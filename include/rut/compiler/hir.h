@@ -773,6 +773,11 @@ struct HirHeaderKV {
 
 struct HirTerminator {
     static constexpr u32 kMaxJsonDynamicValues = 8;
+    // Scalar output remains capped at eight values, while intermediate struct
+    // projections may need additional terminator-local materializations. Keep
+    // those roots bounded by the route expression arena rather than charging
+    // them against the scalar limit.
+    static constexpr u32 kMaxJsonMaterializedValues = 64;
     HirTerminatorKind kind = HirTerminatorKind::ReturnStatus;
     Span span{};
     HirTerminatorSourceKind source_kind = HirTerminatorSourceKind::Literal;
@@ -793,10 +798,14 @@ struct HirTerminator {
     Str response_body{};
     // Runtime JSON template. json_segments has one more item than
     // json_value_ref_indices: segment[0], value[0], segment[1], ... .
-    // Values name synthetic route locals and are limited to scalar carriers.
+    // Values name terminator-local scalar carriers. Their source expressions
+    // stay in the route expression arena but are materialized only after this
+    // terminal block is selected. Intermediate struct roots share this bounded
+    // materialization table without consuming scalar output slots.
     bool has_dynamic_response_body = false;
     FixedVec<Str, kMaxJsonDynamicValues + 1> json_segments;
     FixedVec<u32, kMaxJsonDynamicValues> json_value_ref_indices;
+    FixedVec<u32, kMaxJsonMaterializedValues> json_value_expr_indices;
     // Optional response headers from `response(N, headers: {...})`.
     // Inline-stored so analyze doesn't need the AstFile handle, and
     // downstream passes don't need a module-level pool. len == 0

@@ -1435,6 +1435,123 @@ route GET "/api/users" {
     rir.destroy();
 }
 
+TEST(jit, frontend_return_json_serializes_nested_declared_structs) {
+    const auto src = R"rut(
+struct Meta { ok: bool }
+struct Payload { path: str, answer: i32, meta: Meta }
+route GET "/api/users" {
+    let payload = Payload(path: req.path, answer: 40 + 2, meta: Meta(ok: req.http11))
+    return 200, json(payload)
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    REQUIRE(lower_to_rir(mir.value(), rir));
+    auto cg = codegen(rir.module);
+    REQUIRE(cg.ok);
+    JitEngine engine;
+    REQUIRE(engine.init());
+    REQUIRE(engine.compile(cg.mod, cg.ctx));
+    auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
+    REQUIRE(handler != nullptr);
+
+    Connection conn;
+    conn.reset();
+    TestHandlerCtxFrame frame{};
+    const auto outcome = invoke_jit_handler(handler,
+                                            &conn,
+                                            frame.ctx,
+                                            reinterpret_cast<const u8*>(kGetApiRequest),
+                                            sizeof(kGetApiRequest) - 1,
+                                            nullptr);
+    CHECK(outcome.kind == JitDispatchOutcome::Kind::ReturnStatus);
+    CHECK_EQ(outcome.status_code, 200u);
+    REQUIRE(outcome.dynamic_response_body != nullptr);
+    const Str body{outcome.dynamic_response_body, outcome.dynamic_response_body_len};
+    CHECK(body.eq(lit("{\"path\":\"/api/users\",\"answer\":42,\"meta\":{\"ok\":true}}")));
+
+    engine.shutdown();
+    rir.destroy();
+}
+
+TEST(jit, frontend_return_json_uses_match_payload_binding) {
+    const auto src = R"rut(
+struct Payload { path: str, answer: i32 }
+variant Result { ok(Payload), err }
+route GET "/api/users" {
+    let payload = Payload(path: "outer", answer: 1)
+    let state = Result.ok(Payload(path: req.path, answer: 42))
+    match state {
+    .ok(payload) => return 200, json(payload)
+    .err => return 500
+    }
+}
+route GET "/api/error" {
+    let state = Result.err
+    match state {
+    .ok(payload) => return 200, json(payload)
+    .err => return 500
+    }
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    REQUIRE(lower_to_rir(mir.value(), rir));
+    auto cg = codegen(rir.module);
+    REQUIRE(cg.ok);
+    JitEngine engine;
+    REQUIRE(engine.init());
+    REQUIRE(engine.compile(cg.mod, cg.ctx));
+    auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
+    REQUIRE(handler != nullptr);
+
+    Connection conn;
+    conn.reset();
+    TestHandlerCtxFrame frame{};
+    const auto outcome = invoke_jit_handler(handler,
+                                            &conn,
+                                            frame.ctx,
+                                            reinterpret_cast<const u8*>(kGetApiRequest),
+                                            sizeof(kGetApiRequest) - 1,
+                                            nullptr);
+    CHECK(outcome.kind == JitDispatchOutcome::Kind::ReturnStatus);
+    CHECK_EQ(outcome.status_code, 200u);
+    REQUIRE(outcome.dynamic_response_body != nullptr);
+    const Str body{outcome.dynamic_response_body, outcome.dynamic_response_body_len};
+    CHECK(body.eq(lit("{\"path\":\"/api/users\",\"answer\":42}")));
+
+    auto error_handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_1"));
+    REQUIRE(error_handler != nullptr);
+    constexpr char kGetErrorRequest[] = "GET /api/error HTTP/1.1\r\nHost: example.test\r\n\r\n";
+    conn.reset();
+    TestHandlerCtxFrame error_frame{};
+    const auto error_outcome = invoke_jit_handler(error_handler,
+                                                  &conn,
+                                                  error_frame.ctx,
+                                                  reinterpret_cast<const u8*>(kGetErrorRequest),
+                                                  sizeof(kGetErrorRequest) - 1,
+                                                  nullptr);
+    CHECK(error_outcome.kind == JitDispatchOutcome::Kind::ReturnStatus);
+    CHECK_EQ(error_outcome.status_code, 500u);
+
+    engine.shutdown();
+    rir.destroy();
+}
+
 TEST(jit, runtime_json_serializer_escapes_strings_and_fails_closed_on_overflow) {
     HandlerCtx ctx{};
     rut_helper_json_reset();

@@ -208,9 +208,17 @@ inline JitDispatchOutcome invoke_jit_handler(jit::HandlerFn fn,
                 // 500 while the replacement itself is valid.
                 if (ctx.response_body_mutation_set) {
                     out.response_body_idx = 0;
-                } else if (ctx.response_body_valid != 0 && ctx.response_body_data != nullptr) {
-                    out.dynamic_response_body = ctx.response_body_data;
-                    out.dynamic_response_body_len = ctx.response_body_len;
+                } else {
+                    // A failed/overflowed serializer is a server error, never
+                    // a partial JSON response. The helper clears valid before
+                    // work.
+                    if (ctx.response_body_valid == 0 ||
+                        (ctx.response_body_data == nullptr && ctx.response_body_len != 0)) {
+                        out.status_code = 500;
+                    } else {
+                        out.dynamic_response_body = ctx.response_body_data;
+                        out.dynamic_response_body_len = ctx.response_body_len;
+                    }
                 }
             } else {
                 out.response_body_idx = r.upstream_id;
