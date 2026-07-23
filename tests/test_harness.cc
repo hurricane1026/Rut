@@ -803,6 +803,43 @@ route GET "/without" {
     CHECK_EQ(target.destroy(), harness::CleanupOutcome::Clean);
 }
 
+TEST(harness_scenario, dynamic_json_failure_overrides_committed_status) {
+    TempSource source;
+    REQUIRE(source.write(R"rut(
+func set_status(_ resp: Response) -> i32 {
+    resp.status = 202
+    0
+}
+chain observed { after set_status(resp) }
+route GET "/x" use chain observed {
+    return 200, json({ value: req.header("X-Value").or("") })
+}
+)rut"));
+    harness::SourceTarget target{};
+    harness::HarnessSpec load_spec{};
+    REQUIRE_EQ(target.prepare({source.path, jit::OptLevel::O0}, load_spec).outcome,
+               harness::Outcome::Passed);
+
+    static const char kRequest[] = "GET /x HTTP/1.1\r\nHost: test\r\nX-Value: \xc0\x80\r\n\r\n";
+    harness::ScenarioSpec scenario{};
+    scenario.target = &target;
+    scenario.path = {"/x", 2};
+    scenario.method = kRouteMethodGet;
+    scenario.request_data = reinterpret_cast<const u8*>(kRequest);
+    scenario.request_len = sizeof(kRequest) - 1;
+    scenario.expected = {true, jit::HandlerAction::ReturnStatus, 500};
+
+    auto spec = scripted_scenario_harness();
+    spec.required_capabilities =
+        harness::Capability::SyntheticIo | harness::Capability::VirtualTime;
+    spec.environment_capabilities = spec.required_capabilities;
+    const auto result = harness::drive_scenario(scenario, spec);
+    REQUIRE_EQ(result.harness.outcome, harness::Outcome::Passed);
+    REQUIRE(result.has_terminal);
+    CHECK_EQ(result.terminal.status_code, 500u);
+    CHECK_EQ(target.destroy(), harness::CleanupOutcome::Clean);
+}
+
 TEST(harness_scenario, committed_response_status_and_body_are_observed_after_wait) {
     TempSource source;
     REQUIRE(source.write(

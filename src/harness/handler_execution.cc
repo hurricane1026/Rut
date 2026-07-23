@@ -1,6 +1,7 @@
 #include "rut/harness/handler_execution.h"
 
 #include "rut/jit/runtime_helpers.h"
+#include "rut/runtime/jit_dispatch.h"
 #include "rut/runtime/response_body_storage.h"
 
 namespace rut::harness {
@@ -336,15 +337,7 @@ HandlerExecutionResult drive_handler_deterministically(const DeterministicHandle
     }
 
     const auto& response = execution.frame.context;
-    if (result.action == jit::HandlerAction::ReturnStatus) {
-        if (response.response_status_invalid || response.response_body_mutation_overflow) {
-            result = jit::HandlerResult::make_status(500);
-        } else {
-            if (response.response_status_set) result.status_code = response.response_status;
-            if (response.response_body_mutation_set)
-                result.upstream_id = jit::HandlerResult::kDynamicResponseBody;
-        }
-    }
+    result = effective_return_result(result, response);
     out.terminal = result;
     out.has_terminal = true;
     if (result.action == jit::HandlerAction::ReturnStatus &&

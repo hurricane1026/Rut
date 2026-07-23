@@ -708,11 +708,14 @@ void h2_invoke_emit(H2Dispatch<Loop>& d,
     const JitDispatchOutcome kOutcome = invoke_jit_handler(
         route->fn, static_cast<void*>(d.conn), *ctx, synth, synth_len, /*arena=*/nullptr);
     if (kOutcome.kind == JitDispatchOutcome::Kind::TimerYield) {
-        if (!h2_suspend_timer(d, stream_id, route->fn, *ctx, kOutcome, cfg, synth, synth_len))
+        if (!h2_suspend_timer(d, stream_id, route->fn, *ctx, kOutcome, cfg, synth, synth_len)) {
+            jit::release_response_body_mutation_storage(ctx);
             h2_emit_status(d, stream_id, 503);  // a stream is already suspended
+        }
         return;
     }
     if (kOutcome.kind != JitDispatchOutcome::Kind::ReturnStatus) {
+        jit::release_response_body_mutation_storage(ctx);
         h2_emit_status(d, stream_id, 503);  // forward/event-yield over h2: follow-up
         return;
     }

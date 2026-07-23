@@ -85,6 +85,26 @@ inline u16 effective_return_status(const jit::HandlerResult& result, const jit::
     return dynamic_body_failed && !response_status_forbids_body(status) ? 500 : status;
 }
 
+// Apply the complete terminal precedence while retaining ABI fields that stay
+// meaningful (notably committed headers). Consumers that operate on the packed
+// HandlerResult directly use this instead of reconstructing only scalar status.
+inline jit::HandlerResult effective_return_result(const jit::HandlerResult& result,
+                                                  const jit::HandlerCtx& ctx) {
+    if (result.action != jit::HandlerAction::ReturnStatus) return result;
+    if (ctx.response_status_invalid || ctx.response_body_mutation_overflow)
+        return jit::HandlerResult::make_status(effective_return_status(result, ctx));
+
+    jit::HandlerResult effective = result;
+    effective.status_code = effective_return_status(result, ctx);
+    if (ctx.response_body_mutation_set) {
+        effective.upstream_id = jit::HandlerResult::kDynamicResponseBody;
+    } else if (result.upstream_id == jit::HandlerResult::kDynamicResponseBody &&
+               (ctx.response_body_valid == 0 || ctx.response_body_data == nullptr)) {
+        effective.upstream_id = 0;
+    }
+    return effective;
+}
+
 // Round-up conversion from ms to seconds. Callers using a 1-second
 // TimerWheel (legacy keepalive mechanism) can use this to bucket timer_ms.
 // Native ms-precision paths (IORING_OP_TIMEOUT / epoll min-heap) should
@@ -161,12 +181,13 @@ inline JitDispatchOutcome invoke_jit_handler(jit::HandlerFn fn,
     if (fn == nullptr) return out;  // Kind::Error by default
 
     const u64 packed = fn(conn, &ctx, req_data, req_len, arena);
-    const auto r = jit::HandlerResult::unpack(packed);
+    const auto raw = jit::HandlerResult::unpack(packed);
+    const auto r = effective_return_result(raw, ctx);
 
     switch (r.action) {
         case jit::HandlerAction::ReturnStatus:
             out.kind = JitDispatchOutcome::Kind::ReturnStatus;
-            out.status_code = effective_return_status(r, ctx);
+            out.status_code = r.status_code;
             out.response_ctx = &ctx;
             if (ctx.response_status_invalid || ctx.response_body_mutation_overflow) {
                 out.response_body_idx = 0;

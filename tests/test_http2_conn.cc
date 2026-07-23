@@ -1487,7 +1487,24 @@ struct FakeH2Loop {
         yield_ms = ms;
         return true;
     }
+
+    void epoch_enter() {}
+    void epoch_leave() {}
 };
+
+u64 h2_mutated_body_then_forward(void*, jit::HandlerCtx* ctx, const u8*, u32, void*) {
+    ctx->response_body_mutation_storage = jit::acquire_response_body_mutation_storage();
+    ctx->response_body_mutation_set = true;
+    ctx->response_body_mutation_len = 1;
+    return jit::HandlerResult::make_forward(0).pack();
+}
+
+u64 h2_mutated_body_then_timer(void*, jit::HandlerCtx* ctx, const u8*, u32, void*) {
+    ctx->response_body_mutation_storage = jit::acquire_response_body_mutation_storage();
+    ctx->response_body_mutation_set = true;
+    ctx->response_body_mutation_len = 1;
+    return jit::HandlerResult::make_yield_payload(1, jit::YieldKind::Timer, 1).pack();
+}
 }  // namespace
 
 TEST(h2_serving, response_status_body_rules_include_reset_content) {
@@ -1550,6 +1567,31 @@ TEST(h2_serving, mutation_storage_is_released_after_serialization) {
     REQUIRE(dispatch.resp_len >= sizeof(kBody) - 1);
     CHECK(__builtin_memcmp(
               response + dispatch.resp_len - (sizeof(kBody) - 1), kBody, sizeof(kBody) - 1) == 0);
+}
+
+TEST(h2_serving, rejected_handler_outcomes_release_mutation_storage) {
+    static constexpr u8 kRequest[] = "GET / HTTP/1.1\r\n\r\n";
+    const auto run = [&](jit::HandlerFn fn, bool occupy_async_slot) {
+        Http2Conn h2;
+        h2.init();
+        if (occupy_async_slot) h2.async_stream = 3;
+        Connection conn;
+        conn.reset();
+        conn.h2 = &h2;
+        FakeH2Loop loop;
+        u8 response[256]{};
+        H2Dispatch<FakeH2Loop> dispatch{&loop, &conn, response, sizeof(response), 0, false};
+        RouteEntry route{};
+        route.fn = fn;
+
+        h2_invoke_emit(dispatch, 1, &route, nullptr, 0, nullptr, kRequest, sizeof(kRequest) - 1);
+
+        CHECK(conn.jit_ctx()->response_body_mutation_storage == nullptr);
+        CHECK_GT(dispatch.resp_len, 0u);
+    };
+
+    run(&h2_mutated_body_then_forward, false);
+    run(&h2_mutated_body_then_timer, true);
 }
 
 TEST(h2_serving, deferred_route_params_copied_to_stable_storage) {
