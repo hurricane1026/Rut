@@ -1269,6 +1269,7 @@ FrontendResult<MirModule*> build_mir(const HirModule& module) {
             // side effect itself.
             if (module.routes[i].locals[li].name.len == 0 &&
                 !module.routes[i].locals[li].materialize_on_resume &&
+                module.routes[i].locals[li].type != HirTypeKind::Json &&
                 module.routes[i].locals[li].init.kind != HirExprKind::CacheSet &&
                 module.routes[i].locals[li].init.kind != HirExprKind::ReqSetHeader &&
                 module.routes[i].locals[li].init.kind != HirExprKind::ReqAddHeader &&
@@ -1388,6 +1389,25 @@ FrontendResult<MirModule*> build_mir(const HirModule& module) {
                     term_json_copy_error = Diagnostic{FrontendError::TooManyItems, term.span, {}};
                     return;
                 }
+            }
+            if (term.json_body_expr_index != 0xffffffffu) {
+                if (term.json_body_expr_index >= module.routes[i].exprs.len) {
+                    term_json_copy_failed = true;
+                    term_json_copy_error =
+                        Diagnostic{FrontendError::UnsupportedSyntax, term.span, {}};
+                    return;
+                }
+                const auto& value = module.routes[i].exprs[term.json_body_expr_index];
+                out->json_body_local.span = value.span;
+                out->json_body_local.type = mir_type_kind(value.type);
+                auto init = mir_value(value, module, &fn, ctx);
+                if (!init) {
+                    term_json_copy_failed = true;
+                    term_json_copy_error = init.error();
+                    return;
+                }
+                out->json_body_local.init = init.value();
+                out->has_json_body_plan = true;
             }
             out->forward_set_path = term.forward_set_path;
             out->response_headers.len = 0;

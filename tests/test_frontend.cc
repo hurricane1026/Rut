@@ -7049,6 +7049,61 @@ route {
     rir.destroy();
 }
 
+TEST(frontend, chain_after_materializes_json_local_before_later_response_effects) {
+    const char* src = R"rut(
+func rewrite(_ resp: Response) -> i32 {
+    resp.set("X", "old")
+    let payload = json({ value: resp.header("X").or("missing") })
+    resp.set("X", "new")
+    resp.body = payload
+    0
+}
+chain rewrite_response { after rewrite(resp) }
+route GET "/x" use chain rewrite_response { return 200 }
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    REQUIRE(lower_to_rir(mir.value(), rir));
+    const auto& block = rir.module.functions[0].blocks[0];
+    u32 first_set = 0xffffffffu;
+    u32 response_read = 0xffffffffu;
+    u32 capture = 0xffffffffu;
+    u32 second_set = 0xffffffffu;
+    u32 set_body = 0xffffffffu;
+    for (u32 ii = 0; ii < block.inst_count; ii++) {
+        const auto op = block.insts[ii].op;
+        if (op == rir::Opcode::RespSetHeader) {
+            if (first_set == 0xffffffffu)
+                first_set = ii;
+            else if (second_set == 0xffffffffu)
+                second_set = ii;
+        } else if (op == rir::Opcode::RespHeader && response_read == 0xffffffffu) {
+            response_read = ii;
+        } else if (op == rir::Opcode::JsonCapture && capture == 0xffffffffu) {
+            capture = ii;
+        } else if (op == rir::Opcode::RespSetBody && set_body == 0xffffffffu) {
+            set_body = ii;
+        }
+    }
+    REQUIRE_NE(first_set, 0xffffffffu);
+    REQUIRE_NE(response_read, 0xffffffffu);
+    REQUIRE_NE(capture, 0xffffffffu);
+    REQUIRE_NE(second_set, 0xffffffffu);
+    REQUIRE_NE(set_body, 0xffffffffu);
+    CHECK(first_set < response_read);
+    CHECK(response_read < capture);
+    CHECK(capture < second_set);
+    CHECK(second_set < set_body);
+    rir.destroy();
+}
+
 TEST(frontend, chain_after_commits_response_effects_before_forward) {
     const char* src = R"rut(
 upstream api at "127.0.0.1:9000"
@@ -32456,6 +32511,45 @@ TEST(frontend, reusable_json_local_can_be_returned) {
     CHECK_EQ(term.json_value_ref_indices.len, 0u);
     CHECK_EQ(term.json_segments.len, 0u);
 
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    REQUIRE(lower_to_rir(mir.value(), rir));
+    rir.destroy();
+}
+
+TEST(frontend, declared_json_locals_reject_optional_and_fallible_initializers) {
+    const char* sources[] = {
+        "route GET \"/x\" { let payload: Json = nil return 200, payload }\n",
+        "route GET \"/x\" { guard false else { let payload: Json = error(.missing) return 400, "
+        "payload } return 200 }\n",
+    };
+    for (const char* src : sources) {
+        auto lexed = lex(lit(src));
+        REQUIRE(lexed);
+        auto ast = parse_file_heap(lexed.value());
+        REQUIRE(ast);
+        auto hir = analyze_file_heap(ast.value());
+        REQUIRE_FALSE(hir.has_value());
+    }
+}
+
+TEST(frontend, guard_fail_json_local_resolves_in_scoped_context) {
+    const char* src = R"rut(
+route GET "/x" {
+    guard false else {
+        let payload = json({ message: "bad" })
+        return 400, payload
+    }
+    return 200
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
     auto mir = build_mir_heap(hir.value());
     REQUIRE(mir);
     FrontendRirModule rir{};

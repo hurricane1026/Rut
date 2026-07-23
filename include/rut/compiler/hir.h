@@ -562,6 +562,9 @@ struct HirFunction {
     FixedVec<TypeParamDecl, kMaxTypeParams> type_params;
     FixedVec<ParamDecl, kMaxParams> params;
     FixedVec<HirExpr, kMaxExprs> exprs;
+    // Parallel to exprs: source helper-local ref materialized by this ordered
+    // expression, or UINT32_MAX for response effects and arena-only children.
+    FixedVec<u32, kMaxExprs> expr_materialized_local_refs;
     struct RespondHeader {
         Str key{};
         Str value{};
@@ -596,6 +599,7 @@ struct HirFunction {
           type_params(other.type_params),
           params(other.params),
           exprs(other.exprs),
+          expr_materialized_local_refs(other.expr_materialized_local_refs),
           respond_guards(other.respond_guards),
           body(other.body) {
         for (u32 i = 0; i < other.return_tuple_len; i++) {
@@ -636,6 +640,7 @@ struct HirFunction {
         type_params = other.type_params;
         params = other.params;
         exprs = other.exprs;
+        expr_materialized_local_refs = other.expr_materialized_local_refs;
         respond_guards = other.respond_guards;
         body = other.body;
         rebase_from(other);
@@ -658,6 +663,7 @@ struct HirFunction {
           type_params(other.type_params),
           params(other.params),
           exprs(other.exprs),
+          expr_materialized_local_refs(other.expr_materialized_local_refs),
           respond_guards(other.respond_guards),
           body(other.body) {
         for (u32 i = 0; i < other.return_tuple_len; i++) {
@@ -698,6 +704,7 @@ struct HirFunction {
         type_params = other.type_params;
         params = other.params;
         exprs = other.exprs;
+        expr_materialized_local_refs = other.expr_materialized_local_refs;
         respond_guards = other.respond_guards;
         body = other.body;
         rebase_from(other);

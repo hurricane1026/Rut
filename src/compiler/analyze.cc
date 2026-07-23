@@ -3871,6 +3871,8 @@ static FrontendResult<void> apply_declared_type_to_expr(HirExpr* expr,
                                                   declared_shape.value());
     if (!same_hir_type_shape(mod, *expr, expected))
         return frontend_error(FrontendError::UnsupportedSyntax, stmt.span);
+    if (declared.value() == HirTypeKind::Json && (expr->may_nil || expr->may_error))
+        return frontend_error(FrontendError::UnsupportedSyntax, stmt.span, kJsonOpaqueValueDetail);
     return {};
 }
 
@@ -4623,7 +4625,7 @@ static FrontendResult<HirExpr> analyze_method_call_expr(
         const HirLocal* response = nullptr;
         for (u32 li = local_count; li > 0; li--) {
             if (!locals[li - 1].name.eq(expr.lhs->name)) continue;
-            if (locals[li - 1].init.kind == HirExprKind::ResponseInit) response = &locals[li - 1];
+            if (locals[li - 1].type == HirTypeKind::Response) response = &locals[li - 1];
             break;
         }
         if (response != nullptr) {
@@ -4644,7 +4646,9 @@ static FrontendResult<HirExpr> analyze_method_call_expr(
                     break;
                 }
             }
-            if (!response->init.bool_value) {
+            const bool runtime_response =
+                response->init.kind != HirExprKind::ResponseInit || response->init.bool_value;
+            if (!runtime_response) {
                 if (fallback != nullptr) return *fallback;
                 HirExpr out{};
                 out.kind = HirExprKind::Nil;
@@ -5866,6 +5870,9 @@ static FrontendResult<HirExpr> normalize_function_expr(const HirExpr& expr,
                                                        const HirLocal* locals,
                                                        u32 local_count,
                                                        u32 param_count) {
+    auto push_arena_expr = [&](const HirExpr& value) {
+        return fn->exprs.push(value) && fn->expr_materialized_local_refs.push(0xffffffffu);
+    };
     HirExpr out = expr;
     out.lhs = nullptr;
     out.rhs = nullptr;
@@ -5876,6 +5883,7 @@ static FrontendResult<HirExpr> normalize_function_expr(const HirExpr& expr,
         if (expr.local_index >= local_count)
             return frontend_error(FrontendError::UnsupportedSyntax, expr.span);
         if (expr.local_index < param_count) return expr;
+        if (locals[expr.local_index].type == HirTypeKind::Json) return expr;
         return normalize_function_expr(
             locals[expr.local_index].init, fn, locals, local_count, param_count);
     }
@@ -5894,7 +5902,7 @@ static FrontendResult<HirExpr> normalize_function_expr(const HirExpr& expr,
             out_elem.span = expr.span;
             return out_elem;
         }
-        if (!fn->exprs.push(lhs.value()))
+        if (!push_arena_expr(lhs.value()))
             return frontend_error(FrontendError::TooManyItems, expr.span);
         out.lhs = &fn->exprs[fn->exprs.len - 1];
         out.span = expr.span;
@@ -5904,14 +5912,14 @@ static FrontendResult<HirExpr> normalize_function_expr(const HirExpr& expr,
     if (expr.lhs != nullptr) {
         auto lhs = normalize_function_expr(*expr.lhs, fn, locals, local_count, param_count);
         if (!lhs) return core::make_unexpected(lhs.error());
-        if (!fn->exprs.push(lhs.value()))
+        if (!push_arena_expr(lhs.value()))
             return frontend_error(FrontendError::TooManyItems, expr.span);
         out.lhs = &fn->exprs[fn->exprs.len - 1];
     }
     if (expr.rhs != nullptr) {
         auto rhs = normalize_function_expr(*expr.rhs, fn, locals, local_count, param_count);
         if (!rhs) return core::make_unexpected(rhs.error());
-        if (!fn->exprs.push(rhs.value()))
+        if (!push_arena_expr(rhs.value()))
             return frontend_error(FrontendError::TooManyItems, expr.span);
         out.rhs = &fn->exprs[fn->exprs.len - 1];
     }
@@ -5919,7 +5927,7 @@ static FrontendResult<HirExpr> normalize_function_expr(const HirExpr& expr,
         auto val = normalize_function_expr(
             *expr.field_inits[i].value, fn, locals, local_count, param_count);
         if (!val) return core::make_unexpected(val.error());
-        if (!fn->exprs.push(val.value()))
+        if (!push_arena_expr(val.value()))
             return frontend_error(FrontendError::TooManyItems, expr.span);
         HirExpr::FieldInit init{};
         init.name = expr.field_inits[i].name;
@@ -5930,7 +5938,7 @@ static FrontendResult<HirExpr> normalize_function_expr(const HirExpr& expr,
     for (u32 i = 0; i < expr.args.len; i++) {
         auto arg = normalize_function_expr(*expr.args[i], fn, locals, local_count, param_count);
         if (!arg) return core::make_unexpected(arg.error());
-        if (!fn->exprs.push(arg.value()))
+        if (!push_arena_expr(arg.value()))
             return frontend_error(FrontendError::TooManyItems, expr.span);
         if (!out.args.push(&fn->exprs[fn->exprs.len - 1]))
             return frontend_error(FrontendError::TooManyItems, expr.span);
@@ -5945,14 +5953,20 @@ static bool collect_function_response_effects(HirFunction* fn,
                                               u32 all_local_count,
                                               u32 param_count) {
     for (u32 li = 0; li < scratch.locals.len; li++) {
+        const auto& local = scratch.locals[li];
         const auto kind = scratch.locals[li].init.kind;
-        if (kind != HirExprKind::RespSetHeader && kind != HirExprKind::RespAddHeader &&
-            kind != HirExprKind::RespRemoveHeader && kind != HirExprKind::RespSetStatus &&
-            kind != HirExprKind::RespSetBody)
-            continue;
-        auto normalized = normalize_function_expr(
-            scratch.locals[li].init, fn, all_locals, all_local_count, param_count);
-        if (!normalized || !fn->exprs.push(normalized.value())) return false;
+        const bool response_effect =
+            kind == HirExprKind::RespSetHeader || kind == HirExprKind::RespAddHeader ||
+            kind == HirExprKind::RespRemoveHeader || kind == HirExprKind::RespSetStatus ||
+            kind == HirExprKind::RespSetBody;
+        const bool materialize_json = local.type == HirTypeKind::Json;
+        if (!response_effect && !materialize_json) continue;
+        auto normalized =
+            normalize_function_expr(local.init, fn, all_locals, all_local_count, param_count);
+        if (!normalized || !fn->exprs.push(normalized.value()) ||
+            !fn->expr_materialized_local_refs.push(materialize_json ? local.ref_index
+                                                                    : 0xffffffffu))
+            return false;
     }
     return true;
 }
@@ -16856,7 +16870,7 @@ static FrontendResult<void> analyze_chain_after_response_step(const AstChainDecl
         fn.respond_guards.len != 0)
         return frontend_error(FrontendError::UnsupportedSyntax, step.span, fn.name);
 
-    auto args = std::unique_ptr<HirExpr[]>(new (std::nothrow) HirExpr[AstExpr::kMaxArgs]{});
+    auto args = std::unique_ptr<HirExpr[]>(new (std::nothrow) HirExpr[HirRoute::kMaxLocals]{});
     if (!args) return frontend_error(FrontendError::OutOfMemory, step.span);
     u32 response_params = 0;
     for (u32 ai = 0; ai < fn.params.len; ai++) {
@@ -16908,17 +16922,33 @@ static FrontendResult<void> analyze_chain_after_response_step(const AstChainDecl
             use_span,
             lit_str("chain after currently supports Response header effects only"));
     for (u32 ei = 0; ei < fn.exprs.len; ei++) {
-        if (!is_response_effect(fn.exprs[ei].kind)) continue;
-        auto effect = instantiate_function_expr(
-            fn.exprs[ei], route, mod, args.get(), fn.params.len, nullptr, 0);
-        if (!effect) return core::make_unexpected(effect.error());
+        if (ei >= fn.expr_materialized_local_refs.len)
+            return frontend_error(FrontendError::UnsupportedSyntax, step.span);
+        const u32 materialized_ref = fn.expr_materialized_local_refs[ei];
+        const bool materialize_local = materialized_ref != 0xffffffffu;
+        if (!materialize_local && !is_response_effect(fn.exprs[ei].kind)) continue;
+        auto instantiated = instantiate_function_expr(
+            fn.exprs[ei], route, mod, args.get(), HirRoute::kMaxLocals, nullptr, 0);
+        if (!instantiated) return core::make_unexpected(instantiated.error());
         HirLocal carrier{};
         carrier.span = step.span;
         carrier.ref_index = next_local_ref_index(route, route->locals.data, route->locals.len);
-        carrier.type = effect->type;
-        carrier.init = effect.value();
+        carrier.type = instantiated->type;
+        carrier.shape_index = instantiated->shape_index;
+        carrier.init = instantiated.value();
         if (!route->locals.push(carrier))
             return frontend_error(FrontendError::TooManyItems, step.span);
+        if (materialize_local) {
+            if (materialized_ref >= HirRoute::kMaxLocals)
+                return frontend_error(FrontendError::TooManyItems, step.span);
+            HirExpr ref{};
+            ref.kind = HirExprKind::LocalRef;
+            ref.type = carrier.type;
+            ref.shape_index = carrier.shape_index;
+            ref.local_index = carrier.ref_index;
+            ref.span = step.span;
+            args[materialized_ref] = ref;
+        }
     }
     return {};
 }
@@ -18635,6 +18665,7 @@ static FrontendResult<HirModule*> analyze_file_internal(
                     lit_str("reused helper-local arrays require a runtime local carrier"));
         }
         fn.exprs.len = 0;
+        fn.expr_materialized_local_refs.len = 0;
         fn.respond_guards.len = 0;
         for (u32 gi = 0; gi < scratch->guards.len; gi++) {
             const auto& guard = scratch->guards[gi];
@@ -20254,6 +20285,7 @@ static FrontendResult<HirModule*> analyze_file_internal(
                     lit_str("reused helper-local arrays require a runtime local carrier"));
         }
         fn.exprs.len = 0;
+        fn.expr_materialized_local_refs.len = 0;
         fn.respond_guards.len = 0;
         for (u32 gi = 0; gi < scratch.guards.len; gi++) {
             const auto& guard = scratch.guards[gi];
