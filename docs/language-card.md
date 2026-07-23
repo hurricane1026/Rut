@@ -233,12 +233,12 @@ Dynamic Response header mutations are stored in the resumable handler context,
 so pending mutations survive `wait` and remain isolated per request/stream. A
 handler-local builder must be returned directly. A `chain after` helper
 must have exactly one `Response` parameter and may use `set`/`add`/`remove` with
-literal names and runtime string values; its effects apply to successful direct
-responses. Mutations stay pending until the selected success terminator, so a
-guard or pre-middleware short circuit cannot inherit them. Applying any of these
-mutations to a forwarded response still requires explicit buffered forwarding.
-Status/body writes use the same resumable commit boundary as headers and may be
-used by `chain after` after a yield. Body replacement is a bounded plain `str`
+literal names and runtime string values; its header effects apply to successful
+direct and forwarded responses. Mutations stay pending until the selected
+success terminator, so a guard or pre-middleware short circuit cannot inherit
+them. Status/body writes use the same resumable commit boundary as headers, may
+be used by `chain after` after a yield, and require explicit buffered forwarding
+when applied to a forwarded response. Body replacement is a bounded plain `str`
 view (4 KiB maximum); overflow or a runtime status outside 100...599 fails
 closed as 500. Reading either field, assigning `json(...)`, and mutating a
 streaming forwarded response remain ⏳.
