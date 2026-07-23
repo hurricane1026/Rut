@@ -1854,6 +1854,8 @@ void handle_jit_outcome(Loop* loop,
             return;
         }
         case JitDispatchOutcome::Kind::Forward: {
+            jit::ScopedResponseBodyMutationStorageRelease release_body_storage(
+                static_cast<const jit::HandlerCtx*>(conn.handler_ctx));
             conn.pending_handler_fn = nullptr;
             // Resolve upstream by id against the config pinned at
             // on_header_received. Reading loop->config_ptr here would
