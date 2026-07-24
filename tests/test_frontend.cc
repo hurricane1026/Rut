@@ -264,14 +264,20 @@ static std::string_view markdown_container_content(
                     first_column = padding_column;
                 }
             }
-            if (!non_one_ordered_lists_can_interrupt &&
-                line.substr(padding_end).find_first_not_of(" \t\r") == std::string_view::npos) {
+            const bool marker_only =
+                line.substr(padding_end).find_first_not_of(" \t\r") == std::string_view::npos;
+            if (!non_one_ordered_lists_can_interrupt && marker_only) {
                 column = segment_column;
                 break;
             }
             // CommonMark measures list padding in columns. Padding wider
             // than four columns contributes only its first whitespace unit.
-            if (padding_column - marker_column <= 4) {
+            // A marker-only item always uses exactly one padding column;
+            // excess trailing whitespace is blank content, not indentation.
+            if (marker_only) {
+                list_end = first_end;
+                column = marker_column + 1;
+            } else if (padding_column - marker_column <= 4) {
                 list_end = padding_end;
                 column = padding_column;
             } else {
@@ -831,6 +837,31 @@ TEST(frontend, language_card_recognizes_marker_only_list_items_outside_paragraph
     std::vector<MarkdownContainerSegment> paragraph_container;
     CHECK_EQ(markdown_container_content("-", 0, nullptr, &paragraph_container, false), "-");
     CHECK(paragraph_container.empty());
+
+    std::vector<MarkdownContainerSegment> padded_blank;
+    CHECK_EQ(markdown_container_content("-   ", 0, nullptr, &padded_blank), "  ");
+    REQUIRE_EQ(padded_blank.size(), 1u);
+    CHECK_EQ(padded_blank[0].continuation_width, 2u);
+    std::string_view nested_content;
+    CHECK(markdown_strip_container("  ~~~~markdown", padded_blank, &nested_content));
+    CHECK_EQ(nested_content, "~~~~markdown");
+}
+
+TEST(frontend, language_card_nested_interrupting_container_retains_outer_list) {
+    std::vector<MarkdownContainerSegment> outer;
+    CHECK_EQ(markdown_container_content("- prose", 0, nullptr, &outer), "prose");
+    REQUIRE_EQ(outer.size(), 1u);
+
+    std::string_view outer_content;
+    REQUIRE(markdown_strip_container("  > ~~~~markdown", outer, &outer_content));
+    std::vector<MarkdownContainerSegment> nested;
+    CHECK_EQ(markdown_container_content(outer_content, 0, nullptr, &nested, false),
+             "~~~~markdown");
+    REQUIRE_EQ(nested.size(), 1u);
+    outer.insert(outer.end(), nested.begin(), nested.end());
+    REQUIRE_EQ(outer.size(), 2u);
+    CHECK_EQ(outer[0].kind, MarkdownContainerSegment::Kind::List);
+    CHECK_EQ(outer[1].kind, MarkdownContainerSegment::Kind::Blockquote);
 }
 
 TEST(frontend, language_card_thematic_breaks_precede_list_markers) {
@@ -1000,8 +1031,20 @@ TEST(frontend, language_card_unmarked_rut_examples_parse_and_typecheck) {
             std::string_view container_content;
             if (paragraph_open) {
                 std::vector<MarkdownContainerSegment> interrupting_container;
-                const std::string_view interrupting_content =
-                    markdown_container_content(line, 0, nullptr, &interrupting_container, false);
+                std::string_view interrupting_content;
+                std::string_view outer_content;
+                if (markdown_strip_container(line, paragraph_container, &outer_content)) {
+                    std::vector<MarkdownContainerSegment> nested_container;
+                    interrupting_content = markdown_container_content(
+                        outer_content, 0, nullptr, &nested_container, false);
+                    interrupting_container = paragraph_container;
+                    interrupting_container.insert(interrupting_container.end(),
+                                                  nested_container.begin(),
+                                                  nested_container.end());
+                } else {
+                    interrupting_content = markdown_container_content(
+                        line, 0, nullptr, &interrupting_container, false);
+                }
                 if (!interrupting_container.empty() &&
                     !markdown_same_container(interrupting_container, paragraph_container)) {
                     paragraph_open = false;
