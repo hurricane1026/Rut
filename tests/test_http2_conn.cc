@@ -1347,6 +1347,7 @@ TEST(http2_conn, request_trailers_finalize_instead_of_rst) {
 
     // The serving layer would have deferred this upload.
     c.pending_stream = 1;
+    c.pending_request_forwardable = true;
 
     // Trailing HEADERS: END_STREAM, no pseudo-headers → valid request trailers.
     hpack::Header tr[] = {{{"x-checksum", 10}, {"ok", 2}}};
@@ -1359,6 +1360,7 @@ TEST(http2_conn, request_trailers_finalize_instead_of_rst) {
     CHECK_FALSE(has_frame(tout, tow, Http2FrameType::RstStream, 0, 0));  // not reset
     CHECK_EQ(cap.data_calls, 2u);  // end-of-stream delivered to finalize the upload
     CHECK(cap.data_end);
+    CHECK_FALSE(c.pending_request_forwardable);  // buffered forwarding must reject lost trailers
     Http2Stream* s = c.find_stream(1);
     REQUIRE(s != nullptr);
     CHECK(s->state == Http2StreamState::HalfClosedRemote);

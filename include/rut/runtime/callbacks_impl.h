@@ -4559,6 +4559,7 @@ void buffered_forward_fail(Loop* loop, Connection& conn, u16 status) {
     conn.proxy_resp_started = true;
     conn.set_slots(nullptr, nullptr, nullptr, nullptr);
     conn.transition_to_sending(&on_proxy_response_sent<Loop>);
+    if (conn.handler_ctx != nullptr) rut_helper_resp_release_body_storage(conn.handler_ctx);
     client_send(loop, conn, conn.send_buf.data(), conn.send_buf.len());
 }
 
@@ -4570,6 +4571,7 @@ void finish_buffered_forward(Loop* loop,
                              u32 body_len) {
     constexpr u32 kMaxEffectiveHeaders = kMaxHeaders + jit::kMaxResponseHeaderMutations;
     const bool is_head = conn.req_method == static_cast<u8>(LogHttpMethod::Head);
+    const jit::HandlerCtx* response_ctx = conn.jit_ctx();
     ResponseHeaderKV headers[kMaxEffectiveHeaders];
     u32 header_count = 0;
     for (u32 i = 0; i < resp.header_count; i++) {
@@ -4577,6 +4579,13 @@ void finish_buffered_forward(Loop* loop,
         // Preserve Content-Length on HEAD: it describes the corresponding GET
         // representation even though this response carries no body. A 304 may
         // likewise carry the selected representation's length.
+        if (resp.chunked && http_header_name_eq_ci(name.ptr, name.len, "trailer", 7)) {
+            continue;
+        }
+        if (response_ctx->response_body_mutation_set &&
+            http_header_name_eq_ci(name.ptr, name.len, "content-encoding", 16)) {
+            continue;
+        }
         if (http_header_name_eq_ci(name.ptr, name.len, "content-length", 14)) {
             if (!is_head && resp.status_code != 304) continue;
         } else if (h2_drop_response_header(name)) {
@@ -4597,7 +4606,6 @@ void finish_buffered_forward(Loop* loop,
             name.ptr, name.len, resp.headers[i].value.ptr, resp.headers[i].value.len};
     }
 
-    const jit::HandlerCtx* response_ctx = conn.jit_ctx();
     for (u32 i = 0; i < response_ctx->response_header_count; i++) {
         const Str name = response_ctx->response_header_mutations[i].name;
         if (!http_header_name_eq_ci(name.ptr, name.len, "transfer-encoding", 17)) continue;
@@ -4642,6 +4650,7 @@ void finish_buffered_forward(Loop* loop,
     conn.proxy_response_buffered = false;
     conn.buffered_proxy_send_in_progress = true;
     conn.resp_status = status;
+    conn.keep_alive = conn.keep_alive && conn.req_keep_alive;
     format_response_with_body_and_headers(
         conn,
         status,
@@ -4665,6 +4674,9 @@ void finish_buffered_forward(Loop* loop,
     conn.proxy_resp_started = true;
     conn.set_slots(nullptr, nullptr, nullptr, nullptr);
     conn.transition_to_sending(&on_proxy_response_sent<Loop>);
+    // send_buf owns the fully serialized response now; mutation bytes and
+    // request-backed header snapshots are no longer referenced.
+    rut_helper_resp_release_body_storage(conn.handler_ctx);
     client_send(loop, conn, conn.send_buf.data(), conn.send_buf.len());
 }
 
