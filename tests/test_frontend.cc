@@ -33455,6 +33455,74 @@ route GET "/x" {
     rir.destroy();
 }
 
+TEST(frontend, static_loop_source_arm_guard_runs_before_body_prelude) {
+    const char* src = R"rut(
+route GET "/x" {
+    for item in [1] {
+        match item {
+            1 if false => { guard false else { return 400 } return 200 }
+            _ => return 201
+        }
+    }
+    return 500
+}
+)rut";
+    FrontendRirModule rir{};
+    REQUIRE(lower_src_to_rir(src, rir));
+    CHECK(rir::verify_module(rir.module).ok);
+    rir.destroy();
+}
+
+TEST(frontend, nested_static_loop_matches_accept_closed_exhaustive_sets) {
+    const char* sources[] = {
+        R"rut(
+route GET "/x" {
+    for item in [true] {
+        match item {
+            true => { match req.http11 { true => return 201 false => return 202 } }
+            false => return 203
+        }
+    }
+}
+)rut",
+        R"rut(
+variant Choice { first second }
+route GET "/x" {
+    let choice = Choice.first
+    for item in [true] {
+        match item {
+            true => { match choice { .first => return 201 .second => return 202 } }
+            false => return 203
+        }
+    }
+}
+)rut",
+    };
+    for (const char* src : sources) {
+        FrontendRirModule rir{};
+        REQUIRE(lower_src_to_rir(src, rir));
+        CHECK(rir::verify_module(rir.module).ok);
+        rir.destroy();
+    }
+}
+
+TEST(frontend, loop_control_guard_prevents_false_route_termination_proof) {
+    const char* src = R"rut(
+route GET "/x" {
+    for item in [1] {
+        guard req.http11 else { break }
+        return 200
+    }
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE_FALSE(hir.has_value());
+}
+
 TEST(frontend, mir_defines_arm_capture_before_prelude_and_nested_guard) {
     const char* src = R"rut(
 route GET "/x" {

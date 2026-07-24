@@ -3134,8 +3134,8 @@ FrontendResult<MirModule*> build_mir(const HirModule& module) {
             };
             auto body_match_arm_entry_index = [&](const HirForLoopMatchArm& arm,
                                                   u32 arm_index) -> u32 {
-                if (arm.guards.len != 0) return body_match_prelude_guard_index[arm_index][0];
                 if (arm.has_arm_guard) return body_match_guard_index[arm_index];
+                if (arm.guards.len != 0) return body_match_prelude_guard_index[arm_index][0];
                 return body_match_case_index[arm_index];
             };
             auto body_match_arm_post_prelude_index = [&](const HirForLoopMatchArm& arm,
@@ -3165,7 +3165,6 @@ FrontendResult<MirModule*> build_mir(const HirModule& module) {
                         guard_block.term.cond = cond.value();
                         guard_block.term.then_block =
                             gi + 1 < arm.guards.len ? body_match_prelude_guard_index[ai][gi + 1]
-                            : arm.has_arm_guard     ? body_match_guard_index[ai]
                                                     : body_match_case_index[ai];
                         guard_block.term.else_block = body_match_prelude_guard_fail_index[ai][gi];
                         if (!fn.blocks.push(guard_block))
@@ -3443,7 +3442,8 @@ FrontendResult<MirModule*> build_mir(const HirModule& module) {
                     if (!guard) return core::make_unexpected(guard.error());
                     guard_block.term.cond = guard.value();
                     guard_block.term.then_block =
-                        body_match_arm_body_index(body_match.arms[ai], ai);
+                        arm.guards.len != 0 ? body_match_prelude_guard_index[ai][0]
+                                            : body_match_arm_body_index(body_match.arms[ai], ai);
                     guard_block.term.else_block = body_match_fallthrough_target(ai);
                     if (!fn.blocks.push(guard_block))
                         return frontend_error(FrontendError::TooManyItems, fn.span);

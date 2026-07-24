@@ -17557,7 +17557,18 @@ static FrontendResult<u32> analyze_for_stmt(const AstStatement& stmt,
                         if (!body_match.arms.push(arm))
                             return frontend_error(FrontendError::TooManyItems, inner_arm.span);
                     }
-                    if (!inner_seen_wildcard)
+                    bool inner_exhaustive = inner_seen_wildcard;
+                    if (inner_subject->type == HirTypeKind::Bool)
+                        inner_exhaustive |= inner_seen_bool_true && inner_seen_bool_false;
+                    if (inner_subject->type == HirTypeKind::Variant &&
+                        inner_subject->variant_index < mod.variants.len) {
+                        bool all_cases = true;
+                        const auto& variant = mod.variants[inner_subject->variant_index];
+                        for (u32 ci = 0; ci < variant.cases.len; ci++)
+                            all_cases &= inner_seen_variant_cases[ci];
+                        inner_exhaustive |= all_cases;
+                    }
+                    if (!inner_exhaustive)
                         return frontend_error(FrontendError::UnsupportedSyntax,
                                               nested_match_stmt->span);
                     continue;
@@ -18212,7 +18223,18 @@ static FrontendResult<u32> analyze_for_stmt(const AstStatement& stmt,
                         if (!body_match.arms.push(expanded))
                             return frontend_error(FrontendError::TooManyItems, inner_ast_arm.span);
                     }
-                    if (!inner_seen_wildcard)
+                    bool inner_exhaustive = inner_seen_wildcard;
+                    if (inner_subject->type == HirTypeKind::Bool)
+                        inner_exhaustive |= inner_seen_bool_true && inner_seen_bool_false;
+                    if (inner_subject->type == HirTypeKind::Variant &&
+                        inner_subject->variant_index < mod.variants.len) {
+                        bool all_cases = true;
+                        const auto& variant = mod.variants[inner_subject->variant_index];
+                        for (u32 ci = 0; ci < variant.cases.len; ci++)
+                            all_cases &= inner_seen_variant_cases[ci];
+                        inner_exhaustive |= all_cases;
+                    }
+                    if (!inner_exhaustive)
                         return frontend_error(FrontendError::UnsupportedSyntax, arm_stmt->span);
                     continue;
                 }
@@ -23209,8 +23231,33 @@ static FrontendResult<HirModule*> analyze_file_internal(
                 auto loop = analyze_for_stmt(stmt, &route, mod);
                 if (!loop) return core::make_unexpected(loop.error());
                 const auto& analyzed_loop = route.for_loops[loop.value()];
+                auto loop_may_skip_terminator =
+                    [&](auto&& self, const HirForLoop& candidate) -> bool {
+                    if (candidate.body.has_loop_control) return true;
+                    for (u32 gi = 0; gi < candidate.body.guards.len; gi++)
+                        if (candidate.body.guards[gi].fail_kind ==
+                            HirGuard::FailKind::LoopControl)
+                            return true;
+                    for (u32 mi = 0; mi < candidate.body.matches.len; mi++) {
+                        const auto& body_match = candidate.body.matches[mi];
+                        for (u32 ai = 0; ai < body_match.arms.len; ai++)
+                            for (u32 gi = 0; gi < body_match.arms[ai].guards.len; gi++)
+                                if (body_match.arms[ai].guards[gi].fail_kind ==
+                                    HirGuard::FailKind::LoopControl)
+                                    return true;
+                    }
+                    for (u32 step = 0; step < candidate.body.steps.len; step++) {
+                        const auto& child = candidate.body.steps[step];
+                        if (child.kind == HirForLoopBody::Step::Kind::For &&
+                            child.index < route.for_loops.len &&
+                            self(self, route.for_loops[child.index]))
+                            return true;
+                    }
+                    return false;
+                };
                 u32 iter_len = 0;
                 if (analyzed_loop.body.has_term &&
+                    !loop_may_skip_terminator(loop_may_skip_terminator, analyzed_loop) &&
                     static_for_iter_len(analyzed_loop.iter_expr,
                                         route.locals.data,
                                         route.locals.len,
