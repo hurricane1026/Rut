@@ -4799,6 +4799,7 @@ void on_buffered_upstream_response(Loop* loop,
     }
     conn.upstream_keep_alive = resp.keep_alive && !resp.connection_close &&
                                !(!resp.has_content_length && !resp.chunked && !no_body) &&
+                               !(no_body && resp.chunked) &&
                                conn.req_keep_alive && !contaminated_no_body_response;
     finish_buffered_forward(loop, conn, resp, parser, body_len);
 }

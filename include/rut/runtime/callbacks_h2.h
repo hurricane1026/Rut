@@ -535,6 +535,9 @@ inline void h2_clear_async(Http2Conn& h2) {
     h2.async_kind = H2AsyncKind::None;
     h2.async_cfg = nullptr;
     h2.async_synth_len = 0;
+    h2.async_body_start = 0;
+    h2.async_body_len = 0;
+    h2.async_inject_content_length_on_forward = false;
     h2.async_timer_ms = 0;
     h2.async_fn = nullptr;
     h2.async_state = 0;
@@ -641,7 +644,10 @@ bool h2_suspend_timer(H2Dispatch<Loop>& d,
                       const RouteConfig* cfg,
                       const u8* synth,
                       u32 synth_len,
-                      bool request_forwardable) {
+                      bool request_forwardable,
+                      u32 body_start,
+                      u32 body_len,
+                      bool inject_content_length_on_forward) {
     Http2Conn* h2 = d.conn->h2;
     // Refuse if a stream is already suspended OR a body-reading request is deferred
     // — both reuse pending_synth, so a second would corrupt the first's bytes — OR
@@ -652,6 +658,9 @@ bool h2_suspend_timer(H2Dispatch<Loop>& d,
     // suspending batch could otherwise let a hot reload reclaim them while parked.
     h2_async_epoch_enter(d.loop, *d.conn);
     h2->async_synth_len = h2_stash_synth(*h2, synth, synth_len);
+    h2->async_body_start = body_start;
+    h2->async_body_len = body_len;
+    h2->async_inject_content_length_on_forward = inject_content_length_on_forward;
     if (!h2_snapshot_async_jit_ctx(*h2, live_ctx, synth, h2->async_synth_len)) {
         h2_async_epoch_leave(d.loop, *d.conn);
         return false;
@@ -718,7 +727,10 @@ void h2_invoke_emit(H2Dispatch<Loop>& d,
                     const RouteConfig* cfg,
                     const u8* synth,
                     u32 synth_len,
-                    bool request_forwardable) {
+                    bool request_forwardable,
+                    u32 body_start = 0,
+                    u32 body_len = 0,
+                    bool inject_content_length_on_forward = false) {
     auto* ctx = d.conn->reset_jit_ctx();
     ctx->state = 0;
     ctx->resume_event_kind = static_cast<u32>(jit::YieldKind::Timer);
@@ -737,7 +749,10 @@ void h2_invoke_emit(H2Dispatch<Loop>& d,
                               cfg,
                               synth,
                               synth_len,
-                              request_forwardable)) {
+                              request_forwardable,
+                              body_start,
+                              body_len,
+                              inject_content_length_on_forward)) {
             jit::release_response_body_mutation_storage(ctx);
             h2_emit_status(d, stream_id, 503);  // a stream is already suspended
         }
@@ -748,8 +763,19 @@ void h2_invoke_emit(H2Dispatch<Loop>& d,
             h2_emit_status(d, stream_id, 400);
             return;
         }
+        u32 forward_len = synth_len;
+        if (inject_content_length_on_forward &&
+            !h2_inject_content_length(const_cast<u8*>(synth),
+                                      &forward_len,
+                                      body_start,
+                                      body_len,
+                                      Http2Conn::kBodySynthCap)) {
+            jit::release_response_body_mutation_storage(ctx);
+            h2_emit_status(d, stream_id, 413);
+            return;
+        }
         if (!h2_suspend_proxy(
-                d, stream_id, cfg, route, kOutcome.upstream_id, true, ctx, synth, synth_len))
+                d, stream_id, cfg, route, kOutcome.upstream_id, true, ctx, synth, forward_len))
             h2_emit_status(d, stream_id, 503);
         return;
     }
@@ -791,9 +817,15 @@ void h2_finish_body(H2Dispatch<Loop>& d, u32 stream_id) {
         return;
     }
 
-    // Body-reading handler whose client omitted Content-Length: inject the
-    // observed body length so the HTTP/1-shaped parse exposes the DATA bytes.
-    if (h2->pending_buffer_body && !h2->pending_has_content_length &&
+    const RouteEntry* pending_route = h2->pending_route;
+    const bool inject_for_handler = h2->pending_buffer_body &&
+                                    !h2->pending_has_content_length && pending_route != nullptr &&
+                                    pending_route->needs_req_body;
+    // A body-reading handler still needs the derived length for the HTTP/1-
+    // shaped body parser. A route that only may buffered-forward must observe
+    // the original header set; its derived length is injected after that
+    // outcome is selected below.
+    if (inject_for_handler &&
         !h2_inject_content_length(h2->pending_synth,
                                   &h2->pending_synth_len,
                                   h2->pending_body_start,
@@ -806,8 +838,13 @@ void h2_finish_body(H2Dispatch<Loop>& d, u32 stream_id) {
 
     const u32 kLen = h2->pending_synth_len;
     const u8* synth = h2->pending_synth;
+    const u32 kBodyStart = h2->pending_body_start;
+    const u32 kBodyLen = h2->pending_body_len;
+    const bool kInjectContentLengthOnForward = h2->pending_buffer_body &&
+                                               !h2->pending_has_content_length &&
+                                               !inject_for_handler;
     const RouteConfig* cfg = h2->pending_route_config;
-    const RouteEntry* route = h2->pending_route;
+    const RouteEntry* route = pending_route;
     const jit::HandlerFn kJitFn = h2->pending_jit_fn;
     const u32 kRouteParamCount = h2->pending_route_param_count;
     const bool kRequestForwardable = h2->pending_request_forwardable;
@@ -826,8 +863,18 @@ void h2_finish_body(H2Dispatch<Loop>& d, u32 stream_id) {
     // time (h2->pending_route*), so the deferred body dispatches to exactly the
     // route metered at HEADERS time — h2_dispatch_request charges body routes
     // there (a reload can't swap the route out from under the pinned dispatch).
-    h2_invoke_emit(
-        d, stream_id, route, route_params, kRouteParamCount, cfg, synth, kLen, kRequestForwardable);
+    h2_invoke_emit(d,
+                   stream_id,
+                   route,
+                   route_params,
+                   kRouteParamCount,
+                   cfg,
+                   synth,
+                   kLen,
+                   kRequestForwardable,
+                   kBodyStart,
+                   kBodyLen,
+                   kInjectContentLengthOnForward);
 }
 
 // Resolve a completed header block (END_HEADERS) to a response. end_stream is
@@ -1360,6 +1407,30 @@ void h2_resume_jit_handler(Loop* loop, Connection& conn) {
     }
     if (kOutcome.kind == JitDispatchOutcome::Kind::ForwardBuffered &&
         h2->async_request_forwardable) {
+        if (h2->async_inject_content_length_on_forward &&
+            !h2_inject_content_length(h2->pending_synth,
+                                      &h2->async_synth_len,
+                                      h2->async_body_start,
+                                      h2->async_body_len,
+                                      Http2Conn::kBodySynthCap)) {
+            u8 resp[8192];
+            H2Dispatch<Loop> d{loop, &conn, resp, sizeof(resp), 0, false};
+            h2_emit_status(d, kStreamId, 413);
+            conn.pending_handler_fn = nullptr;
+            conn.handler_ctx = nullptr;
+            h2_clear_async(*h2);
+            h2_async_epoch_leave(loop, conn);
+            if (d.resp_len == 0 || d.overflow) {
+                loop->close_conn(conn);
+                return;
+            }
+            conn.send_progress = 0;
+            conn.send_buf.reset();
+            conn.send_buf.write(resp, d.resp_len);
+            conn.transition_to_sending(&on_h2_sent<Loop>);
+            client_send(loop, conn, conn.send_buf.data(), conn.send_buf.len());
+            return;
+        }
         h2->async_kind = H2AsyncKind::Proxy;
         h2->async_upstream_id = kOutcome.upstream_id;
         h2->async_apply_response_mutations = true;

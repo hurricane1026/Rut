@@ -153,6 +153,9 @@ struct Http2Conn {
     H2AsyncKind async_kind;
     const RouteConfig* async_cfg;
     u32 async_synth_len;
+    u32 async_body_start;
+    u32 async_body_len;
+    bool async_inject_content_length_on_forward;
     // Bytes of the synthesized request already written to the upstream. io_uring
     // sends can complete short (full socket buffer, large header block), so the
     // proxy resubmits the remainder until async_synth_sent == async_synth_len.

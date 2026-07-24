@@ -5872,6 +5872,30 @@ TEST(buffered_forward, contaminated_bodyless_response_is_not_reused) {
     CHECK_FALSE(conn->upstream_keep_alive);
 }
 
+TEST(buffered_forward, chunked_205_is_not_reused_before_delayed_terminator) {
+    SmallLoop loop;
+    loop.setup();
+    auto* conn = setup_proxy_conn(loop);
+    REQUIRE(conn != nullptr);
+    conn->proxy_response_buffered = true;
+    conn->req_keep_alive = true;
+    conn->keep_alive = true;
+    conn->reset_jit_ctx();
+
+    static const char kUpstream[] =
+        "HTTP/1.1 205 Reset Content\r\nTransfer-Encoding: chunked\r\n"
+        "Connection: keep-alive\r\n\r\n";
+    conn->upstream_recv_buf.reset();
+    conn->upstream_recv_buf.write(reinterpret_cast<const u8*>(kUpstream),
+                                  sizeof(kUpstream) - 1);
+    on_upstream_response<SmallLoop>(
+        &loop,
+        *conn,
+        make_ev(conn->id, IoEventType::UpstreamRecv, static_cast<i32>(sizeof(kUpstream) - 1)));
+
+    CHECK_FALSE(conn->upstream_keep_alive);
+}
+
 TEST(buffered_forward, clears_bytes_from_an_abandoned_upstream_wait) {
     SmallLoop loop;
     loop.setup();

@@ -1512,6 +1512,19 @@ u64 h2_mutated_body_then_timer(void*, jit::HandlerCtx* ctx, const u8*, u32, void
 u64 h2_status_204(void*, jit::HandlerCtx*, const u8*, u32, void*) {
     return jit::HandlerResult::make_status(204).pack();
 }
+
+bool h2_handler_saw_content_length = false;
+u64 h2_observe_absent_content_length(void*, jit::HandlerCtx*, const u8* req, u32 len, void*) {
+    static constexpr char kNeedle[] = "content-length:";
+    h2_handler_saw_content_length = false;
+    for (u32 i = 0; i + sizeof(kNeedle) - 1 <= len; i++) {
+        bool match = true;
+        for (u32 j = 0; j < sizeof(kNeedle) - 1; j++)
+            match &= req[i + j] == static_cast<u8>(kNeedle[j]);
+        if (match) h2_handler_saw_content_length = true;
+    }
+    return jit::HandlerResult::make_status(204).pack();
+}
 }  // namespace
 
 TEST(h2_serving, response_status_body_rules_include_reset_content) {
@@ -1554,6 +1567,44 @@ TEST(h2_serving, body_deferral_tracks_buffered_forward_capability_separately) {
     };
     run(false);
     run(true);
+}
+
+TEST(h2_serving, buffered_forward_capability_preserves_absent_content_length_for_handler) {
+    Http2Conn h2;
+    h2.init();
+    Connection conn;
+    conn.reset();
+    conn.h2 = &h2;
+    FakeH2Loop loop;
+    u8 response[512]{};
+    H2Dispatch<FakeH2Loop> dispatch{&loop, &conn, response, sizeof(response), 0, false};
+    RouteConfig config;
+    RouteEntry route{};
+    route.action = RouteAction::JitHandler;
+    route.fn = &h2_observe_absent_content_length;
+    route.needs_req_body = false;
+    route.can_forward_buffered = true;
+
+    static constexpr char kRequest[] = "POST /upload HTTP/1.1\r\nhost: example\r\n\r\nabc";
+    static constexpr u32 kBodyLen = 3;
+    for (u32 i = 0; i < sizeof(kRequest) - 1; i++)
+        h2.pending_synth[i] = static_cast<u8>(kRequest[i]);
+    h2.pending_stream = 1;
+    h2.pending_body_start = sizeof(kRequest) - 1 - kBodyLen;
+    h2.pending_synth_len = sizeof(kRequest) - 1;
+    h2.pending_body_len = kBodyLen;
+    h2.pending_has_content_length = false;
+    h2.pending_buffer_body = true;
+    h2.pending_request_forwardable = true;
+    h2.pending_route_action = RouteAction::JitHandler;
+    h2.pending_route_config = &config;
+    h2.pending_route = &route;
+    h2.pending_jit_fn = route.fn;
+
+    h2_handler_saw_content_length = true;
+    h2_finish_body(dispatch, 1);
+    CHECK_FALSE(h2_handler_saw_content_length);
+    CHECK_GT(dispatch.resp_len, 0u);
 }
 
 TEST(h2_serving, bodyless_mutated_status_suppresses_dynamic_data) {
