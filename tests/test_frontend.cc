@@ -33775,6 +33775,27 @@ route GET "/x" { let pair = keep(([req.path], 1)) return 200 }
     rir.destroy();
 }
 
+TEST(frontend, inferred_tuple_returns_preserve_nested_array_shapes) {
+    const char* src = R"rut(
+func make() => ([1], 2)
+func keep(values: [i32]) -> [i32] => values
+route GET "/x" { let pair = make() let values = pair | keep(_1) return 200 }
+)rut";
+    FrontendRirModule rir{};
+    REQUIRE(lower_src_to_rir(src, rir));
+    rir.destroy();
+}
+
+TEST(frontend, declared_tuple_returns_adapt_nested_runtime_string_lists) {
+    const char* src = R"rut(
+func tags(_ ignored: i32) -> ([str], i32) => (req.queryAll("tag"), 1)
+route GET "/x" { let pair = tags(1) return 200 }
+)rut";
+    FrontendRirModule rir{};
+    REQUIRE(lower_src_to_rir(src, rir));
+    rir.destroy();
+}
+
 TEST(frontend, string_list_local_refs_adapt_to_array_struct_fields) {
     const char* src = R"rut(
 struct Payload { tags: [str] }
@@ -33794,6 +33815,21 @@ route GET "/x" {
     REQUIRE(mir);
     FrontendRirModule rir{};
     REQUIRE(lower_to_rir(mir.value(), rir));
+    rir.destroy();
+}
+
+TEST(frontend, adapting_string_list_locals_preserves_prior_scalar_uses) {
+    const char* src = R"rut(
+struct Payload { tags: [str] }
+route GET "/x" {
+    let raw = req.queryAll("tag")
+    let count = raw.len
+    let payload = Payload(tags: raw)
+    return 200
+}
+)rut";
+    FrontendRirModule rir{};
+    REQUIRE(lower_src_to_rir(src, rir));
     rir.destroy();
 }
 
@@ -33920,6 +33956,26 @@ TEST(frontend, empty_array_call_arguments_use_concrete_parameter_shape) {
     rir.destroy();
 }
 
+TEST(frontend, empty_arrays_nested_in_tuple_arguments_use_parameter_shape) {
+    const char* src =
+        "func keep(pair: ([str], i32)) -> i32 => 1 "
+        "route GET \"/x\" { let result = keep(([], 1)) return 200 }\n";
+    FrontendRirModule rir{};
+    REQUIRE(lower_src_to_rir(src, rir));
+    rir.destroy();
+}
+
+TEST(frontend, aliases_preserve_indexed_tuple_shapes_inside_arrays) {
+    const char* src = R"rut(
+type Pair = ([str], i32)
+func keep(values: [Pair]) -> [Pair] => values
+route GET "/x" { let values = keep([([req.path], 1)]) return 200 }
+)rut";
+    FrontendRirModule rir{};
+    REQUIRE(lower_src_to_rir(src, rir));
+    rir.destroy();
+}
+
 TEST(frontend, empty_array_struct_fields_use_declared_shape) {
     const char* src =
         "struct Payload { tags: [str] } "
@@ -34011,6 +34067,19 @@ route GET "/x" {
     FrontendRirModule rir{};
     REQUIRE(lower_src_to_rir(src, rir));
     rir.destroy();
+}
+
+TEST(frontend, tuple_struct_fields_reject_reversed_scalar_slots) {
+    const char* src =
+        "struct Holder { pair: (i32, str) } "
+        "route GET \"/x\" { let holder = Holder(pair: (\"bad\", 1)) return 200 }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE_FALSE(hir.has_value());
+    CHECK_EQ(hir.error().code, FrontendError::UnsupportedSyntax);
 }
 
 TEST(frontend, rejects_arrays_nested_in_tuple_variant_payloads) {
