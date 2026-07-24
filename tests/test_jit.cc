@@ -1597,6 +1597,61 @@ route GET "/api/users" {
     rir.destroy();
 }
 
+TEST(jit, frontend_return_json_serializes_bounded_runtime_arrays) {
+    const auto src = R"rut(
+struct Item { name: str, count: i32 }
+struct Payload { tags: [str], items: [Item] }
+func keepTags(values: [str]) -> [str] => values
+route GET "/api/users" {
+    let tags = keepTags([req.path, "static"])
+    let counts = [1, 2, 3]
+    let nested = [[req.path], ["tail"]]
+    let empty: [str] = []
+    let items = [Item(name: req.path, count: 1), Item(name: "static", count: 2)]
+    let payload = Payload(tags: tags, items: items)
+    return 200, json({ payload: payload, counts: counts, nested: nested, empty: empty })
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    REQUIRE(lower_to_rir(mir.value(), rir));
+    auto cg = codegen(rir.module);
+    REQUIRE(cg.ok);
+    JitEngine engine;
+    REQUIRE(engine.init());
+    REQUIRE(engine.compile(cg.mod, cg.ctx));
+    auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
+    REQUIRE(handler != nullptr);
+
+    static constexpr char kRequest[] = "GET /api/users HTTP/1.1\r\nHost: test\r\n\r\n";
+    Connection conn;
+    conn.reset();
+    TestHandlerCtxFrame frame{};
+    const auto outcome = invoke_jit_handler(handler,
+                                            &conn,
+                                            frame.ctx,
+                                            reinterpret_cast<const u8*>(kRequest),
+                                            sizeof(kRequest) - 1,
+                                            nullptr);
+    REQUIRE(outcome.dynamic_response_body != nullptr);
+    const Str body{outcome.dynamic_response_body, outcome.dynamic_response_body_len};
+    CHECK(
+        body.eq(lit("{\"payload\":{\"tags\":[\"/api/users\",\"static\"],\"items\":["
+                    "{\"name\":\"/api/users\",\"count\":1},{\"name\":\"static\","
+                    "\"count\":2}]},\"counts\":[1,2,3],\"nested\":[[\"/api/users\"],"
+                    "[\"tail\"]],\"empty\":[]}")));
+
+    engine.shutdown();
+    rir.destroy();
+}
+
 TEST(jit, runtime_json_serializer_escapes_strings_and_fails_closed_on_overflow) {
     HandlerCtx ctx{};
     rut_helper_json_reset();
@@ -7765,6 +7820,49 @@ TEST(jit, runtime_error_code_field_from_mir) {
 
     engine.shutdown();
     rir.destroy();
+}
+
+TEST(jit, bounded_array_carrier_len_and_get) {
+    TestContext tc;
+    REQUIRE(tc.init());
+
+    Builder b;
+    b.init(&tc.mod);
+    auto* fn = V(b.create_function(lit("array_carrier"), lit("/array"), 'G'));
+    auto entry = V(b.create_block(fn, lit("entry")));
+    b.set_insert_point(fn, entry);
+
+    auto* i32_type = V(b.make_type(rir::TypeKind::I32));
+    rir::ValueId items[] = {V(b.emit_const_i32(200)), V(b.emit_const_i32(201))};
+    auto array = V(b.emit_array_create(i32_type, items, 2));
+    auto len = V(b.emit_array_len(array));
+    auto index = V(b.emit_const_i32(0));
+    auto first = V(b.emit_array_get(array, index));
+    auto status = V(b.emit_arith(rir::Opcode::Add, first, len));
+    auto negative = V(b.emit_const_i32(-1));
+    auto past_end = V(b.emit_const_i32(2));
+    auto negative_value = V(b.emit_array_get(array, negative));
+    auto past_end_value = V(b.emit_array_get(array, past_end));
+    auto empty = V(b.emit_array_create(i32_type, nullptr, 0));
+    auto empty_value = V(b.emit_array_get(empty, index));
+    status = V(b.emit_arith(rir::Opcode::Add, status, negative_value));
+    status = V(b.emit_arith(rir::Opcode::Add, status, past_end_value));
+    status = V(b.emit_arith(rir::Opcode::Add, status, empty_value));
+    VOK(b.emit_ret_status(status));
+
+    auto cg = codegen(tc.mod);
+    REQUIRE(cg.ok);
+    JitEngine engine;
+    REQUIRE(engine.init());
+    REQUIRE(engine.compile(cg.mod, cg.ctx));
+    auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_array_carrier"));
+    REQUIRE(handler != nullptr);
+    auto result = HandlerResult::unpack(handler(nullptr, nullptr, nullptr, 0, nullptr));
+    CHECK(result.action == HandlerAction::ReturnStatus);
+    CHECK_EQ(result.status_code, 202);
+
+    engine.shutdown();
+    tc.destroy();
 }
 
 // Test: Handler with path prefix guard.

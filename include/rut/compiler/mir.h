@@ -21,6 +21,8 @@ enum class MirValueKind : u8 {
     BoolConst,
     IntConst,
     StrConst,
+    ArrayLit,
+    ArrayGet,
     RegexMatch,
     Tuple,
     TupleSlot,
@@ -107,6 +109,7 @@ enum class MirTypeKind : u8 {
     ByteSize,
     IP,
     StrList,
+    Array,
 };
 
 struct MirTypeShape {
@@ -118,6 +121,7 @@ struct MirTypeShape {
     u32 struct_index = 0xffffffffu;
     u32 tuple_len = 0;
     u32 tuple_elem_shape_indices[kMaxMirTupleSlots]{};
+    u32 array_elem_shape_index = 0xffffffffu;
 };
 
 struct MirVariant {

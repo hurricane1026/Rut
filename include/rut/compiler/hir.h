@@ -526,6 +526,8 @@ struct HirFunction {
         HirTypeKind tuple_types[kMaxTupleSlots]{};
         u32 tuple_variant_indices[kMaxTupleSlots]{};
         u32 tuple_struct_indices[kMaxTupleSlots]{};
+        u32 tuple_elem_shape_indices[kMaxTupleSlots]{};
+        u32 array_elem_shape_index = 0xffffffffu;
         u32 shape_index = 0xffffffffu;
         bool has_underscore_label = false;
     };
@@ -545,6 +547,8 @@ struct HirFunction {
     HirTypeKind return_tuple_types[kMaxTupleSlots]{};
     u32 return_tuple_variant_indices[kMaxTupleSlots]{};
     u32 return_tuple_struct_indices[kMaxTupleSlots]{};
+    u32 return_tuple_elem_shape_indices[kMaxTupleSlots]{};
+    u32 return_array_elem_shape_index = 0xffffffffu;
     u32 return_shape_index = 0xffffffffu;
     static constexpr u32 kMaxParams = 8;
     static constexpr u32 kMaxExprs = 64;
@@ -580,6 +584,7 @@ struct HirFunction {
           return_variant_index(other.return_variant_index),
           return_struct_index(other.return_struct_index),
           return_tuple_len(other.return_tuple_len),
+          return_array_elem_shape_index(other.return_array_elem_shape_index),
           return_shape_index(other.return_shape_index),
           type_params(other.type_params),
           params(other.params),
@@ -590,6 +595,7 @@ struct HirFunction {
             return_tuple_types[i] = other.return_tuple_types[i];
             return_tuple_variant_indices[i] = other.return_tuple_variant_indices[i];
             return_tuple_struct_indices[i] = other.return_tuple_struct_indices[i];
+            return_tuple_elem_shape_indices[i] = other.return_tuple_elem_shape_indices[i];
         }
         for (u32 i = 0; i < other.return_type_arg_count; i++) {
             return_type_args[i] = other.return_type_args[i];
@@ -609,11 +615,13 @@ struct HirFunction {
         return_variant_index = other.return_variant_index;
         return_struct_index = other.return_struct_index;
         return_tuple_len = other.return_tuple_len;
+        return_array_elem_shape_index = other.return_array_elem_shape_index;
         return_shape_index = other.return_shape_index;
         for (u32 i = 0; i < other.return_tuple_len; i++) {
             return_tuple_types[i] = other.return_tuple_types[i];
             return_tuple_variant_indices[i] = other.return_tuple_variant_indices[i];
             return_tuple_struct_indices[i] = other.return_tuple_struct_indices[i];
+            return_tuple_elem_shape_indices[i] = other.return_tuple_elem_shape_indices[i];
         }
         for (u32 i = 0; i < other.return_type_arg_count; i++) {
             return_type_args[i] = other.return_type_args[i];
@@ -638,6 +646,7 @@ struct HirFunction {
           return_variant_index(other.return_variant_index),
           return_struct_index(other.return_struct_index),
           return_tuple_len(other.return_tuple_len),
+          return_array_elem_shape_index(other.return_array_elem_shape_index),
           return_shape_index(other.return_shape_index),
           type_params(other.type_params),
           params(other.params),
@@ -648,6 +657,7 @@ struct HirFunction {
             return_tuple_types[i] = other.return_tuple_types[i];
             return_tuple_variant_indices[i] = other.return_tuple_variant_indices[i];
             return_tuple_struct_indices[i] = other.return_tuple_struct_indices[i];
+            return_tuple_elem_shape_indices[i] = other.return_tuple_elem_shape_indices[i];
         }
         for (u32 i = 0; i < other.return_type_arg_count; i++) {
             return_type_args[i] = other.return_type_args[i];
@@ -667,11 +677,13 @@ struct HirFunction {
         return_variant_index = other.return_variant_index;
         return_struct_index = other.return_struct_index;
         return_tuple_len = other.return_tuple_len;
+        return_array_elem_shape_index = other.return_array_elem_shape_index;
         return_shape_index = other.return_shape_index;
         for (u32 i = 0; i < other.return_tuple_len; i++) {
             return_tuple_types[i] = other.return_tuple_types[i];
             return_tuple_variant_indices[i] = other.return_tuple_variant_indices[i];
             return_tuple_struct_indices[i] = other.return_tuple_struct_indices[i];
+            return_tuple_elem_shape_indices[i] = other.return_tuple_elem_shape_indices[i];
         }
         for (u32 i = 0; i < other.return_type_arg_count; i++) {
             return_type_args[i] = other.return_type_args[i];

@@ -76,6 +76,7 @@ struct TupleLoweringInfo {
     MirTypeKind tuple_types[kMaxMirTupleSlots]{};
     u32 tuple_variant_indices[kMaxMirTupleSlots]{};
     u32 tuple_struct_indices[kMaxMirTupleSlots]{};
+    u32 shape_index = 0xffffffffu;
 };
 
 struct FlatMirShape {
@@ -90,6 +91,16 @@ struct FlatMirShape {
 
 static FrontendResult<const rir::Type*> rir_type_for_flat_shape(
     const FlatMirShape& shape,
+    const VariantLoweringInfo* variant_infos,
+    TupleLoweringInfo* tuple_infos,
+    u32* tuple_info_count,
+    const rir::StructDef* const* user_struct_defs,
+    rir::Builder& b,
+    Span span);
+
+static FrontendResult<const rir::Type*> rir_type_for_shape_index(
+    const MirModule& mir,
+    u32 shape_index,
     const VariantLoweringInfo* variant_infos,
     TupleLoweringInfo* tuple_infos,
     u32* tuple_info_count,
@@ -480,17 +491,28 @@ static FrontendResult<const TupleLoweringInfo*> get_or_create_tuple_lowering(
     TupleLoweringInfo* tuple_infos,
     u32* tuple_info_count,
     rir::Builder& b,
-    Span span) {
+    Span span,
+    const MirModule* mir = nullptr,
+    u32 shape_index = 0xffffffffu) {
+    bool requires_indexed_shape = false;
+    for (u32 i = 0; i < tuple_len; i++) {
+        if (tuple_types[i] == MirTypeKind::Array || tuple_types[i] == MirTypeKind::Tuple) {
+            requires_indexed_shape = true;
+            break;
+        }
+    }
     for (u32 i = 0; i < *tuple_info_count; i++) {
-        if (same_tuple_shape(tuple_infos[i],
-                             tuple_len,
-                             tuple_types,
-                             tuple_variant_indices,
-                             tuple_struct_indices))
+        if ((shape_index != 0xffffffffu && tuple_infos[i].shape_index == shape_index) ||
+            (!requires_indexed_shape && same_tuple_shape(tuple_infos[i],
+                                                         tuple_len,
+                                                         tuple_types,
+                                                         tuple_variant_indices,
+                                                         tuple_struct_indices)))
             return &tuple_infos[i];
     }
     if (*tuple_info_count >= 64) return frontend_error(FrontendError::TooManyItems, span);
     auto& info = tuple_infos[*tuple_info_count];
+    info.shape_index = shape_index;
     info.tuple_len = tuple_len;
     for (u32 i = 0; i < tuple_len; i++) {
         info.tuple_types[i] = tuple_types[i];
@@ -501,10 +523,31 @@ static FrontendResult<const TupleLoweringInfo*> get_or_create_tuple_lowering(
     for (u32 i = 0; i < tuple_len; i++) {
         if (!build_tuple_field_name(*b.mod->arena, i, &fields[i].name))
             return frontend_error(FrontendError::OutOfMemory, span);
-        const auto elem_shape =
-            tuple_elem_shape(i, tuple_types, tuple_variant_indices, tuple_struct_indices);
-        auto field_ty = rir_type_for_flat_shape(
-            elem_shape, variant_infos, tuple_infos, tuple_info_count, user_struct_defs, b, span);
+        FrontendResult<const rir::Type*> field_ty =
+            frontend_error(FrontendError::UnsupportedSyntax, span);
+        if (mir != nullptr && shape_index < mir->type_shapes.len) {
+            const auto& indexed = mir->type_shapes[shape_index];
+            if (indexed.type != MirTypeKind::Tuple || i >= indexed.tuple_len)
+                return frontend_error(FrontendError::UnsupportedSyntax, span);
+            field_ty = rir_type_for_shape_index(*mir,
+                                                indexed.tuple_elem_shape_indices[i],
+                                                variant_infos,
+                                                tuple_infos,
+                                                tuple_info_count,
+                                                user_struct_defs,
+                                                b,
+                                                span);
+        } else {
+            const auto elem_shape =
+                tuple_elem_shape(i, tuple_types, tuple_variant_indices, tuple_struct_indices);
+            field_ty = rir_type_for_flat_shape(elem_shape,
+                                               variant_infos,
+                                               tuple_infos,
+                                               tuple_info_count,
+                                               user_struct_defs,
+                                               b,
+                                               span);
+        }
         if (!field_ty) return core::make_unexpected(field_ty.error());
         fields[i].type = field_ty.value();
     }
@@ -629,6 +672,58 @@ static FrontendResult<const rir::Type*> rir_type_for_flat_shape(
                               user_struct_defs,
                               b,
                               span);
+}
+
+static FrontendResult<const rir::Type*> rir_type_for_shape_index(
+    const MirModule& mir,
+    u32 shape_index,
+    const VariantLoweringInfo* variant_infos,
+    TupleLoweringInfo* tuple_infos,
+    u32* tuple_info_count,
+    const rir::StructDef* const* user_struct_defs,
+    rir::Builder& b,
+    Span span) {
+    if (shape_index >= mir.type_shapes.len || !mir.type_shapes[shape_index].carrier_ready)
+        return frontend_error(FrontendError::UnsupportedSyntax, span);
+    const auto& shape = mir.type_shapes[shape_index];
+    if (shape.type == MirTypeKind::Array) {
+        auto elem = rir_type_for_shape_index(mir,
+                                             shape.array_elem_shape_index,
+                                             variant_infos,
+                                             tuple_infos,
+                                             tuple_info_count,
+                                             user_struct_defs,
+                                             b,
+                                             span);
+        if (!elem) return core::make_unexpected(elem.error());
+        auto array = b.make_type(rir::TypeKind::Array, elem.value());
+        if (!array) return frontend_error(FrontendError::OutOfMemory, span);
+        return array.value();
+    }
+    if (shape.type == MirTypeKind::Tuple) {
+        FlatMirShape flat{};
+        if (!expand_flat_shape(mir, shape_index, &flat))
+            return frontend_error(FrontendError::UnsupportedSyntax, span);
+        auto tuple = get_or_create_tuple_lowering(flat.tuple_len,
+                                                  flat.tuple_types,
+                                                  flat.tuple_variant_indices,
+                                                  flat.tuple_struct_indices,
+                                                  variant_infos,
+                                                  user_struct_defs,
+                                                  tuple_infos,
+                                                  tuple_info_count,
+                                                  b,
+                                                  span,
+                                                  &mir,
+                                                  shape_index);
+        if (!tuple) return core::make_unexpected(tuple.error());
+        return tuple.value()->struct_type;
+    }
+    FlatMirShape flat{};
+    if (!expand_flat_shape(mir, shape_index, &flat))
+        return frontend_error(FrontendError::UnsupportedSyntax, span);
+    return rir_type_for_flat_shape(
+        flat, variant_infos, tuple_infos, tuple_info_count, user_struct_defs, b, span);
 }
 
 static FrontendResult<rir::ValueId> emit_eq_for_flat_shape(
@@ -1222,6 +1317,65 @@ static FrontendResult<rir::ValueId> materialize_value(const MirValue& value,
         if (!v) return frontend_error(FrontendError::OutOfMemory, span);
         return v.value();
     }
+    if (value.kind == MirValueKind::ArrayLit) {
+        if (value.shape_index >= mir.type_shapes.len ||
+            mir.type_shapes[value.shape_index].type != MirTypeKind::Array)
+            return frontend_error(FrontendError::UnsupportedSyntax, span);
+        const u32 elem_shape_index = mir.type_shapes[value.shape_index].array_elem_shape_index;
+        auto elem_type = rir_type_for_shape_index(mir,
+                                                  elem_shape_index,
+                                                  variant_infos,
+                                                  tuple_infos,
+                                                  tuple_info_count,
+                                                  user_struct_defs,
+                                                  b,
+                                                  span);
+        if (!elem_type) return core::make_unexpected(elem_type.error());
+        rir::ValueId elements[MirValue::kMaxArgs]{};
+        for (u32 i = 0; i < value.args.len; i++) {
+            auto elem = materialize_value(*value.args[i],
+                                          mir,
+                                          variant_infos,
+                                          tuple_infos,
+                                          tuple_info_count,
+                                          error_scalar_infos,
+                                          error_variant_infos,
+                                          error_struct_infos,
+                                          user_struct_defs,
+                                          b,
+                                          locals,
+                                          local_count,
+                                          span);
+            if (!elem) return core::make_unexpected(elem.error());
+            elements[i] = elem.value();
+        }
+        auto created =
+            b.emit_array_create(elem_type.value(), elements, value.args.len, {span.line, span.col});
+        if (!created) return frontend_error(FrontendError::OutOfMemory, span);
+        return created.value();
+    }
+    if (value.kind == MirValueKind::ArrayGet) {
+        if (value.lhs == nullptr) return frontend_error(FrontendError::UnsupportedSyntax, span);
+        auto array = materialize_value(*value.lhs,
+                                       mir,
+                                       variant_infos,
+                                       tuple_infos,
+                                       tuple_info_count,
+                                       error_scalar_infos,
+                                       error_variant_infos,
+                                       error_struct_infos,
+                                       user_struct_defs,
+                                       b,
+                                       locals,
+                                       local_count,
+                                       span);
+        if (!array) return core::make_unexpected(array.error());
+        auto index = b.emit_const_i32(static_cast<i32>(value.int_value), {span.line, span.col});
+        if (!index) return frontend_error(FrontendError::OutOfMemory, span);
+        auto element = b.emit_array_get(array.value(), index.value(), {span.line, span.col});
+        if (!element) return frontend_error(FrontendError::UnsupportedSyntax, span);
+        return element.value();
+    }
     if (value.kind == MirValueKind::RegexMatch) {
         auto lhs = materialize_value(*value.lhs,
                                      mir,
@@ -1243,16 +1397,19 @@ static FrontendResult<rir::ValueId> materialize_value(const MirValue& value,
     }
     if (value.kind == MirValueKind::Tuple) {
         const auto tuple_shape = resolved_shape(mir, value);
-        auto tuple_info = get_or_create_tuple_lowering(tuple_shape.tuple_len,
-                                                       tuple_shape.tuple_types,
-                                                       tuple_shape.tuple_variant_indices,
-                                                       tuple_shape.tuple_struct_indices,
-                                                       variant_infos,
-                                                       user_struct_defs,
-                                                       tuple_infos,
-                                                       tuple_info_count,
-                                                       b,
-                                                       span);
+        auto tuple_info =
+            get_or_create_tuple_lowering(tuple_shape.tuple_len,
+                                         tuple_shape.tuple_types,
+                                         tuple_shape.tuple_variant_indices,
+                                         tuple_shape.tuple_struct_indices,
+                                         variant_infos,
+                                         user_struct_defs,
+                                         tuple_infos,
+                                         tuple_info_count,
+                                         b,
+                                         span,
+                                         value.shape_index < mir.type_shapes.len ? &mir : nullptr,
+                                         value.shape_index);
         if (!tuple_info) return core::make_unexpected(tuple_info.error());
         rir::ValueId field_vals[kMaxMirTupleSlots]{};
         for (u32 i = 0; i < value.args.len; i++) {
@@ -1437,8 +1594,23 @@ static FrontendResult<rir::ValueId> materialize_value(const MirValue& value,
         if (!build_tuple_field_name(*b.mod->arena, static_cast<u32>(value.int_value), &field_name))
             return frontend_error(FrontendError::OutOfMemory, span);
         const auto slot_shape = resolved_shape(mir, value);
-        auto field_type = rir_type_for_flat_shape(
-            slot_shape, variant_infos, tuple_infos, tuple_info_count, user_struct_defs, b, span);
+        auto field_type =
+            (slot_shape.type == MirTypeKind::Array || slot_shape.type == MirTypeKind::Tuple)
+                ? rir_type_for_shape_index(mir,
+                                           value.shape_index,
+                                           variant_infos,
+                                           tuple_infos,
+                                           tuple_info_count,
+                                           user_struct_defs,
+                                           b,
+                                           span)
+                : rir_type_for_flat_shape(slot_shape,
+                                          variant_infos,
+                                          tuple_infos,
+                                          tuple_info_count,
+                                          user_struct_defs,
+                                          b,
+                                          span);
         if (!field_type) return core::make_unexpected(field_type.error());
         auto field = b.emit_struct_field(
             subject.value(), field_name, field_type.value(), {span.line, span.col});
@@ -1466,12 +1638,16 @@ static FrontendResult<rir::ValueId> materialize_value(const MirValue& value,
         return v.value();
     }
     if (value.kind == MirValueKind::ReqQueryAll) {
-        auto v = b.emit_req_query_all(value.str_value, {span.line, span.col});
+        auto v = value.type == MirTypeKind::Array
+                     ? b.emit_req_query_all_array(value.str_value, {span.line, span.col})
+                     : b.emit_req_query_all(value.str_value, {span.line, span.col});
         if (!v) return frontend_error(FrontendError::OutOfMemory, span);
         return v.value();
     }
     if (value.kind == MirValueKind::ReqHeaderAll) {
-        auto v = b.emit_req_header_all(value.str_value, {span.line, span.col});
+        auto v = value.type == MirTypeKind::Array
+                     ? b.emit_req_header_all_array(value.str_value, {span.line, span.col})
+                     : b.emit_req_header_all(value.str_value, {span.line, span.col});
         if (!v) return frontend_error(FrontendError::OutOfMemory, span);
         return v.value();
     }
@@ -1760,7 +1936,33 @@ static FrontendResult<rir::ValueId> materialize_value(const MirValue& value,
             const rir::Type* field_type = nullptr;
             if (field.is_error_type)
                 field_type = err_info.error_type;
-            else {
+            else if (field_shape.type == MirTypeKind::Array) {
+                auto ty = rir_type_for_shape_index(mir,
+                                                   field.shape_index,
+                                                   variant_infos,
+                                                   tuple_infos,
+                                                   tuple_info_count,
+                                                   user_struct_defs,
+                                                   b,
+                                                   span);
+                if (!ty) return core::make_unexpected(ty.error());
+                field_type = ty.value();
+            } else if (field_shape.type == MirTypeKind::Tuple) {
+                auto tuple_info = get_or_create_tuple_lowering(field_shape.tuple_len,
+                                                               field_shape.tuple_types,
+                                                               field_shape.tuple_variant_indices,
+                                                               field_shape.tuple_struct_indices,
+                                                               variant_infos,
+                                                               user_struct_defs,
+                                                               tuple_infos,
+                                                               tuple_info_count,
+                                                               b,
+                                                               span,
+                                                               &mir,
+                                                               field.shape_index);
+                if (!tuple_info) return core::make_unexpected(tuple_info.error());
+                field_type = tuple_info.value()->struct_type;
+            } else {
                 auto ty = rir_type_for_flat_shape(field_shape,
                                                   variant_infos,
                                                   tuple_infos,
@@ -3134,6 +3336,7 @@ static FrontendResult<void> emit_term(const MirTerminator& term,
                     : value_type == rir::TypeKind::I64     ? rir::Opcode::JsonAppendI64
                     : value_type == rir::TypeKind::Str     ? rir::Opcode::JsonAppendStr
                     : value_type == rir::TypeKind::StrList ? rir::Opcode::JsonAppendStrList
+                    : value_type == rir::TypeKind::Array   ? rir::Opcode::JsonAppendArray
                                                            : rir::Opcode::JsonFinish;
                 if (op == rir::Opcode::JsonFinish ||
                     !b.emit_json_append(op, json_locals[ref], {term.span.line, term.span.col}))
@@ -3418,6 +3621,27 @@ FrontendResult<void> lower_to_rir(const MirModule& mir, FrontendRirModule& out) 
     }
 
     bool struct_built[MirModule::kMaxStructs]{};
+    auto shape_defs_ready = [&](auto&& self, u32 shape_index, u32 depth) -> bool {
+        if (depth > mir.type_shapes.len || shape_index >= mir.type_shapes.len) return false;
+        const auto& shape = mir.type_shapes[shape_index];
+        if (shape.type == MirTypeKind::Struct)
+            return shape.struct_index < mir.structs.len &&
+                   user_struct_defs[shape.struct_index] != nullptr;
+        if (shape.type == MirTypeKind::Variant) {
+            if (shape.variant_index >= mir.variants.len) return false;
+            bool has_payload = false;
+            for (u32 ci = 0; ci < mir.variants[shape.variant_index].cases.len; ci++)
+                has_payload |= mir.variants[shape.variant_index].cases[ci].has_payload;
+            return !has_payload || variant_infos[shape.variant_index].struct_type != nullptr;
+        }
+        if (shape.type == MirTypeKind::Array)
+            return self(self, shape.array_elem_shape_index, depth + 1);
+        if (shape.type == MirTypeKind::Tuple) {
+            for (u32 ti = 0; ti < shape.tuple_len; ti++)
+                if (!self(self, shape.tuple_elem_shape_indices[ti], depth + 1)) return false;
+        }
+        return true;
+    };
     auto build_user_struct = [&](u32 si) -> FrontendResult<bool> {
         if (struct_built[si]) return true;
         if (!instance_fully_concrete(mir,
@@ -3448,6 +3672,18 @@ FrontendResult<void> lower_to_rir(const MirModule& mir, FrontendRirModule& out) 
                     field_ty = i32_ty.value();
                 } else if (field_shape.type == MirTypeKind::Str) {
                     field_ty = str_ty.value();
+                } else if (field_shape.type == MirTypeKind::Array) {
+                    if (!shape_defs_ready(shape_defs_ready, field.shape_index, 0)) return false;
+                    auto ty = rir_type_for_shape_index(mir,
+                                                       field.shape_index,
+                                                       variant_infos,
+                                                       tuple_infos,
+                                                       &tuple_info_count,
+                                                       user_struct_defs,
+                                                       b,
+                                                       mir.structs[si].span);
+                    if (!ty) return core::make_unexpected(ty.error());
+                    field_ty = ty.value();
                 } else if (field_shape.type == MirTypeKind::Variant) {
                     if (field_shape.variant_index >= mir.variants.len ||
                         variant_infos[field_shape.variant_index].struct_type == nullptr)
@@ -3465,17 +3701,20 @@ FrontendResult<void> lower_to_rir(const MirModule& mir, FrontendRirModule& out) 
                         return frontend_error(FrontendError::OutOfMemory, mir.structs[si].span);
                     field_ty = ty.value();
                 } else if (field_shape.type == MirTypeKind::Tuple) {
-                    auto tuple_info =
-                        get_or_create_tuple_lowering(field_shape.tuple_len,
-                                                     field_shape.tuple_types,
-                                                     field_shape.tuple_variant_indices,
-                                                     field_shape.tuple_struct_indices,
-                                                     variant_infos,
-                                                     user_struct_defs,
-                                                     tuple_infos,
-                                                     &tuple_info_count,
-                                                     b,
-                                                     mir.structs[si].span);
+                    if (!shape_defs_ready(shape_defs_ready, field.shape_index, 0)) return false;
+                    auto tuple_info = get_or_create_tuple_lowering(
+                        field_shape.tuple_len,
+                        field_shape.tuple_types,
+                        field_shape.tuple_variant_indices,
+                        field_shape.tuple_struct_indices,
+                        variant_infos,
+                        user_struct_defs,
+                        tuple_infos,
+                        &tuple_info_count,
+                        b,
+                        mir.structs[si].span,
+                        field.shape_index < mir.type_shapes.len ? &mir : nullptr,
+                        field.shape_index);
                     if (!tuple_info) return core::make_unexpected(tuple_info.error());
                     field_ty = tuple_info.value()->struct_type;
                 } else {
@@ -3550,16 +3789,19 @@ FrontendResult<void> lower_to_rir(const MirModule& mir, FrontendRirModule& out) 
         const rir::Type* struct_ty_payload = nullptr;
         const rir::Type* struct_opt_ty = nullptr;
         if (has_tuple_payload) {
-            auto tuple_info = get_or_create_tuple_lowering(payload_shape.tuple_len,
-                                                           payload_shape.tuple_types,
-                                                           payload_shape.tuple_variant_indices,
-                                                           payload_shape.tuple_struct_indices,
-                                                           variant_infos,
-                                                           user_struct_defs,
-                                                           tuple_infos,
-                                                           &tuple_info_count,
-                                                           b,
-                                                           mir.variants[vi].span);
+            auto tuple_info = get_or_create_tuple_lowering(
+                payload_shape.tuple_len,
+                payload_shape.tuple_types,
+                payload_shape.tuple_variant_indices,
+                payload_shape.tuple_struct_indices,
+                variant_infos,
+                user_struct_defs,
+                tuple_infos,
+                &tuple_info_count,
+                b,
+                mir.variants[vi].span,
+                variant_infos[vi].payload_shape_index < mir.type_shapes.len ? &mir : nullptr,
+                variant_infos[vi].payload_shape_index);
             if (!tuple_info) {
                 out.destroy();
                 return core::make_unexpected(tuple_info.error());
