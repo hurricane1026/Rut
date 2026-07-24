@@ -169,14 +169,16 @@ The coordinator executes one request at a time:
    invocation, TLS handshake, or open WebSocket session.
 
 The generation whose process-startup `init` hook ran is a separate lifecycle
-owner. Its compiled lifecycle bundle remains pinned until process shutdown has
-run that same generation's paired `shutdown` hook, even if a reload replaces all
-request handlers and every ordinary invocation pin reaches zero. Reload does not
-run a candidate generation's `init`, substitute its `shutdown`, or reclaim the
-startup bundle. A future design may instead define paired per-generation
-shutdown/init transitions, but it must complete the old shutdown before reclaim
-and the new init before publication; mixing hooks from different generations is
-forbidden.
+owner. At startup, its `init`/`shutdown` code and immutable dependencies are
+retained as one dedicated lifecycle artifact, separate from the reloadable
+request-handler/config bundle. That artifact remains pinned until process
+shutdown has run the paired `shutdown` hook, but it does not retain the startup
+generation's request handlers, config, or generation-local tables and is not
+counted as a served generation. Reload does not run a candidate generation's
+`init`, substitute its `shutdown`, or replace the dedicated startup artifact. A
+future design may instead define paired per-generation shutdown/init transitions,
+but it must complete the old shutdown before reclaim and the new init before
+publication; mixing hooks from different generations is forbidden.
 
 Installation also retires old-generation timer registrations before a shard
 acknowledges. The shard removes the old scheduled tick and drains any callback
@@ -246,8 +248,11 @@ Cache schema, and upstream identities never mix generations. The coordinator
 does not publish generation `N+1` until all shards acknowledged `N`; every shard
 therefore observes the same strict generation order without skipped updates.
 Shard acknowledgements alone do not admit `N+2`: retained pins on `N` keep the
-admission gate closed, bounding live configs, JIT bundles, and override tables
-to the active generation and at most one predecessor.
+admission gate closed, bounding live request-handler configs, JIT bundles, and
+override tables to the active generation and at most one predecessor. The one
+dedicated startup lifecycle artifact described above is a fixed process-lifetime
+allocation outside this served-generation bound; it contains no request handler
+entry points or generation-local runtime state.
 
 At a shard command boundary, installation is one release/acquire publication:
 the default generation, route/upstream config, generated handler entry points,
@@ -386,18 +391,24 @@ manual exclusions have disappeared, and compatible adjacent views preserve the
 last published verdict while retaining generation-specific references for
 pinned predecessor work.
 
-Each generation table carries a monotonically increasing override version.
-Every successful mark publication increments that version in the same atomic
-operation as the slot update. A backend-selection capture records the pinned
-generation and exact override version observed by its table read. Capture records
-**every** mark attempt at its workload-event position, including its stable server
-identity, requested verdict, boolean result, and a bounded reason (`published`,
-`stale-or-foreign`, `unavailable`, or `contended`). Successful records additionally
-carry the published version. Replay consumes failed attempts as well as successful
-publication boundaries and orders selection reads by these versions; an omitted
-attempt, mismatched reason/result, or unobservable version is `Unsupported`.
-Recording only successful publications is not sufficient to reproduce handler and
-timer control flow.
+Each generation table carries a monotonically increasing override sequence.
+Successful marks publish through a validated snapshot protocol: a writer changes
+the sequence to an odd value, updates its slot, then release-publishes the next
+even value. Backend selection acquire-reads an even sequence, scans every verdict
+it will consume, and accepts the snapshot only when a second acquire-read returns
+the same even value; otherwise it retries within a fixed bound and takes the
+documented visible unavailable/contended path. Per-slot atomics followed by an
+unvalidated table-version read are not sufficient. A backend-selection capture
+records the pinned generation and exact validated even sequence observed by the
+accepted snapshot. Capture records **every** mark attempt at its workload-event
+position, including its stable server identity, requested verdict, boolean result,
+and a bounded reason (`published`, `stale-or-foreign`, `unavailable`, or
+`contended`). Successful records additionally carry the published even sequence.
+Replay consumes failed attempts as well as successful publication boundaries and
+orders selection snapshots by these sequences; an omitted attempt, mismatched
+reason/result, or unobservable sequence is `Unsupported`. Recording only
+successful publications is not sufficient to reproduce handler and timer control
+flow.
 
 Override selection uses the request, stream, WebSocket session, or lifecycle
 invocation's pinned config generation—not the shard's latest installed
@@ -738,6 +749,16 @@ checkpointed pool before admitting work, or starts with the correspondingly empt
 pool after a recorded drain. A socket count or generic "idle" marker is
 insufficient because it cannot reproduce whether the next operation reuses a
 connection or performs connect/TLS setup.
+
+TLS resumption state survives an idle-socket drain and is therefore independent
+baseline state. Capture must checkpoint each shard's inbound session-ID cache,
+the shared ticket-key generations and rotation epoch, and each outbound-host
+session cache, then record every insertion, eviction, rotation, and invalidation
+in workload-event order. Alternatively it must explicitly clear all of those
+caches and rotate to a recorded fresh ticket-key epoch before assigning the first
+workload event. Capture is `Unsupported` when neither a complete checkpoint nor
+that recorded reset can be established; replay must not silently replace a
+resumed handshake with a full handshake.
 
 Hostname-backed upstreams additionally require the exact per-shard DNS cache
 baseline (address/SRV roster with stable server identities, TTL/expiry and
