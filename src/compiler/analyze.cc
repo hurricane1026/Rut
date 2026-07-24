@@ -11705,6 +11705,7 @@ static FrontendResult<void> build_dynamic_json_plan(
 
 static bool expr_reads_local_ref(const HirExpr& expr, u32 ref_index);
 static bool hir_expr_reads_response_snapshot(const HirExpr& expr);
+static bool hir_expr_reads_request_body_snapshot(const HirExpr& expr);
 static bool terminator_reads_local_ref(const HirTerminator& term,
                                        const HirExpr* exprs,
                                        u32 expr_count,
@@ -11801,6 +11802,17 @@ static FrontendResult<HirTerminator> analyze_term(const AstStatement& stmt,
                                         stmt.expr.span,
                                         lit_str("json cannot preserve Response field snapshots "
                                                 "across a wait"));
+                                bool has_receive_wait = false;
+                                for (u32 wi = 0; wi < route->waits.len; wi++)
+                                    has_receive_wait |=
+                                        (route->waits[wi].arm_mask & kWaitEventArmRecv) != 0;
+                                if (retained[li] && has_receive_wait &&
+                                    hir_expr_reads_request_body_snapshot(route->locals[li].init))
+                                    return frontend_error(
+                                        FrontendError::UnsupportedSyntax,
+                                        stmt.expr.span,
+                                        lit_str("json cannot preserve request-body snapshots "
+                                                "across a receive wait"));
                                 if (retained[li] && !route->locals[li].materialize_on_resume)
                                     route->locals[li].rematerialize_after_wait = true;
                             }
@@ -11912,6 +11924,17 @@ static FrontendResult<HirTerminator> analyze_term(const AstStatement& stmt,
                                         stmt.expr.span,
                                         lit_str("json cannot preserve Response field snapshots "
                                                 "across a wait"));
+                                bool has_receive_wait = false;
+                                for (u32 wi = 0; wi < route->waits.len; wi++)
+                                    has_receive_wait |=
+                                        (route->waits[wi].arm_mask & kWaitEventArmRecv) != 0;
+                                if (retained[li] && has_receive_wait &&
+                                    hir_expr_reads_request_body_snapshot(route->locals[li].init))
+                                    return frontend_error(
+                                        FrontendError::UnsupportedSyntax,
+                                        stmt.expr.span,
+                                        lit_str("json cannot preserve request-body snapshots "
+                                                "across a receive wait"));
                                 if (retained[li] && !route->locals[li].materialize_on_resume)
                                     route->locals[li].rematerialize_after_wait = true;
                             }
@@ -12015,6 +12038,22 @@ static bool hir_expr_reads_response_snapshot(const HirExpr& expr) {
     return false;
 }
 
+static bool hir_expr_reads_request_body_snapshot(const HirExpr& expr) {
+    if (expr.kind == HirExprKind::ReqBody) return true;
+    if (expr.lhs != nullptr && hir_expr_reads_request_body_snapshot(*expr.lhs)) return true;
+    if (expr.rhs != nullptr && hir_expr_reads_request_body_snapshot(*expr.rhs)) return true;
+    for (u32 fi = 0; fi < expr.field_inits.len; fi++) {
+        if (expr.field_inits[fi].value != nullptr &&
+            hir_expr_reads_request_body_snapshot(*expr.field_inits[fi].value))
+            return true;
+    }
+    for (u32 ai = 0; ai < expr.args.len; ai++) {
+        if (expr.args[ai] != nullptr && hir_expr_reads_request_body_snapshot(*expr.args[ai]))
+            return true;
+    }
+    return false;
+}
+
 static bool terminator_reads_local_ref(const HirTerminator& term,
                                        const HirExpr* exprs,
                                        u32 expr_count,
@@ -12027,6 +12066,9 @@ static bool terminator_reads_local_ref(const HirTerminator& term,
         if (expr_index < expr_count && expr_reads_local_ref(exprs[expr_index], ref_index))
             return true;
     }
+    if (term.json_body_expr_index < expr_count &&
+        expr_reads_local_ref(exprs[term.json_body_expr_index], ref_index))
+        return true;
     return false;
 }
 

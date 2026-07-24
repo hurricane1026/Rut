@@ -6958,6 +6958,54 @@ route GET "/users" {
     rir.destroy();
 }
 
+TEST(frontend, wait_any_reusable_json_body_retains_arm_local_dependency) {
+    const char* src = R"rut(
+func choose(flag: bool, yes: Json, no: Json) -> Json {
+    if flag { yes } else { no }
+}
+route GET "/users" {
+    wait any {
+        downstream.recv() => {
+            if let value = req.header("X-Value") {
+                return 200, choose(req.http11, json({ value: value }), json({ value: "other" }))
+            } else {
+                return 404
+            }
+        }
+        timer(250) => { return 408 }
+    }
+}
+)rut";
+    FrontendRirModule rir{};
+    REQUIRE(lower_src_to_rir(src, rir));
+    CHECK(rir::verify_module(rir.module).ok);
+    rir.destroy();
+}
+
+TEST(frontend, reusable_json_rejects_request_body_snapshot_across_receive_wait) {
+    const char* rejected = R"rut(
+route GET "/users" {
+    let payload = json({ body: req.body })
+    wait(downstream.recv())
+    return 200, payload
+}
+)rut";
+    auto lexed = lex(lit(rejected));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE_FALSE(hir.has_value());
+    CHECK_EQ(hir.error().code, FrontendError::UnsupportedSyntax);
+
+    FrontendRirModule rir{};
+    REQUIRE(lower_src_to_rir(
+        "route GET \"/users\" { let payload = json({ body: req.body }) wait(1) return 200, "
+        "payload }\n",
+        rir));
+    rir.destroy();
+}
+
 TEST(frontend, const_match_payload_is_visible_to_direct_dynamic_json) {
     const char* src = R"rut(
 variant Result { ok(str), err }
