@@ -579,6 +579,7 @@ inline void h2_clear_async(Http2Conn& h2) {
     h2.async_route = nullptr;
     h2.async_upstream_id = 0;
     h2.async_apply_response_mutations = false;
+    h2.async_capture_response = false;
     h2.async_request_forwardable = false;
     h2.async_capture_response = false;
     h2.async_resp_len = 0;
@@ -824,10 +825,23 @@ template <typename Loop>
 void h2_finish_body(H2Dispatch<Loop>& d, u32 stream_id) {
     Http2Conn* h2 = d.conn->h2;
     if (h2->pending_overflow) {
-        const bool kBuffered = h2->pending_buffer_body;
-        h2_clear_pending(*h2);
-        h2_emit_status(d, stream_id, kBuffered ? 413 : 400);
-        return;
+        // A body-independent JIT handler may still return a local response even
+        // when the request body is too large to retain for a later buffered
+        // forward. Discard the partial body and run it against the synthesized
+        // headers; mark the request non-forwardable so a buffered/capture
+        // terminal fails closed instead of silently forwarding a prefix.
+        if (h2->pending_route_action == RouteAction::JitHandler && h2->pending_route != nullptr &&
+            !h2->pending_route->needs_req_body) {
+            h2->pending_synth_len = h2->pending_body_start;
+            h2->pending_buffer_body = false;
+            h2->pending_request_forwardable = false;
+            h2->pending_overflow = false;
+        } else {
+            const bool kBuffered = h2->pending_buffer_body;
+            h2_clear_pending(*h2);
+            h2_emit_status(d, stream_id, kBuffered ? 413 : 400);
+            return;
+        }
     }
     // A client-supplied Content-Length must equal the actual DATA octet count,
     // for every deferred action — not just body-reading handlers.
