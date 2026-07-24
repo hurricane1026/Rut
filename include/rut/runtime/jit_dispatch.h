@@ -203,6 +203,11 @@ inline JitDispatchOutcome invoke_jit_handler(jit::HandlerFn fn,
                 }
                 out.uses_captured_response = true;
                 if (!ctx.response_status_set) out.status_code = ctx.captured_response_status;
+                if (out.status_code < 200) {
+                    out.status_code = 500;
+                    out.uses_captured_response = false;
+                    return out;
+                }
                 out.dynamic_response_body = ctx.captured_response_body;
                 out.dynamic_response_body_len = ctx.captured_response_body_len;
             }

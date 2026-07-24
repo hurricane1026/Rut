@@ -1,5 +1,6 @@
 #include "rut/harness/handler_execution.h"
 
+#include "rut/common/http_header_validation.h"
 #include "rut/jit/runtime_helpers.h"
 #include "rut/runtime/jit_dispatch.h"
 #include "rut/runtime/response_body_storage.h"
@@ -15,6 +16,19 @@ void copy_detail(char* dst, u32 cap, const char* src) {
         i++;
     }
     dst[i] = '\0';
+}
+
+bool captured_response_header_is_valid(const jit::CapturedResponseHeader& header) {
+    if (header.name.len == 0 || header.name.ptr == nullptr ||
+        (header.value.len != 0 && header.value.ptr == nullptr))
+        return false;
+    for (u32 i = 0; i < header.name.len; i++)
+        if (!is_http_tchar(static_cast<u8>(header.name.ptr[i]))) return false;
+    for (u32 i = 0; i < header.value.len; i++) {
+        const u8 c = static_cast<u8>(header.value.ptr[i]);
+        if (c != '\t' && (c < 0x20 || c == 0x7f)) return false;
+    }
+    return true;
 }
 
 struct EventPublisher {
@@ -348,8 +362,9 @@ HandlerExecutionResult drive_handler_deterministically(const DeterministicHandle
                         "recv result does not match scripted data length");
             return out;
         }
+        u32 event_input_bytes = event.data_len;
         if (event.kind == jit::YieldKind::Forward) {
-            if (event.response_status < 100 || event.response_status > 599 ||
+            if (event.response_status < 200 || event.response_status > 599 ||
                 event.response_header_count > jit::kMaxCapturedResponseHeaders ||
                 (event.response_header_count != 0 && event.response_headers == nullptr) ||
                 (event.data_len != 0 && event.data == nullptr)) {
@@ -361,8 +376,7 @@ HandlerExecutionResult drive_handler_deterministically(const DeterministicHandle
             }
             for (u32 i = 0; i < event.response_header_count; i++) {
                 const auto& header = event.response_headers[i];
-                if ((header.name.len != 0 && header.name.ptr == nullptr) ||
-                    (header.value.len != 0 && header.value.ptr == nullptr)) {
+                if (!captured_response_header_is_valid(header)) {
                     out.harness.outcome = Outcome::Invalid;
                     copy_detail(out.harness.detail,
                                 sizeof(out.harness.detail),
@@ -397,6 +411,7 @@ HandlerExecutionResult drive_handler_deterministically(const DeterministicHandle
                             "forward completion exceeds captured response storage");
                 return out;
             }
+            event_input_bytes = captured_bytes;
             auto& response = execution.frame.context;
             response.captured_response_valid = true;
             response.captured_response_status = event.response_status;
@@ -407,7 +422,7 @@ HandlerExecutionResult drive_handler_deterministically(const DeterministicHandle
                 response.captured_response_headers[i] = event.response_headers[i];
             event.result = event.response_status;
         }
-        if (event.data_len > harness.limits.max_input_bytes - out.harness.input_bytes) {
+        if (event_input_bytes > harness.limits.max_input_bytes - out.harness.input_bytes) {
             out.harness.outcome = Outcome::Failed;
             out.harness.has_reached_limit = true;
             out.harness.reached_limit = LimitKind::InputBytes;
@@ -415,7 +430,7 @@ HandlerExecutionResult drive_handler_deterministically(const DeterministicHandle
                 out.harness.detail, sizeof(out.harness.detail), "input-bytes limit reached");
             return out;
         }
-        out.harness.input_bytes += event.data_len;
+        out.harness.input_bytes += event_input_bytes;
         if (out.harness.backend_completions >= harness.limits.max_backend_completions) {
             out.harness.outcome = Outcome::Failed;
             out.harness.has_reached_limit = true;

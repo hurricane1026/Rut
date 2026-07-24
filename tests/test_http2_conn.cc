@@ -1873,8 +1873,7 @@ TEST(h2_serving, captured_content_length_is_removed_for_final_204) {
                                        decoded,
                                        8,
                                        &count));
-    for (u32 i = 0; i < count; i++)
-        CHECK_FALSE(decoded[i].name.eq(Str{"content-length", 14}));
+    for (u32 i = 0; i < count; i++) CHECK_FALSE(decoded[i].name.eq(Str{"content-length", 14}));
 }
 
 TEST(h2_serving, mutation_storage_is_released_after_serialization) {

@@ -3588,6 +3588,22 @@ TEST(jit, response_body_mutation_overflow_fails_closed) {
     CHECK_FALSE(captured_failure.uses_captured_response);
 }
 
+TEST(jit, informational_captured_response_fails_closed) {
+    TestHandlerCtxFrame frame{};
+    frame.ctx.captured_response_valid = true;
+    frame.ctx.captured_response_status = 103;
+    const auto captured_terminal = +[](void*, HandlerCtx*, const u8*, u32, void*) -> u64 {
+        return HandlerResult::make_status(0).pack();
+    };
+
+    const auto outcome =
+        invoke_jit_handler(captured_terminal, nullptr, frame.ctx, nullptr, 0, nullptr);
+
+    CHECK(outcome.kind == JitDispatchOutcome::Kind::ReturnStatus);
+    CHECK_EQ(outcome.status_code, 500u);
+    CHECK_FALSE(outcome.uses_captured_response);
+}
+
 TEST(jit, response_body_snapshot_failure_remains_sticky_across_assignment) {
     TestHandlerCtxFrame frame{};
     frame.ctx.response_body_snapshot_failed = true;

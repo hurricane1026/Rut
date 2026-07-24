@@ -481,8 +481,7 @@ void h2_emit_outcome(H2Dispatch<Loop>& d,
         for (u32 i = 0; i < o.response_ctx->captured_response_header_count; i++) {
             const auto& header = o.response_ctx->captured_response_headers[i];
             if ((o.status_code < 200 || o.status_code == 204 || o.status_code == 205) &&
-                http_header_name_eq_ci(
-                    header.name.ptr, header.name.len, "content-length", 14))
+                http_header_name_eq_ci(header.name.ptr, header.name.len, "content-length", 14))
                 continue;
             if (o.response_ctx->response_body_mutation_set &&
                 http_header_name_eq_ci(header.name.ptr, header.name.len, "content-encoding", 16))

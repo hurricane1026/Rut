@@ -913,6 +913,74 @@ TEST(harness_handler, rejects_null_captured_response_header_views) {
     CHECK_EQ(result.harness.cleanup, harness::CleanupOutcome::Clean);
 }
 
+TEST(harness_handler, rejects_informational_captured_response_fixtures) {
+    for (const u16 status : {100u, 103u, 199u}) {
+        harness::HandlerExecution execution{};
+        execution.init(&captured_passthrough_handler, nullptr, nullptr, 0);
+        const harness::DeterministicCompletion completion = {
+            jit::YieldKind::Forward, 0, 100, 1, 7, nullptr, 0, false, false, status, nullptr, 0};
+        harness::DeterministicEnvironment environment{};
+        environment.reset(&completion, 1);
+        harness::DeterministicHandlerSpec driver{};
+        driver.execution = execution;
+        driver.environment = &environment;
+        harness::HarnessSpec spec{};
+        spec.layer = harness::ExecutionLayer::Handler;
+
+        const auto result = harness::drive_handler_deterministically(driver, spec);
+        CHECK_EQ(result.harness.outcome, harness::Outcome::Invalid);
+    }
+}
+
+TEST(harness_handler, rejects_invalid_captured_response_header_syntax) {
+    const jit::CapturedResponseHeader invalid_headers[] = {
+        {{"", 0}, {"value", 5}},
+        {{"Bad Name", 8}, {"value", 5}},
+        {{"X-Test", 6}, {"bad\rvalue", 9}},
+    };
+    for (const auto& header : invalid_headers) {
+        harness::HandlerExecution execution{};
+        execution.init(&captured_passthrough_handler, nullptr, nullptr, 0);
+        const harness::DeterministicCompletion completion = {
+            jit::YieldKind::Forward, 0, 100, 1, 7, nullptr, 0, false, false, 206, &header, 1};
+        harness::DeterministicEnvironment environment{};
+        environment.reset(&completion, 1);
+        harness::DeterministicHandlerSpec driver{};
+        driver.execution = execution;
+        driver.environment = &environment;
+        harness::HarnessSpec spec{};
+        spec.layer = harness::ExecutionLayer::Handler;
+
+        const auto result = harness::drive_handler_deterministically(driver, spec);
+        CHECK_EQ(result.harness.outcome, harness::Outcome::Invalid);
+    }
+}
+
+TEST(harness_handler, captured_response_headers_count_toward_input_limit) {
+    harness::HandlerExecution execution{};
+    execution.init(&captured_passthrough_handler, nullptr, nullptr, 0);
+    const jit::CapturedResponseHeader header = {{"X-Origin", 8}, {"fixture", 7}};
+    const harness::DeterministicCompletion completion = {
+        jit::YieldKind::Forward, 0, 100, 1, 7, nullptr, 0, false, false, 206, &header, 1};
+    harness::DeterministicEnvironment environment{};
+    environment.reset(&completion, 1);
+    harness::DeterministicHandlerSpec driver{};
+    driver.execution = execution;
+    driver.environment = &environment;
+    harness::HarnessSpec spec{};
+    spec.layer = harness::ExecutionLayer::Handler;
+
+    auto result = harness::drive_handler_deterministically(driver, spec);
+    REQUIRE_EQ(result.harness.outcome, harness::Outcome::Passed);
+    CHECK_EQ(result.harness.input_bytes, 15u);
+
+    environment.reset(&completion, 1);
+    spec.limits.max_input_bytes = 14;
+    result = harness::drive_handler_deterministically(driver, spec);
+    CHECK_EQ(result.harness.outcome, harness::Outcome::Failed);
+    CHECK_EQ(result.harness.reached_limit, harness::LimitKind::InputBytes);
+}
+
 TEST(harness_connection, reports_and_resets_cleanup_invariants) {
     harness::ConnectionExecution execution{};
     CHECK_EQ(execution.connection.fd, -1);
