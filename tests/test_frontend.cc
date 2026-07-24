@@ -333,6 +333,15 @@ static bool markdown_same_container(const std::vector<MarkdownContainerSegment>&
     return true;
 }
 
+static void markdown_remember_list_container(const std::vector<MarkdownContainerSegment>& container,
+                                             std::vector<MarkdownContainerSegment>* continuation) {
+    for (const auto& segment : container) {
+        if (segment.kind != MarkdownContainerSegment::Kind::List) continue;
+        *continuation = container;
+        return;
+    }
+}
+
 static bool markdown_strip_container(std::string_view line,
                                      const std::vector<MarkdownContainerSegment>& segments,
                                      std::string_view* content) {
@@ -849,6 +858,27 @@ TEST(frontend, language_card_list_container_survives_blank_line) {
     CHECK_FALSE(markdown_strip_container("outside the list", container, &content));
 }
 
+TEST(frontend, language_card_list_container_survives_nested_block_close) {
+    std::vector<MarkdownContainerSegment> list_container;
+    CHECK_EQ(markdown_container_content("-   ~~~~markdown", 0, nullptr, &list_container),
+             "~~~~markdown");
+    REQUIRE_EQ(list_container.size(), 1u);
+
+    std::vector<MarkdownContainerSegment> continuation;
+    markdown_remember_list_container(list_container, &continuation);
+    std::string_view content;
+    REQUIRE(markdown_strip_container("    ~~~~rut", continuation, &content));
+    MarkdownFence fence{};
+    REQUIRE(parse_markdown_fence_open_content(content, &fence));
+    CHECK(markdown_fence_language(fence.info, "rut"));
+
+    continuation.clear();
+    markdown_remember_list_container(list_container, &continuation);
+    REQUIRE(markdown_strip_container("    ```rut", continuation, &content));
+    REQUIRE(parse_markdown_fence_open_content(content, &fence));
+    CHECK(markdown_fence_language(fence.info, "rut"));
+}
+
 TEST(frontend, language_card_ordered_list_interrupt_requires_start_one) {
     std::vector<MarkdownContainerSegment> container;
     CHECK_EQ(markdown_container_content("1. ~~~~rut", 0, nullptr, &container, false), "~~~~rut");
@@ -892,8 +922,7 @@ TEST(frontend, language_card_nested_interrupting_container_retains_outer_list) {
     std::string_view outer_content;
     REQUIRE(markdown_strip_container("  > ~~~~markdown", outer, &outer_content));
     std::vector<MarkdownContainerSegment> nested;
-    CHECK_EQ(markdown_container_content(outer_content, 0, nullptr, &nested, false),
-             "~~~~markdown");
+    CHECK_EQ(markdown_container_content(outer_content, 0, nullptr, &nested, false), "~~~~markdown");
     REQUIRE_EQ(nested.size(), 1u);
     outer.insert(outer.end(), nested.begin(), nested.end());
     REQUIRE_EQ(outer.size(), 2u);
@@ -1060,6 +1089,8 @@ TEST(frontend, language_card_unmarked_rut_examples_parse_and_typecheck) {
                     }
                     continue;
                 }
+                markdown_remember_list_container(current_fence.container_segments,
+                                                 &continued_list_container);
                 finish_fence();
                 continue;
             }
@@ -1124,6 +1155,7 @@ TEST(frontend, language_card_unmarked_rut_examples_parse_and_typecheck) {
                     continue;
                 }
                 if (markdown_raw_html_closes(raw_html_end, html_content)) {
+                    markdown_remember_list_container(raw_html_container, &continued_list_container);
                     raw_html_end.clear();
                     raw_html_container.clear();
                 }
@@ -1150,10 +1182,10 @@ TEST(frontend, language_card_unmarked_rut_examples_parse_and_typecheck) {
                 paragraph_container.clear();
             }
             bool html_can_interrupt_paragraph = true;
-            const std::string html_end = indented_code
-                                             ? std::string{}
-                                             : markdown_raw_html_end_marker(
-                                                   block_content, &html_can_interrupt_paragraph);
+            const std::string html_end =
+                indented_code
+                    ? std::string{}
+                    : markdown_raw_html_end_marker(block_content, &html_can_interrupt_paragraph);
             if (!html_end.empty() && (!paragraph_open || html_can_interrupt_paragraph)) {
                 REQUIRE_MSG(!pending_skip, "a skip marker must immediately precede a rut fence");
                 const std::string lower = markdown_ascii_lower(block_content);
@@ -1168,19 +1200,18 @@ TEST(frontend, language_card_unmarked_rut_examples_parse_and_typecheck) {
             MarkdownFence opening{};
             const bool is_opening =
                 !indented_code &&
-                (pending_skip
-                     ? parse_markdown_fence_open_in_container(
-                           line, pending_skip_container, &opening)
-                     : parse_markdown_fence_open_content(container_content, &opening));
+                (pending_skip ? parse_markdown_fence_open_in_container(
+                                    line, pending_skip_container, &opening)
+                              : parse_markdown_fence_open_content(container_content, &opening));
             if (is_opening && !pending_skip) {
                 opening.container_segments = line_container;
                 for (const auto& segment : line_container)
                     if (segment.kind == MarkdownContainerSegment::Kind::List)
                         opening.container_indent += segment.continuation_width;
             }
-            REQUIRE_MSG(!is_opening ||
-                            !markdown_fence_language_case_insensitive(opening.info, "swift"),
-                        "language-card language fences must use rut");
+            REQUIRE_MSG(
+                !is_opening || !markdown_fence_language_case_insensitive(opening.info, "swift"),
+                "language-card language fences must use rut");
             if (is_opening) {
                 in_fence = true;
                 paragraph_open = false;
