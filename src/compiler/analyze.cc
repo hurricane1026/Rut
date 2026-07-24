@@ -22520,6 +22520,13 @@ static FrontendResult<HirModule*> analyze_file_internal(
                 route_decl.span,
                 lit_str("Response.body reads in conditional value branches are not supported"));
 
+        // Deferred terminal JSON values are rooted by route-expression
+        // indices. Snapshot all pre-after reads now, before inlining chain
+        // arguments/effects into the same arena.
+        bool response_field_read_before_chain_after = route_reads_response_field(route);
+        for (u32 ei = 0; ei < route.exprs.len; ei++)
+            response_field_read_before_chain_after |=
+                hir_expr_reads_response_field(route.exprs[ei]);
         bool has_chain_after_response_effects = false;
         bool has_chain_after_response_scalar_effects = false;
         for (u32 ci = 0; ci < route_decl.chains.len; ci++) {
@@ -22546,7 +22553,7 @@ static FrontendResult<HirModule*> analyze_file_internal(
         }
         if (has_chain_after_response_effects) {
             if (has_chain_after_response_scalar_effects) {
-                if (route_reads_response_field(route))
+                if (response_field_read_before_chain_after)
                     return frontend_error(
                         FrontendError::UnsupportedSyntax,
                         route_decl.span,

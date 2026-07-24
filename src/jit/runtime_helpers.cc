@@ -615,10 +615,8 @@ void rut_helper_resp_set_body(void* ctx, const char* body, u32 len) {
         hctx->response_body_mutation_storage = jit::acquire_response_body_mutation_storage();
         if (hctx->response_body_mutation_storage == nullptr) {
             hctx->response_body_pending_overflow = true;
-            hctx->response_body_mutation_overflow = true;
         }
     }
-    hctx->response_body_mutation_overflow = hctx->response_body_pending_overflow;
     hctx->response_body_pending_len = hctx->response_body_pending_overflow ? 0 : len;
     if (!hctx->response_body_pending_overflow && len != 0)
         __builtin_memcpy(hctx->response_body_mutation_storage, body, len);
@@ -670,15 +668,14 @@ void rut_helper_resp_body(
     *out_len = fallback_len;
     if (ctx == nullptr) return;
     auto* hctx = static_cast<jit::HandlerCtx*>(ctx);
-    // Overflow is already a fail-closed terminal condition. Do not expose a
-    // partial or dangling value to later expressions while building that 500.
+    // A pending overflow becomes fail-closed only if this builder is committed.
+    // Do not expose a partial or dangling value to later expressions.
     if (!hctx->response_body_pending_set || hctx->response_body_pending_overflow) return;
     const char* snapshot = jit::snapshot_response_body(
         hctx, hctx->response_body_mutation_storage, hctx->response_body_pending_len);
     if (snapshot == nullptr) {
         hctx->response_body_snapshot_failed = true;
         hctx->response_body_pending_overflow = true;
-        hctx->response_body_mutation_overflow = true;
         return;
     }
     *out_ptr = snapshot;

@@ -2874,6 +2874,9 @@ TEST(jit, response_body_mutation_overflow_fails_closed) {
     TestHandlerCtxFrame frame{};
     static char body[kMaxResponseBodyMutationBytes + 1]{};
     rut_helper_resp_set_body(&frame.ctx, body, sizeof(body));
+    CHECK(frame.ctx.response_body_pending_overflow);
+    CHECK_FALSE(frame.ctx.response_body_mutation_overflow);
+    rut_helper_resp_commit_body(&frame.ctx);
     CHECK(frame.ctx.response_body_mutation_overflow);
 
     const auto terminal = +[](void*, HandlerCtx*, const u8*, u32, void*) -> u64 {
@@ -2895,7 +2898,7 @@ TEST(jit, response_body_snapshot_failure_remains_sticky_across_assignment) {
     CHECK(frame.ctx.response_body_mutation_overflow);
 }
 
-TEST(jit, response_body_snapshot_failure_publishes_terminal_overflow_immediately) {
+TEST(jit, response_body_snapshot_failure_stays_pending_until_commit) {
     TestHandlerCtxFrame frame{};
     frame.ctx.response_body_pending_set = true;
     frame.ctx.response_body_pending_len = 1;
@@ -2905,6 +2908,8 @@ TEST(jit, response_body_snapshot_failure_publishes_terminal_overflow_immediately
     rut_helper_resp_body(&frame.ctx, "fallback", 8, &out_ptr, &out_len);
     CHECK(frame.ctx.response_body_snapshot_failed);
     CHECK(frame.ctx.response_body_pending_overflow);
+    CHECK_FALSE(frame.ctx.response_body_mutation_overflow);
+    rut_helper_resp_commit_body(&frame.ctx);
     CHECK(frame.ctx.response_body_mutation_overflow);
 }
 
@@ -2930,7 +2935,8 @@ TEST(jit, valid_response_body_replacement_clears_pending_overflow) {
     TestHandlerCtxFrame frame{};
     static char oversized[kMaxResponseBodyMutationBytes + 1]{};
     rut_helper_resp_set_body(&frame.ctx, oversized, sizeof(oversized));
-    REQUIRE(frame.ctx.response_body_mutation_overflow);
+    REQUIRE(frame.ctx.response_body_pending_overflow);
+    CHECK_FALSE(frame.ctx.response_body_mutation_overflow);
     static constexpr char kBody[] = "ok";
     rut_helper_resp_set_body(&frame.ctx, kBody, sizeof(kBody) - 1);
     CHECK_FALSE(frame.ctx.response_body_pending_overflow);
