@@ -11872,6 +11872,11 @@ static FrontendResult<HirTerminator> analyze_term(const AstStatement& stmt,
                             FrontendError::UnsupportedSyntax,
                             stmt.expr.span,
                             lit_str("json cannot capture wait-result state after a wait"));
+                    if (route->waits.len != 0) {
+                        auto marked = mark_json_expr_locals_for_wait_rematerialization(
+                            *route, body.value(), stmt.expr.span);
+                        if (!marked) return core::make_unexpected(marked.error());
+                    }
                     if (body->kind == HirExprKind::JsonBuild && body->field_inits.len == 0) {
                         term.response_body = body->str_value;
                     } else if (body->kind == HirExprKind::JsonBuild) {
@@ -11904,11 +11909,6 @@ static FrontendResult<HirTerminator> analyze_term(const AstStatement& stmt,
                         // not only a direct JsonBuild. Materialize that plan into
                         // a captured Str at this selected sink, then stream the
                         // captured document as the dynamic response body.
-                        if (route->waits.len != 0) {
-                            auto marked = mark_json_expr_locals_for_wait_rematerialization(
-                                *route, body.value(), stmt.expr.span);
-                            if (!marked) return core::make_unexpected(marked.error());
-                        }
                         if (!route->exprs.push(body.value()))
                             return frontend_error(FrontendError::TooManyItems, stmt.expr.span);
                         term.json_body_expr_index = route->exprs.len - 1;

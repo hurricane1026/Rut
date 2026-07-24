@@ -35108,6 +35108,35 @@ route GET "/x" {
     rir.destroy();
 }
 
+TEST(frontend, helper_returned_json_build_persists_across_wait) {
+    const char* src = R"rut(
+func make(path: str) -> Json => json({ path: path })
+route GET "/x" {
+    wait(5)
+    return 200, make(req.path)
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    bool rematerializes_call_arg = false;
+    for (u32 i = 0; i < hir->routes[0].locals.len; i++) {
+        const auto& local = hir->routes[0].locals[i];
+        if (local.name.eq(lit("$call_arg")) && local.rematerialize_after_wait)
+            rematerializes_call_arg = true;
+    }
+    CHECK(rematerializes_call_arg);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    REQUIRE(lower_to_rir(mir.value(), rir));
+    CHECK(rir::verify_module(rir.module).ok);
+    rir.destroy();
+}
+
 TEST(frontend, reusable_json_local_assigned_to_response_body_persists_across_wait) {
     const char* src = R"rut(
 route GET "/x" {
