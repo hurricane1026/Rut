@@ -7104,6 +7104,57 @@ route GET "/x" use chain rewrite_response { return 200 }
     rir.destroy();
 }
 
+TEST(frontend, chain_after_materializes_scalar_dependencies_before_json_locals) {
+    const char* src = R"rut(
+func rewrite(_ resp: Response) -> i32 {
+    resp.set("X", "old")
+    let before = resp.header("X").or("missing")
+    resp.set("X", "new")
+    let payload = json({ value: before })
+    resp.body = payload
+    0
+}
+chain rewrite_response { after rewrite(resp) }
+route GET "/x" use chain rewrite_response { return 200 }
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    REQUIRE(lower_to_rir(mir.value(), rir));
+    const auto& block = rir.module.functions[0].blocks[0];
+    u32 first_set = 0xffffffffu;
+    u32 response_read = 0xffffffffu;
+    u32 second_set = 0xffffffffu;
+    u32 capture = 0xffffffffu;
+    for (u32 ii = 0; ii < block.inst_count; ii++) {
+        const auto op = block.insts[ii].op;
+        if (op == rir::Opcode::RespSetHeader) {
+            if (first_set == 0xffffffffu)
+                first_set = ii;
+            else if (second_set == 0xffffffffu)
+                second_set = ii;
+        } else if (op == rir::Opcode::RespHeader && response_read == 0xffffffffu) {
+            response_read = ii;
+        } else if (op == rir::Opcode::JsonCapture && capture == 0xffffffffu) {
+            capture = ii;
+        }
+    }
+    REQUIRE_NE(first_set, 0xffffffffu);
+    REQUIRE_NE(response_read, 0xffffffffu);
+    REQUIRE_NE(second_set, 0xffffffffu);
+    REQUIRE_NE(capture, 0xffffffffu);
+    CHECK(first_set < response_read);
+    CHECK(response_read < second_set);
+    CHECK(second_set < capture);
+    rir.destroy();
+}
+
 TEST(frontend, chain_after_commits_response_effects_before_forward) {
     const char* src = R"rut(
 upstream api at "127.0.0.1:9000"
@@ -32577,6 +32628,88 @@ route GET "/x" {
     CHECK_NE(term.json_body_expr_index, 0xffffffffu);
     CHECK_EQ(term.json_value_ref_indices.len, 0u);
     CHECK_EQ(term.json_segments.len, 0u);
+}
+
+TEST(frontend, ordinary_helpers_materialize_named_json_locals) {
+    const char* src = R"rut(
+func make() -> Json {
+    let payload = json({ ok: true })
+    payload
+}
+route GET "/x" { return 200, make() }
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    REQUIRE(lower_to_rir(mir.value(), rir));
+    CHECK(rir::verify_module(rir.module).ok);
+    rir.destroy();
+}
+
+TEST(frontend, helper_respond_guards_reject_expression_bodies) {
+    const char* src = R"rut(
+func check(ok: bool) -> i32 {
+    guard ok else { respond 401, json({ message: "bad" }) }
+    1
+}
+route GET "/x" { let value = check(req.http11) return 200 }
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE_FALSE(hir.has_value());
+    CHECK(hir.error().detail.eq(lit("helper respond guards do not support expression bodies")));
+}
+
+TEST(frontend, direct_json_response_fast_path_respects_shadowing) {
+    const char* src = R"rut(
+func json(value: bool) -> str => "shadow"
+route GET "/x" { return 200, json(true) }
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE_FALSE(hir.has_value());
+    CHECK(hir.error().detail.eq(
+        lit("return body expressions require json(...) with a supported literal or declared "
+            "struct value")));
+}
+
+TEST(frontend, scoped_json_locals_materialize_only_in_selected_blocks) {
+    const char* src = R"rut(
+route GET "/x" {
+    guard req.http11 else {
+        let payload = json({ path: req.path })
+        return 400, payload
+    }
+    return 200
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    for (u32 li = 0; li < mir->functions[0].locals.len; li++)
+        CHECK_NE(mir->functions[0].locals[li].type, MirTypeKind::Json);
+    FrontendRirModule rir{};
+    REQUIRE(lower_to_rir(mir.value(), rir));
+    for (u32 ii = 0; ii < rir.module.functions[0].blocks[0].inst_count; ii++)
+        CHECK_NE(rir.module.functions[0].blocks[0].insts[ii].op, rir::Opcode::JsonCapture);
+    rir.destroy();
 }
 
 TEST(frontend, response_body_accepts_reusable_json_and_rejects_other_values) {

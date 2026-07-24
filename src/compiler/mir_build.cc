@@ -1269,7 +1269,6 @@ FrontendResult<MirModule*> build_mir(const HirModule& module) {
             // side effect itself.
             if (module.routes[i].locals[li].name.len == 0 &&
                 !module.routes[i].locals[li].materialize_on_resume &&
-                module.routes[i].locals[li].type != HirTypeKind::Json &&
                 module.routes[i].locals[li].init.kind != HirExprKind::CacheSet &&
                 module.routes[i].locals[li].init.kind != HirExprKind::ReqSetHeader &&
                 module.routes[i].locals[li].init.kind != HirExprKind::ReqAddHeader &&
