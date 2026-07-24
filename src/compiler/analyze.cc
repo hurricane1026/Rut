@@ -4077,6 +4077,9 @@ static bool hir_expr_reads_wait_result_with_locals(const HirExpr& expr,
                                                    const HirLocal* locals,
                                                    u32 local_count,
                                                    u32 depth = 0);
+static FrontendResult<void> mark_json_expr_locals_for_wait_rematerialization(HirRoute& route,
+                                                                             const HirExpr& expr,
+                                                                             Span span);
 static bool is_static_for_iter_expr(const HirExpr& expr,
                                     const HirLocal* locals,
                                     u32 local_count,
@@ -7651,6 +7654,11 @@ static FrontendResult<HirExpr> analyze_expr_impl(const AstExpr& expr,
             return frontend_error(FrontendError::UnsupportedSyntax,
                                   expr.rhs->span,
                                   lit_str("json cannot capture wait-result state after a wait"));
+        if (set_body && value->type == HirTypeKind::Json && route->waits.len != 0) {
+            auto marked = mark_json_expr_locals_for_wait_rematerialization(
+                *route, value.value(), expr.rhs->span);
+            if (!marked) return core::make_unexpected(marked.error());
+        }
         if (set_status && value->kind == HirExprKind::IntLit &&
             (value->int_value < 100 || value->int_value > 599))
             return frontend_error(FrontendError::InvalidStatusCode, expr.rhs->span);
@@ -11897,47 +11905,9 @@ static FrontendResult<HirTerminator> analyze_term(const AstStatement& stmt,
                         // a captured Str at this selected sink, then stream the
                         // captured document as the dynamic response body.
                         if (route->waits.len != 0) {
-                            bool retained[HirRoute::kMaxLocals]{};
-                            for (u32 li = 0; li < route->locals.len; li++)
-                                retained[li] =
-                                    expr_reads_local_ref(body.value(), route->locals[li].ref_index);
-                            bool changed = true;
-                            while (changed) {
-                                changed = false;
-                                for (u32 li = 0; li < route->locals.len; li++) {
-                                    if (!retained[li]) continue;
-                                    for (u32 dep = 0; dep < route->locals.len; dep++) {
-                                        if (retained[dep] ||
-                                            !expr_reads_local_ref(route->locals[li].init,
-                                                                  route->locals[dep].ref_index))
-                                            continue;
-                                        retained[dep] = true;
-                                        changed = true;
-                                    }
-                                }
-                            }
-                            for (u32 li = 0; li < route->locals.len; li++) {
-                                if (retained[li] &&
-                                    hir_expr_reads_response_snapshot(route->locals[li].init))
-                                    return frontend_error(
-                                        FrontendError::UnsupportedSyntax,
-                                        stmt.expr.span,
-                                        lit_str("json cannot preserve Response field snapshots "
-                                                "across a wait"));
-                                bool has_receive_wait = false;
-                                for (u32 wi = 0; wi < route->waits.len; wi++)
-                                    has_receive_wait |=
-                                        (route->waits[wi].arm_mask & kWaitEventArmRecv) != 0;
-                                if (retained[li] && has_receive_wait &&
-                                    hir_expr_reads_request_body_snapshot(route->locals[li].init))
-                                    return frontend_error(
-                                        FrontendError::UnsupportedSyntax,
-                                        stmt.expr.span,
-                                        lit_str("json cannot preserve request-body snapshots "
-                                                "across a receive wait"));
-                                if (retained[li] && !route->locals[li].materialize_on_resume)
-                                    route->locals[li].rematerialize_after_wait = true;
-                            }
+                            auto marked = mark_json_expr_locals_for_wait_rematerialization(
+                                *route, body.value(), stmt.expr.span);
+                            if (!marked) return core::make_unexpected(marked.error());
                         }
                         if (!route->exprs.push(body.value()))
                             return frontend_error(FrontendError::TooManyItems, stmt.expr.span);
@@ -12052,6 +12022,47 @@ static bool hir_expr_reads_request_body_snapshot(const HirExpr& expr) {
             return true;
     }
     return false;
+}
+
+static FrontendResult<void> mark_json_expr_locals_for_wait_rematerialization(HirRoute& route,
+                                                                             const HirExpr& expr,
+                                                                             Span span) {
+    bool retained[HirRoute::kMaxLocals]{};
+    for (u32 li = 0; li < route.locals.len; li++)
+        retained[li] = expr_reads_local_ref(expr, route.locals[li].ref_index);
+    bool changed = true;
+    while (changed) {
+        changed = false;
+        for (u32 li = 0; li < route.locals.len; li++) {
+            if (!retained[li]) continue;
+            for (u32 dep = 0; dep < route.locals.len; dep++) {
+                if (retained[dep] ||
+                    !expr_reads_local_ref(route.locals[li].init, route.locals[dep].ref_index))
+                    continue;
+                retained[dep] = true;
+                changed = true;
+            }
+        }
+    }
+    bool has_receive_wait = false;
+    for (u32 wi = 0; wi < route.waits.len; wi++)
+        has_receive_wait |= (route.waits[wi].arm_mask & kWaitEventArmRecv) != 0;
+    for (u32 li = 0; li < route.locals.len; li++) {
+        if (retained[li] && hir_expr_reads_response_snapshot(route.locals[li].init))
+            return frontend_error(FrontendError::UnsupportedSyntax,
+                                  span,
+                                  lit_str("json cannot preserve Response field snapshots across "
+                                          "a wait"));
+        if (retained[li] && has_receive_wait &&
+            hir_expr_reads_request_body_snapshot(route.locals[li].init))
+            return frontend_error(
+                FrontendError::UnsupportedSyntax,
+                span,
+                lit_str("json cannot preserve request-body snapshots across a receive wait"));
+        if (retained[li] && !route.locals[li].materialize_on_resume)
+            route.locals[li].rematerialize_after_wait = true;
+    }
+    return {};
 }
 
 static bool terminator_reads_local_ref(const HirTerminator& term,
