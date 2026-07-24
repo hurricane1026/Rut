@@ -10356,9 +10356,10 @@ static FrontendResult<HirTerminator> analyze_term(const AstStatement& stmt,
                         if (expr_index >= route->exprs.len)
                             return frontend_error(FrontendError::UnsupportedSyntax, stmt.expr.span);
                         const auto type = route->exprs[expr_index].type;
-                        const u32 encoded_minimum = type == HirTypeKind::Bool  ? 4u
-                                                    : type == HirTypeKind::Str ? 2u
-                                                                               : 1u;
+                        const u32 encoded_minimum = type == HirTypeKind::Bool      ? 4u
+                                                    : type == HirTypeKind::Str     ? 2u
+                                                    : type == HirTypeKind::StrList ? 2u
+                                                                                   : 1u;
                         if (encoded_minimum > kJsonResponseScratchCapacity - minimum_bytes)
                             return frontend_error(FrontendError::TooManyItems, stmt.expr.span);
                         minimum_bytes += encoded_minimum;
