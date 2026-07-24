@@ -531,6 +531,10 @@ public:
                 retry_deferred_accepts();
             }
             poll_command();
+            // Publish owner-shard memory gauges after every completed event
+            // batch. A process-wide control-plane snapshot may aggregate this
+            // shard while another shard executes the handler.
+            refresh_control_plane_memory_metrics(this);
             // Close listen fd after dispatching the current batch so any
             // already-queued accepts (epoll backlog) get a proper response
             // with Connection: close, rather than being dropped/reset.

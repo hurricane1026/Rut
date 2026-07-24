@@ -243,6 +243,44 @@ TEST(aggregate, handler_snapshot_refreshes_runtime_memory_gauges) {
     CHECK_EQ(ctx.control_plane.stats.memory_connections_used, 3u);
 }
 
+TEST(aggregate, owner_shards_publish_memory_before_process_snapshot) {
+    struct ArenaProbe {
+        u64 used = 0;
+        u64 space_used() const { return used; }
+    } arenas[2]{{1024}, {2048}};
+    struct PoolProbe {
+        u32 used = 0;
+        u32 free = 0;
+        u32 in_use() const { return used; }
+        u32 available() const { return free; }
+    };
+    struct Loop {
+        ShardMetrics* metrics = nullptr;
+        ArenaProbe* metrics_arena = nullptr;
+        PoolProbe pool{};
+        u32 connections = 0;
+        ShardMetrics* const* all_shard_metrics = nullptr;
+        u32 shard_metrics_count = 0;
+        u32 active_count() const { return connections; }
+    } owners[2];
+    ShardMetrics metrics[2];
+    metrics[0].init();
+    metrics[1].init();
+    ShardMetrics* registry[] = {&metrics[0], &metrics[1]};
+    owners[0] = {&metrics[0], &arenas[0], {3, 5}, 7, registry, 2};
+    owners[1] = {&metrics[1], &arenas[1], {11, 13}, 17, registry, 2};
+    refresh_control_plane_memory_metrics(&owners[0]);
+    refresh_control_plane_memory_metrics(&owners[1]);
+
+    jit::HandlerCtx ctx{};
+    latch_control_plane_snapshot(&owners[0], &ctx);
+    REQUIRE(ctx.control_plane.valid);
+    CHECK_EQ(ctx.control_plane.metrics.memory_arena_used, 3072u);
+    CHECK_EQ(ctx.control_plane.metrics.memory_slices_used, 14u);
+    CHECK_EQ(ctx.control_plane.metrics.memory_slices_free, 18u);
+    CHECK_EQ(ctx.control_plane.metrics.memory_connections_used, 24u);
+}
+
 // === Callback + proxy integration ===
 
 // Fixture: SmallLoop with ShardMetrics wired. Provides helpers for
