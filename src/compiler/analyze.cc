@@ -23953,6 +23953,9 @@ static FrontendResult<HirModule*> analyze_file_internal(
             }
             for (u32 fi = 0; fi < route.for_loops.len; fi++) {
                 auto& body = route.for_loops[fi].body;
+                auto mark_loop_branch = [&](HirForLoopBranch& branch) {
+                    if (branch.kind == HirForLoopBranch::Kind::Term) mark_commit(branch.term);
+                };
                 if (body.term.span.end != 0) mark_commit(body.term);
                 for (u32 gi = 0; gi < body.guards.len; gi++) mark_guard_commit(body.guards[gi]);
                 for (u32 ii = 0; ii < body.ifs.len; ii++) {
