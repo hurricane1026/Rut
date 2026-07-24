@@ -579,8 +579,9 @@ TEST(metrics_endpoint, serves_prometheus_exposition) {
     m.init();
     loop->metrics = &m;
     ShardMetrics* reg[1] = {&m};
-    loop->all_shard_metrics = reg;  // enable the endpoint
+    loop->all_shard_metrics = reg;
     loop->shard_metrics_count = 1;
+    loop->metrics_endpoint_enabled = true;
 
     LoopThread lt = {loop, {}, 100};
     lt.start();
@@ -1471,8 +1472,15 @@ TEST(timer_dsl, rejects_more_than_max_timers) {
 // A captureless probe used as a timer handler: the event loop should invoke it
 // each time the timer's interval elapses.
 static rut::u32 g_timer_probe_calls = 0;
+static rut::jit::ControlPlaneSnapshot g_timer_snapshot{};
 static rut::u64 timer_probe_fn(void*, rut::jit::HandlerCtx*, const rut::u8*, rut::u32, void*) {
     g_timer_probe_calls++;
+    return 0;
+}
+
+static rut::u64 timer_snapshot_probe_fn(
+    void*, rut::jit::HandlerCtx* ctx, const rut::u8*, rut::u32, void*) {
+    g_timer_snapshot = ctx->control_plane;
     return 0;
 }
 
@@ -1538,6 +1546,41 @@ TEST(timer, event_loop_fires_due_timer) {
     loop->fire_due_timers();  // now due → fire
     CHECK_GE(loop->timer_fire_count[0], 1u);
     CHECK_GE(g_timer_probe_calls, 1u);
+}
+
+TEST(timer, control_plane_snapshot_is_latched_before_timer_handler) {
+    using namespace rut;
+    RouteConfig cfg{};
+    REQUIRE(cfg.add_timer("t",
+                          1,
+                          /*interval_ms=*/1,
+                          &timer_snapshot_probe_fn,
+                          /*shard=*/-1,
+                          /*needs_control_plane_snapshot=*/true));
+    auto loop = std::make_unique<EpollEventLoop>();
+    const RouteConfig* active = &cfg;
+    loop->config_ptr = &active;
+    loop->shard_id = 4;
+    ShardMetrics local;
+    ShardMetrics other;
+    local.init();
+    other.init();
+    local.requests_total = 7;
+    other.requests_total = 9;
+    ShardMetrics* registry[] = {&local, &other};
+    loop->metrics = &local;
+    loop->all_shard_metrics = registry;
+    loop->shard_metrics_count = 2;
+    g_timer_snapshot = {};
+
+    loop->fire_due_timers();
+    usleep(5000);
+    loop->fire_due_timers();
+    REQUIRE(g_timer_snapshot.valid);
+    CHECK_EQ(g_timer_snapshot.shard_id, 4u);
+    CHECK_EQ(g_timer_snapshot.shard_count, 2u);
+    CHECK_EQ(g_timer_snapshot.stats.requests_total, 7u);
+    CHECK_EQ(g_timer_snapshot.metrics.requests_total, 16u);
 }
 
 TEST(timer, event_loop_releases_response_body_storage_after_firing) {
@@ -9634,6 +9677,8 @@ struct ScriptedUpstreamServer {
     std::atomic<bool> running{false};
     bool started = false;
     pthread_t thread{};
+    char request[1024]{};
+    u32 request_len = 0;
 
     ~ScriptedUpstreamServer() { teardown(); }
 
@@ -9656,8 +9701,9 @@ struct ScriptedUpstreamServer {
         }
         if (client >= 0) {
             if (set_blocking(client)) {
-                char req[1024];
-                (void)recv_timeout(client, req, sizeof(req), 1000);
+                const i32 got =
+                    recv_timeout(client, server->request, sizeof(server->request), 1000);
+                if (got > 0) server->request_len = static_cast<u32>(got);
                 if (server->response != nullptr && server->response_len > 0) {
                     (void)send_all(client, server->response, server->response_len);
                 }
@@ -9745,6 +9791,90 @@ func rewrite(_ resp: Response) -> i32 {
 }
 chain rewrite_chain { after rewrite(resp) }
 route GET "/api" use chain rewrite_chain { wait(1) return forward(api, buffered: true) }
+)rut";
+
+static constexpr const char kBufferedForwardExpressionSource[] = R"rut(
+upstream api
+route GET "/capture" {
+    let resp = forward(api, buffered: true)
+    resp.status = resp.status + 1
+    resp.body = resp.body
+    resp.set("X-Captured", resp.header("X-Origin").or("missing"))
+    wait(1)
+    return resp
+}
+)rut";
+
+static constexpr const char kBufferedForwardRequestResumeSource[] = R"rut(
+upstream api
+route GET "/capture" {
+    let resp = forward(api, buffered: true)
+    resp.set("X-Path", req.path)
+    return resp
+}
+)rut";
+
+static constexpr const char kBufferedForwardDiscardSource[] = R"rut(
+upstream api
+route GET "/capture" {
+    let resp = forward(api, buffered: true)
+    return 404
+}
+)rut";
+
+static constexpr const char kBufferedForwardReturnSource[] = R"rut(
+upstream api
+route GET "/capture" {
+    let resp = forward(api, buffered: true)
+    return resp
+}
+)rut";
+
+static constexpr const char kBufferedForwardAgainSource[] = R"rut(
+upstream first
+upstream second
+route GET "/capture" {
+    let resp = forward(first, buffered: true)
+    return forward(second, set_path: "/rewritten")
+}
+)rut";
+
+static constexpr const char kBufferedHeadReturnSource[] = R"rut(
+upstream api
+route HEAD "/capture" {
+    let resp = forward(api, buffered: true)
+    return resp
+}
+)rut";
+
+static constexpr const char kBufferedHeadHeaderlessBodyMutationSource[] = R"rut(
+upstream api
+route HEAD "/capture" {
+    let resp = forward(api, buffered: true)
+    resp.body = "mutated"
+    return resp
+}
+)rut";
+
+static constexpr const char kBufferedBodylessReturnSource[] = R"rut(
+upstream api
+route GET "/capture" {
+    let resp = forward(api, buffered: true)
+    resp.status = 204
+    return resp
+}
+)rut";
+
+static constexpr const char kDynamicJsonTransportSource[] = R"rut(
+route GET "/json" {
+    let quoted = any(req.header("X-Value"), "")
+    let items = [req.path, quoted]
+    return 200, json({ path: req.path, items: items })
+}
+)rut";
+
+static constexpr const char kControlPlaneSnapshotSource[] = R"rut(
+route GET "/stats" { wait(1) return 200, json(stats()) }
 )rut";
 #endif
 
@@ -10222,6 +10352,198 @@ TEST(proxy_reuse, force_close_all_closes_deferred_idle_fd_iouring) {
 }
 
 #if RUT_ENABLE_JIT_TESTS
+TEST(shard, dynamic_json_bytes_are_exact_over_http1) {
+    CompiledRutRoute compiled;
+    REQUIRE(compiled.compile(kDynamicJsonTransportSource));
+
+    RouteConfig cfg;
+    REQUIRE(cfg.add_jit_handler("/json", 'G', compiled.handler));
+    Shard<EpollEventLoop> shard;
+    i32 lfd = create_listen_socket(0).value_or(-1);
+    REQUIRE(lfd >= 0);
+    const u16 port = get_port(lfd);
+    REQUIRE(shard.init(0, lfd).has_value());
+    shard.route_config = &cfg;
+    REQUIRE(shard.spawn(-1).has_value());
+    usleep(50000);
+
+    i32 client = connect_to(port);
+    REQUIRE(client >= 0);
+    set_socket_timeouts(client, 2);
+    static const char kReq[] =
+        "GET /json HTTP/1.1\r\nHost: test\r\nX-Value: a\"b\r\nConnection: close\r\n\r\n";
+    REQUIRE(write_all_fd(client, reinterpret_cast<const u8*>(kReq), sizeof(kReq) - 1));
+    char response[2048];
+    u32 total = 0;
+    while (total < sizeof(response)) {
+        const i32 got = recv_timeout(client, response + total, sizeof(response) - total, 2000);
+        if (got <= 0) break;
+        total += static_cast<u32>(got);
+    }
+    static constexpr char kExpected[] = R"json({"path":"/json","items":["/json","a\"b"]})json";
+    CHECK(buf_contains(response, total, "HTTP/1.1 200", 12));
+    CHECK(buf_contains(response, total, "Content-Length: 41\r\n", 20));
+    CHECK(buf_contains(response, total, kExpected, sizeof(kExpected) - 1));
+
+    close(client);
+    shard.stop();
+    shard.join();
+    shard.shutdown();
+    close(lfd);
+}
+
+TEST(shard, dynamic_json_bytes_are_exact_over_http2) {
+    CompiledRutRoute compiled;
+    REQUIRE(compiled.compile(kDynamicJsonTransportSource));
+
+    RouteConfig cfg;
+    REQUIRE(cfg.add_jit_handler("/json", 'G', compiled.handler));
+    Shard<EpollEventLoop> shard;
+    i32 lfd = create_listen_socket(0).value_or(-1);
+    REQUIRE(lfd >= 0);
+    const u16 port = get_port(lfd);
+    REQUIRE(shard.init(0, lfd).has_value());
+    shard.route_config = &cfg;
+    REQUIRE(shard.spawn(-1).has_value());
+    usleep(50000);
+
+    i32 client = connect_to(port);
+    REQUIRE(client >= 0);
+    set_socket_timeouts(client, 2);
+    const hpack::Header request_headers[] = {
+        {{":method", 7}, {"GET", 3}},
+        {{":scheme", 7}, {"http", 4}},
+        {{":path", 5}, {"/json", 5}},
+        {{":authority", 10}, {"localhost", 9}},
+        {{"x-value", 7}, {"a\"b", 3}},
+    };
+    u8 request[512];
+    u32 request_len = h2_client_prologue(request);
+    request_len += http2_write_headers(
+        request + request_len, sizeof(request) - request_len, 1, request_headers, 5, true);
+    REQUIRE(write_all_fd(client, request, request_len));
+
+    u8 response[4096];
+    u32 total = 0;
+    u8 body[256];
+    u32 body_len = 0;
+    for (u32 attempt = 0; attempt < 10 && total < sizeof(response); attempt++) {
+        const i32 got = recv_timeout(
+            client, reinterpret_cast<char*>(response + total), sizeof(response) - total, 2000);
+        if (got <= 0) break;
+        total += static_cast<u32>(got);
+        body_len = h2_body_for_stream(response, total, 1, body, sizeof(body));
+        if (h2_status_for_stream(response, total, 1) == 200 && body_len != 0) break;
+    }
+    static constexpr char kExpected[] = R"json({"path":"/json","items":["/json","a\"b"]})json";
+    CHECK_EQ(h2_status_for_stream(response, total, 1), 200u);
+    CHECK_EQ(body_len, sizeof(kExpected) - 1);
+    CHECK(body_len == sizeof(kExpected) - 1 &&
+          __builtin_memcmp(body, kExpected, sizeof(kExpected) - 1) == 0);
+
+    close(client);
+    shard.stop();
+    shard.join();
+    shard.shutdown();
+    close(lfd);
+}
+
+TEST(shard, control_plane_snapshot_is_latched_over_http1) {
+    CompiledRutRoute compiled;
+    REQUIRE(compiled.compile(kControlPlaneSnapshotSource));
+    RouteConfig cfg;
+    REQUIRE(cfg.add_jit_handler("/stats",
+                                'G',
+                                compiled.handler,
+                                /*needs_req_body=*/false,
+                                /*needs_control_plane_snapshot=*/true));
+    Shard<EpollEventLoop> shard;
+    i32 lfd = create_listen_socket(0).value_or(-1);
+    REQUIRE(lfd >= 0);
+    const u16 port = get_port(lfd);
+    REQUIRE(shard.init(0, lfd).has_value());
+    shard.route_config = &cfg;
+    REQUIRE(shard.spawn(-1).has_value());
+    usleep(50000);
+
+    i32 client = connect_to(port);
+    REQUIRE(client >= 0);
+    set_socket_timeouts(client, 2);
+    static const char kReq[] = "GET /stats HTTP/1.1\r\nHost: test\r\nConnection: close\r\n\r\n";
+    REQUIRE(write_all_fd(client, reinterpret_cast<const u8*>(kReq), sizeof(kReq) - 1));
+    char response[2048];
+    u32 total = 0;
+    while (total < sizeof(response)) {
+        const i32 got = recv_timeout(client, response + total, sizeof(response) - total, 2000);
+        if (got <= 0) break;
+        total += static_cast<u32>(got);
+    }
+    CHECK(buf_contains(response, total, "HTTP/1.1 200", 12));
+    CHECK(buf_contains(response,
+                       total,
+                       "{\"scope\":\"shard\",\"shard_id\":0,"
+                       "\"shard_count\":1,",
+                       46));
+    CHECK(buf_contains(response, total, "\"requests\":{\"total\":0,\"active\":1", 32));
+
+    close(client);
+    shard.stop();
+    shard.join();
+    shard.shutdown();
+    close(lfd);
+}
+
+TEST(shard, control_plane_snapshot_is_latched_over_http2) {
+    CompiledRutRoute compiled;
+    REQUIRE(compiled.compile(kControlPlaneSnapshotSource));
+    RouteConfig cfg;
+    REQUIRE(cfg.add_jit_handler("/stats",
+                                'G',
+                                compiled.handler,
+                                /*needs_req_body=*/false,
+                                /*needs_control_plane_snapshot=*/true));
+    Shard<EpollEventLoop> shard;
+    i32 lfd = create_listen_socket(0).value_or(-1);
+    REQUIRE(lfd >= 0);
+    const u16 port = get_port(lfd);
+    REQUIRE(shard.init(0, lfd).has_value());
+    shard.route_config = &cfg;
+    REQUIRE(shard.spawn(-1).has_value());
+    usleep(50000);
+
+    i32 client = connect_to(port);
+    REQUIRE(client >= 0);
+    set_socket_timeouts(client, 2);
+    u8 request[512];
+    u32 request_len = h2_client_prologue(request);
+    request_len +=
+        h2_client_get(request + request_len, sizeof(request) - request_len, 1, "/stats", 6);
+    REQUIRE(write_all_fd(client, request, request_len));
+    u8 response[4096];
+    u32 total = 0;
+    u8 body[1024];
+    u32 body_len = 0;
+    for (u32 attempt = 0; attempt < 10 && total < sizeof(response); attempt++) {
+        const i32 got = recv_timeout(
+            client, reinterpret_cast<char*>(response + total), sizeof(response) - total, 2000);
+        if (got <= 0) break;
+        total += static_cast<u32>(got);
+        body_len = h2_body_for_stream(response, total, 1, body, sizeof(body));
+        if (h2_status_for_stream(response, total, 1) == 200 && body_len != 0) break;
+    }
+    CHECK_EQ(h2_status_for_stream(response, total, 1), 200u);
+    CHECK(buf_contains(reinterpret_cast<const char*>(body),
+                       body_len,
+                       "{\"scope\":\"shard\",\"shard_id\":0,\"shard_count\":1,",
+                       46));
+
+    close(client);
+    shard.stop();
+    shard.join();
+    shard.shutdown();
+    close(lfd);
+}
+
 TEST(shard, buffered_jit_forward_applies_response_mutations_over_http1) {
     ScriptedUpstreamServer backend;
     static const char kResp[] =
@@ -10329,6 +10651,719 @@ TEST(shard, buffered_jit_forward_applies_response_mutations_over_http2) {
     CHECK(h2_response_has_header(response, total, 1, "x-origin", "kept"));
     CHECK(h2_response_has_header(response, total, 1, "x-path", "/api"));
     CHECK(!h2_response_has_header(response, total, 1, "x-after", "no"));
+
+    close(client);
+    shard.stop();
+    shard.join();
+    shard.shutdown();
+    close(lfd);
+}
+
+TEST(shard, buffered_forward_expression_owns_fields_across_yield_over_http1) {
+    ScriptedUpstreamServer backend;
+    static const char kResp[] =
+        "HTTP/1.1 206 Partial Content\r\n"
+        "Transfer-Encoding: chunked\r\n"
+        "X-Origin: kept\r\n"
+        "Connection: close\r\n"
+        "\r\n"
+        "3\r\nori\r\n5\r\nginal\r\n0\r\n\r\n";
+    REQUIRE(backend.setup(kResp, sizeof(kResp) - 1));
+    CompiledRutRoute compiled;
+    REQUIRE(compiled.compile(kBufferedForwardExpressionSource));
+
+    RouteConfig cfg;
+    REQUIRE(cfg.add_upstream("api", 0x7F000001, backend.port).has_value());
+    REQUIRE(cfg.add_jit_handler("/capture", 'G', compiled.handler));
+    Shard<EpollEventLoop> shard;
+    i32 lfd = create_listen_socket(0).value_or(-1);
+    REQUIRE(lfd >= 0);
+    const u16 port = get_port(lfd);
+    REQUIRE(shard.init(0, lfd).has_value());
+    shard.route_config = &cfg;
+    REQUIRE(shard.spawn(-1).has_value());
+    usleep(50000);
+
+    i32 client = connect_to(port);
+    REQUIRE(client >= 0);
+    set_socket_timeouts(client, 2);
+    static const char kReq[] = "GET /capture HTTP/1.1\r\nHost: test\r\nConnection: close\r\n\r\n";
+    REQUIRE(write_all_fd(client, reinterpret_cast<const u8*>(kReq), sizeof(kReq) - 1));
+    char response[2048];
+    u32 total = 0;
+    while (total < sizeof(response)) {
+        const i32 got = recv_timeout(client, response + total, sizeof(response) - total, 2000);
+        if (got <= 0) break;
+        total += static_cast<u32>(got);
+        if (buf_contains(response, total, "\r\n\r\noriginal", 12)) break;
+    }
+    CHECK(buf_contains(response, total, "HTTP/1.1 207", 12));
+    CHECK(buf_contains(response, total, "Content-Length: 8\r\n", 19));
+    CHECK(buf_contains(response, total, "X-Origin: kept\r\n", 16));
+    CHECK(buf_contains(response, total, "X-Captured: kept\r\n", 18));
+    CHECK(buf_contains(response, total, "\r\n\r\noriginal", 12));
+
+    close(client);
+    shard.stop();
+    shard.join();
+    shard.shutdown();
+    close(lfd);
+}
+
+TEST(shard, buffered_forward_expression_owns_fields_across_yield_over_http2) {
+    ScriptedUpstreamServer backend;
+    static const char kResp[] =
+        "HTTP/1.1 206 Partial Content\r\n"
+        "Content-Length: 8\r\n"
+        "X-Origin: kept\r\n"
+        "Connection: close\r\n"
+        "\r\n"
+        "original";
+    REQUIRE(backend.setup(kResp, sizeof(kResp) - 1));
+    CompiledRutRoute compiled;
+    REQUIRE(compiled.compile(kBufferedForwardExpressionSource));
+
+    RouteConfig cfg;
+    REQUIRE(cfg.add_upstream("api", 0x7F000001, backend.port).has_value());
+    REQUIRE(cfg.add_jit_handler("/capture", 'G', compiled.handler));
+    Shard<EpollEventLoop> shard;
+    i32 lfd = create_listen_socket(0).value_or(-1);
+    REQUIRE(lfd >= 0);
+    const u16 port = get_port(lfd);
+    REQUIRE(shard.init(0, lfd).has_value());
+    shard.route_config = &cfg;
+    REQUIRE(shard.spawn(-1).has_value());
+    usleep(50000);
+
+    i32 client = connect_to(port);
+    REQUIRE(client >= 0);
+    set_socket_timeouts(client, 2);
+    u8 request[512];
+    u32 request_len = h2_client_prologue(request);
+    request_len +=
+        h2_client_get(request + request_len, sizeof(request) - request_len, 1, "/capture", 8);
+    REQUIRE(write_all_fd(client, request, request_len));
+
+    u8 response[4096];
+    u32 total = 0;
+    u8 body[64];
+    u32 body_len = 0;
+    for (u32 attempt = 0; attempt < 10 && total < sizeof(response); attempt++) {
+        const i32 got = recv_timeout(
+            client, reinterpret_cast<char*>(response + total), sizeof(response) - total, 2000);
+        if (got <= 0) break;
+        total += static_cast<u32>(got);
+        body_len = h2_body_for_stream(response, total, 1, body, sizeof(body));
+        if (h2_status_for_stream(response, total, 1) == 207 && body_len == 8) break;
+    }
+    CHECK_EQ(h2_status_for_stream(response, total, 1), 207u);
+    CHECK_EQ(body_len, 8u);
+    CHECK(body_len == 8 && __builtin_memcmp(body, "original", 8) == 0);
+    CHECK(h2_response_has_header(response, total, 1, "x-origin", "kept"));
+    CHECK(h2_response_has_header(response, total, 1, "x-captured", "kept"));
+
+    close(client);
+    shard.stop();
+    shard.join();
+    shard.shutdown();
+    close(lfd);
+}
+
+TEST(shard, buffered_forward_expression_preserves_http1_request_for_resume) {
+    ScriptedUpstreamServer backend;
+    static const char kResp[] =
+        "HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok";
+    REQUIRE(backend.setup(kResp, sizeof(kResp) - 1));
+    CompiledRutRoute compiled;
+    REQUIRE(compiled.compile(kBufferedForwardRequestResumeSource));
+    RouteConfig cfg;
+    REQUIRE(cfg.add_upstream("api", 0x7F000001, backend.port).has_value());
+    REQUIRE(cfg.add_jit_handler("/capture", 'G', compiled.handler));
+    Shard<EpollEventLoop> shard;
+    i32 lfd = create_listen_socket(0).value_or(-1);
+    REQUIRE(lfd >= 0);
+    const u16 port = get_port(lfd);
+    REQUIRE(shard.init(0, lfd).has_value());
+    shard.route_config = &cfg;
+    REQUIRE(shard.spawn(-1).has_value());
+    usleep(50000);
+    i32 client = connect_to(port);
+    REQUIRE(client >= 0);
+    set_socket_timeouts(client, 2);
+    static const char kReq[] = "GET /capture HTTP/1.1\r\nHost: test\r\nConnection: close\r\n\r\n";
+    REQUIRE(write_all_fd(client, reinterpret_cast<const u8*>(kReq), sizeof(kReq) - 1));
+    char response[2048];
+    u32 total = 0;
+    while (total < sizeof(response)) {
+        const i32 got = recv_timeout(client, response + total, sizeof(response) - total, 2000);
+        if (got <= 0) break;
+        total += static_cast<u32>(got);
+    }
+    CHECK(buf_contains(response, total, "HTTP/1.1 200", 12));
+    CHECK(buf_contains(response, total, "X-Path: /capture\r\n", 18));
+    close(client);
+    shard.stop();
+    shard.join();
+    shard.shutdown();
+    close(lfd);
+}
+
+TEST(shard, buffered_capture_followup_forward_reuses_owned_http1_request) {
+    ScriptedUpstreamServer first;
+    ScriptedUpstreamServer second;
+    static const char kCaptured[] =
+        "HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok";
+    static const char kFinal[] =
+        "HTTP/1.1 202 Accepted\r\nContent-Length: 5\r\nConnection: close\r\n\r\nfinal";
+    REQUIRE(first.setup(kCaptured, sizeof(kCaptured) - 1));
+    REQUIRE(second.setup(kFinal, sizeof(kFinal) - 1));
+    CompiledRutRoute compiled;
+    REQUIRE(compiled.compile(kBufferedForwardAgainSource));
+    RouteConfig cfg;
+    REQUIRE(cfg.add_upstream("first", 0x7F000001, first.port).has_value());
+    REQUIRE(cfg.add_upstream("second", 0x7F000001, second.port).has_value());
+    REQUIRE(cfg.add_jit_handler("/capture", 'G', compiled.handler));
+    Shard<EpollEventLoop> shard;
+    i32 lfd = create_listen_socket(0).value_or(-1);
+    REQUIRE(lfd >= 0);
+    const u16 port = get_port(lfd);
+    REQUIRE(shard.init(0, lfd).has_value());
+    shard.route_config = &cfg;
+    REQUIRE(shard.spawn(-1).has_value());
+    usleep(50000);
+    i32 client = connect_to(port);
+    REQUIRE(client >= 0);
+    set_socket_timeouts(client, 2);
+    static const char kReq[] = "GET /capture HTTP/1.1\r\nHost: test\r\nConnection: close\r\n\r\n";
+    REQUIRE(write_all_fd(client, reinterpret_cast<const u8*>(kReq), sizeof(kReq) - 1));
+    char response[1025];
+    const i32 got = recv_timeout(client, response, sizeof(response) - 1, 2000);
+    REQUIRE(got > 0);
+    response[got] = '\0';
+    CHECK(buf_contains(response, static_cast<u32>(got), "HTTP/1.1 202", 12));
+    close(client);
+    shard.stop();
+    shard.join();
+    shard.shutdown();
+    first.teardown();
+    second.teardown();
+    static const char kRewritten[] =
+        "GET /rewritten HTTP/1.1\r\nHost: test\r\nConnection: close\r\n\r\n";
+    CHECK_EQ(second.request_len, sizeof(kRewritten) - 1);
+    CHECK(second.request_len == sizeof(kRewritten) - 1 &&
+          ::memcmp(second.request, kRewritten, sizeof(kRewritten) - 1) == 0);
+    close(lfd);
+}
+
+TEST(shard, captured_http1_response_preserves_pipelined_request) {
+    ScriptedUpstreamServer backend;
+    static const char kResp[] =
+        "HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok";
+    REQUIRE(backend.setup(kResp, sizeof(kResp) - 1));
+    CompiledRutRoute compiled;
+    REQUIRE(compiled.compile(kBufferedForwardDiscardSource));
+    RouteConfig cfg;
+    REQUIRE(cfg.add_upstream("api", 0x7F000001, backend.port).has_value());
+    REQUIRE(cfg.add_jit_handler("/capture", 'G', compiled.handler));
+    REQUIRE(cfg.add_static("/next", 'G', 204));
+    Shard<EpollEventLoop> shard;
+    i32 lfd = create_listen_socket(0).value_or(-1);
+    REQUIRE(lfd >= 0);
+    const u16 port = get_port(lfd);
+    REQUIRE(shard.init(0, lfd).has_value());
+    shard.route_config = &cfg;
+    REQUIRE(shard.spawn(-1).has_value());
+    usleep(50000);
+    i32 client = connect_to(port);
+    REQUIRE(client >= 0);
+    set_socket_timeouts(client, 2);
+    static const char kReq[] =
+        "GET /capture HTTP/1.1\r\nHost: test\r\n\r\n"
+        "GET /next HTTP/1.1\r\nHost: test\r\nConnection: close\r\n\r\n";
+    REQUIRE(write_all_fd(client, reinterpret_cast<const u8*>(kReq), sizeof(kReq) - 1));
+    char response[2048];
+    u32 total = 0;
+    while (total < sizeof(response)) {
+        const i32 got = recv_timeout(client, response + total, sizeof(response) - total, 2000);
+        if (got <= 0) break;
+        total += static_cast<u32>(got);
+    }
+    CHECK(buf_contains(response, total, "HTTP/1.1 404", 12));
+    CHECK(buf_contains(response, total, "HTTP/1.1 204", 12));
+    close(client);
+    shard.stop();
+    shard.join();
+    shard.shutdown();
+    close(lfd);
+}
+
+TEST(shard, captured_http1_head_preserves_representation_length) {
+    ScriptedUpstreamServer backend;
+    static const char kResp[] =
+        "HTTP/1.1 200 OK\r\nContent-Length: 123\r\nConnection: close\r\n\r\n";
+    REQUIRE(backend.setup(kResp, sizeof(kResp) - 1));
+    CompiledRutRoute compiled;
+    REQUIRE(compiled.compile(kBufferedHeadReturnSource));
+    RouteConfig cfg;
+    REQUIRE(cfg.add_upstream("api", 0x7F000001, backend.port).has_value());
+    REQUIRE(cfg.add_jit_handler("/capture", 'H', compiled.handler));
+    Shard<EpollEventLoop> shard;
+    i32 lfd = create_listen_socket(0).value_or(-1);
+    REQUIRE(lfd >= 0);
+    const u16 port = get_port(lfd);
+    REQUIRE(shard.init(0, lfd).has_value());
+    shard.route_config = &cfg;
+    REQUIRE(shard.spawn(-1).has_value());
+    usleep(50000);
+    i32 client = connect_to(port);
+    REQUIRE(client >= 0);
+    set_socket_timeouts(client, 2);
+    static const char kReq[] = "HEAD /capture HTTP/1.1\r\nHost: test\r\nConnection: close\r\n\r\n";
+    REQUIRE(write_all_fd(client, reinterpret_cast<const u8*>(kReq), sizeof(kReq) - 1));
+    char response[1025];
+    const i32 got = recv_timeout(client, response, sizeof(response) - 1, 2000);
+    REQUIRE(got > 0);
+    response[got] = '\0';
+    CHECK(buf_contains(response, static_cast<u32>(got), "HTTP/1.1 200", 12));
+    CHECK(buf_contains(response, static_cast<u32>(got), "Content-Length: 123\r\n", 21));
+    const char* end = ::strstr(response, "\r\n\r\n");
+    REQUIRE(end != nullptr);
+    CHECK_EQ(static_cast<u32>(end + 4 - response), static_cast<u32>(got));
+    close(client);
+    shard.stop();
+    shard.join();
+    shard.shutdown();
+    close(lfd);
+}
+
+TEST(shard, captured_http1_head_suppresses_mutated_body_without_headers) {
+    ScriptedUpstreamServer backend;
+    static const char kResp[] = "HTTP/1.1 200 OK\r\nConnection: close\r\n\r\n";
+    REQUIRE(backend.setup(kResp, sizeof(kResp) - 1));
+    CompiledRutRoute compiled;
+    REQUIRE(compiled.compile(kBufferedHeadHeaderlessBodyMutationSource));
+    RouteConfig cfg;
+    REQUIRE(cfg.add_upstream("api", 0x7F000001, backend.port).has_value());
+    REQUIRE(cfg.add_jit_handler("/capture", 'H', compiled.handler));
+    Shard<EpollEventLoop> shard;
+    i32 lfd = create_listen_socket(0).value_or(-1);
+    REQUIRE(lfd >= 0);
+    const u16 port = get_port(lfd);
+    REQUIRE(shard.init(0, lfd).has_value());
+    shard.route_config = &cfg;
+    REQUIRE(shard.spawn(-1).has_value());
+    usleep(50000);
+    i32 client = connect_to(port);
+    REQUIRE(client >= 0);
+    set_socket_timeouts(client, 2);
+    static const char kReq[] = "HEAD /capture HTTP/1.1\r\nHost: test\r\nConnection: close\r\n\r\n";
+    REQUIRE(write_all_fd(client, reinterpret_cast<const u8*>(kReq), sizeof(kReq) - 1));
+    char response[1025];
+    const i32 got = recv_timeout(client, response, sizeof(response) - 1, 2000);
+    REQUIRE(got > 0);
+    response[got] = '\0';
+    CHECK(buf_contains(response, static_cast<u32>(got), "HTTP/1.1 200", 12));
+    CHECK(buf_contains(response, static_cast<u32>(got), "Content-Length: 7\r\n", 19));
+    const char* end = ::strstr(response, "\r\n\r\n");
+    REQUIRE(end != nullptr);
+    CHECK_EQ(static_cast<u32>(end + 4 - response), static_cast<u32>(got));
+    close(client);
+    shard.stop();
+    shard.join();
+    shard.shutdown();
+    close(lfd);
+}
+
+TEST(shard, captured_http2_head_suppresses_mutated_body) {
+    ScriptedUpstreamServer backend;
+    static const char kResp[] =
+        "HTTP/1.1 200 OK\r\nContent-Length: 3\r\nConnection: close\r\n\r\nold";
+    REQUIRE(backend.setup(kResp, sizeof(kResp) - 1));
+    CompiledRutRoute compiled;
+    REQUIRE(compiled.compile(kBufferedHeadHeaderlessBodyMutationSource));
+    RouteConfig cfg;
+    REQUIRE(cfg.add_upstream("api", 0x7F000001, backend.port).has_value());
+    REQUIRE(cfg.add_jit_handler("/capture", 'H', compiled.handler));
+    Shard<EpollEventLoop> shard;
+    i32 lfd = create_listen_socket(0).value_or(-1);
+    REQUIRE(lfd >= 0);
+    const u16 port = get_port(lfd);
+    REQUIRE(shard.init(0, lfd).has_value());
+    shard.route_config = &cfg;
+    REQUIRE(shard.spawn(-1).has_value());
+    usleep(50000);
+    i32 client = connect_to(port);
+    REQUIRE(client >= 0);
+    set_socket_timeouts(client, 2);
+    u8 request[512];
+    u32 request_len = h2_client_prologue(request);
+    const hpack::Header headers[] = {
+        {{":method", 7}, {"HEAD", 4}},
+        {{":scheme", 7}, {"http", 4}},
+        {{":path", 5}, {"/capture", 8}},
+        {{":authority", 10}, {"localhost", 9}},
+    };
+    request_len += http2_write_headers(
+        request + request_len, sizeof(request) - request_len, 1, headers, 4, true);
+    REQUIRE(write_all_fd(client, request, request_len));
+    u8 response[4096];
+    u32 total = 0;
+    for (u32 attempt = 0; attempt < 10 && total < sizeof(response); attempt++) {
+        const i32 got = recv_timeout(
+            client, reinterpret_cast<char*>(response + total), sizeof(response) - total, 2000);
+        if (got <= 0) break;
+        total += static_cast<u32>(got);
+        if (h2_status_for_stream(response, total, 1) != 0) break;
+    }
+    u8 body[16];
+    CHECK_EQ(h2_status_for_stream(response, total, 1), 200u);
+    CHECK_EQ(h2_body_for_stream(response, total, 1, body, sizeof(body)), 0u);
+    close(client);
+    shard.stop();
+    shard.join();
+    shard.shutdown();
+    close(lfd);
+}
+
+TEST(shard, discarded_buffered_capture_does_not_override_http1_literal_response) {
+    ScriptedUpstreamServer backend;
+    static const char kResp[] =
+        "HTTP/1.1 200 OK\r\nContent-Length: 8\r\nX-Origin: leaked\r\nConnection: "
+        "close\r\n\r\noriginal";
+    REQUIRE(backend.setup(kResp, sizeof(kResp) - 1));
+    CompiledRutRoute compiled;
+    REQUIRE(compiled.compile(kBufferedForwardDiscardSource));
+    RouteConfig cfg;
+    REQUIRE(cfg.add_upstream("api", 0x7F000001, backend.port).has_value());
+    REQUIRE(cfg.add_jit_handler("/capture", 'G', compiled.handler));
+    Shard<EpollEventLoop> shard;
+    i32 lfd = create_listen_socket(0).value_or(-1);
+    REQUIRE(lfd >= 0);
+    const u16 port = get_port(lfd);
+    REQUIRE(shard.init(0, lfd).has_value());
+    shard.route_config = &cfg;
+    REQUIRE(shard.spawn(-1).has_value());
+    usleep(50000);
+    i32 client = connect_to(port);
+    REQUIRE(client >= 0);
+    set_socket_timeouts(client, 2);
+    static const char kReq[] = "GET /capture HTTP/1.1\r\nHost: test\r\nConnection: close\r\n\r\n";
+    REQUIRE(write_all_fd(client, reinterpret_cast<const u8*>(kReq), sizeof(kReq) - 1));
+    char response[2048];
+    u32 total = 0;
+    while (total < sizeof(response)) {
+        const i32 got = recv_timeout(client, response + total, sizeof(response) - total, 2000);
+        if (got <= 0) break;
+        total += static_cast<u32>(got);
+    }
+    CHECK(buf_contains(response, total, "HTTP/1.1 404", 12));
+    CHECK(buf_contains(response, total, "Not Found", 9));
+    CHECK_FALSE(buf_contains(response, total, "X-Origin", 8));
+    CHECK_FALSE(buf_contains(response, total, "original", 8));
+    close(client);
+    shard.stop();
+    shard.join();
+    shard.shutdown();
+    close(lfd);
+}
+
+TEST(shard, discarded_buffered_capture_does_not_override_http2_literal_response) {
+    ScriptedUpstreamServer backend;
+    static const char kResp[] =
+        "HTTP/1.1 200 OK\r\nContent-Length: 8\r\nX-Origin: leaked\r\nConnection: "
+        "close\r\n\r\noriginal";
+    REQUIRE(backend.setup(kResp, sizeof(kResp) - 1));
+    CompiledRutRoute compiled;
+    REQUIRE(compiled.compile(kBufferedForwardDiscardSource));
+    RouteConfig cfg;
+    REQUIRE(cfg.add_upstream("api", 0x7F000001, backend.port).has_value());
+    REQUIRE(cfg.add_jit_handler("/capture", 'G', compiled.handler));
+    Shard<EpollEventLoop> shard;
+    i32 lfd = create_listen_socket(0).value_or(-1);
+    REQUIRE(lfd >= 0);
+    const u16 port = get_port(lfd);
+    REQUIRE(shard.init(0, lfd).has_value());
+    shard.route_config = &cfg;
+    REQUIRE(shard.spawn(-1).has_value());
+    usleep(50000);
+    i32 client = connect_to(port);
+    REQUIRE(client >= 0);
+    set_socket_timeouts(client, 2);
+    u8 request[512];
+    u32 request_len = h2_client_prologue(request);
+    request_len +=
+        h2_client_get(request + request_len, sizeof(request) - request_len, 1, "/capture", 8);
+    REQUIRE(write_all_fd(client, request, request_len));
+    u8 response[4096];
+    u32 total = 0;
+    for (u32 attempt = 0; attempt < 10 && total < sizeof(response); attempt++) {
+        const i32 got = recv_timeout(
+            client, reinterpret_cast<char*>(response + total), sizeof(response) - total, 2000);
+        if (got <= 0) break;
+        total += static_cast<u32>(got);
+        if (h2_status_for_stream(response, total, 1) == 404) break;
+    }
+    CHECK_EQ(h2_status_for_stream(response, total, 1), 404u);
+    CHECK_FALSE(h2_response_has_header(response, total, 1, "x-origin", "leaked"));
+    close(client);
+    shard.stop();
+    shard.join();
+    shard.shutdown();
+    close(lfd);
+}
+
+TEST(shard, captured_http2_bodyless_status_suppresses_data) {
+    ScriptedUpstreamServer backend;
+    static const char kResp[] =
+        "HTTP/1.1 200 OK\r\nContent-Length: 8\r\nConnection: close\r\n\r\noriginal";
+    REQUIRE(backend.setup(kResp, sizeof(kResp) - 1));
+    CompiledRutRoute compiled;
+    REQUIRE(compiled.compile(kBufferedBodylessReturnSource));
+    RouteConfig cfg;
+    REQUIRE(cfg.add_upstream("api", 0x7F000001, backend.port).has_value());
+    REQUIRE(cfg.add_jit_handler("/capture", 'G', compiled.handler));
+    Shard<EpollEventLoop> shard;
+    i32 lfd = create_listen_socket(0).value_or(-1);
+    REQUIRE(lfd >= 0);
+    const u16 port = get_port(lfd);
+    REQUIRE(shard.init(0, lfd).has_value());
+    shard.route_config = &cfg;
+    REQUIRE(shard.spawn(-1).has_value());
+    usleep(50000);
+    i32 client = connect_to(port);
+    REQUIRE(client >= 0);
+    set_socket_timeouts(client, 2);
+    u8 request[512];
+    u32 request_len = h2_client_prologue(request);
+    request_len +=
+        h2_client_get(request + request_len, sizeof(request) - request_len, 1, "/capture", 8);
+    REQUIRE(write_all_fd(client, request, request_len));
+    u8 response[4096];
+    u32 total = 0;
+    for (u32 attempt = 0; attempt < 10 && total < sizeof(response); attempt++) {
+        const i32 got = recv_timeout(
+            client, reinterpret_cast<char*>(response + total), sizeof(response) - total, 2000);
+        if (got <= 0) break;
+        total += static_cast<u32>(got);
+        if (h2_status_for_stream(response, total, 1) == 204) break;
+    }
+    u8 body[16];
+    CHECK_EQ(h2_status_for_stream(response, total, 1), 204u);
+    CHECK_EQ(h2_body_for_stream(response, total, 1, body, sizeof(body)), 0u);
+    close(client);
+    shard.stop();
+    shard.join();
+    shard.shutdown();
+    close(lfd);
+}
+
+TEST(shard, oversized_captured_http2_headers_fail_before_resume) {
+    ScriptedUpstreamServer backend;
+    std::string upstream = "HTTP/1.1 200 OK\r\nX-Large: ";
+    upstream.append(9000, 'x');
+    upstream.append("\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+    REQUIRE(backend.setup(upstream.data(), static_cast<u32>(upstream.size())));
+    CompiledRutRoute compiled;
+    REQUIRE(compiled.compile(kBufferedForwardReturnSource));
+    RouteConfig cfg;
+    REQUIRE(cfg.add_upstream("api", 0x7F000001, backend.port).has_value());
+    REQUIRE(cfg.add_jit_handler("/capture", 'G', compiled.handler));
+    Shard<EpollEventLoop> shard;
+    i32 lfd = create_listen_socket(0).value_or(-1);
+    REQUIRE(lfd >= 0);
+    const u16 port = get_port(lfd);
+    REQUIRE(shard.init(0, lfd).has_value());
+    shard.route_config = &cfg;
+    REQUIRE(shard.spawn(-1).has_value());
+    usleep(50000);
+    i32 client = connect_to(port);
+    REQUIRE(client >= 0);
+    set_socket_timeouts(client, 2);
+    u8 request[512];
+    u32 request_len = h2_client_prologue(request);
+    request_len +=
+        h2_client_get(request + request_len, sizeof(request) - request_len, 1, "/capture", 8);
+    REQUIRE(write_all_fd(client, request, request_len));
+    u8 response[1024];
+    u32 total = 0;
+    for (u32 attempt = 0; attempt < 10 && total < sizeof(response); attempt++) {
+        const i32 got = recv_timeout(
+            client, reinterpret_cast<char*>(response + total), sizeof(response) - total, 2000);
+        if (got <= 0) break;
+        total += static_cast<u32>(got);
+        if (h2_status_for_stream(response, total, 1) == 502) break;
+    }
+    CHECK_EQ(h2_status_for_stream(response, total, 1), 502u);
+    close(client);
+    shard.stop();
+    shard.join();
+    shard.shutdown();
+    close(lfd);
+}
+
+TEST(shard, buffered_capture_large_body_resumes_over_http2) {
+    ScriptedUpstreamServer backend;
+    std::string upstream = "HTTP/1.1 200 OK\r\nContent-Length: 12000\r\nConnection: close\r\n\r\n";
+    upstream.append(12000, 'x');
+    REQUIRE(backend.setup(upstream.data(), static_cast<u32>(upstream.size())));
+    CompiledRutRoute compiled;
+    REQUIRE(compiled.compile(kBufferedForwardReturnSource));
+    RouteConfig cfg;
+    REQUIRE(cfg.add_upstream("api", 0x7F000001, backend.port).has_value());
+    REQUIRE(cfg.add_jit_handler("/capture", 'G', compiled.handler));
+    Shard<EpollEventLoop> shard;
+    i32 lfd = create_listen_socket(0).value_or(-1);
+    REQUIRE(lfd >= 0);
+    const u16 port = get_port(lfd);
+    REQUIRE(shard.init(0, lfd).has_value());
+    shard.route_config = &cfg;
+    REQUIRE(shard.spawn(-1).has_value());
+    usleep(50000);
+    i32 client = connect_to(port);
+    REQUIRE(client >= 0);
+    set_socket_timeouts(client, 2);
+    u8 request[512];
+    u32 request_len = h2_client_prologue(request);
+    request_len +=
+        h2_client_get(request + request_len, sizeof(request) - request_len, 1, "/capture", 8);
+    REQUIRE(write_all_fd(client, request, request_len));
+    u8 response[16384];
+    u32 total = 0;
+    u8 body[12000];
+    u32 body_len = 0;
+    for (u32 attempt = 0; attempt < 20 && total < sizeof(response); attempt++) {
+        const i32 got = recv_timeout(
+            client, reinterpret_cast<char*>(response + total), sizeof(response) - total, 2000);
+        if (got <= 0) break;
+        total += static_cast<u32>(got);
+        body_len = h2_body_for_stream(response, total, 1, body, sizeof(body));
+        if (body_len == sizeof(body)) break;
+    }
+    CHECK_EQ(h2_status_for_stream(response, total, 1), 200u);
+    CHECK_EQ(body_len, 12000u);
+    CHECK(body_len == 12000 && body[0] == 'x' && body[11999] == 'x');
+    close(client);
+    shard.stop();
+    shard.join();
+    shard.shutdown();
+    close(lfd);
+}
+
+TEST(shard, buffered_capture_rejects_http1_upgrade_response) {
+    ScriptedUpstreamServer backend;
+    static const char kResp[] =
+        "HTTP/1.1 101 Switching Protocols\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n\r\n";
+    REQUIRE(backend.setup(kResp, sizeof(kResp) - 1));
+    CompiledRutRoute compiled;
+    REQUIRE(compiled.compile(kBufferedForwardReturnSource));
+    RouteConfig cfg;
+    REQUIRE(cfg.add_upstream("api", 0x7F000001, backend.port).has_value());
+    REQUIRE(cfg.add_jit_handler("/capture", 'G', compiled.handler));
+    Shard<EpollEventLoop> shard;
+    i32 lfd = create_listen_socket(0).value_or(-1);
+    REQUIRE(lfd >= 0);
+    const u16 port = get_port(lfd);
+    REQUIRE(shard.init(0, lfd).has_value());
+    shard.route_config = &cfg;
+    REQUIRE(shard.spawn(-1).has_value());
+    usleep(50000);
+    i32 client = connect_to(port);
+    REQUIRE(client >= 0);
+    set_socket_timeouts(client, 2);
+    static const char kReq[] =
+        "GET /capture HTTP/1.1\r\nHost: test\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n\r\n";
+    REQUIRE(write_all_fd(client, reinterpret_cast<const u8*>(kReq), sizeof(kReq) - 1));
+    char response[1024];
+    u32 total = 0;
+    while (total < sizeof(response)) {
+        const i32 got = recv_timeout(client, response + total, sizeof(response) - total, 2000);
+        if (got <= 0) break;
+        total += static_cast<u32>(got);
+    }
+    CHECK(buf_contains(response, total, "HTTP/1.1 502", 12));
+    close(client);
+    shard.stop();
+    shard.join();
+    shard.shutdown();
+    close(lfd);
+}
+
+TEST(shard, buffered_forward_expression_overflow_fails_closed_as_502) {
+    ScriptedUpstreamServer backend;
+    std::string oversized = "HTTP/1.1 200 OK\r\nContent-Length: 17000\r\nConnection: close\r\n\r\n";
+    oversized.append(17000, 'x');
+    REQUIRE(backend.setup(oversized.data(), static_cast<u32>(oversized.size())));
+    CompiledRutRoute compiled;
+    REQUIRE(compiled.compile(kBufferedForwardExpressionSource));
+
+    RouteConfig cfg;
+    REQUIRE(cfg.add_upstream("api", 0x7F000001, backend.port).has_value());
+    REQUIRE(cfg.add_jit_handler("/capture", 'G', compiled.handler));
+    Shard<EpollEventLoop> shard;
+    i32 lfd = create_listen_socket(0).value_or(-1);
+    REQUIRE(lfd >= 0);
+    const u16 port = get_port(lfd);
+    REQUIRE(shard.init(0, lfd).has_value());
+    shard.route_config = &cfg;
+    REQUIRE(shard.spawn(-1).has_value());
+    usleep(50000);
+
+    i32 client = connect_to(port);
+    REQUIRE(client >= 0);
+    set_socket_timeouts(client, 2);
+    static const char kReq[] = "GET /capture HTTP/1.1\r\nHost: test\r\nConnection: close\r\n\r\n";
+    REQUIRE(write_all_fd(client, reinterpret_cast<const u8*>(kReq), sizeof(kReq) - 1));
+    char response[1024];
+    u32 total = 0;
+    while (total < sizeof(response)) {
+        const i32 got = recv_timeout(client, response + total, sizeof(response) - total, 2000);
+        if (got <= 0) break;
+        total += static_cast<u32>(got);
+    }
+    CHECK(buf_contains(response, total, "HTTP/1.1 502", 12));
+    CHECK(buf_contains(response, total, "Bad Gateway", 11));
+
+    close(client);
+    shard.stop();
+    shard.join();
+    shard.shutdown();
+    close(lfd);
+}
+
+TEST(shard, buffered_forward_expression_upstream_failure_fails_closed_as_502) {
+    i32 dead_lfd = create_listen_socket(0).value_or(-1);
+    REQUIRE(dead_lfd >= 0);
+    const u16 dead_port = get_port(dead_lfd);
+    close(dead_lfd);
+
+    CompiledRutRoute compiled;
+    REQUIRE(compiled.compile(kBufferedForwardExpressionSource));
+    RouteConfig cfg;
+    REQUIRE(cfg.add_upstream("api", 0x7F000001, dead_port).has_value());
+    REQUIRE(cfg.add_jit_handler("/capture", 'G', compiled.handler));
+    Shard<EpollEventLoop> shard;
+    i32 lfd = create_listen_socket(0).value_or(-1);
+    REQUIRE(lfd >= 0);
+    const u16 port = get_port(lfd);
+    REQUIRE(shard.init(0, lfd).has_value());
+    shard.route_config = &cfg;
+    REQUIRE(shard.spawn(-1).has_value());
+    usleep(50000);
+
+    i32 client = connect_to(port);
+    REQUIRE(client >= 0);
+    set_socket_timeouts(client, 2);
+    static const char kReq[] = "GET /capture HTTP/1.1\r\nHost: test\r\nConnection: close\r\n\r\n";
+    REQUIRE(write_all_fd(client, reinterpret_cast<const u8*>(kReq), sizeof(kReq) - 1));
+    char response[1024];
+    u32 total = 0;
+    while (total < sizeof(response)) {
+        const i32 got = recv_timeout(client, response + total, sizeof(response) - total, 2000);
+        if (got <= 0) break;
+        total += static_cast<u32>(got);
+    }
+    CHECK(buf_contains(response, total, "HTTP/1.1 502", 12));
+    CHECK(buf_contains(response, total, "Bad Gateway", 11));
 
     close(client);
     shard.stop();
@@ -13961,6 +14996,7 @@ TEST(route, register_jit_routes_selects_segment_trie_and_adds_param_route) {
     REQUIRE_EQ(cfg.route_count, 1u);
     CHECK_EQ(cfg.routes[0].action, RouteAction::JitHandler);
     CHECK_FALSE(cfg.routes[0].needs_req_body);
+    CHECK_FALSE(cfg.routes[0].needs_control_plane_snapshot);
 
     RouteParam params[kMaxRouteParams]{};
     u32 param_count = 0;

@@ -84,6 +84,13 @@ bitwise.flip(a)    bitwise.shiftLeft(a, n)  bitwise.shiftRight(a, n)
 Statements end at newline (no semicolons). Blocks need no commas between items.
 Comments: `// line only`.
 
+JSON objects preserve source order; declared structs use field declaration
+order, and arrays/string-list views preserve carrier order. Duplicate object
+keys are a compile error rather than last-write-wins. Runtime strings are JSON
+escaped at the sink. A direct dynamic JSON response is capped at 7 KiB, while a
+`Response.body` mutation is capped at 4 KiB so it can remain stream-owned across
+resume; either overflow fails closed as 500 and never publishes a partial body.
+
 ## Bindings and control flow
 
 ```swift
@@ -105,10 +112,11 @@ match status {                            // general dispatch — no `case` keyw
     _        => "other"                   // exhaustive: all cases or _
 }
 
-for item in order.items {                 // ⏳ finite collections only, no while
-    if item.qty == 0 { continue }         // ⏳ break / continue allowed
-    guard item.qty > 0 else { return 400 }
+for item in [1, 2, 3] {                   // compile-time array only; bounded unroll, no while
+    guard item >= 0 else { break }
+    guard item != 0 else { continue }
 }
+// break / continue target the innermost bounded `for`; no labels or loop else
 
 defer conn.close()                        // ⏳ runs on every exit path, LIFO (no defer in parser yet)
 ```
@@ -244,8 +252,8 @@ must have exactly one `Response` parameter and may use `set`/`add`/`remove` with
 literal names and runtime string values; its effects apply to successful direct
 and forwarded responses. Mutations stay pending until the selected success terminator, so a
 guard or pre-middleware short circuit cannot inherit them. Applying any of these
-mutations to a forwarded response requires the terminal
-`return forward(upstream, buffered: true)` form.
+mutations to a forwarded response requires buffered forwarding, either terminal
+`return forward(upstream, buffered: true)` or the first-class expression form.
 Status/body writes use the same resumable commit boundary as headers and may be
 used by `chain after` after a yield. Body replacement owns up to 4 KiB in the
 request/stream context; plain `str` and reusable `Json` values therefore survive
@@ -261,8 +269,12 @@ HTTP/1 and HTTP/2 paths use the same boundary and preserve effects across
 `wait`. Malformed, truncated, upgraded, or over-cap upstream responses fail
 closed as 502; invalid or overflowing mutations fail closed as 500. Combining
 buffered response handling with `set_path` or `set_header` request rewrites is
-rejected until the HTTP/2 request-rewrite path is wired. Binding the buffered
-result as a first-class `Response` for upstream field reads remains ⏳.
+rejected until the HTTP/2 request-rewrite path is wired. The expression form
+`let resp = forward(upstream, buffered: true)` owns the filtered status, body,
+and up to 64 headers in a separate lazy 16 KiB stream slice. Reads, mutations,
+and a subsequent `wait` remain valid until `return resp`; the slice is returned
+to the pool after final serialization. Unbuffered expression forwarding is
+rejected because it cannot provide owned response fields.
 
 ## State types (top-level, per-shard, bounded)
 
@@ -339,7 +351,7 @@ or incrementally editing an upstream buffered body remains ⏳.
 // Proxy — the ONLY three forms
 return forward(users)                          // zero-copy, terminal
 return forward(users, buffered: true)          // ✅ bounded terminal buffering + after mutations
-let resp = forward(users, buffered: true)      // ⏳ first-class buffered Response expression
+let resp = forward(users, buffered: true)      // ✅ first-class bounded Response expression
 return forward(users, streaming: true)         // large bodies, no buffering
 
 // Static files / pipes
@@ -453,8 +465,22 @@ time:    time.nowMicros() -> i64 (monotonic µs; latched per invocation — all
          uses in one request see the same value)  max(a, b)  min(a, b)
          — now()/time(s)/Duration arithmetic still ⏳
 misc:    env(k) json(v) log.info/warn/error(msg, key: val, ...)
-admin:   stats() metrics() reload() upstream_status() config_dump() shard_stats() ⏳ runtime
+admin:   stats() metrics() ✅ bounded JSON snapshots; reload() upstream_status()
+         config_dump() shard_stats() ⏳ runtime
 ```
+
+`json(stats())` is a handler-entry snapshot for the invoking shard;
+`json(metrics())` is the process aggregate captured at the same boundary. Both
+use fixed field order and unsigned decimal counters:
+
+```json
+{"scope":"shard","shard_id":0,"shard_count":1,"requests":{"total":0,"active":1,"latency_us":{"buckets":[0,0,0,0,0,0,0,0,0,0,0],"sum":0,"count":0}},"connections":{"total":1,"active":1,"closed":0},"memory":{"arena_used":0,"slices_used":0,"slices_free":0,"connections_used":0}}
+```
+
+The process form replaces `scope` with `"process"`, omits `shard_id`, and
+aggregates the same `requests`, `connections`, and `memory` fields. Serialization
+is bounded by the dynamic-response limit and fails the response closed with 500
+if the runtime capability is unavailable.
 
 ## Do NOT write (compile errors — with the fix)
 

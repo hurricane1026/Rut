@@ -1398,6 +1398,16 @@ TEST(http2_conn, trailing_header_block_with_pseudo_header_rsts) {
     u32 ow = 0;
     c.process(in, inlen, out, sizeof(out), &ow);
 
+    ShardMetrics metrics;
+    metrics.init();
+    metrics.on_request_start();
+    c.metrics = &metrics;
+    Http2Stream* stream = c.find_stream(1);
+    REQUIRE(stream != nullptr);
+    stream->metrics_started = true;
+    stream->request_start_us = monotonic_us();
+    c.on_reset = &h2_on_reset_cb;
+
     // END_STREAM is set, but a pseudo-header (:path) disqualifies it as trailers
     // (RFC 7540 §8.1.2.1) → reset rather than finalize.
     hpack::Header bad[] = {{{":path", 5}, {"/x", 2}}, {{"x-t", 3}, {"1", 1}}};
@@ -1407,6 +1417,8 @@ TEST(http2_conn, trailing_header_block_with_pseudo_header_rsts) {
     u32 bow = 0;
     c.process(bframe, bn, bout, sizeof(bout), &bow);
     CHECK(has_frame(bout, bow, Http2FrameType::RstStream, 0, 0));
+    CHECK_EQ(metrics.requests_active, 0u);
+    CHECK_FALSE(stream->metrics_started);
 }
 
 TEST(h2_serving, finalizes_body_without_injecting_content_length) {
@@ -1503,15 +1515,16 @@ namespace {
 struct FakeH2Loop {
     bool yield_scheduled = false;
     u32 yield_ms = 0;
+    ShardMetrics* metrics = nullptr;
+
+    void epoch_enter() {}
+    void epoch_leave() {}
 
     [[nodiscard]] bool schedule_yield_timer(Connection&, u32 ms) {
         yield_scheduled = true;
         yield_ms = ms;
         return true;
     }
-
-    void epoch_enter() {}
-    void epoch_leave() {}
 };
 
 u64 h2_mutated_body_then_forward(void*, jit::HandlerCtx* ctx, const u8*, u32, void*) {
@@ -1578,7 +1591,12 @@ TEST(h2_serving, body_independent_local_branch_avoids_buffered_forward_cap) {
     conn.reset();
     conn.h2 = &h2;
     RouteConfig config;
-    REQUIRE(config.add_jit_handler("/upload", kRouteMethodPost, &h2_status_204, false, true));
+    REQUIRE(config.add_jit_handler("/upload",
+                                   kRouteMethodPost,
+                                   &h2_status_204,
+                                   /*needs_req_body=*/false,
+                                   /*needs_control_plane_snapshot=*/false,
+                                   /*can_forward_buffered=*/true));
     conn.request_config = &config;
     FakeH2Loop loop;
     u8 response[512]{};
@@ -1600,7 +1618,12 @@ TEST(h2_serving, selected_buffered_forward_defers_and_buffers_data) {
     conn.reset();
     conn.h2 = &h2;
     RouteConfig config;
-    REQUIRE(config.add_jit_handler("/upload", kRouteMethodPost, &h2_buffered_forward, false, true));
+    REQUIRE(config.add_jit_handler("/upload",
+                                   kRouteMethodPost,
+                                   &h2_buffered_forward,
+                                   /*needs_req_body=*/false,
+                                   /*needs_control_plane_snapshot=*/false,
+                                   /*can_forward_buffered=*/true));
     conn.request_config = &config;
     FakeH2Loop loop;
     u8 response[512]{};
@@ -1635,7 +1658,12 @@ TEST(h2_serving, body_independent_timer_starts_before_upload_completion) {
     conn.reset();
     conn.h2 = &h2;
     RouteConfig config;
-    REQUIRE(config.add_jit_handler("/upload", kRouteMethodPost, &h2_buffered_timer, false, true));
+    REQUIRE(config.add_jit_handler("/upload",
+                                   kRouteMethodPost,
+                                   &h2_buffered_timer,
+                                   /*needs_req_body=*/false,
+                                   /*needs_control_plane_snapshot=*/false,
+                                   /*can_forward_buffered=*/true));
     conn.request_config = &config;
     FakeH2Loop loop;
     u8 response[512]{};
@@ -1887,6 +1915,71 @@ TEST(h2_serving, failed_response_serialization_rolls_back_encoder_state) {
 
     CHECK(dispatch.overflow);
     CHECK_EQ(__builtin_memcmp(&h2.hpack_enc, &before, sizeof(before)), 0);
+}
+
+TEST(h2_serving, completed_request_is_accounted_once) {
+    Http2Conn h2;
+    h2.init();
+    h2.nstreams = 1;
+    h2.streams[0] = {1,
+                     Http2StreamState::HalfClosedRemote,
+                     kDefaultInitialWindowSize,
+                     kDefaultInitialWindowSize,
+                     true,
+                     false,
+                     false,
+                     0};
+
+    Connection conn;
+    conn.reset();
+    conn.h2 = &h2;
+    ShardMetrics metrics;
+    metrics.init();
+    FakeH2Loop loop;
+    loop.metrics = &metrics;
+    u8 resp[256];
+    H2Dispatch<FakeH2Loop> d{&loop, &conn, resp, sizeof(resp), 0, false};
+    const hpack::Header hs[] = {{{":method", 7}, {"GET", 3}}, {{":path", 5}, {"/", 1}}};
+
+    h2_on_headers_cb<FakeH2Loop>(&d, h2, 1, hs, 2, true);
+
+    CHECK_EQ(metrics.requests_total, 0u);
+    CHECK_EQ(metrics.requests_active, 1u);
+    CHECK_EQ(metrics.request_latency.count, 0u);
+    CHECK(h2.streams[0].metrics_started);
+    CHECK(h2.streams[0].metrics_pending_send);
+
+    h2_complete_sent_request_metrics(h2);
+
+    CHECK_EQ(metrics.requests_total, 1u);
+    CHECK_EQ(metrics.requests_active, 0u);
+    CHECK_EQ(metrics.request_latency.count, 1u);
+    CHECK_FALSE(h2.streams[0].metrics_started);
+    CHECK_FALSE(h2.streams[0].metrics_pending_send);
+}
+
+TEST(h2_serving, reset_cancels_metrics_after_engine_closes_stream) {
+    Http2Conn h2;
+    h2.init();
+    ShardMetrics metrics;
+    metrics.init();
+    metrics.on_request_start();
+    h2.metrics = &metrics;
+    h2.nstreams = 1;
+    h2.streams[0] = {1,
+                     Http2StreamState::Closed,
+                     kDefaultInitialWindowSize,
+                     kDefaultInitialWindowSize,
+                     true,
+                     true,
+                     false,
+                     monotonic_us()};
+
+    h2_on_reset_cb(nullptr, h2, 1, Http2Error::Cancel);
+
+    CHECK_EQ(metrics.requests_active, 0u);
+    CHECK_EQ(metrics.requests_total, 0u);
+    CHECK_FALSE(h2.streams[0].metrics_started);
 }
 
 TEST(h2_serving, deferred_route_params_copied_to_stable_storage) {

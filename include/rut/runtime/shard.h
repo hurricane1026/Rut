@@ -143,6 +143,7 @@ struct Shard {
         // Init and wire per-shard metrics.
         shard_metrics.init();
         loop->metrics = &shard_metrics;
+        loop->metrics_arena = &scratch;
 
         // Init per-shard control block and epoch.
         control.pending_config.store(nullptr, std::memory_order_relaxed);

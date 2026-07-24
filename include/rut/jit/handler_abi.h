@@ -128,6 +128,11 @@ struct HandlerResult {
 inline constexpr u32 kMaxResponseHeaderMutations = 16;
 inline constexpr u32 kMaxResponseBodyMutationBytes = 4096;
 inline constexpr u32 kMaxDynamicResponseBodyBytes = 7 * 1024;
+inline constexpr u32 kMaxCapturedResponseHeaders = 64;
+inline constexpr u32 kMaxCapturedResponseStorageBytes = 16u * 1024u;
+inline constexpr u32 kCapturedResponseFramingReserve = 512;
+inline constexpr u32 kControlPlaneLatencyBucketCount = 11;
+enum class ControlPlaneJsonKind : u8 { Stats = 0, Metrics = 1 };
 enum class ResponseHeaderMutationMode : u8 { Set, Add, Remove };
 struct ResponseHeaderMutation {
     Str name;
@@ -135,6 +140,38 @@ struct ResponseHeaderMutation {
     ResponseHeaderMutationMode mode;
 };
 struct ResponseBodySnapshotStorage;
+struct CapturedResponseHeader {
+    Str name;
+    Str value;
+};
+
+// Value-only control-plane capability copied into a request at handler entry.
+// JIT code never receives EventLoop, ShardMetrics, or a cross-shard registry
+// pointer: the snapshot is bounded, owns no storage, and remains stable across
+// yields/resumes. `stats` is the invoking shard; `metrics` is the process-wide
+// aggregate captured at the same boundary.
+struct ControlPlaneMetricValues {
+    u64 requests_total;
+    u64 requests_active;
+    u64 connections_total;
+    u64 connections_active;
+    u64 connections_closed;
+    u64 request_latency_buckets[kControlPlaneLatencyBucketCount];
+    u64 request_latency_sum_us;
+    u64 request_latency_count;
+    u64 memory_arena_used;
+    u64 memory_slices_used;
+    u64 memory_slices_free;
+    u64 memory_connections_used;
+};
+
+struct ControlPlaneSnapshot {
+    bool valid;
+    u32 shard_id;
+    u32 shard_count;
+    ControlPlaneMetricValues stats;
+    ControlPlaneMetricValues metrics;
+};
 
 // ── Handler Context ────────────────────────────────────────────────
 // Per-request mutable context, allocated from the scratch Arena.
@@ -152,9 +189,19 @@ struct alignas(alignof(u64)) HandlerCtx {
     i32 resume_event_result;  // IoEvent::result for event waits
     u32 route_param_count;    // number of populated route_params entries
     u32 reserved0;
+    ControlPlaneSnapshot control_plane;
     const char* response_body_data;  // shard-owned dynamic response bytes
     u32 response_body_len;
     u32 response_body_valid;  // 1 only after successful serialization
+    // Lazily materialized upstream response for expression-form buffered
+    // forwarding. String views point into Connection::response_capture_slice,
+    // never into the reusable proxy receive buffer.
+    bool captured_response_valid;
+    u16 captured_response_status;
+    const char* captured_response_body;
+    u32 captured_response_body_len;
+    u8 captured_response_header_count;
+    CapturedResponseHeader captured_response_headers[kMaxCapturedResponseHeaders];
     // Builder-local mutation log. Pending entries are visible to resp.header();
     // commit publishes exactly this prefix to the terminal response. Keeping
     // it in HandlerCtx makes it survive yields without leaking across streams.

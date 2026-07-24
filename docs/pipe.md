@@ -238,7 +238,7 @@ The present-only fallback shape should be spelled explicitly:
 ```rut
 route GET "/all" {
     let token = req.query("x-token")
-    let safe = if token? { token.or("") } else { "" }
+    let safe = if let value = token { value } else { "" }
     if safe == "" { return 401 } else { return 200 }
 }
 ```

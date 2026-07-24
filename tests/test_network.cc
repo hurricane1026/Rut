@@ -4057,6 +4057,24 @@ TEST(upstream_reuse, pre_send_retry_allows_pipelined_suffix) {
     CHECK(rut::request_fully_resendable(*c));
 }
 
+TEST(upstream_reuse, captured_request_is_a_resendable_source) {
+    SmallLoop loop;
+    loop.setup();
+    auto* c = loop.alloc_conn();
+    REQUIRE(c != nullptr);
+    c->req_body_mode = BodyMode::None;
+    static const char request[] = "GET /captured HTTP/1.1\r\nHost: x\r\n\r\n";
+    static u8 captured_request[SlicePool::kSliceSize];
+    c->request_capture_slice = captured_request;
+    c->request_capture_len = sizeof(request) - 1;
+    __builtin_memcpy(c->request_capture_slice, request, c->request_capture_len);
+    c->recv_buf.reset();
+    c->retry_req_send_len = 0;
+
+    CHECK(rut::request_fully_resendable(*c));
+    c->request_capture_slice = nullptr;
+}
+
 // Finding (F3): on the snapshot-retry path the request was replayed from send_buf, so
 // recv_buf holds NO original request. If the client pipelines another request into
 // recv_buf while the fresh connect/send is in flight, the retry's on_upstream_request_-
@@ -4603,6 +4621,12 @@ TEST(route, rir_function_needs_req_body_guard_paths) {
 
     insts[0].op = rir::Opcode::RetForwardBuffered;
     CHECK(!rir_function_needs_req_body(fn));
+    CHECK(rir_function_can_forward_buffered(fn));
+
+    u8 yield_kind = static_cast<u8>(jit::YieldKind::Forward);
+    fn.yield_count = 1;
+    fn.yield_kinds = &yield_kind;
+    insts[0].op = rir::Opcode::YieldTimer;
     CHECK(rir_function_can_forward_buffered(fn));
 }
 
@@ -13478,6 +13502,77 @@ TEST(state_invariant, h2_proxy_timeout_tears_down_upstream_before_sending_504) {
     c->h2 = nullptr;
 }
 
+TEST(state_invariant, h2_followup_proxy_flush_releases_prior_capture) {
+    SmallLoop loop;
+    loop.setup();
+    loop.inject_and_dispatch(make_ev(0, IoEventType::Accept, 42));
+    auto* c = loop.find_fd(42);
+    REQUIRE(c != nullptr);
+
+    Http2Conn h2{};
+    h2.init();
+    h2.async_stream = 1;
+    h2.async_kind = H2AsyncKind::Proxy;
+    c->h2 = &h2;
+    c->protocol = ConnProtocol::Http2;
+    c->epoch_held = true;
+    // SmallLoop has no SlicePool; the pointer is only an ownership sentinel for
+    // this callback-level regression.
+    c->response_capture_slice = c->recv_slice;
+    static const u8 kResponse[] = {0, 0, 0, 1};
+
+    h2_proxy_flush(&loop, *c, kResponse, sizeof(kResponse));
+
+    CHECK_EQ(c->response_capture_slice, nullptr);
+    CHECK_EQ(h2.async_stream, 0u);
+    CHECK(!c->epoch_held);
+    CHECK_EQ(c->on_send, &on_h2_sent<SmallLoop>);
+    c->h2 = nullptr;
+}
+
+TEST(state_invariant, h2_metrics_complete_only_after_full_downstream_send) {
+    SmallLoop loop;
+    loop.setup();
+    loop.inject_and_dispatch(make_ev(0, IoEventType::Accept, 42));
+    auto* c = loop.find_fd(42);
+    REQUIRE(c != nullptr);
+
+    ShardMetrics metrics;
+    metrics.init();
+    metrics.on_request_start();
+    loop.metrics = &metrics;
+    Http2Conn h2{};
+    h2.init();
+    h2.metrics = &metrics;
+    h2.nstreams = 1;
+    h2.streams[0] = {1,
+                     Http2StreamState::Closed,
+                     kDefaultInitialWindowSize,
+                     kDefaultInitialWindowSize,
+                     true,
+                     true,
+                     true,
+                     monotonic_us()};
+    c->h2 = &h2;
+    c->protocol = ConnProtocol::Http2;
+    c->keep_alive = true;
+    static const u8 kResponse[] = {1, 2, 3, 4};
+    c->send_buf.write(kResponse, sizeof(kResponse));
+
+    on_h2_sent<SmallLoop>(&loop, *c, make_ev(c->id, IoEventType::Send, 2));
+    CHECK_EQ(metrics.requests_active, 1u);
+    CHECK_EQ(metrics.requests_total, 0u);
+    CHECK_EQ(c->send_progress, 2u);
+
+    on_h2_sent<SmallLoop>(&loop, *c, make_ev(c->id, IoEventType::Send, 2));
+    CHECK_EQ(metrics.requests_active, 0u);
+    CHECK_EQ(metrics.requests_total, 1u);
+    CHECK_FALSE(h2.streams[0].metrics_started);
+    CHECK_FALSE(h2.streams[0].metrics_pending_send);
+
+    c->h2 = nullptr;
+}
+
 TEST(state_invariant, jit_timer_yield_keeps_exec_handler_slots_clear) {
     SmallLoop loop;
     loop.setup();
@@ -16998,6 +17093,33 @@ TEST(response_headers, head_header_collection_failure_suppresses_fallback_body) 
     }
     REQUIRE(header_end != 0);
     CHECK_EQ(header_end, conn->send_buf.len());
+}
+
+TEST(response_headers, captured_304_preserves_representation_content_length) {
+    SmallLoop loop;
+    loop.setup();
+    loop.inject_and_dispatch(make_ev(0, IoEventType::Accept, 42));
+    auto* conn = loop.find_fd(42);
+    REQUIRE(conn != nullptr);
+
+    jit::HandlerCtx response_ctx{};
+    response_ctx.captured_response_valid = true;
+    response_ctx.captured_response_status = 304;
+    response_ctx.captured_response_header_count = 1;
+    response_ctx.captured_response_headers[0].name = {"Content-Length", 14};
+    response_ctx.captured_response_headers[0].value = {"123", 3};
+
+    JitDispatchOutcome outcome{};
+    outcome.kind = JitDispatchOutcome::Kind::ReturnStatus;
+    outcome.status_code = 304;
+    outcome.response_ctx = &response_ctx;
+    outcome.uses_captured_response = true;
+    handle_jit_outcome<SmallLoop>(
+        &loop, *conn, outcome, &state_invariant_wait_recv_then_status, true);
+
+    const char* wire = reinterpret_cast<const char*>(conn->send_buf.data());
+    CHECK(buf_contains(wire, conn->send_buf.len(), "HTTP/1.1 304", 12));
+    CHECK(buf_contains(wire, conn->send_buf.len(), "Content-Length: 123\r\n", 21));
 }
 
 int main(int argc, char** argv) {

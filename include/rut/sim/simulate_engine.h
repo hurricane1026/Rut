@@ -111,6 +111,7 @@ struct Engine {
         u32 pattern_len = 0;
         jit::HandlerFn fn = nullptr;
         bool needs_req_body = false;
+        bool needs_control_plane_snapshot = false;
     };
 
     CompiledRoute routes[kMaxRoutes];
