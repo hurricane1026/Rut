@@ -4608,7 +4608,9 @@ void finish_buffered_forward(Loop* loop,
 
     for (u32 i = 0; i < response_ctx->response_header_count; i++) {
         const Str name = response_ctx->response_header_mutations[i].name;
-        if (!http_header_name_eq_ci(name.ptr, name.len, "transfer-encoding", 17)) continue;
+        if (!http_header_name_eq_ci(name.ptr, name.len, "transfer-encoding", 17) &&
+            !http_header_name_eq_ci(name.ptr, name.len, "connection", 10))
+            continue;
         buffered_forward_fail(loop, conn, 500);
         return;
     }

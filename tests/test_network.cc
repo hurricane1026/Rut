@@ -5536,6 +5536,39 @@ TEST(buffered_forward, strips_transfer_encoding_added_by_response_mutation) {
     CHECK(!buf_contains(wire, wire_len, "\r\n\r\nbody", 8));
 }
 
+TEST(buffered_forward, rejects_connection_added_by_response_mutation) {
+    SmallLoop loop;
+    loop.setup();
+    auto* conn = setup_proxy_conn(loop);
+    REQUIRE(conn != nullptr);
+    conn->proxy_response_buffered = true;
+    conn->req_keep_alive = true;
+    conn->keep_alive = true;
+
+    auto* ctx = conn->reset_jit_ctx();
+    static const char kName[] = "Connection";
+    static const char kValue[] = "close";
+    ctx->response_header_mutations[0] = {{kName, sizeof(kName) - 1},
+                                         {kValue, sizeof(kValue) - 1},
+                                         jit::ResponseHeaderMutationMode::Set};
+    ctx->response_header_count = 1;
+
+    static const char kUpstream[] =
+        "HTTP/1.1 200 OK\r\nContent-Length: 4\r\nConnection: keep-alive\r\n\r\nbody";
+    conn->upstream_recv_buf.reset();
+    conn->upstream_recv_buf.write(reinterpret_cast<const u8*>(kUpstream), sizeof(kUpstream) - 1);
+    on_upstream_response<SmallLoop>(
+        &loop,
+        *conn,
+        make_ev(conn->id, IoEventType::UpstreamRecv, static_cast<i32>(sizeof(kUpstream) - 1)));
+
+    const char* wire = reinterpret_cast<const char*>(conn->send_buf.data());
+    CHECK_EQ(conn->resp_status, 500u);
+    CHECK_FALSE(conn->keep_alive);
+    CHECK(buf_contains(wire, conn->send_buf.len(), "Connection: close\r\n", 19));
+    CHECK(!buf_contains(wire, conn->send_buf.len(), "Connection: keep-alive", 22));
+}
+
 TEST(buffered_forward, mutated_205_suppresses_upstream_and_replacement_bodies) {
     SmallLoop loop;
     loop.setup();
