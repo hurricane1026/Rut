@@ -1376,6 +1376,45 @@ static FrontendResult<rir::ValueId> materialize_value(const MirValue& value,
         if (!element) return frontend_error(FrontendError::UnsupportedSyntax, span);
         return element.value();
     }
+    if (value.kind == MirValueKind::JsonBuild) {
+        if (!b.emit_json_reset({span.line, span.col}))
+            return frontend_error(FrontendError::OutOfMemory, span);
+        for (u32 i = 0; i < value.field_inits.len; i++) {
+            const auto& part = value.field_inits[i];
+            if (part.value == nullptr || !b.emit_json_append_raw(part.name, {span.line, span.col}))
+                return frontend_error(FrontendError::OutOfMemory, span);
+            auto leaf = materialize_value(*part.value,
+                                          mir,
+                                          variant_infos,
+                                          tuple_infos,
+                                          tuple_info_count,
+                                          error_scalar_infos,
+                                          error_variant_infos,
+                                          error_struct_infos,
+                                          user_struct_defs,
+                                          b,
+                                          locals,
+                                          local_count,
+                                          span);
+            if (!leaf) return core::make_unexpected(leaf.error());
+            const auto kind = b.cur_func->values[leaf->id].type->kind;
+            const auto op = kind == rir::TypeKind::Bool      ? rir::Opcode::JsonAppendBool
+                            : kind == rir::TypeKind::I32     ? rir::Opcode::JsonAppendI32
+                            : kind == rir::TypeKind::I64     ? rir::Opcode::JsonAppendI64
+                            : kind == rir::TypeKind::Str     ? rir::Opcode::JsonAppendStr
+                            : kind == rir::TypeKind::StrList ? rir::Opcode::JsonAppendStrList
+                            : kind == rir::TypeKind::Array   ? rir::Opcode::JsonAppendArray
+                                                             : rir::Opcode::JsonFinish;
+            if (op == rir::Opcode::JsonFinish ||
+                !b.emit_json_append(op, leaf.value(), {span.line, span.col}))
+                return frontend_error(FrontendError::UnsupportedSyntax, span);
+        }
+        if (!b.emit_json_append_raw(value.str_value, {span.line, span.col}))
+            return frontend_error(FrontendError::OutOfMemory, span);
+        auto captured = b.emit_json_capture({span.line, span.col});
+        if (!captured) return frontend_error(FrontendError::OutOfMemory, span);
+        return captured.value();
+    }
     if (value.kind == MirValueKind::RegexMatch) {
         auto lhs = materialize_value(*value.lhs,
                                      mir,
@@ -3289,7 +3328,25 @@ static FrontendResult<void> emit_term(const MirTerminator& term,
         // and pack the 1-based idx into RetStatus's immediate. Empty /
         // missing body ⇒ idx = 0 ⇒ runtime uses default status-reason.
         u16 body_idx = 0;
-        if (term.has_dynamic_response_body) {
+        if (term.has_json_body_plan) {
+            auto body = materialize_value(term.json_body_local.init,
+                                          mir,
+                                          variant_infos,
+                                          tuple_infos,
+                                          tuple_info_count,
+                                          error_scalar_infos,
+                                          error_variant_infos,
+                                          error_struct_infos,
+                                          user_struct_defs,
+                                          b,
+                                          locals,
+                                          local_count,
+                                          term.json_body_local.span);
+            if (!body) return core::make_unexpected(body.error());
+            if (!b.emit_resp_publish_body(body.value(), {term.span.line, term.span.col}))
+                return frontend_error(FrontendError::OutOfMemory, term.span);
+            body_idx = 0xffffu;  // HandlerResult::kDynamicResponseBody
+        } else if (term.has_dynamic_response_body) {
             constexpr u32 kJsonLocalCount =
                 MirFunction::kMaxLocals + MirTerminator::kMaxJsonMaterializedValues;
             rir::ValueId json_locals[kJsonLocalCount]{};

@@ -105,6 +105,7 @@ struct Ctx {
     LLVMValueRef fn_time_now_micros;
     LLVMValueRef fn_parse_prime;
     LLVMValueRef fn_parse_unprime;
+    LLVMValueRef fn_json_capture_reset;
     LLVMValueRef fn_time_unlatch;
     LLVMValueRef fn_json_reset;
     LLVMValueRef fn_json_append_raw;
@@ -112,6 +113,8 @@ struct Ctx {
     LLVMValueRef fn_json_append_str_list;
     LLVMValueRef fn_json_append_i64;
     LLVMValueRef fn_json_append_bool;
+    LLVMValueRef fn_json_capture_data;
+    LLVMValueRef fn_json_capture_len;
     LLVMValueRef fn_json_finish;
 
     // True while emitting a handler that reads the request (and therefore
@@ -202,6 +205,13 @@ struct Ctx {
         }
         return fn_json_reset;
     }
+    LLVMValueRef get_json_capture_reset() {
+        if (!fn_json_capture_reset) {
+            LLVMTypeRef ft = LLVMFunctionType(void_ty, nullptr, 0, 0);
+            fn_json_capture_reset = LLVMAddFunction(llvm_mod, "rut_helper_json_capture_reset", ft);
+        }
+        return fn_json_capture_reset;
+    }
     LLVMValueRef get_json_append_raw() {
         if (!fn_json_append_raw) {
             LLVMTypeRef params[] = {ptr_ty, i32_ty};
@@ -243,6 +253,20 @@ struct Ctx {
         }
         return fn_json_append_bool;
     }
+    LLVMValueRef get_json_capture_data() {
+        if (!fn_json_capture_data) {
+            LLVMTypeRef ft = LLVMFunctionType(ptr_ty, nullptr, 0, 0);
+            fn_json_capture_data = LLVMAddFunction(llvm_mod, "rut_helper_json_capture_data", ft);
+        }
+        return fn_json_capture_data;
+    }
+    LLVMValueRef get_json_capture_len() {
+        if (!fn_json_capture_len) {
+            LLVMTypeRef ft = LLVMFunctionType(i32_ty, nullptr, 0, 0);
+            fn_json_capture_len = LLVMAddFunction(llvm_mod, "rut_helper_json_capture_len", ft);
+        }
+        return fn_json_capture_len;
+    }
     LLVMValueRef get_json_finish() {
         if (!fn_json_finish) {
             LLVMTypeRef params[] = {ptr_ty};
@@ -259,6 +283,15 @@ struct Ctx {
         LLVMValueRef args[] = {param_req_data, param_req_len};
         LLVMBuildCall2(
             builder, LLVMGlobalGetValueType(get_parse_prime()), get_parse_prime(), args, 2, "");
+    }
+
+    void emit_json_capture_reset() {
+        LLVMBuildCall2(builder,
+                       LLVMGlobalGetValueType(get_json_capture_reset()),
+                       get_json_capture_reset(),
+                       nullptr,
+                       0,
+                       "");
     }
 
     // void rut_helper_parse_unprime()
@@ -415,7 +448,9 @@ struct Ctx {
     LLVMValueRef fn_resp_remove_header = nullptr;
     LLVMValueRef fn_resp_set_status = nullptr;
     LLVMValueRef fn_resp_set_body = nullptr;
+    LLVMValueRef fn_resp_publish_body = nullptr;
     LLVMValueRef fn_resp_commit_headers = nullptr;
+    LLVMValueRef fn_resp_commit_body = nullptr;
     LLVMValueRef fn_resp_header = nullptr;
     LLVMValueRef get_resp_set_header() {
         if (!fn_resp_set_header) {
@@ -457,6 +492,14 @@ struct Ctx {
         }
         return fn_resp_set_body;
     }
+    LLVMValueRef get_resp_publish_body() {
+        if (!fn_resp_publish_body) {
+            LLVMTypeRef params[] = {ptr_ty, ptr_ty, i32_ty};
+            fn_resp_publish_body = LLVMAddFunction(
+                llvm_mod, "rut_helper_resp_publish_body", LLVMFunctionType(void_ty, params, 3, 0));
+        }
+        return fn_resp_publish_body;
+    }
     LLVMValueRef get_resp_commit_headers() {
         if (!fn_resp_commit_headers) {
             LLVMTypeRef params[] = {ptr_ty};
@@ -465,6 +508,14 @@ struct Ctx {
                                                      LLVMFunctionType(void_ty, params, 1, 0));
         }
         return fn_resp_commit_headers;
+    }
+    LLVMValueRef get_resp_commit_body() {
+        if (!fn_resp_commit_body) {
+            LLVMTypeRef params[] = {ptr_ty};
+            fn_resp_commit_body = LLVMAddFunction(
+                llvm_mod, "rut_helper_resp_commit_body", LLVMFunctionType(void_ty, params, 1, 0));
+        }
+        return fn_resp_commit_body;
     }
     LLVMValueRef get_resp_header() {
         if (!fn_resp_header) {
@@ -1334,6 +1385,25 @@ static void emit_instruction(Ctx& c, const rir::Instruction& inst) {
                            "");
             break;
         }
+        case rir::Opcode::RespCommitBody: {
+            if (inst.operand_count == 1) {
+                LLVMValueRef value = c.get_value(inst.operands[0]);
+                LLVMValueRef ptr = LLVMBuildExtractValue(c.builder, value, 0, "respbody.ptr");
+                LLVMValueRef len = LLVMBuildExtractValue(c.builder, value, 1, "respbody.len");
+                LLVMValueRef args[] = {c.param_ctx, ptr, len};
+                LLVMValueRef helper = c.get_resp_publish_body();
+                LLVMBuildCall2(c.builder, LLVMGlobalGetValueType(helper), helper, args, 3, "");
+                break;
+            }
+            LLVMValueRef args[] = {c.param_ctx};
+            LLVMBuildCall2(c.builder,
+                           LLVMGlobalGetValueType(c.get_resp_commit_body()),
+                           c.get_resp_commit_body(),
+                           args,
+                           1,
+                           "");
+            break;
+        }
         case rir::Opcode::RespHeader: {
             Str name = inst.imm.str_val;
             LLVMValueRef name_ptr = c.make_global_str(name, "respheader.name");
@@ -2141,6 +2211,25 @@ static void emit_instruction(Ctx& c, const rir::Instruction& inst) {
             emit_json_value(c, c.get_value(inst.operands[0]), type, 0);
             break;
         }
+        case rir::Opcode::JsonCapture: {
+            LLVMValueRef data = LLVMBuildCall2(c.builder,
+                                               LLVMGlobalGetValueType(c.get_json_capture_data()),
+                                               c.get_json_capture_data(),
+                                               nullptr,
+                                               0,
+                                               "json.data");
+            LLVMValueRef len = LLVMBuildCall2(c.builder,
+                                              LLVMGlobalGetValueType(c.get_json_capture_len()),
+                                              c.get_json_capture_len(),
+                                              nullptr,
+                                              0,
+                                              "json.len");
+            LLVMValueRef value = LLVMGetUndef(c.str_ty);
+            value = LLVMBuildInsertValue(c.builder, value, data, 0, "json.value.ptr");
+            value = LLVMBuildInsertValue(c.builder, value, len, 1, "json.value");
+            c.set_value(inst.result, value);
+            break;
+        }
         case rir::Opcode::JsonFinish: {
             LLVMValueRef args[] = {c.param_ctx};
             LLVMBuildCall2(c.builder,
@@ -2424,6 +2513,7 @@ static bool emit_function(Ctx& c, const rir::Function& fn) {
 
         LLVMPositionBuilderAtEnd(c.builder, dispatch_bb);
         c.ctx_store_sink = LLVMBuildAlloca(c.builder, c.i64_ty, "ctx.slot.store.sink");
+        c.emit_json_capture_reset();
         // Parse-once: prime the per-thread parse cache before any state runs,
         // so every req_* helper in this invocation shares one parse. Skipped
         // for handlers that never read the request (status/forward only).
@@ -2482,6 +2572,7 @@ static bool emit_function(Ctx& c, const rir::Function& fn) {
     } else {
         LLVMPositionBuilderAtEnd(c.builder, c.block_map[fn.blocks[0].id.id]);
         c.ctx_store_sink = LLVMBuildAlloca(c.builder, c.i64_ty, "ctx.slot.store.sink");
+        c.emit_json_capture_reset();
         // Parse-once: prime the per-thread parse cache at handler entry,
         // unless the handler never reads the request.
         if (kNeedsParse) c.emit_parse_prime();

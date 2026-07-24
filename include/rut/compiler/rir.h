@@ -183,6 +183,7 @@ enum class Opcode : u8 {
     RespSetStatus,      // resp.status = %i32
     RespSetBody,        // resp.body = %str (bounded copy into request-owned pooled storage)
     RespCommitHeaders,  // publish all pending Response-builder mutations
+    RespCommitBody,     // no operand: commit pending body; str operand: publish direct body
     ReqSetPath,         // req.set_path %path
     CtxStoreSlotI32,    // if i < ctx.slot_count: ctx.slot[i] = %val
                         // Stored as a zero-extended i64 slot. If no slot
@@ -238,6 +239,7 @@ enum class Opcode : u8 {
     JsonAppendStr,      // append escaped/quoted str operand
     JsonAppendStrList,  // append runtime ordered string view as a JSON array
     JsonAppendArray,    // append a bounded generic Array<T> recursively
+    JsonCapture,        // capture scratch as str; overflow becomes an invalid view
     JsonFinish,         // publish scratch through HandlerCtx
 
     // ── Struct operations ──

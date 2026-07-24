@@ -709,6 +709,19 @@ struct Builder {
         return {};
     }
 
+    VoidResult emit_resp_commit_body(SourceLoc loc = {}) {
+        TRY_VOID(emit(Opcode::RespCommitBody, nullptr, loc));
+        return {};
+    }
+
+    VoidResult emit_resp_publish_body(ValueId val, SourceLoc loc = {}) {
+        if (!val_has_type(val, TypeKind::Str)) return err(RirError::InvalidState);
+        auto r = TRY(emit(Opcode::RespCommitBody, nullptr, loc));
+        r.inst->operands[0] = val;
+        r.inst->operand_count = 1;
+        return {};
+    }
+
     VoidResult emit_json_reset(SourceLoc loc = {}) {
         TRY_VOID(emit(Opcode::JsonReset, nullptr, loc));
         return {};
@@ -736,6 +749,11 @@ struct Builder {
         r.inst->operands[0] = value;
         r.inst->operand_count = 1;
         return {};
+    }
+
+    Result<ValueId> emit_json_capture(SourceLoc loc = {}) {
+        auto* ty = TRY(make_type(TypeKind::Str));
+        return TRY(emit(Opcode::JsonCapture, ty, loc)).vid;
     }
 
     VoidResult emit_json_finish(SourceLoc loc = {}) {

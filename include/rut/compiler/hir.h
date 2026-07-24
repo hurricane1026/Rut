@@ -195,6 +195,10 @@ enum class HirExprKind : u8 {
     // the value in rhs and echoes it (type I64).
     CacheGet,
     CacheSet,
+    // Compiler-owned reusable JSON plan. field_inits stores each raw segment
+    // in `name` and the following dynamic leaf in `value`; str_value is the
+    // final raw segment. The plan is serialized only at an output sink.
+    JsonBuild,
     // Checker-level control-plane snapshots. They deliberately have no MIR
     // carrier until HandlerCtx exposes the corresponding runtime services.
     StatsSnapshot,
@@ -233,6 +237,9 @@ enum class HirTypeKind : u8 {
     // A bounded response builder local. It is consumed by `return <local>` and
     // does not have a runtime MIR carrier in the initial literal-only slice.
     Response,
+    // Compile-time JSON plan with captured typed leaves. It has no standalone
+    // runtime carrier and is consumed by response/return body sinks.
+    Json,
     // Opaque, json()-serializable control-plane snapshot types.
     Stats,
     Metrics,
@@ -555,6 +562,9 @@ struct HirFunction {
     FixedVec<TypeParamDecl, kMaxTypeParams> type_params;
     FixedVec<ParamDecl, kMaxParams> params;
     FixedVec<HirExpr, kMaxExprs> exprs;
+    // Parallel to exprs: source helper-local ref materialized by this ordered
+    // expression, or UINT32_MAX for response effects and arena-only children.
+    FixedVec<u32, kMaxExprs> expr_materialized_local_refs;
     struct RespondHeader {
         Str key{};
         Str value{};
@@ -589,6 +599,7 @@ struct HirFunction {
           type_params(other.type_params),
           params(other.params),
           exprs(other.exprs),
+          expr_materialized_local_refs(other.expr_materialized_local_refs),
           respond_guards(other.respond_guards),
           body(other.body) {
         for (u32 i = 0; i < other.return_tuple_len; i++) {
@@ -629,6 +640,7 @@ struct HirFunction {
         type_params = other.type_params;
         params = other.params;
         exprs = other.exprs;
+        expr_materialized_local_refs = other.expr_materialized_local_refs;
         respond_guards = other.respond_guards;
         body = other.body;
         rebase_from(other);
@@ -651,6 +663,7 @@ struct HirFunction {
           type_params(other.type_params),
           params(other.params),
           exprs(other.exprs),
+          expr_materialized_local_refs(other.expr_materialized_local_refs),
           respond_guards(other.respond_guards),
           body(other.body) {
         for (u32 i = 0; i < other.return_tuple_len; i++) {
@@ -691,6 +704,7 @@ struct HirFunction {
         type_params = other.type_params;
         params = other.params;
         exprs = other.exprs;
+        expr_materialized_local_refs = other.expr_materialized_local_refs;
         respond_guards = other.respond_guards;
         body = other.body;
         rebase_from(other);
@@ -818,6 +832,9 @@ struct HirTerminator {
     FixedVec<Str, kMaxJsonDynamicValues + 1> json_segments;
     FixedVec<u32, kMaxJsonDynamicValues> json_value_ref_indices;
     FixedVec<u32, kMaxJsonMaterializedValues> json_value_expr_indices;
+    // Whole reusable Json plan for a direct return/respond sink. Unlike the
+    // scalar template fields above, its materialized Str is already encoded.
+    u32 json_body_expr_index = 0xffffffffu;
     // Optional response headers from `response(N, headers: {...})`.
     // Inline-stored so analyze doesn't need the AstFile handle, and
     // downstream passes don't need a module-level pool. len == 0
