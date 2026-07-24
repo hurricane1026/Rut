@@ -447,6 +447,18 @@ static bool markdown_fence_language(std::string_view info, std::string_view lang
                                 (info[language.size()] == ' ' || info[language.size()] == '\t'));
 }
 
+static bool markdown_fence_language_case_insensitive(std::string_view info,
+                                                     std::string_view language) {
+    if (info.size() < language.size()) return false;
+    for (size_t i = 0; i < language.size(); i++) {
+        char c = info[i];
+        if (c >= 'A' && c <= 'Z') c = static_cast<char>(c - 'A' + 'a');
+        if (c != language[i]) return false;
+    }
+    return info.size() == language.size() || info[language.size()] == ' ' ||
+           info[language.size()] == '\t';
+}
+
 static bool is_markdown_fence_close(std::string_view line, const MarkdownFence& opening) {
     line = markdown_fence_content(line, opening);
     size_t pos = 0;
@@ -664,6 +676,18 @@ static std::string_view markdown_block_content(std::string_view content) {
     return content.substr(indent);
 }
 
+static bool markdown_is_indented_code_block(std::string_view content) {
+    size_t pos = 0;
+    size_t column = 0;
+    while (pos < content.size() && (content[pos] == ' ' || content[pos] == '\t')) {
+        column = markdown_next_column(column, content[pos]);
+        pos++;
+        if (column >= 4)
+            return content.substr(pos).find_first_not_of(" \t\r") != std::string_view::npos;
+    }
+    return false;
+}
+
 static bool markdown_raw_html_closes(std::string_view end_marker, std::string_view content) {
     if (end_marker.size() == 1 && end_marker[0] == kMarkdownRawHtmlBlankLine)
         return content.find_first_not_of(" \t\r") == std::string_view::npos;
@@ -681,6 +705,9 @@ TEST(frontend, language_card_fence_parser_accepts_commonmark_variants) {
 
     REQUIRE(parse_markdown_fence_open("~~~swift title=example", &fence));
     CHECK(markdown_fence_language(fence.info, "swift"));
+    CHECK(markdown_fence_language_case_insensitive("Swift title=example", "swift"));
+    CHECK(markdown_fence_language_case_insensitive("SWIFT", "swift"));
+    CHECK_FALSE(markdown_fence_language_case_insensitive("swiftish", "swift"));
     CHECK(is_markdown_fence_close("~~~~", fence));
 
     REQUIRE(parse_markdown_fence_open("> ```rut", &fence));
@@ -771,6 +798,9 @@ TEST(frontend, language_card_detects_raw_html_fence_exclusions) {
     CHECK(markdown_interrupts_paragraph("## heading"));
     CHECK(markdown_interrupts_paragraph("  * * *"));
     CHECK_FALSE(markdown_interrupts_paragraph("      # indented paragraph text"));
+    CHECK(markdown_is_indented_code_block("    <widget>"));
+    CHECK(markdown_is_indented_code_block("\t<widget>"));
+    CHECK_FALSE(markdown_is_indented_code_block("   <widget>"));
     CHECK(markdown_interrupts_paragraph("  ===  "));
     CHECK(markdown_interrupts_paragraph("-"));
     CHECK_FALSE(markdown_interrupts_paragraph("===", false));
@@ -810,6 +840,13 @@ TEST(frontend, language_card_list_container_survives_blank_line) {
     MarkdownFence fence{};
     CHECK(parse_markdown_fence_open_content(content, &fence));
     CHECK(markdown_fence_language(fence.info, "rut"));
+
+    container.clear();
+    CHECK_EQ(markdown_container_content("- # heading", 0, nullptr, &container), "# heading");
+    REQUIRE_EQ(container.size(), 1u);
+    CHECK(markdown_strip_container("  ~~~~markdown", container, &content));
+    CHECK_EQ(content, "~~~~markdown");
+    CHECK_FALSE(markdown_strip_container("outside the list", container, &content));
 }
 
 TEST(frontend, language_card_ordered_list_interrupt_requires_start_one) {
@@ -1104,6 +1141,8 @@ TEST(frontend, language_card_unmarked_rut_examples_parse_and_typecheck) {
                 continue;
             }
             const std::string_view block_content = markdown_block_content(container_content);
+            const bool indented_code =
+                !paragraph_open && markdown_is_indented_code_block(container_content);
             const bool interrupts_paragraph =
                 markdown_interrupts_paragraph(container_content, paragraph_open);
             if (interrupts_paragraph) {
@@ -1111,8 +1150,10 @@ TEST(frontend, language_card_unmarked_rut_examples_parse_and_typecheck) {
                 paragraph_container.clear();
             }
             bool html_can_interrupt_paragraph = true;
-            const std::string html_end =
-                markdown_raw_html_end_marker(block_content, &html_can_interrupt_paragraph);
+            const std::string html_end = indented_code
+                                             ? std::string{}
+                                             : markdown_raw_html_end_marker(
+                                                   block_content, &html_can_interrupt_paragraph);
             if (!html_end.empty() && (!paragraph_open || html_can_interrupt_paragraph)) {
                 REQUIRE_MSG(!pending_skip, "a skip marker must immediately precede a rut fence");
                 const std::string lower = markdown_ascii_lower(block_content);
@@ -1126,16 +1167,19 @@ TEST(frontend, language_card_unmarked_rut_examples_parse_and_typecheck) {
             }
             MarkdownFence opening{};
             const bool is_opening =
-                pending_skip
-                    ? parse_markdown_fence_open_in_container(line, pending_skip_container, &opening)
-                    : parse_markdown_fence_open_content(container_content, &opening);
+                !indented_code &&
+                (pending_skip
+                     ? parse_markdown_fence_open_in_container(
+                           line, pending_skip_container, &opening)
+                     : parse_markdown_fence_open_content(container_content, &opening));
             if (is_opening && !pending_skip) {
                 opening.container_segments = line_container;
                 for (const auto& segment : line_container)
                     if (segment.kind == MarkdownContainerSegment::Kind::List)
                         opening.container_indent += segment.continuation_width;
             }
-            REQUIRE_MSG(!is_opening || !markdown_fence_language(opening.info, "swift"),
+            REQUIRE_MSG(!is_opening ||
+                            !markdown_fence_language_case_insensitive(opening.info, "swift"),
                         "language-card language fences must use rut");
             if (is_opening) {
                 in_fence = true;
@@ -1156,16 +1200,14 @@ TEST(frontend, language_card_unmarked_rut_examples_parse_and_typecheck) {
                 continue;
             }
             REQUIRE_MSG(!pending_skip, "a skip marker must immediately precede a rut fence");
-            paragraph_open = !interrupts_paragraph && !container_line_blank;
+            paragraph_open = !indented_code && !interrupts_paragraph && !container_line_blank;
             if (paragraph_open)
                 paragraph_container = std::move(line_container);
             else {
-                if (container_line_blank) {
-                    bool has_list = false;
-                    for (const auto& segment : line_container)
-                        has_list |= segment.kind == MarkdownContainerSegment::Kind::List;
-                    if (has_list) continued_list_container = line_container;
-                }
+                bool has_list = false;
+                for (const auto& segment : line_container)
+                    has_list |= segment.kind == MarkdownContainerSegment::Kind::List;
+                if (has_list) continued_list_container = line_container;
                 paragraph_container.clear();
             }
         }
