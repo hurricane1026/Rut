@@ -244,7 +244,8 @@ ReplayDriverResult drive_replay_file(Loop& loop, ReplayReader& reader, const Har
         }
         out.harness.backend_completions += replay.backend_completions;
 
-        if (!detail::publish_replay_result(spec, out.harness, out.replay.total - 1, replay)) {
+        if (!detail::publish_replay_result(
+                spec, out.harness, out.harness.semantic_events, replay)) {
             stopped_by_observer = !out.harness.has_reached_limit;
             break;
         }
