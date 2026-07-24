@@ -6186,6 +6186,27 @@ static bool function_has_response_effects(const HirFunction& fn) {
     return false;
 }
 
+static bool hir_expr_has_deferred_protocol_call(const HirExpr& expr) {
+    if (expr.kind == HirExprKind::ProtocolCall) return true;
+    if (expr.lhs != nullptr && hir_expr_has_deferred_protocol_call(*expr.lhs)) return true;
+    if (expr.rhs != nullptr && hir_expr_has_deferred_protocol_call(*expr.rhs)) return true;
+    for (u32 ai = 0; ai < expr.args.len; ai++)
+        if (expr.args[ai] != nullptr && hir_expr_has_deferred_protocol_call(*expr.args[ai]))
+            return true;
+    for (u32 fi = 0; fi < expr.field_inits.len; fi++)
+        if (expr.field_inits[fi].value != nullptr &&
+            hir_expr_has_deferred_protocol_call(*expr.field_inits[fi].value))
+            return true;
+    return false;
+}
+
+static bool function_has_deferred_protocol_call(const HirFunction& fn) {
+    if (hir_expr_has_deferred_protocol_call(fn.body)) return true;
+    for (u32 ei = 0; ei < fn.exprs.len; ei++)
+        if (hir_expr_has_deferred_protocol_call(fn.exprs[ei])) return true;
+    return false;
+}
+
 static bool is_response_effect(HirExprKind kind) {
     return kind == HirExprKind::RespSetHeader || kind == HirExprKind::RespAddHeader ||
            kind == HirExprKind::RespRemoveHeader || kind == HirExprKind::RespSetStatus ||
@@ -8347,6 +8368,7 @@ static FrontendResult<HirExpr> analyze_expr_impl(const AstExpr& expr,
                 return frontend_error(FrontendError::TooManyItems, expr.span);
             out.kind = read_status ? HirExprKind::RespStatus : HirExprKind::RespBody;
             out.type = read_status ? HirTypeKind::I32 : HirTypeKind::Str;
+            out.is_response_snapshot = true;
             out.lhs = &route->exprs[route->exprs.len - 1];
             return out;
         }
@@ -11261,7 +11283,7 @@ static FrontendResult<HirExpr> analyze_call_expr(const AstExpr& expr,
                     expr.span,
                     "respond-capable helper calls are not supported in conditional pipe",
                     nullptr);
-            if (function_has_response_effects(fn))
+            if (function_has_response_effects(fn) || function_has_deferred_protocol_call(fn))
                 return fail_call(expr.span,
                                  "response-mutating helpers are not supported in conditional pipe",
                                  nullptr);

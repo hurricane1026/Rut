@@ -1753,6 +1753,7 @@ TEST(h2_serving, arming_suspended_handler_releases_scratch_body_storage) {
     scratch->response_body_mutation_storage = jit::acquire_response_body_mutation_storage();
     REQUIRE(scratch->response_body_mutation_storage != nullptr);
     auto* parked = h2.async_jit_ctx();
+    REQUIRE(parked->response_body_snapshot_storage == nullptr);
     parked->response_body_mutation_storage = jit::acquire_response_body_mutation_storage();
     REQUIRE(parked->response_body_mutation_storage != nullptr);
     char* parked_storage = parked->response_body_mutation_storage;

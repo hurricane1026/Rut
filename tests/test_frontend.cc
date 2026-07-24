@@ -8225,6 +8225,36 @@ route GET "/x" {
     REQUIRE_FALSE(hir.has_value());
 }
 
+TEST(frontend, deferred_protocol_response_effects_are_rejected_in_conditional_pipes) {
+    const char* src = R"rut(
+protocol Mutator { func mutate(_ resp: Response) -> i32 }
+struct Box { value: i32 }
+Box impl Mutator {
+    func mutate(self: Box, _ resp: Response) -> i32 {
+        resp.add("X-Probe", "mutated")
+        self.value
+    }
+}
+func apply<T: Mutator>(box: T, value: str, _ resp: Response) -> str {
+    let ignored = box.mutate(resp)
+    value
+}
+route GET "/x" {
+    let resp = response(200)
+    let value = req.header("X") | apply(Box(value: 0), _, resp)
+    return resp
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE_FALSE(hir.has_value());
+    CHECK(hir.error().detail.eq(
+        lit("response-mutating helpers are not supported in conditional pipe")));
+}
+
 TEST(frontend, parse_func_param_accepts_underscore_label) {
     const char* src = "func auth(_ req: i32) -> i32 => 0\n";
     auto lexed = lex(lit(src));
@@ -35845,6 +35875,41 @@ route GET "/x" {
     REQUIRE_FALSE(hir.has_value());
     CHECK(
         hir.error().detail.eq(lit("json cannot preserve Response field snapshots across a wait")));
+}
+
+TEST(frontend, reusable_json_rejects_response_scalar_snapshots_across_wait) {
+    const char* cases[] = {
+        R"rut(
+route GET "/x" {
+    let resp = response(200)
+    resp.body = "old"
+    let payload = json({ value: resp.body })
+    resp.body = "new"
+    wait(5)
+    return 200, payload
+}
+)rut",
+        R"rut(
+route GET "/x" {
+    let resp = response(200)
+    resp.status = 201
+    let payload = json({ value: resp.status })
+    resp.status = 202
+    wait(5)
+    return 200, payload
+}
+)rut",
+    };
+    for (const char* src : cases) {
+        auto lexed = lex(lit(src));
+        REQUIRE(lexed);
+        auto ast = parse_file_heap(lexed.value());
+        REQUIRE(ast);
+        auto hir = analyze_file_heap(ast.value());
+        REQUIRE_FALSE(hir.has_value());
+        CHECK(hir.error().detail.eq(
+            lit("json cannot preserve Response field snapshots across a wait")));
+    }
 }
 
 TEST(frontend, helper_local_json_plan_captures_scalar_arguments_at_call_site) {
