@@ -142,8 +142,9 @@ The current design review keeps the following direction:
 - Optional/fallback syntax should prefer named forms in Rut Core. Use
   `.or(default)`, `guard let`, or `match`; the symbolic forms `?.` and `??`
   are deprecated and unsupported.
-- Chain order should be visible source order. A route attaches one explicit
-  chain with `use chain`; when several policies apply, that chain declares their
-  complete order instead of relying on grouped-route inheritance. Implemented
-  response-header `after` lowering follows the same visible order rather than a
+- Chain order should be visible source order within each handler phase. A route
+  attaches one explicit chain with `use chain`; when several policies apply,
+  that chain declares their pre-handler and post-handler order instead of
+  relying on grouped-route inheritance. Implemented response-header `after`
+  lowering follows source order within the post-handler phase rather than a
   reverse wrapper unwind.

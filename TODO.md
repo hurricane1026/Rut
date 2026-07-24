@@ -84,6 +84,13 @@ implementation promise.
 - Review findings that reveal a recurring class add one scoped backlog item with
   an acceptance criterion, not a historical incident log.
 
+## Front-End Migration
+
+- [ ] Migrate remaining executable topic-guide examples from compatibility
+  spellings to Rut Core, including the inferred generic helper in
+  `docs/pipe.md`; any example intentionally retained to teach compatibility
+  must be labeled as such and paired with its Core specialization.
+
 ## Recently Completed
 
 - [x] Executable `.rut` examples and topic documentation use Rut Core route

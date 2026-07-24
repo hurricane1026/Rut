@@ -96,7 +96,12 @@ and bounded body effects in resumable state, including on routes containing
 `forward(..., buffered: true)`, or bind the same buffered operation as a
 first-class `Response` when the handler needs to inspect or mutate owned
 upstream fields. A Core route attaches one explicit chain, whose steps execute
-in source order.
+in two handler phases: all `before` steps run before the route body and preserve
+their relative source order. For the selected handler's normal response, all
+`after` steps then run after the body and preserve their relative source order;
+guard failures and pre-handler short circuits return without that phase.
+Interleaving `before` and `after` declarations does not create one global
+source-ordered sequence across phases.
 
 See [chains.md](chains.md) for the current design direction.
 The generated-code profile and compatibility migrations are listed in
