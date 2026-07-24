@@ -35880,21 +35880,25 @@ route GET "/x" {
 TEST(frontend, reusable_json_rejects_response_scalar_snapshots_across_wait) {
     const char* cases[] = {
         R"rut(
-route GET "/x" {
+func encode() -> Json {
     let resp = response(200)
     resp.body = "old"
-    let payload = json({ value: resp.body })
-    resp.body = "new"
+    json({ value: resp.body })
+}
+route GET "/x" {
+    let payload = encode()
     wait(5)
     return 200, payload
 }
 )rut",
         R"rut(
-route GET "/x" {
+func encode() -> Json {
     let resp = response(200)
     resp.status = 201
-    let payload = json({ value: resp.status })
-    resp.status = 202
+    json({ value: resp.status })
+}
+route GET "/x" {
+    let payload = encode()
     wait(5)
     return 200, payload
 }
