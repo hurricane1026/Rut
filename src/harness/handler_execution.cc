@@ -114,6 +114,7 @@ HandlerExecutionResult& HandlerExecutionResult::operator=(const HandlerExecution
         captured_response_body, other.captured_response_body, sizeof(captured_response_body));
     captured_response_body_len = other.captured_response_body_len;
     uses_captured_response = other.uses_captured_response;
+    captured_response_body_mutated = other.captured_response_body_mutated;
     captured_response_header_count = other.captured_response_header_count;
     for (u32 i = 0; i < jit::kMaxCapturedResponseHeaders; i++) {
         captured_response_headers[i] = other.captured_response_headers[i];
@@ -467,6 +468,8 @@ HandlerExecutionResult drive_handler_deterministically(const DeterministicHandle
     out.terminal = result;
     out.has_terminal = true;
     out.uses_captured_response = returned_captured_response;
+    out.captured_response_body_mutated =
+        returned_captured_response && response.response_body_mutation_set;
     if (result.action == jit::HandlerAction::ReturnStatus &&
         (result.upstream_id == jit::HandlerResult::kDynamicResponseBody ||
          returned_captured_response)) {

@@ -803,6 +803,7 @@ TEST(harness_handler, routes_captured_body_mutations_through_captured_storage) {
     static constexpr char kExpected[] = "replacement";
     REQUIRE_EQ(result.harness.outcome, harness::Outcome::Passed);
     REQUIRE(result.uses_captured_response);
+    CHECK(result.captured_response_body_mutated);
     REQUIRE_EQ(result.captured_response_body_len, sizeof(kExpected) - 1);
     CHECK(std::memcmp(result.captured_response_body, kExpected, sizeof(kExpected) - 1) == 0);
 }
@@ -837,6 +838,7 @@ TEST(harness_handler, preserves_captured_body_beyond_dynamic_json_limit) {
     const auto result = harness::drive_handler_deterministically(driver, spec);
     REQUIRE_EQ(result.harness.outcome, harness::Outcome::Passed);
     REQUIRE(result.uses_captured_response);
+    CHECK_FALSE(result.captured_response_body_mutated);
     CHECK_EQ(result.captured_response_body_len, sizeof(body));
     CHECK(std::memcmp(result.captured_response_body, body, sizeof(body)) == 0);
 }
@@ -872,6 +874,7 @@ TEST(harness_handler, owns_captured_headers_across_result_copies) {
     const auto result = harness::drive_handler_deterministically(driver, spec);
     const harness::HandlerExecutionResult copied = result;
     REQUIRE(copied.uses_captured_response);
+    CHECK_EQ(copied.captured_response_body_mutated, result.captured_response_body_mutated);
     REQUIRE_EQ(copied.captured_response_header_count, 1u);
     CHECK(copied.captured_response_headers[0].name.eq({"X-Origin", 8}));
     CHECK(copied.captured_response_headers[0].value.eq({"fixture", 7}));

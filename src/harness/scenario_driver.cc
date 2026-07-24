@@ -580,6 +580,7 @@ ScenarioResult drive_scenario(const ScenarioSpec& scenario, const HarnessSpec& h
             dynamic_response_body_len = driven.captured_response_body_len;
             dynamic_response_body_valid = true;
             response_ctx.captured_response_valid = true;
+            response_ctx.response_body_mutation_set = driven.captured_response_body_mutated;
             response_ctx.captured_response_header_count = driven.captured_response_header_count;
             for (u32 i = 0; i < driven.captured_response_header_count; i++)
                 response_ctx.captured_response_headers[i] = driven.captured_response_headers[i];

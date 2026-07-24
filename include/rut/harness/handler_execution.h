@@ -72,6 +72,7 @@ struct HandlerExecutionResult {
                                 jit::kCapturedResponseFramingReserve]{};
     u32 captured_response_body_len = 0;
     bool uses_captured_response = false;
+    bool captured_response_body_mutated = false;
     jit::CapturedResponseHeader captured_response_headers[jit::kMaxCapturedResponseHeaders]{};
     std::string captured_response_header_names[jit::kMaxCapturedResponseHeaders];
     std::string captured_response_header_values[jit::kMaxCapturedResponseHeaders];
