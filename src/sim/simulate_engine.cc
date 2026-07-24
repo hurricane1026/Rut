@@ -162,6 +162,17 @@ static bool rir_function_needs_req_body(const rir::Function& fn) {
     return false;
 }
 
+static bool rir_function_needs_control_plane_snapshot(const rir::Function& fn) {
+    if (fn.blocks == nullptr) return false;
+    for (u32 bi = 0; bi < fn.block_count; bi++) {
+        const auto& block = fn.blocks[bi];
+        if (block.insts == nullptr) continue;
+        for (u32 ii = 0; ii < block.inst_count; ii++)
+            if (block.insts[ii].op == rir::Opcode::JsonAppendControlPlane) return true;
+    }
+    return false;
+}
+
 static bool copy_str_into_arena(MmapArena& arena, const char* src, u32 len, Str* out) {
     char* mem = arena.alloc_array<char>(len + 1);
     if (!mem) return false;
@@ -876,6 +887,7 @@ bool Engine::init(const rir::Module& module,
         route.pattern[route.pattern_len] = '\0';
         route.fn = reinterpret_cast<jit::HandlerFn>(addr);
         route.needs_req_body = rir_function_needs_req_body(fn);
+        route.needs_control_plane_snapshot = rir_function_needs_control_plane_snapshot(fn);
     }
 
     for (u32 i = 0; i < next_route_count; i++) routes[i] = next_routes[i];
@@ -930,6 +942,10 @@ SimulateResult simulate_one(Engine& engine, const CaptureEntry& entry) {
         return result;
     }
     if (route->needs_req_body) {
+        result.verdict = Verdict::Unsupported;
+        return result;
+    }
+    if (route->needs_control_plane_snapshot) {
         result.verdict = Verdict::Unsupported;
         return result;
     }

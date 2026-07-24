@@ -19,10 +19,11 @@ the parser does not make a spelling part of the stable core.
 | Capability | Rut Core spelling | Compatibility surface | Experimental surface |
 |---|---|---|---|
 | Routes | `route GET "/path" { ... }` | grouped `route { ... }` declarations | host/path groups, method unions, expression entries |
-| Middleware | `chain` with ordered `before`; bounded response `after`; terminal `forward(..., buffered: true)` when proxying | official built-in decorators | first-class buffered Response expressions |
+| Middleware | `chain` with ordered `before`; bounded response `after`; terminal or first-class `forward(..., buffered: true)` when proxying | official built-in decorators | custom middleware/decorators |
 | Pipe | `value \| fn(_, arg)` | `_.method(...)`, `_1` … `_10` | a dedicated pipe IR or wider runtime tuple projection |
 | Fallback | `.or(default)`, `guard let`, `if let`, explicit `match` | eager `any(value, default)` and present-only `all(value, next)` | none |
 | Match | flat `i32`, boolean, string, or variant arms with an explicit fallback where needed | `match const` and restricted nested route-match expansion | `i64` subjects and unrestricted nested/pattern match |
+| Loops | `for item in [compile, time, values]` with verifier-bounded unrolling and unlabeled `break`/`continue` | compile-time array aliases | runtime iterators, `while`, labeled control, and loop `else` |
 | Reuse | concrete direct functions and named builtin helpers | inferred generic helpers and protocol-style calls in hand-written code | custom `protocol`/`impl` or generic constraints as generated-code abstractions |
 | Async | explicit `wait(...)`, `wait any`, terminal `forward(...)` | none | outbound HTTP, `submit`, `fire`, raw socket, and lifecycle syntax not wired end to end |
 
@@ -110,9 +111,9 @@ the compatibility form's eager effects.
 implemented bounded response slice: the helper must receive exactly one
 `Response` and may perform ordered header, status, and body effects. Effects
 survive visible `wait` and verifier-bounded `for` control flow. Streaming
-forwards cannot be post-processed; proxy routes must opt into terminal
-`forward(..., buffered: true)`. Binding that operation as a first-class
-`Response` remains experimental.
+forwards cannot be post-processed; proxy routes must opt into buffered
+`forward(..., buffered: true)`. Its first-class expression form owns bounded
+upstream fields and may be read or mutated before `return resp`.
 
 ## Review Rule
 

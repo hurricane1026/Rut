@@ -110,6 +110,22 @@ HandlerExecutionResult& HandlerExecutionResult::operator=(const HandlerExecution
         dynamic_response_body, other.dynamic_response_body, sizeof(dynamic_response_body));
     dynamic_response_body_len = other.dynamic_response_body_len;
     dynamic_response_body_valid = other.dynamic_response_body_valid;
+    __builtin_memcpy(
+        captured_response_body, other.captured_response_body, sizeof(captured_response_body));
+    captured_response_body_len = other.captured_response_body_len;
+    uses_captured_response = other.uses_captured_response;
+    captured_response_header_count = other.captured_response_header_count;
+    for (u32 i = 0; i < jit::kMaxCapturedResponseHeaders; i++) {
+        captured_response_headers[i] = other.captured_response_headers[i];
+        captured_response_header_names[i] = other.captured_response_header_names[i];
+        captured_response_header_values[i] = other.captured_response_header_values[i];
+        captured_response_headers[i].name = {
+            captured_response_header_names[i].data(),
+            static_cast<u32>(captured_response_header_names[i].size())};
+        captured_response_headers[i].value = {
+            captured_response_header_values[i].data(),
+            static_cast<u32>(captured_response_header_values[i].size())};
+    }
     response_header_count = other.response_header_count;
     response_header_overflow = other.response_header_overflow;
     for (u32 i = 0; i < jit::kMaxResponseHeaderMutations; i++) {
@@ -316,19 +332,79 @@ HandlerExecutionResult drive_handler_deterministically(const DeterministicHandle
         out.harness.virtual_time_us = environment.now_us;
         out.consumed_events = environment.cursor;
         if (event.data_len != 0 && event.kind != jit::YieldKind::Recv &&
-            event.kind != jit::YieldKind::UpstreamRecv) {
+            event.kind != jit::YieldKind::UpstreamRecv && event.kind != jit::YieldKind::Forward) {
             out.harness.outcome = Outcome::Invalid;
             copy_detail(out.harness.detail,
                         sizeof(out.harness.detail),
-                        "scripted data requires a recv completion");
+                        "scripted data requires a recv or forward completion");
             return out;
         }
-        if (event.data_len != 0 && event.result != static_cast<i32>(event.data_len)) {
+        if (event.data_len != 0 && event.kind != jit::YieldKind::Forward &&
+            event.result != static_cast<i32>(event.data_len)) {
             out.harness.outcome = Outcome::Invalid;
             copy_detail(out.harness.detail,
                         sizeof(out.harness.detail),
                         "recv result does not match scripted data length");
             return out;
+        }
+        if (event.kind == jit::YieldKind::Forward) {
+            if (event.response_status < 100 || event.response_status > 599 ||
+                event.response_header_count > jit::kMaxCapturedResponseHeaders ||
+                (event.response_header_count != 0 && event.response_headers == nullptr) ||
+                (event.data_len != 0 && event.data == nullptr)) {
+                out.harness.outcome = Outcome::Invalid;
+                copy_detail(out.harness.detail,
+                            sizeof(out.harness.detail),
+                            "forward completion requires a valid response fixture");
+                return out;
+            }
+            for (u32 i = 0; i < event.response_header_count; i++) {
+                const auto& header = event.response_headers[i];
+                if ((header.name.len != 0 && header.name.ptr == nullptr) ||
+                    (header.value.len != 0 && header.value.ptr == nullptr)) {
+                    out.harness.outcome = Outcome::Invalid;
+                    copy_detail(out.harness.detail,
+                                sizeof(out.harness.detail),
+                                "forward completion requires valid response header views");
+                    return out;
+                }
+            }
+            if (event.data_len >
+                jit::kMaxCapturedResponseStorageBytes - jit::kCapturedResponseFramingReserve) {
+                out.harness.outcome = Outcome::Invalid;
+                copy_detail(out.harness.detail,
+                            sizeof(out.harness.detail),
+                            "forward completion exceeds captured response storage");
+                return out;
+            }
+            u32 captured_bytes = event.data_len;
+            for (u32 i = 0; i < event.response_header_count; i++) {
+                const auto& header = event.response_headers[i];
+                if (header.name.len > jit::kMaxCapturedResponseStorageBytes - captured_bytes ||
+                    header.value.len >
+                        jit::kMaxCapturedResponseStorageBytes - captured_bytes - header.name.len) {
+                    captured_bytes = jit::kMaxCapturedResponseStorageBytes;
+                    break;
+                }
+                captured_bytes += header.name.len + header.value.len;
+            }
+            if (captured_bytes >
+                jit::kMaxCapturedResponseStorageBytes - jit::kCapturedResponseFramingReserve) {
+                out.harness.outcome = Outcome::Invalid;
+                copy_detail(out.harness.detail,
+                            sizeof(out.harness.detail),
+                            "forward completion exceeds captured response storage");
+                return out;
+            }
+            auto& response = execution.frame.context;
+            response.captured_response_valid = true;
+            response.captured_response_status = event.response_status;
+            response.captured_response_body = reinterpret_cast<const char*>(event.data);
+            response.captured_response_body_len = event.data_len;
+            response.captured_response_header_count = event.response_header_count;
+            for (u32 i = 0; i < event.response_header_count; i++)
+                response.captured_response_headers[i] = event.response_headers[i];
+            event.result = event.response_status;
         }
         if (event.data_len > harness.limits.max_input_bytes - out.harness.input_bytes) {
             out.harness.outcome = Outcome::Failed;
@@ -374,26 +450,67 @@ HandlerExecutionResult drive_handler_deterministically(const DeterministicHandle
     }
 
     const auto& response = execution.frame.context;
+    bool returned_captured_response =
+        result.action == jit::HandlerAction::ReturnStatus && result.status_code == 0;
     result = effective_return_result(result, response);
+    if (returned_captured_response) {
+        if (!response.captured_response_valid || response.response_status_invalid ||
+            response.response_body_mutation_overflow) {
+            result = jit::HandlerResult::make_status(500);
+            returned_captured_response = false;
+        } else {
+            if (!response.response_status_set)
+                result.status_code = response.captured_response_status;
+            result.upstream_id = jit::HandlerResult::kDynamicResponseBody;
+        }
+    }
     out.terminal = result;
     out.has_terminal = true;
+    out.uses_captured_response = returned_captured_response;
     if (result.action == jit::HandlerAction::ReturnStatus &&
-        result.upstream_id == jit::HandlerResult::kDynamicResponseBody) {
+        (result.upstream_id == jit::HandlerResult::kDynamicResponseBody ||
+         returned_captured_response)) {
         const char* body = nullptr;
         if (response.response_body_mutation_set) {
             body = response.response_body_mutation_storage;
-            out.dynamic_response_body_len = response.response_body_mutation_len;
-            out.dynamic_response_body_valid = !response.response_body_mutation_overflow;
+            if (returned_captured_response) {
+                out.captured_response_body_len = response.response_body_mutation_len;
+            } else {
+                out.dynamic_response_body_len = response.response_body_mutation_len;
+                out.dynamic_response_body_valid = !response.response_body_mutation_overflow;
+            }
+        } else if (returned_captured_response) {
+            body = response.captured_response_body;
+            out.captured_response_body_len = response.captured_response_body_len;
         } else {
             body = response.response_body_data;
             out.dynamic_response_body_len = response.response_body_len;
             out.dynamic_response_body_valid = response.response_body_valid != 0;
         }
-        if (body == nullptr || out.dynamic_response_body_len > jit::kMaxDynamicResponseBodyBytes) {
+        if (returned_captured_response) {
+            if ((body == nullptr && out.captured_response_body_len != 0) ||
+                out.captured_response_body_len > sizeof(out.captured_response_body)) {
+                out.uses_captured_response = false;
+            } else if (out.captured_response_body_len != 0) {
+                __builtin_memcpy(out.captured_response_body, body, out.captured_response_body_len);
+            }
+        } else if ((body == nullptr && out.dynamic_response_body_len != 0) ||
+                   out.dynamic_response_body_len > jit::kMaxDynamicResponseBodyBytes) {
             out.dynamic_response_body_len = 0;
             out.dynamic_response_body_valid = false;
         } else if (out.dynamic_response_body_len != 0) {
             __builtin_memcpy(out.dynamic_response_body, body, out.dynamic_response_body_len);
+        }
+    }
+    if (returned_captured_response && out.uses_captured_response) {
+        out.captured_response_header_count = response.captured_response_header_count;
+        for (u32 i = 0; i < out.captured_response_header_count; i++) {
+            const auto& header = response.captured_response_headers[i];
+            out.captured_response_header_names[i].assign(header.name.ptr, header.name.len);
+            out.captured_response_header_values[i].assign(header.value.ptr, header.value.len);
+            out.captured_response_headers[i] = {
+                {out.captured_response_header_names[i].data(), header.name.len},
+                {out.captured_response_header_values[i].data(), header.value.len}};
         }
     }
     out.response_header_count = execution.frame.context.response_header_count;

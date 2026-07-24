@@ -130,6 +130,7 @@ const char* capability_name(Capability capability) {
         "external-upstream",
         "scripted-faults",
         "syscall-faults",
+        "control-plane-snapshot",
     };
     const u8 kIndex = static_cast<u8>(capability);
     if (kIndex >= static_cast<u8>(Capability::Count)) return "unknown";

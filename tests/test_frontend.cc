@@ -6223,10 +6223,11 @@ TEST(frontend, analyze_rejects_wait_after_for_loop) {
         auto lexed = lex(lit(src));
         REQUIRE(lexed);
         auto ast = parse_file_heap(lexed.value());
-        REQUIRE_FALSE(ast.has_value());
-        CHECK_EQ(static_cast<u8>(ast.error().code),
-                 static_cast<u8>(FrontendError::UnsupportedSyntax));
-        CHECK(ast.error().detail.eq(lit("for loops are unsupported in Rut Core")));
+        REQUIRE(ast);
+        auto hir = analyze_file_heap(ast.value());
+        REQUIRE_FALSE(hir.has_value());
+        CHECK_EQ(hir.error().code, FrontendError::UnsupportedSyntax);
+        CHECK(hir.error().detail.eq(lit("wait cannot be used after a static for-loop")));
     }
 }
 
@@ -6245,10 +6246,11 @@ TEST(frontend, analyze_rejects_for_loop_after_wait) {
         auto lexed = lex(lit(src));
         REQUIRE(lexed);
         auto ast = parse_file_heap(lexed.value());
-        REQUIRE_FALSE(ast.has_value());
-        CHECK_EQ(static_cast<u8>(ast.error().code),
-                 static_cast<u8>(FrontendError::UnsupportedSyntax));
-        CHECK(ast.error().detail.eq(lit("for loops are unsupported in Rut Core")));
+        REQUIRE(ast);
+        auto hir = analyze_file_heap(ast.value());
+        REQUIRE_FALSE(hir.has_value());
+        CHECK_EQ(hir.error().code, FrontendError::UnsupportedSyntax);
+        CHECK(hir.error().detail.eq(lit("static for-loop cannot be combined with wait")));
     }
 }
 
@@ -7908,6 +7910,162 @@ route GET "/x" {
         REQUIRE_FALSE(hir.has_value());
         CHECK(hir.error().detail.eq(
             lit("buffered forward cannot yet combine response buffering with request rewrites")));
+    }
+}
+
+TEST(frontend, buffered_forward_expression_builds_response_resume_state) {
+    const auto src = R"rut(
+upstream api
+route GET "/x" {
+    let resp = forward(api, buffered: true)
+    resp.set("X-Captured", resp.header("X-Origin").or("missing"))
+    resp.status = resp.status
+    resp.body = resp.body
+    return resp
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    REQUIRE_EQ(hir->routes[0].waits.len, 1u);
+    CHECK(hir->routes[0].waits[0].event_kind == WaitEventKind::ForwardBuffered);
+    CHECK_EQ(hir->routes[0].waits[0].ms, 0u);
+    REQUIRE_EQ(hir->routes[0].locals.len, 4u);
+    CHECK(hir->routes[0].locals[0].init.is_wait_result);
+    CHECK_EQ(hir->routes[0].control.direct_term.status_code, 0);
+    CHECK(hir->routes[0].control.direct_term.commit_response_mutations);
+
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    REQUIRE_EQ(mir->functions[0].waits.len, 1u);
+    CHECK(mir->functions[0].waits[0].event_kind == WaitEventKind::ForwardBuffered);
+    REQUIRE_EQ(mir->functions[0].blocks.len, 2u);
+    CHECK(mir->functions[0].blocks[0].term.kind == MirTerminatorKind::YieldTimer);
+    CHECK_EQ(mir->functions[0].blocks[0].effects.len, 0u);
+    CHECK_EQ(mir->functions[0].blocks[1].effects.len, 3u);
+    CHECK(mir->functions[0].blocks[1].term.kind == MirTerminatorKind::ReturnStatus);
+    FrontendRirModule rir{};
+    REQUIRE(lower_to_rir(mir.value(), rir));
+    const auto verified = rir::verify_module(rir.module);
+    CHECK(verified.ok);
+    rir.destroy();
+}
+
+TEST(frontend, chain_after_response_effects_follow_buffered_capture_resume) {
+    const auto src = R"rut(
+upstream api
+func copy_origin(_ resp: Response) -> i32 {
+    resp.set("X-Copy", "yes")
+    0
+}
+chain copy_chain { after copy_origin(resp) }
+route GET "/x" use chain copy_chain {
+    let resp = forward(api, buffered: true)
+    return resp
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    REQUIRE_EQ(mir->functions[0].blocks.len, 2u);
+    CHECK_EQ(mir->functions[0].blocks[0].effects.len, 0u);
+    CHECK_EQ(mir->functions[0].blocks[1].effects.len, 1u);
+}
+
+TEST(frontend, captured_response_rejects_followup_event_wait) {
+    const auto src = R"rut(
+upstream api
+route GET "/x" {
+    let resp = forward(api, buffered: true)
+    wait(downstream.recv())
+    return resp
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE_FALSE(hir.has_value());
+    CHECK(hir.error().detail.eq(lit("non-timer waits cannot follow a captured Response")));
+}
+
+TEST(frontend, buffered_forward_expression_rejects_unowned_and_request_rewrite_forms) {
+    struct Case {
+        const char* expression;
+        const char* detail;
+    };
+    const Case cases[] = {
+        {"forward(api)", "expression-form forward requires `buffered: true`"},
+        {"forward(api, buffered: false)", "expression-form forward requires `buffered: true`"},
+        {"forward(api, buffered: true, set_path: \"/v2\")",
+         "expression-form buffered forward does not support request rewrites"},
+    };
+    for (const auto& c : cases) {
+        std::string source = "upstream api\nroute GET \"/x\" { let resp = ";
+        source += c.expression;
+        source += " return resp }\n";
+        auto lexed = lex(Str{source.data(), static_cast<u32>(source.size())});
+        REQUIRE(lexed);
+        auto ast = parse_file_heap(lexed.value());
+        REQUIRE_FALSE(ast.has_value());
+        u32 detail_len = 0;
+        while (c.detail[detail_len] != '\0') detail_len++;
+        CHECK(ast.error().detail.eq(Str{c.detail, detail_len}));
+    }
+}
+
+TEST(frontend, buffered_forward_expression_rejects_multiple_response_builders) {
+    struct Case {
+        const char* name;
+        const char* source;
+    };
+    const Case cases[] = {
+        {"builder-before-capture", R"rut(
+upstream api
+route GET "/x" {
+    let local = response(200)
+    let captured = forward(api, buffered: true)
+    return captured
+}
+)rut"},
+        {"builder-after-capture", R"rut(
+upstream api
+route GET "/x" {
+    let captured = forward(api, buffered: true)
+    let local = response(200)
+    return captured
+}
+)rut"},
+        {"two-captures", R"rut(
+upstream api
+route GET "/x" {
+    let first = forward(api, buffered: true)
+    let second = forward(api, buffered: true)
+    return second
+}
+)rut"},
+    };
+    for (const auto& c : cases) {
+        const char* source = c.source;
+        auto lexed = lex(Str{source, static_cast<u32>(__builtin_strlen(source))});
+        REQUIRE(lexed);
+        auto ast = parse_file_heap(lexed.value());
+        REQUIRE(ast);
+        auto hir = analyze_file_heap(ast.value());
+        REQUIRE_FALSE(hir.has_value());
+        CHECK_MSG(
+            hir.error().detail.eq(lit(
+                "first-class buffered forward requires exactly one Response builder in the route")),
+            c.name);
     }
 }
 
@@ -25488,14 +25646,14 @@ TEST(frontend, parse_array_lit_nested_type) {
     CHECK(let_stmt.type.type_args[0]->type_args[0]->name.eq(lit("i32")));
 }
 
-TEST(frontend, parse_rejects_for_loops_as_unsupported_syntax) {
+TEST(frontend, parse_for_loop_basic) {
     const char* src = "route GET \"/x\" { for item in [1, 2, 3] { return 200 } return 200 }\n";
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
     auto ast = parse_file_heap(lexed.value());
-    REQUIRE_FALSE(ast.has_value());
-    CHECK_EQ(static_cast<u8>(ast.error().code), static_cast<u8>(FrontendError::UnsupportedSyntax));
-    CHECK(ast.error().detail.eq(lit("for loops are unsupported in Rut Core")));
+    REQUIRE(ast);
+    REQUIRE_EQ(ast->items[0].route.statements.len, 2u);
+    CHECK_EQ(ast->items[0].route.statements[0]->kind, AstStmtKind::For);
 }
 
 TEST(frontend, parse_inline_identifier_is_not_reserved) {
@@ -25519,6 +25677,106 @@ TEST(frontend, parse_rejects_inline_for_compat_spelling) {
     REQUIRE_FALSE(ast.has_value());
     CHECK_EQ(static_cast<u8>(ast.error().code), static_cast<u8>(FrontendError::UnsupportedSyntax));
     CHECK(ast.error().detail.eq(lit("use 'for', not 'inline for'")));
+}
+
+TEST(frontend, bounded_static_for_unrolls_elements_and_verifies_cfg) {
+    const char* src =
+        "route GET \"/x\" { for item in [1, 2, 3] { guard item > 0 else "
+        "{ return 400 } } return 200 }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    REQUIRE_EQ(hir->routes[0].for_loops.len, 1u);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    REQUIRE_EQ(mir->functions[0].blocks.len, 7u);
+    for (u32 i = 0; i < 3; i++) {
+        const auto& cond = mir->functions[0].blocks[i].term.cond;
+        REQUIRE_EQ(cond.kind, MirValueKind::Gt);
+        REQUIRE(cond.lhs != nullptr);
+        CHECK_EQ(cond.lhs->kind, MirValueKind::IntConst);
+        CHECK_EQ(cond.lhs->int_value, static_cast<i64>(i + 1));
+    }
+    FrontendRirModule rir{};
+    REQUIRE(lower_to_rir(mir.value(), rir));
+    const auto verified = rir::verify_module(rir.module);
+    CHECK(verified.ok);
+    rir.destroy();
+}
+
+TEST(frontend, bounded_static_for_rejects_runtime_iterators_and_cfg_overflow) {
+    const char* runtime_src =
+        "func make() -> [i32] => [1, 2, 3]\n"
+        "route GET \"/x\" { for item in make() { return 200 } return 204 }\n";
+    auto runtime_lexed = lex(lit(runtime_src));
+    REQUIRE(runtime_lexed);
+    auto runtime_ast = parse_file_heap(runtime_lexed.value());
+    REQUIRE(runtime_ast);
+    auto runtime_hir = analyze_file_heap(runtime_ast.value());
+    REQUIRE_FALSE(runtime_hir.has_value());
+    CHECK(runtime_hir.error().detail.eq(
+        lit("static for-loop iterator must be a compile-time array literal or alias")));
+
+    const char* overflow_src =
+        "route GET \"/x\" { for n in [1, 2, 3, 4, 5, 6, 7, 8] { "
+        "guard n > 0 else { return 400 } } return 200 }\n";
+    auto overflow_lexed = lex(lit(overflow_src));
+    REQUIRE(overflow_lexed);
+    auto overflow_ast = parse_file_heap(overflow_lexed.value());
+    REQUIRE(overflow_ast);
+    auto overflow_hir = analyze_file_heap(overflow_ast.value());
+    REQUIRE(overflow_hir);
+    auto overflow_mir = build_mir_heap(overflow_hir.value());
+    REQUIRE_FALSE(overflow_mir.has_value());
+    CHECK_EQ(overflow_mir.error().code, FrontendError::TooManyItems);
+    CHECK(overflow_mir.error().detail.eq(lit("static for-loop block budget exceeded")));
+}
+
+TEST(frontend, bounded_static_for_direct_break_and_continue_verify_cfg) {
+    const char* src =
+        "route GET \"/continue\" { for item in [1, 2, 3] { continue } return 204 }\n"
+        "route GET \"/break\" { for item in [1, 2, 3] { break } return 205 }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    REQUIRE_EQ(mir->functions.len, 2u);
+    CHECK_EQ(mir->functions[0].blocks.len, 4u);
+    CHECK_EQ(mir->functions[1].blocks.len, 2u);
+    FrontendRirModule rir{};
+    REQUIRE(lower_to_rir(mir.value(), rir));
+    CHECK(rir::verify_module(rir.module).ok);
+    rir.destroy();
+}
+
+TEST(frontend, break_and_continue_reject_outside_bounded_for) {
+    struct Case {
+        const char* keyword;
+        Str detail;
+    };
+    const Case cases[] = {
+        {"break", lit("break is only valid inside a verifier-bounded for-loop")},
+        {"continue", lit("continue is only valid inside a verifier-bounded for-loop")},
+    };
+    for (const auto& test : cases) {
+        char src[96]{};
+        const int len = std::snprintf(src, sizeof(src), "route GET \"/x\" { %s }\n", test.keyword);
+        REQUIRE(len > 0);
+        auto lexed = lex({src, static_cast<u32>(len)});
+        REQUIRE(lexed);
+        auto ast = parse_file_heap(lexed.value());
+        REQUIRE(ast);
+        auto hir = analyze_file_heap(ast.value());
+        REQUIRE_FALSE(hir.has_value());
+        CHECK(hir.error().detail.eq(test.detail));
+    }
 }
 
 #if 0
@@ -25764,6 +26022,28 @@ TEST(frontend, mir_unrolls_for_from_static_array_alias) {
     auto lowered = lower_to_rir(mir.value(), rir);
     CHECK(lowered);
     rir.destroy();
+}
+
+TEST(frontend, mir_unrolls_runtime_element_alias_without_materializing_alias_chain) {
+    const char* src =
+        "route GET \"/x\" { let xs = [time.nowMicros()] let ys = xs for item in ys { guard "
+        "item > 0 else { return 400 } } return 200 }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    REQUIRE_EQ(mir->functions.len, 1u);
+    CHECK_EQ(mir->functions[0].locals.len, 0u);
+    REQUIRE_EQ(mir->functions[0].blocks.len, 3u);
+    const auto& cond = mir->functions[0].blocks[0].term.cond;
+    CHECK_EQ(static_cast<u8>(cond.kind), static_cast<u8>(MirValueKind::Gt));
+    REQUIRE(cond.lhs != nullptr);
+    CHECK_EQ(static_cast<u8>(cond.lhs->kind), static_cast<u8>(MirValueKind::TimeNowMicros));
 }
 
 TEST(frontend, mir_skips_plain_for_from_typed_empty_array_alias) {
@@ -26389,6 +26669,21 @@ TEST(frontend, analyze_rejects_non_static_for_loop_iter_via_alias_chain) {
     REQUIRE(ast);
     auto hir = analyze_file_heap(ast.value());
     REQUIRE(!hir);
+}
+
+TEST(frontend, analyze_rejects_runtime_function_array_hidden_by_alias_chain) {
+    const char* src =
+        "func make(v: bool) -> [bool] => [v]\n"
+        "route GET \"/x\" { let xs = make(req.http11) let ys = xs for item in ys { guard item "
+        "else { return 400 } } return 200 }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE_FALSE(hir);
+    CHECK(hir.error().detail.eq(
+        lit("static for-loop iterator must be a compile-time array literal or alias")));
 }
 
 TEST(frontend, analyze_plain_for_rejects_non_static_for_loop_iter_via_alias_chain) {
@@ -31875,6 +32170,118 @@ route GET "/x" {
     rir.destroy();
 }
 
+TEST(frontend, mir_materializes_runtime_array_alias_shared_by_static_for_loops_once) {
+    const char* src =
+        "route GET \"/x\" { let xs = [time.nowMicros()] for first in xs { guard first > 0 "
+        "else { return 400 } } for second in xs { guard second > 0 else { return 401 } } return "
+        "200 }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    REQUIRE_EQ(mir->functions.len, 1u);
+    REQUIRE_EQ(mir->functions[0].locals.len, 1u);
+    CHECK_EQ(static_cast<u8>(mir->functions[0].locals[0].init.kind),
+             static_cast<u8>(MirValueKind::ArrayLit));
+    REQUIRE_EQ(mir->functions[0].locals[0].init.args.len, 1u);
+    REQUIRE(mir->functions[0].locals[0].init.args[0] != nullptr);
+    CHECK_EQ(static_cast<u8>(mir->functions[0].locals[0].init.args[0]->kind),
+             static_cast<u8>(MirValueKind::TimeNowMicros));
+
+    FrontendRirModule rir{};
+    REQUIRE(lower_to_rir(mir.value(), rir));
+    u32 samples = 0;
+    for (u32 bi = 0; bi < rir.module.functions[0].block_count; bi++)
+        samples += block_op_count(rir.module.functions[0].blocks[bi], rir::Opcode::TimeNowMicros);
+    CHECK_EQ(samples, 1u);
+    rir.destroy();
+}
+
+TEST(frontend, mir_lowers_dynamic_json_terminator_inside_static_for_loop) {
+    const char* src =
+        "route GET \"/x\" { for item in [req.path] { return 200, json({ value: item }) } "
+        "return 500 }\n";
+    FrontendRirModule rir{};
+    REQUIRE(lower_src_to_rir(src, rir));
+    auto verified = rir::verify_module(rir.module);
+    CHECK(verified.ok);
+    rir.destroy();
+}
+
+TEST(frontend, mir_lowers_dynamic_json_from_static_for_if_terminator_context) {
+    const char* src =
+        "route GET \"/x\" { for item in [req.path] { let value = item if value == \"/x\" { "
+        "return 200, json({ value: value }) } else { return 404, json({ value: value }) } } "
+        "return 500 }\n";
+    FrontendRirModule rir{};
+    REQUIRE(lower_src_to_rir(src, rir));
+    CHECK(rir::verify_module(rir.module).ok);
+    rir.destroy();
+}
+
+TEST(frontend, mir_lowers_dynamic_json_from_static_for_match_arm_context) {
+    const char* src =
+        "route GET \"/x\" { for item in [req.path] { match item { \"/x\" => { let value = "
+        "item return 200, json({ value: value }) } _ => return 404, json({ value: item }) } } "
+        "return 500 }\n";
+    FrontendRirModule rir{};
+    REQUIRE(lower_src_to_rir(src, rir));
+    CHECK(rir::verify_module(rir.module).ok);
+    rir.destroy();
+}
+
+TEST(frontend, nested_conditional_break_does_not_make_outer_loop_unconditionally_terminate) {
+    const char* src =
+        "route GET \"/x\" { for outer in [1] { for inner in [0] { guard inner > 0 else { break } "
+        "return 201 } guard outer > 0 else { return 400 } } return 200 }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    CHECK_FALSE(hir->routes[0].for_loops[0].body.has_term);
+    CHECK(hir->routes[0].for_loops[1].body.has_term);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    REQUIRE(lower_to_rir(mir.value(), rir));
+    CHECK(rir::verify_module(rir.module).ok);
+    rir.destroy();
+}
+
+TEST(frontend, mir_materializes_runtime_iterator_reused_by_nested_loop_expansion) {
+    const char* src =
+        "route GET \"/x\" { let xs = [time.nowMicros()] for outer in [1, 2] { for item in xs "
+        "{ guard item > 0 else { return 400 } } } return 200 }\n";
+    FrontendRirModule rir{};
+    REQUIRE(lower_src_to_rir(src, rir));
+    u32 samples = 0;
+    for (u32 bi = 0; bi < rir.module.functions[0].block_count; bi++)
+        samples += block_op_count(rir.module.functions[0].blocks[bi], rir::Opcode::TimeNowMicros);
+    CHECK_EQ(samples, 1u);
+    rir.destroy();
+}
+
+TEST(frontend, analyze_rejects_call_produced_iterator_alias_inside_static_for_body) {
+    const char* src =
+        "func make(v: i32) -> [i32] => [v]\n"
+        "route GET \"/x\" { for outer in [1] { let xs = make(outer) for item in xs { guard "
+        "item > 0 else { return 400 } } } return 200 }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE_FALSE(hir);
+    CHECK(hir.error().detail.eq(
+        lit("static for-loop iterator must be a compile-time array literal or alias")));
+}
+
 TEST(frontend, match_rejects_case_keyword_with_fixit) {
     const char* src =
         "route GET \"/users\" { let code = 200 match code { case 200 => return 200 _ => return "
@@ -32656,22 +33063,20 @@ TEST(frontend, guard_let_function_body_parity_lowers_and_recovers) {
     rir.destroy();
 }
 
-TEST(frontend, if_let_inside_static_for_loop_is_parser_unreachable) {
-    // Round-2 finding 2: an `if let` inside a static for-loop body cannot be
-    // reached — the parser rejects for-loops wholesale, so no AstStmtKind::For is
-    // ever produced and the static-for If analyzer (which would mis-treat an
-    // if-let usable-value test as a plain bool cond) is dead code. This pins the
-    // reachability: the enclosing for-loop fails to parse before any if-let is
-    // seen. (The analyzer also now fail-loud rejects bind_value defensively, so a
-    // future for-loop enablement fails cleanly instead of mis-analyzing.)
+TEST(frontend, if_let_inside_static_for_loop_is_rejected_explicitly) {
+    // Static unrolling has no branch-local carrier for an `if let` binding.
+    // Reject it in analysis instead of treating the usable-value test as a bool.
     const char* src =
         "route GET \"/u\" { for item in [1] { if let x = error(7) { return 500 } "
         "else { return 200 } } }\n";
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
     auto ast = parse_file_heap(lexed.value());
-    REQUIRE_FALSE(ast.has_value());
-    CHECK_EQ(ast.error().code, FrontendError::UnsupportedSyntax);
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE_FALSE(hir.has_value());
+    CHECK_EQ(hir.error().code, FrontendError::UnsupportedSyntax);
+    CHECK(hir.error().detail.eq(lit("if-let is not supported inside a static for-loop body")));
 }
 
 TEST(frontend, case_in_match_arm_still_rejected_with_fixit) {
@@ -33813,9 +34218,9 @@ TEST(frontend, stats_and_metrics_are_typed_opaque_json_values) {
     const char* src = R"rut(
 route GET "/admin" {
     let snapshot = stats()
-    let statsBody = json(stats())
+    let statsBody = json(snapshot)
     let metricSnapshot = metrics()
-    let metricsBody = json(metrics())
+    let metricsBody = json(metricSnapshot)
     return 200
 }
 )rut";
@@ -33828,18 +34233,70 @@ route GET "/admin" {
     REQUIRE_EQ(hir->routes[0].locals.len, 4u);
     CHECK_EQ(hir->routes[0].locals[0].type, HirTypeKind::Stats);
     CHECK_EQ(hir->routes[0].locals[0].init.kind, HirExprKind::StatsSnapshot);
-    CHECK_EQ(hir->routes[0].locals[1].type, HirTypeKind::Str);
+    CHECK_EQ(hir->routes[0].locals[1].type, HirTypeKind::Json);
     CHECK_EQ(hir->routes[0].locals[1].init.kind, HirExprKind::AdminJson);
+    CHECK_EQ(hir->routes[0].locals[1].init.int_value, 0);
     CHECK_EQ(hir->routes[0].locals[2].type, HirTypeKind::Metrics);
     CHECK_EQ(hir->routes[0].locals[2].init.kind, HirExprKind::MetricsSnapshot);
-    CHECK_EQ(hir->routes[0].locals[3].type, HirTypeKind::Str);
+    CHECK_EQ(hir->routes[0].locals[3].type, HirTypeKind::Json);
     CHECK_EQ(hir->routes[0].locals[3].init.kind, HirExprKind::AdminJson);
+    CHECK_EQ(hir->routes[0].locals[3].init.int_value, 1);
 
     auto mir = build_mir_heap(hir.value());
-    REQUIRE_FALSE(mir.has_value());
-    CHECK(mir.error().detail.eq(
-        lit("control-plane builtin is declared and type-checked, but runtime lowering is not "
-            "connected yet")));
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    REQUIRE(lower_to_rir(mir.value(), rir));
+    rir.destroy();
+}
+
+TEST(frontend, snapshot_locals_use_control_plane_json_terminators) {
+    const char* src = R"rut(
+route GET "/stats" { let snapshot = stats() return 200, json(snapshot) }
+route GET "/metrics" { let snapshot = metrics() return 200, json(snapshot) }
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    REQUIRE_EQ(hir->routes.len, 2u);
+    CHECK_EQ(hir->routes[0].control.direct_term.control_plane_json_kind, 1u);
+    CHECK_EQ(hir->routes[1].control.direct_term.control_plane_json_kind, 2u);
+}
+
+TEST(frontend, stats_and_metrics_lower_as_deterministic_response_json) {
+    const char* src = R"rut(
+route GET "/stats" { return 200, json(stats()) }
+route GET "/metrics" { return 200, json(metrics()) }
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    REQUIRE_EQ(hir->routes.len, 2u);
+    CHECK_EQ(hir->routes[0].control.direct_term.control_plane_json_kind, 1u);
+    CHECK_EQ(hir->routes[1].control.direct_term.control_plane_json_kind, 2u);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    REQUIRE(lower_to_rir(mir.value(), rir));
+    REQUIRE_EQ(rir.module.func_count, 2u);
+    for (u32 fi = 0; fi < rir.module.func_count; fi++) {
+        bool saw_snapshot = false;
+        for (u32 bi = 0; bi < rir.module.functions[fi].block_count; bi++) {
+            const auto& block = rir.module.functions[fi].blocks[bi];
+            for (u32 ii = 0; ii < block.inst_count; ii++) {
+                if (block.insts[ii].op != rir::Opcode::JsonAppendControlPlane) continue;
+                saw_snapshot = true;
+                CHECK_EQ(block.insts[ii].imm.i32_val, static_cast<i32>(fi));
+            }
+        }
+        CHECK(saw_snapshot);
+    }
+    rir.destroy();
 }
 
 TEST(frontend, control_plane_snapshot_declarations_validate_arity) {
@@ -33863,6 +34320,23 @@ TEST(frontend, json_rejects_duplicate_object_fields) {
     auto hir = analyze_file_heap(ast.value());
     REQUIRE_FALSE(hir.has_value());
     CHECK(hir.error().detail.eq(lit("json object field names must be unique")));
+}
+
+TEST(frontend, json_rejects_excessive_literal_depth_deterministically) {
+    std::string src = "route GET \"/x\" { let payload = json(";
+    for (u32 i = 0; i < 34; i++) src += '[';
+    src += "true";
+    for (u32 i = 0; i < 34; i++) src += ']';
+    src += ") return 200 }\n";
+    auto lexed = lex({src.data(), static_cast<u32>(src.size())});
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE_FALSE(hir.has_value());
+    CHECK_EQ(hir.error().code, FrontendError::TooManyItems);
+    CHECK(hir.error().detail.eq(
+        lit("json currently accepts only literal bool/int/string/nil/array/object values")));
 }
 
 TEST(frontend, return_body_expression_rejects_non_json_calls) {

@@ -1,4 +1,5 @@
 // Per-shard metrics tests: counters, histograms, aggregation, callback integration.
+#include "rut/runtime/control_plane_snapshot.h"
 #include "rut/runtime/metrics.h"
 #include "rut/runtime/prometheus.h"
 #include "test.h"
@@ -181,6 +182,65 @@ TEST(aggregate, empty) {
     auto agg = aggregate_metrics(nullptr, 0);
     CHECK_EQ(agg.requests_total, 0u);
     CHECK_EQ(agg.connections_total, 0u);
+}
+
+TEST(aggregate, handler_snapshot_is_value_only_and_latched) {
+    ShardMetrics local;
+    ShardMetrics other;
+    local.init();
+    other.init();
+    local.requests_total = 10;
+    local.requests_active = 1;
+    other.requests_total = 20;
+    ShardMetrics* registry[] = {&local, &other};
+    struct Loop {
+        u32 shard_id = 3;
+        ShardMetrics* metrics = nullptr;
+        ShardMetrics* const* all_shard_metrics = nullptr;
+        u32 shard_metrics_count = 0;
+    } loop{3, &local, registry, 2};
+    jit::HandlerCtx ctx{};
+
+    latch_control_plane_snapshot(&loop, &ctx);
+    REQUIRE(ctx.control_plane.valid);
+    CHECK_EQ(ctx.control_plane.shard_id, 3u);
+    CHECK_EQ(ctx.control_plane.shard_count, 2u);
+    CHECK_EQ(ctx.control_plane.stats.requests_total, 10u);
+    CHECK_EQ(ctx.control_plane.metrics.requests_total, 30u);
+
+    local.requests_total = 100;
+    other.requests_total = 200;
+    CHECK_EQ(ctx.control_plane.stats.requests_total, 10u);
+    CHECK_EQ(ctx.control_plane.metrics.requests_total, 30u);
+}
+
+TEST(aggregate, handler_snapshot_refreshes_runtime_memory_gauges) {
+    struct ArenaProbe {
+        u64 space_used() const { return 4096; }
+    } arena;
+    struct PoolProbe {
+        u32 in_use() const { return 7; }
+        u32 available() const { return 11; }
+    };
+    struct Loop {
+        ShardMetrics* metrics = nullptr;
+        ArenaProbe* metrics_arena = nullptr;
+        PoolProbe pool;
+        u32 active_count() const { return 3; }
+    } loop;
+    ShardMetrics metrics;
+    metrics.init();
+    loop.metrics = &metrics;
+    loop.metrics_arena = &arena;
+    jit::HandlerCtx ctx{};
+
+    latch_control_plane_snapshot(&loop, &ctx);
+
+    REQUIRE(ctx.control_plane.valid);
+    CHECK_EQ(ctx.control_plane.stats.memory_arena_used, 4096u);
+    CHECK_EQ(ctx.control_plane.stats.memory_slices_used, 7u);
+    CHECK_EQ(ctx.control_plane.stats.memory_slices_free, 11u);
+    CHECK_EQ(ctx.control_plane.stats.memory_connections_used, 3u);
 }
 
 // === Callback + proxy integration ===
@@ -378,10 +438,15 @@ TEST_F(MetricsLoopF, proxy_response_sent_error) {
     CHECK_EQ(self.loop.conns[self.cid].fd, -1);
 }
 
-TEST_F(MetricsLoopF, proxy_response_sent_any_positive_succeeds) {
+TEST_F(MetricsLoopF, proxy_response_sent_partial_write_retries_remainder) {
     REQUIRE(self.advance_to_upstream_response());
     inject_upstream_response(self.loop, *self.c);
+    const u32 send_len = self.c->upstream_send_len;
+    REQUIRE_GT(send_len, 1u);
     self.loop.inject_and_dispatch(make_ev(self.cid, IoEventType::Send, 1));
+    CHECK_EQ(self.loop.conns[self.cid].state, ConnState::Sending);
+    self.loop.inject_and_dispatch(
+        make_ev(self.cid, IoEventType::Send, static_cast<i32>(send_len - 1)));
     CHECK_EQ(self.loop.conns[self.cid].state, ConnState::ReadingHeader);
 }
 

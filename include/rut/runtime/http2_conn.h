@@ -17,6 +17,8 @@
 // callbacks. Wiring into the socket/connection loop happens in a later layer.
 namespace rut {
 
+struct ShardMetrics;
+
 enum class Http2StreamState : u8 {
     Idle,
     Open,
@@ -36,6 +38,9 @@ struct Http2Stream {
     i32 send_window;  // how much DATA we may send to the peer on this stream
     i32 recv_window;  // how much DATA the peer may send us on this stream
     bool got_headers;
+    bool metrics_started;
+    bool metrics_pending_send;
+    u64 request_start_us;
 };
 
 struct Http2Conn;
@@ -100,6 +105,10 @@ struct Http2Conn {
 
     Http2Stream streams[kMaxStreams];
     u32 nstreams;
+    // Metrics sink owned by the serving loop. Kept on the connection so
+    // non-templated engine callbacks (notably RST_STREAM) can cancel exactly
+    // the request that HEADERS started.
+    ShardMetrics* metrics;
 
     // Pending request awaiting DATA frames. JIT handlers retain DATA after the
     // synthesized HTTP/1 headers because their terminal action may select a
@@ -176,6 +185,7 @@ struct Http2Conn {
     u16 async_upstream_id;
     bool async_apply_response_mutations;
     bool async_request_forwardable;
+    bool async_capture_response;
     u32 async_resp_len;
 
     jit::HandlerCtx* async_jit_ctx() {

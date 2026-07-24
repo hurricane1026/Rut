@@ -15,9 +15,11 @@
 
 #include "rut/runtime/access_log.h"  // monotonic_us
 #include "rut/runtime/connection.h"
+#include "rut/runtime/control_plane_snapshot.h"
 #include "rut/runtime/http2_conn.h"
 #include "rut/runtime/http_parser.h"  // http_method_str
 #include "rut/runtime/jit_dispatch.h"
+#include "rut/runtime/metrics.h"
 #include "rut/runtime/rate_limit_enforce.h"
 #include "rut/runtime/response_body_storage.h"
 #include "rut/runtime/route_method.h"
@@ -67,6 +69,29 @@ inline void h2_close_stream(Http2Conn* h2, u32 stream_id) {
     }
 }
 
+template <typename Loop>
+inline void h2_mark_request_metrics_pending(H2Dispatch<Loop>& d, u32 stream_id) {
+    Http2Stream* stream = d.conn->h2->find_stream(stream_id);
+    if (stream == nullptr || !stream->metrics_started) return;
+    stream->metrics_pending_send = true;
+}
+
+inline void h2_complete_sent_request_metrics(Http2Conn& h2) {
+    for (u32 i = 0; i < h2.nstreams; i++) {
+        auto& stream = h2.streams[i];
+        if (!stream.metrics_started || !stream.metrics_pending_send) continue;
+        if (h2.metrics != nullptr) {
+            const u64 now = monotonic_us();
+            const u64 elapsed = now >= stream.request_start_us ? now - stream.request_start_us : 0;
+            h2.metrics->on_request_complete(elapsed > 0xffffffffu ? 0xffffffffu
+                                                                  : static_cast<u32>(elapsed));
+        }
+        stream.metrics_started = false;
+        stream.metrics_pending_send = false;
+        stream.request_start_us = 0;
+    }
+}
+
 // Connection-specific (hop-by-hop) header names that MUST NOT appear in an HTTP/2
 // response (RFC 7540 §8.1.2.2). validate_response_header already blocks Connection
 // / Transfer-Encoding / Content-Length, but a route's response(headers:) set can
@@ -103,6 +128,7 @@ void h2_emit_response(H2Dispatch<Loop>& d,
     if (kN != 0) {
         d.conn->h2->hpack_enc = enc;
         d.resp_len += kN;
+        h2_mark_request_metrics_pending(d, stream_id);
         h2_close_stream(d.conn->h2, stream_id);
         return;
     }
@@ -122,6 +148,7 @@ void h2_emit_response(H2Dispatch<Loop>& d,
     else {
         d.conn->h2->hpack_enc = enc;
         d.resp_len += kFallback;
+        h2_mark_request_metrics_pending(d, stream_id);
         h2_close_stream(d.conn->h2, stream_id);
     }
 }
@@ -408,13 +435,24 @@ void h2_emit_outcome(H2Dispatch<Loop>& d,
         body = reinterpret_cast<const u8*>(b.data);
         body_len = b.len;
     }
-    constexpr u32 kMaxEffectiveHeaders =
-        RouteConfig::kMaxHeadersPerSet + jit::kMaxResponseHeaderMutations + 2;
+    constexpr u32 kMaxEffectiveHeaders = RouteConfig::kMaxHeadersPerSet +
+                                         jit::kMaxCapturedResponseHeaders +
+                                         jit::kMaxResponseHeaderMutations + 2;
     hpack::Header hdrs[kMaxEffectiveHeaders];
     // Header values are non-owning Str views and are encoded only after the
     // list is complete, so storage synthesized below must span the emit call.
     char content_length[10];
     u32 nhdrs = 0;
+    if (o.uses_captured_response && o.response_ctx != nullptr &&
+        o.response_ctx->captured_response_valid) {
+        for (u32 i = 0; i < o.response_ctx->captured_response_header_count; i++) {
+            const auto& header = o.response_ctx->captured_response_headers[i];
+            if (h2_is_prohibited_response_header(header.name.ptr, header.name.len)) continue;
+            hdrs[nhdrs].name = header.name;
+            hdrs[nhdrs].value = header.value;
+            nhdrs++;
+        }
+    }
     if (o.response_headers_idx != 0 && cfg != nullptr &&
         o.response_headers_idx <= cfg->response_header_set_count) {
         const auto& ref = cfg->response_header_sets[o.response_headers_idx - 1];
@@ -528,8 +566,8 @@ void h2_async_epoch_leave(Loop* loop, Connection& conn) {
 
 // Release the single async-suspend slot.
 inline void h2_clear_async(Http2Conn& h2) {
-    if (h2.async_stream != 0 &&
-        (h2.async_kind == H2AsyncKind::Timer || h2.async_apply_response_mutations))
+    if (h2.async_stream != 0 && (h2.async_kind == H2AsyncKind::Timer ||
+                                 h2.async_apply_response_mutations || h2.async_capture_response))
         rut_helper_resp_release_body_storage(static_cast<void*>(h2.async_jit_ctx()));
     h2.async_stream = 0;
     h2.async_kind = H2AsyncKind::None;
@@ -542,6 +580,7 @@ inline void h2_clear_async(Http2Conn& h2) {
     h2.async_upstream_id = 0;
     h2.async_apply_response_mutations = false;
     h2.async_request_forwardable = false;
+    h2.async_capture_response = false;
     h2.async_resp_len = 0;
 }
 
@@ -677,6 +716,7 @@ bool h2_suspend_proxy(H2Dispatch<Loop>& d,
                       const RouteEntry* route,
                       u16 upstream_id,
                       bool apply_response_mutations,
+                      bool capture_response,
                       jit::HandlerCtx* live_ctx,
                       const u8* synth,
                       u32 synth_len) {
@@ -689,7 +729,7 @@ bool h2_suspend_proxy(H2Dispatch<Loop>& d,
     // Pin the config epoch before storing cfg/route (see h2_suspend_timer).
     h2_async_epoch_enter(d.loop, *d.conn);
     h2->async_synth_len = h2_stash_synth(*h2, synth, synth_len);
-    if (apply_response_mutations &&
+    if ((apply_response_mutations || capture_response) &&
         (live_ctx == nullptr ||
          !h2_snapshot_async_jit_ctx(*h2, *live_ctx, synth, h2->async_synth_len))) {
         h2_async_epoch_leave(d.loop, *d.conn);
@@ -701,6 +741,7 @@ bool h2_suspend_proxy(H2Dispatch<Loop>& d,
     h2->async_route = route;
     h2->async_upstream_id = upstream_id;
     h2->async_apply_response_mutations = apply_response_mutations;
+    h2->async_capture_response = capture_response;
     h2->async_resp_len = 0;
     return true;
 }
@@ -720,6 +761,7 @@ void h2_invoke_emit(H2Dispatch<Loop>& d,
                     u32 synth_len,
                     bool request_forwardable) {
     auto* ctx = d.conn->reset_jit_ctx();
+    if (route->needs_control_plane_snapshot) latch_control_plane_snapshot(d.loop, ctx);
     ctx->state = 0;
     ctx->resume_event_kind = static_cast<u32>(jit::YieldKind::Timer);
     ctx->resume_event_result = 0;
@@ -743,14 +785,28 @@ void h2_invoke_emit(H2Dispatch<Loop>& d,
         }
         return;
     }
-    if (kOutcome.kind == JitDispatchOutcome::Kind::ForwardBuffered) {
+    if (kOutcome.kind == JitDispatchOutcome::Kind::ForwardBuffered ||
+        kOutcome.kind == JitDispatchOutcome::Kind::ForwardCapture) {
         if (!request_forwardable) {
             h2_emit_status(d, stream_id, 400);
             return;
         }
-        if (!h2_suspend_proxy(
-                d, stream_id, cfg, route, kOutcome.upstream_id, true, ctx, synth, synth_len))
+        const bool capture = kOutcome.kind == JitDispatchOutcome::Kind::ForwardCapture;
+        if (!h2_suspend_proxy(d,
+                              stream_id,
+                              cfg,
+                              route,
+                              kOutcome.upstream_id,
+                              !capture,
+                              capture,
+                              ctx,
+                              synth,
+                              synth_len))
             h2_emit_status(d, stream_id, 503);
+        else if (capture) {
+            d.conn->h2->async_fn = route->fn;
+            d.conn->h2->async_state = kOutcome.next_state;
+        }
         return;
     }
     if (kOutcome.kind != JitDispatchOutcome::Kind::ReturnStatus) {
@@ -1054,6 +1110,7 @@ void h2_dispatch_request(H2Dispatch<Loop>& d,
                                       route,
                                       route->upstream_id,
                                       false,
+                                      false,
                                       nullptr,
                                       synth,
                                       kSynthLen))
@@ -1065,8 +1122,15 @@ void h2_dispatch_request(H2Dispatch<Loop>& d,
 
 template <typename Loop>
 void h2_on_headers_cb(
-    void* ctx, Http2Conn& /*c*/, u32 stream_id, const hpack::Header* hs, u32 n, bool end) {
+    void* ctx, Http2Conn& c, u32 stream_id, const hpack::Header* hs, u32 n, bool end) {
     auto* d = static_cast<H2Dispatch<Loop>*>(ctx);
+    if constexpr (requires { d->loop->metrics; }) c.metrics = d->loop->metrics;
+    if (Http2Stream* stream = c.find_stream(stream_id);
+        stream != nullptr && !stream->metrics_started && c.metrics != nullptr) {
+        stream->metrics_started = true;
+        stream->request_start_us = monotonic_us();
+        c.metrics->on_request_start();
+    }
     h2_dispatch_request(*d, stream_id, hs, n, end);
 }
 
@@ -1100,6 +1164,19 @@ void h2_on_data_cb(
 // time there is no in-flight I/O to undo; the config epoch pinned for the suspend
 // is released by the post-process path once async_stream is clear.
 inline void h2_on_reset_cb(void* /*ctx*/, Http2Conn& c, u32 stream_id, Http2Error /*err*/) {
+    Http2Stream* reset_stream = nullptr;
+    for (u32 i = 0; i < c.nstreams; i++) {
+        if (c.streams[i].id == stream_id) {
+            reset_stream = &c.streams[i];
+            break;
+        }
+    }
+    if (reset_stream != nullptr && reset_stream->metrics_started) {
+        if (c.metrics != nullptr) c.metrics->on_request_cancel();
+        reset_stream->metrics_started = false;
+        reset_stream->metrics_pending_send = false;
+        reset_stream->request_start_us = 0;
+    }
     if (c.async_stream != 0 && c.async_stream == stream_id) h2_clear_async(c);
 }
 
@@ -1145,7 +1222,8 @@ template <typename Loop>
 void h2_begin_suspended_io(Loop* loop, Connection& conn) {
     h2_async_epoch_enter(loop, conn);
     if (conn.h2->async_kind == H2AsyncKind::Proxy) {
-        if (conn.h2->async_apply_response_mutations) conn.handler_ctx = conn.h2->async_jit_ctx();
+        if (conn.h2->async_apply_response_mutations || conn.h2->async_capture_response)
+            conn.handler_ctx = conn.h2->async_jit_ctx();
         h2_proxy_begin<Loop>(loop, conn);
         return;
     }
@@ -1181,6 +1259,7 @@ void on_h2_sent(void* lp, Connection& conn, IoEvent ev) {
     }
 
     conn.send_progress = 0;
+    if (conn.h2) h2_complete_sent_request_metrics(*conn.h2);
     conn.send_buf.reset();
     if (!conn.keep_alive) {  // engine signalled GOAWAY / connection error
         loop->close_conn(conn);
@@ -1363,19 +1442,38 @@ void h2_resume_jit_handler(Loop* loop, Connection& conn) {
         h2->async_kind = H2AsyncKind::Proxy;
         h2->async_upstream_id = kOutcome.upstream_id;
         h2->async_apply_response_mutations = true;
+        h2->async_capture_response = false;
+        conn.pending_handler_fn = nullptr;
+        h2_proxy_begin<Loop>(loop, conn);
+        return;
+    }
+    if (kOutcome.kind == JitDispatchOutcome::Kind::ForwardCapture &&
+        h2->async_request_forwardable) {
+        h2->async_kind = H2AsyncKind::Proxy;
+        h2->async_upstream_id = kOutcome.upstream_id;
+        h2->async_apply_response_mutations = false;
+        h2->async_capture_response = true;
+        h2->async_fn = conn.pending_handler_fn;
+        h2->async_state = kOutcome.next_state;
         conn.pending_handler_fn = nullptr;
         h2_proxy_begin<Loop>(loop, conn);
         return;
     }
 
-    u8 resp[8192];
+    u8 resp[Http2Conn::kBodySynthCap];
     H2Dispatch<Loop> d{loop, &conn, resp, sizeof(resp), 0, false};
     if (kOutcome.kind == JitDispatchOutcome::Kind::ReturnStatus) {
         h2_emit_outcome(d, kStreamId, kOutcome, h2->async_cfg, kHeadRequest);
-    } else if (kOutcome.kind == JitDispatchOutcome::Kind::ForwardBuffered) {
+    } else if (kOutcome.kind == JitDispatchOutcome::Kind::ForwardBuffered ||
+               kOutcome.kind == JitDispatchOutcome::Kind::ForwardCapture) {
         h2_emit_status(d, kStreamId, 400);
     } else {
         h2_emit_status(d, kStreamId, 503);  // forward / event-yield over h2: follow-up
+    }
+    if (conn.response_capture_slice != nullptr) {
+        if constexpr (requires { loop->pool.free(conn.response_capture_slice); })
+            loop->pool.free(conn.response_capture_slice);
+        conn.response_capture_slice = nullptr;
     }
 
     // Clear the suspension before responding so the flush's on_h2_sent re-arms

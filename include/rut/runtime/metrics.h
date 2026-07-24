@@ -1,6 +1,7 @@
 #pragma once
 
 #include "rut/common/types.h"
+#include <atomic>
 
 namespace rut {
 
@@ -55,11 +56,13 @@ struct LatencyHistogram {
     }
 };
 
-// Per-shard metrics — all counters are u64, written by shard thread only.
-// Read by the metrics/Prometheus endpoint (cross-thread, but reads of u64
-// on x86-64 are atomic at aligned addresses).
+// Per-shard metrics. Writers run on the owning shard thread; cross-shard
+// readers take the small lock so every snapshot is race-free and internally
+// consistent (including the latency histogram).
 
 struct ShardMetrics {
+    mutable std::atomic_flag snapshot_lock = ATOMIC_FLAG_INIT;
+
     // --- Request metrics ---
     u64 requests_total;   // completed requests
     u64 requests_active;  // currently processing (inc on recv, dec on response sent)
@@ -91,24 +94,81 @@ struct ShardMetrics {
         memory_connections_used = 0;
     }
 
+    ShardMetrics() = default;
+
+    ShardMetrics(const ShardMetrics& other) { copy_from(other); }
+
+    ShardMetrics& operator=(const ShardMetrics& other) {
+        if (this != &other) copy_from(other);
+        return *this;
+    }
+
+    void lock_snapshot() const {
+        while (snapshot_lock.test_and_set(std::memory_order_acquire)) {
+        }
+    }
+
+    void unlock_snapshot() const { snapshot_lock.clear(std::memory_order_release); }
+
     // --- Recording helpers (called from shard thread) ---
 
     void on_accept() {
+        lock_snapshot();
         connections_total++;
         connections_active++;
+        unlock_snapshot();
     }
 
     void on_close() {
+        lock_snapshot();
         if (connections_active > 0) connections_active--;
         connections_closed++;
+        unlock_snapshot();
     }
 
-    void on_request_start() { requests_active++; }
+    void on_request_start() {
+        lock_snapshot();
+        requests_active++;
+        unlock_snapshot();
+    }
 
     void on_request_complete(u32 duration_us) {
+        lock_snapshot();
         requests_total++;
         if (requests_active > 0) requests_active--;
         request_latency.record(duration_us);
+        unlock_snapshot();
+    }
+
+    void on_request_cancel() {
+        lock_snapshot();
+        if (requests_active > 0) requests_active--;
+        unlock_snapshot();
+    }
+
+    void update_memory(u64 arena_used, u64 slices_used, u64 slices_free, u64 connections_used) {
+        lock_snapshot();
+        memory_arena_used = arena_used;
+        memory_slices_used = slices_used;
+        memory_slices_free = slices_free;
+        memory_connections_used = connections_used;
+        unlock_snapshot();
+    }
+
+private:
+    void copy_from(const ShardMetrics& other) {
+        other.lock_snapshot();
+        requests_total = other.requests_total;
+        requests_active = other.requests_active;
+        connections_total = other.connections_total;
+        connections_active = other.connections_active;
+        connections_closed = other.connections_closed;
+        request_latency = other.request_latency;
+        memory_arena_used = other.memory_arena_used;
+        memory_slices_used = other.memory_slices_used;
+        memory_slices_free = other.memory_slices_free;
+        memory_connections_used = other.memory_connections_used;
+        other.unlock_snapshot();
     }
 };
 
@@ -121,6 +181,7 @@ inline ShardMetrics aggregate_metrics(ShardMetrics* const* shards, u32 count) {
 
     for (u32 i = 0; i < count; i++) {
         const auto& s = *shards[i];
+        s.lock_snapshot();
         agg.requests_total += s.requests_total;
         agg.requests_active += s.requests_active;
         agg.connections_total += s.connections_total;
@@ -136,6 +197,7 @@ inline ShardMetrics aggregate_metrics(ShardMetrics* const* shards, u32 count) {
         }
         agg.request_latency.sum_us += s.request_latency.sum_us;
         agg.request_latency.count += s.request_latency.count;
+        s.unlock_snapshot();
     }
     return agg;
 }

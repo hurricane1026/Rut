@@ -32,6 +32,7 @@ void Http2Conn::init() {
     cont_discard = false;
     hdr_block_len = 0;
     nstreams = 0;
+    metrics = nullptr;
     pending_stream = 0;
     pending_body_start = 0;
     pending_synth_len = 0;
@@ -62,6 +63,7 @@ void Http2Conn::init() {
     async_upstream_id = 0;
     async_apply_response_mutations = false;
     async_request_forwardable = false;
+    async_capture_response = false;
     async_resp_len = 0;
 }
 
@@ -77,13 +79,16 @@ namespace {
 // streams (caller should RST_STREAM with REFUSED_STREAM).
 Http2Stream* alloc_stream(Http2Conn& c, u32 id) {
     for (u32 i = 0; i < c.nstreams; i++) {
-        if (c.streams[i].state == Http2StreamState::Closed) {
+        if (c.streams[i].state == Http2StreamState::Closed && !c.streams[i].metrics_pending_send) {
             Http2Stream& s = c.streams[i];
             s.id = id;
             s.state = Http2StreamState::Open;
             s.send_window = static_cast<i32>(c.peer_settings.initial_window_size);
             s.recv_window = static_cast<i32>(c.our_settings.initial_window_size);
             s.got_headers = false;
+            s.metrics_started = false;
+            s.metrics_pending_send = false;
+            s.request_start_us = 0;
             return &s;
         }
     }
@@ -94,6 +99,9 @@ Http2Stream* alloc_stream(Http2Conn& c, u32 id) {
     s.send_window = static_cast<i32>(c.peer_settings.initial_window_size);
     s.recv_window = static_cast<i32>(c.our_settings.initial_window_size);
     s.got_headers = false;
+    s.metrics_started = false;
+    s.metrics_pending_send = false;
+    s.request_start_us = 0;
     return &s;
 }
 
@@ -475,6 +483,12 @@ void clear_pending_upload(Http2Conn& c, u32 stream_id) {
     }
 }
 
+void reset_stream_locally(Http2Conn& c, Http2Stream* stream, u32 stream_id, Http2Error error) {
+    clear_pending_upload(c, stream_id);
+    if (stream != nullptr) stream->state = Http2StreamState::Closed;
+    if (c.on_reset != nullptr) c.on_reset(c.cb_ctx, c, stream_id, error);
+}
+
 }  // namespace
 
 // Handle a single fully-buffered frame. Returns a connection error (non-NoError
@@ -582,8 +596,7 @@ static Http2Error handle_frame(Http2Conn& c,
                     if (w.room(kFrameHeaderSize + 4))
                         w.len +=
                             write_rst_stream(w.out + w.len, h.stream_id, Http2Error::ProtocolError);
-                    clear_pending_upload(c, h.stream_id);
-                    s->state = Http2StreamState::Closed;
+                    reset_stream_locally(c, s, h.stream_id, Http2Error::ProtocolError);
                     return Http2Error::NoError;
                 }
                 c.cont_stream = h.stream_id;
@@ -630,8 +643,7 @@ static Http2Error handle_frame(Http2Conn& c,
                     if (w.room(kFrameHeaderSize + 4))
                         w.len +=
                             write_rst_stream(w.out + w.len, h.stream_id, Http2Error::ProtocolError);
-                    clear_pending_upload(c, h.stream_id);
-                    if (s) s->state = Http2StreamState::Closed;
+                    reset_stream_locally(c, s, h.stream_id, Http2Error::ProtocolError);
                     return Http2Error::NoError;
                 }
                 if (s && c.cont_end_stream) s->state = Http2StreamState::HalfClosedRemote;
@@ -674,7 +686,7 @@ static Http2Error handle_frame(Http2Conn& c,
                 if (w.room(kFrameHeaderSize + 4))
                     w.len +=
                         write_rst_stream(w.out + w.len, h.stream_id, Http2Error::FlowControlError);
-                s->state = Http2StreamState::Closed;
+                reset_stream_locally(c, s, h.stream_id, Http2Error::FlowControlError);
                 c.conn_recv_window += static_cast<i64>(h.length);
                 return Http2Error::NoError;
             }
@@ -721,7 +733,7 @@ static Http2Error handle_frame(Http2Conn& c,
                     if (w.room(kFrameHeaderSize + 4))
                         w.len +=
                             write_rst_stream(w.out + w.len, h.stream_id, Http2Error::ProtocolError);
-                    s->state = Http2StreamState::Closed;
+                    reset_stream_locally(c, s, h.stream_id, Http2Error::ProtocolError);
                     return Http2Error::NoError;
                 }
                 const i64 kNw = static_cast<i64>(s->send_window) + kInc;
@@ -729,7 +741,7 @@ static Http2Error handle_frame(Http2Conn& c,
                     if (w.room(kFrameHeaderSize + 4))
                         w.len += write_rst_stream(
                             w.out + w.len, h.stream_id, Http2Error::FlowControlError);
-                    s->state = Http2StreamState::Closed;
+                    reset_stream_locally(c, s, h.stream_id, Http2Error::FlowControlError);
                     return Http2Error::NoError;
                 }
                 s->send_window = static_cast<i32>(kNw);

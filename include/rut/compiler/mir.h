@@ -97,6 +97,7 @@ enum class MirValueKind : u8 {
     CacheGet,
     CacheSet,
     JsonBuild,
+    AdminJson,
 };
 
 enum class MirTypeKind : u8 {
@@ -290,6 +291,7 @@ struct MirTerminator {
     // shared body_idx that codegen packs into HandlerResult.upstream_id.
     Str response_body{};
     bool has_dynamic_response_body = false;
+    u8 control_plane_json_kind = 0;
     FixedVec<Str, kMaxJsonDynamicValues + 1> json_segments;
     FixedVec<u32, kMaxJsonDynamicValues> json_value_ref_indices;
     FixedVec<MirLocal, kMaxJsonMaterializedValues> json_locals;
@@ -319,7 +321,9 @@ struct MirBlock {
     Str label{};
     // Side effects materialized in this block immediately before `term`.
     // Each entry indexes the owning MirFunction::values pool.
-    static constexpr u32 kMaxEffects = 4;
+    // A resumed Response may apply the full bounded header mutation log plus
+    // one status and one body replacement before its terminal return.
+    static constexpr u32 kMaxEffects = 18;
     FixedVec<Effect, kMaxEffects> effects;
     MirTerminator term{};
 };

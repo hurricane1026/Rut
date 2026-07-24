@@ -24,7 +24,9 @@ or `remove` header effects plus status and bounded body replacement. These
 effects live in resumable stream-owned state, so they survive explicit `wait`
 and verifier-bounded `for` control flow. A forwarded response must use
 `return forward(upstream, buffered: true)` so the runtime can materialize the
-complete response before committing the effects.
+complete response before committing the effects. A handler that needs direct
+field access may instead bind `let resp = forward(upstream, buffered: true)`,
+read or mutate its owned fields across later yields, and `return resp`.
 
 If a route needs more precise control than "before handler" or "after handler",
 write that logic directly inside the handler with ordinary `guard`, `wait`,
@@ -32,19 +34,15 @@ write that logic directly inside the handler with ordinary `guard`, `wait`,
 
 ## Use Sites
 
-Chains can be attached to a route group:
+Rut Core attaches a chain directly to a route declaration:
 
 ```rut
 chain common {
     before require_host(req) else 400
 }
 
-route {
-    use chain common
-
-    GET "/:id" {
-        return 200
-    }
+route GET "/:id" use chain common {
+    return 200
 }
 ```
 
@@ -61,42 +59,44 @@ chain upload_secure {
     before limit_body(req, 1mb) else 413
 }
 
-route {
-    GET "/:id" use chain read_secure {
-        return 200
-    }
+route GET "/:id" use chain read_secure {
+    return 200
+}
 
-    POST "/upload" use chain upload_secure {
-        return 204
-    }
+route POST "/upload" use chain upload_secure {
+    return 204
 }
 ```
 
-Route-group chains and entry chains compose in source order:
+When a route needs checks from multiple policies, declare their complete order
+in one route chain rather than relying on grouped-route inheritance:
 
 ```rut
-route {
-    use chain common
+chain upload_policy {
+    before require_host(req) else 400
+    before decode_body(req) else 400
+    before require_auth(req) else 401
+    before limit_body(req, 1mb) else 413
+}
 
-    POST "/upload" use chain upload_secure {
-        return 204
-    }
+route POST "/upload" use chain upload_policy {
+    return 204
 }
 ```
 
 The expanded order is:
 
 ```text
-common.before
-upload_secure.before
+require_host
+decode_body
+require_auth
+limit_body
 handler
-common.after
-upload_secure.after
 ```
 
-Implemented `after` lowering uses this same final chain order. It is not a
-reverse wrapper unwind; it follows the code's visible order so review, replay,
-and generated code do not need an extra execution model.
+Implemented `after` lowering follows the same visible source order. It is not a
+reverse wrapper unwind, so review, replay, and generated code do not need an
+extra execution model.
 
 ## Core Restrictions
 

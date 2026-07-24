@@ -250,10 +250,12 @@ public:
     }
 
     ShardMetrics* metrics = nullptr;
+    MmapArena* metrics_arena = nullptr;
     // Registry of every shard's metrics, for the built-in /metrics endpoint to
     // aggregate across shards. Null → endpoint disabled (the default).
     ShardMetrics* const* all_shard_metrics = nullptr;
     u32 shard_metrics_count = 0;
+    bool metrics_endpoint_enabled = false;
     // Per-shard idle upstream connection pool (HTTP/1 keep-alive reuse). Wired by
     // the shard; null in tests/mocks that don't exercise reuse.
     UpstreamPool* upstream = nullptr;
@@ -567,6 +569,8 @@ public:
     void free_conn_impl(Connection& c) {
         u32 cid = c.id;
         timer.remove(&c);
+        if (c.response_capture_slice) pool.free(c.response_capture_slice);
+        if (c.request_capture_slice) pool.free(c.request_capture_slice);
         // Sync backend: kernel is done with buffers. Free immediately.
         if (c.recv_slice) pool.free(c.recv_slice);
         if (c.send_slice) pool.free(c.send_slice);
@@ -576,7 +580,8 @@ public:
         if (c.h2) {
             auto* async_ctx = c.h2->async_jit_ctx();
             if (c.h2->async_stream != 0 &&
-                (c.h2->async_kind == H2AsyncKind::Timer || c.h2->async_apply_response_mutations))
+                (c.h2->async_kind == H2AsyncKind::Timer || c.h2->async_apply_response_mutations ||
+                 c.h2->async_capture_response))
                 rut_helper_resp_release_body_storage(static_cast<void*>(async_ctx));
             if (c.handler_ctx == async_ctx) c.handler_ctx = nullptr;
             h2_pool.free(c.h2);
@@ -682,7 +687,16 @@ public:
         backend.clear_send_state(c.id);
         if (metrics) {
             if (c.req_start_us != 0) {
-                if (metrics->requests_active > 0) metrics->requests_active--;
+                metrics->on_request_cancel();
+            }
+            if (c.h2 != nullptr) {
+                for (u32 i = 0; i < c.h2->nstreams; i++) {
+                    if (!c.h2->streams[i].metrics_started) continue;
+                    metrics->on_request_cancel();
+                    c.h2->streams[i].metrics_started = false;
+                    c.h2->streams[i].metrics_pending_send = false;
+                    c.h2->streams[i].request_start_us = 0;
+                }
             }
             metrics->on_close();
         }

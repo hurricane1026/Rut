@@ -101,9 +101,9 @@ static i32 run_shards(u16 port,
                       const RouteConfig* route_config,
                       bool serve_metrics) {
     Shard<EventLoopType> shards[kMaxShards];
-    // Cross-shard metrics registry for the built-in /metrics endpoint. Lives
-    // for the whole serve duration (outlives the shard threads, which join
-    // before this returns). Only populated under --metrics.
+    // Cross-shard metrics registry for snapshots and the optional built-in
+    // /metrics endpoint. It outlives the shard threads, which join before this
+    // function returns.
     ShardMetrics* metrics_ptrs[kMaxShards];
 
     // One process-shared limiter backing @rateLimit(scope: global). Lives for the
@@ -179,17 +179,17 @@ static i32 run_shards(u16 port,
         shards[i].route_config = route_config;
     }
 
-    // Wire the cross-shard metrics registry so any shard can serve an
-    // aggregated GET /metrics. Done after all shards init (loops valid) and
-    // before spawn (threads see a fully-built registry).
-    if (serve_metrics) {
-        for (u32 i = 0; i < shard_count; i++) metrics_ptrs[i] = &shards[i].shard_metrics;
-        for (u32 i = 0; i < shard_count; i++) {
-            if constexpr (requires { shards[i].loop->all_shard_metrics; }) {
-                shards[i].loop->all_shard_metrics = metrics_ptrs;
-                shards[i].loop->shard_metrics_count = shard_count;
-            }
+    // Wire the registry before spawn so stats()/metrics() can latch a bounded
+    // process snapshot even when the scrape endpoint is disabled.
+    for (u32 i = 0; i < shard_count; i++) metrics_ptrs[i] = &shards[i].shard_metrics;
+    for (u32 i = 0; i < shard_count; i++) {
+        if constexpr (requires { shards[i].loop->all_shard_metrics; }) {
+            shards[i].loop->all_shard_metrics = metrics_ptrs;
+            shards[i].loop->shard_metrics_count = shard_count;
+            shards[i].loop->metrics_endpoint_enabled = serve_metrics;
         }
+    }
+    if (serve_metrics) {
         write_str("Metrics: built-in GET /metrics enabled (reserved path — shadows user routes)\n");
     }
 
