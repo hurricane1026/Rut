@@ -11,17 +11,17 @@ without accepting source forms that cannot be replayed or resumed faithfully.
 
 ### Dynamic JSON serialization
 
-Literal JSON, bounded runtime scalar interpolation, and recursively expanded
-declared structs in direct responses are implemented. Struct keys follow field
-declaration order and scalar leaves share the existing eight-slot bound. The
-serializer uses shard-owned scratch, escapes strings at runtime, and turns
-capacity overflow into a 500 rather than publishing partial JSON. Remaining
-work: reusable `json(...)` values outside a direct return. Generic bounded
-`Array<T>` carriers now survive locals and helper inlining, support nested
-arrays and declared-struct fields, and serialize recursively. Bounded runtime
-string-list views from `queryAll` and `getAll` serialize as ordered JSON
-arrays. Replay publishes the exact bounded response body bytes to harness
-oracles, with the full length and explicit truncation state.
+`json(...)` produces a reusable compiler-owned plan that may flow through
+locals and helper parameters/returns, then serialize at a direct return,
+`respond`, or `Response.body` sink. Literal JSON, bounded runtime scalar
+interpolation, recursively expanded declared structs, generic bounded
+`Array<T>` carriers, and ordered string-list views are supported. Struct keys
+follow field declaration order and dynamic leaves share the existing
+eight-slot bound. The serializer escapes strings at runtime; capacity or 4 KiB
+mutable-body overflow fails closed instead of publishing partial JSON.
+Response-body sinks copy bytes into stream-owned resumable context, while
+replay publishes exact bounded output bytes and explicit truncation state to
+harness oracles.
 
 **Acceptance**:
 - Runtime size/depth overflow fails closed with a deterministic diagnostic.
@@ -33,10 +33,9 @@ oracles, with the full length and explicit truncation state.
 Response header mutation logs now live in resumable `HandlerCtx` state rather
 than `Connection`; pending logs survive `wait`, stay isolated per request or H2
 stream invocation, and `chain after` no longer rejects `wait`/`for` routes.
-Bounded plain-string body replacement and status replacement now use the same
-pending/committed boundary. Remaining work is field reads, JSON-valued body
-assignment, and applying header/status/body mutations to an explicitly buffered
-forwarded response.
+Bounded plain-string/JSON body replacement and status replacement now use the
+same pending/committed boundary. Remaining work is field reads and applying
+header/status/body mutations to an explicitly buffered forwarded response.
 
 **Acceptance**:
 - `chain after` can mutate buffered status/body and survive a yield.

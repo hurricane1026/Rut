@@ -12,6 +12,7 @@
 
 #include <hs.h>
 #include <pthread.h>
+#include <stddef.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -74,6 +75,39 @@ struct JsonResponseScratch {
     bool ok = true;
 };
 thread_local JsonResponseScratch t_json_response;
+
+// Reusable Json values may coexist within one handler invocation (for example,
+// the two eagerly lowered arms of an if-expression). Capture each completed
+// document into distinct invocation-owned storage so a later JsonBuild cannot
+// overwrite an earlier Str view before the select chooses between them. The
+struct JsonCaptureChunk {
+    char* data = nullptr;
+    u32 capacity = 0;
+    u32 used = 0;
+    JsonCaptureChunk* next = nullptr;
+};
+
+struct JsonCaptureArena {
+    // A reusable plan may be published at many sinks, and every eagerly
+    // lowered conditional arm gets its own bounded document capture. The HIR
+    // expression/local limits bound the total below this request-local cap.
+    static constexpr u32 kMaxCapacity = 64 * 1024 * 1024;
+    JsonCaptureChunk* head = nullptr;
+    JsonCaptureChunk* current = nullptr;
+    u32 total_capacity = 0;
+    u32 used = 0;
+    u32 last_capture_len = 0xffffffffu;
+
+    ~JsonCaptureArena() {
+        while (head != nullptr) {
+            JsonCaptureChunk* next = head->next;
+            free(head->data);
+            free(head);
+            head = next;
+        }
+    }
+};
+thread_local JsonCaptureArena t_json_captures;
 
 void json_append(const char* data, u32 len) {
     auto& out = t_json_response;
@@ -158,6 +192,18 @@ void rut_helper_parse_prime(const u8* req_data, u32 req_len) {
     ParseCache& pc = t_parse_cache;
     parse_into(pc, req_data, req_len);
     pc.primed = true;
+}
+
+void rut_helper_json_capture_reset() {
+    // Keep the thread-local allocation between handler invocations. Captured
+    // views live only for the current invocation, so rewinding is sufficient;
+    // retaining the block avoids a 512 KiB malloc/free cycle on every JSON
+    // request. JsonCaptureArena releases it when the worker thread exits.
+    for (JsonCaptureChunk* chunk = t_json_captures.head; chunk != nullptr; chunk = chunk->next)
+        chunk->used = 0;
+    t_json_captures.current = t_json_captures.head;
+    t_json_captures.used = 0;
+    t_json_captures.last_capture_len = 0xffffffffu;
 }
 
 void rut_helper_parse_unprime() {
@@ -252,6 +298,65 @@ void rut_helper_json_append_i64(i64 value) {
 
 void rut_helper_json_append_bool(u8 value) {
     json_append(value != 0 ? "true" : "false", value != 0 ? 4 : 5);
+}
+
+const char* rut_helper_json_capture_data() {
+    auto& captures = t_json_captures;
+    if (!t_json_response.ok) {
+        captures.last_capture_len = 0xffffffffu;
+        return nullptr;
+    }
+    const u32 capture_size = t_json_response.len == 0 ? 1 : t_json_response.len;
+    if (capture_size > JsonCaptureArena::kMaxCapacity - captures.used) {
+        captures.last_capture_len = 0xffffffffu;
+        return nullptr;
+    }
+    while (captures.current != nullptr &&
+           capture_size > captures.current->capacity - captures.current->used)
+        captures.current = captures.current->next;
+    if (captures.current == nullptr) {
+        const u32 previous_capacity = captures.head == nullptr ? 0 : captures.total_capacity;
+        u32 chunk_capacity = previous_capacity == 0 ? 64 * 1024 : previous_capacity;
+        if (chunk_capacity > JsonCaptureArena::kMaxCapacity - captures.total_capacity)
+            chunk_capacity = JsonCaptureArena::kMaxCapacity - captures.total_capacity;
+        if (chunk_capacity < capture_size) {
+            captures.last_capture_len = 0xffffffffu;
+            return nullptr;
+        }
+        auto* chunk = static_cast<JsonCaptureChunk*>(malloc(sizeof(JsonCaptureChunk)));
+        if (chunk == nullptr) {
+            captures.last_capture_len = 0xffffffffu;
+            return nullptr;
+        }
+        chunk->data = static_cast<char*>(malloc(chunk_capacity));
+        if (chunk->data == nullptr) {
+            free(chunk);
+            captures.last_capture_len = 0xffffffffu;
+            return nullptr;
+        }
+        chunk->capacity = chunk_capacity;
+        chunk->used = 0;
+        chunk->next = nullptr;
+        if (captures.head == nullptr) {
+            captures.head = chunk;
+        } else {
+            JsonCaptureChunk* tail = captures.head;
+            while (tail->next != nullptr) tail = tail->next;
+            tail->next = chunk;
+        }
+        captures.current = chunk;
+        captures.total_capacity += chunk_capacity;
+    }
+    char* out = captures.current->data + captures.current->used;
+    if (t_json_response.len != 0) __builtin_memcpy(out, t_json_response.data, t_json_response.len);
+    captures.current->used += capture_size;
+    captures.used += capture_size;
+    captures.last_capture_len = t_json_response.len;
+    return out;
+}
+
+u32 rut_helper_json_capture_len() {
+    return t_json_captures.last_capture_len;
 }
 
 void rut_helper_json_finish(void* ctx) {
@@ -517,6 +622,18 @@ void rut_helper_resp_set_body(void* ctx, const char* body, u32 len) {
         __builtin_memcpy(hctx->response_body_mutation_storage, body, len);
 }
 
+void rut_helper_resp_publish_body(void* ctx, const char* body, u32 len) {
+    if (ctx == nullptr) return;
+    auto* hctx = static_cast<jit::HandlerCtx*>(ctx);
+    hctx->response_body_data = nullptr;
+    hctx->response_body_len = 0;
+    hctx->response_body_valid = 0;
+    if (body == nullptr || len > jit::kMaxDynamicResponseBodyBytes) return;
+    hctx->response_body_data = body;
+    hctx->response_body_len = len;
+    hctx->response_body_valid = 1;
+}
+
 void rut_helper_resp_commit_headers(void* ctx) {
     if (ctx == nullptr) return;
     auto* hctx = static_cast<jit::HandlerCtx*>(ctx);
@@ -525,6 +642,14 @@ void rut_helper_resp_commit_headers(void* ctx) {
     hctx->response_status = hctx->response_status_pending;
     hctx->response_status_set = hctx->response_status_pending_set;
     hctx->response_status_invalid = hctx->response_status_pending_invalid;
+    hctx->response_body_mutation_len = hctx->response_body_pending_len;
+    hctx->response_body_mutation_set = hctx->response_body_pending_set;
+    hctx->response_body_mutation_overflow = hctx->response_body_pending_overflow;
+}
+
+void rut_helper_resp_commit_body(void* ctx) {
+    if (ctx == nullptr) return;
+    auto* hctx = static_cast<jit::HandlerCtx*>(ctx);
     hctx->response_body_mutation_len = hctx->response_body_pending_len;
     hctx->response_body_mutation_set = hctx->response_body_pending_set;
     hctx->response_body_mutation_overflow = hctx->response_body_pending_overflow;

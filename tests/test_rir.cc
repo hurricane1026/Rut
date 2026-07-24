@@ -498,6 +498,26 @@ TEST(RirPrinter, OpcodeNames) {
     CHECK(got2.eq(lit("yield.http_get")));
 }
 
+TEST(RirPrinter, RespCommitBodyPrintsDirectOperand) {
+    TestContext ctx;
+    REQUIRE(ctx.init());
+    Builder b;
+    b.init(&ctx.mod);
+    auto* fn = V(b.create_function(lit("test_fn"), lit("/test"), 1));
+    auto entry = V(b.create_block(fn, lit("entry")));
+    b.set_insert_point(fn, entry);
+    auto body = V(b.emit_const_str(lit("body")));
+    VOK(b.emit_resp_publish_body(body));
+
+    char data[128];
+    PrintBuf out;
+    out.init(data, sizeof(data), -1);
+    print_instruction(out, fn->blocks[entry.id].insts[1], *fn);
+    const Str printed{out.data, out.len};
+    CHECK(printed.eq(lit("    resp.commit_body %0\n")));
+    ctx.destroy();
+}
+
 TEST(RirPrinter, TypeNames) {
     TestContext ctx;
     REQUIRE(ctx.init());
