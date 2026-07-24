@@ -5886,8 +5886,7 @@ TEST(buffered_forward, chunked_205_is_not_reused_before_delayed_terminator) {
         "HTTP/1.1 205 Reset Content\r\nTransfer-Encoding: chunked\r\n"
         "Connection: keep-alive\r\n\r\n";
     conn->upstream_recv_buf.reset();
-    conn->upstream_recv_buf.write(reinterpret_cast<const u8*>(kUpstream),
-                                  sizeof(kUpstream) - 1);
+    conn->upstream_recv_buf.write(reinterpret_cast<const u8*>(kUpstream), sizeof(kUpstream) - 1);
     on_upstream_response<SmallLoop>(
         &loop,
         *conn,
@@ -6118,6 +6117,25 @@ TEST(buffered_forward, waits_for_and_dechunks_complete_upstream_body) {
     CHECK(buf_contains(wire, wire_len, "Content-Length: 9\r\n", 19));
     CHECK(!buf_contains(wire, wire_len, "Transfer-Encoding", 17));
     CHECK(buf_contains(wire, wire_len, "\r\n\r\nWikipedia", 13));
+}
+
+TEST(buffered_forward, truncated_chunked_response_returns_bad_gateway) {
+    SmallLoop loop;
+    loop.setup();
+    auto* conn = setup_proxy_conn(loop);
+    REQUIRE(conn != nullptr);
+    conn->proxy_response_buffered = true;
+    conn->reset_jit_ctx();
+
+    static constexpr char kPartial[] =
+        "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n4\r\nWi";
+    conn->upstream_recv_buf.reset();
+    conn->upstream_recv_buf.write(reinterpret_cast<const u8*>(kPartial), sizeof(kPartial) - 1);
+
+    on_upstream_response<SmallLoop>(&loop, *conn, make_ev(conn->id, IoEventType::UpstreamRecv, 0));
+
+    CHECK_EQ(conn->resp_status, 502u);
+    CHECK_EQ(conn->on_send, &on_proxy_response_sent<SmallLoop>);
 }
 
 TEST(buffered_forward, rejects_body_longer_than_content_length) {
@@ -13258,6 +13276,49 @@ TEST(state_invariant, upstream_response_eof_without_data_resets_proxy_conn) {
     loop.inject_and_dispatch(make_ev(cid, IoEventType::UpstreamRecv, 0));
 
     check_idle_invariant(_tc, &loop.conns[cid]);
+}
+
+TEST(buffered_forward, empty_upstream_response_returns_bad_gateway) {
+    SmallLoop loop;
+    loop.setup();
+    auto* c = setup_proxy_conn(loop);
+    REQUIRE(c != nullptr);
+    c->proxy_response_buffered = true;
+    c->reset_jit_ctx();
+    c->upstream_recv_buf.reset();
+
+    on_upstream_response<SmallLoop>(&loop, *c, make_ev(c->id, IoEventType::UpstreamRecv, 0));
+
+    CHECK_EQ(c->resp_status, 502u);
+    CHECK_EQ(c->on_send, &on_proxy_response_sent<SmallLoop>);
+}
+
+TEST(buffered_forward, h2_rejects_body_longer_than_content_length) {
+    SmallLoop loop;
+    loop.setup();
+    loop.inject_and_dispatch(make_ev(0, IoEventType::Accept, 42));
+    auto* c = loop.find_fd(42);
+    REQUIRE(c != nullptr);
+
+    Http2Conn h2{};
+    h2.init();
+    h2.async_stream = 1;
+    h2.async_kind = H2AsyncKind::Proxy;
+    c->h2 = &h2;
+    c->protocol = ConnProtocol::Http2;
+    c->state = ConnState::Proxying;
+    c->set_slots(nullptr, nullptr, &h2_on_upstream_response<SmallLoop>, nullptr);
+    static constexpr char kResponse[] = "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nabc";
+    c->upstream_recv_buf.write(reinterpret_cast<const u8*>(kResponse), sizeof(kResponse) - 1);
+
+    h2_on_upstream_response<SmallLoop>(
+        &loop,
+        *c,
+        make_ev(c->id, IoEventType::UpstreamRecv, static_cast<i32>(sizeof(kResponse) - 1)));
+
+    CHECK_EQ(h2.async_stream, 0u);
+    CHECK_EQ(c->on_send, &on_h2_sent<SmallLoop>);
+    c->h2 = nullptr;
 }
 
 TEST(state_invariant, proxy_timeout_clears_proxy_slots) {

@@ -3049,7 +3049,11 @@ void h2_on_upstream_response(void* lp, Connection& conn, IoEvent ev) {
         }
     }
     if (!resp.chunked && resp.has_content_length) {
-        if (kHaveBody >= resp.content_length) {
+        if (kHaveBody > resp.content_length) {
+            h2_proxy_fail(loop, conn, 502);
+            return;
+        }
+        if (kHaveBody == resp.content_length) {
             body_len = resp.content_length;
             complete = true;
         } else if (ev.result <= 0) {
@@ -4770,6 +4774,9 @@ void on_buffered_upstream_response(Loop* loop,
                 if (status == ChunkStatus::Done) break;
             }
             body_len = decoded_len;
+        } else if (ev.result <= 0) {
+            buffered_forward_fail(loop, conn, 502);
+            return;
         }
     } else if (resp.has_content_length) {
         if (have_body > resp.content_length) {
@@ -4799,8 +4806,8 @@ void on_buffered_upstream_response(Loop* loop,
     }
     conn.upstream_keep_alive = resp.keep_alive && !resp.connection_close &&
                                !(!resp.has_content_length && !resp.chunked && !no_body) &&
-                               !(no_body && resp.chunked) &&
-                               conn.req_keep_alive && !contaminated_no_body_response;
+                               !(no_body && resp.chunked) && conn.req_keep_alive &&
+                               !contaminated_no_body_response;
     finish_buffered_forward(loop, conn, resp, parser, body_len);
 }
 
@@ -4822,6 +4829,10 @@ void on_upstream_response(void* lp, Connection& conn, IoEvent ev) {
         // fresh connect (request_fully_resendable inside the helper enforces this, so
         // a streamed body upload is never replayed). Otherwise fail closed.
         if (retry_reused_upstream(loop, conn)) return;
+        if (conn.proxy_response_buffered) {
+            buffered_forward_fail(loop, conn, 502);
+            return;
+        }
         loop->close_conn(conn);
         return;
     }

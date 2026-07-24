@@ -12549,6 +12549,11 @@ static FrontendResult<HirTerminator> analyze_term(const AstStatement& stmt,
             has_request_rewrite_effect |=
                 kind == HirExprKind::ReqSetHeader || kind == HirExprKind::ReqAddHeader;
         }
+        for (u32 ei = 0; ei < route->exprs.len; ei++) {
+            const auto kind = route->exprs[ei].kind;
+            has_request_rewrite_effect |=
+                kind == HirExprKind::ReqSetHeader || kind == HirExprKind::ReqAddHeader;
+        }
     }
     if (stmt.forward_buffered && (stmt.has_forward_set_path || stmt.forward_set_headers.len != 0 ||
                                   has_request_rewrite_effect))

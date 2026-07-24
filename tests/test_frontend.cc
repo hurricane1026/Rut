@@ -8338,6 +8338,15 @@ route GET "/x" {
     return forward(api, buffered: true)
 }
 )rut",
+        R"rut(
+upstream api
+route GET "/x" {
+    match req.path {
+        "/x" => { req.set("X-Version", "2") return forward(api, buffered: true) }
+        _ => return 404
+    }
+}
+)rut",
     };
     for (const char* src : rewrite_sources) {
         auto lexed = lex(lit(src));

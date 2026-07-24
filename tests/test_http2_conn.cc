@@ -707,6 +707,12 @@ TEST(h2_proxy_forwardable, rejects_ambiguous_host_without_authority) {
     CHECK(h2_proxy_request_forwardable(auth_plus_host, 6));
 }
 
+TEST(h2_proxy_forwardable, rejects_missing_host_without_authority) {
+    hpack::Header no_host[] = {
+        {{":method", 7}, {"GET", 3}}, {{":scheme", 7}, {"http", 4}}, {{":path", 5}, {"/", 1}}};
+    CHECK_FALSE(h2_proxy_request_forwardable(no_host, 3));
+}
+
 // Write a raw frame (header + payload) into out; return bytes written.
 namespace {
 u32 put_frame(u8* out, Http2FrameType type, u8 flags, u32 stream_id, const u8* payload, u32 plen) {
@@ -1662,7 +1668,7 @@ TEST(h2_serving, mutation_storage_is_released_after_serialization) {
 
 TEST(h2_serving, rejected_handler_outcomes_release_mutation_storage) {
     static constexpr u8 kRequest[] = "GET / HTTP/1.1\r\n\r\n";
-    const auto run = [&](jit::HandlerFn fn, bool occupy_async_slot) {
+    const auto run = [&](jit::HandlerFn fn, bool occupy_async_slot, bool request_forwardable) {
         Http2Conn h2;
         h2.init();
         if (occupy_async_slot) h2.async_stream = 3;
@@ -1675,15 +1681,41 @@ TEST(h2_serving, rejected_handler_outcomes_release_mutation_storage) {
         RouteEntry route{};
         route.fn = fn;
 
-        h2_invoke_emit(
-            dispatch, 1, &route, nullptr, 0, nullptr, kRequest, sizeof(kRequest) - 1, false);
+        h2_invoke_emit(dispatch,
+                       1,
+                       &route,
+                       nullptr,
+                       0,
+                       nullptr,
+                       kRequest,
+                       sizeof(kRequest) - 1,
+                       request_forwardable);
 
         CHECK(conn.jit_ctx()->response_body_mutation_storage == nullptr);
         CHECK_GT(dispatch.resp_len, 0u);
     };
 
-    run(&h2_mutated_body_then_forward, false);
-    run(&h2_mutated_body_then_timer, true);
+    run(&h2_mutated_body_then_forward, false, false);
+    run(&h2_mutated_body_then_forward, true, true);
+    run(&h2_mutated_body_then_timer, true, false);
+}
+
+TEST(h2_serving, failed_response_serialization_rolls_back_encoder_state) {
+    Http2Conn h2;
+    h2.init();
+    Connection conn;
+    conn.reset();
+    conn.h2 = &h2;
+    FakeH2Loop loop;
+    u8 response[1]{};
+    H2Dispatch<FakeH2Loop> dispatch{&loop, &conn, response, sizeof(response), 0, false};
+    const hpack::Header header = {{"x-dynamic", 9}, {"inserted", 8}};
+    const auto before = h2.hpack_enc;
+
+    h2_emit_response(dispatch, 1, 200, &header, 1, nullptr, 0, /*allow_fallback=*/false);
+
+    CHECK(dispatch.overflow);
+    CHECK_EQ(__builtin_memcmp(&h2.hpack_enc, &before, sizeof(before)), 0);
 }
 
 TEST(h2_serving, deferred_route_params_copied_to_stable_storage) {

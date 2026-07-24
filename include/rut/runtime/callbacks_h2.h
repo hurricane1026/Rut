@@ -236,7 +236,7 @@ inline bool h2_proxy_request_forwardable(const hpack::Header* hs, u32 n) {
             host_fields++;
     }
     if (!have_scheme) return false;
-    if (!have_authority && host_fields > 1) return false;
+    if (!have_authority && host_fields != 1) return false;
     return true;
 }
 
@@ -760,6 +760,7 @@ void h2_invoke_emit(H2Dispatch<Loop>& d,
     }
     if (kOutcome.kind == JitDispatchOutcome::Kind::ForwardBuffered) {
         if (!request_forwardable) {
+            jit::release_response_body_mutation_storage(ctx);
             h2_emit_status(d, stream_id, 400);
             return;
         }
@@ -775,8 +776,10 @@ void h2_invoke_emit(H2Dispatch<Loop>& d,
             return;
         }
         if (!h2_suspend_proxy(
-                d, stream_id, cfg, route, kOutcome.upstream_id, true, ctx, synth, forward_len))
+                d, stream_id, cfg, route, kOutcome.upstream_id, true, ctx, synth, forward_len)) {
+            jit::release_response_body_mutation_storage(ctx);
             h2_emit_status(d, stream_id, 503);
+        }
         return;
     }
     if (kOutcome.kind != JitDispatchOutcome::Kind::ReturnStatus) {
@@ -818,19 +821,17 @@ void h2_finish_body(H2Dispatch<Loop>& d, u32 stream_id) {
     }
 
     const RouteEntry* pending_route = h2->pending_route;
-    const bool inject_for_handler = h2->pending_buffer_body &&
-                                    !h2->pending_has_content_length && pending_route != nullptr &&
-                                    pending_route->needs_req_body;
+    const bool inject_for_handler = h2->pending_buffer_body && !h2->pending_has_content_length &&
+                                    pending_route != nullptr && pending_route->needs_req_body;
     // A body-reading handler still needs the derived length for the HTTP/1-
     // shaped body parser. A route that only may buffered-forward must observe
     // the original header set; its derived length is injected after that
     // outcome is selected below.
-    if (inject_for_handler &&
-        !h2_inject_content_length(h2->pending_synth,
-                                  &h2->pending_synth_len,
-                                  h2->pending_body_start,
-                                  h2->pending_body_len,
-                                  Http2Conn::kBodySynthCap)) {
+    if (inject_for_handler && !h2_inject_content_length(h2->pending_synth,
+                                                        &h2->pending_synth_len,
+                                                        h2->pending_body_start,
+                                                        h2->pending_body_len,
+                                                        Http2Conn::kBodySynthCap)) {
         h2_clear_pending(*h2);
         h2_emit_status(d, stream_id, 413);
         return;
@@ -840,9 +841,8 @@ void h2_finish_body(H2Dispatch<Loop>& d, u32 stream_id) {
     const u8* synth = h2->pending_synth;
     const u32 kBodyStart = h2->pending_body_start;
     const u32 kBodyLen = h2->pending_body_len;
-    const bool kInjectContentLengthOnForward = h2->pending_buffer_body &&
-                                               !h2->pending_has_content_length &&
-                                               !inject_for_handler;
+    const bool kInjectContentLengthOnForward =
+        h2->pending_buffer_body && !h2->pending_has_content_length && !inject_for_handler;
     const RouteConfig* cfg = h2->pending_route_config;
     const RouteEntry* route = pending_route;
     const jit::HandlerFn kJitFn = h2->pending_jit_fn;
