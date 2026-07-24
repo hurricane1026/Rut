@@ -1297,7 +1297,6 @@ FrontendResult<MirModule*> build_mir(const HirModule& module) {
             }
             return false;
         };
-
         auto is_response_effect = [](HirExprKind kind) {
             return kind == HirExprKind::RespSetHeader || kind == HirExprKind::RespAddHeader ||
                    kind == HirExprKind::RespRemoveHeader || kind == HirExprKind::RespSetStatus ||

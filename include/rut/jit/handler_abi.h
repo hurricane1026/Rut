@@ -133,6 +133,7 @@ inline constexpr u32 kMaxCapturedResponseStorageBytes = 16u * 1024u;
 inline constexpr u32 kCapturedResponseFramingReserve = 512;
 inline constexpr u32 kControlPlaneLatencyBucketCount = 11;
 enum class ControlPlaneJsonKind : u8 { Stats = 0, Metrics = 1 };
+inline constexpr u32 kMaxDynamicJsonResponseBytes = kMaxDynamicResponseBodyBytes;
 enum class ResponseHeaderMutationMode : u8 { Set, Add, Remove };
 struct ResponseHeaderMutation {
     Str name;

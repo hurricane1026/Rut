@@ -3480,6 +3480,12 @@ void h2_on_upstream_connected(void* lp, Connection& conn, IoEvent ev) {
 template <typename Loop>
 void h2_proxy_begin(Loop* loop, Connection& conn) {
     Http2Conn* h2 = conn.h2;
+    // JIT proxy/capture episodes own a parked HandlerCtx. Repoint the connection
+    // before any upstream callback reads response mutations or capture state; a
+    // later stream in the suspending H2 batch may already have reset the shared
+    // connection scratch frame.
+    if (h2->async_apply_response_mutations || h2->async_capture_response)
+        conn.handler_ctx = h2->async_jit_ctx();
     const RouteConfig* cfg = h2->async_cfg;
     const u16 upstream_id = h2->async_upstream_id;
     if (cfg == nullptr || upstream_id >= cfg->upstream_count) {
@@ -4860,6 +4866,8 @@ inline bool ws_value_has_token(const char* v, u32 vlen, const char* tok, u32 tle
 template <typename Loop>
 void buffered_forward_fail(Loop* loop, Connection& conn, u16 status) {
     conn.proxy_response_buffered = false;
+    conn.proxy_response_capture = false;
+    conn.pending_handler_fn = nullptr;
     conn.buffered_proxy_send_in_progress = true;
     conn.proxy_response_capture = false;
     conn.pending_handler_fn = nullptr;
