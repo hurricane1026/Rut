@@ -1179,123 +1179,9 @@ FrontendResult<MirModule*> build_mir(const HirModule& module) {
                 iter = &source->init;
             }
         }
-        auto expr_refs_local =
-            [&](auto&& self, const HirExpr& expr, u32 ref_index, u32 depth) -> bool {
-            if (depth > HirRoute::kMaxExprs) return false;
-            if (expr.kind == HirExprKind::LocalRef && expr.local_index == ref_index) return true;
-            if (expr.lhs != nullptr && self(self, *expr.lhs, ref_index, depth + 1)) return true;
-            if (expr.rhs != nullptr && self(self, *expr.rhs, ref_index, depth + 1)) return true;
-            for (u32 ai = 0; ai < expr.args.len; ai++)
-                if (expr.args[ai] != nullptr && self(self, *expr.args[ai], ref_index, depth + 1))
-                    return true;
-            for (u32 fi = 0; fi < expr.field_inits.len; fi++)
-                if (expr.field_inits[fi].value != nullptr &&
-                    self(self, *expr.field_inits[fi].value, ref_index, depth + 1))
-                    return true;
-            return false;
-        };
-        auto term_refs_local = [&](const HirTerminator& term, u32 ref_index) {
-            for (u32 ji = 0; ji < term.json_value_expr_indices.len; ji++) {
-                const u32 expr_index = term.json_value_expr_indices[ji];
-                if (expr_index < module.routes[i].exprs.len &&
-                    expr_refs_local(
-                        expr_refs_local, module.routes[i].exprs[expr_index], ref_index, 0))
-                    return true;
-            }
-            return false;
-        };
-        auto static_iter_array_for = [&](u32 loop_index) -> const HirExpr* {
-            if (loop_index >= module.routes[i].for_loops.len) return nullptr;
-            const HirExpr* iter = &module.routes[i].for_loops[loop_index].iter_expr;
-            for (u32 depth = 0; depth <= module.routes[i].locals.len; depth++) {
-                if (iter->kind == HirExprKind::ArrayLit) return iter;
-                if (iter->kind != HirExprKind::LocalRef) return nullptr;
-                const HirLocal* source = nullptr;
-                for (u32 li = 0; li < module.routes[i].locals.len; li++) {
-                    if (module.routes[i].locals[li].ref_index == iter->local_index) {
-                        source = &module.routes[i].locals[li];
-                        break;
-                    }
-                }
-                if (source == nullptr) return nullptr;
-                iter = &source->init;
-            }
-            return nullptr;
-        };
-        auto loop_has_repeating_ancestor = [&](auto&& self, u32 child, u32 depth) -> bool {
-            if (depth > module.routes[i].for_loops.len) return false;
-            for (u32 pi = 0; pi < module.routes[i].for_loops.len; pi++) {
-                const auto& parent = module.routes[i].for_loops[pi];
-                for (u32 si = 0; si < parent.body.steps.len; si++) {
-                    const auto& step = parent.body.steps[si];
-                    if (step.kind != HirForLoopBody::Step::Kind::For || step.index != child)
-                        continue;
-                    const HirExpr* parent_iter = static_iter_array_for(pi);
-                    if (parent_iter != nullptr && parent_iter->args.len > 1) return true;
-                    return self(self, pi, depth + 1);
-                }
-            }
-            return false;
-        };
         auto static_iter_ref_needed_at_runtime =
-            [&](auto&& self, u32 ref_index, u32 depth) -> bool {
-            if (depth > HirRoute::kMaxLocals) return false;
-            u32 iterator_consumers = 0;
-            for (u32 fi = 0; fi < module.routes[i].for_loops.len; fi++) {
-                if (expr_refs_local(
-                        expr_refs_local, module.routes[i].for_loops[fi].iter_expr, ref_index, 0)) {
-                    iterator_consumers +=
-                        loop_has_repeating_ancestor(loop_has_repeating_ancestor, fi, 0) ? 2u : 1u;
-                    if (iterator_consumers > 1) return true;
-                }
-            }
-            for (u32 li = 0; li < module.routes[i].locals.len; li++) {
-                const auto& consumer = module.routes[i].locals[li];
-                if (!expr_refs_local(expr_refs_local, consumer.init, ref_index, 0)) continue;
-                if (consumer.ref_index < HirRoute::kMaxLocals &&
-                    static_iter_ref[consumer.ref_index]) {
-                    if (consumer.ref_index != ref_index &&
-                        self(self, consumer.ref_index, depth + 1))
-                        return true;
-                    continue;
-                }
-                return true;
-            }
-            const auto& control = module.routes[i].control;
-            if (term_refs_local(control.direct_term, ref_index) ||
-                term_refs_local(control.then_term, ref_index) ||
-                term_refs_local(control.else_term, ref_index))
-                return true;
-            for (u32 ai = 0; ai < control.match_arms.len; ai++) {
-                const auto& arm = control.match_arms[ai];
-                if (term_refs_local(arm.direct_term, ref_index) ||
-                    term_refs_local(arm.then_term, ref_index) ||
-                    term_refs_local(arm.else_term, ref_index))
-                    return true;
-                for (u32 gi = 0; gi < arm.guards.len; gi++) {
-                    const auto& guard = arm.guards[gi];
-                    if (term_refs_local(guard.fail_term, ref_index) ||
-                        term_refs_local(guard.fail_body.direct_term, ref_index) ||
-                        term_refs_local(guard.fail_body.then_term, ref_index) ||
-                        term_refs_local(guard.fail_body.else_term, ref_index))
-                        return true;
-                }
-            }
-            for (u32 gi = 0; gi < module.routes[i].guards.len; gi++) {
-                const auto& guard = module.routes[i].guards[gi];
-                if (term_refs_local(guard.fail_term, ref_index) ||
-                    term_refs_local(guard.fail_body.direct_term, ref_index) ||
-                    term_refs_local(guard.fail_body.then_term, ref_index) ||
-                    term_refs_local(guard.fail_body.else_term, ref_index))
-                    return true;
-                for (u32 ai = 0; ai < guard.fail_match_count; ai++) {
-                    const u32 arm_index = guard.fail_match_start + ai;
-                    if (arm_index < module.guard_match_arms.len &&
-                        term_refs_local(module.guard_match_arms[arm_index].direct_term, ref_index))
-                        return true;
-                }
-            }
-            return false;
+            [&](auto&& /*self*/, u32 ref_index, u32 /*depth*/) -> bool {
+            return ref_index < HirRoute::kMaxLocals && static_iter_ref[ref_index];
         };
         auto is_response_effect = [](HirExprKind kind) {
             return kind == HirExprKind::RespSetHeader || kind == HirExprKind::RespAddHeader ||
@@ -1403,6 +1289,58 @@ FrontendResult<MirModule*> build_mir(const HirModule& module) {
                                    ? MirTerminatorSourceKind::LocalRef
                                    : MirTerminatorSourceKind::Literal;
             out->local_ref_index = term.local_ref_index;
+            if (term.source_kind == HirTerminatorSourceKind::LocalRef && ctx != nullptr) {
+                for (u32 li = ctx->locals.len; li > 0; li--) {
+                    const auto& binding = ctx->locals[li - 1];
+                    if (binding.ref_index != term.local_ref_index || binding.value == nullptr)
+                        continue;
+                    auto resolve_static_value =
+                        [&](auto&& self, const MirValue* value, u32 depth) -> const MirValue* {
+                        if (value == nullptr || depth >= HirRoute::kMaxLocals) return nullptr;
+                        if (value->kind == MirValueKind::LocalRef) {
+                            for (u32 ci = ctx->locals.len; ci > 0; ci--)
+                                if (ctx->locals[ci - 1].ref_index == value->local_index &&
+                                    ctx->locals[ci - 1].value != value)
+                                    return self(self, ctx->locals[ci - 1].value, depth + 1);
+                            for (u32 fi = fn.locals.len; fi > 0; fi--)
+                                if (fn.locals[fi - 1].ref_index == value->local_index)
+                                    return self(self, &fn.locals[fi - 1].init, depth + 1);
+                            return nullptr;
+                        }
+                        if (value->kind == MirValueKind::ArrayGet && value->lhs != nullptr) {
+                            const MirValue* array = self(self, value->lhs, depth + 1);
+                            if (array == nullptr || array->kind != MirValueKind::ArrayLit ||
+                                value->int_value < 0 ||
+                                static_cast<u64>(value->int_value) >= array->args.len)
+                                return nullptr;
+                            return self(
+                                self, array->args[static_cast<u32>(value->int_value)], depth + 1);
+                        }
+                        return value;
+                    };
+                    const MirValue* proven =
+                        resolve_static_value(resolve_static_value, binding.value, 0);
+                    if (proven != nullptr && proven->kind == MirValueKind::IntConst) {
+                        if (proven->int_value < 100 || proven->int_value > 599) {
+                            term_json_copy_failed = true;
+                            term_json_copy_error =
+                                Diagnostic{FrontendError::InvalidStatusCode, term.span, {}};
+                            return;
+                        }
+                        out->source_kind = MirTerminatorSourceKind::Literal;
+                        out->status_code = static_cast<u16>(proven->int_value);
+                        out->local_ref_index = 0xffffffffu;
+                    } else {
+                        // A loop-derived runtime i32 has no HTTP-range proof.
+                        // Reject it instead of letting codegen truncate it to
+                        // an invalid wire status.
+                        term_json_copy_failed = true;
+                        term_json_copy_error =
+                            Diagnostic{FrontendError::InvalidStatusCode, term.span, {}};
+                    }
+                    break;
+                }
+            }
             out->response_body = term.response_body;
             out->has_dynamic_response_body = term.has_dynamic_response_body;
             out->control_plane_json_kind = term.control_plane_json_kind;
@@ -2169,6 +2107,7 @@ FrontendResult<MirModule*> build_mir(const HirModule& module) {
             };
             struct RouteStep {
                 enum class Kind : u8 {
+                    Let,
                     Guard,
                     If,
                     IfControl,
@@ -2226,6 +2165,8 @@ FrontendResult<MirModule*> build_mir(const HirModule& module) {
                 bool has_ctx = false;
                 bool ends_all_paths = false;
                 u32 ctx_index = 0xffffffffu;
+                u32 effect_value_index = 0xffffffffu;
+                u32 effect_local_ref_index = 0xffffffffu;
             };
             constexpr u32 kMaxUnrolled = HirExpr::kMaxArgs * HirForLoopBody::kMaxSteps;
             constexpr u32 kMaxForRouteSteps =
@@ -2259,6 +2200,58 @@ FrontendResult<MirModule*> build_mir(const HirModule& module) {
                 binding.value = &fn.values[fn.values.len - 1];
                 if (!ctx->locals.push(binding))
                     return frontend_error(FrontendError::TooManyItems, span);
+                return {};
+            };
+            u32 next_unrolled_local_ref = 0;
+            for (u32 li = 0; li < module.routes[i].locals.len; li++)
+                if (module.routes[i].locals[li].ref_index < MirFunction::kMaxLocals &&
+                    next_unrolled_local_ref <= module.routes[i].locals[li].ref_index)
+                    next_unrolled_local_ref = module.routes[i].locals[li].ref_index + 1;
+            auto push_materialized_binding = [&](ForLoopCtx* ctx,
+                                                 u32 source_ref_index,
+                                                 MirValue value,
+                                                 Span span,
+                                                 u32 order_start) -> FrontendResult<void> {
+                if (next_unrolled_local_ref >= MirFunction::kMaxLocals)
+                    return frontend_error(FrontendError::TooManyItems, span);
+                const u32 materialized_ref = next_unrolled_local_ref++;
+                if (!fn.values.push(value))
+                    return frontend_error(FrontendError::TooManyItems, span);
+                const u32 effect_value_index = fn.values.len - 1;
+
+                MirValue local_ref{};
+                local_ref.kind = MirValueKind::LocalRef;
+                local_ref.type = value.type;
+                local_ref.shape_index = value.shape_index;
+                local_ref.may_nil = value.may_nil;
+                local_ref.may_error = value.may_error;
+                local_ref.local_index = materialized_ref;
+                local_ref.variant_index = value.variant_index;
+                local_ref.struct_index = value.struct_index;
+                local_ref.tuple_len = value.tuple_len;
+                for (u32 ti = 0; ti < value.tuple_len; ti++) {
+                    local_ref.tuple_types[ti] = value.tuple_types[ti];
+                    local_ref.tuple_variant_indices[ti] = value.tuple_variant_indices[ti];
+                    local_ref.tuple_struct_indices[ti] = value.tuple_struct_indices[ti];
+                }
+                local_ref.error_struct_index = value.error_struct_index;
+                local_ref.error_variant_index = value.error_variant_index;
+                if (!fn.values.push(local_ref))
+                    return frontend_error(FrontendError::TooManyItems, span);
+                ForLoopCtx::LocalBinding binding{};
+                binding.ref_index = source_ref_index;
+                binding.value = &fn.values[fn.values.len - 1];
+                if (!ctx->locals.push(binding))
+                    return frontend_error(FrontendError::TooManyItems, span);
+
+                RouteStep step{};
+                step.kind = RouteStep::Kind::Let;
+                step.span = span;
+                step.order_start = order_start;
+                step.order_seq = route_step_seq++;
+                step.effect_value_index = effect_value_index;
+                step.effect_local_ref_index = materialized_ref;
+                if (!steps.push(step)) return frontend_error(FrontendError::TooManyItems, span);
                 return {};
             };
             bool for_loop_is_child[kMaxForRouteSteps]{};
@@ -2319,6 +2312,27 @@ FrontendResult<MirModule*> build_mir(const HirModule& module) {
                 }
                 const bool can_advance_to_later_iteration =
                     loop_can_advance_to_later_iteration(loop_can_advance_to_later_iteration, fi, 0);
+                FixedVec<MirValue, HirExpr::kMaxArgs> eager_inline_elements;
+                if (materialized_iter == nullptr) {
+                    for (u32 ai = 0; ai < iter_array->args.len; ai++) {
+                        auto elem = mir_value(*iter_array->args[ai], module, &fn, parent_ctx);
+                        if (!elem) return core::make_unexpected(elem.error());
+                        const bool capture = elem->kind != MirValueKind::BoolConst &&
+                                             elem->kind != MirValueKind::IntConst &&
+                                             elem->kind != MirValueKind::StrConst &&
+                                             elem->kind != MirValueKind::LocalRef;
+                        if (capture) {
+                            const u32 eager_ref = 0xffffff00u + ai;
+                            ForLoopCtx capture_ctx = parent_ctx ? *parent_ctx : ForLoopCtx{};
+                            auto captured = push_materialized_binding(
+                                &capture_ctx, eager_ref, elem.value(), fl.span, order_start);
+                            if (!captured) return core::make_unexpected(captured.error());
+                            elem = *capture_ctx.locals[capture_ctx.locals.len - 1].value;
+                        }
+                        if (!eager_inline_elements.push(elem.value()))
+                            return frontend_error(FrontendError::TooManyItems, fl.span);
+                    }
+                }
                 const u32 iter_count =
                     fl.body.has_term && !can_advance_to_later_iteration && iter_array->args.len != 0
                         ? 1u
@@ -2406,35 +2420,47 @@ FrontendResult<MirModule*> build_mir(const HirModule& module) {
                     FrontendResult<MirValue> elem =
                         frontend_error(FrontendError::UnsupportedSyntax, fl.span);
                     if (materialized_iter != nullptr) {
-                        auto array = mir_value(*materialized_iter, module, &fn, parent_ctx);
-                        if (!array) return core::make_unexpected(array.error());
-                        if (!fn.values.push(array.value()))
-                            return frontend_error(FrontendError::TooManyItems, fl.span);
-                        MirValue indexed{};
-                        indexed.kind = MirValueKind::ArrayGet;
-                        indexed.type = mir_type_kind(iter_array->args[ai]->type);
-                        indexed.shape_index = iter_array->args[ai]->shape_index;
-                        indexed.variant_index = iter_array->args[ai]->variant_index;
-                        indexed.struct_index = iter_array->args[ai]->struct_index;
-                        indexed.tuple_len = iter_array->args[ai]->tuple_len;
-                        for (u32 ti = 0; ti < indexed.tuple_len; ti++) {
-                            indexed.tuple_types[ti] =
-                                mir_type_kind(iter_array->args[ai]->tuple_types[ti]);
-                            indexed.tuple_variant_indices[ti] =
-                                iter_array->args[ai]->tuple_variant_indices[ti];
-                            indexed.tuple_struct_indices[ti] =
-                                iter_array->args[ai]->tuple_struct_indices[ti];
+                        if (iter_array->args[ai]->kind == HirExprKind::IntLit) {
+                            elem = mir_value(*iter_array->args[ai], module, &fn, parent_ctx);
+                        } else {
+                            auto array = mir_value(*materialized_iter, module, &fn, parent_ctx);
+                            if (!array) return core::make_unexpected(array.error());
+                            if (!fn.values.push(array.value()))
+                                return frontend_error(FrontendError::TooManyItems, fl.span);
+                            MirValue indexed{};
+                            indexed.kind = MirValueKind::ArrayGet;
+                            indexed.type = mir_type_kind(iter_array->args[ai]->type);
+                            indexed.shape_index = iter_array->args[ai]->shape_index;
+                            indexed.variant_index = iter_array->args[ai]->variant_index;
+                            indexed.struct_index = iter_array->args[ai]->struct_index;
+                            indexed.tuple_len = iter_array->args[ai]->tuple_len;
+                            for (u32 ti = 0; ti < indexed.tuple_len; ti++) {
+                                indexed.tuple_types[ti] =
+                                    mir_type_kind(iter_array->args[ai]->tuple_types[ti]);
+                                indexed.tuple_variant_indices[ti] =
+                                    iter_array->args[ai]->tuple_variant_indices[ti];
+                                indexed.tuple_struct_indices[ti] =
+                                    iter_array->args[ai]->tuple_struct_indices[ti];
+                            }
+                            indexed.int_value = ai;
+                            indexed.lhs = &fn.values[fn.values.len - 1];
+                            elem = indexed;
                         }
-                        indexed.int_value = ai;
-                        indexed.lhs = &fn.values[fn.values.len - 1];
-                        elem = indexed;
                     } else {
-                        elem = mir_value(*iter_array->args[ai], module, &fn, parent_ctx);
+                        elem = eager_inline_elements[ai];
                     }
                     if (!elem) return core::make_unexpected(elem.error());
                     ForLoopCtx ctx = parent_ctx ? *parent_ctx : ForLoopCtx{};
+                    const bool capture_inline_runtime_element =
+                        materialized_iter == nullptr && elem->kind != MirValueKind::BoolConst &&
+                        elem->kind != MirValueKind::IntConst &&
+                        elem->kind != MirValueKind::StrConst &&
+                        elem->kind != MirValueKind::LocalRef;
                     auto loop_binding =
-                        push_ctx_binding(&ctx, fl.loop_var_ref_index, elem.value(), fl.span);
+                        capture_inline_runtime_element
+                            ? push_materialized_binding(
+                                  &ctx, fl.loop_var_ref_index, elem.value(), fl.span, order_start)
+                            : push_ctx_binding(&ctx, fl.loop_var_ref_index, elem.value(), fl.span);
                     if (!loop_binding) return core::make_unexpected(loop_binding.error());
                     for (u32 bi = 0; bi < fl.body.steps.len; bi++) {
                         const auto& body_step = fl.body.steps[bi];
@@ -2445,8 +2471,20 @@ FrontendResult<MirModule*> build_mir(const HirModule& module) {
                             const auto& local = fl.body.locals[body_step.index];
                             auto local_value = mir_value(local.init, module, &fn, &ctx);
                             if (!local_value) return core::make_unexpected(local_value.error());
-                            auto local_binding = push_ctx_binding(
-                                &ctx, local.ref_index, local_value.value(), local.span);
+                            const bool capture_local =
+                                local_value->kind != MirValueKind::BoolConst &&
+                                local_value->kind != MirValueKind::IntConst &&
+                                local_value->kind != MirValueKind::StrConst &&
+                                local_value->kind != MirValueKind::LocalRef;
+                            auto local_binding =
+                                capture_local
+                                    ? push_materialized_binding(&ctx,
+                                                                local.ref_index,
+                                                                local_value.value(),
+                                                                local.span,
+                                                                order_start)
+                                    : push_ctx_binding(
+                                          &ctx, local.ref_index, local_value.value(), local.span);
                             if (!local_binding) return core::make_unexpected(local_binding.error());
                             continue;
                         }
@@ -2870,15 +2908,15 @@ FrontendResult<MirModule*> build_mir(const HirModule& module) {
                         reserve_blocks(&cursor, 1, steps[terminating_step_index].span);
                 }
                 for (u32 ai = 0; ai < body_match.arms.len; ai++) {
-                    if (body_match.arms[ai].has_arm_guard)
-                        body_match_guard_index[ai] =
-                            reserve_blocks(&cursor, 1, body_match.arms[ai].span);
-                }
-                for (u32 ai = 0; ai < body_match.arms.len; ai++) {
                     for (u32 gi = 0; gi < body_match.arms[ai].guards.len; gi++) {
                         body_match_prelude_guard_index[ai][gi] =
                             reserve_blocks(&cursor, 1, body_match.arms[ai].guards[gi].span);
                     }
+                }
+                for (u32 ai = 0; ai < body_match.arms.len; ai++) {
+                    if (body_match.arms[ai].has_arm_guard)
+                        body_match_guard_index[ai] =
+                            reserve_blocks(&cursor, 1, body_match.arms[ai].span);
                 }
                 for (u32 ai = 0; ai < body_match.arms.len; ai++) {
                     body_match_case_index[ai] =
@@ -2968,6 +3006,98 @@ FrontendResult<MirModule*> build_mir(const HirModule& module) {
                                       block_budget_span,
                                       lit_str("static for-loop block budget exceeded"));
 
+            ForLoopCtx body_match_arm_contexts[HirForLoopMatch::kMaxMatchArms]{};
+            ForLoopCtx body_match_shared_contexts[HirForLoopMatch::kMaxMatchArms]{};
+            FixedVec<MirBlock::Effect, HirForLoopMatchArm::kMaxLocals>
+                body_match_arm_effects[HirForLoopMatch::kMaxMatchArms]{};
+            FixedVec<u8, HirForLoopMatchArm::kMaxLocals>
+                body_match_arm_effect_depths[HirForLoopMatch::kMaxMatchArms]{};
+            u8 body_match_capture_owner[HirForLoopMatch::kMaxMatchArms]{};
+            const HirForLoopMatch* terminating_body_match = nullptr;
+            const ForLoopCtx* terminating_body_match_ctx = nullptr;
+            if (has_terminating_step &&
+                steps[terminating_step_index].kind == RouteStep::Kind::Match) {
+                terminating_body_match = steps[terminating_step_index].body_match;
+                terminating_body_match_ctx = route_step_ctx(steps[terminating_step_index]);
+                for (u32 ai = 0; ai < terminating_body_match->arms.len; ai++) {
+                    const auto& arm = terminating_body_match->arms[ai];
+                    if (arm.capture_local_count > arm.locals.len)
+                        return frontend_error(FrontendError::UnsupportedSyntax, arm.span);
+                    body_match_capture_owner[ai] = static_cast<u8>(ai);
+                    u32 local_start = 0;
+                    if (arm.capture_group != 0) {
+                        for (u32 prior = 0; prior < ai; prior++) {
+                            if (terminating_body_match->arms[prior].capture_group !=
+                                arm.capture_group)
+                                continue;
+                            body_match_capture_owner[ai] = static_cast<u8>(prior);
+                            body_match_arm_contexts[ai] = body_match_shared_contexts[prior];
+                            local_start = arm.capture_local_count;
+                            break;
+                        }
+                    }
+                    if (body_match_capture_owner[ai] == ai && terminating_body_match_ctx != nullptr)
+                        body_match_arm_contexts[ai] = *terminating_body_match_ctx;
+                    ForLoopCtx* body_ctx = &body_match_arm_contexts[ai];
+                    if (body_match_capture_owner[ai] == ai && arm.capture_local_count == 0)
+                        body_match_shared_contexts[ai] = *body_ctx;
+                    for (u32 li = local_start; li < arm.locals.len; li++) {
+                        const auto& local = arm.locals[li];
+                        auto local_value = mir_value(local.init, module, &fn, body_ctx);
+                        if (!local_value) return core::make_unexpected(local_value.error());
+                        const bool capture_local = local_value->kind != MirValueKind::BoolConst &&
+                                                   local_value->kind != MirValueKind::IntConst &&
+                                                   local_value->kind != MirValueKind::StrConst &&
+                                                   local_value->kind != MirValueKind::LocalRef;
+                        if (!capture_local) {
+                            auto local_binding = push_ctx_binding(
+                                body_ctx, local.ref_index, local_value.value(), local.span);
+                            if (!local_binding) return core::make_unexpected(local_binding.error());
+                            if (body_match_capture_owner[ai] == ai &&
+                                li + 1 == arm.capture_local_count)
+                                body_match_shared_contexts[ai] = *body_ctx;
+                            continue;
+                        }
+                        if (next_unrolled_local_ref >= MirFunction::kMaxLocals)
+                            return frontend_error(FrontendError::TooManyItems, local.span);
+                        const u32 materialized_ref = next_unrolled_local_ref++;
+                        if (!fn.values.push(local_value.value()))
+                            return frontend_error(FrontendError::TooManyItems, local.span);
+                        const u32 value_index = fn.values.len - 1;
+                        MirValue local_ref{};
+                        local_ref.kind = MirValueKind::LocalRef;
+                        local_ref.type = local_value->type;
+                        local_ref.shape_index = local_value->shape_index;
+                        local_ref.may_nil = local_value->may_nil;
+                        local_ref.may_error = local_value->may_error;
+                        local_ref.local_index = materialized_ref;
+                        local_ref.variant_index = local_value->variant_index;
+                        local_ref.struct_index = local_value->struct_index;
+                        local_ref.tuple_len = local_value->tuple_len;
+                        for (u32 ti = 0; ti < local_value->tuple_len; ti++) {
+                            local_ref.tuple_types[ti] = local_value->tuple_types[ti];
+                            local_ref.tuple_variant_indices[ti] =
+                                local_value->tuple_variant_indices[ti];
+                            local_ref.tuple_struct_indices[ti] =
+                                local_value->tuple_struct_indices[ti];
+                        }
+                        local_ref.error_struct_index = local_value->error_struct_index;
+                        local_ref.error_variant_index = local_value->error_variant_index;
+                        if (!fn.values.push(local_ref))
+                            return frontend_error(FrontendError::TooManyItems, local.span);
+                        ForLoopCtx::LocalBinding binding{};
+                        binding.ref_index = local.ref_index;
+                        binding.value = &fn.values[fn.values.len - 1];
+                        if (!body_ctx->locals.push(binding) ||
+                            !body_match_arm_effects[ai].push(
+                                {value_index, local.span, materialized_ref}) ||
+                            !body_match_arm_effect_depths[ai].push(arm.local_guard_depth[li]))
+                            return frontend_error(FrontendError::TooManyItems, local.span);
+                        if (body_match_capture_owner[ai] == ai && li + 1 == arm.capture_local_count)
+                            body_match_shared_contexts[ai] = *body_ctx;
+                    }
+                }
+            }
             auto extend_for_loop_match_arm_ctx =
                 [&](const HirForLoopMatchArm& arm,
                     const ForLoopCtx* base_ctx,
@@ -2985,15 +3115,35 @@ FrontendResult<MirModule*> build_mir(const HirModule& module) {
                 }
                 return body_ctx;
             };
+            auto for_loop_match_arm_ctx = [&](const HirForLoopMatchArm& arm,
+                                              u32 arm_index,
+                                              const ForLoopCtx* base_ctx) -> const ForLoopCtx* {
+                if (arm.locals.len == 0 || terminating_body_match == nullptr) return base_ctx;
+                return &body_match_arm_contexts[arm_index];
+            };
+            auto append_body_match_arm_effects = [&](MirBlock* block,
+                                                     u32 arm_index,
+                                                     u32 guard_depth,
+                                                     Span span) -> FrontendResult<void> {
+                for (u32 ei = 0; ei < body_match_arm_effects[arm_index].len; ei++) {
+                    if (body_match_arm_effect_depths[arm_index][ei] != guard_depth) continue;
+                    if (!block->effects.push(body_match_arm_effects[arm_index][ei]))
+                        return frontend_error(FrontendError::TooManyItems, span);
+                }
+                return {};
+            };
             auto body_match_arm_entry_index = [&](const HirForLoopMatchArm& arm,
                                                   u32 arm_index) -> u32 {
-                if (arm.has_arm_guard) return body_match_guard_index[arm_index];
                 if (arm.guards.len != 0) return body_match_prelude_guard_index[arm_index][0];
+                if (arm.has_arm_guard) return body_match_guard_index[arm_index];
                 return body_match_case_index[arm_index];
             };
-            auto body_match_arm_body_index = [&](const HirForLoopMatchArm& arm,
-                                                 u32 arm_index) -> u32 {
-                if (arm.guards.len != 0) return body_match_prelude_guard_index[arm_index][0];
+            auto body_match_arm_post_prelude_index = [&](const HirForLoopMatchArm& arm,
+                                                         u32 arm_index) -> u32 {
+                if (arm.has_arm_guard) return body_match_guard_index[arm_index];
+                return body_match_case_index[arm_index];
+            };
+            auto body_match_arm_body_index = [&](const HirForLoopMatchArm&, u32 arm_index) -> u32 {
                 return body_match_case_index[arm_index];
             };
             auto emit_body_match_prelude_guards =
@@ -3001,19 +3151,21 @@ FrontendResult<MirModule*> build_mir(const HirModule& module) {
                     const ForLoopCtx* ctx) -> FrontendResult<void> {
                 for (u32 ai = 0; ai < body_match.arms.len; ai++) {
                     const auto& arm = body_match.arms[ai];
-                    ForLoopCtx scoped_ctx{};
-                    auto body_ctx = extend_for_loop_match_arm_ctx(arm, ctx, &scoped_ctx);
-                    if (!body_ctx) return core::make_unexpected(body_ctx.error());
+                    const ForLoopCtx* body_ctx = for_loop_match_arm_ctx(arm, ai, ctx);
                     for (u32 gi = 0; gi < arm.guards.len; gi++) {
                         MirBlock guard_block{};
                         guard_block.label = cont_label();
+                        auto effects =
+                            append_body_match_arm_effects(&guard_block, ai, gi, arm.span);
+                        if (!effects) return core::make_unexpected(effects.error());
                         guard_block.term.kind = MirTerminatorKind::Branch;
                         guard_block.term.span = arm.guards[gi].span;
-                        auto cond = mir_value(arm.guards[gi].cond, module, &fn, body_ctx.value());
+                        auto cond = mir_value(arm.guards[gi].cond, module, &fn, body_ctx);
                         if (!cond) return core::make_unexpected(cond.error());
                         guard_block.term.cond = cond.value();
                         guard_block.term.then_block =
                             gi + 1 < arm.guards.len ? body_match_prelude_guard_index[ai][gi + 1]
+                            : arm.has_arm_guard     ? body_match_guard_index[ai]
                                                     : body_match_case_index[ai];
                         guard_block.term.else_block = body_match_prelude_guard_fail_index[ai][gi];
                         if (!fn.blocks.push(guard_block))
@@ -3027,11 +3179,9 @@ FrontendResult<MirModule*> build_mir(const HirModule& module) {
                     const ForLoopCtx* ctx) -> FrontendResult<void> {
                 for (u32 ai = 0; ai < body_match.arms.len; ai++) {
                     const auto& arm = body_match.arms[ai];
-                    ForLoopCtx scoped_ctx{};
-                    auto body_ctx = extend_for_loop_match_arm_ctx(arm, ctx, &scoped_ctx);
-                    if (!body_ctx) return core::make_unexpected(body_ctx.error());
+                    const ForLoopCtx* body_ctx = for_loop_match_arm_ctx(arm, ai, ctx);
                     for (u32 gi = 0; gi < arm.guards.len; gi++) {
-                        auto emitted = emit_guard_fail(arm.guards[gi], body_ctx.value());
+                        auto emitted = emit_guard_fail(arm.guards[gi], body_ctx);
                         if (!emitted) return core::make_unexpected(emitted.error());
                     }
                 }
@@ -3042,6 +3192,22 @@ FrontendResult<MirModule*> build_mir(const HirModule& module) {
                 const ForLoopCtx* step_ctx = route_step_ctx(steps[si]);
                 MirBlock block{};
                 block.label = si == 0 ? entry_label() : cont_label();
+                if (steps[si].kind == RouteStep::Kind::Let) {
+                    if (!block.effects.push({steps[si].effect_value_index,
+                                             steps[si].span,
+                                             steps[si].effect_local_ref_index}))
+                        return frontend_error(FrontendError::TooManyItems, steps[si].span);
+                    block.term.kind = MirTerminatorKind::Branch;
+                    block.term.span = steps[si].span;
+                    block.term.cond.kind = MirValueKind::BoolConst;
+                    block.term.cond.type = MirTypeKind::Bool;
+                    block.term.cond.bool_value = true;
+                    block.term.then_block = si + 1 < step_count ? si + 1 : terminal_index;
+                    block.term.else_block = block.term.then_block;
+                    if (!fn.blocks.push(block))
+                        return frontend_error(FrontendError::TooManyItems, fn.span);
+                    continue;
+                }
                 if (steps[si].kind == RouteStep::Kind::Term) {
                     set_term_from_hir(&block.term, *steps[si].term, step_ctx);
                     if (!fn.blocks.push(block))
@@ -3212,6 +3378,10 @@ FrontendResult<MirModule*> build_mir(const HirModule& module) {
                 if (!subject) return core::make_unexpected(subject.error());
                 auto body_match_fallthrough_target = [&](u32 arm_index) -> u32 {
                     for (u32 next = arm_index + 1; next < body_match.arms.len; next++) {
+                        if (body_match.arms[arm_index].capture_group != 0 &&
+                            body_match.arms[next].capture_group ==
+                                body_match.arms[arm_index].capture_group)
+                            return body_match_arm_post_prelude_index(body_match.arms[next], next);
                         if (body_match.arms[next].is_wildcard)
                             return body_match_arm_entry_index(body_match.arms[next], next);
                         return body_match_extra_test_index[body_match_test_ordinal[next]];
@@ -3222,20 +3392,18 @@ FrontendResult<MirModule*> build_mir(const HirModule& module) {
                 auto set_body_match_arm_term = [&](MirBlock* out,
                                                    const HirForLoopMatchArm& arm,
                                                    u32 arm_index) -> FrontendResult<void> {
-                    ForLoopCtx scoped_ctx{};
-                    auto body_ctx =
-                        extend_for_loop_match_arm_ctx(arm, terminating_ctx, &scoped_ctx);
-                    if (!body_ctx) return core::make_unexpected(body_ctx.error());
+                    const ForLoopCtx* body_ctx =
+                        for_loop_match_arm_ctx(arm, arm_index, terminating_ctx);
                     if (arm.body_kind == HirForLoopMatchArm::BodyKind::If) {
                         out->term.kind = MirTerminatorKind::Branch;
                         out->term.span = arm.cond.span;
-                        auto cond = mir_value(arm.cond, module, &fn, body_ctx.value());
+                        auto cond = mir_value(arm.cond, module, &fn, body_ctx);
                         if (!cond) return core::make_unexpected(cond.error());
                         out->term.cond = cond.value();
                         out->term.then_block = body_match_then_index[arm_index];
                         out->term.else_block = body_match_else_index[arm_index];
                     } else {
-                        set_term_from_hir(&out->term, arm.direct_branch.term, body_ctx.value());
+                        set_term_from_hir(&out->term, arm.direct_branch.term, body_ctx);
                     }
                     return {};
                 };
@@ -3258,18 +3426,20 @@ FrontendResult<MirModule*> build_mir(const HirModule& module) {
                     if (!fn.blocks.push(test_block))
                         return frontend_error(FrontendError::TooManyItems, fn.span);
                 }
+                auto prelude_guards = emit_body_match_prelude_guards(body_match, terminating_ctx);
+                if (!prelude_guards) return core::make_unexpected(prelude_guards.error());
                 for (u32 ai = 0; ai < body_match.arms.len; ai++) {
                     const auto& arm = body_match.arms[ai];
                     if (!arm.has_arm_guard) continue;
-                    ForLoopCtx scoped_ctx{};
-                    auto body_ctx =
-                        extend_for_loop_match_arm_ctx(arm, terminating_ctx, &scoped_ctx);
-                    if (!body_ctx) return core::make_unexpected(body_ctx.error());
+                    const ForLoopCtx* body_ctx = for_loop_match_arm_ctx(arm, ai, terminating_ctx);
                     MirBlock guard_block{};
                     guard_block.label = cont_label();
+                    auto effects =
+                        append_body_match_arm_effects(&guard_block, ai, arm.guards.len, arm.span);
+                    if (!effects) return core::make_unexpected(effects.error());
                     guard_block.term.kind = MirTerminatorKind::Branch;
                     guard_block.term.span = arm.arm_guard.span;
-                    auto guard = mir_value(arm.arm_guard, module, &fn, body_ctx.value());
+                    auto guard = mir_value(arm.arm_guard, module, &fn, body_ctx);
                     if (!guard) return core::make_unexpected(guard.error());
                     guard_block.term.cond = guard.value();
                     guard_block.term.then_block =
@@ -3278,34 +3448,35 @@ FrontendResult<MirModule*> build_mir(const HirModule& module) {
                     if (!fn.blocks.push(guard_block))
                         return frontend_error(FrontendError::TooManyItems, fn.span);
                 }
-                auto prelude_guards = emit_body_match_prelude_guards(body_match, terminating_ctx);
-                if (!prelude_guards) return core::make_unexpected(prelude_guards.error());
                 for (u32 ai = 0; ai < body_match.arms.len; ai++) {
                     MirBlock case_block{};
                     case_block.label = body_match.arms[ai].is_wildcard ? match_default_label()
                                                                        : match_case_label();
+                    if (!body_match.arms[ai].has_arm_guard) {
+                        auto effects = append_body_match_arm_effects(&case_block,
+                                                                     ai,
+                                                                     body_match.arms[ai].guards.len,
+                                                                     body_match.arms[ai].span);
+                        if (!effects) return core::make_unexpected(effects.error());
+                    }
                     auto armed = set_body_match_arm_term(&case_block, body_match.arms[ai], ai);
                     if (!armed) return core::make_unexpected(armed.error());
                     if (!fn.blocks.push(case_block))
                         return frontend_error(FrontendError::TooManyItems, fn.span);
                     if (body_match.arms[ai].body_kind == HirForLoopMatchArm::BodyKind::If) {
-                        ForLoopCtx scoped_ctx{};
-                        auto body_ctx = extend_for_loop_match_arm_ctx(
-                            body_match.arms[ai], terminating_ctx, &scoped_ctx);
-                        if (!body_ctx) return core::make_unexpected(body_ctx.error());
+                        const ForLoopCtx* body_ctx =
+                            for_loop_match_arm_ctx(body_match.arms[ai], ai, terminating_ctx);
                         MirBlock then_block{};
                         then_block.label = then_label();
-                        set_term_from_hir(&then_block.term,
-                                          body_match.arms[ai].then_branch.term,
-                                          body_ctx.value());
+                        set_term_from_hir(
+                            &then_block.term, body_match.arms[ai].then_branch.term, body_ctx);
                         if (!fn.blocks.push(then_block))
                             return frontend_error(FrontendError::TooManyItems, fn.span);
 
                         MirBlock else_block{};
                         else_block.label = else_label();
-                        set_term_from_hir(&else_block.term,
-                                          body_match.arms[ai].else_branch.term,
-                                          body_ctx.value());
+                        set_term_from_hir(
+                            &else_block.term, body_match.arms[ai].else_branch.term, body_ctx);
                         if (!fn.blocks.push(else_block))
                             return frontend_error(FrontendError::TooManyItems, fn.span);
                     }
@@ -3712,6 +3883,7 @@ FrontendResult<MirModule*> build_mir(const HirModule& module) {
                 if (!emitted) return core::make_unexpected(emitted.error());
             }
 
+            if (term_json_copy_failed) return core::make_unexpected(term_json_copy_error);
             if (!mir->functions.push(fn))
                 return frontend_error(FrontendError::TooManyItems, fn.span);
             continue;

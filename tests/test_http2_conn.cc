@@ -69,11 +69,11 @@ void on_reset(void* ctx, Http2Conn&, u32 sid, Http2Error err) {
 
 void setup(Http2Conn& c, Capture& cap) {
     cap.clear();
+    c.init();
     c.cb_ctx = &cap;
     c.on_headers = on_headers;
     c.on_data = on_data;
     c.on_reset = on_reset;
-    c.init();
 }
 
 // Build "preface + frames" by prepending the client preface to `frames`.
@@ -114,6 +114,20 @@ bool val_is(const Capture& cap, u32 i, const char* s) {
 }
 
 }  // namespace
+
+TEST(http2_conn, init_preserves_configured_callbacks) {
+    Http2Conn conn{};
+    Capture cap{};
+    conn.cb_ctx = &cap;
+    conn.on_headers = on_headers;
+    conn.on_data = on_data;
+    conn.on_reset = on_reset;
+    conn.init();
+    CHECK(conn.cb_ctx == &cap);
+    CHECK(conn.on_headers == on_headers);
+    CHECK(conn.on_data == on_data);
+    CHECK(conn.on_reset == on_reset);
+}
 
 TEST(http2_conn, preface_incomplete_consumes_nothing) {
     Http2Conn c;

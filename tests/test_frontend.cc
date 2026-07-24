@@ -7372,6 +7372,24 @@ route GET "/users" use chain access { return forward(api) }
     REQUIRE_FALSE(hir);
     CHECK(hir.error().detail.eq(
         lit("chain after Response mutations require `forward(..., buffered: true)`")));
+
+    const char* loop_src = R"rut(
+upstream api at "127.0.0.1:9000"
+func rewrite_loop(_ resp: Response) -> i32 { resp.status = 201 0 }
+chain loop_access { after rewrite_loop(resp) }
+route GET "/loop" use chain loop_access {
+    for item in [1] { return forward(api) }
+    return 200
+}
+)rut";
+    auto loop_lexed = lex(lit(loop_src));
+    REQUIRE(loop_lexed);
+    auto loop_ast = parse_file_heap(loop_lexed.value());
+    REQUIRE(loop_ast);
+    auto loop_hir = analyze_file_heap(loop_ast.value());
+    REQUIRE_FALSE(loop_hir);
+    CHECK(loop_hir.error().detail.eq(
+        lit("chain after Response mutations require `forward(..., buffered: true)`")));
 }
 
 TEST(frontend, chain_after_rejects_invalid_response_helpers) {
@@ -7576,16 +7594,8 @@ route GET "/x" {
     if status == 201 { return 200 } else { return 500 }
 }
 )rut";
-    auto lexed = lex(lit(src));
-    REQUIRE(lexed);
-    auto ast = parse_file_heap(lexed.value());
-    REQUIRE(ast);
-    auto hir = analyze_file_heap(ast.value());
-    REQUIRE(hir);
-    auto mir = build_mir_heap(hir.value());
-    REQUIRE(mir);
     FrontendRirModule rir{};
-    REQUIRE(lower_to_rir(mir.value(), rir));
+    REQUIRE(lower_src_to_rir(src, rir));
     bool saw_status_read = false;
     for (u32 bi = 0; bi < rir.module.functions[0].block_count; bi++)
         for (u32 ii = 0; ii < rir.module.functions[0].blocks[bi].inst_count; ii++)
@@ -32633,48 +32643,6 @@ route GET "/x" {
     rir.destroy();
 }
 
-TEST(frontend, mir_materializes_runtime_array_alias_shared_by_static_for_loops_once) {
-    const char* src =
-        "route GET \"/x\" { let xs = [time.nowMicros()] for first in xs { guard first > 0 "
-        "else { return 400 } } for second in xs { guard second > 0 else { return 401 } } return "
-        "200 }\n";
-    auto lexed = lex(lit(src));
-    REQUIRE(lexed);
-    auto ast = parse_file_heap(lexed.value());
-    REQUIRE(ast);
-    auto hir = analyze_file_heap(ast.value());
-    REQUIRE(hir);
-    auto mir = build_mir_heap(hir.value());
-    REQUIRE(mir);
-    REQUIRE_EQ(mir->functions.len, 1u);
-    REQUIRE_EQ(mir->functions[0].locals.len, 1u);
-    CHECK_EQ(static_cast<u8>(mir->functions[0].locals[0].init.kind),
-             static_cast<u8>(MirValueKind::ArrayLit));
-    REQUIRE_EQ(mir->functions[0].locals[0].init.args.len, 1u);
-    REQUIRE(mir->functions[0].locals[0].init.args[0] != nullptr);
-    CHECK_EQ(static_cast<u8>(mir->functions[0].locals[0].init.args[0]->kind),
-             static_cast<u8>(MirValueKind::TimeNowMicros));
-
-    FrontendRirModule rir{};
-    REQUIRE(lower_to_rir(mir.value(), rir));
-    u32 samples = 0;
-    for (u32 bi = 0; bi < rir.module.functions[0].block_count; bi++)
-        samples += block_op_count(rir.module.functions[0].blocks[bi], rir::Opcode::TimeNowMicros);
-    CHECK_EQ(samples, 1u);
-    rir.destroy();
-}
-
-TEST(frontend, mir_lowers_dynamic_json_terminator_inside_static_for_loop) {
-    const char* src =
-        "route GET \"/x\" { for item in [req.path] { return 200, json({ value: item }) } "
-        "return 500 }\n";
-    FrontendRirModule rir{};
-    REQUIRE(lower_src_to_rir(src, rir));
-    auto verified = rir::verify_module(rir.module);
-    CHECK(verified.ok);
-    rir.destroy();
-}
-
 TEST(frontend, mir_lowers_dynamic_json_from_static_for_if_terminator_context) {
     const char* src =
         "route GET \"/x\" { for item in [req.path] { let value = item if value == \"/x\" { "
@@ -32717,6 +32685,80 @@ TEST(frontend, nested_conditional_break_does_not_make_outer_loop_unconditionally
     rir.destroy();
 }
 
+TEST(frontend, mir_materializes_runtime_array_alias_shared_by_static_for_loops_once) {
+    const char* src =
+        "route GET \"/x\" { let xs = [time.nowMicros()] for first in xs { guard first > 0 "
+        "else { return 400 } } for second in xs { guard second > 0 else { return 401 } } return "
+        "200 }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    REQUIRE_EQ(mir->functions.len, 1u);
+    REQUIRE_EQ(mir->functions[0].locals.len, 1u);
+    CHECK_EQ(static_cast<u8>(mir->functions[0].locals[0].init.kind),
+             static_cast<u8>(MirValueKind::ArrayLit));
+    REQUIRE_EQ(mir->functions[0].locals[0].init.args.len, 1u);
+    REQUIRE(mir->functions[0].locals[0].init.args[0] != nullptr);
+    CHECK_EQ(static_cast<u8>(mir->functions[0].locals[0].init.args[0]->kind),
+             static_cast<u8>(MirValueKind::TimeNowMicros));
+
+    FrontendRirModule rir{};
+    REQUIRE(lower_to_rir(mir.value(), rir));
+    u32 samples = 0;
+    for (u32 bi = 0; bi < rir.module.functions[0].block_count; bi++)
+        samples += block_op_count(rir.module.functions[0].blocks[bi], rir::Opcode::TimeNowMicros);
+    CHECK_EQ(samples, 1u);
+    rir.destroy();
+}
+
+TEST(frontend, mir_materializes_runtime_match_arm_local_once) {
+    const char* src =
+        "route GET \"/x\" { for item in [1] { match item { 1 => { let captured = "
+        "time.nowMicros() if captured == captured { return 201 } else { return 500 } } _ => "
+        "return 404 } } return 500 }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+
+    FrontendRirModule rir{};
+    REQUIRE(lower_to_rir(mir.value(), rir));
+    u32 samples = 0;
+    for (u32 bi = 0; bi < rir.module.functions[0].block_count; bi++)
+        samples += block_op_count(rir.module.functions[0].blocks[bi], rir::Opcode::TimeNowMicros);
+    CHECK_EQ(samples, 1u);
+    rir.destroy();
+}
+
+TEST(frontend, mir_lowers_dynamic_json_terminator_inside_static_for_loop) {
+    const char* src =
+        "route GET \"/x\" { for item in [req.path] { return 200, json({ value: item }) } "
+        "return 500 }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    REQUIRE(lower_to_rir(mir.value(), rir));
+    auto verified = rir::verify_module(rir.module);
+    CHECK(verified.ok);
+    rir.destroy();
+}
+
 TEST(frontend, mir_materializes_runtime_iterator_reused_by_nested_loop_expansion) {
     const char* src =
         "route GET \"/x\" { let xs = [time.nowMicros()] for outer in [1, 2] { for item in xs "
@@ -32730,11 +32772,794 @@ TEST(frontend, mir_materializes_runtime_iterator_reused_by_nested_loop_expansion
     rir.destroy();
 }
 
+TEST(frontend, mir_materializes_inline_runtime_loop_element_once_per_iteration) {
+    const char* src =
+        "route GET \"/x\" { for item in [time.nowMicros()] { guard item == item else { "
+        "return 400 } } return 200 }\n";
+    FrontendRirModule rir{};
+    REQUIRE(lower_src_to_rir(src, rir));
+    u32 samples = 0;
+    for (u32 bi = 0; bi < rir.module.functions[0].block_count; bi++)
+        samples += block_op_count(rir.module.functions[0].blocks[bi], rir::Opcode::TimeNowMicros);
+    CHECK_EQ(samples, 1u);
+    rir.destroy();
+}
+
+TEST(frontend, mir_materializes_static_iterator_alias_fanout_at_declaration) {
+    const char* src =
+        "route GET \"/x\" { let xs = [time.nowMicros()] let ys = xs let zs = xs for first "
+        "in ys { guard first > 0 else { return 400 } } for second in zs { guard second > 0 "
+        "else { return 401 } } return 200 }\n";
+    FrontendRirModule rir{};
+    REQUIRE(lower_src_to_rir(src, rir));
+    u32 samples = 0;
+    for (u32 bi = 0; bi < rir.module.functions[0].block_count; bi++)
+        samples += block_op_count(rir.module.functions[0].blocks[bi], rir::Opcode::TimeNowMicros);
+    CHECK_EQ(samples, 1u);
+    rir.destroy();
+}
+
+TEST(frontend, mir_preserves_source_order_for_single_use_runtime_iterator_alias) {
+    const char* src =
+        "route GET \"/x\" { let xs = [time.nowMicros()] let after = time.nowMicros() for item "
+        "in xs { guard item <= after else { return 400 } } return 200 }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    REQUIRE_EQ(mir->functions[0].locals.len, 2u);
+    CHECK(mir->functions[0].locals[0].name.eq(lit("xs")));
+    CHECK(mir->functions[0].locals[1].name.eq(lit("after")));
+    CHECK_EQ(mir->functions[0].locals[0].init.args.len, 1u);
+    CHECK_EQ(mir->functions[0].locals[0].init.args[0]->kind, MirValueKind::TimeNowMicros);
+    CHECK_EQ(mir->functions[0].locals[1].init.kind, MirValueKind::TimeNowMicros);
+}
+
+TEST(frontend, mir_materializes_runtime_loop_body_local_once) {
+    const char* src =
+        "route GET \"/x\" { for item in [1] { let captured = time.nowMicros() guard captured "
+        "== captured else { return 400 } } return 200 }\n";
+    FrontendRirModule rir{};
+    REQUIRE(lower_src_to_rir(src, rir));
+    u32 samples = 0;
+    for (u32 bi = 0; bi < rir.module.functions[0].block_count; bi++)
+        samples += block_op_count(rir.module.functions[0].blocks[bi], rir::Opcode::TimeNowMicros);
+    CHECK_EQ(samples, 1u);
+    rir.destroy();
+}
+
+TEST(frontend, mir_eagerly_materializes_all_inline_iterator_elements_before_body) {
+    const char* src =
+        "route GET \"/x\" { for item in [time.nowMicros(), time.nowMicros()] { return 200 } "
+        "return 500 }\n";
+    FrontendRirModule rir{};
+    REQUIRE(lower_src_to_rir(src, rir));
+    u32 samples = 0;
+    for (u32 bi = 0; bi < rir.module.functions[0].block_count; bi++)
+        samples += block_op_count(rir.module.functions[0].blocks[bi], rir::Opcode::TimeNowMicros);
+    CHECK_EQ(samples, 2u);
+    rir.destroy();
+}
+
+TEST(frontend, analyze_rejects_repeated_runtime_evaluation_at_static_loop_boundaries) {
+    struct Case {
+        const char* src;
+        Str detail;
+    };
+    const Case cases[] = {
+        {"route GET \"/x\" { for item in [1] { guard false else { let captured = "
+         "time.nowMicros() return 400, json(captured) } } return 200 }\n",
+         lit("static for-loop guard-failure locals must alias an existing value or use a "
+             "literal")},
+        {"route GET \"/x\" { for item in [1] { match time.nowMicros() > 0 { true => "
+         "return 201 _ => return 404 } } return 500 }\n",
+         lit("static for-loop match subject must be an existing value or literal")},
+        {"route GET \"/x\" { for item in [1] { guard let value = req.header(\"x\") else "
+         "{ return 400 } guard value == value else { return 401 } } return 200 }\n",
+         lit("static for-loop guard-let source must be an existing value or literal")},
+        {"route GET \"/x\" { for item in [time.nowMicros()] { guard item > 0 else { "
+         "return 400 } } let after = time.nowMicros() return 200 }\n",
+         lit("route locals cannot be declared after a static for-loop")},
+    };
+    for (const auto& tc : cases) {
+        auto lexed = lex(lit(tc.src));
+        REQUIRE(lexed);
+        auto ast = parse_file_heap(lexed.value());
+        REQUIRE(ast);
+        auto hir = analyze_file_heap(ast.value());
+        REQUIRE_FALSE(hir);
+        CHECK(hir.error().detail.eq(tc.detail));
+    }
+}
+
+TEST(frontend, analyze_rejects_runtime_fallible_static_loop_local) {
+    const char* src =
+        "func maybe(ok: bool) -> i32 { if ok { 7 } else { error(.timeout) } }\n"
+        "route GET \"/x\" { for item in [1] { let value = maybe(req.http11) return 200 } "
+        "return 500 }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE_FALSE(hir);
+    CHECK(hir.error().detail.eq(
+        lit("runtime-fallible locals are not supported inside a static for-loop body")));
+}
+
+TEST(frontend, analyze_rejects_runtime_fallible_inline_static_iterator_element) {
+    const char* src =
+        "func maybe(ok: bool) -> i32 { if ok { 7 } else { error(.timeout) } }\n"
+        "route GET \"/x\" { for item in [maybe(req.http11)] { return 200 } return 500 }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE_FALSE(hir);
+    CHECK_EQ(hir.error().code, FrontendError::UnsupportedSyntax);
+}
+
+TEST(frontend, analyze_validates_route_local_response_status) {
+    const char* invalid[] = {
+        "route GET \"/x\" { let code = 99 if req.http11 { return code } else { return 500 } "
+        "}\n",
+        "func pick(ok: bool) -> i32 { if ok { 201 } else { 202 } } route GET \"/x\" { let "
+        "code = pick(req.http11) if req.http11 { return code } else { return 500 } }\n",
+    };
+    for (const char* src : invalid) {
+        auto lexed = lex(lit(src));
+        REQUIRE(lexed);
+        auto ast = parse_file_heap(lexed.value());
+        REQUIRE(ast);
+        auto hir = analyze_file_heap(ast.value());
+        REQUIRE_FALSE(hir);
+        CHECK_EQ(hir.error().code, FrontendError::InvalidStatusCode);
+    }
+    auto lexed =
+        lex(lit("route GET \"/x\" { let code = 201 if req.http11 { return code } else "
+                "{ return 500 } }\n"));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    REQUIRE(lower_to_rir(mir.value(), rir));
+    rir.destroy();
+
+    lexed = lex(lit("route GET \"/x\" { let code = 201 return code }\n"));
+    REQUIRE(lexed);
+    ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    CHECK_EQ(hir->routes[0].control.direct_term.local_ref_index, 0u);
+}
+
+TEST(frontend, analyze_rejects_repeated_runtime_work_in_static_loop_match_sources) {
+    const char* cases[] = {
+        "func maybe(ok: bool) -> i32 { if ok { 7 } else { error(.timeout) } } route GET \"/x\" "
+        "{ for item in [1] { guard match maybe(req.http11) else { .timeout => return 400 _ => "
+        "return 401 } } return 200 }\n",
+        "route GET \"/x\" { for item in [true] { match item { true => { match "
+        "time.nowMicros() > 0 { true => return 201 _ => return 202 } } _ => return 500 } } "
+        "return 501 }\n",
+    };
+    for (const char* src : cases) {
+        auto lexed = lex(lit(src));
+        REQUIRE(lexed);
+        auto ast = parse_file_heap(lexed.value());
+        REQUIRE(ast);
+        auto hir = analyze_file_heap(ast.value());
+        REQUIRE_FALSE(hir);
+    }
+}
+
+TEST(frontend, mir_runs_flattened_match_prelude_once_across_inner_arm_fallthrough) {
+    const char* src =
+        "route GET \"/x\" { for item in [1] { match item { 1 => { guard time.nowMicros() > "
+        "0 else { return 499 } match item { 2 => return 201 _ => return 202 } } _ => return "
+        "500 } } return 501 }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    REQUIRE_EQ(mir->functions[0].blocks.len, 10u);
+    // The first flattened inner-arm guard falls straight into the next inner
+    // arm body; it must not jump through that copy's prelude guard (block 3).
+    CHECK_EQ(mir->functions[0].blocks[4].term.else_block, 6u);
+    FrontendRirModule rir{};
+    REQUIRE(lower_to_rir(mir.value(), rir));
+    CHECK(rir::verify_module(rir.module).ok);
+    rir.destroy();
+}
+
+TEST(frontend, mir_retains_iterator_alias_used_by_loop_terminator) {
+    const char* src =
+        "route GET \"/x\" { let xs = [1, 2] for item in xs { return 200, json(xs) } return "
+        "500 }\n";
+    FrontendRirModule rir{};
+    REQUIRE(lower_src_to_rir(src, rir));
+    CHECK(rir::verify_module(rir.module).ok);
+    rir.destroy();
+}
+
+TEST(frontend, mir_lowers_static_loop_iterator_as_response_status) {
+    const char* cases[] = {
+        "route GET \"/x\" { for code in [201] { return code } return 500 }\n",
+        "route GET \"/x\" { let codes = [201] for code in codes { return code } return 500 }\n",
+        "route GET \"/x\" { let code = 201 for value in [code] { return value } return 500 }\n",
+        "route GET \"/x\" { let code = 201 let codes = [code] for value in codes { return value } "
+        "return 500 }\n",
+    };
+    for (const char* src : cases) {
+        FrontendRirModule rir{};
+        REQUIRE(lower_src_to_rir(src, rir));
+        CHECK(rir::verify_module(rir.module).ok);
+        rir.destroy();
+    }
+}
+
+TEST(frontend, mir_lowers_static_loop_body_alias_as_response_status) {
+    FrontendRirModule rir{};
+    REQUIRE(lower_src_to_rir(
+        "route GET \"/x\" { for item in [201] { let code = item return code } return 500 }\n",
+        rir));
+    CHECK(rir::verify_module(rir.module).ok);
+    rir.destroy();
+}
+
+TEST(frontend, static_loop_match_rejects_guarded_wildcard) {
+    const char* src =
+        "route GET \"/x\" { for item in [true] { match item { true => return 201 _ if false "
+        "=> return 202 } } return 500 }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE_FALSE(hir.has_value());
+}
+
+TEST(frontend, static_loop_plain_guard_materializes_helper_argument_carrier) {
+    const char* src = R"rut(
+func duplicate(values: [str]) -> [[str]] => [values, values]
+func inspect(_ groups: [[str]], flag: bool) -> bool => flag
+route GET "/x" {
+    for item in [1] {
+        guard inspect(duplicate(req.queryAll("x")), req.http11) else { return 400 }
+        return 200
+    }
+    return 500
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    REQUIRE_EQ(hir->routes[0].for_loops[0].body.locals.len, 1u);
+    REQUIRE_GE(hir->routes[0].for_loops[0].body.steps.len, 2u);
+    CHECK_EQ(hir->routes[0].for_loops[0].body.steps[0].kind, HirForLoopBody::Step::Kind::Let);
+    CHECK_EQ(hir->routes[0].for_loops[0].body.steps[1].kind, HirForLoopBody::Step::Kind::Guard);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    REQUIRE(lower_to_rir(mir.value(), rir));
+    CHECK(rir::verify_module(rir.module).ok);
+    rir.destroy();
+}
+
+TEST(frontend, static_loop_match_arm_prelude_guard_materializes_helper_argument_carrier) {
+    const char* src = R"rut(
+func duplicate(values: [str]) -> [[str]] => [values, values]
+func inspect(_ groups: [[str]], flag: bool) -> bool => flag
+route GET "/x" {
+    for item in [1] {
+        match item {
+            1 => {
+                guard inspect(duplicate(req.queryAll("x")), req.http11) else { return 400 }
+                return 200
+            }
+            _ => return 500
+        }
+    }
+    return 501
+}
+)rut";
+    FrontendRirModule rir{};
+    REQUIRE(lower_src_to_rir(src, rir));
+    CHECK(rir::verify_module(rir.module).ok);
+    rir.destroy();
+}
+
+TEST(frontend, static_loop_guard_failure_if_materializes_helper_argument_carrier) {
+    const char* src = R"rut(
+func duplicate(values: [str]) -> [[str]] => [values, values]
+func inspect(_ groups: [[str]], flag: bool) -> bool => flag
+route GET "/x" {
+    for item in [1] {
+        guard false else {
+            if inspect(duplicate(req.queryAll("x")), req.http11) {
+                return 400
+            } else {
+                return 401
+            }
+        }
+    }
+    return 500
+}
+)rut";
+    FrontendRirModule rir{};
+    REQUIRE(lower_src_to_rir(src, rir));
+    CHECK(rir::verify_module(rir.module).ok);
+    rir.destroy();
+}
+
+TEST(frontend, static_loop_loop_control_guard_does_not_supply_route_terminator) {
+    const char* src = "route GET \"/x\" { for item in [1] { guard false else { break } } }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE_FALSE(hir.has_value());
+}
+
+TEST(frontend, static_loop_if_materializes_helper_argument_carrier) {
+    const char* src = R"rut(
+func duplicate(values: [str]) -> [[str]] => [values, values]
+func inspect(_ groups: [[str]], flag: bool) -> bool => flag
+route GET "/x" {
+    for item in [1] {
+        if inspect(duplicate(req.queryAll("x")), req.http11) { return 200 } else { return 400 }
+    }
+    return 500
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    REQUIRE_EQ(hir->routes[0].for_loops[0].body.locals.len, 1u);
+    REQUIRE_GE(hir->routes[0].for_loops[0].body.steps.len, 2u);
+    CHECK_EQ(hir->routes[0].for_loops[0].body.steps[0].kind, HirForLoopBody::Step::Kind::Let);
+    CHECK_EQ(hir->routes[0].for_loops[0].body.steps[1].kind, HirForLoopBody::Step::Kind::If);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    REQUIRE(lower_to_rir(mir.value(), rir));
+    CHECK(rir::verify_module(rir.module).ok);
+    rir.destroy();
+}
+
+TEST(frontend, static_loop_match_arm_if_materializes_helper_argument_carrier) {
+    const char* src = R"rut(
+func duplicate(values: [str]) -> [[str]] => [values, values]
+func inspect(_ groups: [[str]], flag: bool) -> bool => flag
+route GET "/x" {
+    for item in [1] {
+        match item {
+            1 => if inspect(duplicate(req.queryAll("x")), req.http11) {
+                return 200
+            } else {
+                return 400
+            }
+            _ => return 500
+        }
+    }
+    return 501
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    REQUIRE_EQ(hir->routes[0].for_loops[0].body.matches.len, 1u);
+    REQUIRE_EQ(hir->routes[0].for_loops[0].body.matches[0].arms[0].locals.len, 1u);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    REQUIRE(lower_to_rir(mir.value(), rir));
+    CHECK(rir::verify_module(rir.module).ok);
+    rir.destroy();
+}
+
+TEST(frontend, guaranteed_static_loop_exit_rejects_unreturned_dynamic_response_builder) {
+    const char* src = R"rut(
+route GET "/x" {
+    let resp = response(200)
+    resp.body = req.path
+    for item in [1] { return 201 }
+    return resp
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE_FALSE(hir);
+    CHECK(hir.error().detail.eq(
+        lit("a dynamically mutated Response builder must be returned directly")));
+}
+
+TEST(frontend, static_loop_match_arm_guard_rejects_repeated_guard_match_source) {
+    const char* src = R"rut(
+func maybe(ok: bool) -> i32 { if ok { 7 } else { error(.timeout) } }
+route GET "/x" {
+    for item in [true] {
+        match item {
+            true => {
+                guard match maybe(req.http11) else { .timeout => return 400 _ => return 401 }
+                return 200
+            }
+            _ => return 500
+        }
+    }
+    return 501
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE_FALSE(hir);
+    CHECK(hir.error().detail.eq(lit("static for-loop guard source must not repeat runtime work")));
+}
+
+TEST(frontend, static_loop_match_arm_guard_let_accepts_known_missing_literals) {
+    const char* cases[] = {
+        "route GET \"/x\" { for item in [true] { match item { true => { guard let value = nil "
+        "else { return 400 } return 200 } _ => return 500 } } return 501 }\n",
+        "route GET \"/x\" { for item in [true] { match item { true => { guard let value = "
+        "error(.timeout) else { return 400 } return 200 } _ => return 500 } } return 501 }\n",
+    };
+    for (const char* src : cases) {
+        auto lexed = lex(lit(src));
+        REQUIRE(lexed);
+        auto ast = parse_file_heap(lexed.value());
+        REQUIRE(ast);
+        auto hir = analyze_file_heap(ast.value());
+        REQUIRE(hir);
+        REQUIRE_EQ(hir->routes[0].for_loops[0].body.matches.len, 1u);
+        CHECK_EQ(hir->routes[0].for_loops[0].body.matches[0].arms[0].locals.len, 0u);
+    }
+}
+
+TEST(frontend, mir_latches_outer_arm_guard_across_flattened_fallthrough) {
+    const char* src = R"rut(
+route GET "/x" {
+    for item in [1] {
+        match item {
+            1 if time.nowMicros() > 0 => {
+                match item { 2 => return 201 _ => return 202 }
+            }
+            _ => return 500
+        }
+    }
+    return 501
+}
+)rut";
+    FrontendRirModule rir{};
+    REQUIRE(lower_src_to_rir(src, rir));
+    CHECK(rir::verify_module(rir.module).ok);
+    u32 samples = 0;
+    for (u32 bi = 0; bi < rir.module.functions[0].block_count; bi++)
+        samples += block_op_count(rir.module.functions[0].blocks[bi], rir::Opcode::TimeNowMicros);
+    CHECK_EQ(samples, 1u);
+    rir.destroy();
+}
+
+TEST(frontend, nonempty_terminating_static_loop_needs_no_fallback) {
+    const char* cases[] = {
+        "route GET \"/x\" { for item in [1] { return 200 } }\n",
+        "route GET \"/x\" { for flag in [true] { match flag { true => return 200 false => return "
+        "400 } } }\n",
+    };
+    for (const char* src : cases) {
+        FrontendRirModule rir{};
+        REQUIRE(lower_src_to_rir(src, rir));
+        CHECK(rir::verify_module(rir.module).ok);
+        rir.destroy();
+    }
+}
+
+TEST(frontend, static_loop_known_nil_guard_let_skips_success_binding) {
+    const char* src =
+        "route GET \"/x\" { for item in [1] { guard let value = nil else { return 400 } } }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    REQUIRE_EQ(hir->routes[0].for_loops.len, 1u);
+    CHECK_EQ(hir->routes[0].for_loops[0].body.locals.len, 0u);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+}
+
+TEST(frontend, chain_after_marks_static_loop_body_terminators) {
+    const char* src = R"rut(
+func add_header(_ req: i32, _ resp: Response) -> i32 { resp.set("X-After", "yes") 0 }
+chain access { after add_header(req, resp) }
+route {
+    use chain access
+    GET "/x" { for item in [1] { return 200 } }
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    REQUIRE_EQ(hir->routes[0].for_loops.len, 1u);
+    CHECK(hir->routes[0].for_loops[0].body.term.commit_response_mutations);
+}
+
+TEST(frontend, mir_rejects_unproven_static_loop_response_status) {
+    const char* cases[] = {
+        "route GET \"/x\" { for code in [99] { return code } return 500 }\n",
+        "route GET \"/x\" { for code in [600] { return code } return 500 }\n",
+        "func select(ok: bool) -> i32 { if ok { 201 } else { 202 } } route GET \"/x\" { let "
+        "selected = select(req.http11) for code in [selected] { return code } return 500 }\n",
+    };
+    for (const char* src : cases) {
+        auto lexed = lex(lit(src));
+        REQUIRE(lexed);
+        auto ast = parse_file_heap(lexed.value());
+        REQUIRE(ast);
+        auto hir = analyze_file_heap(ast.value());
+        REQUIRE(hir);
+        auto mir = build_mir_heap(hir.value());
+        REQUIRE_FALSE(mir.has_value());
+        CHECK_EQ(mir.error().code, FrontendError::InvalidStatusCode);
+    }
+}
+
+TEST(frontend, analyze_rejects_runtime_fallible_static_loop_match_arm_local) {
+    const char* src =
+        "func maybe(ok: bool) -> i32 { if ok { 7 } else { error(.timeout) } }\n"
+        "route GET \"/x\" { for item in [true] { match item { true => { let value = "
+        "maybe(req.http11) return 200 } _ => return 500 } } return 501 }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE_FALSE(hir);
+    CHECK(hir.error().detail.eq(
+        lit("runtime-fallible locals are not supported inside a static for-loop match arm")));
+}
+
+TEST(frontend, mir_materializes_static_loop_arm_local_before_flattened_nested_match_guard) {
+    const char* src =
+        "route GET \"/x\" { for item in [true] { match item { true => { let captured = "
+        "time.nowMicros() match captured > 0 { true => return 200 _ => return 500 } } _ => "
+        "return 501 } } return 502 }\n";
+    FrontendRirModule rir{};
+    REQUIRE(lower_src_to_rir(src, rir));
+    CHECK(rir::verify_module(rir.module).ok);
+    u32 samples = 0;
+    for (u32 bi = 0; bi < rir.module.functions[0].block_count; bi++)
+        samples += block_op_count(rir.module.functions[0].blocks[bi], rir::Opcode::TimeNowMicros);
+    CHECK_EQ(samples, 1u);
+    rir.destroy();
+}
+
+TEST(frontend, mir_materializes_later_flattened_arm_helper_carriers) {
+    const char* src = R"rut(
+func duplicate(values: [str]) -> [[str]] => [values, values]
+func inspect(_ groups: [[str]], flag: bool) -> bool => flag
+route GET "/x" {
+    for item in [1] {
+        match item {
+            1 => {
+                let captured = req.path
+                match item {
+                    2 => return 201
+                    _ => if inspect(duplicate(req.queryAll("x")), req.http11) {
+                        return 202
+                    } else {
+                        return 203
+                    }
+                }
+            }
+            _ => return 500
+        }
+    }
+    return 501
+}
+)rut";
+    FrontendRirModule rir{};
+    REQUIRE(lower_src_to_rir(src, rir));
+    CHECK(rir::verify_module(rir.module).ok);
+    rir.destroy();
+}
+
+TEST(frontend, static_loop_match_arm_local_overflow_is_diagnosed) {
+    const char* src = R"rut(
+route GET "/x" {
+    for item in [1] {
+        match item {
+            1 => {
+                let a = 1
+                let b = 2
+                let c = 3
+                let d = 4
+                let e = 5
+                return 200
+            }
+            _ => return 500
+        }
+    }
+    return 501
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE_FALSE(hir.has_value());
+    CHECK_EQ(hir.error().code, FrontendError::TooManyItems);
+}
+
+TEST(frontend, mir_runs_match_arm_prelude_before_flattened_nested_match_guard) {
+    const char* src = R"rut(
+func maybe(ok: bool) -> i32 { if ok { 7 } else { error(.timeout) } }
+route GET "/x" {
+    let candidate = maybe(req.http11)
+    for item in [true] {
+        match item {
+            true => {
+                guard let value = candidate else { return 400 }
+                match value { 7 => return 201 _ => return 202 }
+            }
+            _ => return 203
+        }
+    }
+    return 204
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    REQUIRE(lower_to_rir(mir.value(), rir));
+    CHECK(rir::verify_module(rir.module).ok);
+    rir.destroy();
+}
+
+TEST(frontend, mir_defines_arm_capture_before_prelude_and_nested_guard) {
+    const char* src = R"rut(
+route GET "/x" {
+    for item in [true] {
+        match item {
+            true => {
+                let captured = time.nowMicros()
+                guard captured > 0 else { return 400 }
+                match captured > 0 { true => return 201 _ => return 202 }
+            }
+            _ => return 500
+        }
+    }
+    return 501
+}
+)rut";
+    FrontendRirModule rir{};
+    REQUIRE(lower_src_to_rir(src, rir));
+    CHECK(rir::verify_module(rir.module).ok);
+    u32 samples = 0;
+    for (u32 bi = 0; bi < rir.module.functions[0].block_count; bi++)
+        samples += block_op_count(rir.module.functions[0].blocks[bi], rir::Opcode::TimeNowMicros);
+    CHECK_EQ(samples, 1u);
+    rir.destroy();
+}
+
+TEST(frontend, mir_does_not_repeat_post_guard_capture_in_nested_match_case) {
+    const char* src = R"rut(
+route GET "/x" {
+    for item in [true] {
+        match item {
+            true => {
+                guard req.http11 else { return 400 }
+                let captured = time.nowMicros()
+                match captured > 0 { true => return 201 _ => return 202 }
+            }
+            _ => return 500
+        }
+    }
+    return 501
+}
+)rut";
+    FrontendRirModule rir{};
+    REQUIRE(lower_src_to_rir(src, rir));
+    CHECK(rir::verify_module(rir.module).ok);
+    u32 samples = 0;
+    for (u32 bi = 0; bi < rir.module.functions[0].block_count; bi++)
+        samples += block_op_count(rir.module.functions[0].blocks[bi], rir::Opcode::TimeNowMicros);
+    CHECK_EQ(samples, 1u);
+    rir.destroy();
+}
+
+TEST(frontend, mir_materializes_static_loop_guard_let_binding_after_guard_success) {
+    const char* src =
+        "route GET \"/x\" { let maybe = req.header(\"x\") for item in [true] { match item { "
+        "true => { guard let value = maybe else { return 400 } return 200 } _ => return 500 } "
+        "} return 501 }\n";
+    FrontendRirModule rir{};
+    REQUIRE(lower_src_to_rir(src, rir));
+    CHECK(rir::verify_module(rir.module).ok);
+    rir.destroy();
+}
+
+TEST(frontend, analyze_rejects_response_effects_in_static_loop_body_locals) {
+    const char* src = R"rut(
+func mutate(_ resp: Response) -> i32 { resp.status = 202 0 }
+route GET "/x" {
+    let resp = response(200)
+    for item in [1] {
+        let ignored = mutate(resp)
+        guard item > 0 else { return 500 }
+    }
+    return resp
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE_FALSE(hir.has_value());
+    CHECK(hir.error().detail.eq(
+        lit("response-mutating helper calls are not supported in conditional branches")));
+}
+
 TEST(frontend, analyze_rejects_call_produced_iterator_alias_inside_static_for_body) {
     const char* src =
         "func make(v: i32) -> [i32] => [v]\n"
         "route GET \"/x\" { for outer in [1] { let xs = make(outer) for item in xs { guard "
         "item > 0 else { return 400 } } } return 200 }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE_FALSE(hir);
+    CHECK(hir.error().detail.eq(
+        lit("static for-loop iterator must be a compile-time array literal or alias")));
+}
+
+TEST(frontend, analyze_rejects_route_call_iterator_aliased_inside_static_for_body) {
+    const char* src =
+        "func make(v: i32) -> [i32] => [v]\n"
+        "route GET \"/x\" { let xs = make(1) for outer in [1] { let ys = xs for item in ys "
+        "{ return 201 } } return 500 }\n";
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
     auto ast = parse_file_heap(lexed.value());

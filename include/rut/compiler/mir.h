@@ -314,8 +314,9 @@ struct MirBlock {
     struct Effect {
         u32 value_index = 0xffffffffu;
         Span span{};
-        // Non-sentinel for a branch-local initializer whose result becomes
-        // visible to the owning block's terminator.
+        // Optional block-local binding populated with the materialized value.
+        // Used by branch-local initializers and static-loop unrolling to
+        // preserve evaluate-once semantics for the owning block.
         u32 local_ref_index = 0xffffffffu;
     };
     Str label{};
