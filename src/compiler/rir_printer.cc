@@ -343,6 +343,9 @@ void print_opcode(PrintBuf& buf, Opcode op) {
         case Opcode::JsonAppendStr:
             buf.put_cstr("json.append_str");
             break;
+        case Opcode::JsonAppendStrList:
+            buf.put_cstr("json.append_str_list");
+            break;
         case Opcode::JsonFinish:
             buf.put_cstr("json.finish");
             break;
@@ -771,6 +774,7 @@ void print_instruction(PrintBuf& buf, const Instruction& inst, const Function& f
         case Opcode::JsonAppendI32:
         case Opcode::JsonAppendI64:
         case Opcode::JsonAppendStr:
+        case Opcode::JsonAppendStrList:
             buf.put(' ');
             print_value_ref(buf, inst.operands[0]);
             break;

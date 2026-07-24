@@ -32222,6 +32222,22 @@ TEST(frontend, return_json_scratch_bound_includes_dynamic_slot_minima) {
     CHECK_EQ(hir.error().code, FrontendError::TooManyItems);
 }
 
+TEST(frontend, return_json_scratch_bound_reserves_empty_string_list_brackets) {
+    constexpr u32 kRawOverhead =
+        sizeof("{\"padding\":\"") - 1 + sizeof("\",\"values\":") - 1 + sizeof("}") - 1;
+    static_assert(kJsonResponseScratchCapacity > kRawOverhead + 1);
+    std::string src = "route GET \"/x\" { return 200, json({ padding: \"";
+    src.append(kJsonResponseScratchCapacity - 1 - kRawOverhead, 'x');
+    src += "\", values: req.queryAll(\"tag\") }) }\n";
+    auto lexed = lex({src.data(), static_cast<u32>(src.size())});
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE_FALSE(hir.has_value());
+    CHECK_EQ(hir.error().code, FrontendError::TooManyItems);
+}
+
 TEST(frontend, runtime_json_terminators_keep_route_context_in_control_flow) {
     const char* src = R"rut(
 route GET "/if" {

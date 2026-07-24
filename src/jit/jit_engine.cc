@@ -74,6 +74,7 @@ static const HelperEntry kHelpers[] = {
     {"rut_helper_json_reset", reinterpret_cast<void*>(&rut_helper_json_reset)},
     {"rut_helper_json_append_raw", reinterpret_cast<void*>(&rut_helper_json_append_raw)},
     {"rut_helper_json_append_str", reinterpret_cast<void*>(&rut_helper_json_append_str)},
+    {"rut_helper_json_append_str_list", reinterpret_cast<void*>(&rut_helper_json_append_str_list)},
     {"rut_helper_json_append_i64", reinterpret_cast<void*>(&rut_helper_json_append_i64)},
     {"rut_helper_json_append_bool", reinterpret_cast<void*>(&rut_helper_json_append_bool)},
     {"rut_helper_json_finish", reinterpret_cast<void*>(&rut_helper_json_finish)},
