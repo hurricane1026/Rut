@@ -10914,8 +10914,24 @@ static FrontendResult<HirExpr> analyze_call_expr(const AstExpr& expr,
     for (u32 i = 0; i < effective_arg_count; i++) {
         const bool needs_array_carrier =
             hir_type_shape_contains_array(mod, analyzed_args[i].shape_index);
-        const bool needs_json_arg_carrier =
+        bool needs_json_arg_carrier =
             hir_expr_contains_json_build(fn.body) && count_function_param_refs(fn.body, i, 1) != 0;
+        bool has_materialized_json_plan = false;
+        for (u32 ei = 0; ei < fn.exprs.len && ei < fn.expr_materialized_local_refs.len; ei++) {
+            if (fn.expr_materialized_local_refs[ei] != 0xffffffffu &&
+                (fn.exprs[ei].type == HirTypeKind::Json ||
+                 hir_expr_contains_json_build(fn.exprs[ei]))) {
+                has_materialized_json_plan = true;
+                break;
+            }
+        }
+        for (u32 ei = 0; !needs_json_arg_carrier && has_materialized_json_plan &&
+                         ei < fn.exprs.len && ei < fn.expr_materialized_local_refs.len;
+             ei++) {
+            needs_json_arg_carrier =
+                fn.expr_materialized_local_refs[ei] != 0xffffffffu &&
+                count_function_param_refs(fn.exprs[ei], i, 1) != 0;
+        }
         const bool needs_reused_array_carrier =
             needs_array_carrier && function_param_is_reused(fn, i);
         if ((!needs_reused_array_carrier && !needs_json_arg_carrier) ||
@@ -11854,6 +11870,30 @@ static FrontendResult<HirTerminator> analyze_term(const AstStatement& stmt,
                         // not only a direct JsonBuild. Materialize that plan into
                         // a captured Str at this selected sink, then stream the
                         // captured document as the dynamic response body.
+                        if (route->waits.len != 0) {
+                            bool retained[HirRoute::kMaxLocals]{};
+                            for (u32 li = 0; li < route->locals.len; li++)
+                                retained[li] =
+                                    expr_reads_local_ref(body.value(), route->locals[li].ref_index);
+                            bool changed = true;
+                            while (changed) {
+                                changed = false;
+                                for (u32 li = 0; li < route->locals.len; li++) {
+                                    if (!retained[li]) continue;
+                                    for (u32 dep = 0; dep < route->locals.len; dep++) {
+                                        if (retained[dep] ||
+                                            !expr_reads_local_ref(route->locals[li].init,
+                                                                  route->locals[dep].ref_index))
+                                            continue;
+                                        retained[dep] = true;
+                                        changed = true;
+                                    }
+                                }
+                            }
+                            for (u32 li = 0; li < route->locals.len; li++)
+                                if (retained[li] && !route->locals[li].materialize_on_resume)
+                                    route->locals[li].rematerialize_after_wait = true;
+                        }
                         if (!route->exprs.push(body.value()))
                             return frontend_error(FrontendError::TooManyItems, stmt.expr.span);
                         term.json_body_expr_index = route->exprs.len - 1;

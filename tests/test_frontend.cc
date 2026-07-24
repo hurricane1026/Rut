@@ -34980,8 +34980,55 @@ route GET "/x" {
     return 200, payload
 }
 )rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    bool rematerializes_json = false;
+    for (u32 i = 0; i < hir->routes[0].locals.len; i++) {
+        const auto& local = hir->routes[0].locals[i];
+        if (local.type == HirTypeKind::Json && local.rematerialize_after_wait)
+            rematerializes_json = true;
+    }
+    CHECK(rematerializes_json);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
     FrontendRirModule rir{};
-    REQUIRE(lower_src_to_rir(src, rir));
+    REQUIRE(lower_to_rir(mir.value(), rir));
+    CHECK(rir::verify_module(rir.module).ok);
+    rir.destroy();
+}
+
+TEST(frontend, helper_local_json_plan_captures_scalar_arguments_at_call_site) {
+    const char* src = R"rut(
+func encode(value: str, resp: Response) -> Json {
+    resp.set("X-Mode", "new")
+    let payload = json({ value: value })
+    payload
+}
+route GET "/x" {
+    let resp = response(200)
+    resp.set("X-Mode", "old")
+    return 200, encode(req.path, resp)
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    bool has_call_arg_carrier = false;
+    for (u32 i = 0; i < hir->routes[0].locals.len; i++)
+        if (hir->routes[0].locals[i].name.eq(lit("$call_arg"))) has_call_arg_carrier = true;
+    CHECK(has_call_arg_carrier);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    REQUIRE(lower_to_rir(mir.value(), rir));
+    CHECK(rir::verify_module(rir.module).ok);
     rir.destroy();
 }
 

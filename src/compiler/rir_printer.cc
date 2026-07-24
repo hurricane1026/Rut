@@ -639,7 +639,12 @@ void print_instruction(PrintBuf& buf, const Instruction& inst, const Function& f
         case Opcode::ResumeEventKind:
         case Opcode::ResumeEventResult:
         case Opcode::RespCommitHeaders:
+            break;
         case Opcode::RespCommitBody:
+            if (inst.operand_count == 1) {
+                buf.put(' ');
+                print_value_ref(buf, inst.operands[0]);
+            }
             break;
         case Opcode::CtxLoadSlotI32:
             buf.put(' ');
