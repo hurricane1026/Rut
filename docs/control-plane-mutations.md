@@ -168,6 +168,16 @@ The coordinator executes one request at a time:
    shard installation acknowledgement does not cancel or drain a suspended
    invocation, TLS handshake, or open WebSocket session.
 
+The generation whose process-startup `init` hook ran is a separate lifecycle
+owner. Its compiled lifecycle bundle remains pinned until process shutdown has
+run that same generation's paired `shutdown` hook, even if a reload replaces all
+request handlers and every ordinary invocation pin reaches zero. Reload does not
+run a candidate generation's `init`, substitute its `shutdown`, or reclaim the
+startup bundle. A future design may instead define paired per-generation
+shutdown/init transitions, but it must complete the old shutdown before reclaim
+and the new init before publication; mixing hooks from different generations is
+forbidden.
+
 Installation also retires old-generation timer registrations before a shard
 acknowledges. The shard removes the old scheduled tick and drains any callback
 already queued at its command boundary. If a predecessor invocation is active
@@ -582,6 +592,13 @@ larger than the configured bound, was not captured completely, or cannot be
 resolved during replay, that request or capture is `Unsupported`; replay never
 substitutes an empty, truncated, or invented body.
 
+Streaming uploads additionally require an ordered transcript of every client
+body read boundary: chunk bytes/length, EOF, read failure, timeout, cancellation,
+and its event position relative to upstream sends, early upstream responses,
+send completions, and teardown. Replay releases chunks only at those recorded
+boundaries. Until that transcript is implemented, capture of a request forwarded
+with `streaming: true` is `Unsupported`; final body bytes alone are insufficient.
+
 Exact client network and firewall-visible identity is protected request input
 as well. Each admitted connection, request, or stream records address family,
 full source and destination addresses and ports, any trusted proxy-derived
@@ -591,6 +608,14 @@ those exact inputs before firewall, route, rate-limit, or Rut handler
 evaluation, using opaque provider handles when sensitive. Any missing inspected
 field makes the capture `Unsupported`; replay never substitutes zeros or
 target-observed metadata.
+
+Firewall replay also requires the initial attached kernel-map contents and
+visible version, not merely the userspace registry allocation. Every dynamic
+map update records submission, Node Agent result, publication/version boundary,
+and ordering relative to each packet evaluation; replay evaluates a packet
+against the recorded visible version. Until this independently visible XDP-map
+baseline and update transcript is implemented, beginning or continuing capture
+while firewall state can be dynamically updated is `Unsupported`.
 
 Response comparison covers exact observable bytes, not only status and content
 length. Before production releases a response buffer, capture stores the
@@ -630,11 +655,26 @@ compares emitted frames byte-for-byte. A session with an omitted or truncated
 frame event invalidates the capture; recording only its HTTP upgrade is never a
 complete workload.
 
+Passthrough `websocket(upstream)` is a full-duplex byte tunnel rather than a
+terminate-mode frame callback. It requires an ordered bidirectional transcript
+of client/upstream reads, exact bounded bytes, writes, send completions,
+backpressure pauses/resumes, half-closes, failures, and teardown. Until that
+tunnel transcript is implemented, any capture that upgrades into passthrough
+mode is `Unsupported`; the HTTP upgrade record does not make it complete.
+
 Rut-visible environment results form another protected transcript. Each
 invocation records, in call order, every value returned by `time.nowMicros()`,
 `randomBytes()`, `uuid()`, and future clock or entropy APIs. Replay consumes
 those exact values rather than deriving them from capture completion timestamps
 or local entropy. Missing, extra, or reordered calls are `Unsupported`.
+
+Runtime-internal clocks are deterministic inputs too. In particular, capture
+records every monotonic sample used by response throttling together with its
+bucket update, pause/read decision, timer arm/fire, resume decision, and event
+position relative to upstream reads and lifecycle events. Replay consumes those
+samples and decisions from the same ordered transcript. A throttled workload
+without this complete internal-clock transcript is `Unsupported`, even when all
+Rut-visible clock calls were recorded.
 
 Every workload and mutation record carries a monotonic capture sequence number,
 correlation identity, and source `shard_id`. A request or HTTP/2 stream receives
@@ -714,6 +754,11 @@ and all later cache mutations, or drain and invalidate the automatic cache befor
 assigning the first workload-event sequence. Replay restores the checkpoint or
 starts from the correspondingly recorded empty cache. Starting from an
 unrecorded empty cache when production could serve a warm hit is `Unsupported`.
+Each post-baseline lookup also records its monotonic lookup-time sample, selected
+entry/version, and exact outcome (`fresh hit`, `stale hit` including any
+revalidation scheduling, or `miss`) in workload-event order. Replay consumes
+that decision before issuing any corresponding upstream operation; freshness
+metadata without the lookup clock and outcome is not a deterministic transcript.
 
 Per-shard and aggregate stats/metrics counters, histograms, and snapshot epochs
 are checkpointed in the baseline. As an equivalent bounded representation,
