@@ -94,6 +94,17 @@ static u64 replay_matrix_forward_0_handler(void* /*conn*/,
     return rut::jit::HandlerResult::make_forward(0).pack();
 }
 
+static u64 replay_dynamic_json_handler(
+    void* /*conn*/, rut::jit::HandlerCtx* ctx, const u8* /*req*/, u32 /*len*/, void* /*arena*/) {
+    static constexpr char kBody[] = R"({"path":"/dynamic","code":42})";
+    ctx->response_body_data = kBody;
+    ctx->response_body_len = sizeof(kBody) - 1;
+    ctx->response_body_valid = 1;
+    auto result = rut::jit::HandlerResult::make_status(200);
+    result.upstream_id = rut::jit::HandlerResult::kDynamicResponseBody;
+    return result.pack();
+}
+
 // === ReplayReader ===
 
 TEST(replay_reader, open_valid_file) {
@@ -238,8 +249,32 @@ TEST(replay_one, multiple_sequential) {
     }
 }
 
+TEST(replay_one, response_body_observation_is_bounded_and_reports_full_length) {
+    constexpr u32 kBodyLen = ReplayResult::kMaxObservedBodyLen + 17;
+    u8 response[4 + kBodyLen]{};
+    response[0] = '\r';
+    response[1] = '\n';
+    response[2] = '\r';
+    response[3] = '\n';
+    for (u32 i = 0; i < kBodyLen; i++) response[4 + i] = static_cast<u8>(i & 0xffu);
+
+    ReplayResult result{};
+    observe_replay_response_body(response, sizeof(response), &result);
+
+    REQUIRE(result.response_body_observed);
+    CHECK(result.response_body_truncated);
+    CHECK_EQ(result.response_body_len, kBodyLen);
+    CHECK_EQ(result.observed_body_len, ReplayResult::kMaxObservedBodyLen);
+    CHECK(__builtin_memcmp(result.observed_body, response + 4, ReplayResult::kMaxObservedBodyLen) ==
+          0);
+}
+
 static bool reject_replay_observation(void*, const harness::Observation&) {
     return false;
+}
+
+static bool reject_replay_body_observation(void*, const harness::Observation& event) {
+    return event.kind != harness::ObservationKind::ResponseBodyProduced;
 }
 
 TEST(harness_replay, maps_match_mismatch_and_failure_to_common_outcomes) {
@@ -255,7 +290,7 @@ TEST(harness_replay, maps_match_mismatch_and_failure_to_common_outcomes) {
     const auto matched = harness::drive_replay_one(matched_loop, matched_entry, 42, spec);
     CHECK_EQ(matched.harness.outcome, harness::Outcome::Passed);
     CHECK_EQ(matched.harness.cleanup, harness::CleanupOutcome::Clean);
-    CHECK_EQ(matched.harness.semantic_events, 1u);
+    CHECK_EQ(matched.harness.semantic_events, 2u);
     CHECK_EQ(matched.harness.input_bytes, matched_entry.raw_header_len);
     CHECK(matched.harness.output_bytes > 0);
     CHECK_EQ(matched.harness.output_bytes, matched.replay.output_bytes);
@@ -448,7 +483,7 @@ TEST(harness_replay, file_adapter_preserves_summary_and_common_outcome) {
     const auto result = harness::drive_replay_file(loop, reader, spec);
     CHECK_EQ(result.harness.outcome, harness::Outcome::Mismatched);
     CHECK_EQ(result.harness.cleanup, harness::CleanupOutcome::Clean);
-    CHECK_EQ(result.harness.semantic_events, 3u);
+    CHECK_EQ(result.harness.semantic_events, 6u);
     CHECK_EQ(result.harness.input_bytes,
              static_cast<u64>(entries[0].raw_header_len) + entries[1].raw_header_len +
                  entries[2].raw_header_len);
@@ -648,6 +683,136 @@ struct RoutedLoop {
         loop.config_ptr = &active_config;
     }
 };
+
+struct ReplayBodyObservation {
+    bool seen = false;
+    bool truncated = false;
+    u32 sequence = 0;
+    u32 full_len = 0;
+    u32 copied_len = 0;
+    u8 bytes[ReplayResult::kMaxObservedBodyLen]{};
+};
+
+static bool capture_replay_body(void* context, const harness::Observation& event) {
+    if (event.kind != harness::ObservationKind::ResponseBodyProduced) return true;
+    auto* captured = static_cast<ReplayBodyObservation*>(context);
+    captured->seen = true;
+    captured->truncated = event.value1 != 0;
+    captured->sequence = event.sequence;
+    captured->full_len = static_cast<u32>(event.value0);
+    captured->copied_len = event.label.len;
+    if (event.label.len != 0) __builtin_memcpy(captured->bytes, event.label.ptr, event.label.len);
+    return true;
+}
+
+struct ReplaySequenceObservation {
+    u32 count = 0;
+    u32 sequences[4]{};
+    harness::ObservationKind kinds[4]{};
+};
+
+static bool capture_replay_sequence(void* context, const harness::Observation& event) {
+    auto* captured = static_cast<ReplaySequenceObservation*>(context);
+    if (captured->count >= 4) return false;
+    captured->sequences[captured->count] = event.sequence;
+    captured->kinds[captured->count] = event.kind;
+    captured->count++;
+    return true;
+}
+
+TEST(harness_replay, publishes_dynamic_json_response_body_bytes) {
+    RouteConfig cfg;
+    REQUIRE(cfg.add_jit_handler("/dynamic", 'G', &replay_dynamic_json_handler));
+    RoutedLoop rl;
+    rl.setup(&cfg);
+
+    ReplayBodyObservation observed{};
+    harness::HarnessSpec spec{};
+    spec.layer = harness::ExecutionLayer::Connection;
+    spec.required_capabilities = harness::CapabilitySet::one(harness::Capability::SyntheticIo);
+    spec.environment_capabilities = spec.required_capabilities;
+    spec.observations = {&observed, &capture_replay_body};
+    const CaptureEntry entry =
+        make_captured_request("GET /dynamic HTTP/1.1\r\nHost: x\r\n\r\n", 200);
+
+    const auto result = harness::drive_replay_one(rl.loop, entry, 42, spec);
+    static constexpr char kExpected[] = R"({"path":"/dynamic","code":42})";
+    REQUIRE_EQ(result.harness.outcome, harness::Outcome::Passed);
+    REQUIRE(observed.seen);
+    CHECK(!observed.truncated);
+    CHECK_EQ(observed.sequence, 1u);
+    CHECK_EQ(observed.full_len, sizeof(kExpected) - 1);
+    CHECK_EQ(observed.copied_len, sizeof(kExpected) - 1);
+    CHECK(__builtin_memcmp(observed.bytes, kExpected, sizeof(kExpected) - 1) == 0);
+    CHECK_EQ(result.replay.response_body_len, sizeof(kExpected) - 1);
+    CHECK_EQ(result.harness.semantic_events, 2u);
+}
+
+TEST(harness_replay, file_observation_sequences_are_globally_contiguous) {
+    RouteConfig cfg;
+    REQUIRE(cfg.add_jit_handler("/dynamic", 'G', &replay_dynamic_json_handler));
+    RoutedLoop rl;
+    rl.setup(&cfg);
+
+    CaptureEntry entries[2];
+    entries[0] = make_captured_request("GET /dynamic HTTP/1.1\r\nHost: x\r\n\r\n", 200);
+    entries[1] = make_captured_request("GET /dynamic HTTP/1.1\r\nHost: x\r\n\r\n", 200);
+    TempCapture tmp;
+    REQUIRE(tmp.create(entries, 2));
+    ReplayReader reader;
+    REQUIRE(reader.open(tmp.path) == 0);
+
+    ReplaySequenceObservation observed{};
+    harness::HarnessSpec spec{};
+    spec.layer = harness::ExecutionLayer::Connection;
+    spec.required_capabilities = harness::CapabilitySet::one(harness::Capability::SyntheticIo);
+    spec.environment_capabilities = spec.required_capabilities;
+    spec.observations = {&observed, &capture_replay_sequence};
+
+    const auto result = harness::drive_replay_file(rl.loop, reader, spec);
+    REQUIRE_EQ(result.harness.outcome, harness::Outcome::Passed);
+    REQUIRE_EQ(observed.count, 4u);
+    for (u32 i = 0; i < observed.count; i++) CHECK_EQ(observed.sequences[i], i);
+    CHECK_EQ(observed.kinds[0], harness::ObservationKind::ResponseProduced);
+    CHECK_EQ(observed.kinds[1], harness::ObservationKind::ResponseBodyProduced);
+    CHECK_EQ(observed.kinds[2], harness::ObservationKind::ResponseProduced);
+    CHECK_EQ(observed.kinds[3], harness::ObservationKind::ResponseBodyProduced);
+    CHECK_EQ(result.harness.semantic_events, 4u);
+    reader.close();
+}
+
+TEST(harness_replay, body_oracle_mismatch_takes_precedence_over_unsupported_file_entry) {
+    RouteConfig cfg;
+    auto upstream = cfg.add_upstream("backend", 0x7F000001, 9999);
+    REQUIRE(upstream.has_value());
+    REQUIRE(cfg.add_proxy("/api", 0, static_cast<u16>(upstream.value())));
+    REQUIRE(cfg.add_jit_handler("/dynamic", 'G', &replay_dynamic_json_handler));
+    RoutedLoop rl;
+    rl.setup(&cfg);
+
+    CaptureEntry entries[2];
+    entries[0] = make_captured_request("GET /api/users HTTP/1.1\r\nHost: x\r\n\r\n", 200);
+    entries[1] = make_captured_request("GET /dynamic HTTP/1.1\r\nHost: x\r\n\r\n", 200);
+    TempCapture tmp;
+    REQUIRE(tmp.create(entries, 2));
+    ReplayReader reader;
+    REQUIRE(reader.open(tmp.path) == 0);
+
+    harness::HarnessSpec spec{};
+    spec.layer = harness::ExecutionLayer::Connection;
+    spec.required_capabilities = harness::CapabilitySet::one(harness::Capability::SyntheticIo);
+    spec.environment_capabilities = spec.required_capabilities;
+    spec.observations.observe = &reject_replay_body_observation;
+
+    const auto result = harness::drive_replay_file(rl.loop, reader, spec);
+    CHECK_EQ(result.harness.outcome, harness::Outcome::Mismatched);
+    CHECK_EQ(result.harness.cleanup, harness::CleanupOutcome::Clean);
+    CHECK_EQ(result.replay.total, 2u);
+    CHECK_EQ(result.replay.skipped, 1u);
+    CHECK_EQ(result.replay.replayed, 1u);
+    CHECK_EQ(result.replay.matched, 1u);
+    reader.close();
+}
 
 TEST(route, static_200) {
     RouteConfig cfg;
