@@ -1538,6 +1538,9 @@ inline bool collect_effective_response_headers(const jit::HandlerCtx* response_c
         if (response_ctx->captured_response_header_count > capacity) return false;
         for (u32 i = 0; i < response_ctx->captured_response_header_count; i++) {
             const auto& header = response_ctx->captured_response_headers[i];
+            if (response_ctx->response_body_mutation_set &&
+                http_header_name_eq_ci(header.name.ptr, header.name.len, "content-encoding", 16))
+                continue;
             out[(*out_count)++] = {
                 header.name.ptr, header.name.len, header.value.ptr, header.value.len};
         }

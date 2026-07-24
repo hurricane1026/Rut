@@ -17033,6 +17033,22 @@ TEST(response_headers, dynamic_mutations_merge_with_static_headers_in_order) {
         &ctx, &cfg, 1, out, static_cast<u32>(std::size(out)), &count));
 }
 
+TEST(response_headers, captured_body_replacement_drops_content_encoding) {
+    jit::HandlerCtx ctx{};
+    ctx.captured_response_valid = true;
+    ctx.response_body_mutation_set = true;
+    ctx.captured_response_headers[0] = {{"Content-Encoding", 16}, {"gzip", 4}};
+    ctx.captured_response_headers[1] = {{"Content-Type", 12}, {"text/plain", 10}};
+    ctx.captured_response_header_count = 2;
+
+    ResponseHeaderKV out[jit::kMaxCapturedResponseHeaders];
+    u32 count = 0;
+    REQUIRE(collect_effective_response_headers(
+        &ctx, nullptr, 0, out, static_cast<u32>(std::size(out)), &count));
+    REQUIRE_EQ(count, 1u);
+    CHECK((Str{out[0].key_data, out[0].key_len}.eq(Str{"Content-Type", 12})));
+}
+
 TEST(response_body, mutation_storage_is_released_after_http1_serialization) {
     SmallLoop loop;
     loop.setup();

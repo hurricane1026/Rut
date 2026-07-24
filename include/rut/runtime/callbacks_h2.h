@@ -472,6 +472,9 @@ void h2_emit_outcome(H2Dispatch<Loop>& d,
     // Header values are non-owning Str views and are encoded only after the
     // list is complete, so storage synthesized below must span the emit call.
     char content_length[10];
+    static constexpr u32 kCapturedNameStorageBytes = 8192;
+    char captured_name_storage[kCapturedNameStorageBytes];
+    u32 captured_name_cursor = 0;
     u32 nhdrs = 0;
     if (o.uses_captured_response && o.response_ctx != nullptr &&
         o.response_ctx->captured_response_valid) {
@@ -481,8 +484,21 @@ void h2_emit_outcome(H2Dispatch<Loop>& d,
                 http_header_name_eq_ci(
                     header.name.ptr, header.name.len, "content-length", 14))
                 continue;
+            if (o.response_ctx->response_body_mutation_set &&
+                http_header_name_eq_ci(header.name.ptr, header.name.len, "content-encoding", 16))
+                continue;
             if (h2_is_prohibited_response_header(header.name.ptr, header.name.len)) continue;
-            hdrs[nhdrs].name = header.name;
+            if (header.name.len > kCapturedNameStorageBytes - captured_name_cursor) {
+                h2_emit_status(d, stream_id, 500);
+                return;
+            }
+            char* lowercase_name = captured_name_storage + captured_name_cursor;
+            for (u32 ni = 0; ni < header.name.len; ni++) {
+                const char c = header.name.ptr[ni];
+                lowercase_name[ni] = c >= 'A' && c <= 'Z' ? static_cast<char>(c + ('a' - 'A')) : c;
+            }
+            captured_name_cursor += header.name.len;
+            hdrs[nhdrs].name = {lowercase_name, header.name.len};
             hdrs[nhdrs].value = header.value;
             nhdrs++;
         }

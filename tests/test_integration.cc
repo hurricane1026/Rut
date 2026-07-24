@@ -10664,6 +10664,7 @@ TEST(shard, buffered_forward_expression_owns_fields_across_yield_over_http1) {
     static const char kResp[] =
         "HTTP/1.1 206 Partial Content\r\n"
         "Transfer-Encoding: chunked\r\n"
+        "Content-Encoding: gzip\r\n"
         "X-Origin: kept\r\n"
         "Connection: close\r\n"
         "\r\n"
@@ -10701,6 +10702,7 @@ TEST(shard, buffered_forward_expression_owns_fields_across_yield_over_http1) {
     CHECK(buf_contains(response, total, "Content-Length: 8\r\n", 19));
     CHECK(buf_contains(response, total, "X-Origin: kept\r\n", 16));
     CHECK(buf_contains(response, total, "X-Captured: kept\r\n", 18));
+    CHECK_FALSE(buf_contains(response, total, "Content-Encoding", 16));
     CHECK(buf_contains(response, total, "\r\n\r\noriginal", 12));
 
     close(client);
@@ -10715,6 +10717,7 @@ TEST(shard, buffered_forward_expression_owns_fields_across_yield_over_http2) {
     static const char kResp[] =
         "HTTP/1.1 206 Partial Content\r\n"
         "Content-Length: 8\r\n"
+        "Content-Encoding: gzip\r\n"
         "X-Origin: kept\r\n"
         "Connection: close\r\n"
         "\r\n"
@@ -10761,6 +10764,7 @@ TEST(shard, buffered_forward_expression_owns_fields_across_yield_over_http2) {
     CHECK(body_len == 8 && __builtin_memcmp(body, "original", 8) == 0);
     CHECK(h2_response_has_header(response, total, 1, "x-origin", "kept"));
     CHECK(h2_response_has_header(response, total, 1, "x-captured", "kept"));
+    CHECK_FALSE(h2_response_has_header(response, total, 1, "content-encoding", "gzip"));
 
     close(client);
     shard.stop();
