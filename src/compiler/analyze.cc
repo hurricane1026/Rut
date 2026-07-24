@@ -3707,6 +3707,9 @@ static FrontendResult<HirExpr> analyze_expr_impl(const AstExpr& expr,
                                                  const MatchPayloadBinding* binding,
                                                  bool allow_array_lit);
 
+static bool hir_expr_reads_response_field(const HirExpr& expr);
+static bool route_appended_response_effect(const HirRoute& route, u32 previous_local_count);
+
 static FrontendResult<HirExpr> analyze_expr_with_expected_array_shape(
     const AstExpr& expr,
     HirRoute* route,
@@ -3780,10 +3783,19 @@ static FrontendResult<HirExpr> analyze_expr_with_expected_array_shape(
     const u32 elem_shape_index = mod.type_shapes[expected_shape_index].array_elem_shape_index;
     if (!hir_type_shape_has_runtime_carrier(mod, elem_shape_index))
         return frontend_error(FrontendError::UnsupportedSyntax, expr.span);
+    bool earlier_element_reads_response = false;
     for (u32 i = 0; i < expr.args.len; i++) {
+        const u32 locals_before_element = route->locals.len;
         auto elem = analyze_expr_with_expected_array_shape(
             *expr.args[i], route, mod, locals, local_count, binding, elem_shape_index);
         if (!elem) return core::make_unexpected(elem.error());
+        if (earlier_element_reads_response &&
+            route_appended_response_effect(*route, locals_before_element))
+            return frontend_error(
+                FrontendError::UnsupportedSyntax,
+                expr.args[i]->span,
+                lit_str("a response-mutating array element cannot follow a Response field read"));
+        earlier_element_reads_response |= hir_expr_reads_response_field(elem.value());
         HirExpr expected_elem{};
         const auto& shape = mod.type_shapes[elem_shape_index];
         expected_elem.type = shape.type;
@@ -4073,6 +4085,8 @@ static FrontendResult<void> build_reusable_json_plan(
     const MatchPayloadBinding* binding,
     u32 depth = 0);
 static bool hir_expr_reads_wait_result(const HirExpr& expr);
+static bool hir_expr_reads_response_field(const HirExpr& expr);
+static bool is_response_effect(HirExprKind kind);
 static bool hir_expr_reads_wait_result_with_locals(const HirExpr& expr,
                                                    const HirLocal* locals,
                                                    u32 local_count,
@@ -4093,6 +4107,16 @@ static FrontendResult<HirExpr> instantiate_function_expr(const HirExpr& expr,
                                                          u32 arg_count,
                                                          const GenericBinding* generic_bindings,
                                                          u32 generic_binding_count);
+static FrontendResult<void> instantiate_function_response_effects(
+    const HirFunction& fn,
+    HirRoute* route,
+    const HirModule& mod,
+    const HirExpr* args,
+    u32 arg_count,
+    const GenericBinding* generic_bindings,
+    u32 generic_binding_count,
+    Span call_span,
+    bool emit_effects = true);
 static FrontendResult<HirExpr> normalize_function_expr(
     const HirExpr& expr,
     HirFunction* fn,
@@ -4316,8 +4340,15 @@ static FrontendResult<HirExpr> analyze_bitwise_namespace_call(const AstExpr& exp
         rhs_expr.span = expr.span;
         rhs_expr.int_value = -1;
     } else {
+        const u32 locals_before_rhs = route->locals.len;
         auto rhs = analyze_arg(*expr.args[1]);
         if (!rhs) return core::make_unexpected(rhs.error());
+        if (hir_expr_reads_response_field(lhs.value()) &&
+            route_appended_response_effect(*route, locals_before_rhs))
+            return frontend_error(
+                FrontendError::UnsupportedSyntax,
+                expr.args[1]->span,
+                lit_str("a response-mutating bitwise operand cannot follow a Response field read"));
         rhs_expr = rhs.value();
     }
     // Same-width rule as arithmetic: both operands i32 or both i64, with a
@@ -4472,8 +4503,22 @@ static FrontendResult<HirExpr> analyze_arith_expr(const AstExpr& expr,
     }
     auto lhs = analyze_expr(*expr.lhs, route, mod, locals, local_count, binding);
     if (!lhs) return core::make_unexpected(lhs.error());
+    const u32 locals_before_rhs = route->locals.len;
     auto rhs = analyze_expr(*expr.rhs, route, mod, locals, local_count, binding);
     if (!rhs) return core::make_unexpected(rhs.error());
+    if (hir_expr_reads_response_field(lhs.value())) {
+        for (u32 li = locals_before_rhs; li < route->locals.len; li++) {
+            const auto kind = route->locals[li].init.kind;
+            if (kind == HirExprKind::RespSetHeader || kind == HirExprKind::RespAddHeader ||
+                kind == HirExprKind::RespRemoveHeader || kind == HirExprKind::RespSetStatus ||
+                kind == HirExprKind::RespSetBody)
+                return frontend_error(
+                    FrontendError::UnsupportedSyntax,
+                    expr.rhs->span,
+                    lit_str("a response-mutating right operand cannot follow a Response field "
+                            "read"));
+        }
+    }
     adopt_int_literal_type(&lhs.value(), &rhs.value());
     const bool int_typed = (lhs->type == HirTypeKind::I32 || lhs->type == HirTypeKind::I64) &&
                            (rhs->type == HirTypeKind::I32 || rhs->type == HirTypeKind::I64);
@@ -4832,8 +4877,10 @@ static FrontendResult<HirExpr> analyze_method_call_expr(
         // continuations re-analyze the receiver themselves (PR #164 round 6).
         const u32 probe_saved_exprs = route->exprs.len;
         const u32 probe_saved_guards = route->guards.len;
+        const u32 probe_saved_locals = route->locals.len;
         auto recv = analyze_expr(*expr.lhs, route, mod, locals, local_count, binding);
         route->guards.len = probe_saved_guards;
+        route->locals.len = probe_saved_locals;
         const auto receiver_has_or_member = [&]() -> bool {
             if (!recv) return false;  // sugar's any() will re-report the error
             // A missing-capable receiver cannot dispatch a real method (the
@@ -5004,8 +5051,19 @@ static FrontendResult<HirExpr> analyze_method_call_expr(
                                expr.name.eq({"le", 2}) || expr.name.eq({"ge", 2});
     if (is_eq_family || is_ord_family) {
         if (expr.args.len != 1) return frontend_error(FrontendError::UnsupportedSyntax, expr.span);
+        const u32 locals_before_rhs = route->locals.len;
         auto rhs = analyze_expr(*expr.args[0], route, mod, locals, local_count, binding);
         if (!rhs) return core::make_unexpected(rhs.error());
+        if (hir_expr_reads_response_field(recv)) {
+            for (u32 li = locals_before_rhs; li < route->locals.len; li++) {
+                if (is_response_effect(route->locals[li].init.kind))
+                    return frontend_error(
+                        FrontendError::UnsupportedSyntax,
+                        expr.args[0]->span,
+                        lit_str("a response-mutating right operand cannot follow a Response field "
+                                "read"));
+            }
+        }
         if (rhs->may_nil || rhs->may_error)
             return frontend_error(FrontendError::UnsupportedSyntax, expr.span);
         adopt_int_literal_type(&recv, &rhs.value());
@@ -5155,10 +5213,29 @@ static FrontendResult<HirExpr> analyze_method_call_expr(
             for (u32 i = 0; i < expr.args.len; i++) {
                 if (i >= matched_req->params.len)
                     return frontend_error(FrontendError::UnsupportedSyntax, expr.span, expr.name);
+                const u32 locals_before_arg = route->locals.len;
                 auto arg = analyze_expr(*expr.args[i], route, mod, locals, local_count, binding);
                 if (!arg) return core::make_unexpected(arg.error());
                 if (arg->may_nil || arg->may_error)
                     return frontend_error(FrontendError::UnsupportedSyntax, expr.args[i]->span);
+                bool appended_response_effect = false;
+                for (u32 li = locals_before_arg; li < route->locals.len; li++) {
+                    const auto kind = route->locals[li].init.kind;
+                    appended_response_effect |=
+                        kind == HirExprKind::RespSetHeader || kind == HirExprKind::RespAddHeader ||
+                        kind == HirExprKind::RespRemoveHeader ||
+                        kind == HirExprKind::RespSetStatus || kind == HirExprKind::RespSetBody;
+                }
+                if (appended_response_effect) {
+                    for (u32 prior = 0; prior < out.args.len; prior++) {
+                        if (!hir_expr_reads_response_field(*out.args[prior])) continue;
+                        return frontend_error(
+                            FrontendError::UnsupportedSyntax,
+                            expr.args[i]->span,
+                            lit_str("response-mutating protocol arguments cannot follow an "
+                                    "earlier Response field read"));
+                    }
+                }
                 HirExpr expected =
                     make_expected_type_expr(matched_req->params[i].type,
                                             matched_req->params[i].variant_index,
@@ -5743,6 +5820,15 @@ static FrontendResult<HirExpr> instantiate_function_expr(const HirExpr& expr,
         }
         if (fn.respond_guards.len != 0)
             return frontend_error(FrontendError::UnsupportedSyntax, expr.span, fn.name);
+        auto response_effects = instantiate_function_response_effects(fn,
+                                                                      route,
+                                                                      mod,
+                                                                      call_args,
+                                                                      call_arg_count,
+                                                                      impl_bindings,
+                                                                      impl_binding_count,
+                                                                      expr.span);
+        if (!response_effects) return core::make_unexpected(response_effects.error());
         auto inlined = instantiate_function_expr(
             fn.body, route, mod, call_args, call_arg_count, impl_bindings, impl_binding_count);
         if (!inlined) return core::make_unexpected(inlined.error());
@@ -5951,6 +6037,149 @@ static FrontendResult<void> instantiate_function_respond_guards(
     return {};
 }
 
+static bool route_reads_response_field(const HirRoute& route);
+
+static bool function_has_response_effects(const HirFunction& fn) {
+    for (u32 ei = 0; ei < fn.exprs.len; ei++) {
+        const auto kind = fn.exprs[ei].kind;
+        if (kind == HirExprKind::RespSetHeader || kind == HirExprKind::RespAddHeader ||
+            kind == HirExprKind::RespRemoveHeader || kind == HirExprKind::RespSetStatus ||
+            kind == HirExprKind::RespSetBody)
+            return true;
+    }
+    return false;
+}
+
+static bool is_response_effect(HirExprKind kind) {
+    return kind == HirExprKind::RespSetHeader || kind == HirExprKind::RespAddHeader ||
+           kind == HirExprKind::RespRemoveHeader || kind == HirExprKind::RespSetStatus ||
+           kind == HirExprKind::RespSetBody;
+}
+
+static bool route_appended_response_effect(const HirRoute& route, u32 previous_local_count) {
+    for (u32 li = previous_local_count; li < route.locals.len; li++)
+        if (is_response_effect(route.locals[li].init.kind)) return true;
+    return false;
+}
+
+static bool hir_expr_reads_response_field_before(const HirExpr& expr, u32 source_offset) {
+    if ((expr.kind == HirExprKind::RespStatus || expr.kind == HirExprKind::RespBody) &&
+        expr.span.start < source_offset)
+        return true;
+    if (expr.lhs != nullptr && hir_expr_reads_response_field_before(*expr.lhs, source_offset))
+        return true;
+    if (expr.rhs != nullptr && hir_expr_reads_response_field_before(*expr.rhs, source_offset))
+        return true;
+    for (u32 i = 0; i < expr.args.len; i++)
+        if (expr.args[i] != nullptr &&
+            hir_expr_reads_response_field_before(*expr.args[i], source_offset))
+            return true;
+    for (u32 i = 0; i < expr.field_inits.len; i++)
+        if (expr.field_inits[i].value != nullptr &&
+            hir_expr_reads_response_field_before(*expr.field_inits[i].value, source_offset))
+            return true;
+    return false;
+}
+
+static FrontendResult<void> instantiate_function_response_effects(
+    const HirFunction& fn,
+    HirRoute* route,
+    const HirModule& mod,
+    const HirExpr* args,
+    u32 arg_count,
+    const GenericBinding* generic_bindings,
+    u32 generic_binding_count,
+    Span call_span,
+    bool emit_effects) {
+    if (route == nullptr) return frontend_error(FrontendError::UnsupportedSyntax, call_span);
+    if (!function_has_response_effects(fn)) return {};
+    if (!route->allow_response_effects)
+        return frontend_error(
+            FrontendError::UnsupportedSyntax,
+            call_span,
+            lit_str("response-mutating helper calls are not supported in conditional branches"));
+    for (u32 ei = 0; ei < fn.exprs.len; ei++) {
+        if (fn.exprs[ei].kind != HirExprKind::RespSetStatus &&
+            fn.exprs[ei].kind != HirExprKind::RespSetBody)
+            continue;
+        if (hir_expr_reads_response_field_before(fn.body, fn.exprs[ei].span.start))
+            return frontend_error(
+                FrontendError::UnsupportedSyntax,
+                call_span,
+                lit_str("helper Response assignments cannot follow a captured Response field "
+                        "read"));
+        for (u32 later = 0; later < fn.exprs.len; later++) {
+            if (!is_response_effect(fn.exprs[later].kind) ||
+                fn.exprs[later].span.start <= fn.exprs[ei].span.start)
+                continue;
+            if (hir_expr_reads_response_field_before(fn.exprs[later], fn.exprs[ei].span.start))
+                return frontend_error(
+                    FrontendError::UnsupportedSyntax,
+                    call_span,
+                    lit_str("helper Response assignments cannot follow a captured Response field "
+                            "read"));
+        }
+    }
+    if (fn.owns_response_builder) {
+        for (u32 li = 0; li < route->locals.len; li++) {
+            if (route->locals[li].init.kind == HirExprKind::ResponseInit ||
+                route->locals[li].name.eq(lit_str("$helper_owned_response_effect")))
+                return frontend_error(
+                    FrontendError::UnsupportedSyntax,
+                    call_span,
+                    lit_str("a helper-local Response builder cannot mutate caller Response state"));
+        }
+    }
+    if (route_reads_response_field(*route))
+        return frontend_error(
+            FrontendError::UnsupportedSyntax,
+            call_span,
+            lit_str("response-mutating helpers cannot follow a response field read"));
+    if (!fn.owns_response_builder) {
+        u32 response_builder_count = 0;
+        for (u32 li = 0; li < route->locals.len; li++)
+            response_builder_count += route->locals[li].init.kind == HirExprKind::ResponseInit;
+        if (response_builder_count != 1)
+            return frontend_error(
+                FrontendError::UnsupportedSyntax,
+                call_span,
+                lit_str("response-mutating helpers require exactly one Response builder in the "
+                        "route"));
+        for (u32 pi = 0; pi < fn.params.len && pi < arg_count; pi++) {
+            if (fn.params[pi].type != HirTypeKind::Response ||
+                args[pi].kind != HirExprKind::LocalRef)
+                continue;
+            for (u32 li = route->locals.len; li > 0; li--) {
+                auto& local = route->locals[li - 1];
+                if (local.ref_index != args[pi].local_index) continue;
+                if (local.init.kind == HirExprKind::ResponseInit) local.init.bool_value = true;
+                break;
+            }
+        }
+    }
+    if (!emit_effects) return {};
+    for (u32 ei = 0; ei < fn.exprs.len; ei++) {
+        const auto kind = fn.exprs[ei].kind;
+        if (kind != HirExprKind::RespSetHeader && kind != HirExprKind::RespAddHeader &&
+            kind != HirExprKind::RespRemoveHeader && kind != HirExprKind::RespSetStatus &&
+            kind != HirExprKind::RespSetBody)
+            continue;
+        auto effect = instantiate_function_expr(
+            fn.exprs[ei], route, mod, args, arg_count, generic_bindings, generic_binding_count);
+        if (!effect) return core::make_unexpected(effect.error());
+        effect->span = call_span;
+        HirLocal carrier{};
+        carrier.span = call_span;
+        if (fn.owns_response_builder) carrier.name = lit_str("$helper_owned_response_effect");
+        carrier.ref_index = next_local_ref_index(route, route->locals.data, route->locals.len);
+        carrier.type = effect->type;
+        carrier.init = effect.value();
+        if (!route->locals.push(carrier))
+            return frontend_error(FrontendError::TooManyItems, call_span);
+    }
+    return {};
+}
+
 static FrontendResult<HirExpr> normalize_function_expr(const HirExpr& expr,
                                                        HirFunction* fn,
                                                        const HirLocal* locals,
@@ -6093,6 +6322,19 @@ static bool collect_function_response_effects(HirFunction* fn,
             return false;
     }
     return true;
+}
+
+static bool function_has_response_effect_after_guard(const HirRoute& scratch, Span* effect_span) {
+    for (u32 li = 0; li < scratch.locals.len; li++) {
+        const auto& local = scratch.locals[li];
+        if (!is_response_effect(local.init.kind)) continue;
+        for (u32 gi = 0; gi < scratch.guards.len; gi++) {
+            if (local.span.start <= scratch.guards[gi].span.start) continue;
+            if (effect_span != nullptr) *effect_span = local.span;
+            return true;
+        }
+    }
+    return false;
 }
 
 static FrontendResult<HirExpr> analyze_function_body_stmt(const AstStatement& stmt,
@@ -6319,10 +6561,13 @@ static FrontendResult<HirExpr> analyze_function_body_stmt(const AstStatement& st
             return analyze_expr_impl(
                 expr, scratch, mod, cur_locals, cur_local_count, cur_binding, true);
         const bool saved_allow_respond_effects = scratch->allow_respond_effects;
+        const bool saved_allow_response_effects = scratch->allow_response_effects;
         scratch->allow_respond_effects = false;
+        scratch->allow_response_effects = false;
         auto result =
             analyze_expr_impl(expr, scratch, mod, cur_locals, cur_local_count, cur_binding, true);
         scratch->allow_respond_effects = saved_allow_respond_effects;
+        scratch->allow_response_effects = saved_allow_response_effects;
         return result;
     };
 
@@ -6331,10 +6576,13 @@ static FrontendResult<HirExpr> analyze_function_body_stmt(const AstStatement& st
                                               const HirLocal* cur_locals,
                                               u32 cur_local_count) -> FrontendResult<HirExpr> {
         const bool saved_allow_respond_effects = scratch->allow_respond_effects;
+        const bool saved_allow_response_effects = scratch->allow_response_effects;
         scratch->allow_respond_effects = false;
+        scratch->allow_response_effects = false;
         auto result = analyze_match_pattern(
             pattern_expr, subject_expr, scratch, mod, cur_locals, cur_local_count);
         scratch->allow_respond_effects = saved_allow_respond_effects;
+        scratch->allow_response_effects = saved_allow_response_effects;
         return result;
     };
 
@@ -6718,10 +6966,13 @@ static FrontendResult<HirExpr> analyze_function_body_stmt(const AstStatement& st
                 if (arm.guard == nullptr)
                     return frontend_error(FrontendError::UnsupportedSyntax, arm.span);
                 const bool saved_allow_respond_effects = scratch->allow_respond_effects;
+                const bool saved_allow_response_effects = scratch->allow_response_effects;
                 scratch->allow_respond_effects = false;
+                scratch->allow_response_effects = false;
                 auto guard =
                     analyze_expr(*arm.guard, scratch, mod, locals, local_count, arm_binding_ptr);
                 scratch->allow_respond_effects = saved_allow_respond_effects;
+                scratch->allow_response_effects = saved_allow_response_effects;
                 if (!guard) return core::make_unexpected(guard.error());
                 if (guard->type != HirTypeKind::Bool || guard->may_nil || guard->may_error)
                     return frontend_error(FrontendError::UnsupportedSyntax, arm.guard->span);
@@ -6781,10 +7032,13 @@ static FrontendResult<HirExpr> analyze_function_body_stmt(const AstStatement& st
                     return analyze_expr_impl(
                         expr, scratch, mod, expr_locals, expr_local_count, expr_binding, true);
                 const bool saved_allow_respond_effects = scratch->allow_respond_effects;
+                const bool saved_allow_response_effects = scratch->allow_response_effects;
                 scratch->allow_respond_effects = false;
+                scratch->allow_response_effects = false;
                 auto result = analyze_expr_impl(
                     expr, scratch, mod, expr_locals, expr_local_count, expr_binding, true);
                 scratch->allow_respond_effects = saved_allow_respond_effects;
+                scratch->allow_response_effects = saved_allow_response_effects;
                 return result;
             };
             const auto& inner = *stmt.block_stmts[si];
@@ -6846,6 +7100,24 @@ static FrontendResult<HirExpr> analyze_function_body_stmt(const AstStatement& st
                 if (effect->kind != HirExprKind::RespSetStatus &&
                     effect->kind != HirExprKind::RespSetBody)
                     return frontend_error(FrontendError::UnsupportedSyntax, inner.span);
+                HirLocal next_locals[HirRoute::kMaxLocals]{};
+                for (u32 i = 0; i < cur_local_count; i++) next_locals[i] = cur_locals[i];
+                if (inner.expr.lhs != nullptr && inner.expr.lhs->lhs != nullptr) {
+                    for (u32 li = cur_local_count; li > 0; li--) {
+                        if (!next_locals[li - 1].name.eq(inner.expr.lhs->lhs->name)) continue;
+                        if (next_locals[li - 1].init.kind == HirExprKind::ResponseInit) {
+                            next_locals[li - 1].init.bool_value = true;
+                            for (u32 ri = scratch->locals.len; ri > 0; ri--) {
+                                if (scratch->locals[ri - 1].ref_index ==
+                                    next_locals[li - 1].ref_index) {
+                                    scratch->locals[ri - 1].init.bool_value = true;
+                                    break;
+                                }
+                            }
+                        }
+                        break;
+                    }
+                }
                 HirLocal carrier{};
                 carrier.span = inner.span;
                 carrier.ref_index = next_local_ref_index(scratch, cur_locals, cur_local_count);
@@ -6853,7 +7125,7 @@ static FrontendResult<HirExpr> analyze_function_body_stmt(const AstStatement& st
                 carrier.init = effect.value();
                 if (!scratch->locals.push(carrier))
                     return frontend_error(FrontendError::TooManyItems, inner.span);
-                return self(self, si + 1, cur_locals, cur_local_count, cur_allow_respond_guards);
+                return self(self, si + 1, next_locals, cur_local_count, cur_allow_respond_guards);
             }
             if (inner.kind == AstStmtKind::Expr && !is_last &&
                 inner.expr.kind == AstExprKind::MethodCall && inner.expr.lhs != nullptr &&
@@ -7696,6 +7968,7 @@ static FrontendResult<HirExpr> analyze_expr_impl(const AstExpr& expr,
                     }
                     const u32 saved_expr_count = route->exprs.len;
                     const u32 saved_guard_count = route->guards.len;
+                    const u32 saved_local_count = route->locals.len;
                     auto field_value = [&]() -> FrontendResult<HirExpr> {
                         const auto& value_ast = *expr.field_inits[fi].value;
                         if (((value_ast.kind == AstExprKind::ArrayLit &&
@@ -7717,6 +7990,7 @@ static FrontendResult<HirExpr> analyze_expr_impl(const AstExpr& expr,
                     }();
                     route->exprs.len = saved_expr_count;
                     route->guards.len = saved_guard_count;
+                    route->locals.len = saved_local_count;
                     if (!field_value) return core::make_unexpected(field_value.error());
                     if (field_value->may_nil || field_value->may_error)
                         return frontend_error(FrontendError::UnsupportedSyntax,
@@ -7801,6 +8075,7 @@ static FrontendResult<HirExpr> analyze_expr_impl(const AstExpr& expr,
                                                   expr.span);
         if (!struct_shape) return core::make_unexpected(struct_shape.error());
         out.shape_index = struct_shape.value();
+        bool earlier_field_reads_response = false;
         for (u32 fi = 0; fi < expr.field_inits.len; fi++) {
             for (u32 seen = 0; seen < fi; seen++) {
                 if (expr.field_inits[seen].name.eq(expr.field_inits[fi].name))
@@ -7819,6 +8094,7 @@ static FrontendResult<HirExpr> analyze_expr_impl(const AstExpr& expr,
                 return frontend_error(
                     FrontendError::UnsupportedSyntax, expr.span, expr.field_inits[fi].name);
             const auto& field_decl = mod.structs[concrete_struct_index].fields[field_index];
+            const u32 locals_before_field = route->locals.len;
             auto field_value = [&]() -> FrontendResult<HirExpr> {
                 const auto& value_ast = *expr.field_inits[fi].value;
                 if (((value_ast.kind == AstExprKind::ArrayLit &&
@@ -7837,6 +8113,17 @@ static FrontendResult<HirExpr> analyze_expr_impl(const AstExpr& expr,
                 return analyze_expr_impl(value_ast, route, mod, locals, local_count, binding, true);
             }();
             if (!field_value) return core::make_unexpected(field_value.error());
+            if (earlier_field_reads_response) {
+                for (u32 li = locals_before_field; li < route->locals.len; li++) {
+                    if (is_response_effect(route->locals[li].init.kind))
+                        return frontend_error(
+                            FrontendError::UnsupportedSyntax,
+                            expr.field_inits[fi].value->span,
+                            lit_str("a response-mutating struct field cannot follow a Response "
+                                    "field read"));
+                }
+            }
+            earlier_field_reads_response |= hir_expr_reads_response_field(field_value.value());
             if (field_value->may_nil || field_value->may_error)
                 return frontend_error(FrontendError::UnsupportedSyntax,
                                       expr.field_inits[fi].value->span);
@@ -7870,6 +8157,54 @@ static FrontendResult<HirExpr> analyze_expr_impl(const AstExpr& expr,
     }
     if (expr.kind == AstExprKind::MethodCall) {
         return analyze_method_call_expr(expr, route, mod, locals, local_count, binding);
+    }
+    // Handler-local Response builders have a compile-time initial status/body
+    // plus a request-owned pending mutation log. Reads before the first runtime
+    // mutation fold to that initial value; later reads query the log with the
+    // same initial value as their fallback. A Response parameter (for example
+    // in `chain after`) has no concrete upstream/body carrier yet and must not
+    // be fabricated from the response(0) analysis placeholder.
+    if (expr.kind == AstExprKind::Field && expr.lhs != nullptr &&
+        expr.lhs->kind == AstExprKind::Ident) {
+        const HirLocal* response = nullptr;
+        for (u32 li = local_count; li > 0; li--) {
+            if (!locals[li - 1].name.eq(expr.lhs->name)) continue;
+            if (locals[li - 1].type == HirTypeKind::Response) response = &locals[li - 1];
+            break;
+        }
+        if (response != nullptr) {
+            const bool read_status = expr.name.eq({"status", 6});
+            const bool read_body = expr.name.eq({"body", 4});
+            if (!read_status && !read_body)
+                return frontend_error(FrontendError::UnsupportedSyntax,
+                                      expr.span,
+                                      lit_str("Response readable fields are status and body"));
+            if (response->init.kind != HirExprKind::ResponseInit ||
+                response->init.int_value < 100 || response->init.int_value > 599)
+                return frontend_error(
+                    FrontendError::UnsupportedSyntax,
+                    expr.span,
+                    lit_str("runtime Response field reads require explicit buffered forwarding"));
+
+            HirExpr fallback{};
+            fallback.span = expr.span;
+            if (read_status) {
+                fallback.kind = HirExprKind::IntLit;
+                fallback.type = HirTypeKind::I32;
+                fallback.int_value = response->init.int_value;
+            } else {
+                fallback.kind = HirExprKind::StrLit;
+                fallback.type = HirTypeKind::Str;
+                fallback.str_value = {"", 0};
+            }
+            if (!response->init.bool_value) return fallback;
+            if (!route->exprs.push(fallback))
+                return frontend_error(FrontendError::TooManyItems, expr.span);
+            out.kind = read_status ? HirExprKind::RespStatus : HirExprKind::RespBody;
+            out.type = read_status ? HirTypeKind::I32 : HirTypeKind::Str;
+            out.lhs = &route->exprs[route->exprs.len - 1];
+            return out;
+        }
     }
     if (expr.kind == AstExprKind::Field && expr.lhs != nullptr &&
         expr.lhs->kind == AstExprKind::Ident && expr.lhs->name.eq({"req", 3})) {
@@ -8351,10 +8686,20 @@ static FrontendResult<HirExpr> analyze_expr_impl(const AstExpr& expr,
         // uniformity across the array and (b) intern the element shape.
         HirExpr first_elem_snapshot{};
         u32 first_elem_shape_index = 0xffffffffu;
+        bool earlier_element_reads_response = false;
         for (u32 i = 0; i < expr.args.len; i++) {
+            const u32 locals_before_element = route->locals.len;
             auto elem =
                 analyze_expr_impl(*expr.args[i], route, mod, locals, local_count, binding, true);
             if (!elem) return core::make_unexpected(elem.error());
+            if (earlier_element_reads_response &&
+                route_appended_response_effect(*route, locals_before_element))
+                return frontend_error(
+                    FrontendError::UnsupportedSyntax,
+                    expr.args[i]->span,
+                    lit_str(
+                        "a response-mutating array element cannot follow a Response field read"));
+            earlier_element_reads_response |= hir_expr_reads_response_field(elem.value());
             // Reject element kinds that need contextual inference or union
             // widening. Tuple elements are allowed: their shape_index carries
             // slot metadata and same_hir_type_shape enforces homogeneous
@@ -8418,10 +8763,20 @@ static FrontendResult<HirExpr> analyze_expr_impl(const AstExpr& expr,
         out.type = HirTypeKind::Tuple;
         out.tuple_len = expr.args.len;
         u32 tuple_elem_shape_indices[kMaxTupleSlots]{};
+        bool earlier_element_reads_response = false;
         for (u32 i = 0; i < expr.args.len; i++) {
+            const u32 locals_before_element = route->locals.len;
             auto elem =
                 analyze_expr_impl(*expr.args[i], route, mod, locals, local_count, binding, true);
             if (!elem) return core::make_unexpected(elem.error());
+            if (earlier_element_reads_response &&
+                route_appended_response_effect(*route, locals_before_element))
+                return frontend_error(
+                    FrontendError::UnsupportedSyntax,
+                    expr.args[i]->span,
+                    lit_str(
+                        "a response-mutating tuple element cannot follow a Response field read"));
+            earlier_element_reads_response |= hir_expr_reads_response_field(elem.value());
             if (elem->may_nil || elem->may_error || elem->type == HirTypeKind::Unknown ||
                 elem->type == HirTypeKind::Tuple)
                 return frontend_error(FrontendError::UnsupportedSyntax, expr.args[i]->span);
@@ -8640,9 +8995,12 @@ static FrontendResult<HirExpr> analyze_expr_impl(const AstExpr& expr,
         if (route == nullptr)
             return analyze_expr(operand, route, mod, locals, local_count, binding);
         const bool saved_allow_respond_effects = route->allow_respond_effects;
+        const bool saved_allow_response_effects = route->allow_response_effects;
         route->allow_respond_effects = false;
+        route->allow_response_effects = false;
         auto result = analyze_expr(operand, route, mod, locals, local_count, binding);
         route->allow_respond_effects = saved_allow_respond_effects;
+        route->allow_response_effects = saved_allow_response_effects;
         return result;
     };
     if (expr.kind == AstExprKind::Or) {
@@ -8895,18 +9253,24 @@ static FrontendResult<HirExpr> analyze_expr_impl(const AstExpr& expr,
             const auto analyze_conditional_method_stage_expr =
                 [&](const AstExpr& stage_expr) -> FrontendResult<HirExpr> {
                 const bool saved_allow_respond_effects = route->allow_respond_effects;
+                const bool saved_allow_response_effects = route->allow_response_effects;
                 route->allow_respond_effects = false;
+                route->allow_response_effects = false;
                 auto result = analyze_expr(stage_expr, route, mod, locals, local_count, binding);
                 route->allow_respond_effects = saved_allow_respond_effects;
+                route->allow_response_effects = saved_allow_response_effects;
                 return result;
             };
             const auto analyze_conditional_method_stage_call =
                 [&](const HirExpr& recv) -> FrontendResult<HirExpr> {
                 const bool saved_allow_respond_effects = route->allow_respond_effects;
+                const bool saved_allow_response_effects = route->allow_response_effects;
                 route->allow_respond_effects = false;
+                route->allow_response_effects = false;
                 auto result = analyze_method_call_expr(
                     method_stage, route, mod, locals, local_count, binding, &recv);
                 route->allow_respond_effects = saved_allow_respond_effects;
+                route->allow_response_effects = saved_allow_response_effects;
                 return result;
             };
             auto shape_only_result = [](HirExpr value) {
@@ -9142,8 +9506,22 @@ static FrontendResult<HirExpr> analyze_expr_impl(const AstExpr& expr,
         expr.kind == AstExprKind::Gt) {
         auto lhs = analyze_expr(*expr.lhs, route, mod, locals, local_count, binding);
         if (!lhs) return core::make_unexpected(lhs.error());
+        const u32 locals_before_rhs = route->locals.len;
         auto rhs = analyze_expr(*expr.rhs, route, mod, locals, local_count, binding);
         if (!rhs) return core::make_unexpected(rhs.error());
+        if (hir_expr_reads_response_field(lhs.value())) {
+            for (u32 li = locals_before_rhs; li < route->locals.len; li++) {
+                const auto kind = route->locals[li].init.kind;
+                if (kind == HirExprKind::RespSetHeader || kind == HirExprKind::RespAddHeader ||
+                    kind == HirExprKind::RespRemoveHeader || kind == HirExprKind::RespSetStatus ||
+                    kind == HirExprKind::RespSetBody)
+                    return frontend_error(
+                        FrontendError::UnsupportedSyntax,
+                        expr.rhs->span,
+                        lit_str("a response-mutating right operand cannot follow a Response "
+                                "field read"));
+            }
+        }
         adopt_int_literal_type(&lhs.value(), &rhs.value());
         if (lhs->type == HirTypeKind::Json || rhs->type == HirTypeKind::Json)
             return frontend_error(
@@ -9739,8 +10117,16 @@ static FrontendResult<HirExpr> analyze_call_expr(const AstExpr& expr,
         }
         auto lhs = analyze_builtin_arg(*expr.args[0]);
         if (!lhs) return core::make_unexpected(lhs.error());
+        const u32 locals_before_rhs = route->locals.len;
         auto rhs = analyze_builtin_arg(*expr.args[1]);
         if (!rhs) return core::make_unexpected(rhs.error());
+        if (hir_expr_reads_response_field(lhs.value()) &&
+            route_appended_response_effect(*route, locals_before_rhs))
+            return frontend_error(
+                FrontendError::UnsupportedSyntax,
+                expr.args[1]->span,
+                lit_str(
+                    "a response-mutating fallback operand cannot follow a Response field read"));
         *out_lhs = lhs.value();
         *out_rhs = rhs.value();
         return {};
@@ -10150,8 +10536,16 @@ static FrontendResult<HirExpr> analyze_call_expr(const AstExpr& expr,
                 return frontend_error(FrontendError::UnsupportedSyntax, expr.span, kMinMaxDetail);
             auto lhs = analyze_builtin_arg(*expr.args[0]);
             if (!lhs) return core::make_unexpected(lhs.error());
+            const u32 locals_before_rhs = route->locals.len;
             auto rhs = analyze_builtin_arg(*expr.args[1]);
             if (!rhs) return core::make_unexpected(rhs.error());
+            if (hir_expr_reads_response_field(lhs.value()) &&
+                route_appended_response_effect(*route, locals_before_rhs))
+                return frontend_error(
+                    FrontendError::UnsupportedSyntax,
+                    expr.args[1]->span,
+                    lit_str(
+                        "a response-mutating min/max operand cannot follow a Response field read"));
             adopt_int_literal_type(&lhs.value(), &rhs.value());
             const bool int_typed =
                 (lhs->type == HirTypeKind::I32 || lhs->type == HirTypeKind::I64) &&
@@ -10655,10 +11049,13 @@ static FrontendResult<HirExpr> analyze_call_expr(const AstExpr& expr,
             const auto analyze_conditional_pipe_stage_arg =
                 [&](const AstExpr& arg_expr) -> FrontendResult<HirExpr> {
                 const bool saved_allow_respond_effects = route->allow_respond_effects;
+                const bool saved_allow_response_effects = route->allow_response_effects;
                 route->allow_respond_effects = false;
+                route->allow_response_effects = false;
                 auto result =
                     analyze_expr_impl(arg_expr, route, mod, locals, local_count, binding, true);
                 route->allow_respond_effects = saved_allow_respond_effects;
+                route->allow_response_effects = saved_allow_response_effects;
                 return result;
             };
             for (u32 i = 0; i < expr.args.len; i++) {
@@ -10691,6 +11088,10 @@ static FrontendResult<HirExpr> analyze_call_expr(const AstExpr& expr,
                     expr.span,
                     "respond-capable helper calls are not supported in conditional pipe",
                     nullptr);
+            if (function_has_response_effects(fn))
+                return fail_call(expr.span,
+                                 "response-mutating helpers are not supported in conditional pipe",
+                                 nullptr);
             auto then_expr = instantiate_function_expr(fn.body,
                                                        route,
                                                        mod,
@@ -10791,6 +11192,7 @@ static FrontendResult<HirExpr> analyze_call_expr(const AstExpr& expr,
     Span respond_guard_span = expr.span;
     for (u32 i = 0; i < expr.args.len; i++) {
         const auto& arg_expr = *expr.args[i];
+        const u32 locals_before_arg = route->locals.len;
         if (arg_expr.span.end > respond_guard_span.start) {
             respond_guard_span.start = arg_expr.span.end;
             if (respond_guard_span.end < respond_guard_span.start)
@@ -10837,6 +11239,24 @@ static FrontendResult<HirExpr> analyze_call_expr(const AstExpr& expr,
             if (arg->may_nil || arg->may_error)
                 return fail_call(expr.args[i]->span, "arg has nil or error", nullptr);
             analyzed_args[param_index] = arg.value();
+        }
+        bool appended_response_effect = false;
+        for (u32 li = locals_before_arg; li < route->locals.len; li++) {
+            const auto kind = route->locals[li].init.kind;
+            appended_response_effect |=
+                kind == HirExprKind::RespSetHeader || kind == HirExprKind::RespAddHeader ||
+                kind == HirExprKind::RespRemoveHeader || kind == HirExprKind::RespSetStatus ||
+                kind == HirExprKind::RespSetBody;
+        }
+        if (appended_response_effect) {
+            for (u32 prior = 0; prior < param_index; prior++) {
+                if (!hir_expr_reads_response_field(analyzed_args[prior])) continue;
+                return frontend_error(
+                    FrontendError::UnsupportedSyntax,
+                    arg_expr.span,
+                    lit_str("response-mutating helper arguments cannot follow an earlier "
+                            "Response field read"));
+            }
         }
         auto checked = check_call_arg(param_index, analyzed_args[param_index], expr.args[i]->span);
         if (!checked) return core::make_unexpected(checked.error());
@@ -10890,12 +11310,29 @@ static FrontendResult<HirExpr> analyze_call_expr(const AstExpr& expr,
     }
     HirExpr instantiated_args[HirRoute::kMaxLocals]{};
     for (u32 i = 0; i < effective_arg_count; i++) instantiated_args[i] = analyzed_args[i];
+    auto response_effects = instantiate_function_response_effects(fn,
+                                                                  route,
+                                                                  mod,
+                                                                  analyzed_args,
+                                                                  effective_arg_count,
+                                                                  generic_bindings,
+                                                                  fn.type_params.len,
+                                                                  expr.span,
+                                                                  false);
+    if (!response_effects) return core::make_unexpected(response_effects.error());
     for (u32 ei = 0; ei < fn.exprs.len; ei++) {
         if (ei >= fn.expr_materialized_local_refs.len)
             return frontend_error(FrontendError::UnsupportedSyntax, expr.span);
         const u32 materialized_ref = fn.expr_materialized_local_refs[ei];
-        if (materialized_ref == 0xffffffffu) continue;
-        if (materialized_ref >= HirRoute::kMaxLocals)
+        const bool materialize_local = materialized_ref != 0xffffffffu;
+        const bool response_effect = is_response_effect(fn.exprs[ei].kind);
+        if (!materialize_local && !response_effect) continue;
+        if (response_effect && route_reads_response_field(*route))
+            return frontend_error(
+                FrontendError::UnsupportedSyntax,
+                expr.span,
+                lit_str("response-mutating helpers cannot follow a response field read"));
+        if (materialize_local && materialized_ref >= HirRoute::kMaxLocals)
             return frontend_error(FrontendError::TooManyItems, expr.span);
         auto instantiated = instantiate_function_expr(fn.exprs[ei],
                                                       route,
@@ -10905,9 +11342,13 @@ static FrontendResult<HirExpr> analyze_call_expr(const AstExpr& expr,
                                                       generic_bindings,
                                                       fn.type_params.len);
         if (!instantiated) return core::make_unexpected(instantiated.error());
+        if (response_effect) instantiated->span = expr.span;
         HirLocal carrier{};
         carrier.span = expr.span;
-        carrier.name = {"$helper_local", 13};
+        if (materialize_local)
+            carrier.name = {"$helper_local", 13};
+        else if (fn.owns_response_builder)
+            carrier.name = lit_str("$helper_owned_response_effect");
         carrier.ref_index = next_local_ref_index(route, route->locals.data, route->locals.len);
         if (carrier.ref_index >= HirRoute::kMaxLocals)
             return frontend_error(FrontendError::TooManyItems, expr.span);
@@ -10926,12 +11367,14 @@ static FrontendResult<HirExpr> analyze_call_expr(const AstExpr& expr,
         carrier.init = instantiated.value();
         if (!route->locals.push(carrier))
             return frontend_error(FrontendError::TooManyItems, expr.span);
-        HirExpr ref{};
-        ref.kind = HirExprKind::LocalRef;
-        ref.span = expr.span;
-        ref.local_index = carrier.ref_index;
-        copy_hir_shape(&ref, instantiated.value());
-        instantiated_args[materialized_ref] = ref;
+        if (materialize_local) {
+            HirExpr ref{};
+            ref.kind = HirExprKind::LocalRef;
+            ref.span = expr.span;
+            ref.local_index = carrier.ref_index;
+            copy_hir_shape(&ref, instantiated.value());
+            instantiated_args[materialized_ref] = ref;
+        }
     }
     auto respond_guards = instantiate_function_respond_guards(fn,
                                                               route,
@@ -12896,6 +13339,154 @@ static bool hir_expr_reads_wait_result_with_locals(const HirExpr& expr,
             hir_expr_reads_wait_result_with_locals(
                 *expr.field_inits[i].value, locals, local_count, depth + 1))
             return true;
+    return false;
+}
+
+static bool hir_expr_reads_response_field(const HirExpr& expr) {
+    if (expr.kind == HirExprKind::RespStatus || expr.kind == HirExprKind::RespBody ||
+        expr.kind == HirExprKind::RespHeader)
+        return true;
+    if (expr.lhs != nullptr && hir_expr_reads_response_field(*expr.lhs)) return true;
+    if (expr.rhs != nullptr && hir_expr_reads_response_field(*expr.rhs)) return true;
+    for (u32 i = 0; i < expr.args.len; i++)
+        if (expr.args[i] != nullptr && hir_expr_reads_response_field(*expr.args[i])) return true;
+    for (u32 i = 0; i < expr.field_inits.len; i++)
+        if (expr.field_inits[i].value != nullptr &&
+            hir_expr_reads_response_field(*expr.field_inits[i].value))
+            return true;
+    return false;
+}
+
+static bool hir_expr_reads_response_body(const HirExpr& expr) {
+    if (expr.kind == HirExprKind::RespBody) return true;
+    if (expr.lhs != nullptr && hir_expr_reads_response_body(*expr.lhs)) return true;
+    if (expr.rhs != nullptr && hir_expr_reads_response_body(*expr.rhs)) return true;
+    for (u32 i = 0; i < expr.args.len; i++)
+        if (expr.args[i] != nullptr && hir_expr_reads_response_body(*expr.args[i])) return true;
+    for (u32 i = 0; i < expr.field_inits.len; i++)
+        if (expr.field_inits[i].value != nullptr &&
+            hir_expr_reads_response_body(*expr.field_inits[i].value))
+            return true;
+    return false;
+}
+
+static bool hir_expr_conditionally_reads_response_body(const HirExpr& expr) {
+    if (expr.kind == HirExprKind::IfElse &&
+        ((expr.rhs != nullptr && hir_expr_reads_response_body(*expr.rhs)) ||
+         (expr.args.len != 0 && expr.args[0] != nullptr &&
+          hir_expr_reads_response_body(*expr.args[0]))))
+        return true;
+    if (expr.lhs != nullptr && hir_expr_conditionally_reads_response_body(*expr.lhs)) return true;
+    if (expr.rhs != nullptr && hir_expr_conditionally_reads_response_body(*expr.rhs)) return true;
+    for (u32 i = 0; i < expr.args.len; i++)
+        if (expr.args[i] != nullptr && hir_expr_conditionally_reads_response_body(*expr.args[i]))
+            return true;
+    for (u32 i = 0; i < expr.field_inits.len; i++)
+        if (expr.field_inits[i].value != nullptr &&
+            hir_expr_conditionally_reads_response_body(*expr.field_inits[i].value))
+            return true;
+    return false;
+}
+
+static bool route_control_conditionally_reads_response_body(const HirRoute& route) {
+    // Control expressions may point into the route expression arena through
+    // intermediate normalization nodes. Scan the arena as well as the rooted
+    // guard/control trees so those embedded IfElse values cannot escape the
+    // eager-lowering safety check.
+    for (u32 ei = 0; ei < route.exprs.len; ei++)
+        if (hir_expr_conditionally_reads_response_body(route.exprs[ei])) return true;
+    for (u32 gi = 0; gi < route.guards.len; gi++) {
+        const auto& guard = route.guards[gi];
+        if (hir_expr_conditionally_reads_response_body(guard.cond) ||
+            (guard.fail_kind == HirGuard::FailKind::Match &&
+             hir_expr_conditionally_reads_response_body(guard.fail_match_expr)) ||
+            (guard.fail_kind == HirGuard::FailKind::Body &&
+             guard.fail_body.body_kind == HirGuardBody::BodyKind::If &&
+             hir_expr_conditionally_reads_response_body(guard.fail_body.cond)))
+            return true;
+    }
+    const auto& control = route.control;
+    if (control.kind == HirControlKind::If &&
+        hir_expr_conditionally_reads_response_body(control.cond))
+        return true;
+    if (control.kind != HirControlKind::Match) return false;
+    if (hir_expr_conditionally_reads_response_body(control.match_expr)) return true;
+    for (u32 ai = 0; ai < control.match_arms.len; ai++) {
+        const auto& arm = control.match_arms[ai];
+        if (hir_expr_conditionally_reads_response_body(arm.pattern) ||
+            (arm.has_arm_guard && hir_expr_conditionally_reads_response_body(arm.arm_guard)) ||
+            (arm.body_kind == HirMatchArm::BodyKind::If &&
+             hir_expr_conditionally_reads_response_body(arm.cond)))
+            return true;
+        for (u32 gi = 0; gi < arm.guards.len; gi++)
+            if (hir_expr_conditionally_reads_response_body(arm.guards[gi].cond)) return true;
+    }
+    return false;
+}
+
+static bool guard_failure_reads_response_field(const HirGuard& guard) {
+    if (guard.fail_kind == HirGuard::FailKind::Match &&
+        hir_expr_reads_response_field(guard.fail_match_expr))
+        return true;
+    if (guard.fail_kind != HirGuard::FailKind::Body) return false;
+    for (u32 li = 0; li < guard.fail_body.locals.len; li++)
+        if (hir_expr_reads_response_field(guard.fail_body.locals[li].init)) return true;
+    return guard.fail_body.body_kind == HirGuardBody::BodyKind::If &&
+           hir_expr_reads_response_field(guard.fail_body.cond);
+}
+
+static bool hir_for_loop_reads_response_field(const HirForLoop& loop) {
+    if (hir_expr_reads_response_field(loop.iter_expr)) return true;
+    const auto& body = loop.body;
+    for (u32 li = 0; li < body.locals.len; li++)
+        if (hir_expr_reads_response_field(body.locals[li].init)) return true;
+    for (u32 gi = 0; gi < body.guards.len; gi++)
+        if (hir_expr_reads_response_field(body.guards[gi].cond) ||
+            guard_failure_reads_response_field(body.guards[gi]))
+            return true;
+    for (u32 ii = 0; ii < body.ifs.len; ii++)
+        if (hir_expr_reads_response_field(body.ifs[ii].cond)) return true;
+    for (u32 mi = 0; mi < body.matches.len; mi++) {
+        const auto& match = body.matches[mi];
+        if (hir_expr_reads_response_field(match.match_expr)) return true;
+        for (u32 ai = 0; ai < match.arms.len; ai++) {
+            const auto& arm = match.arms[ai];
+            if (arm.has_arm_guard && hir_expr_reads_response_field(arm.arm_guard)) return true;
+            if (hir_expr_reads_response_field(arm.cond)) return true;
+            for (u32 li = 0; li < arm.locals.len; li++)
+                if (hir_expr_reads_response_field(arm.locals[li].init)) return true;
+            for (u32 gi = 0; gi < arm.guards.len; gi++)
+                if (hir_expr_reads_response_field(arm.guards[gi].cond) ||
+                    guard_failure_reads_response_field(arm.guards[gi]))
+                    return true;
+        }
+    }
+    return false;
+}
+
+static bool route_reads_response_field(const HirRoute& route) {
+    for (u32 gi = 0; gi < route.guards.len; gi++) {
+        if (hir_expr_reads_response_field(route.guards[gi].cond) ||
+            guard_failure_reads_response_field(route.guards[gi]))
+            return true;
+    }
+    for (u32 fi = 0; fi < route.for_loops.len; fi++)
+        if (hir_for_loop_reads_response_field(route.for_loops[fi])) return true;
+    const auto& control = route.control;
+    if (control.kind == HirControlKind::If) return hir_expr_reads_response_field(control.cond);
+    if (control.kind != HirControlKind::Match) return false;
+    if (hir_expr_reads_response_field(control.match_expr)) return true;
+    for (u32 ai = 0; ai < control.match_arms.len; ai++) {
+        const auto& arm = control.match_arms[ai];
+        if (hir_expr_reads_response_field(arm.pattern) ||
+            (arm.has_arm_guard && hir_expr_reads_response_field(arm.arm_guard)) ||
+            (arm.body_kind == HirMatchArm::BodyKind::If && hir_expr_reads_response_field(arm.cond)))
+            return true;
+        for (u32 gi = 0; gi < arm.guards.len; gi++)
+            if (hir_expr_reads_response_field(arm.guards[gi].cond) ||
+                guard_failure_reads_response_field(arm.guards[gi]))
+                return true;
+    }
     return false;
 }
 
@@ -15592,10 +16183,13 @@ static FrontendResult<u32> analyze_for_stmt(const AstStatement& stmt,
             lit_str("static for-loop iterator must be a compile-time array literal or alias"));
 
     const bool saved_allow_respond_effects = route->allow_respond_effects;
+    const bool saved_allow_response_effects = route->allow_response_effects;
     route->allow_respond_effects = false;
+    route->allow_response_effects = false;
     auto iter =
         analyze_array_iter_expr(stmt.expr, route, mod, route->locals.data, route->locals.len);
     route->allow_respond_effects = saved_allow_respond_effects;
+    route->allow_response_effects = saved_allow_response_effects;
     if (!iter) return core::make_unexpected(iter.error());
     if (iter->type != HirTypeKind::Array || iter->shape_index >= mod.type_shapes.len)
         return frontend_error(FrontendError::UnsupportedSyntax,
@@ -18956,6 +19550,10 @@ static FrontendResult<HirModule*> analyze_file_internal(
         fn.exprs.len = 0;
         fn.expr_materialized_local_refs.len = 0;
         fn.respond_guards.len = 0;
+        for (u32 li = 0; li < scratch->locals.len; li++)
+            fn.owns_response_builder |=
+                scratch->locals[li].init.kind == HirExprKind::ResponseInit ||
+                scratch->locals[li].name.eq(lit_str("$helper_owned_response_effect"));
         for (u32 gi = 0; gi < scratch->guards.len; gi++) {
             const auto& guard = scratch->guards[gi];
             if (guard.fail_term.has_dynamic_response_body)
@@ -18979,6 +19577,13 @@ static FrontendResult<HirModule*> analyze_file_internal(
             if (!fn.respond_guards.push(respond_guard))
                 return frontend_error(FrontendError::TooManyItems, guard.fail_term.span);
         }
+        Span post_guard_effect_span{};
+        if (function_has_response_effect_after_guard(*scratch, &post_guard_effect_span))
+            return frontend_error(
+                FrontendError::UnsupportedSyntax,
+                post_guard_effect_span,
+                lit_str("response effects after a helper respond guard are not supported; move "
+                        "the effect before the guard"));
         if (!collect_function_response_effects(
                 &fn, *scratch, all_locals, all_local_count, fn.params.len))
             return frontend_error(FrontendError::TooManyItems, ast_func.body->span);
@@ -20592,6 +21197,10 @@ static FrontendResult<HirModule*> analyze_file_internal(
         fn.exprs.len = 0;
         fn.expr_materialized_local_refs.len = 0;
         fn.respond_guards.len = 0;
+        for (u32 li = 0; li < scratch.locals.len; li++)
+            fn.owns_response_builder |=
+                scratch.locals[li].init.kind == HirExprKind::ResponseInit ||
+                scratch.locals[li].name.eq(lit_str("$helper_owned_response_effect"));
         for (u32 gi = 0; gi < scratch.guards.len; gi++) {
             const auto& guard = scratch.guards[gi];
             if (guard.fail_term.has_dynamic_response_body)
@@ -20615,6 +21224,13 @@ static FrontendResult<HirModule*> analyze_file_internal(
             if (!fn.respond_guards.push(respond_guard))
                 return frontend_error(FrontendError::TooManyItems, guard.fail_term.span);
         }
+        Span post_guard_effect_span{};
+        if (function_has_response_effect_after_guard(scratch, &post_guard_effect_span))
+            return frontend_error(
+                FrontendError::UnsupportedSyntax,
+                post_guard_effect_span,
+                lit_str("response effects after a helper respond guard are not supported; move "
+                        "the effect before the guard"));
         if (!collect_function_response_effects(
                 &fn, scratch, all_locals, all_local_count, fn.params.len))
             return frontend_error(FrontendError::TooManyItems, item.func.body->span);
@@ -20883,6 +21499,9 @@ static FrontendResult<HirModule*> analyze_file_internal(
                     fn, &route, mod, args, step.call.args.len, nullptr, 0, use_span);
                 route.allow_respond_effects = saved_allow;
                 if (!expanded) return core::make_unexpected(expanded.error());
+                auto effects = instantiate_function_response_effects(
+                    fn, &route, mod, args, step.call.args.len, nullptr, 0, use_span);
+                if (!effects) return core::make_unexpected(effects.error());
                 return {};
             }
 
@@ -20897,6 +21516,9 @@ static FrontendResult<HirModule*> analyze_file_internal(
                     lit_str("bool chain steps need `else <status>`; only respond-capable "
                             "helpers may omit it"));
 
+            auto effects = instantiate_function_response_effects(
+                fn, &route, mod, args, step.call.args.len, nullptr, 0, use_span);
+            if (!effects) return core::make_unexpected(effects.error());
             auto cond = instantiate_function_expr(
                 fn.body, &route, mod, args, step.call.args.len, nullptr, 0);
             if (!cond) return core::make_unexpected(cond.error());
@@ -21130,6 +21752,12 @@ static FrontendResult<HirModule*> analyze_file_internal(
                     }
                 }
                 if (stmt.expr.kind == AstExprKind::Assign) {
+                    if (route_reads_response_field(route))
+                        return frontend_error(
+                            FrontendError::UnsupportedSyntax,
+                            stmt.span,
+                            lit_str("Response scalar assignments after a guard are not supported; "
+                                    "move the assignment before the guard"));
                     const bool saved_allow_respond_effects = route.allow_respond_effects;
                     route.allow_respond_effects = true;
                     route.response_assignment_stmt_ok = true;
@@ -21338,7 +21966,9 @@ static FrontendResult<HirModule*> analyze_file_internal(
                 const bool used_for_iter =
                     can_be_used_for_iter(can_be_used_for_iter, stmt.name, si + 1);
                 const bool saved_allow_respond_effects = route.allow_respond_effects;
+                const bool saved_allow_response_effects = route.allow_response_effects;
                 route.allow_respond_effects = !used_for_iter;
+                route.allow_response_effects = !used_for_iter;
                 auto init =
                     stmt.expr.kind == AstExprKind::Wait
                         ? analyze_wait_result_expr(stmt.expr, mod)
@@ -21362,6 +21992,7 @@ static FrontendResult<HirModule*> analyze_file_internal(
                                                                route.locals.len,
                                                                nullptr)));
                 route.allow_respond_effects = saved_allow_respond_effects;
+                route.allow_response_effects = saved_allow_response_effects;
                 if (!init) return core::make_unexpected(init.error());
                 if (init->kind == HirExprKind::WaitResult) {
                     if (seen_for)
@@ -21387,6 +22018,14 @@ static FrontendResult<HirModule*> analyze_file_internal(
                         stmt.expr.span,
                         lit_str("Response builders cannot be copied or aliased in this slice"));
                 if (init->kind == HirExprKind::ResponseInit) {
+                    for (u32 li = 0; li < route.locals.len; li++) {
+                        if (route.locals[li].name.eq(lit_str("$helper_owned_response_effect")))
+                            return frontend_error(
+                                FrontendError::UnsupportedSyntax,
+                                stmt.expr.span,
+                                lit_str("a caller Response builder cannot follow mutations from "
+                                        "a helper-local Response builder"));
+                    }
                     for (u32 li = 0; li < route.locals.len; li++) {
                         if (route.locals[li].init.kind == HirExprKind::ResponseInit &&
                             route.locals[li].init.bool_value)
@@ -21599,6 +22238,19 @@ static FrontendResult<HirModule*> analyze_file_internal(
             break;
         }
 
+        for (u32 li = 0; li < route.locals.len; li++) {
+            if (!hir_expr_conditionally_reads_response_body(route.locals[li].init)) continue;
+            return frontend_error(
+                FrontendError::UnsupportedSyntax,
+                route.locals[li].span,
+                lit_str("Response.body reads in conditional value branches are not supported"));
+        }
+        if (route_control_conditionally_reads_response_body(route))
+            return frontend_error(
+                FrontendError::UnsupportedSyntax,
+                route_decl.span,
+                lit_str("Response.body reads in conditional value branches are not supported"));
+
         bool has_chain_after_response_effects = false;
         bool has_chain_after_response_scalar_effects = false;
         for (u32 ci = 0; ci < route_decl.chains.len; ci++) {
@@ -21625,6 +22277,12 @@ static FrontendResult<HirModule*> analyze_file_internal(
         }
         if (has_chain_after_response_effects) {
             if (has_chain_after_response_scalar_effects) {
+                if (route_reads_response_field(route))
+                    return frontend_error(
+                        FrontendError::UnsupportedSyntax,
+                        route_decl.span,
+                        lit_str("chain-after Response scalar effects cannot follow a Response "
+                                "field read"));
                 bool forwards = false;
                 auto check_forward = [&](const HirTerminator& term) {
                     forwards |= term.kind == HirTerminatorKind::ForwardUpstream;
@@ -22146,6 +22804,9 @@ static FrontendResult<HirModule*> analyze_file_internal(
             if (deco_fn.respond_guards.len != 0)
                 return frontend_error(
                     FrontendError::UnsupportedSyntax, ast_deco.span, deco_fn.name);
+            auto effects = instantiate_function_response_effects(
+                deco_fn, &route, mod, deco_args, 1u, nullptr, 0u, ast_deco.span);
+            if (!effects) return core::make_unexpected(effects.error());
             auto inlined =
                 instantiate_function_expr(deco_fn.body, &route, mod, deco_args, 1u, nullptr, 0u);
             if (!inlined) return core::make_unexpected(inlined.error());

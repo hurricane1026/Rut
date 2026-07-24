@@ -7331,6 +7331,490 @@ route GET "/x" use chain rewrite_response {
     rir.destroy();
 }
 
+TEST(frontend, response_status_and_body_reads_fold_initial_values_and_lower_pending_reads) {
+    const char* src = R"rut(
+route GET "/x" {
+    let resp = response(200)
+    let initial_status = resp.status
+    let initial_body = resp.body
+    resp.status = initial_status + 1
+    resp.body = req.path
+    resp.status = resp.status + 1
+    resp.set("X-Seen-Body", resp.body)
+    return resp
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    REQUIRE(hir->routes[0].locals.len >= 3u);
+    CHECK(hir->routes[0].locals[1].init.kind == HirExprKind::IntLit);
+    CHECK_EQ(hir->routes[0].locals[1].init.int_value, 200);
+    CHECK(hir->routes[0].locals[2].init.kind == HirExprKind::StrLit);
+    CHECK_EQ(hir->routes[0].locals[2].init.str_value.len, 0u);
+
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    REQUIRE(lower_to_rir(mir.value(), rir));
+    u32 status_reads = 0;
+    u32 body_reads = 0;
+    for (u32 bi = 0; bi < rir.module.functions[0].block_count; bi++) {
+        const auto& block = rir.module.functions[0].blocks[bi];
+        for (u32 ii = 0; ii < block.inst_count; ii++) {
+            status_reads += block.insts[ii].op == rir::Opcode::RespStatus;
+            body_reads += block.insts[ii].op == rir::Opcode::RespBody;
+        }
+    }
+    CHECK_EQ(status_reads, 1u);
+    CHECK_EQ(body_reads, 1u);
+    rir.destroy();
+}
+
+TEST(frontend, response_field_reads_reject_runtime_placeholders_and_unknown_fields) {
+    struct Case {
+        const char* src;
+        const char* detail;
+    };
+    const Case cases[] = {
+        {R"rut(
+func inspect(_ resp: Response) -> i32 { resp.status }
+)rut",
+         "runtime Response field reads require explicit buffered forwarding"},
+        {"route GET \"/x\" { let resp = response(200) let value = resp.foo return resp }\n",
+         "Response readable fields are status and body"},
+    };
+    for (const auto& c : cases) {
+        auto lexed = lex(lit(c.src));
+        REQUIRE(lexed);
+        auto ast = parse_file_heap(lexed.value());
+        REQUIRE(ast);
+        auto hir = analyze_file_heap(ast.value());
+        REQUIRE_FALSE(hir.has_value());
+        CHECK(hir.error().detail.eq(lit(c.detail)));
+    }
+}
+
+TEST(frontend, helper_block_response_assignment_marks_later_read_runtime) {
+    const char* src = R"rut(
+func rewrite() -> i32 {
+    let resp = response(200)
+    resp.status = 201
+    resp.status
+}
+route GET "/x" {
+    let status = rewrite()
+    if status == 201 { return 200 } else { return 500 }
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    REQUIRE(lower_to_rir(mir.value(), rir));
+    bool saw_status_read = false;
+    for (u32 bi = 0; bi < rir.module.functions[0].block_count; bi++)
+        for (u32 ii = 0; ii < rir.module.functions[0].blocks[bi].inst_count; ii++)
+            saw_status_read |=
+                rir.module.functions[0].blocks[bi].insts[ii].op == rir::Opcode::RespStatus;
+    CHECK(saw_status_read);
+    rir.destroy();
+}
+
+TEST(frontend, response_scalar_assignment_after_guard_is_rejected) {
+    const char* src = R"rut(
+route GET "/x" {
+    let resp = response(200)
+    resp.status = 201
+    guard resp.status == 201 else { return 400 }
+    resp.status = 202
+    return resp
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE_FALSE(hir.has_value());
+    CHECK(
+        hir.error().detail.eq(lit("Response scalar assignments after a guard are not supported; "
+                                  "move the assignment before the guard")));
+}
+
+TEST(frontend, response_mutating_helper_after_field_read_is_rejected) {
+    const char* src = R"rut(
+func rewrite(_ resp: Response) -> i32 {
+    resp.status = 202
+    0
+}
+route GET "/x" {
+    let resp = response(200)
+    resp.status = 201
+    guard resp.status == 201 else { return 400 }
+    let ignored = rewrite(resp)
+    return resp
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE_FALSE(hir.has_value());
+}
+
+TEST(frontend, response_scalar_assignment_after_guard_failure_read_is_rejected) {
+    const char* src = R"rut(
+route GET "/x" {
+    let resp = response(200)
+    resp.status = 201
+    guard req.http11 else {
+        if resp.status == 201 { return 400 } else { return 401 }
+    }
+    resp.status = 202
+    return resp
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE_FALSE(hir.has_value());
+    CHECK(
+        hir.error().detail.eq(lit("Response scalar assignments after a guard are not supported; "
+                                  "move the assignment before the guard")));
+}
+
+TEST(frontend, response_body_reads_in_conditional_value_branches_are_rejected) {
+    const char* src = R"rut(
+func choose(flag: bool) -> str {
+    let resp = response(200)
+    resp.body = "pending"
+    if flag { "ok" } else { resp.body }
+}
+route GET "/x" {
+    let selected = choose(req.http11)
+    return 200
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE_FALSE(hir.has_value());
+    CHECK(hir.error().detail.eq(
+        lit("Response.body reads in conditional value branches are not supported")));
+}
+
+TEST(frontend, response_body_reads_in_terminal_control_conditions_are_rejected) {
+    const char* src = R"rut(
+func choose(flag: bool) -> str {
+    let resp = response(200)
+    resp.body = "pending"
+    if flag { "ok" } else { resp.body }
+}
+route GET "/x" {
+    if choose(req.http11) == "ok" {
+        return 200
+    } else {
+        return 204
+    }
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE_FALSE(hir.has_value());
+    CHECK(hir.error().detail.eq(
+        lit("Response.body reads in conditional value branches are not supported")));
+}
+
+TEST(frontend, nested_call_arguments_cannot_reorder_response_reads_and_mutations) {
+    const char* src = R"rut(
+func mutate(_ resp: Response) -> i32 {
+    resp.status = 202
+    1
+}
+func choose(first: i32, second: i32) -> i32 => first
+route GET "/x" {
+    let resp = response(200)
+    resp.status = 201
+    let selected = choose(resp.status, mutate(resp))
+    return resp
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE_FALSE(hir.has_value());
+    CHECK(hir.error().detail.eq(
+        lit("response-mutating helper arguments cannot follow an earlier Response field read")));
+}
+
+TEST(frontend, nested_call_arguments_cannot_reorder_response_header_reads_and_mutations) {
+    const char* src = R"rut(
+func overwrite(_ resp: Response) -> i32 {
+    resp.set("X-Test", "later")
+    1
+}
+func first(value: str, ignored: i32) -> str => value
+route GET "/x" {
+    let resp = response(200)
+    resp.set("X-Test", req.path)
+    let selected = first(resp.header("X-Test").or(""), overwrite(resp))
+    return resp
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE_FALSE(hir.has_value());
+    CHECK(hir.error().detail.eq(
+        lit("response-mutating helper arguments cannot follow an earlier Response field read")));
+}
+
+TEST(frontend, generic_protocol_arguments_cannot_reorder_response_reads_and_mutations) {
+    const char* src = R"rut(
+protocol Pick { func pick(first: i32, second: i32) -> i32 => first }
+struct Box { value: i32 }
+Box impl Pick {}
+func mutate(_ resp: Response) -> i32 {
+    resp.status = 202
+    1
+}
+func select<T: Pick>(value: T) -> i32 {
+    let resp = response(200)
+    resp.status = 201
+    value.pick(resp.status, mutate(resp))
+}
+route GET "/x" {
+    return 200
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE_FALSE(hir.has_value());
+    CHECK_EQ(static_cast<u8>(hir.error().code), static_cast<u8>(FrontendError::UnsupportedSyntax));
+}
+
+TEST(frontend, nested_helper_effects_use_the_wrapper_call_site_span) {
+    const char* src = R"rut(
+func mutate(_ resp: Response) -> i32 {
+    resp.status = 202
+    1
+}
+func wrapper() -> i32 {
+    let resp = response(200)
+    resp.status = 201
+    let saved = resp.status
+    let ignored = mutate(resp)
+    saved
+}
+route GET "/x" {
+    let selected = wrapper()
+    return 200
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE_FALSE(hir.has_value());
+    CHECK(hir.error().detail.eq(
+        lit("helper Response assignments cannot follow a captured Response field read")));
+}
+
+TEST(frontend, or_receiver_probe_rolls_back_response_effect_carriers) {
+    const char* src = R"rut(
+func maybe(_ resp: Response) -> i32 {
+    resp.add("X-Probe", "once")
+    7
+}
+route GET "/x" {
+    let resp = response(200)
+    let value = maybe(resp).or(0)
+    return resp
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    u32 adds = 0;
+    for (u32 li = 0; li < hir->routes[0].locals.len; li++)
+        adds += hir->routes[0].locals[li].init.kind == HirExprKind::RespAddHeader;
+    CHECK_EQ(adds, 1u);
+}
+
+TEST(frontend, response_effects_after_helper_respond_guards_are_rejected) {
+    const char* src = R"rut(
+func mutate_after_guard(ok: bool, _ resp: Response) -> i32 {
+    guard ok else { respond 401 }
+    resp.add("X-Guarded", "yes")
+    1
+}
+route GET "/x" {
+    let resp = response(200)
+    let selected = mutate_after_guard(req.http11, resp)
+    return resp
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE_FALSE(hir.has_value());
+    CHECK(hir.error().detail.eq(
+        lit("response effects after a helper respond guard are not supported; move the effect "
+            "before the guard")));
+}
+
+TEST(frontend, helper_local_response_builder_cannot_mutate_caller_builder) {
+    const char* src = R"rut(
+func rewrite() -> i32 {
+    let inner = response(200)
+    inner.status = 201
+    0
+}
+route GET "/x" {
+    let outer = response(200)
+    let ignored = rewrite()
+    outer.body = "outer"
+    return outer
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE_FALSE(hir.has_value());
+}
+
+TEST(frontend, helper_local_response_effects_reject_later_caller_builder) {
+    const char* src = R"rut(
+func rewrite() -> i32 {
+    let inner = response(200)
+    inner.status = 201
+    0
+}
+route GET "/x" {
+    let ignored = rewrite()
+    let outer = response(200)
+    outer.body = "outer"
+    return outer
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE_FALSE(hir.has_value());
+}
+
+TEST(frontend, successive_helper_local_response_builders_are_rejected) {
+    const char* src = R"rut(
+func first() -> i32 {
+    let resp = response(200)
+    resp.status = 201
+    0
+}
+func second() -> i32 {
+    let resp = response(200)
+    resp.body = "second"
+    resp.status
+}
+route GET "/x" {
+    let ignored = first()
+    let status = second()
+    if status == 200 { return 200 } else { return 500 }
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE_FALSE(hir.has_value());
+}
+
+TEST(frontend, protocol_methods_preserve_response_effects_before_reads) {
+    const char* sources[] = {
+        R"rut(
+protocol Status { func status() -> i32 { let resp = response(200) resp.status = 201 resp.status } }
+struct Box { value: i32 }
+Box impl Status {}
+route GET "/x" { let value = Box(value: 0).status() if value == 201 { return 201 } else { return 500 } }
+)rut",
+        R"rut(
+protocol Status { func status() -> i32 => 200 }
+struct Box { value: i32 }
+Box impl Status { func status(self: Box) -> i32 { let resp = response(200) resp.status = 201 resp.status } }
+route GET "/x" { let value = Box(value: 0).status() if value == 201 { return 201 } else { return 500 } }
+)rut",
+    };
+    for (const char* src : sources) {
+        FrontendRirModule rir{};
+        REQUIRE(lower_src_to_rir(src, rir));
+        u32 writes = 0;
+        u32 reads = 0;
+        for (u32 bi = 0; bi < rir.module.functions[0].block_count; bi++)
+            for (u32 ii = 0; ii < rir.module.functions[0].blocks[bi].inst_count; ii++) {
+                writes +=
+                    rir.module.functions[0].blocks[bi].insts[ii].op == rir::Opcode::RespSetStatus;
+                reads += rir.module.functions[0].blocks[bi].insts[ii].op == rir::Opcode::RespStatus;
+            }
+        CHECK_EQ(writes, 1u);
+        CHECK_EQ(reads, 1u);
+        rir.destroy();
+    }
+}
+
+TEST(frontend, response_mutating_helpers_are_rejected_in_conditional_pipes) {
+    const char* src = R"rut(
+func rewrite(value: str) -> i32 {
+    let resp = response(200)
+    resp.status = 201
+    resp.status
+}
+route GET "/x" {
+    let status = req.header("X-Value") | rewrite(_)
+    return 200
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE_FALSE(hir.has_value());
+}
+
 TEST(frontend, parse_func_param_accepts_underscore_label) {
     const char* src = "func auth(_ req: i32) -> i32 => 0\n";
     auto lexed = lex(lit(src));
@@ -33427,52 +33911,6 @@ TEST(frontend, reusable_json_helper_materializes_struct_arguments_once) {
     rir.destroy();
 }
 
-TEST(frontend, protocol_and_impl_methods_materialize_local_json_values) {
-    const char* sources[] = {
-        R"rut(
-protocol Encoder {
-    func encode() -> Json {
-        let body = json({ ok: true })
-        body
-    }
-}
-struct Box { value: i32 }
-Box impl Encoder {}
-route GET "/x" {
-    let body = Box(value: 1).encode()
-    return 200, body
-}
-)rut",
-        R"rut(
-protocol Encoder { func encode() -> Json }
-struct Box { value: i32 }
-Box impl Encoder {
-    func encode(self: Box) -> Json {
-        let body = json({ value: self.value })
-        body
-    }
-}
-route GET "/x" {
-    let body = Box(value: 1).encode()
-    return 200, body
-}
-)rut",
-    };
-    for (const char* src : sources) {
-        auto lexed = lex(lit(src));
-        REQUIRE(lexed);
-        auto ast = parse_file_heap(lexed.value());
-        REQUIRE(ast);
-        auto hir = analyze_file_heap(ast.value());
-        REQUIRE(hir);
-        auto mir = build_mir_heap(hir.value());
-        REQUIRE(mir);
-        FrontendRirModule rir{};
-        REQUIRE(lower_to_rir(mir.value(), rir));
-        rir.destroy();
-    }
-}
-
 TEST(frontend, conditional_json_locals_capture_selection_at_initialization) {
     const char* src = R"rut(
 func choose(flag: bool, yes: Json, no: Json) -> Json {
@@ -33999,6 +34437,52 @@ route GET "/x" {
         lit("response scalar mutations require exactly one Response builder in the route")));
 }
 
+TEST(frontend, protocol_and_impl_methods_materialize_local_json_values) {
+    const char* sources[] = {
+        R"rut(
+protocol Encoder {
+    func encode() -> Json {
+        let body = json({ ok: true })
+        body
+    }
+}
+struct Box { value: i32 }
+Box impl Encoder {}
+route GET "/x" {
+    let body = Box(value: 1).encode()
+    return 200, body
+}
+)rut",
+        R"rut(
+protocol Encoder { func encode() -> Json }
+struct Box { value: i32 }
+Box impl Encoder {
+    func encode(self: Box) -> Json {
+        let body = json({ value: self.value })
+        body
+    }
+}
+route GET "/x" {
+    let body = Box(value: 1).encode()
+    return 200, body
+}
+)rut",
+    };
+    for (const char* src : sources) {
+        auto lexed = lex(lit(src));
+        REQUIRE(lexed);
+        auto ast = parse_file_heap(lexed.value());
+        REQUIRE(ast);
+        auto hir = analyze_file_heap(ast.value());
+        REQUIRE(hir);
+        auto mir = build_mir_heap(hir.value());
+        REQUIRE(mir);
+        FrontendRirModule rir{};
+        REQUIRE(lower_to_rir(mir.value(), rir));
+        rir.destroy();
+    }
+}
+
 TEST(frontend, response_scalar_mutation_rejects_later_shadowing_builder) {
     const char* src = R"rut(
 route GET "/x" {
@@ -34423,27 +34907,6 @@ route GET "/x" { let pair = keep(([req.path], 1)) return 200 }
     rir.destroy();
 }
 
-TEST(frontend, inferred_tuple_returns_preserve_nested_array_shapes) {
-    const char* src = R"rut(
-func make() => ([1], 2)
-func keep(values: [i32]) -> [i32] => values
-route GET "/x" { let pair = make() let values = pair | keep(_1) return 200 }
-)rut";
-    FrontendRirModule rir{};
-    REQUIRE(lower_src_to_rir(src, rir));
-    rir.destroy();
-}
-
-TEST(frontend, declared_tuple_returns_adapt_nested_runtime_string_lists) {
-    const char* src = R"rut(
-func tags(_ ignored: i32) -> ([str], i32) => (req.queryAll("tag"), 1)
-route GET "/x" { let pair = tags(1) return 200 }
-)rut";
-    FrontendRirModule rir{};
-    REQUIRE(lower_src_to_rir(src, rir));
-    rir.destroy();
-}
-
 TEST(frontend, string_list_local_refs_adapt_to_array_struct_fields) {
     const char* src = R"rut(
 struct Payload { tags: [str] }
@@ -34463,21 +34926,6 @@ route GET "/x" {
     REQUIRE(mir);
     FrontendRirModule rir{};
     REQUIRE(lower_to_rir(mir.value(), rir));
-    rir.destroy();
-}
-
-TEST(frontend, adapting_string_list_locals_preserves_prior_scalar_uses) {
-    const char* src = R"rut(
-struct Payload { tags: [str] }
-route GET "/x" {
-    let raw = req.queryAll("tag")
-    let count = raw.len
-    let payload = Payload(tags: raw)
-    return 200
-}
-)rut";
-    FrontendRirModule rir{};
-    REQUIRE(lower_src_to_rir(src, rir));
     rir.destroy();
 }
 
@@ -34604,26 +35052,6 @@ TEST(frontend, empty_array_call_arguments_use_concrete_parameter_shape) {
     rir.destroy();
 }
 
-TEST(frontend, empty_arrays_nested_in_tuple_arguments_use_parameter_shape) {
-    const char* src =
-        "func keep(pair: ([str], i32)) -> i32 => 1 "
-        "route GET \"/x\" { let result = keep(([], 1)) return 200 }\n";
-    FrontendRirModule rir{};
-    REQUIRE(lower_src_to_rir(src, rir));
-    rir.destroy();
-}
-
-TEST(frontend, aliases_preserve_indexed_tuple_shapes_inside_arrays) {
-    const char* src = R"rut(
-type Pair = ([str], i32)
-func keep(values: [Pair]) -> [Pair] => values
-route GET "/x" { let values = keep([([req.path], 1)]) return 200 }
-)rut";
-    FrontendRirModule rir{};
-    REQUIRE(lower_src_to_rir(src, rir));
-    rir.destroy();
-}
-
 TEST(frontend, empty_array_struct_fields_use_declared_shape) {
     const char* src =
         "struct Payload { tags: [str] } "
@@ -34715,19 +35143,6 @@ route GET "/x" {
     FrontendRirModule rir{};
     REQUIRE(lower_src_to_rir(src, rir));
     rir.destroy();
-}
-
-TEST(frontend, tuple_struct_fields_reject_reversed_scalar_slots) {
-    const char* src =
-        "struct Holder { pair: (i32, str) } "
-        "route GET \"/x\" { let holder = Holder(pair: (\"bad\", 1)) return 200 }\n";
-    auto lexed = lex(lit(src));
-    REQUIRE(lexed);
-    auto ast = parse_file_heap(lexed.value());
-    REQUIRE(ast);
-    auto hir = analyze_file_heap(ast.value());
-    REQUIRE_FALSE(hir.has_value());
-    CHECK_EQ(hir.error().code, FrontendError::UnsupportedSyntax);
 }
 
 TEST(frontend, rejects_arrays_nested_in_tuple_variant_payloads) {
@@ -34983,6 +35398,551 @@ route GET "/x" {
 )rut";
     FrontendRirModule rir{};
     REQUIRE(lower_src_to_rir(src, rir));
+    rir.destroy();
+}
+
+TEST(frontend, deferred_protocol_dispatch_replays_response_effects) {
+    const char* src = R"rut(
+protocol Status { func status() -> i32 }
+struct Box { value: i32 }
+Box impl Status {
+    func status(self: Box) -> i32 {
+        let resp = response(200)
+        resp.status = 201
+        resp.status
+    }
+}
+func run<T: Status>(value: T) -> i32 => value.status()
+route GET "/x" {
+    let value = run(Box(value: 0))
+    if value == 201 { return 201 } else { return 500 }
+}
+)rut";
+    FrontendRirModule rir{};
+    REQUIRE(lower_src_to_rir(src, rir));
+    u32 writes = 0;
+    for (u32 bi = 0; bi < rir.module.functions[0].block_count; bi++)
+        for (u32 ii = 0; ii < rir.module.functions[0].blocks[bi].inst_count; ii++)
+            writes += rir.module.functions[0].blocks[bi].insts[ii].op == rir::Opcode::RespSetStatus;
+    CHECK_EQ(writes, 1u);
+    rir.destroy();
+}
+
+TEST(frontend, chain_after_scalar_effects_reject_prior_response_reads) {
+    const char* src = R"rut(
+func rewrite(_ resp: Response) -> i32 {
+    resp.status = 202
+    0
+}
+chain rewrite_response { after rewrite(resp) }
+route GET "/x" use chain rewrite_response {
+    let resp = response(200)
+    resp.status = 201
+    guard resp.status == 201 else { return 400 }
+    return resp
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE_FALSE(hir.has_value());
+    CHECK(hir.error().detail.eq(
+        lit("chain-after Response scalar effects cannot follow a Response field read")));
+}
+
+TEST(frontend, chain_before_replays_helper_response_effects) {
+    const char* src = R"rut(
+func ready(_ req: i32) -> bool {
+    let resp = response(200)
+    resp.status = 201
+    resp.status == 201
+}
+chain access { before ready(req) else 401 }
+route GET "/x" use chain access { return 200 }
+)rut";
+    FrontendRirModule rir{};
+    REQUIRE(lower_src_to_rir(src, rir));
+    u32 writes = 0;
+    for (u32 bi = 0; bi < rir.module.functions[0].block_count; bi++)
+        for (u32 ii = 0; ii < rir.module.functions[0].blocks[bi].inst_count; ii++)
+            writes += rir.module.functions[0].blocks[bi].insts[ii].op == rir::Opcode::RespSetStatus;
+    CHECK_EQ(writes, 1u);
+    rir.destroy();
+}
+
+TEST(frontend, wrapper_helpers_propagate_owned_response_builders) {
+    const char* src = R"rut(
+func inner() -> i32 {
+    let resp = response(200)
+    resp.status = 201
+    0
+}
+func wrapper() -> i32 => inner()
+route GET "/x" {
+    let outer = response(200)
+    let ignored = wrapper()
+    return outer
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE_FALSE(hir.has_value());
+}
+
+TEST(frontend, binary_operands_reject_response_mutation_after_field_read) {
+    const char* src = R"rut(
+func mutate(_ resp: Response) -> i32 {
+    resp.status = 202
+    201
+}
+route GET "/x" {
+    let resp = response(200)
+    resp.status = 201
+    guard resp.status == mutate(resp) else { return 500 }
+    return resp
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE_FALSE(hir.has_value());
+    CHECK(hir.error().detail.eq(
+        lit("a response-mutating right operand cannot follow a Response field read")));
+}
+
+TEST(frontend, method_arguments_reject_response_mutation_after_receiver_read) {
+    const char* src = R"rut(
+func mutate(_ resp: Response) -> i32 {
+    resp.status = 202
+    201
+}
+route GET "/x" {
+    let resp = response(200)
+    resp.status = 201
+    guard resp.status.eq(mutate(resp)) else { return 500 }
+    return resp
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE_FALSE(hir.has_value());
+    CHECK(hir.error().detail.eq(
+        lit("a response-mutating right operand cannot follow a Response field read")));
+}
+
+TEST(frontend, struct_fields_reject_response_mutation_after_field_read) {
+    const char* src = R"rut(
+struct Pair { first: i32, second: i32 }
+func mutate(_ resp: Response) -> i32 {
+    resp.status = 202
+    0
+}
+route GET "/x" {
+    let resp = response(200)
+    resp.status = 201
+    let pair = Pair(first: resp.status, second: mutate(resp))
+    guard pair.first == 201 else { return 500 }
+    return resp
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE_FALSE(hir.has_value());
+    CHECK(hir.error().detail.eq(
+        lit("a response-mutating struct field cannot follow a Response field read")));
+}
+
+TEST(frontend, helper_assignment_rejects_earlier_captured_response_read) {
+    const char* src = R"rut(
+func sample(code: i32) -> i32 {
+    let resp = response(200)
+    resp.status = code
+    let saved = resp.status
+    resp.body = "done"
+    saved
+}
+route GET "/x" {
+    let value = sample(201)
+    return 200
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE_FALSE(hir.has_value());
+    CHECK(hir.error().detail.eq(
+        lit("helper Response assignments cannot follow a captured Response field read")));
+}
+
+TEST(frontend, helper_effect_rejects_response_read_before_later_scalar_assignment) {
+    const char* src = R"rut(
+func sample(_ resp: Response) -> str {
+    resp.body = "old"
+    let saved = resp.body
+    resp.body = "new"
+    resp.set("X-Saved", saved)
+    resp.header("X-Saved")
+}
+route GET "/x" {
+    let resp = response(200)
+    let saved = sample(resp)
+    return resp
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE_FALSE(hir.has_value());
+}
+
+TEST(frontend, chain_after_scalar_effects_reject_terminal_control_response_reads) {
+    const char* src = R"rut(
+func rewrite(_ resp: Response) -> i32 {
+    resp.status = 202
+    0
+}
+chain rewrite_response { after rewrite(resp) }
+route GET "/x" use chain rewrite_response {
+    let resp = response(200)
+    resp.status = 201
+    if resp.status == 201 { return resp } else { return 500 }
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE_FALSE(hir.has_value());
+}
+
+TEST(frontend, response_mutating_helpers_are_rejected_in_value_branches) {
+    const char* src = R"rut(
+func mutate(_ resp: Response) -> i32 {
+    resp.status = 202
+    1
+}
+func choose(flag: bool, _ resp: Response) -> i32 {
+    if flag { mutate(resp) } else { 0 }
+}
+route GET "/x" {
+    let resp = response(200)
+    let value = choose(req.http10, resp)
+    return resp
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE_FALSE(hir.has_value());
+}
+
+TEST(frontend, response_mutating_helpers_are_rejected_in_lazy_bool_operands) {
+    const char* src = R"rut(
+func mutate(_ resp: Response) -> bool {
+    resp.status = 202
+    true
+}
+route GET "/x" {
+    let resp = response(200)
+    let value = req.http10 && mutate(resp)
+    return resp
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE_FALSE(hir.has_value());
+}
+TEST(frontend, dynamic_json_rejects_mutation_after_earlier_response_read) {
+    const char* src = R"rut(
+func mutate(_ resp: Response) -> i32 {
+    resp.status = 202
+    0
+}
+route GET "/x" {
+    let resp = response(200)
+    resp.status = 201
+    return 200, json([resp.status, mutate(resp)])
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE_FALSE(hir.has_value());
+    CHECK(hir.error().detail.eq(
+              lit("a response-mutating JSON value cannot follow an earlier Response field read")) ||
+          hir.error().detail.eq(lit("a dynamically mutated Response builder must be returned "
+                                    "directly")));
+}
+
+TEST(frontend, response_mutating_helpers_are_rejected_in_conditional_body_locals) {
+    const char* sources[] = {
+        R"rut(
+func mutate(_ resp: Response) -> i32 { resp.status = 202 0 }
+route GET "/x" {
+    let resp = response(200)
+    match req.http11 {
+        true => { let ignored = mutate(resp) return resp }
+        _ => return resp
+    }
+}
+)rut",
+        R"rut(
+func mutate(_ resp: Response) -> i32 { resp.status = 202 0 }
+route GET "/x" {
+    let resp = response(200)
+    guard req.http11 else { let ignored = mutate(resp) return resp }
+    return resp
+}
+)rut",
+    };
+    for (const char* src : sources) {
+        auto lexed = lex(lit(src));
+        REQUIRE(lexed);
+        auto ast = parse_file_heap(lexed.value());
+        REQUIRE(ast);
+        auto hir = analyze_file_heap(ast.value());
+        REQUIRE_FALSE(hir.has_value());
+        CHECK(hir.error().detail.eq(lit(
+                  "response-mutating helper calls are not supported in conditional branches")) ||
+              hir.error().detail.eq(
+                  lit("returning a Response local is currently supported only as the direct route "
+                      "terminator")));
+    }
+}
+
+TEST(frontend, response_mutating_helpers_require_one_caller_builder) {
+    const char* src = R"rut(
+func mutate(_ resp: Response, code: i32) -> i32 {
+    resp.status = code
+    0
+}
+route GET "/x" {
+    let first = response(200)
+    let second = response(300)
+    let ignored = mutate(first, 201)
+    return first
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE_FALSE(hir.has_value());
+    CHECK(hir.error().detail.eq(
+        lit("response-mutating helpers require exactly one Response builder in the route")));
+}
+
+TEST(frontend, aggregate_elements_reject_response_mutation_after_field_read) {
+    const char* sources[] = {
+        R"rut(
+func mutate(_ resp: Response) -> i32 { resp.status = 202 0 }
+route GET "/x" {
+    let resp = response(200)
+    resp.status = 201
+    let pair = (resp.status, mutate(resp))
+    return resp
+}
+)rut",
+        R"rut(
+func mutate(_ resp: Response) -> i32 { resp.status = 202 0 }
+route GET "/x" {
+    let resp = response(200)
+    resp.status = 201
+    let values = [resp.status, mutate(resp)]
+    return resp
+}
+)rut",
+    };
+    for (u32 source_index = 0; source_index < 2; source_index++) {
+        const char* src = sources[source_index];
+        auto lexed = lex(lit(src));
+        REQUIRE(lexed);
+        auto ast = parse_file_heap(lexed.value());
+        REQUIRE(ast);
+        auto hir = analyze_file_heap(ast.value());
+        REQUIRE_FALSE(hir.has_value());
+    }
+}
+
+TEST(frontend, builtin_operands_reject_response_mutation_after_field_read) {
+    const char* expressions[] = {
+        "bitwise.and(resp.status, mutate(resp))",
+        "max(resp.status, mutate(resp))",
+        "any(resp.status, mutate(resp))",
+        "all(resp.status, mutate(resp))",
+    };
+    for (const char* expression : expressions) {
+        std::string src = R"rut(
+func mutate(_ resp: Response) -> i32 { resp.status = 202 255 }
+route GET "/x" {
+    let resp = response(200)
+    resp.status = 201
+    let value = )rut";
+        src += expression;
+        src += R"rut(
+    return resp
+}
+)rut";
+        auto lexed = lex({src.data(), static_cast<u32>(src.size())});
+        REQUIRE(lexed);
+        auto ast = parse_file_heap(lexed.value());
+        REQUIRE(ast);
+        auto hir = analyze_file_heap(ast.value());
+        REQUIRE_FALSE(hir.has_value());
+    }
+}
+
+TEST(frontend, inferred_tuple_returns_preserve_nested_array_shapes) {
+    const char* src = R"rut(
+func make() => ([1], 2)
+func keep(values: [i32]) -> [i32] => values
+route GET "/x" { let pair = make() let values = pair | keep(_1) return 200 }
+)rut";
+    FrontendRirModule rir{};
+    REQUIRE(lower_src_to_rir(src, rir));
+    rir.destroy();
+}
+
+TEST(frontend, declared_tuple_returns_adapt_nested_runtime_string_lists) {
+    const char* src = R"rut(
+func tags(_ ignored: i32) -> ([str], i32) => (req.queryAll("tag"), 1)
+route GET "/x" { let pair = tags(1) return 200 }
+)rut";
+    FrontendRirModule rir{};
+    REQUIRE(lower_src_to_rir(src, rir));
+    rir.destroy();
+}
+
+TEST(frontend, adapting_string_list_locals_preserves_prior_scalar_uses) {
+    const char* src = R"rut(
+struct Payload { tags: [str] }
+route GET "/x" {
+    let raw = req.queryAll("tag")
+    let count = raw.len
+    let payload = Payload(tags: raw)
+    return 200
+}
+)rut";
+    FrontendRirModule rir{};
+    REQUIRE(lower_src_to_rir(src, rir));
+    rir.destroy();
+}
+
+TEST(frontend, empty_arrays_nested_in_tuple_arguments_use_parameter_shape) {
+    const char* src =
+        "func keep(pair: ([str], i32)) -> i32 => 1 "
+        "route GET \"/x\" { let result = keep(([], 1)) return 200 }\n";
+    FrontendRirModule rir{};
+    REQUIRE(lower_src_to_rir(src, rir));
+    rir.destroy();
+}
+
+TEST(frontend, aliases_preserve_indexed_tuple_shapes_inside_arrays) {
+    const char* src = R"rut(
+type Pair = ([str], i32)
+func keep(values: [Pair]) -> [Pair] => values
+route GET "/x" { let values = keep([([req.path], 1)]) return 200 }
+)rut";
+    FrontendRirModule rir{};
+    REQUIRE(lower_src_to_rir(src, rir));
+    rir.destroy();
+}
+
+TEST(frontend, tuple_struct_fields_reject_reversed_scalar_slots) {
+    const char* src =
+        "struct Holder { pair: (i32, str) } "
+        "route GET \"/x\" { let holder = Holder(pair: (\"bad\", 1)) return 200 }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE_FALSE(hir.has_value());
+    CHECK_EQ(hir.error().code, FrontendError::UnsupportedSyntax);
+}
+
+TEST(frontend, direct_helper_materializes_json_after_earlier_response_effects) {
+    const char* src = R"rut(
+func make_payload() -> Json {
+    let resp = response(200)
+    resp.status = 201
+    let payload = json({ status: resp.status })
+    payload
+}
+route GET "/x" { let payload = make_payload() return 200, payload }
+)rut";
+    FrontendRirModule rir{};
+    REQUIRE(lower_src_to_rir(src, rir));
+    const auto& block = rir.module.functions[0].blocks[0];
+    u32 set_status = 0xffffffffu;
+    u32 read_status = 0xffffffffu;
+    u32 capture = 0xffffffffu;
+    for (u32 ii = 0; ii < block.inst_count; ii++) {
+        if (block.insts[ii].op == rir::Opcode::RespSetStatus && set_status == 0xffffffffu)
+            set_status = ii;
+        else if (block.insts[ii].op == rir::Opcode::RespStatus && read_status == 0xffffffffu)
+            read_status = ii;
+        else if (block.insts[ii].op == rir::Opcode::JsonCapture && capture == 0xffffffffu)
+            capture = ii;
+    }
+    REQUIRE_NE(set_status, 0xffffffffu);
+    REQUIRE_NE(read_status, 0xffffffffu);
+    REQUIRE_NE(capture, 0xffffffffu);
+    CHECK(set_status < read_status);
+    CHECK(read_status < capture);
+    rir.destroy();
+}
+
+TEST(frontend, direct_helper_response_effects_use_materialized_json_locals) {
+    const char* src = R"rut(
+func rewrite() -> i32 {
+    let resp = response(200)
+    let payload = json({ ok: true })
+    resp.body = payload
+    0
+}
+route GET "/x" { let ignored = rewrite() return 204 }
+)rut";
+    FrontendRirModule rir{};
+    REQUIRE(lower_src_to_rir(src, rir));
+    const auto& block = rir.module.functions[0].blocks[0];
+    u32 capture = 0xffffffffu;
+    u32 set_body = 0xffffffffu;
+    for (u32 ii = 0; ii < block.inst_count; ii++) {
+        if (block.insts[ii].op == rir::Opcode::JsonCapture && capture == 0xffffffffu)
+            capture = ii;
+        else if (block.insts[ii].op == rir::Opcode::RespSetBody && set_body == 0xffffffffu)
+            set_body = ii;
+    }
+    REQUIRE_NE(capture, 0xffffffffu);
+    REQUIRE_NE(set_body, 0xffffffffu);
+    CHECK(capture < set_body);
     rir.destroy();
 }
 

@@ -33,9 +33,11 @@ harness oracles.
 Response header mutation logs now live in resumable `HandlerCtx` state rather
 than `Connection`; pending logs survive `wait`, stay isolated per request or H2
 stream invocation, and `chain after` no longer rejects `wait`/`for` routes.
-Bounded plain-string/JSON body replacement and status replacement now use the
-same pending/committed boundary. Remaining work is field reads and applying
-header/status/body mutations to an explicitly buffered forwarded response.
+Bounded plain-string/JSON body replacement and status replacement use the same
+pending/committed boundary. Handler-local `status`/`body` reads now observe the
+latest pending replacement. Remaining work is materializing explicitly
+buffered forwarded responses so their fields and header/status/body mutations
+can use the same boundary.
 
 **Acceptance**:
 - `chain after` can mutate buffered status/body and survive a yield.

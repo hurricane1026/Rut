@@ -118,6 +118,8 @@ enum class HirExprKind : u8 {
     // field_inits stores ordered literal response headers.
     ResponseInit,
     RespHeader,
+    RespStatus,
+    RespBody,
     RespSetHeader,
     RespAddHeader,
     RespRemoveHeader,
@@ -557,6 +559,7 @@ struct HirFunction {
     u32 return_tuple_elem_shape_indices[kMaxTupleSlots]{};
     u32 return_array_elem_shape_index = 0xffffffffu;
     u32 return_shape_index = 0xffffffffu;
+    bool owns_response_builder = false;
     static constexpr u32 kMaxParams = 8;
     static constexpr u32 kMaxExprs = 64;
     FixedVec<TypeParamDecl, kMaxTypeParams> type_params;
@@ -596,6 +599,7 @@ struct HirFunction {
           return_tuple_len(other.return_tuple_len),
           return_array_elem_shape_index(other.return_array_elem_shape_index),
           return_shape_index(other.return_shape_index),
+          owns_response_builder(other.owns_response_builder),
           type_params(other.type_params),
           params(other.params),
           exprs(other.exprs),
@@ -628,6 +632,7 @@ struct HirFunction {
         return_tuple_len = other.return_tuple_len;
         return_array_elem_shape_index = other.return_array_elem_shape_index;
         return_shape_index = other.return_shape_index;
+        owns_response_builder = other.owns_response_builder;
         for (u32 i = 0; i < other.return_tuple_len; i++) {
             return_tuple_types[i] = other.return_tuple_types[i];
             return_tuple_variant_indices[i] = other.return_tuple_variant_indices[i];
@@ -660,6 +665,7 @@ struct HirFunction {
           return_tuple_len(other.return_tuple_len),
           return_array_elem_shape_index(other.return_array_elem_shape_index),
           return_shape_index(other.return_shape_index),
+          owns_response_builder(other.owns_response_builder),
           type_params(other.type_params),
           params(other.params),
           exprs(other.exprs),
@@ -692,6 +698,7 @@ struct HirFunction {
         return_tuple_len = other.return_tuple_len;
         return_array_elem_shape_index = other.return_array_elem_shape_index;
         return_shape_index = other.return_shape_index;
+        owns_response_builder = other.owns_response_builder;
         for (u32 i = 0; i < other.return_tuple_len; i++) {
             return_tuple_types[i] = other.return_tuple_types[i];
             return_tuple_variant_indices[i] = other.return_tuple_variant_indices[i];
@@ -1178,6 +1185,7 @@ struct HirRoute {
     FixedVec<HirForLoop, kMaxForLoops> for_loops;
     HirControl control{};
     bool allow_respond_effects = false;
+    bool allow_response_effects = true;
     u32 error_variant_index = 0xffffffffu;
     // @rateLimit decorators → stacked fixed-window rules (empty = no limit).
     // Flows to the RIR Function and on to RouteConfig rate-limit setup.
@@ -1213,6 +1221,7 @@ struct HirRoute {
           for_loops(other.for_loops),
           control(other.control),
           allow_respond_effects(other.allow_respond_effects),
+          allow_response_effects(other.allow_response_effects),
           error_variant_index(other.error_variant_index),
           rate_limit(other.rate_limit),
           throttle_down_bps(other.throttle_down_bps),
@@ -1237,6 +1246,7 @@ struct HirRoute {
         for_loops = other.for_loops;
         control = other.control;
         allow_respond_effects = other.allow_respond_effects;
+        allow_response_effects = other.allow_response_effects;
         error_variant_index = other.error_variant_index;
         rate_limit = other.rate_limit;
         throttle_down_bps = other.throttle_down_bps;
@@ -1261,6 +1271,7 @@ struct HirRoute {
           for_loops(other.for_loops),
           control(other.control),
           allow_respond_effects(other.allow_respond_effects),
+          allow_response_effects(other.allow_response_effects),
           error_variant_index(other.error_variant_index),
           rate_limit(other.rate_limit),
           throttle_down_bps(other.throttle_down_bps),
@@ -1285,6 +1296,7 @@ struct HirRoute {
         for_loops = other.for_loops;
         control = other.control;
         allow_respond_effects = other.allow_respond_effects;
+        allow_response_effects = other.allow_response_effects;
         error_variant_index = other.error_variant_index;
         rate_limit = other.rate_limit;
         throttle_down_bps = other.throttle_down_bps;
