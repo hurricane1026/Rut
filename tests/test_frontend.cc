@@ -7176,8 +7176,7 @@ route GET "/x" use chain rewrite_response {
     auto hir = analyze_file_heap(ast.value());
     std::string hir_detail;
     if (!hir)
-        hir_detail.assign(hir.error().detail.ptr,
-                          hir.error().detail.ptr + hir.error().detail.len);
+        hir_detail.assign(hir.error().detail.ptr, hir.error().detail.ptr + hir.error().detail.len);
     REQUIRE_MSG(hir, hir_detail.c_str());
     auto mir = build_mir_heap(hir.value());
     REQUIRE(mir);
@@ -7206,8 +7205,7 @@ route GET "/x" use chain rewrite_response {
 }
 
 TEST(frontend, direct_json_sink_rejects_fallible_fallback) {
-    const char* src =
-        "route GET \"/x\" { return 200, all(json({ ok: true }), error(.missing)) }\n";
+    const char* src = "route GET \"/x\" { return 200, all(json({ ok: true }), error(.missing)) }\n";
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
     auto ast = parse_file_heap(lexed.value());
@@ -35079,8 +35077,8 @@ route GET "/x" {
     REQUIRE(ast);
     auto hir = analyze_file_heap(ast.value());
     REQUIRE_FALSE(hir.has_value());
-    CHECK(hir.error().detail.eq(
-        lit("json cannot preserve Response field snapshots across a wait")));
+    CHECK(
+        hir.error().detail.eq(lit("json cannot preserve Response field snapshots across a wait")));
 }
 
 TEST(frontend, helper_local_json_plan_captures_scalar_arguments_at_call_site) {

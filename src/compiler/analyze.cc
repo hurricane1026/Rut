@@ -10934,9 +10934,8 @@ static FrontendResult<HirExpr> analyze_call_expr(const AstExpr& expr,
         for (u32 ei = 0; !needs_json_arg_carrier && has_materialized_json_plan &&
                          ei < fn.exprs.len && ei < fn.expr_materialized_local_refs.len;
              ei++) {
-            needs_json_arg_carrier =
-                fn.expr_materialized_local_refs[ei] != 0xffffffffu &&
-                count_function_param_refs(fn.exprs[ei], i, 1) != 0;
+            needs_json_arg_carrier = fn.expr_materialized_local_refs[ei] != 0xffffffffu &&
+                                     count_function_param_refs(fn.exprs[ei], i, 1) != 0;
         }
         const bool needs_reused_array_carrier =
             needs_array_carrier && function_param_is_reused(fn, i);
@@ -17348,16 +17347,14 @@ static FrontendResult<void> analyze_chain_after_response_step(const AstChainDecl
     // Json plan: capture them before the first inlined mutation can change a
     // response/request read embedded in the argument expression.
     for (u32 ai = 0; ai < fn.params.len; ai++) {
-        if (fn.params[ai].type == HirTypeKind::Response ||
-            args[ai].kind == HirExprKind::LocalRef)
+        if (fn.params[ai].type == HirTypeKind::Response || args[ai].kind == HirExprKind::LocalRef)
             continue;
         bool needs_json_arg_carrier =
             hir_expr_contains_json_build(fn.body) && count_function_param_refs(fn.body, ai, 1) != 0;
         for (u32 ei = 0; !needs_json_arg_carrier && ei < fn.exprs.len; ei++) {
-            needs_json_arg_carrier =
-                (fn.exprs[ei].type == HirTypeKind::Json ||
-                 hir_expr_contains_json_build(fn.exprs[ei])) &&
-                count_function_param_refs(fn.exprs[ei], ai, 1) != 0;
+            needs_json_arg_carrier = (fn.exprs[ei].type == HirTypeKind::Json ||
+                                      hir_expr_contains_json_build(fn.exprs[ei])) &&
+                                     count_function_param_refs(fn.exprs[ei], ai, 1) != 0;
         }
         if (!needs_json_arg_carrier) continue;
         HirLocal carrier{};
