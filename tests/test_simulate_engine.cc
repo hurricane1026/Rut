@@ -600,6 +600,31 @@ TEST(simulate_engine, req_body_route_is_unsupported_for_header_only_capture) {
     rir.destroy();
 }
 
+TEST(simulate_engine, bodyless_buffered_forward_route_is_simulated) {
+    const char* src = R"rut(
+upstream api
+route GET "/upload" { return forward(api, buffered: true) }
+)rut";
+    FrontendRirModule rir{};
+    REQUIRE(compile_to_rir(src, rir));
+
+    ManifestUpstream upstream{};
+    upstream.id = 0;
+    strcpy(upstream.name, "api");
+    Engine engine;
+    REQUIRE(engine.init(rir.module, &upstream, 1));
+    REQUIRE_EQ(engine.route_count, 1u);
+    CHECK_FALSE(engine.routes[0].needs_req_body);
+
+    const auto result =
+        simulate_one(engine, make_entry("GET /upload HTTP/1.1\r\nHost: x\r\n\r\n", 200, "api"));
+    CHECK_EQ(result.verdict, Verdict::Match);
+    CHECK_EQ(result.action, jit::HandlerAction::ForwardBuffered);
+
+    engine.shutdown();
+    rir.destroy();
+}
+
 TEST(simulate_engine, let_before_wait_drives_to_terminal) {
     // Slice 1 acceptance: a let before a wait runs when the terminal
     // state reaches the entry block, and the yield chain still drives

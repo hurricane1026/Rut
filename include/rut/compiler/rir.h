@@ -274,25 +274,26 @@ enum class Opcode : u8 {
     AccessLogWrite,
 
     // ── Terminators ── (must be last instruction in a block)
-    Br,          // br %cond, then_block, else_block
-    Jmp,         // jmp target_block
-    RetStatus,   // ret.status — two encodings, disambiguated by operand_count:
-                 //   operand_count == 0 (literal form): imm.i64_val holds
-                 //     a packed (status | body_idx<<16 | headers_idx<<32):
-                 //       bits [ 0:16): HTTP status code (0..65535)
-                 //       bits [16:32): 1-based response_bodies index,
-                 //                     0 = no custom body
-                 //       bits [32:48): 1-based response header_sets index,
-                 //                     0 = no custom headers
-                 //       bits [48:64): reserved (must be 0)
-                 //   operand_count >  0 (value form):   operands[0] is an
-                 //     SSA i32 status code; imm is unused and both
-                 //     body_idx and headers_idx are implicitly 0.
-                 //   Printers/decoders MUST branch on operand_count before
-                 //   reading imm.i64_val — doing otherwise will print
-                 //   garbage for the value form and miss body/header idx
-                 //   in the literal form.
-    RetForward,  // ret.forward upstream [, options]
+    Br,                  // br %cond, then_block, else_block
+    Jmp,                 // jmp target_block
+    RetStatus,           // ret.status — two encodings, disambiguated by operand_count:
+                         //   operand_count == 0 (literal form): imm.i64_val holds
+                         //     a packed (status | body_idx<<16 | headers_idx<<32):
+                         //       bits [ 0:16): HTTP status code (0..65535)
+                         //       bits [16:32): 1-based response_bodies index,
+                         //                     0 = no custom body
+                         //       bits [32:48): 1-based response header_sets index,
+                         //                     0 = no custom headers
+                         //       bits [48:64): reserved (must be 0)
+                         //   operand_count >  0 (value form):   operands[0] is an
+                         //     SSA i32 status code; imm is unused and both
+                         //     body_idx and headers_idx are implicitly 0.
+                         //   Printers/decoders MUST branch on operand_count before
+                         //   reading imm.i64_val — doing otherwise will print
+                         //   garbage for the value form and miss body/header idx
+                         //   in the literal form.
+    RetForward,          // ret.forward upstream [, options]
+    RetForwardBuffered,  // ret.forward_buffered upstream
 
     // ── Yield (I/O suspend → state machine boundary) ──
     YieldTimer,     // yield.timer ms, next_state
@@ -362,7 +363,7 @@ struct Instruction {
     // than range check so opcode reordering can't silently break semantics.
     bool is_terminator() const {
         return op == Opcode::Br || op == Opcode::Jmp || op == Opcode::RetStatus ||
-               op == Opcode::RetForward || is_yield();
+               op == Opcode::RetForward || op == Opcode::RetForwardBuffered || is_yield();
     }
 };
 

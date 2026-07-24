@@ -7328,7 +7328,7 @@ func response_headers(_ resp: Response) -> i32 {
     0
 }
 chain access { after response_headers(resp) }
-route GET "/users" use chain access { return forward(api) }
+route GET "/users" use chain access { return forward(api, buffered: true) }
 )rut";
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
@@ -7347,7 +7347,7 @@ route GET "/users" use chain access { return forward(api) }
     CHECK_EQ(static_cast<u8>(block.insts[block.inst_count - 2].op),
              static_cast<u8>(rir::Opcode::RespCommitHeaders));
     CHECK_EQ(static_cast<u8>(block.insts[block.inst_count - 1].op),
-             static_cast<u8>(rir::Opcode::RetForward));
+             static_cast<u8>(rir::Opcode::RetForwardBuffered));
     rir.destroy();
 }
 
@@ -7368,9 +7368,8 @@ route GET "/users" use chain access { return forward(api) }
     REQUIRE(ast);
     auto hir = analyze_file_heap(ast.value());
     REQUIRE_FALSE(hir);
-    CHECK(
-        hir.error().detail.eq(lit("Response status/body effects require a buffered response and "
-                                  "cannot be combined with forward yet")));
+    CHECK(hir.error().detail.eq(
+        lit("chain after Response mutations require `forward(..., buffered: true)`")));
 }
 
 TEST(frontend, chain_after_rejects_invalid_response_helpers) {
@@ -8253,6 +8252,103 @@ route GET "/x" {
     REQUIRE_FALSE(hir.has_value());
     CHECK(hir.error().detail.eq(
         lit("response-mutating helpers are not supported in conditional pipe")));
+}
+
+TEST(frontend, buffered_forward_lowers_distinct_terminal_and_gates_chain_mutations) {
+    const auto src = R"rut(
+upstream api
+func rewrite(_ resp: Response) -> i32 {
+    resp.status = 201
+    resp.body = "rewritten"
+    resp.set("X-After", "yes")
+    0
+}
+chain rewrite_chain { after rewrite(resp) }
+route GET "/x" use chain rewrite_chain { return forward(api, buffered: true) }
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    CHECK(hir->routes[0].control.direct_term.forward_buffered);
+    CHECK(hir->routes[0].control.direct_term.commit_response_mutations);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    CHECK(mir->functions[0].blocks[0].term.forward_buffered);
+    FrontendRirModule rir{};
+    REQUIRE(lower_to_rir(mir.value(), rir));
+    const auto& block = rir.module.functions[0].blocks[0];
+    REQUIRE_GT(block.inst_count, 0u);
+    CHECK(block.insts[block.inst_count - 1].op == rir::Opcode::RetForwardBuffered);
+    rir.destroy();
+
+    const auto streaming = R"rut(
+upstream api
+func rewrite(_ resp: Response) -> i32 { resp.status = 201 0 }
+chain rewrite_chain { after rewrite(resp) }
+route GET "/x" use chain rewrite_chain { return forward(api) }
+)rut";
+    auto bad_lexed = lex(lit(streaming));
+    REQUIRE(bad_lexed);
+    auto bad_ast = parse_file_heap(bad_lexed.value());
+    REQUIRE(bad_ast);
+    auto bad_hir = analyze_file_heap(bad_ast.value());
+    REQUIRE_FALSE(bad_hir.has_value());
+    CHECK(bad_hir.error().detail.eq(
+        lit("chain after Response mutations require `forward(..., buffered: true)`")));
+}
+
+TEST(frontend, buffered_forward_rejects_false_and_request_rewrites) {
+    {
+        const auto src = R"rut(
+upstream api
+route GET "/x" { return forward(api, buffered: false) }
+)rut";
+        auto lexed = lex(lit(src));
+        REQUIRE(lexed);
+        auto ast = parse_file_heap(lexed.value());
+        REQUIRE_FALSE(ast.has_value());
+        CHECK(ast.error().detail.eq(lit("forward buffered mode requires `buffered: true`")));
+    }
+
+    const char* rewrite_sources[] = {
+        R"rut(
+upstream api
+route GET "/x" { return forward(api, buffered: true, set_path: "/v2") }
+)rut",
+        R"rut(
+upstream api
+route GET "/x" {
+    return forward(api, buffered: true, set_header: { "X-Version": "2" })
+}
+)rut",
+        R"rut(
+upstream api
+route GET "/x" {
+    req.set("X-Version", "2")
+    return forward(api, buffered: true)
+}
+)rut",
+        R"rut(
+upstream api
+route GET "/x" {
+    req.add("X-Version", "2")
+    return forward(api, buffered: true)
+}
+)rut",
+    };
+    for (const char* src : rewrite_sources) {
+        auto lexed = lex(lit(src));
+        REQUIRE(lexed);
+        auto ast = parse_file_heap(lexed.value());
+        REQUIRE(ast);
+        auto hir = analyze_file_heap(ast.value());
+        REQUIRE_FALSE(hir.has_value());
+        CHECK(hir.error().detail.eq(
+            lit("buffered forward cannot yet combine response buffering with request rewrites")));
+    }
 }
 
 TEST(frontend, parse_func_param_accepts_underscore_label) {

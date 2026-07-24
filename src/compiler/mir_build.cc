@@ -1335,6 +1335,7 @@ FrontendResult<MirModule*> build_mir(const HirModule& module) {
             out->status_code = term.status_code;
             out->commit_response_mutations = term.commit_response_mutations;
             out->upstream_index = term.upstream_index;
+            out->forward_buffered = term.forward_buffered;
             out->kind = term.kind == HirTerminatorKind::ReturnStatus
                             ? MirTerminatorKind::ReturnStatus
                             : MirTerminatorKind::ForwardUpstream;

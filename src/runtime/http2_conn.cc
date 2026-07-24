@@ -39,6 +39,7 @@ void Http2Conn::init() {
     pending_content_length = 0;
     pending_has_content_length = false;
     pending_buffer_body = false;
+    pending_request_forwardable = false;
     pending_overflow = false;
     pending_route_config = nullptr;
     pending_route = nullptr;
@@ -59,6 +60,9 @@ void Http2Conn::init() {
     async_state = 0;
     __builtin_memset(async_handler_ctx_storage, 0, sizeof(async_handler_ctx_storage));
     async_route = nullptr;
+    async_upstream_id = 0;
+    async_apply_response_mutations = false;
+    async_request_forwardable = false;
     async_resp_len = 0;
 }
 
@@ -459,6 +463,7 @@ void clear_pending_upload(Http2Conn& c, u32 stream_id) {
     c.pending_content_length = 0;
     c.pending_has_content_length = false;
     c.pending_buffer_body = false;
+    c.pending_request_forwardable = false;
     c.pending_overflow = false;
     c.pending_route_config = nullptr;
     c.pending_route = nullptr;

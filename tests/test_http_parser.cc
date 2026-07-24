@@ -3586,7 +3586,28 @@ TEST(response_parser, chunked) {
     CHECK_EQ(static_cast<u8>(s), static_cast<u8>(ParseStatus::Complete));
     CHECK_EQ(resp.status_code, 200);
     CHECK(resp.chunked);
+    CHECK_FALSE(resp.unsupported_transfer_coding);
     CHECK(!resp.has_content_length);
+}
+
+TEST(response_parser, records_transfer_codings_before_chunked) {
+    HttpResponseParser parser;
+    ParsedResponse resp;
+    auto s = parse_response(
+        "HTTP/1.1 200 OK\r\nTransfer-Encoding: gzip, chunked\r\n\r\n", &resp, &parser);
+    CHECK_EQ(static_cast<u8>(s), static_cast<u8>(ParseStatus::Complete));
+    CHECK(resp.chunked);
+    CHECK(resp.unsupported_transfer_coding);
+}
+
+TEST(response_parser, rejects_repeated_chunked_transfer_codings) {
+    HttpResponseParser parser;
+    ParsedResponse resp;
+    auto s = parse_response(
+        "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked, chunked\r\n\r\n", &resp, &parser);
+    CHECK_EQ(static_cast<u8>(s), static_cast<u8>(ParseStatus::Complete));
+    CHECK(resp.chunked);
+    CHECK(resp.unsupported_transfer_coding);
 }
 
 TEST(response_parser, connection_close) {

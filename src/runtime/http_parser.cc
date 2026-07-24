@@ -504,8 +504,12 @@ static inline ParseStatus apply_semantic_header_response(
                 while (ti < vlen && val[ti] != ',' && val[ti] != ' ' && val[ti] != '\t') ti++;
                 u32 tok_len = ti - tok_start;
                 if (tok_len == 7 && str_ci_eq(val + tok_start, "chunked", 7)) {
-                    resp->chunked = true;
-                    break;
+                    if (resp->chunked)
+                        resp->unsupported_transfer_coding = true;
+                    else
+                        resp->chunked = true;
+                } else {
+                    resp->unsupported_transfer_coding = true;
                 }
             }
             return ParseStatus::Complete;
