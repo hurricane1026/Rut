@@ -44,10 +44,11 @@ completed before the call returned.
   A `true` result means *accepted*, not *activated*; `202 Accepted` is the
   prescriptive route response.
 - `mark` returns `true` only when it atomically published the requested manual
-  override for a `Server` belonging to the currently active config generation.
-  It returns `false` for a stale/foreign server identity or when control-plane
-  mutation is unavailable. A successful call is already visible through the
-  process-wide override table; it is not merely queued.
+  override for a `Server` belonging to the invocation's pinned, retained config
+  generation and override table. It returns `false` for a foreign identity, a
+  retired generation/table, or when control-plane mutation is unavailable. A
+  successful call is already visible through that table; it is not merely
+  queued.
 
 Ignoring either boolean is legal but explicit. The calls are values, not
 statement-only special cases, so a route or timer can fail closed.
@@ -79,6 +80,14 @@ tick and emit the same bounded skipped-tick event; they do not start or queue a
 second invocation. The next eligible tick may start only after the active
 invocation has torn down its program pin. Thus completion order cannot reorder
 health publications from nominally later timer periods.
+
+Publication does not invalidate an already admitted predecessor timer
+registration. Until the registration's owner shard processes its install
+boundary and retires it, an invocation pins that predecessor generation and
+validates `Server` values against the retained predecessor table. Retirement
+closes further admission before the table can be reclaimed. A predecessor mark
+therefore cannot be silently rejected merely because `N+1` was published while
+the owner shard was still installing it.
 
 ## Reload coordinator
 
@@ -407,13 +416,15 @@ out-of-order, or unobservable probe version is `Unsupported`.
 Upstream in-flight concurrency accounting is likewise identity-scoped. The
 counter is owned by a never-reused stable upstream allocation identity. Its
 compatibility predicate is independent of both balancing policy and endpoint
-roster: when validation proves the same logical upstream and identical
-`max_inflight` scope and value, adjacent generations share the allocation even if
-the candidate changes policy, adds, removes, or replaces endpoints. Their combined
-traffic therefore cannot exceed the process-wide cap during drain. Only a changed
-logical-upstream identity, limit scope, or limit value receives a new allocation
-while its predecessor drains. Endpoint-scoped selection, health, and measurement
-state still follows its stricter endpoint compatibility rules. Every release token
+roster and of the configured `max_inflight` value: when validation proves the
+same logical upstream and limit scope, adjacent generations share the allocation
+even if the candidate changes policy, endpoints, or the limit. Each admission
+compares the shared occupancy with the pinned generation's configured limit, so
+a lowered `N+1` limit cannot admit new `N+1` work while predecessor acquisitions
+already meet or exceed it. Only a changed logical-upstream identity or limit
+scope receives a new allocation while its predecessor drains. Endpoint-scoped
+selection, health, and measurement state still follows its stricter endpoint
+compatibility rules. Every release token
 contains the exact concurrency-allocation identity and acquisition version, so
 completion decrements precisely the counter it acquired; numeric `(generation,
 upstream_id)` coincidence alone never authorizes sharing. Capture records every
@@ -431,19 +442,22 @@ release or later grant; absent or inconsistent initial occupancy is
 
 Retry-budget history is owned by a never-reused stable upstream allocation,
 not by a numeric upstream slot. Validation shares the allocation across
-adjacent generations only when endpoint identity and the complete retry and
-budget policies are compatible; otherwise `N+1` starts a fresh allocation and
-`N` retains its history through predecessor drain. Each retry grant/reject
-records the allocation identity, monotonically assigned arbitration version,
-request/attempt identity, counters before and after the decision, and workload
-event position. Replay consumes the recorded decisions rather than rerunning
-process-global races; missing, duplicate, or reordered decisions are
-`Unsupported`.
+adjacent generations whenever the logical upstream and complete retry/budget
+policies are compatible, independently of endpoint roster changes. Endpoint
+selection remains generation-scoped, but adding, removing, or replacing a
+backend cannot reset upstream-wide retry history. An incompatible policy starts
+a fresh allocation while `N` retains its history through predecessor drain.
+Each retry grant/reject records the allocation identity, monotonically assigned
+arbitration version, request/attempt identity, counters before and after the
+decision, and workload event position. Replay consumes the recorded decisions
+rather than rerunning process-global races; missing, duplicate, or reordered
+decisions are `Unsupported`.
 
 Manual state has priority over probe and passive-ejection state so a later local
 probe cannot silently undo an operator program's verdict. Calls from the one
 shard-pinned timer are ordered by program order. The generation check makes a
-late timer invocation against a replaced config definitely not applied.
+late invocation apply only to its pinned retained table; a foreign or retired
+table is definitely not applied.
 
 ## Failure and observation
 
@@ -666,8 +680,10 @@ shard's installed generation, outstanding invocation/session/lifecycle/`fire`
 pins, any admitted reload and its request id/phase, the next request and event
 sequences, generation-scoped override and probe tables with their versions,
 timer/debounce state, and initial rate-limit, retry-budget, and concurrency
-arbitration state (including live acquisition tokens). It also includes every
-generation-local load-balancer cursor and PRNG position, per-server live
+arbitration state (including live acquisition tokens), plus complete
+circuit-breaker/outlier allocation state: failure counters, open deadlines,
+half-open tokens, ejection state, and arbitration versions. It also includes
+every generation-local load-balancer cursor and PRNG position, per-server live
 connection counts and tokens, latency/EWMA samples, passive-health inputs, and
 other mutable field visible to a built-in policy or Rut `Server` value. Each
 subsequent mutation carries a monotonically ordered version, and every selection
@@ -690,6 +706,14 @@ post-baseline resolution, expiry, refresh, and failure event. Until that bounded
 schema and event transcript are implemented, starting or continuing capture
 with a hostname-backed upstream is `Unsupported`; replay never consults live DNS
 or silently re-resolves a captured hostname.
+
+The automatic RFC response cache used by `cache: .auto` is also baseline state.
+Capture must either checkpoint every warm entry with its response bytes,
+freshness/age state, `Vary` key and request metadata, eviction/order metadata,
+and all later cache mutations, or drain and invalidate the automatic cache before
+assigning the first workload-event sequence. Replay restores the checkpoint or
+starts from the correspondingly recorded empty cache. Starting from an
+unrecorded empty cache when production could serve a warm hit is `Unsupported`.
 
 Per-shard and aggregate stats/metrics counters, histograms, and snapshot epochs
 are checkpointed in the baseline. As an equivalent bounded representation,
