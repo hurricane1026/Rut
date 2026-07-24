@@ -222,6 +222,8 @@ req.ctx.userId               // typed per-request context (user declares struct 
 
 // Response construction — names are literal; values may be runtime strings
 let resp = response(429)          // ✅ literal status
+let initialStatus = resp.status   // ✅ i32; observes the latest pending replacement
+let initialBody = resp.body       // ✅ str; initially empty, then pending-aware
 resp.set("Retry-After", "60")     // ✅ literal replace/dedupe
 resp.set("X-Request-Path", req.path) // ✅ dynamic value
 resp.remove("Server")             // ✅ literal delete
@@ -247,8 +249,10 @@ be used by `chain after` after a yield, and require explicit buffered forwarding
 when applied to a forwarded response. Body replacement owns up to 4 KiB in the
 request/stream context; plain `str` and reusable `Json` values therefore survive
 resume without borrowing serializer scratch. Overflow or a runtime status
-outside 100...599 fails closed as 500. Reading either field and mutating a
-streaming forwarded response remain ⏳.
+outside 100...599 fails closed as 500. Status/body reads are supported on a
+handler-local builder and observe its latest pending replacement; the status
+carrier is currently plain `i32`. Reading or mutating a streaming forwarded
+response still requires an explicitly buffered response and remains ⏳.
 
 ## State types (top-level, per-shard, bounded)
 

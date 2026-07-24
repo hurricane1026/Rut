@@ -84,6 +84,27 @@ u64 mutable_body_handler(void*, jit::HandlerCtx* ctx, const u8*, u32, void*) {
     return result.pack();
 }
 
+u64 snapshotted_header_handler(void*, jit::HandlerCtx* ctx, const u8*, u32, void*) {
+    static constexpr char kBody[] = "saved-body";
+    static constexpr char kName[] = "X-Saved";
+    rut_helper_resp_set_body(ctx, kBody, sizeof(kBody) - 1);
+    const char* snapshot = nullptr;
+    u32 snapshot_len = 0;
+    rut_helper_resp_body(ctx, nullptr, 0, &snapshot, &snapshot_len);
+    rut_helper_resp_set_header(ctx, kName, sizeof(kName) - 1, snapshot, snapshot_len);
+    rut_helper_resp_commit_headers(ctx);
+    return jit::HandlerResult::make_status(200).pack();
+}
+
+u64 long_header_handler(void*, jit::HandlerCtx* ctx, const u8*, u32, void*) {
+    static char value[5000];
+    __builtin_memset(value, 'v', sizeof(value));
+    static constexpr char kName[] = "X-Long";
+    rut_helper_resp_set_header(ctx, kName, sizeof(kName) - 1, value, sizeof(value));
+    rut_helper_resp_commit_headers(ctx);
+    return jit::HandlerResult::make_status(200).pack();
+}
+
 u64 timer_handler(void*, jit::HandlerCtx* ctx, const u8*, u32, void*) {
     if (ctx->state == 0)
         return jit::HandlerResult::make_yield_payload(1, jit::YieldKind::Timer, 25).pack();
@@ -223,20 +244,64 @@ TEST(harness_handler, owns_mutated_response_body_after_driver_returns) {
     CHECK(std::memcmp(result.dynamic_response_body, "stable-body", 11) == 0);
 }
 
+TEST(harness_handler, owns_snapshotted_response_header_values_after_driver_returns) {
+    harness::HandlerExecution execution{};
+    execution.init(&snapshotted_header_handler, nullptr, nullptr, 0);
+    harness::HarnessSpec spec{};
+    spec.layer = harness::ExecutionLayer::Handler;
+
+    const auto result = harness::drive_handler_deterministically({execution}, spec);
+    REQUIRE_EQ(result.harness.outcome, harness::Outcome::Passed);
+    REQUIRE_EQ(result.response_header_count, 1u);
+    CHECK(result.response_header_mutations[0].name.eq({"X-Saved", 7}));
+    CHECK(result.response_header_mutations[0].value.eq({"saved-body", 10}));
+}
+
+TEST(harness_handler, owns_long_response_headers_across_result_copies) {
+    harness::HandlerExecution execution{};
+    execution.init(&long_header_handler, nullptr, nullptr, 0);
+    harness::HarnessSpec spec{};
+    spec.layer = harness::ExecutionLayer::Handler;
+
+    auto result = harness::drive_handler_deterministically({execution}, spec);
+    REQUIRE_FALSE(result.response_header_overflow);
+    REQUIRE_EQ(result.response_header_count, 1u);
+    REQUIRE_EQ(result.response_header_mutations[0].value.len, 5000u);
+    CHECK(result.response_header_mutations[0].value.ptr == result.response_header_values[0].data());
+
+    auto copied = result;
+    CHECK(copied.response_header_mutations[0].value.ptr == copied.response_header_values[0].data());
+    CHECK(copied.response_header_mutations[0].value.ptr !=
+          result.response_header_mutations[0].value.ptr);
+    CHECK_EQ(copied.response_header_mutations[0].value.ptr[4999], 'v');
+
+    auto moved = static_cast<harness::HandlerExecutionResult&&>(copied);
+    CHECK(moved.response_header_mutations[0].value.ptr == moved.response_header_values[0].data());
+    CHECK_EQ(moved.response_header_mutations[0].value.ptr[4999], 'v');
+}
+
 TEST(harness_handler, copying_session_clones_mutated_response_body_storage) {
     harness::HandlerExecution original{};
     original.init(&immediate_handler, nullptr, nullptr, 0);
     static const char kBody[] = "fork-safe";
     rut_helper_resp_set_body(&original.frame.context, kBody, sizeof(kBody) - 1);
     REQUIRE(original.frame.context.response_body_mutation_storage != nullptr);
+    const char* snapshot = nullptr;
+    u32 snapshot_len = 0;
+    rut_helper_resp_body(&original.frame.context, nullptr, 0, &snapshot, &snapshot_len);
+    REQUIRE(snapshot != nullptr);
+    REQUIRE_EQ(snapshot_len, sizeof(kBody) - 1);
 
     harness::HandlerExecution fork = original;
     REQUIRE(fork.frame.context.response_body_mutation_storage != nullptr);
+    CHECK(fork.frame.context.response_body_snapshot_storage ==
+          original.frame.context.response_body_snapshot_storage);
     CHECK(fork.frame.context.response_body_mutation_storage !=
           original.frame.context.response_body_mutation_storage);
     __builtin_memset(original.frame.context.response_body_mutation_storage, 'x', sizeof(kBody) - 1);
     CHECK(std::memcmp(
               fork.frame.context.response_body_mutation_storage, kBody, sizeof(kBody) - 1) == 0);
+    CHECK(std::memcmp(snapshot, kBody, sizeof(kBody) - 1) == 0);
 }
 
 TEST(harness_handler, advances_virtual_time_for_timer_yield) {
@@ -931,6 +996,33 @@ TEST(harness_scenario, committed_response_status_and_body_are_observed_after_wai
     CHECK_EQ(result.terminal.status_code, 201);
     CHECK_EQ(result.harness.handler_resumes, 1u);
     CHECK(result.harness.output_bytes > sizeof("after-wait") - 1);
+    CHECK_EQ(target.destroy(), harness::CleanupOutcome::Clean);
+}
+
+TEST(harness_scenario, response_field_reads_drive_committed_status_and_body) {
+    TempSource source;
+    REQUIRE(
+        source.write("route GET \"/x\" { let resp = response(200) let initial = resp.status "
+                     "resp.status = initial + 1 resp.body = req.path resp.status = resp.status + 1 "
+                     "resp.body = resp.body return resp }\n"));
+    harness::SourceTarget target{};
+    harness::HarnessSpec load_spec{};
+    REQUIRE_EQ(target.prepare({source.path, jit::OptLevel::O0}, load_spec).outcome,
+               harness::Outcome::Passed);
+
+    const char request[] = "GET /x HTTP/1.1\r\nHost: test\r\n\r\n";
+    harness::ScenarioSpec scenario{};
+    scenario.target = &target;
+    scenario.path = {"/x", 2};
+    scenario.method = kRouteMethodGet;
+    scenario.request_data = reinterpret_cast<const u8*>(request);
+    scenario.request_len = sizeof(request) - 1;
+    scenario.expected = {true, jit::HandlerAction::ReturnStatus, 202};
+
+    const auto result = harness::drive_scenario(scenario, scripted_scenario_harness());
+    REQUIRE_EQ(result.harness.outcome, harness::Outcome::Passed);
+    CHECK_EQ(result.terminal.status_code, 202);
+    CHECK(result.harness.output_bytes > sizeof("/x") - 1);
     CHECK_EQ(target.destroy(), harness::CleanupOutcome::Clean);
 }
 

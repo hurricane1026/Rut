@@ -177,6 +177,8 @@ enum class Opcode : u8 {
     ReqSetHeader,       // req.set_header "Name", %val
     ReqAddHeader,       // req.add_header "Name", %val
     RespHeader,         // %opt = resp.header "Name", %fallback_opt
+    RespStatus,         // %status = resp.status %fallback_i32
+    RespBody,           // %body = resp.body %fallback_str
     RespSetHeader,      // resp.set_header "Name", %val
     RespAddHeader,      // resp.add_header "Name", %val
     RespRemoveHeader,   // resp.remove_header "Name"

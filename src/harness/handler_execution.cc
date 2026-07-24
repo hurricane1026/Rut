@@ -57,6 +57,7 @@ HandlerExecution& HandlerExecution::operator=(const HandlerExecution& other) {
     if (this == &other) return *this;
     rut_helper_resp_release_body_storage(&frame.context);
     frame = other.frame;
+    jit::retain_response_body_snapshot_storage(&frame.context);
     frame.context.response_body_mutation_storage = nullptr;
     if (other.frame.context.response_body_mutation_storage != nullptr) {
         frame.context.response_body_mutation_storage =
@@ -93,6 +94,42 @@ HandlerExecution& HandlerExecution::operator=(const HandlerExecution& other) {
 
 HandlerExecution::~HandlerExecution() {
     rut_helper_resp_release_body_storage(&frame.context);
+}
+
+HandlerExecutionResult::HandlerExecutionResult(const HandlerExecutionResult& other) {
+    *this = other;
+}
+
+HandlerExecutionResult& HandlerExecutionResult::operator=(const HandlerExecutionResult& other) {
+    if (this == &other) return *this;
+    harness = other.harness;
+    terminal = other.terminal;
+    has_terminal = other.has_terminal;
+    consumed_events = other.consumed_events;
+    __builtin_memcpy(
+        dynamic_response_body, other.dynamic_response_body, sizeof(dynamic_response_body));
+    dynamic_response_body_len = other.dynamic_response_body_len;
+    dynamic_response_body_valid = other.dynamic_response_body_valid;
+    response_header_count = other.response_header_count;
+    response_header_overflow = other.response_header_overflow;
+    for (u32 i = 0; i < jit::kMaxResponseHeaderMutations; i++) {
+        response_header_mutations[i] = other.response_header_mutations[i];
+        response_header_values[i] = other.response_header_values[i];
+        if (response_header_mutations[i].value.ptr != nullptr) {
+            response_header_mutations[i].value.ptr = response_header_values[i].data();
+            response_header_mutations[i].value.len =
+                static_cast<u32>(response_header_values[i].size());
+        }
+    }
+    return *this;
+}
+
+HandlerExecutionResult::HandlerExecutionResult(HandlerExecutionResult&& other) {
+    *this = other;
+}
+
+HandlerExecutionResult& HandlerExecutionResult::operator=(HandlerExecutionResult&& other) {
+    return *this = static_cast<const HandlerExecutionResult&>(other);
 }
 
 void HandlerExecution::init(
@@ -361,8 +398,14 @@ HandlerExecutionResult drive_handler_deterministically(const DeterministicHandle
     }
     out.response_header_count = execution.frame.context.response_header_count;
     out.response_header_overflow = execution.frame.context.response_header_overflow;
-    for (u32 i = 0; i < out.response_header_count; i++)
+    for (u32 i = 0; i < out.response_header_count; i++) {
         out.response_header_mutations[i] = execution.frame.context.response_header_mutations[i];
+        auto& mutation = out.response_header_mutations[i];
+        if (mutation.value.ptr != nullptr) {
+            out.response_header_values[i].assign(mutation.value.ptr, mutation.value.len);
+            mutation.value.ptr = out.response_header_values[i].data();
+        }
+    }
     if (!publisher.emit(ObservationKind::HandlerTerminated,
                         static_cast<u64>(result.action),
                         result.action == jit::HandlerAction::ReturnStatus ? result.status_code
