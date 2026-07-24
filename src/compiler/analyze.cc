@@ -4093,10 +4093,6 @@ static bool hir_expr_reads_wait_result_with_locals(const HirExpr& expr,
                                                    const HirLocal* locals,
                                                    u32 local_count,
                                                    u32 depth = 0);
-static bool is_static_for_iter_expr(const HirExpr& expr,
-                                    const HirLocal* locals,
-                                    u32 local_count,
-                                    u32 depth = 0);
 static FrontendResult<HirExpr> analyze_array_iter_expr(const AstExpr& expr,
                                                        HirRoute* route,
                                                        const HirModule& mod,
@@ -10065,18 +10061,18 @@ static FrontendResult<HirExpr> analyze_expr(const AstExpr& expr,
     return analyze_expr_impl(expr, route, mod, locals, local_count, binding, false);
 }
 
-static bool is_static_for_iter_expr(const HirExpr& expr,
-                                    const HirLocal* locals,
-                                    u32 local_count,
-                                    u32 depth) {
-    if (depth > local_count + HirRoute::kMaxLocals) return false;
-    if (expr.kind == HirExprKind::ArrayLit) return true;
-    if (expr.kind != HirExprKind::LocalRef) return false;
+static const HirExpr* static_for_iter_array_expr(const HirExpr& expr,
+                                                 const HirLocal* locals,
+                                                 u32 local_count,
+                                                 u32 depth) {
+    if (depth > local_count + HirRoute::kMaxLocals) return nullptr;
+    if (expr.kind == HirExprKind::ArrayLit) return &expr;
+    if (expr.kind != HirExprKind::LocalRef) return nullptr;
     for (u32 i = 0; i < local_count; i++) {
         if (locals[i].ref_index == expr.local_index)
-            return is_static_for_iter_expr(locals[i].init, locals, local_count, depth + 1);
+            return static_for_iter_array_expr(locals[i].init, locals, local_count, depth + 1);
     }
-    return false;
+    return nullptr;
 }
 
 static bool static_for_iter_len(
@@ -16743,19 +16739,20 @@ static FrontendResult<u32> analyze_for_stmt(const AstStatement& stmt,
         return frontend_error(FrontendError::UnsupportedSyntax,
                               stmt.expr.span,
                               lit_str("static for-loop iterator must be an array"));
-    if (!is_static_for_iter_expr(iter.value(), route->locals.data, route->locals.len, 0))
+    const HirExpr* iter_array =
+        static_for_iter_array_expr(iter.value(), route->locals.data, route->locals.len, 0);
+    if (iter_array == nullptr)
         return frontend_error(
             FrontendError::UnsupportedSyntax,
             stmt.expr.span,
             lit_str("static for-loop iterator must be a compile-time array literal or alias"));
-    if (stmt.expr.kind == AstExprKind::ArrayLit)
-        for (u32 ai = 0; ai < iter->args.len; ai++)
-            if (iter->args[ai] != nullptr && iter->args[ai]->may_error)
-                return frontend_error(
-                    FrontendError::UnsupportedSyntax,
-                    stmt.expr.args[ai]->span,
-                    lit_str("runtime-fallible inline elements are not supported in a static "
-                            "for-loop iterator"));
+    for (u32 ai = 0; ai < iter_array->args.len; ai++)
+        if (iter_array->args[ai] != nullptr && iter_array->args[ai]->may_error)
+            return frontend_error(
+                FrontendError::UnsupportedSyntax,
+                iter_array->args[ai]->span,
+                lit_str("runtime-fallible inline elements are not supported in a static "
+                        "for-loop iterator"));
 
     const auto& iter_shape = mod.type_shapes[iter->shape_index];
     if (iter_shape.array_elem_shape_index >= mod.type_shapes.len)
@@ -17579,6 +17576,8 @@ static FrontendResult<u32> analyze_for_stmt(const AstStatement& stmt,
                 arm.capture_group = static_cast<u8>(ai + 1);
                 MatchPayloadBinding arm_binding{};
                 const MatchPayloadBinding* arm_binding_ptr = nullptr;
+                u32 arm_guard_carrier_start = route->locals.len;
+                u32 arm_guard_carrier_end = route->locals.len;
                 if (!ast_arm.is_wildcard) {
                     auto pattern = analyze_match_pattern(*ast_arm.pattern,
                                                          subject.value(),
@@ -17674,7 +17673,9 @@ static FrontendResult<u32> analyze_for_stmt(const AstStatement& stmt,
                             return frontend_error(FrontendError::UnsupportedSyntax,
                                                   ast_arm.guard->span);
                         arm.has_arm_guard = true;
+                        arm.arm_guard_precedes_prelude = true;
                         arm.arm_guard = guard.value();
+                        arm_guard_carrier_end = route->locals.len;
                     }
                 } else {
                     seen_wildcard = true;
@@ -17969,6 +17970,16 @@ static FrontendResult<u32> analyze_for_stmt(const AstStatement& stmt,
                     // same result instead of re-evaluating runtime work.
                     HirExpr source_arm_guard_ref{};
                     if (arm.has_arm_guard) {
+                        for (u32 li = arm_guard_carrier_start; li < arm_guard_carrier_end; li++) {
+                            if (arm.locals.len >= HirForLoopMatchArm::kMaxLocals)
+                                return frontend_error(FrontendError::TooManyItems,
+                                                      arm.arm_guard.span);
+                            arm.local_guard_depth[arm.locals.len] = 0;
+                            if (!arm.locals.push(route->locals[li]))
+                                return frontend_error(FrontendError::TooManyItems,
+                                                      arm.arm_guard.span);
+                            route->locals[li].name = {};
+                        }
                         HirLocal guard_local{};
                         guard_local.span = arm.arm_guard.span;
                         guard_local.ref_index =

@@ -3134,13 +3134,16 @@ FrontendResult<MirModule*> build_mir(const HirModule& module) {
             };
             auto body_match_arm_entry_index = [&](const HirForLoopMatchArm& arm,
                                                   u32 arm_index) -> u32 {
-                if (arm.has_arm_guard) return body_match_guard_index[arm_index];
+                if (arm.has_arm_guard && arm.arm_guard_precedes_prelude)
+                    return body_match_guard_index[arm_index];
                 if (arm.guards.len != 0) return body_match_prelude_guard_index[arm_index][0];
+                if (arm.has_arm_guard) return body_match_guard_index[arm_index];
                 return body_match_case_index[arm_index];
             };
             auto body_match_arm_post_prelude_index = [&](const HirForLoopMatchArm& arm,
                                                          u32 arm_index) -> u32 {
-                if (arm.has_arm_guard) return body_match_guard_index[arm_index];
+                if (arm.has_arm_guard && !arm.arm_guard_precedes_prelude)
+                    return body_match_guard_index[arm_index];
                 return body_match_case_index[arm_index];
             };
             auto body_match_arm_body_index = [&](const HirForLoopMatchArm&, u32 arm_index) -> u32 {
@@ -3165,7 +3168,9 @@ FrontendResult<MirModule*> build_mir(const HirModule& module) {
                         guard_block.term.cond = cond.value();
                         guard_block.term.then_block =
                             gi + 1 < arm.guards.len ? body_match_prelude_guard_index[ai][gi + 1]
-                                                    : body_match_case_index[ai];
+                            : arm.has_arm_guard && !arm.arm_guard_precedes_prelude
+                                ? body_match_guard_index[ai]
+                                : body_match_case_index[ai];
                         guard_block.term.else_block = body_match_prelude_guard_fail_index[ai][gi];
                         if (!fn.blocks.push(guard_block))
                             return frontend_error(FrontendError::TooManyItems, fn.span);
@@ -3433,8 +3438,10 @@ FrontendResult<MirModule*> build_mir(const HirModule& module) {
                     const ForLoopCtx* body_ctx = for_loop_match_arm_ctx(arm, ai, terminating_ctx);
                     MirBlock guard_block{};
                     guard_block.label = cont_label();
-                    auto effects =
-                        append_body_match_arm_effects(&guard_block, ai, arm.guards.len, arm.span);
+                    const u32 guard_effect_depth =
+                        arm.arm_guard_precedes_prelude ? 0 : arm.guards.len;
+                    auto effects = append_body_match_arm_effects(
+                        &guard_block, ai, guard_effect_depth, arm.span);
                     if (!effects) return core::make_unexpected(effects.error());
                     guard_block.term.kind = MirTerminatorKind::Branch;
                     guard_block.term.span = arm.arm_guard.span;
@@ -3442,8 +3449,9 @@ FrontendResult<MirModule*> build_mir(const HirModule& module) {
                     if (!guard) return core::make_unexpected(guard.error());
                     guard_block.term.cond = guard.value();
                     guard_block.term.then_block =
-                        arm.guards.len != 0 ? body_match_prelude_guard_index[ai][0]
-                                            : body_match_arm_body_index(body_match.arms[ai], ai);
+                        arm.arm_guard_precedes_prelude && arm.guards.len != 0
+                            ? body_match_prelude_guard_index[ai][0]
+                            : body_match_arm_body_index(body_match.arms[ai], ai);
                     guard_block.term.else_block = body_match_fallthrough_target(ai);
                     if (!fn.blocks.push(guard_block))
                         return frontend_error(FrontendError::TooManyItems, fn.span);

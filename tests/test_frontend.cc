@@ -33473,6 +33473,68 @@ route GET "/x" {
     rir.destroy();
 }
 
+TEST(frontend, static_loop_runtime_source_arm_guard_latch_precedes_body_prelude) {
+    const char* src = R"rut(
+route GET "/x" {
+    for item in [1] {
+        match item {
+            1 if req.http11 => {
+                guard req.http10 else { return 400 }
+                match item { 1 => return 201 _ => return 202 }
+            }
+            _ => return 203
+        }
+    }
+    return 500
+}
+)rut";
+    FrontendRirModule rir{};
+    REQUIRE(lower_src_to_rir(src, rir));
+    CHECK(rir::verify_module(rir.module).ok);
+    rir.destroy();
+}
+
+TEST(frontend, static_loop_source_arm_guard_latch_retains_helper_carriers) {
+    const char* src = R"rut(
+func duplicate(values: [str]) -> [[str]] => [values, values]
+func inspect(_ groups: [[str]], flag: bool) -> bool => flag
+route GET "/x" {
+    for item in [1] {
+        match item {
+            1 if inspect(duplicate(req.queryAll("x")), req.http11) => {
+                match item { 1 => return 201 _ => return 202 }
+            }
+            _ => return 203
+        }
+    }
+    return 500
+}
+)rut";
+    FrontendRirModule rir{};
+    REQUIRE(lower_src_to_rir(src, rir));
+    CHECK(rir::verify_module(rir.module).ok);
+    rir.destroy();
+}
+
+TEST(frontend, static_loop_iterator_alias_rejects_fallible_elements) {
+    const char* src = R"rut(
+func maybe(ok: bool) -> i32 { if ok { 7 } else { error(.timeout) } }
+route GET "/x" {
+    let candidate = maybe(req.http11)
+    let values = [candidate]
+    for value in values { return 200 }
+    return 500
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE_FALSE(hir.has_value());
+    CHECK_EQ(hir.error().code, FrontendError::UnsupportedSyntax);
+}
+
 TEST(frontend, nested_static_loop_matches_accept_closed_exhaustive_sets) {
     const char* sources[] = {
         R"rut(

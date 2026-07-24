@@ -1011,6 +1011,9 @@ struct HirForLoopMatchArm {
     u32 bind_tuple_variant_indices[kMaxTupleSlots]{};
     u32 bind_tuple_struct_indices[kMaxTupleSlots]{};
     bool has_arm_guard = false;
+    // Source-arm guards run before body preludes; guards synthesized while
+    // flattening a nested body match run after those preludes.
+    bool arm_guard_precedes_prelude = false;
     HirExpr arm_guard{};
     BodyKind body_kind = BodyKind::Direct;
     static constexpr u32 kMaxLocals = 4;
