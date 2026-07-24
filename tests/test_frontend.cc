@@ -7674,6 +7674,31 @@ route GET "/x" {
         lit("Response.body reads in conditional value branches are not supported")));
 }
 
+TEST(frontend, response_body_reads_in_guard_failure_locals_are_rejected) {
+    const char* src = R"rut(
+func choose(flag: bool) -> str {
+    let resp = response(200)
+    resp.body = "pending"
+    if flag { "ok" } else { resp.body }
+}
+route GET "/x" {
+    guard req.http11 else {
+        let saved = choose(req.http11)
+        return 400
+    }
+    return 200
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE_FALSE(hir.has_value());
+    CHECK(hir.error().detail.eq(
+        lit("Response.body reads in conditional value branches are not supported")));
+}
+
 TEST(frontend, nested_call_arguments_cannot_reorder_response_reads_and_mutations) {
     const char* src = R"rut(
 func mutate(_ resp: Response) -> i32 {
@@ -7722,6 +7747,52 @@ route GET "/x" {
         lit("response-mutating helper arguments cannot follow an earlier Response field read")));
 }
 
+TEST(frontend, response_field_call_arguments_cannot_precede_callee_mutations) {
+    const char* src = R"rut(
+func rewrite(value: i32, _ resp: Response) -> i32 {
+    resp.status = 202
+    value
+}
+route GET "/x" {
+    let resp = response(200)
+    resp.status = 201
+    let selected = rewrite(resp.status, resp)
+    return resp
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE_FALSE(hir.has_value());
+    CHECK(hir.error().detail.eq(
+        lit("response-mutating helpers cannot receive a Response field read")));
+}
+
+TEST(frontend, piped_response_reads_cannot_precede_fallback_argument_mutations) {
+    const char* src = R"rut(
+func mutate(_ resp: Response) -> i32 {
+    resp.status = 202
+    1
+}
+route GET "/x" {
+    let resp = response(200)
+    resp.status = 201
+    let selected = resp.status | all(mutate(resp), _)
+    return resp
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE_FALSE(hir.has_value());
+    CHECK(hir.error().detail.eq(
+        lit("response-mutating fallback operands cannot follow a piped Response field read")));
+}
+
 TEST(frontend, nested_call_arguments_cannot_reorder_response_header_reads_and_mutations) {
     const char* src = R"rut(
 func overwrite(_ resp: Response) -> i32 {
@@ -7762,6 +7833,33 @@ func select<T: Pick>(value: T) -> i32 {
 }
 route GET "/x" {
     return 200
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE_FALSE(hir.has_value());
+    CHECK_EQ(static_cast<u8>(hir.error().code), static_cast<u8>(FrontendError::UnsupportedSyntax));
+}
+
+TEST(frontend, generic_protocol_receiver_cannot_precede_argument_mutations) {
+    const char* src = R"rut(
+protocol Mutator { func mutate(_ resp: Response) -> i32 }
+struct Box { value: i32 }
+Box impl Mutator {
+    func mutate(self: Box, _ resp: Response) -> i32 {
+        resp.status = 202
+        self.value
+    }
+}
+func select<T: Mutator>(value: T, _ resp: Response) -> i32 => value.mutate(resp)
+route GET "/x" {
+    let resp = response(200)
+    resp.status = 201
+    let selected = select(Box(value: resp.status), resp)
+    return resp
 }
 )rut";
     auto lexed = lex(lit(src));
@@ -7821,8 +7919,7 @@ route GET "/x" {
     u32 writes = 0;
     for (u32 bi = 0; bi < rir.module.functions[0].block_count; bi++)
         for (u32 ii = 0; ii < rir.module.functions[0].blocks[bi].inst_count; ii++)
-            writes +=
-                rir.module.functions[0].blocks[bi].insts[ii].op == rir::Opcode::RespSetStatus;
+            writes += rir.module.functions[0].blocks[bi].insts[ii].op == rir::Opcode::RespSetStatus;
     CHECK_EQ(writes, 1u);
     rir.destroy();
 }
@@ -35743,6 +35840,30 @@ route GET "/x" use chain rewrite_response {
     REQUIRE_FALSE(hir.has_value());
     CHECK(hir.error().detail.eq(
         lit("chain-after Response scalar effects cannot follow a Response field read")));
+}
+
+TEST(frontend, chain_after_header_effects_reject_prior_response_header_reads) {
+    const char* src = R"rut(
+func overwrite(_ resp: Response) -> i32 {
+    resp.set("X-Test", "new")
+    0
+}
+chain rewrite_response { after overwrite(resp) }
+route GET "/x" use chain rewrite_response {
+    let resp = response(200)
+    resp.set("X-Test", req.path)
+    guard resp.header("X-Test").or("") == req.path else { return 400 }
+    return resp
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE_FALSE(hir.has_value());
+    CHECK(hir.error().detail.eq(
+        lit("chain-after Response header effects cannot follow a Response header read")));
 }
 
 TEST(frontend, chain_before_replays_helper_response_effects) {
