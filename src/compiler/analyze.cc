@@ -6164,7 +6164,8 @@ static bool route_appended_response_effect(const HirRoute& route, u32 previous_l
 }
 
 static bool hir_expr_reads_response_field_before(const HirExpr& expr, u32 source_offset) {
-    if ((expr.kind == HirExprKind::RespStatus || expr.kind == HirExprKind::RespBody) &&
+    if ((expr.kind == HirExprKind::RespStatus || expr.kind == HirExprKind::RespBody ||
+         expr.kind == HirExprKind::RespHeader) &&
         expr.span.start < source_offset)
         return true;
     if (expr.lhs != nullptr && hir_expr_reads_response_field_before(*expr.lhs, source_offset))
@@ -6200,9 +6201,7 @@ static FrontendResult<void> instantiate_function_response_effects(
             call_span,
             lit_str("response-mutating helper calls are not supported in conditional branches"));
     for (u32 ei = 0; ei < fn.exprs.len; ei++) {
-        if (fn.exprs[ei].kind != HirExprKind::RespSetStatus &&
-            fn.exprs[ei].kind != HirExprKind::RespSetBody)
-            continue;
+        if (!is_response_effect(fn.exprs[ei].kind)) continue;
         if (hir_expr_reads_response_field_before(fn.body, fn.exprs[ei].span.start))
             return frontend_error(
                 FrontendError::UnsupportedSyntax,
@@ -8673,9 +8672,11 @@ static FrontendResult<HirExpr> analyze_expr_impl(const AstExpr& expr,
                     return frontend_error(FrontendError::UnsupportedSyntax, expr.span, expr.name);
                 const u32 saved_expr_count = route->exprs.len;
                 const u32 saved_guard_count = route->guards.len;
+                const u32 saved_local_count = route->locals.len;
                 auto payload = analyze_expr(*expr.lhs, route, mod, locals, local_count, binding);
                 route->exprs.len = saved_expr_count;
                 route->guards.len = saved_guard_count;
+                route->locals.len = saved_local_count;
                 if (!payload) return core::make_unexpected(payload.error());
                 if (payload->may_nil || payload->may_error)
                     return frontend_error(FrontendError::UnsupportedSyntax, expr.span);

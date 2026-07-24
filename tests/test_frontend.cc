@@ -3674,6 +3674,31 @@ route GET "/x" {
     CHECK_EQ(inferred_hir->routes[0].exprs.len, explicit_hir->routes[0].exprs.len);
 }
 
+TEST(frontend, analyze_generic_variant_inference_rolls_back_response_effect_carriers) {
+    const auto src = R"rut(
+variant Wrap<T> { some(T), none }
+func mutate(_ resp: Response) -> i32 {
+    resp.add("X-Probe", "once")
+    7
+}
+route GET "/x" {
+    let resp = response(200)
+    let state = Wrap.some(mutate(resp))
+    return resp
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    u32 adds = 0;
+    for (u32 li = 0; li < hir->routes[0].locals.len; li++)
+        adds += hir->routes[0].locals[li].init.kind == HirExprKind::RespAddHeader;
+    CHECK_EQ(adds, 1u);
+}
+
 TEST(frontend, analyze_nested_respond_calls_order_argument_guard_first) {
     const char* src =
         "func inner(ok: bool) -> i32 { guard ok else { respond 401 } 1 }\n"
@@ -35845,6 +35870,30 @@ func sample(code: i32) -> i32 {
 route GET "/x" {
     let value = sample(201)
     return 200
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE_FALSE(hir.has_value());
+    CHECK(hir.error().detail.eq(
+        lit("helper Response assignments cannot follow a captured Response field read")));
+}
+
+TEST(frontend, helper_header_effect_rejects_earlier_captured_header_read) {
+    const char* src = R"rut(
+func sample(_ resp: Response) -> str {
+    let saved = resp.header("X-Test").or("")
+    resp.set("X-Test", "new")
+    saved
+}
+route GET "/x" {
+    let resp = response(200)
+    resp.set("X-Test", "old")
+    let value = sample(resp)
+    return resp
 }
 )rut";
     auto lexed = lex(lit(src));
