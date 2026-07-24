@@ -956,6 +956,48 @@ TEST(harness_handler, rejects_invalid_captured_response_header_syntax) {
     }
 }
 
+TEST(harness_handler, rejects_bodies_for_bodyless_forward_fixtures) {
+    static const u8 body[] = {'x'};
+    for (const u16 status : {204u, 205u, 304u}) {
+        harness::HandlerExecution execution{};
+        execution.init(&captured_passthrough_handler, nullptr, nullptr, 0);
+        const harness::DeterministicCompletion completion = {
+            jit::YieldKind::Forward, 0, 100, 1, 7, body, 1, false, false, status, nullptr, 0};
+        harness::DeterministicEnvironment environment{};
+        environment.reset(&completion, 1);
+        harness::DeterministicHandlerSpec driver{};
+        driver.execution = execution;
+        driver.environment = &environment;
+        harness::HarnessSpec spec{};
+        spec.layer = harness::ExecutionLayer::Handler;
+        CHECK_EQ(harness::drive_handler_deterministically(driver, spec).harness.outcome,
+                 harness::Outcome::Invalid);
+    }
+}
+
+TEST(harness_handler, rejects_hop_by_hop_forward_fixture_headers) {
+    const jit::CapturedResponseHeader headers[] = {
+        {{"Connection", 10}, {"X-Private", 9}},
+        {{"Transfer-Encoding", 17}, {"chunked", 7}},
+        {{"Keep-Alive", 10}, {"timeout=5", 9}},
+    };
+    for (const auto& header : headers) {
+        harness::HandlerExecution execution{};
+        execution.init(&captured_passthrough_handler, nullptr, nullptr, 0);
+        const harness::DeterministicCompletion completion = {
+            jit::YieldKind::Forward, 0, 100, 1, 7, nullptr, 0, false, false, 200, &header, 1};
+        harness::DeterministicEnvironment environment{};
+        environment.reset(&completion, 1);
+        harness::DeterministicHandlerSpec driver{};
+        driver.execution = execution;
+        driver.environment = &environment;
+        harness::HarnessSpec spec{};
+        spec.layer = harness::ExecutionLayer::Handler;
+        CHECK_EQ(harness::drive_handler_deterministically(driver, spec).harness.outcome,
+                 harness::Outcome::Invalid);
+    }
+}
+
 TEST(harness_handler, captured_response_headers_count_toward_input_limit) {
     harness::HandlerExecution execution{};
     execution.init(&captured_passthrough_handler, nullptr, nullptr, 0);

@@ -2988,7 +2988,7 @@ void h2_proxy_finish(Loop* loop,
         // from the DATA body), but a HEAD response carries no DATA, so keep the
         // upstream's so the client learns the corresponding GET body size.
         if (http_header_name_eq_ci(kName.ptr, kName.len, "content-length", 14)) {
-            if (!is_head) continue;
+            if (!is_head && resp.status_code != 304) continue;
         } else if (h2_drop_response_header(kName)) {
             continue;
         }
@@ -3067,6 +3067,18 @@ void h2_proxy_finish(Loop* loop,
         capture_ctx->captured_response_body = captured_body;
         capture_ctx->captured_response_body_len = body_len;
         capture_ctx->captured_response_valid = true;
+
+        // Forwarding a DATA-only request may have inserted a synthetic
+        // Content-Length into pending_synth. The continuation must observe the
+        // original HTTP/2 header set, not the upstream-only framing copy.
+        if (h2->async_inject_content_length_on_forward &&
+            !h2_remove_injected_content_length(h2->pending_synth,
+                                               &h2->async_synth_len,
+                                               h2->async_body_start,
+                                               h2->async_body_len)) {
+            h2_proxy_fail(loop, conn, 500);
+            return;
+        }
 
         const auto resume_fn = h2->async_fn;
         const u16 resume_state = h2->async_state;

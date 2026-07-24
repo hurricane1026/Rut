@@ -1469,6 +1469,7 @@ TEST(h2_serving, inject_content_length_exposes_data_only_body) {
         buf[len] = static_cast<u8>(req[len]);
         len++;
     }
+    const u32 original_len = len;
     const u32 kBodyStart = len - 5;  // just past "\r\n\r\n"
     REQUIRE(h2_inject_content_length(buf, &len, kBodyStart, 5, sizeof(buf)));
 
@@ -1480,6 +1481,10 @@ TEST(h2_serving, inject_content_length_exposes_data_only_body) {
     CHECK_EQ(parsed.content_length, 5u);
     // The 5 body octets must be the final bytes, intact, after injection.
     CHECK(Str(reinterpret_cast<const char*>(buf + len - 5), 5).eq(Str{"abcde", 5}));
+
+    REQUIRE(h2_remove_injected_content_length(buf, &len, kBodyStart, 5));
+    CHECK_EQ(len, original_len);
+    CHECK(Str(reinterpret_cast<const char*>(buf), len).eq(Str{req, len}));
 }
 
 TEST(h2_serving, inject_content_length_zero_length_body) {

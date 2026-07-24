@@ -31,6 +31,21 @@ bool captured_response_header_is_valid(const jit::CapturedResponseHeader& header
     return true;
 }
 
+bool captured_response_header_is_hop_by_hop(const jit::CapturedResponseHeader& header) {
+    const auto eq_ci = [&](const char* expected, u32 expected_len) {
+        if (header.name.len != expected_len) return false;
+        for (u32 i = 0; i < expected_len; i++) {
+            char actual = header.name.ptr[i];
+            if (actual >= 'A' && actual <= 'Z') actual = static_cast<char>(actual + ('a' - 'A'));
+            if (actual != expected[i]) return false;
+        }
+        return true;
+    };
+    return eq_ci("connection", 10) || eq_ci("keep-alive", 10) || eq_ci("proxy-connection", 16) ||
+           eq_ci("transfer-encoding", 17) || eq_ci("upgrade", 7) || eq_ci("trailer", 7) ||
+           eq_ci("te", 2);
+}
+
 struct EventPublisher {
     const HarnessSpec& spec;
     HarnessResult& result;
@@ -392,9 +407,25 @@ HandlerExecutionResult drive_handler_deterministically(const DeterministicHandle
                             "forward completion exceeds captured response storage");
                 return out;
             }
+            if (event.data_len != 0 &&
+                (event.response_status == 204 || event.response_status == 205 ||
+                 event.response_status == 304)) {
+                out.harness.outcome = Outcome::Invalid;
+                copy_detail(out.harness.detail,
+                            sizeof(out.harness.detail),
+                            "bodyless forward completion cannot include response data");
+                return out;
+            }
             u32 captured_bytes = event.data_len;
             for (u32 i = 0; i < event.response_header_count; i++) {
                 const auto& header = event.response_headers[i];
+                if (captured_response_header_is_hop_by_hop(header)) {
+                    out.harness.outcome = Outcome::Invalid;
+                    copy_detail(out.harness.detail,
+                                sizeof(out.harness.detail),
+                                "forward completion cannot include hop-by-hop response headers");
+                    return out;
+                }
                 if (header.name.len > jit::kMaxCapturedResponseStorageBytes - captured_bytes ||
                     header.value.len >
                         jit::kMaxCapturedResponseStorageBytes - captured_bytes - header.name.len) {

@@ -357,6 +357,22 @@ inline bool h2_inject_content_length(u8* buf, u32* len, u32 body_start, u32 body
     return true;
 }
 
+inline bool h2_remove_injected_content_length(u8* buf, u32* len, u32 body_start, u32 body_len) {
+    if (body_start < 4 || body_start > *len) return false;
+    u32 digits = 1;
+    for (u32 value = body_len; value >= 10; value /= 10) digits++;
+    static constexpr u32 kKeyLen = 16;
+    const u32 remove_len = kKeyLen + digits + 2;
+    const u32 at = body_start - 2;
+    if (remove_len > *len - at) return false;
+    static constexpr char kKey[] = "content-length: ";
+    for (u32 i = 0; i < kKeyLen; i++)
+        if (buf[at + i] != static_cast<u8>(kKey[i])) return false;
+    for (u32 i = at + remove_len; i < *len; i++) buf[i - remove_len] = buf[i];
+    *len -= remove_len;
+    return true;
+}
+
 template <typename Loop>
 bool h2_defer_until_data_end(H2Dispatch<Loop>& d,
                              u32 stream_id,
@@ -914,6 +930,9 @@ void h2_invoke_emit(H2Dispatch<Loop>& d,
         } else if (capture) {
             d.conn->h2->async_fn = route->fn;
             d.conn->h2->async_state = kOutcome.next_state;
+            d.conn->h2->async_body_start = body_start;
+            d.conn->h2->async_body_len = body_len;
+            d.conn->h2->async_inject_content_length_on_forward = inject_content_length_on_forward;
         }
         return;
     }
