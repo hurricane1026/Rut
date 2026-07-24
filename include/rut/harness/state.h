@@ -28,6 +28,7 @@ struct ScenarioState {
     u64 active_group = 0;
     const void* active_target = nullptr;
     u64 active_target_generation = 0;
+    const void* active_control_plane_mutation = nullptr;
     CacheLocalState* cache_state = nullptr;
 
     ScenarioState() = default;
@@ -41,7 +42,8 @@ struct ScenarioState {
     bool prepare(StateIsolation isolation,
                  u64 group,
                  const void* target_identity,
-                 u64 target_generation);
+                 u64 target_generation,
+                 const void* control_plane_mutation_identity = nullptr);
     void finish(StateIsolation isolation);
 };
 

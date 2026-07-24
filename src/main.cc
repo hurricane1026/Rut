@@ -114,6 +114,11 @@ static i32 run_shards(u16 port,
     // One process-shared per-upstream concurrency gauge (max-inflight limiting).
     static UpstreamConcurrency upstream_cc;
     upstream_cc.reset();
+    // One process-shared bounded mutation boundary. Source lowering is still
+    // gated, so route admission starts disabled; SIGHUP/coordinator wiring and
+    // the explicit CLI authority flag land with the reload coordinator.
+    ControlPlaneMutationPort control_plane_mutation;
+    control_plane_mutation.reset(1, false, route_config);
 
     // Create one SO_REUSEPORT listen socket per shard.
     // If port==0 (ephemeral), create shard 0 first to get the assigned port,
@@ -169,6 +174,9 @@ static i32 run_shards(u16 port,
         // …and at the one shared per-upstream concurrency gauge.
         if constexpr (requires { shards[i].loop->upstream_cc; }) {
             shards[i].loop->upstream_cc = &upstream_cc;
+        }
+        if constexpr (requires { shards[i].loop->control_plane_mutation; }) {
+            shards[i].loop->control_plane_mutation = &control_plane_mutation;
         }
 
         // Hand the compiled routes to the shard. Read-only and shared by

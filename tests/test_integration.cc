@@ -14845,7 +14845,7 @@ TEST(route, populate_route_config_rejects_pre_bound_over_long_name) {
     // the DSL source is deterministic.
     const char* src =
         "upstream "
-        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n"  // 32 'a's
+        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa at \"127.0.0.1:8080\"\n"  // 32 'a's
         "route GET \"/api\" { return forward(aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa) }\n";
     auto lexed = lex(Str{src, static_cast<u32>(strlen(src))});
     REQUIRE(lexed);
@@ -14873,6 +14873,12 @@ TEST(route, populate_route_config_rejects_pre_bound_over_long_name) {
                              8080)
                 .has_value());
     CHECK(!populate_route_config(cfg, rir.module));
+
+    RouteConfig compiled_cfg{};
+    REQUIRE(populate_route_config(compiled_cfg, rir.module));
+    CHECK_EQ(compiled_cfg.upstreams[0].name_len, 31u);
+    CHECK_EQ(compiled_cfg.upstreams[0].name_identity,
+             upstream_name_identity("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", 32));
     rir.destroy();
 }
 

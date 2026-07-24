@@ -15,6 +15,7 @@
 
 #include "rut/runtime/access_log.h"  // monotonic_us
 #include "rut/runtime/connection.h"
+#include "rut/runtime/control_plane_mutation.h"
 #include "rut/runtime/control_plane_snapshot.h"
 #include "rut/runtime/http2_conn.h"
 #include "rut/runtime/http_parser.h"  // http_method_str
@@ -882,6 +883,7 @@ void h2_invoke_emit(H2Dispatch<Loop>& d,
                     bool inject_content_length_on_forward = false) {
     auto* ctx = d.conn->reset_jit_ctx();
     if (route->needs_control_plane_snapshot) latch_control_plane_snapshot(d.loop, ctx);
+    latch_control_plane_mutation(d.loop, ctx);
     ctx->state = 0;
     ctx->resume_event_kind = static_cast<u32>(jit::YieldKind::Timer);
     ctx->resume_event_result = 0;

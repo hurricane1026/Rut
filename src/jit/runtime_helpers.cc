@@ -5,6 +5,7 @@
 #include "rut/runtime/access_log.h"
 #include "rut/runtime/cache_table.h"
 #include "rut/runtime/connection.h"
+#include "rut/runtime/control_plane_mutation.h"
 #include "rut/runtime/http_parser.h"
 #include "rut/runtime/response_body_storage.h"
 #include <new>
@@ -358,6 +359,24 @@ void rut_helper_json_append_control_plane(void* ctx, u8 kind) {
     append_literal(",\"connections_used\":");
     json_append_u64(values.memory_connections_used);
     append_literal("}}");
+}
+
+u8 rut_helper_reload_request(void* ctx) {
+    if (ctx == nullptr) return 0;
+    auto* handler = static_cast<jit::HandlerCtx*>(ctx);
+    if (handler->control_plane_mutation == nullptr) return 0;
+    return handler->control_plane_mutation->request_reload(ReloadRequestSource::Route) ? 1 : 0;
+}
+
+u8 rut_helper_upstream_mark(
+    void* ctx, u64 config_generation, u16 upstream_id, u16 backend_id, u8 healthy) {
+    if (ctx == nullptr || healthy > 1) return 0;
+    auto* handler = static_cast<jit::HandlerCtx*>(ctx);
+    if (handler->control_plane_mutation == nullptr) return 0;
+    return handler->control_plane_mutation->mark({config_generation, upstream_id, backend_id},
+                                                 healthy != 0)
+               ? 1
+               : 0;
 }
 
 void rut_helper_json_append_bool(u8 value) {

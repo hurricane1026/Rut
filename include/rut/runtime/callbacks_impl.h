@@ -7,6 +7,7 @@
 #include "rut/runtime/chunked_parser.h"
 #include "rut/runtime/connection.h"
 #include "rut/runtime/connection_base.h"
+#include "rut/runtime/control_plane_mutation.h"
 #include "rut/runtime/control_plane_snapshot.h"
 #include "rut/runtime/http_parser.h"
 #include "rut/runtime/io_event.h"
@@ -1298,6 +1299,7 @@ void on_header_received(void* lp, Connection& conn, IoEvent ev) {
         conn.transition_to_exec_handler_wait();
         auto* ctx = conn.reset_jit_ctx();
         if (route->needs_control_plane_snapshot) latch_control_plane_snapshot(loop, ctx);
+        latch_control_plane_mutation(loop, ctx);
         ctx->state = 0;
         ctx->resume_event_kind = static_cast<u32>(jit::YieldKind::Timer);
         ctx->resume_event_result = 0;
@@ -1369,6 +1371,7 @@ void on_jit_request_body_recvd(void* lp, Connection& conn, IoEvent ev) {
     conn.transition_to_exec_handler_wait();
     auto* ctx = conn.reset_jit_ctx();
     if (route->needs_control_plane_snapshot) latch_control_plane_snapshot(loop, ctx);
+    latch_control_plane_mutation(loop, ctx);
     ctx->state = 0;
     ctx->resume_event_kind = static_cast<u32>(jit::YieldKind::Timer);
     ctx->resume_event_result = 0;

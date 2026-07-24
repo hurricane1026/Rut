@@ -272,6 +272,7 @@ inline bool populate_route_config(RouteConfig& cfg, const rir::Module& mod) {
             auto r = cfg.add_upstream(name_buf, up.ip, up.port);
             if (!r.has_value()) return false;
             if (r.value() != i) return false;
+            cfg.upstreams[i].name_identity = upstream_name_identity(up.name.ptr, up.name.len);
             // Append any extra load-balancing endpoints (primary was the
             // ip/port above). add_upstream_backend fails only on a full
             // backend list, which the frontend already bounds.
