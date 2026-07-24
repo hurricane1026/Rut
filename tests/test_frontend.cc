@@ -3319,6 +3319,39 @@ route GET "/x" {
     CHECK_EQ(hir->routes[0].guards.len, 1u);
 }
 
+TEST(frontend, analyze_variant_method_probe_does_not_duplicate_response_effect) {
+    const auto src = R"rut(
+variant Wrap { some(i32), none }
+protocol Pick {
+    func some(value: str) -> i32
+}
+struct Box { value: str }
+Box impl Pick {
+    func some(self: Box, value: str) -> i32 => 7
+}
+func mutate(_ resp: Response) -> str {
+    resp.add("X-Probe", "once")
+    "value"
+}
+route GET "/x" {
+    let resp = response(200)
+    let Wrap = Box(value: "box")
+    let code = Wrap.some(mutate(resp))
+    return resp
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    u32 adds = 0;
+    for (u32 li = 0; li < hir->routes[0].locals.len; li++)
+        adds += hir->routes[0].locals[li].init.kind == HirExprKind::RespAddHeader;
+    CHECK_EQ(adds, 1u);
+}
+
 TEST(frontend, analyze_or_receiver_probe_preserves_respond_capable_receiver_shape) {
     const auto src = R"rut(
 protocol Fallback {
