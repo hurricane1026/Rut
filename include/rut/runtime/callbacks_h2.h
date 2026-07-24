@@ -231,7 +231,7 @@ inline bool h2_proxy_request_forwardable(const hpack::Header* hs, u32 n) {
         if (hs[i].name.eq(Str{":scheme", 7}))
             have_scheme = true;
         else if (hs[i].name.eq(Str{":authority", 10}))
-            have_authority = true;
+            have_authority = hs[i].value.len != 0;
         else if (hs[i].name.len > 0 && hs[i].name.ptr[0] != ':' && hs[i].name.eq(Str{"host", 4}))
             host_fields++;
     }

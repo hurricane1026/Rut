@@ -579,8 +579,7 @@ static Http2Error handle_frame(Http2Conn& c,
                         s->state = (s->state == Http2StreamState::HalfClosedLocal)
                                        ? Http2StreamState::Closed
                                        : Http2StreamState::HalfClosedRemote;
-                        if (c.pending_stream == h.stream_id)
-                            c.pending_request_forwardable = false;
+                        if (c.pending_stream == h.stream_id) c.pending_request_forwardable = false;
                         if (c.pending_stream == h.stream_id && c.on_data)
                             c.on_data(c.cb_ctx, c, h.stream_id, nullptr, 0, /*end_stream=*/true);
                         return Http2Error::NoError;
@@ -629,8 +628,7 @@ static Http2Error handle_frame(Http2Conn& c,
                         s->state = (s->state == Http2StreamState::HalfClosedLocal)
                                        ? Http2StreamState::Closed
                                        : Http2StreamState::HalfClosedRemote;
-                        if (c.pending_stream == h.stream_id)
-                            c.pending_request_forwardable = false;
+                        if (c.pending_stream == h.stream_id) c.pending_request_forwardable = false;
                         if (c.pending_stream == h.stream_id && c.on_data)
                             c.on_data(c.cb_ctx, c, h.stream_id, nullptr, 0, /*end_stream=*/true);
                         return Http2Error::NoError;

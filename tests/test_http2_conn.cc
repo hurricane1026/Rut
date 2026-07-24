@@ -711,6 +711,19 @@ TEST(h2_proxy_forwardable, rejects_missing_host_without_authority) {
     hpack::Header no_host[] = {
         {{":method", 7}, {"GET", 3}}, {{":scheme", 7}, {"http", 4}}, {{":path", 5}, {"/", 1}}};
     CHECK_FALSE(h2_proxy_request_forwardable(no_host, 3));
+
+    hpack::Header empty_authority[] = {{{":method", 7}, {"GET", 3}},
+                                       {{":scheme", 7}, {"http", 4}},
+                                       {{":path", 5}, {"/", 1}},
+                                       {{":authority", 10}, {"", 0}}};
+    CHECK_FALSE(h2_proxy_request_forwardable(empty_authority, 4));
+
+    hpack::Header empty_authority_with_host[] = {{{":method", 7}, {"GET", 3}},
+                                                 {{":scheme", 7}, {"http", 4}},
+                                                 {{":path", 5}, {"/", 1}},
+                                                 {{":authority", 10}, {"", 0}},
+                                                 {{"host", 4}, {"x", 1}}};
+    CHECK(h2_proxy_request_forwardable(empty_authority_with_host, 5));
 }
 
 // Write a raw frame (header + payload) into out; return bytes written.
