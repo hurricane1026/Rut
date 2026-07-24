@@ -476,6 +476,10 @@ struct HirExpr {
     HirExpr* rhs = nullptr;
     bool is_pipe_conditional = false;
     bool is_eager_fallback = false;
+    // Deferred generic protocol dispatch is resolved only when its helper is
+    // instantiated. Preserve whether the source position allowed response
+    // effects so resolution cannot hoist a conditional mutation.
+    bool response_effects_allowed = true;
     bool is_wait_result = false;
     // The value was observed from a mutable Response builder. Rebuilding a
     // reusable JSON plan after a wait must not silently take a newer snapshot.

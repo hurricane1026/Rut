@@ -4088,6 +4088,7 @@ static bool hir_expr_reads_wait_result(const HirExpr& expr);
 static bool hir_expr_reads_response_field(const HirExpr& expr);
 static bool route_reads_response_field(const HirRoute& route);
 static bool is_response_effect(HirExprKind kind);
+static bool function_has_response_effects(const HirFunction& fn);
 static bool hir_expr_reads_wait_result_with_locals(const HirExpr& expr,
                                                    const HirLocal* locals,
                                                    u32 local_count,
@@ -5198,6 +5199,7 @@ static FrontendResult<HirExpr> analyze_method_call_expr(
             out.kind = HirExprKind::ProtocolCall;
             out.span = expr.span;
             out.type = HirTypeKind::Unknown;
+            out.response_effects_allowed = route->allow_response_effects;
             out.protocol_index = matched_protocol_index;
             out.str_value = expr.name;
             if (!route->exprs.push(recv))
@@ -5785,6 +5787,12 @@ static FrontendResult<HirExpr> instantiate_function_expr(const HirExpr& expr,
             function_index = req->function_index;
         }
         const auto& fn = mod.functions[function_index];
+        if (!expr.response_effects_allowed && function_has_response_effects(fn))
+            return frontend_error(
+                FrontendError::UnsupportedSyntax,
+                expr.span,
+                lit_str("response-mutating helper calls are not supported in conditional "
+                        "branches"));
         HirExpr call_args[AstExpr::kMaxArgs]{};
         u32 call_arg_count = 0;
         call_args[call_arg_count++] = recv.value();
@@ -6404,8 +6412,12 @@ static bool collect_function_response_effects(HirFunction* fn,
             kind == HirExprKind::RespSetHeader || kind == HirExprKind::RespAddHeader ||
             kind == HirExprKind::RespRemoveHeader || kind == HirExprKind::RespSetStatus ||
             kind == HirExprKind::RespSetBody;
+        // A generic ProtocolCall's concrete implementation (and therefore its
+        // effects) is unknown until instantiation. Retain even an unused result
+        // so a response mutation cannot disappear during helper normalization.
         const bool materialize_local =
-            local.ref_index < all_local_count && materialized[local.ref_index];
+            local.ref_index < all_local_count &&
+            (materialized[local.ref_index] || kind == HirExprKind::ProtocolCall);
         if (!response_effect && !materialize_local) continue;
         auto normalized = normalize_function_expr(
             local.init, fn, all_locals, all_local_count, param_count, materialized);

@@ -7748,6 +7748,60 @@ route GET "/x" {
     CHECK_EQ(static_cast<u8>(hir.error().code), static_cast<u8>(FrontendError::UnsupportedSyntax));
 }
 
+TEST(frontend, deferred_protocol_response_effects_stay_inside_conditional_branches) {
+    const char* src = R"rut(
+protocol Mutator { func mutate(_ resp: Response) -> i32 }
+struct Box { value: i32 }
+Box impl Mutator {
+    func mutate(self: Box, _ resp: Response) -> i32 { resp.status = 202 1 }
+}
+func choose<T: Mutator>(value: T, flag: bool, _ resp: Response) -> i32 {
+    if flag { value.mutate(resp) } else { 0 }
+}
+route GET "/x" {
+    let resp = response(200)
+    let selected = choose(Box(value: 0), req.http11, resp)
+    return resp
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE_FALSE(hir.has_value());
+    CHECK(hir.error().detail.eq(
+        lit("response-mutating helper calls are not supported in conditional branches")));
+}
+
+TEST(frontend, unused_deferred_protocol_calls_preserve_response_effects) {
+    const char* src = R"rut(
+protocol Mutator { func mutate(_ resp: Response) -> i32 }
+struct Box { value: i32 }
+Box impl Mutator {
+    func mutate(self: Box, _ resp: Response) -> i32 { resp.status = 202 1 }
+}
+func apply<T: Mutator>(value: T, _ resp: Response) -> i32 {
+    let ignored = value.mutate(resp)
+    0
+}
+route GET "/x" {
+    let resp = response(200)
+    let ignored = apply(Box(value: 0), resp)
+    return resp
+}
+)rut";
+    FrontendRirModule rir{};
+    REQUIRE(lower_src_to_rir(src, rir));
+    u32 writes = 0;
+    for (u32 bi = 0; bi < rir.module.functions[0].block_count; bi++)
+        for (u32 ii = 0; ii < rir.module.functions[0].blocks[bi].inst_count; ii++)
+            writes +=
+                rir.module.functions[0].blocks[bi].insts[ii].op == rir::Opcode::RespSetStatus;
+    CHECK_EQ(writes, 1u);
+    rir.destroy();
+}
+
 TEST(frontend, nested_helper_effects_use_the_wrapper_call_site_span) {
     const char* src = R"rut(
 func mutate(_ resp: Response) -> i32 {
