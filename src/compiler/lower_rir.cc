@@ -3701,6 +3701,7 @@ FrontendResult<void> lower_to_rir(const MirModule& mir, FrontendRirModule& out) 
                         return frontend_error(FrontendError::OutOfMemory, mir.structs[si].span);
                     field_ty = ty.value();
                 } else if (field_shape.type == MirTypeKind::Tuple) {
+                    if (!shape_defs_ready(shape_defs_ready, field.shape_index, 0)) return false;
                     auto tuple_info = get_or_create_tuple_lowering(
                         field_shape.tuple_len,
                         field_shape.tuple_types,

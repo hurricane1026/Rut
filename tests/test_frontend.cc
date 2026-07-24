@@ -15672,6 +15672,24 @@ TEST(frontend, lower_to_rir_defers_array_fields_until_element_struct_is_built) {
     rir.destroy();
 }
 
+TEST(frontend, lower_to_rir_defers_tuple_array_fields_until_element_struct_is_built) {
+    const char* src =
+        "struct Holder { pair: ([Item], i32) }\n"
+        "struct Item { value: i32 }\n"
+        "route GET \"/x\" { return 200 }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    REQUIRE(lower_to_rir(mir.value(), rir));
+    rir.destroy();
+}
+
 TEST(frontend, analyze_accepts_typed_empty_arrays_in_match_and_guard_blocks) {
     const char* src = R"rut(
 variant Result { ok, err }
@@ -15771,6 +15789,27 @@ TEST(frontend, generic_array_helpers_bind_element_shapes) {
 func keep<T>(values: [T]) -> [T] => values
 route GET "/x" {
     let values = keep([1, 2])
+    return 200
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    REQUIRE(lower_to_rir(mir.value(), rir));
+    rir.destroy();
+}
+
+TEST(frontend, generic_helpers_construct_arrays_after_concrete_substitution) {
+    const char* src = R"rut(
+func wrap<T>(value: T) -> [T] => [value]
+route GET "/x" {
+    let values = wrap(201)
     return 200
 }
 )rut";

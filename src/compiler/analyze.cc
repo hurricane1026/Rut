@@ -8248,7 +8248,8 @@ static FrontendResult<HirExpr> analyze_expr_impl(const AstExpr& expr,
             if (!elem_shape) return core::make_unexpected(elem_shape.error());
             first_elem_shape_index = elem_shape.value();
         }
-        if (!hir_type_shape_has_runtime_carrier(mod, first_elem_shape_index))
+        if (mod.type_shapes[first_elem_shape_index].is_concrete &&
+            !hir_type_shape_has_runtime_carrier(mod, first_elem_shape_index))
             return frontend_error(FrontendError::UnsupportedSyntax, expr.span);
         auto array_shape = intern_hir_type_shape(const_cast<HirModule*>(&mod),
                                                  HirTypeKind::Array,
