@@ -35062,6 +35062,27 @@ route GET "/x" {
     rir.destroy();
 }
 
+TEST(frontend, reusable_json_rejects_response_snapshot_across_wait) {
+    const char* src = R"rut(
+route GET "/x" {
+    let resp = response(200)
+    resp.set("X", "old")
+    let payload = json({ value: resp.header("X").or("missing") })
+    resp.set("X", "new")
+    wait(5)
+    return 200, payload
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE_FALSE(hir.has_value());
+    CHECK(hir.error().detail.eq(
+        lit("json cannot preserve Response field snapshots across a wait")));
+}
+
 TEST(frontend, helper_local_json_plan_captures_scalar_arguments_at_call_site) {
     const char* src = R"rut(
 func encode(value: str, resp: Response) -> Json {

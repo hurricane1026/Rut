@@ -475,6 +475,9 @@ struct HirExpr {
     bool is_pipe_conditional = false;
     bool is_eager_fallback = false;
     bool is_wait_result = false;
+    // The value was observed from a mutable Response builder. Rebuilding a
+    // reusable JSON plan after a wait must not silently take a newer snapshot.
+    bool is_response_snapshot = false;
     WaitEventKind wait_event_kind = WaitEventKind::Timer;
     u32 wait_payload = 0;
     u8 wait_arm_mask = kWaitEventArmTimer;

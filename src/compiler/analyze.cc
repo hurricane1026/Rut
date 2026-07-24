@@ -4735,11 +4735,16 @@ static FrontendResult<HirExpr> analyze_method_call_expr(
             const bool runtime_response =
                 response->init.kind != HirExprKind::ResponseInit || response->init.bool_value;
             if (!runtime_response) {
-                if (fallback != nullptr) return *fallback;
+                if (fallback != nullptr) {
+                    HirExpr out = *fallback;
+                    out.is_response_snapshot = true;
+                    return out;
+                }
                 HirExpr out{};
                 out.kind = HirExprKind::Nil;
                 out.type = HirTypeKind::Str;
                 out.may_nil = true;
+                out.is_response_snapshot = true;
                 out.span = expr.span;
                 return out;
             }
@@ -4758,6 +4763,7 @@ static FrontendResult<HirExpr> analyze_method_call_expr(
             out.kind = HirExprKind::RespHeader;
             out.type = HirTypeKind::Str;
             out.may_nil = true;
+            out.is_response_snapshot = true;
             out.span = expr.span;
             out.str_value = name;
             out.lhs = &route->exprs[route->exprs.len - 1];
@@ -11699,6 +11705,7 @@ static FrontendResult<void> build_dynamic_json_plan(
 }
 
 static bool expr_reads_local_ref(const HirExpr& expr, u32 ref_index);
+static bool hir_expr_reads_response_snapshot(const HirExpr& expr);
 static bool terminator_reads_local_ref(const HirTerminator& term,
                                        const HirExpr* exprs,
                                        u32 expr_count,
@@ -11787,9 +11794,17 @@ static FrontendResult<HirTerminator> analyze_term(const AstStatement& stmt,
                                     }
                                 }
                             }
-                            for (u32 li = 0; li < route->locals.len; li++)
+                            for (u32 li = 0; li < route->locals.len; li++) {
+                                if (retained[li] &&
+                                    hir_expr_reads_response_snapshot(route->locals[li].init))
+                                    return frontend_error(
+                                        FrontendError::UnsupportedSyntax,
+                                        stmt.expr.span,
+                                        lit_str("json cannot preserve Response field snapshots "
+                                                "across a wait"));
                                 if (retained[li] && !route->locals[li].materialize_on_resume)
                                     route->locals[li].rematerialize_after_wait = true;
+                            }
                         }
                         u32 minimum_bytes = 0;
                         for (const auto& segment : segments) {
@@ -11890,9 +11905,17 @@ static FrontendResult<HirTerminator> analyze_term(const AstStatement& stmt,
                                     }
                                 }
                             }
-                            for (u32 li = 0; li < route->locals.len; li++)
+                            for (u32 li = 0; li < route->locals.len; li++) {
+                                if (retained[li] &&
+                                    hir_expr_reads_response_snapshot(route->locals[li].init))
+                                    return frontend_error(
+                                        FrontendError::UnsupportedSyntax,
+                                        stmt.expr.span,
+                                        lit_str("json cannot preserve Response field snapshots "
+                                                "across a wait"));
                                 if (retained[li] && !route->locals[li].materialize_on_resume)
                                     route->locals[li].rematerialize_after_wait = true;
+                            }
                         }
                         if (!route->exprs.push(body.value()))
                             return frontend_error(FrontendError::TooManyItems, stmt.expr.span);
@@ -11972,6 +11995,22 @@ static bool expr_reads_local_ref(const HirExpr& expr, u32 ref_index) {
     }
     for (u32 ai = 0; ai < expr.args.len; ai++) {
         if (expr.args[ai] != nullptr && expr_reads_local_ref(*expr.args[ai], ref_index))
+            return true;
+    }
+    return false;
+}
+
+static bool hir_expr_reads_response_snapshot(const HirExpr& expr) {
+    if (expr.kind == HirExprKind::RespHeader || expr.is_response_snapshot) return true;
+    if (expr.lhs != nullptr && hir_expr_reads_response_snapshot(*expr.lhs)) return true;
+    if (expr.rhs != nullptr && hir_expr_reads_response_snapshot(*expr.rhs)) return true;
+    for (u32 fi = 0; fi < expr.field_inits.len; fi++) {
+        if (expr.field_inits[fi].value != nullptr &&
+            hir_expr_reads_response_snapshot(*expr.field_inits[fi].value))
+            return true;
+    }
+    for (u32 ai = 0; ai < expr.args.len; ai++) {
+        if (expr.args[ai] != nullptr && hir_expr_reads_response_snapshot(*expr.args[ai]))
             return true;
     }
     return false;
