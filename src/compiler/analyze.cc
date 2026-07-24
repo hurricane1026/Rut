@@ -4333,6 +4333,7 @@ static FrontendResult<HirExpr> analyze_bitwise_namespace_call(const AstExpr& exp
     if (expr.args.len != want_args || expr.args[0] == nullptr ||
         (!is_flip && expr.args[1] == nullptr))
         return frontend_error(FrontendError::UnsupportedSyntax, expr.span, kBitwiseMemberDetail);
+    const u32 locals_before_lhs = route->locals.len;
     auto lhs = analyze_arg(*expr.args[0]);
     if (!lhs) return core::make_unexpected(lhs.error());
     HirExpr rhs_expr{};
@@ -4353,6 +4354,13 @@ static FrontendResult<HirExpr> analyze_bitwise_namespace_call(const AstExpr& exp
                 lit_str("a response-mutating bitwise operand cannot follow a Response field read"));
         rhs_expr = rhs.value();
     }
+    if (pipe_lhs != nullptr && hir_expr_reads_response_field(*pipe_lhs) &&
+        route_appended_response_effect(*route, locals_before_lhs))
+        return frontend_error(
+            FrontendError::UnsupportedSyntax,
+            expr.span,
+            lit_str("response-mutating bitwise operands cannot follow a piped Response field "
+                    "read"));
     // Same-width rule as arithmetic: both operands i32 or both i64, with a
     // bare int literal adopting the i64 side (this also widens flip's
     // synthesized -1 next to an i64 operand). Shift amounts share the
@@ -9012,6 +9020,7 @@ static FrontendResult<HirExpr> analyze_expr_impl(const AstExpr& expr,
             }
             if (expr.field_inits.len != required_extra_fields)
                 return frontend_error(FrontendError::UnsupportedSyntax, expr.span, expr.name);
+            bool earlier_field_reads_response = false;
             for (u32 fi = 0; fi < expr.field_inits.len; fi++) {
                 for (u32 seen = 0; seen < fi; seen++) {
                     if (expr.field_inits[seen].name.eq(expr.field_inits[fi].name))
@@ -9033,9 +9042,18 @@ static FrontendResult<HirExpr> analyze_expr_impl(const AstExpr& expr,
                 if (field_decl.name.eq({"err", 3}) && field_decl.is_error_type)
                     return frontend_error(
                         FrontendError::UnsupportedSyntax, expr.span, expr.field_inits[fi].name);
+                const u32 locals_before_field = route->locals.len;
                 auto field_value = analyze_expr(
                     *expr.field_inits[fi].value, route, mod, locals, local_count, binding);
                 if (!field_value) return core::make_unexpected(field_value.error());
+                if (earlier_field_reads_response &&
+                    route_appended_response_effect(*route, locals_before_field))
+                    return frontend_error(
+                        FrontendError::UnsupportedSyntax,
+                        expr.field_inits[fi].value->span,
+                        lit_str("a response-mutating Error field cannot follow a Response field "
+                                "read"));
+                earlier_field_reads_response |= hir_expr_reads_response_field(field_value.value());
                 if (field_value->may_nil || field_value->may_error)
                     return frontend_error(FrontendError::UnsupportedSyntax,
                                           expr.field_inits[fi].value->span);
@@ -10660,6 +10678,7 @@ static FrontendResult<HirExpr> analyze_call_expr(const AstExpr& expr,
             }
             if (expr.args.len != 2 || expr.args[0] == nullptr || expr.args[1] == nullptr)
                 return frontend_error(FrontendError::UnsupportedSyntax, expr.span, kMinMaxDetail);
+            const u32 locals_before_lhs = route->locals.len;
             auto lhs = analyze_builtin_arg(*expr.args[0]);
             if (!lhs) return core::make_unexpected(lhs.error());
             const u32 locals_before_rhs = route->locals.len;
@@ -10672,6 +10691,13 @@ static FrontendResult<HirExpr> analyze_call_expr(const AstExpr& expr,
                     expr.args[1]->span,
                     lit_str(
                         "a response-mutating min/max operand cannot follow a Response field read"));
+            if (pipe_lhs != nullptr && hir_expr_reads_response_field(*pipe_lhs) &&
+                route_appended_response_effect(*route, locals_before_lhs))
+                return frontend_error(
+                    FrontendError::UnsupportedSyntax,
+                    expr.span,
+                    lit_str("response-mutating min/max operands cannot follow a piped Response "
+                            "field read"));
             adopt_int_literal_type(&lhs.value(), &rhs.value());
             const bool int_typed =
                 (lhs->type == HirTypeKind::I32 || lhs->type == HirTypeKind::I64) &&

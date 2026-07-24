@@ -7793,6 +7793,76 @@ route GET "/x" {
         lit("response-mutating fallback operands cannot follow a piped Response field read")));
 }
 
+TEST(frontend, piped_response_reads_cannot_precede_minmax_operand_mutations) {
+    const char* src = R"rut(
+func mutate(_ resp: Response) -> i32 {
+    resp.status = 202
+    1
+}
+route GET "/x" {
+    let resp = response(200)
+    resp.status = 201
+    let selected = resp.status | max(mutate(resp), _)
+    return resp
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE_FALSE(hir.has_value());
+    CHECK(hir.error().detail.eq(
+        lit("response-mutating min/max operands cannot follow a piped Response field read")));
+}
+
+TEST(frontend, piped_response_reads_cannot_precede_bitwise_operand_mutations) {
+    const char* src = R"rut(
+func mutate(_ resp: Response) -> i32 {
+    resp.status = 202
+    1
+}
+route GET "/x" {
+    let resp = response(200)
+    resp.status = 201
+    let selected = resp.status | bitwise.and(mutate(resp), _)
+    return resp
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE_FALSE(hir.has_value());
+    CHECK(hir.error().detail.eq(
+        lit("response-mutating bitwise operands cannot follow a piped Response field read")));
+}
+
+TEST(frontend, custom_error_fields_reject_response_mutation_after_field_read) {
+    const char* src = R"rut(
+struct AuthError { err: Error, first: i32, second: i32 }
+func mutate(_ resp: Response) -> i32 {
+    resp.status = 202
+    0
+}
+route GET "/x" {
+    let resp = response(200)
+    resp.status = 201
+    let failed = error(AuthError, .bad, "x", first: resp.status, second: mutate(resp))
+    return resp
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE_FALSE(hir.has_value());
+    CHECK(hir.error().detail.eq(
+        lit("a response-mutating Error field cannot follow a Response field read")));
+}
+
 TEST(frontend, nested_call_arguments_cannot_reorder_response_header_reads_and_mutations) {
     const char* src = R"rut(
 func overwrite(_ resp: Response) -> i32 {
