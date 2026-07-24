@@ -7566,6 +7566,109 @@ route GET "/x" {
         lit("response-mutating helper arguments cannot follow an earlier Response field read")));
 }
 
+TEST(frontend, generic_protocol_arguments_cannot_reorder_response_reads_and_mutations) {
+    const char* src = R"rut(
+protocol Pick { func pick(first: i32, second: i32) -> i32 => first }
+struct Box { value: i32 }
+Box impl Pick {}
+func mutate(_ resp: Response) -> i32 {
+    resp.status = 202
+    1
+}
+func select<T: Pick>(value: T) -> i32 {
+    let resp = response(200)
+    resp.status = 201
+    value.pick(resp.status, mutate(resp))
+}
+route GET "/x" {
+    return 200
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE_FALSE(hir.has_value());
+    CHECK_EQ(static_cast<u8>(hir.error().code), static_cast<u8>(FrontendError::UnsupportedSyntax));
+}
+
+TEST(frontend, nested_helper_effects_use_the_wrapper_call_site_span) {
+    const char* src = R"rut(
+func mutate(_ resp: Response) -> i32 {
+    resp.status = 202
+    1
+}
+func wrapper() -> i32 {
+    let resp = response(200)
+    resp.status = 201
+    let saved = resp.status
+    let ignored = mutate(resp)
+    saved
+}
+route GET "/x" {
+    let selected = wrapper()
+    return 200
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE_FALSE(hir.has_value());
+    CHECK(hir.error().detail.eq(
+        lit("helper Response assignments cannot follow a captured Response field read")));
+}
+
+TEST(frontend, or_receiver_probe_rolls_back_response_effect_carriers) {
+    const char* src = R"rut(
+func maybe(_ resp: Response) -> i32 {
+    resp.add("X-Probe", "once")
+    7
+}
+route GET "/x" {
+    let resp = response(200)
+    let value = maybe(resp).or(0)
+    return resp
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    u32 adds = 0;
+    for (u32 li = 0; li < hir->routes[0].locals.len; li++)
+        adds += hir->routes[0].locals[li].init.kind == HirExprKind::RespAddHeader;
+    CHECK_EQ(adds, 1u);
+}
+
+TEST(frontend, response_effects_after_helper_respond_guards_are_rejected) {
+    const char* src = R"rut(
+func mutate_after_guard(ok: bool, _ resp: Response) -> i32 {
+    guard ok else { respond 401 }
+    resp.add("X-Guarded", "yes")
+    1
+}
+route GET "/x" {
+    let resp = response(200)
+    let selected = mutate_after_guard(req.http11, resp)
+    return resp
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE_FALSE(hir.has_value());
+    CHECK(hir.error().detail.eq(
+        lit("response effects after a helper respond guard are not supported; move the effect "
+            "before the guard")));
+}
+
 TEST(frontend, helper_local_response_builder_cannot_mutate_caller_builder) {
     const char* src = R"rut(
 func rewrite() -> i32 {

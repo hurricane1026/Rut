@@ -4820,8 +4820,10 @@ static FrontendResult<HirExpr> analyze_method_call_expr(
         // continuations re-analyze the receiver themselves (PR #164 round 6).
         const u32 probe_saved_exprs = route->exprs.len;
         const u32 probe_saved_guards = route->guards.len;
+        const u32 probe_saved_locals = route->locals.len;
         auto recv = analyze_expr(*expr.lhs, route, mod, locals, local_count, binding);
         route->guards.len = probe_saved_guards;
+        route->locals.len = probe_saved_locals;
         const auto receiver_has_or_member = [&]() -> bool {
             if (!recv) return false;  // sugar's any() will re-report the error
             // A missing-capable receiver cannot dispatch a real method (the
@@ -5154,10 +5156,29 @@ static FrontendResult<HirExpr> analyze_method_call_expr(
             for (u32 i = 0; i < expr.args.len; i++) {
                 if (i >= matched_req->params.len)
                     return frontend_error(FrontendError::UnsupportedSyntax, expr.span, expr.name);
+                const u32 locals_before_arg = route->locals.len;
                 auto arg = analyze_expr(*expr.args[i], route, mod, locals, local_count, binding);
                 if (!arg) return core::make_unexpected(arg.error());
                 if (arg->may_nil || arg->may_error)
                     return frontend_error(FrontendError::UnsupportedSyntax, expr.args[i]->span);
+                bool appended_response_effect = false;
+                for (u32 li = locals_before_arg; li < route->locals.len; li++) {
+                    const auto kind = route->locals[li].init.kind;
+                    appended_response_effect |=
+                        kind == HirExprKind::RespSetHeader || kind == HirExprKind::RespAddHeader ||
+                        kind == HirExprKind::RespRemoveHeader ||
+                        kind == HirExprKind::RespSetStatus || kind == HirExprKind::RespSetBody;
+                }
+                if (appended_response_effect) {
+                    for (u32 prior = 0; prior < out.args.len; prior++) {
+                        if (!hir_expr_reads_response_field(*out.args[prior])) continue;
+                        return frontend_error(
+                            FrontendError::UnsupportedSyntax,
+                            expr.args[i]->span,
+                            lit_str("response-mutating protocol arguments cannot follow an "
+                                    "earlier Response field read"));
+                    }
+                }
                 HirExpr expected =
                     make_expected_type_expr(matched_req->params[i].type,
                                             matched_req->params[i].variant_index,
@@ -6087,6 +6108,7 @@ static FrontendResult<void> instantiate_function_response_effects(
         auto effect = instantiate_function_expr(
             fn.exprs[ei], route, mod, args, arg_count, generic_bindings, generic_binding_count);
         if (!effect) return core::make_unexpected(effect.error());
+        effect->span = call_span;
         HirLocal carrier{};
         carrier.span = call_span;
         if (fn.owns_response_builder) carrier.name = lit_str("$helper_owned_response_effect");
@@ -6241,6 +6263,19 @@ static bool collect_function_response_effects(HirFunction* fn,
             return false;
     }
     return true;
+}
+
+static bool function_has_response_effect_after_guard(const HirRoute& scratch, Span* effect_span) {
+    for (u32 li = 0; li < scratch.locals.len; li++) {
+        const auto& local = scratch.locals[li];
+        if (!is_response_effect(local.init.kind)) continue;
+        for (u32 gi = 0; gi < scratch.guards.len; gi++) {
+            if (local.span.start <= scratch.guards[gi].span.start) continue;
+            if (effect_span != nullptr) *effect_span = local.span;
+            return true;
+        }
+    }
+    return false;
 }
 
 static FrontendResult<HirExpr> analyze_function_body_stmt(const AstStatement& stmt,
@@ -19450,6 +19485,13 @@ static FrontendResult<HirModule*> analyze_file_internal(
             if (!fn.respond_guards.push(respond_guard))
                 return frontend_error(FrontendError::TooManyItems, guard.fail_term.span);
         }
+        Span post_guard_effect_span{};
+        if (function_has_response_effect_after_guard(*scratch, &post_guard_effect_span))
+            return frontend_error(
+                FrontendError::UnsupportedSyntax,
+                post_guard_effect_span,
+                lit_str("response effects after a helper respond guard are not supported; move "
+                        "the effect before the guard"));
         if (!collect_function_response_effects(
                 &fn, *scratch, all_locals, all_local_count, fn.params.len))
             return frontend_error(FrontendError::TooManyItems, ast_func.body->span);
@@ -21082,6 +21124,13 @@ static FrontendResult<HirModule*> analyze_file_internal(
             if (!fn.respond_guards.push(respond_guard))
                 return frontend_error(FrontendError::TooManyItems, guard.fail_term.span);
         }
+        Span post_guard_effect_span{};
+        if (function_has_response_effect_after_guard(scratch, &post_guard_effect_span))
+            return frontend_error(
+                FrontendError::UnsupportedSyntax,
+                post_guard_effect_span,
+                lit_str("response effects after a helper respond guard are not supported; move "
+                        "the effect before the guard"));
         if (!collect_function_response_effects(
                 &fn, scratch, all_locals, all_local_count, fn.params.len))
             return frontend_error(FrontendError::TooManyItems, item.func.body->span);
