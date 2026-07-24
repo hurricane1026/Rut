@@ -7155,6 +7155,67 @@ route GET "/x" use chain rewrite_response { return 200 }
     rir.destroy();
 }
 
+TEST(frontend, chain_after_captures_json_arguments_before_response_effects) {
+    const char* src = R"rut(
+func rewrite(_ resp: Response, value: str) -> i32 {
+    resp.set("X-Mode", "new")
+    resp.body = json({ value: value })
+    0
+}
+chain rewrite_response {
+    after rewrite(resp, resp.header("X-Mode").or("missing"))
+}
+route GET "/x" use chain rewrite_response {
+    return 200
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    std::string hir_detail;
+    if (!hir)
+        hir_detail.assign(hir.error().detail.ptr,
+                          hir.error().detail.ptr + hir.error().detail.len);
+    REQUIRE_MSG(hir, hir_detail.c_str());
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    REQUIRE(lower_to_rir(mir.value(), rir));
+    u32 read = 0xffffffffu;
+    u32 set = 0xffffffffu;
+    u32 capture = 0xffffffffu;
+    u32 ordinal = 0;
+    for (u32 bi = 0; bi < rir.module.functions[0].block_count; bi++) {
+        const auto& block = rir.module.functions[0].blocks[bi];
+        for (u32 ii = 0; ii < block.inst_count; ii++) {
+            const auto op = block.insts[ii].op;
+            if (op == rir::Opcode::RespHeader && read == 0xffffffffu) read = ordinal;
+            if (op == rir::Opcode::RespSetHeader && set == 0xffffffffu) set = ordinal;
+            if (op == rir::Opcode::JsonCapture && capture == 0xffffffffu) capture = ordinal;
+            ordinal++;
+        }
+    }
+    REQUIRE_NE(read, 0xffffffffu);
+    REQUIRE_NE(set, 0xffffffffu);
+    REQUIRE_NE(capture, 0xffffffffu);
+    CHECK(read < set);
+    CHECK(set < capture);
+    rir.destroy();
+}
+
+TEST(frontend, direct_json_sink_rejects_fallible_fallback) {
+    const char* src =
+        "route GET \"/x\" { return 200, all(json({ ok: true }), error(.missing)) }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE_FALSE(hir);
+}
+
 TEST(frontend, chain_after_commits_response_effects_before_forward) {
     const char* src = R"rut(
 upstream api at "127.0.0.1:9000"

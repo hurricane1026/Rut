@@ -11828,7 +11828,7 @@ static FrontendResult<HirTerminator> analyze_term(const AstStatement& stmt,
                 } else {
                     auto body = analyze_expr(stmt.expr, route, mod, locals, local_count, binding);
                     if (!body) return core::make_unexpected(body.error());
-                    if (body->type != HirTypeKind::Json)
+                    if (body->type != HirTypeKind::Json || body->may_nil || body->may_error)
                         return frontend_error(
                             FrontendError::UnsupportedSyntax, stmt.expr.span, body_expr_detail);
                     if (route->waits.len != 0 &&
@@ -17252,6 +17252,21 @@ static FrontendResult<void> analyze_chain_after_response_step(const AstChainDecl
 
     auto args = std::unique_ptr<HirExpr[]>(new (std::nothrow) HirExpr[HirRoute::kMaxLocals]{});
     if (!args) return frontend_error(FrontendError::OutOfMemory, step.span);
+    FixedVec<HirLocal, HirRoute::kMaxLocals> chain_arg_locals;
+    for (u32 li = 0; li < route->locals.len; li++) {
+        if (!chain_arg_locals.push(route->locals[li]))
+            return frontend_error(FrontendError::TooManyItems, step.span);
+    }
+    HirLocal runtime_response{};
+    runtime_response.name = {"resp", 4};
+    runtime_response.type = HirTypeKind::Response;
+    runtime_response.span = step.span;
+    runtime_response.init.kind = HirExprKind::ResponseInit;
+    runtime_response.init.type = HirTypeKind::Response;
+    runtime_response.init.bool_value = true;
+    runtime_response.init.span = step.span;
+    if (!chain_arg_locals.push(runtime_response))
+        return frontend_error(FrontendError::TooManyItems, step.span);
     u32 response_params = 0;
     for (u32 ai = 0; ai < fn.params.len; ai++) {
         const AstExpr& source = *step.call.args[ai];
@@ -17275,7 +17290,8 @@ static FrontendResult<void> analyze_chain_after_response_step(const AstChainDecl
                 placeholder.span = source.span;
                 return placeholder;
             }
-            return analyze_expr(source, route, mod, route->locals.data, route->locals.len, nullptr);
+            return analyze_expr(
+                source, route, mod, chain_arg_locals.data, chain_arg_locals.len, nullptr);
         }();
         if (!arg) return core::make_unexpected(arg.error());
         auto expected = make_expected_param_expr(fn.params[ai]);
@@ -17288,6 +17304,35 @@ static FrontendResult<void> analyze_chain_after_response_step(const AstChainDecl
             FrontendError::UnsupportedSyntax,
             use_span,
             lit_str("chain after helper must have exactly one Response parameter"));
+    // Chain-after helpers are inlined as ordered response effects. Preserve
+    // ordinary call-by-value semantics for arguments consumed by a dynamic
+    // Json plan: capture them before the first inlined mutation can change a
+    // response/request read embedded in the argument expression.
+    for (u32 ai = 0; ai < fn.params.len; ai++) {
+        if (fn.params[ai].type == HirTypeKind::Response ||
+            args[ai].kind == HirExprKind::LocalRef)
+            continue;
+        bool needs_json_arg_carrier =
+            hir_expr_contains_json_build(fn.body) && count_function_param_refs(fn.body, ai, 1) != 0;
+        for (u32 ei = 0; !needs_json_arg_carrier && ei < fn.exprs.len; ei++) {
+            needs_json_arg_carrier =
+                (fn.exprs[ei].type == HirTypeKind::Json ||
+                 hir_expr_contains_json_build(fn.exprs[ei])) &&
+                count_function_param_refs(fn.exprs[ei], ai, 1) != 0;
+        }
+        if (!needs_json_arg_carrier) continue;
+        HirLocal carrier{};
+        carrier.span = step.call.args[ai]->span;
+        carrier.name = {"$chain_arg", 10};
+        carrier.ref_index = next_local_ref_index(route, route->locals.data, route->locals.len);
+        if (carrier.ref_index >= HirRoute::kMaxLocals)
+            return frontend_error(FrontendError::TooManyItems, carrier.span);
+        copy_json_value_metadata(&carrier, args[ai]);
+        carrier.init = args[ai];
+        if (!route->locals.push(carrier))
+            return frontend_error(FrontendError::TooManyItems, carrier.span);
+        args[ai] = make_json_local_ref(carrier, carrier.span);
+    }
     auto is_response_effect = [](HirExprKind kind) {
         return kind == HirExprKind::RespSetHeader || kind == HirExprKind::RespAddHeader ||
                kind == HirExprKind::RespRemoveHeader || kind == HirExprKind::RespSetStatus ||
