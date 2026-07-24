@@ -2952,21 +2952,35 @@ static FrontendResult<void> concretize_named_instance_shape(HirExpr* expr,
             expr->struct_index = concrete.value();
         }
     }
-    // Array element metadata lives only in the indexed shape tree. Substitute
-    // generic leaves recursively and re-intern the concrete tree so [T]
-    // parameters/returns become [i32], [str], etc. at the call site.
-    if (expr->type == HirTypeKind::Array && expr->shape_index < mod.type_shapes.len &&
-        mod.type_shapes[expr->shape_index].type == HirTypeKind::Array) {
+    // Array and tuple element metadata lives only in the indexed shape tree.
+    // Substitute generic leaves recursively and re-intern the concrete tree so
+    // [T] and tuple-nested [T] parameters/returns become concrete at the call
+    // site.
+    if ((expr->type == HirTypeKind::Array || expr->type == HirTypeKind::Tuple) &&
+        expr->shape_index < mod.type_shapes.len &&
+        mod.type_shapes[expr->shape_index].type == expr->type) {
         auto concretize_shape = [&](auto&& self, u32 index) -> FrontendResult<u32> {
             if (index >= mod.type_shapes.len)
                 return frontend_error(FrontendError::UnsupportedSyntax, expr->span);
             const auto shape = mod.type_shapes[index];
             if (shape.type == HirTypeKind::Generic) {
                 if (shape.generic_index >= generic_binding_count ||
-                    !generic_bindings[shape.generic_index].bound ||
-                    generic_bindings[shape.generic_index].shape_index >= mod.type_shapes.len)
+                    !generic_bindings[shape.generic_index].bound)
                     return frontend_error(FrontendError::UnsupportedSyntax, expr->span);
-                return generic_bindings[shape.generic_index].shape_index;
+                const auto& binding = generic_bindings[shape.generic_index];
+                if (binding.shape_index < mod.type_shapes.len) return binding.shape_index;
+                // Scalar expressions historically do not need an interned shape. Nested
+                // generic arrays do, so synthesize it from the binding metadata on demand.
+                return intern_hir_type_shape(const_cast<HirModule*>(&mod),
+                                             binding.type,
+                                             binding.generic_index,
+                                             binding.variant_index,
+                                             binding.struct_index,
+                                             binding.tuple_len,
+                                             binding.tuple_types,
+                                             binding.tuple_variant_indices,
+                                             binding.tuple_struct_indices,
+                                             expr->span);
             }
             u32 array_elem = 0xffffffffu;
             u32 tuple_elems[kMaxTupleSlots]{};
@@ -3550,14 +3564,43 @@ static FrontendResult<void> adapt_str_list_to_array_carrier(HirExpr* expr,
 static FrontendResult<void> adapt_array_carriers_to_expected_shape(HirExpr* expr,
                                                                    HirModule* mod,
                                                                    u32 expected_shape_index,
-                                                                   Span span) {
+                                                                   Span span,
+                                                                   HirLocal* locals = nullptr,
+                                                                   u32 local_count = 0) {
     if (expected_shape_index >= mod->type_shapes.len) return {};
     const auto expected = mod->type_shapes[expected_shape_index];
-    if (expected.type != HirTypeKind::Array || !expected.is_concrete) return {};
+    if (!expected.is_concrete) return {};
+    if (expected.type == HirTypeKind::Tuple) {
+        if (expr->type != HirTypeKind::Tuple || expr->args.len != expected.tuple_len) return {};
+        for (u32 i = 0; i < expected.tuple_len; i++) {
+            auto adapted =
+                adapt_array_carriers_to_expected_shape(expr->args[i],
+                                                       mod,
+                                                       expected.tuple_elem_shape_indices[i],
+                                                       expr->args[i]->span,
+                                                       locals,
+                                                       local_count);
+            if (!adapted) return core::make_unexpected(adapted.error());
+        }
+        expr->shape_index = expected_shape_index;
+        return {};
+    }
+    if (expected.type != HirTypeKind::Array) return {};
     if (expr->type == HirTypeKind::StrList) {
         if (expected.array_elem_shape_index >= mod->type_shapes.len ||
             mod->type_shapes[expected.array_elem_shape_index].type != HirTypeKind::Str)
             return {};
+        if (expr->kind == HirExprKind::LocalRef && locals != nullptr) {
+            for (u32 i = 0; i < local_count; i++) {
+                if (locals[i].ref_index != expr->local_index) continue;
+                auto materialized = adapt_array_carriers_to_expected_shape(
+                    &locals[i].init, mod, expected_shape_index, locals[i].span, locals, i);
+                if (!materialized) return core::make_unexpected(materialized.error());
+                locals[i].type = HirTypeKind::Array;
+                locals[i].shape_index = expected_shape_index;
+                break;
+            }
+        }
         auto adapted = adapt_str_list_to_array_carrier(expr, mod, span);
         if (!adapted) return core::make_unexpected(adapted.error());
         expr->shape_index = expected_shape_index;
@@ -3568,7 +3611,7 @@ static FrontendResult<void> adapt_array_carriers_to_expected_shape(HirExpr* expr
     if (elem_shape_index >= mod->type_shapes.len) return {};
     for (u32 i = 0; i < expr->args.len; i++) {
         auto adapted = adapt_array_carriers_to_expected_shape(
-            expr->args[i], mod, elem_shape_index, expr->args[i]->span);
+            expr->args[i], mod, elem_shape_index, expr->args[i]->span, locals, local_count);
         if (!adapted) return core::make_unexpected(adapted.error());
         const auto& shape = mod->type_shapes[elem_shape_index];
         HirExpr expected_elem{};
@@ -3605,8 +3648,12 @@ static FrontendResult<HirExpr> analyze_expr_with_expected_array_shape(
         mod.type_shapes[expected_shape_index].type != HirTypeKind::Array) {
         auto analyzed = analyze_expr_impl(expr, route, mod, locals, local_count, binding, true);
         if (!analyzed) return core::make_unexpected(analyzed.error());
-        auto adapted = adapt_array_carriers_to_expected_shape(
-            &analyzed.value(), const_cast<HirModule*>(&mod), expected_shape_index, expr.span);
+        auto adapted = adapt_array_carriers_to_expected_shape(&analyzed.value(),
+                                                              const_cast<HirModule*>(&mod),
+                                                              expected_shape_index,
+                                                              expr.span,
+                                                              const_cast<HirLocal*>(locals),
+                                                              local_count);
         if (!adapted) return core::make_unexpected(adapted.error());
         return analyzed.value();
     }
@@ -7426,21 +7473,44 @@ static FrontendResult<HirExpr> analyze_expr_impl(const AstExpr& expr,
                         return frontend_error(
                             FrontendError::UnsupportedSyntax, expr.span, expr.field_inits[fi].name);
                     const auto& field_decl = mod.structs[struct_index].fields[field_index];
+                    auto expected_field = make_expected_type_expr(field_decl.type,
+                                                                  field_decl.variant_index,
+                                                                  field_decl.struct_index,
+                                                                  field_decl.tuple_len,
+                                                                  field_decl.tuple_types,
+                                                                  field_decl.tuple_variant_indices,
+                                                                  field_decl.tuple_struct_indices,
+                                                                  field_decl.shape_index);
+                    expected_field = apply_generic_binding_to_expr(
+                        expected_field, bindings, mod.structs[struct_index].type_params.len, &mod);
+                    if (field_decl.type == HirTypeKind::Array ||
+                        field_decl.type == HirTypeKind::Tuple) {
+                        auto concretized = concretize_named_instance_shape(
+                            &expected_field,
+                            mod,
+                            bindings,
+                            mod.structs[struct_index].type_params.len);
+                        // A field may introduce a generic that has not been bound yet. In that
+                        // case ordinary inference below establishes the binding; prior fields
+                        // still let us contextualize empty nested arrays here.
+                        (void)concretized;
+                    }
                     const u32 saved_expr_count = route->exprs.len;
                     const u32 saved_guard_count = route->guards.len;
                     auto field_value = [&]() -> FrontendResult<HirExpr> {
                         const auto& value_ast = *expr.field_inits[fi].value;
                         if (value_ast.kind == AstExprKind::ArrayLit &&
-                            field_decl.type == HirTypeKind::Array &&
-                            field_decl.shape_index < mod.type_shapes.len &&
-                            mod.type_shapes[field_decl.shape_index].is_concrete)
-                            return analyze_expr_with_expected_array_shape(value_ast,
-                                                                          route,
-                                                                          mod,
-                                                                          locals,
-                                                                          local_count,
-                                                                          binding,
-                                                                          field_decl.shape_index);
+                            expected_field.type == HirTypeKind::Array &&
+                            expected_field.shape_index < mod.type_shapes.len &&
+                            mod.type_shapes[expected_field.shape_index].is_concrete)
+                            return analyze_expr_with_expected_array_shape(
+                                value_ast,
+                                route,
+                                mod,
+                                locals,
+                                local_count,
+                                binding,
+                                expected_field.shape_index);
                         return analyze_expr_impl(
                             value_ast, route, mod, locals, local_count, binding, true);
                     }();
@@ -7450,14 +7520,14 @@ static FrontendResult<HirExpr> analyze_expr_impl(const AstExpr& expr,
                     if (field_value->may_nil || field_value->may_error)
                         return frontend_error(FrontendError::UnsupportedSyntax,
                                               expr.field_inits[fi].value->span);
-                    if (field_decl.type == HirTypeKind::Array) {
-                        auto adapted = adapt_array_carriers_to_expected_shape(
-                            &field_value.value(),
-                            const_cast<HirModule*>(&mod),
-                            field_decl.shape_index,
-                            expr.field_inits[fi].value->span);
-                        if (!adapted) return core::make_unexpected(adapted.error());
-                    }
+                    auto adapted =
+                        adapt_array_carriers_to_expected_shape(&field_value.value(),
+                                                               const_cast<HirModule*>(&mod),
+                                                               expected_field.shape_index,
+                                                               expr.field_inits[fi].value->span,
+                                                               const_cast<HirLocal*>(locals),
+                                                               local_count);
+                    if (!adapted) return core::make_unexpected(adapted.error());
                     bool bound = false;
                     if (field_decl.generic_index != 0xffffffffu) {
                         bound = bind_generic_shape(bindings,
@@ -7567,14 +7637,13 @@ static FrontendResult<HirExpr> analyze_expr_impl(const AstExpr& expr,
             if (field_value->may_nil || field_value->may_error)
                 return frontend_error(FrontendError::UnsupportedSyntax,
                                       expr.field_inits[fi].value->span);
-            if (field_decl.type == HirTypeKind::Array) {
-                auto adapted =
-                    adapt_array_carriers_to_expected_shape(&field_value.value(),
-                                                           const_cast<HirModule*>(&mod),
-                                                           field_decl.shape_index,
-                                                           expr.field_inits[fi].value->span);
-                if (!adapted) return core::make_unexpected(adapted.error());
-            }
+            auto adapted = adapt_array_carriers_to_expected_shape(&field_value.value(),
+                                                                  const_cast<HirModule*>(&mod),
+                                                                  field_decl.shape_index,
+                                                                  expr.field_inits[fi].value->span,
+                                                                  const_cast<HirLocal*>(locals),
+                                                                  local_count);
+            if (!adapted) return core::make_unexpected(adapted.error());
             const auto expected = make_expected_type_expr(field_decl.type,
                                                           field_decl.variant_index,
                                                           field_decl.struct_index,
@@ -10081,11 +10150,15 @@ static FrontendResult<HirExpr> analyze_call_expr(const AstExpr& expr,
         [&](u32 param_index, HirExpr& analyzed_arg, Span span) -> FrontendResult<void> {
         if (fn.params[param_index].type == HirTypeKind::Array) {
             const u32 expected_elem_shape_index = fn.params[param_index].array_elem_shape_index;
-            auto adapted =
-                adapt_array_carriers_to_expected_shape(&analyzed_arg,
-                                                       const_cast<HirModule*>(&mod),
-                                                       fn.params[param_index].shape_index,
-                                                       span);
+            u32 carrier_shape_index = fn.params[param_index].shape_index;
+            auto concrete_expected = concrete_param_expr(fn.params[param_index]);
+            if (concrete_expected) carrier_shape_index = concrete_expected->shape_index;
+            auto adapted = adapt_array_carriers_to_expected_shape(&analyzed_arg,
+                                                                  const_cast<HirModule*>(&mod),
+                                                                  carrier_shape_index,
+                                                                  span,
+                                                                  const_cast<HirLocal*>(locals),
+                                                                  local_count);
             if (!adapted) return core::make_unexpected(adapted.error());
             if (analyzed_arg.type == HirTypeKind::StrList &&
                 expected_elem_shape_index < mod.type_shapes.len) {
@@ -10448,21 +10521,23 @@ static FrontendResult<HirExpr> analyze_call_expr(const AstExpr& expr,
             analyzed_args[param_index] = slot_expr.value();
         } else if (first_arg_override != nullptr && param_index == 0) {
             analyzed_args[param_index] = *first_arg_override;
-        } else if (arg_expr.kind == AstExprKind::ArrayLit &&
-                   fn.params[param_index].type == HirTypeKind::Array &&
-                   fn.params[param_index].shape_index < mod.type_shapes.len &&
-                   mod.type_shapes[fn.params[param_index].shape_index].is_concrete) {
-            auto arg = analyze_expr_with_expected_array_shape(arg_expr,
-                                                              route,
-                                                              mod,
-                                                              locals,
-                                                              local_count,
-                                                              binding,
-                                                              fn.params[param_index].shape_index);
-            if (!arg) return core::make_unexpected(arg.error());
-            analyzed_args[param_index] = arg.value();
         } else {
-            auto arg = analyze_expr_impl(arg_expr, route, mod, locals, local_count, binding, true);
+            FrontendResult<HirExpr> arg = [&]() -> FrontendResult<HirExpr> {
+                if (arg_expr.kind == AstExprKind::ArrayLit) {
+                    auto expected = concrete_param_expr(fn.params[param_index]);
+                    if (expected && expected->type == HirTypeKind::Array &&
+                        expected->shape_index < mod.type_shapes.len &&
+                        mod.type_shapes[expected->shape_index].is_concrete)
+                        return analyze_expr_with_expected_array_shape(arg_expr,
+                                                                      route,
+                                                                      mod,
+                                                                      locals,
+                                                                      local_count,
+                                                                      binding,
+                                                                      expected->shape_index);
+                }
+                return analyze_expr_impl(arg_expr, route, mod, locals, local_count, binding, true);
+            }();
             if (!arg) return core::make_unexpected(arg.error());
             if (arg->may_nil || arg->may_error)
                 return fail_call(expr.args[i]->span, "arg has nil or error", nullptr);
@@ -17695,7 +17770,9 @@ static FrontendResult<HirModule*> analyze_file_internal(
                                                               fn.return_tuple_struct_indices,
                                                               span,
                                                               &fn.return_array_elem_shape_index,
-                                                              &fn.return_associated_name);
+                                                              &fn.return_associated_name,
+                                                              nullptr,
+                                                              fn.return_tuple_elem_shape_indices);
                         if (!ret_type) return core::make_unexpected(ret_type.error());
                         fn.return_type = ret_type.value();
                     }
@@ -17712,7 +17789,9 @@ static FrontendResult<HirModule*> analyze_file_internal(
                                                           fn.return_tuple_struct_indices,
                                                           span,
                                                           &fn.return_array_elem_shape_index,
-                                                          &fn.return_associated_name);
+                                                          &fn.return_associated_name,
+                                                          nullptr,
+                                                          fn.return_tuple_elem_shape_indices);
                     if (!ret_type) return core::make_unexpected(ret_type.error());
                     fn.return_type = ret_type.value();
                 }
@@ -17729,7 +17808,9 @@ static FrontendResult<HirModule*> analyze_file_internal(
                                                       fn.return_tuple_struct_indices,
                                                       span,
                                                       &fn.return_array_elem_shape_index,
-                                                      &fn.return_associated_name);
+                                                      &fn.return_associated_name,
+                                                      nullptr,
+                                                      fn.return_tuple_elem_shape_indices);
                 if (!ret_type) return core::make_unexpected(ret_type.error());
                 fn.return_type = ret_type.value();
             }
@@ -17841,7 +17922,9 @@ static FrontendResult<HirModule*> analyze_file_internal(
                                                                 param.tuple_struct_indices,
                                                                 span,
                                                                 &param.array_elem_shape_index,
-                                                                &param.associated_name);
+                                                                &param.associated_name,
+                                                                nullptr,
+                                                                param.tuple_elem_shape_indices);
                         if (!param_type) return core::make_unexpected(param_type.error());
                         param.type = param_type.value();
                     }
@@ -17858,7 +17941,9 @@ static FrontendResult<HirModule*> analyze_file_internal(
                                                             param.tuple_struct_indices,
                                                             span,
                                                             &param.array_elem_shape_index,
-                                                            &param.associated_name);
+                                                            &param.associated_name,
+                                                            nullptr,
+                                                            param.tuple_elem_shape_indices);
                     if (!param_type) return core::make_unexpected(param_type.error());
                     param.type = param_type.value();
                 }
@@ -17875,7 +17960,9 @@ static FrontendResult<HirModule*> analyze_file_internal(
                                                         param.tuple_struct_indices,
                                                         span,
                                                         &param.array_elem_shape_index,
-                                                        &param.associated_name);
+                                                        &param.associated_name,
+                                                        nullptr,
+                                                        param.tuple_elem_shape_indices);
                 if (!param_type) return core::make_unexpected(param_type.error());
                 param.type = param_type.value();
             }
@@ -17912,7 +17999,10 @@ static FrontendResult<HirModule*> analyze_file_internal(
                                                       fn.return_tuple_variant_indices,
                                                       fn.return_tuple_struct_indices,
                                                       span,
-                                                      fn.return_array_elem_shape_index);
+                                                      fn.return_array_elem_shape_index,
+                                                      fn.return_type == HirTypeKind::Tuple
+                                                          ? fn.return_tuple_elem_shape_indices
+                                                          : nullptr);
             if (!return_shape) return core::make_unexpected(return_shape.error());
             fn.return_shape_index = return_shape.value();
         }
@@ -17927,7 +18017,10 @@ static FrontendResult<HirModule*> analyze_file_internal(
                                                      fn.params[pi].tuple_variant_indices,
                                                      fn.params[pi].tuple_struct_indices,
                                                      span,
-                                                     fn.params[pi].array_elem_shape_index);
+                                                     fn.params[pi].array_elem_shape_index,
+                                                     fn.params[pi].type == HirTypeKind::Tuple
+                                                         ? fn.params[pi].tuple_elem_shape_indices
+                                                         : nullptr);
             if (!param_shape) return core::make_unexpected(param_shape.error());
             fn.params[pi].shape_index = param_shape.value();
         }
@@ -18059,8 +18152,12 @@ static FrontendResult<HirModule*> analyze_file_internal(
             patch_error_variant_refs(&body.value(), error_variant_index);
         }
         if (fn.return_type == HirTypeKind::Array) {
-            auto adapted = adapt_array_carriers_to_expected_shape(
-                &body.value(), &mod, fn.return_shape_index, ast_func.body->span);
+            auto adapted = adapt_array_carriers_to_expected_shape(&body.value(),
+                                                                  &mod,
+                                                                  fn.return_shape_index,
+                                                                  ast_func.body->span,
+                                                                  scratch->locals.data,
+                                                                  scratch->locals.len);
             if (!adapted) return core::make_unexpected(adapted.error());
         }
         if (fn.return_type == HirTypeKind::Unknown) {
@@ -18171,7 +18268,10 @@ static FrontendResult<HirModule*> analyze_file_internal(
                                                           fn.return_tuple_variant_indices,
                                                           fn.return_tuple_struct_indices,
                                                           span,
-                                                          fn.return_array_elem_shape_index);
+                                                          fn.return_array_elem_shape_index,
+                                                          fn.return_type == HirTypeKind::Tuple
+                                                              ? fn.return_tuple_elem_shape_indices
+                                                              : nullptr);
                 if (!return_shape) return core::make_unexpected(return_shape.error());
                 fn.return_shape_index = return_shape.value();
             }
@@ -18663,7 +18763,9 @@ static FrontendResult<HirModule*> analyze_file_internal(
                                                               fn.return_tuple_struct_indices,
                                                               item.func.span,
                                                               &fn.return_array_elem_shape_index,
-                                                              &fn.return_associated_name);
+                                                              &fn.return_associated_name,
+                                                              nullptr,
+                                                              fn.return_tuple_elem_shape_indices);
                         if (!ret_type) return core::make_unexpected(ret_type.error());
                         fn.return_type = ret_type.value();
                     }
@@ -18680,7 +18782,9 @@ static FrontendResult<HirModule*> analyze_file_internal(
                                                           fn.return_tuple_struct_indices,
                                                           item.func.span,
                                                           &fn.return_array_elem_shape_index,
-                                                          &fn.return_associated_name);
+                                                          &fn.return_associated_name,
+                                                          nullptr,
+                                                          fn.return_tuple_elem_shape_indices);
                     if (!ret_type) return core::make_unexpected(ret_type.error());
                     fn.return_type = ret_type.value();
                 }
@@ -18697,7 +18801,9 @@ static FrontendResult<HirModule*> analyze_file_internal(
                                                       fn.return_tuple_struct_indices,
                                                       item.func.span,
                                                       &fn.return_array_elem_shape_index,
-                                                      &fn.return_associated_name);
+                                                      &fn.return_associated_name,
+                                                      nullptr,
+                                                      fn.return_tuple_elem_shape_indices);
                 if (!ret_type) return core::make_unexpected(ret_type.error());
                 fn.return_type = ret_type.value();
             }
@@ -18810,7 +18916,9 @@ static FrontendResult<HirModule*> analyze_file_internal(
                                                                 param.tuple_struct_indices,
                                                                 item.func.span,
                                                                 &param.array_elem_shape_index,
-                                                                &param.associated_name);
+                                                                &param.associated_name,
+                                                                nullptr,
+                                                                param.tuple_elem_shape_indices);
                         if (!param_type) return core::make_unexpected(param_type.error());
                         param.type = param_type.value();
                     }
@@ -18827,7 +18935,9 @@ static FrontendResult<HirModule*> analyze_file_internal(
                                                             param.tuple_struct_indices,
                                                             item.func.span,
                                                             &param.array_elem_shape_index,
-                                                            &param.associated_name);
+                                                            &param.associated_name,
+                                                            nullptr,
+                                                            param.tuple_elem_shape_indices);
                     if (!param_type) return core::make_unexpected(param_type.error());
                     param.type = param_type.value();
                 }
@@ -18844,7 +18954,9 @@ static FrontendResult<HirModule*> analyze_file_internal(
                                                         param.tuple_struct_indices,
                                                         item.func.span,
                                                         &param.array_elem_shape_index,
-                                                        &param.associated_name);
+                                                        &param.associated_name,
+                                                        nullptr,
+                                                        param.tuple_elem_shape_indices);
                 if (!param_type) return core::make_unexpected(param_type.error());
                 param.type = param_type.value();
             }
@@ -18868,17 +18980,19 @@ static FrontendResult<HirModule*> analyze_file_internal(
                     param.generic_protocol_indices[cpi] =
                         fn.type_params[param.generic_index].custom_protocol_indices[cpi];
             }
-            auto param_shape = intern_hir_type_shape(&mod,
-                                                     param.type,
-                                                     param.generic_index,
-                                                     param.variant_index,
-                                                     param.struct_index,
-                                                     param.tuple_len,
-                                                     param.tuple_types,
-                                                     param.tuple_variant_indices,
-                                                     param.tuple_struct_indices,
-                                                     item.func.span,
-                                                     param.array_elem_shape_index);
+            auto param_shape = intern_hir_type_shape(
+                &mod,
+                param.type,
+                param.generic_index,
+                param.variant_index,
+                param.struct_index,
+                param.tuple_len,
+                param.tuple_types,
+                param.tuple_variant_indices,
+                param.tuple_struct_indices,
+                item.func.span,
+                param.array_elem_shape_index,
+                param.type == HirTypeKind::Tuple ? param.tuple_elem_shape_indices : nullptr);
             if (!param_shape) return core::make_unexpected(param_shape.error());
             param.shape_index = param_shape.value();
             if (!fn.params.push(param))
@@ -18895,7 +19009,10 @@ static FrontendResult<HirModule*> analyze_file_internal(
                                                       fn.return_tuple_variant_indices,
                                                       fn.return_tuple_struct_indices,
                                                       item.func.span,
-                                                      fn.return_array_elem_shape_index);
+                                                      fn.return_array_elem_shape_index,
+                                                      fn.return_type == HirTypeKind::Tuple
+                                                          ? fn.return_tuple_elem_shape_indices
+                                                          : nullptr);
             if (!return_shape) return core::make_unexpected(return_shape.error());
             fn.return_shape_index = return_shape.value();
         }
@@ -19661,8 +19778,12 @@ static FrontendResult<HirModule*> analyze_file_internal(
             patch_error_variant_refs(&body.value(), error_variant_index);
         }
         if (fn.return_type == HirTypeKind::Array) {
-            auto adapted = adapt_array_carriers_to_expected_shape(
-                &body.value(), &mod, fn.return_shape_index, item.func.body->span);
+            auto adapted = adapt_array_carriers_to_expected_shape(&body.value(),
+                                                                  &mod,
+                                                                  fn.return_shape_index,
+                                                                  item.func.body->span,
+                                                                  scratch.locals.data,
+                                                                  scratch.locals.len);
             if (!adapted) return core::make_unexpected(adapted.error());
         }
         if (fn.return_type == HirTypeKind::Unknown) {
@@ -19784,7 +19905,7 @@ static FrontendResult<HirModule*> analyze_file_internal(
                                                     fn.params.len,
                                                     visiting,
                                                     2 - refs);
-            if (local.type == HirTypeKind::Array && refs >= 2)
+            if (refs >= 2 && hir_type_shape_contains_array(mod, local.shape_index))
                 return frontend_error(
                     FrontendError::UnsupportedSyntax,
                     local.span,

@@ -33719,6 +33719,101 @@ route GET "/x" {
     rir.destroy();
 }
 
+TEST(frontend, generic_array_calls_contextualize_empty_arrays_from_prior_bindings) {
+    const char* src = R"rut(
+func take<T>(seed: T, values: [T]) -> i32 => 1
+route GET "/x" { let result = take(1, []) return 200 }
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    REQUIRE(lower_to_rir(mir.value(), rir));
+    rir.destroy();
+}
+
+TEST(frontend, generic_struct_fields_contextualize_empty_arrays_from_prior_bindings) {
+    const char* src = R"rut(
+struct Bucket<T> { seed: T, values: [T] }
+route GET "/x" { let bucket = Bucket(seed: 1, values: []) return 200 }
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    REQUIRE(lower_to_rir(mir.value(), rir));
+    rir.destroy();
+}
+
+TEST(frontend, tuple_struct_fields_adapt_nested_runtime_string_lists) {
+    const char* src = R"rut(
+struct Holder { pair: ([str], i32) }
+route GET "/x" { let holder = Holder(pair: (req.queryAll("tag"), 1)) return 200 }
+)rut";
+    FrontendRirModule rir{};
+    REQUIRE(lower_src_to_rir(src, rir));
+    rir.destroy();
+}
+
+TEST(frontend, function_signatures_preserve_tuple_nested_array_shapes) {
+    const char* src = R"rut(
+func keep(pair: ([str], i32)) -> ([str], i32) => pair
+route GET "/x" { let pair = keep(([req.path], 1)) return 200 }
+)rut";
+    FrontendRirModule rir{};
+    REQUIRE(lower_src_to_rir(src, rir));
+    rir.destroy();
+}
+
+TEST(frontend, string_list_local_refs_adapt_to_array_struct_fields) {
+    const char* src = R"rut(
+struct Payload { tags: [str] }
+route GET "/x" {
+    let raw = req.queryAll("tag")
+    let payload = Payload(tags: raw)
+    return 200
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    REQUIRE(lower_to_rir(mir.value(), rir));
+    rir.destroy();
+}
+
+TEST(frontend, rejects_reused_helper_tuple_locals_containing_arrays) {
+    const char* src = R"rut(
+struct Box { values: [i64] }
+func make(source: Box) -> (Box, Box) {
+    let saved = source
+    (saved, saved)
+}
+route GET "/x" { let pair = make(Box(values: [time.nowMicros()])) return 200 }
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE_FALSE(hir.has_value());
+}
+
 TEST(frontend, rejects_nominal_arrays_with_nested_non_carrier_payloads) {
     const char* src =
         "variant Build { ready(Response), none } "
