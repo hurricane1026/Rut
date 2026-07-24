@@ -9703,6 +9703,51 @@ struct ScriptedUpstreamServer {
     }
 };
 
+#if RUT_ENABLE_JIT_TESTS
+struct CompiledRutRoute {
+    FrontendRirModule rir{};
+    jit::JitEngine engine{};
+    jit::HandlerFn handler = nullptr;
+
+    ~CompiledRutRoute() {
+        engine.shutdown();
+        rir.destroy();
+    }
+
+    bool compile(const char* source) {
+        auto lexed = lex(Str{source, static_cast<u32>(strlen(source))});
+        if (!lexed) return false;
+        auto ast = parse_file(lexed.value());
+        if (!ast) return false;
+        std::unique_ptr<AstFile> ast_owned(ast.value());
+        auto hir = analyze_file(*ast_owned);
+        if (!hir) return false;
+        std::unique_ptr<HirModule> hir_owned(hir.value());
+        auto mir = build_mir(*hir_owned);
+        if (!mir) return false;
+        std::unique_ptr<MirModule> mir_owned(mir.value());
+        if (!lower_to_rir(*mir_owned, rir)) return false;
+        auto cg = jit::codegen(rir.module);
+        if (!cg.ok || !engine.init() || !engine.compile(cg.mod, cg.ctx)) return false;
+        handler = reinterpret_cast<jit::HandlerFn>(engine.lookup("handler_route_0"));
+        return handler != nullptr;
+    }
+};
+
+static constexpr const char kBufferedForwardMutationSource[] = R"rut(
+upstream api
+func rewrite(_ resp: Response) -> i32 {
+    resp.status = 201
+    resp.body = "rewritten"
+    resp.set("X-After", "yes")
+    resp.set("X-Path", req.path)
+    0
+}
+chain rewrite_chain { after rewrite(resp) }
+route GET "/api" use chain rewrite_chain { wait(1) return forward(api, buffered: true) }
+)rut";
+#endif
+
 struct ScopedProxyLoop {
     RealLoop* loop = nullptr;
     i32 listen_fd = -1;
@@ -10176,6 +10221,123 @@ TEST(proxy_reuse, force_close_all_closes_deferred_idle_fd_iouring) {
     close(lfd);
 }
 
+#if RUT_ENABLE_JIT_TESTS
+TEST(shard, buffered_jit_forward_applies_response_mutations_over_http1) {
+    ScriptedUpstreamServer backend;
+    static const char kResp[] =
+        "HTTP/1.1 200 OK\r\n"
+        "Content-Length: 8\r\n"
+        "X-After: no\r\n"
+        "X-Origin: kept\r\n"
+        "Connection: close\r\n"
+        "\r\n"
+        "original";
+    REQUIRE(backend.setup(kResp, sizeof(kResp) - 1));
+    CompiledRutRoute compiled;
+    REQUIRE(compiled.compile(kBufferedForwardMutationSource));
+
+    RouteConfig cfg;
+    REQUIRE(cfg.add_upstream("api", 0x7F000001, backend.port).has_value());
+    REQUIRE(cfg.add_jit_handler("/api", 'G', compiled.handler));
+    Shard<EpollEventLoop> shard;
+    i32 lfd = create_listen_socket(0).value_or(-1);
+    REQUIRE(lfd >= 0);
+    const u16 port = get_port(lfd);
+    REQUIRE(shard.init(0, lfd).has_value());
+    shard.route_config = &cfg;
+    REQUIRE(shard.spawn(-1).has_value());
+    usleep(50000);
+
+    i32 client = connect_to(port);
+    REQUIRE(client >= 0);
+    set_socket_timeouts(client, 2);
+    static const char kReq[] = "GET /api HTTP/1.1\r\nHost: test\r\nConnection: close\r\n\r\n";
+    REQUIRE(write_all_fd(client, reinterpret_cast<const u8*>(kReq), sizeof(kReq) - 1));
+    char response[2048];
+    u32 total = 0;
+    while (total < sizeof(response)) {
+        const i32 got = recv_timeout(client, response + total, sizeof(response) - total, 2000);
+        if (got <= 0) break;
+        total += static_cast<u32>(got);
+        if (buf_contains(response, total, "\r\n\r\nrewritten", 13)) break;
+    }
+    CHECK(buf_contains(response, total, "HTTP/1.1 201", 12));
+    CHECK(buf_contains(response, total, "Content-Length: 9\r\n", 19));
+    CHECK(buf_contains(response, total, "X-After: yes\r\n", 14));
+    CHECK(buf_contains(response, total, "X-Origin: kept\r\n", 16));
+    CHECK(!buf_contains(response, total, "X-After: no", 11));
+    CHECK(buf_contains(response, total, "\r\n\r\nrewritten", 13));
+
+    close(client);
+    shard.stop();
+    shard.join();
+    shard.shutdown();
+    close(lfd);
+}
+
+TEST(shard, buffered_jit_forward_applies_response_mutations_over_http2) {
+    ScriptedUpstreamServer backend;
+    static const char kResp[] =
+        "HTTP/1.1 200 OK\r\n"
+        "Transfer-Encoding: chunked\r\n"
+        "X-After: no\r\n"
+        "X-Origin: kept\r\n"
+        "Connection: close\r\n"
+        "\r\n"
+        "3\r\nori\r\n5\r\nginal\r\n0\r\n\r\n";
+    REQUIRE(backend.setup(kResp, sizeof(kResp) - 1));
+    CompiledRutRoute compiled;
+    REQUIRE(compiled.compile(kBufferedForwardMutationSource));
+
+    RouteConfig cfg;
+    REQUIRE(cfg.add_upstream("api", 0x7F000001, backend.port).has_value());
+    REQUIRE(cfg.add_jit_handler("/api", 'G', compiled.handler));
+    Shard<EpollEventLoop> shard;
+    i32 lfd = create_listen_socket(0).value_or(-1);
+    REQUIRE(lfd >= 0);
+    const u16 port = get_port(lfd);
+    REQUIRE(shard.init(0, lfd).has_value());
+    shard.route_config = &cfg;
+    REQUIRE(shard.spawn(-1).has_value());
+    usleep(50000);
+
+    i32 client = connect_to(port);
+    REQUIRE(client >= 0);
+    set_socket_timeouts(client, 2);
+    u8 request[512];
+    u32 request_len = h2_client_prologue(request);
+    request_len +=
+        h2_client_get(request + request_len, sizeof(request) - request_len, 1, "/api", 4);
+    REQUIRE(write_all_fd(client, request, request_len));
+
+    u8 response[4096];
+    u32 total = 0;
+    u8 body[64];
+    u32 body_len = 0;
+    for (u32 attempt = 0; attempt < 10 && total < sizeof(response); attempt++) {
+        const i32 got = recv_timeout(
+            client, reinterpret_cast<char*>(response + total), sizeof(response) - total, 2000);
+        if (got <= 0) break;
+        total += static_cast<u32>(got);
+        body_len = h2_body_for_stream(response, total, 1, body, sizeof(body));
+        if (h2_status_for_stream(response, total, 1) == 201 && body_len == 9) break;
+    }
+    CHECK_EQ(h2_status_for_stream(response, total, 1), 201u);
+    CHECK_EQ(body_len, 9u);
+    CHECK(body_len == 9 && __builtin_memcmp(body, "rewritten", 9) == 0);
+    CHECK(h2_response_has_header(response, total, 1, "x-after", "yes"));
+    CHECK(h2_response_has_header(response, total, 1, "x-origin", "kept"));
+    CHECK(h2_response_has_header(response, total, 1, "x-path", "/api"));
+    CHECK(!h2_response_has_header(response, total, 1, "x-after", "no"));
+
+    close(client);
+    shard.stop();
+    shard.join();
+    shard.shutdown();
+    close(lfd);
+}
+#endif
+
 // End-to-end proxy over HTTP/2: an h2c client requests a RouteAction::Proxy
 // route; the runtime forwards a synthesized h1 request to a real upstream, buffers
 // the upstream's h1 response, and re-encodes it as h2 HEADERS+DATA. Asserts the
@@ -10245,6 +10407,62 @@ TEST(shard, serves_http2_proxy) {
     CHECK(!h2_response_has_header(resp, total, 1, "te", "gzip"));
     CHECK(!h2_response_has_header(resp, total, 1, "x-hop", "secret"));
     CHECK(!h2_response_has_header(resp, total, 1, "x-two", "also-secret"));  // 2nd Connection field
+
+    close(c);
+    shard.stop();
+    shard.join();
+    shard.shutdown();
+    close(lfd);
+}
+
+TEST(shard, serves_http2_head_proxy_with_upstream_content_length) {
+    ScriptedUpstreamServer backend;
+    static const char kResp[] =
+        "HTTP/1.1 200 OK\r\nContent-Length: 123\r\nConnection: close\r\n\r\n";
+    REQUIRE(backend.setup(kResp, sizeof(kResp) - 1));
+
+    RouteConfig cfg;
+    auto id = cfg.add_upstream("b", 0x7F000001, backend.port);
+    REQUIRE(id.has_value());
+    REQUIRE(cfg.add_proxy("/api", 0, id.value()));
+
+    Shard<EpollEventLoop> shard;
+    i32 lfd = create_listen_socket(0).value_or(-1);
+    REQUIRE(lfd >= 0);
+    u16 port = get_port(lfd);
+    REQUIRE(shard.init(0, lfd).has_value());
+    shard.route_config = &cfg;
+    REQUIRE(shard.spawn(-1).has_value());
+    usleep(50000);
+
+    i32 c = connect_to(port);
+    REQUIRE(c >= 0);
+    set_socket_timeouts(c, 2);
+
+    u8 out[512];
+    u32 n = h2_client_prologue(out);
+    const hpack::Header hs[] = {
+        {{":method", 7}, {"HEAD", 4}},
+        {{":scheme", 7}, {"http", 4}},
+        {{":path", 5}, {"/api", 4}},
+        {{":authority", 10}, {"localhost", 9}},
+    };
+    n += http2_write_headers(out + n, sizeof(out) - n, 1, hs, 4, /*end_stream=*/true);
+    REQUIRE(write_all_fd(c, out, n));
+
+    u8 resp[4096];
+    u32 total = 0;
+    for (int attempt = 0; attempt < 10 && total < sizeof(resp); attempt++) {
+        i32 got =
+            recv_timeout(c, reinterpret_cast<char*>(resp + total), sizeof(resp) - total, 2000);
+        if (got <= 0) break;
+        total += static_cast<u32>(got);
+        if (h2_status_for_stream(resp, total, 1) != 0) break;
+    }
+    u8 body[8];
+    CHECK_EQ(h2_status_for_stream(resp, total, 1), 200u);
+    CHECK(h2_response_has_header(resp, total, 1, "content-length", "123"));
+    CHECK_EQ(h2_body_for_stream(resp, total, 1, body, sizeof(body)), 0u);
 
     close(c);
     shard.stop();

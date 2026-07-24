@@ -10,9 +10,10 @@ namespace jit {
 // What the runtime should do after a JIT handler returns.
 
 enum class HandlerAction : u8 {
-    ReturnStatus = 0,  // Send HTTP response with status_code
-    Forward = 1,       // Forward request to upstream_id
-    Yield = 2,         // Suspend: initiate I/O, resume at next_state
+    ReturnStatus = 0,     // Send HTTP response with status_code
+    Forward = 1,          // Forward request to upstream_id
+    Yield = 2,            // Suspend: initiate I/O, resume at next_state
+    ForwardBuffered = 3,  // Buffer the complete upstream response before publishing it
 };
 
 // ── Yield Kind ─────────────────────────────────────────────────────
@@ -96,6 +97,10 @@ struct HandlerResult {
 
     static HandlerResult make_forward(u16 upstream) {
         return {HandlerAction::Forward, 0, upstream, 0, YieldKind::HttpGet};
+    }
+
+    static HandlerResult make_buffered_forward(u16 upstream) {
+        return {HandlerAction::ForwardBuffered, 0, upstream, 0, YieldKind::HttpGet};
     }
 
     static HandlerResult make_yield(u16 state, YieldKind kind) {

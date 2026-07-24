@@ -546,7 +546,8 @@ public:
         // now even with ops in flight (unlike the recv/send slices below).
         if (c.h2) {
             auto* async_ctx = c.h2->async_jit_ctx();
-            if (c.h2->async_stream != 0 && c.h2->async_kind == H2AsyncKind::Timer)
+            if (c.h2->async_stream != 0 &&
+                (c.h2->async_kind == H2AsyncKind::Timer || c.h2->async_apply_response_mutations))
                 rut_helper_resp_release_body_storage(static_cast<void*>(async_ctx));
             if (c.handler_ctx == async_ctx) c.handler_ctx = nullptr;
             h2_pool.free(c.h2);
@@ -1146,11 +1147,11 @@ public:
                     // + optional rearm). A *positive* recv CQE that was already
                     // harvested into recv_buf before the cancel took effect is
                     // deliberately NOT suppressed: those bytes are always past
-                    // the current request's framing (needs_req_body buffers the
-                    // full Content-Length body before the handler can yield, and
-                    // chunked bodies are rejected with 400), so they are the
-                    // next pipelined request. Every request accessor re-parses
-                    // req_data and bounds its output to the first request
+                    // the current request's framing (an actual req.body read
+                    // buffers the full Content-Length body before the handler
+                    // can yield, and chunked bodies are rejected with 400), so
+                    // they are the next pipelined request. Every request accessor
+                    // re-parses req_data and bounds its output to the first request
                     // (rut_helper_req_body caps at content_length, path/method/
                     // header to the first request's line/block), so the larger
                     // req_len is inert — no route value can observe the raced

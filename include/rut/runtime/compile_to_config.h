@@ -78,6 +78,17 @@ inline bool rir_function_needs_req_body(const rir::Function& fn) {
     return false;
 }
 
+inline bool rir_function_can_forward_buffered(const rir::Function& fn) {
+    if (fn.blocks == nullptr) return false;
+    for (u32 bi = 0; bi < fn.block_count; bi++) {
+        const auto& block = fn.blocks[bi];
+        if (block.insts == nullptr) continue;
+        for (u32 ii = 0; ii < block.inst_count; ii++)
+            if (block.insts[ii].op == rir::Opcode::RetForwardBuffered) return true;
+    }
+    return false;
+}
+
 inline bool configure_route_dispatch(RouteConfig& cfg, const rir::Module& mod) {
     if (cfg.route_count != 0) return false;
     if (mod.func_count > 0 && mod.functions == nullptr) return false;
@@ -136,7 +147,11 @@ inline bool register_jit_routes(RouteConfig& cfg, const rir::Module& mod, jit::J
         for (u32 j = 0; j < fn.route_pattern.len; j++) path[j] = fn.route_pattern.ptr[j];
         path[fn.route_pattern.len] = '\0';
 
-        if (!cfg.add_jit_handler(path, fn.http_method, handler, rir_function_needs_req_body(fn)))
+        if (!cfg.add_jit_handler(path,
+                                 fn.http_method,
+                                 handler,
+                                 rir_function_needs_req_body(fn),
+                                 rir_function_can_forward_buffered(fn)))
             return false;
         // @rateLimit decorators → stacked token-bucket rules, each with its own
         // metering key (the route just added is at index route_count - 1).

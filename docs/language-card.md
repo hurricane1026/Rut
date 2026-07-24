@@ -241,18 +241,28 @@ Dynamic Response header mutations are stored in the resumable handler context,
 so pending mutations survive `wait` and remain isolated per request/stream. A
 handler-local builder must be returned directly. A `chain after` helper
 must have exactly one `Response` parameter and may use `set`/`add`/`remove` with
-literal names and runtime string values; its header effects apply to successful
-direct and forwarded responses. Mutations stay pending until the selected
-success terminator, so a guard or pre-middleware short circuit cannot inherit
-them. Status/body writes use the same resumable commit boundary as headers, may
-be used by `chain after` after a yield, and require explicit buffered forwarding
-when applied to a forwarded response. Body replacement owns up to 4 KiB in the
+literal names and runtime string values; its effects apply to successful direct
+and forwarded responses. Mutations stay pending until the selected success terminator, so a
+guard or pre-middleware short circuit cannot inherit them. Applying any of these
+mutations to a forwarded response requires the terminal
+`return forward(upstream, buffered: true)` form.
+Status/body writes use the same resumable commit boundary as headers and may be
+used by `chain after` after a yield. Body replacement owns up to 4 KiB in the
 request/stream context; plain `str` and reusable `Json` values therefore survive
 resume without borrowing serializer scratch. Overflow or a runtime status
 outside 100...599 fails closed as 500. Status/body reads are supported on a
 handler-local builder and observe its latest pending replacement; the status
-carrier is currently plain `i32`. Reading or mutating a streaming forwarded
-response still requires an explicitly buffered response and remains ⏳.
+carrier is currently plain `i32`.
+
+Terminal buffered forwarding accumulates and validates the complete upstream
+response within the 16 KiB proxy buffer, de-frames chunked bodies, removes
+hop-by-hop headers, then applies committed header/status/body mutations. The
+HTTP/1 and HTTP/2 paths use the same boundary and preserve effects across
+`wait`. Malformed, truncated, upgraded, or over-cap upstream responses fail
+closed as 502; invalid or overflowing mutations fail closed as 500. Combining
+buffered response handling with `set_path` or `set_header` request rewrites is
+rejected until the HTTP/2 request-rewrite path is wired. Binding the buffered
+result as a first-class `Response` for upstream field reads remains ⏳.
 
 ## State types (top-level, per-shard, bounded)
 
@@ -319,15 +329,17 @@ route GET "/users" use chain observability { return forward(users) }
 ```
 
 `before` helpers may gate a route; `after` supports committed Response header,
-status, and bounded plain-string body writes. Reading or incrementally editing
-a buffered body remains ⏳.
+status, and bounded plain-string body writes, including after a visible yield.
+Forwarded responses require the explicit terminal buffered form above. Reading
+or incrementally editing an upstream buffered body remains ⏳.
 
 ## I/O
 
 ```swift
 // Proxy — the ONLY three forms
 return forward(users)                          // zero-copy, terminal
-let resp = forward(users, buffered: true)      // buffered Response, then return resp
+return forward(users, buffered: true)          // ✅ bounded terminal buffering + after mutations
+let resp = forward(users, buffered: true)      // ⏳ first-class buffered Response expression
 return forward(users, streaming: true)         // large bodies, no buffering
 
 // Static files / pipes

@@ -1506,6 +1506,10 @@ u64 h2_mutated_body_then_timer(void*, jit::HandlerCtx* ctx, const u8*, u32, void
     ctx->response_body_mutation_len = 1;
     return jit::HandlerResult::make_yield_payload(1, jit::YieldKind::Timer, 1).pack();
 }
+
+u64 h2_status_204(void*, jit::HandlerCtx*, const u8*, u32, void*) {
+    return jit::HandlerResult::make_status(204).pack();
+}
 }  // namespace
 
 TEST(h2_serving, response_status_body_rules_include_reset_content) {
@@ -1515,6 +1519,39 @@ TEST(h2_serving, response_status_body_rules_include_reset_content) {
     CHECK(h2_response_status_forbids_body(304));
     CHECK_FALSE(h2_response_status_forbids_body(200));
     CHECK_FALSE(h2_response_status_forbids_body(206));
+}
+
+TEST(h2_serving, body_deferral_tracks_buffered_forward_capability_separately) {
+    const hpack::Header headers[] = {{{":method", 7}, {"POST", 4}},
+                                     {{":path", 5}, {"/upload", 7}},
+                                     {{":scheme", 7}, {"https", 5}},
+                                     {{":authority", 10}, {"example", 7}}};
+    const auto run = [&](bool can_forward_buffered) {
+        Http2Conn h2;
+        h2.init();
+        Connection conn;
+        conn.reset();
+        conn.h2 = &h2;
+        RouteConfig config;
+        REQUIRE(config.add_jit_handler(
+            "/upload", kRouteMethodPost, &h2_status_204, false, can_forward_buffered));
+        conn.request_config = &config;
+        FakeH2Loop loop;
+        u8 response[512]{};
+        H2Dispatch<FakeH2Loop> dispatch{&loop, &conn, response, sizeof(response), 0, false};
+
+        h2_dispatch_request(dispatch, 1, headers, 4, /*end_stream=*/false);
+        if (can_forward_buffered) {
+            CHECK_EQ(h2.pending_stream, 1u);
+            CHECK(h2.pending_buffer_body);
+            CHECK_EQ(dispatch.resp_len, 0u);
+        } else {
+            CHECK_EQ(h2.pending_stream, 0u);
+            CHECK_GT(dispatch.resp_len, 0u);
+        }
+    };
+    run(false);
+    run(true);
 }
 
 TEST(h2_serving, bodyless_mutated_status_suppresses_dynamic_data) {
@@ -1585,7 +1622,8 @@ TEST(h2_serving, rejected_handler_outcomes_release_mutation_storage) {
         RouteEntry route{};
         route.fn = fn;
 
-        h2_invoke_emit(dispatch, 1, &route, nullptr, 0, nullptr, kRequest, sizeof(kRequest) - 1);
+        h2_invoke_emit(
+            dispatch, 1, &route, nullptr, 0, nullptr, kRequest, sizeof(kRequest) - 1, false);
 
         CHECK(conn.jit_ctx()->response_body_mutation_storage == nullptr);
         CHECK_GT(dispatch.resp_len, 0u);
@@ -1641,6 +1679,8 @@ TEST(h2_serving, deferred_route_params_copied_to_stable_storage) {
     path_buf[8] = '9';
 
     REQUIRE(h2.pending_route_param_count == 1u);
+    CHECK(h2.pending_buffer_body);
+    CHECK_FALSE(h2.pending_request_forwardable);  // missing :scheme
     const H2RouteParam& sp = h2.pending_route_params[0];
     CHECK_EQ(sp.value_len, 2u);
     CHECK(sp.value != path_buf + 7);  // not aliasing the reusable matcher source
@@ -1736,7 +1776,8 @@ TEST(h2_serving, suspended_handler_context_is_snapshotted_and_rebased) {
     CHECK(parked_body.eq(Str{kBody, sizeof(kBody) - 1}));
 
     h2.async_stream = 1;
-    h2.async_kind = H2AsyncKind::Timer;
+    h2.async_kind = H2AsyncKind::Proxy;
+    h2.async_apply_response_mutations = true;
     h2_clear_async(h2);
     CHECK(parked->response_body_mutation_storage == nullptr);
     CHECK(parked->response_body_snapshot_storage == nullptr);

@@ -820,6 +820,7 @@ struct HirTerminator {
     bool commit_response_mutations = false;
     u32 local_ref_index = 0xffffffffu;
     u32 upstream_index = 0;
+    bool forward_buffered = false;
     // Optional response body literal (populated when the source was
     // `return response(N, body: "...")`). Sentinel by ptr, not len:
     //   ptr == nullptr   → no body kwarg, use default status-reason.

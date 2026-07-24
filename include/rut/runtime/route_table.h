@@ -96,6 +96,7 @@ struct RouteEntry {
     u16 status_code;              // status code (if action == Static, e.g., 200, 404)
     jit::HandlerFn fn = nullptr;  // JIT-compiled handler (if action == JitHandler)
     bool needs_req_body = false;  // JIT handler reads req.body and needs the full body buffered
+    bool can_forward_buffered = false;  // H2 must retain DATA until buffered-forward dispatch
     // Per-route rate limit (fixed window). Empty rule set = unlimited. Each rule
     // allows `max` requests per `window_sec` metered by its own key (IP / header
     // / query / cookie / param tuple; empty key = per-client-IP). A request must
@@ -535,6 +536,7 @@ struct RouteConfig {
         r.status_code = 0;
         r.fn = nullptr;
         r.needs_req_body = false;
+        r.can_forward_buffered = false;
         if (!populate_dispatch_state(r)) {
             return false;  // active dispatch at capacity — fail loud
         }
@@ -691,6 +693,7 @@ struct RouteConfig {
         r.status_code = status;
         r.fn = nullptr;
         r.needs_req_body = false;
+        r.can_forward_buffered = false;
         if (!populate_dispatch_state(r)) {
             return false;
         }
@@ -704,7 +707,8 @@ struct RouteConfig {
     bool add_jit_handler(const char* path,
                          u8 method,
                          jit::HandlerFn fn,
-                         bool needs_req_body = false) {
+                         bool needs_req_body = false,
+                         bool can_forward_buffered = false) {
         if (route_count >= kMaxRoutes) return false;
         if (fn == nullptr) return false;
         if (!is_routable_path(path)) return false;
@@ -726,6 +730,7 @@ struct RouteConfig {
         r.status_code = 0;
         r.fn = fn;
         r.needs_req_body = needs_req_body;
+        r.can_forward_buffered = can_forward_buffered;
         if (!populate_dispatch_state(r)) {
             return false;
         }

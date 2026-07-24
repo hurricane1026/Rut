@@ -1319,6 +1319,16 @@ struct Builder {
         return {};
     }
 
+    VoidResult emit_ret_forward_buffered(ValueId upstream, SourceLoc loc = {}) {
+        if (!valid_val(upstream)) return err(RirError::InvalidState);
+        if (!val_has_type(upstream, TypeKind::I32) && !val_has_type(upstream, TypeKind::U32))
+            return err(RirError::InvalidState);
+        auto r = TRY(emit(Opcode::RetForwardBuffered, nullptr, loc));
+        r.inst->operands[0] = upstream;
+        r.inst->operand_count = 1;
+        return {};
+    }
+
     // ── Yields (I/O suspend points) ────────────────────────────────
 
     Result<ValueId> emit_yield_http_get(Str url, ValueId headers, SourceLoc loc = {}) {

@@ -35,7 +35,8 @@ bool expectation_matches(const ScenarioExpectation& expected, const jit::Handler
     if (terminal.action != expected.action) return false;
     if (terminal.action == jit::HandlerAction::ReturnStatus)
         return terminal.status_code == expected.value;
-    if (terminal.action == jit::HandlerAction::Forward)
+    if (terminal.action == jit::HandlerAction::Forward ||
+        terminal.action == jit::HandlerAction::ForwardBuffered)
         return terminal.upstream_id == expected.value;
     return false;
 }

@@ -12261,6 +12261,22 @@ static FrontendResult<HirTerminator> analyze_term(const AstStatement& stmt,
     if (!upstream_index) return core::make_unexpected(upstream_index.error());
     term.kind = HirTerminatorKind::ForwardUpstream;
     term.upstream_index = upstream_index.value();
+    term.forward_buffered = stmt.forward_buffered;
+    bool has_request_rewrite_effect = false;
+    if (stmt.forward_buffered && route != nullptr) {
+        for (u32 li = 0; li < route->locals.len; li++) {
+            const auto kind = route->locals[li].init.kind;
+            has_request_rewrite_effect |=
+                kind == HirExprKind::ReqSetHeader || kind == HirExprKind::ReqAddHeader;
+        }
+    }
+    if (stmt.forward_buffered && (stmt.has_forward_set_path || stmt.forward_set_headers.len != 0 ||
+                                  has_request_rewrite_effect))
+        return frontend_error(
+            FrontendError::UnsupportedSyntax,
+            stmt.span,
+            lit_str(
+                "buffered forward cannot yet combine response buffering with request rewrites"));
     if (stmt.has_forward_set_path) term.forward_set_path = stmt.forward_set_path;
     // Carry forward(set_header:) overrides verbatim (parser validated + deduped).
     for (u32 i = 0; i < stmt.forward_set_headers.len; i++) {
@@ -22283,33 +22299,33 @@ static FrontendResult<HirModule*> analyze_file_internal(
                         route_decl.span,
                         lit_str("chain-after Response scalar effects cannot follow a Response "
                                 "field read"));
-                bool forwards = false;
-                auto check_forward = [&](const HirTerminator& term) {
-                    forwards |= term.kind == HirTerminatorKind::ForwardUpstream;
-                };
-                if (route.control.kind == HirControlKind::Direct) {
-                    check_forward(route.control.direct_term);
-                } else if (route.control.kind == HirControlKind::If) {
-                    check_forward(route.control.then_term);
-                    check_forward(route.control.else_term);
-                } else {
-                    for (u32 ai = 0; ai < route.control.match_arms.len; ai++) {
-                        const auto& arm = route.control.match_arms[ai];
-                        if (arm.body_kind == HirMatchArm::BodyKind::Direct) {
-                            check_forward(arm.direct_term);
-                        } else {
-                            check_forward(arm.then_term);
-                            check_forward(arm.else_term);
-                        }
+            }
+            auto is_streaming_forward = [](const HirTerminator& term) {
+                return term.kind == HirTerminatorKind::ForwardUpstream && !term.forward_buffered;
+            };
+            bool has_streaming_forward = false;
+            if (route.control.kind == HirControlKind::Direct) {
+                has_streaming_forward = is_streaming_forward(route.control.direct_term);
+            } else if (route.control.kind == HirControlKind::If) {
+                has_streaming_forward = is_streaming_forward(route.control.then_term) ||
+                                        is_streaming_forward(route.control.else_term);
+            } else {
+                for (u32 ai = 0; ai < route.control.match_arms.len; ai++) {
+                    const auto& arm = route.control.match_arms[ai];
+                    if (arm.body_kind == HirMatchArm::BodyKind::Direct) {
+                        has_streaming_forward |= is_streaming_forward(arm.direct_term);
+                    } else {
+                        has_streaming_forward |= is_streaming_forward(arm.then_term) ||
+                                                 is_streaming_forward(arm.else_term);
                     }
                 }
-                if (forwards)
-                    return frontend_error(
-                        FrontendError::UnsupportedSyntax,
-                        route_decl.span,
-                        lit_str("Response status/body effects require a buffered response and "
-                                "cannot be combined with forward yet"));
             }
+            if (has_streaming_forward)
+                return frontend_error(
+                    FrontendError::UnsupportedSyntax,
+                    route_decl.span,
+                    lit_str(
+                        "chain after Response mutations require `forward(..., buffered: true)`"));
             auto mark_commit = [](HirTerminator& term) { term.commit_response_mutations = true; };
             if (route.control.kind == HirControlKind::Direct) {
                 mark_commit(route.control.direct_term);
