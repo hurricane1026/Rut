@@ -140,6 +140,10 @@ void rut_helper_parse_prime(const rut::u8* req_data, rut::u32 req_len);
 // call before each terminal return of a request-reading handler.
 void rut_helper_parse_unprime();
 
+// Reset reusable-Json capture storage at every handler invocation, including
+// request-independent handlers that do not call parse_prime.
+void rut_helper_json_capture_reset();
+
 // Bounded per-shard JSON response serializer. reset starts one document;
 // append_* are no-ops after overflow; finish publishes an all-or-nothing view
 // through HandlerCtx. raw is compiler-owned JSON punctuation/key text only.
@@ -149,6 +153,8 @@ void rut_helper_json_append_str(const char* data, rut::u32 len);
 void rut_helper_json_append_str_list(const rut::Str* items, rut::u32 len);
 void rut_helper_json_append_i64(rut::i64 value);
 void rut_helper_json_append_bool(rut::u8 value);
+const char* rut_helper_json_capture_data();
+rut::u32 rut_helper_json_capture_len();
 void rut_helper_json_finish(void* ctx);
 
 // ── String Operations ──────────────────────────────────────────────
@@ -204,10 +210,12 @@ void rut_helper_resp_add_header(
 void rut_helper_resp_remove_header(void* ctx, const char* name, rut::u32 nlen);
 void rut_helper_resp_set_status(void* ctx, rut::i32 status);
 void rut_helper_resp_set_body(void* ctx, const char* body, rut::u32 len);
+void rut_helper_resp_publish_body(void* ctx, const char* body, rut::u32 len);
 // Return a lazily acquired Response.body mutation buffer to the current
 // thread's bounded cache and clear the HandlerCtx pointer. Safe on null.
 void rut_helper_resp_release_body_storage(void* ctx);
 void rut_helper_resp_commit_headers(void* ctx);
+void rut_helper_resp_commit_body(void* ctx);
 void rut_helper_resp_header(void* ctx,
                             const char* name,
                             rut::u32 nlen,

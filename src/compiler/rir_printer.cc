@@ -232,6 +232,9 @@ void print_opcode(PrintBuf& buf, Opcode op) {
         case Opcode::RespCommitHeaders:
             buf.put_cstr("resp.commit_headers");
             break;
+        case Opcode::RespCommitBody:
+            buf.put_cstr("resp.commit_body");
+            break;
         case Opcode::ReqSetPath:
             buf.put_cstr("req.set_path");
             break;
@@ -348,6 +351,9 @@ void print_opcode(PrintBuf& buf, Opcode op) {
             break;
         case Opcode::JsonAppendArray:
             buf.put_cstr("json.append_array");
+            break;
+        case Opcode::JsonCapture:
+            buf.put_cstr("json.capture");
             break;
         case Opcode::JsonFinish:
             buf.put_cstr("json.finish");
@@ -633,6 +639,7 @@ void print_instruction(PrintBuf& buf, const Instruction& inst, const Function& f
         case Opcode::ResumeEventKind:
         case Opcode::ResumeEventResult:
         case Opcode::RespCommitHeaders:
+        case Opcode::RespCommitBody:
             break;
         case Opcode::CtxLoadSlotI32:
             buf.put(' ');

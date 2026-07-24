@@ -690,6 +690,37 @@ TEST(harness_scenario, dynamic_json_body_is_accounted_as_runtime_output) {
     CHECK_EQ(target.destroy(), harness::CleanupOutcome::Clean);
 }
 
+TEST(harness_scenario, reusable_json_body_mutation_survives_resume) {
+    TempSource source;
+    REQUIRE(source.write(
+        "route GET \"/x\" { let body = json({ path: req.path }) let resp = response(200) "
+        "resp.body = body wait(1) return resp }\n"));
+    harness::SourceTarget target{};
+    harness::HarnessSpec load_spec{};
+    REQUIRE_EQ(target.prepare({source.path, jit::OptLevel::O0}, load_spec).outcome,
+               harness::Outcome::Passed);
+
+    const char request[] = "GET /x HTTP/1.1\r\nHost: test\r\n\r\n";
+    harness::ScenarioSpec scenario{};
+    scenario.target = &target;
+    scenario.path = {"/x", 2};
+    scenario.method = kRouteMethodGet;
+    scenario.request_data = reinterpret_cast<const u8*>(request);
+    scenario.request_len = sizeof(request) - 1;
+    scenario.expected = {true, jit::HandlerAction::ReturnStatus, 200};
+
+    auto spec = scripted_scenario_harness();
+    spec.required_capabilities =
+        harness::Capability::SyntheticIo | harness::Capability::VirtualTime;
+    spec.environment_capabilities = spec.required_capabilities;
+    const auto result = harness::drive_scenario(scenario, spec);
+    REQUIRE_EQ(result.harness.outcome, harness::Outcome::Passed);
+    CHECK_EQ(result.terminal.status_code, 200);
+    CHECK_EQ(result.harness.handler_resumes, 1u);
+    CHECK_EQ(result.harness.output_bytes, 117u);
+    CHECK_EQ(target.destroy(), harness::CleanupOutcome::Clean);
+}
+
 TEST(harness_scenario, declared_struct_json_body_is_accounted_as_runtime_output) {
     TempSource source;
     REQUIRE(
