@@ -99,7 +99,9 @@ upstream fields. A Core route attaches one explicit chain, whose steps execute
 in two handler phases: all `before` steps run before the route body and preserve
 their relative source order. For the selected handler's normal response, all
 `after` steps then run after the body and preserve their relative source order;
-guard failures and pre-handler short circuits return without that phase.
+top-level handler guard failures and pre-handler short circuits return without
+that phase, while verifier-bounded static-loop exits receive the `after`
+effects as part of the selected handler response.
 Interleaving `before` and `after` declarations does not create one global
 source-ordered sequence across phases.
 

@@ -96,11 +96,13 @@ handler
 
 Chains have two fixed handler phases. Every `before` declaration runs in source
 order before the handler. For a selected handler's normal response, every
-`after` declaration runs in source order after the handler. Guard failures and
-pre-handler short circuits return directly without entering the post-handler
-phase. Interleaving `after` and `before` declarations does not create a global
-interleaved order. The post-handler phase is not a reverse wrapper unwind, so
-review, replay, and generated code do not need an extra execution model.
+`after` declaration runs in source order after the handler. Top-level handler
+guard failures and pre-handler short circuits return directly without entering
+the post-handler phase; verifier-bounded static-loop exits are part of the
+selected handler response and do receive the `after` effects. Interleaving
+`after` and `before` declarations does not create a global interleaved order.
+The post-handler phase is not a reverse wrapper unwind, so review, replay, and
+generated code do not need an extra execution model.
 
 ## Core Restrictions
 
