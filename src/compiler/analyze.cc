@@ -17776,7 +17776,7 @@ static FrontendResult<u32> analyze_for_stmt(const AstStatement& stmt,
                                     return frontend_error(FrontendError::TooManyItems, inner.span);
                                 route->locals[li].name = {};
                             }
-                            if (arm.locals.len >= HirForLoopMatchArm::kMaxLocals)
+                            if (arm.locals.len >= HirForLoopMatchArm::kMaxSourceLocals)
                                 return frontend_error(FrontendError::TooManyItems, inner.span);
                             arm.local_guard_depth[arm.locals.len] = arm.guards.len;
                             if (!arm.locals.push(local))
@@ -17881,7 +17881,7 @@ static FrontendResult<u32> analyze_for_stmt(const AstStatement& stmt,
                                 }
                             }
                             for (u32 li = scoped_carrier_start; li < scoped_carrier_end; li++) {
-                                if (arm.locals.len >= HirForLoopMatchArm::kMaxLocals)
+                                if (arm.locals.len >= HirForLoopMatchArm::kMaxSourceLocals)
                                     return frontend_error(FrontendError::TooManyItems, inner.span);
                                 arm.local_guard_depth[arm.locals.len] = arm.guards.len;
                                 if (!arm.locals.push(route->locals[li]))
@@ -17942,7 +17942,7 @@ static FrontendResult<u32> analyze_for_stmt(const AstStatement& stmt,
                                 auto init = make_guard_bound_init(route, bound.value(), inner.span);
                                 if (!init) return core::make_unexpected(init.error());
                                 local.init = init.value();
-                                if (arm.locals.len >= HirForLoopMatchArm::kMaxLocals)
+                                if (arm.locals.len >= HirForLoopMatchArm::kMaxSourceLocals)
                                     return frontend_error(FrontendError::TooManyItems, inner.span);
                                 arm.local_guard_depth[arm.locals.len] = arm.guards.len;
                                 if (!arm.locals.push(local))
@@ -18368,7 +18368,7 @@ static FrontendResult<u32> analyze_for_stmt(const AstStatement& stmt,
             if (!loop.body.steps.push(step))
                 return frontend_error(FrontendError::TooManyItems, bstmt.span);
             const HirForLoop& nested_loop = route->for_loops[nested.value()];
-            auto loop_may_skip_terminator = [&](auto&& self, const HirForLoop& candidate) -> bool {
+            auto loop_may_skip_terminator = [&](const HirForLoop& candidate) -> bool {
                 if (candidate.body.has_loop_control) return true;
                 for (u32 gi = 0; gi < candidate.body.guards.len; gi++)
                     if (candidate.body.guards[gi].fail_kind == HirGuard::FailKind::LoopControl)
@@ -18381,18 +18381,11 @@ static FrontendResult<u32> analyze_for_stmt(const AstStatement& stmt,
                                 HirGuard::FailKind::LoopControl)
                                 return true;
                 }
-                for (u32 si = 0; si < candidate.body.steps.len; si++) {
-                    const auto& child_step = candidate.body.steps[si];
-                    if (child_step.kind == HirForLoopBody::Step::Kind::For &&
-                        child_step.index < route->for_loops.len &&
-                        self(self, route->for_loops[child_step.index]))
-                        return true;
-                }
                 return false;
             };
             u32 nested_iter_len = 0;
             if (nested_loop.body.has_term &&
-                !loop_may_skip_terminator(loop_may_skip_terminator, nested_loop) &&
+                !loop_may_skip_terminator(nested_loop) &&
                 static_for_iter_len(nested_loop.iter_expr,
                                     route->locals.data,
                                     route->locals.len,
@@ -23242,8 +23235,7 @@ static FrontendResult<HirModule*> analyze_file_internal(
                 auto loop = analyze_for_stmt(stmt, &route, mod);
                 if (!loop) return core::make_unexpected(loop.error());
                 const auto& analyzed_loop = route.for_loops[loop.value()];
-                auto loop_may_skip_terminator =
-                    [&](auto&& self, const HirForLoop& candidate) -> bool {
+                auto loop_may_skip_terminator = [&](const HirForLoop& candidate) -> bool {
                     if (candidate.body.has_loop_control) return true;
                     for (u32 gi = 0; gi < candidate.body.guards.len; gi++)
                         if (candidate.body.guards[gi].fail_kind ==
@@ -23257,18 +23249,90 @@ static FrontendResult<HirModule*> analyze_file_internal(
                                     HirGuard::FailKind::LoopControl)
                                     return true;
                     }
-                    for (u32 step = 0; step < candidate.body.steps.len; step++) {
-                        const auto& child = candidate.body.steps[step];
-                        if (child.kind == HirForLoopBody::Step::Kind::For &&
-                            child.index < route.for_loops.len &&
-                            self(self, route.for_loops[child.index]))
-                            return true;
-                    }
                     return false;
                 };
+                const HirLocal* dynamic_response = nullptr;
+                for (u32 li = 0; li < route.locals.len; li++) {
+                    if (route.locals[li].init.kind == HirExprKind::ResponseInit &&
+                        route.locals[li].init.bool_value) {
+                        dynamic_response = &route.locals[li];
+                        break;
+                    }
+                }
+                if (dynamic_response != nullptr) {
+                    auto invalid_term = [&](const HirTerminator& term) {
+                        if (term.span.start == 0 && term.span.end == 0) return false;
+                        return term.source_kind != HirTerminatorSourceKind::LocalRef ||
+                               term.local_ref_index != dynamic_response->ref_index;
+                    };
+                    auto invalid_guard = [&](const HirGuard& guard) {
+                        if (guard.fail_kind == HirGuard::FailKind::Term)
+                            return invalid_term(guard.fail_term);
+                        if (guard.fail_kind == HirGuard::FailKind::Match) {
+                            for (u32 ai = 0; ai < guard.fail_match_count; ai++)
+                                if (invalid_term(
+                                        mod.guard_match_arms[guard.fail_match_start + ai]
+                                            .direct_term))
+                                    return true;
+                            return false;
+                        }
+                        if (guard.fail_kind != HirGuard::FailKind::Body) return false;
+                        if (guard.fail_body.body_kind == HirGuardBody::BodyKind::If)
+                            return invalid_term(guard.fail_body.then_term) ||
+                                   invalid_term(guard.fail_body.else_term);
+                        return invalid_term(guard.fail_body.direct_term);
+                    };
+                    auto invalid_loop = [&](auto&& self, const HirForLoop& candidate) -> bool {
+                        const auto& body = candidate.body;
+                        if (body.term.span.end != 0 && invalid_term(body.term)) return true;
+                        for (u32 gi = 0; gi < body.guards.len; gi++)
+                            if (invalid_guard(body.guards[gi])) return true;
+                        for (u32 ii = 0; ii < body.ifs.len; ii++) {
+                            if (body.ifs[ii].then_branch.kind == HirForLoopBranch::Kind::Term &&
+                                invalid_term(body.ifs[ii].then_branch.term))
+                                return true;
+                            if (body.ifs[ii].else_branch.kind == HirForLoopBranch::Kind::Term &&
+                                invalid_term(body.ifs[ii].else_branch.term))
+                                return true;
+                        }
+                        for (u32 mi = 0; mi < body.matches.len; mi++) {
+                            for (u32 ai = 0; ai < body.matches[mi].arms.len; ai++) {
+                                const auto& arm = body.matches[mi].arms[ai];
+                                for (u32 gi = 0; gi < arm.guards.len; gi++)
+                                    if (invalid_guard(arm.guards[gi])) return true;
+                                if (arm.body_kind == HirForLoopMatchArm::BodyKind::Direct) {
+                                    if (arm.direct_branch.kind == HirForLoopBranch::Kind::Term &&
+                                        invalid_term(arm.direct_branch.term))
+                                        return true;
+                                } else {
+                                    if (arm.then_branch.kind == HirForLoopBranch::Kind::Term &&
+                                        invalid_term(arm.then_branch.term))
+                                        return true;
+                                    if (arm.else_branch.kind == HirForLoopBranch::Kind::Term &&
+                                        invalid_term(arm.else_branch.term))
+                                        return true;
+                                }
+                            }
+                        }
+                        for (u32 si = 0; si < body.steps.len; si++) {
+                            const auto& child = body.steps[si];
+                            if (child.kind == HirForLoopBody::Step::Kind::For &&
+                                child.index < route.for_loops.len &&
+                                self(self, route.for_loops[child.index]))
+                                return true;
+                        }
+                        return false;
+                    };
+                    if (invalid_loop(invalid_loop, analyzed_loop))
+                        return frontend_error(
+                            FrontendError::UnsupportedSyntax,
+                            stmt.span,
+                            lit_str("a dynamically mutated Response builder must be returned "
+                                    "directly"));
+                }
                 u32 iter_len = 0;
                 if (analyzed_loop.body.has_term &&
-                    !loop_may_skip_terminator(loop_may_skip_terminator, analyzed_loop) &&
+                    !loop_may_skip_terminator(analyzed_loop) &&
                     static_for_iter_len(analyzed_loop.iter_expr,
                                         route.locals.data,
                                         route.locals.len,
@@ -23410,6 +23474,22 @@ static FrontendResult<HirModule*> analyze_file_internal(
             auto is_streaming_forward = [](const HirTerminator& term) {
                 return term.kind == HirTerminatorKind::ForwardUpstream && !term.forward_buffered;
             };
+            auto guard_has_streaming_forward = [&](const HirGuard& guard) {
+                if (guard.fail_kind == HirGuard::FailKind::Term)
+                    return is_streaming_forward(guard.fail_term);
+                if (guard.fail_kind == HirGuard::FailKind::Match) {
+                    for (u32 ai = 0; ai < guard.fail_match_count; ai++)
+                        if (is_streaming_forward(
+                                mod.guard_match_arms[guard.fail_match_start + ai].direct_term))
+                            return true;
+                    return false;
+                }
+                if (guard.fail_kind != HirGuard::FailKind::Body) return false;
+                if (guard.fail_body.body_kind == HirGuardBody::BodyKind::If)
+                    return is_streaming_forward(guard.fail_body.then_term) ||
+                           is_streaming_forward(guard.fail_body.else_term);
+                return is_streaming_forward(guard.fail_body.direct_term);
+            };
             bool has_streaming_forward = false;
             if (route.control.kind == HirControlKind::Direct) {
                 has_streaming_forward = is_streaming_forward(route.control.direct_term);
@@ -23431,12 +23511,17 @@ static FrontendResult<HirModule*> analyze_file_internal(
                 const auto& body = route.for_loops[fi].body;
                 if (body.term.span.end != 0)
                     has_streaming_forward |= is_streaming_forward(body.term);
+                for (u32 gi = 0; gi < body.guards.len; gi++)
+                    has_streaming_forward |= guard_has_streaming_forward(body.guards[gi]);
                 for (u32 ii = 0; ii < body.ifs.len; ii++)
                     has_streaming_forward |= is_streaming_forward(body.ifs[ii].then_branch.term) ||
                                              is_streaming_forward(body.ifs[ii].else_branch.term);
                 for (u32 mi = 0; mi < body.matches.len; mi++) {
                     for (u32 ai = 0; ai < body.matches[mi].arms.len; ai++) {
                         const auto& arm = body.matches[mi].arms[ai];
+                        for (u32 gi = 0; gi < arm.guards.len; gi++)
+                            has_streaming_forward |=
+                                guard_has_streaming_forward(arm.guards[gi]);
                         if (arm.body_kind == HirForLoopMatchArm::BodyKind::Direct)
                             has_streaming_forward |= is_streaming_forward(arm.direct_branch.term);
                         else
@@ -23452,6 +23537,22 @@ static FrontendResult<HirModule*> analyze_file_internal(
                     lit_str(
                         "chain after Response mutations require `forward(..., buffered: true)`"));
             auto mark_commit = [](HirTerminator& term) { term.commit_response_mutations = true; };
+            auto mark_guard_commit = [&](HirGuard& guard) {
+                if (guard.fail_kind == HirGuard::FailKind::Term) {
+                    mark_commit(guard.fail_term);
+                } else if (guard.fail_kind == HirGuard::FailKind::Match) {
+                    for (u32 ai = 0; ai < guard.fail_match_count; ai++)
+                        mark_commit(
+                            mod.guard_match_arms[guard.fail_match_start + ai].direct_term);
+                } else if (guard.fail_kind == HirGuard::FailKind::Body) {
+                    if (guard.fail_body.body_kind == HirGuardBody::BodyKind::If) {
+                        mark_commit(guard.fail_body.then_term);
+                        mark_commit(guard.fail_body.else_term);
+                    } else {
+                        mark_commit(guard.fail_body.direct_term);
+                    }
+                }
+            };
             if (route.control.kind == HirControlKind::Direct) {
                 mark_commit(route.control.direct_term);
             } else if (route.control.kind == HirControlKind::If) {
@@ -23471,6 +23572,8 @@ static FrontendResult<HirModule*> analyze_file_internal(
             for (u32 fi = 0; fi < route.for_loops.len; fi++) {
                 auto& body = route.for_loops[fi].body;
                 if (body.term.span.end != 0) mark_commit(body.term);
+                for (u32 gi = 0; gi < body.guards.len; gi++)
+                    mark_guard_commit(body.guards[gi]);
                 for (u32 ii = 0; ii < body.ifs.len; ii++) {
                     if (body.ifs[ii].then_branch.kind == HirForLoopBranch::Kind::Term)
                         mark_commit(body.ifs[ii].then_branch.term);
@@ -23480,6 +23583,8 @@ static FrontendResult<HirModule*> analyze_file_internal(
                 for (u32 mi = 0; mi < body.matches.len; mi++) {
                     for (u32 ai = 0; ai < body.matches[mi].arms.len; ai++) {
                         auto& arm = body.matches[mi].arms[ai];
+                        for (u32 gi = 0; gi < arm.guards.len; gi++)
+                            mark_guard_commit(arm.guards[gi]);
                         if (arm.body_kind == HirForLoopMatchArm::BodyKind::Direct) {
                             if (arm.direct_branch.kind == HirForLoopBranch::Kind::Term)
                                 mark_commit(arm.direct_branch.term);

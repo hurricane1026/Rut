@@ -890,9 +890,7 @@ struct HirGuardBody {
         If,
     };
 
-    // Four source locals plus one hidden carrier used to latch a flattened
-    // source-arm guard across the nested arms in its capture group.
-    static constexpr u32 kMaxLocals = 5;
+    static constexpr u32 kMaxLocals = 4;
     BodyKind body_kind = BodyKind::Direct;
     FixedVec<HirLocal, kMaxLocals> locals;
     HirExpr cond{};
@@ -1016,7 +1014,10 @@ struct HirForLoopMatchArm {
     bool arm_guard_precedes_prelude = false;
     HirExpr arm_guard{};
     BodyKind body_kind = BodyKind::Direct;
-    static constexpr u32 kMaxLocals = 4;
+    // Four source locals plus one hidden carrier used to latch a flattened
+    // source-arm guard across the nested arms in its capture group.
+    static constexpr u32 kMaxLocals = 5;
+    static constexpr u32 kMaxSourceLocals = 4;
     static constexpr u32 kMaxPreludeGuards = 2;
     FixedVec<HirLocal, kMaxLocals> locals;
     // 0 materializes at arm entry; N materializes only after prelude guard N
