@@ -18384,8 +18384,7 @@ static FrontendResult<u32> analyze_for_stmt(const AstStatement& stmt,
                 return false;
             };
             u32 nested_iter_len = 0;
-            if (nested_loop.body.has_term &&
-                !loop_may_skip_terminator(nested_loop) &&
+            if (nested_loop.body.has_term && !loop_may_skip_terminator(nested_loop) &&
                 static_for_iter_len(nested_loop.iter_expr,
                                     route->locals.data,
                                     route->locals.len,
@@ -23238,8 +23237,7 @@ static FrontendResult<HirModule*> analyze_file_internal(
                 auto loop_may_skip_terminator = [&](const HirForLoop& candidate) -> bool {
                     if (candidate.body.has_loop_control) return true;
                     for (u32 gi = 0; gi < candidate.body.guards.len; gi++)
-                        if (candidate.body.guards[gi].fail_kind ==
-                            HirGuard::FailKind::LoopControl)
+                        if (candidate.body.guards[gi].fail_kind == HirGuard::FailKind::LoopControl)
                             return true;
                     for (u32 mi = 0; mi < candidate.body.matches.len; mi++) {
                         const auto& body_match = candidate.body.matches[mi];
@@ -23270,9 +23268,8 @@ static FrontendResult<HirModule*> analyze_file_internal(
                             return invalid_term(guard.fail_term);
                         if (guard.fail_kind == HirGuard::FailKind::Match) {
                             for (u32 ai = 0; ai < guard.fail_match_count; ai++)
-                                if (invalid_term(
-                                        mod.guard_match_arms[guard.fail_match_start + ai]
-                                            .direct_term))
+                                if (invalid_term(mod.guard_match_arms[guard.fail_match_start + ai]
+                                                     .direct_term))
                                     return true;
                             return false;
                         }
@@ -23331,8 +23328,7 @@ static FrontendResult<HirModule*> analyze_file_internal(
                                     "directly"));
                 }
                 u32 iter_len = 0;
-                if (analyzed_loop.body.has_term &&
-                    !loop_may_skip_terminator(analyzed_loop) &&
+                if (analyzed_loop.body.has_term && !loop_may_skip_terminator(analyzed_loop) &&
                     static_for_iter_len(analyzed_loop.iter_expr,
                                         route.locals.data,
                                         route.locals.len,
@@ -23520,8 +23516,7 @@ static FrontendResult<HirModule*> analyze_file_internal(
                     for (u32 ai = 0; ai < body.matches[mi].arms.len; ai++) {
                         const auto& arm = body.matches[mi].arms[ai];
                         for (u32 gi = 0; gi < arm.guards.len; gi++)
-                            has_streaming_forward |=
-                                guard_has_streaming_forward(arm.guards[gi]);
+                            has_streaming_forward |= guard_has_streaming_forward(arm.guards[gi]);
                         if (arm.body_kind == HirForLoopMatchArm::BodyKind::Direct)
                             has_streaming_forward |= is_streaming_forward(arm.direct_branch.term);
                         else
@@ -23542,8 +23537,7 @@ static FrontendResult<HirModule*> analyze_file_internal(
                     mark_commit(guard.fail_term);
                 } else if (guard.fail_kind == HirGuard::FailKind::Match) {
                     for (u32 ai = 0; ai < guard.fail_match_count; ai++)
-                        mark_commit(
-                            mod.guard_match_arms[guard.fail_match_start + ai].direct_term);
+                        mark_commit(mod.guard_match_arms[guard.fail_match_start + ai].direct_term);
                 } else if (guard.fail_kind == HirGuard::FailKind::Body) {
                     if (guard.fail_body.body_kind == HirGuardBody::BodyKind::If) {
                         mark_commit(guard.fail_body.then_term);
@@ -23572,8 +23566,7 @@ static FrontendResult<HirModule*> analyze_file_internal(
             for (u32 fi = 0; fi < route.for_loops.len; fi++) {
                 auto& body = route.for_loops[fi].body;
                 if (body.term.span.end != 0) mark_commit(body.term);
-                for (u32 gi = 0; gi < body.guards.len; gi++)
-                    mark_guard_commit(body.guards[gi]);
+                for (u32 gi = 0; gi < body.guards.len; gi++) mark_guard_commit(body.guards[gi]);
                 for (u32 ii = 0; ii < body.ifs.len; ii++) {
                     if (body.ifs[ii].then_branch.kind == HirForLoopBranch::Kind::Term)
                         mark_commit(body.ifs[ii].then_branch.term);

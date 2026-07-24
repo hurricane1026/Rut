@@ -7594,8 +7594,16 @@ route GET "/x" {
     if status == 201 { return 200 } else { return 500 }
 }
 )rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
     FrontendRirModule rir{};
-    REQUIRE(lower_src_to_rir(src, rir));
+    REQUIRE(lower_to_rir(mir.value(), rir));
     bool saw_status_read = false;
     for (u32 bi = 0; bi < rir.module.functions[0].block_count; bi++)
         for (u32 ii = 0; ii < rir.module.functions[0].blocks[bi].inst_count; ii++)
@@ -33265,6 +33273,117 @@ route GET "/x" {
     for (u32 bi = 0; bi < rir.module.functions[0].block_count; bi++)
         samples += block_op_count(rir.module.functions[0].blocks[bi], rir::Opcode::TimeNowMicros);
     CHECK_EQ(samples, 1u);
+    rir.destroy();
+}
+
+TEST(frontend, flattened_source_guard_fallthrough_runs_each_inner_test) {
+    const char* src = R"rut(
+route GET "/x" {
+    for item in [1] {
+        match item {
+            1 if req.http11 => {
+                match 3 { 1 => return 201 2 => return 202 _ => return 203 }
+            }
+            _ => return 500
+        }
+    }
+    return 501
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    u32 combined_guards[2]{};
+    u32 combined_count = 0;
+    for (u32 bi = 0; bi < mir->functions[0].blocks.len; bi++) {
+        if (mir->functions[0].blocks[bi].term.cond.kind != MirValueKind::IfElse) continue;
+        REQUIRE(combined_count < 2u);
+        combined_guards[combined_count++] = bi;
+    }
+    REQUIRE_EQ(combined_count, 2u);
+    CHECK_EQ(mir->functions[0].blocks[combined_guards[0]].term.else_block, combined_guards[1]);
+}
+
+TEST(frontend, match_control_enters_prelude_before_flattened_inner_guard) {
+    const char* src = R"rut(
+route GET "/x" {
+    for item in [1] {
+        match item {
+            1 => {
+                guard req.http11 else { return 400 }
+                match 3 { 1 => break _ => continue }
+            }
+            _ => return 500
+        }
+    }
+    return 204
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    const auto& entry = mir->functions[0].blocks[0].term;
+    REQUIRE(entry.use_cmp);
+    REQUIRE(entry.then_block < mir->functions[0].blocks.len);
+    CHECK_EQ(static_cast<u8>(mir->functions[0].blocks[entry.then_block].term.cond.kind),
+             static_cast<u8>(MirValueKind::ReqHttp11));
+}
+
+TEST(frontend, post_prelude_flattened_guard_materializes_depth_local) {
+    const char* src = R"rut(
+route GET "/x" {
+    for item in [1] {
+        match item {
+            1 => {
+                guard req.http11 else { return 400 }
+                let captured = time.nowMicros()
+                match captured > 0 { true => break _ => continue }
+            }
+            _ => return 500
+        }
+    }
+    return 204
+}
+)rut";
+    FrontendRirModule rir{};
+    REQUIRE(lower_src_to_rir(src, rir));
+    CHECK(rir::verify_module(rir.module).ok);
+    rir.destroy();
+}
+
+TEST(frontend, static_loop_guard_failure_if_let_uses_loop_context) {
+    const char* src = R"rut(
+route GET "/x" {
+    for item in [req.path] {
+        guard false else {
+            if let value = item { return 200, json(value) } else { return 400 }
+        }
+    }
+    return 204
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    REQUIRE(hir->routes[0].for_loops[0].body.guards[0].fail_body.has_then_local);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    REQUIRE(lower_to_rir(mir.value(), rir));
+    CHECK(rir::verify_module(rir.module).ok);
     rir.destroy();
 }
 
