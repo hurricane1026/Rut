@@ -7,6 +7,7 @@
 #include "rut/runtime/callbacks_h2.h"
 #include "rut/runtime/http2_conn.h"
 #include "rut/runtime/http2_frame.h"
+#include "rut/runtime/response_body_storage.h"
 #include "test.h"
 
 using namespace rut;
@@ -1650,6 +1651,34 @@ TEST(h2_serving, deferred_route_params_copied_to_stable_storage) {
     CHECK(sp.name == params[0].name);                 // name still points into stable config
 }
 
+TEST(h2_serving, terminal_outcome_releases_response_body_snapshots) {
+    Http2Conn h2;
+    h2.init();
+    Connection conn;
+    conn.reset();
+    conn.h2 = &h2;
+
+    FakeH2Loop loop;
+    u8 resp[1024];
+    H2Dispatch<FakeH2Loop> dispatch{&loop, &conn, resp, sizeof(resp), 0, false};
+    jit::HandlerCtx ctx{};
+    const char body[] = "snapshot";
+    const char* snapshot = jit::snapshot_response_body(&ctx, body, sizeof(body) - 1);
+    REQUIRE(snapshot != nullptr);
+    REQUIRE(ctx.response_body_snapshot_storage != nullptr);
+
+    JitDispatchOutcome outcome{};
+    outcome.kind = JitDispatchOutcome::Kind::ReturnStatus;
+    outcome.status_code = 200;
+    outcome.dynamic_response_body = snapshot;
+    outcome.dynamic_response_body_len = sizeof(body) - 1;
+    outcome.response_ctx = &ctx;
+    h2_emit_outcome(dispatch, 1, outcome, nullptr, false);
+
+    CHECK(ctx.response_body_snapshot_storage == nullptr);
+    CHECK(ctx.response_body_mutation_storage == nullptr);
+}
+
 TEST(h2_serving, suspended_handler_context_is_snapshotted_and_rebased) {
     Http2Conn h2;
     h2.init();
@@ -1680,10 +1709,14 @@ TEST(h2_serving, suspended_handler_context_is_snapshotted_and_rebased) {
     live->response_body_pending_set = true;
     char* live_body_storage = live->response_body_mutation_storage;
     REQUIRE(live_body_storage != nullptr);
+    const char* live_body_snapshot =
+        jit::snapshot_response_body(live, live_body_storage, sizeof(kBody) - 1);
+    REQUIRE(live_body_snapshot != nullptr);
 
     REQUIRE_EQ(h2_stash_synth(h2, synth, kSynthLen), kSynthLen);
     REQUIRE(h2_snapshot_async_jit_ctx(h2, *live, synth, kSynthLen));
     CHECK(live->response_body_mutation_storage == nullptr);
+    CHECK(live->response_body_snapshot_storage == nullptr);
     conn.reset_jit_ctx();
     for (u32 i = 0; i < kSynthLen; i++) synth[i] = 'x';
 
@@ -1696,6 +1729,8 @@ TEST(h2_serving, suspended_handler_context_is_snapshotted_and_rebased) {
     CHECK_EQ(parked->route_params[0].value_len, 4u);
     CHECK(parked->route_params[0].value == reinterpret_cast<const char*>(h2.pending_synth + 10));
     CHECK(parked->response_body_mutation_storage == live_body_storage);
+    REQUIRE(parked->response_body_snapshot_storage != nullptr);
+    CHECK(__builtin_memcmp(live_body_snapshot, kBody, sizeof(kBody) - 1) == 0);
     const Str parked_body{parked->response_body_mutation_storage,
                           parked->response_body_pending_len};
     CHECK(parked_body.eq(Str{kBody, sizeof(kBody) - 1}));
@@ -1704,6 +1739,7 @@ TEST(h2_serving, suspended_handler_context_is_snapshotted_and_rebased) {
     h2.async_kind = H2AsyncKind::Timer;
     h2_clear_async(h2);
     CHECK(parked->response_body_mutation_storage == nullptr);
+    CHECK(parked->response_body_snapshot_storage == nullptr);
 }
 
 TEST(h2_serving, arming_suspended_handler_releases_scratch_body_storage) {
@@ -1717,6 +1753,7 @@ TEST(h2_serving, arming_suspended_handler_releases_scratch_body_storage) {
     scratch->response_body_mutation_storage = jit::acquire_response_body_mutation_storage();
     REQUIRE(scratch->response_body_mutation_storage != nullptr);
     auto* parked = h2.async_jit_ctx();
+    REQUIRE(parked->response_body_snapshot_storage == nullptr);
     parked->response_body_mutation_storage = jit::acquire_response_body_mutation_storage();
     REQUIRE(parked->response_body_mutation_storage != nullptr);
     char* parked_storage = parked->response_body_mutation_storage;

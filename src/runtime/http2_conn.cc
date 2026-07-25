@@ -57,6 +57,7 @@ void Http2Conn::init() {
     async_timer_ms = 0;
     async_fn = nullptr;
     async_state = 0;
+    __builtin_memset(async_handler_ctx_storage, 0, sizeof(async_handler_ctx_storage));
     async_route = nullptr;
     async_resp_len = 0;
 }

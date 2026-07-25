@@ -4,6 +4,7 @@
 #include "rut/harness/deterministic_environment.h"
 #include "rut/jit/handler_abi.h"
 #include "rut/runtime/connection_base.h"
+#include <string>
 
 namespace rut::harness {
 
@@ -65,8 +66,17 @@ struct HandlerExecutionResult {
     u32 dynamic_response_body_len = 0;
     bool dynamic_response_body_valid = false;
     jit::ResponseHeaderMutation response_header_mutations[jit::kMaxResponseHeaderMutations]{};
+    // Header values are copied out of the temporary HandlerExecution so values
+    // backed by resp.body snapshots remain valid through result consumption.
+    std::string response_header_values[jit::kMaxResponseHeaderMutations];
     u8 response_header_count = 0;
     bool response_header_overflow = false;
+
+    HandlerExecutionResult() = default;
+    HandlerExecutionResult(const HandlerExecutionResult& other);
+    HandlerExecutionResult& operator=(const HandlerExecutionResult& other);
+    HandlerExecutionResult(HandlerExecutionResult&& other);
+    HandlerExecutionResult& operator=(HandlerExecutionResult&& other);
 };
 
 HandlerExecutionResult drive_handler_deterministically(const DeterministicHandlerSpec& driver,

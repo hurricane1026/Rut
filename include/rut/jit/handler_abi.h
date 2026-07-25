@@ -129,6 +129,7 @@ struct ResponseHeaderMutation {
     Str value;
     ResponseHeaderMutationMode mode;
 };
+struct ResponseBodySnapshotStorage;
 
 // ── Handler Context ────────────────────────────────────────────────
 // Per-request mutable context, allocated from the scratch Arena.
@@ -159,7 +160,9 @@ struct alignas(alignof(u64)) HandlerCtx {
     bool response_header_overflow;
     // Bounded mutable response scalars. Setters update pending state; the
     // terminal commit publishes it atomically with the header mutation prefix.
-    u16 response_status_pending;
+    // Keep the raw assigned value so resp.status observes source semantics
+    // even when the terminal commit will reject it as an invalid HTTP status.
+    i32 response_status_pending;
     bool response_status_pending_set;
     bool response_status_pending_invalid;
     u16 response_status;
@@ -168,6 +171,9 @@ struct alignas(alignof(u64)) HandlerCtx {
     u32 response_body_pending_len;
     bool response_body_pending_set;
     bool response_body_pending_overflow;
+    // Snapshot allocation failure remains sticky for this builder. It becomes
+    // terminal only if the pending builder is committed.
+    bool response_body_snapshot_failed;
     u32 response_body_mutation_len;
     bool response_body_mutation_set;
     bool response_body_mutation_overflow;
@@ -177,6 +183,10 @@ struct alignas(alignof(u64)) HandlerCtx {
     // mutable/temporary source bytes survive yields without adding 4 KiB to
     // every preallocated connection context.
     char* response_body_mutation_storage;
+    // Immutable copies returned by resp.body. Kept outside HandlerCtx so saved
+    // Str values survive later body assignments and yields without embedding
+    // another body-sized arena in every preallocated connection.
+    ResponseBodySnapshotStorage* response_body_snapshot_storage;
 
     // Access slot storage (8-byte aligned, immediately after header).
     u8* slots() { return reinterpret_cast<u8*>(this + 1); }
