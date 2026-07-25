@@ -168,6 +168,33 @@ inline u32 select_backend(u16 upstream_id, u32 backend_count, u64 now_us) {
     return idx;
 }
 
+template <typename Loop>
+inline u32 select_backend_with_control_plane(Loop* loop,
+                                             u16 upstream_id,
+                                             u32 backend_count,
+                                             u64 now_us) {
+    static thread_local u16 rr_cursor[RouteConfig::kMaxUpstreams] = {};
+    if (backend_count <= 1 || upstream_id >= RouteConfig::kMaxUpstreams) return 0;
+    ControlPlaneMutationPort* mutation = nullptr;
+    if constexpr (requires { loop->control_plane_mutation; })
+        if (loop != nullptr) mutation = loop->control_plane_mutation;
+    const u64 generation = mutation == nullptr ? 0 : mutation->active_generation();
+    for (u32 step = 0; step < backend_count; step++) {
+        const u32 idx = (rr_cursor[upstream_id] + step) % backend_count;
+        const auto manual = mutation == nullptr
+                                ? ManualHealthOverride::None
+                                : mutation->manual_health({generation, upstream_id, (u16)idx});
+        if (manual == ManualHealthOverride::Unhealthy) continue;
+        if (manual == ManualHealthOverride::Healthy || !backend_ejected(upstream_id, idx, now_us)) {
+            rr_cursor[upstream_id] = static_cast<u16>((idx + 1) % backend_count);
+            return idx;
+        }
+    }
+    const u32 idx = rr_cursor[upstream_id] % backend_count;
+    rr_cursor[upstream_id] = static_cast<u16>((rr_cursor[upstream_id] + 1) % backend_count);
+    return idx;
+}
+
 // --- Active health-check probes (Phase 5 slice 2) — EPOLL ONLY ---
 //
 // A probe is a Connection with fd == -1 (no downstream client) whose upstream_fd
@@ -1221,8 +1248,8 @@ void on_header_received(void* lp, Connection& conn, IoEvent ev) {
         // (terminate-mode config is set unconditionally above, for every request)
         conn.upstream_attempts = 1;  // initial attempt; on_upstream_connected retries
         conn.upstream_start_us = monotonic_us();
-        const u32 kBackend =
-            select_backend(route->upstream_id, target.addr_count, conn.upstream_start_us);
+        const u32 kBackend = select_backend_with_control_plane(
+            loop, route->upstream_id, target.addr_count, conn.upstream_start_us);
         conn.upstream_backend_idx = static_cast<u8>(kBackend);
 
         // Idle reuse: borrow a live keep-alive socket to this endpoint from the
@@ -1894,8 +1921,8 @@ void handle_jit_outcome(Loop* loop,
                 conn.upstream_fd = kUpstreamFd;
                 conn.upstream_idx = static_cast<u16>(upstream_id);
                 conn.upstream_start_us = monotonic_us();
-                const u32 kBackend = select_backend(
-                    static_cast<u16>(upstream_id), target.addr_count, conn.upstream_start_us);
+                const u32 kBackend = select_backend_with_control_plane(
+                    loop, static_cast<u16>(upstream_id), target.addr_count, conn.upstream_start_us);
                 conn.upstream_backend_idx = static_cast<u8>(kBackend);
                 if (!loop->submit_connect(
                         conn, &target.addrs[kBackend], sizeof(target.addrs[kBackend]))) {
@@ -2131,8 +2158,11 @@ void handle_jit_outcome(Loop* loop,
             conn.upstream_idx = static_cast<u16>(outcome.upstream_id);
             conn.upstream_attempts = 1;  // initial attempt; on_upstream_connected retries
             conn.upstream_start_us = monotonic_us();
-            const u32 kBackend = select_backend(
-                static_cast<u16>(outcome.upstream_id), target.addr_count, conn.upstream_start_us);
+            const u32 kBackend =
+                select_backend_with_control_plane(loop,
+                                                  static_cast<u16>(outcome.upstream_id),
+                                                  target.addr_count,
+                                                  conn.upstream_start_us);
             conn.upstream_backend_idx = static_cast<u8>(kBackend);
 
             // Idle reuse (mirrors the direct RouteAction::Proxy path): borrow a live
@@ -2276,8 +2306,8 @@ bool try_connect_next_backend(Loop* loop, Connection& conn) {
     conn.upstream_attempts++;
     conn.upstream_start_us = monotonic_us();
     conn.set_slots(nullptr, nullptr, nullptr, &on_upstream_connected<Loop>);
-    const u32 kBackend =
-        select_backend(conn.upstream_idx, target.addr_count, conn.upstream_start_us);
+    const u32 kBackend = select_backend_with_control_plane(
+        loop, conn.upstream_idx, target.addr_count, conn.upstream_start_us);
     conn.upstream_backend_idx = static_cast<u8>(kBackend);
     if (loop->submit_connect(conn, &target.addrs[kBackend], sizeof(target.addrs[kBackend])))
         return true;
@@ -3539,7 +3569,8 @@ void h2_proxy_begin(Loop* loop, Connection& conn) {
     conn.upstream_attempts = 1;
     conn.upstream_start_us = monotonic_us();
     conn.set_slots(nullptr, nullptr, nullptr, &h2_on_upstream_connected<Loop>);
-    const u32 kBackend = select_backend(upstream_id, target.addr_count, conn.upstream_start_us);
+    const u32 kBackend = select_backend_with_control_plane(
+        loop, upstream_id, target.addr_count, conn.upstream_start_us);
     conn.upstream_backend_idx = static_cast<u8>(kBackend);
     if (!loop->submit_connect(conn, &target.addrs[kBackend], sizeof(target.addrs[kBackend]))) {
         h2_proxy_fail(loop, conn, 502);  // h2_proxy_fail closes the fd we just opened

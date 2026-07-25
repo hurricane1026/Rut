@@ -743,10 +743,10 @@ TEST(control_plane_mutation, authority_contention_revalidates_before_publication
     port.reset(11, true);
 
     u64 signal_id = 99;
-    CHECK_FALSE(
-        ControlPlaneMutationPortTestAccess::publish_after_authority_release(port, &signal_id));
-    CHECK_EQ(signal_id, 0u);
-    CHECK_FALSE(port.last_record().valid);
+    REQUIRE(ControlPlaneMutationPortTestAccess::publish_after_authority_release(port, &signal_id));
+    CHECK_EQ(signal_id, 1u);
+    REQUIRE(port.last_record().valid);
+    CHECK_EQ(port.last_record().outcome, ReloadTerminalOutcome::AdmissionContended);
 
     REQUIRE(port.request_reload(ReloadRequestSource::Signal, &signal_id));
     CHECK_EQ(signal_id, 2u);
@@ -1023,13 +1023,15 @@ TEST(control_plane_mutation, activation_retains_old_health_until_terminal_ack_bo
     CHECK_EQ(port.state(), ReloadAdmissionState::Completing);
     CHECK(!port.request_reload(ReloadRequestSource::Route));
     CHECK_EQ(port.manual_health(old_server), ManualHealthOverride::Unhealthy);
-    CHECK(!port.mark(old_server, true));
+    REQUIRE(port.mark(old_server, true));
+    CHECK_EQ(port.manual_health(old_server), ManualHealthOverride::Healthy);
 
     const ServerIdentity new_server{4, 4, 2};
     CHECK_EQ(port.manual_health(new_server), ManualHealthOverride::None);
     REQUIRE(port.mark(new_server, true));
     CHECK_EQ(port.manual_health(new_server), ManualHealthOverride::Healthy);
-    CHECK(!port.mark(old_server, false));
+    REQUIRE(port.mark(old_server, false));
+    CHECK_EQ(port.manual_health(old_server), ManualHealthOverride::Unhealthy);
     CHECK_EQ(port.manual_health(new_server), ManualHealthOverride::Healthy);
     CHECK(!port.last_record().valid);
     REQUIRE(port.finish_activation(id));
@@ -1481,6 +1483,34 @@ TEST(control_plane_mutation, stop_claims_terminal_slot_before_stopping_transitio
     const auto stopped = port.record_for_request(accepted_id);
     REQUIRE(stopped.valid);
     CHECK_EQ(stopped.outcome, ReloadTerminalOutcome::Stopped);
+    CHECK_EQ(port.last_record().outcome, ReloadTerminalOutcome::Stopped);
+}
+
+TEST(control_plane_mutation, signal_waits_for_transient_record_slot_pressure) {
+    ControlPlaneMutationPort port;
+    port.reset(9, true);
+    u64 accepted_id = 0;
+    REQUIRE(port.request_reload(ReloadRequestSource::Route, &accepted_id));
+    ControlPlaneMutationPortTestAccess::BusyReservation reservations[128]{};
+    for (u32 i = 0; i < 128; i++) {
+        reservations[i] = ControlPlaneMutationPortTestAccess::reserve_busy(port, accepted_id + i);
+        REQUIRE(reservations[i].valid);
+    }
+    std::atomic<bool> returned{false};
+    u64 signal_id = 0;
+    bool admitted = false;
+    std::thread signal([&] {
+        admitted = port.request_reload(ReloadRequestSource::Signal, &signal_id);
+        returned.store(true, std::memory_order_release);
+    });
+    CHECK_FALSE(returned.load(std::memory_order_acquire));
+    for (const auto& reservation : reservations)
+        ControlPlaneMutationPortTestAccess::release_busy(port, reservation);
+    signal.join();
+    CHECK(returned.load(std::memory_order_acquire));
+    CHECK_FALSE(admitted);
+    CHECK_GT(signal_id, accepted_id);
+    CHECK_EQ(port.record_for_request(signal_id).outcome, ReloadTerminalOutcome::Busy);
 }
 
 TEST(control_plane_mutation, busy_history_reserves_final_ticket_for_accepted_terminal) {
@@ -1500,6 +1530,7 @@ TEST(control_plane_mutation, busy_history_reserves_final_ticket_for_accepted_ter
     const auto stopped = port.record_for_request(accepted_id);
     REQUIRE(stopped.valid);
     CHECK_EQ(stopped.outcome, ReloadTerminalOutcome::Stopped);
+    CHECK_EQ(port.last_record().outcome, ReloadTerminalOutcome::Stopped);
 }
 
 TEST(control_plane_mutation, stop_waits_for_the_active_override_writer) {
@@ -1569,14 +1600,18 @@ TEST(control_plane_mutation, stop_terminalizes_an_accepted_request_once) {
     REQUIRE(port.request_reload(ReloadRequestSource::Route, &id));
     port.stop();
     CHECK_EQ(port.state(), ReloadAdmissionState::Stopping);
-    CHECK(!port.request_reload(ReloadRequestSource::Signal));
+    u64 stopped_signal_id = 0;
+    CHECK(!port.request_reload(ReloadRequestSource::Signal, &stopped_signal_id));
+    CHECK_GT(stopped_signal_id, id);
+    CHECK_EQ(port.last_record().request_id, stopped_signal_id);
+    CHECK_EQ(port.last_record().outcome, ReloadTerminalOutcome::Stopped);
     CHECK(!port.mark({5, 0, 0}, true));
     const auto record = port.last_record();
     REQUIRE(record.valid);
-    CHECK_EQ(record.request_id, id);
+    CHECK_EQ(record.request_id, stopped_signal_id);
     CHECK_EQ(record.outcome, ReloadTerminalOutcome::Stopped);
     port.stop();
-    CHECK_EQ(port.last_record().request_id, id);
+    CHECK_EQ(port.last_record().request_id, stopped_signal_id);
 }
 
 TEST(control_plane_mutation, stop_terminalizes_a_failure_waiting_to_publish) {
@@ -1677,7 +1712,7 @@ TEST(control_plane_mutation, stop_racing_take_publishes_terminal_before_return) 
     }
 }
 
-TEST(control_plane_mutation, stop_racing_idle_signal_has_no_false_busy_outcome) {
+TEST(control_plane_mutation, stop_racing_idle_signal_has_explicit_terminal_outcome) {
     for (u32 iteration = 0; iteration < 256; iteration++) {
         ControlPlaneMutationPort port;
         port.reset(5, true);
@@ -1705,11 +1740,11 @@ TEST(control_plane_mutation, stop_racing_idle_signal_has_no_false_busy_outcome) 
             REQUIRE(stopped.valid);
             CHECK_EQ(stopped.outcome, ReloadTerminalOutcome::Stopped);
         } else {
-            // Shutdown may be visible either at the entry check (which
-            // preserves the caller's output sentinel) or after the signal has
-            // speculatively reserved an identity (which rolls back to zero).
-            CHECK(signal_id == 99u || signal_id == 0u);
-            CHECK_FALSE(port.last_record().valid);
+            CHECK_NE(signal_id, 0u);
+            const auto terminal = port.record_for_request(signal_id);
+            REQUIRE(terminal.valid);
+            CHECK(terminal.outcome == ReloadTerminalOutcome::Stopped ||
+                  terminal.outcome == ReloadTerminalOutcome::AdmissionContended);
         }
     }
 }

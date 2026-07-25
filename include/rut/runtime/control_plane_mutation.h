@@ -105,6 +105,7 @@ public:
         activation_terminal_slot_ = {};
         event_counters_.store(0, std::memory_order_relaxed);
         counter_exhaustion_generation_.store(0, std::memory_order_relaxed);
+        counter_exhaustion_frontier_.store(0, std::memory_order_relaxed);
         counter_exhaustion_state_.store(0, std::memory_order_relaxed);
         reload_word_.store(
             pack_reload(
@@ -195,7 +196,10 @@ public:
 
     [[nodiscard]] bool request_reload(ReloadRequestSource source, u64* request_id = nullptr) {
         for (u32 round = 0; round < kMaxAdmissionAttempts; round++) {
-            if (stopping_.load(std::memory_order_acquire) != 0) return false;
+            if (stopping_.load(std::memory_order_acquire) != 0) {
+                if (source == ReloadRequestSource::Signal) (void)publish_stopped_signal(request_id);
+                return false;
+            }
             u64 observed = reload_word_.load(std::memory_order_acquire);
             if (source == ReloadRequestSource::Signal &&
                 unpack_state(observed) == ReloadAdmissionState::Idle &&
@@ -709,10 +713,15 @@ public:
         if (server.config_generation == 0 || server.upstream_id >= RouteConfig::kMaxUpstreams ||
             server.backend_id >= UpstreamTarget::kMaxBackends)
             return false;
-        const u64 generation = active_generation();
-        if (generation == 0 || server.config_generation != generation) return false;
-        const u32 bank = active_bank_.load(std::memory_order_acquire);
-        if (!is_member(bank, server)) return false;
+        const u64 generation = server.config_generation;
+        u32 bank = 2;
+        for (u32 candidate = 0; candidate < 2; candidate++)
+            if (bank_generation_[candidate].load(std::memory_order_acquire) == generation &&
+                is_member(candidate, server)) {
+                bank = candidate;
+                break;
+            }
+        if (bank == 2) return false;
         const auto value =
             healthy ? ManualHealthOverride::Healthy : ManualHealthOverride::Unhealthy;
         const u64 desired = pack_override(generation, value);
@@ -737,15 +746,15 @@ public:
         const u64 prior = slot.load(std::memory_order_relaxed);
         if (stopping_.load(std::memory_order_acquire) != 0 ||
             cutover_.load(std::memory_order_acquire) != 0 ||
-            unpack_override_generation(prior) > generation || active_generation() != generation ||
-            active_bank_.load(std::memory_order_acquire) != bank) {
+            unpack_override_generation(prior) > generation ||
+            bank_generation_[bank].load(std::memory_order_acquire) != generation) {
             sequence.store(stable_seq, std::memory_order_release);
             return false;
         }
         slot.store(desired, std::memory_order_relaxed);
         if (stopping_.load(std::memory_order_acquire) == 0 &&
-            cutover_.load(std::memory_order_acquire) == 0 && active_generation() == generation &&
-            active_bank_.load(std::memory_order_acquire) == bank) {
+            cutover_.load(std::memory_order_acquire) == 0 &&
+            bank_generation_[bank].load(std::memory_order_acquire) == generation) {
             const u64 prior_version = override_version_[bank].load(std::memory_order_relaxed);
             if (prior_version >= kMaxOverrideVersion) {
                 slot.store(prior, std::memory_order_relaxed);
@@ -828,7 +837,9 @@ public:
     }
 
     [[nodiscard]] ReloadTerminalRecord last_record() const {
-        if (counter_exhaustion_state_.load(std::memory_order_acquire) == 2)
+        if (counter_exhaustion_state_.load(std::memory_order_acquire) == 2 &&
+            published_record_.load(std::memory_order_acquire) ==
+                counter_exhaustion_frontier_.load(std::memory_order_acquire))
             return {true,
                     kCounterExhaustedRequestId,
                     counter_exhaustion_generation_.load(std::memory_order_acquire),
@@ -1280,7 +1291,15 @@ private:
             const u64 ticket = unpack_counter_ticket(current);
             if (request_id >= kMaxRequestId || ticket >= kMaxRecordTicket - 1) return 0;
             const ClaimedRecordSlot claimed = claim_record_slot(ticket + 1);
-            if (!claimed.valid) return 0;
+            if (!claimed.valid) {
+                // Slot pressure is transient, not counter exhaustion. Do not
+                // consume the bounded CAS-contention budget or drop an
+                // observed signal while an earlier publisher advances the
+                // record frontier.
+                attempt--;
+                current = event_counters_.load(std::memory_order_acquire);
+                continue;
+            }
             const u64 desired = pack_event_counters(ticket + 1, request_id + 1);
             if (event_counters_.compare_exchange_weak(
                     current, desired, std::memory_order_acq_rel, std::memory_order_acquire)) {
@@ -1347,6 +1366,26 @@ private:
             generation, request_id, slot, returned_request_id);
     }
 
+    [[nodiscard]] bool publish_stopped_signal(u64* returned_request_id) {
+        u64 request_id = 0;
+        ClaimedRecordSlot slot{};
+        if (!allocate_busy_identity(0, &request_id, &slot)) {
+            if (!terminalize_counter_exhaustion(returned_request_id) &&
+                returned_request_id != nullptr)
+                *returned_request_id = 0;
+            return false;
+        }
+        const bool published = publish_claimed_record({true,
+                                                       request_id,
+                                                       active_generation(),
+                                                       0,
+                                                       ReloadRequestSource::Signal,
+                                                       ReloadTerminalOutcome::Stopped},
+                                                      slot);
+        if (published && returned_request_id != nullptr) *returned_request_id = request_id;
+        return published;
+    }
+
     [[nodiscard]] bool publish_authority_contended_signal_record(u64 generation,
                                                                  u64 request_id,
                                                                  const ClaimedRecordSlot& slot,
@@ -1360,9 +1399,13 @@ private:
             stopping_.load(std::memory_order_acquire) != 0 ||
             unpack_state(reload_word_.load(std::memory_order_acquire)) !=
                 ReloadAdmissionState::Idle) {
-            cancel_claimed_record(slot);
-            if (returned_request_id != nullptr) *returned_request_id = 0;
-            return false;
+            const auto outcome = stopping_.load(std::memory_order_acquire) != 0
+                                     ? ReloadTerminalOutcome::Stopped
+                                     : ReloadTerminalOutcome::AdmissionContended;
+            const bool published = publish_claimed_record(
+                {true, request_id, generation, 0, ReloadRequestSource::Signal, outcome}, slot);
+            if (published && returned_request_id != nullptr) *returned_request_id = request_id;
+            return published;
         }
         const bool published = publish_claimed_record({true,
                                                        request_id,
@@ -1407,27 +1450,28 @@ private:
                 return false;
             }
 
-            // An authority/stop claim means no request occupies the Idle slot.
-            // Roll back the speculative identity when possible; otherwise a
-            // hidden tombstone preserves ordered record progress without
-            // exposing a false Busy result.
-            u64 expected = pack_event_counters(identity_slot.ticket, request_id);
-            const u64 desired = pack_event_counters(identity_slot.ticket - 1, request_id - 1);
-            if (event_counters_.compare_exchange_strong(
-                    expected, desired, std::memory_order_acq_rel, std::memory_order_acquire))
-                release_record_slot(identity_slot);
-            else
-                cancel_claimed_record(identity_slot);
-            if (returned_request_id != nullptr) *returned_request_id = 0;
+            const auto outcome = stopping_.load(std::memory_order_acquire) != 0
+                                     ? ReloadTerminalOutcome::Stopped
+                                     : ReloadTerminalOutcome::AdmissionContended;
+            const bool published = publish_claimed_record(
+                {true, request_id, busy_generation, 0, ReloadRequestSource::Signal, outcome},
+                identity_slot);
+            if (published && returned_request_id != nullptr) *returned_request_id = request_id;
             return false;
         }
 
         u64 observed = reload_word_.load(std::memory_order_acquire);
         if (stopping_.load(std::memory_order_acquire) != 0 ||
             unpack_state(observed) == ReloadAdmissionState::Stopping) {
-            cancel_claimed_record(identity_slot);
+            const bool published = publish_claimed_record({true,
+                                                           request_id,
+                                                           busy_generation,
+                                                           0,
+                                                           ReloadRequestSource::Signal,
+                                                           ReloadTerminalOutcome::Stopped},
+                                                          identity_slot);
             release_request_identity_claim();
-            if (returned_request_id != nullptr) *returned_request_id = 0;
+            if (published && returned_request_id != nullptr) *returned_request_id = request_id;
             return false;
         }
         if (unpack_state(observed) != ReloadAdmissionState::Idle) {
@@ -1483,7 +1527,11 @@ private:
             // request's required terminal record.
             if (base >= kMaxRequestId || current_ticket >= kMaxRecordTicket - 1) return false;
             const ClaimedRecordSlot claimed = claim_record_slot(current_ticket + 1);
-            if (!claimed.valid) return false;
+            if (!claimed.valid) {
+                attempt--;
+                current = event_counters_.load(std::memory_order_acquire);
+                continue;
+            }
             const u64 desired = pack_event_counters(current_ticket + 1, base + 1);
             if (event_counters_.compare_exchange_weak(
                     current, desired, std::memory_order_acq_rel, std::memory_order_acquire)) {
@@ -1508,6 +1556,8 @@ private:
         if (counter_exhaustion_state_.compare_exchange_strong(
                 open, 1, std::memory_order_acq_rel, std::memory_order_acquire)) {
             counter_exhaustion_generation_.store(active_generation(), std::memory_order_relaxed);
+            counter_exhaustion_frontier_.store(published_record_.load(std::memory_order_acquire),
+                                               std::memory_order_relaxed);
             counter_exhaustion_state_.store(2, std::memory_order_release);
         }
         if (request_id != nullptr) *request_id = kCounterExhaustedRequestId;
@@ -1943,6 +1993,7 @@ private:
     std::atomic<u64> reload_word_{0};
     std::atomic<u64> event_counters_{0};
     std::atomic<u64> counter_exhaustion_generation_{0};
+    std::atomic<u64> counter_exhaustion_frontier_{0};
     std::atomic<u8> counter_exhaustion_state_{0};
     std::atomic<u32> admission_identity_claim_{0};
     std::atomic<u8> terminal_publication_claim_{0};

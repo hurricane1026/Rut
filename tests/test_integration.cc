@@ -14617,6 +14617,23 @@ TEST(route, round_robin_backend_selection) {
     CHECK_EQ(select_backend(RouteConfig::kMaxUpstreams, 3, kNow), 0u);
 }
 
+TEST(route, manual_health_override_excludes_backend_selection) {
+    using namespace rut;
+    RouteConfig config;
+    auto upstream = config.add_upstream("manual", 0x7f000001u, 8080);
+    REQUIRE(upstream);
+    REQUIRE(config.add_upstream_backend(upstream.value(), 0x7f000001u, 8081));
+    ControlPlaneMutationPort mutation;
+    mutation.reset(9, true, &config);
+    REQUIRE(mutation.mark({9, static_cast<u16>(upstream.value()), 0}, false));
+    struct SelectionLoop {
+        ControlPlaneMutationPort* control_plane_mutation;
+    } loop{&mutation};
+    CHECK_EQ(
+        select_backend_with_control_plane(&loop, static_cast<u16>(upstream.value()), 2, 1'000'000),
+        1u);
+}
+
 // Passive circuit breaking: kBackendFailThreshold consecutive connect failures
 // eject a backend for the cooldown; selection skips it until the cooldown
 // lapses; a success clears the record.
