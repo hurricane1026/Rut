@@ -400,8 +400,9 @@ static bool markdown_strip_container(std::string_view line,
                 // A tab may satisfy the remaining container indentation and
                 // leave residual columns as content indentation.
                 if (normalized != nullptr) {
+                    const std::string suffix(line.substr(pos + 1));
                     normalized->assign(next - target_column, ' ');
-                    normalized->append(line.substr(pos + 1));
+                    normalized->append(suffix);
                     line = *normalized;
                     pos = 0;
                 }
@@ -1069,6 +1070,30 @@ TEST(frontend, language_card_nested_list_close_retains_matching_outer_prefix) {
     CHECK_EQ(content, "~~~~rut");
 }
 
+TEST(frontend, language_card_inner_fence_container_close_retains_outer_list) {
+    MarkdownFence fence{};
+    REQUIRE(parse_markdown_fence_open("- > ~~~~markdown", &fence));
+    REQUIRE_EQ(fence.container_segments.size(), 2u);
+    std::string_view content;
+    CHECK_FALSE(markdown_strip_container("  ~~~~markdown", fence.container_segments, &content));
+    std::vector<MarkdownContainerSegment> outer(fence.container_segments.begin(),
+                                                fence.container_segments.begin() + 1);
+    REQUIRE(markdown_strip_container("  ~~~~markdown", outer, &content));
+    CHECK_EQ(content, "~~~~markdown");
+    CHECK_EQ(outer[0].kind, MarkdownContainerSegment::Kind::List);
+}
+
+TEST(frontend, language_card_nested_tab_normalization_preserves_suffix) {
+    MarkdownFence fence{};
+    REQUIRE(parse_markdown_fence_open("> -  ```rut", &fence));
+    REQUIRE_EQ(fence.container_segments.size(), 2u);
+    std::string_view content;
+    std::string normalized;
+    REQUIRE(
+        markdown_strip_container(">\t\tinvalid", fence.container_segments, &content, &normalized));
+    CHECK_EQ(content, "   invalid");
+}
+
 TEST(frontend, language_card_container_fence_ends_with_its_container) {
     MarkdownFence fence{};
     REQUIRE(parse_markdown_fence_open("> ```rut", &fence));
@@ -1200,8 +1225,22 @@ TEST(frontend, language_card_unmarked_rut_examples_parse_and_typecheck) {
                 std::string normalized_content;
                 if (!markdown_strip_container(
                         line, current_fence.container_segments, &content, &normalized_content)) {
-                    // A fence nested in a block quote or list ends when that
-                    // containing block ends. Reprocess this line at top level.
+                    // The fence ends when an inner container closes, but a
+                    // matching outer list prefix still contains this line.
+                    for (size_t prefix_len = current_fence.container_segments.size();
+                         prefix_len > 1;
+                         prefix_len--) {
+                        std::vector<MarkdownContainerSegment> prefix(
+                            current_fence.container_segments.begin(),
+                            current_fence.container_segments.begin() + prefix_len - 1);
+                        std::string_view prefix_content;
+                        std::string normalized_prefix;
+                        if (!markdown_strip_container(
+                                line, prefix, &prefix_content, &normalized_prefix))
+                            continue;
+                        markdown_remember_list_container(prefix, &continued_list_container);
+                        break;
+                    }
                     finish_fence();
                     process_again = true;
                     continue;
