@@ -1900,7 +1900,8 @@ void handle_jit_outcome(Loop* loop,
             if (conn.proxy_response_buffered && !snapshot_buffered_response_mutation_views(conn)) {
                 conn.resp_status = 500;
                 conn.keep_alive = false;
-                format_static_response(conn, 500, false);
+                format_static_response(
+                    conn, 500, false, conn.req_method == static_cast<u8>(LogHttpMethod::Head));
                 conn.transition_to_sending(&on_response_sent<Loop>);
                 client_send(loop, conn, conn.send_buf.data(), conn.send_buf.len());
                 return;
@@ -1922,7 +1923,10 @@ void handle_jit_outcome(Loop* loop,
                 // the config doesn't know. Fail closed with 502 rather
                 // than hanging or silently discarding the request.
                 conn.resp_status = kStatusBadGateway;
-                format_static_response(conn, 502, /*keep_alive=*/false);
+                format_static_response(conn,
+                                       502,
+                                       /*keep_alive=*/false,
+                                       conn.req_method == static_cast<u8>(LogHttpMethod::Head));
                 conn.keep_alive = false;
                 conn.transition_to_sending(&on_response_sent<Loop>);
                 client_send(loop, conn, conn.send_buf.data(), conn.send_buf.len());
@@ -1942,7 +1946,10 @@ void handle_jit_outcome(Loop* loop,
                 }
                 if (!acquired) {
                     conn.resp_status = 503;
-                    format_static_response(conn, 503, /*keep_alive=*/false);
+                    format_static_response(conn,
+                                           503,
+                                           /*keep_alive=*/false,
+                                           conn.req_method == static_cast<u8>(LogHttpMethod::Head));
                     conn.keep_alive = false;
                     conn.transition_to_sending(&on_response_sent<Loop>);
                     client_send(loop, conn, conn.send_buf.data(), conn.send_buf.len());
@@ -2000,7 +2007,10 @@ void handle_jit_outcome(Loop* loop,
             const i32 kUpstreamFd = UpstreamPool::create_socket();
             if (kUpstreamFd < 0) {
                 conn.resp_status = kStatusBadGateway;
-                format_static_response(conn, 502, /*keep_alive=*/false);
+                format_static_response(conn,
+                                       502,
+                                       /*keep_alive=*/false,
+                                       conn.req_method == static_cast<u8>(LogHttpMethod::Head));
                 conn.keep_alive = false;
                 conn.transition_to_sending(&on_response_sent<Loop>);
                 client_send(loop, conn, conn.send_buf.data(), conn.send_buf.len());
@@ -2015,7 +2025,10 @@ void handle_jit_outcome(Loop* loop,
                 conn.upstream_idx = 0;
                 loop->clear_upstream_fd(conn.id);
                 conn.resp_status = kStatusBadGateway;
-                format_static_response(conn, 502, /*keep_alive=*/false);
+                format_static_response(conn,
+                                       502,
+                                       /*keep_alive=*/false,
+                                       conn.req_method == static_cast<u8>(LogHttpMethod::Head));
                 conn.keep_alive = false;
                 conn.transition_to_sending(&on_response_sent<Loop>);
                 client_send(loop, conn, conn.send_buf.data(), conn.send_buf.len());
@@ -2134,14 +2147,8 @@ void respond_upstream_timeout(Loop* loop, Connection& conn) {
         conn.upstream_send_armed = false;
     }
     conn.upstream_abandoned = true;
-    static const char k504[] =
-        "HTTP/1.1 504 Gateway Timeout\r\n"
-        "Content-Length: 15\r\n"
-        "Connection: close\r\n"
-        "\r\n"
-        "Gateway Timeout";
-    conn.send_buf.reset();
-    conn.send_buf.write(reinterpret_cast<const u8*>(k504), sizeof(k504) - 1);
+    format_static_response(
+        conn, 504, false, conn.req_method == static_cast<u8>(LogHttpMethod::Head));
     conn.keep_alive = false;
     conn.resp_status = 504;
     conn.transition_to_sending(&on_response_sent<Loop>);
@@ -2415,14 +2422,8 @@ void on_upstream_connected(void* lp, Connection& conn, IoEvent ev) {
         record_backend_result(
             conn.upstream_idx, conn.upstream_backend_idx, /*success=*/false, monotonic_us());
         if (try_connect_next_backend(loop, conn)) return;
-        static const char k502[] =
-            "HTTP/1.1 502 Bad Gateway\r\n"
-            "Content-Length: 11\r\n"
-            "Connection: close\r\n"
-            "\r\n"
-            "Bad Gateway";
-        conn.send_buf.reset();
-        conn.send_buf.write(reinterpret_cast<const u8*>(k502), sizeof(k502) - 1);
+        format_static_response(
+            conn, 502, false, conn.req_method == static_cast<u8>(LogHttpMethod::Head));
         conn.keep_alive = false;
         conn.resp_status = kStatusBadGateway;
         conn.transition_to_sending(&on_response_sent<Loop>);
@@ -2469,14 +2470,8 @@ void on_upstream_connected(void* lp, Connection& conn, IoEvent ev) {
                 loop->clear_upstream_fd(conn.id);
             }
             release_upstream_slot(loop, conn);
-            static const char k500[] =
-                "HTTP/1.1 500 Internal Server Error\r\n"
-                "Content-Length: 21\r\n"
-                "Connection: close\r\n"
-                "\r\n"
-                "Internal Server Error";
-            conn.send_buf.reset();
-            conn.send_buf.write(reinterpret_cast<const u8*>(k500), sizeof(k500) - 1);
+            format_static_response(
+                conn, 500, false, conn.req_method == static_cast<u8>(LogHttpMethod::Head));
             conn.keep_alive = false;
             conn.resp_status = kStatusInternalServerError;
             conn.transition_to_sending(&on_response_sent<Loop>);
@@ -4665,7 +4660,9 @@ void finish_buffered_forward(Loop* loop,
         headers,
         header_count,
         conn.keep_alive,
-        false,
+        // Preserve an upstream body's absent Content-Type. The local text/plain
+        // default belongs only to a body supplied by response middleware.
+        !response_ctx->response_body_mutation_set,
         is_head,
         ((is_head && !status_forbids_body) || status == 304) &&
             !response_ctx->response_body_mutation_set && resp.has_content_length,
@@ -4873,14 +4870,8 @@ void on_upstream_response(void* lp, Connection& conn, IoEvent ev) {
             ::close(conn.upstream_fd);
             conn.upstream_fd = -1;
         }
-        static const char k502[] =
-            "HTTP/1.1 502 Bad Gateway\r\n"
-            "Content-Length: 11\r\n"
-            "Connection: close\r\n"
-            "\r\n"
-            "Bad Gateway";
-        conn.send_buf.reset();
-        conn.send_buf.write(reinterpret_cast<const u8*>(k502), sizeof(k502) - 1);
+        format_static_response(
+            conn, 502, false, conn.req_method == static_cast<u8>(LogHttpMethod::Head));
         conn.keep_alive = false;
         conn.resp_status = kStatusBadGateway;
         conn.transition_to_sending(&on_response_sent<Loop>);
@@ -5047,14 +5038,8 @@ void on_upstream_response(void* lp, Connection& conn, IoEvent ev) {
                     ::close(conn.upstream_fd);
                     conn.upstream_fd = -1;
                 }
-                static const char k502[] =
-                    "HTTP/1.1 502 Bad Gateway\r\n"
-                    "Content-Length: 11\r\n"
-                    "Connection: close\r\n"
-                    "\r\n"
-                    "Bad Gateway";
-                conn.send_buf.reset();
-                conn.send_buf.write(reinterpret_cast<const u8*>(k502), sizeof(k502) - 1);
+                format_static_response(
+                    conn, 502, false, conn.req_method == static_cast<u8>(LogHttpMethod::Head));
                 conn.keep_alive = false;
                 conn.resp_status = kStatusBadGateway;
                 conn.transition_to_sending(&on_response_sent<Loop>);

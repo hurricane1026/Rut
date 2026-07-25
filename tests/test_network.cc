@@ -5475,7 +5475,35 @@ TEST(buffered_forward, body_replacement_removes_content_encoding) {
 
     const char* wire = reinterpret_cast<const char*>(conn->send_buf.data());
     CHECK(!buf_contains(wire, conn->send_buf.len(), "Content-Encoding", 16));
+    CHECK(buf_contains(wire,
+                       conn->send_buf.len(),
+                       "Content-Type: text/plain; charset=utf-8\r\n",
+                       sizeof("Content-Type: text/plain; charset=utf-8\r\n") - 1));
     CHECK(buf_contains(wire, conn->send_buf.len(), "\r\n\r\nplain", 9));
+}
+
+TEST(buffered_forward, preserves_absent_content_type_on_unmodified_upstream_body) {
+    SmallLoop loop;
+    loop.setup();
+    auto* conn = setup_proxy_conn(loop);
+    REQUIRE(conn != nullptr);
+    conn->proxy_response_buffered = true;
+    conn->req_keep_alive = true;
+    conn->keep_alive = true;
+    conn->reset_jit_ctx();
+
+    static const char kUpstream[] =
+        "HTTP/1.1 200 OK\r\nContent-Length: 4\r\nConnection: close\r\n\r\ndata";
+    conn->upstream_recv_buf.reset();
+    conn->upstream_recv_buf.write(reinterpret_cast<const u8*>(kUpstream), sizeof(kUpstream) - 1);
+    on_upstream_response<SmallLoop>(
+        &loop,
+        *conn,
+        make_ev(conn->id, IoEventType::UpstreamRecv, static_cast<i32>(sizeof(kUpstream) - 1)));
+
+    const char* wire = reinterpret_cast<const char*>(conn->send_buf.data());
+    CHECK(!buf_contains(wire, conn->send_buf.len(), "Content-Type:", 13));
+    CHECK(buf_contains(wire, conn->send_buf.len(), "\r\n\r\ndata", 8));
 }
 
 TEST(buffered_forward, dechunking_removes_trailer_declaration) {
@@ -6009,6 +6037,24 @@ TEST(buffered_forward, head_failure_suppresses_reason_phrase_body) {
     REQUIRE(conn != nullptr);
 
     buffered_forward_fail(&loop, *conn, 502);
+
+    const char* wire = reinterpret_cast<const char*>(conn->send_buf.data());
+    const u32 wire_len = conn->send_buf.len();
+    CHECK(buf_contains(wire, wire_len, "HTTP/1.1 502", 12));
+    CHECK(buf_contains(wire, wire_len, "Content-Length: 11\r\n", 20));
+    CHECK(!buf_contains(wire, wire_len, "\r\n\r\nBad Gateway", 15));
+}
+
+TEST(buffered_forward, head_connect_failure_suppresses_reason_phrase_body) {
+    SmallLoop loop;
+    loop.setup();
+    auto* conn = setup_proxy_conn_head(loop);
+    REQUIRE(conn != nullptr);
+    conn->proxy_response_buffered = true;
+    conn->upstream_attempts = kMaxConnectAttempts;
+
+    on_upstream_connected<SmallLoop>(
+        &loop, *conn, make_ev(conn->id, IoEventType::UpstreamConnect, -ECONNREFUSED));
 
     const char* wire = reinterpret_cast<const char*>(conn->send_buf.data());
     const u32 wire_len = conn->send_buf.len();

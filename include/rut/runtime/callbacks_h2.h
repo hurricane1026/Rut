@@ -241,6 +241,8 @@ inline bool h2_proxy_request_forwardable(const hpack::Header* hs, u32 n) {
 }
 
 inline void h2_clear_pending(Http2Conn& h2) {
+    if (h2.pending_preinvoked_forward || h2.pending_preinvoked_timer)
+        rut_helper_resp_release_body_storage(static_cast<void*>(h2.async_jit_ctx()));
     h2.pending_stream = 0;
     h2.pending_body_start = 0;
     h2.pending_synth_len = 0;
@@ -250,6 +252,11 @@ inline void h2_clear_pending(Http2Conn& h2) {
     h2.pending_buffer_body = false;
     h2.pending_request_forwardable = false;
     h2.pending_overflow = false;
+    h2.pending_preinvoked_forward = false;
+    h2.pending_preinvoked_timer = false;
+    h2.pending_forward_upstream_id = 0;
+    h2.pending_timer_state = 0;
+    h2.pending_timer_ms = 0;
     h2.pending_route_config = nullptr;
     h2.pending_route = nullptr;
     h2.pending_route_action = RouteAction::Static;
@@ -647,7 +654,8 @@ bool h2_suspend_timer(H2Dispatch<Loop>& d,
                       bool request_forwardable,
                       u32 body_start,
                       u32 body_len,
-                      bool inject_content_length_on_forward) {
+                      bool inject_content_length_on_forward,
+                      bool ctx_already_parked = false) {
     Http2Conn* h2 = d.conn->h2;
     // Refuse if a stream is already suspended OR a body-reading request is deferred
     // — both reuse pending_synth, so a second would corrupt the first's bytes — OR
@@ -661,7 +669,8 @@ bool h2_suspend_timer(H2Dispatch<Loop>& d,
     h2->async_body_start = body_start;
     h2->async_body_len = body_len;
     h2->async_inject_content_length_on_forward = inject_content_length_on_forward;
-    if (!h2_snapshot_async_jit_ctx(*h2, live_ctx, synth, h2->async_synth_len)) {
+    if (!ctx_already_parked &&
+        !h2_snapshot_async_jit_ctx(*h2, live_ctx, synth, h2->async_synth_len)) {
         h2_async_epoch_leave(d.loop, *d.conn);
         return false;
     }
@@ -688,7 +697,8 @@ bool h2_suspend_proxy(H2Dispatch<Loop>& d,
                       bool apply_response_mutations,
                       jit::HandlerCtx* live_ctx,
                       const u8* synth,
-                      u32 synth_len) {
+                      u32 synth_len,
+                      bool ctx_already_parked = false) {
     Http2Conn* h2 = d.conn->h2;
     // Refuse while another stream is suspended OR a body-reading request is
     // deferred — both reuse pending_synth (see h2_suspend_timer) — OR while
@@ -698,7 +708,7 @@ bool h2_suspend_proxy(H2Dispatch<Loop>& d,
     // Pin the config epoch before storing cfg/route (see h2_suspend_timer).
     h2_async_epoch_enter(d.loop, *d.conn);
     h2->async_synth_len = h2_stash_synth(*h2, synth, synth_len);
-    if (apply_response_mutations &&
+    if (apply_response_mutations && !ctx_already_parked &&
         (live_ctx == nullptr ||
          !h2_snapshot_async_jit_ctx(*h2, *live_ctx, synth, h2->async_synth_len))) {
         h2_async_epoch_leave(d.loop, *d.conn);
@@ -817,6 +827,75 @@ void h2_finish_body(H2Dispatch<Loop>& d, u32 stream_id) {
         const u16 kStatus = (kAction == RouteAction::Proxy) ? 503 : h2->pending_static_status;
         h2_clear_pending(*h2);
         h2_emit_status(d, stream_id, kStatus);
+        return;
+    }
+
+    if (h2->pending_preinvoked_forward || h2->pending_preinvoked_timer) {
+        const RouteConfig* cfg = h2->pending_route_config;
+        const RouteEntry* route = h2->pending_route;
+        const u16 upstream_id = h2->pending_forward_upstream_id;
+        const bool preinvoked_timer = h2->pending_preinvoked_timer;
+        if (route == nullptr || (!preinvoked_timer && !h2->pending_request_forwardable)) {
+            const u16 status = route == nullptr ? 500 : 400;
+            h2_clear_pending(*h2);
+            h2_emit_status(d, stream_id, status);
+            return;
+        }
+        if (!preinvoked_timer && !h2->pending_has_content_length &&
+            !h2_inject_content_length(h2->pending_synth,
+                                      &h2->pending_synth_len,
+                                      h2->pending_body_start,
+                                      h2->pending_body_len,
+                                      Http2Conn::kBodySynthCap)) {
+            h2_clear_pending(*h2);
+            h2_emit_status(d, stream_id, 413);
+            return;
+        }
+        const u32 synth_len = h2->pending_synth_len;
+        const u32 body_start = h2->pending_body_start;
+        const u32 body_len = h2->pending_body_len;
+        const bool request_forwardable = h2->pending_request_forwardable;
+        const bool inject_content_length_on_forward = !h2->pending_has_content_length;
+        h2->pending_stream = 0;  // transfer the shared synth/context to async
+        bool suspended = false;
+        if (preinvoked_timer) {
+            JitDispatchOutcome outcome{};
+            outcome.kind = JitDispatchOutcome::Kind::TimerYield;
+            outcome.next_state = h2->pending_timer_state;
+            outcome.timer_ms = h2->pending_timer_ms;
+            suspended = h2_suspend_timer(d,
+                                         stream_id,
+                                         route->fn,
+                                         *h2->async_jit_ctx(),
+                                         outcome,
+                                         cfg,
+                                         h2->pending_synth,
+                                         synth_len,
+                                         request_forwardable,
+                                         body_start,
+                                         body_len,
+                                         inject_content_length_on_forward,
+                                         /*ctx_already_parked=*/true);
+        } else {
+            suspended = h2_suspend_proxy(d,
+                                         stream_id,
+                                         cfg,
+                                         route,
+                                         upstream_id,
+                                         true,
+                                         h2->async_jit_ctx(),
+                                         h2->pending_synth,
+                                         synth_len,
+                                         /*ctx_already_parked=*/true);
+        }
+        if (!suspended) {
+            h2_clear_pending(*h2);
+            h2_emit_status(d, stream_id, 503);
+            return;
+        }
+        h2->pending_preinvoked_forward = false;  // ownership moved to async
+        h2->pending_preinvoked_timer = false;
+        h2_clear_pending(*h2);
         return;
     }
 
@@ -1010,6 +1089,107 @@ void h2_dispatch_request(H2Dispatch<Loop>& d,
         case RouteAction::JitHandler: {
             if (!route->fn) {
                 h2_emit_status(d, stream_id, 500);
+                return;
+            }
+            // A route may contain a buffered-forward terminator without reading
+            // req.body. Run it from the HEADERS view first: local responses and
+            // waits must not inherit the 16 KiB forwarding-body cap merely
+            // because some other branch can forward. Only the selected buffered
+            // forward parks and accumulates DATA. Preserve its already-produced
+            // mutation context so the handler is not invoked a second time.
+            if (!end_stream && !route->needs_req_body && route->can_forward_buffered) {
+                Http2Conn* h2 = d.conn->h2;
+                if (h2->pending_stream != 0 || h2->async_stream != 0 ||
+                    d.conn->h2_proxy_synth_quarantined) {
+                    h2_emit_status(d, stream_id, 503);
+                    return;
+                }
+                u8 synth[Http2Conn::kBodySynthCap];
+                const u32 kSynthLen = h2_synth_h1_request(headers, nheaders, synth, sizeof(synth));
+                if (kSynthLen == 0) {
+                    h2_emit_status(d, stream_id, 400);
+                    return;
+                }
+                RouteParam anchored_params[kMaxRouteParams];
+                if (!h2_reanchor_route_params(
+                        params, param_count, req.path, synth, kSynthLen, anchored_params)) {
+                    h2_emit_status(d, stream_id, 500);
+                    return;
+                }
+                auto* ctx = d.conn->reset_jit_ctx();
+                ctx->state = 0;
+                ctx->resume_event_kind = static_cast<u32>(jit::YieldKind::Timer);
+                ctx->resume_event_result = 0;
+                ctx->route_param_count = param_count;
+                for (u32 i = 0; i < param_count; i++) ctx->route_params[i] = anchored_params[i];
+                const JitDispatchOutcome kOutcome = invoke_jit_handler(
+                    route->fn, static_cast<void*>(d.conn), *ctx, synth, kSynthLen, nullptr);
+
+                if (kOutcome.kind == JitDispatchOutcome::Kind::ForwardBuffered) {
+                    if (!h2_proxy_request_forwardable(headers, nheaders)) {
+                        jit::release_response_body_mutation_storage(ctx);
+                        h2_emit_status(d, stream_id, 400);
+                        return;
+                    }
+                    if (!h2_defer_until_data_end(d,
+                                                 stream_id,
+                                                 headers,
+                                                 nheaders,
+                                                 req,
+                                                 /*buffer_body=*/true,
+                                                 RouteAction::JitHandler,
+                                                 config,
+                                                 route,
+                                                 params,
+                                                 param_count,
+                                                 200)) {
+                        jit::release_response_body_mutation_storage(ctx);
+                        return;
+                    }
+                    if (!h2_snapshot_async_jit_ctx(*h2, *ctx, synth, kSynthLen)) {
+                        h2_clear_pending(*h2);
+                        jit::release_response_body_mutation_storage(ctx);
+                        h2_emit_status(d, stream_id, 500);
+                        return;
+                    }
+                    h2->pending_preinvoked_forward = true;
+                    h2->pending_forward_upstream_id = kOutcome.upstream_id;
+                    return;
+                }
+                if (kOutcome.kind == JitDispatchOutcome::Kind::TimerYield) {
+                    if (!h2_defer_until_data_end(d,
+                                                 stream_id,
+                                                 headers,
+                                                 nheaders,
+                                                 req,
+                                                 /*buffer_body=*/true,
+                                                 RouteAction::JitHandler,
+                                                 config,
+                                                 route,
+                                                 params,
+                                                 param_count,
+                                                 200)) {
+                        jit::release_response_body_mutation_storage(ctx);
+                        return;
+                    }
+                    if (!h2_snapshot_async_jit_ctx(*h2, *ctx, synth, kSynthLen)) {
+                        h2_clear_pending(*h2);
+                        jit::release_response_body_mutation_storage(ctx);
+                        h2_emit_status(d, stream_id, 500);
+                        return;
+                    }
+                    h2->pending_preinvoked_timer = true;
+                    h2->pending_timer_state = static_cast<u16>(kOutcome.next_state);
+                    h2->pending_timer_ms = kOutcome.timer_ms;
+                    return;
+                }
+                if (kOutcome.kind == JitDispatchOutcome::Kind::ReturnStatus) {
+                    h2_emit_outcome(
+                        d, stream_id, kOutcome, config, h2_synth_request_is_head(synth, kSynthLen));
+                    return;
+                }
+                jit::release_response_body_mutation_storage(ctx);
+                h2_emit_status(d, stream_id, 503);
                 return;
             }
             // Routes that inspect the body or may buffered-forward need the

@@ -546,6 +546,8 @@ public:
         // now even with ops in flight (unlike the recv/send slices below).
         if (c.h2) {
             auto* async_ctx = c.h2->async_jit_ctx();
+            if (c.h2->pending_preinvoked_forward || c.h2->pending_preinvoked_timer)
+                rut_helper_resp_release_body_storage(static_cast<void*>(async_ctx));
             if (c.h2->async_stream != 0 &&
                 (c.h2->async_kind == H2AsyncKind::Timer || c.h2->async_apply_response_mutations))
                 rut_helper_resp_release_body_storage(static_cast<void*>(async_ctx));

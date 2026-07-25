@@ -378,11 +378,18 @@ TEST_F(MetricsLoopF, proxy_response_sent_error) {
     CHECK_EQ(self.loop.conns[self.cid].fd, -1);
 }
 
-TEST_F(MetricsLoopF, proxy_response_sent_any_positive_succeeds) {
+TEST_F(MetricsLoopF, proxy_response_sent_short_completion_retries_suffix) {
     REQUIRE(self.advance_to_upstream_response());
     inject_upstream_response(self.loop, *self.c);
+    const u32 resp_len = self.c->upstream_send_len;
+    REQUIRE_GT(resp_len, 1u);
     self.loop.inject_and_dispatch(make_ev(self.cid, IoEventType::Send, 1));
+    CHECK_EQ(self.loop.conns[self.cid].state, ConnState::Sending);
+    CHECK_EQ(self.m.requests_total, 0u);
+    self.loop.inject_and_dispatch(
+        make_ev(self.cid, IoEventType::Send, static_cast<i32>(resp_len - 1)));
     CHECK_EQ(self.loop.conns[self.cid].state, ConnState::ReadingHeader);
+    CHECK_EQ(self.m.requests_total, 1u);
 }
 
 TEST_F(MetricsLoopF, proxy_response_sent_wrong_event) {

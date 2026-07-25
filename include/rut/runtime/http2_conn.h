@@ -118,6 +118,14 @@ struct Http2Conn {
     bool pending_buffer_body;
     bool pending_request_forwardable;
     bool pending_overflow;  // body exceeded kBodySynthCap → respond 413
+    // A body-independent handler that selected ForwardBuffered has already run
+    // at HEADERS time. Its response mutations live in async_handler_ctx_storage
+    // while DATA is collected, so the handler is not invoked twice.
+    bool pending_preinvoked_forward;
+    bool pending_preinvoked_timer;
+    u16 pending_forward_upstream_id;
+    u16 pending_timer_state;
+    u32 pending_timer_ms;
     // Snapshot of matched route decisions at END_HEADERS time for deferred
     // requests. This keeps delayed DATA handlers stable when config changes
     // between HEADERS and DATA frames.

@@ -1,5 +1,7 @@
 #include "rut/runtime/http2_conn.h"
 
+#include "rut/runtime/response_body_storage.h"
+
 namespace rut {
 
 namespace {
@@ -41,6 +43,11 @@ void Http2Conn::init() {
     pending_buffer_body = false;
     pending_request_forwardable = false;
     pending_overflow = false;
+    pending_preinvoked_forward = false;
+    pending_preinvoked_timer = false;
+    pending_forward_upstream_id = 0;
+    pending_timer_state = 0;
+    pending_timer_ms = 0;
     pending_route_config = nullptr;
     pending_route = nullptr;
     pending_route_action = RouteAction::Static;
@@ -459,6 +466,8 @@ Http2Error append_fragment(Http2Conn& c, const u8* p, u32 n) {
 
 void clear_pending_upload(Http2Conn& c, u32 stream_id) {
     if (c.pending_stream != stream_id) return;
+    if (c.pending_preinvoked_forward || c.pending_preinvoked_timer)
+        rut_helper_resp_release_body_storage(static_cast<void*>(c.async_jit_ctx()));
     c.pending_stream = 0;
     c.pending_body_start = 0;
     c.pending_synth_len = 0;
@@ -468,6 +477,11 @@ void clear_pending_upload(Http2Conn& c, u32 stream_id) {
     c.pending_buffer_body = false;
     c.pending_request_forwardable = false;
     c.pending_overflow = false;
+    c.pending_preinvoked_forward = false;
+    c.pending_preinvoked_timer = false;
+    c.pending_forward_upstream_id = 0;
+    c.pending_timer_state = 0;
+    c.pending_timer_ms = 0;
     c.pending_route_config = nullptr;
     c.pending_route = nullptr;
     c.pending_route_action = RouteAction::Static;
