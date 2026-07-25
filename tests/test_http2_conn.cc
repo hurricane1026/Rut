@@ -2349,6 +2349,10 @@ TEST(h2_serving, suspended_handler_context_is_snapshotted_and_rebased) {
     auto* live = conn.reset_jit_ctx();
     live->slot_count = 1;
     live->store_slot<i64>(0, 73);
+    auto* control_plane = jit::acquire_control_plane_snapshot(live);
+    REQUIRE(control_plane != nullptr);
+    control_plane->valid = true;
+    control_plane->shard_id = 7;
 
     u8 synth[] = "GET /slow/abcd HTTP/1.1\r\nhost: example\r\n\r\n";
     constexpr u32 kSynthLen = sizeof(synth) - 1;
@@ -2376,6 +2380,7 @@ TEST(h2_serving, suspended_handler_context_is_snapshotted_and_rebased) {
 
     REQUIRE_EQ(h2_stash_synth(h2, synth, kSynthLen), kSynthLen);
     REQUIRE(h2_snapshot_async_jit_ctx(h2, *live, synth, kSynthLen));
+    CHECK(live->control_plane == nullptr);
     CHECK(live->response_body_mutation_storage == nullptr);
     CHECK(live->response_body_snapshot_storage == nullptr);
     conn.reset_jit_ctx();
@@ -2384,6 +2389,9 @@ TEST(h2_serving, suspended_handler_context_is_snapshotted_and_rebased) {
     const auto* parked = h2.async_jit_ctx();
     CHECK(parked != live);
     CHECK_EQ(parked->load_slot<i64>(0), 73);
+    REQUIRE(parked->control_plane != nullptr);
+    CHECK(parked->control_plane->valid);
+    CHECK_EQ(parked->control_plane->shard_id, 7u);
     CHECK(parked->response_header_mutations[0].value.eq(Str{"/slow/abcd", 10}));
     CHECK(parked->response_header_mutations[0].value.ptr ==
           reinterpret_cast<const char*>(h2.pending_synth + 4));
@@ -2400,6 +2408,7 @@ TEST(h2_serving, suspended_handler_context_is_snapshotted_and_rebased) {
     h2.async_kind = H2AsyncKind::Proxy;
     h2.async_apply_response_mutations = true;
     h2_clear_async(h2);
+    CHECK(parked->control_plane == nullptr);
     CHECK(parked->response_body_mutation_storage == nullptr);
     CHECK(parked->response_body_snapshot_storage == nullptr);
 }

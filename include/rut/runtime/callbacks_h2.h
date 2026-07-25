@@ -723,9 +723,10 @@ inline bool h2_snapshot_async_jit_ctx(Http2Conn& h2,
     auto* parked = h2.async_jit_ctx();
     __builtin_memcpy(parked, &live, kBytes);
 
-    // The parked frame now owns the lazily allocated mutation buffer. Clear the
+    // The parked frame now owns all lazily allocated request storage. Clear the
     // connection scratch copy so another H2 stream can reset it without freeing
     // bytes still needed by this suspended stream.
+    live.control_plane = nullptr;
     live.response_body_mutation_storage = nullptr;
     live.response_body_snapshot_storage = nullptr;
 
