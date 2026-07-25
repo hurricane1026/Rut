@@ -2808,7 +2808,7 @@ void h2_proxy_finish(Loop* loop,
             kName.ptr, kName.len, resp.headers[i].value.ptr, resp.headers[i].value.len};
     }
     const jit::HandlerCtx* response_ctx =
-        h2->async_apply_response_mutations ? conn.jit_ctx() : nullptr;
+        h2->async_apply_response_mutations ? h2->async_jit_ctx() : nullptr;
     bool mutations_valid =
         apply_response_header_mutations(
             response_ctx, effective, kMaxEffectiveHeaders, &effective_count) &&

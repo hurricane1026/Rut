@@ -5721,7 +5721,7 @@ TEST(buffered_forward, status_mutation_to_304_preserves_upstream_representation_
     CHECK(!buf_contains(wire, wire_len, "original", 8));
 }
 
-TEST(buffered_forward, h2_status_mutation_to_304_preserves_upstream_representation_length) {
+TEST(buffered_forward, h2_parked_status_mutation_to_304_preserves_representation_length) {
     SmallLoop loop;
     loop.setup();
     loop.inject_and_dispatch(make_ev(0, IoEventType::Accept, 42));
@@ -5739,7 +5739,8 @@ TEST(buffered_forward, h2_status_mutation_to_304_preserves_upstream_representati
     conn->state = ConnState::Proxying;
     conn->upstream_fd = dup(2);
     REQUIRE(conn->upstream_fd >= 0);
-    auto* ctx = conn->reset_jit_ctx();
+    conn->reset_jit_ctx();
+    auto* ctx = h2.async_jit_ctx();
     ctx->response_status_set = true;
     ctx->response_status = 304;
 
@@ -5772,10 +5773,14 @@ TEST(buffered_forward, h2_status_mutation_to_304_preserves_upstream_representati
                                        headers,
                                        16,
                                        &header_count));
+    bool found_status = false;
     bool found_length = false;
-    for (u32 i = 0; i < header_count; i++)
+    for (u32 i = 0; i < header_count; i++) {
+        found_status |= headers[i].name.eq(Str{":status", 7}) && headers[i].value.eq(Str{"304", 3});
         found_length |=
             headers[i].name.eq(Str{"content-length", 14}) && headers[i].value.eq(Str{"8", 1});
+    }
+    CHECK(found_status);
     CHECK(found_length);
     CHECK((frame.flags & http2_flag::kEndStream) != 0);
 
