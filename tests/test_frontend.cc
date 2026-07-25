@@ -371,8 +371,24 @@ static bool markdown_strip_container(std::string_view line,
             // CommonMark permits the single padding byte after `>` to be
             // present or omitted independently on every continuation line.
             if (pos < line.size() && (line[pos] == ' ' || line[pos] == '\t')) {
-                column = markdown_next_column(column, line[pos]);
-                pos++;
+                if (line[pos] == '\t') {
+                    const size_t next = markdown_next_column(column, line[pos]);
+                    const size_t residual_columns = next - (column + 1);
+                    if (residual_columns != 0 && normalized != nullptr) {
+                        const std::string suffix(line.substr(pos + 1));
+                        normalized->assign(residual_columns, ' ');
+                        normalized->append(suffix);
+                        line = *normalized;
+                        pos = 0;
+                        column++;
+                    } else {
+                        column = next;
+                        pos++;
+                    }
+                } else {
+                    column++;
+                    pos++;
+                }
             }
             continue;
         }
@@ -1019,6 +1035,40 @@ TEST(frontend, language_card_list_continuation_accepts_tab_overshoot) {
     CHECK(markdown_is_indented_code_block(content));
 }
 
+TEST(frontend, language_card_blockquote_tab_padding_retains_residual_columns) {
+    MarkdownFence fence{};
+    REQUIRE(parse_markdown_fence_open("> ```rut", &fence));
+    std::string_view content;
+    std::string normalized;
+    REQUIRE(markdown_strip_container(
+        ">\t  ~~~~markdown", fence.container_segments, &content, &normalized));
+    CHECK_EQ(content, "    ~~~~markdown");
+    CHECK(markdown_is_indented_code_block(content));
+}
+
+TEST(frontend, language_card_ordered_sibling_replaces_current_list_item) {
+    std::vector<MarkdownContainerSegment> paragraph;
+    CHECK_EQ(markdown_container_content("1. prose", 0, nullptr, &paragraph, false), "prose");
+    REQUIRE_EQ(paragraph.size(), 1u);
+    std::string_view content;
+    CHECK_FALSE(markdown_strip_container("2. ~~~~rut", paragraph, &content));
+    std::vector<MarkdownContainerSegment> sibling;
+    CHECK_EQ(markdown_container_content("2. ~~~~rut", 0, nullptr, &sibling, true), "~~~~rut");
+    REQUIRE_EQ(sibling.size(), 1u);
+    CHECK_EQ(sibling[0].kind, MarkdownContainerSegment::Kind::List);
+}
+
+TEST(frontend, language_card_nested_list_close_retains_matching_outer_prefix) {
+    std::vector<MarkdownContainerSegment> nested;
+    CHECK_EQ(markdown_container_content("- - prose", 0, nullptr, &nested), "prose");
+    REQUIRE_EQ(nested.size(), 2u);
+    std::string_view content;
+    CHECK_FALSE(markdown_strip_container("  ~~~~rut", nested, &content));
+    std::vector<MarkdownContainerSegment> outer(nested.begin(), nested.begin() + 1);
+    REQUIRE(markdown_strip_container("  ~~~~rut", outer, &content));
+    CHECK_EQ(content, "~~~~rut");
+}
+
 TEST(frontend, language_card_container_fence_ends_with_its_container) {
     MarkdownFence fence{};
     REQUIRE(parse_markdown_fence_open("> ```rut", &fence));
@@ -1187,8 +1237,11 @@ TEST(frontend, language_card_unmarked_rut_examples_parse_and_typecheck) {
                                                   nested_container.begin(),
                                                   nested_container.end());
                 } else {
+                    const bool replacing_list_item =
+                        !paragraph_container.empty() &&
+                        paragraph_container.back().kind == MarkdownContainerSegment::Kind::List;
                     interrupting_content = markdown_container_content(
-                        line, 0, nullptr, &interrupting_container, false);
+                        line, 0, nullptr, &interrupting_container, replacing_list_item);
                 }
                 const bool partial_lazy_continuation =
                     markdown_container_prefix(interrupting_container, paragraph_container) &&
@@ -1238,12 +1291,23 @@ TEST(frontend, language_card_unmarked_rut_examples_parse_and_typecheck) {
                     }
                 }
             } else {
-                if (!continued_list_container.empty() &&
-                    markdown_strip_container(line,
-                                             continued_list_container,
-                                             &container_content,
-                                             &container_content_storage)) {
-                    line_container = continued_list_container;
+                bool retained_list_container = false;
+                if (!continued_list_container.empty()) {
+                    size_t retained_segments = continued_list_container.size();
+                    while (retained_segments != 0) {
+                        std::vector<MarkdownContainerSegment> candidate(
+                            continued_list_container.begin(),
+                            continued_list_container.begin() + retained_segments);
+                        if (markdown_strip_container(
+                                line, candidate, &container_content, &container_content_storage)) {
+                            line_container = std::move(candidate);
+                            retained_list_container = true;
+                            break;
+                        }
+                        retained_segments--;
+                    }
+                }
+                if (retained_list_container) {
                     std::vector<MarkdownContainerSegment> nested_container;
                     container_content = markdown_container_content(
                         container_content, 0, nullptr, &nested_container);
@@ -1278,7 +1342,7 @@ TEST(frontend, language_card_unmarked_rut_examples_parse_and_typecheck) {
             const std::string_view skip_content = markdown_block_content(container_content);
             if (skip_content.starts_with(kMarkdownSkipPrefix)) {
                 REQUIRE_MSG(!pending_skip, "skip markers cannot be stacked");
-                REQUIRE_MSG(markdown_skip_marker_has_reason(line),
+                REQUIRE_MSG(markdown_skip_marker_has_reason(skip_content),
                             "language-card skip markers require a nonempty reason");
                 pending_skip = true;
                 pending_skip_container = std::move(line_container);
