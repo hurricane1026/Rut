@@ -178,7 +178,7 @@ struct MarkdownFence {
     size_t marker_count = 0;
     size_t container_indent = 0;
     std::vector<MarkdownContainerSegment> container_segments{};
-    std::string_view info{};
+    std::string info{};
 };
 
 static size_t markdown_next_column(size_t column, char c) {
@@ -202,7 +202,8 @@ static std::string_view markdown_container_content(
     size_t continuation_indent,
     size_t* container_indent = nullptr,
     std::vector<MarkdownContainerSegment>* segments = nullptr,
-    bool non_one_ordered_lists_can_interrupt = true) {
+    bool non_one_ordered_lists_can_interrupt = true,
+    std::string* normalized = nullptr) {
     size_t pos = 0;
     size_t indent = 0;
     size_t column = 0;
@@ -217,8 +218,24 @@ static std::string_view markdown_container_content(
             pos = marker + 1;
             column++;
             if (pos < line.size() && (line[pos] == ' ' || line[pos] == '\t')) {
-                column = markdown_next_column(column, line[pos]);
-                pos++;
+                if (line[pos] == '\t') {
+                    const size_t next = markdown_next_column(column, line[pos]);
+                    const size_t residual_columns = next - (column + 1);
+                    if (residual_columns != 0 && normalized != nullptr) {
+                        const std::string suffix(line.substr(pos + 1));
+                        normalized->assign(residual_columns, ' ');
+                        normalized->append(suffix);
+                        line = *normalized;
+                        pos = 0;
+                        column++;
+                    } else {
+                        column = next;
+                        pos++;
+                    }
+                } else {
+                    column++;
+                    pos++;
+                }
             }
             if (segments != nullptr)
                 segments->push_back(
@@ -425,6 +442,35 @@ static bool markdown_strip_container(std::string_view line,
     return true;
 }
 
+static bool markdown_strip_longest_list_prefix(
+    std::string_view line,
+    const std::vector<MarkdownContainerSegment>& container,
+    std::vector<MarkdownContainerSegment>* prefix,
+    std::string_view* content,
+    std::string* normalized = nullptr) {
+    for (size_t prefix_len = container.size(); prefix_len > 1; prefix_len--) {
+        std::vector<MarkdownContainerSegment> candidate(container.begin(),
+                                                        container.begin() + prefix_len - 1);
+        bool has_list = false;
+        for (const auto& segment : candidate)
+            has_list |= segment.kind == MarkdownContainerSegment::Kind::List;
+        if (!has_list) continue;
+        std::string candidate_normalized;
+        std::string_view candidate_content;
+        if (!markdown_strip_container(line, candidate, &candidate_content, &candidate_normalized))
+            continue;
+        if (normalized != nullptr) {
+            *normalized = std::move(candidate_normalized);
+            *content = normalized->empty() ? candidate_content : std::string_view(*normalized);
+        } else {
+            *content = candidate_content;
+        }
+        *prefix = std::move(candidate);
+        return true;
+    }
+    return false;
+}
+
 static std::string_view markdown_fence_content(std::string_view line,
                                                const MarkdownFence& opening,
                                                std::string* normalized = nullptr) {
@@ -463,7 +509,9 @@ static bool parse_markdown_fence_open_content(std::string_view line, MarkdownFen
 static bool parse_markdown_fence_open(std::string_view line, MarkdownFence* out) {
     size_t container_indent = 0;
     std::vector<MarkdownContainerSegment> container_segments;
-    line = markdown_container_content(line, 0, &container_indent, &container_segments);
+    std::string normalized;
+    line = markdown_container_content(
+        line, 0, &container_indent, &container_segments, true, &normalized);
     if (!parse_markdown_fence_open_content(line, out)) return false;
     out->container_indent = container_indent;
     out->container_segments = std::move(container_segments);
@@ -1047,6 +1095,11 @@ TEST(frontend, language_card_blockquote_tab_padding_retains_residual_columns) {
     CHECK(markdown_is_indented_code_block(content));
 }
 
+TEST(frontend, language_card_blockquote_tab_residual_prevents_fence_open) {
+    MarkdownFence fence{};
+    CHECK_FALSE(parse_markdown_fence_open(">\t  ~~~~markdown", &fence));
+}
+
 TEST(frontend, language_card_ordered_sibling_replaces_current_list_item) {
     std::vector<MarkdownContainerSegment> paragraph;
     CHECK_EQ(markdown_container_content("1. prose", 0, nullptr, &paragraph, false), "prose");
@@ -1068,6 +1121,43 @@ TEST(frontend, language_card_nested_list_close_retains_matching_outer_prefix) {
     std::vector<MarkdownContainerSegment> outer(nested.begin(), nested.begin() + 1);
     REQUIRE(markdown_strip_container("  ~~~~rut", outer, &content));
     CHECK_EQ(content, "~~~~rut");
+}
+
+TEST(frontend, language_card_recovers_outer_list_from_nested_container_end) {
+    const char* openers[] = {"- - prose", "- > prose", "- > <div>"};
+    for (const char* opener : openers) {
+        std::vector<MarkdownContainerSegment> container;
+        markdown_container_content(opener, 0, nullptr, &container);
+        REQUIRE_EQ(container.size(), 2u);
+        std::vector<MarkdownContainerSegment> prefix;
+        std::string_view content;
+        std::string normalized;
+        REQUIRE(markdown_strip_longest_list_prefix(
+            "  ~~~~markdown", container, &prefix, &content, &normalized));
+        REQUIRE_EQ(prefix.size(), 1u);
+        CHECK_EQ(prefix[0].kind, MarkdownContainerSegment::Kind::List);
+        CHECK_EQ(content, "~~~~markdown");
+    }
+
+    std::vector<MarkdownContainerSegment> nested_lists;
+    markdown_container_content("- - prose", 0, nullptr, &nested_lists);
+    std::vector<MarkdownContainerSegment> outer;
+    std::string_view sibling;
+    std::string normalized;
+    REQUIRE(markdown_strip_longest_list_prefix(
+        "  + ~~~~markdown", nested_lists, &outer, &sibling, &normalized));
+    std::vector<MarkdownContainerSegment> replacement;
+    CHECK_EQ(markdown_container_content(sibling, 0, nullptr, &replacement, true), "~~~~markdown");
+    outer.insert(outer.end(), replacement.begin(), replacement.end());
+    REQUIRE_EQ(outer.size(), 2u);
+    CHECK_EQ(outer[0].kind, MarkdownContainerSegment::Kind::List);
+    CHECK_EQ(outer[1].kind, MarkdownContainerSegment::Kind::List);
+}
+
+TEST(frontend, language_card_rut_fence_language_is_case_insensitive) {
+    MarkdownFence fence{};
+    REQUIRE(parse_markdown_fence_open("```Rut", &fence));
+    CHECK(markdown_fence_language_case_insensitive(fence.info, "rut"));
 }
 
 TEST(frontend, language_card_inner_fence_container_close_retains_outer_list) {
@@ -1227,20 +1317,15 @@ TEST(frontend, language_card_unmarked_rut_examples_parse_and_typecheck) {
                         line, current_fence.container_segments, &content, &normalized_content)) {
                     // The fence ends when an inner container closes, but a
                     // matching outer list prefix still contains this line.
-                    for (size_t prefix_len = current_fence.container_segments.size();
-                         prefix_len > 1;
-                         prefix_len--) {
-                        std::vector<MarkdownContainerSegment> prefix(
-                            current_fence.container_segments.begin(),
-                            current_fence.container_segments.begin() + prefix_len - 1);
-                        std::string_view prefix_content;
-                        std::string normalized_prefix;
-                        if (!markdown_strip_container(
-                                line, prefix, &prefix_content, &normalized_prefix))
-                            continue;
+                    std::vector<MarkdownContainerSegment> prefix;
+                    std::string_view prefix_content;
+                    std::string normalized_prefix;
+                    if (markdown_strip_longest_list_prefix(line,
+                                                           current_fence.container_segments,
+                                                           &prefix,
+                                                           &prefix_content,
+                                                           &normalized_prefix))
                         markdown_remember_list_container(prefix, &continued_list_container);
-                        break;
-                    }
                     finish_fence();
                     process_again = true;
                     continue;
@@ -1266,6 +1351,7 @@ TEST(frontend, language_card_unmarked_rut_examples_parse_and_typecheck) {
                 std::string_view interrupting_content;
                 std::string_view outer_content;
                 std::string normalized_outer_content;
+                bool replaced_nested_container = false;
                 if (markdown_strip_container(
                         line, paragraph_container, &outer_content, &normalized_outer_content)) {
                     std::vector<MarkdownContainerSegment> nested_container;
@@ -1279,14 +1365,31 @@ TEST(frontend, language_card_unmarked_rut_examples_parse_and_typecheck) {
                     const bool replacing_list_item =
                         !paragraph_container.empty() &&
                         paragraph_container.back().kind == MarkdownContainerSegment::Kind::List;
-                    interrupting_content = markdown_container_content(
-                        line, 0, nullptr, &interrupting_container, replacing_list_item);
+                    std::vector<MarkdownContainerSegment> retained_prefix;
+                    if (markdown_strip_longest_list_prefix(line,
+                                                           paragraph_container,
+                                                           &retained_prefix,
+                                                           &outer_content,
+                                                           &normalized_outer_content)) {
+                        std::vector<MarkdownContainerSegment> nested_container;
+                        interrupting_content = markdown_container_content(
+                            outer_content, 0, nullptr, &nested_container, replacing_list_item);
+                        replaced_nested_container = !nested_container.empty();
+                        interrupting_container = std::move(retained_prefix);
+                        interrupting_container.insert(interrupting_container.end(),
+                                                      nested_container.begin(),
+                                                      nested_container.end());
+                    } else {
+                        interrupting_content = markdown_container_content(
+                            line, 0, nullptr, &interrupting_container, replacing_list_item);
+                    }
                 }
                 const bool partial_lazy_continuation =
                     markdown_container_prefix(interrupting_container, paragraph_container) &&
                     markdown_is_lazy_paragraph_continuation(interrupting_content);
                 if (!interrupting_container.empty() &&
-                    !markdown_same_container(interrupting_container, paragraph_container) &&
+                    (replaced_nested_container ||
+                     !markdown_same_container(interrupting_container, paragraph_container)) &&
                     !partial_lazy_continuation) {
                     paragraph_open = false;
                     paragraph_container.clear();
@@ -1320,11 +1423,27 @@ TEST(frontend, language_card_unmarked_rut_examples_parse_and_typecheck) {
                         }
                         if (!lazy_continuation) {
                             paragraph_open = false;
+                            std::vector<MarkdownContainerSegment> retained_prefix;
+                            std::string retained_storage;
+                            std::string_view retained_content;
+                            if (!markdown_strip_longest_list_prefix(line,
+                                                                    paragraph_container,
+                                                                    &retained_prefix,
+                                                                    &retained_content,
+                                                                    &retained_storage)) {
+                                paragraph_container.clear();
+                                process_again = true;
+                                continue;
+                            }
                             paragraph_container.clear();
-                            process_again = true;
-                            continue;
+                            container_content_storage = std::move(retained_storage);
+                            container_content = container_content_storage.empty()
+                                                    ? retained_content
+                                                    : std::string_view(container_content_storage);
+                            line_container = std::move(retained_prefix);
+                        } else {
+                            line_container = paragraph_container;
                         }
-                        line_container = paragraph_container;
                     } else {
                         line_container = paragraph_container;
                     }
@@ -1366,6 +1485,14 @@ TEST(frontend, language_card_unmarked_rut_examples_parse_and_typecheck) {
                 std::string normalized_html_content;
                 if (!markdown_strip_container(
                         line, raw_html_container, &html_content, &normalized_html_content)) {
+                    std::vector<MarkdownContainerSegment> retained_prefix;
+                    if (markdown_strip_longest_list_prefix(line,
+                                                           raw_html_container,
+                                                           &retained_prefix,
+                                                           &html_content,
+                                                           &normalized_html_content))
+                        markdown_remember_list_container(retained_prefix,
+                                                         &continued_list_container);
                     raw_html_end.clear();
                     raw_html_container.clear();
                     process_again = true;
@@ -1437,7 +1564,7 @@ TEST(frontend, language_card_unmarked_rut_examples_parse_and_typecheck) {
                 paragraph_open = false;
                 paragraph_container.clear();
                 current_fence = opening;
-                current_is_rut = markdown_fence_language(opening.info, "rut");
+                current_is_rut = markdown_fence_language_case_insensitive(opening.info, "rut");
                 if (current_is_rut) {
                     skip_current = pending_skip;
                     pending_skip = false;
