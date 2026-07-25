@@ -104,7 +104,8 @@ Rut Core should keep chains intentionally narrow:
 
 - The implemented route-level extension points are request-side `before` and
   the bounded response `after` slice described above; there are no arbitrary
-  phases or first-class buffered Response expressions.
+  phases. Buffered `Response` expressions are limited to the explicit,
+  bounded `forward(..., buffered: true)` form described above.
 - A `before` step must be a direct call. A bool predicate must declare
   `else <status>` (its only rejection channel); a respond-capable helper
   (one whose body uses `guard ... else { respond <status>[, body] }`) must

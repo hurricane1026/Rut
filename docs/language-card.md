@@ -89,7 +89,9 @@ order, and arrays/string-list views preserve carrier order. Duplicate object
 keys are a compile error rather than last-write-wins. Runtime strings are JSON
 escaped at the sink. A direct dynamic JSON response is capped at 7 KiB, while a
 `Response.body` mutation is capped at 4 KiB so it can remain stream-owned across
-resume; either overflow fails closed as 500 and never publishes a partial body.
+resume. An overflow never publishes a partial body and normally fails closed as
+500; body-forbidden statuses (informational, 204, 205, and 304) preserve their
+status because no dynamic body can be emitted.
 
 ## Bindings and control flow
 
