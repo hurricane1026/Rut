@@ -500,7 +500,8 @@ void h2_emit_outcome(H2Dispatch<Loop>& d,
                 http_header_name_eq_ci(header.name.ptr, header.name.len, "content-length", 14))
                 continue;
             if (o.response_ctx->response_body_mutation_set &&
-                http_header_name_eq_ci(header.name.ptr, header.name.len, "content-encoding", 16))
+                (http_header_name_eq_ci(header.name.ptr, header.name.len, "content-encoding", 16) ||
+                 http_header_name_eq_ci(header.name.ptr, header.name.len, "content-length", 14)))
                 continue;
             if (h2_is_prohibited_response_header(header.name.ptr, header.name.len)) continue;
             if (header.name.len > kCapturedNameStorageBytes - captured_name_cursor) {

@@ -1881,6 +1881,56 @@ TEST(h2_serving, captured_content_length_is_removed_for_final_204) {
     for (u32 i = 0; i < count; i++) CHECK_FALSE(decoded[i].name.eq(Str{"content-length", 14}));
 }
 
+TEST(h2_serving, captured_head_body_replacement_has_one_content_length) {
+    Http2Conn h2;
+    h2.init();
+    Connection conn;
+    conn.reset();
+    conn.h2 = &h2;
+    FakeH2Loop loop;
+    u8 response[512]{};
+    H2Dispatch<FakeH2Loop> dispatch{&loop, &conn, response, sizeof(response), 0, false};
+    jit::HandlerCtx response_ctx{};
+    response_ctx.captured_response_valid = true;
+    response_ctx.captured_response_header_count = 1;
+    response_ctx.captured_response_headers[0].name = {"content-length", 14};
+    response_ctx.captured_response_headers[0].value = {"123", 3};
+    response_ctx.response_body_mutation_set = true;
+    static constexpr char kReplacement[] = "new body";
+    JitDispatchOutcome outcome{};
+    outcome.kind = JitDispatchOutcome::Kind::ReturnStatus;
+    outcome.status_code = 200;
+    outcome.dynamic_response_body = kReplacement;
+    outcome.dynamic_response_body_len = sizeof(kReplacement) - 1;
+    outcome.response_ctx = &response_ctx;
+    outcome.uses_captured_response = true;
+
+    h2_emit_outcome(dispatch, 1, outcome, nullptr, true);
+
+    Http2FrameHeader header{};
+    REQUIRE(parse_frame_header(response, dispatch.resp_len, &header) == ParseStatus::Complete);
+    hpack::DynamicTable dyn;
+    dyn.init(4096);
+    hpack::Header decoded[8];
+    u8 scratch[256];
+    u32 count = 0;
+    REQUIRE(hpack::decode_header_block(dyn,
+                                       response + kFrameHeaderSize,
+                                       header.length,
+                                       scratch,
+                                       sizeof(scratch),
+                                       decoded,
+                                       8,
+                                       &count));
+    u32 content_length_count = 0;
+    for (u32 i = 0; i < count; i++) {
+        if (!decoded[i].name.eq(Str{"content-length", 14})) continue;
+        content_length_count++;
+        CHECK(decoded[i].value.eq(Str{"8", 1}));
+    }
+    CHECK_EQ(content_length_count, 1u);
+}
+
 TEST(h2_serving, mutation_storage_is_released_after_serialization) {
     Http2Conn h2;
     h2.init();

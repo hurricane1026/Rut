@@ -9839,6 +9839,15 @@ route GET "/capture" {
 }
 )rut";
 
+static constexpr const char kBufferedPostForwardAgainSource[] = R"rut(
+upstream first
+upstream second
+route POST "/capture" {
+    let resp = forward(first, buffered: true)
+    return forward(second, set_path: "/rewritten")
+}
+)rut";
+
 static constexpr const char kBufferedHeadReturnSource[] = R"rut(
 upstream api
 route HEAD "/capture" {
@@ -16750,6 +16759,52 @@ TEST(route, forward_set_path_streaming_post_body) {
     }
     engine.shutdown();
     rir.destroy();
+}
+
+TEST(route, buffered_capture_followup_forward_preserves_streamed_post_body) {
+    using namespace rut;
+    PostEchoServer first;
+    PostEchoServer second;
+    REQUIRE(first.setup());
+    REQUIRE(second.setup());
+
+    CompiledRutRoute compiled;
+    REQUIRE(compiled.compile(kBufferedPostForwardAgainSource));
+    RouteConfig cfg;
+    REQUIRE(cfg.add_upstream("first", 0x7F000001, first.port).has_value());
+    REQUIRE(cfg.add_upstream("second", 0x7F000001, second.port).has_value());
+    REQUIRE(cfg.add_jit_handler("/capture", 'P', compiled.handler));
+    Shard<EpollEventLoop> shard;
+    i32 lfd = create_listen_socket(0).value_or(-1);
+    REQUIRE(lfd >= 0);
+    const u16 port = get_port(lfd);
+    REQUIRE(shard.init(0, lfd).has_value());
+    shard.route_config = &cfg;
+    REQUIRE(shard.spawn(-1).has_value());
+    usleep(50000);
+
+    i32 client = connect_to(port);
+    REQUIRE(client >= 0);
+    set_socket_timeouts(client, 3);
+    static constexpr char kHeaders[] =
+        "POST /capture HTTP/1.1\r\nHost: x\r\nContent-Length: 5\r\nConnection: close\r\n\r\n";
+    REQUIRE(send_all(client, kHeaders, sizeof(kHeaders) - 1));
+    usleep(30000);
+    REQUIRE(send_all(client, "hello", 5));
+    char response[1024];
+    u32 total = 0;
+    while (total < sizeof(response)) {
+        const i32 got = recv_timeout(client, response + total, sizeof(response) - total, 2000);
+        if (got <= 0) break;
+        total += static_cast<u32>(got);
+        if (buf_contains(response, total, "/rewritten|hello", 16)) break;
+    }
+    CHECK(buf_contains(response, total, "/rewritten|hello", 16));
+    close(client);
+    shard.stop();
+    shard.join();
+    shard.shutdown();
+    close(lfd);
 }
 
 // forward() rejects an unknown kwarg and a duplicated set_path.

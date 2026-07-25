@@ -181,11 +181,12 @@ bool account_terminal_output(const HarnessSpec& spec,
                                 jit::kMaxResponseHeaderMutations;
     ResponseHeaderKV headers[kMaxHeaders];
     u32 header_count = 0;
+    const bool captured_response = response_ctx != nullptr && response_ctx->captured_response_valid;
     if (!collect_effective_response_headers(
             response_ctx, config, terminal.next_state, headers, kMaxHeaders, &header_count)) {
         connection.resp_status = 500;
         format_static_response(connection, 500, false, suppress_body);
-    } else if (header_count != 0) {
+    } else if (header_count != 0 || captured_response) {
         const char* body_data = nullptr;
         u32 body_len = 0;
         bool fallback_body = false;
@@ -201,8 +202,6 @@ bool account_terminal_output(const HarnessSpec& spec,
             while (body_data[body_len] != '\0') body_len++;
             fallback_body = true;
         }
-        const bool captured_response =
-            response_ctx != nullptr && response_ctx->captured_response_valid;
         const bool captured_head = captured_response && suppress_body;
         const bool body_mutated =
             response_ctx != nullptr && response_ctx->response_body_mutation_set;
@@ -319,7 +318,11 @@ ScenarioResult drive_scenario(const ScenarioSpec& scenario, const HarnessSpec& h
                                            : "control-plane snapshot capability was not declared");
         return out;
     }
-    if (scenario.control_plane_snapshot != nullptr && !scenario.control_plane_snapshot->valid) {
+    if (scenario.control_plane_snapshot != nullptr &&
+        (!scenario.control_plane_snapshot->valid ||
+         scenario.control_plane_snapshot->shard_count == 0 ||
+         scenario.control_plane_snapshot->shard_id >=
+             scenario.control_plane_snapshot->shard_count)) {
         out.harness.outcome = Outcome::Invalid;
         out.harness.cleanup = CleanupOutcome::Clean;
         copy_detail(out.harness, "control-plane snapshot fixture is invalid");

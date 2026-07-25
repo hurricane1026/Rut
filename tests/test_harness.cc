@@ -880,6 +880,51 @@ TEST(harness_handler, owns_captured_headers_across_result_copies) {
     CHECK(copied.captured_response_headers[0].value.eq({"fixture", 7}));
 }
 
+TEST(harness_handler, normalizes_captured_content_length_for_request_method) {
+    const auto run = [](const u8* request, u32 request_len) {
+        harness::HandlerExecution execution{};
+        execution.init(&captured_passthrough_handler, nullptr, request, request_len);
+        const jit::CapturedResponseHeader headers[] = {
+            {{"Content-Length", 14}, {"123", 3}},
+            {{"X-Origin", 8}, {"fixture", 7}},
+        };
+        const harness::DeterministicCompletion completion = {
+            jit::YieldKind::Forward,
+            0,
+            100,
+            1,
+            7,
+            nullptr,
+            0,
+            false,
+            false,
+            200,
+            headers,
+            2,
+        };
+        harness::DeterministicEnvironment environment{};
+        environment.reset(&completion, 1);
+        harness::DeterministicHandlerSpec driver{};
+        driver.execution = execution;
+        driver.environment = &environment;
+        harness::HarnessSpec spec{};
+        spec.layer = harness::ExecutionLayer::Handler;
+        return harness::drive_handler_deterministically(driver, spec);
+    };
+
+    static constexpr u8 kGet[] = "GET /x HTTP/1.1\r\nHost: test\r\n\r\n";
+    const auto get = run(kGet, sizeof(kGet) - 1);
+    REQUIRE_EQ(get.harness.outcome, harness::Outcome::Passed);
+    REQUIRE_EQ(get.captured_response_header_count, 1u);
+    CHECK(get.captured_response_headers[0].name.eq({"X-Origin", 8}));
+
+    static constexpr u8 kHead[] = "HEAD /x HTTP/1.1\r\nHost: test\r\n\r\n";
+    const auto head = run(kHead, sizeof(kHead) - 1);
+    REQUIRE_EQ(head.harness.outcome, harness::Outcome::Passed);
+    REQUIRE_EQ(head.captured_response_header_count, 2u);
+    CHECK(head.captured_response_headers[0].name.eq({"Content-Length", 14}));
+}
+
 TEST(harness_handler, rejects_null_captured_response_header_views) {
     harness::HandlerExecution execution{};
     execution.init(&captured_forward_handler, nullptr, nullptr, 0);
@@ -1157,9 +1202,9 @@ route GET "/x" {
     REQUIRE_EQ(without_header.harness.outcome, harness::Outcome::Passed);
     REQUIRE_EQ(with_header.harness.outcome, harness::Outcome::Passed);
     CHECK_EQ(with_header.terminal.status_code, 204u);
-    // A 204 response omits Content-Length. The captured header occupies the
-    // same number of wire bytes as the baseline's Content-Length: 0 line.
-    CHECK_EQ(with_header.harness.output_bytes, without_header.harness.output_bytes);
+    // Headerless captured responses still take the captured formatter path, so
+    // a 204 does not gain a synthetic Content-Length field.
+    CHECK_EQ(with_header.harness.output_bytes, without_header.harness.output_bytes + 19);
     CHECK_EQ(target.destroy(), harness::CleanupOutcome::Clean);
 }
 
@@ -1177,10 +1222,7 @@ route HEAD "/x" {
     REQUIRE_EQ(target.prepare({source.path, jit::OptLevel::O0}, load_spec).outcome,
                harness::Outcome::Passed);
 
-    const auto run = [&](const char* length, u32 length_len) {
-        const jit::CapturedResponseHeader headers[] = {
-            {{"Content-Length", 14}, {length, length_len}},
-        };
+    const auto run = [&](const jit::CapturedResponseHeader* headers, u32 header_count) {
         harness::ScriptedEnvironment environment{};
         auto& completion = environment.base_completions[0];
         completion.kind = jit::YieldKind::Forward;
@@ -1191,7 +1233,7 @@ route HEAD "/x" {
         completion.logical_fault_point = true;
         completion.response_status = 200;
         completion.response_headers = headers;
-        completion.response_header_count = 1;
+        completion.response_header_count = header_count;
         environment.completion_count = 1;
         environment.next_order = 2;
 
@@ -1207,10 +1249,33 @@ route HEAD "/x" {
         return harness::drive_scenario(scenario, scripted_scenario_harness());
     };
 
-    const auto short_length = run("0", 1);
-    const auto representation_length = run("123", 3);
+    const jit::CapturedResponseHeader short_headers[] = {
+        {{"Content-Length", 14}, {"0", 1}},
+    };
+    const jit::CapturedResponseHeader representation_headers[] = {
+        {{"Content-Length", 14}, {"123", 3}},
+    };
+    const jit::CapturedResponseHeader matching_duplicate_headers[] = {
+        {{"Content-Length", 14}, {"123", 3}},
+        {{"content-length", 14}, {"123", 3}},
+    };
+    const jit::CapturedResponseHeader invalid_headers[] = {
+        {{"Content-Length", 14}, {"nope", 4}},
+    };
+    const jit::CapturedResponseHeader conflicting_headers[] = {
+        {{"Content-Length", 14}, {"1", 1}},
+        {{"content-length", 14}, {"2", 1}},
+    };
+    const auto short_length = run(short_headers, 1);
+    const auto representation_length = run(representation_headers, 1);
+    const auto matching_duplicates = run(matching_duplicate_headers, 2);
+    const auto invalid = run(invalid_headers, 1);
+    const auto conflicting = run(conflicting_headers, 2);
     REQUIRE_EQ(short_length.harness.outcome, harness::Outcome::Passed);
     REQUIRE_EQ(representation_length.harness.outcome, harness::Outcome::Passed);
+    REQUIRE_EQ(matching_duplicates.harness.outcome, harness::Outcome::Passed);
+    CHECK_EQ(invalid.harness.outcome, harness::Outcome::Invalid);
+    CHECK_EQ(conflicting.harness.outcome, harness::Outcome::Invalid);
     CHECK_EQ(representation_length.harness.output_bytes, short_length.harness.output_bytes + 2);
     CHECK_EQ(target.destroy(), harness::CleanupOutcome::Clean);
 }
@@ -1382,6 +1447,20 @@ TEST(harness_scenario, control_plane_snapshot_fixture_replays_exact_json) {
     const auto invalid = harness::drive_scenario(scenario, spec);
     CHECK_EQ(invalid.harness.outcome, harness::Outcome::Invalid);
     CHECK(std::strcmp(invalid.harness.detail, "control-plane snapshot fixture is invalid") == 0);
+
+    invalid_fixture.valid = true;
+    invalid_fixture.shard_count = 0;
+    const auto empty_topology = harness::drive_scenario(scenario, spec);
+    CHECK_EQ(empty_topology.harness.outcome, harness::Outcome::Invalid);
+    CHECK(std::strcmp(empty_topology.harness.detail, "control-plane snapshot fixture is invalid") ==
+          0);
+
+    invalid_fixture.shard_count = 2;
+    invalid_fixture.shard_id = 2;
+    const auto out_of_range_shard = harness::drive_scenario(scenario, spec);
+    CHECK_EQ(out_of_range_shard.harness.outcome, harness::Outcome::Invalid);
+    CHECK(std::strcmp(out_of_range_shard.harness.detail,
+                      "control-plane snapshot fixture is invalid") == 0);
 
     scenario.control_plane_snapshot = nullptr;
     spec.required_capabilities =

@@ -2055,7 +2055,11 @@ void handle_jit_outcome(Loop* loop,
             if (capture && conn.request_capture_slice == nullptr) {
                 const u32 request_len = conn.req_initial_send_len != 0 ? conn.req_initial_send_len
                                                                        : conn.recv_buf.len();
-                if (request_len > SlicePool::kSliceSize) {
+                const bool content_length_capture_overflow =
+                    conn.req_body_mode == BodyMode::ContentLength &&
+                    (conn.req_header_end > SlicePool::kSliceSize ||
+                     conn.req_content_length > SlicePool::kSliceSize - conn.req_header_end);
+                if (request_len > SlicePool::kSliceSize || content_length_capture_overflow) {
                     abandon_capture();
                     conn.resp_status = 500;
                     format_static_response(conn, 500, /*keep_alive=*/false);
@@ -4094,6 +4098,19 @@ void on_request_body_recvd(void* lp, Connection& conn, IoEvent ev) {
             if (kChunkStatus == ChunkStatus::NeedMore) break;
         }
         send_len = pos;
+    }
+
+    if (conn.request_capture_slice != nullptr) {
+        if (send_len > SlicePool::kSliceSize - conn.request_capture_len) {
+            conn.upstream_request_incomplete = true;
+            loop->close_conn(conn);
+            return;
+        }
+        if (send_len != 0)
+            __builtin_memcpy(conn.request_capture_slice + conn.request_capture_len,
+                             conn.recv_buf.data(),
+                             send_len);
+        conn.request_capture_len += send_len;
     }
 
     conn.req_size += send_len;

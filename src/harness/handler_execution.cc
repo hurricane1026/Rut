@@ -46,6 +46,36 @@ bool captured_response_header_is_hop_by_hop(const jit::CapturedResponseHeader& h
            eq_ci("te", 2);
 }
 
+bool captured_response_header_name_is(const jit::CapturedResponseHeader& header,
+                                      const char* expected,
+                                      u32 expected_len) {
+    if (header.name.len != expected_len) return false;
+    for (u32 i = 0; i < expected_len; i++) {
+        char actual = header.name.ptr[i];
+        if (actual >= 'A' && actual <= 'Z') actual = static_cast<char>(actual + ('a' - 'A'));
+        if (actual != expected[i]) return false;
+    }
+    return true;
+}
+
+bool parse_captured_content_length(Str value, u32* out) {
+    if (value.len == 0 || value.ptr == nullptr) return false;
+    u32 parsed = 0;
+    for (u32 i = 0; i < value.len; i++) {
+        const u32 digit = static_cast<u8>(value.ptr[i]) - static_cast<u8>('0');
+        if (digit > 9 || parsed > (0xffffffffu - digit) / 10u) return false;
+        parsed = parsed * 10u + digit;
+    }
+    *out = parsed;
+    return true;
+}
+
+bool request_is_head(const HandlerExecution& execution) {
+    static constexpr char kHeadPrefix[] = "HEAD ";
+    return execution.request_len >= sizeof(kHeadPrefix) - 1 && execution.request_data != nullptr &&
+           __builtin_memcmp(execution.request_data, kHeadPrefix, sizeof(kHeadPrefix) - 1) == 0;
+}
+
 struct EventPublisher {
     const HarnessSpec& spec;
     HarnessResult& result;
@@ -417,6 +447,8 @@ HandlerExecutionResult drive_handler_deterministically(const DeterministicHandle
                 return out;
             }
             u32 captured_bytes = event.data_len;
+            bool has_content_length = false;
+            u32 content_length = 0;
             for (u32 i = 0; i < event.response_header_count; i++) {
                 const auto& header = event.response_headers[i];
                 if (captured_response_header_is_hop_by_hop(header)) {
@@ -425,6 +457,19 @@ HandlerExecutionResult drive_handler_deterministically(const DeterministicHandle
                                 sizeof(out.harness.detail),
                                 "forward completion cannot include hop-by-hop response headers");
                     return out;
+                }
+                if (captured_response_header_name_is(header, "content-length", 14)) {
+                    u32 parsed = 0;
+                    if (!parse_captured_content_length(header.value, &parsed) ||
+                        (has_content_length && parsed != content_length)) {
+                        out.harness.outcome = Outcome::Invalid;
+                        copy_detail(out.harness.detail,
+                                    sizeof(out.harness.detail),
+                                    "forward completion has invalid content-length headers");
+                        return out;
+                    }
+                    has_content_length = true;
+                    content_length = parsed;
                 }
                 if (header.name.len > jit::kMaxCapturedResponseStorageBytes - captured_bytes ||
                     header.value.len >
@@ -448,9 +493,17 @@ HandlerExecutionResult drive_handler_deterministically(const DeterministicHandle
             response.captured_response_status = event.response_status;
             response.captured_response_body = reinterpret_cast<const char*>(event.data);
             response.captured_response_body_len = event.data_len;
-            response.captured_response_header_count = event.response_header_count;
-            for (u32 i = 0; i < event.response_header_count; i++)
-                response.captured_response_headers[i] = event.response_headers[i];
+            response.captured_response_header_count = 0;
+            const bool preserve_content_length =
+                request_is_head(execution) || event.response_status == 304;
+            for (u32 i = 0; i < event.response_header_count; i++) {
+                const auto& header = event.response_headers[i];
+                if (!preserve_content_length &&
+                    captured_response_header_name_is(header, "content-length", 14))
+                    continue;
+                response.captured_response_headers[response.captured_response_header_count++] =
+                    header;
+            }
             event.result = event.response_status;
         }
         if (event_input_bytes > harness.limits.max_input_bytes - out.harness.input_bytes) {
