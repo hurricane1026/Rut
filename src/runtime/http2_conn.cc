@@ -45,8 +45,10 @@ void Http2Conn::init() {
     pending_request_forwardable = false;
     pending_overflow = false;
     pending_preinvoked_forward = false;
+    pending_forward_capture = false;
     pending_preinvoked_timer = false;
     pending_forward_upstream_id = 0;
+    pending_forward_state = 0;
     pending_timer_state = 0;
     pending_timer_ms = 0;
     pending_route_config = nullptr;
@@ -487,8 +489,10 @@ void clear_pending_upload(Http2Conn& c, u32 stream_id) {
     c.pending_request_forwardable = false;
     c.pending_overflow = false;
     c.pending_preinvoked_forward = false;
+    c.pending_forward_capture = false;
     c.pending_preinvoked_timer = false;
     c.pending_forward_upstream_id = 0;
+    c.pending_forward_state = 0;
     c.pending_timer_state = 0;
     c.pending_timer_ms = 0;
     c.pending_route_config = nullptr;

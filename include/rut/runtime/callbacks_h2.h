@@ -302,8 +302,10 @@ inline void h2_clear_pending(Http2Conn& h2) {
     h2.pending_request_forwardable = false;
     h2.pending_overflow = false;
     h2.pending_preinvoked_forward = false;
+    h2.pending_forward_capture = false;
     h2.pending_preinvoked_timer = false;
     h2.pending_forward_upstream_id = 0;
+    h2.pending_forward_state = 0;
     h2.pending_timer_state = 0;
     h2.pending_timer_ms = 0;
     h2.pending_route_config = nullptr;
@@ -979,6 +981,7 @@ void h2_finish_body(H2Dispatch<Loop>& d, u32 stream_id) {
         const RouteConfig* cfg = h2->pending_route_config;
         const RouteEntry* route = h2->pending_route;
         const u16 upstream_id = h2->pending_forward_upstream_id;
+        const bool capture_response = h2->pending_forward_capture;
         const bool preinvoked_timer = h2->pending_preinvoked_timer;
         if (route == nullptr || (!preinvoked_timer && !h2->pending_request_forwardable)) {
             const u16 status = route == nullptr ? 500 : 400;
@@ -1027,11 +1030,19 @@ void h2_finish_body(H2Dispatch<Loop>& d, u32 stream_id) {
                                          cfg,
                                          route,
                                          upstream_id,
-                                         true,
+                                         !capture_response,
+                                         capture_response,
                                          h2->async_jit_ctx(),
                                          h2->pending_synth,
                                          synth_len,
                                          /*ctx_already_parked=*/true);
+            if (suspended && capture_response) {
+                h2->async_fn = route->fn;
+                h2->async_state = h2->pending_forward_state;
+                h2->async_body_start = body_start;
+                h2->async_body_len = body_len;
+                h2->async_inject_content_length_on_forward = inject_content_length_on_forward;
+            }
         }
         if (!suspended) {
             h2_clear_pending(*h2);
@@ -1039,6 +1050,7 @@ void h2_finish_body(H2Dispatch<Loop>& d, u32 stream_id) {
             return;
         }
         h2->pending_preinvoked_forward = false;  // ownership moved to async
+        h2->pending_forward_capture = false;
         h2->pending_preinvoked_timer = false;
         h2_clear_pending(*h2);
         return;
@@ -1271,7 +1283,8 @@ void h2_dispatch_request(H2Dispatch<Loop>& d,
                 const JitDispatchOutcome kOutcome = invoke_jit_handler(
                     route->fn, static_cast<void*>(d.conn), *ctx, synth, kSynthLen, nullptr);
 
-                if (kOutcome.kind == JitDispatchOutcome::Kind::ForwardBuffered) {
+                if (kOutcome.kind == JitDispatchOutcome::Kind::ForwardBuffered ||
+                    kOutcome.kind == JitDispatchOutcome::Kind::ForwardCapture) {
                     if (!h2_proxy_request_forwardable(headers, nheaders)) {
                         jit::release_response_body_mutation_storage(ctx);
                         h2_emit_status(d, stream_id, 400);
@@ -1299,7 +1312,10 @@ void h2_dispatch_request(H2Dispatch<Loop>& d,
                         return;
                     }
                     h2->pending_preinvoked_forward = true;
+                    h2->pending_forward_capture =
+                        kOutcome.kind == JitDispatchOutcome::Kind::ForwardCapture;
                     h2->pending_forward_upstream_id = kOutcome.upstream_id;
+                    h2->pending_forward_state = static_cast<u16>(kOutcome.next_state);
                     return;
                 }
                 if (kOutcome.kind == JitDispatchOutcome::Kind::TimerYield) {

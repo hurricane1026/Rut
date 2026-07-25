@@ -131,8 +131,10 @@ struct Http2Conn {
     // at HEADERS time. Its response mutations live in async_handler_ctx_storage
     // while DATA is collected, so the handler is not invoked twice.
     bool pending_preinvoked_forward;
+    bool pending_forward_capture;
     bool pending_preinvoked_timer;
     u16 pending_forward_upstream_id;
+    u16 pending_forward_state;
     u16 pending_timer_state;
     u32 pending_timer_ms;
     // Snapshot of matched route decisions at END_HEADERS time for deferred
