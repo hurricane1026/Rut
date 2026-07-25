@@ -1706,7 +1706,7 @@ TEST(h2_serving, resumed_timer_defers_body_only_after_selecting_buffered_forward
     h2.async_body_start = sizeof(kSynth) - 1;
     h2.async_wait_for_body_on_forward = true;
 
-    h2_transfer_timer_to_pending_forward(h2, 1, 7);
+    h2_transfer_timer_to_pending_forward(h2, 1, 7, false, 0);
 
     CHECK_EQ(h2.async_stream, 0u);
     CHECK_EQ(h2.pending_stream, 1u);

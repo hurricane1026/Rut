@@ -660,7 +660,8 @@ inline void h2_clear_async(Http2Conn& h2) {
 // still open. Move the stable request bytes and parked HandlerCtx into the
 // pending-body episode; setting async_stream to zero before clearing prevents
 // the old Timer owner from releasing the context's mutation storage.
-inline void h2_transfer_timer_to_pending_forward(Http2Conn& h2, u32 stream_id, u16 upstream_id) {
+inline void h2_transfer_timer_to_pending_forward(
+    Http2Conn& h2, u32 stream_id, u16 upstream_id, bool capture_response, u16 next_state) {
     h2.pending_stream = stream_id;
     h2.pending_body_start = h2.async_body_start;
     h2.pending_synth_len = h2.async_synth_len;
@@ -671,8 +672,10 @@ inline void h2_transfer_timer_to_pending_forward(Http2Conn& h2, u32 stream_id, u
     h2.pending_request_forwardable = true;
     h2.pending_overflow = false;
     h2.pending_preinvoked_forward = true;
+    h2.pending_forward_capture = capture_response;
     h2.pending_preinvoked_timer = false;
     h2.pending_forward_upstream_id = upstream_id;
+    h2.pending_forward_state = next_state;
     h2.pending_route_config = h2.async_cfg;
     h2.pending_route = h2.async_route;
     h2.pending_route_action = RouteAction::JitHandler;
@@ -1766,7 +1769,8 @@ void h2_resume_jit_handler(Loop* loop, Connection& conn) {
         if (!h2_arm_async_timer<Loop>(loop, conn)) loop->close_conn(conn);
         return;
     }
-    if (kOutcome.kind == JitDispatchOutcome::Kind::ForwardBuffered &&
+    if ((kOutcome.kind == JitDispatchOutcome::Kind::ForwardBuffered ||
+         kOutcome.kind == JitDispatchOutcome::Kind::ForwardCapture) &&
         h2->async_request_forwardable && h2->async_wait_for_body_on_forward) {
         // This timer began at HEADERS time while the peer side remained open.
         // Only now that the resumed branch actually selected buffered forwarding
@@ -1775,7 +1779,12 @@ void h2_resume_jit_handler(Loop* loop, Connection& conn) {
         // releasing it; h2_finish_body will move it into the proxy episode.
         conn.pending_handler_fn = nullptr;
         conn.handler_ctx = nullptr;
-        h2_transfer_timer_to_pending_forward(*h2, kStreamId, kOutcome.upstream_id);
+        h2_transfer_timer_to_pending_forward(
+            *h2,
+            kStreamId,
+            kOutcome.upstream_id,
+            kOutcome.kind == JitDispatchOutcome::Kind::ForwardCapture,
+            static_cast<u16>(kOutcome.next_state));
         conn.transition_to_reading_header(&on_h2_data<Loop>);
         loop->submit_recv(conn);
         return;
