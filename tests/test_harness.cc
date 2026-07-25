@@ -1093,6 +1093,42 @@ TEST(harness_handler, captured_response_headers_count_toward_input_limit) {
     CHECK_EQ(result.harness.reached_limit, harness::LimitKind::InputBytes);
 }
 
+TEST(harness_handler, failed_captured_forward_terminates_without_resuming) {
+    for (const bool injected_fault : {false, true}) {
+        harness::HandlerExecution execution{};
+        execution.init(&captured_passthrough_handler, nullptr, nullptr, 0);
+        const harness::DeterministicCompletion completion = {
+            jit::YieldKind::Forward,
+            injected_fault ? 0 : -ECONNRESET,
+            100,
+            1,
+            7,
+            nullptr,
+            0,
+            true,
+            injected_fault,
+            0,
+            nullptr,
+            0,
+        };
+        harness::DeterministicEnvironment environment{};
+        environment.reset(&completion, 1);
+        harness::DeterministicHandlerSpec driver{};
+        driver.execution = execution;
+        driver.environment = &environment;
+        harness::HarnessSpec spec{};
+        spec.layer = harness::ExecutionLayer::Handler;
+
+        const auto result = harness::drive_handler_deterministically(driver, spec);
+        REQUIRE_EQ(result.harness.outcome, harness::Outcome::Passed);
+        REQUIRE(result.has_terminal);
+        CHECK_EQ(result.terminal.action, jit::HandlerAction::ReturnStatus);
+        CHECK_EQ(result.terminal.status_code, 502);
+        CHECK_EQ(result.harness.handler_resumes, 0u);
+        CHECK_FALSE(result.uses_captured_response);
+    }
+}
+
 TEST(harness_connection, reports_and_resets_cleanup_invariants) {
     harness::ConnectionExecution execution{};
     CHECK_EQ(execution.connection.fd, -1);

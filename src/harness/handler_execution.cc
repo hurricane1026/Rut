@@ -414,7 +414,11 @@ HandlerExecutionResult drive_handler_deterministically(const DeterministicHandle
             return out;
         }
         u32 event_input_bytes = event.data_len;
+        bool forward_failed = false;
         if (event.kind == jit::YieldKind::Forward) {
+            forward_failed = event.injected_fault || event.result < 0;
+        }
+        if (event.kind == jit::YieldKind::Forward && !forward_failed) {
             if (event.response_status < 200 || event.response_status > 599 ||
                 event.response_header_count > jit::kMaxCapturedResponseHeaders ||
                 (event.response_header_count != 0 && event.response_headers == nullptr) ||
@@ -561,6 +565,10 @@ HandlerExecutionResult drive_handler_deterministically(const DeterministicHandle
                             static_cast<u64>(event.kind),
                             static_cast<u64>(static_cast<i64>(event.result))))
             return out;
+        if (forward_failed) {
+            result = jit::HandlerResult::make_status(502);
+            break;
+        }
         out.harness.handler_resumes++;
         result = execution.resume(result, event.kind, event.result);
         if (!publisher.emit(ObservationKind::HandlerResumed,
