@@ -11857,6 +11857,9 @@ static FrontendResult<HirTerminator> analyze_response_local_term(const AstStatem
     term.span = stmt.span;
     term.status_code = static_cast<i32>(response->init.int_value);
     term.commit_response_mutations = response->init.bool_value;
+    // Preserve builder identity for nested/loop terminator validation while
+    // keeping the serialized status literal in the terminator.
+    term.local_ref_index = response->ref_index;
     for (u32 fi = 0; fi < response->init.field_inits.len; fi++) {
         const auto& field = response->init.field_inits[fi];
         if (field.value == nullptr || field.value->kind != HirExprKind::StrLit)
@@ -12343,7 +12346,8 @@ static FrontendResult<HirTerminator> analyze_term(const AstStatement& stmt,
                                                   HirRoute* route = nullptr,
                                                   const HirLocal* locals = nullptr,
                                                   u32 local_count = 0,
-                                                  const MatchPayloadBinding* binding = nullptr) {
+                                                  const MatchPayloadBinding* binding = nullptr,
+                                                  bool allow_response_local = false) {
     HirTerminator term{};
     term.span = stmt.span;
     if (stmt.kind == AstStmtKind::ReturnStatus || stmt.kind == AstStmtKind::RespondStatus) {
@@ -12351,6 +12355,8 @@ static FrontendResult<HirTerminator> analyze_term(const AstStatement& stmt,
             for (u32 li = local_count; li > 0; li--) {
                 const auto& local = locals[li - 1];
                 if (!local.name.eq(stmt.name)) continue;
+                if (allow_response_local && local.init.kind == HirExprKind::ResponseInit)
+                    return analyze_response_local_term(stmt, locals, local_count);
                 if (local.type == HirTypeKind::I32 && !local.may_nil && !local.may_error) {
                     const HirExpr* status = &local.init;
                     for (u32 depth = 0; depth <= local_count; depth++) {
@@ -12705,7 +12711,7 @@ static FrontendResult<HirForLoopBranch> analyze_for_branch(
         branch.kind = HirForLoopBranch::Kind::Continue;
         return branch;
     }
-    auto term = analyze_term(stmt, mod, route, locals, local_count, binding);
+    auto term = analyze_term(stmt, mod, route, locals, local_count, binding, true);
     if (!term) return core::make_unexpected(term.error());
     branch.kind = HirForLoopBranch::Kind::Term;
     branch.term = term.value();
@@ -13784,18 +13790,24 @@ static FrontendResult<void> analyze_guard_fail_body(const AstStatement& stmt,
             route->locals[li].name = {};
         }
         body->cond = cond_expr;
-        auto then_term =
-            analyze_term(*stmt.then_stmt, mod, route, then_locals.data, then_locals.len, binding);
+        auto then_term = analyze_term(*stmt.then_stmt,
+                                      mod,
+                                      route,
+                                      then_locals.data,
+                                      then_locals.len,
+                                      binding,
+                                      inside_static_for);
         if (!then_term) return core::make_unexpected(then_term.error());
         if (folds_false) route->locals.len = saved_locals;
-        auto else_term = analyze_term(*stmt.else_stmt, mod, route, locals, local_count, binding);
+        auto else_term = analyze_term(
+            *stmt.else_stmt, mod, route, locals, local_count, binding, inside_static_for);
         if (!else_term) return core::make_unexpected(else_term.error());
         body->then_term = folds_false ? else_term.value() : then_term.value();
         body->else_term = else_term.value();
         return {};
     }
     body->body_kind = HirGuardBody::BodyKind::Direct;
-    auto term = analyze_term(stmt, mod, route, locals, local_count, binding);
+    auto term = analyze_term(stmt, mod, route, locals, local_count, binding, inside_static_for);
     if (!term) return core::make_unexpected(term.error());
     body->direct_term = term.value();
     return {};
@@ -17057,8 +17069,13 @@ static FrontendResult<u32> analyze_for_stmt(const AstStatement& stmt,
                                               ? HirLoopControl::Break
                                               : HirLoopControl::Continue;
             } else if (is_ast_hir_terminator(*bstmt.else_stmt)) {
-                auto fail = analyze_term(
-                    *bstmt.else_stmt, mod, route, route->locals.data, route->locals.len);
+                auto fail = analyze_term(*bstmt.else_stmt,
+                                         mod,
+                                         route,
+                                         route->locals.data,
+                                         route->locals.len,
+                                         nullptr,
+                                         true);
                 if (!fail) return core::make_unexpected(fail.error());
                 guard.fail_term = fail.value();
             } else {
@@ -17165,7 +17182,8 @@ static FrontendResult<u32> analyze_for_stmt(const AstStatement& stmt,
                     FrontendError::UnsupportedSyntax,
                     bstmt.span,
                     lit_str("static for-loop body cannot continue after a route terminator"));
-            auto t = analyze_term(bstmt, mod, route, route->locals.data, route->locals.len);
+            auto t = analyze_term(
+                bstmt, mod, route, route->locals.data, route->locals.len, nullptr, true);
             if (!t) return core::make_unexpected(t.error());
             loop.body.term = t.value();
             loop.body.has_term = true;
@@ -23262,7 +23280,7 @@ static FrontendResult<HirModule*> analyze_file_internal(
                 if (dynamic_response != nullptr) {
                     auto invalid_term = [&](const HirTerminator& term) {
                         if (term.span.start == 0 && term.span.end == 0) return false;
-                        return term.source_kind != HirTerminatorSourceKind::LocalRef ||
+                        return !term.commit_response_mutations ||
                                term.local_ref_index != dynamic_response->ref_index;
                     };
                     auto invalid_guard = [&](const HirGuard& guard) {
@@ -23338,18 +23356,6 @@ static FrontendResult<HirModule*> analyze_file_internal(
                                         &iter_len) &&
                     iter_len != 0)
                     has_guaranteed_loop_terminator = true;
-                if (has_guaranteed_loop_terminator) {
-                    for (u32 li = 0; li < route.locals.len; li++) {
-                        if (route.locals[li].init.kind != HirExprKind::ResponseInit ||
-                            !route.locals[li].init.bool_value)
-                            continue;
-                        return frontend_error(
-                            FrontendError::UnsupportedSyntax,
-                            stmt.span,
-                            lit_str("a dynamically mutated Response builder must be returned "
-                                    "directly"));
-                    }
-                }
                 continue;
             }
             if (stmt.kind == AstStmtKind::Break || stmt.kind == AstStmtKind::Continue) {

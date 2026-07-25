@@ -1530,11 +1530,32 @@ FrontendResult<MirModule*> build_mir(const HirModule& module) {
                         if (!fn.values.push(local_value.value()))
                             return frontend_error(FrontendError::TooManyItems, local.span);
                         const u32 value_index = fn.values.len - 1;
+                        MirValue local_ref{};
+                        local_ref.kind = MirValueKind::LocalRef;
+                        local_ref.type = local_value->type;
+                        local_ref.shape_index = local_value->shape_index;
+                        local_ref.may_nil = local_value->may_nil;
+                        local_ref.may_error = local_value->may_error;
+                        local_ref.local_index = local.ref_index;
+                        local_ref.variant_index = local_value->variant_index;
+                        local_ref.struct_index = local_value->struct_index;
+                        local_ref.tuple_len = local_value->tuple_len;
+                        for (u32 ti = 0; ti < local_value->tuple_len; ti++) {
+                            local_ref.tuple_types[ti] = local_value->tuple_types[ti];
+                            local_ref.tuple_variant_indices[ti] =
+                                local_value->tuple_variant_indices[ti];
+                            local_ref.tuple_struct_indices[ti] =
+                                local_value->tuple_struct_indices[ti];
+                        }
+                        local_ref.error_struct_index = local_value->error_struct_index;
+                        local_ref.error_variant_index = local_value->error_variant_index;
+                        if (!fn.values.push(local_ref))
+                            return frontend_error(FrontendError::TooManyItems, local.span);
                         if (!fail_block.effects.push({value_index, local.span, local.ref_index}))
                             return frontend_error(FrontendError::TooManyItems, local.span);
                         ForLoopCtx::LocalBinding binding{};
                         binding.ref_index = local.ref_index;
-                        binding.value = &fn.values[value_index];
+                        binding.value = &fn.values[fn.values.len - 1];
                         if (!scoped_ctx.locals.push(binding))
                             return frontend_error(FrontendError::TooManyItems, local.span);
                     }

@@ -33116,6 +33116,54 @@ route GET "/x" {
     rir.destroy();
 }
 
+TEST(frontend, guard_failure_condition_reads_materialized_helper_carrier_once) {
+    const char* src = R"rut(
+func duplicate(values: [str]) -> [[str]] => [values, values]
+func inspect(_ groups: [[str]], flag: bool) -> bool => flag
+route GET "/x" {
+    guard false else {
+        if inspect(duplicate(req.queryAll("x")), req.http11) {
+            return 400
+        } else {
+            return 401
+        }
+    }
+    return 200
+}
+)rut";
+    FrontendRirModule rir{};
+    REQUIRE(lower_src_to_rir(src, rir));
+    u32 query_reads = 0;
+    for (u32 bi = 0; bi < rir.module.functions[0].block_count; bi++)
+        for (u32 ii = 0; ii < rir.module.functions[0].blocks[bi].inst_count; ii++)
+            query_reads +=
+                rir.module.functions[0].blocks[bi].insts[ii].op == rir::Opcode::ReqQueryAll;
+    CHECK_EQ(query_reads, 1u);
+    rir.destroy();
+}
+
+TEST(frontend, guaranteed_loop_can_return_mutated_response_builder) {
+    const char* src = R"rut(
+route GET "/x" {
+    let resp = response(200)
+    resp.body = req.path
+    for item in [1] { return resp }
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    REQUIRE(lower_to_rir(mir.value(), rir));
+    CHECK(rir::verify_module(rir.module).ok);
+    rir.destroy();
+}
+
 TEST(frontend, static_loop_loop_control_guard_does_not_supply_route_terminator) {
     const char* src = "route GET \"/x\" { for item in [1] { guard false else { break } } }\n";
     auto lexed = lex(lit(src));
