@@ -12711,8 +12711,22 @@ static FrontendResult<HirForLoopBranch> analyze_for_branch(
         branch.kind = HirForLoopBranch::Kind::Continue;
         return branch;
     }
+    const u32 route_local_count = route->locals.len;
     auto term = analyze_term(stmt, mod, route, locals, local_count, binding, true);
-    if (!term) return core::make_unexpected(term.error());
+    if (!term) {
+        route->locals.len = route_local_count;
+        return core::make_unexpected(term.error());
+    }
+    for (u32 li = route_local_count; li < route->locals.len; li++) {
+        if (!branch.locals.push(route->locals[li])) {
+            route->locals.len = route_local_count;
+            return frontend_error(FrontendError::TooManyItems, stmt.span);
+        }
+    }
+    // These locals are needed only when this branch is selected. Retaining
+    // them on the route would eagerly materialize helper carriers even when a
+    // sibling branch wins.
+    route->locals.len = route_local_count;
     branch.kind = HirForLoopBranch::Kind::Term;
     branch.term = term.value();
     return branch;
@@ -13925,6 +13939,8 @@ static bool hir_expr_conditionally_reads_response_body(const HirExpr& expr) {
     return false;
 }
 
+static bool hir_for_loop_reads_response(const HirForLoop& loop, bool (*reads)(const HirExpr&));
+
 static bool route_control_conditionally_reads_response_body(const HirRoute& route) {
     // Control expressions may point into the route expression arena through
     // intermediate normalization nodes. Scan the arena as well as the rooted
@@ -13950,6 +13966,10 @@ static bool route_control_conditionally_reads_response_body(const HirRoute& rout
         const auto& guard = route.guards[gi];
         if (guard_conditionally_reads_body(guard)) return true;
     }
+    for (u32 fi = 0; fi < route.for_loops.len; fi++)
+        if (hir_for_loop_reads_response(route.for_loops[fi],
+                                        &hir_expr_conditionally_reads_response_body))
+            return true;
     const auto& control = route.control;
     if (control.kind == HirControlKind::If &&
         hir_expr_conditionally_reads_response_body(control.cond))

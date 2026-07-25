@@ -880,7 +880,9 @@ struct HirForLoopBranch {
         Break,
         Continue,
     };
+    static constexpr u32 kMaxLocals = 4;
     Kind kind = Kind::Term;
+    FixedVec<HirLocal, kMaxLocals> locals;
     HirTerminator term{};
 };
 
@@ -1014,9 +1016,10 @@ struct HirForLoopMatchArm {
     bool arm_guard_precedes_prelude = false;
     HirExpr arm_guard{};
     BodyKind body_kind = BodyKind::Direct;
-    // Four source locals plus one hidden carrier used to latch a flattened
-    // source-arm guard across the nested arms in its capture group.
-    static constexpr u32 kMaxLocals = 5;
+    // Four source locals, one source-guard helper carrier, plus one hidden
+    // carrier used to latch a flattened source-arm guard across the nested
+    // arms in its capture group.
+    static constexpr u32 kMaxLocals = 6;
     static constexpr u32 kMaxSourceLocals = 4;
     static constexpr u32 kMaxPreludeGuards = 2;
     FixedVec<HirLocal, kMaxLocals> locals;

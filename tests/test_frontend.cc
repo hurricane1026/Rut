@@ -32673,6 +32673,60 @@ TEST(frontend, mir_lowers_dynamic_json_from_static_for_match_arm_context) {
     rir.destroy();
 }
 
+TEST(frontend, static_for_branch_materializes_helper_json_carriers_at_selected_terminator) {
+    const char* sources[] = {
+        R"rut(
+func envelope(value: str) -> Json {
+    let payload = json({ value: value })
+    payload
+}
+route GET "/x" {
+    for item in [req.path] {
+        if item == "/x" { return 200, envelope(item) } else { return 404 }
+    }
+    return 500
+}
+)rut",
+        R"rut(
+func envelope(value: str) -> Json {
+    let payload = json({ value: value })
+    payload
+}
+route GET "/x" {
+    for item in [req.path] {
+        match item { "/x" => return 200, envelope(item) _ => return 404 }
+    }
+    return 500
+}
+)rut",
+    };
+    for (u32 source_index = 0; source_index < 2; source_index++) {
+        const char* src = sources[source_index];
+        auto lexed = lex(lit(src));
+        REQUIRE(lexed);
+        auto ast = parse_file_heap(lexed.value());
+        REQUIRE(ast);
+        auto hir = analyze_file_heap(ast.value());
+        REQUIRE(hir);
+        const auto& body = hir->routes[0].for_loops[0].body;
+        const auto& branch =
+            source_index == 0 ? body.ifs[0].then_branch : body.matches[0].arms[0].direct_branch;
+        REQUIRE(branch.locals.len != 0);
+        bool found_helper_local = false;
+        for (u32 li = 0; li < branch.locals.len; li++)
+            found_helper_local |= branch.locals[li].name.eq(lit("$helper_local"));
+        CHECK(found_helper_local);
+        for (u32 li = 0; li < hir->routes[0].locals.len; li++)
+            CHECK_FALSE(hir->routes[0].locals[li].name.eq(lit("$helper_local")));
+        auto mir = build_mir_heap(hir.value());
+        REQUIRE(mir);
+        FrontendRirModule rir{};
+        REQUIRE(lower_to_rir(mir.value(), rir));
+        CHECK(rir::verify_module(rir.module).ok);
+        rir.destroy();
+    }
+}
+
 TEST(frontend, nested_conditional_break_does_not_make_outer_loop_unconditionally_terminate) {
     const char* src =
         "route GET \"/x\" { for outer in [1] { for inner in [0] { guard inner > 0 else { break } "
@@ -33665,10 +33719,12 @@ route GET "/x" {
 
 TEST(frontend, flattened_match_arm_reserves_hidden_guard_latch) {
     const char* src = R"rut(
+func duplicate(values: [str]) -> [[str]] => [values, values]
+func inspect(_ groups: [[str]], flag: bool) -> bool => flag
 route GET "/x" {
     for item in [1] {
         match item {
-            1 if req.http11 => {
+            1 if inspect(duplicate(req.queryAll("x")), req.http11) => {
                 let a = 1
                 let b = 2
                 let c = 3

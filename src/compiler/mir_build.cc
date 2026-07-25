@@ -1472,6 +1472,16 @@ FrontendResult<MirModule*> build_mir(const HirModule& module) {
                 return frontend_error(FrontendError::TooManyItems, local.span);
             return {};
         };
+        auto set_for_branch_term = [&](MirBlock* out,
+                                       const HirForLoopBranch& branch,
+                                       const ForLoopCtx* ctx = nullptr) -> FrontendResult<void> {
+            for (u32 li = 0; li < branch.locals.len; li++) {
+                auto local = set_branch_local(out, branch.locals[li], ctx);
+                if (!local) return core::make_unexpected(local.error());
+            }
+            set_term_from_hir(&out->term, branch.term, ctx);
+            return {};
+        };
         auto guard_fail_block_count = [&](const HirGuard& guard) -> u32 {
             if (guard.fail_kind == HirGuard::FailKind::Term) return 1;
             if (guard.fail_kind == HirGuard::FailKind::LoopControl) return 1;
@@ -3396,13 +3406,17 @@ FrontendResult<MirModule*> build_mir(const HirModule& module) {
                 const ForLoopCtx* terminating_ctx = route_step_ctx(steps[terminating_step_index]);
                 MirBlock then_block{};
                 then_block.label = then_label();
-                set_term_from_hir(&then_block.term, body_if.then_branch.term, terminating_ctx);
+                auto then_term =
+                    set_for_branch_term(&then_block, body_if.then_branch, terminating_ctx);
+                if (!then_term) return core::make_unexpected(then_term.error());
                 if (!fn.blocks.push(then_block))
                     return frontend_error(FrontendError::TooManyItems, fn.span);
 
                 MirBlock else_block{};
                 else_block.label = else_label();
-                set_term_from_hir(&else_block.term, body_if.else_branch.term, terminating_ctx);
+                auto else_term =
+                    set_for_branch_term(&else_block, body_if.else_branch, terminating_ctx);
+                if (!else_term) return core::make_unexpected(else_term.error());
                 if (!fn.blocks.push(else_block))
                     return frontend_error(FrontendError::TooManyItems, fn.span);
             } else if (has_terminating_step &&
@@ -3438,7 +3452,8 @@ FrontendResult<MirModule*> build_mir(const HirModule& module) {
                         out->term.then_block = body_match_then_index[arm_index];
                         out->term.else_block = body_match_else_index[arm_index];
                     } else {
-                        set_term_from_hir(&out->term, arm.direct_branch.term, body_ctx);
+                        auto term = set_for_branch_term(out, arm.direct_branch, body_ctx);
+                        if (!term) return core::make_unexpected(term.error());
                     }
                     return {};
                 };
@@ -3510,15 +3525,17 @@ FrontendResult<MirModule*> build_mir(const HirModule& module) {
                             for_loop_match_arm_ctx(body_match.arms[ai], ai, terminating_ctx);
                         MirBlock then_block{};
                         then_block.label = then_label();
-                        set_term_from_hir(
-                            &then_block.term, body_match.arms[ai].then_branch.term, body_ctx);
+                        auto then_term = set_for_branch_term(
+                            &then_block, body_match.arms[ai].then_branch, body_ctx);
+                        if (!then_term) return core::make_unexpected(then_term.error());
                         if (!fn.blocks.push(then_block))
                             return frontend_error(FrontendError::TooManyItems, fn.span);
 
                         MirBlock else_block{};
                         else_block.label = else_label();
-                        set_term_from_hir(
-                            &else_block.term, body_match.arms[ai].else_branch.term, body_ctx);
+                        auto else_term = set_for_branch_term(
+                            &else_block, body_match.arms[ai].else_branch, body_ctx);
+                        if (!else_term) return core::make_unexpected(else_term.error());
                         if (!fn.blocks.push(else_block))
                             return frontend_error(FrontendError::TooManyItems, fn.span);
                     }
@@ -3758,14 +3775,16 @@ FrontendResult<MirModule*> build_mir(const HirModule& module) {
                 if (body_if.then_branch.kind == HirForLoopBranch::Kind::Term) {
                     MirBlock then_term{};
                     then_term.label = then_label();
-                    set_term_from_hir(&then_term.term, body_if.then_branch.term, step_ctx);
+                    auto lowered = set_for_branch_term(&then_term, body_if.then_branch, step_ctx);
+                    if (!lowered) return core::make_unexpected(lowered.error());
                     if (!fn.blocks.push(then_term))
                         return frontend_error(FrontendError::TooManyItems, fn.span);
                 }
                 if (body_if.else_branch.kind == HirForLoopBranch::Kind::Term) {
                     MirBlock else_term{};
                     else_term.label = else_label();
-                    set_term_from_hir(&else_term.term, body_if.else_branch.term, step_ctx);
+                    auto lowered = set_for_branch_term(&else_term, body_if.else_branch, step_ctx);
+                    if (!lowered) return core::make_unexpected(lowered.error());
                     if (!fn.blocks.push(else_term))
                         return frontend_error(FrontendError::TooManyItems, fn.span);
                 }
@@ -4017,21 +4036,24 @@ FrontendResult<MirModule*> build_mir(const HirModule& module) {
                         arm.direct_branch.kind == HirForLoopBranch::Kind::Term) {
                         MirBlock term{};
                         term.label = cont_label();
-                        set_term_from_hir(&term.term, arm.direct_branch.term, body_ctx);
+                        auto lowered = set_for_branch_term(&term, arm.direct_branch, body_ctx);
+                        if (!lowered) return core::make_unexpected(lowered.error());
                         if (!fn.blocks.push(term))
                             return frontend_error(FrontendError::TooManyItems, fn.span);
                     } else if (arm.body_kind == HirForLoopMatchArm::BodyKind::If) {
                         if (arm.then_branch.kind == HirForLoopBranch::Kind::Term) {
                             MirBlock term{};
                             term.label = then_label();
-                            set_term_from_hir(&term.term, arm.then_branch.term, body_ctx);
+                            auto lowered = set_for_branch_term(&term, arm.then_branch, body_ctx);
+                            if (!lowered) return core::make_unexpected(lowered.error());
                             if (!fn.blocks.push(term))
                                 return frontend_error(FrontendError::TooManyItems, fn.span);
                         }
                         if (arm.else_branch.kind == HirForLoopBranch::Kind::Term) {
                             MirBlock term{};
                             term.label = else_label();
-                            set_term_from_hir(&term.term, arm.else_branch.term, body_ctx);
+                            auto lowered = set_for_branch_term(&term, arm.else_branch, body_ctx);
+                            if (!lowered) return core::make_unexpected(lowered.error());
                             if (!fn.blocks.push(term))
                                 return frontend_error(FrontendError::TooManyItems, fn.span);
                         }
