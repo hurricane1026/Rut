@@ -717,8 +717,8 @@ struct RouteConfig {
                          u8 method,
                          jit::HandlerFn fn,
                          bool needs_req_body = false,
-                         bool needs_control_plane_snapshot = false,
-                         bool can_forward_buffered = false) {
+                         bool can_forward_buffered = false,
+                         bool needs_control_plane_snapshot = false) {
         if (route_count >= kMaxRoutes) return false;
         if (fn == nullptr) return false;
         if (!is_routable_path(path)) return false;

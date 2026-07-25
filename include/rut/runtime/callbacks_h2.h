@@ -490,7 +490,7 @@ void h2_emit_outcome(H2Dispatch<Loop>& d,
     // Header values are non-owning Str views and are encoded only after the
     // list is complete, so storage synthesized below must span the emit call.
     char content_length[10];
-    static constexpr u32 kCapturedNameStorageBytes = 8192;
+    static constexpr u32 kCapturedNameStorageBytes = Http2Conn::kBodySynthCap;
     char captured_name_storage[kCapturedNameStorageBytes];
     u32 captured_name_cursor = 0;
     u32 nhdrs = 0;
@@ -577,7 +577,11 @@ void h2_emit_outcome(H2Dispatch<Loop>& d,
         }
     }
     const bool status_forbids_body = h2_response_status_forbids_body(o.status_code);
-    if (o.dynamic_response_body != nullptr && !status_forbids_body) {
+    const bool preserve_absent_captured_content_type = o.uses_captured_response &&
+                                                       o.response_ctx != nullptr &&
+                                                       !o.response_ctx->response_body_mutation_set;
+    if (o.dynamic_response_body != nullptr && !status_forbids_body &&
+        !preserve_absent_captured_content_type) {
         bool has_content_type = false;
         for (u32 i = 0; i < nhdrs; i++) {
             if (http_header_name_eq_ci(hdrs[i].name.ptr, hdrs[i].name.len, "content-type", 12)) {
@@ -1278,6 +1282,7 @@ void h2_dispatch_request(H2Dispatch<Loop>& d,
                     return;
                 }
                 auto* ctx = d.conn->reset_jit_ctx();
+                if (route->needs_control_plane_snapshot) latch_control_plane_snapshot(d.loop, ctx);
                 ctx->state = 0;
                 ctx->resume_event_kind = static_cast<u32>(jit::YieldKind::Timer);
                 ctx->resume_event_result = 0;

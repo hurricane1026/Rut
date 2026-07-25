@@ -1556,6 +1556,12 @@ u64 h2_buffered_forward(void*, jit::HandlerCtx*, const u8*, u32, void*) {
     return jit::HandlerResult::make_buffered_forward(0).pack();
 }
 
+bool h2_preinvoke_saw_control_plane_snapshot = false;
+u64 h2_snapshot_then_buffered_forward(void*, jit::HandlerCtx* ctx, const u8*, u32, void*) {
+    h2_preinvoke_saw_control_plane_snapshot = ctx->control_plane.valid;
+    return jit::HandlerResult::make_buffered_forward(0).pack();
+}
+
 u32 h2_buffered_timer_calls = 0;
 u64 h2_buffered_timer(void*, jit::HandlerCtx*, const u8*, u32, void*) {
     h2_buffered_timer_calls++;
@@ -1600,8 +1606,8 @@ TEST(h2_serving, body_independent_local_branch_avoids_buffered_forward_cap) {
                                    kRouteMethodPost,
                                    &h2_status_204,
                                    /*needs_req_body=*/false,
-                                   /*needs_control_plane_snapshot=*/false,
-                                   /*can_forward_buffered=*/true));
+                                   /*can_forward_buffered=*/true,
+                                   /*needs_control_plane_snapshot=*/false));
     conn.request_config = &config;
     FakeH2Loop loop;
     u8 response[512]{};
@@ -1627,8 +1633,8 @@ TEST(h2_serving, selected_buffered_forward_defers_and_buffers_data) {
                                    kRouteMethodPost,
                                    &h2_buffered_forward,
                                    /*needs_req_body=*/false,
-                                   /*needs_control_plane_snapshot=*/false,
-                                   /*can_forward_buffered=*/true));
+                                   /*can_forward_buffered=*/true,
+                                   /*needs_control_plane_snapshot=*/false));
     conn.request_config = &config;
     FakeH2Loop loop;
     u8 response[512]{};
@@ -1652,6 +1658,37 @@ TEST(h2_serving, selected_buffered_forward_defers_and_buffers_data) {
     h2_clear_async(h2);
 }
 
+TEST(h2_serving, buffered_forward_preinvoke_latches_control_plane_snapshot) {
+    const hpack::Header headers[] = {{{":method", 7}, {"POST", 4}},
+                                     {{":path", 5}, {"/upload", 7}},
+                                     {{":scheme", 7}, {"https", 5}},
+                                     {{":authority", 10}, {"example", 7}}};
+    Http2Conn h2;
+    h2.init();
+    Connection conn;
+    conn.reset();
+    conn.h2 = &h2;
+    RouteConfig config;
+    REQUIRE(config.add_jit_handler("/upload",
+                                   kRouteMethodPost,
+                                   &h2_snapshot_then_buffered_forward,
+                                   /*needs_req_body=*/false,
+                                   /*can_forward_buffered=*/true,
+                                   /*needs_control_plane_snapshot=*/true));
+    conn.request_config = &config;
+    ShardMetrics metrics;
+    FakeH2Loop loop;
+    loop.metrics = &metrics;
+    u8 response[512]{};
+    H2Dispatch<FakeH2Loop> dispatch{&loop, &conn, response, sizeof(response), 0, false};
+
+    h2_preinvoke_saw_control_plane_snapshot = false;
+    h2_dispatch_request(dispatch, 1, headers, 4, /*end_stream=*/false);
+    CHECK(h2_preinvoke_saw_control_plane_snapshot);
+    CHECK_EQ(h2.pending_stream, 1u);
+    h2_clear_pending(h2);
+}
+
 TEST(h2_serving, body_independent_timer_starts_before_upload_completion) {
     const hpack::Header headers[] = {{{":method", 7}, {"POST", 4}},
                                      {{":path", 5}, {"/upload", 7}},
@@ -1667,8 +1704,8 @@ TEST(h2_serving, body_independent_timer_starts_before_upload_completion) {
                                    kRouteMethodPost,
                                    &h2_buffered_timer,
                                    /*needs_req_body=*/false,
-                                   /*needs_control_plane_snapshot=*/false,
-                                   /*can_forward_buffered=*/true));
+                                   /*can_forward_buffered=*/true,
+                                   /*needs_control_plane_snapshot=*/false));
     conn.request_config = &config;
     FakeH2Loop loop;
     u8 response[512]{};
@@ -1927,6 +1964,95 @@ TEST(h2_serving, captured_304_content_length_is_removed_for_final_200) {
         if (decoded[i].name.eq(Str{"content-length", 14}))
             CHECK_FALSE(decoded[i].value.eq(Str{"123", 3}));
     }
+}
+
+TEST(h2_serving, captured_body_preserves_absent_content_type) {
+    Http2Conn h2;
+    h2.init();
+    Connection conn;
+    conn.reset();
+    conn.h2 = &h2;
+    FakeH2Loop loop;
+    u8 response[512]{};
+    H2Dispatch<FakeH2Loop> dispatch{&loop, &conn, response, sizeof(response), 0, false};
+    jit::HandlerCtx response_ctx{};
+    response_ctx.captured_response_valid = true;
+    static constexpr char kBody[] = "data";
+    JitDispatchOutcome outcome{};
+    outcome.kind = JitDispatchOutcome::Kind::ReturnStatus;
+    outcome.status_code = 200;
+    outcome.dynamic_response_body = kBody;
+    outcome.dynamic_response_body_len = sizeof(kBody) - 1;
+    outcome.response_ctx = &response_ctx;
+    outcome.uses_captured_response = true;
+
+    h2_emit_outcome(dispatch, 1, outcome, nullptr, false);
+
+    Http2FrameHeader frame{};
+    REQUIRE(parse_frame_header(response, dispatch.resp_len, &frame) == ParseStatus::Complete);
+    hpack::DynamicTable dyn;
+    dyn.init(4096);
+    hpack::Header decoded[8];
+    u8 scratch[256];
+    u32 count = 0;
+    REQUIRE(hpack::decode_header_block(dyn,
+                                       response + kFrameHeaderSize,
+                                       frame.length,
+                                       scratch,
+                                       sizeof(scratch),
+                                       decoded,
+                                       8,
+                                       &count));
+    for (u32 i = 0; i < count; i++) CHECK_FALSE(decoded[i].name.eq(Str{"content-type", 12}));
+}
+
+TEST(h2_serving, captured_header_names_use_full_capture_budget) {
+    Http2Conn h2;
+    h2.init();
+    Connection conn;
+    conn.reset();
+    conn.h2 = &h2;
+    FakeH2Loop loop;
+    u8 response[Http2Conn::kBodySynthCap]{};
+    H2Dispatch<FakeH2Loop> dispatch{&loop, &conn, response, sizeof(response), 0, false};
+    static constexpr u32 kHeaderCount = 64;
+    static constexpr u32 kNameLen = 140;
+    char names[kHeaderCount][kNameLen];
+    jit::CapturedResponseHeader captured_headers[kHeaderCount];
+    for (u32 hi = 0; hi < kHeaderCount; hi++) {
+        for (u32 ni = 0; ni < kNameLen; ni++) names[hi][ni] = 'X';
+        captured_headers[hi] = {{names[hi], kNameLen}, {"v", 1}};
+    }
+    jit::HandlerCtx response_ctx{};
+    response_ctx.captured_response_valid = true;
+    response_ctx.captured_response_header_count = kHeaderCount;
+    response_ctx.captured_response_headers = captured_headers;
+    JitDispatchOutcome outcome{};
+    outcome.kind = JitDispatchOutcome::Kind::ReturnStatus;
+    outcome.status_code = 200;
+    outcome.response_ctx = &response_ctx;
+    outcome.uses_captured_response = true;
+
+    h2_emit_outcome(dispatch, 1, outcome, nullptr, false);
+
+    Http2FrameHeader frame{};
+    REQUIRE(parse_frame_header(response, dispatch.resp_len, &frame) == ParseStatus::Complete);
+    hpack::DynamicTable dyn;
+    dyn.init(4096);
+    hpack::Header decoded[kHeaderCount + 1];
+    u8 scratch[Http2Conn::kBodySynthCap];
+    u32 count = 0;
+    REQUIRE(hpack::decode_header_block(dyn,
+                                       response + kFrameHeaderSize,
+                                       frame.length,
+                                       scratch,
+                                       sizeof(scratch),
+                                       decoded,
+                                       kHeaderCount + 1,
+                                       &count));
+    REQUIRE_GT(count, 0u);
+    CHECK(decoded[0].name.eq(Str{":status", 7}));
+    CHECK(decoded[0].value.eq(Str{"200", 3}));
 }
 
 TEST(h2_serving, captured_head_body_replacement_has_one_content_length) {

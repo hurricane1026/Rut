@@ -1700,10 +1700,11 @@ void handle_jit_outcome(Loop* loop,
             // HEAD and bodyless statuses must take the header-aware formatter even
             // when mutations removed every effective header.  The simpler body
             // formatters below always write their supplied payload.
-            if (header_count != 0 || captured_head || status_forbids_body) {
+            if (header_count != 0 || outcome.uses_captured_response || captured_head ||
+                status_forbids_body) {
                 const char* body_data = nullptr;
                 u32 body_len = 0;
-                bool body_is_fallback = false;
+                bool body_is_fallback = outcome.uses_captured_response && !body_mutated;
                 if (has_dynamic_body) {
                     body_data = outcome.dynamic_response_body;
                     body_len = outcome.dynamic_response_body_len;

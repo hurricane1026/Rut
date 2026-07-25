@@ -17143,6 +17143,31 @@ TEST(response_headers, captured_304_preserves_representation_content_length) {
     CHECK(buf_contains(wire, conn->send_buf.len(), "Content-Length: 123\r\n", 21));
 }
 
+TEST(response_headers, captured_body_preserves_absent_content_type) {
+    SmallLoop loop;
+    loop.setup();
+    loop.inject_and_dispatch(make_ev(0, IoEventType::Accept, 42));
+    auto* conn = loop.find_fd(42);
+    REQUIRE(conn != nullptr);
+
+    jit::HandlerCtx response_ctx{};
+    response_ctx.captured_response_valid = true;
+    static constexpr char kBody[] = "data";
+    JitDispatchOutcome outcome{};
+    outcome.kind = JitDispatchOutcome::Kind::ReturnStatus;
+    outcome.status_code = 200;
+    outcome.dynamic_response_body = kBody;
+    outcome.dynamic_response_body_len = sizeof(kBody) - 1;
+    outcome.response_ctx = &response_ctx;
+    outcome.uses_captured_response = true;
+    handle_jit_outcome<SmallLoop>(
+        &loop, *conn, outcome, &state_invariant_wait_recv_then_status, true);
+
+    const char* wire = reinterpret_cast<const char*>(conn->send_buf.data());
+    CHECK_FALSE(buf_contains(wire, conn->send_buf.len(), "Content-Type:", 13));
+    CHECK(buf_contains(wire, conn->send_buf.len(), "\r\n\r\ndata", 8));
+}
+
 int main(int argc, char** argv) {
     return rut::test::run_all(argc, argv);
 }

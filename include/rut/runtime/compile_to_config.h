@@ -167,8 +167,8 @@ inline bool register_jit_routes(RouteConfig& cfg, const rir::Module& mod, jit::J
                                  fn.http_method,
                                  handler,
                                  rir_function_needs_req_body(fn),
-                                 rir_function_needs_control_plane_snapshot(fn),
-                                 rir_function_can_forward_buffered(fn)))
+                                 rir_function_can_forward_buffered(fn),
+                                 rir_function_needs_control_plane_snapshot(fn)))
             return false;
         // @rateLimit decorators → stacked token-bucket rules, each with its own
         // metering key (the route just added is at index route_count - 1).
