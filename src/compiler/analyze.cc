@@ -14052,13 +14052,23 @@ static bool guard_failure_reads_response(const HirGuard& guard, ResponseReadPred
 static bool hir_for_loop_reads_response(const HirForLoop& loop, ResponseReadPredicate reads) {
     if (reads(loop.iter_expr)) return true;
     const auto& body = loop.body;
+    const auto branch_reads = [reads](const HirForLoopBranch& branch) {
+        for (u32 li = 0; li < branch.locals.len; li++)
+            if (reads(branch.locals[li].init)) return true;
+        return false;
+    };
     for (u32 li = 0; li < body.locals.len; li++)
         if (reads(body.locals[li].init)) return true;
+    for (u32 li = 0; li < body.term_locals.len; li++)
+        if (reads(body.term_locals[li].init)) return true;
     for (u32 gi = 0; gi < body.guards.len; gi++)
         if (reads(body.guards[gi].cond) || guard_failure_reads_response(body.guards[gi], reads))
             return true;
-    for (u32 ii = 0; ii < body.ifs.len; ii++)
-        if (reads(body.ifs[ii].cond)) return true;
+    for (u32 ii = 0; ii < body.ifs.len; ii++) {
+        if (reads(body.ifs[ii].cond) || branch_reads(body.ifs[ii].then_branch) ||
+            branch_reads(body.ifs[ii].else_branch))
+            return true;
+    }
     for (u32 mi = 0; mi < body.matches.len; mi++) {
         const auto& match = body.matches[mi];
         if (reads(match.match_expr)) return true;
@@ -14072,6 +14082,9 @@ static bool hir_for_loop_reads_response(const HirForLoop& loop, ResponseReadPred
                 if (reads(arm.guards[gi].cond) ||
                     guard_failure_reads_response(arm.guards[gi], reads))
                     return true;
+            if (branch_reads(arm.then_branch) || branch_reads(arm.else_branch) ||
+                branch_reads(arm.direct_branch))
+                return true;
         }
     }
     return false;

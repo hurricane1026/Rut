@@ -1405,6 +1405,12 @@ private:
         rebase_expr(guard.fail_body.cond, other);
     }
 
+    void rebase_for_branch(HirForLoopBranch& branch, const HirRoute& other) {
+        for (u32 li = 0; li < branch.locals.len; li++) {
+            rebase_expr(branch.locals[li].init, other);
+        }
+    }
+
     void rebase_from(const HirRoute& other) {
         for (u32 i = 0; i < exprs.len; i++) rebase_expr(exprs[i], other);
         for (u32 i = 0; i < locals.len; i++) rebase_expr(locals[i].init, other);
@@ -1426,6 +1432,8 @@ private:
             }
             for (u32 ii = 0; ii < for_loops[i].body.ifs.len; ii++) {
                 rebase_expr(for_loops[i].body.ifs[ii].cond, other);
+                rebase_for_branch(for_loops[i].body.ifs[ii].then_branch, other);
+                rebase_for_branch(for_loops[i].body.ifs[ii].else_branch, other);
             }
             for (u32 mi = 0; mi < for_loops[i].body.matches.len; mi++) {
                 rebase_expr(for_loops[i].body.matches[mi].match_expr, other);
@@ -1439,6 +1447,9 @@ private:
                         rebase_guard(for_loops[i].body.matches[mi].arms[ai].guards[gi], other);
                     }
                     rebase_expr(for_loops[i].body.matches[mi].arms[ai].cond, other);
+                    rebase_for_branch(for_loops[i].body.matches[mi].arms[ai].then_branch, other);
+                    rebase_for_branch(for_loops[i].body.matches[mi].arms[ai].else_branch, other);
+                    rebase_for_branch(for_loops[i].body.matches[mi].arms[ai].direct_branch, other);
                 }
             }
         }

@@ -32713,9 +32713,29 @@ route GET "/x" {
             source_index == 0 ? body.ifs[0].then_branch : body.matches[0].arms[0].direct_branch;
         REQUIRE(branch.locals.len != 0);
         bool found_helper_local = false;
+        bool found_rebased_pointer = false;
+        const HirExpr* expr_begin = hir->routes[0].exprs.data;
+        const HirExpr* expr_end = expr_begin + hir->routes[0].exprs.len;
+        const auto check_rebased = [&](const auto& self, const HirExpr& expr) -> void {
+            const auto check_ptr = [&](const HirExpr* ptr) {
+                if (ptr == nullptr) return;
+                found_rebased_pointer = true;
+                CHECK(ptr >= expr_begin);
+                CHECK(ptr < expr_end);
+                self(self, *ptr);
+            };
+            check_ptr(expr.lhs);
+            check_ptr(expr.rhs);
+            for (u32 ai = 0; ai < expr.args.len; ai++) check_ptr(expr.args[ai]);
+            for (u32 fi = 0; fi < expr.field_inits.len; fi++) check_ptr(expr.field_inits[fi].value);
+        };
         for (u32 li = 0; li < branch.locals.len; li++)
-            found_helper_local |= branch.locals[li].name.eq(lit("$helper_local"));
+            if (branch.locals[li].name.eq(lit("$helper_local"))) {
+                found_helper_local = true;
+                check_rebased(check_rebased, branch.locals[li].init);
+            }
         CHECK(found_helper_local);
+        CHECK(found_rebased_pointer);
         for (u32 li = 0; li < hir->routes[0].locals.len; li++)
             CHECK_FALSE(hir->routes[0].locals[li].name.eq(lit("$helper_local")));
         auto mir = build_mir_heap(hir.value());
