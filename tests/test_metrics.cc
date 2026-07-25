@@ -202,16 +202,18 @@ TEST(aggregate, handler_snapshot_is_value_only_and_latched) {
     jit::HandlerCtx ctx{};
 
     latch_control_plane_snapshot(&loop, &ctx);
-    REQUIRE(ctx.control_plane.valid);
-    CHECK_EQ(ctx.control_plane.shard_id, 3u);
-    CHECK_EQ(ctx.control_plane.shard_count, 2u);
-    CHECK_EQ(ctx.control_plane.stats.requests_total, 10u);
-    CHECK_EQ(ctx.control_plane.metrics.requests_total, 30u);
+    REQUIRE(ctx.control_plane != nullptr);
+    REQUIRE(ctx.control_plane->valid);
+    CHECK_EQ(ctx.control_plane->shard_id, 3u);
+    CHECK_EQ(ctx.control_plane->shard_count, 2u);
+    CHECK_EQ(ctx.control_plane->stats.requests_total, 10u);
+    CHECK_EQ(ctx.control_plane->metrics.requests_total, 30u);
 
     local.requests_total = 100;
     other.requests_total = 200;
-    CHECK_EQ(ctx.control_plane.stats.requests_total, 10u);
-    CHECK_EQ(ctx.control_plane.metrics.requests_total, 30u);
+    CHECK_EQ(ctx.control_plane->stats.requests_total, 10u);
+    CHECK_EQ(ctx.control_plane->metrics.requests_total, 30u);
+    jit::release_response_body_mutation_storage(&ctx);
 }
 
 TEST(aggregate, handler_snapshot_refreshes_runtime_memory_gauges) {
@@ -236,11 +238,13 @@ TEST(aggregate, handler_snapshot_refreshes_runtime_memory_gauges) {
 
     latch_control_plane_snapshot(&loop, &ctx);
 
-    REQUIRE(ctx.control_plane.valid);
-    CHECK_EQ(ctx.control_plane.stats.memory_arena_used, 4096u);
-    CHECK_EQ(ctx.control_plane.stats.memory_slices_used, 7u);
-    CHECK_EQ(ctx.control_plane.stats.memory_slices_free, 11u);
-    CHECK_EQ(ctx.control_plane.stats.memory_connections_used, 3u);
+    REQUIRE(ctx.control_plane != nullptr);
+    REQUIRE(ctx.control_plane->valid);
+    CHECK_EQ(ctx.control_plane->stats.memory_arena_used, 4096u);
+    CHECK_EQ(ctx.control_plane->stats.memory_slices_used, 7u);
+    CHECK_EQ(ctx.control_plane->stats.memory_slices_free, 11u);
+    CHECK_EQ(ctx.control_plane->stats.memory_connections_used, 3u);
+    jit::release_response_body_mutation_storage(&ctx);
 }
 
 TEST(aggregate, owner_shards_publish_memory_before_process_snapshot) {
@@ -274,11 +278,13 @@ TEST(aggregate, owner_shards_publish_memory_before_process_snapshot) {
 
     jit::HandlerCtx ctx{};
     latch_control_plane_snapshot(&owners[0], &ctx);
-    REQUIRE(ctx.control_plane.valid);
-    CHECK_EQ(ctx.control_plane.metrics.memory_arena_used, 3072u);
-    CHECK_EQ(ctx.control_plane.metrics.memory_slices_used, 14u);
-    CHECK_EQ(ctx.control_plane.metrics.memory_slices_free, 18u);
-    CHECK_EQ(ctx.control_plane.metrics.memory_connections_used, 24u);
+    REQUIRE(ctx.control_plane != nullptr);
+    REQUIRE(ctx.control_plane->valid);
+    CHECK_EQ(ctx.control_plane->metrics.memory_arena_used, 3072u);
+    CHECK_EQ(ctx.control_plane->metrics.memory_slices_used, 14u);
+    CHECK_EQ(ctx.control_plane->metrics.memory_slices_free, 18u);
+    CHECK_EQ(ctx.control_plane->metrics.memory_connections_used, 24u);
+    jit::release_response_body_mutation_storage(&ctx);
 }
 
 // === Callback + proxy integration ===

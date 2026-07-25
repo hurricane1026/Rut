@@ -26184,6 +26184,20 @@ TEST(frontend, bounded_static_for_rejects_runtime_iterators_and_cfg_overflow) {
     CHECK(overflow_mir.error().detail.eq(lit("static for-loop block budget exceeded")));
 }
 
+TEST(frontend, bounded_static_for_scan_stops_at_shadowing_local) {
+    const char* src =
+        "route GET \"/x\" { let items = req.queryAll(\"x\") let items = [\"fixed\"] "
+        "for item in items { return 200 } return 500 }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+}
+
 TEST(frontend, bounded_static_for_direct_break_and_continue_verify_cfg) {
     const char* src =
         "route GET \"/continue\" { for item in [1, 2, 3] { continue } return 204 }\n"

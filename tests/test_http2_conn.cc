@@ -1558,7 +1558,8 @@ u64 h2_buffered_forward(void*, jit::HandlerCtx*, const u8*, u32, void*) {
 
 bool h2_preinvoke_saw_control_plane_snapshot = false;
 u64 h2_snapshot_then_buffered_forward(void*, jit::HandlerCtx* ctx, const u8*, u32, void*) {
-    h2_preinvoke_saw_control_plane_snapshot = ctx->control_plane.valid;
+    h2_preinvoke_saw_control_plane_snapshot =
+        ctx->control_plane != nullptr && ctx->control_plane->valid;
     return jit::HandlerResult::make_buffered_forward(0).pack();
 }
 

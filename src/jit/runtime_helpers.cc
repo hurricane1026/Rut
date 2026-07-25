@@ -311,13 +311,13 @@ void rut_helper_json_append_control_plane(void* ctx, u8 kind) {
         t_json_response.ok = false;
         return;
     }
-    const auto& snapshot = static_cast<const jit::HandlerCtx*>(ctx)->control_plane;
-    if (!snapshot.valid) {
+    const auto* snapshot = static_cast<const jit::HandlerCtx*>(ctx)->control_plane;
+    if (snapshot == nullptr || !snapshot->valid) {
         t_json_response.ok = false;
         return;
     }
     const bool stats = kind == static_cast<u8>(jit::ControlPlaneJsonKind::Stats);
-    const auto& values = stats ? snapshot.stats : snapshot.metrics;
+    const auto& values = stats ? snapshot->stats : snapshot->metrics;
     auto append_literal = []<size_t N>(const char (&literal)[N]) {
         json_append(literal, static_cast<u32>(N - 1));
     };
@@ -326,10 +326,10 @@ void rut_helper_json_append_control_plane(void* ctx, u8 kind) {
     else
         append_literal("{\"scope\":\"process\",\"shard_count\":");
     if (stats) {
-        json_append_u64(snapshot.shard_id);
+        json_append_u64(snapshot->shard_id);
         append_literal(",\"shard_count\":");
     }
-    json_append_u64(snapshot.shard_count);
+    json_append_u64(snapshot->shard_count);
     append_literal(",\"requests\":{\"total\":");
     json_append_u64(values.requests_total);
     append_literal(",\"active\":");

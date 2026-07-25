@@ -1463,7 +1463,9 @@ route GET "/builder" {
     REQUIRE(engine.compile(cg.mod, cg.ctx));
 
     TestHandlerCtxFrame frame{};
-    auto& snapshot = frame.ctx.control_plane;
+    auto* snapshot_ptr = jit::acquire_control_plane_snapshot(&frame.ctx);
+    REQUIRE(snapshot_ptr != nullptr);
+    auto& snapshot = *snapshot_ptr;
     snapshot.valid = true;
     snapshot.shard_id = 7;
     snapshot.shard_count = 8;
@@ -1536,7 +1538,9 @@ route GET "/builder" {
         kExpectedMetrics)));
 
     TestHandlerCtxFrame builder_frame{};
-    builder_frame.ctx.control_plane = snapshot;
+    auto* builder_snapshot = jit::acquire_control_plane_snapshot(&builder_frame.ctx);
+    REQUIRE(builder_snapshot != nullptr);
+    *builder_snapshot = snapshot;
     const auto builder = invoke(builder_handler, builder_frame);
     REQUIRE(builder.dynamic_response_body != nullptr);
     CHECK(

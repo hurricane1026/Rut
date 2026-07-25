@@ -2,6 +2,7 @@
 
 #include "rut/jit/handler_abi.h"
 #include "rut/runtime/metrics.h"
+#include "rut/runtime/response_body_storage.h"
 
 namespace rut {
 
@@ -53,26 +54,26 @@ inline void refresh_control_plane_memory_metrics(Loop* loop) {
 template <typename Loop>
 inline void latch_control_plane_snapshot(Loop* loop, jit::HandlerCtx* ctx) {
     if (loop == nullptr || ctx == nullptr) return;
-    auto& snapshot = ctx->control_plane;
-    snapshot = {};
+    auto* snapshot = jit::acquire_control_plane_snapshot(ctx);
+    if (snapshot == nullptr) return;
     if constexpr (requires { loop->metrics; }) {
         if (loop->metrics == nullptr) return;
         refresh_control_plane_memory_metrics(loop);
-        snapshot.stats = copy_control_plane_metrics(*loop->metrics);
-        snapshot.metrics = snapshot.stats;
-        snapshot.shard_count = 1;
-        if constexpr (requires { loop->shard_id; }) snapshot.shard_id = loop->shard_id;
+        snapshot->stats = copy_control_plane_metrics(*loop->metrics);
+        snapshot->metrics = snapshot->stats;
+        snapshot->shard_count = 1;
+        if constexpr (requires { loop->shard_id; }) snapshot->shard_id = loop->shard_id;
         if constexpr (requires {
                           loop->all_shard_metrics;
                           loop->shard_metrics_count;
                       }) {
             if (loop->all_shard_metrics != nullptr && loop->shard_metrics_count != 0) {
-                snapshot.metrics = copy_control_plane_metrics(
+                snapshot->metrics = copy_control_plane_metrics(
                     aggregate_metrics(loop->all_shard_metrics, loop->shard_metrics_count));
-                snapshot.shard_count = loop->shard_metrics_count;
+                snapshot->shard_count = loop->shard_metrics_count;
             }
         }
-        snapshot.valid = true;
+        snapshot->valid = true;
     }
 }
 

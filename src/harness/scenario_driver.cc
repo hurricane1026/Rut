@@ -556,8 +556,17 @@ ScenarioResult drive_scenario(const ScenarioSpec& scenario, const HarnessSpec& h
         HandlerExecution execution{};
         execution.init(
             route->fn, &connection.connection, scenario.request_data, scenario.request_len);
-        if (scenario.control_plane_snapshot != nullptr)
-            execution.frame.context.control_plane = *scenario.control_plane_snapshot;
+        if (scenario.control_plane_snapshot != nullptr) {
+            auto* snapshot = jit::acquire_control_plane_snapshot(&execution.frame.context);
+            if (snapshot == nullptr) {
+                out.harness.outcome = Outcome::Failed;
+                out.harness.cleanup = CleanupOutcome::Clean;
+                copy_detail(out.harness, "control-plane snapshot allocation failed");
+                connection.destroy();
+                return out;
+            }
+            *snapshot = *scenario.control_plane_snapshot;
+        }
         execution.frame.context.route_param_count = route_param_count;
         for (u32 i = 0; i < route_param_count; i++)
             execution.frame.context.route_params[i] = route_params[i];

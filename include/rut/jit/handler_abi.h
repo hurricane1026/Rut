@@ -189,7 +189,7 @@ struct alignas(alignof(u64)) HandlerCtx {
     i32 resume_event_result;  // IoEvent::result for event waits
     u32 route_param_count;    // number of populated route_params entries
     u32 reserved0;
-    ControlPlaneSnapshot control_plane;
+    ControlPlaneSnapshot* control_plane;
     const char* response_body_data;  // shard-owned dynamic response bytes
     u32 response_body_len;
     u32 response_body_valid;  // 1 only after successful serialization

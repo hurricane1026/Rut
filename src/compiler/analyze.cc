@@ -22601,6 +22601,8 @@ static FrontendResult<HirModule*> analyze_file_internal(
                     [&](const auto& self, const Str& target_name, u32 start_idx) -> bool {
                     for (u32 fi = start_idx; fi < route_decl.statements.len; fi++) {
                         const AstStatement& future = *route_decl.statements[fi];
+                        if (future.kind == AstStmtKind::Let && future.name.eq(target_name))
+                            return false;
                         if (stmt_uses_iter(stmt_uses_iter, future, target_name)) return true;
                         if (future.kind == AstStmtKind::Let &&
                             future.expr.kind == AstExprKind::Ident &&

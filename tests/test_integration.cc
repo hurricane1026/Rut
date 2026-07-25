@@ -1480,7 +1480,7 @@ static rut::u64 timer_probe_fn(void*, rut::jit::HandlerCtx*, const rut::u8*, rut
 
 static rut::u64 timer_snapshot_probe_fn(
     void*, rut::jit::HandlerCtx* ctx, const rut::u8*, rut::u32, void*) {
-    g_timer_snapshot = ctx->control_plane;
+    if (ctx->control_plane != nullptr) g_timer_snapshot = *ctx->control_plane;
     return 0;
 }
 

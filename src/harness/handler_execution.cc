@@ -116,6 +116,11 @@ HandlerExecution& HandlerExecution::operator=(const HandlerExecution& other) {
     if (this == &other) return *this;
     rut_helper_resp_release_body_storage(&frame.context);
     frame = other.frame;
+    frame.context.control_plane = nullptr;
+    if (other.frame.context.control_plane != nullptr) {
+        auto* snapshot = jit::acquire_control_plane_snapshot(&frame.context);
+        if (snapshot != nullptr) *snapshot = *other.frame.context.control_plane;
+    }
     jit::retain_response_body_snapshot_storage(&frame.context);
     frame.context.response_body_mutation_storage = nullptr;
     if (other.frame.context.response_body_mutation_storage != nullptr) {
