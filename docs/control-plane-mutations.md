@@ -171,10 +171,13 @@ The coordinator executes one request at a time:
 The generation whose process-startup `init` hook ran is a separate lifecycle
 owner. At startup, its `init`/`shutdown` code and immutable dependencies are
 retained as one dedicated lifecycle artifact, separate from the reloadable
-request-handler/config bundle. That artifact remains pinned until process
-shutdown has run the paired `shutdown` hook, but it does not retain the startup
-generation's request handlers, config, or generation-local tables and is not
-counted as a served generation. Reload does not run a candidate generation's
+request-handler/config bundle. That artifact owns every immutable object and
+runtime allocation transitively reachable by either hook, including otherwise
+generation-local Cache, Set, registry, and port tables. It remains pinned until
+process shutdown has run the paired `shutdown` hook; a reload is rejected when
+those dependencies cannot be separated and retained safely. Unreachable startup
+request handlers and config are not retained, and the artifact is not counted as
+a served generation. Reload does not run a candidate generation's
 `init`, substitute its `shutdown`, or replace the dedicated startup artifact. A
 future design may instead define paired per-generation shutdown/init transitions,
 but it must complete the old shutdown before reclaim and the new init before
@@ -187,6 +190,12 @@ or suspended, the replacement remains disabled until that invocation releases
 its pin; the final release enables the replacement on its owner shard. Thus an
 idle callback can never target reclaimed code, and old and replacement timer
 invocations cannot overlap across generations.
+
+Compatible periodic timers have a stable declaration identity and transfer the
+predecessor's pending monotonic deadline and cadence phase to the replacement;
+installation does not restart their period. A changed timer anchors its first
+deadline explicitly to installation time. Transfer, cancellation, new deadline,
+and anchor choice are captured as ordered scheduling events.
 
 Installation also drains every idle upstream connection pooled under the
 predecessor generation before acknowledgement. A connection completing after
@@ -337,12 +346,16 @@ queue or queued realtime signal), not standard SIGHUP semantics.
 The inotify adapter may collapse one kernel burst for the same watched source
 into one bounded, sequence-numbered file-watch event, but that debounce boundary
 is part of capture. Each resulting event is then a non-queued coordinator
-admission attempt exactly like SIGHUP: it receives a request id and either the
-ordinary terminal result or an immediate terminal `busy` record. It is never
-silently dropped, deferred until the active compile finishes, or coalesced with
-a later captured event. Replay consumes the recorded source digest, debounce
-sequence, admission result, and terminal record. An admitted signal or watch
-event follows the ordinary compile, publication, and terminal-record path.
+admission attempt. When the slot is busy it emits the terminal `busy` result for
+that attempt and also updates one bounded dirty slot to the newest observed
+provider-owned source version. After the active request terminates, the adapter
+re-admits that dirty version; repeated busy events may coalesce only by replacing
+the slot with a newer version, and every replacement is captured. Replay consumes
+the debounce sequence, opaque protected source-version handle, dirty-slot
+transition, admission result, and terminal record. Routine capture contains no
+plain source digest or other offline verifier; validation uses a provider-internal
+keyed verifier. An admitted signal or watch event follows the ordinary compile,
+publication, and terminal-record path.
 Route `reload()` retains its synchronous `false` busy result and consumes no
 accepted-request id.
 
@@ -547,10 +560,11 @@ shards, and program lifetimes. A lower-fidelity layer must report
 `Unsupported`, never synthesize a successful activation.
 
 Replay input records mutation requests and coordinator outcomes, not wall-clock
-thread timing. For every successful publication it also contains either a
-bounded portable source/IR artifact rebuilt through the normal verifier for the
-replay target, or a bounded compiled program/config artifact reference whose
-digest and exact compatibility identity are covered by a compiler attestation
+thread timing. For every successful publication it also contains an opaque,
+non-enumerable handle to either a bounded portable source/IR artifact rebuilt
+through the normal verifier for the replay target, or a bounded compiled
+program/config artifact whose digest and exact compatibility identity are
+covered by a compiler attestation
 signed by a configured trusted artifact-store key. The identity includes
 runtime build and program ABI versions, compiler/JIT ABI, target triple, pointer
 width, endianness, object/relocation format, and required CPU features. Replay
@@ -561,7 +575,8 @@ and ABI fields are never treated as provenance. Replay never installs code
 merely because its bytes match a digest and never substitutes the initial target
 for a later published program.
 
-A portable source artifact is self-contained: it bundles the root source and
+A portable source artifact is self-contained inside the access-controlled,
+encrypted artifact provider: it bundles the root source and
 the exact bounded transitive import closure, including each importer's canonical
 resolution identity/path, package identity, bytes, and authenticated digest.
 Replay resolves imports only from that bundle and verifies the recorded closure
@@ -570,11 +585,16 @@ cache. A missing, extra, cyclically inconsistent, unresolved, or oversized
 closure is `Unsupported`. A self-contained verified IR artifact may omit source
 imports only when its attested identity covers the complete lowered program.
 
-Replay artifacts and routine traffic captures are secret-free. They never
-serialize compile-time-resolved environment values, TLS private keys, raw
+Routine replay records and traffic captures are secret-free. Protected replay
+artifacts may contain the exact source/config bytes required for reconstruction,
+but they exist only in the separately access-controlled encrypted provider and
+are referenced from routine input by opaque capability and provider version.
+Routine records never serialize compile-time-resolved environment values, TLS
+private keys, raw
 `Authorization`, `Cookie`, `Proxy-Authorization`, `X-API-Key`, or configured
 sensitive-header values, or other secret bytes embedded in the live
-program/config bundle or request. Sensitive request fields are tokenized before
+program/config bundle or request, nor plain digests of those bytes. Sensitive
+request fields are tokenized before
 ring or file serialization; their exact bytes live only in a separately
 access-controlled encrypted replay-input provider referenced by an opaque
 capability and provider-owned version handle. Redaction alone is insufficient
@@ -620,6 +640,14 @@ evaluation, using opaque provider handles when sensitive. Any missing inspected
 field makes the capture `Unsupported`; replay never substitutes zeros or
 target-observed metadata.
 
+Inbound TLS execution has its own connection-correlated protected transcript:
+record read/write boundaries, selected SNI/ALPN, client-certificate verification
+inputs and result, resumption decision, failure or completion, and exact event
+position relative to reload installation and teardown. Replay injects that
+transcript before HTTP admission. Until it is complete, capture of a connection
+that performs a TLS handshake is `Unsupported`, including handshakes that never
+produce an HTTP request.
+
 Firewall replay also requires the initial attached kernel-map contents and
 visible version, not merely the userspace registry allocation. Every dynamic
 map update records submission, Node Agent result, publication/version boundary,
@@ -651,6 +679,11 @@ workload events. Replay injects these completions instead of contacting a live
 upstream. This applies to buffered forwarding, explicit upstream waits, health
 checks, and detached operations. A proxy or upstream-dependent workload without
 a complete bounded transcript is `Unsupported`.
+
+Retry backoff is part of that transcript rather than local replay timing. Each
+attempt records the monotonic sample, computed deadline, timer arm, fire or
+cancel outcome, and workload-event position that authorizes the next operation.
+Missing retry-timer decisions make a workload using `backoff` `Unsupported`.
 
 Non-upstream operations through `IoPort`, including buffered file reads and raw
 TCP/UDP receives, use the same bounded protected transcript and workload-event
@@ -704,6 +737,13 @@ policy choose another shard. If the recorded shard count or identity cannot be
 recreated, replay returns `Unsupported` before workload execution. This preserves
 per-shard Cache state, local limiter buckets, snapshots, and other shard-owned
 inputs.
+
+For HTTP/1, capture begins at connection reads rather than request admission. A
+connection-correlated transcript records each read chunk, parser boundary,
+pipeline-buffer append/consume transition, keep-alive reuse, retry, and the
+event position at which each parsed request becomes admissible. Replay releases
+buffered bytes only at those boundaries. Pipelined or reused connections without
+this complete transcript are `Unsupported`.
 
 For HTTP/2, the protected transcript additionally records every inbound and
 generated outbound frame in connection order, including `SETTINGS` and its ACK,
@@ -809,15 +849,22 @@ state that cannot be checkpointed exactly makes live-start capture
 
 The input additionally records the logical program-publication event, every mark
 attempt with its requested verdict, boolean result, bounded failure reason,
-workload-event position, and successful publication version when present; the
+workload-event position, and successful publication version when present. It
+also records every route `reload()` call, including invocation correlation,
+linearization and mutation-event position, returned boolean, bounded failure
+reason, and accepted request identity when present; losing concurrent calls are
+records rather than inferred from eventual publication. The input records the
 override and probe-table versions observed by each backend selection; every
 probe-health mutation, retry-budget decision, load-balancer state mutation and
 observed version, randomized backend-selection draw/result, marking-timer skipped
 tick, and each shard's installation acknowledgement in workload-event order.
-Post-baseline StatePort operations are
-recorded with stable allocation/key identity, owner dequeue version, outcome,
+Post-baseline StatePort operations are recorded with stable allocation/key
+identity, owner dequeue version, outcome,
 and resulting state version, so concurrent source shards cannot reverse Hash or
-other registry effects during replay. It also establishes the persistent state
+other registry effects during replay. A key derived from protected request or
+config data is represented only by an opaque provider handle or provider-keyed
+token unavailable with the routine capture; a plain key or deterministic hash
+that can verify guesses is forbidden. It also establishes the persistent state
 present when capture begins, but registry contents never enter the routine
 traffic capture. An explicitly configured protected state provider stores
 either a bounded, schema-identified encrypted checkpoint of every retained
@@ -827,14 +874,18 @@ baseline before the first workload event. The capture contains only an opaque,
 non-enumerable capability and provider-owned version handle; it contains no
 content digest or offline verifier. The protected artifact includes allocation
 identity, contents, eviction/order metadata, versions, the exact keyed-hash seed
-and every equivalent hashing/set-selection parameter for each allocation, and
+and every equivalent hashing/set-selection parameter for each allocation. For a
+TTL-backed LRU it additionally contains every entry's expiration deadline and
+monotonic-clock basis; post-baseline lookups record the clock sample, expiry
+decision, removal/order transition, and outcome. A TTL allocation without that
+state and transcript is `Unsupported`. The protected artifact also contains
 any accepted detached operation that can still mutate it. Restoring slots under
-a newly initialized seed is forbidden; an implementation that cannot restore the
-recorded seed rejects the checkpoint as `Unsupported`. Replay resolves it through
+a newly initialized seed is forbidden; an implementation that cannot restore
+the recorded seed rejects the checkpoint as `Unsupported`. Replay resolves it through
 the access-controlled provider, and a missing, unauthorized, mismatched, or
 unbounded representation is `Unsupported` rather than starting from empty
-state. These boundaries select which adjacent generation
-handles every interleaved request, stream, WebSocket frame, or timer resume
+state. These boundaries select which adjacent generation handles every
+interleaved request, stream, WebSocket frame, or timer resume
 without reproducing thread timing. A replay must reproduce the same
 accepted/rejected calls, per-shard installations, generation choices, program
 artifacts, state effects, arbitration decisions, and terminal records.
