@@ -334,10 +334,17 @@ public:
                 }
             }
 
-            if (source != ReloadRequestSource::Signal ||
-                unpack_state(observed) == ReloadAdmissionState::Stopping ||
-                stopping_.load(std::memory_order_acquire) != 0)
+            if (source != ReloadRequestSource::Signal) return false;
+            if (unpack_state(observed) == ReloadAdmissionState::Stopping ||
+                stopping_.load(std::memory_order_acquire) != 0) {
+                // Shutdown may win after this round's entry check while the
+                // signal is retrying Idle admission. Preserve the same
+                // explicit terminal outcome as a signal that observes
+                // stopping at entry instead of returning its caller's stale
+                // request ID without a corresponding record.
+                (void)publish_stopped_signal(request_id);
                 return false;
+            }
             if (unpack_state(observed) == ReloadAdmissionState::Idle) {
                 // A signal must not disappear while another Idle contender
                 // owns the identity protocol. Preserve it for the bounded
