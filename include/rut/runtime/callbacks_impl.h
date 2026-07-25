@@ -4667,8 +4667,8 @@ void finish_buffered_forward(Loop* loop,
         conn.keep_alive,
         false,
         is_head,
-        (is_head || status == 304) && !response_ctx->response_body_mutation_set &&
-            resp.has_content_length,
+        ((is_head && !status_forbids_body) || status == 304) &&
+            !response_ctx->response_body_mutation_set && resp.has_content_length,
         status == 304 && !response_ctx->response_body_mutation_set && resp.has_content_length
             ? resp.content_length
         : is_head && response_ctx->response_body_mutation_set && !status_forbids_body

@@ -5606,6 +5606,35 @@ TEST(buffered_forward, mutated_205_suppresses_upstream_and_replacement_bodies) {
     CHECK(!buf_contains(wire, wire_len, "rewritten", 9));
 }
 
+TEST(buffered_forward, head_status_mutation_to_205_forces_zero_length) {
+    SmallLoop loop;
+    loop.setup();
+    auto* conn = setup_proxy_conn_head(loop);
+    REQUIRE(conn != nullptr);
+    conn->proxy_response_buffered = true;
+    conn->req_keep_alive = true;
+    conn->keep_alive = true;
+
+    auto* ctx = conn->reset_jit_ctx();
+    ctx->response_status = 205;
+    ctx->response_status_set = true;
+
+    static const char kUpstream[] =
+        "HTTP/1.1 200 OK\r\nContent-Length: 123\r\nConnection: close\r\n\r\n";
+    conn->upstream_recv_buf.reset();
+    conn->upstream_recv_buf.write(reinterpret_cast<const u8*>(kUpstream), sizeof(kUpstream) - 1);
+    on_upstream_response<SmallLoop>(
+        &loop,
+        *conn,
+        make_ev(conn->id, IoEventType::UpstreamRecv, static_cast<i32>(sizeof(kUpstream) - 1)));
+
+    const char* wire = reinterpret_cast<const char*>(conn->send_buf.data());
+    const u32 wire_len = conn->send_buf.len();
+    CHECK_EQ(conn->resp_status, 205u);
+    CHECK(buf_contains(wire, wire_len, "Content-Length: 0\r\n", 19));
+    CHECK(!buf_contains(wire, wire_len, "Content-Length: 123\r\n", 21));
+}
+
 TEST(buffered_forward, head_body_mutation_declares_replacement_length_without_body) {
     SmallLoop loop;
     loop.setup();
