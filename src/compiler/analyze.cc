@@ -22243,9 +22243,10 @@ static FrontendResult<HirModule*> analyze_file_internal(
         // statement is analyzed so pre-wait bindings are caught too.
         for (u32 si = 0; si < route_decl.statements.len; si++) {
             const AstStatement& s = *route_decl.statements[si];
-            const bool buffered_forward_let = s.kind == AstStmtKind::Let &&
-                                              s.expr.kind == AstExprKind::Call &&
-                                              s.expr.name.eq({"forward", 7});
+            const bool buffered_forward_let =
+                s.kind == AstStmtKind::Let && s.expr.kind == AstExprKind::Call &&
+                s.expr.name.eq({"forward", 7}) &&
+                !user_bound_ident_name(mod, nullptr, 0, nullptr, {"forward", 7});
             if (s.kind == AstStmtKind::Wait || s.kind == AstStmtKind::WaitAny ||
                 (s.kind == AstStmtKind::Let && s.expr.kind == AstExprKind::Wait) ||
                 buffered_forward_let) {

@@ -278,6 +278,7 @@ HandlerExecutionResult drive_handler_deterministically(const DeterministicHandle
     }
     out.harness.input_bytes = driver.execution.request_len;
     HandlerExecution execution = driver.execution;
+    jit::CapturedResponseHeader captured_response_headers[jit::kMaxCapturedResponseHeaders]{};
     DeterministicEnvironment environment{};
     if (driver.environment != nullptr) {
         environment.reset(driver.environment->completions, driver.environment->completion_count);
@@ -479,8 +480,22 @@ HandlerExecutionResult drive_handler_deterministically(const DeterministicHandle
                 }
                 captured_bytes += header.name.len + header.value.len;
             }
-            if (captured_bytes >
-                jit::kMaxCapturedResponseStorageBytes - jit::kCapturedResponseFramingReserve) {
+            if (has_content_length && !request_is_head(execution) &&
+                !response_status_forbids_body(event.response_status) &&
+                content_length != event.data_len) {
+                out.harness.outcome = Outcome::Invalid;
+                copy_detail(out.harness.detail,
+                            sizeof(out.harness.detail),
+                            "forward completion content-length does not match response data");
+                return out;
+            }
+            const u32 captured_header_storage_bytes =
+                event.response_header_count * sizeof(jit::CapturedResponseHeader);
+            if (captured_header_storage_bytes >
+                    jit::kMaxCapturedResponseStorageBytes - jit::kCapturedResponseFramingReserve ||
+                captured_bytes > jit::kMaxCapturedResponseStorageBytes -
+                                     jit::kCapturedResponseFramingReserve -
+                                     captured_header_storage_bytes) {
                 out.harness.outcome = Outcome::Invalid;
                 copy_detail(out.harness.detail,
                             sizeof(out.harness.detail),
@@ -494,6 +509,7 @@ HandlerExecutionResult drive_handler_deterministically(const DeterministicHandle
             response.captured_response_body = reinterpret_cast<const char*>(event.data);
             response.captured_response_body_len = event.data_len;
             response.captured_response_header_count = 0;
+            response.captured_response_headers = captured_response_headers;
             const bool preserve_content_length =
                 request_is_head(execution) || event.response_status == 304;
             for (u32 i = 0; i < event.response_header_count; i++) {
@@ -501,8 +517,7 @@ HandlerExecutionResult drive_handler_deterministically(const DeterministicHandle
                 if (!preserve_content_length &&
                     captured_response_header_name_is(header, "content-length", 14))
                     continue;
-                response.captured_response_headers[response.captured_response_header_count++] =
-                    header;
+                captured_response_headers[response.captured_response_header_count++] = header;
             }
             event.result = event.response_status;
         }

@@ -3019,11 +3019,17 @@ void h2_proxy_finish(Loop* loop,
             h2_proxy_fail(loop, conn, 500);
             return;
         }
+        const u32 kCapturedHeaderStorageBytes =
+            sizeof(jit::CapturedResponseHeader) * effective_count;
+        const u32 kCapturedPayloadCapacity = SlicePool::kSliceSize - kCapturedHeaderStorageBytes;
+        auto* captured_headers = reinterpret_cast<jit::CapturedResponseHeader*>(
+            conn.response_capture_slice + kCapturedPayloadCapacity);
+        capture_ctx->captured_response_headers = captured_headers;
         u32 cursor = 0;
         capture_ctx->captured_response_header_count = 0;
         for (u32 i = 0; i < effective_count; i++) {
             if (capture_ctx->captured_response_header_count >= jit::kMaxCapturedResponseHeaders ||
-                effective[i].key_len > SlicePool::kSliceSize - cursor) {
+                effective[i].key_len > kCapturedPayloadCapacity - cursor) {
                 h2_proxy_fail(loop, conn, 500);
                 return;
             }
@@ -3031,7 +3037,7 @@ void h2_proxy_finish(Loop* loop,
             if (effective[i].key_len != 0)
                 __builtin_memmove(name, effective[i].key_data, effective[i].key_len);
             cursor += effective[i].key_len;
-            if (effective[i].value_len > SlicePool::kSliceSize - cursor) {
+            if (effective[i].value_len > kCapturedPayloadCapacity - cursor) {
                 h2_proxy_fail(loop, conn, 500);
                 return;
             }
@@ -3039,8 +3045,8 @@ void h2_proxy_finish(Loop* loop,
             if (effective[i].value_len != 0)
                 __builtin_memmove(value, effective[i].value_data, effective[i].value_len);
             cursor += effective[i].value_len;
-            capture_ctx->captured_response_headers[capture_ctx->captured_response_header_count++] =
-                {{name, effective[i].key_len}, {value, effective[i].value_len}};
+            captured_headers[capture_ctx->captured_response_header_count++] = {
+                {name, effective[i].key_len}, {value, effective[i].value_len}};
         }
         // http2_write_response has a fixed 8 KiB HPACK block.  Reject a
         // captured fixture before exposing it to the resumed handler when its
@@ -3059,8 +3065,8 @@ void h2_proxy_finish(Loop* loop,
         // downstream overhead now so an accepted capture cannot fail only when
         // the handler returns it.
         static_assert(jit::kMaxCapturedResponseStorageBytes == SlicePool::kSliceSize);
-        if (cursor > SlicePool::kSliceSize - jit::kCapturedResponseFramingReserve ||
-            body_len > SlicePool::kSliceSize - jit::kCapturedResponseFramingReserve - cursor) {
+        if (cursor > kCapturedPayloadCapacity - jit::kCapturedResponseFramingReserve ||
+            body_len > kCapturedPayloadCapacity - jit::kCapturedResponseFramingReserve - cursor) {
             h2_proxy_fail(loop, conn, 502);
             return;
         }
@@ -4925,11 +4931,16 @@ void finish_buffered_forward(Loop* loop,
             return;
         }
 
+        const u32 kCapturedHeaderStorageBytes = sizeof(jit::CapturedResponseHeader) * header_count;
+        const u32 kCapturedPayloadCapacity = SlicePool::kSliceSize - kCapturedHeaderStorageBytes;
+        auto* captured_headers = reinterpret_cast<jit::CapturedResponseHeader*>(
+            conn.response_capture_slice + kCapturedPayloadCapacity);
+        capture_ctx->captured_response_headers = captured_headers;
         u32 cursor = 0;
         capture_ctx->captured_response_header_count = 0;
         for (u32 i = 0; i < header_count; i++) {
             if (capture_ctx->captured_response_header_count >= jit::kMaxCapturedResponseHeaders ||
-                headers[i].key_len > SlicePool::kSliceSize - cursor) {
+                headers[i].key_len > kCapturedPayloadCapacity - cursor) {
                 buffered_forward_fail(loop, conn, 500);
                 return;
             }
@@ -4937,7 +4948,7 @@ void finish_buffered_forward(Loop* loop,
             if (headers[i].key_len != 0)
                 __builtin_memmove(name, headers[i].key_data, headers[i].key_len);
             cursor += headers[i].key_len;
-            if (headers[i].value_len > SlicePool::kSliceSize - cursor) {
+            if (headers[i].value_len > kCapturedPayloadCapacity - cursor) {
                 buffered_forward_fail(loop, conn, 500);
                 return;
             }
@@ -4945,12 +4956,12 @@ void finish_buffered_forward(Loop* loop,
             if (headers[i].value_len != 0)
                 __builtin_memmove(value, headers[i].value_data, headers[i].value_len);
             cursor += headers[i].value_len;
-            capture_ctx->captured_response_headers[capture_ctx->captured_response_header_count++] =
-                {{name, headers[i].key_len}, {value, headers[i].value_len}};
+            captured_headers[capture_ctx->captured_response_header_count++] = {
+                {name, headers[i].key_len}, {value, headers[i].value_len}};
         }
         static_assert(jit::kMaxCapturedResponseStorageBytes == SlicePool::kSliceSize);
-        if (cursor > SlicePool::kSliceSize - jit::kCapturedResponseFramingReserve ||
-            body_len > SlicePool::kSliceSize - jit::kCapturedResponseFramingReserve - cursor) {
+        if (cursor > kCapturedPayloadCapacity - jit::kCapturedResponseFramingReserve ||
+            body_len > kCapturedPayloadCapacity - jit::kCapturedResponseFramingReserve - cursor) {
             buffered_forward_fail(loop, conn, 502);
             return;
         }

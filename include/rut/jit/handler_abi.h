@@ -201,7 +201,10 @@ struct alignas(alignof(u64)) HandlerCtx {
     const char* captured_response_body;
     u32 captured_response_body_len;
     u8 captured_response_header_count;
-    CapturedResponseHeader captured_response_headers[kMaxCapturedResponseHeaders];
+    // Header views live in the lazily acquired response-capture allocation.
+    // Keeping only a pointer here avoids charging every preallocated
+    // connection for the maximum captured-header set.
+    const CapturedResponseHeader* captured_response_headers;
     // Builder-local mutation log. Pending entries are visible to resp.header();
     // commit publishes exactly this prefix to the terminal response. Keeping
     // it in HandlerCtx makes it survive yields without leaking across streams.

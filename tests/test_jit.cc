@@ -3440,8 +3440,9 @@ route GET "/x" {
     frame.ctx.captured_response_body = kBody;
     frame.ctx.captured_response_body_len = sizeof(kBody) - 1;
     frame.ctx.captured_response_header_count = 1;
-    frame.ctx.captured_response_headers[0] = {{kHeaderName, sizeof(kHeaderName) - 1},
-                                              {kHeaderValue, sizeof(kHeaderValue) - 1}};
+    const CapturedResponseHeader captured_headers[] = {
+        {{kHeaderName, sizeof(kHeaderName) - 1}, {kHeaderValue, sizeof(kHeaderValue) - 1}}};
+    frame.ctx.captured_response_headers = captured_headers;
     frame.ctx.state = suspended.next_state;
     frame.ctx.resume_event_kind = static_cast<u32>(YieldKind::Forward);
     frame.ctx.resume_event_result = 202;
@@ -3578,7 +3579,8 @@ TEST(jit, response_body_mutation_overflow_fails_closed) {
     frame.ctx.captured_response_valid = true;
     frame.ctx.captured_response_status = 201;
     frame.ctx.captured_response_header_count = 1;
-    frame.ctx.captured_response_headers[0] = {{"X-Secret", 8}, {"hidden", 6}};
+    const CapturedResponseHeader captured_headers[] = {{{"X-Secret", 8}, {"hidden", 6}}};
+    frame.ctx.captured_response_headers = captured_headers;
     const auto captured_terminal = +[](void*, HandlerCtx*, const u8*, u32, void*) -> u64 {
         return HandlerResult::make_status(0).pack();
     };

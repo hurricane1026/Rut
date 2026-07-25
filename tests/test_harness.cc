@@ -882,6 +882,8 @@ TEST(harness_handler, owns_captured_headers_across_result_copies) {
 
 TEST(harness_handler, normalizes_captured_content_length_for_request_method) {
     const auto run = [](const u8* request, u32 request_len) {
+        static const u8 body[123]{};
+        const bool head = request_len >= 4 && request[0] == 'H';
         harness::HandlerExecution execution{};
         execution.init(&captured_passthrough_handler, nullptr, request, request_len);
         const jit::CapturedResponseHeader headers[] = {
@@ -894,8 +896,8 @@ TEST(harness_handler, normalizes_captured_content_length_for_request_method) {
             100,
             1,
             7,
-            nullptr,
-            0,
+            head ? nullptr : body,
+            head ? 0u : static_cast<u32>(sizeof(body)),
             false,
             false,
             200,
@@ -1018,6 +1020,29 @@ TEST(harness_handler, rejects_bodies_for_bodyless_forward_fixtures) {
         CHECK_EQ(harness::drive_handler_deterministically(driver, spec).harness.outcome,
                  harness::Outcome::Invalid);
     }
+}
+
+TEST(harness_handler, rejects_captured_content_length_body_mismatch) {
+    static constexpr u8 request[] = "GET /x HTTP/1.1\r\nHost: test\r\n\r\n";
+    static constexpr u8 body[] = {'x'};
+    const jit::CapturedResponseHeader headers[] = {
+        {{"Content-Length", 14}, {"10", 2}},
+    };
+    harness::HandlerExecution execution{};
+    execution.init(&captured_passthrough_handler, nullptr, request, sizeof(request) - 1);
+    const harness::DeterministicCompletion completion = {
+        jit::YieldKind::Forward, 0, 100, 1, 7, body, 1, false, false, 200, headers, 1};
+    harness::DeterministicEnvironment environment{};
+    environment.reset(&completion, 1);
+    harness::DeterministicHandlerSpec driver{};
+    driver.execution = execution;
+    driver.environment = &environment;
+    harness::HarnessSpec spec{};
+    spec.layer = harness::ExecutionLayer::Handler;
+
+    const auto result = harness::drive_handler_deterministically(driver, spec);
+    CHECK_EQ(result.harness.outcome, harness::Outcome::Invalid);
+    CHECK_EQ(result.harness.cleanup, harness::CleanupOutcome::Clean);
 }
 
 TEST(harness_handler, rejects_hop_by_hop_forward_fixture_headers) {

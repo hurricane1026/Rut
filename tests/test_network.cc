@@ -17035,10 +17035,13 @@ TEST(response_headers, dynamic_mutations_merge_with_static_headers_in_order) {
 
 TEST(response_headers, captured_body_replacement_drops_content_encoding) {
     jit::HandlerCtx ctx{};
+    const jit::CapturedResponseHeader captured_headers[] = {
+        {{"Content-Encoding", 16}, {"gzip", 4}},
+        {{"Content-Type", 12}, {"text/plain", 10}},
+    };
     ctx.captured_response_valid = true;
     ctx.response_body_mutation_set = true;
-    ctx.captured_response_headers[0] = {{"Content-Encoding", 16}, {"gzip", 4}};
-    ctx.captured_response_headers[1] = {{"Content-Type", 12}, {"text/plain", 10}};
+    ctx.captured_response_headers = captured_headers;
     ctx.captured_response_header_count = 2;
 
     ResponseHeaderKV out[jit::kMaxCapturedResponseHeaders];
@@ -17119,11 +17122,13 @@ TEST(response_headers, captured_304_preserves_representation_content_length) {
     REQUIRE(conn != nullptr);
 
     jit::HandlerCtx response_ctx{};
+    jit::CapturedResponseHeader captured_headers[] = {
+        {{"Content-Length", 14}, {"123", 3}},
+    };
     response_ctx.captured_response_valid = true;
     response_ctx.captured_response_status = 304;
     response_ctx.captured_response_header_count = 1;
-    response_ctx.captured_response_headers[0].name = {"Content-Length", 14};
-    response_ctx.captured_response_headers[0].value = {"123", 3};
+    response_ctx.captured_response_headers = captured_headers;
 
     JitDispatchOutcome outcome{};
     outcome.kind = JitDispatchOutcome::Kind::ReturnStatus;

@@ -1851,10 +1851,12 @@ TEST(h2_serving, captured_content_length_is_removed_for_final_204) {
     u8 response[256]{};
     H2Dispatch<FakeH2Loop> dispatch{&loop, &conn, response, sizeof(response), 0, false};
     jit::HandlerCtx response_ctx{};
+    jit::CapturedResponseHeader captured_headers[] = {
+        {{"content-length", 14}, {"123", 3}},
+    };
     response_ctx.captured_response_valid = true;
     response_ctx.captured_response_header_count = 1;
-    response_ctx.captured_response_headers[0].name = {"content-length", 14};
-    response_ctx.captured_response_headers[0].value = {"123", 3};
+    response_ctx.captured_response_headers = captured_headers;
     JitDispatchOutcome outcome{};
     outcome.kind = JitDispatchOutcome::Kind::ReturnStatus;
     outcome.status_code = 204;
@@ -1881,6 +1883,52 @@ TEST(h2_serving, captured_content_length_is_removed_for_final_204) {
     for (u32 i = 0; i < count; i++) CHECK_FALSE(decoded[i].name.eq(Str{"content-length", 14}));
 }
 
+TEST(h2_serving, captured_304_content_length_is_removed_for_final_200) {
+    Http2Conn h2;
+    h2.init();
+    Connection conn;
+    conn.reset();
+    conn.h2 = &h2;
+    FakeH2Loop loop;
+    u8 response[256]{};
+    H2Dispatch<FakeH2Loop> dispatch{&loop, &conn, response, sizeof(response), 0, false};
+    jit::CapturedResponseHeader captured_headers[] = {
+        {{"content-length", 14}, {"123", 3}},
+    };
+    jit::HandlerCtx response_ctx{};
+    response_ctx.captured_response_valid = true;
+    response_ctx.captured_response_status = 304;
+    response_ctx.captured_response_header_count = 1;
+    response_ctx.captured_response_headers = captured_headers;
+    JitDispatchOutcome outcome{};
+    outcome.kind = JitDispatchOutcome::Kind::ReturnStatus;
+    outcome.status_code = 200;
+    outcome.response_ctx = &response_ctx;
+    outcome.uses_captured_response = true;
+
+    h2_emit_outcome(dispatch, 1, outcome, nullptr, false);
+
+    Http2FrameHeader frame{};
+    REQUIRE(parse_frame_header(response, dispatch.resp_len, &frame) == ParseStatus::Complete);
+    hpack::DynamicTable dyn;
+    dyn.init(4096);
+    hpack::Header decoded[8];
+    u8 scratch[256];
+    u32 count = 0;
+    REQUIRE(hpack::decode_header_block(dyn,
+                                       response + kFrameHeaderSize,
+                                       frame.length,
+                                       scratch,
+                                       sizeof(scratch),
+                                       decoded,
+                                       8,
+                                       &count));
+    for (u32 i = 0; i < count; i++) {
+        if (decoded[i].name.eq(Str{"content-length", 14}))
+            CHECK_FALSE(decoded[i].value.eq(Str{"123", 3}));
+    }
+}
+
 TEST(h2_serving, captured_head_body_replacement_has_one_content_length) {
     Http2Conn h2;
     h2.init();
@@ -1891,10 +1939,12 @@ TEST(h2_serving, captured_head_body_replacement_has_one_content_length) {
     u8 response[512]{};
     H2Dispatch<FakeH2Loop> dispatch{&loop, &conn, response, sizeof(response), 0, false};
     jit::HandlerCtx response_ctx{};
+    jit::CapturedResponseHeader captured_headers[] = {
+        {{"content-length", 14}, {"123", 3}},
+    };
     response_ctx.captured_response_valid = true;
     response_ctx.captured_response_header_count = 1;
-    response_ctx.captured_response_headers[0].name = {"content-length", 14};
-    response_ctx.captured_response_headers[0].value = {"123", 3};
+    response_ctx.captured_response_headers = captured_headers;
     response_ctx.response_body_mutation_set = true;
     static constexpr char kReplacement[] = "new body";
     JitDispatchOutcome outcome{};
