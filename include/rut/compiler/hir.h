@@ -892,9 +892,16 @@ struct HirGuardBody {
         If,
     };
 
-    static constexpr u32 kMaxLocals = 4;
+    static constexpr u32 kMaxLocals = 16;
     BodyKind body_kind = BodyKind::Direct;
     FixedVec<HirLocal, kMaxLocals> locals;
+    u8 shared_local_count = 0;
+    u8 then_term_local_start = 0;
+    u8 then_term_local_count = 0;
+    u8 else_term_local_start = 0;
+    u8 else_term_local_count = 0;
+    u8 direct_term_local_start = 0;
+    u8 direct_term_local_count = 0;
     HirExpr cond{};
     bool has_then_local = false;
     HirLocal then_local{};
@@ -907,6 +914,7 @@ struct HirGuardMatchArm {
     Span span{};
     bool is_wildcard = false;
     HirExpr pattern{};
+    FixedVec<HirLocal, HirForLoopBranch::kMaxLocals> locals;
     HirTerminator direct_term{};
 };
 
@@ -1092,6 +1100,7 @@ struct HirForLoopBody {
     FixedVec<HirForLoopIf, kMaxIfs> ifs;
     FixedVec<HirForLoopMatch, kMaxMatches> matches;
     HirTerminator term{};
+    FixedVec<HirLocal, HirForLoopBranch::kMaxLocals> term_locals;
     bool has_term = false;
     // An unconditional loop-control step terminates the current iteration,
     // but unlike has_term it does not terminate the request route.
@@ -1408,6 +1417,9 @@ private:
             rebase_expr(for_loops[i].iter_expr, other);
             for (u32 li = 0; li < for_loops[i].body.locals.len; li++) {
                 rebase_expr(for_loops[i].body.locals[li].init, other);
+            }
+            for (u32 li = 0; li < for_loops[i].body.term_locals.len; li++) {
+                rebase_expr(for_loops[i].body.term_locals[li].init, other);
             }
             for (u32 gi = 0; gi < for_loops[i].body.guards.len; gi++) {
                 rebase_guard(for_loops[i].body.guards[gi], other);

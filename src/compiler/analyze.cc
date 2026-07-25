@@ -12918,7 +12918,8 @@ static FrontendResult<void> analyze_guard_match_arms(
     u32 local_count,
     FixedVec<HirGuardMatchArm, HirModule::kMaxGuardMatchArms>* guard_match_arms,
     HirGuard* guard,
-    const MatchPayloadBinding* binding = nullptr) {
+    const MatchPayloadBinding* binding = nullptr,
+    bool inside_static_for = false) {
     bool seen_wildcard = false;
     guard->fail_match_start = guard_match_arms->len;
     guard->fail_match_count = 0;
@@ -12971,8 +12972,19 @@ static FrontendResult<void> analyze_guard_match_arms(
         } else {
             seen_wildcard = true;
         }
-        auto term = analyze_term(*arm.stmt, mod, route, locals, local_count, binding);
+        const u32 term_local_start = route->locals.len;
+        auto term =
+            analyze_term(*arm.stmt, mod, route, locals, local_count, binding, inside_static_for);
         if (!term) return core::make_unexpected(term.error());
+        if (inside_static_for) {
+            for (u32 li = term_local_start; li < route->locals.len; li++) {
+                if (!hir_arm.locals.push(route->locals[li])) {
+                    route->locals.len = term_local_start;
+                    return frontend_error(FrontendError::TooManyItems, arm.span);
+                }
+            }
+            route->locals.len = term_local_start;
+        }
         hir_arm.direct_term = term.value();
         if (!guard_match_arms->push(hir_arm))
             return frontend_error(FrontendError::TooManyItems, arm.span);
@@ -13804,6 +13816,8 @@ static FrontendResult<void> analyze_guard_fail_body(const AstStatement& stmt,
             route->locals[li].name = {};
         }
         body->cond = cond_expr;
+        body->shared_local_count = body->locals.len;
+        const u32 then_term_local_start = route->locals.len;
         auto then_term = analyze_term(*stmt.then_stmt,
                                       mod,
                                       route,
@@ -13812,17 +13826,53 @@ static FrontendResult<void> analyze_guard_fail_body(const AstStatement& stmt,
                                       binding,
                                       inside_static_for);
         if (!then_term) return core::make_unexpected(then_term.error());
+        if (inside_static_for) {
+            body->then_term_local_start = body->locals.len;
+            for (u32 li = then_term_local_start; li < route->locals.len; li++) {
+                if (!body->locals.push(route->locals[li])) {
+                    route->locals.len = then_term_local_start;
+                    return frontend_error(FrontendError::TooManyItems, stmt.then_stmt->span);
+                }
+            }
+            body->then_term_local_count = body->locals.len - body->then_term_local_start;
+            route->locals.len = then_term_local_start;
+        }
         if (folds_false) route->locals.len = saved_locals;
+        const u32 else_term_local_start = route->locals.len;
         auto else_term = analyze_term(
             *stmt.else_stmt, mod, route, locals, local_count, binding, inside_static_for);
         if (!else_term) return core::make_unexpected(else_term.error());
+        if (inside_static_for) {
+            body->else_term_local_start = body->locals.len;
+            for (u32 li = else_term_local_start; li < route->locals.len; li++) {
+                if (!body->locals.push(route->locals[li])) {
+                    route->locals.len = else_term_local_start;
+                    return frontend_error(FrontendError::TooManyItems, stmt.else_stmt->span);
+                }
+            }
+            body->else_term_local_count = body->locals.len - body->else_term_local_start;
+            route->locals.len = else_term_local_start;
+        }
         body->then_term = folds_false ? else_term.value() : then_term.value();
         body->else_term = else_term.value();
         return {};
     }
     body->body_kind = HirGuardBody::BodyKind::Direct;
+    body->shared_local_count = body->locals.len;
+    const u32 term_local_start = route->locals.len;
     auto term = analyze_term(stmt, mod, route, locals, local_count, binding, inside_static_for);
     if (!term) return core::make_unexpected(term.error());
+    if (inside_static_for) {
+        body->direct_term_local_start = body->locals.len;
+        for (u32 li = term_local_start; li < route->locals.len; li++) {
+            if (!body->locals.push(route->locals[li])) {
+                route->locals.len = term_local_start;
+                return frontend_error(FrontendError::TooManyItems, stmt.span);
+            }
+        }
+        body->direct_term_local_count = body->locals.len - body->direct_term_local_start;
+        route->locals.len = term_local_start;
+    }
     body->direct_term = term.value();
     return {};
 }
@@ -17074,7 +17124,9 @@ static FrontendResult<u32> analyze_for_stmt(const AstStatement& stmt,
                                                                route->locals.data,
                                                                route->locals.len,
                                                                &mod.guard_match_arms,
-                                                               &guard);
+                                                               &guard,
+                                                               nullptr,
+                                                               true);
                     if (!fail_match) return core::make_unexpected(fail_match.error());
                 } else {
                     return frontend_error(
@@ -17089,6 +17141,7 @@ static FrontendResult<u32> analyze_for_stmt(const AstStatement& stmt,
                                               ? HirLoopControl::Break
                                               : HirLoopControl::Continue;
             } else if (is_ast_hir_terminator(*bstmt.else_stmt)) {
+                const u32 fail_local_start = route->locals.len;
                 auto fail = analyze_term(*bstmt.else_stmt,
                                          mod,
                                          route,
@@ -17098,6 +17151,16 @@ static FrontendResult<u32> analyze_for_stmt(const AstStatement& stmt,
                                          true);
                 if (!fail) return core::make_unexpected(fail.error());
                 guard.fail_term = fail.value();
+                guard.fail_body.shared_local_count = 0;
+                guard.fail_body.direct_term_local_start = 0;
+                for (u32 li = fail_local_start; li < route->locals.len; li++) {
+                    if (!guard.fail_body.locals.push(route->locals[li])) {
+                        route->locals.len = fail_local_start;
+                        return frontend_error(FrontendError::TooManyItems, bstmt.span);
+                    }
+                }
+                guard.fail_body.direct_term_local_count = guard.fail_body.locals.len;
+                route->locals.len = fail_local_start;
             } else {
                 guard.fail_kind = HirGuard::FailKind::Body;
                 auto fail_body = analyze_guard_fail_body(*bstmt.else_stmt,
@@ -17202,9 +17265,17 @@ static FrontendResult<u32> analyze_for_stmt(const AstStatement& stmt,
                     FrontendError::UnsupportedSyntax,
                     bstmt.span,
                     lit_str("static for-loop body cannot continue after a route terminator"));
+            const u32 term_local_start = route->locals.len;
             auto t = analyze_term(
                 bstmt, mod, route, route->locals.data, route->locals.len, nullptr, true);
             if (!t) return core::make_unexpected(t.error());
+            for (u32 li = term_local_start; li < route->locals.len; li++) {
+                if (!loop.body.term_locals.push(route->locals[li])) {
+                    route->locals.len = term_local_start;
+                    return frontend_error(FrontendError::TooManyItems, bstmt.span);
+                }
+            }
+            route->locals.len = term_local_start;
             loop.body.term = t.value();
             loop.body.has_term = true;
             HirForLoopBody::Step step{};
@@ -17878,7 +17949,8 @@ static FrontendResult<u32> analyze_for_stmt(const AstStatement& stmt,
                                                                  arm_scoped_locals.len,
                                                                  &mod.guard_match_arms,
                                                                  &guard,
-                                                                 arm_binding_ptr);
+                                                                 arm_binding_ptr,
+                                                                 true);
                                     if (!fail_match)
                                         return core::make_unexpected(fail_match.error());
                                 } else {
@@ -17897,14 +17969,28 @@ static FrontendResult<u32> analyze_for_stmt(const AstStatement& stmt,
                                             ? HirLoopControl::Break
                                             : HirLoopControl::Continue;
                                 } else if (is_ast_hir_terminator(*inner.else_stmt)) {
+                                    const u32 fail_local_start = route->locals.len;
                                     auto fail = analyze_term(*inner.else_stmt,
                                                              mod,
                                                              route,
                                                              arm_scoped_locals.data,
                                                              arm_scoped_locals.len,
-                                                             arm_binding_ptr);
+                                                             arm_binding_ptr,
+                                                             true);
                                     if (!fail) return core::make_unexpected(fail.error());
                                     guard.fail_term = fail.value();
+                                    guard.fail_body.shared_local_count = 0;
+                                    guard.fail_body.direct_term_local_start = 0;
+                                    for (u32 li = fail_local_start; li < route->locals.len; li++) {
+                                        if (!guard.fail_body.locals.push(route->locals[li])) {
+                                            route->locals.len = fail_local_start;
+                                            return frontend_error(FrontendError::TooManyItems,
+                                                                  inner.span);
+                                        }
+                                    }
+                                    guard.fail_body.direct_term_local_count =
+                                        guard.fail_body.locals.len;
+                                    route->locals.len = fail_local_start;
                                 } else {
                                     guard.fail_kind = HirGuard::FailKind::Body;
                                     auto fail_body = analyze_guard_fail_body(*inner.else_stmt,
@@ -18524,6 +18610,10 @@ static FrontendResult<void> validate_timer_route(const HirRoute& route,
         return {};
     };
     auto check_for_branch = [&](const HirForLoopBranch& branch) -> FrontendResult<void> {
+        for (u32 li = 0; li < branch.locals.len; li++) {
+            auto local_ok = check_expr(branch.locals[li].init);
+            if (!local_ok) return local_ok;
+        }
         if (branch.kind != HirForLoopBranch::Kind::Term) return {};
         return check_term(branch.term);
     };
@@ -18555,6 +18645,10 @@ static FrontendResult<void> validate_timer_route(const HirRoute& route,
             const auto& arm = mod.guard_match_arms[idx];
             auto pattern_ok = check_expr(arm.pattern);
             if (!pattern_ok) return pattern_ok;
+            for (u32 li = 0; li < arm.locals.len; li++) {
+                auto local_ok = check_expr(arm.locals[li].init);
+                if (!local_ok) return local_ok;
+            }
             auto arm_term_ok = check_term(arm.direct_term);
             if (!arm_term_ok) return arm_term_ok;
         }
@@ -18635,6 +18729,10 @@ static FrontendResult<void> validate_timer_route(const HirRoute& route,
         const auto& body = loop.body;
         for (u32 li = 0; li < body.locals.len; li++) {
             auto l_ok = check_expr(body.locals[li].init);
+            if (!l_ok) return l_ok;
+        }
+        for (u32 li = 0; li < body.term_locals.len; li++) {
+            auto l_ok = check_expr(body.term_locals[li].init);
             if (!l_ok) return l_ok;
         }
         for (u32 gi = 0; gi < body.guards.len; gi++) {

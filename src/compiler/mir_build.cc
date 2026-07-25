@@ -1502,6 +1502,10 @@ FrontendResult<MirModule*> build_mir(const HirModule& module) {
             if (guard.fail_kind == HirGuard::FailKind::Term) {
                 MirBlock fail_block{};
                 fail_block.label = fail_label();
+                for (u32 li = 0; li < guard.fail_body.locals.len; li++) {
+                    auto local = set_branch_local(&fail_block, guard.fail_body.locals[li], ctx);
+                    if (!local) return core::make_unexpected(local.error());
+                }
                 set_term_from_hir(&fail_block.term, guard.fail_term, ctx);
                 if (!fn.blocks.push(fail_block))
                     return frontend_error(FrontendError::TooManyItems, fn.span);
@@ -1533,7 +1537,7 @@ FrontendResult<MirModule*> build_mir(const HirModule& module) {
                 if (guard.fail_body.locals.len != 0) {
                     if (ctx != nullptr) scoped_ctx = *ctx;
                     body_ctx = &scoped_ctx;
-                    for (u32 li = 0; li < guard.fail_body.locals.len; li++) {
+                    for (u32 li = 0; li < guard.fail_body.shared_local_count; li++) {
                         const auto& local = guard.fail_body.locals[li];
                         auto local_value = mir_value(local.init, module, &fn, body_ctx);
                         if (!local_value) return core::make_unexpected(local_value.error());
@@ -1585,21 +1589,39 @@ FrontendResult<MirModule*> build_mir(const HirModule& module) {
 
                     MirBlock then_block{};
                     then_block.label = then_label();
-                    set_term_from_hir(&then_block.term, guard.fail_body.then_term, body_ctx);
                     if (guard.fail_body.has_then_local) {
                         auto local =
                             set_branch_local(&then_block, guard.fail_body.then_local, body_ctx);
                         if (!local) return core::make_unexpected(local.error());
                     }
+                    for (u32 li = 0; li < guard.fail_body.then_term_local_count; li++) {
+                        const auto& local =
+                            guard.fail_body.locals[guard.fail_body.then_term_local_start + li];
+                        auto added = set_branch_local(&then_block, local, body_ctx);
+                        if (!added) return core::make_unexpected(added.error());
+                    }
+                    set_term_from_hir(&then_block.term, guard.fail_body.then_term, body_ctx);
                     if (!fn.blocks.push(then_block))
                         return frontend_error(FrontendError::TooManyItems, fn.span);
 
                     MirBlock else_block{};
                     else_block.label = else_label();
+                    for (u32 li = 0; li < guard.fail_body.else_term_local_count; li++) {
+                        const auto& local =
+                            guard.fail_body.locals[guard.fail_body.else_term_local_start + li];
+                        auto added = set_branch_local(&else_block, local, body_ctx);
+                        if (!added) return core::make_unexpected(added.error());
+                    }
                     set_term_from_hir(&else_block.term, guard.fail_body.else_term, body_ctx);
                     if (!fn.blocks.push(else_block))
                         return frontend_error(FrontendError::TooManyItems, fn.span);
                 } else {
+                    for (u32 li = 0; li < guard.fail_body.direct_term_local_count; li++) {
+                        const auto& local =
+                            guard.fail_body.locals[guard.fail_body.direct_term_local_start + li];
+                        auto added = set_branch_local(&fail_block, local, body_ctx);
+                        if (!added) return core::make_unexpected(added.error());
+                    }
                     set_term_from_hir(&fail_block.term, guard.fail_body.direct_term, body_ctx);
                     if (!fn.blocks.push(fail_block))
                         return frontend_error(FrontendError::TooManyItems, fn.span);
@@ -1652,6 +1674,10 @@ FrontendResult<MirModule*> build_mir(const HirModule& module) {
                 const auto& arm = module.guard_match_arms[guard.fail_match_start + ai];
                 MirBlock case_block{};
                 case_block.label = arm.is_wildcard ? match_default_label() : match_case_label();
+                for (u32 li = 0; li < arm.locals.len; li++) {
+                    auto local = set_branch_local(&case_block, arm.locals[li], ctx);
+                    if (!local) return core::make_unexpected(local.error());
+                }
                 set_term_from_hir(&case_block.term, arm.direct_term, ctx);
                 if (!fn.blocks.push(case_block))
                     return frontend_error(FrontendError::TooManyItems, fn.span);
@@ -2155,6 +2181,7 @@ FrontendResult<MirModule*> build_mir(const HirModule& module) {
                 const HirForLoopIf* body_if = nullptr;
                 const HirForLoopMatch* body_match = nullptr;
                 const HirTerminator* term = nullptr;
+                const FixedVec<HirLocal, HirForLoopBranch::kMaxLocals>* term_locals = nullptr;
                 Span span{};
                 u32 order_start = 0;
                 u32 order_seq = 0;
@@ -2710,6 +2737,7 @@ FrontendResult<MirModule*> build_mir(const HirModule& module) {
                         RouteStep step{};
                         step.kind = RouteStep::Kind::Term;
                         step.term = &fl.body.term;
+                        step.term_locals = &fl.body.term_locals;
                         step.span = fl.body.term.span;
                         step.order_start = order_start;
                         step.order_seq = route_step_seq++;
@@ -3252,6 +3280,13 @@ FrontendResult<MirModule*> build_mir(const HirModule& module) {
                     continue;
                 }
                 if (steps[si].kind == RouteStep::Kind::Term) {
+                    if (steps[si].term_locals != nullptr) {
+                        for (u32 li = 0; li < steps[si].term_locals->len; li++) {
+                            auto local =
+                                set_branch_local(&block, (*steps[si].term_locals)[li], step_ctx);
+                            if (!local) return core::make_unexpected(local.error());
+                        }
+                    }
                     set_term_from_hir(&block.term, *steps[si].term, step_ctx);
                     if (!fn.blocks.push(block))
                         return frontend_error(FrontendError::TooManyItems, fn.span);

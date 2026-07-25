@@ -32727,6 +32727,71 @@ route GET "/x" {
     }
 }
 
+TEST(frontend, static_for_direct_term_materializes_helper_json_carriers) {
+    const char* src = R"rut(
+func envelope(value: str) -> Json { let payload = json({ value: value }) payload }
+route GET "/x" {
+    for item in [req.path] { return 200, envelope(item) }
+    return 500
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    REQUIRE(hir->routes[0].for_loops[0].body.term_locals.len != 0);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    REQUIRE(lower_to_rir(mir.value(), rir));
+    CHECK(rir::verify_module(rir.module).ok);
+    rir.destroy();
+}
+
+TEST(frontend, static_for_guard_fail_terms_materialize_helper_json_carriers) {
+    const char* sources[] = {
+        R"rut(
+func envelope(value: str) -> Json { let payload = json({ value: value }) payload }
+route GET "/x" {
+    for item in [req.path] { guard false else { return 400, envelope(item) } }
+    return 500
+}
+)rut",
+        R"rut(
+func envelope(value: str) -> Json { let payload = json({ value: value }) payload }
+route GET "/x" {
+    for item in [req.path] {
+        guard false else {
+            if item == "/x" { return 400, envelope(item) } else { return 401 }
+        }
+    }
+    return 500
+}
+)rut",
+        R"rut(
+func envelope(value: str) -> Json { let payload = json({ value: value }) payload }
+route GET "/x" {
+    let failed = error(.timeout)
+    for item in [req.path] {
+        guard match failed else {
+            .timeout => return 400, envelope(item)
+            _ => return 401
+        }
+    }
+    return 500
+}
+)rut",
+    };
+    for (const char* src : sources) {
+        FrontendRirModule rir{};
+        REQUIRE(lower_src_to_rir(src, rir));
+        CHECK(rir::verify_module(rir.module).ok);
+        rir.destroy();
+    }
+}
+
 TEST(frontend, nested_conditional_break_does_not_make_outer_loop_unconditionally_terminate) {
     const char* src =
         "route GET \"/x\" { for outer in [1] { for inner in [0] { guard inner > 0 else { break } "
