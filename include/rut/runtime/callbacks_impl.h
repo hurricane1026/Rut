@@ -4804,7 +4804,9 @@ void on_buffered_upstream_response(Loop* loop,
     conn.upstream_keep_alive = resp.keep_alive && !resp.connection_close &&
                                !(!resp.has_content_length && !resp.chunked && !no_body) &&
                                !(no_body && resp.chunked) && conn.req_keep_alive &&
-                               !contaminated_no_body_response;
+                               !contaminated_no_body_response &&
+                               !((resp.status_code == 204 || resp.status_code == 205) &&
+                                 resp.has_content_length && resp.content_length != 0);
     finish_buffered_forward(loop, conn, resp, parser, body_len);
 }
 
