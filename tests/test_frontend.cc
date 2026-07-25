@@ -266,7 +266,10 @@ static std::string_view markdown_container_content(
             }
             const bool marker_only =
                 line.substr(padding_end).find_first_not_of(" \t\r") == std::string_view::npos;
-            if (!non_one_ordered_lists_can_interrupt && marker_only) {
+            const bool first_block_is_indented_code =
+                !marker_only && padding_column - first_column >= 4;
+            if (!non_one_ordered_lists_can_interrupt &&
+                (marker_only || first_block_is_indented_code)) {
                 column = segment_column;
                 break;
             }
@@ -333,6 +336,14 @@ static bool markdown_same_container(const std::vector<MarkdownContainerSegment>&
     return true;
 }
 
+static bool markdown_container_prefix(const std::vector<MarkdownContainerSegment>& prefix,
+                                      const std::vector<MarkdownContainerSegment>& container) {
+    if (prefix.size() >= container.size()) return false;
+    std::vector<MarkdownContainerSegment> leading(container.begin(),
+                                                  container.begin() + prefix.size());
+    return markdown_same_container(prefix, leading);
+}
+
 static void markdown_remember_list_container(const std::vector<MarkdownContainerSegment>& container,
                                              std::vector<MarkdownContainerSegment>* continuation) {
     for (const auto& segment : container) {
@@ -344,7 +355,8 @@ static void markdown_remember_list_container(const std::vector<MarkdownContainer
 
 static bool markdown_strip_container(std::string_view line,
                                      const std::vector<MarkdownContainerSegment>& segments,
-                                     std::string_view* content) {
+                                     std::string_view* content,
+                                     std::string* normalized = nullptr) {
     size_t pos = 0;
     size_t column = 0;
     for (const auto& segment : segments) {
@@ -371,8 +383,13 @@ static bool markdown_strip_container(std::string_view line,
             if (next > target_column) {
                 // A tab may satisfy the remaining container indentation and
                 // leave residual columns as content indentation.
+                if (normalized != nullptr) {
+                    normalized->assign(next - target_column, ' ');
+                    normalized->append(line.substr(pos + 1));
+                    line = *normalized;
+                    pos = 0;
+                }
                 column = target_column;
-                pos++;
                 break;
             }
             column = next;
@@ -392,9 +409,12 @@ static bool markdown_strip_container(std::string_view line,
 }
 
 static std::string_view markdown_fence_content(std::string_view line,
-                                               const MarkdownFence& opening) {
+                                               const MarkdownFence& opening,
+                                               std::string* normalized = nullptr) {
     std::string_view content;
-    return markdown_strip_container(line, opening.container_segments, &content) ? content : line;
+    return markdown_strip_container(line, opening.container_segments, &content, normalized)
+               ? content
+               : line;
 }
 
 static bool parse_markdown_fence_open_content(std::string_view line, MarkdownFence* out) {
@@ -438,7 +458,8 @@ static bool parse_markdown_fence_open_in_container(
     const std::vector<MarkdownContainerSegment>& container,
     MarkdownFence* out) {
     std::string_view content;
-    if (!markdown_strip_container(line, container, &content)) return false;
+    std::string normalized;
+    if (!markdown_strip_container(line, container, &content, &normalized)) return false;
     MarkdownFence opening{};
     if (!parse_markdown_fence_open(content, &opening) || !opening.container_segments.empty())
         return false;
@@ -469,7 +490,8 @@ static bool markdown_fence_language_case_insensitive(std::string_view info,
 }
 
 static bool is_markdown_fence_close(std::string_view line, const MarkdownFence& opening) {
-    line = markdown_fence_content(line, opening);
+    std::string normalized;
+    line = markdown_fence_content(line, opening, &normalized);
     size_t pos = 0;
     while (pos < line.size() && pos < 3 && line[pos] == ' ') pos++;
     const size_t marker_start = pos;
@@ -645,6 +667,9 @@ static bool markdown_interrupts_paragraph(std::string_view content,
     if (pos != 0 && (pos == content.size() || content[pos] == ' ' || content[pos] == '\t' ||
                      content[pos] == '\r'))
         return true;
+    // Four columns of block indentation cannot interrupt a paragraph. The
+    // caller has removed at most the three columns permitted before a block.
+    if (!content.empty() && (content.front() == ' ' || content.front() == '\t')) return false;
 
     // A setext underline consumes and closes the preceding paragraph. Equals
     // underlines are not thematic breaks, so recognize them explicitly; a
@@ -806,6 +831,7 @@ TEST(frontend, language_card_detects_raw_html_fence_exclusions) {
              std::string(1, kMarkdownRawHtmlBlankLine));
     CHECK(markdown_interrupts_paragraph("## heading"));
     CHECK(markdown_interrupts_paragraph("  * * *"));
+    CHECK_FALSE(markdown_interrupts_paragraph("    * * *"));
     CHECK_FALSE(markdown_interrupts_paragraph("      # indented paragraph text"));
     CHECK(markdown_is_indented_code_block("    <widget>"));
     CHECK(markdown_is_indented_code_block("\t<widget>"));
@@ -879,6 +905,21 @@ TEST(frontend, language_card_list_container_survives_nested_block_close) {
     CHECK(markdown_fence_language(fence.info, "rut"));
 }
 
+TEST(frontend, language_card_same_line_html_close_retains_list_container) {
+    std::vector<MarkdownContainerSegment> container;
+    const std::string_view content =
+        markdown_container_content("- <!-- note -->", 0, nullptr, &container);
+    REQUIRE_EQ(container.size(), 1u);
+    const std::string end = markdown_raw_html_end_marker(markdown_block_content(content));
+    REQUIRE_EQ(end, std::string("-->"));
+    REQUIRE(markdown_raw_html_closes(end, content));
+    std::vector<MarkdownContainerSegment> continuation;
+    markdown_remember_list_container(container, &continuation);
+    std::string_view nested;
+    REQUIRE(markdown_strip_container("  ~~~~markdown", continuation, &nested));
+    CHECK_EQ(nested, "~~~~markdown");
+}
+
 TEST(frontend, language_card_ordered_list_interrupt_requires_start_one) {
     std::vector<MarkdownContainerSegment> container;
     CHECK_EQ(markdown_container_content("1. ~~~~rut", 0, nullptr, &container, false), "~~~~rut");
@@ -890,6 +931,9 @@ TEST(frontend, language_card_ordered_list_interrupt_requires_start_one) {
     CHECK_EQ(markdown_container_content("2. ~~~~rut", 0, nullptr, &container, false), "2. ~~~~rut");
     CHECK(container.empty());
     CHECK_EQ(markdown_container_content("+   \r", 0, nullptr, &container, false), "+   \r");
+    CHECK(container.empty());
+    CHECK_EQ(markdown_container_content("-     literal", 0, nullptr, &container, false),
+             "-     literal");
     CHECK(container.empty());
 }
 
@@ -930,6 +974,30 @@ TEST(frontend, language_card_nested_interrupting_container_retains_outer_list) {
     CHECK_EQ(outer[1].kind, MarkdownContainerSegment::Kind::Blockquote);
 }
 
+TEST(frontend, language_card_continued_list_parses_nested_container) {
+    std::vector<MarkdownContainerSegment> continued;
+    CHECK_EQ(markdown_container_content("- # heading", 0, nullptr, &continued), "# heading");
+    std::string_view content;
+    REQUIRE(markdown_strip_container("  - ~~~~rut", continued, &content));
+    std::vector<MarkdownContainerSegment> nested;
+    CHECK_EQ(markdown_container_content(content, 0, nullptr, &nested), "~~~~rut");
+    REQUIRE_EQ(nested.size(), 1u);
+    continued.insert(continued.end(), nested.begin(), nested.end());
+    REQUIRE_EQ(continued.size(), 2u);
+}
+
+TEST(frontend, language_card_partial_lazy_continuation_strips_present_prefix) {
+    std::vector<MarkdownContainerSegment> paragraph;
+    CHECK_EQ(markdown_container_content("> > prose", 0, nullptr, &paragraph), "prose");
+    REQUIRE_EQ(paragraph.size(), 2u);
+    std::vector<MarkdownContainerSegment> present(paragraph.begin(), paragraph.begin() + 1);
+    CHECK(markdown_container_prefix(present, paragraph));
+    std::string_view content;
+    REQUIRE(markdown_strip_container("> <widget>", present, &content));
+    CHECK_EQ(content, "<widget>");
+    CHECK(markdown_is_lazy_paragraph_continuation(content));
+}
+
 TEST(frontend, language_card_thematic_breaks_precede_list_markers) {
     for (const char* line : {"* * *", "- - -"}) {
         std::vector<MarkdownContainerSegment> container;
@@ -943,8 +1011,12 @@ TEST(frontend, language_card_list_continuation_accepts_tab_overshoot) {
     CHECK_EQ(markdown_container_content("- ```rut", 0, nullptr, &container), "```rut");
     REQUIRE_EQ(container.size(), 1u);
     std::string_view content;
-    CHECK(markdown_strip_container("\tinvalid", container, &content));
-    CHECK_EQ(content, "invalid");
+    std::string normalized;
+    CHECK(markdown_strip_container("\tinvalid", container, &content, &normalized));
+    CHECK_EQ(content, "  invalid");
+    CHECK(markdown_strip_container("\t  ~~~~markdown", container, &content, &normalized));
+    CHECK_EQ(content, "    ~~~~markdown");
+    CHECK(markdown_is_indented_code_block(content));
 }
 
 TEST(frontend, language_card_container_fence_ends_with_its_container) {
@@ -1075,7 +1147,9 @@ TEST(frontend, language_card_unmarked_rut_examples_parse_and_typecheck) {
             process_again = false;
             if (in_fence) {
                 std::string_view content;
-                if (!markdown_strip_container(line, current_fence.container_segments, &content)) {
+                std::string normalized_content;
+                if (!markdown_strip_container(
+                        line, current_fence.container_segments, &content, &normalized_content)) {
                     // A fence nested in a block quote or list ends when that
                     // containing block ends. Reprocess this line at top level.
                     finish_fence();
@@ -1097,11 +1171,14 @@ TEST(frontend, language_card_unmarked_rut_examples_parse_and_typecheck) {
 
             std::vector<MarkdownContainerSegment> line_container;
             std::string_view container_content;
+            std::string container_content_storage;
             if (paragraph_open) {
                 std::vector<MarkdownContainerSegment> interrupting_container;
                 std::string_view interrupting_content;
                 std::string_view outer_content;
-                if (markdown_strip_container(line, paragraph_container, &outer_content)) {
+                std::string normalized_outer_content;
+                if (markdown_strip_container(
+                        line, paragraph_container, &outer_content, &normalized_outer_content)) {
                     std::vector<MarkdownContainerSegment> nested_container;
                     interrupting_content = markdown_container_content(
                         outer_content, 0, nullptr, &nested_container, false);
@@ -1113,30 +1190,65 @@ TEST(frontend, language_card_unmarked_rut_examples_parse_and_typecheck) {
                     interrupting_content = markdown_container_content(
                         line, 0, nullptr, &interrupting_container, false);
                 }
+                const bool partial_lazy_continuation =
+                    markdown_container_prefix(interrupting_container, paragraph_container) &&
+                    markdown_is_lazy_paragraph_continuation(interrupting_content);
                 if (!interrupting_container.empty() &&
-                    !markdown_same_container(interrupting_container, paragraph_container)) {
+                    !markdown_same_container(interrupting_container, paragraph_container) &&
+                    !partial_lazy_continuation) {
                     paragraph_open = false;
                     paragraph_container.clear();
                     container_content = interrupting_content;
                     line_container = std::move(interrupting_container);
-                } else if (!markdown_strip_container(
-                               line, paragraph_container, &container_content)) {
-                    if (markdown_is_lazy_paragraph_continuation(line)) {
-                        container_content = line;
+                } else if (partial_lazy_continuation) {
+                    container_content = interrupting_content;
+                    line_container = paragraph_container;
+                } else {
+                    const bool has_full_container = markdown_strip_container(
+                        line, paragraph_container, &container_content, &container_content_storage);
+                    if (!has_full_container) {
+                        bool lazy_continuation = false;
+                        for (size_t prefix_len = paragraph_container.size(); prefix_len != 0;
+                             prefix_len--) {
+                            std::vector<MarkdownContainerSegment> prefix(
+                                paragraph_container.begin(),
+                                paragraph_container.begin() + prefix_len - 1);
+                            std::string_view partial_content;
+                            std::string normalized_partial_content;
+                            if (!markdown_strip_container(
+                                    line, prefix, &partial_content, &normalized_partial_content) ||
+                                !markdown_is_lazy_paragraph_continuation(partial_content))
+                                continue;
+                            container_content_storage = std::move(normalized_partial_content);
+                            container_content = container_content_storage.empty()
+                                                    ? partial_content
+                                                    : std::string_view(container_content_storage);
+                            lazy_continuation = true;
+                            break;
+                        }
+                        if (!lazy_continuation) {
+                            paragraph_open = false;
+                            paragraph_container.clear();
+                            process_again = true;
+                            continue;
+                        }
                         line_container = paragraph_container;
                     } else {
-                        paragraph_open = false;
-                        paragraph_container.clear();
-                        process_again = true;
-                        continue;
+                        line_container = paragraph_container;
                     }
-                } else {
-                    line_container = paragraph_container;
                 }
             } else {
                 if (!continued_list_container.empty() &&
-                    markdown_strip_container(line, continued_list_container, &container_content)) {
+                    markdown_strip_container(line,
+                                             continued_list_container,
+                                             &container_content,
+                                             &container_content_storage)) {
                     line_container = continued_list_container;
+                    std::vector<MarkdownContainerSegment> nested_container;
+                    container_content = markdown_container_content(
+                        container_content, 0, nullptr, &nested_container);
+                    line_container.insert(
+                        line_container.end(), nested_container.begin(), nested_container.end());
                 } else {
                     continued_list_container.clear();
                     container_content =
@@ -1148,7 +1260,9 @@ TEST(frontend, language_card_unmarked_rut_examples_parse_and_typecheck) {
             if (!container_line_blank) continued_list_container.clear();
             if (!raw_html_end.empty()) {
                 std::string_view html_content;
-                if (!markdown_strip_container(line, raw_html_container, &html_content)) {
+                std::string normalized_html_content;
+                if (!markdown_strip_container(
+                        line, raw_html_container, &html_content, &normalized_html_content)) {
                     raw_html_end.clear();
                     raw_html_container.clear();
                     process_again = true;
@@ -1192,7 +1306,10 @@ TEST(frontend, language_card_unmarked_rut_examples_parse_and_typecheck) {
                 if ((html_end.size() == 1 && html_end[0] == kMarkdownRawHtmlBlankLine) ||
                     lower.find(html_end) == std::string::npos)
                     raw_html_end = html_end;
-                if (!raw_html_end.empty()) raw_html_container = line_container;
+                if (!raw_html_end.empty())
+                    raw_html_container = line_container;
+                else
+                    markdown_remember_list_container(line_container, &continued_list_container);
                 paragraph_open = false;
                 paragraph_container.clear();
                 continue;
