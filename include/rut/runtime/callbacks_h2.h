@@ -132,6 +132,28 @@ void h2_emit_status(H2Dispatch<Loop>& d, u32 stream_id, u16 status) {
     h2_emit_response(d, stream_id, status, nullptr, 0, nullptr, 0);
 }
 
+// Append an informational HEADERS block without closing the stream. This is
+// used for Expect: 100-continue before a selected buffered forward waits for
+// DATA, so a client that gates its upload on the acknowledgement can proceed.
+template <typename Loop>
+void h2_emit_continue(H2Dispatch<Loop>& d, u32 stream_id) {
+    const hpack::Header status{{":status", 7}, {"100", 3}};
+    const u32 n = http2_write_headers(
+        d.resp + d.resp_len, d.resp_cap - d.resp_len, stream_id, &status, 1, false);
+    if (n == 0)
+        d.overflow = true;
+    else
+        d.resp_len += n;
+}
+
+inline bool h2_expects_continue(const hpack::Header* headers, u32 nheaders) {
+    for (u32 i = 0; i < nheaders; i++)
+        if (headers[i].name.eq(Str{"expect", 6}) &&
+            http_header_name_eq_ci(headers[i].value.ptr, headers[i].value.len, "100-continue", 12))
+            return true;
+    return false;
+}
+
 inline bool h2_response_status_forbids_body(u16 status) {
     return status < 200 || status == 204 || status == 205 || status == 304;
 }
@@ -391,6 +413,7 @@ bool h2_defer_until_data_end(H2Dispatch<Loop>& d,
     }
     h2->pending_route_param_count = stored;
     h2->pending_stream = stream_id;
+    if (h2_expects_continue(headers, nheaders)) h2_emit_continue(d, stream_id);
     return true;
 }
 
@@ -545,6 +568,7 @@ inline void h2_clear_async(Http2Conn& h2) {
     h2.async_body_start = 0;
     h2.async_body_len = 0;
     h2.async_inject_content_length_on_forward = false;
+    h2.async_wait_for_body_on_forward = false;
     h2.async_timer_ms = 0;
     h2.async_fn = nullptr;
     h2.async_state = 0;
@@ -553,6 +577,33 @@ inline void h2_clear_async(Http2Conn& h2) {
     h2.async_apply_response_mutations = false;
     h2.async_request_forwardable = false;
     h2.async_resp_len = 0;
+}
+
+// A HEADERS-time timer resumed into ForwardBuffered while the request stream is
+// still open. Move the stable request bytes and parked HandlerCtx into the
+// pending-body episode; setting async_stream to zero before clearing prevents
+// the old Timer owner from releasing the context's mutation storage.
+inline void h2_transfer_timer_to_pending_forward(Http2Conn& h2, u32 stream_id, u16 upstream_id) {
+    h2.pending_stream = stream_id;
+    h2.pending_body_start = h2.async_body_start;
+    h2.pending_synth_len = h2.async_synth_len;
+    h2.pending_body_len = 0;
+    h2.pending_content_length = 0;
+    h2.pending_has_content_length = false;
+    h2.pending_buffer_body = true;
+    h2.pending_request_forwardable = true;
+    h2.pending_overflow = false;
+    h2.pending_preinvoked_forward = true;
+    h2.pending_preinvoked_timer = false;
+    h2.pending_forward_upstream_id = upstream_id;
+    h2.pending_route_config = h2.async_cfg;
+    h2.pending_route = h2.async_route;
+    h2.pending_route_action = RouteAction::JitHandler;
+    h2.pending_jit_fn = h2.async_fn;
+    h2.pending_route_param_count = 0;
+
+    h2.async_stream = 0;
+    h2_clear_async(h2);
 }
 
 // Copy a synthesized h1 request into pending_synth (the per-connection stable
@@ -1097,7 +1148,8 @@ void h2_dispatch_request(H2Dispatch<Loop>& d,
             // because some other branch can forward. Only the selected buffered
             // forward parks and accumulates DATA. Preserve its already-produced
             // mutation context so the handler is not invoked a second time.
-            if (!end_stream && !route->needs_req_body && route->can_forward_buffered) {
+            if (!end_stream && !req.has_content_length && !route->needs_req_body &&
+                route->can_forward_buffered) {
                 Http2Conn* h2 = d.conn->h2;
                 if (h2->pending_stream != 0 || h2->async_stream != 0 ||
                     d.conn->h2_proxy_synth_quarantined) {
@@ -1157,30 +1209,25 @@ void h2_dispatch_request(H2Dispatch<Loop>& d,
                     return;
                 }
                 if (kOutcome.kind == JitDispatchOutcome::Kind::TimerYield) {
-                    if (!h2_defer_until_data_end(d,
-                                                 stream_id,
-                                                 headers,
-                                                 nheaders,
-                                                 req,
-                                                 /*buffer_body=*/true,
-                                                 RouteAction::JitHandler,
-                                                 config,
-                                                 route,
-                                                 params,
-                                                 param_count,
-                                                 200)) {
+                    if (!h2_suspend_timer(d,
+                                          stream_id,
+                                          route->fn,
+                                          *ctx,
+                                          kOutcome,
+                                          config,
+                                          synth,
+                                          kSynthLen,
+                                          h2_proxy_request_forwardable(headers, nheaders),
+                                          kSynthLen,
+                                          0,
+                                          true)) {
                         jit::release_response_body_mutation_storage(ctx);
+                        h2_emit_status(d, stream_id, 503);
                         return;
                     }
-                    if (!h2_snapshot_async_jit_ctx(*h2, *ctx, synth, kSynthLen)) {
-                        h2_clear_pending(*h2);
-                        jit::release_response_body_mutation_storage(ctx);
-                        h2_emit_status(d, stream_id, 500);
-                        return;
-                    }
-                    h2->pending_preinvoked_timer = true;
-                    h2->pending_timer_state = static_cast<u16>(kOutcome.next_state);
-                    h2->pending_timer_ms = kOutcome.timer_ms;
+                    h2->async_route = route;
+                    h2->async_wait_for_body_on_forward = true;
+                    if (h2_expects_continue(headers, nheaders)) h2_emit_continue(d, stream_id);
                     return;
                 }
                 if (kOutcome.kind == JitDispatchOutcome::Kind::ReturnStatus) {
@@ -1328,6 +1375,7 @@ void h2_on_data_cb(
 // is released by the post-process path once async_stream is clear.
 inline void h2_on_reset_cb(void* /*ctx*/, Http2Conn& c, u32 stream_id, Http2Error /*err*/) {
     if (c.async_stream != 0 && c.async_stream == stream_id) h2_clear_async(c);
+    if (c.pending_stream != 0 && c.pending_stream == stream_id) h2_clear_pending(c);
 }
 
 // Forward declaration: defined below; on_h2_data re-arms via this on send done.
@@ -1583,6 +1631,20 @@ void h2_resume_jit_handler(Loop* loop, Connection& conn) {
         h2->async_timer_ms = kOutcome.timer_ms;
         h2->async_state = static_cast<u16>(kOutcome.next_state);
         if (!h2_arm_async_timer<Loop>(loop, conn)) loop->close_conn(conn);
+        return;
+    }
+    if (kOutcome.kind == JitDispatchOutcome::Kind::ForwardBuffered &&
+        h2->async_request_forwardable && h2->async_wait_for_body_on_forward) {
+        // This timer began at HEADERS time while the peer side remained open.
+        // Only now that the resumed branch actually selected buffered forwarding
+        // do we collect DATA and apply the forwarding cap. Transfer ownership of
+        // the parked mutation context to the pending-body episode without
+        // releasing it; h2_finish_body will move it into the proxy episode.
+        conn.pending_handler_fn = nullptr;
+        conn.handler_ctx = nullptr;
+        h2_transfer_timer_to_pending_forward(*h2, kStreamId, kOutcome.upstream_id);
+        conn.transition_to_reading_header(&on_h2_data<Loop>);
+        loop->submit_recv(conn);
         return;
     }
     if (kOutcome.kind == JitDispatchOutcome::Kind::ForwardBuffered &&
