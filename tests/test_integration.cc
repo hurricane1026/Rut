@@ -10465,6 +10465,7 @@ TEST(shard, control_plane_snapshot_is_latched_over_http1) {
                                 'G',
                                 compiled.handler,
                                 /*needs_req_body=*/false,
+                                /*can_forward_buffered=*/false,
                                 /*needs_control_plane_snapshot=*/true));
     Shard<EpollEventLoop> shard;
     i32 lfd = create_listen_socket(0).value_or(-1);
@@ -10510,6 +10511,7 @@ TEST(shard, control_plane_snapshot_is_latched_over_http2) {
                                 'G',
                                 compiled.handler,
                                 /*needs_req_body=*/false,
+                                /*can_forward_buffered=*/false,
                                 /*needs_control_plane_snapshot=*/true));
     Shard<EpollEventLoop> shard;
     i32 lfd = create_listen_socket(0).value_or(-1);
