@@ -17963,6 +17963,17 @@ static FrontendResult<u32> analyze_for_stmt(const AstStatement& stmt,
                     arm_locals = arm_scoped_locals.data;
                     arm_local_count = arm_scoped_locals.len;
                 }
+                if (arm.has_arm_guard) {
+                    for (u32 li = arm_guard_carrier_start; li < arm_guard_carrier_end; li++) {
+                        if (arm.locals.len >= HirForLoopMatchArm::kMaxLocals)
+                            return frontend_error(FrontendError::TooManyItems, arm.arm_guard.span);
+                        arm.local_guard_depth[arm.locals.len] = 0;
+                        arm.local_precedes_arm_guard[arm.locals.len] = true;
+                        if (!arm.locals.push(route->locals[li]))
+                            return frontend_error(FrontendError::TooManyItems, arm.arm_guard.span);
+                        route->locals[li].name = {};
+                    }
+                }
                 if (arm_stmt->kind == AstStmtKind::Match && !arm_stmt->is_const) {
                     // A source-arm guard belongs to the outer match arm, not to
                     // each flattened nested arm. Latch it once into a hidden
@@ -17970,16 +17981,6 @@ static FrontendResult<u32> analyze_for_stmt(const AstStatement& stmt,
                     // same result instead of re-evaluating runtime work.
                     HirExpr source_arm_guard_ref{};
                     if (arm.has_arm_guard) {
-                        for (u32 li = arm_guard_carrier_start; li < arm_guard_carrier_end; li++) {
-                            if (arm.locals.len >= HirForLoopMatchArm::kMaxLocals)
-                                return frontend_error(FrontendError::TooManyItems,
-                                                      arm.arm_guard.span);
-                            arm.local_guard_depth[arm.locals.len] = 0;
-                            if (!arm.locals.push(route->locals[li]))
-                                return frontend_error(FrontendError::TooManyItems,
-                                                      arm.arm_guard.span);
-                            route->locals[li].name = {};
-                        }
                         HirLocal guard_local{};
                         guard_local.span = arm.arm_guard.span;
                         guard_local.ref_index =
@@ -17991,6 +17992,7 @@ static FrontendResult<u32> analyze_for_stmt(const AstStatement& stmt,
                         if (arm.locals.len >= HirForLoopMatchArm::kMaxLocals)
                             return frontend_error(FrontendError::TooManyItems, arm.arm_guard.span);
                         arm.local_guard_depth[arm.locals.len] = 0;
+                        arm.local_precedes_arm_guard[arm.locals.len] = true;
                         if (!arm.locals.push(guard_local) || !route->locals.push(guard_local))
                             return frontend_error(FrontendError::TooManyItems, arm.arm_guard.span);
 

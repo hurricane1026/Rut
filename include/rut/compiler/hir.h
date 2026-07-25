@@ -1023,6 +1023,10 @@ struct HirForLoopMatchArm {
     // 0 materializes at arm entry; N materializes only after prelude guard N
     // succeeds. This keeps guard-let unwrapping off the guard's failure edge.
     u8 local_guard_depth[kMaxLocals]{};
+    // Synthetic helper carriers (and the hidden flattened-guard latch) needed
+    // to evaluate the source arm guard must materialize before that guard. All
+    // other depth-0 locals belong to the arm body and run only after it passes.
+    bool local_precedes_arm_guard[kMaxLocals]{};
     // Flattened nested-match arms copied from one source arm share this id so
     // MIR evaluates their source-arm captures once across guard fallthroughs.
     u8 capture_group = 0;

@@ -3003,6 +3003,8 @@ FrontendResult<MirModule*> build_mir(const HirModule& module) {
             ForLoopCtx body_match_shared_contexts[HirForLoopMatch::kMaxMatchArms]{};
             FixedVec<MirBlock::Effect, HirForLoopMatchArm::kMaxLocals>
                 body_match_arm_effects[HirForLoopMatch::kMaxMatchArms]{};
+            FixedVec<MirBlock::Effect, HirForLoopMatchArm::kMaxLocals>
+                body_match_arm_guard_effects[HirForLoopMatch::kMaxMatchArms]{};
             FixedVec<u8, HirForLoopMatchArm::kMaxLocals>
                 body_match_arm_effect_depths[HirForLoopMatch::kMaxMatchArms]{};
             u8 body_match_capture_owner[HirForLoopMatch::kMaxMatchArms]{};
@@ -3081,11 +3083,17 @@ FrontendResult<MirModule*> build_mir(const HirModule& module) {
                         ForLoopCtx::LocalBinding binding{};
                         binding.ref_index = local.ref_index;
                         binding.value = &fn.values[fn.values.len - 1];
-                        if (!body_ctx->locals.push(binding) ||
-                            !body_match_arm_effects[ai].push(
-                                {value_index, local.span, materialized_ref}) ||
-                            !body_match_arm_effect_depths[ai].push(arm.local_guard_depth[li]))
+                        if (!body_ctx->locals.push(binding))
                             return frontend_error(FrontendError::TooManyItems, local.span);
+                        const MirBlock::Effect effect{value_index, local.span, materialized_ref};
+                        if (arm.local_precedes_arm_guard[li]) {
+                            if (!body_match_arm_guard_effects[ai].push(effect))
+                                return frontend_error(FrontendError::TooManyItems, local.span);
+                        } else if (!body_match_arm_effects[ai].push(effect) ||
+                                   !body_match_arm_effect_depths[ai].push(
+                                       arm.local_guard_depth[li])) {
+                            return frontend_error(FrontendError::TooManyItems, local.span);
+                        }
                         if (body_match_capture_owner[ai] == ai && li + 1 == arm.capture_local_count)
                             body_match_shared_contexts[ai] = *body_ctx;
                     }
@@ -3121,6 +3129,14 @@ FrontendResult<MirModule*> build_mir(const HirModule& module) {
                 for (u32 ei = 0; ei < body_match_arm_effects[arm_index].len; ei++) {
                     if (body_match_arm_effect_depths[arm_index][ei] != guard_depth) continue;
                     if (!block->effects.push(body_match_arm_effects[arm_index][ei]))
+                        return frontend_error(FrontendError::TooManyItems, span);
+                }
+                return {};
+            };
+            auto append_body_match_arm_guard_effects =
+                [&](MirBlock* block, u32 arm_index, Span span) -> FrontendResult<void> {
+                for (u32 ei = 0; ei < body_match_arm_guard_effects[arm_index].len; ei++) {
+                    if (!block->effects.push(body_match_arm_guard_effects[arm_index][ei]))
                         return frontend_error(FrontendError::TooManyItems, span);
                 }
                 return {};
@@ -3432,11 +3448,13 @@ FrontendResult<MirModule*> build_mir(const HirModule& module) {
                     const ForLoopCtx* body_ctx = for_loop_match_arm_ctx(arm, ai, terminating_ctx);
                     MirBlock guard_block{};
                     guard_block.label = cont_label();
-                    const u32 guard_effect_depth =
-                        arm.arm_guard_precedes_prelude ? 0 : arm.guards.len;
-                    auto effects = append_body_match_arm_effects(
-                        &guard_block, ai, guard_effect_depth, arm.span);
+                    auto effects = append_body_match_arm_guard_effects(&guard_block, ai, arm.span);
                     if (!effects) return core::make_unexpected(effects.error());
+                    if (!arm.arm_guard_precedes_prelude) {
+                        effects = append_body_match_arm_effects(
+                            &guard_block, ai, arm.guards.len, arm.span);
+                        if (!effects) return core::make_unexpected(effects.error());
+                    }
                     guard_block.term.kind = MirTerminatorKind::Branch;
                     guard_block.term.span = arm.arm_guard.span;
                     auto guard = mir_value(arm.arm_guard, module, &fn, body_ctx);
@@ -3454,7 +3472,8 @@ FrontendResult<MirModule*> build_mir(const HirModule& module) {
                     MirBlock case_block{};
                     case_block.label = body_match.arms[ai].is_wildcard ? match_default_label()
                                                                        : match_case_label();
-                    if (!body_match.arms[ai].has_arm_guard) {
+                    if (!body_match.arms[ai].has_arm_guard ||
+                        body_match.arms[ai].arm_guard_precedes_prelude) {
                         auto effects = append_body_match_arm_effects(&case_block,
                                                                      ai,
                                                                      body_match.arms[ai].guards.len,
@@ -3739,6 +3758,8 @@ FrontendResult<MirModule*> build_mir(const HirModule& module) {
                 ForLoopCtx shared_contexts[HirForLoopMatch::kMaxMatchArms]{};
                 FixedVec<MirBlock::Effect, HirForLoopMatchArm::kMaxLocals>
                     arm_effects[HirForLoopMatch::kMaxMatchArms]{};
+                FixedVec<MirBlock::Effect, HirForLoopMatchArm::kMaxLocals>
+                    arm_guard_effects[HirForLoopMatch::kMaxMatchArms]{};
                 FixedVec<u8, HirForLoopMatchArm::kMaxLocals>
                     arm_effect_depths[HirForLoopMatch::kMaxMatchArms]{};
                 u8 capture_owner[HirForLoopMatch::kMaxMatchArms]{};
@@ -3808,10 +3829,16 @@ FrontendResult<MirModule*> build_mir(const HirModule& module) {
                         ForLoopCtx::LocalBinding binding{};
                         binding.ref_index = local.ref_index;
                         binding.value = &fn.values[fn.values.len - 1];
-                        if (!body_ctx->locals.push(binding) ||
-                            !arm_effects[ai].push({value_index, local.span, materialized_ref}) ||
-                            !arm_effect_depths[ai].push(arm.local_guard_depth[li]))
+                        if (!body_ctx->locals.push(binding))
                             return frontend_error(FrontendError::TooManyItems, local.span);
+                        const MirBlock::Effect effect{value_index, local.span, materialized_ref};
+                        if (arm.local_precedes_arm_guard[li]) {
+                            if (!arm_guard_effects[ai].push(effect))
+                                return frontend_error(FrontendError::TooManyItems, local.span);
+                        } else if (!arm_effects[ai].push(effect) ||
+                                   !arm_effect_depths[ai].push(arm.local_guard_depth[li])) {
+                            return frontend_error(FrontendError::TooManyItems, local.span);
+                        }
                         if (capture_owner[ai] == ai && li + 1 == arm.capture_local_count)
                             shared_contexts[ai] = *body_ctx;
                     }
@@ -3823,6 +3850,14 @@ FrontendResult<MirModule*> build_mir(const HirModule& module) {
                     for (u32 ei = 0; ei < arm_effects[arm_index].len; ei++) {
                         if (arm_effect_depths[arm_index][ei] != guard_depth) continue;
                         if (!block->effects.push(arm_effects[arm_index][ei]))
+                            return frontend_error(FrontendError::TooManyItems, span);
+                    }
+                    return {};
+                };
+                auto append_arm_guard_effects =
+                    [&](MirBlock* block, u32 arm_index, Span span) -> FrontendResult<void> {
+                    for (u32 ei = 0; ei < arm_guard_effects[arm_index].len; ei++) {
+                        if (!block->effects.push(arm_guard_effects[arm_index][ei]))
                             return frontend_error(FrontendError::TooManyItems, span);
                     }
                     return {};
@@ -3887,10 +3922,12 @@ FrontendResult<MirModule*> build_mir(const HirModule& module) {
                     if (arm.has_arm_guard) {
                         MirBlock guard{};
                         guard.label = cont_label();
-                        const u32 guard_effect_depth =
-                            arm.arm_guard_precedes_prelude ? 0 : arm.guards.len;
-                        auto effects = append_arm_effects(&guard, ai, guard_effect_depth, arm.span);
+                        auto effects = append_arm_guard_effects(&guard, ai, arm.span);
                         if (!effects) return core::make_unexpected(effects.error());
+                        if (!arm.arm_guard_precedes_prelude) {
+                            effects = append_arm_effects(&guard, ai, arm.guards.len, arm.span);
+                            if (!effects) return core::make_unexpected(effects.error());
+                        }
                         guard.term.kind = MirTerminatorKind::Branch;
                         guard.term.span = arm.arm_guard.span;
                         auto cond = mir_value(arm.arm_guard, module, &fn, body_ctx);
@@ -3907,10 +3944,8 @@ FrontendResult<MirModule*> build_mir(const HirModule& module) {
                     for (u32 gi = 0; gi < arm.guards.len; gi++) {
                         MirBlock guard{};
                         guard.label = cont_label();
-                        if (!(gi == 0 && arm.has_arm_guard && arm.arm_guard_precedes_prelude)) {
-                            auto effects = append_arm_effects(&guard, ai, gi, arm.span);
-                            if (!effects) return core::make_unexpected(effects.error());
-                        }
+                        auto effects = append_arm_effects(&guard, ai, gi, arm.span);
+                        if (!effects) return core::make_unexpected(effects.error());
                         guard.term.kind = MirTerminatorKind::Branch;
                         guard.term.span = arm.guards[gi].span;
                         auto cond = mir_value(arm.guards[gi].cond, module, &fn, body_ctx);
@@ -3927,8 +3962,7 @@ FrontendResult<MirModule*> build_mir(const HirModule& module) {
                     }
                     MirBlock case_block{};
                     case_block.label = arm.is_wildcard ? match_default_label() : match_case_label();
-                    if (!arm.has_arm_guard ||
-                        (arm.arm_guard_precedes_prelude && arm.guards.len != 0)) {
+                    if (!arm.has_arm_guard || arm.arm_guard_precedes_prelude) {
                         auto case_effects =
                             append_arm_effects(&case_block, ai, arm.guards.len, arm.span);
                         if (!case_effects) return core::make_unexpected(case_effects.error());

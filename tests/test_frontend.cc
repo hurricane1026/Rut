@@ -33763,6 +33763,74 @@ route GET "/x" {
     rir.destroy();
 }
 
+TEST(frontend, static_loop_direct_arm_guard_retains_helper_carriers) {
+    const char* src = R"rut(
+func duplicate(values: [str]) -> [[str]] => [values, values]
+func inspect(_ groups: [[str]], flag: bool) -> bool => flag
+route GET "/x" {
+    for item in [1] {
+        match item {
+            1 if inspect(duplicate(req.queryAll("x")), req.http11) => return 201
+            _ => return 202
+        }
+    }
+    return 500
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    const auto& arm = hir->routes[0].for_loops[0].body.matches[0].arms[0];
+    REQUIRE_EQ(arm.locals.len, 1u);
+    CHECK(arm.local_precedes_arm_guard[0]);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    REQUIRE(lower_to_rir(mir.value(), rir));
+    CHECK(rir::verify_module(rir.module).ok);
+    rir.destroy();
+}
+
+TEST(frontend, static_loop_source_arm_guard_defers_body_local_effects) {
+    const char* src = R"rut(
+route GET "/x" {
+    for item in [1] {
+        match item {
+            1 if false => {
+                let sampled = time.nowMicros()
+                return 201
+            }
+            _ => return 202
+        }
+    }
+    return 500
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    u32 samples = 0;
+    for (u32 bi = 0; bi < mir->functions[0].blocks.len; bi++) {
+        const auto& block = mir->functions[0].blocks[bi];
+        for (u32 ei = 0; ei < block.effects.len; ei++) {
+            const auto& value = mir->functions[0].values[block.effects[ei].value_index];
+            if (value.kind != MirValueKind::TimeNowMicros) continue;
+            samples++;
+            CHECK_EQ(block.term.kind, MirTerminatorKind::ReturnStatus);
+            CHECK_EQ(block.term.status_code, 201);
+        }
+    }
+    CHECK_EQ(samples, 1u);
+}
+
 TEST(frontend, static_loop_iterator_alias_rejects_fallible_elements) {
     const char* src = R"rut(
 func maybe(ok: bool) -> i32 { if ok { 7 } else { error(.timeout) } }
