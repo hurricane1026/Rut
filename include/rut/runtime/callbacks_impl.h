@@ -2794,11 +2794,10 @@ void h2_proxy_finish(Loop* loop,
         // upstream's so the client learns the corresponding GET body size.
         if (http_header_name_eq_ci(kName.ptr, kName.len, "content-length", 14)) {
             if (!is_head) continue;
-        } else if (resp.chunked && http_header_name_eq_ci(kName.ptr, kName.len, "trailer", 7)) {
-            // ChunkedParser consumes the trailer section while de-framing the
-            // body; do not promise trailing HEADERS that we will not emit.
-            continue;
-        } else if (h2_drop_response_header(kName)) {
+        } else if ((resp.chunked && http_header_name_eq_ci(kName.ptr, kName.len, "trailer", 7)) ||
+                   h2_drop_response_header(kName)) {
+            // Drop hop-by-hop fields. ChunkedParser also consumes the trailer
+            // section, so do not promise trailing HEADERS that we will not emit.
             continue;
         }
         // Fields named by ANY upstream Connection header are hop-by-hop (RFC 7230
