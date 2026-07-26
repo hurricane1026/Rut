@@ -2264,10 +2264,67 @@ FrontendResult<MirModule*> build_mir(const HirModule& module) {
                 return {};
             };
             u32 next_unrolled_local_ref = 0;
-            for (u32 li = 0; li < module.routes[i].locals.len; li++)
-                if (module.routes[i].locals[li].ref_index < MirFunction::kMaxLocals &&
-                    next_unrolled_local_ref <= module.routes[i].locals[li].ref_index)
-                    next_unrolled_local_ref = module.routes[i].locals[li].ref_index + 1;
+            const auto reserve_local_ref = [&](const HirLocal& local) {
+                if (local.ref_index < MirFunction::kMaxLocals &&
+                    next_unrolled_local_ref <= local.ref_index)
+                    next_unrolled_local_ref = local.ref_index + 1;
+            };
+            const auto reserve_branch_refs = [&](const HirForLoopBranch& branch) {
+                for (u32 li = 0; li < branch.locals.len; li++) reserve_local_ref(branch.locals[li]);
+            };
+            const auto reserve_guard_refs = [&](const HirGuard& guard) {
+                if (guard.fail_kind == HirGuard::FailKind::Body) {
+                    for (u32 li = 0; li < guard.fail_body.locals.len; li++)
+                        reserve_local_ref(guard.fail_body.locals[li]);
+                    if (guard.fail_body.has_then_local)
+                        reserve_local_ref(guard.fail_body.then_local);
+                    return;
+                }
+                if (guard.fail_kind != HirGuard::FailKind::Match ||
+                    guard.fail_match_start > module.guard_match_arms.len ||
+                    guard.fail_match_count > module.guard_match_arms.len - guard.fail_match_start)
+                    return;
+                for (u32 ai = 0; ai < guard.fail_match_count; ai++) {
+                    const auto& arm = module.guard_match_arms[guard.fail_match_start + ai];
+                    for (u32 li = 0; li < arm.locals.len; li++) reserve_local_ref(arm.locals[li]);
+                }
+            };
+            const auto& hir_route = module.routes[i];
+            for (u32 li = 0; li < hir_route.locals.len; li++)
+                reserve_local_ref(hir_route.locals[li]);
+            for (u32 gi = 0; gi < hir_route.guards.len; gi++)
+                reserve_guard_refs(hir_route.guards[gi]);
+            if (hir_route.control.kind == HirControlKind::Match) {
+                for (u32 ai = 0; ai < hir_route.control.match_arms.len; ai++) {
+                    const auto& arm = hir_route.control.match_arms[ai];
+                    if (arm.has_then_local) reserve_local_ref(arm.then_local);
+                    for (u32 gi = 0; gi < arm.guards.len; gi++) reserve_guard_refs(arm.guards[gi]);
+                }
+            }
+            for (u32 fi = 0; fi < hir_route.for_loops.len; fi++) {
+                const auto& body = hir_route.for_loops[fi].body;
+                for (u32 li = 0; li < body.locals.len; li++) reserve_local_ref(body.locals[li]);
+                for (u32 li = 0; li < body.term_locals.len; li++)
+                    reserve_local_ref(body.term_locals[li]);
+                for (u32 gi = 0; gi < body.guards.len; gi++) reserve_guard_refs(body.guards[gi]);
+                for (u32 ii = 0; ii < body.ifs.len; ii++) {
+                    reserve_branch_refs(body.ifs[ii].then_branch);
+                    reserve_branch_refs(body.ifs[ii].else_branch);
+                }
+                for (u32 mi = 0; mi < body.matches.len; mi++) {
+                    const auto& match = body.matches[mi];
+                    for (u32 ai = 0; ai < match.arms.len; ai++) {
+                        const auto& arm = match.arms[ai];
+                        for (u32 li = 0; li < arm.locals.len; li++)
+                            reserve_local_ref(arm.locals[li]);
+                        for (u32 gi = 0; gi < arm.guards.len; gi++)
+                            reserve_guard_refs(arm.guards[gi]);
+                        reserve_branch_refs(arm.then_branch);
+                        reserve_branch_refs(arm.else_branch);
+                        reserve_branch_refs(arm.direct_branch);
+                    }
+                }
+            }
             auto push_materialized_binding = [&](ForLoopCtx* ctx,
                                                  u32 source_ref_index,
                                                  MirValue value,

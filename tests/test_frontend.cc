@@ -7751,6 +7751,32 @@ route GET "/x" {
         lit("Response.body reads in conditional value branches are not supported")));
 }
 
+TEST(frontend, response_body_reads_in_guard_match_arm_locals_are_rejected) {
+    const char* src = R"rut(
+func choose(flag: bool) -> str {
+    let resp = response(200)
+    resp.body = "pending"
+    if flag { "ok" } else { resp.body }
+}
+route GET "/x" {
+    let failed = error(.timeout)
+    guard match failed else {
+        .timeout => return 400, json({ value: choose(req.http11) })
+        _ => return 401
+    }
+    return 200
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE_FALSE(hir.has_value());
+    CHECK(hir.error().detail.eq(
+        lit("Response.body reads in conditional value branches are not supported")));
+}
+
 TEST(frontend, nested_call_arguments_cannot_reorder_response_reads_and_mutations) {
     const char* src = R"rut(
 func mutate(_ resp: Response) -> i32 {
@@ -32810,6 +32836,50 @@ route GET "/x" {
         CHECK(rir::verify_module(rir.module).ok);
         rir.destroy();
     }
+}
+
+TEST(frontend, static_for_reserves_guard_match_carrier_refs_before_materialization) {
+    const char* src = R"rut(
+func envelope(value: str) -> Json { let payload = json({ value: value }) payload }
+route GET "/x" {
+    let failed = error(.timeout)
+    for item in [req.path] {
+        guard match failed else {
+            .timeout => return 400, envelope(item)
+            _ => return 401
+        }
+    }
+    return 500
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    const auto& guard = hir->routes[0].for_loops[0].body.guards[0];
+    REQUIRE(static_cast<u8>(guard.fail_kind) == static_cast<u8>(HirGuard::FailKind::Match));
+    REQUIRE(guard.fail_match_count != 0);
+    u32 max_carrier_ref = 0;
+    bool found_carrier = false;
+    for (u32 ai = 0; ai < guard.fail_match_count; ai++) {
+        const auto& arm = hir->guard_match_arms[guard.fail_match_start + ai];
+        for (u32 li = 0; li < arm.locals.len; li++) {
+            found_carrier = true;
+            max_carrier_ref = std::max(max_carrier_ref, arm.locals[li].ref_index);
+        }
+    }
+    REQUIRE(found_carrier);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    REQUIRE(mir->functions[0].blocks.len != 0);
+    REQUIRE(mir->functions[0].blocks[0].effects.len != 0);
+    CHECK(mir->functions[0].blocks[0].effects[0].local_ref_index > max_carrier_ref);
+    FrontendRirModule rir{};
+    REQUIRE(lower_to_rir(mir.value(), rir));
+    CHECK(rir::verify_module(rir.module).ok);
+    rir.destroy();
 }
 
 TEST(frontend, nested_conditional_break_does_not_make_outer_loop_unconditionally_terminate) {

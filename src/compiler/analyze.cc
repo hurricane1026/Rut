@@ -4086,7 +4086,7 @@ static FrontendResult<void> build_reusable_json_plan(
     u32 depth = 0);
 static bool hir_expr_reads_wait_result(const HirExpr& expr);
 static bool hir_expr_reads_response_field(const HirExpr& expr);
-static bool route_reads_response_field(const HirRoute& route);
+static bool route_reads_response_field(const HirRoute& route, const HirModule& mod);
 static bool is_response_effect(HirExprKind kind);
 static bool function_has_response_effects(const HirFunction& fn);
 static bool hir_expr_reads_wait_result_with_locals(const HirExpr& expr,
@@ -5893,7 +5893,7 @@ static FrontendResult<HirExpr> instantiate_function_expr(const HirExpr& expr,
                                          effect_kind == HirExprKind::RespSetStatus ||
                                          effect_kind == HirExprKind::RespSetBody;
             if (!materialize_local && !response_effect) continue;
-            if (response_effect && route_reads_response_field(*route))
+            if (response_effect && route_reads_response_field(*route, mod))
                 return frontend_error(
                     FrontendError::UnsupportedSyntax,
                     expr.span,
@@ -6172,7 +6172,7 @@ static FrontendResult<void> instantiate_function_respond_guards(
     return {};
 }
 
-static bool route_reads_response_field(const HirRoute& route);
+static bool route_reads_response_field(const HirRoute& route, const HirModule& mod);
 
 static bool function_has_response_effects(const HirFunction& fn) {
     for (u32 ei = 0; ei < fn.exprs.len; ei++) {
@@ -6301,7 +6301,7 @@ static FrontendResult<void> instantiate_function_response_effects(
                     lit_str("a helper-local Response builder cannot mutate caller Response state"));
         }
     }
-    if (route_reads_response_field(*route))
+    if (route_reads_response_field(*route, mod))
         return frontend_error(
             FrontendError::UnsupportedSyntax,
             call_span,
@@ -11600,7 +11600,7 @@ static FrontendResult<HirExpr> analyze_call_expr(const AstExpr& expr,
         const bool materialize_local = materialized_ref != 0xffffffffu;
         const bool response_effect = is_response_effect(fn.exprs[ei].kind);
         if (!materialize_local && !response_effect) continue;
-        if (response_effect && route_reads_response_field(*route))
+        if (response_effect && route_reads_response_field(*route, mod))
             return frontend_error(
                 FrontendError::UnsupportedSyntax,
                 expr.span,
@@ -13989,36 +13989,54 @@ static bool hir_expr_conditionally_reads_response_body(const HirExpr& expr) {
     return false;
 }
 
-static bool hir_for_loop_reads_response(const HirForLoop& loop, bool (*reads)(const HirExpr&));
+using ResponseReadPredicate = bool (*)(const HirExpr&);
 
-static bool route_control_conditionally_reads_response_body(const HirRoute& route) {
+static bool guard_failure_reads_response(const HirGuard& guard,
+                                         const HirModule& mod,
+                                         ResponseReadPredicate reads) {
+    if (guard.fail_kind == HirGuard::FailKind::Match) {
+        if (reads(guard.fail_match_expr)) return true;
+        if (guard.fail_match_start > mod.guard_match_arms.len ||
+            guard.fail_match_count > mod.guard_match_arms.len - guard.fail_match_start)
+            return false;
+        for (u32 ai = 0; ai < guard.fail_match_count; ai++) {
+            const auto& arm = mod.guard_match_arms[guard.fail_match_start + ai];
+            if (reads(arm.pattern)) return true;
+            for (u32 li = 0; li < arm.locals.len; li++)
+                if (reads(arm.locals[li].init)) return true;
+        }
+        return false;
+    }
+    if (guard.fail_kind != HirGuard::FailKind::Body) return false;
+    for (u32 li = 0; li < guard.fail_body.locals.len; li++)
+        if (reads(guard.fail_body.locals[li].init)) return true;
+    return guard.fail_body.body_kind == HirGuardBody::BodyKind::If && reads(guard.fail_body.cond);
+}
+
+static bool hir_for_loop_reads_response(const HirForLoop& loop,
+                                        const HirModule& mod,
+                                        ResponseReadPredicate reads);
+
+static bool route_control_conditionally_reads_response_body(const HirRoute& route,
+                                                            const HirModule& mod) {
     // Control expressions may point into the route expression arena through
     // intermediate normalization nodes. Scan the arena as well as the rooted
     // guard/control trees so those embedded IfElse values cannot escape the
     // eager-lowering safety check.
     for (u32 ei = 0; ei < route.exprs.len; ei++)
         if (hir_expr_conditionally_reads_response_body(route.exprs[ei])) return true;
-    const auto guard_conditionally_reads_body = [](const HirGuard& guard) {
-        if (hir_expr_conditionally_reads_response_body(guard.cond) ||
-            (guard.fail_kind == HirGuard::FailKind::Match &&
-             hir_expr_conditionally_reads_response_body(guard.fail_match_expr)) ||
-            (guard.fail_kind == HirGuard::FailKind::Body &&
-             guard.fail_body.body_kind == HirGuardBody::BodyKind::If &&
-             hir_expr_conditionally_reads_response_body(guard.fail_body.cond)))
-            return true;
-        if (guard.fail_kind != HirGuard::FailKind::Body) return false;
-        for (u32 li = 0; li < guard.fail_body.locals.len; li++)
-            if (hir_expr_conditionally_reads_response_body(guard.fail_body.locals[li].init))
-                return true;
-        return false;
+    const auto guard_conditionally_reads_body = [&mod](const HirGuard& guard) {
+        return hir_expr_conditionally_reads_response_body(guard.cond) ||
+               guard_failure_reads_response(
+                   guard, mod, &hir_expr_conditionally_reads_response_body);
     };
     for (u32 gi = 0; gi < route.guards.len; gi++) {
         const auto& guard = route.guards[gi];
         if (guard_conditionally_reads_body(guard)) return true;
     }
     for (u32 fi = 0; fi < route.for_loops.len; fi++)
-        if (hir_for_loop_reads_response(route.for_loops[fi],
-                                        &hir_expr_conditionally_reads_response_body))
+        if (hir_for_loop_reads_response(
+                route.for_loops[fi], mod, &hir_expr_conditionally_reads_response_body))
             return true;
     const auto& control = route.control;
     if (control.kind == HirControlKind::If &&
@@ -14039,17 +14057,9 @@ static bool route_control_conditionally_reads_response_body(const HirRoute& rout
     return false;
 }
 
-using ResponseReadPredicate = bool (*)(const HirExpr&);
-
-static bool guard_failure_reads_response(const HirGuard& guard, ResponseReadPredicate reads) {
-    if (guard.fail_kind == HirGuard::FailKind::Match && reads(guard.fail_match_expr)) return true;
-    if (guard.fail_kind != HirGuard::FailKind::Body) return false;
-    for (u32 li = 0; li < guard.fail_body.locals.len; li++)
-        if (reads(guard.fail_body.locals[li].init)) return true;
-    return guard.fail_body.body_kind == HirGuardBody::BodyKind::If && reads(guard.fail_body.cond);
-}
-
-static bool hir_for_loop_reads_response(const HirForLoop& loop, ResponseReadPredicate reads) {
+static bool hir_for_loop_reads_response(const HirForLoop& loop,
+                                        const HirModule& mod,
+                                        ResponseReadPredicate reads) {
     if (reads(loop.iter_expr)) return true;
     const auto& body = loop.body;
     const auto branch_reads = [reads](const HirForLoopBranch& branch) {
@@ -14062,7 +14072,8 @@ static bool hir_for_loop_reads_response(const HirForLoop& loop, ResponseReadPred
     for (u32 li = 0; li < body.term_locals.len; li++)
         if (reads(body.term_locals[li].init)) return true;
     for (u32 gi = 0; gi < body.guards.len; gi++)
-        if (reads(body.guards[gi].cond) || guard_failure_reads_response(body.guards[gi], reads))
+        if (reads(body.guards[gi].cond) ||
+            guard_failure_reads_response(body.guards[gi], mod, reads))
             return true;
     for (u32 ii = 0; ii < body.ifs.len; ii++) {
         if (reads(body.ifs[ii].cond) || branch_reads(body.ifs[ii].then_branch) ||
@@ -14080,7 +14091,7 @@ static bool hir_for_loop_reads_response(const HirForLoop& loop, ResponseReadPred
                 if (reads(arm.locals[li].init)) return true;
             for (u32 gi = 0; gi < arm.guards.len; gi++)
                 if (reads(arm.guards[gi].cond) ||
-                    guard_failure_reads_response(arm.guards[gi], reads))
+                    guard_failure_reads_response(arm.guards[gi], mod, reads))
                     return true;
             if (branch_reads(arm.then_branch) || branch_reads(arm.else_branch) ||
                 branch_reads(arm.direct_branch))
@@ -14090,13 +14101,16 @@ static bool hir_for_loop_reads_response(const HirForLoop& loop, ResponseReadPred
     return false;
 }
 
-static bool route_reads_response(const HirRoute& route, ResponseReadPredicate reads) {
+static bool route_reads_response(const HirRoute& route,
+                                 const HirModule& mod,
+                                 ResponseReadPredicate reads) {
     for (u32 gi = 0; gi < route.guards.len; gi++) {
-        if (reads(route.guards[gi].cond) || guard_failure_reads_response(route.guards[gi], reads))
+        if (reads(route.guards[gi].cond) ||
+            guard_failure_reads_response(route.guards[gi], mod, reads))
             return true;
     }
     for (u32 fi = 0; fi < route.for_loops.len; fi++)
-        if (hir_for_loop_reads_response(route.for_loops[fi], reads)) return true;
+        if (hir_for_loop_reads_response(route.for_loops[fi], mod, reads)) return true;
     const auto& control = route.control;
     if (control.kind == HirControlKind::If) return reads(control.cond);
     if (control.kind != HirControlKind::Match) return false;
@@ -14107,18 +14121,19 @@ static bool route_reads_response(const HirRoute& route, ResponseReadPredicate re
             (arm.body_kind == HirMatchArm::BodyKind::If && reads(arm.cond)))
             return true;
         for (u32 gi = 0; gi < arm.guards.len; gi++)
-            if (reads(arm.guards[gi].cond) || guard_failure_reads_response(arm.guards[gi], reads))
+            if (reads(arm.guards[gi].cond) ||
+                guard_failure_reads_response(arm.guards[gi], mod, reads))
                 return true;
     }
     return false;
 }
 
-static bool route_reads_response_field(const HirRoute& route) {
-    return route_reads_response(route, &hir_expr_reads_response_field);
+static bool route_reads_response_field(const HirRoute& route, const HirModule& mod) {
+    return route_reads_response(route, mod, &hir_expr_reads_response_field);
 }
 
-static bool route_reads_response_header(const HirRoute& route) {
-    return route_reads_response(route, &hir_expr_reads_response_header);
+static bool route_reads_response_header(const HirRoute& route, const HirModule& mod) {
+    return route_reads_response(route, mod, &hir_expr_reads_response_header);
 }
 
 static FrontendResult<void> analyze_control_stmt(const AstStatement& stmt,
@@ -22856,7 +22871,7 @@ static FrontendResult<HirModule*> analyze_file_internal(
                     }
                 }
                 if (stmt.expr.kind == AstExprKind::Assign) {
-                    if (route_reads_response_field(route))
+                    if (route_reads_response_field(route, mod))
                         return frontend_error(
                             FrontendError::UnsupportedSyntax,
                             stmt.span,
@@ -23545,7 +23560,7 @@ static FrontendResult<HirModule*> analyze_file_internal(
                 route.locals[li].span,
                 lit_str("Response.body reads in conditional value branches are not supported"));
         }
-        if (route_control_conditionally_reads_response_body(route))
+        if (route_control_conditionally_reads_response_body(route, mod))
             return frontend_error(
                 FrontendError::UnsupportedSyntax,
                 route_decl.span,
@@ -23554,8 +23569,8 @@ static FrontendResult<HirModule*> analyze_file_internal(
         // Deferred terminal JSON values are rooted by route-expression
         // indices. Snapshot all pre-after reads now, before inlining chain
         // arguments/effects into the same arena.
-        bool response_field_read_before_chain_after = route_reads_response_field(route);
-        bool response_header_read_before_chain_after = route_reads_response_header(route);
+        bool response_field_read_before_chain_after = route_reads_response_field(route, mod);
+        bool response_header_read_before_chain_after = route_reads_response_header(route, mod);
         for (u32 ei = 0; ei < route.exprs.len; ei++)
             response_field_read_before_chain_after |=
                 hir_expr_reads_response_field(route.exprs[ei]);
