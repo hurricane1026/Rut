@@ -1024,10 +1024,10 @@ struct HirForLoopMatchArm {
     bool arm_guard_precedes_prelude = false;
     HirExpr arm_guard{};
     BodyKind body_kind = BodyKind::Direct;
-    // Four source locals, one source-guard helper carrier, plus one hidden
-    // carrier used to latch a flattened source-arm guard across the nested
-    // arms in its capture group.
-    static constexpr u32 kMaxLocals = 6;
+    // Four source locals, one source-guard helper carrier, plus hidden
+    // carriers used to latch a flattened source-arm guard and request-backed
+    // nested-match subject across the arms in their capture group.
+    static constexpr u32 kMaxLocals = 7;
     static constexpr u32 kMaxSourceLocals = 4;
     static constexpr u32 kMaxPreludeGuards = 2;
     FixedVec<HirLocal, kMaxLocals> locals;

@@ -32976,7 +32976,7 @@ route GET "/x" {
     rir.destroy();
 }
 
-TEST(frontend, static_for_nested_match_rejects_direct_request_subject) {
+TEST(frontend, static_for_nested_match_materializes_direct_request_subject_once) {
     const char* src = R"rut(
 route GET "/x" {
     for item in [1] {
@@ -32997,9 +32997,17 @@ route GET "/x" {
     auto ast = parse_file_heap(lexed.value());
     REQUIRE(ast);
     auto hir = analyze_file_heap(ast.value());
-    REQUIRE_FALSE(hir);
-    CHECK(hir.error().detail.eq(
-        lit("static for-loop nested match subject must not repeat runtime work")));
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    REQUIRE(lower_to_rir(mir.value(), rir));
+    CHECK(rir::verify_module(rir.module).ok);
+    u32 path_reads = 0;
+    for (u32 bi = 0; bi < rir.module.functions[0].block_count; bi++)
+        path_reads += block_op_count(rir.module.functions[0].blocks[bi], rir::Opcode::ReqPath);
+    CHECK_EQ(path_reads, 1u);
+    rir.destroy();
 }
 
 TEST(frontend, nested_conditional_break_does_not_make_outer_loop_unconditionally_terminate) {

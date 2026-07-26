@@ -6201,10 +6201,7 @@ static bool hir_expr_has_deferred_protocol_call(const HirExpr& expr) {
 
 static bool static_for_expr_repeats_runtime_work(const AstExpr& expr) {
     if (expr.kind == AstExprKind::Call || expr.kind == AstExprKind::MethodCall ||
-        expr.kind == AstExprKind::Pipe || expr.kind == AstExprKind::Wait ||
-        expr.kind == AstExprKind::Field || expr.kind == AstExprKind::ReqHeader ||
-        expr.kind == AstExprKind::ReqParam || expr.kind == AstExprKind::ReqCookie ||
-        expr.kind == AstExprKind::ReqQuery || expr.kind == AstExprKind::ReqQueryString)
+        expr.kind == AstExprKind::Pipe || expr.kind == AstExprKind::Wait)
         return true;
     if (expr.lhs != nullptr && static_for_expr_repeats_runtime_work(*expr.lhs)) return true;
     if (expr.rhs != nullptr && static_for_expr_repeats_runtime_work(*expr.rhs)) return true;
@@ -6214,6 +6211,26 @@ static bool static_for_expr_repeats_runtime_work(const AstExpr& expr) {
     for (u32 i = 0; i < expr.field_inits.len; i++)
         if (expr.field_inits[i].value != nullptr &&
             static_for_expr_repeats_runtime_work(*expr.field_inits[i].value))
+            return true;
+    return false;
+}
+
+static bool static_for_expr_reads_request_state(const AstExpr& expr) {
+    if (expr.kind == AstExprKind::ReqHeader || expr.kind == AstExprKind::ReqParam ||
+        expr.kind == AstExprKind::ReqCookie || expr.kind == AstExprKind::ReqQuery ||
+        expr.kind == AstExprKind::ReqQueryString)
+        return true;
+    if (expr.kind == AstExprKind::Field && expr.lhs != nullptr &&
+        expr.lhs->kind == AstExprKind::Ident && expr.lhs->name.eq(lit_str("req")))
+        return true;
+    if (expr.lhs != nullptr && static_for_expr_reads_request_state(*expr.lhs)) return true;
+    if (expr.rhs != nullptr && static_for_expr_reads_request_state(*expr.rhs)) return true;
+    for (u32 i = 0; i < expr.args.len; i++)
+        if (expr.args[i] != nullptr && static_for_expr_reads_request_state(*expr.args[i]))
+            return true;
+    for (u32 i = 0; i < expr.field_inits.len; i++)
+        if (expr.field_inits[i].value != nullptr &&
+            static_for_expr_reads_request_state(*expr.field_inits[i].value))
             return true;
     return false;
 }
@@ -17529,9 +17546,36 @@ static FrontendResult<u32> analyze_for_stmt(const AstStatement& stmt,
                         return frontend_error(FrontendError::UnsupportedSyntax,
                                               nested_match_stmt->expr.span,
                                               kMatchI64Detail);
-                    if (!route->exprs.push(inner_subject.value()))
+                    if (static_for_expr_reads_request_state(nested_match_stmt->expr)) {
+                        HirLocal subject_local{};
+                        subject_local.span = nested_match_stmt->expr.span;
+                        subject_local.ref_index =
+                            next_local_ref_index(route, route->locals.data, route->locals.len);
+                        if (subject_local.ref_index >= HirRoute::kMaxLocals)
+                            return frontend_error(FrontendError::TooManyItems,
+                                                  nested_match_stmt->expr.span);
+                        copy_json_value_metadata(&subject_local, inner_subject.value());
+                        subject_local.init = inner_subject.value();
+                        const u32 local_index = loop.body.locals.len;
+                        if (!route->locals.push(subject_local) ||
+                            !loop.body.locals.push(subject_local))
+                            return frontend_error(FrontendError::TooManyItems,
+                                                  nested_match_stmt->expr.span);
+                        HirForLoopBody::Step local_step{};
+                        local_step.kind = HirForLoopBody::Step::Kind::Let;
+                        local_step.index = local_index;
+                        local_step.span = nested_match_stmt->expr.span;
+                        if (!loop.body.steps.push(local_step))
+                            return frontend_error(FrontendError::TooManyItems,
+                                                  nested_match_stmt->expr.span);
+                        if (!route->exprs.push(
+                                make_json_local_ref(subject_local, nested_match_stmt->expr.span)))
+                            return frontend_error(FrontendError::TooManyItems,
+                                                  nested_match_stmt->expr.span);
+                    } else if (!route->exprs.push(inner_subject.value())) {
                         return frontend_error(FrontendError::TooManyItems,
                                               nested_match_stmt->expr.span);
+                    }
                     HirExpr* inner_subject_ptr = &route->exprs[route->exprs.len - 1];
                     bool inner_seen_wildcard = false;
                     bool inner_seen_bool_true = false;
@@ -18177,8 +18221,39 @@ static FrontendResult<u32> analyze_for_stmt(const AstStatement& stmt,
                     if (inner_subject->type == HirTypeKind::I64)
                         return frontend_error(
                             FrontendError::UnsupportedSyntax, arm_stmt->expr.span, kMatchI64Detail);
-                    if (!route->exprs.push(inner_subject.value()))
+                    if (static_for_expr_reads_request_state(arm_stmt->expr)) {
+                        HirLocal subject_local{};
+                        subject_local.span = arm_stmt->expr.span;
+                        subject_local.ref_index =
+                            next_local_ref_index(route, arm_locals, arm_local_count);
+                        if (subject_local.ref_index >= HirRoute::kMaxLocals ||
+                            arm.locals.len >= HirForLoopMatchArm::kMaxLocals)
+                            return frontend_error(FrontendError::TooManyItems, arm_stmt->expr.span);
+                        copy_json_value_metadata(&subject_local, inner_subject.value());
+                        subject_local.init = inner_subject.value();
+                        arm.local_guard_depth[arm.locals.len] = arm.guards.len;
+                        if (!arm.locals.push(subject_local))
+                            return frontend_error(FrontendError::TooManyItems, arm_stmt->expr.span);
+                        if (arm_locals != arm_scoped_locals.data) {
+                            for (u32 li = 0; li < arm_local_count; li++)
+                                if (!arm_scoped_locals.push(arm_locals[li]))
+                                    return frontend_error(FrontendError::TooManyItems,
+                                                          arm_stmt->expr.span);
+                        }
+                        auto inserted = insert_scoped_local(arm_scoped_locals.data,
+                                                            arm_scoped_locals.len,
+                                                            HirRoute::kMaxLocals,
+                                                            subject_local,
+                                                            arm_stmt->expr.span);
+                        if (!inserted) return core::make_unexpected(inserted.error());
+                        arm_locals = arm_scoped_locals.data;
+                        arm_local_count = arm_scoped_locals.len;
+                        if (!route->exprs.push(
+                                make_json_local_ref(subject_local, arm_stmt->expr.span)))
+                            return frontend_error(FrontendError::TooManyItems, arm_stmt->expr.span);
+                    } else if (!route->exprs.push(inner_subject.value())) {
                         return frontend_error(FrontendError::TooManyItems, arm_stmt->expr.span);
+                    }
                     HirExpr* inner_subject_ptr = &route->exprs[route->exprs.len - 1];
                     arm.capture_local_count = static_cast<u8>(arm.locals.len);
                     bool inner_seen_wildcard = false;
