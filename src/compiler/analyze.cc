@@ -6201,7 +6201,10 @@ static bool hir_expr_has_deferred_protocol_call(const HirExpr& expr) {
 
 static bool static_for_expr_repeats_runtime_work(const AstExpr& expr) {
     if (expr.kind == AstExprKind::Call || expr.kind == AstExprKind::MethodCall ||
-        expr.kind == AstExprKind::Pipe || expr.kind == AstExprKind::Wait)
+        expr.kind == AstExprKind::Pipe || expr.kind == AstExprKind::Wait ||
+        expr.kind == AstExprKind::Field || expr.kind == AstExprKind::ReqHeader ||
+        expr.kind == AstExprKind::ReqParam || expr.kind == AstExprKind::ReqCookie ||
+        expr.kind == AstExprKind::ReqQuery || expr.kind == AstExprKind::ReqQueryString)
         return true;
     if (expr.lhs != nullptr && static_for_expr_repeats_runtime_work(*expr.lhs)) return true;
     if (expr.rhs != nullptr && static_for_expr_repeats_runtime_work(*expr.rhs)) return true;
@@ -23831,6 +23834,11 @@ static FrontendResult<HirModule*> analyze_file_internal(
                                                       named_error_cases);
                 if (!collected) return core::make_unexpected(collected.error());
             }
+            for (u32 li = 0; li < route.for_loops[fi].body.term_locals.len; li++) {
+                collected = collect_named_error_cases(route.for_loops[fi].body.term_locals[li].init,
+                                                      named_error_cases);
+                if (!collected) return core::make_unexpected(collected.error());
+            }
             for (u32 gi = 0; gi < route.for_loops[fi].body.guards.len; gi++) {
                 HirGuard& guard = route.for_loops[fi].body.guards[gi];
                 collected = collect_named_error_cases(guard.cond, named_error_cases);
@@ -24026,6 +24034,14 @@ static FrontendResult<HirModule*> analyze_file_internal(
                 patch_error_variant_refs(&route.for_loops[fi].iter_expr, route.error_variant_index);
                 for (u32 li = 0; li < route.for_loops[fi].body.locals.len; li++) {
                     HirLocal& local = route.for_loops[fi].body.locals[li];
+                    patch_named_error_variant(
+                        &local.init, route.error_variant_index, named_error_cases);
+                    patch_error_variant_refs(&local.init, route.error_variant_index);
+                    if (local.may_error && local.error_variant_index == 0xffffffffu)
+                        local.error_variant_index = route.error_variant_index;
+                }
+                for (u32 li = 0; li < route.for_loops[fi].body.term_locals.len; li++) {
+                    HirLocal& local = route.for_loops[fi].body.term_locals[li];
                     patch_named_error_variant(
                         &local.init, route.error_variant_index, named_error_cases);
                     patch_error_variant_refs(&local.init, route.error_variant_index);

@@ -32948,6 +32948,60 @@ route GET "/x" {
     }
 }
 
+TEST(frontend, static_for_direct_term_helpers_resolve_named_error_cases) {
+    const char* src = R"rut(
+func envelope(value: i32) -> Json {
+    let selected = any(error(.timeout), value)
+    let payload = json({ value: selected })
+    payload
+}
+route GET "/x" {
+    for item in [1] { return 200, envelope(item) }
+    return 500
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    const auto& route = hir->routes[0];
+    REQUIRE(route.for_loops[0].body.term_locals.len != 0);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    REQUIRE(lower_to_rir(mir.value(), rir));
+    CHECK(rir::verify_module(rir.module).ok);
+    rir.destroy();
+}
+
+TEST(frontend, static_for_nested_match_rejects_direct_request_subject) {
+    const char* src = R"rut(
+route GET "/x" {
+    for item in [1] {
+        match item {
+            1 => match req.path {
+                "/a" => return 201
+                "/b" => return 202
+                _ => return 203
+            }
+            _ => return 204
+        }
+    }
+    return 500
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE_FALSE(hir);
+    CHECK(hir.error().detail.eq(
+        lit("static for-loop nested match subject must not repeat runtime work")));
+}
+
 TEST(frontend, nested_conditional_break_does_not_make_outer_loop_unconditionally_terminate) {
     const char* src =
         "route GET \"/x\" { for outer in [1] { for inner in [0] { guard inner > 0 else { break } "
