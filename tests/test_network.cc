@@ -5904,6 +5904,85 @@ TEST(buffered_forward, status_mutations_enforce_partial_content_metadata) {
     CHECK(invalid_upstream_partial.second.find("Content-Range") == std::string::npos);
 }
 
+TEST(buffered_forward, head_206_without_content_length_keeps_structural_range) {
+    SmallLoop loop;
+    loop.setup();
+    auto* conn = setup_proxy_conn_head(loop);
+    REQUIRE(conn != nullptr);
+    conn->proxy_response_buffered = true;
+    conn->reset_jit_ctx();
+
+    static constexpr char kUpstream[] =
+        "HTTP/1.1 206 Partial Content\r\nContent-Range: bytes 0-99/200\r\n"
+        "Connection: close\r\n\r\n";
+    conn->upstream_recv_buf.reset();
+    conn->upstream_recv_buf.write(reinterpret_cast<const u8*>(kUpstream), sizeof(kUpstream) - 1);
+    on_upstream_response<SmallLoop>(
+        &loop,
+        *conn,
+        make_ev(conn->id, IoEventType::UpstreamRecv, static_cast<i32>(sizeof(kUpstream) - 1)));
+
+    const char* wire = reinterpret_cast<const char*>(conn->send_buf.data());
+    CHECK_EQ(conn->resp_status, 206u);
+    CHECK(buf_contains(wire,
+                       conn->send_buf.len(),
+                       "Content-Range: bytes 0-99/200\r\n",
+                       sizeof("Content-Range: bytes 0-99/200\r\n") - 1));
+}
+
+TEST(buffered_forward, body_replacement_rejects_inherited_multipart_206) {
+    SmallLoop loop;
+    loop.setup();
+    auto* conn = setup_proxy_conn(loop);
+    REQUIRE(conn != nullptr);
+    conn->proxy_response_buffered = true;
+    auto* ctx = conn->reset_jit_ctx();
+    static constexpr char kReplacement[] = "rewritten";
+    ctx->response_body_mutation_storage = jit::acquire_response_body_mutation_storage();
+    REQUIRE(ctx->response_body_mutation_storage != nullptr);
+    __builtin_memcpy(ctx->response_body_mutation_storage, kReplacement, sizeof(kReplacement) - 1);
+    ctx->response_body_mutation_len = sizeof(kReplacement) - 1;
+    ctx->response_body_mutation_set = true;
+
+    static constexpr char kUpstream[] =
+        "HTTP/1.1 206 Partial Content\r\nContent-Length: 4\r\n"
+        "Content-Type: multipart/byteranges; boundary=origin\r\n\r\ndata";
+    conn->upstream_recv_buf.reset();
+    conn->upstream_recv_buf.write(reinterpret_cast<const u8*>(kUpstream), sizeof(kUpstream) - 1);
+    on_upstream_response<SmallLoop>(
+        &loop,
+        *conn,
+        make_ev(conn->id, IoEventType::UpstreamRecv, static_cast<i32>(sizeof(kUpstream) - 1)));
+
+    CHECK_EQ(conn->resp_status, 500u);
+}
+
+TEST(buffered_forward, bodyless_head_and_304_allow_unsupported_transfer_coding) {
+    const auto run = [&](bool head) {
+        SmallLoop loop;
+        loop.setup();
+        auto* conn = head ? setup_proxy_conn_head(loop) : setup_proxy_conn(loop);
+        REQUIRE(conn != nullptr);
+        conn->proxy_response_buffered = true;
+        conn->reset_jit_ctx();
+        static constexpr char kHead[] =
+            "HTTP/1.1 200 OK\r\nTransfer-Encoding: gzip, chunked\r\n\r\n";
+        static constexpr char kNotModified[] =
+            "HTTP/1.1 304 Not Modified\r\nTransfer-Encoding: gzip, chunked\r\n\r\n";
+        const char* upstream = head ? kHead : kNotModified;
+        const u32 upstream_len = head ? sizeof(kHead) - 1 : sizeof(kNotModified) - 1;
+        conn->upstream_recv_buf.reset();
+        conn->upstream_recv_buf.write(reinterpret_cast<const u8*>(upstream), upstream_len);
+        on_upstream_response<SmallLoop>(
+            &loop,
+            *conn,
+            make_ev(conn->id, IoEventType::UpstreamRecv, static_cast<i32>(upstream_len)));
+        CHECK_EQ(conn->resp_status, head ? 200u : 304u);
+    };
+    run(true);
+    run(false);
+}
+
 TEST(buffered_forward, body_replacement_preserves_unsatisfied_content_range) {
     SmallLoop loop;
     loop.setup();
@@ -6084,6 +6163,156 @@ TEST(buffered_forward, h2_parked_status_mutation_to_304_preserves_representation
     CHECK((frame.flags & http2_flag::kEndStream) != 0);
 
     conn->h2 = nullptr;
+}
+
+TEST(buffered_forward, h2_validates_head_ranges_and_replaced_multipart_bodies) {
+    const auto run = [&](const char* upstream,
+                         u32 upstream_len,
+                         u32 body_len,
+                         bool is_head,
+                         bool replace_body,
+                         u16 expected_status) {
+        SmallLoop loop;
+        loop.setup();
+        loop.inject_and_dispatch(make_ev(0, IoEventType::Accept, 42));
+        auto* conn = loop.find_fd(42);
+        REQUIRE(conn != nullptr);
+        REQUIRE(loop.alloc_upstream_buf(*conn));
+
+        Http2Conn h2{};
+        h2.init();
+        h2.async_stream = 1;
+        h2.async_kind = H2AsyncKind::Proxy;
+        h2.async_apply_response_mutations = replace_body;
+        conn->h2 = &h2;
+        conn->protocol = ConnProtocol::Http2;
+        conn->state = ConnState::Proxying;
+        conn->upstream_fd = dup(2);
+        REQUIRE(conn->upstream_fd >= 0);
+        conn->reset_jit_ctx();
+        if (replace_body) {
+            auto* ctx = h2.async_jit_ctx();
+            static constexpr char kReplacement[] = "rewritten";
+            ctx->response_body_mutation_storage = jit::acquire_response_body_mutation_storage();
+            REQUIRE(ctx->response_body_mutation_storage != nullptr);
+            __builtin_memcpy(
+                ctx->response_body_mutation_storage, kReplacement, sizeof(kReplacement) - 1);
+            ctx->response_body_mutation_len = sizeof(kReplacement) - 1;
+            ctx->response_body_mutation_set = true;
+        }
+
+        conn->upstream_recv_buf.write(reinterpret_cast<const u8*>(upstream), upstream_len);
+        HttpResponseParser parser;
+        parser.reset();
+        ParsedResponse resp{};
+        REQUIRE(parser.parse(conn->upstream_recv_buf.data(),
+                             conn->upstream_recv_buf.len(),
+                             &resp) == ParseStatus::Complete);
+        loop.backend.clear_ops();
+        h2_proxy_finish(&loop, *conn, resp, parser.header_end, body_len, is_head);
+
+        const auto* send = loop.backend.last_op(MockOp::Send);
+        REQUIRE(send != nullptr);
+        Http2FrameHeader frame{};
+        REQUIRE(parse_frame_header(send->send_buf, send->send_len, &frame) ==
+                ParseStatus::Complete);
+        hpack::DynamicTable dyn;
+        dyn.init(4096);
+        hpack::Header headers[16];
+        u8 scratch[256];
+        u32 header_count = 0;
+        REQUIRE(hpack::decode_header_block(dyn,
+                                           send->send_buf + kFrameHeaderSize,
+                                           frame.length,
+                                           scratch,
+                                           sizeof(scratch),
+                                           headers,
+                                           16,
+                                           &header_count));
+        u16 status = 0;
+        for (u32 i = 0; i < header_count; i++) {
+            if (!headers[i].name.eq(Str{":status", 7})) continue;
+            for (u32 j = 0; j < headers[i].value.len; j++)
+                status = static_cast<u16>(status * 10 + headers[i].value.ptr[j] - '0');
+        }
+        CHECK_EQ(status, expected_status);
+        conn->h2 = nullptr;
+    };
+
+    static constexpr char kHeadRange[] =
+        "HTTP/1.1 206 Partial Content\r\nContent-Range: bytes 0-99/200\r\n\r\n";
+    run(kHeadRange, sizeof(kHeadRange) - 1, 0, true, false, 206);
+
+    static constexpr char kMultipart[] =
+        "HTTP/1.1 206 Partial Content\r\nContent-Length: 4\r\n"
+        "Content-Type: multipart/byteranges; boundary=origin\r\n\r\ndata";
+    run(kMultipart, sizeof(kMultipart) - 1, 4, false, true, 500);
+}
+
+TEST(buffered_forward, h2_bodyless_head_and_304_allow_unsupported_transfer_coding) {
+    const auto run = [&](bool head) {
+        SmallLoop loop;
+        loop.setup();
+        loop.inject_and_dispatch(make_ev(0, IoEventType::Accept, 42));
+        auto* conn = loop.find_fd(42);
+        REQUIRE(conn != nullptr);
+        REQUIRE(loop.alloc_upstream_buf(*conn));
+
+        Http2Conn h2{};
+        h2.init();
+        h2.async_stream = 1;
+        h2.async_kind = H2AsyncKind::Proxy;
+        static constexpr char kHeadRequest[] = "HEAD / HTTP/1.1\r\n\r\n";
+        static constexpr char kGetRequest[] = "GET / HTTP/1.1\r\n\r\n";
+        const char* request = head ? kHeadRequest : kGetRequest;
+        h2.async_synth_len = head ? sizeof(kHeadRequest) - 1 : sizeof(kGetRequest) - 1;
+        __builtin_memcpy(h2.pending_synth, request, h2.async_synth_len);
+        conn->h2 = &h2;
+        conn->protocol = ConnProtocol::Http2;
+        conn->state = ConnState::Proxying;
+        conn->upstream_fd = dup(2);
+        REQUIRE(conn->upstream_fd >= 0);
+        static constexpr char kHead[] =
+            "HTTP/1.1 200 OK\r\nTransfer-Encoding: gzip, chunked\r\n\r\n";
+        static constexpr char kNotModified[] =
+            "HTTP/1.1 304 Not Modified\r\nTransfer-Encoding: gzip, chunked\r\n\r\n";
+        const char* upstream = head ? kHead : kNotModified;
+        const u32 upstream_len = head ? sizeof(kHead) - 1 : sizeof(kNotModified) - 1;
+        conn->upstream_recv_buf.write(reinterpret_cast<const u8*>(upstream), upstream_len);
+        loop.backend.clear_ops();
+        h2_on_upstream_response<SmallLoop>(
+            &loop,
+            *conn,
+            make_ev(conn->id, IoEventType::UpstreamRecv, static_cast<i32>(upstream_len)));
+
+        const auto* send = loop.backend.last_op(MockOp::Send);
+        REQUIRE(send != nullptr);
+        Http2FrameHeader frame{};
+        REQUIRE(parse_frame_header(send->send_buf, send->send_len, &frame) ==
+                ParseStatus::Complete);
+        hpack::DynamicTable dyn;
+        dyn.init(4096);
+        hpack::Header headers[16];
+        u8 scratch[256];
+        u32 header_count = 0;
+        REQUIRE(hpack::decode_header_block(dyn,
+                                           send->send_buf + kFrameHeaderSize,
+                                           frame.length,
+                                           scratch,
+                                           sizeof(scratch),
+                                           headers,
+                                           16,
+                                           &header_count));
+        bool found_status = false;
+        const Str expected = head ? Str{"200", 3} : Str{"304", 3};
+        for (u32 i = 0; i < header_count; i++)
+            found_status |= headers[i].name.eq(Str{":status", 7}) && headers[i].value.eq(expected);
+        CHECK(found_status);
+        conn->h2 = nullptr;
+    };
+
+    run(true);
+    run(false);
 }
 
 TEST(buffered_forward, h2_deframing_and_body_replacement_strip_stale_metadata) {

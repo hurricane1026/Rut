@@ -2733,53 +2733,57 @@ inline bool valid_unsatisfied_content_range(Str value) {
     return pos == value.len;
 }
 
-inline bool response_is_multipart_byteranges(const ResponseHeaderKV* headers, u32 header_count) {
+inline bool content_type_is_multipart_byteranges(Str value) {
     static constexpr char kMultipart[] = "multipart/byteranges";
+    u32 start = 0;
+    while (start < value.len && (value.ptr[start] == ' ' || value.ptr[start] == '\t')) start++;
+    if (value.len - start < sizeof(kMultipart) - 1 ||
+        !http_header_name_eq_ci(
+            value.ptr + start, sizeof(kMultipart) - 1, kMultipart, sizeof(kMultipart) - 1))
+        return false;
+    u32 pos = start + sizeof(kMultipart) - 1;
+    if (pos < value.len && value.ptr[pos] != ';' && value.ptr[pos] != ' ' && value.ptr[pos] != '\t')
+        return false;
+    while (pos < value.len) {
+        while (pos < value.len && (value.ptr[pos] == ' ' || value.ptr[pos] == '\t')) pos++;
+        if (pos == value.len || value.ptr[pos] != ';') break;
+        pos++;
+        while (pos < value.len && (value.ptr[pos] == ' ' || value.ptr[pos] == '\t')) pos++;
+        const u32 name_start = pos;
+        while (pos < value.len && value.ptr[pos] != '=' && value.ptr[pos] != ';' &&
+               value.ptr[pos] != ' ' && value.ptr[pos] != '\t')
+            pos++;
+        const u32 name_len = pos - name_start;
+        while (pos < value.len && (value.ptr[pos] == ' ' || value.ptr[pos] == '\t')) pos++;
+        if (pos == value.len || value.ptr[pos] != '=') continue;
+        pos++;
+        while (pos < value.len && (value.ptr[pos] == ' ' || value.ptr[pos] == '\t')) pos++;
+        const bool boundary =
+            http_header_name_eq_ci(value.ptr + name_start, name_len, "boundary", 8);
+        if (pos < value.len && value.ptr[pos] == '"') {
+            pos++;
+            const u32 value_start = pos;
+            while (pos < value.len && value.ptr[pos] != '"') pos++;
+            if (boundary) return pos > value_start && pos < value.len;
+            if (pos < value.len) pos++;
+        } else {
+            const u32 value_start = pos;
+            while (pos < value.len && value.ptr[pos] != ';' && value.ptr[pos] != ' ' &&
+                   value.ptr[pos] != '\t')
+                pos++;
+            if (boundary) return pos > value_start;
+        }
+        while (pos < value.len && value.ptr[pos] != ';') pos++;
+    }
+    return false;
+}
+
+inline bool response_is_multipart_byteranges(const ResponseHeaderKV* headers, u32 header_count) {
     for (u32 i = 0; i < header_count; i++) {
         if (!http_header_name_eq_ci(headers[i].key_data, headers[i].key_len, "content-type", 12))
             continue;
-        Str value{headers[i].value_data, headers[i].value_len};
-        u32 start = 0;
-        while (start < value.len && (value.ptr[start] == ' ' || value.ptr[start] == '\t')) start++;
-        if (value.len - start < sizeof(kMultipart) - 1 ||
-            !http_header_name_eq_ci(
-                value.ptr + start, sizeof(kMultipart) - 1, kMultipart, sizeof(kMultipart) - 1))
-            continue;
-        u32 pos = start + sizeof(kMultipart) - 1;
-        if (pos < value.len && value.ptr[pos] != ';' && value.ptr[pos] != ' ' &&
-            value.ptr[pos] != '\t')
-            continue;
-        while (pos < value.len) {
-            while (pos < value.len && (value.ptr[pos] == ' ' || value.ptr[pos] == '\t')) pos++;
-            if (pos == value.len || value.ptr[pos] != ';') break;
-            pos++;
-            while (pos < value.len && (value.ptr[pos] == ' ' || value.ptr[pos] == '\t')) pos++;
-            const u32 name_start = pos;
-            while (pos < value.len && value.ptr[pos] != '=' && value.ptr[pos] != ';' &&
-                   value.ptr[pos] != ' ' && value.ptr[pos] != '\t')
-                pos++;
-            const u32 name_len = pos - name_start;
-            while (pos < value.len && (value.ptr[pos] == ' ' || value.ptr[pos] == '\t')) pos++;
-            if (pos == value.len || value.ptr[pos] != '=') continue;
-            pos++;
-            while (pos < value.len && (value.ptr[pos] == ' ' || value.ptr[pos] == '\t')) pos++;
-            const bool boundary =
-                http_header_name_eq_ci(value.ptr + name_start, name_len, "boundary", 8);
-            if (pos < value.len && value.ptr[pos] == '"') {
-                pos++;
-                const u32 value_start = pos;
-                while (pos < value.len && value.ptr[pos] != '"') pos++;
-                if (boundary) return pos > value_start && pos < value.len;
-                if (pos < value.len) pos++;
-            } else {
-                const u32 value_start = pos;
-                while (pos < value.len && value.ptr[pos] != ';' && value.ptr[pos] != ' ' &&
-                       value.ptr[pos] != '\t')
-                    pos++;
-                if (boundary) return pos > value_start;
-            }
-            while (pos < value.len && value.ptr[pos] != ';') pos++;
-        }
+        if (content_type_is_multipart_byteranges({headers[i].value_data, headers[i].value_len}))
+            return true;
     }
     return false;
 }
@@ -2969,6 +2973,10 @@ void h2_proxy_finish(Loop* loop,
             body_replacement_invalidates_upstream_header(kName) && !preserve_unsatisfied_range) {
             continue;
         }
+        if (response_ctx != nullptr && response_ctx->response_body_mutation_set &&
+            http_header_name_eq_ci(kName.ptr, kName.len, "content-type", 12) &&
+            content_type_is_multipart_byteranges(resp.headers[i].value))
+            continue;
         // content-length is normally dropped (http2_write_response re-derives it
         // from the DATA body), but a HEAD response carries no DATA, so keep the
         // upstream's so the client learns the corresponding GET body size.
@@ -3014,9 +3022,12 @@ void h2_proxy_finish(Loop* loop,
     const u64 range_representation_length =
         is_head && !response_body_mutated && resp.has_content_length ? resp.content_length
                                                                      : body_len;
-    if (mutations_valid &&
-        !normalize_partial_content_headers(
-            effective, &effective_count, status, range_representation_length, true)) {
+    const bool validate_range_length = !is_head || response_body_mutated || resp.has_content_length;
+    if (mutations_valid && !normalize_partial_content_headers(effective,
+                                                              &effective_count,
+                                                              status,
+                                                              range_representation_length,
+                                                              validate_range_length)) {
         mutations_valid = false;
         status = response_mutates_partial_content_metadata(response_ctx) ? 500 : 502;
     }
@@ -3150,8 +3161,15 @@ void h2_on_upstream_response(void* lp, Connection& conn, IoEvent ev) {
     }
     // Headers complete.
     const u32 kHdrEnd = parser.header_end;
+    // The synthesized request remains intact until the response is reframed.
+    const bool kHeadReq = conn.h2->async_synth_len >= 4 && conn.h2->pending_synth[0] == 'H' &&
+                          conn.h2->pending_synth[1] == 'E' && conn.h2->pending_synth[2] == 'A' &&
+                          conn.h2->pending_synth[3] == 'D';
 
-    if (resp.unsupported_transfer_coding) {
+    const bool response_has_no_body = kHeadReq || resp.status_code < 200 ||
+                                      resp.status_code == 204 || resp.status_code == 205 ||
+                                      resp.status_code == 304;
+    if (resp.unsupported_transfer_coding && !response_has_no_body) {
         h2_proxy_fail(loop, conn, 502);
         return;
     }
@@ -3187,9 +3205,6 @@ void h2_on_upstream_response(void* lp, Connection& conn, IoEvent ev) {
     // and any response to a HEAD request (the synthesized request is in
     // pending_synth, still intact here). Reframe immediately instead of waiting on
     // a body a keep-alive upstream will never send.
-    const bool kHeadReq = conn.h2->async_synth_len >= 4 && conn.h2->pending_synth[0] == 'H' &&
-                          conn.h2->pending_synth[1] == 'E' && conn.h2->pending_synth[2] == 'A' &&
-                          conn.h2->pending_synth[3] == 'D';
     if (resp.status_code == 204 || resp.status_code == 205 || resp.status_code == 304 || kHeadReq) {
         h2_proxy_finish(loop, conn, resp, kHdrEnd, 0, /*is_head=*/kHeadReq);
         return;
@@ -4823,6 +4838,10 @@ void finish_buffered_forward(Loop* loop,
             body_replacement_invalidates_upstream_header(name) && !preserve_unsatisfied_range) {
             continue;
         }
+        if (response_ctx->response_body_mutation_set &&
+            http_header_name_eq_ci(name.ptr, name.len, "content-type", 12) &&
+            content_type_is_multipart_byteranges(resp.headers[i].value))
+            continue;
         if (http_header_name_eq_ci(name.ptr, name.len, "content-length", 14)) {
             if (!is_head && resp.status_code != 304) continue;
         } else if (h2_drop_response_header(name)) {
@@ -4882,8 +4901,10 @@ void finish_buffered_forward(Loop* loop,
         is_head && !response_ctx->response_body_mutation_set && resp.has_content_length
             ? resp.content_length
             : representation_body_len;
+    const bool validate_range_length =
+        !is_head || response_ctx->response_body_mutation_set || resp.has_content_length;
     if (!normalize_partial_content_headers(
-            headers, &header_count, status, range_representation_length, true)) {
+            headers, &header_count, status, range_representation_length, validate_range_length)) {
         buffered_forward_fail(
             loop, conn, response_mutates_partial_content_metadata(response_ctx) ? 500 : 502);
         return;
@@ -4959,7 +4980,11 @@ void on_buffered_upstream_response(Loop* loop,
         buffered_forward_fail(loop, conn, 502);
         return;
     }
-    if (resp.unsupported_transfer_coding) {
+    const bool is_head = conn.req_method == static_cast<u8>(LogHttpMethod::Head);
+    const bool response_has_no_body = is_head || resp.status_code < 200 ||
+                                      resp.status_code == 204 || resp.status_code == 205 ||
+                                      resp.status_code == 304;
+    if (resp.unsupported_transfer_coding && !response_has_no_body) {
         buffered_forward_fail(loop, conn, 502);
         return;
     }
@@ -4974,7 +4999,6 @@ void on_buffered_upstream_response(Loop* loop,
     }
     const u32 header_end = parser.header_end;
     const u32 have_body = conn.upstream_recv_buf.len() - header_end;
-    const bool is_head = conn.req_method == static_cast<u8>(LogHttpMethod::Head);
     const bool no_body =
         is_head || resp.status_code == 204 || resp.status_code == 205 || resp.status_code == 304;
     u32 body_len = 0;
