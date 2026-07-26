@@ -432,7 +432,8 @@ static void markdown_remember_list_container(const std::vector<MarkdownContainer
 static bool markdown_strip_container(std::string_view line,
                                      const std::vector<MarkdownContainerSegment>& segments,
                                      std::string_view* content,
-                                     std::string* normalized = nullptr) {
+                                     std::string* normalized = nullptr,
+                                     size_t* content_column = nullptr) {
     size_t pos = 0;
     size_t column = 0;
     for (size_t segment_index = 0; segment_index < segments.size(); segment_index++) {
@@ -493,12 +494,14 @@ static bool markdown_strip_container(std::string_view line,
                     if (segments[remaining].kind == MarkdownContainerSegment::Kind::Blockquote)
                         return false;
                 *content = rest;
+                if (content_column != nullptr) *content_column = column;
                 return true;
             }
             return false;
         }
     }
     *content = line.substr(pos);
+    if (content_column != nullptr) *content_column = column;
     return true;
 }
 
@@ -538,9 +541,11 @@ static bool markdown_strip_longest_list_prefix(
 
 static std::string_view markdown_fence_content(std::string_view line,
                                                const MarkdownFence& opening,
-                                               std::string* normalized = nullptr) {
+                                               std::string* normalized = nullptr,
+                                               size_t* content_column = nullptr) {
     std::string_view content;
-    return markdown_strip_container(line, opening.container_segments, &content, normalized)
+    return markdown_strip_container(
+               line, opening.container_segments, &content, normalized, content_column)
                ? content
                : line;
 }
@@ -622,17 +627,26 @@ static bool markdown_fence_language_case_insensitive(std::string_view info,
 enum class MarkdownLinkReferenceDefinition {
     None,
     Complete,
+    DestinationMayContinue,
     TitleMayContinue,
+    OpenTitleMayContinue,
 };
 
-static bool markdown_link_reference_title(std::string_view line, bool allow_leading_indent) {
+enum class MarkdownLinkReferenceTitle {
+    None,
+    Complete,
+    MayContinue,
+};
+
+static MarkdownLinkReferenceTitle markdown_link_reference_title_state(std::string_view line,
+                                                                      bool allow_leading_indent) {
     size_t pos = 0;
     if (allow_leading_indent)
         while (pos < line.size() && pos < 3 && line[pos] == ' ') pos++;
-    if (pos == line.size()) return false;
+    if (pos == line.size()) return MarkdownLinkReferenceTitle::None;
     const char opener = line[pos];
     const char closer = opener == '(' ? ')' : opener;
-    if (opener != '(' && opener != '\'' && opener != '"') return false;
+    if (opener != '(' && opener != '\'' && opener != '"') return MarkdownLinkReferenceTitle::None;
     bool escaped = false;
     for (pos++; pos < line.size(); pos++) {
         const char c = line[pos];
@@ -644,14 +658,24 @@ static bool markdown_link_reference_title(std::string_view line, bool allow_lead
             escaped = true;
             continue;
         }
-        if (c == '\r' || c == '\n' || (opener == '(' && c == '(')) return false;
+        if ((c == '\r' && (pos + 1 == line.size() || line[pos + 1] != '\n')) ||
+            (opener == '(' && c == '('))
+            return MarkdownLinkReferenceTitle::None;
+        if (c == '\n' && pos + 1 < line.size() && line[pos + 1] == '\n')
+            return MarkdownLinkReferenceTitle::None;
         if (c != closer) continue;
         pos++;
         while (pos < line.size() && (line[pos] == ' ' || line[pos] == '\t' || line[pos] == '\r'))
             pos++;
-        return pos == line.size();
+        return pos == line.size() ? MarkdownLinkReferenceTitle::Complete
+                                  : MarkdownLinkReferenceTitle::None;
     }
-    return false;
+    return MarkdownLinkReferenceTitle::MayContinue;
+}
+
+static bool markdown_link_reference_title(std::string_view line, bool allow_leading_indent) {
+    return markdown_link_reference_title_state(line, allow_leading_indent) ==
+           MarkdownLinkReferenceTitle::Complete;
 }
 
 static MarkdownLinkReferenceDefinition markdown_link_reference_definition(std::string_view line) {
@@ -679,8 +703,11 @@ static MarkdownLinkReferenceDefinition markdown_link_reference_definition(std::s
             pos + 1 >= line.size() || line[pos + 1] != ':')
             return MarkdownLinkReferenceDefinition::None;
         pos += 2;
-        while (pos < line.size() && (line[pos] == ' ' || line[pos] == '\t')) pos++;
-        if (pos == line.size() || line[pos] == '\r') return MarkdownLinkReferenceDefinition::None;
+        while (pos < line.size() &&
+               (line[pos] == ' ' || line[pos] == '\t' || line[pos] == '\r' || line[pos] == '\n'))
+            pos++;
+        if (pos == line.size() || line[pos] == '\r')
+            return MarkdownLinkReferenceDefinition::DestinationMayContinue;
         if (line[pos] == '<') {
             pos++;
             const size_t destination_start = pos;
@@ -728,12 +755,16 @@ static MarkdownLinkReferenceDefinition markdown_link_reference_definition(std::s
                 return MarkdownLinkReferenceDefinition::None;
         }
         const size_t destination_end = pos;
-        while (pos < line.size() && (line[pos] == ' ' || line[pos] == '\t' || line[pos] == '\r'))
+        while (pos < line.size() &&
+               (line[pos] == ' ' || line[pos] == '\t' || line[pos] == '\r' || line[pos] == '\n'))
             pos++;
         if (pos == line.size()) return MarkdownLinkReferenceDefinition::TitleMayContinue;
-        if (pos == destination_end || !markdown_link_reference_title(line.substr(pos), false))
-            return MarkdownLinkReferenceDefinition::None;
-        return MarkdownLinkReferenceDefinition::Complete;
+        if (pos == destination_end) return MarkdownLinkReferenceDefinition::None;
+        const auto title = markdown_link_reference_title_state(line.substr(pos), false);
+        if (title == MarkdownLinkReferenceTitle::None) return MarkdownLinkReferenceDefinition::None;
+        return title == MarkdownLinkReferenceTitle::Complete
+                   ? MarkdownLinkReferenceDefinition::Complete
+                   : MarkdownLinkReferenceDefinition::OpenTitleMayContinue;
     }
     return MarkdownLinkReferenceDefinition::None;
 }
@@ -748,16 +779,74 @@ static MarkdownLinkReferenceDefinition markdown_link_reference_definition_at_blo
                           : markdown_link_reference_definition(line);
 }
 
-static bool markdown_take_link_reference_title(
+enum class MarkdownLinkReferenceContinuation {
+    None,
+    Consumed,
+    Invalid,
+};
+
+static MarkdownLinkReferenceContinuation markdown_take_link_reference_continuation(
     std::string_view content,
     const std::vector<MarkdownContainerSegment>& container,
-    bool* pending,
+    MarkdownLinkReferenceDefinition* pending,
+    std::string* pending_text,
     std::vector<MarkdownContainerSegment>* expected_container) {
-    const bool continues = *pending && markdown_same_container(container, *expected_container) &&
-                           markdown_link_reference_title(content, true);
-    *pending = false;
+    if (*pending == MarkdownLinkReferenceDefinition::None)
+        return MarkdownLinkReferenceContinuation::None;
+    const bool same_container = markdown_same_container(container, *expected_container);
+    const bool blank = content.find_first_not_of(" \t\r") == std::string_view::npos;
+    if (!same_container || blank) {
+        const bool required_continuation =
+            *pending != MarkdownLinkReferenceDefinition::TitleMayContinue;
+        *pending = MarkdownLinkReferenceDefinition::None;
+        pending_text->clear();
+        expected_container->clear();
+        return required_continuation ? MarkdownLinkReferenceContinuation::Invalid
+                                     : MarkdownLinkReferenceContinuation::None;
+    }
+
+    if (*pending == MarkdownLinkReferenceDefinition::TitleMayContinue) {
+        const auto title = markdown_link_reference_title_state(content, true);
+        if (title == MarkdownLinkReferenceTitle::None) {
+            *pending = MarkdownLinkReferenceDefinition::None;
+            pending_text->clear();
+            expected_container->clear();
+            return MarkdownLinkReferenceContinuation::None;
+        }
+        if (title == MarkdownLinkReferenceTitle::Complete) {
+            *pending = MarkdownLinkReferenceDefinition::None;
+            pending_text->clear();
+            expected_container->clear();
+        } else {
+            *pending = MarkdownLinkReferenceDefinition::OpenTitleMayContinue;
+            *pending_text = "[pending]: /url ";
+            pending_text->append(content);
+        }
+        return MarkdownLinkReferenceContinuation::Consumed;
+    }
+
+    pending_text->push_back('\n');
+    pending_text->append(content);
+    const auto definition = markdown_link_reference_definition(*pending_text);
+    if (definition == MarkdownLinkReferenceDefinition::Complete) {
+        *pending = MarkdownLinkReferenceDefinition::None;
+        pending_text->clear();
+        expected_container->clear();
+        return MarkdownLinkReferenceContinuation::Consumed;
+    }
+    if (definition == MarkdownLinkReferenceDefinition::DestinationMayContinue ||
+        definition == MarkdownLinkReferenceDefinition::OpenTitleMayContinue) {
+        *pending = definition;
+        return MarkdownLinkReferenceContinuation::Consumed;
+    }
+    if (definition == MarkdownLinkReferenceDefinition::TitleMayContinue) {
+        *pending = definition;
+        return MarkdownLinkReferenceContinuation::Consumed;
+    }
+    *pending = MarkdownLinkReferenceDefinition::None;
+    pending_text->clear();
     expected_container->clear();
-    return continues;
+    return MarkdownLinkReferenceContinuation::Invalid;
 }
 
 static void markdown_retain_normalized_content(std::string_view content,
@@ -783,9 +872,16 @@ static void markdown_retain_normalized_content(std::string_view content,
 
 static bool is_markdown_fence_close(std::string_view line, const MarkdownFence& opening) {
     std::string normalized;
-    line = markdown_fence_content(line, opening, &normalized);
+    size_t column = 0;
+    line = markdown_fence_content(line, opening, &normalized, &column);
     size_t pos = 0;
-    while (pos < line.size() && pos < 3 && line[pos] == ' ') pos++;
+    size_t indent = 0;
+    while (pos < line.size() && (line[pos] == ' ' || line[pos] == '\t')) {
+        const size_t next = markdown_next_column(column + indent, line[pos]);
+        indent = next - column;
+        if (indent > 3) return false;
+        pos++;
+    }
     const size_t marker_start = pos;
     while (pos < line.size() && line[pos] == opening.marker) pos++;
     if (pos - marker_start < opening.marker_count) return false;
@@ -1050,6 +1146,9 @@ TEST(frontend, language_card_fence_parser_accepts_commonmark_variants) {
     CHECK(is_markdown_fence_close("    ````", fence));
     CHECK(markdown_fence_content("    route GET \"/x\" { return 200 }", fence) ==
           "route GET \"/x\" { return 200 }");
+    REQUIRE(parse_markdown_fence_open("- ~~~~markdown", &fence));
+    CHECK(is_markdown_fence_close("  \t~~~~", fence));
+    CHECK_FALSE(is_markdown_fence_close("  \t  ~~~~", fence));
     REQUIRE(parse_markdown_fence_open("```rut", &fence));
     CHECK(markdown_fence_content("- route GET \"/x\" { return 200 }", fence) ==
           "- route GET \"/x\" { return 200 }");
@@ -1329,6 +1428,12 @@ TEST(frontend, language_card_recognizes_link_reference_definitions) {
              MarkdownLinkReferenceDefinition::TitleMayContinue);
     CHECK_EQ(markdown_link_reference_definition("[foo]: /url \"title\""),
              MarkdownLinkReferenceDefinition::Complete);
+    CHECK_EQ(markdown_link_reference_definition("[foo]:"),
+             MarkdownLinkReferenceDefinition::DestinationMayContinue);
+    CHECK_EQ(markdown_link_reference_definition("[foo]: /url \"multi"),
+             MarkdownLinkReferenceDefinition::OpenTitleMayContinue);
+    CHECK_EQ(markdown_link_reference_definition("[foo]: /url \"multi\nline\""),
+             MarkdownLinkReferenceDefinition::Complete);
     CHECK(markdown_link_reference_title("  \"title\"", true));
     CHECK(markdown_link_reference_title("(title)", true));
     CHECK_FALSE(markdown_link_reference_title("  ordinary paragraph", true));
@@ -1350,14 +1455,33 @@ TEST(frontend, language_card_recognizes_link_reference_definitions) {
     CHECK_EQ(markdown_link_reference_definition_at_block_start("[foo]: /url", false),
              MarkdownLinkReferenceDefinition::TitleMayContinue);
 
-    bool title_pending = true;
+    MarkdownLinkReferenceDefinition pending = MarkdownLinkReferenceDefinition::TitleMayContinue;
+    std::string pending_text = "[foo]: /url";
     std::vector<MarkdownContainerSegment> expected_container;
-    CHECK(markdown_take_link_reference_title(
-        "  \"continued title\"", {}, &title_pending, &expected_container));
-    CHECK_FALSE(title_pending);
-    title_pending = true;
-    CHECK_FALSE(markdown_take_link_reference_title(
-        "ordinary paragraph", {}, &title_pending, &expected_container));
+    CHECK_EQ(markdown_take_link_reference_continuation(
+                 "  \"continued title\"", {}, &pending, &pending_text, &expected_container),
+             MarkdownLinkReferenceContinuation::Consumed);
+    CHECK_EQ(pending, MarkdownLinkReferenceDefinition::None);
+
+    pending = MarkdownLinkReferenceDefinition::DestinationMayContinue;
+    pending_text = "[foo]:";
+    CHECK_EQ(markdown_take_link_reference_continuation(
+                 "  /url", {}, &pending, &pending_text, &expected_container),
+             MarkdownLinkReferenceContinuation::Consumed);
+    CHECK_EQ(pending, MarkdownLinkReferenceDefinition::TitleMayContinue);
+
+    pending = MarkdownLinkReferenceDefinition::OpenTitleMayContinue;
+    pending_text = "[foo]: /url \"multi";
+    CHECK_EQ(markdown_take_link_reference_continuation(
+                 "line\"", {}, &pending, &pending_text, &expected_container),
+             MarkdownLinkReferenceContinuation::Consumed);
+    CHECK_EQ(pending, MarkdownLinkReferenceDefinition::None);
+
+    pending = MarkdownLinkReferenceDefinition::TitleMayContinue;
+    pending_text = "[foo]: /url";
+    CHECK_EQ(markdown_take_link_reference_continuation(
+                 "ordinary paragraph", {}, &pending, &pending_text, &expected_container),
+             MarkdownLinkReferenceContinuation::None);
 }
 
 TEST(frontend, language_card_retains_normalized_interrupting_content) {
@@ -1646,7 +1770,8 @@ TEST(frontend, language_card_unmarked_rut_examples_parse_and_typecheck) {
     bool skip_current = false;
     bool paragraph_open = false;
     std::vector<MarkdownContainerSegment> paragraph_container;
-    bool link_reference_title_pending = false;
+    MarkdownLinkReferenceDefinition link_reference_pending = MarkdownLinkReferenceDefinition::None;
+    std::string link_reference_pending_text;
     std::vector<MarkdownContainerSegment> link_reference_container;
     std::vector<MarkdownContainerSegment> continued_list_container;
     std::string raw_html_end;
@@ -1948,15 +2073,21 @@ TEST(frontend, language_card_unmarked_rut_examples_parse_and_typecheck) {
                 }
                 continue;
             }
-            const bool continues_link_reference =
-                markdown_take_link_reference_title(container_content,
-                                                   line_container,
-                                                   &link_reference_title_pending,
-                                                   &link_reference_container);
-            if (continues_link_reference) {
+            const auto link_reference_continuation =
+                markdown_take_link_reference_continuation(container_content,
+                                                          line_container,
+                                                          &link_reference_pending,
+                                                          &link_reference_pending_text,
+                                                          &link_reference_container);
+            if (link_reference_continuation != MarkdownLinkReferenceContinuation::None) {
                 paragraph_open = false;
                 paragraph_container.clear();
-                markdown_remember_list_container(line_container, &continued_list_container);
+                if (link_reference_continuation == MarkdownLinkReferenceContinuation::Consumed)
+                    markdown_remember_list_container(line_container, &continued_list_container);
+                else {
+                    paragraph_open = true;
+                    paragraph_container = line_container;
+                }
                 continue;
             }
             const std::string_view skip_content = markdown_block_content(container_content);
@@ -2036,8 +2167,11 @@ TEST(frontend, language_card_unmarked_rut_examples_parse_and_typecheck) {
                 container_content, paragraph_open);
             paragraph_open = !indented_code && !interrupts_paragraph && !container_line_blank &&
                              link_reference == MarkdownLinkReferenceDefinition::None;
-            if (link_reference == MarkdownLinkReferenceDefinition::TitleMayContinue) {
-                link_reference_title_pending = true;
+            if (link_reference == MarkdownLinkReferenceDefinition::DestinationMayContinue ||
+                link_reference == MarkdownLinkReferenceDefinition::TitleMayContinue ||
+                link_reference == MarkdownLinkReferenceDefinition::OpenTitleMayContinue) {
+                link_reference_pending = link_reference;
+                link_reference_pending_text = std::string(container_content);
                 link_reference_container = line_container;
             }
             if (paragraph_open)
