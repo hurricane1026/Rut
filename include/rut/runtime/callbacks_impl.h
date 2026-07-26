@@ -2793,11 +2793,27 @@ inline bool normalize_partial_content_headers(ResponseHeaderKV* headers,
                                               u16 status,
                                               u64 representation_length = 0,
                                               bool validate_length = false) {
+    if (status != 206 && status != 416) {
+        u32 write = 0;
+        for (u32 read = 0; read < *header_count; read++) {
+            const Str name{headers[read].key_data, headers[read].key_len};
+            if (http_header_name_eq_ci(name.ptr, name.len, "content-range", 13)) continue;
+            if (write != read) {
+                headers[write].key_data = headers[read].key_data;
+                headers[write].key_len = headers[read].key_len;
+                headers[write].value_data = headers[read].value_data;
+                headers[write].value_len = headers[read].value_len;
+            }
+            write++;
+        }
+        *header_count = write;
+        return true;
+    }
+
     bool found = false;
-    for (u32 i = 0; i < *header_count;) {
+    for (u32 i = 0; i < *header_count; i++) {
         const Str name{headers[i].key_data, headers[i].key_len};
         if (!http_header_name_eq_ci(name.ptr, name.len, "content-range", 13)) {
-            i++;
             continue;
         }
         if (status == 206) {
@@ -2816,11 +2832,8 @@ inline bool normalize_partial_content_headers(ResponseHeaderKV* headers,
                 !valid_unsatisfied_content_range({headers[i].value_data, headers[i].value_len}))
                 return false;
             found = true;
-            i++;
             continue;
         }
-        for (u32 move = i + 1; move < *header_count; move++) headers[move - 1] = headers[move];
-        (*header_count)--;
     }
     return status != 206 || found || response_is_multipart_byteranges(headers, *header_count);
 }
