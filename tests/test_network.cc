@@ -5463,18 +5463,25 @@ TEST(buffered_forward, body_replacement_removes_stale_representation_metadata) {
     __builtin_memcpy(ctx->response_body_mutation_storage, kReplacement, sizeof(kReplacement) - 1);
     ctx->response_body_mutation_len = sizeof(kReplacement) - 1;
     ctx->response_body_mutation_set = true;
+    ctx->response_status = 200;
+    ctx->response_status_set = true;
     static const char kDigestName[] = "Digest";
     static const char kDigestValue[] = "sha-256=replacement";
     ctx->response_header_mutations[0] = {{kDigestName, sizeof(kDigestName) - 1},
                                          {kDigestValue, sizeof(kDigestValue) - 1},
                                          jit::ResponseHeaderMutationMode::Set};
-    ctx->response_header_count = 1;
+    static const char kEtagName[] = "ETag";
+    static const char kEtagValue[] = "\"replacement\"";
+    ctx->response_header_mutations[1] = {{kEtagName, sizeof(kEtagName) - 1},
+                                         {kEtagValue, sizeof(kEtagValue) - 1},
+                                         jit::ResponseHeaderMutationMode::Set};
+    ctx->response_header_count = 2;
 
     static const char kUpstream[] =
         "HTTP/1.1 206 Partial Content\r\nContent-Length: 4\r\nContent-Encoding: gzip\r\n"
         "Content-Range: bytes 0-3/100\r\nDigest: sha-256=upstream\r\n"
         "Content-Digest: sha-256=:upstream:\r\nRepr-Digest: sha-256=:upstream:\r\n"
-        "Content-MD5: upstream\r\n\r\ndata";
+        "Content-MD5: upstream\r\nETag: \"upstream\"\r\n\r\ndata";
     conn->upstream_recv_buf.reset();
     conn->upstream_recv_buf.write(reinterpret_cast<const u8*>(kUpstream), sizeof(kUpstream) - 1);
     on_upstream_response<SmallLoop>(
@@ -5494,6 +5501,11 @@ TEST(buffered_forward, body_replacement_removes_stale_representation_metadata) {
                        conn->send_buf.len(),
                        "Digest: sha-256=replacement\r\n",
                        sizeof("Digest: sha-256=replacement\r\n") - 1));
+    CHECK(!buf_contains(wire, conn->send_buf.len(), "\"upstream\"", 10));
+    CHECK(buf_contains(wire,
+                       conn->send_buf.len(),
+                       "ETag: \"replacement\"\r\n",
+                       sizeof("ETag: \"replacement\"\r\n") - 1));
     CHECK(buf_contains(wire,
                        conn->send_buf.len(),
                        "Content-Type: text/plain; charset=utf-8\r\n",
@@ -5717,7 +5729,80 @@ TEST(buffered_forward, head_body_mutation_declares_replacement_length_without_bo
     const char* wire = reinterpret_cast<const char*>(conn->send_buf.data());
     const u32 wire_len = conn->send_buf.len();
     CHECK(buf_contains(wire, wire_len, "Content-Length: 9\r\n", 19));
+    CHECK(buf_contains(wire,
+                       wire_len,
+                       "Content-Type: text/plain; charset=utf-8\r\n",
+                       sizeof("Content-Type: text/plain; charset=utf-8\r\n") - 1));
     CHECK(!buf_contains(wire, wire_len, "rewritten", 9));
+}
+
+TEST(buffered_forward, final_status_normalizes_content_range) {
+    static const char kRangeName[] = "Content-Range";
+    static const char kRangeValue[] = "bytes 0-3/100";
+    static const char kOtherName[] = "X-Origin";
+    static const char kOtherValue[] = "kept";
+    ResponseHeaderKV headers[] = {
+        {kRangeName, sizeof(kRangeName) - 1, kRangeValue, sizeof(kRangeValue) - 1},
+        {kOtherName, sizeof(kOtherName) - 1, kOtherValue, sizeof(kOtherValue) - 1},
+    };
+    u32 header_count = 2;
+    CHECK(normalize_partial_content_headers(headers, &header_count, 200));
+    REQUIRE_EQ(header_count, 1u);
+    CHECK_EQ(std::string_view(headers[0].key_data, headers[0].key_len), "X-Origin");
+
+    ResponseHeaderKV partial[] = {
+        {kRangeName, sizeof(kRangeName) - 1, kRangeValue, sizeof(kRangeValue) - 1},
+    };
+    header_count = 1;
+    CHECK(normalize_partial_content_headers(partial, &header_count, 206));
+    header_count = 0;
+    CHECK_FALSE(normalize_partial_content_headers(partial, &header_count, 206));
+
+    static const char kInvalidRange[] = "bytes 4-3/100";
+    ResponseHeaderKV invalid[] = {
+        {kRangeName, sizeof(kRangeName) - 1, kInvalidRange, sizeof(kInvalidRange) - 1},
+    };
+    header_count = 1;
+    CHECK_FALSE(normalize_partial_content_headers(invalid, &header_count, 206));
+}
+
+TEST(buffered_forward, status_mutations_enforce_partial_content_metadata) {
+    const auto run = [&](u16 upstream_status, bool upstream_has_range, u16 final_status) {
+        SmallLoop loop;
+        loop.setup();
+        auto* conn = setup_proxy_conn(loop);
+        CHECK(conn != nullptr);
+        if (conn == nullptr) return std::pair{u16{0}, std::string{}};
+        conn->proxy_response_buffered = true;
+        auto* ctx = conn->reset_jit_ctx();
+        ctx->response_status = final_status;
+        ctx->response_status_set = true;
+
+        const std::string upstream =
+            std::string("HTTP/1.1 ") + std::to_string(upstream_status) +
+            (upstream_status == 206 ? " Partial Content\r\n" : " OK\r\n") +
+            "Content-Length: 4\r\n" +
+            (upstream_has_range ? "Content-Range: bytes 0-3/100\r\n" : "") +
+            "Connection: close\r\n\r\ndata";
+        conn->upstream_recv_buf.reset();
+        conn->upstream_recv_buf.write(reinterpret_cast<const u8*>(upstream.data()),
+                                      upstream.size());
+        on_upstream_response<SmallLoop>(
+            &loop,
+            *conn,
+            make_ev(conn->id, IoEventType::UpstreamRecv, static_cast<i32>(upstream.size())));
+        return std::pair{conn->resp_status,
+                         std::string(reinterpret_cast<const char*>(conn->send_buf.data()),
+                                     conn->send_buf.len())};
+    };
+
+    const auto changed_to_full = run(206, true, 200);
+    CHECK_EQ(changed_to_full.first, 200u);
+    CHECK(changed_to_full.second.find("Content-Range") == std::string::npos);
+
+    const auto invalid_partial = run(200, false, 206);
+    CHECK_EQ(invalid_partial.first, 500u);
+    CHECK(invalid_partial.second.find("Content-Range") == std::string::npos);
 }
 
 TEST(buffered_forward, preserves_upstream_content_length_on_304) {
@@ -5948,7 +6033,7 @@ TEST(buffered_forward, h2_deframing_and_body_replacement_strip_stale_metadata) {
     run(kEncoded, sizeof(kEncoded) - 1, true, "content-encoding", 16);
 
     static constexpr char kRange[] =
-        "HTTP/1.1 206 Partial Content\r\nContent-Length: 4\r\n"
+        "HTTP/1.1 200 OK\r\nContent-Length: 4\r\n"
         "Content-Range: bytes 0-3/100\r\n\r\ndata";
     run(kRange, sizeof(kRange) - 1, true, "content-range", 13);
 
@@ -5960,6 +6045,10 @@ TEST(buffered_forward, h2_deframing_and_body_replacement_strip_stale_metadata) {
     run(kDigests, sizeof(kDigests) - 1, true, "content-digest", 14);
     run(kDigests, sizeof(kDigests) - 1, true, "repr-digest", 11);
     run(kDigests, sizeof(kDigests) - 1, true, "content-md5", 11);
+
+    static constexpr char kEtag[] =
+        "HTTP/1.1 200 OK\r\nContent-Length: 4\r\nETag: \"upstream\"\r\n\r\ndata";
+    run(kEtag, sizeof(kEtag) - 1, true, "etag", 4);
 
     static constexpr char kChunked[] =
         "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nTrailer: Digest\r\n\r\n"

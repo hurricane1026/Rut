@@ -2661,10 +2661,73 @@ inline bool h2_drop_response_header(Str name) {
 inline bool body_replacement_invalidates_upstream_header(Str name) {
     return http_header_name_eq_ci(name.ptr, name.len, "content-encoding", 16) ||
            http_header_name_eq_ci(name.ptr, name.len, "content-range", 13) ||
+           http_header_name_eq_ci(name.ptr, name.len, "etag", 4) ||
            http_header_name_eq_ci(name.ptr, name.len, "digest", 6) ||
            http_header_name_eq_ci(name.ptr, name.len, "content-digest", 14) ||
            http_header_name_eq_ci(name.ptr, name.len, "repr-digest", 11) ||
            http_header_name_eq_ci(name.ptr, name.len, "content-md5", 11);
+}
+
+inline bool valid_partial_content_range(Str value) {
+    u32 pos = 0;
+    while (pos < value.len && (value.ptr[pos] == ' ' || value.ptr[pos] == '\t')) pos++;
+    if (value.len - pos < 6 || !http_header_name_eq_ci(value.ptr + pos, 5, "bytes", 5) ||
+        (value.ptr[pos + 5] != ' ' && value.ptr[pos + 5] != '\t'))
+        return false;
+    pos += 6;
+    while (pos < value.len && (value.ptr[pos] == ' ' || value.ptr[pos] == '\t')) pos++;
+
+    const auto parse_decimal = [&](u64* out) {
+        if (pos == value.len || value.ptr[pos] < '0' || value.ptr[pos] > '9') return false;
+        u64 parsed = 0;
+        do {
+            const u32 digit = static_cast<u32>(value.ptr[pos] - '0');
+            if (parsed > (UINT64_MAX - digit) / 10) return false;
+            parsed = parsed * 10 + digit;
+            pos++;
+        } while (pos < value.len && value.ptr[pos] >= '0' && value.ptr[pos] <= '9');
+        *out = parsed;
+        return true;
+    };
+
+    u64 first = 0;
+    u64 last = 0;
+    if (!parse_decimal(&first) || pos == value.len || value.ptr[pos++] != '-' ||
+        !parse_decimal(&last) || first > last || pos == value.len || value.ptr[pos++] != '/')
+        return false;
+    if (value.ptr[pos] == '*') {
+        pos++;
+    } else {
+        u64 complete_length = 0;
+        if (!parse_decimal(&complete_length) || complete_length == 0 || last >= complete_length)
+            return false;
+    }
+    while (pos < value.len && (value.ptr[pos] == ' ' || value.ptr[pos] == '\t')) pos++;
+    return pos == value.len;
+}
+
+inline bool normalize_partial_content_headers(ResponseHeaderKV* headers,
+                                              u32* header_count,
+                                              u16 status) {
+    bool found = false;
+    for (u32 i = 0; i < *header_count;) {
+        const Str name{headers[i].key_data, headers[i].key_len};
+        if (!http_header_name_eq_ci(name.ptr, name.len, "content-range", 13)) {
+            i++;
+            continue;
+        }
+        if (status == 206) {
+            if (found ||
+                !valid_partial_content_range({headers[i].value_data, headers[i].value_len}))
+                return false;
+            found = true;
+            i++;
+            continue;
+        }
+        for (u32 move = i + 1; move < *header_count; move++) headers[move - 1] = headers[move];
+        (*header_count)--;
+    }
+    return status != 206 || found;
 }
 
 // Is `name` listed as a token in an upstream `Connection: a, b, c` header value?
@@ -2836,6 +2899,11 @@ void h2_proxy_finish(Loop* loop,
     if (mutations_valid && response_ctx != nullptr && response_ctx->response_body_mutation_set) {
         body = reinterpret_cast<const u8*>(response_ctx->response_body_mutation_storage);
         body_len = response_ctx->response_body_mutation_len;
+    }
+    if (mutations_valid &&
+        !normalize_partial_content_headers(effective, &effective_count, status)) {
+        mutations_valid = false;
+        status = 500;
     }
     const u32 representation_body_len = body_len;
     const bool status_forbids_content_length = status < 200 || status == 204 || status == 205;
@@ -4679,6 +4747,10 @@ void finish_buffered_forward(Loop* loop,
     }
     u16 status =
         response_ctx->response_status_set ? response_ctx->response_status : resp.status_code;
+    if (!normalize_partial_content_headers(headers, &header_count, status)) {
+        buffered_forward_fail(loop, conn, 500);
+        return;
+    }
     if (conn.req_method == static_cast<u8>(LogHttpMethod::Connect) && status >= 200 &&
         status < 300) {
         buffered_forward_fail(loop, conn, 502);
@@ -4694,13 +4766,12 @@ void finish_buffered_forward(Loop* loop,
     const bool status_forbids_body =
         status < 200 || status == 204 || status == 205 || status == 304;
     const bool status_omits_content_length = status < 200 || status == 204;
-    const bool no_body = status_forbids_body || is_head;
     const bool has_known_representation_length =
         (!response_ctx->response_body_mutation_set && resp.has_content_length) ||
         (is_head && response_ctx->response_body_mutation_set && !status_forbids_body);
     const bool omit_unknown_representation_length =
         (is_head || status == 304) && !has_known_representation_length;
-    if (no_body) body_len = 0;
+    if (status_forbids_body) body_len = 0;
 
     // pipeline_stash stores a coalesced next request in send_buf, which response
     // formatting is about to reuse. Move it back to recv_buf first so the
