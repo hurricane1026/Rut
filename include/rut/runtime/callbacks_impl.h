@@ -2695,6 +2695,7 @@ inline bool valid_partial_content_range(Str value, u64* range_length = nullptr) 
     if (!parse_decimal(&first) || pos == value.len || value.ptr[pos++] != '-' ||
         !parse_decimal(&last) || first > last || pos == value.len || value.ptr[pos++] != '/')
         return false;
+    if (pos == value.len) return false;
     if (value.ptr[pos] == '*') {
         pos++;
     } else {
@@ -2739,10 +2740,38 @@ inline bool response_is_multipart_byteranges(const ResponseHeaderKV* headers, u3
             !http_header_name_eq_ci(
                 value.ptr + start, sizeof(kMultipart) - 1, kMultipart, sizeof(kMultipart) - 1))
             continue;
-        const u32 end = start + sizeof(kMultipart) - 1;
-        if (end == value.len || value.ptr[end] == ';' || value.ptr[end] == ' ' ||
-            value.ptr[end] == '\t')
-            return true;
+        u32 pos = start + sizeof(kMultipart) - 1;
+        if (pos < value.len && value.ptr[pos] != ';' && value.ptr[pos] != ' ' &&
+            value.ptr[pos] != '\t')
+            continue;
+        while (pos < value.len) {
+            while (pos < value.len && (value.ptr[pos] == ' ' || value.ptr[pos] == '\t')) pos++;
+            if (pos == value.len || value.ptr[pos++] != ';') break;
+            while (pos < value.len && (value.ptr[pos] == ' ' || value.ptr[pos] == '\t')) pos++;
+            const u32 name_start = pos;
+            while (pos < value.len && value.ptr[pos] != '=' && value.ptr[pos] != ';' &&
+                   value.ptr[pos] != ' ' && value.ptr[pos] != '\t')
+                pos++;
+            const u32 name_len = pos - name_start;
+            while (pos < value.len && (value.ptr[pos] == ' ' || value.ptr[pos] == '\t')) pos++;
+            if (pos == value.len || value.ptr[pos++] != '=') continue;
+            while (pos < value.len && (value.ptr[pos] == ' ' || value.ptr[pos] == '\t')) pos++;
+            const bool boundary =
+                http_header_name_eq_ci(value.ptr + name_start, name_len, "boundary", 8);
+            if (pos < value.len && value.ptr[pos] == '"') {
+                const u32 value_start = ++pos;
+                while (pos < value.len && value.ptr[pos] != '"') pos++;
+                if (boundary) return pos > value_start && pos < value.len;
+                if (pos < value.len) pos++;
+            } else {
+                const u32 value_start = pos;
+                while (pos < value.len && value.ptr[pos] != ';' && value.ptr[pos] != ' ' &&
+                       value.ptr[pos] != '\t')
+                    pos++;
+                if (boundary) return pos > value_start;
+            }
+            while (pos < value.len && value.ptr[pos] != ';') pos++;
+        }
     }
     return false;
 }
@@ -2915,15 +2944,21 @@ void h2_proxy_finish(Loop* loop,
         h2_proxy_fail(loop, conn, 502);
         return;
     }
-    constexpr u32 kMaxEffectiveHeaders = kMaxHeaders + jit::kMaxResponseHeaderMutations + 1;
+    constexpr u32 kMaxEffectiveHeaders = kMaxHeaders + jit::kMaxResponseHeaderMutations + 2;
     const jit::HandlerCtx* response_ctx =
         h2->async_apply_response_mutations ? h2->async_jit_ctx() : nullptr;
+    const u16 final_status = response_ctx != nullptr && response_ctx->response_status_set
+                                 ? response_ctx->response_status
+                                 : resp.status_code;
     ResponseHeaderKV effective[kMaxEffectiveHeaders];
     u32 effective_count = 0;
     for (u32 i = 0; i < resp.header_count && effective_count < kMaxEffectiveHeaders; i++) {
         const Str kName = resp.headers[i].name;
+        const bool preserve_unsatisfied_range =
+            final_status == 416 &&
+            http_header_name_eq_ci(kName.ptr, kName.len, "content-range", 13);
         if (response_ctx != nullptr && response_ctx->response_body_mutation_set &&
-            body_replacement_invalidates_upstream_header(kName)) {
+            body_replacement_invalidates_upstream_header(kName) && !preserve_unsatisfied_range) {
             continue;
         }
         // content-length is normally dropped (http2_write_response re-derives it
@@ -3026,7 +3061,7 @@ void h2_proxy_finish(Loop* loop,
             // Mutations run after the upstream filter, so filter their final
             // result too: a Set must not reintroduce an HTTP/2-prohibited field.
             const Str name{effective[i].key_data, effective[i].key_len};
-            if (resp.chunked && http_header_name_eq_ci(name.ptr, name.len, "trailer", 7)) continue;
+            if (http_header_name_eq_ci(name.ptr, name.len, "trailer", 7)) continue;
             const bool retained_representation_content_length =
                 (is_head || status == 304) && !status_forbids_content_length &&
                 http_header_name_eq_ci(name.ptr, name.len, "content-length", 14);
@@ -3043,7 +3078,15 @@ void h2_proxy_finish(Loop* loop,
             has_content_type |=
                 http_header_name_eq_ci(hdrs[i].name.ptr, hdrs[i].name.len, "content-type", 12);
         if (!has_content_type) {
-            hdrs[nhdrs++] = {{"content-type", 12}, {"text/plain; charset=utf-8", 25}};
+            if (nhdrs >= kMaxEffectiveHeaders) {
+                mutations_valid = false;
+                status = 500;
+                body = nullptr;
+                body_len = 0;
+                nhdrs = 0;
+            } else {
+                hdrs[nhdrs++] = {{"content-type", 12}, {"text/plain; charset=utf-8", 25}};
+            }
         }
     }
     if (!mutations_valid || status < 200 || status == 204 || status == 205 || status == 304 ||
@@ -4754,6 +4797,8 @@ void finish_buffered_forward(Loop* loop,
     constexpr u32 kMaxEffectiveHeaders = kMaxHeaders + jit::kMaxResponseHeaderMutations;
     const bool is_head = conn.req_method == static_cast<u8>(LogHttpMethod::Head);
     const jit::HandlerCtx* response_ctx = conn.jit_ctx();
+    const u16 final_status =
+        response_ctx->response_status_set ? response_ctx->response_status : resp.status_code;
     ResponseHeaderKV headers[kMaxEffectiveHeaders];
     u32 header_count = 0;
     for (u32 i = 0; i < resp.header_count; i++) {
@@ -4761,11 +4806,13 @@ void finish_buffered_forward(Loop* loop,
         // Preserve Content-Length on HEAD: it describes the corresponding GET
         // representation even though this response carries no body. A 304 may
         // likewise carry the selected representation's length.
-        if (resp.chunked && http_header_name_eq_ci(name.ptr, name.len, "trailer", 7)) {
+        if (http_header_name_eq_ci(name.ptr, name.len, "trailer", 7)) {
             continue;
         }
+        const bool preserve_unsatisfied_range =
+            final_status == 416 && http_header_name_eq_ci(name.ptr, name.len, "content-range", 13);
         if (response_ctx->response_body_mutation_set &&
-            body_replacement_invalidates_upstream_header(name)) {
+            body_replacement_invalidates_upstream_header(name) && !preserve_unsatisfied_range) {
             continue;
         }
         if (http_header_name_eq_ci(name.ptr, name.len, "content-length", 14)) {
@@ -4803,15 +4850,13 @@ void finish_buffered_forward(Loop* loop,
         buffered_forward_fail(loop, conn, 500);
         return;
     }
-    if (resp.chunked) {
-        for (u32 i = 0; i < header_count;) {
-            if (!http_header_name_eq_ci(headers[i].key_data, headers[i].key_len, "trailer", 7)) {
-                i++;
-                continue;
-            }
-            for (u32 move = i + 1; move < header_count; move++) headers[move - 1] = headers[move];
-            header_count--;
+    for (u32 i = 0; i < header_count;) {
+        if (!http_header_name_eq_ci(headers[i].key_data, headers[i].key_len, "trailer", 7)) {
+            i++;
+            continue;
         }
+        for (u32 move = i + 1; move < header_count; move++) headers[move - 1] = headers[move];
+        header_count--;
     }
     u16 status =
         response_ctx->response_status_set ? response_ctx->response_status : resp.status_code;
