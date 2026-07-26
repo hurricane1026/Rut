@@ -651,10 +651,18 @@ enum class MarkdownLinkReferenceTitle {
 };
 
 static MarkdownLinkReferenceTitle markdown_link_reference_title_state(std::string_view line,
-                                                                      bool allow_leading_indent) {
+                                                                      bool allow_leading_indent,
+                                                                      size_t initial_column = 0) {
     size_t pos = 0;
-    if (allow_leading_indent)
-        while (pos < line.size() && pos < 3 && line[pos] == ' ') pos++;
+    size_t column = initial_column;
+    if (allow_leading_indent) {
+        while (pos < line.size() && (line[pos] == ' ' || line[pos] == '\t')) {
+            const size_t next = markdown_next_column(column, line[pos]);
+            if (next - initial_column > 3) break;
+            column = next;
+            pos++;
+        }
+    }
     if (pos == line.size()) return MarkdownLinkReferenceTitle::None;
     const char opener = line[pos];
     const char closer = opener == '(' ? ')' : opener;
@@ -833,7 +841,8 @@ static MarkdownLinkReferenceContinuation markdown_take_link_reference_continuati
     const std::vector<MarkdownContainerSegment>& container,
     MarkdownLinkReferenceDefinition* pending,
     std::string* pending_text,
-    std::vector<MarkdownContainerSegment>* expected_container) {
+    std::vector<MarkdownContainerSegment>* expected_container,
+    size_t content_column = 0) {
     if (*pending == MarkdownLinkReferenceDefinition::None)
         return MarkdownLinkReferenceContinuation::None;
     const bool same_container = markdown_same_container(container, *expected_container);
@@ -863,7 +872,7 @@ static MarkdownLinkReferenceContinuation markdown_take_link_reference_continuati
     }
 
     if (*pending == MarkdownLinkReferenceDefinition::TitleMayContinue) {
-        const auto title = markdown_link_reference_title_state(content, true);
+        const auto title = markdown_link_reference_title_state(content, true, content_column);
         if (title == MarkdownLinkReferenceTitle::None) {
             *pending = MarkdownLinkReferenceDefinition::None;
             pending_text->clear();
@@ -1527,6 +1536,29 @@ TEST(frontend, language_card_recognizes_link_reference_definitions) {
     std::vector<MarkdownContainerSegment> expected_container;
     CHECK_EQ(markdown_take_link_reference_continuation(
                  "  \"continued title\"", {}, &pending, &pending_text, &expected_container),
+             MarkdownLinkReferenceContinuation::Consumed);
+    CHECK_EQ(pending, MarkdownLinkReferenceDefinition::None);
+
+    std::vector<MarkdownContainerSegment> list_container;
+    CHECK_EQ(markdown_container_content("- [foo]: /url", 0, nullptr, &list_container),
+             "[foo]: /url");
+    std::string normalized_title;
+    std::string_view continued_title;
+    size_t continued_title_column = 0;
+    REQUIRE(markdown_strip_container("  \t\"title\"",
+                                     list_container,
+                                     &continued_title,
+                                     &normalized_title,
+                                     &continued_title_column));
+    pending = MarkdownLinkReferenceDefinition::TitleMayContinue;
+    pending_text = "[foo]: /url";
+    expected_container = list_container;
+    CHECK_EQ(markdown_take_link_reference_continuation(continued_title,
+                                                       list_container,
+                                                       &pending,
+                                                       &pending_text,
+                                                       &expected_container,
+                                                       continued_title_column),
              MarkdownLinkReferenceContinuation::Consumed);
     CHECK_EQ(pending, MarkdownLinkReferenceDefinition::None);
 
@@ -2263,7 +2295,8 @@ TEST(frontend, language_card_unmarked_rut_examples_parse_and_typecheck) {
                                                           line_container,
                                                           &link_reference_pending,
                                                           &link_reference_pending_text,
-                                                          &link_reference_container);
+                                                          &link_reference_container,
+                                                          container_content_column);
             if (link_reference_continuation != MarkdownLinkReferenceContinuation::None) {
                 paragraph_open = false;
                 paragraph_container.clear();
