@@ -2668,7 +2668,7 @@ inline bool body_replacement_invalidates_upstream_header(Str name) {
            http_header_name_eq_ci(name.ptr, name.len, "content-md5", 11);
 }
 
-inline bool valid_partial_content_range(Str value) {
+inline bool valid_partial_content_range(Str value, u64* range_length = nullptr) {
     u32 pos = 0;
     while (pos < value.len && (value.ptr[pos] == ' ' || value.ptr[pos] == '\t')) pos++;
     if (value.len - pos < 6 || !http_header_name_eq_ci(value.ptr + pos, 5, "bytes", 5) ||
@@ -2703,12 +2703,38 @@ inline bool valid_partial_content_range(Str value) {
             return false;
     }
     while (pos < value.len && (value.ptr[pos] == ' ' || value.ptr[pos] == '\t')) pos++;
+    if (range_length != nullptr) {
+        if (last == UINT64_MAX) return false;
+        *range_length = last - first + 1;
+    }
     return pos == value.len;
+}
+
+inline bool response_is_multipart_byteranges(const ResponseHeaderKV* headers, u32 header_count) {
+    static constexpr char kMultipart[] = "multipart/byteranges";
+    for (u32 i = 0; i < header_count; i++) {
+        if (!http_header_name_eq_ci(headers[i].key_data, headers[i].key_len, "content-type", 12))
+            continue;
+        Str value{headers[i].value_data, headers[i].value_len};
+        u32 start = 0;
+        while (start < value.len && (value.ptr[start] == ' ' || value.ptr[start] == '\t')) start++;
+        if (value.len - start < sizeof(kMultipart) - 1 ||
+            !http_header_name_eq_ci(
+                value.ptr + start, sizeof(kMultipart) - 1, kMultipart, sizeof(kMultipart) - 1))
+            continue;
+        const u32 end = start + sizeof(kMultipart) - 1;
+        if (end == value.len || value.ptr[end] == ';' || value.ptr[end] == ' ' ||
+            value.ptr[end] == '\t')
+            return true;
+    }
+    return false;
 }
 
 inline bool normalize_partial_content_headers(ResponseHeaderKV* headers,
                                               u32* header_count,
-                                              u16 status) {
+                                              u16 status,
+                                              u64 representation_length = 0,
+                                              bool validate_length = false) {
     bool found = false;
     for (u32 i = 0; i < *header_count;) {
         const Str name{headers[i].key_data, headers[i].key_len};
@@ -2717,8 +2743,11 @@ inline bool normalize_partial_content_headers(ResponseHeaderKV* headers,
             continue;
         }
         if (status == 206) {
+            u64 range_length = 0;
             if (found ||
-                !valid_partial_content_range({headers[i].value_data, headers[i].value_len}))
+                !valid_partial_content_range({headers[i].value_data, headers[i].value_len},
+                                             &range_length) ||
+                (validate_length && range_length != representation_length))
                 return false;
             found = true;
             i++;
@@ -2727,7 +2756,7 @@ inline bool normalize_partial_content_headers(ResponseHeaderKV* headers,
         for (u32 move = i + 1; move < *header_count; move++) headers[move - 1] = headers[move];
         (*header_count)--;
     }
-    return status != 206 || found;
+    return status != 206 || found || response_is_multipart_byteranges(headers, *header_count);
 }
 
 // Is `name` listed as a token in an upstream `Connection: a, b, c` header value?
@@ -2900,8 +2929,14 @@ void h2_proxy_finish(Loop* loop,
         body = reinterpret_cast<const u8*>(response_ctx->response_body_mutation_storage);
         body_len = response_ctx->response_body_mutation_len;
     }
+    const bool response_body_mutated =
+        response_ctx != nullptr && response_ctx->response_body_mutation_set;
+    const u64 range_representation_length =
+        is_head && !response_body_mutated && resp.has_content_length ? resp.content_length
+                                                                     : body_len;
     if (mutations_valid &&
-        !normalize_partial_content_headers(effective, &effective_count, status)) {
+        !normalize_partial_content_headers(
+            effective, &effective_count, status, range_representation_length, true)) {
         mutations_valid = false;
         status = 500;
     }
@@ -2909,8 +2944,6 @@ void h2_proxy_finish(Loop* loop,
     const bool status_forbids_content_length = status < 200 || status == 204 || status == 205;
     char replacement_content_length[10];
     u32 replacement_content_length_len = 0;
-    const bool response_body_mutated =
-        response_ctx != nullptr && response_ctx->response_body_mutation_set;
     const bool preserve_upstream_representation_length =
         mutations_valid && status == 304 && !response_body_mutated && resp.has_content_length;
     const bool declare_mutated_head_length = mutations_valid && is_head && response_body_mutated &&
@@ -2926,7 +2959,8 @@ void h2_proxy_finish(Loop* loop,
         for (u32 i = 0; i < replacement_content_length_len; i++)
             replacement_content_length[i] = reversed[replacement_content_length_len - i - 1];
     }
-    if (mutations_valid && (status_forbids_content_length || replacement_content_length_len != 0)) {
+    if (mutations_valid && (status_forbids_content_length || replacement_content_length_len != 0 ||
+                            (response_body_mutated && status == 304))) {
         for (u32 i = 0; i < effective_count;) {
             if (!http_header_name_eq_ci(
                     effective[i].key_data, effective[i].key_len, "content-length", 14)) {
@@ -4747,10 +4781,6 @@ void finish_buffered_forward(Loop* loop,
     }
     u16 status =
         response_ctx->response_status_set ? response_ctx->response_status : resp.status_code;
-    if (!normalize_partial_content_headers(headers, &header_count, status)) {
-        buffered_forward_fail(loop, conn, 500);
-        return;
-    }
     if (conn.req_method == static_cast<u8>(LogHttpMethod::Connect) && status >= 200 &&
         status < 300) {
         buffered_forward_fail(loop, conn, 502);
@@ -4763,6 +4793,15 @@ void finish_buffered_forward(Loop* loop,
         body_len = response_ctx->response_body_mutation_len;
     }
     const u32 representation_body_len = body_len;
+    const u64 range_representation_length =
+        is_head && !response_ctx->response_body_mutation_set && resp.has_content_length
+            ? resp.content_length
+            : representation_body_len;
+    if (!normalize_partial_content_headers(
+            headers, &header_count, status, range_representation_length, true)) {
+        buffered_forward_fail(loop, conn, 500);
+        return;
+    }
     const bool status_forbids_body =
         status < 200 || status == 204 || status == 205 || status == 304;
     const bool status_omits_content_length = status < 200 || status == 204;

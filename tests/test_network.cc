@@ -5754,9 +5754,21 @@ TEST(buffered_forward, final_status_normalizes_content_range) {
         {kRangeName, sizeof(kRangeName) - 1, kRangeValue, sizeof(kRangeValue) - 1},
     };
     header_count = 1;
-    CHECK(normalize_partial_content_headers(partial, &header_count, 206));
+    CHECK(normalize_partial_content_headers(partial, &header_count, 206, 4, true));
+    CHECK_FALSE(normalize_partial_content_headers(partial, &header_count, 206, 5, true));
     header_count = 0;
     CHECK_FALSE(normalize_partial_content_headers(partial, &header_count, 206));
+
+    static const char kContentTypeName[] = "Content-Type";
+    static const char kMultipartValue[] = "multipart/byteranges; boundary=example";
+    ResponseHeaderKV multipart[] = {
+        {kContentTypeName,
+         sizeof(kContentTypeName) - 1,
+         kMultipartValue,
+         sizeof(kMultipartValue) - 1},
+    };
+    header_count = 1;
+    CHECK(normalize_partial_content_headers(multipart, &header_count, 206, 123, true));
 
     static const char kInvalidRange[] = "bytes 4-3/100";
     ResponseHeaderKV invalid[] = {
