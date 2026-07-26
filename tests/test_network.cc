@@ -5776,10 +5776,23 @@ TEST(buffered_forward, final_status_normalizes_content_range) {
     };
     header_count = 1;
     CHECK_FALSE(normalize_partial_content_headers(invalid, &header_count, 206));
+
+    static const char kUnsatisfiedRange[] = "bytes */100";
+    ResponseHeaderKV unsatisfied[] = {
+        {kRangeName, sizeof(kRangeName) - 1, kUnsatisfiedRange, sizeof(kUnsatisfiedRange) - 1},
+    };
+    header_count = 1;
+    CHECK(normalize_partial_content_headers(unsatisfied, &header_count, 416));
+    CHECK_EQ(header_count, 1u);
+    header_count = 1;
+    CHECK_FALSE(normalize_partial_content_headers(partial, &header_count, 416));
 }
 
 TEST(buffered_forward, status_mutations_enforce_partial_content_metadata) {
-    const auto run = [&](u16 upstream_status, bool upstream_has_range, u16 final_status) {
+    const auto run = [&](u16 upstream_status,
+                         bool upstream_has_range,
+                         u16 final_status,
+                         bool mutate_status = true) {
         SmallLoop loop;
         loop.setup();
         auto* conn = setup_proxy_conn(loop);
@@ -5787,8 +5800,10 @@ TEST(buffered_forward, status_mutations_enforce_partial_content_metadata) {
         if (conn == nullptr) return std::pair{u16{0}, std::string{}};
         conn->proxy_response_buffered = true;
         auto* ctx = conn->reset_jit_ctx();
-        ctx->response_status = final_status;
-        ctx->response_status_set = true;
+        if (mutate_status) {
+            ctx->response_status = final_status;
+            ctx->response_status_set = true;
+        }
 
         const std::string upstream =
             std::string("HTTP/1.1 ") + std::to_string(upstream_status) +
@@ -5815,6 +5830,10 @@ TEST(buffered_forward, status_mutations_enforce_partial_content_metadata) {
     const auto invalid_partial = run(200, false, 206);
     CHECK_EQ(invalid_partial.first, 500u);
     CHECK(invalid_partial.second.find("Content-Range") == std::string::npos);
+
+    const auto invalid_upstream_partial = run(206, false, 206, false);
+    CHECK_EQ(invalid_upstream_partial.first, 502u);
+    CHECK(invalid_upstream_partial.second.find("Content-Range") == std::string::npos);
 }
 
 TEST(buffered_forward, preserves_upstream_content_length_on_304) {
@@ -5971,7 +5990,8 @@ TEST(buffered_forward, h2_deframing_and_body_replacement_strip_stale_metadata) {
                          u32 upstream_len,
                          bool replace_body,
                          const char* forbidden_name,
-                         u32 forbidden_name_len) {
+                         u32 forbidden_name_len,
+                         bool explicitly_restore_header = false) {
         SmallLoop loop;
         loop.setup();
         loop.inject_and_dispatch(make_ev(0, IoEventType::Accept, 42));
@@ -5999,6 +6019,12 @@ TEST(buffered_forward, h2_deframing_and_body_replacement_strip_stale_metadata) {
                 ctx->response_body_mutation_storage, kReplacement, sizeof(kReplacement) - 1);
             ctx->response_body_mutation_len = sizeof(kReplacement) - 1;
             ctx->response_body_mutation_set = true;
+            if (explicitly_restore_header) {
+                ctx->response_header_mutations[0] = {{forbidden_name, forbidden_name_len},
+                                                     {"gzip", 4},
+                                                     jit::ResponseHeaderMutationMode::Set};
+                ctx->response_header_count = 1;
+            }
         }
 
         conn->upstream_recv_buf.write(reinterpret_cast<const u8*>(upstream), upstream_len);
@@ -6030,8 +6056,10 @@ TEST(buffered_forward, h2_deframing_and_body_replacement_strip_stale_metadata) {
                                            headers,
                                            16,
                                            &header_count));
+        bool found_forbidden = false;
         for (u32 i = 0; i < header_count; i++)
-            CHECK_FALSE(headers[i].name.eq(Str{forbidden_name, forbidden_name_len}));
+            found_forbidden |= headers[i].name.eq(Str{forbidden_name, forbidden_name_len});
+        CHECK_EQ(found_forbidden, explicitly_restore_header);
         bool found_default_content_type = false;
         for (u32 i = 0; i < header_count; i++)
             found_default_content_type |= headers[i].name.eq(Str{"content-type", 12}) &&
@@ -6043,6 +6071,7 @@ TEST(buffered_forward, h2_deframing_and_body_replacement_strip_stale_metadata) {
     static constexpr char kEncoded[] =
         "HTTP/1.1 200 OK\r\nContent-Length: 4\r\nContent-Encoding: gzip\r\n\r\ndata";
     run(kEncoded, sizeof(kEncoded) - 1, true, "content-encoding", 16);
+    run(kEncoded, sizeof(kEncoded) - 1, true, "content-encoding", 16, true);
 
     static constexpr char kRange[] =
         "HTTP/1.1 200 OK\r\nContent-Length: 4\r\n"

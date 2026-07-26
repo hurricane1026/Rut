@@ -2710,6 +2710,23 @@ inline bool valid_partial_content_range(Str value, u64* range_length = nullptr) 
     return pos == value.len;
 }
 
+inline bool valid_unsatisfied_content_range(Str value) {
+    u32 pos = 0;
+    while (pos < value.len && (value.ptr[pos] == ' ' || value.ptr[pos] == '\t')) pos++;
+    if (value.len - pos < 8 || !http_header_name_eq_ci(value.ptr + pos, 5, "bytes", 5) ||
+        (value.ptr[pos + 5] != ' ' && value.ptr[pos + 5] != '\t'))
+        return false;
+    pos += 6;
+    while (pos < value.len && (value.ptr[pos] == ' ' || value.ptr[pos] == '\t')) pos++;
+    if (value.len - pos < 3 || value.ptr[pos++] != '*' || value.ptr[pos++] != '/') return false;
+    if (pos == value.len || value.ptr[pos] < '0' || value.ptr[pos] > '9') return false;
+    do {
+        pos++;
+    } while (pos < value.len && value.ptr[pos] >= '0' && value.ptr[pos] <= '9');
+    while (pos < value.len && (value.ptr[pos] == ' ' || value.ptr[pos] == '\t')) pos++;
+    return pos == value.len;
+}
+
 inline bool response_is_multipart_byteranges(const ResponseHeaderKV* headers, u32 header_count) {
     static constexpr char kMultipart[] = "multipart/byteranges";
     for (u32 i = 0; i < header_count; i++) {
@@ -2753,10 +2770,30 @@ inline bool normalize_partial_content_headers(ResponseHeaderKV* headers,
             i++;
             continue;
         }
+        if (status == 416) {
+            if (found ||
+                !valid_unsatisfied_content_range({headers[i].value_data, headers[i].value_len}))
+                return false;
+            found = true;
+            i++;
+            continue;
+        }
         for (u32 move = i + 1; move < *header_count; move++) headers[move - 1] = headers[move];
         (*header_count)--;
     }
     return status != 206 || found || response_is_multipart_byteranges(headers, *header_count);
+}
+
+inline bool response_mutates_partial_content_metadata(const jit::HandlerCtx* ctx) {
+    if (ctx == nullptr) return false;
+    if (ctx->response_status_set || ctx->response_body_mutation_set) return true;
+    for (u32 i = 0; i < ctx->response_header_count; i++) {
+        const Str name = ctx->response_header_mutations[i].name;
+        if (http_header_name_eq_ci(name.ptr, name.len, "content-range", 13) ||
+            http_header_name_eq_ci(name.ptr, name.len, "content-type", 12))
+            return true;
+    }
+    return false;
 }
 
 // Is `name` listed as a token in an upstream `Connection: a, b, c` header value?
@@ -2938,7 +2975,7 @@ void h2_proxy_finish(Loop* loop,
         !normalize_partial_content_headers(
             effective, &effective_count, status, range_representation_length, true)) {
         mutations_valid = false;
-        status = 500;
+        status = response_mutates_partial_content_metadata(response_ctx) ? 500 : 502;
     }
     const u32 representation_body_len = body_len;
     const bool status_forbids_content_length = status < 200 || status == 204 || status == 205;
@@ -2989,9 +3026,6 @@ void h2_proxy_finish(Loop* loop,
             // Mutations run after the upstream filter, so filter their final
             // result too: a Set must not reintroduce an HTTP/2-prohibited field.
             const Str name{effective[i].key_data, effective[i].key_len};
-            if (response_body_mutated &&
-                http_header_name_eq_ci(name.ptr, name.len, "content-encoding", 16))
-                continue;
             if (resp.chunked && http_header_name_eq_ci(name.ptr, name.len, "trailer", 7)) continue;
             const bool retained_representation_content_length =
                 (is_head || status == 304) && !status_forbids_content_length &&
@@ -4799,7 +4833,8 @@ void finish_buffered_forward(Loop* loop,
             : representation_body_len;
     if (!normalize_partial_content_headers(
             headers, &header_count, status, range_representation_length, true)) {
-        buffered_forward_fail(loop, conn, 500);
+        buffered_forward_fail(
+            loop, conn, response_mutates_partial_content_metadata(response_ctx) ? 500 : 502);
         return;
     }
     const bool status_forbids_body =
