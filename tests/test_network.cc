@@ -5463,10 +5463,18 @@ TEST(buffered_forward, body_replacement_removes_stale_representation_metadata) {
     __builtin_memcpy(ctx->response_body_mutation_storage, kReplacement, sizeof(kReplacement) - 1);
     ctx->response_body_mutation_len = sizeof(kReplacement) - 1;
     ctx->response_body_mutation_set = true;
+    static const char kDigestName[] = "Digest";
+    static const char kDigestValue[] = "sha-256=replacement";
+    ctx->response_header_mutations[0] = {{kDigestName, sizeof(kDigestName) - 1},
+                                         {kDigestValue, sizeof(kDigestValue) - 1},
+                                         jit::ResponseHeaderMutationMode::Set};
+    ctx->response_header_count = 1;
 
     static const char kUpstream[] =
         "HTTP/1.1 206 Partial Content\r\nContent-Length: 4\r\nContent-Encoding: gzip\r\n"
-        "Content-Range: bytes 0-3/100\r\n\r\ndata";
+        "Content-Range: bytes 0-3/100\r\nDigest: sha-256=upstream\r\n"
+        "Content-Digest: sha-256=:upstream:\r\nRepr-Digest: sha-256=:upstream:\r\n"
+        "Content-MD5: upstream\r\n\r\ndata";
     conn->upstream_recv_buf.reset();
     conn->upstream_recv_buf.write(reinterpret_cast<const u8*>(kUpstream), sizeof(kUpstream) - 1);
     on_upstream_response<SmallLoop>(
@@ -5477,6 +5485,15 @@ TEST(buffered_forward, body_replacement_removes_stale_representation_metadata) {
     const char* wire = reinterpret_cast<const char*>(conn->send_buf.data());
     CHECK(!buf_contains(wire, conn->send_buf.len(), "Content-Encoding", 16));
     CHECK(!buf_contains(wire, conn->send_buf.len(), "Content-Range", 13));
+    CHECK(!buf_contains(
+        wire, conn->send_buf.len(), "sha-256=upstream", sizeof("sha-256=upstream") - 1));
+    CHECK(!buf_contains(wire, conn->send_buf.len(), "Content-Digest", 14));
+    CHECK(!buf_contains(wire, conn->send_buf.len(), "Repr-Digest", 11));
+    CHECK(!buf_contains(wire, conn->send_buf.len(), "Content-MD5", 11));
+    CHECK(buf_contains(wire,
+                       conn->send_buf.len(),
+                       "Digest: sha-256=replacement\r\n",
+                       sizeof("Digest: sha-256=replacement\r\n") - 1));
     CHECK(buf_contains(wire,
                        conn->send_buf.len(),
                        "Content-Type: text/plain; charset=utf-8\r\n",
@@ -5516,7 +5533,13 @@ TEST(buffered_forward, dechunking_removes_trailer_declaration) {
     conn->proxy_response_buffered = true;
     conn->req_keep_alive = true;
     conn->keep_alive = true;
-    conn->reset_jit_ctx();
+    auto* ctx = conn->reset_jit_ctx();
+    static const char kTrailerName[] = "Trailer";
+    static const char kTrailerValue[] = "X-Late";
+    ctx->response_header_mutations[0] = {{kTrailerName, sizeof(kTrailerName) - 1},
+                                         {kTrailerValue, sizeof(kTrailerValue) - 1},
+                                         jit::ResponseHeaderMutationMode::Set};
+    ctx->response_header_count = 1;
 
     static const char kUpstream[] =
         "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nTrailer: Digest\r\n\r\n"
@@ -5912,6 +5935,11 @@ TEST(buffered_forward, h2_deframing_and_body_replacement_strip_stale_metadata) {
                                            &header_count));
         for (u32 i = 0; i < header_count; i++)
             CHECK_FALSE(headers[i].name.eq(Str{forbidden_name, forbidden_name_len}));
+        bool found_default_content_type = false;
+        for (u32 i = 0; i < header_count; i++)
+            found_default_content_type |= headers[i].name.eq(Str{"content-type", 12}) &&
+                                          headers[i].value.eq(Str{"text/plain; charset=utf-8", 25});
+        CHECK_EQ(found_default_content_type, replace_body);
         conn->h2 = nullptr;
     };
 
@@ -5923,6 +5951,15 @@ TEST(buffered_forward, h2_deframing_and_body_replacement_strip_stale_metadata) {
         "HTTP/1.1 206 Partial Content\r\nContent-Length: 4\r\n"
         "Content-Range: bytes 0-3/100\r\n\r\ndata";
     run(kRange, sizeof(kRange) - 1, true, "content-range", 13);
+
+    static constexpr char kDigests[] =
+        "HTTP/1.1 200 OK\r\nContent-Length: 4\r\nDigest: sha-256=upstream\r\n"
+        "Content-Digest: sha-256=:upstream:\r\nRepr-Digest: sha-256=:upstream:\r\n"
+        "Content-MD5: upstream\r\n\r\ndata";
+    run(kDigests, sizeof(kDigests) - 1, true, "digest", 6);
+    run(kDigests, sizeof(kDigests) - 1, true, "content-digest", 14);
+    run(kDigests, sizeof(kDigests) - 1, true, "repr-digest", 11);
+    run(kDigests, sizeof(kDigests) - 1, true, "content-md5", 11);
 
     static constexpr char kChunked[] =
         "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nTrailer: Digest\r\n\r\n"
@@ -6179,9 +6216,15 @@ TEST(buffered_forward, failure_response_closes_after_full_send) {
     REQUIRE(conn != nullptr);
     const i32 fd = conn->fd;
     conn->proxy_response_buffered = true;
+    conn->upstream_recv_armed = true;
 
     buffered_forward_fail(&loop, *conn, 502);
+    CHECK_EQ(conn->upstream_fd, -1);
+    CHECK(conn->upstream_abandoned);
+    CHECK_FALSE(conn->upstream_recv_armed);
     REQUIRE_EQ(conn->on_send, &on_proxy_response_sent<SmallLoop>);
+    loop.dispatch_event(*conn, make_ev(conn->id, IoEventType::UpstreamRecv, -ENOBUFS));
+    CHECK_EQ(conn->fd, fd);
     const u32 wire_len = conn->send_buf.len();
     on_proxy_response_sent<SmallLoop>(
         &loop, *conn, make_ev(conn->id, IoEventType::Send, static_cast<i32>(wire_len)));

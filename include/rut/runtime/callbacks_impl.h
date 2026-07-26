@@ -2658,6 +2658,15 @@ inline bool h2_drop_response_header(Str name) {
            http_header_name_eq_ci(kName, kLen, "content-length", 14);
 }
 
+inline bool body_replacement_invalidates_upstream_header(Str name) {
+    return http_header_name_eq_ci(name.ptr, name.len, "content-encoding", 16) ||
+           http_header_name_eq_ci(name.ptr, name.len, "content-range", 13) ||
+           http_header_name_eq_ci(name.ptr, name.len, "digest", 6) ||
+           http_header_name_eq_ci(name.ptr, name.len, "content-digest", 14) ||
+           http_header_name_eq_ci(name.ptr, name.len, "repr-digest", 11) ||
+           http_header_name_eq_ci(name.ptr, name.len, "content-md5", 11);
+}
+
 // Is `name` listed as a token in an upstream `Connection: a, b, c` header value?
 // Such fields are connection-specific (hop-by-hop) and must not be forwarded to
 // the HTTP/2 client (RFC 7230 §6.1 / RFC 7540 §8.1.2.2). Tokens are comma
@@ -2777,7 +2786,7 @@ void h2_proxy_finish(Loop* loop,
         h2_proxy_fail(loop, conn, 502);
         return;
     }
-    constexpr u32 kMaxEffectiveHeaders = kMaxHeaders + jit::kMaxResponseHeaderMutations;
+    constexpr u32 kMaxEffectiveHeaders = kMaxHeaders + jit::kMaxResponseHeaderMutations + 1;
     const jit::HandlerCtx* response_ctx =
         h2->async_apply_response_mutations ? h2->async_jit_ctx() : nullptr;
     ResponseHeaderKV effective[kMaxEffectiveHeaders];
@@ -2785,8 +2794,7 @@ void h2_proxy_finish(Loop* loop,
     for (u32 i = 0; i < resp.header_count && effective_count < kMaxEffectiveHeaders; i++) {
         const Str kName = resp.headers[i].name;
         if (response_ctx != nullptr && response_ctx->response_body_mutation_set &&
-            (http_header_name_eq_ci(kName.ptr, kName.len, "content-encoding", 16) ||
-             http_header_name_eq_ci(kName.ptr, kName.len, "content-range", 13))) {
+            body_replacement_invalidates_upstream_header(kName)) {
             continue;
         }
         // content-length is normally dropped (http2_write_response re-derives it
@@ -2890,6 +2898,16 @@ void h2_proxy_finish(Loop* loop,
             hdrs[nhdrs].name = {effective[i].key_data, effective[i].key_len};
             hdrs[nhdrs].value = {effective[i].value_data, effective[i].value_len};
             nhdrs++;
+        }
+    }
+    if (mutations_valid && response_body_mutated && representation_body_len != 0 && status >= 200 &&
+        status != 204 && status != 205 && status != 304) {
+        bool has_content_type = false;
+        for (u32 i = 0; i < nhdrs; i++)
+            has_content_type |=
+                http_header_name_eq_ci(hdrs[i].name.ptr, hdrs[i].name.len, "content-type", 12);
+        if (!has_content_type) {
+            hdrs[nhdrs++] = {{"content-type", 12}, {"text/plain; charset=utf-8", 25}};
         }
     }
     if (!mutations_valid || status < 200 || status == 204 || status == 205 || status == 304 ||
@@ -4558,6 +4576,23 @@ inline bool ws_value_has_token(const char* v, u32 vlen, const char* tok, u32 tle
 
 template <typename Loop>
 void buffered_forward_fail(Loop* loop, Connection& conn, u16 status) {
+    // Detach and abandon the upstream before queuing the downstream error. An
+    // io_uring multishot receive may still produce a terminal CQE after close;
+    // upstream_abandoned makes that stale completion benign while the error send
+    // drains instead of letting it tear down the client connection.
+    conn.on_upstream_recv = nullptr;
+    conn.on_upstream_send = nullptr;
+    conn.upstream_abandoned = true;
+    if (conn.upstream_fd >= 0) {
+        ::close(conn.upstream_fd);
+        conn.upstream_fd = -1;
+        loop->clear_upstream_fd(conn.id);
+    }
+    if constexpr (requires { loop->discard_upstream_send(conn); })
+        loop->discard_upstream_send(conn);
+    conn.upstream_recv_armed = false;
+    conn.upstream_send_armed = false;
+    release_upstream_slot(loop, conn);
     conn.proxy_response_buffered = false;
     conn.buffered_proxy_send_in_progress = true;
     conn.upstream_keep_alive = false;
@@ -4594,8 +4629,7 @@ void finish_buffered_forward(Loop* loop,
             continue;
         }
         if (response_ctx->response_body_mutation_set &&
-            (http_header_name_eq_ci(name.ptr, name.len, "content-encoding", 16) ||
-             http_header_name_eq_ci(name.ptr, name.len, "content-range", 13))) {
+            body_replacement_invalidates_upstream_header(name)) {
             continue;
         }
         if (http_header_name_eq_ci(name.ptr, name.len, "content-length", 14)) {
@@ -4632,6 +4666,16 @@ void finish_buffered_forward(Loop* loop,
         (response_ctx->response_status_set && response_ctx->response_status < 200)) {
         buffered_forward_fail(loop, conn, 500);
         return;
+    }
+    if (resp.chunked) {
+        for (u32 i = 0; i < header_count;) {
+            if (!http_header_name_eq_ci(headers[i].key_data, headers[i].key_len, "trailer", 7)) {
+                i++;
+                continue;
+            }
+            for (u32 move = i + 1; move < header_count; move++) headers[move - 1] = headers[move];
+            header_count--;
+        }
     }
     u16 status =
         response_ctx->response_status_set ? response_ctx->response_status : resp.status_code;
