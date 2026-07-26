@@ -435,7 +435,8 @@ static bool markdown_strip_container(std::string_view line,
                                      std::string* normalized = nullptr) {
     size_t pos = 0;
     size_t column = 0;
-    for (const auto& segment : segments) {
+    for (size_t segment_index = 0; segment_index < segments.size(); segment_index++) {
+        const auto& segment = segments[segment_index];
         if (segment.kind == MarkdownContainerSegment::Kind::Blockquote) {
             pos = markdown_container_marker(line, pos, column, &column);
             if (pos >= line.size() || line[pos] != '>') return false;
@@ -488,6 +489,9 @@ static bool markdown_strip_container(std::string_view line,
         if (column != target_column) {
             const std::string_view rest = line.substr(pos);
             if (rest.find_first_not_of(" \t\r") == std::string_view::npos) {
+                for (size_t remaining = segment_index + 1; remaining < segments.size(); remaining++)
+                    if (segments[remaining].kind == MarkdownContainerSegment::Kind::Blockquote)
+                        return false;
                 *content = rest;
                 return true;
             }
@@ -1191,6 +1195,26 @@ TEST(frontend, language_card_list_container_survives_nested_block_close) {
     REQUIRE(markdown_strip_container("    ```rut", continuation, &content));
     REQUIRE(parse_markdown_fence_open_content(content, &fence));
     CHECK(markdown_fence_language(fence.info, "rut"));
+}
+
+TEST(frontend, language_card_blank_line_ends_nested_blockquote_fence) {
+    MarkdownFence fence{};
+    REQUIRE(parse_markdown_fence_open("- > ~~~~markdown", &fence));
+    REQUIRE_EQ(fence.container_segments.size(), 2u);
+
+    std::string_view content;
+    CHECK_FALSE(markdown_strip_container("", fence.container_segments, &content));
+    CHECK_FALSE(markdown_strip_container("  ", fence.container_segments, &content));
+
+    std::vector<MarkdownContainerSegment> outer_list(fence.container_segments.begin(),
+                                                     fence.container_segments.begin() + 1);
+    CHECK(markdown_strip_container("", outer_list, &content));
+    REQUIRE(markdown_strip_container("  > ~~~~rut", outer_list, &content));
+    std::vector<MarkdownContainerSegment> nested_container;
+    content = markdown_container_content(content, 0, nullptr, &nested_container, true);
+    MarkdownFence next{};
+    REQUIRE(parse_markdown_fence_open_content(content, &next));
+    CHECK(markdown_fence_language(next.info, "rut"));
 }
 
 TEST(frontend, language_card_same_line_html_close_retains_list_container) {
