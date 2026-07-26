@@ -23869,6 +23869,19 @@ static FrontendResult<HirModule*> analyze_file_internal(
             return frontend_error(FrontendError::UnsupportedSyntax, route_decl.span);
 
         FixedVec<RouteNamedErrorCase, HirVariant::kMaxCases> named_error_cases;
+        const auto collect_guard_match_arm_named_errors =
+            [&](u32 arm_index) -> FrontendResult<void> {
+            if (arm_index >= mod.guard_match_arms.len)
+                return frontend_error(FrontendError::UnsupportedSyntax, route_decl.span);
+            const auto& arm = mod.guard_match_arms[arm_index];
+            auto collected = collect_named_error_cases(arm.pattern, named_error_cases);
+            if (!collected) return core::make_unexpected(collected.error());
+            for (u32 li = 0; li < arm.locals.len; li++) {
+                collected = collect_named_error_cases(arm.locals[li].init, named_error_cases);
+                if (!collected) return core::make_unexpected(collected.error());
+            }
+            return {};
+        };
         for (u32 li = 0; li < route.locals.len; li++) {
             auto collected = collect_named_error_cases(route.locals[li].init, named_error_cases);
             if (!collected) return core::make_unexpected(collected.error());
@@ -23885,9 +23898,8 @@ static FrontendResult<HirModule*> analyze_file_internal(
                 if (!collected) return core::make_unexpected(collected.error());
             }
             for (u32 ai = 0; ai < route.guards[gi].fail_match_count; ai++) {
-                collected = collect_named_error_cases(
-                    mod.guard_match_arms[route.guards[gi].fail_match_start + ai].pattern,
-                    named_error_cases);
+                collected =
+                    collect_guard_match_arm_named_errors(route.guards[gi].fail_match_start + ai);
                 if (!collected) return core::make_unexpected(collected.error());
             }
         }
@@ -23931,9 +23943,7 @@ static FrontendResult<HirModule*> analyze_file_internal(
                     if (!collected) return core::make_unexpected(collected.error());
                 }
                 for (u32 ai = 0; ai < guard.fail_match_count; ai++) {
-                    collected = collect_named_error_cases(
-                        mod.guard_match_arms[guard.fail_match_start + ai].pattern,
-                        named_error_cases);
+                    collected = collect_guard_match_arm_named_errors(guard.fail_match_start + ai);
                     if (!collected) return core::make_unexpected(collected.error());
                 }
             }
@@ -23982,9 +23992,8 @@ static FrontendResult<HirModule*> analyze_file_internal(
                             if (!collected) return core::make_unexpected(collected.error());
                         }
                         for (u32 fai = 0; fai < guard.fail_match_count; fai++) {
-                            collected = collect_named_error_cases(
-                                mod.guard_match_arms[guard.fail_match_start + fai].pattern,
-                                named_error_cases);
+                            collected =
+                                collect_guard_match_arm_named_errors(guard.fail_match_start + fai);
                             if (!collected) return core::make_unexpected(collected.error());
                         }
                     }
@@ -24032,11 +24041,8 @@ static FrontendResult<HirModule*> analyze_file_internal(
                     for (u32 fai = 0;
                          fai < route.control.match_arms[ai].guards[gi].fail_match_count;
                          fai++) {
-                        collected = collect_named_error_cases(
-                            mod.guard_match_arms
-                                [route.control.match_arms[ai].guards[gi].fail_match_start + fai]
-                                    .pattern,
-                            named_error_cases);
+                        collected = collect_guard_match_arm_named_errors(
+                            route.control.match_arms[ai].guards[gi].fail_match_start + fai);
                         if (!collected) return core::make_unexpected(collected.error());
                     }
                 }
@@ -24058,15 +24064,25 @@ static FrontendResult<HirModule*> analyze_file_internal(
             if (!mod.variants.push(error_variant))
                 return frontend_error(FrontendError::TooManyItems, route_decl.span);
             route.error_variant_index = mod.variants.len - 1;
+            const auto patch_local_named_errors = [&](HirLocal& local) {
+                patch_named_error_variant(
+                    &local.init, route.error_variant_index, named_error_cases);
+                patch_error_variant_refs(&local.init, route.error_variant_index);
+                if (local.may_error && local.error_variant_index == 0xffffffffu)
+                    local.error_variant_index = route.error_variant_index;
+            };
+            const auto patch_guard_match_arm_named_errors = [&](u32 arm_index) {
+                if (arm_index >= mod.guard_match_arms.len) return;
+                auto& arm = mod.guard_match_arms[arm_index];
+                patch_named_error_variant(
+                    &arm.pattern, route.error_variant_index, named_error_cases);
+                patch_error_variant_refs(&arm.pattern, route.error_variant_index);
+                for (u32 li = 0; li < arm.locals.len; li++)
+                    patch_local_named_errors(arm.locals[li]);
+            };
             const auto patch_branch_named_errors = [&](HirForLoopBranch& branch) {
-                for (u32 li = 0; li < branch.locals.len; li++) {
-                    HirLocal& local = branch.locals[li];
-                    patch_named_error_variant(
-                        &local.init, route.error_variant_index, named_error_cases);
-                    patch_error_variant_refs(&local.init, route.error_variant_index);
-                    if (local.may_error && local.error_variant_index == 0xffffffffu)
-                        local.error_variant_index = route.error_variant_index;
-                }
+                for (u32 li = 0; li < branch.locals.len; li++)
+                    patch_local_named_errors(branch.locals[li]);
             };
             for (u32 li = 0; li < route.locals.len; li++) {
                 patch_named_error_variant(
@@ -24094,13 +24110,7 @@ static FrontendResult<HirModule*> analyze_file_internal(
                         local.error_variant_index = route.error_variant_index;
                 }
                 for (u32 ai = 0; ai < route.guards[gi].fail_match_count; ai++) {
-                    patch_named_error_variant(
-                        &mod.guard_match_arms[route.guards[gi].fail_match_start + ai].pattern,
-                        route.error_variant_index,
-                        named_error_cases);
-                    patch_error_variant_refs(
-                        &mod.guard_match_arms[route.guards[gi].fail_match_start + ai].pattern,
-                        route.error_variant_index);
+                    patch_guard_match_arm_named_errors(route.guards[gi].fail_match_start + ai);
                 }
             }
             for (u32 fi = 0; fi < route.for_loops.len; fi++) {
@@ -24146,13 +24156,7 @@ static FrontendResult<HirModule*> analyze_file_internal(
                         patch_error_variant_refs(&guard.fail_body.cond, route.error_variant_index);
                     }
                     for (u32 ai = 0; ai < guard.fail_match_count; ai++) {
-                        patch_named_error_variant(
-                            &mod.guard_match_arms[guard.fail_match_start + ai].pattern,
-                            route.error_variant_index,
-                            named_error_cases);
-                        patch_error_variant_refs(
-                            &mod.guard_match_arms[guard.fail_match_start + ai].pattern,
-                            route.error_variant_index);
+                        patch_guard_match_arm_named_errors(guard.fail_match_start + ai);
                     }
                 }
                 for (u32 ii = 0; ii < route.for_loops[fi].body.ifs.len; ii++) {
@@ -24213,13 +24217,7 @@ static FrontendResult<HirModule*> analyze_file_internal(
                                                          route.error_variant_index);
                             }
                             for (u32 fai = 0; fai < guard.fail_match_count; fai++) {
-                                patch_named_error_variant(
-                                    &mod.guard_match_arms[guard.fail_match_start + fai].pattern,
-                                    route.error_variant_index,
-                                    named_error_cases);
-                                patch_error_variant_refs(
-                                    &mod.guard_match_arms[guard.fail_match_start + fai].pattern,
-                                    route.error_variant_index);
+                                patch_guard_match_arm_named_errors(guard.fail_match_start + fai);
                             }
                         }
                         patch_named_error_variant(
@@ -24279,19 +24277,8 @@ static FrontendResult<HirModule*> analyze_file_internal(
                         for (u32 fai = 0;
                              fai < route.control.match_arms[ai].guards[gi].fail_match_count;
                              fai++) {
-                            patch_named_error_variant(
-                                &mod.guard_match_arms
-                                     [route.control.match_arms[ai].guards[gi].fail_match_start +
-                                      fai]
-                                         .pattern,
-                                route.error_variant_index,
-                                named_error_cases);
-                            patch_error_variant_refs(
-                                &mod.guard_match_arms
-                                     [route.control.match_arms[ai].guards[gi].fail_match_start +
-                                      fai]
-                                         .pattern,
-                                route.error_variant_index);
+                            patch_guard_match_arm_named_errors(
+                                route.control.match_arms[ai].guards[gi].fail_match_start + fai);
                         }
                     }
                     patch_named_error_variant(&route.control.match_arms[ai].cond,

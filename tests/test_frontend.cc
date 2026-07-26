@@ -32976,6 +32976,30 @@ route GET "/x" {
     rir.destroy();
 }
 
+TEST(frontend, static_for_guard_match_helpers_resolve_carrier_named_errors) {
+    const char* src = R"rut(
+func envelope(value: i32) -> Json {
+    let selected = any(error(.carrier), value)
+    let payload = json({ value: selected })
+    payload
+}
+route GET "/x" {
+    let failed = error(.timeout)
+    for item in [1] {
+        guard match failed else {
+            .timeout => return 400, envelope(item)
+            _ => return 401
+        }
+    }
+    return 500
+}
+)rut";
+    FrontendRirModule rir{};
+    REQUIRE(lower_src_to_rir(src, rir));
+    CHECK(rir::verify_module(rir.module).ok);
+    rir.destroy();
+}
+
 TEST(frontend, static_for_nested_match_materializes_direct_request_subject_once) {
     const char* src = R"rut(
 route GET "/x" {
