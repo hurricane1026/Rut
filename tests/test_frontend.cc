@@ -684,10 +684,25 @@ static MarkdownLinkReferenceDefinition markdown_link_reference_definition(std::s
             pos++;
         } else {
             const size_t destination_start = pos;
+            u32 parenthesis_depth = 0;
+            bool destination_escaped = false;
             while (pos < line.size() && line[pos] != ' ' && line[pos] != '\t' &&
-                   line[pos] != '\r' && line[pos] != '\n')
+                   line[pos] != '\r' && line[pos] != '\n') {
+                const char destination_char = line[pos];
+                if (destination_escaped) {
+                    destination_escaped = false;
+                } else if (destination_char == '\\') {
+                    destination_escaped = true;
+                } else if (destination_char == '(') {
+                    parenthesis_depth++;
+                } else if (destination_char == ')') {
+                    if (parenthesis_depth == 0) return MarkdownLinkReferenceDefinition::None;
+                    parenthesis_depth--;
+                }
                 pos++;
-            if (pos == destination_start) return MarkdownLinkReferenceDefinition::None;
+            }
+            if (pos == destination_start || parenthesis_depth != 0)
+                return MarkdownLinkReferenceDefinition::None;
         }
         const size_t destination_end = pos;
         while (pos < line.size() && (line[pos] == ' ' || line[pos] == '\t' || line[pos] == '\r'))
@@ -1270,6 +1285,10 @@ TEST(frontend, language_card_recognizes_link_reference_definitions) {
     CHECK_FALSE(markdown_link_reference_title("  ordinary paragraph", true));
     CHECK_FALSE(markdown_is_link_reference_definition("[foo] ordinary paragraph"));
     CHECK_FALSE(markdown_is_link_reference_definition("[]: /url"));
+    CHECK_FALSE(markdown_is_link_reference_definition("[foo]: /url("));
+    CHECK_FALSE(markdown_is_link_reference_definition("[foo]: /url)"));
+    CHECK(markdown_is_link_reference_definition("[foo]: /url(path)"));
+    CHECK(markdown_is_link_reference_definition("[foo]: /url\\(path\\)"));
 
     bool title_pending = true;
     std::vector<MarkdownContainerSegment> expected_container;
