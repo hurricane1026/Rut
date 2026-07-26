@@ -2825,7 +2825,6 @@ inline bool normalize_partial_content_headers(ResponseHeaderKV* headers,
                 (validate_length && range_length != representation_length))
                 return false;
             found = true;
-            i++;
             continue;
         }
         if (status == 416) {

@@ -63,6 +63,8 @@ void Http2Conn::init() {
     async_synth_len = 0;
     async_body_start = 0;
     async_body_len = 0;
+    async_content_length = 0;
+    async_has_content_length = false;
     async_inject_content_length_on_forward = false;
     async_wait_for_body_on_forward = false;
     async_synth_sent = 0;

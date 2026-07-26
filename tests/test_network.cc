@@ -5820,6 +5820,12 @@ TEST(buffered_forward, final_status_normalizes_content_range) {
     header_count = 1;
     CHECK(normalize_partial_content_headers(partial, &header_count, 206, 4, true));
     CHECK_FALSE(normalize_partial_content_headers(partial, &header_count, 206, 5, true));
+    ResponseHeaderKV duplicate_partial[] = {
+        {kRangeName, sizeof(kRangeName) - 1, kRangeValue, sizeof(kRangeValue) - 1},
+        {kRangeName, sizeof(kRangeName) - 1, kRangeValue, sizeof(kRangeValue) - 1},
+    };
+    header_count = 2;
+    CHECK_FALSE(normalize_partial_content_headers(duplicate_partial, &header_count, 206, 4, true));
     header_count = 0;
     CHECK_FALSE(normalize_partial_content_headers(partial, &header_count, 206));
 

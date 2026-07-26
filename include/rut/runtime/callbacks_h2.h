@@ -567,6 +567,8 @@ inline void h2_clear_async(Http2Conn& h2) {
     h2.async_synth_len = 0;
     h2.async_body_start = 0;
     h2.async_body_len = 0;
+    h2.async_content_length = 0;
+    h2.async_has_content_length = false;
     h2.async_inject_content_length_on_forward = false;
     h2.async_wait_for_body_on_forward = false;
     h2.async_timer_ms = 0;
@@ -588,8 +590,8 @@ inline void h2_transfer_timer_to_pending_forward(Http2Conn& h2, u32 stream_id, u
     h2.pending_body_start = h2.async_body_start;
     h2.pending_synth_len = h2.async_synth_len;
     h2.pending_body_len = 0;
-    h2.pending_content_length = 0;
-    h2.pending_has_content_length = false;
+    h2.pending_content_length = h2.async_content_length;
+    h2.pending_has_content_length = h2.async_has_content_length;
     h2.pending_buffer_body = true;
     h2.pending_request_forwardable = true;
     h2.pending_overflow = false;
@@ -719,6 +721,8 @@ bool h2_suspend_timer(H2Dispatch<Loop>& d,
     h2->async_synth_len = h2_stash_synth(*h2, synth, synth_len);
     h2->async_body_start = body_start;
     h2->async_body_len = body_len;
+    h2->async_content_length = 0;
+    h2->async_has_content_length = false;
     h2->async_inject_content_length_on_forward = inject_content_length_on_forward;
     if (!ctx_already_parked &&
         !h2_snapshot_async_jit_ctx(*h2, live_ctx, synth, h2->async_synth_len)) {
@@ -1219,12 +1223,14 @@ void h2_dispatch_request(H2Dispatch<Loop>& d,
                                           h2_proxy_request_forwardable(headers, nheaders),
                                           kSynthLen,
                                           0,
-                                          true)) {
+                                          !req.has_content_length)) {
                         jit::release_response_body_mutation_storage(ctx);
                         h2_emit_status(d, stream_id, 503);
                         return;
                     }
                     h2->async_route = route;
+                    h2->async_content_length = req.content_length;
+                    h2->async_has_content_length = req.has_content_length;
                     h2->async_wait_for_body_on_forward = true;
                     if (h2_expects_continue(headers, nheaders)) h2_emit_continue(d, stream_id);
                     return;

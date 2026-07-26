@@ -163,6 +163,8 @@ struct Http2Conn {
     u32 async_synth_len;
     u32 async_body_start;
     u32 async_body_len;
+    u32 async_content_length;
+    bool async_has_content_length;
     bool async_inject_content_length_on_forward;
     bool async_wait_for_body_on_forward;
     // Bytes of the synthesized request already written to the upstream. io_uring

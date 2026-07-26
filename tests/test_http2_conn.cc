@@ -1628,7 +1628,8 @@ TEST(h2_serving, body_independent_timer_starts_before_upload_completion) {
     const hpack::Header headers[] = {{{":method", 7}, {"POST", 4}},
                                      {{":path", 5}, {"/upload", 7}},
                                      {{":scheme", 7}, {"https", 5}},
-                                     {{":authority", 10}, {"example", 7}}};
+                                     {{":authority", 10}, {"example", 7}},
+                                     {{"content-length", 14}, {"5", 1}}};
     Http2Conn h2;
     h2.init();
     Connection conn;
@@ -1642,7 +1643,7 @@ TEST(h2_serving, body_independent_timer_starts_before_upload_completion) {
     H2Dispatch<FakeH2Loop> dispatch{&loop, &conn, response, sizeof(response), 0, false};
 
     h2_buffered_timer_calls = 0;
-    h2_dispatch_request(dispatch, 1, headers, 4, /*end_stream=*/false);
+    h2_dispatch_request(dispatch, 1, headers, 5, /*end_stream=*/false);
     CHECK_EQ(h2_buffered_timer_calls, 1u);
     CHECK_EQ(h2.pending_stream, 0u);
     CHECK_EQ(h2.async_stream, 1u);
@@ -1650,7 +1651,9 @@ TEST(h2_serving, body_independent_timer_starts_before_upload_completion) {
     CHECK_EQ(h2.async_state, 7u);
     CHECK_EQ(h2.async_timer_ms, 25u);
     CHECK_EQ(h2.async_body_len, 0u);
-    CHECK(h2.async_inject_content_length_on_forward);
+    CHECK_EQ(h2.async_content_length, 5u);
+    CHECK(h2.async_has_content_length);
+    CHECK_FALSE(h2.async_inject_content_length_on_forward);
     CHECK(h2.async_wait_for_body_on_forward);
     h2_clear_async(h2);
 }
@@ -1671,6 +1674,8 @@ TEST(h2_serving, resumed_timer_defers_body_only_after_selecting_buffered_forward
     h2.async_fn = route.fn;
     h2.async_synth_len = sizeof(kSynth) - 1;
     h2.async_body_start = sizeof(kSynth) - 1;
+    h2.async_content_length = 5;
+    h2.async_has_content_length = true;
     h2.async_wait_for_body_on_forward = true;
 
     h2_transfer_timer_to_pending_forward(h2, 1, 7);
@@ -1682,6 +1687,8 @@ TEST(h2_serving, resumed_timer_defers_body_only_after_selecting_buffered_forward
     CHECK_EQ(h2.pending_forward_upstream_id, 7u);
     CHECK_EQ(h2.pending_synth_len, sizeof(kSynth) - 1);
     CHECK_EQ(h2.pending_body_start, sizeof(kSynth) - 1);
+    CHECK_EQ(h2.pending_content_length, 5u);
+    CHECK(h2.pending_has_content_length);
     CHECK(h2.pending_route == &route);
     h2_clear_pending(h2);
 }
