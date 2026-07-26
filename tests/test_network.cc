@@ -5448,7 +5448,7 @@ TEST(buffered_forward, honors_downstream_connection_close) {
     CHECK(!buf_contains(wire, conn->send_buf.len(), "Connection: keep-alive", 22));
 }
 
-TEST(buffered_forward, body_replacement_removes_content_encoding) {
+TEST(buffered_forward, body_replacement_removes_stale_representation_metadata) {
     SmallLoop loop;
     loop.setup();
     auto* conn = setup_proxy_conn(loop);
@@ -5465,7 +5465,8 @@ TEST(buffered_forward, body_replacement_removes_content_encoding) {
     ctx->response_body_mutation_set = true;
 
     static const char kUpstream[] =
-        "HTTP/1.1 200 OK\r\nContent-Length: 4\r\nContent-Encoding: gzip\r\n\r\ndata";
+        "HTTP/1.1 206 Partial Content\r\nContent-Length: 4\r\nContent-Encoding: gzip\r\n"
+        "Content-Range: bytes 0-3/100\r\n\r\ndata";
     conn->upstream_recv_buf.reset();
     conn->upstream_recv_buf.write(reinterpret_cast<const u8*>(kUpstream), sizeof(kUpstream) - 1);
     on_upstream_response<SmallLoop>(
@@ -5475,6 +5476,7 @@ TEST(buffered_forward, body_replacement_removes_content_encoding) {
 
     const char* wire = reinterpret_cast<const char*>(conn->send_buf.data());
     CHECK(!buf_contains(wire, conn->send_buf.len(), "Content-Encoding", 16));
+    CHECK(!buf_contains(wire, conn->send_buf.len(), "Content-Range", 13));
     CHECK(buf_contains(wire,
                        conn->send_buf.len(),
                        "Content-Type: text/plain; charset=utf-8\r\n",
@@ -5888,6 +5890,11 @@ TEST(buffered_forward, h2_deframing_and_body_replacement_strip_stale_metadata) {
         "HTTP/1.1 200 OK\r\nContent-Length: 4\r\nContent-Encoding: gzip\r\n\r\ndata";
     run(kEncoded, sizeof(kEncoded) - 1, true, "content-encoding", 16);
 
+    static constexpr char kRange[] =
+        "HTTP/1.1 206 Partial Content\r\nContent-Length: 4\r\n"
+        "Content-Range: bytes 0-3/100\r\n\r\ndata";
+    run(kRange, sizeof(kRange) - 1, true, "content-range", 13);
+
     static constexpr char kChunked[] =
         "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nTrailer: Digest\r\n\r\n"
         "4\r\nbody\r\n0\r\nDigest: done\r\n\r\n";
@@ -6242,6 +6249,29 @@ TEST(buffered_forward, rejects_upstream_upgrade_before_websocket_tunnel) {
     CHECK_EQ(conn->resp_status, 502u);
     CHECK_EQ(conn->on_send, &on_proxy_response_sent<SmallLoop>);
     CHECK_FALSE(conn->resp_upgrade_is_websocket);
+}
+
+TEST(buffered_forward, rejects_successful_connect_before_waiting_for_tunnel_close) {
+    SmallLoop loop;
+    loop.setup();
+    auto* conn = setup_proxy_conn(loop);
+    REQUIRE(conn != nullptr);
+    conn->proxy_response_buffered = true;
+    conn->req_method = static_cast<u8>(LogHttpMethod::Connect);
+    conn->reset_jit_ctx();
+
+    static const char kUpstream[] = "HTTP/1.1 200 Connection Established\r\n\r\n";
+    conn->upstream_recv_buf.reset();
+    conn->upstream_recv_buf.write(reinterpret_cast<const u8*>(kUpstream), sizeof(kUpstream) - 1);
+    loop.backend.clear_ops();
+    on_upstream_response<SmallLoop>(
+        &loop,
+        *conn,
+        make_ev(conn->id, IoEventType::UpstreamRecv, static_cast<i32>(sizeof(kUpstream) - 1)));
+
+    CHECK_EQ(conn->resp_status, 502u);
+    CHECK_FALSE(conn->proxy_response_buffered);
+    CHECK_EQ(conn->on_send, &on_proxy_response_sent<SmallLoop>);
 }
 
 TEST(buffered_forward, snapshots_request_backed_header_mutation_values) {

@@ -2778,10 +2778,17 @@ void h2_proxy_finish(Loop* loop,
         return;
     }
     constexpr u32 kMaxEffectiveHeaders = kMaxHeaders + jit::kMaxResponseHeaderMutations;
+    const jit::HandlerCtx* response_ctx =
+        h2->async_apply_response_mutations ? h2->async_jit_ctx() : nullptr;
     ResponseHeaderKV effective[kMaxEffectiveHeaders];
     u32 effective_count = 0;
     for (u32 i = 0; i < resp.header_count && effective_count < kMaxEffectiveHeaders; i++) {
         const Str kName = resp.headers[i].name;
+        if (response_ctx != nullptr && response_ctx->response_body_mutation_set &&
+            (http_header_name_eq_ci(kName.ptr, kName.len, "content-encoding", 16) ||
+             http_header_name_eq_ci(kName.ptr, kName.len, "content-range", 13))) {
+            continue;
+        }
         // content-length is normally dropped (http2_write_response re-derives it
         // from the DATA body), but a HEAD response carries no DATA, so keep the
         // upstream's so the client learns the corresponding GET body size.
@@ -2806,8 +2813,6 @@ void h2_proxy_finish(Loop* loop,
         effective[effective_count++] = {
             kName.ptr, kName.len, resp.headers[i].value.ptr, resp.headers[i].value.len};
     }
-    const jit::HandlerCtx* response_ctx =
-        h2->async_apply_response_mutations ? h2->async_jit_ctx() : nullptr;
     bool mutations_valid =
         apply_response_header_mutations(
             response_ctx, effective, kMaxEffectiveHeaders, &effective_count) &&
@@ -4590,7 +4595,8 @@ void finish_buffered_forward(Loop* loop,
             continue;
         }
         if (response_ctx->response_body_mutation_set &&
-            http_header_name_eq_ci(name.ptr, name.len, "content-encoding", 16)) {
+            (http_header_name_eq_ci(name.ptr, name.len, "content-encoding", 16) ||
+             http_header_name_eq_ci(name.ptr, name.len, "content-range", 13))) {
             continue;
         }
         if (http_header_name_eq_ci(name.ptr, name.len, "content-length", 14)) {
@@ -4706,6 +4712,11 @@ void on_buffered_upstream_response(Loop* loop,
         return;
     }
     if (resp.status_code == 101) {
+        buffered_forward_fail(loop, conn, 502);
+        return;
+    }
+    if (conn.req_method == static_cast<u8>(LogHttpMethod::Connect) && resp.status_code >= 200 &&
+        resp.status_code < 300) {
         buffered_forward_fail(loop, conn, 502);
         return;
     }
