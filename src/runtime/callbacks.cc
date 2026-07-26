@@ -609,7 +609,7 @@ void format_response_with_body_and_headers(Connection& conn,
             user_has_content_type = true;
         }
         if (!omit_content_length && preserve_content_length &&
-            preserved_content_length == nullptr &&
+            content_length_override == 0xffffffffu && preserved_content_length == nullptr &&
             header_name_eq_literal_ci(headers[i].key_data, headers[i].key_len, "Content-Length"))
             preserved_content_length = &headers[i];
     }

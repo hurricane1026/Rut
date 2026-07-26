@@ -5723,6 +5723,35 @@ TEST(buffered_forward, preserves_upstream_content_length_on_304) {
     CHECK(buf_contains(wire, wire_len, "\r\n\r\n", 4));
 }
 
+TEST(buffered_forward, head_ignores_invalid_content_length_mutation) {
+    Connection conn;
+    conn.reset();
+    u8 send_storage[4096];
+    conn.send_buf.bind(send_storage, sizeof(send_storage));
+    static const char kName[] = "Content-Length";
+    static const char kValue[] = "bogus";
+    const ResponseHeaderKV headers[] = {
+        {kName, sizeof(kName) - 1, kValue, sizeof(kValue) - 1},
+    };
+
+    format_response_with_body_and_headers(conn,
+                                          200,
+                                          nullptr,
+                                          0,
+                                          headers,
+                                          1,
+                                          /*keep_alive=*/true,
+                                          /*body_is_fallback_reason_phrase=*/false,
+                                          /*suppress_body=*/true,
+                                          /*preserve_content_length=*/true,
+                                          /*content_length_override=*/123,
+                                          /*omit_content_length=*/false);
+
+    const char* wire = reinterpret_cast<const char*>(conn.send_buf.data());
+    CHECK(buf_contains(wire, conn.send_buf.len(), "Content-Length: 123\r\n", 21));
+    CHECK(!buf_contains(wire, conn.send_buf.len(), "Content-Length: bogus", 21));
+}
+
 TEST(buffered_forward, status_mutation_to_304_preserves_upstream_representation_length) {
     SmallLoop loop;
     loop.setup();
@@ -6272,6 +6301,33 @@ TEST(buffered_forward, rejects_successful_connect_before_waiting_for_tunnel_clos
     CHECK_EQ(conn->resp_status, 502u);
     CHECK_FALSE(conn->proxy_response_buffered);
     CHECK_EQ(conn->on_send, &on_proxy_response_sent<SmallLoop>);
+}
+
+TEST(buffered_forward, rejects_connect_status_mutated_to_success) {
+    SmallLoop loop;
+    loop.setup();
+    auto* conn = setup_proxy_conn(loop);
+    REQUIRE(conn != nullptr);
+    conn->proxy_response_buffered = true;
+    conn->req_method = static_cast<u8>(LogHttpMethod::Connect);
+    auto* ctx = conn->reset_jit_ctx();
+    ctx->response_status = 200;
+    ctx->response_status_set = true;
+
+    static const char kUpstream[] =
+        "HTTP/1.1 403 Forbidden\r\nContent-Length: 4\r\nConnection: close\r\n\r\ndeny";
+    conn->upstream_recv_buf.reset();
+    conn->upstream_recv_buf.write(reinterpret_cast<const u8*>(kUpstream), sizeof(kUpstream) - 1);
+    on_upstream_response<SmallLoop>(
+        &loop,
+        *conn,
+        make_ev(conn->id, IoEventType::UpstreamRecv, static_cast<i32>(sizeof(kUpstream) - 1)));
+
+    CHECK_EQ(conn->resp_status, 502u);
+    CHECK_FALSE(conn->proxy_response_buffered);
+    const char* wire = reinterpret_cast<const char*>(conn->send_buf.data());
+    CHECK(buf_contains(wire, conn->send_buf.len(), "HTTP/1.1 502", 12));
+    CHECK(!buf_contains(wire, conn->send_buf.len(), "deny", 4));
 }
 
 TEST(buffered_forward, snapshots_request_backed_header_mutation_values) {

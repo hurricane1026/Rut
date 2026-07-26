@@ -4635,6 +4635,11 @@ void finish_buffered_forward(Loop* loop,
     }
     u16 status =
         response_ctx->response_status_set ? response_ctx->response_status : resp.status_code;
+    if (conn.req_method == static_cast<u8>(LogHttpMethod::Connect) && status >= 200 &&
+        status < 300) {
+        buffered_forward_fail(loop, conn, 502);
+        return;
+    }
     const char* body =
         reinterpret_cast<const char*>(conn.upstream_recv_buf.data() + parser.header_end);
     if (response_ctx->response_body_mutation_set) {
@@ -4679,7 +4684,8 @@ void finish_buffered_forward(Loop* loop,
         is_head,
         ((is_head && !status_forbids_body) || status == 304) &&
             !response_ctx->response_body_mutation_set && resp.has_content_length,
-        status == 304 && !response_ctx->response_body_mutation_set && resp.has_content_length
+        !response_ctx->response_body_mutation_set && resp.has_content_length &&
+                ((is_head && !status_forbids_body) || status == 304)
             ? resp.content_length
         : is_head && response_ctx->response_body_mutation_set && !status_forbids_body
             ? representation_body_len
