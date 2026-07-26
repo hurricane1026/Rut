@@ -14037,7 +14037,37 @@ static bool guard_failure_reads_response(const HirGuard& guard,
 
 static bool hir_for_loop_reads_response(const HirForLoop& loop,
                                         const HirModule& mod,
+                                        const HirRoute& route,
                                         ResponseReadPredicate reads);
+
+static bool terminator_reads_response(const HirTerminator& term,
+                                      const HirRoute& route,
+                                      ResponseReadPredicate reads) {
+    for (u32 i = 0; i < term.json_value_expr_indices.len; i++) {
+        const u32 expr_index = term.json_value_expr_indices[i];
+        if (expr_index < route.exprs.len && reads(route.exprs[expr_index])) return true;
+    }
+    return term.json_body_expr_index < route.exprs.len &&
+           reads(route.exprs[term.json_body_expr_index]);
+}
+
+static bool guard_failure_terminators_read_response(const HirGuard& guard,
+                                                    const HirModule& mod,
+                                                    const HirRoute& route,
+                                                    ResponseReadPredicate reads) {
+    if (terminator_reads_response(guard.fail_term, route, reads) ||
+        terminator_reads_response(guard.fail_body.then_term, route, reads) ||
+        terminator_reads_response(guard.fail_body.else_term, route, reads) ||
+        terminator_reads_response(guard.fail_body.direct_term, route, reads))
+        return true;
+    for (u32 ai = 0; ai < guard.fail_match_count; ai++) {
+        const u32 arm_index = guard.fail_match_start + ai;
+        if (arm_index < mod.guard_match_arms.len &&
+            terminator_reads_response(mod.guard_match_arms[arm_index].direct_term, route, reads))
+            return true;
+    }
+    return false;
+}
 
 static bool route_control_conditionally_reads_response_body(const HirRoute& route,
                                                             const HirModule& mod) {
@@ -14058,7 +14088,7 @@ static bool route_control_conditionally_reads_response_body(const HirRoute& rout
     }
     for (u32 fi = 0; fi < route.for_loops.len; fi++)
         if (hir_for_loop_reads_response(
-                route.for_loops[fi], mod, &hir_expr_conditionally_reads_response_body))
+                route.for_loops[fi], mod, route, &hir_expr_conditionally_reads_response_body))
             return true;
     const auto& control = route.control;
     if (control.kind == HirControlKind::If &&
@@ -14081,13 +14111,15 @@ static bool route_control_conditionally_reads_response_body(const HirRoute& rout
 
 static bool hir_for_loop_reads_response(const HirForLoop& loop,
                                         const HirModule& mod,
+                                        const HirRoute& route,
                                         ResponseReadPredicate reads) {
     if (reads(loop.iter_expr)) return true;
     const auto& body = loop.body;
-    const auto branch_reads = [reads](const HirForLoopBranch& branch) {
+    const auto branch_reads = [&route, reads](const HirForLoopBranch& branch) {
         for (u32 li = 0; li < branch.locals.len; li++)
             if (reads(branch.locals[li].init)) return true;
-        return false;
+        return branch.kind == HirForLoopBranch::Kind::Term &&
+               terminator_reads_response(branch.term, route, reads);
     };
     for (u32 li = 0; li < body.locals.len; li++)
         if (reads(body.locals[li].init)) return true;
@@ -14095,7 +14127,8 @@ static bool hir_for_loop_reads_response(const HirForLoop& loop,
         if (reads(body.term_locals[li].init)) return true;
     for (u32 gi = 0; gi < body.guards.len; gi++)
         if (reads(body.guards[gi].cond) ||
-            guard_failure_reads_response(body.guards[gi], mod, reads))
+            guard_failure_reads_response(body.guards[gi], mod, reads) ||
+            guard_failure_terminators_read_response(body.guards[gi], mod, route, reads))
             return true;
     for (u32 ii = 0; ii < body.ifs.len; ii++) {
         if (reads(body.ifs[ii].cond) || branch_reads(body.ifs[ii].then_branch) ||
@@ -14113,7 +14146,8 @@ static bool hir_for_loop_reads_response(const HirForLoop& loop,
                 if (reads(arm.locals[li].init)) return true;
             for (u32 gi = 0; gi < arm.guards.len; gi++)
                 if (reads(arm.guards[gi].cond) ||
-                    guard_failure_reads_response(arm.guards[gi], mod, reads))
+                    guard_failure_reads_response(arm.guards[gi], mod, reads) ||
+                    guard_failure_terminators_read_response(arm.guards[gi], mod, route, reads))
                     return true;
             if (branch_reads(arm.then_branch) || branch_reads(arm.else_branch) ||
                 branch_reads(arm.direct_branch))
@@ -14132,7 +14166,7 @@ static bool route_reads_response(const HirRoute& route,
             return true;
     }
     for (u32 fi = 0; fi < route.for_loops.len; fi++)
-        if (hir_for_loop_reads_response(route.for_loops[fi], mod, reads)) return true;
+        if (hir_for_loop_reads_response(route.for_loops[fi], mod, route, reads)) return true;
     const auto& control = route.control;
     if (control.kind == HirControlKind::If) return reads(control.cond);
     if (control.kind != HirControlKind::Match) return false;
@@ -22955,6 +22989,11 @@ static FrontendResult<HirModule*> analyze_file_internal(
                     }
                 }
                 if (stmt.expr.kind == AstExprKind::Assign) {
+                    if (seen_for)
+                        return frontend_error(
+                            FrontendError::UnsupportedSyntax,
+                            stmt.span,
+                            lit_str("Response assignments cannot follow a static for-loop"));
                     if (route_reads_response_field(route, mod))
                         return frontend_error(
                             FrontendError::UnsupportedSyntax,

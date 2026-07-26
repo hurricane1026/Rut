@@ -7777,6 +7777,24 @@ route GET "/x" {
         lit("Response.body reads in conditional value branches are not supported")));
 }
 
+TEST(frontend, response_assignment_after_static_loop_is_rejected) {
+    const char* src = R"rut(
+route GET "/x" {
+    let resp = response(200)
+    for item in [1] { guard req.http11 else { return 400 } }
+    resp.status = 201
+    return resp
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE_FALSE(hir.has_value());
+    CHECK(hir.error().detail.eq(lit("Response assignments cannot follow a static for-loop")));
+}
+
 TEST(frontend, nested_call_arguments_cannot_reorder_response_reads_and_mutations) {
     const char* src = R"rut(
 func mutate(_ resp: Response) -> i32 {

@@ -4026,6 +4026,16 @@ FrontendResult<MirModule*> build_mir(const HirModule& module) {
                     }
                     return arm_entry(body_match.arms.len - 1);
                 };
+                auto pattern_fallthrough_target = [&](u32 arm_index) -> u32 {
+                    const u8 capture_group = body_match.arms[arm_index].capture_group;
+                    u32 next = arm_index + 1;
+                    while (capture_group != 0 && next < body_match.arms.len &&
+                           body_match.arms[next].capture_group == capture_group)
+                        next++;
+                    if (next >= body_match.arms.len) return arm_entry(body_match.arms.len - 1);
+                    if (body_match.arms[next].is_wildcard) return arm_entry(next);
+                    return step.match_test_index[step.match_test_ordinal[next]];
+                };
                 for (u32 ordinal = 1; ordinal < step.match_non_wildcard_count; ordinal++) {
                     u32 arm_index = 0;
                     while (arm_index < body_match.arms.len &&
@@ -4045,7 +4055,7 @@ FrontendResult<MirModule*> build_mir(const HirModule& module) {
                     test.term.lhs = subject.value();
                     test.term.rhs = pattern.value();
                     test.term.then_block = arm_entry(arm_index);
-                    test.term.else_block = fallthrough_target(arm_index);
+                    test.term.else_block = pattern_fallthrough_target(arm_index);
                     if (!fn.blocks.push(test))
                         return frontend_error(FrontendError::TooManyItems, fn.span);
                 }
