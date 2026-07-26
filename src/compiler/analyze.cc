@@ -18232,6 +18232,10 @@ static FrontendResult<u32> analyze_for_stmt(const AstStatement& stmt,
                         copy_json_value_metadata(&subject_local, inner_subject.value());
                         subject_local.init = inner_subject.value();
                         arm.local_guard_depth[arm.locals.len] = arm.guards.len;
+                        // The flattened inner pattern is synthesized as an arm guard, so
+                        // its latched request subject must be available while that guard
+                        // is evaluated, alongside the source-arm guard latch.
+                        arm.local_precedes_arm_guard[arm.locals.len] = true;
                         if (!arm.locals.push(subject_local))
                             return frontend_error(FrontendError::TooManyItems, arm_stmt->expr.span);
                         if (arm_locals != arm_scoped_locals.data) {
