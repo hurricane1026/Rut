@@ -1374,6 +1374,17 @@ struct HirRoute {
         return *this;
     }
 
+    // Guard-match arms are stored at module scope to keep HirGuard compact,
+    // but their inline expressions may still point into this route's expr
+    // arena. Rebase those external owners whenever the route is copied out of
+    // analysis scratch storage (and when an entire HirModule is copied).
+    void rebase_guard_match_arm(HirGuardMatchArm& arm, const HirRoute& other) {
+        rebase_expr(arm.pattern, other);
+        for (u32 li = 0; li < arm.locals.len; li++) {
+            rebase_expr(arm.locals[li].init, other);
+        }
+    }
+
 private:
     void rebase_expr_ptr(const HirRoute& other, HirExpr*& ptr) {
         if (ptr == nullptr) return;
@@ -1572,6 +1583,7 @@ struct HirModule {
           package_span(other.package_span),
           package_name(other.package_name) {
         rebase_type_alias_storage_ptrs(other);
+        rebase_guard_match_arm_ptrs(other);
     }
     HirModule& operator=(const HirModule& other) {
         if (this == &other) return *this;
@@ -1595,6 +1607,7 @@ struct HirModule {
         package_span = other.package_span;
         package_name = other.package_name;
         rebase_type_alias_storage_ptrs(other);
+        rebase_guard_match_arm_ptrs(other);
         return *this;
     }
     HirModule(HirModule&& other) noexcept = delete;
@@ -1605,6 +1618,14 @@ struct HirModule {
             rebase_type_ref_tree_ptrs(other, type_aliases[i].target);
             for (u32 arm_i = 0; arm_i < type_aliases[i].arms.len; arm_i++)
                 rebase_type_ref_tree_ptrs(other, type_aliases[i].arms[arm_i].type);
+        }
+    }
+
+    void rebase_guard_match_arm_ptrs(const HirModule& other) {
+        for (u32 ai = 0; ai < guard_match_arms.len; ai++) {
+            for (u32 ri = 0; ri < routes.len && ri < other.routes.len; ri++) {
+                routes[ri].rebase_guard_match_arm(guard_match_arms[ai], other.routes[ri]);
+            }
         }
     }
 

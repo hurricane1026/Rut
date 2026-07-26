@@ -24371,6 +24371,10 @@ static FrontendResult<HirModule*> analyze_file_internal(
         if (!route.is_timer) http_route_count++;
         if (!mod.routes.push(route))
             return frontend_error(FrontendError::TooManyItems, route_decl.span);
+        HirRoute& stored_route = mod.routes[mod.routes.len - 1];
+        for (u32 ai = 0; ai < mod.guard_match_arms.len; ai++) {
+            stored_route.rebase_guard_match_arm(mod.guard_match_arms[ai], route);
+        }
     }
 
     if (source_path.len != 0 && !import_stack.empty()) import_stack.pop_back();
