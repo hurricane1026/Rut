@@ -3014,6 +3014,7 @@ void h2_proxy_finish(Loop* loop,
             kName.ptr, kName.len, resp.headers[i].value.ptr, resp.headers[i].value.len};
     }
     bool mutations_valid =
+        h2_response_header_mutations_valid(response_ctx) &&
         apply_response_header_mutations(
             response_ctx, effective, kMaxEffectiveHeaders, &effective_count) &&
         (response_ctx == nullptr ||
@@ -4879,9 +4880,7 @@ void finish_buffered_forward(Loop* loop,
             name.ptr, name.len, resp.headers[i].value.ptr, resp.headers[i].value.len};
     }
 
-    for (u32 i = 0; i < response_ctx->response_header_count; i++) {
-        const Str name = response_ctx->response_header_mutations[i].name;
-        if (!h2_drop_response_header(name)) continue;
+    if (!h2_response_header_mutations_valid(response_ctx)) {
         buffered_forward_fail(loop, conn, 500);
         return;
     }

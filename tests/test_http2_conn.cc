@@ -1183,6 +1183,57 @@ TEST(http2_conn, prohibited_response_header_filter) {
     CHECK(!h2_is_prohibited_response_header("cache-control", 13));
 }
 
+TEST(h2_serving, rejects_prohibited_buffered_forward_response_mutations) {
+    struct NoopLoop {};
+    jit::HandlerCtx ctx{};
+    ctx.response_header_count = 1;
+    ctx.response_header_mutations[0].mode = jit::ResponseHeaderMutationMode::Set;
+    ctx.response_header_mutations[0].value = {"value", 5};
+
+    static constexpr Str kProhibited[] = {
+        {"Keep-Alive", 10}, {"Proxy-Connection", 16}, {"TE", 2}, {"Upgrade", 7}};
+    for (const Str name : kProhibited) {
+        ctx.response_header_mutations[0].name = name;
+        CHECK_FALSE(h2_response_header_mutations_valid(&ctx));
+
+        Http2Conn h2;
+        h2.init();
+        Connection conn;
+        conn.reset();
+        conn.h2 = &h2;
+        NoopLoop loop;
+        u8 response[256]{};
+        H2Dispatch<NoopLoop> dispatch{&loop, &conn, response, sizeof(response), 0, false};
+        JitDispatchOutcome outcome{};
+        outcome.kind = JitDispatchOutcome::Kind::ReturnStatus;
+        outcome.status_code = 200;
+        outcome.response_ctx = &ctx;
+        h2_emit_outcome(dispatch, 1, outcome, nullptr, false);
+
+        Http2FrameHeader frame{};
+        REQUIRE(parse_frame_header(response, dispatch.resp_len, &frame) == ParseStatus::Complete);
+        hpack::DynamicTable dyn;
+        dyn.init(4096);
+        hpack::Header decoded[4];
+        u8 scratch[64];
+        u32 decoded_count = 0;
+        REQUIRE(hpack::decode_header_block(dyn,
+                                           response + kFrameHeaderSize,
+                                           frame.length,
+                                           scratch,
+                                           sizeof(scratch),
+                                           decoded,
+                                           4,
+                                           &decoded_count));
+        REQUIRE_EQ(decoded_count, 1u);
+        CHECK(decoded[0].name.eq({":status", 7}));
+        CHECK(decoded[0].value.eq({"500", 3}));
+    }
+
+    ctx.response_header_mutations[0].name = {"x-custom", 8};
+    CHECK(h2_response_header_mutations_valid(&ctx));
+}
+
 // Open stream 1 (HEADERS without END_STREAM) and return the conn/cap ready for
 // more frames. Helper to reduce boilerplate in the branch tests below.
 namespace {

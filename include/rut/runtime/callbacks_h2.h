@@ -81,6 +81,17 @@ inline bool h2_is_prohibited_response_header(const char* name, u32 len) {
            http_header_name_eq_ci(name, len, "te", 2);
 }
 
+inline bool h2_response_header_mutations_valid(const jit::HandlerCtx* response_ctx) {
+    if (response_ctx == nullptr) return true;
+    for (u32 i = 0; i < response_ctx->response_header_count; i++) {
+        const Str name = response_ctx->response_header_mutations[i].name;
+        if (h2_is_prohibited_response_header(name.ptr, name.len) ||
+            http_header_name_eq_ci(name.ptr, name.len, "content-length", 14))
+            return false;
+    }
+    return true;
+}
+
 template <typename Loop>
 void h2_emit_response(H2Dispatch<Loop>& d,
                       u32 stream_id,
@@ -464,6 +475,10 @@ void h2_emit_outcome(H2Dispatch<Loop>& d,
         }
     }
     if (o.response_ctx != nullptr && o.response_ctx->response_header_overflow) {
+        h2_emit_status(d, stream_id, 500);
+        return;
+    }
+    if (!h2_response_header_mutations_valid(o.response_ctx)) {
         h2_emit_status(d, stream_id, 500);
         return;
     }
