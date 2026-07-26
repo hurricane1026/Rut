@@ -222,7 +222,8 @@ static std::string_view markdown_container_content(
     size_t* container_indent = nullptr,
     std::vector<MarkdownContainerSegment>* segments = nullptr,
     bool non_one_ordered_lists_can_interrupt = true,
-    std::string* normalized = nullptr) {
+    std::string* normalized = nullptr,
+    size_t* content_column = nullptr) {
     size_t pos = 0;
     size_t indent = 0;
     size_t column = 0;
@@ -378,6 +379,7 @@ static std::string_view markdown_container_content(
         }
     }
     if (container_indent != nullptr) *container_indent = indent;
+    if (content_column != nullptr) *content_column = column;
     return line.substr(pos);
 }
 
@@ -550,9 +552,17 @@ static std::string_view markdown_fence_content(std::string_view line,
                : line;
 }
 
-static bool parse_markdown_fence_open_content(std::string_view line, MarkdownFence* out) {
+static bool parse_markdown_fence_open_content(std::string_view line,
+                                              MarkdownFence* out,
+                                              size_t content_column = 0) {
     size_t pos = 0;
-    while (pos < line.size() && pos < 3 && line[pos] == ' ') pos++;
+    size_t column = content_column;
+    while (pos < line.size() && (line[pos] == ' ' || line[pos] == '\t')) {
+        const size_t next = markdown_next_column(column, line[pos]);
+        if (next - content_column > 3) return false;
+        column = next;
+        pos++;
+    }
     if (pos == line.size() || (line[pos] != '`' && line[pos] != '~')) return false;
     const char marker = line[pos];
     const size_t marker_start = pos;
@@ -710,7 +720,6 @@ static MarkdownLinkReferenceDefinition markdown_link_reference_definition(std::s
             return MarkdownLinkReferenceDefinition::DestinationMayContinue;
         if (line[pos] == '<') {
             pos++;
-            const size_t destination_start = pos;
             bool destination_escaped = false;
             while (pos < line.size()) {
                 const char destination_char = line[pos];
@@ -729,7 +738,7 @@ static MarkdownLinkReferenceDefinition markdown_link_reference_definition(std::s
                 if (destination_char == '>') break;
                 pos++;
             }
-            if (pos == destination_start || pos == line.size() || line[pos] != '>')
+            if (pos == line.size() || line[pos] != '>')
                 return MarkdownLinkReferenceDefinition::None;
             pos++;
         } else {
@@ -803,6 +812,16 @@ static MarkdownLinkReferenceContinuation markdown_take_link_reference_continuati
         expected_container->clear();
         return required_continuation ? MarkdownLinkReferenceContinuation::Invalid
                                      : MarkdownLinkReferenceContinuation::None;
+    }
+
+    if (*pending == MarkdownLinkReferenceDefinition::DestinationMayContinue) {
+        MarkdownFence opening{};
+        if (parse_markdown_fence_open_content(content, &opening)) {
+            *pending = MarkdownLinkReferenceDefinition::None;
+            pending_text->clear();
+            expected_container->clear();
+            return MarkdownLinkReferenceContinuation::None;
+        }
     }
 
     if (*pending == MarkdownLinkReferenceDefinition::TitleMayContinue) {
@@ -1098,13 +1117,13 @@ static std::string_view markdown_block_content(std::string_view content) {
     return content.substr(indent);
 }
 
-static bool markdown_is_indented_code_block(std::string_view content) {
+static bool markdown_is_indented_code_block(std::string_view content, size_t content_column = 0) {
     size_t pos = 0;
-    size_t column = 0;
+    size_t column = content_column;
     while (pos < content.size() && (content[pos] == ' ' || content[pos] == '\t')) {
         column = markdown_next_column(column, content[pos]);
         pos++;
-        if (column >= 4)
+        if (column - content_column >= 4)
             return content.substr(pos).find_first_not_of(" \t\r") != std::string_view::npos;
     }
     return false;
@@ -1446,6 +1465,7 @@ TEST(frontend, language_card_recognizes_link_reference_definitions) {
     CHECK_FALSE(markdown_is_link_reference_definition("[foo]: /url)"));
     CHECK(markdown_is_link_reference_definition("[foo]: /url(path)"));
     CHECK(markdown_is_link_reference_definition("[foo]: /url\\(path\\)"));
+    CHECK(markdown_is_link_reference_definition("[foo]: <>"));
     CHECK_FALSE(markdown_is_link_reference_definition("[foo]: <foo<bar>"));
     CHECK_FALSE(markdown_is_link_reference_definition("[foo]: <foo\\>"));
     CHECK(markdown_is_link_reference_definition("[foo]: <foo\\<bar>"));
@@ -1469,6 +1489,13 @@ TEST(frontend, language_card_recognizes_link_reference_definitions) {
                  "  /url", {}, &pending, &pending_text, &expected_container),
              MarkdownLinkReferenceContinuation::Consumed);
     CHECK_EQ(pending, MarkdownLinkReferenceDefinition::TitleMayContinue);
+
+    pending = MarkdownLinkReferenceDefinition::DestinationMayContinue;
+    pending_text = "[foo]:";
+    CHECK_EQ(markdown_take_link_reference_continuation(
+                 "~~~~rut", {}, &pending, &pending_text, &expected_container),
+             MarkdownLinkReferenceContinuation::None);
+    CHECK_EQ(pending, MarkdownLinkReferenceDefinition::None);
 
     pending = MarkdownLinkReferenceDefinition::OpenTitleMayContinue;
     pending_text = "[foo]: /url \"multi";
@@ -1553,6 +1580,28 @@ TEST(frontend, language_card_blockquote_tab_padding_retains_residual_columns) {
 TEST(frontend, language_card_blockquote_tab_residual_prevents_fence_open) {
     MarkdownFence fence{};
     CHECK_FALSE(parse_markdown_fence_open(">\t  ~~~~markdown", &fence));
+
+    std::vector<MarkdownContainerSegment> container;
+    std::string normalized;
+    size_t content_column = 0;
+    const auto content = markdown_container_content(
+        ">\t  ~~~~markdown", 0, nullptr, &container, true, &normalized, &content_column);
+    CHECK_EQ(content, "    ~~~~markdown");
+    CHECK(markdown_is_indented_code_block(content, content_column));
+}
+
+TEST(frontend, language_card_list_continuation_uses_post_container_tab_column) {
+    std::vector<MarkdownContainerSegment> continued;
+    CHECK_EQ(markdown_container_content("- # heading", 0, nullptr, &continued), "# heading");
+    std::string_view content;
+    std::string normalized;
+    size_t content_column = 0;
+    REQUIRE(
+        markdown_strip_container("  \t~~~~rut", continued, &content, &normalized, &content_column));
+    CHECK_EQ(content_column, 2u);
+    CHECK_FALSE(markdown_is_indented_code_block(content, content_column));
+    MarkdownFence fence{};
+    CHECK(parse_markdown_fence_open_content(content, &fence, content_column));
 }
 
 TEST(frontend, language_card_wide_list_tab_padding_retains_residual_columns) {
@@ -1864,6 +1913,7 @@ TEST(frontend, language_card_unmarked_rut_examples_parse_and_typecheck) {
             std::vector<MarkdownContainerSegment> line_container;
             std::string_view container_content;
             std::string container_content_storage;
+            size_t container_content_column = 0;
             if (paragraph_open) {
                 std::vector<MarkdownContainerSegment> interrupting_container;
                 std::string_view interrupting_content;
@@ -2009,8 +2059,11 @@ TEST(frontend, language_card_unmarked_rut_examples_parse_and_typecheck) {
                         std::vector<MarkdownContainerSegment> candidate(
                             continued_list_container.begin(),
                             continued_list_container.begin() + retained_segments);
-                        if (markdown_strip_container(
-                                line, candidate, &container_content, &container_content_storage)) {
+                        if (markdown_strip_container(line,
+                                                     candidate,
+                                                     &container_content,
+                                                     &container_content_storage,
+                                                     &container_content_column)) {
                             line_container = std::move(candidate);
                             retained_list_container = true;
                             break;
@@ -2041,8 +2094,13 @@ TEST(frontend, language_card_unmarked_rut_examples_parse_and_typecheck) {
                         line_container.end(), nested_container.begin(), nested_container.end());
                 } else {
                     continued_list_container.clear();
-                    container_content =
-                        markdown_container_content(line, 0, nullptr, &line_container);
+                    container_content = markdown_container_content(line,
+                                                                   0,
+                                                                   nullptr,
+                                                                   &line_container,
+                                                                   true,
+                                                                   &container_content_storage,
+                                                                   &container_content_column);
                 }
             }
             const bool container_line_blank =
@@ -2103,7 +2161,8 @@ TEST(frontend, language_card_unmarked_rut_examples_parse_and_typecheck) {
             }
             const std::string_view block_content = markdown_block_content(container_content);
             const bool indented_code =
-                !paragraph_open && markdown_is_indented_code_block(container_content);
+                !paragraph_open &&
+                markdown_is_indented_code_block(container_content, container_content_column);
             const bool interrupts_paragraph =
                 markdown_interrupts_paragraph(container_content, paragraph_open);
             if (interrupts_paragraph) {
@@ -2134,7 +2193,8 @@ TEST(frontend, language_card_unmarked_rut_examples_parse_and_typecheck) {
                 !indented_code &&
                 (pending_skip ? parse_markdown_fence_open_in_container(
                                     line, pending_skip_container, &opening)
-                              : parse_markdown_fence_open_content(container_content, &opening));
+                              : parse_markdown_fence_open_content(
+                                    container_content, &opening, container_content_column));
             if (is_opening && !pending_skip) {
                 opening.container_segments = line_container;
                 for (const auto& segment : line_container)
