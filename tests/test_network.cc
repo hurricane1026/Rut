@@ -5475,13 +5475,19 @@ TEST(buffered_forward, body_replacement_removes_stale_representation_metadata) {
     ctx->response_header_mutations[1] = {{kEtagName, sizeof(kEtagName) - 1},
                                          {kEtagValue, sizeof(kEtagValue) - 1},
                                          jit::ResponseHeaderMutationMode::Set};
-    ctx->response_header_count = 2;
+    static const char kLastModifiedName[] = "Last-Modified";
+    static const char kLastModifiedValue[] = "Sun, 26 Jul 2026 09:00:00 GMT";
+    ctx->response_header_mutations[2] = {{kLastModifiedName, sizeof(kLastModifiedName) - 1},
+                                         {kLastModifiedValue, sizeof(kLastModifiedValue) - 1},
+                                         jit::ResponseHeaderMutationMode::Set};
+    ctx->response_header_count = 3;
 
     static const char kUpstream[] =
         "HTTP/1.1 206 Partial Content\r\nContent-Length: 4\r\nContent-Encoding: gzip\r\n"
         "Content-Range: bytes 0-3/100\r\nDigest: sha-256=upstream\r\n"
         "Content-Digest: sha-256=:upstream:\r\nRepr-Digest: sha-256=:upstream:\r\n"
-        "Content-MD5: upstream\r\nETag: \"upstream\"\r\n\r\ndata";
+        "Content-MD5: upstream\r\nETag: \"upstream\"\r\n"
+        "Last-Modified: Sat, 25 Jul 2026 09:00:00 GMT\r\n\r\ndata";
     conn->upstream_recv_buf.reset();
     conn->upstream_recv_buf.write(reinterpret_cast<const u8*>(kUpstream), sizeof(kUpstream) - 1);
     on_upstream_response<SmallLoop>(
@@ -5506,6 +5512,11 @@ TEST(buffered_forward, body_replacement_removes_stale_representation_metadata) {
                        conn->send_buf.len(),
                        "ETag: \"replacement\"\r\n",
                        sizeof("ETag: \"replacement\"\r\n") - 1));
+    CHECK(!buf_contains(wire, conn->send_buf.len(), "Sat, 25 Jul 2026", 16));
+    CHECK(buf_contains(wire,
+                       conn->send_buf.len(),
+                       "Last-Modified: Sun, 26 Jul 2026 09:00:00 GMT\r\n",
+                       sizeof("Last-Modified: Sun, 26 Jul 2026 09:00:00 GMT\r\n") - 1));
     CHECK(buf_contains(wire,
                        conn->send_buf.len(),
                        "Content-Type: text/plain; charset=utf-8\r\n",
@@ -6427,6 +6438,11 @@ TEST(buffered_forward, h2_deframing_and_body_replacement_strip_stale_metadata) {
     static constexpr char kEtag[] =
         "HTTP/1.1 200 OK\r\nContent-Length: 4\r\nETag: \"upstream\"\r\n\r\ndata";
     run(kEtag, sizeof(kEtag) - 1, true, "etag", 4);
+
+    static constexpr char kLastModified[] =
+        "HTTP/1.1 200 OK\r\nContent-Length: 4\r\n"
+        "Last-Modified: Sat, 25 Jul 2026 09:00:00 GMT\r\n\r\ndata";
+    run(kLastModified, sizeof(kLastModified) - 1, true, "last-modified", 13);
 
     static constexpr char kChunked[] =
         "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nTrailer: Digest\r\n\r\n"
@@ -14296,6 +14312,67 @@ TEST(buffered_forward, unchanged_serialization_overflow_returns_bad_gateway) {
     const char* wire = reinterpret_cast<const char*>(c->send_buf.data());
     CHECK(buf_contains(wire, c->send_buf.len(), "HTTP/1.1 502", 12));
     CHECK(c->upstream_abandoned);
+}
+
+TEST(buffered_forward, h2_mutation_serialization_overflow_returns_internal_error) {
+    SmallLoop loop;
+    loop.setup();
+    loop.inject_and_dispatch(make_ev(0, IoEventType::Accept, 42));
+    auto* c = loop.find_fd(42);
+    REQUIRE(c != nullptr);
+    REQUIRE(loop.alloc_upstream_buf(*c));
+
+    Http2Conn h2{};
+    h2.init();
+    h2.async_stream = 1;
+    h2.async_kind = H2AsyncKind::Proxy;
+    h2.async_apply_response_mutations = true;
+    c->h2 = &h2;
+    c->protocol = ConnProtocol::Http2;
+    c->state = ConnState::Proxying;
+    c->upstream_fd = dup(2);
+    REQUIRE(c->upstream_fd >= 0);
+
+    char huge_value[Http2Conn::kBodySynthCap];
+    for (u32 i = 0; i < sizeof(huge_value); i++) huge_value[i] = 'x';
+    auto* ctx = h2.async_jit_ctx();
+    ctx->response_header_mutations[0] = {
+        {"x-expanded", 10}, {huge_value, sizeof(huge_value)}, jit::ResponseHeaderMutationMode::Set};
+    ctx->response_header_count = 1;
+
+    static constexpr char kUpstream[] = "HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n";
+    REQUIRE(
+        c->upstream_recv_buf.write(reinterpret_cast<const u8*>(kUpstream), sizeof(kUpstream) - 1));
+    HttpResponseParser parser;
+    ParsedResponse response{};
+    REQUIRE(parser.parse(c->upstream_recv_buf.data(), c->upstream_recv_buf.len(), &response) ==
+            ParseStatus::Complete);
+    loop.backend.clear_ops();
+    h2_proxy_finish(&loop, *c, response, parser.header_end, 0, false);
+
+    const auto* send = loop.backend.last_op(MockOp::Send);
+    REQUIRE(send != nullptr);
+    Http2FrameHeader frame{};
+    REQUIRE(parse_frame_header(send->send_buf, send->send_len, &frame) == ParseStatus::Complete);
+    hpack::DynamicTable dyn;
+    dyn.init(4096);
+    hpack::Header headers[8];
+    u8 scratch[128];
+    u32 header_count = 0;
+    REQUIRE(hpack::decode_header_block(dyn,
+                                       send->send_buf + kFrameHeaderSize,
+                                       frame.length,
+                                       scratch,
+                                       sizeof(scratch),
+                                       headers,
+                                       8,
+                                       &header_count));
+    bool found_internal_error = false;
+    for (u32 i = 0; i < header_count; i++)
+        found_internal_error |=
+            headers[i].name.eq(Str{":status", 7}) && headers[i].value.eq(Str{"500", 3});
+    CHECK(found_internal_error);
+    c->h2 = nullptr;
 }
 
 TEST(buffered_forward, h2_rejects_body_longer_than_content_length) {

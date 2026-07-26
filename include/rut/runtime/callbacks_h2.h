@@ -1148,8 +1148,7 @@ void h2_dispatch_request(H2Dispatch<Loop>& d,
             // because some other branch can forward. Only the selected buffered
             // forward parks and accumulates DATA. Preserve its already-produced
             // mutation context so the handler is not invoked a second time.
-            if (!end_stream && !req.has_content_length && !route->needs_req_body &&
-                route->can_forward_buffered) {
+            if (!end_stream && !route->needs_req_body && route->can_forward_buffered) {
                 Http2Conn* h2 = d.conn->h2;
                 if (h2->pending_stream != 0 || h2->async_stream != 0 ||
                     d.conn->h2_proxy_synth_quarantined) {
@@ -1239,10 +1238,9 @@ void h2_dispatch_request(H2Dispatch<Loop>& d,
                 h2_emit_status(d, stream_id, 503);
                 return;
             }
-            // Routes that inspect the body or may buffered-forward need the
-            // DATA bytes themselves. A declared length also defers dispatch so
-            // framing can be validated, while ordinary body-ignoring handlers
-            // remain able to respond immediately to open-ended uploads.
+            // Routes that inspect the body need the DATA bytes themselves. A
+            // body-independent route that can buffered-forward was already run
+            // above, so only its selected forward reaches the deferred path.
             if (!end_stream &&
                 (route->needs_req_body || route->can_forward_buffered || req.has_content_length)) {
                 h2_defer_until_data_end(

@@ -2662,6 +2662,7 @@ inline bool body_replacement_invalidates_upstream_header(Str name) {
     return http_header_name_eq_ci(name.ptr, name.len, "content-encoding", 16) ||
            http_header_name_eq_ci(name.ptr, name.len, "content-range", 13) ||
            http_header_name_eq_ci(name.ptr, name.len, "etag", 4) ||
+           http_header_name_eq_ci(name.ptr, name.len, "last-modified", 13) ||
            http_header_name_eq_ci(name.ptr, name.len, "digest", 6) ||
            http_header_name_eq_ci(name.ptr, name.len, "content-digest", 14) ||
            http_header_name_eq_ci(name.ptr, name.len, "repr-digest", 11) ||
@@ -3127,13 +3128,17 @@ void h2_proxy_finish(Loop* loop,
     H2Dispatch<Loop> d{loop, &conn, h2->pending_synth, Http2Conn::kBodySynthCap, 0, false};
     // A re-framed response too large for the scratch buffer (large body OR large
     // header block) must NOT close the whole connection (dropping unrelated
-    // streams), nor be reported as a generic 500. Disable the 500 fallback and, on
-    // overflow, answer just this stream with 502 Bad Gateway.
+    // streams). Preserve the HTTP/1 classification: unchanged upstream bytes are
+    // a 502, while middleware output that no longer fits is a 500.
     h2_emit_response(d, kStreamId, status, hdrs, nhdrs, body, body_len, /*allow_fallback=*/false);
     if (d.overflow || d.resp_len == 0) {
         d.resp_len = 0;
         d.overflow = false;
-        h2_emit_status(d, kStreamId, 502);
+        const bool response_mutated =
+            response_ctx != nullptr &&
+            (response_ctx->response_status_set || response_ctx->response_body_mutation_set ||
+             response_ctx->response_header_count != 0);
+        h2_emit_status(d, kStreamId, response_mutated ? 500 : 502);
     }
     h2_proxy_teardown_upstream(loop, conn);
     // Success path: the full upstream response already arrived, so the request
