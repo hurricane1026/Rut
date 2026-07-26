@@ -18116,7 +18116,7 @@ static FrontendResult<u32> analyze_for_stmt(const AstStatement& stmt,
                                 }
                             }
                             for (u32 li = scoped_carrier_start; li < scoped_carrier_end; li++) {
-                                if (arm.locals.len >= HirForLoopMatchArm::kMaxSourceLocals)
+                                if (arm.locals.len >= HirForLoopMatchArm::kMaxLocals)
                                     return frontend_error(FrontendError::TooManyItems, inner.span);
                                 arm.local_guard_depth[arm.locals.len] = arm.guards.len;
                                 if (!arm.locals.push(route->locals[li]))

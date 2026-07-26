@@ -33472,6 +33472,33 @@ route GET "/x" {
     rir.destroy();
 }
 
+TEST(frontend, static_loop_match_arm_prelude_carrier_does_not_consume_source_local_budget) {
+    const char* src = R"rut(
+func duplicate(values: [str]) -> [[str]] => [values, values]
+func inspect(_ groups: [[str]], flag: bool) -> bool => flag
+route GET "/x" {
+    for item in [1] {
+        match item {
+            1 => {
+                let first = 1
+                let second = 2
+                let third = 3
+                let fourth = 4
+                guard inspect(duplicate(req.queryAll("x")), req.http11) else { return 400 }
+                return 200
+            }
+            _ => return 500
+        }
+    }
+    return 501
+}
+)rut";
+    FrontendRirModule rir{};
+    REQUIRE(lower_src_to_rir(src, rir));
+    CHECK(rir::verify_module(rir.module).ok);
+    rir.destroy();
+}
+
 TEST(frontend, static_loop_guard_failure_if_materializes_helper_argument_carrier) {
     const char* src = R"rut(
 func duplicate(values: [str]) -> [[str]] => [values, values]
