@@ -171,6 +171,9 @@ struct MarkdownContainerSegment {
     };
     Kind kind = Kind::Blockquote;
     size_t continuation_width = 0;
+    char list_marker = 0;
+    bool ordered_list = false;
+    u32 ordered_start = 0;
 };
 
 struct MarkdownFence {
@@ -244,9 +247,15 @@ static std::string_view markdown_container_content(
         }
 
         size_t list_end = marker;
+        char list_marker = 0;
+        bool ordered_list = false;
+        u32 ordered_start = 0;
         if (list_end < line.size() &&
             (line[list_end] == '-' || line[list_end] == '+' || line[list_end] == '*')) {
-            if (!markdown_is_thematic_break(line.substr(list_end))) list_end++;
+            if (!markdown_is_thematic_break(line.substr(list_end))) {
+                list_marker = line[list_end];
+                list_end++;
+            }
         } else {
             size_t digits = 0;
             while (list_end < line.size() && line[list_end] >= '0' && line[list_end] <= '9' &&
@@ -262,8 +271,12 @@ static std::string_view markdown_container_content(
                 (!non_one_ordered_lists_can_interrupt && !starts_at_one) ||
                 (line[list_end] != '.' && line[list_end] != ')'))
                 list_end = marker;
-            else
+            else {
+                ordered_list = true;
+                ordered_start = start_value;
+                list_marker = line[list_end];
                 list_end++;
+            }
         }
         if (list_end > marker && list_end < line.size() &&
             (line[list_end] == ' ' || line[list_end] == '\t')) {
@@ -316,8 +329,11 @@ static std::string_view markdown_container_content(
             pos = list_end;
             indent += column - segment_column;
             if (segments != nullptr)
-                segments->push_back(
-                    {MarkdownContainerSegment::Kind::List, column - segment_column});
+                segments->push_back({MarkdownContainerSegment::Kind::List,
+                                     column - segment_column,
+                                     list_marker,
+                                     ordered_list,
+                                     ordered_start});
             continue;
         }
         if (non_one_ordered_lists_can_interrupt && list_end > marker &&
@@ -326,8 +342,11 @@ static std::string_view markdown_container_content(
             pos = list_end;
             indent += column - segment_column;
             if (segments != nullptr)
-                segments->push_back(
-                    {MarkdownContainerSegment::Kind::List, column - segment_column});
+                segments->push_back({MarkdownContainerSegment::Kind::List,
+                                     column - segment_column,
+                                     list_marker,
+                                     ordered_list,
+                                     ordered_start});
             continue;
         }
         column = segment_column;
@@ -356,10 +375,26 @@ static bool markdown_same_container(const std::vector<MarkdownContainerSegment>&
         // blockquote's container identity. List continuation widths do carry
         // semantic indentation and must still match exactly.
         if (lhs[i].kind == MarkdownContainerSegment::Kind::List &&
-            lhs[i].continuation_width != rhs[i].continuation_width)
+            (lhs[i].continuation_width != rhs[i].continuation_width ||
+             lhs[i].list_marker != rhs[i].list_marker ||
+             lhs[i].ordered_list != rhs[i].ordered_list))
             return false;
     }
     return true;
+}
+
+static bool markdown_list_replacement_allowed(
+    const std::vector<MarkdownContainerSegment>& open_container,
+    const std::vector<MarkdownContainerSegment>& replacement) {
+    if (replacement.empty()) return false;
+    const auto& candidate = replacement.front();
+    if (candidate.kind != MarkdownContainerSegment::Kind::List || !candidate.ordered_list ||
+        candidate.ordered_start == 1)
+        return true;
+    if (open_container.empty()) return false;
+    const auto& open = open_container.back();
+    return open.kind == MarkdownContainerSegment::Kind::List && open.ordered_list &&
+           open.list_marker == candidate.list_marker;
 }
 
 static bool markdown_container_prefix(const std::vector<MarkdownContainerSegment>& prefix,
@@ -1151,6 +1186,25 @@ TEST(frontend, language_card_ordered_sibling_replaces_current_list_item) {
     CHECK_EQ(markdown_container_content("2. ~~~~rut", 0, nullptr, &sibling, true), "~~~~rut");
     REQUIRE_EQ(sibling.size(), 1u);
     CHECK_EQ(sibling[0].kind, MarkdownContainerSegment::Kind::List);
+    CHECK(markdown_list_replacement_allowed(paragraph, sibling));
+}
+
+TEST(frontend, language_card_non_one_ordered_sibling_requires_matching_list_marker) {
+    std::vector<MarkdownContainerSegment> bullet;
+    CHECK_EQ(markdown_container_content("- prose", 0, nullptr, &bullet, false), "prose");
+    std::vector<MarkdownContainerSegment> dot_ordered;
+    CHECK_EQ(markdown_container_content("2. ~~~~markdown", 0, nullptr, &dot_ordered, true),
+             "~~~~markdown");
+    CHECK_FALSE(markdown_list_replacement_allowed(bullet, dot_ordered));
+
+    std::vector<MarkdownContainerSegment> paren_ordered;
+    CHECK_EQ(markdown_container_content("1) prose", 0, nullptr, &paren_ordered, false), "prose");
+    CHECK_FALSE(markdown_list_replacement_allowed(paren_ordered, dot_ordered));
+
+    std::vector<MarkdownContainerSegment> matching_dot_ordered;
+    CHECK_EQ(markdown_container_content("1. prose", 0, nullptr, &matching_dot_ordered, false),
+             "prose");
+    CHECK(markdown_list_replacement_allowed(matching_dot_ordered, dot_ordered));
 }
 
 TEST(frontend, language_card_nested_list_close_retains_matching_outer_prefix) {
@@ -1440,11 +1494,16 @@ TEST(frontend, language_card_unmarked_rut_examples_parse_and_typecheck) {
                                                        &nested_container,
                                                        replacing_list_item,
                                                        &normalized_interrupting_content);
-                        replaced_nested_container = !nested_container.empty();
                         interrupting_container = std::move(retained_prefix);
-                        interrupting_container.insert(interrupting_container.end(),
-                                                      nested_container.begin(),
-                                                      nested_container.end());
+                        if (markdown_list_replacement_allowed(paragraph_container,
+                                                              nested_container)) {
+                            replaced_nested_container = !nested_container.empty();
+                            interrupting_container.insert(interrupting_container.end(),
+                                                          nested_container.begin(),
+                                                          nested_container.end());
+                        } else {
+                            interrupting_content = outer_content;
+                        }
                     } else {
                         interrupting_content =
                             markdown_container_content(line,
@@ -1453,6 +1512,12 @@ TEST(frontend, language_card_unmarked_rut_examples_parse_and_typecheck) {
                                                        &interrupting_container,
                                                        replacing_list_item,
                                                        &normalized_interrupting_content);
+                        if (replacing_list_item &&
+                            !markdown_list_replacement_allowed(paragraph_container,
+                                                               interrupting_container)) {
+                            interrupting_container.clear();
+                            interrupting_content = line;
+                        }
                     }
                 }
                 const bool partial_lazy_continuation =
