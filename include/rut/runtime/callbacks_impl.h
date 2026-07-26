@@ -2692,9 +2692,11 @@ inline bool valid_partial_content_range(Str value, u64* range_length = nullptr) 
 
     u64 first = 0;
     u64 last = 0;
-    if (!parse_decimal(&first) || pos == value.len || value.ptr[pos++] != '-' ||
-        !parse_decimal(&last) || first > last || pos == value.len || value.ptr[pos++] != '/')
+    if (!parse_decimal(&first) || pos == value.len || value.ptr[pos] != '-') return false;
+    pos++;
+    if (!parse_decimal(&last) || first > last || pos == value.len || value.ptr[pos] != '/')
         return false;
+    pos++;
     if (pos == value.len) return false;
     if (value.ptr[pos] == '*') {
         pos++;
@@ -2719,11 +2721,14 @@ inline bool valid_unsatisfied_content_range(Str value) {
         return false;
     pos += 6;
     while (pos < value.len && (value.ptr[pos] == ' ' || value.ptr[pos] == '\t')) pos++;
-    if (value.len - pos < 3 || value.ptr[pos++] != '*' || value.ptr[pos++] != '/') return false;
+    if (value.len - pos < 3 || value.ptr[pos] != '*') return false;
+    pos++;
+    if (value.ptr[pos] != '/') return false;
+    pos++;
     if (pos == value.len || value.ptr[pos] < '0' || value.ptr[pos] > '9') return false;
-    do {
+    while (pos < value.len && value.ptr[pos] >= '0' && value.ptr[pos] <= '9') {
         pos++;
-    } while (pos < value.len && value.ptr[pos] >= '0' && value.ptr[pos] <= '9');
+    }
     while (pos < value.len && (value.ptr[pos] == ' ' || value.ptr[pos] == '\t')) pos++;
     return pos == value.len;
 }
@@ -2746,7 +2751,8 @@ inline bool response_is_multipart_byteranges(const ResponseHeaderKV* headers, u3
             continue;
         while (pos < value.len) {
             while (pos < value.len && (value.ptr[pos] == ' ' || value.ptr[pos] == '\t')) pos++;
-            if (pos == value.len || value.ptr[pos++] != ';') break;
+            if (pos == value.len || value.ptr[pos] != ';') break;
+            pos++;
             while (pos < value.len && (value.ptr[pos] == ' ' || value.ptr[pos] == '\t')) pos++;
             const u32 name_start = pos;
             while (pos < value.len && value.ptr[pos] != '=' && value.ptr[pos] != ';' &&
@@ -2754,12 +2760,14 @@ inline bool response_is_multipart_byteranges(const ResponseHeaderKV* headers, u3
                 pos++;
             const u32 name_len = pos - name_start;
             while (pos < value.len && (value.ptr[pos] == ' ' || value.ptr[pos] == '\t')) pos++;
-            if (pos == value.len || value.ptr[pos++] != '=') continue;
+            if (pos == value.len || value.ptr[pos] != '=') continue;
+            pos++;
             while (pos < value.len && (value.ptr[pos] == ' ' || value.ptr[pos] == '\t')) pos++;
             const bool boundary =
                 http_header_name_eq_ci(value.ptr + name_start, name_len, "boundary", 8);
             if (pos < value.len && value.ptr[pos] == '"') {
-                const u32 value_start = ++pos;
+                pos++;
+                const u32 value_start = pos;
                 while (pos < value.len && value.ptr[pos] != '"') pos++;
                 if (boundary) return pos > value_start && pos < value.len;
                 if (pos < value.len) pos++;
