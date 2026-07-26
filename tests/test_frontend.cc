@@ -680,8 +680,24 @@ static MarkdownLinkReferenceDefinition markdown_link_reference_definition(std::s
         if (line[pos] == '<') {
             pos++;
             const size_t destination_start = pos;
-            while (pos < line.size() && line[pos] != '>' && line[pos] != '\r' && line[pos] != '\n')
+            bool destination_escaped = false;
+            while (pos < line.size()) {
+                const char destination_char = line[pos];
+                if (destination_escaped) {
+                    destination_escaped = false;
+                    pos++;
+                    continue;
+                }
+                if (destination_char == '\\') {
+                    destination_escaped = true;
+                    pos++;
+                    continue;
+                }
+                if (destination_char == '<' || destination_char == '\r' || destination_char == '\n')
+                    return MarkdownLinkReferenceDefinition::None;
+                if (destination_char == '>') break;
                 pos++;
+            }
             if (pos == destination_start || pos == line.size() || line[pos] != '>')
                 return MarkdownLinkReferenceDefinition::None;
             pos++;
@@ -1301,6 +1317,10 @@ TEST(frontend, language_card_recognizes_link_reference_definitions) {
     CHECK_FALSE(markdown_is_link_reference_definition("[foo]: /url)"));
     CHECK(markdown_is_link_reference_definition("[foo]: /url(path)"));
     CHECK(markdown_is_link_reference_definition("[foo]: /url\\(path\\)"));
+    CHECK_FALSE(markdown_is_link_reference_definition("[foo]: <foo<bar>"));
+    CHECK_FALSE(markdown_is_link_reference_definition("[foo]: <foo\\>"));
+    CHECK(markdown_is_link_reference_definition("[foo]: <foo\\<bar>"));
+    CHECK(markdown_is_link_reference_definition("[foo]: <foo\\>bar>"));
     CHECK_EQ(markdown_link_reference_definition_at_block_start("[foo]: /url", true),
              MarkdownLinkReferenceDefinition::None);
     CHECK_EQ(markdown_link_reference_definition_at_block_start("[foo]: /url", false),
