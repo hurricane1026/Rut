@@ -668,8 +668,11 @@ static MarkdownLinkReferenceDefinition markdown_link_reference_definition(std::s
         }
         if (c == '[' || c == '\r' || c == '\n') return MarkdownLinkReferenceDefinition::None;
         if (c != ']') continue;
-        if (pos == label_start || pos - label_start > 999 || pos + 1 >= line.size() ||
-            line[pos + 1] != ':')
+        const bool label_has_non_whitespace =
+            line.substr(label_start, pos - label_start).find_first_not_of(" \t\r\n\f\v") !=
+            std::string_view::npos;
+        if (pos == label_start || !label_has_non_whitespace || pos - label_start > 999 ||
+            pos + 1 >= line.size() || line[pos + 1] != ':')
             return MarkdownLinkReferenceDefinition::None;
         pos += 2;
         while (pos < line.size() && (line[pos] == ' ' || line[pos] == '\t')) pos++;
@@ -717,6 +720,12 @@ static MarkdownLinkReferenceDefinition markdown_link_reference_definition(std::s
 
 static bool markdown_is_link_reference_definition(std::string_view line) {
     return markdown_link_reference_definition(line) != MarkdownLinkReferenceDefinition::None;
+}
+
+static MarkdownLinkReferenceDefinition markdown_link_reference_definition_at_block_start(
+    std::string_view line, bool paragraph_open) {
+    return paragraph_open ? MarkdownLinkReferenceDefinition::None
+                          : markdown_link_reference_definition(line);
 }
 
 static bool markdown_take_link_reference_title(
@@ -1285,10 +1294,17 @@ TEST(frontend, language_card_recognizes_link_reference_definitions) {
     CHECK_FALSE(markdown_link_reference_title("  ordinary paragraph", true));
     CHECK_FALSE(markdown_is_link_reference_definition("[foo] ordinary paragraph"));
     CHECK_FALSE(markdown_is_link_reference_definition("[]: /url"));
+    CHECK_FALSE(markdown_is_link_reference_definition("[ ]: /url"));
+    CHECK_FALSE(markdown_is_link_reference_definition("[ \t ]: /url"));
+    CHECK_FALSE(markdown_is_link_reference_definition("[\f]: /url"));
     CHECK_FALSE(markdown_is_link_reference_definition("[foo]: /url("));
     CHECK_FALSE(markdown_is_link_reference_definition("[foo]: /url)"));
     CHECK(markdown_is_link_reference_definition("[foo]: /url(path)"));
     CHECK(markdown_is_link_reference_definition("[foo]: /url\\(path\\)"));
+    CHECK_EQ(markdown_link_reference_definition_at_block_start("[foo]: /url", true),
+             MarkdownLinkReferenceDefinition::None);
+    CHECK_EQ(markdown_link_reference_definition_at_block_start("[foo]: /url", false),
+             MarkdownLinkReferenceDefinition::TitleMayContinue);
 
     bool title_pending = true;
     std::vector<MarkdownContainerSegment> expected_container;
@@ -1972,7 +1988,8 @@ TEST(frontend, language_card_unmarked_rut_examples_parse_and_typecheck) {
                 continue;
             }
             REQUIRE_MSG(!pending_skip, "a skip marker must immediately precede a rut fence");
-            const auto link_reference = markdown_link_reference_definition(container_content);
+            const auto link_reference = markdown_link_reference_definition_at_block_start(
+                container_content, paragraph_open);
             paragraph_open = !indented_code && !interrupts_paragraph && !container_line_blank &&
                              link_reference == MarkdownLinkReferenceDefinition::None;
             if (link_reference == MarkdownLinkReferenceDefinition::TitleMayContinue) {
