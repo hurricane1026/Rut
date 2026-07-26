@@ -2273,7 +2273,8 @@ FrontendResult<MirModule*> build_mir(const HirModule& module) {
                 for (u32 li = 0; li < branch.locals.len; li++) reserve_local_ref(branch.locals[li]);
             };
             const auto reserve_guard_refs = [&](const HirGuard& guard) {
-                if (guard.fail_kind == HirGuard::FailKind::Body) {
+                if (guard.fail_kind == HirGuard::FailKind::Body ||
+                    guard.fail_kind == HirGuard::FailKind::Term) {
                     for (u32 li = 0; li < guard.fail_body.locals.len; li++)
                         reserve_local_ref(guard.fail_body.locals[li]);
                     if (guard.fail_body.has_then_local)

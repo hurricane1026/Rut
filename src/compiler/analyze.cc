@@ -23813,6 +23813,15 @@ static FrontendResult<HirModule*> analyze_file_internal(
                 if (!collected) return core::make_unexpected(collected.error());
             }
         }
+        const auto collect_branch_named_errors =
+            [&](const HirForLoopBranch& branch) -> FrontendResult<void> {
+            for (u32 li = 0; li < branch.locals.len; li++) {
+                auto collected =
+                    collect_named_error_cases(branch.locals[li].init, named_error_cases);
+                if (!collected) return core::make_unexpected(collected.error());
+            }
+            return {};
+        };
         for (u32 fi = 0; fi < route.for_loops.len; fi++) {
             auto collected =
                 collect_named_error_cases(route.for_loops[fi].iter_expr, named_error_cases);
@@ -23848,6 +23857,12 @@ static FrontendResult<HirModule*> analyze_file_internal(
             for (u32 ii = 0; ii < route.for_loops[fi].body.ifs.len; ii++) {
                 collected = collect_named_error_cases(route.for_loops[fi].body.ifs[ii].cond,
                                                       named_error_cases);
+                if (!collected) return core::make_unexpected(collected.error());
+                collected =
+                    collect_branch_named_errors(route.for_loops[fi].body.ifs[ii].then_branch);
+                if (!collected) return core::make_unexpected(collected.error());
+                collected =
+                    collect_branch_named_errors(route.for_loops[fi].body.ifs[ii].else_branch);
                 if (!collected) return core::make_unexpected(collected.error());
             }
             for (u32 mi = 0; mi < route.for_loops[fi].body.matches.len; mi++) {
@@ -23891,6 +23906,12 @@ static FrontendResult<HirModule*> analyze_file_internal(
                         }
                     }
                     collected = collect_named_error_cases(arm.cond, named_error_cases);
+                    if (!collected) return core::make_unexpected(collected.error());
+                    collected = collect_branch_named_errors(arm.then_branch);
+                    if (!collected) return core::make_unexpected(collected.error());
+                    collected = collect_branch_named_errors(arm.else_branch);
+                    if (!collected) return core::make_unexpected(collected.error());
+                    collected = collect_branch_named_errors(arm.direct_branch);
                     if (!collected) return core::make_unexpected(collected.error());
                 }
             }
@@ -23954,6 +23975,16 @@ static FrontendResult<HirModule*> analyze_file_internal(
             if (!mod.variants.push(error_variant))
                 return frontend_error(FrontendError::TooManyItems, route_decl.span);
             route.error_variant_index = mod.variants.len - 1;
+            const auto patch_branch_named_errors = [&](HirForLoopBranch& branch) {
+                for (u32 li = 0; li < branch.locals.len; li++) {
+                    HirLocal& local = branch.locals[li];
+                    patch_named_error_variant(
+                        &local.init, route.error_variant_index, named_error_cases);
+                    patch_error_variant_refs(&local.init, route.error_variant_index);
+                    if (local.may_error && local.error_variant_index == 0xffffffffu)
+                        local.error_variant_index = route.error_variant_index;
+                }
+            };
             for (u32 li = 0; li < route.locals.len; li++) {
                 patch_named_error_variant(
                     &route.locals[li].init, route.error_variant_index, named_error_cases);
@@ -24039,6 +24070,8 @@ static FrontendResult<HirModule*> analyze_file_internal(
                                               named_error_cases);
                     patch_error_variant_refs(&route.for_loops[fi].body.ifs[ii].cond,
                                              route.error_variant_index);
+                    patch_branch_named_errors(route.for_loops[fi].body.ifs[ii].then_branch);
+                    patch_branch_named_errors(route.for_loops[fi].body.ifs[ii].else_branch);
                 }
                 for (u32 mi = 0; mi < route.for_loops[fi].body.matches.len; mi++) {
                     patch_named_error_variant(&route.for_loops[fi].body.matches[mi].match_expr,
@@ -24101,6 +24134,9 @@ static FrontendResult<HirModule*> analyze_file_internal(
                         patch_named_error_variant(
                             &arm.cond, route.error_variant_index, named_error_cases);
                         patch_error_variant_refs(&arm.cond, route.error_variant_index);
+                        patch_branch_named_errors(arm.then_branch);
+                        patch_branch_named_errors(arm.else_branch);
+                        patch_branch_named_errors(arm.direct_branch);
                     }
                 }
             }

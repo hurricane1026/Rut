@@ -32882,6 +32882,72 @@ route GET "/x" {
     rir.destroy();
 }
 
+TEST(frontend, static_for_reserves_direct_guard_fail_carriers_before_materialization) {
+    const char* src = R"rut(
+func envelope(value: str) -> Json { let payload = json({ value: value }) payload }
+route GET "/x" {
+    for item in [req.path] { guard false else { return 400, envelope(item) } }
+    return 500
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    const auto& guard = hir->routes[0].for_loops[0].body.guards[0];
+    REQUIRE_EQ(static_cast<u8>(guard.fail_kind), static_cast<u8>(HirGuard::FailKind::Term));
+    REQUIRE(guard.fail_body.locals.len != 0);
+    u32 max_carrier_ref = 0;
+    for (u32 li = 0; li < guard.fail_body.locals.len; li++)
+        max_carrier_ref = std::max(max_carrier_ref, guard.fail_body.locals[li].ref_index);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    REQUIRE(mir->functions[0].blocks.len != 0);
+    REQUIRE(mir->functions[0].blocks[0].effects.len != 0);
+    CHECK(mir->functions[0].blocks[0].effects[0].local_ref_index > max_carrier_ref);
+    FrontendRirModule rir{};
+    REQUIRE(lower_to_rir(mir.value(), rir));
+    CHECK(rir::verify_module(rir.module).ok);
+    rir.destroy();
+}
+
+TEST(frontend, static_for_branch_helpers_resolve_named_error_cases) {
+    const char* sources[] = {
+        R"rut(
+func envelope(value: i32) -> Json {
+    let selected = any(error(.timeout), value)
+    json({ value: selected })
+}
+route GET "/x" {
+    for item in [1] {
+        if item == 1 { return 200, envelope(item) } else { return 400, envelope(item) }
+    }
+    return 500
+}
+)rut",
+        R"rut(
+func envelope(value: i32) -> Json {
+    let selected = any(error(.timeout), value)
+    json({ value: selected })
+}
+route GET "/x" {
+    for item in [1] {
+        match item { 1 => return 200, envelope(item) _ => return 400 }
+    }
+    return 500
+}
+)rut",
+    };
+    for (const char* src : sources) {
+        FrontendRirModule rir{};
+        REQUIRE(lower_src_to_rir(src, rir));
+        CHECK(rir::verify_module(rir.module).ok);
+        rir.destroy();
+    }
+}
+
 TEST(frontend, nested_conditional_break_does_not_make_outer_loop_unconditionally_terminate) {
     const char* src =
         "route GET \"/x\" { for outer in [1] { for inner in [0] { guard inner > 0 else { break } "
