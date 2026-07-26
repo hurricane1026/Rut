@@ -14007,10 +14007,12 @@ static bool guard_failure_reads_response(const HirGuard& guard,
         }
         return false;
     }
-    if (guard.fail_kind != HirGuard::FailKind::Body) return false;
+    if (guard.fail_kind != HirGuard::FailKind::Body && guard.fail_kind != HirGuard::FailKind::Term)
+        return false;
     for (u32 li = 0; li < guard.fail_body.locals.len; li++)
         if (reads(guard.fail_body.locals[li].init)) return true;
-    return guard.fail_body.body_kind == HirGuardBody::BodyKind::If && reads(guard.fail_body.cond);
+    return guard.fail_kind == HirGuard::FailKind::Body &&
+           guard.fail_body.body_kind == HirGuardBody::BodyKind::If && reads(guard.fail_body.cond);
 }
 
 static bool hir_for_loop_reads_response(const HirForLoop& loop,
