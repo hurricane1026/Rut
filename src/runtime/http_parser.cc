@@ -497,12 +497,14 @@ static inline ParseStatus apply_semantic_header_response(
     } else if (first == 't') {
         if (name_len == 17 && str_ci_eq(name + 1, "ransfer-encoding", 16)) {
             u32 ti = 0;
+            bool saw_transfer_coding = false;
             while (ti < vlen) {
                 while (ti < vlen && (val[ti] == ' ' || val[ti] == '\t' || val[ti] == ',')) ti++;
                 if (ti >= vlen) break;
                 u32 tok_start = ti;
                 while (ti < vlen && val[ti] != ',' && val[ti] != ' ' && val[ti] != '\t') ti++;
                 u32 tok_len = ti - tok_start;
+                saw_transfer_coding = true;
                 if (tok_len == 7 && str_ci_eq(val + tok_start, "chunked", 7)) {
                     if (resp->chunked)
                         resp->unsupported_transfer_coding = true;
@@ -512,6 +514,7 @@ static inline ParseStatus apply_semantic_header_response(
                     resp->unsupported_transfer_coding = true;
                 }
             }
+            if (!saw_transfer_coding) resp->unsupported_transfer_coding = true;
             return ParseStatus::Complete;
         }
     }

@@ -5912,6 +5912,27 @@ TEST(buffered_forward, rejects_repeated_chunked_transfer_codings) {
     CHECK_EQ(conn->on_send, &on_proxy_response_sent<SmallLoop>);
 }
 
+TEST(buffered_forward, rejects_empty_transfer_encoding) {
+    SmallLoop loop;
+    loop.setup();
+    auto* conn = setup_proxy_conn(loop);
+    REQUIRE(conn != nullptr);
+    conn->proxy_response_buffered = true;
+    conn->reset_jit_ctx();
+
+    static const char kUpstream[] =
+        "HTTP/1.1 200 OK\r\nTransfer-Encoding: , \t, \r\nContent-Length: 2\r\n\r\nok";
+    conn->upstream_recv_buf.reset();
+    conn->upstream_recv_buf.write(reinterpret_cast<const u8*>(kUpstream), sizeof(kUpstream) - 1);
+    on_upstream_response<SmallLoop>(
+        &loop,
+        *conn,
+        make_ev(conn->id, IoEventType::UpstreamRecv, static_cast<i32>(sizeof(kUpstream) - 1)));
+
+    CHECK_EQ(conn->resp_status, 502u);
+    CHECK_EQ(conn->on_send, &on_proxy_response_sent<SmallLoop>);
+}
+
 TEST(buffered_forward, contaminated_bodyless_response_is_not_reused) {
     SmallLoop loop;
     loop.setup();
