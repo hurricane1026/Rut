@@ -223,10 +223,11 @@ static std::string_view markdown_container_content(
     std::vector<MarkdownContainerSegment>* segments = nullptr,
     bool non_one_ordered_lists_can_interrupt = true,
     std::string* normalized = nullptr,
-    size_t* content_column = nullptr) {
+    size_t* content_column = nullptr,
+    size_t initial_column = 0) {
     size_t pos = 0;
     size_t indent = 0;
-    size_t column = 0;
+    size_t column = initial_column;
     while (pos < line.size()) {
         const size_t segment_start = pos;
         const size_t segment_column = column;
@@ -637,6 +638,7 @@ static bool markdown_fence_language_case_insensitive(std::string_view info,
 enum class MarkdownLinkReferenceDefinition {
     None,
     Complete,
+    LabelMayContinue,
     DestinationMayContinue,
     TitleMayContinue,
     OpenTitleMayContinue,
@@ -704,7 +706,15 @@ static MarkdownLinkReferenceDefinition markdown_link_reference_definition(std::s
             escaped = true;
             continue;
         }
-        if (c == '[' || c == '\r' || c == '\n') return MarkdownLinkReferenceDefinition::None;
+        if (c == '[') return MarkdownLinkReferenceDefinition::None;
+        if (c == '\r' || c == '\n') {
+            const size_t next =
+                c == '\r' && pos + 1 < line.size() && line[pos + 1] == '\n' ? pos + 2 : pos + 1;
+            if (next >= line.size() || line[next] == '\r' || line[next] == '\n')
+                return next >= line.size() ? MarkdownLinkReferenceDefinition::LabelMayContinue
+                                           : MarkdownLinkReferenceDefinition::None;
+            continue;
+        }
         if (c != ']') continue;
         const bool label_has_non_whitespace =
             line.substr(label_start, pos - label_start).find_first_not_of(" \t\r\n\f\v") !=
@@ -775,7 +785,12 @@ static MarkdownLinkReferenceDefinition markdown_link_reference_definition(std::s
                    ? MarkdownLinkReferenceDefinition::Complete
                    : MarkdownLinkReferenceDefinition::OpenTitleMayContinue;
     }
-    return MarkdownLinkReferenceDefinition::None;
+    const std::string_view partial_label = line.substr(label_start);
+    const bool label_has_non_whitespace =
+        partial_label.find_first_not_of(" \t\r\n\f\v") != std::string_view::npos;
+    return partial_label.size() <= 999 && label_has_non_whitespace
+               ? MarkdownLinkReferenceDefinition::LabelMayContinue
+               : MarkdownLinkReferenceDefinition::None;
 }
 
 static bool markdown_is_link_reference_definition(std::string_view line) {
@@ -794,6 +809,23 @@ enum class MarkdownLinkReferenceContinuation {
     Invalid,
 };
 
+static std::string_view markdown_block_content(std::string_view content);
+static bool markdown_interrupts_paragraph(std::string_view content, bool has_preceding_paragraph);
+static std::string markdown_raw_html_end_marker(std::string_view content,
+                                                bool* can_interrupt_paragraph);
+static bool markdown_is_indented_code_block(std::string_view content, size_t content_column);
+
+static bool markdown_opens_interrupting_block(std::string_view content) {
+    if (markdown_interrupts_paragraph(content, true) || markdown_is_indented_code_block(content, 0))
+        return true;
+    MarkdownFence opening{};
+    if (parse_markdown_fence_open_content(content, &opening)) return true;
+    bool can_interrupt_paragraph = true;
+    return !markdown_raw_html_end_marker(markdown_block_content(content), &can_interrupt_paragraph)
+                .empty() &&
+           can_interrupt_paragraph;
+}
+
 static MarkdownLinkReferenceContinuation markdown_take_link_reference_continuation(
     std::string_view content,
     const std::vector<MarkdownContainerSegment>& container,
@@ -804,6 +836,14 @@ static MarkdownLinkReferenceContinuation markdown_take_link_reference_continuati
         return MarkdownLinkReferenceContinuation::None;
     const bool same_container = markdown_same_container(container, *expected_container);
     const bool blank = content.find_first_not_of(" \t\r") == std::string_view::npos;
+    if ((*pending == MarkdownLinkReferenceDefinition::LabelMayContinue ||
+         *pending == MarkdownLinkReferenceDefinition::DestinationMayContinue) &&
+        ((!same_container && !container.empty()) || markdown_opens_interrupting_block(content))) {
+        *pending = MarkdownLinkReferenceDefinition::None;
+        pending_text->clear();
+        expected_container->clear();
+        return MarkdownLinkReferenceContinuation::None;
+    }
     if (!same_container || blank) {
         const bool required_continuation =
             *pending != MarkdownLinkReferenceDefinition::TitleMayContinue;
@@ -812,16 +852,6 @@ static MarkdownLinkReferenceContinuation markdown_take_link_reference_continuati
         expected_container->clear();
         return required_continuation ? MarkdownLinkReferenceContinuation::Invalid
                                      : MarkdownLinkReferenceContinuation::None;
-    }
-
-    if (*pending == MarkdownLinkReferenceDefinition::DestinationMayContinue) {
-        MarkdownFence opening{};
-        if (parse_markdown_fence_open_content(content, &opening)) {
-            *pending = MarkdownLinkReferenceDefinition::None;
-            pending_text->clear();
-            expected_container->clear();
-            return MarkdownLinkReferenceContinuation::None;
-        }
     }
 
     if (*pending == MarkdownLinkReferenceDefinition::TitleMayContinue) {
@@ -853,7 +883,8 @@ static MarkdownLinkReferenceContinuation markdown_take_link_reference_continuati
         expected_container->clear();
         return MarkdownLinkReferenceContinuation::Consumed;
     }
-    if (definition == MarkdownLinkReferenceDefinition::DestinationMayContinue ||
+    if (definition == MarkdownLinkReferenceDefinition::LabelMayContinue ||
+        definition == MarkdownLinkReferenceDefinition::DestinationMayContinue ||
         definition == MarkdownLinkReferenceDefinition::OpenTitleMayContinue) {
         *pending = definition;
         return MarkdownLinkReferenceContinuation::Consumed;
@@ -1449,6 +1480,10 @@ TEST(frontend, language_card_recognizes_link_reference_definitions) {
              MarkdownLinkReferenceDefinition::Complete);
     CHECK_EQ(markdown_link_reference_definition("[foo]:"),
              MarkdownLinkReferenceDefinition::DestinationMayContinue);
+    CHECK_EQ(markdown_link_reference_definition("[foo"),
+             MarkdownLinkReferenceDefinition::LabelMayContinue);
+    CHECK_EQ(markdown_link_reference_definition("[foo\nbar]: /url"),
+             MarkdownLinkReferenceDefinition::TitleMayContinue);
     CHECK_EQ(markdown_link_reference_definition("[foo]: /url \"multi"),
              MarkdownLinkReferenceDefinition::OpenTitleMayContinue);
     CHECK_EQ(markdown_link_reference_definition("[foo]: /url \"multi\nline\""),
@@ -1496,6 +1531,22 @@ TEST(frontend, language_card_recognizes_link_reference_definitions) {
                  "~~~~rut", {}, &pending, &pending_text, &expected_container),
              MarkdownLinkReferenceContinuation::None);
     CHECK_EQ(pending, MarkdownLinkReferenceDefinition::None);
+
+    for (const char* opener : {"# heading", "---", "<!-- note -->", "~~~~rut"}) {
+        pending = MarkdownLinkReferenceDefinition::DestinationMayContinue;
+        pending_text = "[foo]:";
+        CHECK_EQ(markdown_take_link_reference_continuation(
+                     opener, {}, &pending, &pending_text, &expected_container),
+                 MarkdownLinkReferenceContinuation::None);
+        CHECK_EQ(pending, MarkdownLinkReferenceDefinition::None);
+    }
+
+    pending = MarkdownLinkReferenceDefinition::LabelMayContinue;
+    pending_text = "[foo";
+    CHECK_EQ(markdown_take_link_reference_continuation(
+                 "bar]: /url", {}, &pending, &pending_text, &expected_container),
+             MarkdownLinkReferenceContinuation::Consumed);
+    CHECK_EQ(pending, MarkdownLinkReferenceDefinition::TitleMayContinue);
 
     pending = MarkdownLinkReferenceDefinition::OpenTitleMayContinue;
     pending_text = "[foo]: /url \"multi";
@@ -1600,6 +1651,31 @@ TEST(frontend, language_card_list_continuation_uses_post_container_tab_column) {
         markdown_strip_container("  \t~~~~rut", continued, &content, &normalized, &content_column));
     CHECK_EQ(content_column, 2u);
     CHECK_FALSE(markdown_is_indented_code_block(content, content_column));
+    MarkdownFence fence{};
+    CHECK(parse_markdown_fence_open_content(content, &fence, content_column));
+}
+
+TEST(frontend, language_card_nested_container_uses_outer_absolute_column) {
+    std::vector<MarkdownContainerSegment> continued;
+    CHECK_EQ(markdown_container_content("- # heading", 0, nullptr, &continued), "# heading");
+    std::string_view content;
+    std::string normalized;
+    size_t content_column = 0;
+    REQUIRE(markdown_strip_container(
+        "  \t> ~~~~rut", continued, &content, &normalized, &content_column));
+    std::vector<MarkdownContainerSegment> nested;
+    std::string nested_normalized;
+    const size_t outer_content_column = content_column;
+    content = markdown_container_content(content,
+                                         0,
+                                         nullptr,
+                                         &nested,
+                                         true,
+                                         &nested_normalized,
+                                         &content_column,
+                                         outer_content_column);
+    REQUIRE_EQ(nested.size(), 1u);
+    CHECK_EQ(nested[0].kind, MarkdownContainerSegment::Kind::Blockquote);
     MarkdownFence fence{};
     CHECK(parse_markdown_fence_open_content(content, &fence, content_column));
 }
@@ -2074,13 +2150,16 @@ TEST(frontend, language_card_unmarked_rut_examples_parse_and_typecheck) {
                 if (retained_list_container) {
                     std::vector<MarkdownContainerSegment> nested_container;
                     std::string nested_content_storage;
+                    const size_t outer_content_column = container_content_column;
                     const std::string_view nested_content =
                         markdown_container_content(container_content,
                                                    0,
                                                    nullptr,
                                                    &nested_container,
                                                    true,
-                                                   &nested_content_storage);
+                                                   &nested_content_storage,
+                                                   &container_content_column,
+                                                   outer_content_column);
                     if (nested_content_storage.empty()) {
                         container_content = nested_content;
                     } else {
@@ -2227,7 +2306,8 @@ TEST(frontend, language_card_unmarked_rut_examples_parse_and_typecheck) {
                 container_content, paragraph_open);
             paragraph_open = !indented_code && !interrupts_paragraph && !container_line_blank &&
                              link_reference == MarkdownLinkReferenceDefinition::None;
-            if (link_reference == MarkdownLinkReferenceDefinition::DestinationMayContinue ||
+            if (link_reference == MarkdownLinkReferenceDefinition::LabelMayContinue ||
+                link_reference == MarkdownLinkReferenceDefinition::DestinationMayContinue ||
                 link_reference == MarkdownLinkReferenceDefinition::TitleMayContinue ||
                 link_reference == MarkdownLinkReferenceDefinition::OpenTitleMayContinue) {
                 link_reference_pending = link_reference;
