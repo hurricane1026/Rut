@@ -5659,6 +5659,34 @@ TEST(buffered_forward, rejects_connection_added_by_response_mutation) {
     CHECK(!buf_contains(wire, conn->send_buf.len(), "Connection: keep-alive", 22));
 }
 
+TEST(buffered_forward, rejects_all_hop_by_hop_response_mutations) {
+    const auto run = [&](const char* name, u32 name_len) {
+        SmallLoop loop;
+        loop.setup();
+        auto* conn = setup_proxy_conn(loop);
+        REQUIRE(conn != nullptr);
+        conn->proxy_response_buffered = true;
+        auto* ctx = conn->reset_jit_ctx();
+        ctx->response_header_mutations[0] = {
+            {name, name_len}, {"keep-alive", 10}, jit::ResponseHeaderMutationMode::Set};
+        ctx->response_header_count = 1;
+        static constexpr char kUpstream[] =
+            "HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok";
+        conn->upstream_recv_buf.reset();
+        conn->upstream_recv_buf.write(reinterpret_cast<const u8*>(kUpstream),
+                                      sizeof(kUpstream) - 1);
+        on_upstream_response<SmallLoop>(
+            &loop,
+            *conn,
+            make_ev(conn->id, IoEventType::UpstreamRecv, static_cast<i32>(sizeof(kUpstream) - 1)));
+        CHECK_EQ(conn->resp_status, 500u);
+    };
+    run("Keep-Alive", 10);
+    run("Proxy-Connection", 16);
+    run("Upgrade", 7);
+    run("TE", 2);
+}
+
 TEST(buffered_forward, mutated_205_suppresses_upstream_and_replacement_bodies) {
     SmallLoop loop;
     loop.setup();
@@ -13991,6 +14019,54 @@ TEST(buffered_forward, empty_upstream_response_returns_bad_gateway) {
 
     CHECK_EQ(c->resp_status, 502u);
     CHECK_EQ(c->on_send, &on_proxy_response_sent<SmallLoop>);
+}
+
+TEST(buffered_forward, malformed_upstream_response_uses_buffered_teardown) {
+    SmallLoop loop;
+    loop.setup();
+    auto* c = setup_proxy_conn(loop);
+    REQUIRE(c != nullptr);
+    c->proxy_response_buffered = true;
+    c->reset_jit_ctx();
+    static constexpr char kMalformed[] = "not-http\r\n\r\n";
+    c->upstream_recv_buf.reset();
+    c->upstream_recv_buf.write(reinterpret_cast<const u8*>(kMalformed), sizeof(kMalformed) - 1);
+
+    on_upstream_response<SmallLoop>(
+        &loop,
+        *c,
+        make_ev(c->id, IoEventType::UpstreamRecv, static_cast<i32>(sizeof(kMalformed) - 1)));
+
+    CHECK_EQ(c->resp_status, 502u);
+    CHECK(c->upstream_abandoned);
+    CHECK_EQ(c->upstream_fd, -1);
+    CHECK_EQ(c->on_send, &on_proxy_response_sent<SmallLoop>);
+    loop.inject_and_dispatch(make_ev(c->id, IoEventType::UpstreamRecv, -ENOBUFS));
+    CHECK_EQ(c->on_send, &on_proxy_response_sent<SmallLoop>);
+}
+
+TEST(buffered_forward, unchanged_serialization_overflow_returns_bad_gateway) {
+    SmallLoop loop;
+    loop.setup();
+    auto* c = setup_proxy_conn(loop);
+    REQUIRE(c != nullptr);
+    c->proxy_response_buffered = true;
+    c->reset_jit_ctx();
+    static constexpr char kHeaders[] = "HTTP/1.1 200 OK\r\n\r\n";
+    c->upstream_recv_buf.reset();
+    REQUIRE(
+        c->upstream_recv_buf.write(reinterpret_cast<const u8*>(kHeaders), sizeof(kHeaders) - 1));
+    while (c->upstream_recv_buf.write_avail() != 0) {
+        const u8 byte = 'x';
+        REQUIRE(c->upstream_recv_buf.write(&byte, 1));
+    }
+
+    on_upstream_response<SmallLoop>(&loop, *c, make_ev(c->id, IoEventType::UpstreamRecv, 0));
+
+    CHECK_EQ(c->resp_status, 502u);
+    const char* wire = reinterpret_cast<const char*>(c->send_buf.data());
+    CHECK(buf_contains(wire, c->send_buf.len(), "HTTP/1.1 502", 12));
+    CHECK(c->upstream_abandoned);
 }
 
 TEST(buffered_forward, h2_rejects_body_longer_than_content_length) {

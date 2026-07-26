@@ -488,7 +488,7 @@ struct ResponseHeaderKV {
     const char* value_data;
     u32 value_len;
 };
-void format_response_with_body_and_headers(Connection& conn,
+bool format_response_with_body_and_headers(Connection& conn,
                                            u16 code,
                                            const char* body_data,
                                            u32 body_len,
@@ -4837,9 +4837,7 @@ void finish_buffered_forward(Loop* loop,
 
     for (u32 i = 0; i < response_ctx->response_header_count; i++) {
         const Str name = response_ctx->response_header_mutations[i].name;
-        if (!http_header_name_eq_ci(name.ptr, name.len, "transfer-encoding", 17) &&
-            !http_header_name_eq_ci(name.ptr, name.len, "connection", 10))
-            continue;
+        if (!h2_drop_response_header(name)) continue;
         buffered_forward_fail(loop, conn, 500);
         return;
     }
@@ -4900,11 +4898,9 @@ void finish_buffered_forward(Loop* loop,
         return;
     }
 
-    conn.proxy_response_buffered = false;
-    conn.buffered_proxy_send_in_progress = true;
     conn.resp_status = status;
     conn.keep_alive = conn.keep_alive && conn.req_keep_alive;
-    format_response_with_body_and_headers(
+    const bool serialized = format_response_with_body_and_headers(
         conn,
         status,
         body,
@@ -4925,6 +4921,15 @@ void finish_buffered_forward(Loop* loop,
             ? representation_body_len
             : 0xffffffffu,
         status_omits_content_length || omit_unknown_representation_length);
+    const bool response_mutated = response_ctx->response_status_set ||
+                                  response_ctx->response_body_mutation_set ||
+                                  response_ctx->response_header_count != 0;
+    if (!serialized && !response_mutated) {
+        buffered_forward_fail(loop, conn, 502);
+        return;
+    }
+    conn.proxy_response_buffered = false;
+    conn.buffered_proxy_send_in_progress = true;
     conn.resp_body_sent = conn.send_buf.len();
     conn.upstream_send_len = conn.upstream_recv_buf.len();
     conn.proxy_resp_started = true;
@@ -5126,6 +5131,10 @@ void on_upstream_response(void* lp, Connection& conn, IoEvent ev) {
         }
     }
     if (ps == ParseStatus::Error) {
+        if (conn.proxy_response_buffered) {
+            buffered_forward_fail(loop, conn, 502);
+            return;
+        }
         if (conn.upstream_fd >= 0) {
             ::close(conn.upstream_fd);
             conn.upstream_fd = -1;

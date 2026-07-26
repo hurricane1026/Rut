@@ -579,7 +579,7 @@ static u32 decimal_digit_count(u32 v) {
     return n;
 }
 
-void format_response_with_body_and_headers(Connection& conn,
+bool format_response_with_body_and_headers(Connection& conn,
                                            u16 code,
                                            const char* body_data,
                                            u32 body_len,
@@ -664,7 +664,7 @@ void format_response_with_body_and_headers(Connection& conn,
         conn.resp_status = 500;
         conn.keep_alive = false;
         format_static_response(conn, 500, /*keep_alive=*/false, /*suppress_body=*/suppress_body);
-        return;
+        return false;
     }
 
     conn.send_buf.reset();
@@ -720,6 +720,7 @@ void format_response_with_body_and_headers(Connection& conn,
     if (body_len_emit > 0) {
         conn.send_buf.write(reinterpret_cast<const u8*>(body_data), body_len_emit);
     }
+    return true;
 }
 
 void prepare_early_response_state(Connection& conn) {
