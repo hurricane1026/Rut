@@ -1644,7 +1644,13 @@ void h2_resume_jit_handler(Loop* loop, Connection& conn) {
         conn.handler_ctx = nullptr;
         h2_transfer_timer_to_pending_forward(*h2, kStreamId, kOutcome.upstream_id);
         conn.transition_to_reading_header(&on_h2_data<Loop>);
-        loop->submit_recv(conn);
+        if (conn.recv_buf.len() != 0) {
+            IoEvent buffered{
+                conn.id, static_cast<i32>(conn.recv_buf.len()), 0, 0, IoEventType::Recv, 0};
+            on_h2_data<Loop>(static_cast<void*>(loop), conn, buffered);
+        } else {
+            loop->submit_recv(conn);
+        }
         return;
     }
     if (kOutcome.kind == JitDispatchOutcome::Kind::ForwardBuffered &&

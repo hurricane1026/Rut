@@ -5815,6 +5815,85 @@ TEST(buffered_forward, h2_parked_status_mutation_to_304_preserves_representation
     conn->h2 = nullptr;
 }
 
+TEST(buffered_forward, h2_deframing_and_body_replacement_strip_stale_metadata) {
+    const auto run = [&](const char* upstream,
+                         u32 upstream_len,
+                         bool replace_body,
+                         const char* forbidden_name,
+                         u32 forbidden_name_len) {
+        SmallLoop loop;
+        loop.setup();
+        loop.inject_and_dispatch(make_ev(0, IoEventType::Accept, 42));
+        auto* conn = loop.find_fd(42);
+        REQUIRE(conn != nullptr);
+        REQUIRE(loop.alloc_upstream_buf(*conn));
+
+        Http2Conn h2{};
+        h2.init();
+        h2.async_stream = 1;
+        h2.async_kind = H2AsyncKind::Proxy;
+        h2.async_apply_response_mutations = true;
+        conn->h2 = &h2;
+        conn->protocol = ConnProtocol::Http2;
+        conn->state = ConnState::Proxying;
+        conn->upstream_fd = dup(2);
+        REQUIRE(conn->upstream_fd >= 0);
+        conn->reset_jit_ctx();
+        if (replace_body) {
+            auto* ctx = h2.async_jit_ctx();
+            static constexpr char kReplacement[] = "plain";
+            ctx->response_body_mutation_storage = jit::acquire_response_body_mutation_storage();
+            REQUIRE(ctx->response_body_mutation_storage != nullptr);
+            __builtin_memcpy(
+                ctx->response_body_mutation_storage, kReplacement, sizeof(kReplacement) - 1);
+            ctx->response_body_mutation_len = sizeof(kReplacement) - 1;
+            ctx->response_body_mutation_set = true;
+        }
+
+        conn->upstream_recv_buf.write(reinterpret_cast<const u8*>(upstream), upstream_len);
+        HttpResponseParser parser;
+        parser.reset();
+        ParsedResponse resp{};
+        REQUIRE(parser.parse(conn->upstream_recv_buf.data(),
+                             conn->upstream_recv_buf.len(),
+                             &resp) == ParseStatus::Complete);
+        loop.backend.clear_ops();
+        h2_proxy_finish(&loop, *conn, resp, parser.header_end, 4, false);
+
+        const auto* send = loop.backend.last_op(MockOp::Send);
+        REQUIRE(send != nullptr);
+        Http2FrameHeader frame{};
+        REQUIRE(parse_frame_header(send->send_buf, send->send_len, &frame) ==
+                ParseStatus::Complete);
+        REQUIRE_EQ(frame.type, static_cast<u8>(Http2FrameType::Headers));
+        hpack::DynamicTable dyn;
+        dyn.init(4096);
+        hpack::Header headers[16];
+        u8 scratch[512];
+        u32 header_count = 0;
+        REQUIRE(hpack::decode_header_block(dyn,
+                                           send->send_buf + kFrameHeaderSize,
+                                           frame.length,
+                                           scratch,
+                                           sizeof(scratch),
+                                           headers,
+                                           16,
+                                           &header_count));
+        for (u32 i = 0; i < header_count; i++)
+            CHECK_FALSE(headers[i].name.eq(Str{forbidden_name, forbidden_name_len}));
+        conn->h2 = nullptr;
+    };
+
+    static constexpr char kEncoded[] =
+        "HTTP/1.1 200 OK\r\nContent-Length: 4\r\nContent-Encoding: gzip\r\n\r\ndata";
+    run(kEncoded, sizeof(kEncoded) - 1, true, "content-encoding", 16);
+
+    static constexpr char kChunked[] =
+        "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nTrailer: Digest\r\n\r\n"
+        "4\r\nbody\r\n0\r\nDigest: done\r\n\r\n";
+    run(kChunked, sizeof(kChunked) - 1, false, "trailer", 7);
+}
+
 TEST(buffered_forward, omits_unknown_content_length_on_head_and_304) {
     const auto run = [&](bool head) {
         SmallLoop loop;
@@ -12943,6 +13022,11 @@ static u64 state_invariant_wait_then_status(void*, jit::HandlerCtx* ctx, const u
     return jit::HandlerResult::make_yield_payload(7, jit::YieldKind::Timer, 25).pack();
 }
 
+static u64 state_invariant_resume_to_buffered_forward(
+    void*, jit::HandlerCtx*, const u8*, u32, void*) {
+    return jit::HandlerResult::make_buffered_forward(0).pack();
+}
+
 static u64 state_invariant_wait_recv_then_status(
     void*, jit::HandlerCtx* ctx, const u8*, u32, void*) {
     if (ctx && ctx->state == 7) {
@@ -12977,6 +13061,78 @@ static jit::HandlerResult g_state_invariant_jit_result = jit::HandlerResult::mak
 
 static u64 state_invariant_configured_jit_result(void*, jit::HandlerCtx*, const u8*, u32, void*) {
     return g_state_invariant_jit_result.pack();
+}
+
+TEST(state_invariant, h2_timer_resume_drains_buffered_end_stream_data) {
+    RouteConfig cfg;
+    auto upstream = cfg.add_upstream("api", 0x7F000001, 9000);
+    REQUIRE(upstream.has_value());
+    const RouteConfig* active = &cfg;
+
+    i32 fds[2];
+    REQUIRE(socketpair(AF_UNIX, SOCK_STREAM, 0, fds) == 0);
+    ScopedFakeSocket fake_socket(fds[0]);
+
+    SmallLoop loop;
+    loop.setup();
+    loop.config_ptr = &active;
+    loop.inject_and_dispatch(make_ev(0, IoEventType::Accept, 42));
+    auto* conn = loop.find_fd(42);
+    REQUIRE(conn != nullptr);
+
+    Http2Conn h2{};
+    h2.init();
+    h2.preface_seen = true;
+    h2.last_stream_id = 1;
+    h2.nstreams = 1;
+    h2.streams[0] = {1,
+                     Http2StreamState::Open,
+                     static_cast<i32>(h2.peer_settings.initial_window_size),
+                     static_cast<i32>(h2.our_settings.initial_window_size),
+                     true};
+    RouteEntry route{};
+    route.action = RouteAction::JitHandler;
+    route.fn = &state_invariant_resume_to_buffered_forward;
+    route.upstream_id = static_cast<u16>(upstream.value());
+    static constexpr char kSynth[] = "POST /upload HTTP/1.1\r\nhost: example\r\n\r\n";
+    __builtin_memcpy(h2.pending_synth, kSynth, sizeof(kSynth) - 1);
+    h2.async_stream = 1;
+    h2.async_kind = H2AsyncKind::Timer;
+    h2.async_cfg = &cfg;
+    h2.async_route = &route;
+    h2.async_fn = route.fn;
+    h2.async_synth_len = sizeof(kSynth) - 1;
+    h2.async_body_start = sizeof(kSynth) - 1;
+    h2.async_request_forwardable = true;
+    h2.async_wait_for_body_on_forward = true;
+    conn->h2 = &h2;
+    conn->protocol = ConnProtocol::Http2;
+    conn->pending_handler_fn = route.fn;
+    conn->handler_ctx = h2.async_jit_ctx();
+
+    const u8 data_frame[] = {0, 0, 3, 0, http2_flag::kEndStream, 0, 0, 0, 1, 'a', 'b', 'c'};
+    REQUIRE_EQ(conn->recv_buf.write(data_frame, sizeof(data_frame)), sizeof(data_frame));
+    loop.backend.clear_ops();
+    h2_resume_jit_handler(&loop, *conn);
+
+    CHECK_EQ(conn->recv_buf.len(), 0u);
+    CHECK_EQ(h2.pending_stream, 0u);
+    CHECK_EQ(h2.async_stream, 1u);
+    CHECK_EQ(h2.async_kind, H2AsyncKind::Proxy);
+    CHECK_EQ(loop.backend.count_ops(MockOp::Recv), 0u);
+    const auto* control_send = loop.backend.last_op(MockOp::Send);
+    REQUIRE(control_send != nullptr);
+    const u32 control_len = control_send->send_len;
+    on_h2_sent<SmallLoop>(
+        &loop, *conn, make_ev(conn->id, IoEventType::Send, static_cast<i32>(control_len)));
+    CHECK_EQ(loop.backend.count_ops(MockOp::Connect), 1u);
+
+    conn->h2 = nullptr;
+    if (conn->upstream_fd >= 0) {
+        close(conn->upstream_fd);
+        conn->upstream_fd = -1;
+    }
+    close(fds[1]);
 }
 
 static u64 state_invariant_req_body_payload(

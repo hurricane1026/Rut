@@ -2787,6 +2787,10 @@ void h2_proxy_finish(Loop* loop,
         // upstream's so the client learns the corresponding GET body size.
         if (http_header_name_eq_ci(kName.ptr, kName.len, "content-length", 14)) {
             if (!is_head) continue;
+        } else if (resp.chunked && http_header_name_eq_ci(kName.ptr, kName.len, "trailer", 7)) {
+            // ChunkedParser consumes the trailer section while de-framing the
+            // body; do not promise trailing HEADERS that we will not emit.
+            continue;
         } else if (h2_drop_response_header(kName)) {
             continue;
         }
@@ -2871,6 +2875,10 @@ void h2_proxy_finish(Loop* loop,
             // Mutations run after the upstream filter, so filter their final
             // result too: a Set must not reintroduce an HTTP/2-prohibited field.
             const Str name{effective[i].key_data, effective[i].key_len};
+            if (response_body_mutated &&
+                http_header_name_eq_ci(name.ptr, name.len, "content-encoding", 16))
+                continue;
+            if (resp.chunked && http_header_name_eq_ci(name.ptr, name.len, "trailer", 7)) continue;
             const bool retained_representation_content_length =
                 (is_head || status == 304) && !status_forbids_content_length &&
                 http_header_name_eq_ci(name.ptr, name.len, "content-length", 14);
