@@ -758,6 +758,9 @@ static MarkdownLinkReferenceDefinition markdown_link_reference_definition(std::s
             while (pos < line.size() && line[pos] != ' ' && line[pos] != '\t' &&
                    line[pos] != '\r' && line[pos] != '\n') {
                 const char destination_char = line[pos];
+                const auto destination_byte = static_cast<unsigned char>(destination_char);
+                if (destination_byte < 0x20 || destination_byte == 0x7f)
+                    return MarkdownLinkReferenceDefinition::None;
                 if (destination_escaped) {
                     destination_escaped = false;
                 } else if (destination_char == '\\') {
@@ -816,8 +819,7 @@ static std::string markdown_raw_html_end_marker(std::string_view content,
 static bool markdown_is_indented_code_block(std::string_view content, size_t content_column);
 
 static bool markdown_opens_interrupting_block(std::string_view content) {
-    if (markdown_interrupts_paragraph(content, true) || markdown_is_indented_code_block(content, 0))
-        return true;
+    if (markdown_interrupts_paragraph(content, true)) return true;
     MarkdownFence opening{};
     if (parse_markdown_fence_open_content(content, &opening)) return true;
     bool can_interrupt_paragraph = true;
@@ -836,15 +838,21 @@ static MarkdownLinkReferenceContinuation markdown_take_link_reference_continuati
         return MarkdownLinkReferenceContinuation::None;
     const bool same_container = markdown_same_container(container, *expected_container);
     const bool blank = content.find_first_not_of(" \t\r") == std::string_view::npos;
-    if ((*pending == MarkdownLinkReferenceDefinition::LabelMayContinue ||
-         *pending == MarkdownLinkReferenceDefinition::DestinationMayContinue) &&
-        ((!same_container && !container.empty()) || markdown_opens_interrupting_block(content))) {
+    if (!same_container) {
         *pending = MarkdownLinkReferenceDefinition::None;
         pending_text->clear();
         expected_container->clear();
         return MarkdownLinkReferenceContinuation::None;
     }
-    if (!same_container || blank) {
+    if ((*pending == MarkdownLinkReferenceDefinition::LabelMayContinue ||
+         *pending == MarkdownLinkReferenceDefinition::DestinationMayContinue) &&
+        markdown_opens_interrupting_block(content)) {
+        *pending = MarkdownLinkReferenceDefinition::None;
+        pending_text->clear();
+        expected_container->clear();
+        return MarkdownLinkReferenceContinuation::None;
+    }
+    if (blank) {
         const bool required_continuation =
             *pending != MarkdownLinkReferenceDefinition::TitleMayContinue;
         *pending = MarkdownLinkReferenceDefinition::None;
@@ -1498,6 +1506,10 @@ TEST(frontend, language_card_recognizes_link_reference_definitions) {
     CHECK_FALSE(markdown_is_link_reference_definition("[\f]: /url"));
     CHECK_FALSE(markdown_is_link_reference_definition("[foo]: /url("));
     CHECK_FALSE(markdown_is_link_reference_definition("[foo]: /url)"));
+    CHECK_FALSE(markdown_is_link_reference_definition("[foo]: /url\fgarbage"));
+    CHECK_FALSE(markdown_is_link_reference_definition("[foo]: /url\vgarbage"));
+    CHECK_FALSE(markdown_is_link_reference_definition("[foo]: /url\x01garbage"));
+    CHECK_FALSE(markdown_is_link_reference_definition("[foo]: /url\x7fgarbage"));
     CHECK(markdown_is_link_reference_definition("[foo]: /url(path)"));
     CHECK(markdown_is_link_reference_definition("[foo]: /url\\(path\\)"));
     CHECK(markdown_is_link_reference_definition("[foo]: <>"));
@@ -1541,6 +1553,24 @@ TEST(frontend, language_card_recognizes_link_reference_definitions) {
         CHECK_EQ(pending, MarkdownLinkReferenceDefinition::None);
     }
 
+    pending = MarkdownLinkReferenceDefinition::DestinationMayContinue;
+    pending_text = "[foo]:";
+    CHECK_EQ(markdown_take_link_reference_continuation(
+                 "    continuation", {}, &pending, &pending_text, &expected_container),
+             MarkdownLinkReferenceContinuation::Consumed);
+    CHECK_EQ(pending, MarkdownLinkReferenceDefinition::TitleMayContinue);
+
+    std::vector<MarkdownContainerSegment> blockquote_container;
+    CHECK_EQ(markdown_container_content("> [foo]:", 0, nullptr, &blockquote_container, false),
+             "[foo]:");
+    pending = MarkdownLinkReferenceDefinition::DestinationMayContinue;
+    pending_text = "[foo]:";
+    expected_container = blockquote_container;
+    CHECK_EQ(markdown_take_link_reference_continuation(
+                 "<widget>", {}, &pending, &pending_text, &expected_container),
+             MarkdownLinkReferenceContinuation::None);
+    CHECK_EQ(pending, MarkdownLinkReferenceDefinition::None);
+
     pending = MarkdownLinkReferenceDefinition::LabelMayContinue;
     pending_text = "[foo";
     CHECK_EQ(markdown_take_link_reference_continuation(
@@ -1582,6 +1612,20 @@ TEST(frontend, language_card_retains_normalized_interrupting_content) {
     CHECK_GE(retained.data(), storage.data());
     CHECK_LE(retained.data() + retained.size(), storage.data() + storage.size());
     CHECK(nested.empty());
+}
+
+TEST(frontend, language_card_open_list_paragraph_preserves_absolute_content_column) {
+    std::vector<MarkdownContainerSegment> paragraph;
+    CHECK_EQ(markdown_container_content("- prose", 0, nullptr, &paragraph), "prose");
+    std::string normalized;
+    std::string_view content;
+    size_t content_column = 0;
+    REQUIRE(
+        markdown_strip_container("  \t~~~~rut", paragraph, &content, &normalized, &content_column));
+    CHECK_EQ(content_column, 2u);
+    CHECK_FALSE(markdown_is_indented_code_block(content, content_column));
+    MarkdownFence opening{};
+    CHECK(parse_markdown_fence_open_content(content, &opening, content_column));
 }
 
 TEST(frontend, language_card_partial_lazy_continuation_strips_present_prefix) {
@@ -2078,8 +2122,12 @@ TEST(frontend, language_card_unmarked_rut_examples_parse_and_typecheck) {
                                                        &container_content);
                     line_container = paragraph_container;
                 } else {
-                    const bool has_full_container = markdown_strip_container(
-                        line, paragraph_container, &container_content, &container_content_storage);
+                    const bool has_full_container =
+                        markdown_strip_container(line,
+                                                 paragraph_container,
+                                                 &container_content,
+                                                 &container_content_storage,
+                                                 &container_content_column);
                     if (!has_full_container) {
                         bool lazy_continuation = false;
                         for (size_t prefix_len = paragraph_container.size(); prefix_len != 0;
