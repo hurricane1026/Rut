@@ -15403,6 +15403,19 @@ TEST(route, upstream_health_check_compiles) {
     CHECK((Str{cfg.upstreams[0].hc_path, cfg.upstreams[0].hc_path_len}.eq({"/healthz", 8})));
     CHECK_EQ(cfg.upstreams[0].hc_interval_ms, 5000u);
     CHECK_EQ(cfg.upstreams[0].hc_expected_status, 200u);
+
+    // Runtime-bound addresses must still inherit the DSL health policy.
+    RouteConfig prebound{};
+    REQUIRE(prebound.add_upstream("api", 0x0A000001, 9000).has_value());
+    REQUIRE(populate_route_config(prebound, rir.module));
+    CHECK_EQ(prebound.upstreams[0].addrs[0].sin_addr.s_addr, htonl(0x0A000001));
+    CHECK_EQ(prebound.upstreams[0].addrs[0].sin_port, htons(9000));
+    CHECK(prebound.upstreams[0].hc_enabled);
+    CHECK_EQ(prebound.upstreams[0].hc_path_len, 8u);
+    CHECK((
+        Str{prebound.upstreams[0].hc_path, prebound.upstreams[0].hc_path_len}.eq({"/healthz", 8})));
+    CHECK_EQ(prebound.upstreams[0].hc_interval_ms, 5000u);
+    CHECK_EQ(prebound.upstreams[0].hc_expected_status, 200u);
     rir.destroy();
 }
 
