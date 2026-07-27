@@ -80,7 +80,7 @@ struct Builder {
 
     Result<StructDef*> create_struct(Str name, const FieldDef* fields, u32 count) {
         // Check capacity before allocating to avoid wasting arena space.
-        if (!mod->struct_defs || mod->struct_count >= mod->struct_cap) {
+        if (count > kMaxStructFields || !mod->struct_defs || mod->struct_count >= mod->struct_cap) {
             return err(RirError::CapacityFull);
         }
         auto* arena = mod->arena;
@@ -1178,6 +1178,22 @@ struct Builder {
         inst->operands[1] = value;
         inst->operand_count = 2;
         inst->imm.i32_val = static_cast<i32>(instance);
+        return vid;
+    }
+
+    Result<ValueId> emit_upstream_mark(u16 receiver_upstream,
+                                       ValueId server,
+                                       ValueId healthy,
+                                       SourceLoc loc = {}) {
+        if (!valid_val(server) || !val_has_type(server, TypeKind::I64) || !valid_val(healthy) ||
+            !val_has_type(healthy, TypeKind::Bool))
+            return err(RirError::InvalidState);
+        auto* ty = TRY(make_type(TypeKind::Bool));
+        auto [inst, vid] = TRY(emit(Opcode::UpstreamMark, ty, loc));
+        inst->operands[0] = server;
+        inst->operands[1] = healthy;
+        inst->operand_count = 2;
+        inst->imm.i32_val = receiver_upstream;
         return vid;
     }
 

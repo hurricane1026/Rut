@@ -11171,6 +11171,28 @@ route GET "/users" {
     CHECK(hir->imports[0].same_package);
 }
 
+TEST(frontend, import_namespace_mark_shadows_same_named_upstream_receiver) {
+    const std::string dir = "/tmp/rut_import_namespace_mark_upstream_shadow_frontend";
+    std::filesystem::create_directories(dir);
+    {
+        std::ofstream out(dir + "/helpers.rut", std::ios::binary);
+        out << "func mark() -> i32 => 200\n";
+    }
+    const auto src = R"rut(
+import * as users from "helpers.rut"
+upstream users { backends: ["127.0.0.1:8080"] }
+route GET "/users" {
+    if users.mark() == 200 { return 200 } else { return 500 }
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap_with_path(ast.value(), dir + "/main.rut");
+    REQUIRE(hir);
+}
+
 TEST(frontend, import_namespace_function_call_is_supported_for_file_with_package_decl) {
     const std::string dir = "/tmp/rut_import_namespace_packaged_frontend";
     std::filesystem::create_directories(dir);
@@ -16305,6 +16327,27 @@ route GET "/users" {
     CHECK_EQ(hir->functions[0].return_type, HirTypeKind::Bool);
 }
 #endif
+TEST(frontend, lower_to_rir_supports_ten_slot_tuple) {
+    const char* src = R"(
+struct Box { values: (i32, i32, i32, i32, i32, i32, i32, i32, i32, i32) }
+route GET "/users" { return 200 }
+)";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    REQUIRE(lower_to_rir(mir.value(), rir));
+    bool saw_ten_field_tuple = false;
+    for (u32 si = 0; si < rir.module.struct_count; si++)
+        if (rir.module.struct_defs[si]->field_count == 10) saw_ten_field_tuple = true;
+    CHECK(saw_ten_field_tuple);
+    rir.destroy();
+}
 TEST(frontend, tuple_literal_with_struct_element_can_flow_into_pipe) {
     const auto src = R"rut(
 struct Box { value: i32 }
@@ -39718,6 +39761,842 @@ TEST(frontend, control_plane_builtin_declarations_preserve_signatures_and_contex
     CHECK(mark->params[0].label.len == 0);
     CHECK(mark->params[1].label.eq(lit("healthy")));
     CHECK_EQ(mark->params[1].type, BuiltinDeclType::Bool);
+}
+
+TEST(frontend, pinned_timer_upstream_mark_lowers_declared_servers_in_source_order) {
+    const char* src = R"rut(
+upstream users { backends: ["127.0.0.1:8080", "127.0.0.2:8080"] }
+func check(_ server: Server) -> bool => true
+timer check_health, every: 5s, shard: 0 {
+    for server in users.servers {
+        guard users.mark(server, healthy: check(server)) else { return 500 }
+    }
+    return 200
+}
+
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    const AstStatement& for_stmt = *ast->items[2].timer.statements[0];
+    REQUIRE(for_stmt.then_stmt != nullptr);
+    const AstStatement& guard_stmt = for_stmt.then_stmt->kind == AstStmtKind::Block
+                                         ? *for_stmt.then_stmt->block_stmts[0]
+                                         : *for_stmt.then_stmt;
+    const AstExpr& mark_call = guard_stmt.expr;
+    CHECK(mark_call.msg.eq(lit("healthy")));
+    CHECK_EQ(mark_call.int_value, 2);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    REQUIRE_EQ(hir->routes.len, 1u);
+    REQUIRE_EQ(hir->functions.len, 1u);
+    REQUIRE_EQ(hir->functions[0].params.len, 1u);
+    CHECK_EQ(hir->functions[0].params[0].type, HirTypeKind::Server);
+    REQUIRE_EQ(hir->routes[0].for_loops.len, 1u);
+    CHECK_EQ(hir->routes[0].for_loops[0].loop_var_type, HirTypeKind::Server);
+    CHECK_EQ(hir->routes[0].for_loops[0].iter_expr.args.len, 2u);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    CHECK_EQ(mir->functions[0].upstream_mark_mask, 1u);
+    FrontendRirModule rir{};
+    REQUIRE(lower_to_rir(mir.value(), rir));
+    CHECK_EQ(rir.module.functions[0].upstream_mark_mask, 1u);
+    u32 marks = 0;
+    for (u32 bi = 0; bi < rir.module.functions[0].block_count; bi++) {
+        const auto& block = rir.module.functions[0].blocks[bi];
+        for (u32 ii = 0; ii < block.inst_count; ii++) {
+            if (block.insts[ii].op == rir::Opcode::UpstreamMark) {
+                marks++;
+                CHECK_EQ(block.insts[ii].imm.i32_val, 0);
+            }
+        }
+    }
+    CHECK_EQ(marks, 2u);
+    rir.destroy();
+}
+
+TEST(frontend, pinned_timer_can_discard_upstream_mark_result_once_per_server) {
+    const char* src = R"rut(
+upstream users { backends: ["127.0.0.1:8080", "127.0.0.2:8080"] }
+timer check_health, every: 5s, shard: 0 {
+    for server in users.servers {
+        users.mark(server, healthy: true)
+    }
+    return 200
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    REQUIRE_EQ(hir->routes[0].for_loops.len, 1u);
+    const auto& body = hir->routes[0].for_loops[0].body;
+    REQUIRE_EQ(body.effects.len, 1u);
+    REQUIRE_EQ(body.steps.len, 1u);
+    CHECK_EQ(body.steps[0].kind, HirForLoopBody::Step::Kind::Effect);
+    CHECK_EQ(body.effects[0].kind, HirExprKind::UpstreamMark);
+
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    REQUIRE(lower_to_rir(mir.value(), rir));
+    u32 marks = 0;
+    for (u32 bi = 0; bi < rir.module.functions[0].block_count; bi++) {
+        const auto& block = rir.module.functions[0].blocks[bi];
+        for (u32 ii = 0; ii < block.inst_count; ii++)
+            if (block.insts[ii].op == rir::Opcode::UpstreamMark) marks++;
+    }
+    CHECK_EQ(marks, 2u);
+    rir.destroy();
+}
+
+TEST(frontend, discarded_loop_mark_materializes_reused_helper_array_carrier) {
+    const char* src = R"rut(
+func duplicate(values: [bool]) -> [[bool]] => [values, values]
+func inspect(_ groups: [[bool]], flag: bool) -> bool => flag
+upstream users { backends: ["127.0.0.1:8080"] }
+timer check_health, every: 5s, shard: 0 {
+    for server in users.servers {
+        users.mark(server, healthy: inspect(duplicate([true]), true))
+    }
+    return 200
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    const auto& body = hir->routes[0].for_loops[0].body;
+    REQUIRE_EQ(body.locals.len, 1u);
+    REQUIRE_EQ(body.steps.len, 2u);
+    CHECK_EQ(body.steps[0].kind, HirForLoopBody::Step::Kind::Let);
+    CHECK_EQ(body.steps[1].kind, HirForLoopBody::Step::Kind::Effect);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    REQUIRE(lower_to_rir(mir.value(), rir));
+    CHECK(rir::verify_module(rir.module).ok);
+    rir.destroy();
+}
+
+TEST(frontend, pinned_timer_rejects_request_reads_in_discarded_upstream_mark) {
+    const char* src = R"rut(
+upstream users { backends: ["127.0.0.1:8080"] }
+timer check_health, every: 5s, shard: 0 {
+    for server in users.servers {
+        users.mark(server, healthy: req.http11)
+    }
+    return 200
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE_FALSE(hir.has_value());
+    CHECK(hir.error().detail.eq(
+        lit("timers run outside a request; req access and forward are not available "
+            "in a timer body")));
+}
+
+TEST(frontend, upstream_mark_helper_is_validated_at_pinned_timer_call_site) {
+    const char* valid = R"rut(
+upstream users { backends: ["127.0.0.1:8080"] }
+func record(_ server: Server, healthy: bool) -> bool =>
+    users.mark(server, healthy: healthy)
+timer check_health, every: 5s, shard: 0 {
+    for server in users.servers {
+        guard record(server, true) else { return 500 }
+    }
+    return 200
+}
+)rut";
+    auto lexed = lex(lit(valid));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    REQUIRE_EQ(hir->routes.len, 1u);
+    CHECK_EQ(hir->routes[0].upstream_mark_mask, 1u);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    REQUIRE(lower_to_rir(mir.value(), rir));
+    rir.destroy();
+
+    const char* invalid = R"rut(
+upstream users { backends: ["127.0.0.1:8080"] }
+func record(_ server: Server) -> bool => users.mark(server, healthy: true)
+route GET "/x" {
+    for server in users.servers {
+        guard record(server) else { return 500 }
+    }
+    return 200
+}
+)rut";
+    lexed = lex(lit(invalid));
+    REQUIRE(lexed);
+    ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    hir = analyze_file_heap(ast.value());
+    REQUIRE_FALSE(hir.has_value());
+    CHECK(hir.error().detail.eq(
+        lit("upstream.mark is available only in a timer with an explicit shard")));
+
+    const char* duplicate_owner = R"rut(
+upstream users { backends: ["127.0.0.1:8080"] }
+func record(_ server: Server) -> bool => users.mark(server, healthy: true)
+timer primary, every: 5s, shard: 0 {
+    for server in users.servers { guard record(server) else { return 500 } }
+    return 200
+}
+timer secondary, every: 5s, shard: 1 {
+    for server in users.servers { guard record(server) else { return 500 } }
+    return 200
+}
+)rut";
+    lexed = lex(lit(duplicate_owner));
+    REQUIRE(lexed);
+    ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    hir = analyze_file_heap(ast.value());
+    REQUIRE_FALSE(hir.has_value());
+    CHECK(hir.error().detail.eq(lit("an upstream may be marked by only one pinned timer")));
+}
+
+TEST(frontend, upstream_mark_helper_is_rejected_in_conditional_pipe) {
+    const char* src = R"rut(
+variant MarkResult { accepted(bool) }
+upstream users { backends: ["127.0.0.1:8080"] }
+func maybe(_ server: Server, present: bool) -> Server {
+    if present { server } else { nil }
+}
+func record(_ server: Server) -> MarkResult =>
+    MarkResult.accepted(users.mark(server, healthy: true))
+timer check_health, every: 5s, shard: 0 {
+    for server in users.servers {
+        let candidate = maybe(server, time.nowMicros() > 0)
+        let result = candidate | record(_)
+        match result { .accepted(_) => return 200 _ => return 500 }
+    }
+    return 500
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE_FALSE(hir.has_value());
+    CHECK(
+        hir.error().detail.eq(lit("upstream.mark helpers are not supported in conditional pipe")));
+}
+
+TEST(frontend, upstream_mark_method_argument_is_rejected_in_conditional_pipe) {
+    const char* src = R"rut(
+upstream users { backends: ["127.0.0.1:8080"] }
+func maybe(_ value: bool, present: bool) -> bool {
+    if present { value } else { nil }
+}
+func record(_ server: Server) -> bool => users.mark(server, healthy: true)
+timer check_health, every: 5s, shard: 0 {
+    for server in users.servers {
+        let candidate = maybe(true, time.nowMicros() > 0)
+        guard candidate | _.eq(record(server)) else {
+            return 500
+        }
+        return 200
+    }
+    return 500
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE_FALSE(hir.has_value());
+    CHECK(hir.error().detail.eq(
+        lit("upstream.mark cannot be used in a conditional pipe method stage")));
+}
+
+TEST(frontend, upstream_mark_rejects_helper_local_replay_or_elision) {
+    const char* cases[] = {R"rut(
+upstream users { backends: ["127.0.0.1:8080"] }
+func record(_ server: Server) -> bool {
+    let accepted = users.mark(server, healthy: true)
+    true
+}
+timer check_health, every: 5s, shard: 0 {
+    for server in users.servers { guard record(server) else { return 500 } }
+    return 200
+}
+)rut",
+                           R"rut(
+upstream users { backends: ["127.0.0.1:8080"] }
+func record(_ server: Server) -> bool {
+    let accepted = users.mark(server, healthy: true)
+    accepted && accepted
+}
+timer check_health, every: 5s, shard: 0 {
+    for server in users.servers { guard record(server) else { return 500 } }
+    return 200
+}
+)rut"};
+    for (const char* src : cases) {
+        auto lexed = lex(lit(src));
+        REQUIRE(lexed);
+        auto ast = parse_file_heap(lexed.value());
+        REQUIRE(ast);
+        auto hir = analyze_file_heap(ast.value());
+        REQUIRE_FALSE(hir.has_value());
+        CHECK(hir.error().detail.eq(lit("upstream.mark cannot initialize a helper local")));
+    }
+}
+
+TEST(frontend, upstream_mark_rejects_dynamic_helper_branches) {
+    const char* src = R"rut(
+upstream users { backends: ["127.0.0.1:8080"] }
+func record(_ server: Server, healthy: bool) -> bool {
+    if healthy { users.mark(server, healthy: true) } else { true }
+}
+timer check_health, every: 5s, shard: 0 {
+    for server in users.servers { guard record(server, true) else { return 500 } }
+    return 200
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE_FALSE(hir.has_value());
+    CHECK(hir.error().detail.eq(lit("upstream.mark cannot be conditionally evaluated")));
+}
+
+TEST(frontend, upstream_mark_rejects_conditioned_nested_mark_operand) {
+    const char* src = R"rut(
+upstream users { backends: ["127.0.0.1:8080"] }
+timer check_health, every: 5s, shard: 0 {
+    for server in users.servers {
+        guard users.mark(server, healthy: false && users.mark(server, healthy: false)) else {
+            return 500
+        }
+    }
+    return 200
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE_FALSE(hir.has_value());
+    CHECK(hir.error().detail.eq(lit("upstream.mark cannot be conditionally evaluated")));
+}
+
+TEST(frontend, upstream_mark_allows_eager_helper_if_condition) {
+    const char* src = R"rut(
+upstream users { backends: ["127.0.0.1:8080"] }
+func record(_ server: Server) -> bool {
+    if users.mark(server, healthy: true) { true } else { false }
+}
+timer check_health, every: 5s, shard: 0 {
+    for server in users.servers { guard record(server) else { return 500 } }
+    return 200
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    REQUIRE(lower_to_rir(mir.value(), rir));
+    u32 marks = 0;
+    for (u32 bi = 0; bi < rir.module.functions[0].block_count; bi++)
+        for (u32 ii = 0; ii < rir.module.functions[0].blocks[bi].inst_count; ii++)
+            if (rir.module.functions[0].blocks[bi].insts[ii].op == rir::Opcode::UpstreamMark)
+                marks++;
+    CHECK_EQ(marks, 1u);
+    rir.destroy();
+}
+
+TEST(frontend, upstream_mark_rejects_imported_helpers_before_upstream_ids_are_copied) {
+    const std::string dir = "/tmp/rut_import_upstream_mark_frontend";
+    std::filesystem::create_directories(dir);
+    {
+        std::ofstream out(dir + "/health.rut", std::ios::binary);
+        out << "upstream users { backends: [\"127.0.0.1:8080\"] }\n"
+               "func record(_ server: Server) -> bool => users.mark(server, healthy: true)\n";
+    }
+    const char* src = "import \"health.rut\"\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap_with_path(ast.value(), dir + "/main.rut");
+    REQUIRE_FALSE(hir.has_value());
+    CHECK(hir.error().detail.eq(lit("helpers containing upstream.mark cannot be imported yet")));
+}
+
+TEST(frontend, selective_import_ignores_unselected_upstream_mark_helpers) {
+    const std::string dir = "/tmp/rut_selective_import_upstream_mark_frontend";
+    std::filesystem::create_directories(dir);
+    {
+        std::ofstream out(dir + "/health.rut", std::ios::binary);
+        out << "upstream users { backends: [\"127.0.0.1:8080\"] }\n"
+               "func healthCode() -> i32 => 200\n"
+               "func record(_ server: Server) -> bool => users.mark(server, healthy: true)\n";
+    }
+    const char* src =
+        "import { healthCode } from \"health.rut\"\n"
+        "route GET \"/\" { if healthCode() == 200 { return 200 } else { return 500 } }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap_with_path(ast.value(), dir + "/main.rut");
+    REQUIRE(hir);
+    CHECK_EQ(hir->functions.len, 1u);
+    CHECK(hir->functions[0].name.eq(lit("healthCode")));
+}
+
+TEST(frontend, selective_import_ignores_unselected_hidden_upstream_mark_methods) {
+    const std::string dir = "/tmp/rut_selective_import_hidden_upstream_mark_frontend";
+    std::filesystem::create_directories(dir);
+    {
+        std::ofstream out(dir + "/health.rut", std::ios::binary);
+        out << "upstream users { backends: [\"127.0.0.1:8080\"] }\n"
+               "func healthCode() -> i32 => 200\n"
+               "protocol Marker { func record(server: Server) -> bool => "
+               "users.mark(server, healthy: true) }\n"
+               "struct Box { value: i32 }\n"
+               "Box impl Marker { func record(self: Box, server: Server) -> bool => "
+               "users.mark(server, healthy: true) }\n";
+    }
+    const char* src =
+        "import { healthCode } from \"health.rut\"\n"
+        "route GET \"/\" { if healthCode() == 200 { return 200 } else { return 500 } }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap_with_path(ast.value(), dir + "/main.rut");
+    REQUIRE(hir);
+    bool imported_marker = false;
+    for (u32 i = 0; i < hir->protocols.len; i++)
+        if (hir->protocols[i].name.eq(lit("Marker"))) imported_marker = true;
+    CHECK_FALSE(imported_marker);
+    CHECK_EQ(hir->impls.len, 0u);
+}
+
+TEST(frontend, upstream_mark_rejects_unpinned_route_and_unknown_backend_set) {
+    const char* cases[] = {
+        "upstream users { backends: [\"127.0.0.1:8080\"] }\n"
+        "timer check_health, every: 5s { for server in users.servers { guard "
+        "users.mark(server, healthy: true) else { return 500 } } return 200 }\n",
+        "upstream users { backends: [\"127.0.0.1:8080\"] }\n"
+        "route GET \"/x\" { for server in users.servers { guard users.mark(server, healthy: "
+        "true) else { return 500 } } return 200 }\n",
+        "upstream users\n"
+        "timer check_health, every: 5s, shard: 0 { for server in users.servers { return 200 } "
+        "return 200 }\n",
+    };
+    for (const char* src : cases) {
+        auto lexed = lex({src, static_cast<u32>(__builtin_strlen(src))});
+        REQUIRE(lexed);
+        auto ast = parse_file_heap(lexed.value());
+        REQUIRE(ast);
+        auto hir = analyze_file_heap(ast.value());
+        REQUIRE(!hir);
+    }
+}
+
+TEST(frontend, server_is_reserved_for_the_opaque_upstream_identity) {
+    const char* cases[] = {
+        "struct Server { value: i32 } route GET \"/x\" { return 200 }\n",
+        "variant Server { value(i32) } route GET \"/x\" { return 200 }\n",
+        "type Server = i32 route GET \"/x\" { return 200 }\n",
+    };
+    for (const char* src : cases) {
+        auto lexed = lex({src, static_cast<u32>(__builtin_strlen(src))});
+        REQUIRE(lexed);
+        auto ast = parse_file_heap(lexed.value());
+        REQUIRE(ast);
+        auto hir = analyze_file_heap(ast.value());
+        REQUIRE_FALSE(hir.has_value());
+        CHECK(hir.error().detail.eq(lit("Server")));
+    }
+}
+
+TEST(frontend, upstream_mark_rejects_static_loop_local_initializers) {
+    const char* cases[] = {R"rut(
+upstream users { backends: ["127.0.0.1:8080"] }
+timer check_health, every: 5s, shard: 0 {
+    for server in users.servers {
+        let accepted = users.mark(server, healthy: true)
+        guard accepted else { return 500 }
+    }
+    return 200
+}
+)rut",
+                           R"rut(
+func identity(value: bool) -> bool => value
+upstream users { backends: ["127.0.0.1:8080"] }
+timer check_health, every: 5s, shard: 0 {
+    for server in users.servers {
+        let accepted = identity(users.mark(server, healthy: true))
+        guard accepted else { return 500 }
+    }
+    return 200
+}
+)rut"};
+    const char* expected[] = {"upstream.mark cannot initialize a static for-loop local",
+                              "upstream.mark cannot be passed to a helper"};
+    for (u32 i = 0; i < 2; i++) {
+        const char* src = cases[i];
+        auto lexed = lex(lit(src));
+        REQUIRE(lexed);
+        auto ast = parse_file_heap(lexed.value());
+        REQUIRE(ast);
+        auto hir = analyze_file_heap(ast.value());
+        REQUIRE_FALSE(hir.has_value());
+        CHECK(hir.error().detail.eq(lit(expected[i])));
+    }
+}
+
+TEST(frontend, upstream_mark_rejects_replayed_or_discarded_expression_contexts) {
+    const char* cases[] = {R"rut(
+upstream users { backends: ["127.0.0.1:8080"] }
+timer check_health, every: 5s, shard: 0 {
+    for server in users.servers {
+        match users.mark(server, healthy: true) {
+            true => continue
+            false => return 500
+        }
+    }
+    return 200
+}
+)rut",
+                           R"rut(
+upstream users { backends: ["127.0.0.1:8080"] }
+timer check_health, every: 5s, shard: 0 {
+    for server in users.servers {
+        guard false else {
+            let accepted = users.mark(server, healthy: true)
+            if accepted { return 500 } else { return 501 }
+        }
+    }
+    return 200
+}
+)rut",
+                           R"rut(
+upstream users { backends: ["127.0.0.1:8080"] }
+timer check_health, every: 5s, shard: 0 {
+    for server in users.servers {
+        guard any(true, users.mark(server, healthy: true)) else { return 500 }
+    }
+    return 200
+}
+)rut",
+                           R"rut(
+upstream users { backends: ["127.0.0.1:8080"] }
+timer check_health, every: 5s, shard: 0 {
+    for server in users.servers {
+        guard all(users.mark(server, healthy: true), true) else { return 500 }
+    }
+    return 200
+}
+)rut"};
+    const char* expected[] = {
+        "upstream.mark cannot be used as a static for-loop match subject",
+        "upstream.mark cannot initialize a guard-failure local",
+        "upstream.mark cannot be used with eager fallback builtins",
+        "upstream.mark cannot be used with eager fallback builtins",
+    };
+    for (u32 i = 0; i < 4; i++) {
+        auto lexed = lex(lit(cases[i]));
+        REQUIRE(lexed);
+        auto ast = parse_file_heap(lexed.value());
+        REQUIRE(ast);
+        auto hir = analyze_file_heap(ast.value());
+        REQUIRE_FALSE(hir.has_value());
+        CHECK(hir.error().detail.eq(lit(expected[i])));
+    }
+}
+
+TEST(frontend, upstream_mark_rejects_helper_arguments_before_inlining) {
+    const char* cases[] = {R"rut(
+func ignore(value: bool) -> bool => true
+upstream users { backends: ["127.0.0.1:8080"] }
+timer check_health, every: 5s, shard: 0 {
+    for server in users.servers {
+        guard ignore(users.mark(server, healthy: true)) else { return 500 }
+    }
+    return 200
+}
+)rut",
+                           R"rut(
+func twice(value: bool) -> bool => value && value
+upstream users { backends: ["127.0.0.1:8080"] }
+timer check_health, every: 5s, shard: 0 {
+    for server in users.servers {
+        guard twice(users.mark(server, healthy: true)) else { return 500 }
+    }
+    return 200
+}
+)rut"};
+    for (const char* src : cases) {
+        auto lexed = lex(lit(src));
+        REQUIRE(lexed);
+        auto ast = parse_file_heap(lexed.value());
+        REQUIRE(ast);
+        auto hir = analyze_file_heap(ast.value());
+        REQUIRE_FALSE(hir.has_value());
+        CHECK(hir.error().detail.eq(lit("upstream.mark cannot be passed to a helper")));
+    }
+}
+
+TEST(frontend, upstream_mark_rejects_reordered_struct_initializers) {
+    const char* src = R"rut(
+struct Pair { first: bool second: bool }
+upstream users { backends: ["127.0.0.1:8080"] }
+timer check_health, every: 5s, shard: 0 {
+    for server in users.servers {
+        guard Pair(
+            second: users.mark(server, healthy: false),
+            first: users.mark(server, healthy: true)
+        ).first else { return 500 }
+    }
+    return 200
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE_FALSE(hir.has_value());
+    CHECK(hir.error().detail.eq(lit("upstream.mark cannot be used in a struct initializer")));
+}
+
+TEST(frontend, upstream_mark_rejects_generic_protocol_argument_substitution) {
+    const char* src = R"rut(
+protocol Sink { func keep(value: bool) -> bool }
+struct Box { value: i32 }
+Box impl Sink { func keep(self: Box, value: bool) -> bool => true }
+func dispatch<T: Sink>(receiver: T, server: Server) -> bool =>
+    receiver.keep(users.mark(server, healthy: true))
+upstream users { backends: ["127.0.0.1:8080"] }
+timer check_health, every: 5s, shard: 0 {
+    for server in users.servers {
+        guard dispatch(Box(value: 1), server) else { return 500 }
+    }
+    return 200
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE_FALSE(hir.has_value());
+    CHECK(hir.error().detail.eq(lit("upstream.mark cannot be passed to a helper")));
+}
+
+TEST(frontend, upstream_mark_rejects_unselected_tuple_pipe_slots) {
+    const char* src = R"rut(
+func identity(value: bool) -> bool => value
+upstream users { backends: ["127.0.0.1:8080"] }
+timer check_health, every: 5s, shard: 0 {
+    for server in users.servers {
+        guard (users.mark(server, healthy: true), true) | identity(_2) else { return 500 }
+    }
+    return 200
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE_FALSE(hir.has_value());
+    CHECK(hir.error().detail.eq(lit("upstream.mark cannot be projected through a tuple pipe")));
+}
+
+TEST(frontend, upstream_mark_rejects_builtin_tuple_pipe_projection) {
+    const char* src = R"rut(
+upstream users { backends: ["127.0.0.1:8080"] }
+timer check_health, every: 5s, shard: 0 {
+    for server in users.servers {
+        guard (users.mark(server, healthy: true), true) | any(_2, false) else { return 500 }
+    }
+    return 200
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE_FALSE(hir.has_value());
+    CHECK(hir.error().detail.eq(lit("upstream.mark cannot be projected through a tuple pipe")));
+}
+
+TEST(frontend, upstream_mark_rejects_bitwise_tuple_pipe_projection) {
+    const char* src = R"rut(
+upstream users { backends: ["127.0.0.1:8080"] }
+timer check_health, every: 5s, shard: 0 {
+    for server in users.servers {
+        let value = (users.mark(server, healthy: true), 6) | bitwise.and(_2, 3)
+        guard value == 2 else { return 500 }
+    }
+    return 200
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE_FALSE(hir.has_value());
+    CHECK(hir.error().detail.eq(lit("upstream.mark cannot be projected through a tuple pipe")));
+}
+
+TEST(frontend, upstream_mark_has_one_pinned_timer_owner) {
+    const char* src = R"rut(
+upstream users { backends: ["127.0.0.1:8080"] }
+timer primary, every: 5s, shard: 0 {
+    for server in users.servers {
+        guard users.mark(server, healthy: true) else { return 500 }
+    }
+    return 200
+}
+timer secondary, every: 5s, shard: 1 {
+    for server in users.servers {
+        guard users.mark(server, healthy: false) else { return 500 }
+    }
+    return 200
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE_FALSE(hir.has_value());
+    CHECK(hir.error().detail.eq(lit("an upstream may be marked by only one pinned timer")));
+}
+
+TEST(frontend, upstream_mark_rejects_lazy_value_branches) {
+    const char* ops[] = {"||", "&&"};
+    for (const char* op : ops) {
+        const std::string src =
+            "upstream users { backends: [\"127.0.0.1:8080\"] }\n"
+            "timer check_health, every: 5s, shard: 0 {\n"
+            "  for server in users.servers {\n"
+            "    guard time.nowMicros() > 0 " +
+            std::string(op) +
+            " users.mark(server, healthy: true) else { return 500 }\n"
+            "  }\n"
+            "  return 200\n"
+            "}\n";
+        auto lexed = lex({src.data(), static_cast<u32>(src.size())});
+        REQUIRE(lexed);
+        auto ast = parse_file_heap(lexed.value());
+        REQUIRE(ast);
+        auto hir = analyze_file_heap(ast.value());
+        REQUIRE_FALSE(hir.has_value());
+        CHECK(hir.error().detail.eq(lit("upstream.mark cannot be conditionally evaluated")));
+    }
+}
+
+TEST(frontend, match_payload_binding_shadows_same_named_upstream_mark_receiver) {
+    const char* src = R"rut(
+protocol Markable { func mark(value: bool) -> bool }
+struct Box { value: i32 }
+Box impl Markable {
+    func mark(self: Box, value: bool) -> bool => value
+}
+variant Payload { value(Box) }
+upstream users { backends: ["127.0.0.1:8080"] }
+route GET "/x" {
+    let payload = Payload.value(Box(value: 7))
+    match payload {
+        .value(users) => if users.mark(true) { return 200 } else { return 500 }
+    }
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+}
+
+TEST(frontend, variant_namespace_shadows_same_named_upstream_mark_receiver) {
+    const char* src = R"rut(
+variant users { mark(bool) }
+upstream users { backends: ["127.0.0.1:8080"] }
+route GET "/x" {
+    let result = users.mark(true)
+    match result {
+        .mark(value) => if value { return 200 } else { return 500 }
+    }
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    REQUIRE_EQ(hir->routes[0].locals.len, 1u);
+    CHECK_EQ(hir->routes[0].locals[0].init.kind, HirExprKind::VariantCase);
+}
+
+TEST(frontend, variant_namespace_shadows_same_named_upstream_servers_iterator) {
+    const char* src = R"rut(
+variant users { servers }
+upstream users { backends: ["127.0.0.1:8080"] }
+route GET "/x" {
+    for server in users.servers { return 200 }
+    return 500
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE_FALSE(hir.has_value());
+    CHECK(hir.error().detail.eq(
+        lit("static for-loop iterator must be a compile-time array literal or alias")));
+}
+
+TEST(frontend, method_argument_labels_remain_restricted_to_upstream_mark) {
+    const char* src =
+        "route GET \"/x\" { if req.path.hasPrefix(prefix: \"/x\") { return 200 } else { "
+        "return 500 } }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(!hir);
+    CHECK(hir.error().detail.eq(lit("argument labels are not supported for this method")));
 }
 
 TEST(frontend, stats_and_metrics_are_typed_opaque_json_values) {

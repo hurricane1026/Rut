@@ -83,6 +83,11 @@ u64 reload_admission_handler(void*, jit::HandlerCtx* ctx, const u8*, u32, void*)
     return jit::HandlerResult::make_status(accepted ? 202 : 503).pack();
 }
 
+u64 mark_generation_handler(void*, jit::HandlerCtx* ctx, const u8*, u32, void*) {
+    const bool marked = rut_helper_upstream_mark(ctx, ctx->config_generation, 0, 0, 1) != 0;
+    return jit::HandlerResult::make_status(marked ? 202 : 503).pack();
+}
+
 u64 mutable_body_handler(void*, jit::HandlerCtx* ctx, const u8*, u32, void*) {
     char source[] = "stable-body";
     rut_helper_resp_set_body(ctx, source, sizeof(source) - 1);
@@ -1961,6 +1966,35 @@ TEST(harness_scenario, control_plane_mutation_fixture_follows_state_isolation) {
     CHECK_EQ(undeclared.harness.outcome, harness::Outcome::Invalid);
     CHECK(std::strcmp(undeclared.harness.detail,
                       "control-plane mutation capability was not declared") == 0);
+    CHECK_EQ(target.destroy(), harness::CleanupOutcome::Clean);
+}
+
+TEST(harness_scenario, control_plane_mutation_latches_target_config_generation) {
+    harness::SourceTarget target{};
+    REQUIRE(
+        target.program.config.add_jit_handler("/mark", kRouteMethodPost, &mark_generation_handler));
+    REQUIRE(target.program.config.add_upstream("test", 0x7f000001u, 8000));
+    target.program.config.config_generation = 7;
+    target.prepared = true;
+    ControlPlaneMutationPort mutation;
+    mutation.reset(7, false, &target.program.config);
+    const char request[] = "POST /mark HTTP/1.1\r\nHost: test\r\nContent-Length: 0\r\n\r\n";
+    harness::ScenarioSpec scenario{};
+    scenario.target = &target;
+    scenario.path = {"/mark", 5};
+    scenario.method = kRouteMethodPost;
+    scenario.request_data = reinterpret_cast<const u8*>(request);
+    scenario.request_len = sizeof(request) - 1;
+    scenario.control_plane_mutation = &mutation;
+    scenario.expected = {true, jit::HandlerAction::ReturnStatus, 202};
+    auto spec = scripted_scenario_harness();
+    spec.required_capabilities.add(harness::Capability::ControlPlaneMutation);
+    spec.environment_capabilities = spec.required_capabilities;
+
+    const auto result = harness::drive_scenario(scenario, spec);
+    REQUIRE_EQ(result.harness.outcome, harness::Outcome::Passed);
+    CHECK_EQ(result.terminal.status_code, 202);
+    CHECK_EQ(mutation.manual_health({7, 0, 0}), ManualHealthOverride::Healthy);
     CHECK_EQ(target.destroy(), harness::CleanupOutcome::Clean);
 }
 

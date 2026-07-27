@@ -2518,9 +2518,12 @@ private:
 };
 
 template <typename Loop>
-inline void latch_control_plane_mutation(Loop* loop, jit::HandlerCtx* ctx) {
+inline void latch_control_plane_mutation(Loop* loop,
+                                         jit::HandlerCtx* ctx,
+                                         u64 config_generation = 0) {
     if (ctx == nullptr) return;
     ctx->control_plane_mutation = nullptr;
+    ctx->config_generation = config_generation;
     if (loop == nullptr) return;
     if constexpr (requires { loop->control_plane_mutation; })
         ctx->control_plane_mutation = loop->control_plane_mutation;

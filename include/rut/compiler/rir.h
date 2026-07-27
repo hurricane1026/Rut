@@ -82,6 +82,12 @@ struct FieldDef {
     const Type* type;
 };
 
+// User-declared structs are capped at eight fields by the frontend, while
+// generated tuple StructDefs need to preserve all ten frontend tuple slots.
+// Keep an explicit RIR bound so consumers can reject malformed flexible-array
+// metadata before dereferencing fields().
+static constexpr u32 kMaxStructFields = 10;
+
 // Struct definition — arena-allocated, fields stored inline after.
 struct StructDef {
     Str name;
@@ -231,6 +237,9 @@ enum class Opcode : u8 {
     // ── Cache state (per-shard lossy slots; docs/language-card.md, Cache section) ──
     CacheGet,  // %r = cache.get %key, inst=N        → Optional(i64)  (imm.i32_val = instance)
     CacheSet,  // %r = cache.set %key, %val, inst=N  → i64 (echoes %val)
+
+    // ── Control-plane mutation ──
+    UpstreamMark,  // %r = upstream.mark %server, %healthy → bool
 
     // ── Bounded dynamic JSON response construction ──
     JsonReset,               // reset shard-local serializer scratch
@@ -410,6 +419,10 @@ struct Function {
     bool is_timer = false;
     u32 timer_interval_ms = 0;
     i32 timer_shard = -1;
+    // Upstreams whose manual-health policy is owned by this timer. The
+    // compile-to-config bridge fingerprints the timer body and attaches that
+    // stable policy identity to each target for reload compatibility.
+    u32 upstream_mark_mask = 0;
 
     // Blocks: arena-allocated array. blocks[0] is always entry.
     Block* blocks;
@@ -528,6 +541,11 @@ struct Module {
     };
     CacheInstance cache_instances[kMaxCacheInstances];
     u32 cache_instance_count = 0;
+
+    // Activation gate for mutation effects whose capture/replay event schema is
+    // not yet emitted by source lowering. Hand-built verifier tests may opt in
+    // explicitly; normal compiler output remains fail-closed.
+    bool upstream_mark_replay_complete = false;
 
     // Arena that owns all IR memory (mmap-backed, compiler use).
     MmapArena* arena;

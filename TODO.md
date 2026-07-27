@@ -11,19 +11,22 @@ without accepting source forms that cannot be replayed or resumed faithfully.
 
 ### Control-plane builtins
 
-Connect the remaining declared `reload()` and `upstream.mark()` mutation
-surface to runtime services. Read-only `stats()` and `metrics()` snapshots are
-connected end to end.
+Connect the remaining declared `reload()` mutation surface to the process
+coordinator. Read-only snapshots are connected end to end. Timer-only
+`upstream.mark()` has source lowering and runtime support, but production
+activation remains deliberately gated until replay lowering emits the ordered
+attempt/result/version events required by the mutation contract.
 
 The authority, visible boolean failure, config-generation ordering, lifetime,
 and harness contract is fixed in `docs/control-plane-mutations.md`. Implement
 it in the required order documented there; do not reintroduce the old
 `Void`/statement-only declarations or a hidden wait.
 
-The shared bounded mutation port, generation-tagged manual override table,
-HandlerCtx/JIT helper boundary, production injection, and deterministic harness
-fixture are connected. `Server`/`Upstream.servers`, health-selection integration,
-source lowering, and the reload coordinator remain.
+The shared bounded mutation port, pointer-free `Server`/`Upstream.servers`
+runtime model, generation-tagged manual override table, health-selection
+priority, HandlerCtx/JIT helper boundary, production injection, and
+deterministic harness fixture, and timer-only shard-pinned source lowering are
+connected. The reload coordinator remains.
 
 **Acceptance**:
 - Reload and upstream mutation define authorization, failure, and shard-ordering
@@ -94,6 +97,14 @@ implementation promise.
 
 ## Recently Completed
 
+- [x] A shard-pinned timer can enumerate a statically declared upstream's
+  pointer-free `Server` values, pass them through pure typed helpers, and
+  synchronously publish generation-checked manual health with visible boolean
+  failure; route, unpinned, runtime-bound, stale, and foreign uses fail closed.
+- [x] `RouteConfig` pins a monotonic generation, `Upstream.servers` produces a
+  pointer-free generation-stable view, and both network backends consult manual
+  health before shard-local active/passive health; explicitly unhealthy sets
+  fail closed when no backend remains.
 - [x] Production and deterministic harness execution share one allocation-free
   control-plane mutation port with single-slot reload admission, terminal
   outcome records, generation-tagged manual-health overrides, and fail-closed

@@ -49,6 +49,9 @@ struct UpstreamTarget {
     u32 name_len;
     // Full, non-truncated declaration identity used across config generations.
     u64 name_identity = 0;
+    // Fingerprint of the one marking timer that owns manual health policy for
+    // this upstream. Zero means no compiled marking policy.
+    u64 marking_policy_identity = 0;
     // Max concurrent in-flight proxied requests to this backend (0 = unlimited).
     // Enforced cluster-wide via the shared UpstreamConcurrency gauge; over the
     // cap the runtime answers 503 before connecting.

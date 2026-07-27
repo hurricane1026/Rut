@@ -185,6 +185,7 @@ bool load_rut_program(
 
     // ── Backend: RIR → LLVM IR → native code ────────────────────────
     err.stage = LoadStage::Codegen;
+    if (!marking_policies_valid_for_codegen(out.rir.module)) return false;
     auto cg = jit::codegen(out.rir.module);
     if (!cg.ok) return false;
 

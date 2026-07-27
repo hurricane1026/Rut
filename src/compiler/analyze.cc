@@ -278,6 +278,8 @@ constexpr Str kCacheNameLenDetail = lit_str(
     "state's hot-reload identity)");
 constexpr Str kCacheImportDetail =
     lit_str("state declarations in imported modules are not supported yet");
+constexpr Str kUpstreamMarkImportDetail =
+    lit_str("helpers containing upstream.mark cannot be imported yet");
 constexpr Str kCacheFallibleOrderDetail = lit_str(
     "state writes must precede fallible bindings — locals materialize "
     "before the error prelude, so the write would also run on the error "
@@ -427,11 +429,11 @@ static FrontendResult<u32> intern_hir_type_shape(HirModule* mod,
     shape.tuple_len = tuple_len;
     shape.array_elem_shape_index =
         type == HirTypeKind::Array ? array_elem_shape_index : 0xffffffffu;
-    shape.is_concrete = type == HirTypeKind::Bool || type == HirTypeKind::I32 ||
-                        type == HirTypeKind::I64 || type == HirTypeKind::Str ||
-                        type == HirTypeKind::Method || type == HirTypeKind::ByteSize ||
-                        type == HirTypeKind::IP || type == HirTypeKind::StrList ||
-                        type == HirTypeKind::Response || type == HirTypeKind::Json;
+    shape.is_concrete =
+        type == HirTypeKind::Bool || type == HirTypeKind::I32 || type == HirTypeKind::I64 ||
+        type == HirTypeKind::Str || type == HirTypeKind::Method || type == HirTypeKind::ByteSize ||
+        type == HirTypeKind::IP || type == HirTypeKind::StrList || type == HirTypeKind::Response ||
+        type == HirTypeKind::Json || type == HirTypeKind::Server;
     if (type == HirTypeKind::Variant) shape.is_concrete = variant_index != 0xffffffffu;
     if (type == HirTypeKind::Struct) shape.is_concrete = struct_index != 0xffffffffu;
     if (type == HirTypeKind::Array) {
@@ -2217,6 +2219,7 @@ static HirTypeKind resolve_named_type(const HirModule& mod,
     if (name.eq({"str", 3})) return HirTypeKind::Str;
     if (name.eq({"Response", 8})) return HirTypeKind::Response;
     if (name.eq({"Json", 4})) return HirTypeKind::Json;
+    if (name.eq({"Server", 6})) return HirTypeKind::Server;
     const u32 idx = find_variant_index(mod, name);
     if (idx < mod.variants.len) {
         variant_index = idx;
@@ -4067,6 +4070,7 @@ static FrontendResult<HirExpr> analyze_expr(const AstExpr& expr,
                                             u32 local_count,
                                             const MatchPayloadBinding* binding);
 static bool hir_expr_reads_wait_result(const HirExpr& expr);
+static bool hir_expr_contains_upstream_mark(const HirExpr& expr);
 static FrontendResult<HirExpr> analyze_expr_impl(const AstExpr& expr,
                                                  HirRoute* route,
                                                  const HirModule& mod,
@@ -4280,6 +4284,11 @@ static FrontendResult<HirExpr> analyze_bitwise_namespace_call(const AstExpr& exp
             return frontend_error(FrontendError::UnsupportedSyntax,
                                   arg.span,
                                   lit_str("placeholder slot exceeds tuple arity"));
+        if (hir_expr_contains_upstream_mark(*pipe_lhs))
+            return frontend_error(
+                FrontendError::UnsupportedSyntax,
+                arg.span,
+                lit_str("upstream.mark cannot be projected through a tuple pipe"));
         const u32 slot_index = static_cast<u32>(arg.int_value - 1);
         if (pipe_lhs->args.len == pipe_lhs->tuple_len && pipe_lhs->args[slot_index] != nullptr)
             return *pipe_lhs->args[slot_index];
@@ -4599,6 +4608,69 @@ static FrontendResult<HirExpr> analyze_method_call_expr(
     const MatchPayloadBinding* binding,
     const HirExpr* receiver_override = nullptr) {
     if (expr.lhs == nullptr) return frontend_error(FrontendError::UnsupportedSyntax, expr.span);
+
+    // Control-plane upstream receiver. Upstream declarations are compile-time
+    // namespaces rather than runtime pointers; the Server operand carries the
+    // numeric identity and HandlerCtx supplies the invocation's config pin.
+    if (receiver_override == nullptr && expr.lhs->kind == AstExprKind::Ident &&
+        expr.name.eq({"mark", 4}) &&
+        !user_bound_ident_name(mod, locals, local_count, binding, expr.lhs->name)) {
+        u32 upstream_index = mod.upstreams.len;
+        for (u32 i = 0; i < mod.upstreams.len; i++) {
+            if (mod.upstreams[i].name.eq(expr.lhs->name)) {
+                upstream_index = i;
+                break;
+            }
+        }
+        bool shadowed = false;
+        if (binding != nullptr && binding->subject != nullptr && binding->name.eq(expr.lhs->name))
+            shadowed = true;
+        for (u32 i = 0; i < local_count; i++) {
+            if (locals[i].name.len != 0 && locals[i].name.eq(expr.lhs->name)) {
+                shadowed = true;
+                break;
+            }
+        }
+        if (upstream_index < mod.upstreams.len && !shadowed) {
+            if (route == nullptr ||
+                (!route->is_helper_scratch && (!route->is_timer || route->timer_shard < 0)))
+                return frontend_error(
+                    FrontendError::UnsupportedSyntax,
+                    expr.span,
+                    lit_str("upstream.mark is available only in a timer with an explicit shard"));
+            if (expr.args.len != 2 || expr.args[0] == nullptr || expr.args[1] == nullptr ||
+                expr.int_value != 2 || !expr.msg.eq({"healthy", 7}))
+                return frontend_error(FrontendError::UnsupportedSyntax,
+                                      expr.span,
+                                      lit_str("upstream.mark expects (server, healthy: bool)"));
+            auto server = analyze_expr(*expr.args[0], route, mod, locals, local_count, binding);
+            if (!server) return core::make_unexpected(server.error());
+            auto healthy = analyze_expr(*expr.args[1], route, mod, locals, local_count, binding);
+            if (!healthy) return core::make_unexpected(healthy.error());
+            if (server->type != HirTypeKind::Server || server->may_nil || server->may_error ||
+                healthy->type != HirTypeKind::Bool || healthy->may_nil || healthy->may_error)
+                return frontend_error(FrontendError::UnsupportedSyntax,
+                                      expr.span,
+                                      lit_str("upstream.mark expects (server, healthy: bool)"));
+            HirExpr out{};
+            out.kind = HirExprKind::UpstreamMark;
+            out.type = HirTypeKind::Bool;
+            out.span = expr.span;
+            out.int_value = static_cast<i64>(mod.upstreams[upstream_index].id);
+            route->upstream_mark_mask |= 1u << upstream_index;
+            if (!route->exprs.push(server.value()))
+                return frontend_error(FrontendError::TooManyItems, expr.span);
+            out.lhs = &route->exprs[route->exprs.len - 1];
+            if (!route->exprs.push(healthy.value()))
+                return frontend_error(FrontendError::TooManyItems, expr.span);
+            out.rhs = &route->exprs[route->exprs.len - 1];
+            return out;
+        }
+    }
+    if (expr.msg.len != 0)
+        return frontend_error(FrontendError::UnsupportedSyntax,
+                              expr.span,
+                              lit_str("argument labels are not supported for this method"));
     if (receiver_override == nullptr && expr.lhs->kind == AstExprKind::Ident &&
         has_import_namespace(mod, expr.lhs->name)) {
         Str qualified_member{};
@@ -5775,6 +5847,19 @@ static FrontendResult<HirExpr> instantiate_function_expr(const HirExpr& expr,
             lit_str("helper reads a route capture the attached route does not provide "
                     "(req.params)"));
     }
+    // upstream.mark in a helper is retained as an HIR effect and validated
+    // against each concrete call site. This also propagates the helper's
+    // upstream ownership into the pinned timer for the single-writer check.
+    if (expr.kind == HirExprKind::UpstreamMark) {
+        if (route == nullptr ||
+            (!route->is_helper_scratch && (!route->is_timer || route->timer_shard < 0)))
+            return frontend_error(
+                FrontendError::UnsupportedSyntax,
+                expr.span,
+                lit_str("upstream.mark is available only in a timer with an explicit shard"));
+        const u32 upstream_index = static_cast<u32>(expr.int_value);
+        if (upstream_index < 32) route->upstream_mark_mask |= 1u << upstream_index;
+    }
     HirExpr out =
         apply_generic_binding_to_expr(expr, generic_bindings, generic_binding_count, &mod);
     auto concretized =
@@ -5801,6 +5886,10 @@ static FrontendResult<HirExpr> instantiate_function_expr(const HirExpr& expr,
         auto recv = instantiate_function_expr(
             *expr.lhs, route, mod, args, arg_count, generic_bindings, generic_binding_count);
         if (!recv) return core::make_unexpected(recv.error());
+        if (hir_expr_contains_upstream_mark(recv.value()))
+            return frontend_error(FrontendError::UnsupportedSyntax,
+                                  expr.lhs->span,
+                                  lit_str("upstream.mark cannot be passed to a helper"));
         if (recv->type == HirTypeKind::Generic)
             return frontend_error(FrontendError::UnsupportedSyntax, expr.span, expr.str_value);
         const HirImpl* impl =
@@ -5839,6 +5928,10 @@ static FrontendResult<HirExpr> instantiate_function_expr(const HirExpr& expr,
                                                  generic_bindings,
                                                  generic_binding_count);
             if (!arg) return core::make_unexpected(arg.error());
+            if (hir_expr_contains_upstream_mark(arg.value()))
+                return frontend_error(FrontendError::UnsupportedSyntax,
+                                      expr.args[i]->span,
+                                      lit_str("upstream.mark cannot be passed to a helper"));
             call_args[call_arg_count++] = arg.value();
         }
         GenericBinding impl_bindings[HirFunction::kMaxTypeParams]{};
@@ -8195,6 +8288,11 @@ static FrontendResult<HirExpr> analyze_expr_impl(const AstExpr& expr,
                     route->guards.len = saved_guard_count;
                     route->locals.len = saved_local_count;
                     if (!field_value) return core::make_unexpected(field_value.error());
+                    if (hir_expr_contains_upstream_mark(field_value.value()))
+                        return frontend_error(
+                            FrontendError::UnsupportedSyntax,
+                            expr.field_inits[fi].value->span,
+                            lit_str("upstream.mark cannot be used in a struct initializer"));
                     if (field_value->may_nil || field_value->may_error)
                         return frontend_error(FrontendError::UnsupportedSyntax,
                                               expr.field_inits[fi].value->span);
@@ -8316,6 +8414,11 @@ static FrontendResult<HirExpr> analyze_expr_impl(const AstExpr& expr,
                 return analyze_expr_impl(value_ast, route, mod, locals, local_count, binding, true);
             }();
             if (!field_value) return core::make_unexpected(field_value.error());
+            if (hir_expr_contains_upstream_mark(field_value.value()))
+                return frontend_error(
+                    FrontendError::UnsupportedSyntax,
+                    expr.field_inits[fi].value->span,
+                    lit_str("upstream.mark cannot be used in a struct initializer"));
             if (earlier_field_reads_response) {
                 for (u32 li = locals_before_field; li < route->locals.len; li++) {
                     if (is_response_effect(route->locals[li].init.kind))
@@ -9137,6 +9240,11 @@ static FrontendResult<HirExpr> analyze_expr_impl(const AstExpr& expr,
                         lit_str("a response-mutating Error field cannot follow a Response field "
                                 "read"));
                 earlier_field_reads_response |= hir_expr_reads_response_field(field_value.value());
+                if (hir_expr_contains_upstream_mark(field_value.value()))
+                    return frontend_error(
+                        FrontendError::UnsupportedSyntax,
+                        expr.field_inits[fi].value->span,
+                        lit_str("upstream.mark cannot be used in a struct initializer"));
                 if (field_value->may_nil || field_value->may_error)
                     return frontend_error(FrontendError::UnsupportedSyntax,
                                           expr.field_inits[fi].value->span);
@@ -9227,6 +9335,10 @@ static FrontendResult<HirExpr> analyze_expr_impl(const AstExpr& expr,
         if (!lhs) return core::make_unexpected(lhs.error());
         auto rhs = analyze_lazy_bool_operand(*expr.rhs);
         if (!rhs) return core::make_unexpected(rhs.error());
+        if (hir_expr_contains_upstream_mark(rhs.value()))
+            return frontend_error(FrontendError::UnsupportedSyntax,
+                                  expr.rhs->span,
+                                  lit_str("upstream.mark cannot be conditionally evaluated"));
         if (lhs->may_nil || lhs->may_error || rhs->may_nil || rhs->may_error) {
             const bool error_on_rhs = lhs->may_nil || lhs->may_error;
             return frontend_error(FrontendError::UnsupportedSyntax,
@@ -9321,6 +9433,10 @@ static FrontendResult<HirExpr> analyze_expr_impl(const AstExpr& expr,
         if (!lhs) return core::make_unexpected(lhs.error());
         auto rhs = analyze_lazy_bool_operand(*expr.rhs);
         if (!rhs) return core::make_unexpected(rhs.error());
+        if (hir_expr_contains_upstream_mark(rhs.value()))
+            return frontend_error(FrontendError::UnsupportedSyntax,
+                                  expr.rhs->span,
+                                  lit_str("upstream.mark cannot be conditionally evaluated"));
         if (lhs->type != HirTypeKind::Bool || rhs->type != HirTypeKind::Bool || lhs->may_nil ||
             lhs->may_error || rhs->may_nil || rhs->may_error) {
             return frontend_error(FrontendError::UnsupportedSyntax, expr.span);
@@ -9478,6 +9594,11 @@ static FrontendResult<HirExpr> analyze_expr_impl(const AstExpr& expr,
                 auto result = analyze_expr(stage_expr, route, mod, locals, local_count, binding);
                 route->allow_respond_effects = saved_allow_respond_effects;
                 route->allow_response_effects = saved_allow_response_effects;
+                if (result && hir_expr_contains_upstream_mark(result.value()))
+                    return frontend_error(
+                        FrontendError::UnsupportedSyntax,
+                        stage_expr.span,
+                        lit_str("upstream.mark cannot be used in a conditional pipe method stage"));
                 return result;
             };
             const auto analyze_conditional_method_stage_call =
@@ -9490,6 +9611,11 @@ static FrontendResult<HirExpr> analyze_expr_impl(const AstExpr& expr,
                     method_stage, route, mod, locals, local_count, binding, &recv);
                 route->allow_respond_effects = saved_allow_respond_effects;
                 route->allow_response_effects = saved_allow_response_effects;
+                if (result && hir_expr_contains_upstream_mark(result.value()))
+                    return frontend_error(
+                        FrontendError::UnsupportedSyntax,
+                        method_stage.span,
+                        lit_str("upstream.mark cannot be used in a conditional pipe method stage"));
                 return result;
             };
             auto shape_only_result = [](HirExpr value) {
@@ -10219,6 +10345,43 @@ static bool hir_expr_contains_json_build(const HirExpr& expr) {
     return false;
 }
 
+static bool hir_expr_contains_upstream_mark(const HirExpr& expr) {
+    if (expr.kind == HirExprKind::UpstreamMark) return true;
+    if (expr.lhs != nullptr && hir_expr_contains_upstream_mark(*expr.lhs)) return true;
+    if (expr.rhs != nullptr && hir_expr_contains_upstream_mark(*expr.rhs)) return true;
+    for (u32 i = 0; i < expr.args.len; i++)
+        if (expr.args[i] != nullptr && hir_expr_contains_upstream_mark(*expr.args[i])) return true;
+    for (u32 i = 0; i < expr.field_inits.len; i++)
+        if (expr.field_inits[i].value != nullptr &&
+            hir_expr_contains_upstream_mark(*expr.field_inits[i].value))
+            return true;
+    return false;
+}
+
+static bool hir_expr_contains_conditioned_upstream_mark(const HirExpr& expr,
+                                                        bool conditioned = false) {
+    if (expr.kind == HirExprKind::UpstreamMark && conditioned) return true;
+    const bool branches_conditioned = conditioned || expr.kind == HirExprKind::IfElse;
+    const bool lhs_conditioned =
+        expr.kind == HirExprKind::IfElse ? conditioned : branches_conditioned;
+    if (expr.lhs != nullptr &&
+        hir_expr_contains_conditioned_upstream_mark(*expr.lhs, lhs_conditioned))
+        return true;
+    if (expr.rhs != nullptr &&
+        hir_expr_contains_conditioned_upstream_mark(*expr.rhs, branches_conditioned))
+        return true;
+    for (u32 i = 0; i < expr.args.len; i++)
+        if (expr.args[i] != nullptr &&
+            hir_expr_contains_conditioned_upstream_mark(*expr.args[i], branches_conditioned))
+            return true;
+    for (u32 i = 0; i < expr.field_inits.len; i++)
+        if (expr.field_inits[i].value != nullptr &&
+            hir_expr_contains_conditioned_upstream_mark(*expr.field_inits[i].value,
+                                                        branches_conditioned))
+            return true;
+    return false;
+}
+
 static FrontendResult<HirExpr> analyze_call_expr(const AstExpr& expr,
                                                  HirRoute* route,
                                                  const HirModule& mod,
@@ -10276,6 +10439,11 @@ static FrontendResult<HirExpr> analyze_call_expr(const AstExpr& expr,
             return frontend_error(FrontendError::UnsupportedSyntax,
                                   arg.span,
                                   lit_str("placeholder slot exceeds tuple arity"));
+        if (hir_expr_contains_upstream_mark(*source))
+            return frontend_error(
+                FrontendError::UnsupportedSyntax,
+                arg.span,
+                lit_str("upstream.mark cannot be projected through a tuple pipe"));
         const u32 slot_index = static_cast<u32>(arg.int_value - 1);
         if (source->args.len == source->tuple_len && source->args[slot_index] != nullptr)
             return *source->args[slot_index];
@@ -10520,6 +10688,11 @@ static FrontendResult<HirExpr> analyze_call_expr(const AstExpr& expr,
         if (!args) return core::make_unexpected(args.error());
         HirExpr* lhs = &lhs_value;
         HirExpr* rhs = &rhs_value;
+        if (hir_expr_contains_upstream_mark(*lhs) || hir_expr_contains_upstream_mark(*rhs))
+            return frontend_error(
+                FrontendError::UnsupportedSyntax,
+                expr.span,
+                lit_str("upstream.mark cannot be used with eager fallback builtins"));
         if (rhs->may_nil) return frontend_error(FrontendError::UnsupportedSyntax, expr.span);
 
         // A bare int-literal fallback adopts an i64 carrier's width, so
@@ -10651,6 +10824,11 @@ static FrontendResult<HirExpr> analyze_call_expr(const AstExpr& expr,
         if (!args) return core::make_unexpected(args.error());
         HirExpr* lhs = &lhs_value;
         HirExpr* rhs = &rhs_value;
+        if (hir_expr_contains_upstream_mark(*lhs) || hir_expr_contains_upstream_mark(*rhs))
+            return frontend_error(
+                FrontendError::UnsupportedSyntax,
+                expr.span,
+                lit_str("upstream.mark cannot be used with eager fallback builtins"));
         if (rhs->may_nil) return frontend_error(FrontendError::UnsupportedSyntax, expr.span);
 
         // A bare int-literal fallback adopts an i64 carrier's width, so
@@ -11043,6 +11221,11 @@ static FrontendResult<HirExpr> analyze_call_expr(const AstExpr& expr,
         }
         if (slot > static_cast<i32>(source.tuple_len))
             return fail_call(span, "placeholder slot exceeds tuple arity", nullptr);
+        if (hir_expr_contains_upstream_mark(source))
+            return frontend_error(
+                FrontendError::UnsupportedSyntax,
+                span,
+                lit_str("upstream.mark cannot be projected through a tuple pipe"));
         const u32 slot_index = static_cast<u32>(slot - 1);
         if (source.args.len == source.tuple_len && source.args[slot_index] != nullptr)
             return *source.args[slot_index];
@@ -11097,6 +11280,10 @@ static FrontendResult<HirExpr> analyze_call_expr(const AstExpr& expr,
     };
     auto check_call_arg =
         [&](u32 param_index, HirExpr& analyzed_arg, Span span) -> FrontendResult<void> {
+        if (hir_expr_contains_upstream_mark(analyzed_arg))
+            return frontend_error(FrontendError::UnsupportedSyntax,
+                                  span,
+                                  lit_str("upstream.mark cannot be passed to a helper"));
         if (fn.params[param_index].type == HirTypeKind::Array) {
             const u32 expected_elem_shape_index = fn.params[param_index].array_elem_shape_index;
             u32 carrier_shape_index = fn.params[param_index].shape_index;
@@ -11363,6 +11550,10 @@ static FrontendResult<HirExpr> analyze_call_expr(const AstExpr& expr,
             if (function_has_response_effects(fn) || function_has_deferred_protocol_call(fn))
                 return fail_call(expr.span,
                                  "response-mutating helpers are not supported in conditional pipe",
+                                 nullptr);
+            if (hir_expr_contains_upstream_mark(fn.body))
+                return fail_call(expr.span,
+                                 "upstream.mark helpers are not supported in conditional pipe",
                                  nullptr);
             auto then_expr = instantiate_function_expr(fn.body,
                                                        route,
@@ -13695,15 +13886,6 @@ static FrontendResult<void> analyze_guard_fail_body(const AstStatement& stmt,
             const bool is_last = si + 1 == stmt.block_stmts.len;
             if (inner.kind == AstStmtKind::Let) {
                 if (is_last) return frontend_error(FrontendError::UnsupportedSyntax, inner.span);
-                if (inside_static_for && inner.expr.kind != AstExprKind::Ident &&
-                    inner.expr.kind != AstExprKind::BoolLit &&
-                    inner.expr.kind != AstExprKind::IntLit &&
-                    inner.expr.kind != AstExprKind::StrLit)
-                    return frontend_error(
-                        FrontendError::UnsupportedSyntax,
-                        inner.expr.span,
-                        lit_str("static for-loop guard-failure locals must alias an existing "
-                                "value or use a literal"));
                 HirLocal local{};
                 local.span = inner.span;
                 local.name = inner.name;
@@ -13728,6 +13910,20 @@ static FrontendResult<void> analyze_guard_fail_body(const AstStatement& stmt,
                                                scoped_locals.len,
                                                binding);
                 if (!init) return core::make_unexpected(init.error());
+                if (hir_expr_contains_upstream_mark(init.value()))
+                    return frontend_error(
+                        FrontendError::UnsupportedSyntax,
+                        inner.expr.span,
+                        lit_str("upstream.mark cannot initialize a guard-failure local"));
+                if (inside_static_for && inner.expr.kind != AstExprKind::Ident &&
+                    inner.expr.kind != AstExprKind::BoolLit &&
+                    inner.expr.kind != AstExprKind::IntLit &&
+                    inner.expr.kind != AstExprKind::StrLit)
+                    return frontend_error(
+                        FrontendError::UnsupportedSyntax,
+                        inner.expr.span,
+                        lit_str("static for-loop guard-failure locals must alias an existing "
+                                "value or use a literal"));
                 auto typed = apply_declared_type_to_expr(&init.value(), mod, inner);
                 if (!typed) return core::make_unexpected(typed.error());
                 local.type = init->type;
@@ -15238,6 +15434,40 @@ static Str import_visible_name(const ImportedModuleInfo& imported, Str original_
 static bool is_hidden_import_runtime_function(Str name) {
     return (name.len >= 7 && __builtin_memcmp(name.ptr, "__impl_", 7) == 0) ||
            (name.len >= 8 && __builtin_memcmp(name.ptr, "__proto_", 8) == 0);
+}
+
+static bool imported_name_is_selected(const ImportedModuleInfo& imported, Str name) {
+    for (u32 si = 0; si < imported.selected_names.len; si++)
+        if (imported.selected_names[si].name.eq(name)) return true;
+    return false;
+}
+
+static bool imported_function_is_selected(const ImportedModuleInfo& imported, u32 function_index) {
+    if (function_index >= imported.module->functions.len) return false;
+    const Str name = imported.module->functions[function_index].name;
+    if (!imported.selective || imported.has_namespace_alias) return true;
+    if (!is_hidden_import_runtime_function(name)) return imported_name_is_selected(imported, name);
+
+    // Hidden protocol-default and implementation functions are merged only
+    // to back a selected protocol. An unrelated selective function import
+    // cannot reach them, so apply the same owner-protocol selection used by
+    // refresh_imported_protocol_method_functions() and merge_imported_impls().
+    for (u32 pi = 0; pi < imported.module->protocols.len; pi++) {
+        const auto& protocol = imported.module->protocols[pi];
+        if (!imported_name_is_selected(imported, protocol.name)) continue;
+        for (u32 mi = 0; mi < protocol.methods.len; mi++)
+            if (protocol.methods[mi].function_index == function_index) return true;
+    }
+    for (u32 ii = 0; ii < imported.module->impls.len; ii++) {
+        const auto& impl = imported.module->impls[ii];
+        if (impl.protocol_index >= imported.module->protocols.len ||
+            !imported_name_is_selected(imported,
+                                       imported.module->protocols[impl.protocol_index].name))
+            continue;
+        for (u32 mi = 0; mi < impl.methods.len; mi++)
+            if (impl.methods[mi].function_index == function_index) return true;
+    }
+    return false;
 }
 
 static bool imported_module_exports_function_name(const HirModule& mod, Str name) {
@@ -16885,8 +17115,74 @@ static FrontendResult<void> analyze_wait_any_stmt_control(const AstStatement& st
 static FrontendResult<u32> analyze_for_stmt(const AstStatement& stmt,
                                             HirRoute* route,
                                             HirModule& mod) {
-    if (stmt.expr.kind == AstExprKind::Call || stmt.expr.kind == AstExprKind::MethodCall ||
-        stmt.expr.kind == AstExprKind::Field || stmt.expr.kind == AstExprKind::Pipe)
+    HirExpr upstream_servers{};
+    bool has_upstream_servers = false;
+    if (stmt.expr.kind == AstExprKind::Field && stmt.expr.lhs != nullptr &&
+        stmt.expr.lhs->kind == AstExprKind::Ident && stmt.expr.name.eq({"servers", 7})) {
+        const bool shadowed = user_bound_ident_name(
+            mod, route->locals.data, route->locals.len, nullptr, stmt.expr.lhs->name);
+        u32 upstream_index = mod.upstreams.len;
+        if (!shadowed) {
+            for (u32 i = 0; i < mod.upstreams.len; i++) {
+                if (mod.upstreams[i].name.eq(stmt.expr.lhs->name)) {
+                    upstream_index = i;
+                    break;
+                }
+            }
+        }
+        if (upstream_index < mod.upstreams.len) {
+            const auto& upstream = mod.upstreams[upstream_index];
+            if (!upstream.has_address)
+                return frontend_error(
+                    FrontendError::UnsupportedSyntax,
+                    stmt.expr.span,
+                    lit_str("Upstream.servers requires statically declared backend addresses"));
+            auto server_shape = intern_hir_type_shape(&mod,
+                                                      HirTypeKind::Server,
+                                                      0xffffffffu,
+                                                      0xffffffffu,
+                                                      0xffffffffu,
+                                                      0,
+                                                      nullptr,
+                                                      nullptr,
+                                                      nullptr,
+                                                      stmt.expr.span);
+            if (!server_shape) return core::make_unexpected(server_shape.error());
+            auto array_shape = intern_hir_type_shape(&mod,
+                                                     HirTypeKind::Array,
+                                                     0xffffffffu,
+                                                     0xffffffffu,
+                                                     0xffffffffu,
+                                                     0,
+                                                     nullptr,
+                                                     nullptr,
+                                                     nullptr,
+                                                     stmt.expr.span,
+                                                     server_shape.value());
+            if (!array_shape) return core::make_unexpected(array_shape.error());
+            upstream_servers.kind = HirExprKind::ArrayLit;
+            upstream_servers.type = HirTypeKind::Array;
+            upstream_servers.shape_index = array_shape.value();
+            upstream_servers.span = stmt.expr.span;
+            upstream_servers.array_len = upstream.extra_count + 1;
+            for (u32 backend = 0; backend < upstream_servers.array_len; backend++) {
+                HirExpr server{};
+                server.kind = HirExprKind::ServerLit;
+                server.type = HirTypeKind::Server;
+                server.shape_index = server_shape.value();
+                server.span = stmt.expr.span;
+                server.int_value = (static_cast<i64>(upstream.id) << 16) | backend;
+                if (!route->exprs.push(server))
+                    return frontend_error(FrontendError::TooManyItems, stmt.expr.span);
+                if (!upstream_servers.args.push(&route->exprs[route->exprs.len - 1]))
+                    return frontend_error(FrontendError::TooManyItems, stmt.expr.span);
+            }
+            has_upstream_servers = true;
+        }
+    }
+    if (!has_upstream_servers &&
+        (stmt.expr.kind == AstExprKind::Call || stmt.expr.kind == AstExprKind::MethodCall ||
+         stmt.expr.kind == AstExprKind::Field || stmt.expr.kind == AstExprKind::Pipe))
         return frontend_error(
             FrontendError::UnsupportedSyntax,
             stmt.expr.span,
@@ -16897,7 +17193,9 @@ static FrontendResult<u32> analyze_for_stmt(const AstStatement& stmt,
     route->allow_respond_effects = false;
     route->allow_response_effects = false;
     auto iter =
-        analyze_array_iter_expr(stmt.expr, route, mod, route->locals.data, route->locals.len);
+        has_upstream_servers
+            ? FrontendResult<HirExpr>(upstream_servers)
+            : analyze_array_iter_expr(stmt.expr, route, mod, route->locals.data, route->locals.len);
     route->allow_respond_effects = saved_allow_respond_effects;
     route->allow_response_effects = saved_allow_response_effects;
     if (!iter) return core::make_unexpected(iter.error());
@@ -17026,6 +17324,43 @@ static FrontendResult<u32> analyze_for_stmt(const AstStatement& stmt,
             loop.body.has_loop_control = true;
             continue;
         }
+        if (bstmt.kind == AstStmtKind::Expr) {
+            if (loop.body.has_term)
+                return frontend_error(
+                    FrontendError::UnsupportedSyntax,
+                    bstmt.span,
+                    lit_str("static for-loop body cannot continue after a route terminator"));
+            const u32 scoped_carrier_start = route->locals.len;
+            auto effect = analyze_expr(
+                bstmt.expr, route, mod, route->locals.data, route->locals.len, nullptr);
+            if (!effect) return core::make_unexpected(effect.error());
+            if (effect->kind != HirExprKind::UpstreamMark)
+                return frontend_error(
+                    FrontendError::UnsupportedSyntax,
+                    bstmt.span,
+                    lit_str("static for-loop expression statements must be upstream.mark calls"));
+            for (u32 li = scoped_carrier_start; li < route->locals.len; li++) {
+                const u32 carrier_index = loop.body.locals.len;
+                if (!loop.body.locals.push(route->locals[li]))
+                    return frontend_error(FrontendError::TooManyItems, bstmt.span);
+                HirForLoopBody::Step carrier_step{};
+                carrier_step.kind = HirForLoopBody::Step::Kind::Let;
+                carrier_step.index = carrier_index;
+                carrier_step.span = route->locals[li].span;
+                if (!loop.body.steps.push(carrier_step))
+                    return frontend_error(FrontendError::TooManyItems, bstmt.span);
+            }
+            const u32 effect_index = loop.body.effects.len;
+            if (!loop.body.effects.push(effect.value()))
+                return frontend_error(FrontendError::TooManyItems, bstmt.span);
+            HirForLoopBody::Step step{};
+            step.kind = HirForLoopBody::Step::Kind::Effect;
+            step.index = effect_index;
+            step.span = bstmt.span;
+            if (!loop.body.steps.push(step))
+                return frontend_error(FrontendError::TooManyItems, bstmt.span);
+            continue;
+        }
         if (bstmt.kind == AstStmtKind::Let) {
             if (loop.body.has_term)
                 return frontend_error(
@@ -17106,6 +17441,11 @@ static FrontendResult<u32> analyze_for_stmt(const AstStatement& stmt,
             auto init = analyze_expr(
                 bstmt.expr, route, mod, route->locals.data, route->locals.len, nullptr);
             if (!init) return core::make_unexpected(init.error());
+            if (hir_expr_contains_upstream_mark(init.value()))
+                return frontend_error(
+                    FrontendError::UnsupportedSyntax,
+                    bstmt.expr.span,
+                    lit_str("upstream.mark cannot initialize a static for-loop local"));
             if (init->may_error && init->kind != HirExprKind::Error &&
                 init->kind != HirExprKind::LocalRef)
                 return frontend_error(
@@ -17191,6 +17531,10 @@ static FrontendResult<u32> analyze_for_stmt(const AstStatement& stmt,
             auto bound = analyze_expr(
                 bstmt.expr, route, mod, route->locals.data, route->locals.len, nullptr);
             if (!bound) return core::make_unexpected(bound.error());
+            if (hir_expr_contains_conditioned_upstream_mark(bound.value()))
+                return frontend_error(FrontendError::UnsupportedSyntax,
+                                      bstmt.expr.span,
+                                      lit_str("upstream.mark cannot be conditionally evaluated"));
             auto cond = build_guard_cond_from_analyzed(bound.value(),
                                                        bstmt.expr.span,
                                                        route,
@@ -17449,13 +17793,6 @@ static FrontendResult<u32> analyze_for_stmt(const AstStatement& stmt,
             continue;
         }
         if (bstmt.kind == AstStmtKind::Match) {
-            if (bstmt.expr.kind != AstExprKind::Ident && bstmt.expr.kind != AstExprKind::BoolLit &&
-                bstmt.expr.kind != AstExprKind::IntLit && bstmt.expr.kind != AstExprKind::StrLit)
-                return frontend_error(
-                    FrontendError::UnsupportedSyntax,
-                    bstmt.expr.span,
-                    lit_str("static for-loop match subject must be an existing value or "
-                            "literal"));
             if (loop.body.has_term)
                 return frontend_error(
                     FrontendError::UnsupportedSyntax,
@@ -17466,6 +17803,18 @@ static FrontendResult<u32> analyze_for_stmt(const AstStatement& stmt,
             auto subject = analyze_expr(
                 bstmt.expr, route, mod, route->locals.data, route->locals.len, nullptr);
             if (!subject) return core::make_unexpected(subject.error());
+            if (hir_expr_contains_upstream_mark(subject.value()))
+                return frontend_error(
+                    FrontendError::UnsupportedSyntax,
+                    bstmt.expr.span,
+                    lit_str("upstream.mark cannot be used as a static for-loop match subject"));
+            if (bstmt.expr.kind != AstExprKind::Ident && bstmt.expr.kind != AstExprKind::BoolLit &&
+                bstmt.expr.kind != AstExprKind::IntLit && bstmt.expr.kind != AstExprKind::StrLit)
+                return frontend_error(
+                    FrontendError::UnsupportedSyntax,
+                    bstmt.expr.span,
+                    lit_str("static for-loop match subject must be an existing value or "
+                            "literal"));
             if (subject->may_nil || subject->may_error)
                 return frontend_error(FrontendError::UnsupportedSyntax, bstmt.expr.span);
             if (subject->type == HirTypeKind::I64)
@@ -17578,6 +17927,12 @@ static FrontendResult<u32> analyze_for_stmt(const AstStatement& stmt,
                                                       route->locals.len,
                                                       nullptr);
                     if (!inner_subject) return core::make_unexpected(inner_subject.error());
+                    if (hir_expr_contains_upstream_mark(inner_subject.value()))
+                        return frontend_error(
+                            FrontendError::UnsupportedSyntax,
+                            nested_match_stmt->expr.span,
+                            lit_str("upstream.mark cannot be used as a static for-loop match "
+                                    "subject"));
                     if (inner_subject->may_nil || inner_subject->may_error)
                         return frontend_error(FrontendError::UnsupportedSyntax,
                                               nested_match_stmt->expr.span);
@@ -17958,6 +18313,12 @@ static FrontendResult<u32> analyze_for_stmt(const AstStatement& stmt,
                                                      arm_scoped_locals.len,
                                                      arm_binding_ptr);
                             if (!init) return core::make_unexpected(init.error());
+                            if (hir_expr_contains_upstream_mark(init.value()))
+                                return frontend_error(
+                                    FrontendError::UnsupportedSyntax,
+                                    inner.expr.span,
+                                    lit_str("upstream.mark cannot initialize a static for-loop "
+                                            "local"));
                             if (init->may_error && init->kind != HirExprKind::Error &&
                                 init->kind != HirExprKind::LocalRef)
                                 return frontend_error(
@@ -18263,6 +18624,12 @@ static FrontendResult<u32> analyze_for_stmt(const AstStatement& stmt,
                     auto inner_subject = analyze_expr(
                         arm_stmt->expr, route, mod, arm_locals, arm_local_count, arm_binding_ptr);
                     if (!inner_subject) return core::make_unexpected(inner_subject.error());
+                    if (hir_expr_contains_upstream_mark(inner_subject.value()))
+                        return frontend_error(
+                            FrontendError::UnsupportedSyntax,
+                            arm_stmt->expr.span,
+                            lit_str("upstream.mark cannot be used as a static for-loop match "
+                                    "subject"));
                     if (inner_subject->may_nil || inner_subject->may_error)
                         return frontend_error(FrontendError::UnsupportedSyntax,
                                               arm_stmt->expr.span);
@@ -18745,6 +19112,10 @@ static FrontendResult<void> validate_timer_route(const HirRoute& route,
     auto check_expr = [&](const HirExpr& e) -> FrontendResult<void> {
         if (hir_expr_uses_request(e))
             return frontend_error(FrontendError::UnsupportedSyntax, body_span, kTimerReqDetail);
+        if (hir_expr_contains_conditioned_upstream_mark(e))
+            return frontend_error(FrontendError::UnsupportedSyntax,
+                                  e.span,
+                                  lit_str("upstream.mark cannot be conditionally evaluated"));
         return {};
     };
     auto check_term = [&](const HirTerminator& t) -> FrontendResult<void> {
@@ -18877,6 +19248,10 @@ static FrontendResult<void> validate_timer_route(const HirRoute& route,
         for (u32 li = 0; li < body.term_locals.len; li++) {
             auto l_ok = check_expr(body.term_locals[li].init);
             if (!l_ok) return l_ok;
+        }
+        for (u32 ei = 0; ei < body.effects.len; ei++) {
+            auto e_ok = check_expr(body.effects[ei]);
+            if (!e_ok) return e_ok;
         }
         for (u32 gi = 0; gi < body.guards.len; gi++) {
             auto g_ok = check_guard(body.guards[gi]);
@@ -19417,7 +19792,7 @@ static FrontendResult<HirModule*> analyze_file_internal(
     for (u32 i = 0; i < file.items.len; i++) {
         const auto& item = file.items[i];
         if (item.kind != AstItemKind::Struct) continue;
-        if (item.struct_decl.name.eq({"Error", 5}))
+        if (item.struct_decl.name.eq({"Error", 5}) || item.struct_decl.name.eq({"Server", 6}))
             return frontend_error(
                 FrontendError::UnsupportedSyntax, item.struct_decl.span, item.struct_decl.name);
         if (find_struct_index(mod, item.struct_decl.name) != mod.structs.len)
@@ -19434,6 +19809,9 @@ static FrontendResult<HirModule*> analyze_file_internal(
     for (u32 i = 0; i < file.items.len; i++) {
         const auto& item = file.items[i];
         if (item.kind != AstItemKind::Variant) continue;
+        if (item.variant.name.eq({"Server", 6}))
+            return frontend_error(
+                FrontendError::UnsupportedSyntax, item.variant.span, item.variant.name);
         if (find_variant_index(mod, item.variant.name) != mod.variants.len)
             return frontend_error(
                 FrontendError::UnsupportedSyntax, item.variant.span, item.variant.name);
@@ -19448,6 +19826,9 @@ static FrontendResult<HirModule*> analyze_file_internal(
     for (u32 i = 0; i < file.items.len; i++) {
         const auto& item = file.items[i];
         if (item.kind != AstItemKind::TypeAlias) continue;
+        if (item.type_alias.name.eq({"Server", 6}))
+            return frontend_error(
+                FrontendError::UnsupportedSyntax, item.type_alias.span, item.type_alias.name);
         if (find_type_alias(mod, item.type_alias.name) != nullptr ||
             find_struct_index(mod, item.type_alias.name) < mod.structs.len ||
             find_variant_index(mod, item.type_alias.name) < mod.variants.len ||
@@ -20056,6 +20437,19 @@ static FrontendResult<HirModule*> analyze_file_internal(
         const auto& imp = imported_modules[ii];
         if (imp.module != nullptr && imp.module->caches.len > 0)
             return frontend_error(FrontendError::UnsupportedSyntax, imp.span, kCacheImportDetail);
+        if (imp.module == nullptr) continue;
+        for (u32 fi = 0; fi < imp.module->functions.len; fi++) {
+            const auto& fn = imp.module->functions[fi];
+            if (!imported_function_is_selected(imp, fi)) continue;
+            bool contains_mark = hir_expr_contains_upstream_mark(fn.body);
+            for (u32 ei = 0; !contains_mark && ei < fn.exprs.len; ei++)
+                contains_mark = hir_expr_contains_upstream_mark(fn.exprs[ei]);
+            for (u32 gi = 0; !contains_mark && gi < fn.respond_guards.len; gi++)
+                contains_mark = hir_expr_contains_upstream_mark(fn.respond_guards[gi].cond);
+            if (contains_mark)
+                return frontend_error(
+                    FrontendError::UnsupportedSyntax, imp.span, kUpstreamMarkImportDetail);
+        }
     }
 
     auto imported = merge_imported_functions(&mod, imported_modules);
@@ -20764,6 +21158,10 @@ static FrontendResult<HirModule*> analyze_file_internal(
             all_locals[all_local_count++] = scratch->locals[li];
         for (u32 li = 0; li < scratch->locals.len; li++) {
             const auto& local = scratch->locals[li];
+            if (hir_expr_contains_upstream_mark(local.init))
+                return frontend_error(FrontendError::UnsupportedSyntax,
+                                      local.span,
+                                      lit_str("upstream.mark cannot initialize a helper local"));
             u32 refs = count_function_param_refs(body.value(), local.ref_index, 2);
             for (u32 gi = 0; refs < 2 && gi < scratch->guards.len; gi++)
                 refs +=
@@ -20774,6 +21172,15 @@ static FrontendResult<HirModule*> analyze_file_internal(
                     local.span,
                     lit_str("reused helper-local arrays require a runtime local carrier"));
         }
+        if (hir_expr_contains_conditioned_upstream_mark(body.value()))
+            return frontend_error(FrontendError::UnsupportedSyntax,
+                                  ast_func.body->span,
+                                  lit_str("upstream.mark cannot be conditionally evaluated"));
+        for (u32 gi = 0; gi < scratch->guards.len; gi++)
+            if (hir_expr_contains_conditioned_upstream_mark(scratch->guards[gi].cond))
+                return frontend_error(FrontendError::UnsupportedSyntax,
+                                      scratch->guards[gi].cond.span,
+                                      lit_str("upstream.mark cannot be conditionally evaluated"));
         fn.exprs.len = 0;
         fn.expr_materialized_local_refs.len = 0;
         fn.respond_guards.len = 0;
@@ -22399,6 +22806,10 @@ static FrontendResult<HirModule*> analyze_file_internal(
             all_locals[all_local_count++] = scratch.locals[li];
         for (u32 li = 0; li < scratch.locals.len; li++) {
             const auto& local = scratch.locals[li];
+            if (hir_expr_contains_upstream_mark(local.init))
+                return frontend_error(FrontendError::UnsupportedSyntax,
+                                      local.span,
+                                      lit_str("upstream.mark cannot initialize a helper local"));
             bool visiting[AstFunctionDecl::kMaxParams + HirRoute::kMaxLocals]{};
             u32 refs = count_normalized_local_refs(body.value(),
                                                    local.ref_index,
@@ -22421,6 +22832,15 @@ static FrontendResult<HirModule*> analyze_file_internal(
                     local.span,
                     lit_str("reused helper-local arrays require a runtime local carrier"));
         }
+        if (hir_expr_contains_conditioned_upstream_mark(body.value()))
+            return frontend_error(FrontendError::UnsupportedSyntax,
+                                  item.func.body->span,
+                                  lit_str("upstream.mark cannot be conditionally evaluated"));
+        for (u32 gi = 0; gi < scratch.guards.len; gi++)
+            if (hir_expr_contains_conditioned_upstream_mark(scratch.guards[gi].cond))
+                return frontend_error(FrontendError::UnsupportedSyntax,
+                                      scratch.guards[gi].cond.span,
+                                      lit_str("upstream.mark cannot be conditionally evaluated"));
         fn.exprs.len = 0;
         fn.expr_materialized_local_refs.len = 0;
         fn.respond_guards.len = 0;
@@ -22589,6 +23009,7 @@ static FrontendResult<HirModule*> analyze_file_internal(
 
     u32 timer_count = 0;
     u32 http_route_count = 0;
+    u32 claimed_upstream_mark_mask = 0;
     for (u32 i = 0; i < file.items.len; i++) {
         const auto& item = file.items[i];
         if (item.kind != AstItemKind::Route && item.kind != AstItemKind::Timer) continue;
@@ -24645,6 +25066,12 @@ static FrontendResult<HirModule*> analyze_file_internal(
         if (route.is_timer) {
             auto timer_ok = validate_timer_route(route, mod, route_decl.body_span);
             if (!timer_ok) return core::make_unexpected(timer_ok.error());
+            if ((route.upstream_mark_mask & claimed_upstream_mark_mask) != 0)
+                return frontend_error(
+                    FrontendError::UnsupportedSyntax,
+                    route_decl.span,
+                    lit_str("an upstream may be marked by only one pinned timer"));
+            claimed_upstream_mark_mask |= route.upstream_mark_mask;
         }
         // Cap HTTP routes at kMaxRoutes even though the routes vector reserves extra
         // slots for synthesized timers — a timer must never consume HTTP capacity

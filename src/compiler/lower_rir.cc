@@ -2655,6 +2655,42 @@ static FrontendResult<rir::ValueId> materialize_value(const MirValue& value,
         if (!out) return frontend_error(FrontendError::OutOfMemory, span);
         return out.value();
     }
+    if (value.kind == MirValueKind::UpstreamMark) {
+        auto server = materialize_value(*value.lhs,
+                                        mir,
+                                        variant_infos,
+                                        tuple_infos,
+                                        tuple_info_count,
+                                        error_scalar_infos,
+                                        error_variant_infos,
+                                        error_struct_infos,
+                                        user_struct_defs,
+                                        b,
+                                        locals,
+                                        local_count,
+                                        span);
+        if (!server) return core::make_unexpected(server.error());
+        auto healthy = materialize_value(*value.rhs,
+                                         mir,
+                                         variant_infos,
+                                         tuple_infos,
+                                         tuple_info_count,
+                                         error_scalar_infos,
+                                         error_variant_infos,
+                                         error_struct_infos,
+                                         user_struct_defs,
+                                         b,
+                                         locals,
+                                         local_count,
+                                         span);
+        if (!healthy) return core::make_unexpected(healthy.error());
+        auto out = b.emit_upstream_mark(static_cast<u16>(value.int_value),
+                                        server.value(),
+                                        healthy.value(),
+                                        {span.line, span.col});
+        if (!out) return frontend_error(FrontendError::OutOfMemory, span);
+        return out.value();
+    }
     if (value.kind == MirValueKind::ReqSetHeader || value.kind == MirValueKind::ReqAddHeader) {
         if (value.lhs == nullptr) return frontend_error(FrontendError::UnsupportedSyntax, span);
         auto val = materialize_value(*value.lhs,
@@ -4128,6 +4164,7 @@ FrontendResult<void> lower_to_rir(const MirModule& mir, FrontendRirModule& out) 
         fn.value()->is_timer = mir.functions[i].is_timer;
         fn.value()->timer_interval_ms = mir.functions[i].timer_interval_ms;
         fn.value()->timer_shard = mir.functions[i].timer_shard;
+        fn.value()->upstream_mark_mask = mir.functions[i].upstream_mark_mask;
         if (mir.functions[i].waits.len > 0) {
             u32 ms_list[MirFunction::kMaxWaits]{};
             u8 kind_list[MirFunction::kMaxWaits]{};

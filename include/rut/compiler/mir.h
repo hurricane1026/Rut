@@ -96,6 +96,7 @@ enum class MirValueKind : u8 {
     WaitField,
     CacheGet,
     CacheSet,
+    UpstreamMark,
     JsonBuild,
     AdminJson,
 };
@@ -365,6 +366,7 @@ struct MirFunction {
     bool is_timer = false;
     u32 timer_interval_ms = 0;
     i32 timer_shard = -1;
+    u32 upstream_mark_mask = 0;
 
     MirFunction() = default;
     MirFunction(const MirFunction& other)
@@ -384,7 +386,8 @@ struct MirFunction {
           throttle_down_bps(other.throttle_down_bps),
           is_timer(other.is_timer),
           timer_interval_ms(other.timer_interval_ms),
-          timer_shard(other.timer_shard) {
+          timer_shard(other.timer_shard),
+          upstream_mark_mask(other.upstream_mark_mask) {
         for (u32 i = 0; i < kMaxWaits + 1; i++) resume_blocks[i] = other.resume_blocks[i];
         rebase_from(other);
     }
@@ -408,6 +411,7 @@ struct MirFunction {
         is_timer = other.is_timer;
         timer_interval_ms = other.timer_interval_ms;
         timer_shard = other.timer_shard;
+        upstream_mark_mask = other.upstream_mark_mask;
         rebase_from(other);
         return *this;
     }
@@ -428,7 +432,8 @@ struct MirFunction {
           throttle_down_bps(other.throttle_down_bps),
           is_timer(other.is_timer),
           timer_interval_ms(other.timer_interval_ms),
-          timer_shard(other.timer_shard) {
+          timer_shard(other.timer_shard),
+          upstream_mark_mask(other.upstream_mark_mask) {
         for (u32 i = 0; i < kMaxWaits + 1; i++) resume_blocks[i] = other.resume_blocks[i];
         rebase_from(other);
     }
@@ -452,6 +457,7 @@ struct MirFunction {
         is_timer = other.is_timer;
         timer_interval_ms = other.timer_interval_ms;
         timer_shard = other.timer_shard;
+        upstream_mark_mask = other.upstream_mark_mask;
         rebase_from(other);
         return *this;
     }

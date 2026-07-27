@@ -379,6 +379,17 @@ u8 rut_helper_upstream_mark(
                : 0;
 }
 
+u8 rut_helper_upstream_mark_checked(void* ctx,
+                                    u64 config_generation,
+                                    u16 receiver_upstream_id,
+                                    u16 server_upstream_id,
+                                    u16 backend_id,
+                                    u8 healthy) {
+    if (receiver_upstream_id != server_upstream_id) return 0;
+    return rut_helper_upstream_mark(
+        ctx, config_generation, server_upstream_id, backend_id, healthy);
+}
+
 void rut_helper_json_append_bool(u8 value) {
     json_append(value != 0 ? "true" : "false", value != 0 ? 4 : 5);
 }

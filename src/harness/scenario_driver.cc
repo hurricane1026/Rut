@@ -589,6 +589,8 @@ ScenarioResult drive_scenario(const ScenarioSpec& scenario, const HarnessSpec& h
             *snapshot = *scenario.control_plane_snapshot;
         }
         execution.frame.context.control_plane_mutation = scenario.control_plane_mutation;
+        execution.frame.context.config_generation =
+            scenario.target->program.config.config_generation;
         execution.frame.context.route_param_count = route_param_count;
         for (u32 i = 0; i < route_param_count; i++)
             execution.frame.context.route_params[i] = route_params[i];

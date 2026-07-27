@@ -1321,6 +1321,50 @@ TEST(control_plane_mutation, activation_keys_runtime_tokens_by_stable_identity) 
     concurrency.release(moved_users);
 }
 
+TEST(control_plane_mutation, activation_carries_overrides_across_marking_policy_changes) {
+    for (u64 candidate_policy : {u64{0}, u64{22}}) {
+        ControlPlaneMutationPort port;
+        RouteConfig old_config;
+        REQUIRE(old_config.add_upstream("users", 0x7f000001u, 8000).has_value());
+        old_config.upstreams[0].marking_policy_identity = 11;
+        port.reset(3, true, &old_config);
+        REQUIRE(port.mark({3, 0, 0}, false));
+
+        u64 id = 0;
+        REQUIRE(port.request_reload(ReloadRequestSource::Route, &id));
+        ReloadRequest request{};
+        REQUIRE(port.take_reload(&request));
+        RouteConfig new_config;
+        REQUIRE(new_config.add_upstream("users", 0x7f000001u, 8000).has_value());
+        new_config.upstreams[0].marking_policy_identity = candidate_policy;
+        REQUIRE(port.complete_reload(
+            id, request.source, ReloadTerminalOutcome::Activated, 4, &new_config));
+
+        CHECK_EQ(port.manual_health({4, 0, 0}), ManualHealthOverride::Unhealthy);
+    }
+}
+
+TEST(control_plane_mutation, activation_carries_overrides_for_same_marking_policy) {
+    ControlPlaneMutationPort port;
+    RouteConfig old_config;
+    REQUIRE(old_config.add_upstream("users", 0x7f000001u, 8000).has_value());
+    old_config.upstreams[0].marking_policy_identity = 11;
+    port.reset(3, true, &old_config);
+    REQUIRE(port.mark({3, 0, 0}, false));
+
+    u64 id = 0;
+    REQUIRE(port.request_reload(ReloadRequestSource::Route, &id));
+    ReloadRequest request{};
+    REQUIRE(port.take_reload(&request));
+    RouteConfig new_config;
+    REQUIRE(new_config.add_upstream("users", 0x7f000001u, 8000).has_value());
+    new_config.upstreams[0].marking_policy_identity = 11;
+    REQUIRE(
+        port.complete_reload(id, request.source, ReloadTerminalOutcome::Activated, 4, &new_config));
+
+    CHECK_EQ(port.manual_health({4, 0, 0}), ManualHealthOverride::Unhealthy);
+}
+
 TEST(control_plane_mutation, activation_rejects_skipped_generation) {
     ControlPlaneMutationPort port;
     RouteConfig old_config;
