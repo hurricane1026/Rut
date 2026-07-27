@@ -5844,6 +5844,17 @@ TEST(buffered_forward, final_status_normalizes_content_range) {
     };
     header_count = 1;
     CHECK(normalize_partial_content_headers(multipart, &header_count, 206, 123, true));
+    static const char kJsonValue[] = "application/json";
+    ResponseHeaderKV ambiguous_multipart[] = {
+        {kContentTypeName, sizeof(kContentTypeName) - 1, kJsonValue, sizeof(kJsonValue) - 1},
+        {kContentTypeName,
+         sizeof(kContentTypeName) - 1,
+         kMultipartValue,
+         sizeof(kMultipartValue) - 1},
+    };
+    header_count = 2;
+    CHECK_FALSE(
+        normalize_partial_content_headers(ambiguous_multipart, &header_count, 206, 123, true));
 
     static const char kBareMultipartValue[] = "multipart/byteranges";
     ResponseHeaderKV bare_multipart[] = {
@@ -5882,7 +5893,8 @@ TEST(buffered_forward, status_mutations_enforce_partial_content_metadata) {
     const auto run = [&](u16 upstream_status,
                          bool upstream_has_range,
                          u16 final_status,
-                         bool mutate_status = true) {
+                         bool mutate_status = true,
+                         bool multipart = false) {
         SmallLoop loop;
         loop.setup();
         auto* conn = setup_proxy_conn(loop);
@@ -5900,6 +5912,7 @@ TEST(buffered_forward, status_mutations_enforce_partial_content_metadata) {
             (upstream_status == 206 ? " Partial Content\r\n" : " OK\r\n") +
             "Content-Length: 4\r\n" +
             (upstream_has_range ? "Content-Range: bytes 0-3/100\r\n" : "") +
+            (multipart ? "Content-Type: multipart/byteranges; boundary=origin\r\n" : "") +
             "Connection: close\r\n\r\ndata";
         conn->upstream_recv_buf.reset();
         conn->upstream_recv_buf.write(reinterpret_cast<const u8*>(upstream.data()),
@@ -5924,6 +5937,13 @@ TEST(buffered_forward, status_mutations_enforce_partial_content_metadata) {
     const auto invalid_upstream_partial = run(206, false, 206, false);
     CHECK_EQ(invalid_upstream_partial.first, 502u);
     CHECK(invalid_upstream_partial.second.find("Content-Range") == std::string::npos);
+
+    const auto invalid_multipart_full = run(206, false, 200, true, true);
+    CHECK_EQ(invalid_multipart_full.first, 500u);
+
+    const auto partial_not_modified = run(206, true, 304);
+    CHECK_EQ(partial_not_modified.first, 304u);
+    CHECK(partial_not_modified.second.find("Content-Length: 4") == std::string::npos);
 }
 
 TEST(buffered_forward, head_206_without_content_length_keeps_structural_range) {
@@ -6193,7 +6213,9 @@ TEST(buffered_forward, h2_validates_head_ranges_and_replaced_multipart_bodies) {
                          u32 body_len,
                          bool is_head,
                          bool replace_body,
-                         u16 expected_status) {
+                         u16 expected_status,
+                         u16 mutated_status = 0,
+                         bool expect_content_length = false) {
         SmallLoop loop;
         loop.setup();
         loop.inject_and_dispatch(make_ev(0, IoEventType::Accept, 42));
@@ -6205,22 +6227,28 @@ TEST(buffered_forward, h2_validates_head_ranges_and_replaced_multipart_bodies) {
         h2.init();
         h2.async_stream = 1;
         h2.async_kind = H2AsyncKind::Proxy;
-        h2.async_apply_response_mutations = replace_body;
+        h2.async_apply_response_mutations = replace_body || mutated_status != 0;
         conn->h2 = &h2;
         conn->protocol = ConnProtocol::Http2;
         conn->state = ConnState::Proxying;
         conn->upstream_fd = dup(2);
         REQUIRE(conn->upstream_fd >= 0);
         conn->reset_jit_ctx();
-        if (replace_body) {
+        if (replace_body || mutated_status != 0) {
             auto* ctx = h2.async_jit_ctx();
-            static constexpr char kReplacement[] = "rewritten";
-            ctx->response_body_mutation_storage = jit::acquire_response_body_mutation_storage();
-            REQUIRE(ctx->response_body_mutation_storage != nullptr);
-            __builtin_memcpy(
-                ctx->response_body_mutation_storage, kReplacement, sizeof(kReplacement) - 1);
-            ctx->response_body_mutation_len = sizeof(kReplacement) - 1;
-            ctx->response_body_mutation_set = true;
+            if (replace_body) {
+                static constexpr char kReplacement[] = "rewritten";
+                ctx->response_body_mutation_storage = jit::acquire_response_body_mutation_storage();
+                REQUIRE(ctx->response_body_mutation_storage != nullptr);
+                __builtin_memcpy(
+                    ctx->response_body_mutation_storage, kReplacement, sizeof(kReplacement) - 1);
+                ctx->response_body_mutation_len = sizeof(kReplacement) - 1;
+                ctx->response_body_mutation_set = true;
+            }
+            if (mutated_status != 0) {
+                ctx->response_status = mutated_status;
+                ctx->response_status_set = true;
+            }
         }
 
         conn->upstream_recv_buf.write(reinterpret_cast<const u8*>(upstream), upstream_len);
@@ -6252,12 +6280,16 @@ TEST(buffered_forward, h2_validates_head_ranges_and_replaced_multipart_bodies) {
                                            16,
                                            &header_count));
         u16 status = 0;
+        bool found_content_length = false;
         for (u32 i = 0; i < header_count; i++) {
-            if (!headers[i].name.eq(Str{":status", 7})) continue;
-            for (u32 j = 0; j < headers[i].value.len; j++)
-                status = static_cast<u16>(status * 10 + headers[i].value.ptr[j] - '0');
+            if (headers[i].name.eq(Str{":status", 7})) {
+                for (u32 j = 0; j < headers[i].value.len; j++)
+                    status = static_cast<u16>(status * 10 + headers[i].value.ptr[j] - '0');
+            }
+            found_content_length |= headers[i].name.eq(Str{"content-length", 14});
         }
         CHECK_EQ(status, expected_status);
+        CHECK_EQ(found_content_length, expect_content_length);
         conn->h2 = nullptr;
     };
 
@@ -6269,6 +6301,12 @@ TEST(buffered_forward, h2_validates_head_ranges_and_replaced_multipart_bodies) {
         "HTTP/1.1 206 Partial Content\r\nContent-Length: 4\r\n"
         "Content-Type: multipart/byteranges; boundary=origin\r\n\r\ndata";
     run(kMultipart, sizeof(kMultipart) - 1, 4, false, true, 500);
+    run(kMultipart, sizeof(kMultipart) - 1, 4, false, false, 500, 200);
+
+    static constexpr char kPartialNotModified[] =
+        "HTTP/1.1 206 Partial Content\r\nContent-Length: 4\r\n"
+        "Content-Range: bytes 0-3/100\r\n\r\ndata";
+    run(kPartialNotModified, sizeof(kPartialNotModified) - 1, 4, false, false, 304, 304, false);
 }
 
 TEST(buffered_forward, h2_bodyless_head_and_304_allow_unsupported_transfer_coding) {
@@ -6764,6 +6802,10 @@ TEST(buffered_forward, clears_bytes_from_an_abandoned_upstream_wait) {
     REQUIRE(config.add_upstream("api", 0x7f000001, 8080).has_value());
     conn->request_config = &config;
     conn->reset_jit_ctx();
+    conn->upstream_fd = dup(2);
+    REQUIRE(conn->upstream_fd >= 0);
+    conn->upstream_recv_armed = true;
+    conn->on_upstream_recv = &on_upstream_response<SmallLoop>;
     static const char kStale[] = "HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n";
     conn->upstream_recv_buf.write(reinterpret_cast<const u8*>(kStale), sizeof(kStale) - 1);
 
@@ -6773,6 +6815,9 @@ TEST(buffered_forward, clears_bytes_from_an_abandoned_upstream_wait) {
     handle_jit_outcome<SmallLoop>(&loop, *conn, outcome, nullptr, true);
 
     CHECK_EQ(conn->upstream_recv_buf.len(), 0u);
+    CHECK(conn->upstream_abandoned);
+    CHECK(conn->h2_proxy_recv_draining);
+    CHECK_EQ(conn->on_upstream_recv, nullptr);
 }
 
 TEST(buffered_forward, drains_partial_client_sends_before_completion) {

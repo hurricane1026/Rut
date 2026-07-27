@@ -1906,7 +1906,32 @@ void handle_jit_outcome(Loop* loop,
                 client_send(loop, conn, conn.send_buf.data(), conn.send_buf.len());
                 return;
             }
-            if (conn.proxy_response_buffered) {
+            const bool had_prior_upstream =
+                conn.upstream_fd >= 0 || conn.upstream_recv_armed || conn.upstream_send_armed;
+            if (had_prior_upstream) {
+                /*
+                 * A resumed handler can select a new forward while an io_uring
+                 * multishot recv from its wait(upstream.recv()) is still armed.
+                 * Detach that episode before installing callbacks for the new
+                 * one, and quarantine the shared UpstreamRecv user_data until
+                 * the old terminal CQE drains.
+                 */
+                conn.on_upstream_recv = nullptr;
+                conn.on_upstream_send = nullptr;
+                conn.upstream_abandoned = true;
+                if (conn.upstream_recv_armed) conn.h2_proxy_recv_draining = true;
+                if (conn.upstream_fd >= 0) {
+                    ::close(conn.upstream_fd);
+                    conn.upstream_fd = -1;
+                    loop->clear_upstream_fd(conn.id);
+                }
+                if constexpr (requires { loop->discard_upstream_send(conn); })
+                    loop->discard_upstream_send(conn);
+                conn.upstream_recv_armed = false;
+                conn.upstream_send_armed = false;
+                conn.upstream_idx = 0;
+            }
+            if (conn.proxy_response_buffered || had_prior_upstream) {
                 // A preceding upstream wait may have left response bytes in this
                 // shared buffer. They belong to the abandoned episode, not the
                 // upstream selected by this terminal forward.
@@ -2564,6 +2589,29 @@ void on_upstream_request_sent(void* lp, Connection& conn, IoEvent ev) {
         return;
     }
 
+    /*
+     * Do not install this episode's upstream-recv callback while the terminal
+     * CQE for a prior multishot receive is still outstanding: both episodes use
+     * the same (connection id, UpstreamRecv) dispatch key.
+     */
+    if (conn.h2_proxy_recv_draining) {
+        if (conn.upstream_fd >= 0) {
+            ::close(conn.upstream_fd);
+            conn.upstream_fd = -1;
+            loop->clear_upstream_fd(conn.id);
+        }
+        conn.upstream_abandoned = true;
+        conn.upstream_recv_armed = false;
+        conn.upstream_send_armed = false;
+        format_static_response(
+            conn, 502, false, conn.req_method == static_cast<u8>(LogHttpMethod::Head));
+        conn.keep_alive = false;
+        conn.resp_status = kStatusBadGateway;
+        conn.transition_to_sending(&on_response_sent<Loop>);
+        client_send(loop, conn, conn.send_buf.data(), conn.send_buf.len());
+        return;
+    }
+
     const bool kMoreReqBody =
         (conn.req_body_mode == BodyMode::ContentLength && conn.req_body_remaining > 0) ||
         (conn.req_body_mode == BodyMode::Chunked &&
@@ -2780,10 +2828,23 @@ inline bool content_type_is_multipart_byteranges(Str value) {
 }
 
 inline bool response_is_multipart_byteranges(const ResponseHeaderKV* headers, u32 header_count) {
+    u32 content_type_count = 0;
+    bool multipart = false;
     for (u32 i = 0; i < header_count; i++) {
         if (!http_header_name_eq_ci(headers[i].key_data, headers[i].key_len, "content-type", 12))
             continue;
-        if (content_type_is_multipart_byteranges({headers[i].value_data, headers[i].value_len}))
+        content_type_count++;
+        multipart =
+            content_type_is_multipart_byteranges({headers[i].value_data, headers[i].value_len});
+    }
+    return content_type_count == 1 && multipart;
+}
+
+inline bool upstream_response_is_multipart_byteranges(const ParsedResponse& resp) {
+    for (u32 i = 0; i < resp.header_count; i++) {
+        const Str name = resp.headers[i].name;
+        if (http_header_name_eq_ci(name.ptr, name.len, "content-type", 12) &&
+            content_type_is_multipart_byteranges(resp.headers[i].value))
             return true;
     }
     return false;
@@ -3032,6 +3093,13 @@ void h2_proxy_finish(Loop* loop,
     }
     const bool response_body_mutated =
         response_ctx != nullptr && response_ctx->response_body_mutation_set;
+    const bool final_status_carries_body =
+        status >= 200 && status != 204 && status != 205 && status != 304;
+    if (mutations_valid && resp.status_code == 206 && status != 206 && final_status_carries_body &&
+        !response_body_mutated && upstream_response_is_multipart_byteranges(resp)) {
+        mutations_valid = false;
+        status = 500;
+    }
     const u64 range_representation_length =
         is_head && !response_body_mutated && resp.has_content_length ? resp.content_length
                                                                      : body_len;
@@ -3049,7 +3117,8 @@ void h2_proxy_finish(Loop* loop,
     char replacement_content_length[10];
     u32 replacement_content_length_len = 0;
     const bool preserve_upstream_representation_length =
-        mutations_valid && status == 304 && !response_body_mutated && resp.has_content_length;
+        mutations_valid && status == 304 && resp.status_code != 206 && !response_body_mutated &&
+        resp.has_content_length;
     const bool declare_mutated_head_length = mutations_valid && is_head && response_body_mutated &&
                                              !status_forbids_content_length && status != 304;
     if (preserve_upstream_representation_length || declare_mutated_head_length) {
@@ -3063,8 +3132,10 @@ void h2_proxy_finish(Loop* loop,
         for (u32 i = 0; i < replacement_content_length_len; i++)
             replacement_content_length[i] = reversed[replacement_content_length_len - i - 1];
     }
-    if (mutations_valid && (status_forbids_content_length || replacement_content_length_len != 0 ||
-                            (response_body_mutated && status == 304))) {
+    const bool drop_partial_payload_length = status == 304 && resp.status_code == 206;
+    if (mutations_valid &&
+        (status_forbids_content_length || replacement_content_length_len != 0 ||
+         (response_body_mutated && status == 304) || drop_partial_payload_length)) {
         for (u32 i = 0; i < effective_count;) {
             if (!http_header_name_eq_ci(
                     effective[i].key_data, effective[i].key_len, "content-length", 14)) {
@@ -4910,6 +4981,14 @@ void finish_buffered_forward(Loop* loop,
         body = response_ctx->response_body_mutation_storage;
         body_len = response_ctx->response_body_mutation_len;
     }
+    const bool final_status_carries_body =
+        status >= 200 && status != 204 && status != 205 && status != 304;
+    if (resp.status_code == 206 && status != 206 && final_status_carries_body &&
+        !response_ctx->response_body_mutation_set &&
+        upstream_response_is_multipart_byteranges(resp)) {
+        buffered_forward_fail(loop, conn, 500);
+        return;
+    }
     const u32 representation_body_len = body_len;
     const u64 range_representation_length =
         is_head && !response_ctx->response_body_mutation_set && resp.has_content_length
@@ -4927,7 +5006,8 @@ void finish_buffered_forward(Loop* loop,
         status < 200 || status == 204 || status == 205 || status == 304;
     const bool status_omits_content_length = status < 200 || status == 204;
     const bool has_known_representation_length =
-        (!response_ctx->response_body_mutation_set && resp.has_content_length) ||
+        (!response_ctx->response_body_mutation_set && resp.has_content_length &&
+         (status != 304 || resp.status_code != 206)) ||
         (is_head && response_ctx->response_body_mutation_set && !status_forbids_body);
     const bool omit_unknown_representation_length =
         (is_head || status == 304) && !has_known_representation_length;
@@ -4956,8 +5036,10 @@ void finish_buffered_forward(Loop* loop,
         !response_ctx->response_body_mutation_set,
         is_head,
         ((is_head && !status_forbids_body) || status == 304) &&
-            !response_ctx->response_body_mutation_set && resp.has_content_length,
+            !response_ctx->response_body_mutation_set && resp.has_content_length &&
+            (status != 304 || resp.status_code != 206),
         !response_ctx->response_body_mutation_set && resp.has_content_length &&
+                (status != 304 || resp.status_code != 206) &&
                 ((is_head && !status_forbids_body) || status == 304)
             ? resp.content_length
         : is_head && response_ctx->response_body_mutation_set && !status_forbids_body
