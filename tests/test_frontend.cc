@@ -678,8 +678,8 @@ static MarkdownLinkReferenceTitle markdown_link_reference_title_state(std::strin
             escaped = true;
             continue;
         }
-        if ((c == '\r' && (pos + 1 == line.size() || line[pos + 1] != '\n')) ||
-            (opener == '(' && c == '('))
+        if (c == '\r' && pos + 1 == line.size()) return MarkdownLinkReferenceTitle::MayContinue;
+        if ((c == '\r' && line[pos + 1] != '\n') || (opener == '(' && c == '('))
             return MarkdownLinkReferenceTitle::None;
         if (c == '\n' && pos + 1 < line.size() && line[pos + 1] == '\n')
             return MarkdownLinkReferenceTitle::None;
@@ -820,18 +820,21 @@ enum class MarkdownLinkReferenceContinuation {
     Invalid,
 };
 
-static std::string_view markdown_block_content(std::string_view content);
-static bool markdown_interrupts_paragraph(std::string_view content, bool has_preceding_paragraph);
+static std::string_view markdown_block_content(std::string_view content, size_t initial_column = 0);
+static bool markdown_interrupts_paragraph(std::string_view content,
+                                          bool has_preceding_paragraph = true,
+                                          size_t initial_column = 0);
 static std::string markdown_raw_html_end_marker(std::string_view content,
                                                 bool* can_interrupt_paragraph);
 static bool markdown_is_indented_code_block(std::string_view content, size_t content_column);
 
-static bool markdown_opens_interrupting_block(std::string_view content) {
-    if (markdown_interrupts_paragraph(content, true)) return true;
+static bool markdown_opens_interrupting_block(std::string_view content, size_t content_column = 0) {
+    if (markdown_interrupts_paragraph(content, true, content_column)) return true;
     MarkdownFence opening{};
-    if (parse_markdown_fence_open_content(content, &opening)) return true;
+    if (parse_markdown_fence_open_content(content, &opening, content_column)) return true;
     bool can_interrupt_paragraph = true;
-    return !markdown_raw_html_end_marker(markdown_block_content(content), &can_interrupt_paragraph)
+    return !markdown_raw_html_end_marker(markdown_block_content(content, content_column),
+                                         &can_interrupt_paragraph)
                 .empty() &&
            can_interrupt_paragraph;
 }
@@ -854,8 +857,9 @@ static MarkdownLinkReferenceContinuation markdown_take_link_reference_continuati
         return MarkdownLinkReferenceContinuation::None;
     }
     if ((*pending == MarkdownLinkReferenceDefinition::LabelMayContinue ||
-         *pending == MarkdownLinkReferenceDefinition::DestinationMayContinue) &&
-        markdown_opens_interrupting_block(content)) {
+         *pending == MarkdownLinkReferenceDefinition::DestinationMayContinue ||
+         *pending == MarkdownLinkReferenceDefinition::OpenTitleMayContinue) &&
+        markdown_opens_interrupting_block(content, content_column)) {
         *pending = MarkdownLinkReferenceDefinition::None;
         pending_text->clear();
         expected_container->clear();
@@ -877,7 +881,7 @@ static MarkdownLinkReferenceContinuation markdown_take_link_reference_continuati
             *pending = MarkdownLinkReferenceDefinition::None;
             pending_text->clear();
             expected_container->clear();
-            return MarkdownLinkReferenceContinuation::None;
+            return MarkdownLinkReferenceContinuation::Invalid;
         }
         if (title == MarkdownLinkReferenceTitle::Complete) {
             *pending = MarkdownLinkReferenceDefinition::None;
@@ -1092,7 +1096,8 @@ static std::string markdown_raw_html_end_marker(std::string_view content,
     for (const auto tag : block_tags) {
         if (!lower.substr(tag_start).starts_with(tag)) continue;
         const size_t end = tag_start + tag.size();
-        if (end == lower.size() || lower[end] == ' ' || lower[end] == '\t' || lower[end] == '>' ||
+        if (end == lower.size() || lower[end] == ' ' || lower[end] == '\t' || lower[end] == '\n' ||
+            lower[end] == '\r' || lower[end] == '\f' || lower[end] == '\v' || lower[end] == '>' ||
             (lower[end] == '/' && end + 1 < lower.size() && lower[end + 1] == '>'))
             return std::string(1, kMarkdownRawHtmlBlankLine);
     }
@@ -1110,13 +1115,10 @@ static std::string markdown_raw_html_end_marker(std::string_view content,
     return {};
 }
 
-static std::string_view markdown_block_content(std::string_view content);
-
 static bool markdown_interrupts_paragraph(std::string_view content,
-                                          bool has_preceding_paragraph = true) {
-    size_t indent = 0;
-    while (indent < content.size() && indent < 3 && content[indent] == ' ') indent++;
-    content.remove_prefix(indent);
+                                          bool has_preceding_paragraph,
+                                          size_t initial_column) {
+    content = markdown_block_content(content, initial_column);
     size_t pos = 0;
     while (pos < content.size() && pos < 6 && content[pos] == '#') pos++;
     if (pos != 0 && (pos == content.size() || content[pos] == ' ' || content[pos] == '\t' ||
@@ -1159,10 +1161,16 @@ static bool markdown_is_lazy_paragraph_continuation(std::string_view line) {
     return !parse_markdown_fence_open_content(content, &opening);
 }
 
-static std::string_view markdown_block_content(std::string_view content) {
-    size_t indent = 0;
-    while (indent < content.size() && indent < 3 && content[indent] == ' ') indent++;
-    return content.substr(indent);
+static std::string_view markdown_block_content(std::string_view content, size_t initial_column) {
+    size_t pos = 0;
+    size_t column = initial_column;
+    while (pos < content.size() && (content[pos] == ' ' || content[pos] == '\t')) {
+        const size_t next = markdown_next_column(column, content[pos]);
+        if (next - initial_column > 3) break;
+        column = next;
+        pos++;
+    }
+    return content.substr(pos);
 }
 
 static bool markdown_is_indented_code_block(std::string_view content, size_t content_column = 0) {
@@ -1505,6 +1513,8 @@ TEST(frontend, language_card_recognizes_link_reference_definitions) {
              MarkdownLinkReferenceDefinition::OpenTitleMayContinue);
     CHECK_EQ(markdown_link_reference_definition("[foo]: /url \"multi\nline\""),
              MarkdownLinkReferenceDefinition::Complete);
+    CHECK_EQ(markdown_link_reference_title_state("\"multi\r", false),
+             MarkdownLinkReferenceTitle::MayContinue);
     CHECK(markdown_link_reference_title("  \"title\"", true));
     CHECK(markdown_link_reference_title("(title)", true));
     CHECK_FALSE(markdown_link_reference_title("  ordinary paragraph", true));
@@ -1617,11 +1627,21 @@ TEST(frontend, language_card_recognizes_link_reference_definitions) {
              MarkdownLinkReferenceContinuation::Consumed);
     CHECK_EQ(pending, MarkdownLinkReferenceDefinition::None);
 
+    for (const char* opener : {"# heading", "<div>", "~~~~rut"}) {
+        pending = MarkdownLinkReferenceDefinition::OpenTitleMayContinue;
+        pending_text = "[foo]: /url \"multi";
+        CHECK_EQ(markdown_take_link_reference_continuation(
+                     opener, {}, &pending, &pending_text, &expected_container),
+                 MarkdownLinkReferenceContinuation::None);
+        CHECK_EQ(pending, MarkdownLinkReferenceDefinition::None);
+    }
+
     pending = MarkdownLinkReferenceDefinition::TitleMayContinue;
     pending_text = "[foo]: /url";
     CHECK_EQ(markdown_take_link_reference_continuation(
                  "ordinary paragraph", {}, &pending, &pending_text, &expected_container),
-             MarkdownLinkReferenceContinuation::None);
+             MarkdownLinkReferenceContinuation::Invalid);
+    CHECK_EQ(pending, MarkdownLinkReferenceDefinition::None);
 }
 
 TEST(frontend, language_card_retains_normalized_interrupting_content) {
@@ -1658,6 +1678,8 @@ TEST(frontend, language_card_open_list_paragraph_preserves_absolute_content_colu
     CHECK_FALSE(markdown_is_indented_code_block(content, content_column));
     MarkdownFence opening{};
     CHECK(parse_markdown_fence_open_content(content, &opening, content_column));
+    CHECK_EQ(markdown_block_content("\t<div>", content_column), "<div>");
+    CHECK(markdown_interrupts_paragraph("\t# heading", true, content_column));
 }
 
 TEST(frontend, language_card_partial_lazy_continuation_strips_present_prefix) {
@@ -1754,6 +1776,11 @@ TEST(frontend, language_card_nested_container_uses_outer_absolute_column) {
     CHECK_EQ(nested[0].kind, MarkdownContainerSegment::Kind::Blockquote);
     MarkdownFence fence{};
     CHECK(parse_markdown_fence_open_content(content, &fence, content_column));
+}
+
+TEST(frontend, language_card_block_html_accepts_commonmark_whitespace) {
+    for (const char* opener : {"<div\f>", "<div\v>"})
+        CHECK_FALSE(markdown_raw_html_end_marker(opener).empty());
 }
 
 TEST(frontend, language_card_wide_list_tab_padding_retains_residual_columns) {
@@ -2072,9 +2099,13 @@ TEST(frontend, language_card_unmarked_rut_examples_parse_and_typecheck) {
                 std::string_view outer_content;
                 std::string normalized_outer_content;
                 std::string normalized_interrupting_content;
+                size_t outer_content_column = 0;
                 bool replaced_nested_container = false;
-                if (markdown_strip_container(
-                        line, paragraph_container, &outer_content, &normalized_outer_content)) {
+                if (markdown_strip_container(line,
+                                             paragraph_container,
+                                             &outer_content,
+                                             &normalized_outer_content,
+                                             &outer_content_column)) {
                     std::vector<MarkdownContainerSegment> nested_container;
                     interrupting_content =
                         markdown_container_content(outer_content,
@@ -2082,7 +2113,9 @@ TEST(frontend, language_card_unmarked_rut_examples_parse_and_typecheck) {
                                                    nullptr,
                                                    &nested_container,
                                                    false,
-                                                   &normalized_interrupting_content);
+                                                   &normalized_interrupting_content,
+                                                   nullptr,
+                                                   outer_content_column);
                     interrupting_container = paragraph_container;
                     interrupting_container.insert(interrupting_container.end(),
                                                   nested_container.begin(),
@@ -2308,7 +2341,8 @@ TEST(frontend, language_card_unmarked_rut_examples_parse_and_typecheck) {
                 }
                 continue;
             }
-            const std::string_view skip_content = markdown_block_content(container_content);
+            const std::string_view skip_content =
+                markdown_block_content(container_content, container_content_column);
             if (skip_content.starts_with(kMarkdownSkipPrefix)) {
                 REQUIRE_MSG(!pending_skip, "skip markers cannot be stacked");
                 REQUIRE_MSG(markdown_skip_marker_has_reason(skip_content),
@@ -2319,12 +2353,13 @@ TEST(frontend, language_card_unmarked_rut_examples_parse_and_typecheck) {
                 paragraph_container.clear();
                 continue;
             }
-            const std::string_view block_content = markdown_block_content(container_content);
+            const std::string_view block_content =
+                markdown_block_content(container_content, container_content_column);
             const bool indented_code =
                 !paragraph_open &&
                 markdown_is_indented_code_block(container_content, container_content_column);
-            const bool interrupts_paragraph =
-                markdown_interrupts_paragraph(container_content, paragraph_open);
+            const bool interrupts_paragraph = markdown_interrupts_paragraph(
+                container_content, paragraph_open, container_content_column);
             if (interrupts_paragraph) {
                 paragraph_open = false;
                 paragraph_container.clear();
