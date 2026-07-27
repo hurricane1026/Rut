@@ -4782,8 +4782,9 @@ All operations O(1). One timerfd drives the entire wheel per shard.
 
 ## 10. Hot Reload
 
-> **Superseded design.** This section is retained as historical implementation
-> background only. The normative hot-reload contract is
+> **Superseded design.** This section and every other reload description in
+> this file are retained as historical implementation background only. The
+> sole normative hot-reload contract is
 > [`docs/control-plane-mutations.md`](docs/control-plane-mutations.md), which
 > replaces the single global pointer swap, untouched-pool assumptions,
 > unbounded coexistence of old versions, and immediate compile-and-swap API

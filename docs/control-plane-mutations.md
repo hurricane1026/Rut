@@ -40,7 +40,9 @@ completed before the call returned.
 
 - `reload()` returns `true` only when this invocation claimed the process's one
   pending reload request slot. It returns `false` when route-triggered reload is
-  disabled, the process is stopping, or a request is already pending/in flight.
+  disabled, the process is stopping, a request is already pending/in flight, or
+  admitting another candidate would exceed the two-adjacent-generation bound
+  because a predecessor remains pinned.
   A `true` result means *accepted*, not *activated*; `202 Accepted` is the
   prescriptive route response.
 - `mark` returns `true` only when it atomically published the requested manual
@@ -104,9 +106,14 @@ The coordinator executes one request at a time:
    - every timer shard selector is valid for the unchanged process shard count;
    - listener resources are immutable across hot reload: bind address/port,
      transport/TLS policy, connection limits, and other accept-path security
-     settings must exactly match the active generation. A change fails
-     validation and requires a process restart; no candidate may publish while
-     relying on a later fallible bind or on predecessor listener policy;
+     settings must exactly match the active generation. Certificate material
+     and SNI certificate mappings are the sole exception: validation stages and
+     verifies a complete replacement `SSL_CTX` set before publication, while
+     existing handshakes retain their selected context. Compatible contexts
+     share a stable resumption allocation containing session-ID caches,
+     ticket-key epochs, live OCSP staples, validity windows, and refresh
+     ownership; publication cannot expose an empty or stale replacement. Any
+     other listener-policy change fails validation and requires a restart;
    - firewall/XDP policy is likewise restart-only in this contract. The candidate
      firewall declaration and compiled policy identity must exactly match the
      active generation; any source change fails validation before userspace
@@ -123,15 +130,28 @@ The coordinator executes one request at a time:
      behind a coordinator cutover barrier that first closes **whole invocation
      admission**, not merely state-operation admission. Once the barrier is
      visible, no new request, stream, timer callback, WebSocket callback, or
-     detached operation may enter generation `N`; accepted transport work waits
-     behind a bounded ingress barrier, with overflow receiving an explicit
-     protocol-level busy result that is captured. The coordinator then drains
+     detached operation may enter generation `N`. Accepted HTTP/1 connections
+     and requests and HTTP/2 streams wait in one configured bounded FIFO;
+     overflow receives `503 Service Unavailable` plus `Connection: close` for
+     HTTP/1, and `RST_STREAM(REFUSED_STREAM)` for HTTP/2. An arriving frame for
+     an established terminate-mode WebSocket is not queued: the session closes
+     with code `1013`. A timer deadline or detached callback that reaches this
+     barrier is skipped once with an ordered `cutover-admission-skip` record and
+     resumes only at its next ordinary scheduling opportunity. Accepted
+     transports already inside the FIFO remain open and wait; no work type has
+     an unbounded queue. Every enqueue, overflow, close, skip, and later
+     admission is captured with its ingress position. The coordinator then drains
      every old-generation invocation and detached updater. It also tears down and
      drains every state-capable retained session (including an idle
      terminate-mode WebSocket whose next frame can re-enter old code) and every
      future callback or effect that can still acknowledge an `N` mutation. If any
      such pin cannot be closed and drained within the bounded migration policy,
-     replacement migration is rejected; it may not copy around the pin. Only
+     replacement migration is rejected; it may not copy around the pin.
+     Quiescence authorizes a copy only when layout, hashing semantics, and
+     capacity are representation-compatible. An incompatible schema requires a
+     separately declared, bounded, verifier-approved migration whose capacity
+     proof covers every retained entry; without one, validation rejects the
+     reload rather than truncating, reinterpreting, or resetting state. Only
      then does it copy the quiescent registry before publication. The barrier
      reopens only after the indivisible `N+1` install is committed or the
      candidate is abandoned.
@@ -153,8 +173,12 @@ The coordinator executes one request at a time:
    boundary. Before accepting another reload, also require that publishing it
    would not retain more than two adjacent generations. If generation `N`
    still has invocation or session pins after `N+1` is active, the coordinator
-   delays or rejects `N+2` until those pins drain (or an explicit operator drain
-   tears down the retaining sessions).
+   rejects `N+2` admission until those pins drain (or an explicit operator drain
+   tears down the retaining sessions). Route `reload()` returns `false` without
+   claiming the slot or request id. An observed SIGHUP or file-watch attempt
+   receives a request id and immediate terminal `generation-limit` record; a
+   file-watch attempt also follows the dirty-slot rule below. No source waits in
+   the slot for an unbounded predecessor lifetime.
 6. Reclaim an old program only after all shards acknowledged a newer generation
    and every invocation pin reached zero. Pins include HTTP/1 requests, HTTP/2
    streams, lifecycle invocations such as health timers that can suspend and
@@ -183,6 +207,13 @@ future design may instead define paired per-generation shutdown/init transitions
 but it must complete the old shutdown before reclaim and the new init before
 publication; mixing hooks from different generations is forbidden.
 
+Validation rejects a candidate whose request handlers, timers, or runtime tables
+depend on side effects that only its unexecuted `init` hook would create. A
+reload candidate may depend only on staged resources validated before
+publication, retained startup-owned resources, or generation-local allocations
+whose construction is part of the indivisible install. Publication never
+speculates that candidate initialization will succeed afterward.
+
 Installation also retires old-generation timer registrations before a shard
 acknowledges. The shard removes the old scheduled tick and drains any callback
 already queued at its command boundary. If a predecessor invocation is active
@@ -196,6 +227,14 @@ predecessor's pending monotonic deadline and cadence phase to the replacement;
 installation does not restart their period. A changed timer anchors its first
 deadline explicitly to installation time. Transfer, cancellation, new deadline,
 and anchor choice are captured as ordered scheduling events.
+
+If that deadline becomes overdue while a predecessor invocation keeps the
+replacement disabled, final pin release skips all missed ticks and advances the
+deadline by the smallest whole number of periods that places it strictly after
+the release-time monotonic sample. It emits one ordered
+`timer-overdue-skip(old_deadline, release_sample, missed_periods, new_deadline)`
+record. The replacement never fires immediately and never queues catch-up
+invocations.
 
 Installation also drains every idle upstream connection pooled under the
 predecessor generation before acknowledgement. A connection completing after
@@ -219,6 +258,19 @@ disabled until the predecessor flight completes or is cancelled and drained.
 Every completion compares its captured start epoch with the table's current
 epoch before publishing, so even a stale queued completion that survives
 transport cancellation is discarded rather than advancing the verdict/version.
+
+For a compatible endpoint and probe policy, the stable scheduler allocation
+also transfers the pending deadline, cadence phase, cursor, and single-flight
+epoch. A changed policy uses an installation-time anchor, starts in `warming`,
+retains any predecessor unhealthy/ejected verdict, and cannot enter normal
+selection until its first successful replacement probe publishes or validation
+rejects the reload. A new or replaced endpoint configured with `warming: true`
+likewise begins excluded in a fresh allocation and becomes eligible only when
+its first successful probe atomically publishes a healthy version and
+slow-start recovery epoch. Every sweep records its monotonic sample and, for
+each due server, the exact launch, already-in-flight, completion-budget defer,
+allocation/socket/buffer/submission failure, or successful-start outcome. A
+failed start is a recorded defer, not an invisible no-op.
 
 Accepted cross-shard state operations own independent program pins. Enqueueing
 an owner-shard `Hash.update` (or another compiled updater thunk) transfers a pin
@@ -274,13 +326,15 @@ this contract.
 Rate-limit state is generation-aware as well. Per-shard and process-global
 buckets are selected by the invocation's pinned generation plus the rule's
 stable declaration identity; numeric route/rule indexes alone are never keys.
-Validation may map a bucket into the candidate only when the stable identity,
-scope, key shape, window, burst, and limit policy are exactly compatible.
-Compatible adjacent generations share the same bucket allocation and
-linearization sequence; otherwise `N+1` receives a fresh table while `N` keeps
-its table until the last predecessor pin drains. Installation must not reset
-storage still reachable by old-generation work or let a reordered rule inherit
-unrelated TAT state. Capture records every process-global and shard-local bucket
+Validation maps a bucket into the candidate whenever stable identity, scope, and
+key shape are compatible. Window, burst, or limit changes conservatively
+migrate existing history into the shared allocation and immediately evaluate it
+under the candidate policy; they never grant a fresh burst. A scope or key-shape
+change is rejected until every predecessor bucket and accounting horizon drains
+unless a bounded migration includes predecessor occupancy and history.
+Installation must not reset storage still reachable by old-generation work or
+let a reordered rule inherit unrelated TAT state. Capture records every
+process-global and shard-local bucket
 decision with its stable allocation identity, monotonically assigned decision
 version, grant/reject result, exact monotonic admission-time sample, and
 position in workload-event order. Replay consumes those versions and outcomes
@@ -293,24 +347,29 @@ upstream identity, endpoint ordering, and complete policy are compatible;
 reusing an `upstream_id` never aliases a round-robin cursor by numeric
 coincidence. Per-server observations that span policies, including active
 connection counts and latency/EWMA samples, instead use never-reused stable
-server allocations. Compatible adjacent generations share those allocations
-when upstream identity, endpoint identity, and the measurement semantics match,
-even while both generations still serve traffic. Each acquisition returns a
+server allocations. Compatible adjacent generations share occupancy
+unconditionally for a stable endpoint, even when latency measurement policy
+changes; only the incompatible latency/EWMA fields reset after a recorded
+transition. Each acquisition returns a
 token naming the exact server-state allocation, and its completion updates that
 same allocation after reload. Thus `.leastConn`, `.ewma`, and custom selectors
-in `N+1` observe work still owned by `N`; an incompatible endpoint or measurement
-policy receives fresh state while the predecessor allocation drains.
+in `N+1` observe work still owned by `N`; only an incompatible endpoint identity
+receives fresh occupancy state while the predecessor allocation drains.
 
 Stateful isolation policies are not reset by an unrelated reload. Circuit
 breaker and outlier allocations have never-reused stable identities and are
 shared by adjacent generations only when the upstream/server identity and the
 complete breaker/outlier policy are compatible. The shared allocation carries
 failure counters, open deadlines, half-open admission tokens, ejection state,
-and its versioned arbitration sequence. An incompatible candidate receives a
-fresh allocation while the predecessor allocation remains reachable until its
-last pin/token drains. Every transition and half-open admission is captured by
-allocation identity and version; replay consumes that order rather than
-starting a compatible breaker closed.
+and its versioned arbitration sequence. Policy-only changes conservatively
+retain an open/ejected verdict, deadline, live half-open tokens, and failure
+history; a candidate cannot reopen an isolated stable endpoint at publication.
+A policy that cannot represent that state is rejected until it drains. Only a
+changed endpoint identity receives a fresh allocation. Every transition,
+scheduled evaluation (including a no-op), ordinary admit/reject decision,
+expiry-time monotonic sample, and half-open admission is captured by allocation
+identity and version; replay consumes that order rather than starting a
+compatible breaker closed.
 
 Any selection policy whose effective weights depend on monotonic time, including
 `slowStart`, records the exact selection-time monotonic sample, the recovery
@@ -388,12 +447,24 @@ losing stale call likewise returns `false`. Selection consults the override
 table belonging to the invocation or session's pinned generation before local
 active/passive health state:
 
-- `healthy: false` forces the target out of normal selection;
-- `healthy: true` forces it into normal selection;
+- `healthy: false` is an absolute exclusion from normal and all-down fallback
+  selection;
+- `healthy: true` admits the target to normal health consideration, but does not
+  bypass an open circuit breaker or active outlier ejection;
 - a reload shares the stable override allocation when upstream identity,
-  endpoint identity, and marking policy are compatible; replaced endpoints or
-  policies receive a fresh empty allocation in the same atomic publication
-  transaction that makes that generation active.
+  endpoint identity, and marking policy are compatible. A marking-policy-only
+  change retains the last verdict for each stable endpoint and stages the new
+  writer policy; it never creates an empty selectable window. Replaced endpoint
+  identities alone receive fresh empty slots.
+
+A `false` to `true` manual transition atomically publishes a new slow-start
+recovery epoch when that upstream uses `slowStart`; selection ramps from zero
+using that versioned epoch. If every endpoint is manually excluded, selection
+returns the deterministic no-eligible-backend result: HTTP requests receive
+`503 Service Unavailable` before any upstream operation, and a replay record
+contains the pinned generation, validated override version, and `no-eligible`
+outcome. The ordinary ejected-backend fallback never overrides a manual
+exclusion.
 
 Publication does not clear or reuse the old generation's table. Lagging shards
 and pinned old-generation work continue consulting it until every shard has
@@ -410,7 +481,11 @@ the sequence to an odd value, updates its slot, then release-publishes the next
 even value. Backend selection acquire-reads an even sequence, scans every verdict
 it will consume, and accepts the snapshot only when a second acquire-read returns
 the same even value; otherwise it retries within a fixed bound and takes the
-documented visible unavailable/contended path. Per-slot atomics followed by an
+visible fail-closed contention path: the request receives `503 Service
+Unavailable`, no upstream is selected or contacted, and capture records
+`selection-contended` with both observed sequence values and the workload-event
+position. A custom selector receives the same bounded unavailable result rather
+than stale `Server` data. Per-slot atomics followed by an
 unvalidated table-version read are not sufficient. A backend-selection capture
 records the pinned generation and exact validated even sequence observed by the
 accepted snapshot. Capture records **every** mark attempt at its workload-event
@@ -434,18 +509,25 @@ stable server identity, not only the numeric `(upstream_id, backend_id)` pair.
 Backend selection reads probe state through the invocation pin. Installing
 `N+1` shares the stable health allocation when the upstream, endpoint, and
 probe/passive-health policy are compatible, preserving active failures and
-passive ejections. Replaced endpoints receive fresh state, while the predecessor
-view remains valid until its pins drain. Thus a resumed invocation cannot lose
-an `N` ejection or consume a verdict for an endpoint that merely reused the same
-numeric slot in `N+1`.
+passive ejections. A health-policy-only change conservatively retains every
+unhealthy/ejected verdict and deadline until a replacement-policy observation
+explicitly clears it; if the candidate representation cannot do so, validation
+rejects the reload. Replaced endpoints receive fresh state under the warming
+rule above, while the predecessor view remains valid until its pins drain. Thus
+a resumed invocation cannot lose an `N` ejection or consume a verdict for an
+endpoint that merely reused the same numeric slot in `N+1`.
 
 Every active-probe completion and passive-failure/ejection mutation publishes a
-monotonic version in its generation-scoped probe table. A backend selection
-records the exact probe-table version observed together with its chosen stable
-server identity; probe callbacks record their source event, resulting state,
-published version, and event-loop position. Replay consumes those versions and
-positions instead of rerunning callback timing. A missing, duplicate,
-out-of-order, or unobservable probe version is `Unsupported`.
+monotonic version in its generation-scoped probe table. Selection validates the
+whole table with the same bounded odd/even snapshot protocol as manual
+overrides, or records each consumed slot's verdict and version; reading one
+version after a mixed scan is forbidden. Time-based passive expiry additionally
+records the exact monotonic sample, deadline, derived verdict, and event
+position for every selection or custom `Server.healthy` observation. Probe
+callbacks record their source event, resulting state, published version, and
+event-loop position. Replay consumes those versions, samples, and positions
+instead of rerunning callback timing. A missing, duplicate, out-of-order, or
+unobservable probe version is `Unsupported`.
 
 Upstream in-flight concurrency accounting is likewise identity-scoped. The
 counter is owned by a never-reused stable upstream allocation identity. Its
@@ -455,8 +537,11 @@ same logical upstream and limit scope, adjacent generations share the allocation
 even if the candidate changes policy, endpoints, or the limit. Each admission
 compares the shared occupancy with the pinned generation's configured limit, so
 a lowered `N+1` limit cannot admit new `N+1` work while predecessor acquisitions
-already meet or exceed it. Only a changed logical-upstream identity or limit
-scope receives a new allocation while its predecessor drains. Endpoint-scoped
+already meet or exceed it. A limit-scope change is rejected until every
+predecessor acquisition token drains, unless validation can seed a replacement
+allocation with an exact conservative shadow of all predecessor occupancy and
+keep it charged until those tokens release. Only a changed logical-upstream
+identity receives an independent new allocation. Endpoint-scoped
 selection, health, and measurement state still follows its stricter endpoint
 compatibility rules. Every release token
 contains the exact concurrency-allocation identity and acquisition version, so
@@ -476,22 +561,27 @@ release or later grant; absent or inconsistent initial occupancy is
 
 Retry-budget history is owned by a never-reused stable upstream allocation,
 not by a numeric upstream slot. Validation shares the allocation across
-adjacent generations whenever the logical upstream and complete retry/budget
-policies are compatible, independently of endpoint roster changes. Endpoint
-selection remains generation-scoped, but adding, removing, or replacing a
-backend cannot reset upstream-wide retry history. An incompatible policy starts
-a fresh allocation while `N` retains its history through predecessor drain.
-Each retry grant/reject records the allocation identity, monotonically assigned
+adjacent generations whenever the logical upstream and budget policy are
+compatible, independently of endpoint roster, retryable-status, attempt-count,
+or backoff changes. Attempt scheduling remains generation-scoped, but changing
+it cannot reset upstream-wide retry history. A budget-policy change
+conservatively migrates the complete numerator, denominator, window, and
+outstanding reservation history into a shared representation that grants no
+fresh capacity; if that representation cannot preserve the stricter effective
+history, validation rejects the reload until its accounting horizon drains.
+Every ordinary first-attempt denominator mutation and every retry
+grant/rejection records the allocation identity, monotonically assigned
 arbitration version, request/attempt identity, counters before and after the
-decision, and workload event position. Replay consumes the recorded decisions
+mutation, and workload-event position. Replay consumes all such mutations
 rather than rerunning process-global races; missing, duplicate, or reordered
 decisions are `Unsupported`.
 
-Manual state has priority over probe and passive-ejection state so a later local
-probe cannot silently undo an operator program's verdict. Calls from the one
-shard-pinned timer are ordered by program order. The generation check makes a
-late invocation apply only to its pinned retained table; a foreign or retired
-table is definitely not applied.
+Manual exclusion has priority over probe and passive-health state so a later
+local probe cannot silently undo it. Manual admission participates in the
+remaining breaker/outlier checks and cannot cancel their isolation. Calls from
+the one shard-pinned timer are ordered by program order. The generation check
+makes a late invocation apply only to its pinned retained table; a foreign or
+retired table is definitely not applied.
 
 ## Failure and observation
 
@@ -499,8 +589,10 @@ table is definitely not applied.
 |---|---|---|
 | reload capability disabled | `false` | none |
 | reload already pending/in flight | `false` | none |
-| SIGHUP while reload busy | terminal `busy` record | none; never queued or coalesced |
-| file-watch event while reload busy | terminal `busy` record | none; never queued or deferred |
+| route reload at generation limit | `false` | no request id or slot claim |
+| SIGHUP while reload busy | terminal `busy` record | request-id sequence advances; no candidate or generation change |
+| SIGHUP at generation limit | terminal `generation-limit` record | request-id sequence advances; no candidate or generation change |
+| file-watch event while reload busy | terminal `busy` record | newest version replaces the bounded dirty slot and is re-admitted after the active terminal record |
 | reload accepted | `true` | request slot only; activation is asynchronous |
 | shutdown before publication | terminal `shutdown` record | active generation unchanged |
 | shutdown after publication | terminal success after drain | published generation finishes installation |
@@ -516,6 +608,113 @@ the request id, old generation, candidate generation (if any), and success or a
 bounded failure code. Production writes the record to structured logs and
 counters. The harness exposes the same record directly to its oracle. No record
 stores unbounded compiler text.
+
+## Deterministic live state and capture closure
+
+Capture start is an atomic all-shard barrier, not a timestamp sampled by the
+writer. The coordinator closes workload admission, obtains an acknowledgement
+and last pre-baseline event sequence from every shard, drains or checkpoints the
+live state required below, durably commits that baseline, and only then reopens
+admission with the first post-baseline sequence. A failed acknowledgement or
+checkpoint leaves capture disabled and `Unsupported`; no shard may emit
+apparently complete post-baseline traffic against a partial baseline.
+
+Capture stop similarly closes admission and publishes a cutoff sequence plus a
+per-shard high-water mark. The artifact remains durably `incomplete` while any
+request, stream, timer or WebSocket callback, accepted reload, I/O operation,
+detached effect, connection/session pin, or queued completion admitted at or
+before the cutoff lacks its terminal event. The coordinator either drains all
+such work and records each terminal boundary through the acknowledged shard
+watermarks, or stores an exact bounded terminal checkpoint capable of resuming
+it. A timeout, uncheckpointable live operation, writer failure, or missing
+watermark leaves the artifact incomplete and replay rejects it. Stopping the
+writer alone can never create a valid suffix-truncated capture.
+
+Sequencing begins before higher-level workload admission. Every XDP/firewall
+packet evaluation receives a packet sequence and records the visible map
+version plus `drop`/`pass`; a passed packet is correlated with any later accept
+attempt. Every accepted-fd attempt receives an accept sequence before connection
+allocation and records either the new connection identity or the exact
+resource/batch-limit close outcome. Only after those boundaries does an
+admitted HTTP request or stream receive its workload sequence. A dropped packet
+or pre-admission close therefore remains ordered even though it never owns an
+HTTP identity.
+
+All asynchronous I/O is captured at completion granularity. Each downstream
+write and each upstream write records its exact result (positive byte count,
+zero progress, or bounded error), buffer offset, resubmission decision, and
+event position. Each upstream read records the exact returned bytes through a
+protected handle, byte count, EOF or error, parser boundary, rearm/pause
+decision, and event position. The transcript retains partial completions rather
+than only final assembled bytes. Zero-copy file responses record the exact file
+identity/version, offset, bytes exposed by every completion, and final outcome;
+if the runtime cannot observe and protect those bytes, capture of that response
+is `Unsupported`.
+
+Every internal timer decision is deterministic input: handler `wait` and
+timeout races, retry backoff, response throttling, periodic callbacks, breaker
+and outlier expiry/evaluation, and active-health scheduling record the
+monotonic sample, computed deadline, arm/defer/failure result, fire/cancel/skip
+winner, and event position. Latency/EWMA updates record their start and end
+samples (or exact measured duration), old value, resulting value, allocation
+identity, and version. Replay never samples its local clock for one of these
+decisions.
+
+Backend selection consumes a coherent observation. Manual-override and
+probe/passive-health tables use a bounded versioned snapshot protocol; exhausting
+the bound takes the specified fail-closed `503 selection-contended` path.
+Selection over multiple server allocations either validates one coherent table
+version or records every consumed stable server identity, field value, and read
+version plus the deterministic final result. The same rule applies to
+`.leastConn`, `.ewma`, and custom selectors. A single version read after an
+unvalidated mixed scan is insufficient.
+
+Every invocation that can call `metrics()` records the exact aggregate snapshot
+latched at entry, including its per-shard read versions and order; reconstructing
+an aggregate from event order is not permitted. An invocation using only local
+`stats()` records its exact local snapshot/version. Each request-latency
+histogram or aggregate update records its measured duration, bucket/counter
+mutation, version, and event position so later snapshots reproduce the observed
+cut.
+
+Runtime-created entropy is part of the transcript even when no Rut API exposes
+it. This includes generated trace/span IDs, sampling decisions and their clock
+inputs, WebSocket outbound-mask seed acquisition and failure, every mask-key
+draw or the exact serialized frame bytes, and every seed/draw used when a
+stateful allocation is created. Replay consumes these values and never silently
+uses fresh process entropy.
+
+Cross-shard fan-out is represented per destination. For `notify all` and any
+future broadcast, capture records each destination shard's enqueue
+success/failure, queue identity/version, dequeue sequence, callback outcome, and
+local event position. One source or owner dequeue version cannot stand in for
+independently ordered destination queues.
+
+Idle upstream pools use stable endpoint-scoped allocation identities until the
+reload drain specified above. After the baseline, every put, take, live-socket
+probe, sweep, timeout-clock sample, eviction, close, and reuse result is recorded
+in workload-event order. Reload drain/close outcomes are recorded too; a pooled
+connection is never silently inherited.
+
+Compatible hostname/resolver declarations retain the same per-shard DNS-cache
+allocations, including last-known-good answers, negative entries, TTL
+deadlines, refresh ownership, and stable endpoint identities. An incompatible
+change is validated by staging a complete new resolution and atomically
+publishing it, or is rejected; it cannot publish an empty cache and resolve
+later. All later DNS transitions remain part of the ordered transcript.
+
+The automatic response cache has a stable allocation identity derived from the
+route, cache policy, key/Vary semantics, and response-producing program
+compatibility. Exactly compatible generations share the allocation and its
+in-flight fills; a program or cache-semantic change atomically drains and
+invalidates predecessor entries before new-generation admission (while pinned
+predecessor work retains its old allocation), or rejects the reload. It never
+serves predecessor-produced bytes to an incompatible handler and never turns a
+compatible warm cache into an unrecorded empty one.
+
+This document supersedes every legacy reload description in `DESIGN.md`. Those
+sections are historical background only; a conflicting pointer-swap, pool,
+lifecycle, or generation-retention statement has no normative force.
 
 ## Harness and replay
 
@@ -579,11 +778,15 @@ A portable source artifact is self-contained inside the access-controlled,
 encrypted artifact provider: it bundles the root source and
 the exact bounded transitive import closure, including each importer's canonical
 resolution identity/path, package identity, bytes, and authenticated digest.
-Replay resolves imports only from that bundle and verifies the recorded closure
-before compilation; it never consults the replay target's filesystem or module
-cache. A missing, extra, cyclically inconsistent, unresolved, or oversized
-closure is `Unsupported`. A self-contained verified IR artifact may omit source
-imports only when its attested identity covers the complete lowered program.
+It also pins the capture-time language semantics, runtime ABI, compiler
+frontend/lowering version, standard-library identity, feature flags, and target
+identity. Replay resolves imports only from that bundle, verifies the recorded
+closure, and reconstructs source only with a compiler whose complete semantic
+identity matches; it never consults the replay target's filesystem or module
+cache. A compiler mismatch, missing, extra, cyclically inconsistent, unresolved,
+or oversized closure is `Unsupported`. A self-contained verified IR artifact
+may omit source imports only when its attested identity covers the complete
+lowered program.
 
 Routine replay records and traffic captures are secret-free. Protected replay
 artifacts may contain the exact source/config bytes required for reconstruction,
@@ -721,15 +924,17 @@ without this complete internal-clock transcript is `Unsupported`, even when all
 Rut-visible clock calls were recorded.
 
 Every workload and mutation record carries a monotonic capture sequence number,
-correlation identity, and source `shard_id`. A request or HTTP/2 stream receives
-both its stable identity and workload-admission sequence **before** generation selection or any
-handler, firewall, limiter, or state effect; completion carries that identity
-and never allocates the workload sequence retroactively. Timer invocations,
-WebSocket frames, detached callbacks, and other workload entries receive their
-sequence at the equivalent admission/arrival boundary. Later effect and
-completion events have their own event-order positions correlated to that
-admission identity, so faster request B completion cannot make B appear to have
-entered before yielding request A.
+correlation identity, and source `shard_id`. Packet and accept-attempt sequences
+are assigned at the pre-admission boundaries above. After a packet passes XDP
+and a connection is admitted, a request or HTTP/2 stream receives both its
+stable identity and workload-admission sequence before generation selection or
+any userspace handler, limiter, or state effect; completion carries that
+identity and never allocates the workload sequence retroactively. Timer
+invocations, WebSocket frames, detached callbacks, and other workload entries
+receive their sequence at the equivalent admission/arrival boundary. Later
+effect and completion events have their own event-order positions correlated to
+that admission identity, so faster request B completion cannot make B appear to
+have entered before yielding request A.
 
 Replay dispatches every admission, frame, timer, and callback to its recorded
 source shard before executing it; it never lets the local accept/load-balancing
@@ -822,13 +1027,16 @@ that decision before issuing any corresponding upstream operation; freshness
 metadata without the lookup clock and outcome is not a deterministic transcript.
 
 Per-shard and aggregate stats/metrics counters, histograms, and snapshot epochs
-are checkpointed in the baseline. As an equivalent bounded representation,
-each invocation may record the exact entry-latched `stats()`/`metrics()` snapshot
-it observed. Replay never assumes a zero snapshot when capture begins after
-traffic. It resolves all baseline state through the protected state provider
-and installs it before consuming traffic. Missing, unauthorized, inconsistent,
-or unbounded baseline state is `Unsupported`; replay never starts from an empty
-control plane or assumes every shard already has the latest generation.
+are checkpointed in the baseline. In addition, every invocation that uses
+`metrics()` records the exact entry-latched aggregate snapshot and its per-shard
+read order/versions; every invocation that uses local `stats()` records that
+exact local snapshot/version. Replay never attempts to infer a mixed aggregate
+cut from event order and never assumes a zero snapshot when capture begins
+after traffic. It resolves all baseline state through the protected state
+provider and installs it before consuming traffic. Missing, unauthorized,
+inconsistent, or unbounded baseline state is `Unsupported`; replay never starts
+from an empty control plane or assumes every shard already has the latest
+generation.
 
 Capture normally starts at a quiescent workload boundary: all idle upstream pools
 have also completed the recorded drain described above, and there are no live
