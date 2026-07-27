@@ -5948,7 +5948,7 @@ TEST(buffered_forward, status_mutations_enforce_partial_content_metadata) {
     };
 
     const auto changed_to_full = run(206, true, 200);
-    CHECK_EQ(changed_to_full.first, 200u);
+    CHECK_EQ(changed_to_full.first, 500u);
     CHECK(changed_to_full.second.find("Content-Range") == std::string::npos);
 
     const auto invalid_partial = run(200, false, 206);
@@ -6423,6 +6423,7 @@ TEST(buffered_forward, h2_validates_head_ranges_and_replaced_multipart_bodies) {
     static constexpr char kPartialNotModified[] =
         "HTTP/1.1 206 Partial Content\r\nContent-Length: 4\r\n"
         "Content-Range: bytes 0-3/100\r\n\r\ndata";
+    run(kPartialNotModified, sizeof(kPartialNotModified) - 1, 4, false, false, 500, 200);
     run(kPartialNotModified, sizeof(kPartialNotModified) - 1, 4, false, false, 304, 304, false);
 }
 
@@ -6935,6 +6936,48 @@ TEST(buffered_forward, clears_bytes_from_an_abandoned_upstream_wait) {
     CHECK(conn->upstream_abandoned);
     CHECK(conn->h2_proxy_recv_draining);
     CHECK_EQ(conn->on_upstream_recv, nullptr);
+}
+
+TEST(buffered_forward, snapshot_failure_abandons_prior_upstream_wait) {
+    SmallLoop loop;
+    loop.setup();
+    loop.inject_and_dispatch(make_ev(0, IoEventType::Accept, 42));
+    auto* conn = loop.find_fd(42);
+    REQUIRE(conn != nullptr);
+
+    const u32 oversized_len = jit::kMaxResponseBodyMutationBytes + 1;
+    u8 request_storage[jit::kMaxResponseBodyMutationBytes + 1]{};
+    conn->recv_buf.bind(request_storage, sizeof(request_storage));
+    __builtin_memset(conn->recv_buf.write_ptr(), 'x', oversized_len);
+    conn->recv_buf.commit(oversized_len);
+    auto* ctx = conn->reset_jit_ctx();
+    static constexpr char kName[] = "X-Large";
+    ctx->response_header_mutations[0] = {
+        {kName, sizeof(kName) - 1},
+        {reinterpret_cast<const char*>(conn->recv_buf.data()), oversized_len},
+        jit::ResponseHeaderMutationMode::Set};
+    ctx->response_header_count = 1;
+
+    conn->upstream_fd = dup(2);
+    REQUIRE(conn->upstream_fd >= 0);
+    conn->upstream_recv_armed = true;
+    conn->on_upstream_recv = &on_upstream_response<SmallLoop>;
+    const i32 client_fd = conn->fd;
+
+    JitDispatchOutcome outcome{};
+    outcome.kind = JitDispatchOutcome::Kind::ForwardBuffered;
+    outcome.upstream_id = 0;
+    handle_jit_outcome<SmallLoop>(&loop, *conn, outcome, nullptr, true);
+
+    CHECK_EQ(conn->resp_status, 500u);
+    CHECK_EQ(conn->upstream_fd, -1);
+    CHECK(conn->upstream_abandoned);
+    CHECK(conn->h2_proxy_recv_draining);
+    CHECK_EQ(conn->on_upstream_recv, nullptr);
+    CHECK_EQ(conn->on_upstream_send, nullptr);
+    CHECK_FALSE(conn->upstream_recv_armed);
+    loop.dispatch_event(*conn, make_ev(conn->id, IoEventType::UpstreamRecv, -ENOBUFS));
+    CHECK_EQ(conn->fd, client_fd);
 }
 
 TEST(buffered_forward, drains_partial_client_sends_before_completion) {

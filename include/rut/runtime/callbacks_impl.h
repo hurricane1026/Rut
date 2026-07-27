@@ -1897,15 +1897,6 @@ void handle_jit_outcome(Loop* loop,
             conn.pending_handler_fn = nullptr;
             conn.proxy_response_buffered =
                 outcome.kind == JitDispatchOutcome::Kind::ForwardBuffered;
-            if (conn.proxy_response_buffered && !snapshot_buffered_response_mutation_views(conn)) {
-                conn.resp_status = 500;
-                conn.keep_alive = false;
-                format_static_response(
-                    conn, 500, false, conn.req_method == static_cast<u8>(LogHttpMethod::Head));
-                conn.transition_to_sending(&on_response_sent<Loop>);
-                client_send(loop, conn, conn.send_buf.data(), conn.send_buf.len());
-                return;
-            }
             const bool had_prior_upstream =
                 conn.upstream_fd >= 0 || conn.upstream_recv_armed || conn.upstream_send_armed;
             if (had_prior_upstream) {
@@ -1930,6 +1921,15 @@ void handle_jit_outcome(Loop* loop,
                 conn.upstream_recv_armed = false;
                 conn.upstream_send_armed = false;
                 conn.upstream_idx = 0;
+            }
+            if (conn.proxy_response_buffered && !snapshot_buffered_response_mutation_views(conn)) {
+                conn.resp_status = 500;
+                conn.keep_alive = false;
+                format_static_response(
+                    conn, 500, false, conn.req_method == static_cast<u8>(LogHttpMethod::Head));
+                conn.transition_to_sending(&on_response_sent<Loop>);
+                client_send(loop, conn, conn.send_buf.data(), conn.send_buf.len());
+                return;
             }
             if (conn.proxy_response_buffered || had_prior_upstream) {
                 // A preceding upstream wait may have left response bytes in this
@@ -3121,7 +3121,7 @@ void h2_proxy_finish(Loop* loop,
         status = 500;
     }
     if (mutations_valid && resp.status_code == 206 && status != 206 && final_status_carries_body &&
-        !response_body_mutated && upstream_response_is_multipart_byteranges(resp)) {
+        !response_body_mutated) {
         mutations_valid = false;
         status = 500;
     }
@@ -5016,8 +5016,7 @@ void finish_buffered_forward(Loop* loop,
         return;
     }
     if (resp.status_code == 206 && status != 206 && final_status_carries_body &&
-        !response_ctx->response_body_mutation_set &&
-        upstream_response_is_multipart_byteranges(resp)) {
+        !response_ctx->response_body_mutation_set) {
         buffered_forward_fail(loop, conn, 500);
         return;
     }

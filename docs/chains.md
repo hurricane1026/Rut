@@ -22,7 +22,7 @@ declare the status returned on failure.
 receive exactly one `Response` parameter and may perform ordered `set`, `add`,
 or `remove` header effects plus status and bounded body replacement. These
 effects live in resumable stream-owned state, so they survive explicit `wait`
-and verifier-bounded `for` control flow. A forwarded response must use
+suspension. A forwarded response must use
 `return forward(upstream, buffered: true)` so the runtime can materialize the
 complete response before committing the effects.
 
