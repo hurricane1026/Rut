@@ -5,6 +5,7 @@
 #include "rut/compiler/ast.h"
 #include "rut/compiler/diagnostic.h"
 #include <deque>
+#include <memory>
 #include <string>
 #include <vector>
 
@@ -1162,6 +1163,44 @@ struct HirForLoop {
     HirForLoopBody body{};
 };
 
+template <typename T, u32 Cap>
+struct HeapFixedVec {
+    std::unique_ptr<T[]> storage;
+    u32 len = 0;
+
+    HeapFixedVec() = default;
+    HeapFixedVec(const HeapFixedVec& other) { *this = other; }
+    HeapFixedVec& operator=(const HeapFixedVec& other) {
+        if (this == &other) return *this;
+        if (other.len == 0) {
+            storage.reset();
+            len = 0;
+            return *this;
+        }
+        if (!storage) storage = std::make_unique<T[]>(Cap);
+        for (u32 i = 0; i < other.len; i++) storage[i] = other[i];
+        len = other.len;
+        return *this;
+    }
+    HeapFixedVec(HeapFixedVec&&) noexcept = default;
+    HeapFixedVec& operator=(HeapFixedVec&&) noexcept = default;
+
+    bool push(const T& value) {
+        if (len >= Cap) return false;
+        if (!storage) storage = std::make_unique<T[]>(Cap);
+        storage[len++] = value;
+        return true;
+    }
+    T& operator[](u32 index) { return storage[index]; }
+    const T& operator[](u32 index) const { return storage[index]; }
+    T* begin() { return storage.get(); }
+    T* end() { return storage ? storage.get() + len : nullptr; }
+    const T* begin() const { return storage.get(); }
+    const T* end() const { return storage ? storage.get() + len : nullptr; }
+    [[nodiscard]] bool full() const { return len >= Cap; }
+    [[nodiscard]] bool empty() const { return len == 0; }
+};
+
 // WebSocket terminate-mode frame-handler verdict. Mirrors the runtime
 // `WsFrameAction` (ws_terminate.h): the per-message disposition the JIT'd
 // handler returns. Slice B only produces `Forward` (forward-only / empty
@@ -1267,18 +1306,17 @@ struct HirRoute {
     static constexpr u32 kMaxExprs = 64;
     static constexpr u32 kMaxDecorators = 8;
     static constexpr u32 kMaxWaits = kMaxRouteWaits;
-    // 2 for-loops per route covers realistic DSL patterns (one allowlist
-    // check + one server-pool iteration) while keeping HirRoute under the
-    // stack budget. Each HirForLoop is ~10 KB even at kMaxGuards=2; a
-    // larger cap would push HirRoute past the recursive-analyze budget.
-    static constexpr u32 kMaxForLoops = 2;
+    // 3 for-loops per route covers a parent with sibling child loops. Store
+    // these large nodes out of line so empty routes and recursive import
+    // analysis do not pay the inline HirForLoop footprint.
+    static constexpr u32 kMaxForLoops = 3;
     FixedVec<HirExpr, kMaxExprs> exprs;
     FixedVec<HirLocal, kMaxLocals> locals;
     FixedVec<HirGuard, kMaxGuards> guards;
     FixedVec<DecoratorRef, kMaxDecorators> decorators;
     u32 decorator_guard_count = 0;
     FixedVec<Wait, kMaxWaits> waits;
-    FixedVec<HirForLoop, kMaxForLoops> for_loops;
+    HeapFixedVec<HirForLoop, kMaxForLoops> for_loops;
     HirControl control{};
     bool allow_respond_effects = false;
     bool allow_response_effects = true;

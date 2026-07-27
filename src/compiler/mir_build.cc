@@ -2542,6 +2542,17 @@ FrontendResult<MirModule*> build_mir(const HirModule& module) {
                     };
                     for (u32 next = si + 1; next < loop.body.steps.len; next++) {
                         const auto& suffix = loop.body.steps[next];
+                        if (suffix.kind == HirForLoopBody::Step::Kind::For &&
+                            suffix.index < module.routes[i].for_loops.len) {
+                            const auto& suffix_loop = module.routes[i].for_loops[suffix.index];
+                            const HirExpr* suffix_iter = iter_array_for(suffix_loop);
+                            if (suffix_loop.body.has_term && !suffix_loop.body.has_loop_control &&
+                                suffix_iter != nullptr && suffix_iter->args.len != 0 &&
+                                !self(self, suffix.index, depth + 1)) {
+                                suffix_terminates_route = true;
+                                break;
+                            }
+                        }
                         if (suffix.kind == HirForLoopBody::Step::Kind::Term ||
                             suffix.kind == HirForLoopBody::Step::Kind::Break) {
                             suffix_terminates_route = true;
@@ -2691,6 +2702,28 @@ FrontendResult<MirModule*> build_mir(const HirModule& module) {
                 }
                 const bool can_advance_to_later_iteration =
                     loop_can_advance_to_later_iteration(loop_can_advance_to_later_iteration, fi, 0);
+                const auto nested_loop_has_control_or_terminator =
+                    [&](auto&& nested_self, u32 loop_index, u32 depth) -> bool {
+                    if (loop_index >= module.routes[i].for_loops.len ||
+                        depth > module.routes[i].for_loops.len)
+                        return false;
+                    const auto& candidate = module.routes[i].for_loops[loop_index];
+                    for (u32 step_index = 0; step_index < candidate.body.steps.len; step_index++) {
+                        const auto& candidate_step = candidate.body.steps[step_index];
+                        if (candidate_step.kind != HirForLoopBody::Step::Kind::For ||
+                            candidate_step.index >= module.routes[i].for_loops.len)
+                            continue;
+                        const auto& child = module.routes[i].for_loops[candidate_step.index];
+                        if (child.body.has_term || child.body.has_loop_control ||
+                            nested_self(nested_self, candidate_step.index, depth + 1))
+                            return true;
+                    }
+                    return false;
+                };
+                const bool has_control_or_terminator =
+                    fl.body.has_term || fl.body.has_loop_control ||
+                    nested_loop_has_control_or_terminator(
+                        nested_loop_has_control_or_terminator, fi, 0);
                 FixedVec<MirValue, HirExpr::kMaxArgs> eager_inline_elements;
                 if (materialized_iter == nullptr) {
                     for (u32 ai = 0; ai < iter_array->args.len; ai++) {
@@ -2712,7 +2745,7 @@ FrontendResult<MirModule*> build_mir(const HirModule& module) {
                             return frontend_error(FrontendError::TooManyItems, fl.span);
                     }
                 }
-                const u32 iter_count = (fl.body.has_term || fl.body.has_loop_control) &&
+                const u32 iter_count = has_control_or_terminator &&
                                                !can_advance_to_later_iteration &&
                                                iter_array->args.len != 0
                                            ? 1u

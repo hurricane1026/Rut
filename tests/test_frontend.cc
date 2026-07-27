@@ -35130,6 +35130,31 @@ route GET "/x" {
     }
 }
 
+TEST(frontend, terminating_sibling_loop_prunes_later_parent_iterations) {
+    const char* src = R"rut(
+route GET "/x" {
+    for outer in [1, 2, 3, 4, 5, 6, 7, 8] {
+        guard req.http11 else { break }
+        for first in [1] { continue }
+        for second in [1] { return 201 }
+    }
+    return 500
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    REQUIRE(lower_to_rir(mir.value(), rir));
+    CHECK(rir::verify_module(rir.module).ok);
+    rir.destroy();
+}
+
 TEST(frontend, static_loop_iterator_alias_rejects_fallible_elements) {
     const char* src = R"rut(
 func maybe(ok: bool) -> i32 { if ok { 7 } else { error(.timeout) } }
