@@ -2987,8 +2987,7 @@ void h2_proxy_finish(Loop* loop,
             continue;
         }
         if (response_ctx != nullptr && response_ctx->response_body_mutation_set &&
-            http_header_name_eq_ci(kName.ptr, kName.len, "content-type", 12) &&
-            content_type_is_multipart_byteranges(resp.headers[i].value))
+            http_header_name_eq_ci(kName.ptr, kName.len, "content-type", 12))
             continue;
         // content-length is normally dropped (http2_write_response re-derives it
         // from the DATA body), but a HEAD response carries no DATA, so keep the
@@ -4857,8 +4856,7 @@ void finish_buffered_forward(Loop* loop,
             continue;
         }
         if (response_ctx->response_body_mutation_set &&
-            http_header_name_eq_ci(name.ptr, name.len, "content-type", 12) &&
-            content_type_is_multipart_byteranges(resp.headers[i].value))
+            http_header_name_eq_ci(name.ptr, name.len, "content-type", 12))
             continue;
         if (http_header_name_eq_ci(name.ptr, name.len, "content-length", 14)) {
             if (!is_head && resp.status_code != 304) continue;

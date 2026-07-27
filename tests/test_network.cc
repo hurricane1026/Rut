@@ -5486,7 +5486,7 @@ TEST(buffered_forward, body_replacement_removes_stale_representation_metadata) {
         "HTTP/1.1 206 Partial Content\r\nContent-Length: 4\r\nContent-Encoding: gzip\r\n"
         "Content-Range: bytes 0-3/100\r\nDigest: sha-256=upstream\r\n"
         "Content-Digest: sha-256=:upstream:\r\nRepr-Digest: sha-256=:upstream:\r\n"
-        "Content-MD5: upstream\r\nETag: \"upstream\"\r\n"
+        "Content-MD5: upstream\r\nContent-Type: application/json\r\nETag: \"upstream\"\r\n"
         "Last-Modified: Sat, 25 Jul 2026 09:00:00 GMT\r\n\r\ndata";
     conn->upstream_recv_buf.reset();
     conn->upstream_recv_buf.write(reinterpret_cast<const u8*>(kUpstream), sizeof(kUpstream) - 1);
@@ -5503,6 +5503,11 @@ TEST(buffered_forward, body_replacement_removes_stale_representation_metadata) {
     CHECK(!buf_contains(wire, conn->send_buf.len(), "Content-Digest", 14));
     CHECK(!buf_contains(wire, conn->send_buf.len(), "Repr-Digest", 11));
     CHECK(!buf_contains(wire, conn->send_buf.len(), "Content-MD5", 11));
+    CHECK(!buf_contains(wire, conn->send_buf.len(), "application/json", 16));
+    CHECK(buf_contains(wire,
+                       conn->send_buf.len(),
+                       "Content-Type: text/plain; charset=utf-8\r\n",
+                       sizeof("Content-Type: text/plain; charset=utf-8\r\n") - 1));
     CHECK(buf_contains(wire,
                        conn->send_buf.len(),
                        "Digest: sha-256=replacement\r\n",
@@ -6339,7 +6344,10 @@ TEST(buffered_forward, h2_deframing_and_body_replacement_strip_stale_metadata) {
                          const char* forbidden_name,
                          u32 forbidden_name_len,
                          bool explicitly_restore_header = false,
-                         bool expect_header = false) {
+                         bool expect_header = false,
+                         const char* restored_value = "gzip",
+                         u32 restored_value_len = 4,
+                         bool expect_default_content_type = true) {
         SmallLoop loop;
         loop.setup();
         loop.inject_and_dispatch(make_ev(0, IoEventType::Accept, 42));
@@ -6369,7 +6377,7 @@ TEST(buffered_forward, h2_deframing_and_body_replacement_strip_stale_metadata) {
             ctx->response_body_mutation_set = true;
             if (explicitly_restore_header) {
                 ctx->response_header_mutations[0] = {{forbidden_name, forbidden_name_len},
-                                                     {"gzip", 4},
+                                                     {restored_value, restored_value_len},
                                                      jit::ResponseHeaderMutationMode::Set};
                 ctx->response_header_count = 1;
             }
@@ -6405,14 +6413,23 @@ TEST(buffered_forward, h2_deframing_and_body_replacement_strip_stale_metadata) {
                                            16,
                                            &header_count));
         bool found_forbidden = false;
-        for (u32 i = 0; i < header_count; i++)
+        bool found_restored_value = false;
+        bool found_upstream_content_type = false;
+        for (u32 i = 0; i < header_count; i++) {
             found_forbidden |= headers[i].name.eq(Str{forbidden_name, forbidden_name_len});
+            found_restored_value |= headers[i].name.eq(Str{forbidden_name, forbidden_name_len}) &&
+                                    headers[i].value.eq(Str{restored_value, restored_value_len});
+            found_upstream_content_type |= headers[i].name.eq(Str{"content-type", 12}) &&
+                                           headers[i].value.eq(Str{"application/json", 16});
+        }
         CHECK_EQ(found_forbidden, expect_header);
+        CHECK_EQ(found_restored_value, explicitly_restore_header && expect_header);
+        CHECK_FALSE(found_upstream_content_type);
         bool found_default_content_type = false;
         for (u32 i = 0; i < header_count; i++)
             found_default_content_type |= headers[i].name.eq(Str{"content-type", 12}) &&
                                           headers[i].value.eq(Str{"text/plain; charset=utf-8", 25});
-        CHECK_EQ(found_default_content_type, replace_body);
+        CHECK_EQ(found_default_content_type, replace_body && expect_default_content_type);
         conn->h2 = nullptr;
     };
 
@@ -6449,6 +6466,20 @@ TEST(buffered_forward, h2_deframing_and_body_replacement_strip_stale_metadata) {
         "HTTP/1.1 200 OK\r\nContent-Length: 4\r\n"
         "Last-Modified: Sat, 25 Jul 2026 09:00:00 GMT\r\n\r\ndata";
     run(kLastModified, sizeof(kLastModified) - 1, true, "last-modified", 13);
+
+    static constexpr char kTyped[] =
+        "HTTP/1.1 200 OK\r\nContent-Length: 4\r\nContent-Type: application/json\r\n\r\ndata";
+    run(kTyped, sizeof(kTyped) - 1, true, "content-type", 12, false, true);
+    run(kTyped,
+        sizeof(kTyped) - 1,
+        true,
+        "content-type",
+        12,
+        true,
+        true,
+        "application/custom",
+        18,
+        false);
 
     static constexpr char kChunked[] =
         "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nTrailer: Digest\r\n\r\n"
