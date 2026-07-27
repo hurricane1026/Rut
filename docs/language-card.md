@@ -274,7 +274,7 @@ buffered response handling with `set_path` or `set_header` request rewrites is
 rejected until the HTTP/2 request-rewrite path is wired. The expression form
 `let resp = forward(upstream, buffered: true)` owns the filtered status, body,
 and up to 64 headers in a separate lazy 16 KiB stream slice. Reads, mutations,
-and a subsequent `wait` remain valid until `return resp`; the slice is returned
+and a subsequent timer `wait` remain valid until `return resp`; the slice is returned
 to the pool after final serialization. Unbuffered expression forwarding is
 rejected because it cannot provide owned response fields.
 

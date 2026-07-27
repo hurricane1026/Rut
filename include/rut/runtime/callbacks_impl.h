@@ -3524,6 +3524,7 @@ void h2_proxy_finish(Loop* loop,
             if (http_header_name_eq_ci(name.ptr, name.len, "trailer", 7)) continue;
             const bool retained_representation_content_length =
                 (is_head || status == 304) && !status_forbids_content_length &&
+                (upstream_content_length_retained || replacement_content_length_len != 0) &&
                 http_header_name_eq_ci(name.ptr, name.len, "content-length", 14);
             if (!retained_representation_content_length && h2_drop_response_header(name)) continue;
             hdrs[nhdrs].name = {effective[i].key_data, effective[i].key_len};
