@@ -109,7 +109,7 @@ the compatibility form's eager effects.
 `before` is the stable request-side chain operation. `after` is stable for the
 implemented bounded response slice: the helper must receive exactly one
 `Response` and may perform ordered header, status, and body effects. Effects
-survive visible `wait` and verifier-bounded `for` control flow. Streaming
+survive visible `wait` suspensions. Streaming
 forwards cannot be post-processed; proxy routes must opt into terminal
 `forward(..., buffered: true)`. Binding that operation as a first-class
 `Response` remains experimental.

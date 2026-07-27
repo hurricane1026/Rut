@@ -95,8 +95,8 @@ route {
 The request-side chain boundary is `before` handler. More precise sequencing
 belongs inside the handler body. `before` steps may fail closed with an explicit
 status. The implemented `after` slice accepts ordered Response header, status,
-and bounded body effects in resumable state, including on routes containing
-`wait` or verifier-bounded `for`. A forwarded response must use terminal
+and bounded body effects in resumable state, including across visible `wait`
+suspensions. A forwarded response must use terminal
 `forward(..., buffered: true)`; first-class buffered Response expressions remain
 experimental. Group chains and entry chains compose in source order.
 

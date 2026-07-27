@@ -2845,6 +2845,19 @@ inline bool content_type_is_multipart_byteranges(Str value) {
     return found_boundary;
 }
 
+inline bool content_type_has_multipart_byteranges_media_type(Str value) {
+    static constexpr char kMultipart[] = "multipart/byteranges";
+    u32 start = 0;
+    while (start < value.len && (value.ptr[start] == ' ' || value.ptr[start] == '\t')) start++;
+    if (value.len - start < sizeof(kMultipart) - 1 ||
+        !http_header_name_eq_ci(
+            value.ptr + start, sizeof(kMultipart) - 1, kMultipart, sizeof(kMultipart) - 1))
+        return false;
+    const u32 end = start + sizeof(kMultipart) - 1;
+    return end == value.len || value.ptr[end] == ';' || value.ptr[end] == ' ' ||
+           value.ptr[end] == '\t';
+}
+
 inline bool response_is_multipart_byteranges(const ResponseHeaderKV* headers, u32 header_count) {
     u32 content_type_count = 0;
     bool multipart = false;
@@ -2858,10 +2871,12 @@ inline bool response_is_multipart_byteranges(const ResponseHeaderKV* headers, u3
     return content_type_count == 1 && multipart;
 }
 
-inline bool response_has_multipart_byteranges(const ResponseHeaderKV* headers, u32 header_count) {
+inline bool response_has_multipart_byteranges_media_type(const ResponseHeaderKV* headers,
+                                                         u32 header_count) {
     for (u32 i = 0; i < header_count; i++) {
         if (http_header_name_eq_ci(headers[i].key_data, headers[i].key_len, "content-type", 12) &&
-            content_type_is_multipart_byteranges({headers[i].value_data, headers[i].value_len}))
+            content_type_has_multipart_byteranges_media_type(
+                {headers[i].value_data, headers[i].value_len}))
             return true;
     }
     return false;
@@ -2924,7 +2939,7 @@ inline bool normalize_partial_content_headers(ResponseHeaderKV* headers,
         }
     }
     if (status != 206) return true;
-    if (found) return !response_has_multipart_byteranges(headers, *header_count);
+    if (found) return !response_has_multipart_byteranges_media_type(headers, *header_count);
     return response_is_multipart_byteranges(headers, *header_count);
 }
 
@@ -4931,6 +4946,7 @@ void buffered_forward_fail(Loop* loop, Connection& conn, u16 status) {
     conn.proxy_resp_started = true;
     conn.set_slots(nullptr, nullptr, nullptr, nullptr);
     conn.transition_to_sending(&on_proxy_response_sent<Loop>);
+    loop->timer.refresh(&conn, loop->keepalive_timeout);
     if (conn.handler_ctx != nullptr) rut_helper_resp_release_body_storage(conn.handler_ctx);
     client_send(loop, conn, conn.send_buf.data(), conn.send_buf.len());
 }
@@ -5102,6 +5118,7 @@ void finish_buffered_forward(Loop* loop,
     conn.proxy_resp_started = true;
     conn.set_slots(nullptr, nullptr, nullptr, nullptr);
     conn.transition_to_sending(&on_proxy_response_sent<Loop>);
+    loop->timer.refresh(&conn, loop->keepalive_timeout);
     // send_buf owns the fully serialized response now; mutation bytes and
     // request-backed header snapshots are no longer referenced.
     rut_helper_resp_release_body_storage(conn.handler_ctx);

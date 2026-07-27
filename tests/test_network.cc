@@ -5891,6 +5891,16 @@ TEST(buffered_forward, final_status_normalizes_content_range) {
         header_count = 1;
         CHECK_FALSE(normalize_partial_content_headers(bare_multipart, &header_count, 206));
     }
+    ResponseHeaderKV range_with_malformed_multipart[] = {
+        {kRangeName, sizeof(kRangeName) - 1, kRangeValue, sizeof(kRangeValue) - 1},
+        {kContentTypeName,
+         sizeof(kContentTypeName) - 1,
+         kBareMultipartValue,
+         sizeof(kBareMultipartValue) - 1},
+    };
+    header_count = 2;
+    CHECK_FALSE(
+        normalize_partial_content_headers(range_with_malformed_multipart, &header_count, 206));
 
     static const char kInvalidRange[] = "bytes 4-3/100";
     ResponseHeaderKV invalid[] = {
@@ -7080,6 +7090,45 @@ TEST(buffered_forward, failure_response_closes_after_full_send) {
         &loop, *conn, make_ev(conn->id, IoEventType::Send, static_cast<i32>(wire_len)));
 
     CHECK(loop.find_fd(fd) == nullptr);
+}
+
+TEST(buffered_forward, failure_response_refreshes_downstream_send_deadline) {
+    SmallLoop loop;
+    loop.setup();
+    loop.keepalive_timeout = 5;
+    auto* conn = setup_proxy_conn(loop);
+    REQUIRE(conn != nullptr);
+    const i32 fd = conn->fd;
+    loop.timer.refresh(conn, 0);
+
+    buffered_forward_fail(&loop, *conn, 502);
+    loop.dispatch(make_ev(0, IoEventType::Timeout, 1));
+
+    CHECK(loop.find_fd(fd) != nullptr);
+}
+
+TEST(buffered_forward, completed_response_refreshes_downstream_send_deadline) {
+    SmallLoop loop;
+    loop.setup();
+    loop.keepalive_timeout = 5;
+    auto* conn = setup_proxy_conn(loop);
+    REQUIRE(conn != nullptr);
+    const i32 fd = conn->fd;
+    conn->proxy_response_buffered = true;
+    conn->reset_jit_ctx();
+    loop.timer.refresh(conn, 0);
+
+    static constexpr char kUpstream[] =
+        "HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok";
+    conn->upstream_recv_buf.reset();
+    conn->upstream_recv_buf.write(reinterpret_cast<const u8*>(kUpstream), sizeof(kUpstream) - 1);
+    on_upstream_response<SmallLoop>(
+        &loop,
+        *conn,
+        make_ev(conn->id, IoEventType::UpstreamRecv, static_cast<i32>(sizeof(kUpstream) - 1)));
+    loop.dispatch(make_ev(0, IoEventType::Timeout, 1));
+
+    CHECK(loop.find_fd(fd) != nullptr);
 }
 
 TEST(buffered_forward, head_failure_suppresses_reason_phrase_body) {

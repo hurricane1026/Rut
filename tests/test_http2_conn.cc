@@ -1798,6 +1798,51 @@ TEST(h2_serving, selected_buffered_forward_preserves_declared_length_validation)
     CHECK_GT(dispatch.resp_len, 0u);
 }
 
+TEST(h2_serving, ended_buffered_forward_rejects_nonzero_declared_length) {
+    const hpack::Header headers[] = {{{":method", 7}, {"POST", 4}},
+                                     {{":path", 5}, {"/upload", 7}},
+                                     {{":scheme", 7}, {"https", 5}},
+                                     {{":authority", 10}, {"example", 7}},
+                                     {{"content-length", 14}, {"100", 3}}};
+    Http2Conn h2;
+    h2.init();
+    Connection conn;
+    conn.reset();
+    conn.h2 = &h2;
+    RouteConfig config;
+    REQUIRE(config.add_jit_handler("/upload", kRouteMethodPost, &h2_buffered_forward, false, true));
+    conn.request_config = &config;
+    FakeH2Loop loop;
+    u8 response[512]{};
+    H2Dispatch<FakeH2Loop> dispatch{&loop, &conn, response, sizeof(response), 0, false};
+
+    h2_buffered_forward_calls = 0;
+    h2_dispatch_request(dispatch, 1, headers, 5, /*end_stream=*/true);
+
+    CHECK_EQ(h2_buffered_forward_calls, 0u);
+    CHECK_EQ(h2.pending_stream, 0u);
+    CHECK_EQ(h2.async_stream, 0u);
+    CHECK_GT(dispatch.resp_len, 0u);
+    Http2FrameHeader frame{};
+    REQUIRE(parse_frame_header(response, dispatch.resp_len, &frame) == ParseStatus::Complete);
+    hpack::DynamicTable dyn;
+    dyn.init(4096);
+    hpack::Header decoded[4];
+    u8 scratch[64];
+    u32 decoded_count = 0;
+    REQUIRE(hpack::decode_header_block(dyn,
+                                       response + kFrameHeaderSize,
+                                       frame.length,
+                                       scratch,
+                                       sizeof(scratch),
+                                       decoded,
+                                       static_cast<u32>(std::size(decoded)),
+                                       &decoded_count));
+    REQUIRE_GT(decoded_count, 0u);
+    CHECK(decoded[0].name.eq({":status", 7}));
+    CHECK(decoded[0].value.eq({"400", 3}));
+}
+
 TEST(h2_serving, buffered_forward_route_acknowledges_declared_expect_continue) {
     const hpack::Header headers[] = {{{":method", 7}, {"POST", 4}},
                                      {{":path", 5}, {"/upload", 7}},
