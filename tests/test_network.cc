@@ -5959,6 +5959,11 @@ TEST(buffered_forward, status_mutations_enforce_partial_content_metadata) {
     CHECK_EQ(invalid_upstream_partial.first, 502u);
     CHECK(invalid_upstream_partial.second.find("Content-Range") == std::string::npos);
 
+    const auto ambiguous_upstream_partial = run(206, true, 206, false, true);
+    CHECK_EQ(ambiguous_upstream_partial.first, 502u);
+    const auto ambiguous_mutated_partial = run(206, true, 206, true, true);
+    CHECK_EQ(ambiguous_mutated_partial.first, 500u);
+
     const auto invalid_multipart_full = run(206, false, 200, true, true);
     CHECK_EQ(invalid_multipart_full.first, 500u);
 
@@ -6425,6 +6430,13 @@ TEST(buffered_forward, h2_validates_head_ranges_and_replaced_multipart_bodies) {
         "Content-Range: bytes 0-3/100\r\n\r\ndata";
     run(kPartialNotModified, sizeof(kPartialNotModified) - 1, 4, false, false, 500, 200);
     run(kPartialNotModified, sizeof(kPartialNotModified) - 1, 4, false, false, 304, 304, false);
+
+    static constexpr char kAmbiguousPartial[] =
+        "HTTP/1.1 206 Partial Content\r\nContent-Length: 4\r\n"
+        "Content-Range: bytes 0-3/100\r\n"
+        "Content-Type: multipart/byteranges; boundary=origin\r\n\r\ndata";
+    run(kAmbiguousPartial, sizeof(kAmbiguousPartial) - 1, 4, false, false, 502);
+    run(kAmbiguousPartial, sizeof(kAmbiguousPartial) - 1, 4, false, false, 500, 206);
 }
 
 TEST(buffered_forward, h2_bodyless_head_and_304_allow_unsupported_transfer_coding) {
@@ -7013,6 +7025,38 @@ TEST(buffered_forward, drains_partial_client_sends_before_completion) {
     REQUIRE(retry != nullptr);
     CHECK_EQ(retry->send_buf, wire + 7);
     CHECK_EQ(retry->send_len, wire_len - 7);
+}
+
+TEST(buffered_forward, raced_upstream_error_does_not_truncate_complete_response) {
+    SmallLoop loop;
+    loop.setup();
+    auto* conn = setup_proxy_conn(loop);
+    REQUIRE(conn != nullptr);
+    conn->proxy_response_buffered = true;
+    conn->req_keep_alive = true;
+    conn->keep_alive = true;
+    conn->reset_jit_ctx();
+
+    static constexpr char kUpstream[] =
+        "HTTP/1.1 200 OK\r\nContent-Length: 4\r\nConnection: keep-alive\r\n\r\ndata";
+    conn->upstream_recv_buf.reset();
+    conn->upstream_recv_buf.write(reinterpret_cast<const u8*>(kUpstream), sizeof(kUpstream) - 1);
+    on_upstream_response<SmallLoop>(
+        &loop,
+        *conn,
+        make_ev(conn->id, IoEventType::UpstreamRecv, static_cast<i32>(sizeof(kUpstream) - 1)));
+
+    REQUIRE(conn->buffered_proxy_send_in_progress);
+    REQUIRE(conn->upstream_keep_alive);
+    const i32 client_fd = conn->fd;
+    loop.dispatch_event(*conn, make_ev(conn->id, IoEventType::UpstreamRecv, -ECONNRESET));
+    CHECK_EQ(conn->fd, client_fd);
+    CHECK_FALSE(conn->upstream_keep_alive);
+
+    const u32 wire_len = conn->send_buf.len();
+    on_proxy_response_sent<SmallLoop>(
+        &loop, *conn, make_ev(conn->id, IoEventType::Send, static_cast<i32>(wire_len)));
+    CHECK(loop.find_fd(client_fd) != nullptr);
 }
 
 TEST(buffered_forward, failure_response_closes_after_full_send) {

@@ -2858,6 +2858,15 @@ inline bool response_is_multipart_byteranges(const ResponseHeaderKV* headers, u3
     return content_type_count == 1 && multipart;
 }
 
+inline bool response_has_multipart_byteranges(const ResponseHeaderKV* headers, u32 header_count) {
+    for (u32 i = 0; i < header_count; i++) {
+        if (http_header_name_eq_ci(headers[i].key_data, headers[i].key_len, "content-type", 12) &&
+            content_type_is_multipart_byteranges({headers[i].value_data, headers[i].value_len}))
+            return true;
+    }
+    return false;
+}
+
 inline bool upstream_response_is_multipart_byteranges(const ParsedResponse& resp) {
     for (u32 i = 0; i < resp.header_count; i++) {
         const Str name = resp.headers[i].name;
@@ -2914,7 +2923,9 @@ inline bool normalize_partial_content_headers(ResponseHeaderKV* headers,
             continue;
         }
     }
-    return status != 206 || found || response_is_multipart_byteranges(headers, *header_count);
+    if (status != 206) return true;
+    if (found) return !response_has_multipart_byteranges(headers, *header_count);
+    return response_is_multipart_byteranges(headers, *header_count);
 }
 
 inline bool response_mutates_partial_content_metadata(const jit::HandlerCtx* ctx) {

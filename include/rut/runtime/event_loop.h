@@ -116,6 +116,12 @@ public:
             case IoEventType::UpstreamRecv:
                 if (conn.on_upstream_recv) {
                     conn.on_upstream_recv(&self(), conn, ev);
+                } else if (ev.result < 0 && conn.buffered_proxy_send_in_progress) {
+                    // A complete buffered response already lives in send_buf. An
+                    // io_uring multishot recv may still terminate after the body
+                    // CQE that completed it; that terminal only makes the backend
+                    // ineligible for reuse and must not truncate the client send.
+                    conn.upstream_keep_alive = false;
                 } else if (ev.result < 0 && conn.state != ConnState::ReadingHeader &&
                            !conn.upstream_abandoned) {
                     // -ENOBUFS: upstream_recv_buf full, close to prevent hot-loop.
