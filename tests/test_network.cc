@@ -5844,6 +5844,12 @@ TEST(buffered_forward, final_status_normalizes_content_range) {
     };
     header_count = 1;
     CHECK(normalize_partial_content_headers(multipart, &header_count, 206, 123, true));
+    static const char kMultipartWithExtraParameters[] =
+        "multipart/byteranges; charset=us-ascii; boundary=\"example\"; version=1";
+    multipart[0].value_data = kMultipartWithExtraParameters;
+    multipart[0].value_len = sizeof(kMultipartWithExtraParameters) - 1;
+    header_count = 1;
+    CHECK(normalize_partial_content_headers(multipart, &header_count, 206, 123, true));
     static const char kJsonValue[] = "application/json";
     ResponseHeaderKV ambiguous_multipart[] = {
         {kContentTypeName, sizeof(kContentTypeName) - 1, kJsonValue, sizeof(kJsonValue) - 1},
@@ -5870,6 +5876,21 @@ TEST(buffered_forward, final_status_normalizes_content_range) {
     bare_multipart[0].value_len = sizeof(kEmptyBoundaryValue) - 1;
     header_count = 1;
     CHECK_FALSE(normalize_partial_content_headers(bare_multipart, &header_count, 206));
+
+    static const char* kMalformedMultipartValues[] = {
+        "multipart/byteranges; boundary=good; boundary=other",
+        "multipart/byteranges; boundary=good; boundary=",
+        "multipart/byteranges; boundary=good garbage",
+        "multipart/byteranges; boundary=\"good\" garbage",
+        "multipart/byteranges; boundary=\"unterminated",
+        "multipart/byteranges; boundary=good; broken",
+    };
+    for (const char* value : kMalformedMultipartValues) {
+        bare_multipart[0].value_data = value;
+        bare_multipart[0].value_len = static_cast<u32>(__builtin_strlen(value));
+        header_count = 1;
+        CHECK_FALSE(normalize_partial_content_headers(bare_multipart, &header_count, 206));
+    }
 
     static const char kInvalidRange[] = "bytes 4-3/100";
     ResponseHeaderKV invalid[] = {
@@ -5944,6 +5965,102 @@ TEST(buffered_forward, status_mutations_enforce_partial_content_metadata) {
     const auto partial_not_modified = run(206, true, 304);
     CHECK_EQ(partial_not_modified.first, 304u);
     CHECK(partial_not_modified.second.find("Content-Length: 4") == std::string::npos);
+}
+
+TEST(buffered_forward, bodyless_status_promotion_requires_replacement_body) {
+    static constexpr char kUpstream[] =
+        "HTTP/1.1 304 Not Modified\r\nContent-Length: 123\r\n"
+        "Content-Encoding: gzip\r\nETag: \"origin\"\r\n"
+        "Last-Modified: Sat, 25 Jul 2026 09:00:00 GMT\r\nConnection: close\r\n\r\n";
+
+    {
+        SmallLoop loop;
+        loop.setup();
+        auto* conn = setup_proxy_conn(loop);
+        REQUIRE(conn != nullptr);
+        conn->proxy_response_buffered = true;
+        auto* ctx = conn->reset_jit_ctx();
+        ctx->response_status = 200;
+        ctx->response_status_set = true;
+        conn->upstream_recv_buf.reset();
+        conn->upstream_recv_buf.write(reinterpret_cast<const u8*>(kUpstream),
+                                      sizeof(kUpstream) - 1);
+        on_upstream_response<SmallLoop>(
+            &loop,
+            *conn,
+            make_ev(conn->id, IoEventType::UpstreamRecv, static_cast<i32>(sizeof(kUpstream) - 1)));
+
+        CHECK_EQ(conn->resp_status, 500u);
+        const char* wire = reinterpret_cast<const char*>(conn->send_buf.data());
+        CHECK(!buf_contains(wire, conn->send_buf.len(), "Content-Encoding", 16));
+        CHECK(!buf_contains(wire, conn->send_buf.len(), "ETag", 4));
+        CHECK(!buf_contains(wire, conn->send_buf.len(), "Last-Modified", 13));
+    }
+
+    {
+        SmallLoop loop;
+        loop.setup();
+        loop.inject_and_dispatch(make_ev(0, IoEventType::Accept, 42));
+        auto* conn = loop.find_fd(42);
+        REQUIRE(conn != nullptr);
+        REQUIRE(loop.alloc_upstream_buf(*conn));
+        Http2Conn h2{};
+        h2.init();
+        h2.async_stream = 1;
+        h2.async_kind = H2AsyncKind::Proxy;
+        h2.async_apply_response_mutations = true;
+        conn->h2 = &h2;
+        conn->protocol = ConnProtocol::Http2;
+        conn->state = ConnState::Proxying;
+        conn->upstream_fd = dup(2);
+        REQUIRE(conn->upstream_fd >= 0);
+        conn->reset_jit_ctx();
+        auto* ctx = h2.async_jit_ctx();
+        ctx->response_status = 200;
+        ctx->response_status_set = true;
+        conn->upstream_recv_buf.write(reinterpret_cast<const u8*>(kUpstream),
+                                      sizeof(kUpstream) - 1);
+        HttpResponseParser parser;
+        parser.reset();
+        ParsedResponse resp{};
+        REQUIRE(parser.parse(conn->upstream_recv_buf.data(),
+                             conn->upstream_recv_buf.len(),
+                             &resp) == ParseStatus::Complete);
+        loop.backend.clear_ops();
+        h2_proxy_finish(&loop, *conn, resp, parser.header_end, 0, false);
+
+        const auto* send = loop.backend.last_op(MockOp::Send);
+        REQUIRE(send != nullptr);
+        Http2FrameHeader frame{};
+        REQUIRE(parse_frame_header(send->send_buf, send->send_len, &frame) ==
+                ParseStatus::Complete);
+        REQUIRE_EQ(frame.type, static_cast<u8>(Http2FrameType::Headers));
+        hpack::DynamicTable dyn;
+        dyn.init(4096);
+        hpack::Header headers[8];
+        u8 scratch[256];
+        u32 header_count = 0;
+        REQUIRE(hpack::decode_header_block(dyn,
+                                           send->send_buf + kFrameHeaderSize,
+                                           frame.length,
+                                           scratch,
+                                           sizeof(scratch),
+                                           headers,
+                                           static_cast<u32>(std::size(headers)),
+                                           &header_count));
+        bool found_status = false;
+        bool found_representation_metadata = false;
+        for (u32 i = 0; i < header_count; i++) {
+            found_status |=
+                headers[i].name.eq(Str{":status", 7}) && headers[i].value.eq(Str{"500", 3});
+            found_representation_metadata |= headers[i].name.eq(Str{"content-encoding", 16}) ||
+                                             headers[i].name.eq(Str{"etag", 4}) ||
+                                             headers[i].name.eq(Str{"last-modified", 13});
+        }
+        CHECK(found_status);
+        CHECK_FALSE(found_representation_metadata);
+        conn->h2 = nullptr;
+    }
 }
 
 TEST(buffered_forward, head_206_without_content_length_keeps_structural_range) {

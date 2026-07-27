@@ -2793,38 +2793,56 @@ inline bool content_type_is_multipart_byteranges(Str value) {
     u32 pos = start + sizeof(kMultipart) - 1;
     if (pos < value.len && value.ptr[pos] != ';' && value.ptr[pos] != ' ' && value.ptr[pos] != '\t')
         return false;
+    bool found_boundary = false;
     while (pos < value.len) {
         while (pos < value.len && (value.ptr[pos] == ' ' || value.ptr[pos] == '\t')) pos++;
-        if (pos == value.len || value.ptr[pos] != ';') break;
+        if (pos == value.len) break;
+        if (value.ptr[pos] != ';') return false;
         pos++;
         while (pos < value.len && (value.ptr[pos] == ' ' || value.ptr[pos] == '\t')) pos++;
         const u32 name_start = pos;
-        while (pos < value.len && value.ptr[pos] != '=' && value.ptr[pos] != ';' &&
-               value.ptr[pos] != ' ' && value.ptr[pos] != '\t')
-            pos++;
+        while (pos < value.len && is_http_tchar(static_cast<u8>(value.ptr[pos]))) pos++;
         const u32 name_len = pos - name_start;
+        if (name_len == 0) return false;
         while (pos < value.len && (value.ptr[pos] == ' ' || value.ptr[pos] == '\t')) pos++;
-        if (pos == value.len || value.ptr[pos] != '=') continue;
+        if (pos == value.len || value.ptr[pos] != '=') return false;
         pos++;
         while (pos < value.len && (value.ptr[pos] == ' ' || value.ptr[pos] == '\t')) pos++;
         const bool boundary =
             http_header_name_eq_ci(value.ptr + name_start, name_len, "boundary", 8);
+        if (boundary && found_boundary) return false;
+        bool has_value = false;
         if (pos < value.len && value.ptr[pos] == '"') {
             pos++;
-            const u32 value_start = pos;
-            while (pos < value.len && value.ptr[pos] != '"') pos++;
-            if (boundary) return pos > value_start && pos < value.len;
-            if (pos < value.len) pos++;
-        } else {
-            const u32 value_start = pos;
-            while (pos < value.len && value.ptr[pos] != ';' && value.ptr[pos] != ' ' &&
-                   value.ptr[pos] != '\t')
+            while (pos < value.len && value.ptr[pos] != '"') {
+                const u8 ch = static_cast<u8>(value.ptr[pos]);
+                if (ch == '\\') {
+                    pos++;
+                    if (pos == value.len) return false;
+                    const u8 escaped = static_cast<u8>(value.ptr[pos]);
+                    if (escaped == '\r' || escaped == '\n' || escaped == 0x7f ||
+                        (escaped < 0x20 && escaped != '\t'))
+                        return false;
+                } else if (ch == '\r' || ch == '\n' || ch == 0x7f || (ch < 0x20 && ch != '\t')) {
+                    return false;
+                }
+                has_value = true;
                 pos++;
-            if (boundary) return pos > value_start;
+            }
+            if (pos == value.len) return false;
+            pos++;
+        } else {
+            while (pos < value.len && is_http_tchar(static_cast<u8>(value.ptr[pos]))) {
+                has_value = true;
+                pos++;
+            }
         }
-        while (pos < value.len && value.ptr[pos] != ';') pos++;
+        if (!has_value) return false;
+        if (boundary) found_boundary = true;
+        while (pos < value.len && (value.ptr[pos] == ' ' || value.ptr[pos] == '\t')) pos++;
+        if (pos < value.len && value.ptr[pos] != ';') return false;
     }
-    return false;
+    return found_boundary;
 }
 
 inline bool response_is_multipart_byteranges(const ResponseHeaderKV* headers, u32 header_count) {
@@ -3095,6 +3113,13 @@ void h2_proxy_finish(Loop* loop,
         response_ctx != nullptr && response_ctx->response_body_mutation_set;
     const bool final_status_carries_body =
         status >= 200 && status != 204 && status != 205 && status != 304;
+    const bool upstream_status_forbids_body = resp.status_code < 200 || resp.status_code == 204 ||
+                                              resp.status_code == 205 || resp.status_code == 304;
+    if (mutations_valid && !is_head && upstream_status_forbids_body && final_status_carries_body &&
+        !response_body_mutated) {
+        mutations_valid = false;
+        status = 500;
+    }
     if (mutations_valid && resp.status_code == 206 && status != 206 && final_status_carries_body &&
         !response_body_mutated && upstream_response_is_multipart_byteranges(resp)) {
         mutations_valid = false;
@@ -4983,6 +5008,13 @@ void finish_buffered_forward(Loop* loop,
     }
     const bool final_status_carries_body =
         status >= 200 && status != 204 && status != 205 && status != 304;
+    const bool upstream_status_forbids_body = resp.status_code < 200 || resp.status_code == 204 ||
+                                              resp.status_code == 205 || resp.status_code == 304;
+    if (!is_head && upstream_status_forbids_body && final_status_carries_body &&
+        !response_ctx->response_body_mutation_set) {
+        buffered_forward_fail(loop, conn, 500);
+        return;
+    }
     if (resp.status_code == 206 && status != 206 && final_status_carries_body &&
         !response_ctx->response_body_mutation_set &&
         upstream_response_is_multipart_byteranges(resp)) {
