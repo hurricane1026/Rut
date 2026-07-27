@@ -79,6 +79,48 @@ bool publish_terminal(const HarnessSpec& spec,
     return false;
 }
 
+bool publish_response_body(const HarnessSpec& spec,
+                           HarnessResult& result,
+                           const Connection& connection,
+                           u64 timestamp_us) {
+    if (result.semantic_events >= spec.limits.max_semantic_events) {
+        result.outcome = Outcome::Failed;
+        result.has_reached_limit = true;
+        result.reached_limit = LimitKind::SemanticEvents;
+        copy_detail(result, "semantic-events limit reached");
+        return false;
+    }
+
+    const u8* response = connection.send_buf.data();
+    const u32 response_len = connection.send_buf.len();
+    u32 body_offset = response_len;
+    for (u32 i = 0; i + 3 < response_len; i++) {
+        if (response[i] == '\r' && response[i + 1] == '\n' && response[i + 2] == '\r' &&
+            response[i + 3] == '\n') {
+            body_offset = i + 4;
+            break;
+        }
+    }
+
+    constexpr u32 kMaxObservedBodyLen = 4096;
+    const u32 body_len = response_len - body_offset;
+    const u32 observed_len = body_len < kMaxObservedBodyLen ? body_len : kMaxObservedBodyLen;
+    Observation event{};
+    event.kind = ObservationKind::ResponseBodyProduced;
+    event.phase = Phase::Observe;
+    event.sequence = result.semantic_events;
+    event.timestamp_us = timestamp_us;
+    event.value0 = body_len;
+    event.value1 = observed_len != body_len ? 1 : 0;
+    event.label = {reinterpret_cast<const char*>(response + body_offset), observed_len};
+    result.semantic_events++;
+    if (spec.observations.publish(event)) return true;
+
+    result.outcome = Outcome::Mismatched;
+    copy_detail(result, "observation rejected by oracle");
+    return false;
+}
+
 bool publish_route_selected(const HarnessSpec& spec,
                             HarnessResult& result,
                             u32 route_index,
@@ -119,8 +161,19 @@ bool account_terminal_output(const HarnessSpec& spec,
     if (terminal.action != jit::HandlerAction::ReturnStatus) return true;
 
     connection.resp_status = terminal.status_code;
+    if (response_ctx != nullptr && response_ctx->captured_response_valid &&
+        connection.req_method == static_cast<u8>(LogHttpMethod::Connect) &&
+        terminal.status_code >= 200 && terminal.status_code < 300) {
+        terminal = jit::HandlerResult::make_status(502);
+        connection.resp_status = 502;
+        response_ctx = nullptr;
+        dynamic_body = nullptr;
+        dynamic_body_len = 0;
+        dynamic_body_valid = false;
+    }
     bool wants_dynamic_body = terminal.upstream_id == jit::HandlerResult::kDynamicResponseBody;
-    if (wants_dynamic_body && (!dynamic_body_valid || dynamic_body == nullptr) &&
+    if (wants_dynamic_body &&
+        (!dynamic_body_valid || (dynamic_body == nullptr && dynamic_body_len != 0)) &&
         !response_status_forbids_body(terminal.status_code)) {
         // Match production dispatch: turn the failed serializer into a 500,
         // discard only its body marker, and continue through normal response
@@ -134,17 +187,39 @@ bool account_terminal_output(const HarnessSpec& spec,
     const bool has_body = !wants_dynamic_body && terminal.upstream_id != 0 && config != nullptr &&
                           terminal.upstream_id <= config->response_body_count;
     const bool suppress_body = connection.req_method == static_cast<u8>(LogHttpMethod::Head);
-    constexpr u32 kMaxHeaders = RouteConfig::kMaxHeadersPerSet + jit::kMaxResponseHeaderMutations;
+    constexpr u32 kMaxHeaders = RouteConfig::kMaxHeadersPerSet + jit::kMaxCapturedResponseHeaders +
+                                jit::kMaxResponseHeaderMutations;
     ResponseHeaderKV headers[kMaxHeaders];
     u32 header_count = 0;
-    if (!collect_effective_response_headers(
-            response_ctx, config, terminal.next_state, headers, kMaxHeaders, &header_count)) {
+    const bool captured_response = response_ctx != nullptr && response_ctx->captured_response_valid;
+    if (captured_response &&
+        ((response_ctx->captured_response_status == 206 && terminal.status_code != 206) ||
+         (!suppress_body && (response_ctx->captured_response_status == 204 ||
+                             response_ctx->captured_response_status == 205 ||
+                             response_ctx->captured_response_status == 304))) &&
+        !response_status_forbids_body(terminal.status_code) &&
+        !response_ctx->response_body_mutation_set) {
+        terminal = jit::HandlerResult::make_status(500);
         connection.resp_status = 500;
         format_static_response(connection, 500, false, suppress_body);
-    } else if (header_count != 0) {
+        return true;
+    }
+    if (!collect_effective_response_headers(response_ctx,
+                                            config,
+                                            terminal.next_state,
+                                            headers,
+                                            kMaxHeaders,
+                                            &header_count,
+                                            true,
+                                            terminal.status_code)) {
+        connection.resp_status = 500;
+        format_static_response(connection, 500, false, suppress_body);
+    } else if (header_count != 0 || captured_response) {
         const char* body_data = nullptr;
         u32 body_len = 0;
-        bool fallback_body = false;
+        const bool body_mutated =
+            response_ctx != nullptr && response_ctx->response_body_mutation_set;
+        bool fallback_body = captured_response && !body_mutated;
         if (wants_dynamic_body) {
             body_data = dynamic_body;
             body_len = dynamic_body_len;
@@ -157,15 +232,58 @@ bool account_terminal_output(const HarnessSpec& spec,
             while (body_data[body_len] != '\0') body_len++;
             fallback_body = true;
         }
-        format_response_with_body_and_headers(connection,
-                                              terminal.status_code,
-                                              body_data,
-                                              body_len,
-                                              headers,
-                                              header_count,
-                                              connection.keep_alive,
-                                              fallback_body,
-                                              suppress_body);
+        const bool captured_head = captured_response && suppress_body;
+        bool captured_has_content_length = false;
+        u64 captured_content_length = 0;
+        if (captured_response && !body_mutated) {
+            for (u32 i = 0; i < header_count; i++) {
+                if (!http_header_name_eq_ci(
+                        headers[i].key_data, headers[i].key_len, "content-length", 14))
+                    continue;
+                captured_has_content_length = parse_content_length_value(
+                    {headers[i].value_data, headers[i].value_len}, &captured_content_length);
+                break;
+            }
+        }
+        const bool status_forbids_content_length = terminal.status_code < 200 ||
+                                                   terminal.status_code == 204 ||
+                                                   terminal.status_code == 205;
+        const bool preserve_captured_content_length =
+            captured_has_content_length &&
+            (terminal.status_code == 205 ? captured_content_length == 0
+                                         : captured_head || terminal.status_code == 304);
+        const bool omit_content_length =
+            terminal.status_code < 200 || terminal.status_code == 204 ||
+            (terminal.status_code == 205 && !preserve_captured_content_length) ||
+            (terminal.status_code == 304 && !captured_has_content_length);
+        const u64 range_representation_length =
+            captured_head && !body_mutated && captured_has_content_length ? captured_content_length
+                                                                          : body_len;
+        if (!normalize_partial_content_headers(
+                headers,
+                &header_count,
+                terminal.status_code,
+                range_representation_length,
+                !captured_head || body_mutated || captured_has_content_length)) {
+            terminal = jit::HandlerResult::make_status(500);
+            connection.resp_status = 500;
+            format_static_response(connection, 500, false, suppress_body);
+        } else {
+            format_response_with_body_and_headers(
+                connection,
+                terminal.status_code,
+                body_data,
+                body_len,
+                headers,
+                header_count,
+                connection.keep_alive,
+                fallback_body,
+                suppress_body,
+                preserve_captured_content_length,
+                captured_head && body_mutated && !status_forbids_content_length ? body_len
+                                                                                : 0xffffffffu,
+                omit_content_length);
+        }
     } else if (wants_dynamic_body) {
         format_response_with_body(connection,
                                   terminal.status_code,
@@ -239,6 +357,26 @@ ScenarioResult drive_scenario(const ScenarioSpec& scenario, const HarnessSpec& h
         out.harness.outcome = Outcome::Invalid;
         out.harness.cleanup = CleanupOutcome::Clean;
         copy_detail(out.harness, "scripted faults capability was not declared");
+        return out;
+    }
+    const bool declares_control_plane =
+        declared(harness.required_capabilities, Capability::ControlPlaneSnapshot);
+    if (declares_control_plane != (scenario.control_plane_snapshot != nullptr)) {
+        out.harness.outcome = Outcome::Invalid;
+        out.harness.cleanup = CleanupOutcome::Clean;
+        copy_detail(out.harness,
+                    declares_control_plane ? "control-plane snapshot fixture is missing"
+                                           : "control-plane snapshot capability was not declared");
+        return out;
+    }
+    if (scenario.control_plane_snapshot != nullptr &&
+        (!scenario.control_plane_snapshot->valid ||
+         scenario.control_plane_snapshot->shard_count == 0 ||
+         scenario.control_plane_snapshot->shard_id >=
+             scenario.control_plane_snapshot->shard_count)) {
+        out.harness.outcome = Outcome::Invalid;
+        out.harness.cleanup = CleanupOutcome::Clean;
+        copy_detail(out.harness, "control-plane snapshot fixture is invalid");
         return out;
     }
     if (scenario.target == nullptr || !scenario.target->prepared) {
@@ -337,6 +475,14 @@ ScenarioResult drive_scenario(const ScenarioSpec& scenario, const HarnessSpec& h
         out.harness.outcome = Outcome::Failed;
         out.harness.cleanup = CleanupOutcome::Clean;
         copy_detail(out.harness, "scenario route did not match");
+        connection.destroy();
+        return out;
+    }
+    if (route->needs_control_plane_snapshot &&
+        (!declares_control_plane || scenario.control_plane_snapshot == nullptr)) {
+        out.harness.outcome = Outcome::Invalid;
+        out.harness.cleanup = CleanupOutcome::Clean;
+        copy_detail(out.harness, "selected route requires a control-plane snapshot fixture");
         connection.destroy();
         return out;
     }
@@ -461,6 +607,17 @@ ScenarioResult drive_scenario(const ScenarioSpec& scenario, const HarnessSpec& h
         HandlerExecution execution{};
         execution.init(
             route->fn, &connection.connection, scenario.request_data, scenario.request_len);
+        if (scenario.control_plane_snapshot != nullptr) {
+            auto* snapshot = jit::acquire_control_plane_snapshot(&execution.frame.context);
+            if (snapshot == nullptr) {
+                out.harness.outcome = Outcome::Failed;
+                out.harness.cleanup = CleanupOutcome::Clean;
+                copy_detail(out.harness, "control-plane snapshot allocation failed");
+                connection.destroy();
+                return out;
+            }
+            *snapshot = *scenario.control_plane_snapshot;
+        }
         execution.frame.context.route_param_count = route_param_count;
         for (u32 i = 0; i < route_param_count; i++)
             execution.frame.context.route_params[i] = route_params[i];
@@ -481,6 +638,16 @@ ScenarioResult drive_scenario(const ScenarioSpec& scenario, const HarnessSpec& h
         dynamic_response_body = driven.dynamic_response_body;
         dynamic_response_body_len = driven.dynamic_response_body_len;
         dynamic_response_body_valid = driven.dynamic_response_body_valid;
+        if (driven.uses_captured_response) {
+            dynamic_response_body = driven.captured_response_body;
+            dynamic_response_body_len = driven.captured_response_body_len;
+            dynamic_response_body_valid = true;
+            response_ctx.captured_response_valid = true;
+            response_ctx.captured_response_status = driven.captured_response_status;
+            response_ctx.response_body_mutation_set = driven.captured_response_body_mutated;
+            response_ctx.captured_response_header_count = driven.captured_response_header_count;
+            response_ctx.captured_response_headers = driven.captured_response_headers;
+        }
         response_ctx.response_header_count = driven.response_header_count;
         response_ctx.response_header_overflow = driven.response_header_overflow;
         for (u32 i = 0; i < driven.response_header_count; i++)
@@ -499,6 +666,11 @@ ScenarioResult drive_scenario(const ScenarioSpec& scenario, const HarnessSpec& h
 
     if (out.has_terminal && out.harness.outcome == Outcome::Passed)
         (void)publish_terminal(harness, out.harness, out.terminal, scenario.now_us);
+
+    if (out.has_terminal && out.terminal.action == jit::HandlerAction::ReturnStatus &&
+        out.harness.outcome == Outcome::Passed)
+        (void)publish_response_body(
+            harness, out.harness, connection.connection, out.harness.virtual_time_us);
 
     if (out.harness.outcome == Outcome::Passed && out.has_terminal &&
         !expectation_matches(scenario.expected, out.terminal)) {

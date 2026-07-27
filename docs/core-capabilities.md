@@ -83,22 +83,20 @@ chain secure_upload {
     before require_auth(req) else 401
 }
 
-route {
-    use chain secure_upload
-
-    POST "/data" {
-        return 204
-    }
+route POST "/data" use chain secure_upload {
+    return 204
 }
 ```
 
 The request-side chain boundary is `before` handler. More precise sequencing
 belongs inside the handler body. `before` steps may fail closed with an explicit
 status. The implemented `after` slice accepts ordered Response header, status,
-and bounded body effects in resumable state, including across visible `wait`
-suspensions. A forwarded response must use terminal
-`forward(..., buffered: true)`; first-class buffered Response expressions remain
-experimental. Group chains and entry chains compose in source order.
+and bounded body effects in resumable state, including on routes containing
+`wait` or verifier-bounded `for`. A forwarded response must use terminal
+`forward(..., buffered: true)`, or bind the same buffered operation as a
+first-class `Response` when the handler needs to inspect or mutate owned
+upstream fields. A Core route attaches one explicit chain, whose steps execute
+in source order.
 
 See [chains.md](chains.md) for the current design direction.
 The generated-code profile and compatibility migrations are listed in

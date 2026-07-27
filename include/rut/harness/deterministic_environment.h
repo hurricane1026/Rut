@@ -19,6 +19,12 @@ struct DeterministicCompletion {
     u32 data_len = 0;
     bool logical_fault_point = false;
     bool injected_fault = false;
+    // A successful expression-form buffered forward materializes this fixture
+    // before the handler resumes. The pointed-to bytes belong to the immutable
+    // schedule and therefore remain stable for the whole deterministic run.
+    u16 response_status = 0;
+    const jit::CapturedResponseHeader* response_headers = nullptr;
+    u8 response_header_count = 0;
 };
 
 enum class CompletionStatus : u8 {

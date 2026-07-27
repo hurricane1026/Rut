@@ -47,6 +47,15 @@ char* acquire_response_body_mutation_storage() {
     return g_response_body_mutation_pool.acquire();
 }
 
+ControlPlaneSnapshot* acquire_control_plane_snapshot(HandlerCtx* ctx) {
+    if (ctx == nullptr) return nullptr;
+    if (ctx->control_plane == nullptr)
+        ctx->control_plane =
+            static_cast<ControlPlaneSnapshot*>(malloc(sizeof(ControlPlaneSnapshot)));
+    if (ctx->control_plane != nullptr) *ctx->control_plane = {};
+    return ctx->control_plane;
+}
+
 const char* snapshot_response_body(HandlerCtx* ctx, const char* body, u32 len) {
     if (ctx == nullptr || body == nullptr || len > kMaxResponseBodyMutationBytes) return nullptr;
     const size_t allocation_size =
@@ -67,6 +76,8 @@ void retain_response_body_snapshot_storage(HandlerCtx* ctx) {
 
 void release_response_body_mutation_storage(HandlerCtx* ctx) {
     if (ctx == nullptr) return;
+    free(ctx->control_plane);
+    ctx->control_plane = nullptr;
     g_response_body_mutation_pool.release(ctx->response_body_mutation_storage);
     ctx->response_body_mutation_storage = nullptr;
     auto* snapshot = ctx->response_body_snapshot_storage;

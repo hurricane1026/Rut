@@ -3,10 +3,13 @@
 #include "core/expected.h"
 #include "rut/common/types.h"
 #include "rut/runtime/access_log.h"
+#include "rut/runtime/arena.h"
 #include "rut/runtime/callbacks.h"
 #include "rut/runtime/connection.h"
+#include "rut/runtime/control_plane_snapshot.h"
 #include "rut/runtime/drain.h"
 #include "rut/runtime/error.h"
+#include "rut/runtime/http2_conn.h"
 #include "rut/runtime/io_backend.h"
 #include "rut/runtime/io_event.h"
 #include "rut/runtime/jit_dispatch.h"  // jit::HandlerCtx for fire_due_timers
@@ -186,6 +189,9 @@ public:
     void fire_due_timers() {
         const RouteConfig** cfg_ptr = self().config_ptr;
         const RouteConfig* cfg = cfg_ptr ? *cfg_ptr : nullptr;
+        if (self().metrics_endpoint_enabled ||
+            (cfg != nullptr && cfg->has_control_plane_snapshot_consumer))
+            refresh_control_plane_memory_metrics(&self());
         const u64 now = monotonic_ns();
         // (Re)arm deadlines whenever the active config changes — first install or a
         // hot reload — so each timer's interval is measured from activation rather
@@ -213,6 +219,8 @@ public:
                 continue;
             if (now < timer_deadline_ns[i]) continue;
             jit::HandlerCtx ctx{};
+            if (cfg->timers[i].needs_control_plane_snapshot)
+                latch_control_plane_snapshot(&self(), &ctx);
             (void)cfg->timers[i].fn(nullptr, &ctx, nullptr, 0, nullptr);
             jit::release_response_body_mutation_storage(&ctx);
             timer_fire_count[i]++;
@@ -465,6 +473,10 @@ public:
 
     // Per-shard metrics. Set by Shard before run(). Null = no metrics.
     ShardMetrics* metrics = nullptr;
+    MmapArena* metrics_arena = nullptr;
+    ShardMetrics* const* all_shard_metrics = nullptr;
+    u32 shard_metrics_count = 0;
+    bool metrics_endpoint_enabled = false;
 
     // Per-shard control plane pointers. Set by Shard::init(), read by
     // poll_command() / epoch_enter() / epoch_leave() on the shard thread.
@@ -527,6 +539,13 @@ public:
                 retry_deferred_accepts();
             }
             poll_command();
+            // Publish owner-shard memory gauges after every completed event
+            // batch. A process-wide control-plane snapshot may aggregate this
+            // shard while another shard executes the handler.
+            const RouteConfig* metrics_cfg = config_ptr != nullptr ? *config_ptr : nullptr;
+            if (metrics_endpoint_enabled ||
+                (metrics_cfg != nullptr && metrics_cfg->has_control_plane_snapshot_consumer))
+                refresh_control_plane_memory_metrics(this);
             // Close listen fd after dispatching the current batch so any
             // already-queued accepts (epoll backlog) get a proper response
             // with Connection: close, rather than being dropped/reset.
@@ -599,6 +618,10 @@ public:
     // Called inline from dispatch() when a stale CQE completes reclamation,
     // so a later Accept in the same batch can reuse the slot immediately.
     void reclaim_slot(u32 cid) {
+        if (conns[cid].request_capture_slice) {
+            pool.free(conns[cid].request_capture_slice);
+            conns[cid].request_capture_slice = nullptr;
+        }
         if (conns[cid].recv_slice) {
             pool.free(conns[cid].recv_slice);
             conns[cid].recv_slice = nullptr;
@@ -630,6 +653,10 @@ public:
         for (u32 i = 0; i < pending_free_count; i++) {
             u32 cid = pending_free[i];
             if (conns[cid].pending_ops == 0) {
+                if (conns[cid].request_capture_slice) {
+                    pool.free(conns[cid].request_capture_slice);
+                    conns[cid].request_capture_slice = nullptr;
+                }
                 if (conns[cid].recv_slice) {
                     pool.free(conns[cid].recv_slice);
                     conns[cid].recv_slice = nullptr;
@@ -744,6 +771,10 @@ public:
     void free_conn_impl(Connection& c) {
         u32 cid = c.id;
         timer.remove(&c);
+        if (c.response_capture_slice) {
+            pool.free(c.response_capture_slice);
+            c.response_capture_slice = nullptr;
+        }
         // WebSocket terminate reassembly slices are CPU-only scratch (never handed to a
         // kernel op), so reclaim them now regardless of the async deferred path below.
         if (c.ws_c2u_msg) {
@@ -760,6 +791,7 @@ public:
             // need to defer. This avoids blocking alloc_conn at saturation
             // when a close and accept arrive in the same dispatch batch.
             if (c.pending_ops == 0) {
+                if (c.request_capture_slice) pool.free(c.request_capture_slice);
                 if (c.recv_slice) pool.free(c.recv_slice);
                 if (c.send_slice) pool.free(c.send_slice);
                 if (c.upstream_recv_slice) pool.free(c.upstream_recv_slice);
@@ -772,11 +804,13 @@ public:
             u8* rs = c.recv_slice;
             u8* ss = c.send_slice;
             u8* us = c.upstream_recv_slice;
+            u8* request_capture = c.request_capture_slice;
             u32 ops = c.pending_ops;
             c.reset();
             conns[cid].recv_slice = rs;
             conns[cid].send_slice = ss;
             conns[cid].upstream_recv_slice = us;
+            conns[cid].request_capture_slice = request_capture;
             conns[cid].pending_ops = ops;
             pending_free[pending_free_count++] = cid;
         } else {
@@ -785,6 +819,7 @@ public:
             if (c.recv_slice) pool.free(c.recv_slice);
             if (c.send_slice) pool.free(c.send_slice);
             if (c.upstream_recv_slice) pool.free(c.upstream_recv_slice);
+            if (c.request_capture_slice) pool.free(c.request_capture_slice);
             c.reset();
             free_stack[free_top++] = cid;
         }
@@ -906,7 +941,16 @@ public:
             // If a request was in flight (started but not completed),
             // decrement requests_active to avoid a permanent leak.
             if (c.req_start_us != 0) {
-                if (metrics->requests_active > 0) metrics->requests_active--;
+                metrics->on_request_cancel();
+            }
+            if (c.h2 != nullptr) {
+                for (u32 i = 0; i < c.h2->nstreams; i++) {
+                    if (!c.h2->streams[i].metrics_started) continue;
+                    metrics->on_request_cancel();
+                    c.h2->streams[i].metrics_started = false;
+                    c.h2->streams[i].metrics_pending_send = false;
+                    c.h2->streams[i].request_start_us = 0;
+                }
             }
             metrics->on_close();
         }

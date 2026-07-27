@@ -1435,6 +1435,573 @@ route GET "/api/users" {
     rir.destroy();
 }
 
+TEST(jit, control_plane_snapshots_serialize_exact_unsigned_json_and_fail_closed) {
+    const auto src = R"rut(
+route GET "/stats" { return 200, json(stats()) }
+route GET "/metrics" { return 200, json(metrics()) }
+route GET "/builder" {
+    let snapshot = stats()
+    let resp = response(200)
+    resp.body = json(snapshot)
+    return resp
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    REQUIRE(lower_to_rir(mir.value(), rir));
+    auto cg = codegen(rir.module);
+    REQUIRE(cg.ok);
+    JitEngine engine;
+    REQUIRE(engine.init());
+    REQUIRE(engine.compile(cg.mod, cg.ctx));
+
+    TestHandlerCtxFrame frame{};
+    auto* snapshot_ptr = jit::acquire_control_plane_snapshot(&frame.ctx);
+    REQUIRE(snapshot_ptr != nullptr);
+    auto& snapshot = *snapshot_ptr;
+    snapshot.valid = true;
+    snapshot.shard_id = 7;
+    snapshot.shard_count = 8;
+    snapshot.stats.requests_total = ~u64{0};
+    snapshot.stats.requests_active = 2;
+    snapshot.stats.connections_total = 3;
+    snapshot.stats.connections_active = 4;
+    snapshot.stats.connections_closed = 5;
+    for (u32 i = 0; i < jit::kControlPlaneLatencyBucketCount; i++)
+        snapshot.stats.request_latency_buckets[i] = 10 + i;
+    snapshot.stats.request_latency_sum_us = 21;
+    snapshot.stats.request_latency_count = 22;
+    snapshot.stats.memory_arena_used = 23;
+    snapshot.stats.memory_slices_used = 24;
+    snapshot.stats.memory_slices_free = 25;
+    snapshot.stats.memory_connections_used = 26;
+    snapshot.metrics.requests_total = 101;
+    snapshot.metrics.requests_active = 102;
+    snapshot.metrics.connections_total = 103;
+    snapshot.metrics.connections_active = 104;
+    snapshot.metrics.connections_closed = 105;
+    for (u32 i = 0; i < jit::kControlPlaneLatencyBucketCount; i++)
+        snapshot.metrics.request_latency_buckets[i] = 110 + i;
+    snapshot.metrics.request_latency_sum_us = 121;
+    snapshot.metrics.request_latency_count = 122;
+    snapshot.metrics.memory_arena_used = 123;
+    snapshot.metrics.memory_slices_used = 124;
+    snapshot.metrics.memory_slices_free = 125;
+    snapshot.metrics.memory_connections_used = 126;
+
+    static const Str kExpectedStats =
+        lit("{\"scope\":\"shard\",\"shard_id\":7,\"shard_count\":8,\"requests\":{"
+            "\"total\":18446744073709551615,\"active\":2,\"latency_us\":{"
+            "\"buckets\":[10,11,12,13,14,15,16,17,18,19,20],\"sum\":21,\"count\":22}},"
+            "\"connections\":{\"total\":3,\"active\":4,\"closed\":5},\"memory\":{"
+            "\"arena_used\":23,\"slices_used\":24,\"slices_free\":25,"
+            "\"connections_used\":26}}");
+    static const Str kExpectedMetrics =
+        lit("{\"scope\":\"process\",\"shard_count\":8,\"requests\":{\"total\":101,"
+            "\"active\":102,\"latency_us\":{\"buckets\":[110,111,112,113,114,115,116,"
+            "117,118,119,120],\"sum\":121,\"count\":122}},\"connections\":{"
+            "\"total\":103,\"active\":104,\"closed\":105},\"memory\":{\"arena_used\":123,"
+            "\"slices_used\":124,\"slices_free\":125,\"connections_used\":126}}");
+
+    auto stats_handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
+    auto metrics_handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_1"));
+    auto builder_handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_2"));
+    REQUIRE(stats_handler != nullptr);
+    REQUIRE(metrics_handler != nullptr);
+    REQUIRE(builder_handler != nullptr);
+    auto invoke = [&](HandlerFn handler, TestHandlerCtxFrame& ctx_frame) {
+        return invoke_jit_handler(handler,
+                                  nullptr,
+                                  ctx_frame.ctx,
+                                  reinterpret_cast<const u8*>(kGetApiRequest),
+                                  sizeof(kGetApiRequest) - 1,
+                                  nullptr);
+    };
+
+    const auto stats = invoke(stats_handler, frame);
+    REQUIRE(stats.dynamic_response_body != nullptr);
+    CHECK((Str{stats.dynamic_response_body, stats.dynamic_response_body_len}.eq(kExpectedStats)));
+
+    frame.ctx.response_body_data = nullptr;
+    frame.ctx.response_body_len = 0;
+    frame.ctx.response_body_valid = 0;
+    const auto metrics = invoke(metrics_handler, frame);
+    REQUIRE(metrics.dynamic_response_body != nullptr);
+    CHECK((Str{metrics.dynamic_response_body, metrics.dynamic_response_body_len}.eq(
+        kExpectedMetrics)));
+
+    TestHandlerCtxFrame builder_frame{};
+    auto* builder_snapshot = jit::acquire_control_plane_snapshot(&builder_frame.ctx);
+    REQUIRE(builder_snapshot != nullptr);
+    *builder_snapshot = snapshot;
+    const auto builder = invoke(builder_handler, builder_frame);
+    REQUIRE(builder.dynamic_response_body != nullptr);
+    CHECK(
+        (Str{builder.dynamic_response_body, builder.dynamic_response_body_len}.eq(kExpectedStats)));
+
+    TestHandlerCtxFrame missing{};
+    const auto failed = invoke(stats_handler, missing);
+    CHECK_EQ(failed.status_code, 500u);
+    CHECK(failed.dynamic_response_body == nullptr);
+
+    engine.shutdown();
+    rir.destroy();
+}
+
+TEST(jit, bounded_static_for_executes_unrolled_guard_chain) {
+    const auto src = R"rut(
+route GET "/accepted" {
+    for item in [1, 2, 3] { guard item > 0 else { return 400 } }
+    return 204
+}
+
+route GET "/rejected" {
+    for item in [1, 0, 3] { guard item > 0 else { return 422 } }
+    return 204
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    REQUIRE(lower_to_rir(mir.value(), rir));
+    auto cg = codegen(rir.module);
+    REQUIRE(cg.ok);
+    JitEngine engine;
+    REQUIRE(engine.init());
+    REQUIRE(engine.compile(cg.mod, cg.ctx));
+    auto accepted = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
+    auto rejected = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_1"));
+    REQUIRE(accepted != nullptr);
+    REQUIRE(rejected != nullptr);
+
+    TestHandlerCtxFrame accepted_frame{};
+    const auto accepted_result = invoke_jit_handler(accepted,
+                                                    nullptr,
+                                                    accepted_frame.ctx,
+                                                    reinterpret_cast<const u8*>(kGetApiRequest),
+                                                    sizeof(kGetApiRequest) - 1,
+                                                    nullptr);
+    CHECK_EQ(accepted_result.status_code, 204u);
+
+    TestHandlerCtxFrame rejected_frame{};
+    const auto rejected_result = invoke_jit_handler(rejected,
+                                                    nullptr,
+                                                    rejected_frame.ctx,
+                                                    reinterpret_cast<const u8*>(kGetApiRequest),
+                                                    sizeof(kGetApiRequest) - 1,
+                                                    nullptr);
+    CHECK_EQ(rejected_result.status_code, 422u);
+
+    engine.shutdown();
+    rir.destroy();
+}
+
+TEST(jit, bounded_static_for_guard_break_and_continue_take_distinct_targets) {
+    const auto src = R"rut(
+route GET "/continue" {
+    for item in [1, 0, -1] {
+        guard item != 0 else { continue }
+        guard item > 0 else { return 422 }
+    }
+    return 204
+}
+route GET "/break" {
+    for item in [1, 0, -1] {
+        guard item != 0 else { break }
+        guard item > 0 else { return 423 }
+    }
+    return 205
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    REQUIRE(lower_to_rir(mir.value(), rir));
+    auto cg = codegen(rir.module);
+    REQUIRE(cg.ok);
+    JitEngine engine;
+    REQUIRE(engine.init());
+    REQUIRE(engine.compile(cg.mod, cg.ctx));
+    auto continue_handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
+    auto break_handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_1"));
+    REQUIRE(continue_handler != nullptr);
+    REQUIRE(break_handler != nullptr);
+    TestHandlerCtxFrame continue_frame{};
+    TestHandlerCtxFrame break_frame{};
+    const auto continued = invoke_jit_handler(continue_handler,
+                                              nullptr,
+                                              continue_frame.ctx,
+                                              reinterpret_cast<const u8*>(kGetApiRequest),
+                                              sizeof(kGetApiRequest) - 1,
+                                              nullptr);
+    const auto broken = invoke_jit_handler(break_handler,
+                                           nullptr,
+                                           break_frame.ctx,
+                                           reinterpret_cast<const u8*>(kGetApiRequest),
+                                           sizeof(kGetApiRequest) - 1,
+                                           nullptr);
+    CHECK_EQ(continued.status_code, 422u);
+    CHECK_EQ(broken.status_code, 205u);
+    engine.shutdown();
+    rir.destroy();
+}
+
+TEST(jit, bounded_static_for_loop_control_preserves_later_iteration_and_post_loop_guard) {
+    const auto src = R"rut(
+route GET "/continue" {
+    for item in [0, 1] {
+        guard item > 0 else { continue }
+        return 201
+    }
+    return 500
+}
+route GET "/break" {
+    for item in [1] { break }
+    guard false else { return 400 }
+    return 202
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    REQUIRE(lower_to_rir(mir.value(), rir));
+    auto cg = codegen(rir.module);
+    REQUIRE(cg.ok);
+    JitEngine engine;
+    REQUIRE(engine.init());
+    REQUIRE(engine.compile(cg.mod, cg.ctx));
+    auto continued = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
+    auto broken = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_1"));
+    REQUIRE(continued != nullptr);
+    REQUIRE(broken != nullptr);
+    TestHandlerCtxFrame continue_frame{};
+    TestHandlerCtxFrame break_frame{};
+    const auto continued_result = invoke_jit_handler(continued,
+                                                     nullptr,
+                                                     continue_frame.ctx,
+                                                     reinterpret_cast<const u8*>(kGetApiRequest),
+                                                     sizeof(kGetApiRequest) - 1,
+                                                     nullptr);
+    const auto broken_result = invoke_jit_handler(broken,
+                                                  nullptr,
+                                                  break_frame.ctx,
+                                                  reinterpret_cast<const u8*>(kGetApiRequest),
+                                                  sizeof(kGetApiRequest) - 1,
+                                                  nullptr);
+    CHECK_EQ(continued_result.status_code, 201u);
+    CHECK_EQ(broken_result.status_code, 400u);
+    engine.shutdown();
+    rir.destroy();
+}
+
+TEST(jit, nested_and_conditionally_bypassed_loop_exits_preserve_following_paths) {
+    const auto src = R"rut(
+route GET "/nested-post-guard" {
+    for outer in [1] { for inner in [1] { break } }
+    guard false else { return 400 }
+    return 204
+}
+route GET "/nested-later-iteration" {
+    for outer in [0, 1] {
+        for inner in [0] {
+            guard outer > 0 else { break }
+            return 201
+        }
+    }
+    return 500
+}
+route GET "/continued-before-break" {
+    for item in [0, 1] {
+        guard item > 0 else { continue }
+        guard false else { return 202 }
+        break
+    }
+    return 500
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    REQUIRE(lower_to_rir(mir.value(), rir));
+    auto cg = codegen(rir.module);
+    REQUIRE(cg.ok);
+    JitEngine engine;
+    REQUIRE(engine.init());
+    REQUIRE(engine.compile(cg.mod, cg.ctx));
+
+    const u32 expected[] = {400, 201, 202};
+    for (u32 i = 0; i < 3; i++) {
+        auto handler = reinterpret_cast<HandlerFn>(
+            engine.lookup((std::string{"handler_route_"} + std::to_string(i)).c_str()));
+        REQUIRE(handler != nullptr);
+        TestHandlerCtxFrame frame{};
+        const auto outcome = invoke_jit_handler(handler,
+                                                nullptr,
+                                                frame.ctx,
+                                                reinterpret_cast<const u8*>(kGetApiRequest),
+                                                sizeof(kGetApiRequest) - 1,
+                                                nullptr);
+        CHECK_EQ(outcome.status_code, expected[i]);
+    }
+    engine.shutdown();
+    rir.destroy();
+}
+
+TEST(jit, bounded_static_for_if_break_and_continue_take_distinct_targets) {
+    const auto src = R"rut(
+route GET "/continue" {
+    for item in [0, -1] {
+        if item == 0 { continue } else { return 422 }
+    }
+    return 204
+}
+route GET "/break" {
+    for item in [0, -1] {
+        if item == 0 { break } else { return 423 }
+    }
+    return 205
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    REQUIRE(lower_to_rir(mir.value(), rir));
+    auto cg = codegen(rir.module);
+    REQUIRE(cg.ok);
+    JitEngine engine;
+    REQUIRE(engine.init());
+    REQUIRE(engine.compile(cg.mod, cg.ctx));
+    auto continue_handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
+    auto break_handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_1"));
+    REQUIRE(continue_handler != nullptr);
+    REQUIRE(break_handler != nullptr);
+    TestHandlerCtxFrame continue_frame{};
+    TestHandlerCtxFrame break_frame{};
+    const auto continued = invoke_jit_handler(continue_handler,
+                                              nullptr,
+                                              continue_frame.ctx,
+                                              reinterpret_cast<const u8*>(kGetApiRequest),
+                                              sizeof(kGetApiRequest) - 1,
+                                              nullptr);
+    const auto broken = invoke_jit_handler(break_handler,
+                                           nullptr,
+                                           break_frame.ctx,
+                                           reinterpret_cast<const u8*>(kGetApiRequest),
+                                           sizeof(kGetApiRequest) - 1,
+                                           nullptr);
+    CHECK_EQ(continued.status_code, 422u);
+    CHECK_EQ(broken.status_code, 205u);
+    engine.shutdown();
+    rir.destroy();
+}
+
+TEST(jit, bounded_static_for_match_break_and_continue_take_distinct_targets) {
+    const auto src = R"rut(
+route GET "/continue" {
+    for item in [0, -1] {
+        match item { 0 => continue _ => return 422 }
+    }
+    return 204
+}
+route GET "/break" {
+    for item in [0, -1] {
+        match item { 0 => break _ => return 423 }
+    }
+    return 205
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    REQUIRE(lower_to_rir(mir.value(), rir));
+    auto cg = codegen(rir.module);
+    REQUIRE(cg.ok);
+    JitEngine engine;
+    REQUIRE(engine.init());
+    REQUIRE(engine.compile(cg.mod, cg.ctx));
+    auto continue_handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
+    auto break_handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_1"));
+    REQUIRE(continue_handler != nullptr);
+    REQUIRE(break_handler != nullptr);
+    TestHandlerCtxFrame continue_frame{};
+    TestHandlerCtxFrame break_frame{};
+    const auto continued = invoke_jit_handler(continue_handler,
+                                              nullptr,
+                                              continue_frame.ctx,
+                                              reinterpret_cast<const u8*>(kGetApiRequest),
+                                              sizeof(kGetApiRequest) - 1,
+                                              nullptr);
+    const auto broken = invoke_jit_handler(break_handler,
+                                           nullptr,
+                                           break_frame.ctx,
+                                           reinterpret_cast<const u8*>(kGetApiRequest),
+                                           sizeof(kGetApiRequest) - 1,
+                                           nullptr);
+    CHECK_EQ(continued.status_code, 422u);
+    CHECK_EQ(broken.status_code, 205u);
+    engine.shutdown();
+    rir.destroy();
+}
+
+TEST(jit, bounded_static_for_match_prelude_guard_controls_the_current_loop) {
+    const auto src = R"rut(
+route GET "/continue" {
+    for item in [0, -1] {
+        match item {
+            0 => { guard false else { continue } return 421 }
+            _ => return 422
+        }
+    }
+    return 204
+}
+route GET "/break" {
+    for item in [0, -1] {
+        match item {
+            0 => { guard false else { break } return 423 }
+            _ => return 424
+        }
+    }
+    return 205
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    REQUIRE(lower_to_rir(mir.value(), rir));
+    auto cg = codegen(rir.module);
+    REQUIRE(cg.ok);
+    JitEngine engine;
+    REQUIRE(engine.init());
+    REQUIRE(engine.compile(cg.mod, cg.ctx));
+    auto continue_handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
+    auto break_handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_1"));
+    REQUIRE(continue_handler != nullptr);
+    REQUIRE(break_handler != nullptr);
+    TestHandlerCtxFrame continue_frame{};
+    TestHandlerCtxFrame break_frame{};
+    const auto continued = invoke_jit_handler(continue_handler,
+                                              nullptr,
+                                              continue_frame.ctx,
+                                              reinterpret_cast<const u8*>(kGetApiRequest),
+                                              sizeof(kGetApiRequest) - 1,
+                                              nullptr);
+    const auto broken = invoke_jit_handler(break_handler,
+                                           nullptr,
+                                           break_frame.ctx,
+                                           reinterpret_cast<const u8*>(kGetApiRequest),
+                                           sizeof(kGetApiRequest) - 1,
+                                           nullptr);
+    CHECK_EQ(continued.status_code, 422u);
+    CHECK_EQ(broken.status_code, 205u);
+    engine.shutdown();
+    rir.destroy();
+}
+
+TEST(jit, nested_bounded_static_for_controls_target_innermost_loop) {
+    const auto src = R"rut(
+route GET "/break" {
+    for outer in [1, -1] {
+        for inner in [1, 2] { break }
+        guard outer > 0 else { return 422 }
+    }
+    return 204
+}
+route GET "/continue" {
+    for outer in [1, -1] {
+        for inner in [1, 2] { continue }
+        guard outer > 0 else { return 423 }
+    }
+    return 205
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    REQUIRE(lower_to_rir(mir.value(), rir));
+    auto cg = codegen(rir.module);
+    REQUIRE(cg.ok);
+    JitEngine engine;
+    REQUIRE(engine.init());
+    REQUIRE(engine.compile(cg.mod, cg.ctx));
+    auto break_handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
+    auto continue_handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_1"));
+    REQUIRE(break_handler != nullptr);
+    REQUIRE(continue_handler != nullptr);
+    TestHandlerCtxFrame break_frame{};
+    TestHandlerCtxFrame continue_frame{};
+    const auto broken = invoke_jit_handler(break_handler,
+                                           nullptr,
+                                           break_frame.ctx,
+                                           reinterpret_cast<const u8*>(kGetApiRequest),
+                                           sizeof(kGetApiRequest) - 1,
+                                           nullptr);
+    const auto continued = invoke_jit_handler(continue_handler,
+                                              nullptr,
+                                              continue_frame.ctx,
+                                              reinterpret_cast<const u8*>(kGetApiRequest),
+                                              sizeof(kGetApiRequest) - 1,
+                                              nullptr);
+    CHECK_EQ(broken.status_code, 422u);
+    CHECK_EQ(continued.status_code, 423u);
+    engine.shutdown();
+    rir.destroy();
+}
+
 TEST(jit, frontend_return_json_serializes_nested_declared_structs) {
     const auto src = R"rut(
 struct Meta { ok: bool }
@@ -2829,6 +3396,78 @@ route GET "/api/users" use chain rewrite_chain { return forward(api, buffered: t
     rir.destroy();
 }
 
+TEST(jit, buffered_forward_expression_resumes_with_owned_response_fields) {
+    const auto src = R"rut(
+upstream api
+route GET "/x" {
+    let resp = forward(api, buffered: true)
+    resp.set("X-Captured", resp.header("X-Origin").or("missing"))
+    resp.status = resp.status
+    resp.body = resp.body
+    return resp
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    REQUIRE(lower_to_rir(mir.value(), rir));
+    auto cg = codegen(rir.module);
+    REQUIRE(cg.ok);
+    JitEngine engine;
+    REQUIRE(engine.init());
+    REQUIRE(engine.compile(cg.mod, cg.ctx));
+    auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
+    REQUIRE(handler != nullptr);
+
+    TestHandlerCtxFrame frame{};
+    auto suspended = invoke_jit_handler(handler,
+                                        nullptr,
+                                        frame.ctx,
+                                        reinterpret_cast<const u8*>(kGetApiRequest),
+                                        sizeof(kGetApiRequest) - 1,
+                                        nullptr);
+    CHECK(suspended.kind == JitDispatchOutcome::Kind::ForwardCapture);
+    CHECK_EQ(suspended.upstream_id, 0u);
+    CHECK_EQ(suspended.next_state, 1u);
+
+    static constexpr char kBody[] = "origin-body";
+    static constexpr char kHeaderName[] = "X-Origin";
+    static constexpr char kHeaderValue[] = "yes";
+    frame.ctx.captured_response_valid = true;
+    frame.ctx.captured_response_status = 202;
+    frame.ctx.captured_response_body = kBody;
+    frame.ctx.captured_response_body_len = sizeof(kBody) - 1;
+    frame.ctx.captured_response_header_count = 1;
+    const CapturedResponseHeader captured_headers[] = {
+        {{kHeaderName, sizeof(kHeaderName) - 1}, {kHeaderValue, sizeof(kHeaderValue) - 1}}};
+    frame.ctx.captured_response_headers = captured_headers;
+    frame.ctx.state = suspended.next_state;
+    frame.ctx.resume_event_kind = static_cast<u32>(YieldKind::Forward);
+    frame.ctx.resume_event_result = 202;
+    auto resumed = invoke_jit_handler(handler,
+                                      nullptr,
+                                      frame.ctx,
+                                      reinterpret_cast<const u8*>(kGetApiRequest),
+                                      sizeof(kGetApiRequest) - 1,
+                                      nullptr);
+    CHECK(resumed.kind == JitDispatchOutcome::Kind::ReturnStatus);
+    CHECK_EQ(resumed.status_code, 202u);
+    REQUIRE(resumed.dynamic_response_body != nullptr);
+    CHECK((Str{resumed.dynamic_response_body, resumed.dynamic_response_body_len}).eq(lit(kBody)));
+    REQUIRE_EQ(frame.ctx.response_header_count, 1u);
+    CHECK(frame.ctx.response_header_mutations[0].name.eq(lit("X-Captured")));
+    CHECK(frame.ctx.response_header_mutations[0].value.eq(lit("yes")));
+
+    engine.shutdown();
+    rir.destroy();
+}
+
 TEST(jit, response_helper_mutation_marks_caller_builder_for_commit) {
     const auto src = R"rut(
 func rewrite(_ resp: Response) -> i32 {
@@ -2940,6 +3579,35 @@ TEST(jit, response_body_mutation_overflow_fails_closed) {
     CHECK(outcome.kind == JitDispatchOutcome::Kind::ReturnStatus);
     CHECK_EQ(outcome.status_code, 500u);
     CHECK(outcome.dynamic_response_body == nullptr);
+
+    frame.ctx.captured_response_valid = true;
+    frame.ctx.captured_response_status = 201;
+    frame.ctx.captured_response_header_count = 1;
+    const CapturedResponseHeader captured_headers[] = {{{"X-Secret", 8}, {"hidden", 6}}};
+    frame.ctx.captured_response_headers = captured_headers;
+    const auto captured_terminal = +[](void*, HandlerCtx*, const u8*, u32, void*) -> u64 {
+        return HandlerResult::make_status(0).pack();
+    };
+    const auto captured_failure =
+        invoke_jit_handler(captured_terminal, nullptr, frame.ctx, nullptr, 0, nullptr);
+    CHECK_EQ(captured_failure.status_code, 500u);
+    CHECK_FALSE(captured_failure.uses_captured_response);
+}
+
+TEST(jit, informational_captured_response_fails_closed) {
+    TestHandlerCtxFrame frame{};
+    frame.ctx.captured_response_valid = true;
+    frame.ctx.captured_response_status = 103;
+    const auto captured_terminal = +[](void*, HandlerCtx*, const u8*, u32, void*) -> u64 {
+        return HandlerResult::make_status(0).pack();
+    };
+
+    const auto outcome =
+        invoke_jit_handler(captured_terminal, nullptr, frame.ctx, nullptr, 0, nullptr);
+
+    CHECK(outcome.kind == JitDispatchOutcome::Kind::ReturnStatus);
+    CHECK_EQ(outcome.status_code, 500u);
+    CHECK_FALSE(outcome.uses_captured_response);
 }
 
 TEST(jit, response_body_snapshot_failure_remains_sticky_across_assignment) {
@@ -3014,7 +3682,7 @@ TEST(jit, response_body_mutation_copies_source_bytes) {
     CHECK(outcome.dynamic_response_body == frame.ctx.response_body_mutation_storage);
 }
 
-TEST(jit, response_body_mutation_replaces_failed_dynamic_json) {
+TEST(jit, response_body_mutation_preserves_body_on_failed_dynamic_json) {
     TestHandlerCtxFrame frame{};
     rut_helper_resp_set_status(&frame.ctx, 202);
     rut_helper_resp_set_body(&frame.ctx, "replacement", 11);
@@ -3029,7 +3697,7 @@ TEST(jit, response_body_mutation_replaces_failed_dynamic_json) {
     };
     const auto outcome = invoke_jit_handler(terminal, nullptr, frame.ctx, nullptr, 0, nullptr);
     CHECK(outcome.kind == JitDispatchOutcome::Kind::ReturnStatus);
-    CHECK_EQ(outcome.status_code, 202u);
+    CHECK_EQ(outcome.status_code, 500u);
     REQUIRE(outcome.dynamic_response_body != nullptr);
     const Str replacement{outcome.dynamic_response_body, outcome.dynamic_response_body_len};
     CHECK(replacement.eq(lit("replacement")));
@@ -21180,7 +21848,7 @@ TEST(jit_dispatch, effective_return_status_applies_committed_scalar_precedence) 
     result.upstream_id = HandlerResult::kDynamicResponseBody;
     CHECK_EQ(effective_return_status(result, ctx), 500u);
     ctx.response_body_mutation_set = true;
-    CHECK_EQ(effective_return_status(result, ctx), 200u);
+    CHECK_EQ(effective_return_status(result, ctx), 500u);
     ctx.response_status_set = true;
     ctx.response_status = 204;
     ctx.response_body_mutation_set = false;

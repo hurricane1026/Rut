@@ -1449,6 +1449,16 @@ TEST(http2_conn, trailing_header_block_with_pseudo_header_rsts) {
     u32 ow = 0;
     c.process(in, inlen, out, sizeof(out), &ow);
 
+    ShardMetrics metrics;
+    metrics.init();
+    metrics.on_request_start();
+    c.metrics = &metrics;
+    Http2Stream* stream = c.find_stream(1);
+    REQUIRE(stream != nullptr);
+    stream->metrics_started = true;
+    stream->request_start_us = monotonic_us();
+    c.on_reset = &h2_on_reset_cb;
+
     // END_STREAM is set, but a pseudo-header (:path) disqualifies it as trailers
     // (RFC 7540 §8.1.2.1) → reset rather than finalize.
     hpack::Header bad[] = {{{":path", 5}, {"/x", 2}}, {{"x-t", 3}, {"1", 1}}};
@@ -1458,6 +1468,8 @@ TEST(http2_conn, trailing_header_block_with_pseudo_header_rsts) {
     u32 bow = 0;
     c.process(bframe, bn, bout, sizeof(bout), &bow);
     CHECK(has_frame(bout, bow, Http2FrameType::RstStream, 0, 0));
+    CHECK_EQ(metrics.requests_active, 0u);
+    CHECK_FALSE(stream->metrics_started);
 }
 
 TEST(h2_serving, finalizes_body_without_injecting_content_length) {
@@ -1508,6 +1520,7 @@ TEST(h2_serving, inject_content_length_exposes_data_only_body) {
         buf[len] = static_cast<u8>(req[len]);
         len++;
     }
+    const u32 original_len = len;
     const u32 kBodyStart = len - 5;  // just past "\r\n\r\n"
     REQUIRE(h2_inject_content_length(buf, &len, kBodyStart, 5, sizeof(buf)));
 
@@ -1519,6 +1532,10 @@ TEST(h2_serving, inject_content_length_exposes_data_only_body) {
     CHECK_EQ(parsed.content_length, 5u);
     // The 5 body octets must be the final bytes, intact, after injection.
     CHECK(Str(reinterpret_cast<const char*>(buf + len - 5), 5).eq(Str{"abcde", 5}));
+
+    REQUIRE(h2_remove_injected_content_length(buf, &len, kBodyStart, 5));
+    CHECK_EQ(len, original_len);
+    CHECK(Str(reinterpret_cast<const char*>(buf), len).eq(Str{req, len}));
 }
 
 TEST(h2_serving, inject_content_length_zero_length_body) {
@@ -1554,15 +1571,16 @@ namespace {
 struct FakeH2Loop {
     bool yield_scheduled = false;
     u32 yield_ms = 0;
+    ShardMetrics* metrics = nullptr;
+
+    void epoch_enter() {}
+    void epoch_leave() {}
 
     [[nodiscard]] bool schedule_yield_timer(Connection&, u32 ms) {
         yield_scheduled = true;
         yield_ms = ms;
         return true;
     }
-
-    void epoch_enter() {}
-    void epoch_leave() {}
 };
 
 u64 h2_mutated_body_then_forward(void*, jit::HandlerCtx* ctx, const u8*, u32, void*) {
@@ -1595,6 +1613,13 @@ u64 h2_buffered_forward(void*, jit::HandlerCtx*, const u8* req, u32 len, void*) 
             match &= req[i + j] == static_cast<u8>(kNeedle[j]);
         h2_buffered_forward_saw_te |= match;
     }
+    return jit::HandlerResult::make_buffered_forward(0).pack();
+}
+
+bool h2_preinvoke_saw_control_plane_snapshot = false;
+u64 h2_snapshot_then_buffered_forward(void*, jit::HandlerCtx* ctx, const u8*, u32, void*) {
+    h2_preinvoke_saw_control_plane_snapshot =
+        ctx->control_plane != nullptr && ctx->control_plane->valid;
     return jit::HandlerResult::make_buffered_forward(0).pack();
 }
 
@@ -1638,7 +1663,12 @@ TEST(h2_serving, body_independent_local_branch_avoids_buffered_forward_cap) {
     conn.reset();
     conn.h2 = &h2;
     RouteConfig config;
-    REQUIRE(config.add_jit_handler("/upload", kRouteMethodPost, &h2_status_204, false, true));
+    REQUIRE(config.add_jit_handler("/upload",
+                                   kRouteMethodPost,
+                                   &h2_status_204,
+                                   /*needs_req_body=*/false,
+                                   /*can_forward_buffered=*/true,
+                                   /*needs_control_plane_snapshot=*/false));
     conn.request_config = &config;
     FakeH2Loop loop;
     u8 response[512]{};
@@ -1661,7 +1691,12 @@ TEST(h2_serving, selected_buffered_forward_defers_and_buffers_data) {
     conn.reset();
     conn.h2 = &h2;
     RouteConfig config;
-    REQUIRE(config.add_jit_handler("/upload", kRouteMethodPost, &h2_buffered_forward, false, true));
+    REQUIRE(config.add_jit_handler("/upload",
+                                   kRouteMethodPost,
+                                   &h2_buffered_forward,
+                                   /*needs_req_body=*/false,
+                                   /*can_forward_buffered=*/true,
+                                   /*needs_control_plane_snapshot=*/false));
     conn.request_config = &config;
     FakeH2Loop loop;
     u8 response[512]{};
@@ -1731,6 +1766,37 @@ TEST(h2_serving, ended_buffered_forward_strips_te_after_handler_observes_it) {
     h2_clear_async(h2);
 }
 
+TEST(h2_serving, buffered_forward_preinvoke_latches_control_plane_snapshot) {
+    const hpack::Header headers[] = {{{":method", 7}, {"POST", 4}},
+                                     {{":path", 5}, {"/upload", 7}},
+                                     {{":scheme", 7}, {"https", 5}},
+                                     {{":authority", 10}, {"example", 7}}};
+    Http2Conn h2;
+    h2.init();
+    Connection conn;
+    conn.reset();
+    conn.h2 = &h2;
+    RouteConfig config;
+    REQUIRE(config.add_jit_handler("/upload",
+                                   kRouteMethodPost,
+                                   &h2_snapshot_then_buffered_forward,
+                                   /*needs_req_body=*/false,
+                                   /*can_forward_buffered=*/true,
+                                   /*needs_control_plane_snapshot=*/true));
+    conn.request_config = &config;
+    ShardMetrics metrics;
+    FakeH2Loop loop;
+    loop.metrics = &metrics;
+    u8 response[512]{};
+    H2Dispatch<FakeH2Loop> dispatch{&loop, &conn, response, sizeof(response), 0, false};
+
+    h2_preinvoke_saw_control_plane_snapshot = false;
+    h2_dispatch_request(dispatch, 1, headers, 4, /*end_stream=*/false);
+    CHECK(h2_preinvoke_saw_control_plane_snapshot);
+    CHECK_EQ(h2.pending_stream, 1u);
+    h2_clear_pending(h2);
+}
+
 TEST(h2_serving, body_independent_timer_starts_before_upload_completion) {
     const hpack::Header headers[] = {{{":method", 7}, {"POST", 4}},
                                      {{":path", 5}, {"/upload", 7}},
@@ -1743,7 +1809,12 @@ TEST(h2_serving, body_independent_timer_starts_before_upload_completion) {
     conn.reset();
     conn.h2 = &h2;
     RouteConfig config;
-    REQUIRE(config.add_jit_handler("/upload", kRouteMethodPost, &h2_buffered_timer, false, true));
+    REQUIRE(config.add_jit_handler("/upload",
+                                   kRouteMethodPost,
+                                   &h2_buffered_timer,
+                                   /*needs_req_body=*/false,
+                                   /*can_forward_buffered=*/true,
+                                   /*needs_control_plane_snapshot=*/false));
     conn.request_config = &config;
     FakeH2Loop loop;
     u8 response[512]{};
@@ -1785,7 +1856,7 @@ TEST(h2_serving, resumed_timer_defers_body_only_after_selecting_buffered_forward
     h2.async_has_content_length = true;
     h2.async_wait_for_body_on_forward = true;
 
-    h2_transfer_timer_to_pending_forward(h2, 1, 7);
+    h2_transfer_timer_to_pending_forward(h2, 1, 7, false, 0);
 
     CHECK_EQ(h2.async_stream, 0u);
     CHECK_EQ(h2.pending_stream, 1u);
@@ -1992,6 +2063,582 @@ TEST(h2_serving, bodyless_mutated_status_suppresses_dynamic_data) {
     CHECK_EQ(dispatch.resp_len, kFrameHeaderSize + header.length);
 }
 
+TEST(h2_serving, captured_content_length_is_removed_for_final_204) {
+    Http2Conn h2;
+    h2.init();
+    Connection conn;
+    conn.reset();
+    conn.h2 = &h2;
+    FakeH2Loop loop;
+    u8 response[256]{};
+    H2Dispatch<FakeH2Loop> dispatch{&loop, &conn, response, sizeof(response), 0, false};
+    jit::HandlerCtx response_ctx{};
+    jit::CapturedResponseHeader captured_headers[] = {
+        {{"content-length", 14}, {"123", 3}},
+    };
+    response_ctx.captured_response_valid = true;
+    response_ctx.captured_response_header_count = 1;
+    response_ctx.captured_response_headers = captured_headers;
+    JitDispatchOutcome outcome{};
+    outcome.kind = JitDispatchOutcome::Kind::ReturnStatus;
+    outcome.status_code = 204;
+    outcome.response_ctx = &response_ctx;
+    outcome.uses_captured_response = true;
+
+    h2_emit_outcome(dispatch, 1, outcome, nullptr, false);
+
+    Http2FrameHeader header{};
+    REQUIRE(parse_frame_header(response, dispatch.resp_len, &header) == ParseStatus::Complete);
+    hpack::DynamicTable dyn;
+    dyn.init(4096);
+    hpack::Header decoded[8];
+    u8 scratch[256];
+    u32 count = 0;
+    REQUIRE(hpack::decode_header_block(dyn,
+                                       response + kFrameHeaderSize,
+                                       header.length,
+                                       scratch,
+                                       sizeof(scratch),
+                                       decoded,
+                                       8,
+                                       &count));
+    for (u32 i = 0; i < count; i++) CHECK_FALSE(decoded[i].name.eq(Str{"content-length", 14}));
+}
+
+TEST(h2_serving, captured_multipart_body_replacement_is_rejected) {
+    Http2Conn h2;
+    h2.init();
+    Connection conn;
+    conn.reset();
+    conn.h2 = &h2;
+    FakeH2Loop loop;
+    u8 response[512]{};
+    H2Dispatch<FakeH2Loop> dispatch{&loop, &conn, response, sizeof(response), 0, false};
+    jit::HandlerCtx response_ctx{};
+    jit::CapturedResponseHeader captured_headers[] = {
+        {{"content-type", 12},
+         {"multipart/byteranges; boundary=old", sizeof("multipart/byteranges; boundary=old") - 1}},
+    };
+    response_ctx.captured_response_valid = true;
+    response_ctx.captured_response_header_count = 1;
+    response_ctx.captured_response_headers = captured_headers;
+    response_ctx.response_body_mutation_set = true;
+    static constexpr char kBody[] = "replacement";
+    JitDispatchOutcome outcome{};
+    outcome.kind = JitDispatchOutcome::Kind::ReturnStatus;
+    outcome.status_code = 206;
+    outcome.dynamic_response_body = kBody;
+    outcome.dynamic_response_body_len = sizeof(kBody) - 1;
+    outcome.response_ctx = &response_ctx;
+    outcome.uses_captured_response = true;
+
+    h2_emit_outcome(dispatch, 1, outcome, nullptr, false);
+
+    Http2FrameHeader frame{};
+    REQUIRE(parse_frame_header(response, dispatch.resp_len, &frame) == ParseStatus::Complete);
+    hpack::DynamicTable dyn;
+    dyn.init(4096);
+    hpack::Header decoded[8];
+    u8 scratch[256];
+    u32 count = 0;
+    REQUIRE(hpack::decode_header_block(dyn,
+                                       response + kFrameHeaderSize,
+                                       frame.length,
+                                       scratch,
+                                       sizeof(scratch),
+                                       decoded,
+                                       8,
+                                       &count));
+    bool found_internal_error = false;
+    for (u32 i = 0; i < count; i++)
+        found_internal_error |=
+            decoded[i].name.eq(Str{":status", 7}) && decoded[i].value.eq(Str{"500", 3});
+    CHECK(found_internal_error);
+}
+
+TEST(h2_serving, multipart_206_rejects_top_level_content_range) {
+    hpack::Header headers[] = {
+        {{"content-type", 12}, {"multipart/byteranges; boundary=parts", 36}},
+        {{"content-range", 13}, {"bytes 0-3/10", 12}},
+    };
+    u32 count = static_cast<u32>(std::size(headers));
+
+    CHECK_FALSE(h2_normalize_partial_content_headers(headers, &count, 206, 4, true));
+}
+
+TEST(h2_serving, captured_final_206_requires_valid_range_metadata) {
+    Http2Conn h2;
+    h2.init();
+    Connection conn;
+    conn.reset();
+    conn.h2 = &h2;
+    FakeH2Loop loop;
+    u8 response[256]{};
+    H2Dispatch<FakeH2Loop> dispatch{&loop, &conn, response, sizeof(response), 0, false};
+    jit::HandlerCtx response_ctx{};
+    response_ctx.captured_response_valid = true;
+    response_ctx.captured_response_status = 200;
+    response_ctx.response_status_set = true;
+    response_ctx.response_status = 206;
+    response_ctx.response_body_mutation_set = true;
+    static constexpr char kBody[] = "data";
+    JitDispatchOutcome outcome{};
+    outcome.kind = JitDispatchOutcome::Kind::ReturnStatus;
+    outcome.status_code = 206;
+    outcome.dynamic_response_body = kBody;
+    outcome.dynamic_response_body_len = sizeof(kBody) - 1;
+    outcome.response_ctx = &response_ctx;
+    outcome.uses_captured_response = true;
+
+    h2_emit_outcome(dispatch, 1, outcome, nullptr, false);
+
+    Http2FrameHeader frame{};
+    REQUIRE(parse_frame_header(response, dispatch.resp_len, &frame) == ParseStatus::Complete);
+    hpack::DynamicTable dyn;
+    dyn.init(4096);
+    hpack::Header decoded[8];
+    u8 scratch[256];
+    u32 count = 0;
+    REQUIRE(hpack::decode_header_block(dyn,
+                                       response + kFrameHeaderSize,
+                                       frame.length,
+                                       scratch,
+                                       sizeof(scratch),
+                                       decoded,
+                                       8,
+                                       &count));
+    bool found_500 = false;
+    for (u32 i = 0; i < count; i++)
+        found_500 |= decoded[i].name.eq(Str{":status", 7}) && decoded[i].value.eq(Str{"500", 3});
+    CHECK(found_500);
+}
+
+TEST(h2_serving, captured_partial_status_promotion_requires_body_replacement) {
+    Http2Conn h2;
+    h2.init();
+    Connection conn;
+    conn.reset();
+    conn.h2 = &h2;
+    FakeH2Loop loop;
+    u8 response[256]{};
+    H2Dispatch<FakeH2Loop> dispatch{&loop, &conn, response, sizeof(response), 0, false};
+    static constexpr char kBody[] = "part";
+    jit::HandlerCtx response_ctx{};
+    response_ctx.captured_response_valid = true;
+    response_ctx.captured_response_status = 206;
+    JitDispatchOutcome outcome{};
+    outcome.kind = JitDispatchOutcome::Kind::ReturnStatus;
+    outcome.status_code = 200;
+    outcome.dynamic_response_body = kBody;
+    outcome.dynamic_response_body_len = sizeof(kBody) - 1;
+    outcome.response_ctx = &response_ctx;
+    outcome.uses_captured_response = true;
+
+    h2_emit_outcome(dispatch, 1, outcome, nullptr, false);
+
+    Http2FrameHeader frame{};
+    REQUIRE(parse_frame_header(response, dispatch.resp_len, &frame) == ParseStatus::Complete);
+    hpack::DynamicTable dyn;
+    dyn.init(4096);
+    hpack::Header decoded[4];
+    u8 scratch[64];
+    u32 count = 0;
+    REQUIRE(hpack::decode_header_block(dyn,
+                                       response + kFrameHeaderSize,
+                                       frame.length,
+                                       scratch,
+                                       sizeof(scratch),
+                                       decoded,
+                                       static_cast<u32>(std::size(decoded)),
+                                       &count));
+    REQUIRE_GT(count, 0u);
+    CHECK(decoded[0].name.eq(Str{":status", 7}));
+    CHECK(decoded[0].value.eq(Str{"500", 3}));
+}
+
+TEST(h2_serving, captured_bodyless_status_promotion_requires_body_replacement) {
+    for (const u16 captured_status : {u16{204}, u16{205}, u16{304}}) {
+        Http2Conn h2;
+        h2.init();
+        Connection conn;
+        conn.reset();
+        conn.h2 = &h2;
+        FakeH2Loop loop;
+        u8 response[256]{};
+        H2Dispatch<FakeH2Loop> dispatch{&loop, &conn, response, sizeof(response), 0, false};
+        jit::HandlerCtx response_ctx{};
+        response_ctx.captured_response_valid = true;
+        response_ctx.captured_response_status = captured_status;
+        JitDispatchOutcome outcome{};
+        outcome.kind = JitDispatchOutcome::Kind::ReturnStatus;
+        outcome.status_code = 200;
+        outcome.response_ctx = &response_ctx;
+        outcome.uses_captured_response = true;
+
+        h2_emit_outcome(dispatch, 1, outcome, nullptr, false);
+
+        Http2FrameHeader frame{};
+        REQUIRE(parse_frame_header(response, dispatch.resp_len, &frame) == ParseStatus::Complete);
+        hpack::DynamicTable dyn;
+        dyn.init(4096);
+        hpack::Header decoded[4];
+        u8 scratch[64];
+        u32 count = 0;
+        REQUIRE(hpack::decode_header_block(dyn,
+                                           response + kFrameHeaderSize,
+                                           frame.length,
+                                           scratch,
+                                           sizeof(scratch),
+                                           decoded,
+                                           static_cast<u32>(std::size(decoded)),
+                                           &count));
+        REQUIRE_GT(count, 0u);
+        CHECK(decoded[0].name.eq(Str{":status", 7}));
+        CHECK(decoded[0].value.eq(Str{"500", 3}));
+    }
+}
+
+TEST(h2_serving, captured_head_206_validates_mutated_body_range_length) {
+    Http2Conn h2;
+    h2.init();
+    Connection conn;
+    conn.reset();
+    conn.h2 = &h2;
+    FakeH2Loop loop;
+    u8 response[256]{};
+    H2Dispatch<FakeH2Loop> dispatch{&loop, &conn, response, sizeof(response), 0, false};
+    static constexpr char kRangeName[] = "Content-Range";
+    static constexpr char kRangeValue[] = "bytes 0-9/100";
+    jit::HandlerCtx response_ctx{};
+    response_ctx.captured_response_valid = true;
+    response_ctx.captured_response_status = 200;
+    response_ctx.response_status_set = true;
+    response_ctx.response_status = 206;
+    response_ctx.response_body_mutation_set = true;
+    response_ctx.response_header_mutations[0] = {{kRangeName, sizeof(kRangeName) - 1},
+                                                 {kRangeValue, sizeof(kRangeValue) - 1},
+                                                 jit::ResponseHeaderMutationMode::Set};
+    response_ctx.response_header_count = 1;
+    static constexpr char kBody[] = "data";
+    JitDispatchOutcome outcome{};
+    outcome.kind = JitDispatchOutcome::Kind::ReturnStatus;
+    outcome.status_code = 206;
+    outcome.dynamic_response_body = kBody;
+    outcome.dynamic_response_body_len = sizeof(kBody) - 1;
+    outcome.response_ctx = &response_ctx;
+    outcome.uses_captured_response = true;
+
+    h2_emit_outcome(dispatch, 1, outcome, nullptr, true);
+
+    Http2FrameHeader frame{};
+    REQUIRE(parse_frame_header(response, dispatch.resp_len, &frame) == ParseStatus::Complete);
+    hpack::DynamicTable dyn;
+    dyn.init(4096);
+    hpack::Header decoded[8];
+    u8 scratch[256];
+    u32 count = 0;
+    REQUIRE(hpack::decode_header_block(dyn,
+                                       response + kFrameHeaderSize,
+                                       frame.length,
+                                       scratch,
+                                       sizeof(scratch),
+                                       decoded,
+                                       8,
+                                       &count));
+    bool found_500 = false;
+    for (u32 i = 0; i < count; i++)
+        found_500 |= decoded[i].name.eq(Str{":status", 7}) && decoded[i].value.eq(Str{"500", 3});
+    CHECK(found_500);
+}
+
+TEST(h2_serving, captured_head_206_validates_retained_content_length) {
+    Http2Conn h2;
+    h2.init();
+    Connection conn;
+    conn.reset();
+    conn.h2 = &h2;
+    FakeH2Loop loop;
+    u8 response[256]{};
+    H2Dispatch<FakeH2Loop> dispatch{&loop, &conn, response, sizeof(response), 0, false};
+    const jit::CapturedResponseHeader captured_headers[] = {
+        {{"content-length", 14}, {"4", 1}},
+        {{"content-range", 13}, {"bytes 0-9/100", 13}},
+    };
+    jit::HandlerCtx response_ctx{};
+    response_ctx.captured_response_valid = true;
+    response_ctx.captured_response_status = 206;
+    response_ctx.captured_response_headers = captured_headers;
+    response_ctx.captured_response_header_count = 2;
+    JitDispatchOutcome outcome{};
+    outcome.kind = JitDispatchOutcome::Kind::ReturnStatus;
+    outcome.status_code = 206;
+    outcome.response_ctx = &response_ctx;
+    outcome.uses_captured_response = true;
+
+    h2_emit_outcome(dispatch, 1, outcome, nullptr, true);
+
+    Http2FrameHeader frame{};
+    REQUIRE(parse_frame_header(response, dispatch.resp_len, &frame) == ParseStatus::Complete);
+    hpack::DynamicTable dyn;
+    dyn.init(4096);
+    hpack::Header decoded[8];
+    u8 scratch[256];
+    u32 count = 0;
+    REQUIRE(hpack::decode_header_block(dyn,
+                                       response + kFrameHeaderSize,
+                                       frame.length,
+                                       scratch,
+                                       sizeof(scratch),
+                                       decoded,
+                                       8,
+                                       &count));
+    bool found_500 = false;
+    for (u32 i = 0; i < count; i++)
+        found_500 |= decoded[i].name.eq(Str{":status", 7}) && decoded[i].value.eq(Str{"500", 3});
+    CHECK(found_500);
+}
+
+TEST(h2_serving, captured_connect_status_mutation_to_success_returns_bad_gateway) {
+    Http2Conn h2;
+    h2.init();
+    Connection conn;
+    conn.reset();
+    conn.h2 = &h2;
+    FakeH2Loop loop;
+    u8 response[256]{};
+    H2Dispatch<FakeH2Loop> dispatch{&loop, &conn, response, sizeof(response), 0, false};
+    jit::HandlerCtx response_ctx{};
+    response_ctx.captured_response_valid = true;
+    response_ctx.captured_response_status = 403;
+    response_ctx.response_status_set = true;
+    response_ctx.response_status = 200;
+    JitDispatchOutcome outcome{};
+    outcome.kind = JitDispatchOutcome::Kind::ReturnStatus;
+    outcome.status_code = 200;
+    outcome.response_ctx = &response_ctx;
+    outcome.uses_captured_response = true;
+
+    h2_emit_outcome(dispatch, 1, outcome, nullptr, false, true);
+
+    Http2FrameHeader frame{};
+    REQUIRE(parse_frame_header(response, dispatch.resp_len, &frame) == ParseStatus::Complete);
+    hpack::DynamicTable dyn;
+    dyn.init(4096);
+    hpack::Header decoded[4];
+    u8 scratch[64];
+    u32 count = 0;
+    REQUIRE(hpack::decode_header_block(dyn,
+                                       response + kFrameHeaderSize,
+                                       frame.length,
+                                       scratch,
+                                       sizeof(scratch),
+                                       decoded,
+                                       static_cast<u32>(std::size(decoded)),
+                                       &count));
+    REQUIRE_GT(count, 0u);
+    CHECK(decoded[0].name.eq(Str{":status", 7}));
+    CHECK(decoded[0].value.eq(Str{"502", 3}));
+}
+
+TEST(h2_serving, captured_304_content_length_is_removed_for_final_200) {
+    Http2Conn h2;
+    h2.init();
+    Connection conn;
+    conn.reset();
+    conn.h2 = &h2;
+    FakeH2Loop loop;
+    u8 response[256]{};
+    H2Dispatch<FakeH2Loop> dispatch{&loop, &conn, response, sizeof(response), 0, false};
+    jit::CapturedResponseHeader captured_headers[] = {
+        {{"content-length", 14}, {"123", 3}},
+    };
+    jit::HandlerCtx response_ctx{};
+    response_ctx.captured_response_valid = true;
+    response_ctx.captured_response_status = 304;
+    response_ctx.captured_response_header_count = 1;
+    response_ctx.captured_response_headers = captured_headers;
+    JitDispatchOutcome outcome{};
+    outcome.kind = JitDispatchOutcome::Kind::ReturnStatus;
+    outcome.status_code = 200;
+    outcome.response_ctx = &response_ctx;
+    outcome.uses_captured_response = true;
+
+    h2_emit_outcome(dispatch, 1, outcome, nullptr, false);
+
+    Http2FrameHeader frame{};
+    REQUIRE(parse_frame_header(response, dispatch.resp_len, &frame) == ParseStatus::Complete);
+    hpack::DynamicTable dyn;
+    dyn.init(4096);
+    hpack::Header decoded[8];
+    u8 scratch[256];
+    u32 count = 0;
+    REQUIRE(hpack::decode_header_block(dyn,
+                                       response + kFrameHeaderSize,
+                                       frame.length,
+                                       scratch,
+                                       sizeof(scratch),
+                                       decoded,
+                                       8,
+                                       &count));
+    for (u32 i = 0; i < count; i++) {
+        if (decoded[i].name.eq(Str{"content-length", 14}))
+            CHECK_FALSE(decoded[i].value.eq(Str{"123", 3}));
+    }
+}
+
+TEST(h2_serving, captured_body_preserves_absent_content_type) {
+    Http2Conn h2;
+    h2.init();
+    Connection conn;
+    conn.reset();
+    conn.h2 = &h2;
+    FakeH2Loop loop;
+    u8 response[512]{};
+    H2Dispatch<FakeH2Loop> dispatch{&loop, &conn, response, sizeof(response), 0, false};
+    jit::HandlerCtx response_ctx{};
+    response_ctx.captured_response_valid = true;
+    static constexpr char kBody[] = "data";
+    JitDispatchOutcome outcome{};
+    outcome.kind = JitDispatchOutcome::Kind::ReturnStatus;
+    outcome.status_code = 200;
+    outcome.dynamic_response_body = kBody;
+    outcome.dynamic_response_body_len = sizeof(kBody) - 1;
+    outcome.response_ctx = &response_ctx;
+    outcome.uses_captured_response = true;
+
+    h2_emit_outcome(dispatch, 1, outcome, nullptr, false);
+
+    Http2FrameHeader frame{};
+    REQUIRE(parse_frame_header(response, dispatch.resp_len, &frame) == ParseStatus::Complete);
+    hpack::DynamicTable dyn;
+    dyn.init(4096);
+    hpack::Header decoded[8];
+    u8 scratch[256];
+    u32 count = 0;
+    REQUIRE(hpack::decode_header_block(dyn,
+                                       response + kFrameHeaderSize,
+                                       frame.length,
+                                       scratch,
+                                       sizeof(scratch),
+                                       decoded,
+                                       8,
+                                       &count));
+    for (u32 i = 0; i < count; i++) CHECK_FALSE(decoded[i].name.eq(Str{"content-type", 12}));
+}
+
+TEST(h2_serving, captured_header_names_use_full_capture_budget) {
+    Http2Conn h2;
+    h2.init();
+    Connection conn;
+    conn.reset();
+    conn.h2 = &h2;
+    FakeH2Loop loop;
+    u8 response[Http2Conn::kBodySynthCap]{};
+    H2Dispatch<FakeH2Loop> dispatch{&loop, &conn, response, sizeof(response), 0, false};
+    static constexpr u32 kHeaderCount = 64;
+    static constexpr u32 kNameLen = 140;
+    char names[kHeaderCount][kNameLen];
+    jit::CapturedResponseHeader captured_headers[kHeaderCount];
+    for (u32 hi = 0; hi < kHeaderCount; hi++) {
+        for (u32 ni = 0; ni < kNameLen; ni++) names[hi][ni] = 'X';
+        captured_headers[hi] = {{names[hi], kNameLen}, {"v", 1}};
+    }
+    jit::HandlerCtx response_ctx{};
+    response_ctx.captured_response_valid = true;
+    response_ctx.captured_response_header_count = kHeaderCount;
+    response_ctx.captured_response_headers = captured_headers;
+    JitDispatchOutcome outcome{};
+    outcome.kind = JitDispatchOutcome::Kind::ReturnStatus;
+    outcome.status_code = 200;
+    outcome.response_ctx = &response_ctx;
+    outcome.uses_captured_response = true;
+
+    h2_emit_outcome(dispatch, 1, outcome, nullptr, false);
+
+    Http2FrameHeader frame{};
+    REQUIRE(parse_frame_header(response, dispatch.resp_len, &frame) == ParseStatus::Complete);
+    hpack::DynamicTable dyn;
+    dyn.init(4096);
+    hpack::Header decoded[kHeaderCount + 1];
+    u8 scratch[Http2Conn::kBodySynthCap];
+    u32 count = 0;
+    REQUIRE(hpack::decode_header_block(dyn,
+                                       response + kFrameHeaderSize,
+                                       frame.length,
+                                       scratch,
+                                       sizeof(scratch),
+                                       decoded,
+                                       kHeaderCount + 1,
+                                       &count));
+    REQUIRE_GT(count, 0u);
+    CHECK(decoded[0].name.eq(Str{":status", 7}));
+    CHECK(decoded[0].value.eq(Str{"200", 3}));
+}
+
+TEST(h2_serving, captured_head_body_replacement_has_one_content_length) {
+    Http2Conn h2;
+    h2.init();
+    Connection conn;
+    conn.reset();
+    conn.h2 = &h2;
+    FakeH2Loop loop;
+    u8 response[512]{};
+    H2Dispatch<FakeH2Loop> dispatch{&loop, &conn, response, sizeof(response), 0, false};
+    jit::HandlerCtx response_ctx{};
+    jit::CapturedResponseHeader captured_headers[] = {
+        {{"content-length", 14}, {"123", 3}},
+        {{"content-range", 13}, {"bytes 0-2/10", 12}},
+        {{"etag", 4}, {"\"upstream\"", 10}},
+        {{"digest", 6}, {"sha-256=upstream", sizeof("sha-256=upstream") - 1}},
+        {{"content-digest", 14}, {"sha-256=:upstream:", sizeof("sha-256=:upstream:") - 1}},
+        {{"repr-digest", 11}, {"sha-256=:upstream:", sizeof("sha-256=:upstream:") - 1}},
+        {{"content-md5", 11}, {"upstream", 8}},
+    };
+    response_ctx.captured_response_valid = true;
+    response_ctx.captured_response_header_count = static_cast<u32>(std::size(captured_headers));
+    response_ctx.captured_response_headers = captured_headers;
+    response_ctx.response_body_mutation_set = true;
+    static constexpr char kReplacement[] = "new body";
+    JitDispatchOutcome outcome{};
+    outcome.kind = JitDispatchOutcome::Kind::ReturnStatus;
+    outcome.status_code = 200;
+    outcome.dynamic_response_body = kReplacement;
+    outcome.dynamic_response_body_len = sizeof(kReplacement) - 1;
+    outcome.response_ctx = &response_ctx;
+    outcome.uses_captured_response = true;
+
+    h2_emit_outcome(dispatch, 1, outcome, nullptr, true);
+
+    Http2FrameHeader header{};
+    REQUIRE(parse_frame_header(response, dispatch.resp_len, &header) == ParseStatus::Complete);
+    hpack::DynamicTable dyn;
+    dyn.init(4096);
+    hpack::Header decoded[8];
+    u8 scratch[256];
+    u32 count = 0;
+    REQUIRE(hpack::decode_header_block(dyn,
+                                       response + kFrameHeaderSize,
+                                       header.length,
+                                       scratch,
+                                       sizeof(scratch),
+                                       decoded,
+                                       8,
+                                       &count));
+    u32 content_length_count = 0;
+    for (u32 i = 0; i < count; i++) {
+        CHECK_FALSE(decoded[i].name.eq(Str{"content-range", 13}));
+        CHECK_FALSE(decoded[i].name.eq(Str{"etag", 4}));
+        CHECK_FALSE(decoded[i].name.eq(Str{"digest", 6}));
+        CHECK_FALSE(decoded[i].name.eq(Str{"content-digest", 14}));
+        CHECK_FALSE(decoded[i].name.eq(Str{"repr-digest", 11}));
+        CHECK_FALSE(decoded[i].name.eq(Str{"content-md5", 11}));
+        if (!decoded[i].name.eq(Str{"content-length", 14})) continue;
+        content_length_count++;
+        CHECK(decoded[i].value.eq(Str{"8", 1}));
+    }
+    CHECK_EQ(content_length_count, 1u);
+}
+
 TEST(h2_serving, mutation_storage_is_released_after_serialization) {
     Http2Conn h2;
     h2.init();
@@ -2071,6 +2718,71 @@ TEST(h2_serving, failed_response_serialization_rolls_back_encoder_state) {
 
     CHECK(dispatch.overflow);
     CHECK_EQ(__builtin_memcmp(&h2.hpack_enc, &before, sizeof(before)), 0);
+}
+
+TEST(h2_serving, completed_request_is_accounted_once) {
+    Http2Conn h2;
+    h2.init();
+    h2.nstreams = 1;
+    h2.streams[0] = {1,
+                     Http2StreamState::HalfClosedRemote,
+                     kDefaultInitialWindowSize,
+                     kDefaultInitialWindowSize,
+                     true,
+                     false,
+                     false,
+                     0};
+
+    Connection conn;
+    conn.reset();
+    conn.h2 = &h2;
+    ShardMetrics metrics;
+    metrics.init();
+    FakeH2Loop loop;
+    loop.metrics = &metrics;
+    u8 resp[256];
+    H2Dispatch<FakeH2Loop> d{&loop, &conn, resp, sizeof(resp), 0, false};
+    const hpack::Header hs[] = {{{":method", 7}, {"GET", 3}}, {{":path", 5}, {"/", 1}}};
+
+    h2_on_headers_cb<FakeH2Loop>(&d, h2, 1, hs, 2, true);
+
+    CHECK_EQ(metrics.requests_total, 0u);
+    CHECK_EQ(metrics.requests_active, 1u);
+    CHECK_EQ(metrics.request_latency.count, 0u);
+    CHECK(h2.streams[0].metrics_started);
+    CHECK(h2.streams[0].metrics_pending_send);
+
+    h2_complete_sent_request_metrics(h2);
+
+    CHECK_EQ(metrics.requests_total, 1u);
+    CHECK_EQ(metrics.requests_active, 0u);
+    CHECK_EQ(metrics.request_latency.count, 1u);
+    CHECK_FALSE(h2.streams[0].metrics_started);
+    CHECK_FALSE(h2.streams[0].metrics_pending_send);
+}
+
+TEST(h2_serving, reset_cancels_metrics_after_engine_closes_stream) {
+    Http2Conn h2;
+    h2.init();
+    ShardMetrics metrics;
+    metrics.init();
+    metrics.on_request_start();
+    h2.metrics = &metrics;
+    h2.nstreams = 1;
+    h2.streams[0] = {1,
+                     Http2StreamState::Closed,
+                     kDefaultInitialWindowSize,
+                     kDefaultInitialWindowSize,
+                     true,
+                     true,
+                     false,
+                     monotonic_us()};
+
+    h2_on_reset_cb(nullptr, h2, 1, Http2Error::Cancel);
+
+    CHECK_EQ(metrics.requests_active, 0u);
+    CHECK_EQ(metrics.requests_total, 0u);
+    CHECK_FALSE(h2.streams[0].metrics_started);
 }
 
 TEST(h2_serving, deferred_route_params_copied_to_stable_storage) {
@@ -2168,6 +2880,10 @@ TEST(h2_serving, suspended_handler_context_is_snapshotted_and_rebased) {
     auto* live = conn.reset_jit_ctx();
     live->slot_count = 1;
     live->store_slot<i64>(0, 73);
+    auto* control_plane = jit::acquire_control_plane_snapshot(live);
+    REQUIRE(control_plane != nullptr);
+    control_plane->valid = true;
+    control_plane->shard_id = 7;
 
     u8 synth[] = "GET /slow/abcd HTTP/1.1\r\nhost: example\r\n\r\n";
     constexpr u32 kSynthLen = sizeof(synth) - 1;
@@ -2195,6 +2911,7 @@ TEST(h2_serving, suspended_handler_context_is_snapshotted_and_rebased) {
 
     REQUIRE_EQ(h2_stash_synth(h2, synth, kSynthLen), kSynthLen);
     REQUIRE(h2_snapshot_async_jit_ctx(h2, *live, synth, kSynthLen));
+    CHECK(live->control_plane == nullptr);
     CHECK(live->response_body_mutation_storage == nullptr);
     CHECK(live->response_body_snapshot_storage == nullptr);
     conn.reset_jit_ctx();
@@ -2203,6 +2920,9 @@ TEST(h2_serving, suspended_handler_context_is_snapshotted_and_rebased) {
     const auto* parked = h2.async_jit_ctx();
     CHECK(parked != live);
     CHECK_EQ(parked->load_slot<i64>(0), 73);
+    REQUIRE(parked->control_plane != nullptr);
+    CHECK(parked->control_plane->valid);
+    CHECK_EQ(parked->control_plane->shard_id, 7u);
     CHECK(parked->response_header_mutations[0].value.eq(Str{"/slow/abcd", 10}));
     CHECK(parked->response_header_mutations[0].value.ptr ==
           reinterpret_cast<const char*>(h2.pending_synth + 4));
@@ -2219,6 +2939,7 @@ TEST(h2_serving, suspended_handler_context_is_snapshotted_and_rebased) {
     h2.async_kind = H2AsyncKind::Proxy;
     h2.async_apply_response_mutations = true;
     h2_clear_async(h2);
+    CHECK(parked->control_plane == nullptr);
     CHECK(parked->response_body_mutation_storage == nullptr);
     CHECK(parked->response_body_snapshot_storage == nullptr);
 }

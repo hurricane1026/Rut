@@ -65,6 +65,19 @@ struct HandlerExecutionResult {
     char dynamic_response_body[jit::kMaxDynamicResponseBodyBytes]{};
     u32 dynamic_response_body_len = 0;
     bool dynamic_response_body_valid = false;
+    // Captured upstream responses use the runtime capture-slice budget rather
+    // than the smaller dynamic-JSON serializer budget. Keep their identity so
+    // empty bodies and captured headers survive the connection adapter.
+    char captured_response_body[jit::kMaxCapturedResponseStorageBytes -
+                                jit::kCapturedResponseFramingReserve]{};
+    u32 captured_response_body_len = 0;
+    bool uses_captured_response = false;
+    u16 captured_response_status = 0;
+    bool captured_response_body_mutated = false;
+    jit::CapturedResponseHeader captured_response_headers[jit::kMaxCapturedResponseHeaders]{};
+    std::string captured_response_header_names[jit::kMaxCapturedResponseHeaders];
+    std::string captured_response_header_values[jit::kMaxCapturedResponseHeaders];
+    u8 captured_response_header_count = 0;
     jit::ResponseHeaderMutation response_header_mutations[jit::kMaxResponseHeaderMutations]{};
     // Header values are copied out of the temporary HandlerExecution so values
     // backed by resp.body snapshots remain valid through result consumption.

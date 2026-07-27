@@ -79,12 +79,27 @@ inline bool rir_function_needs_req_body(const rir::Function& fn) {
 }
 
 inline bool rir_function_can_forward_buffered(const rir::Function& fn) {
+    for (u32 yi = 0; yi < fn.yield_count; yi++)
+        if (fn.yield_kinds != nullptr &&
+            fn.yield_kinds[yi] == static_cast<u8>(jit::YieldKind::Forward))
+            return true;
     if (fn.blocks == nullptr) return false;
     for (u32 bi = 0; bi < fn.block_count; bi++) {
         const auto& block = fn.blocks[bi];
         if (block.insts == nullptr) continue;
         for (u32 ii = 0; ii < block.inst_count; ii++)
             if (block.insts[ii].op == rir::Opcode::RetForwardBuffered) return true;
+    }
+    return false;
+}
+
+inline bool rir_function_needs_control_plane_snapshot(const rir::Function& fn) {
+    if (fn.blocks == nullptr) return false;
+    for (u32 bi = 0; bi < fn.block_count; bi++) {
+        const auto& block = fn.blocks[bi];
+        if (block.insts == nullptr) continue;
+        for (u32 ii = 0; ii < block.inst_count; ii++)
+            if (block.insts[ii].op == rir::Opcode::JsonAppendControlPlane) return true;
     }
     return false;
 }
@@ -138,7 +153,8 @@ inline bool register_jit_routes(RouteConfig& cfg, const rir::Module& mod, jit::J
                                fn.route_pattern.len,
                                fn.timer_interval_ms,
                                handler,
-                               fn.timer_shard))
+                               fn.timer_shard,
+                               rir_function_needs_control_plane_snapshot(fn)))
                 return false;
             continue;
         }
@@ -151,7 +167,8 @@ inline bool register_jit_routes(RouteConfig& cfg, const rir::Module& mod, jit::J
                                  fn.http_method,
                                  handler,
                                  rir_function_needs_req_body(fn),
-                                 rir_function_can_forward_buffered(fn)))
+                                 rir_function_can_forward_buffered(fn),
+                                 rir_function_needs_control_plane_snapshot(fn)))
             return false;
         // @rateLimit decorators → stacked token-bucket rules, each with its own
         // metering key (the route just added is at index route_count - 1).

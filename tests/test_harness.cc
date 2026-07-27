@@ -14,7 +14,9 @@
 #include <cerrno>
 #include <cstdio>
 #include <cstring>
+#include <string>
 #include <type_traits>
+#include <utility>
 
 #include <fcntl.h>
 #include <stdlib.h>
@@ -79,9 +81,7 @@ u64 mutable_body_handler(void*, jit::HandlerCtx* ctx, const u8*, u32, void*) {
     rut_helper_resp_set_body(ctx, source, sizeof(source) - 1);
     __builtin_memset(source, 'x', sizeof(source) - 1);
     rut_helper_resp_commit_headers(ctx);
-    auto result = jit::HandlerResult::make_status(200);
-    result.upstream_id = jit::HandlerResult::kDynamicResponseBody;
-    return result.pack();
+    return jit::HandlerResult::make_status(200).pack();
 }
 
 u64 snapshotted_header_handler(void*, jit::HandlerCtx* ctx, const u8*, u32, void*) {
@@ -127,6 +127,85 @@ u64 targeted_upstream_handler(void*, jit::HandlerCtx* ctx, const u8*, u32, void*
     if (ctx->state == 0)
         return jit::HandlerResult::make_yield_payload(1, jit::YieldKind::UpstreamConnect, 1).pack();
     return jit::HandlerResult::make_status(204).pack();
+}
+
+u64 captured_forward_handler(void*, jit::HandlerCtx* ctx, const u8*, u32, void*) {
+    if (ctx->state == 0)
+        return jit::HandlerResult::make_yield_payload(1, jit::YieldKind::Forward, 7).pack();
+    if (ctx->resume_event_kind != static_cast<u32>(jit::YieldKind::Forward) ||
+        ctx->resume_event_result != 206 || !ctx->captured_response_valid ||
+        ctx->captured_response_status != 206 || ctx->captured_response_body_len != 4 ||
+        ctx->captured_response_header_count != 1 ||
+        !ctx->captured_response_headers[0].value.eq({"fixture", 7}))
+        return jit::HandlerResult::make_status(500).pack();
+    return jit::HandlerResult::make_status(0).pack();
+}
+
+u64 captured_empty_forward_handler(void*, jit::HandlerCtx* ctx, const u8*, u32, void*) {
+    if (ctx->state == 0)
+        return jit::HandlerResult::make_yield_payload(1, jit::YieldKind::Forward, 7).pack();
+    if (!ctx->captured_response_valid || ctx->captured_response_body_len != 0)
+        return jit::HandlerResult::make_status(500).pack();
+    return jit::HandlerResult::make_status(0).pack();
+}
+
+u64 captured_passthrough_handler(void*, jit::HandlerCtx* ctx, const u8*, u32, void*) {
+    if (ctx->state == 0)
+        return jit::HandlerResult::make_yield_payload(1, jit::YieldKind::Forward, 7).pack();
+    if (!ctx->captured_response_valid) return jit::HandlerResult::make_status(500).pack();
+    return jit::HandlerResult::make_status(0).pack();
+}
+
+u64 captured_connect_success_handler(void*, jit::HandlerCtx* ctx, const u8*, u32, void*) {
+    if (ctx->state == 0)
+        return jit::HandlerResult::make_yield_payload(1, jit::YieldKind::Forward, 7).pack();
+    if (!ctx->captured_response_valid) return jit::HandlerResult::make_status(500).pack();
+    rut_helper_resp_set_status(ctx, 200);
+    rut_helper_resp_commit_headers(ctx);
+    return jit::HandlerResult::make_status(0).pack();
+}
+
+u64 captured_partial_status_promotion_handler(void*, jit::HandlerCtx* ctx, const u8*, u32, void*) {
+    if (ctx->state == 0)
+        return jit::HandlerResult::make_yield_payload(1, jit::YieldKind::Forward, 7).pack();
+    if (!ctx->captured_response_valid) return jit::HandlerResult::make_status(500).pack();
+    rut_helper_resp_set_status(ctx, 200);
+    rut_helper_resp_commit_headers(ctx);
+    return jit::HandlerResult::make_status(0).pack();
+}
+
+u64 captured_body_mutation_handler(void*, jit::HandlerCtx* ctx, const u8*, u32, void*) {
+    if (ctx->state == 0)
+        return jit::HandlerResult::make_yield_payload(1, jit::YieldKind::Forward, 7).pack();
+    if (!ctx->captured_response_valid) return jit::HandlerResult::make_status(500).pack();
+    static constexpr char kReplacement[] = "replacement";
+    rut_helper_resp_set_body(ctx, kReplacement, sizeof(kReplacement) - 1);
+    rut_helper_resp_commit_headers(ctx);
+    return jit::HandlerResult::make_status(0).pack();
+}
+
+u64 captured_head_invalid_range_handler(void*, jit::HandlerCtx* ctx, const u8*, u32, void*) {
+    if (ctx->state == 0)
+        return jit::HandlerResult::make_yield_payload(1, jit::YieldKind::Forward, 7).pack();
+    if (!ctx->captured_response_valid) return jit::HandlerResult::make_status(500).pack();
+    static constexpr char kBody[] = "data";
+    static constexpr char kRangeName[] = "Content-Range";
+    static constexpr char kRangeValue[] = "bytes 0-9/100";
+    rut_helper_resp_set_body(ctx, kBody, sizeof(kBody) - 1);
+    rut_helper_resp_set_header(
+        ctx, kRangeName, sizeof(kRangeName) - 1, kRangeValue, sizeof(kRangeValue) - 1);
+    rut_helper_resp_set_status(ctx, 206);
+    rut_helper_resp_commit_headers(ctx);
+    return jit::HandlerResult::make_status(0).pack();
+}
+
+u64 captured_informational_status_handler(void*, jit::HandlerCtx* ctx, const u8*, u32, void*) {
+    if (ctx->state == 0)
+        return jit::HandlerResult::make_yield_payload(1, jit::YieldKind::Forward, 7).pack();
+    if (!ctx->captured_response_valid) return jit::HandlerResult::make_status(500).pack();
+    rut_helper_resp_set_status(ctx, 103);
+    rut_helper_resp_commit_headers(ctx);
+    return jit::HandlerResult::make_status(0).pack();
 }
 
 u64 any_timer_handler(void*, jit::HandlerCtx* ctx, const u8*, u32, void*) {
@@ -185,6 +264,27 @@ bool capture_response_observation(void* context, const harness::Observation& eve
     auto* captured = static_cast<ResponseObservation*>(context);
     captured->seen = true;
     captured->status = event.value0;
+    return true;
+}
+
+struct ResponseBodyObservation {
+    bool seen = false;
+    bool truncated = false;
+    u64 timestamp_us = 0;
+    u32 full_len = 0;
+    u32 copied_len = 0;
+    char bytes[4096]{};
+};
+
+bool capture_response_body_observation(void* context, const harness::Observation& event) {
+    if (event.kind != harness::ObservationKind::ResponseBodyProduced) return true;
+    auto* captured = static_cast<ResponseBodyObservation*>(context);
+    captured->seen = true;
+    captured->truncated = event.value1 != 0;
+    captured->timestamp_us = event.timestamp_us;
+    captured->full_len = static_cast<u32>(event.value0);
+    captured->copied_len = event.label.len;
+    if (event.label.len != 0) __builtin_memcpy(captured->bytes, event.label.ptr, event.label.len);
     return true;
 }
 
@@ -594,6 +694,7 @@ TEST(harness_handler, consumes_declared_completion_from_deterministic_environmen
     REQUIRE_EQ(result.harness.outcome, harness::Outcome::Passed);
     REQUIRE(result.has_terminal);
     CHECK_EQ(result.terminal.status_code, 206);
+    CHECK_EQ(result.terminal.upstream_id, 0u);
     CHECK_EQ(result.consumed_events, 1u);
     CHECK_EQ(result.harness.virtual_time_us, 100u);
     // A run consumes an isolated copy, not the caller's reusable environment.
@@ -640,6 +741,601 @@ TEST(harness_handler, stalls_when_script_targets_a_different_upstream) {
     CHECK_EQ(result.harness.outcome, harness::Outcome::Stalled);
     CHECK_EQ(result.consumed_events, 0u);
     CHECK_EQ(result.harness.virtual_time_us, 0u);
+}
+
+TEST(harness_handler, replays_owned_buffered_forward_response_fields) {
+    harness::HandlerExecution execution{};
+    execution.init(&captured_forward_handler, nullptr, nullptr, 0);
+    static constexpr u8 kBody[] = {'b', 'o', 'd', 'y'};
+    static constexpr char kName[] = "X-Origin";
+    static constexpr char kValue[] = "fixture";
+    const jit::CapturedResponseHeader headers[] = {
+        {{kName, sizeof(kName) - 1}, {kValue, sizeof(kValue) - 1}},
+    };
+    const harness::DeterministicCompletion completions[] = {{
+        jit::YieldKind::Forward,
+        0,
+        100,
+        1,
+        7,
+        kBody,
+        sizeof(kBody),
+        false,
+        false,
+        206,
+        headers,
+        1,
+    }};
+    harness::DeterministicEnvironment environment{};
+    environment.reset(completions, 1);
+    harness::DeterministicHandlerSpec driver{};
+    driver.execution = execution;
+    driver.environment = &environment;
+    harness::HarnessSpec spec{};
+    spec.layer = harness::ExecutionLayer::Handler;
+
+    const auto result = harness::drive_handler_deterministically(driver, spec);
+    REQUIRE_EQ(result.harness.outcome, harness::Outcome::Passed);
+    REQUIRE(result.has_terminal);
+    CHECK_EQ(result.terminal.status_code, 206);
+    REQUIRE(result.uses_captured_response);
+    CHECK_EQ(result.captured_response_body_len, sizeof(kBody));
+    CHECK(std::memcmp(result.captured_response_body, kBody, sizeof(kBody)) == 0);
+}
+
+TEST(harness_handler, accepts_empty_captured_response_body) {
+    harness::HandlerExecution execution{};
+    execution.init(&captured_empty_forward_handler, nullptr, nullptr, 0);
+    const harness::DeterministicCompletion completions[] = {{
+        jit::YieldKind::Forward,
+        0,
+        100,
+        1,
+        7,
+        nullptr,
+        0,
+        false,
+        false,
+        204,
+        nullptr,
+        0,
+    }};
+    harness::DeterministicEnvironment environment{};
+    environment.reset(completions, 1);
+    harness::DeterministicHandlerSpec driver{};
+    driver.execution = execution;
+    driver.environment = &environment;
+    harness::HarnessSpec spec{};
+    spec.layer = harness::ExecutionLayer::Handler;
+
+    const auto result = harness::drive_handler_deterministically(driver, spec);
+    REQUIRE_EQ(result.harness.outcome, harness::Outcome::Passed);
+    REQUIRE(result.has_terminal);
+    CHECK_EQ(result.terminal.status_code, 204);
+    CHECK(result.uses_captured_response);
+    CHECK_EQ(result.captured_response_body_len, 0u);
+}
+
+TEST(harness_handler, failed_captured_forward_is_terminal_gateway_error) {
+    for (const auto [failure, expected] : {std::pair{-EIO, 502u}, std::pair{-ETIMEDOUT, 504u}}) {
+        harness::HandlerExecution execution{};
+        execution.init(&captured_passthrough_handler, nullptr, nullptr, 0);
+        const harness::DeterministicCompletion completion = {
+            jit::YieldKind::Forward,
+            failure,
+            100,
+            1,
+            7,
+            nullptr,
+            0,
+            true,
+            true,
+            200,
+            nullptr,
+            0,
+        };
+        harness::DeterministicEnvironment environment{};
+        environment.reset(&completion, 1);
+        harness::DeterministicHandlerSpec driver{};
+        driver.execution = execution;
+        driver.environment = &environment;
+        harness::HarnessSpec spec{};
+        spec.layer = harness::ExecutionLayer::Handler;
+
+        const auto result = harness::drive_handler_deterministically(driver, spec);
+        REQUIRE_EQ(result.harness.outcome, harness::Outcome::Passed);
+        REQUIRE(result.has_terminal);
+        CHECK_EQ(result.terminal.status_code, expected);
+        CHECK_EQ(result.harness.handler_resumes, 0u);
+        CHECK_EQ(result.harness.faults_injected, 1u);
+        CHECK_FALSE(result.uses_captured_response);
+    }
+}
+
+TEST(harness_handler, captured_bodyless_status_promotion_requires_body_replacement) {
+    for (const u16 captured_status : {u16{204}, u16{205}, u16{304}}) {
+        harness::HandlerExecution execution{};
+        execution.init(&captured_partial_status_promotion_handler, nullptr, nullptr, 0);
+        const harness::DeterministicCompletion completion = {
+            jit::YieldKind::Forward,
+            0,
+            100,
+            1,
+            7,
+            nullptr,
+            0,
+            false,
+            false,
+            captured_status,
+            nullptr,
+            0,
+        };
+        harness::DeterministicEnvironment environment{};
+        environment.reset(&completion, 1);
+        harness::DeterministicHandlerSpec driver{};
+        driver.execution = execution;
+        driver.environment = &environment;
+        harness::HarnessSpec spec{};
+        spec.layer = harness::ExecutionLayer::Handler;
+
+        const auto result = harness::drive_handler_deterministically(driver, spec);
+        REQUIRE_EQ(result.harness.outcome, harness::Outcome::Passed);
+        REQUIRE(result.has_terminal);
+        CHECK_EQ(result.terminal.status_code, 500u);
+        CHECK_FALSE(result.uses_captured_response);
+    }
+}
+
+TEST(harness_handler, routes_captured_body_mutations_through_captured_storage) {
+    harness::HandlerExecution execution{};
+    execution.init(&captured_body_mutation_handler, nullptr, nullptr, 0);
+    static constexpr u8 kOriginal[] = {'o', 'l', 'd'};
+    const harness::DeterministicCompletion completions[] = {{
+        jit::YieldKind::Forward,
+        0,
+        100,
+        1,
+        7,
+        kOriginal,
+        sizeof(kOriginal),
+        false,
+        false,
+        200,
+        nullptr,
+        0,
+    }};
+    harness::DeterministicEnvironment environment{};
+    environment.reset(completions, 1);
+    harness::DeterministicHandlerSpec driver{};
+    driver.execution = execution;
+    driver.environment = &environment;
+    harness::HarnessSpec spec{};
+    spec.layer = harness::ExecutionLayer::Handler;
+
+    const auto result = harness::drive_handler_deterministically(driver, spec);
+    static constexpr char kExpected[] = "replacement";
+    REQUIRE_EQ(result.harness.outcome, harness::Outcome::Passed);
+    REQUIRE(result.uses_captured_response);
+    CHECK(result.captured_response_body_mutated);
+    REQUIRE_EQ(result.captured_response_body_len, sizeof(kExpected) - 1);
+    CHECK(std::memcmp(result.captured_response_body, kExpected, sizeof(kExpected) - 1) == 0);
+}
+
+TEST(harness_handler, preserves_captured_body_beyond_dynamic_json_limit) {
+    harness::HandlerExecution execution{};
+    execution.init(&captured_passthrough_handler, nullptr, nullptr, 0);
+    static u8 body[12000];
+    for (u32 i = 0; i < sizeof(body); i++) body[i] = static_cast<u8>('a' + i % 26);
+    const harness::DeterministicCompletion completions[] = {{
+        jit::YieldKind::Forward,
+        0,
+        100,
+        1,
+        7,
+        body,
+        sizeof(body),
+        false,
+        false,
+        200,
+        nullptr,
+        0,
+    }};
+    harness::DeterministicEnvironment environment{};
+    environment.reset(completions, 1);
+    harness::DeterministicHandlerSpec driver{};
+    driver.execution = execution;
+    driver.environment = &environment;
+    harness::HarnessSpec spec{};
+    spec.layer = harness::ExecutionLayer::Handler;
+
+    const auto result = harness::drive_handler_deterministically(driver, spec);
+    REQUIRE_EQ(result.harness.outcome, harness::Outcome::Passed);
+    REQUIRE(result.uses_captured_response);
+    CHECK_FALSE(result.captured_response_body_mutated);
+    CHECK_EQ(result.captured_response_body_len, sizeof(body));
+    CHECK(std::memcmp(result.captured_response_body, body, sizeof(body)) == 0);
+}
+
+TEST(harness_handler, owns_captured_headers_across_result_copies) {
+    harness::HandlerExecution execution{};
+    execution.init(&captured_passthrough_handler, nullptr, nullptr, 0);
+    const jit::CapturedResponseHeader headers[] = {
+        {{"X-Origin", 8}, {"fixture", 7}},
+    };
+    const harness::DeterministicCompletion completions[] = {{
+        jit::YieldKind::Forward,
+        0,
+        100,
+        1,
+        7,
+        nullptr,
+        0,
+        false,
+        false,
+        204,
+        headers,
+        1,
+    }};
+    harness::DeterministicEnvironment environment{};
+    environment.reset(completions, 1);
+    harness::DeterministicHandlerSpec driver{};
+    driver.execution = execution;
+    driver.environment = &environment;
+    harness::HarnessSpec spec{};
+    spec.layer = harness::ExecutionLayer::Handler;
+
+    const auto result = harness::drive_handler_deterministically(driver, spec);
+    const harness::HandlerExecutionResult copied = result;
+    REQUIRE(copied.uses_captured_response);
+    CHECK_EQ(copied.captured_response_body_mutated, result.captured_response_body_mutated);
+    REQUIRE_EQ(copied.captured_response_header_count, 1u);
+    CHECK(copied.captured_response_headers[0].name.eq({"X-Origin", 8}));
+    CHECK(copied.captured_response_headers[0].value.eq({"fixture", 7}));
+}
+
+TEST(harness_handler, normalizes_captured_content_length_for_request_method) {
+    const auto run = [](const u8* request, u32 request_len) {
+        static const u8 body[123]{};
+        const bool head = request_len >= 4 && request[0] == 'H';
+        harness::HandlerExecution execution{};
+        execution.init(&captured_passthrough_handler, nullptr, request, request_len);
+        const jit::CapturedResponseHeader headers[] = {
+            {{"Content-Length", 14}, {"123", 3}},
+            {{"X-Origin", 8}, {"fixture", 7}},
+        };
+        const harness::DeterministicCompletion completion = {
+            jit::YieldKind::Forward,
+            0,
+            100,
+            1,
+            7,
+            head ? nullptr : body,
+            head ? 0u : static_cast<u32>(sizeof(body)),
+            false,
+            false,
+            200,
+            headers,
+            2,
+        };
+        harness::DeterministicEnvironment environment{};
+        environment.reset(&completion, 1);
+        harness::DeterministicHandlerSpec driver{};
+        driver.execution = execution;
+        driver.environment = &environment;
+        harness::HarnessSpec spec{};
+        spec.layer = harness::ExecutionLayer::Handler;
+        return harness::drive_handler_deterministically(driver, spec);
+    };
+
+    static constexpr u8 kGet[] = "GET /x HTTP/1.1\r\nHost: test\r\n\r\n";
+    const auto get = run(kGet, sizeof(kGet) - 1);
+    REQUIRE_EQ(get.harness.outcome, harness::Outcome::Passed);
+    REQUIRE_EQ(get.captured_response_header_count, 1u);
+    CHECK(get.captured_response_headers[0].name.eq({"X-Origin", 8}));
+
+    static constexpr u8 kHead[] = "HEAD /x HTTP/1.1\r\nHost: test\r\n\r\n";
+    const auto head = run(kHead, sizeof(kHead) - 1);
+    REQUIRE_EQ(head.harness.outcome, harness::Outcome::Passed);
+    REQUIRE_EQ(head.captured_response_header_count, 2u);
+    CHECK(head.captured_response_headers[0].name.eq({"Content-Length", 14}));
+}
+
+TEST(harness_handler, rejects_null_captured_response_header_views) {
+    harness::HandlerExecution execution{};
+    execution.init(&captured_forward_handler, nullptr, nullptr, 0);
+    const jit::CapturedResponseHeader headers[] = {
+        {{nullptr, 1}, {"fixture", 7}},
+    };
+    const harness::DeterministicCompletion completions[] = {{
+        jit::YieldKind::Forward,
+        0,
+        100,
+        1,
+        7,
+        nullptr,
+        0,
+        false,
+        false,
+        206,
+        headers,
+        1,
+    }};
+    harness::DeterministicEnvironment environment{};
+    environment.reset(completions, 1);
+    harness::DeterministicHandlerSpec driver{};
+    driver.execution = execution;
+    driver.environment = &environment;
+    harness::HarnessSpec spec{};
+    spec.layer = harness::ExecutionLayer::Handler;
+
+    const auto result = harness::drive_handler_deterministically(driver, spec);
+    CHECK_EQ(result.harness.outcome, harness::Outcome::Invalid);
+    CHECK_EQ(result.harness.cleanup, harness::CleanupOutcome::Clean);
+}
+
+TEST(harness_handler, rejects_informational_captured_response_fixtures) {
+    for (const u16 status : {100u, 103u, 199u}) {
+        harness::HandlerExecution execution{};
+        execution.init(&captured_passthrough_handler, nullptr, nullptr, 0);
+        const harness::DeterministicCompletion completion = {
+            jit::YieldKind::Forward, 0, 100, 1, 7, nullptr, 0, false, false, status, nullptr, 0};
+        harness::DeterministicEnvironment environment{};
+        environment.reset(&completion, 1);
+        harness::DeterministicHandlerSpec driver{};
+        driver.execution = execution;
+        driver.environment = &environment;
+        harness::HarnessSpec spec{};
+        spec.layer = harness::ExecutionLayer::Handler;
+
+        const auto result = harness::drive_handler_deterministically(driver, spec);
+        CHECK_EQ(result.harness.outcome, harness::Outcome::Invalid);
+    }
+}
+
+TEST(harness_handler, rejects_informational_status_mutated_after_capture) {
+    harness::HandlerExecution execution{};
+    execution.init(&captured_informational_status_handler, nullptr, nullptr, 0);
+    const harness::DeterministicCompletion completion = {
+        jit::YieldKind::Forward, 0, 100, 1, 7, nullptr, 0, false, false, 200, nullptr, 0};
+    harness::DeterministicEnvironment environment{};
+    environment.reset(&completion, 1);
+    harness::DeterministicHandlerSpec driver{};
+    driver.execution = execution;
+    driver.environment = &environment;
+    harness::HarnessSpec spec{};
+    spec.layer = harness::ExecutionLayer::Handler;
+
+    const auto result = harness::drive_handler_deterministically(driver, spec);
+    REQUIRE_EQ(result.harness.outcome, harness::Outcome::Passed);
+    REQUIRE(result.has_terminal);
+    CHECK_EQ(result.terminal.status_code, 500u);
+    CHECK_FALSE(result.uses_captured_response);
+}
+
+TEST(harness_handler, rejects_invalid_captured_response_header_syntax) {
+    const jit::CapturedResponseHeader invalid_headers[] = {
+        {{"", 0}, {"value", 5}},
+        {{"Bad Name", 8}, {"value", 5}},
+        {{"X-Test", 6}, {"bad\rvalue", 9}},
+    };
+    for (const auto& header : invalid_headers) {
+        harness::HandlerExecution execution{};
+        execution.init(&captured_passthrough_handler, nullptr, nullptr, 0);
+        const harness::DeterministicCompletion completion = {
+            jit::YieldKind::Forward, 0, 100, 1, 7, nullptr, 0, false, false, 206, &header, 1};
+        harness::DeterministicEnvironment environment{};
+        environment.reset(&completion, 1);
+        harness::DeterministicHandlerSpec driver{};
+        driver.execution = execution;
+        driver.environment = &environment;
+        harness::HarnessSpec spec{};
+        spec.layer = harness::ExecutionLayer::Handler;
+
+        const auto result = harness::drive_handler_deterministically(driver, spec);
+        CHECK_EQ(result.harness.outcome, harness::Outcome::Invalid);
+    }
+}
+
+TEST(harness_handler, rejects_bodies_for_bodyless_forward_fixtures) {
+    static const u8 body[] = {'x'};
+    for (const u16 status : {204u, 205u, 304u}) {
+        harness::HandlerExecution execution{};
+        execution.init(&captured_passthrough_handler, nullptr, nullptr, 0);
+        const harness::DeterministicCompletion completion = {
+            jit::YieldKind::Forward, 0, 100, 1, 7, body, 1, false, false, status, nullptr, 0};
+        harness::DeterministicEnvironment environment{};
+        environment.reset(&completion, 1);
+        harness::DeterministicHandlerSpec driver{};
+        driver.execution = execution;
+        driver.environment = &environment;
+        harness::HarnessSpec spec{};
+        spec.layer = harness::ExecutionLayer::Handler;
+        CHECK_EQ(harness::drive_handler_deterministically(driver, spec).harness.outcome,
+                 harness::Outcome::Invalid);
+    }
+
+    static constexpr u8 kHeadRequest[] = "HEAD /x HTTP/1.1\r\nHost: test\r\n\r\n";
+    harness::HandlerExecution head_execution{};
+    head_execution.init(
+        &captured_passthrough_handler, nullptr, kHeadRequest, sizeof(kHeadRequest) - 1);
+    const harness::DeterministicCompletion head_completion = {
+        jit::YieldKind::Forward, 0, 100, 1, 7, body, 1, false, false, 200, nullptr, 0};
+    harness::DeterministicEnvironment head_environment{};
+    head_environment.reset(&head_completion, 1);
+    harness::DeterministicHandlerSpec head_driver{};
+    head_driver.execution = head_execution;
+    head_driver.environment = &head_environment;
+    harness::HarnessSpec head_spec{};
+    head_spec.layer = harness::ExecutionLayer::Handler;
+    CHECK_EQ(harness::drive_handler_deterministically(head_driver, head_spec).harness.outcome,
+             harness::Outcome::Invalid);
+}
+
+TEST(harness_handler, rejects_successful_connect_forward_fixtures) {
+    static constexpr u8 kRequest[] =
+        "CONNECT example.com:443 HTTP/1.1\r\nHost: example.com\r\n\r\n";
+    harness::HandlerExecution execution{};
+    execution.init(&captured_passthrough_handler, nullptr, kRequest, sizeof(kRequest) - 1);
+    const harness::DeterministicCompletion completion = {
+        jit::YieldKind::Forward, 0, 100, 1, 7, nullptr, 0, false, false, 200, nullptr, 0};
+    harness::DeterministicEnvironment environment{};
+    environment.reset(&completion, 1);
+    harness::DeterministicHandlerSpec driver{};
+    driver.execution = execution;
+    driver.environment = &environment;
+    harness::HarnessSpec spec{};
+    spec.layer = harness::ExecutionLayer::Handler;
+
+    CHECK_EQ(harness::drive_handler_deterministically(driver, spec).harness.outcome,
+             harness::Outcome::Invalid);
+}
+
+TEST(harness_handler, trims_captured_response_header_ows) {
+    harness::HandlerExecution execution{};
+    execution.init(&captured_passthrough_handler, nullptr, nullptr, 0);
+    const jit::CapturedResponseHeader header = {{"X-Origin", 8}, {" \t fixture \t", 12}};
+    const harness::DeterministicCompletion completion = {
+        jit::YieldKind::Forward, 0, 100, 1, 7, nullptr, 0, false, false, 200, &header, 1};
+    harness::DeterministicEnvironment environment{};
+    environment.reset(&completion, 1);
+    harness::DeterministicHandlerSpec driver{};
+    driver.execution = execution;
+    driver.environment = &environment;
+    harness::HarnessSpec spec{};
+    spec.layer = harness::ExecutionLayer::Handler;
+
+    const auto result = harness::drive_handler_deterministically(driver, spec);
+    REQUIRE_EQ(result.harness.outcome, harness::Outcome::Passed);
+    REQUIRE_EQ(result.captured_response_header_count, 1u);
+    CHECK(result.captured_response_headers[0].value.eq({"fixture", 7}));
+}
+
+TEST(harness_handler, rejects_captured_content_length_body_mismatch) {
+    static constexpr u8 request[] = "GET /x HTTP/1.1\r\nHost: test\r\n\r\n";
+    static constexpr u8 body[] = {'x'};
+    const jit::CapturedResponseHeader headers[] = {
+        {{"Content-Length", 14}, {"10", 2}},
+    };
+    harness::HandlerExecution execution{};
+    execution.init(&captured_passthrough_handler, nullptr, request, sizeof(request) - 1);
+    const harness::DeterministicCompletion completion = {
+        jit::YieldKind::Forward, 0, 100, 1, 7, body, 1, false, false, 200, headers, 1};
+    harness::DeterministicEnvironment environment{};
+    environment.reset(&completion, 1);
+    harness::DeterministicHandlerSpec driver{};
+    driver.execution = execution;
+    driver.environment = &environment;
+    harness::HarnessSpec spec{};
+    spec.layer = harness::ExecutionLayer::Handler;
+
+    const auto result = harness::drive_handler_deterministically(driver, spec);
+    CHECK_EQ(result.harness.outcome, harness::Outcome::Invalid);
+    CHECK_EQ(result.harness.cleanup, harness::CleanupOutcome::Clean);
+}
+
+TEST(harness_handler, filters_hop_by_hop_forward_fixture_headers) {
+    const jit::CapturedResponseHeader headers[] = {
+        {{"Connection", 10}, {" keep-alive, X-Private ", 23}},
+        {{"X-Private", 9}, {"secret", 6}},
+        {{"Transfer-Encoding", 17}, {"chunked", 7}},
+        {{"Keep-Alive", 10}, {"timeout=5", 9}},
+        {{"Trailer", 7}, {"X-Checksum", 10}},
+        {{"TE", 2}, {"trailers", 8}},
+        {{"Upgrade", 7}, {"websocket", 9}},
+        {{"Proxy-Connection", 16}, {"keep-alive", 10}},
+        {{"X-Origin", 8}, {"fixture", 7}},
+    };
+    harness::HandlerExecution execution{};
+    execution.init(&captured_passthrough_handler, nullptr, nullptr, 0);
+    const harness::DeterministicCompletion completion = {jit::YieldKind::Forward,
+                                                         0,
+                                                         100,
+                                                         1,
+                                                         7,
+                                                         nullptr,
+                                                         0,
+                                                         false,
+                                                         false,
+                                                         200,
+                                                         headers,
+                                                         static_cast<u32>(std::size(headers))};
+    harness::DeterministicEnvironment environment{};
+    environment.reset(&completion, 1);
+    harness::DeterministicHandlerSpec driver{};
+    driver.execution = execution;
+    driver.environment = &environment;
+    harness::HarnessSpec spec{};
+    spec.layer = harness::ExecutionLayer::Handler;
+
+    const auto result = harness::drive_handler_deterministically(driver, spec);
+    REQUIRE_EQ(result.harness.outcome, harness::Outcome::Passed);
+    REQUIRE(result.uses_captured_response);
+    REQUIRE_EQ(result.captured_response_header_count, 1u);
+    CHECK(result.captured_response_headers[0].name.eq({"X-Origin", 8}));
+    CHECK(result.captured_response_headers[0].value.eq({"fixture", 7}));
+}
+
+TEST(harness_handler, captured_response_headers_count_toward_input_limit) {
+    harness::HandlerExecution execution{};
+    execution.init(&captured_passthrough_handler, nullptr, nullptr, 0);
+    const jit::CapturedResponseHeader header = {{"X-Origin", 8}, {"fixture", 7}};
+    const harness::DeterministicCompletion completion = {
+        jit::YieldKind::Forward, 0, 100, 1, 7, nullptr, 0, false, false, 206, &header, 1};
+    harness::DeterministicEnvironment environment{};
+    environment.reset(&completion, 1);
+    harness::DeterministicHandlerSpec driver{};
+    driver.execution = execution;
+    driver.environment = &environment;
+    harness::HarnessSpec spec{};
+    spec.layer = harness::ExecutionLayer::Handler;
+
+    auto result = harness::drive_handler_deterministically(driver, spec);
+    REQUIRE_EQ(result.harness.outcome, harness::Outcome::Passed);
+    CHECK_EQ(result.harness.input_bytes, 15u);
+
+    environment.reset(&completion, 1);
+    spec.limits.max_input_bytes = 14;
+    result = harness::drive_handler_deterministically(driver, spec);
+    CHECK_EQ(result.harness.outcome, harness::Outcome::Failed);
+    CHECK_EQ(result.harness.reached_limit, harness::LimitKind::InputBytes);
+}
+
+TEST(harness_handler, dropped_content_length_does_not_consume_capture_storage) {
+    static u8 body[15850]{};
+    const jit::CapturedResponseHeader content_length = {
+        {"Content-Length", 14},
+        {"15850", 5},
+    };
+    harness::HandlerExecution execution{};
+    execution.init(&captured_passthrough_handler, nullptr, nullptr, 0);
+    const harness::DeterministicCompletion completion = {
+        jit::YieldKind::Forward,
+        0,
+        100,
+        1,
+        7,
+        body,
+        sizeof(body),
+        false,
+        false,
+        200,
+        &content_length,
+        1,
+    };
+    harness::DeterministicEnvironment environment{};
+    environment.reset(&completion, 1);
+    harness::DeterministicHandlerSpec driver{};
+    driver.execution = execution;
+    driver.environment = &environment;
+    harness::HarnessSpec spec{};
+    spec.layer = harness::ExecutionLayer::Handler;
+
+    const auto result = harness::drive_handler_deterministically(driver, spec);
+    REQUIRE_EQ(result.harness.outcome, harness::Outcome::Passed);
+    REQUIRE(result.uses_captured_response);
+    CHECK_EQ(result.captured_response_body_len, sizeof(body));
+    CHECK_EQ(result.captured_response_header_count, 0u);
+    CHECK_EQ(result.harness.input_bytes, sizeof(body) + 19u);
 }
 
 TEST(harness_connection, reports_and_resets_cleanup_invariants) {
@@ -725,6 +1421,449 @@ TEST(harness_scenario, drives_real_source_with_scripted_upstream_completion) {
     CHECK_EQ(target.destroy(), harness::CleanupOutcome::Clean);
 }
 
+TEST(harness_scenario, empty_capture_and_headers_survive_connection_formatting) {
+    TempSource source;
+    REQUIRE(source.write(R"rut(
+upstream api at "127.0.0.1:9000"
+route GET "/x" {
+    let resp = forward(api, buffered: true)
+    return resp
+}
+)rut"));
+    harness::SourceTarget target{};
+    harness::HarnessSpec load_spec{};
+    REQUIRE_EQ(target.prepare({source.path, jit::OptLevel::O0}, load_spec).outcome,
+               harness::Outcome::Passed);
+
+    static constexpr char kName[] = "X-Origin";
+    static constexpr char kValue[] = "fixture";
+    const jit::CapturedResponseHeader headers[] = {
+        {{kName, sizeof(kName) - 1}, {kValue, sizeof(kValue) - 1}},
+    };
+    const auto run = [&](bool with_header) {
+        harness::ScriptedEnvironment environment{};
+        auto& completion = environment.base_completions[0];
+        completion.kind = jit::YieldKind::Forward;
+        completion.result = 204;
+        completion.at_us = 1;
+        completion.order = 1;
+        completion.target_id = 0;
+        completion.logical_fault_point = true;
+        completion.response_status = 204;
+        completion.response_headers = with_header ? headers : nullptr;
+        completion.response_header_count = with_header ? 1 : 0;
+        environment.completion_count = 1;
+        environment.next_order = 2;
+
+        static const char kRequest[] = "GET /x HTTP/1.1\r\nHost: test\r\n\r\n";
+        harness::ScenarioSpec scenario{};
+        scenario.target = &target;
+        scenario.path = {"/x", 2};
+        scenario.method = kRouteMethodGet;
+        scenario.request_data = reinterpret_cast<const u8*>(kRequest);
+        scenario.request_len = sizeof(kRequest) - 1;
+        scenario.environment = &environment;
+        scenario.expected = {true, jit::HandlerAction::ReturnStatus, 204};
+        return harness::drive_scenario(scenario, scripted_scenario_harness());
+    };
+
+    const auto without_header = run(false);
+    const auto with_header = run(true);
+    REQUIRE_EQ(without_header.harness.outcome, harness::Outcome::Passed);
+    REQUIRE_EQ(with_header.harness.outcome, harness::Outcome::Passed);
+    CHECK_EQ(with_header.terminal.status_code, 204u);
+    // Headerless captured responses still take the captured formatter path, so
+    // a 204 does not gain a synthetic Content-Length field.
+    CHECK_EQ(with_header.harness.output_bytes, without_header.harness.output_bytes + 19);
+    CHECK_EQ(target.destroy(), harness::CleanupOutcome::Clean);
+}
+
+TEST(harness_scenario, captured_205_preserves_explicit_zero_content_length) {
+    TempSource source;
+    REQUIRE(source.write(R"rut(
+upstream api at "127.0.0.1:9000"
+route GET "/x" {
+    let resp = forward(api, buffered: true)
+    return resp
+}
+)rut"));
+    harness::SourceTarget target{};
+    harness::HarnessSpec load_spec{};
+    REQUIRE_EQ(target.prepare({source.path, jit::OptLevel::O0}, load_spec).outcome,
+               harness::Outcome::Passed);
+
+    const jit::CapturedResponseHeader content_length = {
+        {"Content-Length", 14},
+        {"0", 1},
+    };
+    const auto run = [&](bool with_content_length) {
+        harness::ScriptedEnvironment environment{};
+        auto& completion = environment.base_completions[0];
+        completion.kind = jit::YieldKind::Forward;
+        completion.result = 205;
+        completion.at_us = 1;
+        completion.order = 1;
+        completion.logical_fault_point = true;
+        completion.response_status = 205;
+        completion.response_headers = with_content_length ? &content_length : nullptr;
+        completion.response_header_count = with_content_length ? 1 : 0;
+        environment.completion_count = 1;
+        environment.next_order = 2;
+
+        static constexpr char kRequest[] = "GET /x HTTP/1.1\r\nHost: test\r\n\r\n";
+        harness::ScenarioSpec scenario{};
+        scenario.target = &target;
+        scenario.path = {"/x", 2};
+        scenario.method = kRouteMethodGet;
+        scenario.request_data = reinterpret_cast<const u8*>(kRequest);
+        scenario.request_len = sizeof(kRequest) - 1;
+        scenario.environment = &environment;
+        scenario.expected = {true, jit::HandlerAction::ReturnStatus, 205};
+        return harness::drive_scenario(scenario, scripted_scenario_harness());
+    };
+
+    const auto without_content_length = run(false);
+    const auto with_content_length = run(true);
+    REQUIRE_EQ(without_content_length.harness.outcome, harness::Outcome::Passed);
+    REQUIRE_EQ(with_content_length.harness.outcome, harness::Outcome::Passed);
+    CHECK_EQ(with_content_length.terminal.status_code, 205u);
+    CHECK_EQ(with_content_length.harness.output_bytes,
+             without_content_length.harness.output_bytes + sizeof("Content-Length: 0\r\n") - 1);
+    CHECK_EQ(target.destroy(), harness::CleanupOutcome::Clean);
+}
+
+TEST(harness_scenario, captured_connect_status_mutation_to_success_returns_bad_gateway) {
+    harness::SourceTarget target{};
+    REQUIRE(target.program.config.add_jit_handler(
+        "/x", kRouteMethodConnect, &captured_connect_success_handler, false, true));
+    target.prepared = true;
+
+    harness::ScriptedEnvironment environment{};
+    auto& completion = environment.base_completions[0];
+    completion.kind = jit::YieldKind::Forward;
+    completion.result = 403;
+    completion.at_us = 1;
+    completion.order = 1;
+    completion.logical_fault_point = true;
+    completion.response_status = 403;
+    environment.completion_count = 1;
+    environment.next_order = 2;
+
+    static constexpr char kRequest[] = "CONNECT /x HTTP/1.1\r\nHost: test\r\n\r\n";
+    harness::ScenarioSpec scenario{};
+    scenario.target = &target;
+    scenario.path = {"/x", 2};
+    scenario.method = kRouteMethodConnect;
+    scenario.request_data = reinterpret_cast<const u8*>(kRequest);
+    scenario.request_len = sizeof(kRequest) - 1;
+    scenario.environment = &environment;
+    scenario.expected = {true, jit::HandlerAction::ReturnStatus, 502};
+
+    const auto result = harness::drive_scenario(scenario, scripted_scenario_harness());
+    REQUIRE_EQ(result.harness.outcome, harness::Outcome::Passed);
+    REQUIRE(result.has_terminal);
+    CHECK_EQ(result.terminal.status_code, 502u);
+    CHECK_EQ(target.destroy(), harness::CleanupOutcome::Clean);
+}
+
+TEST(harness_scenario, captured_partial_status_promotion_requires_body_replacement) {
+    harness::SourceTarget target{};
+    REQUIRE(target.program.config.add_jit_handler(
+        "/x", kRouteMethodGet, &captured_partial_status_promotion_handler, false, true));
+    target.prepared = true;
+
+    static constexpr u8 kBody[] = {'p', 'a', 'r', 't'};
+    const jit::CapturedResponseHeader range = {
+        {"Content-Range", 13},
+        {"bytes 0-3/10", 12},
+    };
+    harness::ScriptedEnvironment environment{};
+    auto& completion = environment.base_completions[0];
+    completion.kind = jit::YieldKind::Forward;
+    completion.result = 206;
+    completion.at_us = 1;
+    completion.order = 1;
+    completion.logical_fault_point = true;
+    completion.data = kBody;
+    completion.data_len = sizeof(kBody);
+    completion.response_status = 206;
+    completion.response_headers = &range;
+    completion.response_header_count = 1;
+    environment.completion_count = 1;
+    environment.next_order = 2;
+
+    static constexpr char kRequest[] = "GET /x HTTP/1.1\r\nHost: test\r\n\r\n";
+    harness::ScenarioSpec scenario{};
+    scenario.target = &target;
+    scenario.path = {"/x", 2};
+    scenario.method = kRouteMethodGet;
+    scenario.request_data = reinterpret_cast<const u8*>(kRequest);
+    scenario.request_len = sizeof(kRequest) - 1;
+    scenario.environment = &environment;
+    scenario.expected = {true, jit::HandlerAction::ReturnStatus, 500};
+
+    const auto result = harness::drive_scenario(scenario, scripted_scenario_harness());
+    REQUIRE_EQ(result.harness.outcome, harness::Outcome::Passed);
+    REQUIRE(result.has_terminal);
+    CHECK_EQ(result.terminal.status_code, 500u);
+    CHECK_EQ(target.destroy(), harness::CleanupOutcome::Clean);
+}
+
+TEST(harness_scenario, captured_head_206_validates_mutated_body_range_length) {
+    harness::SourceTarget target{};
+    REQUIRE(target.program.config.add_jit_handler(
+        "/x", kRouteMethodHead, &captured_head_invalid_range_handler, false, true));
+    target.prepared = true;
+
+    harness::ScriptedEnvironment environment{};
+    auto& completion = environment.base_completions[0];
+    completion.kind = jit::YieldKind::Forward;
+    completion.result = 200;
+    completion.at_us = 1;
+    completion.order = 1;
+    completion.logical_fault_point = true;
+    completion.response_status = 200;
+    environment.completion_count = 1;
+    environment.next_order = 2;
+
+    static constexpr char kRequest[] = "HEAD /x HTTP/1.1\r\nHost: test\r\n\r\n";
+    harness::ScenarioSpec scenario{};
+    scenario.target = &target;
+    scenario.path = {"/x", 2};
+    scenario.method = kRouteMethodHead;
+    scenario.request_data = reinterpret_cast<const u8*>(kRequest);
+    scenario.request_len = sizeof(kRequest) - 1;
+    scenario.environment = &environment;
+    scenario.expected = {true, jit::HandlerAction::ReturnStatus, 500};
+
+    const auto result = harness::drive_scenario(scenario, scripted_scenario_harness());
+    REQUIRE_EQ(result.harness.outcome, harness::Outcome::Passed);
+    REQUIRE(result.has_terminal);
+    CHECK_EQ(result.terminal.status_code, 500u);
+    CHECK_EQ(target.destroy(), harness::CleanupOutcome::Clean);
+}
+
+TEST(harness_scenario, captured_head_206_validates_retained_content_length) {
+    harness::SourceTarget target{};
+    REQUIRE(target.program.config.add_jit_handler(
+        "/x", kRouteMethodHead, &captured_passthrough_handler, false, true));
+    target.prepared = true;
+
+    const jit::CapturedResponseHeader headers[] = {
+        {{"Content-Length", 14}, {"4", 1}},
+        {{"Content-Range", 13}, {"bytes 0-9/100", 13}},
+    };
+    harness::ScriptedEnvironment environment{};
+    auto& completion = environment.base_completions[0];
+    completion.kind = jit::YieldKind::Forward;
+    completion.result = 206;
+    completion.at_us = 1;
+    completion.order = 1;
+    completion.logical_fault_point = true;
+    completion.response_status = 206;
+    completion.response_headers = headers;
+    completion.response_header_count = 2;
+    environment.completion_count = 1;
+    environment.next_order = 2;
+
+    static constexpr char kRequest[] = "HEAD /x HTTP/1.1\r\nHost: test\r\n\r\n";
+    harness::ScenarioSpec scenario{};
+    scenario.target = &target;
+    scenario.path = {"/x", 2};
+    scenario.method = kRouteMethodHead;
+    scenario.request_data = reinterpret_cast<const u8*>(kRequest);
+    scenario.request_len = sizeof(kRequest) - 1;
+    scenario.environment = &environment;
+    scenario.expected = {true, jit::HandlerAction::ReturnStatus, 500};
+
+    const auto result = harness::drive_scenario(scenario, scripted_scenario_harness());
+    REQUIRE_EQ(result.harness.outcome, harness::Outcome::Passed);
+    REQUIRE(result.has_terminal);
+    CHECK_EQ(result.terminal.status_code, 500u);
+    CHECK_EQ(target.destroy(), harness::CleanupOutcome::Clean);
+}
+
+TEST(harness_scenario, captured_body_preserves_absent_content_type) {
+    TempSource source;
+    REQUIRE(source.write(R"rut(
+upstream api at "127.0.0.1:9000"
+route GET "/x" {
+    let resp = forward(api, buffered: true)
+    return resp
+}
+)rut"));
+    harness::SourceTarget target{};
+    harness::HarnessSpec load_spec{};
+    REQUIRE_EQ(target.prepare({source.path, jit::OptLevel::O0}, load_spec).outcome,
+               harness::Outcome::Passed);
+
+    static constexpr u8 kBody[] = {'d', 'a', 't', 'a'};
+    const jit::CapturedResponseHeader content_type = {{"Content-Type", 12},
+                                                      {"text/plain; charset=utf-8", 25}};
+    const auto run = [&](bool with_content_type) {
+        harness::ScriptedEnvironment environment{};
+        auto& completion = environment.base_completions[0];
+        completion.kind = jit::YieldKind::Forward;
+        completion.result = 200;
+        completion.at_us = 1;
+        completion.order = 1;
+        completion.logical_fault_point = true;
+        completion.data = kBody;
+        completion.data_len = sizeof(kBody);
+        completion.response_status = 200;
+        completion.response_headers = with_content_type ? &content_type : nullptr;
+        completion.response_header_count = with_content_type ? 1 : 0;
+        environment.completion_count = 1;
+        environment.next_order = 2;
+
+        static constexpr char kRequest[] = "GET /x HTTP/1.1\r\nHost: test\r\n\r\n";
+        harness::ScenarioSpec scenario{};
+        scenario.target = &target;
+        scenario.path = {"/x", 2};
+        scenario.method = kRouteMethodGet;
+        scenario.request_data = reinterpret_cast<const u8*>(kRequest);
+        scenario.request_len = sizeof(kRequest) - 1;
+        scenario.environment = &environment;
+        scenario.expected = {true, jit::HandlerAction::ReturnStatus, 200};
+        return harness::drive_scenario(scenario, scripted_scenario_harness());
+    };
+
+    const auto without_content_type = run(false);
+    const auto with_content_type = run(true);
+    REQUIRE_EQ(without_content_type.harness.outcome, harness::Outcome::Passed);
+    REQUIRE_EQ(with_content_type.harness.outcome, harness::Outcome::Passed);
+    CHECK_EQ(with_content_type.harness.output_bytes,
+             without_content_type.harness.output_bytes + 41);
+    CHECK_EQ(target.destroy(), harness::CleanupOutcome::Clean);
+}
+
+TEST(harness_scenario, captured_head_preserves_representation_content_length) {
+    TempSource source;
+    REQUIRE(source.write(R"rut(
+upstream api at "127.0.0.1:9000"
+route HEAD "/x" {
+    let resp = forward(api, buffered: true)
+    return resp
+}
+)rut"));
+    harness::SourceTarget target{};
+    harness::HarnessSpec load_spec{};
+    REQUIRE_EQ(target.prepare({source.path, jit::OptLevel::O0}, load_spec).outcome,
+               harness::Outcome::Passed);
+
+    const auto run = [&](const jit::CapturedResponseHeader* headers, u32 header_count) {
+        harness::ScriptedEnvironment environment{};
+        auto& completion = environment.base_completions[0];
+        completion.kind = jit::YieldKind::Forward;
+        completion.result = 200;
+        completion.at_us = 1;
+        completion.order = 1;
+        completion.target_id = 0;
+        completion.logical_fault_point = true;
+        completion.response_status = 200;
+        completion.response_headers = headers;
+        completion.response_header_count = header_count;
+        environment.completion_count = 1;
+        environment.next_order = 2;
+
+        static const char kRequest[] = "HEAD /x HTTP/1.1\r\nHost: test\r\n\r\n";
+        harness::ScenarioSpec scenario{};
+        scenario.target = &target;
+        scenario.path = {"/x", 2};
+        scenario.method = kRouteMethodHead;
+        scenario.request_data = reinterpret_cast<const u8*>(kRequest);
+        scenario.request_len = sizeof(kRequest) - 1;
+        scenario.environment = &environment;
+        scenario.expected = {true, jit::HandlerAction::ReturnStatus, 200};
+        return harness::drive_scenario(scenario, scripted_scenario_harness());
+    };
+
+    const jit::CapturedResponseHeader short_headers[] = {
+        {{"Content-Length", 14}, {"0", 1}},
+    };
+    const jit::CapturedResponseHeader representation_headers[] = {
+        {{"Content-Length", 14}, {"123", 3}},
+    };
+    const jit::CapturedResponseHeader matching_duplicate_headers[] = {
+        {{"Content-Length", 14}, {"123", 3}},
+        {{"content-length", 14}, {"123", 3}},
+    };
+    const jit::CapturedResponseHeader invalid_headers[] = {
+        {{"Content-Length", 14}, {"nope", 4}},
+    };
+    const jit::CapturedResponseHeader conflicting_headers[] = {
+        {{"Content-Length", 14}, {"1", 1}},
+        {{"content-length", 14}, {"2", 1}},
+    };
+    const auto short_length = run(short_headers, 1);
+    const auto representation_length = run(representation_headers, 1);
+    const auto matching_duplicates = run(matching_duplicate_headers, 2);
+    const auto invalid = run(invalid_headers, 1);
+    const auto conflicting = run(conflicting_headers, 2);
+    REQUIRE_EQ(short_length.harness.outcome, harness::Outcome::Passed);
+    REQUIRE_EQ(representation_length.harness.outcome, harness::Outcome::Passed);
+    REQUIRE_EQ(matching_duplicates.harness.outcome, harness::Outcome::Passed);
+    CHECK_EQ(invalid.harness.outcome, harness::Outcome::Invalid);
+    CHECK_EQ(conflicting.harness.outcome, harness::Outcome::Invalid);
+    CHECK_EQ(representation_length.harness.output_bytes, short_length.harness.output_bytes + 2);
+    CHECK_EQ(target.destroy(), harness::CleanupOutcome::Clean);
+}
+
+TEST(harness_scenario, large_capture_reaches_truncated_body_observation) {
+    TempSource source;
+    REQUIRE(source.write(R"rut(
+upstream api at "127.0.0.1:9000"
+route GET "/x" {
+    let resp = forward(api, buffered: true)
+    return resp
+}
+)rut"));
+    harness::SourceTarget target{};
+    harness::HarnessSpec load_spec{};
+    REQUIRE_EQ(target.prepare({source.path, jit::OptLevel::O0}, load_spec).outcome,
+               harness::Outcome::Passed);
+
+    static u8 body[12000];
+    for (u32 i = 0; i < sizeof(body); i++) body[i] = static_cast<u8>('a' + i % 26);
+    harness::ScriptedEnvironment environment{};
+    auto& completion = environment.base_completions[0];
+    completion.kind = jit::YieldKind::Forward;
+    completion.result = 200;
+    completion.at_us = 1;
+    completion.order = 1;
+    completion.target_id = 0;
+    completion.logical_fault_point = true;
+    completion.data = body;
+    completion.data_len = sizeof(body);
+    completion.response_status = 200;
+    environment.completion_count = 1;
+    environment.next_order = 2;
+
+    static const char kRequest[] = "GET /x HTTP/1.1\r\nHost: test\r\n\r\n";
+    harness::ScenarioSpec scenario{};
+    scenario.target = &target;
+    scenario.path = {"/x", 2};
+    scenario.method = kRouteMethodGet;
+    scenario.request_data = reinterpret_cast<const u8*>(kRequest);
+    scenario.request_len = sizeof(kRequest) - 1;
+    scenario.environment = &environment;
+    scenario.expected = {true, jit::HandlerAction::ReturnStatus, 200};
+
+    ResponseBodyObservation observed{};
+    auto spec = scripted_scenario_harness();
+    spec.observations = {&observed, &capture_response_body_observation};
+    const auto result = harness::drive_scenario(scenario, spec);
+    REQUIRE_EQ(result.harness.outcome, harness::Outcome::Passed);
+    CHECK_EQ(result.terminal.status_code, 200u);
+    REQUIRE(observed.seen);
+    CHECK(observed.truncated);
+    CHECK_EQ(observed.full_len, sizeof(body));
+    CHECK_EQ(observed.copied_len, sizeof(observed.bytes));
+    CHECK(std::memcmp(observed.bytes, body, sizeof(observed.bytes)) == 0);
+    CHECK_GT(result.harness.output_bytes, sizeof(body));
+    CHECK_EQ(target.destroy(), harness::CleanupOutcome::Clean);
+}
+
 TEST(harness_scenario, dynamic_json_body_is_accounted_as_runtime_output) {
     TempSource source;
     REQUIRE(source.write("route GET \"/x\" { return 200, json({ path: req.path }) }\n"));
@@ -746,12 +1885,196 @@ TEST(harness_scenario, dynamic_json_body_is_accounted_as_runtime_output) {
     spec.required_capabilities =
         harness::Capability::SyntheticIo | harness::Capability::VirtualTime;
     spec.environment_capabilities = spec.required_capabilities;
+    ResponseBodyObservation observed{};
+    spec.observations = {&observed, &capture_response_body_observation};
     const auto result = harness::drive_scenario(scenario, spec);
     REQUIRE_EQ(result.harness.outcome, harness::Outcome::Passed);
     CHECK_EQ(result.terminal.status_code, 200);
-    // Includes the 13-byte {"path":"/x"} body, not the two-byte "OK"
-    // fallback that an unrecognized body marker would have produced.
+    REQUIRE(observed.seen);
+    CHECK(!observed.truncated);
+    CHECK_EQ(observed.full_len, 13u);
+    CHECK_EQ(observed.copied_len, 13u);
+    CHECK(__builtin_memcmp(observed.bytes, "{\"path\":\"/x\"}", 13) == 0);
     CHECK_EQ(result.harness.output_bytes, 117u);
+    CHECK_EQ(target.destroy(), harness::CleanupOutcome::Clean);
+}
+
+TEST(harness_scenario, control_plane_snapshot_fixture_replays_exact_json) {
+    TempSource source;
+    REQUIRE(source.write("route GET \"/stats\" { wait(1) return 200, json(stats()) }\n"));
+    harness::SourceTarget target{};
+    harness::HarnessSpec load_spec{};
+    REQUIRE_EQ(target.prepare({source.path, jit::OptLevel::O0}, load_spec).outcome,
+               harness::Outcome::Passed);
+
+    jit::ControlPlaneSnapshot fixture{};
+    fixture.valid = true;
+    fixture.shard_id = 2;
+    fixture.shard_count = 4;
+    fixture.stats.requests_total = 9;
+    fixture.stats.requests_active = 1;
+    fixture.stats.connections_total = 8;
+    fixture.stats.connections_active = 2;
+    fixture.stats.connections_closed = 6;
+    fixture.stats.request_latency_buckets[0] = 3;
+    fixture.stats.request_latency_sum_us = 30;
+    fixture.stats.request_latency_count = 3;
+    fixture.stats.memory_arena_used = 10;
+    fixture.stats.memory_slices_used = 11;
+    fixture.stats.memory_slices_free = 12;
+    fixture.stats.memory_connections_used = 13;
+    static constexpr char kExpectedBytes[] =
+        "{\"scope\":\"shard\",\"shard_id\":2,\"shard_count\":4,\"requests\":{"
+        "\"total\":9,\"active\":1,\"latency_us\":{\"buckets\":[3,0,0,0,0,0,0,0,0,0,"
+        "0],\"sum\":30,\"count\":3}},\"connections\":{\"total\":8,\"active\":2,"
+        "\"closed\":6},\"memory\":{\"arena_used\":10,\"slices_used\":11,"
+        "\"slices_free\":12,\"connections_used\":13}}";
+    const Str kExpected{kExpectedBytes, sizeof(kExpectedBytes) - 1};
+
+    const char request[] = "GET /stats HTTP/1.1\r\nHost: test\r\n\r\n";
+    harness::ScenarioSpec scenario{};
+    scenario.target = &target;
+    scenario.path = {"/stats", 6};
+    scenario.method = kRouteMethodGet;
+    scenario.request_data = reinterpret_cast<const u8*>(request);
+    scenario.request_len = sizeof(request) - 1;
+    scenario.control_plane_snapshot = &fixture;
+    scenario.expected = {true, jit::HandlerAction::ReturnStatus, 200};
+
+    auto spec = scripted_scenario_harness();
+    spec.required_capabilities =
+        harness::Capability::SyntheticIo | harness::Capability::VirtualTime;
+    spec.required_capabilities.add(harness::Capability::ControlPlaneSnapshot);
+    spec.environment_capabilities = spec.required_capabilities;
+    ResponseBodyObservation first_body{};
+    spec.observations = {&first_body, &capture_response_body_observation};
+    const auto first = harness::drive_scenario(scenario, spec);
+    REQUIRE_EQ(first.harness.outcome, harness::Outcome::Passed);
+    CHECK_EQ(first.harness.handler_resumes, 1u);
+    REQUIRE(first_body.seen);
+    CHECK(!first_body.truncated);
+    CHECK_EQ(first_body.full_len, kExpected.len);
+    CHECK_EQ(first_body.copied_len, kExpected.len);
+    CHECK(__builtin_memcmp(first_body.bytes, kExpected.ptr, kExpected.len) == 0);
+    CHECK(first.harness.output_bytes > kExpected.len);
+
+    ResponseBodyObservation replay_body{};
+    spec.observations = {&replay_body, &capture_response_body_observation};
+    const auto replay = harness::drive_scenario(scenario, spec);
+    REQUIRE_EQ(replay.harness.outcome, harness::Outcome::Passed);
+    CHECK_EQ(replay.harness.output_bytes, first.harness.output_bytes);
+    CHECK_EQ(replay_body.copied_len, first_body.copied_len);
+    CHECK(__builtin_memcmp(replay_body.bytes, first_body.bytes, first_body.copied_len) == 0);
+
+    scenario.control_plane_snapshot = nullptr;
+    const auto missing = harness::drive_scenario(scenario, spec);
+    CHECK_EQ(missing.harness.outcome, harness::Outcome::Invalid);
+    CHECK(std::strcmp(missing.harness.detail, "control-plane snapshot fixture is missing") == 0);
+
+    jit::ControlPlaneSnapshot invalid_fixture{};
+    scenario.control_plane_snapshot = &invalid_fixture;
+    const auto invalid = harness::drive_scenario(scenario, spec);
+    CHECK_EQ(invalid.harness.outcome, harness::Outcome::Invalid);
+    CHECK(std::strcmp(invalid.harness.detail, "control-plane snapshot fixture is invalid") == 0);
+
+    invalid_fixture.valid = true;
+    invalid_fixture.shard_count = 0;
+    const auto empty_topology = harness::drive_scenario(scenario, spec);
+    CHECK_EQ(empty_topology.harness.outcome, harness::Outcome::Invalid);
+    CHECK(std::strcmp(empty_topology.harness.detail, "control-plane snapshot fixture is invalid") ==
+          0);
+
+    invalid_fixture.shard_count = 2;
+    invalid_fixture.shard_id = 2;
+    const auto out_of_range_shard = harness::drive_scenario(scenario, spec);
+    CHECK_EQ(out_of_range_shard.harness.outcome, harness::Outcome::Invalid);
+    CHECK(std::strcmp(out_of_range_shard.harness.detail,
+                      "control-plane snapshot fixture is invalid") == 0);
+
+    scenario.control_plane_snapshot = nullptr;
+    spec.required_capabilities =
+        harness::Capability::SyntheticIo | harness::Capability::VirtualTime;
+    spec.environment_capabilities = spec.required_capabilities;
+    const auto undeclared = harness::drive_scenario(scenario, spec);
+    CHECK_EQ(undeclared.harness.outcome, harness::Outcome::Invalid);
+    CHECK(std::strcmp(undeclared.harness.detail,
+                      "selected route requires a control-plane snapshot fixture") == 0);
+    CHECK_EQ(target.destroy(), harness::CleanupOutcome::Clean);
+}
+
+TEST(harness_scenario, dynamic_json_overflow_has_deterministic_500_observation) {
+    std::string source = "route GET \"/x\" { return 200, json({ path: req.path, value: \"";
+    source.append(jit::kMaxDynamicResponseBodyBytes - 22, 'x');
+    source += "\" }) }\n";
+    TempSource file;
+    REQUIRE(file.write(source.c_str()));
+    harness::SourceTarget target{};
+    harness::HarnessSpec load_spec{};
+    REQUIRE_EQ(target.prepare({file.path, jit::OptLevel::O0}, load_spec).outcome,
+               harness::Outcome::Passed);
+
+    const char request[] = "GET /x HTTP/1.1\r\nHost: test\r\n\r\n";
+    harness::ScenarioSpec scenario{};
+    scenario.target = &target;
+    scenario.path = {"/x", 2};
+    scenario.method = kRouteMethodGet;
+    scenario.request_data = reinterpret_cast<const u8*>(request);
+    scenario.request_len = sizeof(request) - 1;
+    scenario.expected = {true, jit::HandlerAction::ReturnStatus, 500};
+
+    ResponseBodyObservation observed{};
+    auto spec = scripted_scenario_harness();
+    spec.required_capabilities =
+        harness::Capability::SyntheticIo | harness::Capability::VirtualTime;
+    spec.environment_capabilities = spec.required_capabilities;
+    spec.observations = {&observed, &capture_response_body_observation};
+    const auto result = harness::drive_scenario(scenario, spec);
+    REQUIRE_EQ(result.harness.outcome, harness::Outcome::Passed);
+    CHECK_EQ(result.terminal.status_code, 500);
+    REQUIRE(observed.seen);
+    CHECK(!observed.truncated);
+    CHECK_EQ(observed.full_len, 21u);
+    CHECK_EQ(observed.copied_len, 21u);
+    CHECK(__builtin_memcmp(observed.bytes, "Internal Server Error", 21) == 0);
+    CHECK_EQ(target.destroy(), harness::CleanupOutcome::Clean);
+}
+
+TEST(harness_scenario, dynamic_json_failure_preserves_committed_body_mutation) {
+    std::string source =
+        "func rewrite(_ resp: Response) -> i32 { resp.body = \"fallback\" 0 }\n"
+        "chain rewrite_chain { after rewrite(resp) }\n"
+        "route GET \"/x\" use chain rewrite_chain { return 200, json({ path: req.path, value: \"";
+    source.append(jit::kMaxDynamicResponseBodyBytes - 22, 'x');
+    source += "\" }) }\n";
+    TempSource file;
+    REQUIRE(file.write(source.c_str()));
+    harness::SourceTarget target{};
+    harness::HarnessSpec load_spec{};
+    REQUIRE_EQ(target.prepare({file.path, jit::OptLevel::O0}, load_spec).outcome,
+               harness::Outcome::Passed);
+
+    const char request[] = "GET /x HTTP/1.1\r\nHost: test\r\n\r\n";
+    harness::ScenarioSpec scenario{};
+    scenario.target = &target;
+    scenario.path = {"/x", 2};
+    scenario.method = kRouteMethodGet;
+    scenario.request_data = reinterpret_cast<const u8*>(request);
+    scenario.request_len = sizeof(request) - 1;
+    scenario.expected = {true, jit::HandlerAction::ReturnStatus, 500};
+
+    ResponseBodyObservation observed{};
+    auto spec = scripted_scenario_harness();
+    spec.required_capabilities =
+        harness::Capability::SyntheticIo | harness::Capability::VirtualTime;
+    spec.environment_capabilities = spec.required_capabilities;
+    spec.observations = {&observed, &capture_response_body_observation};
+    const auto result = harness::drive_scenario(scenario, spec);
+    REQUIRE_EQ(result.harness.outcome, harness::Outcome::Passed);
+    CHECK_EQ(result.terminal.status_code, 500);
+    REQUIRE(observed.seen);
+    CHECK_EQ(observed.full_len, 8u);
+    CHECK_EQ(observed.copied_len, 8u);
+    CHECK(__builtin_memcmp(observed.bytes, "fallback", 8) == 0);
     CHECK_EQ(target.destroy(), harness::CleanupOutcome::Clean);
 }
 
@@ -772,16 +2095,22 @@ TEST(harness_scenario, reusable_json_body_mutation_survives_resume) {
     scenario.method = kRouteMethodGet;
     scenario.request_data = reinterpret_cast<const u8*>(request);
     scenario.request_len = sizeof(request) - 1;
+    scenario.now_us = 700;
     scenario.expected = {true, jit::HandlerAction::ReturnStatus, 200};
 
     auto spec = scripted_scenario_harness();
     spec.required_capabilities =
         harness::Capability::SyntheticIo | harness::Capability::VirtualTime;
     spec.environment_capabilities = spec.required_capabilities;
+    ResponseBodyObservation observed{};
+    spec.observations = {&observed, &capture_response_body_observation};
     const auto result = harness::drive_scenario(scenario, spec);
     REQUIRE_EQ(result.harness.outcome, harness::Outcome::Passed);
     CHECK_EQ(result.terminal.status_code, 200);
     CHECK_EQ(result.harness.handler_resumes, 1u);
+    REQUIRE(observed.seen);
+    CHECK_EQ(observed.timestamp_us, result.harness.virtual_time_us);
+    CHECK_GT(observed.timestamp_us, scenario.now_us);
     CHECK_EQ(result.harness.output_bytes, 117u);
     CHECK_EQ(target.destroy(), harness::CleanupOutcome::Clean);
 }

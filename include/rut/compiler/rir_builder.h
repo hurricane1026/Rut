@@ -22,9 +22,10 @@ inline u8 default_yield_arm_mask(u8 kind, u32 payload) {
             return 1u << 4;
         case jit::YieldKind::UpstreamSend:
             return 1u << 5;
+        case jit::YieldKind::Forward:
+            return 1u << 6;
         case jit::YieldKind::HttpGet:
         case jit::YieldKind::HttpPost:
-        case jit::YieldKind::Forward:
             return 0;
     }
     return 0;
@@ -766,6 +767,13 @@ struct Builder {
         auto r = TRY(emit(op, nullptr, loc));
         r.inst->operands[0] = value;
         r.inst->operand_count = 1;
+        return {};
+    }
+
+    VoidResult emit_json_append_control_plane(u8 kind, SourceLoc loc = {}) {
+        if (kind > 1) return err(RirError::InvalidState);
+        auto r = TRY(emit(Opcode::JsonAppendControlPlane, nullptr, loc));
+        r.inst->imm.i32_val = kind;
         return {};
     }
 
