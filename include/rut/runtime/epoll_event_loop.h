@@ -277,6 +277,7 @@ public:
         upstream_timeout = kDefaultUpstreamTimeout;
         capture_ring = nullptr;
         capture_region_ = nullptr;
+        control_plane_mutation = nullptr;
         config_ptr = nullptr;
         control = nullptr;
         epoch = nullptr;

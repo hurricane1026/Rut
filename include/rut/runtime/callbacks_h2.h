@@ -1300,6 +1300,7 @@ void h2_dispatch_request(H2Dispatch<Loop>& d,
                 }
                 auto* ctx = d.conn->reset_jit_ctx();
                 if (route->needs_control_plane_snapshot) latch_control_plane_snapshot(d.loop, ctx);
+                latch_control_plane_mutation(d.loop, ctx);
                 ctx->state = 0;
                 ctx->resume_event_kind = static_cast<u32>(jit::YieldKind::Timer);
                 ctx->resume_event_result = 0;

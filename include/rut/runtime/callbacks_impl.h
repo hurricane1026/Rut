@@ -49,18 +49,33 @@ struct BackendHealth {
     bool active_down;    // active-probe failure: down until a probe SUCCEEDS (no timed expiry)
 };
 
-// thread_local health table. Returns a mutable ref, or nullptr if indices are
-// out of range (caller then treats the backend as always-healthy).
-inline BackendHealth* backend_health(u16 upstream_id, u32 backend_idx) {
-    static thread_local BackendHealth health[RouteConfig::kMaxUpstreams]
-                                            [UpstreamTarget::kMaxBackends] = {};
+struct GenerationBackendHealth {
+    u64 generation = 0;
+    BackendHealth health{};
+};
+
+// Adjacent generations occupy different parity banks; generation zero is a
+// separate compatibility bank for standalone callers and tests.
+inline BackendHealth* backend_health(u64 generation, u16 upstream_id, u32 backend_idx) {
+    static thread_local GenerationBackendHealth health[3][RouteConfig::kMaxUpstreams]
+                                                      [UpstreamTarget::kMaxBackends] = {};
     if (upstream_id >= RouteConfig::kMaxUpstreams || backend_idx >= UpstreamTarget::kMaxBackends)
         return nullptr;
-    return &health[upstream_id][backend_idx];
+    const u32 bank = generation == 0 ? 2u : static_cast<u32>(generation & 1u);
+    auto& cell = health[bank][upstream_id][backend_idx];
+    if (cell.generation != generation) {
+        cell.generation = generation;
+        cell.health = {};
+    }
+    return &cell.health;
 }
 
-inline bool backend_ejected(u16 upstream_id, u32 backend_idx, u64 now_us) {
-    const BackendHealth* h = backend_health(upstream_id, backend_idx);
+inline BackendHealth* backend_health(u16 upstream_id, u32 backend_idx) {
+    return backend_health(0, upstream_id, backend_idx);
+}
+
+inline bool backend_ejected(u64 generation, u16 upstream_id, u32 backend_idx, u64 now_us) {
+    const BackendHealth* h = backend_health(generation, upstream_id, backend_idx);
     if (h == nullptr) return false;
     // `active_down` (an active-probe failure) has no timed expiry — only a
     // successful probe clears it, so it suppresses the backend independent of the
@@ -69,11 +84,16 @@ inline bool backend_ejected(u16 upstream_id, u32 backend_idx, u64 now_us) {
     return h->active_down || now_us < h->eject_until_us;
 }
 
+inline bool backend_ejected(u16 upstream_id, u32 backend_idx, u64 now_us) {
+    return backend_ejected(0, upstream_id, backend_idx, now_us);
+}
+
 // Record the outcome of a connect attempt to (upstream_id, backend_idx).
 // On success: clear the record. On failure: bump the consecutive-failure count
 // and eject the backend once it crosses the threshold.
-inline void record_backend_result(u16 upstream_id, u32 backend_idx, bool success, u64 now_us) {
-    BackendHealth* h = backend_health(upstream_id, backend_idx);
+inline void record_backend_result(
+    u64 generation, u16 upstream_id, u32 backend_idx, bool success, u64 now_us) {
+    BackendHealth* h = backend_health(generation, upstream_id, backend_idx);
     if (h == nullptr) return;
     if (success) {
         h->fails = 0;
@@ -82,6 +102,10 @@ inline void record_backend_result(u16 upstream_id, u32 backend_idx, bool success
     }
     if (h->fails < 0xffff) h->fails++;
     if (h->fails >= kBackendFailThreshold) h->eject_until_us = now_us + kBackendEjectCooldownUs;
+}
+
+inline void record_backend_result(u16 upstream_id, u32 backend_idx, bool success, u64 now_us) {
+    record_backend_result(0, upstream_id, backend_idx, success, now_us);
 }
 
 // Record the outcome of an ACTIVE health probe to (upstream_id, backend_idx).
@@ -93,9 +117,10 @@ inline void record_backend_result(u16 upstream_id, u32 backend_idx, bool success
 // backend is fully healthy again: clear active_down AND the passive fail/eject
 // record. (`fails` is still bumped on failure for observability; active_down is
 // what select_backend honors.)
-inline void record_active_probe_result(u16 upstream_id, u32 backend_idx, bool healthy, u64 now_us) {
+inline void record_active_probe_result(
+    u64 generation, u16 upstream_id, u32 backend_idx, bool healthy, u64 now_us) {
     (void)now_us;  // active suppression is success-gated, not time-gated
-    BackendHealth* h = backend_health(upstream_id, backend_idx);
+    BackendHealth* h = backend_health(generation, upstream_id, backend_idx);
     if (h == nullptr) return;
     if (healthy) {
         h->active_down = false;
@@ -105,6 +130,10 @@ inline void record_active_probe_result(u16 upstream_id, u32 backend_idx, bool he
     }
     h->active_down = true;
     if (h->fails < 0xffff) h->fails++;
+}
+
+inline void record_active_probe_result(u16 upstream_id, u32 backend_idx, bool healthy, u64 now_us) {
+    record_active_probe_result(0, upstream_id, backend_idx, healthy, now_us);
 }
 
 // In-flight guard for active probes: at most one outstanding probe per
@@ -172,27 +201,49 @@ template <typename Loop>
 inline u32 select_backend_with_control_plane(Loop* loop,
                                              u16 upstream_id,
                                              u32 backend_count,
-                                             u64 now_us) {
-    static thread_local u16 rr_cursor[RouteConfig::kMaxUpstreams] = {};
-    if (backend_count <= 1 || upstream_id >= RouteConfig::kMaxUpstreams) return 0;
+                                             u64 now_us,
+                                             const RouteConfig* pinned_config = nullptr) {
+    struct CursorCell {
+        u64 generation = 0;
+        u16 cursor = 0;
+    };
+    static thread_local CursorCell rr_cursor[2][RouteConfig::kMaxUpstreams] = {};
+    constexpr u32 kUnavailable = ~u32{0};
+    if (backend_count == 0 || upstream_id >= RouteConfig::kMaxUpstreams) return kUnavailable;
     ControlPlaneMutationPort* mutation = nullptr;
     if constexpr (requires { loop->control_plane_mutation; })
         if (loop != nullptr) mutation = loop->control_plane_mutation;
-    const u64 generation = mutation == nullptr ? 0 : mutation->active_generation();
+    const u64 generation =
+        mutation == nullptr
+            ? 0
+            : (pinned_config == nullptr ? mutation->active_generation()
+                                        : mutation->generation_for_config(pinned_config));
+    auto& cell = rr_cursor[generation & 1u][upstream_id];
+    if (cell.generation != generation) {
+        cell.generation = generation;
+        cell.cursor = 0;
+    }
+    ManualHealthOverride manual[UpstreamTarget::kMaxBackends]{};
+    if (mutation != nullptr &&
+        !mutation->manual_health_snapshot(generation, upstream_id, backend_count, manual))
+        return kUnavailable;
     for (u32 step = 0; step < backend_count; step++) {
-        const u32 idx = (rr_cursor[upstream_id] + step) % backend_count;
-        const auto manual = mutation == nullptr
-                                ? ManualHealthOverride::None
-                                : mutation->manual_health({generation, upstream_id, (u16)idx});
-        if (manual == ManualHealthOverride::Unhealthy) continue;
-        if (manual == ManualHealthOverride::Healthy || !backend_ejected(upstream_id, idx, now_us)) {
-            rr_cursor[upstream_id] = static_cast<u16>((idx + 1) % backend_count);
+        const u32 idx = (cell.cursor + step) % backend_count;
+        if (manual[idx] == ManualHealthOverride::Unhealthy) continue;
+        if (!backend_ejected(generation, upstream_id, idx, now_us)) {
+            cell.cursor = static_cast<u16>((idx + 1) % backend_count);
             return idx;
         }
     }
-    const u32 idx = rr_cursor[upstream_id] % backend_count;
-    rr_cursor[upstream_id] = static_cast<u16>((rr_cursor[upstream_id] + 1) % backend_count);
-    return idx;
+    // Preserve the historical all-passively-ejected fallback, but never let it
+    // override an explicit manual exclusion.
+    for (u32 step = 0; step < backend_count; step++) {
+        const u32 idx = (cell.cursor + step) % backend_count;
+        if (manual[idx] == ManualHealthOverride::Unhealthy) continue;
+        cell.cursor = static_cast<u16>((idx + 1) % backend_count);
+        return idx;
+    }
+    return kUnavailable;
 }
 
 // --- Active health-check probes (Phase 5 slice 2) — EPOLL ONLY ---
@@ -274,10 +325,24 @@ void free_probe_conn(Loop* loop, Connection& conn) {
 // against that index would wrongly suppress or clear the new backend. After a
 // swap the result is meaningless, so drop it.
 template <typename Loop>
+inline u64 pinned_control_plane_generation(Loop* loop, const RouteConfig* config) {
+    if (loop == nullptr || config == nullptr) return 0;
+    if constexpr (requires { loop->control_plane_mutation; }) {
+        if (loop->control_plane_mutation != nullptr)
+            return loop->control_plane_mutation->generation_for_config(config);
+    }
+    return 0;
+}
+
+template <typename Loop>
 inline void record_probe_if_current(Loop* loop, Connection& conn, bool healthy, u64 now_us) {
-    const RouteConfig* cur = loop->config_ptr ? *loop->config_ptr : nullptr;
-    if (cur == conn.request_config)
-        record_active_probe_result(conn.upstream_idx, conn.upstream_backend_idx, healthy, now_us);
+    const u64 generation = pinned_control_plane_generation(loop, conn.request_config);
+    bool has_mutation_port = false;
+    if constexpr (requires { loop->control_plane_mutation; })
+        has_mutation_port = loop->control_plane_mutation != nullptr;
+    if (generation != 0 || !has_mutation_port)
+        record_active_probe_result(
+            generation, conn.upstream_idx, conn.upstream_backend_idx, healthy, now_us);
 }
 
 template <typename Loop>
@@ -465,7 +530,11 @@ void on_probe_response(void* lp, Connection& conn, IoEvent ev) {
         conn.upstream_idx < config->upstream_count) {
         healthy = (resp.status_code == config->upstreams[conn.upstream_idx].hc_expected_status);
     }
-    record_active_probe_result(conn.upstream_idx, conn.upstream_backend_idx, healthy, kNowUs);
+    record_active_probe_result(pinned_control_plane_generation(loop, conn.request_config),
+                               conn.upstream_idx,
+                               conn.upstream_backend_idx,
+                               healthy,
+                               kNowUs);
     free_probe_conn(loop, conn);
 }
 
@@ -1249,7 +1318,16 @@ void on_header_received(void* lp, Connection& conn, IoEvent ev) {
         conn.upstream_attempts = 1;  // initial attempt; on_upstream_connected retries
         conn.upstream_start_us = monotonic_us();
         const u32 kBackend = select_backend_with_control_plane(
-            loop, route->upstream_id, target.addr_count, conn.upstream_start_us);
+            loop, route->upstream_id, target.addr_count, conn.upstream_start_us, config);
+        if (kBackend >= target.addr_count) {
+            release_upstream_slot(loop, conn);
+            conn.resp_status = 503;
+            format_static_response(conn, 503, /*keep_alive=*/false);
+            conn.keep_alive = false;
+            conn.transition_to_sending(&on_response_sent<Loop>);
+            client_send(loop, conn, conn.send_buf.data(), conn.send_buf.len());
+            return;
+        }
         conn.upstream_backend_idx = static_cast<u8>(kBackend);
 
         // Idle reuse: borrow a live keep-alive socket to this endpoint from the
@@ -1921,8 +1999,19 @@ void handle_jit_outcome(Loop* loop,
                 conn.upstream_fd = kUpstreamFd;
                 conn.upstream_idx = static_cast<u16>(upstream_id);
                 conn.upstream_start_us = monotonic_us();
-                const u32 kBackend = select_backend_with_control_plane(
-                    loop, static_cast<u16>(upstream_id), target.addr_count, conn.upstream_start_us);
+                const u32 kBackend =
+                    select_backend_with_control_plane(loop,
+                                                      static_cast<u16>(upstream_id),
+                                                      target.addr_count,
+                                                      conn.upstream_start_us,
+                                                      config);
+                if (kBackend >= target.addr_count) {
+                    ::close(conn.upstream_fd);
+                    conn.upstream_fd = -1;
+                    loop->clear_upstream_fd(conn.id);
+                    send_bad_gateway();
+                    return;
+                }
                 conn.upstream_backend_idx = static_cast<u8>(kBackend);
                 if (!loop->submit_connect(
                         conn, &target.addrs[kBackend], sizeof(target.addrs[kBackend]))) {
@@ -2162,7 +2251,21 @@ void handle_jit_outcome(Loop* loop,
                 select_backend_with_control_plane(loop,
                                                   static_cast<u16>(outcome.upstream_id),
                                                   target.addr_count,
-                                                  conn.upstream_start_us);
+                                                  conn.upstream_start_us,
+                                                  config);
+            if (kBackend >= target.addr_count) {
+                release_upstream_slot(loop, conn);
+                abandon_capture();
+                conn.resp_status = 503;
+                format_static_response(conn,
+                                       503,
+                                       /*keep_alive=*/false,
+                                       conn.req_method == static_cast<u8>(LogHttpMethod::Head));
+                conn.keep_alive = false;
+                conn.transition_to_sending(&on_response_sent<Loop>);
+                client_send(loop, conn, conn.send_buf.data(), conn.send_buf.len());
+                return;
+            }
             conn.upstream_backend_idx = static_cast<u8>(kBackend);
 
             // Idle reuse (mirrors the direct RouteAction::Proxy path): borrow a live
@@ -2307,7 +2410,13 @@ bool try_connect_next_backend(Loop* loop, Connection& conn) {
     conn.upstream_start_us = monotonic_us();
     conn.set_slots(nullptr, nullptr, nullptr, &on_upstream_connected<Loop>);
     const u32 kBackend = select_backend_with_control_plane(
-        loop, conn.upstream_idx, target.addr_count, conn.upstream_start_us);
+        loop, conn.upstream_idx, target.addr_count, conn.upstream_start_us, config);
+    if (kBackend >= target.addr_count) {
+        ::close(conn.upstream_fd);
+        conn.upstream_fd = -1;
+        loop->clear_upstream_fd(conn.id);
+        return false;
+    }
     conn.upstream_backend_idx = static_cast<u8>(kBackend);
     if (loop->submit_connect(conn, &target.addrs[kBackend], sizeof(target.addrs[kBackend])))
         return true;
@@ -2611,8 +2720,11 @@ void on_upstream_connected(void* lp, Connection& conn, IoEvent ev) {
         // backend (passive health → ejection past the threshold), then try the
         // next backend within the retry budget; only answer 502 once all
         // candidates are exhausted.
-        record_backend_result(
-            conn.upstream_idx, conn.upstream_backend_idx, /*success=*/false, monotonic_us());
+        record_backend_result(pinned_control_plane_generation(loop, conn.request_config),
+                              conn.upstream_idx,
+                              conn.upstream_backend_idx,
+                              /*success=*/false,
+                              monotonic_us());
         if (try_connect_next_backend(loop, conn)) return;
         format_static_response(
             conn, 502, false, conn.req_method == static_cast<u8>(LogHttpMethod::Head));
@@ -2626,8 +2738,11 @@ void on_upstream_connected(void* lp, Connection& conn, IoEvent ev) {
     // A fresh TCP connect succeeded — clear this backend's passive-health record.
     // Reused pooled sockets only prove health once they return a response.
     if (!conn.upstream_reused) {
-        record_backend_result(
-            conn.upstream_idx, conn.upstream_backend_idx, /*success=*/true, monotonic_us());
+        record_backend_result(pinned_control_plane_generation(loop, conn.request_config),
+                              conn.upstream_idx,
+                              conn.upstream_backend_idx,
+                              /*success=*/true,
+                              monotonic_us());
     }
 
     if (conn.req_malformed) {
@@ -3476,13 +3591,19 @@ void h2_on_upstream_connected(void* lp, Connection& conn, IoEvent ev) {
     auto* loop = static_cast<Loop*>(lp);
     Http2Conn* h2 = conn.h2;
     if (ev.result < 0) {
-        record_backend_result(
-            conn.upstream_idx, conn.upstream_backend_idx, /*success=*/false, monotonic_us());
+        record_backend_result(pinned_control_plane_generation(loop, h2->async_cfg),
+                              conn.upstream_idx,
+                              conn.upstream_backend_idx,
+                              /*success=*/false,
+                              monotonic_us());
         h2_proxy_fail(loop, conn, 502);  // backend failover over h2: follow-up
         return;
     }
-    record_backend_result(
-        conn.upstream_idx, conn.upstream_backend_idx, /*success=*/true, monotonic_us());
+    record_backend_result(pinned_control_plane_generation(loop, h2->async_cfg),
+                          conn.upstream_idx,
+                          conn.upstream_backend_idx,
+                          /*success=*/true,
+                          monotonic_us());
     if (!loop->alloc_upstream_buf(conn)) {
         h2_proxy_fail(loop, conn, 502);
         return;
@@ -3570,7 +3691,11 @@ void h2_proxy_begin(Loop* loop, Connection& conn) {
     conn.upstream_start_us = monotonic_us();
     conn.set_slots(nullptr, nullptr, nullptr, &h2_on_upstream_connected<Loop>);
     const u32 kBackend = select_backend_with_control_plane(
-        loop, upstream_id, target.addr_count, conn.upstream_start_us);
+        loop, upstream_id, target.addr_count, conn.upstream_start_us, cfg);
+    if (kBackend >= target.addr_count) {
+        h2_proxy_fail(loop, conn, 503);
+        return;
+    }
     conn.upstream_backend_idx = static_cast<u8>(kBackend);
     if (!loop->submit_connect(conn, &target.addrs[kBackend], sizeof(target.addrs[kBackend]))) {
         h2_proxy_fail(loop, conn, 502);  // h2_proxy_fail closes the fd we just opened
@@ -5263,8 +5388,11 @@ void on_upstream_response(void* lp, Connection& conn, IoEvent ev) {
     // A reused pooled socket proved healthy once it returned response bytes; record
     // success here rather than at synthetic connect time.
     if (conn.upstream_reused) {
-        record_backend_result(
-            conn.upstream_idx, conn.upstream_backend_idx, /*success=*/true, monotonic_us());
+        record_backend_result(pinned_control_plane_generation(loop, conn.request_config),
+                              conn.upstream_idx,
+                              conn.upstream_backend_idx,
+                              /*success=*/true,
+                              monotonic_us());
         conn.upstream_reused = false;
     }
 

@@ -14634,6 +14634,40 @@ TEST(route, manual_health_override_excludes_backend_selection) {
         1u);
 }
 
+TEST(route, manual_health_override_fails_closed_when_every_backend_is_excluded) {
+    using namespace rut;
+    RouteConfig config;
+    auto upstream = config.add_upstream("manual-all", 0x7f000001u, 8080);
+    REQUIRE(upstream);
+    REQUIRE(config.add_upstream_backend(upstream.value(), 0x7f000001u, 8081));
+    ControlPlaneMutationPort mutation;
+    mutation.reset(19, true, &config);
+    REQUIRE(mutation.mark({19, static_cast<u16>(upstream.value()), 0}, false));
+    REQUIRE(mutation.mark({19, static_cast<u16>(upstream.value()), 1}, false));
+    struct SelectionLoop {
+        ControlPlaneMutationPort* control_plane_mutation;
+    } loop{&mutation};
+    CHECK_EQ(select_backend_with_control_plane(
+                 &loop, static_cast<u16>(upstream.value()), 2, 1'000'000, &config),
+             ~u32{0});
+}
+
+TEST(route, manual_health_override_excludes_a_single_backend) {
+    using namespace rut;
+    RouteConfig config;
+    auto upstream = config.add_upstream("manual-one", 0x7f000001u, 8080);
+    REQUIRE(upstream);
+    ControlPlaneMutationPort mutation;
+    mutation.reset(20, true, &config);
+    REQUIRE(mutation.mark({20, static_cast<u16>(upstream.value()), 0}, false));
+    struct SelectionLoop {
+        ControlPlaneMutationPort* control_plane_mutation;
+    } loop{&mutation};
+    CHECK_EQ(select_backend_with_control_plane(
+                 &loop, static_cast<u16>(upstream.value()), 1, 1'000'000, &config),
+             ~u32{0});
+}
+
 // Passive circuit breaking: kBackendFailThreshold consecutive connect failures
 // eject a backend for the cooldown; selection skips it until the cooldown
 // lapses; a success clears the record.

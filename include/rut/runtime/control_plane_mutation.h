@@ -81,6 +81,8 @@ public:
     static constexpr u32 kMaxSnapshotAttempts = 8;
     static constexpr u32 kMaxAdmissionAttempts = 8;
     static constexpr u32 kMaxCounterAllocationAttempts = 128;
+    static constexpr u32 kPublisherClosed = u32{1} << 31;
+    static constexpr u32 kPublisherCountMask = kPublisherClosed - 1;
 
     ControlPlaneMutationPort() { reset(1, false); }
 
@@ -91,8 +93,10 @@ public:
         for (u32 bank = 0; bank < 2; bank++) {
             clear_bank(bank);
             bank_generation_[bank].store(0, std::memory_order_relaxed);
+            bank_config_[bank].store(nullptr, std::memory_order_relaxed);
         }
         configure_membership(0, config);
+        bank_config_[0].store(config, std::memory_order_relaxed);
         bank_generation_[0].store(generation, std::memory_order_relaxed);
         active_generation_.store(generation, std::memory_order_relaxed);
         stopping_.store(0, std::memory_order_relaxed);
@@ -101,6 +105,8 @@ public:
         terminal_publication_claim_.store(0, std::memory_order_relaxed);
         unclaimed_busy_publishers_.store(0, std::memory_order_relaxed);
         stopping_terminal_publishers_.store(0, std::memory_order_relaxed);
+        stopped_signal_publishers_.store(0, std::memory_order_relaxed);
+        override_writer_claim_.store(0, std::memory_order_relaxed);
         activation_publication_.store(kPublicationOpen, std::memory_order_relaxed);
         activation_terminal_slot_ = {};
         event_counters_.store(0, std::memory_order_relaxed);
@@ -295,26 +301,24 @@ public:
                     unlock_terminal_publication();
                     return false;
                 }
+                u32 identity_open = kAdmissionOpen;
+                if (!admission_identity_claim_.compare_exchange_strong(identity_open,
+                                                                       kAdmissionRequestClaimed,
+                                                                       std::memory_order_acq_rel,
+                                                                       std::memory_order_acquire)) {
+                    unlock_terminal_publication();
+                    observed = reload_word_.load(std::memory_order_acquire);
+                    continue;
+                }
                 ClaimedRecordSlot identity_slot{};
                 const u64 id = reserve_request_identity(&identity_slot);
                 if (id == 0) {
+                    release_request_identity_claim();
                     unlock_terminal_publication();
                     if (source == ReloadRequestSource::Signal)
                         (void)terminalize_counter_exhaustion(request_id);
                     return false;
                 }
-                // Reserve the request identity before making its claim visible.
-                // Signals that contend before the claim may publish Busy, but
-                // their counter allocation necessarily follows this ID.
-                if (!claim_reserved_request_identity(id, source, request_id, identity_slot)) {
-                    unlock_terminal_publication();
-                    return false;
-                }
-                // The coupled ticket is an internal placeholder for the
-                // request-ID reservation. Rolling it back when uncontended or
-                // publishing it before release lets later Busy publishers
-                // advance independently.
-                finish_request_identity_reservation(identity_slot, id);
                 // Expose the request-specific terminal owner only after its
                 // identity is reserved. A signal that observes this value can
                 // therefore allocate only a later Busy identity.
@@ -327,6 +331,37 @@ public:
                     ReloadAdmissionState::Pending, id, source, unpack_route_enabled(observed));
                 const bool admitted = reload_word_.compare_exchange_strong(
                     observed, desired, std::memory_order_acq_rel, std::memory_order_acquire);
+                if (admitted) {
+                    // The accepted request keeps its identity but does not
+                    // consume a terminal-history ticket until completion.
+                    finish_request_identity_reservation(identity_slot, id);
+                } else {
+                    const auto outcome =
+                        stopping_.load(std::memory_order_acquire) != 0 ||
+                                unpack_state(observed) == ReloadAdmissionState::Stopping
+                            ? ReloadTerminalOutcome::Stopped
+                            : ReloadTerminalOutcome::Busy;
+                    if (source == ReloadRequestSource::Signal) {
+                        const bool published = publish_claimed_record({true,
+                                                                       id,
+                                                                       active_generation(),
+                                                                       0,
+                                                                       ReloadRequestSource::Signal,
+                                                                       outcome},
+                                                                      identity_slot);
+                        if (published && request_id != nullptr) *request_id = id;
+                    } else {
+                        u64 counters = pack_event_counters(identity_slot.ticket, id);
+                        const u64 rollback = pack_event_counters(identity_slot.ticket - 1, id - 1);
+                        if (event_counters_.compare_exchange_strong(counters,
+                                                                    rollback,
+                                                                    std::memory_order_acq_rel,
+                                                                    std::memory_order_acquire))
+                            release_record_slot(identity_slot);
+                        else
+                            cancel_claimed_record(identity_slot);
+                    }
+                }
                 release_request_identity_claim();
                 if (admitted) {
                     if (request_id != nullptr) *request_id = id;
@@ -355,9 +390,17 @@ public:
 
             if (publish_busy_for_observed(observed, request_id)) return false;
         }
-        if (source == ReloadRequestSource::Signal)
-            (void)publish_busy_for_observed(reload_word_.load(std::memory_order_acquire),
-                                            request_id);
+        if (source == ReloadRequestSource::Signal) {
+            const u64 observed = reload_word_.load(std::memory_order_acquire);
+            if (stopping_.load(std::memory_order_acquire) != 0 ||
+                unpack_state(observed) == ReloadAdmissionState::Stopping) {
+                (void)publish_stopped_signal(request_id);
+            } else if (!publish_busy_for_observed(observed, request_id) &&
+                       unpack_state(reload_word_.load(std::memory_order_acquire)) ==
+                           ReloadAdmissionState::Idle) {
+                (void)admit_contended_idle_signal(request_id);
+            }
+        }
         return false;
     }
 
@@ -483,6 +526,7 @@ public:
             const u32 new_bank = old_bank ^ 1u;
             clear_bank(new_bank);
             configure_membership(new_bank, new_config);
+            bank_config_[new_bank].store(new_config, std::memory_order_relaxed);
             carry_compatible_overrides(old_bank, new_bank, old_generation, new_generation);
             // Claim physical record capacity before crossing the non-fallible
             // generation-publication boundary. Its ticket is assigned only at
@@ -551,20 +595,12 @@ public:
             unlock_terminal_publication();
             return false;
         }
-        u64 completing_expected = completing;
-        if (!reload_word_.compare_exchange_strong(
-                completing_expected,
-                with_state(completing, ReloadAdmissionState::Idle),
-                std::memory_order_release,
-                std::memory_order_relaxed)) {
-            cancel_claimed_record(terminal_slot);
-            unlock_terminal_publication();
-            return false;
-        }
-        // Claiming the concrete slot before reopening admission prevents a
-        // later Busy burst from replacing every candidate with newer tickets
-        // while this completion is descheduled at its terminal boundary.
+        // Publish the terminal record before exposing Idle. A route requester
+        // that sees Idle can therefore never be rejected merely because this
+        // publisher still owns the terminal lock.
         const bool published = publish_claimed_record(terminal, terminal_slot);
+        reload_word_.store(with_state(completing, ReloadAdmissionState::Idle),
+                           std::memory_order_release);
         unlock_terminal_publication();
         return published;
     }
@@ -691,23 +727,28 @@ public:
         // that already passed its final shutdown check to publish or roll back,
         // so no successful mark can commit after stop() returns. Leave the
         // sequence odd as a permanent shutdown barrier; reset() reinitializes it.
-        const u32 bank = active_bank_.load(std::memory_order_acquire);
-        auto& sequence = override_seq_[bank];
-        u64 stable = sequence.load(std::memory_order_acquire);
-        for (;;) {
-            if ((stable & 1u) != 0) {
-                stable = sequence.load(std::memory_order_acquire);
-                continue;
+        for (u32 bank = 0; bank < 2; bank++) {
+            if (bank_generation_[bank].load(std::memory_order_acquire) == 0) continue;
+            auto& sequence = override_seq_[bank];
+            u64 stable = sequence.load(std::memory_order_acquire);
+            for (;;) {
+                if ((stable & 1u) != 0) {
+                    stable = sequence.load(std::memory_order_acquire);
+                    continue;
+                }
+                if (sequence.compare_exchange_weak(
+                        stable, stable + 1, std::memory_order_acq_rel, std::memory_order_acquire))
+                    break;
             }
-            if (sequence.compare_exchange_weak(
-                    stable, stable + 1, std::memory_order_acq_rel, std::memory_order_acquire))
-                break;
         }
         // Busy publishers behind a request owner do not occupy the admission
         // claim, so wait for any publisher that crossed its terminal-owner
         // validation before declaring shutdown complete.
+        stopped_signal_publishers_.fetch_or(kPublisherClosed, std::memory_order_acq_rel);
         while (unclaimed_busy_publishers_.load(std::memory_order_acquire) != 0 ||
-               stopping_terminal_publishers_.load(std::memory_order_acquire) != 0) {
+               stopping_terminal_publishers_.load(std::memory_order_acquire) != 0 ||
+               (stopped_signal_publishers_.load(std::memory_order_acquire) & kPublisherCountMask) !=
+                   0) {
         }
         stopping_.store(2, std::memory_order_release);
         unlock_terminal_publication();
@@ -729,57 +770,122 @@ public:
                 break;
             }
         if (bank == 2) return false;
+        u8 writer_open = 0;
+        bool writer_claimed = false;
+        for (u32 attempt = 0; attempt < kMaxMarkAttempts; attempt++) {
+            if (override_writer_claim_.compare_exchange_weak(
+                    writer_open, 1, std::memory_order_acq_rel, std::memory_order_acquire)) {
+                writer_claimed = true;
+                break;
+            }
+            writer_open = 0;
+        }
+        if (!writer_claimed) return false;
+
         const auto value =
             healthy ? ManualHealthOverride::Healthy : ManualHealthOverride::Unhealthy;
         const u64 desired = pack_override(generation, value);
+        const auto claim_sequence = [](std::atomic<u64>& sequence, u64* stable) {
+            *stable = sequence.load(std::memory_order_acquire);
+            for (u32 attempt = 0; attempt < kMaxMarkAttempts; attempt++) {
+                if ((*stable & 1u) != 0) {
+                    *stable = sequence.load(std::memory_order_acquire);
+                    continue;
+                }
+                if (sequence.compare_exchange_weak(
+                        *stable, *stable + 1, std::memory_order_acq_rel, std::memory_order_acquire))
+                    return true;
+            }
+            return false;
+        };
+
         auto& sequence = override_seq_[bank];
-        u64 stable_seq = sequence.load(std::memory_order_acquire);
-        bool claimed = false;
-        for (u32 attempt = 0; attempt < kMaxMarkAttempts; attempt++) {
-            if ((stable_seq & 1u) != 0) {
-                stable_seq = sequence.load(std::memory_order_acquire);
-                continue;
-            }
-            if (sequence.compare_exchange_weak(stable_seq,
-                                               stable_seq + 1,
-                                               std::memory_order_acq_rel,
-                                               std::memory_order_acquire)) {
-                claimed = true;
-                break;
-            }
+        u64 stable_seq = 0;
+        if (!claim_sequence(sequence, &stable_seq)) {
+            override_writer_claim_.store(0, std::memory_order_release);
+            return false;
         }
-        if (!claimed) return false;
+
+        u32 peer_upstream = 0;
+        u32 peer_backend = 0;
+        const bool has_peer = compatible_override_peer(
+            bank, server.upstream_id, server.backend_id, &peer_upstream, &peer_backend);
+        const u32 peer_bank = bank ^ 1u;
+        const u64 peer_generation =
+            has_peer ? bank_generation_[peer_bank].load(std::memory_order_acquire) : 0;
+        u64 peer_stable_seq = 0;
+        if (has_peer && !claim_sequence(override_seq_[peer_bank], &peer_stable_seq)) {
+            sequence.store(stable_seq + 2, std::memory_order_release);
+            override_writer_claim_.store(0, std::memory_order_release);
+            return false;
+        }
+
         auto& slot = overrides_[bank][server.upstream_id][server.backend_id];
         const u64 prior = slot.load(std::memory_order_relaxed);
+        auto* peer_slot = has_peer ? &overrides_[peer_bank][peer_upstream][peer_backend] : nullptr;
+        const u64 peer_prior =
+            peer_slot == nullptr ? 0 : peer_slot->load(std::memory_order_relaxed);
         if (stopping_.load(std::memory_order_acquire) != 0 ||
             cutover_.load(std::memory_order_acquire) != 0 ||
             unpack_override_generation(prior) > generation ||
-            bank_generation_[bank].load(std::memory_order_acquire) != generation) {
-            sequence.store(stable_seq, std::memory_order_release);
+            bank_generation_[bank].load(std::memory_order_acquire) != generation ||
+            (has_peer &&
+             bank_generation_[peer_bank].load(std::memory_order_acquire) != peer_generation)) {
+            if (has_peer)
+                override_seq_[peer_bank].store(peer_stable_seq + 2, std::memory_order_release);
+            sequence.store(stable_seq + 2, std::memory_order_release);
+            override_writer_claim_.store(0, std::memory_order_release);
             return false;
         }
         slot.store(desired, std::memory_order_relaxed);
+        if (peer_slot != nullptr)
+            peer_slot->store(pack_override(peer_generation, value), std::memory_order_relaxed);
         if (stopping_.load(std::memory_order_acquire) == 0 &&
             cutover_.load(std::memory_order_acquire) == 0 &&
-            bank_generation_[bank].load(std::memory_order_acquire) == generation) {
+            bank_generation_[bank].load(std::memory_order_acquire) == generation &&
+            (!has_peer ||
+             bank_generation_[peer_bank].load(std::memory_order_acquire) == peer_generation)) {
             const u64 prior_version = override_version_[bank].load(std::memory_order_relaxed);
-            if (prior_version >= kMaxOverrideVersion) {
+            const u64 peer_prior_version =
+                has_peer ? override_version_[peer_bank].load(std::memory_order_relaxed) : 0;
+            if (prior_version >= kMaxOverrideVersion ||
+                (has_peer && peer_prior_version >= kMaxOverrideVersion)) {
                 slot.store(prior, std::memory_order_relaxed);
+                if (peer_slot != nullptr) peer_slot->store(peer_prior, std::memory_order_relaxed);
+                if (has_peer)
+                    override_seq_[peer_bank].store(peer_stable_seq + 2, std::memory_order_release);
                 sequence.store(stable_seq + 2, std::memory_order_release);
+                override_writer_claim_.store(0, std::memory_order_release);
                 return false;
             }
             const u64 version = prior_version + 1;
             publish_committed_override(
                 bank, server.upstream_id, server.backend_id, desired, version);
             override_version_[bank].store(version, std::memory_order_release);
+            if (has_peer) {
+                const u64 peer_version = peer_prior_version + 1;
+                publish_committed_override(peer_bank,
+                                           peer_upstream,
+                                           peer_backend,
+                                           pack_override(peer_generation, value),
+                                           peer_version);
+                override_version_[peer_bank].store(peer_version, std::memory_order_release);
+                override_seq_[peer_bank].store(peer_stable_seq + 2, std::memory_order_release);
+            }
             sequence.store(stable_seq + 2, std::memory_order_release);
+            override_writer_claim_.store(0, std::memory_order_release);
             return true;
         }
         // Readers ignore odd sequences while the prior value is restored. Use a
         // new stable sequence after the rollback: reusing stable_seq would let a
         // reader that straddled the writer validate the transient desired value.
         slot.store(prior, std::memory_order_relaxed);
+        if (peer_slot != nullptr) {
+            peer_slot->store(peer_prior, std::memory_order_relaxed);
+            override_seq_[peer_bank].store(peer_stable_seq + 2, std::memory_order_release);
+        }
         sequence.store(stable_seq + 2, std::memory_order_release);
+        override_writer_claim_.store(0, std::memory_order_release);
         return false;
     }
 
@@ -841,6 +947,56 @@ public:
             return unpack_committed_override(publication);
         }
         return ManualHealthOverride::None;
+    }
+
+    [[nodiscard]] u64 generation_for_config(const RouteConfig* config) const {
+        if (config == nullptr) return 0;
+        for (u32 bank = 0; bank < 2; bank++)
+            if (bank_config_[bank].load(std::memory_order_acquire) == config)
+                return bank_generation_[bank].load(std::memory_order_acquire);
+        return 0;
+    }
+
+    [[nodiscard]] bool manual_health_snapshot(u64 generation,
+                                              u16 upstream_id,
+                                              u32 backend_count,
+                                              ManualHealthOverride* verdicts,
+                                              u64* override_version = nullptr) const {
+        if (verdicts == nullptr || upstream_id >= RouteConfig::kMaxUpstreams ||
+            backend_count > UpstreamTarget::kMaxBackends)
+            return false;
+        for (u32 backend = 0; backend < backend_count; backend++)
+            verdicts[backend] = ManualHealthOverride::None;
+        if (generation == 0) {
+            if (override_version != nullptr) *override_version = 0;
+            return true;
+        }
+        for (u32 bank = 0; bank < 2; bank++) {
+            if (bank_generation_[bank].load(std::memory_order_acquire) != generation) continue;
+            if (upstream_id >= upstream_count_[bank].load(std::memory_order_acquire) ||
+                backend_count > backend_count_[bank][upstream_id].load(std::memory_order_acquire))
+                return false;
+            for (u32 attempt = 0; attempt < kMaxSnapshotAttempts; attempt++) {
+                const u64 before = override_seq_[bank].load(std::memory_order_acquire);
+                if ((before & 1u) != 0) continue;
+                for (u32 backend = 0; backend < backend_count; backend++) {
+                    const u64 packed =
+                        overrides_[bank][upstream_id][backend].load(std::memory_order_relaxed);
+                    verdicts[backend] = unpack_override_generation(packed) == generation
+                                            ? unpack_override(packed)
+                                            : ManualHealthOverride::None;
+                }
+                const u64 version = override_version_[bank].load(std::memory_order_relaxed);
+                std::atomic_thread_fence(std::memory_order_acquire);
+                if (override_seq_[bank].load(std::memory_order_relaxed) != before) continue;
+                if (bank_generation_[bank].load(std::memory_order_acquire) != generation)
+                    return false;
+                if (override_version != nullptr) *override_version = version;
+                return true;
+            }
+            return false;
+        }
+        return false;
     }
 
     [[nodiscard]] ReloadTerminalRecord last_record() const {
@@ -1081,6 +1237,7 @@ private:
     }
 
     void clear_bank(u32 bank) {
+        bank_config_[bank].store(nullptr, std::memory_order_relaxed);
         override_seq_[bank].store(0, std::memory_order_relaxed);
         override_version_[bank].store(0, std::memory_order_relaxed);
         upstream_count_[bank].store(0, std::memory_order_relaxed);
@@ -1136,6 +1293,28 @@ private:
         return old_endpoint.sin_family == new_endpoint.sin_family &&
                old_endpoint.sin_addr.s_addr == new_endpoint.sin_addr.s_addr &&
                old_endpoint.sin_port == new_endpoint.sin_port;
+    }
+
+    [[nodiscard]] bool compatible_override_peer(
+        u32 bank, u16 upstream, u16 backend, u32* peer_upstream, u32* peer_backend) const {
+        if (peer_upstream == nullptr || peer_backend == nullptr || bank >= 2 ||
+            upstream >= RouteConfig::kMaxUpstreams || backend >= UpstreamTarget::kMaxBackends)
+            return false;
+        const u32 peer_bank = bank ^ 1u;
+        if (bank_generation_[peer_bank].load(std::memory_order_acquire) == 0) return false;
+        const auto& target = membership_[bank][upstream];
+        const u32 peer_count = upstream_count_[peer_bank].load(std::memory_order_acquire);
+        for (u32 candidate = 0; candidate < peer_count; candidate++) {
+            const auto& peer = membership_[peer_bank][candidate];
+            if (!compatible_target(target, peer)) continue;
+            for (u32 endpoint = 0; endpoint < peer.addr_count; endpoint++) {
+                if (!same_endpoint(target.addrs[backend], peer.addrs[endpoint])) continue;
+                *peer_upstream = candidate;
+                *peer_backend = endpoint;
+                return true;
+            }
+        }
+        return false;
     }
 
     [[nodiscard]] static u32 matching_endpoint_count(const UpstreamTarget& old_target,
@@ -1299,11 +1478,8 @@ private:
             if (request_id >= kMaxRequestId || ticket >= kMaxRecordTicket - 1) return 0;
             const ClaimedRecordSlot claimed = claim_record_slot(ticket + 1);
             if (!claimed.valid) {
-                // Slot pressure is transient, not counter exhaustion. Do not
-                // consume the bounded CAS-contention budget or drop an
-                // observed signal while an earlier publisher advances the
-                // record frontier.
-                attempt--;
+                // Slot pressure is transient, but admission is non-suspending:
+                // each failed probe consumes the bounded allocation budget.
                 current = event_counters_.load(std::memory_order_acquire);
                 continue;
             }
@@ -1346,7 +1522,7 @@ private:
                 return false;
             }
         }
-        stage_claimed_record(abandoned, identity_slot);
+        (void)publish_claimed_record(abandoned, identity_slot);
         return false;
     }
 
@@ -1374,12 +1550,31 @@ private:
     }
 
     [[nodiscard]] bool publish_stopped_signal(u64* returned_request_id) {
+        u32 publishers = stopped_signal_publishers_.load(std::memory_order_acquire);
+        bool tracked = false;
+        for (;;) {
+            if ((publishers & kPublisherClosed) != 0) {
+                // stop() already closed and drained the pre-return publisher
+                // set. Publish this later observation only after that boundary.
+                while (stopping_.load(std::memory_order_acquire) != 2) {
+                }
+                break;
+            }
+            if (stopped_signal_publishers_.compare_exchange_weak(publishers,
+                                                                 publishers + 1,
+                                                                 std::memory_order_acq_rel,
+                                                                 std::memory_order_acquire)) {
+                tracked = true;
+                break;
+            }
+        }
         u64 request_id = 0;
         ClaimedRecordSlot slot{};
         if (!allocate_busy_identity(0, &request_id, &slot)) {
             if (!terminalize_counter_exhaustion(returned_request_id) &&
                 returned_request_id != nullptr)
                 *returned_request_id = 0;
+            if (tracked) stopped_signal_publishers_.fetch_sub(1, std::memory_order_acq_rel);
             return false;
         }
         const bool published = publish_claimed_record({true,
@@ -1390,6 +1585,7 @@ private:
                                                        ReloadTerminalOutcome::Stopped},
                                                       slot);
         if (published && returned_request_id != nullptr) *returned_request_id = request_id;
+        if (tracked) stopped_signal_publishers_.fetch_sub(1, std::memory_order_acq_rel);
         return published;
     }
 
@@ -1535,7 +1731,6 @@ private:
             if (base >= kMaxRequestId || current_ticket >= kMaxRecordTicket - 1) return false;
             const ClaimedRecordSlot claimed = claim_record_slot(current_ticket + 1);
             if (!claimed.valid) {
-                attempt--;
                 current = event_counters_.load(std::memory_order_acquire);
                 continue;
             }
@@ -2006,6 +2201,8 @@ private:
     std::atomic<u8> terminal_publication_claim_{0};
     std::atomic<u32> unclaimed_busy_publishers_{0};
     std::atomic<u32> stopping_terminal_publishers_{0};
+    std::atomic<u32> stopped_signal_publishers_{0};
+    std::atomic<u8> override_writer_claim_{0};
     std::atomic<u8> stopping_{0};
     std::atomic<u8> cutover_{0};
     std::atomic<u8> activation_publication_{kPublicationOpen};
@@ -2013,6 +2210,7 @@ private:
     std::atomic<u64> active_generation_{1};
     std::atomic<u8> active_bank_{0};
     std::atomic<u64> bank_generation_[2]{};
+    std::atomic<const RouteConfig*> bank_config_[2]{};
     std::atomic<u8> upstream_count_[2]{};
     std::atomic<u8> backend_count_[2][RouteConfig::kMaxUpstreams]{};
     UpstreamTarget membership_[2][RouteConfig::kMaxUpstreams]{};

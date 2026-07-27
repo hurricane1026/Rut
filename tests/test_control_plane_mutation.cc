@@ -1075,6 +1075,32 @@ TEST(control_plane_mutation, activation_carries_overrides_across_probe_policy_ch
     CHECK_EQ(version, 1u);
 }
 
+TEST(control_plane_mutation, compatible_retained_generations_share_override_updates) {
+    ControlPlaneMutationPort port;
+    RouteConfig old_config;
+    REQUIRE(old_config.add_upstream("users", 0x7f000001u, 8000).has_value());
+    port.reset(3, true, &old_config);
+    REQUIRE(port.mark({3, 0, 0}, false));
+
+    u64 id = 0;
+    REQUIRE(port.request_reload(ReloadRequestSource::Route, &id));
+    ReloadRequest request{};
+    REQUIRE(port.take_reload(&request));
+    RouteConfig new_config;
+    REQUIRE(new_config.add_upstream("users", 0x7f000001u, 8000).has_value());
+    REQUIRE(
+        port.complete_reload(id, request.source, ReloadTerminalOutcome::Activated, 4, &new_config));
+    CHECK_EQ(port.manual_health({4, 0, 0}), ManualHealthOverride::Unhealthy);
+
+    REQUIRE(port.mark({3, 0, 0}, true));
+    CHECK_EQ(port.manual_health({3, 0, 0}), ManualHealthOverride::Healthy);
+    CHECK_EQ(port.manual_health({4, 0, 0}), ManualHealthOverride::Healthy);
+
+    REQUIRE(port.mark({4, 0, 0}, false));
+    CHECK_EQ(port.manual_health({3, 0, 0}), ManualHealthOverride::Unhealthy);
+    CHECK_EQ(port.manual_health({4, 0, 0}), ManualHealthOverride::Unhealthy);
+}
+
 TEST(control_plane_mutation, activation_carries_overrides_across_backend_reordering) {
     ControlPlaneMutationPort port;
     RouteConfig old_config;
