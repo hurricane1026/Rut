@@ -6,6 +6,7 @@
 #include "rut/compiler/diagnostic.h"
 #include <deque>
 #include <string>
+#include <vector>
 
 namespace rut {
 
@@ -886,15 +887,35 @@ struct HirForLoopBranch {
     HirTerminator term{};
 };
 
+// Guard-failure bodies are embedded through guards, loop arms, routes, and
+// modules. Inline storage for sixteen HirLocals therefore multiplies into
+// hundreds of megabytes even when no failure body uses a deferred carrier.
+// Retain the hard language limit while allocating storage only for bodies
+// that actually need it.
+struct HirGuardBodyLocals {
+    static constexpr u32 kMaxLocals = 16;
+    std::vector<HirLocal> data;
+    u32 len = 0;
+
+    bool push(const HirLocal& local) {
+        if (len >= kMaxLocals) return false;
+        data.push_back(local);
+        len++;
+        return true;
+    }
+    HirLocal& operator[](u32 index) { return data[index]; }
+    const HirLocal& operator[](u32 index) const { return data[index]; }
+};
+
 struct HirGuardBody {
     enum class BodyKind : u8 {
         Direct,
         If,
     };
 
-    static constexpr u32 kMaxLocals = 16;
+    static constexpr u32 kMaxLocals = HirGuardBodyLocals::kMaxLocals;
     BodyKind body_kind = BodyKind::Direct;
-    FixedVec<HirLocal, kMaxLocals> locals;
+    HirGuardBodyLocals locals;
     u8 shared_local_count = 0;
     u8 then_term_local_start = 0;
     u8 then_term_local_count = 0;
@@ -1028,6 +1049,10 @@ struct HirForLoopMatchArm {
     // selected inner arm's condition.
     bool has_source_arm_guard = false;
     HirExpr source_arm_guard{};
+    // A flattened nested match can require a second guard after source-arm
+    // body locals have been materialized. Keep that expression in the route
+    // arena instead of embedding another HirExpr in every arm.
+    u32 post_arm_guard_expr_index = 0xffffffffu;
     BodyKind body_kind = BodyKind::Direct;
     // Four source locals, one source-guard helper carrier, plus hidden
     // carriers used to latch a flattened source-arm guard and request-backed
@@ -1041,6 +1066,9 @@ struct HirForLoopMatchArm {
     // 0 materializes at arm entry; N materializes only after prelude guard N
     // succeeds. This keeps guard-let unwrapping off the guard's failure edge.
     u8 local_guard_depth[kMaxLocals]{};
+    // Synthetic helper carriers needed to evaluate an arm guard materialize
+    // before it; ordinary depth-0 body locals wait until the guard succeeds.
+    bool local_precedes_arm_guard[kMaxLocals]{};
     // Flattened nested-match arms copied from one source arm share this id so
     // MIR evaluates their source-arm captures once across guard fallthroughs.
     u8 capture_group = 0;

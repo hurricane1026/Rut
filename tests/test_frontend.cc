@@ -7795,6 +7795,43 @@ route GET "/x" {
     CHECK(hir.error().detail.eq(lit("Response assignments cannot follow a static for-loop")));
 }
 
+TEST(frontend, response_header_mutation_after_static_loop_is_rejected) {
+    const char* sources[] = {
+        R"rut(
+route GET "/x" {
+    let resp = response(200)
+    for item in [1] { guard req.http11 else { return resp } }
+    resp.set("X-Late", "yes")
+    return resp
+}
+)rut",
+        R"rut(
+route GET "/x" {
+    let resp = response(200)
+    resp.set("X-Early", req.path)
+    for item in [1] { guard req.http11 else { return resp } }
+    resp.remove("X-Early")
+    return resp
+}
+)rut",
+    };
+    for (const char* src : sources) {
+        auto lexed = lex(lit(src));
+        REQUIRE(lexed);
+        auto ast = parse_file_heap(lexed.value());
+        REQUIRE(ast);
+        auto hir = analyze_file_heap(ast.value());
+        REQUIRE_FALSE(hir.has_value());
+        CHECK(hir.error().detail.eq(
+            lit("Response header mutations cannot follow a static for-loop")));
+    }
+}
+
+TEST(frontend, guard_failure_deferred_locals_do_not_inflate_empty_hir_modules) {
+    CHECK_LT(sizeof(HirGuardBody), 8u * 1024u);
+    CHECK_LT(sizeof(HirModule), 192u * 1024u * 1024u);
+}
+
 TEST(frontend, nested_call_arguments_cannot_reorder_response_reads_and_mutations) {
     const char* src = R"rut(
 func mutate(_ resp: Response) -> i32 {
@@ -33017,6 +33054,16 @@ route GET "/x" {
     REQUIRE(ast);
     auto hir = analyze_file_heap(ast.value());
     REQUIRE(hir);
+    const auto& body = hir->routes[0].for_loops[0].body;
+    CHECK_EQ(body.locals.len, 0u);
+    REQUIRE_EQ(body.matches.len, 1u);
+    REQUIRE_EQ(body.matches[0].arms.len, 4u);
+    REQUIRE_EQ(body.matches[0].arms[0].locals.len, 1u);
+    CHECK_EQ(static_cast<u8>(body.matches[0].arms[0].locals[0].init.kind),
+             static_cast<u8>(HirExprKind::ReqPath));
+    CHECK_EQ(body.matches[0].arms[0].capture_local_count, 1u);
+    CHECK_EQ(body.matches[0].arms[1].capture_group, body.matches[0].arms[0].capture_group);
+    CHECK_EQ(body.matches[0].arms[3].locals.len, 0u);
     auto mir = build_mir_heap(hir.value());
     REQUIRE(mir);
     FrontendRirModule rir{};
