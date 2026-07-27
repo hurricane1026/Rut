@@ -6,7 +6,6 @@
 #include "rut/compiler/diagnostic.h"
 #include <deque>
 #include <string>
-#include <vector>
 
 namespace rut {
 
@@ -887,35 +886,15 @@ struct HirForLoopBranch {
     HirTerminator term{};
 };
 
-// Guard-failure bodies are embedded through guards, loop arms, routes, and
-// modules. Inline storage for sixteen HirLocals therefore multiplies into
-// hundreds of megabytes even when no failure body uses a deferred carrier.
-// Retain the hard language limit while allocating storage only for bodies
-// that actually need it.
-struct HirGuardBodyLocals {
-    static constexpr u32 kMaxLocals = 16;
-    std::vector<HirLocal> data;
-    u32 len = 0;
-
-    bool push(const HirLocal& local) {
-        if (len >= kMaxLocals) return false;
-        data.push_back(local);
-        len++;
-        return true;
-    }
-    HirLocal& operator[](u32 index) { return data[index]; }
-    const HirLocal& operator[](u32 index) const { return data[index]; }
-};
-
 struct HirGuardBody {
     enum class BodyKind : u8 {
         Direct,
         If,
     };
 
-    static constexpr u32 kMaxLocals = HirGuardBodyLocals::kMaxLocals;
+    static constexpr u32 kMaxLocals = 16;
     BodyKind body_kind = BodyKind::Direct;
-    HirGuardBodyLocals locals;
+    FixedVec<HirLocal, kMaxLocals> locals;
     u8 shared_local_count = 0;
     u8 then_term_local_start = 0;
     u8 then_term_local_count = 0;
@@ -1040,14 +1019,15 @@ struct HirForLoopMatchArm {
     u32 bind_tuple_variant_indices[kMaxTupleSlots]{};
     u32 bind_tuple_struct_indices[kMaxTupleSlots]{};
     bool has_arm_guard = false;
-    // Source-arm guards run before body preludes; guards synthesized while
-    // flattening a nested body match run after those preludes.
+    // True for the source-level arm guard; synthesized inner-match guards run
+    // after the source arm's body preludes.
     bool arm_guard_precedes_prelude = false;
     HirExpr arm_guard{};
-    // A flattened nested match can require a second guard after source-arm
-    // body locals have been materialized. Keep that expression in the route
-    // arena instead of embedding another HirExpr in every arm.
-    u32 post_arm_guard_expr_index = 0xffffffffu;
+    // Flattening a guarded source arm around a nested match keeps the source
+    // guard as a distinct first-stage test. arm_guard then represents only the
+    // selected inner arm's condition.
+    bool has_source_arm_guard = false;
+    HirExpr source_arm_guard{};
     BodyKind body_kind = BodyKind::Direct;
     // Four source locals, one source-guard helper carrier, plus hidden
     // carriers used to latch a flattened source-arm guard and request-backed
@@ -1055,14 +1035,12 @@ struct HirForLoopMatchArm {
     static constexpr u32 kMaxLocals = 7;
     static constexpr u32 kMaxSourceLocals = 4;
     static constexpr u32 kMaxPreludeGuards = 2;
+    static constexpr u8 kSourceGuardDependencyDepth = 0xfe;
+    static constexpr u8 kSourceGuardLatchDepth = 0xff;
     FixedVec<HirLocal, kMaxLocals> locals;
     // 0 materializes at arm entry; N materializes only after prelude guard N
     // succeeds. This keeps guard-let unwrapping off the guard's failure edge.
     u8 local_guard_depth[kMaxLocals]{};
-    // Synthetic helper carriers (and the hidden flattened-guard latch) needed
-    // to evaluate the source arm guard must materialize before that guard. All
-    // other depth-0 locals belong to the arm body and run only after it passes.
-    bool local_precedes_arm_guard[kMaxLocals]{};
     // Flattened nested-match arms copied from one source arm share this id so
     // MIR evaluates their source-arm captures once across guard fallthroughs.
     u8 capture_group = 0;
