@@ -2505,8 +2505,11 @@ FrontendResult<MirModule*> build_mir(const HirModule& module) {
                                  arm.else_branch.kind == HirForLoopBranch::Kind::Continue))
                                 return true;
                         }
-                        if (has_literal_subject(body_match.match_expr) && !arm.has_arm_guard &&
-                            !capture_group_has_source_guard(ai))
+                        const bool arm_guard_can_fall_through =
+                            arm.has_arm_guard && (arm.arm_guard.kind != HirExprKind::BoolLit ||
+                                                  !arm.arm_guard.bool_value);
+                        if (has_literal_subject(body_match.match_expr) &&
+                            !arm_guard_can_fall_through && !capture_group_has_source_guard(ai))
                             break;
                     }
                 }
@@ -2648,8 +2651,13 @@ FrontendResult<MirModule*> build_mir(const HirModule& module) {
                                              : ends_parent_trip(arm.then_branch) &&
                                                    ends_parent_trip(arm.else_branch));
                                 all_terminate &= arm_terminates;
+                                const bool arm_guard_can_fall_through =
+                                    arm.has_arm_guard &&
+                                    (arm.arm_guard.kind != HirExprKind::BoolLit ||
+                                     !arm.arm_guard.bool_value);
                                 if (has_literal_subject(body_match.match_expr) &&
-                                    !arm.has_arm_guard && !capture_group_has_source_guard(ai))
+                                    !arm_guard_can_fall_through &&
+                                    !capture_group_has_source_guard(ai))
                                     break;
                             }
                             if (any_reachable && all_terminate) {

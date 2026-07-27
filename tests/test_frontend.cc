@@ -35096,6 +35096,40 @@ route GET "/x" {
     rir.destroy();
 }
 
+TEST(frontend, static_true_match_arm_guard_prunes_unreachable_loop_continue) {
+    const char* sources[] = {
+        R"rut(
+route GET "/x" {
+    for item in [1, 2, 3, 4, 5, 6, 7, 8] {
+        match true {
+            true if true => return 201
+            _ => continue
+        }
+    }
+    return 500
+}
+)rut",
+        R"rut(
+route GET "/x" {
+    for outer in [1, 2, 3, 4, 5, 6, 7, 8] {
+        for inner in [1] { continue }
+        match true {
+            true if true => return 201
+            _ => continue
+        }
+    }
+    return 500
+}
+)rut",
+    };
+    for (const char* src : sources) {
+        FrontendRirModule rir{};
+        REQUIRE(lower_src_to_rir(src, rir));
+        CHECK(rir::verify_module(rir.module).ok);
+        rir.destroy();
+    }
+}
+
 TEST(frontend, static_loop_iterator_alias_rejects_fallible_elements) {
     const char* src = R"rut(
 func maybe(ok: bool) -> i32 { if ok { 7 } else { error(.timeout) } }
