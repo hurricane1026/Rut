@@ -17580,8 +17580,11 @@ static FrontendResult<u32> analyze_for_stmt(const AstStatement& stmt,
                         return frontend_error(FrontendError::UnsupportedSyntax,
                                               nested_match_stmt->expr.span,
                                               kMatchI64Detail);
-                    if (static_for_expr_reads_request_state(nested_match_stmt->expr)) {
-                        HirLocal subject_local{};
+                    HirLocal nested_subject_local{};
+                    const bool has_nested_subject_local =
+                        static_for_expr_reads_request_state(nested_match_stmt->expr);
+                    if (has_nested_subject_local) {
+                        HirLocal& subject_local = nested_subject_local;
                         subject_local.span = nested_match_stmt->expr.span;
                         subject_local.ref_index =
                             next_local_ref_index(route, route->locals.data, route->locals.len);
@@ -17590,16 +17593,7 @@ static FrontendResult<u32> analyze_for_stmt(const AstStatement& stmt,
                                                   nested_match_stmt->expr.span);
                         copy_json_value_metadata(&subject_local, inner_subject.value());
                         subject_local.init = inner_subject.value();
-                        const u32 local_index = loop.body.locals.len;
-                        if (!route->locals.push(subject_local) ||
-                            !loop.body.locals.push(subject_local))
-                            return frontend_error(FrontendError::TooManyItems,
-                                                  nested_match_stmt->expr.span);
-                        HirForLoopBody::Step local_step{};
-                        local_step.kind = HirForLoopBody::Step::Kind::Let;
-                        local_step.index = local_index;
-                        local_step.span = nested_match_stmt->expr.span;
-                        if (!loop.body.steps.push(local_step))
+                        if (!route->locals.push(subject_local))
                             return frontend_error(FrontendError::TooManyItems,
                                                   nested_match_stmt->expr.span);
                         if (!route->exprs.push(
@@ -17629,6 +17623,15 @@ static FrontendResult<u32> analyze_for_stmt(const AstStatement& stmt,
                         HirForLoopMatchArm arm{};
                         arm.span = inner_arm.span;
                         arm.pattern = outer_pattern.value();
+                        arm.capture_group = static_cast<u8>(ai + 1);
+                        if (has_nested_subject_local) {
+                            arm.local_guard_depth[arm.locals.len] = 0;
+                            arm.local_precedes_arm_guard[arm.locals.len] = !inner_arm.is_wildcard;
+                            if (!arm.locals.push(nested_subject_local))
+                                return frontend_error(FrontendError::TooManyItems,
+                                                      nested_match_stmt->expr.span);
+                            arm.capture_local_count = static_cast<u8>(arm.locals.len);
+                        }
                         if (!inner_arm.is_wildcard) {
                             auto inner_pattern = analyze_match_pattern(*inner_arm.pattern,
                                                                        inner_subject.value(),
@@ -18266,10 +18269,11 @@ static FrontendResult<u32> analyze_for_stmt(const AstStatement& stmt,
                         copy_json_value_metadata(&subject_local, inner_subject.value());
                         subject_local.init = inner_subject.value();
                         arm.local_guard_depth[arm.locals.len] = arm.guards.len;
-                        // The flattened inner pattern is synthesized as an arm guard, so
-                        // its latched request subject must be available while that guard
-                        // is evaluated, alongside the source-arm guard latch.
-                        arm.local_precedes_arm_guard[arm.locals.len] = true;
+                        // Without a source guard the synthesized inner
+                        // comparison is the arm guard and needs this capture
+                        // first. With a source guard it becomes the post-body
+                        // guard, so this remains a normal body local.
+                        arm.local_precedes_arm_guard[arm.locals.len] = !arm.has_arm_guard;
                         if (!arm.locals.push(subject_local))
                             return frontend_error(FrontendError::TooManyItems, arm_stmt->expr.span);
                         if (arm_locals != arm_scoped_locals.data) {
@@ -18324,34 +18328,10 @@ static FrontendResult<u32> analyze_for_stmt(const AstStatement& stmt,
                                 return {};
                             }
 
-                            HirExpr combined{};
-                            combined.kind = HirExprKind::IfElse;
-                            combined.type = HirTypeKind::Bool;
-                            combined.span = inner_ast_arm.span;
-
-                            HirExpr fallback{};
-                            fallback.kind = HirExprKind::BoolLit;
-                            fallback.type = HirTypeKind::Bool;
-                            fallback.span = inner_ast_arm.span;
-                            fallback.bool_value = false;
-
-                            if (!route->exprs.push(source_arm_guard_ref))
-                                return frontend_error(FrontendError::TooManyItems,
-                                                      inner_ast_arm.span);
-                            combined.lhs = &route->exprs[route->exprs.len - 1];
                             if (!route->exprs.push(inner_cond))
                                 return frontend_error(FrontendError::TooManyItems,
                                                       inner_ast_arm.span);
-                            combined.rhs = &route->exprs[route->exprs.len - 1];
-                            if (!route->exprs.push(fallback))
-                                return frontend_error(FrontendError::TooManyItems,
-                                                      inner_ast_arm.span);
-                            if (!combined.args.push(&route->exprs[route->exprs.len - 1]))
-                                return frontend_error(FrontendError::TooManyItems,
-                                                      inner_ast_arm.span);
-
-                            target->has_arm_guard = true;
-                            target->arm_guard = combined;
+                            target->post_arm_guard_expr_index = route->exprs.len - 1;
                             return {};
                         };
                         if (!inner_ast_arm.is_wildcard) {
@@ -22879,6 +22859,12 @@ static FrontendResult<HirModule*> analyze_file_internal(
                             return frontend_error(FrontendError::UnsupportedSyntax,
                                                   stmt.span,
                                                   lit_str("Response supports set/add/remove"));
+                        if (seen_for)
+                            return frontend_error(
+                                FrontendError::UnsupportedSyntax,
+                                stmt.span,
+                                lit_str(
+                                    "Response header mutations cannot follow a static for-loop"));
                         const u32 want_args = is_remove ? 1u : 2u;
                         if (stmt.expr.args.len != want_args || stmt.expr.args[0] == nullptr ||
                             stmt.expr.args[0]->kind != AstExprKind::StrLit ||

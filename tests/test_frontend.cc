@@ -7795,6 +7795,43 @@ route GET "/x" {
     CHECK(hir.error().detail.eq(lit("Response assignments cannot follow a static for-loop")));
 }
 
+TEST(frontend, response_header_mutation_after_static_loop_is_rejected) {
+    const char* sources[] = {
+        R"rut(
+route GET "/x" {
+    let resp = response(200)
+    for item in [1] { guard req.http11 else { return resp } }
+    resp.set("X-Late", "yes")
+    return resp
+}
+)rut",
+        R"rut(
+route GET "/x" {
+    let resp = response(200)
+    resp.set("X-Early", req.path)
+    for item in [1] { guard req.http11 else { return resp } }
+    resp.remove("X-Early")
+    return resp
+}
+)rut",
+    };
+    for (const char* src : sources) {
+        auto lexed = lex(lit(src));
+        REQUIRE(lexed);
+        auto ast = parse_file_heap(lexed.value());
+        REQUIRE(ast);
+        auto hir = analyze_file_heap(ast.value());
+        REQUIRE_FALSE(hir.has_value());
+        CHECK(hir.error().detail.eq(
+            lit("Response header mutations cannot follow a static for-loop")));
+    }
+}
+
+TEST(frontend, guard_failure_deferred_locals_do_not_inflate_empty_hir_modules) {
+    CHECK_LT(sizeof(HirGuardBody), 8u * 1024u);
+    CHECK_LT(sizeof(HirModule), 192u * 1024u * 1024u);
+}
+
 TEST(frontend, nested_call_arguments_cannot_reorder_response_reads_and_mutations) {
     const char* src = R"rut(
 func mutate(_ resp: Response) -> i32 {
@@ -33040,6 +33077,16 @@ route GET "/x" {
     REQUIRE(ast);
     auto hir = analyze_file_heap(ast.value());
     REQUIRE(hir);
+    const auto& body = hir->routes[0].for_loops[0].body;
+    CHECK_EQ(body.locals.len, 0u);
+    REQUIRE_EQ(body.matches.len, 1u);
+    REQUIRE_EQ(body.matches[0].arms.len, 4u);
+    REQUIRE_EQ(body.matches[0].arms[0].locals.len, 1u);
+    CHECK_EQ(static_cast<u8>(body.matches[0].arms[0].locals[0].init.kind),
+             static_cast<u8>(HirExprKind::ReqPath));
+    CHECK_EQ(body.matches[0].arms[0].capture_local_count, 1u);
+    CHECK_EQ(body.matches[0].arms[1].capture_group, body.matches[0].arms[0].capture_group);
+    CHECK_EQ(body.matches[0].arms[3].locals.len, 0u);
     auto mir = build_mir_heap(hir.value());
     REQUIRE(mir);
     FrontendRirModule rir{};
@@ -33750,17 +33797,38 @@ route GET "/x" {
     REQUIRE(ast);
     auto hir = analyze_file_heap(ast.value());
     REQUIRE(hir);
+    const auto& arms = hir->routes[0].for_loops[0].body.matches[0].arms;
+    REQUIRE_EQ(arms.len, 4u);
+    CHECK(arms[0].post_arm_guard_expr_index != 0xffffffffu);
+    CHECK(arms[1].post_arm_guard_expr_index != 0xffffffffu);
+    CHECK_EQ(arms[2].post_arm_guard_expr_index, 0xffffffffu);
     auto mir = build_mir_heap(hir.value());
     REQUIRE(mir);
-    u32 combined_guards[2]{};
-    u32 combined_count = 0;
-    for (u32 bi = 0; bi < mir->functions[0].blocks.len; bi++) {
-        if (mir->functions[0].blocks[bi].term.cond.kind != MirValueKind::IfElse) continue;
-        REQUIRE(combined_count < 2u);
-        combined_guards[combined_count++] = bi;
+    FrontendRirModule rir{};
+    REQUIRE(lower_to_rir(mir.value(), rir));
+    CHECK(rir::verify_module(rir.module).ok);
+    rir.destroy();
+}
+
+TEST(frontend, source_guard_materializes_body_local_before_flattened_inner_guard) {
+    const char* src = R"rut(
+route GET "/x" {
+    for item in [1] {
+        match item {
+            1 if req.http11 => {
+                let captured = time.nowMicros()
+                match captured > 0 { true => return 201 _ => return 202 }
+            }
+            _ => return 500
+        }
     }
-    REQUIRE_EQ(combined_count, 2u);
-    CHECK_EQ(mir->functions[0].blocks[combined_guards[0]].term.else_block, combined_guards[1]);
+    return 501
+}
+)rut";
+    FrontendRirModule rir{};
+    REQUIRE(lower_src_to_rir(src, rir));
+    CHECK(rir::verify_module(rir.module).ok);
+    rir.destroy();
 }
 
 TEST(frontend, match_control_enters_prelude_before_flattened_inner_guard) {
