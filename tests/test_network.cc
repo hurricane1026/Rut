@@ -5486,7 +5486,8 @@ TEST(buffered_forward, body_replacement_removes_stale_representation_metadata) {
         "HTTP/1.1 206 Partial Content\r\nContent-Length: 4\r\nContent-Encoding: gzip\r\n"
         "Content-Range: bytes 0-3/100\r\nDigest: sha-256=upstream\r\n"
         "Content-Digest: sha-256=:upstream:\r\nRepr-Digest: sha-256=:upstream:\r\n"
-        "Content-MD5: upstream\r\nContent-Type: application/json\r\nETag: \"upstream\"\r\n"
+        "Content-MD5: upstream\r\nContent-Language: fr\r\n"
+        "Content-Type: application/json\r\nETag: \"upstream\"\r\n"
         "Last-Modified: Sat, 25 Jul 2026 09:00:00 GMT\r\n\r\ndata";
     conn->upstream_recv_buf.reset();
     conn->upstream_recv_buf.write(reinterpret_cast<const u8*>(kUpstream), sizeof(kUpstream) - 1);
@@ -5503,6 +5504,7 @@ TEST(buffered_forward, body_replacement_removes_stale_representation_metadata) {
     CHECK(!buf_contains(wire, conn->send_buf.len(), "Content-Digest", 14));
     CHECK(!buf_contains(wire, conn->send_buf.len(), "Repr-Digest", 11));
     CHECK(!buf_contains(wire, conn->send_buf.len(), "Content-MD5", 11));
+    CHECK(!buf_contains(wire, conn->send_buf.len(), "Content-Language", 16));
     CHECK(!buf_contains(wire, conn->send_buf.len(), "application/json", 16));
     CHECK(buf_contains(wire,
                        conn->send_buf.len(),
@@ -6301,6 +6303,86 @@ TEST(buffered_forward, does_not_restore_connection_nominated_content_length) {
     }
 }
 
+TEST(buffered_forward, does_not_preserve_transfer_coded_content_length) {
+    static constexpr char kUpstream[] =
+        "HTTP/1.1 304 Not Modified\r\nTransfer-Encoding: chunked\r\n"
+        "Content-Length: 999\r\nConnection: close\r\n\r\n";
+
+    {
+        SmallLoop loop;
+        loop.setup();
+        auto* conn = setup_proxy_conn(loop);
+        REQUIRE(conn != nullptr);
+        conn->proxy_response_buffered = true;
+        conn->reset_jit_ctx();
+        conn->upstream_recv_buf.reset();
+        conn->upstream_recv_buf.write(reinterpret_cast<const u8*>(kUpstream),
+                                      sizeof(kUpstream) - 1);
+        on_upstream_response<SmallLoop>(
+            &loop,
+            *conn,
+            make_ev(conn->id, IoEventType::UpstreamRecv, static_cast<i32>(sizeof(kUpstream) - 1)));
+
+        const char* wire = reinterpret_cast<const char*>(conn->send_buf.data());
+        CHECK_EQ(conn->resp_status, 304u);
+        CHECK(!buf_contains(wire, conn->send_buf.len(), "Content-Length:", 15));
+    }
+
+    {
+        SmallLoop loop;
+        loop.setup();
+        loop.inject_and_dispatch(make_ev(0, IoEventType::Accept, 42));
+        auto* conn = loop.find_fd(42);
+        REQUIRE(conn != nullptr);
+        REQUIRE(loop.alloc_upstream_buf(*conn));
+        Http2Conn h2{};
+        h2.init();
+        h2.async_stream = 1;
+        h2.async_kind = H2AsyncKind::Proxy;
+        conn->h2 = &h2;
+        conn->protocol = ConnProtocol::Http2;
+        conn->state = ConnState::Proxying;
+        conn->upstream_fd = dup(2);
+        REQUIRE(conn->upstream_fd >= 0);
+        conn->upstream_recv_buf.write(reinterpret_cast<const u8*>(kUpstream),
+                                      sizeof(kUpstream) - 1);
+        loop.backend.clear_ops();
+        h2_on_upstream_response<SmallLoop>(
+            &loop,
+            *conn,
+            make_ev(conn->id, IoEventType::UpstreamRecv, static_cast<i32>(sizeof(kUpstream) - 1)));
+
+        const auto* send = loop.backend.last_op(MockOp::Send);
+        REQUIRE(send != nullptr);
+        Http2FrameHeader frame{};
+        REQUIRE(parse_frame_header(send->send_buf, send->send_len, &frame) ==
+                ParseStatus::Complete);
+        hpack::DynamicTable dyn;
+        dyn.init(4096);
+        hpack::Header headers[8];
+        u8 scratch[128];
+        u32 header_count = 0;
+        REQUIRE(hpack::decode_header_block(dyn,
+                                           send->send_buf + kFrameHeaderSize,
+                                           frame.length,
+                                           scratch,
+                                           sizeof(scratch),
+                                           headers,
+                                           static_cast<u32>(std::size(headers)),
+                                           &header_count));
+        bool found_status = false;
+        bool found_content_length = false;
+        for (u32 i = 0; i < header_count; i++) {
+            found_status |=
+                headers[i].name.eq(Str{":status", 7}) && headers[i].value.eq(Str{"304", 3});
+            found_content_length |= headers[i].name.eq(Str{"content-length", 14});
+        }
+        CHECK(found_status);
+        CHECK_FALSE(found_content_length);
+        conn->h2 = nullptr;
+    }
+}
+
 TEST(buffered_forward, head_ignores_invalid_content_length_mutation) {
     Connection conn;
     conn.reset();
@@ -6739,6 +6821,11 @@ TEST(buffered_forward, h2_deframing_and_body_replacement_strip_stale_metadata) {
         "Last-Modified: Sat, 25 Jul 2026 09:00:00 GMT\r\n\r\ndata";
     run(kLastModified, sizeof(kLastModified) - 1, true, "last-modified", 13);
 
+    static constexpr char kLanguage[] =
+        "HTTP/1.1 200 OK\r\nContent-Length: 4\r\nContent-Language: fr\r\n\r\ndata";
+    run(kLanguage, sizeof(kLanguage) - 1, true, "content-language", 16);
+    run(kLanguage, sizeof(kLanguage) - 1, true, "content-language", 16, true, true, "en", 2);
+
     static constexpr char kTyped[] =
         "HTTP/1.1 200 OK\r\nContent-Length: 4\r\nContent-Type: application/json\r\n\r\ndata";
     run(kTyped, sizeof(kTyped) - 1, true, "content-type", 12, false, true);
@@ -6958,6 +7045,28 @@ TEST(buffered_forward, rejects_empty_transfer_encoding) {
     CHECK_EQ(conn->on_send, &on_proxy_response_sent<SmallLoop>);
 }
 
+TEST(buffered_forward, rejects_malformed_transfer_encoding_on_interim_response) {
+    SmallLoop loop;
+    loop.setup();
+    auto* conn = setup_proxy_conn(loop);
+    REQUIRE(conn != nullptr);
+    conn->proxy_response_buffered = true;
+    conn->reset_jit_ctx();
+
+    static const char kUpstream[] =
+        "HTTP/1.1 103 Early Hints\r\nTransfer-Encoding: chunked=foo\r\n\r\n"
+        "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok";
+    conn->upstream_recv_buf.reset();
+    conn->upstream_recv_buf.write(reinterpret_cast<const u8*>(kUpstream), sizeof(kUpstream) - 1);
+    on_upstream_response<SmallLoop>(
+        &loop,
+        *conn,
+        make_ev(conn->id, IoEventType::UpstreamRecv, static_cast<i32>(sizeof(kUpstream) - 1)));
+
+    CHECK_EQ(conn->resp_status, 502u);
+    CHECK_EQ(conn->on_send, &on_proxy_response_sent<SmallLoop>);
+}
+
 TEST(buffered_forward, contaminated_bodyless_response_is_not_reused) {
     SmallLoop loop;
     loop.setup();
@@ -7060,6 +7169,7 @@ TEST(buffered_forward, clears_bytes_from_an_abandoned_upstream_wait) {
     resume(&loop, *conn, make_ev(conn->id, IoEventType::UpstreamRecv, -ECANCELED));
 
     CHECK_EQ(conn->on_upstream_recv_drained, nullptr);
+    CHECK_FALSE(conn->upstream_abandoned);
     CHECK_EQ(loop.backend.count_ops(MockOp::Connect), 1u);
 }
 
@@ -15839,6 +15949,9 @@ TEST(state_invariant, jit_forward_closes_prior_wait_connect_socket) {
     CHECK_EQ(c->upstream_fd, -1);
     CHECK_EQ(c->upstream_recv_armed, false);
     CHECK_EQ(c->upstream_send_armed, false);
+    CHECK(c->upstream_abandoned);
+    CHECK(c->h2_proxy_recv_draining);
+    CHECK(c->h2_proxy_synth_quarantined);
     REQUIRE(c->on_upstream_recv_drained != nullptr);
     CHECK_EQ(loop.backend.count_ops(MockOp::Connect), 0u);
 
@@ -15846,7 +15959,16 @@ TEST(state_invariant, jit_forward_closes_prior_wait_connect_socket) {
     c->h2_proxy_recv_draining = false;
     resume(&loop, *c, make_ev(c->id, IoEventType::UpstreamRecv, -ECANCELED));
 
+    CHECK(c->upstream_abandoned);
+    CHECK_EQ(c->on_upstream_recv_drained, resume);
+    CHECK_EQ(loop.backend.count_ops(MockOp::Connect), 0u);
+
+    c->h2_proxy_synth_quarantined = false;
+    resume(&loop, *c, make_ev(c->id, IoEventType::UpstreamSend, -ECANCELED));
+
     CHECK_EQ(c->upstream_fd, new_fds[0]);
+    CHECK_FALSE(c->upstream_abandoned);
+    CHECK_EQ(c->on_upstream_recv_drained, nullptr);
     CHECK_EQ(loop.backend.count_ops(MockOp::Connect), 1u);
 
     if (c->upstream_fd >= 0) {

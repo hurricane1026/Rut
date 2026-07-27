@@ -1221,7 +1221,6 @@ public:
                         // delivers the real bytes below) is untouched.
                         if (conn.h2_proxy_recv_draining) {
                             conn.h2_proxy_recv_draining = false;
-                            conn.on_upstream_recv_drained = nullptr;
                             conn.upstream_recv_buf.reset();
                         }
                         if (conn.pending_ops > 0) conn.pending_ops--;
@@ -1238,7 +1237,8 @@ public:
                             break;
                         }
                         if (!this->try_deferred_upstream_rearm(conn)) this->close_conn(conn);
-                        if (recv_drain_continuation && conn.fd >= 0)
+                        if (recv_drain_continuation && !conn.h2_proxy_synth_quarantined &&
+                            conn.fd >= 0)
                             recv_drain_continuation(&self(), conn, ev);
                         break;
                     }
@@ -1281,6 +1281,7 @@ public:
                         break;
                     }
                     // Async CQE accounting: decrement pending_ops on final CQE.
+                    decltype(conn.on_upstream_recv_drained) send_drain_continuation = nullptr;
                     if (!ev.more) {
                         if (conn.pending_ops > 0) conn.pending_ops--;
                         if (ev.type == IoEventType::Recv) conn.recv_armed = false;
@@ -1289,7 +1290,11 @@ public:
                             conn.upstream_send_armed = false;
                             // A torn-down h2-proxy episode's request send has now drained, so
                             // pending_synth is free again — lift the reuse quarantine.
-                            conn.h2_proxy_synth_quarantined = false;
+                            if (conn.h2_proxy_synth_quarantined) {
+                                conn.h2_proxy_synth_quarantined = false;
+                                if (!conn.h2_proxy_recv_draining)
+                                    send_drain_continuation = conn.on_upstream_recv_drained;
+                            }
                         }
                         if (ev.type == IoEventType::UpstreamRecv) {
                             const auto recv_drain_continuation = conn.h2_proxy_recv_draining
@@ -1311,7 +1316,6 @@ public:
                             // fall-through delivery is suppressed by the abandoned guard.
                             if (conn.h2_proxy_recv_draining) {
                                 conn.h2_proxy_recv_draining = false;
-                                conn.on_upstream_recv_drained = nullptr;
                                 conn.upstream_recv_buf.reset();
                             }
                             if (conn.fd < 0) {
@@ -1329,11 +1333,15 @@ public:
                                 this->close_conn(conn);
                                 break;
                             }
-                            if (recv_drain_continuation) {
+                            if (recv_drain_continuation && !conn.h2_proxy_synth_quarantined) {
                                 recv_drain_continuation(&self(), conn, ev);
                                 break;
                             }
                         }
+                    }
+                    if (send_drain_continuation && conn.fd >= 0) {
+                        send_drain_continuation(&self(), conn, ev);
+                        break;
                     }
                     const bool has_recv_slot =
                         conn.on_recv && (!conn.uses_iouring_tls() || conn.tls_pending_on_recv);

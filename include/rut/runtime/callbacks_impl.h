@@ -1565,8 +1565,11 @@ inline bool snapshot_buffered_response_mutation_views(Connection& conn) {
 
 template <typename Loop>
 void resume_h1_forward_after_upstream_recv_drain(void* lp, Connection& conn, IoEvent) {
-    if (conn.h2_proxy_recv_draining || conn.state != ConnState::Proxying) return;
+    if (conn.h2_proxy_recv_draining || conn.h2_proxy_synth_quarantined ||
+        conn.state != ConnState::Proxying)
+        return;
     conn.on_upstream_recv_drained = nullptr;
+    conn.upstream_abandoned = false;
     JitDispatchOutcome outcome{};
     outcome.kind = conn.proxy_response_buffered ? JitDispatchOutcome::Kind::ForwardBuffered
                                                 : JitDispatchOutcome::Kind::Forward;
@@ -1927,8 +1930,11 @@ void handle_jit_outcome(Loop* loop,
                     conn.upstream_fd = -1;
                     loop->clear_upstream_fd(conn.id);
                 }
+                const bool prior_send_armed = conn.upstream_send_armed;
                 if constexpr (requires { loop->discard_upstream_send(conn); })
                     loop->discard_upstream_send(conn);
+                else if (prior_send_armed)
+                    conn.h2_proxy_synth_quarantined = true;
                 conn.upstream_recv_armed = false;
                 conn.upstream_send_armed = false;
                 conn.upstream_idx = 0;
@@ -1949,12 +1955,13 @@ void handle_jit_outcome(Loop* loop,
                 conn.upstream_recv_buf.reset();
                 conn.upstream_keep_alive = false;
             }
-            if (conn.h2_proxy_recv_draining) {
+            if (conn.h2_proxy_recv_draining || conn.h2_proxy_synth_quarantined) {
                 conn.state = ConnState::Proxying;
                 conn.deferred_h1_forward_upstream_id = outcome.upstream_id;
                 conn.on_upstream_recv_drained = &resume_h1_forward_after_upstream_recv_drain<Loop>;
                 return;
             }
+            conn.upstream_abandoned = false;
             // Resolve upstream by id against the config pinned at
             // on_header_received. Reading loop->config_ptr here would
             // pick up a post-swap config whose upstream table doesn't
@@ -2725,6 +2732,7 @@ inline bool h2_drop_response_header(Str name) {
 
 inline bool body_replacement_invalidates_upstream_header(Str name) {
     return http_header_name_eq_ci(name.ptr, name.len, "content-encoding", 16) ||
+           http_header_name_eq_ci(name.ptr, name.len, "content-language", 16) ||
            http_header_name_eq_ci(name.ptr, name.len, "content-range", 13) ||
            http_header_name_eq_ci(name.ptr, name.len, "etag", 4) ||
            http_header_name_eq_ci(name.ptr, name.len, "last-modified", 13) ||
@@ -3099,7 +3107,9 @@ void h2_proxy_finish(Loop* loop,
                                  : resp.status_code;
     ResponseHeaderKV effective[kMaxEffectiveHeaders];
     u32 effective_count = 0;
-    bool upstream_content_length_retained = resp.has_content_length;
+    const bool upstream_content_length_eligible =
+        resp.has_content_length && !resp.chunked && !resp.unsupported_transfer_coding;
+    bool upstream_content_length_retained = upstream_content_length_eligible;
     for (u32 i = 0; i < resp.header_count && upstream_content_length_retained; i++) {
         if (http_header_name_eq_ci(
                 resp.headers[i].name.ptr, resp.headers[i].name.len, "connection", 10))
@@ -3138,8 +3148,6 @@ void h2_proxy_finish(Loop* loop,
                 nominated = h2_name_in_connection_tokens(resp.headers[j].value, kName);
         }
         if (nominated) continue;
-        if (http_header_name_eq_ci(kName.ptr, kName.len, "content-length", 14))
-            upstream_content_length_retained = true;
         effective[effective_count++] = {
             kName.ptr, kName.len, resp.headers[i].value.ptr, resp.headers[i].value.len};
     }
@@ -4995,7 +5003,9 @@ void finish_buffered_forward(Loop* loop,
         response_ctx->response_status_set ? response_ctx->response_status : resp.status_code;
     ResponseHeaderKV headers[kMaxEffectiveHeaders];
     u32 header_count = 0;
-    bool upstream_content_length_retained = resp.has_content_length;
+    const bool upstream_content_length_eligible =
+        resp.has_content_length && !resp.chunked && !resp.unsupported_transfer_coding;
+    bool upstream_content_length_retained = upstream_content_length_eligible;
     for (u32 i = 0; i < resp.header_count && upstream_content_length_retained; i++) {
         if (http_header_name_eq_ci(
                 resp.headers[i].name.ptr, resp.headers[i].name.len, "connection", 10))
@@ -5031,8 +5041,6 @@ void finish_buffered_forward(Loop* loop,
                 nominated = h2_name_in_connection_tokens(resp.headers[j].value, name);
         }
         if (nominated) continue;
-        if (http_header_name_eq_ci(name.ptr, name.len, "content-length", 14))
-            upstream_content_length_retained = true;
         if (header_count >= kMaxEffectiveHeaders) {
             buffered_forward_fail(loop, conn, 500);
             return;
@@ -5379,6 +5387,11 @@ void on_upstream_response(void* lp, Connection& conn, IoEvent ev) {
         return;
     }
     conn.resp_status = resp.status_code;
+
+    if (conn.proxy_response_buffered && resp.malformed_transfer_coding) {
+        buffered_forward_fail(loop, conn, 502);
+        return;
+    }
 
     if (conn.proxy_response_buffered && resp.status_code == 101) {
         on_buffered_upstream_response(loop, conn, ev, resp, resp_parser);
