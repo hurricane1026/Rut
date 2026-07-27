@@ -1332,6 +1332,24 @@ TEST(control_plane_mutation, every_successful_mark_advances_generation_scoped_ve
     CHECK_EQ(version, 3u);
 }
 
+TEST(control_plane_mutation, backend_override_snapshot_uses_one_table_version) {
+    ControlPlaneMutationPort port;
+    RouteConfig config;
+    REQUIRE(add_upstreams(&config, 1));
+    REQUIRE(config.add_upstream_backend(0, 0x7f000001u, 8100));
+    port.reset(9, false, &config);
+    REQUIRE(port.mark({9, 0, 0}, false));
+    REQUIRE(port.mark({9, 0, 1}, true));
+
+    ManualHealthOverride snapshot[UpstreamTarget::kMaxBackends]{};
+    u64 version = 0;
+    REQUIRE(port.manual_health_snapshot(9, 0, 2, snapshot, &version));
+    CHECK_EQ(version, 2u);
+    CHECK_EQ(snapshot[0], ManualHealthOverride::Unhealthy);
+    CHECK_EQ(snapshot[1], ManualHealthOverride::Healthy);
+    CHECK_FALSE(port.manual_health_snapshot(8, 0, 2, snapshot));
+}
+
 TEST(control_plane_mutation, manual_health_committed_fallback_preserves_bank_version) {
     ControlPlaneMutationPort port;
     RouteConfig config;
