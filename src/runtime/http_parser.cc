@@ -498,23 +498,38 @@ static inline ParseStatus apply_semantic_header_response(
         if (name_len == 17 && str_ci_eq(name + 1, "ransfer-encoding", 16)) {
             u32 ti = 0;
             bool saw_transfer_coding = false;
+            bool need_comma = false;
             while (ti < vlen) {
-                while (ti < vlen && (val[ti] == ' ' || val[ti] == '\t' || val[ti] == ',')) ti++;
+                while (ti < vlen && (val[ti] == ' ' || val[ti] == '\t')) ti++;
                 if (ti >= vlen) break;
+                if (val[ti] == ',') {
+                    if (!need_comma) resp->malformed_transfer_coding = true;
+                    need_comma = false;
+                    ti++;
+                    continue;
+                }
+                if (need_comma) resp->malformed_transfer_coding = true;
                 u32 tok_start = ti;
                 while (ti < vlen && val[ti] != ',' && val[ti] != ' ' && val[ti] != '\t') ti++;
                 u32 tok_len = ti - tok_start;
+                if (resp->chunked) resp->malformed_transfer_coding = true;
                 saw_transfer_coding = true;
                 if (tok_len == 7 && str_ci_eq(val + tok_start, "chunked", 7)) {
-                    if (resp->chunked)
+                    if (resp->chunked) {
                         resp->unsupported_transfer_coding = true;
-                    else
+                        resp->malformed_transfer_coding = true;
+                    } else {
                         resp->chunked = true;
+                    }
                 } else {
                     resp->unsupported_transfer_coding = true;
                 }
+                need_comma = true;
             }
-            if (!saw_transfer_coding) resp->unsupported_transfer_coding = true;
+            if (!saw_transfer_coding || !need_comma) {
+                resp->unsupported_transfer_coding = true;
+                resp->malformed_transfer_coding = true;
+            }
             return ParseStatus::Complete;
         }
     }

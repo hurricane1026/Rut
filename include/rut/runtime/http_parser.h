@@ -116,6 +116,7 @@ struct ParsedResponse {
     bool has_content_length;
     bool chunked;
     bool unsupported_transfer_coding;
+    bool malformed_transfer_coding;
     bool keep_alive;        // HTTP/1.1 default true, HTTP/1.0 default false
     bool connection_close;  // explicit Connection: close
     // True if the response carried more than kMaxHeaders header fields, so
@@ -133,6 +134,7 @@ struct ParsedResponse {
         has_content_length = false;
         chunked = false;
         unsupported_transfer_coding = false;
+        malformed_transfer_coding = false;
         keep_alive = true;  // HTTP/1.1 default
         connection_close = false;
         headers_truncated = false;

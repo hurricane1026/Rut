@@ -3308,6 +3308,10 @@ void h2_on_upstream_response(void* lp, Connection& conn, IoEvent ev) {
     const bool response_has_no_body = kHeadReq || resp.status_code < 200 ||
                                       resp.status_code == 204 || resp.status_code == 205 ||
                                       resp.status_code == 304;
+    if (resp.malformed_transfer_coding) {
+        h2_proxy_fail(loop, conn, 502);
+        return;
+    }
     if (resp.unsupported_transfer_coding && !response_has_no_body) {
         h2_proxy_fail(loop, conn, 502);
         return;
@@ -5139,6 +5143,10 @@ void on_buffered_upstream_response(Loop* loop,
     const bool response_has_no_body = is_head || resp.status_code < 200 ||
                                       resp.status_code == 204 || resp.status_code == 205 ||
                                       resp.status_code == 304;
+    if (resp.malformed_transfer_coding) {
+        buffered_forward_fail(loop, conn, 502);
+        return;
+    }
     if (resp.unsupported_transfer_coding && !response_has_no_body) {
         buffered_forward_fail(loop, conn, 502);
         return;
@@ -5310,12 +5318,12 @@ void on_upstream_response(void* lp, Connection& conn, IoEvent ev) {
     ParseStatus ps =
         resp_parser.parse(conn.upstream_recv_buf.data(), conn.upstream_recv_buf.len(), &resp);
     if (ps == ParseStatus::Incomplete) {
-        if (ev.result <= 0)
+        if (ev.result <= 0 || conn.upstream_recv_buf.write_avail() == 0)
             ps = ParseStatus::Error;
         else {
-            loop->submit_recv_upstream(conn);
-            return;
+            if (!loop->submit_recv_upstream(conn)) ps = ParseStatus::Error;
         }
+        if (ps == ParseStatus::Incomplete) return;
     }
     if (ps == ParseStatus::Error) {
         if (conn.proxy_response_buffered) {

@@ -6131,8 +6131,8 @@ TEST(buffered_forward, body_replacement_rejects_inherited_multipart_206) {
     CHECK_EQ(conn->resp_status, 500u);
 }
 
-TEST(buffered_forward, bodyless_head_and_304_allow_unsupported_transfer_coding) {
-    const auto run = [&](bool head) {
+TEST(buffered_forward, bodyless_head_and_304_distinguish_unsupported_and_malformed_codings) {
+    const auto run = [&](bool head, bool malformed) {
         SmallLoop loop;
         loop.setup();
         auto* conn = head ? setup_proxy_conn_head(loop) : setup_proxy_conn(loop);
@@ -6143,18 +6143,27 @@ TEST(buffered_forward, bodyless_head_and_304_allow_unsupported_transfer_coding) 
             "HTTP/1.1 200 OK\r\nTransfer-Encoding: gzip, chunked\r\n\r\n";
         static constexpr char kNotModified[] =
             "HTTP/1.1 304 Not Modified\r\nTransfer-Encoding: gzip, chunked\r\n\r\n";
-        const char* upstream = head ? kHead : kNotModified;
-        const u32 upstream_len = head ? sizeof(kHead) - 1 : sizeof(kNotModified) - 1;
+        static constexpr char kMalformedHead[] =
+            "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked, chunked\r\n\r\n";
+        static constexpr char kMalformedNotModified[] =
+            "HTTP/1.1 304 Not Modified\r\nTransfer-Encoding:\r\n\r\n";
+        const char* upstream = malformed ? (head ? kMalformedHead : kMalformedNotModified)
+                                         : (head ? kHead : kNotModified);
+        const u32 upstream_len =
+            malformed ? (head ? sizeof(kMalformedHead) - 1 : sizeof(kMalformedNotModified) - 1)
+                      : (head ? sizeof(kHead) - 1 : sizeof(kNotModified) - 1);
         conn->upstream_recv_buf.reset();
         conn->upstream_recv_buf.write(reinterpret_cast<const u8*>(upstream), upstream_len);
         on_upstream_response<SmallLoop>(
             &loop,
             *conn,
             make_ev(conn->id, IoEventType::UpstreamRecv, static_cast<i32>(upstream_len)));
-        CHECK_EQ(conn->resp_status, head ? 200u : 304u);
+        CHECK_EQ(conn->resp_status, malformed ? 502u : (head ? 200u : 304u));
     };
-    run(true);
-    run(false);
+    run(true, false);
+    run(false, false);
+    run(true, true);
+    run(false, true);
 }
 
 TEST(buffered_forward, body_replacement_preserves_unsatisfied_content_range) {
@@ -6449,8 +6458,8 @@ TEST(buffered_forward, h2_validates_head_ranges_and_replaced_multipart_bodies) {
     run(kAmbiguousPartial, sizeof(kAmbiguousPartial) - 1, 4, false, false, 500, 206);
 }
 
-TEST(buffered_forward, h2_bodyless_head_and_304_allow_unsupported_transfer_coding) {
-    const auto run = [&](bool head) {
+TEST(buffered_forward, h2_bodyless_responses_distinguish_unsupported_and_malformed_codings) {
+    const auto run = [&](bool head, bool malformed) {
         SmallLoop loop;
         loop.setup();
         loop.inject_and_dispatch(make_ev(0, IoEventType::Accept, 42));
@@ -6476,8 +6485,15 @@ TEST(buffered_forward, h2_bodyless_head_and_304_allow_unsupported_transfer_codin
             "HTTP/1.1 200 OK\r\nTransfer-Encoding: gzip, chunked\r\n\r\n";
         static constexpr char kNotModified[] =
             "HTTP/1.1 304 Not Modified\r\nTransfer-Encoding: gzip, chunked\r\n\r\n";
-        const char* upstream = head ? kHead : kNotModified;
-        const u32 upstream_len = head ? sizeof(kHead) - 1 : sizeof(kNotModified) - 1;
+        static constexpr char kMalformedHead[] =
+            "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked, chunked\r\n\r\n";
+        static constexpr char kMalformedNotModified[] =
+            "HTTP/1.1 304 Not Modified\r\nTransfer-Encoding:\r\n\r\n";
+        const char* upstream = malformed ? (head ? kMalformedHead : kMalformedNotModified)
+                                         : (head ? kHead : kNotModified);
+        const u32 upstream_len =
+            malformed ? (head ? sizeof(kMalformedHead) - 1 : sizeof(kMalformedNotModified) - 1)
+                      : (head ? sizeof(kHead) - 1 : sizeof(kNotModified) - 1);
         conn->upstream_recv_buf.write(reinterpret_cast<const u8*>(upstream), upstream_len);
         loop.backend.clear_ops();
         h2_on_upstream_response<SmallLoop>(
@@ -6504,15 +6520,17 @@ TEST(buffered_forward, h2_bodyless_head_and_304_allow_unsupported_transfer_codin
                                            16,
                                            &header_count));
         bool found_status = false;
-        const Str expected = head ? Str{"200", 3} : Str{"304", 3};
+        const Str expected = malformed ? Str{"502", 3} : head ? Str{"200", 3} : Str{"304", 3};
         for (u32 i = 0; i < header_count; i++)
             found_status |= headers[i].name.eq(Str{":status", 7}) && headers[i].value.eq(expected);
         CHECK(found_status);
         conn->h2 = nullptr;
     };
 
-    run(true);
-    run(false);
+    run(true, false);
+    run(false, false);
+    run(true, true);
+    run(false, true);
 }
 
 TEST(buffered_forward, h2_deframing_and_body_replacement_strip_stale_metadata) {
@@ -14623,6 +14641,38 @@ TEST(buffered_forward, malformed_upstream_response_uses_buffered_teardown) {
     CHECK_EQ(c->on_send, &on_proxy_response_sent<SmallLoop>);
     loop.inject_and_dispatch(make_ev(c->id, IoEventType::UpstreamRecv, -ENOBUFS));
     CHECK_EQ(c->on_send, &on_proxy_response_sent<SmallLoop>);
+}
+
+TEST(buffered_forward, incomplete_headers_fail_when_full_or_recv_cannot_be_submitted) {
+    const auto run = [&](bool fill_buffer) {
+        SmallLoop loop;
+        loop.setup();
+        auto* c = setup_proxy_conn(loop);
+        REQUIRE(c != nullptr);
+        c->proxy_response_buffered = true;
+        c->reset_jit_ctx();
+        static constexpr char kPrefix[] = "HTTP/1.1 200 OK\r\nX-Incomplete: ";
+        c->upstream_recv_buf.reset();
+        c->upstream_recv_buf.write(reinterpret_cast<const u8*>(kPrefix), sizeof(kPrefix) - 1);
+        if (fill_buffer) {
+            const u32 remaining = c->upstream_recv_buf.write_avail();
+            __builtin_memset(c->upstream_recv_buf.write_ptr(), 'a', remaining);
+            c->upstream_recv_buf.commit(remaining);
+        } else {
+            loop.backend.fail_upstream_recv = true;
+        }
+
+        on_upstream_response<SmallLoop>(
+            &loop,
+            *c,
+            make_ev(
+                c->id, IoEventType::UpstreamRecv, static_cast<i32>(c->upstream_recv_buf.len())));
+
+        CHECK_EQ(c->resp_status, 502u);
+        CHECK_EQ(c->on_send, &on_proxy_response_sent<SmallLoop>);
+    };
+    run(true);
+    run(false);
 }
 
 TEST(buffered_forward, unchanged_serialization_overflow_returns_bad_gateway) {

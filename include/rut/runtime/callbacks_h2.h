@@ -341,6 +341,65 @@ inline bool h2_inject_content_length(u8* buf, u32* len, u32 body_start, u32 body
     return true;
 }
 
+inline bool h2_snapshot_buffered_response_mutation_views(jit::HandlerCtx* ctx,
+                                                         const u8* synth,
+                                                         u32 synth_len) {
+    if (ctx == nullptr) return false;
+    const u32 count = ctx->response_header_pending_count > ctx->response_header_count
+                          ? ctx->response_header_pending_count
+                          : ctx->response_header_count;
+    if (count > jit::kMaxResponseHeaderMutations) return false;
+    const auto begin = reinterpret_cast<uintptr_t>(synth);
+    auto snapshot = [&](Str& view) {
+        if (view.ptr == nullptr || view.len == 0) return true;
+        const auto ptr = reinterpret_cast<uintptr_t>(view.ptr);
+        if (ptr < begin || ptr - begin > synth_len || view.len > synth_len - (ptr - begin))
+            return true;
+        const char* stable = jit::snapshot_response_body(ctx, view.ptr, view.len);
+        if (stable == nullptr) return false;
+        view.ptr = stable;
+        return true;
+    };
+    for (u32 i = 0; i < count; i++) {
+        auto& mutation = ctx->response_header_mutations[i];
+        if (!snapshot(mutation.name) || !snapshot(mutation.value)) return false;
+    }
+    return true;
+}
+
+// HTTP/2 permits only `te: trailers`, but forwarding that field through the
+// synthesized HTTP/1 request would require a matching `Connection: TE` option.
+// Buffered forwarding consumes response trailers rather than relaying them, so
+// remove every TE line after the handler has inspected the original request and
+// before the synthesized bytes are sent upstream.
+inline bool h2_strip_synth_te(u8* buf, u32* len, u32* body_start) {
+    u32 pos = 0;
+    while (pos + 1 < *len && !(buf[pos] == '\r' && buf[pos + 1] == '\n')) pos++;
+    if (pos + 1 >= *len) return false;
+    pos += 2;
+    while (pos + 1 < *len) {
+        if (buf[pos] == '\r' && buf[pos + 1] == '\n') return true;
+        u32 line_end = pos;
+        while (line_end + 1 < *len && !(buf[line_end] == '\r' && buf[line_end + 1] == '\n'))
+            line_end++;
+        if (line_end + 1 >= *len) return false;
+        u32 colon = pos;
+        while (colon < line_end && buf[colon] != ':') colon++;
+        if (colon == line_end) return false;
+        if (http_header_name_eq_ci(
+                reinterpret_cast<const char*>(buf + pos), colon - pos, "te", 2)) {
+            const u32 remove_end = line_end + 2;
+            const u32 remove_len = remove_end - pos;
+            __builtin_memmove(buf + pos, buf + remove_end, *len - remove_end);
+            *len -= remove_len;
+            if (*body_start >= remove_end) *body_start -= remove_len;
+            continue;
+        }
+        pos = line_end + 2;
+    }
+    return false;
+}
+
 template <typename Loop>
 bool h2_defer_until_data_end(H2Dispatch<Loop>& d,
                              u32 stream_id,
@@ -845,10 +904,17 @@ void h2_invoke_emit(H2Dispatch<Loop>& d,
             return;
         }
         u32 forward_len = synth_len;
+        u32 forward_body_start = body_start;
+        if (!h2_snapshot_buffered_response_mutation_views(ctx, synth, synth_len) ||
+            !h2_strip_synth_te(const_cast<u8*>(synth), &forward_len, &forward_body_start)) {
+            jit::release_response_body_mutation_storage(ctx);
+            h2_emit_status(d, stream_id, 500);
+            return;
+        }
         if (inject_content_length_on_forward &&
             !h2_inject_content_length(const_cast<u8*>(synth),
                                       &forward_len,
-                                      body_start,
+                                      forward_body_start,
                                       body_len,
                                       Http2Conn::kBodySynthCap)) {
             jit::release_response_body_mutation_storage(ctx);
@@ -909,6 +975,15 @@ void h2_finish_body(H2Dispatch<Loop>& d, u32 stream_id) {
             const u16 status = route == nullptr ? 500 : 400;
             h2_clear_pending(*h2);
             h2_emit_status(d, stream_id, status);
+            return;
+        }
+        if (!preinvoked_timer &&
+            (!h2_snapshot_buffered_response_mutation_views(
+                 h2->async_jit_ctx(), h2->pending_synth, h2->pending_synth_len) ||
+             !h2_strip_synth_te(
+                 h2->pending_synth, &h2->pending_synth_len, &h2->pending_body_start))) {
+            h2_clear_pending(*h2);
+            h2_emit_status(d, stream_id, 500);
             return;
         }
         if (!preinvoked_timer && !h2->pending_has_content_length &&
@@ -1674,15 +1749,19 @@ void h2_resume_jit_handler(Loop* loop, Connection& conn) {
     }
     if (kOutcome.kind == JitDispatchOutcome::Kind::ForwardBuffered &&
         h2->async_request_forwardable) {
-        if (h2->async_inject_content_length_on_forward &&
-            !h2_inject_content_length(h2->pending_synth,
-                                      &h2->async_synth_len,
-                                      h2->async_body_start,
-                                      h2->async_body_len,
-                                      Http2Conn::kBodySynthCap)) {
+        const bool synth_ok =
+            h2_snapshot_buffered_response_mutation_views(
+                ctx, h2->pending_synth, h2->async_synth_len) &&
+            h2_strip_synth_te(h2->pending_synth, &h2->async_synth_len, &h2->async_body_start);
+        if (!synth_ok || (h2->async_inject_content_length_on_forward &&
+                          !h2_inject_content_length(h2->pending_synth,
+                                                    &h2->async_synth_len,
+                                                    h2->async_body_start,
+                                                    h2->async_body_len,
+                                                    Http2Conn::kBodySynthCap))) {
             u8 resp[8192];
             H2Dispatch<Loop> d{loop, &conn, resp, sizeof(resp), 0, false};
-            h2_emit_status(d, kStreamId, 413);
+            h2_emit_status(d, kStreamId, synth_ok ? 413 : 500);
             conn.pending_handler_fn = nullptr;
             conn.handler_ctx = nullptr;
             h2_clear_async(*h2);

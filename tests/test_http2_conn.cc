@@ -1584,8 +1584,17 @@ u64 h2_status_204(void*, jit::HandlerCtx*, const u8*, u32, void*) {
 }
 
 u32 h2_buffered_forward_calls = 0;
-u64 h2_buffered_forward(void*, jit::HandlerCtx*, const u8*, u32, void*) {
+bool h2_buffered_forward_saw_te = false;
+u64 h2_buffered_forward(void*, jit::HandlerCtx*, const u8* req, u32 len, void*) {
     h2_buffered_forward_calls++;
+    h2_buffered_forward_saw_te = false;
+    static constexpr char kNeedle[] = "\r\nte: trailers\r\n";
+    for (u32 i = 0; i + sizeof(kNeedle) - 1 <= len; i++) {
+        bool match = true;
+        for (u32 j = 0; j < sizeof(kNeedle) - 1; j++)
+            match &= req[i + j] == static_cast<u8>(kNeedle[j]);
+        h2_buffered_forward_saw_te |= match;
+    }
     return jit::HandlerResult::make_buffered_forward(0).pack();
 }
 
@@ -1644,7 +1653,8 @@ TEST(h2_serving, selected_buffered_forward_defers_and_buffers_data) {
     const hpack::Header headers[] = {{{":method", 7}, {"POST", 4}},
                                      {{":path", 5}, {"/upload", 7}},
                                      {{":scheme", 7}, {"https", 5}},
-                                     {{":authority", 10}, {"example", 7}}};
+                                     {{":authority", 10}, {"example", 7}},
+                                     {{"te", 2}, {"trailers", 8}}};
     Http2Conn h2;
     h2.init();
     Connection conn;
@@ -1658,11 +1668,13 @@ TEST(h2_serving, selected_buffered_forward_defers_and_buffers_data) {
     H2Dispatch<FakeH2Loop> dispatch{&loop, &conn, response, sizeof(response), 0, false};
 
     h2_buffered_forward_calls = 0;
-    h2_dispatch_request(dispatch, 1, headers, 4, /*end_stream=*/false);
+    h2_buffered_forward_saw_te = false;
+    h2_dispatch_request(dispatch, 1, headers, 5, /*end_stream=*/false);
     CHECK_EQ(h2.pending_stream, 1u);
     CHECK(h2.pending_buffer_body);
     CHECK(h2.pending_preinvoked_forward);
     CHECK_EQ(h2_buffered_forward_calls, 1u);
+    CHECK(h2_buffered_forward_saw_te);
     CHECK_EQ(dispatch.resp_len, 0u);
 
     static const u8 kBody[] = {'a', 'b', 'c'};
@@ -1672,6 +1684,50 @@ TEST(h2_serving, selected_buffered_forward_defers_and_buffers_data) {
     CHECK_EQ(h2.async_stream, 1u);
     CHECK_EQ(h2.async_kind, H2AsyncKind::Proxy);
     CHECK(h2.async_apply_response_mutations);
+    bool forwarded_te = false;
+    static constexpr char kTeNeedle[] = "\r\nte:";
+    for (u32 i = 0; i + sizeof(kTeNeedle) - 1 <= h2.async_synth_len; i++) {
+        bool match = true;
+        for (u32 j = 0; j < sizeof(kTeNeedle) - 1; j++)
+            match &= h2.pending_synth[i + j] == static_cast<u8>(kTeNeedle[j]);
+        forwarded_te |= match;
+    }
+    CHECK_FALSE(forwarded_te);
+    h2_clear_async(h2);
+}
+
+TEST(h2_serving, ended_buffered_forward_strips_te_after_handler_observes_it) {
+    const hpack::Header headers[] = {{{":method", 7}, {"POST", 4}},
+                                     {{":path", 5}, {"/upload", 7}},
+                                     {{":scheme", 7}, {"https", 5}},
+                                     {{":authority", 10}, {"example", 7}},
+                                     {{"te", 2}, {"trailers", 8}}};
+    Http2Conn h2;
+    h2.init();
+    Connection conn;
+    conn.reset();
+    conn.h2 = &h2;
+    RouteConfig config;
+    REQUIRE(config.add_jit_handler("/upload", kRouteMethodPost, &h2_buffered_forward, false, true));
+    conn.request_config = &config;
+    FakeH2Loop loop;
+    u8 response[512]{};
+    H2Dispatch<FakeH2Loop> dispatch{&loop, &conn, response, sizeof(response), 0, false};
+
+    h2_buffered_forward_saw_te = false;
+    h2_dispatch_request(dispatch, 1, headers, 5, /*end_stream=*/true);
+
+    CHECK(h2_buffered_forward_saw_te);
+    CHECK_EQ(h2.async_kind, H2AsyncKind::Proxy);
+    bool forwarded_te = false;
+    static constexpr char kTeNeedle[] = "\r\nte:";
+    for (u32 i = 0; i + sizeof(kTeNeedle) - 1 <= h2.async_synth_len; i++) {
+        bool match = true;
+        for (u32 j = 0; j < sizeof(kTeNeedle) - 1; j++)
+            match &= h2.pending_synth[i + j] == static_cast<u8>(kTeNeedle[j]);
+        forwarded_te |= match;
+    }
+    CHECK_FALSE(forwarded_te);
     h2_clear_async(h2);
 }
 
