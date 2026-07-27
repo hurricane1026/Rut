@@ -1203,6 +1203,8 @@ public:
                         break;
                     }
                     if (ev.type == IoEventType::UpstreamRecv && ev.result == -ECANCELED) {
+                        const auto recv_drain_continuation =
+                            conn.h2_proxy_recv_draining ? conn.on_upstream_recv_drained : nullptr;
                         // The recv was cancelled (cancel won the race). Don't clear
                         // cancel_pending or re-arm here — the cancel's own CQE owns that,
                         // and may not have drained yet. Account the recv and mark its
@@ -1219,6 +1221,7 @@ public:
                         // delivers the real bytes below) is untouched.
                         if (conn.h2_proxy_recv_draining) {
                             conn.h2_proxy_recv_draining = false;
+                            conn.on_upstream_recv_drained = nullptr;
                             conn.upstream_recv_buf.reset();
                         }
                         if (conn.pending_ops > 0) conn.pending_ops--;
@@ -1235,6 +1238,8 @@ public:
                             break;
                         }
                         if (!this->try_deferred_upstream_rearm(conn)) this->close_conn(conn);
+                        if (recv_drain_continuation && conn.fd >= 0)
+                            recv_drain_continuation(&self(), conn, ev);
                         break;
                     }
                     // Stale post-body recv data/terminal. A body-done pause cancelled this
@@ -1287,6 +1292,9 @@ public:
                             conn.h2_proxy_synth_quarantined = false;
                         }
                         if (ev.type == IoEventType::UpstreamRecv) {
+                            const auto recv_drain_continuation = conn.h2_proxy_recv_draining
+                                                                     ? conn.on_upstream_recv_drained
+                                                                     : nullptr;
                             // Recv ended normally and is NOT stale (the stale case is handled
                             // and dropped above). If a pause cancel lost the race its own CQE
                             // still clears cancel_pending and owns the re-arm; here just
@@ -1303,6 +1311,7 @@ public:
                             // fall-through delivery is suppressed by the abandoned guard.
                             if (conn.h2_proxy_recv_draining) {
                                 conn.h2_proxy_recv_draining = false;
+                                conn.on_upstream_recv_drained = nullptr;
                                 conn.upstream_recv_buf.reset();
                             }
                             if (conn.fd < 0) {
@@ -1318,6 +1327,10 @@ public:
                             }
                             if (!this->try_deferred_upstream_rearm(conn)) {
                                 this->close_conn(conn);
+                                break;
+                            }
+                            if (recv_drain_continuation) {
+                                recv_drain_continuation(&self(), conn, ev);
                                 break;
                             }
                         }

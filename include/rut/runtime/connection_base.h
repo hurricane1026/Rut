@@ -176,6 +176,12 @@ struct ConnectionBase {
     // or the stale CQE would be misrouted to the new stream. Cleared when the
     // terminal is accounted in dispatch.
     bool h2_proxy_recv_draining;
+    // Optional continuation to run once h2_proxy_recv_draining clears. H1 uses
+    // this when a resumed handler replaces a still-draining upstream episode:
+    // starting the new connect/send/recv sequence before the old terminal CQE
+    // arrives would let that CQE target the replacement episode's callback.
+    Callback on_upstream_recv_drained;
+    u32 deferred_h1_forward_upstream_id;
     // h2_proxy_synth_quarantined: an upstream request send was still in flight when
     // an h2 proxy episode was torn down (timeout). The send SQE still sources
     // pending_synth, so a subsequent request must not overwrite it until that send
@@ -585,6 +591,8 @@ struct ConnectionBase {
         close_after_idle_return = false;
         is_health_probe = false;
         h2_proxy_recv_draining = false;
+        on_upstream_recv_drained = nullptr;
+        deferred_h1_forward_upstream_id = 0;
         h2_proxy_synth_quarantined = false;
         req_path_overridden = false;
         req_path_override = {nullptr, 0};

@@ -1899,12 +1899,13 @@ TEST(h2_serving, ended_buffered_forward_rejects_nonzero_declared_length) {
     CHECK(decoded[0].value.eq({"400", 3}));
 }
 
-TEST(h2_serving, buffered_forward_route_acknowledges_declared_expect_continue) {
+TEST(h2_serving, buffered_forward_route_acknowledges_ows_wrapped_expect_continue) {
+    static constexpr char kExpect[] = " \t100-continue \t";
     const hpack::Header headers[] = {{{":method", 7}, {"POST", 4}},
                                      {{":path", 5}, {"/upload", 7}},
                                      {{":scheme", 7}, {"https", 5}},
                                      {{":authority", 10}, {"example", 7}},
-                                     {{"expect", 6}, {"100-continue", 12}},
+                                     {{"expect", 6}, {kExpect, sizeof(kExpect) - 1}},
                                      {{"content-length", 14}, {"3", 1}}};
     Http2Conn h2;
     h2.init();

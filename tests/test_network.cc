@@ -6225,6 +6225,82 @@ TEST(buffered_forward, preserves_upstream_content_length_on_304) {
     CHECK(buf_contains(wire, wire_len, "\r\n\r\n", 4));
 }
 
+TEST(buffered_forward, does_not_restore_connection_nominated_content_length) {
+    static constexpr char kUpstream[] =
+        "HTTP/1.1 304 Not Modified\r\nContent-Length: 123\r\n"
+        "Connection: Content-Length, close\r\n\r\n";
+
+    {
+        SmallLoop loop;
+        loop.setup();
+        auto* conn = setup_proxy_conn(loop);
+        REQUIRE(conn != nullptr);
+        conn->proxy_response_buffered = true;
+        conn->reset_jit_ctx();
+        conn->upstream_recv_buf.reset();
+        conn->upstream_recv_buf.write(reinterpret_cast<const u8*>(kUpstream),
+                                      sizeof(kUpstream) - 1);
+        on_upstream_response<SmallLoop>(
+            &loop,
+            *conn,
+            make_ev(conn->id, IoEventType::UpstreamRecv, static_cast<i32>(sizeof(kUpstream) - 1)));
+
+        const char* wire = reinterpret_cast<const char*>(conn->send_buf.data());
+        CHECK(!buf_contains(wire, conn->send_buf.len(), "Content-Length:", 15));
+    }
+
+    {
+        SmallLoop loop;
+        loop.setup();
+        loop.inject_and_dispatch(make_ev(0, IoEventType::Accept, 42));
+        auto* conn = loop.find_fd(42);
+        REQUIRE(conn != nullptr);
+        REQUIRE(loop.alloc_upstream_buf(*conn));
+        Http2Conn h2{};
+        h2.init();
+        h2.async_stream = 1;
+        h2.async_kind = H2AsyncKind::Proxy;
+        conn->h2 = &h2;
+        conn->protocol = ConnProtocol::Http2;
+        conn->state = ConnState::Proxying;
+        conn->upstream_fd = dup(2);
+        REQUIRE(conn->upstream_fd >= 0);
+        conn->upstream_recv_buf.write(reinterpret_cast<const u8*>(kUpstream),
+                                      sizeof(kUpstream) - 1);
+        HttpResponseParser parser;
+        ParsedResponse resp{};
+        REQUIRE(parser.parse(conn->upstream_recv_buf.data(),
+                             conn->upstream_recv_buf.len(),
+                             &resp) == ParseStatus::Complete);
+        loop.backend.clear_ops();
+        h2_proxy_finish(&loop, *conn, resp, parser.header_end, 0, false);
+
+        const auto* send = loop.backend.last_op(MockOp::Send);
+        REQUIRE(send != nullptr);
+        Http2FrameHeader frame{};
+        REQUIRE(parse_frame_header(send->send_buf, send->send_len, &frame) ==
+                ParseStatus::Complete);
+        hpack::DynamicTable dyn;
+        dyn.init(4096);
+        hpack::Header headers[8];
+        u8 scratch[128];
+        u32 header_count = 0;
+        REQUIRE(hpack::decode_header_block(dyn,
+                                           send->send_buf + kFrameHeaderSize,
+                                           frame.length,
+                                           scratch,
+                                           sizeof(scratch),
+                                           headers,
+                                           static_cast<u32>(std::size(headers)),
+                                           &header_count));
+        bool found_content_length = false;
+        for (u32 i = 0; i < header_count; i++)
+            found_content_length |= headers[i].name.eq(Str{"content-length", 14});
+        CHECK_FALSE(found_content_length);
+        conn->h2 = nullptr;
+    }
+}
+
 TEST(buffered_forward, head_ignores_invalid_content_length_mutation) {
     Connection conn;
     conn.reset();
@@ -6976,6 +7052,15 @@ TEST(buffered_forward, clears_bytes_from_an_abandoned_upstream_wait) {
     CHECK(conn->upstream_abandoned);
     CHECK(conn->h2_proxy_recv_draining);
     CHECK_EQ(conn->on_upstream_recv, nullptr);
+    REQUIRE(conn->on_upstream_recv_drained != nullptr);
+    CHECK_EQ(loop.backend.count_ops(MockOp::Connect), 0u);
+
+    const auto resume = conn->on_upstream_recv_drained;
+    conn->h2_proxy_recv_draining = false;
+    resume(&loop, *conn, make_ev(conn->id, IoEventType::UpstreamRecv, -ECANCELED));
+
+    CHECK_EQ(conn->on_upstream_recv_drained, nullptr);
+    CHECK_EQ(loop.backend.count_ops(MockOp::Connect), 1u);
 }
 
 TEST(buffered_forward, snapshot_failure_abandons_prior_upstream_wait) {
@@ -15751,9 +15836,17 @@ TEST(state_invariant, jit_forward_closes_prior_wait_connect_socket) {
 
     CHECK_EQ(fcntl(old_fds[1], F_GETFD), -1);
     CHECK_EQ(errno, EBADF);
-    CHECK_EQ(c->upstream_fd, new_fds[0]);
+    CHECK_EQ(c->upstream_fd, -1);
     CHECK_EQ(c->upstream_recv_armed, false);
     CHECK_EQ(c->upstream_send_armed, false);
+    REQUIRE(c->on_upstream_recv_drained != nullptr);
+    CHECK_EQ(loop.backend.count_ops(MockOp::Connect), 0u);
+
+    const auto resume = c->on_upstream_recv_drained;
+    c->h2_proxy_recv_draining = false;
+    resume(&loop, *c, make_ev(c->id, IoEventType::UpstreamRecv, -ECANCELED));
+
+    CHECK_EQ(c->upstream_fd, new_fds[0]);
     CHECK_EQ(loop.backend.count_ops(MockOp::Connect), 1u);
 
     if (c->upstream_fd >= 0) {

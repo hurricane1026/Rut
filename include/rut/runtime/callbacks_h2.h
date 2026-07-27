@@ -158,10 +158,19 @@ void h2_emit_continue(H2Dispatch<Loop>& d, u32 stream_id) {
 }
 
 inline bool h2_expects_continue(const hpack::Header* headers, u32 nheaders) {
-    for (u32 i = 0; i < nheaders; i++)
-        if (headers[i].name.eq(Str{"expect", 6}) &&
-            http_header_name_eq_ci(headers[i].value.ptr, headers[i].value.len, "100-continue", 12))
+    for (u32 i = 0; i < nheaders; i++) {
+        if (!headers[i].name.eq(Str{"expect", 6})) continue;
+        u32 start = 0;
+        u32 end = headers[i].value.len;
+        while (start < end &&
+               (headers[i].value.ptr[start] == ' ' || headers[i].value.ptr[start] == '\t'))
+            start++;
+        while (end > start &&
+               (headers[i].value.ptr[end - 1] == ' ' || headers[i].value.ptr[end - 1] == '\t'))
+            end--;
+        if (http_header_name_eq_ci(headers[i].value.ptr + start, end - start, "100-continue", 12))
             return true;
+    }
     return false;
 }
 

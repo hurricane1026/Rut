@@ -1564,6 +1564,17 @@ inline bool snapshot_buffered_response_mutation_views(Connection& conn) {
 }
 
 template <typename Loop>
+void resume_h1_forward_after_upstream_recv_drain(void* lp, Connection& conn, IoEvent) {
+    if (conn.h2_proxy_recv_draining || conn.state != ConnState::Proxying) return;
+    conn.on_upstream_recv_drained = nullptr;
+    JitDispatchOutcome outcome{};
+    outcome.kind = conn.proxy_response_buffered ? JitDispatchOutcome::Kind::ForwardBuffered
+                                                : JitDispatchOutcome::Kind::Forward;
+    outcome.upstream_id = conn.deferred_h1_forward_upstream_id;
+    handle_jit_outcome(static_cast<Loop*>(lp), conn, outcome, /*fn=*/nullptr, conn.keep_alive);
+}
+
+template <typename Loop>
 void handle_jit_outcome(Loop* loop,
                         Connection& conn,
                         const JitDispatchOutcome& outcome,
@@ -1937,6 +1948,12 @@ void handle_jit_outcome(Loop* loop,
                 // upstream selected by this terminal forward.
                 conn.upstream_recv_buf.reset();
                 conn.upstream_keep_alive = false;
+            }
+            if (conn.h2_proxy_recv_draining) {
+                conn.state = ConnState::Proxying;
+                conn.deferred_h1_forward_upstream_id = outcome.upstream_id;
+                conn.on_upstream_recv_drained = &resume_h1_forward_after_upstream_recv_drain<Loop>;
+                return;
             }
             // Resolve upstream by id against the config pinned at
             // on_header_received. Reading loop->config_ptr here would
@@ -3082,6 +3099,13 @@ void h2_proxy_finish(Loop* loop,
                                  : resp.status_code;
     ResponseHeaderKV effective[kMaxEffectiveHeaders];
     u32 effective_count = 0;
+    bool upstream_content_length_retained = resp.has_content_length;
+    for (u32 i = 0; i < resp.header_count && upstream_content_length_retained; i++) {
+        if (http_header_name_eq_ci(
+                resp.headers[i].name.ptr, resp.headers[i].name.len, "connection", 10))
+            upstream_content_length_retained =
+                !h2_name_in_connection_tokens(resp.headers[i].value, {"content-length", 14});
+    }
     for (u32 i = 0; i < resp.header_count && effective_count < kMaxEffectiveHeaders; i++) {
         const Str kName = resp.headers[i].name;
         const bool preserve_unsatisfied_range =
@@ -3114,6 +3138,8 @@ void h2_proxy_finish(Loop* loop,
                 nominated = h2_name_in_connection_tokens(resp.headers[j].value, kName);
         }
         if (nominated) continue;
+        if (http_header_name_eq_ci(kName.ptr, kName.len, "content-length", 14))
+            upstream_content_length_retained = true;
         effective[effective_count++] = {
             kName.ptr, kName.len, resp.headers[i].value.ptr, resp.headers[i].value.len};
     }
@@ -3152,9 +3178,10 @@ void h2_proxy_finish(Loop* loop,
         status = 500;
     }
     const u64 range_representation_length =
-        is_head && !response_body_mutated && resp.has_content_length ? resp.content_length
-                                                                     : body_len;
-    const bool validate_range_length = !is_head || response_body_mutated || resp.has_content_length;
+        is_head && !response_body_mutated && upstream_content_length_retained ? resp.content_length
+                                                                              : body_len;
+    const bool validate_range_length =
+        !is_head || response_body_mutated || upstream_content_length_retained;
     if (mutations_valid && !normalize_partial_content_headers(effective,
                                                               &effective_count,
                                                               status,
@@ -3169,7 +3196,7 @@ void h2_proxy_finish(Loop* loop,
     u32 replacement_content_length_len = 0;
     const bool preserve_upstream_representation_length =
         mutations_valid && status == 304 && resp.status_code != 206 && !response_body_mutated &&
-        resp.has_content_length;
+        upstream_content_length_retained;
     const bool declare_mutated_head_length = mutations_valid && is_head && response_body_mutated &&
                                              !status_forbids_content_length && status != 304;
     if (preserve_upstream_representation_length || declare_mutated_head_length) {
@@ -4968,6 +4995,13 @@ void finish_buffered_forward(Loop* loop,
         response_ctx->response_status_set ? response_ctx->response_status : resp.status_code;
     ResponseHeaderKV headers[kMaxEffectiveHeaders];
     u32 header_count = 0;
+    bool upstream_content_length_retained = resp.has_content_length;
+    for (u32 i = 0; i < resp.header_count && upstream_content_length_retained; i++) {
+        if (http_header_name_eq_ci(
+                resp.headers[i].name.ptr, resp.headers[i].name.len, "connection", 10))
+            upstream_content_length_retained =
+                !h2_name_in_connection_tokens(resp.headers[i].value, {"content-length", 14});
+    }
     for (u32 i = 0; i < resp.header_count; i++) {
         const Str name = resp.headers[i].name;
         // Preserve Content-Length on HEAD: it describes the corresponding GET
@@ -4997,6 +5031,8 @@ void finish_buffered_forward(Loop* loop,
                 nominated = h2_name_in_connection_tokens(resp.headers[j].value, name);
         }
         if (nominated) continue;
+        if (http_header_name_eq_ci(name.ptr, name.len, "content-length", 14))
+            upstream_content_length_retained = true;
         if (header_count >= kMaxEffectiveHeaders) {
             buffered_forward_fail(loop, conn, 500);
             return;
@@ -5053,11 +5089,11 @@ void finish_buffered_forward(Loop* loop,
     }
     const u32 representation_body_len = body_len;
     const u64 range_representation_length =
-        is_head && !response_ctx->response_body_mutation_set && resp.has_content_length
+        is_head && !response_ctx->response_body_mutation_set && upstream_content_length_retained
             ? resp.content_length
             : representation_body_len;
     const bool validate_range_length =
-        !is_head || response_ctx->response_body_mutation_set || resp.has_content_length;
+        !is_head || response_ctx->response_body_mutation_set || upstream_content_length_retained;
     if (!normalize_partial_content_headers(
             headers, &header_count, status, range_representation_length, validate_range_length)) {
         buffered_forward_fail(
@@ -5068,7 +5104,7 @@ void finish_buffered_forward(Loop* loop,
         status < 200 || status == 204 || status == 205 || status == 304;
     const bool status_omits_content_length = status < 200 || status == 204;
     const bool has_known_representation_length =
-        (!response_ctx->response_body_mutation_set && resp.has_content_length &&
+        (!response_ctx->response_body_mutation_set && upstream_content_length_retained &&
          (status != 304 || resp.status_code != 206)) ||
         (is_head && response_ctx->response_body_mutation_set && !status_forbids_body);
     const bool omit_unknown_representation_length =
@@ -5098,9 +5134,9 @@ void finish_buffered_forward(Loop* loop,
         !response_ctx->response_body_mutation_set,
         is_head,
         ((is_head && !status_forbids_body) || status == 304) &&
-            !response_ctx->response_body_mutation_set && resp.has_content_length &&
+            !response_ctx->response_body_mutation_set && upstream_content_length_retained &&
             (status != 304 || resp.status_code != 206),
-        !response_ctx->response_body_mutation_set && resp.has_content_length &&
+        !response_ctx->response_body_mutation_set && upstream_content_length_retained &&
                 (status != 304 || resp.status_code != 206) &&
                 ((is_head && !status_forbids_body) || status == 304)
             ? resp.content_length
