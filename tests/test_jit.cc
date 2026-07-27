@@ -1992,6 +1992,48 @@ route GET "/x" {
     rir.destroy();
 }
 
+TEST(jit, guarded_terminating_sibling_preserves_later_parent_iterations) {
+    const auto src = R"rut(
+route GET "/x" {
+    for outer in [0, 1] {
+        for first in [1] { continue }
+        for second in [1] {
+            guard outer > 0 else { break }
+            return 201
+        }
+    }
+    return 500
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    REQUIRE(lower_to_rir(mir.value(), rir));
+    auto cg = codegen(rir.module);
+    REQUIRE(cg.ok);
+    JitEngine engine;
+    REQUIRE(engine.init());
+    REQUIRE(engine.compile(cg.mod, cg.ctx));
+    auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
+    REQUIRE(handler != nullptr);
+    TestHandlerCtxFrame frame{};
+    const auto outcome = invoke_jit_handler(handler,
+                                            nullptr,
+                                            frame.ctx,
+                                            reinterpret_cast<const u8*>(kGetApiRequest),
+                                            sizeof(kGetApiRequest) - 1,
+                                            nullptr);
+    CHECK_EQ(outcome.status_code, 201u);
+    engine.shutdown();
+    rir.destroy();
+}
+
 TEST(jit, bounded_static_for_if_break_and_continue_take_distinct_targets) {
     const auto src = R"rut(
 route GET "/continue" {

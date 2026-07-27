@@ -3973,19 +3973,6 @@ FrontendResult<MirModule*> build_mir(const HirModule& module) {
                     return body_match_arm_entry_index(body_match.arms[body_match.arms.len - 1],
                                                       body_match.arms.len - 1);
                 };
-                auto body_match_pattern_fallthrough_target = [&](u32 arm_index) -> u32 {
-                    const u8 capture_group = body_match.arms[arm_index].capture_group;
-                    u32 next = arm_index + 1;
-                    while (capture_group != 0 && next < body_match.arms.len &&
-                           body_match.arms[next].capture_group == capture_group)
-                        next++;
-                    if (next >= body_match.arms.len)
-                        return body_match_arm_entry_index(body_match.arms[body_match.arms.len - 1],
-                                                          body_match.arms.len - 1);
-                    if (body_match.arms[next].is_wildcard)
-                        return body_match_arm_entry_index(body_match.arms[next], next);
-                    return body_match_extra_test_index[body_match_test_ordinal[next]];
-                };
                 auto set_body_match_arm_term = [&](MirBlock* out,
                                                    const HirForLoopMatchArm& arm,
                                                    u32 arm_index) -> FrontendResult<void> {
@@ -4080,10 +4067,11 @@ FrontendResult<MirModule*> build_mir(const HirModule& module) {
                             ? body_match_prelude_guard_index[ai][0]
                         : arm.post_arm_guard_expr_index != 0xffffffffu
                             ? body_match_post_guard_index[ai]
-                            : body_match_arm_body_index(body_match.arms[ai], ai);
-                    guard_block.term.else_block = arm.arm_guard_precedes_prelude
-                                                      ? body_match_pattern_fallthrough_target(ai)
-                                                      : body_match_fallthrough_target(ai);
+                        : arm.capture_group != 0
+                            ? body_match_arm_body_index(body_match.arms[ai], ai)
+                        : arm.guards.len != 0 ? body_match_prelude_guard_index[ai][0]
+                                              : body_match_arm_body_index(body_match.arms[ai], ai);
+                    guard_block.term.else_block = body_match_guard_fallthrough_target(ai);
                     if (!fn.blocks.push(guard_block))
                         return frontend_error(FrontendError::TooManyItems, fn.span);
                 }
@@ -4105,7 +4093,7 @@ FrontendResult<MirModule*> build_mir(const HirModule& module) {
                     if (!guard) return core::make_unexpected(guard.error());
                     guard_block.term.cond = guard.value();
                     guard_block.term.then_block = body_match_case_index[ai];
-                    guard_block.term.else_block = body_match_fallthrough_target(ai);
+                    guard_block.term.else_block = body_match_guard_fallthrough_target(ai);
                     if (!fn.blocks.push(guard_block))
                         return frontend_error(FrontendError::TooManyItems, fn.span);
                 }
@@ -4588,50 +4576,10 @@ FrontendResult<MirModule*> build_mir(const HirModule& module) {
                                 ? step.match_prelude_guard_index[ai][0]
                             : arm.post_arm_guard_expr_index != 0xffffffffu
                                 ? step.match_post_guard_index[ai]
-                                : step.match_case_index[ai];
-                        guard.term.else_block = arm.arm_guard_precedes_prelude
-                                                    ? pattern_fallthrough_target(ai)
-                                                    : fallthrough_target(ai);
-                        if (!fn.blocks.push(guard))
-                            return frontend_error(FrontendError::TooManyItems, fn.span);
-                    }
-                    for (u32 gi = 0; gi < arm.guards.len; gi++) {
-                        MirBlock guard{};
-                        guard.label = cont_label();
-                        auto effects = append_arm_effects(&guard, ai, gi, arm.span);
-                        if (!effects) return core::make_unexpected(effects.error());
-                        guard.term.kind = MirTerminatorKind::Branch;
-                        guard.term.span = arm.guards[gi].span;
-                        auto cond = mir_value(arm.guards[gi].cond, module, &fn, body_ctx);
-                        if (!cond) return core::make_unexpected(cond.error());
-                        guard.term.cond = cond.value();
-                        guard.term.then_block =
-                            gi + 1 < arm.guards.len ? step.match_prelude_guard_index[ai][gi + 1]
-                            : arm.has_arm_guard && !arm.arm_guard_precedes_prelude
-                                ? step.match_arm_guard_index[ai]
-                            : arm.post_arm_guard_expr_index != 0xffffffffu
-                                ? step.match_post_guard_index[ai]
-                                : step.match_case_index[ai];
-                        guard.term.else_block = step.match_prelude_fail_index[ai][gi];
-                        if (!fn.blocks.push(guard))
-                            return frontend_error(FrontendError::TooManyItems, fn.span);
-                    }
-                    if (arm.post_arm_guard_expr_index != 0xffffffffu) {
-                        if (arm.post_arm_guard_expr_index >= module.routes[i].exprs.len)
-                            return frontend_error(FrontendError::UnsupportedSyntax, arm.span);
-                        MirBlock guard{};
-                        guard.label = cont_label();
-                        auto effects = append_arm_effects(&guard, ai, arm.guards.len, arm.span);
-                        if (!effects) return core::make_unexpected(effects.error());
-                        const auto& post_guard =
-                            module.routes[i].exprs[arm.post_arm_guard_expr_index];
-                        guard.term.kind = MirTerminatorKind::Branch;
-                        guard.term.span = post_guard.span;
-                        auto cond = mir_value(post_guard, module, &fn, body_ctx);
-                        if (!cond) return core::make_unexpected(cond.error());
-                        guard.term.cond = cond.value();
-                        guard.term.then_block = step.match_case_index[ai];
-                        guard.term.else_block = fallthrough_target(ai);
+                            : arm.capture_group != 0 ? step.match_case_index[ai]
+                            : arm.guards.len != 0    ? step.match_prelude_guard_index[ai][0]
+                                                     : step.match_case_index[ai];
+                        guard.term.else_block = guard_fallthrough_target(ai);
                         if (!fn.blocks.push(guard))
                             return frontend_error(FrontendError::TooManyItems, fn.span);
                     }
