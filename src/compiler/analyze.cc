@@ -17171,7 +17171,9 @@ static FrontendResult<u32> analyze_for_stmt(const AstStatement& stmt,
                 server.type = HirTypeKind::Server;
                 server.shape_index = server_shape.value();
                 server.span = stmt.expr.span;
-                server.int_value = (static_cast<i64>(upstream.id) << 16) | backend;
+                // Keep zero reserved for failed server lookups in lowered RIR.
+                server.int_value =
+                    static_cast<i64>((static_cast<u64>(upstream.id) << 16) | backend) + 1;
                 if (!route->exprs.push(server))
                     return frontend_error(FrontendError::TooManyItems, stmt.expr.span);
                 if (!upstream_servers.args.push(&route->exprs[route->exprs.len - 1]))

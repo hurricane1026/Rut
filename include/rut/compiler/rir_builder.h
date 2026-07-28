@@ -358,6 +358,7 @@ struct Builder {
         inst->loc = loc;
         inst->operand_count = 0;
         inst->extra_operands = nullptr;
+        inst->extra_operand_capacity = 0;
         for (u32 i = 0; i < sizeof(inst->imm); i++) {
             reinterpret_cast<u8*>(&inst->imm)[i] = 0;
         }
@@ -393,6 +394,7 @@ struct Builder {
             extra_ops[i] = ops[kMaxInlineOperands + i];
         }
         inst->extra_operands = extra_ops;
+        inst->extra_operand_capacity = extra;
         inst->operand_count = count;
         return {};
     }
@@ -1086,6 +1088,7 @@ struct Builder {
             inst->extra_operands = static_cast<ValueId*>(
                 mod->arena->alloc(sizeof(ValueId) * (count - kMaxInlineOperands)));
             if (!inst->extra_operands) return err(RirError::OutOfMemory);
+            inst->extra_operand_capacity = count - kMaxInlineOperands;
             for (u32 i = 0; i < count; i++) {
                 if (i < kMaxInlineOperands)
                     inst->operands[i] = values[i];

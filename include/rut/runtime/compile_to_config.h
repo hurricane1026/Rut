@@ -279,11 +279,6 @@ inline bool marking_policy_has_string_immediate(rir::Opcode op) {
 }
 
 inline bool marking_policy_operand_arity_valid(const rir::Instruction& inst) {
-    // Instruction does not carry an allocation-capacity field for extra_operands.
-    // Marking policies cross a defensive runtime boundary, so keep their operand
-    // tables inline; otherwise a forged count plus an undersized non-null pointer
-    // cannot be distinguished from builder-owned storage before fingerprinting.
-    if (inst.operand_count > rir::kMaxInlineOperands) return false;
     switch (inst.op) {
         case rir::Opcode::ConstStr:
         case rir::Opcode::ConstI32:
@@ -419,6 +414,16 @@ inline bool marking_policy_operand_arity_valid(const rir::Instruction& inst) {
     return false;
 }
 
+inline bool marking_policy_operand_storage_valid(const rir::Module& mod,
+                                                 const rir::Instruction& inst) {
+    if (inst.operand_count <= rir::kMaxInlineOperands) return true;
+    if (mod.arena == nullptr || inst.extra_operands == nullptr) return false;
+    const u64 count = inst.operand_count - rir::kMaxInlineOperands;
+    return inst.extra_operand_capacity >= count &&
+           count <= static_cast<u64>(-1) / sizeof(rir::ValueId) &&
+           mod.arena->contains_range(inst.extra_operands, count * sizeof(rir::ValueId));
+}
+
 inline bool marking_policy_find_block(const rir::Function& fn, rir::BlockId id, u32* block_index) {
     for (u32 bi = 0; bi < fn.block_count; bi++) {
         if (fn.blocks[bi].id != id) continue;
@@ -487,6 +492,28 @@ inline bool marking_policy_value_has_kind(const rir::Function& fn,
            fn.values[value.id].type->kind == kind;
 }
 
+inline bool marking_policy_json_type_valid(const rir::Type* type, u32 depth = 0) {
+    if (!marking_policy_type_shape_valid(type) || depth > 32) return false;
+    switch (type->kind) {
+        case rir::TypeKind::Bool:
+        case rir::TypeKind::I32:
+        case rir::TypeKind::I64:
+        case rir::TypeKind::Str:
+        case rir::TypeKind::StrList:
+            return true;
+        case rir::TypeKind::Array:
+            return marking_policy_json_type_valid(type->inner, depth + 1);
+        case rir::TypeKind::Struct:
+            if (type->struct_def == nullptr) return false;
+            for (u32 fi = 0; fi < type->struct_def->field_count; fi++)
+                if (!marking_policy_json_type_valid(type->struct_def->fields()[fi].type, depth + 1))
+                    return false;
+            return true;
+        default:
+            return false;
+    }
+}
+
 inline bool marking_policy_instruction_types_valid(const rir::Function& fn,
                                                    const rir::Instruction& inst) {
     const auto operand_kind = [&](u32 index, rir::TypeKind kind) {
@@ -517,6 +544,24 @@ inline bool marking_policy_instruction_types_valid(const rir::Function& fn,
             return result_kind(rir::TypeKind::StatusCode);
         case rir::Opcode::TimeNowMicros:
             return result_kind(rir::TypeKind::I64);
+        case rir::Opcode::JsonCapture:
+            return result_kind(rir::TypeKind::Str);
+        case rir::Opcode::RespHeader:
+            return operand_kind(0, rir::TypeKind::Optional) &&
+                   fn.values[inst.operand(0).id].type->inner != nullptr &&
+                   fn.values[inst.operand(0).id].type->inner->kind == rir::TypeKind::Str &&
+                   result_type != nullptr && result_type->kind == rir::TypeKind::Optional &&
+                   result_type->inner != nullptr && result_type->inner->kind == rir::TypeKind::Str;
+        case rir::Opcode::RespStatus:
+            return operand_kind(0, rir::TypeKind::I32) && result_kind(rir::TypeKind::I32);
+        case rir::Opcode::RespBody:
+            return operand_kind(0, rir::TypeKind::Str) && result_kind(rir::TypeKind::Str);
+        case rir::Opcode::RespSetHeader:
+        case rir::Opcode::RespAddHeader:
+        case rir::Opcode::RespSetBody:
+            return inst.result == rir::kNoValue && operand_kind(0, rir::TypeKind::Str);
+        case rir::Opcode::RespSetStatus:
+            return inst.result == rir::kNoValue && operand_kind(0, rir::TypeKind::I32);
         case rir::Opcode::StrHasPrefix:
             return operand_kind(0, rir::TypeKind::Str) && operand_kind(1, rir::TypeKind::Str) &&
                    result_kind(rir::TypeKind::Bool);
@@ -536,9 +581,7 @@ inline bool marking_policy_instruction_types_valid(const rir::Function& fn,
                 !marking_policy_types_equal(result_type, inst.imm.struct_ref.type))
                 return false;
             const auto& def = *inst.imm.struct_ref.type->struct_def;
-            if (inst.operand_count != def.field_count ||
-                inst.operand_count > rir::kMaxInlineOperands)
-                return false;
+            if (inst.operand_count != def.field_count) return false;
             for (u32 fi = 0; fi < def.field_count; fi++) {
                 if (inst.operand(fi).id >= fn.value_count ||
                     !marking_policy_types_equal(fn.values[inst.operand(fi).id].type,
@@ -704,7 +747,8 @@ inline bool marking_policy_instruction_types_valid(const rir::Function& fn,
         case rir::Opcode::JsonAppendStrList:
             return inst.result == rir::kNoValue && operand_kind(0, rir::TypeKind::StrList);
         case rir::Opcode::JsonAppendArray:
-            return inst.result == rir::kNoValue && operand_kind(0, rir::TypeKind::Array);
+            return inst.result == rir::kNoValue && operand_kind(0, rir::TypeKind::Array) &&
+                   marking_policy_json_type_valid(fn.values[inst.operand(0).id].type);
         default:
             // Marking-policy RIR can be hand-built or transformed after the
             // typed builder runs. Do not pass an opcode through to codegen until
@@ -713,12 +757,13 @@ inline bool marking_policy_instruction_types_valid(const rir::Function& fn,
     }
 }
 
-inline bool marking_policy_ssa_valid(const rir::Function& fn) {
+inline bool marking_policy_ssa_valid(const rir::Module& mod, const rir::Function& fn) {
     for (u32 bi = 0; bi < fn.block_count; bi++) {
         const auto& block = fn.blocks[bi];
         for (u32 ii = 0; ii < block.inst_count; ii++) {
             const auto& inst = block.insts[ii];
             if (!marking_policy_operand_arity_valid(inst)) return false;
+            if (!marking_policy_operand_storage_valid(mod, inst)) return false;
             if (inst.result != rir::kNoValue) {
                 if (inst.result.id >= fn.value_count ||
                     !marking_policy_type_shape_valid(fn.values[inst.result.id].type) ||
@@ -843,6 +888,19 @@ inline bool marking_policy_shape_valid(const rir::Function& fn, bool inspect_ope
     return true;
 }
 
+inline bool marking_policy_shape_valid(const rir::Module& mod,
+                                       const rir::Function& fn,
+                                       bool inspect_operands = true) {
+    if (!marking_policy_storage_shape_valid(fn)) return false;
+    if (inspect_operands)
+        for (u32 bi = 0; bi < fn.block_count; bi++)
+            for (u32 ii = 0; ii < fn.blocks[bi].inst_count; ii++)
+                if (!marking_policy_operand_storage_valid(mod, fn.blocks[bi].insts[ii]))
+                    return false;
+    return marking_policy_shape_valid(fn, false) &&
+           (!inspect_operands || marking_policy_ssa_valid(mod, fn));
+}
+
 inline bool marking_policy_emitted_mask(const rir::Module& mod,
                                         const rir::Function& fn,
                                         u32 upstream_count,
@@ -860,8 +918,7 @@ inline bool marking_policy_emitted_mask(const rir::Module& mod,
                 break;
             }
     }
-    if (!marking_policy_shape_valid(fn, contains_mark)) return false;
-    if (contains_mark && !marking_policy_ssa_valid(fn)) return false;
+    if (!marking_policy_shape_valid(mod, fn, contains_mark)) return false;
     for (u32 bi = 0; bi < fn.block_count; bi++) {
         const auto& block = fn.blocks[bi];
         for (u32 ii = 0; ii < block.inst_count; ii++) {
@@ -1096,6 +1153,32 @@ inline bool marking_policy_array_element_flows_to_source(
                    fn, inst.operand(1), index, source, depth + 1) ||
                marking_policy_array_element_flows_to_source(
                    fn, inst.operand(2), index, source, depth + 1);
+    if ((inst.op == rir::Opcode::OptWrap || inst.op == rir::Opcode::OptUnwrap) &&
+        inst.operand_count == 1)
+        return marking_policy_array_element_flows_to_source(
+            fn, inst.operand(0), index, source, depth + 1);
+    if (inst.op == rir::Opcode::StructField && inst.operand_count == 1) {
+        const rir::ValueId struct_value = inst.operand(0);
+        if (struct_value.id >= fn.value_count) return false;
+        const auto& struct_definition = fn.values[struct_value.id];
+        u32 struct_block_index = 0;
+        if (!marking_policy_find_block(fn, struct_definition.def_block, &struct_block_index))
+            return false;
+        const auto& struct_block = fn.blocks[struct_block_index];
+        if (struct_definition.def_inst >= struct_block.inst_count) return false;
+        const auto& create = struct_block.insts[struct_definition.def_inst];
+        if (create.result != struct_value || create.op != rir::Opcode::StructCreate ||
+            create.imm.struct_ref.type == nullptr ||
+            create.imm.struct_ref.type->kind != rir::TypeKind::Struct ||
+            create.imm.struct_ref.type->struct_def == nullptr)
+            return false;
+        const auto& def = *create.imm.struct_ref.type->struct_def;
+        for (u32 fi = 0; fi < def.field_count && fi < create.operand_count; fi++)
+            if (def.fields()[fi].name.eq(inst.imm.struct_ref.name))
+                return marking_policy_array_element_flows_to_source(
+                    fn, create.operand(fi), index, source, depth + 1);
+        return false;
+    }
     return inst.op == rir::Opcode::ArrayCreate && index < inst.operand_count &&
            marking_policy_value_flows_to_source(fn, inst.operand(index), source, depth + 1);
 }
@@ -1115,6 +1198,31 @@ inline bool marking_policy_array_flows_to_source(const rir::Function& fn,
     if (inst.op == rir::Opcode::Select && inst.operand_count == 3)
         return marking_policy_array_flows_to_source(fn, inst.operand(1), source, depth + 1) ||
                marking_policy_array_flows_to_source(fn, inst.operand(2), source, depth + 1);
+    if ((inst.op == rir::Opcode::OptWrap || inst.op == rir::Opcode::OptUnwrap) &&
+        inst.operand_count == 1)
+        return marking_policy_array_flows_to_source(fn, inst.operand(0), source, depth + 1);
+    if (inst.op == rir::Opcode::StructField && inst.operand_count == 1) {
+        const rir::ValueId struct_value = inst.operand(0);
+        if (struct_value.id >= fn.value_count) return false;
+        const auto& struct_definition = fn.values[struct_value.id];
+        u32 struct_block_index = 0;
+        if (!marking_policy_find_block(fn, struct_definition.def_block, &struct_block_index))
+            return false;
+        const auto& struct_block = fn.blocks[struct_block_index];
+        if (struct_definition.def_inst >= struct_block.inst_count) return false;
+        const auto& create = struct_block.insts[struct_definition.def_inst];
+        if (create.result != struct_value || create.op != rir::Opcode::StructCreate ||
+            create.imm.struct_ref.type == nullptr ||
+            create.imm.struct_ref.type->kind != rir::TypeKind::Struct ||
+            create.imm.struct_ref.type->struct_def == nullptr)
+            return false;
+        const auto& def = *create.imm.struct_ref.type->struct_def;
+        for (u32 fi = 0; fi < def.field_count && fi < create.operand_count; fi++)
+            if (def.fields()[fi].name.eq(inst.imm.struct_ref.name))
+                return marking_policy_array_flows_to_source(
+                    fn, create.operand(fi), source, depth + 1);
+        return false;
+    }
     if (inst.op != rir::Opcode::ArrayCreate) return false;
     for (u32 index = 0; index < inst.operand_count; index++)
         if (marking_policy_value_flows_to_source(fn, inst.operand(index), source, depth + 1))
@@ -1267,11 +1375,16 @@ inline u64 marking_policy_identity(const rir::Module& mod, const rir::Function& 
                 const u64 immediate = static_cast<u64>(inst.imm.i64_val);
                 if (op == rir::Opcode::ConstI64 && inst.result != rir::kNoValue &&
                     marking_policy_value_is_mark_server(fn, inst.result)) {
-                    const u32 upstream = static_cast<u32>((immediate >> 16) & 0xffffu);
-                    const u32 backend = static_cast<u32>(immediate & 0xffffu);
-                    marking_policy_identity_mix(&identity,
-                                                marking_policy_upstream_identity(mod, upstream));
-                    marking_policy_identity_mix(&identity, backend);
+                    if (immediate == 0) {
+                        marking_policy_identity_mix(&identity, 0xffffffffffffffffull);
+                    } else {
+                        const u64 decoded = immediate - 1;
+                        const u32 upstream = static_cast<u32>((decoded >> 16) & 0xffffu);
+                        const u32 backend = static_cast<u32>(decoded & 0xffffu);
+                        marking_policy_identity_mix(
+                            &identity, marking_policy_upstream_identity(mod, upstream));
+                        marking_policy_identity_mix(&identity, backend);
+                    }
                 } else {
                     marking_policy_identity_mix(&identity, immediate);
                 }

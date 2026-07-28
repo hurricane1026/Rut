@@ -1955,11 +1955,20 @@ static void emit_instruction(Ctx& c, const rir::Instruction& inst) {
             LLVMValueRef generation =
                 LLVMBuildLoad2(c.builder, c.i64_ty, generation_ptr, "mark.generation");
             LLVMValueRef server = c.get_value(inst.operands[0]);
-            LLVMValueRef backend = LLVMBuildTrunc(c.builder, server, c.i16_ty, "mark.backend");
+            LLVMValueRef valid = LLVMBuildICmp(
+                c.builder, LLVMIntNE, server, LLVMConstInt(c.i64_ty, 0, 0), "mark.server.valid");
+            LLVMValueRef decoded =
+                LLVMBuildSub(c.builder, server, LLVMConstInt(c.i64_ty, 1, 0), "mark.server.raw");
+            LLVMValueRef backend = LLVMBuildTrunc(c.builder, decoded, c.i16_ty, "mark.backend");
             LLVMValueRef upstream_shift = LLVMBuildLShr(
-                c.builder, server, LLVMConstInt(c.i64_ty, 16, 0), "mark.upstream.shift");
+                c.builder, decoded, LLVMConstInt(c.i64_ty, 16, 0), "mark.upstream.shift");
             LLVMValueRef upstream =
                 LLVMBuildTrunc(c.builder, upstream_shift, c.i16_ty, "mark.upstream");
+            LLVMValueRef invalid_server = LLVMConstInt(c.i16_ty, 0xffffu, 0);
+            backend =
+                LLVMBuildSelect(c.builder, valid, backend, invalid_server, "mark.backend.checked");
+            upstream = LLVMBuildSelect(
+                c.builder, valid, upstream, invalid_server, "mark.upstream.checked");
             LLVMValueRef receiver =
                 LLVMConstInt(c.i16_ty, static_cast<u16>(static_cast<u32>(inst.imm.i32_val)), 0);
             LLVMValueRef healthy =

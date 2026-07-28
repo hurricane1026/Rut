@@ -118,6 +118,13 @@ struct ValueId {
 // Sentinel for "no value" (void-returning instructions).
 static constexpr ValueId kNoValue = {0xFFFFFFFF};
 
+// Server values reserve zero for failed lookups (for example an out-of-bounds
+// ArrayGet). Valid upstream/backend pairs are stored one-based so a failed
+// lookup cannot accidentally address upstream 0, backend 0.
+inline constexpr i64 encode_server_token(u32 upstream, u32 backend) {
+    return static_cast<i64>((static_cast<u64>(upstream) << 16) | backend) + 1;
+}
+
 // ── Block IDs ───────────────────────────────────────────────────────
 
 struct BlockId {
@@ -331,6 +338,7 @@ struct Instruction {
     // Overflow for variadic instructions (arena-allocated).
     // Non-null only when operand_count > kMaxInlineOperands.
     ValueId* extra_operands;
+    u32 extra_operand_capacity;
 
     // Instruction-specific immediate data (tagged by opcode).
     union Immediate {
