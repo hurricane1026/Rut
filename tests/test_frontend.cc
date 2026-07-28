@@ -33312,6 +33312,56 @@ route GET "/x" {
     rir.destroy();
 }
 
+TEST(frontend, terminating_guard_prunes_unreachable_guard_continue) {
+    const char* src = R"rut(
+route GET "/x" {
+    for item in [1, 2, 3, 4, 5, 6, 7, 8] {
+        guard false else { break }
+        guard false else { continue }
+        return 201
+    }
+    return 500
+}
+)rut";
+    FrontendRirModule rir{};
+    REQUIRE(lower_src_to_rir(src, rir));
+    CHECK(rir::verify_module(rir.module).ok);
+    rir.destroy();
+}
+
+TEST(frontend, dead_match_prelude_break_does_not_hide_terminating_sibling) {
+    const char* src = R"rut(
+route GET "/x" {
+    for outer in [1, 2, 3, 4, 5, 6, 7, 8] {
+        for first in [1] { continue }
+        for second in [1] {
+            match true {
+                true => {
+                    guard true else { break }
+                    return 201
+                }
+                _ => return 202
+            }
+        }
+    }
+    return 500
+}
+)rut";
+    FrontendRirModule rir{};
+    REQUIRE(lower_src_to_rir(src, rir));
+    CHECK(rir::verify_module(rir.module).ok);
+    rir.destroy();
+}
+
+TEST(frontend, constant_selected_loop_branch_terminates_route) {
+    const char* src =
+        "route GET \"/x\" { for item in [1] { if true { return 201 } else { break } } }\n";
+    FrontendRirModule rir{};
+    REQUIRE(lower_src_to_rir(src, rir));
+    CHECK(rir::verify_module(rir.module).ok);
+    rir.destroy();
+}
+
 TEST(frontend, static_false_match_prelude_makes_body_continue_unreachable) {
     const char* src = R"rut(
 route GET "/x" {

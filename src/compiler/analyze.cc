@@ -23628,7 +23628,22 @@ static FrontendResult<HirModule*> analyze_file_internal(
                                     "directly"));
                 }
                 u32 iter_len = 0;
-                if (analyzed_loop.body.has_term && !has_local_loop_control(analyzed_loop) &&
+                bool constant_selected_branch_terminates = false;
+                for (u32 step_index = 0; step_index < analyzed_loop.body.steps.len; step_index++) {
+                    const auto& step = analyzed_loop.body.steps[step_index];
+                    if (step.kind != HirForLoopBody::Step::Kind::If ||
+                        step.index >= analyzed_loop.body.ifs.len)
+                        continue;
+                    const auto& body_if = analyzed_loop.body.ifs[step.index];
+                    if (body_if.cond.kind != HirExprKind::BoolLit) continue;
+                    const auto& selected =
+                        body_if.cond.bool_value ? body_if.then_branch : body_if.else_branch;
+                    constant_selected_branch_terminates =
+                        selected.kind == HirForLoopBranch::Kind::Term;
+                    break;
+                }
+                if ((constant_selected_branch_terminates ||
+                     (analyzed_loop.body.has_term && !has_local_loop_control(analyzed_loop))) &&
                     static_for_iter_len(analyzed_loop.iter_expr,
                                         route.locals.data,
                                         route.locals.len,

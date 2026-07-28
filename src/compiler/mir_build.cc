@@ -2392,7 +2392,6 @@ FrontendResult<MirModule*> build_mir(const HirModule& module) {
             auto loop_has_local_control = [&](u32 loop_index) -> bool {
                 if (loop_index >= module.routes[i].for_loops.len) return false;
                 const auto& loop = module.routes[i].for_loops[loop_index];
-                if (loop.body.has_loop_control) return true;
                 for (u32 gi = 0; gi < loop.body.guards.len; gi++)
                     if (loop.body.guards[gi].fail_kind == HirGuard::FailKind::LoopControl)
                         if (loop.body.guards[gi].cond.kind != HirExprKind::BoolLit ||
@@ -2403,8 +2402,101 @@ FrontendResult<MirModule*> build_mir(const HirModule& module) {
                     for (u32 ai = 0; ai < body_match.arms.len; ai++)
                         for (u32 gi = 0; gi < body_match.arms[ai].guards.len; gi++)
                             if (body_match.arms[ai].guards[gi].fail_kind ==
-                                HirGuard::FailKind::LoopControl)
+                                    HirGuard::FailKind::LoopControl &&
+                                (body_match.arms[ai].guards[gi].cond.kind != HirExprKind::BoolLit ||
+                                 !body_match.arms[ai].guards[gi].cond.bool_value))
                                 return true;
+                }
+                for (u32 si = 0; si < loop.body.steps.len; si++) {
+                    const auto& step = loop.body.steps[si];
+                    if (step.kind == HirForLoopBody::Step::Kind::Break ||
+                        step.kind == HirForLoopBody::Step::Kind::Continue)
+                        return true;
+                    if (step.kind != HirForLoopBody::Step::Kind::If ||
+                        step.index >= loop.body.ifs.len)
+                        continue;
+                    const auto& body_if = loop.body.ifs[step.index];
+                    const bool then_reachable =
+                        body_if.cond.kind != HirExprKind::BoolLit || body_if.cond.bool_value;
+                    const bool else_reachable =
+                        body_if.cond.kind != HirExprKind::BoolLit || !body_if.cond.bool_value;
+                    const auto is_control = [](const HirForLoopBranch& branch) {
+                        return branch.kind == HirForLoopBranch::Kind::Break ||
+                               branch.kind == HirForLoopBranch::Kind::Continue;
+                    };
+                    if ((then_reachable && is_control(body_if.then_branch)) ||
+                        (else_reachable && is_control(body_if.else_branch)))
+                        return true;
+                }
+                return false;
+            };
+            auto loop_has_reachable_terminator = [&](u32 loop_index) -> bool {
+                if (loop_index >= module.routes[i].for_loops.len) return false;
+                const auto& loop = module.routes[i].for_loops[loop_index];
+                if (loop.body.has_term) return true;
+                const auto literal_matches = [](const HirExpr& subject, const HirExpr& pattern) {
+                    if (subject.kind != pattern.kind) return false;
+                    if (subject.kind == HirExprKind::BoolLit)
+                        return subject.bool_value == pattern.bool_value;
+                    if (subject.kind == HirExprKind::IntLit)
+                        return subject.int_value == pattern.int_value;
+                    if (subject.kind == HirExprKind::StrLit)
+                        return subject.str_value.eq(pattern.str_value);
+                    return false;
+                };
+                const auto branch_terminates = [](const HirForLoopBranch& branch) {
+                    return branch.kind == HirForLoopBranch::Kind::Term;
+                };
+                for (u32 si = 0; si < loop.body.steps.len; si++) {
+                    const auto& step = loop.body.steps[si];
+                    if (step.kind == HirForLoopBody::Step::Kind::Term) return true;
+                    if (step.kind == HirForLoopBody::Step::Kind::If &&
+                        step.index < loop.body.ifs.len) {
+                        const auto& body_if = loop.body.ifs[step.index];
+                        if (body_if.cond.kind == HirExprKind::BoolLit) {
+                            if (branch_terminates(body_if.cond.bool_value ? body_if.then_branch
+                                                                          : body_if.else_branch))
+                                return true;
+                        } else if (branch_terminates(body_if.then_branch) &&
+                                   branch_terminates(body_if.else_branch)) {
+                            return true;
+                        }
+                    }
+                    if (step.kind != HirForLoopBody::Step::Kind::Match ||
+                        step.index >= loop.body.matches.len)
+                        continue;
+                    const auto& body_match = loop.body.matches[step.index];
+                    const bool literal_subject =
+                        body_match.match_expr.kind == HirExprKind::BoolLit ||
+                        body_match.match_expr.kind == HirExprKind::IntLit ||
+                        body_match.match_expr.kind == HirExprKind::StrLit;
+                    if (!literal_subject) continue;
+                    for (u32 ai = 0; ai < body_match.arms.len; ai++) {
+                        const auto& arm = body_match.arms[ai];
+                        if (!arm.is_wildcard &&
+                            !literal_matches(body_match.match_expr, arm.pattern))
+                            continue;
+                        bool reaches_body = true;
+                        for (u32 gi = 0; gi < arm.guards.len; gi++) {
+                            const auto& guard = arm.guards[gi];
+                            if (guard.cond.kind == HirExprKind::BoolLit && guard.cond.bool_value)
+                                continue;
+                            reaches_body = false;
+                            break;
+                        }
+                        if (!reaches_body) break;
+                        if (arm.body_kind == HirForLoopMatchArm::BodyKind::Direct) {
+                            if (branch_terminates(arm.direct_branch)) return true;
+                        } else if (arm.cond.kind == HirExprKind::BoolLit) {
+                            if (branch_terminates(arm.cond.bool_value ? arm.then_branch
+                                                                      : arm.else_branch))
+                                return true;
+                        } else if (branch_terminates(arm.then_branch) &&
+                                   branch_terminates(arm.else_branch)) {
+                            return true;
+                        }
+                        break;
+                    }
                 }
                 return false;
             };
@@ -2429,12 +2521,6 @@ FrontendResult<MirModule*> build_mir(const HirModule& module) {
                     return expr.kind == HirExprKind::BoolLit || expr.kind == HirExprKind::IntLit ||
                            expr.kind == HirExprKind::StrLit;
                 };
-                for (u32 gi = 0; gi < loop.body.guards.len; gi++)
-                    if (loop.body.guards[gi].fail_kind == HirGuard::FailKind::LoopControl &&
-                        loop.body.guards[gi].fail_loop_control == HirLoopControl::Continue &&
-                        (loop.body.guards[gi].cond.kind != HirExprKind::BoolLit ||
-                         !loop.body.guards[gi].cond.bool_value))
-                        return true;
                 for (u32 mi = 0; mi < loop.body.matches.len; mi++) {
                     const auto& body_match = loop.body.matches[mi];
                     const auto capture_group_has_source_guard = [&](u32 arm_index) {
@@ -2518,10 +2604,11 @@ FrontendResult<MirModule*> build_mir(const HirModule& module) {
                     if (step.kind == HirForLoopBody::Step::Kind::Guard &&
                         step.index < loop.body.guards.len) {
                         const auto& guard = loop.body.guards[step.index];
+                        if (guard.fail_kind == HirGuard::FailKind::LoopControl &&
+                            guard.fail_loop_control == HirLoopControl::Continue &&
+                            (guard.cond.kind != HirExprKind::BoolLit || !guard.cond.bool_value))
+                            return true;
                         if (guard.cond.kind == HirExprKind::BoolLit && !guard.cond.bool_value) {
-                            if (guard.fail_kind == HirGuard::FailKind::LoopControl &&
-                                guard.fail_loop_control == HirLoopControl::Continue)
-                                return true;
                             if (guard.fail_kind == HirGuard::FailKind::Term ||
                                 (guard.fail_kind == HirGuard::FailKind::LoopControl &&
                                  guard.fail_loop_control == HirLoopControl::Break))
@@ -2562,7 +2649,7 @@ FrontendResult<MirModule*> build_mir(const HirModule& module) {
                             suffix.index < module.routes[i].for_loops.len) {
                             const auto& suffix_loop = module.routes[i].for_loops[suffix.index];
                             const HirExpr* suffix_iter = iter_array_for(suffix_loop);
-                            if (suffix_loop.body.has_term &&
+                            if (loop_has_reachable_terminator(suffix.index) &&
                                 !loop_has_local_control(suffix.index) && suffix_iter != nullptr &&
                                 suffix_iter->args.len != 0 &&
                                 !self(self, suffix.index, depth + 1)) {
@@ -2729,7 +2816,8 @@ FrontendResult<MirModule*> build_mir(const HirModule& module) {
                             continue;
                         const auto& child = module.routes[i].for_loops[candidate_step.index];
                         const HirExpr* child_iter = iter_array_for(child);
-                        if (child.body.has_term && !loop_has_local_control(candidate_step.index) &&
+                        if (loop_has_reachable_terminator(candidate_step.index) &&
+                            !loop_has_local_control(candidate_step.index) &&
                             child_iter != nullptr && child_iter->args.len != 0 &&
                             !loop_can_advance_to_later_iteration(
                                 loop_can_advance_to_later_iteration, candidate_step.index, 0))
