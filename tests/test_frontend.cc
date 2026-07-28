@@ -33831,6 +33831,27 @@ route GET "/x" {
     rir.destroy();
 }
 
+TEST(frontend, flattened_source_guard_failure_skips_inner_capture_group) {
+    const char* src = R"rut(
+route GET "/x" {
+    for item in [1] {
+        match item {
+            1 if req.http11 => {
+                let captured = time.nowMicros()
+                match captured > 0 { true => break _ => continue }
+            }
+            _ => return 500
+        }
+    }
+    return 204
+}
+)rut";
+    FrontendRirModule rir{};
+    REQUIRE(lower_src_to_rir(src, rir));
+    CHECK(rir::verify_module(rir.module).ok);
+    rir.destroy();
+}
+
 TEST(frontend, match_control_enters_prelude_before_flattened_inner_guard) {
     const char* src = R"rut(
 route GET "/x" {

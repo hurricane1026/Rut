@@ -4128,7 +4128,7 @@ FrontendResult<MirModule*> build_mir(const HirModule& module) {
                             : arm.post_arm_guard_expr_index != 0xffffffffu
                                 ? step.match_post_guard_index[ai]
                                 : step.match_case_index[ai];
-                        guard.term.else_block = fallthrough_target(ai);
+                        guard.term.else_block = pattern_fallthrough_target(ai);
                         if (!fn.blocks.push(guard))
                             return frontend_error(FrontendError::TooManyItems, fn.span);
                     }
