@@ -619,6 +619,31 @@ TEST(pool, reset_clears_fields) {
     CHECK_EQ(loop.conns[cid].send_buf.write_avail(), 0u);
 }
 
+TEST(pool, free_conn_releases_connection_local_control_plane_snapshot) {
+    const auto run = [&](auto& loop) {
+        loop.setup();
+        Connection* conn = loop.alloc_conn();
+        REQUIRE(conn != nullptr);
+        auto* ctx = conn->reset_jit_ctx();
+        REQUIRE(jit::acquire_control_plane_snapshot(ctx) != nullptr);
+        REQUIRE(ctx->control_plane != nullptr);
+
+        loop.free_conn(*conn);
+
+        CHECK(ctx->control_plane == nullptr);
+        CHECK(conn->handler_ctx == nullptr);
+    };
+
+    {
+        SmallLoop epoll_like;
+        run(epoll_like);
+    }
+    {
+        AsyncSmallLoop io_uring_like;
+        run(io_uring_like);
+    }
+}
+
 // === Dispatch Edge Cases ===
 
 TEST(dispatch, invalid_connid) {
@@ -4057,6 +4082,24 @@ TEST(upstream_reuse, pre_send_retry_allows_pipelined_suffix) {
     CHECK(rut::request_fully_resendable(*c));
 }
 
+TEST(upstream_reuse, captured_request_is_a_resendable_source) {
+    SmallLoop loop;
+    loop.setup();
+    auto* c = loop.alloc_conn();
+    REQUIRE(c != nullptr);
+    c->req_body_mode = BodyMode::None;
+    static const char request[] = "GET /captured HTTP/1.1\r\nHost: x\r\n\r\n";
+    static u8 captured_request[SlicePool::kSliceSize];
+    c->request_capture_slice = captured_request;
+    c->request_capture_len = sizeof(request) - 1;
+    __builtin_memcpy(c->request_capture_slice, request, c->request_capture_len);
+    c->recv_buf.reset();
+    c->retry_req_send_len = 0;
+
+    CHECK(rut::request_fully_resendable(*c));
+    c->request_capture_slice = nullptr;
+}
+
 // Finding (F3): on the snapshot-retry path the request was replayed from send_buf, so
 // recv_buf holds NO original request. If the client pipelines another request into
 // recv_buf while the fresh connect/send is in flight, the retry's on_upstream_request_-
@@ -4475,6 +4518,11 @@ static u64 route_table_dummy_handler(void*, jit::HandlerCtx*, const u8*, u32, vo
     return jit::HandlerResult::make_status(204).pack();
 }
 
+static u64 captured_passthrough_network_handler(
+    void*, jit::HandlerCtx* ctx, const u8*, u32, void*) {
+    return jit::HandlerResult::make_status(ctx->captured_response_valid ? 0 : 500).pack();
+}
+
 TEST(route, default_dispatch_kind_is_art_jit) {
     // Phase 2 default: ArtJit. Until install_art_jit_fn is called,
     // match() falls back to scalar ArtTrie::match — slower but
@@ -4603,6 +4651,12 @@ TEST(route, rir_function_needs_req_body_guard_paths) {
 
     insts[0].op = rir::Opcode::RetForwardBuffered;
     CHECK(!rir_function_needs_req_body(fn));
+    CHECK(rir_function_can_forward_buffered(fn));
+
+    u8 yield_kind = static_cast<u8>(jit::YieldKind::Forward);
+    fn.yield_count = 1;
+    fn.yield_kinds = &yield_kind;
+    insts[0].op = rir::Opcode::YieldTimer;
     CHECK(rir_function_can_forward_buffered(fn));
 }
 
@@ -14983,6 +15037,18 @@ TEST(buffered_forward, h2_rejects_body_longer_than_content_length) {
     c->h2 = nullptr;
 }
 
+TEST(buffered_forward, h2_capture_budget_includes_generated_framing) {
+    hpack::Encoder encoder;
+    encoder.init(4096);
+    CHECK_EQ(h2_captured_generated_header_reserve(encoder, 299, 1000), 34u);
+
+    encoder.set_table_size(0);
+    encoder.set_table_size(4096);
+    const u32 reserve_with_updates = h2_captured_generated_header_reserve(encoder, 299, 1000);
+    CHECK_GT(reserve_with_updates, 34u);
+    CHECK_GT(8160u + reserve_with_updates, 8192u);
+}
+
 TEST(state_invariant, proxy_timeout_clears_proxy_slots) {
     SmallLoop loop;
     loop.setup();
@@ -15034,6 +15100,77 @@ TEST(state_invariant, h2_proxy_timeout_tears_down_upstream_before_sending_504) {
     CHECK_EQ(c->on_send, &on_h2_sent<SmallLoop>);
 
     // The mock connection does not own stack-backed Http2Conn storage.
+    c->h2 = nullptr;
+}
+
+TEST(state_invariant, h2_followup_proxy_flush_releases_prior_capture) {
+    SmallLoop loop;
+    loop.setup();
+    loop.inject_and_dispatch(make_ev(0, IoEventType::Accept, 42));
+    auto* c = loop.find_fd(42);
+    REQUIRE(c != nullptr);
+
+    Http2Conn h2{};
+    h2.init();
+    h2.async_stream = 1;
+    h2.async_kind = H2AsyncKind::Proxy;
+    c->h2 = &h2;
+    c->protocol = ConnProtocol::Http2;
+    c->epoch_held = true;
+    // SmallLoop has no SlicePool; the pointer is only an ownership sentinel for
+    // this callback-level regression.
+    c->response_capture_slice = c->recv_slice;
+    static const u8 kResponse[] = {0, 0, 0, 1};
+
+    h2_proxy_flush(&loop, *c, kResponse, sizeof(kResponse));
+
+    CHECK_EQ(c->response_capture_slice, nullptr);
+    CHECK_EQ(h2.async_stream, 0u);
+    CHECK(!c->epoch_held);
+    CHECK_EQ(c->on_send, &on_h2_sent<SmallLoop>);
+    c->h2 = nullptr;
+}
+
+TEST(state_invariant, h2_metrics_complete_only_after_full_downstream_send) {
+    SmallLoop loop;
+    loop.setup();
+    loop.inject_and_dispatch(make_ev(0, IoEventType::Accept, 42));
+    auto* c = loop.find_fd(42);
+    REQUIRE(c != nullptr);
+
+    ShardMetrics metrics;
+    metrics.init();
+    metrics.on_request_start();
+    loop.metrics = &metrics;
+    Http2Conn h2{};
+    h2.init();
+    h2.metrics = &metrics;
+    h2.nstreams = 1;
+    h2.streams[0] = {1,
+                     Http2StreamState::Closed,
+                     kDefaultInitialWindowSize,
+                     kDefaultInitialWindowSize,
+                     true,
+                     true,
+                     true,
+                     monotonic_us()};
+    c->h2 = &h2;
+    c->protocol = ConnProtocol::Http2;
+    c->keep_alive = true;
+    static const u8 kResponse[] = {1, 2, 3, 4};
+    c->send_buf.write(kResponse, sizeof(kResponse));
+
+    on_h2_sent<SmallLoop>(&loop, *c, make_ev(c->id, IoEventType::Send, 2));
+    CHECK_EQ(metrics.requests_active, 1u);
+    CHECK_EQ(metrics.requests_total, 0u);
+    CHECK_EQ(c->send_progress, 2u);
+
+    on_h2_sent<SmallLoop>(&loop, *c, make_ev(c->id, IoEventType::Send, 2));
+    CHECK_EQ(metrics.requests_active, 0u);
+    CHECK_EQ(metrics.requests_total, 1u);
+    CHECK_FALSE(h2.streams[0].metrics_started);
+    CHECK_FALSE(h2.streams[0].metrics_pending_send);
+
     c->h2 = nullptr;
 }
 
@@ -18517,6 +18654,234 @@ TEST(response_headers, dynamic_mutations_merge_with_static_headers_in_order) {
         &ctx, &cfg, 1, out, static_cast<u32>(std::size(out)), &count));
 }
 
+TEST(response_headers, captured_body_replacement_drops_representation_metadata) {
+    jit::HandlerCtx ctx{};
+    const jit::CapturedResponseHeader captured_headers[] = {
+        {{"Content-Encoding", 16}, {"gzip", 4}},
+        {{"Content-Range", 13}, {"bytes 0-3/10", 12}},
+        {{"ETag", 4}, {"\"upstream\"", 10}},
+        {{"Last-Modified", 13}, {"Sat, 25 Jul 2026 09:00:00 GMT", 29}},
+        {{"Digest", 6}, {"sha-256=upstream", sizeof("sha-256=upstream") - 1}},
+        {{"Content-Digest", 14}, {"sha-256=:upstream:", sizeof("sha-256=:upstream:") - 1}},
+        {{"Repr-Digest", 11}, {"sha-256=:upstream:", sizeof("sha-256=:upstream:") - 1}},
+        {{"Content-MD5", 11}, {"upstream", 8}},
+        {{"Content-Length", 14}, {"4", 1}},
+        {{"Content-Type", 12},
+         {"multipart/byteranges; boundary=old", sizeof("multipart/byteranges; boundary=old") - 1}},
+        {{"Content-Type", 12}, {"text/plain", 10}},
+    };
+    ctx.captured_response_valid = true;
+    ctx.response_body_mutation_set = true;
+    ctx.captured_response_headers = captured_headers;
+    ctx.captured_response_header_count = static_cast<u32>(std::size(captured_headers));
+
+    ResponseHeaderKV out[jit::kMaxCapturedResponseHeaders];
+    u32 count = 0;
+    REQUIRE(collect_effective_response_headers(
+        &ctx, nullptr, 0, out, static_cast<u32>(std::size(out)), &count));
+    REQUIRE_EQ(count, 1u);
+    CHECK((Str{out[0].key_data, out[0].key_len}.eq(Str{"Content-Type", 12})));
+}
+
+TEST(response_headers, captured_416_body_replacement_preserves_unsatisfied_range) {
+    jit::HandlerCtx ctx{};
+    const jit::CapturedResponseHeader captured_headers[] = {
+        {{"Content-Range", 13}, {"bytes */100", 11}},
+    };
+    ctx.captured_response_valid = true;
+    ctx.response_body_mutation_set = true;
+    ctx.captured_response_headers = captured_headers;
+    ctx.captured_response_header_count = 1;
+
+    ResponseHeaderKV out[jit::kMaxCapturedResponseHeaders];
+    u32 count = 0;
+    REQUIRE(collect_effective_response_headers(
+        &ctx, nullptr, 0, out, static_cast<u32>(std::size(out)), &count, true, 416));
+    REQUIRE_EQ(count, 1u);
+    CHECK(normalize_partial_content_headers(out, &count, 416));
+}
+
+TEST(response_headers, captured_final_206_requires_valid_range_metadata) {
+    SmallLoop loop;
+    loop.setup();
+    loop.inject_and_dispatch(make_ev(0, IoEventType::Accept, 42));
+    auto* conn = loop.find_fd(42);
+    REQUIRE(conn != nullptr);
+
+    jit::HandlerCtx response_ctx{};
+    response_ctx.captured_response_valid = true;
+    response_ctx.captured_response_status = 200;
+    response_ctx.response_status_set = true;
+    response_ctx.response_status = 206;
+    response_ctx.response_body_mutation_set = true;
+    static constexpr char kBody[] = "data";
+    JitDispatchOutcome outcome{};
+    outcome.kind = JitDispatchOutcome::Kind::ReturnStatus;
+    outcome.status_code = 206;
+    outcome.dynamic_response_body = kBody;
+    outcome.dynamic_response_body_len = sizeof(kBody) - 1;
+    outcome.response_ctx = &response_ctx;
+    outcome.uses_captured_response = true;
+
+    handle_jit_outcome<SmallLoop>(
+        &loop, *conn, outcome, &state_invariant_wait_recv_then_status, true);
+
+    const char* wire = reinterpret_cast<const char*>(conn->send_buf.data());
+    CHECK_EQ(conn->resp_status, 500u);
+    CHECK(buf_contains(wire, conn->send_buf.len(), "HTTP/1.1 500", 12));
+}
+
+TEST(response_headers, captured_partial_status_promotion_requires_body_replacement) {
+    SmallLoop loop;
+    loop.setup();
+    loop.inject_and_dispatch(make_ev(0, IoEventType::Accept, 42));
+    auto* conn = loop.find_fd(42);
+    REQUIRE(conn != nullptr);
+
+    static constexpr char kBody[] = "part";
+    jit::HandlerCtx response_ctx{};
+    response_ctx.captured_response_valid = true;
+    response_ctx.captured_response_status = 206;
+    JitDispatchOutcome outcome{};
+    outcome.kind = JitDispatchOutcome::Kind::ReturnStatus;
+    outcome.status_code = 200;
+    outcome.dynamic_response_body = kBody;
+    outcome.dynamic_response_body_len = sizeof(kBody) - 1;
+    outcome.response_ctx = &response_ctx;
+    outcome.uses_captured_response = true;
+
+    handle_jit_outcome<SmallLoop>(
+        &loop, *conn, outcome, &state_invariant_wait_recv_then_status, true);
+
+    const char* wire = reinterpret_cast<const char*>(conn->send_buf.data());
+    CHECK_EQ(conn->resp_status, 500u);
+    CHECK(buf_contains(wire, conn->send_buf.len(), "HTTP/1.1 500", 12));
+    CHECK_FALSE(conn->keep_alive);
+}
+
+TEST(response_headers, captured_bodyless_status_promotion_requires_body_replacement) {
+    for (const u16 captured_status : {u16{204}, u16{205}, u16{304}}) {
+        SmallLoop loop;
+        loop.setup();
+        loop.inject_and_dispatch(make_ev(0, IoEventType::Accept, 42));
+        auto* conn = loop.find_fd(42);
+        REQUIRE(conn != nullptr);
+
+        jit::HandlerCtx response_ctx{};
+        response_ctx.captured_response_valid = true;
+        response_ctx.captured_response_status = captured_status;
+        JitDispatchOutcome outcome{};
+        outcome.kind = JitDispatchOutcome::Kind::ReturnStatus;
+        outcome.status_code = 200;
+        outcome.response_ctx = &response_ctx;
+        outcome.uses_captured_response = true;
+
+        handle_jit_outcome<SmallLoop>(
+            &loop, *conn, outcome, &state_invariant_wait_recv_then_status, true);
+
+        const char* wire = reinterpret_cast<const char*>(conn->send_buf.data());
+        CHECK_EQ(conn->resp_status, 500u);
+        CHECK(buf_contains(wire, conn->send_buf.len(), "HTTP/1.1 500", 12));
+        CHECK_FALSE(conn->keep_alive);
+    }
+}
+
+TEST(response_headers, captured_head_206_validates_mutated_body_range_length) {
+    SmallLoop loop;
+    loop.setup();
+    loop.inject_and_dispatch(make_ev(0, IoEventType::Accept, 42));
+    auto* conn = loop.find_fd(42);
+    REQUIRE(conn != nullptr);
+    conn->req_method = static_cast<u8>(LogHttpMethod::Head);
+
+    static constexpr char kRangeName[] = "Content-Range";
+    static constexpr char kRangeValue[] = "bytes 0-9/100";
+    jit::HandlerCtx response_ctx{};
+    response_ctx.captured_response_valid = true;
+    response_ctx.captured_response_status = 200;
+    response_ctx.response_status_set = true;
+    response_ctx.response_status = 206;
+    response_ctx.response_body_mutation_set = true;
+    response_ctx.response_header_mutations[0] = {{kRangeName, sizeof(kRangeName) - 1},
+                                                 {kRangeValue, sizeof(kRangeValue) - 1},
+                                                 jit::ResponseHeaderMutationMode::Set};
+    response_ctx.response_header_count = 1;
+    static constexpr char kBody[] = "data";
+    JitDispatchOutcome outcome{};
+    outcome.kind = JitDispatchOutcome::Kind::ReturnStatus;
+    outcome.status_code = 206;
+    outcome.dynamic_response_body = kBody;
+    outcome.dynamic_response_body_len = sizeof(kBody) - 1;
+    outcome.response_ctx = &response_ctx;
+    outcome.uses_captured_response = true;
+
+    handle_jit_outcome<SmallLoop>(
+        &loop, *conn, outcome, &state_invariant_wait_recv_then_status, true);
+
+    const char* wire = reinterpret_cast<const char*>(conn->send_buf.data());
+    CHECK_EQ(conn->resp_status, 500u);
+    CHECK(buf_contains(wire, conn->send_buf.len(), "HTTP/1.1 500", 12));
+}
+
+TEST(response_headers, captured_head_206_validates_retained_content_length) {
+    SmallLoop loop;
+    loop.setup();
+    loop.inject_and_dispatch(make_ev(0, IoEventType::Accept, 42));
+    auto* conn = loop.find_fd(42);
+    REQUIRE(conn != nullptr);
+    conn->req_method = static_cast<u8>(LogHttpMethod::Head);
+
+    const jit::CapturedResponseHeader captured_headers[] = {
+        {{"Content-Length", 14}, {"4", 1}},
+        {{"Content-Range", 13}, {"bytes 0-9/100", 13}},
+    };
+    jit::HandlerCtx response_ctx{};
+    response_ctx.captured_response_valid = true;
+    response_ctx.captured_response_status = 206;
+    response_ctx.captured_response_headers = captured_headers;
+    response_ctx.captured_response_header_count = 2;
+    JitDispatchOutcome outcome{};
+    outcome.kind = JitDispatchOutcome::Kind::ReturnStatus;
+    outcome.status_code = 206;
+    outcome.response_ctx = &response_ctx;
+    outcome.uses_captured_response = true;
+
+    handle_jit_outcome<SmallLoop>(
+        &loop, *conn, outcome, &state_invariant_wait_recv_then_status, true);
+
+    const char* wire = reinterpret_cast<const char*>(conn->send_buf.data());
+    CHECK_EQ(conn->resp_status, 500u);
+    CHECK(buf_contains(wire, conn->send_buf.len(), "HTTP/1.1 500", 12));
+}
+
+TEST(response_headers, captured_connect_status_mutation_to_success_returns_bad_gateway) {
+    SmallLoop loop;
+    loop.setup();
+    loop.inject_and_dispatch(make_ev(0, IoEventType::Accept, 42));
+    auto* conn = loop.find_fd(42);
+    REQUIRE(conn != nullptr);
+    conn->req_method = static_cast<u8>(LogHttpMethod::Connect);
+
+    jit::HandlerCtx response_ctx{};
+    response_ctx.captured_response_valid = true;
+    response_ctx.captured_response_status = 403;
+    response_ctx.response_status_set = true;
+    response_ctx.response_status = 200;
+    JitDispatchOutcome outcome{};
+    outcome.kind = JitDispatchOutcome::Kind::ReturnStatus;
+    outcome.status_code = 200;
+    outcome.response_ctx = &response_ctx;
+    outcome.uses_captured_response = true;
+
+    handle_jit_outcome<SmallLoop>(
+        &loop, *conn, outcome, &state_invariant_wait_recv_then_status, true);
+
+    const char* wire = reinterpret_cast<const char*>(conn->send_buf.data());
+    CHECK_EQ(conn->resp_status, 502u);
+    CHECK(buf_contains(wire, conn->send_buf.len(), "HTTP/1.1 502", 12));
+    CHECK_FALSE(conn->keep_alive);
+}
+
 TEST(response_body, mutation_storage_is_released_after_http1_serialization) {
     SmallLoop loop;
     loop.setup();
@@ -18577,6 +18942,342 @@ TEST(response_headers, head_header_collection_failure_suppresses_fallback_body) 
     }
     REQUIRE(header_end != 0);
     CHECK_EQ(header_end, conn->send_buf.len());
+}
+
+TEST(response_headers, captured_304_preserves_representation_content_length) {
+    SmallLoop loop;
+    loop.setup();
+    loop.inject_and_dispatch(make_ev(0, IoEventType::Accept, 42));
+    auto* conn = loop.find_fd(42);
+    REQUIRE(conn != nullptr);
+
+    jit::HandlerCtx response_ctx{};
+    jit::CapturedResponseHeader captured_headers[] = {
+        {{"Content-Length", 14}, {"123", 3}},
+    };
+    response_ctx.captured_response_valid = true;
+    response_ctx.captured_response_status = 304;
+    response_ctx.captured_response_header_count = 1;
+    response_ctx.captured_response_headers = captured_headers;
+
+    JitDispatchOutcome outcome{};
+    outcome.kind = JitDispatchOutcome::Kind::ReturnStatus;
+    outcome.status_code = 304;
+    outcome.response_ctx = &response_ctx;
+    outcome.uses_captured_response = true;
+    handle_jit_outcome<SmallLoop>(
+        &loop, *conn, outcome, &state_invariant_wait_recv_then_status, true);
+
+    const char* wire = reinterpret_cast<const char*>(conn->send_buf.data());
+    CHECK(buf_contains(wire, conn->send_buf.len(), "HTTP/1.1 304", 12));
+    CHECK(buf_contains(wire, conn->send_buf.len(), "Content-Length: 123\r\n", 21));
+}
+
+TEST(response_headers, captured_205_preserves_explicit_zero_content_length) {
+    SmallLoop loop;
+    loop.setup();
+    loop.inject_and_dispatch(make_ev(0, IoEventType::Accept, 42));
+    auto* conn = loop.find_fd(42);
+    REQUIRE(conn != nullptr);
+
+    jit::HandlerCtx response_ctx{};
+    jit::CapturedResponseHeader captured_headers[] = {
+        {{"Content-Length", 14}, {"0", 1}},
+    };
+    response_ctx.captured_response_valid = true;
+    response_ctx.captured_response_status = 205;
+    response_ctx.captured_response_header_count = 1;
+    response_ctx.captured_response_headers = captured_headers;
+
+    JitDispatchOutcome outcome{};
+    outcome.kind = JitDispatchOutcome::Kind::ReturnStatus;
+    outcome.status_code = 205;
+    outcome.response_ctx = &response_ctx;
+    outcome.uses_captured_response = true;
+    handle_jit_outcome<SmallLoop>(
+        &loop, *conn, outcome, &state_invariant_wait_recv_then_status, true);
+
+    const char* wire = reinterpret_cast<const char*>(conn->send_buf.data());
+    CHECK(buf_contains(wire, conn->send_buf.len(), "HTTP/1.1 205", 12));
+    CHECK(buf_contains(wire, conn->send_buf.len(), "Content-Length: 0\r\n", 19));
+    CHECK(buf_contains(wire, conn->send_buf.len(), "Connection: keep-alive\r\n", 24));
+}
+
+TEST(response_capture, captured_205_preserves_zero_content_length_end_to_end) {
+    SmallLoop loop;
+    loop.setup();
+    loop.inject_and_dispatch(make_ev(0, IoEventType::Accept, 42));
+    auto* conn = loop.find_fd(42);
+    REQUIRE(conn != nullptr);
+    conn->reset_jit_ctx();
+    conn->pending_handler_fn = &captured_passthrough_network_handler;
+    conn->proxy_response_buffered = true;
+    conn->proxy_response_capture = true;
+    static u8 response_capture[SlicePool::kSliceSize];
+    conn->response_capture_slice = response_capture;
+    conn->req_keep_alive = true;
+    conn->keep_alive = true;
+
+    ParsedResponse response{};
+    response.reset();
+    response.status_code = 205;
+    response.has_content_length = true;
+    response.content_length = 0;
+    response.header_count = 1;
+    response.headers[0].name = {"Content-Length", 14};
+    response.headers[0].value = {"0", 1};
+    HttpResponseParser parser;
+    parser.reset();
+
+    finish_buffered_forward<SmallLoop>(&loop, *conn, response, parser, 0);
+
+    const char* wire = reinterpret_cast<const char*>(conn->send_buf.data());
+    CHECK_EQ(conn->resp_status, 205u);
+    CHECK(buf_contains(wire, conn->send_buf.len(), "HTTP/1.1 205", 12));
+    CHECK(buf_contains(wire, conn->send_buf.len(), "Content-Length: 0\r\n", 19));
+    CHECK(buf_contains(wire, conn->send_buf.len(), "Connection: keep-alive\r\n", 24));
+}
+
+TEST(response_capture, oversized_declared_request_returns_payload_too_large) {
+    SmallLoop loop;
+    loop.setup();
+    loop.inject_and_dispatch(make_ev(0, IoEventType::Accept, 42));
+    auto* conn = loop.find_fd(42);
+    REQUIRE(conn != nullptr);
+
+    RouteConfig config{};
+    const auto upstream = config.add_upstream("api", 0x7f000001, 8080);
+    REQUIRE(upstream.has_value());
+    conn->request_config = &config;
+    conn->req_body_mode = BodyMode::ContentLength;
+    conn->req_header_end = 32;
+    conn->req_content_length = SlicePool::kSliceSize;
+    conn->req_initial_send_len = 32;
+
+    JitDispatchOutcome outcome{};
+    outcome.kind = JitDispatchOutcome::Kind::ForwardCapture;
+    outcome.upstream_id = upstream.value();
+    handle_jit_outcome<SmallLoop>(
+        &loop, *conn, outcome, &state_invariant_wait_recv_then_status, true);
+
+    const char* wire = reinterpret_cast<const char*>(conn->send_buf.data());
+    CHECK_EQ(conn->resp_status, 413u);
+    CHECK(buf_contains(wire, conn->send_buf.len(), "HTTP/1.1 413", 12));
+}
+
+TEST(response_capture, incremental_chunked_request_overflow_returns_payload_too_large) {
+    SmallLoop loop;
+    loop.setup();
+    loop.inject_and_dispatch(make_ev(0, IoEventType::Accept, 42));
+    auto* conn = loop.find_fd(42);
+    REQUIRE(conn != nullptr);
+
+    static u8 request_capture[SlicePool::kSliceSize];
+    conn->request_capture_slice = request_capture;
+    conn->request_capture_len = SlicePool::kSliceSize - 4;
+    conn->proxy_response_capture = true;
+    conn->req_body_mode = BodyMode::Chunked;
+    conn->req_chunk_parser.reset();
+    static constexpr u8 kBody[] = "8\r\n12345678\r\n0\r\n\r\n";
+    conn->recv_buf.reset();
+    REQUIRE_EQ(conn->recv_buf.write(kBody, sizeof(kBody) - 1), sizeof(kBody) - 1);
+
+    on_request_body_recvd<SmallLoop>(
+        static_cast<void*>(&loop), *conn, make_ev(conn->id, IoEventType::Recv, sizeof(kBody) - 1));
+
+    const char* wire = reinterpret_cast<const char*>(conn->send_buf.data());
+    CHECK_EQ(conn->resp_status, 413u);
+    CHECK(conn->upstream_request_incomplete);
+    CHECK(buf_contains(wire, conn->send_buf.len(), "HTTP/1.1 413", 12));
+    conn->request_capture_slice = nullptr;
+}
+
+TEST(response_capture, oversized_upstream_header_storage_returns_bad_gateway) {
+    SmallLoop loop;
+    loop.setup();
+    loop.inject_and_dispatch(make_ev(0, IoEventType::Accept, 42));
+    auto* conn = loop.find_fd(42);
+    REQUIRE(conn != nullptr);
+    conn->reset_jit_ctx();
+    conn->proxy_response_capture = true;
+    static u8 response_capture[SlicePool::kSliceSize];
+    conn->response_capture_slice = response_capture;
+
+    static char large_name[SlicePool::kSliceSize];
+    __builtin_memset(large_name, 'x', sizeof(large_name));
+    ParsedResponse response{};
+    response.reset();
+    response.status_code = 200;
+    response.header_count = 1;
+    response.headers[0].name = {large_name, sizeof(large_name)};
+    response.headers[0].value = {"v", 1};
+    HttpResponseParser parser;
+    parser.reset();
+
+    finish_buffered_forward<SmallLoop>(&loop, *conn, response, parser, 0);
+
+    const char* wire = reinterpret_cast<const char*>(conn->send_buf.data());
+    CHECK_EQ(conn->resp_status, 502u);
+    CHECK(buf_contains(wire, conn->send_buf.len(), "HTTP/1.1 502", 12));
+    conn->response_capture_slice = nullptr;
+}
+
+TEST(response_capture, h2_oversized_upstream_header_storage_returns_bad_gateway) {
+    SmallLoop loop;
+    loop.setup();
+    loop.inject_and_dispatch(make_ev(0, IoEventType::Accept, 42));
+    auto* conn = loop.find_fd(42);
+    REQUIRE(conn != nullptr);
+    conn->reset_jit_ctx();
+    Http2Conn h2{};
+    h2.init();
+    h2.async_stream = 1;
+    h2.async_capture_response = true;
+    conn->h2 = &h2;
+    conn->protocol = ConnProtocol::Http2;
+    static u8 response_capture[SlicePool::kSliceSize];
+    conn->response_capture_slice = response_capture;
+
+    static char large_name[SlicePool::kSliceSize];
+    __builtin_memset(large_name, 'x', sizeof(large_name));
+    ParsedResponse response{};
+    response.reset();
+    response.status_code = 200;
+    response.header_count = 1;
+    response.headers[0].name = {large_name, sizeof(large_name)};
+    response.headers[0].value = {"v", 1};
+
+    h2_proxy_finish<SmallLoop>(&loop, *conn, response, 0, 0, false);
+
+    Http2FrameHeader frame{};
+    REQUIRE(parse_frame_header(conn->send_buf.data(), conn->send_buf.len(), &frame) ==
+            ParseStatus::Complete);
+    hpack::DynamicTable dyn;
+    dyn.init(4096);
+    hpack::Header decoded[4];
+    u8 scratch[64];
+    u32 decoded_count = 0;
+    REQUIRE(hpack::decode_header_block(dyn,
+                                       conn->send_buf.data() + kFrameHeaderSize,
+                                       frame.length,
+                                       scratch,
+                                       sizeof(scratch),
+                                       decoded,
+                                       4,
+                                       &decoded_count));
+    REQUIRE_EQ(decoded_count, 1u);
+    CHECK(decoded[0].name.eq({":status", 7}));
+    CHECK(decoded[0].value.eq({"502", 3}));
+    conn->response_capture_slice = nullptr;
+}
+
+TEST(response_headers, captured_head_205_drops_content_length) {
+    SmallLoop loop;
+    loop.setup();
+    loop.inject_and_dispatch(make_ev(0, IoEventType::Accept, 42));
+    auto* conn = loop.find_fd(42);
+    REQUIRE(conn != nullptr);
+    conn->req_method = static_cast<u8>(LogHttpMethod::Head);
+
+    jit::HandlerCtx response_ctx{};
+    jit::CapturedResponseHeader captured_headers[] = {
+        {{"Content-Length", 14}, {"123", 3}},
+    };
+    response_ctx.captured_response_valid = true;
+    response_ctx.captured_response_status = 200;
+    response_ctx.captured_response_header_count = 1;
+    response_ctx.captured_response_headers = captured_headers;
+
+    JitDispatchOutcome outcome{};
+    outcome.kind = JitDispatchOutcome::Kind::ReturnStatus;
+    outcome.status_code = 205;
+    outcome.response_ctx = &response_ctx;
+    outcome.uses_captured_response = true;
+    handle_jit_outcome<SmallLoop>(
+        &loop, *conn, outcome, &state_invariant_wait_recv_then_status, true);
+
+    const char* wire = reinterpret_cast<const char*>(conn->send_buf.data());
+    CHECK(buf_contains(wire, conn->send_buf.len(), "HTTP/1.1 205", 12));
+    CHECK_FALSE(buf_contains(wire, conn->send_buf.len(), "Content-Length:", 15));
+}
+
+TEST(response_headers, h2_captured_head_bodyless_status_drops_content_length) {
+    for (const u16 status : {u16{204}, u16{205}}) {
+        SmallLoop loop;
+        loop.setup();
+        loop.inject_and_dispatch(make_ev(0, IoEventType::Accept, 42));
+        auto* conn = loop.find_fd(42);
+        REQUIRE(conn != nullptr);
+        Http2Conn h2{};
+        h2.init();
+        conn->h2 = &h2;
+        conn->protocol = ConnProtocol::Http2;
+
+        jit::HandlerCtx response_ctx{};
+        jit::CapturedResponseHeader captured_headers[] = {
+            {{"Content-Length", 14}, {"123", 3}},
+        };
+        response_ctx.captured_response_valid = true;
+        response_ctx.captured_response_status = 200;
+        response_ctx.captured_response_header_count = 1;
+        response_ctx.captured_response_headers = captured_headers;
+
+        JitDispatchOutcome outcome{};
+        outcome.kind = JitDispatchOutcome::Kind::ReturnStatus;
+        outcome.status_code = status;
+        outcome.response_ctx = &response_ctx;
+        outcome.uses_captured_response = true;
+        u8 wire[512];
+        H2Dispatch<SmallLoop> dispatch{&loop, conn, wire, sizeof(wire), 0, false};
+        h2_emit_outcome(dispatch, 1, outcome, nullptr, true);
+
+        Http2FrameHeader frame{};
+        REQUIRE(parse_frame_header(wire, dispatch.resp_len, &frame) == ParseStatus::Complete);
+        REQUIRE_EQ(frame.type, static_cast<u8>(Http2FrameType::Headers));
+        hpack::DynamicTable dynamic_table;
+        dynamic_table.init(4096);
+        hpack::Header headers[8];
+        u8 scratch[128];
+        u32 header_count = 0;
+        REQUIRE(hpack::decode_header_block(dynamic_table,
+                                           wire + kFrameHeaderSize,
+                                           frame.length,
+                                           scratch,
+                                           sizeof(scratch),
+                                           headers,
+                                           static_cast<u32>(std::size(headers)),
+                                           &header_count));
+        bool found_content_length = false;
+        for (u32 i = 0; i < header_count; i++)
+            found_content_length |= headers[i].name.eq(Str{"content-length", 14});
+        CHECK_FALSE(found_content_length);
+        conn->h2 = nullptr;
+    }
+}
+
+TEST(response_headers, captured_body_preserves_absent_content_type) {
+    SmallLoop loop;
+    loop.setup();
+    loop.inject_and_dispatch(make_ev(0, IoEventType::Accept, 42));
+    auto* conn = loop.find_fd(42);
+    REQUIRE(conn != nullptr);
+
+    jit::HandlerCtx response_ctx{};
+    response_ctx.captured_response_valid = true;
+    static constexpr char kBody[] = "data";
+    JitDispatchOutcome outcome{};
+    outcome.kind = JitDispatchOutcome::Kind::ReturnStatus;
+    outcome.status_code = 200;
+    outcome.dynamic_response_body = kBody;
+    outcome.dynamic_response_body_len = sizeof(kBody) - 1;
+    outcome.response_ctx = &response_ctx;
+    outcome.uses_captured_response = true;
+    handle_jit_outcome<SmallLoop>(
+        &loop, *conn, outcome, &state_invariant_wait_recv_then_status, true);
+
+    const char* wire = reinterpret_cast<const char*>(conn->send_buf.data());
+    CHECK_FALSE(buf_contains(wire, conn->send_buf.len(), "Content-Type:", 13));
+    CHECK(buf_contains(wire, conn->send_buf.len(), "\r\n\r\ndata", 8));
 }
 
 int main(int argc, char** argv) {

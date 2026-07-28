@@ -97,6 +97,7 @@ struct RouteEntry {
     jit::HandlerFn fn = nullptr;  // JIT-compiled handler (if action == JitHandler)
     bool needs_req_body = false;  // JIT handler reads req.body and needs the full body buffered
     bool can_forward_buffered = false;  // H2 must retain DATA until buffered-forward dispatch
+    bool needs_control_plane_snapshot = false;
     // Per-route rate limit (fixed window). Empty rule set = unlimited. Each rule
     // allows `max` requests per `window_sec` metered by its own key (IP / header
     // / query / cookie / param tuple; empty key = per-client-IP). A request must
@@ -245,9 +246,14 @@ struct RouteConfig {
         u32 interval_ms = 0;
         // `shard: N` — fire on that shard only; -1 = every shard (default).
         i32 shard = -1;
+        bool needs_control_plane_snapshot = false;
     };
     TimerEntry timers[kMaxTimers];
     u32 timer_count = 0;
+    // True when any compiled route or timer can observe stats()/metrics().
+    // The event loop uses this aggregate to avoid taking the metrics snapshot
+    // lock on every batch when no control-plane consumer exists.
+    bool has_control_plane_snapshot_consumer = false;
 
     // A shard-pinned timer whose selector is >= the configured shard count can
     // never fire (fire_due_timers only matches selector == shard_id). Called at
@@ -262,8 +268,12 @@ struct RouteConfig {
         return -1;
     }
 
-    bool add_timer(
-        const char* name, u32 name_len, u32 interval_ms, jit::HandlerFn fn, i32 shard = -1) {
+    bool add_timer(const char* name,
+                   u32 name_len,
+                   u32 interval_ms,
+                   jit::HandlerFn fn,
+                   i32 shard = -1,
+                   bool needs_control_plane_snapshot = false) {
         if (timer_count >= kMaxTimers || fn == nullptr || interval_ms == 0) return false;
         TimerEntry& t = timers[timer_count];
         const u32 kN = name_len < sizeof(t.name) - 1 ? name_len : sizeof(t.name) - 1;
@@ -273,7 +283,9 @@ struct RouteConfig {
         t.fn = fn;
         t.interval_ms = interval_ms;
         t.shard = shard;
+        t.needs_control_plane_snapshot = needs_control_plane_snapshot;
         timer_count++;
+        if (needs_control_plane_snapshot) has_control_plane_snapshot_consumer = true;
         return true;
     }
 
@@ -537,6 +549,7 @@ struct RouteConfig {
         r.fn = nullptr;
         r.needs_req_body = false;
         r.can_forward_buffered = false;
+        r.needs_control_plane_snapshot = false;
         if (!populate_dispatch_state(r)) {
             return false;  // active dispatch at capacity — fail loud
         }
@@ -694,6 +707,7 @@ struct RouteConfig {
         r.fn = nullptr;
         r.needs_req_body = false;
         r.can_forward_buffered = false;
+        r.needs_control_plane_snapshot = false;
         if (!populate_dispatch_state(r)) {
             return false;
         }
@@ -708,7 +722,8 @@ struct RouteConfig {
                          u8 method,
                          jit::HandlerFn fn,
                          bool needs_req_body = false,
-                         bool can_forward_buffered = false) {
+                         bool can_forward_buffered = false,
+                         bool needs_control_plane_snapshot = false) {
         if (route_count >= kMaxRoutes) return false;
         if (fn == nullptr) return false;
         if (!is_routable_path(path)) return false;
@@ -731,10 +746,12 @@ struct RouteConfig {
         r.fn = fn;
         r.needs_req_body = needs_req_body;
         r.can_forward_buffered = can_forward_buffered;
+        r.needs_control_plane_snapshot = needs_control_plane_snapshot;
         if (!populate_dispatch_state(r)) {
             return false;
         }
         route_count++;
+        if (needs_control_plane_snapshot) has_control_plane_snapshot_consumer = true;
         return true;
     }
 

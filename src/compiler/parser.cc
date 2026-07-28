@@ -487,6 +487,50 @@ struct Parser {
             expr.span = Span{start.start, rparen.value()->end, start.line, start.col};
             return expr;
         }
+        if (take(TokenType::KwForward)) {
+            // Expression-form forwarding is intentionally narrower than the
+            // terminal builder: it must be buffered so the resumed handler can
+            // own and inspect a complete response.
+            auto lparen = expect(TokenType::LParen);
+            if (!lparen) return core::make_unexpected(lparen.error());
+            auto upstream = expect(TokenType::Ident);
+            if (!upstream) return core::make_unexpected(upstream.error());
+            if (!take(TokenType::Comma))
+                return frontend_error(FrontendError::UnsupportedSyntax,
+                                      span_from(cur()),
+                                      lit_str("expression-form forward requires `buffered: true`"));
+            auto buffered = expect(TokenType::Ident);
+            if (!buffered) return core::make_unexpected(buffered.error());
+            if (!buffered.value()->text.eq({"buffered", 8}))
+                return frontend_error(FrontendError::UnsupportedSyntax,
+                                      span_from(*buffered.value()),
+                                      lit_str("expression-form forward requires `buffered: true`"));
+            auto colon = expect(TokenType::Colon);
+            if (!colon) return core::make_unexpected(colon.error());
+            if (!take(TokenType::KwTrue))
+                return frontend_error(FrontendError::UnsupportedSyntax,
+                                      span_from(cur()),
+                                      lit_str("expression-form forward requires `buffered: true`"));
+            if (cur().type == TokenType::Comma)
+                return frontend_error(
+                    FrontendError::UnsupportedSyntax,
+                    span_from(cur()),
+                    lit_str("expression-form buffered forward does not support request rewrites"));
+            auto rparen = expect(TokenType::RParen);
+            if (!rparen) return core::make_unexpected(rparen.error());
+
+            AstExpr upstream_ref{};
+            upstream_ref.kind = AstExprKind::Ident;
+            upstream_ref.name = upstream.value()->text;
+            upstream_ref.span = span_from(*upstream.value());
+            auto upstream_ptr = alloc_expr(upstream_ref);
+            if (!upstream_ptr) return core::make_unexpected(upstream_ptr.error());
+            expr.kind = AstExprKind::Call;
+            expr.name = {"forward", 7};
+            expr.args.push(upstream_ptr.value());
+            expr.span = Span{start.start, rparen.value()->end, start.line, start.col};
+            return expr;
+        }
         if (take(TokenType::KwTrue)) {
             expr.kind = AstExprKind::BoolLit;
             expr.bool_value = true;
@@ -1908,6 +1952,14 @@ struct Parser {
             stmt.span = Span{start.start, rparen.value()->end, start.line, start.col};
             return stmt;
         }
+        if (cur().type == TokenType::KwBreak || cur().type == TokenType::KwContinue) {
+            const bool is_break = cur().type == TokenType::KwBreak;
+            const Token* keyword = take(cur().type);
+            AstStatement stmt{};
+            stmt.kind = is_break ? AstStmtKind::Break : AstStmtKind::Continue;
+            stmt.span = span_from(*keyword);
+            return stmt;
+        }
         if (take(TokenType::KwIf)) {
             const bool is_const = take(TokenType::KwConst) != nullptr;
             // `if let name = expr { ... } else { ... }` — value-binding form
@@ -1961,9 +2013,30 @@ struct Parser {
                                   lit_str("use 'for', not 'inline for'"));
         }
         if (cur().type == TokenType::KwFor) {
-            return frontend_error(FrontendError::UnsupportedSyntax,
-                                  span_from(cur()),
-                                  lit_str("for loops are unsupported in Rut Core"));
+            if (auto for_kw = expect(TokenType::KwFor); !for_kw)
+                return core::make_unexpected(for_kw.error());
+            auto var_name = expect(TokenType::Ident);
+            if (!var_name) return core::make_unexpected(var_name.error());
+            auto in_kw = take(TokenType::KwIn);
+            if (!in_kw)
+                return frontend_error(FrontendError::UnsupportedSyntax,
+                                      span_from(*var_name.value()),
+                                      lit_str("for loop expects 'in' after iterator name"));
+            auto iter_expr = parse_expr();
+            if (!iter_expr) return core::make_unexpected(iter_expr.error());
+            auto lbrace = expect(TokenType::LBrace);
+            if (!lbrace) return core::make_unexpected(lbrace.error());
+            auto body = parse_braced_stmt_body(*lbrace.value());
+            if (!body) return core::make_unexpected(body.error());
+            auto body_ptr = alloc_stmt(body.value());
+            if (!body_ptr) return core::make_unexpected(body_ptr.error());
+            AstStatement stmt{};
+            stmt.kind = AstStmtKind::For;
+            stmt.name = var_name.value()->text;
+            stmt.expr = iter_expr.value();
+            stmt.then_stmt = body_ptr.value();
+            stmt.span = Span{start.start, body->span.end, start.line, start.col};
+            return stmt;
         }
         if (take(TokenType::KwMatch)) {
             const bool is_const = take(TokenType::KwConst) != nullptr;

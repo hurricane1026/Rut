@@ -15,9 +15,11 @@
 
 #include "rut/runtime/access_log.h"  // monotonic_us
 #include "rut/runtime/connection.h"
+#include "rut/runtime/control_plane_snapshot.h"
 #include "rut/runtime/http2_conn.h"
 #include "rut/runtime/http_parser.h"  // http_method_str
 #include "rut/runtime/jit_dispatch.h"
+#include "rut/runtime/metrics.h"
 #include "rut/runtime/rate_limit_enforce.h"
 #include "rut/runtime/response_body_storage.h"
 #include "rut/runtime/route_method.h"
@@ -67,6 +69,29 @@ inline void h2_close_stream(Http2Conn* h2, u32 stream_id) {
     }
 }
 
+template <typename Loop>
+inline void h2_mark_request_metrics_pending(H2Dispatch<Loop>& d, u32 stream_id) {
+    Http2Stream* stream = d.conn->h2->find_stream(stream_id);
+    if (stream == nullptr || !stream->metrics_started) return;
+    stream->metrics_pending_send = true;
+}
+
+inline void h2_complete_sent_request_metrics(Http2Conn& h2) {
+    for (u32 i = 0; i < h2.nstreams; i++) {
+        auto& stream = h2.streams[i];
+        if (!stream.metrics_started || !stream.metrics_pending_send) continue;
+        if (h2.metrics != nullptr) {
+            const u64 now = monotonic_us();
+            const u64 elapsed = now >= stream.request_start_us ? now - stream.request_start_us : 0;
+            h2.metrics->on_request_complete(elapsed > 0xffffffffu ? 0xffffffffu
+                                                                  : static_cast<u32>(elapsed));
+        }
+        stream.metrics_started = false;
+        stream.metrics_pending_send = false;
+        stream.request_start_us = 0;
+    }
+}
+
 // Connection-specific (hop-by-hop) header names that MUST NOT appear in an HTTP/2
 // response (RFC 7540 §8.1.2.2). validate_response_header already blocks Connection
 // / Transfer-Encoding / Content-Length, but a route's response(headers:) set can
@@ -92,6 +117,193 @@ inline bool h2_response_header_mutations_valid(const jit::HandlerCtx* response_c
     return true;
 }
 
+inline bool response_body_replacement_invalidates_header(Str name) {
+    return http_header_name_eq_ci(name.ptr, name.len, "content-encoding", 16) ||
+           http_header_name_eq_ci(name.ptr, name.len, "content-language", 16) ||
+           http_header_name_eq_ci(name.ptr, name.len, "content-range", 13) ||
+           http_header_name_eq_ci(name.ptr, name.len, "etag", 4) ||
+           http_header_name_eq_ci(name.ptr, name.len, "last-modified", 13) ||
+           http_header_name_eq_ci(name.ptr, name.len, "digest", 6) ||
+           http_header_name_eq_ci(name.ptr, name.len, "content-digest", 14) ||
+           http_header_name_eq_ci(name.ptr, name.len, "repr-digest", 11) ||
+           http_header_name_eq_ci(name.ptr, name.len, "content-md5", 11);
+}
+
+inline bool parse_content_length_value(Str value, u64* out) {
+    if (value.len == 0 || value.ptr == nullptr || out == nullptr) return false;
+    u64 parsed = 0;
+    for (u32 i = 0; i < value.len; i++) {
+        const u32 digit = static_cast<u8>(value.ptr[i]) - static_cast<u8>('0');
+        if (digit > 9 || parsed > (UINT64_MAX - digit) / 10) return false;
+        parsed = parsed * 10 + digit;
+    }
+    *out = parsed;
+    return true;
+}
+
+inline bool valid_partial_content_range_value(Str value, u64* range_length) {
+    u32 pos = 0;
+    while (pos < value.len && (value.ptr[pos] == ' ' || value.ptr[pos] == '\t')) pos++;
+    if (value.len - pos < 6 || !http_header_name_eq_ci(value.ptr + pos, 5, "bytes", 5) ||
+        (value.ptr[pos + 5] != ' ' && value.ptr[pos + 5] != '\t'))
+        return false;
+    pos += 6;
+    while (pos < value.len && (value.ptr[pos] == ' ' || value.ptr[pos] == '\t')) pos++;
+    const auto parse_decimal = [&](u64* out) {
+        if (pos == value.len || value.ptr[pos] < '0' || value.ptr[pos] > '9') return false;
+        u64 parsed = 0;
+        do {
+            const u32 digit = static_cast<u32>(value.ptr[pos] - '0');
+            if (parsed > (UINT64_MAX - digit) / 10) return false;
+            parsed = parsed * 10 + digit;
+            pos++;
+        } while (pos < value.len && value.ptr[pos] >= '0' && value.ptr[pos] <= '9');
+        *out = parsed;
+        return true;
+    };
+    u64 first = 0;
+    u64 last = 0;
+    if (!parse_decimal(&first) || pos == value.len || value.ptr[pos] != '-') return false;
+    pos++;
+    if (!parse_decimal(&last) || first > last || pos == value.len || value.ptr[pos] != '/')
+        return false;
+    pos++;
+    u64 complete_length = 0;
+    if (pos == value.len) return false;
+    if (value.ptr[pos] == '*') {
+        pos++;
+    } else if (!parse_decimal(&complete_length) || complete_length == 0 ||
+               last >= complete_length) {
+        return false;
+    }
+    while (pos < value.len && (value.ptr[pos] == ' ' || value.ptr[pos] == '\t')) pos++;
+    if (last == UINT64_MAX || pos != value.len) return false;
+    *range_length = last - first + 1;
+    return true;
+}
+
+inline bool valid_unsatisfied_content_range_value(Str value) {
+    u32 pos = 0;
+    while (pos < value.len && (value.ptr[pos] == ' ' || value.ptr[pos] == '\t')) pos++;
+    if (value.len - pos < 8 || !http_header_name_eq_ci(value.ptr + pos, 5, "bytes", 5) ||
+        (value.ptr[pos + 5] != ' ' && value.ptr[pos + 5] != '\t'))
+        return false;
+    pos += 6;
+    while (pos < value.len && (value.ptr[pos] == ' ' || value.ptr[pos] == '\t')) pos++;
+    if (value.len - pos < 3 || value.ptr[pos] != '*') return false;
+    pos++;
+    if (value.ptr[pos] != '/') return false;
+    pos++;
+    if (pos == value.len || value.ptr[pos] < '0' || value.ptr[pos] > '9') return false;
+    while (pos < value.len && value.ptr[pos] >= '0' && value.ptr[pos] <= '9') {
+        pos++;
+    }
+    while (pos < value.len && (value.ptr[pos] == ' ' || value.ptr[pos] == '\t')) pos++;
+    return pos == value.len;
+}
+
+inline bool multipart_byteranges_has_boundary(Str value) {
+    static constexpr char kMultipart[] = "multipart/byteranges";
+    u32 start = 0;
+    while (start < value.len && (value.ptr[start] == ' ' || value.ptr[start] == '\t')) start++;
+    if (value.len - start < sizeof(kMultipart) - 1 ||
+        !http_header_name_eq_ci(
+            value.ptr + start, sizeof(kMultipart) - 1, kMultipart, sizeof(kMultipart) - 1))
+        return false;
+    u32 pos = start + sizeof(kMultipart) - 1;
+    if (pos < value.len && value.ptr[pos] != ';' && value.ptr[pos] != ' ' && value.ptr[pos] != '\t')
+        return false;
+    bool found_boundary = false;
+    while (pos < value.len) {
+        while (pos < value.len && (value.ptr[pos] == ' ' || value.ptr[pos] == '\t')) pos++;
+        if (pos == value.len) break;
+        if (value.ptr[pos] != ';') return false;
+        pos++;
+        while (pos < value.len && (value.ptr[pos] == ' ' || value.ptr[pos] == '\t')) pos++;
+        const u32 name_start = pos;
+        while (pos < value.len && is_http_tchar(static_cast<u8>(value.ptr[pos]))) pos++;
+        const u32 name_len = pos - name_start;
+        if (name_len == 0) return false;
+        while (pos < value.len && (value.ptr[pos] == ' ' || value.ptr[pos] == '\t')) pos++;
+        if (pos == value.len || value.ptr[pos] != '=') return false;
+        pos++;
+        while (pos < value.len && (value.ptr[pos] == ' ' || value.ptr[pos] == '\t')) pos++;
+        const bool boundary =
+            http_header_name_eq_ci(value.ptr + name_start, name_len, "boundary", 8);
+        if (boundary && found_boundary) return false;
+        bool has_value = false;
+        if (pos < value.len && value.ptr[pos] == '"') {
+            pos++;
+            while (pos < value.len && value.ptr[pos] != '"') {
+                const u8 ch = static_cast<u8>(value.ptr[pos]);
+                if (ch == '\\') {
+                    pos++;
+                    if (pos == value.len) return false;
+                    const u8 escaped = static_cast<u8>(value.ptr[pos]);
+                    if (escaped == '\r' || escaped == '\n' || escaped == 0x7f ||
+                        (escaped < 0x20 && escaped != '\t'))
+                        return false;
+                } else if (ch == '\r' || ch == '\n' || ch == 0x7f || (ch < 0x20 && ch != '\t')) {
+                    return false;
+                }
+                has_value = true;
+                pos++;
+            }
+            if (pos == value.len) return false;
+            pos++;
+        } else {
+            while (pos < value.len && is_http_tchar(static_cast<u8>(value.ptr[pos]))) {
+                has_value = true;
+                pos++;
+            }
+        }
+        if (!has_value) return false;
+        if (boundary) found_boundary = true;
+        while (pos < value.len && (value.ptr[pos] == ' ' || value.ptr[pos] == '\t')) pos++;
+        if (pos < value.len && value.ptr[pos] != ';') return false;
+    }
+    return found_boundary;
+}
+
+inline bool h2_normalize_partial_content_headers(hpack::Header* headers,
+                                                 u32* header_count,
+                                                 u16 status,
+                                                 u64 representation_length,
+                                                 bool validate_length) {
+    bool found_range = false;
+    bool multipart = false;
+    for (u32 i = 0; i < *header_count; i++) {
+        if (!http_header_name_eq_ci(headers[i].name.ptr, headers[i].name.len, "content-type", 12))
+            continue;
+        multipart = multipart_byteranges_has_boundary(headers[i].value);
+        if (multipart) break;
+    }
+    for (u32 i = 0; i < *header_count;) {
+        if (!http_header_name_eq_ci(
+                headers[i].name.ptr, headers[i].name.len, "content-range", 13)) {
+            i++;
+            continue;
+        }
+        bool valid = false;
+        if (status == 206) {
+            u64 range_length = 0;
+            valid = !found_range &&
+                    valid_partial_content_range_value(headers[i].value, &range_length) &&
+                    (!validate_length || range_length == representation_length);
+        } else if (status == 416) {
+            valid = !found_range && valid_unsatisfied_content_range_value(headers[i].value);
+        } else {
+            for (u32 move = i + 1; move < *header_count; move++) headers[move - 1] = headers[move];
+            (*header_count)--;
+            continue;
+        }
+        if (!valid) return false;
+        found_range = true;
+        i++;
+    }
+    return status != 206 || (multipart ? !found_range : found_range);
+}
+
 template <typename Loop>
 void h2_emit_response(H2Dispatch<Loop>& d,
                       u32 stream_id,
@@ -114,6 +326,7 @@ void h2_emit_response(H2Dispatch<Loop>& d,
     if (kN != 0) {
         d.conn->h2->hpack_enc = enc;
         d.resp_len += kN;
+        h2_mark_request_metrics_pending(d, stream_id);
         h2_close_stream(d.conn->h2, stream_id);
         return;
     }
@@ -133,6 +346,7 @@ void h2_emit_response(H2Dispatch<Loop>& d,
     else {
         d.conn->h2->hpack_enc = enc;
         d.resp_len += kFallback;
+        h2_mark_request_metrics_pending(d, stream_id);
         h2_close_stream(d.conn->h2, stream_id);
     }
 }
@@ -192,6 +406,12 @@ inline u32 h2_u32_to_dec(u32 value, char* out) {
 inline bool h2_synth_request_is_head(const u8* synth, u32 synth_len) {
     return synth != nullptr && synth_len >= 5 && synth[0] == 'H' && synth[1] == 'E' &&
            synth[2] == 'A' && synth[3] == 'D' && synth[4] == ' ';
+}
+
+inline bool h2_synth_request_is_connect(const u8* synth, u32 synth_len) {
+    return synth != nullptr && synth_len >= 8 && synth[0] == 'C' && synth[1] == 'O' &&
+           synth[2] == 'N' && synth[3] == 'N' && synth[4] == 'E' && synth[5] == 'C' &&
+           synth[6] == 'T' && synth[7] == ' ';
 }
 
 // Synthesize a minimal HTTP/1 request from decoded h2 headers into out, so a JIT
@@ -295,8 +515,10 @@ inline void h2_clear_pending(Http2Conn& h2) {
     h2.pending_request_forwardable = false;
     h2.pending_overflow = false;
     h2.pending_preinvoked_forward = false;
+    h2.pending_forward_capture = false;
     h2.pending_preinvoked_timer = false;
     h2.pending_forward_upstream_id = 0;
+    h2.pending_forward_state = 0;
     h2.pending_timer_state = 0;
     h2.pending_timer_ms = 0;
     h2.pending_route_config = nullptr;
@@ -409,6 +631,22 @@ inline bool h2_strip_synth_te(u8* buf, u32* len, u32* body_start) {
     return false;
 }
 
+inline bool h2_remove_injected_content_length(u8* buf, u32* len, u32 body_start, u32 body_len) {
+    if (body_start < 4 || body_start > *len) return false;
+    u32 digits = 1;
+    for (u32 value = body_len; value >= 10; value /= 10) digits++;
+    static constexpr u32 kKeyLen = 16;
+    const u32 remove_len = kKeyLen + digits + 2;
+    const u32 at = body_start - 2;
+    if (remove_len > *len - at) return false;
+    static constexpr char kKey[] = "content-length: ";
+    for (u32 i = 0; i < kKeyLen; i++)
+        if (buf[at + i] != static_cast<u8>(kKey[i])) return false;
+    for (u32 i = at + remove_len; i < *len; i++) buf[i - remove_len] = buf[i];
+    *len -= remove_len;
+    return true;
+}
+
 template <typename Loop>
 bool h2_defer_until_data_end(H2Dispatch<Loop>& d,
                              u32 stream_id,
@@ -504,8 +742,24 @@ void h2_emit_outcome(H2Dispatch<Loop>& d,
                      u32 stream_id,
                      const JitDispatchOutcome& o,
                      const RouteConfig* cfg,
-                     bool head_request) {
+                     bool head_request,
+                     bool connect_request = false) {
     jit::ScopedResponseBodyMutationStorageRelease release_body_storage(o.response_ctx);
+    if (o.uses_captured_response && connect_request && o.status_code >= 200 &&
+        o.status_code < 300) {
+        h2_emit_status(d, stream_id, 502);
+        return;
+    }
+    if (o.uses_captured_response && o.response_ctx != nullptr &&
+        ((o.response_ctx->captured_response_status == 206 && o.status_code != 206) ||
+         (!head_request && (o.response_ctx->captured_response_status == 204 ||
+                            o.response_ctx->captured_response_status == 205 ||
+                            o.response_ctx->captured_response_status == 304))) &&
+        !h2_response_status_forbids_body(o.status_code) &&
+        !o.response_ctx->response_body_mutation_set) {
+        h2_emit_status(d, stream_id, 500);
+        return;
+    }
     const u8* body = nullptr;
     u32 body_len = 0;
     if (o.dynamic_response_body != nullptr) {
@@ -517,13 +771,50 @@ void h2_emit_outcome(H2Dispatch<Loop>& d,
         body = reinterpret_cast<const u8*>(b.data);
         body_len = b.len;
     }
-    constexpr u32 kMaxEffectiveHeaders =
-        RouteConfig::kMaxHeadersPerSet + jit::kMaxResponseHeaderMutations + 2;
+    constexpr u32 kMaxEffectiveHeaders = RouteConfig::kMaxHeadersPerSet +
+                                         jit::kMaxCapturedResponseHeaders +
+                                         jit::kMaxResponseHeaderMutations + 2;
     hpack::Header hdrs[kMaxEffectiveHeaders];
     // Header values are non-owning Str views and are encoded only after the
     // list is complete, so storage synthesized below must span the emit call.
     char content_length[10];
+    static constexpr u32 kCapturedNameStorageBytes = Http2Conn::kBodySynthCap;
+    char captured_name_storage[kCapturedNameStorageBytes];
+    u32 captured_name_cursor = 0;
     u32 nhdrs = 0;
+    if (o.uses_captured_response && o.response_ctx != nullptr &&
+        o.response_ctx->captured_response_valid) {
+        for (u32 i = 0; i < o.response_ctx->captured_response_header_count; i++) {
+            const auto& header = o.response_ctx->captured_response_headers[i];
+            if (http_header_name_eq_ci(header.name.ptr, header.name.len, "content-length", 14) &&
+                (o.status_code < 200 || o.status_code == 204 || o.status_code == 205 ||
+                 (!head_request && o.status_code != 304)))
+                continue;
+            if (o.response_ctx->response_body_mutation_set &&
+                ((response_body_replacement_invalidates_header(header.name) &&
+                  !(o.status_code == 416 &&
+                    http_header_name_eq_ci(
+                        header.name.ptr, header.name.len, "content-range", 13))) ||
+                 (http_header_name_eq_ci(header.name.ptr, header.name.len, "content-type", 12) &&
+                  multipart_byteranges_has_boundary(header.value)) ||
+                 http_header_name_eq_ci(header.name.ptr, header.name.len, "content-length", 14)))
+                continue;
+            if (h2_is_prohibited_response_header(header.name.ptr, header.name.len)) continue;
+            if (header.name.len > kCapturedNameStorageBytes - captured_name_cursor) {
+                h2_emit_status(d, stream_id, 500);
+                return;
+            }
+            char* lowercase_name = captured_name_storage + captured_name_cursor;
+            for (u32 ni = 0; ni < header.name.len; ni++) {
+                const char c = header.name.ptr[ni];
+                lowercase_name[ni] = c >= 'A' && c <= 'Z' ? static_cast<char>(c + ('a' - 'A')) : c;
+            }
+            captured_name_cursor += header.name.len;
+            hdrs[nhdrs].name = {lowercase_name, header.name.len};
+            hdrs[nhdrs].value = header.value;
+            nhdrs++;
+        }
+    }
     if (o.response_headers_idx != 0 && cfg != nullptr &&
         o.response_headers_idx <= cfg->response_header_set_count) {
         const auto& ref = cfg->response_header_sets[o.response_headers_idx - 1];
@@ -584,7 +875,11 @@ void h2_emit_outcome(H2Dispatch<Loop>& d,
         }
     }
     const bool status_forbids_body = h2_response_status_forbids_body(o.status_code);
-    if (o.dynamic_response_body != nullptr && !status_forbids_body) {
+    const bool preserve_absent_captured_content_type = o.uses_captured_response &&
+                                                       o.response_ctx != nullptr &&
+                                                       !o.response_ctx->response_body_mutation_set;
+    if (o.dynamic_response_body != nullptr && !status_forbids_body &&
+        !preserve_absent_captured_content_type) {
         bool has_content_type = false;
         for (u32 i = 0; i < nhdrs; i++) {
             if (http_header_name_eq_ci(hdrs[i].name.ptr, hdrs[i].name.len, "content-type", 12)) {
@@ -597,6 +892,31 @@ void h2_emit_outcome(H2Dispatch<Loop>& d,
             hdrs[nhdrs].value = {"text/plain; charset=utf-8", 25};
             nhdrs++;
         }
+    }
+    const bool body_mutated =
+        o.response_ctx != nullptr && o.response_ctx->response_body_mutation_set;
+    bool captured_has_content_length = false;
+    u64 captured_content_length = 0;
+    if (o.uses_captured_response && !body_mutated) {
+        for (u32 i = 0; i < nhdrs; i++) {
+            if (!http_header_name_eq_ci(hdrs[i].name.ptr, hdrs[i].name.len, "content-length", 14))
+                continue;
+            captured_has_content_length =
+                parse_content_length_value(hdrs[i].value, &captured_content_length);
+            break;
+        }
+    }
+    const u64 range_representation_length =
+        head_request && !body_mutated && captured_has_content_length ? captured_content_length
+                                                                     : body_len;
+    if (!h2_normalize_partial_content_headers(
+            hdrs,
+            &nhdrs,
+            o.status_code,
+            range_representation_length,
+            !head_request || body_mutated || captured_has_content_length)) {
+        h2_emit_status(d, stream_id, 500);
+        return;
     }
     // HEAD suppresses DATA while retaining the representation metadata that the
     // equivalent GET would emit. http2_write_response normally derives
@@ -641,8 +961,8 @@ void h2_async_epoch_leave(Loop* loop, Connection& conn) {
 
 // Release the single async-suspend slot.
 inline void h2_clear_async(Http2Conn& h2) {
-    if (h2.async_stream != 0 &&
-        (h2.async_kind == H2AsyncKind::Timer || h2.async_apply_response_mutations))
+    if (h2.async_stream != 0 && (h2.async_kind == H2AsyncKind::Timer ||
+                                 h2.async_apply_response_mutations || h2.async_capture_response))
         rut_helper_resp_release_body_storage(static_cast<void*>(h2.async_jit_ctx()));
     h2.async_stream = 0;
     h2.async_kind = H2AsyncKind::None;
@@ -661,6 +981,7 @@ inline void h2_clear_async(Http2Conn& h2) {
     h2.async_upstream_id = 0;
     h2.async_apply_response_mutations = false;
     h2.async_request_forwardable = false;
+    h2.async_capture_response = false;
     h2.async_resp_len = 0;
 }
 
@@ -668,7 +989,8 @@ inline void h2_clear_async(Http2Conn& h2) {
 // still open. Move the stable request bytes and parked HandlerCtx into the
 // pending-body episode; setting async_stream to zero before clearing prevents
 // the old Timer owner from releasing the context's mutation storage.
-inline void h2_transfer_timer_to_pending_forward(Http2Conn& h2, u32 stream_id, u16 upstream_id) {
+inline void h2_transfer_timer_to_pending_forward(
+    Http2Conn& h2, u32 stream_id, u16 upstream_id, bool capture_response, u16 next_state) {
     h2.pending_stream = stream_id;
     h2.pending_body_start = h2.async_body_start;
     h2.pending_synth_len = h2.async_synth_len;
@@ -679,8 +1001,10 @@ inline void h2_transfer_timer_to_pending_forward(Http2Conn& h2, u32 stream_id, u
     h2.pending_request_forwardable = true;
     h2.pending_overflow = false;
     h2.pending_preinvoked_forward = true;
+    h2.pending_forward_capture = capture_response;
     h2.pending_preinvoked_timer = false;
     h2.pending_forward_upstream_id = upstream_id;
+    h2.pending_forward_state = next_state;
     h2.pending_route_config = h2.async_cfg;
     h2.pending_route = h2.async_route;
     h2.pending_route_action = RouteAction::JitHandler;
@@ -724,9 +1048,10 @@ inline bool h2_snapshot_async_jit_ctx(Http2Conn& h2,
     auto* parked = h2.async_jit_ctx();
     __builtin_memcpy(parked, &live, kBytes);
 
-    // The parked frame now owns the lazily allocated mutation buffer. Clear the
+    // The parked frame now owns all lazily allocated request storage. Clear the
     // connection scratch copy so another H2 stream can reset it without freeing
     // bytes still needed by this suspended stream.
+    live.control_plane = nullptr;
     live.response_body_mutation_storage = nullptr;
     live.response_body_snapshot_storage = nullptr;
 
@@ -833,6 +1158,7 @@ bool h2_suspend_proxy(H2Dispatch<Loop>& d,
                       const RouteEntry* route,
                       u16 upstream_id,
                       bool apply_response_mutations,
+                      bool capture_response,
                       jit::HandlerCtx* live_ctx,
                       const u8* synth,
                       u32 synth_len,
@@ -846,7 +1172,7 @@ bool h2_suspend_proxy(H2Dispatch<Loop>& d,
     // Pin the config epoch before storing cfg/route (see h2_suspend_timer).
     h2_async_epoch_enter(d.loop, *d.conn);
     h2->async_synth_len = h2_stash_synth(*h2, synth, synth_len);
-    if (apply_response_mutations && !ctx_already_parked &&
+    if ((apply_response_mutations || capture_response) && !ctx_already_parked &&
         (live_ctx == nullptr ||
          !h2_snapshot_async_jit_ctx(*h2, *live_ctx, synth, h2->async_synth_len))) {
         h2_async_epoch_leave(d.loop, *d.conn);
@@ -858,6 +1184,7 @@ bool h2_suspend_proxy(H2Dispatch<Loop>& d,
     h2->async_route = route;
     h2->async_upstream_id = upstream_id;
     h2->async_apply_response_mutations = apply_response_mutations;
+    h2->async_capture_response = capture_response;
     h2->async_resp_len = 0;
     return true;
 }
@@ -880,6 +1207,7 @@ void h2_invoke_emit(H2Dispatch<Loop>& d,
                     u32 body_len = 0,
                     bool inject_content_length_on_forward = false) {
     auto* ctx = d.conn->reset_jit_ctx();
+    if (route->needs_control_plane_snapshot) latch_control_plane_snapshot(d.loop, ctx);
     ctx->state = 0;
     ctx->resume_event_kind = static_cast<u32>(jit::YieldKind::Timer);
     ctx->resume_event_result = 0;
@@ -906,12 +1234,14 @@ void h2_invoke_emit(H2Dispatch<Loop>& d,
         }
         return;
     }
-    if (kOutcome.kind == JitDispatchOutcome::Kind::ForwardBuffered) {
+    if (kOutcome.kind == JitDispatchOutcome::Kind::ForwardBuffered ||
+        kOutcome.kind == JitDispatchOutcome::Kind::ForwardCapture) {
         if (!request_forwardable) {
             jit::release_response_body_mutation_storage(ctx);
             h2_emit_status(d, stream_id, 400);
             return;
         }
+        const bool capture = kOutcome.kind == JitDispatchOutcome::Kind::ForwardCapture;
         u32 forward_len = synth_len;
         u32 forward_body_start = body_start;
         if (!h2_snapshot_buffered_response_mutation_views(ctx, synth, synth_len) ||
@@ -930,10 +1260,24 @@ void h2_invoke_emit(H2Dispatch<Loop>& d,
             h2_emit_status(d, stream_id, 413);
             return;
         }
-        if (!h2_suspend_proxy(
-                d, stream_id, cfg, route, kOutcome.upstream_id, true, ctx, synth, forward_len)) {
+        if (!h2_suspend_proxy(d,
+                              stream_id,
+                              cfg,
+                              route,
+                              kOutcome.upstream_id,
+                              !capture,
+                              capture,
+                              ctx,
+                              synth,
+                              forward_len)) {
             jit::release_response_body_mutation_storage(ctx);
             h2_emit_status(d, stream_id, 503);
+        } else if (capture) {
+            d.conn->h2->async_fn = route->fn;
+            d.conn->h2->async_state = kOutcome.next_state;
+            d.conn->h2->async_body_start = body_start;
+            d.conn->h2->async_body_len = body_len;
+            d.conn->h2->async_inject_content_length_on_forward = inject_content_length_on_forward;
         }
         return;
     }
@@ -942,7 +1286,12 @@ void h2_invoke_emit(H2Dispatch<Loop>& d,
         h2_emit_status(d, stream_id, 503);  // forward/event-yield over h2: follow-up
         return;
     }
-    h2_emit_outcome(d, stream_id, kOutcome, cfg, h2_synth_request_is_head(synth, synth_len));
+    h2_emit_outcome(d,
+                    stream_id,
+                    kOutcome,
+                    cfg,
+                    h2_synth_request_is_head(synth, synth_len),
+                    h2_synth_request_is_connect(synth, synth_len));
 }
 
 // A deferred stream is complete. If the matched handler reads req.body,
@@ -979,6 +1328,7 @@ void h2_finish_body(H2Dispatch<Loop>& d, u32 stream_id) {
         const RouteConfig* cfg = h2->pending_route_config;
         const RouteEntry* route = h2->pending_route;
         const u16 upstream_id = h2->pending_forward_upstream_id;
+        const bool capture_response = h2->pending_forward_capture;
         const bool preinvoked_timer = h2->pending_preinvoked_timer;
         if (route == nullptr || (!preinvoked_timer && !h2->pending_request_forwardable)) {
             const u16 status = route == nullptr ? 500 : 400;
@@ -1036,11 +1386,19 @@ void h2_finish_body(H2Dispatch<Loop>& d, u32 stream_id) {
                                          cfg,
                                          route,
                                          upstream_id,
-                                         true,
+                                         !capture_response,
+                                         capture_response,
                                          h2->async_jit_ctx(),
                                          h2->pending_synth,
                                          synth_len,
                                          /*ctx_already_parked=*/true);
+            if (suspended && capture_response) {
+                h2->async_fn = route->fn;
+                h2->async_state = h2->pending_forward_state;
+                h2->async_body_start = body_start;
+                h2->async_body_len = body_len;
+                h2->async_inject_content_length_on_forward = inject_content_length_on_forward;
+            }
         }
         if (!suspended) {
             h2_clear_pending(*h2);
@@ -1048,6 +1406,7 @@ void h2_finish_body(H2Dispatch<Loop>& d, u32 stream_id) {
             return;
         }
         h2->pending_preinvoked_forward = false;  // ownership moved to async
+        h2->pending_forward_capture = false;
         h2->pending_preinvoked_timer = false;
         h2_clear_pending(*h2);
         return;
@@ -1271,6 +1630,7 @@ void h2_dispatch_request(H2Dispatch<Loop>& d,
                     return;
                 }
                 auto* ctx = d.conn->reset_jit_ctx();
+                if (route->needs_control_plane_snapshot) latch_control_plane_snapshot(d.loop, ctx);
                 ctx->state = 0;
                 ctx->resume_event_kind = static_cast<u32>(jit::YieldKind::Timer);
                 ctx->resume_event_result = 0;
@@ -1279,7 +1639,8 @@ void h2_dispatch_request(H2Dispatch<Loop>& d,
                 const JitDispatchOutcome kOutcome = invoke_jit_handler(
                     route->fn, static_cast<void*>(d.conn), *ctx, synth, kSynthLen, nullptr);
 
-                if (kOutcome.kind == JitDispatchOutcome::Kind::ForwardBuffered) {
+                if (kOutcome.kind == JitDispatchOutcome::Kind::ForwardBuffered ||
+                    kOutcome.kind == JitDispatchOutcome::Kind::ForwardCapture) {
                     if (!h2_proxy_request_forwardable(headers, nheaders)) {
                         jit::release_response_body_mutation_storage(ctx);
                         h2_emit_status(d, stream_id, 400);
@@ -1307,7 +1668,10 @@ void h2_dispatch_request(H2Dispatch<Loop>& d,
                         return;
                     }
                     h2->pending_preinvoked_forward = true;
+                    h2->pending_forward_capture =
+                        kOutcome.kind == JitDispatchOutcome::Kind::ForwardCapture;
                     h2->pending_forward_upstream_id = kOutcome.upstream_id;
+                    h2->pending_forward_state = static_cast<u16>(kOutcome.next_state);
                     return;
                 }
                 if (kOutcome.kind == JitDispatchOutcome::Kind::TimerYield) {
@@ -1335,8 +1699,12 @@ void h2_dispatch_request(H2Dispatch<Loop>& d,
                     return;
                 }
                 if (kOutcome.kind == JitDispatchOutcome::Kind::ReturnStatus) {
-                    h2_emit_outcome(
-                        d, stream_id, kOutcome, config, h2_synth_request_is_head(synth, kSynthLen));
+                    h2_emit_outcome(d,
+                                    stream_id,
+                                    kOutcome,
+                                    config,
+                                    h2_synth_request_is_head(synth, kSynthLen),
+                                    h2_synth_request_is_connect(synth, kSynthLen));
                     return;
                 }
                 jit::release_response_body_mutation_storage(ctx);
@@ -1431,6 +1799,7 @@ void h2_dispatch_request(H2Dispatch<Loop>& d,
                                       route,
                                       route->upstream_id,
                                       false,
+                                      false,
                                       nullptr,
                                       synth,
                                       kSynthLen))
@@ -1442,8 +1811,15 @@ void h2_dispatch_request(H2Dispatch<Loop>& d,
 
 template <typename Loop>
 void h2_on_headers_cb(
-    void* ctx, Http2Conn& /*c*/, u32 stream_id, const hpack::Header* hs, u32 n, bool end) {
+    void* ctx, Http2Conn& c, u32 stream_id, const hpack::Header* hs, u32 n, bool end) {
     auto* d = static_cast<H2Dispatch<Loop>*>(ctx);
+    if constexpr (requires { d->loop->metrics; }) c.metrics = d->loop->metrics;
+    if (Http2Stream* stream = c.find_stream(stream_id);
+        stream != nullptr && !stream->metrics_started && c.metrics != nullptr) {
+        stream->metrics_started = true;
+        stream->request_start_us = monotonic_us();
+        c.metrics->on_request_start();
+    }
     h2_dispatch_request(*d, stream_id, hs, n, end);
 }
 
@@ -1477,6 +1853,19 @@ void h2_on_data_cb(
 // time there is no in-flight I/O to undo; the config epoch pinned for the suspend
 // is released by the post-process path once async_stream is clear.
 inline void h2_on_reset_cb(void* /*ctx*/, Http2Conn& c, u32 stream_id, Http2Error /*err*/) {
+    Http2Stream* reset_stream = nullptr;
+    for (u32 i = 0; i < c.nstreams; i++) {
+        if (c.streams[i].id == stream_id) {
+            reset_stream = &c.streams[i];
+            break;
+        }
+    }
+    if (reset_stream != nullptr && reset_stream->metrics_started) {
+        if (c.metrics != nullptr) c.metrics->on_request_cancel();
+        reset_stream->metrics_started = false;
+        reset_stream->metrics_pending_send = false;
+        reset_stream->request_start_us = 0;
+    }
     if (c.async_stream != 0 && c.async_stream == stream_id) h2_clear_async(c);
     if (c.pending_stream != 0 && c.pending_stream == stream_id) h2_clear_pending(c);
 }
@@ -1523,7 +1912,8 @@ template <typename Loop>
 void h2_begin_suspended_io(Loop* loop, Connection& conn) {
     h2_async_epoch_enter(loop, conn);
     if (conn.h2->async_kind == H2AsyncKind::Proxy) {
-        if (conn.h2->async_apply_response_mutations) conn.handler_ctx = conn.h2->async_jit_ctx();
+        if (conn.h2->async_apply_response_mutations || conn.h2->async_capture_response)
+            conn.handler_ctx = conn.h2->async_jit_ctx();
         h2_proxy_begin<Loop>(loop, conn);
         return;
     }
@@ -1559,6 +1949,7 @@ void on_h2_sent(void* lp, Connection& conn, IoEvent ev) {
     }
 
     conn.send_progress = 0;
+    if (conn.h2) h2_complete_sent_request_metrics(*conn.h2);
     conn.send_buf.reset();
     if (!conn.keep_alive) {  // engine signalled GOAWAY / connection error
         loop->close_conn(conn);
@@ -1718,6 +2109,8 @@ void h2_resume_jit_handler(Loop* loop, Connection& conn) {
     loop->timer.refresh(&conn, loop->keepalive_timeout);
     const u32 kStreamId = h2->async_stream;
     const bool kHeadRequest = h2_synth_request_is_head(h2->pending_synth, h2->async_synth_len);
+    const bool kConnectRequest =
+        h2_synth_request_is_connect(h2->pending_synth, h2->async_synth_len);
     auto* ctx = conn.jit_ctx();
     ctx->state = conn.handler_state;
     ctx->resume_event_kind = static_cast<u32>(conn.resume_event_kind);
@@ -1736,7 +2129,8 @@ void h2_resume_jit_handler(Loop* loop, Connection& conn) {
         if (!h2_arm_async_timer<Loop>(loop, conn)) loop->close_conn(conn);
         return;
     }
-    if (kOutcome.kind == JitDispatchOutcome::Kind::ForwardBuffered &&
+    if ((kOutcome.kind == JitDispatchOutcome::Kind::ForwardBuffered ||
+         kOutcome.kind == JitDispatchOutcome::Kind::ForwardCapture) &&
         h2->async_request_forwardable && h2->async_wait_for_body_on_forward) {
         // This timer began at HEADERS time while the peer side remained open.
         // Only now that the resumed branch actually selected buffered forwarding
@@ -1745,7 +2139,12 @@ void h2_resume_jit_handler(Loop* loop, Connection& conn) {
         // releasing it; h2_finish_body will move it into the proxy episode.
         conn.pending_handler_fn = nullptr;
         conn.handler_ctx = nullptr;
-        h2_transfer_timer_to_pending_forward(*h2, kStreamId, kOutcome.upstream_id);
+        h2_transfer_timer_to_pending_forward(
+            *h2,
+            kStreamId,
+            kOutcome.upstream_id,
+            kOutcome.kind == JitDispatchOutcome::Kind::ForwardCapture,
+            static_cast<u16>(kOutcome.next_state));
         conn.transition_to_reading_header(&on_h2_data<Loop>);
         if (conn.recv_buf.len() != 0) {
             IoEvent buffered{
@@ -1756,7 +2155,8 @@ void h2_resume_jit_handler(Loop* loop, Connection& conn) {
         }
         return;
     }
-    if (kOutcome.kind == JitDispatchOutcome::Kind::ForwardBuffered &&
+    if ((kOutcome.kind == JitDispatchOutcome::Kind::ForwardBuffered ||
+         kOutcome.kind == JitDispatchOutcome::Kind::ForwardCapture) &&
         h2->async_request_forwardable) {
         const bool synth_ok =
             h2_snapshot_buffered_response_mutation_views(
@@ -1786,22 +2186,34 @@ void h2_resume_jit_handler(Loop* loop, Connection& conn) {
             client_send(loop, conn, conn.send_buf.data(), conn.send_buf.len());
             return;
         }
+        const bool capture = kOutcome.kind == JitDispatchOutcome::Kind::ForwardCapture;
         h2->async_kind = H2AsyncKind::Proxy;
         h2->async_upstream_id = kOutcome.upstream_id;
-        h2->async_apply_response_mutations = true;
+        h2->async_apply_response_mutations = !capture;
+        h2->async_capture_response = capture;
+        if (capture) {
+            h2->async_fn = conn.pending_handler_fn;
+            h2->async_state = kOutcome.next_state;
+        }
         conn.pending_handler_fn = nullptr;
         h2_proxy_begin<Loop>(loop, conn);
         return;
     }
 
-    u8 resp[8192];
+    u8 resp[Http2Conn::kBodySynthCap];
     H2Dispatch<Loop> d{loop, &conn, resp, sizeof(resp), 0, false};
     if (kOutcome.kind == JitDispatchOutcome::Kind::ReturnStatus) {
-        h2_emit_outcome(d, kStreamId, kOutcome, h2->async_cfg, kHeadRequest);
-    } else if (kOutcome.kind == JitDispatchOutcome::Kind::ForwardBuffered) {
+        h2_emit_outcome(d, kStreamId, kOutcome, h2->async_cfg, kHeadRequest, kConnectRequest);
+    } else if (kOutcome.kind == JitDispatchOutcome::Kind::ForwardBuffered ||
+               kOutcome.kind == JitDispatchOutcome::Kind::ForwardCapture) {
         h2_emit_status(d, kStreamId, 400);
     } else {
         h2_emit_status(d, kStreamId, 503);  // forward / event-yield over h2: follow-up
+    }
+    if (conn.response_capture_slice != nullptr) {
+        if constexpr (requires { loop->pool.free(conn.response_capture_slice); })
+            loop->pool.free(conn.response_capture_slice);
+        conn.response_capture_slice = nullptr;
     }
 
     // Clear the suspension before responding so the flush's on_h2_sent re-arms

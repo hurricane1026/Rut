@@ -30,6 +30,7 @@ struct JitDispatchOutcome {
         ReturnStatus,
         Forward,
         ForwardBuffered,
+        ForwardCapture,
         TimerYield,
         EventYield,
         Error,
@@ -63,6 +64,10 @@ struct JitDispatchOutcome {
     const char* dynamic_response_body = nullptr;
     u32 dynamic_response_body_len = 0;
     const jit::HandlerCtx* response_ctx = nullptr;
+    // True only when ReturnStatus used the status-0 ABI sentinel to publish a
+    // captured upstream response. A merely valid-but-discarded capture must not
+    // contribute its body or headers to a later literal response.
+    bool uses_captured_response = false;
     // 1-based index into RouteConfig::response_header_sets for
     // Kind::ReturnStatus; 0 = no custom headers. Decoded from the
     // next_state slot per handler ABI (reused while action is
@@ -81,7 +86,6 @@ inline u16 effective_return_status(const jit::HandlerResult& result, const jit::
     const u16 status = ctx.response_status_set ? ctx.response_status : result.status_code;
     const bool dynamic_body_failed =
         result.upstream_id == jit::HandlerResult::kDynamicResponseBody &&
-        !ctx.response_body_mutation_set &&
         (ctx.response_body_valid == 0 || ctx.response_body_data == nullptr);
     return dynamic_body_failed && !response_status_forbids_body(status) ? 500 : status;
 }
@@ -183,6 +187,8 @@ inline JitDispatchOutcome invoke_jit_handler(jit::HandlerFn fn,
 
     const u64 packed = fn(conn, &ctx, req_data, req_len, arena);
     const auto raw = jit::HandlerResult::unpack(packed);
+    const bool returned_captured_response =
+        raw.action == jit::HandlerAction::ReturnStatus && raw.status_code == 0;
     const auto r = effective_return_result(raw, ctx);
 
     switch (r.action) {
@@ -190,7 +196,24 @@ inline JitDispatchOutcome invoke_jit_handler(jit::HandlerFn fn,
             out.kind = JitDispatchOutcome::Kind::ReturnStatus;
             out.status_code = r.status_code;
             out.response_ctx = &ctx;
+            if (returned_captured_response) {
+                if (!ctx.captured_response_valid) {
+                    out.status_code = 500;
+                    return out;
+                }
+                out.uses_captured_response = true;
+                if (!ctx.response_status_set) out.status_code = ctx.captured_response_status;
+                if (out.status_code < 200) {
+                    out.status_code = 500;
+                    out.uses_captured_response = false;
+                    return out;
+                }
+                out.dynamic_response_body = ctx.captured_response_body;
+                out.dynamic_response_body_len = ctx.captured_response_body_len;
+            }
             if (ctx.response_status_invalid || ctx.response_body_mutation_overflow) {
+                out.status_code = 500;
+                out.uses_captured_response = false;
                 out.response_body_idx = 0;
                 out.dynamic_response_body = nullptr;
                 out.dynamic_response_body_len = 0;
@@ -259,7 +282,10 @@ inline JitDispatchOutcome invoke_jit_handler(jit::HandlerFn fn,
                     return out;
                 case jit::YieldKind::HttpGet:
                 case jit::YieldKind::HttpPost:
+                    return out;
                 case jit::YieldKind::Forward:
+                    out.kind = JitDispatchOutcome::Kind::ForwardCapture;
+                    out.upstream_id = static_cast<u16>(r.yield_payload_u32());
                     return out;
             }
             return out;

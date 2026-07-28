@@ -23,6 +23,8 @@ static u8 yield_kind_abi(WaitEventKind kind) {
             return static_cast<u8>(jit::YieldKind::UpstreamRecv);
         case WaitEventKind::UpstreamSend:
             return static_cast<u8>(jit::YieldKind::UpstreamSend);
+        case WaitEventKind::ForwardBuffered:
+            return static_cast<u8>(jit::YieldKind::Forward);
     }
     return static_cast<u8>(jit::YieldKind::Timer);
 }
@@ -1411,6 +1413,16 @@ static FrontendResult<rir::ValueId> materialize_value(const MirValue& value,
         }
         if (!b.emit_json_append_raw(value.str_value, {span.line, span.col}))
             return frontend_error(FrontendError::OutOfMemory, span);
+        auto captured = b.emit_json_capture({span.line, span.col});
+        if (!captured) return frontend_error(FrontendError::OutOfMemory, span);
+        return captured.value();
+    }
+    if (value.kind == MirValueKind::AdminJson) {
+        if (value.int_value < 0 || value.int_value > 1 ||
+            !b.emit_json_reset({span.line, span.col}) ||
+            !b.emit_json_append_control_plane(static_cast<u8>(value.int_value),
+                                              {span.line, span.col}))
+            return frontend_error(FrontendError::UnsupportedSyntax, span);
         auto captured = b.emit_json_capture({span.line, span.col});
         if (!captured) return frontend_error(FrontendError::OutOfMemory, span);
         return captured.value();
@@ -3350,7 +3362,15 @@ static FrontendResult<void> emit_term(const MirTerminator& term,
         // and pack the 1-based idx into RetStatus's immediate. Empty /
         // missing body ⇒ idx = 0 ⇒ runtime uses default status-reason.
         u16 body_idx = 0;
-        if (term.has_json_body_plan) {
+        if (term.control_plane_json_kind != 0) {
+            if (term.control_plane_json_kind > 2 ||
+                !b.emit_json_reset({term.span.line, term.span.col}) ||
+                !b.emit_json_append_control_plane(static_cast<u8>(term.control_plane_json_kind - 1),
+                                                  {term.span.line, term.span.col}) ||
+                !b.emit_json_finish({term.span.line, term.span.col}))
+                return frontend_error(FrontendError::OutOfMemory, term.span);
+            body_idx = 0xffffu;  // HandlerResult::kDynamicResponseBody
+        } else if (term.has_json_body_plan) {
             auto body = materialize_value(term.json_body_local.init,
                                           mir,
                                           variant_infos,

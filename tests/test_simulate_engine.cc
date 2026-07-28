@@ -552,7 +552,7 @@ route GET "/mutated" use chain access {
     rir.destroy();
 }
 
-TEST(simulate_engine, committed_body_replaces_failed_dynamic_json) {
+TEST(simulate_engine, committed_body_preserves_failed_dynamic_json_status) {
     const char* src = R"rut(
 func rewrite(_ resp: Response) -> i32 {
     resp.status = 202
@@ -570,10 +570,10 @@ route GET "/json" use chain access {
     Engine engine;
     REQUIRE(engine.init(rir.module, nullptr, 0));
     static const char kRequest[] = "GET /json HTTP/1.1\r\nHost: x\r\nX-Value: \xc0\x80\r\n\r\n";
-    const auto result = simulate_one(engine, make_entry(kRequest, 202));
+    const auto result = simulate_one(engine, make_entry(kRequest, 500));
 
     CHECK_EQ(result.verdict, Verdict::Match);
-    CHECK_EQ(result.actual_status, 202u);
+    CHECK_EQ(result.actual_status, 500u);
 
     engine.shutdown();
     rir.destroy();
@@ -593,6 +593,25 @@ TEST(simulate_engine, req_body_route_is_unsupported_for_header_only_capture) {
 
     const auto result = simulate_one(
         engine, make_entry("POST /upload HTTP/1.1\r\nHost: x\r\nContent-Length: 7\r\n\r\n", 204));
+    CHECK_EQ(result.verdict, Verdict::Unsupported);
+    CHECK_EQ(result.actual_status, 0u);
+
+    engine.shutdown();
+    rir.destroy();
+}
+
+TEST(simulate_engine, control_plane_route_is_unsupported_without_snapshot_fixture) {
+    const char* src = "route GET \"/stats\" { return 200, json(stats()) }\n";
+    FrontendRirModule rir{};
+    REQUIRE(compile_to_rir(src, rir));
+
+    Engine engine;
+    REQUIRE(engine.init(rir.module, nullptr, 0));
+    REQUIRE_EQ(engine.route_count, 1u);
+    CHECK(engine.routes[0].needs_control_plane_snapshot);
+
+    const auto result =
+        simulate_one(engine, make_entry("GET /stats HTTP/1.1\r\nHost: x\r\n\r\n", 200));
     CHECK_EQ(result.verdict, Verdict::Unsupported);
     CHECK_EQ(result.actual_status, 0u);
 

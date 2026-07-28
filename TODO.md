@@ -9,67 +9,18 @@ short hand-off summary under **Recently Completed**.
 **Goal**: Complete the remaining runtime-backed pieces of the revised syntax
 without accepting source forms that cannot be replayed or resumed faithfully.
 
-### Dynamic JSON serialization
-
-`json(...)` produces a reusable compiler-owned plan that may flow through
-locals and helper parameters/returns, then serialize at a direct return,
-`respond`, or `Response.body` sink. Literal JSON, bounded runtime scalar
-interpolation, recursively expanded declared structs, generic bounded
-`Array<T>` carriers, and ordered string-list views are supported. Struct keys
-follow field declaration order and dynamic leaves share the existing
-eight-slot bound. The serializer escapes strings at runtime; capacity or 4 KiB
-mutable-body overflow fails closed instead of publishing partial JSON.
-Response-body sinks copy bytes into stream-owned resumable context, while
-replay publishes exact bounded output bytes and explicit truncation state to
-harness oracles.
-
-**Acceptance**:
-- Runtime size/depth overflow fails closed with a deterministic diagnostic.
-- HTTP/1, HTTP/2, replay, and harness observe the same serialized bytes.
-- Dynamic object fields have one documented ordering and duplicate-key rule.
-
-### Stream-owned Response mutation
-
-The terminal `return forward(upstream, buffered: true)` path now buffers a
-bounded complete upstream response and commits resumable `chain after`
-header/status/body mutations consistently over HTTP/1 and HTTP/2. Remaining
-work is promoting that terminal operation to a first-class expression such as
-`let resp = forward(upstream, buffered: true)`, materializing upstream
-status/body/header fields in stream-owned storage so they can be read and
-mutated before `return resp`.
-
-**Acceptance**:
-- A buffered forward can be bound as a `Response` and returned without losing
-  upstream fields.
-- Buffered field reads and subsequent mutations survive a yield without
-  borrowing proxy or serializer scratch.
-- Expression-form overflow, upstream failure, and unsupported request-rewrite
-  combinations fail with the same documented policy as terminal buffering.
-
 ### Control-plane builtins
 
-Connect the declared `stats()`, `metrics()`, `reload()`, and
-`upstream.mark()` surface to runtime services. The checker currently validates
-their types and contexts, while MIR rejects lowering rather than returning fake
-data.
+Connect the remaining declared `reload()` and `upstream.mark()` mutation
+surface to runtime services. Read-only `stats()` and `metrics()` snapshots are
+connected end to end.
 
 **Acceptance**:
-- `HandlerCtx` exposes only the bounded control-plane capabilities each builtin
-  needs.
-- Snapshot values serialize deterministically and are covered by harness/replay
-  observations.
 - Reload and upstream mutation define authorization, failure, and shard-ordering
   behavior.
 
 ### Remaining syntax migration
 
-- Implement verifier-bounded `for` loops end to end: parser acceptance,
-  analyzer proof of a finite static bound, MIR/RIR lowering, and verifier
-  rejection of unbounded or runtime-sized iteration.
-- Add `break`/`continue` only after that bounded-loop substrate exists, and keep
-  both operations inside the verifier-proven loop control-flow region.
-- Migrate remaining `.rut` examples and topic docs to
-  `docs/syntax-stability.md` Core spellings.
 - Add a fixture gate that parses and type-checks every unmarked executable
   example in `docs/language-card.md`.
 
@@ -77,8 +28,6 @@ data.
 - Removed or unsupported forms produce the documented prescriptive diagnostics.
 - Compatibility forms remain accepted and keep tests for their documented
   lowering or migration behavior.
-- Bounded `for` examples parse, lower, and execute with an analyzer-visible
-  maximum trip count; unbounded loops remain a source error.
 - Core examples parse and type-check in CI.
 - `./dev.sh test` remains green with no hidden-yield additions.
 
@@ -137,6 +86,23 @@ implementation promise.
 
 ## Recently Completed
 
+- [x] Executable `.rut` examples and topic documentation use Rut Core route
+  declarations; chain examples attach one explicit chain directly to each
+  route instead of teaching grouped-route inheritance.
+- [x] Unlabeled `break`/`continue` lower only inside verifier-bounded static
+  `for`, work through direct, guard, if, match, and nested-loop CFG paths, and
+  always target the innermost loop without introducing runtime back edges.
+- [x] Static `for` accepts only compile-time array literals or aliases, unrolls
+  under the MIR/verifier block budget, rejects every runtime iterator and wait
+  combination, and executes through the same JIT CFG as hand-written guards.
+- [x] Expression-form `forward(upstream, buffered: true)` materializes bounded
+  status/body/header fields in stream-owned storage, survives later yields,
+  replays through the deterministic harness, and preserves the terminal
+  buffering failure and request-rewrite policy over HTTP/1 and HTTP/2.
+- [x] Dynamic JSON plans support runtime scalars, declared structs, bounded
+  arrays and string lists, preserve documented field order, reject duplicate
+  keys, fail closed on overflow, and expose identical bounded body bytes to
+  HTTP/1, HTTP/2, replay, and scenario harness oracles.
 - [x] Coverage reporting separates informational host/integration coverage from
   the unchanged runtime gate, labels ISA/gate exclusions, reports changed files,
   and publishes the full result in GitHub Job Summary.
@@ -146,8 +112,9 @@ implementation promise.
   upstream fd, concurrency slot, pinned epoch, async slot, and callbacks.
 - [x] `Cache(..., backend: ...)` is reserved with a targeted source-of-truth
   diagnostic; strict `Hash` owner-shard semantics have an accepted design.
-- [x] Control-plane builtins have checker declarations and targeted
-  not-yet-lowered diagnostics instead of fake runtime results.
+- [x] `stats()` and `metrics()` latch value-only shard/process metric snapshots
+  at handler entry, serialize fixed-order bounded JSON, survive resumes without
+  rereading mutable state, and replay through an explicit harness capability.
 - [x] Import analysis moves large route workspaces off the thread stack.
 - [x] Request runtime `[str]` views support ordered `queryAll`/`getAll`, `len`,
   `isEmpty`, `first`, and bounds-safe `at`.

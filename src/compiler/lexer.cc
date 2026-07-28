@@ -44,6 +44,8 @@ static TokenType keyword_type(Str text) {
     if (text.eq({"else", 4})) return TokenType::KwElse;
     if (text.eq({"for", 3})) return TokenType::KwFor;
     if (text.eq({"in", 2})) return TokenType::KwIn;
+    if (text.eq({"break", 5})) return TokenType::KwBreak;
+    if (text.eq({"continue", 8})) return TokenType::KwContinue;
     // `and` / `or` / `not` are NOT keywords — boolean operators are the
     // Swift-identical `&&` / `||` / `!`. The words lex as ordinary
     // identifiers so member names like `.or(default)` and `bitwise.and(...)`

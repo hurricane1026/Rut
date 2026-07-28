@@ -56,6 +56,7 @@ enum class Capability : u8 {
     ExternalUpstream,
     ScriptedFaults,
     SyscallFaults,
+    ControlPlaneSnapshot,
     Count,
 };
 

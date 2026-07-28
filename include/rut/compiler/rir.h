@@ -233,16 +233,17 @@ enum class Opcode : u8 {
     CacheSet,  // %r = cache.set %key, %val, inst=N  → i64 (echoes %val)
 
     // ── Bounded dynamic JSON response construction ──
-    JsonReset,          // reset shard-local serializer scratch
-    JsonAppendRaw,      // append compiler-owned JSON bytes (imm.str_val)
-    JsonAppendBool,     // append bool operand
-    JsonAppendI32,      // append signed i32 operand
-    JsonAppendI64,      // append signed i64 operand
-    JsonAppendStr,      // append escaped/quoted str operand
-    JsonAppendStrList,  // append runtime ordered string view as a JSON array
-    JsonAppendArray,    // append a bounded generic Array<T> recursively
-    JsonCapture,        // capture scratch as str; overflow becomes an invalid view
-    JsonFinish,         // publish scratch through HandlerCtx
+    JsonReset,               // reset shard-local serializer scratch
+    JsonAppendRaw,           // append compiler-owned JSON bytes (imm.str_val)
+    JsonAppendBool,          // append bool operand
+    JsonAppendI32,           // append signed i32 operand
+    JsonAppendI64,           // append signed i64 operand
+    JsonAppendStr,           // append escaped/quoted str operand
+    JsonAppendStrList,       // append runtime ordered string view as a JSON array
+    JsonAppendArray,         // append a bounded generic Array<T> recursively
+    JsonAppendControlPlane,  // append stats()/metrics() snapshot (imm.i32_val = kind)
+    JsonCapture,             // capture scratch as str; overflow becomes an invalid view
+    JsonFinish,              // publish scratch through HandlerCtx
 
     // ── Struct operations ──
     StructField,     // %r = struct.field %s, "name"  → T

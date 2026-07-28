@@ -844,6 +844,9 @@ struct HirTerminator {
     // terminal block is selected. Intermediate struct roots share this bounded
     // materialization table without consuming scalar output slots.
     bool has_dynamic_response_body = false;
+    // 0 = ordinary body, 1 = stats(), 2 = metrics(). The snapshot JSON is
+    // produced directly at the terminal sink rather than quoted as a leaf.
+    u8 control_plane_json_kind = 0;
     FixedVec<Str, kMaxJsonDynamicValues + 1> json_segments;
     FixedVec<u32, kMaxJsonDynamicValues> json_value_ref_indices;
     FixedVec<u32, kMaxJsonMaterializedValues> json_value_expr_indices;
@@ -863,6 +866,22 @@ struct HirTerminator {
     // Request-header overrides for `forward(name, set_header: {...})`. len == 0
     // means none; lowering emits one ReqSetHeader per entry before RetForward.
     FixedVec<HirHeaderKV, kMaxHeaders> forward_set_headers;
+};
+
+enum class HirLoopControl : u8 {
+    None,
+    Break,
+    Continue,
+};
+
+struct HirForLoopBranch {
+    enum class Kind : u8 {
+        Term,
+        Break,
+        Continue,
+    };
+    Kind kind = Kind::Term;
+    HirTerminator term{};
 };
 
 struct HirGuardBody {
@@ -892,6 +911,7 @@ struct HirGuardMatchArm {
 struct HirGuard {
     enum class FailKind : u8 {
         Term,
+        LoopControl,
         Match,
         Body,
     };
@@ -901,6 +921,7 @@ struct HirGuard {
     HirExpr cond{};
     FailKind fail_kind = FailKind::Term;
     HirTerminator fail_term{};
+    HirLoopControl fail_loop_control = HirLoopControl::None;
     HirExpr fail_match_expr{};
     u32 fail_match_start = 0;
     u32 fail_match_count = 0;
@@ -965,8 +986,8 @@ struct HirControl {
 struct HirForLoopIf {
     Span span{};
     HirExpr cond{};
-    HirTerminator then_term{};
-    HirTerminator else_term{};
+    HirForLoopBranch then_branch{};
+    HirForLoopBranch else_branch{};
 };
 
 struct HirForLoopMatchArm {
@@ -995,9 +1016,9 @@ struct HirForLoopMatchArm {
     FixedVec<HirLocal, kMaxLocals> locals;
     FixedVec<HirGuard, kMaxPreludeGuards> guards;
     HirExpr cond{};
-    HirTerminator then_term{};
-    HirTerminator else_term{};
-    HirTerminator direct_term{};
+    HirForLoopBranch then_branch{};
+    HirForLoopBranch else_branch{};
+    HirForLoopBranch direct_branch{};
 };
 
 struct HirForLoopMatch {
@@ -1024,6 +1045,8 @@ struct HirForLoopBody {
             If,
             Match,
             For,
+            Break,
+            Continue,
             Term,
         };
         Kind kind = Kind::Let;
@@ -1048,6 +1071,9 @@ struct HirForLoopBody {
     FixedVec<HirForLoopMatch, kMaxMatches> matches;
     HirTerminator term{};
     bool has_term = false;
+    // An unconditional loop-control step terminates the current iteration,
+    // but unlike has_term it does not terminate the request route.
+    bool has_loop_control = false;
 };
 
 struct HirForLoop {

@@ -358,6 +358,9 @@ void print_opcode(PrintBuf& buf, Opcode op) {
         case Opcode::JsonAppendArray:
             buf.put_cstr("json.append_array");
             break;
+        case Opcode::JsonAppendControlPlane:
+            buf.put_cstr("json.append_control_plane");
+            break;
         case Opcode::JsonCapture:
             buf.put_cstr("json.capture");
             break;
@@ -815,6 +818,9 @@ void print_instruction(PrintBuf& buf, const Instruction& inst, const Function& f
         case Opcode::JsonAppendArray:
             buf.put(' ');
             print_value_ref(buf, inst.operands[0]);
+            break;
+        case Opcode::JsonAppendControlPlane:
+            buf.put_cstr(inst.imm.i32_val == 0 ? " stats" : " metrics");
             break;
 
         // Terminators
