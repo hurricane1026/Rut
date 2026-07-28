@@ -2392,25 +2392,54 @@ FrontendResult<MirModule*> build_mir(const HirModule& module) {
             auto loop_has_local_control = [&](u32 loop_index) -> bool {
                 if (loop_index >= module.routes[i].for_loops.len) return false;
                 const auto& loop = module.routes[i].for_loops[loop_index];
-                for (u32 gi = 0; gi < loop.body.guards.len; gi++)
-                    if (loop.body.guards[gi].fail_kind == HirGuard::FailKind::LoopControl)
-                        if (loop.body.guards[gi].cond.kind != HirExprKind::BoolLit ||
-                            !loop.body.guards[gi].cond.bool_value)
-                            return true;
-                for (u32 mi = 0; mi < loop.body.matches.len; mi++) {
+                const auto literal_matches = [](const HirExpr& subject, const HirExpr& pattern) {
+                    if (subject.kind != pattern.kind) return false;
+                    if (subject.kind == HirExprKind::BoolLit)
+                        return subject.bool_value == pattern.bool_value;
+                    if (subject.kind == HirExprKind::IntLit)
+                        return subject.int_value == pattern.int_value;
+                    if (subject.kind == HirExprKind::StrLit)
+                        return subject.str_value.eq(pattern.str_value);
+                    return false;
+                };
+                const auto match_has_local_control = [&](u32 mi) {
+                    if (mi >= loop.body.matches.len) return false;
                     const auto& body_match = loop.body.matches[mi];
-                    for (u32 ai = 0; ai < body_match.arms.len; ai++)
-                        for (u32 gi = 0; gi < body_match.arms[ai].guards.len; gi++)
-                            if (body_match.arms[ai].guards[gi].fail_kind ==
-                                    HirGuard::FailKind::LoopControl &&
-                                (body_match.arms[ai].guards[gi].cond.kind != HirExprKind::BoolLit ||
-                                 !body_match.arms[ai].guards[gi].cond.bool_value))
+                    const bool literal_subject =
+                        body_match.match_expr.kind == HirExprKind::BoolLit ||
+                        body_match.match_expr.kind == HirExprKind::IntLit ||
+                        body_match.match_expr.kind == HirExprKind::StrLit;
+                    for (u32 ai = 0; ai < body_match.arms.len; ai++) {
+                        const auto& arm = body_match.arms[ai];
+                        if (literal_subject && !arm.is_wildcard &&
+                            !literal_matches(body_match.match_expr, arm.pattern))
+                            continue;
+                        for (u32 gi = 0; gi < arm.guards.len; gi++)
+                            if (arm.guards[gi].fail_kind == HirGuard::FailKind::LoopControl &&
+                                (arm.guards[gi].cond.kind != HirExprKind::BoolLit ||
+                                 !arm.guards[gi].cond.bool_value))
                                 return true;
-                }
+                        if (literal_subject) break;
+                    }
+                    return false;
+                };
                 for (u32 si = 0; si < loop.body.steps.len; si++) {
                     const auto& step = loop.body.steps[si];
+                    if (step.kind == HirForLoopBody::Step::Kind::Guard &&
+                        step.index < loop.body.guards.len) {
+                        const auto& guard = loop.body.guards[step.index];
+                        if (guard.fail_kind == HirGuard::FailKind::LoopControl &&
+                            (guard.cond.kind != HirExprKind::BoolLit || !guard.cond.bool_value))
+                            return true;
+                        if (guard.cond.kind == HirExprKind::BoolLit && !guard.cond.bool_value &&
+                            guard.fail_kind == HirGuard::FailKind::Term)
+                            return false;
+                    }
                     if (step.kind == HirForLoopBody::Step::Kind::Break ||
                         step.kind == HirForLoopBody::Step::Kind::Continue)
+                        return true;
+                    if (step.kind == HirForLoopBody::Step::Kind::Match &&
+                        match_has_local_control(step.index))
                         return true;
                     if (step.kind != HirForLoopBody::Step::Kind::If ||
                         step.index >= loop.body.ifs.len)
@@ -2521,7 +2550,8 @@ FrontendResult<MirModule*> build_mir(const HirModule& module) {
                     return expr.kind == HirExprKind::BoolLit || expr.kind == HirExprKind::IntLit ||
                            expr.kind == HirExprKind::StrLit;
                 };
-                for (u32 mi = 0; mi < loop.body.matches.len; mi++) {
+                const auto match_can_advance = [&](u32 mi) {
+                    if (mi >= loop.body.matches.len) return false;
                     const auto& body_match = loop.body.matches[mi];
                     const auto capture_group_has_source_guard = [&](u32 arm_index) {
                         const auto& selected = body_match.arms[arm_index];
@@ -2598,7 +2628,8 @@ FrontendResult<MirModule*> build_mir(const HirModule& module) {
                             !arm_guard_can_fall_through && !capture_group_has_source_guard(ai))
                             break;
                     }
-                }
+                    return false;
+                };
                 for (u32 si = 0; si < loop.body.steps.len; si++) {
                     const auto& step = loop.body.steps[si];
                     if (step.kind == HirForLoopBody::Step::Kind::Guard &&
@@ -2619,6 +2650,9 @@ FrontendResult<MirModule*> build_mir(const HirModule& module) {
                         step.kind == HirForLoopBody::Step::Kind::Break)
                         return false;
                     if (step.kind == HirForLoopBody::Step::Kind::Continue) return true;
+                    if (step.kind == HirForLoopBody::Step::Kind::Match &&
+                        match_can_advance(step.index))
+                        return true;
                     if (step.kind == HirForLoopBody::Step::Kind::If &&
                         step.index < loop.body.ifs.len) {
                         const auto& body_if = loop.body.ifs[step.index];

@@ -23628,22 +23628,74 @@ static FrontendResult<HirModule*> analyze_file_internal(
                                     "directly"));
                 }
                 u32 iter_len = 0;
-                bool constant_selected_branch_terminates = false;
-                for (u32 step_index = 0; step_index < analyzed_loop.body.steps.len; step_index++) {
-                    const auto& step = analyzed_loop.body.steps[step_index];
-                    if (step.kind != HirForLoopBody::Step::Kind::If ||
-                        step.index >= analyzed_loop.body.ifs.len)
-                        continue;
-                    const auto& body_if = analyzed_loop.body.ifs[step.index];
-                    if (body_if.cond.kind != HirExprKind::BoolLit) continue;
-                    const auto& selected =
-                        body_if.cond.bool_value ? body_if.then_branch : body_if.else_branch;
-                    constant_selected_branch_terminates =
-                        selected.kind == HirForLoopBranch::Kind::Term;
-                    break;
-                }
-                if ((constant_selected_branch_terminates ||
-                     (analyzed_loop.body.has_term && !has_local_loop_control(analyzed_loop))) &&
+                const auto body_guarantees_route_termination = [&] {
+                    const auto literal_matches = [](const HirExpr& subject,
+                                                    const HirExpr& pattern) {
+                        if (subject.kind != pattern.kind) return false;
+                        if (subject.kind == HirExprKind::BoolLit)
+                            return subject.bool_value == pattern.bool_value;
+                        if (subject.kind == HirExprKind::IntLit)
+                            return subject.int_value == pattern.int_value;
+                        if (subject.kind == HirExprKind::StrLit)
+                            return subject.str_value.eq(pattern.str_value);
+                        return false;
+                    };
+                    for (u32 step_index = 0; step_index < analyzed_loop.body.steps.len;
+                         step_index++) {
+                        const auto& step = analyzed_loop.body.steps[step_index];
+                        if (step.kind == HirForLoopBody::Step::Kind::Guard &&
+                            step.index < analyzed_loop.body.guards.len) {
+                            const auto& guard = analyzed_loop.body.guards[step.index];
+                            if (guard.fail_kind == HirGuard::FailKind::LoopControl &&
+                                (guard.cond.kind != HirExprKind::BoolLit || !guard.cond.bool_value))
+                                return false;
+                            if (guard.cond.kind == HirExprKind::BoolLit && !guard.cond.bool_value)
+                                return guard.fail_kind == HirGuard::FailKind::Term;
+                        }
+                        if (step.kind == HirForLoopBody::Step::Kind::Term) return true;
+                        if (step.kind == HirForLoopBody::Step::Kind::Break ||
+                            step.kind == HirForLoopBody::Step::Kind::Continue)
+                            return false;
+                        if (step.kind == HirForLoopBody::Step::Kind::If &&
+                            step.index < analyzed_loop.body.ifs.len) {
+                            const auto& body_if = analyzed_loop.body.ifs[step.index];
+                            if (body_if.cond.kind == HirExprKind::BoolLit) {
+                                const auto& selected = body_if.cond.bool_value
+                                                           ? body_if.then_branch
+                                                           : body_if.else_branch;
+                                return selected.kind == HirForLoopBranch::Kind::Term;
+                            }
+                        }
+                        if (step.kind != HirForLoopBody::Step::Kind::Match ||
+                            step.index >= analyzed_loop.body.matches.len)
+                            continue;
+                        const auto& body_match = analyzed_loop.body.matches[step.index];
+                        const bool literal_subject =
+                            body_match.match_expr.kind == HirExprKind::BoolLit ||
+                            body_match.match_expr.kind == HirExprKind::IntLit ||
+                            body_match.match_expr.kind == HirExprKind::StrLit;
+                        if (!literal_subject) continue;
+                        for (u32 ai = 0; ai < body_match.arms.len; ai++) {
+                            const auto& arm = body_match.arms[ai];
+                            if (!arm.is_wildcard &&
+                                !literal_matches(body_match.match_expr, arm.pattern))
+                                continue;
+                            for (u32 gi = 0; gi < arm.guards.len; gi++)
+                                if (arm.guards[gi].cond.kind != HirExprKind::BoolLit ||
+                                    !arm.guards[gi].cond.bool_value)
+                                    return false;
+                            if (arm.body_kind == HirForLoopMatchArm::BodyKind::Direct)
+                                return arm.direct_branch.kind == HirForLoopBranch::Kind::Term;
+                            if (arm.cond.kind == HirExprKind::BoolLit)
+                                return (arm.cond.bool_value ? arm.then_branch : arm.else_branch)
+                                           .kind == HirForLoopBranch::Kind::Term;
+                            return arm.then_branch.kind == HirForLoopBranch::Kind::Term &&
+                                   arm.else_branch.kind == HirForLoopBranch::Kind::Term;
+                        }
+                    }
+                    return analyzed_loop.body.has_term && !has_local_loop_control(analyzed_loop);
+                };
+                if (body_guarantees_route_termination() &&
                     static_for_iter_len(analyzed_loop.iter_expr,
                                         route.locals.data,
                                         route.locals.len,

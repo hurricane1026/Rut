@@ -33362,6 +33362,71 @@ TEST(frontend, constant_selected_loop_branch_terminates_route) {
     rir.destroy();
 }
 
+TEST(frontend, prior_break_prevents_constant_branch_route_termination) {
+    const char* src =
+        "route GET \"/x\" { for item in [1] { guard false else { break } if true { return 201 } "
+        "else { break } } }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE_FALSE(hir);
+}
+
+TEST(frontend, terminating_guard_prunes_unreachable_match_continue) {
+    const char* src = R"rut(
+route GET "/x" {
+    for item in [1, 2, 3, 4, 5, 6, 7, 8] {
+        guard false else { break }
+        match true {
+            true => continue
+            false => return 201
+        }
+    }
+    return 500
+}
+)rut";
+    FrontendRirModule rir{};
+    REQUIRE(lower_src_to_rir(src, rir));
+    CHECK(rir::verify_module(rir.module).ok);
+    rir.destroy();
+}
+
+TEST(frontend, nonmatching_match_arm_control_does_not_hide_terminating_sibling) {
+    const char* src = R"rut(
+route GET "/x" {
+    for outer in [1, 2, 3, 4, 5, 6, 7, 8] {
+        for first in [1] { continue }
+        for second in [1] {
+            match true {
+                true => return 201
+                false => {
+                    guard req.http11 else { break }
+                    return 202
+                }
+            }
+        }
+    }
+    return 500
+}
+)rut";
+    FrontendRirModule rir{};
+    REQUIRE(lower_src_to_rir(src, rir));
+    CHECK(rir::verify_module(rir.module).ok);
+    rir.destroy();
+}
+
+TEST(frontend, constant_selected_match_arm_terminates_route) {
+    const char* src =
+        "route GET \"/x\" { for item in [1] { match true { true => return 201 false => break } } "
+        "}\n";
+    FrontendRirModule rir{};
+    REQUIRE(lower_src_to_rir(src, rir));
+    CHECK(rir::verify_module(rir.module).ok);
+    rir.destroy();
+}
+
 TEST(frontend, static_false_match_prelude_makes_body_continue_unreachable) {
     const char* src = R"rut(
 route GET "/x" {
