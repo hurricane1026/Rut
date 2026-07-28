@@ -33296,6 +33296,22 @@ route GET "/x" {
     rir.destroy();
 }
 
+TEST(frontend, terminating_guard_prunes_unreachable_direct_continue) {
+    const char* src = R"rut(
+route GET "/x" {
+    for item in [1, 2, 3, 4, 5, 6, 7, 8] {
+        guard false else { break }
+        continue
+    }
+    return 500
+}
+)rut";
+    FrontendRirModule rir{};
+    REQUIRE(lower_src_to_rir(src, rir));
+    CHECK(rir::verify_module(rir.module).ok);
+    rir.destroy();
+}
+
 TEST(frontend, static_false_match_prelude_makes_body_continue_unreachable) {
     const char* src = R"rut(
 route GET "/x" {

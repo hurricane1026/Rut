@@ -2515,6 +2515,22 @@ FrontendResult<MirModule*> build_mir(const HirModule& module) {
                 }
                 for (u32 si = 0; si < loop.body.steps.len; si++) {
                     const auto& step = loop.body.steps[si];
+                    if (step.kind == HirForLoopBody::Step::Kind::Guard &&
+                        step.index < loop.body.guards.len) {
+                        const auto& guard = loop.body.guards[step.index];
+                        if (guard.cond.kind == HirExprKind::BoolLit && !guard.cond.bool_value) {
+                            if (guard.fail_kind == HirGuard::FailKind::LoopControl &&
+                                guard.fail_loop_control == HirLoopControl::Continue)
+                                return true;
+                            if (guard.fail_kind == HirGuard::FailKind::Term ||
+                                (guard.fail_kind == HirGuard::FailKind::LoopControl &&
+                                 guard.fail_loop_control == HirLoopControl::Break))
+                                return false;
+                        }
+                    }
+                    if (step.kind == HirForLoopBody::Step::Kind::Term ||
+                        step.kind == HirForLoopBody::Step::Kind::Break)
+                        return false;
                     if (step.kind == HirForLoopBody::Step::Kind::Continue) return true;
                     if (step.kind == HirForLoopBody::Step::Kind::If &&
                         step.index < loop.body.ifs.len) {
