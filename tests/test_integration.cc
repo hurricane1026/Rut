@@ -16097,6 +16097,43 @@ TEST(route, upstream_mark_validates_transitive_ssa_dependencies) {
     CHECK(marking_policies_valid_for_codegen(mod));
 }
 
+TEST(route, marking_policy_checks_cross_block_dominance_paths) {
+    using namespace rut;
+    rir::Instruction entry{};
+    entry.op = rir::Opcode::Br;
+    entry.imm.block_targets[0] = {1};
+    entry.imm.block_targets[1] = {2};
+    rir::Instruction definition_exit{};
+    definition_exit.op = rir::Opcode::Jmp;
+    definition_exit.imm.block_targets[0] = {2};
+    rir::Instruction use_exit{};
+    use_exit.op = rir::Opcode::RetStatus;
+    rir::Block blocks[3] = {
+        {{0}, {}, &entry, 1, 1},
+        {{1}, {}, &definition_exit, 1, 1},
+        {{2}, {}, &use_exit, 1, 1},
+    };
+    rir::Function fn{};
+    fn.blocks = blocks;
+    fn.block_count = 3;
+    fn.block_cap = 3;
+
+    // The direct entry -> use edge bypasses block 1.
+    CHECK_FALSE(marking_policy_block_dominates(fn, 1, 2));
+
+    // Once every path reaches block 1 first, its definitions dominate block 2.
+    entry.op = rir::Opcode::Jmp;
+    CHECK(marking_policy_block_dominates(fn, 1, 2));
+    CHECK(marking_policy_block_dominates(fn, 0, 2));
+    CHECK(marking_policy_block_dominates(fn, 2, 2));
+
+    // Malformed hand-built RIR and oversized policy graphs fail closed.
+    entry.imm.block_targets[0] = {99};
+    CHECK_FALSE(marking_policy_block_dominates(fn, 1, 2));
+    fn.block_count = 4097;
+    CHECK_FALSE(marking_policy_block_dominates(fn, 1, 2));
+}
+
 TEST(route, upstream_mark_validates_string_opcode_types) {
     using namespace rut;
     const rir::Type str_type{rir::TypeKind::Str, nullptr, nullptr};
