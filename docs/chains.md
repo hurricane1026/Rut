@@ -18,11 +18,13 @@ chain secure_upload {
 `before` steps run before the handler. They may fail closed, so each step must
 declare the status returned on failure.
 
-`after` implements the response-header slice of the same chain model. Its helper
-must receive exactly one `Response` parameter and use `set`, `add`, or `remove`
-header effects. The analyzer rejects body/status-only observers and routes that
-combine these effects with `wait` or `for`; those need a resumable, stream-owned
-Response object first.
+`after` implements the response side of the same chain model. Its helper must
+receive exactly one `Response` parameter and may perform ordered `set`, `add`,
+or `remove` header effects plus status and bounded body replacement. These
+effects live in resumable stream-owned state, so they survive explicit `wait`
+suspension. A forwarded response must use
+`return forward(upstream, buffered: true)` so the runtime can materialize the
+complete response before committing the effects.
 
 If a route needs more precise control than "before handler" or "after handler",
 write that logic directly inside the handler with ordinary `guard`, `wait`,
@@ -101,16 +103,16 @@ and generated code do not need an extra execution model.
 Rut Core should keep chains intentionally narrow:
 
 - The implemented route-level extension points are request-side `before` and
-  the constrained response-header `after` slice described above; there are no
-  arbitrary phases or body/status post-processing hooks.
+  the bounded response `after` slice described above; there are no arbitrary
+  phases or first-class buffered Response expressions.
 - A `before` step must be a direct call. A bool predicate must declare
   `else <status>` (its only rejection channel); a respond-capable helper
   (one whose body uses `guard ... else { respond <status>[, body] }`) must
   NOT — it carries its own status, and its respond guards expand at the
   chain position. This is the DESIGN "middleware = ordinary functions"
   surface: `respond` short-circuits, `return` passes through.
-- `after` is limited to ordered Response header effects and cannot yet be used
-  on `wait`/`for` routes.
+- `after` is limited to ordered Response header/status/bounded-body effects;
+  streaming forwards are rejected because their bytes may already be on wire.
 - Chain order is source order only; there is no priority or phase dispatch.
 - A route entry should attach at most one entry chain.
 - Chains are statically expanded before route verification.

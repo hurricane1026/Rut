@@ -101,10 +101,11 @@ struct Http2Conn {
     Http2Stream streams[kMaxStreams];
     u32 nstreams;
 
-    // Pending request awaiting DATA frames. For body-reading handlers the
-    // serving layer appends DATA after synthesized HTTP/1 request headers; for
-    // routes that only need Content-Length validation it keeps only the headers
-    // and counts DATA bytes. One at a time for now: pending_stream == 0 means none.
+    // Pending request awaiting DATA frames. JIT handlers retain DATA after the
+    // synthesized HTTP/1 headers because their terminal action may select a
+    // buffered forward even when the handler never reads req.body itself. Other
+    // routes may count only for Content-Length validation. One at a time for now:
+    // pending_stream == 0 means none.
     // A route snapshot is captured at END_HEADERS so delayed DATA handling does not
     // re-match if config swaps between HEADERS and DATA.
     static constexpr u32 kBodySynthCap = 16384;
@@ -115,7 +116,16 @@ struct Http2Conn {
     u32 pending_content_length;
     bool pending_has_content_length;
     bool pending_buffer_body;
+    bool pending_request_forwardable;
     bool pending_overflow;  // body exceeded kBodySynthCap → respond 413
+    // A body-independent handler that selected ForwardBuffered has already run
+    // at HEADERS time. Its response mutations live in async_handler_ctx_storage
+    // while DATA is collected, so the handler is not invoked twice.
+    bool pending_preinvoked_forward;
+    bool pending_preinvoked_timer;
+    u16 pending_forward_upstream_id;
+    u16 pending_timer_state;
+    u32 pending_timer_ms;
     // Snapshot of matched route decisions at END_HEADERS time for deferred
     // requests. This keeps delayed DATA handlers stable when config changes
     // between HEADERS and DATA frames.
@@ -151,6 +161,12 @@ struct Http2Conn {
     H2AsyncKind async_kind;
     const RouteConfig* async_cfg;
     u32 async_synth_len;
+    u32 async_body_start;
+    u32 async_body_len;
+    u32 async_content_length;
+    bool async_has_content_length;
+    bool async_inject_content_length_on_forward;
+    bool async_wait_for_body_on_forward;
     // Bytes of the synthesized request already written to the upstream. io_uring
     // sends can complete short (full socket buffer, large header block), so the
     // proxy resubmits the remainder until async_synth_sent == async_synth_len.
@@ -171,6 +187,9 @@ struct Http2Conn {
     // and the running count of upstream h1 response bytes accumulated back into
     // pending_synth (reused as the response buffer once the request is sent).
     const RouteEntry* async_route;
+    u16 async_upstream_id;
+    bool async_apply_response_mutations;
+    bool async_request_forwardable;
     u32 async_resp_len;
 
     jit::HandlerCtx* async_jit_ctx() {

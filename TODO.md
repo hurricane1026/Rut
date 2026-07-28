@@ -30,19 +30,21 @@ harness oracles.
 
 ### Stream-owned Response mutation
 
-Response header mutation logs now live in resumable `HandlerCtx` state rather
-than `Connection`; pending logs survive `wait`, stay isolated per request or H2
-stream invocation, and `chain after` no longer rejects `wait`/`for` routes.
-Bounded plain-string/JSON body replacement and status replacement use the same
-pending/committed boundary. Handler-local `status`/`body` reads now observe the
-latest pending replacement. Remaining work is materializing explicitly
-buffered forwarded responses so their fields and header/status/body mutations
-can use the same boundary.
+The terminal `return forward(upstream, buffered: true)` path now buffers a
+bounded complete upstream response and commits resumable `chain after`
+header/status/body mutations consistently over HTTP/1 and HTTP/2. Remaining
+work is promoting that terminal operation to a first-class expression such as
+`let resp = forward(upstream, buffered: true)`, materializing upstream
+status/body/header fields in stream-owned storage so they can be read and
+mutated before `return resp`.
 
 **Acceptance**:
-- `chain after` can mutate buffered status/body and survive a yield.
-- Guard/middleware short-circuits cannot inherit uncommitted response effects.
-- HTTP/1 and HTTP/2 have matching commit and overflow behavior.
+- A buffered forward can be bound as a `Response` and returned without losing
+  upstream fields.
+- Buffered field reads and subsequent mutations survive a yield without
+  borrowing proxy or serializer scratch.
+- Expression-form overflow, upstream failure, and unsupported request-rewrite
+  combinations fail with the same documented policy as terminal buffering.
 
 ### Control-plane builtins
 
@@ -151,6 +153,9 @@ implementation promise.
   `isEmpty`, `first`, and bounds-safe `at`.
 - [x] Literal JSON serialization, response builders, dynamic header mutation,
   and ordered `chain after` header effects lower end to end.
+- [x] Terminal buffered forwarding applies resumable `chain after`
+  header/status/body mutations over HTTP/1 and HTTP/2; malformed, truncated,
+  or over-cap upstream responses and invalid mutations fail closed.
 - [x] `Cache<IP,i64>`, branch-local writes, `i64` arithmetic/bitwise helpers,
   and monotonic time support Rut-written GCRA and fixed-window examples.
 - [x] The common harness provides deterministic handler/scenario execution,

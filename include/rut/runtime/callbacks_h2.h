@@ -81,6 +81,17 @@ inline bool h2_is_prohibited_response_header(const char* name, u32 len) {
            http_header_name_eq_ci(name, len, "te", 2);
 }
 
+inline bool h2_response_header_mutations_valid(const jit::HandlerCtx* response_ctx) {
+    if (response_ctx == nullptr) return true;
+    for (u32 i = 0; i < response_ctx->response_header_count; i++) {
+        const Str name = response_ctx->response_header_mutations[i].name;
+        if (h2_is_prohibited_response_header(name.ptr, name.len) ||
+            http_header_name_eq_ci(name.ptr, name.len, "content-length", 14))
+            return false;
+    }
+    return true;
+}
+
 template <typename Loop>
 void h2_emit_response(H2Dispatch<Loop>& d,
                       u32 stream_id,
@@ -130,6 +141,37 @@ void h2_emit_response(H2Dispatch<Loop>& d,
 template <typename Loop>
 void h2_emit_status(H2Dispatch<Loop>& d, u32 stream_id, u16 status) {
     h2_emit_response(d, stream_id, status, nullptr, 0, nullptr, 0);
+}
+
+// Append an informational HEADERS block without closing the stream. This is
+// used for Expect: 100-continue before a selected buffered forward waits for
+// DATA, so a client that gates its upload on the acknowledgement can proceed.
+template <typename Loop>
+void h2_emit_continue(H2Dispatch<Loop>& d, u32 stream_id) {
+    const hpack::Header status{{":status", 7}, {"100", 3}};
+    const u32 n = http2_write_headers(
+        d.resp + d.resp_len, d.resp_cap - d.resp_len, stream_id, &status, 1, false);
+    if (n == 0)
+        d.overflow = true;
+    else
+        d.resp_len += n;
+}
+
+inline bool h2_expects_continue(const hpack::Header* headers, u32 nheaders) {
+    for (u32 i = 0; i < nheaders; i++) {
+        if (!headers[i].name.eq(Str{"expect", 6})) continue;
+        u32 start = 0;
+        u32 end = headers[i].value.len;
+        while (start < end &&
+               (headers[i].value.ptr[start] == ' ' || headers[i].value.ptr[start] == '\t'))
+            start++;
+        while (end > start &&
+               (headers[i].value.ptr[end - 1] == ' ' || headers[i].value.ptr[end - 1] == '\t'))
+            end--;
+        if (http_header_name_eq_ci(headers[i].value.ptr + start, end - start, "100-continue", 12))
+            return true;
+    }
+    return false;
 }
 
 inline bool h2_response_status_forbids_body(u16 status) {
@@ -231,16 +273,18 @@ inline bool h2_proxy_request_forwardable(const hpack::Header* hs, u32 n) {
         if (hs[i].name.eq(Str{":scheme", 7}))
             have_scheme = true;
         else if (hs[i].name.eq(Str{":authority", 10}))
-            have_authority = true;
+            have_authority = hs[i].value.len != 0;
         else if (hs[i].name.len > 0 && hs[i].name.ptr[0] != ':' && hs[i].name.eq(Str{"host", 4}))
             host_fields++;
     }
     if (!have_scheme) return false;
-    if (!have_authority && host_fields > 1) return false;
+    if (!have_authority && host_fields != 1) return false;
     return true;
 }
 
 inline void h2_clear_pending(Http2Conn& h2) {
+    if (h2.pending_preinvoked_forward || h2.pending_preinvoked_timer)
+        rut_helper_resp_release_body_storage(static_cast<void*>(h2.async_jit_ctx()));
     h2.pending_stream = 0;
     h2.pending_body_start = 0;
     h2.pending_synth_len = 0;
@@ -248,7 +292,13 @@ inline void h2_clear_pending(Http2Conn& h2) {
     h2.pending_content_length = 0;
     h2.pending_has_content_length = false;
     h2.pending_buffer_body = false;
+    h2.pending_request_forwardable = false;
     h2.pending_overflow = false;
+    h2.pending_preinvoked_forward = false;
+    h2.pending_preinvoked_timer = false;
+    h2.pending_forward_upstream_id = 0;
+    h2.pending_timer_state = 0;
+    h2.pending_timer_ms = 0;
     h2.pending_route_config = nullptr;
     h2.pending_route = nullptr;
     h2.pending_route_action = RouteAction::Static;
@@ -300,6 +350,65 @@ inline bool h2_inject_content_length(u8* buf, u32* len, u32 body_start, u32 body
     return true;
 }
 
+inline bool h2_snapshot_buffered_response_mutation_views(jit::HandlerCtx* ctx,
+                                                         const u8* synth,
+                                                         u32 synth_len) {
+    if (ctx == nullptr) return false;
+    const u32 count = ctx->response_header_pending_count > ctx->response_header_count
+                          ? ctx->response_header_pending_count
+                          : ctx->response_header_count;
+    if (count > jit::kMaxResponseHeaderMutations) return false;
+    const auto begin = reinterpret_cast<uintptr_t>(synth);
+    auto snapshot = [&](Str& view) {
+        if (view.ptr == nullptr || view.len == 0) return true;
+        const auto ptr = reinterpret_cast<uintptr_t>(view.ptr);
+        if (ptr < begin || ptr - begin > synth_len || view.len > synth_len - (ptr - begin))
+            return true;
+        const char* stable = jit::snapshot_response_body(ctx, view.ptr, view.len);
+        if (stable == nullptr) return false;
+        view.ptr = stable;
+        return true;
+    };
+    for (u32 i = 0; i < count; i++) {
+        auto& mutation = ctx->response_header_mutations[i];
+        if (!snapshot(mutation.name) || !snapshot(mutation.value)) return false;
+    }
+    return true;
+}
+
+// HTTP/2 permits only `te: trailers`, but forwarding that field through the
+// synthesized HTTP/1 request would require a matching `Connection: TE` option.
+// Buffered forwarding consumes response trailers rather than relaying them, so
+// remove every TE line after the handler has inspected the original request and
+// before the synthesized bytes are sent upstream.
+inline bool h2_strip_synth_te(u8* buf, u32* len, u32* body_start) {
+    u32 pos = 0;
+    while (pos + 1 < *len && !(buf[pos] == '\r' && buf[pos + 1] == '\n')) pos++;
+    if (pos + 1 >= *len) return false;
+    pos += 2;
+    while (pos + 1 < *len) {
+        if (buf[pos] == '\r' && buf[pos + 1] == '\n') return true;
+        u32 line_end = pos;
+        while (line_end + 1 < *len && !(buf[line_end] == '\r' && buf[line_end + 1] == '\n'))
+            line_end++;
+        if (line_end + 1 >= *len) return false;
+        u32 colon = pos;
+        while (colon < line_end && buf[colon] != ':') colon++;
+        if (colon == line_end) return false;
+        if (http_header_name_eq_ci(
+                reinterpret_cast<const char*>(buf + pos), colon - pos, "te", 2)) {
+            const u32 remove_end = line_end + 2;
+            const u32 remove_len = remove_end - pos;
+            __builtin_memmove(buf + pos, buf + remove_end, *len - remove_end);
+            *len -= remove_len;
+            if (*body_start >= remove_end) *body_start -= remove_len;
+            continue;
+        }
+        pos = line_end + 2;
+    }
+    return false;
+}
+
 template <typename Loop>
 bool h2_defer_until_data_end(H2Dispatch<Loop>& d,
                              u32 stream_id,
@@ -341,6 +450,7 @@ bool h2_defer_until_data_end(H2Dispatch<Loop>& d,
     h2->pending_content_length = req.content_length;
     h2->pending_has_content_length = req.has_content_length;
     h2->pending_buffer_body = buffer_body;
+    h2->pending_request_forwardable = h2_proxy_request_forwardable(headers, nheaders);
     h2->pending_overflow = false;
     h2->pending_route_config = route_config;
     h2->pending_route = route;
@@ -382,6 +492,7 @@ bool h2_defer_until_data_end(H2Dispatch<Loop>& d,
     }
     h2->pending_route_param_count = stored;
     h2->pending_stream = stream_id;
+    if (h2_expects_continue(headers, nheaders)) h2_emit_continue(d, stream_id);
     return true;
 }
 
@@ -432,6 +543,10 @@ void h2_emit_outcome(H2Dispatch<Loop>& d,
         }
     }
     if (o.response_ctx != nullptr && o.response_ctx->response_header_overflow) {
+        h2_emit_status(d, stream_id, 500);
+        return;
+    }
+    if (!h2_response_header_mutations_valid(o.response_ctx)) {
         h2_emit_status(d, stream_id, 500);
         return;
     }
@@ -526,17 +641,54 @@ void h2_async_epoch_leave(Loop* loop, Connection& conn) {
 
 // Release the single async-suspend slot.
 inline void h2_clear_async(Http2Conn& h2) {
-    if (h2.async_stream != 0 && h2.async_kind == H2AsyncKind::Timer)
+    if (h2.async_stream != 0 &&
+        (h2.async_kind == H2AsyncKind::Timer || h2.async_apply_response_mutations))
         rut_helper_resp_release_body_storage(static_cast<void*>(h2.async_jit_ctx()));
     h2.async_stream = 0;
     h2.async_kind = H2AsyncKind::None;
     h2.async_cfg = nullptr;
     h2.async_synth_len = 0;
+    h2.async_body_start = 0;
+    h2.async_body_len = 0;
+    h2.async_content_length = 0;
+    h2.async_has_content_length = false;
+    h2.async_inject_content_length_on_forward = false;
+    h2.async_wait_for_body_on_forward = false;
     h2.async_timer_ms = 0;
     h2.async_fn = nullptr;
     h2.async_state = 0;
     h2.async_route = nullptr;
+    h2.async_upstream_id = 0;
+    h2.async_apply_response_mutations = false;
+    h2.async_request_forwardable = false;
     h2.async_resp_len = 0;
+}
+
+// A HEADERS-time timer resumed into ForwardBuffered while the request stream is
+// still open. Move the stable request bytes and parked HandlerCtx into the
+// pending-body episode; setting async_stream to zero before clearing prevents
+// the old Timer owner from releasing the context's mutation storage.
+inline void h2_transfer_timer_to_pending_forward(Http2Conn& h2, u32 stream_id, u16 upstream_id) {
+    h2.pending_stream = stream_id;
+    h2.pending_body_start = h2.async_body_start;
+    h2.pending_synth_len = h2.async_synth_len;
+    h2.pending_body_len = 0;
+    h2.pending_content_length = h2.async_content_length;
+    h2.pending_has_content_length = h2.async_has_content_length;
+    h2.pending_buffer_body = true;
+    h2.pending_request_forwardable = true;
+    h2.pending_overflow = false;
+    h2.pending_preinvoked_forward = true;
+    h2.pending_preinvoked_timer = false;
+    h2.pending_forward_upstream_id = upstream_id;
+    h2.pending_route_config = h2.async_cfg;
+    h2.pending_route = h2.async_route;
+    h2.pending_route_action = RouteAction::JitHandler;
+    h2.pending_jit_fn = h2.async_fn;
+    h2.pending_route_param_count = 0;
+
+    h2.async_stream = 0;
+    h2_clear_async(h2);
 }
 
 // Copy a synthesized h1 request into pending_synth (the per-connection stable
@@ -634,7 +786,12 @@ bool h2_suspend_timer(H2Dispatch<Loop>& d,
                       const JitDispatchOutcome& o,
                       const RouteConfig* cfg,
                       const u8* synth,
-                      u32 synth_len) {
+                      u32 synth_len,
+                      bool request_forwardable,
+                      u32 body_start,
+                      u32 body_len,
+                      bool inject_content_length_on_forward,
+                      bool ctx_already_parked = false) {
     Http2Conn* h2 = d.conn->h2;
     // Refuse if a stream is already suspended OR a body-reading request is deferred
     // — both reuse pending_synth, so a second would corrupt the first's bytes — OR
@@ -645,7 +802,13 @@ bool h2_suspend_timer(H2Dispatch<Loop>& d,
     // suspending batch could otherwise let a hot reload reclaim them while parked.
     h2_async_epoch_enter(d.loop, *d.conn);
     h2->async_synth_len = h2_stash_synth(*h2, synth, synth_len);
-    if (!h2_snapshot_async_jit_ctx(*h2, live_ctx, synth, h2->async_synth_len)) {
+    h2->async_body_start = body_start;
+    h2->async_body_len = body_len;
+    h2->async_content_length = 0;
+    h2->async_has_content_length = false;
+    h2->async_inject_content_length_on_forward = inject_content_length_on_forward;
+    if (!ctx_already_parked &&
+        !h2_snapshot_async_jit_ctx(*h2, live_ctx, synth, h2->async_synth_len)) {
         h2_async_epoch_leave(d.loop, *d.conn);
         return false;
     }
@@ -655,6 +818,7 @@ bool h2_suspend_timer(H2Dispatch<Loop>& d,
     h2->async_timer_ms = o.timer_ms;
     h2->async_fn = fn;
     h2->async_state = static_cast<u16>(o.next_state);
+    h2->async_request_forwardable = request_forwardable;
     return true;
 }
 
@@ -667,8 +831,12 @@ bool h2_suspend_proxy(H2Dispatch<Loop>& d,
                       u32 stream_id,
                       const RouteConfig* cfg,
                       const RouteEntry* route,
+                      u16 upstream_id,
+                      bool apply_response_mutations,
+                      jit::HandlerCtx* live_ctx,
                       const u8* synth,
-                      u32 synth_len) {
+                      u32 synth_len,
+                      bool ctx_already_parked = false) {
     Http2Conn* h2 = d.conn->h2;
     // Refuse while another stream is suspended OR a body-reading request is
     // deferred — both reuse pending_synth (see h2_suspend_timer) — OR while
@@ -678,10 +846,18 @@ bool h2_suspend_proxy(H2Dispatch<Loop>& d,
     // Pin the config epoch before storing cfg/route (see h2_suspend_timer).
     h2_async_epoch_enter(d.loop, *d.conn);
     h2->async_synth_len = h2_stash_synth(*h2, synth, synth_len);
+    if (apply_response_mutations && !ctx_already_parked &&
+        (live_ctx == nullptr ||
+         !h2_snapshot_async_jit_ctx(*h2, *live_ctx, synth, h2->async_synth_len))) {
+        h2_async_epoch_leave(d.loop, *d.conn);
+        return false;
+    }
     h2->async_stream = stream_id;
     h2->async_kind = H2AsyncKind::Proxy;
     h2->async_cfg = cfg;
     h2->async_route = route;
+    h2->async_upstream_id = upstream_id;
+    h2->async_apply_response_mutations = apply_response_mutations;
     h2->async_resp_len = 0;
     return true;
 }
@@ -698,7 +874,11 @@ void h2_invoke_emit(H2Dispatch<Loop>& d,
                     u32 param_count,
                     const RouteConfig* cfg,
                     const u8* synth,
-                    u32 synth_len) {
+                    u32 synth_len,
+                    bool request_forwardable,
+                    u32 body_start = 0,
+                    u32 body_len = 0,
+                    bool inject_content_length_on_forward = false) {
     auto* ctx = d.conn->reset_jit_ctx();
     ctx->state = 0;
     ctx->resume_event_kind = static_cast<u32>(jit::YieldKind::Timer);
@@ -709,9 +889,51 @@ void h2_invoke_emit(H2Dispatch<Loop>& d,
     const JitDispatchOutcome kOutcome = invoke_jit_handler(
         route->fn, static_cast<void*>(d.conn), *ctx, synth, synth_len, /*arena=*/nullptr);
     if (kOutcome.kind == JitDispatchOutcome::Kind::TimerYield) {
-        if (!h2_suspend_timer(d, stream_id, route->fn, *ctx, kOutcome, cfg, synth, synth_len)) {
+        if (!h2_suspend_timer(d,
+                              stream_id,
+                              route->fn,
+                              *ctx,
+                              kOutcome,
+                              cfg,
+                              synth,
+                              synth_len,
+                              request_forwardable,
+                              body_start,
+                              body_len,
+                              inject_content_length_on_forward)) {
             jit::release_response_body_mutation_storage(ctx);
             h2_emit_status(d, stream_id, 503);  // a stream is already suspended
+        }
+        return;
+    }
+    if (kOutcome.kind == JitDispatchOutcome::Kind::ForwardBuffered) {
+        if (!request_forwardable) {
+            jit::release_response_body_mutation_storage(ctx);
+            h2_emit_status(d, stream_id, 400);
+            return;
+        }
+        u32 forward_len = synth_len;
+        u32 forward_body_start = body_start;
+        if (!h2_snapshot_buffered_response_mutation_views(ctx, synth, synth_len) ||
+            !h2_strip_synth_te(const_cast<u8*>(synth), &forward_len, &forward_body_start)) {
+            jit::release_response_body_mutation_storage(ctx);
+            h2_emit_status(d, stream_id, 500);
+            return;
+        }
+        if (inject_content_length_on_forward &&
+            !h2_inject_content_length(const_cast<u8*>(synth),
+                                      &forward_len,
+                                      forward_body_start,
+                                      body_len,
+                                      Http2Conn::kBodySynthCap)) {
+            jit::release_response_body_mutation_storage(ctx);
+            h2_emit_status(d, stream_id, 413);
+            return;
+        }
+        if (!h2_suspend_proxy(
+                d, stream_id, cfg, route, kOutcome.upstream_id, true, ctx, synth, forward_len)) {
+            jit::release_response_body_mutation_storage(ctx);
+            h2_emit_status(d, stream_id, 503);
         }
         return;
     }
@@ -753,14 +975,96 @@ void h2_finish_body(H2Dispatch<Loop>& d, u32 stream_id) {
         return;
     }
 
-    // Body-reading handler whose client omitted Content-Length: inject the
-    // observed body length so the HTTP/1-shaped parse exposes the DATA bytes.
-    if (h2->pending_buffer_body && !h2->pending_has_content_length &&
-        !h2_inject_content_length(h2->pending_synth,
-                                  &h2->pending_synth_len,
-                                  h2->pending_body_start,
-                                  h2->pending_body_len,
-                                  Http2Conn::kBodySynthCap)) {
+    if (h2->pending_preinvoked_forward || h2->pending_preinvoked_timer) {
+        const RouteConfig* cfg = h2->pending_route_config;
+        const RouteEntry* route = h2->pending_route;
+        const u16 upstream_id = h2->pending_forward_upstream_id;
+        const bool preinvoked_timer = h2->pending_preinvoked_timer;
+        if (route == nullptr || (!preinvoked_timer && !h2->pending_request_forwardable)) {
+            const u16 status = route == nullptr ? 500 : 400;
+            h2_clear_pending(*h2);
+            h2_emit_status(d, stream_id, status);
+            return;
+        }
+        if (!preinvoked_timer &&
+            (!h2_snapshot_buffered_response_mutation_views(
+                 h2->async_jit_ctx(), h2->pending_synth, h2->pending_synth_len) ||
+             !h2_strip_synth_te(
+                 h2->pending_synth, &h2->pending_synth_len, &h2->pending_body_start))) {
+            h2_clear_pending(*h2);
+            h2_emit_status(d, stream_id, 500);
+            return;
+        }
+        if (!preinvoked_timer && !h2->pending_has_content_length &&
+            !h2_inject_content_length(h2->pending_synth,
+                                      &h2->pending_synth_len,
+                                      h2->pending_body_start,
+                                      h2->pending_body_len,
+                                      Http2Conn::kBodySynthCap)) {
+            h2_clear_pending(*h2);
+            h2_emit_status(d, stream_id, 413);
+            return;
+        }
+        const u32 synth_len = h2->pending_synth_len;
+        const u32 body_start = h2->pending_body_start;
+        const u32 body_len = h2->pending_body_len;
+        const bool request_forwardable = h2->pending_request_forwardable;
+        const bool inject_content_length_on_forward = !h2->pending_has_content_length;
+        h2->pending_stream = 0;  // transfer the shared synth/context to async
+        bool suspended = false;
+        if (preinvoked_timer) {
+            JitDispatchOutcome outcome{};
+            outcome.kind = JitDispatchOutcome::Kind::TimerYield;
+            outcome.next_state = h2->pending_timer_state;
+            outcome.timer_ms = h2->pending_timer_ms;
+            suspended = h2_suspend_timer(d,
+                                         stream_id,
+                                         route->fn,
+                                         *h2->async_jit_ctx(),
+                                         outcome,
+                                         cfg,
+                                         h2->pending_synth,
+                                         synth_len,
+                                         request_forwardable,
+                                         body_start,
+                                         body_len,
+                                         inject_content_length_on_forward,
+                                         /*ctx_already_parked=*/true);
+        } else {
+            suspended = h2_suspend_proxy(d,
+                                         stream_id,
+                                         cfg,
+                                         route,
+                                         upstream_id,
+                                         true,
+                                         h2->async_jit_ctx(),
+                                         h2->pending_synth,
+                                         synth_len,
+                                         /*ctx_already_parked=*/true);
+        }
+        if (!suspended) {
+            h2_clear_pending(*h2);
+            h2_emit_status(d, stream_id, 503);
+            return;
+        }
+        h2->pending_preinvoked_forward = false;  // ownership moved to async
+        h2->pending_preinvoked_timer = false;
+        h2_clear_pending(*h2);
+        return;
+    }
+
+    const RouteEntry* pending_route = h2->pending_route;
+    const bool inject_for_handler = h2->pending_buffer_body && !h2->pending_has_content_length &&
+                                    pending_route != nullptr && pending_route->needs_req_body;
+    // A body-reading handler still needs the derived length for the HTTP/1-
+    // shaped body parser. A route that only may buffered-forward must observe
+    // the original header set; its derived length is injected after that
+    // outcome is selected below.
+    if (inject_for_handler && !h2_inject_content_length(h2->pending_synth,
+                                                        &h2->pending_synth_len,
+                                                        h2->pending_body_start,
+                                                        h2->pending_body_len,
+                                                        Http2Conn::kBodySynthCap)) {
         h2_clear_pending(*h2);
         h2_emit_status(d, stream_id, 413);
         return;
@@ -768,10 +1072,15 @@ void h2_finish_body(H2Dispatch<Loop>& d, u32 stream_id) {
 
     const u32 kLen = h2->pending_synth_len;
     const u8* synth = h2->pending_synth;
+    const u32 kBodyStart = h2->pending_body_start;
+    const u32 kBodyLen = h2->pending_body_len;
+    const bool kInjectContentLengthOnForward =
+        h2->pending_buffer_body && !h2->pending_has_content_length && !inject_for_handler;
     const RouteConfig* cfg = h2->pending_route_config;
-    const RouteEntry* route = h2->pending_route;
+    const RouteEntry* route = pending_route;
     const jit::HandlerFn kJitFn = h2->pending_jit_fn;
     const u32 kRouteParamCount = h2->pending_route_param_count;
+    const bool kRequestForwardable = h2->pending_request_forwardable;
     RouteParam route_params[kMaxRouteParams];
     for (u32 i = 0; i < kRouteParamCount; i++) {
         const H2RouteParam& p = h2->pending_route_params[i];
@@ -787,7 +1096,18 @@ void h2_finish_body(H2Dispatch<Loop>& d, u32 stream_id) {
     // time (h2->pending_route*), so the deferred body dispatches to exactly the
     // route metered at HEADERS time — h2_dispatch_request charges body routes
     // there (a reload can't swap the route out from under the pinned dispatch).
-    h2_invoke_emit(d, stream_id, route, route_params, kRouteParamCount, cfg, synth, kLen);
+    h2_invoke_emit(d,
+                   stream_id,
+                   route,
+                   route_params,
+                   kRouteParamCount,
+                   cfg,
+                   synth,
+                   kLen,
+                   kRequestForwardable,
+                   kBodyStart,
+                   kBodyLen,
+                   kInjectContentLengthOnForward);
 }
 
 // Resolve a completed header block (END_HEADERS) to a response. end_stream is
@@ -925,22 +1245,122 @@ void h2_dispatch_request(H2Dispatch<Loop>& d,
                 h2_emit_status(d, stream_id, 500);
                 return;
             }
-            // Defer when a body still follows: needs_req_body handlers wait to
-            // read it; others wait only to consume / validate a declared
-            // Content-Length. buffer_body decides whether DATA is accumulated.
-            if (!end_stream && (route->needs_req_body || req.has_content_length)) {
-                h2_defer_until_data_end(d,
-                                        stream_id,
-                                        headers,
-                                        nheaders,
-                                        req,
-                                        /*buffer_body=*/route->needs_req_body,
-                                        RouteAction::JitHandler,
-                                        config,
-                                        route,
-                                        params,
-                                        param_count,
-                                        200);
+            // A route may contain a buffered-forward terminator without reading
+            // req.body. Run it from the HEADERS view first: local responses and
+            // waits must not inherit the 16 KiB forwarding-body cap merely
+            // because some other branch can forward. Only the selected buffered
+            // forward parks and accumulates DATA. Preserve its already-produced
+            // mutation context so the handler is not invoked a second time.
+            if (!end_stream && !route->needs_req_body && route->can_forward_buffered) {
+                Http2Conn* h2 = d.conn->h2;
+                if (h2->pending_stream != 0 || h2->async_stream != 0 ||
+                    d.conn->h2_proxy_synth_quarantined) {
+                    h2_emit_status(d, stream_id, 503);
+                    return;
+                }
+                u8 synth[Http2Conn::kBodySynthCap];
+                const u32 kSynthLen = h2_synth_h1_request(headers, nheaders, synth, sizeof(synth));
+                if (kSynthLen == 0) {
+                    h2_emit_status(d, stream_id, 400);
+                    return;
+                }
+                RouteParam anchored_params[kMaxRouteParams];
+                if (!h2_reanchor_route_params(
+                        params, param_count, req.path, synth, kSynthLen, anchored_params)) {
+                    h2_emit_status(d, stream_id, 500);
+                    return;
+                }
+                auto* ctx = d.conn->reset_jit_ctx();
+                ctx->state = 0;
+                ctx->resume_event_kind = static_cast<u32>(jit::YieldKind::Timer);
+                ctx->resume_event_result = 0;
+                ctx->route_param_count = param_count;
+                for (u32 i = 0; i < param_count; i++) ctx->route_params[i] = anchored_params[i];
+                const JitDispatchOutcome kOutcome = invoke_jit_handler(
+                    route->fn, static_cast<void*>(d.conn), *ctx, synth, kSynthLen, nullptr);
+
+                if (kOutcome.kind == JitDispatchOutcome::Kind::ForwardBuffered) {
+                    if (!h2_proxy_request_forwardable(headers, nheaders)) {
+                        jit::release_response_body_mutation_storage(ctx);
+                        h2_emit_status(d, stream_id, 400);
+                        return;
+                    }
+                    if (!h2_defer_until_data_end(d,
+                                                 stream_id,
+                                                 headers,
+                                                 nheaders,
+                                                 req,
+                                                 /*buffer_body=*/true,
+                                                 RouteAction::JitHandler,
+                                                 config,
+                                                 route,
+                                                 params,
+                                                 param_count,
+                                                 200)) {
+                        jit::release_response_body_mutation_storage(ctx);
+                        return;
+                    }
+                    if (!h2_snapshot_async_jit_ctx(*h2, *ctx, synth, kSynthLen)) {
+                        h2_clear_pending(*h2);
+                        jit::release_response_body_mutation_storage(ctx);
+                        h2_emit_status(d, stream_id, 500);
+                        return;
+                    }
+                    h2->pending_preinvoked_forward = true;
+                    h2->pending_forward_upstream_id = kOutcome.upstream_id;
+                    return;
+                }
+                if (kOutcome.kind == JitDispatchOutcome::Kind::TimerYield) {
+                    if (!h2_suspend_timer(d,
+                                          stream_id,
+                                          route->fn,
+                                          *ctx,
+                                          kOutcome,
+                                          config,
+                                          synth,
+                                          kSynthLen,
+                                          h2_proxy_request_forwardable(headers, nheaders),
+                                          kSynthLen,
+                                          0,
+                                          !req.has_content_length)) {
+                        jit::release_response_body_mutation_storage(ctx);
+                        h2_emit_status(d, stream_id, 503);
+                        return;
+                    }
+                    h2->async_route = route;
+                    h2->async_content_length = req.content_length;
+                    h2->async_has_content_length = req.has_content_length;
+                    h2->async_wait_for_body_on_forward = true;
+                    if (h2_expects_continue(headers, nheaders)) h2_emit_continue(d, stream_id);
+                    return;
+                }
+                if (kOutcome.kind == JitDispatchOutcome::Kind::ReturnStatus) {
+                    h2_emit_outcome(
+                        d, stream_id, kOutcome, config, h2_synth_request_is_head(synth, kSynthLen));
+                    return;
+                }
+                jit::release_response_body_mutation_storage(ctx);
+                h2_emit_status(d, stream_id, 503);
+                return;
+            }
+            // Routes that inspect the body need the DATA bytes themselves. A
+            // body-independent route that can buffered-forward was already run
+            // above, so only its selected forward reaches the deferred path.
+            if (!end_stream &&
+                (route->needs_req_body || route->can_forward_buffered || req.has_content_length)) {
+                h2_defer_until_data_end(
+                    d,
+                    stream_id,
+                    headers,
+                    nheaders,
+                    req,
+                    /*buffer_body=*/route->needs_req_body || route->can_forward_buffered,
+                    RouteAction::JitHandler,
+                    config,
+                    route,
+                    params,
+                    param_count,
+                    200);
                 return;
             }
             // No request body to wait for — invoke now.
@@ -956,8 +1376,15 @@ void h2_dispatch_request(H2Dispatch<Loop>& d,
                 h2_emit_status(d, stream_id, 500);
                 return;
             }
-            h2_invoke_emit(
-                d, stream_id, route, anchored_params, param_count, config, synth, kSynthLen);
+            h2_invoke_emit(d,
+                           stream_id,
+                           route,
+                           anchored_params,
+                           param_count,
+                           config,
+                           synth,
+                           kSynthLen,
+                           h2_proxy_request_forwardable(headers, nheaders));
             return;
         }
         case RouteAction::Proxy:
@@ -998,7 +1425,15 @@ void h2_dispatch_request(H2Dispatch<Loop>& d,
                     h2_emit_status(d, stream_id, 400);
                     return;
                 }
-                if (!h2_suspend_proxy(d, stream_id, config, route, synth, kSynthLen))
+                if (!h2_suspend_proxy(d,
+                                      stream_id,
+                                      config,
+                                      route,
+                                      route->upstream_id,
+                                      false,
+                                      nullptr,
+                                      synth,
+                                      kSynthLen))
                     h2_emit_status(d, stream_id, 503);  // a stream is already suspended
             }
             return;
@@ -1012,9 +1447,9 @@ void h2_on_headers_cb(
     h2_dispatch_request(*d, stream_id, hs, n, end);
 }
 
-// DATA frames for a deferred request: count every body octet, append only when
-// the matched handler reads req.body, and finalize at END_STREAM. DATA for any
-// other stream is ignored (flow control already ran).
+// DATA frames for a deferred request: count every body octet and append when the
+// matched JIT route may need to expose or forward it, then finalize at END_STREAM.
+// DATA for any other stream is ignored (flow control already ran).
 template <typename Loop>
 void h2_on_data_cb(
     void* ctx, Http2Conn& c, u32 stream_id, const u8* data, u32 len, bool end_stream) {
@@ -1043,6 +1478,7 @@ void h2_on_data_cb(
 // is released by the post-process path once async_stream is clear.
 inline void h2_on_reset_cb(void* /*ctx*/, Http2Conn& c, u32 stream_id, Http2Error /*err*/) {
     if (c.async_stream != 0 && c.async_stream == stream_id) h2_clear_async(c);
+    if (c.pending_stream != 0 && c.pending_stream == stream_id) h2_clear_pending(c);
 }
 
 // Forward declaration: defined below; on_h2_data re-arms via this on send done.
@@ -1087,6 +1523,7 @@ template <typename Loop>
 void h2_begin_suspended_io(Loop* loop, Connection& conn) {
     h2_async_epoch_enter(loop, conn);
     if (conn.h2->async_kind == H2AsyncKind::Proxy) {
+        if (conn.h2->async_apply_response_mutations) conn.handler_ctx = conn.h2->async_jit_ctx();
         h2_proxy_begin<Loop>(loop, conn);
         return;
     }
@@ -1299,11 +1736,70 @@ void h2_resume_jit_handler(Loop* loop, Connection& conn) {
         if (!h2_arm_async_timer<Loop>(loop, conn)) loop->close_conn(conn);
         return;
     }
+    if (kOutcome.kind == JitDispatchOutcome::Kind::ForwardBuffered &&
+        h2->async_request_forwardable && h2->async_wait_for_body_on_forward) {
+        // This timer began at HEADERS time while the peer side remained open.
+        // Only now that the resumed branch actually selected buffered forwarding
+        // do we collect DATA and apply the forwarding cap. Transfer ownership of
+        // the parked mutation context to the pending-body episode without
+        // releasing it; h2_finish_body will move it into the proxy episode.
+        conn.pending_handler_fn = nullptr;
+        conn.handler_ctx = nullptr;
+        h2_transfer_timer_to_pending_forward(*h2, kStreamId, kOutcome.upstream_id);
+        conn.transition_to_reading_header(&on_h2_data<Loop>);
+        if (conn.recv_buf.len() != 0) {
+            IoEvent buffered{
+                conn.id, static_cast<i32>(conn.recv_buf.len()), 0, 0, IoEventType::Recv, 0};
+            on_h2_data<Loop>(static_cast<void*>(loop), conn, buffered);
+        } else {
+            loop->submit_recv(conn);
+        }
+        return;
+    }
+    if (kOutcome.kind == JitDispatchOutcome::Kind::ForwardBuffered &&
+        h2->async_request_forwardable) {
+        const bool synth_ok =
+            h2_snapshot_buffered_response_mutation_views(
+                ctx, h2->pending_synth, h2->async_synth_len) &&
+            h2_strip_synth_te(h2->pending_synth, &h2->async_synth_len, &h2->async_body_start);
+        if (!synth_ok || (h2->async_inject_content_length_on_forward &&
+                          !h2_inject_content_length(h2->pending_synth,
+                                                    &h2->async_synth_len,
+                                                    h2->async_body_start,
+                                                    h2->async_body_len,
+                                                    Http2Conn::kBodySynthCap))) {
+            u8 resp[8192];
+            H2Dispatch<Loop> d{loop, &conn, resp, sizeof(resp), 0, false};
+            h2_emit_status(d, kStreamId, synth_ok ? 413 : 500);
+            conn.pending_handler_fn = nullptr;
+            conn.handler_ctx = nullptr;
+            h2_clear_async(*h2);
+            h2_async_epoch_leave(loop, conn);
+            if (d.resp_len == 0 || d.overflow) {
+                loop->close_conn(conn);
+                return;
+            }
+            conn.send_progress = 0;
+            conn.send_buf.reset();
+            conn.send_buf.write(resp, d.resp_len);
+            conn.transition_to_sending(&on_h2_sent<Loop>);
+            client_send(loop, conn, conn.send_buf.data(), conn.send_buf.len());
+            return;
+        }
+        h2->async_kind = H2AsyncKind::Proxy;
+        h2->async_upstream_id = kOutcome.upstream_id;
+        h2->async_apply_response_mutations = true;
+        conn.pending_handler_fn = nullptr;
+        h2_proxy_begin<Loop>(loop, conn);
+        return;
+    }
 
     u8 resp[8192];
     H2Dispatch<Loop> d{loop, &conn, resp, sizeof(resp), 0, false};
     if (kOutcome.kind == JitDispatchOutcome::Kind::ReturnStatus) {
         h2_emit_outcome(d, kStreamId, kOutcome, h2->async_cfg, kHeadRequest);
+    } else if (kOutcome.kind == JitDispatchOutcome::Kind::ForwardBuffered) {
+        h2_emit_status(d, kStreamId, 400);
     } else {
         h2_emit_status(d, kStreamId, 503);  // forward / event-yield over h2: follow-up
     }

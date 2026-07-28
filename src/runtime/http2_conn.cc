@@ -1,5 +1,7 @@
 #include "rut/runtime/http2_conn.h"
 
+#include "rut/runtime/response_body_storage.h"
+
 namespace rut {
 
 namespace {
@@ -39,7 +41,13 @@ void Http2Conn::init() {
     pending_content_length = 0;
     pending_has_content_length = false;
     pending_buffer_body = false;
+    pending_request_forwardable = false;
     pending_overflow = false;
+    pending_preinvoked_forward = false;
+    pending_preinvoked_timer = false;
+    pending_forward_upstream_id = 0;
+    pending_timer_state = 0;
+    pending_timer_ms = 0;
     pending_route_config = nullptr;
     pending_route = nullptr;
     pending_route_action = RouteAction::Static;
@@ -53,12 +61,21 @@ void Http2Conn::init() {
     async_kind = H2AsyncKind::None;
     async_cfg = nullptr;
     async_synth_len = 0;
+    async_body_start = 0;
+    async_body_len = 0;
+    async_content_length = 0;
+    async_has_content_length = false;
+    async_inject_content_length_on_forward = false;
+    async_wait_for_body_on_forward = false;
     async_synth_sent = 0;
     async_timer_ms = 0;
     async_fn = nullptr;
     async_state = 0;
     __builtin_memset(async_handler_ctx_storage, 0, sizeof(async_handler_ctx_storage));
     async_route = nullptr;
+    async_upstream_id = 0;
+    async_apply_response_mutations = false;
+    async_request_forwardable = false;
     async_resp_len = 0;
 }
 
@@ -452,6 +469,8 @@ Http2Error append_fragment(Http2Conn& c, const u8* p, u32 n) {
 
 void clear_pending_upload(Http2Conn& c, u32 stream_id) {
     if (c.pending_stream != stream_id) return;
+    if (c.pending_preinvoked_forward || c.pending_preinvoked_timer)
+        rut_helper_resp_release_body_storage(static_cast<void*>(c.async_jit_ctx()));
     c.pending_stream = 0;
     c.pending_body_start = 0;
     c.pending_synth_len = 0;
@@ -459,7 +478,13 @@ void clear_pending_upload(Http2Conn& c, u32 stream_id) {
     c.pending_content_length = 0;
     c.pending_has_content_length = false;
     c.pending_buffer_body = false;
+    c.pending_request_forwardable = false;
     c.pending_overflow = false;
+    c.pending_preinvoked_forward = false;
+    c.pending_preinvoked_timer = false;
+    c.pending_forward_upstream_id = 0;
+    c.pending_timer_state = 0;
+    c.pending_timer_ms = 0;
     c.pending_route_config = nullptr;
     c.pending_route = nullptr;
     c.pending_route_action = RouteAction::Static;
@@ -571,6 +596,7 @@ static Http2Error handle_frame(Http2Conn& c,
                         s->state = (s->state == Http2StreamState::HalfClosedLocal)
                                        ? Http2StreamState::Closed
                                        : Http2StreamState::HalfClosedRemote;
+                        if (c.pending_stream == h.stream_id) c.pending_request_forwardable = false;
                         if (c.pending_stream == h.stream_id && c.on_data)
                             c.on_data(c.cb_ctx, c, h.stream_id, nullptr, 0, /*end_stream=*/true);
                         return Http2Error::NoError;
@@ -619,6 +645,7 @@ static Http2Error handle_frame(Http2Conn& c,
                         s->state = (s->state == Http2StreamState::HalfClosedLocal)
                                        ? Http2StreamState::Closed
                                        : Http2StreamState::HalfClosedRemote;
+                        if (c.pending_stream == h.stream_id) c.pending_request_forwardable = false;
                         if (c.pending_stream == h.stream_id && c.on_data)
                             c.on_data(c.cb_ctx, c, h.stream_id, nullptr, 0, /*end_stream=*/true);
                         return Http2Error::NoError;

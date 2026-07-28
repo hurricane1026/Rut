@@ -546,7 +546,10 @@ public:
         // now even with ops in flight (unlike the recv/send slices below).
         if (c.h2) {
             auto* async_ctx = c.h2->async_jit_ctx();
-            if (c.h2->async_stream != 0 && c.h2->async_kind == H2AsyncKind::Timer)
+            if (c.h2->pending_preinvoked_forward || c.h2->pending_preinvoked_timer)
+                rut_helper_resp_release_body_storage(static_cast<void*>(async_ctx));
+            if (c.h2->async_stream != 0 &&
+                (c.h2->async_kind == H2AsyncKind::Timer || c.h2->async_apply_response_mutations))
                 rut_helper_resp_release_body_storage(static_cast<void*>(async_ctx));
             if (c.handler_ctx == async_ctx) c.handler_ctx = nullptr;
             h2_pool.free(c.h2);
@@ -1146,11 +1149,11 @@ public:
                     // + optional rearm). A *positive* recv CQE that was already
                     // harvested into recv_buf before the cancel took effect is
                     // deliberately NOT suppressed: those bytes are always past
-                    // the current request's framing (needs_req_body buffers the
-                    // full Content-Length body before the handler can yield, and
-                    // chunked bodies are rejected with 400), so they are the
-                    // next pipelined request. Every request accessor re-parses
-                    // req_data and bounds its output to the first request
+                    // the current request's framing (an actual req.body read
+                    // buffers the full Content-Length body before the handler
+                    // can yield, and chunked bodies are rejected with 400), so
+                    // they are the next pipelined request. Every request accessor
+                    // re-parses req_data and bounds its output to the first request
                     // (rut_helper_req_body caps at content_length, path/method/
                     // header to the first request's line/block), so the larger
                     // req_len is inert — no route value can observe the raced
@@ -1200,6 +1203,8 @@ public:
                         break;
                     }
                     if (ev.type == IoEventType::UpstreamRecv && ev.result == -ECANCELED) {
+                        const auto recv_drain_continuation =
+                            conn.h2_proxy_recv_draining ? conn.on_upstream_recv_drained : nullptr;
                         // The recv was cancelled (cancel won the race). Don't clear
                         // cancel_pending or re-arm here — the cancel's own CQE owns that,
                         // and may not have drained yet. Account the recv and mark its
@@ -1232,6 +1237,9 @@ public:
                             break;
                         }
                         if (!this->try_deferred_upstream_rearm(conn)) this->close_conn(conn);
+                        if (recv_drain_continuation && !conn.h2_proxy_synth_quarantined &&
+                            conn.fd >= 0)
+                            recv_drain_continuation(&self(), conn, ev);
                         break;
                     }
                     // Stale post-body recv data/terminal. A body-done pause cancelled this
@@ -1273,6 +1281,7 @@ public:
                         break;
                     }
                     // Async CQE accounting: decrement pending_ops on final CQE.
+                    decltype(conn.on_upstream_recv_drained) send_drain_continuation = nullptr;
                     if (!ev.more) {
                         if (conn.pending_ops > 0) conn.pending_ops--;
                         if (ev.type == IoEventType::Recv) conn.recv_armed = false;
@@ -1281,9 +1290,16 @@ public:
                             conn.upstream_send_armed = false;
                             // A torn-down h2-proxy episode's request send has now drained, so
                             // pending_synth is free again — lift the reuse quarantine.
-                            conn.h2_proxy_synth_quarantined = false;
+                            if (conn.h2_proxy_synth_quarantined) {
+                                conn.h2_proxy_synth_quarantined = false;
+                                if (!conn.h2_proxy_recv_draining)
+                                    send_drain_continuation = conn.on_upstream_recv_drained;
+                            }
                         }
                         if (ev.type == IoEventType::UpstreamRecv) {
+                            const auto recv_drain_continuation = conn.h2_proxy_recv_draining
+                                                                     ? conn.on_upstream_recv_drained
+                                                                     : nullptr;
                             // Recv ended normally and is NOT stale (the stale case is handled
                             // and dropped above). If a pause cancel lost the race its own CQE
                             // still clears cancel_pending and owns the re-arm; here just
@@ -1317,7 +1333,15 @@ public:
                                 this->close_conn(conn);
                                 break;
                             }
+                            if (recv_drain_continuation && !conn.h2_proxy_synth_quarantined) {
+                                recv_drain_continuation(&self(), conn, ev);
+                                break;
+                            }
                         }
+                    }
+                    if (send_drain_continuation && conn.fd >= 0) {
+                        send_drain_continuation(&self(), conn, ev);
+                        break;
                     }
                     const bool has_recv_slot =
                         conn.on_recv && (!conn.uses_iouring_tls() || conn.tls_pending_on_recv);

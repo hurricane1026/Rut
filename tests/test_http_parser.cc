@@ -3586,7 +3586,95 @@ TEST(response_parser, chunked) {
     CHECK_EQ(static_cast<u8>(s), static_cast<u8>(ParseStatus::Complete));
     CHECK_EQ(resp.status_code, 200);
     CHECK(resp.chunked);
+    CHECK_FALSE(resp.unsupported_transfer_coding);
+    CHECK_FALSE(resp.malformed_transfer_coding);
     CHECK(!resp.has_content_length);
+}
+
+TEST(response_parser, records_transfer_codings_before_chunked) {
+    HttpResponseParser parser;
+    ParsedResponse resp;
+    auto s = parse_response(
+        "HTTP/1.1 200 OK\r\nTransfer-Encoding: gzip, chunked\r\n\r\n", &resp, &parser);
+    CHECK_EQ(static_cast<u8>(s), static_cast<u8>(ParseStatus::Complete));
+    CHECK(resp.chunked);
+    CHECK(resp.unsupported_transfer_coding);
+    CHECK_FALSE(resp.malformed_transfer_coding);
+}
+
+TEST(response_parser, rejects_repeated_chunked_transfer_codings) {
+    HttpResponseParser parser;
+    ParsedResponse resp;
+    auto s = parse_response(
+        "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked, chunked\r\n\r\n", &resp, &parser);
+    CHECK_EQ(static_cast<u8>(s), static_cast<u8>(ParseStatus::Complete));
+    CHECK(resp.chunked);
+    CHECK(resp.unsupported_transfer_coding);
+    CHECK(resp.malformed_transfer_coding);
+}
+
+TEST(response_parser, rejects_empty_transfer_encoding_values) {
+    const char* responses[] = {
+        "HTTP/1.1 200 OK\r\nTransfer-Encoding:\r\n\r\n",
+        "HTTP/1.1 200 OK\r\nTransfer-Encoding:   \r\n\r\n",
+        "HTTP/1.1 200 OK\r\nTransfer-Encoding:\t\r\n\r\n",
+        "HTTP/1.1 200 OK\r\nTransfer-Encoding:,\r\n\r\n",
+        "HTTP/1.1 200 OK\r\nTransfer-Encoding: , \t, \r\n\r\n",
+    };
+    for (const char* response : responses) {
+        HttpResponseParser parser;
+        ParsedResponse resp;
+        const auto s = parse_response(response, &resp, &parser);
+        CHECK_EQ(static_cast<u8>(s), static_cast<u8>(ParseStatus::Complete));
+        CHECK_FALSE(resp.chunked);
+        CHECK(resp.unsupported_transfer_coding);
+        CHECK(resp.malformed_transfer_coding);
+    }
+}
+
+TEST(response_parser, marks_invalid_transfer_coding_lists_malformed) {
+    const char* responses[] = {
+        "HTTP/1.1 200 OK\r\nTransfer-Encoding: gzip chunked\r\n\r\n",
+        "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked, gzip\r\n\r\n",
+        "HTTP/1.1 200 OK\r\nTransfer-Encoding: gzip,\r\n\r\n",
+    };
+    for (const char* response : responses) {
+        HttpResponseParser parser;
+        ParsedResponse resp;
+        const auto s = parse_response(response, &resp, &parser);
+        CHECK_EQ(static_cast<u8>(s), static_cast<u8>(ParseStatus::Complete));
+        CHECK(resp.unsupported_transfer_coding);
+        CHECK(resp.malformed_transfer_coding);
+    }
+}
+
+TEST(response_parser, validates_transfer_coding_tokens_and_parameters) {
+    const char* malformed[] = {
+        "HTTP/1.1 200 OK\r\nTransfer-Encoding: gzip;\r\n\r\n",
+        "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked=foo\r\n\r\n",
+        "HTTP/1.1 200 OK\r\nTransfer-Encoding: gzip; level\r\n\r\n",
+        "HTTP/1.1 200 OK\r\nTransfer-Encoding: gzip; level=\"unterminated\r\n\r\n",
+        "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked; ext=yes\r\n\r\n",
+    };
+    for (const char* response : malformed) {
+        HttpResponseParser parser;
+        ParsedResponse resp;
+        const auto s = parse_response(response, &resp, &parser);
+        CHECK_EQ(static_cast<u8>(s), static_cast<u8>(ParseStatus::Complete));
+        CHECK(resp.malformed_transfer_coding);
+    }
+
+    HttpResponseParser parser;
+    ParsedResponse resp;
+    const auto s = parse_response(
+        "HTTP/1.1 200 OK\r\n"
+        "Transfer-Encoding: gzip; level=9; note=\"quoted value\", chunked\r\n\r\n",
+        &resp,
+        &parser);
+    CHECK_EQ(static_cast<u8>(s), static_cast<u8>(ParseStatus::Complete));
+    CHECK(resp.chunked);
+    CHECK(resp.unsupported_transfer_coding);
+    CHECK_FALSE(resp.malformed_transfer_coding);
 }
 
 TEST(response_parser, connection_close) {

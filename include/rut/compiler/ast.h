@@ -253,6 +253,9 @@ struct AstStatement {
     // proxy rewrites the outbound request line.
     Str forward_set_path{};
     bool has_forward_set_path = false;
+    // Explicit response buffering. Only `buffered: true` selects this mode;
+    // ordinary forward remains the zero-copy streaming terminator.
+    bool forward_buffered = false;
     // Request-header overrides from `forward(name, set_header: { "K": "V", ... })`.
     // Inline-stored like response_headers; lowered to ReqSetHeader ops before the
     // forward terminator so the proxy injects/replaces the lines outbound.

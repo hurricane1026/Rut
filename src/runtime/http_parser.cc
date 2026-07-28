@@ -2,6 +2,7 @@
 
 #include "core/expected.h"
 #include "runtime/simd/simd.h"
+#include "rut/common/http_header_validation.h"
 #include "rut/runtime/error.h"
 #include "rut/runtime/route_canon.h"
 
@@ -496,18 +497,114 @@ static inline ParseStatus apply_semantic_header_response(
         }
     } else if (first == 't') {
         if (name_len == 17 && str_ci_eq(name + 1, "ransfer-encoding", 16)) {
+            const auto malformed = [&] {
+                resp->unsupported_transfer_coding = true;
+                resp->malformed_transfer_coding = true;
+            };
+            const auto skip_ows = [&](u32* pos) {
+                while (*pos < vlen && (val[*pos] == ' ' || val[*pos] == '\t')) (*pos)++;
+            };
+            const auto parse_quoted_string = [&](u32* pos) {
+                if (*pos >= vlen || val[*pos] != '"') return false;
+                (*pos)++;
+                while (*pos < vlen && val[*pos] != '"') {
+                    u8 ch = val[(*pos)++];
+                    if (ch == '\\') {
+                        if (*pos >= vlen) return false;
+                        ch = val[(*pos)++];
+                        if (!(ch == '\t' || ch == ' ' || (ch >= 0x21 && ch <= 0x7e) || ch >= 0x80))
+                            return false;
+                    } else if (!(ch == '\t' || ch == ' ' || ch == 0x21 ||
+                                 (ch >= 0x23 && ch <= 0x5b) || (ch >= 0x5d && ch <= 0x7e) ||
+                                 ch >= 0x80)) {
+                        return false;
+                    }
+                }
+                if (*pos >= vlen) return false;
+                (*pos)++;
+                return true;
+            };
             u32 ti = 0;
+            bool saw_transfer_coding = false;
             while (ti < vlen) {
-                while (ti < vlen && (val[ti] == ' ' || val[ti] == '\t' || val[ti] == ',')) ti++;
-                if (ti >= vlen) break;
+                skip_ows(&ti);
+                if (ti >= vlen || val[ti] == ',') {
+                    malformed();
+                    if (ti < vlen) {
+                        ti++;
+                        continue;
+                    }
+                    break;
+                }
                 u32 tok_start = ti;
-                while (ti < vlen && val[ti] != ',' && val[ti] != ' ' && val[ti] != '\t') ti++;
+                while (ti < vlen && is_http_tchar(val[ti])) ti++;
                 u32 tok_len = ti - tok_start;
-                if (tok_len == 7 && str_ci_eq(val + tok_start, "chunked", 7)) {
-                    resp->chunked = true;
+                if (tok_len == 0) {
+                    malformed();
+                    break;
+                }
+                if (resp->chunked) resp->malformed_transfer_coding = true;
+                saw_transfer_coding = true;
+                const bool is_chunked = tok_len == 7 && str_ci_eq(val + tok_start, "chunked", 7);
+                if (is_chunked) {
+                    if (resp->chunked) {
+                        resp->unsupported_transfer_coding = true;
+                        resp->malformed_transfer_coding = true;
+                    } else {
+                        resp->chunked = true;
+                    }
+                } else {
+                    resp->unsupported_transfer_coding = true;
+                }
+                skip_ows(&ti);
+                bool has_parameters = false;
+                while (ti < vlen && val[ti] == ';') {
+                    has_parameters = true;
+                    ti++;
+                    skip_ows(&ti);
+                    const u32 param_start = ti;
+                    while (ti < vlen && is_http_tchar(val[ti])) ti++;
+                    if (ti == param_start) {
+                        malformed();
+                        return ParseStatus::Complete;
+                    }
+                    skip_ows(&ti);
+                    if (ti >= vlen || val[ti] != '=') {
+                        malformed();
+                        return ParseStatus::Complete;
+                    }
+                    ti++;
+                    skip_ows(&ti);
+                    if (ti < vlen && val[ti] == '"') {
+                        if (!parse_quoted_string(&ti)) {
+                            malformed();
+                            return ParseStatus::Complete;
+                        }
+                    } else {
+                        const u32 value_start = ti;
+                        while (ti < vlen && is_http_tchar(val[ti])) ti++;
+                        if (ti == value_start) {
+                            malformed();
+                            return ParseStatus::Complete;
+                        }
+                    }
+                    skip_ows(&ti);
+                }
+                if (is_chunked && has_parameters) resp->malformed_transfer_coding = true;
+                if (ti == vlen) break;
+                if (val[ti] != ',') {
+                    malformed();
+                    break;
+                }
+                ti++;
+                u32 next = ti;
+                skip_ows(&next);
+                if (next == vlen) {
+                    malformed();
                     break;
                 }
             }
+            if (!saw_transfer_coding) malformed();
             return ParseStatus::Complete;
         }
     }

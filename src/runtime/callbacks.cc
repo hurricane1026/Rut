@@ -579,7 +579,7 @@ static u32 decimal_digit_count(u32 v) {
     return n;
 }
 
-void format_response_with_body_and_headers(Connection& conn,
+bool format_response_with_body_and_headers(Connection& conn,
                                            u16 code,
                                            const char* body_data,
                                            u32 body_len,
@@ -587,7 +587,10 @@ void format_response_with_body_and_headers(Connection& conn,
                                            u32 header_count,
                                            bool keep_alive,
                                            bool body_is_fallback_reason_phrase,
-                                           bool suppress_body) {
+                                           bool suppress_body,
+                                           bool preserve_content_length,
+                                           u32 content_length_override,
+                                           bool omit_content_length) {
     const bool kNoBody = response_status_forbids_body(code);
     const u32 representation_len = kNoBody ? 0 : body_len;
     const u32 body_len_emit = suppress_body ? 0 : representation_len;
@@ -600,11 +603,15 @@ void format_response_with_body_and_headers(Connection& conn,
     // always dropped — we recompute from body_len_emit to keep framing
     // honest regardless of what the user writes.
     bool user_has_content_type = false;
+    const ResponseHeaderKV* preserved_content_length = nullptr;
     for (u32 i = 0; i < header_count; i++) {
         if (header_name_eq_literal_ci(headers[i].key_data, headers[i].key_len, "Content-Type")) {
             user_has_content_type = true;
-            break;
         }
+        if (!omit_content_length && preserve_content_length &&
+            content_length_override == 0xffffffffu && preserved_content_length == nullptr &&
+            header_name_eq_literal_ci(headers[i].key_data, headers[i].key_len, "Content-Length"))
+            preserved_content_length = &headers[i];
     }
     // Skip the default Content-Type when the body is a system-
     // generated reason phrase (fallback path). The bytes aren't
@@ -629,8 +636,13 @@ void format_response_with_body_and_headers(Connection& conn,
         sizeof("Content-Type: text/plain; charset=utf-8\r\n") - 1;
     constexpr u32 kConnKeepAliveLine = 24;  // "Connection: keep-alive\r\n"
     constexpr u32 kConnCloseLine = 19;      // "Connection: close\r\n"
-    u64 needed = kStatusLineFixed + reason_len + kContentLengthPrefix +
-                 decimal_digit_count(representation_len) + 2;
+    const u32 declared_content_length =
+        content_length_override != 0xffffffffu ? content_length_override : representation_len;
+    const u32 content_length_len = preserved_content_length != nullptr
+                                       ? preserved_content_length->value_len
+                                       : decimal_digit_count(declared_content_length);
+    u64 needed = kStatusLineFixed + reason_len;
+    if (!omit_content_length) needed += kContentLengthPrefix + content_length_len + 2;
     if (emit_default_content_type) needed += kDefaultContentTypeLine;
     for (u32 i = 0; i < header_count; i++) {
         if (header_name_eq_literal_ci(headers[i].key_data, headers[i].key_len, "Content-Length")) {
@@ -652,7 +664,7 @@ void format_response_with_body_and_headers(Connection& conn,
         conn.resp_status = 500;
         conn.keep_alive = false;
         format_static_response(conn, 500, /*keep_alive=*/false, /*suppress_body=*/suppress_body);
-        return;
+        return false;
     }
 
     conn.send_buf.reset();
@@ -666,13 +678,21 @@ void format_response_with_body_and_headers(Connection& conn,
     conn.send_buf.write(reinterpret_cast<const u8*>(" "), 1);
     conn.send_buf.write(reinterpret_cast<const u8*>(reason), reason_len);
     conn.send_buf.write(reinterpret_cast<const u8*>("\r\n"), 2);
-    // Content-Length (from body_len_emit, not the user's headers).
-    conn.send_buf.write(reinterpret_cast<const u8*>("Content-Length: "), 16);
-    write_content_length_digits(conn, representation_len);
-    conn.send_buf.write(reinterpret_cast<const u8*>("\r\n"), 2);
+    // Content-Length (from the emitted or explicitly declared representation
+    // length, not the user's headers). Statuses that prohibit it omit it.
+    if (!omit_content_length) {
+        conn.send_buf.write(reinterpret_cast<const u8*>("Content-Length: "), 16);
+        if (preserved_content_length != nullptr) {
+            conn.send_buf.write(reinterpret_cast<const u8*>(preserved_content_length->value_data),
+                                preserved_content_length->value_len);
+        } else {
+            write_content_length_digits(conn, declared_content_length);
+        }
+        conn.send_buf.write(reinterpret_cast<const u8*>("\r\n"), 2);
+    }
     // Default Content-Type only if the user didn't supply one AND
     // we're actually going to send a body. No-body responses (1xx /
-    // 204 / 304 and redirect-style header-only responses) shouldn't
+    // 204 / 205 / 304 and redirect-style header-only responses) shouldn't
     // advertise a Content-Type — matches format_static_response.
     if (emit_default_content_type) {
         static const char kDefaultContentType[] = "Content-Type: text/plain; charset=utf-8\r\n";
@@ -700,6 +720,7 @@ void format_response_with_body_and_headers(Connection& conn,
     if (body_len_emit > 0) {
         conn.send_buf.write(reinterpret_cast<const u8*>(body_data), body_len_emit);
     }
+    return true;
 }
 
 void prepare_early_response_state(Connection& conn) {

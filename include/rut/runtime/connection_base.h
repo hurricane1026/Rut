@@ -176,6 +176,13 @@ struct ConnectionBase {
     // or the stale CQE would be misrouted to the new stream. Cleared when the
     // terminal is accounted in dispatch.
     bool h2_proxy_recv_draining;
+    // Optional continuation to run once both h2_proxy_recv_draining and
+    // h2_proxy_synth_quarantined clear. H1 uses this when a resumed handler
+    // replaces a still-draining upstream episode: starting the new
+    // connect/send/recv sequence before either old terminal CQE arrives would
+    // let that CQE target the replacement episode's callback.
+    Callback on_upstream_recv_drained;
+    u32 deferred_h1_forward_upstream_id;
     // h2_proxy_synth_quarantined: an upstream request send was still in flight when
     // an h2 proxy episode was torn down (timeout). The send SQE still sources
     // pending_synth, so a subsequent request must not overwrite it until that send
@@ -212,6 +219,11 @@ struct ConnectionBase {
     // or close). `upstream_slot_uid` records which backend's gauge to decrement.
     bool upstream_slot_held;
     u16 upstream_slot_uid;
+    // Explicit `forward(..., buffered: true)`: accumulate the complete upstream
+    // response, then apply the committed HandlerCtx Response mutations.
+    bool proxy_response_buffered;
+    // The completed buffered response is currently draining from send_buf.
+    bool buffered_proxy_send_in_progress;
 
     // @throttle downstream pacing — per-connection token bucket (virtual-time /
     // GCRA) for sends to the client. Set per request from the matched route. The
@@ -580,6 +592,8 @@ struct ConnectionBase {
         close_after_idle_return = false;
         is_health_probe = false;
         h2_proxy_recv_draining = false;
+        on_upstream_recv_drained = nullptr;
+        deferred_h1_forward_upstream_id = 0;
         h2_proxy_synth_quarantined = false;
         req_path_overridden = false;
         req_path_override = {nullptr, 0};
@@ -588,6 +602,8 @@ struct ConnectionBase {
         req_header_override_overflow = false;
         upstream_slot_held = false;
         upstream_slot_uid = 0;
+        proxy_response_buffered = false;
+        buffered_proxy_send_in_progress = false;
         throttle_down_bps = 0;
         throttle_tat_ns = 0;
         throttle_paused = false;

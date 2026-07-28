@@ -13,6 +13,7 @@
 #include "rut/runtime/prometheus.h"
 #include "rut/runtime/rate_limit.h"
 #include "rut/runtime/rate_limit_enforce.h"
+#include "rut/runtime/response_body_storage.h"
 #include "rut/runtime/route_table.h"
 #include "rut/runtime/slice_pool.h"   // SlicePool::kSliceSize (terminate reassembly cap)
 #include "rut/runtime/tls_iouring.h"  // tls_fill_output / TlsFill for the io_uring-TLS proxy path
@@ -487,7 +488,7 @@ struct ResponseHeaderKV {
     const char* value_data;
     u32 value_len;
 };
-void format_response_with_body_and_headers(Connection& conn,
+bool format_response_with_body_and_headers(Connection& conn,
                                            u16 code,
                                            const char* body_data,
                                            u32 body_len,
@@ -495,7 +496,10 @@ void format_response_with_body_and_headers(Connection& conn,
                                            u32 header_count,
                                            bool keep_alive,
                                            bool body_is_fallback_reason_phrase = false,
-                                           bool suppress_body = false);
+                                           bool suppress_body = false,
+                                           bool preserve_content_length = false,
+                                           u32 content_length_override = 0xffffffffu,
+                                           bool omit_content_length = false);
 void prepare_early_response_state(Connection& conn);
 u32 consume_upstream_sent(Connection& conn);
 
@@ -1042,6 +1046,7 @@ void on_header_received(void* lp, Connection& conn, IoEvent ev) {
     conn.req_header_append_mask = 0;
     conn.req_header_override_overflow = false;
     conn.proxy_resp_started = false;
+    conn.proxy_response_buffered = false;
     conn.upstream_abandoned = false;
     conn.upstream_keep_alive = false;
     conn.upstream_reused = false;
@@ -1479,26 +1484,11 @@ void on_jit_wait_send_sent(void* lp, Connection& conn, IoEvent ev) {
     resume_jit_handler<Loop>(loop, conn);
 }
 
-inline bool collect_effective_response_headers(const jit::HandlerCtx* response_ctx,
-                                               const RouteConfig* cfg,
-                                               u16 static_set_index,
-                                               ResponseHeaderKV* out,
-                                               u32 capacity,
-                                               u32* out_count) {
-    *out_count = 0;
+inline bool apply_response_header_mutations(const jit::HandlerCtx* response_ctx,
+                                            ResponseHeaderKV* out,
+                                            u32 capacity,
+                                            u32* out_count) {
     if (response_ctx != nullptr && response_ctx->response_header_overflow) return false;
-    if (static_set_index != 0 && cfg != nullptr &&
-        static_set_index <= cfg->response_header_set_count) {
-        const auto& ref = cfg->response_header_sets[static_set_index - 1];
-        if (ref.count > capacity) return false;
-        for (u16 i = 0; i < ref.count; i++) {
-            out[*out_count] = {cfg->header_keys[ref.offset + i].data,
-                               cfg->header_keys[ref.offset + i].len,
-                               cfg->header_values[ref.offset + i].data,
-                               cfg->header_values[ref.offset + i].len};
-            (*out_count)++;
-        }
-    }
     const u32 mutation_count = response_ctx != nullptr ? response_ctx->response_header_count : 0;
     for (u32 mi = 0; mi < mutation_count; mi++) {
         const auto& mutation = response_ctx->response_header_mutations[mi];
@@ -1526,6 +1516,65 @@ inline bool collect_effective_response_headers(const jit::HandlerCtx* response_c
         }
     }
     return true;
+}
+
+inline bool collect_effective_response_headers(const jit::HandlerCtx* response_ctx,
+                                               const RouteConfig* cfg,
+                                               u16 static_set_index,
+                                               ResponseHeaderKV* out,
+                                               u32 capacity,
+                                               u32* out_count) {
+    *out_count = 0;
+    if (static_set_index != 0 && cfg != nullptr &&
+        static_set_index <= cfg->response_header_set_count) {
+        const auto& ref = cfg->response_header_sets[static_set_index - 1];
+        if (ref.count > capacity) return false;
+        for (u16 i = 0; i < ref.count; i++) {
+            out[*out_count] = {cfg->header_keys[ref.offset + i].data,
+                               cfg->header_keys[ref.offset + i].len,
+                               cfg->header_values[ref.offset + i].data,
+                               cfg->header_values[ref.offset + i].len};
+            (*out_count)++;
+        }
+    }
+    return apply_response_header_mutations(response_ctx, out, capacity, out_count);
+}
+
+inline bool snapshot_buffered_response_mutation_views(Connection& conn) {
+    auto* ctx = conn.jit_ctx();
+    if (ctx->response_header_count > jit::kMaxResponseHeaderMutations) return false;
+    const auto source_begin = reinterpret_cast<uintptr_t>(conn.recv_buf.data());
+    const u32 source_len = conn.recv_buf.len();
+    auto snapshot = [&](Str& view) {
+        if (view.ptr == nullptr || view.len == 0) return true;
+        const auto ptr = reinterpret_cast<uintptr_t>(view.ptr);
+        if (ptr < source_begin || ptr - source_begin > source_len ||
+            view.len > source_len - (ptr - source_begin))
+            return true;
+        const char* stable = jit::snapshot_response_body(ctx, view.ptr, view.len);
+        if (stable == nullptr) return false;
+        view.ptr = stable;
+        return true;
+    };
+    for (u32 i = 0; i < ctx->response_header_count; i++) {
+        auto& mutation = ctx->response_header_mutations[i];
+        if (!snapshot(mutation.name) || !snapshot(mutation.value)) return false;
+    }
+    return true;
+}
+
+template <typename Loop>
+void resume_h1_forward_after_upstream_recv_drain(void* lp, Connection& conn, IoEvent) {
+    if (conn.h2_proxy_recv_draining || conn.h2_proxy_synth_quarantined ||
+        conn.state != ConnState::Proxying)
+        return;
+    conn.on_upstream_recv_drained = nullptr;
+    conn.upstream_abandoned = false;
+    JitDispatchOutcome outcome{};
+    outcome.kind = conn.proxy_response_buffered ? JitDispatchOutcome::Kind::ForwardBuffered
+                                                : JitDispatchOutcome::Kind::Forward;
+    outcome.upstream_id = conn.deferred_h1_forward_upstream_id;
+    handle_jit_outcome(static_cast<Loop*>(lp), conn, outcome, /*fn=*/nullptr, conn.keep_alive);
 }
 
 template <typename Loop>
@@ -1853,10 +1902,66 @@ void handle_jit_outcome(Loop* loop,
             }
             return;
         }
-        case JitDispatchOutcome::Kind::Forward: {
+        case JitDispatchOutcome::Kind::Forward:
+        case JitDispatchOutcome::Kind::ForwardBuffered: {
             jit::ScopedResponseBodyMutationStorageRelease release_body_storage(
-                static_cast<const jit::HandlerCtx*>(conn.handler_ctx));
+                outcome.kind == JitDispatchOutcome::Kind::Forward
+                    ? static_cast<const jit::HandlerCtx*>(conn.handler_ctx)
+                    : nullptr);
             conn.pending_handler_fn = nullptr;
+            conn.proxy_response_buffered =
+                outcome.kind == JitDispatchOutcome::Kind::ForwardBuffered;
+            const bool had_prior_upstream =
+                conn.upstream_fd >= 0 || conn.upstream_recv_armed || conn.upstream_send_armed;
+            if (had_prior_upstream) {
+                /*
+                 * A resumed handler can select a new forward while an io_uring
+                 * multishot recv from its wait(upstream.recv()) is still armed.
+                 * Detach that episode before installing callbacks for the new
+                 * one, and quarantine the shared UpstreamRecv user_data until
+                 * the old terminal CQE drains.
+                 */
+                conn.on_upstream_recv = nullptr;
+                conn.on_upstream_send = nullptr;
+                conn.upstream_abandoned = true;
+                if (conn.upstream_recv_armed) conn.h2_proxy_recv_draining = true;
+                if (conn.upstream_fd >= 0) {
+                    ::close(conn.upstream_fd);
+                    conn.upstream_fd = -1;
+                    loop->clear_upstream_fd(conn.id);
+                }
+                const bool prior_send_armed = conn.upstream_send_armed;
+                if constexpr (requires { loop->discard_upstream_send(conn); })
+                    loop->discard_upstream_send(conn);
+                else if (prior_send_armed)
+                    conn.h2_proxy_synth_quarantined = true;
+                conn.upstream_recv_armed = false;
+                conn.upstream_send_armed = false;
+                conn.upstream_idx = 0;
+            }
+            if (conn.proxy_response_buffered && !snapshot_buffered_response_mutation_views(conn)) {
+                conn.resp_status = 500;
+                conn.keep_alive = false;
+                format_static_response(
+                    conn, 500, false, conn.req_method == static_cast<u8>(LogHttpMethod::Head));
+                conn.transition_to_sending(&on_response_sent<Loop>);
+                client_send(loop, conn, conn.send_buf.data(), conn.send_buf.len());
+                return;
+            }
+            if (conn.proxy_response_buffered || had_prior_upstream) {
+                // A preceding upstream wait may have left response bytes in this
+                // shared buffer. They belong to the abandoned episode, not the
+                // upstream selected by this terminal forward.
+                conn.upstream_recv_buf.reset();
+                conn.upstream_keep_alive = false;
+            }
+            if (conn.h2_proxy_recv_draining || conn.h2_proxy_synth_quarantined) {
+                conn.state = ConnState::Proxying;
+                conn.deferred_h1_forward_upstream_id = outcome.upstream_id;
+                conn.on_upstream_recv_drained = &resume_h1_forward_after_upstream_recv_drain<Loop>;
+                return;
+            }
+            conn.upstream_abandoned = false;
             // Resolve upstream by id against the config pinned at
             // on_header_received. Reading loop->config_ptr here would
             // pick up a post-swap config whose upstream table doesn't
@@ -1867,7 +1972,10 @@ void handle_jit_outcome(Loop* loop,
                 // the config doesn't know. Fail closed with 502 rather
                 // than hanging or silently discarding the request.
                 conn.resp_status = kStatusBadGateway;
-                format_static_response(conn, 502, /*keep_alive=*/false);
+                format_static_response(conn,
+                                       502,
+                                       /*keep_alive=*/false,
+                                       conn.req_method == static_cast<u8>(LogHttpMethod::Head));
                 conn.keep_alive = false;
                 conn.transition_to_sending(&on_response_sent<Loop>);
                 client_send(loop, conn, conn.send_buf.data(), conn.send_buf.len());
@@ -1887,7 +1995,10 @@ void handle_jit_outcome(Loop* loop,
                 }
                 if (!acquired) {
                     conn.resp_status = 503;
-                    format_static_response(conn, 503, /*keep_alive=*/false);
+                    format_static_response(conn,
+                                           503,
+                                           /*keep_alive=*/false,
+                                           conn.req_method == static_cast<u8>(LogHttpMethod::Head));
                     conn.keep_alive = false;
                     conn.transition_to_sending(&on_response_sent<Loop>);
                     client_send(loop, conn, conn.send_buf.data(), conn.send_buf.len());
@@ -1945,7 +2056,10 @@ void handle_jit_outcome(Loop* loop,
             const i32 kUpstreamFd = UpstreamPool::create_socket();
             if (kUpstreamFd < 0) {
                 conn.resp_status = kStatusBadGateway;
-                format_static_response(conn, 502, /*keep_alive=*/false);
+                format_static_response(conn,
+                                       502,
+                                       /*keep_alive=*/false,
+                                       conn.req_method == static_cast<u8>(LogHttpMethod::Head));
                 conn.keep_alive = false;
                 conn.transition_to_sending(&on_response_sent<Loop>);
                 client_send(loop, conn, conn.send_buf.data(), conn.send_buf.len());
@@ -1960,7 +2074,10 @@ void handle_jit_outcome(Loop* loop,
                 conn.upstream_idx = 0;
                 loop->clear_upstream_fd(conn.id);
                 conn.resp_status = kStatusBadGateway;
-                format_static_response(conn, 502, /*keep_alive=*/false);
+                format_static_response(conn,
+                                       502,
+                                       /*keep_alive=*/false,
+                                       conn.req_method == static_cast<u8>(LogHttpMethod::Head));
                 conn.keep_alive = false;
                 conn.transition_to_sending(&on_response_sent<Loop>);
                 client_send(loop, conn, conn.send_buf.data(), conn.send_buf.len());
@@ -2079,14 +2196,8 @@ void respond_upstream_timeout(Loop* loop, Connection& conn) {
         conn.upstream_send_armed = false;
     }
     conn.upstream_abandoned = true;
-    static const char k504[] =
-        "HTTP/1.1 504 Gateway Timeout\r\n"
-        "Content-Length: 15\r\n"
-        "Connection: close\r\n"
-        "\r\n"
-        "Gateway Timeout";
-    conn.send_buf.reset();
-    conn.send_buf.write(reinterpret_cast<const u8*>(k504), sizeof(k504) - 1);
+    format_static_response(
+        conn, 504, false, conn.req_method == static_cast<u8>(LogHttpMethod::Head));
     conn.keep_alive = false;
     conn.resp_status = 504;
     conn.transition_to_sending(&on_response_sent<Loop>);
@@ -2360,14 +2471,8 @@ void on_upstream_connected(void* lp, Connection& conn, IoEvent ev) {
         record_backend_result(
             conn.upstream_idx, conn.upstream_backend_idx, /*success=*/false, monotonic_us());
         if (try_connect_next_backend(loop, conn)) return;
-        static const char k502[] =
-            "HTTP/1.1 502 Bad Gateway\r\n"
-            "Content-Length: 11\r\n"
-            "Connection: close\r\n"
-            "\r\n"
-            "Bad Gateway";
-        conn.send_buf.reset();
-        conn.send_buf.write(reinterpret_cast<const u8*>(k502), sizeof(k502) - 1);
+        format_static_response(
+            conn, 502, false, conn.req_method == static_cast<u8>(LogHttpMethod::Head));
         conn.keep_alive = false;
         conn.resp_status = kStatusBadGateway;
         conn.transition_to_sending(&on_response_sent<Loop>);
@@ -2414,14 +2519,8 @@ void on_upstream_connected(void* lp, Connection& conn, IoEvent ev) {
                 loop->clear_upstream_fd(conn.id);
             }
             release_upstream_slot(loop, conn);
-            static const char k500[] =
-                "HTTP/1.1 500 Internal Server Error\r\n"
-                "Content-Length: 21\r\n"
-                "Connection: close\r\n"
-                "\r\n"
-                "Internal Server Error";
-            conn.send_buf.reset();
-            conn.send_buf.write(reinterpret_cast<const u8*>(k500), sizeof(k500) - 1);
+            format_static_response(
+                conn, 500, false, conn.req_method == static_cast<u8>(LogHttpMethod::Head));
             conn.keep_alive = false;
             conn.resp_status = kStatusInternalServerError;
             conn.transition_to_sending(&on_response_sent<Loop>);
@@ -2514,6 +2613,29 @@ void on_upstream_request_sent(void* lp, Connection& conn, IoEvent ev) {
         return;
     }
 
+    /*
+     * Do not install this episode's upstream-recv callback while the terminal
+     * CQE for a prior multishot receive is still outstanding: both episodes use
+     * the same (connection id, UpstreamRecv) dispatch key.
+     */
+    if (conn.h2_proxy_recv_draining) {
+        if (conn.upstream_fd >= 0) {
+            ::close(conn.upstream_fd);
+            conn.upstream_fd = -1;
+            loop->clear_upstream_fd(conn.id);
+        }
+        conn.upstream_abandoned = true;
+        conn.upstream_recv_armed = false;
+        conn.upstream_send_armed = false;
+        format_static_response(
+            conn, 502, false, conn.req_method == static_cast<u8>(LogHttpMethod::Head));
+        conn.keep_alive = false;
+        conn.resp_status = kStatusBadGateway;
+        conn.transition_to_sending(&on_response_sent<Loop>);
+        client_send(loop, conn, conn.send_buf.data(), conn.send_buf.len());
+        return;
+    }
+
     const bool kMoreReqBody =
         (conn.req_body_mode == BodyMode::ContentLength && conn.req_body_remaining > 0) ||
         (conn.req_body_mode == BodyMode::Chunked &&
@@ -2590,8 +2712,9 @@ void on_upstream_request_sent(void* lp, Connection& conn, IoEvent ev) {
 // in pending_synth) → accumulate the whole h1 response in upstream_recv_buf →
 // re-encode it as h2 HEADERS+DATA on the stream. The h1 proxy streams response
 // bytes raw; an h2 client needs frames, so we must buffer + re-frame. Bounded by
-// the 16KB upstream_recv_buf (over-cap → 502). Deferred: chunked de-framing,
-// streaming/large bodies with flow control, request bodies, backend failover.
+// the 16KB upstream_recv_buf (over-cap → 502). Chunked bodies are de-framed in
+// place before re-encoding. Deferred: streaming/large bodies with flow control,
+// request bodies, backend failover.
 
 // h2 response headers we must NOT forward: hop-by-hop / connection-specific
 // (RFC 7540 §8.1.2.2) and content-length (http2_write_response re-derives it).
@@ -2605,6 +2728,256 @@ inline bool h2_drop_response_header(Str name) {
            http_header_name_eq_ci(kName, kLen, "te", 2) ||
            http_header_name_eq_ci(kName, kLen, "upgrade", 7) ||
            http_header_name_eq_ci(kName, kLen, "content-length", 14);
+}
+
+inline bool body_replacement_invalidates_upstream_header(Str name) {
+    return http_header_name_eq_ci(name.ptr, name.len, "content-encoding", 16) ||
+           http_header_name_eq_ci(name.ptr, name.len, "content-language", 16) ||
+           http_header_name_eq_ci(name.ptr, name.len, "content-range", 13) ||
+           http_header_name_eq_ci(name.ptr, name.len, "etag", 4) ||
+           http_header_name_eq_ci(name.ptr, name.len, "last-modified", 13) ||
+           http_header_name_eq_ci(name.ptr, name.len, "digest", 6) ||
+           http_header_name_eq_ci(name.ptr, name.len, "content-digest", 14) ||
+           http_header_name_eq_ci(name.ptr, name.len, "repr-digest", 11) ||
+           http_header_name_eq_ci(name.ptr, name.len, "content-md5", 11);
+}
+
+inline bool valid_partial_content_range(Str value, u64* range_length = nullptr) {
+    u32 pos = 0;
+    while (pos < value.len && (value.ptr[pos] == ' ' || value.ptr[pos] == '\t')) pos++;
+    if (value.len - pos < 6 || !http_header_name_eq_ci(value.ptr + pos, 5, "bytes", 5) ||
+        (value.ptr[pos + 5] != ' ' && value.ptr[pos + 5] != '\t'))
+        return false;
+    pos += 6;
+    while (pos < value.len && (value.ptr[pos] == ' ' || value.ptr[pos] == '\t')) pos++;
+
+    const auto parse_decimal = [&](u64* out) {
+        if (pos == value.len || value.ptr[pos] < '0' || value.ptr[pos] > '9') return false;
+        u64 parsed = 0;
+        do {
+            const u32 digit = static_cast<u32>(value.ptr[pos] - '0');
+            if (parsed > (UINT64_MAX - digit) / 10) return false;
+            parsed = parsed * 10 + digit;
+            pos++;
+        } while (pos < value.len && value.ptr[pos] >= '0' && value.ptr[pos] <= '9');
+        *out = parsed;
+        return true;
+    };
+
+    u64 first = 0;
+    u64 last = 0;
+    if (!parse_decimal(&first) || pos == value.len || value.ptr[pos] != '-') return false;
+    pos++;
+    if (!parse_decimal(&last) || first > last || pos == value.len || value.ptr[pos] != '/')
+        return false;
+    pos++;
+    if (pos == value.len) return false;
+    if (value.ptr[pos] == '*') {
+        pos++;
+    } else {
+        u64 complete_length = 0;
+        if (!parse_decimal(&complete_length) || complete_length == 0 || last >= complete_length)
+            return false;
+    }
+    while (pos < value.len && (value.ptr[pos] == ' ' || value.ptr[pos] == '\t')) pos++;
+    if (range_length != nullptr) {
+        if (last == UINT64_MAX) return false;
+        *range_length = last - first + 1;
+    }
+    return pos == value.len;
+}
+
+inline bool valid_unsatisfied_content_range(Str value) {
+    u32 pos = 0;
+    while (pos < value.len && (value.ptr[pos] == ' ' || value.ptr[pos] == '\t')) pos++;
+    if (value.len - pos < 8 || !http_header_name_eq_ci(value.ptr + pos, 5, "bytes", 5) ||
+        (value.ptr[pos + 5] != ' ' && value.ptr[pos + 5] != '\t'))
+        return false;
+    pos += 6;
+    while (pos < value.len && (value.ptr[pos] == ' ' || value.ptr[pos] == '\t')) pos++;
+    if (value.len - pos < 3 || value.ptr[pos] != '*') return false;
+    pos++;
+    if (value.ptr[pos] != '/') return false;
+    pos++;
+    if (pos == value.len || value.ptr[pos] < '0' || value.ptr[pos] > '9') return false;
+    while (pos < value.len && value.ptr[pos] >= '0' && value.ptr[pos] <= '9') {
+        pos++;
+    }
+    while (pos < value.len && (value.ptr[pos] == ' ' || value.ptr[pos] == '\t')) pos++;
+    return pos == value.len;
+}
+
+inline bool content_type_is_multipart_byteranges(Str value) {
+    static constexpr char kMultipart[] = "multipart/byteranges";
+    u32 start = 0;
+    while (start < value.len && (value.ptr[start] == ' ' || value.ptr[start] == '\t')) start++;
+    if (value.len - start < sizeof(kMultipart) - 1 ||
+        !http_header_name_eq_ci(
+            value.ptr + start, sizeof(kMultipart) - 1, kMultipart, sizeof(kMultipart) - 1))
+        return false;
+    u32 pos = start + sizeof(kMultipart) - 1;
+    if (pos < value.len && value.ptr[pos] != ';' && value.ptr[pos] != ' ' && value.ptr[pos] != '\t')
+        return false;
+    bool found_boundary = false;
+    while (pos < value.len) {
+        while (pos < value.len && (value.ptr[pos] == ' ' || value.ptr[pos] == '\t')) pos++;
+        if (pos == value.len) break;
+        if (value.ptr[pos] != ';') return false;
+        pos++;
+        while (pos < value.len && (value.ptr[pos] == ' ' || value.ptr[pos] == '\t')) pos++;
+        const u32 name_start = pos;
+        while (pos < value.len && is_http_tchar(static_cast<u8>(value.ptr[pos]))) pos++;
+        const u32 name_len = pos - name_start;
+        if (name_len == 0) return false;
+        while (pos < value.len && (value.ptr[pos] == ' ' || value.ptr[pos] == '\t')) pos++;
+        if (pos == value.len || value.ptr[pos] != '=') return false;
+        pos++;
+        while (pos < value.len && (value.ptr[pos] == ' ' || value.ptr[pos] == '\t')) pos++;
+        const bool boundary =
+            http_header_name_eq_ci(value.ptr + name_start, name_len, "boundary", 8);
+        if (boundary && found_boundary) return false;
+        bool has_value = false;
+        if (pos < value.len && value.ptr[pos] == '"') {
+            pos++;
+            while (pos < value.len && value.ptr[pos] != '"') {
+                const u8 ch = static_cast<u8>(value.ptr[pos]);
+                if (ch == '\\') {
+                    pos++;
+                    if (pos == value.len) return false;
+                    const u8 escaped = static_cast<u8>(value.ptr[pos]);
+                    if (escaped == '\r' || escaped == '\n' || escaped == 0x7f ||
+                        (escaped < 0x20 && escaped != '\t'))
+                        return false;
+                } else if (ch == '\r' || ch == '\n' || ch == 0x7f || (ch < 0x20 && ch != '\t')) {
+                    return false;
+                }
+                has_value = true;
+                pos++;
+            }
+            if (pos == value.len) return false;
+            pos++;
+        } else {
+            while (pos < value.len && is_http_tchar(static_cast<u8>(value.ptr[pos]))) {
+                has_value = true;
+                pos++;
+            }
+        }
+        if (!has_value) return false;
+        if (boundary) found_boundary = true;
+        while (pos < value.len && (value.ptr[pos] == ' ' || value.ptr[pos] == '\t')) pos++;
+        if (pos < value.len && value.ptr[pos] != ';') return false;
+    }
+    return found_boundary;
+}
+
+inline bool content_type_has_multipart_byteranges_media_type(Str value) {
+    static constexpr char kMultipart[] = "multipart/byteranges";
+    u32 start = 0;
+    while (start < value.len && (value.ptr[start] == ' ' || value.ptr[start] == '\t')) start++;
+    if (value.len - start < sizeof(kMultipart) - 1 ||
+        !http_header_name_eq_ci(
+            value.ptr + start, sizeof(kMultipart) - 1, kMultipart, sizeof(kMultipart) - 1))
+        return false;
+    const u32 end = start + sizeof(kMultipart) - 1;
+    return end == value.len || value.ptr[end] == ';' || value.ptr[end] == ' ' ||
+           value.ptr[end] == '\t';
+}
+
+inline bool response_is_multipart_byteranges(const ResponseHeaderKV* headers, u32 header_count) {
+    u32 content_type_count = 0;
+    bool multipart = false;
+    for (u32 i = 0; i < header_count; i++) {
+        if (!http_header_name_eq_ci(headers[i].key_data, headers[i].key_len, "content-type", 12))
+            continue;
+        content_type_count++;
+        multipart =
+            content_type_is_multipart_byteranges({headers[i].value_data, headers[i].value_len});
+    }
+    return content_type_count == 1 && multipart;
+}
+
+inline bool response_has_multipart_byteranges_media_type(const ResponseHeaderKV* headers,
+                                                         u32 header_count) {
+    for (u32 i = 0; i < header_count; i++) {
+        if (http_header_name_eq_ci(headers[i].key_data, headers[i].key_len, "content-type", 12) &&
+            content_type_has_multipart_byteranges_media_type(
+                {headers[i].value_data, headers[i].value_len}))
+            return true;
+    }
+    return false;
+}
+
+inline bool upstream_response_is_multipart_byteranges(const ParsedResponse& resp) {
+    for (u32 i = 0; i < resp.header_count; i++) {
+        const Str name = resp.headers[i].name;
+        if (http_header_name_eq_ci(name.ptr, name.len, "content-type", 12) &&
+            content_type_is_multipart_byteranges(resp.headers[i].value))
+            return true;
+    }
+    return false;
+}
+
+inline bool normalize_partial_content_headers(ResponseHeaderKV* headers,
+                                              u32* header_count,
+                                              u16 status,
+                                              u64 representation_length = 0,
+                                              bool validate_length = false) {
+    if (status != 206 && status != 416) {
+        u32 write = 0;
+        for (u32 read = 0; read < *header_count; read++) {
+            const Str name{headers[read].key_data, headers[read].key_len};
+            if (http_header_name_eq_ci(name.ptr, name.len, "content-range", 13)) continue;
+            if (write != read) {
+                headers[write].key_data = headers[read].key_data;
+                headers[write].key_len = headers[read].key_len;
+                headers[write].value_data = headers[read].value_data;
+                headers[write].value_len = headers[read].value_len;
+            }
+            write++;
+        }
+        *header_count = write;
+        return true;
+    }
+
+    bool found = false;
+    for (u32 i = 0; i < *header_count; i++) {
+        const Str name{headers[i].key_data, headers[i].key_len};
+        if (!http_header_name_eq_ci(name.ptr, name.len, "content-range", 13)) {
+            continue;
+        }
+        if (status == 206) {
+            u64 range_length = 0;
+            if (found ||
+                !valid_partial_content_range({headers[i].value_data, headers[i].value_len},
+                                             &range_length) ||
+                (validate_length && range_length != representation_length))
+                return false;
+            found = true;
+            continue;
+        }
+        if (status == 416) {
+            if (found ||
+                !valid_unsatisfied_content_range({headers[i].value_data, headers[i].value_len}))
+                return false;
+            found = true;
+            continue;
+        }
+    }
+    if (status != 206) return true;
+    if (found) return !response_has_multipart_byteranges_media_type(headers, *header_count);
+    return response_is_multipart_byteranges(headers, *header_count);
+}
+
+inline bool response_mutates_partial_content_metadata(const jit::HandlerCtx* ctx) {
+    if (ctx == nullptr) return false;
+    if (ctx->response_status_set || ctx->response_body_mutation_set) return true;
+    for (u32 i = 0; i < ctx->response_header_count; i++) {
+        const Str name = ctx->response_header_mutations[i].name;
+        if (http_header_name_eq_ci(name.ptr, name.len, "content-range", 13) ||
+            http_header_name_eq_ci(name.ptr, name.len, "content-type", 12))
+            return true;
+    }
+    return false;
 }
 
 // Is `name` listed as a token in an upstream `Connection: a, b, c` header value?
@@ -2726,16 +3099,44 @@ void h2_proxy_finish(Loop* loop,
         h2_proxy_fail(loop, conn, 502);
         return;
     }
-    hpack::Header hdrs[kMaxHeaders];
-    u32 nhdrs = 0;
-    for (u32 i = 0; i < resp.header_count && nhdrs < kMaxHeaders; i++) {
+    constexpr u32 kMaxEffectiveHeaders = kMaxHeaders + jit::kMaxResponseHeaderMutations + 2;
+    const jit::HandlerCtx* response_ctx =
+        h2->async_apply_response_mutations ? h2->async_jit_ctx() : nullptr;
+    const u16 final_status = response_ctx != nullptr && response_ctx->response_status_set
+                                 ? response_ctx->response_status
+                                 : resp.status_code;
+    ResponseHeaderKV effective[kMaxEffectiveHeaders];
+    u32 effective_count = 0;
+    const bool upstream_content_length_eligible =
+        resp.has_content_length && !resp.chunked && !resp.unsupported_transfer_coding;
+    bool upstream_content_length_retained = upstream_content_length_eligible;
+    for (u32 i = 0; i < resp.header_count && upstream_content_length_retained; i++) {
+        if (http_header_name_eq_ci(
+                resp.headers[i].name.ptr, resp.headers[i].name.len, "connection", 10))
+            upstream_content_length_retained =
+                !h2_name_in_connection_tokens(resp.headers[i].value, {"content-length", 14});
+    }
+    for (u32 i = 0; i < resp.header_count && effective_count < kMaxEffectiveHeaders; i++) {
         const Str kName = resp.headers[i].name;
+        const bool preserve_unsatisfied_range =
+            final_status == 416 &&
+            http_header_name_eq_ci(kName.ptr, kName.len, "content-range", 13);
+        if (response_ctx != nullptr && response_ctx->response_body_mutation_set &&
+            body_replacement_invalidates_upstream_header(kName) && !preserve_unsatisfied_range) {
+            continue;
+        }
+        if (response_ctx != nullptr && response_ctx->response_body_mutation_set &&
+            http_header_name_eq_ci(kName.ptr, kName.len, "content-type", 12))
+            continue;
         // content-length is normally dropped (http2_write_response re-derives it
         // from the DATA body), but a HEAD response carries no DATA, so keep the
         // upstream's so the client learns the corresponding GET body size.
         if (http_header_name_eq_ci(kName.ptr, kName.len, "content-length", 14)) {
             if (!is_head) continue;
-        } else if (h2_drop_response_header(kName)) {
+        } else if ((resp.chunked && http_header_name_eq_ci(kName.ptr, kName.len, "trailer", 7)) ||
+                   h2_drop_response_header(kName)) {
+            // Drop hop-by-hop fields. ChunkedParser also consumes the trailer
+            // section, so do not promise trailing HEADERS that we will not emit.
             continue;
         }
         // Fields named by ANY upstream Connection header are hop-by-hop (RFC 7230
@@ -2747,24 +3148,153 @@ void h2_proxy_finish(Loop* loop,
                 nominated = h2_name_in_connection_tokens(resp.headers[j].value, kName);
         }
         if (nominated) continue;
-        hdrs[nhdrs].name = kName;
-        hdrs[nhdrs].value = resp.headers[i].value;
-        nhdrs++;
+        effective[effective_count++] = {
+            kName.ptr, kName.len, resp.headers[i].value.ptr, resp.headers[i].value.len};
     }
+    bool mutations_valid =
+        h2_response_header_mutations_valid(response_ctx) &&
+        apply_response_header_mutations(
+            response_ctx, effective, kMaxEffectiveHeaders, &effective_count) &&
+        (response_ctx == nullptr ||
+         (!response_ctx->response_status_invalid &&
+          !response_ctx->response_body_mutation_overflow &&
+          (!response_ctx->response_status_set || response_ctx->response_status >= 200)));
     // body points into upstream_recv_buf, which h2_emit_response copies into the
     // DATA frame in pending_synth scratch — so serialize BEFORE teardown.
+    u16 status = mutations_valid ? resp.status_code : 500;
     const u8* body = conn.upstream_recv_buf.data() + hdr_end;
+    if (mutations_valid && response_ctx != nullptr && response_ctx->response_status_set)
+        status = response_ctx->response_status;
+    if (mutations_valid && response_ctx != nullptr && response_ctx->response_body_mutation_set) {
+        body = reinterpret_cast<const u8*>(response_ctx->response_body_mutation_storage);
+        body_len = response_ctx->response_body_mutation_len;
+    }
+    const bool response_body_mutated =
+        response_ctx != nullptr && response_ctx->response_body_mutation_set;
+    const bool final_status_carries_body =
+        status >= 200 && status != 204 && status != 205 && status != 304;
+    const bool upstream_status_forbids_body = resp.status_code < 200 || resp.status_code == 204 ||
+                                              resp.status_code == 205 || resp.status_code == 304;
+    if (mutations_valid && !is_head && upstream_status_forbids_body && final_status_carries_body &&
+        !response_body_mutated) {
+        mutations_valid = false;
+        status = 500;
+    }
+    if (mutations_valid && resp.status_code == 206 && status != 206 && final_status_carries_body &&
+        !response_body_mutated) {
+        mutations_valid = false;
+        status = 500;
+    }
+    const u64 range_representation_length =
+        is_head && !response_body_mutated && upstream_content_length_retained ? resp.content_length
+                                                                              : body_len;
+    const bool validate_range_length =
+        !is_head || response_body_mutated || upstream_content_length_retained;
+    if (mutations_valid && !normalize_partial_content_headers(effective,
+                                                              &effective_count,
+                                                              status,
+                                                              range_representation_length,
+                                                              validate_range_length)) {
+        mutations_valid = false;
+        status = response_mutates_partial_content_metadata(response_ctx) ? 500 : 502;
+    }
+    const u32 representation_body_len = body_len;
+    const bool status_forbids_content_length = status < 200 || status == 204 || status == 205;
+    char replacement_content_length[10];
+    u32 replacement_content_length_len = 0;
+    const bool preserve_upstream_representation_length =
+        mutations_valid && status == 304 && resp.status_code != 206 && !response_body_mutated &&
+        upstream_content_length_retained;
+    const bool declare_mutated_head_length = mutations_valid && is_head && response_body_mutated &&
+                                             !status_forbids_content_length && status != 304;
+    if (preserve_upstream_representation_length || declare_mutated_head_length) {
+        char reversed[10];
+        u32 value =
+            preserve_upstream_representation_length ? resp.content_length : representation_body_len;
+        do {
+            reversed[replacement_content_length_len++] = static_cast<char>('0' + value % 10);
+            value /= 10;
+        } while (value != 0);
+        for (u32 i = 0; i < replacement_content_length_len; i++)
+            replacement_content_length[i] = reversed[replacement_content_length_len - i - 1];
+    }
+    const bool drop_partial_payload_length = status == 304 && resp.status_code == 206;
+    if (mutations_valid &&
+        (status_forbids_content_length || replacement_content_length_len != 0 ||
+         (response_body_mutated && status == 304) || drop_partial_payload_length)) {
+        for (u32 i = 0; i < effective_count;) {
+            if (!http_header_name_eq_ci(
+                    effective[i].key_data, effective[i].key_len, "content-length", 14)) {
+                i++;
+                continue;
+            }
+            for (u32 move = i + 1; move < effective_count; move++)
+                effective[move - 1] = effective[move];
+            effective_count--;
+        }
+        if (replacement_content_length_len != 0 && effective_count < kMaxEffectiveHeaders) {
+            effective[effective_count++] = {
+                "content-length", 14, replacement_content_length, replacement_content_length_len};
+        } else if (replacement_content_length_len != 0) {
+            mutations_valid = false;
+            status = 500;
+            body = nullptr;
+            body_len = 0;
+            effective_count = 0;
+        }
+    }
+    hpack::Header hdrs[kMaxEffectiveHeaders];
+    u32 nhdrs = 0;
+    if (mutations_valid) {
+        for (u32 i = 0; i < effective_count; i++) {
+            // Mutations run after the upstream filter, so filter their final
+            // result too: a Set must not reintroduce an HTTP/2-prohibited field.
+            const Str name{effective[i].key_data, effective[i].key_len};
+            if (http_header_name_eq_ci(name.ptr, name.len, "trailer", 7)) continue;
+            const bool retained_representation_content_length =
+                (is_head || status == 304) && !status_forbids_content_length &&
+                http_header_name_eq_ci(name.ptr, name.len, "content-length", 14);
+            if (!retained_representation_content_length && h2_drop_response_header(name)) continue;
+            hdrs[nhdrs].name = {effective[i].key_data, effective[i].key_len};
+            hdrs[nhdrs].value = {effective[i].value_data, effective[i].value_len};
+            nhdrs++;
+        }
+    }
+    if (mutations_valid && response_body_mutated && representation_body_len != 0 && status >= 200 &&
+        status != 204 && status != 205 && status != 304) {
+        bool has_content_type = false;
+        for (u32 i = 0; i < nhdrs; i++)
+            has_content_type |=
+                http_header_name_eq_ci(hdrs[i].name.ptr, hdrs[i].name.len, "content-type", 12);
+        if (!has_content_type) {
+            if (nhdrs >= kMaxEffectiveHeaders) {
+                mutations_valid = false;
+                status = 500;
+                body = nullptr;
+                body_len = 0;
+                nhdrs = 0;
+            } else {
+                hdrs[nhdrs++] = {{"content-type", 12}, {"text/plain; charset=utf-8", 25}};
+            }
+        }
+    }
+    if (!mutations_valid || status < 200 || status == 204 || status == 205 || status == 304 ||
+        is_head)
+        body_len = 0;
     H2Dispatch<Loop> d{loop, &conn, h2->pending_synth, Http2Conn::kBodySynthCap, 0, false};
     // A re-framed response too large for the scratch buffer (large body OR large
     // header block) must NOT close the whole connection (dropping unrelated
-    // streams), nor be reported as a generic 500. Disable the 500 fallback and, on
-    // overflow, answer just this stream with 502 Bad Gateway.
-    h2_emit_response(
-        d, kStreamId, resp.status_code, hdrs, nhdrs, body, body_len, /*allow_fallback=*/false);
+    // streams). Preserve the HTTP/1 classification: unchanged upstream bytes are
+    // a 502, while middleware output that no longer fits is a 500.
+    h2_emit_response(d, kStreamId, status, hdrs, nhdrs, body, body_len, /*allow_fallback=*/false);
     if (d.overflow || d.resp_len == 0) {
         d.resp_len = 0;
         d.overflow = false;
-        h2_emit_status(d, kStreamId, 502);
+        const bool response_mutated =
+            response_ctx != nullptr &&
+            (response_ctx->response_status_set || response_ctx->response_body_mutation_set ||
+             response_ctx->response_header_count != 0);
+        h2_emit_status(d, kStreamId, response_mutated ? 500 : 502);
     }
     h2_proxy_teardown_upstream(loop, conn);
     // Success path: the full upstream response already arrived, so the request
@@ -2773,8 +3303,9 @@ void h2_proxy_finish(Loop* loop,
 }
 
 // Upstream response recv completion: accumulate in upstream_recv_buf until the
-// full response is present (headers + content-length body, or close-delimited),
-// then re-frame. Chunked and over-buffer responses fail closed (502).
+// full response is present (headers + content-length, chunked, or close-delimited
+// body), then re-frame. Malformed, truncated, and over-buffer responses fail
+// closed (502).
 template <typename Loop>
 void h2_on_upstream_response(void* lp, Connection& conn, IoEvent ev) {
     auto* loop = static_cast<Loop*>(lp);
@@ -2804,6 +3335,22 @@ void h2_on_upstream_response(void* lp, Connection& conn, IoEvent ev) {
     }
     // Headers complete.
     const u32 kHdrEnd = parser.header_end;
+    // The synthesized request remains intact until the response is reframed.
+    const bool kHeadReq = conn.h2->async_synth_len >= 4 && conn.h2->pending_synth[0] == 'H' &&
+                          conn.h2->pending_synth[1] == 'E' && conn.h2->pending_synth[2] == 'A' &&
+                          conn.h2->pending_synth[3] == 'D';
+
+    const bool response_has_no_body = kHeadReq || resp.status_code < 200 ||
+                                      resp.status_code == 204 || resp.status_code == 205 ||
+                                      resp.status_code == 304;
+    if (resp.malformed_transfer_coding) {
+        h2_proxy_fail(loop, conn, 502);
+        return;
+    }
+    if (resp.unsupported_transfer_coding && !response_has_no_body) {
+        h2_proxy_fail(loop, conn, 502);
+        return;
+    }
 
     // 101 Switching Protocols means the backend upgraded — no final HTTP response
     // follows, and the h2 proxy can't tunnel an upgrade. Fail now (502) instead of
@@ -2836,9 +3383,6 @@ void h2_on_upstream_response(void* lp, Connection& conn, IoEvent ev) {
     // and any response to a HEAD request (the synthesized request is in
     // pending_synth, still intact here). Reframe immediately instead of waiting on
     // a body a keep-alive upstream will never send.
-    const bool kHeadReq = conn.h2->async_synth_len >= 4 && conn.h2->pending_synth[0] == 'H' &&
-                          conn.h2->pending_synth[1] == 'E' && conn.h2->pending_synth[2] == 'A' &&
-                          conn.h2->pending_synth[3] == 'D';
     if (resp.status_code == 204 || resp.status_code == 205 || resp.status_code == 304 || kHeadReq) {
         h2_proxy_finish(loop, conn, resp, kHdrEnd, 0, /*is_head=*/kHeadReq);
         return;
@@ -2849,21 +3393,82 @@ void h2_on_upstream_response(void* lp, Connection& conn, IoEvent ev) {
     u32 body_len = 0;
     bool complete = false;
     if (resp.chunked) {
-        h2_proxy_fail(loop, conn, 502);  // chunked de-framing: follow-up
-        return;
+        ChunkedParser chunk;
+        chunk.reset();
+        u32 pos = 0;
+        u32 decoded_len = 0;
+        while (pos < kHaveBody) {
+            u32 consumed = 0;
+            u32 out_start = 0;
+            u32 out_len = 0;
+            const ChunkStatus status = chunk.feed(conn.upstream_recv_buf.data() + kHdrEnd + pos,
+                                                  kHaveBody - pos,
+                                                  &consumed,
+                                                  &out_start,
+                                                  &out_len);
+            pos += consumed;
+            if (status == ChunkStatus::Data) {
+                decoded_len += out_len;
+                continue;
+            }
+            if (status == ChunkStatus::Done) {
+                if (pos != kHaveBody) {
+                    h2_proxy_fail(loop, conn, 502);
+                    return;
+                }
+                complete = true;
+                break;
+            }
+            if (status == ChunkStatus::Error) {
+                h2_proxy_fail(loop, conn, 502);
+                return;
+            }
+            break;
+        }
+        if (complete) {
+            chunk.reset();
+            pos = 0;
+            u32 write = 0;
+            while (pos < kHaveBody) {
+                u32 consumed = 0;
+                u32 out_start = 0;
+                u32 out_len = 0;
+                const ChunkStatus status = chunk.feed(conn.upstream_recv_buf.data() + kHdrEnd + pos,
+                                                      kHaveBody - pos,
+                                                      &consumed,
+                                                      &out_start,
+                                                      &out_len);
+                if (status == ChunkStatus::Data && out_len != 0) {
+                    __builtin_memmove(conn.upstream_recv_slice + kHdrEnd + write,
+                                      conn.upstream_recv_slice + kHdrEnd + pos + out_start,
+                                      out_len);
+                    write += out_len;
+                }
+                pos += consumed;
+                if (status == ChunkStatus::Done) break;
+            }
+            body_len = decoded_len;
+        } else if (ev.result <= 0) {
+            h2_proxy_fail(loop, conn, 502);
+            return;
+        }
     }
-    if (resp.has_content_length) {
-        if (kHaveBody >= resp.content_length) {
+    if (!resp.chunked && resp.has_content_length) {
+        if (kHaveBody > resp.content_length) {
+            h2_proxy_fail(loop, conn, 502);
+            return;
+        }
+        if (kHaveBody == resp.content_length) {
             body_len = resp.content_length;
             complete = true;
         } else if (ev.result <= 0) {
             h2_proxy_fail(loop, conn, 502);  // closed/errored before the declared body → truncated
             return;
         }
-    } else if (ev.result == 0) {
+    } else if (!resp.chunked && ev.result == 0) {
         body_len = kHaveBody;  // close-delimited body, clean EOF
         complete = true;
-    } else if (ev.result < 0) {
+    } else if (!resp.chunked && ev.result < 0) {
         // A reset / -ENOBUFS overflow must not be reframed as a successful partial
         // body (only a clean EOF terminates an until-close body).
         h2_proxy_fail(loop, conn, 502);
@@ -2986,8 +3591,8 @@ template <typename Loop>
 void h2_proxy_begin(Loop* loop, Connection& conn) {
     Http2Conn* h2 = conn.h2;
     const RouteConfig* cfg = h2->async_cfg;
-    const RouteEntry* route = h2->async_route;
-    if (cfg == nullptr || route == nullptr) {
+    const u16 upstream_id = h2->async_upstream_id;
+    if (cfg == nullptr || upstream_id >= cfg->upstream_count) {
         h2_proxy_fail(loop, conn, 502);
         return;
     }
@@ -3012,18 +3617,18 @@ void h2_proxy_begin(Loop* loop, Connection& conn) {
     if constexpr (requires { loop->upstream_timeout; }) {
         loop->timer.refresh(&conn, loop->upstream_timeout);
     }
-    const UpstreamTarget& target = cfg->upstreams[route->upstream_id];
+    const UpstreamTarget& target = cfg->upstreams[upstream_id];
     if (target.max_inflight != 0) {
         bool acquired = true;
-        if constexpr (requires { loop->upstream_acquire(route->upstream_id, 1u); }) {
-            acquired = loop->upstream_acquire(route->upstream_id, target.max_inflight);
+        if constexpr (requires { loop->upstream_acquire(upstream_id, 1u); }) {
+            acquired = loop->upstream_acquire(upstream_id, target.max_inflight);
         }
         if (!acquired) {
             h2_proxy_fail(loop, conn, 503);
             return;
         }
         conn.upstream_slot_held = true;
-        conn.upstream_slot_uid = route->upstream_id;
+        conn.upstream_slot_uid = upstream_id;
     }
     const i32 kFd = UpstreamPool::create_socket();
     if (kFd < 0) {
@@ -3031,12 +3636,11 @@ void h2_proxy_begin(Loop* loop, Connection& conn) {
         return;
     }
     conn.upstream_fd = kFd;
-    conn.upstream_idx = route->upstream_id;
+    conn.upstream_idx = upstream_id;
     conn.upstream_attempts = 1;
     conn.upstream_start_us = monotonic_us();
     conn.set_slots(nullptr, nullptr, nullptr, &h2_on_upstream_connected<Loop>);
-    const u32 kBackend =
-        select_backend(route->upstream_id, target.addr_count, conn.upstream_start_us);
+    const u32 kBackend = select_backend(upstream_id, target.addr_count, conn.upstream_start_us);
     conn.upstream_backend_idx = static_cast<u8>(kBackend);
     if (!loop->submit_connect(conn, &target.addrs[kBackend], sizeof(target.addrs[kBackend]))) {
         h2_proxy_fail(loop, conn, 502);  // h2_proxy_fail closes the fd we just opened
@@ -4351,6 +4955,364 @@ inline bool ws_value_has_token(const char* v, u32 vlen, const char* tok, u32 tle
 #endif  // RUT_ENABLE_WEBSOCKET
 
 template <typename Loop>
+void buffered_forward_fail(Loop* loop, Connection& conn, u16 status) {
+    // Detach and abandon the upstream before queuing the downstream error. An
+    // io_uring multishot receive may still produce a terminal CQE after close;
+    // upstream_abandoned makes that stale completion benign while the error send
+    // drains instead of letting it tear down the client connection.
+    conn.on_upstream_recv = nullptr;
+    conn.on_upstream_send = nullptr;
+    conn.upstream_abandoned = true;
+    if (conn.upstream_fd >= 0) {
+        ::close(conn.upstream_fd);
+        conn.upstream_fd = -1;
+        loop->clear_upstream_fd(conn.id);
+    }
+    if constexpr (requires { loop->discard_upstream_send(conn); })
+        loop->discard_upstream_send(conn);
+    conn.upstream_recv_armed = false;
+    conn.upstream_send_armed = false;
+    release_upstream_slot(loop, conn);
+    conn.proxy_response_buffered = false;
+    conn.buffered_proxy_send_in_progress = true;
+    conn.upstream_keep_alive = false;
+    conn.resp_status = status;
+    conn.keep_alive = false;
+    const bool is_head = conn.req_method == static_cast<u8>(LogHttpMethod::Head);
+    format_static_response(conn, status, false, is_head);
+    conn.resp_body_sent = conn.send_buf.len();
+    conn.upstream_send_len = conn.upstream_recv_buf.len();
+    conn.proxy_resp_started = true;
+    conn.set_slots(nullptr, nullptr, nullptr, nullptr);
+    conn.transition_to_sending(&on_proxy_response_sent<Loop>);
+    loop->timer.refresh(&conn, loop->keepalive_timeout);
+    if (conn.handler_ctx != nullptr) rut_helper_resp_release_body_storage(conn.handler_ctx);
+    client_send(loop, conn, conn.send_buf.data(), conn.send_buf.len());
+}
+
+template <typename Loop>
+void finish_buffered_forward(Loop* loop,
+                             Connection& conn,
+                             const ParsedResponse& resp,
+                             const HttpResponseParser& parser,
+                             u32 body_len) {
+    constexpr u32 kMaxEffectiveHeaders = kMaxHeaders + jit::kMaxResponseHeaderMutations;
+    const bool is_head = conn.req_method == static_cast<u8>(LogHttpMethod::Head);
+    const jit::HandlerCtx* response_ctx = conn.jit_ctx();
+    const u16 final_status =
+        response_ctx->response_status_set ? response_ctx->response_status : resp.status_code;
+    ResponseHeaderKV headers[kMaxEffectiveHeaders];
+    u32 header_count = 0;
+    const bool upstream_content_length_eligible =
+        resp.has_content_length && !resp.chunked && !resp.unsupported_transfer_coding;
+    bool upstream_content_length_retained = upstream_content_length_eligible;
+    for (u32 i = 0; i < resp.header_count && upstream_content_length_retained; i++) {
+        if (http_header_name_eq_ci(
+                resp.headers[i].name.ptr, resp.headers[i].name.len, "connection", 10))
+            upstream_content_length_retained =
+                !h2_name_in_connection_tokens(resp.headers[i].value, {"content-length", 14});
+    }
+    for (u32 i = 0; i < resp.header_count; i++) {
+        const Str name = resp.headers[i].name;
+        // Preserve Content-Length on HEAD: it describes the corresponding GET
+        // representation even though this response carries no body. A 304 may
+        // likewise carry the selected representation's length.
+        if (http_header_name_eq_ci(name.ptr, name.len, "trailer", 7)) {
+            continue;
+        }
+        const bool preserve_unsatisfied_range =
+            final_status == 416 && http_header_name_eq_ci(name.ptr, name.len, "content-range", 13);
+        if (response_ctx->response_body_mutation_set &&
+            body_replacement_invalidates_upstream_header(name) && !preserve_unsatisfied_range) {
+            continue;
+        }
+        if (response_ctx->response_body_mutation_set &&
+            http_header_name_eq_ci(name.ptr, name.len, "content-type", 12))
+            continue;
+        if (http_header_name_eq_ci(name.ptr, name.len, "content-length", 14)) {
+            if (!is_head && resp.status_code != 304) continue;
+        } else if (h2_drop_response_header(name)) {
+            continue;
+        }
+        bool nominated = false;
+        for (u32 j = 0; j < resp.header_count && !nominated; j++) {
+            if (http_header_name_eq_ci(
+                    resp.headers[j].name.ptr, resp.headers[j].name.len, "connection", 10))
+                nominated = h2_name_in_connection_tokens(resp.headers[j].value, name);
+        }
+        if (nominated) continue;
+        if (header_count >= kMaxEffectiveHeaders) {
+            buffered_forward_fail(loop, conn, 500);
+            return;
+        }
+        headers[header_count++] = {
+            name.ptr, name.len, resp.headers[i].value.ptr, resp.headers[i].value.len};
+    }
+
+    if (!h2_response_header_mutations_valid(response_ctx)) {
+        buffered_forward_fail(loop, conn, 500);
+        return;
+    }
+    if (!apply_response_header_mutations(
+            response_ctx, headers, kMaxEffectiveHeaders, &header_count) ||
+        response_ctx->response_status_invalid || response_ctx->response_body_mutation_overflow ||
+        (response_ctx->response_status_set && response_ctx->response_status < 200)) {
+        buffered_forward_fail(loop, conn, 500);
+        return;
+    }
+    for (u32 i = 0; i < header_count;) {
+        if (!http_header_name_eq_ci(headers[i].key_data, headers[i].key_len, "trailer", 7)) {
+            i++;
+            continue;
+        }
+        for (u32 move = i + 1; move < header_count; move++) headers[move - 1] = headers[move];
+        header_count--;
+    }
+    u16 status =
+        response_ctx->response_status_set ? response_ctx->response_status : resp.status_code;
+    if (conn.req_method == static_cast<u8>(LogHttpMethod::Connect) && status >= 200 &&
+        status < 300) {
+        buffered_forward_fail(loop, conn, 502);
+        return;
+    }
+    const char* body =
+        reinterpret_cast<const char*>(conn.upstream_recv_buf.data() + parser.header_end);
+    if (response_ctx->response_body_mutation_set) {
+        body = response_ctx->response_body_mutation_storage;
+        body_len = response_ctx->response_body_mutation_len;
+    }
+    const bool final_status_carries_body =
+        status >= 200 && status != 204 && status != 205 && status != 304;
+    const bool upstream_status_forbids_body = resp.status_code < 200 || resp.status_code == 204 ||
+                                              resp.status_code == 205 || resp.status_code == 304;
+    if (!is_head && upstream_status_forbids_body && final_status_carries_body &&
+        !response_ctx->response_body_mutation_set) {
+        buffered_forward_fail(loop, conn, 500);
+        return;
+    }
+    if (resp.status_code == 206 && status != 206 && final_status_carries_body &&
+        !response_ctx->response_body_mutation_set) {
+        buffered_forward_fail(loop, conn, 500);
+        return;
+    }
+    const u32 representation_body_len = body_len;
+    const u64 range_representation_length =
+        is_head && !response_ctx->response_body_mutation_set && upstream_content_length_retained
+            ? resp.content_length
+            : representation_body_len;
+    const bool validate_range_length =
+        !is_head || response_ctx->response_body_mutation_set || upstream_content_length_retained;
+    if (!normalize_partial_content_headers(
+            headers, &header_count, status, range_representation_length, validate_range_length)) {
+        buffered_forward_fail(
+            loop, conn, response_mutates_partial_content_metadata(response_ctx) ? 500 : 502);
+        return;
+    }
+    const bool status_forbids_body =
+        status < 200 || status == 204 || status == 205 || status == 304;
+    const bool status_omits_content_length = status < 200 || status == 204;
+    const bool has_known_representation_length =
+        (!response_ctx->response_body_mutation_set && upstream_content_length_retained &&
+         (status != 304 || resp.status_code != 206)) ||
+        (is_head && response_ctx->response_body_mutation_set && !status_forbids_body);
+    const bool omit_unknown_representation_length =
+        (is_head || status == 304) && !has_known_representation_length;
+    if (status_forbids_body) body_len = 0;
+
+    // pipeline_stash stores a coalesced next request in send_buf, which response
+    // formatting is about to reuse. Move it back to recv_buf first so the
+    // completion path can dispatch it after the buffered response drains.
+    if (conn.pipeline_stash_len > 0 && !pipeline_recover(conn)) {
+        buffered_forward_fail(loop, conn, 500);
+        return;
+    }
+
+    conn.resp_status = status;
+    conn.keep_alive = conn.keep_alive && conn.req_keep_alive;
+    const bool serialized = format_response_with_body_and_headers(
+        conn,
+        status,
+        body,
+        body_len,
+        headers,
+        header_count,
+        conn.keep_alive,
+        // Preserve an upstream body's absent Content-Type. The local text/plain
+        // default belongs only to a body supplied by response middleware.
+        !response_ctx->response_body_mutation_set,
+        is_head,
+        ((is_head && !status_forbids_body) || status == 304) &&
+            !response_ctx->response_body_mutation_set && upstream_content_length_retained &&
+            (status != 304 || resp.status_code != 206),
+        !response_ctx->response_body_mutation_set && upstream_content_length_retained &&
+                (status != 304 || resp.status_code != 206) &&
+                ((is_head && !status_forbids_body) || status == 304)
+            ? resp.content_length
+        : is_head && response_ctx->response_body_mutation_set && !status_forbids_body
+            ? representation_body_len
+            : 0xffffffffu,
+        status_omits_content_length || omit_unknown_representation_length);
+    const bool response_mutated = response_ctx->response_status_set ||
+                                  response_ctx->response_body_mutation_set ||
+                                  response_ctx->response_header_count != 0;
+    if (!serialized && !response_mutated) {
+        buffered_forward_fail(loop, conn, 502);
+        return;
+    }
+    conn.proxy_response_buffered = false;
+    conn.buffered_proxy_send_in_progress = true;
+    conn.resp_body_sent = conn.send_buf.len();
+    conn.upstream_send_len = conn.upstream_recv_buf.len();
+    conn.proxy_resp_started = true;
+    conn.set_slots(nullptr, nullptr, nullptr, nullptr);
+    conn.transition_to_sending(&on_proxy_response_sent<Loop>);
+    loop->timer.refresh(&conn, loop->keepalive_timeout);
+    // send_buf owns the fully serialized response now; mutation bytes and
+    // request-backed header snapshots are no longer referenced.
+    rut_helper_resp_release_body_storage(conn.handler_ctx);
+    client_send(loop, conn, conn.send_buf.data(), conn.send_buf.len());
+}
+
+template <typename Loop>
+void on_buffered_upstream_response(Loop* loop,
+                                   Connection& conn,
+                                   IoEvent ev,
+                                   const ParsedResponse& resp,
+                                   const HttpResponseParser& parser) {
+    if (resp.headers_truncated) {
+        buffered_forward_fail(loop, conn, 502);
+        return;
+    }
+    const bool is_head = conn.req_method == static_cast<u8>(LogHttpMethod::Head);
+    const bool response_has_no_body = is_head || resp.status_code < 200 ||
+                                      resp.status_code == 204 || resp.status_code == 205 ||
+                                      resp.status_code == 304;
+    if (resp.malformed_transfer_coding) {
+        buffered_forward_fail(loop, conn, 502);
+        return;
+    }
+    if (resp.unsupported_transfer_coding && !response_has_no_body) {
+        buffered_forward_fail(loop, conn, 502);
+        return;
+    }
+    if (resp.status_code == 101) {
+        buffered_forward_fail(loop, conn, 502);
+        return;
+    }
+    if (conn.req_method == static_cast<u8>(LogHttpMethod::Connect) && resp.status_code >= 200 &&
+        resp.status_code < 300) {
+        buffered_forward_fail(loop, conn, 502);
+        return;
+    }
+    const u32 header_end = parser.header_end;
+    const u32 have_body = conn.upstream_recv_buf.len() - header_end;
+    const bool no_body =
+        is_head || resp.status_code == 204 || resp.status_code == 205 || resp.status_code == 304;
+    u32 body_len = 0;
+    bool complete = false;
+
+    bool contaminated_no_body_response = false;
+    if (no_body) {
+        body_len = 0;
+        complete = true;
+        contaminated_no_body_response = have_body != 0;
+    } else if (resp.chunked) {
+        ChunkedParser chunk;
+        chunk.reset();
+        u32 pos = 0;
+        u32 decoded_len = 0;
+        while (pos < have_body) {
+            u32 consumed = 0;
+            u32 out_start = 0;
+            u32 out_len = 0;
+            const ChunkStatus status = chunk.feed(conn.upstream_recv_buf.data() + header_end + pos,
+                                                  have_body - pos,
+                                                  &consumed,
+                                                  &out_start,
+                                                  &out_len);
+            pos += consumed;
+            if (status == ChunkStatus::Data) {
+                decoded_len += out_len;
+                continue;
+            }
+            if (status == ChunkStatus::Done) {
+                if (pos != have_body) {
+                    buffered_forward_fail(loop, conn, 502);
+                    return;
+                }
+                complete = true;
+                break;
+            }
+            if (status == ChunkStatus::Error) {
+                buffered_forward_fail(loop, conn, 502);
+                return;
+            }
+            break;
+        }
+        if (complete) {
+            chunk.reset();
+            pos = 0;
+            u32 write = 0;
+            while (pos < have_body) {
+                u32 consumed = 0;
+                u32 out_start = 0;
+                u32 out_len = 0;
+                const ChunkStatus status =
+                    chunk.feed(conn.upstream_recv_buf.data() + header_end + pos,
+                               have_body - pos,
+                               &consumed,
+                               &out_start,
+                               &out_len);
+                if (status == ChunkStatus::Data && out_len != 0) {
+                    __builtin_memmove(conn.upstream_recv_slice + header_end + write,
+                                      conn.upstream_recv_slice + header_end + pos + out_start,
+                                      out_len);
+                    write += out_len;
+                }
+                pos += consumed;
+                if (status == ChunkStatus::Done) break;
+            }
+            body_len = decoded_len;
+        } else if (ev.result <= 0) {
+            buffered_forward_fail(loop, conn, 502);
+            return;
+        }
+    } else if (resp.has_content_length) {
+        if (have_body > resp.content_length) {
+            buffered_forward_fail(loop, conn, 502);
+            return;
+        }
+        if (have_body == resp.content_length) {
+            body_len = resp.content_length;
+            complete = true;
+        } else if (ev.result <= 0) {
+            buffered_forward_fail(loop, conn, 502);
+            return;
+        }
+    } else if (ev.result == 0) {
+        body_len = have_body;
+        complete = true;
+        conn.upstream_keep_alive = false;
+    } else if (ev.result < 0) {
+        buffered_forward_fail(loop, conn, 502);
+        return;
+    }
+
+    if (!complete) {
+        if (conn.upstream_recv_buf.write_avail() == 0 || !loop->submit_recv_upstream(conn))
+            buffered_forward_fail(loop, conn, 502);
+        return;
+    }
+    conn.upstream_keep_alive = resp.keep_alive && !resp.connection_close &&
+                               !(!resp.has_content_length && !resp.chunked && !no_body) &&
+                               !(no_body && resp.chunked) && conn.req_keep_alive &&
+                               !contaminated_no_body_response &&
+                               !((resp.status_code == 204 || resp.status_code == 205) &&
+                                 resp.has_content_length && resp.content_length != 0);
+    finish_buffered_forward(loop, conn, resp, parser, body_len);
+}
+
+template <typename Loop>
 void on_upstream_response(void* lp, Connection& conn, IoEvent ev) {
     auto* loop = static_cast<Loop*>(lp);
 
@@ -4368,6 +5330,10 @@ void on_upstream_response(void* lp, Connection& conn, IoEvent ev) {
         // fresh connect (request_fully_resendable inside the helper enforces this, so
         // a streamed body upload is never replayed). Otherwise fail closed.
         if (retry_reused_upstream(loop, conn)) return;
+        if (conn.proxy_response_buffered) {
+            buffered_forward_fail(loop, conn, 502);
+            return;
+        }
         loop->close_conn(conn);
         return;
     }
@@ -4396,26 +5362,24 @@ void on_upstream_response(void* lp, Connection& conn, IoEvent ev) {
     ParseStatus ps =
         resp_parser.parse(conn.upstream_recv_buf.data(), conn.upstream_recv_buf.len(), &resp);
     if (ps == ParseStatus::Incomplete) {
-        if (ev.result <= 0)
+        if (ev.result <= 0 || conn.upstream_recv_buf.write_avail() == 0)
             ps = ParseStatus::Error;
         else {
-            loop->submit_recv_upstream(conn);
-            return;
+            if (!loop->submit_recv_upstream(conn)) ps = ParseStatus::Error;
         }
+        if (ps == ParseStatus::Incomplete) return;
     }
     if (ps == ParseStatus::Error) {
+        if (conn.proxy_response_buffered) {
+            buffered_forward_fail(loop, conn, 502);
+            return;
+        }
         if (conn.upstream_fd >= 0) {
             ::close(conn.upstream_fd);
             conn.upstream_fd = -1;
         }
-        static const char k502[] =
-            "HTTP/1.1 502 Bad Gateway\r\n"
-            "Content-Length: 11\r\n"
-            "Connection: close\r\n"
-            "\r\n"
-            "Bad Gateway";
-        conn.send_buf.reset();
-        conn.send_buf.write(reinterpret_cast<const u8*>(k502), sizeof(k502) - 1);
+        format_static_response(
+            conn, 502, false, conn.req_method == static_cast<u8>(LogHttpMethod::Head));
         conn.keep_alive = false;
         conn.resp_status = kStatusBadGateway;
         conn.transition_to_sending(&on_response_sent<Loop>);
@@ -4423,6 +5387,16 @@ void on_upstream_response(void* lp, Connection& conn, IoEvent ev) {
         return;
     }
     conn.resp_status = resp.status_code;
+
+    if (conn.proxy_response_buffered && resp.malformed_transfer_coding) {
+        buffered_forward_fail(loop, conn, 502);
+        return;
+    }
+
+    if (conn.proxy_response_buffered && resp.status_code == 101) {
+        on_buffered_upstream_response(loop, conn, ev, resp, resp_parser);
+        return;
+    }
 
 #if RUT_ENABLE_WEBSOCKET
     // 101 Switching Protocols → WebSocket/Upgrade passthrough. Forward the 101
@@ -4508,6 +5482,11 @@ void on_upstream_response(void* lp, Connection& conn, IoEvent ev) {
         return;
     }
 
+    if (conn.proxy_response_buffered) {
+        on_buffered_upstream_response(loop, conn, ev, resp, resp_parser);
+        return;
+    }
+
     const bool kIsHead = (conn.req_method == static_cast<u8>(LogHttpMethod::Head));
     const bool kNoBodyStatus =
         resp.status_code == 204 || resp.status_code == 205 || resp.status_code == 304;
@@ -4572,14 +5551,8 @@ void on_upstream_response(void* lp, Connection& conn, IoEvent ev) {
                     ::close(conn.upstream_fd);
                     conn.upstream_fd = -1;
                 }
-                static const char k502[] =
-                    "HTTP/1.1 502 Bad Gateway\r\n"
-                    "Content-Length: 11\r\n"
-                    "Connection: close\r\n"
-                    "\r\n"
-                    "Bad Gateway";
-                conn.send_buf.reset();
-                conn.send_buf.write(reinterpret_cast<const u8*>(k502), sizeof(k502) - 1);
+                format_static_response(
+                    conn, 502, false, conn.req_method == static_cast<u8>(LogHttpMethod::Head));
                 conn.keep_alive = false;
                 conn.resp_status = kStatusBadGateway;
                 conn.transition_to_sending(&on_response_sent<Loop>);
@@ -4709,12 +5682,34 @@ void on_upstream_response(void* lp, Connection& conn, IoEvent ev) {
 template <typename Loop>
 void on_proxy_response_sent(void* lp, Connection& conn, IoEvent ev) {
     auto* loop = static_cast<Loop*>(lp);
-    conn.clear_slots();
 
     if (ev.result < 0) {
         loop->close_conn(conn);
         return;
     }
+
+    const u32 send_len =
+        conn.buffered_proxy_send_in_progress ? conn.send_buf.len() : conn.upstream_send_len;
+    if (conn.send_progress > send_len ||
+        static_cast<u32>(ev.result) > send_len - conn.send_progress) {
+        loop->close_conn(conn);
+        return;
+    }
+    conn.send_progress += static_cast<u32>(ev.result);
+    if (conn.send_progress < send_len) {
+        if (ev.result == 0) {
+            loop->close_conn(conn);
+            return;
+        }
+        const u8* source = conn.buffered_proxy_send_in_progress ? conn.send_buf.data()
+                                                                : conn.upstream_recv_buf.data();
+        conn.transition_to_sending(&on_proxy_response_sent<Loop>);
+        client_send(loop, conn, source + conn.send_progress, send_len - conn.send_progress);
+        return;
+    }
+    conn.send_progress = 0;
+    conn.buffered_proxy_send_in_progress = false;
+    conn.clear_slots();
 
     // One-shot proxy response complete (header-only / small Content-Length that
     // finished in the first read). Release the backend concurrency slot promptly
@@ -4743,6 +5738,11 @@ void on_proxy_response_sent(void* lp, Connection& conn, IoEvent ev) {
     conn.upstream_recv_buf.reset();
 
     release_upstream_conn(loop, conn);  // pool for reuse if keep-alive, else close
+
+    if (!conn.keep_alive) {
+        loop->close_conn(conn);
+        return;
+    }
 
     if (conn.pipeline_stash_len > 0 && conn.recv_buf.len() > 0) {
         const u16 kStashLen = conn.pipeline_stash_len;

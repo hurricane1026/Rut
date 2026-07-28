@@ -707,6 +707,25 @@ TEST(h2_proxy_forwardable, rejects_ambiguous_host_without_authority) {
     CHECK(h2_proxy_request_forwardable(auth_plus_host, 6));
 }
 
+TEST(h2_proxy_forwardable, rejects_missing_host_without_authority) {
+    hpack::Header no_host[] = {
+        {{":method", 7}, {"GET", 3}}, {{":scheme", 7}, {"http", 4}}, {{":path", 5}, {"/", 1}}};
+    CHECK_FALSE(h2_proxy_request_forwardable(no_host, 3));
+
+    hpack::Header empty_authority[] = {{{":method", 7}, {"GET", 3}},
+                                       {{":scheme", 7}, {"http", 4}},
+                                       {{":path", 5}, {"/", 1}},
+                                       {{":authority", 10}, {"", 0}}};
+    CHECK_FALSE(h2_proxy_request_forwardable(empty_authority, 4));
+
+    hpack::Header empty_authority_with_host[] = {{{":method", 7}, {"GET", 3}},
+                                                 {{":scheme", 7}, {"http", 4}},
+                                                 {{":path", 5}, {"/", 1}},
+                                                 {{":authority", 10}, {"", 0}},
+                                                 {{"host", 4}, {"x", 1}}};
+    CHECK(h2_proxy_request_forwardable(empty_authority_with_host, 5));
+}
+
 // Write a raw frame (header + payload) into out; return bytes written.
 namespace {
 u32 put_frame(u8* out, Http2FrameType type, u8 flags, u32 stream_id, const u8* payload, u32 plen) {
@@ -1164,6 +1183,57 @@ TEST(http2_conn, prohibited_response_header_filter) {
     CHECK(!h2_is_prohibited_response_header("cache-control", 13));
 }
 
+TEST(h2_serving, rejects_prohibited_buffered_forward_response_mutations) {
+    struct NoopLoop {};
+    jit::HandlerCtx ctx{};
+    ctx.response_header_count = 1;
+    ctx.response_header_mutations[0].mode = jit::ResponseHeaderMutationMode::Set;
+    ctx.response_header_mutations[0].value = {"value", 5};
+
+    static constexpr Str kProhibited[] = {
+        {"Keep-Alive", 10}, {"Proxy-Connection", 16}, {"TE", 2}, {"Upgrade", 7}};
+    for (const Str name : kProhibited) {
+        ctx.response_header_mutations[0].name = name;
+        CHECK_FALSE(h2_response_header_mutations_valid(&ctx));
+
+        Http2Conn h2;
+        h2.init();
+        Connection conn;
+        conn.reset();
+        conn.h2 = &h2;
+        NoopLoop loop;
+        u8 response[256]{};
+        H2Dispatch<NoopLoop> dispatch{&loop, &conn, response, sizeof(response), 0, false};
+        JitDispatchOutcome outcome{};
+        outcome.kind = JitDispatchOutcome::Kind::ReturnStatus;
+        outcome.status_code = 200;
+        outcome.response_ctx = &ctx;
+        h2_emit_outcome(dispatch, 1, outcome, nullptr, false);
+
+        Http2FrameHeader frame{};
+        REQUIRE(parse_frame_header(response, dispatch.resp_len, &frame) == ParseStatus::Complete);
+        hpack::DynamicTable dyn;
+        dyn.init(4096);
+        hpack::Header decoded[4];
+        u8 scratch[64];
+        u32 decoded_count = 0;
+        REQUIRE(hpack::decode_header_block(dyn,
+                                           response + kFrameHeaderSize,
+                                           frame.length,
+                                           scratch,
+                                           sizeof(scratch),
+                                           decoded,
+                                           4,
+                                           &decoded_count));
+        REQUIRE_EQ(decoded_count, 1u);
+        CHECK(decoded[0].name.eq({":status", 7}));
+        CHECK(decoded[0].value.eq({"500", 3}));
+    }
+
+    ctx.response_header_mutations[0].name = {"x-custom", 8};
+    CHECK(h2_response_header_mutations_valid(&ctx));
+}
+
 // Open stream 1 (HEADERS without END_STREAM) and return the conn/cap ready for
 // more frames. Helper to reduce boilerplate in the branch tests below.
 namespace {
@@ -1347,6 +1417,7 @@ TEST(http2_conn, request_trailers_finalize_instead_of_rst) {
 
     // The serving layer would have deferred this upload.
     c.pending_stream = 1;
+    c.pending_request_forwardable = true;
 
     // Trailing HEADERS: END_STREAM, no pseudo-headers → valid request trailers.
     hpack::Header tr[] = {{{"x-checksum", 10}, {"ok", 2}}};
@@ -1359,6 +1430,7 @@ TEST(http2_conn, request_trailers_finalize_instead_of_rst) {
     CHECK_FALSE(has_frame(tout, tow, Http2FrameType::RstStream, 0, 0));  // not reset
     CHECK_EQ(cap.data_calls, 2u);  // end-of-stream delivered to finalize the upload
     CHECK(cap.data_end);
+    CHECK_FALSE(c.pending_request_forwardable);  // buffered forwarding must reject lost trailers
     Http2Stream* s = c.find_stream(1);
     REQUIRE(s != nullptr);
     CHECK(s->state == Http2StreamState::HalfClosedRemote);
@@ -1506,6 +1578,44 @@ u64 h2_mutated_body_then_timer(void*, jit::HandlerCtx* ctx, const u8*, u32, void
     ctx->response_body_mutation_len = 1;
     return jit::HandlerResult::make_yield_payload(1, jit::YieldKind::Timer, 1).pack();
 }
+
+u64 h2_status_204(void*, jit::HandlerCtx*, const u8*, u32, void*) {
+    return jit::HandlerResult::make_status(204).pack();
+}
+
+u32 h2_buffered_forward_calls = 0;
+bool h2_buffered_forward_saw_te = false;
+u64 h2_buffered_forward(void*, jit::HandlerCtx*, const u8* req, u32 len, void*) {
+    h2_buffered_forward_calls++;
+    h2_buffered_forward_saw_te = false;
+    static constexpr char kNeedle[] = "\r\nte: trailers\r\n";
+    for (u32 i = 0; i + sizeof(kNeedle) - 1 <= len; i++) {
+        bool match = true;
+        for (u32 j = 0; j < sizeof(kNeedle) - 1; j++)
+            match &= req[i + j] == static_cast<u8>(kNeedle[j]);
+        h2_buffered_forward_saw_te |= match;
+    }
+    return jit::HandlerResult::make_buffered_forward(0).pack();
+}
+
+u32 h2_buffered_timer_calls = 0;
+u64 h2_buffered_timer(void*, jit::HandlerCtx*, const u8*, u32, void*) {
+    h2_buffered_timer_calls++;
+    return jit::HandlerResult::make_yield_payload(7, jit::YieldKind::Timer, 25).pack();
+}
+
+bool h2_handler_saw_content_length = false;
+u64 h2_observe_absent_content_length(void*, jit::HandlerCtx*, const u8* req, u32 len, void*) {
+    static constexpr char kNeedle[] = "content-length:";
+    h2_handler_saw_content_length = false;
+    for (u32 i = 0; i + sizeof(kNeedle) - 1 <= len; i++) {
+        bool match = true;
+        for (u32 j = 0; j < sizeof(kNeedle) - 1; j++)
+            match &= req[i + j] == static_cast<u8>(kNeedle[j]);
+        if (match) h2_handler_saw_content_length = true;
+    }
+    return jit::HandlerResult::make_status(204).pack();
+}
 }  // namespace
 
 TEST(h2_serving, response_status_body_rules_include_reset_content) {
@@ -1515,6 +1625,347 @@ TEST(h2_serving, response_status_body_rules_include_reset_content) {
     CHECK(h2_response_status_forbids_body(304));
     CHECK_FALSE(h2_response_status_forbids_body(200));
     CHECK_FALSE(h2_response_status_forbids_body(206));
+}
+
+TEST(h2_serving, body_independent_local_branch_avoids_buffered_forward_cap) {
+    const hpack::Header headers[] = {{{":method", 7}, {"POST", 4}},
+                                     {{":path", 5}, {"/upload", 7}},
+                                     {{":scheme", 7}, {"https", 5}},
+                                     {{":authority", 10}, {"example", 7}}};
+    Http2Conn h2;
+    h2.init();
+    Connection conn;
+    conn.reset();
+    conn.h2 = &h2;
+    RouteConfig config;
+    REQUIRE(config.add_jit_handler("/upload", kRouteMethodPost, &h2_status_204, false, true));
+    conn.request_config = &config;
+    FakeH2Loop loop;
+    u8 response[512]{};
+    H2Dispatch<FakeH2Loop> dispatch{&loop, &conn, response, sizeof(response), 0, false};
+
+    h2_dispatch_request(dispatch, 1, headers, 4, /*end_stream=*/false);
+    CHECK_EQ(h2.pending_stream, 0u);
+    CHECK_GT(dispatch.resp_len, 0u);
+}
+
+TEST(h2_serving, selected_buffered_forward_defers_and_buffers_data) {
+    const hpack::Header headers[] = {{{":method", 7}, {"POST", 4}},
+                                     {{":path", 5}, {"/upload", 7}},
+                                     {{":scheme", 7}, {"https", 5}},
+                                     {{":authority", 10}, {"example", 7}},
+                                     {{"te", 2}, {"trailers", 8}}};
+    Http2Conn h2;
+    h2.init();
+    Connection conn;
+    conn.reset();
+    conn.h2 = &h2;
+    RouteConfig config;
+    REQUIRE(config.add_jit_handler("/upload", kRouteMethodPost, &h2_buffered_forward, false, true));
+    conn.request_config = &config;
+    FakeH2Loop loop;
+    u8 response[512]{};
+    H2Dispatch<FakeH2Loop> dispatch{&loop, &conn, response, sizeof(response), 0, false};
+
+    h2_buffered_forward_calls = 0;
+    h2_buffered_forward_saw_te = false;
+    h2_dispatch_request(dispatch, 1, headers, 5, /*end_stream=*/false);
+    CHECK_EQ(h2.pending_stream, 1u);
+    CHECK(h2.pending_buffer_body);
+    CHECK(h2.pending_preinvoked_forward);
+    CHECK_EQ(h2_buffered_forward_calls, 1u);
+    CHECK(h2_buffered_forward_saw_te);
+    CHECK_EQ(dispatch.resp_len, 0u);
+
+    static const u8 kBody[] = {'a', 'b', 'c'};
+    h2_on_data_cb<FakeH2Loop>(&dispatch, h2, 1, kBody, sizeof(kBody), true);
+    CHECK_EQ(h2_buffered_forward_calls, 1u);
+    CHECK_EQ(h2.pending_stream, 0u);
+    CHECK_EQ(h2.async_stream, 1u);
+    CHECK_EQ(h2.async_kind, H2AsyncKind::Proxy);
+    CHECK(h2.async_apply_response_mutations);
+    bool forwarded_te = false;
+    static constexpr char kTeNeedle[] = "\r\nte:";
+    for (u32 i = 0; i + sizeof(kTeNeedle) - 1 <= h2.async_synth_len; i++) {
+        bool match = true;
+        for (u32 j = 0; j < sizeof(kTeNeedle) - 1; j++)
+            match &= h2.pending_synth[i + j] == static_cast<u8>(kTeNeedle[j]);
+        forwarded_te |= match;
+    }
+    CHECK_FALSE(forwarded_te);
+    h2_clear_async(h2);
+}
+
+TEST(h2_serving, ended_buffered_forward_strips_te_after_handler_observes_it) {
+    const hpack::Header headers[] = {{{":method", 7}, {"POST", 4}},
+                                     {{":path", 5}, {"/upload", 7}},
+                                     {{":scheme", 7}, {"https", 5}},
+                                     {{":authority", 10}, {"example", 7}},
+                                     {{"te", 2}, {"trailers", 8}}};
+    Http2Conn h2;
+    h2.init();
+    Connection conn;
+    conn.reset();
+    conn.h2 = &h2;
+    RouteConfig config;
+    REQUIRE(config.add_jit_handler("/upload", kRouteMethodPost, &h2_buffered_forward, false, true));
+    conn.request_config = &config;
+    FakeH2Loop loop;
+    u8 response[512]{};
+    H2Dispatch<FakeH2Loop> dispatch{&loop, &conn, response, sizeof(response), 0, false};
+
+    h2_buffered_forward_saw_te = false;
+    h2_dispatch_request(dispatch, 1, headers, 5, /*end_stream=*/true);
+
+    CHECK(h2_buffered_forward_saw_te);
+    CHECK_EQ(h2.async_kind, H2AsyncKind::Proxy);
+    bool forwarded_te = false;
+    static constexpr char kTeNeedle[] = "\r\nte:";
+    for (u32 i = 0; i + sizeof(kTeNeedle) - 1 <= h2.async_synth_len; i++) {
+        bool match = true;
+        for (u32 j = 0; j < sizeof(kTeNeedle) - 1; j++)
+            match &= h2.pending_synth[i + j] == static_cast<u8>(kTeNeedle[j]);
+        forwarded_te |= match;
+    }
+    CHECK_FALSE(forwarded_te);
+    h2_clear_async(h2);
+}
+
+TEST(h2_serving, body_independent_timer_starts_before_upload_completion) {
+    const hpack::Header headers[] = {{{":method", 7}, {"POST", 4}},
+                                     {{":path", 5}, {"/upload", 7}},
+                                     {{":scheme", 7}, {"https", 5}},
+                                     {{":authority", 10}, {"example", 7}},
+                                     {{"content-length", 14}, {"5", 1}}};
+    Http2Conn h2;
+    h2.init();
+    Connection conn;
+    conn.reset();
+    conn.h2 = &h2;
+    RouteConfig config;
+    REQUIRE(config.add_jit_handler("/upload", kRouteMethodPost, &h2_buffered_timer, false, true));
+    conn.request_config = &config;
+    FakeH2Loop loop;
+    u8 response[512]{};
+    H2Dispatch<FakeH2Loop> dispatch{&loop, &conn, response, sizeof(response), 0, false};
+
+    h2_buffered_timer_calls = 0;
+    h2_dispatch_request(dispatch, 1, headers, 5, /*end_stream=*/false);
+    CHECK_EQ(h2_buffered_timer_calls, 1u);
+    CHECK_EQ(h2.pending_stream, 0u);
+    CHECK_EQ(h2.async_stream, 1u);
+    CHECK_EQ(h2.async_kind, H2AsyncKind::Timer);
+    CHECK_EQ(h2.async_state, 7u);
+    CHECK_EQ(h2.async_timer_ms, 25u);
+    CHECK_EQ(h2.async_body_len, 0u);
+    CHECK_EQ(h2.async_content_length, 5u);
+    CHECK(h2.async_has_content_length);
+    CHECK_FALSE(h2.async_inject_content_length_on_forward);
+    CHECK(h2.async_wait_for_body_on_forward);
+    h2_clear_async(h2);
+}
+
+TEST(h2_serving, resumed_timer_defers_body_only_after_selecting_buffered_forward) {
+    Http2Conn h2;
+    h2.init();
+    RouteConfig config;
+    RouteEntry route{};
+    route.action = RouteAction::JitHandler;
+    route.fn = &h2_buffered_timer;
+    static constexpr char kSynth[] = "POST /upload HTTP/1.1\r\nhost: example\r\n\r\n";
+    for (u32 i = 0; i < sizeof(kSynth) - 1; i++) h2.pending_synth[i] = static_cast<u8>(kSynth[i]);
+    h2.async_stream = 1;
+    h2.async_kind = H2AsyncKind::Timer;
+    h2.async_cfg = &config;
+    h2.async_route = &route;
+    h2.async_fn = route.fn;
+    h2.async_synth_len = sizeof(kSynth) - 1;
+    h2.async_body_start = sizeof(kSynth) - 1;
+    h2.async_content_length = 5;
+    h2.async_has_content_length = true;
+    h2.async_wait_for_body_on_forward = true;
+
+    h2_transfer_timer_to_pending_forward(h2, 1, 7);
+
+    CHECK_EQ(h2.async_stream, 0u);
+    CHECK_EQ(h2.pending_stream, 1u);
+    CHECK(h2.pending_buffer_body);
+    CHECK(h2.pending_preinvoked_forward);
+    CHECK_EQ(h2.pending_forward_upstream_id, 7u);
+    CHECK_EQ(h2.pending_synth_len, sizeof(kSynth) - 1);
+    CHECK_EQ(h2.pending_body_start, sizeof(kSynth) - 1);
+    CHECK_EQ(h2.pending_content_length, 5u);
+    CHECK(h2.pending_has_content_length);
+    CHECK(h2.pending_route == &route);
+    h2_clear_pending(h2);
+}
+
+TEST(h2_serving, body_independent_local_branch_ignores_declared_upload_length) {
+    const hpack::Header headers[] = {{{":method", 7}, {"POST", 4}},
+                                     {{":path", 5}, {"/upload", 7}},
+                                     {{":scheme", 7}, {"https", 5}},
+                                     {{":authority", 10}, {"example", 7}},
+                                     {{"content-length", 14}, {"100", 3}}};
+    Http2Conn h2;
+    h2.init();
+    Connection conn;
+    conn.reset();
+    conn.h2 = &h2;
+    RouteConfig config;
+    REQUIRE(config.add_jit_handler("/upload", kRouteMethodPost, &h2_status_204, false, true));
+    conn.request_config = &config;
+    FakeH2Loop loop;
+    u8 response[512]{};
+    H2Dispatch<FakeH2Loop> dispatch{&loop, &conn, response, sizeof(response), 0, false};
+
+    h2_dispatch_request(dispatch, 1, headers, 5, /*end_stream=*/false);
+    CHECK_EQ(h2.pending_stream, 0u);
+    CHECK_GT(dispatch.resp_len, 0u);
+}
+
+TEST(h2_serving, selected_buffered_forward_preserves_declared_length_validation) {
+    const hpack::Header headers[] = {{{":method", 7}, {"POST", 4}},
+                                     {{":path", 5}, {"/upload", 7}},
+                                     {{":scheme", 7}, {"https", 5}},
+                                     {{":authority", 10}, {"example", 7}},
+                                     {{"content-length", 14}, {"100", 3}}};
+    Http2Conn h2;
+    h2.init();
+    Connection conn;
+    conn.reset();
+    conn.h2 = &h2;
+    RouteConfig config;
+    REQUIRE(config.add_jit_handler("/upload", kRouteMethodPost, &h2_buffered_forward, false, true));
+    conn.request_config = &config;
+    FakeH2Loop loop;
+    u8 response[512]{};
+    H2Dispatch<FakeH2Loop> dispatch{&loop, &conn, response, sizeof(response), 0, false};
+
+    h2_dispatch_request(dispatch, 1, headers, 5, /*end_stream=*/false);
+    CHECK_EQ(dispatch.resp_len, 0u);
+    CHECK_EQ(h2.pending_stream, 1u);
+    CHECK(h2.pending_preinvoked_forward);
+    CHECK(h2.pending_has_content_length);
+    CHECK_EQ(h2.pending_content_length, 100u);
+
+    static const u8 kShortBody[] = {'a', 'b', 'c'};
+    h2_on_data_cb<FakeH2Loop>(&dispatch, h2, 1, kShortBody, sizeof(kShortBody), true);
+    CHECK_EQ(h2.pending_stream, 0u);
+    CHECK_GT(dispatch.resp_len, 0u);
+}
+
+TEST(h2_serving, ended_buffered_forward_rejects_nonzero_declared_length) {
+    const hpack::Header headers[] = {{{":method", 7}, {"POST", 4}},
+                                     {{":path", 5}, {"/upload", 7}},
+                                     {{":scheme", 7}, {"https", 5}},
+                                     {{":authority", 10}, {"example", 7}},
+                                     {{"content-length", 14}, {"100", 3}}};
+    Http2Conn h2;
+    h2.init();
+    Connection conn;
+    conn.reset();
+    conn.h2 = &h2;
+    RouteConfig config;
+    REQUIRE(config.add_jit_handler("/upload", kRouteMethodPost, &h2_buffered_forward, false, true));
+    conn.request_config = &config;
+    FakeH2Loop loop;
+    u8 response[512]{};
+    H2Dispatch<FakeH2Loop> dispatch{&loop, &conn, response, sizeof(response), 0, false};
+
+    h2_buffered_forward_calls = 0;
+    h2_dispatch_request(dispatch, 1, headers, 5, /*end_stream=*/true);
+
+    CHECK_EQ(h2_buffered_forward_calls, 0u);
+    CHECK_EQ(h2.pending_stream, 0u);
+    CHECK_EQ(h2.async_stream, 0u);
+    CHECK_GT(dispatch.resp_len, 0u);
+    Http2FrameHeader frame{};
+    REQUIRE(parse_frame_header(response, dispatch.resp_len, &frame) == ParseStatus::Complete);
+    hpack::DynamicTable dyn;
+    dyn.init(4096);
+    hpack::Header decoded[4];
+    u8 scratch[64];
+    u32 decoded_count = 0;
+    REQUIRE(hpack::decode_header_block(dyn,
+                                       response + kFrameHeaderSize,
+                                       frame.length,
+                                       scratch,
+                                       sizeof(scratch),
+                                       decoded,
+                                       static_cast<u32>(std::size(decoded)),
+                                       &decoded_count));
+    REQUIRE_GT(decoded_count, 0u);
+    CHECK(decoded[0].name.eq({":status", 7}));
+    CHECK(decoded[0].value.eq({"400", 3}));
+}
+
+TEST(h2_serving, buffered_forward_route_acknowledges_ows_wrapped_expect_continue) {
+    static constexpr char kExpect[] = " \t100-continue \t";
+    const hpack::Header headers[] = {{{":method", 7}, {"POST", 4}},
+                                     {{":path", 5}, {"/upload", 7}},
+                                     {{":scheme", 7}, {"https", 5}},
+                                     {{":authority", 10}, {"example", 7}},
+                                     {{"expect", 6}, {kExpect, sizeof(kExpect) - 1}},
+                                     {{"content-length", 14}, {"3", 1}}};
+    Http2Conn h2;
+    h2.init();
+    Connection conn;
+    conn.reset();
+    conn.h2 = &h2;
+    RouteConfig config;
+    REQUIRE(config.add_jit_handler("/upload", kRouteMethodPost, &h2_buffered_forward, false, true));
+    conn.request_config = &config;
+    FakeH2Loop loop;
+    u8 response[512]{};
+    H2Dispatch<FakeH2Loop> dispatch{&loop, &conn, response, sizeof(response), 0, false};
+
+    h2_dispatch_request(dispatch, 1, headers, 6, /*end_stream=*/false);
+    CHECK_EQ(h2.pending_stream, 1u);
+    REQUIRE_GT(dispatch.resp_len, 0u);
+    Http2FrameHeader frame{};
+    REQUIRE(parse_frame_header(response, dispatch.resp_len, &frame) == ParseStatus::Complete);
+    CHECK_EQ(frame.type, static_cast<u8>(Http2FrameType::Headers));
+    CHECK((frame.flags & http2_flag::kEndHeaders) != 0);
+    CHECK((frame.flags & http2_flag::kEndStream) == 0);
+    h2_clear_pending(h2);
+}
+
+TEST(h2_serving, buffered_forward_capability_preserves_absent_content_length_for_handler) {
+    Http2Conn h2;
+    h2.init();
+    Connection conn;
+    conn.reset();
+    conn.h2 = &h2;
+    FakeH2Loop loop;
+    u8 response[512]{};
+    H2Dispatch<FakeH2Loop> dispatch{&loop, &conn, response, sizeof(response), 0, false};
+    RouteConfig config;
+    RouteEntry route{};
+    route.action = RouteAction::JitHandler;
+    route.fn = &h2_observe_absent_content_length;
+    route.needs_req_body = false;
+    route.can_forward_buffered = true;
+
+    static constexpr char kRequest[] = "POST /upload HTTP/1.1\r\nhost: example\r\n\r\nabc";
+    static constexpr u32 kBodyLen = 3;
+    for (u32 i = 0; i < sizeof(kRequest) - 1; i++)
+        h2.pending_synth[i] = static_cast<u8>(kRequest[i]);
+    h2.pending_stream = 1;
+    h2.pending_body_start = sizeof(kRequest) - 1 - kBodyLen;
+    h2.pending_synth_len = sizeof(kRequest) - 1;
+    h2.pending_body_len = kBodyLen;
+    h2.pending_has_content_length = false;
+    h2.pending_buffer_body = true;
+    h2.pending_request_forwardable = true;
+    h2.pending_route_action = RouteAction::JitHandler;
+    h2.pending_route_config = &config;
+    h2.pending_route = &route;
+    h2.pending_jit_fn = route.fn;
+
+    h2_handler_saw_content_length = true;
+    h2_finish_body(dispatch, 1);
+    CHECK_FALSE(h2_handler_saw_content_length);
+    CHECK_GT(dispatch.resp_len, 0u);
 }
 
 TEST(h2_serving, bodyless_mutated_status_suppresses_dynamic_data) {
@@ -1572,7 +2023,7 @@ TEST(h2_serving, mutation_storage_is_released_after_serialization) {
 
 TEST(h2_serving, rejected_handler_outcomes_release_mutation_storage) {
     static constexpr u8 kRequest[] = "GET / HTTP/1.1\r\n\r\n";
-    const auto run = [&](jit::HandlerFn fn, bool occupy_async_slot) {
+    const auto run = [&](jit::HandlerFn fn, bool occupy_async_slot, bool request_forwardable) {
         Http2Conn h2;
         h2.init();
         if (occupy_async_slot) h2.async_stream = 3;
@@ -1585,14 +2036,41 @@ TEST(h2_serving, rejected_handler_outcomes_release_mutation_storage) {
         RouteEntry route{};
         route.fn = fn;
 
-        h2_invoke_emit(dispatch, 1, &route, nullptr, 0, nullptr, kRequest, sizeof(kRequest) - 1);
+        h2_invoke_emit(dispatch,
+                       1,
+                       &route,
+                       nullptr,
+                       0,
+                       nullptr,
+                       kRequest,
+                       sizeof(kRequest) - 1,
+                       request_forwardable);
 
         CHECK(conn.jit_ctx()->response_body_mutation_storage == nullptr);
         CHECK_GT(dispatch.resp_len, 0u);
     };
 
-    run(&h2_mutated_body_then_forward, false);
-    run(&h2_mutated_body_then_timer, true);
+    run(&h2_mutated_body_then_forward, false, false);
+    run(&h2_mutated_body_then_forward, true, true);
+    run(&h2_mutated_body_then_timer, true, false);
+}
+
+TEST(h2_serving, failed_response_serialization_rolls_back_encoder_state) {
+    Http2Conn h2;
+    h2.init();
+    Connection conn;
+    conn.reset();
+    conn.h2 = &h2;
+    FakeH2Loop loop;
+    u8 response[1]{};
+    H2Dispatch<FakeH2Loop> dispatch{&loop, &conn, response, sizeof(response), 0, false};
+    const hpack::Header header = {{"x-dynamic", 9}, {"inserted", 8}};
+    const auto before = h2.hpack_enc;
+
+    h2_emit_response(dispatch, 1, 200, &header, 1, nullptr, 0, /*allow_fallback=*/false);
+
+    CHECK(dispatch.overflow);
+    CHECK_EQ(__builtin_memcmp(&h2.hpack_enc, &before, sizeof(before)), 0);
 }
 
 TEST(h2_serving, deferred_route_params_copied_to_stable_storage) {
@@ -1641,6 +2119,8 @@ TEST(h2_serving, deferred_route_params_copied_to_stable_storage) {
     path_buf[8] = '9';
 
     REQUIRE(h2.pending_route_param_count == 1u);
+    CHECK(h2.pending_buffer_body);
+    CHECK_FALSE(h2.pending_request_forwardable);  // missing :scheme
     const H2RouteParam& sp = h2.pending_route_params[0];
     CHECK_EQ(sp.value_len, 2u);
     CHECK(sp.value != path_buf + 7);  // not aliasing the reusable matcher source
@@ -1736,7 +2216,8 @@ TEST(h2_serving, suspended_handler_context_is_snapshotted_and_rebased) {
     CHECK(parked_body.eq(Str{kBody, sizeof(kBody) - 1}));
 
     h2.async_stream = 1;
-    h2.async_kind = H2AsyncKind::Timer;
+    h2.async_kind = H2AsyncKind::Proxy;
+    h2.async_apply_response_mutations = true;
     h2_clear_async(h2);
     CHECK(parked->response_body_mutation_storage == nullptr);
     CHECK(parked->response_body_snapshot_storage == nullptr);
