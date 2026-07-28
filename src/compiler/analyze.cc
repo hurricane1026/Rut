@@ -17905,6 +17905,7 @@ static FrontendResult<u32> analyze_for_stmt(const AstStatement& stmt,
                     has_wildcard = true;
                 }
                 const AstStatement* arm_stmt = ast_arm.stmt;
+                u32 arm_source_local_count = 0;
                 FixedVec<HirLocal, HirRoute::kMaxLocals> arm_scoped_locals;
                 const HirLocal* arm_locals = route->locals.data;
                 u32 arm_local_count = route->locals.len;
@@ -17999,11 +18000,12 @@ static FrontendResult<u32> analyze_for_stmt(const AstStatement& stmt,
                                     return frontend_error(FrontendError::TooManyItems, inner.span);
                                 route->locals[li].name = {};
                             }
-                            if (arm.locals.len >= HirForLoopMatchArm::kMaxSourceLocals)
+                            if (arm_source_local_count >= HirForLoopMatchArm::kMaxSourceLocals)
                                 return frontend_error(FrontendError::TooManyItems, inner.span);
                             arm.local_guard_depth[arm.locals.len] = arm.guards.len;
                             if (!arm.locals.push(local))
                                 return frontend_error(FrontendError::TooManyItems, inner.span);
+                            arm_source_local_count++;
                             HirLocal hidden_local = local;
                             hidden_local.name = {};
                             route->locals[local_storage_index] = hidden_local;
@@ -18180,11 +18182,12 @@ static FrontendResult<u32> analyze_for_stmt(const AstStatement& stmt,
                                 auto init = make_guard_bound_init(route, bound.value(), inner.span);
                                 if (!init) return core::make_unexpected(init.error());
                                 local.init = init.value();
-                                if (arm.locals.len >= HirForLoopMatchArm::kMaxSourceLocals)
+                                if (arm_source_local_count >= HirForLoopMatchArm::kMaxSourceLocals)
                                     return frontend_error(FrontendError::TooManyItems, inner.span);
                                 arm.local_guard_depth[arm.locals.len] = arm.guards.len;
                                 if (!arm.locals.push(local))
                                     return frontend_error(FrontendError::TooManyItems, inner.span);
+                                arm_source_local_count++;
                                 auto inserted = insert_scoped_local(arm_scoped_locals.data,
                                                                     arm_scoped_locals.len,
                                                                     HirRoute::kMaxLocals,

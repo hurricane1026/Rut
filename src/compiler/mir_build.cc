@@ -3548,6 +3548,19 @@ FrontendResult<MirModule*> build_mir(const HirModule& module) {
                     return body_match_arm_entry_index(body_match.arms[body_match.arms.len - 1],
                                                       body_match.arms.len - 1);
                 };
+                auto body_match_pattern_fallthrough_target = [&](u32 arm_index) -> u32 {
+                    const u8 capture_group = body_match.arms[arm_index].capture_group;
+                    u32 next = arm_index + 1;
+                    while (capture_group != 0 && next < body_match.arms.len &&
+                           body_match.arms[next].capture_group == capture_group)
+                        next++;
+                    if (next >= body_match.arms.len)
+                        return body_match_arm_entry_index(body_match.arms[body_match.arms.len - 1],
+                                                          body_match.arms.len - 1);
+                    if (body_match.arms[next].is_wildcard)
+                        return body_match_arm_entry_index(body_match.arms[next], next);
+                    return body_match_extra_test_index[body_match_test_ordinal[next]];
+                };
                 auto set_body_match_arm_term = [&](MirBlock* out,
                                                    const HirForLoopMatchArm& arm,
                                                    u32 arm_index) -> FrontendResult<void> {
@@ -3612,7 +3625,9 @@ FrontendResult<MirModule*> build_mir(const HirModule& module) {
                         : arm.post_arm_guard_expr_index != 0xffffffffu
                             ? body_match_post_guard_index[ai]
                             : body_match_arm_body_index(body_match.arms[ai], ai);
-                    guard_block.term.else_block = body_match_fallthrough_target(ai);
+                    guard_block.term.else_block = arm.arm_guard_precedes_prelude
+                                                      ? body_match_pattern_fallthrough_target(ai)
+                                                      : body_match_fallthrough_target(ai);
                     if (!fn.blocks.push(guard_block))
                         return frontend_error(FrontendError::TooManyItems, fn.span);
                 }
@@ -4128,7 +4143,9 @@ FrontendResult<MirModule*> build_mir(const HirModule& module) {
                             : arm.post_arm_guard_expr_index != 0xffffffffu
                                 ? step.match_post_guard_index[ai]
                                 : step.match_case_index[ai];
-                        guard.term.else_block = pattern_fallthrough_target(ai);
+                        guard.term.else_block = arm.arm_guard_precedes_prelude
+                                                    ? pattern_fallthrough_target(ai)
+                                                    : fallthrough_target(ai);
                         if (!fn.blocks.push(guard))
                             return frontend_error(FrontendError::TooManyItems, fn.span);
                     }

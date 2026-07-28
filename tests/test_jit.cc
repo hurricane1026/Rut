@@ -1653,6 +1653,78 @@ route GET "/x" {
     rir.destroy();
 }
 
+TEST(jit, flattened_arm_guards_use_source_and_synthesized_fallthrough_targets) {
+    const auto src = R"rut(
+route GET "/source" {
+    for item in [1] {
+        match item {
+            1 if false => {
+                let captured = time.nowMicros()
+                match captured > 0 {
+                    true => return 201
+                    _ => return 202
+                }
+            }
+            _ => return 500
+        }
+    }
+    return 501
+}
+route GET "/synthesized" {
+    for item in [1] {
+        match item {
+            1 => match 2 {
+                1 => break
+                2 => return 202
+                _ => break
+            }
+            _ => return 500
+        }
+    }
+    return 501
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    REQUIRE(lower_to_rir(mir.value(), rir));
+    auto cg = codegen(rir.module);
+    REQUIRE(cg.ok);
+    JitEngine engine;
+    REQUIRE(engine.init());
+    REQUIRE(engine.compile(cg.mod, cg.ctx));
+    auto source = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
+    auto synthesized = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_1"));
+    REQUIRE(source != nullptr);
+    REQUIRE(synthesized != nullptr);
+
+    TestHandlerCtxFrame source_frame{};
+    const auto source_result = invoke_jit_handler(source,
+                                                  nullptr,
+                                                  source_frame.ctx,
+                                                  reinterpret_cast<const u8*>(kGetApiRequest),
+                                                  sizeof(kGetApiRequest) - 1,
+                                                  nullptr);
+    CHECK_EQ(source_result.status_code, 500u);
+
+    TestHandlerCtxFrame synthesized_frame{};
+    const auto synthesized_result = invoke_jit_handler(synthesized,
+                                                       nullptr,
+                                                       synthesized_frame.ctx,
+                                                       reinterpret_cast<const u8*>(kGetApiRequest),
+                                                       sizeof(kGetApiRequest) - 1,
+                                                       nullptr);
+    CHECK_EQ(synthesized_result.status_code, 202u);
+    engine.shutdown();
+    rir.destroy();
+}
+
 TEST(jit, bounded_static_for_guard_break_and_continue_take_distinct_targets) {
     const auto src = R"rut(
 route GET "/continue" {
