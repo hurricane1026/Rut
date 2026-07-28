@@ -4086,17 +4086,13 @@ static FrontendResult<void> build_reusable_json_plan(
     u32 depth = 0);
 static bool hir_expr_reads_wait_result(const HirExpr& expr);
 static bool hir_expr_reads_response_field(const HirExpr& expr);
-static bool route_reads_response_field(const HirRoute& route);
+static bool route_reads_response_field(const HirRoute& route, const HirModule& mod);
 static bool is_response_effect(HirExprKind kind);
 static bool function_has_response_effects(const HirFunction& fn);
 static bool hir_expr_reads_wait_result_with_locals(const HirExpr& expr,
                                                    const HirLocal* locals,
                                                    u32 local_count,
                                                    u32 depth = 0);
-static bool is_static_for_iter_expr(const HirExpr& expr,
-                                    const HirLocal* locals,
-                                    u32 local_count,
-                                    u32 depth = 0);
 static FrontendResult<HirExpr> analyze_array_iter_expr(const AstExpr& expr,
                                                        HirRoute* route,
                                                        const HirModule& mod,
@@ -4162,7 +4158,8 @@ static FrontendResult<void> analyze_guard_fail_body(const AstStatement& stmt,
                                                     const HirModule& mod,
                                                     const HirLocal* locals,
                                                     u32 local_count,
-                                                    const MatchPayloadBinding* binding);
+                                                    const MatchPayloadBinding* binding,
+                                                    bool inside_static_for = false);
 static FrontendResult<HirExpr> analyze_guard_cond(const AstExpr& expr,
                                                   HirRoute* route,
                                                   const HirModule& mod,
@@ -5896,7 +5893,7 @@ static FrontendResult<HirExpr> instantiate_function_expr(const HirExpr& expr,
                                          effect_kind == HirExprKind::RespSetStatus ||
                                          effect_kind == HirExprKind::RespSetBody;
             if (!materialize_local && !response_effect) continue;
-            if (response_effect && route_reads_response_field(*route))
+            if (response_effect && route_reads_response_field(*route, mod))
                 return frontend_error(
                     FrontendError::UnsupportedSyntax,
                     expr.span,
@@ -6175,7 +6172,7 @@ static FrontendResult<void> instantiate_function_respond_guards(
     return {};
 }
 
-static bool route_reads_response_field(const HirRoute& route);
+static bool route_reads_response_field(const HirRoute& route, const HirModule& mod);
 
 static bool function_has_response_effects(const HirFunction& fn) {
     for (u32 ei = 0; ei < fn.exprs.len; ei++) {
@@ -6198,6 +6195,42 @@ static bool hir_expr_has_deferred_protocol_call(const HirExpr& expr) {
     for (u32 fi = 0; fi < expr.field_inits.len; fi++)
         if (expr.field_inits[fi].value != nullptr &&
             hir_expr_has_deferred_protocol_call(*expr.field_inits[fi].value))
+            return true;
+    return false;
+}
+
+static bool static_for_expr_repeats_runtime_work(const AstExpr& expr) {
+    if (expr.kind == AstExprKind::Call || expr.kind == AstExprKind::MethodCall ||
+        expr.kind == AstExprKind::Pipe || expr.kind == AstExprKind::Wait)
+        return true;
+    if (expr.lhs != nullptr && static_for_expr_repeats_runtime_work(*expr.lhs)) return true;
+    if (expr.rhs != nullptr && static_for_expr_repeats_runtime_work(*expr.rhs)) return true;
+    for (u32 i = 0; i < expr.args.len; i++)
+        if (expr.args[i] != nullptr && static_for_expr_repeats_runtime_work(*expr.args[i]))
+            return true;
+    for (u32 i = 0; i < expr.field_inits.len; i++)
+        if (expr.field_inits[i].value != nullptr &&
+            static_for_expr_repeats_runtime_work(*expr.field_inits[i].value))
+            return true;
+    return false;
+}
+
+static bool static_for_expr_reads_request_state(const AstExpr& expr) {
+    if (expr.kind == AstExprKind::ReqHeader || expr.kind == AstExprKind::ReqParam ||
+        expr.kind == AstExprKind::ReqCookie || expr.kind == AstExprKind::ReqQuery ||
+        expr.kind == AstExprKind::ReqQueryString)
+        return true;
+    if (expr.kind == AstExprKind::Field && expr.lhs != nullptr &&
+        expr.lhs->kind == AstExprKind::Ident && expr.lhs->name.eq(lit_str("req")))
+        return true;
+    if (expr.lhs != nullptr && static_for_expr_reads_request_state(*expr.lhs)) return true;
+    if (expr.rhs != nullptr && static_for_expr_reads_request_state(*expr.rhs)) return true;
+    for (u32 i = 0; i < expr.args.len; i++)
+        if (expr.args[i] != nullptr && static_for_expr_reads_request_state(*expr.args[i]))
+            return true;
+    for (u32 i = 0; i < expr.field_inits.len; i++)
+        if (expr.field_inits[i].value != nullptr &&
+            static_for_expr_reads_request_state(*expr.field_inits[i].value))
             return true;
     return false;
 }
@@ -6288,7 +6321,7 @@ static FrontendResult<void> instantiate_function_response_effects(
                     lit_str("a helper-local Response builder cannot mutate caller Response state"));
         }
     }
-    if (route_reads_response_field(*route))
+    if (route_reads_response_field(*route, mod))
         return frontend_error(
             FrontendError::UnsupportedSyntax,
             call_span,
@@ -10048,18 +10081,18 @@ static FrontendResult<HirExpr> analyze_expr(const AstExpr& expr,
     return analyze_expr_impl(expr, route, mod, locals, local_count, binding, false);
 }
 
-static bool is_static_for_iter_expr(const HirExpr& expr,
-                                    const HirLocal* locals,
-                                    u32 local_count,
-                                    u32 depth) {
-    if (depth > local_count + HirRoute::kMaxLocals) return false;
-    if (expr.kind == HirExprKind::ArrayLit) return true;
-    if (expr.kind != HirExprKind::LocalRef) return false;
+static const HirExpr* static_for_iter_array_expr(const HirExpr& expr,
+                                                 const HirLocal* locals,
+                                                 u32 local_count,
+                                                 u32 depth) {
+    if (depth > local_count + HirRoute::kMaxLocals) return nullptr;
+    if (expr.kind == HirExprKind::ArrayLit) return &expr;
+    if (expr.kind != HirExprKind::LocalRef) return nullptr;
     for (u32 i = 0; i < local_count; i++) {
         if (locals[i].ref_index == expr.local_index)
-            return is_static_for_iter_expr(locals[i].init, locals, local_count, depth + 1);
+            return static_for_iter_array_expr(locals[i].init, locals, local_count, depth + 1);
     }
-    return false;
+    return nullptr;
 }
 
 static bool static_for_iter_len(
@@ -11587,7 +11620,7 @@ static FrontendResult<HirExpr> analyze_call_expr(const AstExpr& expr,
         const bool materialize_local = materialized_ref != 0xffffffffu;
         const bool response_effect = is_response_effect(fn.exprs[ei].kind);
         if (!materialize_local && !response_effect) continue;
-        if (response_effect && route_reads_response_field(*route))
+        if (response_effect && route_reads_response_field(*route, mod))
             return frontend_error(
                 FrontendError::UnsupportedSyntax,
                 expr.span,
@@ -11844,6 +11877,9 @@ static FrontendResult<HirTerminator> analyze_response_local_term(const AstStatem
     term.span = stmt.span;
     term.status_code = static_cast<i32>(response->init.int_value);
     term.commit_response_mutations = response->init.bool_value;
+    // Preserve builder identity for nested/loop terminator validation while
+    // keeping the serialized status literal in the terminator.
+    term.local_ref_index = response->ref_index;
     for (u32 fi = 0; fi < response->init.field_inits.len; fi++) {
         const auto& field = response->init.field_inits[fi];
         if (field.value == nullptr || field.value->kind != HirExprKind::StrLit)
@@ -12330,16 +12366,51 @@ static FrontendResult<HirTerminator> analyze_term(const AstStatement& stmt,
                                                   HirRoute* route = nullptr,
                                                   const HirLocal* locals = nullptr,
                                                   u32 local_count = 0,
-                                                  const MatchPayloadBinding* binding = nullptr) {
+                                                  const MatchPayloadBinding* binding = nullptr,
+                                                  bool allow_response_local = false) {
     HirTerminator term{};
     term.span = stmt.span;
     if (stmt.kind == AstStmtKind::ReturnStatus || stmt.kind == AstStmtKind::RespondStatus) {
-        if (stmt.returns_response_local)
+        if (stmt.returns_response_local) {
+            for (u32 li = local_count; li > 0; li--) {
+                const auto& local = locals[li - 1];
+                if (!local.name.eq(stmt.name)) continue;
+                if (allow_response_local && local.init.kind == HirExprKind::ResponseInit)
+                    return analyze_response_local_term(stmt, locals, local_count);
+                if (local.type == HirTypeKind::I32 && !local.may_nil && !local.may_error) {
+                    const HirExpr* status = &local.init;
+                    for (u32 depth = 0; depth <= local_count; depth++) {
+                        if (status->kind != HirExprKind::LocalRef ||
+                            status->local_index == local.ref_index)
+                            break;
+                        const HirLocal* source = nullptr;
+                        for (u32 si = local_count; si > 0; si--)
+                            if (locals[si - 1].ref_index == status->local_index) {
+                                source = &locals[si - 1];
+                                break;
+                            }
+                        if (source == nullptr) break;
+                        status = &source->init;
+                    }
+                    if (status->kind == HirExprKind::IntLit) {
+                        if (status->int_value < 100 || status->int_value > 599)
+                            return frontend_error(FrontendError::InvalidStatusCode, stmt.span);
+                    } else if (status->kind != HirExprKind::LocalRef) {
+                        return frontend_error(FrontendError::InvalidStatusCode, stmt.span);
+                    }
+                    term.kind = HirTerminatorKind::ReturnStatus;
+                    term.source_kind = HirTerminatorSourceKind::LocalRef;
+                    term.local_ref_index = local.ref_index;
+                    return term;
+                }
+                break;
+            }
             return frontend_error(
                 FrontendError::UnsupportedSyntax,
                 stmt.span,
                 lit_str("returning a Response local is currently supported only as the direct "
                         "route terminator"));
+        }
         if (stmt.status_code < 100 || stmt.status_code > 599)
             return frontend_error(FrontendError::InvalidStatusCode, stmt.span);
         term.kind = HirTerminatorKind::ReturnStatus;
@@ -12660,8 +12731,22 @@ static FrontendResult<HirForLoopBranch> analyze_for_branch(
         branch.kind = HirForLoopBranch::Kind::Continue;
         return branch;
     }
-    auto term = analyze_term(stmt, mod, route, locals, local_count, binding);
-    if (!term) return core::make_unexpected(term.error());
+    const u32 route_local_count = route->locals.len;
+    auto term = analyze_term(stmt, mod, route, locals, local_count, binding, true);
+    if (!term) {
+        route->locals.len = route_local_count;
+        return core::make_unexpected(term.error());
+    }
+    for (u32 li = route_local_count; li < route->locals.len; li++) {
+        if (!branch.locals.push(route->locals[li])) {
+            route->locals.len = route_local_count;
+            return frontend_error(FrontendError::TooManyItems, stmt.span);
+        }
+    }
+    // These locals are needed only when this branch is selected. Retaining
+    // them on the route would eagerly materialize helper carriers even when a
+    // sibling branch wins.
+    route->locals.len = route_local_count;
     branch.kind = HirForLoopBranch::Kind::Term;
     branch.term = term.value();
     return branch;
@@ -12853,7 +12938,8 @@ static FrontendResult<void> analyze_guard_match_arms(
     u32 local_count,
     FixedVec<HirGuardMatchArm, HirModule::kMaxGuardMatchArms>* guard_match_arms,
     HirGuard* guard,
-    const MatchPayloadBinding* binding = nullptr) {
+    const MatchPayloadBinding* binding = nullptr,
+    bool inside_static_for = false) {
     bool seen_wildcard = false;
     guard->fail_match_start = guard_match_arms->len;
     guard->fail_match_count = 0;
@@ -12906,8 +12992,19 @@ static FrontendResult<void> analyze_guard_match_arms(
         } else {
             seen_wildcard = true;
         }
-        auto term = analyze_term(*arm.stmt, mod, route, locals, local_count, binding);
+        const u32 term_local_start = route->locals.len;
+        auto term =
+            analyze_term(*arm.stmt, mod, route, locals, local_count, binding, inside_static_for);
         if (!term) return core::make_unexpected(term.error());
+        if (inside_static_for) {
+            for (u32 li = term_local_start; li < route->locals.len; li++) {
+                if (!hir_arm.locals.push(route->locals[li])) {
+                    route->locals.len = term_local_start;
+                    return frontend_error(FrontendError::TooManyItems, arm.span);
+                }
+            }
+            route->locals.len = term_local_start;
+        }
         hir_arm.direct_term = term.value();
         if (!guard_match_arms->push(hir_arm))
             return frontend_error(FrontendError::TooManyItems, arm.span);
@@ -13585,7 +13682,8 @@ static FrontendResult<void> analyze_guard_fail_body(const AstStatement& stmt,
                                                     const HirModule& mod,
                                                     const HirLocal* locals,
                                                     u32 local_count,
-                                                    const MatchPayloadBinding* binding) {
+                                                    const MatchPayloadBinding* binding,
+                                                    bool inside_static_for) {
     if (stmt.kind == AstStmtKind::Block) {
         FixedVec<HirLocal, HirRoute::kMaxLocals> scoped_locals;
         for (u32 i = 0; i < local_count; i++) {
@@ -13597,6 +13695,15 @@ static FrontendResult<void> analyze_guard_fail_body(const AstStatement& stmt,
             const bool is_last = si + 1 == stmt.block_stmts.len;
             if (inner.kind == AstStmtKind::Let) {
                 if (is_last) return frontend_error(FrontendError::UnsupportedSyntax, inner.span);
+                if (inside_static_for && inner.expr.kind != AstExprKind::Ident &&
+                    inner.expr.kind != AstExprKind::BoolLit &&
+                    inner.expr.kind != AstExprKind::IntLit &&
+                    inner.expr.kind != AstExprKind::StrLit)
+                    return frontend_error(
+                        FrontendError::UnsupportedSyntax,
+                        inner.expr.span,
+                        lit_str("static for-loop guard-failure locals must alias an existing "
+                                "value or use a literal"));
                 HirLocal local{};
                 local.span = inner.span;
                 local.name = inner.name;
@@ -13661,8 +13768,14 @@ static FrontendResult<void> analyze_guard_fail_body(const AstStatement& stmt,
                 continue;
             }
             if (!is_last) return frontend_error(FrontendError::UnsupportedSyntax, inner.span);
-            return analyze_guard_fail_body(
-                inner, body, route, mod, scoped_locals.data, scoped_locals.len, binding);
+            return analyze_guard_fail_body(inner,
+                                           body,
+                                           route,
+                                           mod,
+                                           scoped_locals.data,
+                                           scoped_locals.len,
+                                           binding,
+                                           inside_static_for);
         }
         return frontend_error(FrontendError::UnsupportedSyntax, stmt.span);
     }
@@ -13679,6 +13792,7 @@ static FrontendResult<void> analyze_guard_fail_body(const AstStatement& stmt,
                 return frontend_error(FrontendError::TooManyItems, stmt.span);
         }
         const u32 saved_locals = route->locals.len;
+        u32 condition_carrier_end = saved_locals;
         bool folds_false = false;
         if (stmt.bind_value) {
             auto cond = analyze_guard_cond(stmt.expr,
@@ -13691,6 +13805,7 @@ static FrontendResult<void> analyze_guard_fail_body(const AstStatement& stmt,
                                            /*is_match_guard=*/false);
             if (!cond) return core::make_unexpected(cond.error());
             cond_expr = cond.value();
+            condition_carrier_end = route->locals.len;
             folds_false = cond_expr.kind == HirExprKind::BoolLit && !cond_expr.bool_value;
             HirLocal then_local{};
             auto appended = append_if_let_then_local(stmt,
@@ -13713,21 +13828,71 @@ static FrontendResult<void> analyze_guard_fail_body(const AstStatement& stmt,
             if (cond->type != HirTypeKind::Bool)
                 return frontend_error(FrontendError::UnsupportedSyntax, stmt.expr.span);
             cond_expr = cond.value();
+            condition_carrier_end = route->locals.len;
+        }
+        for (u32 li = saved_locals; li < condition_carrier_end; li++) {
+            if (!body->locals.push(route->locals[li]))
+                return frontend_error(FrontendError::TooManyItems, stmt.expr.span);
+            route->locals[li].name = {};
         }
         body->cond = cond_expr;
-        auto then_term =
-            analyze_term(*stmt.then_stmt, mod, route, then_locals.data, then_locals.len, binding);
+        body->shared_local_count = body->locals.len;
+        const u32 then_term_local_start = route->locals.len;
+        auto then_term = analyze_term(*stmt.then_stmt,
+                                      mod,
+                                      route,
+                                      then_locals.data,
+                                      then_locals.len,
+                                      binding,
+                                      inside_static_for);
         if (!then_term) return core::make_unexpected(then_term.error());
+        if (inside_static_for) {
+            body->then_term_local_start = body->locals.len;
+            for (u32 li = then_term_local_start; li < route->locals.len; li++) {
+                if (!body->locals.push(route->locals[li])) {
+                    route->locals.len = then_term_local_start;
+                    return frontend_error(FrontendError::TooManyItems, stmt.then_stmt->span);
+                }
+            }
+            body->then_term_local_count = body->locals.len - body->then_term_local_start;
+            route->locals.len = then_term_local_start;
+        }
         if (folds_false) route->locals.len = saved_locals;
-        auto else_term = analyze_term(*stmt.else_stmt, mod, route, locals, local_count, binding);
+        const u32 else_term_local_start = route->locals.len;
+        auto else_term = analyze_term(
+            *stmt.else_stmt, mod, route, locals, local_count, binding, inside_static_for);
         if (!else_term) return core::make_unexpected(else_term.error());
+        if (inside_static_for) {
+            body->else_term_local_start = body->locals.len;
+            for (u32 li = else_term_local_start; li < route->locals.len; li++) {
+                if (!body->locals.push(route->locals[li])) {
+                    route->locals.len = else_term_local_start;
+                    return frontend_error(FrontendError::TooManyItems, stmt.else_stmt->span);
+                }
+            }
+            body->else_term_local_count = body->locals.len - body->else_term_local_start;
+            route->locals.len = else_term_local_start;
+        }
         body->then_term = folds_false ? else_term.value() : then_term.value();
         body->else_term = else_term.value();
         return {};
     }
     body->body_kind = HirGuardBody::BodyKind::Direct;
-    auto term = analyze_term(stmt, mod, route, locals, local_count, binding);
+    body->shared_local_count = body->locals.len;
+    const u32 term_local_start = route->locals.len;
+    auto term = analyze_term(stmt, mod, route, locals, local_count, binding, inside_static_for);
     if (!term) return core::make_unexpected(term.error());
+    if (inside_static_for) {
+        body->direct_term_local_start = body->locals.len;
+        for (u32 li = term_local_start; li < route->locals.len; li++) {
+            if (!body->locals.push(route->locals[li])) {
+                route->locals.len = term_local_start;
+                return frontend_error(FrontendError::TooManyItems, stmt.span);
+            }
+        }
+        body->direct_term_local_count = body->locals.len - body->direct_term_local_start;
+        route->locals.len = term_local_start;
+    }
     body->direct_term = term.value();
     return {};
 }
@@ -13844,31 +14009,87 @@ static bool hir_expr_conditionally_reads_response_body(const HirExpr& expr) {
     return false;
 }
 
-static bool route_control_conditionally_reads_response_body(const HirRoute& route) {
+using ResponseReadPredicate = bool (*)(const HirExpr&);
+
+static bool guard_failure_reads_response(const HirGuard& guard,
+                                         const HirModule& mod,
+                                         ResponseReadPredicate reads) {
+    if (guard.fail_kind == HirGuard::FailKind::Match) {
+        if (reads(guard.fail_match_expr)) return true;
+        if (guard.fail_match_start > mod.guard_match_arms.len ||
+            guard.fail_match_count > mod.guard_match_arms.len - guard.fail_match_start)
+            return false;
+        for (u32 ai = 0; ai < guard.fail_match_count; ai++) {
+            const auto& arm = mod.guard_match_arms[guard.fail_match_start + ai];
+            if (reads(arm.pattern)) return true;
+            for (u32 li = 0; li < arm.locals.len; li++)
+                if (reads(arm.locals[li].init)) return true;
+        }
+        return false;
+    }
+    if (guard.fail_kind != HirGuard::FailKind::Body && guard.fail_kind != HirGuard::FailKind::Term)
+        return false;
+    for (u32 li = 0; li < guard.fail_body.locals.len; li++)
+        if (reads(guard.fail_body.locals[li].init)) return true;
+    return guard.fail_kind == HirGuard::FailKind::Body &&
+           guard.fail_body.body_kind == HirGuardBody::BodyKind::If && reads(guard.fail_body.cond);
+}
+
+static bool hir_for_loop_reads_response(const HirForLoop& loop,
+                                        const HirModule& mod,
+                                        const HirRoute& route,
+                                        ResponseReadPredicate reads);
+
+static bool terminator_reads_response(const HirTerminator& term,
+                                      const HirRoute& route,
+                                      ResponseReadPredicate reads) {
+    for (u32 i = 0; i < term.json_value_expr_indices.len; i++) {
+        const u32 expr_index = term.json_value_expr_indices[i];
+        if (expr_index < route.exprs.len && reads(route.exprs[expr_index])) return true;
+    }
+    return term.json_body_expr_index < route.exprs.len &&
+           reads(route.exprs[term.json_body_expr_index]);
+}
+
+static bool guard_failure_terminators_read_response(const HirGuard& guard,
+                                                    const HirModule& mod,
+                                                    const HirRoute& route,
+                                                    ResponseReadPredicate reads) {
+    if (terminator_reads_response(guard.fail_term, route, reads) ||
+        terminator_reads_response(guard.fail_body.then_term, route, reads) ||
+        terminator_reads_response(guard.fail_body.else_term, route, reads) ||
+        terminator_reads_response(guard.fail_body.direct_term, route, reads))
+        return true;
+    for (u32 ai = 0; ai < guard.fail_match_count; ai++) {
+        const u32 arm_index = guard.fail_match_start + ai;
+        if (arm_index < mod.guard_match_arms.len &&
+            terminator_reads_response(mod.guard_match_arms[arm_index].direct_term, route, reads))
+            return true;
+    }
+    return false;
+}
+
+static bool route_control_conditionally_reads_response_body(const HirRoute& route,
+                                                            const HirModule& mod) {
     // Control expressions may point into the route expression arena through
     // intermediate normalization nodes. Scan the arena as well as the rooted
     // guard/control trees so those embedded IfElse values cannot escape the
     // eager-lowering safety check.
     for (u32 ei = 0; ei < route.exprs.len; ei++)
         if (hir_expr_conditionally_reads_response_body(route.exprs[ei])) return true;
-    const auto guard_conditionally_reads_body = [](const HirGuard& guard) {
-        if (hir_expr_conditionally_reads_response_body(guard.cond) ||
-            (guard.fail_kind == HirGuard::FailKind::Match &&
-             hir_expr_conditionally_reads_response_body(guard.fail_match_expr)) ||
-            (guard.fail_kind == HirGuard::FailKind::Body &&
-             guard.fail_body.body_kind == HirGuardBody::BodyKind::If &&
-             hir_expr_conditionally_reads_response_body(guard.fail_body.cond)))
-            return true;
-        if (guard.fail_kind != HirGuard::FailKind::Body) return false;
-        for (u32 li = 0; li < guard.fail_body.locals.len; li++)
-            if (hir_expr_conditionally_reads_response_body(guard.fail_body.locals[li].init))
-                return true;
-        return false;
+    const auto guard_conditionally_reads_body = [&mod](const HirGuard& guard) {
+        return hir_expr_conditionally_reads_response_body(guard.cond) ||
+               guard_failure_reads_response(
+                   guard, mod, &hir_expr_conditionally_reads_response_body);
     };
     for (u32 gi = 0; gi < route.guards.len; gi++) {
         const auto& guard = route.guards[gi];
         if (guard_conditionally_reads_body(guard)) return true;
     }
+    for (u32 fi = 0; fi < route.for_loops.len; fi++)
+        if (hir_for_loop_reads_response(
+                route.for_loops[fi], mod, route, &hir_expr_conditionally_reads_response_body))
+            return true;
     const auto& control = route.control;
     if (control.kind == HirControlKind::If &&
         hir_expr_conditionally_reads_response_body(control.cond))
@@ -13888,26 +14109,32 @@ static bool route_control_conditionally_reads_response_body(const HirRoute& rout
     return false;
 }
 
-using ResponseReadPredicate = bool (*)(const HirExpr&);
-
-static bool guard_failure_reads_response(const HirGuard& guard, ResponseReadPredicate reads) {
-    if (guard.fail_kind == HirGuard::FailKind::Match && reads(guard.fail_match_expr)) return true;
-    if (guard.fail_kind != HirGuard::FailKind::Body) return false;
-    for (u32 li = 0; li < guard.fail_body.locals.len; li++)
-        if (reads(guard.fail_body.locals[li].init)) return true;
-    return guard.fail_body.body_kind == HirGuardBody::BodyKind::If && reads(guard.fail_body.cond);
-}
-
-static bool hir_for_loop_reads_response(const HirForLoop& loop, ResponseReadPredicate reads) {
+static bool hir_for_loop_reads_response(const HirForLoop& loop,
+                                        const HirModule& mod,
+                                        const HirRoute& route,
+                                        ResponseReadPredicate reads) {
     if (reads(loop.iter_expr)) return true;
     const auto& body = loop.body;
+    const auto branch_reads = [&route, reads](const HirForLoopBranch& branch) {
+        for (u32 li = 0; li < branch.locals.len; li++)
+            if (reads(branch.locals[li].init)) return true;
+        return branch.kind == HirForLoopBranch::Kind::Term &&
+               terminator_reads_response(branch.term, route, reads);
+    };
     for (u32 li = 0; li < body.locals.len; li++)
         if (reads(body.locals[li].init)) return true;
+    for (u32 li = 0; li < body.term_locals.len; li++)
+        if (reads(body.term_locals[li].init)) return true;
     for (u32 gi = 0; gi < body.guards.len; gi++)
-        if (reads(body.guards[gi].cond) || guard_failure_reads_response(body.guards[gi], reads))
+        if (reads(body.guards[gi].cond) ||
+            guard_failure_reads_response(body.guards[gi], mod, reads) ||
+            guard_failure_terminators_read_response(body.guards[gi], mod, route, reads))
             return true;
-    for (u32 ii = 0; ii < body.ifs.len; ii++)
-        if (reads(body.ifs[ii].cond)) return true;
+    for (u32 ii = 0; ii < body.ifs.len; ii++) {
+        if (reads(body.ifs[ii].cond) || branch_reads(body.ifs[ii].then_branch) ||
+            branch_reads(body.ifs[ii].else_branch))
+            return true;
+    }
     for (u32 mi = 0; mi < body.matches.len; mi++) {
         const auto& match = body.matches[mi];
         if (reads(match.match_expr)) return true;
@@ -13919,20 +14146,27 @@ static bool hir_for_loop_reads_response(const HirForLoop& loop, ResponseReadPred
                 if (reads(arm.locals[li].init)) return true;
             for (u32 gi = 0; gi < arm.guards.len; gi++)
                 if (reads(arm.guards[gi].cond) ||
-                    guard_failure_reads_response(arm.guards[gi], reads))
+                    guard_failure_reads_response(arm.guards[gi], mod, reads) ||
+                    guard_failure_terminators_read_response(arm.guards[gi], mod, route, reads))
                     return true;
+            if (branch_reads(arm.then_branch) || branch_reads(arm.else_branch) ||
+                branch_reads(arm.direct_branch))
+                return true;
         }
     }
     return false;
 }
 
-static bool route_reads_response(const HirRoute& route, ResponseReadPredicate reads) {
+static bool route_reads_response(const HirRoute& route,
+                                 const HirModule& mod,
+                                 ResponseReadPredicate reads) {
     for (u32 gi = 0; gi < route.guards.len; gi++) {
-        if (reads(route.guards[gi].cond) || guard_failure_reads_response(route.guards[gi], reads))
+        if (reads(route.guards[gi].cond) ||
+            guard_failure_reads_response(route.guards[gi], mod, reads))
             return true;
     }
     for (u32 fi = 0; fi < route.for_loops.len; fi++)
-        if (hir_for_loop_reads_response(route.for_loops[fi], reads)) return true;
+        if (hir_for_loop_reads_response(route.for_loops[fi], mod, route, reads)) return true;
     const auto& control = route.control;
     if (control.kind == HirControlKind::If) return reads(control.cond);
     if (control.kind != HirControlKind::Match) return false;
@@ -13943,18 +14177,19 @@ static bool route_reads_response(const HirRoute& route, ResponseReadPredicate re
             (arm.body_kind == HirMatchArm::BodyKind::If && reads(arm.cond)))
             return true;
         for (u32 gi = 0; gi < arm.guards.len; gi++)
-            if (reads(arm.guards[gi].cond) || guard_failure_reads_response(arm.guards[gi], reads))
+            if (reads(arm.guards[gi].cond) ||
+                guard_failure_reads_response(arm.guards[gi], mod, reads))
                 return true;
     }
     return false;
 }
 
-static bool route_reads_response_field(const HirRoute& route) {
-    return route_reads_response(route, &hir_expr_reads_response_field);
+static bool route_reads_response_field(const HirRoute& route, const HirModule& mod) {
+    return route_reads_response(route, mod, &hir_expr_reads_response_field);
 }
 
-static bool route_reads_response_header(const HirRoute& route) {
-    return route_reads_response(route, &hir_expr_reads_response_header);
+static bool route_reads_response_header(const HirRoute& route, const HirModule& mod) {
+    return route_reads_response(route, mod, &hir_expr_reads_response_header);
 }
 
 static FrontendResult<void> analyze_control_stmt(const AstStatement& stmt,
@@ -14894,10 +15129,18 @@ static FrontendResult<void> analyze_control_stmt(const AstStatement& stmt,
     route->control.kind = HirControlKind::Direct;
     if ((stmt.kind == AstStmtKind::ReturnStatus || stmt.kind == AstStmtKind::RespondStatus) &&
         stmt.returns_response_local) {
-        auto term = analyze_response_local_term(stmt, route->locals.data, route->locals.len);
-        if (!term) return core::make_unexpected(term.error());
-        route->control.direct_term = term.value();
-        return {};
+        for (u32 li = route->locals.len; li > 0; li--) {
+            const auto& local = route->locals[li - 1];
+            if (!local.name.eq(stmt.name)) continue;
+            if (local.init.kind == HirExprKind::ResponseInit) {
+                auto term =
+                    analyze_response_local_term(stmt, route->locals.data, route->locals.len);
+                if (!term) return core::make_unexpected(term.error());
+                route->control.direct_term = term.value();
+                return {};
+            }
+            break;
+        }
     }
     auto term = analyze_term(stmt, mod, route, locals, local_count, binding);
     if (!term) return core::make_unexpected(term.error());
@@ -16662,11 +16905,20 @@ static FrontendResult<u32> analyze_for_stmt(const AstStatement& stmt,
         return frontend_error(FrontendError::UnsupportedSyntax,
                               stmt.expr.span,
                               lit_str("static for-loop iterator must be an array"));
-    if (!is_static_for_iter_expr(iter.value(), route->locals.data, route->locals.len, 0))
+    const HirExpr* iter_array =
+        static_for_iter_array_expr(iter.value(), route->locals.data, route->locals.len, 0);
+    if (iter_array == nullptr)
         return frontend_error(
             FrontendError::UnsupportedSyntax,
             stmt.expr.span,
             lit_str("static for-loop iterator must be a compile-time array literal or alias"));
+    for (u32 ai = 0; ai < iter_array->args.len; ai++)
+        if (iter_array->args[ai] != nullptr && iter_array->args[ai]->may_error)
+            return frontend_error(
+                FrontendError::UnsupportedSyntax,
+                iter_array->args[ai]->span,
+                lit_str("runtime-fallible inline elements are not supported in a static "
+                        "for-loop iterator"));
 
     const auto& iter_shape = mod.type_shapes[iter->shape_index];
     if (iter_shape.array_elem_shape_index >= mod.type_shapes.len)
@@ -16737,6 +16989,18 @@ static FrontendResult<u32> analyze_for_stmt(const AstStatement& stmt,
     if (!route->for_loops.push(fl)) return frontend_error(FrontendError::TooManyItems, stmt.span);
     HirForLoop& loop = route->for_loops[for_index];
 
+    struct RestoreLoopEffectFlags {
+        HirRoute* route;
+        bool respond;
+        bool response;
+        ~RestoreLoopEffectFlags() {
+            route->allow_respond_effects = respond;
+            route->allow_response_effects = response;
+        }
+    } restore_flags{route, route->allow_respond_effects, route->allow_response_effects};
+    route->allow_respond_effects = false;
+    route->allow_response_effects = false;
+
     const AstStatement* body = stmt.then_stmt;
     const u32 body_item_count = body->kind == AstStmtKind::Block ? body->block_stmts.len : 1u;
     for (u32 bi = 0; bi < body_item_count; bi++) {
@@ -16777,10 +17041,21 @@ static FrontendResult<u32> analyze_for_stmt(const AstStatement& stmt,
                     return true;
                 if (future.else_stmt != nullptr && self(self, *future.else_stmt, target_name))
                     return true;
-                for (u32 si = 0; si < future.block_stmts.len; si++)
-                    if (future.block_stmts[si] != nullptr &&
-                        self(self, *future.block_stmts[si], target_name))
-                        return true;
+                FixedVec<Str, HirRoute::kMaxLocals> aliases;
+                if (!aliases.push(target_name)) return false;
+                for (u32 si = 0; si < future.block_stmts.len; si++) {
+                    const AstStatement* child = future.block_stmts[si];
+                    if (child == nullptr) continue;
+                    for (u32 ai = 0; ai < aliases.len; ai++)
+                        if (self(self, *child, aliases[ai])) return true;
+                    if (child->kind != AstStmtKind::Let || child->expr.kind != AstExprKind::Ident)
+                        continue;
+                    for (u32 ai = 0; ai < aliases.len; ai++) {
+                        if (!child->expr.name.eq(aliases[ai])) continue;
+                        if (!aliases.push(child->name)) return false;
+                        break;
+                    }
+                }
                 for (u32 mi = 0; mi < future.match_arms.len; mi++)
                     if (future.match_arms[mi].stmt != nullptr &&
                         self(self, *future.match_arms[mi].stmt, target_name))
@@ -16826,6 +17101,13 @@ static FrontendResult<u32> analyze_for_stmt(const AstStatement& stmt,
             auto init = analyze_expr(
                 bstmt.expr, route, mod, route->locals.data, route->locals.len, nullptr);
             if (!init) return core::make_unexpected(init.error());
+            if (init->may_error && init->kind != HirExprKind::Error &&
+                init->kind != HirExprKind::LocalRef)
+                return frontend_error(
+                    FrontendError::UnsupportedSyntax,
+                    bstmt.expr.span,
+                    lit_str("runtime-fallible locals are not supported inside a static "
+                            "for-loop body"));
             auto typed = apply_declared_type_to_expr(&init.value(), mod, bstmt);
             if (!typed) return core::make_unexpected(typed.error());
             local.type = init->type;
@@ -16889,20 +17171,31 @@ static FrontendResult<u32> analyze_for_stmt(const AstStatement& stmt,
                     lit_str("static for-loop body cannot continue after a route terminator"));
             if (bstmt.match_arms.len == 0 && bstmt.else_stmt == nullptr)
                 return frontend_error(FrontendError::UnsupportedSyntax, bstmt.span);
+            if ((bstmt.bind_value || bstmt.match_arms.len != 0) &&
+                static_for_expr_repeats_runtime_work(bstmt.expr))
+                return frontend_error(
+                    FrontendError::UnsupportedSyntax,
+                    bstmt.expr.span,
+                    bstmt.bind_value
+                        ? lit_str("static for-loop guard-let source must be an existing value or "
+                                  "literal")
+                        : lit_str("static for-loop guard source must not repeat runtime work"));
             HirGuard guard{};
             guard.span = bstmt.span;
+            const u32 scoped_carrier_start = route->locals.len;
             auto bound = analyze_expr(
                 bstmt.expr, route, mod, route->locals.data, route->locals.len, nullptr);
             if (!bound) return core::make_unexpected(bound.error());
-            auto cond = analyze_guard_cond(bstmt.expr,
-                                           route,
-                                           mod,
-                                           route->locals.data,
-                                           route->locals.len,
-                                           nullptr,
-                                           bstmt.bind_value,
-                                           bstmt.match_arms.len != 0);
+            auto cond = build_guard_cond_from_analyzed(bound.value(),
+                                                       bstmt.expr.span,
+                                                       route,
+                                                       route->locals.data,
+                                                       route->locals.len,
+                                                       bstmt.bind_value,
+                                                       bstmt.match_arms.len != 0,
+                                                       kGuardBoolDetail);
             if (!cond) return core::make_unexpected(cond.error());
+            const u32 scoped_carrier_end = route->locals.len;
             guard.cond = cond.value();
             if (bstmt.match_arms.len != 0) {
                 if (bound->may_error) {
@@ -16915,7 +17208,9 @@ static FrontendResult<u32> analyze_for_stmt(const AstStatement& stmt,
                                                                route->locals.data,
                                                                route->locals.len,
                                                                &mod.guard_match_arms,
-                                                               &guard);
+                                                               &guard,
+                                                               nullptr,
+                                                               true);
                     if (!fail_match) return core::make_unexpected(fail_match.error());
                 } else {
                     return frontend_error(
@@ -16930,10 +17225,26 @@ static FrontendResult<u32> analyze_for_stmt(const AstStatement& stmt,
                                               ? HirLoopControl::Break
                                               : HirLoopControl::Continue;
             } else if (is_ast_hir_terminator(*bstmt.else_stmt)) {
-                auto fail = analyze_term(
-                    *bstmt.else_stmt, mod, route, route->locals.data, route->locals.len);
+                const u32 fail_local_start = route->locals.len;
+                auto fail = analyze_term(*bstmt.else_stmt,
+                                         mod,
+                                         route,
+                                         route->locals.data,
+                                         route->locals.len,
+                                         nullptr,
+                                         true);
                 if (!fail) return core::make_unexpected(fail.error());
                 guard.fail_term = fail.value();
+                guard.fail_body.shared_local_count = 0;
+                guard.fail_body.direct_term_local_start = 0;
+                for (u32 li = fail_local_start; li < route->locals.len; li++) {
+                    if (!guard.fail_body.locals.push(route->locals[li])) {
+                        route->locals.len = fail_local_start;
+                        return frontend_error(FrontendError::TooManyItems, bstmt.span);
+                    }
+                }
+                guard.fail_body.direct_term_local_count = guard.fail_body.locals.len;
+                route->locals.len = fail_local_start;
             } else {
                 guard.fail_kind = HirGuard::FailKind::Body;
                 auto fail_body = analyze_guard_fail_body(*bstmt.else_stmt,
@@ -16942,8 +17253,23 @@ static FrontendResult<u32> analyze_for_stmt(const AstStatement& stmt,
                                                          mod,
                                                          route->locals.data,
                                                          route->locals.len,
-                                                         nullptr);
+                                                         nullptr,
+                                                         true);
                 if (!fail_body) return core::make_unexpected(fail_body.error());
+            }
+            // Helper inlining can append synthetic argument carriers while the
+            // guard condition is analyzed. They must execute once per unrolled
+            // iteration before the guard that references them.
+            for (u32 li = scoped_carrier_start; li < scoped_carrier_end; li++) {
+                const u32 carrier_index = loop.body.locals.len;
+                if (!loop.body.locals.push(route->locals[li]))
+                    return frontend_error(FrontendError::TooManyItems, bstmt.span);
+                HirForLoopBody::Step carrier_step{};
+                carrier_step.kind = HirForLoopBody::Step::Kind::Let;
+                carrier_step.index = carrier_index;
+                carrier_step.span = route->locals[li].span;
+                if (!loop.body.steps.push(carrier_step))
+                    return frontend_error(FrontendError::TooManyItems, bstmt.span);
             }
             const u32 guard_index = loop.body.guards.len;
             if (!loop.body.guards.push(guard))
@@ -16954,12 +17280,15 @@ static FrontendResult<u32> analyze_for_stmt(const AstStatement& stmt,
             guard_step.span = bstmt.span;
             if (!loop.body.steps.push(guard_step))
                 return frontend_error(FrontendError::TooManyItems, bstmt.span);
-            // A known-error init folds the guard condition to false, so the
+            const bool guard_always_fails =
+                guard.cond.kind == HirExprKind::BoolLit && !guard.cond.bool_value;
+            // A known-error/nil init folds the guard condition to false, so the
             // success path (and with it the binding) is unreachable — skip it,
             // matching the route/function/match-arm guard-let paths.
-            if (bstmt.bind_value &&
-                known_value_state(bound.value(), route->locals.data, route->locals.len, 0) !=
-                    KnownValueState::Error) {
+            const KnownValueState guard_bound_state =
+                known_value_state(bound.value(), route->locals.data, route->locals.len, 0);
+            if (bstmt.bind_value && guard_bound_state != KnownValueState::Error &&
+                guard_bound_state != KnownValueState::Nil) {
                 for (u32 li = 0; li < route->locals.len; li++) {
                     if (route->locals[li].name.len != 0 && route->locals[li].name.eq(bstmt.name))
                         return frontend_error(FrontendError::UnsupportedSyntax, bstmt.span);
@@ -17010,6 +17339,8 @@ static FrontendResult<u32> analyze_for_stmt(const AstStatement& stmt,
                 if (!loop.body.steps.push(local_step))
                     return frontend_error(FrontendError::TooManyItems, bstmt.span);
             }
+            if (guard_always_fails && guard.fail_kind != HirGuard::FailKind::LoopControl)
+                loop.body.has_term = true;
             continue;
         }
         if (is_ast_hir_terminator(bstmt)) {
@@ -17018,8 +17349,17 @@ static FrontendResult<u32> analyze_for_stmt(const AstStatement& stmt,
                     FrontendError::UnsupportedSyntax,
                     bstmt.span,
                     lit_str("static for-loop body cannot continue after a route terminator"));
-            auto t = analyze_term(bstmt, mod, route, route->locals.data, route->locals.len);
+            const u32 term_local_start = route->locals.len;
+            auto t = analyze_term(
+                bstmt, mod, route, route->locals.data, route->locals.len, nullptr, true);
             if (!t) return core::make_unexpected(t.error());
+            for (u32 li = term_local_start; li < route->locals.len; li++) {
+                if (!loop.body.term_locals.push(route->locals[li])) {
+                    route->locals.len = term_local_start;
+                    return frontend_error(FrontendError::TooManyItems, bstmt.span);
+                }
+            }
+            route->locals.len = term_local_start;
             loop.body.term = t.value();
             loop.body.has_term = true;
             HirForLoopBody::Step step{};
@@ -17057,6 +17397,7 @@ static FrontendResult<u32> analyze_for_stmt(const AstStatement& stmt,
                 return frontend_error(FrontendError::UnsupportedSyntax, bstmt.span);
             HirForLoopIf body_if{};
             body_if.span = bstmt.span;
+            const u32 scoped_carrier_start = route->locals.len;
             auto cond = analyze_expr(
                 bstmt.expr, route, mod, route->locals.data, route->locals.len, nullptr);
             if (!cond) return core::make_unexpected(cond.error());
@@ -17066,6 +17407,20 @@ static FrontendResult<u32> analyze_for_stmt(const AstStatement& stmt,
                     bstmt.expr.span,
                     lit_str("static for-loop if condition must be a non-fallible bool"));
             body_if.cond = cond.value();
+            const u32 scoped_carrier_end = route->locals.len;
+            // Helper inlining can append synthetic argument carriers while
+            // analyzing the condition. Materialize them before the If step.
+            for (u32 li = scoped_carrier_start; li < scoped_carrier_end; li++) {
+                const u32 carrier_index = loop.body.locals.len;
+                if (!loop.body.locals.push(route->locals[li]))
+                    return frontend_error(FrontendError::TooManyItems, bstmt.span);
+                HirForLoopBody::Step carrier_step{};
+                carrier_step.kind = HirForLoopBody::Step::Kind::Let;
+                carrier_step.index = carrier_index;
+                carrier_step.span = route->locals[li].span;
+                if (!loop.body.steps.push(carrier_step))
+                    return frontend_error(FrontendError::TooManyItems, bstmt.span);
+            }
             auto then_branch = analyze_for_branch(
                 *bstmt.then_stmt, mod, route, route->locals.data, route->locals.len);
             if (!then_branch) return core::make_unexpected(then_branch.error());
@@ -17089,6 +17444,13 @@ static FrontendResult<u32> analyze_for_stmt(const AstStatement& stmt,
             continue;
         }
         if (bstmt.kind == AstStmtKind::Match) {
+            if (bstmt.expr.kind != AstExprKind::Ident && bstmt.expr.kind != AstExprKind::BoolLit &&
+                bstmt.expr.kind != AstExprKind::IntLit && bstmt.expr.kind != AstExprKind::StrLit)
+                return frontend_error(
+                    FrontendError::UnsupportedSyntax,
+                    bstmt.expr.span,
+                    lit_str("static for-loop match subject must be an existing value or "
+                            "literal"));
             if (loop.body.has_term)
                 return frontend_error(
                     FrontendError::UnsupportedSyntax,
@@ -17147,6 +17509,12 @@ static FrontendResult<u32> analyze_for_stmt(const AstStatement& stmt,
                 if (ast_arm.stmt == nullptr)
                     return frontend_error(FrontendError::UnsupportedSyntax, ast_arm.span);
                 if (nested_match_stmt != nullptr) {
+                    if (static_for_expr_repeats_runtime_work(nested_match_stmt->expr))
+                        return frontend_error(
+                            FrontendError::UnsupportedSyntax,
+                            nested_match_stmt->expr.span,
+                            lit_str("static for-loop nested match subject must not repeat runtime "
+                                    "work"));
                     auto outer_pattern = analyze_match_pattern(*ast_arm.pattern,
                                                                subject.value(),
                                                                route,
@@ -17212,9 +17580,30 @@ static FrontendResult<u32> analyze_for_stmt(const AstStatement& stmt,
                         return frontend_error(FrontendError::UnsupportedSyntax,
                                               nested_match_stmt->expr.span,
                                               kMatchI64Detail);
-                    if (!route->exprs.push(inner_subject.value()))
+                    HirLocal nested_subject_local{};
+                    const bool has_nested_subject_local =
+                        static_for_expr_reads_request_state(nested_match_stmt->expr);
+                    if (has_nested_subject_local) {
+                        HirLocal& subject_local = nested_subject_local;
+                        subject_local.span = nested_match_stmt->expr.span;
+                        subject_local.ref_index =
+                            next_local_ref_index(route, route->locals.data, route->locals.len);
+                        if (subject_local.ref_index >= HirRoute::kMaxLocals)
+                            return frontend_error(FrontendError::TooManyItems,
+                                                  nested_match_stmt->expr.span);
+                        copy_json_value_metadata(&subject_local, inner_subject.value());
+                        subject_local.init = inner_subject.value();
+                        if (!route->locals.push(subject_local))
+                            return frontend_error(FrontendError::TooManyItems,
+                                                  nested_match_stmt->expr.span);
+                        if (!route->exprs.push(
+                                make_json_local_ref(subject_local, nested_match_stmt->expr.span)))
+                            return frontend_error(FrontendError::TooManyItems,
+                                                  nested_match_stmt->expr.span);
+                    } else if (!route->exprs.push(inner_subject.value())) {
                         return frontend_error(FrontendError::TooManyItems,
                                               nested_match_stmt->expr.span);
+                    }
                     HirExpr* inner_subject_ptr = &route->exprs[route->exprs.len - 1];
                     bool inner_seen_wildcard = false;
                     bool inner_seen_bool_true = false;
@@ -17234,6 +17623,15 @@ static FrontendResult<u32> analyze_for_stmt(const AstStatement& stmt,
                         HirForLoopMatchArm arm{};
                         arm.span = inner_arm.span;
                         arm.pattern = outer_pattern.value();
+                        arm.capture_group = static_cast<u8>(ai + 1);
+                        if (has_nested_subject_local) {
+                            arm.local_guard_depth[arm.locals.len] = 0;
+                            arm.local_precedes_arm_guard[arm.locals.len] = !inner_arm.is_wildcard;
+                            if (!arm.locals.push(nested_subject_local))
+                                return frontend_error(FrontendError::TooManyItems,
+                                                      nested_match_stmt->expr.span);
+                            arm.capture_local_count = static_cast<u8>(arm.locals.len);
+                        }
                         if (!inner_arm.is_wildcard) {
                             auto inner_pattern = analyze_match_pattern(*inner_arm.pattern,
                                                                        inner_subject.value(),
@@ -17326,6 +17724,7 @@ static FrontendResult<u32> analyze_for_stmt(const AstStatement& stmt,
                                 !simple_branch(*inner_arm.stmt->else_stmt))
                                 return frontend_error(FrontendError::UnsupportedSyntax,
                                                       inner_arm.stmt->span);
+                            const u32 scoped_carrier_start = route->locals.len;
                             auto cond_expr = analyze_expr(inner_arm.stmt->expr,
                                                           route,
                                                           mod,
@@ -17340,6 +17739,16 @@ static FrontendResult<u32> analyze_for_stmt(const AstStatement& stmt,
                                     inner_arm.stmt->expr.span,
                                     lit_str("static for-loop match-arm if condition must be a "
                                             "non-fallible bool"));
+                            for (u32 li = scoped_carrier_start; li < route->locals.len; li++) {
+                                if (arm.locals.len >= HirForLoopMatchArm::kMaxLocals)
+                                    return frontend_error(FrontendError::TooManyItems,
+                                                          inner_arm.stmt->span);
+                                arm.local_guard_depth[arm.locals.len] = arm.guards.len;
+                                if (!arm.locals.push(route->locals[li]))
+                                    return frontend_error(FrontendError::TooManyItems,
+                                                          inner_arm.stmt->span);
+                                route->locals[li].name = {};
+                            }
                             auto then_branch = analyze_for_branch(*inner_arm.stmt->then_stmt,
                                                                   mod,
                                                                   route,
@@ -17368,7 +17777,18 @@ static FrontendResult<u32> analyze_for_stmt(const AstStatement& stmt,
                         if (!body_match.arms.push(arm))
                             return frontend_error(FrontendError::TooManyItems, inner_arm.span);
                     }
-                    if (!inner_seen_wildcard)
+                    bool inner_exhaustive = inner_seen_wildcard;
+                    if (inner_subject->type == HirTypeKind::Bool)
+                        inner_exhaustive |= inner_seen_bool_true && inner_seen_bool_false;
+                    if (inner_subject->type == HirTypeKind::Variant &&
+                        inner_subject->variant_index < mod.variants.len) {
+                        bool all_cases = true;
+                        const auto& variant = mod.variants[inner_subject->variant_index];
+                        for (u32 ci = 0; ci < variant.cases.len; ci++)
+                            all_cases &= inner_seen_variant_cases[ci];
+                        inner_exhaustive |= all_cases;
+                    }
+                    if (!inner_exhaustive)
                         return frontend_error(FrontendError::UnsupportedSyntax,
                                               nested_match_stmt->span);
                     continue;
@@ -17376,8 +17796,11 @@ static FrontendResult<u32> analyze_for_stmt(const AstStatement& stmt,
                 HirForLoopMatchArm arm{};
                 arm.span = ast_arm.span;
                 arm.is_wildcard = ast_arm.is_wildcard;
+                arm.capture_group = static_cast<u8>(ai + 1);
                 MatchPayloadBinding arm_binding{};
                 const MatchPayloadBinding* arm_binding_ptr = nullptr;
+                u32 arm_guard_carrier_start = route->locals.len;
+                u32 arm_guard_carrier_end = route->locals.len;
                 if (!ast_arm.is_wildcard) {
                     auto pattern = analyze_match_pattern(*ast_arm.pattern,
                                                          subject.value(),
@@ -17473,13 +17896,16 @@ static FrontendResult<u32> analyze_for_stmt(const AstStatement& stmt,
                             return frontend_error(FrontendError::UnsupportedSyntax,
                                                   ast_arm.guard->span);
                         arm.has_arm_guard = true;
+                        arm.arm_guard_precedes_prelude = true;
                         arm.arm_guard = guard.value();
+                        arm_guard_carrier_end = route->locals.len;
                     }
                 } else {
                     seen_wildcard = true;
                     has_wildcard = true;
                 }
                 const AstStatement* arm_stmt = ast_arm.stmt;
+                u32 arm_source_local_count = 0;
                 FixedVec<HirLocal, HirRoute::kMaxLocals> arm_scoped_locals;
                 const HirLocal* arm_locals = route->locals.data;
                 u32 arm_local_count = route->locals.len;
@@ -17527,6 +17953,13 @@ static FrontendResult<u32> analyze_for_stmt(const AstStatement& stmt,
                                                      arm_scoped_locals.len,
                                                      arm_binding_ptr);
                             if (!init) return core::make_unexpected(init.error());
+                            if (init->may_error && init->kind != HirExprKind::Error &&
+                                init->kind != HirExprKind::LocalRef)
+                                return frontend_error(
+                                    FrontendError::UnsupportedSyntax,
+                                    inner.expr.span,
+                                    lit_str("runtime-fallible locals are not supported inside a "
+                                            "static for-loop match arm"));
                             auto typed = apply_declared_type_to_expr(&init.value(), mod, inner);
                             if (!typed) return core::make_unexpected(typed.error());
                             local.type = init->type;
@@ -17560,12 +17993,19 @@ static FrontendResult<u32> analyze_for_stmt(const AstStatement& stmt,
                             local.shape_index = init->shape_index;
                             local.init = init.value();
                             for (u32 li = scoped_carrier_start; li < route->locals.len; li++) {
+                                if (arm.locals.len >= HirForLoopMatchArm::kMaxLocals)
+                                    return frontend_error(FrontendError::TooManyItems, inner.span);
+                                arm.local_guard_depth[arm.locals.len] = arm.guards.len;
                                 if (!arm.locals.push(route->locals[li]))
                                     return frontend_error(FrontendError::TooManyItems, inner.span);
                                 route->locals[li].name = {};
                             }
+                            if (arm_source_local_count >= HirForLoopMatchArm::kMaxSourceLocals)
+                                return frontend_error(FrontendError::TooManyItems, inner.span);
+                            arm.local_guard_depth[arm.locals.len] = arm.guards.len;
                             if (!arm.locals.push(local))
                                 return frontend_error(FrontendError::TooManyItems, inner.span);
+                            arm_source_local_count++;
                             HirLocal hidden_local = local;
                             hidden_local.name = {};
                             route->locals[local_storage_index] = hidden_local;
@@ -17581,8 +18021,19 @@ static FrontendResult<u32> analyze_for_stmt(const AstStatement& stmt,
                             if (is_last ||
                                 (inner.match_arms.len == 0 && inner.else_stmt == nullptr))
                                 return frontend_error(FrontendError::UnsupportedSyntax, inner.span);
+                            if ((inner.bind_value || inner.match_arms.len != 0) &&
+                                static_for_expr_repeats_runtime_work(inner.expr))
+                                return frontend_error(
+                                    FrontendError::UnsupportedSyntax,
+                                    inner.expr.span,
+                                    inner.bind_value
+                                        ? lit_str("static for-loop guard-let source must be an "
+                                                  "existing value or literal")
+                                        : lit_str("static for-loop guard source must not repeat "
+                                                  "runtime work"));
                             HirGuard guard{};
                             guard.span = inner.span;
+                            const u32 scoped_carrier_start = route->locals.len;
                             auto bound = analyze_expr(inner.expr,
                                                       route,
                                                       mod,
@@ -17590,15 +18041,16 @@ static FrontendResult<u32> analyze_for_stmt(const AstStatement& stmt,
                                                       arm_scoped_locals.len,
                                                       arm_binding_ptr);
                             if (!bound) return core::make_unexpected(bound.error());
-                            auto cond = analyze_guard_cond(inner.expr,
-                                                           route,
-                                                           mod,
-                                                           arm_scoped_locals.data,
-                                                           arm_scoped_locals.len,
-                                                           arm_binding_ptr,
-                                                           inner.bind_value,
-                                                           inner.match_arms.len != 0);
+                            auto cond = build_guard_cond_from_analyzed(bound.value(),
+                                                                       inner.expr.span,
+                                                                       route,
+                                                                       arm_scoped_locals.data,
+                                                                       arm_scoped_locals.len,
+                                                                       inner.bind_value,
+                                                                       inner.match_arms.len != 0,
+                                                                       kGuardBoolDetail);
                             if (!cond) return core::make_unexpected(cond.error());
+                            const u32 scoped_carrier_end = route->locals.len;
                             guard.cond = cond.value();
                             if (inner.match_arms.len != 0) {
                                 if (bound->may_error) {
@@ -17613,7 +18065,8 @@ static FrontendResult<u32> analyze_for_stmt(const AstStatement& stmt,
                                                                  arm_scoped_locals.len,
                                                                  &mod.guard_match_arms,
                                                                  &guard,
-                                                                 arm_binding_ptr);
+                                                                 arm_binding_ptr,
+                                                                 true);
                                     if (!fail_match)
                                         return core::make_unexpected(fail_match.error());
                                 } else {
@@ -17632,14 +18085,28 @@ static FrontendResult<u32> analyze_for_stmt(const AstStatement& stmt,
                                             ? HirLoopControl::Break
                                             : HirLoopControl::Continue;
                                 } else if (is_ast_hir_terminator(*inner.else_stmt)) {
+                                    const u32 fail_local_start = route->locals.len;
                                     auto fail = analyze_term(*inner.else_stmt,
                                                              mod,
                                                              route,
                                                              arm_scoped_locals.data,
                                                              arm_scoped_locals.len,
-                                                             arm_binding_ptr);
+                                                             arm_binding_ptr,
+                                                             true);
                                     if (!fail) return core::make_unexpected(fail.error());
                                     guard.fail_term = fail.value();
+                                    guard.fail_body.shared_local_count = 0;
+                                    guard.fail_body.direct_term_local_start = 0;
+                                    for (u32 li = fail_local_start; li < route->locals.len; li++) {
+                                        if (!guard.fail_body.locals.push(route->locals[li])) {
+                                            route->locals.len = fail_local_start;
+                                            return frontend_error(FrontendError::TooManyItems,
+                                                                  inner.span);
+                                        }
+                                    }
+                                    guard.fail_body.direct_term_local_count =
+                                        guard.fail_body.locals.len;
+                                    route->locals.len = fail_local_start;
                                 } else {
                                     guard.fail_kind = HirGuard::FailKind::Body;
                                     auto fail_body = analyze_guard_fail_body(*inner.else_stmt,
@@ -17648,19 +18115,27 @@ static FrontendResult<u32> analyze_for_stmt(const AstStatement& stmt,
                                                                              mod,
                                                                              arm_scoped_locals.data,
                                                                              arm_scoped_locals.len,
-                                                                             arm_binding_ptr);
+                                                                             arm_binding_ptr,
+                                                                             true);
                                     if (!fail_body) return core::make_unexpected(fail_body.error());
                                 }
                             }
+                            for (u32 li = scoped_carrier_start; li < scoped_carrier_end; li++) {
+                                if (arm.locals.len >= HirForLoopMatchArm::kMaxLocals)
+                                    return frontend_error(FrontendError::TooManyItems, inner.span);
+                                arm.local_guard_depth[arm.locals.len] = arm.guards.len;
+                                if (!arm.locals.push(route->locals[li]))
+                                    return frontend_error(FrontendError::TooManyItems, inner.span);
+                                route->locals[li].name = {};
+                            }
                             if (!arm.guards.push(guard))
                                 return frontend_error(FrontendError::TooManyItems, inner.span);
-                            // A known-error init folds the guard condition to false, so
+                            // A known-error/nil init folds the guard condition to false, so
                             // the success path (and the binding) is unreachable — skip it.
-                            if (inner.bind_value &&
-                                known_value_state(bound.value(),
-                                                  arm_scoped_locals.data,
-                                                  arm_scoped_locals.len,
-                                                  0) != KnownValueState::Error) {
+                            const KnownValueState guard_bound_state = known_value_state(
+                                bound.value(), arm_scoped_locals.data, arm_scoped_locals.len, 0);
+                            if (inner.bind_value && guard_bound_state != KnownValueState::Error &&
+                                guard_bound_state != KnownValueState::Nil) {
                                 for (u32 li = 0; li < arm_scoped_locals.len; li++) {
                                     if (arm_scoped_locals[li].name.len != 0 &&
                                         arm_scoped_locals[li].name.eq(inner.name))
@@ -17707,8 +18182,12 @@ static FrontendResult<u32> analyze_for_stmt(const AstStatement& stmt,
                                 auto init = make_guard_bound_init(route, bound.value(), inner.span);
                                 if (!init) return core::make_unexpected(init.error());
                                 local.init = init.value();
+                                if (arm_source_local_count >= HirForLoopMatchArm::kMaxSourceLocals)
+                                    return frontend_error(FrontendError::TooManyItems, inner.span);
+                                arm.local_guard_depth[arm.locals.len] = arm.guards.len;
                                 if (!arm.locals.push(local))
                                     return frontend_error(FrontendError::TooManyItems, inner.span);
+                                arm_source_local_count++;
                                 auto inserted = insert_scoped_local(arm_scoped_locals.data,
                                                                     arm_scoped_locals.len,
                                                                     HirRoute::kMaxLocals,
@@ -17725,7 +18204,50 @@ static FrontendResult<u32> analyze_for_stmt(const AstStatement& stmt,
                     arm_locals = arm_scoped_locals.data;
                     arm_local_count = arm_scoped_locals.len;
                 }
+                if (arm.has_arm_guard) {
+                    for (u32 li = arm_guard_carrier_start; li < arm_guard_carrier_end; li++) {
+                        if (arm.locals.len >= HirForLoopMatchArm::kMaxLocals)
+                            return frontend_error(FrontendError::TooManyItems, arm.arm_guard.span);
+                        arm.local_guard_depth[arm.locals.len] = 0;
+                        arm.local_precedes_arm_guard[arm.locals.len] = true;
+                        if (!arm.locals.push(route->locals[li]))
+                            return frontend_error(FrontendError::TooManyItems, arm.arm_guard.span);
+                        route->locals[li].name = {};
+                    }
+                }
                 if (arm_stmt->kind == AstStmtKind::Match && !arm_stmt->is_const) {
+                    // A source-arm guard belongs to the outer match arm, not to
+                    // each flattened nested arm. Latch it once into a hidden
+                    // capture-group local so inner-arm fallthrough observes the
+                    // same result instead of re-evaluating runtime work.
+                    HirExpr source_arm_guard_ref{};
+                    if (arm.has_arm_guard) {
+                        HirLocal guard_local{};
+                        guard_local.span = arm.arm_guard.span;
+                        guard_local.ref_index =
+                            next_local_ref_index(route, arm_locals, arm_local_count);
+                        if (guard_local.ref_index >= HirRoute::kMaxLocals)
+                            return frontend_error(FrontendError::TooManyItems, arm.arm_guard.span);
+                        guard_local.type = HirTypeKind::Bool;
+                        guard_local.init = arm.arm_guard;
+                        if (arm.locals.len >= HirForLoopMatchArm::kMaxLocals)
+                            return frontend_error(FrontendError::TooManyItems, arm.arm_guard.span);
+                        arm.local_guard_depth[arm.locals.len] = 0;
+                        arm.local_precedes_arm_guard[arm.locals.len] = true;
+                        if (!arm.locals.push(guard_local) || !route->locals.push(guard_local))
+                            return frontend_error(FrontendError::TooManyItems, arm.arm_guard.span);
+
+                        source_arm_guard_ref.kind = HirExprKind::LocalRef;
+                        source_arm_guard_ref.type = HirTypeKind::Bool;
+                        source_arm_guard_ref.span = arm.arm_guard.span;
+                        source_arm_guard_ref.local_index = guard_local.ref_index;
+                    }
+                    if (static_for_expr_repeats_runtime_work(arm_stmt->expr))
+                        return frontend_error(
+                            FrontendError::UnsupportedSyntax,
+                            arm_stmt->expr.span,
+                            lit_str("static for-loop nested match subject must not repeat runtime "
+                                    "work"));
                     auto inner_subject = analyze_expr(
                         arm_stmt->expr, route, mod, arm_locals, arm_local_count, arm_binding_ptr);
                     if (!inner_subject) return core::make_unexpected(inner_subject.error());
@@ -17739,9 +18261,46 @@ static FrontendResult<u32> analyze_for_stmt(const AstStatement& stmt,
                     if (inner_subject->type == HirTypeKind::I64)
                         return frontend_error(
                             FrontendError::UnsupportedSyntax, arm_stmt->expr.span, kMatchI64Detail);
-                    if (!route->exprs.push(inner_subject.value()))
+                    if (static_for_expr_reads_request_state(arm_stmt->expr)) {
+                        HirLocal subject_local{};
+                        subject_local.span = arm_stmt->expr.span;
+                        subject_local.ref_index =
+                            next_local_ref_index(route, arm_locals, arm_local_count);
+                        if (subject_local.ref_index >= HirRoute::kMaxLocals ||
+                            arm.locals.len >= HirForLoopMatchArm::kMaxLocals)
+                            return frontend_error(FrontendError::TooManyItems, arm_stmt->expr.span);
+                        copy_json_value_metadata(&subject_local, inner_subject.value());
+                        subject_local.init = inner_subject.value();
+                        arm.local_guard_depth[arm.locals.len] = arm.guards.len;
+                        // Without a source guard the synthesized inner
+                        // comparison is the arm guard and needs this capture
+                        // first. With a source guard it becomes the post-body
+                        // guard, so this remains a normal body local.
+                        arm.local_precedes_arm_guard[arm.locals.len] = !arm.has_arm_guard;
+                        if (!arm.locals.push(subject_local))
+                            return frontend_error(FrontendError::TooManyItems, arm_stmt->expr.span);
+                        if (arm_locals != arm_scoped_locals.data) {
+                            for (u32 li = 0; li < arm_local_count; li++)
+                                if (!arm_scoped_locals.push(arm_locals[li]))
+                                    return frontend_error(FrontendError::TooManyItems,
+                                                          arm_stmt->expr.span);
+                        }
+                        auto inserted = insert_scoped_local(arm_scoped_locals.data,
+                                                            arm_scoped_locals.len,
+                                                            HirRoute::kMaxLocals,
+                                                            subject_local,
+                                                            arm_stmt->expr.span);
+                        if (!inserted) return core::make_unexpected(inserted.error());
+                        arm_locals = arm_scoped_locals.data;
+                        arm_local_count = arm_scoped_locals.len;
+                        if (!route->exprs.push(
+                                make_json_local_ref(subject_local, arm_stmt->expr.span)))
+                            return frontend_error(FrontendError::TooManyItems, arm_stmt->expr.span);
+                    } else if (!route->exprs.push(inner_subject.value())) {
                         return frontend_error(FrontendError::TooManyItems, arm_stmt->expr.span);
+                    }
                     HirExpr* inner_subject_ptr = &route->exprs[route->exprs.len - 1];
+                    arm.capture_local_count = static_cast<u8>(arm.locals.len);
                     bool inner_seen_wildcard = false;
                     bool inner_seen_bool_true = false;
                     bool inner_seen_bool_false = false;
@@ -17762,6 +18321,7 @@ static FrontendResult<u32> analyze_for_stmt(const AstStatement& stmt,
                                                   inner_ast_arm.span);
                         HirForLoopMatchArm expanded = arm;
                         expanded.span = inner_ast_arm.span;
+                        if (arm.has_arm_guard) expanded.arm_guard = source_arm_guard_ref;
                         auto assign_flattened_arm_guard =
                             [&](HirForLoopMatchArm* target,
                                 const HirExpr& inner_cond) -> FrontendResult<void> {
@@ -17771,34 +18331,10 @@ static FrontendResult<u32> analyze_for_stmt(const AstStatement& stmt,
                                 return {};
                             }
 
-                            HirExpr combined{};
-                            combined.kind = HirExprKind::IfElse;
-                            combined.type = HirTypeKind::Bool;
-                            combined.span = inner_ast_arm.span;
-
-                            HirExpr fallback{};
-                            fallback.kind = HirExprKind::BoolLit;
-                            fallback.type = HirTypeKind::Bool;
-                            fallback.span = inner_ast_arm.span;
-                            fallback.bool_value = false;
-
-                            if (!route->exprs.push(arm.arm_guard))
-                                return frontend_error(FrontendError::TooManyItems,
-                                                      inner_ast_arm.span);
-                            combined.lhs = &route->exprs[route->exprs.len - 1];
                             if (!route->exprs.push(inner_cond))
                                 return frontend_error(FrontendError::TooManyItems,
                                                       inner_ast_arm.span);
-                            combined.rhs = &route->exprs[route->exprs.len - 1];
-                            if (!route->exprs.push(fallback))
-                                return frontend_error(FrontendError::TooManyItems,
-                                                      inner_ast_arm.span);
-                            if (!combined.args.push(&route->exprs[route->exprs.len - 1]))
-                                return frontend_error(FrontendError::TooManyItems,
-                                                      inner_ast_arm.span);
-
-                            target->has_arm_guard = true;
-                            target->arm_guard = combined;
+                            target->post_arm_guard_expr_index = route->exprs.len - 1;
                             return {};
                         };
                         if (!inner_ast_arm.is_wildcard) {
@@ -17893,6 +18429,7 @@ static FrontendResult<u32> analyze_for_stmt(const AstStatement& stmt,
                                 !simple_branch(*inner_ast_arm.stmt->else_stmt))
                                 return frontend_error(FrontendError::UnsupportedSyntax,
                                                       inner_ast_arm.stmt->span);
+                            const u32 scoped_carrier_start = route->locals.len;
                             auto cond = analyze_expr(inner_ast_arm.stmt->expr,
                                                      route,
                                                      mod,
@@ -17906,6 +18443,17 @@ static FrontendResult<u32> analyze_for_stmt(const AstStatement& stmt,
                                     inner_ast_arm.stmt->expr.span,
                                     lit_str("static for-loop match-arm if condition must be a "
                                             "non-fallible bool"));
+                            for (u32 li = scoped_carrier_start; li < route->locals.len; li++) {
+                                if (expanded.locals.len >= HirForLoopMatchArm::kMaxLocals)
+                                    return frontend_error(FrontendError::TooManyItems,
+                                                          inner_ast_arm.stmt->span);
+                                expanded.local_guard_depth[expanded.locals.len] =
+                                    expanded.guards.len;
+                                if (!expanded.locals.push(route->locals[li]))
+                                    return frontend_error(FrontendError::TooManyItems,
+                                                          inner_ast_arm.stmt->span);
+                                route->locals[li].name = {};
+                            }
                             auto then_branch = analyze_for_branch(*inner_ast_arm.stmt->then_stmt,
                                                                   mod,
                                                                   route,
@@ -17941,7 +18489,18 @@ static FrontendResult<u32> analyze_for_stmt(const AstStatement& stmt,
                         if (!body_match.arms.push(expanded))
                             return frontend_error(FrontendError::TooManyItems, inner_ast_arm.span);
                     }
-                    if (!inner_seen_wildcard)
+                    bool inner_exhaustive = inner_seen_wildcard;
+                    if (inner_subject->type == HirTypeKind::Bool)
+                        inner_exhaustive |= inner_seen_bool_true && inner_seen_bool_false;
+                    if (inner_subject->type == HirTypeKind::Variant &&
+                        inner_subject->variant_index < mod.variants.len) {
+                        bool all_cases = true;
+                        const auto& variant = mod.variants[inner_subject->variant_index];
+                        for (u32 ci = 0; ci < variant.cases.len; ci++)
+                            all_cases &= inner_seen_variant_cases[ci];
+                        inner_exhaustive |= all_cases;
+                    }
+                    if (!inner_exhaustive)
                         return frontend_error(FrontendError::UnsupportedSyntax, arm_stmt->span);
                     continue;
                 }
@@ -17953,6 +18512,7 @@ static FrontendResult<u32> analyze_for_stmt(const AstStatement& stmt,
                         !simple_branch(*arm_stmt->then_stmt) ||
                         !simple_branch(*arm_stmt->else_stmt))
                         return frontend_error(FrontendError::UnsupportedSyntax, arm_stmt->span);
+                    const u32 scoped_carrier_start = route->locals.len;
                     auto cond = analyze_expr(
                         arm_stmt->expr, route, mod, arm_locals, arm_local_count, arm_binding_ptr);
                     if (!cond) return core::make_unexpected(cond.error());
@@ -17962,6 +18522,14 @@ static FrontendResult<u32> analyze_for_stmt(const AstStatement& stmt,
                             arm_stmt->expr.span,
                             lit_str("static for-loop match-arm if condition must be a "
                                     "non-fallible bool"));
+                    for (u32 li = scoped_carrier_start; li < route->locals.len; li++) {
+                        if (arm.locals.len >= HirForLoopMatchArm::kMaxLocals)
+                            return frontend_error(FrontendError::TooManyItems, arm_stmt->span);
+                        arm.local_guard_depth[arm.locals.len] = arm.guards.len;
+                        if (!arm.locals.push(route->locals[li]))
+                            return frontend_error(FrontendError::TooManyItems, arm_stmt->span);
+                        route->locals[li].name = {};
+                    }
                     auto then_branch = analyze_for_branch(*arm_stmt->then_stmt,
                                                           mod,
                                                           route,
@@ -17991,7 +18559,18 @@ static FrontendResult<u32> analyze_for_stmt(const AstStatement& stmt,
                 if (!body_match.arms.push(arm))
                     return frontend_error(FrontendError::TooManyItems, ast_arm.span);
             }
-            if (!has_wildcard) return frontend_error(FrontendError::UnsupportedSyntax, bstmt.span);
+            bool exhaustive = has_wildcard;
+            if (subject->type == HirTypeKind::Bool)
+                exhaustive |= seen_unguarded_bool_true && seen_unguarded_bool_false;
+            if (subject->type == HirTypeKind::Variant &&
+                subject->variant_index < mod.variants.len) {
+                bool all_variant_cases = true;
+                const auto& variant = mod.variants[subject->variant_index];
+                for (u32 ci = 0; ci < variant.cases.len; ci++)
+                    all_variant_cases &= seen_unguarded_variant_cases[ci];
+                exhaustive |= all_variant_cases;
+            }
+            if (!exhaustive) return frontend_error(FrontendError::UnsupportedSyntax, bstmt.span);
             const u32 match_index = loop.body.matches.len;
             if (!loop.body.matches.push(body_match))
                 return frontend_error(FrontendError::TooManyItems, bstmt.span);
@@ -18044,7 +18623,7 @@ static FrontendResult<u32> analyze_for_stmt(const AstStatement& stmt,
             if (!loop.body.steps.push(step))
                 return frontend_error(FrontendError::TooManyItems, bstmt.span);
             const HirForLoop& nested_loop = route->for_loops[nested.value()];
-            auto loop_may_skip_terminator = [&](auto&& self, const HirForLoop& candidate) -> bool {
+            auto loop_may_skip_terminator = [&](const HirForLoop& candidate) -> bool {
                 if (candidate.body.has_loop_control) return true;
                 for (u32 gi = 0; gi < candidate.body.guards.len; gi++)
                     if (candidate.body.guards[gi].fail_kind == HirGuard::FailKind::LoopControl)
@@ -18057,18 +18636,10 @@ static FrontendResult<u32> analyze_for_stmt(const AstStatement& stmt,
                                 HirGuard::FailKind::LoopControl)
                                 return true;
                 }
-                for (u32 si = 0; si < candidate.body.steps.len; si++) {
-                    const auto& child_step = candidate.body.steps[si];
-                    if (child_step.kind == HirForLoopBody::Step::Kind::For &&
-                        child_step.index < route->for_loops.len &&
-                        self(self, route->for_loops[child_step.index]))
-                        return true;
-                }
                 return false;
             };
             u32 nested_iter_len = 0;
-            if (nested_loop.body.has_term &&
-                !loop_may_skip_terminator(loop_may_skip_terminator, nested_loop) &&
+            if (nested_loop.body.has_term && !loop_may_skip_terminator(nested_loop) &&
                 static_for_iter_len(nested_loop.iter_expr,
                                     route->locals.data,
                                     route->locals.len,
@@ -18168,6 +18739,10 @@ static FrontendResult<void> validate_timer_route(const HirRoute& route,
         return {};
     };
     auto check_for_branch = [&](const HirForLoopBranch& branch) -> FrontendResult<void> {
+        for (u32 li = 0; li < branch.locals.len; li++) {
+            auto local_ok = check_expr(branch.locals[li].init);
+            if (!local_ok) return local_ok;
+        }
         if (branch.kind != HirForLoopBranch::Kind::Term) return {};
         return check_term(branch.term);
     };
@@ -18199,6 +18774,10 @@ static FrontendResult<void> validate_timer_route(const HirRoute& route,
             const auto& arm = mod.guard_match_arms[idx];
             auto pattern_ok = check_expr(arm.pattern);
             if (!pattern_ok) return pattern_ok;
+            for (u32 li = 0; li < arm.locals.len; li++) {
+                auto local_ok = check_expr(arm.locals[li].init);
+                if (!local_ok) return local_ok;
+            }
             auto arm_term_ok = check_term(arm.direct_term);
             if (!arm_term_ok) return arm_term_ok;
         }
@@ -18279,6 +18858,10 @@ static FrontendResult<void> validate_timer_route(const HirRoute& route,
         const auto& body = loop.body;
         for (u32 li = 0; li < body.locals.len; li++) {
             auto l_ok = check_expr(body.locals[li].init);
+            if (!l_ok) return l_ok;
+        }
+        for (u32 li = 0; li < body.term_locals.len; li++) {
+            auto l_ok = check_expr(body.term_locals[li].init);
             if (!l_ok) return l_ok;
         }
         for (u32 gi = 0; gi < body.guards.len; gi++) {
@@ -22217,6 +22800,7 @@ static FrontendResult<HirModule*> analyze_file_internal(
         // and would stall 1s under the wheel fallback.
         bool seen_wait = false;
         bool seen_for = false;
+        bool has_guaranteed_loop_terminator = false;
         // Chain `before` steps have already appended guards to route.guards,
         // and decorator guards are appended after body analysis then rotated
         // ahead of user guards — either way the route body runs behind a
@@ -22278,6 +22862,12 @@ static FrontendResult<HirModule*> analyze_file_internal(
                             return frontend_error(FrontendError::UnsupportedSyntax,
                                                   stmt.span,
                                                   lit_str("Response supports set/add/remove"));
+                        if (seen_for)
+                            return frontend_error(
+                                FrontendError::UnsupportedSyntax,
+                                stmt.span,
+                                lit_str(
+                                    "Response header mutations cannot follow a static for-loop"));
                         const u32 want_args = is_remove ? 1u : 2u;
                         if (stmt.expr.args.len != want_args || stmt.expr.args[0] == nullptr ||
                             stmt.expr.args[0]->kind != AstExprKind::StrLit ||
@@ -22388,7 +22978,12 @@ static FrontendResult<HirModule*> analyze_file_internal(
                     }
                 }
                 if (stmt.expr.kind == AstExprKind::Assign) {
-                    if (route_reads_response_field(route))
+                    if (seen_for)
+                        return frontend_error(
+                            FrontendError::UnsupportedSyntax,
+                            stmt.span,
+                            lit_str("Response assignments cannot follow a static for-loop"));
+                    if (route_reads_response_field(route, mod))
                         return frontend_error(
                             FrontendError::UnsupportedSyntax,
                             stmt.span,
@@ -22574,6 +23169,11 @@ static FrontendResult<HirModule*> analyze_file_internal(
                                 "builder in the route"));
                 return frontend_error(FrontendError::UnsupportedSyntax, stmt.span);
             }
+            if (stmt.kind == AstStmtKind::Let && seen_for && !let_wait_result)
+                return frontend_error(
+                    FrontendError::UnsupportedSyntax,
+                    stmt.span,
+                    lit_str("route locals cannot be declared after a static for-loop"));
             if (stmt.kind == AstStmtKind::Let) {
                 auto stmt_uses_iter = [&](const auto& self,
                                           const AstStatement& future,
@@ -22585,10 +23185,21 @@ static FrontendResult<HirModule*> analyze_file_internal(
                         return true;
                     if (future.else_stmt != nullptr && self(self, *future.else_stmt, target_name))
                         return true;
+                    FixedVec<Str, HirRoute::kMaxLocals> aliases;
+                    if (!aliases.push(target_name)) return false;
                     for (u32 bi = 0; bi < future.block_stmts.len; bi++) {
-                        if (future.block_stmts[bi] != nullptr &&
-                            self(self, *future.block_stmts[bi], target_name))
-                            return true;
+                        const AstStatement* child = future.block_stmts[bi];
+                        if (child == nullptr) continue;
+                        for (u32 ai = 0; ai < aliases.len; ai++)
+                            if (self(self, *child, aliases[ai])) return true;
+                        if (child->kind != AstStmtKind::Let ||
+                            child->expr.kind != AstExprKind::Ident)
+                            continue;
+                        for (u32 ai = 0; ai < aliases.len; ai++) {
+                            if (!child->expr.name.eq(aliases[ai])) continue;
+                            if (!aliases.push(child->name)) return false;
+                            break;
+                        }
                     }
                     for (u32 mi = 0; mi < future.match_arms.len; mi++) {
                         if (future.match_arms[mi].stmt != nullptr &&
@@ -22900,6 +23511,109 @@ static FrontendResult<HirModule*> analyze_file_internal(
                 seen_for = true;
                 auto loop = analyze_for_stmt(stmt, &route, mod);
                 if (!loop) return core::make_unexpected(loop.error());
+                const auto& analyzed_loop = route.for_loops[loop.value()];
+                auto loop_may_skip_terminator = [&](const HirForLoop& candidate) -> bool {
+                    if (candidate.body.has_loop_control) return true;
+                    for (u32 gi = 0; gi < candidate.body.guards.len; gi++)
+                        if (candidate.body.guards[gi].fail_kind == HirGuard::FailKind::LoopControl)
+                            return true;
+                    for (u32 mi = 0; mi < candidate.body.matches.len; mi++) {
+                        const auto& body_match = candidate.body.matches[mi];
+                        for (u32 ai = 0; ai < body_match.arms.len; ai++)
+                            for (u32 gi = 0; gi < body_match.arms[ai].guards.len; gi++)
+                                if (body_match.arms[ai].guards[gi].fail_kind ==
+                                    HirGuard::FailKind::LoopControl)
+                                    return true;
+                    }
+                    return false;
+                };
+                const HirLocal* dynamic_response = nullptr;
+                for (u32 li = 0; li < route.locals.len; li++) {
+                    if (route.locals[li].init.kind == HirExprKind::ResponseInit &&
+                        route.locals[li].init.bool_value) {
+                        dynamic_response = &route.locals[li];
+                        break;
+                    }
+                }
+                if (dynamic_response != nullptr) {
+                    auto invalid_term = [&](const HirTerminator& term) {
+                        if (term.span.start == 0 && term.span.end == 0) return false;
+                        return !term.commit_response_mutations ||
+                               term.local_ref_index != dynamic_response->ref_index;
+                    };
+                    auto invalid_guard = [&](const HirGuard& guard) {
+                        if (guard.fail_kind == HirGuard::FailKind::Term)
+                            return invalid_term(guard.fail_term);
+                        if (guard.fail_kind == HirGuard::FailKind::Match) {
+                            for (u32 ai = 0; ai < guard.fail_match_count; ai++)
+                                if (invalid_term(mod.guard_match_arms[guard.fail_match_start + ai]
+                                                     .direct_term))
+                                    return true;
+                            return false;
+                        }
+                        if (guard.fail_kind != HirGuard::FailKind::Body) return false;
+                        if (guard.fail_body.body_kind == HirGuardBody::BodyKind::If)
+                            return invalid_term(guard.fail_body.then_term) ||
+                                   invalid_term(guard.fail_body.else_term);
+                        return invalid_term(guard.fail_body.direct_term);
+                    };
+                    auto invalid_loop = [&](auto&& self, const HirForLoop& candidate) -> bool {
+                        const auto& body = candidate.body;
+                        if (body.term.span.end != 0 && invalid_term(body.term)) return true;
+                        for (u32 gi = 0; gi < body.guards.len; gi++)
+                            if (invalid_guard(body.guards[gi])) return true;
+                        for (u32 ii = 0; ii < body.ifs.len; ii++) {
+                            if (body.ifs[ii].then_branch.kind == HirForLoopBranch::Kind::Term &&
+                                invalid_term(body.ifs[ii].then_branch.term))
+                                return true;
+                            if (body.ifs[ii].else_branch.kind == HirForLoopBranch::Kind::Term &&
+                                invalid_term(body.ifs[ii].else_branch.term))
+                                return true;
+                        }
+                        for (u32 mi = 0; mi < body.matches.len; mi++) {
+                            for (u32 ai = 0; ai < body.matches[mi].arms.len; ai++) {
+                                const auto& arm = body.matches[mi].arms[ai];
+                                for (u32 gi = 0; gi < arm.guards.len; gi++)
+                                    if (invalid_guard(arm.guards[gi])) return true;
+                                if (arm.body_kind == HirForLoopMatchArm::BodyKind::Direct) {
+                                    if (arm.direct_branch.kind == HirForLoopBranch::Kind::Term &&
+                                        invalid_term(arm.direct_branch.term))
+                                        return true;
+                                } else {
+                                    if (arm.then_branch.kind == HirForLoopBranch::Kind::Term &&
+                                        invalid_term(arm.then_branch.term))
+                                        return true;
+                                    if (arm.else_branch.kind == HirForLoopBranch::Kind::Term &&
+                                        invalid_term(arm.else_branch.term))
+                                        return true;
+                                }
+                            }
+                        }
+                        for (u32 si = 0; si < body.steps.len; si++) {
+                            const auto& child = body.steps[si];
+                            if (child.kind == HirForLoopBody::Step::Kind::For &&
+                                child.index < route.for_loops.len &&
+                                self(self, route.for_loops[child.index]))
+                                return true;
+                        }
+                        return false;
+                    };
+                    if (invalid_loop(invalid_loop, analyzed_loop))
+                        return frontend_error(
+                            FrontendError::UnsupportedSyntax,
+                            stmt.span,
+                            lit_str("a dynamically mutated Response builder must be returned "
+                                    "directly"));
+                }
+                u32 iter_len = 0;
+                if (analyzed_loop.body.has_term && !loop_may_skip_terminator(analyzed_loop) &&
+                    static_for_iter_len(analyzed_loop.iter_expr,
+                                        route.locals.data,
+                                        route.locals.len,
+                                        0,
+                                        &iter_len) &&
+                    iter_len != 0)
+                    has_guaranteed_loop_terminator = true;
                 continue;
             }
             if (stmt.kind == AstStmtKind::Break || stmt.kind == AstStmtKind::Continue) {
@@ -22958,7 +23672,7 @@ static FrontendResult<HirModule*> analyze_file_internal(
                 route.locals[li].span,
                 lit_str("Response.body reads in conditional value branches are not supported"));
         }
-        if (route_control_conditionally_reads_response_body(route))
+        if (route_control_conditionally_reads_response_body(route, mod))
             return frontend_error(
                 FrontendError::UnsupportedSyntax,
                 route_decl.span,
@@ -22967,8 +23681,8 @@ static FrontendResult<HirModule*> analyze_file_internal(
         // Deferred terminal JSON values are rooted by route-expression
         // indices. Snapshot all pre-after reads now, before inlining chain
         // arguments/effects into the same arena.
-        bool response_field_read_before_chain_after = route_reads_response_field(route);
-        bool response_header_read_before_chain_after = route_reads_response_header(route);
+        bool response_field_read_before_chain_after = route_reads_response_field(route, mod);
+        bool response_header_read_before_chain_after = route_reads_response_header(route, mod);
         for (u32 ei = 0; ei < route.exprs.len; ei++)
             response_field_read_before_chain_after |=
                 hir_expr_reads_response_field(route.exprs[ei]);
@@ -23022,6 +23736,22 @@ static FrontendResult<HirModule*> analyze_file_internal(
             auto is_streaming_forward = [](const HirTerminator& term) {
                 return term.kind == HirTerminatorKind::ForwardUpstream && !term.forward_buffered;
             };
+            auto guard_has_streaming_forward = [&](const HirGuard& guard) {
+                if (guard.fail_kind == HirGuard::FailKind::Term)
+                    return is_streaming_forward(guard.fail_term);
+                if (guard.fail_kind == HirGuard::FailKind::Match) {
+                    for (u32 ai = 0; ai < guard.fail_match_count; ai++)
+                        if (is_streaming_forward(
+                                mod.guard_match_arms[guard.fail_match_start + ai].direct_term))
+                            return true;
+                    return false;
+                }
+                if (guard.fail_kind != HirGuard::FailKind::Body) return false;
+                if (guard.fail_body.body_kind == HirGuardBody::BodyKind::If)
+                    return is_streaming_forward(guard.fail_body.then_term) ||
+                           is_streaming_forward(guard.fail_body.else_term);
+                return is_streaming_forward(guard.fail_body.direct_term);
+            };
             bool has_streaming_forward = false;
             if (route.control.kind == HirControlKind::Direct) {
                 has_streaming_forward = is_streaming_forward(route.control.direct_term);
@@ -23039,6 +23769,28 @@ static FrontendResult<HirModule*> analyze_file_internal(
                     }
                 }
             }
+            for (u32 fi = 0; fi < route.for_loops.len; fi++) {
+                const auto& body = route.for_loops[fi].body;
+                if (body.term.span.end != 0)
+                    has_streaming_forward |= is_streaming_forward(body.term);
+                for (u32 gi = 0; gi < body.guards.len; gi++)
+                    has_streaming_forward |= guard_has_streaming_forward(body.guards[gi]);
+                for (u32 ii = 0; ii < body.ifs.len; ii++)
+                    has_streaming_forward |= is_streaming_forward(body.ifs[ii].then_branch.term) ||
+                                             is_streaming_forward(body.ifs[ii].else_branch.term);
+                for (u32 mi = 0; mi < body.matches.len; mi++) {
+                    for (u32 ai = 0; ai < body.matches[mi].arms.len; ai++) {
+                        const auto& arm = body.matches[mi].arms[ai];
+                        for (u32 gi = 0; gi < arm.guards.len; gi++)
+                            has_streaming_forward |= guard_has_streaming_forward(arm.guards[gi]);
+                        if (arm.body_kind == HirForLoopMatchArm::BodyKind::Direct)
+                            has_streaming_forward |= is_streaming_forward(arm.direct_branch.term);
+                        else
+                            has_streaming_forward |= is_streaming_forward(arm.then_branch.term) ||
+                                                     is_streaming_forward(arm.else_branch.term);
+                    }
+                }
+            }
             if (has_streaming_forward)
                 return frontend_error(
                     FrontendError::UnsupportedSyntax,
@@ -23046,6 +23798,21 @@ static FrontendResult<HirModule*> analyze_file_internal(
                     lit_str(
                         "chain after Response mutations require `forward(..., buffered: true)`"));
             auto mark_commit = [](HirTerminator& term) { term.commit_response_mutations = true; };
+            auto mark_guard_commit = [&](HirGuard& guard) {
+                if (guard.fail_kind == HirGuard::FailKind::Term) {
+                    mark_commit(guard.fail_term);
+                } else if (guard.fail_kind == HirGuard::FailKind::Match) {
+                    for (u32 ai = 0; ai < guard.fail_match_count; ai++)
+                        mark_commit(mod.guard_match_arms[guard.fail_match_start + ai].direct_term);
+                } else if (guard.fail_kind == HirGuard::FailKind::Body) {
+                    if (guard.fail_body.body_kind == HirGuardBody::BodyKind::If) {
+                        mark_commit(guard.fail_body.then_term);
+                        mark_commit(guard.fail_body.else_term);
+                    } else {
+                        mark_commit(guard.fail_body.direct_term);
+                    }
+                }
+            };
             if (route.control.kind == HirControlKind::Direct) {
                 mark_commit(route.control.direct_term);
             } else if (route.control.kind == HirControlKind::If) {
@@ -23059,6 +23826,33 @@ static FrontendResult<HirModule*> analyze_file_internal(
                     } else {
                         mark_commit(arm.then_term);
                         mark_commit(arm.else_term);
+                    }
+                }
+            }
+            for (u32 fi = 0; fi < route.for_loops.len; fi++) {
+                auto& body = route.for_loops[fi].body;
+                if (body.term.span.end != 0) mark_commit(body.term);
+                for (u32 gi = 0; gi < body.guards.len; gi++) mark_guard_commit(body.guards[gi]);
+                for (u32 ii = 0; ii < body.ifs.len; ii++) {
+                    if (body.ifs[ii].then_branch.kind == HirForLoopBranch::Kind::Term)
+                        mark_commit(body.ifs[ii].then_branch.term);
+                    if (body.ifs[ii].else_branch.kind == HirForLoopBranch::Kind::Term)
+                        mark_commit(body.ifs[ii].else_branch.term);
+                }
+                for (u32 mi = 0; mi < body.matches.len; mi++) {
+                    for (u32 ai = 0; ai < body.matches[mi].arms.len; ai++) {
+                        auto& arm = body.matches[mi].arms[ai];
+                        for (u32 gi = 0; gi < arm.guards.len; gi++)
+                            mark_guard_commit(arm.guards[gi]);
+                        if (arm.body_kind == HirForLoopMatchArm::BodyKind::Direct) {
+                            if (arm.direct_branch.kind == HirForLoopBranch::Kind::Term)
+                                mark_commit(arm.direct_branch.term);
+                        } else {
+                            if (arm.then_branch.kind == HirForLoopBranch::Kind::Term)
+                                mark_commit(arm.then_branch.term);
+                            if (arm.else_branch.kind == HirForLoopBranch::Kind::Term)
+                                mark_commit(arm.else_branch.term);
+                        }
                     }
                 }
             }
@@ -23102,10 +23896,24 @@ static FrontendResult<HirModule*> analyze_file_internal(
         // A ws-terminate route carries a HirWsHandler, not a direct_term, so its empty
         // direct_term is expected — don't flag it as a missing terminator.
         if (!route.is_ws_terminate && route.control.kind == HirControlKind::Direct &&
-            route.control.direct_term.span.end == 0 && route.control.direct_term.span.start == 0)
+            route.control.direct_term.span.end == 0 && route.control.direct_term.span.start == 0 &&
+            !has_guaranteed_loop_terminator)
             return frontend_error(FrontendError::UnsupportedSyntax, route_decl.span);
 
         FixedVec<RouteNamedErrorCase, HirVariant::kMaxCases> named_error_cases;
+        const auto collect_guard_match_arm_named_errors =
+            [&](u32 arm_index) -> FrontendResult<void> {
+            if (arm_index >= mod.guard_match_arms.len)
+                return frontend_error(FrontendError::UnsupportedSyntax, route_decl.span);
+            const auto& arm = mod.guard_match_arms[arm_index];
+            auto collected = collect_named_error_cases(arm.pattern, named_error_cases);
+            if (!collected) return core::make_unexpected(collected.error());
+            for (u32 li = 0; li < arm.locals.len; li++) {
+                collected = collect_named_error_cases(arm.locals[li].init, named_error_cases);
+                if (!collected) return core::make_unexpected(collected.error());
+            }
+            return {};
+        };
         for (u32 li = 0; li < route.locals.len; li++) {
             auto collected = collect_named_error_cases(route.locals[li].init, named_error_cases);
             if (!collected) return core::make_unexpected(collected.error());
@@ -23122,18 +23930,31 @@ static FrontendResult<HirModule*> analyze_file_internal(
                 if (!collected) return core::make_unexpected(collected.error());
             }
             for (u32 ai = 0; ai < route.guards[gi].fail_match_count; ai++) {
-                collected = collect_named_error_cases(
-                    mod.guard_match_arms[route.guards[gi].fail_match_start + ai].pattern,
-                    named_error_cases);
+                collected =
+                    collect_guard_match_arm_named_errors(route.guards[gi].fail_match_start + ai);
                 if (!collected) return core::make_unexpected(collected.error());
             }
         }
+        const auto collect_branch_named_errors =
+            [&](const HirForLoopBranch& branch) -> FrontendResult<void> {
+            for (u32 li = 0; li < branch.locals.len; li++) {
+                auto collected =
+                    collect_named_error_cases(branch.locals[li].init, named_error_cases);
+                if (!collected) return core::make_unexpected(collected.error());
+            }
+            return {};
+        };
         for (u32 fi = 0; fi < route.for_loops.len; fi++) {
             auto collected =
                 collect_named_error_cases(route.for_loops[fi].iter_expr, named_error_cases);
             if (!collected) return core::make_unexpected(collected.error());
             for (u32 li = 0; li < route.for_loops[fi].body.locals.len; li++) {
                 collected = collect_named_error_cases(route.for_loops[fi].body.locals[li].init,
+                                                      named_error_cases);
+                if (!collected) return core::make_unexpected(collected.error());
+            }
+            for (u32 li = 0; li < route.for_loops[fi].body.term_locals.len; li++) {
+                collected = collect_named_error_cases(route.for_loops[fi].body.term_locals[li].init,
                                                       named_error_cases);
                 if (!collected) return core::make_unexpected(collected.error());
             }
@@ -23154,15 +23975,19 @@ static FrontendResult<HirModule*> analyze_file_internal(
                     if (!collected) return core::make_unexpected(collected.error());
                 }
                 for (u32 ai = 0; ai < guard.fail_match_count; ai++) {
-                    collected = collect_named_error_cases(
-                        mod.guard_match_arms[guard.fail_match_start + ai].pattern,
-                        named_error_cases);
+                    collected = collect_guard_match_arm_named_errors(guard.fail_match_start + ai);
                     if (!collected) return core::make_unexpected(collected.error());
                 }
             }
             for (u32 ii = 0; ii < route.for_loops[fi].body.ifs.len; ii++) {
                 collected = collect_named_error_cases(route.for_loops[fi].body.ifs[ii].cond,
                                                       named_error_cases);
+                if (!collected) return core::make_unexpected(collected.error());
+                collected =
+                    collect_branch_named_errors(route.for_loops[fi].body.ifs[ii].then_branch);
+                if (!collected) return core::make_unexpected(collected.error());
+                collected =
+                    collect_branch_named_errors(route.for_loops[fi].body.ifs[ii].else_branch);
                 if (!collected) return core::make_unexpected(collected.error());
             }
             for (u32 mi = 0; mi < route.for_loops[fi].body.matches.len; mi++) {
@@ -23199,13 +24024,18 @@ static FrontendResult<HirModule*> analyze_file_internal(
                             if (!collected) return core::make_unexpected(collected.error());
                         }
                         for (u32 fai = 0; fai < guard.fail_match_count; fai++) {
-                            collected = collect_named_error_cases(
-                                mod.guard_match_arms[guard.fail_match_start + fai].pattern,
-                                named_error_cases);
+                            collected =
+                                collect_guard_match_arm_named_errors(guard.fail_match_start + fai);
                             if (!collected) return core::make_unexpected(collected.error());
                         }
                     }
                     collected = collect_named_error_cases(arm.cond, named_error_cases);
+                    if (!collected) return core::make_unexpected(collected.error());
+                    collected = collect_branch_named_errors(arm.then_branch);
+                    if (!collected) return core::make_unexpected(collected.error());
+                    collected = collect_branch_named_errors(arm.else_branch);
+                    if (!collected) return core::make_unexpected(collected.error());
+                    collected = collect_branch_named_errors(arm.direct_branch);
                     if (!collected) return core::make_unexpected(collected.error());
                 }
             }
@@ -23243,11 +24073,8 @@ static FrontendResult<HirModule*> analyze_file_internal(
                     for (u32 fai = 0;
                          fai < route.control.match_arms[ai].guards[gi].fail_match_count;
                          fai++) {
-                        collected = collect_named_error_cases(
-                            mod.guard_match_arms
-                                [route.control.match_arms[ai].guards[gi].fail_match_start + fai]
-                                    .pattern,
-                            named_error_cases);
+                        collected = collect_guard_match_arm_named_errors(
+                            route.control.match_arms[ai].guards[gi].fail_match_start + fai);
                         if (!collected) return core::make_unexpected(collected.error());
                     }
                 }
@@ -23269,6 +24096,26 @@ static FrontendResult<HirModule*> analyze_file_internal(
             if (!mod.variants.push(error_variant))
                 return frontend_error(FrontendError::TooManyItems, route_decl.span);
             route.error_variant_index = mod.variants.len - 1;
+            const auto patch_local_named_errors = [&](HirLocal& local) {
+                patch_named_error_variant(
+                    &local.init, route.error_variant_index, named_error_cases);
+                patch_error_variant_refs(&local.init, route.error_variant_index);
+                if (local.may_error && local.error_variant_index == 0xffffffffu)
+                    local.error_variant_index = route.error_variant_index;
+            };
+            const auto patch_guard_match_arm_named_errors = [&](u32 arm_index) {
+                if (arm_index >= mod.guard_match_arms.len) return;
+                auto& arm = mod.guard_match_arms[arm_index];
+                patch_named_error_variant(
+                    &arm.pattern, route.error_variant_index, named_error_cases);
+                patch_error_variant_refs(&arm.pattern, route.error_variant_index);
+                for (u32 li = 0; li < arm.locals.len; li++)
+                    patch_local_named_errors(arm.locals[li]);
+            };
+            const auto patch_branch_named_errors = [&](HirForLoopBranch& branch) {
+                for (u32 li = 0; li < branch.locals.len; li++)
+                    patch_local_named_errors(branch.locals[li]);
+            };
             for (u32 li = 0; li < route.locals.len; li++) {
                 patch_named_error_variant(
                     &route.locals[li].init, route.error_variant_index, named_error_cases);
@@ -23295,13 +24142,7 @@ static FrontendResult<HirModule*> analyze_file_internal(
                         local.error_variant_index = route.error_variant_index;
                 }
                 for (u32 ai = 0; ai < route.guards[gi].fail_match_count; ai++) {
-                    patch_named_error_variant(
-                        &mod.guard_match_arms[route.guards[gi].fail_match_start + ai].pattern,
-                        route.error_variant_index,
-                        named_error_cases);
-                    patch_error_variant_refs(
-                        &mod.guard_match_arms[route.guards[gi].fail_match_start + ai].pattern,
-                        route.error_variant_index);
+                    patch_guard_match_arm_named_errors(route.guards[gi].fail_match_start + ai);
                 }
             }
             for (u32 fi = 0; fi < route.for_loops.len; fi++) {
@@ -23310,6 +24151,14 @@ static FrontendResult<HirModule*> analyze_file_internal(
                 patch_error_variant_refs(&route.for_loops[fi].iter_expr, route.error_variant_index);
                 for (u32 li = 0; li < route.for_loops[fi].body.locals.len; li++) {
                     HirLocal& local = route.for_loops[fi].body.locals[li];
+                    patch_named_error_variant(
+                        &local.init, route.error_variant_index, named_error_cases);
+                    patch_error_variant_refs(&local.init, route.error_variant_index);
+                    if (local.may_error && local.error_variant_index == 0xffffffffu)
+                        local.error_variant_index = route.error_variant_index;
+                }
+                for (u32 li = 0; li < route.for_loops[fi].body.term_locals.len; li++) {
+                    HirLocal& local = route.for_loops[fi].body.term_locals[li];
                     patch_named_error_variant(
                         &local.init, route.error_variant_index, named_error_cases);
                     patch_error_variant_refs(&local.init, route.error_variant_index);
@@ -23339,13 +24188,7 @@ static FrontendResult<HirModule*> analyze_file_internal(
                         patch_error_variant_refs(&guard.fail_body.cond, route.error_variant_index);
                     }
                     for (u32 ai = 0; ai < guard.fail_match_count; ai++) {
-                        patch_named_error_variant(
-                            &mod.guard_match_arms[guard.fail_match_start + ai].pattern,
-                            route.error_variant_index,
-                            named_error_cases);
-                        patch_error_variant_refs(
-                            &mod.guard_match_arms[guard.fail_match_start + ai].pattern,
-                            route.error_variant_index);
+                        patch_guard_match_arm_named_errors(guard.fail_match_start + ai);
                     }
                 }
                 for (u32 ii = 0; ii < route.for_loops[fi].body.ifs.len; ii++) {
@@ -23354,6 +24197,8 @@ static FrontendResult<HirModule*> analyze_file_internal(
                                               named_error_cases);
                     patch_error_variant_refs(&route.for_loops[fi].body.ifs[ii].cond,
                                              route.error_variant_index);
+                    patch_branch_named_errors(route.for_loops[fi].body.ifs[ii].then_branch);
+                    patch_branch_named_errors(route.for_loops[fi].body.ifs[ii].else_branch);
                 }
                 for (u32 mi = 0; mi < route.for_loops[fi].body.matches.len; mi++) {
                     patch_named_error_variant(&route.for_loops[fi].body.matches[mi].match_expr,
@@ -23404,18 +24249,15 @@ static FrontendResult<HirModule*> analyze_file_internal(
                                                          route.error_variant_index);
                             }
                             for (u32 fai = 0; fai < guard.fail_match_count; fai++) {
-                                patch_named_error_variant(
-                                    &mod.guard_match_arms[guard.fail_match_start + fai].pattern,
-                                    route.error_variant_index,
-                                    named_error_cases);
-                                patch_error_variant_refs(
-                                    &mod.guard_match_arms[guard.fail_match_start + fai].pattern,
-                                    route.error_variant_index);
+                                patch_guard_match_arm_named_errors(guard.fail_match_start + fai);
                             }
                         }
                         patch_named_error_variant(
                             &arm.cond, route.error_variant_index, named_error_cases);
                         patch_error_variant_refs(&arm.cond, route.error_variant_index);
+                        patch_branch_named_errors(arm.then_branch);
+                        patch_branch_named_errors(arm.else_branch);
+                        patch_branch_named_errors(arm.direct_branch);
                     }
                 }
             }
@@ -23467,19 +24309,8 @@ static FrontendResult<HirModule*> analyze_file_internal(
                         for (u32 fai = 0;
                              fai < route.control.match_arms[ai].guards[gi].fail_match_count;
                              fai++) {
-                            patch_named_error_variant(
-                                &mod.guard_match_arms
-                                     [route.control.match_arms[ai].guards[gi].fail_match_start +
-                                      fai]
-                                         .pattern,
-                                route.error_variant_index,
-                                named_error_cases);
-                            patch_error_variant_refs(
-                                &mod.guard_match_arms
-                                     [route.control.match_arms[ai].guards[gi].fail_match_start +
-                                      fai]
-                                         .pattern,
-                                route.error_variant_index);
+                            patch_guard_match_arm_named_errors(
+                                route.control.match_arms[ai].guards[gi].fail_match_start + fai);
                         }
                     }
                     patch_named_error_variant(&route.control.match_arms[ai].cond,
@@ -23703,6 +24534,10 @@ static FrontendResult<HirModule*> analyze_file_internal(
         if (!route.is_timer) http_route_count++;
         if (!mod.routes.push(route))
             return frontend_error(FrontendError::TooManyItems, route_decl.span);
+        HirRoute& stored_route = mod.routes[mod.routes.len - 1];
+        for (u32 ai = 0; ai < mod.guard_match_arms.len; ai++) {
+            stored_route.rebase_guard_match_arm(mod.guard_match_arms[ai], route);
+        }
     }
 
     if (source_path.len != 0 && !import_stack.empty()) import_stack.pop_back();

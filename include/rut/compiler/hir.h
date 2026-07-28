@@ -6,6 +6,7 @@
 #include "rut/compiler/diagnostic.h"
 #include <deque>
 #include <string>
+#include <vector>
 
 namespace rut {
 
@@ -880,8 +881,30 @@ struct HirForLoopBranch {
         Break,
         Continue,
     };
+    static constexpr u32 kMaxLocals = 4;
     Kind kind = Kind::Term;
+    FixedVec<HirLocal, kMaxLocals> locals;
     HirTerminator term{};
+};
+
+// Guard-failure bodies are embedded through guards, loop arms, routes, and
+// modules. Inline storage for sixteen HirLocals therefore multiplies into
+// hundreds of megabytes even when no failure body uses a deferred carrier.
+// Retain the hard language limit while allocating storage only for bodies
+// that actually need it.
+struct HirGuardBodyLocals {
+    static constexpr u32 kMaxLocals = 16;
+    std::vector<HirLocal> data;
+    u32 len = 0;
+
+    bool push(const HirLocal& local) {
+        if (len >= kMaxLocals) return false;
+        data.push_back(local);
+        len++;
+        return true;
+    }
+    HirLocal& operator[](u32 index) { return data[index]; }
+    const HirLocal& operator[](u32 index) const { return data[index]; }
 };
 
 struct HirGuardBody {
@@ -890,9 +913,16 @@ struct HirGuardBody {
         If,
     };
 
-    static constexpr u32 kMaxLocals = 4;
+    static constexpr u32 kMaxLocals = HirGuardBodyLocals::kMaxLocals;
     BodyKind body_kind = BodyKind::Direct;
-    FixedVec<HirLocal, kMaxLocals> locals;
+    HirGuardBodyLocals locals;
+    u8 shared_local_count = 0;
+    u8 then_term_local_start = 0;
+    u8 then_term_local_count = 0;
+    u8 else_term_local_start = 0;
+    u8 else_term_local_count = 0;
+    u8 direct_term_local_start = 0;
+    u8 direct_term_local_count = 0;
     HirExpr cond{};
     bool has_then_local = false;
     HirLocal then_local{};
@@ -905,6 +935,7 @@ struct HirGuardMatchArm {
     Span span{};
     bool is_wildcard = false;
     HirExpr pattern{};
+    FixedVec<HirLocal, HirForLoopBranch::kMaxLocals> locals;
     HirTerminator direct_term{};
 };
 
@@ -1009,11 +1040,35 @@ struct HirForLoopMatchArm {
     u32 bind_tuple_variant_indices[kMaxTupleSlots]{};
     u32 bind_tuple_struct_indices[kMaxTupleSlots]{};
     bool has_arm_guard = false;
+    // Source-arm guards run before body preludes; guards synthesized while
+    // flattening a nested body match run after those preludes.
+    bool arm_guard_precedes_prelude = false;
     HirExpr arm_guard{};
+    // A flattened nested match can require a second guard after source-arm
+    // body locals have been materialized. Keep that expression in the route
+    // arena instead of embedding another HirExpr in every arm.
+    u32 post_arm_guard_expr_index = 0xffffffffu;
     BodyKind body_kind = BodyKind::Direct;
-    static constexpr u32 kMaxLocals = 4;
+    // Four source locals, one source-guard helper carrier, plus hidden
+    // carriers used to latch a flattened source-arm guard and request-backed
+    // nested-match subject across the arms in their capture group.
+    static constexpr u32 kMaxLocals = 7;
+    static constexpr u32 kMaxSourceLocals = 4;
     static constexpr u32 kMaxPreludeGuards = 2;
     FixedVec<HirLocal, kMaxLocals> locals;
+    // 0 materializes at arm entry; N materializes only after prelude guard N
+    // succeeds. This keeps guard-let unwrapping off the guard's failure edge.
+    u8 local_guard_depth[kMaxLocals]{};
+    // Synthetic helper carriers (and the hidden flattened-guard latch) needed
+    // to evaluate the source arm guard must materialize before that guard. All
+    // other depth-0 locals belong to the arm body and run only after it passes.
+    bool local_precedes_arm_guard[kMaxLocals]{};
+    // Flattened nested-match arms copied from one source arm share this id so
+    // MIR evaluates their source-arm captures once across guard fallthroughs.
+    u8 capture_group = 0;
+    // Prefix of `locals` shared by every flattened arm in `capture_group`.
+    // Locals appended while analyzing an individual inner arm remain per-arm.
+    u8 capture_local_count = 0;
     FixedVec<HirGuard, kMaxPreludeGuards> guards;
     HirExpr cond{};
     HirForLoopBranch then_branch{};
@@ -1070,6 +1125,7 @@ struct HirForLoopBody {
     FixedVec<HirForLoopIf, kMaxIfs> ifs;
     FixedVec<HirForLoopMatch, kMaxMatches> matches;
     HirTerminator term{};
+    FixedVec<HirLocal, HirForLoopBranch::kMaxLocals> term_locals;
     bool has_term = false;
     // An unconditional loop-control step terminates the current iteration,
     // but unlike has_term it does not terminate the request route.
@@ -1343,6 +1399,17 @@ struct HirRoute {
         return *this;
     }
 
+    // Guard-match arms are stored at module scope to keep HirGuard compact,
+    // but their inline expressions may still point into this route's expr
+    // arena. Rebase those external owners whenever the route is copied out of
+    // analysis scratch storage (and when an entire HirModule is copied).
+    void rebase_guard_match_arm(HirGuardMatchArm& arm, const HirRoute& other) {
+        rebase_expr(arm.pattern, other);
+        for (u32 li = 0; li < arm.locals.len; li++) {
+            rebase_expr(arm.locals[li].init, other);
+        }
+    }
+
 private:
     void rebase_expr_ptr(const HirRoute& other, HirExpr*& ptr) {
         if (ptr == nullptr) return;
@@ -1374,6 +1441,12 @@ private:
         rebase_expr(guard.fail_body.cond, other);
     }
 
+    void rebase_for_branch(HirForLoopBranch& branch, const HirRoute& other) {
+        for (u32 li = 0; li < branch.locals.len; li++) {
+            rebase_expr(branch.locals[li].init, other);
+        }
+    }
+
     void rebase_from(const HirRoute& other) {
         for (u32 i = 0; i < exprs.len; i++) rebase_expr(exprs[i], other);
         for (u32 i = 0; i < locals.len; i++) rebase_expr(locals[i].init, other);
@@ -1387,11 +1460,16 @@ private:
             for (u32 li = 0; li < for_loops[i].body.locals.len; li++) {
                 rebase_expr(for_loops[i].body.locals[li].init, other);
             }
+            for (u32 li = 0; li < for_loops[i].body.term_locals.len; li++) {
+                rebase_expr(for_loops[i].body.term_locals[li].init, other);
+            }
             for (u32 gi = 0; gi < for_loops[i].body.guards.len; gi++) {
                 rebase_guard(for_loops[i].body.guards[gi], other);
             }
             for (u32 ii = 0; ii < for_loops[i].body.ifs.len; ii++) {
                 rebase_expr(for_loops[i].body.ifs[ii].cond, other);
+                rebase_for_branch(for_loops[i].body.ifs[ii].then_branch, other);
+                rebase_for_branch(for_loops[i].body.ifs[ii].else_branch, other);
             }
             for (u32 mi = 0; mi < for_loops[i].body.matches.len; mi++) {
                 rebase_expr(for_loops[i].body.matches[mi].match_expr, other);
@@ -1405,6 +1483,9 @@ private:
                         rebase_guard(for_loops[i].body.matches[mi].arms[ai].guards[gi], other);
                     }
                     rebase_expr(for_loops[i].body.matches[mi].arms[ai].cond, other);
+                    rebase_for_branch(for_loops[i].body.matches[mi].arms[ai].then_branch, other);
+                    rebase_for_branch(for_loops[i].body.matches[mi].arms[ai].else_branch, other);
+                    rebase_for_branch(for_loops[i].body.matches[mi].arms[ai].direct_branch, other);
                 }
             }
         }
@@ -1527,6 +1608,7 @@ struct HirModule {
           package_span(other.package_span),
           package_name(other.package_name) {
         rebase_type_alias_storage_ptrs(other);
+        rebase_guard_match_arm_ptrs(other);
     }
     HirModule& operator=(const HirModule& other) {
         if (this == &other) return *this;
@@ -1550,6 +1632,7 @@ struct HirModule {
         package_span = other.package_span;
         package_name = other.package_name;
         rebase_type_alias_storage_ptrs(other);
+        rebase_guard_match_arm_ptrs(other);
         return *this;
     }
     HirModule(HirModule&& other) noexcept = delete;
@@ -1560,6 +1643,14 @@ struct HirModule {
             rebase_type_ref_tree_ptrs(other, type_aliases[i].target);
             for (u32 arm_i = 0; arm_i < type_aliases[i].arms.len; arm_i++)
                 rebase_type_ref_tree_ptrs(other, type_aliases[i].arms[arm_i].type);
+        }
+    }
+
+    void rebase_guard_match_arm_ptrs(const HirModule& other) {
+        for (u32 ai = 0; ai < guard_match_arms.len; ai++) {
+            for (u32 ri = 0; ri < routes.len && ri < other.routes.len; ri++) {
+                routes[ri].rebase_guard_match_arm(guard_match_arms[ai], other.routes[ri]);
+            }
         }
     }
 

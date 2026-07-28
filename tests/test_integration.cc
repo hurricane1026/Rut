@@ -1323,6 +1323,22 @@ TEST(timer_dsl, rejects_guard_match_forward_in_body) {
     CHECK(hir.error().detail.len != 0);
 }
 
+TEST(timer_dsl, rejects_request_reads_hidden_in_static_loop_branch_carriers) {
+    using namespace rut;
+    const char* src =
+        "func envelope(value: str) -> Json { let payload = json({ value: value }) payload }\n"
+        "timer t, every: 1s { for item in [\"x\"] { if true { return 200, "
+        "envelope(req.path) } else { return 500 } } }\n";
+    auto lexed = lex(Str{src, static_cast<u32>(strlen(src))});
+    REQUIRE(lexed);
+    auto ast = parse_file(lexed.value());
+    REQUIRE(ast);
+    std::unique_ptr<AstFile> ast_owned(ast.value());
+    auto hir = analyze_file(*ast_owned);
+    REQUIRE(!hir);
+    CHECK(hir.error().detail.len != 0);
+}
+
 #if RUT_ENABLE_WEBSOCKET
 // A websocket terminator needs a live client connection; MIR also skips
 // ws-terminate routes entirely, which would silently drop the timer
