@@ -604,16 +604,19 @@ TEST(control_plane_mutation, every_signal_joins_a_contended_busy_publication) {
 
     constexpr u32 kSignals = 16;
     u64 signal_ids[kSignals]{};
+    bool signal_admitted[kSignals]{};
     std::thread signals[kSignals];
     for (u32 i = 0; i < kSignals; i++) {
         signals[i] = std::thread([&, i] {
-            CHECK_FALSE(port.request_reload(ReloadRequestSource::Signal, &signal_ids[i]));
+            signal_admitted[i] = port.request_reload(ReloadRequestSource::Signal, &signal_ids[i]);
         });
     }
     for (auto& signal : signals) signal.join();
 
     bool seen[kSignals + 1]{};
-    for (const u64 signal_id : signal_ids) {
+    for (u32 i = 0; i < kSignals; i++) {
+        CHECK_FALSE(signal_admitted[i]);
+        const u64 signal_id = signal_ids[i];
         REQUIRE(signal_id >= 1 && signal_id <= kSignals);
         CHECK_FALSE(seen[signal_id]);
         seen[signal_id] = true;

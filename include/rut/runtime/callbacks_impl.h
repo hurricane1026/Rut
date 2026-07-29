@@ -80,7 +80,10 @@ struct AllocationBackendHealth {
     u32 address = 0;
     u16 port = 0;
     u16 family = 0;
+    u16 seed_allocation = ControlPlaneMutationPort::kInvalidAllocation;
+    u64 seed_incarnation = 0;
     bool owner_set = false;
+    bool transitioning = false;
     BackendHealth health{};
 };
 
@@ -90,7 +93,8 @@ inline BackendHealth* backend_health_allocation(
     u32 backend_idx = 0,
     u64 incarnation = 0,
     u16 seed_allocation = ControlPlaneMutationPort::kInvalidAllocation,
-    u64 seed_incarnation = 0) {
+    u64 seed_incarnation = 0,
+    bool observe_transition = false) {
     static thread_local AllocationBackendHealth
         health[ControlPlaneMutationPort::kMaxEndpointAllocations] = {};
     if (allocation >= ControlPlaneMutationPort::kMaxEndpointAllocations) return nullptr;
@@ -102,10 +106,13 @@ inline BackendHealth* backend_health_allocation(
             cell.address != endpoint.sin_addr.s_addr || cell.port != endpoint.sin_port ||
             cell.family != endpoint.sin_family) {
             BackendHealth seed{};
-            if (seed_allocation < ControlPlaneMutationPort::kMaxEndpointAllocations) {
+            const bool can_seed =
+                target->hc_enabled &&
+                seed_allocation < ControlPlaneMutationPort::kMaxEndpointAllocations;
+            if (can_seed) {
                 const auto& source = health[seed_allocation];
                 if (source.owner_set && source.incarnation == seed_incarnation) {
-                    seed.active_down = target->hc_enabled && source.health.active_down;
+                    seed.active_down = source.health.active_down;
                     seed.fails = source.health.fails;
                     seed.eject_until_us = source.health.eject_until_us;
                 }
@@ -115,10 +122,30 @@ inline BackendHealth* backend_health_allocation(
             cell.address = endpoint.sin_addr.s_addr;
             cell.port = endpoint.sin_port;
             cell.family = endpoint.sin_family;
+            cell.seed_allocation =
+                can_seed ? seed_allocation : ControlPlaneMutationPort::kInvalidAllocation;
+            cell.seed_incarnation = can_seed ? seed_incarnation : 0;
             cell.owner_set = true;
+            cell.transitioning = can_seed;
             cell.health = seed;
         }
     }
+    auto refresh_transition = [&](auto&& self, AllocationBackendHealth& destination, u32 depth) {
+        if (!destination.transitioning ||
+            destination.seed_allocation >= ControlPlaneMutationPort::kMaxEndpointAllocations ||
+            depth >= ControlPlaneMutationPort::kMaxEndpointAllocations)
+            return;
+        auto& source = health[destination.seed_allocation];
+        if (!source.owner_set || source.incarnation != destination.seed_incarnation) return;
+        self(self, source, depth + 1);
+        destination.health.active_down |= source.health.active_down;
+        if (destination.health.fails < source.health.fails)
+            destination.health.fails = source.health.fails;
+        if (destination.health.eject_until_us < source.health.eject_until_us)
+            destination.health.eject_until_us = source.health.eject_until_us;
+    };
+    refresh_transition(refresh_transition, cell, 0);
+    if (observe_transition) cell.transitioning = false;
     return &cell.health;
 }
 
@@ -179,7 +206,7 @@ inline void record_backend_result_allocation(
     u16 seed_allocation = ControlPlaneMutationPort::kInvalidAllocation,
     u64 seed_incarnation = 0) {
     BackendHealth* h = backend_health_allocation(
-        allocation, target, backend_idx, incarnation, seed_allocation, seed_incarnation);
+        allocation, target, backend_idx, incarnation, seed_allocation, seed_incarnation, true);
     if (h == nullptr) return;
     if (success) {
         h->fails = 0;
@@ -229,7 +256,7 @@ inline void record_active_probe_result_allocation(
     u64 seed_incarnation = 0) {
     (void)now_us;
     BackendHealth* h = backend_health_allocation(
-        allocation, target, backend_idx, incarnation, seed_allocation, seed_incarnation);
+        allocation, target, backend_idx, incarnation, seed_allocation, seed_incarnation, true);
     if (h == nullptr) return;
     if (healthy) {
         h->active_down = false;

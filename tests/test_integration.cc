@@ -2752,6 +2752,13 @@ TEST(active_health, policy_health_is_eagerly_migrated_and_active_down_drops_when
         third_allocation, 2, &third_config.upstreams[0], 0, third_incarnation));
     CHECK_NE(port.endpoint_probe_allocation_for_config(&third_config, 0, 0),
              port.endpoint_probe_allocation_for_config(&third_config, 0, 1));
+    record_active_probe_result_allocation(
+        third_allocation, true, 3, &third_config.upstreams[0], 0, third_incarnation);
+    for (u16 failure = 0; failure < kBackendFailThreshold; failure++)
+        record_backend_result_allocation(
+            third_allocation, false, 4, &third_config.upstreams[0], 0, third_incarnation);
+    CHECK(backend_ejected_allocation(
+        third_allocation, 4, &third_config.upstreams[0], 0, third_incarnation));
 
     RouteConfig disabled_config;
     REQUIRE(disabled_config.add_upstream("policy-chain", 0x7f000001u, 8016).has_value());
@@ -2760,6 +2767,71 @@ TEST(active_health, policy_health_is_eagerly_migrated_and_active_down_drops_when
     const u64 disabled_incarnation = port.endpoint_incarnation_for_config(&disabled_config, 0, 0);
     CHECK_FALSE(backend_ejected_allocation(
         disabled_allocation, 2, &disabled_config.upstreams[0], 0, disabled_incarnation));
+    record_backend_result_allocation(
+        disabled_allocation, false, 5, &disabled_config.upstreams[0], 0, disabled_incarnation);
+    CHECK_FALSE(backend_ejected_allocation(
+        disabled_allocation, 5, &disabled_config.upstreams[0], 0, disabled_incarnation));
+}
+
+TEST(active_health, late_retained_failure_propagates_until_successor_observes) {
+    ControlPlaneMutationPort port;
+    RouteConfig old_config;
+    REQUIRE(old_config.add_upstream("late-health", 0x7f000001u, 8019).has_value());
+    REQUIRE(old_config.set_upstream_health_check(0, "/health", 7, 1000, 200));
+    port.reset(91, true, &old_config);
+    const u16 old_allocation = port.endpoint_allocation_for_config(&old_config, 0, 0);
+    const u64 old_incarnation = port.endpoint_incarnation_for_config(&old_config, 0, 0);
+
+    u64 id = 0;
+    REQUIRE(port.request_reload(ReloadRequestSource::Route, &id));
+    ReloadRequest request{};
+    REQUIRE(port.take_reload(&request));
+    RouteConfig new_config;
+    REQUIRE(new_config.add_upstream("late-health", 0x7f000001u, 8019).has_value());
+    REQUIRE(new_config.set_upstream_health_check(0, "/health", 7, 2000, 200));
+    REQUIRE(port.complete_reload(
+        id, request.source, ReloadTerminalOutcome::Activated, 92, &new_config));
+    materialize_control_plane_health(&port, &new_config);
+    const u16 new_allocation = port.endpoint_allocation_for_config(&new_config, 0, 0);
+    const u64 new_incarnation = port.endpoint_incarnation_for_config(&new_config, 0, 0);
+    const u16 seed_allocation = port.endpoint_health_seed_allocation_for_config(&new_config, 0, 0);
+    const u64 seed_incarnation =
+        port.endpoint_health_seed_incarnation_for_config(&new_config, 0, 0);
+    CHECK_FALSE(backend_ejected_allocation(new_allocation,
+                                           1,
+                                           &new_config.upstreams[0],
+                                           0,
+                                           new_incarnation,
+                                           seed_allocation,
+                                           seed_incarnation));
+
+    record_active_probe_result_allocation(
+        old_allocation, false, 2, &old_config.upstreams[0], 0, old_incarnation);
+    CHECK(backend_ejected_allocation(new_allocation,
+                                     2,
+                                     &new_config.upstreams[0],
+                                     0,
+                                     new_incarnation,
+                                     seed_allocation,
+                                     seed_incarnation));
+
+    record_active_probe_result_allocation(new_allocation,
+                                          true,
+                                          3,
+                                          &new_config.upstreams[0],
+                                          0,
+                                          new_incarnation,
+                                          seed_allocation,
+                                          seed_incarnation);
+    record_active_probe_result_allocation(
+        old_allocation, false, 4, &old_config.upstreams[0], 0, old_incarnation);
+    CHECK_FALSE(backend_ejected_allocation(new_allocation,
+                                           4,
+                                           &new_config.upstreams[0],
+                                           0,
+                                           new_incarnation,
+                                           seed_allocation,
+                                           seed_incarnation));
 }
 
 TEST(active_health, retained_probe_success_is_accepted_after_cutover) {
