@@ -261,16 +261,30 @@ transport cancellation is discarded rather than advancing the verdict/version.
 
 For a compatible endpoint and probe policy, the stable scheduler allocation
 also transfers the pending deadline, cadence phase, cursor, and single-flight
-epoch. A changed policy uses an installation-time anchor, starts in `warming`,
-retains any predecessor unhealthy/ejected verdict, and cannot enter normal
-selection until its first successful replacement probe publishes or validation
-rejects the reload. A new or replaced endpoint configured with `warming: true`
-likewise begins excluded in a fresh allocation and becomes eligible only when
-its first successful probe atomically publishes a healthy version and
-slow-start recovery epoch. Every sweep records its monotonic sample and, for
-each due server, the exact launch, already-in-flight, completion-budget defer,
-allocation/socket/buffer/submission failure, or successful-start outcome. A
-failed start is a recorded defer, not an invisible no-op.
+epoch. A changed policy that still schedules active probes uses an
+installation-time anchor, starts in `warming`, retains any predecessor
+unhealthy/ejected verdict, and cannot enter normal selection until its first
+successful replacement probe publishes; validation rejects the reload if the
+replacement policy cannot schedule that probe.
+
+A changed policy that removes active probing never enters that probe-dependent
+`warming` state. Installation atomically discards the predecessor's active-probe
+verdict and publishes an eligible baseline under the replacement policy. A
+passive-only replacement starts with neutral passive counters and can publish
+later failure or recovery observations from selected traffic; a policy with no
+probing remains normally selectable. Either transition starts a new slow-start
+epoch, so disabling active probing cannot strand an endpoint behind a success
+event that no scheduler can produce.
+
+A new or replaced endpoint configured with `warming: true` likewise begins
+excluded in a fresh allocation and becomes eligible only when its first
+successful probe atomically publishes a healthy version and slow-start recovery
+epoch; validation rejects `warming: true` when the endpoint has no active probe
+capable of publishing that success. Every sweep records its monotonic sample
+and, for each due server, the exact launch, already-in-flight,
+completion-budget defer, allocation/socket/buffer/submission failure, or
+successful-start outcome. A failed start is a recorded defer, not an invisible
+no-op.
 
 Accepted cross-shard state operations own independent program pins. Enqueueing
 an owner-shard `Hash.update` (or another compiled updater thunk) transfers a pin
@@ -843,13 +857,25 @@ evaluation, using opaque provider handles when sensitive. Any missing inspected
 field makes the capture `Unsupported`; replay never substitutes zeros or
 target-observed metadata.
 
-Inbound TLS execution has its own connection-correlated protected transcript:
-record read/write boundaries, selected SNI/ALPN, client-certificate verification
-inputs and result, resumption decision, failure or completion, and exact event
-position relative to reload installation and teardown. Replay injects that
-transcript before HTTP admission. Until it is complete, capture of a connection
-that performs a TLS handshake is `Unsupported`, including handshakes that never
-produce an HTTP request.
+Inbound TLS execution has its own connection-correlated protected transcript.
+For every inbound and outbound TLS record, the protected provider stores the
+exact record header and protected payload bytes; the routine capture stores an
+opaque handle, direction, length, read/write boundary, and total order. This
+includes every handshake message and extension, negotiated cipher/version
+traffic, alert, resumption exchange, application-data record, and post-handshake
+message, including records emitted before failure. Selected SNI/ALPN,
+client-certificate verification inputs and result, resumption decision, failure
+or completion, and exact event position relative to reload installation and
+teardown are additional metadata and never substitutes for record bytes.
+
+Replay feeds the recorded inbound wire bytes at the recorded boundaries and
+requires each outbound record to match the recorded wire bytes exactly before
+HTTP admission can advance. If TLS randomness, keys, provider state, or another
+protected input required to reproduce those bytes is unavailable, replay does
+not accept a semantically similar handshake: the connection is `Unsupported`.
+Until this byte-complete transcript and deterministic TLS execution are
+implemented, capture of any connection that performs a TLS handshake is
+`Unsupported`, including handshakes that never produce an HTTP request.
 
 Firewall replay also requires the initial attached kernel-map contents and
 visible version, not merely the userspace registry allocation. Every dynamic
