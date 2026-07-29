@@ -7,10 +7,13 @@
 #include "rut/compiler/parser.h"
 #include "rut/compiler/verifier.h"
 #include "test.h"
+#include <cstdint>
 #include <cstdio>
 #include <filesystem>
 #include <fstream>
 #include <string>
+#include <string_view>
+#include <vector>
 using namespace rut;
 static Str lit(const char* s) {
     u32 n = 0;
@@ -160,6 +163,2317 @@ static std::string format_verify_text(const rir::VerifyResult& result) {
     msg.init(msg_data, sizeof(msg_data), -1);
     rir::format_verify_result(msg, result);
     return std::string(msg.data, msg.len);
+}
+
+struct MarkdownContainerSegment {
+    enum class Kind : u8 {
+        Blockquote,
+        List,
+    };
+    Kind kind = Kind::Blockquote;
+    size_t continuation_width = 0;
+    char list_marker = 0;
+    bool ordered_list = false;
+    u32 ordered_start = 0;
+};
+
+struct MarkdownFence {
+    char marker = 0;
+    size_t marker_count = 0;
+    size_t container_indent = 0;
+    std::vector<MarkdownContainerSegment> container_segments{};
+    std::string info{};
+};
+
+static size_t markdown_next_column(size_t column, char c) {
+    return c == '\t' ? column + (4 - column % 4) : column + 1;
+}
+
+static size_t markdown_container_marker(std::string_view line,
+                                        size_t pos,
+                                        size_t segment_column,
+                                        size_t* marker_column) {
+    size_t column = segment_column;
+    while (pos < line.size() && (line[pos] == ' ' || line[pos] == '\t')) {
+        const size_t next = markdown_next_column(column, line[pos]);
+        if (next - segment_column > 3) break;
+        column = next;
+        pos++;
+    }
+    *marker_column = column;
+    return pos;
+}
+
+static bool markdown_is_thematic_break(std::string_view content) {
+    char marker = 0;
+    size_t count = 0;
+    for (char c : content) {
+        if (c == ' ' || c == '\t' || c == '\r') continue;
+        if (marker == 0 && (c == '*' || c == '-' || c == '_')) marker = c;
+        if (c != marker) return false;
+        count++;
+    }
+    return count >= 3;
+}
+
+static std::string_view markdown_container_content(
+    std::string_view line,
+    size_t continuation_indent,
+    size_t* container_indent = nullptr,
+    std::vector<MarkdownContainerSegment>* segments = nullptr,
+    bool non_one_ordered_lists_can_interrupt = true,
+    std::string* normalized = nullptr,
+    size_t* content_column = nullptr,
+    size_t initial_column = 0) {
+    size_t pos = 0;
+    size_t indent = 0;
+    size_t column = initial_column;
+    while (pos < line.size()) {
+        const size_t segment_start = pos;
+        const size_t segment_column = column;
+        size_t leading_column = column;
+        const size_t marker = markdown_container_marker(line, pos, segment_column, &leading_column);
+        column = leading_column;
+        if (marker < line.size() && line[marker] == '>') {
+            pos = marker + 1;
+            column++;
+            if (pos < line.size() && (line[pos] == ' ' || line[pos] == '\t')) {
+                if (line[pos] == '\t') {
+                    const size_t next = markdown_next_column(column, line[pos]);
+                    const size_t residual_columns = next - (column + 1);
+                    if (residual_columns != 0 && normalized != nullptr) {
+                        const std::string suffix(line.substr(pos + 1));
+                        normalized->assign(residual_columns, ' ');
+                        normalized->append(suffix);
+                        line = *normalized;
+                        pos = 0;
+                        column++;
+                    } else {
+                        column = next;
+                        pos++;
+                    }
+                } else {
+                    column++;
+                    pos++;
+                }
+            }
+            if (segments != nullptr)
+                segments->push_back(
+                    {MarkdownContainerSegment::Kind::Blockquote, pos - segment_start});
+            continue;
+        }
+
+        size_t list_end = marker;
+        char list_marker = 0;
+        bool ordered_list = false;
+        u32 ordered_start = 0;
+        if (list_end < line.size() &&
+            (line[list_end] == '-' || line[list_end] == '+' || line[list_end] == '*')) {
+            if (!markdown_is_thematic_break(line.substr(list_end))) {
+                list_marker = line[list_end];
+                list_end++;
+            }
+        } else {
+            size_t digits = 0;
+            while (list_end < line.size() && line[list_end] >= '0' && line[list_end] <= '9' &&
+                   digits < 10) {
+                list_end++;
+                digits++;
+            }
+            u32 start_value = 0;
+            for (size_t di = 0; di < digits && di < 9; di++)
+                start_value = start_value * 10 + static_cast<u32>(line[marker + di] - '0');
+            const bool starts_at_one = digits > 0 && digits <= 9 && start_value == 1;
+            if (digits == 0 || digits > 9 || list_end >= line.size() ||
+                (!non_one_ordered_lists_can_interrupt && !starts_at_one) ||
+                (line[list_end] != '.' && line[list_end] != ')'))
+                list_end = marker;
+            else {
+                ordered_list = true;
+                ordered_start = start_value;
+                list_marker = line[list_end];
+                list_end++;
+            }
+        }
+        if (list_end > marker && list_end < line.size() &&
+            (line[list_end] == ' ' || line[list_end] == '\t')) {
+            size_t marker_column = column + (list_end - marker);
+            size_t padding_end = list_end;
+            size_t padding_column = marker_column;
+            size_t first_end = list_end;
+            size_t first_column = marker_column;
+            while (padding_end < line.size() &&
+                   (line[padding_end] == ' ' || line[padding_end] == '\t')) {
+                padding_column = markdown_next_column(padding_column, line[padding_end]);
+                padding_end++;
+                if (first_end == list_end) {
+                    first_end = padding_end;
+                    first_column = padding_column;
+                }
+            }
+            const bool marker_only =
+                line.substr(padding_end).find_first_not_of(" \t\r") == std::string_view::npos;
+            const bool first_block_is_indented_code =
+                !marker_only && padding_column - first_column >= 4;
+            if (!non_one_ordered_lists_can_interrupt &&
+                (marker_only || first_block_is_indented_code)) {
+                column = segment_column;
+                break;
+            }
+            // CommonMark measures list padding in columns. Padding wider
+            // than four columns contributes only its first whitespace unit.
+            // A marker-only item always uses exactly one padding column;
+            // excess trailing whitespace is blank content, not indentation.
+            if (marker_only) {
+                list_end = first_end;
+                column = marker_column + 1;
+            } else if (padding_column - marker_column <= 4) {
+                list_end = padding_end;
+                column = padding_column;
+            } else {
+                column = marker_column + 1;
+                if (line[list_end] == '\t' && normalized != nullptr) {
+                    const size_t residual_columns = first_column - column;
+                    const std::string suffix(line.substr(first_end));
+                    normalized->assign(residual_columns, ' ');
+                    normalized->append(suffix);
+                    line = *normalized;
+                    list_end = 0;
+                } else {
+                    list_end = first_end;
+                }
+            }
+            pos = list_end;
+            indent += column - segment_column;
+            if (segments != nullptr)
+                segments->push_back({MarkdownContainerSegment::Kind::List,
+                                     column - segment_column,
+                                     list_marker,
+                                     ordered_list,
+                                     ordered_start});
+            continue;
+        }
+        if (non_one_ordered_lists_can_interrupt && list_end > marker &&
+            (list_end == line.size() || (list_end + 1 == line.size() && line[list_end] == '\r'))) {
+            column += list_end - marker + 1;
+            pos = list_end;
+            indent += column - segment_column;
+            if (segments != nullptr)
+                segments->push_back({MarkdownContainerSegment::Kind::List,
+                                     column - segment_column,
+                                     list_marker,
+                                     ordered_list,
+                                     ordered_start});
+            continue;
+        }
+        column = segment_column;
+        break;
+    }
+    if (continuation_indent > indent) {
+        size_t stripped_columns = 0;
+        while (pos < line.size() && stripped_columns < continuation_indent - indent &&
+               (line[pos] == ' ' || line[pos] == '\t')) {
+            const size_t next = markdown_next_column(stripped_columns, line[pos]);
+            if (next > continuation_indent - indent) break;
+            pos++;
+            stripped_columns = next;
+        }
+    }
+    if (container_indent != nullptr) *container_indent = indent;
+    if (content_column != nullptr) *content_column = column;
+    return line.substr(pos);
+}
+
+static bool markdown_same_container(const std::vector<MarkdownContainerSegment>& lhs,
+                                    const std::vector<MarkdownContainerSegment>& rhs) {
+    if (lhs.size() != rhs.size()) return false;
+    for (size_t i = 0; i < lhs.size(); i++) {
+        if (lhs[i].kind != rhs[i].kind) return false;
+        // The optional byte after `>` is line-local padding, not part of the
+        // blockquote's container identity. List continuation widths do carry
+        // semantic indentation and must still match exactly.
+        if (lhs[i].kind == MarkdownContainerSegment::Kind::List &&
+            (lhs[i].continuation_width != rhs[i].continuation_width ||
+             lhs[i].list_marker != rhs[i].list_marker ||
+             lhs[i].ordered_list != rhs[i].ordered_list))
+            return false;
+    }
+    return true;
+}
+
+static bool markdown_list_replacement_allowed(
+    const std::vector<MarkdownContainerSegment>& open_container,
+    const std::vector<MarkdownContainerSegment>& replacement) {
+    if (replacement.empty()) return false;
+    const auto& candidate = replacement.front();
+    if (candidate.kind != MarkdownContainerSegment::Kind::List || !candidate.ordered_list ||
+        candidate.ordered_start == 1)
+        return true;
+    if (open_container.empty()) return false;
+    const auto& open = open_container.back();
+    return open.kind == MarkdownContainerSegment::Kind::List && open.ordered_list &&
+           open.list_marker == candidate.list_marker;
+}
+
+static bool markdown_container_prefix(const std::vector<MarkdownContainerSegment>& prefix,
+                                      const std::vector<MarkdownContainerSegment>& container) {
+    if (prefix.size() >= container.size()) return false;
+    std::vector<MarkdownContainerSegment> leading(container.begin(),
+                                                  container.begin() + prefix.size());
+    return markdown_same_container(prefix, leading);
+}
+
+static void markdown_remember_list_container(const std::vector<MarkdownContainerSegment>& container,
+                                             std::vector<MarkdownContainerSegment>* continuation) {
+    for (const auto& segment : container) {
+        if (segment.kind != MarkdownContainerSegment::Kind::List) continue;
+        *continuation = container;
+        return;
+    }
+}
+
+static bool markdown_strip_container(std::string_view line,
+                                     const std::vector<MarkdownContainerSegment>& segments,
+                                     std::string_view* content,
+                                     std::string* normalized = nullptr,
+                                     size_t* content_column = nullptr) {
+    size_t pos = 0;
+    size_t column = 0;
+    for (size_t segment_index = 0; segment_index < segments.size(); segment_index++) {
+        const auto& segment = segments[segment_index];
+        if (segment.kind == MarkdownContainerSegment::Kind::Blockquote) {
+            pos = markdown_container_marker(line, pos, column, &column);
+            if (pos >= line.size() || line[pos] != '>') return false;
+            pos++;
+            column++;
+            // CommonMark permits the single padding byte after `>` to be
+            // present or omitted independently on every continuation line.
+            if (pos < line.size() && (line[pos] == ' ' || line[pos] == '\t')) {
+                if (line[pos] == '\t') {
+                    const size_t next = markdown_next_column(column, line[pos]);
+                    const size_t residual_columns = next - (column + 1);
+                    if (residual_columns != 0 && normalized != nullptr) {
+                        const std::string suffix(line.substr(pos + 1));
+                        normalized->assign(residual_columns, ' ');
+                        normalized->append(suffix);
+                        line = *normalized;
+                        pos = 0;
+                        column++;
+                    } else {
+                        column = next;
+                        pos++;
+                    }
+                } else {
+                    column++;
+                    pos++;
+                }
+            }
+            continue;
+        }
+        const size_t target_column = column + segment.continuation_width;
+        while (pos < line.size() && column < target_column &&
+               (line[pos] == ' ' || line[pos] == '\t')) {
+            const size_t next = markdown_next_column(column, line[pos]);
+            if (next > target_column) {
+                // A tab may satisfy the remaining container indentation and
+                // leave residual columns as content indentation.
+                if (normalized != nullptr) {
+                    const std::string suffix(line.substr(pos + 1));
+                    normalized->assign(next - target_column, ' ');
+                    normalized->append(suffix);
+                    line = *normalized;
+                    pos = 0;
+                }
+                column = target_column;
+                break;
+            }
+            column = next;
+            pos++;
+        }
+        if (column != target_column) {
+            const std::string_view rest = line.substr(pos);
+            if (rest.find_first_not_of(" \t\r") == std::string_view::npos) {
+                for (size_t remaining = segment_index + 1; remaining < segments.size(); remaining++)
+                    if (segments[remaining].kind == MarkdownContainerSegment::Kind::Blockquote)
+                        return false;
+                *content = rest;
+                if (content_column != nullptr) *content_column = column;
+                return true;
+            }
+            return false;
+        }
+    }
+    *content = line.substr(pos);
+    if (content_column != nullptr) *content_column = column;
+    return true;
+}
+
+static bool markdown_strip_longest_list_prefix(
+    std::string_view line,
+    const std::vector<MarkdownContainerSegment>& container,
+    std::vector<MarkdownContainerSegment>* prefix,
+    std::string_view* content,
+    std::string* normalized = nullptr) {
+    for (size_t prefix_len = container.size(); prefix_len > 1; prefix_len--) {
+        std::vector<MarkdownContainerSegment> candidate(container.begin(),
+                                                        container.begin() + prefix_len - 1);
+        bool has_list = false;
+        for (const auto& segment : candidate)
+            has_list |= segment.kind == MarkdownContainerSegment::Kind::List;
+        if (!has_list) continue;
+        std::string candidate_normalized;
+        std::string_view candidate_content;
+        if (!markdown_strip_container(line, candidate, &candidate_content, &candidate_normalized))
+            continue;
+        if (normalized != nullptr) {
+            const size_t content_offset =
+                candidate_normalized.empty()
+                    ? 0
+                    : static_cast<size_t>(candidate_content.data() - candidate_normalized.data());
+            *normalized = std::move(candidate_normalized);
+            *content = normalized->empty() ? candidate_content
+                                           : std::string_view(*normalized).substr(content_offset);
+        } else {
+            *content = candidate_content;
+        }
+        *prefix = std::move(candidate);
+        return true;
+    }
+    return false;
+}
+
+static std::string_view markdown_fence_content(std::string_view line,
+                                               const MarkdownFence& opening,
+                                               std::string* normalized = nullptr,
+                                               size_t* content_column = nullptr) {
+    std::string_view content;
+    return markdown_strip_container(
+               line, opening.container_segments, &content, normalized, content_column)
+               ? content
+               : line;
+}
+
+static bool parse_markdown_fence_open_content(std::string_view line,
+                                              MarkdownFence* out,
+                                              size_t content_column = 0) {
+    size_t pos = 0;
+    size_t column = content_column;
+    while (pos < line.size() && (line[pos] == ' ' || line[pos] == '\t')) {
+        const size_t next = markdown_next_column(column, line[pos]);
+        if (next - content_column > 3) return false;
+        column = next;
+        pos++;
+    }
+    if (pos == line.size() || (line[pos] != '`' && line[pos] != '~')) return false;
+    const char marker = line[pos];
+    const size_t marker_start = pos;
+    while (pos < line.size() && line[pos] == marker) pos++;
+    if (pos - marker_start < 3) return false;
+    size_t info_start = pos;
+    while (info_start < line.size() && (line[info_start] == ' ' || line[info_start] == '\t'))
+        info_start++;
+    size_t info_end = line.size();
+    while (info_end > info_start &&
+           (line[info_end - 1] == ' ' || line[info_end - 1] == '\t' || line[info_end - 1] == '\r'))
+        info_end--;
+    if (marker == '`' &&
+        line.substr(info_start, info_end - info_start).find('`') != std::string_view::npos)
+        return false;
+    out->marker = marker;
+    out->marker_count = pos - marker_start;
+    out->container_indent = 0;
+    out->container_segments.clear();
+    out->info = line.substr(info_start, info_end - info_start);
+    return true;
+}
+
+static bool parse_markdown_fence_open(std::string_view line, MarkdownFence* out) {
+    size_t container_indent = 0;
+    std::vector<MarkdownContainerSegment> container_segments;
+    std::string normalized;
+    line = markdown_container_content(
+        line, 0, &container_indent, &container_segments, true, &normalized);
+    if (!parse_markdown_fence_open_content(line, out)) return false;
+    out->container_indent = container_indent;
+    out->container_segments = std::move(container_segments);
+    return true;
+}
+
+static bool parse_markdown_fence_open_in_container(
+    std::string_view line,
+    const std::vector<MarkdownContainerSegment>& container,
+    MarkdownFence* out) {
+    std::string_view content;
+    std::string normalized;
+    size_t content_column = 0;
+    if (!markdown_strip_container(line, container, &content, &normalized, &content_column))
+        return false;
+    MarkdownFence opening{};
+    if (!parse_markdown_fence_open_content(content, &opening, content_column)) return false;
+    opening.container_segments = container;
+    opening.container_indent = 0;
+    for (const auto& segment : container)
+        if (segment.kind == MarkdownContainerSegment::Kind::List)
+            opening.container_indent += segment.continuation_width;
+    *out = std::move(opening);
+    return true;
+}
+
+static bool markdown_is_ascii_whitespace(char c) {
+    return c == ' ' || (c >= '\t' && c <= '\r');
+}
+
+static bool markdown_fence_language(std::string_view info, std::string_view language) {
+    return info == language || (info.size() > language.size() && info.starts_with(language) &&
+                                markdown_is_ascii_whitespace(info[language.size()]));
+}
+
+static bool markdown_fence_language_case_insensitive(std::string_view info,
+                                                     std::string_view language) {
+    if (info.size() < language.size()) return false;
+    for (size_t i = 0; i < language.size(); i++) {
+        char c = info[i];
+        if (c >= 'A' && c <= 'Z') c = static_cast<char>(c - 'A' + 'a');
+        if (c != language[i]) return false;
+    }
+    return info.size() == language.size() || markdown_is_ascii_whitespace(info[language.size()]);
+}
+
+enum class MarkdownLinkReferenceDefinition {
+    None,
+    Complete,
+    LabelMayContinue,
+    DestinationMayContinue,
+    TitleMayContinue,
+    OpenTitleMayContinue,
+};
+
+enum class MarkdownLinkReferenceTitle {
+    None,
+    Complete,
+    MayContinue,
+};
+
+static MarkdownLinkReferenceTitle markdown_link_reference_title_state(std::string_view line,
+                                                                      bool allow_leading_indent,
+                                                                      size_t initial_column = 0) {
+    size_t pos = 0;
+    size_t column = initial_column;
+    if (allow_leading_indent) {
+        while (pos < line.size() && (line[pos] == ' ' || line[pos] == '\t')) {
+            const size_t next = markdown_next_column(column, line[pos]);
+            if (next - initial_column > 3) break;
+            column = next;
+            pos++;
+        }
+    }
+    if (pos == line.size()) return MarkdownLinkReferenceTitle::None;
+    const char opener = line[pos];
+    const char closer = opener == '(' ? ')' : opener;
+    if (opener != '(' && opener != '\'' && opener != '"') return MarkdownLinkReferenceTitle::None;
+    bool escaped = false;
+    for (pos++; pos < line.size(); pos++) {
+        const char c = line[pos];
+        if (escaped) {
+            escaped = false;
+            continue;
+        }
+        if (c == '\\') {
+            escaped = true;
+            continue;
+        }
+        if (c == '\r' && pos + 1 == line.size()) return MarkdownLinkReferenceTitle::MayContinue;
+        if ((c == '\r' && line[pos + 1] != '\n') || (opener == '(' && c == '('))
+            return MarkdownLinkReferenceTitle::None;
+        if (c == '\n' && pos + 1 < line.size() && line[pos + 1] == '\n')
+            return MarkdownLinkReferenceTitle::None;
+        if (c != closer) continue;
+        pos++;
+        while (pos < line.size() && (line[pos] == ' ' || line[pos] == '\t' || line[pos] == '\r'))
+            pos++;
+        return pos == line.size() ? MarkdownLinkReferenceTitle::Complete
+                                  : MarkdownLinkReferenceTitle::None;
+    }
+    return MarkdownLinkReferenceTitle::MayContinue;
+}
+
+static bool markdown_link_reference_title(std::string_view line, bool allow_leading_indent) {
+    return markdown_link_reference_title_state(line, allow_leading_indent) ==
+           MarkdownLinkReferenceTitle::Complete;
+}
+
+static MarkdownLinkReferenceDefinition markdown_link_reference_definition(std::string_view line) {
+    size_t pos = 0;
+    while (pos < line.size() && pos < 3 && line[pos] == ' ') pos++;
+    if (pos >= line.size() || line[pos] != '[') return MarkdownLinkReferenceDefinition::None;
+    const size_t label_start = ++pos;
+    bool escaped = false;
+    for (; pos < line.size(); pos++) {
+        const char c = line[pos];
+        if (escaped) {
+            escaped = false;
+            continue;
+        }
+        if (c == '\\') {
+            escaped = true;
+            continue;
+        }
+        if (c == '[') return MarkdownLinkReferenceDefinition::None;
+        if (c == '\r' || c == '\n') {
+            const size_t next =
+                c == '\r' && pos + 1 < line.size() && line[pos + 1] == '\n' ? pos + 2 : pos + 1;
+            if (next >= line.size() || line[next] == '\r' || line[next] == '\n')
+                return next >= line.size() ? MarkdownLinkReferenceDefinition::LabelMayContinue
+                                           : MarkdownLinkReferenceDefinition::None;
+            continue;
+        }
+        if (c != ']') continue;
+        const bool label_has_non_whitespace =
+            line.substr(label_start, pos - label_start).find_first_not_of(" \t\r\n\f\v") !=
+            std::string_view::npos;
+        if (pos == label_start || !label_has_non_whitespace || pos - label_start > 999 ||
+            pos + 1 >= line.size() || line[pos + 1] != ':')
+            return MarkdownLinkReferenceDefinition::None;
+        pos += 2;
+        while (pos < line.size() &&
+               (line[pos] == ' ' || line[pos] == '\t' || line[pos] == '\r' || line[pos] == '\n'))
+            pos++;
+        if (pos == line.size() || line[pos] == '\r')
+            return MarkdownLinkReferenceDefinition::DestinationMayContinue;
+        if (line[pos] == '<') {
+            pos++;
+            bool destination_escaped = false;
+            while (pos < line.size()) {
+                const char destination_char = line[pos];
+                if (destination_escaped) {
+                    destination_escaped = false;
+                    pos++;
+                    continue;
+                }
+                if (destination_char == '\\') {
+                    destination_escaped = true;
+                    pos++;
+                    continue;
+                }
+                if (destination_char == '<' || destination_char == '\r' || destination_char == '\n')
+                    return MarkdownLinkReferenceDefinition::None;
+                if (destination_char == '>') break;
+                pos++;
+            }
+            if (pos == line.size() || line[pos] != '>')
+                return MarkdownLinkReferenceDefinition::None;
+            pos++;
+        } else {
+            const size_t destination_start = pos;
+            u32 parenthesis_depth = 0;
+            bool destination_escaped = false;
+            while (pos < line.size() && line[pos] != ' ' && line[pos] != '\t' &&
+                   line[pos] != '\r' && line[pos] != '\n') {
+                const char destination_char = line[pos];
+                const auto destination_byte = static_cast<unsigned char>(destination_char);
+                if (destination_byte < 0x20 || destination_byte == 0x7f)
+                    return MarkdownLinkReferenceDefinition::None;
+                if (destination_escaped) {
+                    destination_escaped = false;
+                } else if (destination_char == '\\') {
+                    destination_escaped = true;
+                } else if (destination_char == '(') {
+                    parenthesis_depth++;
+                } else if (destination_char == ')') {
+                    if (parenthesis_depth == 0) return MarkdownLinkReferenceDefinition::None;
+                    parenthesis_depth--;
+                }
+                pos++;
+            }
+            if (pos == destination_start || parenthesis_depth != 0)
+                return MarkdownLinkReferenceDefinition::None;
+        }
+        const size_t destination_end = pos;
+        while (pos < line.size() &&
+               (line[pos] == ' ' || line[pos] == '\t' || line[pos] == '\r' || line[pos] == '\n'))
+            pos++;
+        if (pos == line.size()) return MarkdownLinkReferenceDefinition::TitleMayContinue;
+        if (pos == destination_end) return MarkdownLinkReferenceDefinition::None;
+        const auto title = markdown_link_reference_title_state(line.substr(pos), false);
+        if (title == MarkdownLinkReferenceTitle::None) return MarkdownLinkReferenceDefinition::None;
+        return title == MarkdownLinkReferenceTitle::Complete
+                   ? MarkdownLinkReferenceDefinition::Complete
+                   : MarkdownLinkReferenceDefinition::OpenTitleMayContinue;
+    }
+    const std::string_view partial_label = line.substr(label_start);
+    const bool label_has_non_whitespace =
+        partial_label.find_first_not_of(" \t\r\n\f\v") != std::string_view::npos;
+    return partial_label.size() <= 999 && label_has_non_whitespace
+               ? MarkdownLinkReferenceDefinition::LabelMayContinue
+               : MarkdownLinkReferenceDefinition::None;
+}
+
+static bool markdown_is_link_reference_definition(std::string_view line) {
+    return markdown_link_reference_definition(line) != MarkdownLinkReferenceDefinition::None;
+}
+
+static MarkdownLinkReferenceDefinition markdown_link_reference_definition_at_block_start(
+    std::string_view line, bool paragraph_open) {
+    return paragraph_open ? MarkdownLinkReferenceDefinition::None
+                          : markdown_link_reference_definition(line);
+}
+
+enum class MarkdownLinkReferenceContinuation {
+    None,
+    Consumed,
+    Invalid,
+};
+
+static std::string_view markdown_block_content(std::string_view content, size_t initial_column = 0);
+static bool markdown_interrupts_paragraph(std::string_view content,
+                                          bool has_preceding_paragraph = true,
+                                          size_t initial_column = 0);
+static std::string markdown_raw_html_end_marker(std::string_view content,
+                                                bool* can_interrupt_paragraph);
+static bool markdown_is_indented_code_block(std::string_view content, size_t content_column);
+
+static bool markdown_opens_interrupting_block(std::string_view content, size_t content_column = 0) {
+    if (markdown_interrupts_paragraph(content, true, content_column)) return true;
+    MarkdownFence opening{};
+    if (parse_markdown_fence_open_content(content, &opening, content_column)) return true;
+    bool can_interrupt_paragraph = true;
+    return !markdown_raw_html_end_marker(markdown_block_content(content, content_column),
+                                         &can_interrupt_paragraph)
+                .empty() &&
+           can_interrupt_paragraph;
+}
+
+static MarkdownLinkReferenceContinuation markdown_take_link_reference_continuation(
+    std::string_view content,
+    const std::vector<MarkdownContainerSegment>& container,
+    MarkdownLinkReferenceDefinition* pending,
+    std::string* pending_text,
+    std::vector<MarkdownContainerSegment>* expected_container,
+    size_t content_column = 0) {
+    if (*pending == MarkdownLinkReferenceDefinition::None)
+        return MarkdownLinkReferenceContinuation::None;
+    const bool same_container = markdown_same_container(container, *expected_container);
+    const bool blank = content.find_first_not_of(" \t\r") == std::string_view::npos;
+    if (!same_container) {
+        *pending = MarkdownLinkReferenceDefinition::None;
+        pending_text->clear();
+        expected_container->clear();
+        return MarkdownLinkReferenceContinuation::None;
+    }
+    if ((*pending == MarkdownLinkReferenceDefinition::LabelMayContinue ||
+         *pending == MarkdownLinkReferenceDefinition::DestinationMayContinue ||
+         *pending == MarkdownLinkReferenceDefinition::OpenTitleMayContinue) &&
+        markdown_opens_interrupting_block(content, content_column)) {
+        *pending = MarkdownLinkReferenceDefinition::None;
+        pending_text->clear();
+        expected_container->clear();
+        return MarkdownLinkReferenceContinuation::None;
+    }
+    if (blank) {
+        const bool required_continuation =
+            *pending != MarkdownLinkReferenceDefinition::TitleMayContinue;
+        *pending = MarkdownLinkReferenceDefinition::None;
+        pending_text->clear();
+        expected_container->clear();
+        return required_continuation ? MarkdownLinkReferenceContinuation::Invalid
+                                     : MarkdownLinkReferenceContinuation::None;
+    }
+
+    if (*pending == MarkdownLinkReferenceDefinition::TitleMayContinue) {
+        const auto title = markdown_link_reference_title_state(content, true, content_column);
+        if (title == MarkdownLinkReferenceTitle::None) {
+            *pending = MarkdownLinkReferenceDefinition::None;
+            pending_text->clear();
+            expected_container->clear();
+            return MarkdownLinkReferenceContinuation::Invalid;
+        }
+        if (title == MarkdownLinkReferenceTitle::Complete) {
+            *pending = MarkdownLinkReferenceDefinition::None;
+            pending_text->clear();
+            expected_container->clear();
+        } else {
+            *pending = MarkdownLinkReferenceDefinition::OpenTitleMayContinue;
+            *pending_text = "[pending]: /url ";
+            pending_text->append(content);
+        }
+        return MarkdownLinkReferenceContinuation::Consumed;
+    }
+
+    pending_text->push_back('\n');
+    pending_text->append(content);
+    const auto definition = markdown_link_reference_definition(*pending_text);
+    if (definition == MarkdownLinkReferenceDefinition::Complete) {
+        *pending = MarkdownLinkReferenceDefinition::None;
+        pending_text->clear();
+        expected_container->clear();
+        return MarkdownLinkReferenceContinuation::Consumed;
+    }
+    if (definition == MarkdownLinkReferenceDefinition::LabelMayContinue ||
+        definition == MarkdownLinkReferenceDefinition::DestinationMayContinue ||
+        definition == MarkdownLinkReferenceDefinition::OpenTitleMayContinue) {
+        *pending = definition;
+        return MarkdownLinkReferenceContinuation::Consumed;
+    }
+    if (definition == MarkdownLinkReferenceDefinition::TitleMayContinue) {
+        *pending = definition;
+        return MarkdownLinkReferenceContinuation::Consumed;
+    }
+    *pending = MarkdownLinkReferenceDefinition::None;
+    pending_text->clear();
+    expected_container->clear();
+    return MarkdownLinkReferenceContinuation::Invalid;
+}
+
+static void markdown_retain_normalized_content(std::string_view content,
+                                               std::string* first,
+                                               std::string* second,
+                                               std::string* storage,
+                                               std::string_view* retained) {
+    for (std::string* candidate : {first, second}) {
+        if (candidate == nullptr || candidate->empty()) continue;
+        const auto content_start = reinterpret_cast<std::uintptr_t>(content.data());
+        const auto candidate_start = reinterpret_cast<std::uintptr_t>(candidate->data());
+        if (content_start < candidate_start ||
+            content_start - candidate_start > candidate->size() ||
+            content.size() > candidate->size() - (content_start - candidate_start))
+            continue;
+        const size_t offset = static_cast<size_t>(content_start - candidate_start);
+        *storage = std::move(*candidate);
+        *retained = std::string_view(*storage).substr(offset, content.size());
+        return;
+    }
+    *retained = content;
+}
+
+static bool is_markdown_fence_close(std::string_view line, const MarkdownFence& opening) {
+    std::string normalized;
+    size_t column = 0;
+    line = markdown_fence_content(line, opening, &normalized, &column);
+    size_t pos = 0;
+    size_t indent = 0;
+    while (pos < line.size() && (line[pos] == ' ' || line[pos] == '\t')) {
+        const size_t next = markdown_next_column(column + indent, line[pos]);
+        indent = next - column;
+        if (indent > 3) return false;
+        pos++;
+    }
+    const size_t marker_start = pos;
+    while (pos < line.size() && line[pos] == opening.marker) pos++;
+    if (pos - marker_start < opening.marker_count) return false;
+    while (pos < line.size() && (line[pos] == ' ' || line[pos] == '\t' || line[pos] == '\r')) pos++;
+    return pos == line.size();
+}
+
+static constexpr std::string_view kMarkdownSkipPrefix = "<!-- rut-example: skip ";
+static constexpr std::string_view kMarkdownSkipSuffix = " -->";
+
+static bool markdown_skip_marker_has_reason(std::string_view line) {
+    line = markdown_container_content(line, 0);
+    size_t indent = 0;
+    while (indent < line.size() && indent < 3 && line[indent] == ' ') indent++;
+    line.remove_prefix(indent);
+    if (!line.empty() && line.back() == '\r') line.remove_suffix(1);
+    if (!line.starts_with(kMarkdownSkipPrefix) || !line.ends_with(kMarkdownSkipSuffix))
+        return false;
+    if (line.find("-->", kMarkdownSkipPrefix.size()) != line.size() - 3) return false;
+    const auto reason =
+        line.substr(kMarkdownSkipPrefix.size(),
+                    line.size() - kMarkdownSkipPrefix.size() - kMarkdownSkipSuffix.size());
+    return reason.find_first_not_of(" \t\r\n") != std::string_view::npos;
+}
+
+static std::string markdown_ascii_lower(std::string_view text) {
+    std::string lower(text);
+    for (char& c : lower)
+        if (c >= 'A' && c <= 'Z') c = static_cast<char>(c - 'A' + 'a');
+    return lower;
+}
+
+static constexpr char kMarkdownRawHtmlBlankLine = '\1';
+
+static bool markdown_html_name_start(char c) {
+    return (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || c == '_' || c == ':';
+}
+
+static bool markdown_html_name_char(char c) {
+    return markdown_html_name_start(c) || (c >= '0' && c <= '9') || c == '.' || c == '-';
+}
+
+static bool markdown_complete_html_tag(std::string_view content) {
+    while (!content.empty() &&
+           (content.back() == ' ' || content.back() == '\t' || content.back() == '\r'))
+        content.remove_suffix(1);
+    if (content.size() < 3 || content.front() != '<' || content.back() != '>') return false;
+
+    size_t pos = 1;
+    const bool closing = content[pos] == '/';
+    if (closing) pos++;
+    if (pos >= content.size() || !((content[pos] >= 'A' && content[pos] <= 'Z') ||
+                                   (content[pos] >= 'a' && content[pos] <= 'z')))
+        return false;
+    pos++;
+    while (pos < content.size() &&
+           ((content[pos] >= '0' && content[pos] <= '9') ||
+            (content[pos] >= 'A' && content[pos] <= 'Z') ||
+            (content[pos] >= 'a' && content[pos] <= 'z') || content[pos] == '-'))
+        pos++;
+
+    if (closing) {
+        while (pos < content.size() && (content[pos] == ' ' || content[pos] == '\t')) pos++;
+        return pos + 1 == content.size() && content[pos] == '>';
+    }
+
+    while (pos < content.size()) {
+        bool had_space = false;
+        while (pos < content.size() && (content[pos] == ' ' || content[pos] == '\t')) {
+            had_space = true;
+            pos++;
+        }
+        if (pos + 1 == content.size() && content[pos] == '>') return true;
+        if (pos + 2 == content.size() && content[pos] == '/' && content[pos + 1] == '>')
+            return true;
+        if (!had_space || pos >= content.size() || !markdown_html_name_start(content[pos]))
+            return false;
+        pos++;
+        while (pos < content.size() && markdown_html_name_char(content[pos])) pos++;
+        const size_t attribute_end = pos;
+        while (pos < content.size() && (content[pos] == ' ' || content[pos] == '\t')) pos++;
+        if (pos >= content.size() || content[pos] != '=') {
+            pos = attribute_end;
+            continue;
+        }
+        pos++;
+        while (pos < content.size() && (content[pos] == ' ' || content[pos] == '\t')) pos++;
+        if (pos >= content.size()) return false;
+        if (content[pos] == '\'' || content[pos] == '"') {
+            const char quote = content[pos++];
+            while (pos < content.size() && content[pos] != quote) pos++;
+            if (pos == content.size()) return false;
+            pos++;
+            continue;
+        }
+        const size_t value_start = pos;
+        while (pos < content.size() && content[pos] != ' ' && content[pos] != '\t' &&
+               content[pos] != '\'' && content[pos] != '"' && content[pos] != '=' &&
+               content[pos] != '<' && content[pos] != '>' && content[pos] != '`')
+            pos++;
+        if (pos == value_start) return false;
+    }
+    return false;
+}
+
+static std::string markdown_raw_html_end_marker(std::string_view content,
+                                                bool* can_interrupt_paragraph = nullptr) {
+    if (can_interrupt_paragraph != nullptr) *can_interrupt_paragraph = true;
+    if (!content.empty() && content.back() == '\r') content.remove_suffix(1);
+    const std::string lower = markdown_ascii_lower(content);
+    if (lower.empty()) return {};
+    for (const char* tag : {"pre", "script", "style", "textarea"}) {
+        const std::string open = std::string("<") + tag;
+        if (!lower.starts_with(open)) continue;
+        if (lower.size() > open.size() && lower[open.size()] != ' ' && lower[open.size()] != '\t' &&
+            lower[open.size()] != '>')
+            continue;
+        return std::string("</") + tag + ">";
+    }
+    if (lower.starts_with("<!--")) return "-->";
+    if (lower.starts_with("<?")) return "?>";
+    if (content.starts_with("<![CDATA[")) return "]]>";
+    if (content.size() >= 3 && content[0] == '<' && content[1] == '!' && content[2] >= 'A' &&
+        content[2] <= 'Z')
+        return ">";
+
+    static constexpr std::string_view block_tags[] = {
+        "address",  "article", "aside",    "base",     "basefont", "blockquote", "body",
+        "caption",  "center",  "col",      "colgroup", "dd",       "details",    "dialog",
+        "dir",      "div",     "dl",       "dt",       "fieldset", "figcaption", "figure",
+        "footer",   "form",    "frame",    "frameset", "h1",       "h2",         "h3",
+        "h4",       "h5",      "h6",       "head",     "header",   "hgroup",     "hr",
+        "html",     "iframe",  "legend",   "li",       "link",     "main",       "menu",
+        "menuitem", "nav",     "noframes", "ol",       "optgroup", "option",     "p",
+        "param",    "search",  "section",  "summary",  "table",    "tbody",      "td",
+        "tfoot",    "th",      "thead",    "title",    "tr",       "track",      "ul",
+    };
+    if (lower.empty() || lower[0] != '<') return {};
+    size_t tag_start = 1;
+    if (tag_start < lower.size() && lower[tag_start] == '/') tag_start++;
+    for (const auto tag : block_tags) {
+        if (!lower.substr(tag_start).starts_with(tag)) continue;
+        const size_t end = tag_start + tag.size();
+        if (end == lower.size() || lower[end] == ' ' || lower[end] == '\t' || lower[end] == '\n' ||
+            lower[end] == '\r' || lower[end] == '\f' || lower[end] == '\v' || lower[end] == '>' ||
+            (lower[end] == '/' && end + 1 < lower.size() && lower[end + 1] == '>'))
+            return std::string(1, kMarkdownRawHtmlBlankLine);
+    }
+
+    // CommonMark type 7: a complete open/closing tag on its own line.
+    size_t tag_end = tag_start;
+    while (tag_end < lower.size() &&
+           ((lower[tag_end] >= 'a' && lower[tag_end] <= 'z') ||
+            (lower[tag_end] >= '0' && lower[tag_end] <= '9') || lower[tag_end] == '-'))
+        tag_end++;
+    if (tag_end > tag_start && markdown_complete_html_tag(content)) {
+        if (can_interrupt_paragraph != nullptr) *can_interrupt_paragraph = false;
+        return std::string(1, kMarkdownRawHtmlBlankLine);
+    }
+    return {};
+}
+
+static bool markdown_interrupts_paragraph(std::string_view content,
+                                          bool has_preceding_paragraph,
+                                          size_t initial_column) {
+    content = markdown_block_content(content, initial_column);
+    size_t pos = 0;
+    while (pos < content.size() && pos < 6 && content[pos] == '#') pos++;
+    if (pos != 0 && (pos == content.size() || content[pos] == ' ' || content[pos] == '\t' ||
+                     content[pos] == '\r'))
+        return true;
+    // Four columns of block indentation cannot interrupt a paragraph. The
+    // caller has removed at most the three columns permitted before a block.
+    if (!content.empty() && (content.front() == ' ' || content.front() == '\t')) return false;
+
+    // A setext underline consumes and closes the preceding paragraph. Equals
+    // underlines are not thematic breaks, so recognize them explicitly; a
+    // one- or two-dash underline needs the same treatment before the thematic
+    // break rule below applies at three markers.
+    size_t setext_end = content.size();
+    while (setext_end != 0 && (content[setext_end - 1] == ' ' || content[setext_end - 1] == '\t' ||
+                               content[setext_end - 1] == '\r'))
+        setext_end--;
+    if (has_preceding_paragraph && setext_end != 0 && (content[0] == '=' || content[0] == '-')) {
+        bool setext = true;
+        for (size_t i = 1; i < setext_end; i++) setext &= content[i] == content[0];
+        if (setext) return true;
+    }
+
+    return markdown_is_thematic_break(content);
+}
+
+static bool markdown_is_lazy_paragraph_continuation(std::string_view line) {
+    std::vector<MarkdownContainerSegment> container;
+    const std::string_view content =
+        markdown_container_content(line, 0, nullptr, &container, false);
+    if (!container.empty() || content.find_first_not_of(" \t\r") == std::string_view::npos)
+        return false;
+    const std::string_view block_content = markdown_block_content(content);
+    if (markdown_interrupts_paragraph(content)) return false;
+    bool html_can_interrupt_paragraph = true;
+    const std::string html_end =
+        markdown_raw_html_end_marker(block_content, &html_can_interrupt_paragraph);
+    if (!html_end.empty() && html_can_interrupt_paragraph) return false;
+    MarkdownFence opening{};
+    return !parse_markdown_fence_open_content(content, &opening);
+}
+
+static std::string_view markdown_block_content(std::string_view content, size_t initial_column) {
+    size_t pos = 0;
+    size_t column = initial_column;
+    while (pos < content.size() && (content[pos] == ' ' || content[pos] == '\t')) {
+        const size_t next = markdown_next_column(column, content[pos]);
+        if (next - initial_column > 3) break;
+        column = next;
+        pos++;
+    }
+    return content.substr(pos);
+}
+
+static bool markdown_is_indented_code_block(std::string_view content, size_t content_column = 0) {
+    size_t pos = 0;
+    size_t column = content_column;
+    while (pos < content.size() && (content[pos] == ' ' || content[pos] == '\t')) {
+        column = markdown_next_column(column, content[pos]);
+        pos++;
+        if (column - content_column >= 4)
+            return content.substr(pos).find_first_not_of(" \t\r") != std::string_view::npos;
+    }
+    return false;
+}
+
+static bool markdown_raw_html_closes(std::string_view end_marker, std::string_view content) {
+    if (end_marker.size() == 1 && end_marker[0] == kMarkdownRawHtmlBlankLine)
+        return content.find_first_not_of(" \t\r") == std::string_view::npos;
+    return markdown_ascii_lower(content).find(end_marker) != std::string::npos;
+}
+
+TEST(frontend, language_card_fence_parser_accepts_commonmark_variants) {
+    MarkdownFence fence{};
+    REQUIRE(parse_markdown_fence_open("   ````rut  \t", &fence));
+    CHECK(markdown_fence_language(fence.info, "rut"));
+    CHECK_EQ(fence.marker, '`');
+    CHECK_EQ(fence.marker_count, 4u);
+    CHECK(is_markdown_fence_close("  ````` \t", fence));
+    CHECK_FALSE(is_markdown_fence_close("```", fence));
+
+    REQUIRE(parse_markdown_fence_open("~~~swift title=example", &fence));
+    CHECK(markdown_fence_language(fence.info, "swift"));
+    CHECK(markdown_fence_language_case_insensitive("Swift title=example", "swift"));
+    CHECK(markdown_fence_language_case_insensitive("SWIFT", "swift"));
+    CHECK(markdown_fence_language_case_insensitive("Rut\fmetadata", "rut"));
+    CHECK(markdown_fence_language_case_insensitive("RUT\vmetadata", "rut"));
+    CHECK_FALSE(markdown_fence_language_case_insensitive("swiftish", "swift"));
+    CHECK_FALSE(markdown_fence_language_case_insensitive("rut-metadata", "rut"));
+    CHECK(is_markdown_fence_close("~~~~", fence));
+
+    REQUIRE(parse_markdown_fence_open("```rut\fmetadata", &fence));
+    CHECK(markdown_fence_language(fence.info, "rut"));
+
+    REQUIRE(parse_markdown_fence_open("> ```rut", &fence));
+    CHECK(markdown_fence_language(fence.info, "rut"));
+    CHECK(is_markdown_fence_close("> ```", fence));
+    CHECK(markdown_fence_content("> route GET \"/x\" { return 200 }", fence) ==
+          "route GET \"/x\" { return 200 }");
+    CHECK(markdown_fence_content(">route GET \"/x\" { return 200 }", fence) ==
+          "route GET \"/x\" { return 200 }");
+    CHECK(is_markdown_fence_close(">```", fence));
+
+    REQUIRE(parse_markdown_fence_open("  - ````rut", &fence));
+    CHECK_EQ(fence.container_indent, 4u);
+    CHECK(is_markdown_fence_close("    ````", fence));
+    CHECK(markdown_fence_content("    route GET \"/x\" { return 200 }", fence) ==
+          "route GET \"/x\" { return 200 }");
+    REQUIRE(parse_markdown_fence_open("- ~~~~markdown", &fence));
+    CHECK(is_markdown_fence_close("  \t~~~~", fence));
+    CHECK_FALSE(is_markdown_fence_close("  \t  ~~~~", fence));
+    REQUIRE(parse_markdown_fence_open("```rut", &fence));
+    CHECK(markdown_fence_content("- route GET \"/x\" { return 200 }", fence) ==
+          "- route GET \"/x\" { return 200 }");
+    CHECK(markdown_fence_content("> route GET \"/x\" { return 200 }", fence) ==
+          "> route GET \"/x\" { return 200 }");
+    CHECK_FALSE(parse_markdown_fence_open("1234567890. ~~~markdown", &fence));
+    CHECK_FALSE(parse_markdown_fence_open("-     ~~~~markdown", &fence));
+    CHECK_FALSE(parse_markdown_fence_open("```markdown ` not-an-opener", &fence));
+}
+
+TEST(frontend, language_card_skip_marker_container_must_match_fence) {
+    std::vector<MarkdownContainerSegment> container;
+    size_t indent = 0;
+    CHECK(markdown_container_content(
+              "> <!-- rut-example: skip pending -->", 0, &indent, &container) ==
+          "<!-- rut-example: skip pending -->");
+    MarkdownFence fence{};
+    CHECK(parse_markdown_fence_open_in_container(">```rut", container, &fence));
+    CHECK_FALSE(parse_markdown_fence_open_in_container("```rut", container, &fence));
+
+    container.clear();
+    CHECK(markdown_container_content(
+              "- <!-- rut-example: skip pending -->", 0, &indent, &container) ==
+          "<!-- rut-example: skip pending -->");
+    CHECK(parse_markdown_fence_open_in_container("  ```rut", container, &fence));
+    CHECK(parse_markdown_fence_open_in_container("  \t~~~~rut", container, &fence));
+    CHECK_FALSE(parse_markdown_fence_open_in_container("```rut", container, &fence));
+
+    container.clear();
+    CHECK(markdown_container_content(
+              "-\t<!-- rut-example: skip pending -->", 0, &indent, &container) ==
+          "<!-- rut-example: skip pending -->");
+    REQUIRE_EQ(container.size(), 1u);
+    CHECK_EQ(container[0].continuation_width, 4u);
+    CHECK(parse_markdown_fence_open_in_container("\t```rut", container, &fence));
+
+    container.clear();
+    CHECK(markdown_container_content(
+              "> -\t<!-- rut-example: skip pending -->", 0, &indent, &container) ==
+          "<!-- rut-example: skip pending -->");
+    CHECK(parse_markdown_fence_open_in_container("> \t```rut", container, &fence));
+}
+
+TEST(frontend, language_card_detects_raw_html_fence_exclusions) {
+    CHECK_EQ(markdown_raw_html_end_marker("<pre>"), std::string("</pre>"));
+    CHECK_EQ(markdown_raw_html_end_marker("<SCRIPT type=text/javascript>"),
+             std::string("</script>"));
+    CHECK_EQ(markdown_raw_html_end_marker("<!-- literal Markdown -->"), std::string("-->"));
+    CHECK_EQ(markdown_raw_html_end_marker("<!DOCTYPE html>"), std::string(">"));
+    CHECK_EQ(markdown_raw_html_end_marker("<div>literal Markdown"),
+             std::string(1, kMarkdownRawHtmlBlankLine));
+    CHECK_EQ(markdown_raw_html_end_marker("<div\r"), std::string(1, kMarkdownRawHtmlBlankLine));
+    CHECK_EQ(markdown_raw_html_end_marker("<hgroup"), std::string(1, kMarkdownRawHtmlBlankLine));
+    CHECK(markdown_raw_html_end_marker("<div/not-html").empty());
+    CHECK(markdown_raw_html_end_marker("xdiv>").empty());
+    CHECK_EQ(markdown_raw_html_end_marker("<![CDATA[text"), std::string("]]>"));
+    CHECK(markdown_raw_html_end_marker("<![cdata[text").empty());
+    CHECK_EQ(markdown_raw_html_end_marker("<prefix>"), std::string(1, kMarkdownRawHtmlBlankLine));
+    const std::string block_end = markdown_raw_html_end_marker("<table>");
+    CHECK_FALSE(markdown_raw_html_closes(block_end, "~~~~markdown"));
+    CHECK(markdown_raw_html_closes(block_end, ""));
+
+    bool can_interrupt_paragraph = true;
+    CHECK_EQ(markdown_raw_html_end_marker("<custom>", &can_interrupt_paragraph),
+             std::string(1, kMarkdownRawHtmlBlankLine));
+    CHECK_FALSE(can_interrupt_paragraph);
+    CHECK(markdown_complete_html_tag("<widget data-id='x' disabled>"));
+    CHECK(markdown_complete_html_tag("</widget  >\r"));
+    CHECK_FALSE(markdown_complete_html_tag("<widget ?\?>"));
+    CHECK(markdown_raw_html_end_marker("<widget ?\?>").empty());
+    CHECK_EQ(markdown_raw_html_end_marker(markdown_block_content("   <div>")),
+             std::string(1, kMarkdownRawHtmlBlankLine));
+    CHECK(markdown_interrupts_paragraph("## heading"));
+    CHECK(markdown_interrupts_paragraph("  * * *"));
+    CHECK_FALSE(markdown_interrupts_paragraph("    * * *"));
+    CHECK_FALSE(markdown_interrupts_paragraph("      # indented paragraph text"));
+    CHECK(markdown_is_indented_code_block("    <widget>"));
+    CHECK(markdown_is_indented_code_block("\t<widget>"));
+    CHECK_FALSE(markdown_is_indented_code_block("   <widget>"));
+    CHECK(markdown_interrupts_paragraph("  ===  "));
+    CHECK(markdown_interrupts_paragraph("-"));
+    CHECK_FALSE(markdown_interrupts_paragraph("===", false));
+    CHECK_FALSE(markdown_interrupts_paragraph("--", false));
+    // Without a preceding paragraph, a setext-looking line is paragraph text.
+    // The following complete custom tag is therefore a lazy continuation, not
+    // a type-7 raw HTML block that could hide a subsequent Rut fence.
+    bool standalone_setext_paragraph_open = !markdown_interrupts_paragraph("===", false);
+    bool custom_tag_can_interrupt = true;
+    CHECK_EQ(markdown_raw_html_end_marker("<widget>", &custom_tag_can_interrupt),
+             std::string(1, kMarkdownRawHtmlBlankLine));
+    CHECK(standalone_setext_paragraph_open);
+    CHECK_FALSE(custom_tag_can_interrupt);
+    CHECK_FALSE(!standalone_setext_paragraph_open || custom_tag_can_interrupt);
+    CHECK_FALSE(markdown_interrupts_paragraph("= ="));
+    CHECK_FALSE(markdown_interrupts_paragraph("- -"));
+    CHECK_FALSE(markdown_interrupts_paragraph("####### paragraph"));
+    CHECK(markdown_is_lazy_paragraph_continuation("<widget>"));
+    CHECK(markdown_is_lazy_paragraph_continuation("plain continuation"));
+    CHECK_FALSE(markdown_is_lazy_paragraph_continuation("```rut"));
+    CHECK_FALSE(markdown_is_lazy_paragraph_continuation("<div>"));
+
+    std::vector<MarkdownContainerSegment> padded_quote;
+    std::vector<MarkdownContainerSegment> compact_quote;
+    CHECK_EQ(markdown_container_content("> prose", 0, nullptr, &padded_quote), "prose");
+    CHECK_EQ(markdown_container_content("><widget>", 0, nullptr, &compact_quote), "<widget>");
+    CHECK(markdown_same_container(padded_quote, compact_quote));
+}
+
+TEST(frontend, language_card_list_container_survives_blank_line) {
+    std::vector<MarkdownContainerSegment> container;
+    CHECK_EQ(markdown_container_content("- prose", 0, nullptr, &container), "prose");
+    REQUIRE_EQ(container.size(), 1u);
+    std::string_view content;
+    CHECK(markdown_strip_container("", container, &content));
+    CHECK(markdown_strip_container("    ```rut", container, &content));
+    MarkdownFence fence{};
+    CHECK(parse_markdown_fence_open_content(content, &fence));
+    CHECK(markdown_fence_language(fence.info, "rut"));
+
+    container.clear();
+    CHECK_EQ(markdown_container_content("- # heading", 0, nullptr, &container), "# heading");
+    REQUIRE_EQ(container.size(), 1u);
+    CHECK(markdown_strip_container("  ~~~~markdown", container, &content));
+    CHECK_EQ(content, "~~~~markdown");
+    CHECK_FALSE(markdown_strip_container("outside the list", container, &content));
+}
+
+TEST(frontend, language_card_list_container_survives_nested_block_close) {
+    std::vector<MarkdownContainerSegment> list_container;
+    CHECK_EQ(markdown_container_content("-   ~~~~markdown", 0, nullptr, &list_container),
+             "~~~~markdown");
+    REQUIRE_EQ(list_container.size(), 1u);
+
+    std::vector<MarkdownContainerSegment> continuation;
+    markdown_remember_list_container(list_container, &continuation);
+    std::string_view content;
+    REQUIRE(markdown_strip_container("    ~~~~rut", continuation, &content));
+    MarkdownFence fence{};
+    REQUIRE(parse_markdown_fence_open_content(content, &fence));
+    CHECK(markdown_fence_language(fence.info, "rut"));
+
+    continuation.clear();
+    markdown_remember_list_container(list_container, &continuation);
+    REQUIRE(markdown_strip_container("    ```rut", continuation, &content));
+    REQUIRE(parse_markdown_fence_open_content(content, &fence));
+    CHECK(markdown_fence_language(fence.info, "rut"));
+}
+
+TEST(frontend, language_card_blank_line_ends_nested_blockquote_fence) {
+    MarkdownFence fence{};
+    REQUIRE(parse_markdown_fence_open("- > ~~~~markdown", &fence));
+    REQUIRE_EQ(fence.container_segments.size(), 2u);
+
+    std::string_view content;
+    CHECK_FALSE(markdown_strip_container("", fence.container_segments, &content));
+    CHECK_FALSE(markdown_strip_container("  ", fence.container_segments, &content));
+
+    std::vector<MarkdownContainerSegment> outer_list(fence.container_segments.begin(),
+                                                     fence.container_segments.begin() + 1);
+    CHECK(markdown_strip_container("", outer_list, &content));
+    REQUIRE(markdown_strip_container("  > ~~~~rut", outer_list, &content));
+    std::vector<MarkdownContainerSegment> nested_container;
+    content = markdown_container_content(content, 0, nullptr, &nested_container, true);
+    MarkdownFence next{};
+    REQUIRE(parse_markdown_fence_open_content(content, &next));
+    CHECK(markdown_fence_language(next.info, "rut"));
+}
+
+TEST(frontend, language_card_same_line_html_close_retains_list_container) {
+    std::vector<MarkdownContainerSegment> container;
+    const std::string_view content =
+        markdown_container_content("- <!-- note -->", 0, nullptr, &container);
+    REQUIRE_EQ(container.size(), 1u);
+    const std::string end = markdown_raw_html_end_marker(markdown_block_content(content));
+    REQUIRE_EQ(end, std::string("-->"));
+    REQUIRE(markdown_raw_html_closes(end, content));
+    std::vector<MarkdownContainerSegment> continuation;
+    markdown_remember_list_container(container, &continuation);
+    std::string_view nested;
+    REQUIRE(markdown_strip_container("  ~~~~markdown", continuation, &nested));
+    CHECK_EQ(nested, "~~~~markdown");
+}
+
+TEST(frontend, language_card_ordered_list_interrupt_requires_start_one) {
+    std::vector<MarkdownContainerSegment> container;
+    CHECK_EQ(markdown_container_content("1. ~~~~rut", 0, nullptr, &container, false), "~~~~rut");
+    REQUIRE_EQ(container.size(), 1u);
+    container.clear();
+    CHECK_EQ(markdown_container_content("01. ~~~~rut", 0, nullptr, &container, false), "~~~~rut");
+    REQUIRE_EQ(container.size(), 1u);
+    container.clear();
+    CHECK_EQ(markdown_container_content("2. ~~~~rut", 0, nullptr, &container, false), "2. ~~~~rut");
+    CHECK(container.empty());
+    CHECK_EQ(markdown_container_content("+   \r", 0, nullptr, &container, false), "+   \r");
+    CHECK(container.empty());
+    CHECK_EQ(markdown_container_content("-     literal", 0, nullptr, &container, false),
+             "-     literal");
+    CHECK(container.empty());
+}
+
+TEST(frontend, language_card_recognizes_marker_only_list_items_outside_paragraphs) {
+    const char* markers[] = {"-", "+", "*", "1.", "1)"};
+    for (const char* marker : markers) {
+        std::vector<MarkdownContainerSegment> container;
+        CHECK(markdown_container_content(marker, 0, nullptr, &container) == "");
+        REQUIRE_EQ(container.size(), 1u);
+        CHECK_EQ(container[0].kind, MarkdownContainerSegment::Kind::List);
+    }
+    std::vector<MarkdownContainerSegment> paragraph_container;
+    CHECK_EQ(markdown_container_content("-", 0, nullptr, &paragraph_container, false), "-");
+    CHECK(paragraph_container.empty());
+
+    std::vector<MarkdownContainerSegment> padded_blank;
+    CHECK_EQ(markdown_container_content("-   ", 0, nullptr, &padded_blank), "  ");
+    REQUIRE_EQ(padded_blank.size(), 1u);
+    CHECK_EQ(padded_blank[0].continuation_width, 2u);
+    std::string_view nested_content;
+    CHECK(markdown_strip_container("  ~~~~markdown", padded_blank, &nested_content));
+    CHECK_EQ(nested_content, "~~~~markdown");
+}
+
+TEST(frontend, language_card_nested_interrupting_container_retains_outer_list) {
+    std::vector<MarkdownContainerSegment> outer;
+    CHECK_EQ(markdown_container_content("- prose", 0, nullptr, &outer), "prose");
+    REQUIRE_EQ(outer.size(), 1u);
+
+    std::string_view outer_content;
+    REQUIRE(markdown_strip_container("  > ~~~~markdown", outer, &outer_content));
+    std::vector<MarkdownContainerSegment> nested;
+    CHECK_EQ(markdown_container_content(outer_content, 0, nullptr, &nested, false), "~~~~markdown");
+    REQUIRE_EQ(nested.size(), 1u);
+    outer.insert(outer.end(), nested.begin(), nested.end());
+    REQUIRE_EQ(outer.size(), 2u);
+    CHECK_EQ(outer[0].kind, MarkdownContainerSegment::Kind::List);
+    CHECK_EQ(outer[1].kind, MarkdownContainerSegment::Kind::Blockquote);
+}
+
+TEST(frontend, language_card_continued_list_parses_nested_container) {
+    std::vector<MarkdownContainerSegment> continued;
+    CHECK_EQ(markdown_container_content("- # heading", 0, nullptr, &continued), "# heading");
+    std::string_view content;
+    REQUIRE(markdown_strip_container("  - ~~~~rut", continued, &content));
+    std::vector<MarkdownContainerSegment> nested;
+    CHECK_EQ(markdown_container_content(content, 0, nullptr, &nested), "~~~~rut");
+    REQUIRE_EQ(nested.size(), 1u);
+    continued.insert(continued.end(), nested.begin(), nested.end());
+    REQUIRE_EQ(continued.size(), 2u);
+}
+
+TEST(frontend, language_card_continued_list_preserves_nested_tab_residual) {
+    std::vector<MarkdownContainerSegment> continued;
+    CHECK_EQ(markdown_container_content("- # heading", 0, nullptr, &continued), "# heading");
+    std::string_view outer_content;
+    std::string outer_normalized;
+    REQUIRE(markdown_strip_container(
+        "  >\t  ~~~~markdown", continued, &outer_content, &outer_normalized));
+    std::vector<MarkdownContainerSegment> nested;
+    std::string nested_normalized;
+    const auto content =
+        markdown_container_content(outer_content, 0, nullptr, &nested, true, &nested_normalized);
+    REQUIRE_EQ(nested.size(), 1u);
+    CHECK_EQ(content, "    ~~~~markdown");
+    CHECK(markdown_is_indented_code_block(content));
+}
+
+TEST(frontend, language_card_tabs_can_indent_nested_container_markers) {
+    MarkdownFence fence{};
+    REQUIRE(parse_markdown_fence_open("> \t> ~~~~rut", &fence));
+    REQUIRE_EQ(fence.container_segments.size(), 2u);
+    CHECK_EQ(fence.container_segments[0].kind, MarkdownContainerSegment::Kind::Blockquote);
+    CHECK_EQ(fence.container_segments[1].kind, MarkdownContainerSegment::Kind::Blockquote);
+}
+
+TEST(frontend, language_card_recognizes_link_reference_definitions) {
+    CHECK(markdown_is_link_reference_definition("[foo]: /url"));
+    CHECK(markdown_is_link_reference_definition("  [foo]: <https://example.test/path> \"title\""));
+    CHECK_EQ(markdown_link_reference_definition("[foo]: /url"),
+             MarkdownLinkReferenceDefinition::TitleMayContinue);
+    CHECK_EQ(markdown_link_reference_definition("[foo]: /url \"title\""),
+             MarkdownLinkReferenceDefinition::Complete);
+    CHECK_EQ(markdown_link_reference_definition("[foo]:"),
+             MarkdownLinkReferenceDefinition::DestinationMayContinue);
+    CHECK_EQ(markdown_link_reference_definition("[foo"),
+             MarkdownLinkReferenceDefinition::LabelMayContinue);
+    CHECK_EQ(markdown_link_reference_definition("[foo\nbar]: /url"),
+             MarkdownLinkReferenceDefinition::TitleMayContinue);
+    CHECK_EQ(markdown_link_reference_definition("[foo]: /url \"multi"),
+             MarkdownLinkReferenceDefinition::OpenTitleMayContinue);
+    CHECK_EQ(markdown_link_reference_definition("[foo]: /url \"multi\nline\""),
+             MarkdownLinkReferenceDefinition::Complete);
+    CHECK_EQ(markdown_link_reference_title_state("\"multi\r", false),
+             MarkdownLinkReferenceTitle::MayContinue);
+    CHECK(markdown_link_reference_title("  \"title\"", true));
+    CHECK(markdown_link_reference_title("(title)", true));
+    CHECK_FALSE(markdown_link_reference_title("  ordinary paragraph", true));
+    CHECK_FALSE(markdown_is_link_reference_definition("[foo] ordinary paragraph"));
+    CHECK_FALSE(markdown_is_link_reference_definition("[]: /url"));
+    CHECK_FALSE(markdown_is_link_reference_definition("[ ]: /url"));
+    CHECK_FALSE(markdown_is_link_reference_definition("[ \t ]: /url"));
+    CHECK_FALSE(markdown_is_link_reference_definition("[\f]: /url"));
+    CHECK_FALSE(markdown_is_link_reference_definition("[foo]: /url("));
+    CHECK_FALSE(markdown_is_link_reference_definition("[foo]: /url)"));
+    CHECK_FALSE(markdown_is_link_reference_definition("[foo]: /url\fgarbage"));
+    CHECK_FALSE(markdown_is_link_reference_definition("[foo]: /url\vgarbage"));
+    CHECK_FALSE(markdown_is_link_reference_definition("[foo]: /url\x01garbage"));
+    CHECK_FALSE(markdown_is_link_reference_definition("[foo]: /url\x7fgarbage"));
+    CHECK(markdown_is_link_reference_definition("[foo]: /url(path)"));
+    CHECK(markdown_is_link_reference_definition("[foo]: /url\\(path\\)"));
+    CHECK(markdown_is_link_reference_definition("[foo]: <>"));
+    CHECK_FALSE(markdown_is_link_reference_definition("[foo]: <foo<bar>"));
+    CHECK_FALSE(markdown_is_link_reference_definition("[foo]: <foo\\>"));
+    CHECK(markdown_is_link_reference_definition("[foo]: <foo\\<bar>"));
+    CHECK(markdown_is_link_reference_definition("[foo]: <foo\\>bar>"));
+    CHECK_EQ(markdown_link_reference_definition_at_block_start("[foo]: /url", true),
+             MarkdownLinkReferenceDefinition::None);
+    CHECK_EQ(markdown_link_reference_definition_at_block_start("[foo]: /url", false),
+             MarkdownLinkReferenceDefinition::TitleMayContinue);
+
+    MarkdownLinkReferenceDefinition pending = MarkdownLinkReferenceDefinition::TitleMayContinue;
+    std::string pending_text = "[foo]: /url";
+    std::vector<MarkdownContainerSegment> expected_container;
+    CHECK_EQ(markdown_take_link_reference_continuation(
+                 "  \"continued title\"", {}, &pending, &pending_text, &expected_container),
+             MarkdownLinkReferenceContinuation::Consumed);
+    CHECK_EQ(pending, MarkdownLinkReferenceDefinition::None);
+
+    std::vector<MarkdownContainerSegment> list_container;
+    CHECK_EQ(markdown_container_content("- [foo]: /url", 0, nullptr, &list_container),
+             "[foo]: /url");
+    std::string normalized_title;
+    std::string_view continued_title;
+    size_t continued_title_column = 0;
+    REQUIRE(markdown_strip_container("  \t\"title\"",
+                                     list_container,
+                                     &continued_title,
+                                     &normalized_title,
+                                     &continued_title_column));
+    pending = MarkdownLinkReferenceDefinition::TitleMayContinue;
+    pending_text = "[foo]: /url";
+    expected_container = list_container;
+    CHECK_EQ(markdown_take_link_reference_continuation(continued_title,
+                                                       list_container,
+                                                       &pending,
+                                                       &pending_text,
+                                                       &expected_container,
+                                                       continued_title_column),
+             MarkdownLinkReferenceContinuation::Consumed);
+    CHECK_EQ(pending, MarkdownLinkReferenceDefinition::None);
+
+    pending = MarkdownLinkReferenceDefinition::DestinationMayContinue;
+    pending_text = "[foo]:";
+    CHECK_EQ(markdown_take_link_reference_continuation(
+                 "  /url", {}, &pending, &pending_text, &expected_container),
+             MarkdownLinkReferenceContinuation::Consumed);
+    CHECK_EQ(pending, MarkdownLinkReferenceDefinition::TitleMayContinue);
+
+    pending = MarkdownLinkReferenceDefinition::DestinationMayContinue;
+    pending_text = "[foo]:";
+    CHECK_EQ(markdown_take_link_reference_continuation(
+                 "~~~~rut", {}, &pending, &pending_text, &expected_container),
+             MarkdownLinkReferenceContinuation::None);
+    CHECK_EQ(pending, MarkdownLinkReferenceDefinition::None);
+
+    for (const char* opener : {"# heading", "---", "<!-- note -->", "~~~~rut"}) {
+        pending = MarkdownLinkReferenceDefinition::DestinationMayContinue;
+        pending_text = "[foo]:";
+        CHECK_EQ(markdown_take_link_reference_continuation(
+                     opener, {}, &pending, &pending_text, &expected_container),
+                 MarkdownLinkReferenceContinuation::None);
+        CHECK_EQ(pending, MarkdownLinkReferenceDefinition::None);
+    }
+
+    pending = MarkdownLinkReferenceDefinition::DestinationMayContinue;
+    pending_text = "[foo]:";
+    CHECK_EQ(markdown_take_link_reference_continuation(
+                 "    continuation", {}, &pending, &pending_text, &expected_container),
+             MarkdownLinkReferenceContinuation::Consumed);
+    CHECK_EQ(pending, MarkdownLinkReferenceDefinition::TitleMayContinue);
+
+    std::vector<MarkdownContainerSegment> blockquote_container;
+    CHECK_EQ(markdown_container_content("> [foo]:", 0, nullptr, &blockquote_container, false),
+             "[foo]:");
+    pending = MarkdownLinkReferenceDefinition::DestinationMayContinue;
+    pending_text = "[foo]:";
+    expected_container = blockquote_container;
+    CHECK_EQ(markdown_take_link_reference_continuation(
+                 "<widget>", {}, &pending, &pending_text, &expected_container),
+             MarkdownLinkReferenceContinuation::None);
+    CHECK_EQ(pending, MarkdownLinkReferenceDefinition::None);
+
+    pending = MarkdownLinkReferenceDefinition::LabelMayContinue;
+    pending_text = "[foo";
+    CHECK_EQ(markdown_take_link_reference_continuation(
+                 "bar]: /url", {}, &pending, &pending_text, &expected_container),
+             MarkdownLinkReferenceContinuation::Consumed);
+    CHECK_EQ(pending, MarkdownLinkReferenceDefinition::TitleMayContinue);
+
+    pending = MarkdownLinkReferenceDefinition::OpenTitleMayContinue;
+    pending_text = "[foo]: /url \"multi";
+    CHECK_EQ(markdown_take_link_reference_continuation(
+                 "line\"", {}, &pending, &pending_text, &expected_container),
+             MarkdownLinkReferenceContinuation::Consumed);
+    CHECK_EQ(pending, MarkdownLinkReferenceDefinition::None);
+
+    for (const char* opener : {"# heading", "<div>", "~~~~rut"}) {
+        pending = MarkdownLinkReferenceDefinition::OpenTitleMayContinue;
+        pending_text = "[foo]: /url \"multi";
+        CHECK_EQ(markdown_take_link_reference_continuation(
+                     opener, {}, &pending, &pending_text, &expected_container),
+                 MarkdownLinkReferenceContinuation::None);
+        CHECK_EQ(pending, MarkdownLinkReferenceDefinition::None);
+    }
+
+    pending = MarkdownLinkReferenceDefinition::TitleMayContinue;
+    pending_text = "[foo]: /url";
+    CHECK_EQ(markdown_take_link_reference_continuation(
+                 "ordinary paragraph", {}, &pending, &pending_text, &expected_container),
+             MarkdownLinkReferenceContinuation::Invalid);
+    CHECK_EQ(pending, MarkdownLinkReferenceDefinition::None);
+}
+
+TEST(frontend, language_card_retains_normalized_interrupting_content) {
+    std::vector<MarkdownContainerSegment> paragraph;
+    CHECK_EQ(markdown_container_content("- prose", 0, nullptr, &paragraph), "prose");
+    std::string outer;
+    std::string_view outer_content;
+    REQUIRE(markdown_strip_container(
+        "  >\t~~~~rut long-info-string", paragraph, &outer_content, &outer));
+    std::vector<MarkdownContainerSegment> interrupting_container;
+    std::string nested;
+    const std::string_view content = markdown_container_content(
+        outer_content, 0, nullptr, &interrupting_container, false, &nested);
+    REQUIRE_FALSE(nested.empty());
+    const std::string expected(content);
+    std::string storage;
+    std::string_view retained;
+    markdown_retain_normalized_content(content, &nested, &outer, &storage, &retained);
+    CHECK_EQ(retained, expected);
+    CHECK_GE(retained.data(), storage.data());
+    CHECK_LE(retained.data() + retained.size(), storage.data() + storage.size());
+    CHECK(nested.empty());
+}
+
+TEST(frontend, language_card_open_list_paragraph_preserves_absolute_content_column) {
+    std::vector<MarkdownContainerSegment> paragraph;
+    CHECK_EQ(markdown_container_content("- prose", 0, nullptr, &paragraph), "prose");
+    std::string normalized;
+    std::string_view content;
+    size_t content_column = 0;
+    REQUIRE(
+        markdown_strip_container("  \t~~~~rut", paragraph, &content, &normalized, &content_column));
+    CHECK_EQ(content_column, 2u);
+    CHECK_FALSE(markdown_is_indented_code_block(content, content_column));
+    MarkdownFence opening{};
+    CHECK(parse_markdown_fence_open_content(content, &opening, content_column));
+    CHECK_EQ(markdown_block_content("\t<div>", content_column), "<div>");
+    CHECK(markdown_interrupts_paragraph("\t# heading", true, content_column));
+}
+
+TEST(frontend, language_card_partial_lazy_continuation_strips_present_prefix) {
+    std::vector<MarkdownContainerSegment> paragraph;
+    CHECK_EQ(markdown_container_content("> > prose", 0, nullptr, &paragraph), "prose");
+    REQUIRE_EQ(paragraph.size(), 2u);
+    std::vector<MarkdownContainerSegment> present(paragraph.begin(), paragraph.begin() + 1);
+    CHECK(markdown_container_prefix(present, paragraph));
+    std::string_view content;
+    REQUIRE(markdown_strip_container("> <widget>", present, &content));
+    CHECK_EQ(content, "<widget>");
+    CHECK(markdown_is_lazy_paragraph_continuation(content));
+}
+
+TEST(frontend, language_card_thematic_breaks_precede_list_markers) {
+    for (const char* line : {"* * *", "- - -"}) {
+        std::vector<MarkdownContainerSegment> container;
+        CHECK_EQ(markdown_container_content(line, 0, nullptr, &container), line);
+        CHECK(container.empty());
+    }
+}
+
+TEST(frontend, language_card_list_continuation_accepts_tab_overshoot) {
+    std::vector<MarkdownContainerSegment> container;
+    CHECK_EQ(markdown_container_content("- ```rut", 0, nullptr, &container), "```rut");
+    REQUIRE_EQ(container.size(), 1u);
+    std::string_view content;
+    std::string normalized;
+    CHECK(markdown_strip_container("\tinvalid", container, &content, &normalized));
+    CHECK_EQ(content, "  invalid");
+    CHECK(markdown_strip_container("\t  ~~~~markdown", container, &content, &normalized));
+    CHECK_EQ(content, "    ~~~~markdown");
+    CHECK(markdown_is_indented_code_block(content));
+}
+
+TEST(frontend, language_card_blockquote_tab_padding_retains_residual_columns) {
+    MarkdownFence fence{};
+    REQUIRE(parse_markdown_fence_open("> ```rut", &fence));
+    std::string_view content;
+    std::string normalized;
+    REQUIRE(markdown_strip_container(
+        ">\t  ~~~~markdown", fence.container_segments, &content, &normalized));
+    CHECK_EQ(content, "    ~~~~markdown");
+    CHECK(markdown_is_indented_code_block(content));
+}
+
+TEST(frontend, language_card_blockquote_tab_residual_prevents_fence_open) {
+    MarkdownFence fence{};
+    CHECK_FALSE(parse_markdown_fence_open(">\t  ~~~~markdown", &fence));
+
+    std::vector<MarkdownContainerSegment> container;
+    std::string normalized;
+    size_t content_column = 0;
+    const auto content = markdown_container_content(
+        ">\t  ~~~~markdown", 0, nullptr, &container, true, &normalized, &content_column);
+    CHECK_EQ(content, "    ~~~~markdown");
+    CHECK(markdown_is_indented_code_block(content, content_column));
+}
+
+TEST(frontend, language_card_list_continuation_uses_post_container_tab_column) {
+    std::vector<MarkdownContainerSegment> continued;
+    CHECK_EQ(markdown_container_content("- # heading", 0, nullptr, &continued), "# heading");
+    std::string_view content;
+    std::string normalized;
+    size_t content_column = 0;
+    REQUIRE(
+        markdown_strip_container("  \t~~~~rut", continued, &content, &normalized, &content_column));
+    CHECK_EQ(content_column, 2u);
+    CHECK_FALSE(markdown_is_indented_code_block(content, content_column));
+    MarkdownFence fence{};
+    CHECK(parse_markdown_fence_open_content(content, &fence, content_column));
+}
+
+TEST(frontend, language_card_nested_container_uses_outer_absolute_column) {
+    std::vector<MarkdownContainerSegment> continued;
+    CHECK_EQ(markdown_container_content("- # heading", 0, nullptr, &continued), "# heading");
+    std::string_view content;
+    std::string normalized;
+    size_t content_column = 0;
+    REQUIRE(markdown_strip_container(
+        "  \t> ~~~~rut", continued, &content, &normalized, &content_column));
+    std::vector<MarkdownContainerSegment> nested;
+    std::string nested_normalized;
+    const size_t outer_content_column = content_column;
+    content = markdown_container_content(content,
+                                         0,
+                                         nullptr,
+                                         &nested,
+                                         true,
+                                         &nested_normalized,
+                                         &content_column,
+                                         outer_content_column);
+    REQUIRE_EQ(nested.size(), 1u);
+    CHECK_EQ(nested[0].kind, MarkdownContainerSegment::Kind::Blockquote);
+    MarkdownFence fence{};
+    CHECK(parse_markdown_fence_open_content(content, &fence, content_column));
+}
+
+TEST(frontend, language_card_block_html_accepts_commonmark_whitespace) {
+    for (const char* opener : {"<div\f>", "<div\v>"})
+        CHECK_FALSE(markdown_raw_html_end_marker(opener).empty());
+}
+
+TEST(frontend, language_card_wide_list_tab_padding_retains_residual_columns) {
+    std::vector<MarkdownContainerSegment> container;
+    std::string normalized;
+    const std::string_view content =
+        markdown_container_content("-\t  ~~~~markdown", 0, nullptr, &container, true, &normalized);
+    REQUIRE_EQ(container.size(), 1u);
+    CHECK_EQ(container[0].continuation_width, 2u);
+    CHECK_EQ(content, "    ~~~~markdown");
+    CHECK(markdown_is_indented_code_block(content));
+}
+
+TEST(frontend, language_card_nested_container_retains_blockquote_tab_residual) {
+    std::vector<MarkdownContainerSegment> outer;
+    CHECK_EQ(markdown_container_content("-   prose", 0, nullptr, &outer), "prose");
+    std::string_view outer_content;
+    std::string outer_normalized;
+    REQUIRE(markdown_strip_container(
+        "    >\t  ~~~~markdown", outer, &outer_content, &outer_normalized));
+    std::vector<MarkdownContainerSegment> nested;
+    std::string nested_normalized;
+    const auto content =
+        markdown_container_content(outer_content, 0, nullptr, &nested, false, &nested_normalized);
+    REQUIRE_EQ(nested.size(), 1u);
+    CHECK_EQ(content, "    ~~~~markdown");
+    CHECK(markdown_is_indented_code_block(content));
+}
+
+TEST(frontend, language_card_ordered_sibling_replaces_current_list_item) {
+    std::vector<MarkdownContainerSegment> paragraph;
+    CHECK_EQ(markdown_container_content("1. prose", 0, nullptr, &paragraph, false), "prose");
+    REQUIRE_EQ(paragraph.size(), 1u);
+    std::string_view content;
+    CHECK_FALSE(markdown_strip_container("2. ~~~~rut", paragraph, &content));
+    std::vector<MarkdownContainerSegment> sibling;
+    CHECK_EQ(markdown_container_content("2. ~~~~rut", 0, nullptr, &sibling, true), "~~~~rut");
+    REQUIRE_EQ(sibling.size(), 1u);
+    CHECK_EQ(sibling[0].kind, MarkdownContainerSegment::Kind::List);
+    CHECK(markdown_list_replacement_allowed(paragraph, sibling));
+}
+
+TEST(frontend, language_card_non_one_ordered_sibling_requires_matching_list_marker) {
+    std::vector<MarkdownContainerSegment> bullet;
+    CHECK_EQ(markdown_container_content("- prose", 0, nullptr, &bullet, false), "prose");
+    std::vector<MarkdownContainerSegment> dot_ordered;
+    CHECK_EQ(markdown_container_content("2. ~~~~markdown", 0, nullptr, &dot_ordered, true),
+             "~~~~markdown");
+    CHECK_FALSE(markdown_list_replacement_allowed(bullet, dot_ordered));
+
+    std::vector<MarkdownContainerSegment> paren_ordered;
+    CHECK_EQ(markdown_container_content("1) prose", 0, nullptr, &paren_ordered, false), "prose");
+    CHECK_FALSE(markdown_list_replacement_allowed(paren_ordered, dot_ordered));
+
+    std::vector<MarkdownContainerSegment> matching_dot_ordered;
+    CHECK_EQ(markdown_container_content("1. prose", 0, nullptr, &matching_dot_ordered, false),
+             "prose");
+    CHECK(markdown_list_replacement_allowed(matching_dot_ordered, dot_ordered));
+}
+
+TEST(frontend, language_card_nested_list_close_retains_matching_outer_prefix) {
+    std::vector<MarkdownContainerSegment> nested;
+    CHECK_EQ(markdown_container_content("- - prose", 0, nullptr, &nested), "prose");
+    REQUIRE_EQ(nested.size(), 2u);
+    std::string_view content;
+    CHECK_FALSE(markdown_strip_container("  ~~~~rut", nested, &content));
+    std::vector<MarkdownContainerSegment> outer(nested.begin(), nested.begin() + 1);
+    REQUIRE(markdown_strip_container("  ~~~~rut", outer, &content));
+    CHECK_EQ(content, "~~~~rut");
+}
+
+TEST(frontend, language_card_recovers_outer_list_from_nested_container_end) {
+    const char* openers[] = {"- - prose", "- > prose", "- > <div>"};
+    for (const char* opener : openers) {
+        std::vector<MarkdownContainerSegment> container;
+        markdown_container_content(opener, 0, nullptr, &container);
+        REQUIRE_EQ(container.size(), 2u);
+        std::vector<MarkdownContainerSegment> prefix;
+        std::string_view content;
+        std::string normalized;
+        REQUIRE(markdown_strip_longest_list_prefix(
+            "  ~~~~markdown", container, &prefix, &content, &normalized));
+        REQUIRE_EQ(prefix.size(), 1u);
+        CHECK_EQ(prefix[0].kind, MarkdownContainerSegment::Kind::List);
+        CHECK_EQ(content, "~~~~markdown");
+    }
+
+    std::vector<MarkdownContainerSegment> nested_lists;
+    markdown_container_content("- - prose", 0, nullptr, &nested_lists);
+    std::vector<MarkdownContainerSegment> outer;
+    std::string_view sibling;
+    std::string normalized;
+    REQUIRE(markdown_strip_longest_list_prefix(
+        "  + ~~~~markdown", nested_lists, &outer, &sibling, &normalized));
+    std::vector<MarkdownContainerSegment> replacement;
+    CHECK_EQ(markdown_container_content(sibling, 0, nullptr, &replacement, true), "~~~~markdown");
+    outer.insert(outer.end(), replacement.begin(), replacement.end());
+    REQUIRE_EQ(outer.size(), 2u);
+    CHECK_EQ(outer[0].kind, MarkdownContainerSegment::Kind::List);
+    CHECK_EQ(outer[1].kind, MarkdownContainerSegment::Kind::List);
+}
+
+TEST(frontend, language_card_prefix_recovery_preserves_normalized_content_offset) {
+    std::vector<MarkdownContainerSegment> container;
+    CHECK_EQ(markdown_container_content("> -   > prose", 0, nullptr, &container), "prose");
+    REQUIRE_EQ(container.size(), 3u);
+    std::vector<MarkdownContainerSegment> prefix;
+    std::string_view content;
+    std::string normalized;
+    REQUIRE(markdown_strip_longest_list_prefix(
+        ">\t    ~~~~rut", container, &prefix, &content, &normalized));
+    REQUIRE_EQ(prefix.size(), 2u);
+    CHECK_EQ(content, "  ~~~~rut");
+    CHECK_FALSE(markdown_is_indented_code_block(content));
+}
+
+TEST(frontend, language_card_rut_fence_language_is_case_insensitive) {
+    MarkdownFence fence{};
+    REQUIRE(parse_markdown_fence_open("```Rut", &fence));
+    CHECK(markdown_fence_language_case_insensitive(fence.info, "rut"));
+}
+
+TEST(frontend, language_card_inner_fence_container_close_retains_outer_list) {
+    MarkdownFence fence{};
+    REQUIRE(parse_markdown_fence_open("- > ~~~~markdown", &fence));
+    REQUIRE_EQ(fence.container_segments.size(), 2u);
+    std::string_view content;
+    CHECK_FALSE(markdown_strip_container("  ~~~~markdown", fence.container_segments, &content));
+    std::vector<MarkdownContainerSegment> outer(fence.container_segments.begin(),
+                                                fence.container_segments.begin() + 1);
+    REQUIRE(markdown_strip_container("  ~~~~markdown", outer, &content));
+    CHECK_EQ(content, "~~~~markdown");
+    CHECK_EQ(outer[0].kind, MarkdownContainerSegment::Kind::List);
+}
+
+TEST(frontend, language_card_nested_tab_normalization_preserves_suffix) {
+    MarkdownFence fence{};
+    REQUIRE(parse_markdown_fence_open("> -  ```rut", &fence));
+    REQUIRE_EQ(fence.container_segments.size(), 2u);
+    std::string_view content;
+    std::string normalized;
+    REQUIRE(
+        markdown_strip_container(">\t\tinvalid", fence.container_segments, &content, &normalized));
+    CHECK_EQ(content, "   invalid");
+}
+
+TEST(frontend, language_card_container_fence_ends_with_its_container) {
+    MarkdownFence fence{};
+    REQUIRE(parse_markdown_fence_open("> ```rut", &fence));
+    std::string_view content;
+    CHECK(markdown_strip_container("> return 200", fence.container_segments, &content));
+    CHECK_EQ(content, "return 200");
+    CHECK_FALSE(markdown_strip_container("```rut", fence.container_segments, &content));
+}
+
+TEST(frontend, language_card_fence_parser_ignores_fences_shown_inside_other_fences) {
+    const char* lines[] = {
+        "````markdown",
+        "```rut",
+        "route GET \"/shown\" { return 200 }",
+        "```",
+        "```swift",
+        "```",
+        "````",
+        "```rut",
+        "route GET \"/real\" { return 200 }",
+        "```",
+    };
+    bool in_fence = false;
+    MarkdownFence current{};
+    u32 rut_fences = 0;
+    u32 swift_fences = 0;
+    for (const char* raw : lines) {
+        const std::string_view line = raw;
+        if (in_fence) {
+            if (is_markdown_fence_close(line, current)) in_fence = false;
+            continue;
+        }
+        MarkdownFence opening{};
+        if (!parse_markdown_fence_open(line, &opening)) continue;
+        in_fence = true;
+        current = opening;
+        if (markdown_fence_language(opening.info, "rut")) rut_fences++;
+        if (markdown_fence_language(opening.info, "swift")) swift_fences++;
+    }
+    CHECK_FALSE(in_fence);
+    CHECK_EQ(rut_fences, 1u);
+    CHECK_EQ(swift_fences, 0u);
+}
+
+TEST(frontend, language_card_skip_marker_requires_non_whitespace_reason) {
+    CHECK(markdown_skip_marker_has_reason("<!-- rut-example: skip typed body is pending -->"));
+    CHECK(markdown_skip_marker_has_reason("<!-- rut-example: skip typed body is pending -->\r"));
+    CHECK_FALSE(markdown_skip_marker_has_reason("<!-- rut-example: skip   -->"));
+    CHECK_FALSE(markdown_skip_marker_has_reason("<!-- rut-example: skip \t\r -->"));
+    CHECK_FALSE(markdown_skip_marker_has_reason("<!-- rut-example: skip missing suffix"));
+    CHECK_FALSE(
+        markdown_skip_marker_has_reason("<!-- rut-example: skip reason --> intervening text -->"));
+    CHECK(markdown_skip_marker_has_reason("> <!-- rut-example: skip pending -->"));
+    CHECK(markdown_skip_marker_has_reason("- <!-- rut-example: skip pending -->"));
+    CHECK(markdown_skip_marker_has_reason("   <!-- rut-example: skip pending -->"));
+}
+
+TEST(frontend, language_card_unmarked_rut_examples_parse_and_typecheck) {
+    const std::string path = std::string(RUT_SOURCE_DIR) + "/docs/language-card.md";
+    std::ifstream input(path, std::ios::binary);
+    REQUIRE_MSG(input.good(), "language card must be readable");
+
+    std::string line;
+    std::string source;
+    bool in_fence = false;
+    bool current_is_rut = false;
+    bool pending_skip = false;
+    std::vector<MarkdownContainerSegment> pending_skip_container;
+    bool skip_current = false;
+    bool paragraph_open = false;
+    std::vector<MarkdownContainerSegment> paragraph_container;
+    MarkdownLinkReferenceDefinition link_reference_pending = MarkdownLinkReferenceDefinition::None;
+    std::string link_reference_pending_text;
+    std::vector<MarkdownContainerSegment> link_reference_container;
+    std::vector<MarkdownContainerSegment> continued_list_container;
+    std::string raw_html_end;
+    std::vector<MarkdownContainerSegment> raw_html_container;
+    MarkdownFence current_fence{};
+    u32 line_number = 0;
+    u32 fence_line = 0;
+    u32 executable_count = 0;
+    u32 skipped_count = 0;
+
+    auto report_failure = [&](const char* phase, const Diagnostic* diagnostic = nullptr) {
+        rut::test::out("language-card Rut example failed ");
+        rut::test::out(phase);
+        rut::test::out(" at fence starting on line ");
+        rut::test::out_int(static_cast<int>(fence_line));
+        if (diagnostic != nullptr) {
+            rut::test::out(" (example line ");
+            rut::test::out_int(static_cast<int>(diagnostic->span.line));
+            rut::test::out(", column ");
+            rut::test::out_int(static_cast<int>(diagnostic->span.col));
+            rut::test::out(")");
+            if (diagnostic->detail.len != 0) {
+                const std::string detail(diagnostic->detail.ptr, diagnostic->detail.len);
+                rut::test::out(": ");
+                rut::test::out(detail.c_str());
+            }
+        }
+        rut::test::out("\n");
+    };
+
+    auto finish_fence = [&]() {
+        in_fence = false;
+        if (!current_is_rut) return;
+        if (skip_current) {
+            skipped_count++;
+            return;
+        }
+
+        executable_count++;
+        const Str input_source{source.data(), static_cast<u32>(source.size())};
+        auto lexed = lex(input_source);
+        if (!lexed) report_failure("lexing", &lexed.error());
+        REQUIRE_MSG(lexed, "language-card Rut example must lex");
+        auto ast = parse_file_heap(lexed.value());
+        if (!ast) report_failure("parsing", &ast.error());
+        REQUIRE_MSG(ast, "language-card Rut example must parse");
+        auto hir = analyze_file_heap_with_path(ast.value(), path);
+        if (!hir) report_failure("type checking", &hir.error());
+        REQUIRE_MSG(hir, "language-card Rut example must type-check");
+    };
+
+    while (std::getline(input, line)) {
+        line_number++;
+        bool process_again = true;
+        while (process_again) {
+            process_again = false;
+            if (in_fence) {
+                std::string_view content;
+                std::string normalized_content;
+                if (!markdown_strip_container(
+                        line, current_fence.container_segments, &content, &normalized_content)) {
+                    // The fence ends when an inner container closes, but a
+                    // matching outer list prefix still contains this line.
+                    std::vector<MarkdownContainerSegment> prefix;
+                    std::string_view prefix_content;
+                    std::string normalized_prefix;
+                    if (markdown_strip_longest_list_prefix(line,
+                                                           current_fence.container_segments,
+                                                           &prefix,
+                                                           &prefix_content,
+                                                           &normalized_prefix))
+                        markdown_remember_list_container(prefix, &continued_list_container);
+                    finish_fence();
+                    process_again = true;
+                    continue;
+                }
+                if (!is_markdown_fence_close(line, current_fence)) {
+                    if (current_is_rut) {
+                        source.append(content);
+                        source.push_back('\n');
+                    }
+                    continue;
+                }
+                markdown_remember_list_container(current_fence.container_segments,
+                                                 &continued_list_container);
+                finish_fence();
+                continue;
+            }
+
+            std::vector<MarkdownContainerSegment> line_container;
+            std::string_view container_content;
+            std::string container_content_storage;
+            size_t container_content_column = 0;
+            if (paragraph_open) {
+                std::vector<MarkdownContainerSegment> interrupting_container;
+                std::string_view interrupting_content;
+                std::string_view outer_content;
+                std::string normalized_outer_content;
+                std::string normalized_interrupting_content;
+                size_t outer_content_column = 0;
+                bool replaced_nested_container = false;
+                if (markdown_strip_container(line,
+                                             paragraph_container,
+                                             &outer_content,
+                                             &normalized_outer_content,
+                                             &outer_content_column)) {
+                    std::vector<MarkdownContainerSegment> nested_container;
+                    interrupting_content =
+                        markdown_container_content(outer_content,
+                                                   0,
+                                                   nullptr,
+                                                   &nested_container,
+                                                   false,
+                                                   &normalized_interrupting_content,
+                                                   nullptr,
+                                                   outer_content_column);
+                    interrupting_container = paragraph_container;
+                    interrupting_container.insert(interrupting_container.end(),
+                                                  nested_container.begin(),
+                                                  nested_container.end());
+                } else {
+                    const bool replacing_list_item =
+                        !paragraph_container.empty() &&
+                        paragraph_container.back().kind == MarkdownContainerSegment::Kind::List;
+                    std::vector<MarkdownContainerSegment> retained_prefix;
+                    if (markdown_strip_longest_list_prefix(line,
+                                                           paragraph_container,
+                                                           &retained_prefix,
+                                                           &outer_content,
+                                                           &normalized_outer_content)) {
+                        std::vector<MarkdownContainerSegment> nested_container;
+                        interrupting_content =
+                            markdown_container_content(outer_content,
+                                                       0,
+                                                       nullptr,
+                                                       &nested_container,
+                                                       replacing_list_item,
+                                                       &normalized_interrupting_content);
+                        interrupting_container = std::move(retained_prefix);
+                        if (markdown_list_replacement_allowed(paragraph_container,
+                                                              nested_container)) {
+                            replaced_nested_container = !nested_container.empty();
+                            interrupting_container.insert(interrupting_container.end(),
+                                                          nested_container.begin(),
+                                                          nested_container.end());
+                        } else {
+                            interrupting_content = outer_content;
+                        }
+                    } else {
+                        interrupting_content =
+                            markdown_container_content(line,
+                                                       0,
+                                                       nullptr,
+                                                       &interrupting_container,
+                                                       replacing_list_item,
+                                                       &normalized_interrupting_content);
+                        if (replacing_list_item &&
+                            !markdown_list_replacement_allowed(paragraph_container,
+                                                               interrupting_container)) {
+                            interrupting_container.clear();
+                            interrupting_content = line;
+                        }
+                    }
+                }
+                const bool partial_lazy_continuation =
+                    markdown_container_prefix(interrupting_container, paragraph_container) &&
+                    markdown_is_lazy_paragraph_continuation(interrupting_content);
+                if (!interrupting_container.empty() &&
+                    (replaced_nested_container ||
+                     !markdown_same_container(interrupting_container, paragraph_container)) &&
+                    !partial_lazy_continuation) {
+                    paragraph_open = false;
+                    paragraph_container.clear();
+                    markdown_retain_normalized_content(interrupting_content,
+                                                       &normalized_interrupting_content,
+                                                       &normalized_outer_content,
+                                                       &container_content_storage,
+                                                       &container_content);
+                    line_container = std::move(interrupting_container);
+                } else if (partial_lazy_continuation) {
+                    markdown_retain_normalized_content(interrupting_content,
+                                                       &normalized_interrupting_content,
+                                                       &normalized_outer_content,
+                                                       &container_content_storage,
+                                                       &container_content);
+                    line_container = paragraph_container;
+                } else {
+                    const bool has_full_container =
+                        markdown_strip_container(line,
+                                                 paragraph_container,
+                                                 &container_content,
+                                                 &container_content_storage,
+                                                 &container_content_column);
+                    if (!has_full_container) {
+                        bool lazy_continuation = false;
+                        for (size_t prefix_len = paragraph_container.size(); prefix_len != 0;
+                             prefix_len--) {
+                            std::vector<MarkdownContainerSegment> prefix(
+                                paragraph_container.begin(),
+                                paragraph_container.begin() + prefix_len - 1);
+                            std::string_view partial_content;
+                            std::string normalized_partial_content;
+                            if (!markdown_strip_container(
+                                    line, prefix, &partial_content, &normalized_partial_content) ||
+                                !markdown_is_lazy_paragraph_continuation(partial_content))
+                                continue;
+                            container_content_storage = std::move(normalized_partial_content);
+                            container_content = container_content_storage.empty()
+                                                    ? partial_content
+                                                    : std::string_view(container_content_storage);
+                            lazy_continuation = true;
+                            break;
+                        }
+                        if (!lazy_continuation) {
+                            paragraph_open = false;
+                            std::vector<MarkdownContainerSegment> retained_prefix;
+                            std::string retained_storage;
+                            std::string_view retained_content;
+                            if (!markdown_strip_longest_list_prefix(line,
+                                                                    paragraph_container,
+                                                                    &retained_prefix,
+                                                                    &retained_content,
+                                                                    &retained_storage)) {
+                                paragraph_container.clear();
+                                process_again = true;
+                                continue;
+                            }
+                            paragraph_container.clear();
+                            container_content_storage = std::move(retained_storage);
+                            container_content = container_content_storage.empty()
+                                                    ? retained_content
+                                                    : std::string_view(container_content_storage);
+                            line_container = std::move(retained_prefix);
+                        } else {
+                            line_container = paragraph_container;
+                        }
+                    } else {
+                        line_container = paragraph_container;
+                    }
+                }
+            } else {
+                bool retained_list_container = false;
+                if (!continued_list_container.empty()) {
+                    size_t retained_segments = continued_list_container.size();
+                    while (retained_segments != 0) {
+                        std::vector<MarkdownContainerSegment> candidate(
+                            continued_list_container.begin(),
+                            continued_list_container.begin() + retained_segments);
+                        if (markdown_strip_container(line,
+                                                     candidate,
+                                                     &container_content,
+                                                     &container_content_storage,
+                                                     &container_content_column)) {
+                            line_container = std::move(candidate);
+                            retained_list_container = true;
+                            break;
+                        }
+                        retained_segments--;
+                    }
+                }
+                if (retained_list_container) {
+                    std::vector<MarkdownContainerSegment> nested_container;
+                    std::string nested_content_storage;
+                    const size_t outer_content_column = container_content_column;
+                    const std::string_view nested_content =
+                        markdown_container_content(container_content,
+                                                   0,
+                                                   nullptr,
+                                                   &nested_container,
+                                                   true,
+                                                   &nested_content_storage,
+                                                   &container_content_column,
+                                                   outer_content_column);
+                    if (nested_content_storage.empty()) {
+                        container_content = nested_content;
+                    } else {
+                        const size_t nested_offset = static_cast<size_t>(
+                            nested_content.data() - nested_content_storage.data());
+                        container_content_storage = std::move(nested_content_storage);
+                        container_content =
+                            std::string_view(container_content_storage).substr(nested_offset);
+                    }
+                    line_container.insert(
+                        line_container.end(), nested_container.begin(), nested_container.end());
+                } else {
+                    continued_list_container.clear();
+                    container_content = markdown_container_content(line,
+                                                                   0,
+                                                                   nullptr,
+                                                                   &line_container,
+                                                                   true,
+                                                                   &container_content_storage,
+                                                                   &container_content_column);
+                }
+            }
+            const bool container_line_blank =
+                container_content.find_first_not_of(" \t\r") == std::string_view::npos;
+            if (!container_line_blank) continued_list_container.clear();
+            if (!raw_html_end.empty()) {
+                std::string_view html_content;
+                std::string normalized_html_content;
+                if (!markdown_strip_container(
+                        line, raw_html_container, &html_content, &normalized_html_content)) {
+                    std::vector<MarkdownContainerSegment> retained_prefix;
+                    if (markdown_strip_longest_list_prefix(line,
+                                                           raw_html_container,
+                                                           &retained_prefix,
+                                                           &html_content,
+                                                           &normalized_html_content))
+                        markdown_remember_list_container(retained_prefix,
+                                                         &continued_list_container);
+                    raw_html_end.clear();
+                    raw_html_container.clear();
+                    process_again = true;
+                    continue;
+                }
+                if (markdown_raw_html_closes(raw_html_end, html_content)) {
+                    markdown_remember_list_container(raw_html_container, &continued_list_container);
+                    raw_html_end.clear();
+                    raw_html_container.clear();
+                }
+                continue;
+            }
+            const auto link_reference_continuation =
+                markdown_take_link_reference_continuation(container_content,
+                                                          line_container,
+                                                          &link_reference_pending,
+                                                          &link_reference_pending_text,
+                                                          &link_reference_container,
+                                                          container_content_column);
+            if (link_reference_continuation != MarkdownLinkReferenceContinuation::None) {
+                paragraph_open = false;
+                paragraph_container.clear();
+                if (link_reference_continuation == MarkdownLinkReferenceContinuation::Consumed)
+                    markdown_remember_list_container(line_container, &continued_list_container);
+                else {
+                    paragraph_open = true;
+                    paragraph_container = line_container;
+                }
+                continue;
+            }
+            const std::string_view skip_content =
+                markdown_block_content(container_content, container_content_column);
+            if (skip_content.starts_with(kMarkdownSkipPrefix)) {
+                REQUIRE_MSG(!pending_skip, "skip markers cannot be stacked");
+                REQUIRE_MSG(markdown_skip_marker_has_reason(skip_content),
+                            "language-card skip markers require a nonempty reason");
+                pending_skip = true;
+                pending_skip_container = std::move(line_container);
+                paragraph_open = false;
+                paragraph_container.clear();
+                continue;
+            }
+            const std::string_view block_content =
+                markdown_block_content(container_content, container_content_column);
+            const bool indented_code =
+                !paragraph_open &&
+                markdown_is_indented_code_block(container_content, container_content_column);
+            const bool interrupts_paragraph = markdown_interrupts_paragraph(
+                container_content, paragraph_open, container_content_column);
+            if (interrupts_paragraph) {
+                paragraph_open = false;
+                paragraph_container.clear();
+            }
+            bool html_can_interrupt_paragraph = true;
+            const std::string html_end =
+                indented_code
+                    ? std::string{}
+                    : markdown_raw_html_end_marker(block_content, &html_can_interrupt_paragraph);
+            if (!html_end.empty() && (!paragraph_open || html_can_interrupt_paragraph)) {
+                REQUIRE_MSG(!pending_skip, "a skip marker must immediately precede a rut fence");
+                const std::string lower = markdown_ascii_lower(block_content);
+                if ((html_end.size() == 1 && html_end[0] == kMarkdownRawHtmlBlankLine) ||
+                    lower.find(html_end) == std::string::npos)
+                    raw_html_end = html_end;
+                if (!raw_html_end.empty())
+                    raw_html_container = line_container;
+                else
+                    markdown_remember_list_container(line_container, &continued_list_container);
+                paragraph_open = false;
+                paragraph_container.clear();
+                continue;
+            }
+            MarkdownFence opening{};
+            const bool is_opening =
+                !indented_code &&
+                (pending_skip ? parse_markdown_fence_open_in_container(
+                                    line, pending_skip_container, &opening)
+                              : parse_markdown_fence_open_content(
+                                    container_content, &opening, container_content_column));
+            if (is_opening && !pending_skip) {
+                opening.container_segments = line_container;
+                for (const auto& segment : line_container)
+                    if (segment.kind == MarkdownContainerSegment::Kind::List)
+                        opening.container_indent += segment.continuation_width;
+            }
+            REQUIRE_MSG(
+                !is_opening || !markdown_fence_language_case_insensitive(opening.info, "swift"),
+                "language-card language fences must use rut");
+            if (is_opening) {
+                in_fence = true;
+                paragraph_open = false;
+                paragraph_container.clear();
+                current_fence = opening;
+                current_is_rut = markdown_fence_language_case_insensitive(opening.info, "rut");
+                if (current_is_rut) {
+                    skip_current = pending_skip;
+                    pending_skip = false;
+                    pending_skip_container.clear();
+                    fence_line = line_number;
+                    source.clear();
+                } else {
+                    REQUIRE_MSG(!pending_skip,
+                                "a skip marker must immediately precede a rut fence");
+                }
+                continue;
+            }
+            REQUIRE_MSG(!pending_skip, "a skip marker must immediately precede a rut fence");
+            const auto link_reference = markdown_link_reference_definition_at_block_start(
+                container_content, paragraph_open);
+            paragraph_open = !indented_code && !interrupts_paragraph && !container_line_blank &&
+                             link_reference == MarkdownLinkReferenceDefinition::None;
+            if (link_reference == MarkdownLinkReferenceDefinition::LabelMayContinue ||
+                link_reference == MarkdownLinkReferenceDefinition::DestinationMayContinue ||
+                link_reference == MarkdownLinkReferenceDefinition::TitleMayContinue ||
+                link_reference == MarkdownLinkReferenceDefinition::OpenTitleMayContinue) {
+                link_reference_pending = link_reference;
+                link_reference_pending_text = std::string(container_content);
+                link_reference_container = line_container;
+            }
+            if (paragraph_open)
+                paragraph_container = std::move(line_container);
+            else {
+                bool has_list = false;
+                for (const auto& segment : line_container)
+                    has_list |= segment.kind == MarkdownContainerSegment::Kind::List;
+                if (has_list) continued_list_container = line_container;
+                paragraph_container.clear();
+            }
+        }
+    }
+
+    if (in_fence) finish_fence();
+    // CommonMark raw HTML blocks are implicitly closed by end of input.
+    raw_html_end.clear();
+    raw_html_container.clear();
+    REQUIRE_MSG(!in_fence, "language card contains an unterminated Markdown fence");
+    REQUIRE_MSG(!pending_skip, "language card contains a dangling skip marker");
+    CHECK_GE(executable_count, 3u);
+    CHECK_GT(skipped_count, 0u);
+}
+
+TEST(frontend, language_card_typecheck_resolves_imports_from_document_path) {
+    const char* src =
+        "import \"definitely-missing-language-card-example.rut\"\n"
+        "route GET \"/x\" { return 200 }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap_with_path(
+        ast.value(), std::string(RUT_SOURCE_DIR) + "/docs/language-card-example.rut");
+    REQUIRE_FALSE(hir.has_value());
 }
 
 TEST(frontend, rir_verifier_e2e_accepts_lowered_wait_route) {
