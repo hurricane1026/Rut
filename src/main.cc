@@ -98,7 +98,7 @@ static i32 run_shards(u16 port,
                       const char* access_log_path,
                       bool access_log_compress,
                       i32 access_log_level,
-                      const RouteConfig* route_config,
+                      RouteConfig* route_config,
                       bool serve_metrics) {
     Shard<EventLoopType> shards[kMaxShards];
     // Cross-shard metrics registry for snapshots and the optional built-in
@@ -480,7 +480,7 @@ int main(int argc, char** argv) {
     // serve. The loader owns the JIT code + RIR arena + source mapping
     // for the whole run, so it lives at file scope to outlive every
     // shard and to keep the 1.28 MB RouteConfig off the stack.
-    const RouteConfig* route_config = nullptr;
+    RouteConfig* route_config = nullptr;
 #ifdef RUT_ENABLE_JIT
     static LoadedProgram program;
     if (config_path) {

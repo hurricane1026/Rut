@@ -91,8 +91,9 @@ public:
     ControlPlaneMutationPort() { reset(1, false); }
 
     // Startup/harness setup only: callers must ensure no concurrent users.
-    void reset(u64 generation, bool allow_route_reload, const RouteConfig* config = nullptr) {
+    void reset(u64 generation, bool allow_route_reload, RouteConfig* config = nullptr) {
         if (generation == 0 || generation > kMaxGeneration) generation = 1;
+        if (config != nullptr) config->config_generation = generation;
         active_bank_.store(0, std::memory_order_relaxed);
         for (u32 bank = 0; bank < 2; bank++) {
             clear_bank(bank);
@@ -429,7 +430,7 @@ public:
                                        ReloadRequestSource source,
                                        ReloadTerminalOutcome outcome,
                                        u64 new_generation = 0,
-                                       const RouteConfig* new_config = nullptr) {
+                                       RouteConfig* new_config = nullptr) {
         if (outcome == ReloadTerminalOutcome::None || outcome == ReloadTerminalOutcome::Busy ||
             outcome == ReloadTerminalOutcome::Stopped ||
             outcome == ReloadTerminalOutcome::AdmissionContended ||
@@ -560,6 +561,7 @@ public:
                 cutover_.store(0, std::memory_order_release);
                 return false;
             }
+            new_config->config_generation = new_generation;
             bank_generation_[new_bank].store(new_generation, std::memory_order_release);
             active_bank_.store(static_cast<u8>(new_bank), std::memory_order_release);
             active_generation_.store(new_generation, std::memory_order_release);
@@ -2471,7 +2473,7 @@ private:
     std::atomic<u64> active_generation_{1};
     std::atomic<u8> active_bank_{0};
     std::atomic<u64> bank_generation_[2]{};
-    std::atomic<const RouteConfig*> bank_config_[2]{};
+    std::atomic<RouteConfig*> bank_config_[2]{};
     std::atomic<u8> upstream_count_[2]{};
     std::atomic<u8> backend_count_[2][RouteConfig::kMaxUpstreams]{};
     std::atomic<u16> upstream_allocation_[2][RouteConfig::kMaxUpstreams]{};

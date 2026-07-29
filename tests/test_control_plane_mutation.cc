@@ -1007,6 +1007,7 @@ TEST(control_plane_mutation, activation_retains_old_health_until_terminal_ack_bo
     REQUIRE(old_config.add_upstream_backend(4, 0x7f000001u, 8100));
     REQUIRE(old_config.add_upstream_backend(4, 0x7f000001u, 8101));
     port.reset(3, true, &old_config);
+    CHECK_EQ(old_config.config_generation, 3u);
     const ServerIdentity old_server{3, 4, 2};
     REQUIRE(port.mark(old_server, false));
     CHECK_EQ(port.manual_health(old_server), ManualHealthOverride::Unhealthy);
@@ -1023,6 +1024,7 @@ TEST(control_plane_mutation, activation_retains_old_health_until_terminal_ack_bo
     REQUIRE(new_config.add_upstream_backend(4, 0x7f000001u, 8201));
     REQUIRE(
         port.complete_reload(id, request.source, ReloadTerminalOutcome::Activated, 4, &new_config));
+    CHECK_EQ(new_config.config_generation, 4u);
     CHECK_EQ(port.active_generation(), 4u);
     CHECK_EQ(port.state(), ReloadAdmissionState::Completing);
     CHECK(!port.request_reload(ReloadRequestSource::Route));
