@@ -164,8 +164,12 @@ requires identical declaration identity, key/value layout, hash algorithm, and
 seed.
 
 Each accepted update pins the compiled configuration that owns its updater
-thunk. Reload cannot reinterpret an old numeric updater id against new code; the
-old module remains alive until its accepted messages and replies finish.
+thunk. On cross-shard enqueue, the queue entry acquires its own pin before the
+request can release its pin. A client disconnect therefore cannot detach an
+un-pinned updater: the queued operation retains the program through owner
+execution and through delivery or explicit discard of its reserved reply.
+Reload cannot reinterpret an old numeric updater id against new code; the old
+module remains alive until its accepted messages and replies finish.
 
 Changing `shardCount` changes key ownership. A reload that would preserve a
 non-empty consistent `Hash` while changing shard count is rejected until the

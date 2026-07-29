@@ -15,6 +15,11 @@ Connect the remaining declared `reload()` and `upstream.mark()` mutation
 surface to runtime services. Read-only `stats()` and `metrics()` snapshots are
 connected end to end.
 
+The authority, visible boolean failure, config-generation ordering, lifetime,
+and harness contract is fixed in `docs/control-plane-mutations.md`. Implement
+it in the required order documented there; do not reintroduce the old
+`Void`/statement-only declarations or a hidden wait.
+
 **Acceptance**:
 - Reload and upstream mutation define authorization, failure, and shard-ordering
   behavior.
@@ -84,6 +89,10 @@ implementation promise.
 
 ## Recently Completed
 
+- [x] Control-plane mutations have one explicit contract for authority, visible
+  boolean failure, config-generation publication, program lifetime, shard
+  ordering, manual-health priority, and deterministic replay; runtime wiring
+  remains the P0 implementation task above.
 - [x] `language-card.md` Rut fences are front-end fixtures by default; target
   and fragment surveys require an adjacent reasoned skip marker, and every
   unmarked example parses and type-checks in CI.

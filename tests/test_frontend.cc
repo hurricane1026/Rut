@@ -39705,9 +39705,13 @@ TEST(frontend, control_plane_builtin_declarations_preserve_signatures_and_contex
     CHECK(stats->json_serializable);
     CHECK_EQ(metrics->return_type, BuiltinDeclType::Metrics);
     CHECK(metrics->json_serializable);
-    CHECK(reload->statement_only);
+    CHECK_EQ(reload->return_type, BuiltinDeclType::Bool);
+    CHECK(!reload->statement_only);
+    CHECK(!reload->requires_pinned_timer);
     CHECK_EQ(reload->contexts, static_cast<u8>(BuiltinInRoute));
-    CHECK(mark->statement_only);
+    CHECK_EQ(mark->return_type, BuiltinDeclType::Bool);
+    CHECK(!mark->statement_only);
+    CHECK(mark->requires_pinned_timer);
     CHECK_EQ(mark->contexts, static_cast<u8>(BuiltinInTimer));
     REQUIRE_EQ(mark->param_count, 2u);
     CHECK_EQ(mark->params[0].type, BuiltinDeclType::Server);

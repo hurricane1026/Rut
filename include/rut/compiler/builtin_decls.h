@@ -37,6 +37,7 @@ struct BuiltinDecl {
     BuiltinDeclType return_type = BuiltinDeclType::Void;
     u8 contexts = 0;
     bool statement_only = false;
+    bool requires_pinned_timer = false;
     bool json_serializable = false;
     u8 param_count = 0;
     BuiltinParamDecl params[2]{};
@@ -48,6 +49,7 @@ inline constexpr BuiltinDecl kControlPlaneBuiltinDecls[] = {
      BuiltinDeclType::Stats,
      BuiltinInRoute | BuiltinInTimer,
      false,
+     false,
      true,
      0,
      {}},
@@ -56,21 +58,24 @@ inline constexpr BuiltinDecl kControlPlaneBuiltinDecls[] = {
      BuiltinDeclType::Metrics,
      BuiltinInRoute | BuiltinInTimer,
      false,
+     false,
      true,
      0,
      {}},
     {{"reload", 6},
      BuiltinReceiver::None,
-     BuiltinDeclType::Void,
+     BuiltinDeclType::Bool,
      BuiltinInRoute,
-     true,
+     false,
+     false,
      false,
      0,
      {}},
     {{"mark", 4},
      BuiltinReceiver::Upstream,
-     BuiltinDeclType::Void,
+     BuiltinDeclType::Bool,
      BuiltinInTimer,
+     false,
      true,
      false,
      2,
