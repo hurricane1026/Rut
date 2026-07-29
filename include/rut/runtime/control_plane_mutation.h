@@ -1291,6 +1291,8 @@ private:
             for (auto& backend : overrides_[bank][upstream])
                 backend.store(0, std::memory_order_relaxed);
             for (u32 backend = 0; backend < UpstreamTarget::kMaxBackends; backend++) {
+                override_peer_upstream_[bank][upstream][backend] = 0xff;
+                override_peer_backend_[bank][upstream][backend] = 0xff;
                 endpoint_allocation_[bank][upstream][backend].store(kInvalidAllocation,
                                                                     std::memory_order_relaxed);
                 endpoint_incarnation_[bank][upstream][backend].store(0, std::memory_order_relaxed);
@@ -1383,27 +1385,17 @@ private:
             return false;
         const u32 peer_bank = bank ^ 1u;
         if (bank_generation_[peer_bank].load(std::memory_order_acquire) == 0) return false;
-        const u16 upstream_identity =
-            upstream_allocation_[bank][upstream].load(std::memory_order_relaxed);
-        const u16 endpoint_identity =
-            endpoint_allocation_[bank][upstream][backend].load(std::memory_order_relaxed);
-        const u32 peer_count = upstream_count_[peer_bank].load(std::memory_order_acquire);
-        for (u32 candidate = 0; candidate < peer_count; candidate++) {
-            if (upstream_allocation_[peer_bank][candidate].load(std::memory_order_relaxed) !=
-                upstream_identity)
-                continue;
-            const u32 endpoints =
-                backend_count_[peer_bank][candidate].load(std::memory_order_relaxed);
-            for (u32 endpoint = 0; endpoint < endpoints; endpoint++) {
-                if (endpoint_allocation_[peer_bank][candidate][endpoint].load(
-                        std::memory_order_relaxed) != endpoint_identity)
-                    continue;
-                *peer_upstream = candidate;
-                *peer_backend = endpoint;
-                return true;
-            }
-        }
-        return false;
+        const u8 mapped_upstream = override_peer_upstream_[bank][upstream][backend];
+        const u8 mapped_backend = override_peer_backend_[bank][upstream][backend];
+        if (mapped_upstream >= RouteConfig::kMaxUpstreams ||
+            mapped_backend >= UpstreamTarget::kMaxBackends ||
+            mapped_upstream >= upstream_count_[peer_bank].load(std::memory_order_acquire) ||
+            mapped_backend >=
+                backend_count_[peer_bank][mapped_upstream].load(std::memory_order_acquire))
+            return false;
+        *peer_upstream = mapped_upstream;
+        *peer_backend = mapped_backend;
+        return true;
     }
 
     [[nodiscard]] static u32 matching_endpoint_count(const UpstreamTarget& old_target,
@@ -1573,16 +1565,32 @@ private:
                     continue;
                 }
                 matched_old_backend[old_backend] = true;
-                endpoint_allocation_[new_bank][upstream][backend].store(
-                    endpoint_allocation_[old_bank][old_upstream][old_backend].load(
-                        std::memory_order_relaxed),
-                    std::memory_order_relaxed);
-                endpoint_incarnation_[new_bank][upstream][backend].store(
-                    compatible_health_policy(old_target, new_target)
-                        ? endpoint_incarnation_[old_bank][old_upstream][old_backend].load(
-                              std::memory_order_relaxed)
-                        : allocate_endpoint_incarnation(),
-                    std::memory_order_relaxed);
+                override_peer_upstream_[new_bank][upstream][backend] =
+                    static_cast<u8>(old_upstream);
+                override_peer_backend_[new_bank][upstream][backend] = static_cast<u8>(old_backend);
+                override_peer_upstream_[old_bank][old_upstream][old_backend] =
+                    static_cast<u8>(upstream);
+                override_peer_backend_[old_bank][old_upstream][old_backend] =
+                    static_cast<u8>(backend);
+                if (compatible_health_policy(old_target, new_target)) {
+                    endpoint_allocation_[new_bank][upstream][backend].store(
+                        endpoint_allocation_[old_bank][old_upstream][old_backend].load(
+                            std::memory_order_relaxed),
+                        std::memory_order_relaxed);
+                    endpoint_incarnation_[new_bank][upstream][backend].store(
+                        endpoint_incarnation_[old_bank][old_upstream][old_backend].load(
+                            std::memory_order_relaxed),
+                        std::memory_order_relaxed);
+                } else {
+                    while (next_endpoint < kMaxEndpointAllocations && used_endpoint[next_endpoint])
+                        next_endpoint++;
+                    endpoint_allocation_[new_bank][upstream][backend].store(
+                        next_endpoint, std::memory_order_relaxed);
+                    endpoint_incarnation_[new_bank][upstream][backend].store(
+                        allocate_endpoint_incarnation(), std::memory_order_relaxed);
+                    if (next_endpoint < kMaxEndpointAllocations)
+                        used_endpoint[next_endpoint++] = true;
+                }
                 const u64 old_value =
                     committed_override(old_bank, old_upstream, old_backend, nullptr);
                 if (unpack_override_generation(old_value) != old_generation ||
@@ -2366,6 +2374,8 @@ private:
     std::atomic<u64> endpoint_incarnation_[2][RouteConfig::kMaxUpstreams]
                                           [UpstreamTarget::kMaxBackends]{};
     UpstreamTarget membership_[2][RouteConfig::kMaxUpstreams]{};
+    u8 override_peer_upstream_[2][RouteConfig::kMaxUpstreams][UpstreamTarget::kMaxBackends]{};
+    u8 override_peer_backend_[2][RouteConfig::kMaxUpstreams][UpstreamTarget::kMaxBackends]{};
     std::atomic<u64> overrides_[2][RouteConfig::kMaxUpstreams][UpstreamTarget::kMaxBackends]{};
     std::atomic<u64> committed_overrides_[2][RouteConfig::kMaxUpstreams]
                                          [UpstreamTarget::kMaxBackends][2]{};

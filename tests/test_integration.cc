@@ -2665,6 +2665,45 @@ TEST(active_health, verdict_follows_stable_endpoint_across_reload) {
     record_active_probe_result_allocation(moved_users, /*healthy=*/true, 3);
 }
 
+TEST(active_health, policy_changes_isolate_retained_generation_verdicts) {
+    ControlPlaneMutationPort port;
+    RouteConfig old_config;
+    REQUIRE(old_config.add_upstream("users-health", 0x7f000001u, 8015).has_value());
+    REQUIRE(old_config.set_upstream_health_check(0, "/health", 7, 1000, 200));
+    port.reset(41, true, &old_config);
+    const u16 old_allocation = port.endpoint_allocation_for_config(&old_config, 0, 0);
+    const u64 old_incarnation = port.endpoint_incarnation_for_config(&old_config, 0, 0);
+    record_active_probe_result_allocation(
+        old_allocation, false, 1, &old_config.upstreams[0], 0, old_incarnation);
+    CHECK(backend_ejected_allocation(
+        old_allocation, 1, &old_config.upstreams[0], 0, old_incarnation));
+
+    u64 id = 0;
+    REQUIRE(port.request_reload(ReloadRequestSource::Route, &id));
+    ReloadRequest request{};
+    REQUIRE(port.take_reload(&request));
+    RouteConfig new_config;
+    REQUIRE(new_config.add_upstream("users-health", 0x7f000001u, 8015).has_value());
+    REQUIRE(new_config.set_upstream_health_check(0, "/health", 7, 2000, 200));
+    REQUIRE(port.complete_reload(
+        id, request.source, ReloadTerminalOutcome::Activated, 42, &new_config));
+
+    const u16 new_allocation = port.endpoint_allocation_for_config(&new_config, 0, 0);
+    const u64 new_incarnation = port.endpoint_incarnation_for_config(&new_config, 0, 0);
+    CHECK_NE(new_allocation, old_allocation);
+    CHECK_NE(new_incarnation, old_incarnation);
+    CHECK_FALSE(backend_ejected_allocation(
+        new_allocation, 1, &new_config.upstreams[0], 0, new_incarnation));
+    record_active_probe_result_allocation(
+        new_allocation, false, 2, &new_config.upstreams[0], 0, new_incarnation);
+    record_active_probe_result_allocation(
+        old_allocation, true, 3, &old_config.upstreams[0], 0, old_incarnation);
+    CHECK_FALSE(backend_ejected_allocation(
+        old_allocation, 3, &old_config.upstreams[0], 0, old_incarnation));
+    CHECK(backend_ejected_allocation(
+        new_allocation, 3, &new_config.upstreams[0], 0, new_incarnation));
+}
+
 TEST(active_health, recycled_allocation_clears_unrelated_endpoint_verdict) {
     ControlPlaneMutationPort port;
     RouteConfig first_config;
