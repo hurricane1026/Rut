@@ -1790,6 +1790,7 @@ route GET "/continue" {
     }
     return 500
 }
+
 route GET "/break" {
     for item in [1] { break }
     guard false else { return 400 }
@@ -1835,6 +1836,63 @@ route GET "/break" {
     rir.destroy();
 }
 
+TEST(jit, bounded_static_for_match_fallthrough_preserves_source_arm_semantics) {
+    const auto src = R"rut(
+route GET "/wildcard" {
+    for item in [false] {
+        match item { _ => { match item { true => return 201 false => return 202 } } }
+    }
+    return 500
+}
+route GET "/guard-order" {
+    for item in [true] {
+        match item {
+            true if false => { guard false else { return 400 } return 200 }
+            _ => return 201
+        }
+    }
+    return 500
+}
+route GET "/wildcard-control" {
+    for item in [false] {
+        match item { _ => { match item { true => break false => return 202 } } }
+    }
+    return 500
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    REQUIRE(lower_to_rir(mir.value(), rir));
+    auto cg = codegen(rir.module);
+    REQUIRE(cg.ok);
+    JitEngine engine;
+    REQUIRE(engine.init());
+    REQUIRE(engine.compile(cg.mod, cg.ctx));
+    const u32 expected[] = {202, 201, 202};
+    for (u32 route = 0; route < 3; route++) {
+        const std::string name = "handler_route_" + std::to_string(route);
+        auto handler = reinterpret_cast<HandlerFn>(engine.lookup(name.c_str()));
+        REQUIRE(handler != nullptr);
+        TestHandlerCtxFrame frame{};
+        const auto result = invoke_jit_handler(handler,
+                                               nullptr,
+                                               frame.ctx,
+                                               reinterpret_cast<const u8*>(kGetApiRequest),
+                                               sizeof(kGetApiRequest) - 1,
+                                               nullptr);
+        CHECK_EQ(result.status_code, expected[route]);
+    }
+    engine.shutdown();
+    rir.destroy();
+}
+
 TEST(jit, nested_and_conditionally_bypassed_loop_exits_preserve_following_paths) {
     const auto src = R"rut(
 route GET "/nested-post-guard" {
@@ -1854,7 +1912,7 @@ route GET "/nested-later-iteration" {
 route GET "/continued-before-break" {
     for item in [0, 1] {
         guard item > 0 else { continue }
-        guard false else { return 202 }
+        guard req.path == "/never" else { return 202 }
         break
     }
     return 500
@@ -1890,6 +1948,88 @@ route GET "/continued-before-break" {
                                                 nullptr);
         CHECK_EQ(outcome.status_code, expected[i]);
     }
+    engine.shutdown();
+    rir.destroy();
+}
+
+TEST(jit, terminating_sibling_loop_prunes_later_parent_iterations) {
+    const auto src = R"rut(
+route GET "/x" {
+    for outer in [1, 2, 3, 4, 5, 6, 7, 8] {
+        guard req.http11 else { break }
+        for first in [1] { continue }
+        for second in [1] { return 201 }
+    }
+    return 500
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    REQUIRE(lower_to_rir(mir.value(), rir));
+    auto cg = codegen(rir.module);
+    REQUIRE(cg.ok);
+    JitEngine engine;
+    REQUIRE(engine.init());
+    REQUIRE(engine.compile(cg.mod, cg.ctx));
+    auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
+    REQUIRE(handler != nullptr);
+    TestHandlerCtxFrame frame{};
+    const auto outcome = invoke_jit_handler(handler,
+                                            nullptr,
+                                            frame.ctx,
+                                            reinterpret_cast<const u8*>(kGetApiRequest),
+                                            sizeof(kGetApiRequest) - 1,
+                                            nullptr);
+    CHECK_EQ(outcome.status_code, 201u);
+    engine.shutdown();
+    rir.destroy();
+}
+
+TEST(jit, guarded_terminating_sibling_preserves_later_parent_iterations) {
+    const auto src = R"rut(
+route GET "/x" {
+    for outer in [0, 1] {
+        for first in [1] { continue }
+        for second in [1] {
+            guard outer > 0 else { break }
+            return 201
+        }
+    }
+    return 500
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    REQUIRE(lower_to_rir(mir.value(), rir));
+    auto cg = codegen(rir.module);
+    REQUIRE(cg.ok);
+    JitEngine engine;
+    REQUIRE(engine.init());
+    REQUIRE(engine.compile(cg.mod, cg.ctx));
+    auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
+    REQUIRE(handler != nullptr);
+    TestHandlerCtxFrame frame{};
+    const auto outcome = invoke_jit_handler(handler,
+                                            nullptr,
+                                            frame.ctx,
+                                            reinterpret_cast<const u8*>(kGetApiRequest),
+                                            sizeof(kGetApiRequest) - 1,
+                                            nullptr);
+    CHECK_EQ(outcome.status_code, 201u);
     engine.shutdown();
     rir.destroy();
 }

@@ -2214,6 +2214,7 @@ FrontendResult<MirModule*> build_mir(const HirModule& module) {
                 u32 match_test_index[HirForLoopMatch::kMaxMatchArms]{};
                 u32 match_test_ordinal[HirForLoopMatch::kMaxMatchArms]{};
                 u32 match_case_index[HirForLoopMatch::kMaxMatchArms]{};
+                u32 match_source_guard_index[HirForLoopMatch::kMaxMatchArms]{};
                 u32 match_arm_guard_index[HirForLoopMatch::kMaxMatchArms]{};
                 u32 match_post_guard_index[HirForLoopMatch::kMaxMatchArms]{};
                 u32 match_prelude_guard_index[HirForLoopMatch::kMaxMatchArms]
@@ -2229,6 +2230,8 @@ FrontendResult<MirModule*> build_mir(const HirModule& module) {
                 u32 ctx_index = 0xffffffffu;
                 u32 effect_value_index = 0xffffffffu;
                 u32 effect_local_ref_index = 0xffffffffu;
+                MirValue match_subject{};
+                bool has_match_subject = false;
             };
             constexpr u32 kMaxUnrolled = HirExpr::kMaxArgs * HirForLoopBody::kMaxSteps;
             constexpr u32 kMaxForRouteSteps =
@@ -2386,27 +2389,467 @@ FrontendResult<MirModule*> build_mir(const HirModule& module) {
                     }
                 }
             }
-            auto loop_can_advance_to_later_iteration = [&](u32 loop_index) -> bool {
+            auto loop_has_local_control = [&](u32 loop_index) -> bool {
                 if (loop_index >= module.routes[i].for_loops.len) return false;
                 const auto& loop = module.routes[i].for_loops[loop_index];
-                if (loop.body.has_loop_control) return true;
-                for (u32 gi = 0; gi < loop.body.guards.len; gi++)
-                    if (loop.body.guards[gi].fail_kind == HirGuard::FailKind::LoopControl)
-                        return true;
-                for (u32 mi = 0; mi < loop.body.matches.len; mi++) {
+                const auto literal_matches = [](const HirExpr& subject, const HirExpr& pattern) {
+                    if (subject.kind != pattern.kind) return false;
+                    if (subject.kind == HirExprKind::BoolLit)
+                        return subject.bool_value == pattern.bool_value;
+                    if (subject.kind == HirExprKind::IntLit)
+                        return subject.int_value == pattern.int_value;
+                    if (subject.kind == HirExprKind::StrLit)
+                        return subject.str_value.eq(pattern.str_value);
+                    return false;
+                };
+                const auto match_has_local_control = [&](u32 mi) {
+                    if (mi >= loop.body.matches.len) return false;
                     const auto& body_match = loop.body.matches[mi];
-                    for (u32 ai = 0; ai < body_match.arms.len; ai++)
-                        for (u32 gi = 0; gi < body_match.arms[ai].guards.len; gi++)
-                            if (body_match.arms[ai].guards[gi].fail_kind ==
-                                HirGuard::FailKind::LoopControl)
+                    const bool literal_subject =
+                        body_match.match_expr.kind == HirExprKind::BoolLit ||
+                        body_match.match_expr.kind == HirExprKind::IntLit ||
+                        body_match.match_expr.kind == HirExprKind::StrLit;
+                    for (u32 ai = 0; ai < body_match.arms.len; ai++) {
+                        const auto& arm = body_match.arms[ai];
+                        if (literal_subject && !arm.is_wildcard &&
+                            !literal_matches(body_match.match_expr, arm.pattern))
+                            continue;
+                        const bool arm_guard_can_fall_through =
+                            (arm.has_source_arm_guard &&
+                             (arm.source_arm_guard.kind != HirExprKind::BoolLit ||
+                              !arm.source_arm_guard.bool_value)) ||
+                            (arm.has_arm_guard && (arm.arm_guard.kind != HirExprKind::BoolLit ||
+                                                   !arm.arm_guard.bool_value));
+                        for (u32 gi = 0; gi < arm.guards.len; gi++)
+                            if (arm.guards[gi].fail_kind == HirGuard::FailKind::LoopControl &&
+                                (arm.guards[gi].cond.kind != HirExprKind::BoolLit ||
+                                 !arm.guards[gi].cond.bool_value))
                                 return true;
+                        if (literal_subject && !arm_guard_can_fall_through) break;
+                    }
+                    return false;
+                };
+                for (u32 si = 0; si < loop.body.steps.len; si++) {
+                    const auto& step = loop.body.steps[si];
+                    if (step.kind == HirForLoopBody::Step::Kind::Guard &&
+                        step.index < loop.body.guards.len) {
+                        const auto& guard = loop.body.guards[step.index];
+                        if (guard.fail_kind == HirGuard::FailKind::LoopControl &&
+                            (guard.cond.kind != HirExprKind::BoolLit || !guard.cond.bool_value))
+                            return true;
+                        if (guard.cond.kind == HirExprKind::BoolLit && !guard.cond.bool_value &&
+                            guard.fail_kind == HirGuard::FailKind::Term)
+                            return false;
+                    }
+                    if (step.kind == HirForLoopBody::Step::Kind::Break ||
+                        step.kind == HirForLoopBody::Step::Kind::Continue)
+                        return true;
+                    if (step.kind == HirForLoopBody::Step::Kind::Match &&
+                        match_has_local_control(step.index))
+                        return true;
+                    if (step.kind != HirForLoopBody::Step::Kind::If ||
+                        step.index >= loop.body.ifs.len)
+                        continue;
+                    const auto& body_if = loop.body.ifs[step.index];
+                    const bool then_reachable =
+                        body_if.cond.kind != HirExprKind::BoolLit || body_if.cond.bool_value;
+                    const bool else_reachable =
+                        body_if.cond.kind != HirExprKind::BoolLit || !body_if.cond.bool_value;
+                    const auto is_control = [](const HirForLoopBranch& branch) {
+                        return branch.kind == HirForLoopBranch::Kind::Break ||
+                               branch.kind == HirForLoopBranch::Kind::Continue;
+                    };
+                    if ((then_reachable && is_control(body_if.then_branch)) ||
+                        (else_reachable && is_control(body_if.else_branch)))
+                        return true;
+                }
+                return false;
+            };
+            auto loop_has_reachable_terminator = [&](u32 loop_index) -> bool {
+                if (loop_index >= module.routes[i].for_loops.len) return false;
+                const auto& loop = module.routes[i].for_loops[loop_index];
+                if (loop.body.has_term) return true;
+                const auto literal_matches = [](const HirExpr& subject, const HirExpr& pattern) {
+                    if (subject.kind != pattern.kind) return false;
+                    if (subject.kind == HirExprKind::BoolLit)
+                        return subject.bool_value == pattern.bool_value;
+                    if (subject.kind == HirExprKind::IntLit)
+                        return subject.int_value == pattern.int_value;
+                    if (subject.kind == HirExprKind::StrLit)
+                        return subject.str_value.eq(pattern.str_value);
+                    return false;
+                };
+                const auto branch_terminates = [](const HirForLoopBranch& branch) {
+                    return branch.kind == HirForLoopBranch::Kind::Term;
+                };
+                for (u32 si = 0; si < loop.body.steps.len; si++) {
+                    const auto& step = loop.body.steps[si];
+                    if (step.kind == HirForLoopBody::Step::Kind::Term) return true;
+                    if (step.kind == HirForLoopBody::Step::Kind::If &&
+                        step.index < loop.body.ifs.len) {
+                        const auto& body_if = loop.body.ifs[step.index];
+                        if (body_if.cond.kind == HirExprKind::BoolLit) {
+                            if (branch_terminates(body_if.cond.bool_value ? body_if.then_branch
+                                                                          : body_if.else_branch))
+                                return true;
+                        } else if (branch_terminates(body_if.then_branch) &&
+                                   branch_terminates(body_if.else_branch)) {
+                            return true;
+                        }
+                    }
+                    if (step.kind != HirForLoopBody::Step::Kind::Match ||
+                        step.index >= loop.body.matches.len)
+                        continue;
+                    const auto& body_match = loop.body.matches[step.index];
+                    const bool literal_subject =
+                        body_match.match_expr.kind == HirExprKind::BoolLit ||
+                        body_match.match_expr.kind == HirExprKind::IntLit ||
+                        body_match.match_expr.kind == HirExprKind::StrLit;
+                    if (!literal_subject) continue;
+                    for (u32 ai = 0; ai < body_match.arms.len; ai++) {
+                        const auto& arm = body_match.arms[ai];
+                        if (!arm.is_wildcard &&
+                            !literal_matches(body_match.match_expr, arm.pattern))
+                            continue;
+                        const bool source_guard_is_false =
+                            arm.has_source_arm_guard &&
+                            arm.source_arm_guard.kind == HirExprKind::BoolLit &&
+                            !arm.source_arm_guard.bool_value;
+                        const bool arm_guard_is_false =
+                            arm.has_arm_guard && arm.arm_guard.kind == HirExprKind::BoolLit &&
+                            !arm.arm_guard.bool_value;
+                        const bool arm_guard_can_fall_through =
+                            (arm.has_source_arm_guard &&
+                             (arm.source_arm_guard.kind != HirExprKind::BoolLit ||
+                              !arm.source_arm_guard.bool_value)) ||
+                            (arm.has_arm_guard && (arm.arm_guard.kind != HirExprKind::BoolLit ||
+                                                   !arm.arm_guard.bool_value));
+                        if (source_guard_is_false || arm_guard_is_false) continue;
+                        bool reaches_body = true;
+                        for (u32 gi = 0; gi < arm.guards.len; gi++) {
+                            const auto& guard = arm.guards[gi];
+                            if (guard.cond.kind == HirExprKind::BoolLit && guard.cond.bool_value)
+                                continue;
+                            if (guard.cond.kind == HirExprKind::BoolLit &&
+                                guard.fail_kind == HirGuard::FailKind::Term)
+                                return true;
+                            reaches_body = false;
+                            break;
+                        }
+                        if (!reaches_body) return false;
+                        if (arm.body_kind == HirForLoopMatchArm::BodyKind::Direct) {
+                            if (branch_terminates(arm.direct_branch) && !arm_guard_can_fall_through)
+                                return true;
+                        } else if (arm.cond.kind == HirExprKind::BoolLit) {
+                            if (branch_terminates(arm.cond.bool_value ? arm.then_branch
+                                                                      : arm.else_branch) &&
+                                !arm_guard_can_fall_through)
+                                return true;
+                        } else if (branch_terminates(arm.then_branch) &&
+                                   branch_terminates(arm.else_branch) &&
+                                   !arm_guard_can_fall_through) {
+                            return true;
+                        }
+                        if (!arm_guard_can_fall_through) break;
+                    }
+                }
+                return false;
+            };
+            auto loop_can_advance_to_later_iteration =
+                [&](auto&& self, u32 loop_index, u32 depth) -> bool {
+                if (loop_index >= module.routes[i].for_loops.len ||
+                    depth > module.routes[i].for_loops.len)
+                    return false;
+                const auto& loop = module.routes[i].for_loops[loop_index];
+                const auto literal_pattern_matches = [](const HirExpr& subject,
+                                                        const HirExpr& pattern) {
+                    if (subject.kind != pattern.kind) return false;
+                    if (subject.kind == HirExprKind::BoolLit)
+                        return subject.bool_value == pattern.bool_value;
+                    if (subject.kind == HirExprKind::IntLit)
+                        return subject.int_value == pattern.int_value;
+                    if (subject.kind == HirExprKind::StrLit)
+                        return subject.str_value.eq(pattern.str_value);
+                    return false;
+                };
+                const auto has_literal_subject = [](const HirExpr& expr) {
+                    return expr.kind == HirExprKind::BoolLit || expr.kind == HirExprKind::IntLit ||
+                           expr.kind == HirExprKind::StrLit;
+                };
+                const auto match_can_advance = [&](u32 mi) {
+                    if (mi >= loop.body.matches.len) return false;
+                    const auto& body_match = loop.body.matches[mi];
+                    const auto capture_group_has_source_guard = [&](u32 arm_index) {
+                        const auto& selected = body_match.arms[arm_index];
+                        const auto can_fall_through = [](const HirForLoopMatchArm& candidate) {
+                            return candidate.has_source_arm_guard &&
+                                   (candidate.source_arm_guard.kind != HirExprKind::BoolLit ||
+                                    !candidate.source_arm_guard.bool_value);
+                        };
+                        if (can_fall_through(selected)) return true;
+                        if (selected.capture_group == 0) return false;
+                        for (u32 grouped = 0; grouped < body_match.arms.len; grouped++)
+                            if (body_match.arms[grouped].capture_group == selected.capture_group &&
+                                can_fall_through(body_match.arms[grouped]))
+                                return true;
+                        return false;
+                    };
+                    const auto source_guard_is_statically_false = [&](u32 arm_index) {
+                        const auto& selected = body_match.arms[arm_index];
+                        if (selected.has_source_arm_guard)
+                            return selected.source_arm_guard.kind == HirExprKind::BoolLit &&
+                                   !selected.source_arm_guard.bool_value;
+                        if (selected.capture_group == 0) return false;
+                        for (u32 grouped = 0; grouped < body_match.arms.len; grouped++) {
+                            const auto& candidate = body_match.arms[grouped];
+                            if (candidate.capture_group != selected.capture_group ||
+                                !candidate.has_source_arm_guard)
+                                continue;
+                            return candidate.source_arm_guard.kind == HirExprKind::BoolLit &&
+                                   !candidate.source_arm_guard.bool_value;
+                        }
+                        return false;
+                    };
+                    for (u32 ai = 0; ai < body_match.arms.len; ai++) {
+                        const auto& arm = body_match.arms[ai];
+                        if (has_literal_subject(body_match.match_expr) && !arm.is_wildcard &&
+                            !literal_pattern_matches(body_match.match_expr, arm.pattern))
+                            continue;
+                        if (source_guard_is_statically_false(ai) ||
+                            (arm.has_arm_guard && arm.arm_guard.kind == HirExprKind::BoolLit &&
+                             !arm.arm_guard.bool_value))
+                            continue;
+                        bool body_reachable = true;
+                        for (u32 gi = 0; gi < arm.guards.len; gi++) {
+                            const auto& guard = arm.guards[gi];
+                            if (guard.cond.kind == HirExprKind::BoolLit && guard.cond.bool_value)
+                                continue;
+                            if (guard.fail_kind == HirGuard::FailKind::LoopControl &&
+                                guard.fail_loop_control == HirLoopControl::Continue)
+                                return true;
+                            if (guard.cond.kind == HirExprKind::BoolLit) {
+                                body_reachable = false;
+                                break;
+                            }
+                        }
+                        if (body_reachable &&
+                            arm.body_kind == HirForLoopMatchArm::BodyKind::Direct) {
+                            if (arm.direct_branch.kind == HirForLoopBranch::Kind::Continue)
+                                return true;
+                        } else if (body_reachable) {
+                            const bool then_reachable =
+                                arm.cond.kind != HirExprKind::BoolLit || arm.cond.bool_value;
+                            const bool else_reachable =
+                                arm.cond.kind != HirExprKind::BoolLit || !arm.cond.bool_value;
+                            if ((then_reachable &&
+                                 arm.then_branch.kind == HirForLoopBranch::Kind::Continue) ||
+                                (else_reachable &&
+                                 arm.else_branch.kind == HirForLoopBranch::Kind::Continue))
+                                return true;
+                        }
+                        const bool arm_guard_can_fall_through =
+                            arm.has_arm_guard && (arm.arm_guard.kind != HirExprKind::BoolLit ||
+                                                  !arm.arm_guard.bool_value);
+                        if (has_literal_subject(body_match.match_expr) &&
+                            !arm_guard_can_fall_through && !capture_group_has_source_guard(ai))
+                            break;
+                    }
+                    return false;
+                };
+                for (u32 si = 0; si < loop.body.steps.len; si++) {
+                    const auto& step = loop.body.steps[si];
+                    if (step.kind == HirForLoopBody::Step::Kind::Guard &&
+                        step.index < loop.body.guards.len) {
+                        const auto& guard = loop.body.guards[step.index];
+                        if (guard.fail_kind == HirGuard::FailKind::LoopControl &&
+                            guard.fail_loop_control == HirLoopControl::Continue &&
+                            (guard.cond.kind != HirExprKind::BoolLit || !guard.cond.bool_value))
+                            return true;
+                        if (guard.cond.kind == HirExprKind::BoolLit && !guard.cond.bool_value) {
+                            if (guard.fail_kind == HirGuard::FailKind::Term ||
+                                (guard.fail_kind == HirGuard::FailKind::LoopControl &&
+                                 guard.fail_loop_control == HirLoopControl::Break))
+                                return false;
+                        }
+                    }
+                    if (step.kind == HirForLoopBody::Step::Kind::Term ||
+                        step.kind == HirForLoopBody::Step::Kind::Break)
+                        return false;
+                    if (step.kind == HirForLoopBody::Step::Kind::Continue) return true;
+                    if (step.kind == HirForLoopBody::Step::Kind::Match &&
+                        match_can_advance(step.index))
+                        return true;
+                    if (step.kind == HirForLoopBody::Step::Kind::If &&
+                        step.index < loop.body.ifs.len) {
+                        const auto& body_if = loop.body.ifs[step.index];
+                        const bool then_reachable =
+                            body_if.cond.kind != HirExprKind::BoolLit || body_if.cond.bool_value;
+                        const bool else_reachable =
+                            body_if.cond.kind != HirExprKind::BoolLit || !body_if.cond.bool_value;
+                        if ((then_reachable &&
+                             body_if.then_branch.kind == HirForLoopBranch::Kind::Continue) ||
+                            (else_reachable &&
+                             body_if.else_branch.kind == HirForLoopBranch::Kind::Continue))
+                            return true;
+                    }
+                    if (step.kind != HirForLoopBody::Step::Kind::For ||
+                        !self(self, step.index, depth + 1))
+                        continue;
+                    // Child control resumes at the next parent step. It can
+                    // expose a later parent iteration only when the remaining
+                    // suffix does not terminate every path through this trip.
+                    bool suffix_terminates_route = false;
+                    const auto ends_parent_trip = [](const HirForLoopBranch& branch) {
+                        return branch.kind == HirForLoopBranch::Kind::Term ||
+                               branch.kind == HirForLoopBranch::Kind::Break;
+                    };
+                    for (u32 next = si + 1; next < loop.body.steps.len; next++) {
+                        const auto& suffix = loop.body.steps[next];
+                        if (suffix.kind == HirForLoopBody::Step::Kind::For &&
+                            suffix.index < module.routes[i].for_loops.len) {
+                            const auto& suffix_loop = module.routes[i].for_loops[suffix.index];
+                            const HirExpr* suffix_iter = iter_array_for(suffix_loop);
+                            if (loop_has_reachable_terminator(suffix.index) &&
+                                !loop_has_local_control(suffix.index) && suffix_iter != nullptr &&
+                                suffix_iter->args.len != 0 &&
+                                !self(self, suffix.index, depth + 1)) {
+                                suffix_terminates_route = true;
+                                break;
+                            }
+                        }
+                        if (suffix.kind == HirForLoopBody::Step::Kind::Term ||
+                            suffix.kind == HirForLoopBody::Step::Kind::Break) {
+                            suffix_terminates_route = true;
+                            break;
+                        }
+                        if (suffix.kind == HirForLoopBody::Step::Kind::Guard &&
+                            suffix.index < loop.body.guards.len) {
+                            const auto& guard = loop.body.guards[suffix.index];
+                            if (guard.cond.kind == HirExprKind::BoolLit && !guard.cond.bool_value &&
+                                (guard.fail_kind == HirGuard::FailKind::Term ||
+                                 (guard.fail_kind == HirGuard::FailKind::LoopControl &&
+                                  guard.fail_loop_control == HirLoopControl::Break))) {
+                                suffix_terminates_route = true;
+                                break;
+                            }
+                        }
+                        if (suffix.kind == HirForLoopBody::Step::Kind::If &&
+                            suffix.index < loop.body.ifs.len) {
+                            const auto& body_if = loop.body.ifs[suffix.index];
+                            const bool selected_terminates =
+                                body_if.cond.kind == HirExprKind::BoolLit
+                                    ? ends_parent_trip(body_if.cond.bool_value
+                                                           ? body_if.then_branch
+                                                           : body_if.else_branch)
+                                    : ends_parent_trip(body_if.then_branch) &&
+                                          ends_parent_trip(body_if.else_branch);
+                            if (selected_terminates) {
+                                suffix_terminates_route = true;
+                                break;
+                            }
+                        }
+                        if (suffix.kind == HirForLoopBody::Step::Kind::Match &&
+                            suffix.index < loop.body.matches.len) {
+                            const auto& body_match = loop.body.matches[suffix.index];
+                            const auto capture_group_has_source_guard = [&](u32 arm_index) {
+                                const auto& selected = body_match.arms[arm_index];
+                                const auto can_fall_through =
+                                    [](const HirForLoopMatchArm& candidate) {
+                                        return candidate.has_source_arm_guard &&
+                                               (candidate.source_arm_guard.kind !=
+                                                    HirExprKind::BoolLit ||
+                                                !candidate.source_arm_guard.bool_value);
+                                    };
+                                if (can_fall_through(selected)) return true;
+                                if (selected.capture_group == 0) return false;
+                                for (u32 grouped = 0; grouped < body_match.arms.len; grouped++)
+                                    if (body_match.arms[grouped].capture_group ==
+                                            selected.capture_group &&
+                                        can_fall_through(body_match.arms[grouped]))
+                                        return true;
+                                return false;
+                            };
+                            const auto source_guard_is_statically_false = [&](u32 arm_index) {
+                                const auto& selected = body_match.arms[arm_index];
+                                if (selected.has_source_arm_guard)
+                                    return selected.source_arm_guard.kind == HirExprKind::BoolLit &&
+                                           !selected.source_arm_guard.bool_value;
+                                if (selected.capture_group == 0) return false;
+                                for (u32 grouped = 0; grouped < body_match.arms.len; grouped++) {
+                                    const auto& candidate = body_match.arms[grouped];
+                                    if (candidate.capture_group != selected.capture_group ||
+                                        !candidate.has_source_arm_guard)
+                                        continue;
+                                    return candidate.source_arm_guard.kind ==
+                                               HirExprKind::BoolLit &&
+                                           !candidate.source_arm_guard.bool_value;
+                                }
+                                return false;
+                            };
+                            bool any_reachable = false;
+                            bool all_terminate = true;
+                            for (u32 ai = 0; ai < body_match.arms.len; ai++) {
+                                const auto& arm = body_match.arms[ai];
+                                if (has_literal_subject(body_match.match_expr) &&
+                                    !arm.is_wildcard &&
+                                    !literal_pattern_matches(body_match.match_expr, arm.pattern))
+                                    continue;
+                                if (source_guard_is_statically_false(ai) ||
+                                    (arm.has_arm_guard &&
+                                     arm.arm_guard.kind == HirExprKind::BoolLit &&
+                                     !arm.arm_guard.bool_value))
+                                    continue;
+                                any_reachable = true;
+                                bool arm_terminates = true;
+                                bool body_reachable = true;
+                                for (u32 gi = 0; gi < arm.guards.len && body_reachable; gi++) {
+                                    const auto& guard = arm.guards[gi];
+                                    if (guard.cond.kind == HirExprKind::BoolLit &&
+                                        guard.cond.bool_value)
+                                        continue;
+                                    const bool failure_terminates =
+                                        guard.fail_kind != HirGuard::FailKind::LoopControl ||
+                                        guard.fail_loop_control == HirLoopControl::Break;
+                                    arm_terminates = arm_terminates && failure_terminates;
+                                    if (guard.cond.kind == HirExprKind::BoolLit)
+                                        body_reachable = false;
+                                }
+                                if (body_reachable)
+                                    arm_terminates =
+                                        arm_terminates &&
+                                        (arm.body_kind == HirForLoopMatchArm::BodyKind::Direct
+                                             ? ends_parent_trip(arm.direct_branch)
+                                         : arm.cond.kind == HirExprKind::BoolLit
+                                             ? ends_parent_trip(arm.cond.bool_value
+                                                                    ? arm.then_branch
+                                                                    : arm.else_branch)
+                                             : ends_parent_trip(arm.then_branch) &&
+                                                   ends_parent_trip(arm.else_branch));
+                                all_terminate &= arm_terminates;
+                                const bool arm_guard_can_fall_through =
+                                    arm.has_arm_guard &&
+                                    (arm.arm_guard.kind != HirExprKind::BoolLit ||
+                                     !arm.arm_guard.bool_value);
+                                if (has_literal_subject(body_match.match_expr) &&
+                                    !arm_guard_can_fall_through &&
+                                    !capture_group_has_source_guard(ai))
+                                    break;
+                            }
+                            if (any_reachable && all_terminate) {
+                                suffix_terminates_route = true;
+                                break;
+                            }
+                        }
+                    }
+                    if (!suffix_terminates_route) return true;
                 }
                 return false;
             };
             auto emit_for_loop = [&](auto&& self,
                                      u32 fi,
                                      const ForLoopCtx* parent_ctx,
-                                     u32 order_start) -> FrontendResult<void> {
+                                     u32 order_start,
+                                     bool enclosing_can_advance) -> FrontendResult<void> {
                 const auto& fl = module.routes[i].for_loops[fi];
                 const HirExpr* iter_array = iter_array_for(fl);
                 const HirExpr* materialized_iter = materialized_iter_ref_for(fl);
@@ -2421,7 +2864,30 @@ FrontendResult<MirModule*> build_mir(const HirModule& module) {
                         fl.span,
                         lit_str("static for-loop body must contain at least one supported step"));
                 }
-                const bool can_advance_to_later_iteration = loop_can_advance_to_later_iteration(fi);
+                const bool can_advance_to_later_iteration =
+                    loop_can_advance_to_later_iteration(loop_can_advance_to_later_iteration, fi, 0);
+                const auto nested_loop_guarantees_route_termination = [&](u32 loop_index) {
+                    if (loop_index >= module.routes[i].for_loops.len) return false;
+                    const auto& candidate = module.routes[i].for_loops[loop_index];
+                    for (u32 step_index = 0; step_index < candidate.body.steps.len; step_index++) {
+                        const auto& candidate_step = candidate.body.steps[step_index];
+                        if (candidate_step.kind != HirForLoopBody::Step::Kind::For ||
+                            candidate_step.index >= module.routes[i].for_loops.len)
+                            continue;
+                        const auto& child = module.routes[i].for_loops[candidate_step.index];
+                        const HirExpr* child_iter = iter_array_for(child);
+                        if (loop_has_reachable_terminator(candidate_step.index) &&
+                            !loop_has_local_control(candidate_step.index) &&
+                            child_iter != nullptr && child_iter->args.len != 0 &&
+                            !loop_can_advance_to_later_iteration(
+                                loop_can_advance_to_later_iteration, candidate_step.index, 0))
+                            return true;
+                    }
+                    return false;
+                };
+                const bool has_control_or_terminator = fl.body.has_term ||
+                                                       fl.body.has_loop_control ||
+                                                       nested_loop_guarantees_route_termination(fi);
                 FixedVec<MirValue, HirExpr::kMaxArgs> eager_inline_elements;
                 if (materialized_iter == nullptr) {
                     for (u32 ai = 0; ai < iter_array->args.len; ai++) {
@@ -2443,10 +2909,11 @@ FrontendResult<MirModule*> build_mir(const HirModule& module) {
                             return frontend_error(FrontendError::TooManyItems, fl.span);
                     }
                 }
-                const u32 iter_count =
-                    fl.body.has_term && !can_advance_to_later_iteration && iter_array->args.len != 0
-                        ? 1u
-                        : iter_array->args.len;
+                const u32 iter_count = has_control_or_terminator &&
+                                               !can_advance_to_later_iteration &&
+                                               iter_array->args.len != 0
+                                           ? 1u
+                                           : iter_array->args.len;
                 struct PendingTarget {
                     enum class Slot : u8 {
                         Jump,
@@ -2602,15 +3069,21 @@ FrontendResult<MirModule*> build_mir(const HirModule& module) {
                             if (body_step.index >= fl.body.guards.len)
                                 return frontend_error(FrontendError::UnsupportedSyntax,
                                                       body_step.span);
+                            const auto& body_guard = fl.body.guards[body_step.index];
+                            if (body_guard.fail_kind == HirGuard::FailKind::LoopControl &&
+                                body_guard.cond.kind == HirExprKind::BoolLit &&
+                                body_guard.cond.bool_value)
+                                continue;
                             RouteStep step{};
                             step.kind = RouteStep::Kind::Guard;
-                            step.guard = &fl.body.guards[body_step.index];
-                            step.span = fl.body.guards[body_step.index].span;
+                            step.guard = &body_guard;
+                            step.span = body_guard.span;
                             step.order_start = order_start;
                             step.order_seq = route_step_seq++;
                             if (step.guard->fail_kind == HirGuard::FailKind::LoopControl) {
-                                can_continue_before_direct_break |=
-                                    step.guard->fail_loop_control == HirLoopControl::Continue;
+                                // Either break or continue can bypass a later
+                                // terminating child loop in the parent body.
+                                can_continue_before_direct_break = true;
                                 const PendingTarget target{steps.len, PendingTarget::Slot::Jump, 0};
                                 const bool exits_loop =
                                     step.guard->fail_loop_control == HirLoopControl::Break ||
@@ -2634,7 +3107,8 @@ FrontendResult<MirModule*> build_mir(const HirModule& module) {
                             step.kind =
                                 body_if.then_branch.kind == HirForLoopBranch::Kind::Term &&
                                         body_if.else_branch.kind == HirForLoopBranch::Kind::Term &&
-                                        !can_advance_to_later_iteration
+                                        !can_advance_to_later_iteration &&
+                                        !can_continue_before_direct_break && !enclosing_can_advance
                                     ? RouteStep::Kind::If
                                     : RouteStep::Kind::IfControl;
                             step.body_if = &body_if;
@@ -2644,8 +3118,7 @@ FrontendResult<MirModule*> build_mir(const HirModule& module) {
                             const auto set_branch_target = [&](const HirForLoopBranch& branch,
                                                                bool then_branch) -> bool {
                                 if (branch.kind == HirForLoopBranch::Kind::Term) return true;
-                                can_continue_before_direct_break |=
-                                    branch.kind == HirForLoopBranch::Kind::Continue;
+                                can_continue_before_direct_break = true;
                                 if (branch.kind == HirForLoopBranch::Kind::Break ||
                                     ai + 1 == iter_count) {
                                     return after_loop_targets.push(
@@ -2701,7 +3174,9 @@ FrontendResult<MirModule*> build_mir(const HirModule& module) {
                                         arm.then_branch.kind == HirForLoopBranch::Kind::Term &&
                                         arm.else_branch.kind == HirForLoopBranch::Kind::Term;
                             }
-                            step.kind = all_terms && !can_advance_to_later_iteration
+                            step.kind = all_terms && !can_advance_to_later_iteration &&
+                                                !can_continue_before_direct_break &&
+                                                !enclosing_can_advance
                                             ? RouteStep::Kind::Match
                                             : RouteStep::Kind::MatchControl;
                             step.span = fl.body.matches[body_step.index].span;
@@ -2711,8 +3186,7 @@ FrontendResult<MirModule*> build_mir(const HirModule& module) {
                                                               PendingTarget::Slot slot,
                                                               u32 arm_index) -> bool {
                                 if (branch.kind == HirForLoopBranch::Kind::Term) return true;
-                                can_continue_before_direct_break |=
-                                    branch.kind == HirForLoopBranch::Kind::Continue;
+                                can_continue_before_direct_break = true;
                                 const PendingTarget target{steps.len, slot, arm_index};
                                 if (branch.kind == HirForLoopBranch::Kind::Break ||
                                     ai + 1 == iter_count)
@@ -2740,8 +3214,7 @@ FrontendResult<MirModule*> build_mir(const HirModule& module) {
                                         const auto& guard = arm.guards[gi];
                                         if (guard.fail_kind != HirGuard::FailKind::LoopControl)
                                             continue;
-                                        can_continue_before_direct_break |=
-                                            guard.fail_loop_control == HirLoopControl::Continue;
+                                        can_continue_before_direct_break = true;
                                         const PendingTarget target{
                                             steps.len, PendingTarget::Slot::MatchGuard, mi, gi};
                                         const bool exits_loop =
@@ -2764,7 +3237,12 @@ FrontendResult<MirModule*> build_mir(const HirModule& module) {
                             if (body_step.index >= module.routes[i].for_loops.len)
                                 return frontend_error(FrontendError::UnsupportedSyntax,
                                                       body_step.span);
-                            auto child = self(self, body_step.index, &ctx, order_start);
+                            auto child =
+                                self(self,
+                                     body_step.index,
+                                     &ctx,
+                                     order_start,
+                                     enclosing_can_advance || can_continue_before_direct_break);
                             if (!child) return core::make_unexpected(child.error());
                             continue;
                         }
@@ -2800,7 +3278,7 @@ FrontendResult<MirModule*> build_mir(const HirModule& module) {
                         step.span = fl.body.term.span;
                         step.order_start = order_start;
                         step.order_seq = route_step_seq++;
-                        step.ends_all_paths = !can_advance_to_later_iteration;
+                        step.ends_all_paths = !loop_has_local_control(fi) && !enclosing_can_advance;
                         auto ctx_set = set_step_ctx(&step, ctx);
                         if (!ctx_set) return core::make_unexpected(ctx_set.error());
                         if (!steps.push(step))
@@ -2838,7 +3316,7 @@ FrontendResult<MirModule*> build_mir(const HirModule& module) {
             for (u32 fi = 0; fi < module.routes[i].for_loops.len; fi++) {
                 if (for_loop_is_child[fi]) continue;
                 auto emitted = emit_for_loop(
-                    emit_for_loop, fi, nullptr, module.routes[i].for_loops[fi].span.start);
+                    emit_for_loop, fi, nullptr, module.routes[i].for_loops[fi].span.start, false);
                 if (!emitted) return core::make_unexpected(emitted.error());
             }
             for (u32 si = 1; si < steps.len; si++) {
@@ -2944,6 +3422,7 @@ FrontendResult<MirModule*> build_mir(const HirModule& module) {
             u32 body_match_extra_test_index[HirForLoopMatch::kMaxMatchArms]{};
             u32 body_match_test_ordinal[HirForLoopMatch::kMaxMatchArms]{};
             u32 body_match_guard_index[HirForLoopMatch::kMaxMatchArms]{};
+            u32 body_match_source_guard_index[HirForLoopMatch::kMaxMatchArms]{};
             u32 body_match_post_guard_index[HirForLoopMatch::kMaxMatchArms]{};
             u32 body_match_prelude_guard_index[HirForLoopMatch::kMaxMatchArms]
                                               [HirForLoopMatchArm::kMaxPreludeGuards]{};
@@ -2967,6 +3446,13 @@ FrontendResult<MirModule*> build_mir(const HirModule& module) {
                 *cursor += count;
                 note_block_budget(*cursor, span);
                 return first;
+            };
+            auto is_capture_group_owner = [](const HirForLoopMatch& match, u32 arm_index) {
+                const u8 group = match.arms[arm_index].capture_group;
+                if (group == 0) return true;
+                for (u32 prior = 0; prior < arm_index; prior++)
+                    if (match.arms[prior].capture_group == group) return false;
+                return true;
             };
             if (module.routes[i].control.kind == HirControlKind::Match && !has_terminating_step) {
                 match_arm_count = module.routes[i].control.match_arms.len;
@@ -3020,12 +3506,16 @@ FrontendResult<MirModule*> build_mir(const HirModule& module) {
                         reserve_blocks(&cursor, 1, steps[terminating_step_index].span);
                 }
                 for (u32 ai = 0; ai < body_match.arms.len; ai++) {
+                    if (!is_capture_group_owner(body_match, ai)) continue;
                     for (u32 gi = 0; gi < body_match.arms[ai].guards.len; gi++) {
                         body_match_prelude_guard_index[ai][gi] =
                             reserve_blocks(&cursor, 1, body_match.arms[ai].guards[gi].span);
                     }
                 }
                 for (u32 ai = 0; ai < body_match.arms.len; ai++) {
+                    if (body_match.arms[ai].has_source_arm_guard)
+                        body_match_source_guard_index[ai] =
+                            reserve_blocks(&cursor, 1, body_match.arms[ai].span);
                     if (body_match.arms[ai].has_arm_guard)
                         body_match_guard_index[ai] =
                             reserve_blocks(&cursor, 1, body_match.arms[ai].span);
@@ -3046,6 +3536,7 @@ FrontendResult<MirModule*> build_mir(const HirModule& module) {
                     }
                 }
                 for (u32 ai = 0; ai < body_match.arms.len; ai++) {
+                    if (!is_capture_group_owner(body_match, ai)) continue;
                     for (u32 gi = 0; gi < body_match.arms[ai].guards.len; gi++) {
                         body_match_prelude_guard_fail_index[ai][gi] = cursor;
                         reserve_blocks(&cursor,
@@ -3086,11 +3577,16 @@ FrontendResult<MirModule*> build_mir(const HirModule& module) {
                     step.match_test_index[ordinal] = reserve_blocks(&fail_cursor, 1, step.span);
                 for (u32 ai = 0; ai < body_match.arms.len; ai++) {
                     const auto& arm = body_match.arms[ai];
+                    if (arm.has_source_arm_guard)
+                        step.match_source_guard_index[ai] =
+                            reserve_blocks(&fail_cursor, 1, arm.span);
                     if (arm.has_arm_guard)
                         step.match_arm_guard_index[ai] = reserve_blocks(&fail_cursor, 1, arm.span);
-                    for (u32 gi = 0; gi < arm.guards.len; gi++)
-                        step.match_prelude_guard_index[ai][gi] =
-                            reserve_blocks(&fail_cursor, 1, arm.guards[gi].span);
+                    if (is_capture_group_owner(body_match, ai)) {
+                        for (u32 gi = 0; gi < arm.guards.len; gi++)
+                            step.match_prelude_guard_index[ai][gi] =
+                                reserve_blocks(&fail_cursor, 1, arm.guards[gi].span);
+                    }
                     if (arm.post_arm_guard_expr_index != 0xffffffffu)
                         step.match_post_guard_index[ai] = reserve_blocks(&fail_cursor, 1, arm.span);
                     step.match_case_index[ai] = reserve_blocks(&fail_cursor, 1, arm.span);
@@ -3106,11 +3602,13 @@ FrontendResult<MirModule*> build_mir(const HirModule& module) {
                             step.match_else_term_index[ai] =
                                 reserve_blocks(&fail_cursor, 1, arm.span);
                     }
-                    for (u32 gi = 0; gi < arm.guards.len; gi++) {
-                        step.match_prelude_fail_index[ai][gi] = fail_cursor;
-                        reserve_blocks(&fail_cursor,
-                                       guard_fail_block_count(arm.guards[gi]),
-                                       arm.guards[gi].span);
+                    if (is_capture_group_owner(body_match, ai)) {
+                        for (u32 gi = 0; gi < arm.guards.len; gi++) {
+                            step.match_prelude_fail_index[ai][gi] = fail_cursor;
+                            reserve_blocks(&fail_cursor,
+                                           guard_fail_block_count(arm.guards[gi]),
+                                           arm.guards[gi].span);
+                        }
                     }
                 }
             }
@@ -3129,8 +3627,6 @@ FrontendResult<MirModule*> build_mir(const HirModule& module) {
             ForLoopCtx body_match_shared_contexts[HirForLoopMatch::kMaxMatchArms]{};
             FixedVec<MirBlock::Effect, HirForLoopMatchArm::kMaxLocals>
                 body_match_arm_effects[HirForLoopMatch::kMaxMatchArms]{};
-            FixedVec<MirBlock::Effect, HirForLoopMatchArm::kMaxLocals>
-                body_match_arm_guard_effects[HirForLoopMatch::kMaxMatchArms]{};
             FixedVec<u8, HirForLoopMatchArm::kMaxLocals>
                 body_match_arm_effect_depths[HirForLoopMatch::kMaxMatchArms]{};
             u8 body_match_capture_owner[HirForLoopMatch::kMaxMatchArms]{};
@@ -3209,15 +3705,10 @@ FrontendResult<MirModule*> build_mir(const HirModule& module) {
                         ForLoopCtx::LocalBinding binding{};
                         binding.ref_index = local.ref_index;
                         binding.value = &fn.values[fn.values.len - 1];
-                        if (!body_ctx->locals.push(binding))
-                            return frontend_error(FrontendError::TooManyItems, local.span);
-                        const MirBlock::Effect effect{value_index, local.span, materialized_ref};
-                        if (arm.local_precedes_arm_guard[li]) {
-                            if (!body_match_arm_guard_effects[ai].push(effect))
-                                return frontend_error(FrontendError::TooManyItems, local.span);
-                        } else if (!body_match_arm_effects[ai].push(effect) ||
-                                   !body_match_arm_effect_depths[ai].push(
-                                       arm.local_guard_depth[li])) {
+                        if (!body_ctx->locals.push(binding) ||
+                            !body_match_arm_effects[ai].push(
+                                {value_index, local.span, materialized_ref}) ||
+                            !body_match_arm_effect_depths[ai].push(arm.local_guard_depth[li])) {
                             return frontend_error(FrontendError::TooManyItems, local.span);
                         }
                         if (body_match_capture_owner[ai] == ai && li + 1 == arm.capture_local_count)
@@ -3225,23 +3716,6 @@ FrontendResult<MirModule*> build_mir(const HirModule& module) {
                     }
                 }
             }
-            auto extend_for_loop_match_arm_ctx =
-                [&](const HirForLoopMatchArm& arm,
-                    const ForLoopCtx* base_ctx,
-                    ForLoopCtx* scoped_ctx) -> FrontendResult<const ForLoopCtx*> {
-                if (arm.locals.len == 0) return base_ctx;
-                if (base_ctx != nullptr) *scoped_ctx = *base_ctx;
-                const ForLoopCtx* body_ctx = scoped_ctx;
-                for (u32 li = 0; li < arm.locals.len; li++) {
-                    const auto& local = arm.locals[li];
-                    auto local_value = mir_value(local.init, module, &fn, body_ctx);
-                    if (!local_value) return core::make_unexpected(local_value.error());
-                    auto local_binding = push_ctx_binding(
-                        scoped_ctx, local.ref_index, local_value.value(), local.span);
-                    if (!local_binding) return core::make_unexpected(local_binding.error());
-                }
-                return body_ctx;
-            };
             auto for_loop_match_arm_ctx = [&](const HirForLoopMatchArm& arm,
                                               u32 arm_index,
                                               const ForLoopCtx* base_ctx) -> const ForLoopCtx* {
@@ -3259,22 +3733,69 @@ FrontendResult<MirModule*> build_mir(const HirModule& module) {
                 }
                 return {};
             };
-            auto append_body_match_arm_guard_effects =
-                [&](MirBlock* block, u32 arm_index, Span span) -> FrontendResult<void> {
-                for (u32 ei = 0; ei < body_match_arm_guard_effects[arm_index].len; ei++) {
-                    if (!block->effects.push(body_match_arm_guard_effects[arm_index][ei]))
-                        return frontend_error(FrontendError::TooManyItems, span);
+            auto extend_for_loop_match_arm_ctx =
+                [&](const HirForLoopMatchArm& arm,
+                    const ForLoopCtx* base_ctx,
+                    ForLoopCtx* scoped_ctx,
+                    u32 local_start,
+                    u32 local_end,
+                    FixedVec<MirBlock::Effect, HirForLoopMatchArm::kMaxLocals>* effects,
+                    FixedVec<u32, HirForLoopMatchArm::kMaxLocals>* effect_depths)
+                -> FrontendResult<const ForLoopCtx*> {
+                if (local_start >= local_end) return base_ctx;
+                if (base_ctx != nullptr) *scoped_ctx = *base_ctx;
+                const ForLoopCtx* body_ctx = scoped_ctx;
+                for (u32 li = local_start; li < local_end; li++) {
+                    const auto& local = arm.locals[li];
+                    auto local_value = mir_value(local.init, module, &fn, body_ctx);
+                    if (!local_value) return core::make_unexpected(local_value.error());
+                    const bool capture_local = local_value->kind != MirValueKind::BoolConst &&
+                                               local_value->kind != MirValueKind::IntConst &&
+                                               local_value->kind != MirValueKind::StrConst &&
+                                               local_value->kind != MirValueKind::LocalRef;
+                    if (capture_local) {
+                        if (next_unrolled_local_ref >= MirFunction::kMaxLocals)
+                            return frontend_error(FrontendError::TooManyItems, local.span);
+                        const u32 materialized_ref = next_unrolled_local_ref++;
+                        if (!fn.values.push(local_value.value()))
+                            return frontend_error(FrontendError::TooManyItems, local.span);
+                        const u32 value_index = fn.values.len - 1;
+                        MirValue local_ref = local_value.value();
+                        local_ref.kind = MirValueKind::LocalRef;
+                        local_ref.local_index = materialized_ref;
+                        local_ref.args.len = 0;
+                        local_ref.lhs = nullptr;
+                        local_ref.rhs = nullptr;
+                        auto local_binding =
+                            push_ctx_binding(scoped_ctx, local.ref_index, local_ref, local.span);
+                        if (!local_binding) return core::make_unexpected(local_binding.error());
+                        if (effects == nullptr || effect_depths == nullptr ||
+                            !effects->push({value_index, local.span, materialized_ref}) ||
+                            !effect_depths->push(arm.local_guard_depth[li]))
+                            return frontend_error(FrontendError::TooManyItems, local.span);
+                        continue;
+                    }
+                    auto local_binding = push_ctx_binding(
+                        scoped_ctx, local.ref_index, local_value.value(), local.span);
+                    if (!local_binding) return core::make_unexpected(local_binding.error());
                 }
-                return {};
+                return body_ctx;
             };
             auto body_match_arm_entry_index = [&](const HirForLoopMatchArm& arm,
                                                   u32 arm_index) -> u32 {
+                if (arm.has_source_arm_guard) return body_match_source_guard_index[arm_index];
                 if (arm.has_arm_guard && arm.arm_guard_precedes_prelude)
                     return body_match_guard_index[arm_index];
-                if (arm.guards.len != 0) return body_match_prelude_guard_index[arm_index][0];
+                if (is_capture_group_owner(*terminating_body_match, arm_index) &&
+                    arm.capture_group != 0 && arm.guards.len != 0)
+                    return body_match_prelude_guard_index[arm_index][0];
                 if (arm.has_arm_guard) return body_match_guard_index[arm_index];
                 if (arm.post_arm_guard_expr_index != 0xffffffffu)
                     return body_match_post_guard_index[arm_index];
+                if (arm.guards.len != 0 &&
+                    (arm.capture_group == 0 ||
+                     is_capture_group_owner(*terminating_body_match, arm_index)))
+                    return body_match_prelude_guard_index[arm_index][0];
                 return body_match_case_index[arm_index];
             };
             auto body_match_arm_post_prelude_index = [&](const HirForLoopMatchArm& arm,
@@ -3291,6 +3812,7 @@ FrontendResult<MirModule*> build_mir(const HirModule& module) {
                 [&](const HirForLoopMatch& body_match,
                     const ForLoopCtx* ctx) -> FrontendResult<void> {
                 for (u32 ai = 0; ai < body_match.arms.len; ai++) {
+                    if (!is_capture_group_owner(body_match, ai)) continue;
                     const auto& arm = body_match.arms[ai];
                     const ForLoopCtx* body_ctx = for_loop_match_arm_ctx(arm, ai, ctx);
                     for (u32 gi = 0; gi < arm.guards.len; gi++) {
@@ -3306,7 +3828,7 @@ FrontendResult<MirModule*> build_mir(const HirModule& module) {
                         guard_block.term.cond = cond.value();
                         guard_block.term.then_block =
                             gi + 1 < arm.guards.len ? body_match_prelude_guard_index[ai][gi + 1]
-                            : arm.has_arm_guard && !arm.arm_guard_precedes_prelude
+                            : arm.capture_group != 0 && arm.has_arm_guard
                                 ? body_match_guard_index[ai]
                             : arm.post_arm_guard_expr_index != 0xffffffffu
                                 ? body_match_post_guard_index[ai]
@@ -3322,6 +3844,7 @@ FrontendResult<MirModule*> build_mir(const HirModule& module) {
                 [&](const HirForLoopMatch& body_match,
                     const ForLoopCtx* ctx) -> FrontendResult<void> {
                 for (u32 ai = 0; ai < body_match.arms.len; ai++) {
+                    if (!is_capture_group_owner(body_match, ai)) continue;
                     const auto& arm = body_match.arms[ai];
                     const ForLoopCtx* body_ctx = for_loop_match_arm_ctx(arm, ai, ctx);
                     for (u32 gi = 0; gi < arm.guards.len; gi++) {
@@ -3404,19 +3927,51 @@ FrontendResult<MirModule*> build_mir(const HirModule& module) {
                         return frontend_error(FrontendError::UnsupportedSyntax, body_match.span);
                     auto subject = mir_value(body_match.match_expr, module, &fn, step_ctx);
                     if (!subject) return core::make_unexpected(subject.error());
+                    const bool capture_subject = subject->kind != MirValueKind::BoolConst &&
+                                                 subject->kind != MirValueKind::IntConst &&
+                                                 subject->kind != MirValueKind::StrConst &&
+                                                 subject->kind != MirValueKind::LocalRef;
+                    if (capture_subject) {
+                        if (next_unrolled_local_ref >= MirFunction::kMaxLocals)
+                            return frontend_error(FrontendError::TooManyItems, body_match.span);
+                        const u32 materialized_ref = next_unrolled_local_ref++;
+                        if (!fn.values.push(subject.value()))
+                            return frontend_error(FrontendError::TooManyItems, body_match.span);
+                        if (!block.effects.push(
+                                {fn.values.len - 1, body_match.span, materialized_ref}))
+                            return frontend_error(FrontendError::TooManyItems, body_match.span);
+                        MirValue local_ref = subject.value();
+                        local_ref.kind = MirValueKind::LocalRef;
+                        local_ref.local_index = materialized_ref;
+                        local_ref.args.len = 0;
+                        local_ref.lhs = nullptr;
+                        local_ref.rhs = nullptr;
+                        steps[si].match_subject = local_ref;
+                    } else {
+                        steps[si].match_subject = subject.value();
+                    }
+                    steps[si].has_match_subject = true;
                     auto arm_entry = [&](u32 arm_index) -> u32 {
                         const auto& arm = body_match.arms[arm_index];
-                        if (arm.has_arm_guard && arm.arm_guard_precedes_prelude)
-                            return steps[si].match_arm_guard_index[arm_index];
-                        if (arm.guards.len != 0)
+                        if (arm.has_source_arm_guard)
+                            return steps[si].match_source_guard_index[arm_index];
+                        if (is_capture_group_owner(body_match, arm_index) &&
+                            arm.capture_group != 0 && arm.guards.len != 0)
                             return steps[si].match_prelude_guard_index[arm_index][0];
                         if (arm.has_arm_guard) return steps[si].match_arm_guard_index[arm_index];
                         if (arm.post_arm_guard_expr_index != 0xffffffffu)
                             return steps[si].match_post_guard_index[arm_index];
+                        if (arm.guards.len != 0 && (arm.capture_group == 0 ||
+                                                    is_capture_group_owner(body_match, arm_index)))
+                            return steps[si].match_prelude_guard_index[arm_index][0];
                         return steps[si].match_case_index[arm_index];
                     };
                     auto fallthrough_target = [&](u32 arm_index) -> u32 {
                         for (u32 next = arm_index + 1; next < body_match.arms.len; next++) {
+                            if (body_match.arms[arm_index].capture_group != 0 &&
+                                body_match.arms[next].capture_group ==
+                                    body_match.arms[arm_index].capture_group)
+                                continue;
                             if (body_match.arms[next].is_wildcard) return arm_entry(next);
                             return steps[si].match_test_index[steps[si].match_test_ordinal[next]];
                         }
@@ -3435,7 +3990,7 @@ FrontendResult<MirModule*> build_mir(const HirModule& module) {
                         block.term.kind = MirTerminatorKind::Branch;
                         block.term.use_cmp = true;
                         block.term.span = body_match.arms[0].span;
-                        block.term.lhs = subject.value();
+                        block.term.lhs = steps[si].match_subject;
                         block.term.rhs = pattern.value();
                         block.term.then_block = arm_entry(0);
                         block.term.else_block = fallthrough_target(0);
@@ -3452,6 +4007,10 @@ FrontendResult<MirModule*> build_mir(const HirModule& module) {
                     if (!subject) return core::make_unexpected(subject.error());
                     auto body_match_fallthrough_target = [&](u32 arm_index) -> u32 {
                         for (u32 next = arm_index + 1; next < body_match.arms.len; next++) {
+                            if (body_match.arms[arm_index].capture_group != 0 &&
+                                body_match.arms[next].capture_group ==
+                                    body_match.arms[arm_index].capture_group)
+                                continue;
                             if (body_match.arms[next].is_wildcard)
                                 return body_match_arm_entry_index(body_match.arms[next], next);
                             const u32 ordinal = body_match_test_ordinal[next];
@@ -3535,12 +4094,12 @@ FrontendResult<MirModule*> build_mir(const HirModule& module) {
                 const ForLoopCtx* terminating_ctx = route_step_ctx(steps[terminating_step_index]);
                 auto subject = mir_value(body_match.match_expr, module, &fn, terminating_ctx);
                 if (!subject) return core::make_unexpected(subject.error());
-                auto body_match_fallthrough_target = [&](u32 arm_index) -> u32 {
+                auto body_match_pattern_fallthrough_target = [&](u32 arm_index) -> u32 {
                     for (u32 next = arm_index + 1; next < body_match.arms.len; next++) {
                         if (body_match.arms[arm_index].capture_group != 0 &&
                             body_match.arms[next].capture_group ==
                                 body_match.arms[arm_index].capture_group)
-                            return body_match_arm_post_prelude_index(body_match.arms[next], next);
+                            continue;
                         if (body_match.arms[next].is_wildcard)
                             return body_match_arm_entry_index(body_match.arms[next], next);
                         return body_match_extra_test_index[body_match_test_ordinal[next]];
@@ -3548,18 +4107,35 @@ FrontendResult<MirModule*> build_mir(const HirModule& module) {
                     return body_match_arm_entry_index(body_match.arms[body_match.arms.len - 1],
                                                       body_match.arms.len - 1);
                 };
-                auto body_match_pattern_fallthrough_target = [&](u32 arm_index) -> u32 {
-                    const u8 capture_group = body_match.arms[arm_index].capture_group;
-                    u32 next = arm_index + 1;
-                    while (capture_group != 0 && next < body_match.arms.len &&
-                           body_match.arms[next].capture_group == capture_group)
-                        next++;
-                    if (next >= body_match.arms.len)
-                        return body_match_arm_entry_index(body_match.arms[body_match.arms.len - 1],
-                                                          body_match.arms.len - 1);
-                    if (body_match.arms[next].is_wildcard)
-                        return body_match_arm_entry_index(body_match.arms[next], next);
-                    return body_match_extra_test_index[body_match_test_ordinal[next]];
+                auto body_match_guard_fallthrough_target = [&](u32 arm_index) -> u32 {
+                    for (u32 next = arm_index + 1; next < body_match.arms.len; next++) {
+                        if (body_match.arms[arm_index].capture_group != 0 &&
+                            body_match.arms[next].capture_group ==
+                                body_match.arms[arm_index].capture_group) {
+                            if (body_match.arms[next].is_wildcard)
+                                return body_match_arm_post_prelude_index(body_match.arms[next],
+                                                                         next);
+                            return body_match_extra_test_index[body_match_test_ordinal[next]];
+                        }
+                        if (body_match.arms[next].is_wildcard)
+                            return body_match_arm_entry_index(body_match.arms[next], next);
+                        return body_match_extra_test_index[body_match_test_ordinal[next]];
+                    }
+                    return body_match_arm_entry_index(body_match.arms[body_match.arms.len - 1],
+                                                      body_match.arms.len - 1);
+                };
+                auto body_match_source_fallthrough_target = [&](u32 arm_index) -> u32 {
+                    for (u32 next = arm_index + 1; next < body_match.arms.len; next++) {
+                        if (body_match.arms[arm_index].capture_group != 0 &&
+                            body_match.arms[next].capture_group ==
+                                body_match.arms[arm_index].capture_group)
+                            continue;
+                        if (body_match.arms[next].is_wildcard)
+                            return body_match_arm_entry_index(body_match.arms[next], next);
+                        return body_match_extra_test_index[body_match_test_ordinal[next]];
+                    }
+                    return body_match_arm_entry_index(body_match.arms[body_match.arms.len - 1],
+                                                      body_match.arms.len - 1);
                 };
                 auto set_body_match_arm_term = [&](MirBlock* out,
                                                    const HirForLoopMatchArm& arm,
@@ -3592,10 +4168,14 @@ FrontendResult<MirModule*> build_mir(const HirModule& module) {
                     test_block.term.lhs = subject.value();
                     test_block.term.rhs = arm_pattern.value();
                     test_block.term.then_block =
-                        body_match_arm_entry_index(body_match.arms[ai], ai);
+                        body_match.arms[ai].capture_group != 0 &&
+                                body_match.arms[ai - 1].capture_group ==
+                                    body_match.arms[ai].capture_group
+                            ? body_match_arm_post_prelude_index(body_match.arms[ai], ai)
+                            : body_match_arm_entry_index(body_match.arms[ai], ai);
                     test_block.term.else_block = ai + 1 < body_match_non_wildcard_count
                                                      ? body_match_extra_test_index[ai + 1]
-                                                     : body_match_fallthrough_target(ai);
+                                                     : body_match_pattern_fallthrough_target(ai);
                     if (!fn.blocks.push(test_block))
                         return frontend_error(FrontendError::TooManyItems, fn.span);
                 }
@@ -3603,17 +4183,44 @@ FrontendResult<MirModule*> build_mir(const HirModule& module) {
                 if (!prelude_guards) return core::make_unexpected(prelude_guards.error());
                 for (u32 ai = 0; ai < body_match.arms.len; ai++) {
                     const auto& arm = body_match.arms[ai];
+                    if (!arm.has_source_arm_guard) continue;
+                    const ForLoopCtx* body_ctx = for_loop_match_arm_ctx(arm, ai, terminating_ctx);
+                    MirBlock source_guard{};
+                    source_guard.label = cont_label();
+                    auto effects = append_body_match_arm_effects(
+                        &source_guard,
+                        ai,
+                        HirForLoopMatchArm::kSourceGuardDependencyDepth,
+                        arm.span);
+                    if (!effects) return core::make_unexpected(effects.error());
+                    effects = append_body_match_arm_effects(
+                        &source_guard, ai, HirForLoopMatchArm::kSourceGuardLatchDepth, arm.span);
+                    if (!effects) return core::make_unexpected(effects.error());
+                    source_guard.term.kind = MirTerminatorKind::Branch;
+                    source_guard.term.span = arm.source_arm_guard.span;
+                    auto guard = mir_value(arm.source_arm_guard, module, &fn, body_ctx);
+                    if (!guard) return core::make_unexpected(guard.error());
+                    source_guard.term.cond = guard.value();
+                    source_guard.term.then_block = arm.guards.len != 0
+                                                       ? body_match_prelude_guard_index[ai][0]
+                                                   : arm.has_arm_guard ? body_match_guard_index[ai]
+                                                                       : body_match_case_index[ai];
+                    source_guard.term.else_block = body_match_source_fallthrough_target(ai);
+                    if (!fn.blocks.push(source_guard))
+                        return frontend_error(FrontendError::TooManyItems, fn.span);
+                }
+                for (u32 ai = 0; ai < body_match.arms.len; ai++) {
+                    const auto& arm = body_match.arms[ai];
                     if (!arm.has_arm_guard) continue;
                     const ForLoopCtx* body_ctx = for_loop_match_arm_ctx(arm, ai, terminating_ctx);
                     MirBlock guard_block{};
                     guard_block.label = cont_label();
-                    auto effects = append_body_match_arm_guard_effects(&guard_block, ai, arm.span);
+                    const u32 effect_depth = arm.arm_guard_precedes_prelude
+                                                 ? HirForLoopMatchArm::kSourceGuardDependencyDepth
+                                                 : arm.guards.len;
+                    auto effects =
+                        append_body_match_arm_effects(&guard_block, ai, effect_depth, arm.span);
                     if (!effects) return core::make_unexpected(effects.error());
-                    if (!arm.arm_guard_precedes_prelude) {
-                        effects = append_body_match_arm_effects(
-                            &guard_block, ai, arm.guards.len, arm.span);
-                        if (!effects) return core::make_unexpected(effects.error());
-                    }
                     guard_block.term.kind = MirTerminatorKind::Branch;
                     guard_block.term.span = arm.arm_guard.span;
                     auto guard = mir_value(arm.arm_guard, module, &fn, body_ctx);
@@ -3624,10 +4231,11 @@ FrontendResult<MirModule*> build_mir(const HirModule& module) {
                             ? body_match_prelude_guard_index[ai][0]
                         : arm.post_arm_guard_expr_index != 0xffffffffu
                             ? body_match_post_guard_index[ai]
-                            : body_match_arm_body_index(body_match.arms[ai], ai);
-                    guard_block.term.else_block = arm.arm_guard_precedes_prelude
-                                                      ? body_match_pattern_fallthrough_target(ai)
-                                                      : body_match_fallthrough_target(ai);
+                        : arm.capture_group != 0
+                            ? body_match_arm_body_index(body_match.arms[ai], ai)
+                        : arm.guards.len != 0 ? body_match_prelude_guard_index[ai][0]
+                                              : body_match_arm_body_index(body_match.arms[ai], ai);
+                    guard_block.term.else_block = body_match_guard_fallthrough_target(ai);
                     if (!fn.blocks.push(guard_block))
                         return frontend_error(FrontendError::TooManyItems, fn.span);
                 }
@@ -3649,7 +4257,7 @@ FrontendResult<MirModule*> build_mir(const HirModule& module) {
                     if (!guard) return core::make_unexpected(guard.error());
                     guard_block.term.cond = guard.value();
                     guard_block.term.then_block = body_match_case_index[ai];
-                    guard_block.term.else_block = body_match_fallthrough_target(ai);
+                    guard_block.term.else_block = body_match_guard_fallthrough_target(ai);
                     if (!fn.blocks.push(guard_block))
                         return frontend_error(FrontendError::TooManyItems, fn.span);
                 }
@@ -3944,116 +4552,8 @@ FrontendResult<MirModule*> build_mir(const HirModule& module) {
                 auto& step = steps[si];
                 const auto& body_match = *step.body_match;
                 const ForLoopCtx* step_ctx = route_step_ctx(step);
-                ForLoopCtx arm_contexts[HirForLoopMatch::kMaxMatchArms]{};
-                ForLoopCtx shared_contexts[HirForLoopMatch::kMaxMatchArms]{};
-                FixedVec<MirBlock::Effect, HirForLoopMatchArm::kMaxLocals>
-                    arm_effects[HirForLoopMatch::kMaxMatchArms]{};
-                FixedVec<MirBlock::Effect, HirForLoopMatchArm::kMaxLocals>
-                    arm_guard_effects[HirForLoopMatch::kMaxMatchArms]{};
-                FixedVec<u8, HirForLoopMatchArm::kMaxLocals>
-                    arm_effect_depths[HirForLoopMatch::kMaxMatchArms]{};
-                u8 capture_owner[HirForLoopMatch::kMaxMatchArms]{};
-                for (u32 ai = 0; ai < body_match.arms.len; ai++) {
-                    const auto& arm = body_match.arms[ai];
-                    if (arm.capture_local_count > arm.locals.len)
-                        return frontend_error(FrontendError::UnsupportedSyntax, arm.span);
-                    capture_owner[ai] = static_cast<u8>(ai);
-                    u32 local_start = 0;
-                    if (arm.capture_group != 0) {
-                        for (u32 prior = 0; prior < ai; prior++) {
-                            if (body_match.arms[prior].capture_group != arm.capture_group) continue;
-                            capture_owner[ai] = static_cast<u8>(prior);
-                            arm_contexts[ai] = shared_contexts[prior];
-                            local_start = arm.capture_local_count;
-                            break;
-                        }
-                    }
-                    if (capture_owner[ai] == ai && step_ctx != nullptr)
-                        arm_contexts[ai] = *step_ctx;
-                    ForLoopCtx* body_ctx = &arm_contexts[ai];
-                    if (capture_owner[ai] == ai && arm.capture_local_count == 0)
-                        shared_contexts[ai] = *body_ctx;
-                    for (u32 li = local_start; li < arm.locals.len; li++) {
-                        const auto& local = arm.locals[li];
-                        auto local_value = mir_value(local.init, module, &fn, body_ctx);
-                        if (!local_value) return core::make_unexpected(local_value.error());
-                        const bool capture_local = local_value->kind != MirValueKind::BoolConst &&
-                                                   local_value->kind != MirValueKind::IntConst &&
-                                                   local_value->kind != MirValueKind::StrConst &&
-                                                   local_value->kind != MirValueKind::LocalRef;
-                        if (!capture_local) {
-                            auto binding = push_ctx_binding(
-                                body_ctx, local.ref_index, local_value.value(), local.span);
-                            if (!binding) return core::make_unexpected(binding.error());
-                            if (capture_owner[ai] == ai && li + 1 == arm.capture_local_count)
-                                shared_contexts[ai] = *body_ctx;
-                            continue;
-                        }
-                        if (next_unrolled_local_ref >= MirFunction::kMaxLocals)
-                            return frontend_error(FrontendError::TooManyItems, local.span);
-                        const u32 materialized_ref = next_unrolled_local_ref++;
-                        if (!fn.values.push(local_value.value()))
-                            return frontend_error(FrontendError::TooManyItems, local.span);
-                        const u32 value_index = fn.values.len - 1;
-                        MirValue local_ref{};
-                        local_ref.kind = MirValueKind::LocalRef;
-                        local_ref.type = local_value->type;
-                        local_ref.shape_index = local_value->shape_index;
-                        local_ref.may_nil = local_value->may_nil;
-                        local_ref.may_error = local_value->may_error;
-                        local_ref.local_index = materialized_ref;
-                        local_ref.variant_index = local_value->variant_index;
-                        local_ref.struct_index = local_value->struct_index;
-                        local_ref.tuple_len = local_value->tuple_len;
-                        for (u32 ti = 0; ti < local_value->tuple_len; ti++) {
-                            local_ref.tuple_types[ti] = local_value->tuple_types[ti];
-                            local_ref.tuple_variant_indices[ti] =
-                                local_value->tuple_variant_indices[ti];
-                            local_ref.tuple_struct_indices[ti] =
-                                local_value->tuple_struct_indices[ti];
-                        }
-                        local_ref.error_struct_index = local_value->error_struct_index;
-                        local_ref.error_variant_index = local_value->error_variant_index;
-                        if (!fn.values.push(local_ref))
-                            return frontend_error(FrontendError::TooManyItems, local.span);
-                        ForLoopCtx::LocalBinding binding{};
-                        binding.ref_index = local.ref_index;
-                        binding.value = &fn.values[fn.values.len - 1];
-                        if (!body_ctx->locals.push(binding))
-                            return frontend_error(FrontendError::TooManyItems, local.span);
-                        const MirBlock::Effect effect{value_index, local.span, materialized_ref};
-                        if (arm.local_precedes_arm_guard[li]) {
-                            if (!arm_guard_effects[ai].push(effect))
-                                return frontend_error(FrontendError::TooManyItems, local.span);
-                        } else if (!arm_effects[ai].push(effect) ||
-                                   !arm_effect_depths[ai].push(arm.local_guard_depth[li])) {
-                            return frontend_error(FrontendError::TooManyItems, local.span);
-                        }
-                        if (capture_owner[ai] == ai && li + 1 == arm.capture_local_count)
-                            shared_contexts[ai] = *body_ctx;
-                    }
-                }
-                auto append_arm_effects = [&](MirBlock* block,
-                                              u32 arm_index,
-                                              u32 guard_depth,
-                                              Span span) -> FrontendResult<void> {
-                    for (u32 ei = 0; ei < arm_effects[arm_index].len; ei++) {
-                        if (arm_effect_depths[arm_index][ei] != guard_depth) continue;
-                        if (!block->effects.push(arm_effects[arm_index][ei]))
-                            return frontend_error(FrontendError::TooManyItems, span);
-                    }
-                    return {};
-                };
-                auto append_arm_guard_effects =
-                    [&](MirBlock* block, u32 arm_index, Span span) -> FrontendResult<void> {
-                    for (u32 ei = 0; ei < arm_guard_effects[arm_index].len; ei++) {
-                        if (!block->effects.push(arm_guard_effects[arm_index][ei]))
-                            return frontend_error(FrontendError::TooManyItems, span);
-                    }
-                    return {};
-                };
-                auto subject = mir_value(body_match.match_expr, module, &fn, step_ctx);
-                if (!subject) return core::make_unexpected(subject.error());
+                if (!step.has_match_subject)
+                    return frontend_error(FrontendError::UnsupportedSyntax, step.span);
                 auto arm_target =
                     [&](const HirForLoopBranch& branch, u32 term_index, u32 loop_index) -> u32 {
                     if (branch.kind == HirForLoopBranch::Kind::Term) return term_index;
@@ -4061,41 +4561,61 @@ FrontendResult<MirModule*> build_mir(const HirModule& module) {
                 };
                 auto arm_entry = [&](u32 arm_index) -> u32 {
                     const auto& arm = body_match.arms[arm_index];
+                    if (arm.has_source_arm_guard) return step.match_source_guard_index[arm_index];
                     if (arm.has_arm_guard && arm.arm_guard_precedes_prelude)
                         return step.match_arm_guard_index[arm_index];
-                    if (arm.guards.len != 0) return step.match_prelude_guard_index[arm_index][0];
+                    if (is_capture_group_owner(body_match, arm_index) && arm.capture_group != 0 &&
+                        arm.guards.len != 0)
+                        return step.match_prelude_guard_index[arm_index][0];
                     if (arm.has_arm_guard) return step.match_arm_guard_index[arm_index];
                     if (arm.post_arm_guard_expr_index != 0xffffffffu)
                         return step.match_post_guard_index[arm_index];
+                    if (arm.guards.len != 0 &&
+                        (arm.capture_group == 0 || is_capture_group_owner(body_match, arm_index)))
+                        return step.match_prelude_guard_index[arm_index][0];
                     return step.match_case_index[arm_index];
                 };
-                auto post_prelude_entry = [&](u32 arm_index) -> u32 {
+                auto arm_post_prelude = [&](u32 arm_index) -> u32 {
                     const auto& arm = body_match.arms[arm_index];
                     if (arm.post_arm_guard_expr_index != 0xffffffffu)
                         return step.match_post_guard_index[arm_index];
                     if (arm.has_arm_guard) return step.match_arm_guard_index[arm_index];
                     return step.match_case_index[arm_index];
                 };
-                auto fallthrough_target = [&](u32 arm_index) -> u32 {
+                auto pattern_fallthrough_target = [&](u32 arm_index) -> u32 {
                     for (u32 next = arm_index + 1; next < body_match.arms.len; next++) {
                         if (body_match.arms[arm_index].capture_group != 0 &&
                             body_match.arms[next].capture_group ==
                                 body_match.arms[arm_index].capture_group)
-                            return post_prelude_entry(next);
+                            continue;
                         if (body_match.arms[next].is_wildcard) return arm_entry(next);
                         return step.match_test_index[step.match_test_ordinal[next]];
                     }
                     return arm_entry(body_match.arms.len - 1);
                 };
-                auto pattern_fallthrough_target = [&](u32 arm_index) -> u32 {
-                    const u8 capture_group = body_match.arms[arm_index].capture_group;
-                    u32 next = arm_index + 1;
-                    while (capture_group != 0 && next < body_match.arms.len &&
-                           body_match.arms[next].capture_group == capture_group)
-                        next++;
-                    if (next >= body_match.arms.len) return arm_entry(body_match.arms.len - 1);
-                    if (body_match.arms[next].is_wildcard) return arm_entry(next);
-                    return step.match_test_index[step.match_test_ordinal[next]];
+                auto guard_fallthrough_target = [&](u32 arm_index) -> u32 {
+                    for (u32 next = arm_index + 1; next < body_match.arms.len; next++) {
+                        if (body_match.arms[arm_index].capture_group != 0 &&
+                            body_match.arms[next].capture_group ==
+                                body_match.arms[arm_index].capture_group) {
+                            if (body_match.arms[next].is_wildcard) return arm_post_prelude(next);
+                            return step.match_test_index[step.match_test_ordinal[next]];
+                        }
+                        if (body_match.arms[next].is_wildcard) return arm_entry(next);
+                        return step.match_test_index[step.match_test_ordinal[next]];
+                    }
+                    return arm_entry(body_match.arms.len - 1);
+                };
+                auto source_fallthrough_target = [&](u32 arm_index) -> u32 {
+                    for (u32 next = arm_index + 1; next < body_match.arms.len; next++) {
+                        if (body_match.arms[arm_index].capture_group != 0 &&
+                            body_match.arms[next].capture_group ==
+                                body_match.arms[arm_index].capture_group)
+                            continue;
+                        if (body_match.arms[next].is_wildcard) return arm_entry(next);
+                        return step.match_test_index[step.match_test_ordinal[next]];
+                    }
+                    return arm_entry(body_match.arms.len - 1);
                 };
                 for (u32 ordinal = 1; ordinal < step.match_non_wildcard_count; ordinal++) {
                     u32 arm_index = 0;
@@ -4113,25 +4633,103 @@ FrontendResult<MirModule*> build_mir(const HirModule& module) {
                     test.term.kind = MirTerminatorKind::Branch;
                     test.term.use_cmp = true;
                     test.term.span = body_match.arms[arm_index].span;
-                    test.term.lhs = subject.value();
+                    test.term.lhs = step.match_subject;
                     test.term.rhs = pattern.value();
-                    test.term.then_block = arm_entry(arm_index);
+                    test.term.then_block = arm_index != 0 &&
+                                                   body_match.arms[arm_index].capture_group != 0 &&
+                                                   body_match.arms[arm_index - 1].capture_group ==
+                                                       body_match.arms[arm_index].capture_group
+                                               ? arm_post_prelude(arm_index)
+                                               : arm_entry(arm_index);
                     test.term.else_block = pattern_fallthrough_target(arm_index);
                     if (!fn.blocks.push(test))
                         return frontend_error(FrontendError::TooManyItems, fn.span);
                 }
+                ForLoopCtx arm_contexts[HirForLoopMatch::kMaxMatchArms]{};
+                ForLoopCtx shared_arm_contexts[HirForLoopMatch::kMaxMatchArms]{};
+                FixedVec<MirBlock::Effect, HirForLoopMatchArm::kMaxLocals>
+                    arm_effects[HirForLoopMatch::kMaxMatchArms]{};
+                FixedVec<u32, HirForLoopMatchArm::kMaxLocals>
+                    arm_effect_depths[HirForLoopMatch::kMaxMatchArms]{};
+                u8 capture_owner[HirForLoopMatch::kMaxMatchArms]{};
+                for (u32 ai = 0; ai < body_match.arms.len; ai++) {
+                    const auto& arm = body_match.arms[ai];
+                    if (arm.capture_local_count > arm.locals.len)
+                        return frontend_error(FrontendError::UnsupportedSyntax, arm.span);
+                    capture_owner[ai] = static_cast<u8>(ai);
+                    if (arm.capture_group != 0) {
+                        for (u32 prior = 0; prior < ai; prior++) {
+                            if (body_match.arms[prior].capture_group != arm.capture_group) continue;
+                            capture_owner[ai] = static_cast<u8>(prior);
+                            arm_contexts[ai] = shared_arm_contexts[prior];
+                            break;
+                        }
+                    }
+                    const u32 owner = capture_owner[ai];
+                    if (owner == ai) {
+                        arm_contexts[ai] = *step_ctx;
+                        auto prefix = extend_for_loop_match_arm_ctx(arm,
+                                                                    step_ctx,
+                                                                    &arm_contexts[ai],
+                                                                    0,
+                                                                    arm.capture_local_count,
+                                                                    &arm_effects[ai],
+                                                                    &arm_effect_depths[ai]);
+                        if (!prefix) return core::make_unexpected(prefix.error());
+                        shared_arm_contexts[ai] = arm_contexts[ai];
+                    }
+                    auto extended = extend_for_loop_match_arm_ctx(arm,
+                                                                  &arm_contexts[ai],
+                                                                  &arm_contexts[ai],
+                                                                  arm.capture_local_count,
+                                                                  arm.locals.len,
+                                                                  &arm_effects[ai],
+                                                                  &arm_effect_depths[ai]);
+                    if (!extended) return core::make_unexpected(extended.error());
+                }
                 for (u32 ai = 0; ai < body_match.arms.len; ai++) {
                     const auto& arm = body_match.arms[ai];
                     const ForLoopCtx* body_ctx = arm.locals.len == 0 ? step_ctx : &arm_contexts[ai];
+                    auto append_effects_at_depth = [&](MirBlock* block,
+                                                       u32 depth) -> FrontendResult<void> {
+                        for (u32 ei = 0; ei < arm_effects[ai].len; ei++) {
+                            if (arm_effect_depths[ai][ei] != depth) continue;
+                            if (!block->effects.push(arm_effects[ai][ei]))
+                                return frontend_error(FrontendError::TooManyItems, arm.span);
+                        }
+                        return {};
+                    };
+                    if (arm.has_source_arm_guard) {
+                        MirBlock source_guard{};
+                        source_guard.label = cont_label();
+                        auto effects = append_effects_at_depth(
+                            &source_guard, HirForLoopMatchArm::kSourceGuardDependencyDepth);
+                        if (!effects) return core::make_unexpected(effects.error());
+                        effects = append_effects_at_depth(
+                            &source_guard, HirForLoopMatchArm::kSourceGuardLatchDepth);
+                        if (!effects) return core::make_unexpected(effects.error());
+                        source_guard.term.kind = MirTerminatorKind::Branch;
+                        source_guard.term.span = arm.source_arm_guard.span;
+                        auto cond = mir_value(arm.source_arm_guard, module, &fn, body_ctx);
+                        if (!cond) return core::make_unexpected(cond.error());
+                        source_guard.term.cond = cond.value();
+                        source_guard.term.then_block =
+                            arm.guards.len != 0 ? step.match_prelude_guard_index[ai][0]
+                            : arm.has_arm_guard ? step.match_arm_guard_index[ai]
+                                                : step.match_case_index[ai];
+                        source_guard.term.else_block = source_fallthrough_target(ai);
+                        if (!fn.blocks.push(source_guard))
+                            return frontend_error(FrontendError::TooManyItems, fn.span);
+                    }
                     if (arm.has_arm_guard) {
                         MirBlock guard{};
                         guard.label = cont_label();
-                        auto effects = append_arm_guard_effects(&guard, ai, arm.span);
+                        const u32 effect_depth =
+                            arm.arm_guard_precedes_prelude
+                                ? HirForLoopMatchArm::kSourceGuardDependencyDepth
+                                : arm.guards.len;
+                        auto effects = append_effects_at_depth(&guard, effect_depth);
                         if (!effects) return core::make_unexpected(effects.error());
-                        if (!arm.arm_guard_precedes_prelude) {
-                            effects = append_arm_effects(&guard, ai, arm.guards.len, arm.span);
-                            if (!effects) return core::make_unexpected(effects.error());
-                        }
                         guard.term.kind = MirTerminatorKind::Branch;
                         guard.term.span = arm.arm_guard.span;
                         auto cond = mir_value(arm.arm_guard, module, &fn, body_ctx);
@@ -4142,40 +4740,39 @@ FrontendResult<MirModule*> build_mir(const HirModule& module) {
                                 ? step.match_prelude_guard_index[ai][0]
                             : arm.post_arm_guard_expr_index != 0xffffffffu
                                 ? step.match_post_guard_index[ai]
-                                : step.match_case_index[ai];
-                        guard.term.else_block = arm.arm_guard_precedes_prelude
-                                                    ? pattern_fallthrough_target(ai)
-                                                    : fallthrough_target(ai);
+                            : arm.capture_group != 0 ? step.match_case_index[ai]
+                            : arm.guards.len != 0    ? step.match_prelude_guard_index[ai][0]
+                                                     : step.match_case_index[ai];
+                        guard.term.else_block = guard_fallthrough_target(ai);
                         if (!fn.blocks.push(guard))
                             return frontend_error(FrontendError::TooManyItems, fn.span);
                     }
-                    for (u32 gi = 0; gi < arm.guards.len; gi++) {
-                        MirBlock guard{};
-                        guard.label = cont_label();
-                        auto effects = append_arm_effects(&guard, ai, gi, arm.span);
-                        if (!effects) return core::make_unexpected(effects.error());
-                        guard.term.kind = MirTerminatorKind::Branch;
-                        guard.term.span = arm.guards[gi].span;
-                        auto cond = mir_value(arm.guards[gi].cond, module, &fn, body_ctx);
-                        if (!cond) return core::make_unexpected(cond.error());
-                        guard.term.cond = cond.value();
-                        guard.term.then_block =
-                            gi + 1 < arm.guards.len ? step.match_prelude_guard_index[ai][gi + 1]
-                            : arm.has_arm_guard && !arm.arm_guard_precedes_prelude
-                                ? step.match_arm_guard_index[ai]
-                            : arm.post_arm_guard_expr_index != 0xffffffffu
-                                ? step.match_post_guard_index[ai]
-                                : step.match_case_index[ai];
-                        guard.term.else_block = step.match_prelude_fail_index[ai][gi];
-                        if (!fn.blocks.push(guard))
-                            return frontend_error(FrontendError::TooManyItems, fn.span);
-                    }
+                    if (is_capture_group_owner(body_match, ai))
+                        for (u32 gi = 0; gi < arm.guards.len; gi++) {
+                            MirBlock guard{};
+                            guard.label = cont_label();
+                            auto effects = append_effects_at_depth(&guard, gi);
+                            if (!effects) return core::make_unexpected(effects.error());
+                            guard.term.kind = MirTerminatorKind::Branch;
+                            guard.term.span = arm.guards[gi].span;
+                            auto cond = mir_value(arm.guards[gi].cond, module, &fn, body_ctx);
+                            if (!cond) return core::make_unexpected(cond.error());
+                            guard.term.cond = cond.value();
+                            guard.term.then_block = gi + 1 < arm.guards.len
+                                                        ? step.match_prelude_guard_index[ai][gi + 1]
+                                                    : arm.capture_group != 0 && arm.has_arm_guard
+                                                        ? step.match_arm_guard_index[ai]
+                                                        : step.match_case_index[ai];
+                            guard.term.else_block = step.match_prelude_fail_index[ai][gi];
+                            if (!fn.blocks.push(guard))
+                                return frontend_error(FrontendError::TooManyItems, fn.span);
+                        }
                     if (arm.post_arm_guard_expr_index != 0xffffffffu) {
                         if (arm.post_arm_guard_expr_index >= module.routes[i].exprs.len)
                             return frontend_error(FrontendError::UnsupportedSyntax, arm.span);
                         MirBlock guard{};
                         guard.label = cont_label();
-                        auto effects = append_arm_effects(&guard, ai, arm.guards.len, arm.span);
+                        auto effects = append_effects_at_depth(&guard, arm.guards.len);
                         if (!effects) return core::make_unexpected(effects.error());
                         const auto& post_guard =
                             module.routes[i].exprs[arm.post_arm_guard_expr_index];
@@ -4185,7 +4782,7 @@ FrontendResult<MirModule*> build_mir(const HirModule& module) {
                         if (!cond) return core::make_unexpected(cond.error());
                         guard.term.cond = cond.value();
                         guard.term.then_block = step.match_case_index[ai];
-                        guard.term.else_block = fallthrough_target(ai);
+                        guard.term.else_block = guard_fallthrough_target(ai);
                         if (!fn.blocks.push(guard))
                             return frontend_error(FrontendError::TooManyItems, fn.span);
                     }
@@ -4193,9 +4790,8 @@ FrontendResult<MirModule*> build_mir(const HirModule& module) {
                     case_block.label = arm.is_wildcard ? match_default_label() : match_case_label();
                     if (arm.post_arm_guard_expr_index == 0xffffffffu &&
                         (!arm.has_arm_guard || arm.arm_guard_precedes_prelude)) {
-                        auto case_effects =
-                            append_arm_effects(&case_block, ai, arm.guards.len, arm.span);
-                        if (!case_effects) return core::make_unexpected(case_effects.error());
+                        auto effects = append_effects_at_depth(&case_block, arm.guards.len);
+                        if (!effects) return core::make_unexpected(effects.error());
                     }
                     if (arm.body_kind == HirForLoopMatchArm::BodyKind::If) {
                         case_block.term.kind = MirTerminatorKind::Branch;
@@ -4248,13 +4844,15 @@ FrontendResult<MirModule*> build_mir(const HirModule& module) {
                                 return frontend_error(FrontendError::TooManyItems, fn.span);
                         }
                     }
-                    for (u32 gi = 0; gi < arm.guards.len; gi++) {
-                        const u32 loop_target = step.match_guard_target_index[ai][gi] == 0xffffffffu
-                                                    ? terminal_index
-                                                    : step.match_guard_target_index[ai][gi];
-                        auto emitted = emit_guard_fail(arm.guards[gi], body_ctx, loop_target);
-                        if (!emitted) return core::make_unexpected(emitted.error());
-                    }
+                    if (is_capture_group_owner(body_match, ai))
+                        for (u32 gi = 0; gi < arm.guards.len; gi++) {
+                            const u32 loop_target =
+                                step.match_guard_target_index[ai][gi] == 0xffffffffu
+                                    ? terminal_index
+                                    : step.match_guard_target_index[ai][gi];
+                            auto emitted = emit_guard_fail(arm.guards[gi], body_ctx, loop_target);
+                            if (!emitted) return core::make_unexpected(emitted.error());
+                        }
                 }
             }
 
