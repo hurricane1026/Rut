@@ -331,7 +331,8 @@ public:
                 }
                 bool all_issued = true;
                 for (u32 b = 0; b < up.addr_count; b++) {
-                    if (probe_in_flight(static_cast<u16>(u), b)) continue;
+                    if (probe_in_flight(self().control_plane_mutation, cfg, static_cast<u16>(u), b))
+                        continue;
                     if (budget == 0) {
                         all_issued = false;
                         break;

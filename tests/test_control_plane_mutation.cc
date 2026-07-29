@@ -1,4 +1,5 @@
 #include "rut/runtime/control_plane_mutation.h"
+#include "rut/runtime/upstream_concurrency.h"
 #include "test.h"
 #include <atomic>
 #include <thread>
@@ -1245,6 +1246,48 @@ TEST(control_plane_mutation, activation_compares_full_upstream_name_identity) {
              0);
     CHECK_NE(old_config.upstreams[0].name_identity, new_config.upstreams[0].name_identity);
     CHECK_EQ(port.manual_health({4, 0, 0}), ManualHealthOverride::None);
+}
+
+TEST(control_plane_mutation, activation_keys_runtime_tokens_by_stable_identity) {
+    ControlPlaneMutationPort port;
+    RouteConfig old_config;
+    REQUIRE(old_config.add_upstream("users", 0x7f000001u, 8000).has_value());
+    REQUIRE(old_config.add_upstream("orders", 0x7f000001u, 9000).has_value());
+    port.reset(3, true, &old_config);
+
+    const u16 old_users = port.upstream_allocation_for_config(&old_config, 0);
+    const u16 old_users_endpoint = port.endpoint_allocation_for_config(&old_config, 0, 0);
+    REQUIRE_NE(old_users, ControlPlaneMutationPort::kInvalidAllocation);
+    REQUIRE_NE(old_users_endpoint, ControlPlaneMutationPort::kInvalidAllocation);
+
+    u64 id = 0;
+    REQUIRE(port.request_reload(ReloadRequestSource::Route, &id));
+    ReloadRequest request{};
+    REQUIRE(port.take_reload(&request));
+    RouteConfig new_config;
+    // Reuse the old numeric slot and address for a different upstream while
+    // moving the compatible upstream to another index.
+    REQUIRE(new_config.add_upstream("replacement", 0x7f000001u, 8000).has_value());
+    REQUIRE(new_config.add_upstream("users", 0x7f000001u, 8000).has_value());
+    REQUIRE(
+        port.complete_reload(id, request.source, ReloadTerminalOutcome::Activated, 4, &new_config));
+
+    const u16 replacement = port.upstream_allocation_for_config(&new_config, 0);
+    const u16 moved_users = port.upstream_allocation_for_config(&new_config, 1);
+    CHECK_EQ(moved_users, old_users);
+    CHECK_NE(replacement, old_users);
+    CHECK_EQ(port.endpoint_allocation_for_config(&new_config, 1, 0), old_users_endpoint);
+    CHECK_NE(port.endpoint_allocation_for_config(&new_config, 0, 0), old_users_endpoint);
+
+    UpstreamConcurrency concurrency;
+    concurrency.reset();
+    REQUIRE(concurrency.try_acquire(old_users, 1));
+    CHECK_FALSE(concurrency.try_acquire(moved_users, 1));
+    CHECK(concurrency.try_acquire(replacement, 1));
+    concurrency.release(replacement);
+    concurrency.release(old_users);
+    CHECK(concurrency.try_acquire(moved_users, 1));
+    concurrency.release(moved_users);
 }
 
 TEST(control_plane_mutation, activation_rejects_skipped_generation) {

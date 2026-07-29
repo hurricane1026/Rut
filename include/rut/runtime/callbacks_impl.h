@@ -142,12 +142,20 @@ inline void record_active_probe_result(u16 upstream_id, u32 backend_idx, bool he
 // due sweep would launch ANOTHER probe for the same backend, accumulating probe
 // Connection slots without bound and eventually starving real client accepts.
 // Per-shard thread_local — same rationale as BackendHealth / rr_cursor.
-inline bool* probe_in_flight_slot(u16 upstream_id, u32 backend_idx) {
-    static thread_local bool in_flight[RouteConfig::kMaxUpstreams][UpstreamTarget::kMaxBackends] =
-        {};
+inline bool* probe_in_flight_allocation_slot(u16 allocation) {
+    static thread_local bool in_flight[ControlPlaneMutationPort::kMaxEndpointAllocations] = {};
+    if (allocation >= ControlPlaneMutationPort::kMaxEndpointAllocations) return nullptr;
+    return &in_flight[allocation];
+}
+
+inline u16 legacy_probe_allocation(u16 upstream_id, u32 backend_idx) {
     if (upstream_id >= RouteConfig::kMaxUpstreams || backend_idx >= UpstreamTarget::kMaxBackends)
-        return nullptr;
-    return &in_flight[upstream_id][backend_idx];
+        return ControlPlaneMutationPort::kInvalidAllocation;
+    return static_cast<u16>(upstream_id * UpstreamTarget::kMaxBackends + backend_idx);
+}
+
+inline bool* probe_in_flight_slot(u16 upstream_id, u32 backend_idx) {
+    return probe_in_flight_allocation_slot(legacy_probe_allocation(upstream_id, backend_idx));
 }
 
 bool probe_in_flight(u16 upstream_id, u32 backend_idx);
@@ -155,6 +163,16 @@ bool probe_in_flight(u16 upstream_id, u32 backend_idx);
 inline void set_probe_in_flight(u16 upstream_id, u32 backend_idx, bool v) {
     bool* s = probe_in_flight_slot(upstream_id, backend_idx);
     if (s != nullptr) *s = v;
+}
+
+inline bool probe_in_flight_allocation(u16 allocation) {
+    const bool* slot = probe_in_flight_allocation_slot(allocation);
+    return slot != nullptr && *slot;
+}
+
+inline void set_probe_in_flight_allocation(u16 allocation, bool value) {
+    bool* slot = probe_in_flight_allocation_slot(allocation);
+    if (slot != nullptr) *slot = value;
 }
 
 // Clear ALL per-(upstream, backend) health verdicts. Called from
@@ -315,7 +333,11 @@ void free_probe_conn(Loop* loop, Connection& conn) {
     // at exactly the slot that was marked. The one mark-then-exit path that does
     // NOT route through here — the create_socket-failure branch in
     // start_health_probe (which calls free_conn directly) — clears it inline.
-    set_probe_in_flight(conn.upstream_idx, conn.upstream_backend_idx, false);
+    const u16 allocation =
+        conn.health_probe_slot_uid != ControlPlaneMutationPort::kInvalidAllocation
+            ? conn.health_probe_slot_uid
+            : legacy_probe_allocation(conn.upstream_idx, conn.upstream_backend_idx);
+    set_probe_in_flight_allocation(allocation, false);
     loop->free_health_probe(conn);
 }
 
@@ -332,6 +354,39 @@ inline u64 pinned_control_plane_generation(Loop* loop, const RouteConfig* config
             return loop->control_plane_mutation->generation_for_config(config);
     }
     return 0;
+}
+
+template <typename Loop>
+inline u16 control_plane_upstream_allocation(Loop* loop,
+                                             const RouteConfig* config,
+                                             u16 upstream_id) {
+    if (loop != nullptr) {
+        if constexpr (requires { loop->control_plane_mutation; }) {
+            if (loop->control_plane_mutation != nullptr) {
+                const u16 allocation = loop->control_plane_mutation->upstream_allocation_for_config(
+                    config, upstream_id);
+                if (allocation != ControlPlaneMutationPort::kInvalidAllocation) return allocation;
+            }
+        }
+    }
+    return upstream_id;
+}
+
+template <typename Loop>
+inline u16 control_plane_endpoint_allocation(Loop* loop,
+                                             const RouteConfig* config,
+                                             u16 upstream_id,
+                                             u32 backend_id) {
+    if (loop != nullptr) {
+        if constexpr (requires { loop->control_plane_mutation; }) {
+            if (loop->control_plane_mutation != nullptr) {
+                const u16 allocation = loop->control_plane_mutation->endpoint_allocation_for_config(
+                    config, upstream_id, backend_id);
+                if (allocation != ControlPlaneMutationPort::kInvalidAllocation) return allocation;
+            }
+        }
+    }
+    return legacy_probe_allocation(upstream_id, backend_id);
 }
 
 template <typename Loop>
@@ -363,6 +418,9 @@ bool start_health_probe(Loop* loop, u16 upstream_idx, u32 backend_idx) {
     if (config == nullptr || upstream_idx >= config->upstream_count) return false;
     const UpstreamTarget& target = config->upstreams[upstream_idx];
     if (backend_idx >= target.addr_count) return false;
+    const u16 probe_allocation =
+        control_plane_endpoint_allocation(loop, config, upstream_idx, backend_idx);
+    if (probe_allocation == ControlPlaneMutationPort::kInvalidAllocation) return false;
 
     // Reserve a margin of Connection slots for real client traffic. Near
     // kMaxConns a due sweep can launch up to kMaxProbesPerSweep (32) probes,
@@ -383,12 +441,12 @@ bool start_health_probe(Loop* loop, u16 upstream_idx, u32 backend_idx) {
     // due sweep until each times out. Mark BEFORE alloc_conn and clear on EVERY
     // exit-after-mark path below (alloc/create-socket failure here, every other
     // path through free_probe_conn).
-    if (probe_in_flight(upstream_idx, backend_idx)) return false;
-    set_probe_in_flight(upstream_idx, backend_idx, true);
+    if (probe_in_flight_allocation(probe_allocation)) return false;
+    set_probe_in_flight_allocation(probe_allocation, true);
 
     Connection* cptr = loop->alloc_conn();
     if (cptr == nullptr) {  // slot exhaustion: never starve real traffic
-        set_probe_in_flight(upstream_idx, backend_idx, false);
+        set_probe_in_flight_allocation(probe_allocation, false);
         return false;
     }
     Connection& conn = *cptr;
@@ -396,6 +454,7 @@ bool start_health_probe(Loop* loop, u16 upstream_idx, u32 backend_idx) {
     conn.fd = -1;
     conn.upstream_idx = upstream_idx;
     conn.upstream_backend_idx = static_cast<u8>(backend_idx);
+    conn.health_probe_slot_uid = probe_allocation;
     // Pin the launching config so on_probe_* drops results after a hot swap.
     conn.request_config = config;
 
@@ -410,7 +469,7 @@ bool start_health_probe(Loop* loop, u16 upstream_idx, u32 backend_idx) {
     if (kProbeFd < 0) {
         // The one mark-then-exit path that bypasses free_probe_conn, so clear the
         // in-flight guard inline.
-        set_probe_in_flight(upstream_idx, backend_idx, false);
+        set_probe_in_flight_allocation(probe_allocation, false);
         loop->free_conn(conn);
         return false;
     }
@@ -1292,9 +1351,11 @@ void on_header_received(void* lp, Connection& conn, IoEvent ev) {
         // Otherwise take a slot, released on every exit path (completion via
         // release_upstream_slot at body-done; failure/close via close_conn).
         if (target.max_inflight != 0) {
+            const u16 allocation =
+                control_plane_upstream_allocation(loop, config, route->upstream_id);
             bool acquired = true;
-            if constexpr (requires { loop->upstream_acquire(route->upstream_id, 1u); }) {
-                acquired = loop->upstream_acquire(route->upstream_id, target.max_inflight);
+            if constexpr (requires { loop->upstream_acquire(allocation, 1u); }) {
+                acquired = loop->upstream_acquire(allocation, target.max_inflight);
             }
             if (!acquired) {
                 conn.resp_status = 503;
@@ -1305,7 +1366,7 @@ void on_header_received(void* lp, Connection& conn, IoEvent ev) {
                 return;
             }
             conn.upstream_slot_held = true;
-            conn.upstream_slot_uid = route->upstream_id;
+            conn.upstream_slot_uid = allocation;
         }
         for (u32 i = 0; i < sizeof(conn.upstream_name) && i < target.name_len; i++)
             conn.upstream_name[i] = target.name[i];
@@ -2211,9 +2272,11 @@ void handle_jit_outcome(Loop* loop,
             // Shed with 503 before connecting; slot released on every exit via
             // close_conn's catch-all (or release_upstream_slot at body-done).
             if (target.max_inflight != 0) {
+                const u16 allocation =
+                    control_plane_upstream_allocation(loop, config, outcome.upstream_id);
                 bool acquired = true;
-                if constexpr (requires { loop->upstream_acquire(outcome.upstream_id, 1u); }) {
-                    acquired = loop->upstream_acquire(outcome.upstream_id, target.max_inflight);
+                if constexpr (requires { loop->upstream_acquire(allocation, 1u); }) {
+                    acquired = loop->upstream_acquire(allocation, target.max_inflight);
                 }
                 if (!acquired) {
                     abandon_capture();
@@ -2228,7 +2291,7 @@ void handle_jit_outcome(Loop* loop,
                     return;
                 }
                 conn.upstream_slot_held = true;
-                conn.upstream_slot_uid = outcome.upstream_id;
+                conn.upstream_slot_uid = allocation;
             }
             for (u32 i = 0; i < sizeof(conn.upstream_name) && i < target.name_len; i++)
                 conn.upstream_name[i] = target.name[i];
@@ -3669,16 +3732,17 @@ void h2_proxy_begin(Loop* loop, Connection& conn) {
     }
     const UpstreamTarget& target = cfg->upstreams[upstream_id];
     if (target.max_inflight != 0) {
+        const u16 allocation = control_plane_upstream_allocation(loop, cfg, upstream_id);
         bool acquired = true;
-        if constexpr (requires { loop->upstream_acquire(upstream_id, 1u); }) {
-            acquired = loop->upstream_acquire(upstream_id, target.max_inflight);
+        if constexpr (requires { loop->upstream_acquire(allocation, 1u); }) {
+            acquired = loop->upstream_acquire(allocation, target.max_inflight);
         }
         if (!acquired) {
             h2_proxy_fail(loop, conn, 503);
             return;
         }
         conn.upstream_slot_held = true;
-        conn.upstream_slot_uid = upstream_id;
+        conn.upstream_slot_uid = allocation;
     }
     const i32 kFd = UpstreamPool::create_socket();
     if (kFd < 0) {

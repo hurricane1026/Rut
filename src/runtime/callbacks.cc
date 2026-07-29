@@ -805,6 +805,19 @@ bool probe_in_flight(u16 upstream_id, u32 backend_idx) {
     return s != nullptr && *s;
 }
 
+bool probe_in_flight(ControlPlaneMutationPort* mutation,
+                     const RouteConfig* config,
+                     u16 upstream_id,
+                     u32 backend_idx) {
+    u16 allocation = legacy_probe_allocation(upstream_id, backend_idx);
+    if (mutation != nullptr) {
+        const u16 stable =
+            mutation->endpoint_allocation_for_config(config, upstream_id, backend_idx);
+        if (stable != ControlPlaneMutationPort::kInvalidAllocation) allocation = stable;
+    }
+    return probe_in_flight_allocation(allocation);
+}
+
 // The probe teardown / config-pin helpers are also odr-used directly from the
 // epoll timer tick (stalled-probe reap), where only their callbacks.h
 // declarations are visible — emit the epoll instantiations here.

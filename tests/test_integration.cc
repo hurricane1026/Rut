@@ -2543,6 +2543,31 @@ TEST(active_health, failed_probe_keeps_backend_down_until_success) {
 // reap it as a health FAILURE, clear probe_in_flight, and free the slot, so the
 // next sweep re-probes. Driven deterministically: we issue the probe but never
 // pump its I/O (it stays parked), then advance the wheel by hand.
+TEST(active_health, probe_guard_follows_stable_endpoint_across_reload) {
+    ControlPlaneMutationPort port;
+    RouteConfig old_config;
+    REQUIRE(old_config.add_upstream("users", 0x7f000001u, 8000).has_value());
+    port.reset(3, true, &old_config);
+    const u16 old_allocation = port.endpoint_allocation_for_config(&old_config, 0, 0);
+    REQUIRE_NE(old_allocation, ControlPlaneMutationPort::kInvalidAllocation);
+    set_probe_in_flight_allocation(old_allocation, true);
+
+    u64 id = 0;
+    REQUIRE(port.request_reload(ReloadRequestSource::Route, &id));
+    ReloadRequest request{};
+    REQUIRE(port.take_reload(&request));
+    RouteConfig new_config;
+    REQUIRE(new_config.add_upstream("replacement", 0x7f000001u, 8000).has_value());
+    REQUIRE(new_config.add_upstream("users", 0x7f000001u, 8000).has_value());
+    REQUIRE(
+        port.complete_reload(id, request.source, ReloadTerminalOutcome::Activated, 4, &new_config));
+
+    CHECK_FALSE(probe_in_flight(&port, &new_config, 0, 0));
+    CHECK(probe_in_flight(&port, &new_config, 1, 0));
+    set_probe_in_flight_allocation(old_allocation, false);
+    CHECK_FALSE(probe_in_flight(&port, &new_config, 1, 0));
+}
+
 TEST(active_health, stalled_probe_reaped_then_reprobed) {
     using namespace rut;
     // A bare listening socket: the kernel completes the handshake via the backlog,
