@@ -2671,18 +2671,22 @@ TEST(active_health, recycled_allocation_clears_unrelated_endpoint_verdict) {
     REQUIRE(first_config.add_upstream("first-health", 0x7f000001u, 8020).has_value());
     port.reset(51, true, &first_config);
     const u16 first_allocation = port.endpoint_allocation_for_config(&first_config, 0, 0);
+    const u64 first_incarnation = port.endpoint_incarnation_for_config(&first_config, 0, 0);
     REQUIRE_NE(first_allocation, ControlPlaneMutationPort::kInvalidAllocation);
     record_active_probe_result_allocation(first_allocation,
                                           /*healthy=*/true,
                                           1,
                                           &first_config.upstreams[0],
-                                          0);
+                                          0,
+                                          first_incarnation);
     record_active_probe_result_allocation(first_allocation,
                                           /*healthy=*/false,
                                           2,
                                           &first_config.upstreams[0],
-                                          0);
-    CHECK(backend_ejected_allocation(first_allocation, 2, &first_config.upstreams[0], 0));
+                                          0,
+                                          first_incarnation);
+    CHECK(backend_ejected_allocation(
+        first_allocation, 2, &first_config.upstreams[0], 0, first_incarnation));
 
     auto activate = [&](u64 generation, RouteConfig* config) {
         u64 id = 0;
@@ -2700,20 +2704,31 @@ TEST(active_health, recycled_allocation_clears_unrelated_endpoint_verdict) {
     CHECK_NE(port.endpoint_allocation_for_config(&second_config, 0, 0), first_allocation);
 
     RouteConfig third_config;
-    REQUIRE(third_config.add_upstream("third-health", 0x7f000001u, 8022).has_value());
+    REQUIRE(third_config.add_upstream("first-health", 0x7f000001u, 8020).has_value());
     activate(53, &third_config);
     const u16 recycled = port.endpoint_allocation_for_config(&third_config, 0, 0);
+    const u64 recycled_incarnation = port.endpoint_incarnation_for_config(&third_config, 0, 0);
     CHECK_EQ(recycled, first_allocation);
-    CHECK_FALSE(backend_ejected_allocation(recycled, 2, &third_config.upstreams[0], 0));
+    CHECK_NE(recycled_incarnation, first_incarnation);
+    CHECK_FALSE(backend_ejected_allocation(
+        recycled, 2, &third_config.upstreams[0], 0, recycled_incarnation));
     for (u16 failure = 0; failure < kBackendFailThreshold; failure++)
         record_backend_result_allocation(recycled,
                                          /*success=*/false,
                                          3,
                                          &third_config.upstreams[0],
-                                         0);
-    CHECK(backend_ejected_allocation(recycled, 3, &third_config.upstreams[0], 0));
-    record_backend_result_allocation(recycled, /*success=*/true, 4, &third_config.upstreams[0], 0);
-    CHECK_FALSE(backend_ejected_allocation(recycled, 3, &third_config.upstreams[0], 0));
+                                         0,
+                                         recycled_incarnation);
+    CHECK(backend_ejected_allocation(
+        recycled, 3, &third_config.upstreams[0], 0, recycled_incarnation));
+    record_backend_result_allocation(recycled,
+                                     /*success=*/true,
+                                     4,
+                                     &third_config.upstreams[0],
+                                     0,
+                                     recycled_incarnation);
+    CHECK_FALSE(backend_ejected_allocation(
+        recycled, 3, &third_config.upstreams[0], 0, recycled_incarnation));
 }
 
 TEST(active_health, stalled_probe_reaped_then_reprobed) {
