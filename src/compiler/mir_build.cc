@@ -2414,12 +2414,18 @@ FrontendResult<MirModule*> build_mir(const HirModule& module) {
                         if (literal_subject && !arm.is_wildcard &&
                             !literal_matches(body_match.match_expr, arm.pattern))
                             continue;
+                        const bool arm_guard_can_fall_through =
+                            (arm.has_source_arm_guard &&
+                             (arm.source_arm_guard.kind != HirExprKind::BoolLit ||
+                              !arm.source_arm_guard.bool_value)) ||
+                            (arm.has_arm_guard && (arm.arm_guard.kind != HirExprKind::BoolLit ||
+                                                   !arm.arm_guard.bool_value));
                         for (u32 gi = 0; gi < arm.guards.len; gi++)
                             if (arm.guards[gi].fail_kind == HirGuard::FailKind::LoopControl &&
                                 (arm.guards[gi].cond.kind != HirExprKind::BoolLit ||
                                  !arm.guards[gi].cond.bool_value))
                                 return true;
-                        if (literal_subject) break;
+                        if (literal_subject && !arm_guard_can_fall_through) break;
                     }
                     return false;
                 };
@@ -2505,26 +2511,46 @@ FrontendResult<MirModule*> build_mir(const HirModule& module) {
                         if (!arm.is_wildcard &&
                             !literal_matches(body_match.match_expr, arm.pattern))
                             continue;
+                        const bool source_guard_is_false =
+                            arm.has_source_arm_guard &&
+                            arm.source_arm_guard.kind == HirExprKind::BoolLit &&
+                            !arm.source_arm_guard.bool_value;
+                        const bool arm_guard_is_false =
+                            arm.has_arm_guard && arm.arm_guard.kind == HirExprKind::BoolLit &&
+                            !arm.arm_guard.bool_value;
+                        const bool arm_guard_can_fall_through =
+                            (arm.has_source_arm_guard &&
+                             (arm.source_arm_guard.kind != HirExprKind::BoolLit ||
+                              !arm.source_arm_guard.bool_value)) ||
+                            (arm.has_arm_guard && (arm.arm_guard.kind != HirExprKind::BoolLit ||
+                                                   !arm.arm_guard.bool_value));
+                        if (source_guard_is_false || arm_guard_is_false) continue;
                         bool reaches_body = true;
                         for (u32 gi = 0; gi < arm.guards.len; gi++) {
                             const auto& guard = arm.guards[gi];
                             if (guard.cond.kind == HirExprKind::BoolLit && guard.cond.bool_value)
                                 continue;
+                            if (guard.cond.kind == HirExprKind::BoolLit &&
+                                guard.fail_kind == HirGuard::FailKind::Term)
+                                return true;
                             reaches_body = false;
                             break;
                         }
-                        if (!reaches_body) break;
+                        if (!reaches_body) return false;
                         if (arm.body_kind == HirForLoopMatchArm::BodyKind::Direct) {
-                            if (branch_terminates(arm.direct_branch)) return true;
+                            if (branch_terminates(arm.direct_branch) && !arm_guard_can_fall_through)
+                                return true;
                         } else if (arm.cond.kind == HirExprKind::BoolLit) {
                             if (branch_terminates(arm.cond.bool_value ? arm.then_branch
-                                                                      : arm.else_branch))
+                                                                      : arm.else_branch) &&
+                                !arm_guard_can_fall_through)
                                 return true;
                         } else if (branch_terminates(arm.then_branch) &&
-                                   branch_terminates(arm.else_branch)) {
+                                   branch_terminates(arm.else_branch) &&
+                                   !arm_guard_can_fall_through) {
                             return true;
                         }
-                        break;
+                        if (!arm_guard_can_fall_through) break;
                     }
                 }
                 return false;

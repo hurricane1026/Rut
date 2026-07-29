@@ -23680,10 +23680,36 @@ static FrontendResult<HirModule*> analyze_file_internal(
                             if (!arm.is_wildcard &&
                                 !literal_matches(body_match.match_expr, arm.pattern))
                                 continue;
-                            for (u32 gi = 0; gi < arm.guards.len; gi++)
-                                if (arm.guards[gi].cond.kind != HirExprKind::BoolLit ||
-                                    !arm.guards[gi].cond.bool_value)
-                                    return false;
+                            const auto guard_can_fail = [](const HirExpr& guard) {
+                                return guard.kind != HirExprKind::BoolLit || !guard.bool_value;
+                            };
+                            if ((arm.has_source_arm_guard &&
+                                 guard_can_fail(arm.source_arm_guard)) ||
+                                (arm.has_arm_guard && guard_can_fail(arm.arm_guard))) {
+                                const bool guard_is_false =
+                                    (arm.has_source_arm_guard &&
+                                     arm.source_arm_guard.kind == HirExprKind::BoolLit &&
+                                     !arm.source_arm_guard.bool_value) ||
+                                    (arm.has_arm_guard &&
+                                     arm.arm_guard.kind == HirExprKind::BoolLit &&
+                                     !arm.arm_guard.bool_value);
+                                if (guard_is_false) continue;
+                                return false;
+                            }
+                            bool reaches_body = true;
+                            for (u32 gi = 0; gi < arm.guards.len; gi++) {
+                                const auto& guard = arm.guards[gi];
+                                if (guard.cond.kind == HirExprKind::BoolLit &&
+                                    guard.cond.bool_value)
+                                    continue;
+                                if (guard.cond.kind == HirExprKind::BoolLit &&
+                                    guard.fail_kind == HirGuard::FailKind::Term)
+                                    return true;
+                                reaches_body = false;
+                                if (guard.cond.kind != HirExprKind::BoolLit) return false;
+                                break;
+                            }
+                            if (!reaches_body) return false;
                             if (arm.body_kind == HirForLoopMatchArm::BodyKind::Direct)
                                 return arm.direct_branch.kind == HirForLoopBranch::Kind::Term;
                             if (arm.cond.kind == HirExprKind::BoolLit)

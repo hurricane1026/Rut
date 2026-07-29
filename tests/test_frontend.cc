@@ -39874,6 +39874,46 @@ route GET "/x" { let ignored = rewrite() return 204 }
     rir.destroy();
 }
 
+TEST(frontend, guarded_literal_match_does_not_prove_loop_termination) {
+    const char* src =
+        "route GET \"/x\" { for item in [1] { match true { true if false => return 201 "
+        "_ => break } } }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE_FALSE(hir.has_value());
+}
+
+TEST(frontend, terminating_false_match_prelude_proves_loop_termination) {
+    const char* src =
+        "route GET \"/x\" { for item in [1] { match true { true => { guard false else { "
+        "return 400 } break } _ => return 201 } } }\n";
+    FrontendRirModule rir{};
+    REQUIRE(lower_src_to_rir(src, rir));
+    rir.destroy();
+}
+
+TEST(frontend, guarded_sibling_loop_preserves_later_parent_iterations) {
+    const char* src =
+        "route GET \"/x\" { for outer in [0, 1] { for first in [1] { continue } "
+        "for second in [1] { match true { true if outer > 0 => return 201 _ => break } } } "
+        "return 500 }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    bool found_201 = false;
+    for (u32 bi = 0; bi < mir->functions[0].blocks.len; bi++)
+        if (mir->functions[0].blocks[bi].term.status_code == 201u) found_201 = true;
+    CHECK(found_201);
+}
+
 int main(int argc, char** argv) {
     return rut::test::run_all(argc, argv);
 }
