@@ -94,9 +94,15 @@ limit_body
 handler
 ```
 
-Implemented `after` lowering follows the same visible source order. It is not a
-reverse wrapper unwind, so review, replay, and generated code do not need an
-extra execution model.
+Chains have two fixed handler phases. Every `before` declaration runs in source
+order before the handler. For a selected handler's normal response, every
+`after` declaration runs in source order after the handler. Top-level handler
+guard failures and pre-handler short circuits return directly without entering
+the post-handler phase; verifier-bounded static-loop exits are part of the
+selected handler response and do receive the `after` effects. Interleaving
+`after` and `before` declarations does not create a global interleaved order.
+The post-handler phase is not a reverse wrapper unwind, so review, replay, and
+generated code do not need an extra execution model.
 
 ## Core Restrictions
 
@@ -114,7 +120,8 @@ Rut Core should keep chains intentionally narrow:
   surface: `respond` short-circuits, `return` passes through.
 - `after` is limited to ordered Response header/status/bounded-body effects;
   streaming forwards are rejected because their bytes may already be on wire.
-- Chain order is source order only; there is no priority or phase dispatch.
+- Chain order is source order within each of the fixed pre-handler (`before`)
+  and post-handler (`after`) phases; there is no priority dispatch.
 - A route entry should attach at most one entry chain.
 - Chains are statically expanded before route verification.
 - Chain functions must not hide new suspension points. Any operation that can
