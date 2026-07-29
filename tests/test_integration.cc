@@ -2714,7 +2714,7 @@ TEST(active_health, policy_changes_isolate_retained_generation_verdicts) {
         new_allocation, 3, &new_config.upstreams[0], 0, new_incarnation));
 }
 
-TEST(active_health, policy_health_is_eagerly_migrated_and_active_down_drops_when_disabled) {
+TEST(active_health, policy_health_preserves_passive_ejection_when_active_checks_are_disabled) {
     ControlPlaneMutationPort port;
     RouteConfig first_config;
     REQUIRE(first_config.add_upstream("policy-chain", 0x7f000001u, 8016).has_value());
@@ -2765,12 +2765,49 @@ TEST(active_health, policy_health_is_eagerly_migrated_and_active_down_drops_when
     activate(64, &disabled_config);
     const u16 disabled_allocation = port.endpoint_allocation_for_config(&disabled_config, 0, 0);
     const u64 disabled_incarnation = port.endpoint_incarnation_for_config(&disabled_config, 0, 0);
-    CHECK_FALSE(backend_ejected_allocation(
+    CHECK(backend_ejected_allocation(
         disabled_allocation, 2, &disabled_config.upstreams[0], 0, disabled_incarnation));
     record_backend_result_allocation(
         disabled_allocation, false, 5, &disabled_config.upstreams[0], 0, disabled_incarnation);
-    CHECK_FALSE(backend_ejected_allocation(
+    CHECK(backend_ejected_allocation(
         disabled_allocation, 5, &disabled_config.upstreams[0], 0, disabled_incarnation));
+    CHECK_FALSE(backend_ejected_allocation(disabled_allocation,
+                                           4 + kBackendEjectCooldownUs + 1,
+                                           &disabled_config.upstreams[0],
+                                           0,
+                                           disabled_incarnation));
+}
+
+TEST(active_health, disabling_active_checks_clears_active_only_failure_state) {
+    ControlPlaneMutationPort port;
+    RouteConfig enabled_config;
+    REQUIRE(enabled_config.add_upstream("active-only", 0x7f000001u, 8022).has_value());
+    REQUIRE(enabled_config.set_upstream_health_check(0, "/health", 7, 1000, 200));
+    port.reset(65, true, &enabled_config);
+    const u16 enabled_allocation = port.endpoint_allocation_for_config(&enabled_config, 0, 0);
+    const u64 enabled_incarnation = port.endpoint_incarnation_for_config(&enabled_config, 0, 0);
+    record_active_probe_result_allocation(
+        enabled_allocation, false, 1, &enabled_config.upstreams[0], 0, enabled_incarnation);
+    CHECK(backend_ejected_allocation(
+        enabled_allocation, 1, &enabled_config.upstreams[0], 0, enabled_incarnation));
+
+    u64 id = 0;
+    REQUIRE(port.request_reload(ReloadRequestSource::Route, &id));
+    ReloadRequest request{};
+    REQUIRE(port.take_reload(&request));
+    RouteConfig disabled_config;
+    REQUIRE(disabled_config.add_upstream("active-only", 0x7f000001u, 8022).has_value());
+    REQUIRE(port.complete_reload(
+        id, request.source, ReloadTerminalOutcome::Activated, 66, &disabled_config));
+    materialize_control_plane_health(&port, &disabled_config);
+    const u16 disabled_allocation = port.endpoint_allocation_for_config(&disabled_config, 0, 0);
+    const u64 disabled_incarnation = port.endpoint_incarnation_for_config(&disabled_config, 0, 0);
+    CHECK_FALSE(backend_ejected_allocation(
+        disabled_allocation, 2, &disabled_config.upstreams[0], 0, disabled_incarnation));
+    record_backend_result_allocation(
+        disabled_allocation, false, 3, &disabled_config.upstreams[0], 0, disabled_incarnation);
+    CHECK_FALSE(backend_ejected_allocation(
+        disabled_allocation, 3, &disabled_config.upstreams[0], 0, disabled_incarnation));
 }
 
 TEST(active_health, late_retained_failure_propagates_until_successor_observes) {
@@ -15097,6 +15134,44 @@ TEST(route, compatible_reload_preserves_round_robin_cursor) {
     REQUIRE(mutation.complete_reload(
         id, request.source, ReloadTerminalOutcome::Activated, 72, &new_config));
     CHECK_EQ(select_backend_with_control_plane(&loop, 0, 2, 1'000'000, &new_config), 1u);
+}
+
+TEST(route, recycled_upstream_allocation_resets_round_robin_cursor) {
+    ControlPlaneMutationPort mutation;
+    RouteConfig first_config;
+    REQUIRE(first_config.add_upstream("cursor-recycle", 0x7f000001u, 8182).has_value());
+    REQUIRE(first_config.add_upstream_backend(0, 0x7f000001u, 8183));
+    REQUIRE(first_config.add_upstream_backend(0, 0x7f000001u, 8184));
+    mutation.reset(73, true, &first_config);
+    struct SelectionLoop {
+        ControlPlaneMutationPort* control_plane_mutation;
+    } loop{&mutation};
+    const u16 first_allocation = mutation.upstream_allocation_for_config(&first_config, 0);
+    const u64 first_incarnation = mutation.upstream_incarnation_for_config(&first_config, 0);
+    CHECK_EQ(select_backend_with_control_plane(&loop, 0, 3, 1'000'000, &first_config), 0u);
+    CHECK_EQ(select_backend_with_control_plane(&loop, 0, 3, 1'000'000, &first_config), 1u);
+
+    auto activate = [&](u64 generation, RouteConfig* config) {
+        u64 id = 0;
+        REQUIRE(mutation.request_reload(ReloadRequestSource::Route, &id));
+        ReloadRequest request{};
+        REQUIRE(mutation.take_reload(&request));
+        REQUIRE(mutation.complete_reload(
+            id, request.source, ReloadTerminalOutcome::Activated, generation, config));
+        REQUIRE(mutation.finish_activation(id));
+    };
+    RouteConfig intervening_config;
+    REQUIRE(intervening_config.add_upstream("cursor-other", 0x7f000001u, 8185).has_value());
+    activate(74, &intervening_config);
+
+    RouteConfig recycled_config;
+    REQUIRE(recycled_config.add_upstream("cursor-recycle", 0x7f000001u, 8182).has_value());
+    REQUIRE(recycled_config.add_upstream_backend(0, 0x7f000001u, 8183));
+    REQUIRE(recycled_config.add_upstream_backend(0, 0x7f000001u, 8184));
+    activate(75, &recycled_config);
+    CHECK_EQ(mutation.upstream_allocation_for_config(&recycled_config, 0), first_allocation);
+    CHECK_NE(mutation.upstream_incarnation_for_config(&recycled_config, 0), first_incarnation);
+    CHECK_EQ(select_backend_with_control_plane(&loop, 0, 3, 1'000'000, &recycled_config), 0u);
 }
 
 TEST(route, manual_health_override_fails_closed_when_every_backend_is_excluded) {

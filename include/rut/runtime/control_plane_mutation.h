@@ -969,6 +969,16 @@ public:
         return kInvalidAllocation;
     }
 
+    [[nodiscard]] u64 upstream_incarnation_for_config(const RouteConfig* config,
+                                                      u16 upstream_id) const {
+        if (config == nullptr || upstream_id >= RouteConfig::kMaxUpstreams) return 0;
+        for (u32 bank = 0; bank < 2; bank++)
+            if (bank_config_[bank].load(std::memory_order_acquire) == config &&
+                upstream_id < upstream_count_[bank].load(std::memory_order_acquire))
+                return upstream_incarnation_[bank][upstream_id].load(std::memory_order_acquire);
+        return 0;
+    }
+
     [[nodiscard]] u16 endpoint_allocation_for_config(const RouteConfig* config,
                                                      u16 upstream_id,
                                                      u32 backend_id) const {
@@ -1331,6 +1341,7 @@ private:
         for (u32 upstream = 0; upstream < RouteConfig::kMaxUpstreams; upstream++) {
             upstream_allocation_[bank][upstream].store(kInvalidAllocation,
                                                        std::memory_order_relaxed);
+            upstream_incarnation_[bank][upstream].store(0, std::memory_order_relaxed);
             membership_[bank][upstream] = {};
             backend_count_[bank][upstream].store(0, std::memory_order_relaxed);
             for (auto& backend : overrides_[bank][upstream])
@@ -1386,11 +1397,20 @@ private:
         return incarnation;
     }
 
+    [[nodiscard]] static u64 allocate_upstream_incarnation() {
+        u64 incarnation = next_upstream_incarnation_.fetch_add(1, std::memory_order_relaxed);
+        if (incarnation == 0)
+            incarnation = next_upstream_incarnation_.fetch_add(1, std::memory_order_relaxed);
+        return incarnation;
+    }
+
     void initialize_allocations(u32 bank) {
         const u32 upstreams = upstream_count_[bank].load(std::memory_order_relaxed);
         for (u32 upstream = 0; upstream < upstreams; upstream++) {
             upstream_allocation_[bank][upstream].store(static_cast<u16>(upstream),
                                                        std::memory_order_relaxed);
+            upstream_incarnation_[bank][upstream].store(allocate_upstream_incarnation(),
+                                                        std::memory_order_relaxed);
             const u32 backends = backend_count_[bank][upstream].load(std::memory_order_relaxed);
             for (u32 backend = 0; backend < backends; backend++) {
                 endpoint_allocation_[bank][upstream][backend].store(
@@ -1580,11 +1600,16 @@ private:
                 upstream_allocation_[new_bank][upstream].store(
                     upstream_allocation_[old_bank][old_upstream].load(std::memory_order_relaxed),
                     std::memory_order_relaxed);
+                upstream_incarnation_[new_bank][upstream].store(
+                    upstream_incarnation_[old_bank][old_upstream].load(std::memory_order_relaxed),
+                    std::memory_order_relaxed);
             } else {
                 while (next_upstream < kMaxUpstreamAllocations && used_upstream[next_upstream])
                     next_upstream++;
                 upstream_allocation_[new_bank][upstream].store(next_upstream,
                                                                std::memory_order_relaxed);
+                upstream_incarnation_[new_bank][upstream].store(allocate_upstream_incarnation(),
+                                                                std::memory_order_relaxed);
                 if (next_upstream < kMaxUpstreamAllocations) used_upstream[next_upstream++] = true;
             }
             if (old_upstream == old_upstreams) {
@@ -2450,6 +2475,7 @@ private:
     std::atomic<u8> upstream_count_[2]{};
     std::atomic<u8> backend_count_[2][RouteConfig::kMaxUpstreams]{};
     std::atomic<u16> upstream_allocation_[2][RouteConfig::kMaxUpstreams]{};
+    std::atomic<u64> upstream_incarnation_[2][RouteConfig::kMaxUpstreams]{};
     std::atomic<u16> endpoint_allocation_[2][RouteConfig::kMaxUpstreams]
                                          [UpstreamTarget::kMaxBackends]{};
     std::atomic<u16> endpoint_probe_allocation_[2][RouteConfig::kMaxUpstreams]
@@ -2475,6 +2501,7 @@ private:
     std::atomic<u64> override_seq_[2]{};
     std::atomic<u64> override_version_[2]{};
     inline static std::atomic<u64> next_endpoint_incarnation_{1};
+    inline static std::atomic<u64> next_upstream_incarnation_{1};
 
     std::atomic<u64> published_record_{0};
     std::atomic<u64> record_seq_[kRecordSlotCount]{};

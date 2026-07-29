@@ -84,6 +84,7 @@ struct AllocationBackendHealth {
     u64 seed_incarnation = 0;
     bool owner_set = false;
     bool transitioning = false;
+    bool inherit_active = false;
     BackendHealth health{};
 };
 
@@ -107,12 +108,11 @@ inline BackendHealth* backend_health_allocation(
             cell.family != endpoint.sin_family) {
             BackendHealth seed{};
             const bool can_seed =
-                target->hc_enabled &&
                 seed_allocation < ControlPlaneMutationPort::kMaxEndpointAllocations;
             if (can_seed) {
                 const auto& source = health[seed_allocation];
                 if (source.owner_set && source.incarnation == seed_incarnation) {
-                    seed.active_down = source.health.active_down;
+                    if (target->hc_enabled) seed.active_down = source.health.active_down;
                     seed.fails = source.health.fails;
                     seed.eject_until_us = source.health.eject_until_us;
                 }
@@ -127,6 +127,7 @@ inline BackendHealth* backend_health_allocation(
             cell.seed_incarnation = can_seed ? seed_incarnation : 0;
             cell.owner_set = true;
             cell.transitioning = can_seed;
+            cell.inherit_active = target->hc_enabled;
             cell.health = seed;
         }
     }
@@ -138,7 +139,7 @@ inline BackendHealth* backend_health_allocation(
         auto& source = health[destination.seed_allocation];
         if (!source.owner_set || source.incarnation != destination.seed_incarnation) return;
         self(self, source, depth + 1);
-        destination.health.active_down |= source.health.active_down;
+        if (destination.inherit_active) destination.health.active_down |= source.health.active_down;
         if (destination.health.fails < source.health.fails)
             destination.health.fails = source.health.fails;
         if (destination.health.eject_until_us < source.health.eject_until_us)
@@ -224,8 +225,8 @@ inline void record_backend_result_allocation(
 // > kBackendEjectCooldownUs, the passive cooldown would lapse between probes and
 // select_backend would resume routing to a still-dead backend. On success the
 // backend is fully healthy again: clear active_down AND the passive fail/eject
-// record. (`fails` is still bumped on failure for observability; active_down is
-// what select_backend honors.)
+// record. Active failures do not contribute to `fails`: that counter belongs
+// to the passive circuit breaker and may survive disabling active probing.
 inline void record_active_probe_result(
     u64 generation, u16 upstream_id, u32 backend_idx, bool healthy, u64 now_us) {
     (void)now_us;  // active suppression is success-gated, not time-gated
@@ -238,7 +239,6 @@ inline void record_active_probe_result(
         return;
     }
     h->active_down = true;
-    if (h->fails < 0xffff) h->fails++;
 }
 
 inline void record_active_probe_result(u16 upstream_id, u32 backend_idx, bool healthy, u64 now_us) {
@@ -265,7 +265,6 @@ inline void record_active_probe_result_allocation(
         return;
     }
     h->active_down = true;
-    if (h->fails < 0xffff) h->fails++;
 }
 
 // In-flight guard for active probes: at most one outstanding probe per
@@ -334,6 +333,7 @@ inline u32 select_backend_with_control_plane(Loop* loop,
                                              const RouteConfig* pinned_config = nullptr) {
     struct CursorCell {
         u64 selection_identity = 0;
+        u64 allocation_incarnation = 0;
         u16 cursor = 0;
     };
     static thread_local CursorCell rr_cursor[ControlPlaneMutationPort::kMaxUpstreamAllocations] =
@@ -355,9 +355,12 @@ inline u32 select_backend_with_control_plane(Loop* loop,
                 allocation_config = *loop->config_ptr;
     }
     u16 cursor_allocation = upstream_id;
+    u64 cursor_incarnation = 0;
     if (mutation != nullptr) {
         const u16 stable = mutation->upstream_allocation_for_config(allocation_config, upstream_id);
         if (stable < ControlPlaneMutationPort::kMaxUpstreamAllocations) cursor_allocation = stable;
+        cursor_incarnation =
+            mutation->upstream_incarnation_for_config(allocation_config, upstream_id);
     }
     u64 selection_identity = 0xCBF29CE484222325ull;
     if (allocation_config != nullptr && upstream_id < allocation_config->upstream_count) {
@@ -381,8 +384,10 @@ inline u32 select_backend_with_control_plane(Loop* loop,
     }
     if (selection_identity == 0) selection_identity = 1;
     auto& cell = rr_cursor[cursor_allocation];
-    if (cell.selection_identity != selection_identity) {
+    if (cell.selection_identity != selection_identity ||
+        cell.allocation_incarnation != cursor_incarnation) {
         cell.selection_identity = selection_identity;
+        cell.allocation_incarnation = cursor_incarnation;
         cell.cursor = 0;
     }
     ManualHealthOverride manual[UpstreamTarget::kMaxBackends]{};
