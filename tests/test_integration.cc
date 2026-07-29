@@ -2729,6 +2729,23 @@ TEST(active_health, recycled_allocation_clears_unrelated_endpoint_verdict) {
                                      recycled_incarnation);
     CHECK_FALSE(backend_ejected_allocation(
         recycled, 3, &third_config.upstreams[0], 0, recycled_incarnation));
+
+    record_active_probe_result_allocation(recycled,
+                                          /*healthy=*/false,
+                                          5,
+                                          &third_config.upstreams[0],
+                                          0,
+                                          recycled_incarnation);
+    ControlPlaneMutationPort restarted_port;
+    restarted_port.reset(53, true, &third_config);
+    const u16 restarted_allocation =
+        restarted_port.endpoint_allocation_for_config(&third_config, 0, 0);
+    const u64 restarted_incarnation =
+        restarted_port.endpoint_incarnation_for_config(&third_config, 0, 0);
+    CHECK_EQ(restarted_allocation, recycled);
+    CHECK_NE(restarted_incarnation, recycled_incarnation);
+    CHECK_FALSE(backend_ejected_allocation(
+        restarted_allocation, 5, &third_config.upstreams[0], 0, restarted_incarnation));
 }
 
 TEST(active_health, stalled_probe_reaped_then_reprobed) {

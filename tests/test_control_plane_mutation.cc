@@ -1052,6 +1052,8 @@ TEST(control_plane_mutation, activation_carries_overrides_across_probe_policy_ch
     old_config.upstreams[1].hc_interval_ms = 1000;
     old_config.upstreams[1].hc_expected_status = 204;
     port.reset(3, true, &old_config);
+    const u16 old_allocation = port.endpoint_allocation_for_config(&old_config, 1, 0);
+    const u64 old_incarnation = port.endpoint_incarnation_for_config(&old_config, 1, 0);
     REQUIRE(port.mark({3, 0, 0}, false));
     REQUIRE(port.mark({3, 1, 0}, true));
 
@@ -1071,6 +1073,8 @@ TEST(control_plane_mutation, activation_carries_overrides_across_probe_policy_ch
     CHECK_EQ(port.manual_health({4, 0, 0}), ManualHealthOverride::Unhealthy);
     CHECK_EQ(port.manual_health({4, 0, 1}), ManualHealthOverride::None);
     CHECK_EQ(port.manual_health({4, 1, 0}), ManualHealthOverride::Healthy);
+    CHECK_EQ(port.endpoint_allocation_for_config(&new_config, 1, 0), old_allocation);
+    CHECK_NE(port.endpoint_incarnation_for_config(&new_config, 1, 0), old_incarnation);
     u64 version = 0;
     CHECK_EQ(port.manual_health({4, 0, 0}, &version), ManualHealthOverride::Unhealthy);
     CHECK_EQ(version, 1u);
@@ -1168,6 +1172,10 @@ TEST(control_plane_mutation, activation_matches_duplicate_endpoints_one_to_one) 
 
     CHECK_EQ(port.manual_health({4, 0, 0}), ManualHealthOverride::Unhealthy);
     CHECK_EQ(port.manual_health({4, 0, 1}), ManualHealthOverride::Healthy);
+    REQUIRE(port.mark({3, 0, 0}, true));
+    REQUIRE(port.mark({3, 0, 1}, false));
+    CHECK_EQ(port.manual_health({4, 0, 0}), ManualHealthOverride::Healthy);
+    CHECK_EQ(port.manual_health({4, 0, 1}), ManualHealthOverride::Unhealthy);
 }
 
 TEST(control_plane_mutation, activation_matches_duplicate_upstreams_one_to_one) {
@@ -1191,6 +1199,10 @@ TEST(control_plane_mutation, activation_matches_duplicate_upstreams_one_to_one) 
 
     CHECK_EQ(port.manual_health({4, 0, 0}), ManualHealthOverride::Healthy);
     CHECK_EQ(port.manual_health({4, 1, 0}), ManualHealthOverride::Unhealthy);
+    REQUIRE(port.mark({3, 0, 0}, true));
+    REQUIRE(port.mark({3, 1, 0}, false));
+    CHECK_EQ(port.manual_health({4, 0, 0}), ManualHealthOverride::Unhealthy);
+    CHECK_EQ(port.manual_health({4, 1, 0}), ManualHealthOverride::Healthy);
 }
 
 TEST(control_plane_mutation, activation_globally_matches_overlapping_duplicate_upstreams) {

@@ -100,7 +100,7 @@ public:
             bank_config_[bank].store(nullptr, std::memory_order_relaxed);
         }
         configure_membership(0, config);
-        initialize_allocations(0, generation);
+        initialize_allocations(0);
         bank_config_[0].store(config, std::memory_order_relaxed);
         bank_generation_[0].store(generation, std::memory_order_relaxed);
         active_generation_.store(generation, std::memory_order_relaxed);
@@ -1326,7 +1326,14 @@ private:
         upstream_count_[bank].store(static_cast<u8>(count), std::memory_order_release);
     }
 
-    void initialize_allocations(u32 bank, u64 generation) {
+    [[nodiscard]] static u64 allocate_endpoint_incarnation() {
+        u64 incarnation = next_endpoint_incarnation_.fetch_add(1, std::memory_order_relaxed);
+        if (incarnation == 0)
+            incarnation = next_endpoint_incarnation_.fetch_add(1, std::memory_order_relaxed);
+        return incarnation;
+    }
+
+    void initialize_allocations(u32 bank) {
         const u32 upstreams = upstream_count_[bank].load(std::memory_order_relaxed);
         for (u32 upstream = 0; upstream < upstreams; upstream++) {
             upstream_allocation_[bank][upstream].store(static_cast<u16>(upstream),
@@ -1336,8 +1343,8 @@ private:
                 endpoint_allocation_[bank][upstream][backend].store(
                     static_cast<u16>(upstream * UpstreamTarget::kMaxBackends + backend),
                     std::memory_order_relaxed);
-                endpoint_incarnation_[bank][upstream][backend].store(generation,
-                                                                     std::memory_order_relaxed);
+                endpoint_incarnation_[bank][upstream][backend].store(
+                    allocate_endpoint_incarnation(), std::memory_order_relaxed);
             }
         }
     }
@@ -1358,6 +1365,17 @@ private:
                old_endpoint.sin_port == new_endpoint.sin_port;
     }
 
+    [[nodiscard]] static bool compatible_health_policy(const UpstreamTarget& old_target,
+                                                       const UpstreamTarget& new_target) {
+        if (old_target.hc_enabled != new_target.hc_enabled) return false;
+        if (!old_target.hc_enabled) return true;
+        return old_target.hc_path_len == new_target.hc_path_len &&
+               old_target.hc_interval_ms == new_target.hc_interval_ms &&
+               old_target.hc_expected_status == new_target.hc_expected_status &&
+               __builtin_memcmp(old_target.hc_path, new_target.hc_path, old_target.hc_path_len) ==
+                   0;
+    }
+
     [[nodiscard]] bool compatible_override_peer(
         u32 bank, u16 upstream, u16 backend, u32* peer_upstream, u32* peer_backend) const {
         if (peer_upstream == nullptr || peer_backend == nullptr || bank >= 2 ||
@@ -1365,13 +1383,21 @@ private:
             return false;
         const u32 peer_bank = bank ^ 1u;
         if (bank_generation_[peer_bank].load(std::memory_order_acquire) == 0) return false;
-        const auto& target = membership_[bank][upstream];
+        const u16 upstream_identity =
+            upstream_allocation_[bank][upstream].load(std::memory_order_relaxed);
+        const u16 endpoint_identity =
+            endpoint_allocation_[bank][upstream][backend].load(std::memory_order_relaxed);
         const u32 peer_count = upstream_count_[peer_bank].load(std::memory_order_acquire);
         for (u32 candidate = 0; candidate < peer_count; candidate++) {
-            const auto& peer = membership_[peer_bank][candidate];
-            if (!compatible_target(target, peer)) continue;
-            for (u32 endpoint = 0; endpoint < peer.addr_count; endpoint++) {
-                if (!same_endpoint(target.addrs[backend], peer.addrs[endpoint])) continue;
+            if (upstream_allocation_[peer_bank][candidate].load(std::memory_order_relaxed) !=
+                upstream_identity)
+                continue;
+            const u32 endpoints =
+                backend_count_[peer_bank][candidate].load(std::memory_order_relaxed);
+            for (u32 endpoint = 0; endpoint < endpoints; endpoint++) {
+                if (endpoint_allocation_[peer_bank][candidate][endpoint].load(
+                        std::memory_order_relaxed) != endpoint_identity)
+                    continue;
                 *peer_upstream = candidate;
                 *peer_backend = endpoint;
                 return true;
@@ -1517,7 +1543,7 @@ private:
                     endpoint_allocation_[new_bank][upstream][backend].store(
                         next_endpoint, std::memory_order_relaxed);
                     endpoint_incarnation_[new_bank][upstream][backend].store(
-                        new_generation, std::memory_order_relaxed);
+                        allocate_endpoint_incarnation(), std::memory_order_relaxed);
                     if (next_endpoint < kMaxEndpointAllocations)
                         used_endpoint[next_endpoint++] = true;
                 }
@@ -1541,7 +1567,7 @@ private:
                     endpoint_allocation_[new_bank][upstream][backend].store(
                         next_endpoint, std::memory_order_relaxed);
                     endpoint_incarnation_[new_bank][upstream][backend].store(
-                        new_generation, std::memory_order_relaxed);
+                        allocate_endpoint_incarnation(), std::memory_order_relaxed);
                     if (next_endpoint < kMaxEndpointAllocations)
                         used_endpoint[next_endpoint++] = true;
                     continue;
@@ -1552,8 +1578,10 @@ private:
                         std::memory_order_relaxed),
                     std::memory_order_relaxed);
                 endpoint_incarnation_[new_bank][upstream][backend].store(
-                    endpoint_incarnation_[old_bank][old_upstream][old_backend].load(
-                        std::memory_order_relaxed),
+                    compatible_health_policy(old_target, new_target)
+                        ? endpoint_incarnation_[old_bank][old_upstream][old_backend].load(
+                              std::memory_order_relaxed)
+                        : allocate_endpoint_incarnation(),
                     std::memory_order_relaxed);
                 const u64 old_value =
                     committed_override(old_bank, old_upstream, old_backend, nullptr);
@@ -2349,6 +2377,7 @@ private:
                                                     [UpstreamTarget::kMaxBackends]{};
     std::atomic<u64> override_seq_[2]{};
     std::atomic<u64> override_version_[2]{};
+    inline static std::atomic<u64> next_endpoint_incarnation_{1};
 
     std::atomic<u64> published_record_{0};
     std::atomic<u64> record_seq_[kRecordSlotCount]{};
