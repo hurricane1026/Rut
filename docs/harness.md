@@ -149,6 +149,13 @@ ControlPlaneMutation
 The runner validates required capabilities before starting. No driver should
 discover halfway through a run that its environment cannot model an operation.
 
+`ControlPlaneMutation` scenarios provide an explicit
+`ScenarioSpec::control_plane_mutation` fixture. The production event loops and
+the scenario driver inject the same allocation-free port into `HandlerCtx`, and
+the pointer remains stable across resumes. Missing or undeclared fixtures are
+invalid runs. Handler-layer coverage may exercise admission and manual-health
+atomics; activation still requires the `Process` layer.
+
 `stats()`/`metrics()` scenarios use the `ControlPlaneSnapshot` capability and
 must supply `ScenarioSpec::control_plane_snapshot`. The fixture is a bounded,
 pointer-free value copied into `HandlerCtx` before the first invocation. It is

@@ -1535,6 +1535,7 @@ struct FakeH2Loop {
     bool yield_scheduled = false;
     u32 yield_ms = 0;
     ShardMetrics* metrics = nullptr;
+    ControlPlaneMutationPort* control_plane_mutation = nullptr;
 
     void epoch_enter() {}
     void epoch_leave() {}
@@ -1571,9 +1572,11 @@ u64 h2_buffered_forward(void*, jit::HandlerCtx*, const u8*, u32, void*) {
 }
 
 bool h2_preinvoke_saw_control_plane_snapshot = false;
+bool h2_preinvoke_saw_control_plane_mutation = false;
 u64 h2_snapshot_then_buffered_forward(void*, jit::HandlerCtx* ctx, const u8*, u32, void*) {
     h2_preinvoke_saw_control_plane_snapshot =
         ctx->control_plane != nullptr && ctx->control_plane->valid;
+    h2_preinvoke_saw_control_plane_mutation = ctx->control_plane_mutation != nullptr;
     return jit::HandlerResult::make_buffered_forward(0).pack();
 }
 
@@ -1694,12 +1697,17 @@ TEST(h2_serving, buffered_forward_preinvoke_latches_control_plane_snapshot) {
     ShardMetrics metrics;
     FakeH2Loop loop;
     loop.metrics = &metrics;
+    ControlPlaneMutationPort mutation;
+    mutation.reset(9, true, &config);
+    loop.control_plane_mutation = &mutation;
     u8 response[512]{};
     H2Dispatch<FakeH2Loop> dispatch{&loop, &conn, response, sizeof(response), 0, false};
 
     h2_preinvoke_saw_control_plane_snapshot = false;
+    h2_preinvoke_saw_control_plane_mutation = false;
     h2_dispatch_request(dispatch, 1, headers, 4, /*end_stream=*/false);
     CHECK(h2_preinvoke_saw_control_plane_snapshot);
+    CHECK(h2_preinvoke_saw_control_plane_mutation);
     CHECK_EQ(h2.pending_stream, 1u);
     h2_clear_pending(h2);
 }

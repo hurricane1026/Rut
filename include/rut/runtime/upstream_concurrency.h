@@ -18,7 +18,9 @@
 namespace rut {
 
 struct UpstreamConcurrency {
-    static constexpr u32 kMaxUpstreams = 64;  // matches RouteConfig::kMaxUpstreams
+    // Two adjacent generations can retain disjoint stable upstream
+    // allocations while compatible upstreams share one allocation.
+    static constexpr u32 kMaxUpstreams = 128;
     std::atomic<u32> inflight[kMaxUpstreams];
 
     void reset() {

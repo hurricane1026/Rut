@@ -328,6 +328,17 @@ ScenarioResult drive_scenario(const ScenarioSpec& scenario, const HarnessSpec& h
         copy_detail(out.harness, "control-plane snapshot fixture is invalid");
         return out;
     }
+    const bool declares_control_plane_mutation =
+        declared(harness.required_capabilities, Capability::ControlPlaneMutation);
+    if (declares_control_plane_mutation != (scenario.control_plane_mutation != nullptr)) {
+        out.harness.outcome = Outcome::Invalid;
+        out.harness.cleanup = CleanupOutcome::Clean;
+        copy_detail(out.harness,
+                    declares_control_plane_mutation
+                        ? "control-plane mutation fixture is missing"
+                        : "control-plane mutation capability was not declared");
+        return out;
+    }
     if (scenario.target == nullptr || !scenario.target->prepared) {
         out.harness.outcome = Outcome::Invalid;
         out.harness.cleanup = CleanupOutcome::Clean;
@@ -470,11 +481,21 @@ ScenarioResult drive_scenario(const ScenarioSpec& scenario, const HarnessSpec& h
         connection.destroy();
         return out;
     }
-    if (state->prepare(scenario.state_isolation,
-                       scenario.state_group,
-                       scenario.target,
-                       scenario.target->generation))
+    const bool reset_state = state->prepare(scenario.state_isolation,
+                                            scenario.state_group,
+                                            scenario.target,
+                                            scenario.target->generation,
+                                            scenario.control_plane_mutation);
+    if (reset_state) {
         out.harness.state_resets++;
+        if (scenario.control_plane_mutation != nullptr) {
+            const u64 generation = scenario.control_plane_mutation->active_generation();
+            const bool route_reload_enabled =
+                scenario.control_plane_mutation->route_reload_enabled();
+            scenario.control_plane_mutation->reset_preserving_membership(generation,
+                                                                         route_reload_enabled);
+        }
+    }
     CacheLocalState* previous_cache_state = rut_helper_cache_select_local_state(state->cache_state);
     const u32 previous_cache_shard = rut_helper_cache_select_local_shard(scenario.shard_id);
     struct CacheStateRestore {
@@ -567,6 +588,7 @@ ScenarioResult drive_scenario(const ScenarioSpec& scenario, const HarnessSpec& h
             }
             *snapshot = *scenario.control_plane_snapshot;
         }
+        execution.frame.context.control_plane_mutation = scenario.control_plane_mutation;
         execution.frame.context.route_param_count = route_param_count;
         for (u32 i = 0; i < route_param_count; i++)
             execution.frame.context.route_params[i] = route_params[i];

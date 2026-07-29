@@ -2371,6 +2371,74 @@ TEST(upstream_concurrency_e2e, slot_released_on_upstream_failure) {
     destroy_real_loop(loop);
 }
 
+static u64 wait_upstream_zero_connect_handler(void* /*conn*/,
+                                              rut::jit::HandlerCtx* /*ctx*/,
+                                              const u8* /*req*/,
+                                              u32 /*len*/,
+                                              void* /*arena*/) {
+    return rut::jit::HandlerResult::make_yield_payload(1, rut::jit::YieldKind::UpstreamConnect, 1)
+        .pack();
+}
+
+TEST(route, no_eligible_backend_returns_bodyless_head_503_and_jit_wait_503) {
+    using namespace rut;
+    RouteConfig cfg{};
+    auto id = cfg.add_upstream("excluded", 0x7F000001, 1);
+    REQUIRE(id.has_value());
+    REQUIRE(cfg.add_proxy("/direct", 0, id.value()));
+    REQUIRE(cfg.add_jit_handler("/jit", 'G', &wait_upstream_zero_connect_handler));
+    const RouteConfig* active = &cfg;
+
+    ControlPlaneMutationPort mutation;
+    mutation.reset(41, true, &cfg);
+    REQUIRE(mutation.mark({41, static_cast<u16>(id.value()), 0}, false));
+
+    RealLoop* loop = create_real_loop();
+    REQUIRE(loop != nullptr);
+    auto lfd = create_listen_socket(0);
+    REQUIRE(lfd.has_value());
+    const i32 listen_fd = lfd.value();
+    const u16 port = get_port(listen_fd);
+    REQUIRE(loop->init(0, listen_fd).has_value());
+    loop->config_ptr = &active;
+    loop->control_plane_mutation = &mutation;
+    LoopThread lt = {loop, {}, 5000};
+    lt.start();
+
+    char buf[1024];
+    i32 client = connect_to(port);
+    REQUIRE(client >= 0);
+    static const char kHead[] = "HEAD /direct HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n";
+    REQUIRE(send_all(client, kHead, sizeof(kHead) - 1));
+    const i32 head_len = recv_timeout(client, buf, sizeof(buf), 2000);
+    REQUIRE_GT(head_len, 0);
+    CHECK(buf_contains(buf, static_cast<u32>(head_len), "503", 3));
+    i32 header_end = -1;
+    for (i32 i = 0; i + 3 < head_len; i++) {
+        if (buf[i] == '\r' && buf[i + 1] == '\n' && buf[i + 2] == '\r' && buf[i + 3] == '\n') {
+            header_end = i + 4;
+            break;
+        }
+    }
+    REQUIRE_GT(header_end, 0);
+    CHECK_EQ(head_len, header_end);
+    close(client);
+
+    client = connect_to(port);
+    REQUIRE(client >= 0);
+    static const char kJit[] = "GET /jit HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n";
+    REQUIRE(send_all(client, kJit, sizeof(kJit) - 1));
+    const i32 jit_len = recv_timeout(client, buf, sizeof(buf), 2000);
+    REQUIRE_GT(jit_len, 0);
+    CHECK(buf_contains(buf, static_cast<u32>(jit_len), "503", 3));
+    close(client);
+
+    lt.stop();
+    loop->shutdown();
+    close(listen_fd);
+    destroy_real_loop(loop);
+}
+
 // A tiny backend whose HTTP status for the health path is switchable at runtime
 // (atomic), so one server can model a failing-then-recovering backend. Each probe
 // uses Connection: close, so every probe is a fresh accepted connection.
@@ -2543,6 +2611,417 @@ TEST(active_health, failed_probe_keeps_backend_down_until_success) {
 // reap it as a health FAILURE, clear probe_in_flight, and free the slot, so the
 // next sweep re-probes. Driven deterministically: we issue the probe but never
 // pump its I/O (it stays parked), then advance the wheel by hand.
+TEST(active_health, probe_guard_follows_stable_endpoint_across_reload) {
+    ControlPlaneMutationPort port;
+    RouteConfig old_config;
+    REQUIRE(old_config.add_upstream("users", 0x7f000001u, 8000).has_value());
+    port.reset(3, true, &old_config);
+    const u16 old_allocation = port.endpoint_allocation_for_config(&old_config, 0, 0);
+    REQUIRE_NE(old_allocation, ControlPlaneMutationPort::kInvalidAllocation);
+    set_probe_in_flight_allocation(old_allocation, true);
+
+    u64 id = 0;
+    REQUIRE(port.request_reload(ReloadRequestSource::Route, &id));
+    ReloadRequest request{};
+    REQUIRE(port.take_reload(&request));
+    RouteConfig new_config;
+    REQUIRE(new_config.add_upstream("replacement", 0x7f000001u, 8000).has_value());
+    REQUIRE(new_config.add_upstream("users", 0x7f000001u, 8000).has_value());
+    REQUIRE(
+        port.complete_reload(id, request.source, ReloadTerminalOutcome::Activated, 4, &new_config));
+
+    CHECK_FALSE(probe_in_flight(&port, &new_config, 0, 0));
+    CHECK(probe_in_flight(&port, &new_config, 1, 0));
+    set_probe_in_flight_allocation(old_allocation, false);
+    CHECK_FALSE(probe_in_flight(&port, &new_config, 1, 0));
+}
+
+TEST(active_health, verdict_follows_stable_endpoint_across_reload) {
+    ControlPlaneMutationPort port;
+    RouteConfig old_config;
+    REQUIRE(old_config.add_upstream("users-health", 0x7f000001u, 8010).has_value());
+    port.reset(31, true, &old_config);
+    const u16 old_allocation = port.endpoint_allocation_for_config(&old_config, 0, 0);
+    REQUIRE_NE(old_allocation, ControlPlaneMutationPort::kInvalidAllocation);
+    record_active_probe_result_allocation(old_allocation, /*healthy=*/true, 1);
+    record_active_probe_result_allocation(old_allocation, /*healthy=*/false, 2);
+
+    u64 id = 0;
+    REQUIRE(port.request_reload(ReloadRequestSource::Route, &id));
+    ReloadRequest request{};
+    REQUIRE(port.take_reload(&request));
+    RouteConfig new_config;
+    REQUIRE(new_config.add_upstream("replacement-health", 0x7f000001u, 8010).has_value());
+    REQUIRE(new_config.add_upstream("users-health", 0x7f000001u, 8010).has_value());
+    REQUIRE(port.complete_reload(
+        id, request.source, ReloadTerminalOutcome::Activated, 32, &new_config));
+
+    const u16 replacement = port.endpoint_allocation_for_config(&new_config, 0, 0);
+    const u16 moved_users = port.endpoint_allocation_for_config(&new_config, 1, 0);
+    REQUIRE_NE(replacement, ControlPlaneMutationPort::kInvalidAllocation);
+    CHECK_EQ(moved_users, old_allocation);
+    CHECK_FALSE(backend_ejected_allocation(replacement, 2));
+    CHECK(backend_ejected_allocation(moved_users, 2));
+    record_active_probe_result_allocation(moved_users, /*healthy=*/true, 3);
+}
+
+TEST(active_health, policy_changes_isolate_retained_generation_verdicts) {
+    ControlPlaneMutationPort port;
+    RouteConfig old_config;
+    REQUIRE(old_config.add_upstream("users-health", 0x7f000001u, 8015).has_value());
+    REQUIRE(old_config.set_upstream_health_check(0, "/health", 7, 1000, 200));
+    port.reset(41, true, &old_config);
+    const u16 old_allocation = port.endpoint_allocation_for_config(&old_config, 0, 0);
+    const u64 old_incarnation = port.endpoint_incarnation_for_config(&old_config, 0, 0);
+    record_active_probe_result_allocation(
+        old_allocation, false, 1, &old_config.upstreams[0], 0, old_incarnation);
+    CHECK(backend_ejected_allocation(
+        old_allocation, 1, &old_config.upstreams[0], 0, old_incarnation));
+    const u16 probe_allocation = port.endpoint_probe_allocation_for_config(&old_config, 0, 0);
+    set_probe_in_flight_allocation(probe_allocation, true);
+
+    u64 id = 0;
+    REQUIRE(port.request_reload(ReloadRequestSource::Route, &id));
+    ReloadRequest request{};
+    REQUIRE(port.take_reload(&request));
+    RouteConfig new_config;
+    REQUIRE(new_config.add_upstream("users-health", 0x7f000001u, 8015).has_value());
+    REQUIRE(new_config.set_upstream_health_check(0, "/health", 7, 2000, 200));
+    REQUIRE(port.complete_reload(
+        id, request.source, ReloadTerminalOutcome::Activated, 42, &new_config));
+
+    const u16 new_allocation = port.endpoint_allocation_for_config(&new_config, 0, 0);
+    const u64 new_incarnation = port.endpoint_incarnation_for_config(&new_config, 0, 0);
+    CHECK_NE(new_allocation, old_allocation);
+    CHECK_NE(new_incarnation, old_incarnation);
+    CHECK_EQ(port.endpoint_probe_allocation_for_config(&new_config, 0, 0), old_allocation);
+    CHECK(probe_in_flight(&port, &new_config, 0, 0));
+    set_probe_in_flight_allocation(probe_allocation, false);
+    CHECK(backend_ejected_allocation(new_allocation,
+                                     1,
+                                     &new_config.upstreams[0],
+                                     0,
+                                     new_incarnation,
+                                     old_allocation,
+                                     old_incarnation));
+    record_active_probe_result_allocation(
+        new_allocation, false, 2, &new_config.upstreams[0], 0, new_incarnation);
+    record_active_probe_result_allocation(
+        old_allocation, true, 3, &old_config.upstreams[0], 0, old_incarnation);
+    CHECK_FALSE(backend_ejected_allocation(
+        old_allocation, 3, &old_config.upstreams[0], 0, old_incarnation));
+    CHECK(backend_ejected_allocation(
+        new_allocation, 3, &new_config.upstreams[0], 0, new_incarnation));
+}
+
+TEST(active_health, policy_health_preserves_passive_ejection_when_active_checks_are_disabled) {
+    ControlPlaneMutationPort port;
+    RouteConfig first_config;
+    REQUIRE(first_config.add_upstream("policy-chain", 0x7f000001u, 8016).has_value());
+    REQUIRE(first_config.set_upstream_health_check(0, "/health", 7, 1000, 200));
+    port.reset(61, true, &first_config);
+    const u16 first_allocation = port.endpoint_allocation_for_config(&first_config, 0, 0);
+    const u64 first_incarnation = port.endpoint_incarnation_for_config(&first_config, 0, 0);
+    record_active_probe_result_allocation(
+        first_allocation, false, 1, &first_config.upstreams[0], 0, first_incarnation);
+
+    auto activate = [&](u64 generation, RouteConfig* config) {
+        u64 id = 0;
+        REQUIRE(port.request_reload(ReloadRequestSource::Route, &id));
+        ReloadRequest request{};
+        REQUIRE(port.take_reload(&request));
+        REQUIRE(port.complete_reload(
+            id, request.source, ReloadTerminalOutcome::Activated, generation, config));
+        materialize_control_plane_health(&port, config);
+        REQUIRE(port.finish_activation(id));
+    };
+
+    RouteConfig second_config;
+    REQUIRE(second_config.add_upstream("policy-chain", 0x7f000001u, 8016).has_value());
+    REQUIRE(second_config.set_upstream_health_check(0, "/health", 7, 2000, 200));
+    activate(62, &second_config);
+
+    RouteConfig third_config;
+    REQUIRE(third_config.add_upstream("policy-chain", 0x7f000001u, 8016).has_value());
+    REQUIRE(third_config.add_upstream_backend(0, 0x7f000001u, 8018));
+    REQUIRE(third_config.set_upstream_health_check(0, "/health", 7, 3000, 200));
+    activate(63, &third_config);
+    const u16 third_allocation = port.endpoint_allocation_for_config(&third_config, 0, 0);
+    const u64 third_incarnation = port.endpoint_incarnation_for_config(&third_config, 0, 0);
+    CHECK(backend_ejected_allocation(
+        third_allocation, 2, &third_config.upstreams[0], 0, third_incarnation));
+    CHECK_NE(port.endpoint_probe_allocation_for_config(&third_config, 0, 0),
+             port.endpoint_probe_allocation_for_config(&third_config, 0, 1));
+    record_active_probe_result_allocation(
+        third_allocation, true, 3, &third_config.upstreams[0], 0, third_incarnation);
+    for (u16 failure = 0; failure < kBackendFailThreshold; failure++)
+        record_backend_result_allocation(
+            third_allocation, false, 4, &third_config.upstreams[0], 0, third_incarnation);
+    CHECK(backend_ejected_allocation(
+        third_allocation, 4, &third_config.upstreams[0], 0, third_incarnation));
+
+    RouteConfig disabled_config;
+    REQUIRE(disabled_config.add_upstream("policy-chain", 0x7f000001u, 8016).has_value());
+    activate(64, &disabled_config);
+    const u16 disabled_allocation = port.endpoint_allocation_for_config(&disabled_config, 0, 0);
+    const u64 disabled_incarnation = port.endpoint_incarnation_for_config(&disabled_config, 0, 0);
+    CHECK(backend_ejected_allocation(
+        disabled_allocation, 2, &disabled_config.upstreams[0], 0, disabled_incarnation));
+    record_backend_result_allocation(
+        disabled_allocation, false, 5, &disabled_config.upstreams[0], 0, disabled_incarnation);
+    CHECK(backend_ejected_allocation(
+        disabled_allocation, 5, &disabled_config.upstreams[0], 0, disabled_incarnation));
+    CHECK_FALSE(backend_ejected_allocation(disabled_allocation,
+                                           4 + kBackendEjectCooldownUs + 1,
+                                           &disabled_config.upstreams[0],
+                                           0,
+                                           disabled_incarnation));
+}
+
+TEST(active_health, disabling_active_checks_clears_active_only_failure_state) {
+    ControlPlaneMutationPort port;
+    RouteConfig enabled_config;
+    REQUIRE(enabled_config.add_upstream("active-only", 0x7f000001u, 8022).has_value());
+    REQUIRE(enabled_config.set_upstream_health_check(0, "/health", 7, 1000, 200));
+    port.reset(65, true, &enabled_config);
+    const u16 enabled_allocation = port.endpoint_allocation_for_config(&enabled_config, 0, 0);
+    const u64 enabled_incarnation = port.endpoint_incarnation_for_config(&enabled_config, 0, 0);
+    record_active_probe_result_allocation(
+        enabled_allocation, false, 1, &enabled_config.upstreams[0], 0, enabled_incarnation);
+    CHECK(backend_ejected_allocation(
+        enabled_allocation, 1, &enabled_config.upstreams[0], 0, enabled_incarnation));
+
+    u64 id = 0;
+    REQUIRE(port.request_reload(ReloadRequestSource::Route, &id));
+    ReloadRequest request{};
+    REQUIRE(port.take_reload(&request));
+    RouteConfig disabled_config;
+    REQUIRE(disabled_config.add_upstream("active-only", 0x7f000001u, 8022).has_value());
+    REQUIRE(port.complete_reload(
+        id, request.source, ReloadTerminalOutcome::Activated, 66, &disabled_config));
+    materialize_control_plane_health(&port, &disabled_config);
+    const u16 disabled_allocation = port.endpoint_allocation_for_config(&disabled_config, 0, 0);
+    const u64 disabled_incarnation = port.endpoint_incarnation_for_config(&disabled_config, 0, 0);
+    CHECK_FALSE(backend_ejected_allocation(
+        disabled_allocation, 2, &disabled_config.upstreams[0], 0, disabled_incarnation));
+    record_backend_result_allocation(
+        disabled_allocation, false, 3, &disabled_config.upstreams[0], 0, disabled_incarnation);
+    CHECK_FALSE(backend_ejected_allocation(
+        disabled_allocation, 3, &disabled_config.upstreams[0], 0, disabled_incarnation));
+}
+
+TEST(active_health, late_retained_failure_propagates_until_successor_observes) {
+    ControlPlaneMutationPort port;
+    RouteConfig old_config;
+    REQUIRE(old_config.add_upstream("late-health", 0x7f000001u, 8019).has_value());
+    REQUIRE(old_config.set_upstream_health_check(0, "/health", 7, 1000, 200));
+    port.reset(91, true, &old_config);
+    const u16 old_allocation = port.endpoint_allocation_for_config(&old_config, 0, 0);
+    const u64 old_incarnation = port.endpoint_incarnation_for_config(&old_config, 0, 0);
+
+    u64 id = 0;
+    REQUIRE(port.request_reload(ReloadRequestSource::Route, &id));
+    ReloadRequest request{};
+    REQUIRE(port.take_reload(&request));
+    RouteConfig new_config;
+    REQUIRE(new_config.add_upstream("late-health", 0x7f000001u, 8019).has_value());
+    REQUIRE(new_config.set_upstream_health_check(0, "/health", 7, 2000, 200));
+    REQUIRE(port.complete_reload(
+        id, request.source, ReloadTerminalOutcome::Activated, 92, &new_config));
+    materialize_control_plane_health(&port, &new_config);
+    const u16 new_allocation = port.endpoint_allocation_for_config(&new_config, 0, 0);
+    const u64 new_incarnation = port.endpoint_incarnation_for_config(&new_config, 0, 0);
+    const u16 seed_allocation = port.endpoint_health_seed_allocation_for_config(&new_config, 0, 0);
+    const u64 seed_incarnation =
+        port.endpoint_health_seed_incarnation_for_config(&new_config, 0, 0);
+    CHECK_FALSE(backend_ejected_allocation(new_allocation,
+                                           1,
+                                           &new_config.upstreams[0],
+                                           0,
+                                           new_incarnation,
+                                           seed_allocation,
+                                           seed_incarnation));
+
+    record_active_probe_result_allocation(
+        old_allocation, false, 2, &old_config.upstreams[0], 0, old_incarnation);
+    CHECK(backend_ejected_allocation(new_allocation,
+                                     2,
+                                     &new_config.upstreams[0],
+                                     0,
+                                     new_incarnation,
+                                     seed_allocation,
+                                     seed_incarnation));
+
+    record_active_probe_result_allocation(new_allocation,
+                                          true,
+                                          3,
+                                          &new_config.upstreams[0],
+                                          0,
+                                          new_incarnation,
+                                          seed_allocation,
+                                          seed_incarnation);
+    record_active_probe_result_allocation(
+        old_allocation, false, 4, &old_config.upstreams[0], 0, old_incarnation);
+    CHECK_FALSE(backend_ejected_allocation(new_allocation,
+                                           4,
+                                           &new_config.upstreams[0],
+                                           0,
+                                           new_incarnation,
+                                           seed_allocation,
+                                           seed_incarnation));
+}
+
+TEST(active_health, retained_probe_success_is_accepted_after_cutover) {
+    RouteConfig old_config;
+    REQUIRE(old_config.add_upstream("retained-probe", 0x7f000001u, 8017).has_value());
+    REQUIRE(old_config.set_upstream_health_check(0, "/health", 7, 1000, 200));
+    const RouteConfig* active = &old_config;
+    ControlPlaneMutationPort port;
+    port.reset(81, true, &old_config);
+
+    RealLoop* loop = create_real_loop();
+    REQUIRE(loop != nullptr);
+    auto lfd = create_listen_socket(0);
+    REQUIRE(lfd.has_value());
+    const i32 listen_fd = lfd.value();
+    REQUIRE(loop->init(0, listen_fd).has_value());
+    loop->config_ptr = &active;
+    loop->control_plane_mutation = &port;
+
+    i32 fds[2];
+    REQUIRE_EQ(socketpair(AF_UNIX, SOCK_STREAM | SOCK_NONBLOCK, 0, fds), 0);
+    Connection* conn = loop->alloc_conn();
+    REQUIRE(conn != nullptr);
+    REQUIRE(loop->alloc_upstream_buf(*conn));
+    conn->is_health_probe = true;
+    conn->fd = -1;
+    conn->upstream_fd = fds[0];
+    conn->upstream_idx = 0;
+    conn->upstream_backend_idx = 0;
+    conn->request_config = &old_config;
+    const u16 probe_allocation = port.endpoint_probe_allocation_for_config(&old_config, 0, 0);
+    conn->health_probe_slot_uid = probe_allocation;
+    set_probe_in_flight_allocation(probe_allocation, true);
+    static constexpr char kResponse[] = "HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n";
+    REQUIRE_EQ(conn->upstream_recv_buf.write(reinterpret_cast<const u8*>(kResponse),
+                                             sizeof(kResponse) - 1),
+               sizeof(kResponse) - 1);
+
+    const u16 allocation = port.endpoint_allocation_for_config(&old_config, 0, 0);
+    const u64 incarnation = port.endpoint_incarnation_for_config(&old_config, 0, 0);
+    record_active_probe_result_allocation(
+        allocation, false, 1, &old_config.upstreams[0], 0, incarnation);
+    CHECK(backend_ejected_allocation(allocation, 1, &old_config.upstreams[0], 0, incarnation));
+
+    u64 id = 0;
+    REQUIRE(port.request_reload(ReloadRequestSource::Route, &id));
+    ReloadRequest request{};
+    REQUIRE(port.take_reload(&request));
+    RouteConfig new_config;
+    REQUIRE(new_config.add_upstream("retained-probe", 0x7f000001u, 8017).has_value());
+    REQUIRE(new_config.set_upstream_health_check(0, "/health", 7, 1000, 200));
+    REQUIRE(port.complete_reload(
+        id, request.source, ReloadTerminalOutcome::Activated, 82, &new_config));
+    active = &new_config;
+
+    on_probe_response<EpollEventLoop>(
+        loop,
+        *conn,
+        IoEvent{
+            conn->id, static_cast<i32>(sizeof(kResponse) - 1), 0, 0, IoEventType::UpstreamRecv, 0});
+    CHECK_FALSE(
+        backend_ejected_allocation(allocation, 2, &old_config.upstreams[0], 0, incarnation));
+    CHECK_FALSE(probe_in_flight_allocation(probe_allocation));
+
+    close(fds[1]);
+    loop->shutdown();
+    close(listen_fd);
+    destroy_real_loop(loop);
+}
+
+TEST(active_health, recycled_allocation_clears_unrelated_endpoint_verdict) {
+    ControlPlaneMutationPort port;
+    RouteConfig first_config;
+    REQUIRE(first_config.add_upstream("first-health", 0x7f000001u, 8020).has_value());
+    port.reset(51, true, &first_config);
+    const u16 first_allocation = port.endpoint_allocation_for_config(&first_config, 0, 0);
+    const u64 first_incarnation = port.endpoint_incarnation_for_config(&first_config, 0, 0);
+    REQUIRE_NE(first_allocation, ControlPlaneMutationPort::kInvalidAllocation);
+    record_active_probe_result_allocation(first_allocation,
+                                          /*healthy=*/true,
+                                          1,
+                                          &first_config.upstreams[0],
+                                          0,
+                                          first_incarnation);
+    record_active_probe_result_allocation(first_allocation,
+                                          /*healthy=*/false,
+                                          2,
+                                          &first_config.upstreams[0],
+                                          0,
+                                          first_incarnation);
+    CHECK(backend_ejected_allocation(
+        first_allocation, 2, &first_config.upstreams[0], 0, first_incarnation));
+
+    auto activate = [&](u64 generation, RouteConfig* config) {
+        u64 id = 0;
+        REQUIRE(port.request_reload(ReloadRequestSource::Route, &id));
+        ReloadRequest request{};
+        REQUIRE(port.take_reload(&request));
+        REQUIRE(port.complete_reload(
+            id, request.source, ReloadTerminalOutcome::Activated, generation, config));
+        REQUIRE(port.finish_activation(id));
+    };
+
+    RouteConfig second_config;
+    REQUIRE(second_config.add_upstream("second-health", 0x7f000001u, 8021).has_value());
+    activate(52, &second_config);
+    CHECK_NE(port.endpoint_allocation_for_config(&second_config, 0, 0), first_allocation);
+
+    RouteConfig third_config;
+    REQUIRE(third_config.add_upstream("first-health", 0x7f000001u, 8020).has_value());
+    activate(53, &third_config);
+    const u16 recycled = port.endpoint_allocation_for_config(&third_config, 0, 0);
+    const u64 recycled_incarnation = port.endpoint_incarnation_for_config(&third_config, 0, 0);
+    CHECK_EQ(recycled, first_allocation);
+    CHECK_NE(recycled_incarnation, first_incarnation);
+    CHECK_FALSE(backend_ejected_allocation(
+        recycled, 2, &third_config.upstreams[0], 0, recycled_incarnation));
+    for (u16 failure = 0; failure < kBackendFailThreshold; failure++)
+        record_backend_result_allocation(recycled,
+                                         /*success=*/false,
+                                         3,
+                                         &third_config.upstreams[0],
+                                         0,
+                                         recycled_incarnation);
+    CHECK(backend_ejected_allocation(
+        recycled, 3, &third_config.upstreams[0], 0, recycled_incarnation));
+    record_backend_result_allocation(recycled,
+                                     /*success=*/true,
+                                     4,
+                                     &third_config.upstreams[0],
+                                     0,
+                                     recycled_incarnation);
+    CHECK_FALSE(backend_ejected_allocation(
+        recycled, 3, &third_config.upstreams[0], 0, recycled_incarnation));
+
+    record_active_probe_result_allocation(recycled,
+                                          /*healthy=*/false,
+                                          5,
+                                          &third_config.upstreams[0],
+                                          0,
+                                          recycled_incarnation);
+    ControlPlaneMutationPort restarted_port;
+    restarted_port.reset(53, true, &third_config);
+    const u16 restarted_allocation =
+        restarted_port.endpoint_allocation_for_config(&third_config, 0, 0);
+    const u64 restarted_incarnation =
+        restarted_port.endpoint_incarnation_for_config(&third_config, 0, 0);
+    CHECK_EQ(restarted_allocation, recycled);
+    CHECK_NE(restarted_incarnation, recycled_incarnation);
+    CHECK_FALSE(backend_ejected_allocation(
+        restarted_allocation, 5, &third_config.upstreams[0], 0, restarted_incarnation));
+}
+
 TEST(active_health, stalled_probe_reaped_then_reprobed) {
     using namespace rut;
     // A bare listening socket: the kernel completes the handshake via the backlog,
@@ -14617,6 +15096,118 @@ TEST(route, round_robin_backend_selection) {
     CHECK_EQ(select_backend(RouteConfig::kMaxUpstreams, 3, kNow), 0u);
 }
 
+TEST(route, manual_health_override_excludes_backend_selection) {
+    using namespace rut;
+    RouteConfig config;
+    auto upstream = config.add_upstream("manual", 0x7f000001u, 8080);
+    REQUIRE(upstream);
+    REQUIRE(config.add_upstream_backend(upstream.value(), 0x7f000001u, 8081));
+    ControlPlaneMutationPort mutation;
+    mutation.reset(9, true, &config);
+    REQUIRE(mutation.mark({9, static_cast<u16>(upstream.value()), 0}, false));
+    struct SelectionLoop {
+        ControlPlaneMutationPort* control_plane_mutation;
+    } loop{&mutation};
+    CHECK_EQ(
+        select_backend_with_control_plane(&loop, static_cast<u16>(upstream.value()), 2, 1'000'000),
+        1u);
+}
+
+TEST(route, compatible_reload_preserves_round_robin_cursor) {
+    RouteConfig old_config;
+    REQUIRE(old_config.add_upstream("cursor-reload", 0x7f000001u, 8180).has_value());
+    REQUIRE(old_config.add_upstream_backend(0, 0x7f000001u, 8181));
+    ControlPlaneMutationPort mutation;
+    mutation.reset(71, true, &old_config);
+    struct SelectionLoop {
+        ControlPlaneMutationPort* control_plane_mutation;
+    } loop{&mutation};
+    CHECK_EQ(select_backend_with_control_plane(&loop, 0, 2, 1'000'000, &old_config), 0u);
+
+    u64 id = 0;
+    REQUIRE(mutation.request_reload(ReloadRequestSource::Route, &id));
+    ReloadRequest request{};
+    REQUIRE(mutation.take_reload(&request));
+    RouteConfig new_config;
+    REQUIRE(new_config.add_upstream("cursor-reload", 0x7f000001u, 8180).has_value());
+    REQUIRE(new_config.add_upstream_backend(0, 0x7f000001u, 8181));
+    REQUIRE(mutation.complete_reload(
+        id, request.source, ReloadTerminalOutcome::Activated, 72, &new_config));
+    CHECK_EQ(select_backend_with_control_plane(&loop, 0, 2, 1'000'000, &new_config), 1u);
+}
+
+TEST(route, recycled_upstream_allocation_resets_round_robin_cursor) {
+    ControlPlaneMutationPort mutation;
+    RouteConfig first_config;
+    REQUIRE(first_config.add_upstream("cursor-recycle", 0x7f000001u, 8182).has_value());
+    REQUIRE(first_config.add_upstream_backend(0, 0x7f000001u, 8183));
+    REQUIRE(first_config.add_upstream_backend(0, 0x7f000001u, 8184));
+    mutation.reset(73, true, &first_config);
+    struct SelectionLoop {
+        ControlPlaneMutationPort* control_plane_mutation;
+    } loop{&mutation};
+    const u16 first_allocation = mutation.upstream_allocation_for_config(&first_config, 0);
+    const u64 first_incarnation = mutation.upstream_incarnation_for_config(&first_config, 0);
+    CHECK_EQ(select_backend_with_control_plane(&loop, 0, 3, 1'000'000, &first_config), 0u);
+    CHECK_EQ(select_backend_with_control_plane(&loop, 0, 3, 1'000'000, &first_config), 1u);
+
+    auto activate = [&](u64 generation, RouteConfig* config) {
+        u64 id = 0;
+        REQUIRE(mutation.request_reload(ReloadRequestSource::Route, &id));
+        ReloadRequest request{};
+        REQUIRE(mutation.take_reload(&request));
+        REQUIRE(mutation.complete_reload(
+            id, request.source, ReloadTerminalOutcome::Activated, generation, config));
+        REQUIRE(mutation.finish_activation(id));
+    };
+    RouteConfig intervening_config;
+    REQUIRE(intervening_config.add_upstream("cursor-other", 0x7f000001u, 8185).has_value());
+    activate(74, &intervening_config);
+
+    RouteConfig recycled_config;
+    REQUIRE(recycled_config.add_upstream("cursor-recycle", 0x7f000001u, 8182).has_value());
+    REQUIRE(recycled_config.add_upstream_backend(0, 0x7f000001u, 8183));
+    REQUIRE(recycled_config.add_upstream_backend(0, 0x7f000001u, 8184));
+    activate(75, &recycled_config);
+    CHECK_EQ(mutation.upstream_allocation_for_config(&recycled_config, 0), first_allocation);
+    CHECK_NE(mutation.upstream_incarnation_for_config(&recycled_config, 0), first_incarnation);
+    CHECK_EQ(select_backend_with_control_plane(&loop, 0, 3, 1'000'000, &recycled_config), 0u);
+}
+
+TEST(route, manual_health_override_fails_closed_when_every_backend_is_excluded) {
+    using namespace rut;
+    RouteConfig config;
+    auto upstream = config.add_upstream("manual-all", 0x7f000001u, 8080);
+    REQUIRE(upstream);
+    REQUIRE(config.add_upstream_backend(upstream.value(), 0x7f000001u, 8081));
+    ControlPlaneMutationPort mutation;
+    mutation.reset(19, true, &config);
+    REQUIRE(mutation.mark({19, static_cast<u16>(upstream.value()), 0}, false));
+    REQUIRE(mutation.mark({19, static_cast<u16>(upstream.value()), 1}, false));
+    struct SelectionLoop {
+        ControlPlaneMutationPort* control_plane_mutation;
+    } loop{&mutation};
+    CHECK_EQ(select_backend_with_control_plane(
+                 &loop, static_cast<u16>(upstream.value()), 2, 1'000'000, &config),
+             ~u32{0});
+}
+
+TEST(route, manual_health_override_excludes_a_single_backend) {
+    using namespace rut;
+    RouteConfig config;
+    auto upstream = config.add_upstream("manual-one", 0x7f000001u, 8080);
+    REQUIRE(upstream);
+    ControlPlaneMutationPort mutation;
+    mutation.reset(20, true, &config);
+    REQUIRE(mutation.mark({20, static_cast<u16>(upstream.value()), 0}, false));
+    struct SelectionLoop {
+        ControlPlaneMutationPort* control_plane_mutation;
+    } loop{&mutation};
+    CHECK_EQ(select_backend_with_control_plane(
+                 &loop, static_cast<u16>(upstream.value()), 1, 1'000'000, &config),
+             ~u32{0});
+}
+
 // Passive circuit breaking: kBackendFailThreshold consecutive connect failures
 // eject a backend for the cooldown; selection skips it until the cooldown
 // lapses; a success clears the record.
@@ -14845,7 +15436,7 @@ TEST(route, populate_route_config_rejects_pre_bound_over_long_name) {
     // the DSL source is deterministic.
     const char* src =
         "upstream "
-        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n"  // 32 'a's
+        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa at \"127.0.0.1:8080\"\n"  // 32 'a's
         "route GET \"/api\" { return forward(aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa) }\n";
     auto lexed = lex(Str{src, static_cast<u32>(strlen(src))});
     REQUIRE(lexed);
@@ -14873,6 +15464,12 @@ TEST(route, populate_route_config_rejects_pre_bound_over_long_name) {
                              8080)
                 .has_value());
     CHECK(!populate_route_config(cfg, rir.module));
+
+    RouteConfig compiled_cfg{};
+    REQUIRE(populate_route_config(compiled_cfg, rir.module));
+    CHECK_EQ(compiled_cfg.upstreams[0].name_len, 31u);
+    CHECK_EQ(compiled_cfg.upstreams[0].name_identity,
+             upstream_name_identity("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", 32));
     rir.destroy();
 }
 

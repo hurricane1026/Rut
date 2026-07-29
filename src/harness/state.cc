@@ -23,6 +23,7 @@ void ScenarioState::reset() {
     active_group = 0;
     active_target = nullptr;
     active_target_generation = 0;
+    active_control_plane_mutation = nullptr;
 }
 
 RateLimiter* ScenarioState::rate_limiter_for_shard(u32 shard_id) {
@@ -35,7 +36,8 @@ RateLimiter* ScenarioState::rate_limiter_for_shard(u32 shard_id) {
 bool ScenarioState::prepare(StateIsolation isolation,
                             u64 group,
                             const void* target_identity,
-                            u64 target_generation) {
+                            u64 target_generation,
+                            const void* control_plane_mutation_identity) {
     bool should_reset = false;
     switch (isolation) {
         case StateIsolation::Run:
@@ -44,11 +46,13 @@ bool ScenarioState::prepare(StateIsolation isolation,
         case StateIsolation::Group:
             should_reset = !initialized || active_group != group ||
                            active_target != target_identity ||
-                           active_target_generation != target_generation;
+                           active_target_generation != target_generation ||
+                           active_control_plane_mutation != control_plane_mutation_identity;
             break;
         case StateIsolation::Process:
             should_reset = !initialized || active_target != target_identity ||
-                           active_target_generation != target_generation;
+                           active_target_generation != target_generation ||
+                           active_control_plane_mutation != control_plane_mutation_identity;
             break;
         case StateIsolation::External:
             should_reset = false;
@@ -59,6 +63,7 @@ bool ScenarioState::prepare(StateIsolation isolation,
     active_group = group;
     active_target = target_identity;
     active_target_generation = target_generation;
+    active_control_plane_mutation = control_plane_mutation_identity;
     return should_reset;
 }
 

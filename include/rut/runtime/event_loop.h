@@ -6,6 +6,7 @@
 #include "rut/runtime/arena.h"
 #include "rut/runtime/callbacks.h"
 #include "rut/runtime/connection.h"
+#include "rut/runtime/control_plane_mutation.h"
 #include "rut/runtime/control_plane_snapshot.h"
 #include "rut/runtime/drain.h"
 #include "rut/runtime/error.h"
@@ -213,6 +214,7 @@ public:
             jit::HandlerCtx ctx{};
             if (cfg->timers[i].needs_control_plane_snapshot)
                 latch_control_plane_snapshot(&self(), &ctx);
+            latch_control_plane_mutation(&self(), &ctx);
             (void)cfg->timers[i].fn(nullptr, &ctx, nullptr, 0, nullptr);
             jit::release_response_body_mutation_storage(&ctx);
             timer_fire_count[i]++;
@@ -329,7 +331,8 @@ public:
                 }
                 bool all_issued = true;
                 for (u32 b = 0; b < up.addr_count; b++) {
-                    if (probe_in_flight(static_cast<u16>(u), b)) continue;
+                    if (probe_in_flight(self().control_plane_mutation, cfg, static_cast<u16>(u), b))
+                        continue;
                     if (budget == 0) {
                         all_issued = false;
                         break;
@@ -469,6 +472,7 @@ public:
     ShardMetrics* const* all_shard_metrics = nullptr;
     u32 shard_metrics_count = 0;
     bool metrics_endpoint_enabled = false;
+    ControlPlaneMutationPort* control_plane_mutation = nullptr;
 
     // Per-shard control plane pointers. Set by Shard::init(), read by
     // poll_command() / epoch_enter() / epoch_leave() on the shard thread.
@@ -489,6 +493,7 @@ public:
         upstream_timeout = kDefaultUpstreamTimeout;
         capture_ring = nullptr;
         capture_region_ = nullptr;
+        control_plane_mutation = nullptr;
         config_ptr = nullptr;
         control = nullptr;
         epoch = nullptr;
@@ -565,7 +570,10 @@ public:
         // Single atomic exchange per slot: read + clear in one op.
         // nullptr = no update; non-null = apply.
         auto* cfg = control->pending_config.exchange(nullptr, std::memory_order_acq_rel);
-        if (cfg && config_ptr) *config_ptr = cfg;
+        if (cfg && config_ptr) {
+            materialize_control_plane_health(control_plane_mutation, cfg);
+            *config_ptr = cfg;
+        }
 
         auto* jit = control->pending_jit.exchange(nullptr, std::memory_order_acq_rel);
         if (jit && jit_code_ptr) *jit_code_ptr = jit;

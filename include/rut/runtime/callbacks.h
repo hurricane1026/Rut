@@ -11,6 +11,8 @@ enum class HttpMethod : u8;
 
 struct EpollEventLoop;
 struct IoUringEventLoop;
+class ControlPlaneMutationPort;
+struct RouteConfig;
 
 // Verify capture slice size constants match the authoritative CaptureEntry::kMaxHeaderLen.
 // These are defined separately in each EventLoop type to avoid circular includes.
@@ -132,6 +134,16 @@ bool start_health_probe(Loop* loop, u16 upstream_idx, u32 backend_idx);
 // backend. Defined in callbacks_impl.h; EventLoopCRTP uses it to distinguish an
 // intentional in-flight skip from a local launch deferral.
 bool probe_in_flight(u16 upstream_id, u32 backend_idx);
+bool probe_in_flight(ControlPlaneMutationPort* mutation,
+                     const RouteConfig* config,
+                     u16 upstream_id,
+                     u32 backend_idx);
+
+// Materialize policy-transition health state on the shard thread before a new
+// config becomes visible, so consecutive reloads cannot skip an unobserved
+// intermediate generation's seed.
+void materialize_control_plane_health(ControlPlaneMutationPort* mutation,
+                                      const RouteConfig* config);
 
 // Minimal teardown for a health-probe Connection: clears the in-flight guard for
 // the probe's (upstream, backend) then routes through Loop::free_health_probe.

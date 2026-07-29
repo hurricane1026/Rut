@@ -19,6 +19,15 @@
 
 namespace rut {
 
+inline u64 upstream_name_identity(const char* name, u32 name_len) {
+    u64 h = 0xCBF29CE484222325ull;
+    for (u32 i = 0; i < name_len; i++) {
+        h ^= static_cast<u8>(name[i]);
+        h *= 0x100000001B3ull;
+    }
+    return h == 0 ? 1 : h;
+}
+
 // Action for a matched route.
 enum class RouteAction : u8 {
     Static,      // respond with fixed status (e.g., 200 OK, 404)
@@ -38,6 +47,8 @@ struct UpstreamTarget {
     // Short name for logging/debugging (e.g., "api-v1")
     char name[kMaxUpstreamNameLen];
     u32 name_len;
+    // Full, non-truncated declaration identity used across config generations.
+    u64 name_identity = 0;
     // Max concurrent in-flight proxied requests to this backend (0 = unlimited).
     // Enforced cluster-wide via the shared UpstreamConcurrency gauge; over the
     // cap the runtime answers 503 before connecting.
@@ -54,6 +65,9 @@ struct UpstreamTarget {
     u16 hc_expected_status = 200;
 
     void set_name(const char* n) {
+        u32 full_len = 0;
+        while (n[full_len]) full_len++;
+        name_identity = upstream_name_identity(n, full_len);
         name_len = 0;
         while (n[name_len] && name_len < sizeof(name) - 1) {
             name[name_len] = n[name_len];

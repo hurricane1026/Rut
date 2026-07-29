@@ -805,6 +805,42 @@ bool probe_in_flight(u16 upstream_id, u32 backend_idx) {
     return s != nullptr && *s;
 }
 
+bool probe_in_flight(ControlPlaneMutationPort* mutation,
+                     const RouteConfig* config,
+                     u16 upstream_id,
+                     u32 backend_idx) {
+    u16 allocation = legacy_probe_allocation(upstream_id, backend_idx);
+    if (mutation != nullptr) {
+        const u16 stable =
+            mutation->endpoint_probe_allocation_for_config(config, upstream_id, backend_idx);
+        if (stable != ControlPlaneMutationPort::kInvalidAllocation) allocation = stable;
+    }
+    return probe_in_flight_allocation(allocation);
+}
+
+void materialize_control_plane_health(ControlPlaneMutationPort* mutation,
+                                      const RouteConfig* config) {
+    if (mutation == nullptr || config == nullptr) return;
+    const u32 upstreams = config->upstream_count < RouteConfig::kMaxUpstreams
+                              ? config->upstream_count
+                              : RouteConfig::kMaxUpstreams;
+    for (u32 upstream = 0; upstream < upstreams; upstream++) {
+        const auto& target = config->upstreams[upstream];
+        const u32 backends = target.addr_count < UpstreamTarget::kMaxBackends
+                                 ? target.addr_count
+                                 : UpstreamTarget::kMaxBackends;
+        for (u32 backend = 0; backend < backends; backend++) {
+            (void)backend_health_allocation(
+                mutation->endpoint_allocation_for_config(config, upstream, backend),
+                &target,
+                backend,
+                mutation->endpoint_incarnation_for_config(config, upstream, backend),
+                mutation->endpoint_health_seed_allocation_for_config(config, upstream, backend),
+                mutation->endpoint_health_seed_incarnation_for_config(config, upstream, backend));
+        }
+    }
+}
+
 // The probe teardown / config-pin helpers are also odr-used directly from the
 // epoll timer tick (stalled-probe reap), where only their callbacks.h
 // declarations are visible — emit the epoll instantiations here.

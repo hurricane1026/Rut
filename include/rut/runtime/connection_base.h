@@ -212,6 +212,7 @@ struct ConnectionBase {
     // or close). `upstream_slot_uid` records which backend's gauge to decrement.
     bool upstream_slot_held;
     u16 upstream_slot_uid;
+    u16 health_probe_slot_uid;
     // Explicit `forward(..., buffered: true)`: accumulate the complete upstream
     // response, then apply the committed HandlerCtx Response mutations.
     bool proxy_response_buffered;
@@ -605,6 +606,7 @@ struct ConnectionBase {
         req_header_override_overflow = false;
         upstream_slot_held = false;
         upstream_slot_uid = 0;
+        health_probe_slot_uid = 0xffff;
         proxy_response_buffered = false;
         buffered_proxy_send_in_progress = false;
         proxy_response_capture = false;

@@ -5,6 +5,7 @@
 #include "rut/harness/scripted_environment.h"
 #include "rut/harness/source_target.h"
 #include "rut/harness/state.h"
+#include "rut/runtime/control_plane_mutation.h"
 
 namespace rut::harness {
 
@@ -31,6 +32,10 @@ struct ScenarioSpec {
     // Explicit value-only fixture for stats()/metrics(). The scenario must
     // declare ControlPlaneSnapshot; the copied value is stable across resumes.
     const jit::ControlPlaneSnapshot* control_plane_snapshot = nullptr;
+    // Deterministic mutation state. Declaration and fixture must match; the
+    // pointer remains stable across resumes and follows state_isolation reset
+    // boundaries while preserving its configured generation and authority.
+    ControlPlaneMutationPort* control_plane_mutation = nullptr;
     bool auto_complete_timers = true;
     ScenarioExpectation expected{};
 };
