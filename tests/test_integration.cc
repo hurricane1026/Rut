@@ -2665,6 +2665,57 @@ TEST(active_health, verdict_follows_stable_endpoint_across_reload) {
     record_active_probe_result_allocation(moved_users, /*healthy=*/true, 3);
 }
 
+TEST(active_health, recycled_allocation_clears_unrelated_endpoint_verdict) {
+    ControlPlaneMutationPort port;
+    RouteConfig first_config;
+    REQUIRE(first_config.add_upstream("first-health", 0x7f000001u, 8020).has_value());
+    port.reset(51, true, &first_config);
+    const u16 first_allocation = port.endpoint_allocation_for_config(&first_config, 0, 0);
+    REQUIRE_NE(first_allocation, ControlPlaneMutationPort::kInvalidAllocation);
+    record_active_probe_result_allocation(first_allocation,
+                                          /*healthy=*/true,
+                                          1,
+                                          &first_config.upstreams[0],
+                                          0);
+    record_active_probe_result_allocation(first_allocation,
+                                          /*healthy=*/false,
+                                          2,
+                                          &first_config.upstreams[0],
+                                          0);
+    CHECK(backend_ejected_allocation(first_allocation, 2, &first_config.upstreams[0], 0));
+
+    auto activate = [&](u64 generation, RouteConfig* config) {
+        u64 id = 0;
+        REQUIRE(port.request_reload(ReloadRequestSource::Route, &id));
+        ReloadRequest request{};
+        REQUIRE(port.take_reload(&request));
+        REQUIRE(port.complete_reload(
+            id, request.source, ReloadTerminalOutcome::Activated, generation, config));
+        REQUIRE(port.finish_activation(id));
+    };
+
+    RouteConfig second_config;
+    REQUIRE(second_config.add_upstream("second-health", 0x7f000001u, 8021).has_value());
+    activate(52, &second_config);
+    CHECK_NE(port.endpoint_allocation_for_config(&second_config, 0, 0), first_allocation);
+
+    RouteConfig third_config;
+    REQUIRE(third_config.add_upstream("third-health", 0x7f000001u, 8022).has_value());
+    activate(53, &third_config);
+    const u16 recycled = port.endpoint_allocation_for_config(&third_config, 0, 0);
+    CHECK_EQ(recycled, first_allocation);
+    CHECK_FALSE(backend_ejected_allocation(recycled, 2, &third_config.upstreams[0], 0));
+    for (u16 failure = 0; failure < kBackendFailThreshold; failure++)
+        record_backend_result_allocation(recycled,
+                                         /*success=*/false,
+                                         3,
+                                         &third_config.upstreams[0],
+                                         0);
+    CHECK(backend_ejected_allocation(recycled, 3, &third_config.upstreams[0], 0));
+    record_backend_result_allocation(recycled, /*success=*/true, 4, &third_config.upstreams[0], 0);
+    CHECK_FALSE(backend_ejected_allocation(recycled, 3, &third_config.upstreams[0], 0));
+}
+
 TEST(active_health, stalled_probe_reaped_then_reprobed) {
     using namespace rut;
     // A bare listening socket: the kernel completes the handshake via the backlog,
