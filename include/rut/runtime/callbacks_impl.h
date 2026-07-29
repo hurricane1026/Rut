@@ -413,7 +413,7 @@ inline u32 select_backend_with_control_plane(Loop* loop,
                                                  allocation_config, upstream_id, idx),
                                              mutation->endpoint_health_seed_incarnation_for_config(
                                                  allocation_config, upstream_id, idx));
-        if (!ejected) {
+        if (manual[idx] == ManualHealthOverride::Healthy || !ejected) {
             cell.cursor = static_cast<u16>((idx + 1) % backend_count);
             return idx;
         }
