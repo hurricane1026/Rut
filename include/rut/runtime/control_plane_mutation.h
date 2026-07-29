@@ -984,6 +984,21 @@ public:
         return kInvalidAllocation;
     }
 
+    [[nodiscard]] u16 endpoint_probe_allocation_for_config(const RouteConfig* config,
+                                                           u16 upstream_id,
+                                                           u32 backend_id) const {
+        if (config == nullptr || upstream_id >= RouteConfig::kMaxUpstreams ||
+            backend_id >= UpstreamTarget::kMaxBackends)
+            return kInvalidAllocation;
+        for (u32 bank = 0; bank < 2; bank++)
+            if (bank_config_[bank].load(std::memory_order_acquire) == config &&
+                upstream_id < upstream_count_[bank].load(std::memory_order_acquire) &&
+                backend_id < backend_count_[bank][upstream_id].load(std::memory_order_acquire))
+                return endpoint_probe_allocation_[bank][upstream_id][backend_id].load(
+                    std::memory_order_acquire);
+        return kInvalidAllocation;
+    }
+
     [[nodiscard]] u64 endpoint_incarnation_for_config(const RouteConfig* config,
                                                       u16 upstream_id,
                                                       u32 backend_id) const {
@@ -1325,6 +1340,8 @@ private:
                 override_peer_backend_[bank][upstream][backend] = 0xff;
                 endpoint_allocation_[bank][upstream][backend].store(kInvalidAllocation,
                                                                     std::memory_order_relaxed);
+                endpoint_probe_allocation_[bank][upstream][backend].store(
+                    kInvalidAllocation, std::memory_order_relaxed);
                 endpoint_incarnation_[bank][upstream][backend].store(0, std::memory_order_relaxed);
                 endpoint_health_seed_allocation_[bank][upstream][backend].store(
                     kInvalidAllocation, std::memory_order_relaxed);
@@ -1377,6 +1394,9 @@ private:
             const u32 backends = backend_count_[bank][upstream].load(std::memory_order_relaxed);
             for (u32 backend = 0; backend < backends; backend++) {
                 endpoint_allocation_[bank][upstream][backend].store(
+                    static_cast<u16>(upstream * UpstreamTarget::kMaxBackends + backend),
+                    std::memory_order_relaxed);
+                endpoint_probe_allocation_[bank][upstream][backend].store(
                     static_cast<u16>(upstream * UpstreamTarget::kMaxBackends + backend),
                     std::memory_order_relaxed);
                 endpoint_incarnation_[bank][upstream][backend].store(
@@ -1534,6 +1554,7 @@ private:
             membership_[old_bank], old_upstreams, membership_[new_bank], upstreams, old_for_new);
         bool used_upstream[kMaxUpstreamAllocations]{};
         bool used_endpoint[kMaxEndpointAllocations]{};
+        bool used_probe[kMaxEndpointAllocations]{};
         for (u32 upstream = 0; upstream < old_upstreams; upstream++) {
             const u16 allocation =
                 upstream_allocation_[old_bank][upstream].load(std::memory_order_relaxed);
@@ -1543,10 +1564,14 @@ private:
                 const u16 endpoint = endpoint_allocation_[old_bank][upstream][backend].load(
                     std::memory_order_relaxed);
                 if (endpoint < kMaxEndpointAllocations) used_endpoint[endpoint] = true;
+                const u16 probe = endpoint_probe_allocation_[old_bank][upstream][backend].load(
+                    std::memory_order_relaxed);
+                if (probe < kMaxEndpointAllocations) used_probe[probe] = true;
             }
         }
         u16 next_upstream = 0;
         u16 next_endpoint = 0;
+        u16 next_probe = 0;
         bool carried = false;
         for (u32 upstream = 0; upstream < upstreams; upstream++) {
             const auto& new_target = membership_[new_bank][upstream];
@@ -1568,10 +1593,15 @@ private:
                         next_endpoint++;
                     endpoint_allocation_[new_bank][upstream][backend].store(
                         next_endpoint, std::memory_order_relaxed);
+                    while (next_probe < kMaxEndpointAllocations && used_probe[next_probe])
+                        next_probe++;
+                    endpoint_probe_allocation_[new_bank][upstream][backend].store(
+                        next_probe, std::memory_order_relaxed);
                     endpoint_incarnation_[new_bank][upstream][backend].store(
                         allocate_endpoint_incarnation(), std::memory_order_relaxed);
                     if (next_endpoint < kMaxEndpointAllocations)
                         used_endpoint[next_endpoint++] = true;
+                    if (next_probe < kMaxEndpointAllocations) used_probe[next_probe++] = true;
                 }
                 continue;
             }
@@ -1592,13 +1622,22 @@ private:
                         next_endpoint++;
                     endpoint_allocation_[new_bank][upstream][backend].store(
                         next_endpoint, std::memory_order_relaxed);
+                    while (next_probe < kMaxEndpointAllocations && used_probe[next_probe])
+                        next_probe++;
+                    endpoint_probe_allocation_[new_bank][upstream][backend].store(
+                        next_probe, std::memory_order_relaxed);
                     endpoint_incarnation_[new_bank][upstream][backend].store(
                         allocate_endpoint_incarnation(), std::memory_order_relaxed);
                     if (next_endpoint < kMaxEndpointAllocations)
                         used_endpoint[next_endpoint++] = true;
+                    if (next_probe < kMaxEndpointAllocations) used_probe[next_probe++] = true;
                     continue;
                 }
                 matched_old_backend[old_backend] = true;
+                endpoint_probe_allocation_[new_bank][upstream][backend].store(
+                    endpoint_probe_allocation_[old_bank][old_upstream][old_backend].load(
+                        std::memory_order_relaxed),
+                    std::memory_order_relaxed);
                 override_peer_upstream_[new_bank][upstream][backend] =
                     static_cast<u8>(old_upstream);
                 override_peer_backend_[new_bank][upstream][backend] = static_cast<u8>(old_backend);
@@ -2413,6 +2452,8 @@ private:
     std::atomic<u16> upstream_allocation_[2][RouteConfig::kMaxUpstreams]{};
     std::atomic<u16> endpoint_allocation_[2][RouteConfig::kMaxUpstreams]
                                          [UpstreamTarget::kMaxBackends]{};
+    std::atomic<u16> endpoint_probe_allocation_[2][RouteConfig::kMaxUpstreams]
+                                               [UpstreamTarget::kMaxBackends]{};
     std::atomic<u64> endpoint_incarnation_[2][RouteConfig::kMaxUpstreams]
                                           [UpstreamTarget::kMaxBackends]{};
     std::atomic<u16> endpoint_health_seed_allocation_[2][RouteConfig::kMaxUpstreams]

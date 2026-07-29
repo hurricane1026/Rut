@@ -570,7 +570,10 @@ public:
         // Single atomic exchange per slot: read + clear in one op.
         // nullptr = no update; non-null = apply.
         auto* cfg = control->pending_config.exchange(nullptr, std::memory_order_acq_rel);
-        if (cfg && config_ptr) *config_ptr = cfg;
+        if (cfg && config_ptr) {
+            materialize_control_plane_health(control_plane_mutation, cfg);
+            *config_ptr = cfg;
+        }
 
         auto* jit = control->pending_jit.exchange(nullptr, std::memory_order_acq_rel);
         if (jit && jit_code_ptr) *jit_code_ptr = jit;

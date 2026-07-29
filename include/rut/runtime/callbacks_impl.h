@@ -105,7 +105,7 @@ inline BackendHealth* backend_health_allocation(
             if (seed_allocation < ControlPlaneMutationPort::kMaxEndpointAllocations) {
                 const auto& source = health[seed_allocation];
                 if (source.owner_set && source.incarnation == seed_incarnation) {
-                    seed.active_down = source.health.active_down;
+                    seed.active_down = target->hc_enabled && source.health.active_down;
                     seed.fails = source.health.fails;
                     seed.eject_until_us = source.health.eject_until_us;
                 }
@@ -306,10 +306,11 @@ inline u32 select_backend_with_control_plane(Loop* loop,
                                              u64 now_us,
                                              const RouteConfig* pinned_config = nullptr) {
     struct CursorCell {
-        u64 generation = 0;
+        u64 selection_identity = 0;
         u16 cursor = 0;
     };
-    static thread_local CursorCell rr_cursor[2][RouteConfig::kMaxUpstreams] = {};
+    static thread_local CursorCell rr_cursor[ControlPlaneMutationPort::kMaxUpstreamAllocations] =
+        {};
     constexpr u32 kUnavailable = ~u32{0};
     if (backend_count == 0 || upstream_id >= RouteConfig::kMaxUpstreams) return kUnavailable;
     ControlPlaneMutationPort* mutation = nullptr;
@@ -326,9 +327,35 @@ inline u32 select_backend_with_control_plane(Loop* loop,
             if (loop != nullptr && loop->config_ptr != nullptr)
                 allocation_config = *loop->config_ptr;
     }
-    auto& cell = rr_cursor[generation & 1u][upstream_id];
-    if (cell.generation != generation) {
-        cell.generation = generation;
+    u16 cursor_allocation = upstream_id;
+    if (mutation != nullptr) {
+        const u16 stable = mutation->upstream_allocation_for_config(allocation_config, upstream_id);
+        if (stable < ControlPlaneMutationPort::kMaxUpstreamAllocations) cursor_allocation = stable;
+    }
+    u64 selection_identity = 0xCBF29CE484222325ull;
+    if (allocation_config != nullptr && upstream_id < allocation_config->upstream_count) {
+        const auto& target = allocation_config->upstreams[upstream_id];
+        selection_identity ^= target.name_identity;
+        selection_identity *= 0x100000001B3ull;
+        const u32 identity_backends = target.addr_count < UpstreamTarget::kMaxBackends
+                                          ? target.addr_count
+                                          : UpstreamTarget::kMaxBackends;
+        selection_identity ^= identity_backends;
+        selection_identity *= 0x100000001B3ull;
+        for (u32 backend = 0; backend < identity_backends; backend++) {
+            const auto& endpoint = target.addrs[backend];
+            selection_identity ^= endpoint.sin_family;
+            selection_identity *= 0x100000001B3ull;
+            selection_identity ^= endpoint.sin_addr.s_addr;
+            selection_identity *= 0x100000001B3ull;
+            selection_identity ^= endpoint.sin_port;
+            selection_identity *= 0x100000001B3ull;
+        }
+    }
+    if (selection_identity == 0) selection_identity = 1;
+    auto& cell = rr_cursor[cursor_allocation];
+    if (cell.selection_identity != selection_identity) {
+        cell.selection_identity = selection_identity;
         cell.cursor = 0;
     }
     ManualHealthOverride manual[UpstreamTarget::kMaxBackends]{};
@@ -496,6 +523,24 @@ inline u16 control_plane_endpoint_allocation(Loop* loop,
 }
 
 template <typename Loop>
+inline u16 control_plane_probe_allocation(Loop* loop,
+                                          const RouteConfig* config,
+                                          u16 upstream_id,
+                                          u32 backend_id) {
+    if (loop != nullptr) {
+        if constexpr (requires { loop->control_plane_mutation; }) {
+            if (loop->control_plane_mutation != nullptr) {
+                const u16 allocation =
+                    loop->control_plane_mutation->endpoint_probe_allocation_for_config(
+                        config, upstream_id, backend_id);
+                if (allocation != ControlPlaneMutationPort::kInvalidAllocation) return allocation;
+            }
+        }
+    }
+    return legacy_probe_allocation(upstream_id, backend_id);
+}
+
+template <typename Loop>
 inline void record_backend_result_for_config(Loop* loop,
                                              const RouteConfig* config,
                                              u16 upstream_id,
@@ -599,7 +644,7 @@ bool start_health_probe(Loop* loop, u16 upstream_idx, u32 backend_idx) {
     const UpstreamTarget& target = config->upstreams[upstream_idx];
     if (backend_idx >= target.addr_count) return false;
     const u16 probe_allocation =
-        control_plane_endpoint_allocation(loop, config, upstream_idx, backend_idx);
+        control_plane_probe_allocation(loop, config, upstream_idx, backend_idx);
     if (probe_allocation == ControlPlaneMutationPort::kInvalidAllocation) return false;
 
     // Reserve a margin of Connection slots for real client traffic. Near
@@ -757,8 +802,17 @@ void on_probe_response(void* lp, Connection& conn, IoEvent ev) {
     // upstream_idx at a different upstream. Guard BEFORE the expected-status
     // comparison — after a swap the response is meaningless, so free without
     // recording (the stale result must not touch the new backend at this index).
-    const RouteConfig* config = loop->config_ptr ? *loop->config_ptr : nullptr;
-    if (config != conn.request_config) {
+    const RouteConfig* config = conn.request_config;
+    bool retained = config != nullptr;
+    if constexpr (requires { loop->control_plane_mutation; }) {
+        if (loop->control_plane_mutation != nullptr)
+            retained = loop->control_plane_mutation->generation_for_config(config) != 0;
+        else
+            retained = loop->config_ptr != nullptr && *loop->config_ptr == config;
+    } else {
+        retained = loop->config_ptr != nullptr && *loop->config_ptr == config;
+    }
+    if (!retained) {
         free_probe_conn(loop, conn);
         return;
     }
@@ -769,8 +823,7 @@ void on_probe_response(void* lp, Connection& conn, IoEvent ev) {
         conn.upstream_idx < config->upstream_count) {
         healthy = (resp.status_code == config->upstreams[conn.upstream_idx].hc_expected_status);
     }
-    record_active_probe_result_for_config(
-        loop, conn.request_config, conn.upstream_idx, conn.upstream_backend_idx, healthy, kNowUs);
+    record_probe_if_current(loop, conn, healthy, kNowUs);
     free_probe_conn(loop, conn);
 }
 

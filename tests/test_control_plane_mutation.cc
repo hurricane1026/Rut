@@ -1074,6 +1074,7 @@ TEST(control_plane_mutation, activation_carries_overrides_across_probe_policy_ch
     CHECK_EQ(port.manual_health({4, 0, 1}), ManualHealthOverride::None);
     CHECK_EQ(port.manual_health({4, 1, 0}), ManualHealthOverride::Healthy);
     CHECK_NE(port.endpoint_allocation_for_config(&new_config, 1, 0), old_allocation);
+    CHECK_EQ(port.endpoint_probe_allocation_for_config(&new_config, 1, 0), old_allocation);
     CHECK_NE(port.endpoint_incarnation_for_config(&new_config, 1, 0), old_incarnation);
     CHECK_EQ(port.endpoint_health_seed_allocation_for_config(&new_config, 1, 0), old_allocation);
     CHECK_EQ(port.endpoint_health_seed_incarnation_for_config(&new_config, 1, 0), old_incarnation);

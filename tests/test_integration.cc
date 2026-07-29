@@ -2677,6 +2677,8 @@ TEST(active_health, policy_changes_isolate_retained_generation_verdicts) {
         old_allocation, false, 1, &old_config.upstreams[0], 0, old_incarnation);
     CHECK(backend_ejected_allocation(
         old_allocation, 1, &old_config.upstreams[0], 0, old_incarnation));
+    const u16 probe_allocation = port.endpoint_probe_allocation_for_config(&old_config, 0, 0);
+    set_probe_in_flight_allocation(probe_allocation, true);
 
     u64 id = 0;
     REQUIRE(port.request_reload(ReloadRequestSource::Route, &id));
@@ -2692,6 +2694,9 @@ TEST(active_health, policy_changes_isolate_retained_generation_verdicts) {
     const u64 new_incarnation = port.endpoint_incarnation_for_config(&new_config, 0, 0);
     CHECK_NE(new_allocation, old_allocation);
     CHECK_NE(new_incarnation, old_incarnation);
+    CHECK_EQ(port.endpoint_probe_allocation_for_config(&new_config, 0, 0), old_allocation);
+    CHECK(probe_in_flight(&port, &new_config, 0, 0));
+    set_probe_in_flight_allocation(probe_allocation, false);
     CHECK(backend_ejected_allocation(new_allocation,
                                      1,
                                      &new_config.upstreams[0],
@@ -2707,6 +2712,122 @@ TEST(active_health, policy_changes_isolate_retained_generation_verdicts) {
         old_allocation, 3, &old_config.upstreams[0], 0, old_incarnation));
     CHECK(backend_ejected_allocation(
         new_allocation, 3, &new_config.upstreams[0], 0, new_incarnation));
+}
+
+TEST(active_health, policy_health_is_eagerly_migrated_and_active_down_drops_when_disabled) {
+    ControlPlaneMutationPort port;
+    RouteConfig first_config;
+    REQUIRE(first_config.add_upstream("policy-chain", 0x7f000001u, 8016).has_value());
+    REQUIRE(first_config.set_upstream_health_check(0, "/health", 7, 1000, 200));
+    port.reset(61, true, &first_config);
+    const u16 first_allocation = port.endpoint_allocation_for_config(&first_config, 0, 0);
+    const u64 first_incarnation = port.endpoint_incarnation_for_config(&first_config, 0, 0);
+    record_active_probe_result_allocation(
+        first_allocation, false, 1, &first_config.upstreams[0], 0, first_incarnation);
+
+    auto activate = [&](u64 generation, RouteConfig* config) {
+        u64 id = 0;
+        REQUIRE(port.request_reload(ReloadRequestSource::Route, &id));
+        ReloadRequest request{};
+        REQUIRE(port.take_reload(&request));
+        REQUIRE(port.complete_reload(
+            id, request.source, ReloadTerminalOutcome::Activated, generation, config));
+        materialize_control_plane_health(&port, config);
+        REQUIRE(port.finish_activation(id));
+    };
+
+    RouteConfig second_config;
+    REQUIRE(second_config.add_upstream("policy-chain", 0x7f000001u, 8016).has_value());
+    REQUIRE(second_config.set_upstream_health_check(0, "/health", 7, 2000, 200));
+    activate(62, &second_config);
+
+    RouteConfig third_config;
+    REQUIRE(third_config.add_upstream("policy-chain", 0x7f000001u, 8016).has_value());
+    REQUIRE(third_config.add_upstream_backend(0, 0x7f000001u, 8018));
+    REQUIRE(third_config.set_upstream_health_check(0, "/health", 7, 3000, 200));
+    activate(63, &third_config);
+    const u16 third_allocation = port.endpoint_allocation_for_config(&third_config, 0, 0);
+    const u64 third_incarnation = port.endpoint_incarnation_for_config(&third_config, 0, 0);
+    CHECK(backend_ejected_allocation(
+        third_allocation, 2, &third_config.upstreams[0], 0, third_incarnation));
+    CHECK_NE(port.endpoint_probe_allocation_for_config(&third_config, 0, 0),
+             port.endpoint_probe_allocation_for_config(&third_config, 0, 1));
+
+    RouteConfig disabled_config;
+    REQUIRE(disabled_config.add_upstream("policy-chain", 0x7f000001u, 8016).has_value());
+    activate(64, &disabled_config);
+    const u16 disabled_allocation = port.endpoint_allocation_for_config(&disabled_config, 0, 0);
+    const u64 disabled_incarnation = port.endpoint_incarnation_for_config(&disabled_config, 0, 0);
+    CHECK_FALSE(backend_ejected_allocation(
+        disabled_allocation, 2, &disabled_config.upstreams[0], 0, disabled_incarnation));
+}
+
+TEST(active_health, retained_probe_success_is_accepted_after_cutover) {
+    RouteConfig old_config;
+    REQUIRE(old_config.add_upstream("retained-probe", 0x7f000001u, 8017).has_value());
+    REQUIRE(old_config.set_upstream_health_check(0, "/health", 7, 1000, 200));
+    const RouteConfig* active = &old_config;
+    ControlPlaneMutationPort port;
+    port.reset(81, true, &old_config);
+
+    RealLoop* loop = create_real_loop();
+    REQUIRE(loop != nullptr);
+    auto lfd = create_listen_socket(0);
+    REQUIRE(lfd.has_value());
+    const i32 listen_fd = lfd.value();
+    REQUIRE(loop->init(0, listen_fd).has_value());
+    loop->config_ptr = &active;
+    loop->control_plane_mutation = &port;
+
+    i32 fds[2];
+    REQUIRE_EQ(socketpair(AF_UNIX, SOCK_STREAM | SOCK_NONBLOCK, 0, fds), 0);
+    Connection* conn = loop->alloc_conn();
+    REQUIRE(conn != nullptr);
+    REQUIRE(loop->alloc_upstream_buf(*conn));
+    conn->is_health_probe = true;
+    conn->fd = -1;
+    conn->upstream_fd = fds[0];
+    conn->upstream_idx = 0;
+    conn->upstream_backend_idx = 0;
+    conn->request_config = &old_config;
+    const u16 probe_allocation = port.endpoint_probe_allocation_for_config(&old_config, 0, 0);
+    conn->health_probe_slot_uid = probe_allocation;
+    set_probe_in_flight_allocation(probe_allocation, true);
+    static constexpr char kResponse[] = "HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n";
+    REQUIRE_EQ(conn->upstream_recv_buf.write(reinterpret_cast<const u8*>(kResponse),
+                                             sizeof(kResponse) - 1),
+               sizeof(kResponse) - 1);
+
+    const u16 allocation = port.endpoint_allocation_for_config(&old_config, 0, 0);
+    const u64 incarnation = port.endpoint_incarnation_for_config(&old_config, 0, 0);
+    record_active_probe_result_allocation(
+        allocation, false, 1, &old_config.upstreams[0], 0, incarnation);
+    CHECK(backend_ejected_allocation(allocation, 1, &old_config.upstreams[0], 0, incarnation));
+
+    u64 id = 0;
+    REQUIRE(port.request_reload(ReloadRequestSource::Route, &id));
+    ReloadRequest request{};
+    REQUIRE(port.take_reload(&request));
+    RouteConfig new_config;
+    REQUIRE(new_config.add_upstream("retained-probe", 0x7f000001u, 8017).has_value());
+    REQUIRE(new_config.set_upstream_health_check(0, "/health", 7, 1000, 200));
+    REQUIRE(port.complete_reload(
+        id, request.source, ReloadTerminalOutcome::Activated, 82, &new_config));
+    active = &new_config;
+
+    on_probe_response<EpollEventLoop>(
+        loop,
+        *conn,
+        IoEvent{
+            conn->id, static_cast<i32>(sizeof(kResponse) - 1), 0, 0, IoEventType::UpstreamRecv, 0});
+    CHECK_FALSE(
+        backend_ejected_allocation(allocation, 2, &old_config.upstreams[0], 0, incarnation));
+    CHECK_FALSE(probe_in_flight_allocation(probe_allocation));
+
+    close(fds[1]);
+    loop->shutdown();
+    close(listen_fd);
+    destroy_real_loop(loop);
 }
 
 TEST(active_health, recycled_allocation_clears_unrelated_endpoint_verdict) {
@@ -14881,6 +15002,29 @@ TEST(route, manual_health_override_excludes_backend_selection) {
     CHECK_EQ(
         select_backend_with_control_plane(&loop, static_cast<u16>(upstream.value()), 2, 1'000'000),
         1u);
+}
+
+TEST(route, compatible_reload_preserves_round_robin_cursor) {
+    RouteConfig old_config;
+    REQUIRE(old_config.add_upstream("cursor-reload", 0x7f000001u, 8180).has_value());
+    REQUIRE(old_config.add_upstream_backend(0, 0x7f000001u, 8181));
+    ControlPlaneMutationPort mutation;
+    mutation.reset(71, true, &old_config);
+    struct SelectionLoop {
+        ControlPlaneMutationPort* control_plane_mutation;
+    } loop{&mutation};
+    CHECK_EQ(select_backend_with_control_plane(&loop, 0, 2, 1'000'000, &old_config), 0u);
+
+    u64 id = 0;
+    REQUIRE(mutation.request_reload(ReloadRequestSource::Route, &id));
+    ReloadRequest request{};
+    REQUIRE(mutation.take_reload(&request));
+    RouteConfig new_config;
+    REQUIRE(new_config.add_upstream("cursor-reload", 0x7f000001u, 8180).has_value());
+    REQUIRE(new_config.add_upstream_backend(0, 0x7f000001u, 8181));
+    REQUIRE(mutation.complete_reload(
+        id, request.source, ReloadTerminalOutcome::Activated, 72, &new_config));
+    CHECK_EQ(select_backend_with_control_plane(&loop, 0, 2, 1'000'000, &new_config), 1u);
 }
 
 TEST(route, manual_health_override_fails_closed_when_every_backend_is_excluded) {
