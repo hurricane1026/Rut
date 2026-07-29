@@ -15113,7 +15113,7 @@ TEST(route, manual_health_override_excludes_backend_selection) {
         1u);
 }
 
-TEST(route, manual_healthy_override_admits_locally_ejected_backend) {
+TEST(route, manual_healthy_override_remains_subject_to_local_ejection) {
     RouteConfig config;
     auto upstream = config.add_upstream("manual-healthy", 0x7f000001u, 8082);
     REQUIRE(upstream);
@@ -15130,7 +15130,7 @@ TEST(route, manual_healthy_override_admits_locally_ejected_backend) {
     record_active_probe_result_allocation(
         allocation, false, 1'000'001, &config.upstreams[0], 1, incarnation);
     REQUIRE(mutation.mark({10, 0, 1}, true));
-    CHECK_EQ(select_backend_with_control_plane(&loop, 0, 2, 1'000'002, &config), 1u);
+    CHECK_EQ(select_backend_with_control_plane(&loop, 0, 2, 1'000'002, &config), 0u);
 }
 
 TEST(route, compatible_reload_preserves_round_robin_cursor) {
