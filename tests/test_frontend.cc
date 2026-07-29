@@ -605,10 +605,11 @@ static bool parse_markdown_fence_open_in_container(
     MarkdownFence* out) {
     std::string_view content;
     std::string normalized;
-    if (!markdown_strip_container(line, container, &content, &normalized)) return false;
-    MarkdownFence opening{};
-    if (!parse_markdown_fence_open(content, &opening) || !opening.container_segments.empty())
+    size_t content_column = 0;
+    if (!markdown_strip_container(line, container, &content, &normalized, &content_column))
         return false;
+    MarkdownFence opening{};
+    if (!parse_markdown_fence_open_content(content, &opening, content_column)) return false;
     opening.container_segments = container;
     opening.container_indent = 0;
     for (const auto& segment : container)
@@ -1258,6 +1259,7 @@ TEST(frontend, language_card_skip_marker_container_must_match_fence) {
               "- <!-- rut-example: skip pending -->", 0, &indent, &container) ==
           "<!-- rut-example: skip pending -->");
     CHECK(parse_markdown_fence_open_in_container("  ```rut", container, &fence));
+    CHECK(parse_markdown_fence_open_in_container("  \t~~~~rut", container, &fence));
     CHECK_FALSE(parse_markdown_fence_open_in_container("```rut", container, &fence));
 
     container.clear();
