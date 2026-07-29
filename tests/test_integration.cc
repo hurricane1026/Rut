@@ -2371,6 +2371,74 @@ TEST(upstream_concurrency_e2e, slot_released_on_upstream_failure) {
     destroy_real_loop(loop);
 }
 
+static u64 wait_upstream_zero_connect_handler(void* /*conn*/,
+                                              rut::jit::HandlerCtx* /*ctx*/,
+                                              const u8* /*req*/,
+                                              u32 /*len*/,
+                                              void* /*arena*/) {
+    return rut::jit::HandlerResult::make_yield_payload(1, rut::jit::YieldKind::UpstreamConnect, 1)
+        .pack();
+}
+
+TEST(route, no_eligible_backend_returns_bodyless_head_503_and_jit_wait_503) {
+    using namespace rut;
+    RouteConfig cfg{};
+    auto id = cfg.add_upstream("excluded", 0x7F000001, 1);
+    REQUIRE(id.has_value());
+    REQUIRE(cfg.add_proxy("/direct", 0, id.value()));
+    REQUIRE(cfg.add_jit_handler("/jit", 'G', &wait_upstream_zero_connect_handler));
+    const RouteConfig* active = &cfg;
+
+    ControlPlaneMutationPort mutation;
+    mutation.reset(41, true, &cfg);
+    REQUIRE(mutation.mark({41, static_cast<u16>(id.value()), 0}, false));
+
+    RealLoop* loop = create_real_loop();
+    REQUIRE(loop != nullptr);
+    auto lfd = create_listen_socket(0);
+    REQUIRE(lfd.has_value());
+    const i32 listen_fd = lfd.value();
+    const u16 port = get_port(listen_fd);
+    REQUIRE(loop->init(0, listen_fd).has_value());
+    loop->config_ptr = &active;
+    loop->control_plane_mutation = &mutation;
+    LoopThread lt = {loop, {}, 5000};
+    lt.start();
+
+    char buf[1024];
+    i32 client = connect_to(port);
+    REQUIRE(client >= 0);
+    static const char kHead[] = "HEAD /direct HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n";
+    REQUIRE(send_all(client, kHead, sizeof(kHead) - 1));
+    const i32 head_len = recv_timeout(client, buf, sizeof(buf), 2000);
+    REQUIRE_GT(head_len, 0);
+    CHECK(buf_contains(buf, static_cast<u32>(head_len), "503", 3));
+    i32 header_end = -1;
+    for (i32 i = 0; i + 3 < head_len; i++) {
+        if (buf[i] == '\r' && buf[i + 1] == '\n' && buf[i + 2] == '\r' && buf[i + 3] == '\n') {
+            header_end = i + 4;
+            break;
+        }
+    }
+    REQUIRE_GT(header_end, 0);
+    CHECK_EQ(head_len, header_end);
+    close(client);
+
+    client = connect_to(port);
+    REQUIRE(client >= 0);
+    static const char kJit[] = "GET /jit HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n";
+    REQUIRE(send_all(client, kJit, sizeof(kJit) - 1));
+    const i32 jit_len = recv_timeout(client, buf, sizeof(buf), 2000);
+    REQUIRE_GT(jit_len, 0);
+    CHECK(buf_contains(buf, static_cast<u32>(jit_len), "503", 3));
+    close(client);
+
+    lt.stop();
+    loop->shutdown();
+    close(listen_fd);
+    destroy_real_loop(loop);
+}
+
 // A tiny backend whose HTTP status for the health path is switchable at runtime
 // (atomic), so one server can model a failing-then-recovering backend. Each probe
 // uses Connection: close, so every probe is a fresh accepted connection.
@@ -2566,6 +2634,35 @@ TEST(active_health, probe_guard_follows_stable_endpoint_across_reload) {
     CHECK(probe_in_flight(&port, &new_config, 1, 0));
     set_probe_in_flight_allocation(old_allocation, false);
     CHECK_FALSE(probe_in_flight(&port, &new_config, 1, 0));
+}
+
+TEST(active_health, verdict_follows_stable_endpoint_across_reload) {
+    ControlPlaneMutationPort port;
+    RouteConfig old_config;
+    REQUIRE(old_config.add_upstream("users-health", 0x7f000001u, 8010).has_value());
+    port.reset(31, true, &old_config);
+    const u16 old_allocation = port.endpoint_allocation_for_config(&old_config, 0, 0);
+    REQUIRE_NE(old_allocation, ControlPlaneMutationPort::kInvalidAllocation);
+    record_active_probe_result_allocation(old_allocation, /*healthy=*/true, 1);
+    record_active_probe_result_allocation(old_allocation, /*healthy=*/false, 2);
+
+    u64 id = 0;
+    REQUIRE(port.request_reload(ReloadRequestSource::Route, &id));
+    ReloadRequest request{};
+    REQUIRE(port.take_reload(&request));
+    RouteConfig new_config;
+    REQUIRE(new_config.add_upstream("replacement-health", 0x7f000001u, 8010).has_value());
+    REQUIRE(new_config.add_upstream("users-health", 0x7f000001u, 8010).has_value());
+    REQUIRE(port.complete_reload(
+        id, request.source, ReloadTerminalOutcome::Activated, 32, &new_config));
+
+    const u16 replacement = port.endpoint_allocation_for_config(&new_config, 0, 0);
+    const u16 moved_users = port.endpoint_allocation_for_config(&new_config, 1, 0);
+    REQUIRE_NE(replacement, ControlPlaneMutationPort::kInvalidAllocation);
+    CHECK_EQ(moved_users, old_allocation);
+    CHECK_FALSE(backend_ejected_allocation(replacement, 2));
+    CHECK(backend_ejected_allocation(moved_users, 2));
+    record_active_probe_result_allocation(moved_users, /*healthy=*/true, 3);
 }
 
 TEST(active_health, stalled_probe_reaped_then_reprobed) {

@@ -1281,7 +1281,9 @@ TEST(control_plane_mutation, activation_keys_runtime_tokens_by_stable_identity) 
 
     UpstreamConcurrency concurrency;
     concurrency.reset();
-    REQUIRE(concurrency.try_acquire(old_users, 1));
+    // Even the unlimited predecessor is accounted against the shared token, so
+    // lowering the compatible successor to one observes the request already in flight.
+    REQUIRE(concurrency.try_acquire(old_users, ~u32{0}));
     CHECK_FALSE(concurrency.try_acquire(moved_users, 1));
     CHECK(concurrency.try_acquire(replacement, 1));
     concurrency.release(replacement);
