@@ -100,7 +100,11 @@ directly.
 The coordinator executes one request at a time:
 
 1. Admit the request into the single slot and assign a monotonically increasing
-   request id (busy SIGHUP attempts use the explicit terminal path below).
+   request id (busy SIGHUP attempts use the explicit terminal path below). At
+   this boundary the source provider creates a provider-owned immutable
+   snapshot and binds its version handle to the request id. All root and import
+   resolution for the request occurs inside that one snapshot; later filesystem
+   contents are never consulted.
 2. Compile/JIT a candidate without changing live registries or shard pointers.
 3. Validate the candidate before publication:
    - every timer shard selector is valid for the unchanged process shard count;
@@ -192,6 +196,19 @@ The coordinator executes one request at a time:
    shard installation acknowledgement does not cancel or drain a suspended
    invocation, TLS handshake, or open WebSocket session.
 
+The snapshot provider resolves the root and iteratively discovered imports to a
+closed manifest containing each canonical path, exact bytes, content identity,
+and import edge. Parsing may discover the closure incrementally, but every read
+uses the request's immutable provider version. Before compilation succeeds, the
+provider seals the complete transitive manifest and rejects path aliases,
+resolution outside the snapshot namespace, or an import absent from that
+version. The candidate generation records the sealed manifest identity.
+Mapping the root and later opening imports from the mutable live filesystem is
+forbidden, even if per-file metadata appears unchanged. If the configured
+provider cannot supply an atomic immutable view of the entire resolution
+namespace, reload admission fails with a source-snapshot terminal error; it
+never compiles a best-effort mixture of revisions.
+
 The generation whose process-startup `init` hook ran is a separate lifecycle
 owner. At startup, its `init`/`shutdown` code and immutable dependencies are
 retained as one dedicated lifecycle artifact, separate from the reloadable
@@ -222,10 +239,22 @@ its pin; the final release enables the replacement on its owner shard. Thus an
 idle callback can never target reclaimed code, and old and replacement timer
 invocations cannot overlap across generations.
 
-Compatible periodic timers have a stable declaration identity and transfer the
-predecessor's pending monotonic deadline and cadence phase to the replacement;
-installation does not restart their period. A changed timer anchors its first
-deadline explicitly to installation time. Transfer, cancellation, new deadline,
+A periodic timer's stable declaration identity is its canonical source-module
+identity plus declared timer name. Matching names reached through a different
+module or import alias do not collide. Two matched timers are cadence-compatible
+only when their owner shard set, period, scheduling/non-overlap mode, and
+compiler-produced semantic identity are identical. That semantic identity
+covers the complete lowered timer body, every transitively called helper and
+immutable captured declaration, and all timer declaration fields that can
+affect execution. Source-location-only changes do not affect it.
+
+Cadence-compatible timers transfer the predecessor's pending monotonic deadline
+and cadence phase to the replacement; installation does not restart their
+period. Any predicate mismatch makes the timer changed: the predecessor
+registration is retired and the replacement anchors its first deadline
+explicitly to installation time on its declared owner shard. In particular, a
+shard, period, body, helper, or captured-dependency change never inherits the
+old deadline. Transfer, cancellation, new deadline, compatibility identities,
 and anchor choice are captured as ordered scheduling events.
 
 If that deadline becomes overdue while a predecessor invocation keeps the
@@ -242,6 +271,17 @@ that drain may return to a pool only when its pinned generation and stable
 endpoint identity still match the installed config; otherwise it is closed.
 Numeric `(upstream_id, backend_idx)` reuse alone never authorizes pooling, so a
 replacement backend cannot inherit a socket connected to the old address.
+
+Stable endpoint identity covers every input that affects connection
+establishment, authentication, wire protocol, or safe pool reuse. It includes
+address family and address/port, transport, source bind/interface/namespace and
+relevant socket options, PROXY-protocol mode, TLS enablement, SNI, ALPN,
+verification policy and name, trust roots, cipher/version policy, client
+certificate and key identity, resumption context, and protocol framing or
+upgrade mode. The canonical identity also includes any future connection policy
+field unless that field has an explicit pool-compatibility rule. A difference
+in any such input creates a new endpoint identity; a predecessor connection
+that completes after drain is closed and can never enter the replacement pool.
 
 Every built-in active-health probe owns a pin to the exact generation and probe
 table it selected before asynchronous connect/send/receive begins. The pin lasts
@@ -393,6 +433,23 @@ representation only when the record also identifies the policy-state version
 it observed. Replay consumes the recorded sample/weights or exact result and
 never resamples its local clock during a ramp; a missing clock or effective
 selection input is `Unsupported`.
+
+Each stable server owns a never-reused slow-start allocation containing the
+recovery epoch id, epoch-start monotonic sample, current ramp state, and
+version. Adjacent generations share that allocation only when both the stable
+endpoint identity and the complete slow-start policy are identical, including
+duration, initial/floor weight, curve, and every event that starts or resets a
+ramp. An unrelated compatible reload therefore transfers the live epoch and
+cannot restart it or declare it complete.
+
+If the slow-start policy changes while an epoch is active, validation rejects
+the reload; an implementation may not silently restart, truncate, or
+recalculate the live ramp. Once no epoch is active, a policy change installs a
+fresh allocation at the recorded publication boundary. The endpoint remains at
+full eligibility at cutover, and only a later recovery trigger starts an epoch
+under the new policy. A changed stable endpoint also receives a fresh
+allocation. Allocation transfer, rejection, fresh installation, recovery
+trigger, epoch id, and cutover sample are recorded for replay.
 
 Randomized policies are captured explicitly. Every `.random` selection records
 the draw and chosen stable server identity; every `.powerOfTwo` selection
