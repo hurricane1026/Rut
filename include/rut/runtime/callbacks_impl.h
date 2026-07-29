@@ -84,10 +84,13 @@ struct AllocationBackendHealth {
     BackendHealth health{};
 };
 
-inline BackendHealth* backend_health_allocation(u16 allocation,
-                                                const UpstreamTarget* target = nullptr,
-                                                u32 backend_idx = 0,
-                                                u64 incarnation = 0) {
+inline BackendHealth* backend_health_allocation(
+    u16 allocation,
+    const UpstreamTarget* target = nullptr,
+    u32 backend_idx = 0,
+    u64 incarnation = 0,
+    u16 seed_allocation = ControlPlaneMutationPort::kInvalidAllocation,
+    u64 seed_incarnation = 0) {
     static thread_local AllocationBackendHealth
         health[ControlPlaneMutationPort::kMaxEndpointAllocations] = {};
     if (allocation >= ControlPlaneMutationPort::kMaxEndpointAllocations) return nullptr;
@@ -98,25 +101,37 @@ inline BackendHealth* backend_health_allocation(u16 allocation,
             cell.name_identity != target->name_identity ||
             cell.address != endpoint.sin_addr.s_addr || cell.port != endpoint.sin_port ||
             cell.family != endpoint.sin_family) {
+            BackendHealth seed{};
+            if (seed_allocation < ControlPlaneMutationPort::kMaxEndpointAllocations) {
+                const auto& source = health[seed_allocation];
+                if (source.owner_set && source.incarnation == seed_incarnation) {
+                    seed.active_down = source.health.active_down;
+                    seed.fails = source.health.fails;
+                    seed.eject_until_us = source.health.eject_until_us;
+                }
+            }
             cell.name_identity = target->name_identity;
             cell.incarnation = incarnation;
             cell.address = endpoint.sin_addr.s_addr;
             cell.port = endpoint.sin_port;
             cell.family = endpoint.sin_family;
             cell.owner_set = true;
-            cell.health = {};
+            cell.health = seed;
         }
     }
     return &cell.health;
 }
 
-inline bool backend_ejected_allocation(u16 allocation,
-                                       u64 now_us,
-                                       const UpstreamTarget* target = nullptr,
-                                       u32 backend_idx = 0,
-                                       u64 incarnation = 0) {
-    const BackendHealth* h =
-        backend_health_allocation(allocation, target, backend_idx, incarnation);
+inline bool backend_ejected_allocation(
+    u16 allocation,
+    u64 now_us,
+    const UpstreamTarget* target = nullptr,
+    u32 backend_idx = 0,
+    u64 incarnation = 0,
+    u16 seed_allocation = ControlPlaneMutationPort::kInvalidAllocation,
+    u64 seed_incarnation = 0) {
+    const BackendHealth* h = backend_health_allocation(
+        allocation, target, backend_idx, incarnation, seed_allocation, seed_incarnation);
     return h != nullptr && (h->active_down || now_us < h->eject_until_us);
 }
 
@@ -154,13 +169,17 @@ inline void record_backend_result(u16 upstream_id, u32 backend_idx, bool success
     record_backend_result(0, upstream_id, backend_idx, success, now_us);
 }
 
-inline void record_backend_result_allocation(u16 allocation,
-                                             bool success,
-                                             u64 now_us,
-                                             const UpstreamTarget* target = nullptr,
-                                             u32 backend_idx = 0,
-                                             u64 incarnation = 0) {
-    BackendHealth* h = backend_health_allocation(allocation, target, backend_idx, incarnation);
+inline void record_backend_result_allocation(
+    u16 allocation,
+    bool success,
+    u64 now_us,
+    const UpstreamTarget* target = nullptr,
+    u32 backend_idx = 0,
+    u64 incarnation = 0,
+    u16 seed_allocation = ControlPlaneMutationPort::kInvalidAllocation,
+    u64 seed_incarnation = 0) {
+    BackendHealth* h = backend_health_allocation(
+        allocation, target, backend_idx, incarnation, seed_allocation, seed_incarnation);
     if (h == nullptr) return;
     if (success) {
         h->fails = 0;
@@ -199,14 +218,18 @@ inline void record_active_probe_result(u16 upstream_id, u32 backend_idx, bool he
     record_active_probe_result(0, upstream_id, backend_idx, healthy, now_us);
 }
 
-inline void record_active_probe_result_allocation(u16 allocation,
-                                                  bool healthy,
-                                                  u64 now_us,
-                                                  const UpstreamTarget* target = nullptr,
-                                                  u32 backend_idx = 0,
-                                                  u64 incarnation = 0) {
+inline void record_active_probe_result_allocation(
+    u16 allocation,
+    bool healthy,
+    u64 now_us,
+    const UpstreamTarget* target = nullptr,
+    u32 backend_idx = 0,
+    u64 incarnation = 0,
+    u16 seed_allocation = ControlPlaneMutationPort::kInvalidAllocation,
+    u64 seed_incarnation = 0) {
     (void)now_us;
-    BackendHealth* h = backend_health_allocation(allocation, target, backend_idx, incarnation);
+    BackendHealth* h = backend_health_allocation(
+        allocation, target, backend_idx, incarnation, seed_allocation, seed_incarnation);
     if (h == nullptr) return;
     if (healthy) {
         h->active_down = false;
@@ -326,6 +349,10 @@ inline u32 select_backend_with_control_plane(Loop* loop,
                                              &allocation_config->upstreams[upstream_id],
                                              idx,
                                              mutation->endpoint_incarnation_for_config(
+                                                 allocation_config, upstream_id, idx),
+                                             mutation->endpoint_health_seed_allocation_for_config(
+                                                 allocation_config, upstream_id, idx),
+                                             mutation->endpoint_health_seed_incarnation_for_config(
                                                  allocation_config, upstream_id, idx));
         if (!ejected) {
             cell.cursor = static_cast<u16>((idx + 1) % backend_count);
@@ -491,6 +518,10 @@ inline void record_backend_result_for_config(Loop* loop,
                     target,
                     backend_id,
                     loop->control_plane_mutation->endpoint_incarnation_for_config(
+                        config, upstream_id, backend_id),
+                    loop->control_plane_mutation->endpoint_health_seed_allocation_for_config(
+                        config, upstream_id, backend_id),
+                    loop->control_plane_mutation->endpoint_health_seed_incarnation_for_config(
                         config, upstream_id, backend_id));
                 return;
             }
@@ -522,6 +553,10 @@ inline void record_active_probe_result_for_config(Loop* loop,
                     target,
                     backend_id,
                     loop->control_plane_mutation->endpoint_incarnation_for_config(
+                        config, upstream_id, backend_id),
+                    loop->control_plane_mutation->endpoint_health_seed_allocation_for_config(
+                        config, upstream_id, backend_id),
+                    loop->control_plane_mutation->endpoint_health_seed_incarnation_for_config(
                         config, upstream_id, backend_id));
                 return;
             }

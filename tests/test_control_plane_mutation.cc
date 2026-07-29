@@ -1075,6 +1075,17 @@ TEST(control_plane_mutation, activation_carries_overrides_across_probe_policy_ch
     CHECK_EQ(port.manual_health({4, 1, 0}), ManualHealthOverride::Healthy);
     CHECK_NE(port.endpoint_allocation_for_config(&new_config, 1, 0), old_allocation);
     CHECK_NE(port.endpoint_incarnation_for_config(&new_config, 1, 0), old_incarnation);
+    CHECK_EQ(port.endpoint_health_seed_allocation_for_config(&new_config, 1, 0), old_allocation);
+    CHECK_EQ(port.endpoint_health_seed_incarnation_for_config(&new_config, 1, 0), old_incarnation);
+    CHECK_EQ(port.endpoint_health_seed_allocation_for_config(nullptr, 1, 0),
+             ControlPlaneMutationPort::kInvalidAllocation);
+    CHECK_EQ(port.endpoint_health_seed_incarnation_for_config(nullptr, 1, 0), 0u);
+    CHECK_EQ(
+        port.endpoint_health_seed_allocation_for_config(&new_config, RouteConfig::kMaxUpstreams, 0),
+        ControlPlaneMutationPort::kInvalidAllocation);
+    CHECK_EQ(port.endpoint_health_seed_incarnation_for_config(
+                 &new_config, 1, UpstreamTarget::kMaxBackends),
+             0u);
     u64 version = 0;
     CHECK_EQ(port.manual_health({4, 0, 0}, &version), ManualHealthOverride::Unhealthy);
     CHECK_EQ(version, 1u);

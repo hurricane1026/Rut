@@ -2692,8 +2692,13 @@ TEST(active_health, policy_changes_isolate_retained_generation_verdicts) {
     const u64 new_incarnation = port.endpoint_incarnation_for_config(&new_config, 0, 0);
     CHECK_NE(new_allocation, old_allocation);
     CHECK_NE(new_incarnation, old_incarnation);
-    CHECK_FALSE(backend_ejected_allocation(
-        new_allocation, 1, &new_config.upstreams[0], 0, new_incarnation));
+    CHECK(backend_ejected_allocation(new_allocation,
+                                     1,
+                                     &new_config.upstreams[0],
+                                     0,
+                                     new_incarnation,
+                                     old_allocation,
+                                     old_incarnation));
     record_active_probe_result_allocation(
         new_allocation, false, 2, &new_config.upstreams[0], 0, new_incarnation);
     record_active_probe_result_allocation(
