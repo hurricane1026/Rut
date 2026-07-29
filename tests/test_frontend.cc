@@ -618,9 +618,13 @@ static bool parse_markdown_fence_open_in_container(
     return true;
 }
 
+static bool markdown_is_ascii_whitespace(char c) {
+    return c == ' ' || (c >= '\t' && c <= '\r');
+}
+
 static bool markdown_fence_language(std::string_view info, std::string_view language) {
     return info == language || (info.size() > language.size() && info.starts_with(language) &&
-                                (info[language.size()] == ' ' || info[language.size()] == '\t'));
+                                markdown_is_ascii_whitespace(info[language.size()]));
 }
 
 static bool markdown_fence_language_case_insensitive(std::string_view info,
@@ -631,8 +635,7 @@ static bool markdown_fence_language_case_insensitive(std::string_view info,
         if (c >= 'A' && c <= 'Z') c = static_cast<char>(c - 'A' + 'a');
         if (c != language[i]) return false;
     }
-    return info.size() == language.size() || info[language.size()] == ' ' ||
-           info[language.size()] == '\t';
+    return info.size() == language.size() || markdown_is_ascii_whitespace(info[language.size()]);
 }
 
 enum class MarkdownLinkReferenceDefinition {
@@ -1204,8 +1207,14 @@ TEST(frontend, language_card_fence_parser_accepts_commonmark_variants) {
     CHECK(markdown_fence_language(fence.info, "swift"));
     CHECK(markdown_fence_language_case_insensitive("Swift title=example", "swift"));
     CHECK(markdown_fence_language_case_insensitive("SWIFT", "swift"));
+    CHECK(markdown_fence_language_case_insensitive("Rut\fmetadata", "rut"));
+    CHECK(markdown_fence_language_case_insensitive("RUT\vmetadata", "rut"));
     CHECK_FALSE(markdown_fence_language_case_insensitive("swiftish", "swift"));
+    CHECK_FALSE(markdown_fence_language_case_insensitive("rut-metadata", "rut"));
     CHECK(is_markdown_fence_close("~~~~", fence));
+
+    REQUIRE(parse_markdown_fence_open("```rut\fmetadata", &fence));
+    CHECK(markdown_fence_language(fence.info, "rut"));
 
     REQUIRE(parse_markdown_fence_open("> ```rut", &fence));
     CHECK(markdown_fence_language(fence.info, "rut"));
