@@ -214,7 +214,7 @@ public:
             jit::HandlerCtx ctx{};
             if (cfg->timers[i].needs_control_plane_snapshot)
                 latch_control_plane_snapshot(&self(), &ctx);
-            latch_control_plane_mutation(&self(), &ctx);
+            latch_control_plane_mutation(&self(), &ctx, cfg->config_generation);
             (void)cfg->timers[i].fn(nullptr, &ctx, nullptr, 0, nullptr);
             jit::release_response_body_mutation_storage(&ctx);
             timer_fire_count[i]++;

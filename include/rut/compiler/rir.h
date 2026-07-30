@@ -82,13 +82,22 @@ struct FieldDef {
     const Type* type;
 };
 
-// Struct definition — arena-allocated, fields stored inline after.
+// User-declared structs are capped at eight fields by the frontend, while
+// generated tuple StructDefs need to preserve all ten frontend tuple slots.
+// Keep an explicit RIR bound so consumers can reject malformed flexible-array
+// metadata before dereferencing fields().
+static constexpr u32 kMaxStructFields = 10;
+
+// Struct definition — arena-allocated with bounded inline field storage. Keeping
+// the backing array in the object lets consumers validate field_count before
+// reading fields without trusting separately allocated flexible-array metadata.
 struct StructDef {
     Str name;
     u32 field_count;
-    // FieldDef fields[] follows in arena memory (flexible array idiom).
-    FieldDef* fields() { return reinterpret_cast<FieldDef*>(this + 1); }
-    const FieldDef* fields() const { return reinterpret_cast<const FieldDef*>(this + 1); }
+    u32 field_capacity;
+    FieldDef field_storage[kMaxStructFields];
+    FieldDef* fields() { return field_storage; }
+    const FieldDef* fields() const { return field_storage; }
 };
 
 // ── Values (SSA) ────────────────────────────────────────────────────
@@ -111,6 +120,13 @@ struct ValueId {
 
 // Sentinel for "no value" (void-returning instructions).
 static constexpr ValueId kNoValue = {0xFFFFFFFF};
+
+// Server values reserve zero for failed lookups (for example an out-of-bounds
+// ArrayGet). Valid upstream/backend pairs are stored one-based so a failed
+// lookup cannot accidentally address upstream 0, backend 0.
+inline constexpr i64 encode_server_token(u32 upstream, u32 backend) {
+    return static_cast<i64>((static_cast<u64>(upstream) << 16) | backend) + 1;
+}
 
 // ── Block IDs ───────────────────────────────────────────────────────
 
@@ -232,6 +248,9 @@ enum class Opcode : u8 {
     CacheGet,  // %r = cache.get %key, inst=N        → Optional(i64)  (imm.i32_val = instance)
     CacheSet,  // %r = cache.set %key, %val, inst=N  → i64 (echoes %val)
 
+    // ── Control-plane mutation ──
+    UpstreamMark,  // %r = upstream.mark %server, %healthy → bool
+
     // ── Bounded dynamic JSON response construction ──
     JsonReset,               // reset shard-local serializer scratch
     JsonAppendRaw,           // append compiler-owned JSON bytes (imm.str_val)
@@ -322,6 +341,7 @@ struct Instruction {
     // Overflow for variadic instructions (arena-allocated).
     // Non-null only when operand_count > kMaxInlineOperands.
     ValueId* extra_operands;
+    u32 extra_operand_capacity;
 
     // Instruction-specific immediate data (tagged by opcode).
     union Immediate {
@@ -410,6 +430,10 @@ struct Function {
     bool is_timer = false;
     u32 timer_interval_ms = 0;
     i32 timer_shard = -1;
+    // Upstreams whose manual-health policy is owned by this timer. The
+    // compile-to-config bridge fingerprints the timer body and attaches that
+    // stable policy identity to each target for reload compatibility.
+    u32 upstream_mark_mask = 0;
 
     // Blocks: arena-allocated array. blocks[0] is always entry.
     Block* blocks;
@@ -528,6 +552,11 @@ struct Module {
     };
     CacheInstance cache_instances[kMaxCacheInstances];
     u32 cache_instance_count = 0;
+
+    // Activation gate for mutation effects whose capture/replay event schema is
+    // not yet emitted by source lowering. Hand-built verifier tests may opt in
+    // explicitly; normal compiler output remains fail-closed.
+    bool upstream_mark_replay_complete = false;
 
     // Arena that owns all IR memory (mmap-backed, compiler use).
     MmapArena* arena;

@@ -2,6 +2,7 @@
 
 #include "rut/compiler/rir.h"
 #include "rut/jit/handler_abi.h"
+#include "rut/runtime/compile_to_config.h"
 #include <atomic>
 #include <cstddef>
 
@@ -102,6 +103,7 @@ struct Ctx {
     LLVMValueRef fn_req_content_length;
     LLVMValueRef fn_cache_get;
     LLVMValueRef fn_cache_set;
+    LLVMValueRef fn_upstream_mark;
     LLVMValueRef fn_time_now_micros;
     LLVMValueRef fn_parse_prime;
     LLVMValueRef fn_parse_unprime;
@@ -641,6 +643,16 @@ struct Ctx {
             fn_cache_set = LLVMAddFunction(llvm_mod, "rut_helper_cache_set", ft);
         }
         return fn_cache_set;
+    }
+
+    // u8 rut_helper_upstream_mark_checked(ptr, i64, i16, i16, i16, i8)
+    LLVMValueRef get_upstream_mark() {
+        if (!fn_upstream_mark) {
+            LLVMTypeRef params[] = {ptr_ty, i64_ty, i16_ty, i16_ty, i16_ty, i8_ty};
+            LLVMTypeRef ft = LLVMFunctionType(i8_ty, params, 6, 0);
+            fn_upstream_mark = LLVMAddFunction(llvm_mod, "rut_helper_upstream_mark_checked", ft);
+        }
+        return fn_upstream_mark;
     }
 
     // i64 rut_helper_time_now_micros()
@@ -1936,6 +1948,51 @@ static void emit_instruction(Ctx& c, const rir::Instruction& inst) {
             c.set_value(inst.result, val);
             break;
         }
+        case rir::Opcode::UpstreamMark: {
+            LLVMValueRef generation_off = LLVMConstInt(
+                c.i32_ty, static_cast<u32>(offsetof(HandlerCtx, config_generation)), 0);
+            LLVMValueRef generation_ptr = LLVMBuildGEP2(
+                c.builder, c.i8_ty, c.param_ctx, &generation_off, 1, "mark.generation.ptr");
+            LLVMValueRef generation =
+                LLVMBuildLoad2(c.builder, c.i64_ty, generation_ptr, "mark.generation");
+            LLVMValueRef server = c.get_value(inst.operands[0]);
+            LLVMValueRef decoded =
+                LLVMBuildSub(c.builder, server, LLVMConstInt(c.i64_ty, 1, 0), "mark.server.raw");
+            LLVMValueRef nonzero = LLVMBuildICmp(
+                c.builder, LLVMIntNE, server, LLVMConstInt(c.i64_ty, 0, 0), "mark.server.nonzero");
+            LLVMValueRef packed = LLVMBuildICmp(c.builder,
+                                                LLVMIntULE,
+                                                decoded,
+                                                LLVMConstInt(c.i64_ty, 0xffffffffu, 0),
+                                                "mark.server.packed");
+            LLVMValueRef valid = LLVMBuildAnd(c.builder, nonzero, packed, "mark.server.valid");
+            LLVMValueRef backend = LLVMBuildTrunc(c.builder, decoded, c.i16_ty, "mark.backend");
+            LLVMValueRef upstream_shift = LLVMBuildLShr(
+                c.builder, decoded, LLVMConstInt(c.i64_ty, 16, 0), "mark.upstream.shift");
+            LLVMValueRef upstream =
+                LLVMBuildTrunc(c.builder, upstream_shift, c.i16_ty, "mark.upstream");
+            LLVMValueRef invalid_server = LLVMConstInt(c.i16_ty, 0xffffu, 0);
+            backend =
+                LLVMBuildSelect(c.builder, valid, backend, invalid_server, "mark.backend.checked");
+            upstream = LLVMBuildSelect(
+                c.builder, valid, upstream, invalid_server, "mark.upstream.checked");
+            LLVMValueRef receiver =
+                LLVMConstInt(c.i16_ty, static_cast<u16>(static_cast<u32>(inst.imm.i32_val)), 0);
+            LLVMValueRef healthy =
+                LLVMBuildZExt(c.builder, c.get_value(inst.operands[1]), c.i8_ty, "mark.healthy");
+            LLVMValueRef args[] = {c.param_ctx, generation, receiver, upstream, backend, healthy};
+            LLVMValueRef accepted = LLVMBuildCall2(c.builder,
+                                                   LLVMGlobalGetValueType(c.get_upstream_mark()),
+                                                   c.get_upstream_mark(),
+                                                   args,
+                                                   6,
+                                                   "mark.accepted");
+            c.set_value(
+                inst.result,
+                LLVMBuildICmp(
+                    c.builder, LLVMIntNE, accepted, LLVMConstInt(c.i8_ty, 0, 0), "mark.ok"));
+            break;
+        }
 
         // ── Comparisons ──
         case rir::Opcode::CmpEq:
@@ -2671,6 +2728,7 @@ static bool emit_function(Ctx& c, const rir::Function& fn) {
 // ── Module Codegen ─────────────────────────────────────────────────
 
 CodegenResult codegen(const rir::Module& rir_mod) {
+    if (!marking_policies_valid_for_codegen(rir_mod)) return {nullptr, nullptr, false};
     static std::atomic<u32> next_regex_module_id{1};
     Ctx c{};
     c.llvm_ctx = LLVMContextCreate();

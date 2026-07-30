@@ -49,6 +49,7 @@ static MirTypeKind mir_type_kind(HirTypeKind kind) {
     return kind == HirTypeKind::Bool       ? MirTypeKind::Bool
            : kind == HirTypeKind::I32      ? MirTypeKind::I32
            : kind == HirTypeKind::I64      ? MirTypeKind::I64
+           : kind == HirTypeKind::Server   ? MirTypeKind::I64
            : kind == HirTypeKind::Str      ? MirTypeKind::Str
            : kind == HirTypeKind::Method   ? MirTypeKind::Method
            : kind == HirTypeKind::ByteSize ? MirTypeKind::ByteSize
@@ -269,9 +270,9 @@ static FrontendResult<MirValue> mir_value(const HirExpr& expr,
         v.bool_value = expr.bool_value;
         return v;
     }
-    if (expr.kind == HirExprKind::IntLit) {
+    if (expr.kind == HirExprKind::IntLit || expr.kind == HirExprKind::ServerLit) {
         v.kind = MirValueKind::IntConst;
-        v.type = mir_type_kind(expr.type);  // I32 or I64
+        v.type = mir_type_kind(expr.type);  // I32, I64, or opaque Server as I64
         v.int_value = expr.int_value;
         return v;
     }
@@ -778,6 +779,25 @@ static FrontendResult<MirValue> mir_value(const HirExpr& expr,
         v.rhs = &fn->values[fn->values.len - 1];
         return v;
     }
+    if (expr.kind == HirExprKind::UpstreamMark) {
+        auto server = mir_value(*expr.lhs, module, fn, ctx);
+        if (!server) return core::make_unexpected(server.error());
+        auto healthy = mir_value(*expr.rhs, module, fn, ctx);
+        if (!healthy) return core::make_unexpected(healthy.error());
+        if (!fn->values.push(server.value()))
+            return frontend_error(FrontendError::TooManyItems, expr.span);
+        MirValue* server_ptr = &fn->values[fn->values.len - 1];
+        if (!fn->values.push(healthy.value()))
+            return frontend_error(FrontendError::TooManyItems, expr.span);
+        v.kind = MirValueKind::UpstreamMark;
+        v.type = MirTypeKind::Bool;
+        v.int_value = expr.int_value;
+        if (expr.int_value >= 0 && expr.int_value < 32)
+            fn->upstream_mark_mask |= u32{1} << static_cast<u32>(expr.int_value);
+        v.lhs = server_ptr;
+        v.rhs = &fn->values[fn->values.len - 1];
+        return v;
+    }
     if (expr.kind == HirExprKind::IfElse) {
         auto cond = mir_value(*expr.lhs, module, fn, ctx);
         if (!cond) return core::make_unexpected(cond.error());
@@ -1148,6 +1168,9 @@ FrontendResult<MirModule*> build_mir(const HirModule& module) {
         fn.is_timer = module.routes[i].is_timer;
         fn.timer_interval_ms = module.routes[i].timer_interval_ms;
         fn.timer_shard = module.routes[i].timer_shard;
+        // Derive ownership from marks that survive MIR's static loop
+        // unrolling. HIR analysis can see marks in zero-iteration bodies.
+        fn.upstream_mark_mask = 0;
 
         // Propagate wait(ms) list 1:1. Codegen will turn each into a yield
         // boundary in the generated state machine.
@@ -2168,6 +2191,7 @@ FrontendResult<MirModule*> build_mir(const HirModule& module) {
             struct RouteStep {
                 enum class Kind : u8 {
                     Let,
+                    Effect,
                     Guard,
                     If,
                     IfControl,
@@ -3065,6 +3089,27 @@ FrontendResult<MirModule*> build_mir(const HirModule& module) {
                             if (!local_binding) return core::make_unexpected(local_binding.error());
                             continue;
                         }
+                        if (body_step.kind == HirForLoopBody::Step::Kind::Effect) {
+                            if (body_step.index >= fl.body.effects.len)
+                                return frontend_error(FrontendError::UnsupportedSyntax,
+                                                      body_step.span);
+                            auto effect =
+                                mir_value(fl.body.effects[body_step.index], module, &fn, &ctx);
+                            if (!effect) return core::make_unexpected(effect.error());
+                            if (!fn.values.push(effect.value()))
+                                return frontend_error(FrontendError::TooManyItems, body_step.span);
+                            RouteStep step{};
+                            step.kind = RouteStep::Kind::Effect;
+                            step.span = body_step.span;
+                            step.order_start = order_start;
+                            step.order_seq = route_step_seq++;
+                            step.effect_value_index = fn.values.len - 1;
+                            auto ctx_set = set_step_ctx(&step, ctx);
+                            if (!ctx_set) return core::make_unexpected(ctx_set.error());
+                            if (!steps.push(step))
+                                return frontend_error(FrontendError::TooManyItems, fl.span);
+                            continue;
+                        }
                         if (body_step.kind == HirForLoopBody::Step::Kind::Guard) {
                             if (body_step.index >= fl.body.guards.len)
                                 return frontend_error(FrontendError::UnsupportedSyntax,
@@ -3859,7 +3904,8 @@ FrontendResult<MirModule*> build_mir(const HirModule& module) {
                 const ForLoopCtx* step_ctx = route_step_ctx(steps[si]);
                 MirBlock block{};
                 block.label = si == 0 ? entry_label() : cont_label();
-                if (steps[si].kind == RouteStep::Kind::Let) {
+                if (steps[si].kind == RouteStep::Kind::Let ||
+                    steps[si].kind == RouteStep::Kind::Effect) {
                     if (!block.effects.push({steps[si].effect_value_index,
                                              steps[si].span,
                                              steps[si].effect_local_ref_index}))

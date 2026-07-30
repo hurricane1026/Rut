@@ -10,6 +10,7 @@
 #include "rut/jit/jit_engine.h"
 #include "rut/jit/runtime_helpers.h"
 #include "rut/runtime/cache_table.h"
+#include "rut/runtime/compile_to_config.h"
 #include "rut/runtime/connection.h"
 #include "rut/runtime/control_plane_mutation.h"
 #include "rut/runtime/jit_dispatch.h"
@@ -1456,6 +1457,204 @@ TEST(jit, control_plane_mutation_helpers_fail_closed_and_delegate_to_explicit_po
     CHECK_EQ(rut_helper_upstream_mark(&frame.ctx, 6, 0, 0, 2), 0u);
     CHECK_EQ(rut_helper_upstream_mark(&frame.ctx, 6, 0, 0, 0), 1u);
     CHECK_EQ(mutation.manual_health({6, 0, 0}), ManualHealthOverride::Unhealthy);
+    CHECK_EQ(rut_helper_upstream_mark_checked(&frame.ctx, 6, 1, 0, 0, 1), 0u);
+    CHECK_EQ(mutation.manual_health({6, 0, 0}), ManualHealthOverride::Unhealthy);
+    CHECK_EQ(rut_helper_upstream_mark_checked(&frame.ctx, 6, 0, 0, 0, 1), 1u);
+    CHECK_EQ(mutation.manual_health({6, 0, 0}), ManualHealthOverride::Healthy);
+}
+
+TEST(jit, pinned_timer_upstream_mark_executes_with_latched_generation) {
+    const char* src = R"rut(
+upstream users { backends: ["127.0.0.1:8080", "127.0.0.2:8080"] }
+timer check_health, every: 5s, shard: 0 {
+    for server in users.servers {
+        guard users.mark(server, healthy: true) else { return 500 }
+    }
+    return 200
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    REQUIRE(lower_to_rir(mir.value(), rir));
+    rir.module.upstream_mark_replay_complete = true;
+    auto cg = codegen(rir.module);
+    REQUIRE(cg.ok);
+    JitEngine engine;
+    REQUIRE(engine.init());
+    REQUIRE(engine.compile(cg.mod, cg.ctx));
+    auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
+    REQUIRE(handler != nullptr);
+
+    RouteConfig mutation_config;
+    REQUIRE(populate_route_config(mutation_config, rir.module));
+    ControlPlaneMutationPort mutation;
+    mutation.reset(9, false, &mutation_config);
+    TestHandlerCtxFrame frame{};
+    frame.ctx.control_plane_mutation = &mutation;
+    frame.ctx.config_generation = 9;
+    auto result = HandlerResult::unpack(handler(nullptr, &frame.ctx, nullptr, 0, nullptr));
+    CHECK_EQ(result.status_code, 200u);
+    CHECK_EQ(mutation.manual_health({9, 0, 0}), ManualHealthOverride::Healthy);
+    CHECK_EQ(mutation.manual_health({9, 0, 1}), ManualHealthOverride::Healthy);
+
+    mutation.reset(10, false, &mutation_config);
+    result = HandlerResult::unpack(handler(nullptr, &frame.ctx, nullptr, 0, nullptr));
+    CHECK_EQ(result.status_code, 500u);
+    CHECK_EQ(mutation.manual_health({10, 0, 0}), ManualHealthOverride::None);
+
+    engine.shutdown();
+    rir.destroy();
+}
+
+TEST(jit, out_of_bounds_server_lookup_cannot_mark_backend_zero) {
+    FrontendRirModule rir{};
+    REQUIRE(rir.init(1));
+    rir::Builder builder{};
+    builder.init(&rir.module);
+    auto function_result = builder.create_function(lit("check_health"), {}, 0);
+    REQUIRE(function_result);
+    rir::Function* fn = function_result.value();
+    fn->is_timer = true;
+    fn->timer_shard = 0;
+    fn->timer_interval_ms = 5000;
+    fn->upstream_mark_mask = 1;
+    auto block_result = builder.create_block(fn, lit("entry"));
+    REQUIRE(block_result);
+    builder.set_insert_point(fn, block_result.value());
+    auto server = builder.emit_const_i64(rir::encode_server_token(0, 0));
+    REQUIRE(server);
+    const rir::Type* i64_type = fn->values[server.value().id].type;
+    const rir::ValueId servers[] = {server.value()};
+    auto array = builder.emit_array_create(i64_type, servers, 1);
+    REQUIRE(array);
+    auto index = builder.emit_const_i32(5);
+    REQUIRE(index);
+    auto missing = builder.emit_array_get(array.value(), index.value());
+    REQUIRE(missing);
+    auto unhealthy = builder.emit_const_bool(false);
+    REQUIRE(unhealthy);
+    REQUIRE(builder.emit_upstream_mark(0, missing.value(), unhealthy.value()));
+    REQUIRE(builder.emit_ret_status(200));
+    rir.module.upstream_mark_replay_complete = true;
+    rir.module.upstream_count = 1;
+    rir.module.upstreams[0].name = lit("users");
+    rir.module.upstreams[0].has_address = true;
+    rir.module.upstreams[0].ip = 0x7f000001;
+    rir.module.upstreams[0].port = 8080;
+    auto cg = codegen(rir.module);
+    REQUIRE(cg.ok);
+    JitEngine engine;
+    REQUIRE(engine.init());
+    REQUIRE(engine.compile(cg.mod, cg.ctx));
+    auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_check_health"));
+    REQUIRE(handler != nullptr);
+
+    RouteConfig mutation_config;
+    REQUIRE(populate_route_config(mutation_config, rir.module));
+    ControlPlaneMutationPort mutation;
+    mutation.reset(11, false, &mutation_config);
+    TestHandlerCtxFrame frame{};
+    frame.ctx.control_plane_mutation = &mutation;
+    frame.ctx.config_generation = 11;
+    const auto result = HandlerResult::unpack(handler(nullptr, &frame.ctx, nullptr, 0, nullptr));
+    CHECK_EQ(result.status_code, 200u);
+    CHECK_EQ(mutation.manual_health({11, 0, 0}), ManualHealthOverride::None);
+
+    engine.shutdown();
+    rir.destroy();
+}
+
+TEST(jit, oversized_server_token_cannot_mark_truncated_backend) {
+    FrontendRirModule rir{};
+    REQUIRE(rir.init(1));
+    rir::Builder builder{};
+    builder.init(&rir.module);
+    auto function_result = builder.create_function(lit("check_health"), {}, 0);
+    REQUIRE(function_result);
+    rir::Function* fn = function_result.value();
+    fn->is_timer = true;
+    fn->timer_shard = 0;
+    fn->timer_interval_ms = 5000;
+    fn->upstream_mark_mask = 1;
+    auto block_result = builder.create_block(fn, lit("entry"));
+    REQUIRE(block_result);
+    builder.set_insert_point(fn, block_result.value());
+    auto server = builder.emit_const_i64((i64{1} << 32) | rir::encode_server_token(0, 0));
+    REQUIRE(server);
+    auto unhealthy = builder.emit_const_bool(false);
+    REQUIRE(unhealthy);
+    REQUIRE(builder.emit_upstream_mark(0, server.value(), unhealthy.value()));
+    REQUIRE(builder.emit_ret_status(200));
+    rir.module.upstream_mark_replay_complete = true;
+    rir.module.upstream_count = 1;
+    rir.module.upstreams[0].name = lit("users");
+    rir.module.upstreams[0].has_address = true;
+    rir.module.upstreams[0].ip = 0x7f000001;
+    rir.module.upstreams[0].port = 8080;
+    auto cg = codegen(rir.module);
+    REQUIRE(cg.ok);
+    JitEngine engine;
+    REQUIRE(engine.init());
+    REQUIRE(engine.compile(cg.mod, cg.ctx));
+    auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_check_health"));
+    REQUIRE(handler != nullptr);
+
+    RouteConfig mutation_config;
+    REQUIRE(populate_route_config(mutation_config, rir.module));
+    ControlPlaneMutationPort mutation;
+    mutation.reset(12, false, &mutation_config);
+    TestHandlerCtxFrame frame{};
+    frame.ctx.control_plane_mutation = &mutation;
+    frame.ctx.config_generation = 12;
+    const auto result = HandlerResult::unpack(handler(nullptr, &frame.ctx, nullptr, 0, nullptr));
+    CHECK_EQ(result.status_code, 200u);
+    CHECK_EQ(mutation.manual_health({12, 0, 0}), ManualHealthOverride::None);
+
+    engine.shutdown();
+    rir.destroy();
+}
+
+TEST(jit, codegen_rejects_malformed_marking_policy_at_common_boundary) {
+    FrontendRirModule rir{};
+    REQUIRE(rir.init(1));
+    rir::Builder builder{};
+    builder.init(&rir.module);
+    auto function_result = builder.create_function(lit("check_health"), {}, 0);
+    REQUIRE(function_result);
+    rir::Function* fn = function_result.value();
+    fn->is_timer = true;
+    fn->timer_shard = 0;
+    fn->timer_interval_ms = 5000;
+    fn->upstream_mark_mask = 1;
+    auto block_result = builder.create_block(fn, lit("entry"));
+    REQUIRE(block_result);
+    builder.set_insert_point(fn, block_result.value());
+    auto server = builder.emit_const_i64(rir::encode_server_token(0, 0));
+    REQUIRE(server);
+    auto healthy = builder.emit_const_bool(true);
+    REQUIRE(healthy);
+    REQUIRE(builder.emit_upstream_mark(0, server.value(), healthy.value()));
+    REQUIRE(builder.emit_ret_status(200));
+    rir.module.upstream_mark_replay_complete = true;
+    rir.module.upstream_count = 1;
+    rir.module.upstreams[0].name = lit("users");
+    rir.module.upstreams[0].has_address = true;
+    rir.module.upstreams[0].ip = 0x7f000001;
+    rir.module.upstreams[0].port = 8080;
+
+    fn->blocks[0].insts[2].operand_count = 1;
+    const auto cg = codegen(rir.module);
+    CHECK_FALSE(cg.ok);
+    CHECK_EQ(cg.mod, nullptr);
+    CHECK_EQ(cg.ctx, nullptr);
+    rir.destroy();
 }
 
 TEST(jit, control_plane_snapshots_serialize_exact_unsigned_json_and_fail_closed) {

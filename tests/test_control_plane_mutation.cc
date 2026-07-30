@@ -1321,6 +1321,60 @@ TEST(control_plane_mutation, activation_keys_runtime_tokens_by_stable_identity) 
     concurrency.release(moved_users);
 }
 
+TEST(control_plane_mutation, activation_carries_overrides_across_marking_policy_changes) {
+    for (u64 candidate_policy : {u64{0}, u64{22}}) {
+        ControlPlaneMutationPort port;
+        RouteConfig old_config;
+        REQUIRE(old_config.add_upstream("users", 0x7f000001u, 8000).has_value());
+        old_config.upstreams[0].marking_policy_identity = 11;
+        port.reset(3, true, &old_config);
+        REQUIRE(port.mark({3, 0, 0}, false));
+        const u16 old_allocation = port.endpoint_allocation_for_config(&old_config, 0, 0);
+        const u64 old_incarnation = port.endpoint_incarnation_for_config(&old_config, 0, 0);
+
+        u64 id = 0;
+        REQUIRE(port.request_reload(ReloadRequestSource::Route, &id));
+        ReloadRequest request{};
+        REQUIRE(port.take_reload(&request));
+        RouteConfig new_config;
+        REQUIRE(new_config.add_upstream("users", 0x7f000001u, 8000).has_value());
+        new_config.upstreams[0].marking_policy_identity = candidate_policy;
+        REQUIRE(port.complete_reload(
+            id, request.source, ReloadTerminalOutcome::Activated, 4, &new_config));
+
+        CHECK_EQ(port.manual_health({4, 0, 0}), ManualHealthOverride::Unhealthy);
+        CHECK_NE(port.endpoint_allocation_for_config(&new_config, 0, 0), old_allocation);
+        CHECK_NE(port.endpoint_incarnation_for_config(&new_config, 0, 0), old_incarnation);
+        CHECK_EQ(port.endpoint_health_seed_incarnation_for_config(&new_config, 0, 0),
+                 old_incarnation);
+    }
+}
+
+TEST(control_plane_mutation, activation_carries_overrides_for_same_marking_policy) {
+    ControlPlaneMutationPort port;
+    RouteConfig old_config;
+    REQUIRE(old_config.add_upstream("users", 0x7f000001u, 8000).has_value());
+    old_config.upstreams[0].marking_policy_identity = 11;
+    port.reset(3, true, &old_config);
+    REQUIRE(port.mark({3, 0, 0}, false));
+    const u16 old_allocation = port.endpoint_allocation_for_config(&old_config, 0, 0);
+    const u64 old_incarnation = port.endpoint_incarnation_for_config(&old_config, 0, 0);
+
+    u64 id = 0;
+    REQUIRE(port.request_reload(ReloadRequestSource::Route, &id));
+    ReloadRequest request{};
+    REQUIRE(port.take_reload(&request));
+    RouteConfig new_config;
+    REQUIRE(new_config.add_upstream("users", 0x7f000001u, 8000).has_value());
+    new_config.upstreams[0].marking_policy_identity = 11;
+    REQUIRE(
+        port.complete_reload(id, request.source, ReloadTerminalOutcome::Activated, 4, &new_config));
+
+    CHECK_EQ(port.manual_health({4, 0, 0}), ManualHealthOverride::Unhealthy);
+    CHECK_EQ(port.endpoint_allocation_for_config(&new_config, 0, 0), old_allocation);
+    CHECK_EQ(port.endpoint_incarnation_for_config(&new_config, 0, 0), old_incarnation);
+}
+
 TEST(control_plane_mutation, activation_rejects_skipped_generation) {
     ControlPlaneMutationPort port;
     RouteConfig old_config;
@@ -2102,9 +2156,9 @@ TEST(control_plane_mutation, handler_context_latches_only_the_explicit_loop_capa
     ControlPlaneMutationPort port;
     jit::HandlerCtx ctx{};
     loop.control_plane_mutation = &port;
-    latch_control_plane_mutation(&loop, &ctx);
+    latch_control_plane_mutation(&loop, &ctx, 0);
     CHECK(ctx.control_plane_mutation == &port);
-    latch_control_plane_mutation<Loop>(nullptr, &ctx);
+    latch_control_plane_mutation<Loop>(nullptr, &ctx, 0);
     CHECK(ctx.control_plane_mutation == nullptr);
 }
 

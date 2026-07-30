@@ -91,6 +91,7 @@ struct HirTypeAlias {
 enum class HirExprKind : u8 {
     BoolLit,
     IntLit,
+    ServerLit,
     StrLit,
     RegexMatch,
     Tuple,
@@ -199,6 +200,7 @@ enum class HirExprKind : u8 {
     // the value in rhs and echoes it (type I64).
     CacheGet,
     CacheSet,
+    UpstreamMark,
     // Compiler-owned reusable JSON plan. field_inits stores each raw segment
     // in `name` and the following dynamic leaf in `value`; str_value is the
     // final raw segment. The plan is serialized only at an output sink.
@@ -247,6 +249,9 @@ enum class HirTypeKind : u8 {
     // Opaque, json()-serializable control-plane snapshot types.
     Stats,
     Metrics,
+    // Opaque pointer-free `(upstream_id, backend_id)` token. The active config
+    // generation is latched in HandlerCtx when a timer invocation begins.
+    Server,
 };
 
 inline constexpr u32 kMaxTupleSlots = 10;
@@ -1103,6 +1108,7 @@ struct HirForLoopBody {
     struct Step {
         enum class Kind : u8 {
             Let,
+            Effect,
             Guard,
             If,
             Match,
@@ -1118,6 +1124,7 @@ struct HirForLoopBody {
     // Body-local lets are compile-time-expanded with each iteration. Keep
     // this small: each HirLocal carries an inline HirExpr init.
     static constexpr u32 kMaxLocals = 4;
+    static constexpr u32 kMaxEffects = 2;
     // 2 guards cover the canonical DESIGN.md examples (1 guard short-circuits
     // the request, rarely 2 for compound checks). Each HirGuard is ~4.5 KB
     // inline, so raising this directly grows HirRoute on the stack — see
@@ -1125,9 +1132,11 @@ struct HirForLoopBody {
     static constexpr u32 kMaxGuards = 2;
     static constexpr u32 kMaxIfs = 1;
     static constexpr u32 kMaxMatches = 1;
-    static constexpr u32 kMaxSteps = kMaxLocals + kMaxGuards + kMaxIfs + kMaxMatches + 2;
+    static constexpr u32 kMaxSteps =
+        kMaxLocals + kMaxEffects + kMaxGuards + kMaxIfs + kMaxMatches + 2;
     FixedVec<Step, kMaxSteps> steps;
     FixedVec<HirLocal, kMaxLocals> locals;
+    FixedVec<HirExpr, kMaxEffects> effects;
     FixedVec<HirGuard, kMaxGuards> guards;
     FixedVec<HirForLoopIf, kMaxIfs> ifs;
     FixedVec<HirForLoopMatch, kMaxMatches> matches;
@@ -1340,6 +1349,9 @@ struct HirRoute {
     u32 timer_interval_ms = 0;
     // `shard: N` — fire on that shard only; -1 = every shard (default).
     i32 timer_shard = -1;
+    // Upstreams mutated by this timer. Analysis uses this to enforce the
+    // single-writer contract across all pinned timers in a module.
+    u32 upstream_mark_mask = 0;
 
     HirRoute() = default;
     HirRoute(const HirRoute& other)
@@ -1363,7 +1375,8 @@ struct HirRoute {
           ws_handler(other.ws_handler),
           is_timer(other.is_timer),
           timer_interval_ms(other.timer_interval_ms),
-          timer_shard(other.timer_shard) {
+          timer_shard(other.timer_shard),
+          upstream_mark_mask(other.upstream_mark_mask) {
         rebase_from(other);
     }
     HirRoute& operator=(const HirRoute& other) {
@@ -1389,6 +1402,7 @@ struct HirRoute {
         is_timer = other.is_timer;
         timer_interval_ms = other.timer_interval_ms;
         timer_shard = other.timer_shard;
+        upstream_mark_mask = other.upstream_mark_mask;
         rebase_from(other);
         return *this;
     }
@@ -1413,7 +1427,8 @@ struct HirRoute {
           ws_handler(other.ws_handler),
           is_timer(other.is_timer),
           timer_interval_ms(other.timer_interval_ms),
-          timer_shard(other.timer_shard) {
+          timer_shard(other.timer_shard),
+          upstream_mark_mask(other.upstream_mark_mask) {
         rebase_from(other);
     }
     HirRoute& operator=(HirRoute&& other) noexcept {
@@ -1439,6 +1454,7 @@ struct HirRoute {
         is_timer = other.is_timer;
         timer_interval_ms = other.timer_interval_ms;
         timer_shard = other.timer_shard;
+        upstream_mark_mask = other.upstream_mark_mask;
         rebase_from(other);
         return *this;
     }
@@ -1506,6 +1522,9 @@ private:
             }
             for (u32 li = 0; li < for_loops[i].body.term_locals.len; li++) {
                 rebase_expr(for_loops[i].body.term_locals[li].init, other);
+            }
+            for (u32 ei = 0; ei < for_loops[i].body.effects.len; ei++) {
+                rebase_expr(for_loops[i].body.effects[ei], other);
             }
             for (u32 gi = 0; gi < for_loops[i].body.guards.len; gi++) {
                 rebase_guard(for_loops[i].body.guards[gi], other);

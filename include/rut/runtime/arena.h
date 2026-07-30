@@ -85,6 +85,7 @@ struct Arena {
 
         static constexpr u64 kHeaderSize = (sizeof(Block) + 15) & ~u64(15);
         u8* data() { return reinterpret_cast<u8*>(this) + kHeaderSize; }
+        const u8* data() const { return reinterpret_cast<const u8*>(this) + kHeaderSize; }
         u64 capacity() const { return size - kHeaderSize; }
         u64 remaining() const { return capacity() - used; }
     };
@@ -184,6 +185,19 @@ struct Arena {
     }
 
     u64 space_allocated() const { return total_allocated; }
+
+    bool contains_range(const void* ptr, u64 size) const {
+        if (ptr == nullptr) return size == 0;
+        const auto begin = reinterpret_cast<uintptr_t>(ptr);
+        if (size > static_cast<u64>(UINTPTR_MAX) - begin) return false;
+        const auto end = begin + static_cast<uintptr_t>(size);
+        for (const Block* block = current; block; block = block->prev) {
+            const auto block_begin = reinterpret_cast<uintptr_t>(block->data());
+            const auto block_end = block_begin + static_cast<uintptr_t>(block->used);
+            if (begin >= block_begin && end <= block_end) return true;
+        }
+        return false;
+    }
 
 private:
     Block* alloc_block(u64 needed, Block* prev) {

@@ -481,8 +481,11 @@ time:    time.nowMicros() -> i64 (monotonic µs; latched per invocation — all
          — now()/time(s)/Duration arithmetic still ⏳
 misc:    env(k) json(v) log.info/warn/error(msg, key: val, ...)
 admin:   stats() metrics() ✅ bounded JSON snapshots; reload() -> bool
-         (accepted, not activated; route-only, capability-gated) upstream_status()
-         config_dump() shard_stats() ⏳ runtime
+         (accepted, not activated; route-only, capability-gated) ⏳ runtime;
+         upstream.mark(server, healthy: bool) -> bool ⏳ compiler/runtime plumbing only:
+         timer-only, explicit shard, statically declared backends; production
+         activation is gated pending replay lowering; upstream_status()
+         config_dump() shard_stats() ⏳
 ```
 
 `json(stats())` is a handler-entry snapshot for the invoking shard;
@@ -498,10 +501,27 @@ aggregates the same `requests`, `connections`, and `memory` fields. Serializatio
 is bounded by the dynamic-response limit and fails the response closed with 500
 if the runtime capability is unavailable.
 
+`Server` is an opaque, non-constructible carrier that may be passed through a
+typed pure helper. The bounded form below documents the compile-time and runtime
+plumbing contract; it is not production-loadable yet because mark replay lowering
+has not activated the generated timer metadata:
+
+```rut
+upstream users { backends: ["127.0.0.1:8080"] }
+func check(_ server: Server) -> bool => true
+timer health, every: 5s, shard: 0 {
+    for server in users.servers {
+        guard users.mark(server, healthy: check(server)) else { return 503 }
+    }
+    return 200
+}
+```
+
 Control-plane mutations use visible boolean failure results and never introduce
 hidden waits. Their authority, generation ordering, and replay contract are
-specified in `docs/control-plane-mutations.md`; the runtime surface remains ⏳
-until that contract is connected end to end.
+specified in `docs/control-plane-mutations.md`; `reload()` activation remains ⏳
+until the process coordinator is connected end to end, and `upstream.mark`
+production activation remains ⏳ until replay lowering is implemented.
 
 ## Do NOT write (compile errors — with the fix)
 

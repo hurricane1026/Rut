@@ -1445,6 +1445,7 @@ private:
 
     [[nodiscard]] static bool compatible_health_policy(const UpstreamTarget& old_target,
                                                        const UpstreamTarget& new_target) {
+        if (old_target.marking_policy_identity != new_target.marking_policy_identity) return false;
         if (old_target.hc_enabled != new_target.hc_enabled) return false;
         if (!old_target.hc_enabled) return true;
         return old_target.hc_path_len == new_target.hc_path_len &&
@@ -2518,9 +2519,10 @@ private:
 };
 
 template <typename Loop>
-inline void latch_control_plane_mutation(Loop* loop, jit::HandlerCtx* ctx) {
+inline void latch_control_plane_mutation(Loop* loop, jit::HandlerCtx* ctx, u64 config_generation) {
     if (ctx == nullptr) return;
     ctx->control_plane_mutation = nullptr;
+    ctx->config_generation = config_generation;
     if (loop == nullptr) return;
     if constexpr (requires { loop->control_plane_mutation; })
         ctx->control_plane_mutation = loop->control_plane_mutation;

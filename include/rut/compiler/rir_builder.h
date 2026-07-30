@@ -76,21 +76,36 @@ struct Builder {
         for (u32 i = 0; i < kTypeKindCount; i++) type_cache[i] = nullptr;
     }
 
+    Result<Str> own_str(Str value) {
+        if (value.len == 0) return Str{};
+        if (value.ptr == nullptr) return err(RirError::InvalidState);
+        auto* owned = mod->arena->alloc_array<char>(value.len);
+        if (owned == nullptr) return err(RirError::OutOfMemory);
+        for (u32 i = 0; i < value.len; i++) owned[i] = value.ptr[i];
+        return Str{owned, value.len};
+    }
+
+    VoidResult set_str_immediate(Instruction* inst, Str value) {
+        inst->imm.str_val = TRY(own_str(value));
+        return {};
+    }
+
     // ── Module-level ────────────────────────────────────────────────
 
     Result<StructDef*> create_struct(Str name, const FieldDef* fields, u32 count) {
         // Check capacity before allocating to avoid wasting arena space.
-        if (!mod->struct_defs || mod->struct_count >= mod->struct_cap) {
+        if (count > kMaxStructFields || !mod->struct_defs || mod->struct_count >= mod->struct_cap) {
             return err(RirError::CapacityFull);
         }
         auto* arena = mod->arena;
-        u64 size = sizeof(StructDef) + sizeof(FieldDef) * count;
-        auto* sd = static_cast<StructDef*>(arena->alloc(size));
+        auto* sd = static_cast<StructDef*>(arena->alloc(sizeof(StructDef)));
         if (!sd) return err(RirError::OutOfMemory);
-        sd->name = name;
+        sd->name = TRY(own_str(name));
         sd->field_count = count;
+        sd->field_capacity = count;
         for (u32 i = 0; i < count; i++) {
             sd->fields()[i] = fields[i];
+            sd->fields()[i].name = TRY(own_str(fields[i].name));
         }
         mod->struct_defs[mod->struct_count++] = sd;
         return sd;
@@ -358,6 +373,7 @@ struct Builder {
         inst->loc = loc;
         inst->operand_count = 0;
         inst->extra_operands = nullptr;
+        inst->extra_operand_capacity = 0;
         for (u32 i = 0; i < sizeof(inst->imm); i++) {
             reinterpret_cast<u8*>(&inst->imm)[i] = 0;
         }
@@ -393,6 +409,7 @@ struct Builder {
             extra_ops[i] = ops[kMaxInlineOperands + i];
         }
         inst->extra_operands = extra_ops;
+        inst->extra_operand_capacity = extra;
         inst->operand_count = count;
         return {};
     }
@@ -402,7 +419,7 @@ struct Builder {
     Result<ValueId> emit_const_str(Str val, SourceLoc loc = {}) {
         auto* ty = TRY(make_type(TypeKind::Str));
         auto [inst, vid] = TRY(emit(Opcode::ConstStr, ty, loc));
-        inst->imm.str_val = val;
+        TRY_VOID(set_str_immediate(inst, val));
         return vid;
     }
 
@@ -461,14 +478,14 @@ struct Builder {
         auto* inner = TRY(make_type(TypeKind::Str));
         auto* ty = TRY(make_type(TypeKind::Optional, inner));
         auto [inst, vid] = TRY(emit(Opcode::ReqHeader, ty, loc));
-        inst->imm.str_val = name;
+        TRY_VOID(set_str_immediate(inst, name));
         return vid;
     }
 
     Result<ValueId> emit_req_param(Str name, SourceLoc loc = {}) {
         auto* ty = TRY(make_type(TypeKind::Str));
         auto [inst, vid] = TRY(emit(Opcode::ReqParam, ty, loc));
-        inst->imm.str_val = name;
+        TRY_VOID(set_str_immediate(inst, name));
         return vid;
     }
 
@@ -553,7 +570,7 @@ struct Builder {
         auto* inner = TRY(make_type(TypeKind::Str));
         auto* ty = TRY(make_type(TypeKind::Optional, inner));
         auto [inst, vid] = TRY(emit(Opcode::ReqCookie, ty, loc));
-        inst->imm.str_val = name;
+        TRY_VOID(set_str_immediate(inst, name));
         return vid;
     }
 
@@ -561,14 +578,14 @@ struct Builder {
         auto* inner = TRY(make_type(TypeKind::Str));
         auto* ty = TRY(make_type(TypeKind::Optional, inner));
         auto [inst, vid] = TRY(emit(Opcode::ReqQuery, ty, loc));
-        inst->imm.str_val = name;
+        TRY_VOID(set_str_immediate(inst, name));
         return vid;
     }
 
     Result<ValueId> emit_req_query_all(Str name, SourceLoc loc = {}) {
         auto* ty = TRY(make_type(TypeKind::StrList));
         auto [inst, vid] = TRY(emit(Opcode::ReqQueryAll, ty, loc));
-        inst->imm.str_val = name;
+        TRY_VOID(set_str_immediate(inst, name));
         return vid;
     }
 
@@ -576,14 +593,14 @@ struct Builder {
         auto* elem = TRY(make_type(TypeKind::Str));
         auto* ty = TRY(make_type(TypeKind::Array, elem));
         auto [inst, vid] = TRY(emit(Opcode::ReqQueryAll, ty, loc));
-        inst->imm.str_val = name;
+        TRY_VOID(set_str_immediate(inst, name));
         return vid;
     }
 
     Result<ValueId> emit_req_header_all(Str name, SourceLoc loc = {}) {
         auto* ty = TRY(make_type(TypeKind::StrList));
         auto [inst, vid] = TRY(emit(Opcode::ReqHeaderAll, ty, loc));
-        inst->imm.str_val = name;
+        TRY_VOID(set_str_immediate(inst, name));
         return vid;
     }
 
@@ -591,7 +608,7 @@ struct Builder {
         auto* elem = TRY(make_type(TypeKind::Str));
         auto* ty = TRY(make_type(TypeKind::Array, elem));
         auto [inst, vid] = TRY(emit(Opcode::ReqHeaderAll, ty, loc));
-        inst->imm.str_val = name;
+        TRY_VOID(set_str_immediate(inst, name));
         return vid;
     }
 
@@ -636,7 +653,7 @@ struct Builder {
     VoidResult emit_req_set_header(Str name, ValueId val, SourceLoc loc = {}) {
         if (!val_has_type(val, TypeKind::Str)) return err(RirError::InvalidState);
         auto r = TRY(emit(Opcode::ReqSetHeader, nullptr, loc));
-        r.inst->imm.str_val = name;
+        TRY_VOID(set_str_immediate(r.inst, name));
         r.inst->operands[0] = val;
         r.inst->operand_count = 1;
         return {};
@@ -645,7 +662,7 @@ struct Builder {
     VoidResult emit_req_add_header(Str name, ValueId val, SourceLoc loc = {}) {
         if (!val_has_type(val, TypeKind::Str)) return err(RirError::InvalidState);
         auto r = TRY(emit(Opcode::ReqAddHeader, nullptr, loc));
-        r.inst->imm.str_val = name;
+        TRY_VOID(set_str_immediate(r.inst, name));
         r.inst->operands[0] = val;
         r.inst->operand_count = 1;
         return {};
@@ -659,7 +676,7 @@ struct Builder {
         auto* inner = TRY(make_type(TypeKind::Str));
         auto* ty = TRY(make_type(TypeKind::Optional, inner));
         auto r = TRY(emit(Opcode::RespHeader, ty, loc));
-        r.inst->imm.str_val = name;
+        TRY_VOID(set_str_immediate(r.inst, name));
         r.inst->operands[0] = fallback;
         r.inst->operand_count = 1;
         return r.vid;
@@ -686,7 +703,7 @@ struct Builder {
     VoidResult emit_resp_set_header(Str name, ValueId val, SourceLoc loc = {}) {
         if (!val_has_type(val, TypeKind::Str)) return err(RirError::InvalidState);
         auto r = TRY(emit(Opcode::RespSetHeader, nullptr, loc));
-        r.inst->imm.str_val = name;
+        TRY_VOID(set_str_immediate(r.inst, name));
         r.inst->operands[0] = val;
         r.inst->operand_count = 1;
         return {};
@@ -695,7 +712,7 @@ struct Builder {
     VoidResult emit_resp_add_header(Str name, ValueId val, SourceLoc loc = {}) {
         if (!val_has_type(val, TypeKind::Str)) return err(RirError::InvalidState);
         auto r = TRY(emit(Opcode::RespAddHeader, nullptr, loc));
-        r.inst->imm.str_val = name;
+        TRY_VOID(set_str_immediate(r.inst, name));
         r.inst->operands[0] = val;
         r.inst->operand_count = 1;
         return {};
@@ -703,7 +720,7 @@ struct Builder {
 
     VoidResult emit_resp_remove_header(Str name, SourceLoc loc = {}) {
         auto r = TRY(emit(Opcode::RespRemoveHeader, nullptr, loc));
-        r.inst->imm.str_val = name;
+        TRY_VOID(set_str_immediate(r.inst, name));
         return {};
     }
 
@@ -748,7 +765,7 @@ struct Builder {
 
     VoidResult emit_json_append_raw(Str bytes, SourceLoc loc = {}) {
         auto r = TRY(emit(Opcode::JsonAppendRaw, nullptr, loc));
-        r.inst->imm.str_val = bytes;
+        TRY_VOID(set_str_immediate(r.inst, bytes));
         return {};
     }
 
@@ -834,7 +851,7 @@ struct Builder {
         auto [inst, vid] = TRY(emit(Opcode::StrRegexMatch, ty, loc));
         inst->operands[0] = str;
         inst->operand_count = 1;
-        inst->imm.str_val = pattern;
+        TRY_VOID(set_str_immediate(inst, pattern));
         return vid;
     }
 
@@ -974,7 +991,7 @@ struct Builder {
         auto [inst, vid] = TRY(emit(Opcode::IpInCidr, ty, loc));
         inst->operands[0] = ip;
         inst->operand_count = 1;
-        inst->imm.str_val = cidr_lit;
+        TRY_VOID(set_str_immediate(inst, cidr_lit));
         return vid;
     }
 
@@ -1061,7 +1078,7 @@ struct Builder {
         auto [inst, vid] = TRY(emit(Opcode::StructField, field_type, loc));
         inst->operands[0] = s;
         inst->operand_count = 1;
-        inst->imm.struct_ref.name = field_name;
+        inst->imm.struct_ref.name = TRY(own_str(field_name));
         inst->imm.struct_ref.type = field_type;
         return vid;
     }
@@ -1086,6 +1103,7 @@ struct Builder {
             inst->extra_operands = static_cast<ValueId*>(
                 mod->arena->alloc(sizeof(ValueId) * (count - kMaxInlineOperands)));
             if (!inst->extra_operands) return err(RirError::OutOfMemory);
+            inst->extra_operand_capacity = count - kMaxInlineOperands;
             for (u32 i = 0; i < count; i++) {
                 if (i < kMaxInlineOperands)
                     inst->operands[i] = values[i];
@@ -1178,6 +1196,22 @@ struct Builder {
         inst->operands[1] = value;
         inst->operand_count = 2;
         inst->imm.i32_val = static_cast<i32>(instance);
+        return vid;
+    }
+
+    Result<ValueId> emit_upstream_mark(u16 receiver_upstream,
+                                       ValueId server,
+                                       ValueId healthy,
+                                       SourceLoc loc = {}) {
+        if (!valid_val(server) || !val_has_type(server, TypeKind::I64) || !valid_val(healthy) ||
+            !val_has_type(healthy, TypeKind::Bool))
+            return err(RirError::InvalidState);
+        auto* ty = TRY(make_type(TypeKind::Bool));
+        auto [inst, vid] = TRY(emit(Opcode::UpstreamMark, ty, loc));
+        inst->operands[0] = server;
+        inst->operands[1] = healthy;
+        inst->operand_count = 2;
+        inst->imm.i32_val = receiver_upstream;
         return vid;
     }
 
@@ -1344,7 +1378,7 @@ struct Builder {
         if (headers != kNoValue && !valid_val(headers)) return err(RirError::InvalidState);
         auto* ty = TRY(make_type(TypeKind::Str));
         auto [inst, vid] = TRY(emit(Opcode::YieldHttpGet, ty, loc));
-        inst->imm.str_val = url;
+        TRY_VOID(set_str_immediate(inst, url));
         if (headers != kNoValue) {
             inst->operands[0] = headers;
             inst->operand_count = 1;

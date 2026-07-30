@@ -5,6 +5,7 @@
 #include "rut/compiler/lower_rir.h"
 #include "rut/compiler/mir_build.h"
 #include "rut/compiler/parser.h"
+#include "rut/compiler/rir_builder.h"
 #if RUT_ENABLE_JIT_TESTS
 #include "rut/jit/codegen.h"
 #include "rut/jit/jit_engine.h"
@@ -15072,6 +15073,72 @@ TEST(route, populate_route_config_accepts_pre_bound_upstreams) {
     rir.destroy();
 }
 
+TEST(route, populate_route_config_preserves_unmarked_pre_bound_runtime_address) {
+    using namespace rut;
+    const char* src =
+        "upstream backend at \"127.0.0.1:8080\"\n"
+        "route GET \"/api\" { return forward(backend) }\n";
+    auto lexed = lex(Str{src, static_cast<u32>(strlen(src))});
+    REQUIRE(lexed);
+    auto ast = parse_file(lexed.value());
+    REQUIRE(ast);
+    std::unique_ptr<AstFile> ast_owned(ast.value());
+    auto hir = analyze_file(*ast_owned);
+    REQUIRE(hir);
+    std::unique_ptr<HirModule> hir_owned(hir.value());
+    auto mir = build_mir(*hir_owned);
+    REQUIRE(mir);
+    std::unique_ptr<MirModule> mir_owned(mir.value());
+    FrontendRirModule rir{};
+    REQUIRE(lower_to_rir(*mir_owned, rir));
+
+    RouteConfig cfg{};
+    REQUIRE(cfg.add_upstream("backend", 0x0A000001, 9000).has_value());
+    CHECK(populate_route_config(cfg, rir.module));
+    CHECK_EQ(cfg.upstreams[0].addrs[0].sin_addr.s_addr, htonl(0x0A000001));
+    CHECK_EQ(cfg.upstreams[0].addrs[0].sin_port, htons(9000));
+    rir.destroy();
+}
+
+TEST(route, populate_route_config_validates_pre_bound_backend_identity_order) {
+    using namespace rut;
+    const char* src =
+        "upstream backend { backends: [\"127.0.0.1:8080\", \"127.0.0.2:8081\"] }\n"
+        "timer check_health, every: 5s, shard: 0 { for server in backend.servers { "
+        "backend.mark(server, healthy: true) } return 200 }\n";
+    auto lexed = lex(Str{src, static_cast<u32>(strlen(src))});
+    REQUIRE(lexed);
+    auto ast = parse_file(lexed.value());
+    REQUIRE(ast);
+    std::unique_ptr<AstFile> ast_owned(ast.value());
+    auto hir = analyze_file(*ast_owned);
+    REQUIRE(hir);
+    std::unique_ptr<HirModule> hir_owned(hir.value());
+    auto mir = build_mir(*hir_owned);
+    REQUIRE(mir);
+    std::unique_ptr<MirModule> mir_owned(mir.value());
+    FrontendRirModule rir{};
+    REQUIRE(lower_to_rir(*mir_owned, rir));
+    rir.module.upstream_mark_replay_complete = true;
+
+    // RouteConfig is intentionally large; keep the three fixtures off this
+    // already-deep debug-build stack frame.
+    auto missing = std::make_unique<RouteConfig>();
+    REQUIRE(missing->add_upstream("backend", 0x7F000001, 8080).has_value());
+    CHECK_FALSE(populate_route_config(*missing, rir.module));
+
+    auto reversed = std::make_unique<RouteConfig>();
+    REQUIRE(reversed->add_upstream("backend", 0x7F000002, 8081).has_value());
+    REQUIRE(reversed->add_upstream_backend(0, 0x7F000001, 8080));
+    CHECK_FALSE(populate_route_config(*reversed, rir.module));
+
+    auto matching = std::make_unique<RouteConfig>();
+    REQUIRE(matching->add_upstream("backend", 0x7F000001, 8080).has_value());
+    REQUIRE(matching->add_upstream_backend(0, 0x7F000002, 8081));
+    CHECK(populate_route_config(*matching, rir.module));
+    rir.destroy();
+}
+
 // Round-robin backend selection: a multi-backend upstream rotates through its
 // endpoints; a single-backend upstream always returns index 0. Uses dedicated
 // upstream ids so the per-shard (thread_local) cursor + health start clean.
@@ -15337,6 +15404,19 @@ TEST(route, upstream_health_check_compiles) {
     CHECK((Str{cfg.upstreams[0].hc_path, cfg.upstreams[0].hc_path_len}.eq({"/healthz", 8})));
     CHECK_EQ(cfg.upstreams[0].hc_interval_ms, 5000u);
     CHECK_EQ(cfg.upstreams[0].hc_expected_status, 200u);
+
+    // Runtime-bound addresses must still inherit the DSL health policy.
+    RouteConfig prebound{};
+    REQUIRE(prebound.add_upstream("api", 0x0A000001, 9000).has_value());
+    REQUIRE(populate_route_config(prebound, rir.module));
+    CHECK_EQ(prebound.upstreams[0].addrs[0].sin_addr.s_addr, htonl(0x0A000001));
+    CHECK_EQ(prebound.upstreams[0].addrs[0].sin_port, htons(9000));
+    CHECK(prebound.upstreams[0].hc_enabled);
+    CHECK_EQ(prebound.upstreams[0].hc_path_len, 8u);
+    CHECK((
+        Str{prebound.upstreams[0].hc_path, prebound.upstreams[0].hc_path_len}.eq({"/healthz", 8})));
+    CHECK_EQ(prebound.upstreams[0].hc_interval_ms, 5000u);
+    CHECK_EQ(prebound.upstreams[0].hc_expected_status, 200u);
     rir.destroy();
 }
 
@@ -15491,6 +15571,2493 @@ TEST(route, populate_route_config_rejects_pre_bound_over_long_name) {
     CHECK_EQ(compiled_cfg.upstreams[0].name_identity,
              upstream_name_identity("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", 32));
     rir.destroy();
+}
+
+TEST(route, populate_route_config_fingerprints_upstream_marking_policy) {
+    using namespace rut;
+    auto compile_policy = [](const char* source, u64* out_identity) {
+        auto lexed = lex(Str{source, static_cast<u32>(strlen(source))});
+        if (!lexed) return false;
+        auto ast = parse_file(lexed.value());
+        if (!ast) return false;
+        std::unique_ptr<AstFile> ast_owned(ast.value());
+        auto hir = analyze_file(*ast_owned);
+        if (!hir) return false;
+        std::unique_ptr<HirModule> hir_owned(hir.value());
+        auto mir = build_mir(*hir_owned);
+        if (!mir) return false;
+        std::unique_ptr<MirModule> mir_owned(mir.value());
+        FrontendRirModule rir{};
+        if (!lower_to_rir(*mir_owned, rir)) return false;
+        rir.module.upstream_mark_replay_complete = true;
+        RouteConfig cfg{};
+        const bool populated = populate_route_config(cfg, rir.module);
+        if (populated) *out_identity = cfg.upstreams[0].marking_policy_identity;
+        rir.destroy();
+        return populated;
+    };
+
+    const char* healthy =
+        "upstream users at \"127.0.0.1:8080\"\n"
+        "timer check_health, every: 5s, shard: 0 { for server in users.servers { "
+        "users.mark(server, healthy: true) } return 200 }\n";
+    const char* unhealthy =
+        "upstream users at \"127.0.0.1:8080\"\n"
+        "timer check_health, every: 5s, shard: 0 { for server in users.servers { "
+        "users.mark(server, healthy: false) } return 200 }\n";
+    const char* timed =
+        "upstream users at \"127.0.0.1:8080\"\n"
+        "timer check_health, every: 5s, shard: 0 { for server in users.servers { "
+        "users.mark(server, healthy: time.nowMicros() > 0) } return 200 }\n";
+    const char* array_carrier =
+        "func duplicate(values: [bool]) -> [[bool]] => [values, values, values, values]\n"
+        "func inspect(_ groups: [[bool]], flag: bool) -> bool => flag\n"
+        "upstream users at \"127.0.0.1:8080\"\n"
+        "timer check_health, every: 5s, shard: 0 { for server in users.servers { "
+        "users.mark(server, healthy: inspect(duplicate([true]), true)) } return 200 }\n";
+    const char* struct_carrier =
+        "struct Verdict { healthy: bool, a: bool, b: bool, c: bool }\n"
+        "upstream users at \"127.0.0.1:8080\"\n"
+        "timer check_health, every: 5s, shard: 0 { for server in users.servers { "
+        "users.mark(server, healthy: Verdict(healthy: true, a: false, b: true, c: false).healthy) "
+        "} return 200 }\n";
+    const char* regex_health =
+        "upstream users at \"127.0.0.1:8080\"\n"
+        "timer check_health, every: 5s, shard: 0 { for server in users.servers { "
+        "users.mark(server, healthy: \"healthy\".matches(re\"health.*\")) } return 200 }\n";
+    const char* nullable_health =
+        "func maybe(flag: bool) -> bool { if flag { true } else { nil } }\n"
+        "upstream users at \"127.0.0.1:8080\"\n"
+        "timer check_health, every: 5s, shard: 0 { for server in users.servers { "
+        "users.mark(server, healthy: maybe(time.nowMicros() > 0).or(false)) } return 200 }\n";
+    u64 healthy_identity = 0;
+    u64 unhealthy_identity = 0;
+    u64 timed_identity = 0;
+    u64 array_carrier_identity = 0;
+    u64 struct_carrier_identity = 0;
+    u64 regex_health_identity = 0;
+    u64 nullable_health_identity = 0;
+    REQUIRE(compile_policy(healthy, &healthy_identity));
+    REQUIRE(compile_policy(unhealthy, &unhealthy_identity));
+    REQUIRE(compile_policy(timed, &timed_identity));
+    REQUIRE(compile_policy(array_carrier, &array_carrier_identity));
+    REQUIRE(compile_policy(struct_carrier, &struct_carrier_identity));
+    REQUIRE(compile_policy(regex_health, &regex_health_identity));
+    REQUIRE(compile_policy(nullable_health, &nullable_health_identity));
+    CHECK_NE(healthy_identity, 0u);
+    CHECK_NE(unhealthy_identity, 0u);
+    CHECK_NE(timed_identity, 0u);
+    CHECK_NE(array_carrier_identity, 0u);
+    CHECK_NE(struct_carrier_identity, 0u);
+    CHECK_NE(regex_health_identity, 0u);
+    CHECK_NE(nullable_health_identity, 0u);
+    CHECK_NE(healthy_identity, unhealthy_identity);
+}
+
+TEST(route, static_empty_for_loop_does_not_claim_upstream_mark) {
+    using namespace rut;
+    const char* source = R"rut(
+upstream users at "127.0.0.1:8080"
+timer empty, every: 5s, shard: 0 {
+    let xs: [i32] = []
+    for x in xs {
+        for server in users.servers { users.mark(server, healthy: true) }
+    }
+    return 200
+}
+timer active, every: 5s, shard: 1 {
+    for server in users.servers { users.mark(server, healthy: true) }
+    return 200
+}
+)rut";
+    auto lexed = lex(Str{source, static_cast<u32>(strlen(source))});
+    REQUIRE(lexed);
+    auto ast = parse_file(lexed.value());
+    REQUIRE(ast);
+    std::unique_ptr<AstFile> ast_owned(ast.value());
+    auto hir = analyze_file(*ast_owned);
+    REQUIRE(hir);
+    std::unique_ptr<HirModule> hir_owned(hir.value());
+    auto mir = build_mir(*hir_owned);
+    REQUIRE(mir);
+    std::unique_ptr<MirModule> mir_owned(mir.value());
+    REQUIRE_EQ(mir_owned->functions.len, 2u);
+    CHECK_EQ(mir_owned->functions[0].upstream_mark_mask, 0u);
+    CHECK_EQ(mir_owned->functions[1].upstream_mark_mask, 1u);
+
+    FrontendRirModule rir{};
+    REQUIRE(lower_to_rir(*mir_owned, rir));
+    rir.module.upstream_mark_replay_complete = true;
+    CHECK(marking_policies_valid_for_codegen(rir.module));
+    RouteConfig cfg{};
+    CHECK(populate_route_config(cfg, rir.module));
+    rir.destroy();
+}
+
+TEST(route, marking_policy_accepts_arena_owned_variadic_constructors) {
+    using namespace rut;
+    FrontendRirModule rir{};
+    REQUIRE(rir.init(1, 1));
+    rir::Builder builder{};
+    builder.init(&rir.module);
+    auto bool_type_result = builder.make_type(rir::TypeKind::Bool);
+    REQUIRE(bool_type_result);
+    const rir::Type* bool_type = bool_type_result.value();
+    rir::FieldDef fields[4] = {
+        {Str{"a", 1}, bool_type},
+        {Str{"b", 1}, bool_type},
+        {Str{"c", 1}, bool_type},
+        {Str{"d", 1}, bool_type},
+    };
+    auto struct_result = builder.create_struct(Str{"Verdict", 7}, fields, 4);
+    REQUIRE(struct_result);
+    auto function_result = builder.create_function(Str{"check", 5}, Str{}, 0);
+    REQUIRE(function_result);
+    rir::Function* fn = function_result.value();
+    fn->is_timer = true;
+    fn->timer_shard = 0;
+    fn->timer_interval_ms = 5000;
+    fn->upstream_mark_mask = 1;
+    auto block_result = builder.create_block(fn, Str{"entry", 5});
+    REQUIRE(block_result);
+    builder.set_insert_point(fn, block_result.value());
+    rir::ValueId values[4]{};
+    for (u32 i = 0; i < 4; i++) {
+        auto value = builder.emit_const_bool(i % 2 == 0);
+        REQUIRE(value);
+        values[i] = value.value();
+    }
+    auto array = builder.emit_array_create(bool_type, values, 4);
+    REQUIRE(array);
+    auto record = builder.emit_struct_create(struct_result.value(), values, 4);
+    REQUIRE(record);
+    auto server = builder.emit_const_i64(rir::encode_server_token(0, 0));
+    REQUIRE(server);
+    auto mark = builder.emit_upstream_mark(0, server.value(), values[0]);
+    REQUIRE(mark);
+    REQUIRE(builder.emit_ret_status(200));
+    rir.module.upstream_mark_replay_complete = true;
+    rir.module.upstream_count = 1;
+    rir.module.upstreams[0].name = Str{"users", 5};
+    rir.module.upstreams[0].has_address = true;
+    rir.module.upstreams[0].ip = 0x7f000001;
+    rir.module.upstreams[0].port = 8080;
+    auto& array_inst = fn->blocks[0].insts[4];
+    CHECK_GT(array_inst.operand_count, rir::kMaxInlineOperands);
+    CHECK_GT(fn->blocks[0].insts[5].operand_count, rir::kMaxInlineOperands);
+    const u32 capacity = array_inst.extra_operand_capacity;
+    array_inst.extra_operand_capacity = 0;
+    RouteConfig undersized{};
+    CHECK_FALSE(populate_route_config(undersized, rir.module));
+    array_inst.extra_operand_capacity = capacity;
+    rir::ValueId forged_extra[1]{};
+    rir::ValueId* owned_extra = array_inst.extra_operands;
+    array_inst.extra_operands = forged_extra;
+    RouteConfig unowned{};
+    CHECK_FALSE(populate_route_config(unowned, rir.module));
+    array_inst.extra_operands = owned_extra;
+    RouteConfig cfg{};
+    CHECK(populate_route_config(cfg, rir.module));
+    rir.destroy();
+}
+
+TEST(route, populate_route_config_rejects_malformed_marking_policy_storage) {
+    using namespace rut;
+    rir::Instruction inst{};
+    rir::Block block{};
+    block.inst_count = 1;
+    block.inst_cap = 1;
+    block.insts = &inst;
+    rir::Function timer{};
+    timer.is_timer = true;
+    timer.timer_shard = 0;
+    timer.upstream_mark_mask = 1;
+    timer.block_count = 1;
+    timer.block_cap = 1;
+    timer.blocks = &block;
+    rir::Module mod{};
+    mod.functions = &timer;
+    mod.func_count = 1;
+    mod.func_cap = 1;
+
+    mod.functions = nullptr;
+    RouteConfig missing_functions{};
+    CHECK(!populate_route_config(missing_functions, mod));
+    mod.functions = &timer;
+
+    mod.func_count = 2;
+    auto oversized_functions = std::make_unique<RouteConfig>();
+    CHECK(!populate_route_config(*oversized_functions, mod));
+    mod.func_count = 1;
+
+    timer.blocks = nullptr;
+    RouteConfig missing_blocks{};
+    CHECK(!populate_route_config(missing_blocks, mod));
+    timer.blocks = &block;
+
+    timer.block_count = 2;
+    auto oversized_blocks = std::make_unique<RouteConfig>();
+    CHECK(!populate_route_config(*oversized_blocks, mod));
+    timer.block_count = 1;
+
+    block.inst_count = 2;
+    auto oversized_instructions = std::make_unique<RouteConfig>();
+    CHECK(!populate_route_config(*oversized_instructions, mod));
+    block.inst_count = 1;
+
+    rir::Value value{};
+    timer.values = &value;
+    timer.value_count = 1;
+    auto oversized_values = std::make_unique<RouteConfig>();
+    CHECK(!populate_route_config(*oversized_values, mod));
+    timer.values = nullptr;
+    timer.value_count = 0;
+
+    block.insts = nullptr;
+    RouteConfig missing_insts{};
+    CHECK(!populate_route_config(missing_insts, mod));
+    block.insts = &inst;
+
+    inst.operand_count = rir::kMaxInlineOperands + 1;
+    inst.extra_operands = nullptr;
+    RouteConfig missing_operands{};
+    CHECK(!populate_route_config(missing_operands, mod));
+
+    rir::ValueId undersized_extra[1]{};
+    inst.extra_operands = undersized_extra;
+    auto inflated_fixed_arity = std::make_unique<RouteConfig>();
+    CHECK(!populate_route_config(*inflated_fixed_arity, mod));
+
+    rir::StructDef malformed_def{};
+    malformed_def.field_count = rir::kMaxStructFields + 1;
+    const rir::Type malformed_struct_type{rir::TypeKind::Struct, nullptr, &malformed_def};
+    inst.operand_count = 0;
+    inst.op = rir::Opcode::StructCreate;
+    inst.imm.struct_ref.type = &malformed_struct_type;
+    RouteConfig oversized_struct{};
+    CHECK(!populate_route_config(oversized_struct, mod));
+
+    rir::Type cyclic_optional{rir::TypeKind::Optional, nullptr, nullptr};
+    cyclic_optional.inner = &cyclic_optional;
+    inst.imm.struct_ref.type = &cyclic_optional;
+    auto cyclic_type = std::make_unique<RouteConfig>();
+    CHECK(!populate_route_config(*cyclic_type, mod));
+
+    u64 cyclic_identity = 1;
+    marking_policy_identity_mix_type(&cyclic_identity, cyclic_optional);
+    CHECK_NE(cyclic_identity, 0u);
+}
+
+TEST(route, marking_policy_rejects_unbacked_arena_storage_ranges) {
+    using namespace rut;
+    MmapArena arena;
+    REQUIRE(arena.init(4096));
+    auto* functions = arena.alloc_array<rir::Function>(1);
+    REQUIRE(functions != nullptr);
+    rir::Module mod{};
+    mod.arena = &arena;
+    mod.functions = functions;
+    mod.func_count = 1;
+    mod.func_cap = 2;
+    CHECK_FALSE(marking_policies_valid_for_codegen(mod));
+
+    mod.func_cap = 1;
+    mod.functions = reinterpret_cast<rir::Function*>(reinterpret_cast<char*>(functions) + 1);
+    CHECK_FALSE(marking_policies_valid_for_codegen(mod));
+    mod.functions = functions;
+
+    rir::Block external_block{};
+    functions[0].blocks = &external_block;
+    functions[0].block_count = 1;
+    functions[0].block_cap = 1;
+    u32 emitted_mask = 0;
+    CHECK_FALSE(marking_policy_emitted_mask(mod, functions[0], 0, &emitted_mask));
+
+    auto* blocks = arena.alloc_array<rir::Block>(1);
+    REQUIRE(blocks != nullptr);
+    functions[0].blocks = blocks;
+    functions[0].block_count = 1;
+    functions[0].block_cap = 2;
+    CHECK_FALSE(marking_policy_arena_storage_shape_valid(mod, functions[0]));
+
+    functions[0].blocks = reinterpret_cast<rir::Block*>(reinterpret_cast<char*>(blocks) + 1);
+    functions[0].block_cap = 1;
+    CHECK_FALSE(marking_policy_arena_storage_shape_valid(mod, functions[0]));
+    functions[0].blocks = blocks;
+
+    functions[0].block_cap = 1;
+    auto* values = arena.alloc_array<rir::Value>(1);
+    REQUIRE(values != nullptr);
+    functions[0].values = values;
+    functions[0].value_count = 1;
+    functions[0].value_cap = 2;
+    CHECK_FALSE(marking_policy_arena_storage_shape_valid(mod, functions[0]));
+
+    functions[0].values = reinterpret_cast<rir::Value*>(reinterpret_cast<char*>(values) + 1);
+    functions[0].value_cap = 1;
+    CHECK_FALSE(marking_policy_arena_storage_shape_valid(mod, functions[0]));
+    functions[0].values = values;
+
+    functions[0].value_cap = 1;
+    auto* insts = arena.alloc_array<rir::Instruction>(1);
+    REQUIRE(insts != nullptr);
+    blocks[0].insts = insts;
+    blocks[0].inst_count = 1;
+    blocks[0].inst_cap = 2;
+    CHECK_FALSE(marking_policy_arena_storage_shape_valid(mod, functions[0]));
+
+    blocks[0].insts = reinterpret_cast<rir::Instruction*>(reinterpret_cast<char*>(insts) + 1);
+    blocks[0].inst_cap = 1;
+    CHECK_FALSE(marking_policy_arena_storage_shape_valid(mod, functions[0]));
+    blocks[0].insts = insts;
+
+    blocks[0].inst_cap = 1;
+    const rir::Type external_type{rir::TypeKind::I64, nullptr, nullptr};
+    values[0].type = &external_type;
+    CHECK_FALSE(marking_policy_arena_storage_shape_valid(mod, functions[0]));
+
+    auto* arena_str_type = arena.alloc_t<rir::Type>();
+    REQUIRE(arena_str_type != nullptr);
+    *arena_str_type = {rir::TypeKind::Str, nullptr, nullptr};
+    values[0].type = arena_str_type;
+    const char external_string[] = "outside";
+    insts[0].op = rir::Opcode::ConstStr;
+    insts[0].imm.str_val = Str{external_string, 7};
+    CHECK_FALSE(marking_policy_arena_storage_shape_valid(mod, functions[0]));
+    insts[0] = {};
+
+    insts[0].op = rir::Opcode::StructField;
+    insts[0].imm.struct_ref.name = Str{external_string, 7};
+    insts[0].imm.struct_ref.type = arena_str_type;
+    CHECK_FALSE(marking_policy_arena_storage_shape_valid(mod, functions[0]));
+    insts[0] = {};
+
+    auto* optional_type = arena.alloc_t<rir::Type>();
+    REQUIRE(optional_type != nullptr);
+    *optional_type = {rir::TypeKind::Optional, &external_type, nullptr};
+    values[0].type = optional_type;
+    CHECK_FALSE(marking_policy_arena_storage_shape_valid(mod, functions[0]));
+
+    auto* struct_type = arena.alloc_t<rir::Type>();
+    REQUIRE(struct_type != nullptr);
+    rir::StructDef external_def{};
+    *struct_type = {rir::TypeKind::Struct, nullptr, &external_def};
+    values[0].type = struct_type;
+    CHECK_FALSE(marking_policy_arena_storage_shape_valid(mod, functions[0]));
+
+    auto* arena_def = arena.alloc_t<rir::StructDef>();
+    REQUIRE(arena_def != nullptr);
+    *arena_def = {};
+    arena_def->name = Str{external_string, 7};
+    arena_def->field_count = 1;
+    arena_def->field_capacity = 1;
+    arena_def->fields()[0] = {Str{}, arena_str_type};
+    struct_type->struct_def = arena_def;
+    CHECK_FALSE(marking_policy_arena_storage_shape_valid(mod, functions[0]));
+
+    arena_def->name = {};
+    arena_def->fields()[0].name = Str{external_string, 7};
+    CHECK_FALSE(marking_policy_arena_storage_shape_valid(mod, functions[0]));
+    arena.destroy();
+}
+
+TEST(route, populate_route_config_rejects_oversized_cache_table_before_policy_scan) {
+    using namespace rut;
+    rir::Instruction get{};
+    get.op = rir::Opcode::CacheGet;
+    get.imm.i32_val = 0;
+    rir::Block block{};
+    block.inst_count = 1;
+    block.inst_cap = 1;
+    block.insts = &get;
+    rir::Function timer{};
+    timer.is_timer = true;
+    timer.block_count = 1;
+    timer.block_cap = 1;
+    timer.blocks = &block;
+    rir::Module mod{};
+    mod.functions = &timer;
+    mod.func_count = 1;
+    mod.func_cap = 1;
+    mod.cache_instance_count = rir::Module::kMaxCacheInstances + 1;
+    auto cfg = std::make_unique<RouteConfig>();
+    CHECK_FALSE(populate_route_config(*cfg, mod));
+}
+
+TEST(route, populate_route_config_validates_emitted_upstream_mark_mask) {
+    using namespace rut;
+    rir::Instruction policy[4]{};
+    policy[0].op = rir::Opcode::ConstI64;
+    policy[0].result = {0};
+    policy[0].imm.i64_val = rir::encode_server_token(0, 0);
+    policy[1].op = rir::Opcode::ConstBool;
+    policy[1].result = {1};
+    auto& mark = policy[2];
+    mark.op = rir::Opcode::UpstreamMark;
+    mark.imm.i32_val = 0;
+    mark.operand_count = 2;
+    mark.operands[0] = {0};
+    mark.operands[1] = {1};
+    mark.result = {2};
+    policy[3].op = rir::Opcode::RetStatus;
+    policy[3].result = rir::kNoValue;
+    policy[3].imm.i64_val = 200;
+    const rir::Type i64_type{rir::TypeKind::I64, nullptr, nullptr};
+    const rir::Type bool_type{rir::TypeKind::Bool, nullptr, nullptr};
+    rir::Value values[3] = {{&i64_type, {0}, 0}, {&bool_type, {0}, 1}, {&bool_type, {0}, 2}};
+    rir::Block block{};
+    block.inst_count = 4;
+    block.inst_cap = 4;
+    block.insts = policy;
+    rir::Function timer{};
+    timer.is_timer = true;
+    timer.timer_shard = 0;
+    timer.block_count = 1;
+    timer.block_cap = 1;
+    timer.blocks = &block;
+    timer.values = values;
+    timer.value_count = 3;
+    timer.value_cap = 3;
+    rir::Module mod{};
+    mod.upstream_count = 2;
+    mod.upstreams[0].name = Str{"users", 5};
+    mod.upstreams[1].name = Str{"orders", 6};
+    mod.functions = &timer;
+    mod.func_count = 1;
+    mod.func_cap = 1;
+
+    auto make_config = [] {
+        auto cfg = std::make_unique<RouteConfig>();
+        if (!cfg->add_upstream("users", 0x7F000001, 8000) ||
+            !cfg->add_upstream("orders", 0x7F000001, 9000))
+            return std::unique_ptr<RouteConfig>{};
+        return cfg;
+    };
+
+    timer.upstream_mark_mask = 1;
+    auto replay_gated = make_config();
+    REQUIRE(replay_gated != nullptr);
+    CHECK_FALSE(populate_route_config(*replay_gated, mod));
+    mod.upstream_mark_replay_complete = true;
+
+    timer.upstream_mark_mask = 0;
+    auto missing_mask = make_config();
+    REQUIRE(missing_mask != nullptr);
+    CHECK(!populate_route_config(*missing_mask, mod));
+
+    timer.upstream_mark_mask = u32{1} << 1;
+    auto wrong_target = make_config();
+    REQUIRE(wrong_target != nullptr);
+    CHECK(!populate_route_config(*wrong_target, mod));
+
+    timer.upstream_mark_mask = 1;
+    auto matching = make_config();
+    REQUIRE(matching != nullptr);
+    REQUIRE(populate_route_config(*matching, mod));
+    CHECK_NE(matching->upstreams[0].marking_policy_identity, 0u);
+    CHECK_EQ(matching->upstreams[1].marking_policy_identity, 0u);
+
+    values[0].def_inst = 2;
+    auto missing_mark_definition = make_config();
+    REQUIRE(missing_mark_definition != nullptr);
+    CHECK_FALSE(populate_route_config(*missing_mark_definition, mod));
+    values[0].def_inst = 0;
+
+    mark.operand_count = 1;
+    auto missing_mark_operand = make_config();
+    REQUIRE(missing_mark_operand != nullptr);
+    CHECK(!populate_route_config(*missing_mark_operand, mod));
+    mark.operand_count = 2;
+
+    mark.operands[0] = {3};
+    auto invalid_mark_operand = make_config();
+    REQUIRE(invalid_mark_operand != nullptr);
+    CHECK(!populate_route_config(*invalid_mark_operand, mod));
+    mark.operands[0] = {0};
+
+    values[0].type = &bool_type;
+    auto wrong_server_type = make_config();
+    REQUIRE(wrong_server_type != nullptr);
+    CHECK(!populate_route_config(*wrong_server_type, mod));
+    values[0].type = &i64_type;
+
+    values[1].type = &i64_type;
+    auto wrong_health_type = make_config();
+    REQUIRE(wrong_health_type != nullptr);
+    CHECK(!populate_route_config(*wrong_health_type, mod));
+    values[1].type = &bool_type;
+
+    values[2].type = &i64_type;
+    auto wrong_result_type = make_config();
+    REQUIRE(wrong_result_type != nullptr);
+    CHECK(!populate_route_config(*wrong_result_type, mod));
+    values[2].type = &bool_type;
+
+    mark.result = {3};
+    auto invalid_mark_result = make_config();
+    REQUIRE(invalid_mark_result != nullptr);
+    CHECK(!populate_route_config(*invalid_mark_result, mod));
+    mark.result = {2};
+
+    rir::Instruction yielding_policy[2]{};
+    yielding_policy[0].op = rir::Opcode::YieldTimer;
+    yielding_policy[0].result = rir::kNoValue;
+    yielding_policy[1] = mark;
+    block.insts = yielding_policy;
+    block.inst_count = 2;
+    auto suspending_mark = make_config();
+    REQUIRE(suspending_mark != nullptr);
+    CHECK(!populate_route_config(*suspending_mark, mod));
+    block.insts = &mark;
+    block.inst_count = 1;
+
+    timer.yield_count = 1;
+    auto synthetic_yield = make_config();
+    REQUIRE(synthetic_yield != nullptr);
+    CHECK(!populate_route_config(*synthetic_yield, mod));
+    timer.yield_count = 0;
+
+    mark.imm.i32_val = 2;
+    auto out_of_range = make_config();
+    REQUIRE(out_of_range != nullptr);
+    CHECK(!populate_route_config(*out_of_range, mod));
+
+    mark.imm.i32_val = 0;
+    timer.is_timer = false;
+    auto request_handler = make_config();
+    REQUIRE(request_handler != nullptr);
+    CHECK(!populate_route_config(*request_handler, mod));
+
+    timer.is_timer = true;
+    timer.timer_shard = -1;
+    auto unpinned = make_config();
+    REQUIRE(unpinned != nullptr);
+    CHECK(!populate_route_config(*unpinned, mod));
+
+    timer.timer_shard = 0;
+    rir::Function duplicate_timers[2] = {timer, timer};
+    mod.functions = duplicate_timers;
+    mod.func_count = 2;
+    mod.func_cap = 2;
+    auto duplicate_owner = make_config();
+    REQUIRE(duplicate_owner != nullptr);
+    CHECK(!populate_route_config(*duplicate_owner, mod));
+
+    rir::Instruction request_dependent[2]{};
+    request_dependent[0].op = rir::Opcode::ReqHttp11;
+    request_dependent[1] = mark;
+    block.insts = request_dependent;
+    block.inst_count = 2;
+    mod.functions = &timer;
+    mod.func_count = 1;
+    mod.func_cap = 1;
+    auto request_read = make_config();
+    REQUIRE(request_read != nullptr);
+    CHECK(!populate_route_config(*request_read, mod));
+
+    request_dependent[0].op = rir::Opcode::BodyParse;
+    auto body_parse = make_config();
+    REQUIRE(body_parse != nullptr);
+    CHECK(!populate_route_config(*body_parse, mod));
+}
+
+TEST(route, marking_policy_shape_validates_block_ids_and_targets) {
+    using namespace rut;
+    rir::Instruction jump{};
+    jump.op = rir::Opcode::Jmp;
+    jump.result = rir::kNoValue;
+    jump.imm.block_targets[0] = {3};
+    rir::Block blocks[2]{};
+    blocks[0].id = {1};
+    blocks[0].insts = &jump;
+    blocks[0].inst_count = 1;
+    blocks[0].inst_cap = 1;
+    blocks[1].id = {3};
+    rir::Function timer{};
+    timer.blocks = blocks;
+    timer.block_count = 2;
+    timer.block_cap = 4;
+    CHECK(marking_policy_shape_valid(timer));
+
+    blocks[1].id = {1};
+    CHECK_FALSE(marking_policy_shape_valid(timer));
+    blocks[1].id = {4};
+    CHECK_FALSE(marking_policy_shape_valid(timer));
+    blocks[1].id = {3};
+    jump.imm.block_targets[0] = {2};
+    CHECK_FALSE(marking_policy_shape_valid(timer));
+}
+
+TEST(route, upstream_mark_operands_require_dominating_definitions) {
+    using namespace rut;
+    const rir::Type i64_type{rir::TypeKind::I64, nullptr, nullptr};
+    const rir::Type bool_type{rir::TypeKind::Bool, nullptr, nullptr};
+    rir::Value values[3] = {{&i64_type, {1}, 0}, {&bool_type, {1}, 1}, {&bool_type, {3}, 0}};
+
+    rir::Instruction entry_branch{};
+    entry_branch.op = rir::Opcode::Br;
+    entry_branch.result = rir::kNoValue;
+    entry_branch.operand_count = 1;
+    entry_branch.operands[0] = {1};
+    entry_branch.imm.block_targets[0] = {1};
+    entry_branch.imm.block_targets[1] = {2};
+    rir::Instruction branch_with_definitions[3]{};
+    branch_with_definitions[0].op = rir::Opcode::ConstI64;
+    branch_with_definitions[0].result = {0};
+    branch_with_definitions[1].op = rir::Opcode::ConstBool;
+    branch_with_definitions[1].result = {1};
+    branch_with_definitions[2].op = rir::Opcode::Jmp;
+    branch_with_definitions[2].result = rir::kNoValue;
+    branch_with_definitions[2].imm.block_targets[0] = {3};
+    rir::Instruction merge_jump{};
+    merge_jump.op = rir::Opcode::Jmp;
+    merge_jump.result = rir::kNoValue;
+    merge_jump.imm.block_targets[0] = {3};
+    rir::Instruction mark{};
+    mark.op = rir::Opcode::UpstreamMark;
+    mark.result = {2};
+    mark.operand_count = 2;
+    mark.operands[0] = {0};
+    mark.operands[1] = {1};
+    mark.imm.i32_val = 0;
+
+    rir::Block blocks[4]{};
+    blocks[0] = {{0}, {}, &entry_branch, 1, 1};
+    blocks[1] = {{1}, {}, branch_with_definitions, 3, 3};
+    blocks[2] = {{2}, {}, &merge_jump, 1, 1};
+    blocks[3] = {{3}, {}, &mark, 1, 1};
+    rir::Function timer{};
+    timer.blocks = blocks;
+    timer.block_count = 4;
+    timer.block_cap = 4;
+    timer.values = values;
+    timer.value_count = 3;
+    timer.value_cap = 3;
+    rir::Module mod{};
+    u32 mask = 0;
+    CHECK_FALSE(marking_policy_emitted_mask(mod, timer, 1, &mask));
+
+    rir::Instruction entry_with_definitions[3] = {
+        branch_with_definitions[0], branch_with_definitions[1], entry_branch};
+    blocks[0].insts = entry_with_definitions;
+    blocks[0].inst_count = 3;
+    blocks[0].inst_cap = 3;
+    blocks[1].insts = &branch_with_definitions[2];
+    blocks[1].inst_count = 1;
+    blocks[1].inst_cap = 1;
+    values[0].def_block = {0};
+    values[1].def_block = {0};
+    CHECK(marking_policy_emitted_mask(mod, timer, 1, &mask));
+    CHECK_EQ(mask, 1u);
+
+    entry_with_definitions[2].operand_count = 0;
+    CHECK_FALSE(marking_policy_emitted_mask(mod, timer, 1, &mask));
+    entry_with_definitions[2].operand_count = 1;
+    entry_with_definitions[2].operands[0] = {3};
+    CHECK_FALSE(marking_policy_emitted_mask(mod, timer, 1, &mask));
+    entry_with_definitions[2].operands[0] = {0};
+    CHECK_FALSE(marking_policy_emitted_mask(mod, timer, 1, &mask));
+}
+
+TEST(route, upstream_mark_validates_transitive_ssa_dependencies) {
+    using namespace rut;
+    const rir::Type i32_type{rir::TypeKind::I32, nullptr, nullptr};
+    const rir::Type i64_type{rir::TypeKind::I64, nullptr, nullptr};
+    const rir::Type bool_type{rir::TypeKind::Bool, nullptr, nullptr};
+    rir::Value values[4] = {
+        {&i64_type, {0}, 0}, {&bool_type, {0}, 2}, {&i32_type, {0}, 1}, {&bool_type, {0}, 3}};
+    rir::Instruction policy[5]{};
+    policy[0].op = rir::Opcode::ConstI64;
+    policy[0].result = {0};
+    policy[1].op = rir::Opcode::ConstI32;
+    policy[1].result = {2};
+    policy[2].op = rir::Opcode::ArrayGet;
+    policy[2].result = {1};
+    policy[2].operand_count = 2;
+    policy[2].operands[0] = {4};
+    policy[2].operands[1] = {2};
+    policy[3].op = rir::Opcode::UpstreamMark;
+    policy[3].result = {3};
+    policy[3].operand_count = 2;
+    policy[3].operands[0] = {0};
+    policy[3].operands[1] = {1};
+    policy[4].op = rir::Opcode::RetStatus;
+    policy[4].result = rir::kNoValue;
+    policy[4].imm.i64_val = 200;
+    rir::Block block{{0}, {}, policy, 5, 5};
+    rir::Function timer{};
+    timer.blocks = &block;
+    timer.block_count = 1;
+    timer.block_cap = 1;
+    timer.values = values;
+    timer.value_count = 4;
+    timer.value_cap = 4;
+    rir::Module mod{};
+    timer.is_timer = true;
+    timer.timer_shard = 0;
+    timer.upstream_mark_mask = 1;
+    mod.upstream_count = 1;
+    mod.functions = &timer;
+    mod.func_count = 1;
+    mod.func_cap = 1;
+    mod.upstream_mark_replay_complete = true;
+    u32 mask = 0;
+    rir::ValueId undersized_extra[1]{};
+    policy[0].operand_count = rir::kMaxInlineOperands + 1;
+    policy[0].extra_operands = undersized_extra;
+    CHECK_FALSE(marking_policy_emitted_mask(mod, timer, 1, &mask));
+    policy[0].operand_count = 0;
+    policy[0].extra_operands = nullptr;
+
+    CHECK_FALSE(marking_policy_emitted_mask(mod, timer, 1, &mask));
+    CHECK_FALSE(marking_policies_valid_for_codegen(mod));
+
+    policy[2].operands[0] = {0};
+    CHECK_FALSE(marking_policy_emitted_mask(mod, timer, 1, &mask));
+
+    policy[2].op = rir::Opcode::ConstBool;
+    policy[2].operand_count = 0;
+    CHECK(marking_policies_valid_for_codegen(mod));
+}
+
+TEST(route, marking_policy_checks_cross_block_dominance_paths) {
+    using namespace rut;
+    rir::Instruction entry{};
+    entry.op = rir::Opcode::Br;
+    entry.imm.block_targets[0] = {1};
+    entry.imm.block_targets[1] = {2};
+    rir::Instruction definition_exit{};
+    definition_exit.op = rir::Opcode::Jmp;
+    definition_exit.imm.block_targets[0] = {2};
+    rir::Instruction use_exit{};
+    use_exit.op = rir::Opcode::RetStatus;
+    rir::Block blocks[3] = {
+        {{0}, {}, &entry, 1, 1},
+        {{1}, {}, &definition_exit, 1, 1},
+        {{2}, {}, &use_exit, 1, 1},
+    };
+    rir::Function fn{};
+    fn.blocks = blocks;
+    fn.block_count = 3;
+    fn.block_cap = 3;
+
+    // The direct entry -> use edge bypasses block 1.
+    CHECK_FALSE(marking_policy_block_dominates(fn, 1, 2));
+
+    // Once every path reaches block 1 first, its definitions dominate block 2.
+    entry.op = rir::Opcode::Jmp;
+    CHECK(marking_policy_block_dominates(fn, 1, 2));
+    CHECK(marking_policy_block_dominates(fn, 0, 2));
+    CHECK(marking_policy_block_dominates(fn, 2, 2));
+
+    // Malformed hand-built RIR and oversized policy graphs fail closed.
+    entry.imm.block_targets[0] = {99};
+    CHECK_FALSE(marking_policy_block_dominates(fn, 1, 2));
+    fn.block_count = 4097;
+    CHECK_FALSE(marking_policy_block_dominates(fn, 1, 2));
+}
+
+TEST(route, marking_policy_ssa_dominance_ignores_block_storage_order) {
+    using namespace rut;
+    const rir::Type i64_type{rir::TypeKind::I64, nullptr, nullptr};
+    rir::Value values[1] = {{&i64_type, {2}, 0}};
+    rir::Instruction entry{};
+    entry.op = rir::Opcode::Jmp;
+    entry.imm.block_targets[0] = {2};
+    rir::Instruction use{};
+    use.op = rir::Opcode::RetStatus;
+    rir::Instruction definition[2]{};
+    definition[0].op = rir::Opcode::ConstI64;
+    definition[0].result = {0};
+    definition[1].op = rir::Opcode::Jmp;
+    definition[1].imm.block_targets[0] = {1};
+    rir::Block blocks[3] = {
+        {{0}, {}, &entry, 1, 1},
+        {{1}, {}, &use, 1, 1},
+        {{2}, {}, definition, 2, 2},
+    };
+    rir::Function fn{};
+    fn.blocks = blocks;
+    fn.block_count = 3;
+    fn.block_cap = 3;
+    fn.values = values;
+    fn.value_count = 1;
+    fn.value_cap = 1;
+
+    CHECK(marking_policy_operand_has_dominating_definition(fn, {0}, 1, 0));
+}
+
+TEST(route, marking_policy_marks_must_dominate_every_exit) {
+    using namespace rut;
+    rir::Instruction entry{};
+    entry.op = rir::Opcode::Br;
+    entry.imm.block_targets[0] = {1};
+    entry.imm.block_targets[1] = {2};
+    rir::Instruction marked_exit[2]{};
+    marked_exit[0].op = rir::Opcode::UpstreamMark;
+    marked_exit[1].op = rir::Opcode::RetStatus;
+    rir::Instruction bypass_exit{};
+    bypass_exit.op = rir::Opcode::RetStatus;
+    rir::Block blocks[3] = {
+        {{0}, {}, &entry, 1, 1},
+        {{1}, {}, marked_exit, 2, 2},
+        {{2}, {}, &bypass_exit, 1, 1},
+    };
+    rir::Function fn{};
+    fn.blocks = blocks;
+    fn.block_count = 3;
+    fn.block_cap = 3;
+
+    CHECK_FALSE(marking_policy_is_mark_failure_exit(fn, bypass_exit, 2));
+    entry.operand_count = 1;
+    entry.operands[0] = {0};
+    CHECK_FALSE(marking_policy_is_mark_failure_exit(fn, entry, 1));
+    entry.operand_count = 0;
+    CHECK_FALSE(marking_policy_control_flow_valid(fn));
+
+    entry.op = rir::Opcode::Jmp;
+    marked_exit[1].op = rir::Opcode::Jmp;
+    marked_exit[1].imm.block_targets[0] = {2};
+    CHECK(marking_policy_control_flow_valid(fn));
+
+    // Every publication must dominate every exit, even when an earlier
+    // publication for the same receiver is already unconditional.
+    rir::Instruction entry_with_mark[2]{};
+    entry_with_mark[0].op = rir::Opcode::UpstreamMark;
+    entry_with_mark[1].op = rir::Opcode::Br;
+    entry_with_mark[1].imm.block_targets[0] = {1};
+    entry_with_mark[1].imm.block_targets[1] = {2};
+    blocks[0].insts = entry_with_mark;
+    blocks[0].inst_count = 2;
+    blocks[0].inst_cap = 2;
+    marked_exit[1].op = rir::Opcode::RetStatus;
+    CHECK_FALSE(marking_policy_control_flow_valid(fn));
+}
+
+TEST(route, marking_policy_source_search_is_bounded_for_shared_select_dags) {
+    using namespace rut;
+    static constexpr u32 kValueCount = 48;
+    rir::Value values[kValueCount]{};
+    rir::Instruction policy[kValueCount]{};
+    policy[0].op = rir::Opcode::ConstI64;
+    policy[0].result = {0};
+    policy[1].op = rir::Opcode::ConstI64;
+    policy[1].result = {1};
+    values[0].def_block = {0};
+    values[0].def_inst = 0;
+    values[1].def_block = {0};
+    values[1].def_inst = 1;
+    for (u32 vi = 2; vi < kValueCount; vi++) {
+        policy[vi].op = rir::Opcode::Select;
+        policy[vi].result = {vi};
+        policy[vi].operand_count = 3;
+        policy[vi].operands[1] = {vi - 1};
+        policy[vi].operands[2] = {vi - 1};
+        values[vi].def_block = {0};
+        values[vi].def_inst = vi;
+    }
+    rir::Block block{{0}, {}, policy, kValueCount, kValueCount};
+    rir::Function fn{};
+    fn.blocks = &block;
+    fn.block_count = 1;
+    fn.block_cap = 1;
+    fn.values = values;
+    fn.value_count = kValueCount;
+    fn.value_cap = kValueCount;
+
+    CHECK_FALSE(marking_policy_value_flows_to_source(fn, {kValueCount - 1}, {0}));
+    policy[kValueCount - 1].operands[2] = {0};
+    CHECK(marking_policy_value_flows_to_source(fn, {kValueCount - 1}, {0}));
+
+    bool exhausted = false;
+    CHECK_FALSE(marking_policy_value_flows_to_source_with_budget(
+        fn, {kValueCount - 1}, {0}, 0, &exhausted));
+    CHECK(exhausted);
+}
+
+TEST(route, upstream_mark_validates_string_opcode_types) {
+    using namespace rut;
+    const rir::Type str_type{rir::TypeKind::Str, nullptr, nullptr};
+    const rir::Type i64_type{rir::TypeKind::I64, nullptr, nullptr};
+    const rir::Type bool_type{rir::TypeKind::Bool, nullptr, nullptr};
+    rir::Value values[5] = {{&i64_type, {0}, 0},
+                            {&str_type, {0}, 1},
+                            {&str_type, {0}, 2},
+                            {&bool_type, {0}, 3},
+                            {&bool_type, {0}, 4}};
+    rir::Instruction policy[5]{};
+    policy[0].op = rir::Opcode::ConstI64;
+    policy[0].result = {0};
+    policy[1].op = rir::Opcode::ConstStr;
+    policy[1].result = {1};
+    policy[2].op = rir::Opcode::ConstStr;
+    policy[2].result = {2};
+    policy[3].op = rir::Opcode::StrHasPrefix;
+    policy[3].result = {3};
+    policy[3].operand_count = 2;
+    policy[3].operands[0] = {1};
+    policy[3].operands[1] = {2};
+    policy[4].op = rir::Opcode::UpstreamMark;
+    policy[4].result = {4};
+    policy[4].operand_count = 2;
+    policy[4].operands[0] = {0};
+    policy[4].operands[1] = {3};
+    rir::Block block{{0}, {}, policy, 5, 5};
+    rir::Function timer{};
+    timer.blocks = &block;
+    timer.block_count = 1;
+    timer.block_cap = 1;
+    timer.values = values;
+    timer.value_count = 5;
+    timer.value_cap = 5;
+    rir::Module mod{};
+    u32 mask = 0;
+
+    CHECK(marking_policy_emitted_mask(mod, timer, 1, &mask));
+    CHECK_EQ(mask, 1u);
+
+    policy[3].op = rir::Opcode::StrRegexMatch;
+    policy[3].operand_count = 1;
+    policy[3].imm.str_val = Str{"health.*", 8};
+    CHECK(marking_policy_emitted_mask(mod, timer, 1, &mask));
+    values[1].type = &i64_type;
+    CHECK_FALSE(marking_policy_emitted_mask(mod, timer, 1, &mask));
+    values[1].type = &str_type;
+
+    policy[3].op = rir::Opcode::StrHasPrefix;
+    policy[3].operand_count = 2;
+    values[1].type = &i64_type;
+    values[2].type = &i64_type;
+    CHECK_FALSE(marking_policy_emitted_mask(mod, timer, 1, &mask));
+}
+
+TEST(route, marking_policy_comparisons_reject_unsupported_aggregate_types) {
+    using namespace rut;
+    const rir::Type bool_type{rir::TypeKind::Bool, nullptr, nullptr};
+    const rir::Type i64_type{rir::TypeKind::I64, nullptr, nullptr};
+    const rir::Type str_type{rir::TypeKind::Str, nullptr, nullptr};
+    const rir::Type ip_type{rir::TypeKind::IP, nullptr, nullptr};
+    rir::StructDef struct_def{};
+    const rir::Type struct_type{rir::TypeKind::Struct, nullptr, &struct_def};
+    const rir::Type optional_type{rir::TypeKind::Optional, &i64_type, nullptr};
+    rir::Value values[3] = {{&i64_type, {}, 0}, {&i64_type, {}, 0}, {&bool_type, {}, 0}};
+    rir::Function fn{};
+    fn.values = values;
+    fn.value_count = 3;
+    rir::Instruction cmp{};
+    cmp.op = rir::Opcode::CmpEq;
+    cmp.result = {2};
+    cmp.operand_count = 2;
+    cmp.operands[0] = {0};
+    cmp.operands[1] = {1};
+
+    CHECK(marking_policy_instruction_types_valid(fn, cmp));
+    values[0].type = &str_type;
+    values[1].type = &str_type;
+    CHECK(marking_policy_instruction_types_valid(fn, cmp));
+    values[0].type = &struct_type;
+    values[1].type = &struct_type;
+    CHECK_FALSE(marking_policy_instruction_types_valid(fn, cmp));
+    values[0].type = &optional_type;
+    values[1].type = &optional_type;
+    CHECK_FALSE(marking_policy_instruction_types_valid(fn, cmp));
+
+    cmp.op = rir::Opcode::CmpLt;
+    values[0].type = &i64_type;
+    values[1].type = &i64_type;
+    CHECK(marking_policy_instruction_types_valid(fn, cmp));
+    values[0].type = &str_type;
+    values[1].type = &str_type;
+    CHECK(marking_policy_instruction_types_valid(fn, cmp));
+    values[0].type = &ip_type;
+    values[1].type = &ip_type;
+    CHECK_FALSE(marking_policy_instruction_types_valid(fn, cmp));
+    values[0].type = &bool_type;
+    values[1].type = &bool_type;
+    CHECK_FALSE(marking_policy_instruction_types_valid(fn, cmp));
+}
+
+TEST(route, marking_policy_json_append_validates_operand_types) {
+    using namespace rut;
+    const rir::Type bool_type{rir::TypeKind::Bool, nullptr, nullptr};
+    const rir::Type i32_type{rir::TypeKind::I32, nullptr, nullptr};
+    const rir::Type i64_type{rir::TypeKind::I64, nullptr, nullptr};
+    const rir::Type str_type{rir::TypeKind::Str, nullptr, nullptr};
+    const rir::Type str_list_type{rir::TypeKind::StrList, nullptr, nullptr};
+    const rir::Type array_type{rir::TypeKind::Array, &i64_type, nullptr};
+    const struct {
+        rir::Opcode op;
+        const rir::Type* type;
+    } cases[] = {
+        {rir::Opcode::JsonAppendBool, &bool_type},
+        {rir::Opcode::JsonAppendI32, &i32_type},
+        {rir::Opcode::JsonAppendI64, &i64_type},
+        {rir::Opcode::JsonAppendStr, &str_type},
+        {rir::Opcode::JsonAppendStrList, &str_list_type},
+        {rir::Opcode::JsonAppendArray, &array_type},
+    };
+    rir::Value value{};
+    rir::Function fn{};
+    fn.values = &value;
+    fn.value_count = 1;
+    rir::Instruction append{};
+    append.result = rir::kNoValue;
+    append.operand_count = 1;
+    append.operands[0] = {0};
+
+    for (const auto& item : cases) {
+        append.op = item.op;
+        value.type = item.type;
+        CHECK(marking_policy_instruction_types_valid(fn, append));
+        value.type = item.type == &i64_type ? &bool_type : &i64_type;
+        CHECK_FALSE(marking_policy_instruction_types_valid(fn, append));
+    }
+}
+
+TEST(route, marking_policy_json_array_matches_codegen_type_support) {
+    using namespace rut;
+    const rir::Type bool_type{rir::TypeKind::Bool, nullptr, nullptr};
+    const rir::Type i32_type{rir::TypeKind::I32, nullptr, nullptr};
+    const rir::Type i64_type{rir::TypeKind::I64, nullptr, nullptr};
+    const rir::Type str_list_type{rir::TypeKind::StrList, nullptr, nullptr};
+    const rir::Type duration_type{rir::TypeKind::Duration, nullptr, nullptr};
+    const rir::Type optional_i64_type{rir::TypeKind::Optional, &i64_type, nullptr};
+    rir::Type array_types[33]{};
+    array_types[0] = {rir::TypeKind::Array, &i64_type, nullptr};
+    for (u32 i = 1; i < 33; i++)
+        array_types[i] = {rir::TypeKind::Array, &array_types[i - 1], nullptr};
+    const rir::Type duration_array{rir::TypeKind::Array, &duration_type, nullptr};
+    const rir::Type optional_array{rir::TypeKind::Array, &optional_i64_type, nullptr};
+    alignas(rir::StructDef) u8 storage[sizeof(rir::StructDef) + 2 * sizeof(rir::FieldDef)]{};
+    auto* struct_def = reinterpret_cast<rir::StructDef*>(storage);
+    struct_def->name = Str{"Payload", 7};
+    struct_def->field_count = 2;
+    struct_def->field_capacity = 2;
+    struct_def->fields()[0] = {Str{"ok", 2}, &bool_type};
+    struct_def->fields()[1] = {Str{"value", 5}, &i64_type};
+    const rir::Type struct_type{rir::TypeKind::Struct, nullptr, struct_def};
+    const rir::Type struct_array{rir::TypeKind::Array, &struct_type, nullptr};
+    rir::Value value{&array_types[31], {}, 0};
+    rir::Function fn{};
+    fn.values = &value;
+    fn.value_count = 1;
+    rir::Instruction append{};
+    append.op = rir::Opcode::JsonAppendArray;
+    append.result = rir::kNoValue;
+    append.operand_count = 1;
+    append.operands[0] = {0};
+
+    CHECK(marking_policy_instruction_types_valid(fn, append));
+    value.type = &array_types[32];
+    CHECK_FALSE(marking_policy_instruction_types_valid(fn, append));
+    value.type = &duration_array;
+    CHECK_FALSE(marking_policy_instruction_types_valid(fn, append));
+    value.type = &optional_array;
+    CHECK_FALSE(marking_policy_instruction_types_valid(fn, append));
+    CHECK(marking_policy_json_type_valid(&bool_type));
+    CHECK(marking_policy_json_type_valid(&i32_type));
+    CHECK(marking_policy_json_type_valid(&str_list_type));
+    value.type = &struct_array;
+    CHECK(marking_policy_instruction_types_valid(fn, append));
+    struct_def->fields()[1].type = &duration_type;
+    CHECK_FALSE(marking_policy_instruction_types_valid(fn, append));
+}
+
+TEST(route, marking_policy_accepts_typed_response_and_json_capture_operations) {
+    using namespace rut;
+    const rir::Type i32_type{rir::TypeKind::I32, nullptr, nullptr};
+    const rir::Type str_type{rir::TypeKind::Str, nullptr, nullptr};
+    const rir::Type optional_str_type{rir::TypeKind::Optional, &str_type, nullptr};
+    rir::Value values[3] = {{&i32_type, {}, 0}, {&str_type, {}, 0}, {&optional_str_type, {}, 0}};
+    rir::Function fn{};
+    fn.values = values;
+    fn.value_count = 3;
+    rir::Instruction inst{};
+
+    inst.op = rir::Opcode::JsonCapture;
+    inst.result = {1};
+    CHECK(marking_policy_instruction_types_valid(fn, inst));
+
+    inst.operand_count = 1;
+    inst.operands[0] = {2};
+    inst.op = rir::Opcode::RespHeader;
+    inst.result = {2};
+    CHECK(marking_policy_instruction_types_valid(fn, inst));
+    inst.operands[0] = {1};
+    CHECK_FALSE(marking_policy_instruction_types_valid(fn, inst));
+
+    inst.operands[0] = {0};
+    inst.op = rir::Opcode::RespStatus;
+    inst.result = {0};
+    CHECK(marking_policy_instruction_types_valid(fn, inst));
+    inst.op = rir::Opcode::RespSetStatus;
+    inst.result = rir::kNoValue;
+    CHECK(marking_policy_instruction_types_valid(fn, inst));
+
+    inst.operands[0] = {1};
+    inst.op = rir::Opcode::RespBody;
+    inst.result = {1};
+    CHECK(marking_policy_instruction_types_valid(fn, inst));
+    inst.result = rir::kNoValue;
+    for (const auto op :
+         {rir::Opcode::RespSetHeader, rir::Opcode::RespAddHeader, rir::Opcode::RespSetBody}) {
+        inst.op = op;
+        CHECK(marking_policy_instruction_types_valid(fn, inst));
+    }
+}
+
+TEST(route, marking_policy_validates_cache_and_return_types) {
+    using namespace rut;
+    const rir::Type bool_type{rir::TypeKind::Bool, nullptr, nullptr};
+    const rir::Type i32_type{rir::TypeKind::I32, nullptr, nullptr};
+    const rir::Type u32_type{rir::TypeKind::U32, nullptr, nullptr};
+    const rir::Type i64_type{rir::TypeKind::I64, nullptr, nullptr};
+    const rir::Type str_type{rir::TypeKind::Str, nullptr, nullptr};
+    const rir::Type ip_type{rir::TypeKind::IP, nullptr, nullptr};
+    const rir::Type optional_i64_type{rir::TypeKind::Optional, &i64_type, nullptr};
+    rir::Value values[3] = {{&ip_type, {}, 0}, {&i64_type, {}, 0}, {&optional_i64_type, {}, 0}};
+    rir::Function fn{};
+    fn.values = values;
+    fn.value_count = 3;
+    rir::Instruction inst{};
+    inst.op = rir::Opcode::TimeNowMicros;
+    inst.result = {1};
+    CHECK(marking_policy_instruction_types_valid(fn, inst));
+    values[1].type = &bool_type;
+    CHECK_FALSE(marking_policy_instruction_types_valid(fn, inst));
+    values[1].type = &i64_type;
+
+    inst.op = rir::Opcode::CacheGet;
+    inst.result = {2};
+    inst.operand_count = 1;
+    inst.operands[0] = {0};
+    CHECK(marking_policy_instruction_types_valid(fn, inst));
+    values[0].type = &i64_type;
+    CHECK_FALSE(marking_policy_instruction_types_valid(fn, inst));
+
+    values[0].type = &ip_type;
+    inst.op = rir::Opcode::CacheSet;
+    inst.result = {1};
+    inst.operand_count = 2;
+    inst.operands[1] = {1};
+    CHECK(marking_policy_instruction_types_valid(fn, inst));
+    values[1].type = &bool_type;
+    CHECK_FALSE(marking_policy_instruction_types_valid(fn, inst));
+
+    inst.result = rir::kNoValue;
+    inst.operand_count = 1;
+    inst.operands[0] = {0};
+    inst.op = rir::Opcode::RetStatus;
+    values[0].type = &i32_type;
+    CHECK(marking_policy_instruction_types_valid(fn, inst));
+    values[0].type = &i64_type;
+    CHECK_FALSE(marking_policy_instruction_types_valid(fn, inst));
+    inst.operand_count = 0;
+    CHECK(marking_policy_instruction_types_valid(fn, inst));
+
+    inst.operand_count = 1;
+    inst.op = rir::Opcode::RetForward;
+    values[0].type = &u32_type;
+    CHECK(marking_policy_instruction_types_valid(fn, inst));
+    values[0].type = &bool_type;
+    CHECK_FALSE(marking_policy_instruction_types_valid(fn, inst));
+    inst.op = rir::Opcode::RetForwardBuffered;
+    values[0].type = &i32_type;
+    CHECK(marking_policy_instruction_types_valid(fn, inst));
+    values[0].type = &optional_i64_type;
+    CHECK_FALSE(marking_policy_instruction_types_valid(fn, inst));
+
+    inst.op = rir::Opcode::RespCommitBody;
+    values[0].type = &str_type;
+    CHECK(marking_policy_instruction_types_valid(fn, inst));
+    values[0].type = &i64_type;
+    CHECK_FALSE(marking_policy_instruction_types_valid(fn, inst));
+    inst.operand_count = 0;
+    CHECK(marking_policy_instruction_types_valid(fn, inst));
+}
+
+TEST(route, marking_policy_validates_single_operand_arities) {
+    using namespace rut;
+    const rir::Opcode single_operand[] = {
+        rir::Opcode::ReqSetHeader,    rir::Opcode::ReqAddHeader,    rir::Opcode::RespHeader,
+        rir::Opcode::RespStatus,      rir::Opcode::RespBody,        rir::Opcode::RespSetHeader,
+        rir::Opcode::RespAddHeader,   rir::Opcode::RespSetStatus,   rir::Opcode::RespSetBody,
+        rir::Opcode::ReqSetPath,      rir::Opcode::CtxStoreSlotI32, rir::Opcode::StrRegexMatch,
+        rir::Opcode::SextI64,         rir::Opcode::IpInCidr,        rir::Opcode::BytesHex,
+        rir::Opcode::CacheGet,        rir::Opcode::JsonAppendBool,  rir::Opcode::JsonAppendI32,
+        rir::Opcode::JsonAppendI64,   rir::Opcode::JsonAppendStr,   rir::Opcode::JsonAppendStrList,
+        rir::Opcode::JsonAppendArray, rir::Opcode::StructField,     rir::Opcode::ArrayLen,
+        rir::Opcode::StrListLen,      rir::Opcode::StrListIsEmpty,  rir::Opcode::OptWrap,
+        rir::Opcode::OptIsNil,        rir::Opcode::OptUnwrap,
+    };
+    rir::Instruction inst{};
+    for (const auto op : single_operand) {
+        inst.op = op;
+        inst.operand_count = 1;
+        CHECK(marking_policy_operand_arity_valid(inst));
+        inst.operand_count = 0;
+        CHECK_FALSE(marking_policy_operand_arity_valid(inst));
+    }
+
+    const rir::Type bool_type{rir::TypeKind::Bool, nullptr, nullptr};
+    rir::Type optional_bool_type{rir::TypeKind::Optional, &bool_type, nullptr};
+    rir::Value value{&optional_bool_type, {}, 0};
+    rir::Function fn{};
+    fn.values = &value;
+    fn.value_count = 1;
+    inst = {};
+    inst.op = rir::Opcode::OptNil;
+    inst.result = {0};
+    CHECK(marking_policy_operand_arity_valid(inst));
+    CHECK(marking_policy_instruction_types_valid(fn, inst));
+    optional_bool_type.inner = nullptr;
+    CHECK_FALSE(marking_policy_instruction_types_valid(fn, inst));
+    value.type = &bool_type;
+    CHECK_FALSE(marking_policy_instruction_types_valid(fn, inst));
+}
+
+TEST(route, marking_policy_rejects_instructions_after_terminator) {
+    using namespace rut;
+    const rir::Type i64_type{rir::TypeKind::I64, nullptr, nullptr};
+    const rir::Type bool_type{rir::TypeKind::Bool, nullptr, nullptr};
+    rir::Value values[3] = {{&i64_type, {0}, 0}, {&bool_type, {0}, 1}, {&bool_type, {0}, 3}};
+    rir::Instruction policy[4]{};
+    policy[0].op = rir::Opcode::ConstI64;
+    policy[0].result = {0};
+    policy[1].op = rir::Opcode::ConstBool;
+    policy[1].result = {1};
+    policy[2].op = rir::Opcode::Jmp;
+    policy[2].result = rir::kNoValue;
+    policy[2].imm.block_targets[0] = {0};
+    policy[3].op = rir::Opcode::UpstreamMark;
+    policy[3].result = {2};
+    policy[3].operand_count = 2;
+    policy[3].operands[0] = {0};
+    policy[3].operands[1] = {1};
+    rir::Block block{{0}, {}, policy, 4, 4};
+    rir::Function timer{};
+    timer.blocks = &block;
+    timer.block_count = 1;
+    timer.block_cap = 1;
+    timer.values = values;
+    timer.value_count = 3;
+    timer.value_cap = 3;
+    rir::Module mod{};
+    u32 mask = 0;
+
+    CHECK_FALSE(marking_policy_emitted_mask(mod, timer, 1, &mask));
+    block.inst_count = 3;
+    CHECK(marking_policy_shape_valid(timer));
+}
+
+TEST(route, marking_policy_rejects_missing_terminators_and_control_cycles) {
+    using namespace rut;
+    const rir::Type i64_type{rir::TypeKind::I64, nullptr, nullptr};
+    const rir::Type bool_type{rir::TypeKind::Bool, nullptr, nullptr};
+    rir::Value values[3] = {{&i64_type, {0}, 0}, {&bool_type, {0}, 1}, {&bool_type, {0}, 2}};
+    rir::Instruction policy[4]{};
+    policy[0].op = rir::Opcode::ConstI64;
+    policy[0].result = {0};
+    policy[1].op = rir::Opcode::ConstBool;
+    policy[1].result = {1};
+    policy[1].imm.bool_val = true;
+    policy[2].op = rir::Opcode::UpstreamMark;
+    policy[2].result = {2};
+    policy[2].operand_count = 2;
+    policy[2].operands[0] = {0};
+    policy[2].operands[1] = {1};
+    policy[3].op = rir::Opcode::RetStatus;
+    policy[3].result = rir::kNoValue;
+    policy[3].imm.i64_val = 200;
+    rir::Block block{{0}, {}, policy, 4, 4};
+    rir::Function timer{};
+    timer.is_timer = true;
+    timer.timer_shard = 0;
+    timer.upstream_mark_mask = 1;
+    timer.blocks = &block;
+    timer.block_count = 1;
+    timer.block_cap = 1;
+    timer.values = values;
+    timer.value_count = 3;
+    timer.value_cap = 3;
+    rir::Module mod{};
+    mod.upstream_count = 1;
+    mod.functions = &timer;
+    mod.func_count = 1;
+    mod.func_cap = 1;
+    mod.upstream_mark_replay_complete = true;
+
+    CHECK(marking_policies_valid_for_codegen(mod));
+    block.inst_count = 3;
+    CHECK_FALSE(marking_policies_valid_for_codegen(mod));
+    block.inst_count = 4;
+    policy[3].op = rir::Opcode::Jmp;
+    policy[3].imm.block_targets[0] = {0};
+    CHECK_FALSE(marking_policies_valid_for_codegen(mod));
+
+    rir::Instruction entry_return{};
+    entry_return.op = rir::Opcode::RetStatus;
+    entry_return.result = rir::kNoValue;
+    entry_return.imm.i64_val = 200;
+    rir::Block disconnected[2] = {{{0}, {}, &entry_return, 1, 1}, {{1}, {}, policy, 4, 4}};
+    policy[3].op = rir::Opcode::RetStatus;
+    policy[3].imm.i64_val = 200;
+    for (auto& value : values) value.def_block = {1};
+    timer.blocks = disconnected;
+    timer.block_count = 2;
+    timer.block_cap = 2;
+    CHECK_FALSE(marking_policies_valid_for_codegen(mod));
+}
+
+TEST(route, populate_route_config_fingerprints_struct_field_layout) {
+    using namespace rut;
+    alignas(rir::StructDef) u8 storage[sizeof(rir::StructDef) + 2 * sizeof(rir::FieldDef)]{};
+    auto* def = reinterpret_cast<rir::StructDef*>(storage);
+    def->name = Str{"Result", 6};
+    def->field_count = 2;
+    def->field_capacity = 2;
+    const rir::Type bool_type{rir::TypeKind::Bool, nullptr, nullptr};
+    auto* fields = def->fields();
+    fields[0] = rir::FieldDef{Str{"healthy", 7}, &bool_type};
+    fields[1] = rir::FieldDef{Str{"ignored", 7}, &bool_type};
+    rir::StructDef* defs[] = {def};
+    rir::Module mod{};
+    mod.struct_defs = defs;
+    mod.struct_count = 1;
+    const rir::Type result_type{rir::TypeKind::Struct, nullptr, def};
+    rir::Instruction create{};
+    create.op = rir::Opcode::StructCreate;
+    create.imm.struct_ref.name = def->name;
+    create.imm.struct_ref.type = &result_type;
+    rir::Block block{};
+    block.insts = &create;
+    block.inst_count = 1;
+    rir::Function timer{};
+    timer.is_timer = true;
+    timer.upstream_mark_mask = 1;
+    timer.blocks = &block;
+    timer.block_count = 1;
+
+    const u64 original_identity = marking_policy_identity(mod, timer);
+    const rir::FieldDef first = fields[0];
+    fields[0] = fields[1];
+    fields[1] = first;
+    CHECK_NE(marking_policy_identity(mod, timer), original_identity);
+}
+
+TEST(route, marking_policy_fingerprint_includes_ordered_upstream_backends) {
+    using namespace rut;
+    rir::Instruction mark{};
+    mark.op = rir::Opcode::UpstreamMark;
+    mark.imm.i32_val = 0;
+    rir::Block block{};
+    block.insts = &mark;
+    block.inst_count = 1;
+    rir::Function timer{};
+    timer.blocks = &block;
+    timer.block_count = 1;
+    rir::Module mod{};
+    mod.upstream_count = 1;
+    auto& upstream = mod.upstreams[0];
+    upstream.name = Str{"users", 5};
+    upstream.has_address = true;
+    upstream.ip = 0x7f000001;
+    upstream.port = 8000;
+    upstream.extra_count = 1;
+    upstream.extra_ips[0] = 0x7f000002;
+    upstream.extra_ports[0] = 9000;
+
+    const u64 original_identity = marking_policy_identity(mod, timer);
+    const u32 primary_ip = upstream.ip;
+    const u16 primary_port = upstream.port;
+    upstream.ip = upstream.extra_ips[0];
+    upstream.port = upstream.extra_ports[0];
+    upstream.extra_ips[0] = primary_ip;
+    upstream.extra_ports[0] = primary_port;
+    CHECK_NE(marking_policy_identity(mod, timer), original_identity);
+}
+
+TEST(route, marking_policy_fingerprint_normalizes_static_response_tables) {
+    using namespace rut;
+    rir::Instruction original_return{};
+    original_return.op = rir::Opcode::RetStatus;
+    original_return.result = rir::kNoValue;
+    original_return.imm.i64_val = 200 | (u64{1} << 16) | (u64{1} << 32);
+    rir::Block original_block{{0}, {}, &original_return, 1, 1};
+    rir::Function original_timer{};
+    original_timer.blocks = &original_block;
+    original_timer.block_count = 1;
+    original_timer.block_cap = 1;
+    rir::Module original{};
+    original.response_bodies[0] = Str{"healthy", 7};
+    original.response_body_count = 1;
+    original.header_keys[0] = Str{"x-health", 8};
+    original.header_values[0] = Str{"up", 2};
+    original.header_pool_used = 1;
+    original.header_sets[0] = {0, 1};
+    original.header_set_count = 1;
+
+    rir::Instruction shifted_return = original_return;
+    shifted_return.imm.i64_val = 200 | (u64{2} << 16) | (u64{2} << 32);
+    rir::Block shifted_block{{0}, {}, &shifted_return, 1, 1};
+    rir::Function shifted_timer = original_timer;
+    shifted_timer.blocks = &shifted_block;
+    rir::Module shifted{};
+    shifted.response_bodies[0] = Str{"unrelated", 9};
+    shifted.response_bodies[1] = original.response_bodies[0];
+    shifted.response_body_count = 2;
+    shifted.header_keys[0] = Str{"x-unrelated", 11};
+    shifted.header_values[0] = Str{"value", 5};
+    shifted.header_keys[1] = original.header_keys[0];
+    shifted.header_values[1] = original.header_values[0];
+    shifted.header_pool_used = 2;
+    shifted.header_sets[0] = {0, 1};
+    shifted.header_sets[1] = {1, 1};
+    shifted.header_set_count = 2;
+
+    const u64 original_identity = marking_policy_identity(original, original_timer);
+    CHECK_EQ(marking_policy_identity(shifted, shifted_timer), original_identity);
+    shifted.response_bodies[1] = Str{"unhealthy", 9};
+    CHECK_NE(marking_policy_identity(shifted, shifted_timer), original_identity);
+    shifted.response_bodies[1] = original.response_bodies[0];
+    shifted.header_values[1] = Str{"down", 4};
+    CHECK_NE(marking_policy_identity(shifted, shifted_timer), original_identity);
+    shifted_return.imm.i64_val = 200 | (u64{3} << 16) | (u64{3} << 32);
+    CHECK_NE(marking_policy_identity(shifted, shifted_timer), original_identity);
+    shifted_return.imm.i64_val = 200 | (u64{2} << 16) | (u64{2} << 32);
+    shifted.header_sets[1] = {2, 1};
+    CHECK_NE(marking_policy_identity(shifted, shifted_timer), original_identity);
+}
+
+TEST(route, marking_policy_fingerprint_ignores_unrelated_upstream_positions) {
+    using namespace rut;
+    const auto compile_policy = [](const char* source, u64* out_identity, bool* saw_select) {
+        auto lexed = lex(Str{source, static_cast<u32>(strlen(source))});
+        if (!lexed) return false;
+        auto ast = parse_file(lexed.value());
+        if (!ast) return false;
+        std::unique_ptr<AstFile> ast_owned(ast.value());
+        auto hir = analyze_file(*ast_owned);
+        if (!hir) return false;
+        std::unique_ptr<HirModule> hir_owned(hir.value());
+        auto mir = build_mir(*hir_owned);
+        if (!mir) return false;
+        std::unique_ptr<MirModule> mir_owned(mir.value());
+        FrontendRirModule rir{};
+        if (!lower_to_rir(*mir_owned, rir)) return false;
+        rir.module.upstream_mark_replay_complete = true;
+        *saw_select = false;
+        for (u32 fi = 0; fi < rir.module.func_count; fi++) {
+            const auto& fn = rir.module.functions[fi];
+            for (u32 bi = 0; bi < fn.block_count; bi++) {
+                const auto& block = fn.blocks[bi];
+                for (u32 ii = 0; ii < block.inst_count; ii++) {
+                    const auto& inst = block.insts[ii];
+                    if (inst.op != rir::Opcode::UpstreamMark || inst.operand_count != 2 ||
+                        inst.operand(0).id >= fn.value_count)
+                        continue;
+                    const auto& definition = fn.values[inst.operand(0).id];
+                    u32 definition_block = 0;
+                    if (marking_policy_find_block(fn, definition.def_block, &definition_block) &&
+                        definition.def_inst < fn.blocks[definition_block].inst_count &&
+                        fn.blocks[definition_block].insts[definition.def_inst].op ==
+                            rir::Opcode::Select)
+                        *saw_select = true;
+                }
+            }
+        }
+        RouteConfig cfg{};
+        const bool populated = populate_route_config(cfg, rir.module);
+        if (populated) {
+            const u64 users_identity = upstream_name_identity("users", 5);
+            for (u32 upstream = 0; upstream < cfg.upstream_count; upstream++) {
+                if (cfg.upstreams[upstream].name_identity == users_identity) {
+                    *out_identity = cfg.upstreams[upstream].marking_policy_identity;
+                    break;
+                }
+            }
+        }
+        rir.destroy();
+        return populated && *out_identity != 0;
+    };
+    const char* original =
+        "func choose(server: Server, flag: bool) -> Server { if flag { server } else { server } }\n"
+        "upstream users at \"127.0.0.1:8080\"\n"
+        "timer check_health, every: 5s, shard: 0 { for server in users.servers { "
+        "users.mark(choose(server, true), healthy: true) } return 200 }\n";
+    const char* shifted =
+        "func choose(server: Server, flag: bool) -> Server { if flag { server } else { server } }\n"
+        "upstream unrelated at \"127.0.0.2:9090\"\n"
+        "upstream users at \"127.0.0.1:8080\"\n"
+        "timer check_health, every: 5s, shard: 0 { for server in users.servers { "
+        "users.mark(choose(server, true), healthy: true) } return 200 }\n";
+    u64 original_identity = 0;
+    u64 shifted_identity = 0;
+    bool original_select = false;
+    bool shifted_select = false;
+    REQUIRE(compile_policy(original, &original_identity, &original_select));
+    REQUIRE(compile_policy(shifted, &shifted_identity, &shifted_select));
+    CHECK(original_select);
+    CHECK(shifted_select);
+    CHECK_EQ(original_identity, shifted_identity);
+}
+
+TEST(route, marking_policy_fingerprint_normalizes_struct_carried_server) {
+    using namespace rut;
+    const rir::Type i64_type{rir::TypeKind::I64, nullptr, nullptr};
+    const rir::Type bool_type{rir::TypeKind::Bool, nullptr, nullptr};
+    alignas(rir::StructDef) u8 storage[sizeof(rir::StructDef) + sizeof(rir::FieldDef)]{};
+    auto* def = reinterpret_cast<rir::StructDef*>(storage);
+    def->name = Str{"Wrapped", 7};
+    def->field_count = 1;
+    def->field_capacity = 1;
+    def->fields()[0] = rir::FieldDef{Str{"server", 6}, &i64_type};
+    const rir::Type wrapped_type{rir::TypeKind::Struct, nullptr, def};
+    rir::Value values[5] = {{&i64_type, {0}, 0},
+                            {&wrapped_type, {0}, 1},
+                            {&i64_type, {0}, 2},
+                            {&bool_type, {0}, 3},
+                            {&bool_type, {0}, 4}};
+    rir::Instruction policy[5]{};
+    policy[0].op = rir::Opcode::ConstI64;
+    policy[0].result = {0};
+    policy[0].imm.i64_val = rir::encode_server_token(0, 0);
+    policy[1].op = rir::Opcode::StructCreate;
+    policy[1].result = {1};
+    policy[1].operand_count = 1;
+    policy[1].operands[0] = {0};
+    policy[1].imm.struct_ref.type = &wrapped_type;
+    policy[2].op = rir::Opcode::StructField;
+    policy[2].result = {2};
+    policy[2].operand_count = 1;
+    policy[2].operands[0] = {1};
+    policy[2].imm.struct_ref.name = Str{"server", 6};
+    policy[2].imm.struct_ref.type = &i64_type;
+    policy[3].op = rir::Opcode::ConstBool;
+    policy[3].result = {3};
+    policy[3].imm.bool_val = true;
+    policy[4].op = rir::Opcode::UpstreamMark;
+    policy[4].result = {4};
+    policy[4].operand_count = 2;
+    policy[4].operands[0] = {2};
+    policy[4].operands[1] = {3};
+    rir::Block block{{0}, {}, policy, 5, 5};
+    rir::Function timer{};
+    timer.blocks = &block;
+    timer.block_count = 1;
+    timer.block_cap = 1;
+    timer.values = values;
+    timer.value_count = 5;
+    timer.value_cap = 5;
+    timer.upstream_mark_mask = 1;
+
+    rir::Module original{};
+    original.upstream_count = 1;
+    original.upstreams[0].name = Str{"users", 5};
+    original.upstreams[0].has_address = true;
+    original.upstreams[0].ip = 0x7F000001;
+    original.upstreams[0].port = 8080;
+    const u64 original_identity = marking_policy_identity(original, timer);
+    policy[0].imm.i64_val =
+        static_cast<i64>((u64{1} << 32) | static_cast<u64>(rir::encode_server_token(0, 0)));
+    CHECK_NE(marking_policy_identity(original, timer), original_identity);
+
+    rir::Module shifted{};
+    shifted.upstream_count = 2;
+    shifted.upstreams[0].name = Str{"unrelated", 9};
+    shifted.upstreams[0].has_address = true;
+    shifted.upstreams[0].ip = 0x7F000002;
+    shifted.upstreams[0].port = 9090;
+    shifted.upstreams[1] = original.upstreams[0];
+    policy[0].imm.i64_val = rir::encode_server_token(1, 0);
+    policy[4].imm.i32_val = 1;
+    timer.upstream_mark_mask = u32{1} << 1;
+    CHECK_EQ(marking_policy_identity(shifted, timer), original_identity);
+}
+
+TEST(route, marking_policy_fingerprint_normalizes_nested_struct_projection) {
+    using namespace rut;
+    const rir::Type i32_type{rir::TypeKind::I32, nullptr, nullptr};
+    const rir::Type i64_type{rir::TypeKind::I64, nullptr, nullptr};
+    const rir::Type bool_type{rir::TypeKind::Bool, nullptr, nullptr};
+    alignas(rir::StructDef) u8 inner_storage[sizeof(rir::StructDef) + sizeof(rir::FieldDef)]{};
+    auto* inner_def = reinterpret_cast<rir::StructDef*>(inner_storage);
+    inner_def->name = Str{"Inner", 5};
+    inner_def->field_count = 1;
+    inner_def->field_capacity = 1;
+    inner_def->fields()[0] = rir::FieldDef{Str{"server", 6}, &i64_type};
+    const rir::Type inner_type{rir::TypeKind::Struct, nullptr, inner_def};
+    alignas(rir::StructDef) u8 middle_storage[sizeof(rir::StructDef) + sizeof(rir::FieldDef)]{};
+    auto* middle_def = reinterpret_cast<rir::StructDef*>(middle_storage);
+    middle_def->name = Str{"Middle", 6};
+    middle_def->field_count = 1;
+    middle_def->field_capacity = 1;
+    middle_def->fields()[0] = rir::FieldDef{Str{"inner", 5}, &inner_type};
+    const rir::Type middle_type{rir::TypeKind::Struct, nullptr, middle_def};
+    alignas(rir::StructDef) u8 outer_storage[sizeof(rir::StructDef) + sizeof(rir::FieldDef)]{};
+    auto* outer_def = reinterpret_cast<rir::StructDef*>(outer_storage);
+    outer_def->name = Str{"Outer", 5};
+    outer_def->field_count = 1;
+    outer_def->field_capacity = 1;
+    outer_def->fields()[0] = rir::FieldDef{Str{"middle", 6}, &middle_type};
+    const rir::Type outer_type{rir::TypeKind::Struct, nullptr, outer_def};
+    const rir::Type optional_outer_type{rir::TypeKind::Optional, &outer_type, nullptr};
+    const rir::Type outer_array_type{rir::TypeKind::Array, &outer_type, nullptr};
+    const rir::Type nested_outer_array_type{rir::TypeKind::Array, &outer_array_type, nullptr};
+    const rir::Type optional_nested_outer_array_type{
+        rir::TypeKind::Optional, &nested_outer_array_type, nullptr};
+    const rir::Type* types[] = {&i64_type,
+                                &inner_type,
+                                &middle_type,
+                                &outer_type,
+                                &optional_outer_type,
+                                &outer_type,
+                                &outer_array_type,
+                                &nested_outer_array_type,
+                                &i32_type,
+                                &outer_array_type,
+                                &i32_type,
+                                &outer_type,
+                                &middle_type,
+                                &inner_type,
+                                &i64_type,
+                                &bool_type,
+                                &bool_type,
+                                &bool_type,
+                                &nested_outer_array_type,
+                                &optional_nested_outer_array_type,
+                                &nested_outer_array_type};
+    rir::Value values[21]{};
+    rir::Instruction policy[21]{};
+    for (u32 i = 0; i < 21; i++) {
+        values[i] = {types[i], {0}, i};
+        policy[i].result = {i};
+    }
+    policy[0].op = rir::Opcode::ConstI64;
+    policy[0].imm.i64_val = rir::encode_server_token(0, 0);
+    policy[1].op = rir::Opcode::StructCreate;
+    policy[1].operand_count = 1;
+    policy[1].operands[0] = {0};
+    policy[1].imm.struct_ref.type = &inner_type;
+    policy[2].op = rir::Opcode::StructCreate;
+    policy[2].operand_count = 1;
+    policy[2].operands[0] = {1};
+    policy[2].imm.struct_ref.type = &middle_type;
+    policy[3].op = rir::Opcode::StructCreate;
+    policy[3].operand_count = 1;
+    policy[3].operands[0] = {2};
+    policy[3].imm.struct_ref.type = &outer_type;
+    policy[4].op = rir::Opcode::OptWrap;
+    policy[4].operand_count = 1;
+    policy[4].operands[0] = {3};
+    policy[5].op = rir::Opcode::OptUnwrap;
+    policy[5].operand_count = 1;
+    policy[5].operands[0] = {4};
+    policy[6].op = rir::Opcode::ArrayCreate;
+    policy[6].operand_count = 1;
+    policy[6].operands[0] = {5};
+    policy[7].op = rir::Opcode::ArrayCreate;
+    policy[7].operand_count = 1;
+    policy[7].operands[0] = {6};
+    policy[8].op = rir::Opcode::CtxLoadSlotI32;
+    policy[9].op = rir::Opcode::ArrayGet;
+    policy[9].operand_count = 2;
+    policy[9].operands[0] = {7};
+    policy[9].operands[1] = {8};
+    policy[10].op = rir::Opcode::CtxLoadSlotI32;
+    policy[11].op = rir::Opcode::ArrayGet;
+    policy[11].operand_count = 2;
+    policy[11].operands[0] = {9};
+    policy[11].operands[1] = {10};
+    policy[12].op = rir::Opcode::StructField;
+    policy[12].operand_count = 1;
+    policy[12].operands[0] = {11};
+    policy[12].imm.struct_ref.name = Str{"middle", 6};
+    policy[12].imm.struct_ref.type = &middle_type;
+    policy[13].op = rir::Opcode::StructField;
+    policy[13].operand_count = 1;
+    policy[13].operands[0] = {12};
+    policy[13].imm.struct_ref.name = Str{"inner", 5};
+    policy[13].imm.struct_ref.type = &inner_type;
+    policy[14].op = rir::Opcode::StructField;
+    policy[14].operand_count = 1;
+    policy[14].operands[0] = {13};
+    policy[14].imm.struct_ref.name = Str{"server", 6};
+    policy[14].imm.struct_ref.type = &i64_type;
+    policy[15].op = rir::Opcode::ConstBool;
+    policy[15].imm.bool_val = true;
+    policy[16].op = rir::Opcode::UpstreamMark;
+    policy[16].operand_count = 2;
+    policy[16].operands[0] = {14};
+    policy[16].operands[1] = {15};
+    policy[17].op = rir::Opcode::ConstBool;
+    policy[17].imm.bool_val = true;
+    policy[18].op = rir::Opcode::Select;
+    policy[18].operand_count = 3;
+    policy[18].operands[0] = {17};
+    policy[18].operands[1] = {7};
+    policy[18].operands[2] = {7};
+    policy[19].op = rir::Opcode::OptWrap;
+    policy[19].operand_count = 1;
+    policy[19].operands[0] = {18};
+    policy[20].op = rir::Opcode::OptUnwrap;
+    policy[20].operand_count = 1;
+    policy[20].operands[0] = {19};
+    rir::Block block{{0}, {}, policy, 21, 21};
+    rir::Function timer{};
+    timer.blocks = &block;
+    timer.block_count = 1;
+    timer.values = values;
+    timer.value_count = 21;
+    timer.upstream_mark_mask = 1;
+
+    const bool has_indices[] = {false, false};
+    const u32 indices[] = {0, 0};
+    const Str fields[] = {Str{"server", 6}, Str{"inner", 5}, Str{"middle", 6}};
+    u8 select_state[21]{};
+    u8 select_result[21]{};
+    MarkingPolicySourceSearch search{65536, select_state, select_result, 21, false};
+    CHECK(marking_policy_array_struct_field_path_flows_to_source(
+        timer, {20}, has_indices, indices, 1, fields, 2, {0}, 0, &search));
+
+    rir::Module original{};
+    original.upstream_count = 1;
+    original.upstreams[0].name = Str{"users", 5};
+    original.upstreams[0].has_address = true;
+    original.upstreams[0].ip = 0x7F000001;
+    original.upstreams[0].port = 8080;
+    const u64 original_identity = marking_policy_identity(original, timer);
+    rir::Module shifted{};
+    shifted.upstream_count = 2;
+    shifted.upstreams[0].name = Str{"unrelated", 9};
+    shifted.upstreams[0].has_address = true;
+    shifted.upstreams[0].ip = 0x7F000002;
+    shifted.upstreams[0].port = 9090;
+    shifted.upstreams[1] = original.upstreams[0];
+    policy[0].imm.i64_val = rir::encode_server_token(1, 0);
+    policy[16].imm.i32_val = 1;
+    timer.upstream_mark_mask = u32{1} << 1;
+    CHECK_EQ(marking_policy_identity(shifted, timer), original_identity);
+
+    policy[8].op = rir::Opcode::ConstI32;
+    policy[10].op = rir::Opcode::ConstI32;
+    const u64 constant_shifted_identity = marking_policy_identity(shifted, timer);
+    policy[0].imm.i64_val = rir::encode_server_token(0, 0);
+    policy[16].imm.i32_val = 0;
+    timer.upstream_mark_mask = 1;
+    CHECK_EQ(marking_policy_identity(original, timer), constant_shifted_identity);
+}
+
+TEST(route, marking_policy_fingerprint_normalizes_carried_struct_receiver) {
+    using namespace rut;
+    const rir::Type i32_type{rir::TypeKind::I32, nullptr, nullptr};
+    const rir::Type i64_type{rir::TypeKind::I64, nullptr, nullptr};
+    const rir::Type bool_type{rir::TypeKind::Bool, nullptr, nullptr};
+    alignas(rir::StructDef) u8 storage[sizeof(rir::StructDef) + sizeof(rir::FieldDef)]{};
+    auto* def = reinterpret_cast<rir::StructDef*>(storage);
+    def->name = Str{"Wrapped", 7};
+    def->field_count = 1;
+    def->field_capacity = 1;
+    def->fields()[0] = rir::FieldDef{Str{"server", 6}, &i64_type};
+    const rir::Type struct_type{rir::TypeKind::Struct, nullptr, def};
+    const rir::Type optional_type{rir::TypeKind::Optional, &struct_type, nullptr};
+    const rir::Type array_type{rir::TypeKind::Array, &struct_type, nullptr};
+    const rir::Type* types[] = {&i64_type,
+                                &struct_type,
+                                &optional_type,
+                                &struct_type,
+                                &array_type,
+                                &i32_type,
+                                &struct_type,
+                                &i64_type,
+                                &bool_type,
+                                &bool_type};
+    rir::Value values[10]{};
+    rir::Instruction policy[10]{};
+    for (u32 i = 0; i < 10; i++) {
+        values[i] = {types[i], {0}, i};
+        policy[i].result = {i};
+    }
+    policy[0].op = rir::Opcode::ConstI64;
+    policy[0].imm.i64_val = rir::encode_server_token(0, 0);
+    policy[1].op = rir::Opcode::StructCreate;
+    policy[1].operand_count = 1;
+    policy[1].operands[0] = {0};
+    policy[1].imm.struct_ref.type = &struct_type;
+    policy[2].op = rir::Opcode::OptWrap;
+    policy[2].operand_count = 1;
+    policy[2].operands[0] = {1};
+    policy[3].op = rir::Opcode::OptUnwrap;
+    policy[3].operand_count = 1;
+    policy[3].operands[0] = {2};
+    policy[4].op = rir::Opcode::ArrayCreate;
+    policy[4].operand_count = 1;
+    policy[4].operands[0] = {3};
+    policy[5].op = rir::Opcode::ConstI32;
+    policy[6].op = rir::Opcode::ArrayGet;
+    policy[6].operand_count = 2;
+    policy[6].operands[0] = {4};
+    policy[6].operands[1] = {5};
+    policy[7].op = rir::Opcode::StructField;
+    policy[7].operand_count = 1;
+    policy[7].operands[0] = {6};
+    policy[7].imm.struct_ref.name = Str{"server", 6};
+    policy[7].imm.struct_ref.type = &i64_type;
+    policy[8].op = rir::Opcode::ConstBool;
+    policy[8].imm.bool_val = true;
+    policy[9].op = rir::Opcode::UpstreamMark;
+    policy[9].operand_count = 2;
+    policy[9].operands[0] = {7};
+    policy[9].operands[1] = {8};
+    rir::Block block{{0}, {}, policy, 10, 10};
+    rir::Function timer{};
+    timer.blocks = &block;
+    timer.block_count = 1;
+    timer.block_cap = 1;
+    timer.values = values;
+    timer.value_count = 10;
+    timer.value_cap = 10;
+    timer.upstream_mark_mask = 1;
+
+    rir::Module original{};
+    original.upstream_count = 1;
+    original.upstreams[0].name = Str{"users", 5};
+    original.upstreams[0].has_address = true;
+    original.upstreams[0].ip = 0x7F000001;
+    original.upstreams[0].port = 8080;
+    const u64 original_identity = marking_policy_identity(original, timer);
+
+    rir::Module shifted{};
+    shifted.upstream_count = 2;
+    shifted.upstreams[0].name = Str{"unrelated", 9};
+    shifted.upstreams[0].has_address = true;
+    shifted.upstreams[0].ip = 0x7F000002;
+    shifted.upstreams[0].port = 9090;
+    shifted.upstreams[1] = original.upstreams[0];
+    policy[0].imm.i64_val = rir::encode_server_token(1, 0);
+    policy[9].imm.i32_val = 1;
+    timer.upstream_mark_mask = u32{1} << 1;
+    CHECK_EQ(marking_policy_identity(shifted, timer), original_identity);
+
+    policy[0].imm.i64_val = rir::encode_server_token(0, 0);
+    policy[9].imm.i32_val = 0;
+    policy[5].op = rir::Opcode::CtxLoadSlotI32;
+    timer.upstream_mark_mask = 1;
+    const u64 dynamic_original_identity = marking_policy_identity(original, timer);
+    policy[0].imm.i64_val = rir::encode_server_token(1, 0);
+    policy[9].imm.i32_val = 1;
+    timer.upstream_mark_mask = u32{1} << 1;
+    CHECK_EQ(marking_policy_identity(shifted, timer), dynamic_original_identity);
+}
+
+TEST(route, marking_policy_fingerprint_normalizes_array_carried_server) {
+    using namespace rut;
+    const rir::Type i32_type{rir::TypeKind::I32, nullptr, nullptr};
+    const rir::Type i64_type{rir::TypeKind::I64, nullptr, nullptr};
+    const rir::Type bool_type{rir::TypeKind::Bool, nullptr, nullptr};
+    const rir::Type array_type{rir::TypeKind::Array, &i64_type, nullptr};
+    rir::Value values[6] = {{&i64_type, {0}, 0},
+                            {&array_type, {0}, 1},
+                            {&i32_type, {0}, 2},
+                            {&i64_type, {0}, 3},
+                            {&bool_type, {0}, 4},
+                            {&bool_type, {0}, 5}};
+    rir::Instruction policy[6]{};
+    policy[0].op = rir::Opcode::ConstI64;
+    policy[0].result = {0};
+    policy[0].imm.i64_val = rir::encode_server_token(0, 0);
+    policy[1].op = rir::Opcode::ArrayCreate;
+    policy[1].result = {1};
+    policy[1].operand_count = 1;
+    policy[1].operands[0] = {0};
+    policy[2].op = rir::Opcode::ConstI32;
+    policy[2].result = {2};
+    policy[2].imm.i32_val = 0;
+    policy[3].op = rir::Opcode::ArrayGet;
+    policy[3].result = {3};
+    policy[3].operand_count = 2;
+    policy[3].operands[0] = {1};
+    policy[3].operands[1] = {2};
+    policy[4].op = rir::Opcode::ConstBool;
+    policy[4].result = {4};
+    policy[4].imm.bool_val = true;
+    policy[5].op = rir::Opcode::UpstreamMark;
+    policy[5].result = {5};
+    policy[5].operand_count = 2;
+    policy[5].operands[0] = {3};
+    policy[5].operands[1] = {4};
+    rir::Block block{{0}, {}, policy, 6, 6};
+    rir::Function timer{};
+    timer.blocks = &block;
+    timer.block_count = 1;
+    timer.block_cap = 1;
+    timer.values = values;
+    timer.value_count = 6;
+    timer.value_cap = 6;
+    timer.upstream_mark_mask = 1;
+
+    rir::Module original{};
+    original.upstream_count = 1;
+    original.upstreams[0].name = Str{"users", 5};
+    original.upstreams[0].has_address = true;
+    original.upstreams[0].ip = 0x7F000001;
+    original.upstreams[0].port = 8080;
+    const u64 original_identity = marking_policy_identity(original, timer);
+
+    rir::Module shifted{};
+    shifted.upstream_count = 2;
+    shifted.upstreams[0].name = Str{"unrelated", 9};
+    shifted.upstreams[0].has_address = true;
+    shifted.upstreams[0].ip = 0x7F000002;
+    shifted.upstreams[0].port = 9090;
+    shifted.upstreams[1] = original.upstreams[0];
+    policy[0].imm.i64_val = rir::encode_server_token(1, 0);
+    policy[5].imm.i32_val = 1;
+    timer.upstream_mark_mask = u32{1} << 1;
+    CHECK_EQ(marking_policy_identity(shifted, timer), original_identity);
+}
+
+TEST(route, marking_policy_fingerprint_normalizes_dynamic_array_server_sources) {
+    using namespace rut;
+    const rir::Type i32_type{rir::TypeKind::I32, nullptr, nullptr};
+    const rir::Type i64_type{rir::TypeKind::I64, nullptr, nullptr};
+    const rir::Type bool_type{rir::TypeKind::Bool, nullptr, nullptr};
+    const rir::Type array_type{rir::TypeKind::Array, &i64_type, nullptr};
+    const rir::Type nested_array_type{rir::TypeKind::Array, &array_type, nullptr};
+    rir::Value values[12] = {{&i64_type, {0}, 0},
+                             {&i64_type, {0}, 1},
+                             {&array_type, {0}, 2},
+                             {&nested_array_type, {0}, 3},
+                             {&bool_type, {0}, 4},
+                             {&i32_type, {0}, 5},
+                             {&i32_type, {0}, 6},
+                             {&i32_type, {0}, 7},
+                             {&array_type, {0}, 8},
+                             {&i64_type, {0}, 9},
+                             {&bool_type, {0}, 10},
+                             {&bool_type, {0}, 11}};
+    rir::Instruction policy[12]{};
+    policy[0].op = rir::Opcode::ConstI64;
+    policy[0].result = {0};
+    policy[0].imm.i64_val = rir::encode_server_token(0, 0);
+    policy[1].op = rir::Opcode::ConstI64;
+    policy[1].result = {1};
+    policy[1].imm.i64_val = rir::encode_server_token(0, 1);
+    policy[2].op = rir::Opcode::ArrayCreate;
+    policy[2].result = {2};
+    policy[2].operand_count = 2;
+    policy[2].operands[0] = {0};
+    policy[2].operands[1] = {1};
+    policy[3].op = rir::Opcode::ArrayCreate;
+    policy[3].result = {3};
+    policy[3].operand_count = 1;
+    policy[3].operands[0] = {2};
+    policy[4].op = rir::Opcode::ConstBool;
+    policy[4].result = {4};
+    policy[4].imm.bool_val = true;
+    policy[5].op = rir::Opcode::ConstI32;
+    policy[5].result = {5};
+    policy[5].imm.i32_val = 0;
+    policy[6].op = rir::Opcode::ConstI32;
+    policy[6].result = {6};
+    policy[6].imm.i32_val = 1;
+    policy[7].op = rir::Opcode::Select;
+    policy[7].result = {7};
+    policy[7].operand_count = 3;
+    policy[7].operands[0] = {4};
+    policy[7].operands[1] = {5};
+    policy[7].operands[2] = {6};
+    policy[8].op = rir::Opcode::ArrayGet;
+    policy[8].result = {8};
+    policy[8].operand_count = 2;
+    policy[8].operands[0] = {3};
+    policy[8].operands[1] = {7};
+    policy[9].op = rir::Opcode::ArrayGet;
+    policy[9].result = {9};
+    policy[9].operand_count = 2;
+    policy[9].operands[0] = {8};
+    policy[9].operands[1] = {7};
+    policy[10].op = rir::Opcode::ConstBool;
+    policy[10].result = {10};
+    policy[10].imm.bool_val = true;
+    policy[11].op = rir::Opcode::UpstreamMark;
+    policy[11].result = {11};
+    policy[11].operand_count = 2;
+    policy[11].operands[0] = {9};
+    policy[11].operands[1] = {10};
+    rir::Block block{{0}, {}, policy, 12, 12};
+    rir::Function timer{};
+    timer.blocks = &block;
+    timer.block_count = 1;
+    timer.block_cap = 1;
+    timer.values = values;
+    timer.value_count = 12;
+    timer.value_cap = 12;
+    timer.upstream_mark_mask = 1;
+
+    rir::Module original{};
+    original.upstream_count = 1;
+    original.upstreams[0].name = Str{"users", 5};
+    original.upstreams[0].has_address = true;
+    original.upstreams[0].ip = 0x7F000001;
+    original.upstreams[0].port = 8080;
+    original.upstreams[0].extra_count = 1;
+    original.upstreams[0].extra_ips[0] = 0x7F000001;
+    original.upstreams[0].extra_ports[0] = 8081;
+    const u64 original_identity = marking_policy_identity(original, timer);
+
+    rir::Module shifted{};
+    shifted.upstream_count = 2;
+    shifted.upstreams[0].name = Str{"unrelated", 9};
+    shifted.upstreams[0].has_address = true;
+    shifted.upstreams[0].ip = 0x7F000002;
+    shifted.upstreams[0].port = 9090;
+    shifted.upstreams[1] = original.upstreams[0];
+    policy[0].imm.i64_val = rir::encode_server_token(1, 0);
+    policy[1].imm.i64_val = rir::encode_server_token(1, 1);
+    policy[11].imm.i32_val = 1;
+    timer.upstream_mark_mask = u32{1} << 1;
+    CHECK_EQ(marking_policy_identity(shifted, timer), original_identity);
+}
+
+TEST(route, marking_policy_fingerprint_normalizes_optional_carried_server) {
+    using namespace rut;
+    const rir::Type i64_type{rir::TypeKind::I64, nullptr, nullptr};
+    const rir::Type bool_type{rir::TypeKind::Bool, nullptr, nullptr};
+    const rir::Type optional_i64_type{rir::TypeKind::Optional, &i64_type, nullptr};
+    rir::Value values[5] = {{&i64_type, {0}, 0},
+                            {&optional_i64_type, {0}, 1},
+                            {&i64_type, {0}, 2},
+                            {&bool_type, {0}, 3},
+                            {&bool_type, {0}, 4}};
+    rir::Instruction policy[5]{};
+    policy[0].op = rir::Opcode::ConstI64;
+    policy[0].result = {0};
+    policy[0].imm.i64_val = rir::encode_server_token(0, 0);
+    policy[1].op = rir::Opcode::OptWrap;
+    policy[1].result = {1};
+    policy[1].operand_count = 1;
+    policy[1].operands[0] = {0};
+    policy[2].op = rir::Opcode::OptUnwrap;
+    policy[2].result = {2};
+    policy[2].operand_count = 1;
+    policy[2].operands[0] = {1};
+    policy[3].op = rir::Opcode::ConstBool;
+    policy[3].result = {3};
+    policy[3].imm.bool_val = true;
+    policy[4].op = rir::Opcode::UpstreamMark;
+    policy[4].result = {4};
+    policy[4].operand_count = 2;
+    policy[4].operands[0] = {2};
+    policy[4].operands[1] = {3};
+    rir::Block block{{0}, {}, policy, 5, 5};
+    rir::Function timer{};
+    timer.blocks = &block;
+    timer.block_count = 1;
+    timer.block_cap = 1;
+    timer.values = values;
+    timer.value_count = 5;
+    timer.value_cap = 5;
+    timer.upstream_mark_mask = 1;
+
+    rir::Module original{};
+    original.upstream_count = 1;
+    original.upstreams[0].name = Str{"users", 5};
+    original.upstreams[0].has_address = true;
+    original.upstreams[0].ip = 0x7F000001;
+    original.upstreams[0].port = 8080;
+    const u64 original_identity = marking_policy_identity(original, timer);
+
+    rir::Module shifted{};
+    shifted.upstream_count = 2;
+    shifted.upstreams[0].name = Str{"unrelated", 9};
+    shifted.upstreams[0].has_address = true;
+    shifted.upstreams[0].ip = 0x7F000002;
+    shifted.upstreams[0].port = 9090;
+    shifted.upstreams[1] = original.upstreams[0];
+    policy[0].imm.i64_val = rir::encode_server_token(1, 0);
+    policy[4].imm.i32_val = 1;
+    timer.upstream_mark_mask = u32{1} << 1;
+    CHECK_EQ(marking_policy_identity(shifted, timer), original_identity);
+}
+
+TEST(route, marking_policy_traces_arrays_through_struct_and_optional_carriers) {
+    using namespace rut;
+    const rir::Type i32_type{rir::TypeKind::I32, nullptr, nullptr};
+    const rir::Type i64_type{rir::TypeKind::I64, nullptr, nullptr};
+    const rir::Type bool_type{rir::TypeKind::Bool, nullptr, nullptr};
+    const rir::Type array_type{rir::TypeKind::Array, &i64_type, nullptr};
+    const rir::Type optional_array_type{rir::TypeKind::Optional, &array_type, nullptr};
+    alignas(rir::StructDef) u8 storage[sizeof(rir::StructDef) + sizeof(rir::FieldDef)]{};
+    auto* def = reinterpret_cast<rir::StructDef*>(storage);
+    def->name = Str{"Servers", 7};
+    def->field_count = 1;
+    def->field_capacity = 1;
+    def->fields()[0] = rir::FieldDef{Str{"values", 6}, &array_type};
+    const rir::Type struct_type{rir::TypeKind::Struct, nullptr, def};
+
+    const auto check_carrier = [&](bool use_struct) {
+        rir::Value values[8] = {
+            {&i64_type, {0}, 0},
+            {&array_type, {0}, 1},
+            {use_struct ? &struct_type : &optional_array_type, {0}, 2},
+            {&array_type, {0}, 3},
+            {&i32_type, {0}, 4},
+            {&i64_type, {0}, 5},
+            {&bool_type, {0}, 6},
+            {&bool_type, {0}, 7},
+        };
+        rir::Instruction policy[8]{};
+        policy[0].op = rir::Opcode::ConstI64;
+        policy[0].result = {0};
+        policy[0].imm.i64_val = rir::encode_server_token(0, 0);
+        policy[1].op = rir::Opcode::ArrayCreate;
+        policy[1].result = {1};
+        policy[1].operand_count = 1;
+        policy[1].operands[0] = {0};
+        policy[2].op = use_struct ? rir::Opcode::StructCreate : rir::Opcode::OptWrap;
+        policy[2].result = {2};
+        policy[2].operand_count = 1;
+        policy[2].operands[0] = {1};
+        policy[2].imm.struct_ref.type = use_struct ? &struct_type : nullptr;
+        policy[3].op = use_struct ? rir::Opcode::StructField : rir::Opcode::OptUnwrap;
+        policy[3].result = {3};
+        policy[3].operand_count = 1;
+        policy[3].operands[0] = {2};
+        policy[3].imm.struct_ref.name = use_struct ? Str{"values", 6} : Str{};
+        policy[3].imm.struct_ref.type = use_struct ? &array_type : nullptr;
+        policy[4].op = rir::Opcode::ConstI32;
+        policy[4].result = {4};
+        policy[4].imm.i32_val = 0;
+        policy[5].op = rir::Opcode::ArrayGet;
+        policy[5].result = {5};
+        policy[5].operand_count = 2;
+        policy[5].operands[0] = {3};
+        policy[5].operands[1] = {4};
+        policy[6].op = rir::Opcode::ConstBool;
+        policy[6].result = {6};
+        policy[6].imm.bool_val = true;
+        policy[7].op = rir::Opcode::UpstreamMark;
+        policy[7].result = {7};
+        policy[7].operand_count = 2;
+        policy[7].operands[0] = {5};
+        policy[7].operands[1] = {6};
+        rir::Block block{{0}, {}, policy, 8, 8};
+        rir::Function fn{};
+        fn.blocks = &block;
+        fn.block_count = 1;
+        fn.block_cap = 1;
+        fn.values = values;
+        fn.value_count = 8;
+        fn.value_cap = 8;
+        return marking_policy_value_is_mark_server(fn, {0}) &&
+               marking_policy_array_flows_to_source(fn, {3}, {0}, 0);
+    };
+
+    CHECK(check_carrier(true));
+    CHECK(check_carrier(false));
+}
+
+TEST(route, marking_policy_shape_validates_struct_constructor_operands) {
+    using namespace rut;
+    alignas(rir::StructDef) u8 storage[sizeof(rir::StructDef) + sizeof(rir::FieldDef)]{};
+    auto* def = reinterpret_cast<rir::StructDef*>(storage);
+    def->name = Str{"Result", 6};
+    def->field_count = 1;
+    def->field_capacity = 1;
+    const rir::Type bool_type{rir::TypeKind::Bool, nullptr, nullptr};
+    const rir::Type i64_type{rir::TypeKind::I64, nullptr, nullptr};
+    const rir::Type result_type{rir::TypeKind::Struct, nullptr, def};
+    def->fields()[0] = rir::FieldDef{Str{"healthy", 7}, &bool_type};
+    rir::Value values[2] = {{&bool_type, {0}, 0}, {&result_type, {0}, 1}};
+    rir::Instruction create{};
+    create.op = rir::Opcode::StructCreate;
+    create.result = {1};
+    create.operand_count = 1;
+    create.operands[0] = {0};
+    create.imm.struct_ref.type = &result_type;
+    rir::Block block{};
+    block.insts = &create;
+    block.inst_count = 1;
+    block.inst_cap = 1;
+    rir::Function timer{};
+    timer.blocks = &block;
+    timer.block_count = 1;
+    timer.block_cap = 1;
+    timer.values = values;
+    timer.value_count = 2;
+    timer.value_cap = 2;
+    CHECK(marking_policy_shape_valid(timer));
+    CHECK(marking_policy_instruction_types_valid(timer, create));
+
+    rir::ValueId undersized_extra[1]{};
+    create.operand_count = rir::kMaxInlineOperands + 2;
+    create.extra_operands = undersized_extra;
+    CHECK_FALSE(marking_policy_shape_valid(timer));
+    create.operand_count = 1;
+    create.extra_operands = nullptr;
+
+    create.operand_count = 0;
+    CHECK_FALSE(marking_policy_shape_valid(timer));
+    CHECK_FALSE(marking_policy_instruction_types_valid(timer, create));
+    create.operand_count = 2;
+    CHECK_FALSE(marking_policy_shape_valid(timer));
+    create.operand_count = 1;
+    create.operands[0] = {2};
+    CHECK_FALSE(marking_policy_shape_valid(timer));
+    create.operands[0] = {0};
+    values[0].type = &i64_type;
+    CHECK_FALSE(marking_policy_shape_valid(timer));
+    values[0].type = &bool_type;
+    create.result = {2};
+    CHECK_FALSE(marking_policy_shape_valid(timer));
+
+    values[0].type = &result_type;
+    values[1].type = &bool_type;
+    create.op = rir::Opcode::StructField;
+    create.result = {1};
+    create.operand_count = 1;
+    create.operands[0] = {0};
+    create.imm.struct_ref.name = Str{"healthy", 7};
+    create.imm.struct_ref.type = &bool_type;
+    CHECK(marking_policy_shape_valid(timer));
+    CHECK(marking_policy_instruction_types_valid(timer, create));
+    create.imm.struct_ref.name = Str{"missing", 7};
+    CHECK_FALSE(marking_policy_shape_valid(timer));
+    CHECK_FALSE(marking_policy_instruction_types_valid(timer, create));
+    create.imm.struct_ref.name = Str{"healthy", 7};
+    create.imm.struct_ref.type = &i64_type;
+    CHECK_FALSE(marking_policy_shape_valid(timer));
+    create.imm.struct_ref.type = &bool_type;
+    values[1].type = &i64_type;
+    CHECK_FALSE(marking_policy_shape_valid(timer));
+}
+
+TEST(route, marking_policy_shape_rejects_null_string_immediates) {
+    using namespace rut;
+    rir::Instruction string_inst{};
+    string_inst.op = rir::Opcode::ConstStr;
+    string_inst.imm.str_val = Str{nullptr, 1};
+    rir::Block block{};
+    block.insts = &string_inst;
+    block.inst_count = 1;
+    block.inst_cap = 1;
+    rir::Function timer{};
+    timer.blocks = &block;
+    timer.block_count = 1;
+    timer.block_cap = 1;
+    CHECK_FALSE(marking_policy_shape_valid(timer));
+    string_inst.imm.str_val = Str{nullptr, 0};
+    CHECK(marking_policy_shape_valid(timer));
+}
+
+TEST(route, marking_policy_type_shape_rejects_invalid_composites) {
+    using namespace rut;
+    rir::StructDef truncated_def{};
+    truncated_def.name = Str{"Truncated", 9};
+    truncated_def.field_count = 1;
+    truncated_def.field_capacity = 0;
+    const rir::Type truncated_type{rir::TypeKind::Struct, nullptr, &truncated_def};
+    CHECK_FALSE(marking_policy_type_shape_valid(&truncated_type));
+
+    alignas(rir::StructDef) u8 direct_storage[sizeof(rir::StructDef) + sizeof(rir::FieldDef)]{};
+    auto* direct_def = reinterpret_cast<rir::StructDef*>(direct_storage);
+    direct_def->name = Str{"Direct", 6};
+    direct_def->field_count = 1;
+    direct_def->field_capacity = 1;
+    rir::Type direct_type{rir::TypeKind::Struct, nullptr, direct_def};
+    direct_def->fields()[0] = rir::FieldDef{Str{"next", 4}, &direct_type};
+    CHECK_FALSE(marking_policy_type_shape_valid(&direct_type));
+
+    alignas(rir::StructDef) u8 indirect_storage[sizeof(rir::StructDef) + sizeof(rir::FieldDef)]{};
+    auto* indirect_def = reinterpret_cast<rir::StructDef*>(indirect_storage);
+    indirect_def->name = Str{"Indirect", 8};
+    indirect_def->field_count = 1;
+    indirect_def->field_capacity = 1;
+    rir::Type indirect_type{rir::TypeKind::Struct, nullptr, indirect_def};
+    rir::Type optional_indirect{rir::TypeKind::Optional, &indirect_type, nullptr};
+    indirect_def->fields()[0] = rir::FieldDef{Str{"next", 4}, &optional_indirect};
+    CHECK_FALSE(marking_policy_type_shape_valid(&indirect_type));
+
+    const rir::Type void_type{rir::TypeKind::Void, nullptr, nullptr};
+    const rir::Type optional_void{rir::TypeKind::Optional, &void_type, nullptr};
+    CHECK_FALSE(marking_policy_type_shape_valid(&optional_void));
+
+    alignas(rir::StructDef) u8 void_field_storage[sizeof(rir::StructDef) + sizeof(rir::FieldDef)]{};
+    auto* void_field_def = reinterpret_cast<rir::StructDef*>(void_field_storage);
+    void_field_def->name = Str{"VoidField", 9};
+    void_field_def->field_count = 1;
+    void_field_def->field_capacity = 1;
+    void_field_def->fields()[0] = rir::FieldDef{Str{"value", 5}, &void_type};
+    const rir::Type void_field_type{rir::TypeKind::Struct, nullptr, void_field_def};
+    const rir::Type optional_void_field{rir::TypeKind::Optional, &void_field_type, nullptr};
+    CHECK_FALSE(marking_policy_type_shape_valid(&void_field_type));
+    CHECK_FALSE(marking_policy_type_shape_valid(&optional_void_field));
+
+    alignas(rir::StructDef)
+        u8 duplicate_storage[sizeof(rir::StructDef) + 2 * sizeof(rir::FieldDef)]{};
+    auto* duplicate_def = reinterpret_cast<rir::StructDef*>(duplicate_storage);
+    duplicate_def->name = Str{"Duplicate", 9};
+    duplicate_def->field_count = 2;
+    duplicate_def->field_capacity = 2;
+    const rir::Type bool_type{rir::TypeKind::Bool, nullptr, nullptr};
+    const rir::Type i64_type{rir::TypeKind::I64, nullptr, nullptr};
+    duplicate_def->fields()[0] = rir::FieldDef{Str{"value", 5}, &bool_type};
+    duplicate_def->fields()[1] = rir::FieldDef{Str{"value", 5}, &i64_type};
+    const rir::Type duplicate_type{rir::TypeKind::Struct, nullptr, duplicate_def};
+    CHECK_FALSE(marking_policy_type_shape_valid(&duplicate_type));
+}
+
+TEST(route, marking_policy_shape_validates_array_constructors) {
+    using namespace rut;
+    const rir::Type bool_type{rir::TypeKind::Bool, nullptr, nullptr};
+    const rir::Type i64_type{rir::TypeKind::I64, nullptr, nullptr};
+    const rir::Type bool_array_type{rir::TypeKind::Array, &bool_type, nullptr};
+    rir::Value values[3] = {{&bool_type, {0}, 0}, {&bool_type, {0}, 1}, {&bool_array_type, {0}, 2}};
+    rir::Instruction create{};
+    create.op = rir::Opcode::ArrayCreate;
+    create.result = {2};
+    create.operand_count = 2;
+    create.operands[0] = {0};
+    create.operands[1] = {1};
+    rir::Block block{};
+    block.insts = &create;
+    block.inst_count = 1;
+    block.inst_cap = 1;
+    rir::Function timer{};
+    timer.blocks = &block;
+    timer.block_count = 1;
+    timer.block_cap = 1;
+    timer.values = values;
+    timer.value_count = 3;
+    timer.value_cap = 3;
+    CHECK(marking_policy_shape_valid(timer));
+    CHECK(marking_policy_instruction_types_valid(timer, create));
+
+    rir::ValueId undersized_extra[1]{};
+    create.operand_count = rir::kMaxInlineOperands + 2;
+    create.extra_operands = undersized_extra;
+    CHECK_FALSE(marking_policy_shape_valid(timer));
+    create.operand_count = 2;
+    create.extra_operands = nullptr;
+
+    create.operands[1] = {3};
+    CHECK_FALSE(marking_policy_shape_valid(timer));
+    CHECK_FALSE(marking_policy_instruction_types_valid(timer, create));
+    create.operands[1] = {1};
+    values[1].type = &i64_type;
+    CHECK_FALSE(marking_policy_shape_valid(timer));
+    CHECK_FALSE(marking_policy_instruction_types_valid(timer, create));
+    values[1].type = &bool_type;
+    create.result = {0};
+    CHECK_FALSE(marking_policy_shape_valid(timer));
+    create.result = {2};
+    rir::ValueId extra_operands[rir::kMaxArrayItems - rir::kMaxInlineOperands + 1]{};
+    create.operand_count = rir::kMaxArrayItems + 1;
+    create.extra_operands = extra_operands;
+    CHECK_FALSE(marking_policy_shape_valid(timer));
+}
+
+TEST(route, unmarked_function_preflight_does_not_traverse_extra_operands) {
+    using namespace rut;
+    rir::ValueId undersized_extra[1]{};
+    rir::Instruction create{};
+    create.op = rir::Opcode::ArrayCreate;
+    create.operand_count = rir::kMaxInlineOperands + 2;
+    create.extra_operands = undersized_extra;
+    rir::Block block{{0}, {}, &create, 1, 1};
+    rir::Function fn{};
+    fn.blocks = &block;
+    fn.block_count = 1;
+    fn.block_cap = 1;
+    rir::Module mod{};
+    u32 emitted_mask = ~u32{0};
+
+    CHECK(marking_policy_shape_valid(fn, false));
+    CHECK(marking_policy_emitted_mask(mod, fn, 0, &emitted_mask));
+    CHECK_EQ(emitted_mask, 0u);
+}
+
+TEST(route, marking_policy_validates_cache_instruction_values) {
+    using namespace rut;
+    const rir::Type ip_type{rir::TypeKind::IP, nullptr, nullptr};
+    const rir::Type i64_type{rir::TypeKind::I64, nullptr, nullptr};
+    const rir::Type optional_i64_type{rir::TypeKind::Optional, &i64_type, nullptr};
+    rir::Value values[3] = {{&ip_type, {0}, 0}, {&i64_type, {0}, 1}, {&optional_i64_type, {0}, 2}};
+    rir::Instruction cache{};
+    cache.op = rir::Opcode::CacheGet;
+    cache.result = {2};
+    cache.operand_count = 1;
+    cache.operands[0] = {0};
+    cache.imm.i32_val = 0;
+    rir::Block block{};
+    block.insts = &cache;
+    block.inst_count = 1;
+    block.inst_cap = 1;
+    rir::Function timer{};
+    timer.blocks = &block;
+    timer.block_count = 1;
+    timer.block_cap = 1;
+    timer.values = values;
+    timer.value_count = 3;
+    timer.value_cap = 3;
+    rir::Module mod{};
+    mod.cache_instance_count = 1;
+    mod.cache_instances[0].name = Str{"health", 6};
+    mod.cache_instances[0].capacity = 16;
+    u32 mask = 0;
+    CHECK(marking_policy_emitted_mask(mod, timer, 0, &mask));
+    cache.operand_count = 0;
+    CHECK_FALSE(marking_policy_emitted_mask(mod, timer, 0, &mask));
+    cache.operand_count = 1;
+    cache.operands[0] = {1};
+    CHECK_FALSE(marking_policy_emitted_mask(mod, timer, 0, &mask));
+    cache.operands[0] = {0};
+    cache.result = {1};
+    CHECK_FALSE(marking_policy_emitted_mask(mod, timer, 0, &mask));
+
+    cache.op = rir::Opcode::CacheSet;
+    cache.result = {1};
+    cache.operand_count = 2;
+    cache.operands[0] = {0};
+    cache.operands[1] = {1};
+    CHECK(marking_policy_emitted_mask(mod, timer, 0, &mask));
+    cache.operands[1] = {0};
+    CHECK_FALSE(marking_policy_emitted_mask(mod, timer, 0, &mask));
+}
+
+TEST(route, marking_policy_fingerprint_includes_referenced_cache_declaration) {
+    using namespace rut;
+    rir::Instruction get{};
+    get.op = rir::Opcode::CacheGet;
+    get.imm.i32_val = 0;
+    rir::Block block{};
+    block.insts = &get;
+    block.inst_count = 1;
+    rir::Function timer{};
+    timer.is_timer = true;
+    timer.blocks = &block;
+    timer.block_count = 1;
+    rir::Module mod{};
+    mod.cache_instance_count = 1;
+    mod.cache_instances[0].name = Str{"health", 6};
+    mod.cache_instances[0].capacity = 64;
+
+    const u64 original_identity = marking_policy_identity(mod, timer);
+    mod.cache_instances[0].name = Str{"verdict", 7};
+    CHECK_NE(marking_policy_identity(mod, timer), original_identity);
+    mod.cache_instances[0].name = Str{"health", 6};
+    mod.cache_instances[0].capacity = 128;
+    CHECK_NE(marking_policy_identity(mod, timer), original_identity);
+    mod.cache_instances[0].capacity = 64;
+
+    rir::Module shifted{};
+    shifted.cache_instance_count = 2;
+    shifted.cache_instances[0].name = Str{"unrelated", 9};
+    shifted.cache_instances[0].capacity = 32;
+    shifted.cache_instances[1] = mod.cache_instances[0];
+    get.imm.i32_val = 1;
+    CHECK_EQ(marking_policy_identity(shifted, timer), original_identity);
 }
 
 #if RUT_ENABLE_JIT_TESTS
