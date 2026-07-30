@@ -1177,10 +1177,17 @@ inline u64 marking_policy_upstream_identity(const rir::Module& mod, u32 upstream
 
 struct MarkingPolicySourceSearch {
     u32 budget;
+    u8* select_state;
+    u8* select_result;
+    u32 select_capacity;
+    bool exhausted;
 };
 
 inline bool marking_policy_source_search_step(MarkingPolicySourceSearch* search) {
-    if (search->budget == 0) return false;
+    if (search->budget == 0) {
+        search->exhausted = true;
+        return false;
+    }
     search->budget--;
     return true;
 }
@@ -1313,10 +1320,18 @@ inline bool marking_policy_array_flows_to_source(const rir::Function& fn,
                                                  rir::ValueId source,
                                                  u32 depth) {
     static constexpr u32 kMaxSourceSearchSteps = 65536;
+    static constexpr u32 kMaxMemoizedValues = 4096;
     const u64 requested = static_cast<u64>(fn.value_count) * 8 + 1;
-    MarkingPolicySourceSearch search{requested < kMaxSourceSearchSteps ? static_cast<u32>(requested)
-                                                                       : kMaxSourceSearchSteps};
-    return marking_policy_array_flows_to_source(fn, receiver, source, depth, &search);
+    u8 select_state[kMaxMemoizedValues]{};
+    u8 select_result[kMaxMemoizedValues]{};
+    MarkingPolicySourceSearch search{
+        requested < kMaxSourceSearchSteps ? static_cast<u32>(requested) : kMaxSourceSearchSteps,
+        select_state,
+        select_result,
+        fn.value_count < kMaxMemoizedValues ? fn.value_count : kMaxMemoizedValues,
+        false};
+    const bool result = marking_policy_array_flows_to_source(fn, receiver, source, depth, &search);
+    return result || search.exhausted;
 }
 
 inline bool marking_policy_struct_field_flows_to_source(const rir::Function& fn,
@@ -1368,11 +1383,21 @@ inline bool marking_policy_value_flows_to_source_impl(const rir::Function& fn,
     if (definition.def_inst >= block.inst_count) return false;
     const auto& inst = block.insts[definition.def_inst];
     if (inst.result != value) return false;
-    if (inst.op == rir::Opcode::Select && inst.operand_count == 3)
-        return marking_policy_value_flows_to_source_impl(
-                   fn, inst.operand(1), source, depth + 1, search) ||
-               marking_policy_value_flows_to_source_impl(
-                   fn, inst.operand(2), source, depth + 1, search);
+    if (inst.op == rir::Opcode::Select && inst.operand_count == 3) {
+        if (value.id < search->select_capacity && search->select_state[value.id] == 2)
+            return search->select_result[value.id] != 0;
+        if (value.id < search->select_capacity && search->select_state[value.id] == 1) return false;
+        if (value.id < search->select_capacity) search->select_state[value.id] = 1;
+        const bool result = marking_policy_value_flows_to_source_impl(
+                                fn, inst.operand(1), source, depth + 1, search) ||
+                            marking_policy_value_flows_to_source_impl(
+                                fn, inst.operand(2), source, depth + 1, search);
+        if (value.id < search->select_capacity) {
+            search->select_result[value.id] = result ? 1 : 0;
+            search->select_state[value.id] = 2;
+        }
+        return result;
+    }
     if (inst.op == rir::Opcode::StructField && inst.operand_count == 1)
         return marking_policy_struct_field_flows_to_source(
             fn, inst.operand(0), inst.imm.struct_ref.name, source, depth + 1, search);
@@ -1395,10 +1420,18 @@ inline bool marking_policy_value_flows_to_source(const rir::Function& fn,
                                                  rir::ValueId value,
                                                  rir::ValueId source) {
     static constexpr u32 kMaxSourceSearchSteps = 65536;
+    static constexpr u32 kMaxMemoizedValues = 4096;
     const u64 requested = static_cast<u64>(fn.value_count) * 8 + 1;
-    MarkingPolicySourceSearch search{requested < kMaxSourceSearchSteps ? static_cast<u32>(requested)
-                                                                       : kMaxSourceSearchSteps};
-    return marking_policy_value_flows_to_source_impl(fn, value, source, 0, &search);
+    u8 select_state[kMaxMemoizedValues]{};
+    u8 select_result[kMaxMemoizedValues]{};
+    MarkingPolicySourceSearch search{
+        requested < kMaxSourceSearchSteps ? static_cast<u32>(requested) : kMaxSourceSearchSteps,
+        select_state,
+        select_result,
+        fn.value_count < kMaxMemoizedValues ? fn.value_count : kMaxMemoizedValues,
+        false};
+    const bool result = marking_policy_value_flows_to_source_impl(fn, value, source, 0, &search);
+    return result || search.exhausted;
 }
 
 inline bool marking_policy_value_is_mark_server(const rir::Function& fn, rir::ValueId value) {
