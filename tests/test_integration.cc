@@ -15808,6 +15808,45 @@ TEST(route, populate_route_config_rejects_malformed_marking_policy_storage) {
     CHECK_NE(cyclic_identity, 0u);
 }
 
+TEST(route, marking_policy_rejects_unbacked_arena_storage_ranges) {
+    using namespace rut;
+    MmapArena arena;
+    REQUIRE(arena.init(4096));
+    auto* functions = arena.alloc_array<rir::Function>(1);
+    REQUIRE(functions != nullptr);
+    rir::Module mod{};
+    mod.arena = &arena;
+    mod.functions = functions;
+    mod.func_count = 1;
+    mod.func_cap = 2;
+    CHECK_FALSE(marking_policies_valid_for_codegen(mod));
+
+    mod.func_cap = 1;
+    auto* blocks = arena.alloc_array<rir::Block>(1);
+    REQUIRE(blocks != nullptr);
+    functions[0].blocks = blocks;
+    functions[0].block_count = 1;
+    functions[0].block_cap = 2;
+    CHECK_FALSE(marking_policy_arena_storage_shape_valid(mod, functions[0]));
+
+    functions[0].block_cap = 1;
+    auto* values = arena.alloc_array<rir::Value>(1);
+    REQUIRE(values != nullptr);
+    functions[0].values = values;
+    functions[0].value_count = 1;
+    functions[0].value_cap = 2;
+    CHECK_FALSE(marking_policy_arena_storage_shape_valid(mod, functions[0]));
+
+    functions[0].value_cap = 1;
+    auto* insts = arena.alloc_array<rir::Instruction>(1);
+    REQUIRE(insts != nullptr);
+    blocks[0].insts = insts;
+    blocks[0].inst_count = 1;
+    blocks[0].inst_cap = 2;
+    CHECK_FALSE(marking_policy_arena_storage_shape_valid(mod, functions[0]));
+    arena.destroy();
+}
+
 TEST(route, populate_route_config_rejects_oversized_cache_table_before_policy_scan) {
     using namespace rut;
     rir::Instruction get{};
