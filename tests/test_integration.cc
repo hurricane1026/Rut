@@ -16255,6 +16255,11 @@ TEST(route, marking_policy_marks_must_dominate_every_exit) {
     fn.block_count = 3;
     fn.block_cap = 3;
 
+    CHECK_FALSE(marking_policy_is_mark_failure_exit(fn, bypass_exit, 2));
+    entry.operand_count = 1;
+    entry.operands[0] = {0};
+    CHECK_FALSE(marking_policy_is_mark_failure_exit(fn, entry, 1));
+    entry.operand_count = 0;
     CHECK_FALSE(marking_policy_control_flow_valid(fn));
 
     entry.op = rir::Opcode::Jmp;
