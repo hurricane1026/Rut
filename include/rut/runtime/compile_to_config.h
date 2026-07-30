@@ -276,12 +276,17 @@ inline bool marking_policy_arena_type_graph_valid_impl(const rir::Module& mod,
     if (def == nullptr || reinterpret_cast<uintptr_t>(def) % alignof(rir::StructDef) != 0 ||
         !mod.arena->contains_range(def, sizeof(rir::StructDef)) ||
         def->field_count > rir::kMaxStructFields || def->field_capacity > rir::kMaxStructFields ||
-        def->field_count > def->field_capacity)
+        def->field_count > def->field_capacity ||
+        (def->name.len != 0 && !mod.arena->contains_range(def->name.ptr, def->name.len)))
         return false;
-    for (u32 field = 0; field < def->field_count; field++)
-        if (!marking_policy_arena_type_graph_valid_impl(
-                mod, def->fields()[field].type, seen, depth + 1))
+    for (u32 field = 0; field < def->field_count; field++) {
+        const auto& field_def = def->fields()[field];
+        if (field_def.name.len != 0 &&
+            !mod.arena->contains_range(field_def.name.ptr, field_def.name.len))
             return false;
+        if (!marking_policy_arena_type_graph_valid_impl(mod, field_def.type, seen, depth + 1))
+            return false;
+    }
     return true;
 }
 

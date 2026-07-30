@@ -15872,6 +15872,20 @@ TEST(route, marking_policy_rejects_unbacked_arena_storage_ranges) {
     *struct_type = {rir::TypeKind::Struct, nullptr, &external_def};
     values[0].type = struct_type;
     CHECK_FALSE(marking_policy_arena_storage_shape_valid(mod, functions[0]));
+
+    auto* arena_def = arena.alloc_t<rir::StructDef>();
+    REQUIRE(arena_def != nullptr);
+    *arena_def = {};
+    arena_def->name = Str{external_string, 7};
+    arena_def->field_count = 1;
+    arena_def->field_capacity = 1;
+    arena_def->fields()[0] = {Str{}, arena_str_type};
+    struct_type->struct_def = arena_def;
+    CHECK_FALSE(marking_policy_arena_storage_shape_valid(mod, functions[0]));
+
+    arena_def->name = {};
+    arena_def->fields()[0].name = Str{external_string, 7};
+    CHECK_FALSE(marking_policy_arena_storage_shape_valid(mod, functions[0]));
     arena.destroy();
 }
 

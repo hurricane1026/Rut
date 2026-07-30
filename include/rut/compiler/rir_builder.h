@@ -76,16 +76,17 @@ struct Builder {
         for (u32 i = 0; i < kTypeKindCount; i++) type_cache[i] = nullptr;
     }
 
-    VoidResult set_str_immediate(Instruction* inst, Str value) {
-        if (value.len == 0) {
-            inst->imm.str_val = {};
-            return {};
-        }
+    Result<Str> own_str(Str value) {
+        if (value.len == 0) return Str{};
         if (value.ptr == nullptr) return err(RirError::InvalidState);
         auto* owned = mod->arena->alloc_array<char>(value.len);
         if (owned == nullptr) return err(RirError::OutOfMemory);
         for (u32 i = 0; i < value.len; i++) owned[i] = value.ptr[i];
-        inst->imm.str_val = {owned, value.len};
+        return Str{owned, value.len};
+    }
+
+    VoidResult set_str_immediate(Instruction* inst, Str value) {
+        inst->imm.str_val = TRY(own_str(value));
         return {};
     }
 
@@ -99,11 +100,12 @@ struct Builder {
         auto* arena = mod->arena;
         auto* sd = static_cast<StructDef*>(arena->alloc(sizeof(StructDef)));
         if (!sd) return err(RirError::OutOfMemory);
-        sd->name = name;
+        sd->name = TRY(own_str(name));
         sd->field_count = count;
         sd->field_capacity = count;
         for (u32 i = 0; i < count; i++) {
             sd->fields()[i] = fields[i];
+            sd->fields()[i].name = TRY(own_str(fields[i].name));
         }
         mod->struct_defs[mod->struct_count++] = sd;
         return sd;
