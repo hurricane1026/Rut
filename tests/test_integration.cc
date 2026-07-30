@@ -16261,6 +16261,19 @@ TEST(route, marking_policy_marks_must_dominate_every_exit) {
     marked_exit[1].op = rir::Opcode::Jmp;
     marked_exit[1].imm.block_targets[0] = {2};
     CHECK(marking_policy_control_flow_valid(fn));
+
+    // Every publication must dominate every exit, even when an earlier
+    // publication for the same receiver is already unconditional.
+    rir::Instruction entry_with_mark[2]{};
+    entry_with_mark[0].op = rir::Opcode::UpstreamMark;
+    entry_with_mark[1].op = rir::Opcode::Br;
+    entry_with_mark[1].imm.block_targets[0] = {1};
+    entry_with_mark[1].imm.block_targets[1] = {2};
+    blocks[0].insts = entry_with_mark;
+    blocks[0].inst_count = 2;
+    blocks[0].inst_cap = 2;
+    marked_exit[1].op = rir::Opcode::RetStatus;
+    CHECK_FALSE(marking_policy_control_flow_valid(fn));
 }
 
 TEST(route, marking_policy_source_search_is_bounded_for_shared_select_dags) {
@@ -16987,6 +17000,98 @@ TEST(route, marking_policy_fingerprint_normalizes_struct_carried_server) {
     shifted.upstreams[1] = original.upstreams[0];
     policy[0].imm.i64_val = rir::encode_server_token(1, 0);
     policy[4].imm.i32_val = 1;
+    timer.upstream_mark_mask = u32{1} << 1;
+    CHECK_EQ(marking_policy_identity(shifted, timer), original_identity);
+}
+
+TEST(route, marking_policy_fingerprint_normalizes_carried_struct_receiver) {
+    using namespace rut;
+    const rir::Type i32_type{rir::TypeKind::I32, nullptr, nullptr};
+    const rir::Type i64_type{rir::TypeKind::I64, nullptr, nullptr};
+    const rir::Type bool_type{rir::TypeKind::Bool, nullptr, nullptr};
+    alignas(rir::StructDef) u8 storage[sizeof(rir::StructDef) + sizeof(rir::FieldDef)]{};
+    auto* def = reinterpret_cast<rir::StructDef*>(storage);
+    def->name = Str{"Wrapped", 7};
+    def->field_count = 1;
+    def->field_capacity = 1;
+    def->fields()[0] = rir::FieldDef{Str{"server", 6}, &i64_type};
+    const rir::Type struct_type{rir::TypeKind::Struct, nullptr, def};
+    const rir::Type optional_type{rir::TypeKind::Optional, &struct_type, nullptr};
+    const rir::Type array_type{rir::TypeKind::Array, &struct_type, nullptr};
+    const rir::Type* types[] = {&i64_type,
+                                &struct_type,
+                                &optional_type,
+                                &struct_type,
+                                &array_type,
+                                &i32_type,
+                                &struct_type,
+                                &i64_type,
+                                &bool_type,
+                                &bool_type};
+    rir::Value values[10]{};
+    rir::Instruction policy[10]{};
+    for (u32 i = 0; i < 10; i++) {
+        values[i] = {types[i], {0}, i};
+        policy[i].result = {i};
+    }
+    policy[0].op = rir::Opcode::ConstI64;
+    policy[0].imm.i64_val = rir::encode_server_token(0, 0);
+    policy[1].op = rir::Opcode::StructCreate;
+    policy[1].operand_count = 1;
+    policy[1].operands[0] = {0};
+    policy[1].imm.struct_ref.type = &struct_type;
+    policy[2].op = rir::Opcode::OptWrap;
+    policy[2].operand_count = 1;
+    policy[2].operands[0] = {1};
+    policy[3].op = rir::Opcode::OptUnwrap;
+    policy[3].operand_count = 1;
+    policy[3].operands[0] = {2};
+    policy[4].op = rir::Opcode::ArrayCreate;
+    policy[4].operand_count = 1;
+    policy[4].operands[0] = {3};
+    policy[5].op = rir::Opcode::ConstI32;
+    policy[6].op = rir::Opcode::ArrayGet;
+    policy[6].operand_count = 2;
+    policy[6].operands[0] = {4};
+    policy[6].operands[1] = {5};
+    policy[7].op = rir::Opcode::StructField;
+    policy[7].operand_count = 1;
+    policy[7].operands[0] = {6};
+    policy[7].imm.struct_ref.name = Str{"server", 6};
+    policy[7].imm.struct_ref.type = &i64_type;
+    policy[8].op = rir::Opcode::ConstBool;
+    policy[8].imm.bool_val = true;
+    policy[9].op = rir::Opcode::UpstreamMark;
+    policy[9].operand_count = 2;
+    policy[9].operands[0] = {7};
+    policy[9].operands[1] = {8};
+    rir::Block block{{0}, {}, policy, 10, 10};
+    rir::Function timer{};
+    timer.blocks = &block;
+    timer.block_count = 1;
+    timer.block_cap = 1;
+    timer.values = values;
+    timer.value_count = 10;
+    timer.value_cap = 10;
+    timer.upstream_mark_mask = 1;
+
+    rir::Module original{};
+    original.upstream_count = 1;
+    original.upstreams[0].name = Str{"users", 5};
+    original.upstreams[0].has_address = true;
+    original.upstreams[0].ip = 0x7F000001;
+    original.upstreams[0].port = 8080;
+    const u64 original_identity = marking_policy_identity(original, timer);
+
+    rir::Module shifted{};
+    shifted.upstream_count = 2;
+    shifted.upstreams[0].name = Str{"unrelated", 9};
+    shifted.upstreams[0].has_address = true;
+    shifted.upstreams[0].ip = 0x7F000002;
+    shifted.upstreams[0].port = 9090;
+    shifted.upstreams[1] = original.upstreams[0];
+    policy[0].imm.i64_val = rir::encode_server_token(1, 0);
+    policy[9].imm.i32_val = 1;
     timer.upstream_mark_mask = u32{1} << 1;
     CHECK_EQ(marking_policy_identity(shifted, timer), original_identity);
 }
