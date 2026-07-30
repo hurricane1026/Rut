@@ -903,6 +903,9 @@ inline bool marking_policy_arena_storage_shape_valid(const rir::Module& mod,
             return false;
         for (u32 ii = 0; ii < block.inst_count; ii++) {
             const auto& inst = block.insts[ii];
+            if (marking_policy_has_string_immediate(inst.op) && inst.imm.str_val.len != 0 &&
+                !mod.arena->contains_range(inst.imm.str_val.ptr, inst.imm.str_val.len))
+                return false;
             if ((inst.op == rir::Opcode::StructCreate || inst.op == rir::Opcode::StructField) &&
                 !marking_policy_arena_type_graph_valid(mod, inst.imm.struct_ref.type))
                 return false;
@@ -1278,12 +1281,14 @@ inline bool marking_policy_const_i32(const rir::Function& fn, rir::ValueId value
     return true;
 }
 
-inline bool marking_policy_array_element_flows_to_source(const rir::Function& fn,
-                                                         rir::ValueId receiver,
-                                                         u32 index,
-                                                         rir::ValueId source,
-                                                         u32 depth,
-                                                         MarkingPolicySourceSearch* search) {
+inline bool marking_policy_array_element_path_flows_to_source(const rir::Function& fn,
+                                                              rir::ValueId receiver,
+                                                              const bool* has_indices,
+                                                              const u32* indices,
+                                                              i32 index_index,
+                                                              rir::ValueId source,
+                                                              u32 depth,
+                                                              MarkingPolicySourceSearch* search) {
     if (receiver.id >= fn.value_count || depth >= fn.value_count ||
         !marking_policy_source_search_step(search))
         return false;
@@ -1295,14 +1300,26 @@ inline bool marking_policy_array_element_flows_to_source(const rir::Function& fn
     const auto& inst = block.insts[definition.def_inst];
     if (inst.result != receiver) return false;
     if (inst.op == rir::Opcode::Select && inst.operand_count == 3)
-        return marking_policy_array_element_flows_to_source(
-                   fn, inst.operand(1), index, source, depth + 1, search) ||
-               marking_policy_array_element_flows_to_source(
-                   fn, inst.operand(2), index, source, depth + 1, search);
+        return marking_policy_array_element_path_flows_to_source(fn,
+                                                                 inst.operand(1),
+                                                                 has_indices,
+                                                                 indices,
+                                                                 index_index,
+                                                                 source,
+                                                                 depth + 1,
+                                                                 search) ||
+               marking_policy_array_element_path_flows_to_source(fn,
+                                                                 inst.operand(2),
+                                                                 has_indices,
+                                                                 indices,
+                                                                 index_index,
+                                                                 source,
+                                                                 depth + 1,
+                                                                 search);
     if ((inst.op == rir::Opcode::OptWrap || inst.op == rir::Opcode::OptUnwrap) &&
         inst.operand_count == 1)
-        return marking_policy_array_element_flows_to_source(
-            fn, inst.operand(0), index, source, depth + 1, search);
+        return marking_policy_array_element_path_flows_to_source(
+            fn, inst.operand(0), has_indices, indices, index_index, source, depth + 1, search);
     if (inst.op == rir::Opcode::StructField && inst.operand_count == 1) {
         const rir::ValueId struct_value = inst.operand(0);
         if (struct_value.id >= fn.value_count) return false;
@@ -1321,13 +1338,35 @@ inline bool marking_policy_array_element_flows_to_source(const rir::Function& fn
         const auto& def = *create.imm.struct_ref.type->struct_def;
         for (u32 fi = 0; fi < def.field_count && fi < create.operand_count; fi++)
             if (def.fields()[fi].name.eq(inst.imm.struct_ref.name))
-                return marking_policy_array_element_flows_to_source(
-                    fn, create.operand(fi), index, source, depth + 1, search);
+                return marking_policy_array_element_path_flows_to_source(fn,
+                                                                         create.operand(fi),
+                                                                         has_indices,
+                                                                         indices,
+                                                                         index_index,
+                                                                         source,
+                                                                         depth + 1,
+                                                                         search);
         return false;
     }
-    return inst.op == rir::Opcode::ArrayCreate && index < inst.operand_count &&
-           marking_policy_value_flows_to_source_impl(
-               fn, inst.operand(index), source, depth + 1, search);
+    if (inst.op != rir::Opcode::ArrayCreate) return false;
+    const u32 begin = has_indices[index_index] ? indices[index_index] : 0;
+    const u32 end = has_indices[index_index] ? begin + 1 : inst.operand_count;
+    for (u32 element = begin; element < end && element < inst.operand_count; element++) {
+        const bool result =
+            index_index == 0
+                ? marking_policy_value_flows_to_source_impl(
+                      fn, inst.operand(element), source, depth + 1, search)
+                : marking_policy_array_element_path_flows_to_source(fn,
+                                                                    inst.operand(element),
+                                                                    has_indices,
+                                                                    indices,
+                                                                    index_index - 1,
+                                                                    source,
+                                                                    depth + 1,
+                                                                    search);
+        if (result) return true;
+    }
+    return false;
 }
 
 inline bool marking_policy_array_flows_to_source(const rir::Function& fn,
@@ -1727,12 +1766,41 @@ inline bool marking_policy_value_flows_to_source_impl(const rir::Function& fn,
             fn, receiver, fields, static_cast<i32>(field_count) - 1, source, depth + 1, search);
     }
     if (inst.op == rir::Opcode::ArrayGet && inst.operand_count == 2) {
-        i32 index = -1;
-        if (marking_policy_const_i32(fn, inst.operand(1), &index))
-            return index >= 0 &&
-                   marking_policy_array_element_flows_to_source(
-                       fn, inst.operand(0), static_cast<u32>(index), source, depth + 1, search);
-        return marking_policy_array_flows_to_source(fn, inst.operand(0), source, depth + 1, search);
+        static constexpr u32 kMaxArrayPath = 64;
+        bool has_indices[kMaxArrayPath];
+        u32 indices[kMaxArrayPath];
+        u32 index_count = 0;
+        rir::ValueId receiver = value;
+        while (index_count < kMaxArrayPath) {
+            if (receiver.id >= fn.value_count) return false;
+            const auto& array_definition = fn.values[receiver.id];
+            u32 array_block_index = 0;
+            if (!marking_policy_find_block(fn, array_definition.def_block, &array_block_index))
+                break;
+            const auto& array_block = fn.blocks[array_block_index];
+            if (array_definition.def_inst >= array_block.inst_count) break;
+            const auto& array_inst = array_block.insts[array_definition.def_inst];
+            if (array_inst.result != receiver || array_inst.op != rir::Opcode::ArrayGet ||
+                array_inst.operand_count != 2)
+                break;
+            i32 index = -1;
+            has_indices[index_count] =
+                marking_policy_const_i32(fn, array_inst.operand(1), &index) && index >= 0;
+            indices[index_count++] = static_cast<u32>(index);
+            receiver = array_inst.operand(0);
+        }
+        if (index_count == kMaxArrayPath) {
+            search->exhausted = true;
+            return false;
+        }
+        return marking_policy_array_element_path_flows_to_source(fn,
+                                                                 receiver,
+                                                                 has_indices,
+                                                                 indices,
+                                                                 static_cast<i32>(index_count) - 1,
+                                                                 source,
+                                                                 depth + 1,
+                                                                 search);
     }
     if ((inst.op == rir::Opcode::OptWrap || inst.op == rir::Opcode::OptUnwrap) &&
         inst.operand_count == 1)

@@ -15850,6 +15850,16 @@ TEST(route, marking_policy_rejects_unbacked_arena_storage_ranges) {
     values[0].type = &external_type;
     CHECK_FALSE(marking_policy_arena_storage_shape_valid(mod, functions[0]));
 
+    auto* arena_str_type = arena.alloc_t<rir::Type>();
+    REQUIRE(arena_str_type != nullptr);
+    *arena_str_type = {rir::TypeKind::Str, nullptr, nullptr};
+    values[0].type = arena_str_type;
+    const char external_string[] = "outside";
+    insts[0].op = rir::Opcode::ConstStr;
+    insts[0].imm.str_val = Str{external_string, 7};
+    CHECK_FALSE(marking_policy_arena_storage_shape_valid(mod, functions[0]));
+    insts[0] = {};
+
     auto* optional_type = arena.alloc_t<rir::Type>();
     REQUIRE(optional_type != nullptr);
     *optional_type = {rir::TypeKind::Optional, &external_type, nullptr};
@@ -17422,17 +17432,20 @@ TEST(route, marking_policy_fingerprint_normalizes_dynamic_array_server_sources) 
     const rir::Type i64_type{rir::TypeKind::I64, nullptr, nullptr};
     const rir::Type bool_type{rir::TypeKind::Bool, nullptr, nullptr};
     const rir::Type array_type{rir::TypeKind::Array, &i64_type, nullptr};
-    rir::Value values[10] = {{&i64_type, {0}, 0},
+    const rir::Type nested_array_type{rir::TypeKind::Array, &array_type, nullptr};
+    rir::Value values[12] = {{&i64_type, {0}, 0},
                              {&i64_type, {0}, 1},
                              {&array_type, {0}, 2},
-                             {&bool_type, {0}, 3},
-                             {&i32_type, {0}, 4},
+                             {&nested_array_type, {0}, 3},
+                             {&bool_type, {0}, 4},
                              {&i32_type, {0}, 5},
                              {&i32_type, {0}, 6},
-                             {&i64_type, {0}, 7},
-                             {&bool_type, {0}, 8},
-                             {&bool_type, {0}, 9}};
-    rir::Instruction policy[10]{};
+                             {&i32_type, {0}, 7},
+                             {&array_type, {0}, 8},
+                             {&i64_type, {0}, 9},
+                             {&bool_type, {0}, 10},
+                             {&bool_type, {0}, 11}};
+    rir::Instruction policy[12]{};
     policy[0].op = rir::Opcode::ConstI64;
     policy[0].result = {0};
     policy[0].imm.i64_val = rir::encode_server_token(0, 0);
@@ -17444,42 +17457,51 @@ TEST(route, marking_policy_fingerprint_normalizes_dynamic_array_server_sources) 
     policy[2].operand_count = 2;
     policy[2].operands[0] = {0};
     policy[2].operands[1] = {1};
-    policy[3].op = rir::Opcode::ConstBool;
+    policy[3].op = rir::Opcode::ArrayCreate;
     policy[3].result = {3};
-    policy[3].imm.bool_val = true;
-    policy[4].op = rir::Opcode::ConstI32;
+    policy[3].operand_count = 1;
+    policy[3].operands[0] = {2};
+    policy[4].op = rir::Opcode::ConstBool;
     policy[4].result = {4};
-    policy[4].imm.i32_val = 0;
+    policy[4].imm.bool_val = true;
     policy[5].op = rir::Opcode::ConstI32;
     policy[5].result = {5};
-    policy[5].imm.i32_val = 1;
-    policy[6].op = rir::Opcode::Select;
+    policy[5].imm.i32_val = 0;
+    policy[6].op = rir::Opcode::ConstI32;
     policy[6].result = {6};
-    policy[6].operand_count = 3;
-    policy[6].operands[0] = {3};
-    policy[6].operands[1] = {4};
-    policy[6].operands[2] = {5};
-    policy[7].op = rir::Opcode::ArrayGet;
+    policy[6].imm.i32_val = 1;
+    policy[7].op = rir::Opcode::Select;
     policy[7].result = {7};
-    policy[7].operand_count = 2;
-    policy[7].operands[0] = {2};
-    policy[7].operands[1] = {6};
-    policy[8].op = rir::Opcode::ConstBool;
+    policy[7].operand_count = 3;
+    policy[7].operands[0] = {4};
+    policy[7].operands[1] = {5};
+    policy[7].operands[2] = {6};
+    policy[8].op = rir::Opcode::ArrayGet;
     policy[8].result = {8};
-    policy[8].imm.bool_val = true;
-    policy[9].op = rir::Opcode::UpstreamMark;
+    policy[8].operand_count = 2;
+    policy[8].operands[0] = {3};
+    policy[8].operands[1] = {7};
+    policy[9].op = rir::Opcode::ArrayGet;
     policy[9].result = {9};
     policy[9].operand_count = 2;
-    policy[9].operands[0] = {7};
-    policy[9].operands[1] = {8};
-    rir::Block block{{0}, {}, policy, 10, 10};
+    policy[9].operands[0] = {8};
+    policy[9].operands[1] = {7};
+    policy[10].op = rir::Opcode::ConstBool;
+    policy[10].result = {10};
+    policy[10].imm.bool_val = true;
+    policy[11].op = rir::Opcode::UpstreamMark;
+    policy[11].result = {11};
+    policy[11].operand_count = 2;
+    policy[11].operands[0] = {9};
+    policy[11].operands[1] = {10};
+    rir::Block block{{0}, {}, policy, 12, 12};
     rir::Function timer{};
     timer.blocks = &block;
     timer.block_count = 1;
     timer.block_cap = 1;
     timer.values = values;
-    timer.value_count = 10;
-    timer.value_cap = 10;
+    timer.value_count = 12;
+    timer.value_cap = 12;
     timer.upstream_mark_mask = 1;
 
     rir::Module original{};
@@ -17502,7 +17524,7 @@ TEST(route, marking_policy_fingerprint_normalizes_dynamic_array_server_sources) 
     shifted.upstreams[1] = original.upstreams[0];
     policy[0].imm.i64_val = rir::encode_server_token(1, 0);
     policy[1].imm.i64_val = rir::encode_server_token(1, 1);
-    policy[9].imm.i32_val = 1;
+    policy[11].imm.i32_val = 1;
     timer.upstream_mark_mask = u32{1} << 1;
     CHECK_EQ(marking_policy_identity(shifted, timer), original_identity);
 }
