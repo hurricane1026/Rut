@@ -1511,9 +1511,45 @@ inline u64 marking_policy_identity(const rir::Module& mod, const rir::Function& 
                 const u32 upstream = static_cast<u32>(inst.imm.i32_val);
                 marking_policy_identity_mix(&identity,
                                             marking_policy_upstream_identity(mod, upstream));
+            } else if (op == rir::Opcode::RetStatus && inst.operand_count == 0) {
+                const u64 immediate = static_cast<u64>(inst.imm.i64_val);
+                const u32 status = static_cast<u32>(immediate & 0xffffu);
+                const u32 body_index = static_cast<u32>((immediate >> 16) & 0xffffu);
+                const u32 header_set_index = static_cast<u32>((immediate >> 32) & 0xffffu);
+                marking_policy_identity_mix(&identity, status);
+                marking_policy_identity_mix(&identity, body_index == 0 ? 0 : 1);
+                if (body_index != 0) {
+                    if (body_index <= mod.response_body_count) {
+                        marking_policy_identity_mix_str(&identity,
+                                                        mod.response_bodies[body_index - 1]);
+                    } else {
+                        marking_policy_identity_mix(&identity, 0xffffffffffffffffull);
+                        marking_policy_identity_mix(&identity, body_index);
+                    }
+                }
+                marking_policy_identity_mix(&identity, header_set_index == 0 ? 0 : 1);
+                if (header_set_index != 0) {
+                    if (header_set_index <= mod.header_set_count) {
+                        const auto& header_set = mod.header_sets[header_set_index - 1];
+                        marking_policy_identity_mix(&identity, header_set.count);
+                        for (u32 header = 0; header < header_set.count; header++) {
+                            const u32 pool_index = header_set.offset + header;
+                            if (pool_index >= mod.header_pool_used) {
+                                marking_policy_identity_mix(&identity, 0xfffffffffffffffeull);
+                                marking_policy_identity_mix(&identity, pool_index);
+                                continue;
+                            }
+                            marking_policy_identity_mix_str(&identity, mod.header_keys[pool_index]);
+                            marking_policy_identity_mix_str(&identity,
+                                                            mod.header_values[pool_index]);
+                        }
+                    } else {
+                        marking_policy_identity_mix(&identity, 0xffffffffffffffffull);
+                        marking_policy_identity_mix(&identity, header_set_index);
+                    }
+                }
             } else if (op == rir::Opcode::ConstI64 || op == rir::Opcode::ConstDuration ||
-                       op == rir::Opcode::ConstByteSize || op == rir::Opcode::YieldTimer ||
-                       (op == rir::Opcode::RetStatus && inst.operand_count == 0)) {
+                       op == rir::Opcode::ConstByteSize || op == rir::Opcode::YieldTimer) {
                 const u64 immediate = static_cast<u64>(inst.imm.i64_val);
                 if (op == rir::Opcode::ConstI64 && inst.result != rir::kNoValue &&
                     marking_policy_value_is_mark_server(fn, inst.result)) {

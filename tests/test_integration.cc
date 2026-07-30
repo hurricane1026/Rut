@@ -16801,6 +16801,53 @@ TEST(route, marking_policy_fingerprint_includes_ordered_upstream_backends) {
     CHECK_NE(marking_policy_identity(mod, timer), original_identity);
 }
 
+TEST(route, marking_policy_fingerprint_normalizes_static_response_tables) {
+    using namespace rut;
+    rir::Instruction original_return{};
+    original_return.op = rir::Opcode::RetStatus;
+    original_return.result = rir::kNoValue;
+    original_return.imm.i64_val = 200 | (u64{1} << 16) | (u64{1} << 32);
+    rir::Block original_block{{0}, {}, &original_return, 1, 1};
+    rir::Function original_timer{};
+    original_timer.blocks = &original_block;
+    original_timer.block_count = 1;
+    original_timer.block_cap = 1;
+    rir::Module original{};
+    original.response_bodies[0] = Str{"healthy", 7};
+    original.response_body_count = 1;
+    original.header_keys[0] = Str{"x-health", 8};
+    original.header_values[0] = Str{"up", 2};
+    original.header_pool_used = 1;
+    original.header_sets[0] = {0, 1};
+    original.header_set_count = 1;
+
+    rir::Instruction shifted_return = original_return;
+    shifted_return.imm.i64_val = 200 | (u64{2} << 16) | (u64{2} << 32);
+    rir::Block shifted_block{{0}, {}, &shifted_return, 1, 1};
+    rir::Function shifted_timer = original_timer;
+    shifted_timer.blocks = &shifted_block;
+    rir::Module shifted{};
+    shifted.response_bodies[0] = Str{"unrelated", 9};
+    shifted.response_bodies[1] = original.response_bodies[0];
+    shifted.response_body_count = 2;
+    shifted.header_keys[0] = Str{"x-unrelated", 11};
+    shifted.header_values[0] = Str{"value", 5};
+    shifted.header_keys[1] = original.header_keys[0];
+    shifted.header_values[1] = original.header_values[0];
+    shifted.header_pool_used = 2;
+    shifted.header_sets[0] = {0, 1};
+    shifted.header_sets[1] = {1, 1};
+    shifted.header_set_count = 2;
+
+    const u64 original_identity = marking_policy_identity(original, original_timer);
+    CHECK_EQ(marking_policy_identity(shifted, shifted_timer), original_identity);
+    shifted.response_bodies[1] = Str{"unhealthy", 9};
+    CHECK_NE(marking_policy_identity(shifted, shifted_timer), original_identity);
+    shifted.response_bodies[1] = original.response_bodies[0];
+    shifted.header_values[1] = Str{"down", 4};
+    CHECK_NE(marking_policy_identity(shifted, shifted_timer), original_identity);
+}
+
 TEST(route, marking_policy_fingerprint_ignores_unrelated_upstream_positions) {
     using namespace rut;
     const auto compile_policy = [](const char* source, u64* out_identity, bool* saw_select) {
