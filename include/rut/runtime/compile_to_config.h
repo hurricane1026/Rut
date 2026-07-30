@@ -258,6 +258,39 @@ inline bool marking_policy_type_shape_valid(const rir::Type* type) {
     return marking_policy_type_shape_valid_impl(type, seen, 0);
 }
 
+inline bool marking_policy_arena_type_graph_valid_impl(const rir::Module& mod,
+                                                       const rir::Type* type,
+                                                       const rir::Type** seen,
+                                                       u32 depth) {
+    if (type == nullptr || depth >= 64 ||
+        reinterpret_cast<uintptr_t>(type) % alignof(rir::Type) != 0 ||
+        !mod.arena->contains_range(type, sizeof(rir::Type)))
+        return false;
+    for (u32 i = 0; i < depth; i++)
+        if (seen[i] == type) return false;
+    seen[depth] = type;
+    if (type->kind == rir::TypeKind::Optional || type->kind == rir::TypeKind::Array)
+        return marking_policy_arena_type_graph_valid_impl(mod, type->inner, seen, depth + 1);
+    if (type->kind != rir::TypeKind::Struct) return true;
+    const auto* def = type->struct_def;
+    if (def == nullptr || reinterpret_cast<uintptr_t>(def) % alignof(rir::StructDef) != 0 ||
+        !mod.arena->contains_range(def, sizeof(rir::StructDef)) ||
+        def->field_count > rir::kMaxStructFields || def->field_capacity > rir::kMaxStructFields ||
+        def->field_count > def->field_capacity)
+        return false;
+    for (u32 field = 0; field < def->field_count; field++)
+        if (!marking_policy_arena_type_graph_valid_impl(
+                mod, def->fields()[field].type, seen, depth + 1))
+            return false;
+    return true;
+}
+
+inline bool marking_policy_arena_type_graph_valid(const rir::Module& mod, const rir::Type* type) {
+    if (mod.arena == nullptr) return true;
+    const rir::Type* seen[64]{};
+    return marking_policy_arena_type_graph_valid_impl(mod, type, seen, 0);
+}
+
 inline bool marking_policy_types_equal(const rir::Type* lhs, const rir::Type* rhs, u32 depth = 0) {
     if (lhs == rhs) return lhs != nullptr;
     if (lhs == nullptr || rhs == nullptr || lhs->kind != rhs->kind || depth >= 64) return false;
@@ -860,12 +893,20 @@ inline bool marking_policy_arena_storage_shape_valid(const rir::Module& mod,
                                    static_cast<u64>(fn.block_cap) * sizeof(rir::Block)) ||
         !mod.arena->contains_range(fn.values, static_cast<u64>(fn.value_cap) * sizeof(rir::Value)))
         return false;
+    for (u32 value = 0; value < fn.value_count; value++)
+        if (!marking_policy_arena_type_graph_valid(mod, fn.values[value].type)) return false;
     for (u32 bi = 0; bi < fn.block_count; bi++) {
         const auto& block = fn.blocks[bi];
         if (block.inst_count > block.inst_cap ||
             !mod.arena->contains_range(block.insts,
                                        static_cast<u64>(block.inst_cap) * sizeof(rir::Instruction)))
             return false;
+        for (u32 ii = 0; ii < block.inst_count; ii++) {
+            const auto& inst = block.insts[ii];
+            if ((inst.op == rir::Opcode::StructCreate || inst.op == rir::Opcode::StructField) &&
+                !marking_policy_arena_type_graph_valid(mod, inst.imm.struct_ref.type))
+                return false;
+        }
     }
     return true;
 }

@@ -15844,6 +15844,24 @@ TEST(route, marking_policy_rejects_unbacked_arena_storage_ranges) {
     blocks[0].inst_count = 1;
     blocks[0].inst_cap = 2;
     CHECK_FALSE(marking_policy_arena_storage_shape_valid(mod, functions[0]));
+
+    blocks[0].inst_cap = 1;
+    const rir::Type external_type{rir::TypeKind::I64, nullptr, nullptr};
+    values[0].type = &external_type;
+    CHECK_FALSE(marking_policy_arena_storage_shape_valid(mod, functions[0]));
+
+    auto* optional_type = arena.alloc_t<rir::Type>();
+    REQUIRE(optional_type != nullptr);
+    *optional_type = {rir::TypeKind::Optional, &external_type, nullptr};
+    values[0].type = optional_type;
+    CHECK_FALSE(marking_policy_arena_storage_shape_valid(mod, functions[0]));
+
+    auto* struct_type = arena.alloc_t<rir::Type>();
+    REQUIRE(struct_type != nullptr);
+    rir::StructDef external_def{};
+    *struct_type = {rir::TypeKind::Struct, nullptr, &external_def};
+    values[0].type = struct_type;
+    CHECK_FALSE(marking_policy_arena_storage_shape_valid(mod, functions[0]));
     arena.destroy();
 }
 
