@@ -1955,10 +1955,16 @@ static void emit_instruction(Ctx& c, const rir::Instruction& inst) {
             LLVMValueRef generation =
                 LLVMBuildLoad2(c.builder, c.i64_ty, generation_ptr, "mark.generation");
             LLVMValueRef server = c.get_value(inst.operands[0]);
-            LLVMValueRef valid = LLVMBuildICmp(
-                c.builder, LLVMIntNE, server, LLVMConstInt(c.i64_ty, 0, 0), "mark.server.valid");
             LLVMValueRef decoded =
                 LLVMBuildSub(c.builder, server, LLVMConstInt(c.i64_ty, 1, 0), "mark.server.raw");
+            LLVMValueRef nonzero = LLVMBuildICmp(
+                c.builder, LLVMIntNE, server, LLVMConstInt(c.i64_ty, 0, 0), "mark.server.nonzero");
+            LLVMValueRef packed = LLVMBuildICmp(c.builder,
+                                                LLVMIntULE,
+                                                decoded,
+                                                LLVMConstInt(c.i64_ty, 0xffffffffu, 0),
+                                                "mark.server.packed");
+            LLVMValueRef valid = LLVMBuildAnd(c.builder, nonzero, packed, "mark.server.valid");
             LLVMValueRef backend = LLVMBuildTrunc(c.builder, decoded, c.i16_ty, "mark.backend");
             LLVMValueRef upstream_shift = LLVMBuildLShr(
                 c.builder, decoded, LLVMConstInt(c.i64_ty, 16, 0), "mark.upstream.shift");

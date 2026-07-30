@@ -16204,6 +16204,35 @@ TEST(route, marking_policy_checks_cross_block_dominance_paths) {
     CHECK_FALSE(marking_policy_block_dominates(fn, 1, 2));
 }
 
+TEST(route, marking_policy_marks_must_dominate_every_exit) {
+    using namespace rut;
+    rir::Instruction entry{};
+    entry.op = rir::Opcode::Br;
+    entry.imm.block_targets[0] = {1};
+    entry.imm.block_targets[1] = {2};
+    rir::Instruction marked_exit[2]{};
+    marked_exit[0].op = rir::Opcode::UpstreamMark;
+    marked_exit[1].op = rir::Opcode::RetStatus;
+    rir::Instruction bypass_exit{};
+    bypass_exit.op = rir::Opcode::RetStatus;
+    rir::Block blocks[3] = {
+        {{0}, {}, &entry, 1, 1},
+        {{1}, {}, marked_exit, 2, 2},
+        {{2}, {}, &bypass_exit, 1, 1},
+    };
+    rir::Function fn{};
+    fn.blocks = blocks;
+    fn.block_count = 3;
+    fn.block_cap = 3;
+
+    CHECK_FALSE(marking_policy_control_flow_valid(fn));
+
+    entry.op = rir::Opcode::Jmp;
+    marked_exit[1].op = rir::Opcode::Jmp;
+    marked_exit[1].imm.block_targets[0] = {2};
+    CHECK(marking_policy_control_flow_valid(fn));
+}
+
 TEST(route, upstream_mark_validates_string_opcode_types) {
     using namespace rut;
     const rir::Type str_type{rir::TypeKind::Str, nullptr, nullptr};

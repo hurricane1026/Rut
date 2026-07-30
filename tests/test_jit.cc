@@ -1571,6 +1571,56 @@ TEST(jit, out_of_bounds_server_lookup_cannot_mark_backend_zero) {
     rir.destroy();
 }
 
+TEST(jit, oversized_server_token_cannot_mark_truncated_backend) {
+    FrontendRirModule rir{};
+    REQUIRE(rir.init(1));
+    rir::Builder builder{};
+    builder.init(&rir.module);
+    auto function_result = builder.create_function(lit("check_health"), {}, 0);
+    REQUIRE(function_result);
+    rir::Function* fn = function_result.value();
+    fn->is_timer = true;
+    fn->timer_shard = 0;
+    fn->timer_interval_ms = 5000;
+    fn->upstream_mark_mask = 1;
+    auto block_result = builder.create_block(fn, lit("entry"));
+    REQUIRE(block_result);
+    builder.set_insert_point(fn, block_result.value());
+    auto server = builder.emit_const_i64((i64{1} << 32) | rir::encode_server_token(0, 0));
+    REQUIRE(server);
+    auto unhealthy = builder.emit_const_bool(false);
+    REQUIRE(unhealthy);
+    REQUIRE(builder.emit_upstream_mark(0, server.value(), unhealthy.value()));
+    REQUIRE(builder.emit_ret_status(200));
+    rir.module.upstream_mark_replay_complete = true;
+    rir.module.upstream_count = 1;
+    rir.module.upstreams[0].name = lit("users");
+    rir.module.upstreams[0].has_address = true;
+    rir.module.upstreams[0].ip = 0x7f000001;
+    rir.module.upstreams[0].port = 8080;
+    auto cg = codegen(rir.module);
+    REQUIRE(cg.ok);
+    JitEngine engine;
+    REQUIRE(engine.init());
+    REQUIRE(engine.compile(cg.mod, cg.ctx));
+    auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_check_health"));
+    REQUIRE(handler != nullptr);
+
+    RouteConfig mutation_config;
+    REQUIRE(populate_route_config(mutation_config, rir.module));
+    ControlPlaneMutationPort mutation;
+    mutation.reset(12, false, &mutation_config);
+    TestHandlerCtxFrame frame{};
+    frame.ctx.control_plane_mutation = &mutation;
+    frame.ctx.config_generation = 12;
+    const auto result = HandlerResult::unpack(handler(nullptr, &frame.ctx, nullptr, 0, nullptr));
+    CHECK_EQ(result.status_code, 200u);
+    CHECK_EQ(mutation.manual_health({12, 0, 0}), ManualHealthOverride::None);
+
+    engine.shutdown();
+    rir.destroy();
+}
+
 TEST(jit, control_plane_snapshots_serialize_exact_unsigned_json_and_fail_closed) {
     const auto src = R"rut(
 route GET "/stats" { return 200, json(stats()) }

@@ -467,6 +467,43 @@ inline bool marking_policy_block_dominates(const rir::Function& fn,
     return true;
 }
 
+inline bool marking_policy_receiver_dominates_exit(const rir::Function& fn,
+                                                   u32 receiver,
+                                                   u32 exit_block) {
+    static constexpr u32 kMaxPolicyBlocks = 4096;
+    if (fn.block_count > kMaxPolicyBlocks) return false;
+    bool visited[kMaxPolicyBlocks]{};
+    u32 worklist[kMaxPolicyBlocks]{};
+    u32 work_count = 1;
+    worklist[0] = 0;
+    visited[0] = true;
+    while (work_count != 0) {
+        const u32 bi = worklist[--work_count];
+        const auto& block = fn.blocks[bi];
+        bool marked = false;
+        for (u32 ii = 0; ii < block.inst_count; ii++)
+            marked |= block.insts[ii].op == rir::Opcode::UpstreamMark &&
+                      block.insts[ii].imm.i32_val >= 0 &&
+                      static_cast<u32>(block.insts[ii].imm.i32_val) == receiver;
+        if (marked) continue;
+        if (bi == exit_block) return false;
+        const auto& term = block.insts[block.inst_count - 1];
+        const u32 target_count = term.op == rir::Opcode::Br    ? 2
+                                 : term.op == rir::Opcode::Jmp ? 1
+                                                               : 0;
+        for (u32 ti = 0; ti < target_count; ti++) {
+            u32 target_index = 0;
+            if (!marking_policy_find_block(fn, term.imm.block_targets[ti], &target_index))
+                return false;
+            if (!visited[target_index]) {
+                visited[target_index] = true;
+                worklist[work_count++] = target_index;
+            }
+        }
+    }
+    return true;
+}
+
 inline bool marking_policy_operand_has_dominating_definition(const rir::Function& fn,
                                                              rir::ValueId operand,
                                                              u32 use_block,
@@ -1021,6 +1058,24 @@ inline bool marking_policy_control_flow_valid(const rir::Function& fn) {
         const auto& block = fn.blocks[bi];
         for (u32 ii = 0; ii < block.inst_count; ii++)
             if (block.insts[ii].op == rir::Opcode::UpstreamMark) return false;
+    }
+    u32 receivers = 0;
+    for (u32 bi = 0; bi < fn.block_count; bi++)
+        for (u32 ii = 0; ii < fn.blocks[bi].inst_count; ii++) {
+            const auto& inst = fn.blocks[bi].insts[ii];
+            if (inst.op == rir::Opcode::UpstreamMark && inst.imm.i32_val >= 0 &&
+                inst.imm.i32_val < 32)
+                receivers |= u32{1} << static_cast<u32>(inst.imm.i32_val);
+        }
+    for (u32 exit_block = 0; exit_block < fn.block_count; exit_block++) {
+        if (color[exit_block] == 0) continue;
+        const auto& exit = fn.blocks[exit_block];
+        const auto& term = exit.insts[exit.inst_count - 1];
+        if (term.op == rir::Opcode::Br || term.op == rir::Opcode::Jmp) continue;
+        for (u32 receiver = 0; receiver < 32; receiver++)
+            if ((receivers & (u32{1} << receiver)) != 0 &&
+                !marking_policy_receiver_dominates_exit(fn, receiver, exit_block))
+                return false;
     }
     return true;
 }
