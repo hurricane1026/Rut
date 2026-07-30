@@ -16995,6 +16995,9 @@ TEST(route, marking_policy_fingerprint_normalizes_struct_carried_server) {
     original.upstreams[0].ip = 0x7F000001;
     original.upstreams[0].port = 8080;
     const u64 original_identity = marking_policy_identity(original, timer);
+    policy[0].imm.i64_val =
+        static_cast<i64>((u64{1} << 32) | static_cast<u64>(rir::encode_server_token(0, 0)));
+    CHECK_NE(marking_policy_identity(original, timer), original_identity);
 
     rir::Module shifted{};
     shifted.upstream_count = 2;
@@ -17005,6 +17008,86 @@ TEST(route, marking_policy_fingerprint_normalizes_struct_carried_server) {
     shifted.upstreams[1] = original.upstreams[0];
     policy[0].imm.i64_val = rir::encode_server_token(1, 0);
     policy[4].imm.i32_val = 1;
+    timer.upstream_mark_mask = u32{1} << 1;
+    CHECK_EQ(marking_policy_identity(shifted, timer), original_identity);
+}
+
+TEST(route, marking_policy_fingerprint_normalizes_nested_struct_projection) {
+    using namespace rut;
+    const rir::Type i64_type{rir::TypeKind::I64, nullptr, nullptr};
+    const rir::Type bool_type{rir::TypeKind::Bool, nullptr, nullptr};
+    alignas(rir::StructDef) u8 inner_storage[sizeof(rir::StructDef) + sizeof(rir::FieldDef)]{};
+    auto* inner_def = reinterpret_cast<rir::StructDef*>(inner_storage);
+    inner_def->name = Str{"Inner", 5};
+    inner_def->field_count = 1;
+    inner_def->field_capacity = 1;
+    inner_def->fields()[0] = rir::FieldDef{Str{"server", 6}, &i64_type};
+    const rir::Type inner_type{rir::TypeKind::Struct, nullptr, inner_def};
+    alignas(rir::StructDef) u8 outer_storage[sizeof(rir::StructDef) + sizeof(rir::FieldDef)]{};
+    auto* outer_def = reinterpret_cast<rir::StructDef*>(outer_storage);
+    outer_def->name = Str{"Outer", 5};
+    outer_def->field_count = 1;
+    outer_def->field_capacity = 1;
+    outer_def->fields()[0] = rir::FieldDef{Str{"inner", 5}, &inner_type};
+    const rir::Type outer_type{rir::TypeKind::Struct, nullptr, outer_def};
+    const rir::Type* types[] = {
+        &i64_type, &inner_type, &outer_type, &inner_type, &i64_type, &bool_type, &bool_type};
+    rir::Value values[7]{};
+    rir::Instruction policy[7]{};
+    for (u32 i = 0; i < 7; i++) {
+        values[i] = {types[i], {0}, i};
+        policy[i].result = {i};
+    }
+    policy[0].op = rir::Opcode::ConstI64;
+    policy[0].imm.i64_val = rir::encode_server_token(0, 0);
+    policy[1].op = rir::Opcode::StructCreate;
+    policy[1].operand_count = 1;
+    policy[1].operands[0] = {0};
+    policy[1].imm.struct_ref.type = &inner_type;
+    policy[2].op = rir::Opcode::StructCreate;
+    policy[2].operand_count = 1;
+    policy[2].operands[0] = {1};
+    policy[2].imm.struct_ref.type = &outer_type;
+    policy[3].op = rir::Opcode::StructField;
+    policy[3].operand_count = 1;
+    policy[3].operands[0] = {2};
+    policy[3].imm.struct_ref.name = Str{"inner", 5};
+    policy[3].imm.struct_ref.type = &inner_type;
+    policy[4].op = rir::Opcode::StructField;
+    policy[4].operand_count = 1;
+    policy[4].operands[0] = {3};
+    policy[4].imm.struct_ref.name = Str{"server", 6};
+    policy[4].imm.struct_ref.type = &i64_type;
+    policy[5].op = rir::Opcode::ConstBool;
+    policy[5].imm.bool_val = true;
+    policy[6].op = rir::Opcode::UpstreamMark;
+    policy[6].operand_count = 2;
+    policy[6].operands[0] = {4};
+    policy[6].operands[1] = {5};
+    rir::Block block{{0}, {}, policy, 7, 7};
+    rir::Function timer{};
+    timer.blocks = &block;
+    timer.block_count = 1;
+    timer.values = values;
+    timer.value_count = 7;
+    timer.upstream_mark_mask = 1;
+
+    rir::Module original{};
+    original.upstream_count = 1;
+    original.upstreams[0].name = Str{"users", 5};
+    original.upstreams[0].has_address = true;
+    original.upstreams[0].ip = 0x7F000001;
+    original.upstreams[0].port = 8080;
+    const u64 original_identity = marking_policy_identity(original, timer);
+    rir::Module shifted{};
+    shifted.upstream_count = 2;
+    shifted.upstreams[0].name = Str{"unrelated", 9};
+    shifted.upstreams[0].has_address = true;
+    shifted.upstreams[0].ip = 0x7F000002;
+    shifted.upstreams[0].port = 9090;
+    shifted.upstreams[1] = original.upstreams[0];
+    policy[0].imm.i64_val = rir::encode_server_token(1, 0);
+    policy[6].imm.i32_val = 1;
     timer.upstream_mark_mask = u32{1} << 1;
     CHECK_EQ(marking_policy_identity(shifted, timer), original_identity);
 }

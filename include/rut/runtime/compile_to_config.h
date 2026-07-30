@@ -1322,6 +1322,44 @@ inline bool marking_policy_struct_field_flows_to_source(const rir::Function& fn,
                                                         u32 depth,
                                                         MarkingPolicySourceSearch* search);
 
+inline bool marking_policy_nested_struct_field_flows_to_source(const rir::Function& fn,
+                                                               rir::ValueId receiver,
+                                                               Str projected_field,
+                                                               Str nested_field,
+                                                               rir::ValueId source,
+                                                               u32 depth,
+                                                               MarkingPolicySourceSearch* search) {
+    if (receiver.id >= fn.value_count || depth >= fn.value_count ||
+        !marking_policy_source_search_step(search))
+        return false;
+    const auto& definition = fn.values[receiver.id];
+    u32 block_index = 0;
+    if (!marking_policy_find_block(fn, definition.def_block, &block_index)) return false;
+    const auto& block = fn.blocks[block_index];
+    if (definition.def_inst >= block.inst_count) return false;
+    const auto& inst = block.insts[definition.def_inst];
+    if (inst.result != receiver) return false;
+    if (inst.op == rir::Opcode::Select && inst.operand_count == 3)
+        return marking_policy_nested_struct_field_flows_to_source(
+                   fn, inst.operand(1), projected_field, nested_field, source, depth + 1, search) ||
+               marking_policy_nested_struct_field_flows_to_source(
+                   fn, inst.operand(2), projected_field, nested_field, source, depth + 1, search);
+    if ((inst.op == rir::Opcode::OptWrap || inst.op == rir::Opcode::OptUnwrap) &&
+        inst.operand_count == 1)
+        return marking_policy_nested_struct_field_flows_to_source(
+            fn, inst.operand(0), projected_field, nested_field, source, depth + 1, search);
+    if (inst.op != rir::Opcode::StructCreate || inst.imm.struct_ref.type == nullptr ||
+        inst.imm.struct_ref.type->kind != rir::TypeKind::Struct ||
+        inst.imm.struct_ref.type->struct_def == nullptr)
+        return false;
+    const auto& def = *inst.imm.struct_ref.type->struct_def;
+    for (u32 field = 0; field < def.field_count && field < inst.operand_count; field++)
+        if (def.fields()[field].name.eq(projected_field))
+            return marking_policy_struct_field_flows_to_source(
+                fn, inst.operand(field), nested_field, source, depth + 1, search);
+    return false;
+}
+
 inline bool marking_policy_array_struct_field_flows_to_source(const rir::Function& fn,
                                                               rir::ValueId receiver,
                                                               bool has_index,
@@ -1386,6 +1424,9 @@ inline bool marking_policy_struct_field_flows_to_source(const rir::Function& fn,
         inst.operand_count == 1)
         return marking_policy_struct_field_flows_to_source(
             fn, inst.operand(0), field_name, source, depth + 1, search);
+    if (inst.op == rir::Opcode::StructField && inst.operand_count == 1)
+        return marking_policy_nested_struct_field_flows_to_source(
+            fn, inst.operand(0), inst.imm.struct_ref.name, field_name, source, depth + 1, search);
     if (inst.op == rir::Opcode::ArrayGet && inst.operand_count == 2) {
         i32 index = -1;
         const bool has_index = marking_policy_const_i32(fn, inst.operand(1), &index) && index >= 0;
@@ -1600,6 +1641,11 @@ inline u64 marking_policy_identity(const rir::Module& mod, const rir::Function& 
                         marking_policy_identity_mix(&identity, 0xffffffffffffffffull);
                     } else {
                         const u64 decoded = immediate - 1;
+                        if (decoded > 0xffffffffu) {
+                            marking_policy_identity_mix(&identity, 0xfffffffffffffffeull);
+                            marking_policy_identity_mix(&identity, immediate);
+                            continue;
+                        }
                         const u32 upstream = static_cast<u32>((decoded >> 16) & 0xffffu);
                         const u32 backend = static_cast<u32>(decoded & 0xffffu);
                         marking_policy_identity_mix(
