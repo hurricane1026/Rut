@@ -468,6 +468,26 @@ inline bool marking_policy_block_dominates(const rir::Function& fn,
     return true;
 }
 
+inline bool marking_policy_is_mark_failure_exit(const rir::Function& fn,
+                                                const rir::Instruction& branch,
+                                                u32 target_block) {
+    if (branch.op != rir::Opcode::Br || branch.operand_count != 1 ||
+        branch.operand(0).id >= fn.value_count)
+        return false;
+    const auto& condition = fn.values[branch.operand(0).id];
+    u32 condition_block = 0;
+    if (!marking_policy_find_block(fn, condition.def_block, &condition_block) ||
+        condition.def_inst >= fn.blocks[condition_block].inst_count ||
+        fn.blocks[condition_block].insts[condition.def_inst].op != rir::Opcode::UpstreamMark)
+        return false;
+    const auto& exit = fn.blocks[target_block];
+    if (exit.inst_count == 0 || exit.insts == nullptr) return false;
+    for (u32 ii = 0; ii + 1 < exit.inst_count; ii++)
+        if (exit.insts[ii].op == rir::Opcode::UpstreamMark) return false;
+    const auto& term = exit.insts[exit.inst_count - 1];
+    return term.op != rir::Opcode::Br && term.op != rir::Opcode::Jmp;
+}
+
 inline bool marking_policy_mark_dominates_exits(const rir::Function& fn, u32 mark_block) {
     if (mark_block == 0) return true;
     static constexpr u32 kMaxPolicyBlocks = 4096;
@@ -490,6 +510,7 @@ inline bool marking_policy_mark_dominates_exits(const rir::Function& fn, u32 mar
             u32 target_index = 0;
             if (!marking_policy_find_block(fn, term.imm.block_targets[ti], &target_index))
                 return false;
+            if (ti == 1 && marking_policy_is_mark_failure_exit(fn, term, target_index)) continue;
             if (!visited[target_index]) {
                 visited[target_index] = true;
                 worklist[work_count++] = target_index;

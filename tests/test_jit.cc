@@ -1468,7 +1468,7 @@ TEST(jit, pinned_timer_upstream_mark_executes_with_latched_generation) {
 upstream users { backends: ["127.0.0.1:8080", "127.0.0.2:8080"] }
 timer check_health, every: 5s, shard: 0 {
     for server in users.servers {
-        users.mark(server, healthy: true)
+        guard users.mark(server, healthy: true) else { return 500 }
     }
     return 200
 }
@@ -1506,7 +1506,7 @@ timer check_health, every: 5s, shard: 0 {
 
     mutation.reset(10, false, &mutation_config);
     result = HandlerResult::unpack(handler(nullptr, &frame.ctx, nullptr, 0, nullptr));
-    CHECK_EQ(result.status_code, 200u);
+    CHECK_EQ(result.status_code, 500u);
     CHECK_EQ(mutation.manual_health({10, 0, 0}), ManualHealthOverride::None);
 
     engine.shutdown();

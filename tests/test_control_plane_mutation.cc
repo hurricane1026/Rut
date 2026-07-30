@@ -2156,9 +2156,9 @@ TEST(control_plane_mutation, handler_context_latches_only_the_explicit_loop_capa
     ControlPlaneMutationPort port;
     jit::HandlerCtx ctx{};
     loop.control_plane_mutation = &port;
-    latch_control_plane_mutation(&loop, &ctx);
+    latch_control_plane_mutation(&loop, &ctx, 0);
     CHECK(ctx.control_plane_mutation == &port);
-    latch_control_plane_mutation<Loop>(nullptr, &ctx);
+    latch_control_plane_mutation<Loop>(nullptr, &ctx, 0);
     CHECK(ctx.control_plane_mutation == nullptr);
 }
 
