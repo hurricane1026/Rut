@@ -1329,6 +1329,8 @@ TEST(control_plane_mutation, activation_carries_overrides_across_marking_policy_
         old_config.upstreams[0].marking_policy_identity = 11;
         port.reset(3, true, &old_config);
         REQUIRE(port.mark({3, 0, 0}, false));
+        const u16 old_allocation = port.endpoint_allocation_for_config(&old_config, 0, 0);
+        const u64 old_incarnation = port.endpoint_incarnation_for_config(&old_config, 0, 0);
 
         u64 id = 0;
         REQUIRE(port.request_reload(ReloadRequestSource::Route, &id));
@@ -1341,6 +1343,10 @@ TEST(control_plane_mutation, activation_carries_overrides_across_marking_policy_
             id, request.source, ReloadTerminalOutcome::Activated, 4, &new_config));
 
         CHECK_EQ(port.manual_health({4, 0, 0}), ManualHealthOverride::Unhealthy);
+        CHECK_NE(port.endpoint_allocation_for_config(&new_config, 0, 0), old_allocation);
+        CHECK_NE(port.endpoint_incarnation_for_config(&new_config, 0, 0), old_incarnation);
+        CHECK_EQ(port.endpoint_health_seed_incarnation_for_config(&new_config, 0, 0),
+                 old_incarnation);
     }
 }
 
@@ -1351,6 +1357,8 @@ TEST(control_plane_mutation, activation_carries_overrides_for_same_marking_polic
     old_config.upstreams[0].marking_policy_identity = 11;
     port.reset(3, true, &old_config);
     REQUIRE(port.mark({3, 0, 0}, false));
+    const u16 old_allocation = port.endpoint_allocation_for_config(&old_config, 0, 0);
+    const u64 old_incarnation = port.endpoint_incarnation_for_config(&old_config, 0, 0);
 
     u64 id = 0;
     REQUIRE(port.request_reload(ReloadRequestSource::Route, &id));
@@ -1363,6 +1371,8 @@ TEST(control_plane_mutation, activation_carries_overrides_for_same_marking_polic
         port.complete_reload(id, request.source, ReloadTerminalOutcome::Activated, 4, &new_config));
 
     CHECK_EQ(port.manual_health({4, 0, 0}), ManualHealthOverride::Unhealthy);
+    CHECK_EQ(port.endpoint_allocation_for_config(&new_config, 0, 0), old_allocation);
+    CHECK_EQ(port.endpoint_incarnation_for_config(&new_config, 0, 0), old_incarnation);
 }
 
 TEST(control_plane_mutation, activation_rejects_skipped_generation) {

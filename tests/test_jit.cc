@@ -1621,6 +1621,42 @@ TEST(jit, oversized_server_token_cannot_mark_truncated_backend) {
     rir.destroy();
 }
 
+TEST(jit, codegen_rejects_malformed_marking_policy_at_common_boundary) {
+    FrontendRirModule rir{};
+    REQUIRE(rir.init(1));
+    rir::Builder builder{};
+    builder.init(&rir.module);
+    auto function_result = builder.create_function(lit("check_health"), {}, 0);
+    REQUIRE(function_result);
+    rir::Function* fn = function_result.value();
+    fn->is_timer = true;
+    fn->timer_shard = 0;
+    fn->timer_interval_ms = 5000;
+    fn->upstream_mark_mask = 1;
+    auto block_result = builder.create_block(fn, lit("entry"));
+    REQUIRE(block_result);
+    builder.set_insert_point(fn, block_result.value());
+    auto server = builder.emit_const_i64(rir::encode_server_token(0, 0));
+    REQUIRE(server);
+    auto healthy = builder.emit_const_bool(true);
+    REQUIRE(healthy);
+    REQUIRE(builder.emit_upstream_mark(0, server.value(), healthy.value()));
+    REQUIRE(builder.emit_ret_status(200));
+    rir.module.upstream_mark_replay_complete = true;
+    rir.module.upstream_count = 1;
+    rir.module.upstreams[0].name = lit("users");
+    rir.module.upstreams[0].has_address = true;
+    rir.module.upstreams[0].ip = 0x7f000001;
+    rir.module.upstreams[0].port = 8080;
+
+    fn->blocks[0].insts[2].operand_count = 1;
+    const auto cg = codegen(rir.module);
+    CHECK_FALSE(cg.ok);
+    CHECK_EQ(cg.mod, nullptr);
+    CHECK_EQ(cg.ctx, nullptr);
+    rir.destroy();
+}
+
 TEST(jit, control_plane_snapshots_serialize_exact_unsigned_json_and_fail_closed) {
     const auto src = R"rut(
 route GET "/stats" { return 200, json(stats()) }

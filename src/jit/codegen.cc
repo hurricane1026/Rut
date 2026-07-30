@@ -2,6 +2,7 @@
 
 #include "rut/compiler/rir.h"
 #include "rut/jit/handler_abi.h"
+#include "rut/runtime/compile_to_config.h"
 #include <atomic>
 #include <cstddef>
 
@@ -2727,6 +2728,7 @@ static bool emit_function(Ctx& c, const rir::Function& fn) {
 // ── Module Codegen ─────────────────────────────────────────────────
 
 CodegenResult codegen(const rir::Module& rir_mod) {
+    if (!marking_policies_valid_for_codegen(rir_mod)) return {nullptr, nullptr, false};
     static std::atomic<u32> next_regex_module_id{1};
     Ctx c{};
     c.llvm_ctx = LLVMContextCreate();
