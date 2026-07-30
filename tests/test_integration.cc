@@ -17030,11 +17030,19 @@ TEST(route, marking_policy_fingerprint_normalizes_nested_struct_projection) {
     outer_def->field_capacity = 1;
     outer_def->fields()[0] = rir::FieldDef{Str{"inner", 5}, &inner_type};
     const rir::Type outer_type{rir::TypeKind::Struct, nullptr, outer_def};
-    const rir::Type* types[] = {
-        &i64_type, &inner_type, &outer_type, &inner_type, &i64_type, &bool_type, &bool_type};
-    rir::Value values[7]{};
-    rir::Instruction policy[7]{};
-    for (u32 i = 0; i < 7; i++) {
+    const rir::Type optional_outer_type{rir::TypeKind::Optional, &outer_type, nullptr};
+    const rir::Type* types[] = {&i64_type,
+                                &inner_type,
+                                &outer_type,
+                                &optional_outer_type,
+                                &outer_type,
+                                &inner_type,
+                                &i64_type,
+                                &bool_type,
+                                &bool_type};
+    rir::Value values[9]{};
+    rir::Instruction policy[9]{};
+    for (u32 i = 0; i < 9; i++) {
         values[i] = {types[i], {0}, i};
         policy[i].result = {i};
     }
@@ -17048,28 +17056,34 @@ TEST(route, marking_policy_fingerprint_normalizes_nested_struct_projection) {
     policy[2].operand_count = 1;
     policy[2].operands[0] = {1};
     policy[2].imm.struct_ref.type = &outer_type;
-    policy[3].op = rir::Opcode::StructField;
+    policy[3].op = rir::Opcode::OptWrap;
     policy[3].operand_count = 1;
     policy[3].operands[0] = {2};
-    policy[3].imm.struct_ref.name = Str{"inner", 5};
-    policy[3].imm.struct_ref.type = &inner_type;
-    policy[4].op = rir::Opcode::StructField;
+    policy[4].op = rir::Opcode::OptUnwrap;
     policy[4].operand_count = 1;
     policy[4].operands[0] = {3};
-    policy[4].imm.struct_ref.name = Str{"server", 6};
-    policy[4].imm.struct_ref.type = &i64_type;
-    policy[5].op = rir::Opcode::ConstBool;
-    policy[5].imm.bool_val = true;
-    policy[6].op = rir::Opcode::UpstreamMark;
-    policy[6].operand_count = 2;
-    policy[6].operands[0] = {4};
-    policy[6].operands[1] = {5};
-    rir::Block block{{0}, {}, policy, 7, 7};
+    policy[5].op = rir::Opcode::StructField;
+    policy[5].operand_count = 1;
+    policy[5].operands[0] = {4};
+    policy[5].imm.struct_ref.name = Str{"inner", 5};
+    policy[5].imm.struct_ref.type = &inner_type;
+    policy[6].op = rir::Opcode::StructField;
+    policy[6].operand_count = 1;
+    policy[6].operands[0] = {5};
+    policy[6].imm.struct_ref.name = Str{"server", 6};
+    policy[6].imm.struct_ref.type = &i64_type;
+    policy[7].op = rir::Opcode::ConstBool;
+    policy[7].imm.bool_val = true;
+    policy[8].op = rir::Opcode::UpstreamMark;
+    policy[8].operand_count = 2;
+    policy[8].operands[0] = {6};
+    policy[8].operands[1] = {7};
+    rir::Block block{{0}, {}, policy, 9, 9};
     rir::Function timer{};
     timer.blocks = &block;
     timer.block_count = 1;
     timer.values = values;
-    timer.value_count = 7;
+    timer.value_count = 9;
     timer.upstream_mark_mask = 1;
 
     rir::Module original{};
@@ -17087,7 +17101,7 @@ TEST(route, marking_policy_fingerprint_normalizes_nested_struct_projection) {
     shifted.upstreams[0].port = 9090;
     shifted.upstreams[1] = original.upstreams[0];
     policy[0].imm.i64_val = rir::encode_server_token(1, 0);
-    policy[6].imm.i32_val = 1;
+    policy[8].imm.i32_val = 1;
     timer.upstream_mark_mask = u32{1} << 1;
     CHECK_EQ(marking_policy_identity(shifted, timer), original_identity);
 }
