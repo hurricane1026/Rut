@@ -1078,7 +1078,7 @@ struct Builder {
         auto [inst, vid] = TRY(emit(Opcode::StructField, field_type, loc));
         inst->operands[0] = s;
         inst->operand_count = 1;
-        inst->imm.struct_ref.name = field_name;
+        inst->imm.struct_ref.name = TRY(own_str(field_name));
         inst->imm.struct_ref.type = field_type;
         return vid;
     }

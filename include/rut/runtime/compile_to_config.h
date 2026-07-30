@@ -912,7 +912,10 @@ inline bool marking_policy_arena_storage_shape_valid(const rir::Module& mod,
                 !mod.arena->contains_range(inst.imm.str_val.ptr, inst.imm.str_val.len))
                 return false;
             if ((inst.op == rir::Opcode::StructCreate || inst.op == rir::Opcode::StructField) &&
-                !marking_policy_arena_type_graph_valid(mod, inst.imm.struct_ref.type))
+                (!marking_policy_arena_type_graph_valid(mod, inst.imm.struct_ref.type) ||
+                 (inst.imm.struct_ref.name.len != 0 &&
+                  !mod.arena->contains_range(inst.imm.struct_ref.name.ptr,
+                                             inst.imm.struct_ref.name.len))))
                 return false;
         }
     }
@@ -1028,7 +1031,9 @@ inline bool marking_policy_emitted_mask(const rir::Module& mod,
                                         u32* emitted_mask,
                                         bool* request_dependent = nullptr,
                                         bool* suspends = nullptr) {
-    if (!marking_policy_storage_shape_valid(fn)) return false;
+    if (!marking_policy_arena_storage_shape_valid(mod, fn) ||
+        !marking_policy_storage_shape_valid(fn))
+        return false;
     u32 mask = 0;
     bool contains_mark = false;
     for (u32 bi = 0; bi < fn.block_count && !contains_mark; bi++) {

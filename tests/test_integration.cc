@@ -15822,6 +15822,13 @@ TEST(route, marking_policy_rejects_unbacked_arena_storage_ranges) {
     CHECK_FALSE(marking_policies_valid_for_codegen(mod));
 
     mod.func_cap = 1;
+    rir::Block external_block{};
+    functions[0].blocks = &external_block;
+    functions[0].block_count = 1;
+    functions[0].block_cap = 1;
+    u32 emitted_mask = 0;
+    CHECK_FALSE(marking_policy_emitted_mask(mod, functions[0], 0, &emitted_mask));
+
     auto* blocks = arena.alloc_array<rir::Block>(1);
     REQUIRE(blocks != nullptr);
     functions[0].blocks = blocks;
@@ -15857,6 +15864,12 @@ TEST(route, marking_policy_rejects_unbacked_arena_storage_ranges) {
     const char external_string[] = "outside";
     insts[0].op = rir::Opcode::ConstStr;
     insts[0].imm.str_val = Str{external_string, 7};
+    CHECK_FALSE(marking_policy_arena_storage_shape_valid(mod, functions[0]));
+    insts[0] = {};
+
+    insts[0].op = rir::Opcode::StructField;
+    insts[0].imm.struct_ref.name = Str{external_string, 7};
+    insts[0].imm.struct_ref.type = arena_str_type;
     CHECK_FALSE(marking_policy_arena_storage_shape_valid(mod, functions[0]));
     insts[0] = {};
 
