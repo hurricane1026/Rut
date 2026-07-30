@@ -237,6 +237,7 @@ public:
             // unchanged; advances health_armed_config so the later sweep doesn't
             // double-reset.
             this->arm_health_on_config_change();
+            this->acknowledge_active_generation();
             if (draining_.load(std::memory_order_acquire)) {
                 close_listen();
                 // Drain the idle upstream pool on the shard thread (NOT in drain(),
@@ -270,8 +271,6 @@ public:
             // (upstream_id, backend_idx); drop idle sockets parked under the old
             // config so post-reload requests don't reuse a stale connection.
             if (upstream) upstream->drain();
-            control->acknowledged_generation.store(cfg->config_generation,
-                                                   std::memory_order_release);
         }
         auto* jit = control->pending_jit.exchange(nullptr, std::memory_order_acq_rel);
         if (jit && jit_code_ptr) *jit_code_ptr = jit;
@@ -386,6 +385,8 @@ public:
         // recv drains, the deferred put_idle would slip a stale-config socket past
         // poll_command's pool drain — try_deferred_upstream_rearm closes on mismatch.
         c.idle_return_config = config_ptr ? *config_ptr : nullptr;
+        c.idle_return_generation =
+            c.idle_return_config != nullptr ? c.idle_return_config->config_generation : 0;
         c.upstream_fd = -1;
         c.upstream_send_armed = false;
     }
@@ -809,7 +810,10 @@ public:
             // A reload landed while the cancel drained: the pinned config no longer
             // matches the live one, so poll_command's pool drain already ran and this
             // fd's (uid, bidx) may now map to a different backend — close, don't pool.
-            const bool kConfigStale = !config_ptr || *config_ptr != c.idle_return_config;
+            const bool kConfigStale = !config_ptr || *config_ptr == nullptr ||
+                                      (*config_ptr)->config_generation != c.idle_return_generation;
+            c.idle_return_config = nullptr;
+            c.idle_return_generation = 0;
             // Stale bytes the backend wrote after the framed response were copied into
             // upstream_recv_buf while the cancel drained (on_upstream_recv was cleared,
             // so they were silently consumed off the socket). take_idle's MSG_PEEK can't
@@ -954,7 +958,10 @@ public:
             // Same refusals as the deferred drain in try_deferred_upstream_rearm: a
             // config swap (poll_command drained the pool) or surplus bytes copied into
             // upstream_recv_buf both desync reuse — close rather than pool.
-            const bool kConfigStale = !config_ptr || *config_ptr != c.idle_return_config;
+            const bool kConfigStale = !config_ptr || *config_ptr == nullptr ||
+                                      (*config_ptr)->config_generation != c.idle_return_generation;
+            c.idle_return_config = nullptr;
+            c.idle_return_generation = 0;
             const bool kStaleBytes =
                 c.upstream_recv_buf.len() != 0 || c.upstream_recv_idle_stale_bytes;
             const bool kDraining = is_draining();

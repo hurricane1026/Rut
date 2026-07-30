@@ -87,8 +87,6 @@ struct SmallLoop : EventLoopCRTP<SmallLoop> {
         auto* cfg = control->pending_config.exchange(nullptr, std::memory_order_acq_rel);
         if (cfg && config_ptr) {
             *config_ptr = cfg;
-            control->acknowledged_generation.store(cfg->config_generation,
-                                                   std::memory_order_release);
         }
         auto* jit = control->pending_jit.exchange(nullptr, std::memory_order_acq_rel);
         if (jit && jit_code_ptr) *jit_code_ptr = jit;

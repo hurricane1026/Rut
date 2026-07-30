@@ -161,6 +161,8 @@ TEST_F(RealLoopF, poll_command_reload) {
     CHECK(active_config == &cfg);
     CHECK_EQ(active_config->route_count, 7u);
     CHECK(cb.pending_config == nullptr);
+    CHECK_EQ(cb.acknowledged_generation.load(std::memory_order_acquire), 0u);
+    self.loop->acknowledge_active_generation();
     CHECK_EQ(cb.acknowledged_generation.load(std::memory_order_acquire), 19u);
 }
 
@@ -417,6 +419,8 @@ TEST(shard_control, reload_config_updates_ptr) {
     CHECK(active == &cfg2);
     CHECK_EQ(active->route_count, 20u);
     CHECK(cb.pending_config == nullptr);
+    CHECK_EQ(cb.acknowledged_generation.load(std::memory_order_acquire), 0u);
+    loop.acknowledge_active_generation();
     CHECK_EQ(cb.acknowledged_generation.load(std::memory_order_acquire), 2u);
 }
 

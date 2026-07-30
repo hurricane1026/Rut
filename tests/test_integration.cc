@@ -3035,6 +3035,8 @@ TEST(active_health, stalled_probe_reaped_then_reprobed) {
     const u16 backend_port = get_port(backend_fd);
 
     RouteConfig cfg{};
+    ProgramPinCounters pins{};
+    cfg.program_pins = &pins;
     auto id = cfg.add_upstream("b", 0x7F000001, backend_port);
     REQUIRE(id.has_value());
     const u16 uid = static_cast<u16>(id.value());
@@ -3066,7 +3068,9 @@ TEST(active_health, stalled_probe_reaped_then_reprobed) {
     // deliberately do NOT pump the I/O, so it stays parked on the timer wheel.
     loop->health_probe_deadline_ns[uid] = 0;
     loop->sweep_health_probes();
-    CHECK(probe_in_flight(uid, 0));                   // probe launched, in flight
+    CHECK(probe_in_flight(uid, 0));  // probe launched, in flight
+    CHECK_EQ(pins.health_probes.load(std::memory_order_acquire), 1u);
+    CHECK_FALSE(pins.empty());
     CHECK_EQ(loop->active_count(), 1u);               // one probe Connection taken
     CHECK(!backend_ejected(uid, 0, monotonic_us()));  // not failed yet
 
@@ -3079,17 +3083,21 @@ TEST(active_health, stalled_probe_reaped_then_reprobed) {
     // Reaped: backend recorded down, in-flight guard cleared, slot freed.
     CHECK(backend_ejected(uid, 0, monotonic_us()));
     CHECK(!probe_in_flight(uid, 0));
+    CHECK_EQ(pins.health_probes.load(std::memory_order_acquire), 0u);
+    CHECK(pins.empty());
     CHECK_EQ(loop->active_count(), 0u);
 
     // The cleared guard re-enables probing: a later sweep issues a fresh probe.
     loop->health_probe_deadline_ns[uid] = 0;
     loop->sweep_health_probes();
     CHECK(probe_in_flight(uid, 0));
+    CHECK_EQ(pins.health_probes.load(std::memory_order_acquire), 1u);
     CHECK_EQ(loop->active_count(), 1u);
 
     // Reap the second probe so no Connection dangles past teardown.
     loop->dispatch(tick);
     CHECK(!probe_in_flight(uid, 0));
+    CHECK_EQ(pins.health_probes.load(std::memory_order_acquire), 0u);
     CHECK_EQ(loop->active_count(), 0u);
 
     loop->shutdown();
@@ -10685,6 +10693,8 @@ TEST(proxy_reuse, deferred_idle_return_guards_iouring) {
     }
     RouteConfig cfg_a{};
     RouteConfig cfg_b{};
+    cfg_a.config_generation = 41;
+    cfg_b.config_generation = 42;
 
     // Match + empty buffer → pooled and reusable.
     {
@@ -10697,6 +10707,7 @@ TEST(proxy_reuse, deferred_idle_return_guards_iouring) {
         c.idle_return_uid = 5;
         c.idle_return_bidx = 0;
         c.idle_return_config = &cfg_a;
+        c.idle_return_generation = cfg_a.config_generation;
         shard.loop->try_deferred_upstream_rearm(c);
         CHECK_EQ(c.idle_return_fd, -1);            // parked fd consumed
         CHECK_EQ(shard.upstream->idle_count, 1u);  // pooled, not closed
@@ -10715,10 +10726,30 @@ TEST(proxy_reuse, deferred_idle_return_guards_iouring) {
         c.idle_return_uid = 6;
         c.idle_return_bidx = 0;
         c.idle_return_config = &cfg_b;  // parked under a now-superseded config
+        c.idle_return_generation = cfg_b.config_generation;
         shard.loop->try_deferred_upstream_rearm(c);
         CHECK_EQ(c.idle_return_fd, -1);
         CHECK_EQ(shard.upstream->idle_count, 0u);  // refused: not pooled
         CHECK(::close(sv[0]) < 0);                 // try_deferred already closed it
+        close(sv[1]);
+    }
+    // A reclaimed LoadedProgram may reuse the same RouteConfig address. Generation,
+    // rather than pointer identity, must still reject the old backend socket.
+    {
+        shard.active_config = &cfg_a;
+        auto& c = shard.loop->conns[5];
+        c.reset();
+        i32 sv[2];
+        REQUIRE_EQ(socketpair(AF_UNIX, SOCK_STREAM, 0, sv), 0);
+        c.idle_return_fd = sv[0];
+        c.idle_return_uid = 10;
+        c.idle_return_bidx = 0;
+        c.idle_return_config = &cfg_a;
+        c.idle_return_generation = cfg_a.config_generation;
+        cfg_a.config_generation++;
+        shard.loop->try_deferred_upstream_rearm(c);
+        CHECK_EQ(shard.upstream->idle_count, 0u);
+        CHECK(::close(sv[0]) < 0);
         close(sv[1]);
     }
     // Config matches but stale bytes were copied into upstream_recv_buf → closed and
@@ -10737,6 +10768,7 @@ TEST(proxy_reuse, deferred_idle_return_guards_iouring) {
         c.idle_return_uid = 7;
         c.idle_return_bidx = 0;
         c.idle_return_config = &cfg_a;
+        c.idle_return_generation = cfg_a.config_generation;
         shard.loop->try_deferred_upstream_rearm(c);
         CHECK_EQ(c.idle_return_fd, -1);
         CHECK_EQ(shard.upstream->idle_count, 0u);  // refused: desynced socket
@@ -10759,6 +10791,7 @@ TEST(proxy_reuse, deferred_idle_return_guards_iouring) {
         c.idle_return_uid = 9;
         c.idle_return_bidx = 0;
         c.idle_return_config = &cfg_a;
+        c.idle_return_generation = cfg_a.config_generation;
         shard.loop->try_deferred_upstream_rearm(c);
         CHECK_EQ(c.idle_return_fd, -1);
         CHECK(!c.upstream_recv_idle_stale_bytes);
@@ -10820,6 +10853,7 @@ TEST(proxy_reuse, force_close_all_closes_deferred_idle_fd_iouring) {
     live.idle_return_uid = 9;
     live.idle_return_bidx = 0;
     live.idle_return_config = &cfg;
+    live.idle_return_generation = cfg.config_generation;
 
     // Already-deferred-closed slot (client fd already gone).
     auto& deferred = shard.loop->conns[1];

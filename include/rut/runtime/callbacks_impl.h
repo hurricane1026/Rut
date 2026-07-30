@@ -714,6 +714,7 @@ bool start_health_probe(Loop* loop, u16 upstream_idx, u32 backend_idx) {
     conn.health_probe_slot_uid = probe_allocation;
     // Pin the launching config so on_probe_* drops results after a hot swap.
     conn.request_config = config;
+    acquire_health_probe_program_pin(config);
 
     // Probe-SETUP failures below (create_socket / alloc_buf / submit_connect) are
     // LOCAL resource or kernel-submission failures, not backend health signals —
@@ -727,7 +728,7 @@ bool start_health_probe(Loop* loop, u16 upstream_idx, u32 backend_idx) {
         // The one mark-then-exit path that bypasses free_probe_conn, so clear the
         // in-flight guard inline.
         set_probe_in_flight_allocation(probe_allocation, false);
-        loop->free_conn(conn);
+        free_probe_conn(loop, conn);
         return false;
     }
     conn.upstream_fd = kProbeFd;

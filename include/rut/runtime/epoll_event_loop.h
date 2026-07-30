@@ -334,6 +334,7 @@ public:
             // until the next 1s sweep (#161 F4). No-op when unchanged; advances
             // health_armed_config so the later sweep doesn't double-reset.
             this->arm_health_on_config_change();
+            this->acknowledge_active_generation();
             if (draining_.load(std::memory_order_acquire)) {
                 close_listen();
                 // Empty the idle upstream pool on the SHARD thread (here), not in
@@ -369,8 +370,6 @@ public:
             // (upstream_id, backend_idx); drop idle sockets parked under the old
             // config so post-reload requests don't reuse a stale connection.
             if (upstream) upstream->drain();
-            control->acknowledged_generation.store(cfg->config_generation,
-                                                   std::memory_order_release);
         }
         auto* jit = control->pending_jit.exchange(nullptr, std::memory_order_acq_rel);
         if (jit && jit_code_ptr) *jit_code_ptr = jit;
@@ -640,6 +639,8 @@ public:
             backend.downstream_fd_map[c.id] = -1;
         }
         backend.clear_send_state(c.id);
+        release_health_probe_program_pin(c.request_config);
+        c.request_config = nullptr;
         this->free_conn(c);  // timer.remove + free slices + return slot (no metrics)
     }
 

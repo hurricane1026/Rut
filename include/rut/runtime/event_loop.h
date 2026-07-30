@@ -275,6 +275,16 @@ public:
         return true;
     }
 
+    // Publish only after the run loop has installed every generation-local
+    // timer and health bookkeeping item following poll_command().
+    void acknowledge_active_generation() {
+        const RouteConfig** cfg_ptr = self().config_ptr;
+        const RouteConfig* cfg = cfg_ptr ? *cfg_ptr : nullptr;
+        if (self().control != nullptr)
+            self().control->acknowledged_generation.store(
+                cfg != nullptr ? cfg->config_generation : 0, std::memory_order_release);
+    }
+
     void sweep_health_probes() {
         // A swap detected here just reset + re-armed deadlines; probes wait for
         // the next tick. In the run loop the swap is normally already absorbed by
@@ -536,6 +546,7 @@ public:
                 retry_deferred_accepts();
             }
             poll_command();
+            this->acknowledge_active_generation();
             // Publish owner-shard memory gauges after every completed event
             // batch. A process-wide control-plane snapshot may aggregate this
             // shard while another shard executes the handler.
@@ -573,8 +584,6 @@ public:
         if (cfg && config_ptr) {
             materialize_control_plane_health(control_plane_mutation, cfg);
             *config_ptr = cfg;
-            control->acknowledged_generation.store(cfg->config_generation,
-                                                   std::memory_order_release);
         }
 
         auto* jit = control->pending_jit.exchange(nullptr, std::memory_order_acq_rel);
