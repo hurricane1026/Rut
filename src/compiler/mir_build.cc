@@ -792,6 +792,8 @@ static FrontendResult<MirValue> mir_value(const HirExpr& expr,
         v.kind = MirValueKind::UpstreamMark;
         v.type = MirTypeKind::Bool;
         v.int_value = expr.int_value;
+        if (expr.int_value >= 0 && expr.int_value < 32)
+            fn->upstream_mark_mask |= u32{1} << static_cast<u32>(expr.int_value);
         v.lhs = server_ptr;
         v.rhs = &fn->values[fn->values.len - 1];
         return v;
@@ -1166,7 +1168,9 @@ FrontendResult<MirModule*> build_mir(const HirModule& module) {
         fn.is_timer = module.routes[i].is_timer;
         fn.timer_interval_ms = module.routes[i].timer_interval_ms;
         fn.timer_shard = module.routes[i].timer_shard;
-        fn.upstream_mark_mask = module.routes[i].upstream_mark_mask;
+        // Derive ownership from marks that survive MIR's static loop
+        // unrolling. HIR analysis can see marks in zero-iteration bodies.
+        fn.upstream_mark_mask = 0;
 
         // Propagate wait(ms) list 1:1. Codegen will turn each into a yield
         // boundary in the generated state machine.

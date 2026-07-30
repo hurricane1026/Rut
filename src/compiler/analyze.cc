@@ -25068,12 +25068,34 @@ static FrontendResult<HirModule*> analyze_file_internal(
         if (route.is_timer) {
             auto timer_ok = validate_timer_route(route, mod, route_decl.body_span);
             if (!timer_ok) return core::make_unexpected(timer_ok.error());
-            if ((route.upstream_mark_mask & claimed_upstream_mark_mask) != 0)
+            bool has_empty_static_loop = false;
+            for (u32 fi = 0; fi < route.for_loops.len && !has_empty_static_loop; fi++) {
+                const HirExpr* iter = &route.for_loops[fi].iter_expr;
+                for (u32 depth = 0; depth <= route.locals.len; depth++) {
+                    if (iter->kind == HirExprKind::ArrayLit) {
+                        has_empty_static_loop = iter->array_len == 0;
+                        break;
+                    }
+                    if (iter->kind != HirExprKind::LocalRef) break;
+                    const HirLocal* source = nullptr;
+                    for (u32 li = 0; li < route.locals.len; li++)
+                        if (route.locals[li].ref_index == iter->local_index) {
+                            source = &route.locals[li];
+                            break;
+                        }
+                    if (source == nullptr) break;
+                    iter = &source->init;
+                }
+            }
+            // MIR derives the exact mask after unrolling. Avoid rejecting a
+            // second real owner because this route may eliminate its marks.
+            const u32 analyzed_mark_mask = has_empty_static_loop ? 0 : route.upstream_mark_mask;
+            if ((analyzed_mark_mask & claimed_upstream_mark_mask) != 0)
                 return frontend_error(
                     FrontendError::UnsupportedSyntax,
                     route_decl.span,
                     lit_str("an upstream may be marked by only one pinned timer"));
-            claimed_upstream_mark_mask |= route.upstream_mark_mask;
+            claimed_upstream_mark_mask |= analyzed_mark_mask;
         }
         // Cap HTTP routes at kMaxRoutes even though the routes vector reserves extra
         // slots for synthesized timers — a timer must never consume HTTP capacity

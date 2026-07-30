@@ -15654,6 +15654,46 @@ TEST(route, populate_route_config_fingerprints_upstream_marking_policy) {
     CHECK_NE(healthy_identity, unhealthy_identity);
 }
 
+TEST(route, static_empty_for_loop_does_not_claim_upstream_mark) {
+    using namespace rut;
+    const char* source = R"rut(
+upstream users at "127.0.0.1:8080"
+timer empty, every: 5s, shard: 0 {
+    let xs: [i32] = []
+    for x in xs {
+        for server in users.servers { users.mark(server, healthy: true) }
+    }
+    return 200
+}
+timer active, every: 5s, shard: 1 {
+    for server in users.servers { users.mark(server, healthy: true) }
+    return 200
+}
+)rut";
+    auto lexed = lex(Str{source, static_cast<u32>(strlen(source))});
+    REQUIRE(lexed);
+    auto ast = parse_file(lexed.value());
+    REQUIRE(ast);
+    std::unique_ptr<AstFile> ast_owned(ast.value());
+    auto hir = analyze_file(*ast_owned);
+    REQUIRE(hir);
+    std::unique_ptr<HirModule> hir_owned(hir.value());
+    auto mir = build_mir(*hir_owned);
+    REQUIRE(mir);
+    std::unique_ptr<MirModule> mir_owned(mir.value());
+    REQUIRE_EQ(mir_owned->functions.len, 2u);
+    CHECK_EQ(mir_owned->functions[0].upstream_mark_mask, 0u);
+    CHECK_EQ(mir_owned->functions[1].upstream_mark_mask, 1u);
+
+    FrontendRirModule rir{};
+    REQUIRE(lower_to_rir(*mir_owned, rir));
+    rir.module.upstream_mark_replay_complete = true;
+    CHECK(marking_policies_valid_for_codegen(rir.module));
+    RouteConfig cfg{};
+    CHECK(populate_route_config(cfg, rir.module));
+    rir.destroy();
+}
+
 TEST(route, marking_policy_accepts_arena_owned_variadic_constructors) {
     using namespace rut;
     FrontendRirModule rir{};
@@ -15822,6 +15862,10 @@ TEST(route, marking_policy_rejects_unbacked_arena_storage_ranges) {
     CHECK_FALSE(marking_policies_valid_for_codegen(mod));
 
     mod.func_cap = 1;
+    mod.functions = reinterpret_cast<rir::Function*>(reinterpret_cast<char*>(functions) + 1);
+    CHECK_FALSE(marking_policies_valid_for_codegen(mod));
+    mod.functions = functions;
+
     rir::Block external_block{};
     functions[0].blocks = &external_block;
     functions[0].block_count = 1;
@@ -15836,6 +15880,11 @@ TEST(route, marking_policy_rejects_unbacked_arena_storage_ranges) {
     functions[0].block_cap = 2;
     CHECK_FALSE(marking_policy_arena_storage_shape_valid(mod, functions[0]));
 
+    functions[0].blocks = reinterpret_cast<rir::Block*>(reinterpret_cast<char*>(blocks) + 1);
+    functions[0].block_cap = 1;
+    CHECK_FALSE(marking_policy_arena_storage_shape_valid(mod, functions[0]));
+    functions[0].blocks = blocks;
+
     functions[0].block_cap = 1;
     auto* values = arena.alloc_array<rir::Value>(1);
     REQUIRE(values != nullptr);
@@ -15844,6 +15893,11 @@ TEST(route, marking_policy_rejects_unbacked_arena_storage_ranges) {
     functions[0].value_cap = 2;
     CHECK_FALSE(marking_policy_arena_storage_shape_valid(mod, functions[0]));
 
+    functions[0].values = reinterpret_cast<rir::Value*>(reinterpret_cast<char*>(values) + 1);
+    functions[0].value_cap = 1;
+    CHECK_FALSE(marking_policy_arena_storage_shape_valid(mod, functions[0]));
+    functions[0].values = values;
+
     functions[0].value_cap = 1;
     auto* insts = arena.alloc_array<rir::Instruction>(1);
     REQUIRE(insts != nullptr);
@@ -15851,6 +15905,11 @@ TEST(route, marking_policy_rejects_unbacked_arena_storage_ranges) {
     blocks[0].inst_count = 1;
     blocks[0].inst_cap = 2;
     CHECK_FALSE(marking_policy_arena_storage_shape_valid(mod, functions[0]));
+
+    blocks[0].insts = reinterpret_cast<rir::Instruction*>(reinterpret_cast<char*>(insts) + 1);
+    blocks[0].inst_cap = 1;
+    CHECK_FALSE(marking_policy_arena_storage_shape_valid(mod, functions[0]));
+    blocks[0].insts = insts;
 
     blocks[0].inst_cap = 1;
     const rir::Type external_type{rir::TypeKind::I64, nullptr, nullptr};

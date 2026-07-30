@@ -894,7 +894,9 @@ inline bool marking_policy_arena_storage_shape_valid(const rir::Module& mod,
                                                      const rir::Function& fn) {
     if (mod.arena == nullptr) return true;
     if (fn.block_count > fn.block_cap || fn.value_count > fn.value_cap) return false;
-    if (!mod.arena->contains_range(fn.blocks,
+    if (reinterpret_cast<uintptr_t>(fn.blocks) % alignof(rir::Block) != 0 ||
+        reinterpret_cast<uintptr_t>(fn.values) % alignof(rir::Value) != 0 ||
+        !mod.arena->contains_range(fn.blocks,
                                    static_cast<u64>(fn.block_cap) * sizeof(rir::Block)) ||
         !mod.arena->contains_range(fn.values, static_cast<u64>(fn.value_cap) * sizeof(rir::Value)))
         return false;
@@ -903,6 +905,7 @@ inline bool marking_policy_arena_storage_shape_valid(const rir::Module& mod,
     for (u32 bi = 0; bi < fn.block_count; bi++) {
         const auto& block = fn.blocks[bi];
         if (block.inst_count > block.inst_cap ||
+            reinterpret_cast<uintptr_t>(block.insts) % alignof(rir::Instruction) != 0 ||
             !mod.arena->contains_range(block.insts,
                                        static_cast<u64>(block.inst_cap) * sizeof(rir::Instruction)))
             return false;
@@ -1167,8 +1170,9 @@ inline bool marking_policies_valid_for_codegen(const rir::Module& mod) {
         mod.func_count > mod.func_cap || (mod.func_count != 0 && mod.functions == nullptr))
         return false;
     if (mod.arena != nullptr &&
-        !mod.arena->contains_range(mod.functions,
-                                   static_cast<u64>(mod.func_cap) * sizeof(rir::Function)))
+        (reinterpret_cast<uintptr_t>(mod.functions) % alignof(rir::Function) != 0 ||
+         !mod.arena->contains_range(mod.functions,
+                                    static_cast<u64>(mod.func_cap) * sizeof(rir::Function))))
         return false;
 
     u32 claimed_upstreams = 0;
