@@ -181,6 +181,11 @@ struct RouteConfig {
     RouteEntry routes[kMaxRoutes];
     u32 route_count = 0;
 
+    // Monotonic activation identity assigned before this immutable config is
+    // published. Handler invocations pin it with the config pointer so a
+    // ServerIdentity cannot silently address a recycled generation.
+    u64 config_generation = 1;
+
     // Phase 2 dispatch — 2-way tagged union.
     //
     // Pre-add_*: caller picks ArtJit (default) or SegmentTrie via

@@ -15113,6 +15113,26 @@ TEST(route, manual_health_override_excludes_backend_selection) {
         1u);
 }
 
+TEST(route, manual_healthy_override_remains_subject_to_local_ejection) {
+    RouteConfig config;
+    auto upstream = config.add_upstream("manual-healthy", 0x7f000001u, 8082);
+    REQUIRE(upstream);
+    REQUIRE(config.add_upstream_backend(upstream.value(), 0x7f000001u, 8083));
+    ControlPlaneMutationPort mutation;
+    mutation.reset(10, true, &config);
+    struct SelectionLoop {
+        ControlPlaneMutationPort* control_plane_mutation;
+    } loop{&mutation};
+
+    CHECK_EQ(select_backend_with_control_plane(&loop, 0, 2, 1'000'000, &config), 0u);
+    const u16 allocation = mutation.endpoint_allocation_for_config(&config, 0, 1);
+    const u64 incarnation = mutation.endpoint_incarnation_for_config(&config, 0, 1);
+    record_active_probe_result_allocation(
+        allocation, false, 1'000'001, &config.upstreams[0], 1, incarnation);
+    REQUIRE(mutation.mark({10, 0, 1}, true));
+    CHECK_EQ(select_backend_with_control_plane(&loop, 0, 2, 1'000'002, &config), 0u);
+}
+
 TEST(route, compatible_reload_preserves_round_robin_cursor) {
     RouteConfig old_config;
     REQUIRE(old_config.add_upstream("cursor-reload", 0x7f000001u, 8180).has_value());
