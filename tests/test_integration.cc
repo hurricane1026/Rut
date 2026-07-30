@@ -16859,6 +16859,11 @@ TEST(route, marking_policy_fingerprint_normalizes_static_response_tables) {
     shifted.response_bodies[1] = original.response_bodies[0];
     shifted.header_values[1] = Str{"down", 4};
     CHECK_NE(marking_policy_identity(shifted, shifted_timer), original_identity);
+    shifted_return.imm.i64_val = 200 | (u64{3} << 16) | (u64{3} << 32);
+    CHECK_NE(marking_policy_identity(shifted, shifted_timer), original_identity);
+    shifted_return.imm.i64_val = 200 | (u64{2} << 16) | (u64{2} << 32);
+    shifted.header_sets[1] = {2, 1};
+    CHECK_NE(marking_policy_identity(shifted, shifted_timer), original_identity);
 }
 
 TEST(route, marking_policy_fingerprint_ignores_unrelated_upstream_positions) {
@@ -17094,6 +17099,16 @@ TEST(route, marking_policy_fingerprint_normalizes_carried_struct_receiver) {
     policy[9].imm.i32_val = 1;
     timer.upstream_mark_mask = u32{1} << 1;
     CHECK_EQ(marking_policy_identity(shifted, timer), original_identity);
+
+    policy[0].imm.i64_val = rir::encode_server_token(0, 0);
+    policy[9].imm.i32_val = 0;
+    policy[5].op = rir::Opcode::CtxLoadSlotI32;
+    timer.upstream_mark_mask = 1;
+    const u64 dynamic_original_identity = marking_policy_identity(original, timer);
+    policy[0].imm.i64_val = rir::encode_server_token(1, 0);
+    policy[9].imm.i32_val = 1;
+    timer.upstream_mark_mask = u32{1} << 1;
+    CHECK_EQ(marking_policy_identity(shifted, timer), dynamic_original_identity);
 }
 
 TEST(route, marking_policy_fingerprint_normalizes_array_carried_server) {
