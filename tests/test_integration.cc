@@ -17046,6 +17046,8 @@ TEST(route, marking_policy_fingerprint_normalizes_nested_struct_projection) {
     const rir::Type optional_outer_type{rir::TypeKind::Optional, &outer_type, nullptr};
     const rir::Type outer_array_type{rir::TypeKind::Array, &outer_type, nullptr};
     const rir::Type nested_outer_array_type{rir::TypeKind::Array, &outer_array_type, nullptr};
+    const rir::Type optional_nested_outer_array_type{
+        rir::TypeKind::Optional, &nested_outer_array_type, nullptr};
     const rir::Type* types[] = {&i64_type,
                                 &inner_type,
                                 &middle_type,
@@ -17064,10 +17066,12 @@ TEST(route, marking_policy_fingerprint_normalizes_nested_struct_projection) {
                                 &bool_type,
                                 &bool_type,
                                 &bool_type,
+                                &nested_outer_array_type,
+                                &optional_nested_outer_array_type,
                                 &nested_outer_array_type};
-    rir::Value values[19]{};
-    rir::Instruction policy[19]{};
-    for (u32 i = 0; i < 19; i++) {
+    rir::Value values[21]{};
+    rir::Instruction policy[21]{};
+    for (u32 i = 0; i < 21; i++) {
         values[i] = {types[i], {0}, i};
         policy[i].result = {i};
     }
@@ -17135,22 +17139,28 @@ TEST(route, marking_policy_fingerprint_normalizes_nested_struct_projection) {
     policy[18].operands[0] = {17};
     policy[18].operands[1] = {7};
     policy[18].operands[2] = {7};
-    rir::Block block{{0}, {}, policy, 19, 19};
+    policy[19].op = rir::Opcode::OptWrap;
+    policy[19].operand_count = 1;
+    policy[19].operands[0] = {18};
+    policy[20].op = rir::Opcode::OptUnwrap;
+    policy[20].operand_count = 1;
+    policy[20].operands[0] = {19};
+    rir::Block block{{0}, {}, policy, 21, 21};
     rir::Function timer{};
     timer.blocks = &block;
     timer.block_count = 1;
     timer.values = values;
-    timer.value_count = 19;
+    timer.value_count = 21;
     timer.upstream_mark_mask = 1;
 
     const bool has_indices[] = {false, false};
     const u32 indices[] = {0, 0};
     const Str fields[] = {Str{"server", 6}, Str{"inner", 5}, Str{"middle", 6}};
-    u8 select_state[19]{};
-    u8 select_result[19]{};
-    MarkingPolicySourceSearch search{65536, select_state, select_result, 19, false};
+    u8 select_state[21]{};
+    u8 select_result[21]{};
+    MarkingPolicySourceSearch search{65536, select_state, select_result, 21, false};
     CHECK(marking_policy_array_struct_field_path_flows_to_source(
-        timer, {18}, has_indices, indices, 1, fields, 2, {0}, 0, &search));
+        timer, {20}, has_indices, indices, 1, fields, 2, {0}, 0, &search));
 
     rir::Module original{};
     original.upstream_count = 1;
