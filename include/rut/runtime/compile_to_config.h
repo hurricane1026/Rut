@@ -1411,16 +1411,17 @@ inline bool marking_policy_struct_field_path_flows_to_source(const rir::Function
             search->exhausted = true;
             return false;
         }
-        return marking_policy_array_struct_field_path_flows_to_source(fn,
-                                                                      array_receiver,
-                                                                      has_indices,
-                                                                      indices,
-                                                                      index_count - 1,
-                                                                      fields,
-                                                                      field_index,
-                                                                      source,
-                                                                      depth + 1,
-                                                                      search);
+        return marking_policy_array_struct_field_path_flows_to_source(
+            fn,
+            array_receiver,
+            has_indices,
+            indices,
+            static_cast<i32>(index_count) - 1,
+            fields,
+            field_index,
+            source,
+            depth + 1,
+            search);
     }
     if (inst.op != rir::Opcode::StructCreate || inst.imm.struct_ref.type == nullptr ||
         inst.imm.struct_ref.type->kind != rir::TypeKind::Struct ||
