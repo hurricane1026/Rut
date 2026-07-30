@@ -17062,10 +17062,12 @@ TEST(route, marking_policy_fingerprint_normalizes_nested_struct_projection) {
                                 &inner_type,
                                 &i64_type,
                                 &bool_type,
-                                &bool_type};
-    rir::Value values[17]{};
-    rir::Instruction policy[17]{};
-    for (u32 i = 0; i < 17; i++) {
+                                &bool_type,
+                                &bool_type,
+                                &nested_outer_array_type};
+    rir::Value values[19]{};
+    rir::Instruction policy[19]{};
+    for (u32 i = 0; i < 19; i++) {
         values[i] = {types[i], {0}, i};
         policy[i].result = {i};
     }
@@ -17126,13 +17128,29 @@ TEST(route, marking_policy_fingerprint_normalizes_nested_struct_projection) {
     policy[16].operand_count = 2;
     policy[16].operands[0] = {14};
     policy[16].operands[1] = {15};
-    rir::Block block{{0}, {}, policy, 17, 17};
+    policy[17].op = rir::Opcode::ConstBool;
+    policy[17].imm.bool_val = true;
+    policy[18].op = rir::Opcode::Select;
+    policy[18].operand_count = 3;
+    policy[18].operands[0] = {17};
+    policy[18].operands[1] = {7};
+    policy[18].operands[2] = {7};
+    rir::Block block{{0}, {}, policy, 19, 19};
     rir::Function timer{};
     timer.blocks = &block;
     timer.block_count = 1;
     timer.values = values;
-    timer.value_count = 17;
+    timer.value_count = 19;
     timer.upstream_mark_mask = 1;
+
+    const bool has_indices[] = {false, false};
+    const u32 indices[] = {0, 0};
+    const Str fields[] = {Str{"server", 6}, Str{"inner", 5}, Str{"middle", 6}};
+    u8 select_state[19]{};
+    u8 select_result[19]{};
+    MarkingPolicySourceSearch search{65536, select_state, select_result, 19, false};
+    CHECK(marking_policy_array_struct_field_path_flows_to_source(
+        timer, {18}, has_indices, indices, 1, fields, 2, {0}, 0, &search));
 
     rir::Module original{};
     original.upstream_count = 1;
@@ -17152,6 +17170,14 @@ TEST(route, marking_policy_fingerprint_normalizes_nested_struct_projection) {
     policy[16].imm.i32_val = 1;
     timer.upstream_mark_mask = u32{1} << 1;
     CHECK_EQ(marking_policy_identity(shifted, timer), original_identity);
+
+    policy[8].op = rir::Opcode::ConstI32;
+    policy[10].op = rir::Opcode::ConstI32;
+    const u64 constant_shifted_identity = marking_policy_identity(shifted, timer);
+    policy[0].imm.i64_val = rir::encode_server_token(0, 0);
+    policy[16].imm.i32_val = 0;
+    timer.upstream_mark_mask = 1;
+    CHECK_EQ(marking_policy_identity(original, timer), constant_shifted_identity);
 }
 
 TEST(route, marking_policy_fingerprint_normalizes_carried_struct_receiver) {
