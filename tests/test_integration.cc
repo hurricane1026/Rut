@@ -16468,6 +16468,11 @@ TEST(route, marking_policy_source_search_is_bounded_for_shared_select_dags) {
     CHECK_FALSE(marking_policy_value_flows_to_source(fn, {kValueCount - 1}, {0}));
     policy[kValueCount - 1].operands[2] = {0};
     CHECK(marking_policy_value_flows_to_source(fn, {kValueCount - 1}, {0}));
+
+    bool exhausted = false;
+    CHECK_FALSE(marking_policy_value_flows_to_source_with_budget(
+        fn, {kValueCount - 1}, {0}, 0, &exhausted));
+    CHECK(exhausted);
 }
 
 TEST(route, upstream_mark_validates_string_opcode_types) {

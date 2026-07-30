@@ -1823,22 +1823,42 @@ inline bool marking_policy_value_flows_to_source_impl(const rir::Function& fn,
     return false;
 }
 
-inline bool marking_policy_value_flows_to_source(const rir::Function& fn,
-                                                 rir::ValueId value,
-                                                 rir::ValueId source) {
-    static constexpr u32 kMaxSourceSearchSteps = 65536;
+inline bool marking_policy_value_flows_to_source_with_budget(
+    const rir::Function& fn, rir::ValueId value, rir::ValueId source, u32 budget, bool* exhausted) {
     static constexpr u32 kMaxMemoizedValues = 4096;
-    const u64 requested = static_cast<u64>(fn.value_count) * 8 + 1;
     u8 select_state[kMaxMemoizedValues]{};
     u8 select_result[kMaxMemoizedValues]{};
     MarkingPolicySourceSearch search{
-        requested < kMaxSourceSearchSteps ? static_cast<u32>(requested) : kMaxSourceSearchSteps,
+        budget,
         select_state,
         select_result,
         fn.value_count < kMaxMemoizedValues ? fn.value_count : kMaxMemoizedValues,
         false};
     const bool result = marking_policy_value_flows_to_source_impl(fn, value, source, 0, &search);
-    return result || search.exhausted;
+    if (exhausted != nullptr) *exhausted = search.exhausted;
+    return result;
+}
+
+inline u32 marking_policy_source_search_budget(const rir::Function& fn) {
+    static constexpr u32 kMaxSourceSearchSteps = 65536;
+    const u64 requested = static_cast<u64>(fn.value_count) * 8 + 1;
+    return requested < kMaxSourceSearchSteps ? static_cast<u32>(requested) : kMaxSourceSearchSteps;
+}
+
+inline bool marking_policy_value_flows_to_source(const rir::Function& fn,
+                                                 rir::ValueId value,
+                                                 rir::ValueId source) {
+    bool exhausted = false;
+    const bool result = marking_policy_value_flows_to_source_with_budget(
+        fn, value, source, marking_policy_source_search_budget(fn), &exhausted);
+    return result || exhausted;
+}
+
+inline bool marking_policy_value_proven_to_flow_to_source(const rir::Function& fn,
+                                                          rir::ValueId value,
+                                                          rir::ValueId source) {
+    return marking_policy_value_flows_to_source_with_budget(
+        fn, value, source, marking_policy_source_search_budget(fn), nullptr);
 }
 
 inline bool marking_policy_value_is_mark_server(const rir::Function& fn, rir::ValueId value) {
@@ -1847,7 +1867,7 @@ inline bool marking_policy_value_is_mark_server(const rir::Function& fn, rir::Va
         for (u32 ii = 0; ii < block.inst_count; ii++) {
             const auto& inst = block.insts[ii];
             if (inst.op == rir::Opcode::UpstreamMark && inst.operand_count == 2 &&
-                marking_policy_value_flows_to_source(fn, inst.operand(0), value))
+                marking_policy_value_proven_to_flow_to_source(fn, inst.operand(0), value))
                 return true;
         }
     }
