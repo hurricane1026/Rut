@@ -16204,6 +16204,36 @@ TEST(route, marking_policy_checks_cross_block_dominance_paths) {
     CHECK_FALSE(marking_policy_block_dominates(fn, 1, 2));
 }
 
+TEST(route, marking_policy_ssa_dominance_ignores_block_storage_order) {
+    using namespace rut;
+    const rir::Type i64_type{rir::TypeKind::I64, nullptr, nullptr};
+    rir::Value values[1] = {{&i64_type, {2}, 0}};
+    rir::Instruction entry{};
+    entry.op = rir::Opcode::Jmp;
+    entry.imm.block_targets[0] = {2};
+    rir::Instruction use{};
+    use.op = rir::Opcode::RetStatus;
+    rir::Instruction definition[2]{};
+    definition[0].op = rir::Opcode::ConstI64;
+    definition[0].result = {0};
+    definition[1].op = rir::Opcode::Jmp;
+    definition[1].imm.block_targets[0] = {1};
+    rir::Block blocks[3] = {
+        {{0}, {}, &entry, 1, 1},
+        {{1}, {}, &use, 1, 1},
+        {{2}, {}, definition, 2, 2},
+    };
+    rir::Function fn{};
+    fn.blocks = blocks;
+    fn.block_count = 3;
+    fn.block_cap = 3;
+    fn.values = values;
+    fn.value_count = 1;
+    fn.value_cap = 1;
+
+    CHECK(marking_policy_operand_has_dominating_definition(fn, {0}, 1, 0));
+}
+
 TEST(route, marking_policy_marks_must_dominate_every_exit) {
     using namespace rut;
     rir::Instruction entry{};
@@ -16231,6 +16261,40 @@ TEST(route, marking_policy_marks_must_dominate_every_exit) {
     marked_exit[1].op = rir::Opcode::Jmp;
     marked_exit[1].imm.block_targets[0] = {2};
     CHECK(marking_policy_control_flow_valid(fn));
+}
+
+TEST(route, marking_policy_source_search_is_bounded_for_shared_select_dags) {
+    using namespace rut;
+    static constexpr u32 kValueCount = 48;
+    rir::Value values[kValueCount]{};
+    rir::Instruction policy[kValueCount]{};
+    policy[0].op = rir::Opcode::ConstI64;
+    policy[0].result = {0};
+    policy[1].op = rir::Opcode::ConstI64;
+    policy[1].result = {1};
+    values[0].def_block = {0};
+    values[0].def_inst = 0;
+    values[1].def_block = {0};
+    values[1].def_inst = 1;
+    for (u32 vi = 2; vi < kValueCount; vi++) {
+        policy[vi].op = rir::Opcode::Select;
+        policy[vi].result = {vi};
+        policy[vi].operand_count = 3;
+        policy[vi].operands[1] = {vi - 1};
+        policy[vi].operands[2] = {vi - 1};
+        values[vi].def_block = {0};
+        values[vi].def_inst = vi;
+    }
+    rir::Block block{{0}, {}, policy, kValueCount, kValueCount};
+    rir::Function fn{};
+    fn.blocks = &block;
+    fn.block_count = 1;
+    fn.block_cap = 1;
+    fn.values = values;
+    fn.value_count = kValueCount;
+    fn.value_cap = kValueCount;
+
+    CHECK_FALSE(marking_policy_value_flows_to_source(fn, {kValueCount - 1}, {0}));
 }
 
 TEST(route, upstream_mark_validates_string_opcode_types) {
@@ -16390,6 +16454,7 @@ TEST(route, marking_policy_json_array_matches_codegen_type_support) {
     auto* struct_def = reinterpret_cast<rir::StructDef*>(storage);
     struct_def->name = Str{"Payload", 7};
     struct_def->field_count = 2;
+    struct_def->field_capacity = 2;
     struct_def->fields()[0] = {Str{"ok", 2}, &bool_type};
     struct_def->fields()[1] = {Str{"value", 5}, &i64_type};
     const rir::Type struct_type{rir::TypeKind::Struct, nullptr, struct_def};
@@ -16672,6 +16737,7 @@ TEST(route, populate_route_config_fingerprints_struct_field_layout) {
     auto* def = reinterpret_cast<rir::StructDef*>(storage);
     def->name = Str{"Result", 6};
     def->field_count = 2;
+    def->field_capacity = 2;
     const rir::Type bool_type{rir::TypeKind::Bool, nullptr, nullptr};
     auto* fields = def->fields();
     fields[0] = rir::FieldDef{Str{"healthy", 7}, &bool_type};
@@ -16814,6 +16880,7 @@ TEST(route, marking_policy_fingerprint_normalizes_struct_carried_server) {
     auto* def = reinterpret_cast<rir::StructDef*>(storage);
     def->name = Str{"Wrapped", 7};
     def->field_count = 1;
+    def->field_capacity = 1;
     def->fields()[0] = rir::FieldDef{Str{"server", 6}, &i64_type};
     const rir::Type wrapped_type{rir::TypeKind::Struct, nullptr, def};
     rir::Value values[5] = {{&i64_type, {0}, 0},
@@ -17105,6 +17172,7 @@ TEST(route, marking_policy_traces_arrays_through_struct_and_optional_carriers) {
     auto* def = reinterpret_cast<rir::StructDef*>(storage);
     def->name = Str{"Servers", 7};
     def->field_count = 1;
+    def->field_capacity = 1;
     def->fields()[0] = rir::FieldDef{Str{"values", 6}, &array_type};
     const rir::Type struct_type{rir::TypeKind::Struct, nullptr, def};
 
@@ -17176,6 +17244,7 @@ TEST(route, marking_policy_shape_validates_struct_constructor_operands) {
     auto* def = reinterpret_cast<rir::StructDef*>(storage);
     def->name = Str{"Result", 6};
     def->field_count = 1;
+    def->field_capacity = 1;
     const rir::Type bool_type{rir::TypeKind::Bool, nullptr, nullptr};
     const rir::Type i64_type{rir::TypeKind::I64, nullptr, nullptr};
     const rir::Type result_type{rir::TypeKind::Struct, nullptr, def};
@@ -17264,10 +17333,18 @@ TEST(route, marking_policy_shape_rejects_null_string_immediates) {
 
 TEST(route, marking_policy_type_shape_rejects_invalid_composites) {
     using namespace rut;
+    rir::StructDef truncated_def{};
+    truncated_def.name = Str{"Truncated", 9};
+    truncated_def.field_count = 1;
+    truncated_def.field_capacity = 0;
+    const rir::Type truncated_type{rir::TypeKind::Struct, nullptr, &truncated_def};
+    CHECK_FALSE(marking_policy_type_shape_valid(&truncated_type));
+
     alignas(rir::StructDef) u8 direct_storage[sizeof(rir::StructDef) + sizeof(rir::FieldDef)]{};
     auto* direct_def = reinterpret_cast<rir::StructDef*>(direct_storage);
     direct_def->name = Str{"Direct", 6};
     direct_def->field_count = 1;
+    direct_def->field_capacity = 1;
     rir::Type direct_type{rir::TypeKind::Struct, nullptr, direct_def};
     direct_def->fields()[0] = rir::FieldDef{Str{"next", 4}, &direct_type};
     CHECK_FALSE(marking_policy_type_shape_valid(&direct_type));
@@ -17276,6 +17353,7 @@ TEST(route, marking_policy_type_shape_rejects_invalid_composites) {
     auto* indirect_def = reinterpret_cast<rir::StructDef*>(indirect_storage);
     indirect_def->name = Str{"Indirect", 8};
     indirect_def->field_count = 1;
+    indirect_def->field_capacity = 1;
     rir::Type indirect_type{rir::TypeKind::Struct, nullptr, indirect_def};
     rir::Type optional_indirect{rir::TypeKind::Optional, &indirect_type, nullptr};
     indirect_def->fields()[0] = rir::FieldDef{Str{"next", 4}, &optional_indirect};
@@ -17289,6 +17367,7 @@ TEST(route, marking_policy_type_shape_rejects_invalid_composites) {
     auto* void_field_def = reinterpret_cast<rir::StructDef*>(void_field_storage);
     void_field_def->name = Str{"VoidField", 9};
     void_field_def->field_count = 1;
+    void_field_def->field_capacity = 1;
     void_field_def->fields()[0] = rir::FieldDef{Str{"value", 5}, &void_type};
     const rir::Type void_field_type{rir::TypeKind::Struct, nullptr, void_field_def};
     const rir::Type optional_void_field{rir::TypeKind::Optional, &void_field_type, nullptr};
@@ -17300,6 +17379,7 @@ TEST(route, marking_policy_type_shape_rejects_invalid_composites) {
     auto* duplicate_def = reinterpret_cast<rir::StructDef*>(duplicate_storage);
     duplicate_def->name = Str{"Duplicate", 9};
     duplicate_def->field_count = 2;
+    duplicate_def->field_capacity = 2;
     const rir::Type bool_type{rir::TypeKind::Bool, nullptr, nullptr};
     const rir::Type i64_type{rir::TypeKind::I64, nullptr, nullptr};
     duplicate_def->fields()[0] = rir::FieldDef{Str{"value", 5}, &bool_type};

@@ -84,11 +84,11 @@ struct Builder {
             return err(RirError::CapacityFull);
         }
         auto* arena = mod->arena;
-        u64 size = sizeof(StructDef) + sizeof(FieldDef) * count;
-        auto* sd = static_cast<StructDef*>(arena->alloc(size));
+        auto* sd = static_cast<StructDef*>(arena->alloc(sizeof(StructDef)));
         if (!sd) return err(RirError::OutOfMemory);
         sd->name = name;
         sd->field_count = count;
+        sd->field_capacity = count;
         for (u32 i = 0; i < count; i++) {
             sd->fields()[i] = fields[i];
         }

@@ -88,13 +88,16 @@ struct FieldDef {
 // metadata before dereferencing fields().
 static constexpr u32 kMaxStructFields = 10;
 
-// Struct definition — arena-allocated, fields stored inline after.
+// Struct definition — arena-allocated with bounded inline field storage. Keeping
+// the backing array in the object lets consumers validate field_count before
+// reading fields without trusting separately allocated flexible-array metadata.
 struct StructDef {
     Str name;
     u32 field_count;
-    // FieldDef fields[] follows in arena memory (flexible array idiom).
-    FieldDef* fields() { return reinterpret_cast<FieldDef*>(this + 1); }
-    const FieldDef* fields() const { return reinterpret_cast<const FieldDef*>(this + 1); }
+    u32 field_capacity;
+    FieldDef field_storage[kMaxStructFields];
+    FieldDef* fields() { return field_storage; }
+    const FieldDef* fields() const { return field_storage; }
 };
 
 // ── Values (SSA) ────────────────────────────────────────────────────
