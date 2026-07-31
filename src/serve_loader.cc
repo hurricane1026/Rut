@@ -152,7 +152,10 @@ bool capture_snapshot_file(const std::filesystem::path& source,
                            std::vector<std::filesystem::path>& captured,
                            u64* used_bytes,
                            u64 max_source_bytes) {
-    const auto normalized = std::filesystem::absolute(source).lexically_normal();
+    std::error_code path_error;
+    const auto absolute_source = std::filesystem::absolute(source, path_error);
+    if (path_error) return false;
+    const auto normalized = absolute_source.lexically_normal();
     for (const auto& path : captured)
         if (path == normalized) return true;
 
@@ -184,7 +187,9 @@ bool capture_snapshot_file(const std::filesystem::path& source,
         const std::filesystem::path import_path(import_text);
         if (import_path.is_absolute()) return false;
         const auto imported = (normalized.parent_path() / import_path).lexically_normal();
-        const auto relative = imported.lexically_relative(provider_root);
+        const auto resolved_import = std::filesystem::weakly_canonical(imported, path_error);
+        if (path_error) return false;
+        const auto relative = resolved_import.lexically_relative(provider_root);
         if (relative.empty() || *relative.begin() == "..") return false;
         if (!capture_snapshot_file(
                 imported, snapshot_root, provider_root, captured, used_bytes, max_source_bytes))
@@ -205,14 +210,20 @@ bool load_rut_program_snapshot(
     SourceSnapshot snapshot{std::filesystem::path(created)};
     std::vector<std::filesystem::path> captured;
     u64 used_bytes = 0;
-    const auto requested = std::filesystem::absolute(path).lexically_normal();
     std::error_code error;
+    const auto absolute_requested = std::filesystem::absolute(path, error);
+    if (error) return false;
+    const auto requested = absolute_requested.lexically_normal();
     const bool versioned_provider =
         std::filesystem::is_symlink(std::filesystem::symlink_status(requested, error));
     if (error || !versioned_provider) return false;
     const auto target = std::filesystem::read_symlink(requested, error);
     if (error) return false;
-    const std::filesystem::path source = (requested.parent_path() / target).lexically_normal();
+    const std::filesystem::path selected = (requested.parent_path() / target).lexically_normal();
+    if (std::filesystem::is_symlink(std::filesystem::symlink_status(selected, error)) || error)
+        return false;
+    const auto source = std::filesystem::weakly_canonical(selected, error);
+    if (error) return false;
     const auto provider_root = source.parent_path();
     // Resolve the version handle exactly once. The provider owns the target
     // tree and must never mutate a published version; later symlink swaps cannot

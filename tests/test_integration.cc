@@ -1689,6 +1689,48 @@ TEST(timer, preserves_deadline_for_unchanged_timer_across_config_swap) {
     CHECK_EQ(loop->timer_deadline_ns[0], deadline);
 }
 
+TEST(timer, changed_semantic_identity_rearms_deadline_across_config_swap) {
+    using namespace rut;
+    RouteConfig cfg_a{};
+    cfg_a.config_generation = 1;
+    REQUIRE(cfg_a.add_timer("stable", 6, 1000, &timer_probe_fn, -1, false, 11));
+    RouteConfig cfg_b{};
+    cfg_b.config_generation = 2;
+    REQUIRE(cfg_b.add_timer("stable", 6, 1000, &timer_probe_fn, -1, false, 12));
+
+    auto loop = std::make_unique<EpollEventLoop>();
+    const RouteConfig* active = &cfg_a;
+    loop->config_ptr = &active;
+    loop->fire_due_timers();
+    loop->timer_deadline_ns[0] = 1;
+    active = &cfg_b;
+    loop->fire_due_timers();
+    CHECK_GT(loop->timer_deadline_ns[0], 1u);
+}
+
+TEST(health_probe, preserves_compatible_deadline_across_config_swap) {
+    using namespace rut;
+    RouteConfig cfg_a{};
+    cfg_a.config_generation = 1;
+    auto first = cfg_a.add_upstream("api", 0x7f000001u, 8080);
+    REQUIRE(first);
+    REQUIRE(cfg_a.set_upstream_health_check(first.value(), "/health", 7, 1000, 200));
+    RouteConfig cfg_b{};
+    cfg_b.config_generation = 2;
+    auto second = cfg_b.add_upstream("api", 0x7f000001u, 8080);
+    REQUIRE(second);
+    REQUIRE(cfg_b.set_upstream_health_check(second.value(), "/health", 7, 1000, 200));
+
+    auto loop = std::make_unique<EpollEventLoop>();
+    const RouteConfig* active = &cfg_a;
+    loop->config_ptr = &active;
+    REQUIRE(loop->arm_health_on_config_change());
+    const u64 deadline = loop->health_probe_deadline_ns[0];
+    active = &cfg_b;
+    REQUIRE(loop->arm_health_on_config_change());
+    CHECK_EQ(loop->health_probe_deadline_ns[0], deadline);
+}
+
 // The `by:` clause compiles to a composite metering-key spec on the RIR function.
 TEST(rate_limit_dsl, by_clause_compiles_to_key_spec) {
     using namespace rut;

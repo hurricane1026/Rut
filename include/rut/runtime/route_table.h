@@ -299,6 +299,7 @@ struct RouteConfig {
         // `shard: N` — fire on that shard only; -1 = every shard (default).
         i32 shard = -1;
         bool needs_control_plane_snapshot = false;
+        u64 semantic_identity = 0;
     };
     TimerEntry timers[kMaxTimers];
     u32 timer_count = 0;
@@ -321,7 +322,8 @@ struct RouteConfig {
                    u32 interval_ms,
                    jit::HandlerFn fn,
                    i32 shard = -1,
-                   bool needs_control_plane_snapshot = false) {
+                   bool needs_control_plane_snapshot = false,
+                   u64 semantic_identity = 0) {
         if (timer_count >= kMaxTimers || fn == nullptr || interval_ms == 0) return false;
         TimerEntry& t = timers[timer_count];
         const u32 kN = name_len < sizeof(t.name) - 1 ? name_len : sizeof(t.name) - 1;
@@ -332,6 +334,7 @@ struct RouteConfig {
         t.interval_ms = interval_ms;
         t.shard = shard;
         t.needs_control_plane_snapshot = needs_control_plane_snapshot;
+        t.semantic_identity = semantic_identity;
         timer_count++;
         return true;
     }

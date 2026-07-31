@@ -104,6 +104,8 @@ inline bool rir_function_needs_control_plane_snapshot(const rir::Function& fn) {
     return false;
 }
 
+inline u64 marking_policy_identity(const rir::Module& mod, const rir::Function& fn);
+
 inline bool configure_route_dispatch(RouteConfig& cfg, const rir::Module& mod) {
     if (cfg.route_count != 0) return false;
     if (mod.func_count > 0 && mod.functions == nullptr) return false;
@@ -154,7 +156,8 @@ inline bool register_jit_routes(RouteConfig& cfg, const rir::Module& mod, jit::J
                                fn.timer_interval_ms,
                                handler,
                                fn.timer_shard,
-                               rir_function_needs_control_plane_snapshot(fn)))
+                               rir_function_needs_control_plane_snapshot(fn),
+                               marking_policy_identity(mod, fn)))
                 return false;
             continue;
         }

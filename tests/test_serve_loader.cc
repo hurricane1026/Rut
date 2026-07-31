@@ -12,6 +12,9 @@
 #include <fstream>
 #include <string>
 
+#include <fcntl.h>
+#include <unistd.h>
+
 using namespace rut;
 
 namespace {
@@ -461,6 +464,70 @@ TEST(serve_loader, reload_snapshot_rejects_unversioned_import_graph) {
     CHECK_FALSE(load_rut_program_snapshot(path.c_str(), program, err));
     CHECK_EQ(err.stage, LoadStage::Read);
     program.destroy();
+}
+
+TEST(serve_loader, reload_snapshot_rejects_import_symlink_escape) {
+    const std::string dir = "/tmp/rut_serve_loader_snapshot_escape";
+    const std::string version_dir = dir + "/releases/v1";
+    const std::string external = write_file(dir, "external.rut", "func code() -> i32 => 200\n");
+    std::filesystem::create_directories(version_dir);
+    std::error_code error;
+    const auto imported = std::filesystem::path(version_dir) / "auth.rut";
+    std::filesystem::remove(imported, error);
+    error.clear();
+    std::filesystem::create_symlink(external, imported, error);
+    REQUIRE_FALSE(error);
+    const std::string root = write_file(
+        version_dir, "main.rut", "import \"auth.rut\"\nroute GET \"/\" { return code() }\n");
+    const auto current = std::filesystem::path(dir) / "current.rut";
+    std::filesystem::remove(current, error);
+    error.clear();
+    std::filesystem::create_symlink(
+        std::filesystem::path(root).lexically_relative(dir), current, error);
+    REQUIRE_FALSE(error);
+    LoadedProgram program;
+    LoadError load_error;
+    CHECK_FALSE(load_rut_program_snapshot(current.c_str(), program, load_error));
+    program.destroy();
+}
+
+TEST(serve_loader, reload_snapshot_reports_inaccessible_relative_path) {
+    const int cwd = open(".", O_RDONLY | O_DIRECTORY);
+    REQUIRE(cwd >= 0);
+    const std::string dir = "/tmp/rut_serve_loader_removed_cwd";
+    std::error_code error;
+    std::filesystem::remove_all(dir, error);
+    std::filesystem::create_directories(dir);
+    REQUIRE_EQ(chdir(dir.c_str()), 0);
+    std::filesystem::remove(dir, error);
+    REQUIRE_FALSE(error);
+    LoadedProgram program;
+    LoadError load_error;
+    CHECK_FALSE(load_rut_program_snapshot("current.rut", program, load_error));
+    CHECK_EQ(load_error.stage, LoadStage::Read);
+    REQUIRE_EQ(fchdir(cwd), 0);
+    close(cwd);
+    program.destroy();
+}
+
+TEST(serve_loader, timer_semantic_identity_changes_with_lowered_body) {
+    const std::string dir = "/tmp/rut_serve_loader_timer_identity";
+    const std::string first_path =
+        write_file(dir, "first.rut", "timer tick, every: 5s { return 200 }\n");
+    const std::string second_path =
+        write_file(dir, "second.rut", "timer tick, every: 5s { return 201 }\n");
+    LoadedProgram first;
+    LoadedProgram second;
+    LoadError error;
+    REQUIRE(load_rut_program(first_path.c_str(), first, error));
+    REQUIRE(load_rut_program(second_path.c_str(), second, error));
+    REQUIRE_EQ(first.config.timer_count, 1u);
+    REQUIRE_EQ(second.config.timer_count, 1u);
+    CHECK_NE(first.config.timers[0].semantic_identity, 0u);
+    CHECK_NE(second.config.timers[0].semantic_identity, 0u);
+    CHECK_NE(first.config.timers[0].semantic_identity, second.config.timers[0].semantic_identity);
+    first.destroy();
+    second.destroy();
 }
 
 TEST(serve_loader, unknown_import_reports_copied_detail) {

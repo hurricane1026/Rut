@@ -413,7 +413,13 @@ static i32 run_shards(u16 port,
     // published generation one final chance to retire cleanly before stopping
     // the mutation port; process teardown remains safe even if a shard exited
     // before consuming its pending pointer.
-    if (reload_enabled) (void)reload_coordinator.poll();
+    if (reload_enabled) {
+        const ReloadCoordinatorPoll kFinalReload = reload_coordinator.poll();
+        if (kFinalReload == ReloadCoordinatorPoll::Activated) {
+            write_str("Reload activated during shutdown\n");
+            write_reload_record(control_plane_mutation.last_record());
+        }
+    }
 #endif
     control_plane_mutation.stop();
 
