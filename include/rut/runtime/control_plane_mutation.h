@@ -2612,6 +2612,11 @@ inline void latch_control_plane_mutation(Loop* loop, jit::HandlerCtx* ctx, u64 c
     ctx->config_generation = config_generation;
     if (loop == nullptr) return;
     if (control_plane_replay_mode) return;
+    // Route reload attempts do not yet have a traffic capture/replay event.
+    // Keep the capability unavailable while capture is active so captured
+    // executions remain deterministic and fail closed.
+    if constexpr (requires { loop->capture_ring; })
+        if (loop->capture_ring != nullptr) return;
     if constexpr (requires { loop->control_plane_mutation; })
         ctx->control_plane_mutation = loop->control_plane_mutation;
 }

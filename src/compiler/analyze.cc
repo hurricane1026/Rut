@@ -13700,6 +13700,10 @@ static FrontendResult<void> analyze_match_arm_body(const AstStatement& stmt,
                                                scoped_locals.len,
                                                binding);
                 if (!init) return core::make_unexpected(init.error());
+                if (hir_expr_contains_reload_request(init.value()))
+                    return frontend_error(FrontendError::UnsupportedSyntax,
+                                          inner.expr.span,
+                                          lit_str("reload cannot initialize a match-arm local"));
                 auto typed = apply_declared_type_to_expr(&init.value(), mod, inner);
                 if (!typed) return core::make_unexpected(typed.error());
                 local.type = init->type;
@@ -17574,6 +17578,10 @@ static FrontendResult<u32> analyze_for_stmt(const AstStatement& stmt,
                     FrontendError::UnsupportedSyntax,
                     bstmt.expr.span,
                     lit_str("upstream.mark cannot initialize a static for-loop local"));
+            if (hir_expr_contains_reload_request(init.value()))
+                return frontend_error(FrontendError::UnsupportedSyntax,
+                                      bstmt.expr.span,
+                                      lit_str("reload cannot initialize a static for-loop local"));
             if (init->may_error && init->kind != HirExprKind::Error &&
                 init->kind != HirExprKind::LocalRef)
                 return frontend_error(

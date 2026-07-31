@@ -2173,12 +2173,17 @@ TEST(control_plane_mutation, published_terminal_record_remains_readable_during_s
 TEST(control_plane_mutation, handler_context_latches_only_the_explicit_loop_capability) {
     struct Loop {
         ControlPlaneMutationPort* control_plane_mutation = nullptr;
+        void* capture_ring = nullptr;
     } loop;
     ControlPlaneMutationPort port;
     jit::HandlerCtx ctx{};
     loop.control_plane_mutation = &port;
     latch_control_plane_mutation(&loop, &ctx, 0);
     CHECK(ctx.control_plane_mutation == &port);
+    loop.capture_ring = &loop;
+    latch_control_plane_mutation(&loop, &ctx, 0);
+    CHECK(ctx.control_plane_mutation == nullptr);
+    loop.capture_ring = nullptr;
     latch_control_plane_mutation<Loop>(nullptr, &ctx, 0);
     CHECK(ctx.control_plane_mutation == nullptr);
 }

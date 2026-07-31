@@ -40015,6 +40015,10 @@ TEST(frontend, reload_request_rejects_reordered_or_discarded_effect_contexts) {
         "struct Pair { first: bool second: bool }\n"
         "route POST \"/reload\" { let pair = Pair(second: reload(), first: reload()) "
         "guard pair.first else { return 503 } return 202 }\n",
+        "route POST \"/reload\" { for item in [1] { let accepted = reload() guard accepted "
+        "else { return 503 } } return 202 }\n",
+        "route POST \"/reload\" { match req.http11 { true => { let accepted = reload() guard "
+        "accepted else { return 503 } return 202 } false => return 400 } }\n",
     };
     for (const char* src : invalid_sources) {
         auto lexed = lex(lit(src));
