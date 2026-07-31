@@ -8298,6 +8298,11 @@ static FrontendResult<HirExpr> analyze_expr_impl(const AstExpr& expr,
                             FrontendError::UnsupportedSyntax,
                             expr.field_inits[fi].value->span,
                             lit_str("upstream.mark cannot be used in a struct initializer"));
+                    if (hir_expr_contains_reload_request(field_value.value()))
+                        return frontend_error(
+                            FrontendError::UnsupportedSyntax,
+                            expr.field_inits[fi].value->span,
+                            lit_str("reload cannot be used in a struct initializer"));
                     if (field_value->may_nil || field_value->may_error)
                         return frontend_error(FrontendError::UnsupportedSyntax,
                                               expr.field_inits[fi].value->span);
@@ -8424,6 +8429,10 @@ static FrontendResult<HirExpr> analyze_expr_impl(const AstExpr& expr,
                     FrontendError::UnsupportedSyntax,
                     expr.field_inits[fi].value->span,
                     lit_str("upstream.mark cannot be used in a struct initializer"));
+            if (hir_expr_contains_reload_request(field_value.value()))
+                return frontend_error(FrontendError::UnsupportedSyntax,
+                                      expr.field_inits[fi].value->span,
+                                      lit_str("reload cannot be used in a struct initializer"));
             if (earlier_field_reads_response) {
                 for (u32 li = locals_before_field; li < route->locals.len; li++) {
                     if (is_response_effect(route->locals[li].init.kind))
@@ -9250,6 +9259,10 @@ static FrontendResult<HirExpr> analyze_expr_impl(const AstExpr& expr,
                         FrontendError::UnsupportedSyntax,
                         expr.field_inits[fi].value->span,
                         lit_str("upstream.mark cannot be used in a struct initializer"));
+                if (hir_expr_contains_reload_request(field_value.value()))
+                    return frontend_error(FrontendError::UnsupportedSyntax,
+                                          expr.field_inits[fi].value->span,
+                                          lit_str("reload cannot be used in a struct initializer"));
                 if (field_value->may_nil || field_value->may_error)
                     return frontend_error(FrontendError::UnsupportedSyntax,
                                           expr.field_inits[fi].value->span);
@@ -13999,6 +14012,11 @@ static FrontendResult<void> analyze_guard_fail_body(const AstStatement& stmt,
                         FrontendError::UnsupportedSyntax,
                         inner.expr.span,
                         lit_str("upstream.mark cannot initialize a guard-failure local"));
+                if (hir_expr_contains_reload_request(init.value()))
+                    return frontend_error(
+                        FrontendError::UnsupportedSyntax,
+                        inner.expr.span,
+                        lit_str("reload cannot initialize a guard-failure local"));
                 if (inside_static_for && inner.expr.kind != AstExprKind::Ident &&
                     inner.expr.kind != AstExprKind::BoolLit &&
                     inner.expr.kind != AstExprKind::IntLit &&

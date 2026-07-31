@@ -1237,6 +1237,11 @@ inline bool marking_policies_valid_for_codegen(const rir::Module& mod) {
         if (!marking_policy_emitted_mask(
                 mod, fn, mod.upstream_count, &emitted_mask, &request_dependent, &suspends))
             return false;
+        if (fn.is_timer) {
+            for (u32 bi = 0; bi < fn.block_count; bi++)
+                for (u32 ii = 0; ii < fn.blocks[bi].inst_count; ii++)
+                    if (fn.blocks[bi].insts[ii].op == rir::Opcode::ReloadRequest) return false;
+        }
         if (!fn.is_timer) {
             if (emitted_mask != 0 || fn.upstream_mark_mask != 0) return false;
             continue;
@@ -2226,6 +2231,11 @@ inline bool populate_route_config(RouteConfig& cfg, const rir::Module& mod) {
         if (!marking_policy_emitted_mask(
                 mod, fn, mod.upstream_count, &emitted_mask, &request_dependent, &suspends))
             return false;
+        if (fn.is_timer) {
+            for (u32 bi = 0; bi < fn.block_count; bi++)
+                for (u32 ii = 0; ii < fn.blocks[bi].inst_count; ii++)
+                    if (fn.blocks[bi].insts[ii].op == rir::Opcode::ReloadRequest) return false;
+        }
         if (!fn.is_timer) {
             if (emitted_mask != 0 || fn.upstream_mark_mask != 0) return false;
             continue;
