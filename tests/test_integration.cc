@@ -1670,6 +1670,25 @@ TEST(timer, rearms_on_config_swap) {
     CHECK_GE(loop->timer_fire_count[0], 1u);
 }
 
+TEST(timer, preserves_deadline_for_unchanged_timer_across_config_swap) {
+    using namespace rut;
+    RouteConfig cfg_a{};
+    cfg_a.config_generation = 1;
+    REQUIRE(cfg_a.add_timer("stable", 6, 1000, &timer_probe_fn));
+    RouteConfig cfg_b{};
+    cfg_b.config_generation = 2;
+    REQUIRE(cfg_b.add_timer("stable", 6, 1000, &timer_probe_fn));
+
+    auto loop = std::make_unique<EpollEventLoop>();
+    const RouteConfig* active = &cfg_a;
+    loop->config_ptr = &active;
+    loop->fire_due_timers();
+    const u64 deadline = loop->timer_deadline_ns[0];
+    active = &cfg_b;
+    loop->fire_due_timers();
+    CHECK_EQ(loop->timer_deadline_ns[0], deadline);
+}
+
 // The `by:` clause compiles to a composite metering-key spec on the RIR function.
 TEST(rate_limit_dsl, by_clause_compiles_to_key_spec) {
     using namespace rut;

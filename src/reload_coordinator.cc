@@ -4,7 +4,7 @@ namespace rut {
 
 bool ProcessReloadCoordinator::default_loader(
     void*, const char* source_path, LoadedProgram& output, LoadError& error, jit::OptLevel opt) {
-    return load_rut_program(source_path, output, error, opt);
+    return load_rut_program_snapshot(source_path, output, error, opt);
 }
 
 bool ProcessReloadCoordinator::init(ControlPlaneMutationPort* mutation,
@@ -50,6 +50,7 @@ bool ProcessReloadCoordinator::compatible(const RouteConfig& active,
                                           u32 shard_count) {
     if (shard_count == 0 || candidate.first_out_of_range_timer_shard(shard_count) >= 0)
         return false;
+    if (!active.same_firewall_policy(candidate)) return false;
     if (active.cache_instance_count != candidate.cache_instance_count) return false;
     for (u32 i = 0; i < active.cache_instance_count; i++) {
         const auto& lhs = active.cache_instances[i];

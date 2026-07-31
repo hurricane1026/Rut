@@ -425,6 +425,22 @@ TEST(serve_loader, import_resolves_relative_to_program) {
     program.destroy();
 }
 
+TEST(serve_loader, reload_snapshot_captures_relative_import_graph) {
+    const std::string dir = "/tmp/rut_serve_loader_snapshot_import";
+    write_file(dir, "auth.rut", "func jwtAuth() -> i32 => 200\n");
+    const std::string path = write_file(
+        dir,
+        "main.rut",
+        "import \"auth.rut\"\n"
+        "route GET \"/users\" { if jwtAuth() == 200 { return 200 } else { return 500 } }\n");
+
+    LoadedProgram program;
+    LoadError err;
+    REQUIRE(load_rut_program_snapshot(path.c_str(), program, err));
+    CHECK_EQ(program.config.route_count, 1u);
+    program.destroy();
+}
+
 TEST(serve_loader, unknown_import_reports_copied_detail) {
     // The diagnostic detail (the imported name) lives in analyzer storage
     // that is freed when load_rut_program returns; format_load_error must

@@ -16,6 +16,11 @@
 #include "rut/runtime/ws_terminate.h"  // WsMessageHandlerFn
 #endif
 
+#include <filesystem>
+#include <fstream>
+#include <string>
+#include <vector>
+
 #include <fcntl.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
@@ -112,7 +117,115 @@ void set_load_diag(LoadError& err, const Diagnostic& diag) {
     err.diag.detail = Str{err.detail_buf, n};
 }
 
+struct SourceSnapshot {
+    std::filesystem::path root;
+
+    ~SourceSnapshot() {
+        if (!root.empty()) {
+            std::error_code ignored;
+            std::filesystem::remove_all(root, ignored);
+        }
+    }
+};
+
+bool read_snapshot_source(const std::filesystem::path& path,
+                          std::string& content,
+                          u64* used_bytes,
+                          u64 max_source_bytes) {
+    std::ifstream input(path, std::ios::binary);
+    if (!input) return false;
+    input.seekg(0, std::ios::end);
+    const std::streamoff size = input.tellg();
+    if (size < 0 || *used_bytes > max_source_bytes ||
+        static_cast<u64>(size) > max_source_bytes - *used_bytes)
+        return false;
+    input.seekg(0, std::ios::beg);
+    content.resize(static_cast<size_t>(size));
+    if (size != 0 && !input.read(content.data(), size)) return false;
+    *used_bytes += static_cast<u64>(size);
+    return true;
+}
+
+bool capture_snapshot_file(const std::filesystem::path& source,
+                           const std::filesystem::path& snapshot_root,
+                           std::vector<std::filesystem::path>& captured,
+                           std::vector<std::string>& captured_contents,
+                           u64* used_bytes,
+                           u64 max_source_bytes) {
+    const auto normalized = std::filesystem::absolute(source).lexically_normal();
+    for (const auto& path : captured)
+        if (path == normalized) return true;
+
+    std::string content;
+    if (!read_snapshot_source(normalized, content, used_bytes, max_source_bytes)) return false;
+    captured.push_back(normalized);
+    captured_contents.push_back(content);
+
+    const auto destination = snapshot_root / normalized.relative_path();
+    std::error_code error;
+    std::filesystem::create_directories(destination.parent_path(), error);
+    if (error) return false;
+    std::ofstream output(destination, std::ios::binary | std::ios::trunc);
+    if (!output || (!content.empty() &&
+                    !output.write(content.data(), static_cast<std::streamsize>(content.size()))))
+        return false;
+    output.close();
+    if (!output) return false;
+
+    const Str source_text{content.data(), static_cast<u32>(content.size())};
+    auto lexed = lex(source_text);
+    if (!lexed) return false;
+    auto parsed = parse_file(lexed.value());
+    if (!parsed) return false;
+    std::unique_ptr<AstFile> ast(parsed.value());
+    for (u32 i = 0; i < ast->items.len; i++) {
+        const auto& item = ast->items[i];
+        if (item.kind != AstItemKind::Import) continue;
+        std::string import_text(item.import_decl.path.ptr, item.import_decl.path.len);
+        const std::filesystem::path import_path(import_text);
+        // Absolute imports would escape the private tree when the captured root
+        // is compiled. They are intentionally fail-closed for live reload.
+        if (import_path.is_absolute()) return false;
+        if (!capture_snapshot_file(normalized.parent_path() / import_path,
+                                   snapshot_root,
+                                   captured,
+                                   captured_contents,
+                                   used_bytes,
+                                   max_source_bytes))
+            return false;
+    }
+    return true;
+}
+
 }  // namespace
+
+bool load_rut_program_snapshot(
+    const char* path, LoadedProgram& out, LoadError& err, jit::OptLevel opt, u64 max_source_bytes) {
+    err = LoadError{};
+    err.stage = LoadStage::Read;
+    char directory[] = "/tmp/rut-source-snapshot-XXXXXX";
+    char* created = mkdtemp(directory);
+    if (created == nullptr) return false;
+    SourceSnapshot snapshot{std::filesystem::path(created)};
+    std::vector<std::filesystem::path> captured;
+    std::vector<std::string> captured_contents;
+    u64 used_bytes = 0;
+    const auto source = std::filesystem::absolute(path).lexically_normal();
+    if (!capture_snapshot_file(
+            source, snapshot.root, captured, captured_contents, &used_bytes, max_source_bytes))
+        return false;
+    // Detect an in-place deployment racing the graph walk. Compilation still
+    // uses only the private copies; a later request can retry the stable tree.
+    for (size_t i = 0; i < captured.size(); i++) {
+        std::string verified;
+        u64 verification_bytes = 0;
+        if (!read_snapshot_source(captured[i], verified, &verification_bytes, ~u64{0}) ||
+            verified != captured_contents[i])
+            return false;
+    }
+    const std::string captured_root = (snapshot.root / source.relative_path()).string();
+    return load_rut_program(captured_root.c_str(), out, err, opt, max_source_bytes);
+}
 
 bool load_rut_program(
     const char* path, LoadedProgram& out, LoadError& err, jit::OptLevel opt, u64 max_source_bytes) {

@@ -193,14 +193,40 @@ public:
         // added slot, which would fire on the next tick instead of after `every`).
         const u64 generation = cfg != nullptr ? cfg->config_generation : 0;
         if (cfg != timer_armed_config || generation != timer_armed_generation) {
+            const RouteConfig* previous = timer_armed_config;
+            u64 previous_deadlines[RouteConfig::kMaxTimers]{};
+            for (u32 i = 0; i < RouteConfig::kMaxTimers; i++)
+                previous_deadlines[i] = timer_deadline_ns[i];
             timer_armed_config = cfg;
             timer_armed_generation = generation;
             if (cfg != nullptr) {
                 const u32 m = cfg->timer_count < RouteConfig::kMaxTimers ? cfg->timer_count
                                                                          : RouteConfig::kMaxTimers;
-                for (u32 i = 0; i < m; i++)
+                for (u32 i = 0; i < m; i++) {
                     timer_deadline_ns[i] =
                         now + static_cast<u64>(cfg->timers[i].interval_ms) * 1'000'000ull;
+                    if (previous == nullptr) continue;
+                    const auto& next = cfg->timers[i];
+                    const u32 previous_count = previous->timer_count < RouteConfig::kMaxTimers
+                                                   ? previous->timer_count
+                                                   : RouteConfig::kMaxTimers;
+                    for (u32 j = 0; j < previous_count; j++) {
+                        const auto& old = previous->timers[j];
+                        if (old.name_len != next.name_len || old.interval_ms != next.interval_ms ||
+                            old.shard != next.shard ||
+                            old.needs_control_plane_snapshot != next.needs_control_plane_snapshot)
+                            continue;
+                        bool same_name = true;
+                        for (u32 c = 0; c < old.name_len; c++)
+                            if (old.name[c] != next.name[c]) {
+                                same_name = false;
+                                break;
+                            }
+                        if (!same_name) continue;
+                        timer_deadline_ns[i] = previous_deadlines[j];
+                        break;
+                    }
+                }
             }
             return;
         }

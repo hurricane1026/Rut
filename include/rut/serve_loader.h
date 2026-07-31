@@ -89,6 +89,15 @@ bool load_rut_program(const char* path,
                       jit::OptLevel opt = jit::OptLevel::O2,
                       u64 max_source_bytes = ~u64{0});
 
+// Capture the root and its transitive relative imports before compiling. The
+// compiler then reads only the private snapshot, so one reload can never mix
+// files from different filesystem revisions.
+bool load_rut_program_snapshot(const char* path,
+                               LoadedProgram& out,
+                               LoadError& err,
+                               jit::OptLevel opt = jit::OptLevel::O2,
+                               u64 max_source_bytes = ~u64{0});
+
 // Publish the program's Cache descriptors as part of installing its
 // RouteConfig. Compilation alone never mutates the live Cache registry;
 // callers must invoke this at the config activation boundary. The current

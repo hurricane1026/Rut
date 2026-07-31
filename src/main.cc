@@ -360,8 +360,8 @@ static i32 run_shards(u16 port,
     // single-slot mutation boundary as route-triggered requests; compilation
     // stays on this process-control thread, never a shard thread.
     for (;;) {
-        struct timespec timeout{0, 100 * 1000 * 1000};
-        const i32 sig = sigtimedwait(&wait_set, nullptr, &timeout);
+        const struct timespec kTimeout{0, 100L * 1000L * 1000L};
+        const i32 sig = sigtimedwait(&wait_set, nullptr, &kTimeout);
         if (sig == SIGINT || sig == SIGTERM) break;
 #ifdef RUT_ENABLE_JIT
         if (sig == SIGHUP) {
@@ -369,6 +369,7 @@ static i32 run_shards(u16 port,
                 write_str("SIGHUP ignored: no .rut program is loaded\n");
             } else if (!reload_coordinator.request_signal()) {
                 write_str("Reload request ignored: another reload is pending\n");
+                write_reload_record(control_plane_mutation.last_record());
             }
         }
         if (reload_enabled) {

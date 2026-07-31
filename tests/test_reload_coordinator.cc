@@ -10,6 +10,7 @@ struct FakeLoader {
     bool add_cache = false;
     u32 cache_capacity = 64;
     i32 timer_shard = -1;
+    bool change_firewall = false;
     u32 calls = 0;
 };
 
@@ -31,6 +32,7 @@ bool load_fake(void* context, const char*, LoadedProgram& output, LoadError& err
     if (fake.timer_shard >= 0 &&
         !output.config.add_timer("tick", 4, 1000, &timer_noop, fake.timer_shard))
         return false;
+    if (fake.change_firewall && !output.config.add_firewall_deny_ip("10.0.0.1")) return false;
     return true;
 }
 
@@ -157,6 +159,16 @@ TEST(reload_coordinator, incompatible_cache_or_timer_is_rejected_before_publicat
         CHECK_EQ(f.mutation.active_generation(), 1u);
         f.cleanup();
     }
+}
+
+TEST(reload_coordinator, firewall_policy_change_is_rejected_before_publication) {
+    Fixture f;
+    f.loader.change_firewall = true;
+    REQUIRE(f.setup());
+    REQUIRE(f.coordinator.request_signal());
+    CHECK_EQ(f.coordinator.poll(), ReloadCoordinatorPoll::ValidationFailed);
+    CHECK_EQ(f.mutation.active_generation(), 1u);
+    f.cleanup();
 }
 
 TEST(reload_coordinator, signal_uses_same_single_slot_and_bypasses_route_authority) {
