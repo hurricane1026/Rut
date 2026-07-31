@@ -15,7 +15,9 @@ bool ProcessReloadCoordinator::init(ControlPlaneMutationPort* mutation,
                                     const ReloadShardEndpoint* shards,
                                     u32 shard_count,
                                     ReloadProgramLoader loader,
-                                    void* loader_context) {
+                                    void* loader_context,
+                                    ReloadCancellationCheck cancellation_check,
+                                    void* cancellation_context) {
     if (mutation == nullptr || source_path == nullptr || active == nullptr || spare == nullptr ||
         active == spare || shards == nullptr || shard_count == 0 || shard_count > kMaxShards ||
         active->config.config_generation == 0 ||
@@ -34,6 +36,8 @@ bool ProcessReloadCoordinator::init(ControlPlaneMutationPort* mutation,
     shard_count_ = shard_count;
     loader_ = loader != nullptr ? loader : &default_loader;
     loader_context_ = loader_context;
+    cancellation_check_ = cancellation_check;
+    cancellation_context_ = cancellation_context;
     request_ = {};
     old_generation_ = 0;
     last_load_error_ = {};
@@ -95,6 +99,11 @@ ReloadCoordinatorPoll ProcessReloadCoordinator::poll() {
         (void)mutation_->complete_reload(
             request.id, request.source, ReloadTerminalOutcome::CompileFailed);
         return ReloadCoordinatorPoll::CompileFailed;
+    }
+    if (cancellation_check_ != nullptr && cancellation_check_(cancellation_context_)) {
+        spare_->destroy();
+        mutation_->stop();
+        return ReloadCoordinatorPoll::Stopped;
     }
     if (!compatible(active_->config, spare_->config, shard_count_) ||
         old_generation_ >= ControlPlaneMutationPort::kMaxGeneration) {

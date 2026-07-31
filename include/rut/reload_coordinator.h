@@ -17,6 +17,7 @@ enum class ReloadCoordinatorPoll : u8 {
     Published,
     Waiting,
     Activated,
+    Stopped,
 };
 
 using ReloadProgramLoader = bool (*)(void* context,
@@ -24,6 +25,7 @@ using ReloadProgramLoader = bool (*)(void* context,
                                      LoadedProgram& output,
                                      LoadError& error,
                                      jit::OptLevel opt);
+using ReloadCancellationCheck = bool (*)(void* context);
 
 // Single process owner for source compilation, generation publication, shard
 // acknowledgements, and LoadedProgram lifetime. poll() is called only by the
@@ -41,7 +43,9 @@ public:
                             const ReloadShardEndpoint* shards,
                             u32 shard_count,
                             ReloadProgramLoader loader = nullptr,
-                            void* loader_context = nullptr);
+                            void* loader_context = nullptr,
+                            ReloadCancellationCheck cancellation_check = nullptr,
+                            void* cancellation_context = nullptr);
 
     [[nodiscard]] bool request_signal(u64* request_id = nullptr);
     ReloadCoordinatorPoll poll();
@@ -72,6 +76,8 @@ private:
     u32 shard_count_ = 0;
     ReloadProgramLoader loader_ = nullptr;
     void* loader_context_ = nullptr;
+    ReloadCancellationCheck cancellation_check_ = nullptr;
+    void* cancellation_context_ = nullptr;
     ReloadRequest request_{};
     u64 old_generation_ = 0;
     LoadError last_load_error_{};

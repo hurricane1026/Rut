@@ -151,7 +151,8 @@ bool capture_snapshot_file(const std::filesystem::path& source,
                            const std::filesystem::path& provider_root,
                            std::vector<std::filesystem::path>& captured,
                            u64* used_bytes,
-                           u64 max_source_bytes) {
+                           u64 max_source_bytes,
+                           LoadError& err) {
     std::error_code path_error;
     const auto absolute_source = std::filesystem::absolute(source, path_error);
     if (path_error) return false;
@@ -176,9 +177,17 @@ bool capture_snapshot_file(const std::filesystem::path& source,
 
     const Str source_text{content.data(), static_cast<u32>(content.size())};
     auto lexed = lex(source_text);
-    if (!lexed) return false;
+    if (!lexed) {
+        err.stage = LoadStage::Lex;
+        set_load_diag(err, lexed.error());
+        return false;
+    }
     auto parsed = parse_file(lexed.value());
-    if (!parsed) return false;
+    if (!parsed) {
+        err.stage = LoadStage::Parse;
+        set_load_diag(err, parsed.error());
+        return false;
+    }
     std::unique_ptr<AstFile> ast(parsed.value());
     for (u32 i = 0; i < ast->items.len; i++) {
         const auto& item = ast->items[i];
@@ -191,8 +200,13 @@ bool capture_snapshot_file(const std::filesystem::path& source,
         if (path_error) return false;
         const auto relative = resolved_import.lexically_relative(provider_root);
         if (relative.empty() || *relative.begin() == "..") return false;
-        if (!capture_snapshot_file(
-                imported, snapshot_root, provider_root, captured, used_bytes, max_source_bytes))
+        if (!capture_snapshot_file(imported,
+                                   snapshot_root,
+                                   provider_root,
+                                   captured,
+                                   used_bytes,
+                                   max_source_bytes,
+                                   err))
             return false;
     }
     return true;
@@ -229,7 +243,7 @@ bool load_rut_program_snapshot(
     // tree and must never mutate a published version; later symlink swaps cannot
     // affect this request's source or import namespace.
     if (!capture_snapshot_file(
-            source, snapshot.root, provider_root, captured, &used_bytes, max_source_bytes))
+            source, snapshot.root, provider_root, captured, &used_bytes, max_source_bytes, err))
         return false;
     const std::string captured_root = (snapshot.root / source.relative_path()).string();
     return load_rut_program(captured_root.c_str(), out, err, opt, max_source_bytes);

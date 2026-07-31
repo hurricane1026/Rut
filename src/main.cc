@@ -119,6 +119,12 @@ static bool detect_io_uring() {
 
 // --- Signal handling for graceful shutdown ---
 
+static bool shutdown_signal_pending(void*) {
+    sigset_t pending;
+    if (sigpending(&pending) != 0) return true;
+    return sigismember(&pending, SIGINT) == 1 || sigismember(&pending, SIGTERM) == 1;
+}
+
 static void write_error(const char* prefix, const rut::Error& err) {
     write_str(prefix);
     write_str(" (errno=");
@@ -252,7 +258,11 @@ static i32 run_shards(u16 port,
                                                  reload_config->active,
                                                  reload_config->spare,
                                                  endpoints,
-                                                 shard_count);
+                                                 shard_count,
+                                                 nullptr,
+                                                 nullptr,
+                                                 &shutdown_signal_pending,
+                                                 nullptr);
         if (!reload_enabled) {
             write_str("Failed to initialize reload coordinator\n");
             for (u32 i = 0; i < shard_count; i++) shards[i].shutdown();

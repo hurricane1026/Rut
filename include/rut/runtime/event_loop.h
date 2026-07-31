@@ -331,6 +331,11 @@ public:
                             same = false;
                     if (!same) continue;
                     health_probe_deadline_ns[u] = previous_deadlines[old_index];
+                    inherit_backend_health(previous->config_generation,
+                                           static_cast<u16>(old_index),
+                                           cfg->config_generation,
+                                           static_cast<u16>(u),
+                                           next.addr_count);
                     break;
                 }
             }

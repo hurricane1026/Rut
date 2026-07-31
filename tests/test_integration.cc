@@ -1726,9 +1726,19 @@ TEST(health_probe, preserves_compatible_deadline_across_config_swap) {
     loop->config_ptr = &active;
     REQUIRE(loop->arm_health_on_config_change());
     const u64 deadline = loop->health_probe_deadline_ns[0];
+    BackendHealth* old_health = backend_health(1, 0, 0);
+    REQUIRE(old_health != nullptr);
+    old_health->fails = 3;
+    old_health->eject_until_us = 99;
+    old_health->active_down = true;
     active = &cfg_b;
     REQUIRE(loop->arm_health_on_config_change());
     CHECK_EQ(loop->health_probe_deadline_ns[0], deadline);
+    const BackendHealth* inherited = backend_health(2, 0, 0);
+    REQUIRE(inherited != nullptr);
+    CHECK_EQ(inherited->fails, 3u);
+    CHECK_EQ(inherited->eject_until_us, 99u);
+    CHECK(inherited->active_down);
 }
 
 // The `by:` clause compiles to a composite metering-key spec on the RIR function.

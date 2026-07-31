@@ -14,6 +14,10 @@ struct FakeLoader {
     u32 calls = 0;
 };
 
+bool cancellation_requested(void* context) {
+    return *static_cast<bool*>(context);
+}
+
 u64 timer_noop(void*, jit::HandlerCtx*, const u8*, u32, void*) {
     return 0;
 }
@@ -136,6 +140,40 @@ TEST(reload_coordinator, compile_failure_is_definitely_not_applied) {
     CHECK_EQ(record.new_generation, 0u);
     for (const auto& control : f.controls) CHECK(control.pending_config == nullptr);
     f.cleanup();
+}
+
+TEST(reload_coordinator, shutdown_after_compile_cancels_before_publication) {
+    ControlPlaneMutationPort mutation;
+    mutation.reset(1, true);
+    LoadedProgram active;
+    LoadedProgram spare;
+    active.config.config_generation = 1;
+    active.config.program_pins = &active.pins;
+    ShardControlBlock control{};
+    control.acknowledged_generation.store(1, std::memory_order_relaxed);
+    ReloadShardEndpoint shard{&control};
+    FakeLoader loader;
+    bool cancel = true;
+    ProcessReloadCoordinator coordinator;
+    REQUIRE(coordinator.init(&mutation,
+                             "/fake/app.rut",
+                             jit::OptLevel::O2,
+                             &active,
+                             &spare,
+                             &shard,
+                             1,
+                             &load_fake,
+                             &loader,
+                             &cancellation_requested,
+                             &cancel));
+    REQUIRE(coordinator.request_signal());
+    CHECK_EQ(coordinator.poll(), ReloadCoordinatorPoll::Stopped);
+    CHECK_EQ(loader.calls, 1u);
+    CHECK_EQ(mutation.active_generation(), 1u);
+    CHECK(control.pending_config.load(std::memory_order_relaxed) == nullptr);
+    CHECK_EQ(mutation.last_record().outcome, ReloadTerminalOutcome::Stopped);
+    active.destroy();
+    spare.destroy();
 }
 
 TEST(reload_coordinator, incompatible_cache_or_timer_is_rejected_before_publication) {

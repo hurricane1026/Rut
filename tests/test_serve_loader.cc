@@ -452,6 +452,25 @@ TEST(serve_loader, reload_snapshot_captures_relative_import_graph) {
     program.destroy();
 }
 
+TEST(serve_loader, reload_snapshot_preserves_parse_diagnostic) {
+    const std::string dir = "/tmp/rut_serve_loader_snapshot_parse";
+    const std::string path = write_file(dir, "broken.rut", "route GET \"/\" { this is broken\n");
+    const std::string current = dir + "/current.rut";
+    std::error_code error;
+    std::filesystem::remove(current, error);
+    error.clear();
+    std::filesystem::create_symlink(
+        std::filesystem::path(path).lexically_relative(dir), current, error);
+    REQUIRE_FALSE(error);
+
+    LoadedProgram program;
+    LoadError load_error;
+    CHECK_FALSE(load_rut_program_snapshot(current.c_str(), program, load_error));
+    CHECK_EQ(load_error.stage, LoadStage::Parse);
+    CHECK(load_error.has_diag);
+    program.destroy();
+}
+
 TEST(serve_loader, reload_snapshot_rejects_unversioned_import_graph) {
     const std::string dir = "/tmp/rut_serve_loader_unversioned_import";
     write_file(dir, "auth.rut", "func jwtAuth() -> i32 => 200\n");
