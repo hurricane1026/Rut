@@ -132,6 +132,17 @@ TEST(reload_coordinator, incompatible_rate_limit_key_or_scope_change_is_rejected
     CHECK_FALSE(ProcessReloadCoordinator::compatible(active, candidate, 1));
 }
 
+TEST(reload_coordinator, identical_sibling_count_change_is_rejected) {
+    RouteConfig active;
+    RouteConfig candidate;
+    REQUIRE(active.add_static("/api", 0, 200));
+    REQUIRE(candidate.add_static("/api", 0, 200));
+    REQUIRE(active.add_route_rate_limit_rule(0, 10, 60, RateLimitScope::Shard, 10));
+    REQUIRE(active.add_route_rate_limit_rule(0, 10, 60, RateLimitScope::Shard, 10));
+    REQUIRE(candidate.add_route_rate_limit_rule(0, 10, 60, RateLimitScope::Shard, 10));
+    CHECK_FALSE(ProcessReloadCoordinator::compatible(active, candidate, 1));
+}
+
 TEST(reload_coordinator, changed_health_policy_requires_warming_support) {
     RouteConfig active;
     RouteConfig candidate;

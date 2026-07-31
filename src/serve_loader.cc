@@ -132,6 +132,9 @@ bool read_snapshot_source(const std::filesystem::path& path,
                           std::string& content,
                           u64* used_bytes,
                           u64 max_source_bytes) {
+    std::error_code type_error;
+    if (!std::filesystem::is_regular_file(std::filesystem::status(path, type_error)) || type_error)
+        return false;
     std::ifstream input(path, std::ios::binary);
     if (!input) return false;
     input.seekg(0, std::ios::end);
@@ -196,11 +199,14 @@ bool capture_snapshot_file(const std::filesystem::path& source,
         const std::filesystem::path import_path(import_text);
         if (import_path.is_absolute()) return false;
         const auto imported = (normalized.parent_path() / import_path).lexically_normal();
+        if (std::filesystem::is_symlink(std::filesystem::symlink_status(imported, path_error)) ||
+            path_error)
+            return false;
         const auto resolved_import = std::filesystem::weakly_canonical(imported, path_error);
         if (path_error) return false;
         const auto relative = resolved_import.lexically_relative(provider_root);
         if (relative.empty() || *relative.begin() == "..") return false;
-        if (!capture_snapshot_file(imported,
+        if (!capture_snapshot_file(resolved_import,
                                    snapshot_root,
                                    provider_root,
                                    captured,

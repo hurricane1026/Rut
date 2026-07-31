@@ -13,6 +13,7 @@
 #include <string>
 
 #include <fcntl.h>
+#include <sys/stat.h>
 #include <unistd.h>
 
 using namespace rut;
@@ -525,6 +526,44 @@ TEST(serve_loader, reload_snapshot_rejects_import_symlink_escape) {
     error.clear();
     std::filesystem::create_symlink(
         std::filesystem::path(root).lexically_relative(dir), current, error);
+    REQUIRE_FALSE(error);
+    LoadedProgram program;
+    LoadError load_error;
+    CHECK_FALSE(load_rut_program_snapshot(current.c_str(), program, load_error));
+    program.destroy();
+}
+
+TEST(serve_loader, reload_snapshot_rejects_internal_import_symlink_alias) {
+    const std::string dir = "/tmp/rut_serve_loader_snapshot_alias";
+    const std::string version_dir = dir + "/releases/v1";
+    std::error_code error;
+    std::filesystem::remove_all(dir, error);
+    write_file(version_dir, "auth.rut", "func code() -> i32 => 200\n");
+    std::filesystem::create_symlink(
+        "auth.rut", std::filesystem::path(version_dir) / "alias.rut", error);
+    REQUIRE_FALSE(error);
+    const std::string root = write_file(
+        version_dir, "main.rut", "import \"alias.rut\"\nroute GET \"/\" { return code() }\n");
+    const auto current = std::filesystem::path(dir) / "current.rut";
+    std::filesystem::create_symlink(
+        std::filesystem::path(root).lexically_relative(dir), current, error);
+    REQUIRE_FALSE(error);
+    LoadedProgram program;
+    LoadError load_error;
+    CHECK_FALSE(load_rut_program_snapshot(current.c_str(), program, load_error));
+    program.destroy();
+}
+
+TEST(serve_loader, reload_snapshot_rejects_fifo_source_without_opening_it) {
+    const std::string dir = "/tmp/rut_serve_loader_snapshot_fifo";
+    std::error_code error;
+    std::filesystem::remove_all(dir, error);
+    std::filesystem::create_directories(dir, error);
+    REQUIRE_FALSE(error);
+    const auto fifo = std::filesystem::path(dir) / "version.rut";
+    REQUIRE_EQ(mkfifo(fifo.c_str(), 0600), 0);
+    const auto current = std::filesystem::path(dir) / "current.rut";
+    std::filesystem::create_symlink("version.rut", current, error);
     REQUIRE_FALSE(error);
     LoadedProgram program;
     LoadError load_error;

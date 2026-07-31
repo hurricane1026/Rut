@@ -130,6 +130,21 @@ bool ProcessReloadCoordinator::compatible(const RouteConfig& active,
         }
         if (previous == nullptr) continue;
 
+        // Without a persistent declaration id, changing the cardinality of a
+        // group of identical siblings cannot identify which bucket survived.
+        // Reject the ambiguous transition instead of remapping by position.
+        for (u32 oi = 0; oi < previous->rate_limit.count; oi++) {
+            u32 old_copies = 0;
+            u32 new_copies = 0;
+            for (u32 other = 0; other < previous->rate_limit.count; other++)
+                old_copies += same_rate_limit_policy(previous->rate_limit.rules[oi],
+                                                     previous->rate_limit.rules[other]);
+            for (u32 ni = 0; ni < next.rate_limit.count; ni++)
+                new_copies += same_rate_limit_policy(previous->rate_limit.rules[oi],
+                                                     next.rate_limit.rules[ni]);
+            if (old_copies != new_copies && (old_copies > 1 || new_copies > 1)) return false;
+        }
+
         bool old_used[kMaxRateLimitRules]{};
         bool new_used[kMaxRateLimitRules]{};
         // First preserve exact declarations independent of sibling order.
