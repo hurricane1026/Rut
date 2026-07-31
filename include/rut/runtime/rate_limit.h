@@ -25,21 +25,22 @@
 namespace rut {
 
 inline u64 migrate_rate_limit_tat(u64 tat,
+                                  u64 last_grant_us,
                                   u64 old_emit_us,
                                   u64 /*old_tau_us*/,
                                   u64 new_emit_us,
                                   u64 /*new_tau_us*/,
-                                  u64 activation_us) {
-    if (tat == 0 || old_emit_us == 0 || new_emit_us == 0) return 0;
-    // TAT may trail `activation_us` by as much as the old burst tolerance while
-    // the bucket is still conforming.  That interval is unused burst capacity,
-    // not consumed history.  Only virtual arrivals scheduled after activation
-    // are occupied tokens that must cross the policy boundary.
-    if (tat <= activation_us) return 0;
-    const u64 debt = tat - activation_us;
+                                  u64 /*activation_us*/) {
+    if (tat == 0 || last_grant_us == 0 || old_emit_us == 0 || new_emit_us == 0) return 0;
+    // Anchor the virtual arrivals at the last actual grant. Using the old burst
+    // floor turns unused capacity into debt, while anchoring at activation drops
+    // requests whose old cadence has elapsed but whose candidate cadence has
+    // not. The distance from the last grant to TAT is the occupied virtual
+    // arrival count represented by this bucket.
+    const u64 debt = tat > last_grant_us ? tat - last_grant_us : old_emit_us;
     const u64 used = debt / old_emit_us + (debt % old_emit_us != 0 ? 1 : 0);
-    if (used > (~u64{0} - activation_us) / new_emit_us) return ~u64{0};
-    return activation_us + used * new_emit_us;
+    if (used > (~u64{0} - last_grant_us) / new_emit_us) return ~u64{0};
+    return last_grant_us + used * new_emit_us;
 }
 
 // Per-shard limiter (one thread per shard → no atomics). Value-initialized to all
@@ -50,6 +51,7 @@ struct RateLimiter {
     struct Slot {
         u64 key;  // metering key (see rate_limit_key()); 0 = empty
         u64 tat;  // GCRA theoretical arrival time, in monotonic µs
+        u64 last_grant_us;
         u64 emit_us;
         u64 tau_us;
     };
@@ -71,10 +73,12 @@ struct RateLimiter {
         if (s.key != key) {  // collision / first use → empty bucket for this key
             s.key = key;
             s.tat = 0;
+            s.last_grant_us = 0;
             s.emit_us = emit_us;
             s.tau_us = tau_us;
         } else if (s.emit_us != emit_us || s.tau_us != tau_us) {
             s.tat = migrate_rate_limit_tat(s.tat,
+                                           s.last_grant_us,
                                            s.emit_us,
                                            s.tau_us,
                                            emit_us,
@@ -86,6 +90,7 @@ struct RateLimiter {
         if (now_us + tau_us < s.tat) return false;  // too early → throttle (429)
         const u64 kBase = (now_us > s.tat) ? now_us : s.tat;
         s.tat = kBase + emit_us;
+        s.last_grant_us = now_us;
         return true;
     }
 };
@@ -102,6 +107,7 @@ struct GlobalRateLimiter {
         std::atomic_flag lock = ATOMIC_FLAG_INIT;
         u64 key = 0;
         u64 tat = 0;
+        u64 last_grant_us = 0;
         u64 emit_us = 0;
         u64 tau_us = 0;
         u64 migration_time_us = 0;
@@ -112,6 +118,7 @@ struct GlobalRateLimiter {
         for (u32 i = 0; i < kSlots; i++) {
             slots[i].key = 0;
             slots[i].tat = 0;
+            slots[i].last_grant_us = 0;
             slots[i].emit_us = 0;
             slots[i].tau_us = 0;
             slots[i].migration_time_us = 0;
@@ -129,6 +136,7 @@ struct GlobalRateLimiter {
         if (slot.key == 0) {
             slot.key = key;
             slot.tat = 0;
+            slot.last_grant_us = 0;
             slot.emit_us = emit_us;
             slot.tau_us = tau_us;
             slot.migration_time_us = migration_time_us;
@@ -138,7 +146,7 @@ struct GlobalRateLimiter {
             // inheriting an unrelated looser cadence would bypass strict rules.
             slot.key = key;
             slot.tat = migrate_rate_limit_tat(
-                slot.tat, slot.emit_us, slot.tau_us, emit_us, tau_us, now_us);
+                slot.tat, slot.last_grant_us, slot.emit_us, slot.tau_us, emit_us, tau_us, now_us);
             slot.emit_us = emit_us;
             slot.tau_us = tau_us;
             slot.migration_time_us = migration_time_us;
@@ -149,6 +157,7 @@ struct GlobalRateLimiter {
             if (migration_time_us >= slot.migration_time_us) {
                 slot.tat =
                     migrate_rate_limit_tat(slot.tat,
+                                           slot.last_grant_us,
                                            slot.emit_us,
                                            slot.tau_us,
                                            emit_us,
@@ -167,6 +176,7 @@ struct GlobalRateLimiter {
         if (allowed) {
             const u64 base = now_us > slot.tat ? now_us : slot.tat;
             slot.tat = base > ~u64{0} - emit_us ? ~u64{0} : base + emit_us;
+            slot.last_grant_us = now_us;
         }
         slot.lock.clear(std::memory_order_release);
         return allowed;

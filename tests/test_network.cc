@@ -2798,6 +2798,18 @@ TEST(rate_limit, policy_migration_does_not_convert_idle_burst_to_debt) {
     CHECK(limiter.allow_key(key, 60000000, 0, 60001000, 1000));
 }
 
+TEST(rate_limit, policy_migration_retains_history_elapsed_under_old_cadence) {
+    using namespace rut;
+    RateLimiter limiter{};
+    const u64 key = 0xfeedbeef;
+    REQUIRE(limiter.allow_key(key, 600000, 99 * 600000, 1000));
+
+    // The old 0.6-second cadence has elapsed at activation, but the request is
+    // still inside the candidate's one-minute accounting horizon.
+    CHECK_FALSE(limiter.allow_key(key, 60000000, 0, 30001000, 30001000));
+    CHECK(limiter.allow_key(key, 60000000, 0, 60001000, 30001000));
+}
+
 TEST(global_rate_limit, token_bucket_shared) {
     using namespace rut;
     GlobalRateLimiter rl{};
