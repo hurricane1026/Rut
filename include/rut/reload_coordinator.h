@@ -67,6 +67,7 @@ private:
                                LoadedProgram& output,
                                LoadError& error,
                                jit::OptLevel opt);
+    static bool capture_source_version(void* context, char* out, u32 capacity, u32* out_len);
     bool all_shards_acknowledged(u64 generation) const;
 
     ControlPlaneMutationPort* mutation_ = nullptr;
@@ -81,6 +82,7 @@ private:
     void* loader_context_ = nullptr;
     ReloadCancellationCheck cancellation_check_ = nullptr;
     void* cancellation_context_ = nullptr;
+    bool default_loader_selected_ = false;
     ReloadRequest request_{};
     u64 old_generation_ = 0;
     LoadError last_load_error_{};

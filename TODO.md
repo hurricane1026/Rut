@@ -11,8 +11,8 @@ without accepting source forms that cannot be replayed or resumed faithfully.
 
 ### Control-plane builtins
 
-Connect the remaining declared `reload()` mutation surface to the process
-coordinator. Read-only snapshots are connected end to end. Timer-only
+Continue the remaining reload compatibility and source-snapshot hardening.
+Read-only snapshots are connected end to end. Timer-only
 `upstream.mark()` has source lowering and runtime support, but production
 activation remains deliberately gated until replay lowering emits the ordered
 attempt/result/version events required by the mutation contract.
@@ -29,9 +29,8 @@ deterministic harness fixture plus timer-only shard-pinned source lowering are
 connected. Generation-carrying shard publication, installation
 acknowledgements, and exact HTTP/1 request / suspended HTTP/2 stream program
 pins plus terminate-mode WebSocket session pins are connected. The process
-coordinator, compatibility validation, SIGHUP activation path, and process
-harness are connected. Route-only `reload()` lowering and its explicit CLI
-authority flag remain.
+coordinator, compatibility validation, SIGHUP activation path, process harness,
+and route-only `reload()` lowering with explicit CLI authority are connected.
 
 **Acceptance**:
 - Reload and upstream mutation define authorization, failure, and shard-ordering
@@ -102,6 +101,9 @@ implementation promise.
 
 ## Recently Completed
 
+- [x] Lower route-only `reload() -> bool` through HIR/MIR/RIR/JIT, gate its
+  authority behind `--allow-route-reload`, and connect its bounded admission
+  to the same process coordinator used by SIGHUP.
 - [x] One process reload coordinator compiles into a spare program, validates
   timer/Cache compatibility, publishes strict generations to every shard,
   waits for installation acknowledgements and exact old-program pins, reuses

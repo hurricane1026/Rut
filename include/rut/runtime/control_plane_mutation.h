@@ -71,9 +71,15 @@ struct ServerIdentity {
 };
 
 struct ReloadRequest {
+    static constexpr u32 kMaxSourceVersion = 1024;
+
     u64 id = 0;
     ReloadRequestSource source = ReloadRequestSource::Route;
+    u32 source_version_len = 0;
+    char source_version[kMaxSourceVersion]{};
 };
+
+using ReloadSourceVersionCapture = bool (*)(void* context, char* out, u32 capacity, u32* out_len);
 
 struct ReloadTerminalRecord {
     bool valid = false;
@@ -222,7 +228,20 @@ public:
         return active_generation_.load(std::memory_order_acquire);
     }
 
+    void set_reload_source_version_capture(ReloadSourceVersionCapture capture, void* context) {
+        source_version_capture_ = capture;
+        source_version_capture_context_ = context;
+    }
+
     [[nodiscard]] bool request_reload(ReloadRequestSource source, u64* request_id = nullptr) {
+        char source_version[ReloadRequest::kMaxSourceVersion]{};
+        u32 source_version_len = 0;
+        if (source_version_capture_ != nullptr &&
+            !source_version_capture_(source_version_capture_context_,
+                                     source_version,
+                                     ReloadRequest::kMaxSourceVersion,
+                                     &source_version_len))
+            return false;
         for (u32 round = 0; round < kMaxAdmissionAttempts; round++) {
             if (stopping_.load(std::memory_order_acquire) != 0) {
                 if (source == ReloadRequestSource::Signal) (void)publish_stopped_signal(request_id);
@@ -354,6 +373,8 @@ public:
                 unlock_terminal_publication();
                 const u64 desired = pack_reload(
                     ReloadAdmissionState::Pending, id, source, unpack_route_enabled(observed));
+                source_version_len_ = source_version_len;
+                for (u32 i = 0; i < source_version_len; i++) source_version_[i] = source_version[i];
                 const bool admitted = reload_word_.compare_exchange_strong(
                     observed, desired, std::memory_order_acq_rel, std::memory_order_acquire);
                 if (admitted) {
@@ -449,6 +470,10 @@ public:
         }
         out->id = unpack_request_id(desired);
         out->source = unpack_source(desired);
+        out->source_version_len = source_version_len_;
+        for (u32 i = 0; i < source_version_len_; i++) out->source_version[i] = source_version_[i];
+        if (source_version_len_ < ReloadRequest::kMaxSourceVersion)
+            out->source_version[source_version_len_] = '\0';
         return true;
     }
 
@@ -2487,6 +2512,10 @@ private:
     }
 
     std::atomic<u64> reload_word_{0};
+    ReloadSourceVersionCapture source_version_capture_ = nullptr;
+    void* source_version_capture_context_ = nullptr;
+    u32 source_version_len_ = 0;
+    char source_version_[ReloadRequest::kMaxSourceVersion]{};
     std::atomic<u64> event_counters_{0};
     std::atomic<u64> counter_exhaustion_generation_{0};
     std::atomic<u64> counter_exhaustion_frontier_{0};

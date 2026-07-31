@@ -402,6 +402,7 @@ inline bool marking_policy_operand_arity_valid(const rir::Instruction& inst) {
         case rir::Opcode::RespRemoveHeader:
         case rir::Opcode::RespCommitHeaders:
         case rir::Opcode::TimeNowMicros:
+        case rir::Opcode::ReloadRequest:
         case rir::Opcode::JsonReset:
         case rir::Opcode::JsonAppendRaw:
         case rir::Opcode::JsonAppendControlPlane:
@@ -684,6 +685,8 @@ inline bool marking_policy_instruction_types_valid(const rir::Function& fn,
             return result_kind(rir::TypeKind::StatusCode);
         case rir::Opcode::TimeNowMicros:
             return result_kind(rir::TypeKind::I64);
+        case rir::Opcode::ReloadRequest:
+            return result_kind(rir::TypeKind::Bool);
         case rir::Opcode::JsonCapture:
             return result_kind(rir::TypeKind::Str);
         case rir::Opcode::RespHeader:

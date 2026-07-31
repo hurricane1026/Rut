@@ -39971,6 +39971,62 @@ timer secondary, every: 5s, shard: 1 {
     CHECK(hir.error().detail.eq(lit("an upstream may be marked by only one pinned timer")));
 }
 
+TEST(frontend, reload_request_lowers_only_from_a_nullary_route_call) {
+    FrontendRirModule rir{};
+    REQUIRE(lower_src_to_rir(
+        "route POST \"/reload\" { guard reload() else { return 503 } return 202 }\n", rir));
+    REQUIRE_EQ(rir.module.func_count, 1u);
+    CHECK(function_has_op(rir.module.functions[0], rir::Opcode::ReloadRequest));
+    rir.destroy();
+
+    const char* invalid_sources[] = {
+        "route POST \"/reload\" { let accepted = reload(1) return 202 }\n",
+        "timer refresh, every: 5s { let accepted = reload() return 200 }\n",
+        "func request_reload() -> bool => reload()\n"
+        "route POST \"/reload\" { guard request_reload() else { return 503 } return 202 }\n",
+    };
+    for (const char* src : invalid_sources) {
+        auto lexed = lex(lit(src));
+        REQUIRE(lexed);
+        auto ast = parse_file_heap(lexed.value());
+        REQUIRE(ast);
+        auto hir = analyze_file_heap(ast.value());
+        REQUIRE_FALSE(hir.has_value());
+        CHECK(hir.error().detail.eq(lit("reload() is available only as a nullary route value")));
+    }
+}
+
+TEST(frontend, reload_request_rejects_reordered_or_discarded_effect_contexts) {
+    const char* invalid_sources[] = {
+        "route POST \"/reload\" { guard req.http11 else { return 401 } let accepted = reload() "
+        "return 202 }\n",
+        "route POST \"/reload\" { guard req.http11 && reload() else { return 401 } return 202 }\n",
+        "route POST \"/reload\" { guard any(true, reload()) else { return 503 } return 202 }\n",
+        "func ignore(value: bool) -> bool => true\n"
+        "route POST \"/reload\" { guard ignore(reload()) else { return 503 } return 202 }\n",
+    };
+    for (const char* src : invalid_sources) {
+        auto lexed = lex(lit(src));
+        REQUIRE(lexed);
+        auto ast = parse_file_heap(lexed.value());
+        REQUIRE(ast);
+        auto hir = analyze_file_heap(ast.value());
+        REQUIRE_FALSE(hir.has_value());
+    }
+}
+
+TEST(frontend, user_defined_reload_shadows_the_route_builtin) {
+    FrontendRirModule rir{};
+    REQUIRE(lower_src_to_rir(
+        "func reload() -> bool => true\n"
+        "route POST \"/reload\" { guard reload() else { return 503 } return 202 }\n",
+        rir));
+    REQUIRE(rir.module.func_count >= 1u);
+    for (u32 i = 0; i < rir.module.func_count; i++)
+        CHECK_FALSE(function_has_op(rir.module.functions[i], rir::Opcode::ReloadRequest));
+    rir.destroy();
+}
+
 TEST(frontend, upstream_mark_helper_is_rejected_in_conditional_pipe) {
     const char* src = R"rut(
 variant MarkResult { accepted(bool) }

@@ -496,6 +496,11 @@ TEST(RirPrinter, OpcodeNames) {
     print_opcode(buf, Opcode::YieldHttpGet);
     Str got2 = {buf.data, buf.len};
     CHECK(got2.eq(lit("yield.http_get")));
+
+    buf.len = 0;
+    print_opcode(buf, Opcode::ReloadRequest);
+    Str got3 = {buf.data, buf.len};
+    CHECK(got3.eq(lit("reload.request")));
 }
 
 TEST(RirPrinter, RespCommitBodyPrintsDirectOperand) {

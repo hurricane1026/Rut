@@ -243,6 +243,19 @@ bool capture_snapshot_file(const std::filesystem::path& source,
 
 bool load_rut_program_snapshot(
     const char* path, LoadedProgram& out, LoadError& err, jit::OptLevel opt, u64 max_source_bytes) {
+    char source_version[1024];
+    u32 source_version_len = 0;
+    if (!resolve_rut_program_source_version(
+            path, source_version, sizeof(source_version), &source_version_len))
+        return false;
+    return load_rut_program_source_version(source_version, out, err, opt, max_source_bytes);
+}
+
+bool load_rut_program_source_version(const char* source_version,
+                                     LoadedProgram& out,
+                                     LoadError& err,
+                                     jit::OptLevel opt,
+                                     u64 max_source_bytes) {
     err = LoadError{};
     err.stage = LoadStage::Read;
     char directory[] = "/tmp/rut-source-snapshot-XXXXXX";
@@ -252,18 +265,9 @@ bool load_rut_program_snapshot(
     std::vector<std::filesystem::path> captured;
     u64 used_bytes = 0;
     std::error_code error;
-    const auto absolute_requested = std::filesystem::absolute(path, error);
+    const auto absolute_source = std::filesystem::absolute(source_version, error);
     if (error) return false;
-    const auto requested = absolute_requested.lexically_normal();
-    const bool versioned_provider =
-        std::filesystem::is_symlink(std::filesystem::symlink_status(requested, error));
-    if (error || !versioned_provider) return false;
-    const auto target = std::filesystem::read_symlink(requested, error);
-    if (error) return false;
-    const std::filesystem::path selected = (requested.parent_path() / target).lexically_normal();
-    if (std::filesystem::is_symlink(std::filesystem::symlink_status(selected, error)) || error)
-        return false;
-    const auto source = std::filesystem::weakly_canonical(selected, error);
+    const auto source = std::filesystem::weakly_canonical(absolute_source, error);
     if (error) return false;
     const auto provider_root = source.parent_path();
     // Resolve the version handle exactly once. The provider owns the target
@@ -274,6 +278,29 @@ bool load_rut_program_snapshot(
         return false;
     const std::string captured_root = (snapshot.root / source.relative_path()).string();
     return load_rut_program(captured_root.c_str(), out, err, opt, max_source_bytes);
+}
+
+bool resolve_rut_program_source_version(const char* path, char* out, u32 capacity, u32* out_len) {
+    if (path == nullptr || out == nullptr || out_len == nullptr || capacity == 0) return false;
+    std::error_code error;
+    const auto absolute_requested = std::filesystem::absolute(path, error);
+    if (error) return false;
+    const auto requested = absolute_requested.lexically_normal();
+    if (!std::filesystem::is_symlink(std::filesystem::symlink_status(requested, error)) || error)
+        return false;
+    const auto target = std::filesystem::read_symlink(requested, error);
+    if (error) return false;
+    const auto selected = (requested.parent_path() / target).lexically_normal();
+    if (std::filesystem::is_symlink(std::filesystem::symlink_status(selected, error)) || error)
+        return false;
+    const auto canonical_version = std::filesystem::weakly_canonical(selected, error);
+    if (error) return false;
+    const std::string version = canonical_version.string();
+    if (version.size() >= capacity) return false;
+    __builtin_memcpy(out, version.data(), version.size());
+    out[version.size()] = '\0';
+    *out_len = static_cast<u32>(version.size());
+    return true;
 }
 
 bool load_rut_program(

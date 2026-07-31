@@ -139,6 +139,7 @@ static i32 run_shards(u16 port,
                       i32 access_log_level,
                       RouteConfig* route_config,
                       bool serve_metrics,
+                      bool allow_route_reload,
                       ServerReloadConfig* reload_config) {
     Shard<EventLoopType> shards[kMaxShards];
     // Cross-shard metrics registry for snapshots and the optional built-in
@@ -154,12 +155,12 @@ static i32 run_shards(u16 port,
     // One process-shared per-upstream concurrency gauge (max-inflight limiting).
     static UpstreamConcurrency upstream_cc;
     upstream_cc.reset();
-    // One process-shared bounded mutation boundary. Source lowering is still
-    // gated, so route admission starts disabled; the follow-up that lowers
-    // reload() also owns the explicit CLI authority flag.
+    // One process-shared bounded mutation boundary. Route authority is explicit;
+    // SIGHUP remains available as the separate process-control channel.
     ControlPlaneMutationPort control_plane_mutation;
-    control_plane_mutation.reset(
-        route_config != nullptr ? route_config->config_generation : 1, false, route_config);
+    control_plane_mutation.reset(route_config != nullptr ? route_config->config_generation : 1,
+                                 allow_route_reload,
+                                 route_config);
 
     // Block process-control signals before publishing the listening state or
     // spawning threads. Threads inherit this mask and the control thread owns
@@ -405,6 +406,10 @@ static i32 run_shards(u16 port,
     write_u32(drain_secs);
     write_str("s)...\n");
 
+    // Close route admission before shards begin draining. A request already
+    // occupying the single slot remains owned by the coordinator below.
+    (void)control_plane_mutation.set_route_reload_enabled(false);
+
     // Begin graceful drain on all shards.
     // Each shard will: respond with Connection: close on new requests,
     // probabilistically close idle connections, and exit when empty or
@@ -463,6 +468,7 @@ int main(int argc, char** argv) {
     // Serve an aggregated Prometheus exposition at GET /metrics on the data
     // listener. Opt-in (internal metrics shouldn't be public by default).
     bool serve_metrics = false;
+    bool allow_route_reload = false;
     i32 access_log_level = AccessLogFlusher::kDefaultLevel;
     u32 opt_level = 2;  // JIT IR optimization level (0=low/fast-start .. 3=high)
 
@@ -562,6 +568,7 @@ int main(int argc, char** argv) {
         if (str_eq(argv[i], "--access-log-compress")) access_log_compress = true;
         if (str_eq(argv[i], "--h2")) offer_h2 = true;
         if (str_eq(argv[i], "--metrics")) serve_metrics = true;
+        if (str_eq(argv[i], "--allow-route-reload")) allow_route_reload = true;
         // Catch flags that require a value but appear as the last argument.
         if (i + 1 >= argc) {
             if (str_eq(argv[i], "--shards") || str_eq(argv[i], "--drain") ||
@@ -710,6 +717,7 @@ int main(int argc, char** argv) {
                                           access_log_level,
                                           route_config,
                                           serve_metrics,
+                                          allow_route_reload,
                                           &server_reload);
         if (rc != 0 && tls_server) {
             write_str("Backend: io_uring TLS startup failed; falling back to epoll (TLS)\n");
@@ -724,6 +732,7 @@ int main(int argc, char** argv) {
                                             access_log_level,
                                             route_config,
                                             serve_metrics,
+                                            allow_route_reload,
                                             &server_reload);
         }
     } else {
@@ -739,6 +748,7 @@ int main(int argc, char** argv) {
                                         access_log_level,
                                         route_config,
                                         serve_metrics,
+                                        allow_route_reload,
                                         &server_reload);
     }
     destroy_tls_server_context(tls_server);

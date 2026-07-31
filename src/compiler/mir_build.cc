@@ -270,6 +270,11 @@ static FrontendResult<MirValue> mir_value(const HirExpr& expr,
         v.bool_value = expr.bool_value;
         return v;
     }
+    if (expr.kind == HirExprKind::ReloadRequest) {
+        v.kind = MirValueKind::ReloadRequest;
+        v.type = MirTypeKind::Bool;
+        return v;
+    }
     if (expr.kind == HirExprKind::IntLit || expr.kind == HirExprKind::ServerLit) {
         v.kind = MirValueKind::IntConst;
         v.type = mir_type_kind(expr.type);  // I32, I64, or opaque Server as I64

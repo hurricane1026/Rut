@@ -65,7 +65,23 @@ bool same_upstream_endpoints(const UpstreamTarget& lhs, const UpstreamTarget& rh
 
 bool ProcessReloadCoordinator::default_loader(
     void*, const char* source_path, LoadedProgram& output, LoadError& error, jit::OptLevel opt) {
-    return load_rut_program_snapshot(source_path, output, error, opt);
+    return load_rut_program_source_version(source_path, output, error, opt);
+}
+
+bool ProcessReloadCoordinator::capture_source_version(void* context,
+                                                      char* out,
+                                                      u32 capacity,
+                                                      u32* out_len) {
+    auto* coordinator = static_cast<ProcessReloadCoordinator*>(context);
+    if (coordinator == nullptr) return false;
+    if (coordinator->default_loader_selected_)
+        return resolve_rut_program_source_version(
+            coordinator->source_path_, out, capacity, out_len);
+    const u32 len = static_cast<u32>(__builtin_strlen(coordinator->source_path_));
+    if (len >= capacity) return false;
+    __builtin_memcpy(out, coordinator->source_path_, len + 1);
+    *out_len = len;
+    return true;
 }
 
 bool ProcessReloadCoordinator::init(ControlPlaneMutationPort* mutation,
@@ -95,10 +111,12 @@ bool ProcessReloadCoordinator::init(ControlPlaneMutationPort* mutation,
     spare_ = spare;
     retired_ = nullptr;
     shard_count_ = shard_count;
+    default_loader_selected_ = loader == nullptr;
     loader_ = loader != nullptr ? loader : &default_loader;
     loader_context_ = loader_context;
     cancellation_check_ = cancellation_check;
     cancellation_context_ = cancellation_context;
+    mutation_->set_reload_source_version_capture(&capture_source_version, this);
     request_ = {};
     old_generation_ = 0;
     last_load_error_ = {};
@@ -268,7 +286,8 @@ ReloadCoordinatorPoll ProcessReloadCoordinator::poll() {
     old_generation_ = active_->config.config_generation;
     spare_->destroy();
     last_load_error_ = {};
-    if (!loader_(loader_context_, source_path_, *spare_, last_load_error_, opt_)) {
+    if (request.source_version_len == 0 ||
+        !loader_(loader_context_, request.source_version, *spare_, last_load_error_, opt_)) {
         spare_->destroy();
         (void)mutation_->complete_reload(
             request.id, request.source, ReloadTerminalOutcome::CompileFailed);

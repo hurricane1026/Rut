@@ -99,6 +99,15 @@ bool load_rut_program_snapshot(const char* path,
                                jit::OptLevel opt = jit::OptLevel::O2,
                                u64 max_source_bytes = ~u64{0});
 
+// Resolve the provider's immutable version handle without reading program
+// contents. The returned canonical path remains the identity of this request.
+bool resolve_rut_program_source_version(const char* path, char* out, u32 capacity, u32* out_len);
+bool load_rut_program_source_version(const char* source_version,
+                                     LoadedProgram& out,
+                                     LoadError& err,
+                                     jit::OptLevel opt = jit::OptLevel::O2,
+                                     u64 max_source_bytes = ~u64{0});
+
 // Publish the program's Cache descriptors as part of installing its
 // RouteConfig. Compilation alone never mutates the live Cache registry;
 // callers must invoke this at the config activation boundary. The current

@@ -334,6 +334,9 @@ void print_opcode(PrintBuf& buf, Opcode op) {
         case Opcode::CacheSet:
             buf.put_cstr("cache.set");
             break;
+        case Opcode::ReloadRequest:
+            buf.put_cstr("reload.request");
+            break;
         case Opcode::UpstreamMark:
             buf.put_cstr("upstream.mark");
             break;

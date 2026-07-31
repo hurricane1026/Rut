@@ -2655,6 +2655,11 @@ static FrontendResult<rir::ValueId> materialize_value(const MirValue& value,
         if (!out) return frontend_error(FrontendError::OutOfMemory, span);
         return out.value();
     }
+    if (value.kind == MirValueKind::ReloadRequest) {
+        auto out = b.emit_reload_request({span.line, span.col});
+        if (!out) return frontend_error(FrontendError::OutOfMemory, span);
+        return out.value();
+    }
     if (value.kind == MirValueKind::UpstreamMark) {
         auto server = materialize_value(*value.lhs,
                                         mir,

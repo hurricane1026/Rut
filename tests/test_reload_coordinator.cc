@@ -12,6 +12,7 @@ struct FakeLoader {
     i32 timer_shard = -1;
     bool change_firewall = false;
     u32 calls = 0;
+    char last_source[ReloadRequest::kMaxSourceVersion]{};
 };
 
 bool cancellation_requested(void* context) {
@@ -22,9 +23,13 @@ u64 timer_noop(void*, jit::HandlerCtx*, const u8*, u32, void*) {
     return 0;
 }
 
-bool load_fake(void* context, const char*, LoadedProgram& output, LoadError& error, jit::OptLevel) {
+bool load_fake(
+    void* context, const char* source, LoadedProgram& output, LoadError& error, jit::OptLevel) {
     auto& fake = *static_cast<FakeLoader*>(context);
     fake.calls++;
+    const u32 source_len = static_cast<u32>(__builtin_strlen(source));
+    if (source_len >= ReloadRequest::kMaxSourceVersion) return false;
+    __builtin_memcpy(fake.last_source, source, source_len + 1);
     if (!fake.succeed) {
         error.stage = LoadStage::Analyze;
         return false;
@@ -37,6 +42,19 @@ bool load_fake(void* context, const char*, LoadedProgram& output, LoadError& err
         !output.config.add_timer("tick", 4, 1000, &timer_noop, fake.timer_shard))
         return false;
     if (fake.change_firewall && !output.config.add_firewall_deny_ip("10.0.0.1")) return false;
+    return true;
+}
+
+struct MutableSourceVersion {
+    const char* current = nullptr;
+};
+
+bool capture_mutable_source_version(void* context, char* out, u32 capacity, u32* out_len) {
+    const char* current = static_cast<MutableSourceVersion*>(context)->current;
+    const u32 len = static_cast<u32>(__builtin_strlen(current));
+    if (len >= capacity) return false;
+    __builtin_memcpy(out, current, len + 1);
+    *out_len = len;
     return true;
 }
 
@@ -268,6 +286,18 @@ TEST(reload_coordinator, shutdown_after_compile_cancels_before_publication) {
     CHECK_EQ(mutation.last_record().outcome, ReloadTerminalOutcome::Stopped);
     active.destroy();
     spare.destroy();
+}
+
+TEST(reload_coordinator, request_keeps_its_admission_time_source_version) {
+    Fixture f;
+    REQUIRE(f.setup());
+    MutableSourceVersion source{"/versions/v1/app.rut"};
+    f.mutation.set_reload_source_version_capture(&capture_mutable_source_version, &source);
+    REQUIRE(f.mutation.request_reload(ReloadRequestSource::Route));
+    source.current = "/versions/v2/app.rut";
+    CHECK_EQ(f.coordinator.poll(), ReloadCoordinatorPoll::Published);
+    CHECK_EQ(__builtin_strcmp(f.loader.last_source, "/versions/v1/app.rut"), 0);
+    f.cleanup();
 }
 
 TEST(reload_coordinator, incompatible_cache_or_timer_is_rejected_before_publication) {
