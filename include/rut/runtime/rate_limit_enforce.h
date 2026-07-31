@@ -23,11 +23,16 @@ inline bool rate_limit_exceeded_with_limiters(RateLimiter& rate_limiter,
     for (u32 ri = 0; ri < rules.count; ri++) {
         const RateLimitRule& rule = rules.rules[ri];
         const u32 kScope = route_idx * kMaxRateLimitRules + ri;
-        const u64 kKey = rate_limit_key(kScope, rule.key.comps, rule.key.count, key_in);
         const u64 kNamespace = rule.identity != 0
                                    ? rule.identity
                                    : (config_generation << 32u) ^
                                          static_cast<u64>(route_idx * kMaxRateLimitRules + ri);
+        // A lowered rule identity already names the declaration independently
+        // of its current numeric route index. Keep the request-component hash
+        // index-free as well so route insertion/reordering cannot reset a
+        // compatible bucket. Legacy identity-less rules retain the old scope.
+        const u64 kKey =
+            rate_limit_key(rule.identity != 0 ? 0 : kScope, rule.key.comps, rule.key.count, key_in);
         const u64 kNamespacedKey =
             kKey ^ (kNamespace + 0x9e3779b97f4a7c15ull + (kKey << 6u) + (kKey >> 2u));
         const bool kOk = (rule.scope == RateLimitScope::Global && global_rate_limiter != nullptr)

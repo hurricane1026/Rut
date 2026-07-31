@@ -199,9 +199,11 @@ inline bool register_jit_routes(RouteConfig& cfg, const rir::Module& mod, jit::J
                 for (u32 byte = 0; byte < fn.route_pattern.len; byte++)
                     hash_byte(static_cast<u8>(fn.route_pattern.ptr[byte]));
                 hash_u32(ri);
-                hash_u32(rule.max);
-                hash_u32(rule.window_sec);
-                hash_u32(rule.burst);
+                // Policy parameters deliberately do not participate in the
+                // allocation identity. A compatible max/window/burst update
+                // reuses the predecessor TAT and evaluates it immediately with
+                // the candidate emit interval and tolerance instead of granting
+                // a fresh burst.
                 hash_byte(static_cast<u8>(rule.scope));
                 hash_byte(rule.key.count);
                 for (u32 ki = 0; ki < rule.key.count; ki++) {

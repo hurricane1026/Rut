@@ -2738,8 +2738,7 @@ TEST(rate_limit, token_bucket_gcra) {
 
 TEST(rate_limit, exceeded_helper_meters_and_isolates) {
     using namespace rut;
-    struct NoGlobalLoop {
-    } loop;  // no global_rl member → shard-only limiter
+    RateLimiter limiter{};
     RateLimitRuleSet rules;
     rules.count = 1;
     rules.rules[0].emit_interval_us = 10;
@@ -2752,21 +2751,24 @@ TEST(rate_limit, exceeded_helper_meters_and_isolates) {
 
     // No rules → never exceeded.
     RateLimitRuleSet none;
-    CHECK(!rate_limit_exceeded(&loop, none, 1, 0, in, 1000));
+    CHECK(!rate_limit_exceeded_with_limiters(limiter, nullptr, none, 1, 0, in, 1000));
 
     // Fresh bucket admits a burst of 3 at the same instant, then trips. This is
     // the shared logic the HTTP/1 and HTTP/2 dispatch paths both call.
-    CHECK(!rate_limit_exceeded(&loop, rules, 1, 0, in, 1000));
-    CHECK(!rate_limit_exceeded(&loop, rules, 1, 0, in, 1000));
-    CHECK(!rate_limit_exceeded(&loop, rules, 1, 0, in, 1000));
-    CHECK(rate_limit_exceeded(&loop, rules, 1, 0, in, 1000));  // 4th → over the burst
+    CHECK(!rate_limit_exceeded_with_limiters(limiter, nullptr, rules, 1, 0, in, 1000));
+    CHECK(!rate_limit_exceeded_with_limiters(limiter, nullptr, rules, 1, 0, in, 1000));
+    CHECK(!rate_limit_exceeded_with_limiters(limiter, nullptr, rules, 1, 0, in, 1000));
+    CHECK(rate_limit_exceeded_with_limiters(limiter, nullptr, rules, 1, 0, in, 1000));
 
-    // A different route index folds into a separate bucket scope.
-    CHECK(!rate_limit_exceeded(&loop, rules, 1, 1, in, 1000));
-    // An unchanged semantic identity preserves the bucket across generations.
-    CHECK(rate_limit_exceeded(&loop, rules, 2, 0, in, 1000));
+    // Stable identity preserves the bucket across route reordering, generation
+    // changes, and compatible policy updates. Tightening the burst evaluates
+    // the predecessor TAT under the candidate tolerance; it cannot reset state.
+    CHECK(rate_limit_exceeded_with_limiters(limiter, nullptr, rules, 1, 1, in, 1000));
+    CHECK(rate_limit_exceeded_with_limiters(limiter, nullptr, rules, 2, 0, in, 1000));
+    rules.rules[0].tau_us = 0;
+    CHECK(rate_limit_exceeded_with_limiters(limiter, nullptr, rules, 2, 0, in, 1000));
     rules.rules[0].identity = 0x5678;
-    CHECK(!rate_limit_exceeded(&loop, rules, 2, 0, in, 1000));
+    CHECK(!rate_limit_exceeded_with_limiters(limiter, nullptr, rules, 2, 0, in, 1000));
 }
 
 TEST(global_rate_limit, token_bucket_shared) {
