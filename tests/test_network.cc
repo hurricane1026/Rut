@@ -2810,6 +2810,19 @@ TEST(rate_limit, policy_migration_retains_history_elapsed_under_old_cadence) {
     CHECK(limiter.allow_key(key, 60000000, 0, 60001000, 30001000));
 }
 
+TEST(rate_limit, policy_migration_retains_multiple_recent_grants) {
+    using namespace rut;
+    RateLimiter limiter{};
+    const u64 key = 0xfeedbeef;
+    REQUIRE(limiter.allow_key(key, 600000, 0, 1000));
+    REQUIRE(limiter.allow_key(key, 600000, 0, 30001000));
+
+    // Both grants remain inside the candidate's one-minute accounting horizon.
+    CHECK_FALSE(limiter.allow_key(key, 60000000, 0, 30001000, 30001000));
+    CHECK_FALSE(limiter.allow_key(key, 60000000, 0, 90001000, 30001000));
+    CHECK(limiter.allow_key(key, 60000000, 0, 150001000, 30001000));
+}
+
 TEST(global_rate_limit, token_bucket_shared) {
     using namespace rut;
     GlobalRateLimiter rl{};
@@ -2862,7 +2875,7 @@ TEST(global_rate_limit, concurrent_updates_wait_for_the_slot_owner) {
     std::this_thread::sleep_for(std::chrono::milliseconds(5));
     slot.lock.clear(std::memory_order_release);
     waiter.join();
-    CHECK(allowed);
+    CHECK_FALSE(allowed);  // contended rejection must not busy-spin
 }
 
 TEST(global_rate_limit, colliding_keys_share_debt_instead_of_resetting) {

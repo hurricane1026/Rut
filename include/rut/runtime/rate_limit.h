@@ -25,35 +25,54 @@
 namespace rut {
 
 inline u64 migrate_rate_limit_tat(u64 tat,
-                                  u64 last_grant_us,
+                                  const u64* grants,
+                                  u32 grant_count,
+                                  bool history_overflow,
                                   u64 old_emit_us,
                                   u64 /*old_tau_us*/,
                                   u64 new_emit_us,
                                   u64 /*new_tau_us*/,
-                                  u64 /*activation_us*/) {
-    if (tat == 0 || last_grant_us == 0 || old_emit_us == 0 || new_emit_us == 0) return 0;
-    // Anchor the virtual arrivals at the last actual grant. Using the old burst
-    // floor turns unused capacity into debt, while anchoring at activation drops
-    // requests whose old cadence has elapsed but whose candidate cadence has
-    // not. The distance from the last grant to TAT is the occupied virtual
-    // arrival count represented by this bucket.
-    const u64 debt = tat > last_grant_us ? tat - last_grant_us : old_emit_us;
-    const u64 used = debt / old_emit_us + (debt % old_emit_us != 0 ? 1 : 0);
-    if (used > (~u64{0} - last_grant_us) / new_emit_us) return ~u64{0};
-    return last_grant_us + used * new_emit_us;
+                                  u64 activation_us,
+                                  u64 new_window_us) {
+    if (tat == 0 || grant_count == 0 || old_emit_us == 0 || new_emit_us == 0) return 0;
+    if (history_overflow) return ~u64{0};
+    const u64 horizon = new_window_us != 0 ? new_window_us : new_emit_us;
+    const u64 cutoff = activation_us > horizon ? activation_us - horizon : 0;
+    u64 ordered[32]{};
+    u32 count = 0;
+    for (u32 i = 0; i < grant_count && i < 32; i++) {
+        if (grants[i] < cutoff) continue;
+        u32 pos = count++;
+        while (pos > 0 && ordered[pos - 1] > grants[i]) {
+            ordered[pos] = ordered[pos - 1];
+            pos--;
+        }
+        ordered[pos] = grants[i];
+    }
+    u64 migrated = 0;
+    for (u32 i = 0; i < count; i++) {
+        const u64 base = ordered[i] > migrated ? ordered[i] : migrated;
+        if (new_emit_us > ~u64{0} - base) return ~u64{0};
+        migrated = base + new_emit_us;
+    }
+    return migrated;
 }
 
 // Per-shard limiter (one thread per shard → no atomics). Value-initialized to all
 // zeros, which reads as an empty/idle bucket for every key.
 struct RateLimiter {
-    static constexpr u32 kSlots = 8192;  // 16 B/slot → 128 KB per shard
+    static constexpr u32 kSlots = 8192;  // fixed direct-mapped table
+    static constexpr u32 kHistory = 32;
 
     struct Slot {
         u64 key;  // metering key (see rate_limit_key()); 0 = empty
         u64 tat;  // GCRA theoretical arrival time, in monotonic µs
-        u64 last_grant_us;
         u64 emit_us;
         u64 tau_us;
+        u64 window_us;
+        u64 grants[kHistory];
+        u32 grant_count;
+        bool history_overflow;
     };
     Slot slots[kSlots];
 
@@ -65,7 +84,12 @@ struct RateLimiter {
     // it conforms. `emit_us` = µs between tokens at the steady rate; `tau_us` =
     // burst tolerance in µs (both precomputed per rule from limit/window/burst).
     // `now_us` is a monotonic microsecond clock. emit_us == 0 disables the rule.
-    bool allow_key(u64 key, u64 emit_us, u64 tau_us, u64 now_us, u64 migration_time_us = 0) {
+    bool allow_key(u64 key,
+                   u64 emit_us,
+                   u64 tau_us,
+                   u64 now_us,
+                   u64 migration_time_us = 0,
+                   u64 window_us = 0) {
         if (emit_us == 0) return true;  // disabled
         u64 h = key * 0x9E3779B97F4A7C15ull;
         h ^= h >> 29;
@@ -73,24 +97,33 @@ struct RateLimiter {
         if (s.key != key) {  // collision / first use → empty bucket for this key
             s.key = key;
             s.tat = 0;
-            s.last_grant_us = 0;
             s.emit_us = emit_us;
             s.tau_us = tau_us;
-        } else if (s.emit_us != emit_us || s.tau_us != tau_us) {
+            s.window_us = window_us;
+            s.grant_count = 0;
+            s.history_overflow = false;
+        } else if (s.emit_us != emit_us || s.tau_us != tau_us || s.window_us != window_us) {
             s.tat = migrate_rate_limit_tat(s.tat,
-                                           s.last_grant_us,
+                                           s.grants,
+                                           s.grant_count,
+                                           s.history_overflow,
                                            s.emit_us,
                                            s.tau_us,
                                            emit_us,
                                            tau_us,
-                                           migration_time_us != 0 ? migration_time_us : now_us);
+                                           migration_time_us != 0 ? migration_time_us : now_us,
+                                           window_us);
             s.emit_us = emit_us;
             s.tau_us = tau_us;
+            s.window_us = window_us;
         }
         if (now_us + tau_us < s.tat) return false;  // too early → throttle (429)
         const u64 kBase = (now_us > s.tat) ? now_us : s.tat;
         s.tat = kBase + emit_us;
-        s.last_grant_us = now_us;
+        if (s.grant_count < kHistory)
+            s.grants[s.grant_count++] = now_us;
+        else
+            s.history_overflow = true;
         return true;
     }
 };
@@ -103,13 +136,17 @@ struct RateLimiter {
 // shards, including at a live-reload policy boundary.
 struct GlobalRateLimiter {
     static constexpr u32 kSlots = 8192;
+    static constexpr u32 kHistory = 32;
     struct Slot {
         std::atomic_flag lock = ATOMIC_FLAG_INIT;
         u64 key = 0;
         u64 tat = 0;
-        u64 last_grant_us = 0;
         u64 emit_us = 0;
         u64 tau_us = 0;
+        u64 window_us = 0;
+        u64 grants[kHistory] = {};
+        u32 grant_count = 0;
+        bool history_overflow = false;
         u64 migration_time_us = 0;
     };
     Slot slots[kSlots];
@@ -118,53 +155,76 @@ struct GlobalRateLimiter {
         for (u32 i = 0; i < kSlots; i++) {
             slots[i].key = 0;
             slots[i].tat = 0;
-            slots[i].last_grant_us = 0;
             slots[i].emit_us = 0;
             slots[i].tau_us = 0;
+            slots[i].window_us = 0;
+            slots[i].grant_count = 0;
+            slots[i].history_overflow = false;
             slots[i].migration_time_us = 0;
             slots[i].lock.clear(std::memory_order_relaxed);
         }
     }
 
-    bool allow_key(u64 key, u64 emit_us, u64 tau_us, u64 now_us, u64 migration_time_us = 0) {
+    bool allow_key(u64 key,
+                   u64 emit_us,
+                   u64 tau_us,
+                   u64 now_us,
+                   u64 migration_time_us = 0,
+                   u64 window_us = 0) {
         if (emit_us == 0) return true;  // disabled
         u64 h = key * 0x9E3779B97F4A7C15ull;
         h ^= h >> 29;
         Slot& slot = slots[h % kSlots];
-        while (slot.lock.test_and_set(std::memory_order_acquire)) {
-        }
+        // A rejected flood must not spin behind a hot key's cache line.
+        if (slot.lock.test_and_set(std::memory_order_acquire)) return false;
         if (slot.key == 0) {
             slot.key = key;
             slot.tat = 0;
-            slot.last_grant_us = 0;
             slot.emit_us = emit_us;
             slot.tau_us = tau_us;
+            slot.window_us = window_us;
+            slot.grant_count = 0;
+            slot.history_overflow = false;
             slot.migration_time_us = migration_time_us;
         } else if (slot.key != key) {
             // Direct-map collisions conservatively share the existing debt.
             // Translate its occupied-token count to this key's own policy;
             // inheriting an unrelated looser cadence would bypass strict rules.
             slot.key = key;
-            slot.tat = migrate_rate_limit_tat(
-                slot.tat, slot.last_grant_us, slot.emit_us, slot.tau_us, emit_us, tau_us, now_us);
+            slot.tat = migrate_rate_limit_tat(slot.tat,
+                                              slot.grants,
+                                              slot.grant_count,
+                                              slot.history_overflow,
+                                              slot.emit_us,
+                                              slot.tau_us,
+                                              emit_us,
+                                              tau_us,
+                                              now_us,
+                                              window_us);
             slot.emit_us = emit_us;
             slot.tau_us = tau_us;
+            slot.window_us = window_us;
             slot.migration_time_us = migration_time_us;
-        } else if (slot.emit_us != emit_us || slot.tau_us != tau_us) {
+        } else if (slot.emit_us != emit_us || slot.tau_us != tau_us ||
+                   slot.window_us != window_us) {
             // Shards adopt a generation independently. Only the candidate's
             // activation timestamp may advance shared policy metadata; a late
             // predecessor request must not migrate the slot back.
             if (migration_time_us >= slot.migration_time_us) {
                 slot.tat =
                     migrate_rate_limit_tat(slot.tat,
-                                           slot.last_grant_us,
+                                           slot.grants,
+                                           slot.grant_count,
+                                           slot.history_overflow,
                                            slot.emit_us,
                                            slot.tau_us,
                                            emit_us,
                                            tau_us,
-                                           migration_time_us != 0 ? migration_time_us : now_us);
+                                           migration_time_us != 0 ? migration_time_us : now_us,
+                                           window_us);
                 slot.emit_us = emit_us;
                 slot.tau_us = tau_us;
+                slot.window_us = window_us;
                 slot.migration_time_us = migration_time_us;
             }
         }
@@ -176,7 +236,10 @@ struct GlobalRateLimiter {
         if (allowed) {
             const u64 base = now_us > slot.tat ? now_us : slot.tat;
             slot.tat = base > ~u64{0} - emit_us ? ~u64{0} : base + emit_us;
-            slot.last_grant_us = now_us;
+            if (slot.grant_count < kHistory)
+                slot.grants[slot.grant_count++] = now_us;
+            else
+                slot.history_overflow = true;
         }
         slot.lock.clear(std::memory_order_release);
         return allowed;

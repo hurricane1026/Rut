@@ -40,12 +40,14 @@ inline bool rate_limit_exceeded_with_limiters(RateLimiter& rate_limiter,
                                                               rule.emit_interval_us,
                                                               rule.tau_us,
                                                               now_us,
-                                                              rule.migration_time_us)
+                                                              rule.migration_time_us,
+                                                              rule.window_us)
                              : rate_limiter.allow_key(kNamespacedKey,
                                                       rule.emit_interval_us,
                                                       rule.tau_us,
                                                       now_us,
-                                                      rule.migration_time_us);
+                                                      rule.migration_time_us,
+                                                      rule.window_us);
         if (!kOk) return true;
     }
     return false;
