@@ -4290,6 +4290,10 @@ static FrontendResult<HirExpr> analyze_bitwise_namespace_call(const AstExpr& exp
                 FrontendError::UnsupportedSyntax,
                 arg.span,
                 lit_str("upstream.mark cannot be projected through a tuple pipe"));
+        if (hir_expr_contains_reload_request(*pipe_lhs))
+            return frontend_error(FrontendError::UnsupportedSyntax,
+                                  arg.span,
+                                  lit_str("reload cannot be projected through a tuple pipe"));
         const u32 slot_index = static_cast<u32>(arg.int_value - 1);
         if (pipe_lhs->args.len == pipe_lhs->tuple_len && pipe_lhs->args[slot_index] != nullptr)
             return *pipe_lhs->args[slot_index];
@@ -10466,6 +10470,10 @@ static FrontendResult<HirExpr> analyze_call_expr(const AstExpr& expr,
                 FrontendError::UnsupportedSyntax,
                 arg.span,
                 lit_str("upstream.mark cannot be projected through a tuple pipe"));
+        if (hir_expr_contains_reload_request(*source))
+            return frontend_error(FrontendError::UnsupportedSyntax,
+                                  arg.span,
+                                  lit_str("reload cannot be projected through a tuple pipe"));
         const u32 slot_index = static_cast<u32>(arg.int_value - 1);
         if (source->args.len == source->tuple_len && source->args[slot_index] != nullptr)
             return *source->args[slot_index];
@@ -11270,6 +11278,10 @@ static FrontendResult<HirExpr> analyze_call_expr(const AstExpr& expr,
                 FrontendError::UnsupportedSyntax,
                 span,
                 lit_str("upstream.mark cannot be projected through a tuple pipe"));
+        if (hir_expr_contains_reload_request(source))
+            return frontend_error(FrontendError::UnsupportedSyntax,
+                                  span,
+                                  lit_str("reload cannot be projected through a tuple pipe"));
         const u32 slot_index = static_cast<u32>(slot - 1);
         if (source.args.len == source.tuple_len && source.args[slot_index] != nullptr)
             return *source.args[slot_index];
@@ -24468,6 +24480,8 @@ static FrontendResult<HirModule*> analyze_file_internal(
                 if (e.kind == HirExprKind::TimeNowMicros) return kTimeWaitDetail;
                 if (e.kind == HirExprKind::CacheGet || e.kind == HirExprKind::CacheSet)
                     return kCacheWaitDetail;
+                if (e.kind == HirExprKind::ReloadRequest)
+                    return lit_str("reload locals cannot be used in routes that wait");
                 return Str{};
             };
             const HirExpr* found = nullptr;

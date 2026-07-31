@@ -406,9 +406,20 @@ static i32 run_shards(u16 port,
     write_u32(drain_secs);
     write_str("s)...\n");
 
-    // Close route admission before shards begin draining. A request already
-    // occupying the single slot remains owned by the coordinator below.
-    (void)control_plane_mutation.set_route_reload_enabled(false);
+    bool mutation_stopped = false;
+#ifdef RUT_ENABLE_JIT
+    const bool finish_published_reload =
+        reload_enabled && reload_coordinator.waiting_for_activation();
+    if (reload_enabled && !finish_published_reload) {
+        // No generation has crossed publication. stop() closes route admission
+        // and terminalizes a Pending request before any shard can exit.
+        control_plane_mutation.stop();
+        mutation_stopped = true;
+    } else
+#endif
+    {
+        (void)control_plane_mutation.set_route_reload_enabled(false);
+    }
 
     // Begin graceful drain on all shards.
     // Each shard will: respond with Connection: close on new requests,
@@ -416,27 +427,34 @@ static i32 run_shards(u16 port,
     // when the drain deadline is reached.
     for (u32 i = 0; i < shard_count; i++) shards[i].drain(drain_secs);
 
-    // Wait for all shard threads to finish (they exit after drain completes).
-    for (u32 i = 0; i < shard_count; i++) shards[i].join();
-
 #ifdef RUT_ENABLE_JIT
-    // Joining proves there are no remaining request/stream/session pins. Give a
-    // published generation one final chance to retire cleanly before stopping
-    // the mutation port; process teardown remains safe even if a shard exited
-    // before consuming its pending pointer.
-    if (reload_enabled) {
-        const ReloadCoordinatorPoll kFinalReload = reload_coordinator.poll();
-        if (kFinalReload == ReloadCoordinatorPoll::Activated) {
+    // A published generation must be acknowledged and retired while shards are
+    // still alive. Draining releases its remaining program pins.
+    while (reload_enabled && reload_coordinator.waiting_for_activation()) {
+        const ReloadCoordinatorPoll result = reload_coordinator.poll();
+        if (result == ReloadCoordinatorPoll::Activated) {
             write_str("Reload activated during shutdown\n");
             write_reload_record(control_plane_mutation.last_record());
-        } else if (reload_coordinator.waiting_for_activation() &&
-                   reload_coordinator.finish_activation_for_shutdown()) {
+            break;
+        }
+        usleep(1000);
+    }
+    if (!mutation_stopped) {
+        control_plane_mutation.stop();
+        mutation_stopped = true;
+    }
+#endif
+
+    // Wait for all shard threads to finish (they exit after drain completes).
+    for (u32 i = 0; i < shard_count; i++) shards[i].join();
+    if (!mutation_stopped) {
+        if (reload_enabled && reload_coordinator.waiting_for_activation() &&
+            reload_coordinator.finish_activation_for_shutdown()) {
             write_str("Reload finalized during shutdown\n");
             write_reload_record(control_plane_mutation.last_record());
         }
+        control_plane_mutation.stop();
     }
-#endif
-    control_plane_mutation.stop();
 
     // Stop access log flusher (final flush of remaining entries).
     if (access_log_fd >= 0) {

@@ -40004,6 +40004,10 @@ TEST(frontend, reload_request_rejects_reordered_or_discarded_effect_contexts) {
         "route POST \"/reload\" { guard any(true, reload()) else { return 503 } return 202 }\n",
         "func ignore(value: bool) -> bool => true\n"
         "route POST \"/reload\" { guard ignore(reload()) else { return 503 } return 202 }\n",
+        "route POST \"/reload\" { guard (reload(), true) | identity(_2) else { return 503 } "
+        "return 202 }\n",
+        "route POST \"/reload\" { let accepted = reload() wait(1000) guard accepted else { "
+        "return 503 } return 202 }\n",
     };
     for (const char* src : invalid_sources) {
         auto lexed = lex(lit(src));
