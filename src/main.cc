@@ -418,7 +418,7 @@ static i32 run_shards(u16 port,
     } else
 #endif
     {
-        (void)control_plane_mutation.set_route_reload_enabled(false);
+        control_plane_mutation.close_route_reload_admission();
     }
 
     // Begin graceful drain on all shards.

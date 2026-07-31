@@ -212,6 +212,34 @@ public:
         return updated && stopping_.load(std::memory_order_acquire) == 0;
     }
 
+    // Permanently close route authority at a process shutdown boundary without
+    // cancelling an activation that has already crossed publication. Unlike the
+    // general capability setter, this must also work while the slot is
+    // Completing; finish_activation() preserves the cleared bit when it exposes
+    // Idle, so draining handlers cannot claim a new request in between
+    // activation completion and stop(). Signal admission remains available to
+    // the coordinator until stop() closes the entire mutation boundary.
+    void close_route_reload_admission() {
+        lock_terminal_publication();
+        u32 identity_open = kAdmissionOpen;
+        while (!admission_identity_claim_.compare_exchange_weak(identity_open,
+                                                                kAdmissionAuthorityClaimed,
+                                                                std::memory_order_acq_rel,
+                                                                std::memory_order_acquire)) {
+            identity_open = kAdmissionOpen;
+        }
+        u64 observed = reload_word_.load(std::memory_order_acquire);
+        for (;;) {
+            const u64 closed = with_route_enabled(observed, false);
+            if (closed == observed ||
+                reload_word_.compare_exchange_weak(
+                    observed, closed, std::memory_order_acq_rel, std::memory_order_acquire))
+                break;
+        }
+        admission_identity_claim_.store(kAdmissionOpen, std::memory_order_release);
+        unlock_terminal_publication();
+    }
+
     [[nodiscard]] bool route_reload_enabled() const {
         return unpack_route_enabled(reload_word_.load(std::memory_order_acquire));
     }

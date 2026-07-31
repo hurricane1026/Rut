@@ -1049,6 +1049,27 @@ TEST(control_plane_mutation, activation_retains_old_health_until_terminal_ack_bo
     CHECK_EQ(record.new_generation, 4u);
 }
 
+TEST(control_plane_mutation, shutdown_authority_stays_closed_after_activation_finishes) {
+    ControlPlaneMutationPort port;
+    RouteConfig old_config;
+    RouteConfig new_config;
+    port.reset(3, true, &old_config);
+    u64 id = 0;
+    REQUIRE(port.request_reload(ReloadRequestSource::Route, &id));
+    ReloadRequest request{};
+    REQUIRE(port.take_reload(&request));
+    REQUIRE(
+        port.complete_reload(id, request.source, ReloadTerminalOutcome::Activated, 4, &new_config));
+    REQUIRE_EQ(port.state(), ReloadAdmissionState::Completing);
+
+    port.close_route_reload_admission();
+    CHECK_FALSE(port.route_reload_enabled());
+    REQUIRE(port.finish_activation(id));
+    CHECK_EQ(port.state(), ReloadAdmissionState::Idle);
+    CHECK_FALSE(port.route_reload_enabled());
+    CHECK_FALSE(port.request_reload(ReloadRequestSource::Route));
+}
+
 TEST(control_plane_mutation, activation_carries_overrides_across_probe_policy_changes) {
     ControlPlaneMutationPort port;
     RouteConfig old_config;
