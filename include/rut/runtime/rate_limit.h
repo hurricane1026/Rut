@@ -2,6 +2,8 @@
 
 #include "rut/common/types.h"
 #include <atomic>
+#include <chrono>
+#include <thread>
 
 // Token-bucket rate limiter, implemented as GCRA (Generic Cell Rate Algorithm —
 // the "virtual scheduling" form of a token bucket). Instead of fractional tokens
@@ -35,8 +37,12 @@ inline u64 migrate_rate_limit_tat(u64 tat,
                                   u64 activation_us,
                                   u64 new_window_us) {
     if (tat == 0 || grant_count == 0 || old_emit_us == 0 || new_emit_us == 0) return 0;
-    if (history_overflow) return ~u64{0};
     const u64 horizon = new_window_us != 0 ? new_window_us : new_emit_us;
+    if (history_overflow) {
+        if (horizon > ~u64{0} - activation_us) return ~u64{0};
+        const u64 drain = activation_us + horizon;
+        return new_emit_us > ~u64{0} - drain ? ~u64{0} : drain + new_emit_us;
+    }
     const u64 cutoff = activation_us > horizon ? activation_us - horizon : 0;
     u64 ordered[32]{};
     u32 count = 0;
@@ -58,6 +64,22 @@ inline u64 migrate_rate_limit_tat(u64 tat,
     return migrated;
 }
 
+inline void record_rate_limit_grant(u64* grants,
+                                    u32& grant_count,
+                                    u32& grant_head,
+                                    bool& history_overflow,
+                                    u64 now_us,
+                                    u32 capacity) {
+    if (grant_count < capacity) {
+        grants[(grant_head + grant_count) % capacity] = now_us;
+        grant_count++;
+    } else {
+        grants[grant_head] = now_us;
+        grant_head = (grant_head + 1) % capacity;
+        history_overflow = true;
+    }
+}
+
 // Per-shard limiter (one thread per shard → no atomics). Value-initialized to all
 // zeros, which reads as an empty/idle bucket for every key.
 struct RateLimiter {
@@ -72,6 +94,7 @@ struct RateLimiter {
         u64 window_us;
         u64 grants[kHistory];
         u32 grant_count;
+        u32 grant_head;
         bool history_overflow;
     };
     Slot slots[kSlots];
@@ -101,6 +124,7 @@ struct RateLimiter {
             s.tau_us = tau_us;
             s.window_us = window_us;
             s.grant_count = 0;
+            s.grant_head = 0;
             s.history_overflow = false;
         } else if (s.emit_us != emit_us || s.tau_us != tau_us || s.window_us != window_us) {
             s.tat = migrate_rate_limit_tat(s.tat,
@@ -120,10 +144,8 @@ struct RateLimiter {
         if (now_us + tau_us < s.tat) return false;  // too early → throttle (429)
         const u64 kBase = (now_us > s.tat) ? now_us : s.tat;
         s.tat = kBase + emit_us;
-        if (s.grant_count < kHistory)
-            s.grants[s.grant_count++] = now_us;
-        else
-            s.history_overflow = true;
+        record_rate_limit_grant(
+            s.grants, s.grant_count, s.grant_head, s.history_overflow, now_us, kHistory);
         return true;
     }
 };
@@ -146,6 +168,7 @@ struct GlobalRateLimiter {
         u64 window_us = 0;
         u64 grants[kHistory] = {};
         u32 grant_count = 0;
+        u32 grant_head = 0;
         bool history_overflow = false;
         u64 migration_time_us = 0;
     };
@@ -159,6 +182,7 @@ struct GlobalRateLimiter {
             slots[i].tau_us = 0;
             slots[i].window_us = 0;
             slots[i].grant_count = 0;
+            slots[i].grant_head = 0;
             slots[i].history_overflow = false;
             slots[i].migration_time_us = 0;
             slots[i].lock.clear(std::memory_order_relaxed);
@@ -175,8 +199,17 @@ struct GlobalRateLimiter {
         u64 h = key * 0x9E3779B97F4A7C15ull;
         h ^= h >> 29;
         Slot& slot = slots[h % kSlots];
-        // A rejected flood must not spin behind a hot key's cache line.
-        if (slot.lock.test_and_set(std::memory_order_acquire)) return false;
+        // A rejected flood must not spin indefinitely behind a hot key's cache
+        // line, but brief contention must not turn conforming requests into 429s.
+        bool locked = false;
+        for (u32 attempt = 0; attempt < 128; attempt++) {
+            if (!slot.lock.test_and_set(std::memory_order_acquire)) {
+                locked = true;
+                break;
+            }
+            std::this_thread::sleep_for(std::chrono::microseconds(50));
+        }
+        if (!locked) return false;
         if (slot.key == 0) {
             slot.key = key;
             slot.tat = 0;
@@ -184,6 +217,7 @@ struct GlobalRateLimiter {
             slot.tau_us = tau_us;
             slot.window_us = window_us;
             slot.grant_count = 0;
+            slot.grant_head = 0;
             slot.history_overflow = false;
             slot.migration_time_us = migration_time_us;
         } else if (slot.key != key) {
@@ -236,10 +270,12 @@ struct GlobalRateLimiter {
         if (allowed) {
             const u64 base = now_us > slot.tat ? now_us : slot.tat;
             slot.tat = base > ~u64{0} - emit_us ? ~u64{0} : base + emit_us;
-            if (slot.grant_count < kHistory)
-                slot.grants[slot.grant_count++] = now_us;
-            else
-                slot.history_overflow = true;
+            record_rate_limit_grant(slot.grants,
+                                    slot.grant_count,
+                                    slot.grant_head,
+                                    slot.history_overflow,
+                                    now_us,
+                                    kHistory);
         }
         slot.lock.clear(std::memory_order_release);
         return allowed;

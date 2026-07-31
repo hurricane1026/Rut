@@ -2823,6 +2823,17 @@ TEST(rate_limit, policy_migration_retains_multiple_recent_grants) {
     CHECK(limiter.allow_key(key, 60000000, 0, 150001000, 30001000));
 }
 
+TEST(rate_limit, overflowing_history_eventually_drains_after_migration) {
+    using namespace rut;
+    RateLimiter limiter{};
+    const u64 key = 0xfeedbeef;
+    for (u32 i = 0; i < RateLimiter::kHistory + 1; i++)
+        REQUIRE(limiter.allow_key(key, 10, 1000, 1000));
+
+    CHECK_FALSE(limiter.allow_key(key, 100, 0, 1000, 1000, 1000));
+    CHECK(limiter.allow_key(key, 100, 0, 2100, 1000, 1000));
+}
+
 TEST(global_rate_limit, token_bucket_shared) {
     using namespace rut;
     GlobalRateLimiter rl{};
@@ -2875,7 +2886,7 @@ TEST(global_rate_limit, concurrent_updates_wait_for_the_slot_owner) {
     std::this_thread::sleep_for(std::chrono::milliseconds(5));
     slot.lock.clear(std::memory_order_release);
     waiter.join();
-    CHECK_FALSE(allowed);  // contended rejection must not busy-spin
+    CHECK(allowed);  // brief contention is retried without an unbounded spin
 }
 
 TEST(global_rate_limit, colliding_keys_share_debt_instead_of_resetting) {
