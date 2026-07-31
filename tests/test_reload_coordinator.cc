@@ -1,5 +1,7 @@
 #include "rut/reload_coordinator.h"
 #include "test.h"
+#include <filesystem>
+#include <fstream>
 
 using namespace rut;
 
@@ -298,6 +300,93 @@ TEST(reload_coordinator, request_keeps_its_admission_time_source_version) {
     CHECK_EQ(f.coordinator.poll(), ReloadCoordinatorPoll::Published);
     CHECK_EQ(__builtin_strcmp(f.loader.last_source, "/versions/v1/app.rut"), 0);
     f.cleanup();
+}
+
+TEST(reload_coordinator, default_source_snapshot_is_captured_by_the_winning_request) {
+    namespace fs = std::filesystem;
+    const fs::path root = "/tmp/rut_reload_coordinator_source_capture";
+    fs::remove_all(root);
+    fs::create_directories(root / "v1");
+    fs::create_directories(root / "v2");
+    std::ofstream(root / "v1" / "app.rut") << "route GET \"/\" { return 201 }\n";
+    std::ofstream(root / "v2" / "app.rut") << "route GET \"/\" { return 202 }\n";
+    fs::create_symlink(root / "v1" / "app.rut", root / "current.rut");
+    const std::string source_path = (root / "current.rut").string();
+
+    ControlPlaneMutationPort mutation;
+    mutation.reset(1, true);
+    LoadedProgram active;
+    LoadedProgram spare;
+    active.config.config_generation = 1;
+    active.config.program_pins = &active.pins;
+    ShardControlBlock control{};
+    control.acknowledged_generation.store(1, std::memory_order_relaxed);
+    ReloadShardEndpoint shard{&control};
+    std::string first_snapshot_root;
+    std::string second_snapshot_root;
+    {
+        ProcessReloadCoordinator coordinator;
+        // Initialization must remain valid even for ordinary regular paths;
+        // immutable provider resolution is deferred until a reload attempt.
+        REQUIRE(coordinator.init(
+            &mutation, source_path.c_str(), jit::OptLevel::O2, &active, &spare, &shard, 1));
+
+        fs::remove(root / "current.rut");
+        fs::create_symlink(root / "v2" / "app.rut", root / "current.rut");
+        REQUIRE(mutation.request_reload(ReloadRequestSource::Route));
+        ReloadRequest request{};
+        REQUIRE(mutation.take_reload(&request));
+        std::ifstream captured(request.source_version);
+        std::string contents((std::istreambuf_iterator<char>(captured)), {});
+        CHECK(contents.find("return 202") != std::string::npos);
+        first_snapshot_root = fs::path(request.source_version).parent_path();
+        REQUIRE(mutation.complete_reload(
+            request.id, request.source, ReloadTerminalOutcome::CompileFailed));
+
+        fs::remove(root / "current.rut");
+        fs::create_symlink(root / "v1" / "app.rut", root / "current.rut");
+        REQUIRE(mutation.request_reload(ReloadRequestSource::Route));
+        REQUIRE(mutation.take_reload(&request));
+        second_snapshot_root = fs::path(request.source_version).parent_path();
+        CHECK_FALSE(fs::exists(first_snapshot_root));
+        CHECK(fs::exists(second_snapshot_root));
+        REQUIRE(mutation.complete_reload(
+            request.id, request.source, ReloadTerminalOutcome::CompileFailed));
+    }
+    CHECK_FALSE(fs::exists(second_snapshot_root));
+
+    // The destroyed coordinator detached its callback; the surviving port does
+    // not call through freed coordinator state.
+    REQUIRE(mutation.request_reload(ReloadRequestSource::Route));
+    mutation.stop();
+    active.destroy();
+    spare.destroy();
+    fs::remove_all(root);
+}
+
+TEST(reload_coordinator, regular_source_path_does_not_fail_initialization) {
+    namespace fs = std::filesystem;
+    const fs::path root = "/tmp/rut_reload_coordinator_regular_source";
+    fs::remove_all(root);
+    fs::create_directories(root);
+    std::ofstream(root / "app.rut") << "route GET \"/\" { return 200 }\n";
+    const std::string source_path = (root / "app.rut").string();
+
+    ControlPlaneMutationPort mutation;
+    mutation.reset(1, false);
+    LoadedProgram active;
+    LoadedProgram spare;
+    active.config.config_generation = 1;
+    active.config.program_pins = &active.pins;
+    ShardControlBlock control{};
+    control.acknowledged_generation.store(1, std::memory_order_relaxed);
+    ReloadShardEndpoint shard{&control};
+    ProcessReloadCoordinator coordinator;
+    CHECK(coordinator.init(
+        &mutation, source_path.c_str(), jit::OptLevel::O2, &active, &spare, &shard, 1));
+    active.destroy();
+    spare.destroy();
+    fs::remove_all(root);
 }
 
 TEST(reload_coordinator, incompatible_cache_or_timer_is_rejected_before_publication) {

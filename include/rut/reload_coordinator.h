@@ -3,10 +3,7 @@
 #include "rut/runtime/control_plane_mutation.h"
 #include "rut/runtime/shard_control.h"
 #include "rut/serve_loader.h"
-#include <atomic>
-#include <memory>
 #include <string>
-#include <vector>
 
 namespace rut {
 
@@ -91,9 +88,8 @@ private:
     void* cancellation_context_ = nullptr;
     bool default_loader_selected_ = false;
     std::string cached_provider_version_;
-    std::atomic<const std::string*> cached_snapshot_source_{nullptr};
-    std::vector<std::unique_ptr<std::string>> source_snapshot_sources_;
-    std::vector<std::string> source_snapshot_roots_;
+    std::string cached_snapshot_source_;
+    std::string source_snapshot_root_;
     ReloadRequest request_{};
     u64 old_generation_ = 0;
     LoadError last_load_error_{};

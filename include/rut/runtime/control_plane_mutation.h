@@ -261,15 +261,14 @@ public:
         source_version_capture_context_ = context;
     }
 
+    void clear_reload_source_version_capture(ReloadSourceVersionCapture capture, void* context) {
+        if (source_version_capture_ == capture && source_version_capture_context_ == context) {
+            source_version_capture_ = nullptr;
+            source_version_capture_context_ = nullptr;
+        }
+    }
+
     [[nodiscard]] bool request_reload(ReloadRequestSource source, u64* request_id = nullptr) {
-        char source_version[ReloadRequest::kMaxSourceVersion]{};
-        u32 source_version_len = 0;
-        if (source_version_capture_ != nullptr &&
-            !source_version_capture_(source_version_capture_context_,
-                                     source_version,
-                                     ReloadRequest::kMaxSourceVersion,
-                                     &source_version_len))
-            return false;
         for (u32 round = 0; round < kMaxAdmissionAttempts; round++) {
             if (stopping_.load(std::memory_order_acquire) != 0) {
                 if (source == ReloadRequestSource::Signal) (void)publish_stopped_signal(request_id);
@@ -381,6 +380,21 @@ public:
                     unlock_terminal_publication();
                     observed = reload_word_.load(std::memory_order_acquire);
                     continue;
+                }
+                // Capture only after this caller owns the single admission
+                // slot. This lets a provider bind an immutable source snapshot
+                // to the winning request without doing work for Busy callers.
+                char source_version[ReloadRequest::kMaxSourceVersion]{};
+                u32 source_version_len = 0;
+                if (source_version_capture_ != nullptr &&
+                    !source_version_capture_(source_version_capture_context_,
+                                             source_version,
+                                             ReloadRequest::kMaxSourceVersion,
+                                             &source_version_len)) {
+                    release_request_identity_claim();
+                    unlock_terminal_publication();
+                    if (request_id != nullptr) *request_id = 0;
+                    return false;
                 }
                 ClaimedRecordSlot identity_slot{};
                 const u64 id = reserve_request_identity(&identity_slot);

@@ -70,17 +70,18 @@ bool ProcessReloadCoordinator::default_loader(
 }
 
 ProcessReloadCoordinator::~ProcessReloadCoordinator() {
+    if (mutation_ != nullptr)
+        mutation_->clear_reload_source_version_capture(&capture_source_version, this);
     clear_source_snapshots();
 }
 
 void ProcessReloadCoordinator::clear_source_snapshots() {
-    for (const auto& root : source_snapshot_roots_) {
+    if (!source_snapshot_root_.empty()) {
         std::error_code ignored;
-        std::filesystem::remove_all(root, ignored);
+        std::filesystem::remove_all(source_snapshot_root_, ignored);
     }
-    source_snapshot_roots_.clear();
-    cached_snapshot_source_.store(nullptr, std::memory_order_relaxed);
-    source_snapshot_sources_.clear();
+    source_snapshot_root_.clear();
+    cached_snapshot_source_.clear();
     cached_provider_version_.clear();
 }
 
@@ -105,10 +106,14 @@ bool ProcessReloadCoordinator::refresh_source_snapshot() {
                                                  sizeof(snapshot_root),
                                                  &root_len))
         return false;
-    source_snapshot_roots_.emplace_back(snapshot_root, root_len);
+    std::string previous_root = std::move(source_snapshot_root_);
+    source_snapshot_root_.assign(snapshot_root, root_len);
     cached_provider_version_.assign(version, version_len);
-    source_snapshot_sources_.push_back(std::make_unique<std::string>(snapshot_source, source_len));
-    cached_snapshot_source_.store(source_snapshot_sources_.back().get(), std::memory_order_release);
+    cached_snapshot_source_.assign(snapshot_source, source_len);
+    if (!previous_root.empty()) {
+        std::error_code ignored;
+        std::filesystem::remove_all(previous_root, ignored);
+    }
     return true;
 }
 
@@ -119,12 +124,13 @@ bool ProcessReloadCoordinator::capture_source_version(void* context,
     auto* coordinator = static_cast<ProcessReloadCoordinator*>(context);
     if (coordinator == nullptr) return false;
     if (coordinator->default_loader_selected_) {
-        const std::string* snapshot =
-            coordinator->cached_snapshot_source_.load(std::memory_order_acquire);
-        if (snapshot == nullptr) return false;
-        const u32 len = static_cast<u32>(snapshot->size());
+        // request_reload invokes capture only after reserving the single
+        // admission slot, so resolve and materialize the provider version that
+        // belongs to this request rather than a periodically refreshed cache.
+        if (!coordinator->refresh_source_snapshot()) return false;
+        const u32 len = static_cast<u32>(coordinator->cached_snapshot_source_.size());
         if (len == 0 || len >= capacity) return false;
-        __builtin_memcpy(out, snapshot->data(), len);
+        __builtin_memcpy(out, coordinator->cached_snapshot_source_.data(), len);
         out[len] = '\0';
         *out_len = len;
         return true;
@@ -156,6 +162,8 @@ bool ProcessReloadCoordinator::init(ControlPlaneMutationPort* mutation,
         if (shards[i].control == nullptr) return false;
         shards_[i] = shards[i];
     }
+    if (mutation_ != nullptr && mutation_ != mutation)
+        mutation_->clear_reload_source_version_capture(&capture_source_version, this);
     mutation_ = mutation;
     source_path_ = source_path;
     opt_ = opt;
@@ -169,7 +177,6 @@ bool ProcessReloadCoordinator::init(ControlPlaneMutationPort* mutation,
     cancellation_check_ = cancellation_check;
     cancellation_context_ = cancellation_context;
     clear_source_snapshots();
-    if (!refresh_source_snapshot()) return false;
     mutation_->set_reload_source_version_capture(&capture_source_version, this);
     request_ = {};
     old_generation_ = 0;
@@ -178,7 +185,7 @@ bool ProcessReloadCoordinator::init(ControlPlaneMutationPort* mutation,
 }
 
 bool ProcessReloadCoordinator::request_signal(u64* request_id) {
-    return mutation_ != nullptr && refresh_source_snapshot() &&
+    return mutation_ != nullptr &&
            mutation_->request_reload(ReloadRequestSource::Signal, request_id);
 }
 
@@ -335,10 +342,7 @@ ReloadCoordinatorPoll ProcessReloadCoordinator::poll() {
     }
 
     ReloadRequest request{};
-    if (!mutation_->take_reload(&request)) {
-        (void)refresh_source_snapshot();
-        return ReloadCoordinatorPoll::Idle;
-    }
+    if (!mutation_->take_reload(&request)) return ReloadCoordinatorPoll::Idle;
     request_ = request;
     old_generation_ = active_->config.config_generation;
     spare_->destroy();
