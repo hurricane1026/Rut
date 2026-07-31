@@ -98,6 +98,7 @@ struct GlobalRateLimiter {
         u64 tat = 0;
         u64 emit_us = 0;
         u64 tau_us = 0;
+        u64 migration_time_us = 0;
     };
     Slot slots[kSlots];
 
@@ -107,6 +108,7 @@ struct GlobalRateLimiter {
             slots[i].tat = 0;
             slots[i].emit_us = 0;
             slots[i].tau_us = 0;
+            slots[i].migration_time_us = 0;
             slots[i].lock.clear(std::memory_order_relaxed);
         }
     }
@@ -123,16 +125,28 @@ struct GlobalRateLimiter {
             slot.tat = 0;
             slot.emit_us = emit_us;
             slot.tau_us = tau_us;
+            slot.migration_time_us = migration_time_us;
         } else if (slot.emit_us != emit_us || slot.tau_us != tau_us) {
-            slot.tat = migrate_rate_limit_tat(slot.tat,
-                                              slot.emit_us,
-                                              slot.tau_us,
-                                              emit_us,
-                                              tau_us,
-                                              migration_time_us != 0 ? migration_time_us : now_us);
-            slot.emit_us = emit_us;
-            slot.tau_us = tau_us;
+            // Shards adopt a generation independently. Only the candidate's
+            // activation timestamp may advance shared policy metadata; a late
+            // predecessor request must not migrate the slot back.
+            if (migration_time_us >= slot.migration_time_us) {
+                slot.tat = migrate_rate_limit_tat(
+                    slot.tat,
+                    slot.emit_us,
+                    slot.tau_us,
+                    emit_us,
+                    tau_us,
+                    migration_time_us != 0 ? migration_time_us : now_us);
+                slot.emit_us = emit_us;
+                slot.tau_us = tau_us;
+                slot.migration_time_us = migration_time_us;
+            }
         }
+        // During cutover, predecessor requests use the already-installed
+        // candidate policy instead of oscillating the shared slot metadata.
+        emit_us = slot.emit_us;
+        tau_us = slot.tau_us;
         const bool allowed = now_us + tau_us >= slot.tat;
         if (allowed) {
             const u64 base = now_us > slot.tat ? now_us : slot.tat;

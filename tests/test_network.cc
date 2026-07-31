@@ -2797,6 +2797,23 @@ TEST(global_rate_limit, token_bucket_shared) {
     CHECK(rl.allow_key(kKey, 0, 0, 1000));          // emit==0 disables
 }
 
+TEST(global_rate_limit, policy_migration_is_not_reversed_by_predecessor_shards) {
+    using namespace rut;
+    GlobalRateLimiter rl{};
+    rl.reset();
+    const u64 key = 0xABCDEF12;
+    REQUIRE(rl.allow_key(key, 10, 0, 1000));
+
+    // The candidate migrates the occupied bucket to a slower policy at its
+    // activation boundary. A request from a shard still serving the predecessor
+    // must use that installed policy rather than converting the slot back.
+    CHECK_FALSE(rl.allow_key(key, 100, 0, 1000, 1000));
+    CHECK_FALSE(rl.allow_key(key, 10, 0, 1010, 0));
+    u64 hash = key * 0x9E3779B97F4A7C15ull;
+    hash ^= hash >> 29;
+    CHECK_EQ(rl.slots[hash % GlobalRateLimiter::kSlots].emit_us, 100u);
+}
+
 TEST(upstream_concurrency, gauge_acquire_release) {
     using namespace rut;
     UpstreamConcurrency cc{};
