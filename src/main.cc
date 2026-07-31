@@ -68,10 +68,7 @@ static void write_u64(u64 val) {
 static void write_reload_record(const ReloadTerminalRecord& record) {
     if (!record.valid) return;
     const char* source = record.source == ReloadRequestSource::Signal ? "signal" : "route";
-    const char* outcome = "activated";
-    if (record.outcome == ReloadTerminalOutcome::CompileFailed) outcome = "compile_failed";
-    if (record.outcome == ReloadTerminalOutcome::ValidationFailed) outcome = "validation_failed";
-    if (record.outcome == ReloadTerminalOutcome::Stopped) outcome = "stopped";
+    const char* outcome = reload_terminal_outcome_name(record.outcome);
     write_str("{\"event\":\"reload\",\"request_id\":");
     write_u64(record.request_id);
     write_str(",\"source\":\"");

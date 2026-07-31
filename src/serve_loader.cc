@@ -148,8 +148,8 @@ bool read_snapshot_source(const std::filesystem::path& path,
 
 bool capture_snapshot_file(const std::filesystem::path& source,
                            const std::filesystem::path& snapshot_root,
+                           const std::filesystem::path& provider_root,
                            std::vector<std::filesystem::path>& captured,
-                           std::vector<std::string>& captured_contents,
                            u64* used_bytes,
                            u64 max_source_bytes) {
     const auto normalized = std::filesystem::absolute(source).lexically_normal();
@@ -159,7 +159,6 @@ bool capture_snapshot_file(const std::filesystem::path& source,
     std::string content;
     if (!read_snapshot_source(normalized, content, used_bytes, max_source_bytes)) return false;
     captured.push_back(normalized);
-    captured_contents.push_back(content);
 
     const auto destination = snapshot_root / normalized.relative_path();
     std::error_code error;
@@ -183,15 +182,12 @@ bool capture_snapshot_file(const std::filesystem::path& source,
         if (item.kind != AstItemKind::Import) continue;
         std::string import_text(item.import_decl.path.ptr, item.import_decl.path.len);
         const std::filesystem::path import_path(import_text);
-        // Absolute imports would escape the private tree when the captured root
-        // is compiled. They are intentionally fail-closed for live reload.
         if (import_path.is_absolute()) return false;
-        if (!capture_snapshot_file(normalized.parent_path() / import_path,
-                                   snapshot_root,
-                                   captured,
-                                   captured_contents,
-                                   used_bytes,
-                                   max_source_bytes))
+        const auto imported = (normalized.parent_path() / import_path).lexically_normal();
+        const auto relative = imported.lexically_relative(provider_root);
+        if (relative.empty() || *relative.begin() == "..") return false;
+        if (!capture_snapshot_file(
+                imported, snapshot_root, provider_root, captured, used_bytes, max_source_bytes))
             return false;
     }
     return true;
@@ -208,21 +204,22 @@ bool load_rut_program_snapshot(
     if (created == nullptr) return false;
     SourceSnapshot snapshot{std::filesystem::path(created)};
     std::vector<std::filesystem::path> captured;
-    std::vector<std::string> captured_contents;
     u64 used_bytes = 0;
-    const auto source = std::filesystem::absolute(path).lexically_normal();
+    const auto requested = std::filesystem::absolute(path).lexically_normal();
+    std::error_code error;
+    const bool versioned_provider =
+        std::filesystem::is_symlink(std::filesystem::symlink_status(requested, error));
+    if (error || !versioned_provider) return false;
+    const auto target = std::filesystem::read_symlink(requested, error);
+    if (error) return false;
+    const std::filesystem::path source = (requested.parent_path() / target).lexically_normal();
+    const auto provider_root = source.parent_path();
+    // Resolve the version handle exactly once. The provider owns the target
+    // tree and must never mutate a published version; later symlink swaps cannot
+    // affect this request's source or import namespace.
     if (!capture_snapshot_file(
-            source, snapshot.root, captured, captured_contents, &used_bytes, max_source_bytes))
+            source, snapshot.root, provider_root, captured, &used_bytes, max_source_bytes))
         return false;
-    // Detect an in-place deployment racing the graph walk. Compilation still
-    // uses only the private copies; a later request can retry the stable tree.
-    for (size_t i = 0; i < captured.size(); i++) {
-        std::string verified;
-        u64 verification_bytes = 0;
-        if (!read_snapshot_source(captured[i], verified, &verification_bytes, ~u64{0}) ||
-            verified != captured_contents[i])
-            return false;
-    }
     const std::string captured_root = (snapshot.root / source.relative_path()).string();
     return load_rut_program(captured_root.c_str(), out, err, opt, max_source_bytes);
 }

@@ -427,17 +427,39 @@ TEST(serve_loader, import_resolves_relative_to_program) {
 
 TEST(serve_loader, reload_snapshot_captures_relative_import_graph) {
     const std::string dir = "/tmp/rut_serve_loader_snapshot_import";
-    write_file(dir, "auth.rut", "func jwtAuth() -> i32 => 200\n");
+    const std::string version_dir = dir + "/releases/v1";
+    write_file(version_dir, "auth.rut", "func jwtAuth() -> i32 => 200\n");
     const std::string path = write_file(
-        dir,
+        version_dir,
         "main.rut",
         "import \"auth.rut\"\n"
         "route GET \"/users\" { if jwtAuth() == 200 { return 200 } else { return 500 } }\n");
+    const std::string current = dir + "/current.rut";
+    std::error_code error;
+    std::filesystem::remove(current, error);
+    error.clear();
+    std::filesystem::create_symlink(
+        std::filesystem::path(path).lexically_relative(dir), current, error);
+    REQUIRE_FALSE(error);
 
     LoadedProgram program;
     LoadError err;
-    REQUIRE(load_rut_program_snapshot(path.c_str(), program, err));
+    REQUIRE(load_rut_program_snapshot(current.c_str(), program, err));
     CHECK_EQ(program.config.route_count, 1u);
+    program.destroy();
+}
+
+TEST(serve_loader, reload_snapshot_rejects_unversioned_import_graph) {
+    const std::string dir = "/tmp/rut_serve_loader_unversioned_import";
+    write_file(dir, "auth.rut", "func jwtAuth() -> i32 => 200\n");
+    const std::string path = write_file(dir,
+                                        "main.rut",
+                                        "import \"auth.rut\"\n"
+                                        "route GET \"/users\" { return jwtAuth() }\n");
+    LoadedProgram program;
+    LoadError err;
+    CHECK_FALSE(load_rut_program_snapshot(path.c_str(), program, err));
+    CHECK_EQ(err.stage, LoadStage::Read);
     program.destroy();
 }
 

@@ -2751,17 +2751,19 @@ TEST(rate_limit, exceeded_helper_meters_and_isolates) {
 
     // No rules → never exceeded.
     RateLimitRuleSet none;
-    CHECK(!rate_limit_exceeded(&loop, none, 0, in, 1000));
+    CHECK(!rate_limit_exceeded(&loop, none, 1, 0, in, 1000));
 
     // Fresh bucket admits a burst of 3 at the same instant, then trips. This is
     // the shared logic the HTTP/1 and HTTP/2 dispatch paths both call.
-    CHECK(!rate_limit_exceeded(&loop, rules, 0, in, 1000));
-    CHECK(!rate_limit_exceeded(&loop, rules, 0, in, 1000));
-    CHECK(!rate_limit_exceeded(&loop, rules, 0, in, 1000));
-    CHECK(rate_limit_exceeded(&loop, rules, 0, in, 1000));  // 4th → over the burst
+    CHECK(!rate_limit_exceeded(&loop, rules, 1, 0, in, 1000));
+    CHECK(!rate_limit_exceeded(&loop, rules, 1, 0, in, 1000));
+    CHECK(!rate_limit_exceeded(&loop, rules, 1, 0, in, 1000));
+    CHECK(rate_limit_exceeded(&loop, rules, 1, 0, in, 1000));  // 4th → over the burst
 
     // A different route index folds into a separate bucket scope.
-    CHECK(!rate_limit_exceeded(&loop, rules, 1, in, 1000));
+    CHECK(!rate_limit_exceeded(&loop, rules, 1, 1, in, 1000));
+    // A reload generation also receives a fresh namespace at the same indices.
+    CHECK(!rate_limit_exceeded(&loop, rules, 2, 0, in, 1000));
 }
 
 TEST(global_rate_limit, token_bucket_shared) {

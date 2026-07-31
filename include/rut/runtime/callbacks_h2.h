@@ -1246,7 +1246,12 @@ void h2_dispatch_request(H2Dispatch<Loop>& d,
         key_in.params = params;
         key_in.param_count = param_count;
         const u32 kRouteIdx = static_cast<u32>(route - config->routes);
-        if (rate_limit_exceeded(d.loop, route->rate_limit, kRouteIdx, key_in, monotonic_us())) {
+        if (rate_limit_exceeded(d.loop,
+                                route->rate_limit,
+                                config->config_generation,
+                                kRouteIdx,
+                                key_in,
+                                monotonic_us())) {
             h2_emit_status(d, stream_id, 429);
             return;
         }

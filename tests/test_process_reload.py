@@ -33,8 +33,13 @@ def main() -> int:
     with tempfile.TemporaryDirectory(prefix="rut-reload-") as tmp:
         root = Path(tmp)
         source = root / "app.rut"
+        releases = root / "releases"
+        releases.mkdir()
+        version1 = releases / "v1.rut"
+        version2 = releases / "v2.rut"
         log_path = root / "rut.log"
-        source.write_text('route GET "/" { return 200 }\n')
+        version1.write_text('route GET "/" { return 200 }\n')
+        source.symlink_to(version1.relative_to(root))
 
         with log_path.open("w+b") as log:
             process = subprocess.Popen(
@@ -45,7 +50,10 @@ def main() -> int:
             try:
                 wait_for(log_path, r"Listening on port [0-9]+", process)
 
-                source.write_text('route GET "/" { return 201 }\n')
+                version2.write_text('route GET "/" { return 201 }\n')
+                replacement = root / "app.next"
+                replacement.symlink_to(version2.relative_to(root))
+                os.replace(replacement, source)
                 os.kill(process.pid, signal.SIGHUP)
                 wait_for(log_path, r"Reload activated", process)
                 wait_for(

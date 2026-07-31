@@ -31,6 +31,28 @@ enum class ReloadTerminalOutcome : u8 {
     CounterExhausted,
 };
 
+constexpr const char* reload_terminal_outcome_name(ReloadTerminalOutcome outcome) {
+    switch (outcome) {
+        case ReloadTerminalOutcome::None:
+            return "none";
+        case ReloadTerminalOutcome::Activated:
+            return "activated";
+        case ReloadTerminalOutcome::CompileFailed:
+            return "compile_failed";
+        case ReloadTerminalOutcome::ValidationFailed:
+            return "validation_failed";
+        case ReloadTerminalOutcome::Busy:
+            return "busy";
+        case ReloadTerminalOutcome::Stopped:
+            return "stopped";
+        case ReloadTerminalOutcome::AdmissionContended:
+            return "admission_contended";
+        case ReloadTerminalOutcome::CounterExhausted:
+            return "counter_exhausted";
+    }
+    return "none";
+}
+
 enum class ManualHealthOverride : u8 {
     None = 0,
     Healthy,
