@@ -64,8 +64,8 @@ struct Shard {
     ShardMetrics shard_metrics{};
 
     // Route config — set before spawning threads, read-only during runtime.
-    // Phase 3 hot reload will use std::atomic store/load for
-    // cross-thread swap + epoch-based reclamation. Currently immutable.
+    // Live publication uses the control block; active_config changes only on
+    // the shard thread at a command boundary.
     const RouteConfig* route_config = nullptr;
 
     // Per-shard control block (control plane → shard thread).
@@ -149,6 +149,7 @@ struct Shard {
         control.pending_config.store(nullptr, std::memory_order_relaxed);
         control.pending_jit.store(nullptr, std::memory_order_relaxed);
         control.pending_capture.store(nullptr, std::memory_order_relaxed);
+        control.acknowledged_generation.store(0, std::memory_order_relaxed);
         epoch.epoch.store(0, std::memory_order_relaxed);
 
         // Wire control pointers into EventLoop for poll_command/epoch.
@@ -232,6 +233,9 @@ struct Shard {
         // Seed from route_config only if active_config wasn't already set
         // by a reload_config() call before spawn.
         if (!active_config) active_config = route_config;
+        control.acknowledged_generation.store(
+            active_config != nullptr ? active_config->config_generation : 0,
+            std::memory_order_release);
         if (thread_spawned)
             return core::make_unexpected(Error::make(EEXIST, Error::Source::Thread));
 
@@ -298,6 +302,8 @@ struct Shard {
             // empty pool, so an apply-before-spawn is harmless.
             active_config = cfg;
             if (upstream) upstream->drain();
+            control.acknowledged_generation.store(cfg != nullptr ? cfg->config_generation : 0,
+                                                  std::memory_order_release);
             return;
         }
         // Thread may be running or exiting. Queue atomically.
@@ -329,6 +335,8 @@ struct Shard {
                 // fd to a now-different (upstream_id, backend_idx).
                 active_config = cfg;
                 if (upstream) upstream->drain();
+                control.acknowledged_generation.store(cfg->config_generation,
+                                                      std::memory_order_release);
             }
             auto* jit = control.pending_jit.exchange(nullptr, std::memory_order_acq_rel);
             if (jit) jit_code = jit;
@@ -339,6 +347,10 @@ struct Shard {
                 if (loop) loop->set_capture(cap);
             }
         }
+    }
+
+    [[nodiscard]] u64 acknowledged_generation() const {
+        return control.acknowledged_generation.load(std::memory_order_acquire);
     }
 
     // Release all resources. Stops and joins thread if still running.

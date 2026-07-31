@@ -13502,6 +13502,36 @@ TEST(state_invariant, h2_proxy_timeout_tears_down_upstream_before_sending_504) {
     c->h2 = nullptr;
 }
 
+TEST(state_invariant, h2_async_epoch_retains_episode_pin_across_config_change) {
+    SmallLoop loop;
+    loop.setup();
+    Connection conn{};
+    conn.reset();
+    RouteConfig old_config{};
+    RouteConfig new_config{};
+    ProgramPinCounters old_pins{};
+    ProgramPinCounters new_pins{};
+    old_config.program_pins = &old_pins;
+    new_config.program_pins = &new_pins;
+
+    conn.request_config = &old_config;
+    h2_async_epoch_enter(&loop, conn);
+    CHECK(conn.epoch_held);
+    CHECK_EQ(old_pins.http2_streams.load(std::memory_order_acquire), 1u);
+    CHECK_EQ(new_pins.http2_streams.load(std::memory_order_acquire), 0u);
+
+    conn.request_config = &new_config;
+    h2_async_epoch_enter(&loop, conn);
+    CHECK(conn.epoch_held);
+    CHECK_EQ(conn.http2_program_pin_config, &old_config);
+    CHECK_EQ(old_pins.http2_streams.load(std::memory_order_acquire), 1u);
+    CHECK_EQ(new_pins.http2_streams.load(std::memory_order_acquire), 0u);
+
+    h2_async_epoch_leave(&loop, conn);
+    CHECK_FALSE(conn.epoch_held);
+    CHECK_EQ(old_pins.http2_streams.load(std::memory_order_acquire), 0u);
+}
+
 TEST(state_invariant, h2_followup_proxy_flush_releases_prior_capture) {
     SmallLoop loop;
     loop.setup();
@@ -13837,6 +13867,79 @@ TEST(state_invariant, response_sent_clears_stale_upstream_fd_on_keepalive) {
     CHECK_EQ(c->upstream_fd, -1);
     CHECK_EQ(c->state, ConnState::ReadingHeader);
     CHECK_SLOTS(c, &on_header_received<SmallLoop>, nullptr, nullptr, nullptr);
+}
+
+TEST(program_lifetime, http1_request_pin_releases_on_completion_and_abnormal_close) {
+    SmallLoop loop;
+    loop.setup();
+    RouteConfig cfg;
+    ProgramPinCounters pins;
+    cfg.program_pins = &pins;
+    REQUIRE(cfg.add_static("/x", kRouteMethodGet, 200));
+    const RouteConfig* active = &cfg;
+    loop.config_ptr = &active;
+
+    const auto start_request = [&]() -> Connection* {
+        loop.inject_and_dispatch(make_ev(0, IoEventType::Accept, 42));
+        auto* conn = loop.find_fd(42);
+        if (conn == nullptr) return nullptr;
+        static constexpr char kReq[] = "GET /x HTTP/1.1\r\nHost: example\r\n\r\n";
+        conn->recv_buf.write(reinterpret_cast<const u8*>(kReq), sizeof(kReq) - 1);
+        on_header_received<SmallLoop>(
+            &loop, *conn, make_ev(conn->id, IoEventType::Recv, sizeof(kReq) - 1));
+        return conn;
+    };
+
+    Connection* conn = start_request();
+    REQUIRE(conn != nullptr);
+    CHECK_EQ(pins.http1_requests.load(std::memory_order_acquire), 1u);
+    REQUIRE(conn->on_send == &on_response_sent<SmallLoop>);
+    loop.dispatch(make_ev(conn->id, IoEventType::Send, static_cast<i32>(conn->send_buf.len())));
+    CHECK_EQ(pins.http1_requests.load(std::memory_order_acquire), 0u);
+    loop.close_conn(*conn);
+
+    conn = start_request();
+    REQUIRE(conn != nullptr);
+    CHECK_EQ(pins.http1_requests.load(std::memory_order_acquire), 1u);
+    loop.close_conn(*conn);
+    CHECK_EQ(pins.http1_requests.load(std::memory_order_acquire), 0u);
+    CHECK(pins.empty());
+}
+
+TEST(program_lifetime, http2_async_stream_pin_is_idempotent_and_balanced) {
+    SmallLoop loop;
+    loop.setup();
+    RouteConfig cfg;
+    ProgramPinCounters pins;
+    cfg.program_pins = &pins;
+    Connection* conn = loop.alloc_conn();
+    REQUIRE(conn != nullptr);
+    conn->request_config = &cfg;
+
+    h2_async_epoch_enter(&loop, *conn);
+    h2_async_epoch_enter(&loop, *conn);
+    CHECK_EQ(pins.http2_streams.load(std::memory_order_acquire), 1u);
+    h2_async_epoch_leave(&loop, *conn);
+    h2_async_epoch_leave(&loop, *conn);
+    CHECK_EQ(pins.http2_streams.load(std::memory_order_acquire), 0u);
+    CHECK(pins.empty());
+}
+
+TEST(program_lifetime, terminate_websocket_session_pin_releases_only_on_close) {
+    SmallLoop loop;
+    loop.setup();
+    RouteConfig cfg;
+    ProgramPinCounters pins;
+    cfg.program_pins = &pins;
+    Connection* conn = loop.alloc_conn();
+    REQUIRE(conn != nullptr);
+
+    acquire_websocket_program_pin(&cfg);
+    conn->websocket_program_pin_config = &cfg;
+    CHECK_EQ(pins.websocket_sessions.load(std::memory_order_acquire), 1u);
+    loop.close_conn(*conn);
+    CHECK_EQ(pins.websocket_sessions.load(std::memory_order_acquire), 0u);
+    CHECK(pins.empty());
 }
 
 TEST(state_invariant, response_sent_clears_send_buf_before_downstream_send_wait) {

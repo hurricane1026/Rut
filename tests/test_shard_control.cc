@@ -78,6 +78,7 @@ TEST(shard_control, control_block_init_zero) {
     ShardControlBlock cb{};
     CHECK(cb.pending_config == nullptr);
     CHECK(cb.pending_jit == nullptr);
+    CHECK_EQ(cb.acknowledged_generation.load(std::memory_order_relaxed), 0u);
 }
 
 TEST(shard_control, control_block_config_write_read) {
@@ -150,6 +151,7 @@ TEST_F(RealLoopF, poll_command_reload) {
     ShardControlBlock cb{};
     RouteConfig cfg;
     cfg.route_count = 7;
+    cfg.config_generation = 19;
 
     self.loop->config_ptr = &active_config;
     self.loop->control = &cb;
@@ -159,6 +161,9 @@ TEST_F(RealLoopF, poll_command_reload) {
     CHECK(active_config == &cfg);
     CHECK_EQ(active_config->route_count, 7u);
     CHECK(cb.pending_config == nullptr);
+    CHECK_EQ(cb.acknowledged_generation.load(std::memory_order_acquire), 0u);
+    self.loop->acknowledge_active_generation();
+    CHECK_EQ(cb.acknowledged_generation.load(std::memory_order_acquire), 19u);
 }
 
 TEST_F(RealLoopF, poll_command_swap_jit) {
@@ -397,6 +402,7 @@ TEST(shard_control, reload_config_updates_ptr) {
     cfg1.route_count = 10;
     RouteConfig cfg2;
     cfg2.route_count = 20;
+    cfg2.config_generation = 2;
 
     const RouteConfig* active = &cfg1;
     ShardControlBlock cb{};
@@ -413,6 +419,37 @@ TEST(shard_control, reload_config_updates_ptr) {
     CHECK(active == &cfg2);
     CHECK_EQ(active->route_count, 20u);
     CHECK(cb.pending_config == nullptr);
+    CHECK_EQ(cb.acknowledged_generation.load(std::memory_order_acquire), 0u);
+    loop.acknowledge_active_generation();
+    CHECK_EQ(cb.acknowledged_generation.load(std::memory_order_acquire), 2u);
+}
+
+TEST(shard_control, activation_bookkeeping_detects_reused_config_address) {
+    SmallLoop loop;
+    loop.setup();
+    RouteConfig cfg{};
+    cfg.config_generation = 11;
+    const RouteConfig* active = &cfg;
+    ShardControlBlock cb{};
+    loop.config_ptr = &active;
+    loop.control = &cb;
+
+    loop.fire_due_timers();
+    REQUIRE(loop.arm_health_on_config_change());
+    CHECK_EQ(loop.timer_armed_generation, 11u);
+    CHECK_EQ(loop.health_armed_generation, 11u);
+
+    // Double-buffer reuse can reconstruct a later program at the same address.
+    cfg.config_generation = 12;
+    loop.fire_due_timers();
+    REQUIRE(loop.arm_health_on_config_change());
+    CHECK_EQ(loop.timer_armed_config, &cfg);
+    CHECK_EQ(loop.health_armed_config, &cfg);
+    CHECK_EQ(loop.timer_armed_generation, 12u);
+    CHECK_EQ(loop.health_armed_generation, 12u);
+
+    loop.acknowledge_active_generation();
+    CHECK_EQ(cb.acknowledged_generation.load(std::memory_order_acquire), 12u);
 }
 
 // === Command sequencing ===
@@ -585,8 +622,10 @@ TEST_F(RealLoopF, poll_command_without_jit_ptr) {
 TEST_F(ShardF, reload_before_spawn_applies_directly) {
     REQUIRE(self.ok);
     RouteConfig cfg;
+    cfg.config_generation = 7;
     self.shard.reload_config_unchecked(&cfg);
     CHECK_EQ(self.shard.active_config, &cfg);
+    CHECK_EQ(self.shard.acknowledged_generation(), 7u);
 }
 
 TEST_F(ShardF, swap_jit_before_spawn_applies_directly) {

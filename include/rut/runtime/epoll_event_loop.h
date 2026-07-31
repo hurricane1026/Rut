@@ -334,6 +334,7 @@ public:
             // until the next 1s sweep (#161 F4). No-op when unchanged; advances
             // health_armed_config so the later sweep doesn't double-reset.
             this->arm_health_on_config_change();
+            this->acknowledge_active_generation();
             if (draining_.load(std::memory_order_acquire)) {
                 close_listen();
                 // Empty the idle upstream pool on the SHARD thread (here), not in
@@ -638,6 +639,8 @@ public:
             backend.downstream_fd_map[c.id] = -1;
         }
         backend.clear_send_state(c.id);
+        release_health_probe_program_pin(c.request_config);
+        c.request_config = nullptr;
         this->free_conn(c);  // timer.remove + free slices + return slot (no metrics)
     }
 
@@ -653,6 +656,12 @@ public:
         // epoch_held covers a suspended HTTP/2 async (wait/proxy) stream pinning
         // the config epoch without an h1-style req_start_us (see event_loop.h).
         if (c.req_start_us != 0 || c.epoch_held) epoch_leave();
+        release_http1_program_pin(c.http1_program_pin_config);
+        release_http2_program_pin(c.http2_program_pin_config);
+        release_websocket_program_pin(c.websocket_program_pin_config);
+        c.http1_program_pin_config = nullptr;
+        c.http2_program_pin_config = nullptr;
+        c.websocket_program_pin_config = nullptr;
         c.epoch_held = false;
         // Release any held upstream concurrency slot (catch-all for failure /
         // non-keep-alive completion; the held flag makes a prior release a no-op).

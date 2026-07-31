@@ -157,7 +157,11 @@ undeclared fixtures are invalid runs. Handler-layer coverage may execute the
 same shard-pinned `upstream.mark` lowering and manual-health atomics as
 production. Its pointer-free `UpstreamServersView` pins the observed config
 generation, and selection scenarios apply the same manual-over-local health
-priority as production. Activation still requires the `Process` layer.
+priority as production. HTTP/1 requests, suspended HTTP/2 streams, and
+terminate-mode WebSocket sessions increment the same per-program lifetime
+counters as production, including abnormal-close release, while each shard
+acknowledges only the generation it installed at a command boundary. Activation
+still requires the `Process` layer.
 
 `stats()`/`metrics()` scenarios use the `ControlPlaneSnapshot` capability and
 must supply `ScenarioSpec::control_plane_snapshot`. The fixture is a bounded,

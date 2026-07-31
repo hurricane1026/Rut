@@ -85,7 +85,9 @@ struct SmallLoop : EventLoopCRTP<SmallLoop> {
     void poll_command() {
         if (!control) return;
         auto* cfg = control->pending_config.exchange(nullptr, std::memory_order_acq_rel);
-        if (cfg && config_ptr) *config_ptr = cfg;
+        if (cfg && config_ptr) {
+            *config_ptr = cfg;
+        }
         auto* jit = control->pending_jit.exchange(nullptr, std::memory_order_acq_rel);
         if (jit && jit_code_ptr) *jit_code_ptr = jit;
         auto* cap = control->pending_capture.exchange(nullptr, std::memory_order_acq_rel);
@@ -186,7 +188,14 @@ struct SmallLoop : EventLoopCRTP<SmallLoop> {
         return true;
     }
     void close_conn_impl(Connection& c) {
-        if (c.req_start_us != 0) epoch_leave();
+        if (c.req_start_us != 0 || c.epoch_held) epoch_leave();
+        release_http1_program_pin(c.http1_program_pin_config);
+        release_http2_program_pin(c.http2_program_pin_config);
+        release_websocket_program_pin(c.websocket_program_pin_config);
+        c.http1_program_pin_config = nullptr;
+        c.http2_program_pin_config = nullptr;
+        c.websocket_program_pin_config = nullptr;
+        c.epoch_held = false;
         // Mirror real EventLoop: cancel in-flight I/O before freeing.
         if (c.fd >= 0) {
             backend.cancel(c.fd, c.id);
@@ -613,7 +622,14 @@ struct AsyncSmallLoop : EventLoopCRTP<AsyncSmallLoop> {
     }
 
     void close_conn_impl(Connection& c) {
-        if (c.req_start_us != 0) epoch_leave();
+        if (c.req_start_us != 0 || c.epoch_held) epoch_leave();
+        release_http1_program_pin(c.http1_program_pin_config);
+        release_http2_program_pin(c.http2_program_pin_config);
+        release_websocket_program_pin(c.websocket_program_pin_config);
+        c.http1_program_pin_config = nullptr;
+        c.http2_program_pin_config = nullptr;
+        c.websocket_program_pin_config = nullptr;
+        c.epoch_held = false;
         if (c.pending_ops > 0) {
             c.pending_ops += backend.cancel(c.fd,
                                             c.id,
@@ -933,7 +949,14 @@ struct FailRecvAsyncSmallLoop : EventLoopCRTP<FailRecvAsyncSmallLoop> {
         return true;
     }
     void close_conn_impl(Connection& c) {
-        if (c.req_start_us != 0) epoch_leave();
+        if (c.req_start_us != 0 || c.epoch_held) epoch_leave();
+        release_http1_program_pin(c.http1_program_pin_config);
+        release_http2_program_pin(c.http2_program_pin_config);
+        release_websocket_program_pin(c.websocket_program_pin_config);
+        c.http1_program_pin_config = nullptr;
+        c.http2_program_pin_config = nullptr;
+        c.websocket_program_pin_config = nullptr;
+        c.epoch_held = false;
         c.fd = -1;
         c.upstream_fd = -1;
         this->free_conn(c);

@@ -237,6 +237,7 @@ public:
             // unchanged; advances health_armed_config so the later sweep doesn't
             // double-reset.
             this->arm_health_on_config_change();
+            this->acknowledge_active_generation();
             if (draining_.load(std::memory_order_acquire)) {
                 close_listen();
                 // Drain the idle upstream pool on the shard thread (NOT in drain(),
@@ -384,6 +385,8 @@ public:
         // recv drains, the deferred put_idle would slip a stale-config socket past
         // poll_command's pool drain — try_deferred_upstream_rearm closes on mismatch.
         c.idle_return_config = config_ptr ? *config_ptr : nullptr;
+        c.idle_return_generation =
+            c.idle_return_config != nullptr ? c.idle_return_config->config_generation : 0;
         c.upstream_fd = -1;
         c.upstream_send_armed = false;
     }
@@ -807,7 +810,10 @@ public:
             // A reload landed while the cancel drained: the pinned config no longer
             // matches the live one, so poll_command's pool drain already ran and this
             // fd's (uid, bidx) may now map to a different backend — close, don't pool.
-            const bool kConfigStale = !config_ptr || *config_ptr != c.idle_return_config;
+            const bool kConfigStale = !config_ptr || *config_ptr == nullptr ||
+                                      (*config_ptr)->config_generation != c.idle_return_generation;
+            c.idle_return_config = nullptr;
+            c.idle_return_generation = 0;
             // Stale bytes the backend wrote after the framed response were copied into
             // upstream_recv_buf while the cancel drained (on_upstream_recv was cleared,
             // so they were silently consumed off the socket). take_idle's MSG_PEEK can't
@@ -864,6 +870,12 @@ public:
         // epoch_held covers a suspended HTTP/2 async (wait/proxy) stream pinning
         // the config epoch without an h1-style req_start_us (see event_loop.h).
         if (c.req_start_us != 0 || c.epoch_held) epoch_leave();
+        release_http1_program_pin(c.http1_program_pin_config);
+        release_http2_program_pin(c.http2_program_pin_config);
+        release_websocket_program_pin(c.websocket_program_pin_config);
+        c.http1_program_pin_config = nullptr;
+        c.http2_program_pin_config = nullptr;
+        c.websocket_program_pin_config = nullptr;
         c.epoch_held = false;
         // Release any held upstream concurrency slot (catch-all; held flag makes a
         // prior release at completion a no-op).
@@ -946,7 +958,10 @@ public:
             // Same refusals as the deferred drain in try_deferred_upstream_rearm: a
             // config swap (poll_command drained the pool) or surplus bytes copied into
             // upstream_recv_buf both desync reuse — close rather than pool.
-            const bool kConfigStale = !config_ptr || *config_ptr != c.idle_return_config;
+            const bool kConfigStale = !config_ptr || *config_ptr == nullptr ||
+                                      (*config_ptr)->config_generation != c.idle_return_generation;
+            c.idle_return_config = nullptr;
+            c.idle_return_generation = 0;
             const bool kStaleBytes =
                 c.upstream_recv_buf.len() != 0 || c.upstream_recv_idle_stale_bytes;
             const bool kDraining = is_draining();

@@ -358,7 +358,10 @@ TEST(serve_loader, empty_program_loads_routeless) {
     LoadError err;
     REQUIRE(load_rut_program(path.c_str(), program, err));
     CHECK_EQ(program.config.route_count, 0u);
+    CHECK(program.config.program_pins == &program.pins);
+    CHECK(program.pins.empty());
     program.destroy();
+    CHECK(program.config.program_pins == nullptr);
 }
 
 TEST(serve_loader, cache_registry_changes_only_at_activation) {

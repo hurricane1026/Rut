@@ -149,13 +149,14 @@ struct ConnectionBase {
     i32 idle_return_fd;
     u16 idle_return_uid;
     u8 idle_return_bidx;
+    u64 idle_return_generation;
     // Active RouteConfig pinned when idle_return_fd was parked (return_idle_upstream).
     // A hot reload can land while the cancelled recv is still draining; poll_command
     // only drains sockets ALREADY in the pool, so the deferred fd would escape that
     // drain and later be put_idle'd into the freshly-drained pool under a now-stale
-    // (upstream_id, backend_idx). try_deferred_upstream_rearm compares this against the
-    // live config and CLOSES instead of pooling on mismatch. request_config can't be
-    // reused: the keep-alive client repoints it on its next request while this drains.
+    // (upstream_id, backend_idx). try_deferred_upstream_rearm compares the captured
+    // monotonic generation against the live config and CLOSES instead of pooling on
+    // mismatch, including when a LoadedProgram reuses this pointer address.
     const RouteConfig* idle_return_config;
     // io_uring-only deferred close: close_conn was called on a conn whose deferred
     // idle-pool return (idle_return_fd) had not yet drained its cancelled recv. Rather
@@ -351,6 +352,11 @@ struct ConnectionBase {
     // config hot-swap during wait(ms) can't resolve an upstream_id
     // against the post-swap config. Cleared by reset().
     const RouteConfig* request_config;
+    // Exact reload lifetime pins. The pointers are non-null only while the
+    // corresponding counter in RouteConfig::program_pins is held.
+    const RouteConfig* http1_program_pin_config;
+    const RouteConfig* http2_program_pin_config;
+    const RouteConfig* websocket_program_pin_config;
 
     // Per-connection timespec storage for IORING_OP_TIMEOUT yields. The
     // kernel reads this asynchronously after SQE submission, so it must
@@ -594,6 +600,7 @@ struct ConnectionBase {
         idle_return_fd = -1;
         idle_return_uid = 0;
         idle_return_bidx = 0;
+        idle_return_generation = 0;
         idle_return_config = nullptr;
         close_after_idle_return = false;
         is_health_probe = false;
@@ -652,6 +659,9 @@ struct ConnectionBase {
         // recycled reliably fails the generation match. It's
         // initialized at accept-time via EventLoop::alloc_conn_impl.
         request_config = nullptr;
+        http1_program_pin_config = nullptr;
+        http2_program_pin_config = nullptr;
+        websocket_program_pin_config = nullptr;
         pending_handler_fn = nullptr;
         yield_timespec.tv_sec = 0;
         yield_timespec.tv_nsec = 0;
