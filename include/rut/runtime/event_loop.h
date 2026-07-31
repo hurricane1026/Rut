@@ -175,6 +175,7 @@ public:
     // active config changes (incl. a hot reload swapping *config_ptr), so a new
     // timer set measures `every: D` from activation, not from stale deadlines.
     const RouteConfig* timer_armed_config = nullptr;
+    u64 timer_armed_generation = 0;
 
     // Fire any background timer whose interval has elapsed. Called from each
     // concrete loop's 1s keepalive tick (so timers run at ~1s granularity, slice 1)
@@ -190,8 +191,10 @@ public:
         // hot reload — so each timer's interval is measured from activation rather
         // than reusing the old config's deadlines (or a zero deadline for a newly
         // added slot, which would fire on the next tick instead of after `every`).
-        if (cfg != timer_armed_config) {
+        const u64 generation = cfg != nullptr ? cfg->config_generation : 0;
+        if (cfg != timer_armed_config || generation != timer_armed_generation) {
             timer_armed_config = cfg;
+            timer_armed_generation = generation;
             if (cfg != nullptr) {
                 const u32 m = cfg->timer_count < RouteConfig::kMaxTimers ? cfg->timer_count
                                                                          : RouteConfig::kMaxTimers;
@@ -235,6 +238,7 @@ public:
     // tear a probe Connection down. io_uring probing is a deliberate follow-up.
     u64 health_probe_deadline_ns[RouteConfig::kMaxUpstreams]{};
     const RouteConfig* health_armed_config = nullptr;
+    u64 health_armed_generation = 0;
     u32 health_probe_sweep_cursor = 0;
 
     // Detect a config swap (first install or hot reload) and, if so, reset the
@@ -259,8 +263,10 @@ public:
     bool arm_health_on_config_change() {
         const RouteConfig** cfg_ptr = self().config_ptr;
         const RouteConfig* cfg = cfg_ptr ? *cfg_ptr : nullptr;
-        if (cfg == health_armed_config) return false;
+        const u64 generation = cfg != nullptr ? cfg->config_generation : 0;
+        if (cfg == health_armed_config && generation == health_armed_generation) return false;
         health_armed_config = cfg;
+        health_armed_generation = generation;
         health_probe_sweep_cursor = 0;
         reset_backend_health();
         if (cfg != nullptr) {

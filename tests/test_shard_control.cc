@@ -424,6 +424,34 @@ TEST(shard_control, reload_config_updates_ptr) {
     CHECK_EQ(cb.acknowledged_generation.load(std::memory_order_acquire), 2u);
 }
 
+TEST(shard_control, activation_bookkeeping_detects_reused_config_address) {
+    SmallLoop loop;
+    loop.setup();
+    RouteConfig cfg{};
+    cfg.config_generation = 11;
+    const RouteConfig* active = &cfg;
+    ShardControlBlock cb{};
+    loop.config_ptr = &active;
+    loop.control = &cb;
+
+    loop.fire_due_timers();
+    REQUIRE(loop.arm_health_on_config_change());
+    CHECK_EQ(loop.timer_armed_generation, 11u);
+    CHECK_EQ(loop.health_armed_generation, 11u);
+
+    // Double-buffer reuse can reconstruct a later program at the same address.
+    cfg.config_generation = 12;
+    loop.fire_due_timers();
+    REQUIRE(loop.arm_health_on_config_change());
+    CHECK_EQ(loop.timer_armed_config, &cfg);
+    CHECK_EQ(loop.health_armed_config, &cfg);
+    CHECK_EQ(loop.timer_armed_generation, 12u);
+    CHECK_EQ(loop.health_armed_generation, 12u);
+
+    loop.acknowledge_active_generation();
+    CHECK_EQ(cb.acknowledged_generation.load(std::memory_order_acquire), 12u);
+}
+
 // === Command sequencing ===
 
 TEST(shard_control, sequential_commands) {
