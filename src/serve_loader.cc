@@ -177,6 +177,21 @@ bool read_snapshot_source(const std::filesystem::path& path,
     return true;
 }
 
+bool has_symlink_component(const std::filesystem::path& path,
+                           const std::filesystem::path& provider_root) {
+    const auto relative = path.lexically_relative(provider_root);
+    if (relative.empty() || *relative.begin() == "..") return true;
+    std::filesystem::path current = provider_root;
+    std::error_code error;
+    for (const auto& component : relative) {
+        if (component == ".") continue;
+        current /= component;
+        if (std::filesystem::is_symlink(std::filesystem::symlink_status(current, error)) || error)
+            return true;
+    }
+    return false;
+}
+
 bool capture_snapshot_file(const std::filesystem::path& source,
                            const std::filesystem::path& snapshot_root,
                            const std::filesystem::path& provider_root,
@@ -191,6 +206,7 @@ bool capture_snapshot_file(const std::filesystem::path& source,
     for (const auto& path : captured)
         if (path == normalized) return true;
 
+    if (has_symlink_component(normalized, provider_root)) return false;
     std::string content;
     if (!read_snapshot_source(normalized, content, used_bytes, max_source_bytes)) return false;
     captured.push_back(normalized);
@@ -227,12 +243,10 @@ bool capture_snapshot_file(const std::filesystem::path& source,
         const std::filesystem::path import_path(import_text);
         if (import_path.is_absolute()) return false;
         const auto imported = (normalized.parent_path() / import_path).lexically_normal();
-        if (std::filesystem::is_symlink(std::filesystem::symlink_status(imported, path_error)) ||
-            path_error)
-            return false;
         const auto resolved_import =
             std::filesystem::absolute(imported, path_error).lexically_normal();
         if (path_error) return false;
+        if (has_symlink_component(resolved_import, provider_root)) return false;
         const auto relative = resolved_import.lexically_relative(provider_root);
         if (relative.empty() || *relative.begin() == "..") return false;
         if (!capture_snapshot_file(resolved_import,

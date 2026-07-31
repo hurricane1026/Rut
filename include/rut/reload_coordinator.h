@@ -3,6 +3,7 @@
 #include "rut/runtime/control_plane_mutation.h"
 #include "rut/runtime/shard_control.h"
 #include "rut/serve_loader.h"
+#include <mutex>
 #include <string>
 
 namespace rut {
@@ -90,6 +91,7 @@ private:
     std::string cached_provider_version_;
     std::string cached_snapshot_source_;
     std::string source_snapshot_root_;
+    mutable std::mutex source_snapshot_mutex_;
     ReloadRequest request_{};
     u64 old_generation_ = 0;
     LoadError last_load_error_{};

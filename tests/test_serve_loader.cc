@@ -453,6 +453,31 @@ TEST(serve_loader, reload_snapshot_captures_relative_import_graph) {
     program.destroy();
 }
 
+TEST(serve_loader, reload_snapshot_rejects_symlinked_import_directory) {
+    const std::string dir = "/tmp/rut_serve_loader_snapshot_symlink_component";
+    const auto provider = std::filesystem::path(dir) / "releases/v1";
+    const auto outside = std::filesystem::path(dir) / "outside";
+    std::error_code error;
+    std::filesystem::remove_all(dir, error);
+    write_file(outside.string(), "route.rut", "func escaped() -> i32 => 200\n");
+    write_file(provider.string(),
+               "main.rut",
+               "import \"shared/route.rut\"\n"
+               "route GET \"/\" { return escaped() }\n");
+    std::filesystem::create_symlink(outside, provider / "shared", error);
+    REQUIRE_FALSE(error);
+    const auto current = std::filesystem::path(dir) / "current.rut";
+    std::filesystem::create_symlink(
+        std::filesystem::path(provider / "main.rut").lexically_relative(dir), current, error);
+    REQUIRE_FALSE(error);
+
+    LoadedProgram program;
+    LoadError load_error;
+    CHECK_FALSE(load_rut_program_snapshot(current.c_str(), program, load_error));
+    program.destroy();
+    std::filesystem::remove_all(dir, error);
+}
+
 TEST(serve_loader, materialized_source_handle_survives_provider_directory_replacement) {
     const std::string dir = "/tmp/rut_serve_loader_immutable_handle";
     const auto version_dir = std::filesystem::path(dir) / "releases/v1";

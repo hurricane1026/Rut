@@ -333,6 +333,7 @@ TEST(reload_coordinator, default_source_snapshot_is_captured_by_the_winning_requ
 
         fs::remove(root / "current.rut");
         fs::create_symlink(root / "v2" / "app.rut", root / "current.rut");
+        CHECK_EQ(coordinator.poll(), ReloadCoordinatorPoll::Idle);
         REQUIRE(mutation.request_reload(ReloadRequestSource::Route));
         ReloadRequest request{};
         REQUIRE(mutation.take_reload(&request));
@@ -345,6 +346,7 @@ TEST(reload_coordinator, default_source_snapshot_is_captured_by_the_winning_requ
 
         fs::remove(root / "current.rut");
         fs::create_symlink(root / "v1" / "app.rut", root / "current.rut");
+        CHECK_EQ(coordinator.poll(), ReloadCoordinatorPoll::Idle);
         REQUIRE(mutation.request_reload(ReloadRequestSource::Route));
         REQUIRE(mutation.take_reload(&request));
         second_snapshot_root = fs::path(request.source_version).parent_path();

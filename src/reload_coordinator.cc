@@ -76,13 +76,17 @@ ProcessReloadCoordinator::~ProcessReloadCoordinator() {
 }
 
 void ProcessReloadCoordinator::clear_source_snapshots() {
-    if (!source_snapshot_root_.empty()) {
-        std::error_code ignored;
-        std::filesystem::remove_all(source_snapshot_root_, ignored);
+    std::string previous_root;
+    {
+        std::lock_guard lock(source_snapshot_mutex_);
+        previous_root = std::move(source_snapshot_root_);
+        cached_snapshot_source_.clear();
+        cached_provider_version_.clear();
     }
-    source_snapshot_root_.clear();
-    cached_snapshot_source_.clear();
-    cached_provider_version_.clear();
+    if (!previous_root.empty()) {
+        std::error_code ignored;
+        std::filesystem::remove_all(previous_root, ignored);
+    }
 }
 
 bool ProcessReloadCoordinator::refresh_source_snapshot() {
@@ -91,9 +95,12 @@ bool ProcessReloadCoordinator::refresh_source_snapshot() {
     u32 version_len = 0;
     if (!resolve_rut_program_source_version(source_path_, version, sizeof(version), &version_len))
         return false;
-    if (cached_provider_version_.size() == version_len &&
-        __builtin_memcmp(cached_provider_version_.data(), version, version_len) == 0)
-        return true;
+    {
+        std::lock_guard lock(source_snapshot_mutex_);
+        if (cached_provider_version_.size() == version_len &&
+            __builtin_memcmp(cached_provider_version_.data(), version, version_len) == 0)
+            return true;
+    }
     char snapshot_source[ReloadRequest::kMaxSourceVersion]{};
     char snapshot_root[ReloadRequest::kMaxSourceVersion]{};
     u32 source_len = 0;
@@ -106,10 +113,19 @@ bool ProcessReloadCoordinator::refresh_source_snapshot() {
                                                  sizeof(snapshot_root),
                                                  &root_len))
         return false;
-    std::string previous_root = std::move(source_snapshot_root_);
-    source_snapshot_root_.assign(snapshot_root, root_len);
-    cached_provider_version_.assign(version, version_len);
-    cached_snapshot_source_.assign(snapshot_source, source_len);
+    std::string previous_root;
+    {
+        std::lock_guard lock(source_snapshot_mutex_);
+        if (cached_provider_version_.size() == version_len &&
+            __builtin_memcmp(cached_provider_version_.data(), version, version_len) == 0) {
+            previous_root.assign(snapshot_root, root_len);
+        } else {
+            previous_root = std::move(source_snapshot_root_);
+            source_snapshot_root_.assign(snapshot_root, root_len);
+            cached_provider_version_.assign(version, version_len);
+            cached_snapshot_source_.assign(snapshot_source, source_len);
+        }
+    }
     if (!previous_root.empty()) {
         std::error_code ignored;
         std::filesystem::remove_all(previous_root, ignored);
@@ -124,10 +140,9 @@ bool ProcessReloadCoordinator::capture_source_version(void* context,
     auto* coordinator = static_cast<ProcessReloadCoordinator*>(context);
     if (coordinator == nullptr) return false;
     if (coordinator->default_loader_selected_) {
-        // request_reload invokes capture only after reserving the single
-        // admission slot, so resolve and materialize the provider version that
-        // belongs to this request rather than a periodically refreshed cache.
-        if (!coordinator->refresh_source_snapshot()) return false;
+        // Snapshot materialization runs on the control thread. Admission only
+        // copies the already prepared immutable path under a short lock.
+        std::lock_guard lock(coordinator->source_snapshot_mutex_);
         const u32 len = static_cast<u32>(coordinator->cached_snapshot_source_.size());
         if (len == 0 || len >= capacity) return false;
         __builtin_memcpy(out, coordinator->cached_snapshot_source_.data(), len);
@@ -177,6 +192,7 @@ bool ProcessReloadCoordinator::init(ControlPlaneMutationPort* mutation,
     cancellation_check_ = cancellation_check;
     cancellation_context_ = cancellation_context;
     clear_source_snapshots();
+    if (default_loader_selected_) (void)refresh_source_snapshot();
     mutation_->set_reload_source_version_capture(&capture_source_version, this);
     request_ = {};
     old_generation_ = 0;
@@ -342,13 +358,27 @@ ReloadCoordinatorPoll ProcessReloadCoordinator::poll() {
     }
 
     ReloadRequest request{};
-    if (!mutation_->take_reload(&request)) return ReloadCoordinatorPoll::Idle;
+    if (!mutation_->take_reload(&request)) {
+        (void)refresh_source_snapshot();
+        return ReloadCoordinatorPoll::Idle;
+    }
     request_ = request;
     old_generation_ = active_->config.config_generation;
     spare_->destroy();
     last_load_error_ = {};
-    if (request.source_version_len == 0 ||
-        !loader_(loader_context_, request.source_version, *spare_, last_load_error_, opt_)) {
+    std::string source_for_load;
+    const char* source_path = request.source_version;
+    if (default_loader_selected_) {
+        if (!refresh_source_snapshot())
+            source_path = nullptr;
+        else {
+            std::lock_guard lock(source_snapshot_mutex_);
+            source_for_load = cached_snapshot_source_;
+            source_path = source_for_load.c_str();
+        }
+    }
+    if (source_path == nullptr || source_path[0] == '\0' ||
+        !loader_(loader_context_, source_path, *spare_, last_load_error_, opt_)) {
         spare_->destroy();
         (void)mutation_->complete_reload(
             request.id, request.source, ReloadTerminalOutcome::CompileFailed);
