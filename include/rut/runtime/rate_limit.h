@@ -25,15 +25,22 @@
 namespace rut {
 
 inline u64 migrate_rate_limit_tat(
-    u64 tat, u64 old_emit_us, u64 old_tau_us, u64 new_emit_us, u64 new_tau_us, u64 activation_us) {
+    u64 tat,
+    u64 old_emit_us,
+    u64 /*old_tau_us*/,
+    u64 new_emit_us,
+    u64 /*new_tau_us*/,
+    u64 activation_us) {
     if (tat == 0 || old_emit_us == 0 || new_emit_us == 0) return 0;
-    const u64 old_floor = activation_us > old_tau_us ? activation_us - old_tau_us : 0;
-    if (tat <= old_floor) return 0;
-    const u64 debt = tat - old_floor;
+    // TAT may trail `activation_us` by as much as the old burst tolerance while
+    // the bucket is still conforming.  That interval is unused burst capacity,
+    // not consumed history.  Only virtual arrivals scheduled after activation
+    // are occupied tokens that must cross the policy boundary.
+    if (tat <= activation_us) return 0;
+    const u64 debt = tat - activation_us;
     const u64 used = debt / old_emit_us + (debt % old_emit_us != 0 ? 1 : 0);
-    const u64 new_floor = activation_us > new_tau_us ? activation_us - new_tau_us : 0;
-    if (used > (~u64{0} - new_floor) / new_emit_us) return ~u64{0};
-    return new_floor + used * new_emit_us;
+    if (used > (~u64{0} - activation_us) / new_emit_us) return ~u64{0};
+    return activation_us + used * new_emit_us;
 }
 
 // Per-shard limiter (one thread per shard → no atomics). Value-initialized to all

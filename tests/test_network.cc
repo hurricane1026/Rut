@@ -2785,6 +2785,19 @@ TEST(rate_limit, policy_migration_preserves_occupancy_at_activation_time) {
     CHECK(limiter.allow_key(key, 60000000, 0, 60001000, 1000));
 }
 
+TEST(rate_limit, policy_migration_does_not_convert_idle_burst_to_debt) {
+    using namespace rut;
+    RateLimiter limiter{};
+    const u64 key = 0xfeedbeef;
+    // 100/minute with the default burst of 100. One request occupies one token;
+    // the remaining 99-token tolerance is available capacity, not debt.
+    REQUIRE(limiter.allow_key(key, 600000, 99 * 600000, 1000));
+
+    // Tightening to 1/minute, burst 1 preserves exactly that one occupied token.
+    CHECK_FALSE(limiter.allow_key(key, 60000000, 0, 60000999, 1000));
+    CHECK(limiter.allow_key(key, 60000000, 0, 60001000, 1000));
+}
+
 TEST(global_rate_limit, token_bucket_shared) {
     using namespace rut;
     GlobalRateLimiter rl{};
