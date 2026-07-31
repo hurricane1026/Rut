@@ -10408,6 +10408,30 @@ static bool hir_expr_contains_conditioned_upstream_mark(const HirExpr& expr,
     return false;
 }
 
+static bool hir_expr_contains_conditioned_reload_request(const HirExpr& expr,
+                                                         bool conditioned = false) {
+    if (expr.kind == HirExprKind::ReloadRequest && conditioned) return true;
+    const bool children_conditioned = conditioned || expr.kind == HirExprKind::IfElse;
+    const bool lhs_conditioned =
+        expr.kind == HirExprKind::IfElse ? conditioned : children_conditioned;
+    if (expr.lhs != nullptr &&
+        hir_expr_contains_conditioned_reload_request(*expr.lhs, lhs_conditioned))
+        return true;
+    if (expr.rhs != nullptr &&
+        hir_expr_contains_conditioned_reload_request(*expr.rhs, children_conditioned))
+        return true;
+    for (u32 i = 0; i < expr.args.len; i++)
+        if (expr.args[i] != nullptr &&
+            hir_expr_contains_conditioned_reload_request(*expr.args[i], children_conditioned))
+            return true;
+    for (u32 i = 0; i < expr.field_inits.len; i++)
+        if (expr.field_inits[i].value != nullptr &&
+            hir_expr_contains_conditioned_reload_request(*expr.field_inits[i].value,
+                                                         children_conditioned))
+            return true;
+    return false;
+}
+
 static FrontendResult<HirExpr> analyze_call_expr(const AstExpr& expr,
                                                  HirRoute* route,
                                                  const HirModule& mod,
@@ -14714,9 +14738,21 @@ static FrontendResult<void> analyze_control_stmt(const AstStatement& stmt,
             then_arm.direct_term.status_code = 500;
             then_arm.direct_term.span = stmt.then_stmt->span;
         } else {
+            const u32 branch_local_start = route->locals.len;
+            const u32 branch_expr_start = route->exprs.len;
             auto then_body = analyze_match_arm_body(
                 *stmt.then_stmt, &then_arm, route, mod, then_locals.data, then_locals.len, binding);
             if (!then_body) return core::make_unexpected(then_body.error());
+            for (u32 i = branch_local_start; i < route->locals.len; i++)
+                if (hir_expr_contains_reload_request(route->locals[i].init))
+                    return frontend_error(FrontendError::UnsupportedSyntax,
+                                          route->locals[i].init.span,
+                                          lit_str("reload cannot be conditionally evaluated"));
+            for (u32 i = branch_expr_start; i < route->exprs.len; i++)
+                if (hir_expr_contains_reload_request(route->exprs[i]))
+                    return frontend_error(FrontendError::UnsupportedSyntax,
+                                          route->exprs[i].span,
+                                          lit_str("reload cannot be conditionally evaluated"));
         }
         if (!route->control.match_arms.push(then_arm))
             return frontend_error(FrontendError::TooManyItems, stmt.then_stmt->span);
@@ -14735,9 +14771,21 @@ static FrontendResult<void> analyze_control_stmt(const AstStatement& stmt,
             else_arm.direct_term.status_code = 500;
             else_arm.direct_term.span = stmt.else_stmt->span;
         } else {
+            const u32 branch_local_start = route->locals.len;
+            const u32 branch_expr_start = route->exprs.len;
             auto else_body = analyze_match_arm_body(
                 *stmt.else_stmt, &else_arm, route, mod, locals, local_count, binding);
             if (!else_body) return core::make_unexpected(else_body.error());
+            for (u32 i = branch_local_start; i < route->locals.len; i++)
+                if (hir_expr_contains_reload_request(route->locals[i].init))
+                    return frontend_error(FrontendError::UnsupportedSyntax,
+                                          route->locals[i].init.span,
+                                          lit_str("reload cannot be conditionally evaluated"));
+            for (u32 i = branch_expr_start; i < route->exprs.len; i++)
+                if (hir_expr_contains_reload_request(route->exprs[i]))
+                    return frontend_error(FrontendError::UnsupportedSyntax,
+                                          route->exprs[i].span,
+                                          lit_str("reload cannot be conditionally evaluated"));
         }
         if (!route->control.match_arms.push(else_arm))
             return frontend_error(FrontendError::TooManyItems, stmt.else_stmt->span);
@@ -24464,6 +24512,22 @@ static FrontendResult<HirModule*> analyze_file_internal(
                     }
                 }
             }
+        }
+
+        auto reject_conditioned_reload = [](const HirExpr& expr) -> FrontendResult<void> {
+            if (hir_expr_contains_conditioned_reload_request(expr))
+                return frontend_error(FrontendError::UnsupportedSyntax,
+                                      expr.span,
+                                      lit_str("reload cannot be conditionally evaluated"));
+            return {};
+        };
+        for (u32 i = 0; i < route.exprs.len; i++) {
+            auto valid = reject_conditioned_reload(route.exprs[i]);
+            if (!valid) return core::make_unexpected(valid.error());
+        }
+        for (u32 i = 0; i < route.locals.len; i++) {
+            auto valid = reject_conditioned_reload(route.locals[i].init);
+            if (!valid) return core::make_unexpected(valid.error());
         }
 
         // Wait-route backstop: the creation-time gates (kTimeWaitDetail /

@@ -243,6 +243,8 @@ bool capture_snapshot_file(const std::filesystem::path& source,
 
 bool load_rut_program_snapshot(
     const char* path, LoadedProgram& out, LoadError& err, jit::OptLevel opt, u64 max_source_bytes) {
+    err = LoadError{};
+    err.stage = LoadStage::Read;
     char source_version[1024];
     u32 source_version_len = 0;
     if (!resolve_rut_program_source_version(

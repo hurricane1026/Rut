@@ -40008,6 +40008,8 @@ TEST(frontend, reload_request_rejects_reordered_or_discarded_effect_contexts) {
         "return 202 }\n",
         "route POST \"/reload\" { let accepted = reload() wait(1000) guard accepted else { "
         "return 503 } return 202 }\n",
+        "route POST \"/reload\" { if req.http11 { let accepted = reload() guard accepted else "
+        "{ return 503 } return 202 } else { return 503 } }\n",
     };
     for (const char* src : invalid_sources) {
         auto lexed = lex(lit(src));
