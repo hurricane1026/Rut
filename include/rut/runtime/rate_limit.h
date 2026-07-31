@@ -24,13 +24,12 @@
 // high-cardinality limiting.
 namespace rut {
 
-inline u64 migrate_rate_limit_tat(
-    u64 tat,
-    u64 old_emit_us,
-    u64 /*old_tau_us*/,
-    u64 new_emit_us,
-    u64 /*new_tau_us*/,
-    u64 activation_us) {
+inline u64 migrate_rate_limit_tat(u64 tat,
+                                  u64 old_emit_us,
+                                  u64 /*old_tau_us*/,
+                                  u64 new_emit_us,
+                                  u64 /*new_tau_us*/,
+                                  u64 activation_us) {
     if (tat == 0 || old_emit_us == 0 || new_emit_us == 0) return 0;
     // TAT may trail `activation_us` by as much as the old burst tolerance while
     // the bucket is still conforming.  That interval is unused burst capacity,
