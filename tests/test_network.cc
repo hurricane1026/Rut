@@ -2857,6 +2857,25 @@ TEST(global_rate_limit, colliding_keys_share_debt_instead_of_resetting) {
     CHECK_FALSE(rl.allow_key(first, 10, 0, 1000));
 }
 
+TEST(global_rate_limit, colliding_key_uses_its_own_stricter_policy) {
+    using namespace rut;
+    GlobalRateLimiter rl{};
+    rl.reset();
+    const u64 loose_key = 1;
+    auto slot_for = [](u64 key) {
+        u64 hash = key * 0x9E3779B97F4A7C15ull;
+        hash ^= hash >> 29;
+        return hash % GlobalRateLimiter::kSlots;
+    };
+    u64 strict_key = 2;
+    while (slot_for(strict_key) != slot_for(loose_key)) strict_key++;
+    REQUIRE(rl.allow_key(loose_key, 10, 0, 1000));
+    CHECK_FALSE(rl.allow_key(strict_key, 100, 0, 1000));
+    const auto& slot = rl.slots[slot_for(strict_key)];
+    CHECK_EQ(slot.emit_us, 100u);
+    CHECK_EQ(slot.tat, 1100u);
+}
+
 TEST(upstream_concurrency, gauge_acquire_release) {
     using namespace rut;
     UpstreamConcurrency cc{};

@@ -128,9 +128,14 @@ struct GlobalRateLimiter {
             slot.migration_time_us = migration_time_us;
         } else if (slot.key != key) {
             // Direct-map collisions conservatively share the existing debt.
-            // Replacing the key must never turn alternating colliders into a
-            // sequence of fresh buckets.
+            // Translate its occupied-token count to this key's own policy;
+            // inheriting an unrelated looser cadence would bypass strict rules.
             slot.key = key;
+            slot.tat = migrate_rate_limit_tat(
+                slot.tat, slot.emit_us, slot.tau_us, emit_us, tau_us, now_us);
+            slot.emit_us = emit_us;
+            slot.tau_us = tau_us;
+            slot.migration_time_us = migration_time_us;
         } else if (slot.emit_us != emit_us || slot.tau_us != tau_us) {
             // Shards adopt a generation independently. Only the candidate's
             // activation timestamp may advance shared policy metadata; a late
