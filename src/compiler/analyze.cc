@@ -11767,8 +11767,16 @@ static FrontendResult<HirExpr> analyze_call_expr(const AstExpr& expr,
             auto slot_expr = placeholder_slot_expr(
                 *placeholder_source, static_cast<i32>(arg_expr.int_value), arg_expr.span);
             if (!slot_expr) return core::make_unexpected(slot_expr.error());
+            if (hir_expr_contains_reload_request(slot_expr.value()))
+                return frontend_error(FrontendError::UnsupportedSyntax,
+                                      arg_expr.span,
+                                      lit_str("reload cannot be passed to a helper"));
             analyzed_args[param_index] = slot_expr.value();
         } else if (first_arg_override != nullptr && param_index == 0) {
+            if (hir_expr_contains_reload_request(*first_arg_override))
+                return frontend_error(FrontendError::UnsupportedSyntax,
+                                      arg_expr.span,
+                                      lit_str("reload cannot be passed to a helper"));
             analyzed_args[param_index] = *first_arg_override;
         } else {
             FrontendResult<HirExpr> arg = [&]() -> FrontendResult<HirExpr> {
