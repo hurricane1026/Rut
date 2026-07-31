@@ -120,12 +120,17 @@ struct GlobalRateLimiter {
         Slot& slot = slots[h % kSlots];
         while (slot.lock.test_and_set(std::memory_order_acquire)) {
         }
-        if (slot.key != key) {
+        if (slot.key == 0) {
             slot.key = key;
             slot.tat = 0;
             slot.emit_us = emit_us;
             slot.tau_us = tau_us;
             slot.migration_time_us = migration_time_us;
+        } else if (slot.key != key) {
+            // Direct-map collisions conservatively share the existing debt.
+            // Replacing the key must never turn alternating colliders into a
+            // sequence of fresh buckets.
+            slot.key = key;
         } else if (slot.emit_us != emit_us || slot.tau_us != tau_us) {
             // Shards adopt a generation independently. Only the candidate's
             // activation timestamp may advance shared policy metadata; a late

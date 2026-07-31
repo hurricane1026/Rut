@@ -2840,6 +2840,23 @@ TEST(global_rate_limit, concurrent_updates_wait_for_the_slot_owner) {
     CHECK(allowed);
 }
 
+TEST(global_rate_limit, colliding_keys_share_debt_instead_of_resetting) {
+    using namespace rut;
+    GlobalRateLimiter rl{};
+    rl.reset();
+    const u64 first = 1;
+    auto slot_for = [](u64 key) {
+        u64 hash = key * 0x9E3779B97F4A7C15ull;
+        hash ^= hash >> 29;
+        return hash % GlobalRateLimiter::kSlots;
+    };
+    u64 second = 2;
+    while (slot_for(second) != slot_for(first)) second++;
+    REQUIRE(rl.allow_key(first, 10, 0, 1000));
+    CHECK_FALSE(rl.allow_key(second, 10, 0, 1000));
+    CHECK_FALSE(rl.allow_key(first, 10, 0, 1000));
+}
+
 TEST(upstream_concurrency, gauge_acquire_release) {
     using namespace rut;
     UpstreamConcurrency cc{};

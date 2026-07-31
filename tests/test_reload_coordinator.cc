@@ -117,7 +117,7 @@ TEST(reload_coordinator, compatible_rate_limit_insertion_preserves_existing_rule
 
     REQUIRE(ProcessReloadCoordinator::compatible(active, candidate, 1));
     CHECK_EQ(candidate.routes[0].rate_limit.rules[1].identity, 0x111u);
-    CHECK_EQ(candidate.routes[0].rate_limit.rules[0].identity, 0x222u);
+    CHECK_NE(candidate.routes[0].rate_limit.rules[0].identity, 0x222u);
 }
 
 TEST(reload_coordinator, incompatible_rate_limit_key_or_scope_change_is_rejected) {
@@ -141,6 +141,16 @@ TEST(reload_coordinator, identical_sibling_count_change_is_rejected) {
     REQUIRE(active.add_route_rate_limit_rule(0, 10, 60, RateLimitScope::Shard, 10));
     REQUIRE(candidate.add_route_rate_limit_rule(0, 10, 60, RateLimitScope::Shard, 10));
     CHECK_FALSE(ProcessReloadCoordinator::compatible(active, candidate, 1));
+}
+
+TEST(reload_coordinator, reintroduced_rule_receives_fresh_identity) {
+    RouteConfig active;
+    RouteConfig candidate;
+    REQUIRE(candidate.add_static("/api", 0, 200));
+    REQUIRE(candidate.add_route_rate_limit_rule(0, 10, 60, RateLimitScope::Shard, 10));
+    const u64 provisional = candidate.routes[0].rate_limit.rules[0].identity;
+    REQUIRE(ProcessReloadCoordinator::compatible(active, candidate, 1));
+    CHECK_NE(candidate.routes[0].rate_limit.rules[0].identity, provisional);
 }
 
 TEST(reload_coordinator, changed_health_policy_requires_warming_support) {

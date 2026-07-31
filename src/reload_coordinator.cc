@@ -6,6 +6,15 @@ namespace rut {
 
 namespace {
 
+std::atomic<u64> next_rate_limit_incarnation{1};
+
+u64 fresh_rate_limit_identity(u64 provisional) {
+    const u64 incarnation = next_rate_limit_incarnation.fetch_add(1, std::memory_order_relaxed);
+    u64 identity = provisional ^ (incarnation * 0x9E3779B97F4A7C15ull);
+    identity ^= identity >> 29;
+    return identity != 0 ? identity : incarnation;
+}
+
 bool same_rate_limit_key_shape(const RateLimitRule& lhs, const RateLimitRule& rhs) {
     if (lhs.scope != rhs.scope || lhs.key.count != rhs.key.count) return false;
     for (u32 component = 0; component < lhs.key.count; component++) {
@@ -128,7 +137,12 @@ bool ProcessReloadCoordinator::compatible(const RouteConfig& active,
                 break;
             }
         }
-        if (previous == nullptr) continue;
+        if (previous == nullptr) {
+            for (u32 ni = 0; ni < next.rate_limit.count; ni++)
+                next.rate_limit.rules[ni].identity =
+                    fresh_rate_limit_identity(next.rate_limit.rules[ni].identity);
+            continue;
+        }
 
         // Without a persistent declaration id, changing the cardinality of a
         // group of identical siblings cannot identify which bucket survived.
@@ -196,6 +210,10 @@ bool ProcessReloadCoordinator::compatible(const RouteConfig& active,
         // which cannot safely receive a fresh bucket while predecessor history
         // is live.
         if (old_unmatched && new_unmatched) return false;
+        for (u32 ni = 0; ni < next.rate_limit.count; ni++)
+            if (!new_used[ni])
+                next.rate_limit.rules[ni].identity =
+                    fresh_rate_limit_identity(next.rate_limit.rules[ni].identity);
     }
     return true;
 }
