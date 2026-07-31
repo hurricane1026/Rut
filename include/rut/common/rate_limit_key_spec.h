@@ -71,6 +71,9 @@ enum class RateLimitScope : u8 {
 // per @rateLimit) — a request must pass them all (e.g. an anonymous per-IP cap
 // and a higher per-API-key cap coexist).
 struct RateLimitRule {
+    // Stable semantic identity assigned after route lowering. Compatible reloads
+    // reuse the same limiter bucket; changed routes/rules receive a new one.
+    u64 identity = 0;
     u32 max = 0;         // tokens per window (steady rate = max / window_sec)
     u32 window_sec = 0;  // refill window
     u32 burst = 0;       // bucket capacity; 0 in the spec means "default to max"

@@ -2745,6 +2745,7 @@ TEST(rate_limit, exceeded_helper_meters_and_isolates) {
     rules.rules[0].emit_interval_us = 10;
     rules.rules[0].tau_us = 20;  // burst capacity 3
     rules.rules[0].scope = RateLimitScope::Shard;
+    rules.rules[0].identity = 0x1234;
     rules.rules[0].key.count = 0;  // empty key → per-peer-IP
     RateLimitKeyInput in;
     in.peer_addr = 0x0100007F;
@@ -2762,7 +2763,9 @@ TEST(rate_limit, exceeded_helper_meters_and_isolates) {
 
     // A different route index folds into a separate bucket scope.
     CHECK(!rate_limit_exceeded(&loop, rules, 1, 1, in, 1000));
-    // A reload generation also receives a fresh namespace at the same indices.
+    // An unchanged semantic identity preserves the bucket across generations.
+    CHECK(rate_limit_exceeded(&loop, rules, 2, 0, in, 1000));
+    rules.rules[0].identity = 0x5678;
     CHECK(!rate_limit_exceeded(&loop, rules, 2, 0, in, 1000));
 }
 

@@ -396,6 +396,9 @@ static i32 run_shards(u16 port,
             } else if (result == ReloadCoordinatorPoll::Activated) {
                 write_str("Reload activated\n");
                 write_reload_record(control_plane_mutation.last_record());
+            } else if (result == ReloadCoordinatorPoll::Stopped) {
+                write_str("Reload cancelled by shutdown\n");
+                write_reload_record(control_plane_mutation.last_record());
             }
         }
 #endif

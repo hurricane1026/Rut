@@ -185,6 +185,33 @@ inline bool register_jit_routes(RouteConfig& cfg, const rir::Module& mod, jit::J
                     const RateLimitKeyComponent& kc = rule.key.comps[ki];
                     cfg.add_route_rate_limit_key(kRouteIdx, kc.kind, kc.name, kc.name_len);
                 }
+                u64 identity = 1469598103934665603ull;
+                auto hash_byte = [&](u8 value) {
+                    identity ^= value;
+                    identity *= 1099511628211ull;
+                };
+                auto hash_u32 = [&](u32 value) {
+                    for (u32 byte = 0; byte < 4; byte++)
+                        hash_byte(static_cast<u8>(value >> (byte * 8u)));
+                };
+                hash_byte(fn.http_method);
+                hash_u32(fn.route_pattern.len);
+                for (u32 byte = 0; byte < fn.route_pattern.len; byte++)
+                    hash_byte(static_cast<u8>(fn.route_pattern.ptr[byte]));
+                hash_u32(ri);
+                hash_u32(rule.max);
+                hash_u32(rule.window_sec);
+                hash_u32(rule.burst);
+                hash_byte(static_cast<u8>(rule.scope));
+                hash_byte(rule.key.count);
+                for (u32 ki = 0; ki < rule.key.count; ki++) {
+                    const auto& component = rule.key.comps[ki];
+                    hash_byte(static_cast<u8>(component.kind));
+                    hash_byte(component.name_len);
+                    for (u32 byte = 0; byte < component.name_len; byte++)
+                        hash_byte(static_cast<u8>(component.name[byte]));
+                }
+                cfg.routes[kRouteIdx].rate_limit.rules[ri].identity = identity;
             }
         }
         if (fn.throttle_down_bps > 0) {
