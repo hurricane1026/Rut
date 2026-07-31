@@ -15,6 +15,7 @@
 #include <linux/io_uring.h>
 #include <netinet/in.h>
 #include <signal.h>
+#include <stdio.h>
 #include <string.h>
 #include <sys/socket.h>
 #include <sys/syscall.h>
@@ -55,31 +56,23 @@ static void write_u32(u32 val) {
 }
 
 #ifdef RUT_ENABLE_JIT
-static void write_u64(u64 val) {
-    char buf[24];
-    i32 n = 0;
-    do {
-        buf[n++] = static_cast<char>('0' + val % 10);
-        val /= 10;
-    } while (val);
-    for (i32 i = n - 1; i >= 0; i--) (void)write(2, &buf[i], 1);
-}
-
 static void write_reload_record(const ReloadTerminalRecord& record) {
     if (!record.valid) return;
     const char* source = record.source == ReloadRequestSource::Signal ? "signal" : "route";
     const char* outcome = reload_terminal_outcome_name(record.outcome);
-    write_str("{\"event\":\"reload\",\"request_id\":");
-    write_u64(record.request_id);
-    write_str(",\"source\":\"");
-    write_str(source);
-    write_str("\",\"old_generation\":");
-    write_u64(record.old_generation);
-    write_str(",\"new_generation\":");
-    write_u64(record.new_generation);
-    write_str(",\"outcome\":\"");
-    write_str(outcome);
-    write_str("\"}\n");
+    char buf[256];
+    const i32 len = snprintf(buf,
+                             sizeof(buf),
+                             "{\"event\":\"reload\",\"request_id\":%llu,\"source\":\"%s\","
+                             "\"old_generation\":%llu,\"new_generation\":%llu,"
+                             "\"outcome\":\"%s\"}\n",
+                             static_cast<unsigned long long>(record.request_id),
+                             source,
+                             static_cast<unsigned long long>(record.old_generation),
+                             static_cast<unsigned long long>(record.new_generation),
+                             outcome);
+    if (len > 0 && static_cast<size_t>(len) < sizeof(buf))
+        (void)write(2, buf, static_cast<size_t>(len));
 }
 #endif
 

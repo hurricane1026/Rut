@@ -136,7 +136,7 @@ bool read_snapshot_source(const std::filesystem::path& path,
     if (!input) return false;
     input.seekg(0, std::ios::end);
     const std::streamoff size = input.tellg();
-    if (size < 0 || *used_bytes > max_source_bytes ||
+    if (size < 0 || static_cast<u64>(size) > 0xffffffffu || *used_bytes > max_source_bytes ||
         static_cast<u64>(size) > max_source_bytes - *used_bytes)
         return false;
     input.seekg(0, std::ios::beg);

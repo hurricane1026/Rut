@@ -471,6 +471,28 @@ TEST(serve_loader, reload_snapshot_preserves_parse_diagnostic) {
     program.destroy();
 }
 
+TEST(serve_loader, reload_snapshot_rejects_unrepresentable_source_before_allocating) {
+    const std::string dir = "/tmp/rut_serve_loader_snapshot_oversized";
+    const std::string version_dir = dir + "/releases/v1";
+    std::error_code error;
+    std::filesystem::remove_all(dir, error);
+    std::filesystem::create_directories(version_dir, error);
+    REQUIRE_FALSE(error);
+    const auto source = std::filesystem::path(write_file(version_dir, "main.rut", ""));
+    std::filesystem::resize_file(source, u64{0x100000000}, error);
+    REQUIRE_FALSE(error);
+    const auto current = std::filesystem::path(dir) / "current.rut";
+    std::filesystem::create_symlink(source.lexically_relative(dir), current, error);
+    REQUIRE_FALSE(error);
+
+    LoadedProgram program;
+    LoadError load_error;
+    CHECK_FALSE(load_rut_program_snapshot(current.c_str(), program, load_error));
+    CHECK_EQ(load_error.stage, LoadStage::Read);
+    program.destroy();
+    std::filesystem::remove_all(dir, error);
+}
+
 TEST(serve_loader, reload_snapshot_rejects_unversioned_import_graph) {
     const std::string dir = "/tmp/rut_serve_loader_unversioned_import";
     write_file(dir, "auth.rut", "func jwtAuth() -> i32 => 200\n");
