@@ -131,13 +131,13 @@ struct GlobalRateLimiter {
             // activation timestamp may advance shared policy metadata; a late
             // predecessor request must not migrate the slot back.
             if (migration_time_us >= slot.migration_time_us) {
-                slot.tat = migrate_rate_limit_tat(
-                    slot.tat,
-                    slot.emit_us,
-                    slot.tau_us,
-                    emit_us,
-                    tau_us,
-                    migration_time_us != 0 ? migration_time_us : now_us);
+                slot.tat =
+                    migrate_rate_limit_tat(slot.tat,
+                                           slot.emit_us,
+                                           slot.tau_us,
+                                           emit_us,
+                                           tau_us,
+                                           migration_time_us != 0 ? migration_time_us : now_us);
                 slot.emit_us = emit_us;
                 slot.tau_us = tau_us;
                 slot.migration_time_us = migration_time_us;

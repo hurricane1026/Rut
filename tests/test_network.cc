@@ -15,7 +15,10 @@
 #include "rut/runtime/upstream_pool.h"
 #include "test.h"
 #include "test_helpers.h"
+#include <atomic>
+#include <chrono>
 #include <memory>
+#include <thread>
 
 #include <errno.h>
 #include <sys/socket.h>
@@ -2812,6 +2815,29 @@ TEST(global_rate_limit, policy_migration_is_not_reversed_by_predecessor_shards) 
     u64 hash = key * 0x9E3779B97F4A7C15ull;
     hash ^= hash >> 29;
     CHECK_EQ(rl.slots[hash % GlobalRateLimiter::kSlots].emit_us, 100u);
+}
+
+TEST(global_rate_limit, concurrent_updates_wait_for_the_slot_owner) {
+    using namespace rut;
+    GlobalRateLimiter rl{};
+    rl.reset();
+    const u64 key = 0x12345678;
+    u64 hash = key * 0x9E3779B97F4A7C15ull;
+    hash ^= hash >> 29;
+    auto& slot = rl.slots[hash % GlobalRateLimiter::kSlots];
+    REQUIRE_FALSE(slot.lock.test_and_set(std::memory_order_acquire));
+
+    std::atomic<bool> started{false};
+    bool allowed = false;
+    std::thread waiter([&] {
+        started.store(true, std::memory_order_release);
+        allowed = rl.allow_key(key, 10, 0, 1000);
+    });
+    while (!started.load(std::memory_order_acquire)) std::this_thread::yield();
+    std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    slot.lock.clear(std::memory_order_release);
+    waiter.join();
+    CHECK(allowed);
 }
 
 TEST(upstream_concurrency, gauge_acquire_release) {
