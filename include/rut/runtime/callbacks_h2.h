@@ -629,13 +629,6 @@ void h2_async_epoch_enter(Loop* loop, Connection& conn) {
         acquire_http2_program_pin(conn.request_config);
         conn.http2_program_pin_config = conn.request_config;
         conn.epoch_held = true;
-    } else if (conn.http2_program_pin_config != conn.request_config) {
-        // A body-deferred batch can finish DATA and continue into coalesced
-        // HEADERS after a reload. Keep the epoch held, but transfer the exact
-        // program pin before the new stream can suspend on its new config/JIT.
-        acquire_http2_program_pin(conn.request_config);
-        release_http2_program_pin(conn.http2_program_pin_config);
-        conn.http2_program_pin_config = conn.request_config;
     }
 }
 template <typename Loop>
@@ -1675,11 +1668,12 @@ void on_h2_data(void* lp, Connection& conn, IoEvent ev) {
     conn.h2->on_headers = &h2_on_headers_cb<Loop>;
     conn.h2->on_data = &h2_on_data_cb<Loop>;  // accumulates request bodies
     conn.h2->on_reset = &h2_on_reset_cb;      // cancels a parked stream on RST_STREAM
-    // Snapshot and pin before matching. poll_command runs only after this
-    // dispatch batch on the same shard, so the active pointer cannot change
-    // between these two statements; storing it first lets the exact program pin
-    // name the same config as the stream instead of a stale prior snapshot.
-    conn.request_config = loop->config_ptr ? *loop->config_ptr : nullptr;
+    // A deferred body episode retains its original config/route across DATA
+    // batches. Keep that program pinned and use the same generation for any
+    // coalesced frames until the episode releases its epoch; switching here
+    // would expose pending_route_config after releasing its owning program.
+    // A fresh episode snapshots the active config before taking its exact pin.
+    if (!conn.epoch_held) conn.request_config = loop->config_ptr ? *loop->config_ptr : nullptr;
     h2_async_epoch_enter(loop, conn);
 
     u32 ctrl_len = 0;
