@@ -2832,6 +2832,10 @@ TEST(rate_limit, overflowing_history_eventually_drains_after_migration) {
 
     CHECK_FALSE(limiter.allow_key(key, 100, 0, 1000, 1000, 1000));
     CHECK(limiter.allow_key(key, 100, 0, 2100, 1000, 1000));
+    // Once every retained timestamp is outside the candidate horizon, the
+    // discarded older history is no longer relevant and the overflow penalty
+    // expires on the next policy migration.
+    CHECK(limiter.allow_key(key, 200, 0, 100000, 100000, 1000));
 }
 
 TEST(global_rate_limit, token_bucket_shared) {

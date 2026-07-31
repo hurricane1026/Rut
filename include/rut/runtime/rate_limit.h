@@ -38,12 +38,17 @@ inline u64 migrate_rate_limit_tat(u64 tat,
                                   u64 new_window_us) {
     if (tat == 0 || grant_count == 0 || old_emit_us == 0 || new_emit_us == 0) return 0;
     const u64 horizon = new_window_us != 0 ? new_window_us : new_emit_us;
-    if (history_overflow) {
-        if (horizon > ~u64{0} - activation_us) return ~u64{0};
-        const u64 drain = activation_us + horizon;
-        return new_emit_us > ~u64{0} - drain ? ~u64{0} : drain + new_emit_us;
-    }
     const u64 cutoff = activation_us > horizon ? activation_us - horizon : 0;
+    if (history_overflow) {
+        u64 oldest = ~u64{0};
+        for (u32 i = 0; i < grant_count && i < 32; i++)
+            oldest = grants[i] < oldest ? grants[i] : oldest;
+        if (oldest >= cutoff) {
+            if (horizon > ~u64{0} - activation_us) return ~u64{0};
+            const u64 drain = activation_us + horizon;
+            return new_emit_us > ~u64{0} - drain ? ~u64{0} : drain + new_emit_us;
+        }
+    }
     u64 ordered[32]{};
     u32 count = 0;
     for (u32 i = 0; i < grant_count && i < 32; i++) {
@@ -84,7 +89,7 @@ inline void record_rate_limit_grant(u64* grants,
 // zeros, which reads as an empty/idle bucket for every key.
 struct RateLimiter {
     static constexpr u32 kSlots = 8192;  // fixed direct-mapped table
-    static constexpr u32 kHistory = 32;
+    static constexpr u32 kHistory = 8;
 
     struct Slot {
         u64 key;  // metering key (see rate_limit_key()); 0 = empty
