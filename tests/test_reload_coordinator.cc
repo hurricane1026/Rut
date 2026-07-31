@@ -88,6 +88,65 @@ struct Fixture {
 
 }  // namespace
 
+TEST(reload_coordinator, compatible_rate_limit_policy_migrates_stable_allocation) {
+    RouteConfig active;
+    RouteConfig candidate;
+    REQUIRE(active.add_static("/api", 0, 200));
+    REQUIRE(candidate.add_static("/api", 0, 200));
+    REQUIRE(active.add_route_rate_limit_rule(0, 100, 60, RateLimitScope::Shard, 1));
+    REQUIRE(candidate.add_route_rate_limit_rule(0, 1, 60, RateLimitScope::Shard, 1));
+    active.routes[0].rate_limit.rules[0].identity = 0xabc;
+    candidate.routes[0].rate_limit.rules[0].identity = 0xdef;
+
+    REQUIRE(ProcessReloadCoordinator::compatible(active, candidate, 1));
+    CHECK_EQ(candidate.routes[0].rate_limit.rules[0].identity, 0xabcu);
+    CHECK_NE(candidate.routes[0].rate_limit.rules[0].migration_time_us, 0u);
+}
+
+TEST(reload_coordinator, compatible_rate_limit_insertion_preserves_existing_rule) {
+    RouteConfig active;
+    RouteConfig candidate;
+    REQUIRE(active.add_static("/api", 0, 200));
+    REQUIRE(candidate.add_static("/api", 0, 200));
+    REQUIRE(active.add_route_rate_limit_rule(0, 10, 60, RateLimitScope::Shard, 10));
+    REQUIRE(candidate.add_route_rate_limit_rule(0, 20, 60, RateLimitScope::Shard, 20));
+    REQUIRE(candidate.add_route_rate_limit_rule(0, 10, 60, RateLimitScope::Shard, 10));
+    active.routes[0].rate_limit.rules[0].identity = 0x111;
+    candidate.routes[0].rate_limit.rules[0].identity = 0x222;
+    candidate.routes[0].rate_limit.rules[1].identity = 0x333;
+
+    REQUIRE(ProcessReloadCoordinator::compatible(active, candidate, 1));
+    CHECK_EQ(candidate.routes[0].rate_limit.rules[1].identity, 0x111u);
+    CHECK_EQ(candidate.routes[0].rate_limit.rules[0].identity, 0x222u);
+}
+
+TEST(reload_coordinator, incompatible_rate_limit_key_or_scope_change_is_rejected) {
+    RouteConfig active;
+    RouteConfig candidate;
+    REQUIRE(active.add_static("/api", 0, 200));
+    REQUIRE(candidate.add_static("/api", 0, 200));
+    REQUIRE(active.add_route_rate_limit_rule(0, 10, 60, RateLimitScope::Shard, 10));
+    REQUIRE(candidate.add_route_rate_limit_rule(0, 10, 60, RateLimitScope::Global, 10));
+    active.routes[0].rate_limit.rules[0].identity = 0x111;
+    candidate.routes[0].rate_limit.rules[0].identity = 0x222;
+    CHECK_FALSE(ProcessReloadCoordinator::compatible(active, candidate, 1));
+}
+
+TEST(reload_coordinator, changed_health_policy_requires_warming_support) {
+    RouteConfig active;
+    RouteConfig candidate;
+    REQUIRE(active.add_upstream("api", 0x7f000001u, 8000));
+    REQUIRE(candidate.add_upstream("api", 0x7f000001u, 8000));
+    active.upstreams[0].hc_enabled = true;
+    active.upstreams[0].hc_path_len = 7;
+    __builtin_memcpy(active.upstreams[0].hc_path, "/health", 7);
+    active.upstreams[0].hc_interval_ms = 1000;
+    active.upstreams[0].hc_expected_status = 200;
+    candidate.upstreams[0] = active.upstreams[0];
+    candidate.upstreams[0].hc_expected_status = 204;
+    CHECK_FALSE(ProcessReloadCoordinator::compatible(active, candidate, 1));
+}
+
 TEST(reload_coordinator, publication_waits_for_all_shards_and_retired_program_pins) {
     Fixture f;
     REQUIRE(f.setup());

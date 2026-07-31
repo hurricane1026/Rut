@@ -54,9 +54,7 @@ public:
     [[nodiscard]] const LoadError& last_load_error() const { return last_load_error_; }
     [[nodiscard]] bool waiting_for_activation() const { return retired_ != nullptr; }
 
-    static bool compatible(const RouteConfig& active,
-                           const RouteConfig& candidate,
-                           u32 shard_count);
+    static bool compatible(const RouteConfig& active, RouteConfig& candidate, u32 shard_count);
 
 private:
     static bool default_loader(void* context,

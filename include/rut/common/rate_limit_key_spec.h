@@ -80,6 +80,10 @@ struct RateLimitRule {
     RateLimitScope scope = RateLimitScope::Shard;
     u64 emit_interval_us = 0;  // µs between tokens (0 = rule disabled)
     u64 tau_us = 0;            // burst tolerance, in µs
+    // Monotonic activation boundary used to translate predecessor GCRA history
+    // when a compatible reload changes emit/tau. Zero means no migration is
+    // required (or a hand-built rule that migrates at first observation).
+    u64 migration_time_us = 0;
     RateLimitKeySpec key{};
 };
 

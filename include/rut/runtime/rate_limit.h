@@ -24,6 +24,18 @@
 // high-cardinality limiting.
 namespace rut {
 
+inline u64 migrate_rate_limit_tat(
+    u64 tat, u64 old_emit_us, u64 old_tau_us, u64 new_emit_us, u64 new_tau_us, u64 activation_us) {
+    if (tat == 0 || old_emit_us == 0 || new_emit_us == 0) return 0;
+    const u64 old_floor = activation_us > old_tau_us ? activation_us - old_tau_us : 0;
+    if (tat <= old_floor) return 0;
+    const u64 debt = tat - old_floor;
+    const u64 used = debt / old_emit_us + (debt % old_emit_us != 0 ? 1 : 0);
+    const u64 new_floor = activation_us > new_tau_us ? activation_us - new_tau_us : 0;
+    if (used > (~u64{0} - new_floor) / new_emit_us) return ~u64{0};
+    return new_floor + used * new_emit_us;
+}
+
 // Per-shard limiter (one thread per shard → no atomics). Value-initialized to all
 // zeros, which reads as an empty/idle bucket for every key.
 struct RateLimiter {
@@ -32,6 +44,8 @@ struct RateLimiter {
     struct Slot {
         u64 key;  // metering key (see rate_limit_key()); 0 = empty
         u64 tat;  // GCRA theoretical arrival time, in monotonic µs
+        u64 emit_us;
+        u64 tau_us;
     };
     Slot slots[kSlots];
 
@@ -43,7 +57,7 @@ struct RateLimiter {
     // it conforms. `emit_us` = µs between tokens at the steady rate; `tau_us` =
     // burst tolerance in µs (both precomputed per rule from limit/window/burst).
     // `now_us` is a monotonic microsecond clock. emit_us == 0 disables the rule.
-    bool allow_key(u64 key, u64 emit_us, u64 tau_us, u64 now_us) {
+    bool allow_key(u64 key, u64 emit_us, u64 tau_us, u64 now_us, u64 migration_time_us = 0) {
         if (emit_us == 0) return true;  // disabled
         u64 h = key * 0x9E3779B97F4A7C15ull;
         h ^= h >> 29;
@@ -51,6 +65,17 @@ struct RateLimiter {
         if (s.key != key) {  // collision / first use → empty bucket for this key
             s.key = key;
             s.tat = 0;
+            s.emit_us = emit_us;
+            s.tau_us = tau_us;
+        } else if (s.emit_us != emit_us || s.tau_us != tau_us) {
+            s.tat = migrate_rate_limit_tat(s.tat,
+                                           s.emit_us,
+                                           s.tau_us,
+                                           emit_us,
+                                           tau_us,
+                                           migration_time_us != 0 ? migration_time_us : now_us);
+            s.emit_us = emit_us;
+            s.tau_us = tau_us;
         }
         if (now_us + tau_us < s.tat) return false;  // too early → throttle (429)
         const u64 kBase = (now_us > s.tat) ? now_us : s.tat;
@@ -62,35 +87,59 @@ struct RateLimiter {
 // Cross-shard limiter for @rateLimit(scope: global). One instance shared by every
 // shard; the bucket is truly cluster-wide (all shards advance the same `tat`), so
 // the configured limit is the exact process-wide cap — no divide-by-shard-count.
-// Each slot is a single atomic<u64> `tat`, so a grant is one CAS (no field
-// packing) and the throttle path is a *read only* (load + compare, no RMW): a
-// flood on a hot key keeps the slot's cache line Shared across cores and never
-// writes it; grants are inherently bounded by the rate, so the RMW/barrier rate is
-// capped by the limit, not by traffic. relaxed ordering — `tat` is the only shared
-// datum. Collisions share a slot (rare, bounded), minus the per-key eviction.
+// A small per-slot spin lock serializes the GCRA update and the rare policy
+// migration. This keeps key, TAT, and timing metadata one coherent state across
+// shards, including at a live-reload policy boundary.
 struct GlobalRateLimiter {
-    static constexpr u32 kSlots = 8192;  // 64 KB shared (atomic<u64> per slot)
-    std::atomic<u64> slots[kSlots];
+    static constexpr u32 kSlots = 8192;
+    struct Slot {
+        std::atomic_flag lock = ATOMIC_FLAG_INIT;
+        u64 key = 0;
+        u64 tat = 0;
+        u64 emit_us = 0;
+        u64 tau_us = 0;
+    };
+    Slot slots[kSlots];
 
     void reset() {
-        for (u32 i = 0; i < kSlots; i++) slots[i].store(0, std::memory_order_relaxed);
+        for (u32 i = 0; i < kSlots; i++) {
+            slots[i].key = 0;
+            slots[i].tat = 0;
+            slots[i].emit_us = 0;
+            slots[i].tau_us = 0;
+            slots[i].lock.clear(std::memory_order_relaxed);
+        }
     }
 
-    bool allow_key(u64 key, u64 emit_us, u64 tau_us, u64 now_us) {
+    bool allow_key(u64 key, u64 emit_us, u64 tau_us, u64 now_us, u64 migration_time_us = 0) {
         if (emit_us == 0) return true;  // disabled
         u64 h = key * 0x9E3779B97F4A7C15ull;
         h ^= h >> 29;
-        std::atomic<u64>& slot = slots[h % kSlots];
-        u64 tat = slot.load(std::memory_order_relaxed);
-        for (;;) {
-            if (now_us + tau_us < tat) return false;  // throttle — read-only, no RMW
-            const u64 kBase = (now_us > tat) ? now_us : tat;
-            const u64 kNext = kBase + emit_us;
-            if (slot.compare_exchange_weak(
-                    tat, kNext, std::memory_order_relaxed, std::memory_order_relaxed))
-                return true;
-            // CAS failed: `tat` reloaded with the current value — retry.
+        Slot& slot = slots[h % kSlots];
+        while (slot.lock.test_and_set(std::memory_order_acquire)) {
         }
+        if (slot.key != key) {
+            slot.key = key;
+            slot.tat = 0;
+            slot.emit_us = emit_us;
+            slot.tau_us = tau_us;
+        } else if (slot.emit_us != emit_us || slot.tau_us != tau_us) {
+            slot.tat = migrate_rate_limit_tat(slot.tat,
+                                              slot.emit_us,
+                                              slot.tau_us,
+                                              emit_us,
+                                              tau_us,
+                                              migration_time_us != 0 ? migration_time_us : now_us);
+            slot.emit_us = emit_us;
+            slot.tau_us = tau_us;
+        }
+        const bool allowed = now_us + tau_us >= slot.tat;
+        if (allowed) {
+            const u64 base = now_us > slot.tat ? now_us : slot.tat;
+            slot.tat = base > ~u64{0} - emit_us ? ~u64{0} : base + emit_us;
+        }
+        slot.lock.clear(std::memory_order_release);
+        return allowed;
     }
 };
 

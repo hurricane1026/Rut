@@ -2771,6 +2771,17 @@ TEST(rate_limit, exceeded_helper_meters_and_isolates) {
     CHECK(!rate_limit_exceeded_with_limiters(limiter, nullptr, rules, 2, 0, in, 1000));
 }
 
+TEST(rate_limit, policy_migration_preserves_occupancy_at_activation_time) {
+    using namespace rut;
+    RateLimiter limiter{};
+    const u64 key = 0xfeedbeef;
+    REQUIRE(limiter.allow_key(key, 600000, 0, 1000));  // predecessor: 100/min, burst 1
+    // Candidate is 1/min, burst 1. The predecessor's one occupied token is
+    // translated at activation, so the old 0.6s TAT cannot grant a fresh token.
+    CHECK_FALSE(limiter.allow_key(key, 60000000, 0, 601000, 1000));
+    CHECK(limiter.allow_key(key, 60000000, 0, 60001000, 1000));
+}
+
 TEST(global_rate_limit, token_bucket_shared) {
     using namespace rut;
     GlobalRateLimiter rl{};

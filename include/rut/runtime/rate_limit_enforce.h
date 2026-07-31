@@ -36,10 +36,16 @@ inline bool rate_limit_exceeded_with_limiters(RateLimiter& rate_limiter,
         const u64 kNamespacedKey =
             kKey ^ (kNamespace + 0x9e3779b97f4a7c15ull + (kKey << 6u) + (kKey >> 2u));
         const bool kOk = (rule.scope == RateLimitScope::Global && global_rate_limiter != nullptr)
-                             ? global_rate_limiter->allow_key(
-                                   kNamespacedKey, rule.emit_interval_us, rule.tau_us, now_us)
-                             : rate_limiter.allow_key(
-                                   kNamespacedKey, rule.emit_interval_us, rule.tau_us, now_us);
+                             ? global_rate_limiter->allow_key(kNamespacedKey,
+                                                              rule.emit_interval_us,
+                                                              rule.tau_us,
+                                                              now_us,
+                                                              rule.migration_time_us)
+                             : rate_limiter.allow_key(kNamespacedKey,
+                                                      rule.emit_interval_us,
+                                                      rule.tau_us,
+                                                      now_us,
+                                                      rule.migration_time_us);
         if (!kOk) return true;
     }
     return false;

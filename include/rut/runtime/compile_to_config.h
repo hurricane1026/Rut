@@ -198,12 +198,30 @@ inline bool register_jit_routes(RouteConfig& cfg, const rir::Module& mod, jit::J
                 hash_u32(fn.route_pattern.len);
                 for (u32 byte = 0; byte < fn.route_pattern.len; byte++)
                     hash_byte(static_cast<u8>(fn.route_pattern.ptr[byte]));
-                hash_u32(ri);
-                // Policy parameters deliberately do not participate in the
-                // allocation identity. A compatible max/window/burst update
-                // reuses the predecessor TAT and evaluates it immediately with
-                // the candidate emit interval and tolerance instead of granting
-                // a fresh burst.
+                u32 duplicate_ordinal = 0;
+                for (u32 previous = 0; previous < ri; previous++) {
+                    const auto& other = fn.rate_limit.rules[previous];
+                    bool same = other.max == rule.max && other.window_sec == rule.window_sec &&
+                                other.burst == rule.burst && other.scope == rule.scope &&
+                                other.key.count == rule.key.count;
+                    for (u32 ki = 0; same && ki < rule.key.count; ki++) {
+                        const auto& lhs = other.key.comps[ki];
+                        const auto& rhs = rule.key.comps[ki];
+                        same = lhs.kind == rhs.kind && lhs.name_len == rhs.name_len;
+                        for (u32 byte = 0; same && byte < lhs.name_len; byte++)
+                            same = lhs.name[byte] == rhs.name[byte];
+                    }
+                    if (same) duplicate_ordinal++;
+                }
+                // Policy participates in the provisional declaration identity,
+                // while the duplicate ordinal distinguishes truly identical
+                // siblings without depending on unrelated decorator insertion.
+                // The reload coordinator remaps a compatible policy edit to the
+                // predecessor allocation and supplies its activation timestamp.
+                hash_u32(rule.max);
+                hash_u32(rule.window_sec);
+                hash_u32(rule.burst);
+                hash_u32(duplicate_ordinal);
                 hash_byte(static_cast<u8>(rule.scope));
                 hash_byte(rule.key.count);
                 for (u32 ki = 0; ki < rule.key.count; ki++) {
