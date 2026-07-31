@@ -629,6 +629,13 @@ void h2_async_epoch_enter(Loop* loop, Connection& conn) {
         acquire_http2_program_pin(conn.request_config);
         conn.http2_program_pin_config = conn.request_config;
         conn.epoch_held = true;
+    } else if (conn.http2_program_pin_config != conn.request_config) {
+        // A body-deferred batch can finish DATA and continue into coalesced
+        // HEADERS after a reload. Keep the epoch held, but transfer the exact
+        // program pin before the new stream can suspend on its new config/JIT.
+        acquire_http2_program_pin(conn.request_config);
+        release_http2_program_pin(conn.http2_program_pin_config);
+        conn.http2_program_pin_config = conn.request_config;
     }
 }
 template <typename Loop>
