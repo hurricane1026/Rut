@@ -255,6 +255,10 @@ public:
         return current;
     }
 
+    [[nodiscard]] bool admission_in_progress() const {
+        return admission_identity_claim_.load(std::memory_order_acquire) != kAdmissionOpen;
+    }
+
     [[nodiscard]] u64 active_generation() const {
         return active_generation_.load(std::memory_order_acquire);
     }
@@ -389,6 +393,7 @@ public:
                 // to the winning request without doing work for Busy callers.
                 char source_version[ReloadRequest::kMaxSourceVersion]{};
                 u32 source_version_len = 0;
+                bool snapshot_recorded = false;
                 if (source_version_capture_ != nullptr &&
                     !source_version_capture_(source_version_capture_context_,
                                              source_version,
@@ -398,17 +403,26 @@ public:
                         ClaimedRecordSlot snapshot_slot{};
                         const u64 snapshot_id = reserve_request_identity(&snapshot_slot);
                         if (snapshot_id != 0) {
-                            const bool published = publish_claimed_record(
-                                {true,
-                                 snapshot_id,
-                                 active_generation(),
-                                 0,
-                                 ReloadRequestSource::Signal,
-                                 ReloadTerminalOutcome::SnapshotUnavailable},
-                                snapshot_slot);
-                            if (published && request_id != nullptr) *request_id = snapshot_id;
+                            const bool published =
+                                publish_claimed_record({true,
+                                                        snapshot_id,
+                                                        active_generation(),
+                                                        0,
+                                                        ReloadRequestSource::Signal,
+                                                        ReloadTerminalOutcome::SnapshotUnavailable},
+                                                       snapshot_slot);
+                            if (published) {
+                                snapshot_recorded = true;
+                                if (request_id != nullptr) *request_id = snapshot_id;
+                            }
                         }
                     }
+                    release_request_identity_claim();
+                    unlock_terminal_publication();
+                    if (request_id != nullptr && !snapshot_recorded) *request_id = 0;
+                    return false;
+                }
+                if (source_version_len >= ReloadRequest::kMaxSourceVersion) {
                     release_request_identity_claim();
                     unlock_terminal_publication();
                     if (request_id != nullptr) *request_id = 0;

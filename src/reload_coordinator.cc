@@ -142,7 +142,8 @@ bool ProcessReloadCoordinator::refresh_source_snapshot() {
     // mutation port is also used directly by tests/integrations). Reclaim
     // retired roots only once admission is idle; Pending/InFlight requests may
     // still hold a pathname into one of them.
-    if (mutation_ != nullptr && mutation_->state() == ReloadAdmissionState::Idle) {
+    if (mutation_ != nullptr && mutation_->state() == ReloadAdmissionState::Idle &&
+        !mutation_->admission_in_progress()) {
         std::vector<std::string> roots;
         {
             std::lock_guard lock(source_snapshot_mutex_);
