@@ -141,8 +141,10 @@ bool ProcessReloadCoordinator::capture_source_version(void* context,
     if (coordinator == nullptr) return false;
     if (coordinator->default_loader_selected_) {
         // Snapshot materialization runs on the control thread. Admission only
-        // copies the already prepared immutable path under a short lock.
-        std::lock_guard lock(coordinator->source_snapshot_mutex_);
+        // copies the already prepared immutable path under a short lock. Do not
+        // block a request worker behind snapshot refresh or cleanup.
+        std::unique_lock lock(coordinator->source_snapshot_mutex_, std::try_to_lock);
+        if (!lock.owns_lock()) return false;
         const u32 len = static_cast<u32>(coordinator->cached_snapshot_source_.size());
         if (len == 0 || len >= capacity) return false;
         __builtin_memcpy(out, coordinator->cached_snapshot_source_.data(), len);
@@ -366,17 +368,10 @@ ReloadCoordinatorPoll ProcessReloadCoordinator::poll() {
     old_generation_ = active_->config.config_generation;
     spare_->destroy();
     last_load_error_ = {};
-    std::string source_for_load;
     const char* source_path = request.source_version;
-    if (default_loader_selected_) {
-        if (!refresh_source_snapshot())
-            source_path = nullptr;
-        else {
-            std::lock_guard lock(source_snapshot_mutex_);
-            source_for_load = cached_snapshot_source_;
-            source_path = source_for_load.c_str();
-        }
-    }
+    // The admission callback captured this immutable source-version handle.
+    // Never refresh the provider cache here: doing so could compile a newer
+    // version than the one associated with the admitted request.
     if (source_path == nullptr || source_path[0] == '\0' ||
         !loader_(loader_context_, source_path, *spare_, last_load_error_, opt_)) {
         spare_->destroy();
