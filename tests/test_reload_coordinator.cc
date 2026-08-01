@@ -240,6 +240,25 @@ TEST(reload_coordinator, publication_waits_for_all_shards_and_retired_program_pi
     f.cleanup();
 }
 
+TEST(reload_coordinator, shutdown_finalizes_published_activation_after_shards_join) {
+    Fixture f;
+    REQUIRE(f.setup());
+
+    u64 request_id = 0;
+    REQUIRE(f.mutation.request_reload(ReloadRequestSource::Route, &request_id));
+    CHECK_EQ(f.coordinator.poll(), ReloadCoordinatorPoll::Published);
+    REQUIRE(f.coordinator.waiting_for_activation());
+    CHECK(f.coordinator.finish_activation_for_shutdown());
+    CHECK_FALSE(f.coordinator.waiting_for_activation());
+    CHECK_EQ(f.mutation.state(), ReloadAdmissionState::Idle);
+    const auto record = f.mutation.last_record();
+    REQUIRE(record.valid);
+    CHECK_EQ(record.request_id, request_id);
+    CHECK_EQ(record.outcome, ReloadTerminalOutcome::Activated);
+
+    f.cleanup();
+}
+
 TEST(reload_coordinator, compile_failure_is_definitely_not_applied) {
     Fixture f;
     f.loader.succeed = false;
