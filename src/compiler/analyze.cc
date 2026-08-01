@@ -14621,12 +14621,24 @@ static FrontendResult<void> analyze_control_stmt(const AstStatement& stmt,
             // never referenceable — no local is injected.
             route->control.kind = HirControlKind::If;
             route->control.cond = cond_expr;
+            const u32 branch_local_start = route->locals.len;
+            const u32 branch_expr_start = route->exprs.len;
             auto then_term =
                 analyze_term(*stmt.then_stmt, mod, route, locals, local_count, binding);
             if (!then_term) return core::make_unexpected(then_term.error());
             auto else_term =
                 analyze_term(*stmt.else_stmt, mod, route, locals, local_count, binding);
             if (!else_term) return core::make_unexpected(else_term.error());
+            for (u32 i = branch_local_start; i < route->locals.len; i++)
+                if (hir_expr_contains_reload_request(route->locals[i].init))
+                    return frontend_error(FrontendError::UnsupportedSyntax,
+                                          route->locals[i].init.span,
+                                          lit_str("reload cannot be conditionally evaluated"));
+            for (u32 i = branch_expr_start; i < route->exprs.len; i++)
+                if (hir_expr_contains_reload_request(route->exprs[i]))
+                    return frontend_error(FrontendError::UnsupportedSyntax,
+                                          route->exprs[i].span,
+                                          lit_str("reload cannot be conditionally evaluated"));
             route->control.then_term = then_term.value();
             route->control.else_term = else_term.value();
             return {};
@@ -14825,6 +14837,10 @@ static FrontendResult<void> analyze_control_stmt(const AstStatement& stmt,
     if (stmt.kind == AstStmtKind::Match) {
         auto subject = analyze_expr(stmt.expr, route, mod, locals, local_count, binding);
         if (!subject) return core::make_unexpected(subject.error());
+        if (hir_expr_contains_reload_request(subject.value()))
+            return frontend_error(FrontendError::UnsupportedSyntax,
+                                  stmt.expr.span,
+                                  lit_str("reload cannot be used as a match subject"));
         if (subject->type == HirTypeKind::I64)
             return frontend_error(
                 FrontendError::UnsupportedSyntax, stmt.expr.span, kMatchI64Detail);
