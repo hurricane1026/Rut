@@ -38,9 +38,8 @@ inline u64 migrate_rate_limit_tat(u64 tat,
                                   u64 new_window_us) {
     if (tat == 0 || grant_count == 0 || old_emit_us == 0 || new_emit_us == 0) return 0;
     u64 horizon = new_window_us;
-    const u64 burst_horizon = new_tau_us > ~u64{0} - new_emit_us
-                                  ? ~u64{0}
-                                  : new_tau_us + new_emit_us;
+    const u64 burst_horizon =
+        new_tau_us > ~u64{0} - new_emit_us ? ~u64{0} : new_tau_us + new_emit_us;
     if (burst_horizon > horizon) horizon = burst_horizon;
     if (horizon == 0) horizon = new_emit_us;
     const u64 cutoff = activation_us > horizon ? activation_us - horizon : 0;
