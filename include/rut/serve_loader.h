@@ -99,6 +99,27 @@ bool load_rut_program_snapshot(const char* path,
                                jit::OptLevel opt = jit::OptLevel::O2,
                                u64 max_source_bytes = ~u64{0});
 
+// Resolve the provider's immutable version handle without reading program
+// contents. The returned canonical path remains the identity of this request.
+bool resolve_rut_program_source_version(const char* path, char* out, u32 capacity, u32* out_len);
+// Copy one already-resolved provider version into a private immutable snapshot.
+// The caller owns `snapshot_root` and must remove it after `snapshot_source` is
+// no longer reachable by admitted requests.
+bool materialize_rut_program_source_snapshot(const char* source_version,
+                                             char* snapshot_source,
+                                             u32 source_capacity,
+                                             u32* source_len,
+                                             char* snapshot_root,
+                                             u32 root_capacity,
+                                             u32* root_len,
+                                             LoadError* error = nullptr,
+                                             u64 max_source_bytes = ~u64{0});
+bool load_rut_program_source_version(const char* source_version,
+                                     LoadedProgram& out,
+                                     LoadError& err,
+                                     jit::OptLevel opt = jit::OptLevel::O2,
+                                     u64 max_source_bytes = ~u64{0});
+
 // Publish the program's Cache descriptors as part of installing its
 // RouteConfig. Compilation alone never mutates the live Cache registry;
 // callers must invoke this at the config activation boundary. The current

@@ -28,16 +28,6 @@
 
 namespace rut {
 
-struct ScopedFd {
-    int value = -1;
-    explicit ScopedFd(int fd) : value(fd) {}
-    ~ScopedFd() {
-        if (value >= 0) ::close(value);
-    }
-    ScopedFd(const ScopedFd&) = delete;
-    ScopedFd& operator=(const ScopedFd&) = delete;
-};
-
 void LoadedProgram::destroy() {
     (void)cache_registry_unpublish_if_owner(this);
     if (jit_inited) {
@@ -138,6 +128,13 @@ struct SourceSnapshot {
     }
 };
 
+struct ScopedFd {
+    i32 value = -1;
+    ~ScopedFd() {
+        if (value >= 0) close(value);
+    }
+};
+
 bool read_snapshot_source(const std::filesystem::path& path,
                           std::string& content,
                           u64* used_bytes,
@@ -170,6 +167,21 @@ bool read_snapshot_source(const std::filesystem::path& path,
     return true;
 }
 
+bool has_symlink_component(const std::filesystem::path& path,
+                           const std::filesystem::path& provider_root) {
+    const auto relative = path.lexically_relative(provider_root);
+    if (relative.empty() || *relative.begin() == "..") return true;
+    std::filesystem::path current = provider_root;
+    std::error_code error;
+    for (const auto& component : relative) {
+        if (component == ".") continue;
+        current /= component;
+        if (std::filesystem::is_symlink(std::filesystem::symlink_status(current, error)) || error)
+            return true;
+    }
+    return false;
+}
+
 bool capture_snapshot_file(const std::filesystem::path& source,
                            const std::filesystem::path& snapshot_root,
                            const std::filesystem::path& provider_root,
@@ -184,6 +196,7 @@ bool capture_snapshot_file(const std::filesystem::path& source,
     for (const auto& path : captured)
         if (path == normalized) return true;
 
+    if (has_symlink_component(normalized, provider_root)) return false;
     std::string content;
     if (!read_snapshot_source(normalized, content, used_bytes, max_source_bytes)) return false;
     captured.push_back(normalized);
@@ -220,11 +233,10 @@ bool capture_snapshot_file(const std::filesystem::path& source,
         const std::filesystem::path import_path(import_text);
         if (import_path.is_absolute()) return false;
         const auto imported = (normalized.parent_path() / import_path).lexically_normal();
-        if (std::filesystem::is_symlink(std::filesystem::symlink_status(imported, path_error)) ||
-            path_error)
-            return false;
-        const auto resolved_import = std::filesystem::weakly_canonical(imported, path_error);
+        const auto resolved_import =
+            std::filesystem::absolute(imported, path_error).lexically_normal();
         if (path_error) return false;
+        if (has_symlink_component(resolved_import, provider_root)) return false;
         const auto relative = resolved_import.lexically_relative(provider_root);
         if (relative.empty() || *relative.begin() == "..") return false;
         if (!capture_snapshot_file(resolved_import,
@@ -241,8 +253,90 @@ bool capture_snapshot_file(const std::filesystem::path& source,
 
 }  // namespace
 
+bool materialize_rut_program_source_snapshot(const char* source_version,
+                                             char* snapshot_source,
+                                             u32 source_capacity,
+                                             u32* source_len,
+                                             char* snapshot_root,
+                                             u32 root_capacity,
+                                             u32* root_len,
+                                             LoadError* load_error,
+                                             u64 max_source_bytes) {
+    if (source_version == nullptr || snapshot_source == nullptr || source_len == nullptr ||
+        snapshot_root == nullptr || root_len == nullptr || source_capacity == 0 ||
+        root_capacity == 0)
+        return false;
+    char directory[] = "/tmp/rut-source-snapshot-XXXXXX";
+    char* created = mkdtemp(directory);
+    if (created == nullptr) return false;
+    SourceSnapshot snapshot{std::filesystem::path(created)};
+    std::vector<std::filesystem::path> captured;
+    u64 used_bytes = 0;
+    std::error_code error;
+    const auto absolute_source = std::filesystem::absolute(source_version, error);
+    if (error) return false;
+    const auto source = std::filesystem::weakly_canonical(absolute_source, error);
+    if (error) return false;
+    ScopedFd provider_fd{open(source.parent_path().c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC)};
+    if (provider_fd.value < 0) return false;
+    const auto provider_root =
+        std::filesystem::path("/proc/self/fd") / std::to_string(provider_fd.value);
+    const auto anchored_source = provider_root / source.filename();
+    LoadError ignored_error{};
+    LoadError& capture_error = load_error != nullptr ? *load_error : ignored_error;
+    if (!capture_snapshot_file(anchored_source,
+                               snapshot.root,
+                               provider_root,
+                               captured,
+                               &used_bytes,
+                               max_source_bytes,
+                               capture_error))
+        return false;
+    const std::string root = snapshot.root.string();
+    const std::string captured_source = (snapshot.root / anchored_source.relative_path()).string();
+    if (root.size() >= root_capacity || captured_source.size() >= source_capacity) return false;
+    __builtin_memcpy(snapshot_root, root.data(), root.size());
+    snapshot_root[root.size()] = '\0';
+    *root_len = static_cast<u32>(root.size());
+    __builtin_memcpy(snapshot_source, captured_source.data(), captured_source.size());
+    snapshot_source[captured_source.size()] = '\0';
+    *source_len = static_cast<u32>(captured_source.size());
+    snapshot.root.clear();
+    return true;
+}
+
 bool load_rut_program_snapshot(
     const char* path, LoadedProgram& out, LoadError& err, jit::OptLevel opt, u64 max_source_bytes) {
+    err = LoadError{};
+    err.stage = LoadStage::Read;
+    char source_version[1024];
+    u32 source_version_len = 0;
+    if (!resolve_rut_program_source_version(
+            path, source_version, sizeof(source_version), &source_version_len))
+        return false;
+    char snapshot_source[2048];
+    char snapshot_root[1024];
+    u32 snapshot_source_len = 0;
+    u32 snapshot_root_len = 0;
+    if (!materialize_rut_program_source_snapshot(source_version,
+                                                 snapshot_source,
+                                                 sizeof(snapshot_source),
+                                                 &snapshot_source_len,
+                                                 snapshot_root,
+                                                 sizeof(snapshot_root),
+                                                 &snapshot_root_len,
+                                                 &err,
+                                                 max_source_bytes))
+        return false;
+    SourceSnapshot cleanup{std::filesystem::path(snapshot_root)};
+    return load_rut_program(snapshot_source, out, err, opt, max_source_bytes);
+}
+
+bool load_rut_program_source_version(const char* source_version,
+                                     LoadedProgram& out,
+                                     LoadError& err,
+                                     jit::OptLevel opt,
+                                     u64 max_source_bytes) {
     err = LoadError{};
     err.stage = LoadStage::Read;
     char directory[] = "/tmp/rut-source-snapshot-XXXXXX";
@@ -252,18 +346,9 @@ bool load_rut_program_snapshot(
     std::vector<std::filesystem::path> captured;
     u64 used_bytes = 0;
     std::error_code error;
-    const auto absolute_requested = std::filesystem::absolute(path, error);
+    const auto absolute_source = std::filesystem::absolute(source_version, error);
     if (error) return false;
-    const auto requested = absolute_requested.lexically_normal();
-    const bool versioned_provider =
-        std::filesystem::is_symlink(std::filesystem::symlink_status(requested, error));
-    if (error || !versioned_provider) return false;
-    const auto target = std::filesystem::read_symlink(requested, error);
-    if (error) return false;
-    const std::filesystem::path selected = (requested.parent_path() / target).lexically_normal();
-    if (std::filesystem::is_symlink(std::filesystem::symlink_status(selected, error)) || error)
-        return false;
-    const auto source = std::filesystem::weakly_canonical(selected, error);
+    const auto source = std::filesystem::weakly_canonical(absolute_source, error);
     if (error) return false;
     const auto provider_root = source.parent_path();
     // Resolve the version handle exactly once. The provider owns the target
@@ -274,6 +359,29 @@ bool load_rut_program_snapshot(
         return false;
     const std::string captured_root = (snapshot.root / source.relative_path()).string();
     return load_rut_program(captured_root.c_str(), out, err, opt, max_source_bytes);
+}
+
+bool resolve_rut_program_source_version(const char* path, char* out, u32 capacity, u32* out_len) {
+    if (path == nullptr || out == nullptr || out_len == nullptr || capacity == 0) return false;
+    std::error_code error;
+    const auto absolute_requested = std::filesystem::absolute(path, error);
+    if (error) return false;
+    const auto requested = absolute_requested.lexically_normal();
+    if (!std::filesystem::is_symlink(std::filesystem::symlink_status(requested, error)) || error)
+        return false;
+    const auto target = std::filesystem::read_symlink(requested, error);
+    if (error) return false;
+    const auto selected = (requested.parent_path() / target).lexically_normal();
+    if (std::filesystem::is_symlink(std::filesystem::symlink_status(selected, error)) || error)
+        return false;
+    const auto canonical_version = std::filesystem::weakly_canonical(selected, error);
+    if (error) return false;
+    const std::string version = canonical_version.string();
+    if (version.size() >= capacity) return false;
+    __builtin_memcpy(out, version.data(), version.size());
+    out[version.size()] = '\0';
+    *out_len = static_cast<u32>(version.size());
+    return true;
 }
 
 bool load_rut_program(

@@ -139,6 +139,7 @@ static i32 run_shards(u16 port,
                       i32 access_log_level,
                       RouteConfig* route_config,
                       bool serve_metrics,
+                      bool allow_route_reload,
                       ServerReloadConfig* reload_config) {
     Shard<EventLoopType> shards[kMaxShards];
     // Cross-shard metrics registry for snapshots and the optional built-in
@@ -154,12 +155,12 @@ static i32 run_shards(u16 port,
     // One process-shared per-upstream concurrency gauge (max-inflight limiting).
     static UpstreamConcurrency upstream_cc;
     upstream_cc.reset();
-    // One process-shared bounded mutation boundary. Source lowering is still
-    // gated, so route admission starts disabled; the follow-up that lowers
-    // reload() also owns the explicit CLI authority flag.
+    // One process-shared bounded mutation boundary. Route authority is explicit;
+    // SIGHUP remains available as the separate process-control channel.
     ControlPlaneMutationPort control_plane_mutation;
-    control_plane_mutation.reset(
-        route_config != nullptr ? route_config->config_generation : 1, false, route_config);
+    control_plane_mutation.reset(route_config != nullptr ? route_config->config_generation : 1,
+                                 allow_route_reload,
+                                 route_config);
 
     // Block process-control signals before publishing the listening state or
     // spawning threads. Threads inherit this mask and the control thread owns
@@ -405,33 +406,57 @@ static i32 run_shards(u16 port,
     write_u32(drain_secs);
     write_str("s)...\n");
 
+    bool mutation_stopped = false;
+#ifdef RUT_ENABLE_JIT
+    const bool finish_published_reload =
+        reload_enabled && reload_coordinator.waiting_for_activation();
+    if (reload_enabled && !finish_published_reload) {
+        // No generation has crossed publication. stop() closes route admission
+        // and terminalizes a Pending request before any shard can exit.
+        control_plane_mutation.stop();
+        mutation_stopped = true;
+    } else
+#endif
+    {
+        control_plane_mutation.close_route_reload_admission();
+    }
+
     // Begin graceful drain on all shards.
     // Each shard will: respond with Connection: close on new requests,
     // probabilistically close idle connections, and exit when empty or
     // when the drain deadline is reached.
     for (u32 i = 0; i < shard_count; i++) shards[i].drain(drain_secs);
 
-    // Wait for all shard threads to finish (they exit after drain completes).
-    for (u32 i = 0; i < shard_count; i++) shards[i].join();
-
 #ifdef RUT_ENABLE_JIT
-    // Joining proves there are no remaining request/stream/session pins. Give a
-    // published generation one final chance to retire cleanly before stopping
-    // the mutation port; process teardown remains safe even if a shard exited
-    // before consuming its pending pointer.
-    if (reload_enabled) {
-        const ReloadCoordinatorPoll kFinalReload = reload_coordinator.poll();
-        if (kFinalReload == ReloadCoordinatorPoll::Activated) {
+    // A published generation must be acknowledged and retired while shards are
+    // still alive. Draining releases its remaining program pins.
+    while (reload_enabled && reload_coordinator.waiting_for_activation()) {
+        const ReloadCoordinatorPoll result = reload_coordinator.poll();
+        if (result == ReloadCoordinatorPoll::Activated) {
             write_str("Reload activated during shutdown\n");
             write_reload_record(control_plane_mutation.last_record());
-        } else if (reload_coordinator.waiting_for_activation() &&
-                   reload_coordinator.finish_activation_for_shutdown()) {
+            break;
+        }
+        usleep(1000);
+    }
+    if (!mutation_stopped) {
+        control_plane_mutation.stop();
+        mutation_stopped = true;
+    }
+#endif
+
+    // Wait for all shard threads to finish (they exit after drain completes).
+    for (u32 i = 0; i < shard_count; i++) shards[i].join();
+    if (!mutation_stopped) {
+#ifdef RUT_ENABLE_JIT
+        if (reload_enabled && reload_coordinator.waiting_for_activation() &&
+            reload_coordinator.finish_activation_for_shutdown()) {
             write_str("Reload finalized during shutdown\n");
             write_reload_record(control_plane_mutation.last_record());
         }
-    }
 #endif
-    control_plane_mutation.stop();
+        control_plane_mutation.stop();
+    }
 
     // Stop access log flusher (final flush of remaining entries).
     if (access_log_fd >= 0) {
@@ -463,6 +488,7 @@ int main(int argc, char** argv) {
     // Serve an aggregated Prometheus exposition at GET /metrics on the data
     // listener. Opt-in (internal metrics shouldn't be public by default).
     bool serve_metrics = false;
+    bool allow_route_reload = false;
     i32 access_log_level = AccessLogFlusher::kDefaultLevel;
     u32 opt_level = 2;  // JIT IR optimization level (0=low/fast-start .. 3=high)
 
@@ -562,6 +588,7 @@ int main(int argc, char** argv) {
         if (str_eq(argv[i], "--access-log-compress")) access_log_compress = true;
         if (str_eq(argv[i], "--h2")) offer_h2 = true;
         if (str_eq(argv[i], "--metrics")) serve_metrics = true;
+        if (str_eq(argv[i], "--allow-route-reload")) allow_route_reload = true;
         // Catch flags that require a value but appear as the last argument.
         if (i + 1 >= argc) {
             if (str_eq(argv[i], "--shards") || str_eq(argv[i], "--drain") ||
@@ -710,6 +737,7 @@ int main(int argc, char** argv) {
                                           access_log_level,
                                           route_config,
                                           serve_metrics,
+                                          allow_route_reload,
                                           &server_reload);
         if (rc != 0 && tls_server) {
             write_str("Backend: io_uring TLS startup failed; falling back to epoll (TLS)\n");
@@ -724,6 +752,7 @@ int main(int argc, char** argv) {
                                             access_log_level,
                                             route_config,
                                             serve_metrics,
+                                            allow_route_reload,
                                             &server_reload);
         }
     } else {
@@ -739,6 +768,7 @@ int main(int argc, char** argv) {
                                         access_log_level,
                                         route_config,
                                         serve_metrics,
+                                        allow_route_reload,
                                         &server_reload);
     }
     destroy_tls_server_context(tls_server);

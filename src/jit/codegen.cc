@@ -103,6 +103,7 @@ struct Ctx {
     LLVMValueRef fn_req_content_length;
     LLVMValueRef fn_cache_get;
     LLVMValueRef fn_cache_set;
+    LLVMValueRef fn_reload_request;
     LLVMValueRef fn_upstream_mark;
     LLVMValueRef fn_time_now_micros;
     LLVMValueRef fn_parse_prime;
@@ -653,6 +654,16 @@ struct Ctx {
             fn_upstream_mark = LLVMAddFunction(llvm_mod, "rut_helper_upstream_mark_checked", ft);
         }
         return fn_upstream_mark;
+    }
+
+    // u8 rut_helper_reload_request(ptr)
+    LLVMValueRef get_reload_request() {
+        if (!fn_reload_request) {
+            LLVMTypeRef params[] = {ptr_ty};
+            LLVMTypeRef ft = LLVMFunctionType(i8_ty, params, 1, 0);
+            fn_reload_request = LLVMAddFunction(llvm_mod, "rut_helper_reload_request", ft);
+        }
+        return fn_reload_request;
     }
 
     // i64 rut_helper_time_now_micros()
@@ -1993,6 +2004,20 @@ static void emit_instruction(Ctx& c, const rir::Instruction& inst) {
                     c.builder, LLVMIntNE, accepted, LLVMConstInt(c.i8_ty, 0, 0), "mark.ok"));
             break;
         }
+        case rir::Opcode::ReloadRequest: {
+            LLVMValueRef args[] = {c.param_ctx};
+            LLVMValueRef accepted = LLVMBuildCall2(c.builder,
+                                                   LLVMGlobalGetValueType(c.get_reload_request()),
+                                                   c.get_reload_request(),
+                                                   args,
+                                                   1,
+                                                   "reload.accepted");
+            c.set_value(
+                inst.result,
+                LLVMBuildICmp(
+                    c.builder, LLVMIntNE, accepted, LLVMConstInt(c.i8_ty, 0, 0), "reload.ok"));
+            break;
+        }
 
         // ── Comparisons ──
         case rir::Opcode::CmpEq:
@@ -2754,6 +2779,7 @@ CodegenResult codegen(const rir::Module& rir_mod) {
     c.fn_req_content_length = nullptr;
     c.fn_cache_get = nullptr;
     c.fn_cache_set = nullptr;
+    c.fn_reload_request = nullptr;
     c.fn_time_now_micros = nullptr;
     c.fn_parse_prime = nullptr;
     c.fn_parse_unprime = nullptr;

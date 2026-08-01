@@ -249,7 +249,8 @@ enum class Opcode : u8 {
     CacheSet,  // %r = cache.set %key, %val, inst=N  → i64 (echoes %val)
 
     // ── Control-plane mutation ──
-    UpstreamMark,  // %r = upstream.mark %server, %healthy → bool
+    ReloadRequest,  // %r = reload.request → bool
+    UpstreamMark,   // %r = upstream.mark %server, %healthy → bool
 
     // ── Bounded dynamic JSON response construction ──
     JsonReset,               // reset shard-local serializer scratch

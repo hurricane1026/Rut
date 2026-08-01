@@ -16994,6 +16994,13 @@ TEST(route, marking_policy_rejects_missing_terminators_and_control_cycles) {
     mod.upstream_mark_replay_complete = true;
 
     CHECK(marking_policies_valid_for_codegen(mod));
+    policy[2].op = rir::Opcode::ReloadRequest;
+    policy[2].operand_count = 0;
+    CHECK_FALSE(marking_policies_valid_for_codegen(mod));
+    RouteConfig reload_timer_config{};
+    CHECK_FALSE(populate_route_config(reload_timer_config, mod));
+    policy[2].op = rir::Opcode::UpstreamMark;
+    policy[2].operand_count = 2;
     block.inst_count = 3;
     CHECK_FALSE(marking_policies_valid_for_codegen(mod));
     block.inst_count = 4;

@@ -1,6 +1,7 @@
 #include "rut/reload_coordinator.h"
 
 #include "rut/runtime/access_log.h"
+#include <filesystem>
 
 namespace rut {
 
@@ -65,7 +66,121 @@ bool same_upstream_endpoints(const UpstreamTarget& lhs, const UpstreamTarget& rh
 
 bool ProcessReloadCoordinator::default_loader(
     void*, const char* source_path, LoadedProgram& output, LoadError& error, jit::OptLevel opt) {
-    return load_rut_program_snapshot(source_path, output, error, opt);
+    return load_rut_program(source_path, output, error, opt);
+}
+
+ProcessReloadCoordinator::~ProcessReloadCoordinator() {
+    if (mutation_ != nullptr)
+        mutation_->clear_reload_source_version_capture(&capture_source_version, this);
+    clear_source_snapshots();
+}
+
+void ProcessReloadCoordinator::clear_source_snapshots() {
+    std::vector<std::string> roots;
+    {
+        std::lock_guard lock(source_snapshot_mutex_);
+        if (!source_snapshot_root_.empty())
+            retired_snapshot_roots_.push_back(std::move(source_snapshot_root_));
+        cached_snapshot_source_.clear();
+        cached_provider_version_.clear();
+        roots.swap(retired_snapshot_roots_);
+    }
+    for (const auto& root : roots) {
+        std::error_code ignored;
+        std::filesystem::remove_all(root, ignored);
+    }
+}
+
+bool ProcessReloadCoordinator::refresh_source_snapshot() {
+    if (!default_loader_selected_) return true;
+    char version[ReloadRequest::kMaxSourceVersion]{};
+    u32 version_len = 0;
+    if (!resolve_rut_program_source_version(source_path_, version, sizeof(version), &version_len))
+        return false;
+    {
+        std::lock_guard lock(source_snapshot_mutex_);
+        if (cached_provider_version_.size() == version_len &&
+            __builtin_memcmp(cached_provider_version_.data(), version, version_len) == 0)
+            return true;
+    }
+    char snapshot_source[ReloadRequest::kMaxSourceVersion]{};
+    char snapshot_root[ReloadRequest::kMaxSourceVersion]{};
+    u32 source_len = 0;
+    u32 root_len = 0;
+    if (!materialize_rut_program_source_snapshot(version,
+                                                 snapshot_source,
+                                                 sizeof(snapshot_source),
+                                                 &source_len,
+                                                 snapshot_root,
+                                                 sizeof(snapshot_root),
+                                                 &root_len)) {
+        std::lock_guard lock(source_snapshot_mutex_);
+        cached_snapshot_source_.clear();
+        cached_provider_version_.clear();
+        if (!source_snapshot_root_.empty())
+            retired_snapshot_roots_.push_back(std::move(source_snapshot_root_));
+        return false;
+    }
+    std::string previous_root;
+    {
+        std::lock_guard lock(source_snapshot_mutex_);
+        if (cached_provider_version_.size() == version_len &&
+            __builtin_memcmp(cached_provider_version_.data(), version, version_len) == 0) {
+            previous_root.assign(snapshot_root, root_len);
+        } else {
+            previous_root = std::move(source_snapshot_root_);
+            source_snapshot_root_.assign(snapshot_root, root_len);
+            cached_provider_version_.assign(version, version_len);
+            cached_snapshot_source_.assign(snapshot_source, source_len);
+        }
+    }
+    if (!previous_root.empty()) {
+        std::lock_guard lock(source_snapshot_mutex_);
+        retired_snapshot_roots_.push_back(std::move(previous_root));
+    }
+    // A previous request may have completed without going through poll() (the
+    // mutation port is also used directly by tests/integrations). Reclaim
+    // retired roots only once admission is idle; Pending/InFlight requests may
+    // still hold a pathname into one of them.
+    if (mutation_ != nullptr && mutation_->state() == ReloadAdmissionState::Idle &&
+        !mutation_->admission_in_progress()) {
+        std::vector<std::string> roots;
+        {
+            std::lock_guard lock(source_snapshot_mutex_);
+            roots.swap(retired_snapshot_roots_);
+        }
+        for (const auto& root : roots) {
+            std::error_code ignored;
+            std::filesystem::remove_all(root, ignored);
+        }
+    }
+    return true;
+}
+
+bool ProcessReloadCoordinator::capture_source_version(void* context,
+                                                      char* out,
+                                                      u32 capacity,
+                                                      u32* out_len) {
+    auto* coordinator = static_cast<ProcessReloadCoordinator*>(context);
+    if (coordinator == nullptr) return false;
+    if (coordinator->default_loader_selected_) {
+        // Snapshot materialization runs on the control thread. Admission only
+        // copies the already prepared immutable path under a short lock. Do not
+        // block a request worker behind snapshot refresh or cleanup.
+        std::unique_lock lock(coordinator->source_snapshot_mutex_, std::try_to_lock);
+        if (!lock.owns_lock()) return false;
+        const u32 len = static_cast<u32>(coordinator->cached_snapshot_source_.size());
+        if (len == 0 || len >= capacity) return false;
+        __builtin_memcpy(out, coordinator->cached_snapshot_source_.data(), len);
+        out[len] = '\0';
+        *out_len = len;
+        return true;
+    }
+    const u32 len = static_cast<u32>(__builtin_strlen(coordinator->source_path_));
+    if (len >= capacity) return false;
+    __builtin_memcpy(out, coordinator->source_path_, len + 1);
+    *out_len = len;
+    return true;
 }
 
 bool ProcessReloadCoordinator::init(ControlPlaneMutationPort* mutation,
@@ -88,6 +203,8 @@ bool ProcessReloadCoordinator::init(ControlPlaneMutationPort* mutation,
         if (shards[i].control == nullptr) return false;
         shards_[i] = shards[i];
     }
+    if (mutation_ != nullptr && mutation_ != mutation)
+        mutation_->clear_reload_source_version_capture(&capture_source_version, this);
     mutation_ = mutation;
     source_path_ = source_path;
     opt_ = opt;
@@ -95,10 +212,14 @@ bool ProcessReloadCoordinator::init(ControlPlaneMutationPort* mutation,
     spare_ = spare;
     retired_ = nullptr;
     shard_count_ = shard_count;
+    default_loader_selected_ = loader == nullptr;
     loader_ = loader != nullptr ? loader : &default_loader;
     loader_context_ = loader_context;
     cancellation_check_ = cancellation_check;
     cancellation_context_ = cancellation_context;
+    clear_source_snapshots();
+    if (default_loader_selected_) (void)refresh_source_snapshot();
+    mutation_->set_reload_source_version_capture(&capture_source_version, this);
     request_ = {};
     old_generation_ = 0;
     last_load_error_ = {};
@@ -263,17 +384,40 @@ ReloadCoordinatorPoll ProcessReloadCoordinator::poll() {
     }
 
     ReloadRequest request{};
-    if (!mutation_->take_reload(&request)) return ReloadCoordinatorPoll::Idle;
+    if (!mutation_->take_reload(&request)) {
+        (void)refresh_source_snapshot();
+        return ReloadCoordinatorPoll::Idle;
+    }
     request_ = request;
     old_generation_ = active_->config.config_generation;
     spare_->destroy();
     last_load_error_ = {};
-    if (!loader_(loader_context_, source_path_, *spare_, last_load_error_, opt_)) {
+    const char* source_path = request.source_version;
+    // The admission callback captured this immutable source-version handle.
+    // Never refresh the provider cache here: doing so could compile a newer
+    // version than the one associated with the admitted request.
+    auto reclaim_retired_snapshots = [&] {
+        std::vector<std::string> roots;
+        {
+            std::lock_guard lock(source_snapshot_mutex_);
+            roots.swap(retired_snapshot_roots_);
+        }
+        for (const auto& root : roots) {
+            std::error_code ignored;
+            std::filesystem::remove_all(root, ignored);
+        }
+    };
+    if (source_path == nullptr || source_path[0] == '\0' ||
+        !loader_(loader_context_, source_path, *spare_, last_load_error_, opt_)) {
         spare_->destroy();
+        reclaim_retired_snapshots();
         (void)mutation_->complete_reload(
             request.id, request.source, ReloadTerminalOutcome::CompileFailed);
         return ReloadCoordinatorPoll::CompileFailed;
     }
+    // The admitted request has finished reading its source. Older snapshot
+    // roots retained across a cache swap can now be reclaimed safely.
+    reclaim_retired_snapshots();
     if (cancellation_check_ != nullptr && cancellation_check_(cancellation_context_)) {
         spare_->destroy();
         mutation_->stop();

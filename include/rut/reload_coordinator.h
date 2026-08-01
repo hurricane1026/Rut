@@ -3,6 +3,9 @@
 #include "rut/runtime/control_plane_mutation.h"
 #include "rut/runtime/shard_control.h"
 #include "rut/serve_loader.h"
+#include <mutex>
+#include <string>
+#include <vector>
 
 namespace rut {
 
@@ -34,6 +37,7 @@ using ReloadCancellationCheck = bool (*)(void* context);
 class ProcessReloadCoordinator {
 public:
     static constexpr u32 kMaxShards = 256;
+    ~ProcessReloadCoordinator();
 
     [[nodiscard]] bool init(ControlPlaneMutationPort* mutation,
                             const char* source_path,
@@ -67,6 +71,9 @@ private:
                                LoadedProgram& output,
                                LoadError& error,
                                jit::OptLevel opt);
+    static bool capture_source_version(void* context, char* out, u32 capacity, u32* out_len);
+    bool refresh_source_snapshot();
+    void clear_source_snapshots();
     bool all_shards_acknowledged(u64 generation) const;
 
     ControlPlaneMutationPort* mutation_ = nullptr;
@@ -81,6 +88,12 @@ private:
     void* loader_context_ = nullptr;
     ReloadCancellationCheck cancellation_check_ = nullptr;
     void* cancellation_context_ = nullptr;
+    bool default_loader_selected_ = false;
+    std::string cached_provider_version_;
+    std::string cached_snapshot_source_;
+    std::string source_snapshot_root_;
+    std::vector<std::string> retired_snapshot_roots_;
+    mutable std::mutex source_snapshot_mutex_;
     ReloadRequest request_{};
     u64 old_generation_ = 0;
     LoadError last_load_error_{};

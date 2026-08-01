@@ -1215,6 +1215,12 @@ struct Builder {
         return vid;
     }
 
+    Result<ValueId> emit_reload_request(SourceLoc loc = {}) {
+        auto* ty = TRY(make_type(TypeKind::Bool));
+        auto [inst, vid] = TRY(emit(Opcode::ReloadRequest, ty, loc));
+        return vid;
+    }
+
     // ── Terminators ─────────────────────────────────────────────────
 
     VoidResult emit_br(ValueId cond, BlockId then_blk, BlockId else_blk, SourceLoc loc = {}) {

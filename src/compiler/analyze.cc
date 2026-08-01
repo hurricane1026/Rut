@@ -4127,6 +4127,7 @@ static FrontendResult<HirExpr> normalize_function_expr(
     u32 param_count,
     const bool* materialized_local_refs = nullptr);
 static u32 count_function_param_refs(const HirExpr& expr, u32 param_index, u32 limit);
+static bool hir_expr_contains_reload_request(const HirExpr& expr);
 static FrontendResult<HirExpr> analyze_function_body_stmt(const AstStatement& stmt,
                                                           HirRoute* scratch,
                                                           const HirModule& mod,
@@ -4289,6 +4290,10 @@ static FrontendResult<HirExpr> analyze_bitwise_namespace_call(const AstExpr& exp
                 FrontendError::UnsupportedSyntax,
                 arg.span,
                 lit_str("upstream.mark cannot be projected through a tuple pipe"));
+        if (hir_expr_contains_reload_request(*pipe_lhs))
+            return frontend_error(FrontendError::UnsupportedSyntax,
+                                  arg.span,
+                                  lit_str("reload cannot be projected through a tuple pipe"));
         const u32 slot_index = static_cast<u32>(arg.int_value - 1);
         if (pipe_lhs->args.len == pipe_lhs->tuple_len && pipe_lhs->args[slot_index] != nullptr)
             return *pipe_lhs->args[slot_index];
@@ -8293,6 +8298,11 @@ static FrontendResult<HirExpr> analyze_expr_impl(const AstExpr& expr,
                             FrontendError::UnsupportedSyntax,
                             expr.field_inits[fi].value->span,
                             lit_str("upstream.mark cannot be used in a struct initializer"));
+                    if (hir_expr_contains_reload_request(field_value.value()))
+                        return frontend_error(
+                            FrontendError::UnsupportedSyntax,
+                            expr.field_inits[fi].value->span,
+                            lit_str("reload cannot be used in a struct initializer"));
                     if (field_value->may_nil || field_value->may_error)
                         return frontend_error(FrontendError::UnsupportedSyntax,
                                               expr.field_inits[fi].value->span);
@@ -8419,6 +8429,10 @@ static FrontendResult<HirExpr> analyze_expr_impl(const AstExpr& expr,
                     FrontendError::UnsupportedSyntax,
                     expr.field_inits[fi].value->span,
                     lit_str("upstream.mark cannot be used in a struct initializer"));
+            if (hir_expr_contains_reload_request(field_value.value()))
+                return frontend_error(FrontendError::UnsupportedSyntax,
+                                      expr.field_inits[fi].value->span,
+                                      lit_str("reload cannot be used in a struct initializer"));
             if (earlier_field_reads_response) {
                 for (u32 li = locals_before_field; li < route->locals.len; li++) {
                     if (is_response_effect(route->locals[li].init.kind))
@@ -9245,6 +9259,10 @@ static FrontendResult<HirExpr> analyze_expr_impl(const AstExpr& expr,
                         FrontendError::UnsupportedSyntax,
                         expr.field_inits[fi].value->span,
                         lit_str("upstream.mark cannot be used in a struct initializer"));
+                if (hir_expr_contains_reload_request(field_value.value()))
+                    return frontend_error(FrontendError::UnsupportedSyntax,
+                                          expr.field_inits[fi].value->span,
+                                          lit_str("reload cannot be used in a struct initializer"));
                 if (field_value->may_nil || field_value->may_error)
                     return frontend_error(FrontendError::UnsupportedSyntax,
                                           expr.field_inits[fi].value->span);
@@ -9339,6 +9357,10 @@ static FrontendResult<HirExpr> analyze_expr_impl(const AstExpr& expr,
             return frontend_error(FrontendError::UnsupportedSyntax,
                                   expr.rhs->span,
                                   lit_str("upstream.mark cannot be conditionally evaluated"));
+        if (hir_expr_contains_reload_request(rhs.value()))
+            return frontend_error(FrontendError::UnsupportedSyntax,
+                                  expr.rhs->span,
+                                  lit_str("reload cannot be conditionally evaluated"));
         if (lhs->may_nil || lhs->may_error || rhs->may_nil || rhs->may_error) {
             const bool error_on_rhs = lhs->may_nil || lhs->may_error;
             return frontend_error(FrontendError::UnsupportedSyntax,
@@ -9437,6 +9459,10 @@ static FrontendResult<HirExpr> analyze_expr_impl(const AstExpr& expr,
             return frontend_error(FrontendError::UnsupportedSyntax,
                                   expr.rhs->span,
                                   lit_str("upstream.mark cannot be conditionally evaluated"));
+        if (hir_expr_contains_reload_request(rhs.value()))
+            return frontend_error(FrontendError::UnsupportedSyntax,
+                                  expr.rhs->span,
+                                  lit_str("reload cannot be conditionally evaluated"));
         if (lhs->type != HirTypeKind::Bool || rhs->type != HirTypeKind::Bool || lhs->may_nil ||
             lhs->may_error || rhs->may_nil || rhs->may_error) {
             return frontend_error(FrontendError::UnsupportedSyntax, expr.span);
@@ -10358,6 +10384,19 @@ static bool hir_expr_contains_upstream_mark(const HirExpr& expr) {
     return false;
 }
 
+static bool hir_expr_contains_reload_request(const HirExpr& expr) {
+    if (expr.kind == HirExprKind::ReloadRequest) return true;
+    if (expr.lhs != nullptr && hir_expr_contains_reload_request(*expr.lhs)) return true;
+    if (expr.rhs != nullptr && hir_expr_contains_reload_request(*expr.rhs)) return true;
+    for (u32 i = 0; i < expr.args.len; i++)
+        if (expr.args[i] != nullptr && hir_expr_contains_reload_request(*expr.args[i])) return true;
+    for (u32 i = 0; i < expr.field_inits.len; i++)
+        if (expr.field_inits[i].value != nullptr &&
+            hir_expr_contains_reload_request(*expr.field_inits[i].value))
+            return true;
+    return false;
+}
+
 static bool hir_expr_contains_conditioned_upstream_mark(const HirExpr& expr,
                                                         bool conditioned = false) {
     if (expr.kind == HirExprKind::UpstreamMark && conditioned) return true;
@@ -10378,6 +10417,30 @@ static bool hir_expr_contains_conditioned_upstream_mark(const HirExpr& expr,
         if (expr.field_inits[i].value != nullptr &&
             hir_expr_contains_conditioned_upstream_mark(*expr.field_inits[i].value,
                                                         branches_conditioned))
+            return true;
+    return false;
+}
+
+static bool hir_expr_contains_conditioned_reload_request(const HirExpr& expr,
+                                                         bool conditioned = false) {
+    if (expr.kind == HirExprKind::ReloadRequest && conditioned) return true;
+    const bool children_conditioned = conditioned || expr.kind == HirExprKind::IfElse;
+    const bool lhs_conditioned =
+        expr.kind == HirExprKind::IfElse ? conditioned : children_conditioned;
+    if (expr.lhs != nullptr &&
+        hir_expr_contains_conditioned_reload_request(*expr.lhs, lhs_conditioned))
+        return true;
+    if (expr.rhs != nullptr &&
+        hir_expr_contains_conditioned_reload_request(*expr.rhs, children_conditioned))
+        return true;
+    for (u32 i = 0; i < expr.args.len; i++)
+        if (expr.args[i] != nullptr &&
+            hir_expr_contains_conditioned_reload_request(*expr.args[i], children_conditioned))
+            return true;
+    for (u32 i = 0; i < expr.field_inits.len; i++)
+        if (expr.field_inits[i].value != nullptr &&
+            hir_expr_contains_conditioned_reload_request(*expr.field_inits[i].value,
+                                                         children_conditioned))
             return true;
     return false;
 }
@@ -10444,6 +10507,10 @@ static FrontendResult<HirExpr> analyze_call_expr(const AstExpr& expr,
                 FrontendError::UnsupportedSyntax,
                 arg.span,
                 lit_str("upstream.mark cannot be projected through a tuple pipe"));
+        if (hir_expr_contains_reload_request(*source))
+            return frontend_error(FrontendError::UnsupportedSyntax,
+                                  arg.span,
+                                  lit_str("reload cannot be projected through a tuple pipe"));
         const u32 slot_index = static_cast<u32>(arg.int_value - 1);
         if (source->args.len == source->tuple_len && source->args[slot_index] != nullptr)
             return *source->args[slot_index];
@@ -10526,6 +10593,20 @@ static FrontendResult<HirExpr> analyze_call_expr(const AstExpr& expr,
         *out_rhs = rhs.value();
         return {};
     };
+
+    if (expr.name.eq({"reload", 6}) &&
+        !user_bound_ident_name(mod, locals, local_count, binding, expr.name)) {
+        if (route == nullptr || route->is_timer || route->is_helper_scratch ||
+            pipe_lhs != nullptr || first_arg_override != nullptr || expr.args.len != 0)
+            return frontend_error(FrontendError::UnsupportedSyntax,
+                                  expr.span,
+                                  lit_str("reload() is available only as a nullary route value"));
+        HirExpr out{};
+        out.kind = HirExprKind::ReloadRequest;
+        out.type = HirTypeKind::Bool;
+        out.span = expr.span;
+        return out;
+    }
 
     // Control-plane snapshot declarations are checker-visible before their
     // HandlerCtx/runtime lowering lands. This preserves distinct Stats and
@@ -10693,6 +10774,10 @@ static FrontendResult<HirExpr> analyze_call_expr(const AstExpr& expr,
                 FrontendError::UnsupportedSyntax,
                 expr.span,
                 lit_str("upstream.mark cannot be used with eager fallback builtins"));
+        if (hir_expr_contains_reload_request(*lhs) || hir_expr_contains_reload_request(*rhs))
+            return frontend_error(FrontendError::UnsupportedSyntax,
+                                  expr.span,
+                                  lit_str("reload cannot be used with eager fallback builtins"));
         if (rhs->may_nil) return frontend_error(FrontendError::UnsupportedSyntax, expr.span);
 
         // A bare int-literal fallback adopts an i64 carrier's width, so
@@ -10829,6 +10914,10 @@ static FrontendResult<HirExpr> analyze_call_expr(const AstExpr& expr,
                 FrontendError::UnsupportedSyntax,
                 expr.span,
                 lit_str("upstream.mark cannot be used with eager fallback builtins"));
+        if (hir_expr_contains_reload_request(*lhs) || hir_expr_contains_reload_request(*rhs))
+            return frontend_error(FrontendError::UnsupportedSyntax,
+                                  expr.span,
+                                  lit_str("reload cannot be used with eager fallback builtins"));
         if (rhs->may_nil) return frontend_error(FrontendError::UnsupportedSyntax, expr.span);
 
         // A bare int-literal fallback adopts an i64 carrier's width, so
@@ -11226,6 +11315,10 @@ static FrontendResult<HirExpr> analyze_call_expr(const AstExpr& expr,
                 FrontendError::UnsupportedSyntax,
                 span,
                 lit_str("upstream.mark cannot be projected through a tuple pipe"));
+        if (hir_expr_contains_reload_request(source))
+            return frontend_error(FrontendError::UnsupportedSyntax,
+                                  span,
+                                  lit_str("reload cannot be projected through a tuple pipe"));
         const u32 slot_index = static_cast<u32>(slot - 1);
         if (source.args.len == source.tuple_len && source.args[slot_index] != nullptr)
             return *source.args[slot_index];
@@ -11674,8 +11767,16 @@ static FrontendResult<HirExpr> analyze_call_expr(const AstExpr& expr,
             auto slot_expr = placeholder_slot_expr(
                 *placeholder_source, static_cast<i32>(arg_expr.int_value), arg_expr.span);
             if (!slot_expr) return core::make_unexpected(slot_expr.error());
+            if (hir_expr_contains_reload_request(slot_expr.value()))
+                return frontend_error(FrontendError::UnsupportedSyntax,
+                                      arg_expr.span,
+                                      lit_str("reload cannot be passed to a helper"));
             analyzed_args[param_index] = slot_expr.value();
         } else if (first_arg_override != nullptr && param_index == 0) {
+            if (hir_expr_contains_reload_request(*first_arg_override))
+                return frontend_error(FrontendError::UnsupportedSyntax,
+                                      arg_expr.span,
+                                      lit_str("reload cannot be passed to a helper"));
             analyzed_args[param_index] = *first_arg_override;
         } else {
             FrontendResult<HirExpr> arg = [&]() -> FrontendResult<HirExpr> {
@@ -11699,6 +11800,10 @@ static FrontendResult<HirExpr> analyze_call_expr(const AstExpr& expr,
                 return analyze_expr_impl(arg_expr, route, mod, locals, local_count, binding, true);
             }();
             if (!arg) return core::make_unexpected(arg.error());
+            if (hir_expr_contains_reload_request(arg.value()))
+                return frontend_error(FrontendError::UnsupportedSyntax,
+                                      arg_expr.span,
+                                      lit_str("reload cannot be passed to a helper"));
             if (arg->may_nil || arg->may_error)
                 return fail_call(expr.args[i]->span, "arg has nil or error", nullptr);
             analyzed_args[param_index] = arg.value();
@@ -13603,6 +13708,10 @@ static FrontendResult<void> analyze_match_arm_body(const AstStatement& stmt,
                                                scoped_locals.len,
                                                binding);
                 if (!init) return core::make_unexpected(init.error());
+                if (hir_expr_contains_reload_request(init.value()))
+                    return frontend_error(FrontendError::UnsupportedSyntax,
+                                          inner.expr.span,
+                                          lit_str("reload cannot initialize a match-arm local"));
                 auto typed = apply_declared_type_to_expr(&init.value(), mod, inner);
                 if (!typed) return core::make_unexpected(typed.error());
                 local.type = init->type;
@@ -13915,6 +14024,11 @@ static FrontendResult<void> analyze_guard_fail_body(const AstStatement& stmt,
                         FrontendError::UnsupportedSyntax,
                         inner.expr.span,
                         lit_str("upstream.mark cannot initialize a guard-failure local"));
+                if (hir_expr_contains_reload_request(init.value()))
+                    return frontend_error(
+                        FrontendError::UnsupportedSyntax,
+                        inner.expr.span,
+                        lit_str("reload cannot initialize a guard-failure local"));
                 if (inside_static_for && inner.expr.kind != AstExprKind::Ident &&
                     inner.expr.kind != AstExprKind::BoolLit &&
                     inner.expr.kind != AstExprKind::IntLit &&
@@ -14507,12 +14621,24 @@ static FrontendResult<void> analyze_control_stmt(const AstStatement& stmt,
             // never referenceable — no local is injected.
             route->control.kind = HirControlKind::If;
             route->control.cond = cond_expr;
+            const u32 branch_local_start = route->locals.len;
+            const u32 branch_expr_start = route->exprs.len;
             auto then_term =
                 analyze_term(*stmt.then_stmt, mod, route, locals, local_count, binding);
             if (!then_term) return core::make_unexpected(then_term.error());
             auto else_term =
                 analyze_term(*stmt.else_stmt, mod, route, locals, local_count, binding);
             if (!else_term) return core::make_unexpected(else_term.error());
+            for (u32 i = branch_local_start; i < route->locals.len; i++)
+                if (hir_expr_contains_reload_request(route->locals[i].init))
+                    return frontend_error(FrontendError::UnsupportedSyntax,
+                                          route->locals[i].init.span,
+                                          lit_str("reload cannot be conditionally evaluated"));
+            for (u32 i = branch_expr_start; i < route->exprs.len; i++)
+                if (hir_expr_contains_reload_request(route->exprs[i]))
+                    return frontend_error(FrontendError::UnsupportedSyntax,
+                                          route->exprs[i].span,
+                                          lit_str("reload cannot be conditionally evaluated"));
             route->control.then_term = then_term.value();
             route->control.else_term = else_term.value();
             return {};
@@ -14654,9 +14780,21 @@ static FrontendResult<void> analyze_control_stmt(const AstStatement& stmt,
             then_arm.direct_term.status_code = 500;
             then_arm.direct_term.span = stmt.then_stmt->span;
         } else {
+            const u32 branch_local_start = route->locals.len;
+            const u32 branch_expr_start = route->exprs.len;
             auto then_body = analyze_match_arm_body(
                 *stmt.then_stmt, &then_arm, route, mod, then_locals.data, then_locals.len, binding);
             if (!then_body) return core::make_unexpected(then_body.error());
+            for (u32 i = branch_local_start; i < route->locals.len; i++)
+                if (hir_expr_contains_reload_request(route->locals[i].init))
+                    return frontend_error(FrontendError::UnsupportedSyntax,
+                                          route->locals[i].init.span,
+                                          lit_str("reload cannot be conditionally evaluated"));
+            for (u32 i = branch_expr_start; i < route->exprs.len; i++)
+                if (hir_expr_contains_reload_request(route->exprs[i]))
+                    return frontend_error(FrontendError::UnsupportedSyntax,
+                                          route->exprs[i].span,
+                                          lit_str("reload cannot be conditionally evaluated"));
         }
         if (!route->control.match_arms.push(then_arm))
             return frontend_error(FrontendError::TooManyItems, stmt.then_stmt->span);
@@ -14675,9 +14813,21 @@ static FrontendResult<void> analyze_control_stmt(const AstStatement& stmt,
             else_arm.direct_term.status_code = 500;
             else_arm.direct_term.span = stmt.else_stmt->span;
         } else {
+            const u32 branch_local_start = route->locals.len;
+            const u32 branch_expr_start = route->exprs.len;
             auto else_body = analyze_match_arm_body(
                 *stmt.else_stmt, &else_arm, route, mod, locals, local_count, binding);
             if (!else_body) return core::make_unexpected(else_body.error());
+            for (u32 i = branch_local_start; i < route->locals.len; i++)
+                if (hir_expr_contains_reload_request(route->locals[i].init))
+                    return frontend_error(FrontendError::UnsupportedSyntax,
+                                          route->locals[i].init.span,
+                                          lit_str("reload cannot be conditionally evaluated"));
+            for (u32 i = branch_expr_start; i < route->exprs.len; i++)
+                if (hir_expr_contains_reload_request(route->exprs[i]))
+                    return frontend_error(FrontendError::UnsupportedSyntax,
+                                          route->exprs[i].span,
+                                          lit_str("reload cannot be conditionally evaluated"));
         }
         if (!route->control.match_arms.push(else_arm))
             return frontend_error(FrontendError::TooManyItems, stmt.else_stmt->span);
@@ -14687,6 +14837,10 @@ static FrontendResult<void> analyze_control_stmt(const AstStatement& stmt,
     if (stmt.kind == AstStmtKind::Match) {
         auto subject = analyze_expr(stmt.expr, route, mod, locals, local_count, binding);
         if (!subject) return core::make_unexpected(subject.error());
+        if (hir_expr_contains_reload_request(subject.value()))
+            return frontend_error(FrontendError::UnsupportedSyntax,
+                                  stmt.expr.span,
+                                  lit_str("reload cannot be used as a match subject"));
         if (subject->type == HirTypeKind::I64)
             return frontend_error(
                 FrontendError::UnsupportedSyntax, stmt.expr.span, kMatchI64Detail);
@@ -17448,6 +17602,10 @@ static FrontendResult<u32> analyze_for_stmt(const AstStatement& stmt,
                     FrontendError::UnsupportedSyntax,
                     bstmt.expr.span,
                     lit_str("upstream.mark cannot initialize a static for-loop local"));
+            if (hir_expr_contains_reload_request(init.value()))
+                return frontend_error(FrontendError::UnsupportedSyntax,
+                                      bstmt.expr.span,
+                                      lit_str("reload cannot initialize a static for-loop local"));
             if (init->may_error && init->kind != HirExprKind::Error &&
                 init->kind != HirExprKind::LocalRef)
                 return frontend_error(
@@ -18320,6 +18478,12 @@ static FrontendResult<u32> analyze_for_stmt(const AstStatement& stmt,
                                     FrontendError::UnsupportedSyntax,
                                     inner.expr.span,
                                     lit_str("upstream.mark cannot initialize a static for-loop "
+                                            "local"));
+                            if (hir_expr_contains_reload_request(init.value()))
+                                return frontend_error(
+                                    FrontendError::UnsupportedSyntax,
+                                    inner.expr.span,
+                                    lit_str("reload cannot initialize a static for-loop match arm "
                                             "local"));
                             if (init->may_error && init->kind != HirExprKind::Error &&
                                 init->kind != HirExprKind::LocalRef)
@@ -23714,6 +23878,11 @@ static FrontendResult<HirModule*> analyze_file_internal(
                 route.allow_respond_effects = saved_allow_respond_effects;
                 route.allow_response_effects = saved_allow_response_effects;
                 if (!init) return core::make_unexpected(init.error());
+                if ((seen_guard || route.guards.len > 0) &&
+                    hir_expr_contains_reload_request(init.value()))
+                    return frontend_error(FrontendError::UnsupportedSyntax,
+                                          stmt.expr.span,
+                                          lit_str("reload locals cannot follow guards or waits"));
                 if (init->is_wait_result &&
                     init->wait_event_kind == WaitEventKind::ForwardBuffered) {
                     for (u32 li = 0; li < route.locals.len; li++) {
@@ -24401,6 +24570,22 @@ static FrontendResult<HirModule*> analyze_file_internal(
             }
         }
 
+        auto reject_conditioned_reload = [](const HirExpr& expr) -> FrontendResult<void> {
+            if (hir_expr_contains_conditioned_reload_request(expr))
+                return frontend_error(FrontendError::UnsupportedSyntax,
+                                      expr.span,
+                                      lit_str("reload cannot be conditionally evaluated"));
+            return {};
+        };
+        for (u32 i = 0; i < route.exprs.len; i++) {
+            auto valid = reject_conditioned_reload(route.exprs[i]);
+            if (!valid) return core::make_unexpected(valid.error());
+        }
+        for (u32 i = 0; i < route.locals.len; i++) {
+            auto valid = reject_conditioned_reload(route.locals[i].init);
+            if (!valid) return core::make_unexpected(valid.error());
+        }
+
         // Wait-route backstop: the creation-time gates (kTimeWaitDetail /
         // kCacheWaitDetail above) catch direct spellings, but not
         // TimeNowMicros or CacheGet/CacheSet trees inlined from helper
@@ -24415,6 +24600,8 @@ static FrontendResult<HirModule*> analyze_file_internal(
                 if (e.kind == HirExprKind::TimeNowMicros) return kTimeWaitDetail;
                 if (e.kind == HirExprKind::CacheGet || e.kind == HirExprKind::CacheSet)
                     return kCacheWaitDetail;
+                if (e.kind == HirExprKind::ReloadRequest)
+                    return lit_str("reload locals cannot be used in routes that wait");
                 return Str{};
             };
             const HirExpr* found = nullptr;

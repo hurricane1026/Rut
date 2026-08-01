@@ -200,6 +200,7 @@ enum class HirExprKind : u8 {
     // the value in rhs and echoes it (type I64).
     CacheGet,
     CacheSet,
+    ReloadRequest,
     UpstreamMark,
     // Compiler-owned reusable JSON plan. field_inits stores each raw segment
     // in `name` and the following dynamic leaf in `value`; str_value is the

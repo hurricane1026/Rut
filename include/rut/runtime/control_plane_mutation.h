@@ -34,6 +34,7 @@ enum class ReloadTerminalOutcome : u8 {
     Stopped,
     AdmissionContended,
     CounterExhausted,
+    SnapshotUnavailable,
 };
 
 constexpr const char* reload_terminal_outcome_name(ReloadTerminalOutcome outcome) {
@@ -54,6 +55,8 @@ constexpr const char* reload_terminal_outcome_name(ReloadTerminalOutcome outcome
             return "admission_contended";
         case ReloadTerminalOutcome::CounterExhausted:
             return "counter_exhausted";
+        case ReloadTerminalOutcome::SnapshotUnavailable:
+            return "snapshot_unavailable";
     }
     return "none";
 }
@@ -71,9 +74,15 @@ struct ServerIdentity {
 };
 
 struct ReloadRequest {
+    static constexpr u32 kMaxSourceVersion = 1024;
+
     u64 id = 0;
     ReloadRequestSource source = ReloadRequestSource::Route;
+    u32 source_version_len = 0;
+    char source_version[kMaxSourceVersion]{};
 };
+
+using ReloadSourceVersionCapture = bool (*)(void* context, char* out, u32 capacity, u32* out_len);
 
 struct ReloadTerminalRecord {
     bool valid = false;
@@ -206,6 +215,34 @@ public:
         return updated && stopping_.load(std::memory_order_acquire) == 0;
     }
 
+    // Permanently close route authority at a process shutdown boundary without
+    // cancelling an activation that has already crossed publication. Unlike the
+    // general capability setter, this must also work while the slot is
+    // Completing; finish_activation() preserves the cleared bit when it exposes
+    // Idle, so draining handlers cannot claim a new request in between
+    // activation completion and stop(). Signal admission remains available to
+    // the coordinator until stop() closes the entire mutation boundary.
+    void close_route_reload_admission() {
+        lock_terminal_publication();
+        u32 identity_open = kAdmissionOpen;
+        while (!admission_identity_claim_.compare_exchange_weak(identity_open,
+                                                                kAdmissionAuthorityClaimed,
+                                                                std::memory_order_acq_rel,
+                                                                std::memory_order_acquire)) {
+            identity_open = kAdmissionOpen;
+        }
+        u64 observed = reload_word_.load(std::memory_order_acquire);
+        for (;;) {
+            const u64 closed = with_route_enabled(observed, false);
+            if (closed == observed ||
+                reload_word_.compare_exchange_weak(
+                    observed, closed, std::memory_order_acq_rel, std::memory_order_acquire))
+                break;
+        }
+        admission_identity_claim_.store(kAdmissionOpen, std::memory_order_release);
+        unlock_terminal_publication();
+    }
+
     [[nodiscard]] bool route_reload_enabled() const {
         return unpack_route_enabled(reload_word_.load(std::memory_order_acquire));
     }
@@ -218,8 +255,24 @@ public:
         return current;
     }
 
+    [[nodiscard]] bool admission_in_progress() const {
+        return admission_identity_claim_.load(std::memory_order_acquire) != kAdmissionOpen;
+    }
+
     [[nodiscard]] u64 active_generation() const {
         return active_generation_.load(std::memory_order_acquire);
+    }
+
+    void set_reload_source_version_capture(ReloadSourceVersionCapture capture, void* context) {
+        source_version_capture_ = capture;
+        source_version_capture_context_ = context;
+    }
+
+    void clear_reload_source_version_capture(ReloadSourceVersionCapture capture, void* context) {
+        if (source_version_capture_ == capture && source_version_capture_context_ == context) {
+            source_version_capture_ = nullptr;
+            source_version_capture_context_ = nullptr;
+        }
     }
 
     [[nodiscard]] bool request_reload(ReloadRequestSource source, u64* request_id = nullptr) {
@@ -335,6 +388,46 @@ public:
                     observed = reload_word_.load(std::memory_order_acquire);
                     continue;
                 }
+                // Capture only after this caller owns the single admission
+                // slot. This lets a provider bind an immutable source snapshot
+                // to the winning request without doing work for Busy callers.
+                char source_version[ReloadRequest::kMaxSourceVersion]{};
+                u32 source_version_len = 0;
+                bool snapshot_recorded = false;
+                bool snapshot_capture_failed = false;
+                if (source_version_capture_ != nullptr) {
+                    snapshot_capture_failed =
+                        !source_version_capture_(source_version_capture_context_,
+                                                 source_version,
+                                                 ReloadRequest::kMaxSourceVersion,
+                                                 &source_version_len);
+                    snapshot_capture_failed |=
+                        source_version_len >= ReloadRequest::kMaxSourceVersion;
+                }
+                if (snapshot_capture_failed) {
+                    if (source == ReloadRequestSource::Signal) {
+                        ClaimedRecordSlot snapshot_slot{};
+                        const u64 snapshot_id = reserve_request_identity(&snapshot_slot);
+                        if (snapshot_id != 0) {
+                            const bool published =
+                                publish_claimed_record({true,
+                                                        snapshot_id,
+                                                        active_generation(),
+                                                        0,
+                                                        ReloadRequestSource::Signal,
+                                                        ReloadTerminalOutcome::SnapshotUnavailable},
+                                                       snapshot_slot);
+                            if (published) {
+                                snapshot_recorded = true;
+                                if (request_id != nullptr) *request_id = snapshot_id;
+                            }
+                        }
+                    }
+                    release_request_identity_claim();
+                    unlock_terminal_publication();
+                    if (request_id != nullptr && !snapshot_recorded) *request_id = 0;
+                    return false;
+                }
                 ClaimedRecordSlot identity_slot{};
                 const u64 id = reserve_request_identity(&identity_slot);
                 if (id == 0) {
@@ -354,6 +447,8 @@ public:
                 unlock_terminal_publication();
                 const u64 desired = pack_reload(
                     ReloadAdmissionState::Pending, id, source, unpack_route_enabled(observed));
+                source_version_len_ = source_version_len;
+                for (u32 i = 0; i < source_version_len; i++) source_version_[i] = source_version[i];
                 const bool admitted = reload_word_.compare_exchange_strong(
                     observed, desired, std::memory_order_acq_rel, std::memory_order_acquire);
                 if (admitted) {
@@ -449,6 +544,10 @@ public:
         }
         out->id = unpack_request_id(desired);
         out->source = unpack_source(desired);
+        out->source_version_len = source_version_len_;
+        for (u32 i = 0; i < source_version_len_; i++) out->source_version[i] = source_version_[i];
+        if (source_version_len_ < ReloadRequest::kMaxSourceVersion)
+            out->source_version[source_version_len_] = '\0';
         return true;
     }
 
@@ -2487,6 +2586,10 @@ private:
     }
 
     std::atomic<u64> reload_word_{0};
+    ReloadSourceVersionCapture source_version_capture_ = nullptr;
+    void* source_version_capture_context_ = nullptr;
+    u32 source_version_len_ = 0;
+    char source_version_[ReloadRequest::kMaxSourceVersion]{};
     std::atomic<u64> event_counters_{0};
     std::atomic<u64> counter_exhaustion_generation_{0};
     std::atomic<u64> counter_exhaustion_frontier_{0};
@@ -2555,6 +2658,11 @@ inline void latch_control_plane_mutation(Loop* loop, jit::HandlerCtx* ctx, u64 c
     ctx->config_generation = config_generation;
     if (loop == nullptr) return;
     if (control_plane_replay_mode) return;
+    // Route reload attempts do not yet have a traffic capture/replay event.
+    // Keep the capability unavailable while capture is active so captured
+    // executions remain deterministic and fail closed.
+    if constexpr (requires { loop->capture_ring; })
+        if (loop->capture_ring != nullptr) return;
     if constexpr (requires { loop->control_plane_mutation; })
         ctx->control_plane_mutation = loop->control_plane_mutation;
 }

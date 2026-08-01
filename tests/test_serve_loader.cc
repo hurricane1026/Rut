@@ -453,6 +453,77 @@ TEST(serve_loader, reload_snapshot_captures_relative_import_graph) {
     program.destroy();
 }
 
+TEST(serve_loader, reload_snapshot_rejects_symlinked_import_directory) {
+    const std::string dir = "/tmp/rut_serve_loader_snapshot_symlink_component";
+    const auto provider = std::filesystem::path(dir) / "releases/v1";
+    const auto outside = std::filesystem::path(dir) / "outside";
+    std::error_code error;
+    std::filesystem::remove_all(dir, error);
+    write_file(outside.string(), "route.rut", "func escaped() -> i32 => 200\n");
+    write_file(provider.string(),
+               "main.rut",
+               "import \"shared/route.rut\"\n"
+               "route GET \"/\" { return escaped() }\n");
+    std::filesystem::create_symlink(outside, provider / "shared", error);
+    REQUIRE_FALSE(error);
+    const auto current = std::filesystem::path(dir) / "current.rut";
+    std::filesystem::create_symlink(
+        std::filesystem::path(provider / "main.rut").lexically_relative(dir), current, error);
+    REQUIRE_FALSE(error);
+
+    LoadedProgram program;
+    LoadError load_error;
+    CHECK_FALSE(load_rut_program_snapshot(current.c_str(), program, load_error));
+    program.destroy();
+    std::filesystem::remove_all(dir, error);
+}
+
+TEST(serve_loader, materialized_source_handle_survives_provider_directory_replacement) {
+    const std::string dir = "/tmp/rut_serve_loader_immutable_handle";
+    const auto version_dir = std::filesystem::path(dir) / "releases/v1";
+    std::error_code error;
+    std::filesystem::remove_all(dir, error);
+    const std::string source =
+        write_file(version_dir.string(), "main.rut", "route GET \"/\" { return 201 }\n");
+    const auto current = std::filesystem::path(dir) / "current.rut";
+    std::filesystem::create_symlink(
+        std::filesystem::path(source).lexically_relative(dir), current, error);
+    REQUIRE_FALSE(error);
+
+    char version[1024]{};
+    u32 version_len = 0;
+    REQUIRE(resolve_rut_program_source_version(
+        current.c_str(), version, sizeof(version), &version_len));
+    char snapshot_source[2048]{};
+    char snapshot_root[1024]{};
+    u32 snapshot_source_len = 0;
+    u32 snapshot_root_len = 0;
+    LoadError snapshot_error;
+    REQUIRE(materialize_rut_program_source_snapshot(version,
+                                                    snapshot_source,
+                                                    sizeof(snapshot_source),
+                                                    &snapshot_source_len,
+                                                    snapshot_root,
+                                                    sizeof(snapshot_root),
+                                                    &snapshot_root_len,
+                                                    &snapshot_error));
+
+    std::filesystem::rename(version_dir, version_dir.string() + ".old", error);
+    REQUIRE_FALSE(error);
+    write_file(version_dir.string(), "main.rut", "route GET \"/\" { return 202 }\n");
+    std::ifstream captured(snapshot_source, std::ios::binary);
+    const std::string captured_text((std::istreambuf_iterator<char>(captured)),
+                                    std::istreambuf_iterator<char>());
+    CHECK(captured_text.find("return 201") != std::string::npos);
+    CHECK(captured_text.find("return 202") == std::string::npos);
+    LoadedProgram program;
+    LoadError load_error;
+    REQUIRE(load_rut_program(snapshot_source, program, load_error));
+    REQUIRE_EQ(program.config.route_count, 1u);
+    program.destroy();
+    std::filesystem::remove_all(snapshot_root, error);
+}
+
 TEST(serve_loader, reload_snapshot_preserves_parse_diagnostic) {
     const std::string dir = "/tmp/rut_serve_loader_snapshot_parse";
     const std::string path = write_file(dir, "broken.rut", "route GET \"/\" { this is broken\n");
@@ -505,6 +576,20 @@ TEST(serve_loader, reload_snapshot_rejects_unversioned_import_graph) {
     LoadError err;
     CHECK_FALSE(load_rut_program_snapshot(path.c_str(), program, err));
     CHECK_EQ(err.stage, LoadStage::Read);
+    program.destroy();
+}
+
+TEST(serve_loader, reload_snapshot_resolution_failure_clears_stale_diagnostic) {
+    LoadedProgram program;
+    LoadError error;
+    error.stage = LoadStage::Parse;
+    error.has_diag = true;
+    error.detail_buf[0] = 'x';
+    error.detail_buf[1] = '\0';
+    error.diag.detail = Str{error.detail_buf, 1};
+    CHECK_FALSE(load_rut_program_snapshot("/tmp/rut_missing_version_link", program, error));
+    CHECK_EQ(error.stage, LoadStage::Read);
+    CHECK_FALSE(error.has_diag);
     program.destroy();
 }
 

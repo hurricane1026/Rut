@@ -6,6 +6,14 @@
 
 using namespace rut;
 
+static bool failed_source_capture(void*, char*, u32, u32*) {
+    return false;
+}
+static bool oversized_source_capture(void*, char*, u32 capacity, u32* out_len) {
+    *out_len = capacity;
+    return true;
+}
+
 namespace rut {
 struct ControlPlaneMutationPortTestAccess {
     static u64 begin_serialized_admission_claim(ControlPlaneMutationPort& port) {
@@ -1047,6 +1055,27 @@ TEST(control_plane_mutation, activation_retains_old_health_until_terminal_ack_bo
     CHECK_EQ(record.outcome, ReloadTerminalOutcome::Activated);
     CHECK_EQ(record.old_generation, 3u);
     CHECK_EQ(record.new_generation, 4u);
+}
+
+TEST(control_plane_mutation, shutdown_authority_stays_closed_after_activation_finishes) {
+    ControlPlaneMutationPort port;
+    RouteConfig old_config;
+    RouteConfig new_config;
+    port.reset(3, true, &old_config);
+    u64 id = 0;
+    REQUIRE(port.request_reload(ReloadRequestSource::Route, &id));
+    ReloadRequest request{};
+    REQUIRE(port.take_reload(&request));
+    REQUIRE(
+        port.complete_reload(id, request.source, ReloadTerminalOutcome::Activated, 4, &new_config));
+    REQUIRE_EQ(port.state(), ReloadAdmissionState::Completing);
+
+    port.close_route_reload_admission();
+    CHECK_FALSE(port.route_reload_enabled());
+    REQUIRE(port.finish_activation(id));
+    CHECK_EQ(port.state(), ReloadAdmissionState::Idle);
+    CHECK_FALSE(port.route_reload_enabled());
+    CHECK_FALSE(port.request_reload(ReloadRequestSource::Route));
 }
 
 TEST(control_plane_mutation, activation_carries_overrides_across_probe_policy_changes) {
@@ -2152,12 +2181,17 @@ TEST(control_plane_mutation, published_terminal_record_remains_readable_during_s
 TEST(control_plane_mutation, handler_context_latches_only_the_explicit_loop_capability) {
     struct Loop {
         ControlPlaneMutationPort* control_plane_mutation = nullptr;
+        void* capture_ring = nullptr;
     } loop;
     ControlPlaneMutationPort port;
     jit::HandlerCtx ctx{};
     loop.control_plane_mutation = &port;
     latch_control_plane_mutation(&loop, &ctx, 0);
     CHECK(ctx.control_plane_mutation == &port);
+    loop.capture_ring = &loop;
+    latch_control_plane_mutation(&loop, &ctx, 0);
+    CHECK(ctx.control_plane_mutation == nullptr);
+    loop.capture_ring = nullptr;
     latch_control_plane_mutation<Loop>(nullptr, &ctx, 0);
     CHECK(ctx.control_plane_mutation == nullptr);
 }
@@ -2176,6 +2210,22 @@ TEST(control_plane_mutation, terminal_outcome_names_are_explicit_and_stable) {
              "admission_contended");
     CHECK_EQ(std::string(reload_terminal_outcome_name(ReloadTerminalOutcome::CounterExhausted)),
              "counter_exhausted");
+    CHECK_EQ(std::string(reload_terminal_outcome_name(ReloadTerminalOutcome::SnapshotUnavailable)),
+             "snapshot_unavailable");
+}
+
+TEST(control_plane_mutation, signal_snapshot_capture_failures_are_terminalized) {
+    for (auto capture : {failed_source_capture, oversized_source_capture}) {
+        ControlPlaneMutationPort port;
+        port.reset(1, true);
+        port.set_reload_source_version_capture(capture, nullptr);
+        u64 request_id = 0;
+        CHECK_FALSE(port.request_reload(ReloadRequestSource::Signal, &request_id));
+        CHECK_NE(request_id, 0u);
+        CHECK(port.last_record().valid);
+        CHECK_EQ(port.last_record().request_id, request_id);
+        CHECK_EQ(port.last_record().outcome, ReloadTerminalOutcome::SnapshotUnavailable);
+    }
 }
 
 int main(int argc, char** argv) {

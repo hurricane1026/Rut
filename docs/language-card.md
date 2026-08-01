@@ -519,9 +519,9 @@ timer health, every: 5s, shard: 0 {
 
 Control-plane mutations use visible boolean failure results and never introduce
 hidden waits. Their authority, generation ordering, and replay contract are
-specified in `docs/control-plane-mutations.md`; `reload()` activation remains ⏳
-until the process coordinator is connected end to end, and `upstream.mark`
-production activation remains ⏳ until replay lowering is implemented.
+specified in `docs/control-plane-mutations.md`; route `reload()` activation is
+✅, while `upstream.mark` production activation remains ⏳ until replay lowering
+is implemented.
 
 ## Do NOT write (compile errors — with the fix)
 
