@@ -54,6 +54,11 @@ public:
     [[nodiscard]] const LoadError& last_load_error() const { return last_load_error_; }
     [[nodiscard]] bool waiting_for_activation() const { return retired_ != nullptr; }
 
+    // Shutdown-only completion after all shard threads have joined. At that
+    // point no acknowledgement or generation pin can arrive, so a published
+    // activation must be finalized before the mutation port is stopped.
+    bool finish_activation_for_shutdown();
+
     static bool compatible(const RouteConfig& active, RouteConfig& candidate, u32 shard_count);
 
 private:

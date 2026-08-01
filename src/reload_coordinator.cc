@@ -98,6 +98,15 @@ bool ProcessReloadCoordinator::request_signal(u64* request_id) {
            mutation_->request_reload(ReloadRequestSource::Signal, request_id);
 }
 
+bool ProcessReloadCoordinator::finish_activation_for_shutdown() {
+    if (retired_ == nullptr) return true;
+    if (!mutation_->finish_activation(request_.id)) return false;
+    retired_->destroy();
+    spare_ = retired_;
+    retired_ = nullptr;
+    return true;
+}
+
 bool ProcessReloadCoordinator::compatible(const RouteConfig& active,
                                           RouteConfig& candidate,
                                           u32 shard_count) {

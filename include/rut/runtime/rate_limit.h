@@ -33,11 +33,16 @@ inline u64 migrate_rate_limit_tat(u64 tat,
                                   u64 old_emit_us,
                                   u64 /*old_tau_us*/,
                                   u64 new_emit_us,
-                                  u64 /*new_tau_us*/,
+                                  u64 new_tau_us,
                                   u64 activation_us,
                                   u64 new_window_us) {
     if (tat == 0 || grant_count == 0 || old_emit_us == 0 || new_emit_us == 0) return 0;
-    const u64 horizon = new_window_us != 0 ? new_window_us : new_emit_us;
+    u64 horizon = new_window_us;
+    const u64 burst_horizon = new_tau_us > ~u64{0} - new_emit_us
+                                  ? ~u64{0}
+                                  : new_tau_us + new_emit_us;
+    if (burst_horizon > horizon) horizon = burst_horizon;
+    if (horizon == 0) horizon = new_emit_us;
     const u64 cutoff = activation_us > horizon ? activation_us - horizon : 0;
     if (history_overflow) {
         u64 oldest = ~u64{0};
@@ -101,6 +106,7 @@ struct RateLimiter {
         u32 grant_count;
         u32 grant_head;
         bool history_overflow;
+        u64 migration_time_us;
     };
     Slot slots[kSlots];
 
@@ -128,24 +134,31 @@ struct RateLimiter {
             s.emit_us = emit_us;
             s.tau_us = tau_us;
             s.window_us = window_us;
+            s.migration_time_us = migration_time_us;
             s.grant_count = 0;
             s.grant_head = 0;
             s.history_overflow = false;
         } else if (s.emit_us != emit_us || s.tau_us != tau_us || s.window_us != window_us) {
-            s.tat = migrate_rate_limit_tat(s.tat,
-                                           s.grants,
-                                           s.grant_count,
-                                           s.history_overflow,
-                                           s.emit_us,
-                                           s.tau_us,
-                                           emit_us,
-                                           tau_us,
-                                           migration_time_us != 0 ? migration_time_us : now_us,
-                                           window_us);
-            s.emit_us = emit_us;
-            s.tau_us = tau_us;
-            s.window_us = window_us;
+            const u64 candidate_time = migration_time_us != 0 ? migration_time_us : now_us;
+            if (candidate_time >= s.migration_time_us) {
+                s.tat = migrate_rate_limit_tat(s.tat,
+                                               s.grants,
+                                               s.grant_count,
+                                               s.history_overflow,
+                                               s.emit_us,
+                                               s.tau_us,
+                                               emit_us,
+                                               tau_us,
+                                               candidate_time,
+                                               window_us);
+                s.emit_us = emit_us;
+                s.tau_us = tau_us;
+                s.window_us = window_us;
+                s.migration_time_us = candidate_time;
+            }
         }
+        emit_us = s.emit_us;
+        tau_us = s.tau_us;
         if (now_us + tau_us < s.tat) return false;  // too early → throttle (429)
         const u64 kBase = (now_us > s.tat) ? now_us : s.tat;
         s.tat = kBase + emit_us;

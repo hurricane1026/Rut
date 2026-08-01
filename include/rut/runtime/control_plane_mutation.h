@@ -7,6 +7,11 @@
 
 namespace rut {
 
+// Replay executes captured requests outside live traffic admission. Keep this
+// thread-local so replay cannot latch a real mutation port into its handler
+// context even when the loop does not expose a capture ring.
+inline thread_local bool control_plane_replay_mode = false;
+
 enum class ReloadRequestSource : u8 {
     Route = 0,
     Signal,
@@ -2546,6 +2551,7 @@ inline void latch_control_plane_mutation(Loop* loop, jit::HandlerCtx* ctx, u64 c
     ctx->control_plane_mutation = nullptr;
     ctx->config_generation = config_generation;
     if (loop == nullptr) return;
+    if (control_plane_replay_mode) return;
     if constexpr (requires { loop->control_plane_mutation; })
         ctx->control_plane_mutation = loop->control_plane_mutation;
 }
