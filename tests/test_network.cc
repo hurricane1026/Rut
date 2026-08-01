@@ -15,7 +15,10 @@
 #include "rut/runtime/upstream_pool.h"
 #include "test.h"
 #include "test_helpers.h"
+#include <atomic>
+#include <chrono>
 #include <memory>
+#include <thread>
 
 #include <errno.h>
 #include <sys/socket.h>
@@ -2738,30 +2741,101 @@ TEST(rate_limit, token_bucket_gcra) {
 
 TEST(rate_limit, exceeded_helper_meters_and_isolates) {
     using namespace rut;
-    struct NoGlobalLoop {
-    } loop;  // no global_rl member → shard-only limiter
+    RateLimiter limiter{};
     RateLimitRuleSet rules;
     rules.count = 1;
     rules.rules[0].emit_interval_us = 10;
     rules.rules[0].tau_us = 20;  // burst capacity 3
     rules.rules[0].scope = RateLimitScope::Shard;
+    rules.rules[0].identity = 0x1234;
     rules.rules[0].key.count = 0;  // empty key → per-peer-IP
     RateLimitKeyInput in;
     in.peer_addr = 0x0100007F;
 
     // No rules → never exceeded.
     RateLimitRuleSet none;
-    CHECK(!rate_limit_exceeded(&loop, none, 0, in, 1000));
+    CHECK(!rate_limit_exceeded_with_limiters(limiter, nullptr, none, 1, 0, in, 1000));
 
     // Fresh bucket admits a burst of 3 at the same instant, then trips. This is
     // the shared logic the HTTP/1 and HTTP/2 dispatch paths both call.
-    CHECK(!rate_limit_exceeded(&loop, rules, 0, in, 1000));
-    CHECK(!rate_limit_exceeded(&loop, rules, 0, in, 1000));
-    CHECK(!rate_limit_exceeded(&loop, rules, 0, in, 1000));
-    CHECK(rate_limit_exceeded(&loop, rules, 0, in, 1000));  // 4th → over the burst
+    CHECK(!rate_limit_exceeded_with_limiters(limiter, nullptr, rules, 1, 0, in, 1000));
+    CHECK(!rate_limit_exceeded_with_limiters(limiter, nullptr, rules, 1, 0, in, 1000));
+    CHECK(!rate_limit_exceeded_with_limiters(limiter, nullptr, rules, 1, 0, in, 1000));
+    CHECK(rate_limit_exceeded_with_limiters(limiter, nullptr, rules, 1, 0, in, 1000));
 
-    // A different route index folds into a separate bucket scope.
-    CHECK(!rate_limit_exceeded(&loop, rules, 1, in, 1000));
+    // Stable identity preserves the bucket across route reordering, generation
+    // changes, and compatible policy updates. Tightening the burst evaluates
+    // the predecessor TAT under the candidate tolerance; it cannot reset state.
+    CHECK(rate_limit_exceeded_with_limiters(limiter, nullptr, rules, 1, 1, in, 1000));
+    CHECK(rate_limit_exceeded_with_limiters(limiter, nullptr, rules, 2, 0, in, 1000));
+    rules.rules[0].tau_us = 0;
+    CHECK(rate_limit_exceeded_with_limiters(limiter, nullptr, rules, 2, 0, in, 1000));
+    rules.rules[0].identity = 0x5678;
+    CHECK(!rate_limit_exceeded_with_limiters(limiter, nullptr, rules, 2, 0, in, 1000));
+}
+
+TEST(rate_limit, policy_migration_preserves_occupancy_at_activation_time) {
+    using namespace rut;
+    RateLimiter limiter{};
+    const u64 key = 0xfeedbeef;
+    REQUIRE(limiter.allow_key(key, 600000, 0, 1000));  // predecessor: 100/min, burst 1
+    // Candidate is 1/min, burst 1. The predecessor's one occupied token is
+    // translated at activation, so the old 0.6s TAT cannot grant a fresh token.
+    CHECK_FALSE(limiter.allow_key(key, 60000000, 0, 601000, 1000));
+    CHECK(limiter.allow_key(key, 60000000, 0, 60001000, 1000));
+}
+
+TEST(rate_limit, policy_migration_does_not_convert_idle_burst_to_debt) {
+    using namespace rut;
+    RateLimiter limiter{};
+    const u64 key = 0xfeedbeef;
+    // 100/minute with the default burst of 100. One request occupies one token;
+    // the remaining 99-token tolerance is available capacity, not debt.
+    REQUIRE(limiter.allow_key(key, 600000, 99 * 600000, 1000));
+
+    // Tightening to 1/minute, burst 1 preserves exactly that one occupied token.
+    CHECK_FALSE(limiter.allow_key(key, 60000000, 0, 60000999, 1000));
+    CHECK(limiter.allow_key(key, 60000000, 0, 60001000, 1000));
+}
+
+TEST(rate_limit, policy_migration_retains_history_elapsed_under_old_cadence) {
+    using namespace rut;
+    RateLimiter limiter{};
+    const u64 key = 0xfeedbeef;
+    REQUIRE(limiter.allow_key(key, 600000, 99 * 600000, 1000));
+
+    // The old 0.6-second cadence has elapsed at activation, but the request is
+    // still inside the candidate's one-minute accounting horizon.
+    CHECK_FALSE(limiter.allow_key(key, 60000000, 0, 30001000, 30001000));
+    CHECK(limiter.allow_key(key, 60000000, 0, 60001000, 30001000));
+}
+
+TEST(rate_limit, policy_migration_retains_multiple_recent_grants) {
+    using namespace rut;
+    RateLimiter limiter{};
+    const u64 key = 0xfeedbeef;
+    REQUIRE(limiter.allow_key(key, 600000, 0, 1000));
+    REQUIRE(limiter.allow_key(key, 600000, 0, 30001000));
+
+    // Both grants remain inside the candidate's one-minute accounting horizon.
+    CHECK_FALSE(limiter.allow_key(key, 60000000, 0, 30001000, 30001000));
+    CHECK_FALSE(limiter.allow_key(key, 60000000, 0, 90001000, 30001000));
+    CHECK(limiter.allow_key(key, 60000000, 0, 150001000, 30001000));
+}
+
+TEST(rate_limit, overflowing_history_eventually_drains_after_migration) {
+    using namespace rut;
+    RateLimiter limiter{};
+    const u64 key = 0xfeedbeef;
+    for (u32 i = 0; i < RateLimiter::kHistory + 1; i++)
+        REQUIRE(limiter.allow_key(key, 10, 1000, 1000));
+
+    CHECK_FALSE(limiter.allow_key(key, 100, 0, 1000, 1000, 1000));
+    CHECK(limiter.allow_key(key, 100, 0, 2100, 1000, 1000));
+    // Once every retained timestamp is outside the candidate horizon, the
+    // discarded older history is no longer relevant and the overflow penalty
+    // expires on the next policy migration.
+    CHECK(limiter.allow_key(key, 200, 0, 100000, 100000, 1000));
 }
 
 TEST(global_rate_limit, token_bucket_shared) {
@@ -2777,6 +2851,82 @@ TEST(global_rate_limit, token_bucket_shared) {
     CHECK(rl.allow_key(kKey, kEmit, kTau, 1010));   // one token refilled after 10µs
     CHECK(rl.allow_key(0x99, kEmit, kTau, 1000));   // a different key is independent
     CHECK(rl.allow_key(kKey, 0, 0, 1000));          // emit==0 disables
+}
+
+TEST(global_rate_limit, policy_migration_is_not_reversed_by_predecessor_shards) {
+    using namespace rut;
+    GlobalRateLimiter rl{};
+    rl.reset();
+    const u64 key = 0xABCDEF12;
+    REQUIRE(rl.allow_key(key, 10, 0, 1000));
+
+    // The candidate migrates the occupied bucket to a slower policy at its
+    // activation boundary. A request from a shard still serving the predecessor
+    // must use that installed policy rather than converting the slot back.
+    CHECK_FALSE(rl.allow_key(key, 100, 0, 1000, 1000));
+    CHECK_FALSE(rl.allow_key(key, 10, 0, 1010, 0));
+    u64 hash = key * 0x9E3779B97F4A7C15ull;
+    hash ^= hash >> 29;
+    CHECK_EQ(rl.slots[hash % GlobalRateLimiter::kSlots].emit_us, 100u);
+}
+
+TEST(global_rate_limit, concurrent_updates_wait_for_the_slot_owner) {
+    using namespace rut;
+    GlobalRateLimiter rl{};
+    rl.reset();
+    const u64 key = 0x12345678;
+    u64 hash = key * 0x9E3779B97F4A7C15ull;
+    hash ^= hash >> 29;
+    auto& slot = rl.slots[hash % GlobalRateLimiter::kSlots];
+    REQUIRE_FALSE(slot.lock.test_and_set(std::memory_order_acquire));
+
+    std::atomic<bool> started{false};
+    bool allowed = false;
+    std::thread waiter([&] {
+        started.store(true, std::memory_order_release);
+        allowed = rl.allow_key(key, 10, 0, 1000);
+    });
+    while (!started.load(std::memory_order_acquire)) std::this_thread::yield();
+    std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    slot.lock.clear(std::memory_order_release);
+    waiter.join();
+    CHECK(allowed);  // brief contention is retried without an unbounded spin
+}
+
+TEST(global_rate_limit, colliding_keys_share_debt_instead_of_resetting) {
+    using namespace rut;
+    GlobalRateLimiter rl{};
+    rl.reset();
+    const u64 first = 1;
+    auto slot_for = [](u64 key) {
+        u64 hash = key * 0x9E3779B97F4A7C15ull;
+        hash ^= hash >> 29;
+        return hash % GlobalRateLimiter::kSlots;
+    };
+    u64 second = 2;
+    while (slot_for(second) != slot_for(first)) second++;
+    REQUIRE(rl.allow_key(first, 10, 0, 1000));
+    CHECK_FALSE(rl.allow_key(second, 10, 0, 1000));
+    CHECK_FALSE(rl.allow_key(first, 10, 0, 1000));
+}
+
+TEST(global_rate_limit, colliding_key_uses_its_own_stricter_policy) {
+    using namespace rut;
+    GlobalRateLimiter rl{};
+    rl.reset();
+    const u64 loose_key = 1;
+    auto slot_for = [](u64 key) {
+        u64 hash = key * 0x9E3779B97F4A7C15ull;
+        hash ^= hash >> 29;
+        return hash % GlobalRateLimiter::kSlots;
+    };
+    u64 strict_key = 2;
+    while (slot_for(strict_key) != slot_for(loose_key)) strict_key++;
+    REQUIRE(rl.allow_key(loose_key, 10, 0, 1000));
+    CHECK_FALSE(rl.allow_key(strict_key, 100, 0, 1000));
+    const auto& slot = rl.slots[slot_for(strict_key)];
+    CHECK_EQ(slot.emit_us, 100u);
+    CHECK_EQ(slot.tat, 1100u);
 }
 
 TEST(upstream_concurrency, gauge_acquire_release) {

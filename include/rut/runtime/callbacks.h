@@ -162,6 +162,11 @@ void record_probe_if_current(Loop* loop, Connection& conn, bool healthy, u64 now
 // Clear ALL per-(upstream, backend) active/passive health verdicts. Called from
 // sweep_health_probes on a config change (hot reload). Defined in callbacks_impl.h.
 void reset_backend_health();
+void inherit_backend_health(u64 old_generation,
+                            u16 old_upstream_id,
+                            u64 new_generation,
+                            u16 new_upstream_id,
+                            u32 backend_count);
 
 template <typename Loop>
 void on_early_upstream_recvd_send_inflight(void* lp, Connection& conn, IoEvent ev);

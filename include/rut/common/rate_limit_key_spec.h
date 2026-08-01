@@ -71,12 +71,20 @@ enum class RateLimitScope : u8 {
 // per @rateLimit) — a request must pass them all (e.g. an anonymous per-IP cap
 // and a higher per-API-key cap coexist).
 struct RateLimitRule {
+    // Stable semantic identity assigned after route lowering. Compatible reloads
+    // reuse the same limiter bucket; changed routes/rules receive a new one.
+    u64 identity = 0;
     u32 max = 0;         // tokens per window (steady rate = max / window_sec)
     u32 window_sec = 0;  // refill window
     u32 burst = 0;       // bucket capacity; 0 in the spec means "default to max"
     RateLimitScope scope = RateLimitScope::Shard;
     u64 emit_interval_us = 0;  // µs between tokens (0 = rule disabled)
     u64 tau_us = 0;            // burst tolerance, in µs
+    u64 window_us = 0;         // complete accounting horizon, in µs
+    // Monotonic activation boundary used to translate predecessor GCRA history
+    // when a compatible reload changes emit/tau. Zero means no migration is
+    // required (or a hand-built rule that migrates at first observation).
+    u64 migration_time_us = 0;
     RateLimitKeySpec key{};
 };
 
@@ -107,9 +115,11 @@ struct RateLimitRuleSet {
             if (emit == 0) emit = 1;  // clamp: extremely high rate → ~1 token/µs
             r.emit_interval_us = emit;
             r.tau_us = (r.burst > 0 ? static_cast<u64>(r.burst - 1) : 0) * emit;
+            r.window_us = static_cast<u64>(window_sec) * 1000000ull;
         } else {
             r.emit_interval_us = 0;  // disabled
             r.tau_us = 0;
+            r.window_us = 0;
         }
         return static_cast<i32>(count++);
     }

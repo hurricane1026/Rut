@@ -2162,6 +2162,22 @@ TEST(control_plane_mutation, handler_context_latches_only_the_explicit_loop_capa
     CHECK(ctx.control_plane_mutation == nullptr);
 }
 
+TEST(control_plane_mutation, terminal_outcome_names_are_explicit_and_stable) {
+    CHECK_EQ(std::string(reload_terminal_outcome_name(ReloadTerminalOutcome::None)), "none");
+    CHECK_EQ(std::string(reload_terminal_outcome_name(ReloadTerminalOutcome::Activated)),
+             "activated");
+    CHECK_EQ(std::string(reload_terminal_outcome_name(ReloadTerminalOutcome::CompileFailed)),
+             "compile_failed");
+    CHECK_EQ(std::string(reload_terminal_outcome_name(ReloadTerminalOutcome::ValidationFailed)),
+             "validation_failed");
+    CHECK_EQ(std::string(reload_terminal_outcome_name(ReloadTerminalOutcome::Busy)), "busy");
+    CHECK_EQ(std::string(reload_terminal_outcome_name(ReloadTerminalOutcome::Stopped)), "stopped");
+    CHECK_EQ(std::string(reload_terminal_outcome_name(ReloadTerminalOutcome::AdmissionContended)),
+             "admission_contended");
+    CHECK_EQ(std::string(reload_terminal_outcome_name(ReloadTerminalOutcome::CounterExhausted)),
+             "counter_exhausted");
+}
+
 int main(int argc, char** argv) {
     return rut::test::run_all(argc, argv);
 }

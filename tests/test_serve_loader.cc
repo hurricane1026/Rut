@@ -12,6 +12,10 @@
 #include <fstream>
 #include <string>
 
+#include <fcntl.h>
+#include <sys/stat.h>
+#include <unistd.h>
+
 using namespace rut;
 
 namespace {
@@ -423,6 +427,187 @@ TEST(serve_loader, import_resolves_relative_to_program) {
     REQUIRE(load_rut_program(path.c_str(), program, err));
     CHECK_EQ(program.config.route_count, 1u);
     program.destroy();
+}
+
+TEST(serve_loader, reload_snapshot_captures_relative_import_graph) {
+    const std::string dir = "/tmp/rut_serve_loader_snapshot_import";
+    const std::string version_dir = dir + "/releases/v1";
+    write_file(version_dir, "auth.rut", "func jwtAuth() -> i32 => 200\n");
+    const std::string path = write_file(
+        version_dir,
+        "main.rut",
+        "import \"auth.rut\"\n"
+        "route GET \"/users\" { if jwtAuth() == 200 { return 200 } else { return 500 } }\n");
+    const std::string current = dir + "/current.rut";
+    std::error_code error;
+    std::filesystem::remove(current, error);
+    error.clear();
+    std::filesystem::create_symlink(
+        std::filesystem::path(path).lexically_relative(dir), current, error);
+    REQUIRE_FALSE(error);
+
+    LoadedProgram program;
+    LoadError err;
+    REQUIRE(load_rut_program_snapshot(current.c_str(), program, err));
+    CHECK_EQ(program.config.route_count, 1u);
+    program.destroy();
+}
+
+TEST(serve_loader, reload_snapshot_preserves_parse_diagnostic) {
+    const std::string dir = "/tmp/rut_serve_loader_snapshot_parse";
+    const std::string path = write_file(dir, "broken.rut", "route GET \"/\" { this is broken\n");
+    const std::string current = dir + "/current.rut";
+    std::error_code error;
+    std::filesystem::remove(current, error);
+    error.clear();
+    std::filesystem::create_symlink(
+        std::filesystem::path(path).lexically_relative(dir), current, error);
+    REQUIRE_FALSE(error);
+
+    LoadedProgram program;
+    LoadError load_error;
+    CHECK_FALSE(load_rut_program_snapshot(current.c_str(), program, load_error));
+    CHECK_EQ(load_error.stage, LoadStage::Parse);
+    CHECK(load_error.has_diag);
+    program.destroy();
+}
+
+TEST(serve_loader, reload_snapshot_rejects_unrepresentable_source_before_allocating) {
+    const std::string dir = "/tmp/rut_serve_loader_snapshot_oversized";
+    const std::string version_dir = dir + "/releases/v1";
+    std::error_code error;
+    std::filesystem::remove_all(dir, error);
+    std::filesystem::create_directories(version_dir, error);
+    REQUIRE_FALSE(error);
+    const auto source = std::filesystem::path(write_file(version_dir, "main.rut", ""));
+    std::filesystem::resize_file(source, u64{0x100000000}, error);
+    REQUIRE_FALSE(error);
+    const auto current = std::filesystem::path(dir) / "current.rut";
+    std::filesystem::create_symlink(source.lexically_relative(dir), current, error);
+    REQUIRE_FALSE(error);
+
+    LoadedProgram program;
+    LoadError load_error;
+    CHECK_FALSE(load_rut_program_snapshot(current.c_str(), program, load_error));
+    CHECK_EQ(load_error.stage, LoadStage::Read);
+    program.destroy();
+    std::filesystem::remove_all(dir, error);
+}
+
+TEST(serve_loader, reload_snapshot_rejects_unversioned_import_graph) {
+    const std::string dir = "/tmp/rut_serve_loader_unversioned_import";
+    write_file(dir, "auth.rut", "func jwtAuth() -> i32 => 200\n");
+    const std::string path = write_file(dir,
+                                        "main.rut",
+                                        "import \"auth.rut\"\n"
+                                        "route GET \"/users\" { return jwtAuth() }\n");
+    LoadedProgram program;
+    LoadError err;
+    CHECK_FALSE(load_rut_program_snapshot(path.c_str(), program, err));
+    CHECK_EQ(err.stage, LoadStage::Read);
+    program.destroy();
+}
+
+TEST(serve_loader, reload_snapshot_rejects_import_symlink_escape) {
+    const std::string dir = "/tmp/rut_serve_loader_snapshot_escape";
+    const std::string version_dir = dir + "/releases/v1";
+    const std::string external = write_file(dir, "external.rut", "func code() -> i32 => 200\n");
+    std::filesystem::create_directories(version_dir);
+    std::error_code error;
+    const auto imported = std::filesystem::path(version_dir) / "auth.rut";
+    std::filesystem::remove(imported, error);
+    error.clear();
+    std::filesystem::create_symlink(external, imported, error);
+    REQUIRE_FALSE(error);
+    const std::string root = write_file(
+        version_dir, "main.rut", "import \"auth.rut\"\nroute GET \"/\" { return code() }\n");
+    const auto current = std::filesystem::path(dir) / "current.rut";
+    std::filesystem::remove(current, error);
+    error.clear();
+    std::filesystem::create_symlink(
+        std::filesystem::path(root).lexically_relative(dir), current, error);
+    REQUIRE_FALSE(error);
+    LoadedProgram program;
+    LoadError load_error;
+    CHECK_FALSE(load_rut_program_snapshot(current.c_str(), program, load_error));
+    program.destroy();
+}
+
+TEST(serve_loader, reload_snapshot_rejects_internal_import_symlink_alias) {
+    const std::string dir = "/tmp/rut_serve_loader_snapshot_alias";
+    const std::string version_dir = dir + "/releases/v1";
+    std::error_code error;
+    std::filesystem::remove_all(dir, error);
+    write_file(version_dir, "auth.rut", "func code() -> i32 => 200\n");
+    std::filesystem::create_symlink(
+        "auth.rut", std::filesystem::path(version_dir) / "alias.rut", error);
+    REQUIRE_FALSE(error);
+    const std::string root = write_file(
+        version_dir, "main.rut", "import \"alias.rut\"\nroute GET \"/\" { return code() }\n");
+    const auto current = std::filesystem::path(dir) / "current.rut";
+    std::filesystem::create_symlink(
+        std::filesystem::path(root).lexically_relative(dir), current, error);
+    REQUIRE_FALSE(error);
+    LoadedProgram program;
+    LoadError load_error;
+    CHECK_FALSE(load_rut_program_snapshot(current.c_str(), program, load_error));
+    program.destroy();
+}
+
+TEST(serve_loader, reload_snapshot_rejects_fifo_source_without_opening_it) {
+    const std::string dir = "/tmp/rut_serve_loader_snapshot_fifo";
+    std::error_code error;
+    std::filesystem::remove_all(dir, error);
+    std::filesystem::create_directories(dir, error);
+    REQUIRE_FALSE(error);
+    const auto fifo = std::filesystem::path(dir) / "version.rut";
+    REQUIRE_EQ(mkfifo(fifo.c_str(), 0600), 0);
+    const auto current = std::filesystem::path(dir) / "current.rut";
+    std::filesystem::create_symlink("version.rut", current, error);
+    REQUIRE_FALSE(error);
+    LoadedProgram program;
+    LoadError load_error;
+    CHECK_FALSE(load_rut_program_snapshot(current.c_str(), program, load_error));
+    program.destroy();
+}
+
+TEST(serve_loader, reload_snapshot_reports_inaccessible_relative_path) {
+    const int cwd = open(".", O_RDONLY | O_DIRECTORY);
+    REQUIRE(cwd >= 0);
+    const std::string dir = "/tmp/rut_serve_loader_removed_cwd";
+    std::error_code error;
+    std::filesystem::remove_all(dir, error);
+    std::filesystem::create_directories(dir);
+    REQUIRE_EQ(chdir(dir.c_str()), 0);
+    std::filesystem::remove(dir, error);
+    REQUIRE_FALSE(error);
+    LoadedProgram program;
+    LoadError load_error;
+    CHECK_FALSE(load_rut_program_snapshot("current.rut", program, load_error));
+    CHECK_EQ(load_error.stage, LoadStage::Read);
+    REQUIRE_EQ(fchdir(cwd), 0);
+    close(cwd);
+    program.destroy();
+}
+
+TEST(serve_loader, timer_semantic_identity_changes_with_lowered_body) {
+    const std::string dir = "/tmp/rut_serve_loader_timer_identity";
+    const std::string first_path =
+        write_file(dir, "first.rut", "timer tick, every: 5s { return 200 }\n");
+    const std::string second_path =
+        write_file(dir, "second.rut", "timer tick, every: 5s { return 201 }\n");
+    LoadedProgram first;
+    LoadedProgram second;
+    LoadError error;
+    REQUIRE(load_rut_program(first_path.c_str(), first, error));
+    REQUIRE(load_rut_program(second_path.c_str(), second, error));
+    REQUIRE_EQ(first.config.timer_count, 1u);
+    REQUIRE_EQ(second.config.timer_count, 1u);
+    CHECK_NE(first.config.timers[0].semantic_identity, 0u);
+    CHECK_NE(second.config.timers[0].semantic_identity, 0u);
+    CHECK_NE(first.config.timers[0].semantic_identity, second.config.timers[0].semantic_identity);
+    first.destroy();
+    second.destroy();
 }
 
 TEST(serve_loader, unknown_import_reports_copied_detail) {

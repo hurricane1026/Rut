@@ -470,7 +470,14 @@ Missing, reordered, or incompatible randomized-selection input is
 `Unsupported`.
 
 SIGHUP, file-watch reload, and an accepted `reload()` request use this one
-coordinator and the same validation path. For SIGHUP, the observable attempt
+coordinator and the same validation path. The production SIGHUP source provider
+resolves the configured source symlink exactly once. The symlink target is a
+provider-owned immutable version tree, and every relative import must remain
+inside it; mutable regular paths are rejected for live reload. Deployments publish
+a new version by atomically replacing the symlink, never by editing an already
+published target tree in place.
+
+For SIGHUP, the observable attempt
 boundary is one record read from `signalfd`: Linux may coalesce multiple standard
 SIGHUP sends before that read, and those unobservable sends are one attempt, not
 several missing terminal records. Each observed record is a non-queued admission

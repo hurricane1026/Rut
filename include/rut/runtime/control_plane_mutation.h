@@ -7,6 +7,11 @@
 
 namespace rut {
 
+// Replay executes captured requests outside live traffic admission. Keep this
+// thread-local so replay cannot latch a real mutation port into its handler
+// context even when the loop does not expose a capture ring.
+inline thread_local bool control_plane_replay_mode = false;
+
 enum class ReloadRequestSource : u8 {
     Route = 0,
     Signal,
@@ -30,6 +35,28 @@ enum class ReloadTerminalOutcome : u8 {
     AdmissionContended,
     CounterExhausted,
 };
+
+constexpr const char* reload_terminal_outcome_name(ReloadTerminalOutcome outcome) {
+    switch (outcome) {
+        case ReloadTerminalOutcome::None:
+            return "none";
+        case ReloadTerminalOutcome::Activated:
+            return "activated";
+        case ReloadTerminalOutcome::CompileFailed:
+            return "compile_failed";
+        case ReloadTerminalOutcome::ValidationFailed:
+            return "validation_failed";
+        case ReloadTerminalOutcome::Busy:
+            return "busy";
+        case ReloadTerminalOutcome::Stopped:
+            return "stopped";
+        case ReloadTerminalOutcome::AdmissionContended:
+            return "admission_contended";
+        case ReloadTerminalOutcome::CounterExhausted:
+            return "counter_exhausted";
+    }
+    return "none";
+}
 
 enum class ManualHealthOverride : u8 {
     None = 0,
@@ -211,6 +238,9 @@ public:
             for (u32 attempt = 0; attempt < kMaxAdmissionAttempts; attempt++) {
                 if (unpack_state(observed) != ReloadAdmissionState::Idle) break;
                 if (source == ReloadRequestSource::Route && !unpack_route_enabled(observed))
+                    return false;
+                if (source == ReloadRequestSource::Route &&
+                    active_generation_.load(std::memory_order_acquire) >= kMaxGeneration)
                     return false;
                 // Serialize the request claim through identity reservation
                 // with Busy terminal publication and stop(). No observer can
@@ -2524,6 +2554,7 @@ inline void latch_control_plane_mutation(Loop* loop, jit::HandlerCtx* ctx, u64 c
     ctx->control_plane_mutation = nullptr;
     ctx->config_generation = config_generation;
     if (loop == nullptr) return;
+    if (control_plane_replay_mode) return;
     if constexpr (requires { loop->control_plane_mutation; })
         ctx->control_plane_mutation = loop->control_plane_mutation;
 }

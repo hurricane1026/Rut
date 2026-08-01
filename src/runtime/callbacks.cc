@@ -800,6 +800,18 @@ void reset_backend_health() {
         }
 }
 
+void inherit_backend_health(u64 old_generation,
+                            u16 old_upstream_id,
+                            u64 new_generation,
+                            u16 new_upstream_id,
+                            u32 backend_count) {
+    for (u32 backend = 0; backend < backend_count; backend++) {
+        BackendHealth* source = backend_health(old_generation, old_upstream_id, backend);
+        BackendHealth* destination = backend_health(new_generation, new_upstream_id, backend);
+        if (source != nullptr && destination != nullptr) *destination = *source;
+    }
+}
+
 bool probe_in_flight(u16 upstream_id, u32 backend_idx) {
     const bool* s = probe_in_flight_slot(upstream_id, backend_idx);
     return s != nullptr && *s;

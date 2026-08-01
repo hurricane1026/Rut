@@ -193,14 +193,44 @@ public:
         // added slot, which would fire on the next tick instead of after `every`).
         const u64 generation = cfg != nullptr ? cfg->config_generation : 0;
         if (cfg != timer_armed_config || generation != timer_armed_generation) {
+            const RouteConfig* previous = timer_armed_config;
+            u64 previous_deadlines[RouteConfig::kMaxTimers]{};
+            for (u32 i = 0; i < RouteConfig::kMaxTimers; i++)
+                previous_deadlines[i] = timer_deadline_ns[i];
             timer_armed_config = cfg;
             timer_armed_generation = generation;
             if (cfg != nullptr) {
                 const u32 m = cfg->timer_count < RouteConfig::kMaxTimers ? cfg->timer_count
                                                                          : RouteConfig::kMaxTimers;
-                for (u32 i = 0; i < m; i++)
+                bool previous_used[RouteConfig::kMaxTimers]{};
+                for (u32 i = 0; i < m; i++) {
                     timer_deadline_ns[i] =
                         now + static_cast<u64>(cfg->timers[i].interval_ms) * 1'000'000ull;
+                    if (previous == nullptr) continue;
+                    const auto& next = cfg->timers[i];
+                    const u32 previous_count = previous->timer_count < RouteConfig::kMaxTimers
+                                                   ? previous->timer_count
+                                                   : RouteConfig::kMaxTimers;
+                    for (u32 j = 0; j < previous_count; j++) {
+                        if (previous_used[j]) continue;
+                        const auto& old = previous->timers[j];
+                        if (old.name_len != next.name_len || old.interval_ms != next.interval_ms ||
+                            old.shard != next.shard ||
+                            old.needs_control_plane_snapshot != next.needs_control_plane_snapshot ||
+                            old.semantic_identity != next.semantic_identity)
+                            continue;
+                        bool same_name = true;
+                        for (u32 c = 0; c < old.name_len; c++)
+                            if (old.name[c] != next.name[c]) {
+                                same_name = false;
+                                break;
+                            }
+                        if (!same_name) continue;
+                        timer_deadline_ns[i] = previous_deadlines[j];
+                        previous_used[j] = true;
+                        break;
+                    }
+                }
             }
             return;
         }
@@ -265,6 +295,10 @@ public:
         const RouteConfig* cfg = cfg_ptr ? *cfg_ptr : nullptr;
         const u64 generation = cfg != nullptr ? cfg->config_generation : 0;
         if (cfg == health_armed_config && generation == health_armed_generation) return false;
+        const RouteConfig* previous = health_armed_config;
+        u64 previous_deadlines[RouteConfig::kMaxUpstreams]{};
+        for (u32 i = 0; i < RouteConfig::kMaxUpstreams; i++)
+            previous_deadlines[i] = health_probe_deadline_ns[i];
         health_armed_config = cfg;
         health_armed_generation = generation;
         health_probe_sweep_cursor = 0;
@@ -274,9 +308,40 @@ public:
             const u32 m = cfg->upstream_count < RouteConfig::kMaxUpstreams
                               ? cfg->upstream_count
                               : RouteConfig::kMaxUpstreams;
-            for (u32 u = 0; u < m; u++)
+            for (u32 u = 0; u < m; u++) {
                 health_probe_deadline_ns[u] =
                     now + static_cast<u64>(cfg->upstreams[u].hc_interval_ms) * 1'000'000ull;
+                if (previous == nullptr || !cfg->upstreams[u].hc_enabled) continue;
+                const auto& next = cfg->upstreams[u];
+                const u32 old_count = previous->upstream_count < RouteConfig::kMaxUpstreams
+                                          ? previous->upstream_count
+                                          : RouteConfig::kMaxUpstreams;
+                for (u32 old_index = 0; old_index < old_count; old_index++) {
+                    const auto& old = previous->upstreams[old_index];
+                    if (!old.hc_enabled || old.name_identity != next.name_identity ||
+                        old.hc_interval_ms != next.hc_interval_ms ||
+                        old.hc_expected_status != next.hc_expected_status ||
+                        old.hc_path_len != next.hc_path_len || old.addr_count != next.addr_count)
+                        continue;
+                    bool same = true;
+                    for (u32 c = 0; c < old.hc_path_len; c++)
+                        if (old.hc_path[c] != next.hc_path[c]) same = false;
+                    for (u32 address = 0; address < old.addr_count; address++)
+                        if (old.addrs[address].sin_family != next.addrs[address].sin_family ||
+                            old.addrs[address].sin_addr.s_addr !=
+                                next.addrs[address].sin_addr.s_addr ||
+                            old.addrs[address].sin_port != next.addrs[address].sin_port)
+                            same = false;
+                    if (!same) continue;
+                    health_probe_deadline_ns[u] = previous_deadlines[old_index];
+                    inherit_backend_health(previous->config_generation,
+                                           static_cast<u16>(old_index),
+                                           cfg->config_generation,
+                                           static_cast<u16>(u),
+                                           next.addr_count);
+                    break;
+                }
+            }
         }
         return true;
     }

@@ -530,12 +530,14 @@ ScenarioResult drive_scenario(const ScenarioSpec& scenario, const HarnessSpec& h
         key_input.path_len = routing_path.len;
         key_input.params = route_params;
         key_input.param_count = route_param_count;
-        rate_limited = rate_limit_exceeded_with_limiters(*rate_limiter,
-                                                         &state->global_rate_limiter,
-                                                         route->rate_limit,
-                                                         out.route_index,
-                                                         key_input,
-                                                         scenario.now_us);
+        rate_limited =
+            rate_limit_exceeded_with_limiters(*rate_limiter,
+                                              &state->global_rate_limiter,
+                                              route->rate_limit,
+                                              scenario.target->program.config.config_generation,
+                                              out.route_index,
+                                              key_input,
+                                              scenario.now_us);
     }
 
     if (rate_limited) {

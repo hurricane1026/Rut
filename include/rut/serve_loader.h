@@ -89,6 +89,16 @@ bool load_rut_program(const char* path,
                       jit::OptLevel opt = jit::OptLevel::O2,
                       u64 max_source_bytes = ~u64{0});
 
+// Resolve an atomically replaced symlink once, then capture its root and
+// relative imports from the provider-owned immutable version tree. Regular
+// mutable paths are rejected for live reload; all imports must remain inside
+// the selected version tree.
+bool load_rut_program_snapshot(const char* path,
+                               LoadedProgram& out,
+                               LoadError& err,
+                               jit::OptLevel opt = jit::OptLevel::O2,
+                               u64 max_source_bytes = ~u64{0});
+
 // Publish the program's Cache descriptors as part of installing its
 // RouteConfig. Compilation alone never mutates the live Cache registry;
 // callers must invoke this at the config activation boundary. The current

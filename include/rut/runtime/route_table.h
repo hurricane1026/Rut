@@ -299,6 +299,7 @@ struct RouteConfig {
         // `shard: N` — fire on that shard only; -1 = every shard (default).
         i32 shard = -1;
         bool needs_control_plane_snapshot = false;
+        u64 semantic_identity = 0;
     };
     TimerEntry timers[kMaxTimers];
     u32 timer_count = 0;
@@ -321,7 +322,8 @@ struct RouteConfig {
                    u32 interval_ms,
                    jit::HandlerFn fn,
                    i32 shard = -1,
-                   bool needs_control_plane_snapshot = false) {
+                   bool needs_control_plane_snapshot = false,
+                   u64 semantic_identity = 0) {
         if (timer_count >= kMaxTimers || fn == nullptr || interval_ms == 0) return false;
         TimerEntry& t = timers[timer_count];
         const u32 kN = name_len < sizeof(t.name) - 1 ? name_len : sizeof(t.name) - 1;
@@ -332,6 +334,7 @@ struct RouteConfig {
         t.interval_ms = interval_ms;
         t.shard = shard;
         t.needs_control_plane_snapshot = needs_control_plane_snapshot;
+        t.semantic_identity = semantic_identity;
         timer_count++;
         return true;
     }
@@ -475,6 +478,44 @@ struct RouteConfig {
     u32 firewall_allow_port_count = 0;
     u32 firewall_deny_port_count = 0;
     bool firewall_default_allow = true;
+
+    bool same_firewall_policy(const RouteConfig& other) const {
+        if (firewall_allow_count != other.firewall_allow_count ||
+            firewall_deny_count != other.firewall_deny_count ||
+            firewall_allow_cidr_count != other.firewall_allow_cidr_count ||
+            firewall_deny_cidr_count != other.firewall_deny_cidr_count ||
+            firewall_allow_range_count != other.firewall_allow_range_count ||
+            firewall_deny_range_count != other.firewall_deny_range_count ||
+            firewall_allow_port_count != other.firewall_allow_port_count ||
+            firewall_deny_port_count != other.firewall_deny_port_count ||
+            firewall_default_allow != other.firewall_default_allow)
+            return false;
+        for (u32 i = 0; i < firewall_allow_count; i++)
+            if (firewall_allow_ips[i] != other.firewall_allow_ips[i]) return false;
+        for (u32 i = 0; i < firewall_deny_count; i++)
+            if (firewall_deny_ips[i] != other.firewall_deny_ips[i]) return false;
+        for (u32 i = 0; i < firewall_allow_port_count; i++)
+            if (firewall_allow_ports[i] != other.firewall_allow_ports[i]) return false;
+        for (u32 i = 0; i < firewall_deny_port_count; i++)
+            if (firewall_deny_ports[i] != other.firewall_deny_ports[i]) return false;
+        for (u32 i = 0; i < firewall_allow_cidr_count; i++)
+            if (firewall_allow_cidrs[i].net_addr != other.firewall_allow_cidrs[i].net_addr ||
+                firewall_allow_cidrs[i].mask != other.firewall_allow_cidrs[i].mask)
+                return false;
+        for (u32 i = 0; i < firewall_deny_cidr_count; i++)
+            if (firewall_deny_cidrs[i].net_addr != other.firewall_deny_cidrs[i].net_addr ||
+                firewall_deny_cidrs[i].mask != other.firewall_deny_cidrs[i].mask)
+                return false;
+        for (u32 i = 0; i < firewall_allow_range_count; i++)
+            if (firewall_allow_ranges[i].start_ip != other.firewall_allow_ranges[i].start_ip ||
+                firewall_allow_ranges[i].end_ip != other.firewall_allow_ranges[i].end_ip)
+                return false;
+        for (u32 i = 0; i < firewall_deny_range_count; i++)
+            if (firewall_deny_ranges[i].start_ip != other.firewall_deny_ranges[i].start_ip ||
+                firewall_deny_ranges[i].end_ip != other.firewall_deny_ranges[i].end_ip)
+                return false;
+        return true;
+    }
 
     // Reject route paths that aren't in origin-form. Required by the
     // segment trie (which would otherwise silently mismatch malformed

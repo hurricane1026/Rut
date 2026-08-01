@@ -2,6 +2,7 @@
 
 #include "rut/common/types.h"
 #include "rut/runtime/connection.h"
+#include "rut/runtime/control_plane_mutation.h"
 #include "rut/runtime/io_event.h"
 #include "rut/runtime/traffic_capture.h"
 
@@ -162,6 +163,11 @@ struct ReplayReader {
 // Returns ReplayResult with comparison.
 template <typename Loop>
 ReplayResult replay_one(Loop& loop, const CaptureEntry& entry, i32 fake_fd) {
+    struct ReplayAdmissionGuard {
+        bool previous = control_plane_replay_mode;
+        ReplayAdmissionGuard() { control_plane_replay_mode = true; }
+        ~ReplayAdmissionGuard() { control_plane_replay_mode = previous; }
+    } replay_guard;
     ReplayResult result{};
     result.expected_status = entry.resp_status;
     result.replayed = false;

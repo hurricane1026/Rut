@@ -104,6 +104,8 @@ inline bool rir_function_needs_control_plane_snapshot(const rir::Function& fn) {
     return false;
 }
 
+inline u64 marking_policy_identity(const rir::Module& mod, const rir::Function& fn);
+
 inline bool configure_route_dispatch(RouteConfig& cfg, const rir::Module& mod) {
     if (cfg.route_count != 0) return false;
     if (mod.func_count > 0 && mod.functions == nullptr) return false;
@@ -154,7 +156,8 @@ inline bool register_jit_routes(RouteConfig& cfg, const rir::Module& mod, jit::J
                                fn.timer_interval_ms,
                                handler,
                                fn.timer_shard,
-                               rir_function_needs_control_plane_snapshot(fn)))
+                               rir_function_needs_control_plane_snapshot(fn),
+                               marking_policy_identity(mod, fn)))
                 return false;
             continue;
         }
@@ -182,6 +185,53 @@ inline bool register_jit_routes(RouteConfig& cfg, const rir::Module& mod, jit::J
                     const RateLimitKeyComponent& kc = rule.key.comps[ki];
                     cfg.add_route_rate_limit_key(kRouteIdx, kc.kind, kc.name, kc.name_len);
                 }
+                u64 identity = 1469598103934665603ull;
+                auto hash_byte = [&](u8 value) {
+                    identity ^= value;
+                    identity *= 1099511628211ull;
+                };
+                auto hash_u32 = [&](u32 value) {
+                    for (u32 byte = 0; byte < 4; byte++)
+                        hash_byte(static_cast<u8>(value >> (byte * 8u)));
+                };
+                hash_byte(fn.http_method);
+                hash_u32(fn.route_pattern.len);
+                for (u32 byte = 0; byte < fn.route_pattern.len; byte++)
+                    hash_byte(static_cast<u8>(fn.route_pattern.ptr[byte]));
+                u32 duplicate_ordinal = 0;
+                for (u32 previous = 0; previous < ri; previous++) {
+                    const auto& other = fn.rate_limit.rules[previous];
+                    bool same = other.max == rule.max && other.window_sec == rule.window_sec &&
+                                other.burst == rule.burst && other.scope == rule.scope &&
+                                other.key.count == rule.key.count;
+                    for (u32 ki = 0; same && ki < rule.key.count; ki++) {
+                        const auto& lhs = other.key.comps[ki];
+                        const auto& rhs = rule.key.comps[ki];
+                        same = lhs.kind == rhs.kind && lhs.name_len == rhs.name_len;
+                        for (u32 byte = 0; same && byte < lhs.name_len; byte++)
+                            same = lhs.name[byte] == rhs.name[byte];
+                    }
+                    if (same) duplicate_ordinal++;
+                }
+                // Policy participates in the provisional declaration identity,
+                // while the duplicate ordinal distinguishes truly identical
+                // siblings without depending on unrelated decorator insertion.
+                // The reload coordinator remaps a compatible policy edit to the
+                // predecessor allocation and supplies its activation timestamp.
+                hash_u32(rule.max);
+                hash_u32(rule.window_sec);
+                hash_u32(rule.burst);
+                hash_u32(duplicate_ordinal);
+                hash_byte(static_cast<u8>(rule.scope));
+                hash_byte(rule.key.count);
+                for (u32 ki = 0; ki < rule.key.count; ki++) {
+                    const auto& component = rule.key.comps[ki];
+                    hash_byte(static_cast<u8>(component.kind));
+                    hash_byte(component.name_len);
+                    for (u32 byte = 0; byte < component.name_len; byte++)
+                        hash_byte(static_cast<u8>(component.name[byte]));
+                }
+                cfg.routes[kRouteIdx].rate_limit.rules[ri].identity = identity;
             }
         }
         if (fn.throttle_down_bps > 0) {
