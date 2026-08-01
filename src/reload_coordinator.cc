@@ -396,16 +396,7 @@ ReloadCoordinatorPoll ProcessReloadCoordinator::poll() {
     // The admission callback captured this immutable source-version handle.
     // Never refresh the provider cache here: doing so could compile a newer
     // version than the one associated with the admitted request.
-    if (source_path == nullptr || source_path[0] == '\0' ||
-        !loader_(loader_context_, source_path, *spare_, last_load_error_, opt_)) {
-        spare_->destroy();
-        (void)mutation_->complete_reload(
-            request.id, request.source, ReloadTerminalOutcome::CompileFailed);
-        return ReloadCoordinatorPoll::CompileFailed;
-    }
-    // The admitted request has finished reading its source. Older snapshot
-    // roots retained across a cache swap can now be reclaimed safely.
-    {
+    auto reclaim_retired_snapshots = [&] {
         std::vector<std::string> roots;
         {
             std::lock_guard lock(source_snapshot_mutex_);
@@ -415,7 +406,18 @@ ReloadCoordinatorPoll ProcessReloadCoordinator::poll() {
             std::error_code ignored;
             std::filesystem::remove_all(root, ignored);
         }
+    };
+    if (source_path == nullptr || source_path[0] == '\0' ||
+        !loader_(loader_context_, source_path, *spare_, last_load_error_, opt_)) {
+        spare_->destroy();
+        reclaim_retired_snapshots();
+        (void)mutation_->complete_reload(
+            request.id, request.source, ReloadTerminalOutcome::CompileFailed);
+        return ReloadCoordinatorPoll::CompileFailed;
     }
+    // The admitted request has finished reading its source. Older snapshot
+    // roots retained across a cache swap can now be reclaimed safely.
+    reclaim_retired_snapshots();
     if (cancellation_check_ != nullptr && cancellation_check_(cancellation_context_)) {
         spare_->destroy();
         mutation_->stop();

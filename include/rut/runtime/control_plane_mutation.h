@@ -394,11 +394,17 @@ public:
                 char source_version[ReloadRequest::kMaxSourceVersion]{};
                 u32 source_version_len = 0;
                 bool snapshot_recorded = false;
-                if (source_version_capture_ != nullptr &&
-                    !source_version_capture_(source_version_capture_context_,
-                                             source_version,
-                                             ReloadRequest::kMaxSourceVersion,
-                                             &source_version_len)) {
+                bool snapshot_capture_failed = false;
+                if (source_version_capture_ != nullptr) {
+                    snapshot_capture_failed =
+                        !source_version_capture_(source_version_capture_context_,
+                                                 source_version,
+                                                 ReloadRequest::kMaxSourceVersion,
+                                                 &source_version_len);
+                    snapshot_capture_failed |=
+                        source_version_len >= ReloadRequest::kMaxSourceVersion;
+                }
+                if (snapshot_capture_failed) {
                     if (source == ReloadRequestSource::Signal) {
                         ClaimedRecordSlot snapshot_slot{};
                         const u64 snapshot_id = reserve_request_identity(&snapshot_slot);
@@ -420,12 +426,6 @@ public:
                     release_request_identity_claim();
                     unlock_terminal_publication();
                     if (request_id != nullptr && !snapshot_recorded) *request_id = 0;
-                    return false;
-                }
-                if (source_version_len >= ReloadRequest::kMaxSourceVersion) {
-                    release_request_identity_claim();
-                    unlock_terminal_publication();
-                    if (request_id != nullptr) *request_id = 0;
                     return false;
                 }
                 ClaimedRecordSlot identity_slot{};
