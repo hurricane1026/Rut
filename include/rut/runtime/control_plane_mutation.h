@@ -13,6 +13,7 @@ namespace rut {
 // thread-local so replay cannot latch a real mutation port into its handler
 // context even when the loop does not expose a capture ring.
 inline thread_local bool control_plane_replay_mode = false;
+inline thread_local bool control_plane_mark_replay_callback = false;
 
 enum class ReloadRequestSource : u8 {
     Route = 0,
@@ -278,7 +279,10 @@ public:
     }
 
     void set_upstream_mark_replay_sink(UpstreamMarkReplaySink sink, void* context) {
+        if (control_plane_mark_replay_callback) return;
         std::lock_guard lock(mark_replay_mutex_);
+        while (mark_replay_callbacks_.load(std::memory_order_acquire) != 0) {
+        }
         mark_replay_sink_ = sink;
         mark_replay_sink_context_ = context;
         mark_replay_sequence_.store(0, std::memory_order_release);
@@ -896,10 +900,8 @@ public:
     }
 
     [[nodiscard]] bool mark(ServerIdentity server, bool healthy) {
-        const auto emit_event =
+        const auto make_event =
             [&](bool accepted, UpstreamMarkReplayReason reason, u64 published_version = 0) {
-                std::lock_guard lock(mark_replay_mutex_);
-                if (mark_replay_sink_ == nullptr) return;
                 UpstreamMarkReplayEvent event{};
                 event.event_sequence =
                     mark_replay_sequence_.fetch_add(1, std::memory_order_acq_rel) + 1;
@@ -910,16 +912,31 @@ public:
                 event.accepted = accepted;
                 event.reason = reason;
                 event.published_version = published_version;
-                mark_replay_sink_(mark_replay_sink_context_, event);
+                return event;
             };
+        const auto publish_event = [&](const UpstreamMarkReplayEvent& event) {
+            UpstreamMarkReplaySink sink = nullptr;
+            void* context = nullptr;
+            {
+                std::lock_guard lock(mark_replay_mutex_);
+                sink = mark_replay_sink_;
+                context = mark_replay_sink_context_;
+                if (sink == nullptr) return;
+                mark_replay_callbacks_.fetch_add(1, std::memory_order_acq_rel);
+            }
+            control_plane_mark_replay_callback = true;
+            sink(context, event);
+            control_plane_mark_replay_callback = false;
+            mark_replay_callbacks_.fetch_sub(1, std::memory_order_release);
+        };
         if (stopping_.load(std::memory_order_acquire) != 0 ||
             cutover_.load(std::memory_order_acquire) != 0) {
-            emit_event(false, UpstreamMarkReplayReason::Unavailable);
+            publish_event(make_event(false, UpstreamMarkReplayReason::Unavailable));
             return false;
         }
         if (server.config_generation == 0 || server.upstream_id >= RouteConfig::kMaxUpstreams ||
             server.backend_id >= UpstreamTarget::kMaxBackends) {
-            emit_event(false, UpstreamMarkReplayReason::StaleOrForeign);
+            publish_event(make_event(false, UpstreamMarkReplayReason::StaleOrForeign));
             return false;
         }
         const u64 generation = server.config_generation;
@@ -931,7 +948,7 @@ public:
                 break;
             }
         if (bank == 2) {
-            emit_event(false, UpstreamMarkReplayReason::StaleOrForeign);
+            publish_event(make_event(false, UpstreamMarkReplayReason::StaleOrForeign));
             return false;
         }
         u8 writer_open = 0;
@@ -945,7 +962,7 @@ public:
             writer_open = 0;
         }
         if (!writer_claimed) {
-            emit_event(false, UpstreamMarkReplayReason::Contended);
+            publish_event(make_event(false, UpstreamMarkReplayReason::Contended));
             return false;
         }
 
@@ -970,7 +987,7 @@ public:
         u64 stable_seq = 0;
         if (!claim_sequence(sequence, &stable_seq)) {
             override_writer_claim_.store(0, std::memory_order_release);
-            emit_event(false, UpstreamMarkReplayReason::Contended);
+            publish_event(make_event(false, UpstreamMarkReplayReason::Contended));
             return false;
         }
 
@@ -985,7 +1002,7 @@ public:
         if (has_peer && !claim_sequence(override_seq_[peer_bank], &peer_stable_seq)) {
             sequence.store(stable_seq + 2, std::memory_order_release);
             override_writer_claim_.store(0, std::memory_order_release);
-            emit_event(false, UpstreamMarkReplayReason::Contended);
+            publish_event(make_event(false, UpstreamMarkReplayReason::Contended));
             return false;
         }
 
@@ -1004,7 +1021,7 @@ public:
                 override_seq_[peer_bank].store(peer_stable_seq + 2, std::memory_order_release);
             sequence.store(stable_seq + 2, std::memory_order_release);
             override_writer_claim_.store(0, std::memory_order_release);
-            emit_event(false, UpstreamMarkReplayReason::Unavailable);
+            publish_event(make_event(false, UpstreamMarkReplayReason::Unavailable));
             return false;
         }
         slot.store(desired, std::memory_order_relaxed);
@@ -1026,7 +1043,7 @@ public:
                     override_seq_[peer_bank].store(peer_stable_seq + 2, std::memory_order_release);
                 sequence.store(stable_seq + 2, std::memory_order_release);
                 override_writer_claim_.store(0, std::memory_order_release);
-                emit_event(false, UpstreamMarkReplayReason::VersionExhausted);
+                publish_event(make_event(false, UpstreamMarkReplayReason::VersionExhausted));
                 return false;
             }
             const u64 version = prior_version + 1;
@@ -1044,8 +1061,10 @@ public:
                 override_seq_[peer_bank].store(peer_stable_seq + 2, std::memory_order_release);
             }
             sequence.store(stable_seq + 2, std::memory_order_release);
-            emit_event(true, UpstreamMarkReplayReason::Published, stable_seq + 2);
+            const auto success_event =
+                make_event(true, UpstreamMarkReplayReason::Published, stable_seq + 2);
             override_writer_claim_.store(0, std::memory_order_release);
+            publish_event(success_event);
             return true;
         }
         // Readers ignore odd sequences while the prior value is restored. Use a
@@ -1058,7 +1077,7 @@ public:
         }
         sequence.store(stable_seq + 2, std::memory_order_release);
         override_writer_claim_.store(0, std::memory_order_release);
-        emit_event(false, UpstreamMarkReplayReason::Unavailable);
+        publish_event(make_event(false, UpstreamMarkReplayReason::Unavailable));
         return false;
     }
 
@@ -2630,6 +2649,7 @@ private:
     UpstreamMarkReplaySink mark_replay_sink_ = nullptr;
     void* mark_replay_sink_context_ = nullptr;
     std::atomic<u64> mark_replay_sequence_{0};
+    std::atomic<u32> mark_replay_callbacks_{0};
     std::mutex mark_replay_mutex_;
     ReloadSourceVersionCapture source_version_capture_ = nullptr;
     void* source_version_capture_context_ = nullptr;
