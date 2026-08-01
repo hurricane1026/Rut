@@ -18463,6 +18463,12 @@ static FrontendResult<u32> analyze_for_stmt(const AstStatement& stmt,
                                     inner.expr.span,
                                     lit_str("upstream.mark cannot initialize a static for-loop "
                                             "local"));
+                            if (hir_expr_contains_reload_request(init.value()))
+                                return frontend_error(
+                                    FrontendError::UnsupportedSyntax,
+                                    inner.expr.span,
+                                    lit_str("reload cannot initialize a static for-loop match arm "
+                                            "local"));
                             if (init->may_error && init->kind != HirExprKind::Error &&
                                 init->kind != HirExprKind::LocalRef)
                                 return frontend_error(

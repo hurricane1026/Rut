@@ -76,16 +76,18 @@ ProcessReloadCoordinator::~ProcessReloadCoordinator() {
 }
 
 void ProcessReloadCoordinator::clear_source_snapshots() {
-    std::string previous_root;
+    std::vector<std::string> roots;
     {
         std::lock_guard lock(source_snapshot_mutex_);
-        previous_root = std::move(source_snapshot_root_);
+        if (!source_snapshot_root_.empty())
+            retired_snapshot_roots_.push_back(std::move(source_snapshot_root_));
         cached_snapshot_source_.clear();
         cached_provider_version_.clear();
+        roots.swap(retired_snapshot_roots_);
     }
-    if (!previous_root.empty()) {
+    for (const auto& root : roots) {
         std::error_code ignored;
-        std::filesystem::remove_all(previous_root, ignored);
+        std::filesystem::remove_all(root, ignored);
     }
 }
 
@@ -111,8 +113,14 @@ bool ProcessReloadCoordinator::refresh_source_snapshot() {
                                                  &source_len,
                                                  snapshot_root,
                                                  sizeof(snapshot_root),
-                                                 &root_len))
+                                                 &root_len)) {
+        std::lock_guard lock(source_snapshot_mutex_);
+        cached_snapshot_source_.clear();
+        cached_provider_version_.clear();
+        if (!source_snapshot_root_.empty())
+            retired_snapshot_roots_.push_back(std::move(source_snapshot_root_));
         return false;
+    }
     std::string previous_root;
     {
         std::lock_guard lock(source_snapshot_mutex_);
@@ -127,8 +135,23 @@ bool ProcessReloadCoordinator::refresh_source_snapshot() {
         }
     }
     if (!previous_root.empty()) {
-        std::error_code ignored;
-        std::filesystem::remove_all(previous_root, ignored);
+        std::lock_guard lock(source_snapshot_mutex_);
+        retired_snapshot_roots_.push_back(std::move(previous_root));
+    }
+    // A previous request may have completed without going through poll() (the
+    // mutation port is also used directly by tests/integrations). Reclaim
+    // retired roots only once admission is idle; Pending/InFlight requests may
+    // still hold a pathname into one of them.
+    if (mutation_ != nullptr && mutation_->state() == ReloadAdmissionState::Idle) {
+        std::vector<std::string> roots;
+        {
+            std::lock_guard lock(source_snapshot_mutex_);
+            roots.swap(retired_snapshot_roots_);
+        }
+        for (const auto& root : roots) {
+            std::error_code ignored;
+            std::filesystem::remove_all(root, ignored);
+        }
     }
     return true;
 }
@@ -378,6 +401,19 @@ ReloadCoordinatorPoll ProcessReloadCoordinator::poll() {
         (void)mutation_->complete_reload(
             request.id, request.source, ReloadTerminalOutcome::CompileFailed);
         return ReloadCoordinatorPoll::CompileFailed;
+    }
+    // The admitted request has finished reading its source. Older snapshot
+    // roots retained across a cache swap can now be reclaimed safely.
+    {
+        std::vector<std::string> roots;
+        {
+            std::lock_guard lock(source_snapshot_mutex_);
+            roots.swap(retired_snapshot_roots_);
+        }
+        for (const auto& root : roots) {
+            std::error_code ignored;
+            std::filesystem::remove_all(root, ignored);
+        }
     }
     if (cancellation_check_ != nullptr && cancellation_check_(cancellation_context_)) {
         spare_->destroy();
