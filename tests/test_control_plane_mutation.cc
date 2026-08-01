@@ -6,6 +6,14 @@
 
 using namespace rut;
 
+static bool failed_source_capture(void*, char*, u32, u32*) {
+    return false;
+}
+static bool oversized_source_capture(void*, char*, u32 capacity, u32* out_len) {
+    *out_len = capacity;
+    return true;
+}
+
 namespace rut {
 struct ControlPlaneMutationPortTestAccess {
     static u64 begin_serialized_admission_claim(ControlPlaneMutationPort& port) {
@@ -2202,6 +2210,22 @@ TEST(control_plane_mutation, terminal_outcome_names_are_explicit_and_stable) {
              "admission_contended");
     CHECK_EQ(std::string(reload_terminal_outcome_name(ReloadTerminalOutcome::CounterExhausted)),
              "counter_exhausted");
+    CHECK_EQ(std::string(reload_terminal_outcome_name(ReloadTerminalOutcome::SnapshotUnavailable)),
+             "snapshot_unavailable");
+}
+
+TEST(control_plane_mutation, signal_snapshot_capture_failures_are_terminalized) {
+    for (auto capture : {failed_source_capture, oversized_source_capture}) {
+        ControlPlaneMutationPort port;
+        port.reset(1, true);
+        port.set_reload_source_version_capture(capture, nullptr);
+        u64 request_id = 0;
+        CHECK_FALSE(port.request_reload(ReloadRequestSource::Signal, &request_id));
+        CHECK_NE(request_id, 0u);
+        CHECK(port.last_record().valid);
+        CHECK_EQ(port.last_record().request_id, request_id);
+        CHECK_EQ(port.last_record().outcome, ReloadTerminalOutcome::SnapshotUnavailable);
+    }
 }
 
 int main(int argc, char** argv) {
