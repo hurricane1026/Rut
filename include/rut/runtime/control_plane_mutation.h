@@ -34,6 +34,7 @@ enum class ReloadTerminalOutcome : u8 {
     Stopped,
     AdmissionContended,
     CounterExhausted,
+    SnapshotUnavailable,
 };
 
 constexpr const char* reload_terminal_outcome_name(ReloadTerminalOutcome outcome) {
@@ -54,6 +55,8 @@ constexpr const char* reload_terminal_outcome_name(ReloadTerminalOutcome outcome
             return "admission_contended";
         case ReloadTerminalOutcome::CounterExhausted:
             return "counter_exhausted";
+        case ReloadTerminalOutcome::SnapshotUnavailable:
+            return "snapshot_unavailable";
     }
     return "none";
 }
@@ -391,6 +394,21 @@ public:
                                              source_version,
                                              ReloadRequest::kMaxSourceVersion,
                                              &source_version_len)) {
+                    if (source == ReloadRequestSource::Signal) {
+                        ClaimedRecordSlot snapshot_slot{};
+                        const u64 snapshot_id = reserve_request_identity(&snapshot_slot);
+                        if (snapshot_id != 0) {
+                            const bool published = publish_claimed_record(
+                                {true,
+                                 snapshot_id,
+                                 active_generation(),
+                                 0,
+                                 ReloadRequestSource::Signal,
+                                 ReloadTerminalOutcome::SnapshotUnavailable},
+                                snapshot_slot);
+                            if (published && request_id != nullptr) *request_id = snapshot_id;
+                        }
+                    }
                     release_request_identity_claim();
                     unlock_terminal_publication();
                     if (request_id != nullptr) *request_id = 0;
