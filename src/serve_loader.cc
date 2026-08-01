@@ -28,16 +28,6 @@
 
 namespace rut {
 
-struct ScopedFd {
-    int value = -1;
-    explicit ScopedFd(int fd) : value(fd) {}
-    ~ScopedFd() {
-        if (value >= 0) ::close(value);
-    }
-    ScopedFd(const ScopedFd&) = delete;
-    ScopedFd& operator=(const ScopedFd&) = delete;
-};
-
 void LoadedProgram::destroy() {
     (void)cache_registry_unpublish_if_owner(this);
     if (jit_inited) {

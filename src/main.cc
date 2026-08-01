@@ -448,11 +448,13 @@ static i32 run_shards(u16 port,
     // Wait for all shard threads to finish (they exit after drain completes).
     for (u32 i = 0; i < shard_count; i++) shards[i].join();
     if (!mutation_stopped) {
+#ifdef RUT_ENABLE_JIT
         if (reload_enabled && reload_coordinator.waiting_for_activation() &&
             reload_coordinator.finish_activation_for_shutdown()) {
             write_str("Reload finalized during shutdown\n");
             write_reload_record(control_plane_mutation.last_record());
         }
+#endif
         control_plane_mutation.stop();
     }
 
