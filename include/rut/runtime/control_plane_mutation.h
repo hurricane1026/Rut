@@ -239,6 +239,9 @@ public:
                 if (unpack_state(observed) != ReloadAdmissionState::Idle) break;
                 if (source == ReloadRequestSource::Route && !unpack_route_enabled(observed))
                     return false;
+                if (source == ReloadRequestSource::Route &&
+                    active_generation_.load(std::memory_order_acquire) >= kMaxGeneration)
+                    return false;
                 // Serialize the request claim through identity reservation
                 // with Busy terminal publication and stop(). No observer can
                 // allocate a later request identity from a claim whose
