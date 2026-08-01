@@ -2,6 +2,7 @@
 
 #include "rut/common/types.h"
 #include "rut/jit/handler_abi.h"
+#include "rut/runtime/control_plane_replay.h"
 #include "rut/runtime/route_table.h"
 #include <atomic>
 
@@ -273,6 +274,12 @@ public:
             source_version_capture_ = nullptr;
             source_version_capture_context_ = nullptr;
         }
+    }
+
+    void set_upstream_mark_replay_sink(UpstreamMarkReplaySink sink, void* context) {
+        mark_replay_sink_ = sink;
+        mark_replay_sink_context_ = context;
+        mark_replay_sequence_.store(0, std::memory_order_release);
     }
 
     [[nodiscard]] bool request_reload(ReloadRequestSource source, u64* request_id = nullptr) {
@@ -887,12 +894,31 @@ public:
     }
 
     [[nodiscard]] bool mark(ServerIdentity server, bool healthy) {
+        const auto emit_event =
+            [&](bool accepted, UpstreamMarkReplayReason reason, u64 published_version = 0) {
+                if (mark_replay_sink_ == nullptr) return;
+                UpstreamMarkReplayEvent event{};
+                event.event_sequence =
+                    mark_replay_sequence_.fetch_add(1, std::memory_order_acq_rel) + 1;
+                event.config_generation = server.config_generation;
+                event.upstream_id = server.upstream_id;
+                event.backend_id = server.backend_id;
+                event.healthy = healthy;
+                event.accepted = accepted;
+                event.reason = reason;
+                event.published_version = published_version;
+                mark_replay_sink_(mark_replay_sink_context_, event);
+            };
         if (stopping_.load(std::memory_order_acquire) != 0 ||
-            cutover_.load(std::memory_order_acquire) != 0)
+            cutover_.load(std::memory_order_acquire) != 0) {
+            emit_event(false, UpstreamMarkReplayReason::Unavailable);
             return false;
+        }
         if (server.config_generation == 0 || server.upstream_id >= RouteConfig::kMaxUpstreams ||
-            server.backend_id >= UpstreamTarget::kMaxBackends)
+            server.backend_id >= UpstreamTarget::kMaxBackends) {
+            emit_event(false, UpstreamMarkReplayReason::StaleOrForeign);
             return false;
+        }
         const u64 generation = server.config_generation;
         u32 bank = 2;
         for (u32 candidate = 0; candidate < 2; candidate++)
@@ -901,7 +927,10 @@ public:
                 bank = candidate;
                 break;
             }
-        if (bank == 2) return false;
+        if (bank == 2) {
+            emit_event(false, UpstreamMarkReplayReason::StaleOrForeign);
+            return false;
+        }
         u8 writer_open = 0;
         bool writer_claimed = false;
         for (u32 attempt = 0; attempt < kMaxMarkAttempts; attempt++) {
@@ -912,7 +941,10 @@ public:
             }
             writer_open = 0;
         }
-        if (!writer_claimed) return false;
+        if (!writer_claimed) {
+            emit_event(false, UpstreamMarkReplayReason::Contended);
+            return false;
+        }
 
         const auto value =
             healthy ? ManualHealthOverride::Healthy : ManualHealthOverride::Unhealthy;
@@ -1006,6 +1038,7 @@ public:
             }
             sequence.store(stable_seq + 2, std::memory_order_release);
             override_writer_claim_.store(0, std::memory_order_release);
+            emit_event(true, UpstreamMarkReplayReason::Published, version);
             return true;
         }
         // Readers ignore odd sequences while the prior value is restored. Use a
@@ -2586,6 +2619,9 @@ private:
     }
 
     std::atomic<u64> reload_word_{0};
+    UpstreamMarkReplaySink mark_replay_sink_ = nullptr;
+    void* mark_replay_sink_context_ = nullptr;
+    std::atomic<u64> mark_replay_sequence_{0};
     ReloadSourceVersionCapture source_version_capture_ = nullptr;
     void* source_version_capture_context_ = nullptr;
     u32 source_version_len_ = 0;

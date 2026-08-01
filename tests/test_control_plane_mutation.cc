@@ -14,6 +14,16 @@ static bool oversized_source_capture(void*, char*, u32 capacity, u32* out_len) {
     return true;
 }
 
+struct MarkReplayEvents {
+    UpstreamMarkReplayEvent events[8]{};
+    u32 count = 0;
+};
+
+static void collect_mark_replay_event(void* context, const UpstreamMarkReplayEvent& event) {
+    auto* events = static_cast<MarkReplayEvents*>(context);
+    if (events != nullptr && events->count < 8) events->events[events->count++] = event;
+}
+
 namespace rut {
 struct ControlPlaneMutationPortTestAccess {
     static u64 begin_serialized_admission_claim(ControlPlaneMutationPort& port) {
@@ -1086,10 +1096,16 @@ TEST(control_plane_mutation, activation_carries_overrides_across_probe_policy_ch
     old_config.upstreams[1].hc_interval_ms = 1000;
     old_config.upstreams[1].hc_expected_status = 204;
     port.reset(3, true, &old_config);
+    MarkReplayEvents replay_events;
+    port.set_upstream_mark_replay_sink(&collect_mark_replay_event, &replay_events);
     const u16 old_allocation = port.endpoint_allocation_for_config(&old_config, 1, 0);
     const u64 old_incarnation = port.endpoint_incarnation_for_config(&old_config, 1, 0);
     REQUIRE(port.mark({3, 0, 0}, false));
     REQUIRE(port.mark({3, 1, 0}, true));
+    REQUIRE(replay_events.count == 2);
+    CHECK_EQ(replay_events.events[0].event_sequence, 1u);
+    CHECK(replay_events.events[0].accepted);
+    CHECK_EQ(replay_events.events[0].reason, UpstreamMarkReplayReason::Published);
 
     u64 id = 0;
     REQUIRE(port.request_reload(ReloadRequestSource::Route, &id));
