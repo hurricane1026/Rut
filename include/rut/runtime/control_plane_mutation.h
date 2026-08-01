@@ -5,6 +5,7 @@
 #include "rut/runtime/control_plane_replay.h"
 #include "rut/runtime/route_table.h"
 #include <atomic>
+#include <mutex>
 
 namespace rut {
 
@@ -277,6 +278,7 @@ public:
     }
 
     void set_upstream_mark_replay_sink(UpstreamMarkReplaySink sink, void* context) {
+        std::lock_guard lock(mark_replay_mutex_);
         mark_replay_sink_ = sink;
         mark_replay_sink_context_ = context;
         mark_replay_sequence_.store(0, std::memory_order_release);
@@ -896,6 +898,7 @@ public:
     [[nodiscard]] bool mark(ServerIdentity server, bool healthy) {
         const auto emit_event =
             [&](bool accepted, UpstreamMarkReplayReason reason, u64 published_version = 0) {
+                std::lock_guard lock(mark_replay_mutex_);
                 if (mark_replay_sink_ == nullptr) return;
                 UpstreamMarkReplayEvent event{};
                 event.event_sequence =
@@ -967,6 +970,7 @@ public:
         u64 stable_seq = 0;
         if (!claim_sequence(sequence, &stable_seq)) {
             override_writer_claim_.store(0, std::memory_order_release);
+            emit_event(false, UpstreamMarkReplayReason::Contended);
             return false;
         }
 
@@ -981,6 +985,7 @@ public:
         if (has_peer && !claim_sequence(override_seq_[peer_bank], &peer_stable_seq)) {
             sequence.store(stable_seq + 2, std::memory_order_release);
             override_writer_claim_.store(0, std::memory_order_release);
+            emit_event(false, UpstreamMarkReplayReason::Contended);
             return false;
         }
 
@@ -999,6 +1004,7 @@ public:
                 override_seq_[peer_bank].store(peer_stable_seq + 2, std::memory_order_release);
             sequence.store(stable_seq + 2, std::memory_order_release);
             override_writer_claim_.store(0, std::memory_order_release);
+            emit_event(false, UpstreamMarkReplayReason::Unavailable);
             return false;
         }
         slot.store(desired, std::memory_order_relaxed);
@@ -1020,6 +1026,7 @@ public:
                     override_seq_[peer_bank].store(peer_stable_seq + 2, std::memory_order_release);
                 sequence.store(stable_seq + 2, std::memory_order_release);
                 override_writer_claim_.store(0, std::memory_order_release);
+                emit_event(false, UpstreamMarkReplayReason::VersionExhausted);
                 return false;
             }
             const u64 version = prior_version + 1;
@@ -1037,8 +1044,8 @@ public:
                 override_seq_[peer_bank].store(peer_stable_seq + 2, std::memory_order_release);
             }
             sequence.store(stable_seq + 2, std::memory_order_release);
+            emit_event(true, UpstreamMarkReplayReason::Published, stable_seq + 2);
             override_writer_claim_.store(0, std::memory_order_release);
-            emit_event(true, UpstreamMarkReplayReason::Published, version);
             return true;
         }
         // Readers ignore odd sequences while the prior value is restored. Use a
@@ -1051,6 +1058,7 @@ public:
         }
         sequence.store(stable_seq + 2, std::memory_order_release);
         override_writer_claim_.store(0, std::memory_order_release);
+        emit_event(false, UpstreamMarkReplayReason::Unavailable);
         return false;
     }
 
@@ -2622,6 +2630,7 @@ private:
     UpstreamMarkReplaySink mark_replay_sink_ = nullptr;
     void* mark_replay_sink_context_ = nullptr;
     std::atomic<u64> mark_replay_sequence_{0};
+    std::mutex mark_replay_mutex_;
     ReloadSourceVersionCapture source_version_capture_ = nullptr;
     void* source_version_capture_context_ = nullptr;
     u32 source_version_len_ = 0;
