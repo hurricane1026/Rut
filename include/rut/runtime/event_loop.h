@@ -202,6 +202,7 @@ public:
             if (cfg != nullptr) {
                 const u32 m = cfg->timer_count < RouteConfig::kMaxTimers ? cfg->timer_count
                                                                          : RouteConfig::kMaxTimers;
+                bool previous_used[RouteConfig::kMaxTimers]{};
                 for (u32 i = 0; i < m; i++) {
                     timer_deadline_ns[i] =
                         now + static_cast<u64>(cfg->timers[i].interval_ms) * 1'000'000ull;
@@ -211,6 +212,7 @@ public:
                                                    ? previous->timer_count
                                                    : RouteConfig::kMaxTimers;
                     for (u32 j = 0; j < previous_count; j++) {
+                        if (previous_used[j]) continue;
                         const auto& old = previous->timers[j];
                         if (old.name_len != next.name_len || old.interval_ms != next.interval_ms ||
                             old.shard != next.shard ||
@@ -225,6 +227,7 @@ public:
                             }
                         if (!same_name) continue;
                         timer_deadline_ns[i] = previous_deadlines[j];
+                        previous_used[j] = true;
                         break;
                     }
                 }

@@ -49,6 +49,18 @@ bool same_health_policy(const UpstreamTarget& lhs, const UpstreamTarget& rhs) {
     return true;
 }
 
+bool same_upstream_endpoints(const UpstreamTarget& lhs, const UpstreamTarget& rhs) {
+    if (lhs.addr_count != rhs.addr_count) return false;
+    for (u32 i = 0; i < lhs.addr_count; i++) {
+        const auto& a = lhs.addrs[i];
+        const auto& b = rhs.addrs[i];
+        if (a.sin_family != b.sin_family || a.sin_addr.s_addr != b.sin_addr.s_addr ||
+            a.sin_port != b.sin_port)
+            return false;
+    }
+    return true;
+}
+
 }  // namespace
 
 bool ProcessReloadCoordinator::default_loader(
@@ -131,7 +143,8 @@ bool ProcessReloadCoordinator::compatible(const RouteConfig& active,
             const auto& new_target = candidate.upstreams[new_upstream];
             if (old_target.name_identity != 0 &&
                 old_target.name_identity == new_target.name_identity &&
-                !same_health_policy(old_target, new_target))
+                (!same_health_policy(old_target, new_target) ||
+                 !same_upstream_endpoints(old_target, new_target)))
                 return false;
         }
     }

@@ -168,6 +168,20 @@ TEST(reload_coordinator, changed_health_policy_requires_warming_support) {
     CHECK_FALSE(ProcessReloadCoordinator::compatible(active, candidate, 1));
 }
 
+TEST(reload_coordinator, changed_health_endpoint_requires_warming_support) {
+    RouteConfig active;
+    RouteConfig candidate;
+    REQUIRE(active.add_upstream("api", 0x7f000001u, 8000));
+    REQUIRE(candidate.add_upstream("api", 0x7f000001u, 8001));
+    active.upstreams[0].hc_enabled = true;
+    active.upstreams[0].hc_path_len = 7;
+    __builtin_memcpy(active.upstreams[0].hc_path, "/health", 7);
+    active.upstreams[0].hc_interval_ms = 1000;
+    candidate.upstreams[0] = active.upstreams[0];
+    candidate.upstreams[0].set_addr(0x7f000001u, 8001);
+    CHECK_FALSE(ProcessReloadCoordinator::compatible(active, candidate, 1));
+}
+
 TEST(reload_coordinator, publication_waits_for_all_shards_and_retired_program_pins) {
     Fixture f;
     REQUIRE(f.setup());
