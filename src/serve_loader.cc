@@ -132,20 +132,31 @@ bool read_snapshot_source(const std::filesystem::path& path,
                           std::string& content,
                           u64* used_bytes,
                           u64 max_source_bytes) {
-    std::error_code type_error;
-    if (!std::filesystem::is_regular_file(std::filesystem::status(path, type_error)) || type_error)
+    ScopedFd input{open(path.c_str(), O_RDONLY | O_CLOEXEC | O_NOFOLLOW | O_NONBLOCK)};
+    if (input.value < 0) return false;
+    struct stat before{};
+    if (fstat(input.value, &before) < 0 || !S_ISREG(before.st_mode)) return false;
+    const u64 size = static_cast<u64>(before.st_size);
+    if (size > 0xffffffffu || *used_bytes > max_source_bytes ||
+        size > max_source_bytes - *used_bytes)
         return false;
-    std::ifstream input(path, std::ios::binary);
-    if (!input) return false;
-    input.seekg(0, std::ios::end);
-    const std::streamoff size = input.tellg();
-    if (size < 0 || static_cast<u64>(size) > 0xffffffffu || *used_bytes > max_source_bytes ||
-        static_cast<u64>(size) > max_source_bytes - *used_bytes)
-        return false;
-    input.seekg(0, std::ios::beg);
     content.resize(static_cast<size_t>(size));
-    if (size != 0 && !input.read(content.data(), size)) return false;
-    *used_bytes += static_cast<u64>(size);
+    u64 offset = 0;
+    while (offset < size) {
+        const ssize_t n = pread(input.value,
+                                content.data() + offset,
+                                static_cast<size_t>(size - offset),
+                                static_cast<off_t>(offset));
+        if (n <= 0) return false;
+        offset += static_cast<u64>(n);
+    }
+    struct stat after{};
+    if (fstat(input.value, &after) < 0 || after.st_dev != before.st_dev ||
+        after.st_ino != before.st_ino || after.st_size != before.st_size ||
+        after.st_mtim.tv_sec != before.st_mtim.tv_sec ||
+        after.st_mtim.tv_nsec != before.st_mtim.tv_nsec)
+        return false;
+    *used_bytes += size;
     return true;
 }
 
