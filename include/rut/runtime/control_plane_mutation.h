@@ -1057,7 +1057,11 @@ public:
         if (has_peer && !claim_sequence(override_seq_[peer_bank], &peer_stable_seq)) {
             sequence.store(stable_seq + 2, std::memory_order_release);
             override_writer_claim_.store(0, std::memory_order_release);
-            publish_event(make_event(false, UpstreamMarkReplayReason::Contended));
+            const auto reason = stopping_.load(std::memory_order_acquire) != 0 ||
+                                        cutover_.load(std::memory_order_acquire) != 0
+                                    ? UpstreamMarkReplayReason::Unavailable
+                                    : UpstreamMarkReplayReason::Contended;
+            publish_event(make_event(false, reason, stable_seq + 2));
             return false;
         }
 
@@ -1076,7 +1080,7 @@ public:
                 override_seq_[peer_bank].store(peer_stable_seq + 2, std::memory_order_release);
             sequence.store(stable_seq + 2, std::memory_order_release);
             override_writer_claim_.store(0, std::memory_order_release);
-            publish_event(make_event(false, UpstreamMarkReplayReason::Unavailable));
+            publish_event(make_event(false, UpstreamMarkReplayReason::Unavailable, stable_seq + 2));
             return false;
         }
         slot.store(desired, std::memory_order_relaxed);
@@ -1098,7 +1102,8 @@ public:
                     override_seq_[peer_bank].store(peer_stable_seq + 2, std::memory_order_release);
                 sequence.store(stable_seq + 2, std::memory_order_release);
                 override_writer_claim_.store(0, std::memory_order_release);
-                publish_event(make_event(false, UpstreamMarkReplayReason::VersionExhausted));
+                publish_event(
+                    make_event(false, UpstreamMarkReplayReason::VersionExhausted, stable_seq + 2));
                 return false;
             }
             const u64 version = prior_version + 1;
@@ -1132,7 +1137,7 @@ public:
         }
         sequence.store(stable_seq + 2, std::memory_order_release);
         override_writer_claim_.store(0, std::memory_order_release);
-        publish_event(make_event(false, UpstreamMarkReplayReason::Unavailable));
+        publish_event(make_event(false, UpstreamMarkReplayReason::Unavailable, stable_seq + 2));
         return false;
     }
 
