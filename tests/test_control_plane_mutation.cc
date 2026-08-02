@@ -24,6 +24,17 @@ static void collect_mark_replay_event(void* context, const UpstreamMarkReplayEve
     if (events != nullptr && events->count < 8) events->events[events->count++] = event;
 }
 
+struct ReentrantMarkReplaySinkContext {
+    ControlPlaneMutationPort* port = nullptr;
+    u32 count = 0;
+};
+
+static void disable_mark_replay_sink(void* context, const UpstreamMarkReplayEvent&) {
+    auto* state = static_cast<ReentrantMarkReplaySinkContext*>(context);
+    ++state->count;
+    state->port->set_upstream_mark_replay_sink(nullptr, nullptr);
+}
+
 namespace rut {
 struct ControlPlaneMutationPortTestAccess {
     static u64 begin_serialized_admission_claim(ControlPlaneMutationPort& port) {
@@ -1141,6 +1152,30 @@ TEST(control_plane_mutation, activation_carries_overrides_across_probe_policy_ch
     u64 version = 0;
     CHECK_EQ(port.manual_health({4, 0, 0}, &version), ManualHealthOverride::Unhealthy);
     CHECK_EQ(version, 1u);
+}
+
+TEST(control_plane_mutation, mark_replay_sink_handles_reentrant_disable_and_failures) {
+    ControlPlaneMutationPort port;
+    RouteConfig config;
+    REQUIRE(config.add_upstream("users", 0x7f000001u, 8000).has_value());
+    port.reset(3, true, &config);
+
+    ReentrantMarkReplaySinkContext reentrant{&port};
+    port.set_upstream_mark_replay_sink(&disable_mark_replay_sink, &reentrant);
+    REQUIRE(port.mark({3, 0, 0}, true));
+    CHECK_EQ(reentrant.count, 1u);
+
+    MarkReplayEvents events;
+    port.set_upstream_mark_replay_sink(&collect_mark_replay_event, &events);
+    CHECK_FALSE(port.mark({3, RouteConfig::kMaxUpstreams, 0}, false));
+    REQUIRE_EQ(events.count, 1u);
+    CHECK_FALSE(events.events[0].accepted);
+    CHECK_EQ(events.events[0].reason, UpstreamMarkReplayReason::StaleOrForeign);
+
+    port.stop();
+    CHECK_FALSE(port.mark({3, 0, 0}, false));
+    REQUIRE_EQ(events.count, 2u);
+    CHECK_EQ(events.events[1].reason, UpstreamMarkReplayReason::Unavailable);
 }
 
 TEST(control_plane_mutation, compatible_retained_generations_share_override_updates) {
