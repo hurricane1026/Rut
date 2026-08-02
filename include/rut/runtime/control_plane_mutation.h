@@ -1032,7 +1032,11 @@ public:
             writer_open = 0;
         }
         if (!writer_claimed) {
-            publish_event(make_event(false, UpstreamMarkReplayReason::Contended));
+            const auto reason = stopping_.load(std::memory_order_acquire) != 0 ||
+                                        cutover_.load(std::memory_order_acquire) != 0
+                                    ? UpstreamMarkReplayReason::Unavailable
+                                    : UpstreamMarkReplayReason::Contended;
+            publish_event(make_event(false, reason));
             return false;
         }
 

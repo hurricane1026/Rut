@@ -49,6 +49,10 @@ static void install_other_port_sink(void* context, const UpstreamMarkReplayEvent
 
 namespace rut {
 struct ControlPlaneMutationPortTestAccess {
+    static void set_writer_claim(ControlPlaneMutationPort& port, u8 claimed) {
+        port.override_writer_claim_.store(claimed, std::memory_order_release);
+    }
+
     static u64 begin_serialized_admission_claim(ControlPlaneMutationPort& port) {
         port.lock_terminal_publication();
         ControlPlaneMutationPort::ClaimedRecordSlot identity_slot{};
@@ -1222,6 +1226,20 @@ TEST(control_plane_mutation, reset_preserving_membership_restarts_replay_sequenc
     REQUIRE(port.mark({4, 0, 0}, false));
     REQUIRE_EQ(events.count, 2u);
     CHECK_EQ(events.events[1].event_sequence, 1u);
+}
+
+TEST(control_plane_mutation, replay_records_writer_contention) {
+    ControlPlaneMutationPort port;
+    RouteConfig config;
+    REQUIRE(config.add_upstream("users", 0x7f000001u, 8000).has_value());
+    port.reset(3, true, &config);
+    MarkReplayEvents events;
+    port.set_upstream_mark_replay_sink(&collect_mark_replay_event, &events);
+    ControlPlaneMutationPortTestAccess::set_writer_claim(port, 1);
+    CHECK_FALSE(port.mark({3, 0, 0}, true));
+    ControlPlaneMutationPortTestAccess::set_writer_claim(port, 0);
+    REQUIRE_EQ(events.count, 1u);
+    CHECK_EQ(events.events[0].reason, UpstreamMarkReplayReason::Contended);
 }
 
 TEST(control_plane_mutation, compatible_retained_generations_share_override_updates) {
