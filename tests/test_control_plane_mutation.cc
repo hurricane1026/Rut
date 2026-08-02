@@ -1208,6 +1208,22 @@ TEST(control_plane_mutation, mark_replay_sink_guard_is_scoped_to_its_port) {
     CHECK_FALSE(second_events.events[0].healthy);
 }
 
+TEST(control_plane_mutation, reset_preserving_membership_restarts_replay_sequence) {
+    ControlPlaneMutationPort port;
+    RouteConfig config;
+    REQUIRE(config.add_upstream("users", 0x7f000001u, 8000).has_value());
+    port.reset(3, true, &config);
+    MarkReplayEvents events;
+    port.set_upstream_mark_replay_sink(&collect_mark_replay_event, &events);
+    REQUIRE(port.mark({3, 0, 0}, true));
+    REQUIRE_EQ(events.count, 1u);
+    CHECK_EQ(events.events[0].event_sequence, 1u);
+    port.reset_preserving_membership(4, true);
+    REQUIRE(port.mark({4, 0, 0}, false));
+    REQUIRE_EQ(events.count, 2u);
+    CHECK_EQ(events.events[1].event_sequence, 1u);
+}
+
 TEST(control_plane_mutation, compatible_retained_generations_share_override_updates) {
     ControlPlaneMutationPort port;
     RouteConfig old_config;

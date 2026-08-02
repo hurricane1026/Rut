@@ -15,6 +15,7 @@ namespace rut {
 inline thread_local bool control_plane_replay_mode = false;
 inline thread_local const void* control_plane_mark_replay_callback_owners[16]{};
 inline thread_local u32 control_plane_mark_replay_callback_depth = 0;
+inline thread_local bool control_plane_mark_replay_callback_overflow = false;
 
 enum class ReloadRequestSource : u8 {
     Route = 0,
@@ -284,7 +285,7 @@ public:
         bool callback_owns_port = false;
         for (u32 i = 0; i < control_plane_mark_replay_callback_depth; i++)
             callback_owns_port |= control_plane_mark_replay_callback_owners[i] == this;
-        if (callback_owns_port) {
+        if (callback_owns_port || control_plane_mark_replay_callback_overflow) {
             std::lock_guard lock(mark_replay_mutex_);
             const u64 epoch = mark_replay_sink_epoch_.load(std::memory_order_relaxed);
             const bool opened_epoch = (epoch & 1u) == 0;
@@ -293,6 +294,15 @@ public:
             mark_replay_sink_context_.store(context, std::memory_order_relaxed);
             mark_replay_sequence_.store(0, std::memory_order_release);
             if (opened_epoch) mark_replay_sink_epoch_.fetch_add(1, std::memory_order_release);
+            return;
+        }
+        if (control_plane_mark_replay_callback_depth != 0) {
+            std::lock_guard lock(mark_replay_mutex_);
+            mark_replay_sink_epoch_.fetch_add(1, std::memory_order_acq_rel);
+            mark_replay_sink_.store(sink, std::memory_order_relaxed);
+            mark_replay_sink_context_.store(context, std::memory_order_relaxed);
+            mark_replay_sequence_.store(0, std::memory_order_release);
+            mark_replay_sink_epoch_.fetch_add(1, std::memory_order_release);
             return;
         }
         for (;;) {
@@ -957,9 +967,7 @@ public:
                     event_context = nullptr;
                     continue;
                 }
-                event_callback_claimed = event_sink != nullptr;
-                if (!event_callback_claimed)
-                    mark_replay_callbacks_.fetch_sub(1, std::memory_order_release);
+                event_callback_claimed = true;
                 break;
             }
             UpstreamMarkReplayEvent event{};
@@ -977,13 +985,17 @@ public:
             return event;
         };
         const auto publish_event = [&](const UpstreamMarkReplayEvent& event) {
-            if (!event_callback_claimed || event_sink == nullptr) return;
+            if (!event_callback_claimed) return;
             const u32 previous_callback_depth = control_plane_mark_replay_callback_depth;
-            if (control_plane_mark_replay_callback_depth < 16)
+            const bool previous_callback_overflow = control_plane_mark_replay_callback_overflow;
+            if (event_sink != nullptr && control_plane_mark_replay_callback_depth < 16)
                 control_plane_mark_replay_callback_owners
                     [control_plane_mark_replay_callback_depth++] = this;
-            event_sink(event_context, event);
+            else if (event_sink != nullptr)
+                control_plane_mark_replay_callback_overflow = true;
+            if (event_sink != nullptr) event_sink(event_context, event);
             control_plane_mark_replay_callback_depth = previous_callback_depth;
+            control_plane_mark_replay_callback_overflow = previous_callback_overflow;
             mark_replay_callbacks_.fetch_sub(1, std::memory_order_release);
             event_callback_claimed = false;
         };
