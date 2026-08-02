@@ -1033,7 +1033,11 @@ public:
         u64 stable_seq = 0;
         if (!claim_sequence(sequence, &stable_seq)) {
             override_writer_claim_.store(0, std::memory_order_release);
-            publish_event(make_event(false, UpstreamMarkReplayReason::Contended));
+            const auto reason = stopping_.load(std::memory_order_acquire) != 0 ||
+                                        cutover_.load(std::memory_order_acquire) != 0
+                                    ? UpstreamMarkReplayReason::Unavailable
+                                    : UpstreamMarkReplayReason::Contended;
+            publish_event(make_event(false, reason));
             return false;
         }
 
