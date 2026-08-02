@@ -279,7 +279,13 @@ public:
     }
 
     void set_upstream_mark_replay_sink(UpstreamMarkReplaySink sink, void* context) {
-        if (control_plane_mark_replay_callback) return;
+        if (control_plane_mark_replay_callback) {
+            std::lock_guard lock(mark_replay_mutex_);
+            mark_replay_sink_ = sink;
+            mark_replay_sink_context_ = context;
+            mark_replay_sequence_.store(0, std::memory_order_release);
+            return;
+        }
         std::lock_guard lock(mark_replay_mutex_);
         while (mark_replay_callbacks_.load(std::memory_order_acquire) != 0) {
         }
@@ -900,8 +906,20 @@ public:
     }
 
     [[nodiscard]] bool mark(ServerIdentity server, bool healthy) {
+        UpstreamMarkReplaySink event_sink = nullptr;
+        void* event_context = nullptr;
+        bool event_callback_claimed = false;
         const auto make_event =
             [&](bool accepted, UpstreamMarkReplayReason reason, u64 published_version = 0) {
+                {
+                    std::lock_guard lock(mark_replay_mutex_);
+                    event_sink = mark_replay_sink_;
+                    event_context = mark_replay_sink_context_;
+                    if (event_sink != nullptr) {
+                        mark_replay_callbacks_.fetch_add(1, std::memory_order_acq_rel);
+                        event_callback_claimed = true;
+                    }
+                }
                 UpstreamMarkReplayEvent event{};
                 event.event_sequence =
                     mark_replay_sequence_.fetch_add(1, std::memory_order_acq_rel) + 1;
@@ -915,19 +933,12 @@ public:
                 return event;
             };
         const auto publish_event = [&](const UpstreamMarkReplayEvent& event) {
-            UpstreamMarkReplaySink sink = nullptr;
-            void* context = nullptr;
-            {
-                std::lock_guard lock(mark_replay_mutex_);
-                sink = mark_replay_sink_;
-                context = mark_replay_sink_context_;
-                if (sink == nullptr) return;
-                mark_replay_callbacks_.fetch_add(1, std::memory_order_acq_rel);
-            }
+            if (!event_callback_claimed || event_sink == nullptr) return;
             control_plane_mark_replay_callback = true;
-            sink(context, event);
+            event_sink(event_context, event);
             control_plane_mark_replay_callback = false;
             mark_replay_callbacks_.fetch_sub(1, std::memory_order_release);
+            event_callback_claimed = false;
         };
         if (stopping_.load(std::memory_order_acquire) != 0 ||
             cutover_.load(std::memory_order_acquire) != 0) {
