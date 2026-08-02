@@ -911,14 +911,19 @@ public:
         bool event_callback_claimed = false;
         const auto make_event =
             [&](bool accepted, UpstreamMarkReplayReason reason, u64 published_version = 0) {
-                {
-                    std::lock_guard lock(mark_replay_mutex_);
+                event_sink = nullptr;
+                event_context = nullptr;
+                event_callback_claimed = false;
+                for (u32 attempt = 0; attempt < kMaxMarkAttempts; attempt++) {
+                    if (!mark_replay_mutex_.try_lock()) continue;
                     event_sink = mark_replay_sink_;
                     event_context = mark_replay_sink_context_;
                     if (event_sink != nullptr) {
                         mark_replay_callbacks_.fetch_add(1, std::memory_order_acq_rel);
                         event_callback_claimed = true;
                     }
+                    mark_replay_mutex_.unlock();
+                    break;
                 }
                 UpstreamMarkReplayEvent event{};
                 event.event_sequence =
@@ -934,9 +939,10 @@ public:
             };
         const auto publish_event = [&](const UpstreamMarkReplayEvent& event) {
             if (!event_callback_claimed || event_sink == nullptr) return;
+            const bool previous_callback_state = control_plane_mark_replay_callback;
             control_plane_mark_replay_callback = true;
             event_sink(event_context, event);
-            control_plane_mark_replay_callback = false;
+            control_plane_mark_replay_callback = previous_callback_state;
             mark_replay_callbacks_.fetch_sub(1, std::memory_order_release);
             event_callback_claimed = false;
         };
