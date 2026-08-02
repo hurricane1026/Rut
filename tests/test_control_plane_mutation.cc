@@ -1183,6 +1183,8 @@ TEST(control_plane_mutation, compatible_retained_generations_share_override_upda
     RouteConfig old_config;
     REQUIRE(old_config.add_upstream("users", 0x7f000001u, 8000).has_value());
     port.reset(3, true, &old_config);
+    MarkReplayEvents replay_events;
+    port.set_upstream_mark_replay_sink(&collect_mark_replay_event, &replay_events);
     REQUIRE(port.mark({3, 0, 0}, false));
 
     u64 id = 0;
@@ -1196,6 +1198,9 @@ TEST(control_plane_mutation, compatible_retained_generations_share_override_upda
     CHECK_EQ(port.manual_health({4, 0, 0}), ManualHealthOverride::Unhealthy);
 
     REQUIRE(port.mark({3, 0, 0}, true));
+    REQUIRE_EQ(replay_events.count, 2u);
+    CHECK_EQ(replay_events.events[1].peer_config_generation, 4u);
+    CHECK(replay_events.events[1].peer_published_version > 0u);
     CHECK_EQ(port.manual_health({3, 0, 0}), ManualHealthOverride::Healthy);
     CHECK_EQ(port.manual_health({4, 0, 0}), ManualHealthOverride::Healthy);
 

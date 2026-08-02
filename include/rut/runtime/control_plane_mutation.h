@@ -930,50 +930,49 @@ public:
         UpstreamMarkReplaySink event_sink = nullptr;
         void* event_context = nullptr;
         bool event_callback_claimed = false;
-        const auto make_event =
-            [&](bool accepted,
-                UpstreamMarkReplayReason reason,
-                u64 published_version = 0,
-                u64 peer_config_generation = 0,
-                u64 peer_published_version = 0) {
-                event_sink = nullptr;
-                event_context = nullptr;
-                event_callback_claimed = false;
-                for (u32 attempt = 0; attempt < kMaxMarkAttempts; attempt++) {
-                    const u64 epoch = mark_replay_sink_epoch_.load(std::memory_order_acquire);
-                    if ((epoch & 1u) != 0) continue;
-                    mark_replay_callbacks_.fetch_add(1, std::memory_order_acq_rel);
-                    if (epoch != mark_replay_sink_epoch_.load(std::memory_order_acquire)) {
-                        mark_replay_callbacks_.fetch_sub(1, std::memory_order_release);
-                        continue;
-                    }
-                    event_sink = mark_replay_sink_.load(std::memory_order_relaxed);
-                    event_context = mark_replay_sink_context_.load(std::memory_order_relaxed);
-                    if (epoch != mark_replay_sink_epoch_.load(std::memory_order_acquire)) {
-                        mark_replay_callbacks_.fetch_sub(1, std::memory_order_release);
-                        event_sink = nullptr;
-                        event_context = nullptr;
-                        continue;
-                    }
-                    event_callback_claimed = event_sink != nullptr;
-                    if (!event_callback_claimed)
-                        mark_replay_callbacks_.fetch_sub(1, std::memory_order_release);
-                    break;
+        const auto make_event = [&](bool accepted,
+                                    UpstreamMarkReplayReason reason,
+                                    u64 published_version = 0,
+                                    u64 peer_config_generation = 0,
+                                    u64 peer_published_version = 0) {
+            event_sink = nullptr;
+            event_context = nullptr;
+            event_callback_claimed = false;
+            for (u32 attempt = 0; attempt < kMaxMarkAttempts; attempt++) {
+                const u64 epoch = mark_replay_sink_epoch_.load(std::memory_order_acquire);
+                if ((epoch & 1u) != 0) continue;
+                mark_replay_callbacks_.fetch_add(1, std::memory_order_acq_rel);
+                if (epoch != mark_replay_sink_epoch_.load(std::memory_order_acquire)) {
+                    mark_replay_callbacks_.fetch_sub(1, std::memory_order_release);
+                    continue;
                 }
-                UpstreamMarkReplayEvent event{};
-                event.event_sequence =
-                    mark_replay_sequence_.fetch_add(1, std::memory_order_acq_rel) + 1;
-                event.config_generation = server.config_generation;
-                event.upstream_id = server.upstream_id;
-                event.backend_id = server.backend_id;
-                event.healthy = healthy;
-                event.accepted = accepted;
-                event.reason = reason;
-                event.published_version = published_version;
-                event.peer_config_generation = peer_config_generation;
-                event.peer_published_version = peer_published_version;
-                return event;
-            };
+                event_sink = mark_replay_sink_.load(std::memory_order_relaxed);
+                event_context = mark_replay_sink_context_.load(std::memory_order_relaxed);
+                if (epoch != mark_replay_sink_epoch_.load(std::memory_order_acquire)) {
+                    mark_replay_callbacks_.fetch_sub(1, std::memory_order_release);
+                    event_sink = nullptr;
+                    event_context = nullptr;
+                    continue;
+                }
+                event_callback_claimed = event_sink != nullptr;
+                if (!event_callback_claimed)
+                    mark_replay_callbacks_.fetch_sub(1, std::memory_order_release);
+                break;
+            }
+            UpstreamMarkReplayEvent event{};
+            event.event_sequence =
+                mark_replay_sequence_.fetch_add(1, std::memory_order_acq_rel) + 1;
+            event.config_generation = server.config_generation;
+            event.upstream_id = server.upstream_id;
+            event.backend_id = server.backend_id;
+            event.healthy = healthy;
+            event.accepted = accepted;
+            event.reason = reason;
+            event.published_version = published_version;
+            event.peer_config_generation = peer_config_generation;
+            event.peer_published_version = peer_published_version;
+            return event;
+        };
         const auto publish_event = [&](const UpstreamMarkReplayEvent& event) {
             if (!event_callback_claimed || event_sink == nullptr) return;
             const void* previous_callback_owner = control_plane_mark_replay_callback_owner;
@@ -1134,12 +1133,11 @@ public:
                 override_seq_[peer_bank].store(peer_stable_seq + 2, std::memory_order_release);
             }
             sequence.store(stable_seq + 2, std::memory_order_release);
-            const auto success_event =
-                make_event(true,
-                           UpstreamMarkReplayReason::Published,
-                           stable_seq + 2,
-                           has_peer ? peer_generation : 0,
-                           has_peer ? peer_stable_seq + 2 : 0);
+            const auto success_event = make_event(true,
+                                                  UpstreamMarkReplayReason::Published,
+                                                  stable_seq + 2,
+                                                  has_peer ? peer_generation : 0,
+                                                  has_peer ? peer_stable_seq + 2 : 0);
             override_writer_claim_.store(0, std::memory_order_release);
             publish_event(success_event);
             return true;
