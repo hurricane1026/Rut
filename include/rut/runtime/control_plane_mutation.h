@@ -13,7 +13,8 @@ namespace rut {
 // thread-local so replay cannot latch a real mutation port into its handler
 // context even when the loop does not expose a capture ring.
 inline thread_local bool control_plane_replay_mode = false;
-inline thread_local bool control_plane_mark_replay_callback = false;
+inline thread_local const void* control_plane_mark_replay_callback_owner = nullptr;
+inline thread_local u32 control_plane_mark_replay_callback_depth = 0;
 
 enum class ReloadRequestSource : u8 {
     Route = 0,
@@ -279,7 +280,8 @@ public:
     }
 
     void set_upstream_mark_replay_sink(UpstreamMarkReplaySink sink, void* context) {
-        if (control_plane_mark_replay_callback) {
+        if (control_plane_mark_replay_callback_owner == this &&
+            control_plane_mark_replay_callback_depth != 0) {
             std::lock_guard lock(mark_replay_mutex_);
             const u64 epoch = mark_replay_sink_epoch_.load(std::memory_order_relaxed);
             const bool opened_epoch = (epoch & 1u) == 0;
@@ -968,10 +970,13 @@ public:
             };
         const auto publish_event = [&](const UpstreamMarkReplayEvent& event) {
             if (!event_callback_claimed || event_sink == nullptr) return;
-            const bool previous_callback_state = control_plane_mark_replay_callback;
-            control_plane_mark_replay_callback = true;
+            const void* previous_callback_owner = control_plane_mark_replay_callback_owner;
+            const u32 previous_callback_depth = control_plane_mark_replay_callback_depth;
+            control_plane_mark_replay_callback_owner = this;
+            control_plane_mark_replay_callback_depth++;
             event_sink(event_context, event);
-            control_plane_mark_replay_callback = previous_callback_state;
+            control_plane_mark_replay_callback_owner = previous_callback_owner;
+            control_plane_mark_replay_callback_depth = previous_callback_depth;
             mark_replay_callbacks_.fetch_sub(1, std::memory_order_release);
             event_callback_claimed = false;
         };
