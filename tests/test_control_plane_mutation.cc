@@ -35,6 +35,18 @@ static void disable_mark_replay_sink(void* context, const UpstreamMarkReplayEven
     state->port->set_upstream_mark_replay_sink(nullptr, nullptr);
 }
 
+struct CrossPortMarkReplaySinkContext {
+    ControlPlaneMutationPort* other = nullptr;
+    MarkReplayEvents* events = nullptr;
+    u32 count = 0;
+};
+
+static void install_other_port_sink(void* context, const UpstreamMarkReplayEvent&) {
+    auto* state = static_cast<CrossPortMarkReplaySinkContext*>(context);
+    ++state->count;
+    state->other->set_upstream_mark_replay_sink(&collect_mark_replay_event, state->events);
+}
+
 namespace rut {
 struct ControlPlaneMutationPortTestAccess {
     static u64 begin_serialized_admission_claim(ControlPlaneMutationPort& port) {
@@ -1176,6 +1188,24 @@ TEST(control_plane_mutation, mark_replay_sink_handles_reentrant_disable_and_fail
     CHECK_FALSE(port.mark({3, 0, 0}, false));
     REQUIRE_EQ(events.count, 2u);
     CHECK_EQ(events.events[1].reason, UpstreamMarkReplayReason::Unavailable);
+}
+
+TEST(control_plane_mutation, mark_replay_sink_guard_is_scoped_to_its_port) {
+    ControlPlaneMutationPort first;
+    ControlPlaneMutationPort second;
+    RouteConfig config;
+    REQUIRE(config.add_upstream("users", 0x7f000001u, 8000).has_value());
+    first.reset(3, true, &config);
+    second.reset(3, true, &config);
+
+    MarkReplayEvents second_events;
+    CrossPortMarkReplaySinkContext context{&second, &second_events};
+    first.set_upstream_mark_replay_sink(&install_other_port_sink, &context);
+    REQUIRE(first.mark({3, 0, 0}, true));
+    CHECK_EQ(context.count, 1u);
+    REQUIRE(second.mark({3, 0, 0}, false));
+    REQUIRE_EQ(second_events.count, 1u);
+    CHECK_FALSE(second_events.events[0].healthy);
 }
 
 TEST(control_plane_mutation, compatible_retained_generations_share_override_updates) {
