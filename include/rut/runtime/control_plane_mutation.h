@@ -13,7 +13,7 @@ namespace rut {
 // thread-local so replay cannot latch a real mutation port into its handler
 // context even when the loop does not expose a capture ring.
 inline thread_local bool control_plane_replay_mode = false;
-inline thread_local const void* control_plane_mark_replay_callback_owner = nullptr;
+inline thread_local const void* control_plane_mark_replay_callback_owners[16]{};
 inline thread_local u32 control_plane_mark_replay_callback_depth = 0;
 
 enum class ReloadRequestSource : u8 {
@@ -159,6 +159,7 @@ public:
         counter_exhaustion_generation_.store(0, std::memory_order_relaxed);
         counter_exhaustion_frontier_.store(0, std::memory_order_relaxed);
         counter_exhaustion_state_.store(0, std::memory_order_relaxed);
+        mark_replay_sequence_.store(0, std::memory_order_relaxed);
         reload_word_.store(
             pack_reload(
                 ReloadAdmissionState::Idle, 0, ReloadRequestSource::Route, allow_route_reload),
@@ -280,8 +281,10 @@ public:
     }
 
     void set_upstream_mark_replay_sink(UpstreamMarkReplaySink sink, void* context) {
-        if (control_plane_mark_replay_callback_owner == this &&
-            control_plane_mark_replay_callback_depth != 0) {
+        bool callback_owns_port = false;
+        for (u32 i = 0; i < control_plane_mark_replay_callback_depth; i++)
+            callback_owns_port |= control_plane_mark_replay_callback_owners[i] == this;
+        if (callback_owns_port) {
             std::lock_guard lock(mark_replay_mutex_);
             const u64 epoch = mark_replay_sink_epoch_.load(std::memory_order_relaxed);
             const bool opened_epoch = (epoch & 1u) == 0;
@@ -975,12 +978,11 @@ public:
         };
         const auto publish_event = [&](const UpstreamMarkReplayEvent& event) {
             if (!event_callback_claimed || event_sink == nullptr) return;
-            const void* previous_callback_owner = control_plane_mark_replay_callback_owner;
             const u32 previous_callback_depth = control_plane_mark_replay_callback_depth;
-            control_plane_mark_replay_callback_owner = this;
-            control_plane_mark_replay_callback_depth++;
+            if (control_plane_mark_replay_callback_depth < 16)
+                control_plane_mark_replay_callback_owners
+                    [control_plane_mark_replay_callback_depth++] = this;
             event_sink(event_context, event);
-            control_plane_mark_replay_callback_owner = previous_callback_owner;
             control_plane_mark_replay_callback_depth = previous_callback_depth;
             mark_replay_callbacks_.fetch_sub(1, std::memory_order_release);
             event_callback_claimed = false;
