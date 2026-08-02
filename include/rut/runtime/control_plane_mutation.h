@@ -286,9 +286,9 @@ public:
             mark_replay_sequence_.store(0, std::memory_order_release);
             return;
         }
-        std::lock_guard lock(mark_replay_mutex_);
         while (mark_replay_callbacks_.load(std::memory_order_acquire) != 0) {
         }
+        std::lock_guard lock(mark_replay_mutex_);
         mark_replay_sink_ = sink;
         mark_replay_sink_context_ = context;
         mark_replay_sequence_.store(0, std::memory_order_release);
