@@ -281,17 +281,32 @@ public:
     void set_upstream_mark_replay_sink(UpstreamMarkReplaySink sink, void* context) {
         if (control_plane_mark_replay_callback) {
             std::lock_guard lock(mark_replay_mutex_);
-            mark_replay_sink_ = sink;
-            mark_replay_sink_context_ = context;
+            mark_replay_sink_epoch_.fetch_add(1, std::memory_order_acq_rel);
+            mark_replay_sink_.store(sink, std::memory_order_relaxed);
+            mark_replay_sink_context_.store(context, std::memory_order_relaxed);
+            mark_replay_sink_epoch_.fetch_add(1, std::memory_order_release);
             mark_replay_sequence_.store(0, std::memory_order_release);
             return;
         }
+        {
+            std::lock_guard lock(mark_replay_mutex_);
+            if ((mark_replay_sink_epoch_.load(std::memory_order_relaxed) & 1u) == 0)
+                mark_replay_sink_epoch_.fetch_add(1, std::memory_order_acq_rel);
+        }
         while (mark_replay_callbacks_.load(std::memory_order_acquire) != 0) {
         }
-        std::lock_guard lock(mark_replay_mutex_);
-        mark_replay_sink_ = sink;
-        mark_replay_sink_context_ = context;
-        mark_replay_sequence_.store(0, std::memory_order_release);
+        {
+            std::lock_guard lock(mark_replay_mutex_);
+            u64 epoch = mark_replay_sink_epoch_.load(std::memory_order_relaxed);
+            if ((epoch & 1u) == 0) {
+                mark_replay_sink_epoch_.fetch_add(1, std::memory_order_acq_rel);
+                epoch++;
+            }
+            mark_replay_sink_.store(sink, std::memory_order_relaxed);
+            mark_replay_sink_context_.store(context, std::memory_order_relaxed);
+            mark_replay_sink_epoch_.store(epoch + 1, std::memory_order_release);
+            mark_replay_sequence_.store(0, std::memory_order_release);
+        }
     }
 
     [[nodiscard]] bool request_reload(ReloadRequestSource source, u64* request_id = nullptr) {
@@ -915,14 +930,24 @@ public:
                 event_context = nullptr;
                 event_callback_claimed = false;
                 for (u32 attempt = 0; attempt < kMaxMarkAttempts; attempt++) {
-                    if (!mark_replay_mutex_.try_lock()) continue;
-                    event_sink = mark_replay_sink_;
-                    event_context = mark_replay_sink_context_;
-                    if (event_sink != nullptr) {
-                        mark_replay_callbacks_.fetch_add(1, std::memory_order_acq_rel);
-                        event_callback_claimed = true;
+                    const u64 epoch = mark_replay_sink_epoch_.load(std::memory_order_acquire);
+                    if ((epoch & 1u) != 0) continue;
+                    mark_replay_callbacks_.fetch_add(1, std::memory_order_acq_rel);
+                    if (epoch != mark_replay_sink_epoch_.load(std::memory_order_acquire)) {
+                        mark_replay_callbacks_.fetch_sub(1, std::memory_order_release);
+                        continue;
                     }
-                    mark_replay_mutex_.unlock();
+                    event_sink = mark_replay_sink_.load(std::memory_order_relaxed);
+                    event_context = mark_replay_sink_context_.load(std::memory_order_relaxed);
+                    if (epoch != mark_replay_sink_epoch_.load(std::memory_order_acquire)) {
+                        mark_replay_callbacks_.fetch_sub(1, std::memory_order_release);
+                        event_sink = nullptr;
+                        event_context = nullptr;
+                        continue;
+                    }
+                    event_callback_claimed = event_sink != nullptr;
+                    if (!event_callback_claimed)
+                        mark_replay_callbacks_.fetch_sub(1, std::memory_order_release);
                     break;
                 }
                 UpstreamMarkReplayEvent event{};
@@ -2663,8 +2688,9 @@ private:
     }
 
     std::atomic<u64> reload_word_{0};
-    UpstreamMarkReplaySink mark_replay_sink_ = nullptr;
-    void* mark_replay_sink_context_ = nullptr;
+    std::atomic<UpstreamMarkReplaySink> mark_replay_sink_{nullptr};
+    std::atomic<void*> mark_replay_sink_context_{nullptr};
+    std::atomic<u64> mark_replay_sink_epoch_{0};
     std::atomic<u64> mark_replay_sequence_{0};
     std::atomic<u32> mark_replay_callbacks_{0};
     std::mutex mark_replay_mutex_;
