@@ -281,22 +281,25 @@ public:
     void set_upstream_mark_replay_sink(UpstreamMarkReplaySink sink, void* context) {
         if (control_plane_mark_replay_callback) {
             std::lock_guard lock(mark_replay_mutex_);
-            mark_replay_sink_epoch_.fetch_add(1, std::memory_order_acq_rel);
+            const u64 epoch = mark_replay_sink_epoch_.load(std::memory_order_relaxed);
+            const bool opened_epoch = (epoch & 1u) == 0;
+            if (opened_epoch) mark_replay_sink_epoch_.fetch_add(1, std::memory_order_acq_rel);
             mark_replay_sink_.store(sink, std::memory_order_relaxed);
             mark_replay_sink_context_.store(context, std::memory_order_relaxed);
-            mark_replay_sink_epoch_.fetch_add(1, std::memory_order_release);
             mark_replay_sequence_.store(0, std::memory_order_release);
+            if (opened_epoch) mark_replay_sink_epoch_.fetch_add(1, std::memory_order_release);
             return;
         }
-        {
+        for (;;) {
+            {
+                std::lock_guard lock(mark_replay_mutex_);
+                if ((mark_replay_sink_epoch_.load(std::memory_order_relaxed) & 1u) == 0)
+                    mark_replay_sink_epoch_.fetch_add(1, std::memory_order_acq_rel);
+            }
+            while (mark_replay_callbacks_.load(std::memory_order_acquire) != 0) {
+            }
             std::lock_guard lock(mark_replay_mutex_);
-            if ((mark_replay_sink_epoch_.load(std::memory_order_relaxed) & 1u) == 0)
-                mark_replay_sink_epoch_.fetch_add(1, std::memory_order_acq_rel);
-        }
-        while (mark_replay_callbacks_.load(std::memory_order_acquire) != 0) {
-        }
-        {
-            std::lock_guard lock(mark_replay_mutex_);
+            if (mark_replay_callbacks_.load(std::memory_order_acquire) != 0) continue;
             u64 epoch = mark_replay_sink_epoch_.load(std::memory_order_relaxed);
             if ((epoch & 1u) == 0) {
                 mark_replay_sink_epoch_.fetch_add(1, std::memory_order_acq_rel);
@@ -304,8 +307,9 @@ public:
             }
             mark_replay_sink_.store(sink, std::memory_order_relaxed);
             mark_replay_sink_context_.store(context, std::memory_order_relaxed);
-            mark_replay_sink_epoch_.store(epoch + 1, std::memory_order_release);
             mark_replay_sequence_.store(0, std::memory_order_release);
+            mark_replay_sink_epoch_.store(epoch + 1, std::memory_order_release);
+            return;
         }
     }
 
