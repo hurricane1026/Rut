@@ -1267,6 +1267,7 @@ TEST(control_plane_mutation, nested_cross_port_sink_reentry_does_not_deadlock) {
     first.set_upstream_mark_replay_sink(&nested_cross_port_sink, &first_context);
     second.set_upstream_mark_replay_sink(&nested_cross_port_sink, &second_context);
     REQUIRE(first.mark({3, 0, 0}, true));
+    REQUIRE(first.mark({3, 0, 0}, false));
     CHECK(events.count > 0u);
 }
 
