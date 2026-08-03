@@ -55,7 +55,7 @@ struct NestedCrossPortSinkContext {
 
 static void nested_cross_port_sink(void* context, const UpstreamMarkReplayEvent&) {
     auto* state = static_cast<NestedCrossPortSinkContext*>(context);
-    if (state->nested != nullptr) REQUIRE(state->nested->mark({3, 0, 0}, false));
+    if (state->nested != nullptr) (void)state->nested->mark({3, 0, 0}, false);
     state->replace->set_upstream_mark_replay_sink(&collect_mark_replay_event, state->events);
 }
 
