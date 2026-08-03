@@ -992,16 +992,31 @@ public:
             if (!event_callback_claimed) return;
             const u32 previous_callback_depth = control_plane_mark_replay_callback_depth;
             const bool previous_callback_overflow = control_plane_mark_replay_callback_overflow;
+            struct CallbackCleanup {
+                u32& depth;
+                bool& overflow;
+                u32 previous_depth;
+                bool previous_overflow;
+                std::atomic<u32>& callbacks;
+                bool& claimed;
+                ~CallbackCleanup() {
+                    depth = previous_depth;
+                    overflow = previous_overflow;
+                    callbacks.fetch_sub(1, std::memory_order_release);
+                    claimed = false;
+                }
+            } cleanup{control_plane_mark_replay_callback_depth,
+                      control_plane_mark_replay_callback_overflow,
+                      previous_callback_depth,
+                      previous_callback_overflow,
+                      mark_replay_callbacks_,
+                      event_callback_claimed};
             if (event_sink != nullptr && control_plane_mark_replay_callback_depth < 16)
                 control_plane_mark_replay_callback_owners
                     [control_plane_mark_replay_callback_depth++] = this;
             else if (event_sink != nullptr)
                 control_plane_mark_replay_callback_overflow = true;
             if (event_sink != nullptr) event_sink(event_context, event);
-            control_plane_mark_replay_callback_depth = previous_callback_depth;
-            control_plane_mark_replay_callback_overflow = previous_callback_overflow;
-            mark_replay_callbacks_.fetch_sub(1, std::memory_order_release);
-            event_callback_claimed = false;
         };
         if (stopping_.load(std::memory_order_acquire) != 0 ||
             cutover_.load(std::memory_order_acquire) != 0) {
