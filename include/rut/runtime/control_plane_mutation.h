@@ -1169,12 +1169,13 @@ public:
             override_seq_[peer_bank].store(peer_stable_seq + 2, std::memory_order_release);
         }
         sequence.store(stable_seq + 2, std::memory_order_release);
+        const auto rollback_event = make_event(false,
+                                               UpstreamMarkReplayReason::Unavailable,
+                                               stable_seq + 2,
+                                               has_peer ? peer_generation : 0,
+                                               has_peer ? peer_stable_seq + 2 : 0);
         override_writer_claim_.store(0, std::memory_order_release);
-        publish_event(make_event(false,
-                                 UpstreamMarkReplayReason::Unavailable,
-                                 stable_seq + 2,
-                                 has_peer ? peer_generation : 0,
-                                 has_peer ? peer_stable_seq + 2 : 0));
+        publish_event(rollback_event);
         return false;
     }
 
