@@ -1145,11 +1145,12 @@ public:
                 return false;
             }
             const u64 version = prior_version + 1;
+            u64 peer_version = 0;
             publish_committed_override(
                 bank, server.upstream_id, server.backend_id, desired, version);
             override_version_[bank].store(version, std::memory_order_release);
             if (has_peer) {
-                const u64 peer_version = peer_prior_version + 1;
+                peer_version = peer_prior_version + 1;
                 publish_committed_override(peer_bank,
                                            peer_upstream,
                                            peer_backend,
