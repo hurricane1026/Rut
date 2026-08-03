@@ -14,8 +14,57 @@ static bool oversized_source_capture(void*, char*, u32 capacity, u32* out_len) {
     return true;
 }
 
+struct MarkReplayEvents {
+    UpstreamMarkReplayEvent events[8]{};
+    u32 count = 0;
+};
+
+static void collect_mark_replay_event(void* context, const UpstreamMarkReplayEvent& event) {
+    auto* events = static_cast<MarkReplayEvents*>(context);
+    if (events != nullptr && events->count < 8) events->events[events->count++] = event;
+}
+
+struct ReentrantMarkReplaySinkContext {
+    ControlPlaneMutationPort* port = nullptr;
+    u32 count = 0;
+};
+
+static void disable_mark_replay_sink(void* context, const UpstreamMarkReplayEvent&) {
+    auto* state = static_cast<ReentrantMarkReplaySinkContext*>(context);
+    ++state->count;
+    state->port->set_upstream_mark_replay_sink(nullptr, nullptr);
+}
+
+struct CrossPortMarkReplaySinkContext {
+    ControlPlaneMutationPort* other = nullptr;
+    MarkReplayEvents* events = nullptr;
+    u32 count = 0;
+};
+
+static void install_other_port_sink(void* context, const UpstreamMarkReplayEvent&) {
+    auto* state = static_cast<CrossPortMarkReplaySinkContext*>(context);
+    ++state->count;
+    state->other->set_upstream_mark_replay_sink(&collect_mark_replay_event, state->events);
+}
+
+struct NestedCrossPortSinkContext {
+    ControlPlaneMutationPort* nested = nullptr;
+    ControlPlaneMutationPort* replace = nullptr;
+    MarkReplayEvents* events = nullptr;
+};
+
+static void nested_cross_port_sink(void* context, const UpstreamMarkReplayEvent&) {
+    auto* state = static_cast<NestedCrossPortSinkContext*>(context);
+    if (state->nested != nullptr) (void)state->nested->mark({3, 0, 0}, false);
+    state->replace->set_upstream_mark_replay_sink(&collect_mark_replay_event, state->events);
+}
+
 namespace rut {
 struct ControlPlaneMutationPortTestAccess {
+    static void set_writer_claim(ControlPlaneMutationPort& port, u8 claimed) {
+        port.override_writer_claim_.store(claimed, std::memory_order_release);
+    }
+
     static u64 begin_serialized_admission_claim(ControlPlaneMutationPort& port) {
         port.lock_terminal_publication();
         ControlPlaneMutationPort::ClaimedRecordSlot identity_slot{};
@@ -1086,10 +1135,18 @@ TEST(control_plane_mutation, activation_carries_overrides_across_probe_policy_ch
     old_config.upstreams[1].hc_interval_ms = 1000;
     old_config.upstreams[1].hc_expected_status = 204;
     port.reset(3, true, &old_config);
+    MarkReplayEvents replay_events;
+    port.set_upstream_mark_replay_sink(&collect_mark_replay_event, &replay_events);
     const u16 old_allocation = port.endpoint_allocation_for_config(&old_config, 1, 0);
     const u64 old_incarnation = port.endpoint_incarnation_for_config(&old_config, 1, 0);
     REQUIRE(port.mark({3, 0, 0}, false));
     REQUIRE(port.mark({3, 1, 0}, true));
+    REQUIRE(replay_events.count == 2);
+    CHECK_EQ(replay_events.events[0].event_sequence, 1u);
+    CHECK(replay_events.events[0].accepted);
+    CHECK_EQ(replay_events.events[0].reason, UpstreamMarkReplayReason::Published);
+    CHECK_EQ(replay_events.events[0].published_version, 1u);
+    CHECK_EQ(replay_events.events[0].published_sequence, 2u);
 
     u64 id = 0;
     REQUIRE(port.request_reload(ReloadRequestSource::Route, &id));
@@ -1126,11 +1183,102 @@ TEST(control_plane_mutation, activation_carries_overrides_across_probe_policy_ch
     CHECK_EQ(version, 1u);
 }
 
+TEST(control_plane_mutation, mark_replay_sink_handles_reentrant_disable_and_failures) {
+    ControlPlaneMutationPort port;
+    RouteConfig config;
+    REQUIRE(config.add_upstream("users", 0x7f000001u, 8000).has_value());
+    port.reset(3, true, &config);
+
+    ReentrantMarkReplaySinkContext reentrant{&port};
+    port.set_upstream_mark_replay_sink(&disable_mark_replay_sink, &reentrant);
+    REQUIRE(port.mark({3, 0, 0}, true));
+    CHECK_EQ(reentrant.count, 1u);
+
+    MarkReplayEvents events;
+    port.set_upstream_mark_replay_sink(&collect_mark_replay_event, &events);
+    CHECK_FALSE(port.mark({3, RouteConfig::kMaxUpstreams, 0}, false));
+    REQUIRE_EQ(events.count, 1u);
+    CHECK_FALSE(events.events[0].accepted);
+    CHECK_EQ(events.events[0].reason, UpstreamMarkReplayReason::StaleOrForeign);
+
+    port.stop();
+    CHECK_FALSE(port.mark({3, 0, 0}, false));
+    REQUIRE_EQ(events.count, 2u);
+    CHECK_EQ(events.events[1].reason, UpstreamMarkReplayReason::Unavailable);
+}
+
+TEST(control_plane_mutation, mark_replay_sink_guard_is_scoped_to_its_port) {
+    ControlPlaneMutationPort first;
+    ControlPlaneMutationPort second;
+    RouteConfig config;
+    REQUIRE(config.add_upstream("users", 0x7f000001u, 8000).has_value());
+    first.reset(3, true, &config);
+    second.reset(3, true, &config);
+
+    MarkReplayEvents second_events;
+    CrossPortMarkReplaySinkContext context{&second, &second_events};
+    first.set_upstream_mark_replay_sink(&install_other_port_sink, &context);
+    REQUIRE(first.mark({3, 0, 0}, true));
+    CHECK_EQ(context.count, 1u);
+    REQUIRE(second.mark({3, 0, 0}, false));
+    REQUIRE_EQ(second_events.count, 1u);
+    CHECK_FALSE(second_events.events[0].healthy);
+}
+
+TEST(control_plane_mutation, reset_preserving_membership_restarts_replay_sequence) {
+    ControlPlaneMutationPort port;
+    RouteConfig config;
+    REQUIRE(config.add_upstream("users", 0x7f000001u, 8000).has_value());
+    port.reset(3, true, &config);
+    MarkReplayEvents events;
+    port.set_upstream_mark_replay_sink(&collect_mark_replay_event, &events);
+    REQUIRE(port.mark({3, 0, 0}, true));
+    REQUIRE_EQ(events.count, 1u);
+    CHECK_EQ(events.events[0].event_sequence, 1u);
+    port.reset_preserving_membership(4, true);
+    REQUIRE(port.mark({4, 0, 0}, false));
+    REQUIRE_EQ(events.count, 2u);
+    CHECK_EQ(events.events[1].event_sequence, 1u);
+}
+
+TEST(control_plane_mutation, replay_records_writer_contention) {
+    ControlPlaneMutationPort port;
+    RouteConfig config;
+    REQUIRE(config.add_upstream("users", 0x7f000001u, 8000).has_value());
+    port.reset(3, true, &config);
+    MarkReplayEvents events;
+    port.set_upstream_mark_replay_sink(&collect_mark_replay_event, &events);
+    ControlPlaneMutationPortTestAccess::set_writer_claim(port, 1);
+    CHECK_FALSE(port.mark({3, 0, 0}, true));
+    ControlPlaneMutationPortTestAccess::set_writer_claim(port, 0);
+    REQUIRE_EQ(events.count, 1u);
+    CHECK_EQ(events.events[0].reason, UpstreamMarkReplayReason::Contended);
+}
+
+TEST(control_plane_mutation, nested_cross_port_sink_reentry_does_not_deadlock) {
+    ControlPlaneMutationPort first;
+    ControlPlaneMutationPort second;
+    RouteConfig config;
+    REQUIRE(config.add_upstream("users", 0x7f000001u, 8000).has_value());
+    first.reset(3, true, &config);
+    second.reset(3, true, &config);
+    MarkReplayEvents events;
+    NestedCrossPortSinkContext first_context{&second, &first, &events};
+    NestedCrossPortSinkContext second_context{nullptr, &first, &events};
+    first.set_upstream_mark_replay_sink(&nested_cross_port_sink, &first_context);
+    second.set_upstream_mark_replay_sink(&nested_cross_port_sink, &second_context);
+    REQUIRE(first.mark({3, 0, 0}, true));
+    REQUIRE(first.mark({3, 0, 0}, false));
+    CHECK(events.count > 0u);
+}
+
 TEST(control_plane_mutation, compatible_retained_generations_share_override_updates) {
     ControlPlaneMutationPort port;
     RouteConfig old_config;
     REQUIRE(old_config.add_upstream("users", 0x7f000001u, 8000).has_value());
     port.reset(3, true, &old_config);
+    MarkReplayEvents replay_events;
+    port.set_upstream_mark_replay_sink(&collect_mark_replay_event, &replay_events);
     REQUIRE(port.mark({3, 0, 0}, false));
 
     u64 id = 0;
@@ -1144,6 +1292,9 @@ TEST(control_plane_mutation, compatible_retained_generations_share_override_upda
     CHECK_EQ(port.manual_health({4, 0, 0}), ManualHealthOverride::Unhealthy);
 
     REQUIRE(port.mark({3, 0, 0}, true));
+    REQUIRE_EQ(replay_events.count, 2u);
+    CHECK_EQ(replay_events.events[1].peer_config_generation, 4u);
+    CHECK(replay_events.events[1].peer_published_version > 0u);
     CHECK_EQ(port.manual_health({3, 0, 0}), ManualHealthOverride::Healthy);
     CHECK_EQ(port.manual_health({4, 0, 0}), ManualHealthOverride::Healthy);
 
