@@ -47,6 +47,18 @@ static void install_other_port_sink(void* context, const UpstreamMarkReplayEvent
     state->other->set_upstream_mark_replay_sink(&collect_mark_replay_event, state->events);
 }
 
+struct NestedCrossPortSinkContext {
+    ControlPlaneMutationPort* nested = nullptr;
+    ControlPlaneMutationPort* replace = nullptr;
+    MarkReplayEvents* events = nullptr;
+};
+
+static void nested_cross_port_sink(void* context, const UpstreamMarkReplayEvent&) {
+    auto* state = static_cast<NestedCrossPortSinkContext*>(context);
+    if (state->nested != nullptr) REQUIRE(state->nested->mark({3, 0, 0}, false));
+    state->replace->set_upstream_mark_replay_sink(&collect_mark_replay_event, state->events);
+}
+
 namespace rut {
 struct ControlPlaneMutationPortTestAccess {
     static void set_writer_claim(ControlPlaneMutationPort& port, u8 claimed) {
@@ -1240,6 +1252,22 @@ TEST(control_plane_mutation, replay_records_writer_contention) {
     ControlPlaneMutationPortTestAccess::set_writer_claim(port, 0);
     REQUIRE_EQ(events.count, 1u);
     CHECK_EQ(events.events[0].reason, UpstreamMarkReplayReason::Contended);
+}
+
+TEST(control_plane_mutation, nested_cross_port_sink_reentry_does_not_deadlock) {
+    ControlPlaneMutationPort first;
+    ControlPlaneMutationPort second;
+    RouteConfig config;
+    REQUIRE(config.add_upstream("users", 0x7f000001u, 8000).has_value());
+    first.reset(3, true, &config);
+    second.reset(3, true, &config);
+    MarkReplayEvents events;
+    NestedCrossPortSinkContext first_context{&second, &first, &events};
+    NestedCrossPortSinkContext second_context{nullptr, &first, &events};
+    first.set_upstream_mark_replay_sink(&nested_cross_port_sink, &first_context);
+    second.set_upstream_mark_replay_sink(&nested_cross_port_sink, &second_context);
+    REQUIRE(first.mark({3, 0, 0}, true));
+    CHECK(events.count > 0u);
 }
 
 TEST(control_plane_mutation, compatible_retained_generations_share_override_updates) {
