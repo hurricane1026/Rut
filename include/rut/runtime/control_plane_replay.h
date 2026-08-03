@@ -27,6 +27,8 @@ struct UpstreamMarkReplayEvent {
     u64 published_version = 0;
     u64 peer_config_generation = 0;
     u64 peer_published_version = 0;
+    u64 published_sequence = 0;
+    u64 peer_published_sequence = 0;
 };
 
 using UpstreamMarkReplaySink = void (*)(void* context, const UpstreamMarkReplayEvent& event);

@@ -947,7 +947,9 @@ public:
                                     UpstreamMarkReplayReason reason,
                                     u64 published_version = 0,
                                     u64 peer_config_generation = 0,
-                                    u64 peer_published_version = 0) {
+                                    u64 peer_published_version = 0,
+                                    u64 published_sequence = 0,
+                                    u64 peer_published_sequence = 0) {
             event_sink = nullptr;
             event_context = nullptr;
             event_callback_claimed = false;
@@ -982,6 +984,8 @@ public:
             event.published_version = published_version;
             event.peer_config_generation = peer_config_generation;
             event.peer_published_version = peer_published_version;
+            event.published_sequence = published_sequence;
+            event.peer_published_sequence = peer_published_sequence;
             return event;
         };
         const auto publish_event = [&](const UpstreamMarkReplayEvent& event) {
@@ -1084,7 +1088,7 @@ public:
                                         cutover_.load(std::memory_order_acquire) != 0
                                     ? UpstreamMarkReplayReason::Unavailable
                                     : UpstreamMarkReplayReason::Contended;
-            publish_event(make_event(false, reason, stable_seq + 2));
+            publish_event(make_event(false, reason, 0, 0, 0, stable_seq + 2));
             return false;
         }
 
@@ -1105,8 +1109,10 @@ public:
             override_writer_claim_.store(0, std::memory_order_release);
             publish_event(make_event(false,
                                      UpstreamMarkReplayReason::Unavailable,
-                                     stable_seq + 2,
+                                     0,
                                      has_peer ? peer_generation : 0,
+                                     0,
+                                     stable_seq + 2,
                                      has_peer ? peer_stable_seq + 2 : 0));
             return false;
         }
@@ -1131,8 +1137,10 @@ public:
                 override_writer_claim_.store(0, std::memory_order_release);
                 publish_event(make_event(false,
                                          UpstreamMarkReplayReason::VersionExhausted,
-                                         stable_seq + 2,
+                                         0,
                                          has_peer ? peer_generation : 0,
+                                         0,
+                                         stable_seq + 2,
                                          has_peer ? peer_stable_seq + 2 : 0));
                 return false;
             }
@@ -1153,8 +1161,10 @@ public:
             sequence.store(stable_seq + 2, std::memory_order_release);
             const auto success_event = make_event(true,
                                                   UpstreamMarkReplayReason::Published,
-                                                  stable_seq + 2,
+                                                  version,
                                                   has_peer ? peer_generation : 0,
+                                                  has_peer ? peer_version : 0,
+                                                  stable_seq + 2,
                                                   has_peer ? peer_stable_seq + 2 : 0);
             override_writer_claim_.store(0, std::memory_order_release);
             publish_event(success_event);
@@ -1171,8 +1181,10 @@ public:
         sequence.store(stable_seq + 2, std::memory_order_release);
         const auto rollback_event = make_event(false,
                                                UpstreamMarkReplayReason::Unavailable,
-                                               stable_seq + 2,
+                                               0,
                                                has_peer ? peer_generation : 0,
+                                               0,
+                                               stable_seq + 2,
                                                has_peer ? peer_stable_seq + 2 : 0);
         override_writer_claim_.store(0, std::memory_order_release);
         publish_event(rollback_event);

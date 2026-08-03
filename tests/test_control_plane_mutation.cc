@@ -1145,7 +1145,8 @@ TEST(control_plane_mutation, activation_carries_overrides_across_probe_policy_ch
     CHECK_EQ(replay_events.events[0].event_sequence, 1u);
     CHECK(replay_events.events[0].accepted);
     CHECK_EQ(replay_events.events[0].reason, UpstreamMarkReplayReason::Published);
-    CHECK_EQ(replay_events.events[0].published_version, 2u);
+    CHECK_EQ(replay_events.events[0].published_version, 1u);
+    CHECK_EQ(replay_events.events[0].published_sequence, 2u);
 
     u64 id = 0;
     REQUIRE(port.request_reload(ReloadRequestSource::Route, &id));
