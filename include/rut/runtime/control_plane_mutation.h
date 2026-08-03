@@ -296,15 +296,6 @@ public:
             if (opened_epoch) mark_replay_sink_epoch_.fetch_add(1, std::memory_order_release);
             return;
         }
-        if (control_plane_mark_replay_callback_depth != 0) {
-            std::lock_guard lock(mark_replay_mutex_);
-            mark_replay_sink_epoch_.fetch_add(1, std::memory_order_acq_rel);
-            mark_replay_sink_.store(sink, std::memory_order_relaxed);
-            mark_replay_sink_context_.store(context, std::memory_order_relaxed);
-            mark_replay_sequence_.store(0, std::memory_order_release);
-            mark_replay_sink_epoch_.fetch_add(1, std::memory_order_release);
-            return;
-        }
         for (;;) {
             {
                 std::lock_guard lock(mark_replay_mutex_);
@@ -943,6 +934,7 @@ public:
         UpstreamMarkReplaySink event_sink = nullptr;
         void* event_context = nullptr;
         bool event_callback_claimed = false;
+        std::unique_lock<std::recursive_mutex> callback_dispatch_lock;
         const auto make_event = [&](bool accepted,
                                     UpstreamMarkReplayReason reason,
                                     u64 published_version = 0,
@@ -956,9 +948,16 @@ public:
             for (u32 attempt = 0; attempt < kMaxMarkAttempts; attempt++) {
                 const u64 epoch = mark_replay_sink_epoch_.load(std::memory_order_acquire);
                 if ((epoch & 1u) != 0) continue;
+                callback_dispatch_lock =
+                    std::unique_lock<std::recursive_mutex>(mark_replay_dispatch_mutex_);
+                if (epoch != mark_replay_sink_epoch_.load(std::memory_order_acquire)) {
+                    callback_dispatch_lock.unlock();
+                    continue;
+                }
                 mark_replay_callbacks_.fetch_add(1, std::memory_order_acq_rel);
                 if (epoch != mark_replay_sink_epoch_.load(std::memory_order_acquire)) {
                     mark_replay_callbacks_.fetch_sub(1, std::memory_order_release);
+                    callback_dispatch_lock.unlock();
                     continue;
                 }
                 event_sink = mark_replay_sink_.load(std::memory_order_relaxed);
@@ -967,6 +966,7 @@ public:
                     mark_replay_callbacks_.fetch_sub(1, std::memory_order_release);
                     event_sink = nullptr;
                     event_context = nullptr;
+                    callback_dispatch_lock.unlock();
                     continue;
                 }
                 event_callback_claimed = true;
@@ -999,9 +999,11 @@ public:
                 bool previous_overflow;
                 std::atomic<u32>& callbacks;
                 bool& claimed;
+                std::unique_lock<std::recursive_mutex>& dispatch_lock;
                 ~CallbackCleanup() {
                     depth = previous_depth;
                     overflow = previous_overflow;
+                    if (dispatch_lock.owns_lock()) dispatch_lock.unlock();
                     callbacks.fetch_sub(1, std::memory_order_release);
                     claimed = false;
                 }
@@ -1010,7 +1012,8 @@ public:
                       previous_callback_depth,
                       previous_callback_overflow,
                       mark_replay_callbacks_,
-                      event_callback_claimed};
+                      event_callback_claimed,
+                      callback_dispatch_lock};
             if (event_sink != nullptr && control_plane_mark_replay_callback_depth < 16)
                 control_plane_mark_replay_callback_owners
                     [control_plane_mark_replay_callback_depth++] = this;
@@ -2778,6 +2781,7 @@ private:
     std::atomic<u64> mark_replay_sequence_{0};
     std::atomic<u32> mark_replay_callbacks_{0};
     std::mutex mark_replay_mutex_;
+    inline static std::recursive_mutex mark_replay_dispatch_mutex_;
     ReloadSourceVersionCapture source_version_capture_ = nullptr;
     void* source_version_capture_context_ = nullptr;
     u32 source_version_len_ = 0;
