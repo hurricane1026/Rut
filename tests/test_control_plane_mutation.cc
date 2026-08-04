@@ -1272,6 +1272,46 @@ TEST(control_plane_mutation, nested_cross_port_sink_reentry_does_not_deadlock) {
     CHECK(events.count > 0u);
 }
 
+TEST(control_plane_mutation, replay_sink_replacement_races_mark_without_losing_lifetime) {
+    ControlPlaneMutationPort port;
+    RouteConfig config;
+    REQUIRE(config.add_upstream("users", 0x7f000001u, 8000).has_value());
+    port.reset(3, true, &config);
+    MarkReplayEvents events;
+    port.set_upstream_mark_replay_sink(&collect_mark_replay_event, &events);
+
+    std::atomic<bool> first_marked = false;
+    std::thread replacer([&] {
+        while (!first_marked.load(std::memory_order_acquire)) std::this_thread::yield();
+        for (u32 i = 0; i < 256; i++)
+            port.set_upstream_mark_replay_sink(
+                (i & 1u) == 0 ? &collect_mark_replay_event : nullptr,
+                (i & 1u) == 0 ? static_cast<void*>(&events) : nullptr);
+    });
+    REQUIRE(port.mark({3, 0, 0}, true));
+    first_marked.store(true, std::memory_order_release);
+    for (u32 i = 0; i < 256; i++) (void)port.mark({3, 0, 0}, (i & 1u) != 0);
+    replacer.join();
+    CHECK(events.count > 0u);
+}
+
+TEST(control_plane_mutation, replay_sink_callback_overflow_restores_thread_state) {
+    ControlPlaneMutationPort port;
+    RouteConfig config;
+    REQUIRE(config.add_upstream("users", 0x7f000001u, 8000).has_value());
+    port.reset(3, true, &config);
+    MarkReplayEvents events;
+    CrossPortMarkReplaySinkContext context{&port, &events};
+    port.set_upstream_mark_replay_sink(&install_other_port_sink, &context);
+
+    control_plane_mark_replay_callback_depth = 16;
+    control_plane_mark_replay_callback_overflow = false;
+    REQUIRE(port.mark({3, 0, 0}, true));
+    CHECK_EQ(control_plane_mark_replay_callback_depth, 16u);
+    CHECK_FALSE(control_plane_mark_replay_callback_overflow);
+    control_plane_mark_replay_callback_depth = 0;
+}
+
 TEST(control_plane_mutation, compatible_retained_generations_share_override_updates) {
     ControlPlaneMutationPort port;
     RouteConfig old_config;
