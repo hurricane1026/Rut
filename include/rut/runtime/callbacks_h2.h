@@ -894,8 +894,13 @@ void h2_invoke_emit(H2Dispatch<Loop>& d,
     ctx->route_param_count = param_count;
     for (u32 i = 0; i < param_count; i++) ctx->route_params[i] = params[i];
 
-    const JitDispatchOutcome kOutcome = invoke_jit_handler(
-        route->fn, static_cast<void*>(d.conn), *ctx, synth, synth_len, /*arena=*/nullptr);
+    const JitDispatchOutcome kOutcome = invoke_jit_handler(route->fn,
+                                                           static_cast<void*>(d.conn),
+                                                           *ctx,
+                                                           synth,
+                                                           synth_len,
+                                                           /*arena=*/nullptr,
+                                                           &d.conn->replay_context);
     if (kOutcome.kind == JitDispatchOutcome::Kind::TimerYield) {
         if (!h2_suspend_timer(d,
                               stream_id,
@@ -1316,8 +1321,13 @@ void h2_dispatch_request(H2Dispatch<Loop>& d,
                 ctx->resume_event_result = 0;
                 ctx->route_param_count = param_count;
                 for (u32 i = 0; i < param_count; i++) ctx->route_params[i] = anchored_params[i];
-                const JitDispatchOutcome kOutcome = invoke_jit_handler(
-                    route->fn, static_cast<void*>(d.conn), *ctx, synth, kSynthLen, nullptr);
+                const JitDispatchOutcome kOutcome = invoke_jit_handler(route->fn,
+                                                                       static_cast<void*>(d.conn),
+                                                                       *ctx,
+                                                                       synth,
+                                                                       kSynthLen,
+                                                                       nullptr,
+                                                                       &d.conn->replay_context);
 
                 if (kOutcome.kind == JitDispatchOutcome::Kind::ForwardBuffered ||
                     kOutcome.kind == JitDispatchOutcome::Kind::ForwardCapture) {
@@ -1792,7 +1802,8 @@ void h2_resume_jit_handler(Loop* loop, Connection& conn) {
                                                            *ctx,
                                                            h2->pending_synth,
                                                            h2->async_synth_len,
-                                                           /*arena=*/nullptr);
+                                                           /*arena=*/nullptr,
+                                                           &conn.replay_context);
 
     // Another wait(): keep the stream parked and re-arm without flushing.
     if (kOutcome.kind == JitDispatchOutcome::Kind::TimerYield) {

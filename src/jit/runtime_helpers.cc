@@ -374,7 +374,8 @@ u8 rut_helper_upstream_mark(
     auto* handler = static_cast<jit::HandlerCtx*>(ctx);
     if (handler->control_plane_mutation == nullptr) return 0;
     return handler->control_plane_mutation->mark({config_generation, upstream_id, backend_id},
-                                                 healthy != 0)
+                                                 healthy != 0,
+                                                 active_upstream_mark_replay_context)
                ? 1
                : 0;
 }

@@ -30,6 +30,17 @@ using namespace rut::jit;
 
 extern "C" u32 rut_helper_regex_scratch_cache_entry_count_for_test();
 
+struct ReplayEventCapture {
+    UpstreamMarkReplayEvent event{};
+    u32 count = 0;
+};
+
+static void capture_replay_event(void* context, const UpstreamMarkReplayEvent& event) {
+    auto* capture = static_cast<ReplayEventCapture*>(context);
+    capture->event = event;
+    capture->count++;
+}
+
 // ── Helpers ────────────────────────────────────────────────────────
 
 static Str lit(const char* s) {
@@ -1448,7 +1459,10 @@ TEST(jit, control_plane_mutation_helpers_fail_closed_and_delegate_to_explicit_po
     RouteConfig mutation_config;
     REQUIRE(mutation_config.add_upstream("test", 0x7f000001u, 8000));
     mutation.reset(6, false, &mutation_config);
+    ReplayEventCapture replay_events;
+    mutation.set_upstream_mark_replay_sink(&capture_replay_event, &replay_events);
     frame.ctx.control_plane_mutation = &mutation;
+    set_active_upstream_mark_replay_context(3);
     CHECK_EQ(rut_helper_reload_request(&frame.ctx), 0u);
     REQUIRE(mutation.set_route_reload_enabled(true));
     CHECK_EQ(rut_helper_reload_request(&frame.ctx), 1u);
@@ -1456,6 +1470,9 @@ TEST(jit, control_plane_mutation_helpers_fail_closed_and_delegate_to_explicit_po
     CHECK_EQ(rut_helper_upstream_mark(&frame.ctx, 5, 0, 0, 1), 0u);
     CHECK_EQ(rut_helper_upstream_mark(&frame.ctx, 6, 0, 0, 2), 0u);
     CHECK_EQ(rut_helper_upstream_mark(&frame.ctx, 6, 0, 0, 0), 1u);
+    REQUIRE_EQ(replay_events.count, 1u);
+    CHECK_EQ(replay_events.event.source_shard_id, 3u);
+    CHECK(replay_events.event.workload_event_position != 0u);
     CHECK_EQ(mutation.manual_health({6, 0, 0}), ManualHealthOverride::Unhealthy);
     CHECK_EQ(rut_helper_upstream_mark_checked(&frame.ctx, 6, 1, 0, 0, 1), 0u);
     CHECK_EQ(mutation.manual_health({6, 0, 0}), ManualHealthOverride::Unhealthy);

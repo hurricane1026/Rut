@@ -5,6 +5,7 @@
 #include "rut/common/wait_limits.h"
 #include "rut/jit/handler_abi.h"
 #include "rut/runtime/chunked_parser.h"
+#include "rut/runtime/control_plane_replay.h"
 #include "rut/runtime/io_event.h"
 #include "rut/runtime/response_body_storage.h"
 #include "rut/runtime/tls_engine.h"
@@ -313,6 +314,7 @@ struct ConnectionBase {
     jit::YieldKind resume_event_kind;
     i32 resume_event_result;
     void* handler_ctx = nullptr;
+    UpstreamMarkReplayContext replay_context{};
     jit::HandlerFn pending_handler_fn;
     alignas(alignof(u64)) u8 handler_ctx_storage[sizeof(jit::HandlerCtx) +
                                                  static_cast<size_t>(kMaxJitHandlerSlots) * 8]{};
@@ -327,6 +329,8 @@ struct ConnectionBase {
         __builtin_memset(ctx->slots(), 0, static_cast<size_t>(kMaxJitHandlerSlots) * 8);
         ctx->slot_count = kMaxJitHandlerSlots;
         handler_ctx = ctx;
+        set_active_upstream_mark_replay_context(shard_id);
+        replay_context = active_upstream_mark_replay_context;
         return ctx;
     }
 

@@ -930,7 +930,9 @@ public:
         unlock_terminal_publication();
     }
 
-    [[nodiscard]] bool mark(ServerIdentity server, bool healthy) {
+    [[nodiscard]] bool mark(ServerIdentity server,
+                            bool healthy,
+                            UpstreamMarkReplayContext replay_context = {}) {
         UpstreamMarkReplaySink event_sink = nullptr;
         void* event_context = nullptr;
         bool event_callback_claimed = false;
@@ -970,6 +972,9 @@ public:
             UpstreamMarkReplayEvent event{};
             event.event_sequence =
                 mark_replay_sequence_.fetch_add(1, std::memory_order_acq_rel) + 1;
+            event.workload_event_position = replay_context.workload_event_position;
+            event.correlation_id = replay_context.correlation_id;
+            event.source_shard_id = replay_context.source_shard_id;
             event.config_generation = server.config_generation;
             event.upstream_id = server.upstream_id;
             event.backend_id = server.backend_id;
@@ -2845,6 +2850,11 @@ private:
 template <typename Loop>
 inline void latch_control_plane_mutation(Loop* loop, jit::HandlerCtx* ctx, u64 config_generation) {
     if (ctx == nullptr) return;
+    u32 shard_id = 0;
+    if (loop != nullptr) {
+        if constexpr (requires { loop->shard_id; }) shard_id = loop->shard_id;
+    }
+    set_active_upstream_mark_replay_context(shard_id);
     ctx->control_plane_mutation = nullptr;
     ctx->config_generation = config_generation;
     if (loop == nullptr) return;

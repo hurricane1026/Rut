@@ -1754,7 +1754,8 @@ void on_header_received(void* lp, Connection& conn, IoEvent ev) {
                                           *ctx,
                                           conn.recv_buf.data(),
                                           conn.recv_buf.len(),
-                                          /*arena=*/nullptr);
+                                          /*arena=*/nullptr,
+                                          &conn.replay_context);
         handle_jit_outcome<Loop>(loop, conn, outcome, route->fn, kKeepAlive);
     } else {
         conn.resp_status = kStatusOK;
@@ -1826,7 +1827,8 @@ void on_jit_request_body_recvd(void* lp, Connection& conn, IoEvent ev) {
                                       *ctx,
                                       conn.recv_buf.data(),
                                       conn.recv_buf.len(),
-                                      /*arena=*/nullptr);
+                                      /*arena=*/nullptr,
+                                      &conn.replay_context);
     handle_jit_outcome<Loop>(loop, conn, outcome, route->fn, conn.keep_alive);
 }
 
@@ -2716,7 +2718,8 @@ void resume_jit_handler(Loop* loop, Connection& conn) {
                                       *ctx,
                                       request_data,
                                       request_len,
-                                      /*arena=*/nullptr);
+                                      /*arena=*/nullptr,
+                                      &conn.replay_context);
     handle_jit_outcome<Loop>(loop, conn, outcome, fn, conn.keep_alive);
 }
 

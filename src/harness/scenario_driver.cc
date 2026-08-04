@@ -579,6 +579,7 @@ ScenarioResult drive_scenario(const ScenarioSpec& scenario, const HarnessSpec& h
         HandlerExecution execution{};
         execution.init(
             route->fn, &connection.connection, scenario.request_data, scenario.request_len);
+        set_active_upstream_mark_replay_context(scenario.shard_id);
         if (scenario.control_plane_snapshot != nullptr) {
             auto* snapshot = jit::acquire_control_plane_snapshot(&execution.frame.context);
             if (snapshot == nullptr) {
