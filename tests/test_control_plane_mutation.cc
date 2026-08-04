@@ -1272,6 +1272,25 @@ TEST(control_plane_mutation, nested_cross_port_sink_reentry_does_not_deadlock) {
     CHECK(events.count > 0u);
 }
 
+TEST(control_plane_mutation, replay_sink_replacement_races_mark_without_losing_lifetime) {
+    ControlPlaneMutationPort port;
+    RouteConfig config;
+    REQUIRE(config.add_upstream("users", 0x7f000001u, 8000).has_value());
+    port.reset(3, true, &config);
+    MarkReplayEvents events;
+    port.set_upstream_mark_replay_sink(&collect_mark_replay_event, &events);
+
+    std::thread replacer([&] {
+        for (u32 i = 0; i < 256; i++)
+            port.set_upstream_mark_replay_sink(
+                (i & 1u) == 0 ? &collect_mark_replay_event : nullptr,
+                (i & 1u) == 0 ? static_cast<void*>(&events) : nullptr);
+    });
+    for (u32 i = 0; i < 256; i++) (void)port.mark({3, 0, 0}, (i & 1u) != 0);
+    replacer.join();
+    CHECK(events.count > 0u);
+}
+
 TEST(control_plane_mutation, compatible_retained_generations_share_override_updates) {
     ControlPlaneMutationPort port;
     RouteConfig old_config;
