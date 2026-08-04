@@ -146,6 +146,7 @@ struct Http2Conn {
     RouteAction pending_route_action;
     u16 pending_static_status;
     jit::HandlerFn pending_jit_fn;
+    UpstreamMarkReplayContext pending_replay_context;
     // Route param VALUES the matcher produced point into hdr_scratch, which the
     // engine reuses for the next decoded header block. The snapshot re-anchors
     // each value into pending_synth — a stable, per-connection verbatim copy of

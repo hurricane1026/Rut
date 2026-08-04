@@ -1454,6 +1454,7 @@ void on_header_received(void* lp, Connection& conn, IoEvent ev) {
     // the new request's req_start_us lands in the same microsecond.
     conn.handler_gen++;
     conn.req_start_us = monotonic_us();
+    conn.assign_upstream_mark_replay_admission();
     // Per-request proxy state must start clean on EVERY request. reset() runs
     // only at connection alloc, so on a keep-alive-reused connection these flags
     // would otherwise leak from the previous request: a prior forward(set_path:)

@@ -2401,7 +2401,8 @@ TEST(h2_serving, suspended_handler_context_is_snapshotted_and_rebased) {
     REQUIRE(live_body_snapshot != nullptr);
 
     REQUIRE_EQ(h2_stash_synth(h2, synth, kSynthLen), kSynthLen);
-    REQUIRE(h2_snapshot_async_jit_ctx(h2, *live, synth, kSynthLen));
+    const UpstreamMarkReplayContext kReplayContext{17, 19, 23};
+    REQUIRE(h2_snapshot_async_jit_ctx(h2, *live, kReplayContext, synth, kSynthLen));
     CHECK(live->control_plane == nullptr);
     CHECK(live->response_body_mutation_storage == nullptr);
     CHECK(live->response_body_snapshot_storage == nullptr);
@@ -2418,6 +2419,9 @@ TEST(h2_serving, suspended_handler_context_is_snapshotted_and_rebased) {
     CHECK(parked->response_header_mutations[0].value.ptr ==
           reinterpret_cast<const char*>(h2.pending_synth + 4));
     CHECK_EQ(parked->route_params[0].value_len, 4u);
+    CHECK_EQ(h2.async_replay_context.workload_event_position, 17u);
+    CHECK_EQ(h2.async_replay_context.correlation_id, 19u);
+    CHECK_EQ(h2.async_replay_context.source_shard_id, 23u);
     CHECK(parked->route_params[0].value == reinterpret_cast<const char*>(h2.pending_synth + 10));
     CHECK(parked->response_body_mutation_storage == live_body_storage);
     REQUIRE(parked->response_body_snapshot_storage != nullptr);

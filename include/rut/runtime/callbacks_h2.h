@@ -314,6 +314,7 @@ inline void h2_clear_pending(Http2Conn& h2) {
     h2.pending_route_action = RouteAction::Static;
     h2.pending_static_status = 200;
     h2.pending_jit_fn = nullptr;
+    h2.pending_replay_context = {};
     h2.pending_route_param_count = 0;
     for (u32 i = 0; i < kMaxRouteParams; i++) {
         h2.pending_route_params[i] = {};
@@ -424,6 +425,7 @@ bool h2_defer_until_data_end(H2Dispatch<Loop>& d,
     h2->pending_route_action = action;
     h2->pending_static_status = static_status;
     h2->pending_jit_fn = route ? route->fn : nullptr;
+    h2->pending_replay_context = d.conn->replay_context;
     // Snapshot route params for the deferred handler. Only JIT handlers consume
     // params, and only they build the synthesized request; re-anchor each param
     // value into pending_synth (stable) rather than the matcher's hdr_scratch
@@ -690,6 +692,7 @@ inline void h2_transfer_timer_to_pending_forward(
     h2.pending_route = h2.async_route;
     h2.pending_route_action = RouteAction::JitHandler;
     h2.pending_jit_fn = h2.async_fn;
+    h2.pending_replay_context = h2.async_replay_context;
     h2.pending_route_param_count = 0;
 
     h2.async_stream = 0;
@@ -719,6 +722,7 @@ inline void h2_rebase_synth_view(Str& view,
 
 inline bool h2_snapshot_async_jit_ctx(Http2Conn& h2,
                                       jit::HandlerCtx& live,
+                                      const UpstreamMarkReplayContext& replay_context,
                                       const u8* old_synth,
                                       u32 synth_len) {
     if (live.slot_count > kMaxJitHandlerSlots ||
@@ -728,7 +732,7 @@ inline bool h2_snapshot_async_jit_ctx(Http2Conn& h2,
     const size_t kBytes = sizeof(jit::HandlerCtx) + static_cast<size_t>(live.slot_count) * 8;
     auto* parked = h2.async_jit_ctx();
     __builtin_memcpy(parked, &live, kBytes);
-    h2.async_replay_context = active_upstream_mark_replay_context;
+    h2.async_replay_context = replay_context;
 
     // The parked frame now owns all lazily allocated request storage. Clear the
     // connection scratch copy so another H2 stream can reset it without freeing
@@ -813,7 +817,8 @@ bool h2_suspend_timer(H2Dispatch<Loop>& d,
     h2->async_body_len = body_len;
     h2->async_inject_content_length_on_forward = inject_content_length_on_forward;
     if (!ctx_already_parked &&
-        !h2_snapshot_async_jit_ctx(*h2, live_ctx, synth, h2->async_synth_len)) {
+        !h2_snapshot_async_jit_ctx(
+            *h2, live_ctx, d.conn->replay_context, synth, h2->async_synth_len)) {
         h2_async_epoch_leave(d.loop, *d.conn);
         return false;
     }
@@ -854,7 +859,8 @@ bool h2_suspend_proxy(H2Dispatch<Loop>& d,
     h2->async_synth_len = h2_stash_synth(*h2, synth, synth_len);
     if ((apply_response_mutations || capture_response) && !ctx_already_parked &&
         (live_ctx == nullptr ||
-         !h2_snapshot_async_jit_ctx(*h2, *live_ctx, synth, h2->async_synth_len))) {
+         !h2_snapshot_async_jit_ctx(
+             *h2, *live_ctx, d.conn->replay_context, synth, h2->async_synth_len))) {
         h2_async_epoch_leave(d.loop, *d.conn);
         return false;
     }
@@ -1018,6 +1024,7 @@ void h2_finish_body(H2Dispatch<Loop>& d, u32 stream_id) {
         const u16 upstream_id = h2->pending_forward_upstream_id;
         const bool capture_response = h2->pending_forward_capture;
         const bool preinvoked_timer = h2->pending_preinvoked_timer;
+        const UpstreamMarkReplayContext replay_context = h2->pending_replay_context;
         if (route == nullptr || (!preinvoked_timer && !h2->pending_request_forwardable)) {
             const u16 status = route == nullptr ? 500 : 400;
             h2_clear_pending(*h2);
@@ -1040,6 +1047,8 @@ void h2_finish_body(H2Dispatch<Loop>& d, u32 stream_id) {
         const bool request_forwardable = h2->pending_request_forwardable;
         const bool inject_content_length_on_forward = !h2->pending_has_content_length;
         h2->pending_stream = 0;  // transfer the shared synth/context to async
+        d.conn->replay_context = replay_context;
+        h2->async_replay_context = replay_context;
         bool suspended = false;
         if (preinvoked_timer) {
             JitDispatchOutcome outcome{};
@@ -1117,6 +1126,7 @@ void h2_finish_body(H2Dispatch<Loop>& d, u32 stream_id) {
     const RouteConfig* cfg = h2->pending_route_config;
     const RouteEntry* route = pending_route;
     const jit::HandlerFn kJitFn = h2->pending_jit_fn;
+    const UpstreamMarkReplayContext kReplayContext = h2->pending_replay_context;
     const u32 kRouteParamCount = h2->pending_route_param_count;
     const bool kRequestForwardable = h2->pending_request_forwardable;
     RouteParam route_params[kMaxRouteParams];
@@ -1126,6 +1136,7 @@ void h2_finish_body(H2Dispatch<Loop>& d, u32 stream_id) {
     }
 
     h2_clear_pending(*h2);  // clear before responding
+    d.conn->replay_context = kReplayContext;
     if (route == nullptr || kJitFn == nullptr) {
         h2_emit_status(d, stream_id, 500);
         return;
@@ -1165,6 +1176,7 @@ void h2_dispatch_request(H2Dispatch<Loop>& d,
         h2_emit_status(d, stream_id, 400);
         return;
     }
+    d.conn->assign_upstream_mark_replay_admission();
 
     const RouteConfig* config = d.conn->request_config;
     // Firewall gate — mirrors the HTTP/1 path (callbacks_impl.h checks
@@ -1355,7 +1367,8 @@ void h2_dispatch_request(H2Dispatch<Loop>& d,
                         jit::release_response_body_mutation_storage(ctx);
                         return;
                     }
-                    if (!h2_snapshot_async_jit_ctx(*h2, *ctx, synth, kSynthLen)) {
+                    if (!h2_snapshot_async_jit_ctx(
+                            *h2, *ctx, d.conn->replay_context, synth, kSynthLen)) {
                         h2_clear_pending(*h2);
                         jit::release_response_body_mutation_storage(ctx);
                         h2_emit_status(d, stream_id, 500);

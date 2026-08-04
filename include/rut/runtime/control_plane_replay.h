@@ -14,9 +14,9 @@ enum class UpstreamMarkReplayReason : u8 {
 };
 
 struct UpstreamMarkReplayContext {
-    u64 workload_event_position = 0;
-    u64 correlation_id = 0;
-    u32 source_shard_id = 0;
+    u64 workload_event_position;
+    u64 correlation_id;
+    u32 source_shard_id;
 };
 
 inline std::atomic<u64> upstream_mark_replay_workload_sequence{0};

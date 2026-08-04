@@ -31,12 +31,14 @@ using namespace rut::jit;
 extern "C" u32 rut_helper_regex_scratch_cache_entry_count_for_test();
 
 struct ReplayEventCapture {
+    UpstreamMarkReplayEvent events[4]{};
     UpstreamMarkReplayEvent event{};
     u32 count = 0;
 };
 
 static void capture_replay_event(void* context, const UpstreamMarkReplayEvent& event) {
     auto* capture = static_cast<ReplayEventCapture*>(context);
+    if (capture->count < 4) capture->events[capture->count] = event;
     capture->event = event;
     capture->count++;
 }
@@ -1470,9 +1472,13 @@ TEST(jit, control_plane_mutation_helpers_fail_closed_and_delegate_to_explicit_po
     CHECK_EQ(rut_helper_upstream_mark(&frame.ctx, 5, 0, 0, 1), 0u);
     CHECK_EQ(rut_helper_upstream_mark(&frame.ctx, 6, 0, 0, 2), 0u);
     CHECK_EQ(rut_helper_upstream_mark(&frame.ctx, 6, 0, 0, 0), 1u);
-    REQUIRE_EQ(replay_events.count, 1u);
-    CHECK_EQ(replay_events.event.source_shard_id, 3u);
-    CHECK(replay_events.event.workload_event_position != 0u);
+    REQUIRE_EQ(replay_events.count, 2u);
+    CHECK_EQ(replay_events.events[0].reason, UpstreamMarkReplayReason::StaleOrForeign);
+    CHECK_EQ(replay_events.events[0].accepted, false);
+    CHECK_EQ(replay_events.events[1].reason, UpstreamMarkReplayReason::Published);
+    CHECK_EQ(replay_events.events[1].accepted, true);
+    CHECK_EQ(replay_events.events[1].source_shard_id, 3u);
+    CHECK(replay_events.events[1].workload_event_position != 0u);
     CHECK_EQ(mutation.manual_health({6, 0, 0}), ManualHealthOverride::Unhealthy);
     CHECK_EQ(rut_helper_upstream_mark_checked(&frame.ctx, 6, 1, 0, 0, 1), 0u);
     CHECK_EQ(mutation.manual_health({6, 0, 0}), ManualHealthOverride::Unhealthy);

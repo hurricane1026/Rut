@@ -314,7 +314,7 @@ struct ConnectionBase {
     jit::YieldKind resume_event_kind;
     i32 resume_event_result;
     void* handler_ctx = nullptr;
-    UpstreamMarkReplayContext replay_context{};
+    UpstreamMarkReplayContext replay_context;
     jit::HandlerFn pending_handler_fn;
     alignas(alignof(u64)) u8 handler_ctx_storage[sizeof(jit::HandlerCtx) +
                                                  static_cast<size_t>(kMaxJitHandlerSlots) * 8]{};
@@ -329,9 +329,12 @@ struct ConnectionBase {
         __builtin_memset(ctx->slots(), 0, static_cast<size_t>(kMaxJitHandlerSlots) * 8);
         ctx->slot_count = kMaxJitHandlerSlots;
         handler_ctx = ctx;
+        return ctx;
+    }
+
+    void assign_upstream_mark_replay_admission() {
         set_active_upstream_mark_replay_context(shard_id);
         replay_context = active_upstream_mark_replay_context;
-        return ctx;
     }
 
     jit::HandlerCtx* jit_ctx() {
