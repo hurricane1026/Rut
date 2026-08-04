@@ -1291,6 +1291,23 @@ TEST(control_plane_mutation, replay_sink_replacement_races_mark_without_losing_l
     CHECK(events.count > 0u);
 }
 
+TEST(control_plane_mutation, replay_sink_callback_overflow_restores_thread_state) {
+    ControlPlaneMutationPort port;
+    RouteConfig config;
+    REQUIRE(config.add_upstream("users", 0x7f000001u, 8000).has_value());
+    port.reset(3, true, &config);
+    MarkReplayEvents events;
+    CrossPortMarkReplaySinkContext context{&port, &events};
+    port.set_upstream_mark_replay_sink(&install_other_port_sink, &context);
+
+    control_plane_mark_replay_callback_depth = 16;
+    control_plane_mark_replay_callback_overflow = false;
+    REQUIRE(port.mark({3, 0, 0}, true));
+    CHECK_EQ(control_plane_mark_replay_callback_depth, 16u);
+    CHECK_FALSE(control_plane_mark_replay_callback_overflow);
+    control_plane_mark_replay_callback_depth = 0;
+}
+
 TEST(control_plane_mutation, compatible_retained_generations_share_override_updates) {
     ControlPlaneMutationPort port;
     RouteConfig old_config;
