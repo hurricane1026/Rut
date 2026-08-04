@@ -2848,13 +2848,20 @@ private:
 };
 
 template <typename Loop>
-inline void latch_control_plane_mutation(Loop* loop, jit::HandlerCtx* ctx, u64 config_generation) {
+inline void latch_control_plane_mutation(
+    Loop* loop,
+    jit::HandlerCtx* ctx,
+    u64 config_generation,
+    const UpstreamMarkReplayContext* replay_context = nullptr) {
     if (ctx == nullptr) return;
     u32 shard_id = 0;
     if (loop != nullptr) {
         if constexpr (requires { loop->shard_id; }) shard_id = loop->shard_id;
     }
-    set_active_upstream_mark_replay_context(shard_id);
+    if (replay_context != nullptr)
+        active_upstream_mark_replay_context = *replay_context;
+    else
+        set_active_upstream_mark_replay_context(shard_id);
     ctx->control_plane_mutation = nullptr;
     ctx->config_generation = config_generation;
     if (loop == nullptr) return;
