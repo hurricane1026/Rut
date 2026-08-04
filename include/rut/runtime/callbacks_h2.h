@@ -728,6 +728,7 @@ inline bool h2_snapshot_async_jit_ctx(Http2Conn& h2,
     const size_t kBytes = sizeof(jit::HandlerCtx) + static_cast<size_t>(live.slot_count) * 8;
     auto* parked = h2.async_jit_ctx();
     __builtin_memcpy(parked, &live, kBytes);
+    h2.async_replay_context = active_upstream_mark_replay_context;
 
     // The parked frame now owns all lazily allocated request storage. Clear the
     // connection scratch copy so another H2 stream can reset it without freeing
@@ -1806,7 +1807,7 @@ void h2_resume_jit_handler(Loop* loop, Connection& conn) {
                                                            h2->pending_synth,
                                                            h2->async_synth_len,
                                                            /*arena=*/nullptr,
-                                                           &conn.replay_context);
+                                                           &h2->async_replay_context);
 
     // Another wait(): keep the stream parked and re-arm without flushing.
     if (kOutcome.kind == JitDispatchOutcome::Kind::TimerYield) {

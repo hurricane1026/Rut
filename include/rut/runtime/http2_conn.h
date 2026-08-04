@@ -2,6 +2,7 @@
 
 #include "rut/common/types.h"
 #include "rut/common/wait_limits.h"
+#include "rut/runtime/control_plane_replay.h"
 #include "rut/runtime/hpack.h"
 #include "rut/runtime/http2_frame.h"
 #include "rut/runtime/http_parser.h"
@@ -183,6 +184,7 @@ struct Http2Conn {
     u32 async_timer_ms;
     jit::HandlerFn async_fn;
     u16 async_state;
+    UpstreamMarkReplayContext async_replay_context;
     // A yielded stream must not keep using ConnectionBase::handler_ctx_storage:
     // another stream in the same decoded batch can invoke synchronously and
     // reset that connection scratch before this stream resumes. The h2 engine
