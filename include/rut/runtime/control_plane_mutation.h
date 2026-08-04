@@ -947,7 +947,8 @@ public:
             event_callback_claimed = false;
             callback_dispatch_lock = std::unique_lock<std::recursive_mutex>(
                 mark_replay_dispatch_mutex_, std::try_to_lock);
-            for (u32 attempt = 0; attempt < kMaxMarkAttempts; attempt++) {
+            for (u32 attempt = 0; callback_dispatch_lock.owns_lock() && attempt < kMaxMarkAttempts;
+                 attempt++) {
                 const u64 epoch = mark_replay_sink_epoch_.load(std::memory_order_acquire);
                 if ((epoch & 1u) != 0) continue;
                 mark_replay_callbacks_.fetch_add(1, std::memory_order_acq_rel);
@@ -997,9 +998,9 @@ public:
                 ~CallbackCleanup() {
                     depth = previous_depth;
                     overflow = previous_overflow;
-                    if (dispatch_lock.owns_lock()) dispatch_lock.unlock();
                     callbacks.fetch_sub(1, std::memory_order_release);
                     claimed = false;
+                    if (dispatch_lock.owns_lock()) dispatch_lock.unlock();
                 }
             } cleanup{control_plane_mark_replay_callback_depth,
                       control_plane_mark_replay_callback_overflow,
