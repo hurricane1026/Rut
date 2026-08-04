@@ -1280,12 +1280,16 @@ TEST(control_plane_mutation, replay_sink_replacement_races_mark_without_losing_l
     MarkReplayEvents events;
     port.set_upstream_mark_replay_sink(&collect_mark_replay_event, &events);
 
+    std::atomic<bool> first_marked = false;
     std::thread replacer([&] {
+        while (!first_marked.load(std::memory_order_acquire)) std::this_thread::yield();
         for (u32 i = 0; i < 256; i++)
             port.set_upstream_mark_replay_sink(
                 (i & 1u) == 0 ? &collect_mark_replay_event : nullptr,
                 (i & 1u) == 0 ? static_cast<void*>(&events) : nullptr);
     });
+    REQUIRE(port.mark({3, 0, 0}, true));
+    first_marked.store(true, std::memory_order_release);
     for (u32 i = 0; i < 256; i++) (void)port.mark({3, 0, 0}, (i & 1u) != 0);
     replacer.join();
     CHECK(events.count > 0u);

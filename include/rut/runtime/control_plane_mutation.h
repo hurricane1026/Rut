@@ -946,8 +946,9 @@ public:
             event_context = nullptr;
             event_callback_claimed = false;
             for (u32 attempt = 0; attempt < kMaxMarkAttempts; attempt++) {
-                callback_dispatch_lock =
-                    std::unique_lock<std::recursive_mutex>(mark_replay_dispatch_mutex_);
+                callback_dispatch_lock = std::unique_lock<std::recursive_mutex>(
+                    mark_replay_dispatch_mutex_, std::try_to_lock);
+                if (!callback_dispatch_lock.owns_lock()) continue;
                 std::lock_guard sink_lock(mark_replay_mutex_);
                 const u64 epoch = mark_replay_sink_epoch_.load(std::memory_order_relaxed);
                 if ((epoch & 1u) != 0) {
