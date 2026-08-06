@@ -1371,6 +1371,69 @@ TEST(websocket, terminate_client_close_starts_and_completes_echo_handshake) {
     CHECK_EQ(loop.conns[cid].fd, -1);
 }
 
+TEST(websocket, terminate_discards_partial_frames_after_peer_fin) {
+    SmallLoop loop;
+    loop.setup();
+    loop.inject_and_dispatch(make_ev(0, IoEventType::Accept, 42));
+    auto* conn = loop.find_fd(42);
+    REQUIRE(conn != nullptr);
+    REQUIRE(loop.alloc_upstream_buf(*conn));
+    conn->is_ws_tunnel = true;
+    conn->is_ws_terminate = true;
+    conn->upstream_fd = 43;
+    conn->ws_c2u.masked = true;
+    conn->ws_c2u.from_client = true;
+    conn->ws_u2c.masked = false;
+    conn->ws_max_message_size = 64;
+    u8 c2u_msg[64] = {};
+    u8 u2c_msg[64] = {};
+    conn->ws_c2u_msg = c2u_msg;
+    conn->ws_u2c_msg = u2c_msg;
+
+    const u8 partial_header[] = {0x82};
+    REQUIRE_EQ(conn->recv_buf.write(partial_header, sizeof(partial_header)),
+               sizeof(partial_header));
+    conn->ws_client_eof = true;
+    CHECK(ws_try_send_client_to_upstream(&loop, *conn));
+    CHECK_EQ(conn->recv_buf.len(), 0u);
+
+    REQUIRE_EQ(conn->upstream_recv_buf.write(partial_header, sizeof(partial_header)),
+               sizeof(partial_header));
+    CHECK(ws_try_send_upstream_to_client(&loop, *conn));
+    CHECK_EQ(conn->upstream_recv_buf.len(), 0u);
+}
+
+TEST(websocket, terminate_send_completions_drain_before_closing) {
+    SmallLoop client_loop;
+    client_loop.setup();
+    client_loop.inject_and_dispatch(make_ev(0, IoEventType::Accept, 42));
+    auto* client_conn = client_loop.find_fd(42);
+    REQUIRE(client_conn != nullptr);
+    client_conn->is_ws_tunnel = true;
+    client_conn->is_ws_terminate = true;
+    client_conn->upstream_fd = 43;
+    client_conn->ws_client_send_pending = true;
+    client_conn->ws_client_eof = true;
+    on_ws_client_to_upstream_sent<SmallLoop>(
+        &client_loop, *client_conn, make_ev(client_conn->id, IoEventType::UpstreamSend, 1));
+    CHECK_EQ(client_loop.conns[client_conn->id].fd, -1);
+
+    SmallLoop upstream_loop;
+    upstream_loop.setup();
+    upstream_loop.inject_and_dispatch(make_ev(0, IoEventType::Accept, 52));
+    auto* upstream_conn = upstream_loop.find_fd(52);
+    REQUIRE(upstream_conn != nullptr);
+    REQUIRE(upstream_loop.alloc_upstream_buf(*upstream_conn));
+    upstream_conn->is_ws_tunnel = true;
+    upstream_conn->is_ws_terminate = true;
+    upstream_conn->upstream_fd = 53;
+    upstream_conn->ws_upstream_send_pending = true;
+    upstream_conn->ws_upstream_eof = true;
+    on_ws_upstream_to_client_sent<SmallLoop>(
+        &upstream_loop, *upstream_conn, make_ev(upstream_conn->id, IoEventType::Send, 1));
+    CHECK_EQ(upstream_loop.conns[upstream_conn->id].fd, -1);
+}
+
 // Bytes that race into recv_buf while a client→upstream tunnel send is in flight
 // must be forwarded next, never dropped: the send-completion consumes ONLY the
 // submitted length and re-sends the remainder, keeping client recv paused until
