@@ -2,6 +2,7 @@
 
 #include "rut/common/types.h"
 #include "rut/jit/handler_abi.h"
+#include "rut/runtime/control_plane_replay.h"
 #include "rut/runtime/io_event.h"
 
 namespace rut {
@@ -176,16 +177,21 @@ inline jit::YieldKind yield_kind_from_event(IoEventType type) {
 // a resume, `ctx` must include the 8-byte-aligned frame slots advertised by
 // `slot_count`, and the same 8-byte-aligned storage must be reused across
 // resumes. The entry call must set `ctx.state = 0`.
-inline JitDispatchOutcome invoke_jit_handler(jit::HandlerFn fn,
-                                             void* conn,
-                                             jit::HandlerCtx& ctx,
-                                             const u8* req_data,
-                                             u32 req_len,
-                                             void* arena) {
+inline JitDispatchOutcome invoke_jit_handler(
+    jit::HandlerFn fn,
+    void* conn,
+    jit::HandlerCtx& ctx,
+    const u8* req_data,
+    u32 req_len,
+    void* arena,
+    const UpstreamMarkReplayContext* replay_context = nullptr) {
     JitDispatchOutcome out{};
     if (fn == nullptr) return out;  // Kind::Error by default
 
+    const auto previous_replay_context = active_upstream_mark_replay_context;
+    if (replay_context != nullptr) active_upstream_mark_replay_context = *replay_context;
     const u64 packed = fn(conn, &ctx, req_data, req_len, arena);
+    active_upstream_mark_replay_context = previous_replay_context;
     const auto raw = jit::HandlerResult::unpack(packed);
     const bool returned_captured_response =
         raw.action == jit::HandlerAction::ReturnStatus && raw.status_code == 0;

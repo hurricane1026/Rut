@@ -288,6 +288,24 @@ TEST(http2_conn, rst_stream_closes_and_notifies) {
     Http2Conn c;
     Capture cap;
     setup(c, cap);
+    c.pending_stream = 1;
+    c.pending_body_start = 9;
+    c.pending_synth_len = 8;
+    c.pending_body_len = 7;
+    c.pending_content_length = 6;
+    c.pending_has_content_length = true;
+    c.pending_buffer_body = true;
+    c.pending_request_forwardable = true;
+    c.pending_overflow = true;
+    c.pending_forward_capture = true;
+    c.pending_forward_upstream_id = 5;
+    c.pending_forward_state = 4;
+    c.pending_timer_state = 3;
+    c.pending_timer_ms = 2;
+    c.pending_route_action = RouteAction::Proxy;
+    c.pending_static_status = 418;
+    c.pending_route_param_count = 1;
+    c.pending_route_params[0] = {"id", 2, "42", 2};
     hpack::Header hs[] = {{{":method", 7}, {"GET", 3}}, {{":path", 5}, {"/", 1}}};
     u8 frame[256];
     u32 fn = http2_write_headers(frame, sizeof(frame), 1, hs, 2, false);
@@ -301,6 +319,24 @@ TEST(http2_conn, rst_stream_closes_and_notifies) {
     CHECK_EQ(cap.reset_stream, 1u);
     CHECK(cap.reset_err == Http2Error::Cancel);
     CHECK(c.find_stream(1) == nullptr);  // closed streams are not findable
+    CHECK_EQ(c.pending_stream, 0u);
+    CHECK_EQ(c.pending_body_start, 0u);
+    CHECK_EQ(c.pending_synth_len, 0u);
+    CHECK_EQ(c.pending_body_len, 0u);
+    CHECK_EQ(c.pending_content_length, 0u);
+    CHECK_FALSE(c.pending_has_content_length);
+    CHECK_FALSE(c.pending_buffer_body);
+    CHECK_FALSE(c.pending_request_forwardable);
+    CHECK_FALSE(c.pending_overflow);
+    CHECK_FALSE(c.pending_forward_capture);
+    CHECK_EQ(c.pending_forward_upstream_id, 0u);
+    CHECK_EQ(c.pending_forward_state, 0u);
+    CHECK_EQ(c.pending_timer_state, 0u);
+    CHECK_EQ(c.pending_timer_ms, 0u);
+    CHECK(c.pending_route_action == RouteAction::Static);
+    CHECK_EQ(c.pending_static_status, 200u);
+    CHECK_EQ(c.pending_route_param_count, 0u);
+    CHECK_EQ(c.pending_route_params[0].value_len, 0u);
 }
 
 // Regression: a stream we've already responded to (END_STREAM sent) while the
@@ -740,6 +776,24 @@ TEST(h2_proxy_forwardable, rejects_missing_host_without_authority) {
     CHECK(h2_proxy_request_forwardable(empty_authority_with_host, 5));
 }
 
+TEST(h2_request, synthesis_joins_multiple_cookie_fields) {
+    const hpack::Header headers[] = {{{":method", 7}, {"GET", 3}},
+                                     {{":path", 5}, {"/", 1}},
+                                     {{":scheme", 7}, {"https", 5}},
+                                     {{":authority", 10}, {"example", 7}},
+                                     {{"cookie", 6}, {"session=one", 11}},
+                                     {{"cookie", 6}, {"theme=dark", 10}}};
+    u8 request[256]{};
+    const u32 request_len = h2_synth_h1_request(headers, 6, request, sizeof(request));
+
+    REQUIRE_GT(request_len, 0u);
+    static constexpr char kCombined[] = "cookie: session=one; theme=dark\r\n";
+    bool found = false;
+    for (u32 i = 0; i + sizeof(kCombined) - 1 <= request_len; i++)
+        found |= __builtin_memcmp(request + i, kCombined, sizeof(kCombined) - 1) == 0;
+    CHECK(found);
+}
+
 // Write a raw frame (header + payload) into out; return bytes written.
 namespace {
 u32 put_frame(u8* out, Http2FrameType type, u8 flags, u32 stream_id, const u8* payload, u32 plen) {
@@ -1089,6 +1143,107 @@ TEST(http2_conn, window_update_overflow_rsts_stream) {
     CHECK(has_frame(out, ow, Http2FrameType::RstStream, 0, 0));
 }
 
+TEST(http2_conn, data_exceeding_stream_receive_window_rsts_stream) {
+    Http2Conn c;
+    Capture cap;
+    setup(c, cap);
+
+    const hpack::Header request_headers[] = {
+        {{":method", 7}, {"POST", 4}},
+        {{":path", 5}, {"/", 1}},
+    };
+    u8 headers[256];
+    u32 headers_len =
+        http2_write_headers(headers, sizeof(headers), 1, request_headers, 2, /*end_stream=*/false);
+    u8 in[384];
+    u32 inlen = with_preface(in, headers, headers_len);
+    u8 out[256];
+    u32 ow = 0;
+    REQUIRE_FALSE(c.process(in, inlen, out, sizeof(out), &ow).close);
+
+    Http2Stream* stream = c.find_stream(1);
+    REQUIRE(stream != nullptr);
+    stream->recv_window = 1;
+
+    const u8 payload[] = {'o', 'k'};
+    u8 data[64];
+    const u32 data_len = http2_write_data(data, 1, payload, sizeof(payload), false);
+    ow = 0;
+    Http2Result result = c.process(data, data_len, out, sizeof(out), &ow);
+    CHECK_FALSE(result.close);
+    CHECK(has_frame(out, ow, Http2FrameType::RstStream, 0, 0));
+    CHECK_EQ(cap.reset_calls, 1u);
+    CHECK(cap.reset_err == Http2Error::FlowControlError);
+    CHECK(c.find_stream(1) == nullptr);
+}
+
+TEST(http2_conn, data_exceeding_connection_receive_window_goaways) {
+    Http2Conn c;
+    Capture cap;
+    setup(c, cap);
+    c.conn_recv_window = 1;
+
+    const u8 payload[] = {'o', 'k'};
+    u8 frame[64];
+    const u32 frame_len = http2_write_data(frame, 1, payload, sizeof(payload), false);
+    u8 in[128];
+    const u32 in_len = with_preface(in, frame, frame_len);
+    u8 out[128];
+    u32 out_len = 0;
+    Http2Result result = c.process(in, in_len, out, sizeof(out), &out_len);
+    CHECK(result.close);
+    CHECK(has_frame(out, out_len, Http2FrameType::Goaway, 0, 0));
+}
+
+TEST(http2_conn, headers_padding_larger_than_payload_goaways) {
+    Http2Conn c;
+    Capture cap;
+    setup(c, cap);
+
+    const u8 payload[] = {2, 0};
+    u8 frame[64];
+    const u32 frame_len = put_frame(frame,
+                                    Http2FrameType::Headers,
+                                    http2_flag::kPadded | http2_flag::kEndHeaders,
+                                    1,
+                                    payload,
+                                    sizeof(payload));
+    u8 in[128];
+    const u32 in_len = with_preface(in, frame, frame_len);
+    u8 out[128];
+    u32 out_len = 0;
+    Http2Result result = c.process(in, in_len, out, sizeof(out), &out_len);
+    CHECK(result.close);
+    CHECK(has_frame(out, out_len, Http2FrameType::Goaway, 0, 0));
+}
+
+TEST(http2_conn, full_live_stream_table_refuses_new_stream) {
+    Http2Conn c;
+    Capture cap;
+    setup(c, cap);
+    c.nstreams = Http2Conn::kMaxStreams;
+    for (u32 i = 0; i < c.nstreams; i++) {
+        c.streams[i].id = i * 2 + 1;
+        c.streams[i].state = Http2StreamState::Open;
+    }
+
+    const hpack::Header request_headers[] = {
+        {{":method", 7}, {"GET", 3}},
+        {{":path", 5}, {"/", 1}},
+    };
+    u8 frame[256];
+    const u32 frame_len =
+        http2_write_headers(frame, sizeof(frame), 129, request_headers, 2, /*end_stream=*/true);
+    u8 in[320];
+    const u32 in_len = with_preface(in, frame, frame_len);
+    u8 out[128];
+    u32 out_len = 0;
+    Http2Result result = c.process(in, in_len, out, sizeof(out), &out_len);
+    CHECK_FALSE(result.close);
+    CHECK(has_frame(out, out_len, Http2FrameType::RstStream, 0, 0));
+    CHECK_EQ(c.last_stream_id, 129u);
+}
+
 TEST(http2_conn, write_response_with_body_and_headers) {
     hpack::Encoder enc;
     enc.init(4096);
@@ -1399,6 +1554,86 @@ TEST(http2_conn, request_trailers_finalize_instead_of_rst) {
     CHECK(s->state == Http2StreamState::HalfClosedRemote);
 }
 
+TEST(http2_conn, continuation_terminated_request_trailers_finalize_without_reset) {
+    Http2Conn c;
+    Capture cap;
+    setup(c, cap);
+
+    hpack::Header request[] = {{{":method", 7}, {"POST", 4}}, {{":path", 5}, {"/up", 3}}};
+    u8 initial[512];
+    u32 initial_len = http2_write_headers(initial, sizeof(initial), 1, request, 2, false);
+    initial_len +=
+        http2_write_data(initial + initial_len, 1, reinterpret_cast<const u8*>("hello"), 5, false);
+    u8 initial_in[640];
+    const u32 initial_in_len = with_preface(initial_in, initial, initial_len);
+    u8 out[256];
+    u32 out_written = 0;
+    REQUIRE_FALSE(c.process(initial_in, initial_in_len, out, sizeof(out), &out_written).close);
+
+    c.pending_stream = 1;
+    c.pending_request_forwardable = true;
+    hpack::Encoder encoder;
+    encoder.init(4096);
+    u8 trailer_block[128];
+    const u32 trailer_len = encoder.encode(trailer_block, Str{"x-checksum", 10}, Str{"ok", 2});
+    REQUIRE(trailer_len > 1);
+
+    u8 trailers[256];
+    u32 trailers_len =
+        put_frame(trailers, Http2FrameType::Headers, http2_flag::kEndStream, 1, trailer_block, 1);
+    trailers_len += put_frame(trailers + trailers_len,
+                              Http2FrameType::Continuation,
+                              http2_flag::kEndHeaders,
+                              1,
+                              trailer_block + 1,
+                              trailer_len - 1);
+    out_written = 0;
+    const Http2Result result = c.process(trailers, trailers_len, out, sizeof(out), &out_written);
+    CHECK_FALSE(result.close);
+    CHECK_FALSE(has_frame(out, out_written, Http2FrameType::RstStream, 0, 0));
+    CHECK_EQ(cap.data_calls, 2u);
+    CHECK(cap.data_end);
+    CHECK_FALSE(c.pending_request_forwardable);
+    Http2Stream* stream = c.find_stream(1);
+    REQUIRE(stream != nullptr);
+    CHECK(stream->state == Http2StreamState::HalfClosedRemote);
+}
+
+TEST(http2_conn, continuation_terminated_pseudo_trailer_resets_the_stream) {
+    Http2Conn c;
+    Capture cap;
+    setup(c, cap);
+
+    hpack::Header request[] = {{{":method", 7}, {"POST", 4}}, {{":path", 5}, {"/up", 3}}};
+    u8 initial[256];
+    const u32 initial_len = http2_write_headers(initial, sizeof(initial), 1, request, 2, false);
+    u8 initial_in[384];
+    const u32 initial_in_len = with_preface(initial_in, initial, initial_len);
+    u8 out[256];
+    u32 out_written = 0;
+    REQUIRE_FALSE(c.process(initial_in, initial_in_len, out, sizeof(out), &out_written).close);
+
+    hpack::Encoder encoder;
+    encoder.init(4096);
+    u8 trailer_block[128];
+    const u32 trailer_len = encoder.encode(trailer_block, Str{":path", 5}, Str{"/invalid", 8});
+    REQUIRE(trailer_len > 1);
+    u8 trailers[256];
+    u32 trailers_len =
+        put_frame(trailers, Http2FrameType::Headers, http2_flag::kEndStream, 1, trailer_block, 1);
+    trailers_len += put_frame(trailers + trailers_len,
+                              Http2FrameType::Continuation,
+                              http2_flag::kEndHeaders,
+                              1,
+                              trailer_block + 1,
+                              trailer_len - 1);
+    out_written = 0;
+    const Http2Result result = c.process(trailers, trailers_len, out, sizeof(out), &out_written);
+    CHECK_FALSE(result.close);
+    CHECK(has_frame(out, out_written, Http2FrameType::RstStream, 0, 0));
+    CHECK(c.find_stream(1) == nullptr);
+}
+
 TEST(http2_conn, trailing_header_block_with_pseudo_header_rsts) {
     Http2Conn c;
     Capture cap;
@@ -1586,6 +1821,10 @@ u64 h2_buffered_timer(void*, jit::HandlerCtx*, const u8*, u32, void*) {
     return jit::HandlerResult::make_yield_payload(7, jit::YieldKind::Timer, 25).pack();
 }
 
+u64 h2_unsupported_event_yield(void*, jit::HandlerCtx*, const u8*, u32, void*) {
+    return jit::HandlerResult::make_yield(1, jit::YieldKind::Recv).pack();
+}
+
 bool h2_handler_saw_content_length = false;
 u64 h2_observe_absent_content_length(void*, jit::HandlerCtx*, const u8* req, u32 len, void*) {
     static constexpr char kNeedle[] = "content-length:";
@@ -1634,6 +1873,128 @@ TEST(h2_serving, body_independent_local_branch_avoids_buffered_forward_cap) {
     h2_dispatch_request(dispatch, 1, headers, 4, /*end_stream=*/false);
     CHECK_EQ(h2.pending_stream, 0u);
     CHECK_GT(dispatch.resp_len, 0u);
+}
+
+TEST(h2_serving, route_less_request_uses_default_response) {
+    const hpack::Header headers[] = {{{":method", 7}, {"GET", 3}},
+                                     {{":path", 5}, {"/", 1}},
+                                     {{":scheme", 7}, {"https", 5}},
+                                     {{":authority", 10}, {"example", 7}}};
+    Http2Conn h2;
+    h2.init();
+    Connection conn;
+    conn.reset();
+    conn.h2 = &h2;
+    FakeH2Loop loop;
+    u8 response[256]{};
+    H2Dispatch<FakeH2Loop> dispatch{&loop, &conn, response, sizeof(response), 0, false};
+
+    h2_dispatch_request(dispatch, 1, headers, 4, /*end_stream=*/true);
+
+    Http2FrameHeader header{};
+    REQUIRE(parse_frame_header(response, dispatch.resp_len, &header) == ParseStatus::Complete);
+    hpack::DynamicTable dyn;
+    dyn.init(4096);
+    hpack::Header decoded[4];
+    u8 scratch[128];
+    u32 count = 0;
+    REQUIRE(hpack::decode_header_block(dyn,
+                                       response + kFrameHeaderSize,
+                                       header.length,
+                                       scratch,
+                                       sizeof(scratch),
+                                       decoded,
+                                       4,
+                                       &count));
+    CHECK(decoded[0].value.eq(Str{"200", 3}));
+}
+
+TEST(h2_serving, bodyless_proxy_route_parks_forwardable_request) {
+    const hpack::Header headers[] = {{{":method", 7}, {"GET", 3}},
+                                     {{":path", 5}, {"/proxy", 6}},
+                                     {{":scheme", 7}, {"https", 5}},
+                                     {{":authority", 10}, {"example", 7}}};
+    Http2Conn h2;
+    h2.init();
+    Connection conn;
+    conn.reset();
+    conn.h2 = &h2;
+    RouteConfig config;
+    REQUIRE(config.add_upstream("backend", 0x7f000001, 8080).has_value());
+    REQUIRE(config.add_proxy("/proxy", kRouteMethodGet, 0));
+    conn.request_config = &config;
+    FakeH2Loop loop;
+    u8 response[256]{};
+    H2Dispatch<FakeH2Loop> dispatch{&loop, &conn, response, sizeof(response), 0, false};
+
+    h2_dispatch_request(dispatch, 1, headers, 4, /*end_stream=*/true);
+
+    CHECK_EQ(dispatch.resp_len, 0u);
+    CHECK_EQ(h2.async_stream, 1u);
+    CHECK_EQ(h2.async_kind, H2AsyncKind::Proxy);
+    CHECK_EQ(h2.async_upstream_id, 0u);
+    h2_clear_async(h2);
+}
+
+TEST(h2_serving, proxy_route_rejects_request_without_scheme) {
+    const hpack::Header headers[] = {{{":method", 7}, {"GET", 3}},
+                                     {{":path", 5}, {"/proxy", 6}},
+                                     {{":authority", 10}, {"example", 7}}};
+    Http2Conn h2;
+    h2.init();
+    Connection conn;
+    conn.reset();
+    conn.h2 = &h2;
+    RouteConfig config;
+    REQUIRE(config.add_upstream("backend", 0x7f000001, 8080).has_value());
+    REQUIRE(config.add_proxy("/proxy", kRouteMethodGet, 0));
+    conn.request_config = &config;
+    FakeH2Loop loop;
+    u8 response[256]{};
+    H2Dispatch<FakeH2Loop> dispatch{&loop, &conn, response, sizeof(response), 0, false};
+
+    h2_dispatch_request(dispatch, 1, headers, 3, /*end_stream=*/true);
+
+    CHECK_EQ(h2.async_stream, 0u);
+    REQUIRE_GT(dispatch.resp_len, 0u);
+}
+
+TEST(h2_serving, bodyless_jit_route_invokes_handler_immediately) {
+    const hpack::Header headers[] = {{{":method", 7}, {"GET", 3}},
+                                     {{":path", 5}, {"/jit", 4}},
+                                     {{":scheme", 7}, {"https", 5}},
+                                     {{":authority", 10}, {"example", 7}}};
+    Http2Conn h2;
+    h2.init();
+    Connection conn;
+    conn.reset();
+    conn.h2 = &h2;
+    RouteConfig config;
+    REQUIRE(config.add_jit_handler("/jit", kRouteMethodGet, &h2_status_204, false, false));
+    conn.request_config = &config;
+    FakeH2Loop loop;
+    u8 response[256]{};
+    H2Dispatch<FakeH2Loop> dispatch{&loop, &conn, response, sizeof(response), 0, false};
+
+    h2_dispatch_request(dispatch, 1, headers, 4, /*end_stream=*/true);
+
+    CHECK_EQ(h2.pending_stream, 0u);
+    Http2FrameHeader header{};
+    REQUIRE(parse_frame_header(response, dispatch.resp_len, &header) == ParseStatus::Complete);
+    hpack::DynamicTable dyn;
+    dyn.init(4096);
+    hpack::Header decoded[4];
+    u8 scratch[128];
+    u32 count = 0;
+    REQUIRE(hpack::decode_header_block(dyn,
+                                       response + kFrameHeaderSize,
+                                       header.length,
+                                       scratch,
+                                       sizeof(scratch),
+                                       decoded,
+                                       4,
+                                       &count));
+    CHECK(decoded[0].value.eq(Str{"204", 3}));
 }
 
 TEST(h2_serving, selected_buffered_forward_defers_and_buffers_data) {
@@ -1809,6 +2170,100 @@ TEST(h2_serving, body_independent_preinvoke_preserves_declared_length_validation
     CHECK_GT(dispatch.resp_len, 0u);
 }
 
+TEST(h2_serving, unmatched_route_defers_declared_body_before_default_response) {
+    const hpack::Header headers[] = {{{":method", 7}, {"POST", 4}},
+                                     {{":path", 5}, {"/missing", 8}},
+                                     {{":scheme", 7}, {"https", 5}},
+                                     {{":authority", 10}, {"example", 7}},
+                                     {{"content-length", 14}, {"3", 1}}};
+    Http2Conn h2;
+    h2.init();
+    Connection conn;
+    conn.reset();
+    conn.h2 = &h2;
+    RouteConfig config;
+    REQUIRE(config.add_static("/present", kRouteMethodPost, 204));
+    conn.request_config = &config;
+    FakeH2Loop loop;
+    u8 response[256]{};
+    H2Dispatch<FakeH2Loop> dispatch{&loop, &conn, response, sizeof(response), 0, false};
+
+    h2_dispatch_request(dispatch, 1, headers, 5, /*end_stream=*/false);
+    REQUIRE_EQ(h2.pending_stream, 1u);
+    static constexpr u8 kBody[] = {'a', 'b', 'c'};
+    h2_on_data_cb<FakeH2Loop>(&dispatch, h2, 1, kBody, sizeof(kBody), true);
+
+    CHECK_EQ(h2.pending_stream, 0u);
+    Http2FrameHeader header{};
+    REQUIRE(parse_frame_header(response, dispatch.resp_len, &header) == ParseStatus::Complete);
+    hpack::DynamicTable dyn;
+    dyn.init(4096);
+    hpack::Header decoded[4];
+    u8 scratch[128];
+    u32 count = 0;
+    REQUIRE(hpack::decode_header_block(dyn,
+                                       response + kFrameHeaderSize,
+                                       header.length,
+                                       scratch,
+                                       sizeof(scratch),
+                                       decoded,
+                                       4,
+                                       &count));
+    CHECK(decoded[0].value.eq(Str{"200", 3}));
+}
+
+TEST(h2_serving, buffered_body_overflow_rejects_non_jit_deferred_route) {
+    Http2Conn h2;
+    h2.init();
+    Connection conn;
+    conn.reset();
+    conn.h2 = &h2;
+    FakeH2Loop loop;
+    u8 response[256]{};
+    H2Dispatch<FakeH2Loop> dispatch{&loop, &conn, response, sizeof(response), 0, false};
+    h2.pending_stream = 1;
+    h2.pending_overflow = true;
+    h2.pending_buffer_body = true;
+    h2.pending_route_action = RouteAction::Static;
+
+    h2_finish_body(dispatch, 1);
+
+    CHECK_EQ(h2.pending_stream, 0u);
+    REQUIRE_GT(dispatch.resp_len, 0u);
+}
+
+TEST(h2_serving, body_independent_jit_discards_overflowed_buffer) {
+    Http2Conn h2;
+    h2.init();
+    Connection conn;
+    conn.reset();
+    conn.h2 = &h2;
+    FakeH2Loop loop;
+    u8 response[256]{};
+    H2Dispatch<FakeH2Loop> dispatch{&loop, &conn, response, sizeof(response), 0, false};
+    RouteEntry route{};
+    route.action = RouteAction::JitHandler;
+    route.fn = &h2_status_204;
+    route.needs_req_body = false;
+    static constexpr char kHeaders[] = "POST /upload HTTP/1.1\r\nhost: example\r\n\r\n";
+    __builtin_memcpy(h2.pending_synth, kHeaders, sizeof(kHeaders) - 1);
+    h2.pending_stream = 1;
+    h2.pending_overflow = true;
+    h2.pending_buffer_body = true;
+    h2.pending_route_action = RouteAction::JitHandler;
+    h2.pending_route = &route;
+    h2.pending_jit_fn = route.fn;
+    h2.pending_body_start = sizeof(kHeaders) - 1;
+    h2.pending_synth_len = sizeof(kHeaders) - 1;
+    h2.pending_body_len = 17;
+
+    h2_finish_body(dispatch, 1);
+
+    CHECK_FALSE(h2.pending_overflow);
+    CHECK_EQ(h2.pending_stream, 0u);
+    REQUIRE_GT(dispatch.resp_len, 0u);
+}
+
 TEST(h2_serving, buffered_forward_route_acknowledges_declared_expect_continue) {
     const hpack::Header headers[] = {{{":method", 7}, {"POST", 4}},
                                      {{":path", 5}, {"/upload", 7}},
@@ -1877,6 +2332,317 @@ TEST(h2_serving, buffered_forward_capability_preserves_absent_content_length_for
     CHECK_GT(dispatch.resp_len, 0u);
 }
 
+TEST(h2_serving, preinvoked_forward_without_route_fails_closed) {
+    Http2Conn h2;
+    h2.init();
+    Connection conn;
+    conn.reset();
+    conn.h2 = &h2;
+    FakeH2Loop loop;
+    u8 response[256]{};
+    H2Dispatch<FakeH2Loop> dispatch{&loop, &conn, response, sizeof(response), 0, false};
+    h2.pending_stream = 1;
+    h2.pending_route_action = RouteAction::JitHandler;
+    h2.pending_preinvoked_forward = true;
+
+    h2_finish_body(dispatch, 1);
+
+    CHECK_EQ(h2.pending_stream, 0u);
+    REQUIRE_GT(dispatch.resp_len, 0u);
+    Http2FrameHeader header{};
+    REQUIRE(parse_frame_header(response, dispatch.resp_len, &header) == ParseStatus::Complete);
+    hpack::DynamicTable dyn;
+    dyn.init(4096);
+    hpack::Header decoded[4];
+    u8 scratch[128];
+    u32 count = 0;
+    REQUIRE(hpack::decode_header_block(dyn,
+                                       response + kFrameHeaderSize,
+                                       header.length,
+                                       scratch,
+                                       sizeof(scratch),
+                                       decoded,
+                                       4,
+                                       &count));
+    CHECK(decoded[0].name.eq(Str{":status", 7}));
+    CHECK(decoded[0].value.eq(Str{"500", 3}));
+}
+
+TEST(h2_serving, unsupported_event_yield_returns_503) {
+    Http2Conn h2;
+    h2.init();
+    Connection conn;
+    conn.reset();
+    conn.h2 = &h2;
+    FakeH2Loop loop;
+    u8 response[256]{};
+    H2Dispatch<FakeH2Loop> dispatch{&loop, &conn, response, sizeof(response), 0, false};
+    RouteEntry route{};
+    route.fn = &h2_unsupported_event_yield;
+    static constexpr u8 kRequest[] = "GET / HTTP/1.1\r\nhost: example\r\n\r\n";
+
+    h2_invoke_emit(dispatch,
+                   1,
+                   &route,
+                   nullptr,
+                   0,
+                   nullptr,
+                   kRequest,
+                   sizeof(kRequest) - 1,
+                   /*request_forwardable=*/true);
+
+    REQUIRE_GT(dispatch.resp_len, 0u);
+    Http2FrameHeader header{};
+    REQUIRE(parse_frame_header(response, dispatch.resp_len, &header) == ParseStatus::Complete);
+    hpack::DynamicTable dyn;
+    dyn.init(4096);
+    hpack::Header decoded[4];
+    u8 scratch[128];
+    u32 count = 0;
+    REQUIRE(hpack::decode_header_block(dyn,
+                                       response + kFrameHeaderSize,
+                                       header.length,
+                                       scratch,
+                                       sizeof(scratch),
+                                       decoded,
+                                       4,
+                                       &count));
+    CHECK(decoded[0].name.eq(Str{":status", 7}));
+    CHECK(decoded[0].value.eq(Str{"503", 3}));
+}
+
+TEST(h2_serving, buffered_forward_rejects_nonforwardable_request) {
+    Http2Conn h2;
+    h2.init();
+    Connection conn;
+    conn.reset();
+    conn.h2 = &h2;
+    FakeH2Loop loop;
+    u8 response[256]{};
+    H2Dispatch<FakeH2Loop> dispatch{&loop, &conn, response, sizeof(response), 0, false};
+    RouteEntry route{};
+    route.fn = &h2_buffered_forward;
+    static constexpr u8 kRequest[] = "POST / HTTP/1.1\r\nhost: example\r\n\r\n";
+
+    h2_invoke_emit(dispatch,
+                   1,
+                   &route,
+                   nullptr,
+                   0,
+                   nullptr,
+                   kRequest,
+                   sizeof(kRequest) - 1,
+                   /*request_forwardable=*/false);
+
+    REQUIRE_GT(dispatch.resp_len, 0u);
+    Http2FrameHeader header{};
+    REQUIRE(parse_frame_header(response, dispatch.resp_len, &header) == ParseStatus::Complete);
+    hpack::DynamicTable dyn;
+    dyn.init(4096);
+    hpack::Header decoded[4];
+    u8 scratch[128];
+    u32 count = 0;
+    REQUIRE(hpack::decode_header_block(dyn,
+                                       response + kFrameHeaderSize,
+                                       header.length,
+                                       scratch,
+                                       sizeof(scratch),
+                                       decoded,
+                                       4,
+                                       &count));
+    CHECK(decoded[0].value.eq(Str{"400", 3}));
+}
+
+TEST(h2_serving, buffered_forward_rejects_content_length_injection_overflow) {
+    Http2Conn h2;
+    h2.init();
+    Connection conn;
+    conn.reset();
+    conn.h2 = &h2;
+    FakeH2Loop loop;
+    u8 response[256]{};
+    H2Dispatch<FakeH2Loop> dispatch{&loop, &conn, response, sizeof(response), 0, false};
+    RouteEntry route{};
+    route.fn = &h2_buffered_forward;
+    u8 request[Http2Conn::kBodySynthCap];
+    __builtin_memset(request, 'x', sizeof(request));
+    static constexpr char kHeaders[] = "POST / HTTP/1.1\r\nhost: example\r\n\r\n";
+    __builtin_memcpy(request, kHeaders, sizeof(kHeaders) - 1);
+
+    h2_invoke_emit(dispatch,
+                   1,
+                   &route,
+                   nullptr,
+                   0,
+                   nullptr,
+                   request,
+                   sizeof(request),
+                   /*request_forwardable=*/true,
+                   sizeof(kHeaders) - 1,
+                   1,
+                   /*inject_content_length_on_forward=*/true);
+
+    REQUIRE_GT(dispatch.resp_len, 0u);
+    Http2FrameHeader header{};
+    REQUIRE(parse_frame_header(response, dispatch.resp_len, &header) == ParseStatus::Complete);
+    hpack::DynamicTable dyn;
+    dyn.init(4096);
+    hpack::Header decoded[4];
+    u8 scratch[128];
+    u32 count = 0;
+    REQUIRE(hpack::decode_header_block(dyn,
+                                       response + kFrameHeaderSize,
+                                       header.length,
+                                       scratch,
+                                       sizeof(scratch),
+                                       decoded,
+                                       4,
+                                       &count));
+    CHECK(decoded[0].value.eq(Str{"413", 3}));
+}
+
+TEST(h2_serving, static_response_headers_filter_connection_specific_fields) {
+    Http2Conn h2;
+    h2.init();
+    Connection conn;
+    conn.reset();
+    conn.h2 = &h2;
+    FakeH2Loop loop;
+    u8 response[512]{};
+    H2Dispatch<FakeH2Loop> dispatch{&loop, &conn, response, sizeof(response), 0, false};
+    RouteConfig config;
+    static constexpr char kRouteHeader[] = "x-route";
+    static constexpr char kRouteValue[] = "enabled";
+    static constexpr char kKeepAlive[] = "keep-alive";
+    static constexpr char kKeepAliveValue[] = "timeout=5";
+    const char* keys[] = {kRouteHeader, kKeepAlive};
+    const u32 key_lens[] = {sizeof(kRouteHeader) - 1, sizeof(kKeepAlive) - 1};
+    const char* values[] = {kRouteValue, kKeepAliveValue};
+    const u32 value_lens[] = {sizeof(kRouteValue) - 1, sizeof(kKeepAliveValue) - 1};
+    const u16 header_set = config.add_response_header_set(keys, key_lens, values, value_lens, 2);
+    REQUIRE_NE(header_set, 0u);
+    JitDispatchOutcome outcome{};
+    outcome.kind = JitDispatchOutcome::Kind::ReturnStatus;
+    outcome.status_code = 200;
+    outcome.response_headers_idx = header_set;
+
+    h2_emit_outcome(dispatch, 1, outcome, &config, false);
+
+    Http2FrameHeader header{};
+    REQUIRE(parse_frame_header(response, dispatch.resp_len, &header) == ParseStatus::Complete);
+    hpack::DynamicTable dyn;
+    dyn.init(4096);
+    hpack::Header decoded[8];
+    u8 scratch[256];
+    u32 count = 0;
+    REQUIRE(hpack::decode_header_block(dyn,
+                                       response + kFrameHeaderSize,
+                                       header.length,
+                                       scratch,
+                                       sizeof(scratch),
+                                       decoded,
+                                       8,
+                                       &count));
+    bool has_route_header = false;
+    bool has_keep_alive = false;
+    for (u32 i = 0; i < count; i++) {
+        has_route_header |= decoded[i].name.eq(Str{kRouteHeader, sizeof(kRouteHeader) - 1}) &&
+                            decoded[i].value.eq(Str{kRouteValue, sizeof(kRouteValue) - 1});
+        has_keep_alive |= decoded[i].name.eq(Str{kKeepAlive, sizeof(kKeepAlive) - 1});
+    }
+    CHECK(has_route_header);
+    CHECK_FALSE(has_keep_alive);
+}
+
+TEST(h2_serving, header_keyed_rate_limit_rejects_oversized_h2_header_block) {
+    Http2Conn h2;
+    h2.init();
+    Connection conn;
+    conn.reset();
+    conn.h2 = &h2;
+    RouteConfig config;
+    REQUIRE(config.add_static("/limited", kRouteMethodGet, 200));
+    REQUIRE(config.set_route_rate_limit(0, 10, 60));
+    REQUIRE(config.add_route_rate_limit_key(0, RateLimitKeyKind::Header, "x-client", 8));
+    conn.request_config = &config;
+    FakeH2Loop loop;
+    u8 response[256]{};
+    H2Dispatch<FakeH2Loop> dispatch{&loop, &conn, response, sizeof(response), 0, false};
+    char oversized_value[8192];
+    __builtin_memset(oversized_value, 'x', sizeof(oversized_value));
+    const hpack::Header headers[] = {{{":method", 7}, {"GET", 3}},
+                                     {{":path", 5}, {"/limited", 8}},
+                                     {{":scheme", 7}, {"https", 5}},
+                                     {{":authority", 10}, {"example", 7}},
+                                     {{"x-client", 8}, {oversized_value, sizeof(oversized_value)}}};
+
+    h2_dispatch_request(dispatch, 1, headers, 5, /*end_stream=*/true);
+
+    Http2FrameHeader header{};
+    REQUIRE(parse_frame_header(response, dispatch.resp_len, &header) == ParseStatus::Complete);
+    hpack::DynamicTable dyn;
+    dyn.init(4096);
+    hpack::Header decoded[4];
+    u8 scratch[128];
+    u32 count = 0;
+    REQUIRE(hpack::decode_header_block(dyn,
+                                       response + kFrameHeaderSize,
+                                       header.length,
+                                       scratch,
+                                       sizeof(scratch),
+                                       decoded,
+                                       4,
+                                       &count));
+    CHECK(decoded[0].value.eq(Str{"431", 3}));
+}
+
+TEST(h2_serving, rate_limited_static_route_returns_429_after_quota) {
+    RouteConfig config;
+    REQUIRE(config.add_static("/limited", kRouteMethodGet, 200));
+    REQUIRE(config.set_route_rate_limit(0, 1, 60));
+    const hpack::Header headers[] = {{{":method", 7}, {"GET", 3}},
+                                     {{":path", 5}, {"/limited", 8}},
+                                     {{":scheme", 7}, {"https", 5}},
+                                     {{":authority", 10}, {"example", 7}}};
+    const auto dispatch_status = [&](u32 stream_id, u16* status) {
+        Http2Conn h2;
+        h2.init();
+        Connection conn;
+        conn.reset();
+        conn.h2 = &h2;
+        conn.request_config = &config;
+        FakeH2Loop loop;
+        u8 response[256]{};
+        H2Dispatch<FakeH2Loop> dispatch{&loop, &conn, response, sizeof(response), 0, false};
+        h2_dispatch_request(dispatch, stream_id, headers, 4, /*end_stream=*/true);
+        Http2FrameHeader frame{};
+        REQUIRE(parse_frame_header(response, dispatch.resp_len, &frame) == ParseStatus::Complete);
+        hpack::DynamicTable dyn;
+        dyn.init(4096);
+        hpack::Header decoded[4];
+        u8 scratch[128];
+        u32 count = 0;
+        REQUIRE(hpack::decode_header_block(dyn,
+                                           response + kFrameHeaderSize,
+                                           frame.length,
+                                           scratch,
+                                           sizeof(scratch),
+                                           decoded,
+                                           4,
+                                           &count));
+        *status = static_cast<u16>((decoded[0].value.ptr[0] - '0') * 100 +
+                                   (decoded[0].value.ptr[1] - '0') * 10 +
+                                   (decoded[0].value.ptr[2] - '0'));
+    };
+
+    u16 first_status = 0;
+    u16 second_status = 0;
+    dispatch_status(1, &first_status);
+    dispatch_status(3, &second_status);
+    CHECK_EQ(first_status, 200u);
+    CHECK_EQ(second_status, 429u);
+}
+
 TEST(h2_serving, bodyless_mutated_status_suppresses_dynamic_data) {
     Http2Conn h2;
     h2.init();
@@ -1899,6 +2665,45 @@ TEST(h2_serving, bodyless_mutated_status_suppresses_dynamic_data) {
     CHECK_EQ(header.type, static_cast<u8>(Http2FrameType::Headers));
     CHECK((header.flags & http2_flag::kEndStream) != 0);
     CHECK_EQ(dispatch.resp_len, kFrameHeaderSize + header.length);
+}
+
+TEST(h2_serving, dynamic_response_without_content_type_adds_default_header) {
+    Http2Conn h2;
+    h2.init();
+    Connection conn;
+    conn.reset();
+    conn.h2 = &h2;
+    FakeH2Loop loop;
+    u8 response[256]{};
+    H2Dispatch<FakeH2Loop> dispatch{&loop, &conn, response, sizeof(response), 0, false};
+    JitDispatchOutcome outcome{};
+    outcome.kind = JitDispatchOutcome::Kind::ReturnStatus;
+    outcome.status_code = 200;
+    outcome.dynamic_response_body = "body";
+    outcome.dynamic_response_body_len = 4;
+
+    h2_emit_outcome(dispatch, 1, outcome, nullptr, false);
+
+    Http2FrameHeader header{};
+    REQUIRE(parse_frame_header(response, dispatch.resp_len, &header) == ParseStatus::Complete);
+    hpack::DynamicTable dyn;
+    dyn.init(4096);
+    hpack::Header decoded[8];
+    u8 scratch[256];
+    u32 count = 0;
+    REQUIRE(hpack::decode_header_block(dyn,
+                                       response + kFrameHeaderSize,
+                                       header.length,
+                                       scratch,
+                                       sizeof(scratch),
+                                       decoded,
+                                       8,
+                                       &count));
+    bool has_content_type = false;
+    for (u32 i = 0; i < count; i++)
+        has_content_type |= decoded[i].name.eq(Str{"content-type", 12}) &&
+                            decoded[i].value.eq(Str{"text/plain; charset=utf-8", 25});
+    CHECK(has_content_type);
 }
 
 TEST(h2_serving, captured_content_length_is_removed_for_final_204) {
@@ -1941,6 +2746,138 @@ TEST(h2_serving, captured_content_length_is_removed_for_final_204) {
                                        8,
                                        &count));
     for (u32 i = 0; i < count; i++) CHECK_FALSE(decoded[i].name.eq(Str{"content-length", 14}));
+}
+
+TEST(h2_serving, response_header_remove_mutation_filters_captured_header) {
+    Http2Conn h2;
+    h2.init();
+    Connection conn;
+    conn.reset();
+    conn.h2 = &h2;
+    FakeH2Loop loop;
+    u8 response[256]{};
+    H2Dispatch<FakeH2Loop> dispatch{&loop, &conn, response, sizeof(response), 0, false};
+    jit::CapturedResponseHeader captured_headers[] = {
+        {{"x-remove", 8}, {"gone", 4}},
+        {{"x-keep", 6}, {"present", 7}},
+    };
+    jit::HandlerCtx response_ctx{};
+    response_ctx.captured_response_valid = true;
+    response_ctx.captured_response_header_count = 2;
+    response_ctx.captured_response_headers = captured_headers;
+    response_ctx.response_header_count = 1;
+    response_ctx.response_header_mutations[0].mode = jit::ResponseHeaderMutationMode::Remove;
+    response_ctx.response_header_mutations[0].name = {"x-remove", 8};
+    JitDispatchOutcome outcome{};
+    outcome.kind = JitDispatchOutcome::Kind::ReturnStatus;
+    outcome.status_code = 200;
+    outcome.response_ctx = &response_ctx;
+    outcome.uses_captured_response = true;
+
+    h2_emit_outcome(dispatch, 1, outcome, nullptr, false);
+
+    Http2FrameHeader header{};
+    REQUIRE(parse_frame_header(response, dispatch.resp_len, &header) == ParseStatus::Complete);
+    hpack::DynamicTable dyn;
+    dyn.init(4096);
+    hpack::Header decoded[8];
+    u8 scratch[256];
+    u32 count = 0;
+    REQUIRE(hpack::decode_header_block(dyn,
+                                       response + kFrameHeaderSize,
+                                       header.length,
+                                       scratch,
+                                       sizeof(scratch),
+                                       decoded,
+                                       8,
+                                       &count));
+    bool kept = false;
+    for (u32 i = 0; i < count; i++) {
+        CHECK_FALSE(decoded[i].name.eq(Str{"x-remove", 8}));
+        kept |= decoded[i].name.eq(Str{"x-keep", 6}) && decoded[i].value.eq(Str{"present", 7});
+    }
+    CHECK(kept);
+}
+
+TEST(h2_serving, response_header_add_mutation_is_serialized) {
+    Http2Conn h2;
+    h2.init();
+    Connection conn;
+    conn.reset();
+    conn.h2 = &h2;
+    FakeH2Loop loop;
+    u8 response[256]{};
+    H2Dispatch<FakeH2Loop> dispatch{&loop, &conn, response, sizeof(response), 0, false};
+    jit::HandlerCtx response_ctx{};
+    response_ctx.response_header_count = 1;
+    response_ctx.response_header_mutations[0].mode = jit::ResponseHeaderMutationMode::Add;
+    response_ctx.response_header_mutations[0].name = {"x-added", 7};
+    response_ctx.response_header_mutations[0].value = {"yes", 3};
+    JitDispatchOutcome outcome{};
+    outcome.kind = JitDispatchOutcome::Kind::ReturnStatus;
+    outcome.status_code = 200;
+    outcome.response_ctx = &response_ctx;
+
+    h2_emit_outcome(dispatch, 1, outcome, nullptr, false);
+
+    Http2FrameHeader header{};
+    REQUIRE(parse_frame_header(response, dispatch.resp_len, &header) == ParseStatus::Complete);
+    hpack::DynamicTable dyn;
+    dyn.init(4096);
+    hpack::Header decoded[8];
+    u8 scratch[256];
+    u32 count = 0;
+    REQUIRE(hpack::decode_header_block(dyn,
+                                       response + kFrameHeaderSize,
+                                       header.length,
+                                       scratch,
+                                       sizeof(scratch),
+                                       decoded,
+                                       8,
+                                       &count));
+    bool has_added = false;
+    for (u32 i = 0; i < count; i++)
+        has_added |= decoded[i].name.eq(Str{"x-added", 7}) && decoded[i].value.eq(Str{"yes", 3});
+    CHECK(has_added);
+}
+
+TEST(h2_serving, invalid_response_header_mutation_fails_closed) {
+    Http2Conn h2;
+    h2.init();
+    Connection conn;
+    conn.reset();
+    conn.h2 = &h2;
+    FakeH2Loop loop;
+    u8 response[256]{};
+    H2Dispatch<FakeH2Loop> dispatch{&loop, &conn, response, sizeof(response), 0, false};
+    jit::HandlerCtx response_ctx{};
+    response_ctx.response_header_count = 1;
+    response_ctx.response_header_mutations[0].mode = jit::ResponseHeaderMutationMode::Add;
+    response_ctx.response_header_mutations[0].name = {"bad\nname", 8};
+    response_ctx.response_header_mutations[0].value = {"value", 5};
+    JitDispatchOutcome outcome{};
+    outcome.kind = JitDispatchOutcome::Kind::ReturnStatus;
+    outcome.status_code = 200;
+    outcome.response_ctx = &response_ctx;
+
+    h2_emit_outcome(dispatch, 1, outcome, nullptr, false);
+
+    Http2FrameHeader header{};
+    REQUIRE(parse_frame_header(response, dispatch.resp_len, &header) == ParseStatus::Complete);
+    hpack::DynamicTable dyn;
+    dyn.init(4096);
+    hpack::Header decoded[4];
+    u8 scratch[128];
+    u32 count = 0;
+    REQUIRE(hpack::decode_header_block(dyn,
+                                       response + kFrameHeaderSize,
+                                       header.length,
+                                       scratch,
+                                       sizeof(scratch),
+                                       decoded,
+                                       4,
+                                       &count));
+    CHECK(decoded[0].value.eq(Str{"500", 3}));
 }
 
 TEST(h2_serving, captured_304_content_length_is_removed_for_final_200) {
@@ -2211,6 +3148,26 @@ TEST(h2_serving, failed_response_serialization_rolls_back_encoder_state) {
     CHECK_EQ(__builtin_memcmp(&h2.hpack_enc, &before, sizeof(before)), 0);
 }
 
+TEST(h2_serving, first_oversized_response_falls_back_to_500) {
+    Http2Conn h2;
+    h2.init();
+    Connection conn;
+    conn.reset();
+    conn.h2 = &h2;
+    FakeH2Loop loop;
+    u8 response[64]{};
+    H2Dispatch<FakeH2Loop> dispatch{&loop, &conn, response, sizeof(response), 0, false};
+    char value[128];
+    __builtin_memset(value, 'x', sizeof(value));
+    const hpack::Header header = {{"x-oversized", 11}, {value, sizeof(value)}};
+
+    h2_emit_response(dispatch, 1, 200, &header, 1, nullptr, 0);
+
+    CHECK_FALSE(dispatch.overflow);
+    CHECK_GT(dispatch.resp_len, 0u);
+    CHECK_EQ(response[3], static_cast<u8>(Http2FrameType::Headers));
+}
+
 TEST(h2_serving, completed_request_is_accounted_once) {
     Http2Conn h2;
     h2.init();
@@ -2401,7 +3358,8 @@ TEST(h2_serving, suspended_handler_context_is_snapshotted_and_rebased) {
     REQUIRE(live_body_snapshot != nullptr);
 
     REQUIRE_EQ(h2_stash_synth(h2, synth, kSynthLen), kSynthLen);
-    REQUIRE(h2_snapshot_async_jit_ctx(h2, *live, synth, kSynthLen));
+    const UpstreamMarkReplayContext kReplayContext{17, 19, 23};
+    REQUIRE(h2_snapshot_async_jit_ctx(h2, *live, kReplayContext, synth, kSynthLen));
     CHECK(live->control_plane == nullptr);
     CHECK(live->response_body_mutation_storage == nullptr);
     CHECK(live->response_body_snapshot_storage == nullptr);
@@ -2418,6 +3376,9 @@ TEST(h2_serving, suspended_handler_context_is_snapshotted_and_rebased) {
     CHECK(parked->response_header_mutations[0].value.ptr ==
           reinterpret_cast<const char*>(h2.pending_synth + 4));
     CHECK_EQ(parked->route_params[0].value_len, 4u);
+    CHECK_EQ(h2.async_replay_context.workload_event_position, 17u);
+    CHECK_EQ(h2.async_replay_context.correlation_id, 19u);
+    CHECK_EQ(h2.async_replay_context.source_shard_id, 23u);
     CHECK(parked->route_params[0].value == reinterpret_cast<const char*>(h2.pending_synth + 10));
     CHECK(parked->response_body_mutation_storage == live_body_storage);
     REQUIRE(parked->response_body_snapshot_storage != nullptr);

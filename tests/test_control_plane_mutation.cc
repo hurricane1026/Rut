@@ -413,6 +413,17 @@ struct ControlPlaneMutationPortTestAccess {
         port.override_seq_[bank].store(sequence, std::memory_order_release);
     }
 
+    static u64 override_sequence(const ControlPlaneMutationPort& port, u32 bank) {
+        return port.override_seq_[bank].load(std::memory_order_acquire);
+    }
+
+    static u32 bank_for_generation(const ControlPlaneMutationPort& port, u64 generation) {
+        for (u32 bank = 0; bank < 2; bank++)
+            if (port.bank_generation_[bank].load(std::memory_order_acquire) == generation)
+                return bank;
+        return 2;
+    }
+
     static void set_override_version(ControlPlaneMutationPort& port, u32 bank, u64 version) {
         port.override_version_[bank].store(version, std::memory_order_release);
     }
@@ -456,6 +467,15 @@ struct ControlPlaneMutationPortTestAccess {
             std::memory_order_relaxed);
         port.committed_override_versions_[bank][server.upstream_id][server.backend_id][slot].store(
             version, std::memory_order_relaxed);
+    }
+
+    static u64 committed_override(const ControlPlaneMutationPort& port,
+                                  u32 bank,
+                                  ServerIdentity server,
+                                  u64* version,
+                                  u64 maximum_version) {
+        return port.committed_override(
+            bank, server.upstream_id, server.backend_id, version, maximum_version);
     }
 
     static u8 stopping(const ControlPlaneMutationPort& port) {
@@ -1343,6 +1363,40 @@ TEST(control_plane_mutation, compatible_retained_generations_share_override_upda
     CHECK_EQ(port.manual_health({4, 0, 0}), ManualHealthOverride::Unhealthy);
 }
 
+TEST(control_plane_mutation, peer_sequence_contention_rolls_back_the_local_mark_claim) {
+    ControlPlaneMutationPort port;
+    RouteConfig old_config;
+    REQUIRE(old_config.add_upstream("users", 0x7f000001u, 8000).has_value());
+    port.reset(3, true, &old_config);
+
+    u64 id = 0;
+    REQUIRE(port.request_reload(ReloadRequestSource::Route, &id));
+    ReloadRequest request{};
+    REQUIRE(port.take_reload(&request));
+    RouteConfig new_config;
+    REQUIRE(new_config.add_upstream("users", 0x7f000001u, 8000).has_value());
+    REQUIRE(
+        port.complete_reload(id, request.source, ReloadTerminalOutcome::Activated, 4, &new_config));
+
+    const u32 active_bank = ControlPlaneMutationPortTestAccess::bank_for_generation(port, 4);
+    REQUIRE(active_bank < 2);
+    const u32 peer_bank = active_bank ^ 1u;
+    MarkReplayEvents events;
+    port.set_upstream_mark_replay_sink(&collect_mark_replay_event, &events);
+    ControlPlaneMutationPortTestAccess::set_override_sequence(port, peer_bank, 1);
+
+    CHECK_FALSE(port.mark({4, 0, 0}, true));
+    CHECK_EQ(ControlPlaneMutationPortTestAccess::override_sequence(port, active_bank), 2u);
+    CHECK_EQ(ControlPlaneMutationPortTestAccess::override_sequence(port, peer_bank), 1u);
+    REQUIRE_EQ(events.count, 1u);
+    CHECK_EQ(events.events[0].reason, UpstreamMarkReplayReason::Contended);
+
+    ControlPlaneMutationPortTestAccess::set_override_sequence(port, peer_bank, 0);
+    REQUIRE(port.mark({4, 0, 0}, true));
+    CHECK_EQ(port.manual_health({4, 0, 0}), ManualHealthOverride::Healthy);
+    CHECK_EQ(port.manual_health({3, 0, 0}), ManualHealthOverride::Healthy);
+}
+
 TEST(control_plane_mutation, activation_carries_overrides_across_backend_reordering) {
     ControlPlaneMutationPort port;
     RouteConfig old_config;
@@ -1680,6 +1734,41 @@ TEST(control_plane_mutation, every_successful_mark_advances_generation_scoped_ve
     CHECK_EQ(version, 3u);
 }
 
+TEST(control_plane_mutation, mark_rejects_override_version_exhaustion_without_publishing) {
+    ControlPlaneMutationPort port;
+    RouteConfig config;
+    REQUIRE(add_upstreams(&config, 1));
+    port.reset(9, false, &config);
+    const ServerIdentity server{9, 0, 0};
+    ControlPlaneMutationPortTestAccess::set_override_version(port, 0, (u64{1} << 62) - 1);
+
+    CHECK_FALSE(port.mark(server, true));
+
+    u64 version = 0;
+    CHECK_EQ(port.manual_health(server, &version), ManualHealthOverride::None);
+    CHECK_EQ(version, (u64{1} << 62) - 1);
+}
+
+TEST(control_plane_mutation, mark_reports_and_recovers_from_a_busy_override_sequence) {
+    ControlPlaneMutationPort port;
+    RouteConfig config;
+    REQUIRE(add_upstreams(&config, 1));
+    port.reset(9, false, &config);
+    const ServerIdentity server{9, 0, 0};
+    MarkReplayEvents events;
+    port.set_upstream_mark_replay_sink(&collect_mark_replay_event, &events);
+
+    ControlPlaneMutationPortTestAccess::set_override_sequence(port, 0, 1);
+    CHECK_FALSE(port.mark(server, true));
+    CHECK_EQ(ControlPlaneMutationPortTestAccess::override_sequence(port, 0), 1u);
+    REQUIRE_EQ(events.count, 1u);
+    CHECK_EQ(events.events[0].reason, UpstreamMarkReplayReason::Contended);
+
+    ControlPlaneMutationPortTestAccess::set_override_sequence(port, 0, 0);
+    REQUIRE(port.mark(server, true));
+    CHECK_EQ(port.manual_health(server), ManualHealthOverride::Healthy);
+}
+
 TEST(control_plane_mutation, backend_override_snapshot_uses_one_table_version) {
     ControlPlaneMutationPort port;
     RouteConfig config;
@@ -1737,6 +1826,29 @@ TEST(control_plane_mutation, committed_fallback_never_pairs_future_version_with_
     CHECK_EQ(port.manual_health(server, &version), ManualHealthOverride::Healthy);
     CHECK_EQ(version, 2u);
     ControlPlaneMutationPortTestAccess::set_override_sequence(port, 0, 4);
+}
+
+TEST(control_plane_mutation, bounded_committed_override_read_rejects_only_future_slots) {
+    ControlPlaneMutationPort port;
+    RouteConfig config;
+    REQUIRE(add_upstreams(&config, 1));
+    port.reset(9, false, &config);
+    const ServerIdentity server{9, 0, 0};
+    REQUIRE(port.mark(server, false));
+    ControlPlaneMutationPortTestAccess::stage_committed_override(port, 0, server, true, 2);
+
+    u64 version = 99;
+    const u64 packed =
+        ControlPlaneMutationPortTestAccess::committed_override(port, 0, server, &version, 0);
+    CHECK_EQ(packed, 0u);
+    CHECK_EQ(version, 0u);
+
+    ControlPlaneMutationPortTestAccess::publish_committed_override(port, 0, server, true, 2);
+    version = 0;
+    const u64 bounded =
+        ControlPlaneMutationPortTestAccess::committed_override(port, 0, server, &version, 1);
+    CHECK_EQ(version, 1u);
+    CHECK_NE(bounded, 0u);
 }
 
 TEST(control_plane_mutation, snapshot_exhaustion_preserves_committed_unhealthy_verdict) {
@@ -2417,6 +2529,48 @@ TEST(control_plane_mutation, signal_snapshot_capture_failures_are_terminalized) 
         CHECK_EQ(port.last_record().request_id, request_id);
         CHECK_EQ(port.last_record().outcome, ReloadTerminalOutcome::SnapshotUnavailable);
     }
+}
+
+TEST(control_plane_mutation, source_version_capture_only_clears_for_its_registration) {
+    ControlPlaneMutationPort port;
+    port.reset(1, true);
+    port.set_reload_source_version_capture(failed_source_capture, nullptr);
+
+    // A mismatched callback must not silently clear the registered source.
+    port.clear_reload_source_version_capture(oversized_source_capture, nullptr);
+    u64 failed_request_id = 0;
+    CHECK_FALSE(port.request_reload(ReloadRequestSource::Signal, &failed_request_id));
+    CHECK_NE(failed_request_id, 0u);
+    CHECK_EQ(port.last_record().outcome, ReloadTerminalOutcome::SnapshotUnavailable);
+
+    port.clear_reload_source_version_capture(failed_source_capture, nullptr);
+    u64 request_id = 0;
+    CHECK(port.request_reload(ReloadRequestSource::Signal, &request_id));
+    CHECK_NE(request_id, 0u);
+}
+
+TEST(control_plane_mutation, admission_in_progress_tracks_reserved_identity) {
+    ControlPlaneMutationPort port;
+    port.reset(1, true);
+    CHECK_FALSE(port.admission_in_progress());
+
+    const u64 request_id = ControlPlaneMutationPortTestAccess::reserve_admission_identity(port);
+    REQUIRE_NE(request_id, 0u);
+    CHECK(port.admission_in_progress());
+}
+
+TEST(control_plane_mutation, zero_generation_health_snapshot_is_empty) {
+    ControlPlaneMutationPort port;
+    port.reset(1, true);
+    ManualHealthOverride verdicts[2] = {ManualHealthOverride::Healthy,
+                                        ManualHealthOverride::Unhealthy};
+    u64 version = 99;
+
+    REQUIRE(port.manual_health_snapshot(/*generation=*/0, 0, 2, verdicts, &version));
+
+    CHECK_EQ(verdicts[0], ManualHealthOverride::None);
+    CHECK_EQ(verdicts[1], ManualHealthOverride::None);
+    CHECK_EQ(version, 0u);
 }
 
 int main(int argc, char** argv) {

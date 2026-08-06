@@ -314,6 +314,7 @@ inline void h2_clear_pending(Http2Conn& h2) {
     h2.pending_route_action = RouteAction::Static;
     h2.pending_static_status = 200;
     h2.pending_jit_fn = nullptr;
+    h2.pending_replay_context = {};
     h2.pending_route_param_count = 0;
     for (u32 i = 0; i < kMaxRouteParams; i++) {
         h2.pending_route_params[i] = {};
@@ -424,6 +425,7 @@ bool h2_defer_until_data_end(H2Dispatch<Loop>& d,
     h2->pending_route_action = action;
     h2->pending_static_status = static_status;
     h2->pending_jit_fn = route ? route->fn : nullptr;
+    h2->pending_replay_context = d.conn->replay_context;
     // Snapshot route params for the deferred handler. Only JIT handlers consume
     // params, and only they build the synthesized request; re-anchor each param
     // value into pending_synth (stable) rather than the matcher's hdr_scratch
@@ -631,6 +633,26 @@ void h2_async_epoch_enter(Loop* loop, Connection& conn) {
         conn.epoch_held = true;
     }
 }
+
+// A receive batch needs RCU protection while decoding headers, but it cannot
+// pin a program until the admitted stream has selected its generation.
+template <typename Loop>
+void h2_process_epoch_enter(Loop* loop, Connection& conn) {
+    if (!conn.epoch_held) {
+        loop->epoch_enter();
+        conn.epoch_held = true;
+    }
+}
+
+// A stream chooses its config at HEADERS admission, after it receives its
+// replay position. Keep that exact program alive only when the stream outlives
+// the current h2 process() call.
+inline void h2_pin_held_stream_config(Connection& conn, const RouteConfig* config) {
+    if (conn.http2_program_pin_config == config) return;
+    release_http2_program_pin(conn.http2_program_pin_config);
+    conn.http2_program_pin_config = config;
+    acquire_http2_program_pin(config);
+}
 template <typename Loop>
 void h2_async_epoch_leave(Loop* loop, Connection& conn) {
     if (conn.epoch_held) {
@@ -690,6 +712,7 @@ inline void h2_transfer_timer_to_pending_forward(
     h2.pending_route = h2.async_route;
     h2.pending_route_action = RouteAction::JitHandler;
     h2.pending_jit_fn = h2.async_fn;
+    h2.pending_replay_context = h2.async_replay_context;
     h2.pending_route_param_count = 0;
 
     h2.async_stream = 0;
@@ -719,6 +742,7 @@ inline void h2_rebase_synth_view(Str& view,
 
 inline bool h2_snapshot_async_jit_ctx(Http2Conn& h2,
                                       jit::HandlerCtx& live,
+                                      const UpstreamMarkReplayContext& replay_context,
                                       const u8* old_synth,
                                       u32 synth_len) {
     if (live.slot_count > kMaxJitHandlerSlots ||
@@ -728,6 +752,7 @@ inline bool h2_snapshot_async_jit_ctx(Http2Conn& h2,
     const size_t kBytes = sizeof(jit::HandlerCtx) + static_cast<size_t>(live.slot_count) * 8;
     auto* parked = h2.async_jit_ctx();
     __builtin_memcpy(parked, &live, kBytes);
+    h2.async_replay_context = replay_context;
 
     // The parked frame now owns all lazily allocated request storage. Clear the
     // connection scratch copy so another H2 stream can reset it without freeing
@@ -804,15 +829,17 @@ bool h2_suspend_timer(H2Dispatch<Loop>& d,
     // while pending_synth is quarantined behind a draining io_uring upstream send.
     if (h2->async_stream != 0 || h2->pending_stream != 0 || d.conn->h2_proxy_synth_quarantined)
         return false;
-    // Pin the config epoch BEFORE storing cfg/route — a backpressured flush of the
-    // suspending batch could otherwise let a hot reload reclaim them while parked.
+    // Pin the selected config before storing cfg/route — a backpressured flush
+    // of the suspending batch could otherwise let a hot reload reclaim them.
     h2_async_epoch_enter(d.loop, *d.conn);
+    h2_pin_held_stream_config(*d.conn, cfg);
     h2->async_synth_len = h2_stash_synth(*h2, synth, synth_len);
     h2->async_body_start = body_start;
     h2->async_body_len = body_len;
     h2->async_inject_content_length_on_forward = inject_content_length_on_forward;
     if (!ctx_already_parked &&
-        !h2_snapshot_async_jit_ctx(*h2, live_ctx, synth, h2->async_synth_len)) {
+        !h2_snapshot_async_jit_ctx(
+            *h2, live_ctx, d.conn->replay_context, synth, h2->async_synth_len)) {
         h2_async_epoch_leave(d.loop, *d.conn);
         return false;
     }
@@ -848,12 +875,14 @@ bool h2_suspend_proxy(H2Dispatch<Loop>& d,
     // pending_synth is quarantined behind a draining io_uring upstream send.
     if (h2->async_stream != 0 || h2->pending_stream != 0 || d.conn->h2_proxy_synth_quarantined)
         return false;
-    // Pin the config epoch before storing cfg/route (see h2_suspend_timer).
+    // Pin the selected config before storing cfg/route (see h2_suspend_timer).
     h2_async_epoch_enter(d.loop, *d.conn);
+    h2_pin_held_stream_config(*d.conn, cfg);
     h2->async_synth_len = h2_stash_synth(*h2, synth, synth_len);
     if ((apply_response_mutations || capture_response) && !ctx_already_parked &&
         (live_ctx == nullptr ||
-         !h2_snapshot_async_jit_ctx(*h2, *live_ctx, synth, h2->async_synth_len))) {
+         !h2_snapshot_async_jit_ctx(
+             *h2, *live_ctx, d.conn->replay_context, synth, h2->async_synth_len))) {
         h2_async_epoch_leave(d.loop, *d.conn);
         return false;
     }
@@ -887,15 +916,21 @@ void h2_invoke_emit(H2Dispatch<Loop>& d,
                     bool inject_content_length_on_forward = false) {
     auto* ctx = d.conn->reset_jit_ctx();
     if (route->needs_control_plane_snapshot) latch_control_plane_snapshot(d.loop, ctx);
-    latch_control_plane_mutation(d.loop, ctx, cfg != nullptr ? cfg->config_generation : 0);
+    latch_control_plane_mutation(
+        d.loop, ctx, cfg != nullptr ? cfg->config_generation : 0, &d.conn->replay_context);
     ctx->state = 0;
     ctx->resume_event_kind = static_cast<u32>(jit::YieldKind::Timer);
     ctx->resume_event_result = 0;
     ctx->route_param_count = param_count;
     for (u32 i = 0; i < param_count; i++) ctx->route_params[i] = params[i];
 
-    const JitDispatchOutcome kOutcome = invoke_jit_handler(
-        route->fn, static_cast<void*>(d.conn), *ctx, synth, synth_len, /*arena=*/nullptr);
+    const JitDispatchOutcome kOutcome = invoke_jit_handler(route->fn,
+                                                           static_cast<void*>(d.conn),
+                                                           *ctx,
+                                                           synth,
+                                                           synth_len,
+                                                           /*arena=*/nullptr,
+                                                           &d.conn->replay_context);
     if (kOutcome.kind == JitDispatchOutcome::Kind::TimerYield) {
         if (!h2_suspend_timer(d,
                               stream_id,
@@ -1011,6 +1046,7 @@ void h2_finish_body(H2Dispatch<Loop>& d, u32 stream_id) {
         const u16 upstream_id = h2->pending_forward_upstream_id;
         const bool capture_response = h2->pending_forward_capture;
         const bool preinvoked_timer = h2->pending_preinvoked_timer;
+        const UpstreamMarkReplayContext replay_context = h2->pending_replay_context;
         if (route == nullptr || (!preinvoked_timer && !h2->pending_request_forwardable)) {
             const u16 status = route == nullptr ? 500 : 400;
             h2_clear_pending(*h2);
@@ -1033,6 +1069,8 @@ void h2_finish_body(H2Dispatch<Loop>& d, u32 stream_id) {
         const bool request_forwardable = h2->pending_request_forwardable;
         const bool inject_content_length_on_forward = !h2->pending_has_content_length;
         h2->pending_stream = 0;  // transfer the shared synth/context to async
+        d.conn->replay_context = replay_context;
+        h2->async_replay_context = replay_context;
         bool suspended = false;
         if (preinvoked_timer) {
             JitDispatchOutcome outcome{};
@@ -1110,6 +1148,7 @@ void h2_finish_body(H2Dispatch<Loop>& d, u32 stream_id) {
     const RouteConfig* cfg = h2->pending_route_config;
     const RouteEntry* route = pending_route;
     const jit::HandlerFn kJitFn = h2->pending_jit_fn;
+    const UpstreamMarkReplayContext kReplayContext = h2->pending_replay_context;
     const u32 kRouteParamCount = h2->pending_route_param_count;
     const bool kRequestForwardable = h2->pending_request_forwardable;
     RouteParam route_params[kMaxRouteParams];
@@ -1119,6 +1158,7 @@ void h2_finish_body(H2Dispatch<Loop>& d, u32 stream_id) {
     }
 
     h2_clear_pending(*h2);  // clear before responding
+    d.conn->replay_context = kReplayContext;
     if (route == nullptr || kJitFn == nullptr) {
         h2_emit_status(d, stream_id, 500);
         return;
@@ -1158,7 +1198,6 @@ void h2_dispatch_request(H2Dispatch<Loop>& d,
         h2_emit_status(d, stream_id, 400);
         return;
     }
-
     const RouteConfig* config = d.conn->request_config;
     // Firewall gate — mirrors the HTTP/1 path (callbacks_impl.h checks
     // firewall_allows_peer before route matching and 403s). Without this an h2
@@ -1309,15 +1348,22 @@ void h2_dispatch_request(H2Dispatch<Loop>& d,
                 }
                 auto* ctx = d.conn->reset_jit_ctx();
                 if (route->needs_control_plane_snapshot) latch_control_plane_snapshot(d.loop, ctx);
-                latch_control_plane_mutation(
-                    d.loop, ctx, config != nullptr ? config->config_generation : 0);
+                latch_control_plane_mutation(d.loop,
+                                             ctx,
+                                             config != nullptr ? config->config_generation : 0,
+                                             &d.conn->replay_context);
                 ctx->state = 0;
                 ctx->resume_event_kind = static_cast<u32>(jit::YieldKind::Timer);
                 ctx->resume_event_result = 0;
                 ctx->route_param_count = param_count;
                 for (u32 i = 0; i < param_count; i++) ctx->route_params[i] = anchored_params[i];
-                const JitDispatchOutcome kOutcome = invoke_jit_handler(
-                    route->fn, static_cast<void*>(d.conn), *ctx, synth, kSynthLen, nullptr);
+                const JitDispatchOutcome kOutcome = invoke_jit_handler(route->fn,
+                                                                       static_cast<void*>(d.conn),
+                                                                       *ctx,
+                                                                       synth,
+                                                                       kSynthLen,
+                                                                       nullptr,
+                                                                       &d.conn->replay_context);
 
                 if (kOutcome.kind == JitDispatchOutcome::Kind::ForwardBuffered ||
                     kOutcome.kind == JitDispatchOutcome::Kind::ForwardCapture) {
@@ -1341,7 +1387,8 @@ void h2_dispatch_request(H2Dispatch<Loop>& d,
                         jit::release_response_body_mutation_storage(ctx);
                         return;
                     }
-                    if (!h2_snapshot_async_jit_ctx(*h2, *ctx, synth, kSynthLen)) {
+                    if (!h2_snapshot_async_jit_ctx(
+                            *h2, *ctx, d.conn->replay_context, synth, kSynthLen)) {
                         h2_clear_pending(*h2);
                         jit::release_response_body_mutation_storage(ctx);
                         h2_emit_status(d, stream_id, 500);
@@ -1495,6 +1542,12 @@ void h2_on_headers_cb(
         stream->request_start_us = monotonic_us();
         c.metrics->on_request_start();
     }
+    // Admission establishes the replay order before this stream selects a
+    // generation. Do this per stream rather than once for an entire coalesced
+    // receive batch, whose streams can cross a config swap.
+    d->conn->assign_upstream_mark_replay_admission();
+    if constexpr (requires { d->loop->config_ptr; })
+        d->conn->request_config = d->loop->config_ptr ? *d->loop->config_ptr : nullptr;
     h2_dispatch_request(*d, stream_id, hs, n, end);
 }
 
@@ -1673,13 +1726,10 @@ void on_h2_data(void* lp, Connection& conn, IoEvent ev) {
     conn.h2->on_headers = &h2_on_headers_cb<Loop>;
     conn.h2->on_data = &h2_on_data_cb<Loop>;  // accumulates request bodies
     conn.h2->on_reset = &h2_on_reset_cb;      // cancels a parked stream on RST_STREAM
-    // A deferred body episode retains its original config/route across DATA
-    // batches. Keep that program pinned and use the same generation for any
-    // coalesced frames until the episode releases its epoch; switching here
-    // would expose pending_route_config after releasing its owning program.
-    // A fresh episode snapshots the active config before taking its exact pin.
-    if (!conn.epoch_held) conn.request_config = loop->config_ptr ? *loop->config_ptr : nullptr;
-    h2_async_epoch_enter(loop, conn);
+    // Enter the RCU epoch before decoding the batch. Each stream then snapshots
+    // its generation from h2_on_headers_cb after receiving its admission order.
+    // A deferred or async stream pins its own selected program below.
+    h2_process_epoch_enter(loop, conn);
 
     u32 ctrl_len = 0;
     Http2Result r =
@@ -1702,6 +1752,7 @@ void on_h2_data(void* lp, Connection& conn, IoEvent ev) {
     // or right here if there isn't. Not entered on kClose: a closing connection
     // abandons the suspended handler rather than parking it.
     if (conn.h2->async_stream != 0 && !kClose) {
+        h2_pin_held_stream_config(conn, conn.h2->async_cfg);
         if (ctrl_len == 0 && d.resp_len == 0) {
             h2_begin_suspended_io<Loop>(loop, conn);
             return;
@@ -1720,7 +1771,9 @@ void on_h2_data(void* lp, Connection& conn, IoEvent ev) {
     // for a later DATA batch (keep it then), or a parked stream rides a close
     // (close_conn releases it). The leave is idempotent, so a later close_conn is
     // a harmless no-op.
-    if (conn.h2->async_stream == 0 && conn.h2->pending_stream == 0)
+    if (conn.h2->pending_stream != 0)
+        h2_pin_held_stream_config(conn, conn.h2->pending_route_config);
+    else if (conn.h2->async_stream == 0)
         h2_async_epoch_leave(loop, conn);
 
     // No output and a partial frame that fills the whole recv buffer => the peer
@@ -1792,7 +1845,8 @@ void h2_resume_jit_handler(Loop* loop, Connection& conn) {
                                                            *ctx,
                                                            h2->pending_synth,
                                                            h2->async_synth_len,
-                                                           /*arena=*/nullptr);
+                                                           /*arena=*/nullptr,
+                                                           &h2->async_replay_context);
 
     // Another wait(): keep the stream parked and re-arm without flushing.
     if (kOutcome.kind == JitDispatchOutcome::Kind::TimerYield) {

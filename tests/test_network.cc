@@ -7,6 +7,7 @@
 #include "rut/runtime/iouring_event_loop.h"
 #include "rut/runtime/rate_limit.h"
 #include "rut/runtime/route_table.h"
+#include "rut/runtime/signal_wait.h"
 #include "rut/runtime/simd/simd.h"
 #include "rut/runtime/slab_pool.h"
 #include "rut/runtime/slice_pool.h"
@@ -21,11 +22,19 @@
 #include <thread>
 
 #include <errno.h>
+#include <signal.h>
 #include <sys/socket.h>
 
 using rut::test_fault::ScopedFakeSocket;
 using rut::test_fault::ScopedMemoryFault;
 using rut::test_fault::ScopedRecvData;
+
+TEST(signal_wait, classifies_saved_errno_without_observing_global_errno) {
+    CHECK_FALSE(signal_wait_failed(-1, EAGAIN));
+    CHECK_FALSE(signal_wait_failed(-1, EINTR));
+    CHECK_FALSE(signal_wait_failed(SIGTERM, 0));
+    CHECK(signal_wait_failed(-1, EINVAL));
+}
 
 // === Accept ===
 
@@ -1162,6 +1171,269 @@ TEST(websocket, upgrade_101_sent_preserves_early_only_upstream_bytes) {
     CHECK_EQ(loop.backend.ops[1].send_len, sizeof(early_bytes));
     CHECK_EQ(loop.backend.ops[2].type, MockOp::PauseUpstreamRecv);
     CHECK_EQ(loop.backend.ops[2].conn_id, conn->id);
+}
+
+// A terminate-mode Close must echo to both peers and retain the connection until
+// each close-frame send completes. This directly exercises the close driver plus
+// both terminate-mode completion callbacks.
+TEST(websocket, terminate_close_handshake_waits_for_both_echoes) {
+    SmallLoop loop;
+    loop.setup();
+    loop.inject_and_dispatch(make_ev(0, IoEventType::Accept, 42));
+    auto* conn = loop.find_fd(42);
+    REQUIRE(conn != nullptr);
+    conn->is_ws_tunnel = true;
+    conn->is_ws_terminate = true;
+    conn->upstream_fd = 43;
+    conn->ws_closing = true;
+    conn->ws_close_client_need = true;
+    conn->ws_close_upstream_need = true;
+    conn->ws_echo_close_code = 1000;
+    const u32 cid = conn->id;
+
+    loop.backend.op_count = 0;
+    REQUIRE(ws_drive_close(&loop, *conn));
+    REQUIRE_EQ(loop.backend.op_count, 2u);
+    CHECK_EQ(loop.backend.ops[0].type, MockOp::Send);
+    CHECK_EQ(loop.backend.ops[0].fd, 42);
+    CHECK_EQ(loop.backend.ops[1].type, MockOp::Send);
+    CHECK_EQ(loop.backend.ops[1].fd, 43);
+    CHECK(conn->ws_close_client_inflight);
+    CHECK(conn->ws_close_upstream_inflight);
+
+    on_ws_client_to_upstream_sent<SmallLoop>(
+        &loop, *conn, make_ev(cid, IoEventType::UpstreamSend, 4));
+    CHECK_EQ(loop.conns[cid].fd, 42);  // client echo still in flight
+    CHECK(!conn->ws_close_upstream_inflight);
+
+    on_ws_upstream_to_client_sent<SmallLoop>(&loop, *conn, make_ev(cid, IoEventType::Send, 4));
+    CHECK_EQ(loop.conns[cid].fd, -1);  // both close echoes drained
+}
+
+TEST(websocket, terminate_forwards_complete_frames_and_rearms_both_directions) {
+    SmallLoop loop;
+    loop.setup();
+    loop.inject_and_dispatch(make_ev(0, IoEventType::Accept, 42));
+    auto* conn = loop.find_fd(42);
+    REQUIRE(conn != nullptr);
+    REQUIRE(loop.alloc_upstream_buf(*conn));
+    conn->is_ws_tunnel = true;
+    conn->is_ws_terminate = true;
+    conn->upstream_fd = 43;
+    conn->ws_c2u.masked = true;
+    conn->ws_c2u.from_client = true;
+    conn->ws_u2c.masked = false;
+    conn->ws_max_message_size = 64;
+    conn->ws_c2u.max_message_size = 64;
+    conn->ws_u2c.max_message_size = 64;
+    u8 c2u_msg[64] = {};
+    u8 u2c_msg[64] = {};
+    conn->ws_c2u_msg = c2u_msg;
+    conn->ws_u2c_msg = u2c_msg;
+    const rut::WsMessageHandlerFn forward =
+        +[](void*, rut::WsOpcode, const rut::u8*, rut::u64, bool) {
+            return rut::WsFrameAction::Forward;
+        };
+    conn->ws_handler = forward;
+    const u32 cid = conn->id;
+
+    // Masked client Binary("HI") frame. Terminate mode parses and re-masks it for the backend.
+    const u8 client_frame[] = {0x82, 0x82, 1, 2, 3, 4, 'H' ^ 1, 'I' ^ 2};
+    REQUIRE_EQ(conn->recv_buf.write(client_frame, sizeof(client_frame)), sizeof(client_frame));
+    loop.backend.op_count = 0;
+    on_ws_client_recv<SmallLoop>(
+        &loop, *conn, make_ev(cid, IoEventType::Recv, static_cast<i32>(sizeof(client_frame))));
+    REQUIRE_EQ(loop.backend.op_count, 2u);
+    CHECK_EQ(loop.backend.ops[0].type, MockOp::Send);
+    CHECK_EQ(loop.backend.ops[0].fd, 43);
+    CHECK_EQ(loop.backend.ops[1].type, MockOp::PauseRecv);
+
+    loop.backend.op_count = 0;
+    on_ws_client_to_upstream_sent<SmallLoop>(
+        &loop, *conn, make_ev(cid, IoEventType::UpstreamSend, 8));
+    CHECK_EQ(conn->recv_buf.len(), 0u);
+    REQUIRE_EQ(loop.backend.op_count, 1u);
+    CHECK_EQ(loop.backend.ops[0].type, MockOp::Recv);
+    CHECK_EQ(loop.backend.ops[0].fd, 42);
+
+    // Unmasked backend Binary("OK") frame. The client-facing frame remains unmasked.
+    const u8 upstream_frame[] = {0x82, 0x02, 'O', 'K'};
+    REQUIRE_EQ(conn->upstream_recv_buf.write(upstream_frame, sizeof(upstream_frame)),
+               sizeof(upstream_frame));
+    loop.backend.op_count = 0;
+    on_ws_upstream_recv<SmallLoop>(
+        &loop,
+        *conn,
+        make_ev(cid, IoEventType::UpstreamRecv, static_cast<i32>(sizeof(upstream_frame))));
+    REQUIRE_EQ(loop.backend.op_count, 2u);
+    CHECK_EQ(loop.backend.ops[0].type, MockOp::Send);
+    CHECK_EQ(loop.backend.ops[0].fd, 42);
+    CHECK_EQ(loop.backend.ops[1].type, MockOp::PauseUpstreamRecv);
+
+    loop.backend.op_count = 0;
+    on_ws_upstream_to_client_sent<SmallLoop>(&loop, *conn, make_ev(cid, IoEventType::Send, 4));
+    CHECK_EQ(conn->upstream_recv_buf.len(), 0u);
+    REQUIRE_EQ(loop.backend.op_count, 1u);
+    CHECK_EQ(loop.backend.ops[0].type, MockOp::Recv);
+    CHECK_EQ(loop.backend.ops[0].fd, 43);
+}
+
+TEST(websocket, terminate_drops_complete_frames_and_keeps_both_receives_armed) {
+    SmallLoop loop;
+    loop.setup();
+    loop.inject_and_dispatch(make_ev(0, IoEventType::Accept, 42));
+    auto* conn = loop.find_fd(42);
+    REQUIRE(conn != nullptr);
+    REQUIRE(loop.alloc_upstream_buf(*conn));
+    conn->is_ws_tunnel = true;
+    conn->is_ws_terminate = true;
+    conn->upstream_fd = 43;
+    conn->ws_c2u.masked = true;
+    conn->ws_c2u.from_client = true;
+    conn->ws_u2c.masked = false;
+    conn->ws_max_message_size = 64;
+    conn->ws_c2u.max_message_size = 64;
+    conn->ws_u2c.max_message_size = 64;
+    u8 c2u_msg[64] = {};
+    u8 u2c_msg[64] = {};
+    conn->ws_c2u_msg = c2u_msg;
+    conn->ws_u2c_msg = u2c_msg;
+    const rut::WsMessageHandlerFn drop = +[](void*, rut::WsOpcode, const rut::u8*, rut::u64, bool) {
+        return rut::WsFrameAction::Drop;
+    };
+    conn->ws_handler = drop;
+    const u32 cid = conn->id;
+
+    const u8 client_frame[] = {0x82, 0x82, 1, 2, 3, 4, 'H' ^ 1, 'I' ^ 2};
+    REQUIRE_EQ(conn->recv_buf.write(client_frame, sizeof(client_frame)), sizeof(client_frame));
+    loop.backend.op_count = 0;
+    on_ws_client_recv<SmallLoop>(
+        &loop, *conn, make_ev(cid, IoEventType::Recv, static_cast<i32>(sizeof(client_frame))));
+    CHECK_EQ(conn->recv_buf.len(), 0u);
+    REQUIRE_EQ(loop.backend.op_count, 1u);
+    CHECK_EQ(loop.backend.ops[0].type, MockOp::Recv);
+    CHECK_EQ(loop.backend.ops[0].fd, 42);
+
+    const u8 upstream_frame[] = {0x82, 0x02, 'O', 'K'};
+    REQUIRE_EQ(conn->upstream_recv_buf.write(upstream_frame, sizeof(upstream_frame)),
+               sizeof(upstream_frame));
+    loop.backend.op_count = 0;
+    on_ws_upstream_recv<SmallLoop>(
+        &loop,
+        *conn,
+        make_ev(cid, IoEventType::UpstreamRecv, static_cast<i32>(sizeof(upstream_frame))));
+    CHECK_EQ(conn->upstream_recv_buf.len(), 0u);
+    REQUIRE_EQ(loop.backend.op_count, 1u);
+    CHECK_EQ(loop.backend.ops[0].type, MockOp::Recv);
+    CHECK_EQ(loop.backend.ops[0].fd, 43);
+}
+
+TEST(websocket, terminate_client_close_starts_and_completes_echo_handshake) {
+    SmallLoop loop;
+    loop.setup();
+    loop.inject_and_dispatch(make_ev(0, IoEventType::Accept, 42));
+    auto* conn = loop.find_fd(42);
+    REQUIRE(conn != nullptr);
+    REQUIRE(loop.alloc_upstream_buf(*conn));
+    conn->is_ws_tunnel = true;
+    conn->is_ws_terminate = true;
+    conn->upstream_fd = 43;
+    conn->ws_c2u.masked = true;
+    conn->ws_c2u.from_client = true;
+    conn->ws_c2u.max_message_size = 64;
+    conn->ws_u2c.max_message_size = 64;
+    u8 c2u_msg[64] = {};
+    u8 u2c_msg[64] = {};
+    conn->ws_c2u_msg = c2u_msg;
+    conn->ws_u2c_msg = u2c_msg;
+    const u32 cid = conn->id;
+
+    // Masked Close(1000) from the client. The forward close goes upstream and
+    // the generated unmasked echo goes back to the client immediately.
+    const u8 close_frame[] = {0x88, 0x82, 1, 2, 3, 4, 0x03 ^ 1, 0xe8 ^ 2};
+    REQUIRE_EQ(conn->recv_buf.write(close_frame, sizeof(close_frame)), sizeof(close_frame));
+    loop.backend.op_count = 0;
+    on_ws_client_recv<SmallLoop>(
+        &loop, *conn, make_ev(cid, IoEventType::Recv, static_cast<i32>(sizeof(close_frame))));
+    REQUIRE_EQ(loop.backend.op_count, 2u);
+    CHECK_EQ(loop.backend.ops[0].type, MockOp::Send);
+    CHECK_EQ(loop.backend.ops[0].fd, 43);
+    CHECK_EQ(loop.backend.ops[1].type, MockOp::Send);
+    CHECK_EQ(loop.backend.ops[1].fd, 42);
+    CHECK(conn->ws_closing);
+    CHECK(conn->ws_close_upstream_inflight);
+    CHECK(conn->ws_close_client_inflight);
+
+    on_ws_client_to_upstream_sent<SmallLoop>(
+        &loop, *conn, make_ev(cid, IoEventType::UpstreamSend, 8));
+    CHECK_EQ(loop.conns[cid].fd, 42);
+    CHECK(!conn->ws_close_upstream_inflight);
+
+    on_ws_upstream_to_client_sent<SmallLoop>(&loop, *conn, make_ev(cid, IoEventType::Send, 4));
+    CHECK_EQ(loop.conns[cid].fd, -1);
+}
+
+TEST(websocket, terminate_discards_partial_frames_after_peer_fin) {
+    SmallLoop loop;
+    loop.setup();
+    loop.inject_and_dispatch(make_ev(0, IoEventType::Accept, 42));
+    auto* conn = loop.find_fd(42);
+    REQUIRE(conn != nullptr);
+    REQUIRE(loop.alloc_upstream_buf(*conn));
+    conn->is_ws_tunnel = true;
+    conn->is_ws_terminate = true;
+    conn->upstream_fd = 43;
+    conn->ws_c2u.masked = true;
+    conn->ws_c2u.from_client = true;
+    conn->ws_u2c.masked = false;
+    conn->ws_max_message_size = 64;
+    u8 c2u_msg[64] = {};
+    u8 u2c_msg[64] = {};
+    conn->ws_c2u_msg = c2u_msg;
+    conn->ws_u2c_msg = u2c_msg;
+
+    const u8 partial_header[] = {0x82};
+    REQUIRE_EQ(conn->recv_buf.write(partial_header, sizeof(partial_header)),
+               sizeof(partial_header));
+    conn->ws_client_eof = true;
+    CHECK(ws_try_send_client_to_upstream(&loop, *conn));
+    CHECK_EQ(conn->recv_buf.len(), 0u);
+
+    REQUIRE_EQ(conn->upstream_recv_buf.write(partial_header, sizeof(partial_header)),
+               sizeof(partial_header));
+    CHECK(ws_try_send_upstream_to_client(&loop, *conn));
+    CHECK_EQ(conn->upstream_recv_buf.len(), 0u);
+}
+
+TEST(websocket, terminate_send_completions_drain_before_closing) {
+    SmallLoop client_loop;
+    client_loop.setup();
+    client_loop.inject_and_dispatch(make_ev(0, IoEventType::Accept, 42));
+    auto* client_conn = client_loop.find_fd(42);
+    REQUIRE(client_conn != nullptr);
+    client_conn->is_ws_tunnel = true;
+    client_conn->is_ws_terminate = true;
+    client_conn->upstream_fd = 43;
+    client_conn->ws_client_send_pending = true;
+    client_conn->ws_client_eof = true;
+    on_ws_client_to_upstream_sent<SmallLoop>(
+        &client_loop, *client_conn, make_ev(client_conn->id, IoEventType::UpstreamSend, 1));
+    CHECK_EQ(client_loop.conns[client_conn->id].fd, -1);
+
+    SmallLoop upstream_loop;
+    upstream_loop.setup();
+    upstream_loop.inject_and_dispatch(make_ev(0, IoEventType::Accept, 52));
+    auto* upstream_conn = upstream_loop.find_fd(52);
+    REQUIRE(upstream_conn != nullptr);
+    REQUIRE(upstream_loop.alloc_upstream_buf(*upstream_conn));
+    upstream_conn->is_ws_tunnel = true;
+    upstream_conn->is_ws_terminate = true;
+    upstream_conn->upstream_fd = 53;
+    upstream_conn->ws_upstream_send_pending = true;
+    upstream_conn->ws_upstream_eof = true;
+    on_ws_upstream_to_client_sent<SmallLoop>(
+        &upstream_loop, *upstream_conn, make_ev(upstream_conn->id, IoEventType::Send, 1));
+    CHECK_EQ(upstream_loop.conns[upstream_conn->id].fd, -1);
 }
 
 // Bytes that race into recv_buf while a client→upstream tunnel send is in flight
@@ -4778,6 +5050,21 @@ TEST(route, rir_function_needs_req_body_guard_paths) {
     fn.yield_kinds = &yield_kind;
     insts[0].op = rir::Opcode::YieldTimer;
     CHECK(rir_function_can_forward_buffered(fn));
+
+    yield_kind = static_cast<u8>(jit::YieldKind::Timer);
+    insts[0].op = rir::Opcode::RetForwardBuffered;
+    CHECK(rir_function_can_forward_buffered(fn));
+    fn.blocks = nullptr;
+    CHECK_FALSE(rir_function_can_forward_buffered(fn));
+    fn.yield_kinds = nullptr;
+    CHECK_FALSE(rir_function_can_forward_buffered(fn));
+    fn.blocks = blocks;
+
+    CHECK_FALSE(rir_function_needs_control_plane_snapshot(fn));
+    insts[0].op = rir::Opcode::JsonAppendControlPlane;
+    CHECK(rir_function_needs_control_plane_snapshot(fn));
+    fn.blocks = nullptr;
+    CHECK_FALSE(rir_function_needs_control_plane_snapshot(fn));
 }
 
 TEST(route, populate_route_config_rejects_malformed_runtime_tables) {
@@ -13680,6 +13967,32 @@ TEST(state_invariant, h2_async_epoch_retains_episode_pin_across_config_change) {
     h2_async_epoch_leave(&loop, conn);
     CHECK_FALSE(conn.epoch_held);
     CHECK_EQ(old_pins.http2_streams.load(std::memory_order_acquire), 0u);
+}
+
+TEST(state_invariant, h2_held_stream_pin_transfers_to_new_episode_config) {
+    SmallLoop loop;
+    loop.setup();
+    Connection conn{};
+    conn.reset();
+    RouteConfig old_config{};
+    RouteConfig new_config{};
+    ProgramPinCounters old_pins{};
+    ProgramPinCounters new_pins{};
+    old_config.program_pins = &old_pins;
+    new_config.program_pins = &new_pins;
+
+    h2_process_epoch_enter(&loop, conn);
+    h2_pin_held_stream_config(conn, &old_config);
+    CHECK_EQ(old_pins.http2_streams.load(std::memory_order_acquire), 1u);
+    CHECK_EQ(new_pins.http2_streams.load(std::memory_order_acquire), 0u);
+
+    h2_pin_held_stream_config(conn, &new_config);
+    CHECK_EQ(conn.http2_program_pin_config, &new_config);
+    CHECK_EQ(old_pins.http2_streams.load(std::memory_order_acquire), 0u);
+    CHECK_EQ(new_pins.http2_streams.load(std::memory_order_acquire), 1u);
+
+    h2_async_epoch_leave(&loop, conn);
+    CHECK_EQ(new_pins.http2_streams.load(std::memory_order_acquire), 0u);
 }
 
 TEST(state_invariant, h2_followup_proxy_flush_releases_prior_capture) {

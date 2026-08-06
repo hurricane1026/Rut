@@ -1454,6 +1454,7 @@ void on_header_received(void* lp, Connection& conn, IoEvent ev) {
     // the new request's req_start_us lands in the same microsecond.
     conn.handler_gen++;
     conn.req_start_us = monotonic_us();
+    conn.assign_upstream_mark_replay_admission();
     // Per-request proxy state must start clean on EVERY request. reset() runs
     // only at connection alloc, so on a keep-alive-reused connection these flags
     // would otherwise leak from the previous request: a prior forward(set_path:)
@@ -1742,7 +1743,8 @@ void on_header_received(void* lp, Connection& conn, IoEvent ev) {
         conn.transition_to_exec_handler_wait();
         auto* ctx = conn.reset_jit_ctx();
         if (route->needs_control_plane_snapshot) latch_control_plane_snapshot(loop, ctx);
-        latch_control_plane_mutation(loop, ctx, config != nullptr ? config->config_generation : 0);
+        latch_control_plane_mutation(
+            loop, ctx, config != nullptr ? config->config_generation : 0, &conn.replay_context);
         ctx->state = 0;
         ctx->resume_event_kind = static_cast<u32>(jit::YieldKind::Timer);
         ctx->resume_event_result = 0;
@@ -1754,7 +1756,8 @@ void on_header_received(void* lp, Connection& conn, IoEvent ev) {
                                           *ctx,
                                           conn.recv_buf.data(),
                                           conn.recv_buf.len(),
-                                          /*arena=*/nullptr);
+                                          /*arena=*/nullptr,
+                                          &conn.replay_context);
         handle_jit_outcome<Loop>(loop, conn, outcome, route->fn, kKeepAlive);
     } else {
         conn.resp_status = kStatusOK;
@@ -1814,7 +1817,8 @@ void on_jit_request_body_recvd(void* lp, Connection& conn, IoEvent ev) {
     conn.transition_to_exec_handler_wait();
     auto* ctx = conn.reset_jit_ctx();
     if (route->needs_control_plane_snapshot) latch_control_plane_snapshot(loop, ctx);
-    latch_control_plane_mutation(loop, ctx, config != nullptr ? config->config_generation : 0);
+    latch_control_plane_mutation(
+        loop, ctx, config != nullptr ? config->config_generation : 0, &conn.replay_context);
     ctx->state = 0;
     ctx->resume_event_kind = static_cast<u32>(jit::YieldKind::Timer);
     ctx->resume_event_result = 0;
@@ -1826,7 +1830,8 @@ void on_jit_request_body_recvd(void* lp, Connection& conn, IoEvent ev) {
                                       *ctx,
                                       conn.recv_buf.data(),
                                       conn.recv_buf.len(),
-                                      /*arena=*/nullptr);
+                                      /*arena=*/nullptr,
+                                      &conn.replay_context);
     handle_jit_outcome<Loop>(loop, conn, outcome, route->fn, conn.keep_alive);
 }
 
@@ -2716,7 +2721,8 @@ void resume_jit_handler(Loop* loop, Connection& conn) {
                                       *ctx,
                                       request_data,
                                       request_len,
-                                      /*arena=*/nullptr);
+                                      /*arena=*/nullptr,
+                                      &conn.replay_context);
     handle_jit_outcome<Loop>(loop, conn, outcome, fn, conn.keep_alive);
 }
 

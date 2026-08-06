@@ -30,6 +30,19 @@ using namespace rut::jit;
 
 extern "C" u32 rut_helper_regex_scratch_cache_entry_count_for_test();
 
+struct ReplayEventCapture {
+    UpstreamMarkReplayEvent events[4]{};
+    UpstreamMarkReplayEvent event{};
+    u32 count = 0;
+};
+
+static void capture_replay_event(void* context, const UpstreamMarkReplayEvent& event) {
+    auto* capture = static_cast<ReplayEventCapture*>(context);
+    if (capture->count < 4) capture->events[capture->count] = event;
+    capture->event = event;
+    capture->count++;
+}
+
 // ── Helpers ────────────────────────────────────────────────────────
 
 static Str lit(const char* s) {
@@ -165,6 +178,234 @@ static const char kGetApiQueryRequest[] =
     "GET /api/users?x=1 HTTP/1.1\r\n"
     "Host: localhost\r\n"
     "\r\n";
+
+TEST(marking_policy, selected_array_carriers_preserve_server_provenance) {
+    const rir::Type i64_type{rir::TypeKind::I64, nullptr, nullptr};
+    const rir::Type bool_type{rir::TypeKind::Bool, nullptr, nullptr};
+    const rir::Type array_type{rir::TypeKind::Array, &i64_type, nullptr};
+    rir::Value values[6] = {{&i64_type, {0}, 0},
+                            {&array_type, {0}, 1},
+                            {&bool_type, {0}, 2},
+                            {&i64_type, {0}, 3},
+                            {&array_type, {0}, 4},
+                            {&array_type, {0}, 5}};
+    rir::Instruction instructions[6]{};
+    instructions[0].op = rir::Opcode::ConstI64;
+    instructions[0].result = {0};
+    instructions[0].imm.i64_val = rir::encode_server_token(0, 0);
+    instructions[1].op = rir::Opcode::ArrayCreate;
+    instructions[1].result = {1};
+    instructions[1].operand_count = 1;
+    instructions[1].operands[0] = {0};
+    instructions[2].op = rir::Opcode::ConstBool;
+    instructions[2].result = {2};
+    instructions[2].imm.bool_val = true;
+    instructions[3].op = rir::Opcode::ConstI64;
+    instructions[3].result = {3};
+    instructions[4].op = rir::Opcode::ArrayCreate;
+    instructions[4].result = {4};
+    instructions[4].operand_count = 1;
+    instructions[4].operands[0] = {3};
+    instructions[5].op = rir::Opcode::Select;
+    instructions[5].result = {5};
+    instructions[5].operand_count = 3;
+    instructions[5].operands[0] = {2};
+    instructions[5].operands[1] = {4};
+    instructions[5].operands[2] = {1};
+    rir::Block block{{0}, {}, instructions, 6, 6};
+    rir::Function function{};
+    function.blocks = &block;
+    function.block_count = 1;
+    function.block_cap = 1;
+    function.values = values;
+    function.value_count = 6;
+    function.value_cap = 6;
+
+    CHECK(marking_policy_array_flows_to_source(function, {5}, {0}, 0));
+    bool has_indices[1] = {false};
+    u32 indices[1] = {0};
+    u8 select_state[6]{};
+    u8 select_result[6]{};
+    MarkingPolicySourceSearch search{32, select_state, select_result, 6, false};
+    CHECK(marking_policy_array_element_path_flows_to_source(
+        function, {5}, has_indices, indices, 0, {0}, 0, &search));
+}
+
+TEST(marking_policy, selected_struct_and_array_carriers_preserve_server_provenance) {
+    const rir::Type i64_type{rir::TypeKind::I64, nullptr, nullptr};
+    const rir::Type bool_type{rir::TypeKind::Bool, nullptr, nullptr};
+    alignas(rir::StructDef) u8 storage[sizeof(rir::StructDef) + sizeof(rir::FieldDef)]{};
+    auto* definition = reinterpret_cast<rir::StructDef*>(storage);
+    definition->name = Str{"Server", 6};
+    definition->field_count = 1;
+    definition->field_capacity = 1;
+    definition->fields()[0] = rir::FieldDef{Str{"id", 2}, &i64_type};
+    const rir::Type struct_type{rir::TypeKind::Struct, nullptr, definition};
+    const rir::Type array_type{rir::TypeKind::Array, &struct_type, nullptr};
+    rir::Value values[9] = {{&i64_type, {0}, 0},
+                            {&i64_type, {0}, 1},
+                            {&struct_type, {0}, 2},
+                            {&struct_type, {0}, 3},
+                            {&array_type, {0}, 4},
+                            {&array_type, {0}, 5},
+                            {&bool_type, {0}, 6},
+                            {&array_type, {0}, 7},
+                            {&struct_type, {0}, 8}};
+    rir::Instruction instructions[9]{};
+    instructions[0].op = rir::Opcode::ConstI64;
+    instructions[0].result = {0};
+    instructions[0].imm.i64_val = rir::encode_server_token(0, 0);
+    instructions[1].op = rir::Opcode::ConstI64;
+    instructions[1].result = {1};
+    instructions[2].op = rir::Opcode::StructCreate;
+    instructions[2].result = {2};
+    instructions[2].operand_count = 1;
+    instructions[2].operands[0] = {0};
+    instructions[2].imm.struct_ref.type = &struct_type;
+    instructions[3].op = rir::Opcode::StructCreate;
+    instructions[3].result = {3};
+    instructions[3].operand_count = 1;
+    instructions[3].operands[0] = {1};
+    instructions[3].imm.struct_ref.type = &struct_type;
+    instructions[4].op = rir::Opcode::ArrayCreate;
+    instructions[4].result = {4};
+    instructions[4].operand_count = 1;
+    instructions[4].operands[0] = {2};
+    instructions[5].op = rir::Opcode::ArrayCreate;
+    instructions[5].result = {5};
+    instructions[5].operand_count = 1;
+    instructions[5].operands[0] = {3};
+    instructions[6].op = rir::Opcode::ConstBool;
+    instructions[6].result = {6};
+    instructions[6].imm.bool_val = true;
+    instructions[7].op = rir::Opcode::Select;
+    instructions[7].result = {7};
+    instructions[7].operand_count = 3;
+    instructions[7].operands[0] = {6};
+    instructions[7].operands[1] = {5};
+    instructions[7].operands[2] = {4};
+    instructions[8].op = rir::Opcode::Select;
+    instructions[8].result = {8};
+    instructions[8].operand_count = 3;
+    instructions[8].operands[0] = {6};
+    instructions[8].operands[1] = {3};
+    instructions[8].operands[2] = {2};
+    rir::Block block{{0}, {}, instructions, 9, 9};
+    rir::Function function{};
+    function.blocks = &block;
+    function.block_count = 1;
+    function.block_cap = 1;
+    function.values = values;
+    function.value_count = 9;
+    function.value_cap = 9;
+    u8 select_state[9]{};
+    u8 select_result[9]{};
+    MarkingPolicySourceSearch search{64, select_state, select_result, 9, false};
+    const Str fields[] = {{"id", 2}};
+    const bool has_indices[] = {false};
+    const u32 indices[] = {0};
+
+    CHECK(marking_policy_array_struct_field_flows_to_source(
+        function, {7}, false, 0, fields[0], {0}, 0, &search));
+    CHECK(marking_policy_array_struct_field_path_flows_to_source(
+        function, {7}, has_indices, indices, 0, fields, 0, {0}, 0, &search));
+    CHECK(marking_policy_struct_field_path_flows_to_source(
+        function, {8}, fields, 0, {0}, 0, &search));
+    CHECK(marking_policy_struct_field_flows_to_source(function, {8}, fields[0], {0}, 0, &search));
+}
+
+TEST(marking_policy, type_equality_distinguishes_struct_definitions) {
+    rir::StructDef first_definition{};
+    rir::StructDef second_definition{};
+    const rir::Type first_struct{rir::TypeKind::Struct, nullptr, &first_definition};
+    const rir::Type second_struct{rir::TypeKind::Struct, nullptr, &second_definition};
+    const rir::Type first_i64{rir::TypeKind::I64, nullptr, nullptr};
+    const rir::Type second_i64{rir::TypeKind::I64, nullptr, nullptr};
+
+    CHECK_FALSE(marking_policy_types_equal(&first_struct, &second_struct));
+    CHECK(marking_policy_types_equal(&first_i64, &second_i64));
+}
+
+TEST(marking_policy, side_effect_only_instructions_require_no_result_value) {
+    const rir::Opcode operations[] = {rir::Opcode::RespRemoveHeader,
+                                      rir::Opcode::RespCommitHeaders,
+                                      rir::Opcode::JsonReset,
+                                      rir::Opcode::JsonAppendRaw,
+                                      rir::Opcode::JsonAppendControlPlane,
+                                      rir::Opcode::JsonFinish};
+    rir::Function function{};
+
+    for (rir::Opcode operation : operations) {
+        rir::Instruction instruction{};
+        instruction.op = operation;
+        instruction.result = rir::kNoValue;
+        CHECK(marking_policy_instruction_types_valid(function, instruction));
+    }
+}
+
+TEST(marking_policy, optional_array_struct_carrier_preserves_server_provenance) {
+    const rir::Type i64_type{rir::TypeKind::I64, nullptr, nullptr};
+    alignas(rir::StructDef) u8 storage[sizeof(rir::StructDef) + sizeof(rir::FieldDef)]{};
+    auto* definition = reinterpret_cast<rir::StructDef*>(storage);
+    definition->name = Str{"Server", 6};
+    definition->field_count = 1;
+    definition->field_capacity = 1;
+    definition->fields()[0] = rir::FieldDef{Str{"id", 2}, &i64_type};
+    const rir::Type struct_type{rir::TypeKind::Struct, nullptr, definition};
+    const rir::Type array_type{rir::TypeKind::Array, &struct_type, nullptr};
+    const rir::Type optional_array_type{rir::TypeKind::Optional, &array_type, nullptr};
+    rir::Value values[4] = {{&i64_type, {0}, 0},
+                            {&struct_type, {0}, 1},
+                            {&array_type, {0}, 2},
+                            {&optional_array_type, {0}, 3}};
+    rir::Instruction instructions[4]{};
+    instructions[0].op = rir::Opcode::ConstI64;
+    instructions[0].result = {0};
+    instructions[0].imm.i64_val = rir::encode_server_token(0, 0);
+    instructions[1].op = rir::Opcode::StructCreate;
+    instructions[1].result = {1};
+    instructions[1].operand_count = 1;
+    instructions[1].operands[0] = {0};
+    instructions[1].imm.struct_ref.type = &struct_type;
+    instructions[2].op = rir::Opcode::ArrayCreate;
+    instructions[2].result = {2};
+    instructions[2].operand_count = 1;
+    instructions[2].operands[0] = {1};
+    instructions[3].op = rir::Opcode::OptWrap;
+    instructions[3].result = {3};
+    instructions[3].operand_count = 1;
+    instructions[3].operands[0] = {2};
+    rir::Block block{{0}, {}, instructions, 4, 4};
+    rir::Function function{};
+    function.blocks = &block;
+    function.block_count = 1;
+    function.block_cap = 1;
+    function.values = values;
+    function.value_count = 4;
+    function.value_cap = 4;
+    u8 state[4]{};
+    u8 result[4]{};
+    MarkingPolicySourceSearch search{32, state, result, 4, false};
+
+    CHECK(marking_policy_array_struct_field_flows_to_source(
+        function, {3}, false, 0, {"id", 2}, {0}, 0, &search));
+}
+
+TEST(marking_policy, missing_cache_declaration_changes_policy_identity) {
+    rir::Module module{};
+    rir::Instruction instruction{};
+    instruction.op = rir::Opcode::CacheGet;
+    instruction.imm.i32_val = 7;
+    rir::Block block{{0}, {}, &instruction, 1, 1};
+    rir::Function function{};
+    function.blocks = &block;
+    function.block_count = 1;
+    function.block_cap = 1;
+
+    const u64 first = marking_policy_identity(module, function);
+    instruction.imm.i32_val = 8;
+    CHECK_NE(first, marking_policy_identity(module, function));
+}
 
 static const char kGetRootRequest[] =
     "GET / HTTP/1.1\r\n"
@@ -1448,7 +1689,10 @@ TEST(jit, control_plane_mutation_helpers_fail_closed_and_delegate_to_explicit_po
     RouteConfig mutation_config;
     REQUIRE(mutation_config.add_upstream("test", 0x7f000001u, 8000));
     mutation.reset(6, false, &mutation_config);
+    ReplayEventCapture replay_events;
+    mutation.set_upstream_mark_replay_sink(&capture_replay_event, &replay_events);
     frame.ctx.control_plane_mutation = &mutation;
+    set_active_upstream_mark_replay_context(3);
     CHECK_EQ(rut_helper_reload_request(&frame.ctx), 0u);
     REQUIRE(mutation.set_route_reload_enabled(true));
     CHECK_EQ(rut_helper_reload_request(&frame.ctx), 1u);
@@ -1456,6 +1700,13 @@ TEST(jit, control_plane_mutation_helpers_fail_closed_and_delegate_to_explicit_po
     CHECK_EQ(rut_helper_upstream_mark(&frame.ctx, 5, 0, 0, 1), 0u);
     CHECK_EQ(rut_helper_upstream_mark(&frame.ctx, 6, 0, 0, 2), 0u);
     CHECK_EQ(rut_helper_upstream_mark(&frame.ctx, 6, 0, 0, 0), 1u);
+    REQUIRE_EQ(replay_events.count, 2u);
+    CHECK_EQ(replay_events.events[0].reason, UpstreamMarkReplayReason::StaleOrForeign);
+    CHECK_EQ(replay_events.events[0].accepted, false);
+    CHECK_EQ(replay_events.events[1].reason, UpstreamMarkReplayReason::Published);
+    CHECK_EQ(replay_events.events[1].accepted, true);
+    CHECK_EQ(replay_events.events[1].source_shard_id, 3u);
+    CHECK(replay_events.events[1].workload_event_position != 0u);
     CHECK_EQ(mutation.manual_health({6, 0, 0}), ManualHealthOverride::Unhealthy);
     CHECK_EQ(rut_helper_upstream_mark_checked(&frame.ctx, 6, 1, 0, 0, 1), 0u);
     CHECK_EQ(mutation.manual_health({6, 0, 0}), ManualHealthOverride::Unhealthy);
