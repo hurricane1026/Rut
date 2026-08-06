@@ -1992,6 +1992,58 @@ TEST(h2_serving, unmatched_route_defers_declared_body_before_default_response) {
     CHECK(decoded[0].value.eq(Str{"200", 3}));
 }
 
+TEST(h2_serving, buffered_body_overflow_rejects_non_jit_deferred_route) {
+    Http2Conn h2;
+    h2.init();
+    Connection conn;
+    conn.reset();
+    conn.h2 = &h2;
+    FakeH2Loop loop;
+    u8 response[256]{};
+    H2Dispatch<FakeH2Loop> dispatch{&loop, &conn, response, sizeof(response), 0, false};
+    h2.pending_stream = 1;
+    h2.pending_overflow = true;
+    h2.pending_buffer_body = true;
+    h2.pending_route_action = RouteAction::Static;
+
+    h2_finish_body(dispatch, 1);
+
+    CHECK_EQ(h2.pending_stream, 0u);
+    REQUIRE_GT(dispatch.resp_len, 0u);
+}
+
+TEST(h2_serving, body_independent_jit_discards_overflowed_buffer) {
+    Http2Conn h2;
+    h2.init();
+    Connection conn;
+    conn.reset();
+    conn.h2 = &h2;
+    FakeH2Loop loop;
+    u8 response[256]{};
+    H2Dispatch<FakeH2Loop> dispatch{&loop, &conn, response, sizeof(response), 0, false};
+    RouteEntry route{};
+    route.action = RouteAction::JitHandler;
+    route.fn = &h2_status_204;
+    route.needs_req_body = false;
+    static constexpr char kHeaders[] = "POST /upload HTTP/1.1\r\nhost: example\r\n\r\n";
+    __builtin_memcpy(h2.pending_synth, kHeaders, sizeof(kHeaders) - 1);
+    h2.pending_stream = 1;
+    h2.pending_overflow = true;
+    h2.pending_buffer_body = true;
+    h2.pending_route_action = RouteAction::JitHandler;
+    h2.pending_route = &route;
+    h2.pending_jit_fn = route.fn;
+    h2.pending_body_start = sizeof(kHeaders) - 1;
+    h2.pending_synth_len = sizeof(kHeaders) - 1;
+    h2.pending_body_len = 17;
+
+    h2_finish_body(dispatch, 1);
+
+    CHECK_FALSE(h2.pending_overflow);
+    CHECK_EQ(h2.pending_stream, 0u);
+    REQUIRE_GT(dispatch.resp_len, 0u);
+}
+
 TEST(h2_serving, buffered_forward_route_acknowledges_declared_expect_continue) {
     const hpack::Header headers[] = {{{":method", 7}, {"POST", 4}},
                                      {{":path", 5}, {"/upload", 7}},
