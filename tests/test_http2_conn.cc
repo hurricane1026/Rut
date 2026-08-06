@@ -2080,6 +2080,57 @@ TEST(h2_serving, captured_content_length_is_removed_for_final_204) {
     for (u32 i = 0; i < count; i++) CHECK_FALSE(decoded[i].name.eq(Str{"content-length", 14}));
 }
 
+TEST(h2_serving, response_header_remove_mutation_filters_captured_header) {
+    Http2Conn h2;
+    h2.init();
+    Connection conn;
+    conn.reset();
+    conn.h2 = &h2;
+    FakeH2Loop loop;
+    u8 response[256]{};
+    H2Dispatch<FakeH2Loop> dispatch{&loop, &conn, response, sizeof(response), 0, false};
+    jit::CapturedResponseHeader captured_headers[] = {
+        {{"x-remove", 8}, {"gone", 4}},
+        {{"x-keep", 6}, {"present", 7}},
+    };
+    jit::HandlerCtx response_ctx{};
+    response_ctx.captured_response_valid = true;
+    response_ctx.captured_response_header_count = 2;
+    response_ctx.captured_response_headers = captured_headers;
+    response_ctx.response_header_count = 1;
+    response_ctx.response_header_mutations[0].mode = jit::ResponseHeaderMutationMode::Remove;
+    response_ctx.response_header_mutations[0].name = {"x-remove", 8};
+    JitDispatchOutcome outcome{};
+    outcome.kind = JitDispatchOutcome::Kind::ReturnStatus;
+    outcome.status_code = 200;
+    outcome.response_ctx = &response_ctx;
+    outcome.uses_captured_response = true;
+
+    h2_emit_outcome(dispatch, 1, outcome, nullptr, false);
+
+    Http2FrameHeader header{};
+    REQUIRE(parse_frame_header(response, dispatch.resp_len, &header) == ParseStatus::Complete);
+    hpack::DynamicTable dyn;
+    dyn.init(4096);
+    hpack::Header decoded[8];
+    u8 scratch[256];
+    u32 count = 0;
+    REQUIRE(hpack::decode_header_block(dyn,
+                                       response + kFrameHeaderSize,
+                                       header.length,
+                                       scratch,
+                                       sizeof(scratch),
+                                       decoded,
+                                       8,
+                                       &count));
+    bool kept = false;
+    for (u32 i = 0; i < count; i++) {
+        CHECK_FALSE(decoded[i].name.eq(Str{"x-remove", 8}));
+        kept |= decoded[i].name.eq(Str{"x-keep", 6}) && decoded[i].value.eq(Str{"present", 7});
+    }
+    CHECK(kept);
+}
+
 TEST(h2_serving, captured_304_content_length_is_removed_for_final_200) {
     Http2Conn h2;
     h2.init();
