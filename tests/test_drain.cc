@@ -346,6 +346,25 @@ TEST(event_loop, unschedulable_jit_timer_yield_fails_closed) {
     CHECK_EQ(conn->state, ConnState::Sending);
 }
 
+TEST(event_loop, jit_upstream_connect_yield_rejects_unknown_target) {
+    SmallLoop loop;
+    loop.setup();
+    loop.inject_and_dispatch(make_ev(0, IoEventType::Accept, 42));
+    Connection* conn = loop.find_fd(42);
+    REQUIRE(conn != nullptr);
+    JitDispatchOutcome outcome{};
+    outcome.kind = JitDispatchOutcome::Kind::EventYield;
+    outcome.yield_kind = jit::YieldKind::UpstreamConnect;
+    outcome.timer_ms = 1;
+
+    handle_jit_outcome<SmallLoop>(&loop, *conn, outcome, &timer_yield_handler, /*keep_alive=*/true);
+
+    CHECK_EQ(conn->pending_handler_fn, nullptr);
+    CHECK_EQ(conn->resp_status, 502u);
+    CHECK_FALSE(conn->keep_alive);
+    CHECK_EQ(conn->state, ConnState::Sending);
+}
+
 // === Drain accepts: served gracefully, not RST'd ===
 
 TEST(drain_accept, accepts_during_drain_get_response) {
