@@ -776,6 +776,24 @@ TEST(h2_proxy_forwardable, rejects_missing_host_without_authority) {
     CHECK(h2_proxy_request_forwardable(empty_authority_with_host, 5));
 }
 
+TEST(h2_request, synthesis_joins_multiple_cookie_fields) {
+    const hpack::Header headers[] = {{{":method", 7}, {"GET", 3}},
+                                     {{":path", 5}, {"/", 1}},
+                                     {{":scheme", 7}, {"https", 5}},
+                                     {{":authority", 10}, {"example", 7}},
+                                     {{"cookie", 6}, {"session=one", 11}},
+                                     {{"cookie", 6}, {"theme=dark", 10}}};
+    u8 request[256]{};
+    const u32 request_len = h2_synth_h1_request(headers, 6, request, sizeof(request));
+
+    REQUIRE_GT(request_len, 0u);
+    static constexpr char kCombined[] = "cookie: session=one; theme=dark\r\n";
+    bool found = false;
+    for (u32 i = 0; i + sizeof(kCombined) - 1 <= request_len; i++)
+        found |= __builtin_memcmp(request + i, kCombined, sizeof(kCombined) - 1) == 0;
+    CHECK(found);
+}
+
 // Write a raw frame (header + payload) into out; return bytes written.
 namespace {
 u32 put_frame(u8* out, Http2FrameType type, u8 flags, u32 stream_id, const u8* payload, u32 plen) {
@@ -1775,6 +1793,40 @@ TEST(h2_serving, body_independent_local_branch_avoids_buffered_forward_cap) {
     h2_dispatch_request(dispatch, 1, headers, 4, /*end_stream=*/false);
     CHECK_EQ(h2.pending_stream, 0u);
     CHECK_GT(dispatch.resp_len, 0u);
+}
+
+TEST(h2_serving, route_less_request_uses_default_response) {
+    const hpack::Header headers[] = {{{":method", 7}, {"GET", 3}},
+                                     {{":path", 5}, {"/", 1}},
+                                     {{":scheme", 7}, {"https", 5}},
+                                     {{":authority", 10}, {"example", 7}}};
+    Http2Conn h2;
+    h2.init();
+    Connection conn;
+    conn.reset();
+    conn.h2 = &h2;
+    FakeH2Loop loop;
+    u8 response[256]{};
+    H2Dispatch<FakeH2Loop> dispatch{&loop, &conn, response, sizeof(response), 0, false};
+
+    h2_dispatch_request(dispatch, 1, headers, 4, /*end_stream=*/true);
+
+    Http2FrameHeader header{};
+    REQUIRE(parse_frame_header(response, dispatch.resp_len, &header) == ParseStatus::Complete);
+    hpack::DynamicTable dyn;
+    dyn.init(4096);
+    hpack::Header decoded[4];
+    u8 scratch[128];
+    u32 count = 0;
+    REQUIRE(hpack::decode_header_block(dyn,
+                                       response + kFrameHeaderSize,
+                                       header.length,
+                                       scratch,
+                                       sizeof(scratch),
+                                       decoded,
+                                       4,
+                                       &count));
+    CHECK(decoded[0].value.eq(Str{"200", 3}));
 }
 
 TEST(h2_serving, selected_buffered_forward_defers_and_buffers_data) {
