@@ -1210,6 +1210,73 @@ TEST(websocket, terminate_close_handshake_waits_for_both_echoes) {
     CHECK_EQ(loop.conns[cid].fd, -1);  // both close echoes drained
 }
 
+TEST(websocket, terminate_forwards_complete_frames_and_rearms_both_directions) {
+    SmallLoop loop;
+    loop.setup();
+    loop.inject_and_dispatch(make_ev(0, IoEventType::Accept, 42));
+    auto* conn = loop.find_fd(42);
+    REQUIRE(conn != nullptr);
+    REQUIRE(loop.alloc_upstream_buf(*conn));
+    conn->is_ws_tunnel = true;
+    conn->is_ws_terminate = true;
+    conn->upstream_fd = 43;
+    conn->ws_c2u.masked = true;
+    conn->ws_c2u.from_client = true;
+    conn->ws_u2c.masked = false;
+    conn->ws_c2u.max_message_size = 64;
+    conn->ws_u2c.max_message_size = 64;
+    u8 c2u_msg[64] = {};
+    u8 u2c_msg[64] = {};
+    conn->ws_c2u_msg = c2u_msg;
+    conn->ws_u2c_msg = u2c_msg;
+    const rut::WsMessageHandlerFn forward =
+        +[](void*, rut::WsOpcode, const rut::u8*, rut::u64, bool) {
+            return rut::WsFrameAction::Forward;
+        };
+    conn->ws_handler = forward;
+    const u32 cid = conn->id;
+
+    // Masked client Binary("HI") frame. Terminate mode parses and re-masks it for the backend.
+    const u8 client_frame[] = {0x82, 0x82, 1, 2, 3, 4, 'H' ^ 1, 'I' ^ 2};
+    REQUIRE_EQ(conn->recv_buf.write(client_frame, sizeof(client_frame)), sizeof(client_frame));
+    loop.backend.op_count = 0;
+    on_ws_client_recv<SmallLoop>(
+        &loop, *conn, make_ev(cid, IoEventType::Recv, static_cast<i32>(sizeof(client_frame))));
+    REQUIRE_EQ(loop.backend.op_count, 2u);
+    CHECK_EQ(loop.backend.ops[0].type, MockOp::Send);
+    CHECK_EQ(loop.backend.ops[0].fd, 43);
+    CHECK_EQ(loop.backend.ops[1].type, MockOp::PauseRecv);
+
+    loop.backend.op_count = 0;
+    on_ws_client_to_upstream_sent<SmallLoop>(
+        &loop, *conn, make_ev(cid, IoEventType::UpstreamSend, 8));
+    CHECK_EQ(conn->recv_buf.len(), 0u);
+    REQUIRE_EQ(loop.backend.op_count, 1u);
+    CHECK_EQ(loop.backend.ops[0].type, MockOp::Recv);
+    CHECK_EQ(loop.backend.ops[0].fd, 42);
+
+    // Unmasked backend Binary("OK") frame. The client-facing frame remains unmasked.
+    const u8 upstream_frame[] = {0x82, 0x02, 'O', 'K'};
+    REQUIRE_EQ(conn->upstream_recv_buf.write(upstream_frame, sizeof(upstream_frame)),
+               sizeof(upstream_frame));
+    loop.backend.op_count = 0;
+    on_ws_upstream_recv<SmallLoop>(
+        &loop,
+        *conn,
+        make_ev(cid, IoEventType::UpstreamRecv, static_cast<i32>(sizeof(upstream_frame))));
+    REQUIRE_EQ(loop.backend.op_count, 2u);
+    CHECK_EQ(loop.backend.ops[0].type, MockOp::Send);
+    CHECK_EQ(loop.backend.ops[0].fd, 42);
+    CHECK_EQ(loop.backend.ops[1].type, MockOp::PauseUpstreamRecv);
+
+    loop.backend.op_count = 0;
+    on_ws_upstream_to_client_sent<SmallLoop>(&loop, *conn, make_ev(cid, IoEventType::Send, 4));
+    CHECK_EQ(conn->upstream_recv_buf.len(), 0u);
+    REQUIRE_EQ(loop.backend.op_count, 1u);
+    CHECK_EQ(loop.backend.ops[0].type, MockOp::UpstreamRecv);
+    CHECK_EQ(loop.backend.ops[0].fd, 43);
+}
+
 // Bytes that race into recv_buf while a client→upstream tunnel send is in flight
 // must be forwarded next, never dropped: the send-completion consumes ONLY the
 // submitted length and re-sends the remainder, keeping client recv paused until
