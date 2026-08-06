@@ -349,6 +349,40 @@ TEST(event_loop, jit_upstream_recv_yield_arms_upstream_receive) {
     conn->upstream_fd = -1;
 }
 
+TEST(event_loop, buffered_response_mutation_snapshots_recv_buffer_views) {
+    SmallLoop loop;
+    loop.setup();
+    loop.inject_and_dispatch(make_ev(0, IoEventType::Accept, 42));
+    Connection* conn = loop.find_fd(42);
+    REQUIRE(conn != nullptr);
+    static constexpr char kValue[] = "transient";
+    static constexpr char kCapturedValue[] = "captured";
+    u8 capture_slice[SlicePool::kSliceSize]{};
+    __builtin_memcpy(capture_slice, kCapturedValue, sizeof(kCapturedValue) - 1);
+    conn->recv_buf.write(reinterpret_cast<const u8*>(kValue), sizeof(kValue) - 1);
+    conn->response_capture_slice = capture_slice;
+    auto* ctx = conn->reset_jit_ctx();
+    ctx->response_header_count = 2;
+    ctx->response_header_mutations[0].mode = jit::ResponseHeaderMutationMode::Add;
+    ctx->response_header_mutations[0].name = {"x-snapshot", 10};
+    ctx->response_header_mutations[0].value = {reinterpret_cast<const char*>(conn->recv_buf.data()),
+                                               sizeof(kValue) - 1};
+    ctx->response_header_mutations[1].mode = jit::ResponseHeaderMutationMode::Add;
+    ctx->response_header_mutations[1].name = {"x-capture", 9};
+    ctx->response_header_mutations[1].value = {reinterpret_cast<const char*>(capture_slice),
+                                               sizeof(kCapturedValue) - 1};
+
+    REQUIRE(snapshot_buffered_response_mutation_views(*conn));
+
+    const auto value = ctx->response_header_mutations[0].value;
+    CHECK_NE(value.ptr, reinterpret_cast<const char*>(conn->recv_buf.data()));
+    CHECK(value.eq(Str{kValue, sizeof(kValue) - 1}));
+    const auto captured_value = ctx->response_header_mutations[1].value;
+    CHECK_NE(captured_value.ptr, reinterpret_cast<const char*>(capture_slice));
+    CHECK(captured_value.eq(Str{kCapturedValue, sizeof(kCapturedValue) - 1}));
+    conn->response_capture_slice = nullptr;
+}
+
 TEST(event_loop, jit_timer_yield_parks_handler_with_requested_delay) {
     SmallLoop loop;
     loop.setup();
