@@ -413,6 +413,17 @@ struct ControlPlaneMutationPortTestAccess {
         port.override_seq_[bank].store(sequence, std::memory_order_release);
     }
 
+    static u64 override_sequence(const ControlPlaneMutationPort& port, u32 bank) {
+        return port.override_seq_[bank].load(std::memory_order_acquire);
+    }
+
+    static u32 bank_for_generation(const ControlPlaneMutationPort& port, u64 generation) {
+        for (u32 bank = 0; bank < 2; bank++)
+            if (port.bank_generation_[bank].load(std::memory_order_acquire) == generation)
+                return bank;
+        return 2;
+    }
+
     static void set_override_version(ControlPlaneMutationPort& port, u32 bank, u64 version) {
         port.override_version_[bank].store(version, std::memory_order_release);
     }
@@ -1343,6 +1354,40 @@ TEST(control_plane_mutation, compatible_retained_generations_share_override_upda
     CHECK_EQ(port.manual_health({4, 0, 0}), ManualHealthOverride::Unhealthy);
 }
 
+TEST(control_plane_mutation, peer_sequence_contention_rolls_back_the_local_mark_claim) {
+    ControlPlaneMutationPort port;
+    RouteConfig old_config;
+    REQUIRE(old_config.add_upstream("users", 0x7f000001u, 8000).has_value());
+    port.reset(3, true, &old_config);
+
+    u64 id = 0;
+    REQUIRE(port.request_reload(ReloadRequestSource::Route, &id));
+    ReloadRequest request{};
+    REQUIRE(port.take_reload(&request));
+    RouteConfig new_config;
+    REQUIRE(new_config.add_upstream("users", 0x7f000001u, 8000).has_value());
+    REQUIRE(
+        port.complete_reload(id, request.source, ReloadTerminalOutcome::Activated, 4, &new_config));
+
+    const u32 active_bank = ControlPlaneMutationPortTestAccess::bank_for_generation(port, 4);
+    REQUIRE(active_bank < 2);
+    const u32 peer_bank = active_bank ^ 1u;
+    MarkReplayEvents events;
+    port.set_upstream_mark_replay_sink(&collect_mark_replay_event, &events);
+    ControlPlaneMutationPortTestAccess::set_override_sequence(port, peer_bank, 1);
+
+    CHECK_FALSE(port.mark({4, 0, 0}, true));
+    CHECK_EQ(ControlPlaneMutationPortTestAccess::override_sequence(port, active_bank), 2u);
+    CHECK_EQ(ControlPlaneMutationPortTestAccess::override_sequence(port, peer_bank), 1u);
+    REQUIRE_EQ(events.count, 1u);
+    CHECK_EQ(events.events[0].reason, UpstreamMarkReplayReason::Contended);
+
+    ControlPlaneMutationPortTestAccess::set_override_sequence(port, peer_bank, 0);
+    REQUIRE(port.mark({4, 0, 0}, true));
+    CHECK_EQ(port.manual_health({4, 0, 0}), ManualHealthOverride::Healthy);
+    CHECK_EQ(port.manual_health({3, 0, 0}), ManualHealthOverride::Healthy);
+}
+
 TEST(control_plane_mutation, activation_carries_overrides_across_backend_reordering) {
     ControlPlaneMutationPort port;
     RouteConfig old_config;
@@ -1693,6 +1738,26 @@ TEST(control_plane_mutation, mark_rejects_override_version_exhaustion_without_pu
     u64 version = 0;
     CHECK_EQ(port.manual_health(server, &version), ManualHealthOverride::None);
     CHECK_EQ(version, (u64{1} << 62) - 1);
+}
+
+TEST(control_plane_mutation, mark_reports_and_recovers_from_a_busy_override_sequence) {
+    ControlPlaneMutationPort port;
+    RouteConfig config;
+    REQUIRE(add_upstreams(&config, 1));
+    port.reset(9, false, &config);
+    const ServerIdentity server{9, 0, 0};
+    MarkReplayEvents events;
+    port.set_upstream_mark_replay_sink(&collect_mark_replay_event, &events);
+
+    ControlPlaneMutationPortTestAccess::set_override_sequence(port, 0, 1);
+    CHECK_FALSE(port.mark(server, true));
+    CHECK_EQ(ControlPlaneMutationPortTestAccess::override_sequence(port, 0), 1u);
+    REQUIRE_EQ(events.count, 1u);
+    CHECK_EQ(events.events[0].reason, UpstreamMarkReplayReason::Contended);
+
+    ControlPlaneMutationPortTestAccess::set_override_sequence(port, 0, 0);
+    REQUIRE(port.mark(server, true));
+    CHECK_EQ(port.manual_health(server), ManualHealthOverride::Healthy);
 }
 
 TEST(control_plane_mutation, backend_override_snapshot_uses_one_table_version) {
