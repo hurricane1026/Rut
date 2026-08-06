@@ -1,7 +1,8 @@
 // Graceful shutdown + connection draining tests.
-#include "rut/runtime/drain.h"
 #include "rut/runtime/cache_table.h"
+#include "rut/runtime/drain.h"
 #include "rut/runtime/event_loop.h"
+#include "rut/runtime/tls.h"
 #include "test.h"
 #include "test_helpers.h"
 
@@ -348,6 +349,23 @@ TEST(cache_table, full_set_evicts_the_lowest_value) {
     CHECK(table.get(5, &value));
     CHECK_EQ(value, 50);
     table.destroy();
+}
+
+TEST(cache_table, owner_can_withdraw_its_published_registry) {
+    const u32 capacities[] = {4};
+    const u64 identities[] = {cache_instance_identity("drain", 5)};
+    int owner = 0;
+    cache_registry_set_seed(1);
+    cache_registry_publish(capacities, identities, 1, &owner);
+
+    CHECK(cache_registry_unpublish_if_owner(&owner));
+    CHECK_EQ(cache_registry().count.load(std::memory_order_relaxed), 0u);
+}
+
+TEST(tls, missing_certificate_path_returns_an_error) {
+    auto context =
+        create_tls_server_context("/tmp/rut-missing-cert.pem", "/tmp/rut-missing-key.pem");
+    CHECK_FALSE(context);
 }
 
 TEST(event_loop, unsupported_jit_outcome_fails_closed) {
