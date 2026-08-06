@@ -16734,6 +16734,34 @@ TEST(route, marking_policy_validates_integer_arithmetic_opcode_family) {
     CHECK(marking_policy_instruction_types_valid(fn, inst));
 }
 
+TEST(route, marking_policy_validates_scalar_constant_result_types) {
+    using namespace rut;
+    const rir::Type bool_type{rir::TypeKind::Bool, nullptr, nullptr};
+    const rir::Type duration_type{rir::TypeKind::Duration, nullptr, nullptr};
+    const rir::Type byte_size_type{rir::TypeKind::ByteSize, nullptr, nullptr};
+    const rir::Type method_type{rir::TypeKind::Method, nullptr, nullptr};
+    const rir::Type status_type{rir::TypeKind::StatusCode, nullptr, nullptr};
+    rir::Value value{};
+    rir::Function fn{};
+    fn.values = &value;
+    fn.value_count = 1;
+    rir::Instruction inst{};
+    inst.result = {0};
+
+    for (const auto item : {std::pair{rir::Opcode::ConstDuration, &duration_type},
+                            std::pair{rir::Opcode::ConstByteSize, &byte_size_type},
+                            std::pair{rir::Opcode::ConstMethod, &method_type},
+                            std::pair{rir::Opcode::ConstStatus, &status_type},
+                            std::pair{rir::Opcode::ReloadRequest, &bool_type}}) {
+        inst.op = item.first;
+        value.type = item.second;
+        CHECK(marking_policy_instruction_types_valid(fn, inst));
+        value.type = &bool_type;
+        if (item.second != &bool_type)
+            CHECK_FALSE(marking_policy_instruction_types_valid(fn, inst));
+    }
+}
+
 TEST(route, marking_policy_json_append_validates_operand_types) {
     using namespace rut;
     const rir::Type bool_type{rir::TypeKind::Bool, nullptr, nullptr};
