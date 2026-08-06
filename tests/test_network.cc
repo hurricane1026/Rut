@@ -4788,6 +4788,15 @@ TEST(route, rir_function_needs_req_body_guard_paths) {
     insts[0].op = rir::Opcode::YieldTimer;
     CHECK(rir_function_can_forward_buffered(fn));
 
+    yield_kind = static_cast<u8>(jit::YieldKind::Timer);
+    insts[0].op = rir::Opcode::RetForwardBuffered;
+    CHECK(rir_function_can_forward_buffered(fn));
+    fn.blocks = nullptr;
+    CHECK_FALSE(rir_function_can_forward_buffered(fn));
+    fn.yield_kinds = nullptr;
+    CHECK_FALSE(rir_function_can_forward_buffered(fn));
+    fn.blocks = blocks;
+
     CHECK_FALSE(rir_function_needs_control_plane_snapshot(fn));
     insts[0].op = rir::Opcode::JsonAppendControlPlane;
     CHECK(rir_function_needs_control_plane_snapshot(fn));
