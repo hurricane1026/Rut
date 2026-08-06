@@ -23,6 +23,7 @@
 #include "rut/runtime/upstream_pool.h"
 #include "rut/runtime/ws_terminate.h"  // ws_inspect for terminate-mode tunnels
 
+#include <arpa/inet.h>
 #include <errno.h>
 #include <openssl/rand.h>  // RAND_bytes — fresh outbound mask-key seed (terminate mode)
 #include <sys/socket.h>
@@ -77,9 +78,7 @@ inline BackendHealth* backend_health(u16 upstream_id, u32 backend_idx) {
 struct AllocationBackendHealth {
     u64 incarnation = 0;
     u64 name_identity = 0;
-    u32 address = 0;
-    u16 port = 0;
-    u16 family = 0;
+    UpstreamEndpoint endpoint{};
     u16 seed_allocation = ControlPlaneMutationPort::kInvalidAllocation;
     u64 seed_incarnation = 0;
     bool owner_set = false;
@@ -101,11 +100,9 @@ inline BackendHealth* backend_health_allocation(
     if (allocation >= ControlPlaneMutationPort::kMaxEndpointAllocations) return nullptr;
     auto& cell = health[allocation];
     if (target != nullptr && backend_idx < target->addr_count) {
-        const sockaddr_in& endpoint = target->addrs[backend_idx];
+        const UpstreamEndpoint& endpoint = target->addrs[backend_idx];
         if (!cell.owner_set || (incarnation != 0 && cell.incarnation != incarnation) ||
-            cell.name_identity != target->name_identity ||
-            cell.address != endpoint.sin_addr.s_addr || cell.port != endpoint.sin_port ||
-            cell.family != endpoint.sin_family) {
+            cell.name_identity != target->name_identity || !cell.endpoint.same_address(endpoint)) {
             BackendHealth seed{};
             const bool can_seed =
                 seed_allocation < ControlPlaneMutationPort::kMaxEndpointAllocations;
@@ -119,9 +116,7 @@ inline BackendHealth* backend_health_allocation(
             }
             cell.name_identity = target->name_identity;
             cell.incarnation = incarnation;
-            cell.address = endpoint.sin_addr.s_addr;
-            cell.port = endpoint.sin_port;
-            cell.family = endpoint.sin_family;
+            cell.endpoint = endpoint;
             cell.seed_allocation =
                 can_seed ? seed_allocation : ControlPlaneMutationPort::kInvalidAllocation;
             cell.seed_incarnation = can_seed ? seed_incarnation : 0;
@@ -374,11 +369,7 @@ inline u32 select_backend_with_control_plane(Loop* loop,
         selection_identity *= 0x100000001B3ull;
         for (u32 backend = 0; backend < identity_backends; backend++) {
             const auto& endpoint = target.addrs[backend];
-            selection_identity ^= endpoint.sin_family;
-            selection_identity *= 0x100000001B3ull;
-            selection_identity ^= endpoint.sin_addr.s_addr;
-            selection_identity *= 0x100000001B3ull;
-            selection_identity ^= endpoint.sin_port;
+            selection_identity ^= endpoint.identity();
             selection_identity *= 0x100000001B3ull;
         }
     }
@@ -440,20 +431,26 @@ inline u32 select_backend_with_control_plane(Loop* loop,
 // parallel health state. Teardown goes through free_probe_conn (never the full
 // close_conn, which moves per-request metrics/epoch/access-log counters).
 //
-// Format "<ipv4>:<port>" (network-order sockaddr_in) for the probe Host header.
-// out must hold >= 22 bytes ("255.255.255.255:65535"). Returns bytes written.
-inline u32 format_probe_host(char* out, const struct sockaddr_in& addr) {
+// Format an endpoint for the HTTP Host header. IPv6 literals use RFC 3986
+// brackets so the address colons cannot be confused with the port separator.
+// out must hold at least INET6_ADDRSTRLEN + 8 bytes.
+inline u32 format_probe_host(char* out, const UpstreamEndpoint& endpoint) {
     u32 w = 0;
-    const auto* bytes = reinterpret_cast<const u8*>(&addr.sin_addr.s_addr);
-    for (u32 i = 0; i < 4; i++) {
-        if (i > 0) out[w++] = '.';
-        const u8 kOctet = bytes[i];
-        if (kOctet >= 100) out[w++] = static_cast<char>('0' + kOctet / 100);
-        if (kOctet >= 10) out[w++] = static_cast<char>('0' + (kOctet / 10) % 10);
-        out[w++] = static_cast<char>('0' + kOctet % 10);
+    char address[INET6_ADDRSTRLEN];
+    const void* source = nullptr;
+    if (const auto* value = endpoint.ipv4()) {
+        source = &value->sin_addr;
+    } else if (const auto* value = endpoint.ipv6()) {
+        out[w++] = '[';
+        source = &value->sin6_addr;
+    } else {
+        return 0;
     }
+    if (inet_ntop(endpoint.family(), source, address, sizeof(address)) == nullptr) return 0;
+    for (u32 i = 0; address[i] != '\0'; i++) out[w++] = address[i];
+    if (endpoint.family() == AF_INET6) out[w++] = ']';
     out[w++] = ':';
-    u16 port = ntohs(addr.sin_port);
+    u16 port = ntohs(endpoint.port());
     char tmp[5];
     u32 t = 0;
     if (port == 0) tmp[t++] = '0';
@@ -478,7 +475,7 @@ inline void build_probe_request(Connection& conn, const UpstreamTarget& target, 
         buf.write(reinterpret_cast<const u8*>("/"), 1);
     static const char kProto[] = " HTTP/1.1\r\nHost: ";
     buf.write(reinterpret_cast<const u8*>(kProto), sizeof(kProto) - 1);
-    char host[24];
+    char host[INET6_ADDRSTRLEN + 8];
     const u32 kHostLen = format_probe_host(host, target.addrs[backend_idx]);
     buf.write(reinterpret_cast<const u8*>(host), kHostLen);
     static const char kTail[] = "\r\nConnection: close\r\nUser-Agent: rut-healthcheck\r\n\r\n";
@@ -723,7 +720,8 @@ bool start_health_probe(Loop* loop, u16 upstream_idx, u32 backend_idx) {
     // ejected). Just free and skip this probe; the next sweep retries. Only
     // genuine on-wire outcomes (connect refused/reset, send/recv result, response)
     // feed record_active_probe_result.
-    const i32 kProbeFd = UpstreamPool::create_socket();
+    const auto& endpoint = target.addrs[backend_idx];
+    const i32 kProbeFd = UpstreamPool::create_socket(endpoint.family());
     if (kProbeFd < 0) {
         // The one mark-then-exit path that bypasses free_probe_conn, so clear the
         // in-flight guard inline.
@@ -742,8 +740,7 @@ bool start_health_probe(Loop* loop, u16 upstream_idx, u32 backend_idx) {
     build_probe_request(conn, target, backend_idx);
 
     conn.set_slots(nullptr, nullptr, nullptr, &on_probe_connected<Loop>);
-    if (!loop->submit_connect(
-            conn, &target.addrs[backend_idx], sizeof(target.addrs[backend_idx]))) {
+    if (!loop->submit_connect(conn, endpoint.addr(), endpoint.length)) {
         free_probe_conn(loop, conn);
         return false;
     }
@@ -1298,14 +1295,13 @@ bool retry_reused_upstream(Loop* loop, Connection& conn) {
     conn.upstream_recv_armed = false;
     conn.upstream_send_armed = false;
     conn.upstream_recv_buf.reset();
-    const i32 fd = UpstreamPool::create_socket();
+    const auto& endpoint = target.addrs[conn.upstream_backend_idx];
+    const i32 fd = UpstreamPool::create_socket(endpoint.family());
     if (fd < 0) return false;
     conn.upstream_fd = fd;
     conn.upstream_start_us = monotonic_us();
     conn.set_slots(nullptr, nullptr, nullptr, &on_upstream_connected<Loop>);
-    if (!loop->submit_connect(conn,
-                              &target.addrs[conn.upstream_backend_idx],
-                              sizeof(target.addrs[conn.upstream_backend_idx]))) {
+    if (!loop->submit_connect(conn, endpoint.addr(), endpoint.length)) {
         ::close(conn.upstream_fd);
         conn.upstream_fd = -1;
         loop->clear_upstream_fd(conn.id);
@@ -1695,7 +1691,8 @@ void on_header_received(void* lp, Connection& conn, IoEvent ev) {
             }
         }
 
-        const i32 kUpstreamFd = UpstreamPool::create_socket();
+        const auto& endpoint = target.addrs[kBackend];
+        const i32 kUpstreamFd = UpstreamPool::create_socket(endpoint.family());
         if (kUpstreamFd < 0) {
             conn.resp_status = kStatusBadGateway;
             format_static_response(conn, 502, false);
@@ -1706,7 +1703,7 @@ void on_header_received(void* lp, Connection& conn, IoEvent ev) {
         }
         conn.upstream_fd = kUpstreamFd;
         conn.set_slots(nullptr, nullptr, nullptr, &on_upstream_connected<Loop>);
-        if (!loop->submit_connect(conn, &target.addrs[kBackend], sizeof(target.addrs[kBackend]))) {
+        if (!loop->submit_connect(conn, endpoint.addr(), endpoint.length)) {
             ::close(conn.upstream_fd);
             conn.upstream_fd = -1;
             conn.upstream_idx = 0;
@@ -2345,7 +2342,8 @@ void handle_jit_outcome(Loop* loop,
                     send_service_unavailable();
                     return;
                 }
-                const i32 kUpstreamFd = UpstreamPool::create_socket();
+                const auto& endpoint = target.addrs[kBackend];
+                const i32 kUpstreamFd = UpstreamPool::create_socket(endpoint.family());
                 if (kUpstreamFd < 0) {
                     send_bad_gateway();
                     return;
@@ -2361,8 +2359,7 @@ void handle_jit_outcome(Loop* loop,
                 conn.upstream_fd = kUpstreamFd;
                 conn.upstream_idx = static_cast<u16>(upstream_id);
                 conn.upstream_backend_idx = static_cast<u8>(kBackend);
-                if (!loop->submit_connect(
-                        conn, &target.addrs[kBackend], sizeof(target.addrs[kBackend]))) {
+                if (!loop->submit_connect(conn, endpoint.addr(), endpoint.length)) {
                     ::close(conn.upstream_fd);
                     conn.upstream_fd = -1;
                     conn.upstream_idx = 0;
@@ -2644,7 +2641,8 @@ void handle_jit_outcome(Loop* loop,
                 }
             }
 
-            const i32 kUpstreamFd = UpstreamPool::create_socket();
+            const auto& endpoint = target.addrs[kBackend];
+            const i32 kUpstreamFd = UpstreamPool::create_socket(endpoint.family());
             if (kUpstreamFd < 0) {
                 abandon_capture();
                 conn.resp_status = kStatusBadGateway;
@@ -2659,8 +2657,7 @@ void handle_jit_outcome(Loop* loop,
             }
             conn.upstream_fd = kUpstreamFd;
             conn.set_slots(nullptr, nullptr, nullptr, &on_upstream_connected<Loop>);
-            if (!loop->submit_connect(
-                    conn, &target.addrs[kBackend], sizeof(target.addrs[kBackend]))) {
+            if (!loop->submit_connect(conn, endpoint.addr(), endpoint.length)) {
                 ::close(conn.upstream_fd);
                 conn.upstream_fd = -1;
                 conn.upstream_idx = 0;
@@ -2755,23 +2752,18 @@ bool try_connect_next_backend(Loop* loop, Connection& conn) {
         conn.upstream_recv_armed = false;
         conn.upstream_send_armed = false;
     }
-    const i32 kFd = UpstreamPool::create_socket();
+    conn.upstream_start_us = monotonic_us();
+    const u32 kBackend = select_backend_with_control_plane(
+        loop, conn.upstream_idx, target.addr_count, conn.upstream_start_us, config);
+    if (kBackend >= target.addr_count) return false;
+    const auto& endpoint = target.addrs[kBackend];
+    const i32 kFd = UpstreamPool::create_socket(endpoint.family());
     if (kFd < 0) return false;
     conn.upstream_fd = kFd;
     conn.upstream_attempts++;
-    conn.upstream_start_us = monotonic_us();
     conn.set_slots(nullptr, nullptr, nullptr, &on_upstream_connected<Loop>);
-    const u32 kBackend = select_backend_with_control_plane(
-        loop, conn.upstream_idx, target.addr_count, conn.upstream_start_us, config);
-    if (kBackend >= target.addr_count) {
-        ::close(conn.upstream_fd);
-        conn.upstream_fd = -1;
-        loop->clear_upstream_fd(conn.id);
-        return false;
-    }
     conn.upstream_backend_idx = static_cast<u8>(kBackend);
-    if (loop->submit_connect(conn, &target.addrs[kBackend], sizeof(target.addrs[kBackend])))
-        return true;
+    if (loop->submit_connect(conn, endpoint.addr(), endpoint.length)) return true;
     if (conn.upstream_fd >= 0) {
         ::close(conn.upstream_fd);
         conn.upstream_fd = -1;
@@ -4038,24 +4030,25 @@ void h2_proxy_begin(Loop* loop, Connection& conn) {
         conn.upstream_slot_held = true;
         conn.upstream_slot_uid = allocation;
     }
-    const i32 kFd = UpstreamPool::create_socket();
-    if (kFd < 0) {
-        h2_proxy_fail(loop, conn, 502);
-        return;
-    }
-    conn.upstream_fd = kFd;
     conn.upstream_idx = upstream_id;
     conn.upstream_attempts = 1;
     conn.upstream_start_us = monotonic_us();
-    conn.set_slots(nullptr, nullptr, nullptr, &h2_on_upstream_connected<Loop>);
     const u32 kBackend = select_backend_with_control_plane(
         loop, upstream_id, target.addr_count, conn.upstream_start_us, cfg);
     if (kBackend >= target.addr_count) {
         h2_proxy_fail(loop, conn, 503);
         return;
     }
+    const auto& endpoint = target.addrs[kBackend];
+    const i32 kFd = UpstreamPool::create_socket(endpoint.family());
+    if (kFd < 0) {
+        h2_proxy_fail(loop, conn, 502);
+        return;
+    }
+    conn.upstream_fd = kFd;
+    conn.set_slots(nullptr, nullptr, nullptr, &h2_on_upstream_connected<Loop>);
     conn.upstream_backend_idx = static_cast<u8>(kBackend);
-    if (!loop->submit_connect(conn, &target.addrs[kBackend], sizeof(target.addrs[kBackend]))) {
+    if (!loop->submit_connect(conn, endpoint.addr(), endpoint.length)) {
         h2_proxy_fail(loop, conn, 502);  // h2_proxy_fail closes the fd we just opened
     }
 }

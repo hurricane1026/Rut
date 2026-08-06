@@ -95,6 +95,9 @@ Notes:
 
 - An upstream used by `forward` must have a concrete address —
   `upstream X at "host:port"` or `upstream X { host: "...", port: N }`.
+  IPv6 literals use brackets in packed endpoints, for example
+  `upstream X at "[2001:db8::1]:8080"`; dictionary-form `host` values are bare.
+  A `backends` list may mix IPv4 and IPv6 endpoints.
   A name-only upstream makes the program fail to load (fail-closed).
 - Requests that match no route fall through to the default action
   (currently a `200`).
@@ -186,8 +189,8 @@ curl -s -o /dev/null -w "%{http_code}\n" http://127.0.0.1:8080/   # 200
 
 - **HTTP/1.1 only.** No HTTP/2, HTTP/3, or WebSocket upgrade yet.
 - **Server TLS only.** No SNI / ALPN / mTLS / kTLS.
-- **`forward` upstreams need an address** in the `.rut` (no runtime
-  binding / service discovery yet).
+- **`forward` upstreams need an IP address** in the `.rut` (DNS names and
+  service discovery are not supported yet).
 - **No hot reload of `.rut` at runtime.** Restart to apply changes.
 - Some environments (containers/sandboxes) can set up io_uring but not
   complete its operations; if requests connect but never respond, force

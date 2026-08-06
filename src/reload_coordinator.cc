@@ -53,11 +53,7 @@ bool same_health_policy(const UpstreamTarget& lhs, const UpstreamTarget& rhs) {
 bool same_upstream_endpoints(const UpstreamTarget& lhs, const UpstreamTarget& rhs) {
     if (lhs.addr_count != rhs.addr_count) return false;
     for (u32 i = 0; i < lhs.addr_count; i++) {
-        const auto& a = lhs.addrs[i];
-        const auto& b = rhs.addrs[i];
-        if (a.sin_family != b.sin_family || a.sin_addr.s_addr != b.sin_addr.s_addr ||
-            a.sin_port != b.sin_port)
-            return false;
+        if (!lhs.addrs[i].same_address(rhs.addrs[i])) return false;
     }
     return true;
 }

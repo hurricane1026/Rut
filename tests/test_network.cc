@@ -3373,10 +3373,39 @@ TEST(route, upstream_target_addr) {
     REQUIRE(idx.has_value());
     auto& t = cfg.upstreams[idx.value()];
     CHECK_EQ(t.addr_count, 1u);
-    CHECK_EQ(t.addrs[0].sin_family, AF_INET);
-    CHECK_EQ(__builtin_bswap16(t.addrs[0].sin_port), 9090u);
-    CHECK_EQ(__builtin_bswap32(t.addrs[0].sin_addr.s_addr), 0x0A000101u);
+    REQUIRE(t.addrs[0].ipv4() != nullptr);
+    CHECK_EQ(t.addrs[0].family(), AF_INET);
+    CHECK_EQ(__builtin_bswap16(t.addrs[0].ipv4()->sin_port), 9090u);
+    CHECK_EQ(__builtin_bswap32(t.addrs[0].ipv4()->sin_addr.s_addr), 0x0A000101u);
     CHECK_EQ(t.name[0], 'a');
+}
+
+TEST(route, upstream_target_ipv6_addr) {
+    IpAddress address{};
+    REQUIRE(parse_ip_address(Str{"2001:db8::1", 11}, &address));
+    RouteConfig cfg;
+    auto idx = cfg.add_upstream("api-v6", address, 9443);
+    REQUIRE(idx.has_value());
+    const auto& endpoint = cfg.upstreams[idx.value()].addrs[0];
+    REQUIRE(endpoint.ipv6() != nullptr);
+    CHECK_EQ(endpoint.family(), AF_INET6);
+    CHECK_EQ(endpoint.length, sizeof(sockaddr_in6));
+    CHECK_EQ(ntohs(endpoint.ipv6()->sin6_port), 9443u);
+    CHECK_EQ(endpoint.ipv6()->sin6_addr.s6_addr[15], 1u);
+
+    const i32 fd = UpstreamPool::create_socket(endpoint.family());
+    REQUIRE(fd >= 0);
+    CHECK_EQ(close(fd), 0);
+}
+
+TEST(route, upstream_rejects_invalid_address_family_without_consuming_slot) {
+    RouteConfig cfg;
+    IpAddress address{};
+    address.family = static_cast<IpAddress::Family>(0xff);
+    auto result = cfg.add_upstream("invalid", address, 9443);
+    REQUIRE(!result.has_value());
+    CHECK_EQ(result.error().code, EINVAL);
+    CHECK_EQ(cfg.upstream_count, 0u);
 }
 
 TEST(route, upstream_multi_backend) {
@@ -3388,8 +3417,10 @@ TEST(route, upstream_multi_backend) {
     CHECK(cfg.add_upstream_backend(idx.value(), 0x0A000103, 8080));
     auto& t = cfg.upstreams[idx.value()];
     CHECK_EQ(t.addr_count, 3u);
-    CHECK_EQ(__builtin_bswap32(t.addrs[1].sin_addr.s_addr), 0x0A000102u);
-    CHECK_EQ(__builtin_bswap32(t.addrs[2].sin_addr.s_addr), 0x0A000103u);
+    REQUIRE(t.addrs[1].ipv4() != nullptr);
+    REQUIRE(t.addrs[2].ipv4() != nullptr);
+    CHECK_EQ(__builtin_bswap32(t.addrs[1].ipv4()->sin_addr.s_addr), 0x0A000102u);
+    CHECK_EQ(__builtin_bswap32(t.addrs[2].ipv4()->sin_addr.s_addr), 0x0A000103u);
     // A bad upstream index is rejected.
     CHECK(!cfg.add_upstream_backend(99, 0x0A000104, 8080));
 }

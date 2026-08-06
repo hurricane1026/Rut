@@ -1307,10 +1307,15 @@ inline u64 marking_policy_upstream_identity(const rir::Module& mod, u32 upstream
     marking_policy_identity_mix(&identity, declaration.has_address ? 1 : 0);
     if (declaration.has_address) {
         marking_policy_identity_mix(&identity, declaration.extra_count + 1);
-        marking_policy_identity_mix(&identity, declaration.ip);
+        marking_policy_identity_mix(&identity, static_cast<u8>(declaration.address.family));
+        for (u32 byte = 0; byte < declaration.address.byte_count(); byte++)
+            marking_policy_identity_mix(&identity, declaration.address.bytes[byte]);
         marking_policy_identity_mix(&identity, declaration.port);
         for (u32 backend = 0; backend < declaration.extra_count; backend++) {
-            marking_policy_identity_mix(&identity, declaration.extra_ips[backend]);
+            const auto& address = declaration.extra_addresses[backend];
+            marking_policy_identity_mix(&identity, static_cast<u8>(address.family));
+            for (u32 byte = 0; byte < address.byte_count(); byte++)
+                marking_policy_identity_mix(&identity, address.bytes[byte]);
             marking_policy_identity_mix(&identity, declaration.extra_ports[backend]);
         }
     }
@@ -2146,7 +2151,7 @@ inline bool populate_route_config(RouteConfig& cfg, const rir::Module& mod) {
             if (copy_len >= sizeof(name_buf)) copy_len = sizeof(name_buf) - 1;
             for (u32 j = 0; j < copy_len; j++) name_buf[j] = up.name.ptr[j];
             name_buf[copy_len] = '\0';
-            auto r = cfg.add_upstream(name_buf, up.ip, up.port);
+            auto r = cfg.add_upstream(name_buf, up.address, up.port);
             if (!r.has_value()) return false;
             if (r.value() != i) return false;
             cfg.upstreams[i].name_identity = upstream_name_identity(up.name.ptr, up.name.len);
@@ -2154,7 +2159,8 @@ inline bool populate_route_config(RouteConfig& cfg, const rir::Module& mod) {
             // ip/port above). add_upstream_backend fails only on a full
             // backend list, which the frontend already bounds.
             for (u32 b = 0; b < up.extra_count; b++) {
-                if (!cfg.add_upstream_backend(i, up.extra_ips[b], up.extra_ports[b])) return false;
+                if (!cfg.add_upstream_backend(i, up.extra_addresses[b], up.extra_ports[b]))
+                    return false;
             }
             // Attach active health-check config (data only; the frontend already
             // validated path/interval). Fails only on an over-long path.
@@ -2196,12 +2202,13 @@ inline bool populate_route_config(RouteConfig& cfg, const rir::Module& mod) {
             if (up.has_address && (marked_upstream_mask & (u32{1} << i)) != 0) {
                 const auto& target = cfg.upstreams[i];
                 if (target.addr_count != up.extra_count + 1) return false;
-                if (target.addrs[0].sin_addr.s_addr != htonl(up.ip) ||
-                    target.addrs[0].sin_port != htons(up.port))
+                UpstreamEndpoint primary{};
+                if (!primary.set_ip(up.address, up.port) || !target.addrs[0].same_address(primary))
                     return false;
                 for (u32 b = 0; b < up.extra_count; b++) {
-                    if (target.addrs[b + 1].sin_addr.s_addr != htonl(up.extra_ips[b]) ||
-                        target.addrs[b + 1].sin_port != htons(up.extra_ports[b]))
+                    UpstreamEndpoint extra{};
+                    if (!extra.set_ip(up.extra_addresses[b], up.extra_ports[b]) ||
+                        !target.addrs[b + 1].same_address(extra))
                         return false;
                 }
             }

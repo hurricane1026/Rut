@@ -2,6 +2,7 @@
 
 #include "core/expected.h"
 #include "rut/common/http_header_validation.h"
+#include "rut/common/ip_address.h"
 #include "rut/common/types.h"
 #include "rut/jit/art_jit_codegen.h"  // ArtJitMatchFn typedef (LLVM-free)
 #include "rut/jit/handler_abi.h"
@@ -61,6 +62,76 @@ enum class RouteAction : u8 {
     JitHandler,  // invoke JIT-compiled handler, may yield for I/O/timer
 };
 
+struct UpstreamEndpoint {
+    sockaddr_storage storage{};
+    socklen_t length = 0;
+
+    [[nodiscard]] sa_family_t family() const { return length == 0 ? AF_UNSPEC : storage.ss_family; }
+
+    [[nodiscard]] const sockaddr* addr() const {
+        return reinterpret_cast<const sockaddr*>(&storage);
+    }
+
+    [[nodiscard]] const sockaddr_in* ipv4() const {
+        return family() == AF_INET ? reinterpret_cast<const sockaddr_in*>(&storage) : nullptr;
+    }
+
+    [[nodiscard]] const sockaddr_in6* ipv6() const {
+        return family() == AF_INET6 ? reinterpret_cast<const sockaddr_in6*>(&storage) : nullptr;
+    }
+
+    [[nodiscard]] u16 port() const {
+        if (const auto* value = ipv4()) return value->sin_port;
+        if (const auto* value = ipv6()) return value->sin6_port;
+        return 0;
+    }
+
+    void set_ipv4(u32 ip, u16 port_value) {
+        memset(&storage, 0, sizeof(storage));
+        auto* value = reinterpret_cast<sockaddr_in*>(&storage);
+        value->sin_family = AF_INET;
+        value->sin_addr.s_addr = htonl(ip);
+        value->sin_port = htons(port_value);
+        length = sizeof(*value);
+    }
+
+    void set_ipv6(const u8 ip[16], u16 port_value) {
+        memset(&storage, 0, sizeof(storage));
+        auto* value = reinterpret_cast<sockaddr_in6*>(&storage);
+        value->sin6_family = AF_INET6;
+        memcpy(&value->sin6_addr, ip, sizeof(value->sin6_addr));
+        value->sin6_port = htons(port_value);
+        length = sizeof(*value);
+    }
+
+    bool set_ip(const IpAddress& ip, u16 port_value) {
+        if (ip.family == IpAddress::Family::V4) {
+            set_ipv4(ip.v4_host_order(), port_value);
+            return true;
+        }
+        if (ip.family == IpAddress::Family::V6) {
+            set_ipv6(ip.bytes, port_value);
+            return true;
+        }
+        return false;
+    }
+
+    [[nodiscard]] bool same_address(const UpstreamEndpoint& other) const {
+        return length == other.length && length != 0 &&
+               memcmp(&storage, &other.storage, length) == 0;
+    }
+
+    [[nodiscard]] u64 identity() const {
+        u64 hash = 0xCBF29CE484222325ull;
+        const auto* bytes = reinterpret_cast<const u8*>(&storage);
+        for (u32 i = 0; i < length; i++) {
+            hash ^= bytes[i];
+            hash *= 0x100000001B3ull;
+        }
+        return hash == 0 ? 1 : hash;
+    }
+};
+
 // Upstream target — one named backend that may resolve to several
 // address:port endpoints. Multiple endpoints enable per-shard round-robin
 // load balancing; a single-endpoint upstream is just addr_count == 1.
@@ -68,7 +139,7 @@ struct UpstreamTarget {
     static constexpr u32 kMaxUpstreamNameLen = 32;
     static constexpr u32 kMaxBackends = 8;  // endpoints per upstream (LB pool)
 
-    struct sockaddr_in addrs[kMaxBackends];
+    UpstreamEndpoint addrs[kMaxBackends];
     u32 addr_count;
     // Short name for logging/debugging (e.g., "api-v1")
     char name[kMaxUpstreamNameLen];
@@ -109,11 +180,20 @@ struct UpstreamTarget {
     // Returns false if the backend list is full.
     bool add_addr(u32 ip, u16 port) {
         if (addr_count >= kMaxBackends) return false;
-        struct sockaddr_in& a = addrs[addr_count++];
-        memset(&a, 0, sizeof(a));
-        a.sin_family = AF_INET;
-        a.sin_addr.s_addr = htonl(ip);
-        a.sin_port = htons(port);
+        addrs[addr_count++].set_ipv4(ip, port);
+        return true;
+    }
+
+    bool add_addr_v6(const u8 ip[16], u16 port) {
+        if (addr_count >= kMaxBackends) return false;
+        addrs[addr_count++].set_ipv6(ip, port);
+        return true;
+    }
+
+    bool add_addr(const IpAddress& ip, u16 port) {
+        if (addr_count >= kMaxBackends) return false;
+        if (!addrs[addr_count].set_ip(ip, port)) return false;
+        addr_count++;
         return true;
     }
 
@@ -941,11 +1021,20 @@ struct RouteConfig {
 
     // Add an upstream target. Returns its index, or error if at capacity.
     core::Expected<u32, Error> add_upstream(const char* name, u32 ip, u16 port) {
+        return add_upstream(name, IpAddress::v4(ip), port);
+    }
+
+    core::Expected<u32, Error> add_upstream(const char* name, const IpAddress& address, u16 port) {
         if (upstream_count >= kMaxUpstreams)
             return core::make_unexpected(Error::make(ENOSPC, Error::Source::RouteTable));
-        u32 idx = upstream_count++;
+        if (address.family != IpAddress::Family::V4 && address.family != IpAddress::Family::V6)
+            return core::make_unexpected(Error::make(EINVAL, Error::Source::RouteTable));
+        const u32 idx = upstream_count;
         upstreams[idx].set_name(name);
-        upstreams[idx].set_addr(ip, port);
+        upstreams[idx].addr_count = 0;
+        if (!upstreams[idx].add_addr(address, port))
+            return core::make_unexpected(Error::make(EINVAL, Error::Source::RouteTable));
+        upstream_count++;
         return idx;
     }
 
@@ -953,8 +1042,12 @@ struct RouteConfig {
     // load balancing). `idx` must be a previously added upstream. Returns
     // false on a bad index or a full backend list.
     bool add_upstream_backend(u32 idx, u32 ip, u16 port) {
+        return add_upstream_backend(idx, IpAddress::v4(ip), port);
+    }
+
+    bool add_upstream_backend(u32 idx, const IpAddress& address, u16 port) {
         if (idx >= upstream_count) return false;
-        return upstreams[idx].add_addr(ip, port);
+        return upstreams[idx].add_addr(address, port);
     }
 
     // Firewall helpers.

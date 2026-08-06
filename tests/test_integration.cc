@@ -15177,7 +15177,8 @@ TEST(route, populate_route_config_accepts_pre_bound_upstreams) {
     // returns true even though the module had a name-only upstream.
     CHECK(populate_route_config(cfg, rir.module));
     // The manually-bound address is untouched.
-    CHECK_EQ(cfg.upstreams[0].addrs[0].sin_port, __builtin_bswap16(8080));
+    REQUIRE(cfg.upstreams[0].addrs[0].ipv4() != nullptr);
+    CHECK_EQ(cfg.upstreams[0].addrs[0].ipv4()->sin_port, __builtin_bswap16(8080));
     CHECK_EQ(cfg.response_body_count, 1u);
     CHECK_EQ(cfg.response_bodies[0].len, 5u);
     CHECK_EQ(cfg.response_header_set_count, 1u);
@@ -15207,8 +15208,9 @@ TEST(route, populate_route_config_preserves_unmarked_pre_bound_runtime_address) 
     RouteConfig cfg{};
     REQUIRE(cfg.add_upstream("backend", 0x0A000001, 9000).has_value());
     CHECK(populate_route_config(cfg, rir.module));
-    CHECK_EQ(cfg.upstreams[0].addrs[0].sin_addr.s_addr, htonl(0x0A000001));
-    CHECK_EQ(cfg.upstreams[0].addrs[0].sin_port, htons(9000));
+    REQUIRE(cfg.upstreams[0].addrs[0].ipv4() != nullptr);
+    CHECK_EQ(cfg.upstreams[0].addrs[0].ipv4()->sin_addr.s_addr, htonl(0x0A000001));
+    CHECK_EQ(cfg.upstreams[0].addrs[0].ipv4()->sin_port, htons(9000));
     rir.destroy();
 }
 
@@ -15474,20 +15476,56 @@ TEST(route, upstream_backends_list_compiles) {
     // RIR module: primary + 2 extras, all addresses resolved.
     REQUIRE_EQ(rir.module.upstream_count, 1u);
     CHECK(rir.module.upstreams[0].has_address);
-    CHECK_EQ(rir.module.upstreams[0].ip, 0x7F000001u);
+    CHECK_EQ(rir.module.upstreams[0].address.v4_host_order(), 0x7F000001u);
     CHECK_EQ(rir.module.upstreams[0].port, 8081u);
     REQUIRE_EQ(rir.module.upstreams[0].extra_count, 2u);
-    CHECK_EQ(rir.module.upstreams[0].extra_ips[0], 0x7F000002u);
+    CHECK_EQ(rir.module.upstreams[0].extra_addresses[0].v4_host_order(), 0x7F000002u);
     CHECK_EQ(rir.module.upstreams[0].extra_ports[0], 8082u);
-    CHECK_EQ(rir.module.upstreams[0].extra_ips[1], 0x7F000003u);
+    CHECK_EQ(rir.module.upstreams[0].extra_addresses[1].v4_host_order(), 0x7F000003u);
     CHECK_EQ(rir.module.upstreams[0].extra_ports[1], 8083u);
     // populate_route_config builds a 3-endpoint UpstreamTarget.
     RouteConfig cfg{};
     REQUIRE(populate_route_config(cfg, rir.module));
     REQUIRE_EQ(cfg.upstream_count, 1u);
     CHECK_EQ(cfg.upstreams[0].addr_count, 3u);
-    CHECK_EQ(__builtin_bswap32(cfg.upstreams[0].addrs[0].sin_addr.s_addr), 0x7F000001u);
-    CHECK_EQ(__builtin_bswap16(cfg.upstreams[0].addrs[2].sin_port), 8083u);
+    REQUIRE(cfg.upstreams[0].addrs[0].ipv4() != nullptr);
+    REQUIRE(cfg.upstreams[0].addrs[2].ipv4() != nullptr);
+    CHECK_EQ(__builtin_bswap32(cfg.upstreams[0].addrs[0].ipv4()->sin_addr.s_addr), 0x7F000001u);
+    CHECK_EQ(__builtin_bswap16(cfg.upstreams[0].addrs[2].ipv4()->sin_port), 8083u);
+    rir.destroy();
+}
+
+TEST(route, mixed_ipv4_ipv6_upstream_backends_compile) {
+    const char* src =
+        "upstream pool { backends: [\"127.0.0.1:8081\", \"[2001:db8::2]:8082\"] }\n"
+        "route GET \"/api\" { return forward(pool) }\n";
+    auto lexed = lex(Str{src, static_cast<u32>(__builtin_strlen(src))});
+    REQUIRE(lexed);
+    auto ast = parse_file(lexed.value());
+    REQUIRE(ast);
+    std::unique_ptr<AstFile> ast_owned(ast.value());
+    auto hir = analyze_file(*ast_owned);
+    REQUIRE(hir);
+    std::unique_ptr<HirModule> hir_owned(hir.value());
+    auto mir = build_mir(*hir_owned);
+    REQUIRE(mir);
+    std::unique_ptr<MirModule> mir_owned(mir.value());
+    FrontendRirModule rir{};
+    REQUIRE(lower_to_rir(*mir_owned, rir));
+
+    RouteConfig cfg{};
+    REQUIRE(populate_route_config(cfg, rir.module));
+    REQUIRE_EQ(cfg.upstreams[0].addr_count, 2u);
+    CHECK_EQ(cfg.upstreams[0].addrs[0].family(), AF_INET);
+    CHECK_EQ(cfg.upstreams[0].addrs[1].family(), AF_INET6);
+    REQUIRE(cfg.upstreams[0].addrs[1].ipv6() != nullptr);
+    CHECK_EQ(cfg.upstreams[0].addrs[1].ipv6()->sin6_addr.s6_addr[0], 0x20u);
+    CHECK_EQ(cfg.upstreams[0].addrs[1].ipv6()->sin6_addr.s6_addr[15], 0x02u);
+    CHECK_EQ(ntohs(cfg.upstreams[0].addrs[1].ipv6()->sin6_port), 8082u);
+
+    char host[INET6_ADDRSTRLEN + 8];
+    const u32 host_len = format_probe_host(host, cfg.upstreams[0].addrs[1]);
+    CHECK((Str{host, host_len}.eq(Str{"[2001:db8::2]:8082", 18})));
     rir.destroy();
 }
 
@@ -15535,8 +15573,9 @@ TEST(route, upstream_health_check_compiles) {
     RouteConfig prebound{};
     REQUIRE(prebound.add_upstream("api", 0x0A000001, 9000).has_value());
     REQUIRE(populate_route_config(prebound, rir.module));
-    CHECK_EQ(prebound.upstreams[0].addrs[0].sin_addr.s_addr, htonl(0x0A000001));
-    CHECK_EQ(prebound.upstreams[0].addrs[0].sin_port, htons(9000));
+    REQUIRE(prebound.upstreams[0].addrs[0].ipv4() != nullptr);
+    CHECK_EQ(prebound.upstreams[0].addrs[0].ipv4()->sin_addr.s_addr, htonl(0x0A000001));
+    CHECK_EQ(prebound.upstreams[0].addrs[0].ipv4()->sin_port, htons(9000));
     CHECK(prebound.upstreams[0].hc_enabled);
     CHECK_EQ(prebound.upstreams[0].hc_path_len, 8u);
     CHECK((
@@ -15866,7 +15905,7 @@ TEST(route, marking_policy_accepts_arena_owned_variadic_constructors) {
     rir.module.upstream_count = 1;
     rir.module.upstreams[0].name = Str{"users", 5};
     rir.module.upstreams[0].has_address = true;
-    rir.module.upstreams[0].ip = 0x7f000001;
+    rir.module.upstreams[0].address = IpAddress::v4(0x7f000001);
     rir.module.upstreams[0].port = 8080;
     auto& array_inst = fn->blocks[0].insts[4];
     CHECK_GT(array_inst.operand_count, rir::kMaxInlineOperands);
@@ -17280,18 +17319,18 @@ TEST(route, marking_policy_fingerprint_includes_ordered_upstream_backends) {
     auto& upstream = mod.upstreams[0];
     upstream.name = Str{"users", 5};
     upstream.has_address = true;
-    upstream.ip = 0x7f000001;
+    upstream.address = IpAddress::v4(0x7f000001);
     upstream.port = 8000;
     upstream.extra_count = 1;
-    upstream.extra_ips[0] = 0x7f000002;
+    upstream.extra_addresses[0] = IpAddress::v4(0x7f000002);
     upstream.extra_ports[0] = 9000;
 
     const u64 original_identity = marking_policy_identity(mod, timer);
-    const u32 primary_ip = upstream.ip;
+    const IpAddress primary_ip = upstream.address;
     const u16 primary_port = upstream.port;
-    upstream.ip = upstream.extra_ips[0];
+    upstream.address = upstream.extra_addresses[0];
     upstream.port = upstream.extra_ports[0];
-    upstream.extra_ips[0] = primary_ip;
+    upstream.extra_addresses[0] = primary_ip;
     upstream.extra_ports[0] = primary_port;
     CHECK_NE(marking_policy_identity(mod, timer), original_identity);
 }
@@ -17474,7 +17513,7 @@ TEST(route, marking_policy_fingerprint_normalizes_struct_carried_server) {
     original.upstream_count = 1;
     original.upstreams[0].name = Str{"users", 5};
     original.upstreams[0].has_address = true;
-    original.upstreams[0].ip = 0x7F000001;
+    original.upstreams[0].address = IpAddress::v4(0x7F000001);
     original.upstreams[0].port = 8080;
     const u64 original_identity = marking_policy_identity(original, timer);
     policy[0].imm.i64_val =
@@ -17485,7 +17524,7 @@ TEST(route, marking_policy_fingerprint_normalizes_struct_carried_server) {
     shifted.upstream_count = 2;
     shifted.upstreams[0].name = Str{"unrelated", 9};
     shifted.upstreams[0].has_address = true;
-    shifted.upstreams[0].ip = 0x7F000002;
+    shifted.upstreams[0].address = IpAddress::v4(0x7F000002);
     shifted.upstreams[0].port = 9090;
     shifted.upstreams[1] = original.upstreams[0];
     policy[0].imm.i64_val = rir::encode_server_token(1, 0);
@@ -17643,14 +17682,14 @@ TEST(route, marking_policy_fingerprint_normalizes_nested_struct_projection) {
     original.upstream_count = 1;
     original.upstreams[0].name = Str{"users", 5};
     original.upstreams[0].has_address = true;
-    original.upstreams[0].ip = 0x7F000001;
+    original.upstreams[0].address = IpAddress::v4(0x7F000001);
     original.upstreams[0].port = 8080;
     const u64 original_identity = marking_policy_identity(original, timer);
     rir::Module shifted{};
     shifted.upstream_count = 2;
     shifted.upstreams[0].name = Str{"unrelated", 9};
     shifted.upstreams[0].has_address = true;
-    shifted.upstreams[0].ip = 0x7F000002;
+    shifted.upstreams[0].address = IpAddress::v4(0x7F000002);
     shifted.upstreams[0].port = 9090;
     shifted.upstreams[1] = original.upstreams[0];
     policy[0].imm.i64_val = rir::encode_server_token(1, 0);
@@ -17742,7 +17781,7 @@ TEST(route, marking_policy_fingerprint_normalizes_carried_struct_receiver) {
     original.upstream_count = 1;
     original.upstreams[0].name = Str{"users", 5};
     original.upstreams[0].has_address = true;
-    original.upstreams[0].ip = 0x7F000001;
+    original.upstreams[0].address = IpAddress::v4(0x7F000001);
     original.upstreams[0].port = 8080;
     const u64 original_identity = marking_policy_identity(original, timer);
 
@@ -17750,7 +17789,7 @@ TEST(route, marking_policy_fingerprint_normalizes_carried_struct_receiver) {
     shifted.upstream_count = 2;
     shifted.upstreams[0].name = Str{"unrelated", 9};
     shifted.upstreams[0].has_address = true;
-    shifted.upstreams[0].ip = 0x7F000002;
+    shifted.upstreams[0].address = IpAddress::v4(0x7F000002);
     shifted.upstreams[0].port = 9090;
     shifted.upstreams[1] = original.upstreams[0];
     policy[0].imm.i64_val = rir::encode_server_token(1, 0);
@@ -17819,7 +17858,7 @@ TEST(route, marking_policy_fingerprint_normalizes_array_carried_server) {
     original.upstream_count = 1;
     original.upstreams[0].name = Str{"users", 5};
     original.upstreams[0].has_address = true;
-    original.upstreams[0].ip = 0x7F000001;
+    original.upstreams[0].address = IpAddress::v4(0x7F000001);
     original.upstreams[0].port = 8080;
     const u64 original_identity = marking_policy_identity(original, timer);
 
@@ -17827,7 +17866,7 @@ TEST(route, marking_policy_fingerprint_normalizes_array_carried_server) {
     shifted.upstream_count = 2;
     shifted.upstreams[0].name = Str{"unrelated", 9};
     shifted.upstreams[0].has_address = true;
-    shifted.upstreams[0].ip = 0x7F000002;
+    shifted.upstreams[0].address = IpAddress::v4(0x7F000002);
     shifted.upstreams[0].port = 9090;
     shifted.upstreams[1] = original.upstreams[0];
     policy[0].imm.i64_val = rir::encode_server_token(1, 0);
@@ -17918,10 +17957,10 @@ TEST(route, marking_policy_fingerprint_normalizes_dynamic_array_server_sources) 
     original.upstream_count = 1;
     original.upstreams[0].name = Str{"users", 5};
     original.upstreams[0].has_address = true;
-    original.upstreams[0].ip = 0x7F000001;
+    original.upstreams[0].address = IpAddress::v4(0x7F000001);
     original.upstreams[0].port = 8080;
     original.upstreams[0].extra_count = 1;
-    original.upstreams[0].extra_ips[0] = 0x7F000001;
+    original.upstreams[0].extra_addresses[0] = IpAddress::v4(0x7F000001);
     original.upstreams[0].extra_ports[0] = 8081;
     const u64 original_identity = marking_policy_identity(original, timer);
 
@@ -17929,7 +17968,7 @@ TEST(route, marking_policy_fingerprint_normalizes_dynamic_array_server_sources) 
     shifted.upstream_count = 2;
     shifted.upstreams[0].name = Str{"unrelated", 9};
     shifted.upstreams[0].has_address = true;
-    shifted.upstreams[0].ip = 0x7F000002;
+    shifted.upstreams[0].address = IpAddress::v4(0x7F000002);
     shifted.upstreams[0].port = 9090;
     shifted.upstreams[1] = original.upstreams[0];
     policy[0].imm.i64_val = rir::encode_server_token(1, 0);
@@ -17983,7 +18022,7 @@ TEST(route, marking_policy_fingerprint_normalizes_optional_carried_server) {
     original.upstream_count = 1;
     original.upstreams[0].name = Str{"users", 5};
     original.upstreams[0].has_address = true;
-    original.upstreams[0].ip = 0x7F000001;
+    original.upstreams[0].address = IpAddress::v4(0x7F000001);
     original.upstreams[0].port = 8080;
     const u64 original_identity = marking_policy_identity(original, timer);
 
@@ -17991,7 +18030,7 @@ TEST(route, marking_policy_fingerprint_normalizes_optional_carried_server) {
     shifted.upstream_count = 2;
     shifted.upstreams[0].name = Str{"unrelated", 9};
     shifted.upstreams[0].has_address = true;
-    shifted.upstreams[0].ip = 0x7F000002;
+    shifted.upstreams[0].address = IpAddress::v4(0x7F000002);
     shifted.upstreams[0].port = 9090;
     shifted.upstreams[1] = original.upstreams[0];
     policy[0].imm.i64_val = rir::encode_server_token(1, 0);
@@ -20690,7 +20729,7 @@ TEST(route, populate_route_config_binds_upstream_from_dsl) {
     // RIR module carries the declared upstream with its address.
     REQUIRE_EQ(rir.module.upstream_count, 1u);
     CHECK(rir.module.upstreams[0].has_address);
-    CHECK_EQ(rir.module.upstreams[0].ip, 0x7F000001u);
+    CHECK_EQ(rir.module.upstreams[0].address.v4_host_order(), 0x7F000001u);
     CHECK_EQ(rir.module.upstreams[0].port, upstream_port);
 
     auto cg = jit::codegen(rir.module);
@@ -20717,8 +20756,9 @@ TEST(route, populate_route_config_binds_upstream_from_dsl) {
     const Str actual_name{cfg.upstreams[0].name, 7u};
     const Str expected_name{"backend", 7u};
     CHECK(actual_name.eq(expected_name));
-    CHECK_EQ(cfg.upstreams[0].addrs[0].sin_port, __builtin_bswap16(upstream_port));
-    CHECK_EQ(cfg.upstreams[0].addrs[0].sin_addr.s_addr, __builtin_bswap32(0x7F000001));
+    REQUIRE(cfg.upstreams[0].addrs[0].ipv4() != nullptr);
+    CHECK_EQ(cfg.upstreams[0].addrs[0].ipv4()->sin_port, __builtin_bswap16(upstream_port));
+    CHECK_EQ(cfg.upstreams[0].addrs[0].ipv4()->sin_addr.s_addr, __builtin_bswap32(0x7F000001));
     REQUIRE(cfg.add_jit_handler("/api", 'G', handler_fn));
     const RouteConfig* active = &cfg;
 

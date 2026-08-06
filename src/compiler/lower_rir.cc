@@ -3625,11 +3625,11 @@ FrontendResult<void> lower_to_rir(const MirModule& mir, FrontendRirModule& out) 
         }
         out.module.upstreams[i].name = {name_buf, src_name.len};
         out.module.upstreams[i].has_address = mir.upstreams[i].has_address;
-        out.module.upstreams[i].ip = mir.upstreams[i].ip;
+        out.module.upstreams[i].address = mir.upstreams[i].address;
         out.module.upstreams[i].port = mir.upstreams[i].port;
         out.module.upstreams[i].extra_count = mir.upstreams[i].extra_count;
         for (u32 b = 0; b < mir.upstreams[i].extra_count; b++) {
-            out.module.upstreams[i].extra_ips[b] = mir.upstreams[i].extra_ips[b];
+            out.module.upstreams[i].extra_addresses[b] = mir.upstreams[i].extra_addresses[b];
             out.module.upstreams[i].extra_ports[b] = mir.upstreams[i].extra_ports[b];
         }
         // Active health-check config. hc_path is copied into arena memory (like
