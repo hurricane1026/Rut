@@ -205,6 +205,23 @@ TEST(event_loop, delegates_shared_upstream_concurrency) {
     loop->shutdown();
 }
 
+TEST(event_loop, dispatch_event_ignores_non_connection_event_kinds) {
+    SmallLoop loop;
+    loop.setup();
+    loop.inject_and_dispatch(make_ev(0, IoEventType::Accept, 42));
+    auto* conn = loop.find_fd(42);
+    REQUIRE(conn != nullptr);
+
+    for (const auto type : {IoEventType::Accept,
+                            IoEventType::Timeout,
+                            IoEventType::HandlerTimer,
+                            IoEventType::Count}) {
+        IoEvent event = make_ev(conn->id, type, 0);
+        loop.dispatch_event(*conn, event);
+        CHECK_EQ(conn->fd, 42);
+    }
+}
+
 // === Drain accepts: served gracefully, not RST'd ===
 
 TEST(drain_accept, accepts_during_drain_get_response) {
