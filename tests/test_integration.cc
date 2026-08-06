@@ -16762,6 +16762,84 @@ TEST(route, marking_policy_validates_scalar_constant_result_types) {
     }
 }
 
+TEST(route, marking_policy_validates_aggregate_and_optional_operations) {
+    using namespace rut;
+    const rir::Type bool_type{rir::TypeKind::Bool, nullptr, nullptr};
+    const rir::Type i32_type{rir::TypeKind::I32, nullptr, nullptr};
+    const rir::Type i64_type{rir::TypeKind::I64, nullptr, nullptr};
+    const rir::Type str_type{rir::TypeKind::Str, nullptr, nullptr};
+    const rir::Type array_i64_type{rir::TypeKind::Array, &i64_type, nullptr};
+    const rir::Type str_list_type{rir::TypeKind::StrList, nullptr, nullptr};
+    const rir::Type optional_str_type{rir::TypeKind::Optional, &str_type, nullptr};
+    const rir::Type optional_i64_type{rir::TypeKind::Optional, &i64_type, nullptr};
+    rir::Value values[6] = {{&array_i64_type, {}, 0},
+                            {&i32_type, {}, 0},
+                            {&i64_type, {}, 0},
+                            {&str_list_type, {}, 0},
+                            {&str_type, {}, 0},
+                            {&optional_i64_type, {}, 0}};
+    rir::Function fn{};
+    fn.values = values;
+    fn.value_count = 6;
+    rir::Instruction inst{};
+    inst.operands[0] = {0};
+    inst.result = {1};
+    inst.operand_count = 1;
+    inst.op = rir::Opcode::ArrayLen;
+    CHECK(marking_policy_instruction_types_valid(fn, inst));
+
+    inst.operand_count = 2;
+    inst.operands[1] = {1};
+    inst.result = {2};
+    inst.op = rir::Opcode::ArrayGet;
+    CHECK(marking_policy_instruction_types_valid(fn, inst));
+
+    inst.operand_count = 1;
+    inst.operands[0] = {3};
+    inst.result = {1};
+    inst.op = rir::Opcode::StrListLen;
+    CHECK(marking_policy_instruction_types_valid(fn, inst));
+    inst.result = {0};
+    values[0].type = &bool_type;
+    inst.op = rir::Opcode::StrListIsEmpty;
+    CHECK(marking_policy_instruction_types_valid(fn, inst));
+    values[0].type = &array_i64_type;
+    inst.result = {4};
+    values[4].type = &optional_str_type;
+    inst.operand_count = 2;
+    inst.operands[1] = {1};
+    inst.op = rir::Opcode::StrListGet;
+    CHECK(marking_policy_instruction_types_valid(fn, inst));
+
+    inst.operand_count = 1;
+    inst.operands[0] = {1};
+    inst.result = {2};
+    inst.op = rir::Opcode::SextI64;
+    CHECK(marking_policy_instruction_types_valid(fn, inst));
+
+    values[0].type = &str_type;
+    values[1].type = &str_type;
+    values[2].type = &str_type;
+    inst.operand_count = 2;
+    inst.operands[0] = {0};
+    inst.operands[1] = {1};
+    inst.result = {2};
+    inst.op = rir::Opcode::StrTrimPrefix;
+    CHECK(marking_policy_instruction_types_valid(fn, inst));
+
+    values[0].type = &i64_type;
+    values[2].type = &optional_i64_type;
+    inst.operand_count = 1;
+    inst.operands[0] = {0};
+    inst.result = {2};
+    inst.op = rir::Opcode::OptWrap;
+    CHECK(marking_policy_instruction_types_valid(fn, inst));
+    inst.operands[0] = {2};
+    inst.result = {0};
+    inst.op = rir::Opcode::OptUnwrap;
+    CHECK(marking_policy_instruction_types_valid(fn, inst));
+}
+
 TEST(route, marking_policy_json_append_validates_operand_types) {
     using namespace rut;
     const rir::Type bool_type{rir::TypeKind::Bool, nullptr, nullptr};
