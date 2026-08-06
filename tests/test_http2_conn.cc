@@ -1559,12 +1559,11 @@ TEST(http2_conn, continuation_terminated_request_trailers_finalize_without_reset
     Capture cap;
     setup(c, cap);
 
-    hpack::Header request[] = {
-        {{":method", 7}, {"POST", 4}}, {{":path", 5}, {"/up", 3}}};
+    hpack::Header request[] = {{{":method", 7}, {"POST", 4}}, {{":path", 5}, {"/up", 3}}};
     u8 initial[512];
     u32 initial_len = http2_write_headers(initial, sizeof(initial), 1, request, 2, false);
-    initial_len += http2_write_data(
-        initial + initial_len, 1, reinterpret_cast<const u8*>("hello"), 5, false);
+    initial_len +=
+        http2_write_data(initial + initial_len, 1, reinterpret_cast<const u8*>("hello"), 5, false);
     u8 initial_in[640];
     const u32 initial_in_len = with_preface(initial_in, initial, initial_len);
     u8 out[256];
@@ -1576,17 +1575,12 @@ TEST(http2_conn, continuation_terminated_request_trailers_finalize_without_reset
     hpack::Encoder encoder;
     encoder.init(4096);
     u8 trailer_block[128];
-    const u32 trailer_len =
-        encoder.encode(trailer_block, Str{"x-checksum", 10}, Str{"ok", 2});
+    const u32 trailer_len = encoder.encode(trailer_block, Str{"x-checksum", 10}, Str{"ok", 2});
     REQUIRE(trailer_len > 1);
 
     u8 trailers[256];
-    u32 trailers_len = put_frame(trailers,
-                                 Http2FrameType::Headers,
-                                 http2_flag::kEndStream,
-                                 1,
-                                 trailer_block,
-                                 1);
+    u32 trailers_len =
+        put_frame(trailers, Http2FrameType::Headers, http2_flag::kEndStream, 1, trailer_block, 1);
     trailers_len += put_frame(trailers + trailers_len,
                               Http2FrameType::Continuation,
                               http2_flag::kEndHeaders,
@@ -1610,8 +1604,7 @@ TEST(http2_conn, continuation_terminated_pseudo_trailer_resets_the_stream) {
     Capture cap;
     setup(c, cap);
 
-    hpack::Header request[] = {
-        {{":method", 7}, {"POST", 4}}, {{":path", 5}, {"/up", 3}}};
+    hpack::Header request[] = {{{":method", 7}, {"POST", 4}}, {{":path", 5}, {"/up", 3}}};
     u8 initial[256];
     const u32 initial_len = http2_write_headers(initial, sizeof(initial), 1, request, 2, false);
     u8 initial_in[384];
@@ -1623,16 +1616,11 @@ TEST(http2_conn, continuation_terminated_pseudo_trailer_resets_the_stream) {
     hpack::Encoder encoder;
     encoder.init(4096);
     u8 trailer_block[128];
-    const u32 trailer_len =
-        encoder.encode(trailer_block, Str{":path", 5}, Str{"/invalid", 8});
+    const u32 trailer_len = encoder.encode(trailer_block, Str{":path", 5}, Str{"/invalid", 8});
     REQUIRE(trailer_len > 1);
     u8 trailers[256];
-    u32 trailers_len = put_frame(trailers,
-                                 Http2FrameType::Headers,
-                                 http2_flag::kEndStream,
-                                 1,
-                                 trailer_block,
-                                 1);
+    u32 trailers_len =
+        put_frame(trailers, Http2FrameType::Headers, http2_flag::kEndStream, 1, trailer_block, 1);
     trailers_len += put_frame(trailers + trailers_len,
                               Http2FrameType::Continuation,
                               http2_flag::kEndHeaders,
