@@ -278,6 +278,30 @@ TEST(event_loop, jit_forward_to_unknown_upstream_fails_closed) {
     CHECK_EQ(conn->state, ConnState::Sending);
 }
 
+TEST(event_loop, jit_forward_starts_configured_upstream_connect) {
+    SmallLoop loop;
+    loop.setup();
+    loop.inject_and_dispatch(make_ev(0, IoEventType::Accept, 42));
+    Connection* conn = loop.find_fd(42);
+    REQUIRE(conn != nullptr);
+    RouteConfig config;
+    REQUIRE(config.add_upstream("backend", 0x7f000001, 8080).has_value());
+    conn->request_config = &config;
+    JitDispatchOutcome outcome{};
+    outcome.kind = JitDispatchOutcome::Kind::Forward;
+    outcome.upstream_id = 0;
+
+    handle_jit_outcome<SmallLoop>(&loop, *conn, outcome, nullptr, /*keep_alive=*/true);
+
+    CHECK_EQ(conn->state, ConnState::Proxying);
+    CHECK(conn->upstream_slot_held);
+    CHECK_EQ(conn->upstream_idx, 0u);
+    CHECK_EQ(conn->upstream_attempts, 1u);
+    REQUIRE_GE(conn->upstream_fd, 0);
+    ::close(conn->upstream_fd);
+    conn->upstream_fd = -1;
+}
+
 // === Drain accepts: served gracefully, not RST'd ===
 
 TEST(drain_accept, accepts_during_drain_get_response) {
