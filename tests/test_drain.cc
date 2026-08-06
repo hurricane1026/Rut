@@ -1,5 +1,6 @@
 // Graceful shutdown + connection draining tests.
 #include "rut/runtime/drain.h"
+#include "rut/runtime/cache_table.h"
 #include "rut/runtime/event_loop.h"
 #include "test.h"
 #include "test_helpers.h"
@@ -331,6 +332,22 @@ TEST(route_config, direct_api_preserves_deduplication_and_empty_input_contracts)
                                                         range_end_network_order));
     CHECK_FALSE(cfg.remove_firewall_deny_range(static_cast<const char*>(nullptr)));
     CHECK_EQ(cfg.match_canonical({nullptr, 0}, kRouteMethodGet, nullptr, nullptr, 0), nullptr);
+}
+
+TEST(cache_table, full_set_evicts_the_lowest_value) {
+    CacheTable table;
+    REQUIRE(table.init(4, 1));
+    table.set(1, 10);
+    table.set(2, 20);
+    table.set(3, 30);
+    table.set(4, 40);
+    table.set(5, 50);
+
+    i64 value = 0;
+    CHECK_FALSE(table.get(1, &value));
+    CHECK(table.get(5, &value));
+    CHECK_EQ(value, 50);
+    table.destroy();
 }
 
 TEST(event_loop, unsupported_jit_outcome_fails_closed) {
