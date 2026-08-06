@@ -2187,6 +2187,59 @@ TEST(h2_serving, buffered_forward_rejects_content_length_injection_overflow) {
     CHECK(decoded[0].value.eq(Str{"413", 3}));
 }
 
+TEST(h2_serving, static_response_headers_filter_connection_specific_fields) {
+    Http2Conn h2;
+    h2.init();
+    Connection conn;
+    conn.reset();
+    conn.h2 = &h2;
+    FakeH2Loop loop;
+    u8 response[512]{};
+    H2Dispatch<FakeH2Loop> dispatch{&loop, &conn, response, sizeof(response), 0, false};
+    RouteConfig config;
+    static constexpr char kRouteHeader[] = "x-route";
+    static constexpr char kRouteValue[] = "enabled";
+    static constexpr char kKeepAlive[] = "keep-alive";
+    static constexpr char kKeepAliveValue[] = "timeout=5";
+    const char* keys[] = {kRouteHeader, kKeepAlive};
+    const u32 key_lens[] = {sizeof(kRouteHeader) - 1, sizeof(kKeepAlive) - 1};
+    const char* values[] = {kRouteValue, kKeepAliveValue};
+    const u32 value_lens[] = {sizeof(kRouteValue) - 1, sizeof(kKeepAliveValue) - 1};
+    const u16 header_set = config.add_response_header_set(keys, key_lens, values, value_lens, 2);
+    REQUIRE_NE(header_set, 0u);
+    JitDispatchOutcome outcome{};
+    outcome.kind = JitDispatchOutcome::Kind::ReturnStatus;
+    outcome.status_code = 200;
+    outcome.response_headers_idx = header_set;
+
+    h2_emit_outcome(dispatch, 1, outcome, &config, false);
+
+    Http2FrameHeader header{};
+    REQUIRE(parse_frame_header(response, dispatch.resp_len, &header) == ParseStatus::Complete);
+    hpack::DynamicTable dyn;
+    dyn.init(4096);
+    hpack::Header decoded[8];
+    u8 scratch[256];
+    u32 count = 0;
+    REQUIRE(hpack::decode_header_block(dyn,
+                                       response + kFrameHeaderSize,
+                                       header.length,
+                                       scratch,
+                                       sizeof(scratch),
+                                       decoded,
+                                       8,
+                                       &count));
+    bool has_route_header = false;
+    bool has_keep_alive = false;
+    for (u32 i = 0; i < count; i++) {
+        has_route_header |= decoded[i].name.eq(Str{kRouteHeader, sizeof(kRouteHeader) - 1}) &&
+                            decoded[i].value.eq(Str{kRouteValue, sizeof(kRouteValue) - 1});
+        has_keep_alive |= decoded[i].name.eq(Str{kKeepAlive, sizeof(kKeepAlive) - 1});
+    }
+    CHECK(has_route_header);
+    CHECK_FALSE(has_keep_alive);
+}
+
 TEST(h2_serving, bodyless_mutated_status_suppresses_dynamic_data) {
     Http2Conn h2;
     h2.init();
