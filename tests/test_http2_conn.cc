@@ -1829,6 +1829,56 @@ TEST(h2_serving, route_less_request_uses_default_response) {
     CHECK(decoded[0].value.eq(Str{"200", 3}));
 }
 
+TEST(h2_serving, bodyless_proxy_route_parks_forwardable_request) {
+    const hpack::Header headers[] = {{{":method", 7}, {"GET", 3}},
+                                     {{":path", 5}, {"/proxy", 6}},
+                                     {{":scheme", 7}, {"https", 5}},
+                                     {{":authority", 10}, {"example", 7}}};
+    Http2Conn h2;
+    h2.init();
+    Connection conn;
+    conn.reset();
+    conn.h2 = &h2;
+    RouteConfig config;
+    REQUIRE(config.add_upstream("backend", 0x7f000001, 8080).has_value());
+    REQUIRE(config.add_proxy("/proxy", kRouteMethodGet, 0));
+    conn.request_config = &config;
+    FakeH2Loop loop;
+    u8 response[256]{};
+    H2Dispatch<FakeH2Loop> dispatch{&loop, &conn, response, sizeof(response), 0, false};
+
+    h2_dispatch_request(dispatch, 1, headers, 4, /*end_stream=*/true);
+
+    CHECK_EQ(dispatch.resp_len, 0u);
+    CHECK_EQ(h2.async_stream, 1u);
+    CHECK_EQ(h2.async_kind, H2AsyncKind::Proxy);
+    CHECK_EQ(h2.async_upstream_id, 0u);
+    h2_clear_async(h2);
+}
+
+TEST(h2_serving, proxy_route_rejects_request_without_scheme) {
+    const hpack::Header headers[] = {{{":method", 7}, {"GET", 3}},
+                                     {{":path", 5}, {"/proxy", 6}},
+                                     {{":authority", 10}, {"example", 7}}};
+    Http2Conn h2;
+    h2.init();
+    Connection conn;
+    conn.reset();
+    conn.h2 = &h2;
+    RouteConfig config;
+    REQUIRE(config.add_upstream("backend", 0x7f000001, 8080).has_value());
+    REQUIRE(config.add_proxy("/proxy", kRouteMethodGet, 0));
+    conn.request_config = &config;
+    FakeH2Loop loop;
+    u8 response[256]{};
+    H2Dispatch<FakeH2Loop> dispatch{&loop, &conn, response, sizeof(response), 0, false};
+
+    h2_dispatch_request(dispatch, 1, headers, 3, /*end_stream=*/true);
+
+    CHECK_EQ(h2.async_stream, 0u);
+    REQUIRE_GT(dispatch.resp_len, 0u);
+}
+
 TEST(h2_serving, selected_buffered_forward_defers_and_buffers_data) {
     const hpack::Header headers[] = {{{":method", 7}, {"POST", 4}},
                                      {{":path", 5}, {"/upload", 7}},
