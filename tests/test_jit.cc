@@ -326,6 +326,23 @@ TEST(marking_policy, type_equality_distinguishes_struct_definitions) {
     CHECK(marking_policy_types_equal(&first_i64, &second_i64));
 }
 
+TEST(marking_policy, side_effect_only_instructions_require_no_result_value) {
+    const rir::Opcode operations[] = {rir::Opcode::RespRemoveHeader,
+                                      rir::Opcode::RespCommitHeaders,
+                                      rir::Opcode::JsonReset,
+                                      rir::Opcode::JsonAppendRaw,
+                                      rir::Opcode::JsonAppendControlPlane,
+                                      rir::Opcode::JsonFinish};
+    rir::Function function{};
+
+    for (rir::Opcode operation : operations) {
+        rir::Instruction instruction{};
+        instruction.op = operation;
+        instruction.result = rir::kNoValue;
+        CHECK(marking_policy_instruction_types_valid(function, instruction));
+    }
+}
+
 static const char kGetRootRequest[] =
     "GET / HTTP/1.1\r\n"
     "Host: localhost\r\n"
