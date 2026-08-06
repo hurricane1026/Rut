@@ -275,6 +275,18 @@ TEST(event_loop, lazily_allocates_and_reclaims_proxy_and_terminate_buffers) {
     loop->shutdown();
 }
 
+TEST(event_loop, timeout_dispatch_clamps_accumulated_ticks_to_wheel_size) {
+    using rut::EventLoop;
+    using rut::MockBackend;
+    auto loop = std::make_unique<EventLoop<MockBackend>>();
+    REQUIRE(loop->init(0, -1).has_value());
+
+    loop->dispatch(make_ev(0, IoEventType::Timeout, TimerWheel::kSlots + 3));
+
+    CHECK_EQ(loop->timer.cursor, TimerWheel::kSlots);
+    loop->shutdown();
+}
+
 TEST(event_loop, unsupported_jit_outcome_fails_closed) {
     SmallLoop loop;
     loop.setup();
