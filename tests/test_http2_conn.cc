@@ -2357,6 +2357,87 @@ TEST(h2_serving, response_header_remove_mutation_filters_captured_header) {
     CHECK(kept);
 }
 
+TEST(h2_serving, response_header_add_mutation_is_serialized) {
+    Http2Conn h2;
+    h2.init();
+    Connection conn;
+    conn.reset();
+    conn.h2 = &h2;
+    FakeH2Loop loop;
+    u8 response[256]{};
+    H2Dispatch<FakeH2Loop> dispatch{&loop, &conn, response, sizeof(response), 0, false};
+    jit::HandlerCtx response_ctx{};
+    response_ctx.response_header_count = 1;
+    response_ctx.response_header_mutations[0].mode = jit::ResponseHeaderMutationMode::Add;
+    response_ctx.response_header_mutations[0].name = {"x-added", 7};
+    response_ctx.response_header_mutations[0].value = {"yes", 3};
+    JitDispatchOutcome outcome{};
+    outcome.kind = JitDispatchOutcome::Kind::ReturnStatus;
+    outcome.status_code = 200;
+    outcome.response_ctx = &response_ctx;
+
+    h2_emit_outcome(dispatch, 1, outcome, nullptr, false);
+
+    Http2FrameHeader header{};
+    REQUIRE(parse_frame_header(response, dispatch.resp_len, &header) == ParseStatus::Complete);
+    hpack::DynamicTable dyn;
+    dyn.init(4096);
+    hpack::Header decoded[8];
+    u8 scratch[256];
+    u32 count = 0;
+    REQUIRE(hpack::decode_header_block(dyn,
+                                       response + kFrameHeaderSize,
+                                       header.length,
+                                       scratch,
+                                       sizeof(scratch),
+                                       decoded,
+                                       8,
+                                       &count));
+    bool has_added = false;
+    for (u32 i = 0; i < count; i++)
+        has_added |= decoded[i].name.eq(Str{"x-added", 7}) && decoded[i].value.eq(Str{"yes", 3});
+    CHECK(has_added);
+}
+
+TEST(h2_serving, invalid_response_header_mutation_fails_closed) {
+    Http2Conn h2;
+    h2.init();
+    Connection conn;
+    conn.reset();
+    conn.h2 = &h2;
+    FakeH2Loop loop;
+    u8 response[256]{};
+    H2Dispatch<FakeH2Loop> dispatch{&loop, &conn, response, sizeof(response), 0, false};
+    jit::HandlerCtx response_ctx{};
+    response_ctx.response_header_count = 1;
+    response_ctx.response_header_mutations[0].mode = jit::ResponseHeaderMutationMode::Add;
+    response_ctx.response_header_mutations[0].name = {"bad\nname", 8};
+    response_ctx.response_header_mutations[0].value = {"value", 5};
+    JitDispatchOutcome outcome{};
+    outcome.kind = JitDispatchOutcome::Kind::ReturnStatus;
+    outcome.status_code = 200;
+    outcome.response_ctx = &response_ctx;
+
+    h2_emit_outcome(dispatch, 1, outcome, nullptr, false);
+
+    Http2FrameHeader header{};
+    REQUIRE(parse_frame_header(response, dispatch.resp_len, &header) == ParseStatus::Complete);
+    hpack::DynamicTable dyn;
+    dyn.init(4096);
+    hpack::Header decoded[4];
+    u8 scratch[128];
+    u32 count = 0;
+    REQUIRE(hpack::decode_header_block(dyn,
+                                       response + kFrameHeaderSize,
+                                       header.length,
+                                       scratch,
+                                       sizeof(scratch),
+                                       decoded,
+                                       4,
+                                       &count));
+    CHECK(decoded[0].value.eq(Str{"500", 3}));
+}
+
 TEST(h2_serving, captured_304_content_length_is_removed_for_final_200) {
     Http2Conn h2;
     h2.init();
