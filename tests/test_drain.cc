@@ -261,6 +261,23 @@ TEST(event_loop, unsupported_jit_outcome_fails_closed) {
     CHECK_EQ(conn->state, ConnState::Sending);
 }
 
+TEST(event_loop, jit_forward_to_unknown_upstream_fails_closed) {
+    SmallLoop loop;
+    loop.setup();
+    loop.inject_and_dispatch(make_ev(0, IoEventType::Accept, 42));
+    Connection* conn = loop.find_fd(42);
+    REQUIRE(conn != nullptr);
+    JitDispatchOutcome outcome{};
+    outcome.kind = JitDispatchOutcome::Kind::Forward;
+    outcome.upstream_id = 7;
+
+    handle_jit_outcome<SmallLoop>(&loop, *conn, outcome, nullptr, /*keep_alive=*/true);
+
+    CHECK_EQ(conn->resp_status, 502u);
+    CHECK_FALSE(conn->keep_alive);
+    CHECK_EQ(conn->state, ConnState::Sending);
+}
+
 // === Drain accepts: served gracefully, not RST'd ===
 
 TEST(drain_accept, accepts_during_drain_get_response) {
