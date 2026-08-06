@@ -1326,6 +1326,51 @@ TEST(websocket, terminate_drops_complete_frames_and_keeps_both_receives_armed) {
     CHECK_EQ(loop.backend.ops[0].fd, 43);
 }
 
+TEST(websocket, terminate_client_close_starts_and_completes_echo_handshake) {
+    SmallLoop loop;
+    loop.setup();
+    loop.inject_and_dispatch(make_ev(0, IoEventType::Accept, 42));
+    auto* conn = loop.find_fd(42);
+    REQUIRE(conn != nullptr);
+    REQUIRE(loop.alloc_upstream_buf(*conn));
+    conn->is_ws_tunnel = true;
+    conn->is_ws_terminate = true;
+    conn->upstream_fd = 43;
+    conn->ws_c2u.masked = true;
+    conn->ws_c2u.from_client = true;
+    conn->ws_c2u.max_message_size = 64;
+    conn->ws_u2c.max_message_size = 64;
+    u8 c2u_msg[64] = {};
+    u8 u2c_msg[64] = {};
+    conn->ws_c2u_msg = c2u_msg;
+    conn->ws_u2c_msg = u2c_msg;
+    const u32 cid = conn->id;
+
+    // Masked Close(1000) from the client. The forward close goes upstream and
+    // the generated unmasked echo goes back to the client immediately.
+    const u8 close_frame[] = {0x88, 0x82, 1, 2, 3, 4, 0x03 ^ 1, 0xe8 ^ 2};
+    REQUIRE_EQ(conn->recv_buf.write(close_frame, sizeof(close_frame)), sizeof(close_frame));
+    loop.backend.op_count = 0;
+    on_ws_client_recv<SmallLoop>(
+        &loop, *conn, make_ev(cid, IoEventType::Recv, static_cast<i32>(sizeof(close_frame))));
+    REQUIRE_EQ(loop.backend.op_count, 2u);
+    CHECK_EQ(loop.backend.ops[0].type, MockOp::Send);
+    CHECK_EQ(loop.backend.ops[0].fd, 43);
+    CHECK_EQ(loop.backend.ops[1].type, MockOp::Send);
+    CHECK_EQ(loop.backend.ops[1].fd, 42);
+    CHECK(conn->ws_closing);
+    CHECK(conn->ws_close_upstream_inflight);
+    CHECK(conn->ws_close_client_inflight);
+
+    on_ws_client_to_upstream_sent<SmallLoop>(
+        &loop, *conn, make_ev(cid, IoEventType::UpstreamSend, 8));
+    CHECK_EQ(loop.conns[cid].fd, 42);
+    CHECK(!conn->ws_close_upstream_inflight);
+
+    on_ws_upstream_to_client_sent<SmallLoop>(&loop, *conn, make_ev(cid, IoEventType::Send, 4));
+    CHECK_EQ(loop.conns[cid].fd, -1);
+}
+
 // Bytes that race into recv_buf while a client→upstream tunnel send is in flight
 // must be forwarded next, never dropped: the send-completion consumes ONLY the
 // submitted length and re-sends the remainder, keeping client recv paused until
