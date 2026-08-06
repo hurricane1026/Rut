@@ -2097,6 +2097,96 @@ TEST(h2_serving, unsupported_event_yield_returns_503) {
     CHECK(decoded[0].value.eq(Str{"503", 3}));
 }
 
+TEST(h2_serving, buffered_forward_rejects_nonforwardable_request) {
+    Http2Conn h2;
+    h2.init();
+    Connection conn;
+    conn.reset();
+    conn.h2 = &h2;
+    FakeH2Loop loop;
+    u8 response[256]{};
+    H2Dispatch<FakeH2Loop> dispatch{&loop, &conn, response, sizeof(response), 0, false};
+    RouteEntry route{};
+    route.fn = &h2_buffered_forward;
+    static constexpr u8 kRequest[] = "POST / HTTP/1.1\r\nhost: example\r\n\r\n";
+
+    h2_invoke_emit(dispatch,
+                   1,
+                   &route,
+                   nullptr,
+                   0,
+                   nullptr,
+                   kRequest,
+                   sizeof(kRequest) - 1,
+                   /*request_forwardable=*/false);
+
+    REQUIRE_GT(dispatch.resp_len, 0u);
+    Http2FrameHeader header{};
+    REQUIRE(parse_frame_header(response, dispatch.resp_len, &header) == ParseStatus::Complete);
+    hpack::DynamicTable dyn;
+    dyn.init(4096);
+    hpack::Header decoded[4];
+    u8 scratch[128];
+    u32 count = 0;
+    REQUIRE(hpack::decode_header_block(dyn,
+                                       response + kFrameHeaderSize,
+                                       header.length,
+                                       scratch,
+                                       sizeof(scratch),
+                                       decoded,
+                                       4,
+                                       &count));
+    CHECK(decoded[0].value.eq(Str{"400", 3}));
+}
+
+TEST(h2_serving, buffered_forward_rejects_content_length_injection_overflow) {
+    Http2Conn h2;
+    h2.init();
+    Connection conn;
+    conn.reset();
+    conn.h2 = &h2;
+    FakeH2Loop loop;
+    u8 response[256]{};
+    H2Dispatch<FakeH2Loop> dispatch{&loop, &conn, response, sizeof(response), 0, false};
+    RouteEntry route{};
+    route.fn = &h2_buffered_forward;
+    u8 request[Http2Conn::kBodySynthCap];
+    __builtin_memset(request, 'x', sizeof(request));
+    static constexpr char kHeaders[] = "POST / HTTP/1.1\r\nhost: example\r\n\r\n";
+    __builtin_memcpy(request, kHeaders, sizeof(kHeaders) - 1);
+
+    h2_invoke_emit(dispatch,
+                   1,
+                   &route,
+                   nullptr,
+                   0,
+                   nullptr,
+                   request,
+                   sizeof(request),
+                   /*request_forwardable=*/true,
+                   sizeof(kHeaders) - 1,
+                   1,
+                   /*inject_content_length_on_forward=*/true);
+
+    REQUIRE_GT(dispatch.resp_len, 0u);
+    Http2FrameHeader header{};
+    REQUIRE(parse_frame_header(response, dispatch.resp_len, &header) == ParseStatus::Complete);
+    hpack::DynamicTable dyn;
+    dyn.init(4096);
+    hpack::Header decoded[4];
+    u8 scratch[128];
+    u32 count = 0;
+    REQUIRE(hpack::decode_header_block(dyn,
+                                       response + kFrameHeaderSize,
+                                       header.length,
+                                       scratch,
+                                       sizeof(scratch),
+                                       decoded,
+                                       4,
+                                       &count));
+    CHECK(decoded[0].value.eq(Str{"413", 3}));
+}
+
 TEST(h2_serving, bodyless_mutated_status_suppresses_dynamic_data) {
     Http2Conn h2;
     h2.init();
