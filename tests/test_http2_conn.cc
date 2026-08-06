@@ -2240,6 +2240,95 @@ TEST(h2_serving, static_response_headers_filter_connection_specific_fields) {
     CHECK_FALSE(has_keep_alive);
 }
 
+TEST(h2_serving, header_keyed_rate_limit_rejects_oversized_h2_header_block) {
+    Http2Conn h2;
+    h2.init();
+    Connection conn;
+    conn.reset();
+    conn.h2 = &h2;
+    RouteConfig config;
+    REQUIRE(config.add_static("/limited", kRouteMethodGet, 200));
+    REQUIRE(config.set_route_rate_limit(0, 10, 60));
+    REQUIRE(config.add_route_rate_limit_key(0, RateLimitKeyKind::Header, "x-client", 8));
+    conn.request_config = &config;
+    FakeH2Loop loop;
+    u8 response[256]{};
+    H2Dispatch<FakeH2Loop> dispatch{&loop, &conn, response, sizeof(response), 0, false};
+    char oversized_value[8192];
+    __builtin_memset(oversized_value, 'x', sizeof(oversized_value));
+    const hpack::Header headers[] = {{{":method", 7}, {"GET", 3}},
+                                     {{":path", 5}, {"/limited", 8}},
+                                     {{":scheme", 7}, {"https", 5}},
+                                     {{":authority", 10}, {"example", 7}},
+                                     {{"x-client", 8}, {oversized_value, sizeof(oversized_value)}}};
+
+    h2_dispatch_request(dispatch, 1, headers, 5, /*end_stream=*/true);
+
+    Http2FrameHeader header{};
+    REQUIRE(parse_frame_header(response, dispatch.resp_len, &header) == ParseStatus::Complete);
+    hpack::DynamicTable dyn;
+    dyn.init(4096);
+    hpack::Header decoded[4];
+    u8 scratch[128];
+    u32 count = 0;
+    REQUIRE(hpack::decode_header_block(dyn,
+                                       response + kFrameHeaderSize,
+                                       header.length,
+                                       scratch,
+                                       sizeof(scratch),
+                                       decoded,
+                                       4,
+                                       &count));
+    CHECK(decoded[0].value.eq(Str{"431", 3}));
+}
+
+TEST(h2_serving, rate_limited_static_route_returns_429_after_quota) {
+    RouteConfig config;
+    REQUIRE(config.add_static("/limited", kRouteMethodGet, 200));
+    REQUIRE(config.set_route_rate_limit(0, 1, 60));
+    const hpack::Header headers[] = {{{":method", 7}, {"GET", 3}},
+                                     {{":path", 5}, {"/limited", 8}},
+                                     {{":scheme", 7}, {"https", 5}},
+                                     {{":authority", 10}, {"example", 7}}};
+    const auto dispatch_status = [&](u32 stream_id, u16* status) {
+        Http2Conn h2;
+        h2.init();
+        Connection conn;
+        conn.reset();
+        conn.h2 = &h2;
+        conn.request_config = &config;
+        FakeH2Loop loop;
+        u8 response[256]{};
+        H2Dispatch<FakeH2Loop> dispatch{&loop, &conn, response, sizeof(response), 0, false};
+        h2_dispatch_request(dispatch, stream_id, headers, 4, /*end_stream=*/true);
+        Http2FrameHeader frame{};
+        REQUIRE(parse_frame_header(response, dispatch.resp_len, &frame) == ParseStatus::Complete);
+        hpack::DynamicTable dyn;
+        dyn.init(4096);
+        hpack::Header decoded[4];
+        u8 scratch[128];
+        u32 count = 0;
+        REQUIRE(hpack::decode_header_block(dyn,
+                                           response + kFrameHeaderSize,
+                                           frame.length,
+                                           scratch,
+                                           sizeof(scratch),
+                                           decoded,
+                                           4,
+                                           &count));
+        *status = static_cast<u16>((decoded[0].value.ptr[0] - '0') * 100 +
+                                   (decoded[0].value.ptr[1] - '0') * 10 +
+                                   (decoded[0].value.ptr[2] - '0'));
+    };
+
+    u16 first_status = 0;
+    u16 second_status = 0;
+    dispatch_status(1, &first_status);
+    dispatch_status(3, &second_status);
+    CHECK_EQ(first_status, 200u);
+    CHECK_EQ(second_status, 429u);
+}
+
 TEST(h2_serving, bodyless_mutated_status_suppresses_dynamic_data) {
     Http2Conn h2;
     h2.init();
