@@ -2447,6 +2447,20 @@ TEST(control_plane_mutation, admission_in_progress_tracks_reserved_identity) {
     CHECK(port.admission_in_progress());
 }
 
+TEST(control_plane_mutation, zero_generation_health_snapshot_is_empty) {
+    ControlPlaneMutationPort port;
+    port.reset(1, true);
+    ManualHealthOverride verdicts[2] = {ManualHealthOverride::Healthy,
+                                        ManualHealthOverride::Unhealthy};
+    u64 version = 99;
+
+    REQUIRE(port.manual_health_snapshot(/*generation=*/0, 0, 2, verdicts, &version));
+
+    CHECK_EQ(verdicts[0], ManualHealthOverride::None);
+    CHECK_EQ(verdicts[1], ManualHealthOverride::None);
+    CHECK_EQ(version, 0u);
+}
+
 int main(int argc, char** argv) {
     return rut::test::run_all(argc, argv);
 }
