@@ -288,6 +288,24 @@ TEST(http2_conn, rst_stream_closes_and_notifies) {
     Http2Conn c;
     Capture cap;
     setup(c, cap);
+    c.pending_stream = 1;
+    c.pending_body_start = 9;
+    c.pending_synth_len = 8;
+    c.pending_body_len = 7;
+    c.pending_content_length = 6;
+    c.pending_has_content_length = true;
+    c.pending_buffer_body = true;
+    c.pending_request_forwardable = true;
+    c.pending_overflow = true;
+    c.pending_forward_capture = true;
+    c.pending_forward_upstream_id = 5;
+    c.pending_forward_state = 4;
+    c.pending_timer_state = 3;
+    c.pending_timer_ms = 2;
+    c.pending_route_action = RouteAction::Proxy;
+    c.pending_static_status = 418;
+    c.pending_route_param_count = 1;
+    c.pending_route_params[0] = {"id", 2, "42", 2};
     hpack::Header hs[] = {{{":method", 7}, {"GET", 3}}, {{":path", 5}, {"/", 1}}};
     u8 frame[256];
     u32 fn = http2_write_headers(frame, sizeof(frame), 1, hs, 2, false);
@@ -301,6 +319,24 @@ TEST(http2_conn, rst_stream_closes_and_notifies) {
     CHECK_EQ(cap.reset_stream, 1u);
     CHECK(cap.reset_err == Http2Error::Cancel);
     CHECK(c.find_stream(1) == nullptr);  // closed streams are not findable
+    CHECK_EQ(c.pending_stream, 0u);
+    CHECK_EQ(c.pending_body_start, 0u);
+    CHECK_EQ(c.pending_synth_len, 0u);
+    CHECK_EQ(c.pending_body_len, 0u);
+    CHECK_EQ(c.pending_content_length, 0u);
+    CHECK_FALSE(c.pending_has_content_length);
+    CHECK_FALSE(c.pending_buffer_body);
+    CHECK_FALSE(c.pending_request_forwardable);
+    CHECK_FALSE(c.pending_overflow);
+    CHECK_FALSE(c.pending_forward_capture);
+    CHECK_EQ(c.pending_forward_upstream_id, 0u);
+    CHECK_EQ(c.pending_forward_state, 0u);
+    CHECK_EQ(c.pending_timer_state, 0u);
+    CHECK_EQ(c.pending_timer_ms, 0u);
+    CHECK(c.pending_route_action == RouteAction::Static);
+    CHECK_EQ(c.pending_static_status, 200u);
+    CHECK_EQ(c.pending_route_param_count, 0u);
+    CHECK_EQ(c.pending_route_params[0].value_len, 0u);
 }
 
 // Regression: a stream we've already responded to (END_STREAM sent) while the
@@ -1087,6 +1123,107 @@ TEST(http2_conn, window_update_overflow_rsts_stream) {
     Http2Result r = c.process(in, inlen, out, sizeof(out), &ow);
     CHECK_FALSE(r.close);  // stream-level error, connection survives
     CHECK(has_frame(out, ow, Http2FrameType::RstStream, 0, 0));
+}
+
+TEST(http2_conn, data_exceeding_stream_receive_window_rsts_stream) {
+    Http2Conn c;
+    Capture cap;
+    setup(c, cap);
+
+    const hpack::Header request_headers[] = {
+        {{":method", 7}, {"POST", 4}},
+        {{":path", 5}, {"/", 1}},
+    };
+    u8 headers[256];
+    u32 headers_len =
+        http2_write_headers(headers, sizeof(headers), 1, request_headers, 2, /*end_stream=*/false);
+    u8 in[384];
+    u32 inlen = with_preface(in, headers, headers_len);
+    u8 out[256];
+    u32 ow = 0;
+    REQUIRE_FALSE(c.process(in, inlen, out, sizeof(out), &ow).close);
+
+    Http2Stream* stream = c.find_stream(1);
+    REQUIRE(stream != nullptr);
+    stream->recv_window = 1;
+
+    const u8 payload[] = {'o', 'k'};
+    u8 data[64];
+    const u32 data_len = http2_write_data(data, 1, payload, sizeof(payload), false);
+    ow = 0;
+    Http2Result result = c.process(data, data_len, out, sizeof(out), &ow);
+    CHECK_FALSE(result.close);
+    CHECK(has_frame(out, ow, Http2FrameType::RstStream, 0, 0));
+    CHECK_EQ(cap.reset_calls, 1u);
+    CHECK(cap.reset_err == Http2Error::FlowControlError);
+    CHECK(c.find_stream(1) == nullptr);
+}
+
+TEST(http2_conn, data_exceeding_connection_receive_window_goaways) {
+    Http2Conn c;
+    Capture cap;
+    setup(c, cap);
+    c.conn_recv_window = 1;
+
+    const u8 payload[] = {'o', 'k'};
+    u8 frame[64];
+    const u32 frame_len = http2_write_data(frame, 1, payload, sizeof(payload), false);
+    u8 in[128];
+    const u32 in_len = with_preface(in, frame, frame_len);
+    u8 out[128];
+    u32 out_len = 0;
+    Http2Result result = c.process(in, in_len, out, sizeof(out), &out_len);
+    CHECK(result.close);
+    CHECK(has_frame(out, out_len, Http2FrameType::Goaway, 0, 0));
+}
+
+TEST(http2_conn, headers_padding_larger_than_payload_goaways) {
+    Http2Conn c;
+    Capture cap;
+    setup(c, cap);
+
+    const u8 payload[] = {2, 0};
+    u8 frame[64];
+    const u32 frame_len = put_frame(frame,
+                                    Http2FrameType::Headers,
+                                    http2_flag::kPadded | http2_flag::kEndHeaders,
+                                    1,
+                                    payload,
+                                    sizeof(payload));
+    u8 in[128];
+    const u32 in_len = with_preface(in, frame, frame_len);
+    u8 out[128];
+    u32 out_len = 0;
+    Http2Result result = c.process(in, in_len, out, sizeof(out), &out_len);
+    CHECK(result.close);
+    CHECK(has_frame(out, out_len, Http2FrameType::Goaway, 0, 0));
+}
+
+TEST(http2_conn, full_live_stream_table_refuses_new_stream) {
+    Http2Conn c;
+    Capture cap;
+    setup(c, cap);
+    c.nstreams = Http2Conn::kMaxStreams;
+    for (u32 i = 0; i < c.nstreams; i++) {
+        c.streams[i].id = i * 2 + 1;
+        c.streams[i].state = Http2StreamState::Open;
+    }
+
+    const hpack::Header request_headers[] = {
+        {{":method", 7}, {"GET", 3}},
+        {{":path", 5}, {"/", 1}},
+    };
+    u8 frame[256];
+    const u32 frame_len =
+        http2_write_headers(frame, sizeof(frame), 129, request_headers, 2, /*end_stream=*/true);
+    u8 in[320];
+    const u32 in_len = with_preface(in, frame, frame_len);
+    u8 out[128];
+    u32 out_len = 0;
+    Http2Result result = c.process(in, in_len, out, sizeof(out), &out_len);
+    CHECK_FALSE(result.close);
+    CHECK(has_frame(out, out_len, Http2FrameType::RstStream, 0, 0));
+    CHECK_EQ(c.last_stream_id, 129u);
 }
 
 TEST(http2_conn, write_response_with_body_and_headers) {
