@@ -16697,6 +16697,43 @@ TEST(route, marking_policy_comparisons_reject_unsupported_aggregate_types) {
     CHECK_FALSE(marking_policy_instruction_types_valid(fn, cmp));
 }
 
+TEST(route, marking_policy_validates_integer_arithmetic_opcode_family) {
+    using namespace rut;
+    const rir::Type i32_type{rir::TypeKind::I32, nullptr, nullptr};
+    const rir::Type i64_type{rir::TypeKind::I64, nullptr, nullptr};
+    rir::Value values[3] = {{&i32_type, {}, 0}, {&i32_type, {}, 0}, {&i32_type, {}, 0}};
+    rir::Function fn{};
+    fn.values = values;
+    fn.value_count = 3;
+    rir::Instruction inst{};
+    inst.result = {2};
+    inst.operand_count = 2;
+    inst.operands[0] = {0};
+    inst.operands[1] = {1};
+
+    for (const auto op : {rir::Opcode::BitAnd,
+                          rir::Opcode::BitOr,
+                          rir::Opcode::BitXor,
+                          rir::Opcode::BitShl,
+                          rir::Opcode::BitShr,
+                          rir::Opcode::Add,
+                          rir::Opcode::Sub,
+                          rir::Opcode::Mul,
+                          rir::Opcode::Div,
+                          rir::Opcode::Mod,
+                          rir::Opcode::MaxInt,
+                          rir::Opcode::MinInt}) {
+        inst.op = op;
+        CHECK(marking_policy_instruction_types_valid(fn, inst));
+    }
+
+    values[0].type = &i64_type;
+    CHECK_FALSE(marking_policy_instruction_types_valid(fn, inst));
+    values[1].type = &i64_type;
+    values[2].type = &i64_type;
+    CHECK(marking_policy_instruction_types_valid(fn, inst));
+}
+
 TEST(route, marking_policy_json_append_validates_operand_types) {
     using namespace rut;
     const rir::Type bool_type{rir::TypeKind::Bool, nullptr, nullptr};
