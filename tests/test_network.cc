@@ -4787,6 +4787,12 @@ TEST(route, rir_function_needs_req_body_guard_paths) {
     fn.yield_kinds = &yield_kind;
     insts[0].op = rir::Opcode::YieldTimer;
     CHECK(rir_function_can_forward_buffered(fn));
+
+    CHECK_FALSE(rir_function_needs_control_plane_snapshot(fn));
+    insts[0].op = rir::Opcode::JsonAppendControlPlane;
+    CHECK(rir_function_needs_control_plane_snapshot(fn));
+    fn.blocks = nullptr;
+    CHECK_FALSE(rir_function_needs_control_plane_snapshot(fn));
 }
 
 TEST(route, populate_route_config_rejects_malformed_runtime_tables) {
