@@ -10,6 +10,7 @@
 #include "rut/runtime/simd/simd.h"
 #include "rut/runtime/slab_pool.h"
 #include "rut/runtime/slice_pool.h"
+#include "rut/runtime/signal_wait.h"
 #include "rut/runtime/tls_iouring.h"
 #include "rut/runtime/upstream_concurrency.h"
 #include "rut/runtime/upstream_pool.h"
@@ -21,11 +22,19 @@
 #include <thread>
 
 #include <errno.h>
+#include <signal.h>
 #include <sys/socket.h>
 
 using rut::test_fault::ScopedFakeSocket;
 using rut::test_fault::ScopedMemoryFault;
 using rut::test_fault::ScopedRecvData;
+
+TEST(signal_wait, classifies_saved_errno_without_observing_global_errno) {
+    CHECK_FALSE(signal_wait_failed(-1, EAGAIN));
+    CHECK_FALSE(signal_wait_failed(-1, EINTR));
+    CHECK_FALSE(signal_wait_failed(SIGTERM, 0));
+    CHECK(signal_wait_failed(-1, EINVAL));
+}
 
 // === Accept ===
 

@@ -2,6 +2,7 @@
 #include "rut/runtime/epoll_event_loop.h"
 #include "rut/runtime/iouring_event_loop.h"
 #include "rut/runtime/shard.h"
+#include "rut/runtime/signal_wait.h"
 #include "rut/runtime/socket.h"
 #include "rut/runtime/tls.h"
 
@@ -400,7 +401,7 @@ static i32 run_shards(u16 port,
             }
         }
 #endif
-        if (sig < 0 && wait_errno != EAGAIN && wait_errno != EINTR) {
+        if (signal_wait_failed(sig, wait_errno)) {
             write_str("sigtimedwait failed; beginning shutdown\n");
             break;
         }
