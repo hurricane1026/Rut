@@ -1173,6 +1173,43 @@ TEST(websocket, upgrade_101_sent_preserves_early_only_upstream_bytes) {
     CHECK_EQ(loop.backend.ops[2].conn_id, conn->id);
 }
 
+// A terminate-mode Close must echo to both peers and retain the connection until
+// each close-frame send completes. This directly exercises the close driver plus
+// both terminate-mode completion callbacks.
+TEST(websocket, terminate_close_handshake_waits_for_both_echoes) {
+    SmallLoop loop;
+    loop.setup();
+    loop.inject_and_dispatch(make_ev(0, IoEventType::Accept, 42));
+    auto* conn = loop.find_fd(42);
+    REQUIRE(conn != nullptr);
+    conn->is_ws_tunnel = true;
+    conn->is_ws_terminate = true;
+    conn->upstream_fd = 43;
+    conn->ws_closing = true;
+    conn->ws_close_client_need = true;
+    conn->ws_close_upstream_need = true;
+    conn->ws_echo_close_code = 1000;
+    const u32 cid = conn->id;
+
+    loop.backend.op_count = 0;
+    REQUIRE(ws_drive_close(&loop, *conn));
+    REQUIRE_EQ(loop.backend.op_count, 2u);
+    CHECK_EQ(loop.backend.ops[0].type, MockOp::Send);
+    CHECK_EQ(loop.backend.ops[0].fd, 42);
+    CHECK_EQ(loop.backend.ops[1].type, MockOp::Send);
+    CHECK_EQ(loop.backend.ops[1].fd, 43);
+    CHECK(conn->ws_close_client_inflight);
+    CHECK(conn->ws_close_upstream_inflight);
+
+    on_ws_client_to_upstream_sent<SmallLoop>(
+        &loop, *conn, make_ev(cid, IoEventType::UpstreamSend, 4));
+    CHECK_EQ(loop.conns[cid].fd, 42);  // client echo still in flight
+    CHECK(!conn->ws_close_upstream_inflight);
+
+    on_ws_upstream_to_client_sent<SmallLoop>(&loop, *conn, make_ev(cid, IoEventType::Send, 4));
+    CHECK_EQ(loop.conns[cid].fd, -1);  // both close echoes drained
+}
+
 // Bytes that race into recv_buf while a client→upstream tunnel send is in flight
 // must be forwarded next, never dropped: the send-completion consumes ONLY the
 // submitted length and re-sends the remainder, keeping client recv paused until
