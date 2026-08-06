@@ -183,9 +183,13 @@ TEST(marking_policy, selected_array_carriers_preserve_server_provenance) {
     const rir::Type i64_type{rir::TypeKind::I64, nullptr, nullptr};
     const rir::Type bool_type{rir::TypeKind::Bool, nullptr, nullptr};
     const rir::Type array_type{rir::TypeKind::Array, &i64_type, nullptr};
-    rir::Value values[4] = {
-        {&i64_type, {0}, 0}, {&array_type, {0}, 1}, {&bool_type, {0}, 2}, {&array_type, {0}, 3}};
-    rir::Instruction instructions[4]{};
+    rir::Value values[6] = {{&i64_type, {0}, 0},
+                            {&array_type, {0}, 1},
+                            {&bool_type, {0}, 2},
+                            {&i64_type, {0}, 3},
+                            {&array_type, {0}, 4},
+                            {&array_type, {0}, 5}};
+    rir::Instruction instructions[6]{};
     instructions[0].op = rir::Opcode::ConstI64;
     instructions[0].result = {0};
     instructions[0].imm.i64_val = rir::encode_server_token(0, 0);
@@ -196,29 +200,35 @@ TEST(marking_policy, selected_array_carriers_preserve_server_provenance) {
     instructions[2].op = rir::Opcode::ConstBool;
     instructions[2].result = {2};
     instructions[2].imm.bool_val = true;
-    instructions[3].op = rir::Opcode::Select;
+    instructions[3].op = rir::Opcode::ConstI64;
     instructions[3].result = {3};
-    instructions[3].operand_count = 3;
-    instructions[3].operands[0] = {2};
-    instructions[3].operands[1] = {1};
-    instructions[3].operands[2] = {1};
-    rir::Block block{{0}, {}, instructions, 4, 4};
+    instructions[4].op = rir::Opcode::ArrayCreate;
+    instructions[4].result = {4};
+    instructions[4].operand_count = 1;
+    instructions[4].operands[0] = {3};
+    instructions[5].op = rir::Opcode::Select;
+    instructions[5].result = {5};
+    instructions[5].operand_count = 3;
+    instructions[5].operands[0] = {2};
+    instructions[5].operands[1] = {4};
+    instructions[5].operands[2] = {1};
+    rir::Block block{{0}, {}, instructions, 6, 6};
     rir::Function function{};
     function.blocks = &block;
     function.block_count = 1;
     function.block_cap = 1;
     function.values = values;
-    function.value_count = 4;
-    function.value_cap = 4;
+    function.value_count = 6;
+    function.value_cap = 6;
 
-    CHECK(marking_policy_array_flows_to_source(function, {3}, {0}, 0));
+    CHECK(marking_policy_array_flows_to_source(function, {5}, {0}, 0));
     bool has_indices[1] = {false};
     u32 indices[1] = {0};
-    u8 select_state[4]{};
-    u8 select_result[4]{};
-    MarkingPolicySourceSearch search{32, select_state, select_result, 4, false};
+    u8 select_state[6]{};
+    u8 select_result[6]{};
+    MarkingPolicySourceSearch search{32, select_state, select_result, 6, false};
     CHECK(marking_policy_array_element_path_flows_to_source(
-        function, {3}, has_indices, indices, 0, {0}, 0, &search));
+        function, {5}, has_indices, indices, 0, {0}, 0, &search));
 }
 
 TEST(marking_policy, selected_struct_and_array_carriers_preserve_server_provenance) {
@@ -232,52 +242,76 @@ TEST(marking_policy, selected_struct_and_array_carriers_preserve_server_provenan
     definition->fields()[0] = rir::FieldDef{Str{"id", 2}, &i64_type};
     const rir::Type struct_type{rir::TypeKind::Struct, nullptr, definition};
     const rir::Type array_type{rir::TypeKind::Array, &struct_type, nullptr};
-    rir::Value values[5] = {{&i64_type, {0}, 0},
-                            {&struct_type, {0}, 1},
-                            {&array_type, {0}, 2},
-                            {&bool_type, {0}, 3},
-                            {&array_type, {0}, 4}};
-    rir::Instruction instructions[5]{};
+    rir::Value values[9] = {{&i64_type, {0}, 0},
+                            {&i64_type, {0}, 1},
+                            {&struct_type, {0}, 2},
+                            {&struct_type, {0}, 3},
+                            {&array_type, {0}, 4},
+                            {&array_type, {0}, 5},
+                            {&bool_type, {0}, 6},
+                            {&array_type, {0}, 7},
+                            {&struct_type, {0}, 8}};
+    rir::Instruction instructions[9]{};
     instructions[0].op = rir::Opcode::ConstI64;
     instructions[0].result = {0};
     instructions[0].imm.i64_val = rir::encode_server_token(0, 0);
-    instructions[1].op = rir::Opcode::StructCreate;
+    instructions[1].op = rir::Opcode::ConstI64;
     instructions[1].result = {1};
-    instructions[1].operand_count = 1;
-    instructions[1].operands[0] = {0};
-    instructions[1].imm.struct_ref.type = &struct_type;
-    instructions[2].op = rir::Opcode::ArrayCreate;
+    instructions[2].op = rir::Opcode::StructCreate;
     instructions[2].result = {2};
     instructions[2].operand_count = 1;
-    instructions[2].operands[0] = {1};
-    instructions[3].op = rir::Opcode::ConstBool;
+    instructions[2].operands[0] = {0};
+    instructions[2].imm.struct_ref.type = &struct_type;
+    instructions[3].op = rir::Opcode::StructCreate;
     instructions[3].result = {3};
-    instructions[3].imm.bool_val = true;
-    instructions[4].op = rir::Opcode::Select;
+    instructions[3].operand_count = 1;
+    instructions[3].operands[0] = {1};
+    instructions[3].imm.struct_ref.type = &struct_type;
+    instructions[4].op = rir::Opcode::ArrayCreate;
     instructions[4].result = {4};
-    instructions[4].operand_count = 3;
-    instructions[4].operands[0] = {3};
-    instructions[4].operands[1] = {2};
-    instructions[4].operands[2] = {2};
-    rir::Block block{{0}, {}, instructions, 5, 5};
+    instructions[4].operand_count = 1;
+    instructions[4].operands[0] = {2};
+    instructions[5].op = rir::Opcode::ArrayCreate;
+    instructions[5].result = {5};
+    instructions[5].operand_count = 1;
+    instructions[5].operands[0] = {3};
+    instructions[6].op = rir::Opcode::ConstBool;
+    instructions[6].result = {6};
+    instructions[6].imm.bool_val = true;
+    instructions[7].op = rir::Opcode::Select;
+    instructions[7].result = {7};
+    instructions[7].operand_count = 3;
+    instructions[7].operands[0] = {6};
+    instructions[7].operands[1] = {5};
+    instructions[7].operands[2] = {4};
+    instructions[8].op = rir::Opcode::Select;
+    instructions[8].result = {8};
+    instructions[8].operand_count = 3;
+    instructions[8].operands[0] = {6};
+    instructions[8].operands[1] = {3};
+    instructions[8].operands[2] = {2};
+    rir::Block block{{0}, {}, instructions, 9, 9};
     rir::Function function{};
     function.blocks = &block;
     function.block_count = 1;
     function.block_cap = 1;
     function.values = values;
-    function.value_count = 5;
-    function.value_cap = 5;
-    u8 select_state[5]{};
-    u8 select_result[5]{};
-    MarkingPolicySourceSearch search{64, select_state, select_result, 5, false};
+    function.value_count = 9;
+    function.value_cap = 9;
+    u8 select_state[9]{};
+    u8 select_result[9]{};
+    MarkingPolicySourceSearch search{64, select_state, select_result, 9, false};
     const Str fields[] = {{"id", 2}};
     const bool has_indices[] = {false};
     const u32 indices[] = {0};
 
     CHECK(marking_policy_array_struct_field_flows_to_source(
-        function, {4}, false, 0, fields[0], {0}, 0, &search));
+        function, {7}, false, 0, fields[0], {0}, 0, &search));
     CHECK(marking_policy_array_struct_field_path_flows_to_source(
-        function, {4}, has_indices, indices, 0, fields, 0, {0}, 0, &search));
+        function, {7}, has_indices, indices, 0, fields, 0, {0}, 0, &search));
+    CHECK(marking_policy_struct_field_path_flows_to_source(
+        function, {8}, fields, 0, {0}, 0, &search));
+    CHECK(marking_policy_struct_field_flows_to_source(function, {8}, fields[0], {0}, 0, &search));
 }
 
 static const char kGetRootRequest[] =
