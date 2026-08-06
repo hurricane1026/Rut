@@ -221,6 +221,65 @@ TEST(marking_policy, selected_array_carriers_preserve_server_provenance) {
         function, {3}, has_indices, indices, 0, {0}, 0, &search));
 }
 
+TEST(marking_policy, selected_struct_and_array_carriers_preserve_server_provenance) {
+    const rir::Type i64_type{rir::TypeKind::I64, nullptr, nullptr};
+    const rir::Type bool_type{rir::TypeKind::Bool, nullptr, nullptr};
+    alignas(rir::StructDef) u8 storage[sizeof(rir::StructDef) + sizeof(rir::FieldDef)]{};
+    auto* definition = reinterpret_cast<rir::StructDef*>(storage);
+    definition->name = Str{"Server", 6};
+    definition->field_count = 1;
+    definition->field_capacity = 1;
+    definition->fields()[0] = rir::FieldDef{Str{"id", 2}, &i64_type};
+    const rir::Type struct_type{rir::TypeKind::Struct, nullptr, definition};
+    const rir::Type array_type{rir::TypeKind::Array, &struct_type, nullptr};
+    rir::Value values[5] = {{&i64_type, {0}, 0},
+                            {&struct_type, {0}, 1},
+                            {&array_type, {0}, 2},
+                            {&bool_type, {0}, 3},
+                            {&array_type, {0}, 4}};
+    rir::Instruction instructions[5]{};
+    instructions[0].op = rir::Opcode::ConstI64;
+    instructions[0].result = {0};
+    instructions[0].imm.i64_val = rir::encode_server_token(0, 0);
+    instructions[1].op = rir::Opcode::StructCreate;
+    instructions[1].result = {1};
+    instructions[1].operand_count = 1;
+    instructions[1].operands[0] = {0};
+    instructions[1].imm.struct_ref.type = &struct_type;
+    instructions[2].op = rir::Opcode::ArrayCreate;
+    instructions[2].result = {2};
+    instructions[2].operand_count = 1;
+    instructions[2].operands[0] = {1};
+    instructions[3].op = rir::Opcode::ConstBool;
+    instructions[3].result = {3};
+    instructions[3].imm.bool_val = true;
+    instructions[4].op = rir::Opcode::Select;
+    instructions[4].result = {4};
+    instructions[4].operand_count = 3;
+    instructions[4].operands[0] = {3};
+    instructions[4].operands[1] = {2};
+    instructions[4].operands[2] = {2};
+    rir::Block block{{0}, {}, instructions, 5, 5};
+    rir::Function function{};
+    function.blocks = &block;
+    function.block_count = 1;
+    function.block_cap = 1;
+    function.values = values;
+    function.value_count = 5;
+    function.value_cap = 5;
+    u8 select_state[5]{};
+    u8 select_result[5]{};
+    MarkingPolicySourceSearch search{64, select_state, select_result, 5, false};
+    const Str fields[] = {{"id", 2}};
+    const bool has_indices[] = {false};
+    const u32 indices[] = {0};
+
+    CHECK(marking_policy_array_struct_field_flows_to_source(
+        function, {4}, false, 0, fields[0], {0}, 0, &search));
+    CHECK(marking_policy_array_struct_field_path_flows_to_source(
+        function, {4}, has_indices, indices, 0, fields, 0, {0}, 0, &search));
+}
+
 static const char kGetRootRequest[] =
     "GET / HTTP/1.1\r\n"
     "Host: localhost\r\n"
