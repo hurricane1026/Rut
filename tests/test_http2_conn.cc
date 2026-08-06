@@ -2348,6 +2348,26 @@ TEST(h2_serving, failed_response_serialization_rolls_back_encoder_state) {
     CHECK_EQ(__builtin_memcmp(&h2.hpack_enc, &before, sizeof(before)), 0);
 }
 
+TEST(h2_serving, first_oversized_response_falls_back_to_500) {
+    Http2Conn h2;
+    h2.init();
+    Connection conn;
+    conn.reset();
+    conn.h2 = &h2;
+    FakeH2Loop loop;
+    u8 response[64]{};
+    H2Dispatch<FakeH2Loop> dispatch{&loop, &conn, response, sizeof(response), 0, false};
+    char value[128];
+    __builtin_memset(value, 'x', sizeof(value));
+    const hpack::Header header = {{"x-oversized", 11}, {value, sizeof(value)}};
+
+    h2_emit_response(dispatch, 1, 200, &header, 1, nullptr, 0);
+
+    CHECK_FALSE(dispatch.overflow);
+    CHECK_GT(dispatch.resp_len, 0u);
+    CHECK_EQ(response[3], static_cast<u8>(Http2FrameType::Headers));
+}
+
 TEST(h2_serving, completed_request_is_accounted_once) {
     Http2Conn h2;
     h2.init();
