@@ -28,6 +28,10 @@ static bool buf_contains(const Buffer& buf, const char* needle) {
     return false;
 }
 
+static u64 timer_yield_handler(void*, jit::HandlerCtx*, const u8*, u32, void*) {
+    return 0;
+}
+
 // Write an HTTP response string into conn's upstream_recv_buf and dispatch
 // the UpstreamRecv event. Unlike inject_upstream_response() in test_helpers.h,
 // this takes an arbitrary response string (for testing header rewriting).
@@ -300,6 +304,26 @@ TEST(event_loop, jit_forward_starts_configured_upstream_connect) {
     REQUIRE_GE(conn->upstream_fd, 0);
     ::close(conn->upstream_fd);
     conn->upstream_fd = -1;
+}
+
+TEST(event_loop, jit_timer_yield_parks_handler_with_requested_delay) {
+    SmallLoop loop;
+    loop.setup();
+    loop.inject_and_dispatch(make_ev(0, IoEventType::Accept, 42));
+    Connection* conn = loop.find_fd(42);
+    REQUIRE(conn != nullptr);
+    JitDispatchOutcome outcome{};
+    outcome.kind = JitDispatchOutcome::Kind::TimerYield;
+    outcome.next_state = 9;
+    outcome.timer_ms = 125;
+
+    handle_jit_outcome<SmallLoop>(&loop, *conn, outcome, &timer_yield_handler, /*keep_alive=*/true);
+
+    CHECK_EQ(loop.last_yield_ms, 125u);
+    CHECK_EQ(conn->pending_handler_fn, &timer_yield_handler);
+    CHECK_EQ(conn->handler_state, 9u);
+    CHECK_EQ(conn->pending_yield_kind, jit::YieldKind::Timer);
+    CHECK_EQ(conn->state, ConnState::ExecHandler);
 }
 
 // === Drain accepts: served gracefully, not RST'd ===
