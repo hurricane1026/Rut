@@ -13682,6 +13682,32 @@ TEST(state_invariant, h2_async_epoch_retains_episode_pin_across_config_change) {
     CHECK_EQ(old_pins.http2_streams.load(std::memory_order_acquire), 0u);
 }
 
+TEST(state_invariant, h2_held_stream_pin_transfers_to_new_episode_config) {
+    SmallLoop loop;
+    loop.setup();
+    Connection conn{};
+    conn.reset();
+    RouteConfig old_config{};
+    RouteConfig new_config{};
+    ProgramPinCounters old_pins{};
+    ProgramPinCounters new_pins{};
+    old_config.program_pins = &old_pins;
+    new_config.program_pins = &new_pins;
+
+    h2_process_epoch_enter(&loop, conn);
+    h2_pin_held_stream_config(conn, &old_config);
+    CHECK_EQ(old_pins.http2_streams.load(std::memory_order_acquire), 1u);
+    CHECK_EQ(new_pins.http2_streams.load(std::memory_order_acquire), 0u);
+
+    h2_pin_held_stream_config(conn, &new_config);
+    CHECK_EQ(conn.http2_program_pin_config, &new_config);
+    CHECK_EQ(old_pins.http2_streams.load(std::memory_order_acquire), 0u);
+    CHECK_EQ(new_pins.http2_streams.load(std::memory_order_acquire), 1u);
+
+    h2_async_epoch_leave(&loop, conn);
+    CHECK_EQ(new_pins.http2_streams.load(std::memory_order_acquire), 0u);
+}
+
 TEST(state_invariant, h2_followup_proxy_flush_releases_prior_capture) {
     SmallLoop loop;
     loop.setup();

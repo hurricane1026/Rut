@@ -648,9 +648,10 @@ void h2_process_epoch_enter(Loop* loop, Connection& conn) {
 // replay position. Keep that exact program alive only when the stream outlives
 // the current h2 process() call.
 inline void h2_pin_held_stream_config(Connection& conn, const RouteConfig* config) {
-    if (conn.http2_program_pin_config != nullptr || config == nullptr) return;
-    acquire_http2_program_pin(config);
+    if (conn.http2_program_pin_config == config) return;
+    release_http2_program_pin(conn.http2_program_pin_config);
     conn.http2_program_pin_config = config;
+    acquire_http2_program_pin(config);
 }
 template <typename Loop>
 void h2_async_epoch_leave(Loop* loop, Connection& conn) {
@@ -828,9 +829,10 @@ bool h2_suspend_timer(H2Dispatch<Loop>& d,
     // while pending_synth is quarantined behind a draining io_uring upstream send.
     if (h2->async_stream != 0 || h2->pending_stream != 0 || d.conn->h2_proxy_synth_quarantined)
         return false;
-    // Pin the config epoch BEFORE storing cfg/route — a backpressured flush of the
-    // suspending batch could otherwise let a hot reload reclaim them while parked.
+    // Pin the selected config before storing cfg/route — a backpressured flush
+    // of the suspending batch could otherwise let a hot reload reclaim them.
     h2_async_epoch_enter(d.loop, *d.conn);
+    h2_pin_held_stream_config(*d.conn, cfg);
     h2->async_synth_len = h2_stash_synth(*h2, synth, synth_len);
     h2->async_body_start = body_start;
     h2->async_body_len = body_len;
@@ -873,8 +875,9 @@ bool h2_suspend_proxy(H2Dispatch<Loop>& d,
     // pending_synth is quarantined behind a draining io_uring upstream send.
     if (h2->async_stream != 0 || h2->pending_stream != 0 || d.conn->h2_proxy_synth_quarantined)
         return false;
-    // Pin the config epoch before storing cfg/route (see h2_suspend_timer).
+    // Pin the selected config before storing cfg/route (see h2_suspend_timer).
     h2_async_epoch_enter(d.loop, *d.conn);
+    h2_pin_held_stream_config(*d.conn, cfg);
     h2->async_synth_len = h2_stash_synth(*h2, synth, synth_len);
     if ((apply_response_mutations || capture_response) && !ctx_already_parked &&
         (live_ctx == nullptr ||
@@ -1635,7 +1638,7 @@ void h2_proxy_begin(Loop* loop, Connection& conn);
 // pinned in the async slot (released when the stream completes).
 template <typename Loop>
 void h2_begin_suspended_io(Loop* loop, Connection& conn) {
-    h2_process_epoch_enter(loop, conn);
+    h2_async_epoch_enter(loop, conn);
     if (conn.h2->async_kind == H2AsyncKind::Proxy) {
         if (conn.h2->async_apply_response_mutations || conn.h2->async_capture_response)
             conn.handler_ctx = conn.h2->async_jit_ctx();
@@ -1726,7 +1729,7 @@ void on_h2_data(void* lp, Connection& conn, IoEvent ev) {
     // Enter the RCU epoch before decoding the batch. Each stream then snapshots
     // its generation from h2_on_headers_cb after receiving its admission order.
     // A deferred or async stream pins its own selected program below.
-    h2_async_epoch_enter(loop, conn);
+    h2_process_epoch_enter(loop, conn);
 
     u32 ctrl_len = 0;
     Http2Result r =
