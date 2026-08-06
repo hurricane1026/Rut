@@ -184,6 +184,27 @@ TEST(aggregate, empty) {
     CHECK_EQ(agg.connections_total, 0u);
 }
 
+TEST(metrics, copy_and_assignment_snapshot_all_fields) {
+    ShardMetrics source;
+    source.init();
+    source.requests_total = 7;
+    source.connections_active = 3;
+    source.request_latency.record(250);
+    source.update_memory(11, 12, 13, 14);
+
+    ShardMetrics copied(source);
+    CHECK_EQ(copied.requests_total, 7u);
+    CHECK_EQ(copied.connections_active, 3u);
+    CHECK_EQ(copied.request_latency.count, 1u);
+    CHECK_EQ(copied.memory_connections_used, 14u);
+
+    ShardMetrics assigned;
+    assigned.init();
+    assigned = source;
+    CHECK_EQ(assigned.requests_total, 7u);
+    CHECK_EQ(assigned.memory_arena_used, 11u);
+}
+
 TEST(aggregate, handler_snapshot_is_value_only_and_latched) {
     ShardMetrics local;
     ShardMetrics other;
