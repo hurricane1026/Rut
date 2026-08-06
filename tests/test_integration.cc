@@ -15286,6 +15286,20 @@ TEST(route, manual_health_override_excludes_backend_selection) {
         1u);
 }
 
+TEST(route, control_plane_selection_fails_closed_on_incomplete_backend_snapshot) {
+    RouteConfig config;
+    REQUIRE(config.add_upstream("snapshot", 0x7f000001u, 8080).has_value());
+    ControlPlaneMutationPort mutation;
+    mutation.reset(91, true, &config);
+    struct SelectionLoop {
+        ControlPlaneMutationPort* control_plane_mutation;
+    } loop{&mutation};
+
+    // The active config only publishes one backend. Asking for two must not
+    // select from an incomplete manual-health snapshot.
+    CHECK_EQ(select_backend_with_control_plane(&loop, 0, 2, 1'000'000, &config), ~u32{0});
+}
+
 TEST(route, manual_healthy_override_remains_subject_to_local_ejection) {
     RouteConfig config;
     auto upstream = config.add_upstream("manual-healthy", 0x7f000001u, 8082);
