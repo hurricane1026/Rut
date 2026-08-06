@@ -469,6 +469,15 @@ struct ControlPlaneMutationPortTestAccess {
             version, std::memory_order_relaxed);
     }
 
+    static u64 committed_override(const ControlPlaneMutationPort& port,
+                                  u32 bank,
+                                  ServerIdentity server,
+                                  u64* version,
+                                  u64 maximum_version) {
+        return port.committed_override(
+            bank, server.upstream_id, server.backend_id, version, maximum_version);
+    }
+
     static u8 stopping(const ControlPlaneMutationPort& port) {
         return port.stopping_.load(std::memory_order_acquire);
     }
@@ -1817,6 +1826,29 @@ TEST(control_plane_mutation, committed_fallback_never_pairs_future_version_with_
     CHECK_EQ(port.manual_health(server, &version), ManualHealthOverride::Healthy);
     CHECK_EQ(version, 2u);
     ControlPlaneMutationPortTestAccess::set_override_sequence(port, 0, 4);
+}
+
+TEST(control_plane_mutation, bounded_committed_override_read_rejects_only_future_slots) {
+    ControlPlaneMutationPort port;
+    RouteConfig config;
+    REQUIRE(add_upstreams(&config, 1));
+    port.reset(9, false, &config);
+    const ServerIdentity server{9, 0, 0};
+    REQUIRE(port.mark(server, false));
+    ControlPlaneMutationPortTestAccess::stage_committed_override(port, 0, server, true, 2);
+
+    u64 version = 99;
+    const u64 packed =
+        ControlPlaneMutationPortTestAccess::committed_override(port, 0, server, &version, 0);
+    CHECK_EQ(packed, 0u);
+    CHECK_EQ(version, 0u);
+
+    ControlPlaneMutationPortTestAccess::publish_committed_override(port, 0, server, true, 2);
+    version = 0;
+    const u64 bounded =
+        ControlPlaneMutationPortTestAccess::committed_override(port, 0, server, &version, 1);
+    CHECK_EQ(version, 1u);
+    CHECK_NE(bounded, 0u);
 }
 
 TEST(control_plane_mutation, snapshot_exhaustion_preserves_committed_unhealthy_verdict) {
