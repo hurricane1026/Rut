@@ -628,10 +628,17 @@ template <typename Loop>
 void h2_async_epoch_enter(Loop* loop, Connection& conn) {
     if (!conn.epoch_held) {
         loop->epoch_enter();
-        acquire_http2_program_pin(conn.request_config);
-        conn.http2_program_pin_config = conn.request_config;
         conn.epoch_held = true;
     }
+}
+
+// A stream chooses its config at HEADERS admission, after it receives its
+// replay position. Keep that exact program alive only when the stream outlives
+// the current h2 process() call.
+inline void h2_pin_held_stream_config(Connection& conn, const RouteConfig* config) {
+    if (conn.http2_program_pin_config != nullptr || config == nullptr) return;
+    acquire_http2_program_pin(config);
+    conn.http2_program_pin_config = config;
 }
 template <typename Loop>
 void h2_async_epoch_leave(Loop* loop, Connection& conn) {
@@ -1176,8 +1183,6 @@ void h2_dispatch_request(H2Dispatch<Loop>& d,
         h2_emit_status(d, stream_id, 400);
         return;
     }
-    d.conn->assign_upstream_mark_replay_admission();
-
     const RouteConfig* config = d.conn->request_config;
     // Firewall gate — mirrors the HTTP/1 path (callbacks_impl.h checks
     // firewall_allows_peer before route matching and 403s). Without this an h2
@@ -1522,6 +1527,12 @@ void h2_on_headers_cb(
         stream->request_start_us = monotonic_us();
         c.metrics->on_request_start();
     }
+    // Admission establishes the replay order before this stream selects a
+    // generation. Do this per stream rather than once for an entire coalesced
+    // receive batch, whose streams can cross a config swap.
+    d->conn->assign_upstream_mark_replay_admission();
+    if constexpr (requires { d->loop->config_ptr; })
+        d->conn->request_config = d->loop->config_ptr ? *d->loop->config_ptr : nullptr;
     h2_dispatch_request(*d, stream_id, hs, n, end);
 }
 
@@ -1700,12 +1711,9 @@ void on_h2_data(void* lp, Connection& conn, IoEvent ev) {
     conn.h2->on_headers = &h2_on_headers_cb<Loop>;
     conn.h2->on_data = &h2_on_data_cb<Loop>;  // accumulates request bodies
     conn.h2->on_reset = &h2_on_reset_cb;      // cancels a parked stream on RST_STREAM
-    // A deferred body episode retains its original config/route across DATA
-    // batches. Keep that program pinned and use the same generation for any
-    // coalesced frames until the episode releases its epoch; switching here
-    // would expose pending_route_config after releasing its owning program.
-    // A fresh episode snapshots the active config before taking its exact pin.
-    if (!conn.epoch_held) conn.request_config = loop->config_ptr ? *loop->config_ptr : nullptr;
+    // Enter the RCU epoch before decoding the batch. Each stream then snapshots
+    // its generation from h2_on_headers_cb after receiving its admission order.
+    // A deferred or async stream pins its own selected program below.
     h2_async_epoch_enter(loop, conn);
 
     u32 ctrl_len = 0;
@@ -1729,6 +1737,7 @@ void on_h2_data(void* lp, Connection& conn, IoEvent ev) {
     // or right here if there isn't. Not entered on kClose: a closing connection
     // abandons the suspended handler rather than parking it.
     if (conn.h2->async_stream != 0 && !kClose) {
+        h2_pin_held_stream_config(conn, conn.h2->async_cfg);
         if (ctrl_len == 0 && d.resp_len == 0) {
             h2_begin_suspended_io<Loop>(loop, conn);
             return;
@@ -1747,7 +1756,9 @@ void on_h2_data(void* lp, Connection& conn, IoEvent ev) {
     // for a later DATA batch (keep it then), or a parked stream rides a close
     // (close_conn releases it). The leave is idempotent, so a later close_conn is
     // a harmless no-op.
-    if (conn.h2->async_stream == 0 && conn.h2->pending_stream == 0)
+    if (conn.h2->pending_stream != 0)
+        h2_pin_held_stream_config(conn, conn.h2->pending_route_config);
+    else if (conn.h2->async_stream == 0)
         h2_async_epoch_leave(loop, conn);
 
     // No output and a partial frame that fills the whole recv buffer => the peer
