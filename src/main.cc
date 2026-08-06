@@ -363,6 +363,10 @@ static i32 run_shards(u16 port,
     for (;;) {
         const struct timespec kTimeout{0, 100L * 1000L * 1000L};
         const i32 sig = sigtimedwait(&wait_set, nullptr, &kTimeout);
+        // Reload polling can perform syscalls and overwrite errno. Preserve the
+        // result from sigtimedwait itself so a normal timeout is not mistaken
+        // for a fatal signal-wait failure.
+        const i32 wait_errno = sig < 0 ? errno : 0;
         if (sig == SIGINT || sig == SIGTERM) break;
 #ifdef RUT_ENABLE_JIT
         if (sig == SIGHUP) {
@@ -396,7 +400,7 @@ static i32 run_shards(u16 port,
             }
         }
 #endif
-        if (sig < 0 && errno != EAGAIN && errno != EINTR) {
+        if (sig < 0 && wait_errno != EAGAIN && wait_errno != EINTR) {
             write_str("sigtimedwait failed; beginning shutdown\n");
             break;
         }
