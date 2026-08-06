@@ -1680,6 +1680,21 @@ TEST(control_plane_mutation, every_successful_mark_advances_generation_scoped_ve
     CHECK_EQ(version, 3u);
 }
 
+TEST(control_plane_mutation, mark_rejects_override_version_exhaustion_without_publishing) {
+    ControlPlaneMutationPort port;
+    RouteConfig config;
+    REQUIRE(add_upstreams(&config, 1));
+    port.reset(9, false, &config);
+    const ServerIdentity server{9, 0, 0};
+    ControlPlaneMutationPortTestAccess::set_override_version(port, 0, (u64{1} << 62) - 1);
+
+    CHECK_FALSE(port.mark(server, true));
+
+    u64 version = 0;
+    CHECK_EQ(port.manual_health(server, &version), ManualHealthOverride::None);
+    CHECK_EQ(version, (u64{1} << 62) - 1);
+}
+
 TEST(control_plane_mutation, backend_override_snapshot_uses_one_table_version) {
     ControlPlaneMutationPort port;
     RouteConfig config;
