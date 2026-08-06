@@ -323,6 +323,13 @@ TEST(route_config, direct_api_preserves_deduplication_and_empty_input_contracts)
     CHECK(cfg.add_firewall_deny_range("10.0.0.20-10.0.0.30"));
     CHECK_FALSE(cfg.add_firewall_deny_range("not-a-range"));
     CHECK_EQ(cfg.firewall_deny_range_count, 1u);
+    const u32 range_start_network_order = __builtin_bswap32(0x0a000040u);
+    const u32 range_end_network_order = __builtin_bswap32(0x0a00004fu);
+    CHECK(cfg.add_firewall_allow_range_network_order(range_start_network_order,
+                                                     range_end_network_order));
+    CHECK(cfg.remove_firewall_allow_range_network_order(range_start_network_order,
+                                                        range_end_network_order));
+    CHECK_FALSE(cfg.remove_firewall_deny_range(static_cast<const char*>(nullptr)));
     CHECK_EQ(cfg.match_canonical({nullptr, 0}, kRouteMethodGet, nullptr, nullptr, 0), nullptr);
 }
 
