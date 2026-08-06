@@ -179,6 +179,48 @@ static const char kGetApiQueryRequest[] =
     "Host: localhost\r\n"
     "\r\n";
 
+TEST(marking_policy, selected_array_carriers_preserve_server_provenance) {
+    const rir::Type i64_type{rir::TypeKind::I64, nullptr, nullptr};
+    const rir::Type bool_type{rir::TypeKind::Bool, nullptr, nullptr};
+    const rir::Type array_type{rir::TypeKind::Array, &i64_type, nullptr};
+    rir::Value values[4] = {
+        {&i64_type, {0}, 0}, {&array_type, {0}, 1}, {&bool_type, {0}, 2}, {&array_type, {0}, 3}};
+    rir::Instruction instructions[4]{};
+    instructions[0].op = rir::Opcode::ConstI64;
+    instructions[0].result = {0};
+    instructions[0].imm.i64_val = rir::encode_server_token(0, 0);
+    instructions[1].op = rir::Opcode::ArrayCreate;
+    instructions[1].result = {1};
+    instructions[1].operand_count = 1;
+    instructions[1].operands[0] = {0};
+    instructions[2].op = rir::Opcode::ConstBool;
+    instructions[2].result = {2};
+    instructions[2].imm.bool_val = true;
+    instructions[3].op = rir::Opcode::Select;
+    instructions[3].result = {3};
+    instructions[3].operand_count = 3;
+    instructions[3].operands[0] = {2};
+    instructions[3].operands[1] = {1};
+    instructions[3].operands[2] = {1};
+    rir::Block block{{0}, {}, instructions, 4, 4};
+    rir::Function function{};
+    function.blocks = &block;
+    function.block_count = 1;
+    function.block_cap = 1;
+    function.values = values;
+    function.value_count = 4;
+    function.value_cap = 4;
+
+    CHECK(marking_policy_array_flows_to_source(function, {3}, {0}, 0));
+    bool has_indices[1] = {false};
+    u32 indices[1] = {0};
+    u8 select_state[4]{};
+    u8 select_result[4]{};
+    MarkingPolicySourceSearch search{32, select_state, select_result, 4, false};
+    CHECK(marking_policy_array_element_path_flows_to_source(
+        function, {3}, has_indices, indices, 0, {0}, 0, &search));
+}
+
 static const char kGetRootRequest[] =
     "GET / HTTP/1.1\r\n"
     "Host: localhost\r\n"
