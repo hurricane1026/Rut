@@ -544,7 +544,7 @@ jobs:
           set +e
           LLVM_COV="$LLVM_COV" python3 scripts/coverage_report.py \
             --profile build/merged.profdata \
-            --threshold 95 \
+            --threshold 97 \
             "${changed_args[@]}" \
             build/tests/test_buffer \
             build/tests/test_types \
