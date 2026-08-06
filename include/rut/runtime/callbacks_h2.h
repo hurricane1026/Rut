@@ -628,6 +628,18 @@ template <typename Loop>
 void h2_async_epoch_enter(Loop* loop, Connection& conn) {
     if (!conn.epoch_held) {
         loop->epoch_enter();
+        acquire_http2_program_pin(conn.request_config);
+        conn.http2_program_pin_config = conn.request_config;
+        conn.epoch_held = true;
+    }
+}
+
+// A receive batch needs RCU protection while decoding headers, but it cannot
+// pin a program until the admitted stream has selected its generation.
+template <typename Loop>
+void h2_process_epoch_enter(Loop* loop, Connection& conn) {
+    if (!conn.epoch_held) {
+        loop->epoch_enter();
         conn.epoch_held = true;
     }
 }
@@ -1623,7 +1635,7 @@ void h2_proxy_begin(Loop* loop, Connection& conn);
 // pinned in the async slot (released when the stream completes).
 template <typename Loop>
 void h2_begin_suspended_io(Loop* loop, Connection& conn) {
-    h2_async_epoch_enter(loop, conn);
+    h2_process_epoch_enter(loop, conn);
     if (conn.h2->async_kind == H2AsyncKind::Proxy) {
         if (conn.h2->async_apply_response_mutations || conn.h2->async_capture_response)
             conn.handler_ctx = conn.h2->async_jit_ctx();
