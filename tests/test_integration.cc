@@ -16973,6 +16973,49 @@ TEST(route, marking_policy_validates_single_operand_arities) {
     CHECK_FALSE(marking_policy_instruction_types_valid(fn, inst));
 }
 
+TEST(route, marking_policy_validates_special_operand_arities) {
+    using namespace rut;
+    rir::Instruction inst{};
+
+    for (const auto op : {rir::Opcode::RespCommitBody,
+                          rir::Opcode::RetStatus,
+                          rir::Opcode::YieldHttpGet,
+                          rir::Opcode::YieldForward}) {
+        inst.op = op;
+        inst.operand_count = 0;
+        CHECK(marking_policy_operand_arity_valid(inst));
+        inst.operand_count = 1;
+        CHECK(marking_policy_operand_arity_valid(inst));
+        inst.operand_count = 2;
+        CHECK_FALSE(marking_policy_operand_arity_valid(inst));
+    }
+
+    inst.op = rir::Opcode::YieldHttpPost;
+    inst.operand_count = 2;
+    CHECK(marking_policy_operand_arity_valid(inst));
+    inst.operand_count = 3;
+    CHECK_FALSE(marking_policy_operand_arity_valid(inst));
+
+    for (const auto op :
+         {rir::Opcode::StrInterpolate, rir::Opcode::StructCreate, rir::Opcode::ArrayCreate}) {
+        inst.op = op;
+        inst.operand_count = rir::kMaxInlineOperands + 1;
+        CHECK(marking_policy_operand_arity_valid(inst));
+    }
+
+    for (const auto op : {rir::Opcode::TraceFuncEnter,
+                          rir::Opcode::TraceFuncExit,
+                          rir::Opcode::TraceIoStart,
+                          rir::Opcode::TraceIoEnd,
+                          rir::Opcode::MetricHistRecord,
+                          rir::Opcode::MetricCounterIncr,
+                          rir::Opcode::AccessLogWrite}) {
+        inst.op = op;
+        inst.operand_count = 0;
+        CHECK_FALSE(marking_policy_operand_arity_valid(inst));
+    }
+}
+
 TEST(route, marking_policy_rejects_instructions_after_terminator) {
     using namespace rut;
     const rir::Type i64_type{rir::TypeKind::I64, nullptr, nullptr};
