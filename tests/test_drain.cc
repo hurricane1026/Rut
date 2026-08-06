@@ -172,6 +172,20 @@ TEST(event_loop_drain, active_count_empty) {
     CHECK_EQ(loop.free_top, SmallLoop::kMaxConns);
 }
 
+TEST(event_loop, pause_upstream_recv_adapts_void_backend_hook) {
+    SmallLoop loop;
+    loop.setup();
+    loop.inject_and_dispatch(make_ev(0, IoEventType::Accept, 42));
+    auto* conn = loop.find_fd(42);
+    REQUIRE(conn != nullptr);
+
+    loop.backend.op_count = 0;
+    CHECK(loop.pause_upstream_recv(*conn));
+    REQUIRE_EQ(loop.backend.op_count, 1u);
+    CHECK_EQ(loop.backend.ops[0].type, MockOp::PauseUpstreamRecv);
+    CHECK_EQ(loop.backend.ops[0].conn_id, conn->id);
+}
+
 // === Drain accepts: served gracefully, not RST'd ===
 
 TEST(drain_accept, accepts_during_drain_get_response) {
