@@ -1223,6 +1223,7 @@ TEST(websocket, terminate_forwards_complete_frames_and_rearms_both_directions) {
     conn->ws_c2u.masked = true;
     conn->ws_c2u.from_client = true;
     conn->ws_u2c.masked = false;
+    conn->ws_max_message_size = 64;
     conn->ws_c2u.max_message_size = 64;
     conn->ws_u2c.max_message_size = 64;
     u8 c2u_msg[64] = {};
@@ -1273,7 +1274,7 @@ TEST(websocket, terminate_forwards_complete_frames_and_rearms_both_directions) {
     on_ws_upstream_to_client_sent<SmallLoop>(&loop, *conn, make_ev(cid, IoEventType::Send, 4));
     CHECK_EQ(conn->upstream_recv_buf.len(), 0u);
     REQUIRE_EQ(loop.backend.op_count, 1u);
-    CHECK_EQ(loop.backend.ops[0].type, MockOp::UpstreamRecv);
+    CHECK_EQ(loop.backend.ops[0].type, MockOp::Recv);
     CHECK_EQ(loop.backend.ops[0].fd, 43);
 }
 
@@ -1290,6 +1291,7 @@ TEST(websocket, terminate_drops_complete_frames_and_keeps_both_receives_armed) {
     conn->ws_c2u.masked = true;
     conn->ws_c2u.from_client = true;
     conn->ws_u2c.masked = false;
+    conn->ws_max_message_size = 64;
     conn->ws_c2u.max_message_size = 64;
     conn->ws_u2c.max_message_size = 64;
     u8 c2u_msg[64] = {};
@@ -1322,7 +1324,7 @@ TEST(websocket, terminate_drops_complete_frames_and_keeps_both_receives_armed) {
         make_ev(cid, IoEventType::UpstreamRecv, static_cast<i32>(sizeof(upstream_frame))));
     CHECK_EQ(conn->upstream_recv_buf.len(), 0u);
     REQUIRE_EQ(loop.backend.op_count, 1u);
-    CHECK_EQ(loop.backend.ops[0].type, MockOp::UpstreamRecv);
+    CHECK_EQ(loop.backend.ops[0].type, MockOp::Recv);
     CHECK_EQ(loop.backend.ops[0].fd, 43);
 }
 
