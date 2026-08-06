@@ -15150,7 +15150,9 @@ TEST(route, populate_route_config_accepts_pre_bound_upstreams) {
     using namespace rut;
     const char* src =
         "upstream backend\n"
-        "route GET \"/api\" { return forward(backend) }\n";
+        "route GET \"/api\" { return forward(backend) }\n"
+        "route GET \"/body\" { return response(200, body: \"ready\", headers: { \"X-Mode\": "
+        "\"test\" }) }\n";
     auto lexed = lex(Str{src, static_cast<u32>(strlen(src))});
     REQUIRE(lexed);
     auto ast = parse_file(lexed.value());
@@ -15176,6 +15178,10 @@ TEST(route, populate_route_config_accepts_pre_bound_upstreams) {
     CHECK(populate_route_config(cfg, rir.module));
     // The manually-bound address is untouched.
     CHECK_EQ(cfg.upstreams[0].addrs[0].sin_port, __builtin_bswap16(8080));
+    CHECK_EQ(cfg.response_body_count, 1u);
+    CHECK_EQ(cfg.response_bodies[0].len, 5u);
+    CHECK_EQ(cfg.response_header_set_count, 1u);
+    CHECK_EQ(cfg.response_header_sets[0].count, 1u);
     rir.destroy();
 }
 
