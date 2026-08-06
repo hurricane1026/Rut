@@ -365,6 +365,31 @@ TEST(event_loop, jit_upstream_connect_yield_rejects_unknown_target) {
     CHECK_EQ(conn->state, ConnState::Sending);
 }
 
+TEST(event_loop, jit_upstream_connect_yield_starts_configured_connect) {
+    SmallLoop loop;
+    loop.setup();
+    loop.inject_and_dispatch(make_ev(0, IoEventType::Accept, 42));
+    Connection* conn = loop.find_fd(42);
+    REQUIRE(conn != nullptr);
+    RouteConfig config;
+    REQUIRE(config.add_upstream("backend", 0x7f000001, 8080).has_value());
+    conn->request_config = &config;
+    JitDispatchOutcome outcome{};
+    outcome.kind = JitDispatchOutcome::Kind::EventYield;
+    outcome.yield_kind = jit::YieldKind::UpstreamConnect;
+    outcome.timer_ms = 1;
+    outcome.next_state = 4;
+
+    handle_jit_outcome<SmallLoop>(&loop, *conn, outcome, &timer_yield_handler, /*keep_alive=*/true);
+
+    CHECK_EQ(conn->pending_handler_fn, &timer_yield_handler);
+    CHECK_EQ(conn->handler_state, 4u);
+    CHECK_EQ(conn->upstream_idx, 0u);
+    REQUIRE_GE(conn->upstream_fd, 0);
+    ::close(conn->upstream_fd);
+    conn->upstream_fd = -1;
+}
+
 // === Drain accepts: served gracefully, not RST'd ===
 
 TEST(drain_accept, accepts_during_drain_get_response) {
