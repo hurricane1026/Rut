@@ -2587,6 +2587,45 @@ TEST(h2_serving, bodyless_mutated_status_suppresses_dynamic_data) {
     CHECK_EQ(dispatch.resp_len, kFrameHeaderSize + header.length);
 }
 
+TEST(h2_serving, dynamic_response_without_content_type_adds_default_header) {
+    Http2Conn h2;
+    h2.init();
+    Connection conn;
+    conn.reset();
+    conn.h2 = &h2;
+    FakeH2Loop loop;
+    u8 response[256]{};
+    H2Dispatch<FakeH2Loop> dispatch{&loop, &conn, response, sizeof(response), 0, false};
+    JitDispatchOutcome outcome{};
+    outcome.kind = JitDispatchOutcome::Kind::ReturnStatus;
+    outcome.status_code = 200;
+    outcome.dynamic_response_body = "body";
+    outcome.dynamic_response_body_len = 4;
+
+    h2_emit_outcome(dispatch, 1, outcome, nullptr, false);
+
+    Http2FrameHeader header{};
+    REQUIRE(parse_frame_header(response, dispatch.resp_len, &header) == ParseStatus::Complete);
+    hpack::DynamicTable dyn;
+    dyn.init(4096);
+    hpack::Header decoded[8];
+    u8 scratch[256];
+    u32 count = 0;
+    REQUIRE(hpack::decode_header_block(dyn,
+                                       response + kFrameHeaderSize,
+                                       header.length,
+                                       scratch,
+                                       sizeof(scratch),
+                                       decoded,
+                                       8,
+                                       &count));
+    bool has_content_type = false;
+    for (u32 i = 0; i < count; i++)
+        has_content_type |= decoded[i].name.eq(Str{"content-type", 12}) &&
+                            decoded[i].value.eq(Str{"text/plain; charset=utf-8", 25});
+    CHECK(has_content_type);
+}
+
 TEST(h2_serving, captured_content_length_is_removed_for_final_204) {
     Http2Conn h2;
     h2.init();
