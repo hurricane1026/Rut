@@ -252,6 +252,18 @@ TEST(event_loop, unhandled_upstream_receive_error_closes_proxy_connection) {
     CHECK_EQ(loop.find_fd(42), nullptr);
 }
 
+TEST(health_probe, config_helpers_fall_back_without_a_mutation_port) {
+    RouteConfig config;
+    REQUIRE(config.add_upstream("backend", 0x7f000001u, 8080).has_value());
+
+    CHECK_EQ(control_plane_upstream_allocation<SmallLoop>(nullptr, &config, 0), 0u);
+    CHECK_EQ(control_plane_endpoint_allocation<SmallLoop>(nullptr, &config, 0, 0), 0u);
+    CHECK_EQ(control_plane_probe_allocation<SmallLoop>(nullptr, &config, 0, 0), 0u);
+
+    record_backend_result_for_config<SmallLoop>(nullptr, &config, 0, 0, true, 1);
+    record_active_probe_result_for_config<SmallLoop>(nullptr, &config, 0, 0, false, 2);
+}
+
 TEST(event_loop, lazily_allocates_and_reclaims_proxy_and_terminate_buffers) {
     using rut::EventLoop;
     using rut::MockBackend;
