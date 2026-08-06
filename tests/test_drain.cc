@@ -222,6 +222,29 @@ TEST(event_loop, dispatch_event_ignores_non_connection_event_kinds) {
     }
 }
 
+TEST(event_loop, lazily_allocates_and_reclaims_proxy_and_terminate_buffers) {
+    using rut::EventLoop;
+    using rut::MockBackend;
+    auto loop = std::make_unique<EventLoop<MockBackend>>();
+    REQUIRE(loop->init(0, -1).has_value());
+    Connection* conn = loop->alloc_conn();
+    REQUIRE(conn != nullptr);
+
+    CHECK(loop->alloc_upstream_buf(*conn));
+    auto* upstream = conn->upstream_recv_slice;
+    REQUIRE(upstream != nullptr);
+    CHECK(loop->alloc_upstream_buf(*conn));
+    CHECK_EQ(conn->upstream_recv_slice, upstream);
+
+    CHECK(loop->alloc_ws_terminate_bufs(*conn));
+    REQUIRE(conn->ws_c2u_msg != nullptr);
+    REQUIRE(conn->ws_u2c_msg != nullptr);
+    CHECK(loop->alloc_ws_terminate_bufs(*conn));
+
+    loop->free_conn(*conn);
+    loop->shutdown();
+}
+
 // === Drain accepts: served gracefully, not RST'd ===
 
 TEST(drain_accept, accepts_during_drain_get_response) {
