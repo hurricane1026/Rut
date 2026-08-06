@@ -186,6 +186,25 @@ TEST(event_loop, pause_upstream_recv_adapts_void_backend_hook) {
     CHECK_EQ(loop.backend.ops[0].conn_id, conn->id);
 }
 
+TEST(event_loop, delegates_shared_upstream_concurrency) {
+    using rut::EventLoop;
+    using rut::MockBackend;
+    using rut::UpstreamConcurrency;
+    auto loop = std::make_unique<EventLoop<MockBackend>>();
+    REQUIRE(loop->init(0, -1).has_value());
+
+    CHECK(loop->upstream_acquire(3, 1));  // no shared limiter means unlimited
+    UpstreamConcurrency concurrency{};
+    concurrency.reset();
+    loop->upstream_cc = &concurrency;
+    CHECK(loop->upstream_acquire(3, 1));
+    CHECK_FALSE(loop->upstream_acquire(3, 1));
+    loop->upstream_release(3);
+    CHECK(loop->upstream_acquire(3, 1));
+    loop->upstream_release(3);
+    loop->shutdown();
+}
+
 // === Drain accepts: served gracefully, not RST'd ===
 
 TEST(drain_accept, accepts_during_drain_get_response) {
