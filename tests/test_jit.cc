@@ -314,6 +314,18 @@ TEST(marking_policy, selected_struct_and_array_carriers_preserve_server_provenan
     CHECK(marking_policy_struct_field_flows_to_source(function, {8}, fields[0], {0}, 0, &search));
 }
 
+TEST(marking_policy, type_equality_distinguishes_struct_definitions) {
+    rir::StructDef first_definition{};
+    rir::StructDef second_definition{};
+    const rir::Type first_struct{rir::TypeKind::Struct, nullptr, &first_definition};
+    const rir::Type second_struct{rir::TypeKind::Struct, nullptr, &second_definition};
+    const rir::Type first_i64{rir::TypeKind::I64, nullptr, nullptr};
+    const rir::Type second_i64{rir::TypeKind::I64, nullptr, nullptr};
+
+    CHECK_FALSE(marking_policy_types_equal(&first_struct, &second_struct));
+    CHECK(marking_policy_types_equal(&first_i64, &second_i64));
+}
+
 static const char kGetRootRequest[] =
     "GET / HTTP/1.1\r\n"
     "Host: localhost\r\n"
