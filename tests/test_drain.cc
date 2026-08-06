@@ -287,6 +287,33 @@ TEST(event_loop, timeout_dispatch_clamps_accumulated_ticks_to_wheel_size) {
     loop->shutdown();
 }
 
+TEST(route_config, direct_api_preserves_deduplication_and_empty_input_contracts) {
+    ProgramPinCounters pins;
+    pins.http1_requests.store(1, std::memory_order_relaxed);
+    pins.http2_streams.store(1, std::memory_order_relaxed);
+    pins.websocket_sessions.store(1, std::memory_order_relaxed);
+    pins.health_probes.store(1, std::memory_order_relaxed);
+    pins.reset();
+    CHECK(pins.empty());
+
+    RouteConfig cfg;
+    CHECK(cfg.add_cache_instance("small", 5, 1));
+    CHECK_FALSE(cfg.add_cache_instance("small", 5, 1));
+    CHECK(cfg.add_firewall_deny_port(443));
+    CHECK(cfg.add_firewall_deny_port(443));
+    CHECK_EQ(cfg.firewall_deny_port_count, 1u);
+    CHECK(cfg.add_firewall_allow_cidr(0x0a000001, 24));
+    CHECK(cfg.add_firewall_allow_cidr(0x0a0000fe, 24));
+    CHECK_EQ(cfg.firewall_allow_cidr_count, 1u);
+    CHECK(cfg.add_firewall_allow_range(0x0a000001, 0x0a000010));
+    CHECK(cfg.add_firewall_allow_range(0x0a000001, 0x0a000010));
+    CHECK(cfg.add_firewall_deny_range("10.0.0.20-10.0.0.30"));
+    CHECK(cfg.add_firewall_deny_range("10.0.0.20-10.0.0.30"));
+    CHECK_FALSE(cfg.add_firewall_deny_range("not-a-range"));
+    CHECK_EQ(cfg.firewall_deny_range_count, 1u);
+    CHECK_EQ(cfg.match_canonical({nullptr, 0}, kRouteMethodGet, nullptr, nullptr, 0), nullptr);
+}
+
 TEST(event_loop, unsupported_jit_outcome_fails_closed) {
     SmallLoop loop;
     loop.setup();
