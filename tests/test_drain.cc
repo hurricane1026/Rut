@@ -326,6 +326,26 @@ TEST(event_loop, jit_timer_yield_parks_handler_with_requested_delay) {
     CHECK_EQ(conn->state, ConnState::ExecHandler);
 }
 
+TEST(event_loop, unschedulable_jit_timer_yield_fails_closed) {
+    SmallLoop loop;
+    loop.setup();
+    loop.inject_and_dispatch(make_ev(0, IoEventType::Accept, 42));
+    Connection* conn = loop.find_fd(42);
+    REQUIRE(conn != nullptr);
+    JitDispatchOutcome outcome{};
+    outcome.kind = JitDispatchOutcome::Kind::TimerYield;
+    outcome.next_state = 9;
+    outcome.timer_ms = TimerWheel::kSlots * 1000;
+
+    handle_jit_outcome<SmallLoop>(&loop, *conn, outcome, &timer_yield_handler, /*keep_alive=*/true);
+
+    CHECK_EQ(loop.last_yield_ms, TimerWheel::kSlots * 1000u);
+    CHECK_EQ(conn->pending_handler_fn, nullptr);
+    CHECK_EQ(conn->resp_status, 500u);
+    CHECK_FALSE(conn->keep_alive);
+    CHECK_EQ(conn->state, ConnState::Sending);
+}
+
 // === Drain accepts: served gracefully, not RST'd ===
 
 TEST(drain_accept, accepts_during_drain_get_response) {
