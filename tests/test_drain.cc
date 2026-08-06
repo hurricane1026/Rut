@@ -226,6 +226,32 @@ TEST(event_loop, dispatch_event_ignores_non_connection_event_kinds) {
     }
 }
 
+TEST(event_loop, mock_loop_refuses_h2_allocation_without_engine_pool) {
+    SmallLoop loop;
+    loop.setup();
+    loop.inject_and_dispatch(make_ev(0, IoEventType::Accept, 42));
+    Connection* conn = loop.find_fd(42);
+    REQUIRE(conn != nullptr);
+
+    CHECK_FALSE(loop.alloc_h2(*conn));
+    CHECK_EQ(conn->h2, nullptr);
+}
+
+TEST(event_loop, unhandled_upstream_receive_error_closes_proxy_connection) {
+    SmallLoop loop;
+    loop.setup();
+    loop.inject_and_dispatch(make_ev(0, IoEventType::Accept, 42));
+    Connection* conn = loop.find_fd(42);
+    REQUIRE(conn != nullptr);
+    const u32 id = conn->id;
+    conn->state = ConnState::Proxying;
+    conn->on_upstream_recv = nullptr;
+
+    loop.dispatch_event(*conn, make_ev(id, IoEventType::UpstreamRecv, -1));
+
+    CHECK_EQ(loop.find_fd(42), nullptr);
+}
+
 TEST(event_loop, lazily_allocates_and_reclaims_proxy_and_terminate_buffers) {
     using rut::EventLoop;
     using rut::MockBackend;
