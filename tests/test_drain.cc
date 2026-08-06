@@ -306,6 +306,49 @@ TEST(event_loop, jit_forward_starts_configured_upstream_connect) {
     conn->upstream_fd = -1;
 }
 
+TEST(event_loop, jit_upstream_send_yield_submits_request_bytes) {
+    SmallLoop loop;
+    loop.setup();
+    loop.inject_and_dispatch(make_ev(0, IoEventType::Accept, 42));
+    Connection* conn = loop.find_fd(42);
+    REQUIRE(conn != nullptr);
+    static constexpr char kRequest[] = "GET / HTTP/1.1\r\n\r\n";
+    conn->recv_buf.write(reinterpret_cast<const u8*>(kRequest), sizeof(kRequest) - 1);
+    conn->upstream_fd = 99;
+    JitDispatchOutcome outcome{};
+    outcome.kind = JitDispatchOutcome::Kind::EventYield;
+    outcome.yield_kind = jit::YieldKind::UpstreamSend;
+
+    loop.backend.op_count = 0;
+    handle_jit_outcome<SmallLoop>(&loop, *conn, outcome, &timer_yield_handler, /*keep_alive=*/true);
+
+    REQUIRE_GT(loop.backend.op_count, 0u);
+    CHECK_EQ(loop.backend.ops[0].type, MockOp::Send);
+    CHECK_EQ(loop.backend.ops[0].fd, 99);
+    CHECK_EQ(loop.backend.ops[0].send_len, sizeof(kRequest) - 1);
+    conn->upstream_fd = -1;
+}
+
+TEST(event_loop, jit_upstream_recv_yield_arms_upstream_receive) {
+    SmallLoop loop;
+    loop.setup();
+    loop.inject_and_dispatch(make_ev(0, IoEventType::Accept, 42));
+    Connection* conn = loop.find_fd(42);
+    REQUIRE(conn != nullptr);
+    conn->upstream_fd = 99;
+    JitDispatchOutcome outcome{};
+    outcome.kind = JitDispatchOutcome::Kind::EventYield;
+    outcome.yield_kind = jit::YieldKind::UpstreamRecv;
+
+    loop.backend.op_count = 0;
+    handle_jit_outcome<SmallLoop>(&loop, *conn, outcome, &timer_yield_handler, /*keep_alive=*/true);
+
+    REQUIRE_GT(loop.backend.op_count, 0u);
+    CHECK_EQ(loop.backend.ops[0].type, MockOp::Recv);
+    CHECK_EQ(loop.backend.ops[0].fd, 99);
+    conn->upstream_fd = -1;
+}
+
 TEST(event_loop, jit_timer_yield_parks_handler_with_requested_delay) {
     SmallLoop loop;
     loop.setup();
