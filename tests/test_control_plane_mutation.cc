@@ -2419,6 +2419,34 @@ TEST(control_plane_mutation, signal_snapshot_capture_failures_are_terminalized) 
     }
 }
 
+TEST(control_plane_mutation, source_version_capture_only_clears_for_its_registration) {
+    ControlPlaneMutationPort port;
+    port.reset(1, true);
+    port.set_reload_source_version_capture(failed_source_capture, nullptr);
+
+    // A mismatched callback must not silently clear the registered source.
+    port.clear_reload_source_version_capture(oversized_source_capture, nullptr);
+    u64 failed_request_id = 0;
+    CHECK_FALSE(port.request_reload(ReloadRequestSource::Signal, &failed_request_id));
+    CHECK_NE(failed_request_id, 0u);
+    CHECK_EQ(port.last_record().outcome, ReloadTerminalOutcome::SnapshotUnavailable);
+
+    port.clear_reload_source_version_capture(failed_source_capture, nullptr);
+    u64 request_id = 0;
+    CHECK(port.request_reload(ReloadRequestSource::Signal, &request_id));
+    CHECK_NE(request_id, 0u);
+}
+
+TEST(control_plane_mutation, admission_in_progress_tracks_reserved_identity) {
+    ControlPlaneMutationPort port;
+    port.reset(1, true);
+    CHECK_FALSE(port.admission_in_progress());
+
+    const u64 request_id = ControlPlaneMutationPortTestAccess::reserve_admission_identity(port);
+    REQUIRE_NE(request_id, 0u);
+    CHECK(port.admission_in_progress());
+}
+
 int main(int argc, char** argv) {
     return rut::test::run_all(argc, argv);
 }
