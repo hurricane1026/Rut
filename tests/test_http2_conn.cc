@@ -1879,6 +1879,44 @@ TEST(h2_serving, proxy_route_rejects_request_without_scheme) {
     REQUIRE_GT(dispatch.resp_len, 0u);
 }
 
+TEST(h2_serving, bodyless_jit_route_invokes_handler_immediately) {
+    const hpack::Header headers[] = {{{":method", 7}, {"GET", 3}},
+                                     {{":path", 5}, {"/jit", 4}},
+                                     {{":scheme", 7}, {"https", 5}},
+                                     {{":authority", 10}, {"example", 7}}};
+    Http2Conn h2;
+    h2.init();
+    Connection conn;
+    conn.reset();
+    conn.h2 = &h2;
+    RouteConfig config;
+    REQUIRE(config.add_jit_handler("/jit", kRouteMethodGet, &h2_status_204, false, false));
+    conn.request_config = &config;
+    FakeH2Loop loop;
+    u8 response[256]{};
+    H2Dispatch<FakeH2Loop> dispatch{&loop, &conn, response, sizeof(response), 0, false};
+
+    h2_dispatch_request(dispatch, 1, headers, 4, /*end_stream=*/true);
+
+    CHECK_EQ(h2.pending_stream, 0u);
+    Http2FrameHeader header{};
+    REQUIRE(parse_frame_header(response, dispatch.resp_len, &header) == ParseStatus::Complete);
+    hpack::DynamicTable dyn;
+    dyn.init(4096);
+    hpack::Header decoded[4];
+    u8 scratch[128];
+    u32 count = 0;
+    REQUIRE(hpack::decode_header_block(dyn,
+                                       response + kFrameHeaderSize,
+                                       header.length,
+                                       scratch,
+                                       sizeof(scratch),
+                                       decoded,
+                                       4,
+                                       &count));
+    CHECK(decoded[0].value.eq(Str{"204", 3}));
+}
+
 TEST(h2_serving, selected_buffered_forward_defers_and_buffers_data) {
     const hpack::Header headers[] = {{{":method", 7}, {"POST", 4}},
                                      {{":path", 5}, {"/upload", 7}},
