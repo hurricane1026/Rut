@@ -125,6 +125,35 @@ TEST(http2_settings, parse_applies_values) {
     CHECK(s.has_max_concurrent_streams);
 }
 
+TEST(http2_settings, parse_applies_optional_and_table_values) {
+    Http2Settings s;
+    s.set_defaults();
+    u8 payload[] = {0x00,
+                    0x01,
+                    0x00,
+                    0x00,
+                    0x10,
+                    0x00,  // header table size 4096
+                    0x00,
+                    0x02,
+                    0x00,
+                    0x00,
+                    0x00,
+                    0x00,  // disable server push
+                    0x00,
+                    0x06,
+                    0x00,
+                    0x00,
+                    0x20,
+                    0x00};  // max header list size 8192
+
+    CHECK(parse_settings(payload, sizeof(payload), &s) == Http2Error::NoError);
+    CHECK_EQ(s.header_table_size, 4096u);
+    CHECK_EQ(s.enable_push, 0u);
+    CHECK_EQ(s.max_header_list_size, 8192u);
+    CHECK(s.has_max_header_list_size);
+}
+
 TEST(http2_settings, unknown_id_ignored) {
     Http2Settings s;
     s.set_defaults();
