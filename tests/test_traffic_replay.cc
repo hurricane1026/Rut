@@ -842,7 +842,7 @@ TEST(route, static_404) {
     CHECK(result.status_match);
 }
 
-TEST(route, no_match_default_200) {
+TEST(route, no_match_returns_404) {
     RouteConfig cfg;
     cfg.add_static("/api", 'G', 200);
     // /other doesn't match /api
@@ -850,10 +850,10 @@ TEST(route, no_match_default_200) {
     RoutedLoop rl;
     rl.setup(&cfg);
 
-    CaptureEntry entry = make_captured_request("GET /other HTTP/1.1\r\nHost: x\r\n\r\n", 200);
+    CaptureEntry entry = make_captured_request("GET /other HTTP/1.1\r\nHost: x\r\n\r\n", 404);
     ReplayResult result = replay_one(rl.loop, entry, 42);
     CHECK(result.replayed);
-    CHECK_EQ(result.actual_status, 200);  // default
+    CHECK_EQ(result.actual_status, 404);
 }
 
 TEST(route, method_filtering) {
@@ -982,14 +982,14 @@ TEST(route, replay_one_route_action_matrix) {
 
     const MatrixCase cases[] = {
         {"static status", "GET /static HTTP/1.1\r\nHost: x\r\n\r\n", 204, true, false, true, 204},
-        {"default status", "GET /missing HTTP/1.1\r\nHost: x\r\n\r\n", 200, true, false, true, 200},
+        {"not found", "GET /missing HTTP/1.1\r\nHost: x\r\n\r\n", 404, true, false, true, 404},
         {"method default",
          "GET /post-only HTTP/1.1\r\nHost: x\r\n\r\n",
-         200,
+         404,
          true,
          false,
          true,
-         200},
+         404},
         {"method match",
          "POST /post-only HTTP/1.1\r\nHost: x\r\nContent-Length: 0\r\n\r\n",
          202,
@@ -1038,8 +1038,8 @@ TEST(route, replay_file_route_action_matrix_summary) {
 
     CaptureEntry entries[] = {
         make_captured_request("GET /static HTTP/1.1\r\nHost: x\r\n\r\n", 204),
-        make_captured_request("GET /missing HTTP/1.1\r\nHost: x\r\n\r\n", 200),
-        make_captured_request("GET /post-only HTTP/1.1\r\nHost: x\r\n\r\n", 200),
+        make_captured_request("GET /missing HTTP/1.1\r\nHost: x\r\n\r\n", 404),
+        make_captured_request("GET /post-only HTTP/1.1\r\nHost: x\r\n\r\n", 404),
         make_captured_request("POST /post-only HTTP/1.1\r\nHost: x\r\nContent-Length: 0\r\n\r\n",
                               202),
         make_captured_request("GET /static HTTP/1.1\r\nHost: x\r\n\r\n", 201),
