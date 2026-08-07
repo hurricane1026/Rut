@@ -1756,6 +1756,13 @@ void on_header_received(void* lp, Connection& conn, IoEvent ev) {
                                           /*arena=*/nullptr,
                                           &conn.replay_context);
         handle_jit_outcome<Loop>(loop, conn, outcome, route->fn, kKeepAlive);
+    } else if (!route && config != nullptr) {
+        const bool keep_alive = kKeepAlive && request_body_replayable(conn);
+        conn.resp_status = 404;
+        conn.keep_alive = keep_alive;
+        format_static_response(conn, 404, keep_alive);
+        conn.transition_to_sending(&on_response_sent<Loop>);
+        client_send(loop, conn, conn.send_buf.data(), conn.send_buf.len());
     } else {
         conn.resp_status = kStatusOK;
         conn.send_buf.reset();

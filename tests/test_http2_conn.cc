@@ -2170,7 +2170,7 @@ TEST(h2_serving, body_independent_preinvoke_preserves_declared_length_validation
     CHECK_GT(dispatch.resp_len, 0u);
 }
 
-TEST(h2_serving, unmatched_route_defers_declared_body_before_default_response) {
+TEST(h2_serving, unmatched_route_defers_declared_body_before_not_found_response) {
     const hpack::Header headers[] = {{{":method", 7}, {"POST", 4}},
                                      {{":path", 5}, {"/missing", 8}},
                                      {{":scheme", 7}, {"https", 5}},
@@ -2209,7 +2209,7 @@ TEST(h2_serving, unmatched_route_defers_declared_body_before_default_response) {
                                        decoded,
                                        4,
                                        &count));
-    CHECK(decoded[0].value.eq(Str{"200", 3}));
+    CHECK(decoded[0].value.eq(Str{"404", 3}));
 }
 
 TEST(h2_serving, buffered_body_overflow_rejects_non_jit_deferred_route) {
