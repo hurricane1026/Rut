@@ -143,14 +143,16 @@ gracefully before exiting.
 | `--drain N` | Graceful drain window, seconds | `30` |
 | `--opt N` | JIT optimization level: `0` (low, fastest startup) .. `3` (high) | `2` |
 | `--pool-prealloc N` | Pre-commit N buffer slices per shard | `0` (lazy) |
+| `--backend MODE` | I/O backend: `auto`, `io_uring`, or `epoll` | `auto` |
 | `--tls-cert PATH` | TLS certificate (PEM); enables TLS | off |
 | `--tls-key PATH` | TLS private key (PEM); required with `--tls-cert` | off |
 | `--access-log PATH` | Write access logs to PATH | off |
 | `--access-log-compress` | zstd-compress access logs | off |
 | `--access-log-level N` | Access log verbosity | build default |
 
-`--tls-cert`/`--tls-key` must be given together. With TLS enabled the
-server uses the epoll backend.
+`--tls-cert`/`--tls-key` must be given together. Both backends support server
+TLS. In `auto` mode, Rut prefers io_uring when available unless the program
+configures active upstream health checks, which currently require epoll.
 
 `--opt` selects how hard the JIT optimizes each handler at startup:
 
@@ -193,9 +195,8 @@ curl -s -o /dev/null -w "%{http_code}\n" http://127.0.0.1:8080/   # 200
   service discovery are not supported yet).
 - **No hot reload of `.rut` at runtime.** Restart to apply changes.
 - Some environments (containers/sandboxes) can set up io_uring but not
-  complete its operations; if requests connect but never respond, force
-  the epoll backend by running with TLS, or run on a host with working
-  io_uring.
+  complete its operations; if requests connect but never respond, use
+  `--backend epoll`, or run on a host with working io_uring.
 
 For what is and isn't implemented across the language and runtime, see
 `docs/core-capabilities.md`.

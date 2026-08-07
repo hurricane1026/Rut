@@ -1,6 +1,7 @@
 // Mock tests — no real sockets. Ported from libuv/libevent scenarios.
 #include "fault_injection.h"
 #include "rut/runtime/arena.h"
+#include "rut/runtime/backend_selection.h"
 #include "rut/runtime/compile_to_config.h"
 #include "rut/runtime/error.h"
 #include "rut/runtime/io_uring_backend.h"
@@ -34,6 +35,53 @@ TEST(signal_wait, classifies_saved_errno_without_observing_global_errno) {
     CHECK_FALSE(signal_wait_failed(-1, EINTR));
     CHECK_FALSE(signal_wait_failed(SIGTERM, 0));
     CHECK(signal_wait_failed(-1, EINVAL));
+}
+
+TEST(backend_selection, honors_preference_capabilities_and_health_checks) {
+    auto selected = select_server_backend(BackendPreference::Auto, true, false);
+    CHECK(selected.ok());
+    CHECK_EQ(selected.backend, ServerBackend::IoUring);
+    CHECK_FALSE(selected.health_probe_fallback);
+
+    selected = select_server_backend(BackendPreference::Auto, false, false);
+    CHECK(selected.ok());
+    CHECK_EQ(selected.backend, ServerBackend::Epoll);
+
+    selected = select_server_backend(BackendPreference::Auto, true, true);
+    CHECK(selected.ok());
+    CHECK_EQ(selected.backend, ServerBackend::Epoll);
+    CHECK(selected.health_probe_fallback);
+
+    selected = select_server_backend(BackendPreference::Auto, false, true);
+    CHECK(selected.ok());
+    CHECK_EQ(selected.backend, ServerBackend::Epoll);
+    CHECK_FALSE(selected.health_probe_fallback);
+
+    selected = select_server_backend(BackendPreference::Epoll, true, true);
+    CHECK(selected.ok());
+    CHECK_EQ(selected.backend, ServerBackend::Epoll);
+
+    selected = select_server_backend(BackendPreference::IoUring, false, false);
+    CHECK_FALSE(selected.ok());
+    CHECK_EQ(selected.error, BackendSelectionError::IoUringUnavailable);
+
+    selected = select_server_backend(BackendPreference::IoUring, true, true);
+    CHECK_FALSE(selected.ok());
+    CHECK_EQ(selected.error, BackendSelectionError::HealthProbesUnsupported);
+
+    selected = select_server_backend(BackendPreference::IoUring, true, false);
+    CHECK(selected.ok());
+    CHECK_EQ(selected.backend, ServerBackend::IoUring);
+}
+
+TEST(backend_selection, route_config_reports_active_health_requirement) {
+    RouteConfig cfg;
+    CHECK_FALSE(cfg.requires_active_health_probes());
+    const auto upstream = cfg.add_upstream("api", 0x7f000001, 8080);
+    REQUIRE(upstream.has_value());
+    CHECK_FALSE(cfg.requires_active_health_probes());
+    REQUIRE(cfg.set_upstream_health_check(upstream.value(), "/health", 7, 1000, 200));
+    CHECK(cfg.requires_active_health_probes());
 }
 
 // === Accept ===
