@@ -1760,7 +1760,8 @@ void on_header_received(void* lp, Connection& conn, IoEvent ev) {
         const bool keep_alive = kKeepAlive && request_body_replayable(conn);
         conn.resp_status = 404;
         conn.keep_alive = keep_alive;
-        format_static_response(conn, 404, keep_alive);
+        format_static_response(
+            conn, 404, keep_alive, conn.req_method == static_cast<u8>(LogHttpMethod::Head));
         conn.transition_to_sending(&on_response_sent<Loop>);
         client_send(loop, conn, conn.send_buf.data(), conn.send_buf.len());
     } else {
