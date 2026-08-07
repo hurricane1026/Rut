@@ -17,7 +17,7 @@ bool same_ip(const IpAddress& lhs, const IpAddress& rhs) {
 
 bool resolve_upstream_hostname(Str hostname, ResolvedUpstreamAddresses* out) {
     if (out == nullptr) return false;
-    *out = {};
+    *out = ResolvedUpstreamAddresses{};
     if (hostname.ptr == nullptr || hostname.len == 0 || hostname.len > 253) return false;
 
     char name[254];

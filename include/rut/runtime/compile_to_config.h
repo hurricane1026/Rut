@@ -2098,7 +2098,7 @@ inline bool resolve_upstream_endpoints(const rir::Module::Upstream& upstream,
                                        UpstreamHostnameResolver hostname_resolver,
                                        ResolvedUpstreamEndpoints* out) {
     if (out == nullptr) return false;
-    *out = {};
+    *out = ResolvedUpstreamEndpoints{};
     auto append = [&](const IpAddress& address, Str hostname, u16 port) -> bool {
         ResolvedUpstreamAddresses resolved{};
         const IpAddress* addresses = &address;

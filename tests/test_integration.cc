@@ -15236,7 +15236,7 @@ TEST(route, populate_route_config_resolves_hostname_backends) {
 
     auto resolver = +[](Str hostname, ResolvedUpstreamAddresses* out) -> bool {
         if (out == nullptr) return false;
-        *out = {};
+        *out = ResolvedUpstreamAddresses{};
         if (hostname.eq(Str{"api.internal", 12})) {
             out->addresses[out->count++] = IpAddress::v4(0x7f000001);
             if (!parse_ip_address(Str{"2001:db8::1", 11}, &out->addresses[out->count]))
@@ -15264,20 +15264,20 @@ TEST(route, populate_route_config_resolves_hostname_backends) {
     auto failed = std::make_unique<RouteConfig>();
     CHECK_FALSE(populate_route_config(*failed, rir.module, nullptr));
     auto empty_resolver = +[](Str, ResolvedUpstreamAddresses* out) -> bool {
-        *out = {};
+        *out = ResolvedUpstreamAddresses{};
         return true;
     };
     auto empty = std::make_unique<RouteConfig>();
     CHECK_FALSE(populate_route_config(*empty, rir.module, empty_resolver));
     auto invalid_family_resolver = +[](Str, ResolvedUpstreamAddresses* out) -> bool {
-        *out = {};
+        *out = ResolvedUpstreamAddresses{};
         out->count = 1;
         return true;
     };
     auto invalid_family = std::make_unique<RouteConfig>();
     CHECK_FALSE(populate_route_config(*invalid_family, rir.module, invalid_family_resolver));
     auto oversized_resolver = +[](Str, ResolvedUpstreamAddresses* out) -> bool {
-        *out = {};
+        *out = ResolvedUpstreamAddresses{};
         out->count = ResolvedUpstreamAddresses::kMaxAddresses + 1;
         return true;
     };
@@ -15330,7 +15330,7 @@ TEST(route, populate_route_config_validates_pre_bound_backend_identity_order) {
     rir.module.upstream_mark_replay_complete = true;
     auto resolver = +[](Str hostname, ResolvedUpstreamAddresses* out) -> bool {
         if (out == nullptr || !hostname.eq(Str{"api.internal", 12})) return false;
-        *out = {};
+        *out = ResolvedUpstreamAddresses{};
         out->addresses[out->count++] = IpAddress::v4(0x7f000001);
         return true;
     };
