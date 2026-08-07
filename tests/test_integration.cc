@@ -15257,9 +15257,9 @@ TEST(route, populate_route_config_resolves_hostname_backends) {
     REQUIRE_EQ(cfg->upstream_count, 1u);
     REQUIRE_EQ(cfg->upstreams[0].addr_count, 3u);
     CHECK_EQ(cfg->upstreams[0].addrs[0].family(), AF_INET);
-    CHECK_EQ(cfg->upstreams[0].addrs[1].family(), AF_INET);
-    CHECK_EQ(cfg->upstreams[0].addrs[2].family(), AF_INET6);
-    CHECK_EQ(ntohs(cfg->upstreams[0].addrs[2].port()), 8080u);
+    CHECK_EQ(cfg->upstreams[0].addrs[1].family(), AF_INET6);
+    CHECK_EQ(cfg->upstreams[0].addrs[2].family(), AF_INET);
+    CHECK_EQ(ntohs(cfg->upstreams[0].addrs[1].port()), 8080u);
 
     auto failed = std::make_unique<RouteConfig>();
     CHECK_FALSE(populate_route_config(*failed, rir.module, nullptr));
