@@ -399,12 +399,10 @@ bool h2_defer_until_data_end(H2Dispatch<Loop>& d,
         h2_emit_status(d, stream_id, 503);
         return false;
     }
-    // Only JIT handlers consume the synthesized HTTP/1 request. Static / proxy /
-    // default deferrals just count DATA octets and validate Content-Length, so
-    // they never serialize the header list — that avoids a spurious 400 when a
-    // large-but-legal h2 header block exceeds the HTTP/1 synth cap.
+    // JIT handlers and proxy routes consume the synthesized HTTP/1 request.
+    // Static/default deferrals only count DATA octets for Content-Length validation.
     u32 synth_len = 0;
-    if (action == RouteAction::JitHandler) {
+    if (action == RouteAction::JitHandler || action == RouteAction::Proxy) {
         synth_len =
             h2_synth_h1_request(headers, nheaders, h2->pending_synth, Http2Conn::kBodySynthCap);
         if (synth_len == 0) {
@@ -1031,12 +1029,50 @@ void h2_finish_body(H2Dispatch<Loop>& d, u32 stream_id) {
     }
 
     const RouteAction kAction = h2->pending_route_action;
-    if (kAction != RouteAction::JitHandler) {
-        // Static / default / proxy: respond from the decision made at HEADERS
-        // time. No synthesized request was built for these.
-        const u16 kStatus = (kAction == RouteAction::Proxy) ? 503 : h2->pending_static_status;
+    if (kAction == RouteAction::Proxy) {
+        const RouteConfig* cfg = h2->pending_route_config;
+        const RouteEntry* route = h2->pending_route;
+        const bool request_forwardable = h2->pending_request_forwardable;
+        const UpstreamMarkReplayContext replay_context = h2->pending_replay_context;
+        if (cfg == nullptr || route == nullptr || !request_forwardable) {
+            h2_clear_pending(*h2);
+            h2_emit_status(d, stream_id, request_forwardable ? 500 : 400);
+            return;
+        }
+        if (!h2->pending_has_content_length &&
+            !h2_inject_content_length(h2->pending_synth,
+                                      &h2->pending_synth_len,
+                                      h2->pending_body_start,
+                                      h2->pending_body_len,
+                                      Http2Conn::kBodySynthCap)) {
+            h2_clear_pending(*h2);
+            h2_emit_status(d, stream_id, 413);
+            return;
+        }
+        const u32 synth_len = h2->pending_synth_len;
+        h2->pending_stream = 0;  // transfer the shared request buffer to async
+        d.conn->replay_context = replay_context;
+        d.conn->h2->async_replay_context = replay_context;
+        const bool suspended = h2_suspend_proxy(d,
+                                                stream_id,
+                                                cfg,
+                                                route,
+                                                route->upstream_id,
+                                                false,
+                                                false,
+                                                nullptr,
+                                                h2->pending_synth,
+                                                synth_len);
         h2_clear_pending(*h2);
-        h2_emit_status(d, stream_id, kStatus);
+        if (!suspended) h2_emit_status(d, stream_id, 503);
+        return;
+    }
+
+    if (kAction != RouteAction::JitHandler) {
+        // Static/default routes respond from the decision made at HEADERS time.
+        const u16 status = h2->pending_static_status;
+        h2_clear_pending(*h2);
+        h2_emit_status(d, stream_id, status);
         return;
     }
 
@@ -1479,19 +1515,15 @@ void h2_dispatch_request(H2Dispatch<Loop>& d,
         }
         case RouteAction::Proxy:
         default:
-            // Any request body (DATA frames follow) blocks proxying: we'd forward
-            // the synthesized headers immediately and silently drop the body
-            // (it's never tied to pending_stream). Gate on end_stream, NOT just a
-            // declared content-length — an h2 POST can stream a body with no
-            // content-length. Defer to drain DATA, then 503 (forwarding request
-            // bodies over h2 is a follow-up); see h2_finish_body's Proxy branch.
+            // Buffer DATA before opening the HTTP/1.1 upstream. Gate on end_stream,
+            // not just a declared content-length: an h2 POST may omit it.
             if (!end_stream) {
                 h2_defer_until_data_end(d,
                                         stream_id,
                                         headers,
                                         nheaders,
                                         req,
-                                        /*buffer_body=*/false,
+                                        /*buffer_body=*/true,
                                         RouteAction::Proxy,
                                         config,
                                         route,

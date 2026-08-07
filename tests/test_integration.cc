@@ -12176,14 +12176,14 @@ TEST(shard, serves_http2_proxy_truncated_upstream) {
     close(lfd);
 }
 
-// A proxy request that carries a body (HEADERS without END_STREAM, then DATA)
-// must be rejected with 503 BEFORE any upstream contact — forwarding request
-// bodies over h2 isn't supported yet, and the no-body path would otherwise drop
-// the body. The upstream points at a dead port: a 503 (not 502) proves we never
-// tried to connect. Regression for the DATA-bearing-proxy fix.
-TEST(shard, serves_http2_proxy_rejects_request_body) {
+TEST(shard, serves_http2_proxy_request_body) {
+    ScriptedUpstreamServer backend;
+    static const char kResponse[] =
+        "HTTP/1.1 201 Created\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok";
+    REQUIRE(backend.setup(kResponse, sizeof(kResponse) - 1));
+
     RouteConfig cfg;
-    auto id = cfg.add_upstream("dead", 0x7F000001, 9);  // discard port, never connected
+    auto id = cfg.add_upstream("body", 0x7F000001, backend.port);
     REQUIRE(id.has_value());
     REQUIRE(cfg.add_proxy("/api", 0, id.value()));
 
@@ -12221,9 +12221,63 @@ TEST(shard, serves_http2_proxy_rejects_request_body) {
         total += static_cast<u32>(got);
         if (h2_status_for_stream(resp, total, 1) != 0) break;
     }
-    CHECK_EQ(h2_status_for_stream(resp, total, 1), 503u);  // rejected pre-forward, not 502
+    CHECK_EQ(h2_status_for_stream(resp, total, 1), 201u);
+    CHECK(buf_contains(backend.request, backend.request_len, "content-length: 4", 17));
+    CHECK(buf_contains(backend.request, backend.request_len, "\r\n\r\nbody", 8));
 
     close(c);
+    shard.stop();
+    shard.join();
+    shard.shutdown();
+    close(lfd);
+}
+
+TEST(shard, rejects_oversized_http2_proxy_request_body) {
+    RouteConfig cfg;
+    auto id = cfg.add_upstream("dead", 0x7F000001, 9);
+    REQUIRE(id.has_value());
+    REQUIRE(cfg.add_proxy("/api", 0, id.value()));
+
+    Shard<EpollEventLoop> shard;
+    i32 lfd = create_listen_socket(0).value_or(-1);
+    REQUIRE(lfd >= 0);
+    const u16 port = get_port(lfd);
+    REQUIRE(shard.init(0, lfd).has_value());
+    shard.route_config = &cfg;
+    REQUIRE(shard.spawn(-1).has_value());
+    usleep(50000);
+
+    i32 client = connect_to(port);
+    REQUIRE(client >= 0);
+    set_socket_timeouts(client, 2);
+    static u8 request[32000];
+    u32 request_len = h2_client_prologue(request);
+    const hpack::Header headers[] = {
+        {{":method", 7}, {"POST", 4}},
+        {{":scheme", 7}, {"http", 4}},
+        {{":path", 5}, {"/api", 4}},
+        {{":authority", 10}, {"localhost", 9}},
+        {{"content-length", 14}, {"20000", 5}},
+    };
+    request_len += http2_write_headers(
+        request + request_len, sizeof(request) - request_len, 1, headers, 5, false);
+    static u8 body[10000];
+    request_len += http2_write_data(request + request_len, 1, body, sizeof(body), false);
+    request_len += http2_write_data(request + request_len, 1, body, sizeof(body), true);
+    REQUIRE(write_all_fd(client, request, request_len));
+
+    u8 response[4096];
+    u32 total = 0;
+    for (i32 attempt = 0; attempt < 8 && total < sizeof(response); attempt++) {
+        const i32 got = recv_timeout(
+            client, reinterpret_cast<char*>(response + total), sizeof(response) - total, 2000);
+        if (got <= 0) break;
+        total += static_cast<u32>(got);
+        if (h2_status_for_stream(response, total, 1) != 0) break;
+    }
+    CHECK_EQ(h2_status_for_stream(response, total, 1), 413u);
+
+    close(client);
     shard.stop();
     shard.join();
     shard.shutdown();
