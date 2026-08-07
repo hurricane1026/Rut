@@ -2164,7 +2164,7 @@ inline bool resolve_upstream_endpoints(const rir::Module::Upstream& upstream,
         u32 i = 0;
         while (i < upstream.extra_count) {
             if (upstream.extra_hostnames[i].len != 0) return true;
-            ++i;
+            i += 1;
         }
         return false;
     }();
