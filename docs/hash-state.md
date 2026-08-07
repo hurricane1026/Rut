@@ -1,6 +1,9 @@
 # Strict Hash and Owner-Shard Updates — Decision Record
 
-Status: **accepted design, not implemented** (2026-07-18).
+Status: **accepted design, implementation in progress** (2026-08-07). The
+fixed-capacity, failure-atomic cuckoo table substrate is implemented; the DSL
+surface and owner-shard operation protocol remain reserved until their complete
+error and reload semantics land.
 
 This record defines the contract required before Rut may expose `Hash` or call
 in-process state a source of truth. It does not promise cross-node durability or

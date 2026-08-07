@@ -487,6 +487,7 @@ jobs:
           LLVM_PROFILE_FILE=build/test_arena.profraw ./build/tests/test_arena
           LLVM_PROFILE_FILE=build/test_expected.profraw ./build/tests/test_expected
           LLVM_PROFILE_FILE=build/test_http_parser.profraw ./build/tests/test_http_parser
+          LLVM_PROFILE_FILE=build/test_hash_table.profraw ./build/tests/test_hash_table
           LLVM_PROFILE_FILE=build/test_drain.profraw ./build/tests/test_drain
           LLVM_PROFILE_FILE=build/test_access_log.profraw ./build/tests/test_access_log
           LLVM_PROFILE_FILE=build/test_fault_injection.profraw ./build/tests/test_fault_injection
@@ -552,6 +553,7 @@ jobs:
             build/tests/test_integration \
             build/tests/test_arena \
             build/tests/test_http_parser \
+            build/tests/test_hash_table \
             build/tests/test_http2 \
             build/tests/test_hpack \
             build/tests/test_hpack_diff \
