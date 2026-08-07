@@ -189,7 +189,8 @@ bool ProcessReloadCoordinator::init(ControlPlaneMutationPort* mutation,
                                     ReloadProgramLoader loader,
                                     void* loader_context,
                                     ReloadCancellationCheck cancellation_check,
-                                    void* cancellation_context) {
+                                    void* cancellation_context,
+                                    bool supports_active_health_probes) {
     if (mutation == nullptr || source_path == nullptr || active == nullptr || spare == nullptr ||
         active == spare || shards == nullptr || shard_count == 0 || shard_count > kMaxShards ||
         active->config.config_generation == 0 ||
@@ -213,6 +214,7 @@ bool ProcessReloadCoordinator::init(ControlPlaneMutationPort* mutation,
     loader_context_ = loader_context;
     cancellation_check_ = cancellation_check;
     cancellation_context_ = cancellation_context;
+    supports_active_health_probes_ = supports_active_health_probes;
     clear_source_snapshots();
     if (default_loader_selected_) (void)refresh_source_snapshot();
     mutation_->set_reload_source_version_capture(&capture_source_version, this);
@@ -238,9 +240,11 @@ bool ProcessReloadCoordinator::finish_activation_for_shutdown() {
 
 bool ProcessReloadCoordinator::compatible(const RouteConfig& active,
                                           RouteConfig& candidate,
-                                          u32 shard_count) {
+                                          u32 shard_count,
+                                          bool supports_active_health_probes) {
     if (shard_count == 0 || candidate.first_out_of_range_timer_shard(shard_count) >= 0)
         return false;
+    if (!supports_active_health_probes && candidate.requires_active_health_probes()) return false;
     if (!active.same_firewall_policy(candidate)) return false;
     if (active.cache_instance_count != candidate.cache_instance_count) return false;
     for (u32 i = 0; i < active.cache_instance_count; i++) {
@@ -419,7 +423,10 @@ ReloadCoordinatorPoll ProcessReloadCoordinator::poll() {
         mutation_->stop();
         return ReloadCoordinatorPoll::Stopped;
     }
-    if (!compatible(active_->config, spare_->config, shard_count_) ||
+    if (!compatible(active_->config,
+                    spare_->config,
+                    shard_count_,
+                    supports_active_health_probes_) ||
         old_generation_ >= ControlPlaneMutationPort::kMaxGeneration) {
         spare_->destroy();
         (void)mutation_->complete_reload(

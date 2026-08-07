@@ -258,7 +258,8 @@ static i32 run_shards(u16 port,
                                                  nullptr,
                                                  nullptr,
                                                  &shutdown_signal_pending,
-                                                 nullptr);
+                                                 nullptr,
+                                                 EventLoopType::kSupportsHealthProbe);
         if (!reload_enabled) {
             write_str("Failed to initialize reload coordinator\n");
             for (u32 i = 0; i < shard_count; i++) shards[i].shutdown();
