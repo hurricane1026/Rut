@@ -2160,7 +2160,12 @@ inline bool resolve_upstream_endpoints(const rir::Module::Upstream& upstream,
                 upstream.extra_addresses[i], upstream.extra_hostnames[i], upstream.extra_ports[i]))
             return false;
     }
-    for (u32 i = 1; i < out->count; ++i) {
+    const bool has_hostname = upstream.hostname.len != 0 || [&] {
+        for (u32 i = 0; i < upstream.extra_count; ++i)
+            if (upstream.extra_hostnames[i].len != 0) return true;
+        return false;
+    }();
+    for (u32 i = 1; has_hostname && i < out->count; ++i) {
         const IpAddress address = out->addresses[i];
         const u16 port = out->ports[i];
         u32 pos = i;
