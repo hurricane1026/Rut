@@ -6675,6 +6675,20 @@ TEST(frontend, parse_upstream_ipv6_literals) {
     }
 }
 
+TEST(frontend, parse_upstream_preserves_zero_padded_ipv4_octets) {
+    const char* src = "upstream api at \"001.002.003.004:8443\"\nroute GET \"/u\" { return 200 }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    REQUIRE_EQ(hir->upstreams.len, 1u);
+    CHECK_EQ(hir->upstreams[0].address.family, IpAddress::Family::V4);
+    CHECK_EQ(hir->upstreams[0].address.v4_host_order(), 0x01020304u);
+    CHECK_EQ(hir->upstreams[0].port, 8443u);
+}
+
 TEST(frontend, analyze_rejects_unbracketed_ipv6_endpoint) {
     const char* src = "upstream api at \"2001:db8::1:8443\"\nroute GET \"/u\" { return 200 }\n";
     auto lexed = lex(lit(src));

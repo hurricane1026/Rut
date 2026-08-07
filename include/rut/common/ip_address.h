@@ -40,19 +40,43 @@ struct IpAddress {
     }
 };
 
+inline bool parse_ipv4_decimal(Str text, IpAddress* out) {
+    if (out == nullptr || text.ptr == nullptr || text.len == 0) return false;
+    u8 octets[4]{};
+    u32 octet = 0;
+    u32 digits = 0;
+    u32 value = 0;
+    for (u32 i = 0; i < text.len; i++) {
+        const char c = text.ptr[i];
+        if (c == '.') {
+            if (digits == 0 || octet >= 3) return false;
+            octets[octet++] = static_cast<u8>(value);
+            digits = 0;
+            value = 0;
+            continue;
+        }
+        if (c < '0' || c > '9' || digits >= 3) return false;
+        value = value * 10 + static_cast<u32>(c - '0');
+        if (value > 255) return false;
+        digits++;
+    }
+    if (digits == 0 || octet != 3) return false;
+    octets[3] = static_cast<u8>(value);
+    out->family = IpAddress::Family::V4;
+    memcpy(out->bytes, octets, sizeof(octets));
+    return true;
+}
+
 inline bool parse_ip_address(Str text, IpAddress* out) {
     if (out == nullptr || text.ptr == nullptr || text.len == 0 || text.len >= INET6_ADDRSTRLEN)
         return false;
+    // Preserve the DSL's original decimal dotted-quad syntax, including
+    // zero-padded octets that inet_pton intentionally rejects.
+    if (parse_ipv4_decimal(text, out)) return true;
     char buffer[INET6_ADDRSTRLEN];
     for (u32 i = 0; i < text.len; i++) buffer[i] = text.ptr[i];
     buffer[text.len] = '\0';
 
-    in_addr v4{};
-    if (inet_pton(AF_INET, buffer, &v4) == 1) {
-        out->family = IpAddress::Family::V4;
-        memcpy(out->bytes, &v4, sizeof(v4));
-        return true;
-    }
     in6_addr v6{};
     if (inet_pton(AF_INET6, buffer, &v6) == 1) {
         out->family = IpAddress::Family::V6;
