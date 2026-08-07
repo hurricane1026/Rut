@@ -3398,6 +3398,62 @@ TEST(route, upstream_target_ipv6_addr) {
     CHECK_EQ(close(fd), 0);
 }
 
+TEST(route, ip_address_parser_covers_legacy_and_invalid_literals) {
+    IpAddress address{};
+    CHECK(!parse_ipv4_decimal(Str{}, &address));
+    CHECK(!parse_ipv4_decimal(Str{nullptr, 1}, &address));
+    CHECK(!parse_ipv4_decimal(Str{"1..2.3", 6}, &address));
+    CHECK(!parse_ipv4_decimal(Str{"1.2.3.4.5", 9}, &address));
+    CHECK(!parse_ipv4_decimal(Str{"1.2.x.4", 7}, &address));
+    CHECK(!parse_ipv4_decimal(Str{"0000.2.3.4", 10}, &address));
+    CHECK(!parse_ipv4_decimal(Str{"256.2.3.4", 9}, &address));
+    CHECK(!parse_ipv4_decimal(Str{"1.2.3.", 6}, &address));
+    CHECK(!parse_ipv4_decimal(Str{"1.2.3", 5}, &address));
+    CHECK(!parse_ipv4_decimal(Str{"1.2.3.4", 7}, nullptr));
+
+    CHECK(!parse_ip_address(Str{}, &address));
+    CHECK(!parse_ip_address(Str{nullptr, 1}, &address));
+    CHECK(!parse_ip_address(Str{"not-an-ip", 9}, &address));
+    char oversized[INET6_ADDRSTRLEN]{};
+    CHECK(!parse_ip_address(Str{oversized, INET6_ADDRSTRLEN}, &address));
+    CHECK(!parse_ip_address(Str{"127.0.0.1", 9}, nullptr));
+
+    REQUIRE(parse_ip_address(Str{"001.002.003.004", 15}, &address));
+    CHECK_EQ(address.family, IpAddress::Family::V4);
+    CHECK_EQ(address.v4_host_order(), 0x01020304u);
+    CHECK_EQ(address.byte_count(), 4u);
+
+    REQUIRE(parse_ip_address(Str{"2001:db8::1", 11}, &address));
+    CHECK_EQ(address.family, IpAddress::Family::V6);
+    CHECK_EQ(address.v4_host_order(), 0u);
+    CHECK_EQ(address.byte_count(), 16u);
+
+    address = {};
+    CHECK_EQ(address.byte_count(), 0u);
+}
+
+TEST(route, upstream_endpoint_empty_and_ipv6_helpers) {
+    UpstreamEndpoint empty{};
+    CHECK_EQ(empty.family(), AF_UNSPEC);
+    CHECK(empty.addr() != nullptr);
+    CHECK(empty.ipv4() == nullptr);
+    CHECK(empty.ipv6() == nullptr);
+    CHECK_EQ(empty.port(), 0u);
+    CHECK(!empty.same_address(empty));
+    CHECK_NE(empty.identity(), 0u);
+    CHECK(!empty.set_ip(IpAddress{}, 8080));
+
+    IpAddress address{};
+    REQUIRE(parse_ip_address(Str{"2001:db8::7", 11}, &address));
+    UpstreamTarget target{};
+    REQUIRE(target.add_addr_v6(address.bytes, 8080));
+    REQUIRE_EQ(target.addr_count, 1u);
+    REQUIRE(target.addrs[0].ipv6() != nullptr);
+    CHECK_EQ(ntohs(target.addrs[0].port()), 8080u);
+    CHECK(target.addrs[0].same_address(target.addrs[0]));
+    CHECK_NE(target.addrs[0].identity(), 0u);
+}
+
 TEST(route, upstream_rejects_invalid_address_family_without_consuming_slot) {
     RouteConfig cfg;
     IpAddress address{};
