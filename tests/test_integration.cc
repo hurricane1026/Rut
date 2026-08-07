@@ -15325,6 +15325,22 @@ TEST(route, dns_upstream_rejects_static_server_iteration) {
         hir.error().detail.eq(Str{"Upstream.servers requires concrete IP backend addresses", 55}));
 }
 
+TEST(route, static_duplicate_backends_are_rejected) {
+    using namespace rut;
+    const char* src =
+        "upstream backend { backends: [\"127.0.0.1:8080\", \"127.0.0.1:8080\"] }\n"
+        "timer check_health, every: 5s, shard: 0 { for server in backend.servers { "
+        "backend.mark(server, healthy: true) } return 200 }\n";
+    auto lexed = lex(Str{src, static_cast<u32>(strlen(src))});
+    REQUIRE(lexed);
+    auto ast = parse_file(lexed.value());
+    REQUIRE(ast);
+    std::unique_ptr<AstFile> ast_owned(ast.value());
+    auto hir = analyze_file(*ast_owned);
+    REQUIRE_FALSE(hir.has_value());
+    CHECK_EQ(hir.error().code, FrontendError::UnsupportedSyntax);
+}
+
 // Round-robin backend selection: a multi-backend upstream rotates through its
 // endpoints; a single-backend upstream always returns index 0. Uses dedicated
 // upstream ids so the per-shard (thread_local) cursor + health start clean.

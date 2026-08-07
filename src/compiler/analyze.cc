@@ -19774,6 +19774,28 @@ static FrontendResult<HirModule*> analyze_file_internal(
                     return frontend_error(FrontendError::UnsupportedSyntax,
                                           item.upstream.addr_span,
                                           item.upstream.backend_lits[b]);
+                if (extra.hostname.len == 0 && extra.port == primary.port &&
+                    extra.address.family == primary.address.family &&
+                    extra.address.byte_count() != 0 &&
+                    memcmp(extra.address.bytes,
+                           primary.address.bytes,
+                           extra.address.byte_count()) == 0)
+                    return frontend_error(FrontendError::UnsupportedSyntax,
+                                          item.upstream.addr_span,
+                                          item.upstream.backend_lits[b]);
+                for (u32 previous = 0; previous < up.extra_count; ++previous) {
+                    const IpAddress& previous_address = up.extra_addresses[previous];
+                    if (extra.hostname.len == 0 && up.extra_hostnames[previous].len == 0 &&
+                        extra.port == up.extra_ports[previous] &&
+                        extra.address.family == previous_address.family &&
+                        extra.address.byte_count() != 0 &&
+                        memcmp(extra.address.bytes,
+                               previous_address.bytes,
+                               extra.address.byte_count()) == 0)
+                        return frontend_error(FrontendError::UnsupportedSyntax,
+                                              item.upstream.addr_span,
+                                              item.upstream.backend_lits[b]);
+                }
                 up.extra_addresses[up.extra_count] = extra.address;
                 up.extra_hostnames[up.extra_count] = extra.hostname;
                 up.extra_ports[up.extra_count] = extra.port;
