@@ -53,6 +53,7 @@
 #include "rut/jit/codegen.h"
 #include "rut/jit/jit_engine.h"
 #include "rut/runtime/cache_table.h"
+#include "rut/runtime/dns_resolver.h"
 #include "rut/runtime/route_table.h"
 
 namespace rut {
@@ -1307,15 +1308,21 @@ inline u64 marking_policy_upstream_identity(const rir::Module& mod, u32 upstream
     marking_policy_identity_mix(&identity, declaration.has_address ? 1 : 0);
     if (declaration.has_address) {
         marking_policy_identity_mix(&identity, declaration.extra_count + 1);
-        marking_policy_identity_mix(&identity, static_cast<u8>(declaration.address.family));
-        for (u32 byte = 0; byte < declaration.address.byte_count(); byte++)
-            marking_policy_identity_mix(&identity, declaration.address.bytes[byte]);
+        marking_policy_identity_mix_str(&identity, declaration.hostname);
+        if (declaration.hostname.len == 0) {
+            marking_policy_identity_mix(&identity, static_cast<u8>(declaration.address.family));
+            for (u32 byte = 0; byte < declaration.address.byte_count(); byte++)
+                marking_policy_identity_mix(&identity, declaration.address.bytes[byte]);
+        }
         marking_policy_identity_mix(&identity, declaration.port);
         for (u32 backend = 0; backend < declaration.extra_count; backend++) {
             const auto& address = declaration.extra_addresses[backend];
-            marking_policy_identity_mix(&identity, static_cast<u8>(address.family));
-            for (u32 byte = 0; byte < address.byte_count(); byte++)
-                marking_policy_identity_mix(&identity, address.bytes[byte]);
+            marking_policy_identity_mix_str(&identity, declaration.extra_hostnames[backend]);
+            if (declaration.extra_hostnames[backend].len == 0) {
+                marking_policy_identity_mix(&identity, static_cast<u8>(address.family));
+                for (u32 byte = 0; byte < address.byte_count(); byte++)
+                    marking_policy_identity_mix(&identity, address.bytes[byte]);
+            }
             marking_policy_identity_mix(&identity, declaration.extra_ports[backend]);
         }
     }
@@ -2081,7 +2088,69 @@ inline u64 marking_policy_identity(const rir::Module& mod, const rir::Function& 
     return identity == 0 ? 1 : identity;
 }
 
-inline bool populate_route_config(RouteConfig& cfg, const rir::Module& mod) {
+struct ResolvedUpstreamEndpoints {
+    IpAddress addresses[UpstreamTarget::kMaxBackends]{};
+    u16 ports[UpstreamTarget::kMaxBackends]{};
+    u32 count = 0;
+};
+
+inline bool resolve_upstream_endpoints(const rir::Module::Upstream& upstream,
+                                       UpstreamHostnameResolver hostname_resolver,
+                                       ResolvedUpstreamEndpoints* out) {
+    if (out == nullptr) return false;
+    *out = {};
+    auto append = [&](const IpAddress& address, Str hostname, u16 port) -> bool {
+        ResolvedUpstreamAddresses resolved{};
+        const IpAddress* addresses = &address;
+        u32 address_count = 1;
+        if (hostname.len != 0) {
+            if (hostname.ptr == nullptr || hostname_resolver == nullptr ||
+                !hostname_resolver(hostname, &resolved))
+                return false;
+            if (resolved.count == 0 || resolved.count > ResolvedUpstreamAddresses::kMaxAddresses)
+                return false;
+            for (u32 i = 0; i < resolved.count; ++i) {
+                if (resolved.addresses[i].family != IpAddress::Family::V4 &&
+                    resolved.addresses[i].family != IpAddress::Family::V6)
+                    return false;
+            }
+            addresses = resolved.addresses;
+            address_count = resolved.count;
+        } else if (address.family != IpAddress::Family::V4 &&
+                   address.family != IpAddress::Family::V6) {
+            return false;
+        }
+        for (u32 i = 0; i < address_count; ++i) {
+            bool duplicate = false;
+            for (u32 existing = 0; existing < out->count; ++existing) {
+                const u32 byte_count = addresses[i].byte_count();
+                duplicate |=
+                    out->ports[existing] == port &&
+                    out->addresses[existing].family == addresses[i].family && byte_count != 0 &&
+                    memcmp(out->addresses[existing].bytes, addresses[i].bytes, byte_count) == 0;
+            }
+            if (duplicate) continue;
+            if (out->count == UpstreamTarget::kMaxBackends) return false;
+            out->addresses[out->count] = addresses[i];
+            out->ports[out->count] = port;
+            out->count++;
+        }
+        return true;
+    };
+
+    if (!append(upstream.address, upstream.hostname, upstream.port)) return false;
+    for (u32 i = 0; i < upstream.extra_count; ++i) {
+        if (!append(
+                upstream.extra_addresses[i], upstream.extra_hostnames[i], upstream.extra_ports[i]))
+            return false;
+    }
+    return out->count != 0;
+}
+
+inline bool populate_route_config(
+    RouteConfig& cfg,
+    const rir::Module& mod,
+    UpstreamHostnameResolver hostname_resolver = &resolve_upstream_hostname) {
     // Bodies / header sets / routes must always start empty — there's
     // no "merge" semantics for those tables, and a non-zero count
     // would break the compile-time body_idx / headers_idx invariants.
@@ -2139,6 +2208,8 @@ inline bool populate_route_config(RouteConfig& cfg, const rir::Module& mod) {
         }
         for (u32 i = 0; i < mod.upstream_count; i++) {
             const auto& up = mod.upstreams[i];
+            ResolvedUpstreamEndpoints endpoints{};
+            if (!resolve_upstream_endpoints(up, hostname_resolver, &endpoints)) return false;
             // add_upstream's name parameter is a NUL-terminated C
             // string; rir::Module stores Str (ptr + len) where the
             // bytes may not be NUL-terminated. Copy into a buffer
@@ -2151,15 +2222,12 @@ inline bool populate_route_config(RouteConfig& cfg, const rir::Module& mod) {
             if (copy_len >= sizeof(name_buf)) copy_len = sizeof(name_buf) - 1;
             for (u32 j = 0; j < copy_len; j++) name_buf[j] = up.name.ptr[j];
             name_buf[copy_len] = '\0';
-            auto r = cfg.add_upstream(name_buf, up.address, up.port);
+            auto r = cfg.add_upstream(name_buf, endpoints.addresses[0], endpoints.ports[0]);
             if (!r.has_value()) return false;
             if (r.value() != i) return false;
             cfg.upstreams[i].name_identity = upstream_name_identity(up.name.ptr, up.name.len);
-            // Append any extra load-balancing endpoints (primary was the
-            // ip/port above). add_upstream_backend fails only on a full
-            // backend list, which the frontend already bounds.
-            for (u32 b = 0; b < up.extra_count; b++) {
-                if (!cfg.add_upstream_backend(i, up.extra_addresses[b], up.extra_ports[b]))
+            for (u32 b = 1; b < endpoints.count; b++) {
+                if (!cfg.add_upstream_backend(i, endpoints.addresses[b], endpoints.ports[b]))
                     return false;
             }
             // Attach active health-check config (data only; the frontend already
@@ -2201,14 +2269,13 @@ inline bool populate_route_config(RouteConfig& cfg, const rir::Module& mod) {
             // numeric backend identity could name another endpoint.
             if (up.has_address && (marked_upstream_mask & (u32{1} << i)) != 0) {
                 const auto& target = cfg.upstreams[i];
-                if (target.addr_count != up.extra_count + 1) return false;
-                UpstreamEndpoint primary{};
-                if (!primary.set_ip(up.address, up.port) || !target.addrs[0].same_address(primary))
-                    return false;
-                for (u32 b = 0; b < up.extra_count; b++) {
-                    UpstreamEndpoint extra{};
-                    if (!extra.set_ip(up.extra_addresses[b], up.extra_ports[b]) ||
-                        !target.addrs[b + 1].same_address(extra))
+                ResolvedUpstreamEndpoints endpoints{};
+                if (!resolve_upstream_endpoints(up, hostname_resolver, &endpoints)) return false;
+                if (target.addr_count != endpoints.count) return false;
+                for (u32 b = 0; b < endpoints.count; b++) {
+                    UpstreamEndpoint expected{};
+                    if (!expected.set_ip(endpoints.addresses[b], endpoints.ports[b]) ||
+                        !target.addrs[b].same_address(expected))
                         return false;
                 }
             }

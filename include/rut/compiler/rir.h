@@ -525,12 +525,14 @@ struct Module {
         Str name;
         bool has_address;
         IpAddress address{};
+        Str hostname{};
         u16 port;
         // Extra load-balancing endpoints (primary = ip/port). The
         // compile→config helper appends these via add_upstream_backend.
         static constexpr u32 kMaxExtraBackends = 7;
         u32 extra_count = 0;
         IpAddress extra_addresses[kMaxExtraBackends] = {};
+        Str extra_hostnames[kMaxExtraBackends]{};
         u16 extra_ports[kMaxExtraBackends] = {};
         // Active health-check config carried verbatim from MIR (data only; the
         // compile→config helper feeds it to set_upstream_health_check). hc_path

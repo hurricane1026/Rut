@@ -19684,13 +19684,37 @@ static FrontendResult<HirModule*> analyze_file_internal(
         up.id = static_cast<u16>(mod.upstreams.len);
         struct ParsedEndpoint {
             IpAddress address{};
+            Str hostname{};
             u16 port = 0;
+        };
+        auto valid_hostname = [](Str host) -> bool {
+            if (host.ptr == nullptr || host.len == 0 || host.len > 253) return false;
+            u32 label_len = 0;
+            bool has_non_numeric = false;
+            for (u32 k = 0; k < host.len; ++k) {
+                const char c = host.ptr[k];
+                if (c == '.') {
+                    if (label_len == 0 || label_len > 63 || host.ptr[k - 1] == '-') return false;
+                    label_len = 0;
+                    continue;
+                }
+                const bool alpha = (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z');
+                const bool digit = c >= '0' && c <= '9';
+                if (!alpha && !digit && c != '-') return false;
+                if (label_len == 0 && c == '-') return false;
+                has_non_numeric |= alpha || c == '-';
+                label_len++;
+            }
+            return label_len > 0 && label_len <= 63 && host.ptr[host.len - 1] != '-' &&
+                   has_non_numeric;
         };
         auto parse_host_port = [&](Str lit, ParsedEndpoint* out) -> bool {
             if (out == nullptr || lit.ptr == nullptr || lit.len == 0) return false;
             Str host_part{};
             u32 port_start = 0;
+            bool bracketed = false;
             if (lit.ptr[0] == '[') {
+                bracketed = true;
                 u32 close = 1;
                 while (close < lit.len && lit.ptr[close] != ']') close++;
                 if (close == lit.len || close + 2 > lit.len || lit.ptr[close + 1] != ':')
@@ -19716,7 +19740,10 @@ static FrontendResult<HirModule*> analyze_file_internal(
                 if (port_value > 0xffffu) return false;
             }
             if (port_value == 0) return false;
-            if (!parse_ip_address(host_part, &out->address)) return false;
+            if (!parse_ip_address(host_part, &out->address)) {
+                if (bracketed || !valid_hostname(host_part)) return false;
+                out->hostname = host_part;
+            }
             out->port = static_cast<u16>(port_value);
             return true;
         };
@@ -19733,6 +19760,7 @@ static FrontendResult<HirModule*> analyze_file_internal(
                                       item.upstream.backend_lits[0]);
             up.has_address = true;
             up.address = primary.address;
+            up.hostname = primary.hostname;
             up.port = primary.port;
             for (u32 b = 1; b < item.upstream.backend_count; b++) {
                 ParsedEndpoint extra{};
@@ -19741,6 +19769,7 @@ static FrontendResult<HirModule*> analyze_file_internal(
                                           item.upstream.addr_span,
                                           item.upstream.backend_lits[b]);
                 up.extra_addresses[up.extra_count] = extra.address;
+                up.extra_hostnames[up.extra_count] = extra.hostname;
                 up.extra_ports[up.extra_count] = extra.port;
                 up.extra_count++;
             }
@@ -19792,11 +19821,13 @@ static FrontendResult<HirModule*> analyze_file_internal(
                 return frontend_error(
                     FrontendError::UnsupportedSyntax, item.upstream.addr_span, port_detail);
             }
-            if (host_part.len >= 2 && host_part.ptr[0] == '[' &&
-                host_part.ptr[host_part.len - 1] == ']') {
+            const bool bracketed = host_part.len >= 2 && host_part.ptr[0] == '[' &&
+                                   host_part.ptr[host_part.len - 1] == ']';
+            if (bracketed) {
                 host_part = {host_part.ptr + 1, host_part.len - 2};
             }
-            if (!parse_ip_address(host_part, &up.address)) {
+            if (!parse_ip_address(host_part, &up.address) &&
+                (bracketed || !valid_hostname(host_part))) {
                 // Keep the detail informative when host_part is
                 // empty (`":8080"` in at-form, `{ host: "" }` in dict
                 // form). An empty detail prints nothing and hides
@@ -19808,6 +19839,7 @@ static FrontendResult<HirModule*> analyze_file_internal(
                 return frontend_error(
                     FrontendError::UnsupportedSyntax, item.upstream.addr_span, host_detail);
             }
+            if (up.address.family == IpAddress::Family::None) up.hostname = host_part;
             up.has_address = true;
             up.port = static_cast<u16>(port_value);
         }

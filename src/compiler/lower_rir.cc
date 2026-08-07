@@ -3626,10 +3626,30 @@ FrontendResult<void> lower_to_rir(const MirModule& mir, FrontendRirModule& out) 
         out.module.upstreams[i].name = {name_buf, src_name.len};
         out.module.upstreams[i].has_address = mir.upstreams[i].has_address;
         out.module.upstreams[i].address = mir.upstreams[i].address;
+        const Str src_hostname = mir.upstreams[i].hostname;
+        char* hostname_buf = nullptr;
+        if (src_hostname.len > 0) {
+            hostname_buf = out.module.arena->alloc_array<char>(src_hostname.len);
+            if (!hostname_buf)
+                return frontend_error(FrontendError::OutOfMemory, mir.upstreams[i].span);
+            for (u32 k = 0; k < src_hostname.len; k++) hostname_buf[k] = src_hostname.ptr[k];
+        }
+        out.module.upstreams[i].hostname = {hostname_buf, src_hostname.len};
         out.module.upstreams[i].port = mir.upstreams[i].port;
         out.module.upstreams[i].extra_count = mir.upstreams[i].extra_count;
         for (u32 b = 0; b < mir.upstreams[i].extra_count; b++) {
             out.module.upstreams[i].extra_addresses[b] = mir.upstreams[i].extra_addresses[b];
+            const Str src_extra_hostname = mir.upstreams[i].extra_hostnames[b];
+            char* extra_hostname_buf = nullptr;
+            if (src_extra_hostname.len > 0) {
+                extra_hostname_buf = out.module.arena->alloc_array<char>(src_extra_hostname.len);
+                if (!extra_hostname_buf)
+                    return frontend_error(FrontendError::OutOfMemory, mir.upstreams[i].span);
+                for (u32 k = 0; k < src_extra_hostname.len; k++)
+                    extra_hostname_buf[k] = src_extra_hostname.ptr[k];
+            }
+            out.module.upstreams[i].extra_hostnames[b] = {extra_hostname_buf,
+                                                          src_extra_hostname.len};
             out.module.upstreams[i].extra_ports[b] = mir.upstreams[i].extra_ports[b];
         }
         // Active health-check config. hc_path is copied into arena memory (like

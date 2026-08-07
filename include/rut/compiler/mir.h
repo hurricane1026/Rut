@@ -508,11 +508,13 @@ struct MirUpstream {
     // must bind this upstream via add_upstream(); addresses declared
     bool has_address = false;
     IpAddress address{};
+    Str hostname{};
     u16 port = 0;
     // Extra load-balancing endpoints copied from HIR (primary = ip/port).
     static constexpr u32 kMaxExtraBackends = 7;
     u32 extra_count = 0;
     IpAddress extra_addresses[kMaxExtraBackends] = {};
+    Str extra_hostnames[kMaxExtraBackends]{};
     u16 extra_ports[kMaxExtraBackends] = {};
     // Active health-check config copied from HIR (data only; no probing yet).
     bool hc_enabled = false;
