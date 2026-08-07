@@ -19691,10 +19691,10 @@ static FrontendResult<HirModule*> analyze_file_internal(
             u16 port = 0;
         };
         auto valid_hostname = [](Str host) -> bool {
-            if (host.ptr == nullptr || host.len == 0 || host.len > 253) return false;
+            if (host.ptr == nullptr || host.len == 0 || host.len > 254) return false;
             const u32 name_len =
                 host.len > 1 && host.ptr[host.len - 1] == '.' ? host.len - 1 : host.len;
-            if (name_len == 0) return false;
+            if (name_len == 0 || name_len > 253) return false;
             u32 label_len = 0;
             bool has_non_numeric = false;
             for (u32 k = 0; k < name_len; ++k) {

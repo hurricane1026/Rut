@@ -6865,6 +6865,22 @@ TEST(frontend, parse_upstream_accepts_absolute_hostname) {
     CHECK(hir->upstreams[0].hostname.eq(lit("example.com.")));
 }
 
+TEST(frontend, parse_upstream_accepts_maximum_length_absolute_hostname) {
+    const std::string label63(63, 'a');
+    const std::string hostname =
+        label63 + "." + label63 + "." + label63 + "." + std::string(61, 'a') + ".";
+    REQUIRE_EQ(hostname.size(), 254u);
+    const std::string src =
+        "upstream api at \"" + hostname + ":8080\"\nroute GET \"/u\" { return 200 }\n";
+    auto lexed = lex({src.data(), static_cast<u32>(src.size())});
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    CHECK(hir->upstreams[0].hostname.eq({hostname.data(), static_cast<u32>(hostname.size())}));
+}
+
 TEST(frontend, parse_upstream_accepts_hostname_backend_list) {
     const char* src =
         "upstream api { backends: [\"api-a.internal:8080\", \"127.0.0.1:8081\", "

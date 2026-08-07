@@ -24,9 +24,12 @@ bool address_less(const IpAddress& lhs, const IpAddress& rhs) {
 bool resolve_upstream_hostname(Str hostname, ResolvedUpstreamAddresses* out) {
     if (out == nullptr) return false;
     *out = ResolvedUpstreamAddresses{};
-    if (hostname.ptr == nullptr || hostname.len == 0 || hostname.len > 253) return false;
+    if (hostname.ptr == nullptr || hostname.len == 0) return false;
+    const u32 name_len =
+        hostname.len > 1 && hostname.ptr[hostname.len - 1] == '.' ? hostname.len - 1 : hostname.len;
+    if (name_len > 253 || hostname.len > 254) return false;
 
-    char name[254];
+    char name[255];
     memcpy(name, hostname.ptr, hostname.len);
     name[hostname.len] = '\0';
 
