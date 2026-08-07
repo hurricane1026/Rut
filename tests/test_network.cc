@@ -16385,8 +16385,8 @@ TEST(route_coverage, unmatched_head_route_suppresses_404_body) {
 
     CHECK_EQ(c->resp_status, 404u);
     const char* response = reinterpret_cast<const char*>(c->send_buf.data());
-    CHECK(__builtin_strstr(response, "Content-Length: 9\r\n") != nullptr);
-    CHECK(__builtin_strstr(response, "\r\n\r\nNot Found") == nullptr);
+    CHECK(buf_contains(response, c->send_buf.len(), "Content-Length: 9\r\n", 19));
+    CHECK_FALSE(buf_contains(response, c->send_buf.len(), "\r\n\r\nNot Found", 15));
 }
 
 TEST(route_coverage, capture_stage_and_write) {
