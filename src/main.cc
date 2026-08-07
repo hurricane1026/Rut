@@ -743,9 +743,11 @@ int main(int argc, char** argv) {
         }
     }
 
+    const bool io_uring_available =
+        backend_preference == BackendPreference::Epoll ? false : detect_io_uring();
     const BackendSelection backend = select_server_backend(
         backend_preference,
-        detect_io_uring(),
+        io_uring_available,
         route_config != nullptr && route_config->requires_active_health_probes());
     if (!backend.ok()) {
         if (backend.error == BackendSelectionError::IoUringUnavailable)
