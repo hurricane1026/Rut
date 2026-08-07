@@ -1,5 +1,6 @@
 #pragma once
 
+#include "rut/common/ip_address.h"
 #include "rut/common/rate_limit_key_spec.h"
 #include "rut/common/types.h"
 #include "rut/common/wait_limits.h"
@@ -505,15 +506,13 @@ struct MirUpstream {
     u16 id = 0;
     // Address copied from HIR. has_address == false → the runtime
     // must bind this upstream via add_upstream(); addresses declared
-    // in the DSL live here in host byte order (matching
-    // RouteConfig::add_upstream's expected layout).
     bool has_address = false;
-    u32 ip = 0;
+    IpAddress address{};
     u16 port = 0;
     // Extra load-balancing endpoints copied from HIR (primary = ip/port).
     static constexpr u32 kMaxExtraBackends = 7;
     u32 extra_count = 0;
-    u32 extra_ips[kMaxExtraBackends] = {};
+    IpAddress extra_addresses[kMaxExtraBackends] = {};
     u16 extra_ports[kMaxExtraBackends] = {};
     // Active health-check config copied from HIR (data only; no probing yet).
     bool hc_enabled = false;

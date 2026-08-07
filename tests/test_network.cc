@@ -3373,10 +3373,95 @@ TEST(route, upstream_target_addr) {
     REQUIRE(idx.has_value());
     auto& t = cfg.upstreams[idx.value()];
     CHECK_EQ(t.addr_count, 1u);
-    CHECK_EQ(t.addrs[0].sin_family, AF_INET);
-    CHECK_EQ(__builtin_bswap16(t.addrs[0].sin_port), 9090u);
-    CHECK_EQ(__builtin_bswap32(t.addrs[0].sin_addr.s_addr), 0x0A000101u);
+    REQUIRE(t.addrs[0].ipv4() != nullptr);
+    CHECK_EQ(t.addrs[0].family(), AF_INET);
+    CHECK_EQ(__builtin_bswap16(t.addrs[0].ipv4()->sin_port), 9090u);
+    CHECK_EQ(__builtin_bswap32(t.addrs[0].ipv4()->sin_addr.s_addr), 0x0A000101u);
     CHECK_EQ(t.name[0], 'a');
+}
+
+TEST(route, upstream_target_ipv6_addr) {
+    IpAddress address{};
+    REQUIRE(parse_ip_address(Str{"2001:db8::1", 11}, &address));
+    RouteConfig cfg;
+    auto idx = cfg.add_upstream("api-v6", address, 9443);
+    REQUIRE(idx.has_value());
+    const auto& endpoint = cfg.upstreams[idx.value()].addrs[0];
+    REQUIRE(endpoint.ipv6() != nullptr);
+    CHECK_EQ(endpoint.family(), AF_INET6);
+    CHECK_EQ(endpoint.length, sizeof(sockaddr_in6));
+    CHECK_EQ(ntohs(endpoint.ipv6()->sin6_port), 9443u);
+    CHECK_EQ(endpoint.ipv6()->sin6_addr.s6_addr[15], 1u);
+
+    const i32 fd = UpstreamPool::create_socket(endpoint.family());
+    REQUIRE(fd >= 0);
+    CHECK_EQ(close(fd), 0);
+}
+
+TEST(route, ip_address_parser_covers_legacy_and_invalid_literals) {
+    IpAddress address{};
+    CHECK(!parse_ipv4_decimal(Str{}, &address));
+    CHECK(!parse_ipv4_decimal(Str{nullptr, 1}, &address));
+    CHECK(!parse_ipv4_decimal(Str{"1..2.3", 6}, &address));
+    CHECK(!parse_ipv4_decimal(Str{"1.2.3.4.5", 9}, &address));
+    CHECK(!parse_ipv4_decimal(Str{"1.2.x.4", 7}, &address));
+    CHECK(!parse_ipv4_decimal(Str{"0000.2.3.4", 10}, &address));
+    CHECK(!parse_ipv4_decimal(Str{"256.2.3.4", 9}, &address));
+    CHECK(!parse_ipv4_decimal(Str{"1.2.3.", 6}, &address));
+    CHECK(!parse_ipv4_decimal(Str{"1.2.3", 5}, &address));
+    CHECK(!parse_ipv4_decimal(Str{"1.2.3.4", 7}, nullptr));
+
+    CHECK(!parse_ip_address(Str{}, &address));
+    CHECK(!parse_ip_address(Str{nullptr, 1}, &address));
+    CHECK(!parse_ip_address(Str{"not-an-ip", 9}, &address));
+    char oversized[INET6_ADDRSTRLEN]{};
+    CHECK(!parse_ip_address(Str{oversized, INET6_ADDRSTRLEN}, &address));
+    CHECK(!parse_ip_address(Str{"127.0.0.1", 9}, nullptr));
+
+    REQUIRE(parse_ip_address(Str{"001.002.003.004", 15}, &address));
+    CHECK_EQ(address.family, IpAddress::Family::V4);
+    CHECK_EQ(address.v4_host_order(), 0x01020304u);
+    CHECK_EQ(address.byte_count(), 4u);
+
+    REQUIRE(parse_ip_address(Str{"2001:db8::1", 11}, &address));
+    CHECK_EQ(address.family, IpAddress::Family::V6);
+    CHECK_EQ(address.v4_host_order(), 0u);
+    CHECK_EQ(address.byte_count(), 16u);
+
+    address = {};
+    CHECK_EQ(address.byte_count(), 0u);
+}
+
+TEST(route, upstream_endpoint_empty_and_ipv6_helpers) {
+    UpstreamEndpoint empty{};
+    CHECK_EQ(empty.family(), AF_UNSPEC);
+    CHECK(empty.addr() != nullptr);
+    CHECK(empty.ipv4() == nullptr);
+    CHECK(empty.ipv6() == nullptr);
+    CHECK_EQ(empty.port(), 0u);
+    CHECK(!empty.same_address(empty));
+    CHECK_NE(empty.identity(), 0u);
+    CHECK(!empty.set_ip(IpAddress{}, 8080));
+
+    IpAddress address{};
+    REQUIRE(parse_ip_address(Str{"2001:db8::7", 11}, &address));
+    UpstreamTarget target{};
+    REQUIRE(target.add_addr_v6(address.bytes, 8080));
+    REQUIRE_EQ(target.addr_count, 1u);
+    REQUIRE(target.addrs[0].ipv6() != nullptr);
+    CHECK_EQ(ntohs(target.addrs[0].port()), 8080u);
+    CHECK(target.addrs[0].same_address(target.addrs[0]));
+    CHECK_NE(target.addrs[0].identity(), 0u);
+}
+
+TEST(route, upstream_rejects_invalid_address_family_without_consuming_slot) {
+    RouteConfig cfg;
+    IpAddress address{};
+    address.family = static_cast<IpAddress::Family>(0xff);
+    auto result = cfg.add_upstream("invalid", address, 9443);
+    REQUIRE(!result.has_value());
+    CHECK_EQ(result.error().code, EINVAL);
+    CHECK_EQ(cfg.upstream_count, 0u);
 }
 
 TEST(route, upstream_multi_backend) {
@@ -3388,8 +3473,10 @@ TEST(route, upstream_multi_backend) {
     CHECK(cfg.add_upstream_backend(idx.value(), 0x0A000103, 8080));
     auto& t = cfg.upstreams[idx.value()];
     CHECK_EQ(t.addr_count, 3u);
-    CHECK_EQ(__builtin_bswap32(t.addrs[1].sin_addr.s_addr), 0x0A000102u);
-    CHECK_EQ(__builtin_bswap32(t.addrs[2].sin_addr.s_addr), 0x0A000103u);
+    REQUIRE(t.addrs[1].ipv4() != nullptr);
+    REQUIRE(t.addrs[2].ipv4() != nullptr);
+    CHECK_EQ(__builtin_bswap32(t.addrs[1].ipv4()->sin_addr.s_addr), 0x0A000102u);
+    CHECK_EQ(__builtin_bswap32(t.addrs[2].ipv4()->sin_addr.s_addr), 0x0A000103u);
     // A bad upstream index is rejected.
     CHECK(!cfg.add_upstream_backend(99, 0x0A000104, 8080));
 }
@@ -4921,6 +5008,7 @@ TEST(route, default_dispatch_kind_is_art_jit) {
     // correct. SegmentTrie is opt-in via use_segment_trie().
     RouteConfig cfg;
     CHECK_EQ(cfg.dispatch_kind(), RouteConfig::DispatchKind::ArtJit);
+    cfg.install_art_jit_fn(nullptr);
 }
 
 TEST(route, use_segment_trie_swaps_dispatch_pre_add) {
@@ -16910,6 +16998,7 @@ TEST(route_coverage, firewall_remove_deny_restores_allow_match) {
 
 TEST(route_coverage, firewall_default_deny_requires_explicit_allow) {
     RouteConfig cfg;
+    CHECK(cfg.same_firewall_policy(cfg));
     cfg.set_firewall_default_deny();
     CHECK(!cfg.firewall_default_is_allow());
 
@@ -16929,6 +17018,9 @@ TEST(route_coverage, firewall_default_deny_requires_explicit_allow) {
     // Clearing rules preserves default policy.
     cfg.clear_firewall_rules();
     CHECK(!cfg.firewall_allows_peer_host(0x7f000001));
+
+    cfg.set_firewall_default_allow(true);
+    CHECK(cfg.firewall_default_is_allow());
 }
 
 TEST(route_coverage, firewall_clear_allow_rules_keeps_deny_active) {
@@ -16981,6 +17073,7 @@ TEST(route_coverage, firewall_range_string_and_network_order_helpers) {
     RouteConfig cfg;
     REQUIRE(cfg.add_firewall_allow_range("10.0.0.1-10.0.0.3"));
     REQUIRE(cfg.add_firewall_deny_range_network_order(htonl(0x0a000002), htonl(0x0a000002)));
+    REQUIRE(cfg.add_firewall_deny_range("10.0.0.5-10.0.0.6"));
 
     CHECK(cfg.firewall_allows_peer_host(0x0a000001));
     CHECK(!cfg.firewall_allows_peer_host(0x0a000002));
@@ -16989,6 +17082,7 @@ TEST(route_coverage, firewall_range_string_and_network_order_helpers) {
 
     REQUIRE(cfg.remove_firewall_allow_range("10.0.0.1-10.0.0.3"));
     REQUIRE(cfg.remove_firewall_deny_range_network_order(htonl(0x0a000002), htonl(0x0a000002)));
+    REQUIRE(cfg.remove_firewall_deny_range("10.0.0.5-10.0.0.6"));
 }
 
 TEST(route_coverage, firewall_range_rejects_invalid_inputs) {

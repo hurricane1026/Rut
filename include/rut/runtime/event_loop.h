@@ -327,11 +327,7 @@ public:
                     for (u32 c = 0; c < old.hc_path_len; c++)
                         if (old.hc_path[c] != next.hc_path[c]) same = false;
                     for (u32 address = 0; address < old.addr_count; address++)
-                        if (old.addrs[address].sin_family != next.addrs[address].sin_family ||
-                            old.addrs[address].sin_addr.s_addr !=
-                                next.addrs[address].sin_addr.s_addr ||
-                            old.addrs[address].sin_port != next.addrs[address].sin_port)
-                            same = false;
+                        if (!old.addrs[address].same_address(next.addrs[address])) same = false;
                     if (!same) continue;
                     health_probe_deadline_ns[u] = previous_deadlines[old_index];
                     inherit_backend_health(previous->config_generation,

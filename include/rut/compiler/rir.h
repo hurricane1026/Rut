@@ -1,6 +1,7 @@
 #pragma once
 
 #include "core/expected.h"
+#include "rut/common/ip_address.h"
 #include "rut/common/rate_limit_key_spec.h"
 #include "rut/common/types.h"
 #include "rut/runtime/arena.h"
@@ -519,17 +520,17 @@ struct Module {
     // compile→config helper can translate them into
     // RouteConfig::add_upstream calls without re-parsing addresses.
     // has_address == false means the DSL declared the name only; the
-    // runtime must bind it separately. ip is host byte order.
+    // runtime must bind it separately.
     struct Upstream {
         Str name;
         bool has_address;
-        u32 ip;
+        IpAddress address{};
         u16 port;
         // Extra load-balancing endpoints (primary = ip/port). The
         // compile→config helper appends these via add_upstream_backend.
         static constexpr u32 kMaxExtraBackends = 7;
         u32 extra_count = 0;
-        u32 extra_ips[kMaxExtraBackends] = {};
+        IpAddress extra_addresses[kMaxExtraBackends] = {};
         u16 extra_ports[kMaxExtraBackends] = {};
         // Active health-check config carried verbatim from MIR (data only; the
         // compile→config helper feeds it to set_upstream_health_check). hc_path

@@ -1842,7 +1842,7 @@ TEST(jit, out_of_bounds_server_lookup_cannot_mark_backend_zero) {
     rir.module.upstream_count = 1;
     rir.module.upstreams[0].name = lit("users");
     rir.module.upstreams[0].has_address = true;
-    rir.module.upstreams[0].ip = 0x7f000001;
+    rir.module.upstreams[0].address = IpAddress::v4(0x7f000001);
     rir.module.upstreams[0].port = 8080;
     auto cg = codegen(rir.module);
     REQUIRE(cg.ok);
@@ -1892,7 +1892,7 @@ TEST(jit, oversized_server_token_cannot_mark_truncated_backend) {
     rir.module.upstream_count = 1;
     rir.module.upstreams[0].name = lit("users");
     rir.module.upstreams[0].has_address = true;
-    rir.module.upstreams[0].ip = 0x7f000001;
+    rir.module.upstreams[0].address = IpAddress::v4(0x7f000001);
     rir.module.upstreams[0].port = 8080;
     auto cg = codegen(rir.module);
     REQUIRE(cg.ok);
@@ -1942,7 +1942,7 @@ TEST(jit, codegen_rejects_malformed_marking_policy_at_common_boundary) {
     rir.module.upstream_count = 1;
     rir.module.upstreams[0].name = lit("users");
     rir.module.upstreams[0].has_address = true;
-    rir.module.upstreams[0].ip = 0x7f000001;
+    rir.module.upstreams[0].address = IpAddress::v4(0x7f000001);
     rir.module.upstreams[0].port = 8080;
 
     fn->blocks[0].insts[2].operand_count = 1;

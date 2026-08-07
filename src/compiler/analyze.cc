@@ -19611,36 +19611,6 @@ static FrontendResult<HirModule*> analyze_file_internal(
         import_stack.push_back(normalized_source);
     }
 
-    // Parse an IPv4 dotted-quad into a u32 in host byte order. Returns
-    // false on any malformed input (non-digit, octet > 255, missing
-    // dot, empty octet). `len` is the number of bytes at `s` to
-    // consider (does NOT need to be NUL-terminated).
-    auto parse_ipv4 = [](const char* s, u32 len, u32& out_ip) -> bool {
-        u32 octets[4] = {0, 0, 0, 0};
-        u32 octet_idx = 0;
-        u32 digit_count = 0;
-        u32 cur = 0;
-        for (u32 i = 0; i < len; i++) {
-            const char c = s[i];
-            if (c == '.') {
-                if (digit_count == 0 || octet_idx >= 3) return false;
-                octets[octet_idx++] = cur;
-                cur = 0;
-                digit_count = 0;
-                continue;
-            }
-            if (c < '0' || c > '9') return false;
-            cur = cur * 10 + static_cast<u32>(c - '0');
-            if (cur > 255) return false;
-            digit_count++;
-            if (digit_count > 3) return false;
-        }
-        if (digit_count == 0 || octet_idx != 3) return false;
-        octets[3] = cur;
-        out_ip = (octets[0] << 24) | (octets[1] << 16) | (octets[2] << 8) | octets[3];
-        return true;
-    };
-
     for (u32 i = 0; i < file.items.len; i++) {
         const auto& item = file.items[i];
         if (item.kind != AstItemKind::State) continue;
@@ -19712,27 +19682,42 @@ static FrontendResult<HirModule*> analyze_file_internal(
         // dispatch does `if (upstream_id < cfg->upstream_count)`
         // without adjustment.
         up.id = static_cast<u16>(mod.upstreams.len);
-        // Parse a packed "host:port" literal (split on the last colon, IPv4
-        // host, 1..65535 port) into (ip, port). Used by the backends-list
-        // form; returns false on any malformed component.
-        auto parse_host_port = [&](Str lit, u32& out_ip, u16& out_port) -> bool {
-            u32 colon_idx = 0xffffffffu;
-            for (u32 k = 0; k < lit.len; k++)
-                if (lit.ptr[k] == ':') colon_idx = k;
-            if (colon_idx == 0xffffffffu || colon_idx + 1 == lit.len) return false;
-            const Str host_part = {lit.ptr, colon_idx};
+        struct ParsedEndpoint {
+            IpAddress address{};
+            u16 port = 0;
+        };
+        auto parse_host_port = [&](Str lit, ParsedEndpoint* out) -> bool {
+            if (out == nullptr || lit.ptr == nullptr || lit.len == 0) return false;
+            Str host_part{};
+            u32 port_start = 0;
+            if (lit.ptr[0] == '[') {
+                u32 close = 1;
+                while (close < lit.len && lit.ptr[close] != ']') close++;
+                if (close == lit.len || close + 2 > lit.len || lit.ptr[close + 1] != ':')
+                    return false;
+                host_part = {lit.ptr + 1, close - 1};
+                port_start = close + 2;
+            } else {
+                u32 colon_idx = 0xffffffffu;
+                for (u32 k = 0; k < lit.len; k++) {
+                    if (lit.ptr[k] != ':') continue;
+                    if (colon_idx != 0xffffffffu) return false;
+                    colon_idx = k;
+                }
+                if (colon_idx == 0xffffffffu || colon_idx + 1 == lit.len) return false;
+                host_part = {lit.ptr, colon_idx};
+                port_start = colon_idx + 1;
+            }
             u32 port_value = 0;
-            for (u32 k = colon_idx + 1; k < lit.len; k++) {
+            for (u32 k = port_start; k < lit.len; k++) {
                 const char c = lit.ptr[k];
                 if (c < '0' || c > '9') return false;
                 port_value = port_value * 10 + static_cast<u32>(c - '0');
                 if (port_value > 0xffffu) return false;
             }
             if (port_value == 0) return false;
-            u32 ip = 0;
-            if (!parse_ipv4(host_part.ptr, host_part.len, ip)) return false;
-            out_ip = ip;
-            out_port = static_cast<u16>(port_value);
+            if (!parse_ip_address(host_part, &out->address)) return false;
+            out->port = static_cast<u16>(port_value);
             return true;
         };
 
@@ -19741,24 +19726,22 @@ static FrontendResult<HirModule*> analyze_file_internal(
         // host_lit; `{ host, port }` separates them; `{ backends: [...] }`
         // lists several "host:port" endpoints (backends[0] = primary).
         if (item.upstream.backend_count > 0) {
-            u32 ip0 = 0;
-            u16 port0 = 0;
-            if (!parse_host_port(item.upstream.backend_lits[0], ip0, port0))
+            ParsedEndpoint primary{};
+            if (!parse_host_port(item.upstream.backend_lits[0], &primary))
                 return frontend_error(FrontendError::UnsupportedSyntax,
                                       item.upstream.addr_span,
                                       item.upstream.backend_lits[0]);
             up.has_address = true;
-            up.ip = ip0;
-            up.port = port0;
+            up.address = primary.address;
+            up.port = primary.port;
             for (u32 b = 1; b < item.upstream.backend_count; b++) {
-                u32 ipb = 0;
-                u16 portb = 0;
-                if (!parse_host_port(item.upstream.backend_lits[b], ipb, portb))
+                ParsedEndpoint extra{};
+                if (!parse_host_port(item.upstream.backend_lits[b], &extra))
                     return frontend_error(FrontendError::UnsupportedSyntax,
                                           item.upstream.addr_span,
                                           item.upstream.backend_lits[b]);
-                up.extra_ips[up.extra_count] = ipb;
-                up.extra_ports[up.extra_count] = portb;
+                up.extra_addresses[up.extra_count] = extra.address;
+                up.extra_ports[up.extra_count] = extra.port;
                 up.extra_count++;
             }
         } else if (item.upstream.has_address) {
@@ -19778,6 +19761,14 @@ static FrontendResult<HirModule*> analyze_file_internal(
                         FrontendError::UnsupportedSyntax, item.upstream.addr_span, lit);
                 }
                 host_part = {lit.ptr, colon_idx};
+                if (host_part.len > 0 && host_part.ptr[0] != '[') {
+                    for (u32 k = 0; k < host_part.len; k++) {
+                        if (host_part.ptr[k] == ':') {
+                            return frontend_error(
+                                FrontendError::UnsupportedSyntax, item.upstream.addr_span, lit);
+                        }
+                    }
+                }
                 port_value = 0;
                 for (u32 k = colon_idx + 1; k < lit.len; k++) {
                     const char c = lit.ptr[k];
@@ -19801,8 +19792,11 @@ static FrontendResult<HirModule*> analyze_file_internal(
                 return frontend_error(
                     FrontendError::UnsupportedSyntax, item.upstream.addr_span, port_detail);
             }
-            u32 ip = 0;
-            if (!parse_ipv4(host_part.ptr, host_part.len, ip)) {
+            if (host_part.len >= 2 && host_part.ptr[0] == '[' &&
+                host_part.ptr[host_part.len - 1] == ']') {
+                host_part = {host_part.ptr + 1, host_part.len - 2};
+            }
+            if (!parse_ip_address(host_part, &up.address)) {
                 // Keep the detail informative when host_part is
                 // empty (`":8080"` in at-form, `{ host: "" }` in dict
                 // form). An empty detail prints nothing and hides
@@ -19815,7 +19809,6 @@ static FrontendResult<HirModule*> analyze_file_internal(
                     FrontendError::UnsupportedSyntax, item.upstream.addr_span, host_detail);
             }
             up.has_address = true;
-            up.ip = ip;
             up.port = static_cast<u16>(port_value);
         }
         // Active health-check config (parser already validated path/interval

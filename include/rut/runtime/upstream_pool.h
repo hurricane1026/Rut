@@ -127,8 +127,9 @@ struct UpstreamPool {
     }
 
     // Create a non-blocking upstream socket. Returns fd on success, -1 on failure.
-    static i32 create_socket() {
-        return socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
+    static i32 create_socket(sa_family_t family = AF_INET) {
+        if (family != AF_INET && family != AF_INET6) return -1;
+        return socket(family, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
     }
 
 private:

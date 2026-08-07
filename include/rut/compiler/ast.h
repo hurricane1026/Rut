@@ -305,20 +305,21 @@ struct AstUpstreamDecl {
     //      → host_lit = "127.0.0.1:8080", port_is_set = false.
     //   B. `upstream backend { host: "127.0.0.1", port: 8080 }`
     //      → host_lit = "127.0.0.1", port_lit = 8080, port_is_set = true.
-    // Analyze parses host_lit + port_lit into (ip u32, port u16) and
+    // Analyze parses host_lit + port_lit into (IpAddress, port u16) and
     // stores the result on HirUpstream. has_address == false means no
     // address was declared in the DSL (runtime must supply one via
-    // add_upstream()). Both forms require an IPv4 literal today;
-    // DNS/IPv6 are future work.
+    // add_upstream()). Both forms accept IPv4 and IPv6 literals. The packed
+    // form brackets IPv6 addresses, for example `[2001:db8::1]:8080`.
+    // DNS names are future work.
     bool has_address = false;
     Str host_lit{};    // raw string from `at "..."` or `host: "..."`
     Span addr_span{};  // points at the address site for diagnostics
     bool port_is_set = false;
     u32 port_lit = 0;  // u32 to fit any parsed IntLit before range check
 
-    //   C. `upstream backend { backends: ["10.0.0.1:8080", "10.0.0.2:8080"] }`
+    //   C. `upstream backend { backends: ["10.0.0.1:8080", "[2001:db8::1]:8080"] }`
     //      → backend_count > 0, each backend_lits[i] = "host:port".
-    //      Analyze parses backend_lits[0] into the primary (ip,port) and
+    //      Analyze parses backend_lits[0] into the primary (address,port) and
     //      backend_lits[1..] into the extra-backend arrays on HirUpstream,
     //      so existing single-address readers are unchanged. Mutually
     //      exclusive with host_lit/port_lit (the parser rejects mixing).

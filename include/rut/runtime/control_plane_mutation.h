@@ -1754,11 +1754,9 @@ private:
                old_target.name_identity == new_target.name_identity;
     }
 
-    [[nodiscard]] static bool same_endpoint(const sockaddr_in& old_endpoint,
-                                            const sockaddr_in& new_endpoint) {
-        return old_endpoint.sin_family == new_endpoint.sin_family &&
-               old_endpoint.sin_addr.s_addr == new_endpoint.sin_addr.s_addr &&
-               old_endpoint.sin_port == new_endpoint.sin_port;
+    [[nodiscard]] static bool same_endpoint(const UpstreamEndpoint& old_endpoint,
+                                            const UpstreamEndpoint& new_endpoint) {
+        return old_endpoint.same_address(new_endpoint);
     }
 
     [[nodiscard]] static bool compatible_health_policy(const UpstreamTarget& old_target,

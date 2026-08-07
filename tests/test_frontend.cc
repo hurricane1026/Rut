@@ -6622,7 +6622,7 @@ TEST(frontend, parse_upstream_at_form) {
     REQUIRE_EQ(hir->upstreams.len, 1u);
     const auto& u = hir->upstreams[0];
     CHECK(u.has_address);
-    CHECK_EQ(u.ip, 0x7F000001u);
+    CHECK_EQ(u.address.v4_host_order(), 0x7F000001u);
     CHECK_EQ(u.port, 8080u);
 }
 
@@ -6645,9 +6645,59 @@ TEST(frontend, parse_upstream_dict_form) {
         REQUIRE_EQ(hir->upstreams.len, 1u);
         const auto& u = hir->upstreams[0];
         CHECK(u.has_address);
-        CHECK_EQ(u.ip, 0x0A000001u);
+        CHECK_EQ(u.address.v4_host_order(), 0x0A000001u);
         CHECK_EQ(u.port, 9090u);
     }
+}
+
+TEST(frontend, parse_upstream_ipv6_literals) {
+    const char* sources[] = {
+        "upstream api at \"[2001:db8::1]:8443\"\nroute GET \"/u\" { return 200 }\n",
+        "upstream api { host: \"2001:db8::1\", port: 8443 }\n"
+        "route GET \"/u\" { return 200 }\n",
+    };
+    for (const char* src : sources) {
+        auto lexed = lex(lit(src));
+        REQUIRE(lexed);
+        auto ast = parse_file_heap(lexed.value());
+        REQUIRE(ast);
+        auto hir = analyze_file_heap(ast.value());
+        REQUIRE(hir);
+        REQUIRE_EQ(hir->upstreams.len, 1u);
+        const auto& address = hir->upstreams[0].address;
+        CHECK_EQ(address.family, IpAddress::Family::V6);
+        CHECK_EQ(address.bytes[0], 0x20u);
+        CHECK_EQ(address.bytes[1], 0x01u);
+        CHECK_EQ(address.bytes[2], 0x0du);
+        CHECK_EQ(address.bytes[3], 0xb8u);
+        CHECK_EQ(address.bytes[15], 0x01u);
+        CHECK_EQ(hir->upstreams[0].port, 8443u);
+    }
+}
+
+TEST(frontend, parse_upstream_preserves_zero_padded_ipv4_octets) {
+    const char* src = "upstream api at \"001.002.003.004:8443\"\nroute GET \"/u\" { return 200 }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    REQUIRE_EQ(hir->upstreams.len, 1u);
+    CHECK_EQ(hir->upstreams[0].address.family, IpAddress::Family::V4);
+    CHECK_EQ(hir->upstreams[0].address.v4_host_order(), 0x01020304u);
+    CHECK_EQ(hir->upstreams[0].port, 8443u);
+}
+
+TEST(frontend, analyze_rejects_unbracketed_ipv6_endpoint) {
+    const char* src = "upstream api at \"2001:db8::1:8443\"\nroute GET \"/u\" { return 200 }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(!hir);
+    CHECK_EQ(hir.error().code, FrontendError::UnsupportedSyntax);
 }
 
 TEST(frontend, parse_upstream_health_check_valid_status) {
