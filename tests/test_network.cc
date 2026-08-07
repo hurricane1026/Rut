@@ -3435,6 +3435,7 @@ TEST(route, ip_address_parser_covers_legacy_and_invalid_literals) {
 TEST(route, system_hostname_resolver_resolves_localhost_and_rejects_invalid_input) {
     ResolvedUpstreamAddresses resolved{};
     CHECK(!resolve_upstream_hostname(Str{}, &resolved));
+    CHECK(!resolve_upstream_hostname(Str{nullptr, 1}, &resolved));
     CHECK(!resolve_upstream_hostname(Str{"localhost", 9}, nullptr));
 
     char oversized[254]{};
@@ -3446,6 +3447,10 @@ TEST(route, system_hostname_resolver_resolves_localhost_and_rejects_invalid_inpu
         CHECK(resolved.addresses[i].family == IpAddress::Family::V4 ||
               resolved.addresses[i].family == IpAddress::Family::V6);
     }
+
+    ResolvedUpstreamAddresses absolute{};
+    REQUIRE(resolve_upstream_hostname(Str{"localhost.", 10}, &absolute));
+    CHECK_GT(absolute.count, 0u);
 }
 
 TEST(route, upstream_endpoint_empty_and_ipv6_helpers) {
