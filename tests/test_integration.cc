@@ -15310,6 +15310,27 @@ TEST(route, populate_route_config_rejects_dns_expansion_over_backend_capacity) {
     CHECK_FALSE(populate_route_config(cfg, mod, resolver));
 }
 
+TEST(route, populate_route_config_preserves_static_backend_order) {
+    using namespace rut;
+    rir::Module mod{};
+    mod.upstream_count = 1;
+    mod.upstreams[0].name = Str{"backend", 7};
+    mod.upstreams[0].has_address = true;
+    mod.upstreams[0].address = IpAddress::v4(0x7f000002);
+    mod.upstreams[0].port = 8080;
+    mod.upstreams[0].extra_count = 1;
+    mod.upstreams[0].extra_addresses[0] = IpAddress::v4(0x7f000001);
+    mod.upstreams[0].extra_ports[0] = 8081;
+
+    RouteConfig cfg{};
+    REQUIRE(populate_route_config(cfg, mod));
+    REQUIRE_EQ(cfg.upstreams[0].addr_count, 2u);
+    CHECK_EQ(cfg.upstreams[0].addrs[0].ipv4()->sin_addr.s_addr, htonl(0x7f000002));
+    CHECK_EQ(cfg.upstreams[0].addrs[0].port(), htons(8080));
+    CHECK_EQ(cfg.upstreams[0].addrs[1].ipv4()->sin_addr.s_addr, htonl(0x7f000001));
+    CHECK_EQ(cfg.upstreams[0].addrs[1].port(), htons(8081));
+}
+
 TEST(route, dns_upstream_rejects_static_server_iteration) {
     using namespace rut;
     const char* src =
