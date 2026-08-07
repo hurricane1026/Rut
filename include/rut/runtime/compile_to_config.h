@@ -2161,8 +2161,11 @@ inline bool resolve_upstream_endpoints(const rir::Module::Upstream& upstream,
             return false;
     }
     const bool has_hostname = upstream.hostname.len != 0 || [&] {
-        for (u32 i = 0; i < upstream.extra_count; ++i)
+        u32 i = 0;
+        while (i < upstream.extra_count) {
             if (upstream.extra_hostnames[i].len != 0) return true;
+            ++i;
+        }
         return false;
     }();
     for (u32 i = 1; has_hostname && i < out->count; ++i) {
