@@ -3447,7 +3447,6 @@ TEST(route, system_hostname_resolver_resolves_localhost_and_rejects_invalid_inpu
         CHECK(resolved.addresses[i].family == IpAddress::Family::V4 ||
               resolved.addresses[i].family == IpAddress::Family::V6);
     }
-
 }
 
 TEST(route, upstream_endpoint_empty_and_ipv6_helpers) {
