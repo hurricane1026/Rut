@@ -743,12 +743,14 @@ int main(int argc, char** argv) {
         }
     }
 
-    const bool io_uring_available =
-        backend_preference == BackendPreference::Epoll ? false : detect_io_uring();
+    const bool requires_active_health_probes =
+        route_config != nullptr && route_config->requires_active_health_probes();
+    const bool should_detect_io_uring =
+        backend_preference == BackendPreference::IoUring ||
+        (backend_preference == BackendPreference::Auto && !requires_active_health_probes);
+    const bool io_uring_available = should_detect_io_uring && detect_io_uring();
     const BackendSelection backend = select_server_backend(
-        backend_preference,
-        io_uring_available,
-        route_config != nullptr && route_config->requires_active_health_probes());
+        backend_preference, io_uring_available, requires_active_health_probes);
     if (!backend.ok()) {
         if (backend.error == BackendSelectionError::IoUringUnavailable)
             write_str("--backend io_uring requested, but io_uring is unavailable\n");
