@@ -145,6 +145,7 @@ add_library(rut_runtime STATIC
     runtime/http2_conn.cc
     runtime/hpack.cc
     runtime/chunked_parser.cc
+    runtime/dns_resolver.cc
     runtime/ws_frame.cc
     runtime/ws_terminate.cc
     runtime/access_log.cc

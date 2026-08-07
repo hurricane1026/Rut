@@ -1019,10 +1019,12 @@ FrontendResult<MirModule*> build_mir(const HirModule& module) {
         up.id = module.upstreams[i].id;
         up.has_address = module.upstreams[i].has_address;
         up.address = module.upstreams[i].address;
+        up.hostname = module.upstreams[i].hostname;
         up.port = module.upstreams[i].port;
         up.extra_count = module.upstreams[i].extra_count;
         for (u32 b = 0; b < up.extra_count; b++) {
             up.extra_addresses[b] = module.upstreams[i].extra_addresses[b];
+            up.extra_hostnames[b] = module.upstreams[i].extra_hostnames[b];
             up.extra_ports[b] = module.upstreams[i].extra_ports[b];
         }
         up.hc_enabled = module.upstreams[i].hc_enabled;

@@ -507,7 +507,7 @@ plumbing contract; it is not production-loadable yet because mark replay lowerin
 has not activated the generated timer metadata:
 
 ```rut
-upstream users { backends: ["127.0.0.1:8080"] }
+upstream users { backends: ["127.0.0.1:8080", "[2001:db8::1]:8080"] }
 func check(_ server: Server) -> bool => true
 timer health, every: 5s, shard: 0 {
     for server in users.servers {
@@ -516,6 +516,9 @@ timer health, every: 5s, shard: 0 {
     return 200
 }
 ```
+
+Hostname backends resolve A/AAAA records when the configuration loads. A load
+fails closed if resolution fails or expands beyond the eight-backend limit.
 
 Control-plane mutations use visible boolean failure results and never introduce
 hidden waits. Their authority, generation ordering, and replay contract are

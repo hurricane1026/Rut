@@ -3480,6 +3480,23 @@ TEST(route, ip_address_parser_covers_legacy_and_invalid_literals) {
     CHECK_EQ(address.byte_count(), 0u);
 }
 
+TEST(route, system_hostname_resolver_resolves_localhost_and_rejects_invalid_input) {
+    ResolvedUpstreamAddresses resolved{};
+    CHECK(!resolve_upstream_hostname(Str{}, &resolved));
+    CHECK(!resolve_upstream_hostname(Str{nullptr, 1}, &resolved));
+    CHECK(!resolve_upstream_hostname(Str{"localhost", 9}, nullptr));
+
+    char oversized[254]{};
+    CHECK(!resolve_upstream_hostname(Str{oversized, 254}, &resolved));
+    REQUIRE(resolve_upstream_hostname(Str{"localhost", 9}, &resolved));
+    REQUIRE_GT(resolved.count, 0u);
+    CHECK_LE(resolved.count, ResolvedUpstreamAddresses::kMaxAddresses);
+    for (u32 i = 0; i < resolved.count; ++i) {
+        CHECK(resolved.addresses[i].family == IpAddress::Family::V4 ||
+              resolved.addresses[i].family == IpAddress::Family::V6);
+    }
+}
+
 TEST(route, upstream_endpoint_empty_and_ipv6_helpers) {
     UpstreamEndpoint empty{};
     CHECK_EQ(empty.family(), AF_UNSPEC);

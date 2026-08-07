@@ -6839,16 +6839,82 @@ TEST(frontend, parse_upstream_rejects_malformed_ip) {
     CHECK_EQ(hir.error().code, FrontendError::UnsupportedSyntax);
 }
 
-TEST(frontend, parse_upstream_rejects_hostname) {
-    // DNS names aren't supported yet — only IPv4 dotted-quad literals.
+TEST(frontend, parse_upstream_accepts_hostname) {
     const char* src = "upstream api at \"example.com:8080\"\nroute GET \"/u\" { return 200 }\n";
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
     auto ast = parse_file_heap(lexed.value());
     REQUIRE(ast);
     auto hir = analyze_file_heap(ast.value());
-    REQUIRE(!hir);
-    CHECK_EQ(hir.error().code, FrontendError::UnsupportedSyntax);
+    REQUIRE(hir);
+    REQUIRE_EQ(hir->upstreams.len, 1u);
+    CHECK(hir->upstreams[0].has_address);
+    CHECK(hir->upstreams[0].hostname.eq(lit("example.com")));
+    CHECK_EQ(hir->upstreams[0].address.family, IpAddress::Family::None);
+    CHECK_EQ(hir->upstreams[0].port, 8080u);
+}
+
+TEST(frontend, parse_upstream_accepts_absolute_hostname) {
+    const char* src = "upstream api at \"example.com.:8080\"\nroute GET \"/u\" { return 200 }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    CHECK(hir->upstreams[0].hostname.eq(lit("example.com.")));
+}
+
+TEST(frontend, parse_upstream_accepts_maximum_length_absolute_hostname) {
+    const std::string label63(63, 'a');
+    const std::string hostname =
+        label63 + "." + label63 + "." + label63 + "." + std::string(61, 'a') + ".";
+    REQUIRE_EQ(hostname.size(), 254u);
+    const std::string src =
+        "upstream api at \"" + hostname + ":8080\"\nroute GET \"/u\" { return 200 }\n";
+    auto lexed = lex({src.data(), static_cast<u32>(src.size())});
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    CHECK(hir->upstreams[0].hostname.eq({hostname.data(), static_cast<u32>(hostname.size())}));
+}
+
+TEST(frontend, parse_upstream_accepts_hostname_backend_list) {
+    const char* src =
+        "upstream api { backends: [\"api-a.internal:8080\", \"127.0.0.1:8081\", "
+        "\"api-b.internal:8082\"] }\nroute GET \"/u\" { return 200 }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    REQUIRE_EQ(hir->upstreams.len, 1u);
+    const auto& upstream = hir->upstreams[0];
+    CHECK(upstream.hostname.eq(lit("api-a.internal")));
+    REQUIRE_EQ(upstream.extra_count, 2u);
+    CHECK_EQ(upstream.extra_addresses[0].family, IpAddress::Family::V4);
+    CHECK(upstream.extra_hostnames[1].eq(lit("api-b.internal")));
+}
+
+TEST(frontend, parse_upstream_rejects_invalid_hostname) {
+    for (const char* host :
+         {"-api.internal", "api..internal", "api_internal", "256.0.0.1", "[api.internal]"}) {
+        char src[160];
+        snprintf(src,
+                 sizeof(src),
+                 "upstream api at \"%s:8080\"\nroute GET \"/u\" { return 200 }\n",
+                 host);
+        auto lexed = lex(lit(src));
+        REQUIRE(lexed);
+        auto ast = parse_file_heap(lexed.value());
+        REQUIRE(ast);
+        auto hir = analyze_file_heap(ast.value());
+        REQUIRE(!hir);
+        CHECK_EQ(hir.error().code, FrontendError::UnsupportedSyntax);
+    }
 }
 
 TEST(frontend, parse_upstream_rejects_missing_port) {

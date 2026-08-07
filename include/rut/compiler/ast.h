@@ -310,7 +310,7 @@ struct AstUpstreamDecl {
     // address was declared in the DSL (runtime must supply one via
     // add_upstream()). Both forms accept IPv4 and IPv6 literals. The packed
     // form brackets IPv6 addresses, for example `[2001:db8::1]:8080`.
-    // DNS names are future work.
+    // Hostnames are resolved before the RouteConfig is published.
     bool has_address = false;
     Str host_lit{};    // raw string from `at "..."` or `host: "..."`
     Span addr_span{};  // points at the address site for diagnostics

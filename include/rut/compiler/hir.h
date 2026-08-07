@@ -30,12 +30,14 @@ struct HirUpstream {
     // compatible with test configs that register upstreams manually.
     bool has_address = false;
     IpAddress address{};
+    Str hostname{};
     u16 port = 0;
     // Extra load-balancing endpoints beyond the primary (ip, port), from
     // `{ backends: [...] }`. Primary + extras are round-robined at runtime.
     static constexpr u32 kMaxExtraBackends = 7;  // AstUpstreamDecl::kMaxBackends - 1
     u32 extra_count = 0;
     IpAddress extra_addresses[kMaxExtraBackends] = {};
+    Str extra_hostnames[kMaxExtraBackends]{};
     u16 extra_ports[kMaxExtraBackends] = {};
     // Active health-check config copied from the DSL (data only; no probing in
     // this slice). hc_enabled gates the rest. path/interval required when set;

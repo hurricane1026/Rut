@@ -15225,12 +15225,12 @@ TEST(route, populate_route_config_preserves_unmarked_pre_bound_runtime_address) 
     rir.destroy();
 }
 
-TEST(route, populate_route_config_validates_pre_bound_backend_identity_order) {
+TEST(route, populate_route_config_resolves_hostname_backends) {
     using namespace rut;
     const char* src =
-        "upstream backend { backends: [\"127.0.0.1:8080\", \"127.0.0.2:8081\"] }\n"
-        "timer check_health, every: 5s, shard: 0 { for server in backend.servers { "
-        "backend.mark(server, healthy: true) } return 200 }\n";
+        "upstream backend { backends: [\"api.internal:8080\", "
+        "\"backup.internal:8080\"] }\n"
+        "route GET \"/api\" { return forward(backend) }\n";
     auto lexed = lex(Str{src, static_cast<u32>(strlen(src))});
     REQUIRE(lexed);
     auto ast = parse_file(lexed.value());
@@ -15244,24 +15244,192 @@ TEST(route, populate_route_config_validates_pre_bound_backend_identity_order) {
     std::unique_ptr<MirModule> mir_owned(mir.value());
     FrontendRirModule rir{};
     REQUIRE(lower_to_rir(*mir_owned, rir));
-    rir.module.upstream_mark_replay_complete = true;
 
-    // RouteConfig is intentionally large; keep the three fixtures off this
-    // already-deep debug-build stack frame.
-    auto missing = std::make_unique<RouteConfig>();
-    REQUIRE(missing->add_upstream("backend", 0x7F000001, 8080).has_value());
-    CHECK_FALSE(populate_route_config(*missing, rir.module));
+    auto resolver = +[](Str hostname, ResolvedUpstreamAddresses* out) -> bool {
+        if (out == nullptr) return false;
+        out->count = 0;
+        if (hostname.eq(Str{"api.internal", 12})) {
+            out->addresses[out->count++] = IpAddress::v4(0x7f000001);
+            if (!parse_ip_address(Str{"2001:db8::1", 11}, &out->addresses[out->count]))
+                return false;
+            out->count++;
+            return true;
+        }
+        if (hostname.eq(Str{"backup.internal", 15})) {
+            out->addresses[out->count++] = IpAddress::v4(0x7f000001);
+            out->addresses[out->count++] = IpAddress::v4(0x7f000002);
+            return true;
+        }
+        return false;
+    };
 
-    auto reversed = std::make_unique<RouteConfig>();
-    REQUIRE(reversed->add_upstream("backend", 0x7F000002, 8081).has_value());
-    REQUIRE(reversed->add_upstream_backend(0, 0x7F000001, 8080));
-    CHECK_FALSE(populate_route_config(*reversed, rir.module));
+    auto cfg = std::make_unique<RouteConfig>();
+    REQUIRE(populate_route_config(*cfg, rir.module, resolver));
+    REQUIRE_EQ(cfg->upstream_count, 1u);
+    REQUIRE_EQ(cfg->upstreams[0].addr_count, 3u);
+    CHECK_EQ(cfg->upstreams[0].addrs[0].family(), AF_INET);
+    CHECK_EQ(cfg->upstreams[0].addrs[0].ipv4()->sin_addr.s_addr, __builtin_bswap32(0x7f000001));
+    CHECK_EQ(cfg->upstreams[0].addrs[1].family(), AF_INET);
+    CHECK_EQ(cfg->upstreams[0].addrs[1].ipv4()->sin_addr.s_addr, __builtin_bswap32(0x7f000002));
+    CHECK_EQ(cfg->upstreams[0].addrs[2].family(), AF_INET6);
+    CHECK_EQ(ntohs(cfg->upstreams[0].addrs[2].port()), 8080u);
 
-    auto matching = std::make_unique<RouteConfig>();
-    REQUIRE(matching->add_upstream("backend", 0x7F000001, 8080).has_value());
-    REQUIRE(matching->add_upstream_backend(0, 0x7F000002, 8081));
-    CHECK(populate_route_config(*matching, rir.module));
+    auto failed = std::make_unique<RouteConfig>();
+    CHECK_FALSE(populate_route_config(*failed, rir.module, nullptr));
+    auto empty_resolver = +[](Str, ResolvedUpstreamAddresses* out) -> bool {
+        out->count = 0;
+        return true;
+    };
+    auto empty = std::make_unique<RouteConfig>();
+    CHECK_FALSE(populate_route_config(*empty, rir.module, empty_resolver));
+    auto invalid_family_resolver = +[](Str, ResolvedUpstreamAddresses* out) -> bool {
+        out->count = 0;
+        out->count = 1;
+        return true;
+    };
+    auto invalid_family = std::make_unique<RouteConfig>();
+    CHECK_FALSE(populate_route_config(*invalid_family, rir.module, invalid_family_resolver));
+    auto oversized_resolver = +[](Str, ResolvedUpstreamAddresses* out) -> bool {
+        *out = ResolvedUpstreamAddresses{};
+        out->overflow = true;
+        return true;
+    };
+    auto oversized = std::make_unique<RouteConfig>();
+    CHECK_FALSE(populate_route_config(*oversized, rir.module, oversized_resolver));
     rir.destroy();
+}
+
+TEST(route, populate_route_config_rejects_dns_expansion_over_backend_capacity) {
+    using namespace rut;
+    rir::Module mod{};
+    mod.upstream_count = 1;
+    mod.upstreams[0].name = Str{"backend", 7};
+    mod.upstreams[0].has_address = true;
+    mod.upstreams[0].hostname = Str{"many.internal", 13};
+    mod.upstreams[0].port = 8080;
+    mod.upstreams[0].extra_count = 1;
+    mod.upstreams[0].extra_addresses[0] = IpAddress::v4(0x7f0000ff);
+    mod.upstreams[0].extra_ports[0] = 8080;
+    auto resolver = +[](Str, ResolvedUpstreamAddresses* out) -> bool {
+        if (out == nullptr) return false;
+        out->count = ResolvedUpstreamAddresses::kMaxAddresses;
+        for (u32 i = 0; i < out->count; ++i) out->addresses[i] = IpAddress::v4(0x7f000001 + i);
+        return true;
+    };
+
+    RouteConfig cfg{};
+    CHECK_FALSE(populate_route_config(cfg, mod, resolver));
+}
+
+TEST(route, populate_route_config_preserves_static_backend_order) {
+    using namespace rut;
+    rir::Module mod{};
+    mod.upstream_count = 1;
+    mod.upstreams[0].name = Str{"backend", 7};
+    mod.upstreams[0].has_address = true;
+    mod.upstreams[0].address = IpAddress::v4(0x7f000002);
+    mod.upstreams[0].port = 8080;
+    mod.upstreams[0].extra_count = 1;
+    mod.upstreams[0].extra_addresses[0] = IpAddress::v4(0x7f000001);
+    mod.upstreams[0].extra_ports[0] = 8081;
+
+    RouteConfig cfg{};
+    REQUIRE(populate_route_config(cfg, mod));
+    REQUIRE_EQ(cfg.upstreams[0].addr_count, 2u);
+    CHECK_EQ(cfg.upstreams[0].addrs[0].ipv4()->sin_addr.s_addr, htonl(0x7f000002));
+    CHECK_EQ(cfg.upstreams[0].addrs[0].port(), htons(8080));
+    CHECK_EQ(cfg.upstreams[0].addrs[1].ipv4()->sin_addr.s_addr, htonl(0x7f000001));
+    CHECK_EQ(cfg.upstreams[0].addrs[1].port(), htons(8081));
+}
+
+TEST(route, populate_route_config_canonicalizes_static_and_hostname_backends) {
+    using namespace rut;
+    rir::Module mod{};
+    mod.upstream_count = 1;
+    mod.upstreams[0].name = Str{"backend", 7};
+    mod.upstreams[0].has_address = true;
+    mod.upstreams[0].address = IpAddress::v4(0x7f000002);
+    mod.upstreams[0].port = 8080;
+    mod.upstreams[0].extra_count = 1;
+    mod.upstreams[0].extra_hostnames[0] = Str{"api.internal", 12};
+    mod.upstreams[0].extra_ports[0] = 8081;
+    auto resolver = +[](Str hostname, ResolvedUpstreamAddresses* out) -> bool {
+        if (!hostname.eq(Str{"api.internal", 12}) || out == nullptr) return false;
+        out->count = 2;
+        out->addresses[0] = IpAddress::v4(0x7f000003);
+        out->addresses[1] = IpAddress::v4(0x7f000001);
+        return true;
+    };
+
+    RouteConfig cfg{};
+    REQUIRE(populate_route_config(cfg, mod, resolver));
+    REQUIRE_EQ(cfg.upstreams[0].addr_count, 3u);
+    CHECK_EQ(cfg.upstreams[0].addrs[0].ipv4()->sin_addr.s_addr, htonl(0x7f000001));
+    CHECK_EQ(cfg.upstreams[0].addrs[1].ipv4()->sin_addr.s_addr, htonl(0x7f000002));
+    CHECK_EQ(cfg.upstreams[0].addrs[2].ipv4()->sin_addr.s_addr, htonl(0x7f000003));
+}
+
+TEST(route, populate_route_config_rejects_failed_dns_and_deduplicates_endpoints) {
+    using namespace rut;
+    rir::Module mod{};
+    mod.upstream_count = 1;
+    mod.upstreams[0].name = Str{"backend", 7};
+    mod.upstreams[0].has_address = true;
+    mod.upstreams[0].address = IpAddress::v4(0x7f000001);
+    mod.upstreams[0].port = 8080;
+    mod.upstreams[0].extra_count = 1;
+    mod.upstreams[0].extra_hostnames[0] = Str{"api.internal", 12};
+    mod.upstreams[0].extra_ports[0] = 8080;
+
+    auto failing_resolver = +[](Str, ResolvedUpstreamAddresses*) -> bool { return false; };
+    RouteConfig failed{};
+    CHECK_FALSE(populate_route_config(failed, mod, failing_resolver));
+
+    auto resolver = +[](Str hostname, ResolvedUpstreamAddresses* out) -> bool {
+        if (!hostname.eq(Str{"api.internal", 12}) || out == nullptr) return false;
+        out->count = 2;
+        out->addresses[0] = IpAddress::v4(0x7f000001);
+        out->addresses[1] = IpAddress::v4(0x7f000002);
+        return true;
+    };
+    RouteConfig cfg{};
+    REQUIRE(populate_route_config(cfg, mod, resolver));
+    REQUIRE_EQ(cfg.upstreams[0].addr_count, 2u);
+    CHECK_EQ(cfg.upstreams[0].addrs[0].ipv4()->sin_addr.s_addr, htonl(0x7f000001));
+    CHECK_EQ(cfg.upstreams[0].addrs[1].ipv4()->sin_addr.s_addr, htonl(0x7f000002));
+}
+
+TEST(route, dns_upstream_rejects_static_server_iteration) {
+    using namespace rut;
+    const char* src =
+        "upstream backend { backends: [\"api.internal:8080\", \"127.0.0.2:8081\"] }\n"
+        "timer check_health, every: 5s, shard: 0 { for server in backend.servers { "
+        "backend.mark(server, healthy: true) } return 200 }\n";
+    auto lexed = lex(Str{src, static_cast<u32>(strlen(src))});
+    REQUIRE(lexed);
+    auto ast = parse_file(lexed.value());
+    REQUIRE(ast);
+    std::unique_ptr<AstFile> ast_owned(ast.value());
+    auto hir = analyze_file(*ast_owned);
+    REQUIRE_FALSE(hir.has_value());
+    CHECK(
+        hir.error().detail.eq(Str{"Upstream.servers requires concrete IP backend addresses", 55}));
+}
+
+TEST(route, static_duplicate_backends_are_rejected) {
+    using namespace rut;
+    const char* src =
+        "upstream backend { backends: [\"127.0.0.1:8080\", \"127.0.0.1:8080\"] }\n"
+        "timer check_health, every: 5s, shard: 0 { for server in backend.servers { "
+        "backend.mark(server, healthy: true) } return 200 }\n";
+    auto lexed = lex(Str{src, static_cast<u32>(strlen(src))});
+    REQUIRE(lexed);
+    auto ast = parse_file(lexed.value());
+    REQUIRE(ast);
+    std::unique_ptr<AstFile> ast_owned(ast.value());
+    auto hir = analyze_file(*ast_owned);
+    REQUIRE_FALSE(hir.has_value());
+    CHECK_EQ(hir.error().code, FrontendError::UnsupportedSyntax);
 }
 
 // Round-robin backend selection: a multi-backend upstream rotates through its
