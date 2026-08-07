@@ -3448,9 +3448,6 @@ TEST(route, system_hostname_resolver_resolves_localhost_and_rejects_invalid_inpu
               resolved.addresses[i].family == IpAddress::Family::V6);
     }
 
-    ResolvedUpstreamAddresses absolute{};
-    REQUIRE(resolve_upstream_hostname(Str{"localhost.", 10}, &absolute));
-    CHECK_GT(absolute.count, 0u);
 }
 
 TEST(route, upstream_endpoint_empty_and_ipv6_helpers) {

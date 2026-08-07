@@ -2160,6 +2160,26 @@ inline bool resolve_upstream_endpoints(const rir::Module::Upstream& upstream,
                 upstream.extra_addresses[i], upstream.extra_hostnames[i], upstream.extra_ports[i]))
             return false;
     }
+    for (u32 i = 1; i < out->count; ++i) {
+        const IpAddress address = out->addresses[i];
+        const u16 port = out->ports[i];
+        u32 pos = i;
+        while (pos > 0) {
+            const IpAddress& previous = out->addresses[pos - 1];
+            const u32 byte_count = address.byte_count();
+            const bool ordered = previous.family < address.family ||
+                                 (previous.family == address.family &&
+                                  (memcmp(previous.bytes, address.bytes, byte_count) < 0 ||
+                                   (memcmp(previous.bytes, address.bytes, byte_count) == 0 &&
+                                    out->ports[pos - 1] <= port)));
+            if (ordered) break;
+            out->addresses[pos] = previous;
+            out->ports[pos] = out->ports[pos - 1];
+            pos--;
+        }
+        out->addresses[pos] = address;
+        out->ports[pos] = port;
+    }
     return out->count != 0;
 }
 
