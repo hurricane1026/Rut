@@ -6454,8 +6454,7 @@ TEST(shard, concurrent_https_clients_iouring) {
 }
 
 TEST(shard, serves_http2_routed) {
-    // A real RouteConfig: /health is a static 204; an unmatched path falls
-    // through to the default 200.
+    // A real RouteConfig: /health is a static 204; an unmatched path is 404.
     RouteConfig cfg;
     cfg.add_static("/health", 0, 204);
     cfg.add_upstream("api", 0x7F000001, 8080);
@@ -6491,7 +6490,7 @@ TEST(shard, serves_http2_routed) {
         if (h2_status_for_stream(resp, total, 5) != 0) break;
     }
     CHECK_EQ(h2_status_for_stream(resp, total, 1), 204u);  // matched static route
-    CHECK_EQ(h2_status_for_stream(resp, total, 3), 200u);  // default fallback
+    CHECK_EQ(h2_status_for_stream(resp, total, 3), 404u);  // unmatched configured route
     // Proxy over h2 now forwards to the upstream; 127.0.0.1:8080 isn't listening,
     // so the connect is refused and the stream gets 502 (Bad Gateway).
     CHECK_EQ(h2_status_for_stream(resp, total, 5), 502u);
@@ -7955,7 +7954,7 @@ TEST(route, static_200_real_socket) {
 
 TEST(route, static_404_real_socket) {
     RouteConfig cfg;
-    cfg.add_static("/", 0, 404);
+    cfg.add_static("/present", 0, 200);
     const RouteConfig* active = &cfg;
 
     RealLoop* loop = create_real_loop();
@@ -7988,6 +7987,18 @@ TEST(route, static_404_real_socket) {
     }
     CHECK(found_404);
     close(c);
+
+    c = connect_to(port);
+    REQUIRE(c >= 0);
+    static constexpr char kIncompleteBody[] =
+        "POST /missing HTTP/1.1\r\nHost: x\r\nContent-Length: 5\r\n\r\n";
+    REQUIRE(send_all(c, kIncompleteBody, sizeof(kIncompleteBody) - 1));
+    n = recv_timeout(c, buf, sizeof(buf), 500);
+    CHECK_GT(n, 0);
+    CHECK(buf_contains(buf, static_cast<u32>(n), "404", 3));
+    CHECK(buf_contains(buf, static_cast<u32>(n), "Connection: close", 17));
+    close(c);
+
     lt.stop();
     loop->shutdown();
     close(lfd);

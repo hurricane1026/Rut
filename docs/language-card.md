@@ -550,9 +550,7 @@ is implemented.
 ```rut
 upstream users at "10.0.0.1:8080"
 // A standalone Cache/GCRA implementation lives in examples/ratelimit.rut.
-// ⚠ Unmatched methods/paths currently use Rut's default 200 OK handler; there
-// is no shipped top-level catch-all syntax yet. Configure the surrounding
-// listener/proxy to return 404 for traffic outside these declared routes.
+// Unmatched methods and paths return 404 when a program is loaded.
 
 route GET "/health" { return 200 }
 route GET "/users/:id" { return forward(users) }

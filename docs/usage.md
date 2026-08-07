@@ -99,8 +99,8 @@ Notes:
   `upstream X at "[2001:db8::1]:8080"`; dictionary-form `host` values are bare.
   A `backends` list may mix IPv4 and IPv6 endpoints.
   A name-only upstream makes the program fail to load (fail-closed).
-- Requests that match no route fall through to the default action
-  (currently a `200`).
+- Requests that match no route return `404`. Running without a `.rut` program
+  retains the route-less `200` response used for basic listener checks.
 - See `DESIGN.md` for the full language; not every documented construct
   is JIT-backed yet. New and generated programs should follow the profile in
   `docs/syntax-stability.md`; capability gaps are tracked in

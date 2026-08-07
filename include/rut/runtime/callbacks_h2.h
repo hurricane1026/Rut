@@ -4,7 +4,7 @@
 // per-connection Http2Conn engine: feed inbound bytes, run dispatch for each
 // completed request, serialize responses as HEADERS(+DATA), and flush.
 //
-// Serves: static (return-status) routes, the default 200, synchronous JIT
+// Serves: static (return-status) routes, the route-less default 200, synchronous JIT
 // handlers (status + optional body/headers + request bodies), timer-yielding JIT
 // handlers (wait(ms) — suspended on the async slot, resumed via the yield timer),
 // and no-body proxy routes (forwarded to the h1 upstream, response buffered and
@@ -1246,10 +1246,10 @@ void h2_dispatch_request(H2Dispatch<Loop>& d,
                                     /*route=*/nullptr,
                                     /*params=*/nullptr,
                                     /*param_count=*/0,
-                                    /*static_status=*/200);
+                                    /*static_status=*/404);
             return;
         }
-        h2_emit_status(d, stream_id, 200);  // default (matches HTTP/1 catchall)
+        h2_emit_status(d, stream_id, 404);
         return;
     }
 

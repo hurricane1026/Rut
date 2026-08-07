@@ -1575,8 +1575,8 @@ public:
     // (`this->dispatch`), but the default linear-scan dispatch keeps
     // the historical contract: first-match-wins byte-prefix scan,
     // method 0 in a route entry matches any request method, and
-    // unmatched requests return nullptr (callers fall back to the
-    // default 200 OK handler).
+    // unmatched requests return nullptr (serving callers answer 404 when a
+    // config is loaded).
     //
     // `method` is a route method key (0 = any, 1..9 = full HTTP
     // method), or a legacy first-char method byte accepted for

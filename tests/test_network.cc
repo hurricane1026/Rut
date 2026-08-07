@@ -16365,7 +16365,7 @@ TEST(route_coverage, static_routes) {
                  {"GET /e502 HTTP/1.1\r\nHost: x\r\n\r\n", 502},
                  {"GET /e503 HTTP/1.1\r\nHost: x\r\n\r\n", 503},
                  {"GET /e999 HTTP/1.1\r\nHost: x\r\n\r\n", 999},
-                 {"GET /other HTTP/1.1\r\nHost: x\r\n\r\n", 200}};
+                 {"GET /other HTTP/1.1\r\nHost: x\r\n\r\n", 404}};
     i32 fake_fd = 50;
     for (auto& tc : cases) {
         loop.inject_and_dispatch(make_ev(0, IoEventType::Accept, fake_fd));
@@ -16387,6 +16387,54 @@ TEST(route_coverage, static_routes) {
         CHECK_EQ(c->resp_status, tc.status);
         loop.inject_and_dispatch(make_ev(c->id, IoEventType::Recv, 0));
     }
+}
+
+TEST(route_coverage, unmatched_route_with_incomplete_body_closes_after_404) {
+    RouteConfig cfg;
+    REQUIRE(cfg.add_static("/present", 0, 200));
+    const RouteConfig* active = &cfg;
+    SmallLoop loop;
+    loop.setup();
+    loop.config_ptr = &active;
+
+    loop.inject_and_dispatch(make_ev(0, IoEventType::Accept, 50));
+    auto* c = loop.find_fd(50);
+    REQUIRE(c != nullptr);
+    static constexpr char kRequest[] =
+        "POST /missing HTTP/1.1\r\nHost: x\r\nContent-Length: 4\r\n\r\n";
+    c->recv_buf.write(reinterpret_cast<const u8*>(kRequest), sizeof(kRequest) - 1);
+    loop.backend.inject(make_ev(c->id, IoEventType::Recv, static_cast<i32>(sizeof(kRequest) - 1)));
+    IoEvent events[8];
+    const u32 event_count = loop.backend.wait(events, 8);
+    for (u32 i = 0; i < event_count; ++i) loop.dispatch(events[i]);
+
+    CHECK_EQ(c->resp_status, 404u);
+    CHECK_FALSE(c->keep_alive);
+    CHECK_EQ(c->req_body_remaining, 4u);
+}
+
+TEST(route_coverage, unmatched_head_route_suppresses_404_body) {
+    RouteConfig cfg;
+    REQUIRE(cfg.add_static("/present", 0, 200));
+    const RouteConfig* active = &cfg;
+    SmallLoop loop;
+    loop.setup();
+    loop.config_ptr = &active;
+
+    loop.inject_and_dispatch(make_ev(0, IoEventType::Accept, 50));
+    auto* c = loop.find_fd(50);
+    REQUIRE(c != nullptr);
+    static constexpr char kRequest[] = "HEAD /missing HTTP/1.1\r\nHost: x\r\n\r\n";
+    c->recv_buf.write(reinterpret_cast<const u8*>(kRequest), sizeof(kRequest) - 1);
+    loop.backend.inject(make_ev(c->id, IoEventType::Recv, static_cast<i32>(sizeof(kRequest) - 1)));
+    IoEvent events[8];
+    const u32 event_count = loop.backend.wait(events, 8);
+    for (u32 i = 0; i < event_count; ++i) loop.dispatch(events[i]);
+
+    CHECK_EQ(c->resp_status, 404u);
+    const char* response = reinterpret_cast<const char*>(c->send_buf.data());
+    CHECK(buf_contains(response, c->send_buf.len(), "Content-Length: 9\r\n", 19));
+    CHECK_FALSE(buf_contains(response, c->send_buf.len(), "\r\n\r\nNot Found", 15));
 }
 
 TEST(route_coverage, capture_stage_and_write) {
