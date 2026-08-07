@@ -5008,6 +5008,7 @@ TEST(route, default_dispatch_kind_is_art_jit) {
     // correct. SegmentTrie is opt-in via use_segment_trie().
     RouteConfig cfg;
     CHECK_EQ(cfg.dispatch_kind(), RouteConfig::DispatchKind::ArtJit);
+    cfg.install_art_jit_fn(nullptr);
 }
 
 TEST(route, use_segment_trie_swaps_dispatch_pre_add) {
@@ -16997,6 +16998,7 @@ TEST(route_coverage, firewall_remove_deny_restores_allow_match) {
 
 TEST(route_coverage, firewall_default_deny_requires_explicit_allow) {
     RouteConfig cfg;
+    CHECK(cfg.same_firewall_policy(cfg));
     cfg.set_firewall_default_deny();
     CHECK(!cfg.firewall_default_is_allow());
 
@@ -17016,6 +17018,9 @@ TEST(route_coverage, firewall_default_deny_requires_explicit_allow) {
     // Clearing rules preserves default policy.
     cfg.clear_firewall_rules();
     CHECK(!cfg.firewall_allows_peer_host(0x7f000001));
+
+    cfg.set_firewall_default_allow(true);
+    CHECK(cfg.firewall_default_is_allow());
 }
 
 TEST(route_coverage, firewall_clear_allow_rules_keeps_deny_active) {
@@ -17068,6 +17073,7 @@ TEST(route_coverage, firewall_range_string_and_network_order_helpers) {
     RouteConfig cfg;
     REQUIRE(cfg.add_firewall_allow_range("10.0.0.1-10.0.0.3"));
     REQUIRE(cfg.add_firewall_deny_range_network_order(htonl(0x0a000002), htonl(0x0a000002)));
+    REQUIRE(cfg.add_firewall_deny_range("10.0.0.5-10.0.0.6"));
 
     CHECK(cfg.firewall_allows_peer_host(0x0a000001));
     CHECK(!cfg.firewall_allows_peer_host(0x0a000002));
@@ -17076,6 +17082,7 @@ TEST(route_coverage, firewall_range_string_and_network_order_helpers) {
 
     REQUIRE(cfg.remove_firewall_allow_range("10.0.0.1-10.0.0.3"));
     REQUIRE(cfg.remove_firewall_deny_range_network_order(htonl(0x0a000002), htonl(0x0a000002)));
+    REQUIRE(cfg.remove_firewall_deny_range("10.0.0.5-10.0.0.6"));
 }
 
 TEST(route_coverage, firewall_range_rejects_invalid_inputs) {
