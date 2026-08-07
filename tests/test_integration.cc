@@ -15331,6 +15331,33 @@ TEST(route, populate_route_config_preserves_static_backend_order) {
     CHECK_EQ(cfg.upstreams[0].addrs[1].port(), htons(8081));
 }
 
+TEST(route, populate_route_config_canonicalizes_static_and_hostname_backends) {
+    using namespace rut;
+    rir::Module mod{};
+    mod.upstream_count = 1;
+    mod.upstreams[0].name = Str{"backend", 7};
+    mod.upstreams[0].has_address = true;
+    mod.upstreams[0].address = IpAddress::v4(0x7f000002);
+    mod.upstreams[0].port = 8080;
+    mod.upstreams[0].extra_count = 1;
+    mod.upstreams[0].extra_hostnames[0] = Str{"api.internal", 12};
+    mod.upstreams[0].extra_ports[0] = 8081;
+    auto resolver = +[](Str hostname, ResolvedUpstreamAddresses* out) -> bool {
+        if (!hostname.eq(Str{"api.internal", 12}) || out == nullptr) return false;
+        out->count = 2;
+        out->addresses[0] = IpAddress::v4(0x7f000003);
+        out->addresses[1] = IpAddress::v4(0x7f000001);
+        return true;
+    };
+
+    RouteConfig cfg{};
+    REQUIRE(populate_route_config(cfg, mod, resolver));
+    REQUIRE_EQ(cfg.upstreams[0].addr_count, 3u);
+    CHECK_EQ(cfg.upstreams[0].addrs[0].ipv4()->sin_addr.s_addr, htonl(0x7f000001));
+    CHECK_EQ(cfg.upstreams[0].addrs[1].ipv4()->sin_addr.s_addr, htonl(0x7f000002));
+    CHECK_EQ(cfg.upstreams[0].addrs[2].ipv4()->sin_addr.s_addr, htonl(0x7f000003));
+}
+
 TEST(route, dns_upstream_rejects_static_server_iteration) {
     using namespace rut;
     const char* src =
