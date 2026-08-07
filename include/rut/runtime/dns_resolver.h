@@ -9,6 +9,7 @@ struct ResolvedUpstreamAddresses {
 
     IpAddress addresses[kMaxAddresses]{};
     u32 count = 0;
+    bool overflow = false;
 };
 
 using UpstreamHostnameResolver = bool (*)(Str hostname, ResolvedUpstreamAddresses* out);

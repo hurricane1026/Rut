@@ -15257,8 +15257,8 @@ TEST(route, populate_route_config_resolves_hostname_backends) {
     REQUIRE_EQ(cfg->upstream_count, 1u);
     REQUIRE_EQ(cfg->upstreams[0].addr_count, 3u);
     CHECK_EQ(cfg->upstreams[0].addrs[0].family(), AF_INET);
-    CHECK_EQ(cfg->upstreams[0].addrs[1].family(), AF_INET6);
-    CHECK_EQ(cfg->upstreams[0].addrs[2].family(), AF_INET);
+    CHECK_EQ(cfg->upstreams[0].addrs[1].family(), AF_INET);
+    CHECK_EQ(cfg->upstreams[0].addrs[2].family(), AF_INET6);
     CHECK_EQ(ntohs(cfg->upstreams[0].addrs[2].port()), 8080u);
 
     auto failed = std::make_unique<RouteConfig>();
@@ -15277,8 +15277,8 @@ TEST(route, populate_route_config_resolves_hostname_backends) {
     auto invalid_family = std::make_unique<RouteConfig>();
     CHECK_FALSE(populate_route_config(*invalid_family, rir.module, invalid_family_resolver));
     auto oversized_resolver = +[](Str, ResolvedUpstreamAddresses* out) -> bool {
-        out->count = 0;
-        out->count = ResolvedUpstreamAddresses::kMaxAddresses + 1;
+        *out = ResolvedUpstreamAddresses{};
+        out->overflow = true;
         return true;
     };
     auto oversized = std::make_unique<RouteConfig>();
@@ -15308,7 +15308,7 @@ TEST(route, populate_route_config_rejects_dns_expansion_over_backend_capacity) {
     CHECK_FALSE(populate_route_config(cfg, mod, resolver));
 }
 
-TEST(route, populate_route_config_validates_pre_bound_backend_identity_order) {
+TEST(route, dns_upstream_rejects_static_server_iteration) {
     using namespace rut;
     const char* src =
         "upstream backend { backends: [\"api.internal:8080\", \"127.0.0.2:8081\"] }\n"
@@ -15320,41 +15320,9 @@ TEST(route, populate_route_config_validates_pre_bound_backend_identity_order) {
     REQUIRE(ast);
     std::unique_ptr<AstFile> ast_owned(ast.value());
     auto hir = analyze_file(*ast_owned);
-    REQUIRE(hir);
-    std::unique_ptr<HirModule> hir_owned(hir.value());
-    auto mir = build_mir(*hir_owned);
-    REQUIRE(mir);
-    std::unique_ptr<MirModule> mir_owned(mir.value());
-    FrontendRirModule rir{};
-    REQUIRE(lower_to_rir(*mir_owned, rir));
-    rir.module.upstream_mark_replay_complete = true;
-    auto resolver = +[](Str hostname, ResolvedUpstreamAddresses* out) -> bool {
-        if (out == nullptr || !hostname.eq(Str{"api.internal", 12})) return false;
-        *out = ResolvedUpstreamAddresses{};
-        out->addresses[out->count++] = IpAddress::v4(0x7f000001);
-        return true;
-    };
-    const u64 hostname_identity = marking_policy_upstream_identity(rir.module, 0);
-    rir.module.upstreams[0].hostname = Str{"other.internal", 14};
-    CHECK_NE(marking_policy_upstream_identity(rir.module, 0), hostname_identity);
-    rir.module.upstreams[0].hostname = Str{"api.internal", 12};
-
-    // RouteConfig is intentionally large; keep the three fixtures off this
-    // already-deep debug-build stack frame.
-    auto missing = std::make_unique<RouteConfig>();
-    REQUIRE(missing->add_upstream("backend", 0x7F000001, 8080).has_value());
-    CHECK_FALSE(populate_route_config(*missing, rir.module, resolver));
-
-    auto reversed = std::make_unique<RouteConfig>();
-    REQUIRE(reversed->add_upstream("backend", 0x7F000002, 8081).has_value());
-    REQUIRE(reversed->add_upstream_backend(0, 0x7F000001, 8080));
-    CHECK_FALSE(populate_route_config(*reversed, rir.module, resolver));
-
-    auto matching = std::make_unique<RouteConfig>();
-    REQUIRE(matching->add_upstream("backend", 0x7F000001, 8080).has_value());
-    REQUIRE(matching->add_upstream_backend(0, 0x7F000002, 8081));
-    CHECK(populate_route_config(*matching, rir.module, resolver));
-    rir.destroy();
+    REQUIRE_FALSE(hir.has_value());
+    CHECK(
+        hir.error().detail.eq(Str{"Upstream.servers requires concrete IP backend addresses", 55}));
 }
 
 // Round-robin backend selection: a multi-backend upstream rotates through its

@@ -6854,6 +6854,17 @@ TEST(frontend, parse_upstream_accepts_hostname) {
     CHECK_EQ(hir->upstreams[0].port, 8080u);
 }
 
+TEST(frontend, parse_upstream_accepts_absolute_hostname) {
+    const char* src = "upstream api at \"example.com.:8080\"\nroute GET \"/u\" { return 200 }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    CHECK(hir->upstreams[0].hostname.eq(lit("example.com.")));
+}
+
 TEST(frontend, parse_upstream_accepts_hostname_backend_list) {
     const char* src =
         "upstream api { backends: [\"api-a.internal:8080\", \"127.0.0.1:8081\", "

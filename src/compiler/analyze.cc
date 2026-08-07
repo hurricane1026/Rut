@@ -17286,11 +17286,14 @@ static FrontendResult<u32> analyze_for_stmt(const AstStatement& stmt,
         }
         if (upstream_index < mod.upstreams.len) {
             const auto& upstream = mod.upstreams[upstream_index];
-            if (!upstream.has_address)
+            bool has_hostname = upstream.hostname.len != 0;
+            for (u32 backend = 0; backend < upstream.extra_count; ++backend)
+                has_hostname |= upstream.extra_hostnames[backend].len != 0;
+            if (!upstream.has_address || has_hostname)
                 return frontend_error(
                     FrontendError::UnsupportedSyntax,
                     stmt.expr.span,
-                    lit_str("Upstream.servers requires statically declared backend addresses"));
+                    lit_str("Upstream.servers requires concrete IP backend addresses"));
             auto server_shape = intern_hir_type_shape(&mod,
                                                       HirTypeKind::Server,
                                                       0xffffffffu,
@@ -19689,9 +19692,12 @@ static FrontendResult<HirModule*> analyze_file_internal(
         };
         auto valid_hostname = [](Str host) -> bool {
             if (host.ptr == nullptr || host.len == 0 || host.len > 253) return false;
+            const u32 name_len =
+                host.len > 1 && host.ptr[host.len - 1] == '.' ? host.len - 1 : host.len;
+            if (name_len == 0) return false;
             u32 label_len = 0;
             bool has_non_numeric = false;
-            for (u32 k = 0; k < host.len; ++k) {
+            for (u32 k = 0; k < name_len; ++k) {
                 const char c = host.ptr[k];
                 if (c == '.') {
                     if (label_len == 0 || label_len > 63 || host.ptr[k - 1] == '-') return false;
@@ -19705,7 +19711,7 @@ static FrontendResult<HirModule*> analyze_file_internal(
                 has_non_numeric |= alpha || c == '-';
                 label_len++;
             }
-            return label_len > 0 && label_len <= 63 && host.ptr[host.len - 1] != '-' &&
+            return label_len > 0 && label_len <= 63 && host.ptr[name_len - 1] != '-' &&
                    has_non_numeric;
         };
         auto parse_host_port = [&](Str lit, ParsedEndpoint* out) -> bool {

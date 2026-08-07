@@ -13,6 +13,12 @@ bool same_ip(const IpAddress& lhs, const IpAddress& rhs) {
            memcmp(lhs.bytes, rhs.bytes, byte_count) == 0;
 }
 
+bool address_less(const IpAddress& lhs, const IpAddress& rhs) {
+    if (lhs.family != rhs.family) return lhs.family < rhs.family;
+    const u32 byte_count = lhs.byte_count();
+    return byte_count != 0 && memcmp(lhs.bytes, rhs.bytes, byte_count) < 0;
+}
+
 }  // namespace
 
 bool resolve_upstream_hostname(Str hostname, ResolvedUpstreamAddresses* out) {
@@ -26,6 +32,7 @@ bool resolve_upstream_hostname(Str hostname, ResolvedUpstreamAddresses* out) {
 
     addrinfo hints{};
     hints.ai_family = AF_UNSPEC;
+    hints.ai_flags = AI_ADDRCONFIG;
     hints.ai_socktype = SOCK_STREAM;
     hints.ai_protocol = IPPROTO_TCP;
 
@@ -49,11 +56,24 @@ bool resolve_upstream_hostname(Str hostname, ResolvedUpstreamAddresses* out) {
         bool duplicate = false;
         for (u32 i = 0; i < out->count; ++i) duplicate |= same_ip(out->addresses[i], address);
         if (duplicate) continue;
-        if (out->count == ResolvedUpstreamAddresses::kMaxAddresses) break;
+        if (out->count == ResolvedUpstreamAddresses::kMaxAddresses) {
+            out->overflow = true;
+            continue;
+        }
         out->addresses[out->count++] = address;
     }
     freeaddrinfo(results);
-    return out->count != 0;
+    if (out->overflow || out->count == 0) return false;
+    for (u32 i = 1; i < out->count; ++i) {
+        IpAddress next = out->addresses[i];
+        u32 pos = i;
+        while (pos > 0 && address_less(next, out->addresses[pos - 1])) {
+            out->addresses[pos] = out->addresses[pos - 1];
+            pos--;
+        }
+        out->addresses[pos] = next;
+    }
+    return true;
 }
 
 }  // namespace rut

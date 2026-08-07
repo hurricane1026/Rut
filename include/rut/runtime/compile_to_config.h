@@ -2107,12 +2107,28 @@ inline bool resolve_upstream_endpoints(const rir::Module::Upstream& upstream,
             if (hostname.ptr == nullptr || hostname_resolver == nullptr ||
                 !hostname_resolver(hostname, &resolved))
                 return false;
-            if (resolved.count == 0 || resolved.count > ResolvedUpstreamAddresses::kMaxAddresses)
+            if (resolved.overflow || resolved.count == 0 ||
+                resolved.count > ResolvedUpstreamAddresses::kMaxAddresses)
                 return false;
             for (u32 i = 0; i < resolved.count; ++i) {
                 if (resolved.addresses[i].family != IpAddress::Family::V4 &&
                     resolved.addresses[i].family != IpAddress::Family::V6)
                     return false;
+            }
+            for (u32 i = 1; i < resolved.count; ++i) {
+                IpAddress next = resolved.addresses[i];
+                u32 pos = i;
+                while (pos > 0) {
+                    const IpAddress& previous = resolved.addresses[pos - 1];
+                    const u32 byte_count = next.byte_count();
+                    const bool ordered = previous.family < next.family ||
+                                         (previous.family == next.family && byte_count != 0 &&
+                                          memcmp(previous.bytes, next.bytes, byte_count) <= 0);
+                    if (ordered) break;
+                    resolved.addresses[pos] = previous;
+                    pos--;
+                }
+                resolved.addresses[pos] = next;
             }
             addresses = resolved.addresses;
             address_count = resolved.count;
