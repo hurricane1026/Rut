@@ -423,10 +423,8 @@ ReloadCoordinatorPoll ProcessReloadCoordinator::poll() {
         mutation_->stop();
         return ReloadCoordinatorPoll::Stopped;
     }
-    if (!compatible(active_->config,
-                    spare_->config,
-                    shard_count_,
-                    supports_active_health_probes_) ||
+    if (!compatible(
+            active_->config, spare_->config, shard_count_, supports_active_health_probes_) ||
         old_generation_ >= ControlPlaneMutationPort::kMaxGeneration) {
         spare_->destroy();
         (void)mutation_->complete_reload(
