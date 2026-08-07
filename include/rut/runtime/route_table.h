@@ -397,6 +397,13 @@ struct RouteConfig {
         return -1;
     }
 
+    [[nodiscard]] bool requires_active_health_probes() const {
+        const u32 n = upstream_count < kMaxUpstreams ? upstream_count : kMaxUpstreams;
+        for (u32 i = 0; i < n; i++)
+            if (upstreams[i].hc_enabled) return true;
+        return false;
+    }
+
     bool add_timer(const char* name,
                    u32 name_len,
                    u32 interval_ms,
@@ -818,8 +825,8 @@ struct RouteConfig {
         return true;
     }
 
-    // Attach active health-check config to an upstream (by id). Data only — no
-    // probing is performed yet. `path` (length `path_len`, not required to be
+    // Attach active health-check config to an upstream (by id). `path` (length
+    // `path_len`, not required to be
     // NUL-terminated) is the probe path; `interval_ms` the probe period;
     // `status` the status code that marks a backend healthy. Returns false on a
     // bad upstream id, an over-long path, a non-origin-form path (empty, missing

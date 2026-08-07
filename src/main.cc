@@ -1,4 +1,5 @@
 #include "rut/common/shard_limits.h"
+#include "rut/runtime/backend_selection.h"
 #include "rut/runtime/epoll_event_loop.h"
 #include "rut/runtime/iouring_event_loop.h"
 #include "rut/runtime/shard.h"
@@ -257,7 +258,8 @@ static i32 run_shards(u16 port,
                                                  nullptr,
                                                  nullptr,
                                                  &shutdown_signal_pending,
-                                                 nullptr);
+                                                 nullptr,
+                                                 EventLoopType::kSupportsHealthProbe);
         if (!reload_enabled) {
             write_str("Failed to initialize reload coordinator\n");
             for (u32 i = 0; i < shard_count; i++) shards[i].shutdown();
@@ -494,10 +496,12 @@ int main(int argc, char** argv) {
     // listener. Opt-in (internal metrics shouldn't be public by default).
     bool serve_metrics = false;
     bool allow_route_reload = false;
+    BackendPreference backend_preference = BackendPreference::Auto;
     i32 access_log_level = AccessLogFlusher::kDefaultLevel;
     u32 opt_level = 2;  // JIT IR optimization level (0=low/fast-start .. 3=high)
 
     // Simple arg parsing: [port] [--shards N] [--no-pin] [--drain N]
+    //                      [--backend auto|io_uring|epoll]
     //                      [--tls-cert PATH] [--tls-key PATH]
     //                      [--access-log PATH] [--access-log-compress]
     //                      [--metrics]
@@ -587,6 +591,18 @@ int main(int argc, char** argv) {
                     write_str("--opt must be between 0 and 3\n");
                     return 1;
                 }
+            } else if (str_eq(argv[i], "--backend")) {
+                i++;
+                if (str_eq(argv[i], "auto")) {
+                    backend_preference = BackendPreference::Auto;
+                } else if (str_eq(argv[i], "io_uring")) {
+                    backend_preference = BackendPreference::IoUring;
+                } else if (str_eq(argv[i], "epoll")) {
+                    backend_preference = BackendPreference::Epoll;
+                } else {
+                    write_str("--backend must be auto, io_uring, or epoll\n");
+                    return 1;
+                }
             }
         }
         if (str_eq(argv[i], "--no-pin")) pin_cpus = false;
@@ -599,7 +615,8 @@ int main(int argc, char** argv) {
             if (str_eq(argv[i], "--shards") || str_eq(argv[i], "--drain") ||
                 str_eq(argv[i], "--pool-prealloc") || str_eq(argv[i], "--tls-cert") ||
                 str_eq(argv[i], "--tls-key") || str_eq(argv[i], "--access-log") ||
-                str_eq(argv[i], "--access-log-level") || str_eq(argv[i], "--opt")) {
+                str_eq(argv[i], "--access-log-level") || str_eq(argv[i], "--opt") ||
+                str_eq(argv[i], "--backend")) {
                 write_str(argv[i]);
                 write_str(" requires an argument\n");
                 return 1;
@@ -726,10 +743,29 @@ int main(int argc, char** argv) {
         }
     }
 
+    const bool requires_active_health_probes =
+        route_config != nullptr && route_config->requires_active_health_probes();
+    const bool should_detect_io_uring =
+        backend_preference == BackendPreference::IoUring ||
+        (backend_preference == BackendPreference::Auto && !requires_active_health_probes);
+    const bool io_uring_available = should_detect_io_uring && detect_io_uring();
+    const BackendSelection backend = select_server_backend(
+        backend_preference, io_uring_available, requires_active_health_probes);
+    if (!backend.ok()) {
+        if (backend.error == BackendSelectionError::IoUringUnavailable)
+            write_str("--backend io_uring requested, but io_uring is unavailable\n");
+        else
+            write_str(
+                "--backend io_uring cannot run configured active health checks; use "
+                "--backend epoll\n");
+        destroy_tls_server_context(tls_server);
+        return 1;
+    }
+    if (backend.health_probe_fallback)
+        write_str("Backend: active health checks require epoll; skipping available io_uring\n");
+
     i32 rc = 0;
-    // io_uring now terminates TLS too (event-loop TlsEngine), so it is preferred
-    // whenever available — TLS no longer forces the epoll fallback.
-    if (detect_io_uring()) {
+    if (backend.backend == ServerBackend::IoUring) {
         write_str(tls_server ? "Backend: io_uring (TLS)\n" : "Backend: io_uring\n");
         rc = run_shards<IoUringEventLoop>(port,
                                           shard_count,
@@ -744,7 +780,7 @@ int main(int argc, char** argv) {
                                           serve_metrics,
                                           allow_route_reload,
                                           &server_reload);
-        if (rc != 0 && tls_server) {
+        if (rc != 0 && tls_server && backend_preference == BackendPreference::Auto) {
             write_str("Backend: io_uring TLS startup failed; falling back to epoll (TLS)\n");
             rc = run_shards<EpollEventLoop>(port,
                                             shard_count,

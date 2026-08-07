@@ -202,6 +202,20 @@ TEST(reload_coordinator, changed_health_endpoint_requires_warming_support) {
     CHECK_FALSE(ProcessReloadCoordinator::compatible(active, candidate, 1));
 }
 
+TEST(reload_coordinator, rejects_health_check_reload_when_backend_cannot_probe) {
+    RouteConfig active;
+    RouteConfig candidate;
+    REQUIRE(candidate.add_upstream("api", 0x7f000001u, 8000));
+    candidate.upstreams[0].hc_enabled = true;
+    candidate.upstreams[0].hc_path_len = 7;
+    __builtin_memcpy(candidate.upstreams[0].hc_path, "/health", 7);
+    candidate.upstreams[0].hc_interval_ms = 1000;
+    candidate.upstreams[0].hc_expected_status = 200;
+
+    CHECK_FALSE(ProcessReloadCoordinator::compatible(active, candidate, 1, false));
+    CHECK(ProcessReloadCoordinator::compatible(active, candidate, 1, true));
+}
+
 TEST(reload_coordinator, publication_waits_for_all_shards_and_retired_program_pins) {
     Fixture f;
     REQUIRE(f.setup());

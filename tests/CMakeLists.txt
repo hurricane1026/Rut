@@ -364,6 +364,14 @@ if(RUT_ENABLE_JIT)
                 --rut $<TARGET_FILE:rut>
     )
     set_tests_properties(test_process_reload PROPERTIES LABELS "integration;process;jit;harness")
+
+    add_test(
+        NAME test_backend_selection
+        COMMAND ${Python3_EXECUTABLE}
+                ${CMAKE_CURRENT_SOURCE_DIR}/test_backend_selection.py
+                --rut $<TARGET_FILE:rut>
+    )
+    set_tests_properties(test_backend_selection PROPERTIES LABELS "integration;process;jit;network")
 endif()
 
 add_executable(test_traffic_capture
@@ -475,6 +483,7 @@ if(RUT_ENABLE_JIT)
         COMMAND $<TARGET_FILE:test_serve_loader>
         COMMAND $<TARGET_FILE:test_reload_coordinator>
         COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/test_process_reload.py --rut $<TARGET_FILE:rut>
+        COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/test_backend_selection.py --rut $<TARGET_FILE:rut>
         COMMAND $<TARGET_FILE:test_traffic_capture>
         COMMAND $<TARGET_FILE:test_traffic_replay>
         COMMAND $<TARGET_FILE:test_sim>
