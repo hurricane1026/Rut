@@ -3,6 +3,7 @@
 #include "rut/runtime/control_plane_mutation.h"
 #include "rut/runtime/shard_control.h"
 #include "rut/serve_loader.h"
+#include <atomic>
 #include <mutex>
 #include <string>
 #include <vector>
@@ -98,6 +99,10 @@ private:
     std::string cached_snapshot_source_;
     std::string source_snapshot_root_;
     std::vector<std::string> retired_snapshot_roots_;
+    // Published by the control thread after a complete immutable snapshot is
+    // installed. Route workers use it to copy a stable prepared path without
+    // resolving the source provider or touching the filesystem.
+    std::atomic<u64> source_snapshot_epoch_{0};
     mutable std::mutex source_snapshot_mutex_;
     ReloadRequest request_{};
     u64 old_generation_ = 0;

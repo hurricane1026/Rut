@@ -445,6 +445,40 @@ TEST(reload_coordinator, route_admission_rejects_a_stale_snapshot_until_control_
     fs::remove_all(root);
 }
 
+TEST(reload_coordinator, signal_snapshot_refresh_failure_is_terminalized) {
+    namespace fs = std::filesystem;
+    const fs::path root = "/tmp/rut_reload_coordinator_snapshot_failure";
+    fs::remove_all(root);
+    fs::create_directories(root);
+    const fs::path source = root / "regular.rut";
+    std::ofstream(source) << "route GET \"/\" { return 200 }\n";
+
+    ControlPlaneMutationPort mutation;
+    mutation.reset(1, true);
+    LoadedProgram active;
+    LoadedProgram spare;
+    active.config.config_generation = 1;
+    active.config.program_pins = &active.pins;
+    ShardControlBlock control{};
+    control.acknowledged_generation.store(1, std::memory_order_relaxed);
+    ReloadShardEndpoint shard{&control};
+    {
+        ProcessReloadCoordinator coordinator;
+        REQUIRE(coordinator.init(
+            &mutation, source.c_str(), jit::OptLevel::O0, &active, &spare, &shard, 1));
+        u64 request_id = 0;
+        CHECK_FALSE(coordinator.request_signal(&request_id));
+        CHECK_NE(request_id, 0u);
+        const auto record = mutation.last_record();
+        REQUIRE(record.valid);
+        CHECK_EQ(record.request_id, request_id);
+        CHECK_EQ(record.outcome, ReloadTerminalOutcome::SnapshotUnavailable);
+    }
+    active.destroy();
+    spare.destroy();
+    fs::remove_all(root);
+}
+
 TEST(reload_coordinator, regular_source_path_does_not_fail_initialization) {
     namespace fs = std::filesystem;
     const fs::path root = "/tmp/rut_reload_coordinator_regular_source";

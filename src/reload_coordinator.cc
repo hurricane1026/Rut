@@ -79,6 +79,7 @@ void ProcessReloadCoordinator::clear_source_snapshots() {
             retired_snapshot_roots_.push_back(std::move(source_snapshot_root_));
         cached_snapshot_source_.clear();
         cached_provider_version_.clear();
+        source_snapshot_epoch_.store(0, std::memory_order_release);
         roots.swap(retired_snapshot_roots_);
     }
     for (const auto& root : roots) {
@@ -91,8 +92,13 @@ bool ProcessReloadCoordinator::refresh_source_snapshot() {
     if (!default_loader_selected_) return true;
     char version[ReloadRequest::kMaxSourceVersion]{};
     u32 version_len = 0;
-    if (!resolve_rut_program_source_version(source_path_, version, sizeof(version), &version_len))
+    if (!resolve_rut_program_source_version(source_path_, version, sizeof(version), &version_len)) {
+        std::lock_guard lock(source_snapshot_mutex_);
+        cached_snapshot_source_.clear();
+        cached_provider_version_.clear();
+        source_snapshot_epoch_.store(0, std::memory_order_release);
         return false;
+    }
     {
         std::lock_guard lock(source_snapshot_mutex_);
         if (cached_provider_version_.size() == version_len &&
@@ -113,6 +119,7 @@ bool ProcessReloadCoordinator::refresh_source_snapshot() {
         std::lock_guard lock(source_snapshot_mutex_);
         cached_snapshot_source_.clear();
         cached_provider_version_.clear();
+        source_snapshot_epoch_.store(0, std::memory_order_release);
         if (!source_snapshot_root_.empty())
             retired_snapshot_roots_.push_back(std::move(source_snapshot_root_));
         return false;
@@ -128,6 +135,7 @@ bool ProcessReloadCoordinator::refresh_source_snapshot() {
             source_snapshot_root_.assign(snapshot_root, root_len);
             cached_provider_version_.assign(version, version_len);
             cached_snapshot_source_.assign(snapshot_source, source_len);
+            source_snapshot_epoch_.fetch_add(1, std::memory_order_release);
         }
     }
     if (!previous_root.empty()) {
@@ -160,21 +168,14 @@ bool ProcessReloadCoordinator::capture_source_version(void* context,
     auto* coordinator = static_cast<ProcessReloadCoordinator*>(context);
     if (coordinator == nullptr) return false;
     if (coordinator->default_loader_selected_) {
-        // This callback can run on a route worker. It must not materialize an
-        // import closure or touch the filesystem beyond resolving the version
-        // handle. A cache miss is fail-closed until the control thread refreshes
-        // the immutable snapshot.
-        char version[ReloadRequest::kMaxSourceVersion]{};
-        u32 version_len = 0;
-        if (!resolve_rut_program_source_version(
-                coordinator->source_path_, version, sizeof(version), &version_len))
-            return false;
+        // This callback can run on a route worker. It uses only the immutable
+        // snapshot epoch published by the control thread; filesystem/provider
+        // resolution and snapshot materialization stay off the shard thread.
+        const u64 epoch = coordinator->source_snapshot_epoch_.load(std::memory_order_acquire);
+        if (epoch == 0) return false;
         std::unique_lock lock(coordinator->source_snapshot_mutex_, std::try_to_lock);
         if (!lock.owns_lock()) return false;
-        if (coordinator->cached_provider_version_.size() != version_len ||
-            __builtin_memcmp(
-                coordinator->cached_provider_version_.data(), version, version_len) != 0)
-            return false;
+        if (epoch != coordinator->source_snapshot_epoch_.load(std::memory_order_acquire)) return false;
         const u32 len = static_cast<u32>(coordinator->cached_snapshot_source_.size());
         if (len == 0 || len >= capacity) return false;
         __builtin_memcpy(out, coordinator->cached_snapshot_source_.data(), len);
@@ -237,8 +238,10 @@ bool ProcessReloadCoordinator::init(ControlPlaneMutationPort* mutation,
 bool ProcessReloadCoordinator::request_signal(u64* request_id) {
     if (mutation_ == nullptr) return false;
     // Signals are processed by the control thread, so they may synchronously
-    // materialize the current immutable source version before admission.
-    if (default_loader_selected_ && !refresh_source_snapshot()) return false;
+    // materialize the current immutable source version before admission. A
+    // refresh failure still enters the mutation port so SIGHUP receives its
+    // required SnapshotUnavailable terminal record.
+    if (default_loader_selected_) (void)refresh_source_snapshot();
     return mutation_->request_reload(ReloadRequestSource::Signal, request_id);
 }
 

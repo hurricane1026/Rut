@@ -167,8 +167,8 @@ single symlink to an immutable version tree; deploy a new version by atomically
 replacing that symlink. Route-triggered reload stays disabled unless
 `--allow-route-reload` is set; that flag is an operator capability, not
 application authentication. Immediately after a symlink replacement, a route
-`reload()` can return `false` until the control loop has prepared that version's
-immutable snapshot; use SIGHUP or retry after that bounded refresh.
+`reload()` uses the latest immutable snapshot published by the control loop;
+use SIGHUP to synchronously prepare and admit a just-deployed version.
 
 `--opt` selects how hard the JIT optimizes each handler at startup:
 
@@ -210,7 +210,9 @@ curl -s -o /dev/null -w "%{http_code}\n" http://127.0.0.1:8080/   # 200
   advertisement. HTTP/2 supports static routes, JIT handlers (including timer
   waits), buffered JIT forwarding, and no-body proxy requests. Unbuffered JIT
   forwarding, non-timer event waits, and proxy requests with bodies return
-  `503`. HTTP/3 is not implemented.
+  `503`. One shared async slot is available per HTTP/2 connection, so a second
+  stream requiring a timer wait, buffered forward, or no-body proxy while that
+  slot is occupied also returns `503`. HTTP/3 is not implemented.
 - **WebSocket support is HTTP/1.1 upgrade only.** Passthrough and bounded
   terminate-mode frame handlers are available when built with
   `RUT_ENABLE_WEBSOCKET=ON`. Terminate mode accepts only a single unfragmented
