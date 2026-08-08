@@ -3666,6 +3666,17 @@ FrontendResult<void> lower_to_rir(const MirModule& mir, FrontendRirModule& out) 
         out.module.upstreams[i].hc_path = {hc_path_buf, src_hc_path.len};
         out.module.upstreams[i].hc_interval_ms = mir.upstreams[i].hc_interval_ms;
         out.module.upstreams[i].hc_expected_status = mir.upstreams[i].hc_expected_status;
+        out.module.upstreams[i].tls_enabled = mir.upstreams[i].tls_enabled;
+        const Str src_tls_server_name = mir.upstreams[i].tls_server_name;
+        char* tls_server_name_buf = nullptr;
+        if (src_tls_server_name.len > 0) {
+            tls_server_name_buf = out.module.arena->alloc_array<char>(src_tls_server_name.len);
+            if (!tls_server_name_buf)
+                return frontend_error(FrontendError::OutOfMemory, mir.upstreams[i].span);
+            for (u32 k = 0; k < src_tls_server_name.len; k++)
+                tls_server_name_buf[k] = src_tls_server_name.ptr[k];
+        }
+        out.module.upstreams[i].tls_server_name = {tls_server_name_buf, src_tls_server_name.len};
     }
     out.module.upstream_count = mir.upstreams.len;
 

@@ -2284,6 +2284,9 @@ inline bool populate_route_config(
                                                    up.hc_expected_status))
                     return false;
             }
+            if (up.tls_enabled &&
+                !cfg.set_upstream_tls(i, up.tls_server_name.ptr, up.tls_server_name.len))
+                return false;
         }
     } else {
         // Pre-bound mode: verify the caller added upstreams in DSL
@@ -2338,6 +2341,9 @@ inline bool populate_route_config(
                                                    up.hc_expected_status))
                     return false;
             }
+            if (up.tls_enabled &&
+                !cfg.set_upstream_tls(i, up.tls_server_name.ptr, up.tls_server_name.len))
+                return false;
         }
     }
 

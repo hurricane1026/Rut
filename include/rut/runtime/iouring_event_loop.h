@@ -70,6 +70,7 @@ public:
     // io_uring loop doesn't support that yet, so sweep_health_probes only re-arms
     // deadlines here and issues no connects (epoll-only this slice).
     static constexpr bool kSupportsHealthProbe = false;
+    static constexpr bool kSupportsUpstreamTls = false;
     static constexpr u32 kTlsInputSize = SlicePool::kSliceSize + 1024;
     // Owned ciphertext output buffer + watermark backpressure for proxy-over-TLS
     // streaming on io_uring. See docs/iouring-tls-output-buffer.md.
@@ -906,6 +907,11 @@ public:
         if (c.fd >= 0) {
             ::close(c.fd);
             c.fd = -1;
+        }
+        if (c.upstream_tls) {
+            destroy_tls_client_ssl(c.upstream_tls);
+            c.upstream_tls = nullptr;
+            c.upstream_tls_handshake_complete = false;
         }
         if (c.upstream_fd >= 0) {
             ::close(c.upstream_fd);

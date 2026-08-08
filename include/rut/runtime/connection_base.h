@@ -142,6 +142,8 @@ struct ConnectionBase {
     // desynced must never be reused (the next request would be parsed as leftover
     // body). Reset at the per-request boundary like the other reuse flags.
     bool upstream_request_incomplete;
+    SSL* upstream_tls;
+    bool upstream_tls_handshake_complete;
     // io_uring-only deferred idle-pool return: an upstream fd to park in the pool
     // once its cancelled multishot recv terminal drains (handing the fd out while a
     // recv is still draining on it would let two recvs race the same socket). -1 =
@@ -313,6 +315,10 @@ struct ConnectionBase {
     jit::YieldKind pending_yield_kind;
     jit::YieldKind resume_event_kind;
     i32 resume_event_result;
+    // Prefix of upstream_recv_buf already delivered to an explicit JIT recv.
+    // Subsequent wait(upstream.recv()) calls complete synchronously only for
+    // bytes appended after this offset.
+    u32 upstream_jit_recv_delivered = 0;
     void* handler_ctx = nullptr;
     UpstreamMarkReplayContext replay_context;
     jit::HandlerFn pending_handler_fn;
@@ -604,6 +610,8 @@ struct ConnectionBase {
         upstream_keep_alive = false;
         upstream_reused = false;
         upstream_request_incomplete = false;
+        upstream_tls = nullptr;
+        upstream_tls_handshake_complete = false;
         idle_return_fd = -1;
         idle_return_uid = 0;
         idle_return_bidx = 0;
@@ -660,6 +668,7 @@ struct ConnectionBase {
         pending_yield_kind = jit::YieldKind::Timer;
         resume_event_kind = jit::YieldKind::Timer;
         resume_event_result = 0;
+        upstream_jit_recv_delivered = 0;
         handler_ctx = nullptr;
         // Deliberately NOT reset here: handler_gen persists across
         // reset() so a stale YieldHeap entry whose target slot was

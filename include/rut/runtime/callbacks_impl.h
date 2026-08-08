@@ -26,6 +26,8 @@
 #include <arpa/inet.h>
 #include <errno.h>
 #include <openssl/rand.h>  // RAND_bytes — fresh outbound mask-key seed (terminate mode)
+#include <openssl/ssl.h>
+#include <sys/epoll.h>
 #include <sys/socket.h>
 #include <unistd.h>
 
@@ -1156,6 +1158,9 @@ void release_upstream_slot(Loop* loop, Connection& conn) {
 // backend before parking it; loops without that method just close (no reuse).
 template <typename Loop>
 bool proxy_upstream_reusable(Loop* loop, Connection& conn) {
+    // The idle pool owns bare fds, not SSL state. TLS sockets stay attached to
+    // their request and are closed at completion.
+    if (conn.upstream_tls != nullptr) return false;
     // The upstream must have signalled keep-alive + a self-framed body, and the
     // episode must not have been abandoned on timeout.
     if (!conn.upstream_keep_alive || conn.upstream_abandoned) return false;
@@ -1188,6 +1193,11 @@ bool proxy_upstream_reusable(Loop* loop, Connection& conn) {
 
 template <typename Loop>
 void release_upstream_conn(Loop* loop, Connection& conn) {
+    // The receive buffer belongs to this upstream episode. Keep-alive reuses the
+    // downstream Connection, so retaining it would replay bytes (and the JIT
+    // explicit-recv watermark) into the next request.
+    conn.upstream_recv_buf.reset();
+    conn.upstream_jit_recv_delivered = 0;
     if (conn.upstream_fd >= 0 && proxy_upstream_reusable(loop, conn)) {
         if constexpr (requires {
                           loop->return_idle_upstream(
@@ -1196,6 +1206,11 @@ void release_upstream_conn(Loop* loop, Connection& conn) {
             loop->return_idle_upstream(conn, conn.upstream_idx, conn.upstream_backend_idx);
             if (conn.upstream_fd < 0) return;  // parked (or closed) + cleared by the loop
         }
+    }
+    if (conn.upstream_tls) {
+        destroy_tls_client_ssl(conn.upstream_tls);
+        conn.upstream_tls = nullptr;
+        conn.upstream_tls_handshake_complete = false;
     }
     if (conn.upstream_fd >= 0) {
         ::close(conn.upstream_fd);
@@ -1281,6 +1296,11 @@ bool retry_reused_upstream(Loop* loop, Connection& conn) {
     if (conn.upstream_backend_idx >= target.addr_count) return false;
 
     if (conn.upstream_fd >= 0) {
+        if (conn.upstream_tls) {
+            destroy_tls_client_ssl(conn.upstream_tls);
+            conn.upstream_tls = nullptr;
+            conn.upstream_tls_handshake_complete = false;
+        }
         ::close(conn.upstream_fd);
         conn.upstream_fd = -1;
     }
@@ -1884,14 +1904,8 @@ void on_response_sent(void* lp, Connection& conn, IoEvent ev) {
     conn.http1_program_pin_config = nullptr;
     loop->epoch_leave();
 
-    if (conn.upstream_fd >= 0) {
-        ::close(conn.upstream_fd);
-        conn.upstream_fd = -1;
-    }
+    release_upstream_conn(loop, conn);
     conn.upstream_idx = 0;
-    loop->clear_upstream_fd(conn.id);
-    conn.upstream_recv_armed = false;
-    conn.upstream_send_armed = false;
 
     if (!conn.keep_alive) {
         loop->close_conn(conn);
@@ -2357,6 +2371,11 @@ void handle_jit_outcome(Loop* loop,
                     return;
                 }
                 if (conn.upstream_fd >= 0) {
+                    if (conn.upstream_tls) {
+                        destroy_tls_client_ssl(conn.upstream_tls);
+                        conn.upstream_tls = nullptr;
+                        conn.upstream_tls_handshake_complete = false;
+                    }
                     ::close(conn.upstream_fd);
                     conn.upstream_fd = -1;
                     conn.upstream_idx = 0;
@@ -2364,6 +2383,8 @@ void handle_jit_outcome(Loop* loop,
                     conn.upstream_recv_armed = false;
                     conn.upstream_send_armed = false;
                 }
+                conn.upstream_recv_buf.reset();
+                conn.upstream_jit_recv_delivered = 0;
                 conn.upstream_fd = kUpstreamFd;
                 conn.upstream_idx = static_cast<u16>(upstream_id);
                 conn.upstream_backend_idx = static_cast<u8>(kBackend);
@@ -2388,6 +2409,10 @@ void handle_jit_outcome(Loop* loop,
                 }
             } else if (outcome.yield_kind == jit::YieldKind::UpstreamRecv) {
                 if (upstream_target_matches()) {
+                    if (!loop->alloc_upstream_buf(conn)) {
+                        send_bad_gateway();
+                        return;
+                    }
                     if (!loop->submit_recv_upstream(conn)) {
                         send_bad_gateway();
                         return;
@@ -2593,12 +2618,10 @@ void handle_jit_outcome(Loop* loop,
             else
                 conn.upstream_name[sizeof(conn.upstream_name) - 1] = '\0';
             if (conn.upstream_fd >= 0) {
-                ::close(conn.upstream_fd);
-                conn.upstream_fd = -1;
+                // A Forward outcome replaces this upstream episode, never pools it.
+                conn.upstream_keep_alive = false;
+                release_upstream_conn(loop, conn);
                 conn.upstream_idx = 0;
-                loop->clear_upstream_fd(conn.id);
-                conn.upstream_recv_armed = false;
-                conn.upstream_send_armed = false;
             }
             conn.upstream_idx = static_cast<u16>(outcome.upstream_id);
             conn.upstream_attempts = 1;  // initial attempt; on_upstream_connected retries
@@ -3088,6 +3111,67 @@ void on_upstream_connected(void* lp, Connection& conn, IoEvent ev) {
         return;
     }
 
+    const RouteConfig* tls_config = conn.request_config;
+    const bool wants_tls = tls_config && conn.upstream_idx < tls_config->upstream_count &&
+                           tls_config->upstreams[conn.upstream_idx].tls_enabled;
+    if (wants_tls && !conn.upstream_tls_handshake_complete) {
+        bool supported = false;
+        if constexpr (requires {
+                          loop->tls_client;
+                          loop->arm_upstream_tls_handshake(conn, 0u);
+                      }) {
+            supported = loop->tls_client != nullptr;
+            if (supported && !conn.upstream_tls) {
+                const auto& target = tls_config->upstreams[conn.upstream_idx];
+                auto ssl = create_tls_client_ssl(
+                    loop->tls_client, conn.upstream_fd, target.tls_server_name);
+                if (ssl)
+                    conn.upstream_tls = ssl.value();
+                else
+                    supported = false;
+            }
+            if (supported) {
+                errno = 0;
+                const i32 rc = SSL_connect(conn.upstream_tls);
+                if (rc == 1) {
+                    conn.upstream_tls_handshake_complete = true;
+                } else {
+                    const i32 ssl_err = SSL_get_error(conn.upstream_tls, rc);
+                    if (ssl_err == SSL_ERROR_WANT_READ || ssl_err == SSL_ERROR_WANT_WRITE) {
+                        const u32 events = ssl_err == SSL_ERROR_WANT_WRITE ? EPOLLOUT : EPOLLIN;
+                        if (loop->arm_upstream_tls_handshake(conn, events)) return;
+                    }
+                    supported = false;
+                }
+            }
+        }
+        if (!supported) {
+            if (conn.upstream_tls) {
+                destroy_tls_client_ssl(conn.upstream_tls);
+                conn.upstream_tls = nullptr;
+            }
+            record_backend_result_for_config(loop,
+                                             conn.request_config,
+                                             conn.upstream_idx,
+                                             conn.upstream_backend_idx,
+                                             /*success=*/false,
+                                             monotonic_us());
+            if (try_connect_next_backend(loop, conn)) return;
+            // A failed final TLS handshake leaves no usable upstream episode.
+            // Do not leave its level-triggered connect registration alive while
+            // the downstream 502 is waiting to be sent.
+            conn.upstream_keep_alive = false;
+            release_upstream_conn(loop, conn);
+            format_static_response(
+                conn, 502, false, conn.req_method == static_cast<u8>(LogHttpMethod::Head));
+            conn.keep_alive = false;
+            conn.resp_status = kStatusBadGateway;
+            conn.transition_to_sending(&on_response_sent<Loop>);
+            client_send(loop, conn, conn.send_buf.data(), conn.send_buf.len());
+            return;
+        }
+    }
+
     // A fresh TCP connect succeeded — clear this backend's passive-health record.
     // Reused pooled sockets only prove health once they return a response.
     if (!conn.upstream_reused) {
@@ -3228,6 +3312,13 @@ void on_upstream_request_sent(void* lp, Connection& conn, IoEvent ev) {
             prepare_early_response_state(conn);
             conn.set_slots(nullptr, nullptr, &on_upstream_response<Loop>, nullptr);
             loop->submit_recv_upstream(conn);
+            return;
+        }
+        if (conn.upstream_tls) {
+            prepare_early_response_state(conn);
+            conn.set_slots(nullptr, nullptr, &on_upstream_response<Loop>, nullptr);
+            if (loop->submit_recv_upstream(conn)) return;
+            loop->close_conn(conn);
             return;
         }
         if (conn.upstream_fd >= 0) {
@@ -3393,6 +3484,11 @@ void h2_proxy_teardown_upstream(Loop* loop, Connection& conn) {
     // ever armed there.) close() doesn't cancel these SQEs — their CQEs still come.
     if (conn.upstream_recv_armed) conn.h2_proxy_recv_draining = true;
     if (conn.upstream_send_armed) conn.h2_proxy_synth_quarantined = true;
+    if (conn.upstream_tls) {
+        destroy_tls_client_ssl(conn.upstream_tls);
+        conn.upstream_tls = nullptr;
+        conn.upstream_tls_handshake_complete = false;
+    }
     if (conn.upstream_fd >= 0) {
         ::close(conn.upstream_fd);
         conn.upstream_fd = -1;
@@ -3894,6 +3990,10 @@ void h2_on_upstream_request_sent(void* lp, Connection& conn, IoEvent ev) {
             h2_on_upstream_response<Loop>(lp, conn, eof);
             return;
         }
+        if (conn.upstream_tls) {
+            conn.set_slots(nullptr, nullptr, &h2_on_upstream_response<Loop>, nullptr);
+            if (loop->submit_recv_upstream(conn)) return;
+        }
         h2_proxy_fail(loop, conn, 502);
         return;
     }
@@ -3953,6 +4053,50 @@ void h2_on_upstream_connected(void* lp, Connection& conn, IoEvent ev) {
                                          monotonic_us());
         h2_proxy_fail(loop, conn, 502);  // backend failover over h2: follow-up
         return;
+    }
+    const bool wants_tls = h2->async_cfg && conn.upstream_idx < h2->async_cfg->upstream_count &&
+                           h2->async_cfg->upstreams[conn.upstream_idx].tls_enabled;
+    if (wants_tls && !conn.upstream_tls_handshake_complete) {
+        bool supported = false;
+        if constexpr (requires {
+                          loop->tls_client;
+                          loop->arm_upstream_tls_handshake(conn, 0u);
+                      }) {
+            supported = loop->tls_client != nullptr;
+            if (supported && !conn.upstream_tls) {
+                const auto& target = h2->async_cfg->upstreams[conn.upstream_idx];
+                auto ssl = create_tls_client_ssl(
+                    loop->tls_client, conn.upstream_fd, target.tls_server_name);
+                if (ssl)
+                    conn.upstream_tls = ssl.value();
+                else
+                    supported = false;
+            }
+            if (supported) {
+                errno = 0;
+                const i32 rc = SSL_connect(conn.upstream_tls);
+                if (rc == 1) {
+                    conn.upstream_tls_handshake_complete = true;
+                } else {
+                    const i32 ssl_err = SSL_get_error(conn.upstream_tls, rc);
+                    if (ssl_err == SSL_ERROR_WANT_READ || ssl_err == SSL_ERROR_WANT_WRITE) {
+                        const u32 events = ssl_err == SSL_ERROR_WANT_WRITE ? EPOLLOUT : EPOLLIN;
+                        if (loop->arm_upstream_tls_handshake(conn, events)) return;
+                    }
+                    supported = false;
+                }
+            }
+        }
+        if (!supported) {
+            record_backend_result_for_config(loop,
+                                             h2->async_cfg,
+                                             conn.upstream_idx,
+                                             conn.upstream_backend_idx,
+                                             /*success=*/false,
+                                             monotonic_us());
+            h2_proxy_fail(loop, conn, 502);
+            return;
+        }
     }
     record_backend_result_for_config(loop,
                                      h2->async_cfg,
@@ -4529,6 +4673,13 @@ void on_request_body_sent(void* lp, Connection& conn, IoEvent ev) {
             prepare_early_response_state(conn);
             conn.set_slots(nullptr, nullptr, &on_upstream_response<Loop>, nullptr);
             loop->submit_recv_upstream(conn);
+            return;
+        }
+        if (conn.upstream_tls) {
+            prepare_early_response_state(conn);
+            conn.set_slots(nullptr, nullptr, &on_upstream_response<Loop>, nullptr);
+            if (loop->submit_recv_upstream(conn)) return;
+            loop->close_conn(conn);
             return;
         }
         if (conn.upstream_fd >= 0) {

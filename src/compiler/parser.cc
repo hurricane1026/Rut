@@ -2385,6 +2385,31 @@ struct Parser {
                             FrontendError::UnsupportedSyntax, span_from(*field.value()), detail);
                     }
                     item.upstream.hc_enabled = true;
+                } else if (field_name.eq({"tls", 3})) {
+                    if (item.upstream.tls_enabled)
+                        return frontend_error(
+                            FrontendError::UnexpectedToken, span_from(*field.value()), field_name);
+                    auto tls_lbrace = expect(TokenType::LBrace);
+                    if (!tls_lbrace) return core::make_unexpected(tls_lbrace.error());
+                    auto tls_field = expect(TokenType::Ident);
+                    if (!tls_field) return core::make_unexpected(tls_field.error());
+                    if (!tls_field.value()->text.eq({"server_name", 11}))
+                        return frontend_error(FrontendError::UnsupportedSyntax,
+                                              span_from(*tls_field.value()),
+                                              tls_field.value()->text);
+                    auto tls_colon = expect(TokenType::Colon);
+                    if (!tls_colon) return core::make_unexpected(tls_colon.error());
+                    auto tls_name = expect(TokenType::StringLit);
+                    if (!tls_name) return core::make_unexpected(tls_name.error());
+                    if (tls_name.value()->text.len == 0 || tls_name.value()->text.len > 253)
+                        return frontend_error(FrontendError::UnsupportedSyntax,
+                                              span_from(*tls_name.value()),
+                                              tls_name.value()->text);
+                    item.upstream.tls_server_name_lit = tls_name.value()->text;
+                    (void)take(TokenType::Comma);
+                    auto tls_rbrace = expect(TokenType::RBrace);
+                    if (!tls_rbrace) return core::make_unexpected(tls_rbrace.error());
+                    item.upstream.tls_enabled = true;
                 } else {
                     return frontend_error(
                         FrontendError::UnexpectedToken, span_from(*field.value()), field_name);
@@ -2405,7 +2430,8 @@ struct Parser {
                 if (seen_host || seen_port)
                     return frontend_error(FrontendError::UnsupportedSyntax,
                                           item.upstream.addr_span);
-            } else if (!seen_host && !seen_port && item.upstream.hc_enabled) {
+            } else if (!seen_host && !seen_port &&
+                       (item.upstream.hc_enabled || item.upstream.tls_enabled)) {
                 // Health-check-only, name-only upstream
                 // (`upstream api { health_check: {...} }`). The host
                 // application binds the address at runtime (pre-bound slot);
