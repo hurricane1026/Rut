@@ -3,8 +3,9 @@
 Status: accepted contract. The shared mutation port, handler ABI capability,
 JIT helper boundary, production event-loop injection, deterministic harness
 fixture, shard-pinned `upstream.mark` source lowering, generation installation
-acknowledgements, and exact program pins are implemented. The process reload
-coordinator remains staged in TODO.md.
+acknowledgements, exact program pins, and the process reload coordinator are
+implemented. `upstream.mark` remains unavailable in production compiler output
+until capture artifacts persist its ordered replay events.
 
 Rut exposes control-plane reads (`stats()` and `metrics()`) as bounded values
 latched at handler entry. Mutations are different: they change process-wide
@@ -65,8 +66,8 @@ statement-only special cases, so a route or timer can fail closed.
 
 ## Authority
 
-Route-triggered reload is disabled by default and requires an explicit process
-capability (the production CLI spelling will be `--allow-route-reload`). This
+Route-triggered reload is disabled by default and requires the explicit process
+capability `--allow-route-reload`. This
 prevents a source typo or an accidentally exposed route from gaining process
 mutation authority merely because the binary supports hot reload.
 
@@ -1210,12 +1211,12 @@ artifacts, state effects, arbitration decisions, and terminal records.
 
 1. [x] Add the control-plane mutation port and deterministic admission/override
    model to the handler ABI and harness.
-2. Implement `Server` identities, `Upstream.servers`, and the shared manual
+2. [x] Implement `Server` identities, `Upstream.servers`, and the shared manual
    health override consulted by both network backends.
 3. [x] Lower and execute timer-only, shard-pinned `upstream.mark`.
 4. [x] Add generation acknowledgements and exact HTTP/1 request, suspended
    HTTP/2 stream, and terminate-mode WebSocket session program pins.
-5. Implement the reload coordinator, compatibility validation, SIGHUP, and
+5. [x] Implement the reload coordinator, compatibility validation, SIGHUP, and
    process-harness coverage.
-6. Lower route-only `reload()` after the same coordinator is the sole activation
-   path.
+6. [x] Lower route-only `reload()` after the same coordinator is the sole
+   activation path.

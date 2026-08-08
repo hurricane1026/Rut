@@ -481,7 +481,7 @@ time:    time.nowMicros() -> i64 (monotonic µs; latched per invocation — all
          — now()/time(s)/Duration arithmetic still ⏳
 misc:    env(k) json(v) log.info/warn/error(msg, key: val, ...)
 admin:   stats() metrics() ✅ bounded JSON snapshots; reload() -> bool
-         (accepted, not activated; route-only, capability-gated) ⏳ runtime;
+         (route-only, capability-gated by --allow-route-reload) ✅ runtime;
          upstream.mark(server, healthy: bool) -> bool ⏳ compiler/runtime plumbing only:
          timer-only, explicit shard, statically declared backends; production
          activation is gated pending replay lowering; upstream_status()
