@@ -166,7 +166,9 @@ single-flight coordinator used by `reload()`. The program path must be a
 single symlink to an immutable version tree; deploy a new version by atomically
 replacing that symlink. Route-triggered reload stays disabled unless
 `--allow-route-reload` is set; that flag is an operator capability, not
-application authentication.
+application authentication. Immediately after a symlink replacement, a route
+`reload()` can return `false` until the control loop has prepared that version's
+immutable snapshot; use SIGHUP or retry after that bounded refresh.
 
 `--opt` selects how hard the JIT optimizes each handler at startup:
 

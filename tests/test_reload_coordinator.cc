@@ -399,7 +399,7 @@ TEST(reload_coordinator, default_source_snapshot_is_captured_by_the_winning_requ
     fs::remove_all(root);
 }
 
-TEST(reload_coordinator, default_admission_refreshes_a_replaced_version_symlink) {
+TEST(reload_coordinator, route_admission_rejects_a_stale_snapshot_until_control_refresh) {
     namespace fs = std::filesystem;
     const fs::path root = "/tmp/rut_reload_coordinator_admission_refresh";
     fs::remove_all(root);
@@ -426,7 +426,9 @@ TEST(reload_coordinator, default_admission_refreshes_a_replaced_version_symlink)
 
         fs::remove(root / "current.rut");
         fs::create_symlink(root / "v2" / "app.rut", root / "current.rut");
-        REQUIRE(coordinator.request_signal());
+        CHECK_FALSE(mutation.request_reload(ReloadRequestSource::Route));
+        CHECK_EQ(coordinator.poll(), ReloadCoordinatorPoll::Idle);
+        REQUIRE(mutation.request_reload(ReloadRequestSource::Route));
         CHECK_EQ(coordinator.poll(), ReloadCoordinatorPoll::Published);
         const auto* next = coordinator.active_program();
         REQUIRE(next != nullptr);
