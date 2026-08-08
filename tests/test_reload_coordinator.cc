@@ -399,6 +399,50 @@ TEST(reload_coordinator, default_source_snapshot_is_captured_by_the_winning_requ
     fs::remove_all(root);
 }
 
+TEST(reload_coordinator, default_admission_refreshes_a_replaced_version_symlink) {
+    namespace fs = std::filesystem;
+    const fs::path root = "/tmp/rut_reload_coordinator_admission_refresh";
+    fs::remove_all(root);
+    fs::create_directories(root / "v1");
+    fs::create_directories(root / "v2");
+    std::ofstream(root / "v1" / "app.rut") << "route GET \"/\" { return 201 }\n";
+    std::ofstream(root / "v2" / "app.rut") << "route GET \"/\" { return 202 }\n";
+    fs::create_symlink(root / "v1" / "app.rut", root / "current.rut");
+    const std::string source_path = (root / "current.rut").string();
+
+    ControlPlaneMutationPort mutation;
+    mutation.reset(1, true);
+    LoadedProgram active;
+    LoadedProgram spare;
+    active.config.config_generation = 1;
+    active.config.program_pins = &active.pins;
+    ShardControlBlock control{};
+    control.acknowledged_generation.store(1, std::memory_order_relaxed);
+    ReloadShardEndpoint shard{&control};
+    {
+        ProcessReloadCoordinator coordinator;
+        REQUIRE(coordinator.init(
+            &mutation, source_path.c_str(), jit::OptLevel::O0, &active, &spare, &shard, 1));
+
+        fs::remove(root / "current.rut");
+        fs::create_symlink(root / "v2" / "app.rut", root / "current.rut");
+        REQUIRE(coordinator.request_signal());
+        CHECK_EQ(coordinator.poll(), ReloadCoordinatorPoll::Published);
+        const auto* next = coordinator.active_program();
+        REQUIRE(next != nullptr);
+        REQUIRE_EQ(next->config.route_count, 1u);
+        CHECK_EQ(next->config.routes[0].status_code, 202u);
+
+        const RouteConfig* pending = control.pending_config.exchange(nullptr, std::memory_order_acq_rel);
+        REQUIRE(pending != nullptr);
+        control.acknowledged_generation.store(pending->config_generation, std::memory_order_release);
+        CHECK_EQ(coordinator.poll(), ReloadCoordinatorPoll::Activated);
+    }
+    active.destroy();
+    spare.destroy();
+    fs::remove_all(root);
+}
+
 TEST(reload_coordinator, regular_source_path_does_not_fail_initialization) {
     namespace fs = std::filesystem;
     const fs::path root = "/tmp/rut_reload_coordinator_regular_source";

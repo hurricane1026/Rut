@@ -206,11 +206,14 @@ curl -s -o /dev/null -w "%{http_code}\n" http://127.0.0.1:8080/   # 200
 - **HTTP/2 has distinct cleartext and TLS admission paths.** Cleartext h2c
   prior knowledge is accepted automatically; `--h2` only enables TLS ALPN
   advertisement. HTTP/2 supports static routes, JIT handlers (including timer
-  waits), and no-body proxy requests. JIT forwarding/event waits and proxy
-  requests with bodies return `503`. HTTP/3 is not implemented.
+  waits), buffered JIT forwarding, and no-body proxy requests. Unbuffered JIT
+  forwarding, non-timer event waits, and proxy requests with bodies return
+  `503`. HTTP/3 is not implemented.
 - **WebSocket support is HTTP/1.1 upgrade only.** Passthrough and bounded
   terminate-mode frame handlers are available when built with
-  `RUT_ENABLE_WEBSOCKET=ON`; HTTP/2 extended CONNECT is not implemented.
+  `RUT_ENABLE_WEBSOCKET=ON`. Terminate mode accepts only a single unfragmented
+  frame of roughly 16 KiB or less; larger or fragmented messages fail closed.
+  HTTP/2 extended CONNECT is not implemented.
 - **Server TLS only.** ALPN is supported for the opt-in HTTP/2 path; SNI,
   mTLS, and kTLS are not implemented.
 - **DNS is resolved at configuration load time.** TTL-based refresh, SRV

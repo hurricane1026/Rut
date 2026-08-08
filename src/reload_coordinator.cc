@@ -160,9 +160,10 @@ bool ProcessReloadCoordinator::capture_source_version(void* context,
     auto* coordinator = static_cast<ProcessReloadCoordinator*>(context);
     if (coordinator == nullptr) return false;
     if (coordinator->default_loader_selected_) {
-        // Snapshot materialization runs on the control thread. Admission only
-        // copies the already prepared immutable path under a short lock. Do not
-        // block a request worker behind snapshot refresh or cleanup.
+        // The winning admission defines the source-version boundary. Refresh
+        // before copying so a symlink replacement immediately before SIGHUP or
+        // reload() cannot publish an older prepared snapshot.
+        if (!coordinator->refresh_source_snapshot()) return false;
         std::unique_lock lock(coordinator->source_snapshot_mutex_, std::try_to_lock);
         if (!lock.owns_lock()) return false;
         const u32 len = static_cast<u32>(coordinator->cached_snapshot_source_.size());
