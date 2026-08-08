@@ -136,6 +136,7 @@ static i32 run_shards(u16 port,
                       u32 drain_secs,
                       u32 pool_prealloc,
                       TlsServerContext* tls_server,
+                      TlsClientContext* tls_client,
                       const char* access_log_path,
                       bool access_log_compress,
                       i32 access_log_level,
@@ -221,6 +222,9 @@ static i32 run_shards(u16 port,
         if constexpr (requires { shards[i].loop->tls_server; }) {
             shards[i].loop->tls_server = tls_server;
         }
+        if constexpr (requires { shards[i].loop->tls_client; }) {
+            shards[i].loop->tls_client = tls_client;
+        }
         // Point every shard at the one shared limiter for @rateLimit(scope: global).
         if constexpr (requires { shards[i].loop->global_rl; }) {
             shards[i].loop->global_rl = &global_rl;
@@ -248,18 +252,20 @@ static i32 run_shards(u16 port,
         reload_config->active != nullptr && reload_config->spare != nullptr) {
         ReloadShardEndpoint endpoints[kMaxShards];
         for (u32 i = 0; i < shard_count; i++) endpoints[i].control = &shards[i].control;
-        reload_enabled = reload_coordinator.init(&control_plane_mutation,
-                                                 reload_config->source_path,
-                                                 reload_config->opt,
-                                                 reload_config->active,
-                                                 reload_config->spare,
-                                                 endpoints,
-                                                 shard_count,
-                                                 nullptr,
-                                                 nullptr,
-                                                 &shutdown_signal_pending,
-                                                 nullptr,
-                                                 EventLoopType::kSupportsHealthProbe);
+        reload_enabled =
+            reload_coordinator.init(&control_plane_mutation,
+                                    reload_config->source_path,
+                                    reload_config->opt,
+                                    reload_config->active,
+                                    reload_config->spare,
+                                    endpoints,
+                                    shard_count,
+                                    nullptr,
+                                    nullptr,
+                                    &shutdown_signal_pending,
+                                    nullptr,
+                                    EventLoopType::kSupportsHealthProbe,
+                                    EventLoopType::kSupportsUpstreamTls && tls_client != nullptr);
         if (!reload_enabled) {
             write_str("Failed to initialize reload coordinator\n");
             for (u32 i = 0; i < shard_count; i++) shards[i].shutdown();
@@ -489,6 +495,7 @@ int main(int argc, char** argv) {
     const char* config_path = nullptr;
     const char* access_log_path = nullptr;
     bool access_log_compress = false;
+    const char* upstream_tls_ca_file = nullptr;
     // Advertise HTTP/2 over ALPN. Opt-in for now: h2 serves static/return-status
     // routes; JIT-handler and proxy routes answer 503 over h2 (follow-up).
     bool offer_h2 = false;
@@ -624,7 +631,7 @@ int main(int argc, char** argv) {
         }
     }
 
-    // Environment variable override: RUE_ACCESS_LOG_COMPRESS=1
+    // Environment variable overrides; avoid pulling in stdlib solely for getenv.
     // getenv without stdlib — scan environ directly.
     {
         extern char** environ;
@@ -632,6 +639,14 @@ int main(int argc, char** argv) {
         for (char** e = environ; *e; e++) {
             if (str_eq(*e, kEnv)) {
                 access_log_compress = true;
+                break;
+            }
+        }
+        static constexpr char kUpstreamTlsCaPrefix[] = "RUT_UPSTREAM_TLS_CA_FILE=";
+        for (char** e = environ; *e; e++) {
+            if (strncmp(*e, kUpstreamTlsCaPrefix, sizeof(kUpstreamTlsCaPrefix) - 1) == 0 &&
+                (*e)[sizeof(kUpstreamTlsCaPrefix) - 1] != '\0') {
+                upstream_tls_ca_file = *e + sizeof(kUpstreamTlsCaPrefix) - 1;
                 break;
             }
         }
@@ -745,12 +760,21 @@ int main(int argc, char** argv) {
 
     const bool requires_active_health_probes =
         route_config != nullptr && route_config->requires_active_health_probes();
+    const bool has_upstream_tls = route_config && route_config->has_tls_upstreams();
+    if (has_upstream_tls && backend_preference == BackendPreference::IoUring) {
+        write_str("--backend io_uring cannot run configured upstream TLS; use --backend epoll\n");
+        destroy_tls_server_context(tls_server);
+        return 1;
+    }
+    const BackendPreference effective_backend_preference =
+        has_upstream_tls && backend_preference == BackendPreference::Auto ? BackendPreference::Epoll
+                                                                          : backend_preference;
     const bool should_detect_io_uring =
-        backend_preference == BackendPreference::IoUring ||
-        (backend_preference == BackendPreference::Auto && !requires_active_health_probes);
+        effective_backend_preference == BackendPreference::IoUring ||
+        (effective_backend_preference == BackendPreference::Auto && !requires_active_health_probes);
     const bool io_uring_available = should_detect_io_uring && detect_io_uring();
     const BackendSelection backend = select_server_backend(
-        backend_preference, io_uring_available, requires_active_health_probes);
+        effective_backend_preference, io_uring_available, requires_active_health_probes);
     if (!backend.ok()) {
         if (backend.error == BackendSelectionError::IoUringUnavailable)
             write_str("--backend io_uring requested, but io_uring is unavailable\n");
@@ -763,8 +787,19 @@ int main(int argc, char** argv) {
     }
     if (backend.health_probe_fallback)
         write_str("Backend: active health checks require epoll; skipping available io_uring\n");
+    if (has_upstream_tls && backend_preference == BackendPreference::Auto)
+        write_str("Backend: upstream TLS requires epoll; skipping available io_uring\n");
 
     i32 rc = 0;
+    TlsClientContext* tls_client = nullptr;
+    auto tls_client_result = create_tls_client_context(upstream_tls_ca_file);
+    if (tls_client_result) {
+        tls_client = tls_client_result.value();
+    } else if (has_upstream_tls) {
+        write_error("Failed to initialize upstream TLS trust store", tls_client_result.error());
+        destroy_tls_server_context(tls_server);
+        return 1;
+    }
     if (backend.backend == ServerBackend::IoUring) {
         write_str(tls_server ? "Backend: io_uring (TLS)\n" : "Backend: io_uring\n");
         rc = run_shards<IoUringEventLoop>(port,
@@ -773,6 +808,7 @@ int main(int argc, char** argv) {
                                           drain_secs,
                                           pool_prealloc,
                                           tls_server,
+                                          tls_client,
                                           access_log_path,
                                           access_log_compress,
                                           access_log_level,
@@ -788,6 +824,7 @@ int main(int argc, char** argv) {
                                             drain_secs,
                                             pool_prealloc,
                                             tls_server,
+                                            tls_client,
                                             access_log_path,
                                             access_log_compress,
                                             access_log_level,
@@ -797,13 +834,14 @@ int main(int argc, char** argv) {
                                             &server_reload);
         }
     } else {
-        write_str(tls_server ? "Backend: epoll (TLS)\n" : "Backend: epoll\n");
+        write_str((tls_server || has_upstream_tls) ? "Backend: epoll (TLS)\n" : "Backend: epoll\n");
         rc = run_shards<EpollEventLoop>(port,
                                         shard_count,
                                         pin_cpus,
                                         drain_secs,
                                         pool_prealloc,
                                         tls_server,
+                                        tls_client,
                                         access_log_path,
                                         access_log_compress,
                                         access_log_level,
@@ -812,6 +850,7 @@ int main(int argc, char** argv) {
                                         allow_route_reload,
                                         &server_reload);
     }
+    destroy_tls_client_context(tls_client);
     destroy_tls_server_context(tls_server);
 #ifdef RUT_ENABLE_JIT
     // Shards have joined inside run_shards; safe to release JIT code,

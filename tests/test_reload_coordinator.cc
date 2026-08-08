@@ -212,8 +212,31 @@ TEST(reload_coordinator, rejects_health_check_reload_when_backend_cannot_probe) 
     candidate.upstreams[0].hc_interval_ms = 1000;
     candidate.upstreams[0].hc_expected_status = 200;
 
-    CHECK_FALSE(ProcessReloadCoordinator::compatible(active, candidate, 1, false));
+    CHECK_FALSE(ProcessReloadCoordinator::compatible(active, candidate, 1, false, true));
+    CHECK(ProcessReloadCoordinator::compatible(active, candidate, 1, true, true));
+}
+
+TEST(reload_coordinator, rejects_tls_reload_when_backend_cannot_handshake) {
+    RouteConfig active;
+    RouteConfig candidate;
+    auto id = candidate.add_upstream("api", 0x7f000001u, 443);
+    REQUIRE(id.has_value());
+    REQUIRE(candidate.set_upstream_tls(id.value(), "api.internal", 12));
+
+    CHECK_FALSE(ProcessReloadCoordinator::compatible(active, candidate, 1, true, false));
     CHECK(ProcessReloadCoordinator::compatible(active, candidate, 1, true));
+}
+
+TEST(reload_coordinator, rejects_tls_mode_transition_for_existing_upstream) {
+    RouteConfig active{};
+    auto active_id = active.add_upstream("api", 0x7f000001, 443);
+    REQUIRE(active_id.has_value());
+    RouteConfig candidate{};
+    auto candidate_id = candidate.add_upstream("api", 0x7f000001, 443);
+    REQUIRE(candidate_id.has_value());
+    REQUIRE(candidate.set_upstream_tls(candidate_id.value(), "api.internal", 12));
+
+    CHECK_FALSE(ProcessReloadCoordinator::compatible(active, candidate, 1, true));
 }
 
 TEST(reload_coordinator, publication_waits_for_all_shards_and_retired_program_pins) {

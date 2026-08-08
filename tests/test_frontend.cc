@@ -6675,6 +6675,37 @@ TEST(frontend, parse_upstream_ipv6_literals) {
     }
 }
 
+TEST(frontend, parse_upstream_tls_server_name) {
+    const char* src =
+        "upstream api { host: \"127.0.0.1\", port: 8443, "
+        "tls: { server_name: \"api.example.com\" } }\n"
+        "route GET \"/u\" { return forward(api) }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    CHECK(ast->items[0].upstream.tls_enabled);
+    CHECK(ast->items[0].upstream.tls_server_name_lit.eq({"api.example.com", 15}));
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    REQUIRE_EQ(hir->upstreams.len, 1u);
+    CHECK(hir->upstreams[0].tls_enabled);
+    CHECK(hir->upstreams[0].tls_server_name.eq({"api.example.com", 15}));
+}
+
+TEST(frontend, parse_upstream_tls_rejects_missing_or_unknown_server_name) {
+    const char* sources[] = {
+        "upstream api { host: \"127.0.0.1\", port: 8443, tls: {} }\n",
+        "upstream api { host: \"127.0.0.1\", port: 8443, tls: { name: \"x\" } }\n",
+        "upstream api { host: \"127.0.0.1\", port: 8443, tls: { server_name: \"\" } }\n",
+    };
+    for (const char* src : sources) {
+        auto lexed = lex(lit(src));
+        REQUIRE(lexed);
+        CHECK(!parse_file_heap(lexed.value()));
+    }
+}
+
 TEST(frontend, parse_upstream_preserves_zero_padded_ipv4_octets) {
     const char* src = "upstream api at \"001.002.003.004:8443\"\nroute GET \"/u\" { return 200 }\n";
     auto lexed = lex(lit(src));

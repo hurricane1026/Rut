@@ -521,6 +521,8 @@ struct MirUpstream {
     Str hc_path{};
     u32 hc_interval_ms = 0;
     u16 hc_expected_status = 200;
+    bool tls_enabled = false;
+    Str tls_server_name{};
 };
 
 struct MirCacheInstance {

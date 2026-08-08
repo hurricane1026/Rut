@@ -23,6 +23,10 @@ struct TlsServerContext {
     bool offer_h2;
 };
 
+struct TlsClientContext {
+    SSL_CTX* ssl_ctx;
+};
+
 // offer_h2: advertise HTTP/2 over ALPN. Leave false until the HTTP/2 data
 // path is wired, otherwise an h2 client would be handed to the HTTP/1 parser.
 core::Expected<TlsServerContext*, Error> create_tls_server_context(const char* cert_path,
@@ -41,5 +45,14 @@ AlpnProtocol alpn_pick(bool offer_h2, const u8* client_protos, u32 client_len);
 // Read the ALPN protocol negotiated on a completed handshake. None when the
 // handshake selected no ALPN protocol (plain HTTP/1.1).
 AlpnProtocol tls_negotiated_protocol(SSL* ssl);
+
+// Verified upstream TLS. A null ca_file uses the platform trust store; tests
+// and private deployments may provide an explicit PEM bundle.
+core::Expected<TlsClientContext*, Error> create_tls_client_context(const char* ca_file = nullptr);
+void destroy_tls_client_context(TlsClientContext* ctx);
+core::Expected<SSL*, Error> create_tls_client_ssl(TlsClientContext* ctx,
+                                                  i32 fd,
+                                                  const char* server_name);
+void destroy_tls_client_ssl(SSL* ssl);
 
 }  // namespace rut

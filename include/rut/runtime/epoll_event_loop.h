@@ -25,6 +25,7 @@
 #include <atomic>
 
 #include <netinet/in.h>
+#include <openssl/ssl.h>
 #include <sys/socket.h>
 #include <sys/timerfd.h>
 #include <time.h>
@@ -202,6 +203,7 @@ public:
     // health-check probes from EventLoopCRTP::sweep_health_probes. io_uring sets
     // this false — its sweep only re-arms deadlines (probing is a follow-up).
     static constexpr bool kSupportsHealthProbe = true;
+    static constexpr bool kSupportsUpstreamTls = true;
     SlicePool pool;
     // Per-shard HTTP/2 engine pool — lazily handed out when a connection
     // upgrades to h2. Bounded; over-cap upgrades fall back to closing the conn.
@@ -219,6 +221,7 @@ public:
     // EventLoopCRTP base (fire_due_timers + timer_deadline_ns/timer_fire_count),
     // so both backends drive them.
     TlsServerContext* tls_server = nullptr;
+    TlsClientContext* tls_client = nullptr;
 
     AccessLogRing* access_log = nullptr;
 
@@ -610,11 +613,17 @@ public:
     }
 
     bool submit_send_upstream_impl(Connection& c, const u8* buf, u32 len) {
+        if (c.upstream_tls) return backend.add_send_upstream_tls(c, buf, len);
         return backend.add_send_upstream(c.upstream_fd, c.id, buf, len);
     }
 
     bool submit_recv_upstream_impl(Connection& c) {
+        if (c.upstream_tls) return backend.add_recv_upstream_tls(c);
         return backend.add_recv_upstream(c.upstream_fd, c.id);
+    }
+
+    bool arm_upstream_tls_handshake(Connection& c, u32 events) {
+        return backend.arm_upstream_tls_handshake(c, events);
     }
 
     void pause_upstream_recv_impl(Connection& c) {
@@ -688,6 +697,11 @@ public:
             c.tls = nullptr;
             c.tls_active = false;
             c.tls_handshake_complete = false;
+        }
+        if (c.upstream_tls) {
+            destroy_tls_client_ssl(c.upstream_tls);
+            c.upstream_tls = nullptr;
+            c.upstream_tls_handshake_complete = false;
         }
         if (c.upstream_fd >= 0) {
             ::close(c.upstream_fd);
@@ -991,9 +1005,16 @@ public:
                         this->dispatch_event(conn, ev);
                     } else if (conn.pending_handler_fn) {
                         if (yield_kind_matches_event(conn.pending_yield_kind, ev.type)) {
+                            i32 resume_result = ev.result;
+                            if (ev.type == IoEventType::UpstreamConnect &&
+                                !complete_yield_upstream_tls_connect(conn, resume_result)) {
+                                break;
+                            }
+                            if (ev.type == IoEventType::UpstreamRecv && ev.result > 0)
+                                conn.upstream_jit_recv_delivered = conn.upstream_recv_buf.len();
                             disarm_yield_timer(conn);
                             conn.resume_event_kind = yield_kind_from_event(ev.type);
-                            conn.resume_event_result = ev.result;
+                            conn.resume_event_result = resume_result;
                             resume_jit_handler<EpollEventLoop>(this, conn);
                             break;
                         }
@@ -1017,6 +1038,62 @@ public:
 
 private:
     using Self = EpollEventLoop;
+
+    // An explicit handler `wait(upstream(...).connect())` has no proxy callback
+    // installed to drive TLS. Keep its yield parked until the TCP connection has
+    // also completed its configured TLS handshake.
+    bool complete_yield_upstream_tls_connect(Connection& conn, i32& result) {
+        const RouteConfig* config = conn.request_config;
+        const bool wants_tls = config && conn.upstream_idx < config->upstream_count &&
+                               config->upstreams[conn.upstream_idx].tls_enabled;
+        if (!wants_tls || conn.upstream_tls_handshake_complete || result < 0) return true;
+
+        const auto fail_tls_connect = [&]() {
+            if (conn.upstream_tls) {
+                destroy_tls_client_ssl(conn.upstream_tls);
+                conn.upstream_tls = nullptr;
+            }
+            conn.upstream_tls_handshake_complete = false;
+            if (conn.upstream_fd >= 0) {
+                backend.cancel(conn.upstream_fd, conn.id);
+                ::close(conn.upstream_fd);
+                conn.upstream_fd = -1;
+            }
+            clear_upstream_fd(conn.id);
+            clear_upstream_send_state(conn.id);
+            result = -ECONNRESET;
+            return true;
+        };
+
+        if (!tls_client) {
+            return fail_tls_connect();
+        }
+        if (!conn.upstream_tls) {
+            const auto& target = config->upstreams[conn.upstream_idx];
+            auto ssl = create_tls_client_ssl(tls_client, conn.upstream_fd, target.tls_server_name);
+            if (!ssl) return fail_tls_connect();
+            conn.upstream_tls = ssl.value();
+        }
+
+        errno = 0;
+        const i32 rc = SSL_connect(conn.upstream_tls);
+        if (rc == 1) {
+            conn.upstream_tls_handshake_complete = true;
+            // The handshake registration is level-triggered. Remove it before
+            // resuming the handler: it may choose a timer wait or a downstream
+            // response rather than immediately submitting upstream I/O.
+            backend.cancel(conn.upstream_fd, conn.id);
+            return true;
+        }
+
+        const i32 ssl_err = SSL_get_error(conn.upstream_tls, rc);
+        if (ssl_err == SSL_ERROR_WANT_READ || ssl_err == SSL_ERROR_WANT_WRITE) {
+            const u32 events = ssl_err == SSL_ERROR_WANT_WRITE ? EPOLLOUT : EPOLLIN;
+            if (arm_upstream_tls_handshake(conn, events)) return false;
+        }
+
+        return fail_tls_connect();
+    }
 
     void on_accept(const IoEvent& ev) {
         if (ev.result < 0) return;

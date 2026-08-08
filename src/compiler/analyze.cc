@@ -19877,6 +19877,8 @@ static FrontendResult<HirModule*> analyze_file_internal(
         up.hc_path = item.upstream.hc_path_lit;
         up.hc_interval_ms = item.upstream.hc_interval_ms;
         up.hc_expected_status = item.upstream.hc_expected_status;
+        up.tls_enabled = item.upstream.tls_enabled;
+        up.tls_server_name = item.upstream.tls_server_name_lit;
         if (!mod.upstreams.push(up))
             return frontend_error(FrontendError::TooManyItems, item.upstream.span);
     }

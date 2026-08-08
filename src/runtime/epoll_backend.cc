@@ -34,6 +34,9 @@ i32 default_ssl_write(SSL* ssl, const void* buf, i32 len) {
 i32 default_ssl_get_error(SSL* ssl, i32 rc) {
     return SSL_get_error(ssl, rc);
 }
+i32 default_ssl_pending(SSL* ssl) {
+    return SSL_pending(ssl);
+}
 AlpnProtocol default_alpn_negotiated(SSL* ssl) {
     return tls_negotiated_protocol(ssl);
 }
@@ -42,6 +45,7 @@ EpollTlsHooks default_tls_hooks = {default_ssl_accept,
                                    default_ssl_read,
                                    default_ssl_write,
                                    default_ssl_get_error,
+                                   default_ssl_pending,
                                    default_alpn_negotiated};
 
 const EpollTlsHooks* get_tls_hooks() {
@@ -53,9 +57,9 @@ const EpollTlsHooks* get_tls_hooks() {
 
 }  // namespace
 
-static i32 map_tls_error(SSL* ssl, i32 rc) {
+static i32 map_tls_error(SSL* ssl, i32 rc, bool eof_is_error = false) {
     i32 err = get_tls_hooks()->ssl_get_error(ssl, rc);
-    if (err == SSL_ERROR_ZERO_RETURN) return 0;
+    if (err == SSL_ERROR_ZERO_RETURN) return eof_is_error ? -ECONNRESET : 0;
     if (err == SSL_ERROR_SYSCALL) {
         if (errno != 0) return -errno;
         return -ECONNRESET;
@@ -81,11 +85,8 @@ static void queue_pending_completion(IoEvent* pending_completions,
                                      u32 conn_id,
                                      IoEventType type,
                                      i32 result,
-                                     bool force_slot = false) {
-    if (pending_count >= 64) {
-        if (!force_slot) return;
-        pending_count = 63;
-    }
+                                     bool /*force_slot*/ = false) {
+    if (pending_count >= EpollBackend::kPendingCap) return;
 
     pending_completions[pending_count].conn_id = conn_id;
     pending_completions[pending_count].type = type;
@@ -312,7 +313,7 @@ void EpollBackend::pause_upstream_recv(u32 conn_id, bool preserve_send_interest)
     if (preserve_send_interest) {
         const auto& ss = upstream_send_state[conn_id];
         if (ss.remaining > 0 && ss.fd == fd) {
-            events = EPOLLOUT;
+            events = ss.tls ? tls_send_interest_for_state(ss) : EPOLLOUT;
         }
     }
     set_fd_interest(epoll_fd, fd, conn_id, type, events);
@@ -322,7 +323,7 @@ bool EpollBackend::add_send_upstream(i32 fd, u32 conn_id, const u8* buf, u32 len
     ssize_t nw = send(fd, buf, len, MSG_NOSIGNAL);
 
     if (nw == static_cast<ssize_t>(len)) {
-        if (pending_count < 64) {
+        if (pending_count < kPendingCap) {
             pending_completions[pending_count].conn_id = conn_id;
             pending_completions[pending_count].type = IoEventType::UpstreamSend;
             pending_completions[pending_count].result = static_cast<i32>(nw);
@@ -336,7 +337,7 @@ bool EpollBackend::add_send_upstream(i32 fd, u32 conn_id, const u8* buf, u32 len
     }
 
     if (nw < 0 && errno != EAGAIN && errno != EWOULDBLOCK) {
-        if (pending_count < 64) {
+        if (pending_count < kPendingCap) {
             pending_completions[pending_count].conn_id = conn_id;
             pending_completions[pending_count].type = IoEventType::UpstreamSend;
             pending_completions[pending_count].result = -errno;
@@ -413,7 +414,7 @@ bool EpollBackend::add_send(i32 fd, u32 conn_id, const u8* buf, u32 len) {
     ssize_t nw = send(fd, buf, len, MSG_NOSIGNAL);
 
     if (nw == static_cast<ssize_t>(len)) {
-        if (pending_count < 64) {
+        if (pending_count < kPendingCap) {
             pending_completions[pending_count].conn_id = conn_id;
             pending_completions[pending_count].type = IoEventType::Send;
             pending_completions[pending_count].result = static_cast<i32>(nw);
@@ -427,7 +428,7 @@ bool EpollBackend::add_send(i32 fd, u32 conn_id, const u8* buf, u32 len) {
     }
 
     if (nw < 0 && errno != EAGAIN && errno != EWOULDBLOCK) {
-        if (pending_count < 64) {
+        if (pending_count < kPendingCap) {
             pending_completions[pending_count].conn_id = conn_id;
             pending_completions[pending_count].type = IoEventType::Send;
             pending_completions[pending_count].result = -errno;
@@ -457,15 +458,8 @@ bool EpollBackend::add_send(i32 fd, u32 conn_id, const u8* buf, u32 len) {
         if (conn_id < kMaxFdMap) {
             send_state[conn_id] = {nullptr, -1, 0, 0, IoEventType::Send, false, 0};
         }
-        if (pending_count >= 64) pending_count = 63;
-        pending_completions[pending_count].conn_id = conn_id;
-        pending_completions[pending_count].type = IoEventType::Send;
-        pending_completions[pending_count].result = -err;
-        pending_completions[pending_count].buf_id = 0;
-        pending_completions[pending_count].has_buf = 0;
-        pending_completions[pending_count].more = 0;
-        pending_completions[pending_count].aux = 0;
-        pending_count++;
+        queue_pending_completion(
+            pending_completions, pending_count, conn_id, IoEventType::Send, -err);
     }
     return true;
 }
@@ -508,10 +502,10 @@ bool EpollBackend::add_send_tls(Connection& c, const u8* buf, u32 len) {
             return true;
         }
 
-        if (pending_count < 64) {
+        if (pending_count < kPendingCap) {
             pending_completions[pending_count].conn_id = c.id;
             pending_completions[pending_count].type = IoEventType::Send;
-            pending_completions[pending_count].result = map_tls_error(ssl, nw);
+            pending_completions[pending_count].result = map_tls_error(ssl, nw, true);
             pending_completions[pending_count].buf_id = 0;
             pending_completions[pending_count].has_buf = 0;
             pending_completions[pending_count].more = 0;
@@ -521,7 +515,7 @@ bool EpollBackend::add_send_tls(Connection& c, const u8* buf, u32 len) {
         return true;
     }
 
-    if (pending_count < 64) {
+    if (pending_count < kPendingCap) {
         pending_completions[pending_count].conn_id = c.id;
         pending_completions[pending_count].type = IoEventType::Send;
         pending_completions[pending_count].result = static_cast<i32>(len);
@@ -534,6 +528,131 @@ bool EpollBackend::add_send_tls(Connection& c, const u8* buf, u32 len) {
     return true;
 }
 
+bool EpollBackend::add_send_upstream_tls(Connection& c, const u8* buf, u32 len) {
+    if (!c.upstream_tls) return add_send_upstream(c.upstream_fd, c.id, buf, len);
+    SSL* ssl = c.upstream_tls;
+    const EpollTlsHooks* tls_hooks = get_tls_hooks();
+    u32 sent = 0;
+    while (sent < len) {
+        errno = 0;
+        const i32 nw = tls_hooks->ssl_write(ssl, buf + sent, static_cast<i32>(len - sent));
+        if (nw > 0) {
+            sent += static_cast<u32>(nw);
+            continue;
+        }
+        const i32 ssl_err = tls_hooks->ssl_get_error(ssl, nw);
+        if (ssl_err == SSL_ERROR_WANT_READ || ssl_err == SSL_ERROR_WANT_WRITE) {
+            if (c.id >= kMaxFdMap) {
+                queue_pending_completion(pending_completions,
+                                         pending_count,
+                                         c.id,
+                                         IoEventType::UpstreamSend,
+                                         -EINVAL,
+                                         true);
+                return true;
+            }
+            upstream_send_state[c.id] = {buf,
+                                         c.upstream_fd,
+                                         sent,
+                                         len - sent,
+                                         IoEventType::UpstreamSend,
+                                         true,
+                                         tls_interest_for_error(ssl_err)};
+            const i32 rc = set_fd_interest(epoll_fd,
+                                           c.upstream_fd,
+                                           c.id,
+                                           IoEventType::UpstreamRecv,
+                                           tls_send_interest_for_error(ssl_err));
+            if (rc < 0) {
+                upstream_send_state[c.id] = {
+                    nullptr, -1, 0, 0, IoEventType::UpstreamSend, false, 0};
+                queue_pending_completion(
+                    pending_completions, pending_count, c.id, IoEventType::UpstreamSend, rc, true);
+            }
+            return true;
+        }
+        queue_pending_completion(pending_completions,
+                                 pending_count,
+                                 c.id,
+                                 IoEventType::UpstreamSend,
+                                 map_tls_error(ssl, nw, true));
+        return true;
+    }
+    queue_pending_completion(
+        pending_completions, pending_count, c.id, IoEventType::UpstreamSend, static_cast<i32>(len));
+    return true;
+}
+
+bool EpollBackend::add_recv_upstream_tls(Connection& c) {
+    if (!c.upstream_tls) return add_recv_upstream(c.upstream_fd, c.id);
+    if (c.id < kMaxFdMap) upstream_fd_map[c.id] = c.upstream_fd;
+    // A prior TLS read can have decrypted a response while a different explicit
+    // handler yield was pending. Deliver those bytes to the later recv request
+    // instead of waiting for another socket readiness edge.
+    if (c.upstream_jit_recv_delivered > c.upstream_recv_buf.len())
+        c.upstream_jit_recv_delivered = 0;
+    // A resumed handler has finished with the entire previous result before it
+    // submits another recv. Reclaim that prefix so an incremental TLS stream
+    // cannot exhaust the fixed upstream buffer with already-delivered bytes.
+    if (c.upstream_jit_recv_delivered != 0 &&
+        c.upstream_jit_recv_delivered == c.upstream_recv_buf.len()) {
+        c.upstream_recv_buf.reset();
+        c.upstream_jit_recv_delivered = 0;
+    }
+    if (c.pending_handler_fn != nullptr && c.pending_yield_kind == jit::YieldKind::UpstreamRecv &&
+        c.upstream_recv_buf.len() > c.upstream_jit_recv_delivered) {
+        queue_pending_completion(
+            pending_completions,
+            pending_count,
+            c.id,
+            IoEventType::UpstreamRecv,
+            static_cast<i32>(c.upstream_recv_buf.len() - c.upstream_jit_recv_delivered),
+            true);
+        return true;
+    }
+    const EpollTlsHooks* tls_hooks = get_tls_hooks();
+    if (tls_hooks->ssl_pending != nullptr && tls_hooks->ssl_pending(c.upstream_tls) > 0) {
+        const u32 avail = c.upstream_recv_buf.write_avail();
+        i32 result = -ENOBUFS;
+        if (avail > 0) {
+            errno = 0;
+            const i32 nr = tls_hooks->ssl_read(
+                c.upstream_tls, c.upstream_recv_buf.write_ptr(), static_cast<i32>(avail));
+            if (nr > 0) {
+                c.upstream_recv_buf.commit(static_cast<u32>(nr));
+                result = nr;
+            } else {
+                result = map_tls_error(c.upstream_tls, nr);
+            }
+        }
+        u32 events = EPOLLIN;
+        if (c.id < kMaxFdMap) {
+            const auto& ss = upstream_send_state[c.id];
+            if (ss.remaining > 0 && ss.fd == c.upstream_fd && ss.tls_wait_events != EPOLLIN)
+                events |= EPOLLOUT;
+        }
+        if (set_fd_interest(epoll_fd, c.upstream_fd, c.id, IoEventType::UpstreamRecv, events) < 0)
+            return false;
+        queue_pending_completion(
+            pending_completions, pending_count, c.id, IoEventType::UpstreamRecv, result, true);
+        return true;
+    }
+    u32 events = EPOLLIN;
+    if (c.id < kMaxFdMap) {
+        const auto& ss = upstream_send_state[c.id];
+        if (ss.remaining > 0 && ss.fd == c.upstream_fd && ss.tls_wait_events != EPOLLIN)
+            events |= EPOLLOUT;
+    }
+    return set_fd_interest(epoll_fd, c.upstream_fd, c.id, IoEventType::UpstreamRecv, events) >= 0;
+}
+
+bool EpollBackend::arm_upstream_tls_handshake(Connection& c, u32 events) {
+    if (!c.upstream_tls || c.upstream_fd < 0) return false;
+    if (c.id < kMaxFdMap) upstream_fd_map[c.id] = c.upstream_fd;
+    return set_fd_interest(epoll_fd, c.upstream_fd, c.id, IoEventType::UpstreamConnect, events) >=
+           0;
+}
+
 bool EpollBackend::add_connect(i32 fd, u32 conn_id, const void* addr, u32 addr_len) {
     if (conn_id < kMaxFdMap) upstream_fd_map[conn_id] = fd;
     i32 rc = connect(fd, static_cast<const struct sockaddr*>(addr), addr_len);
@@ -542,7 +661,7 @@ bool EpollBackend::add_connect(i32 fd, u32 conn_id, const void* addr, u32 addr_l
             if (conn_id < kMaxFdMap) upstream_fd_map[conn_id] = -1;
             return false;
         }
-        if (pending_count < 64) {
+        if (pending_count < kPendingCap) {
             pending_completions[pending_count].conn_id = conn_id;
             pending_completions[pending_count].type = IoEventType::UpstreamConnect;
             pending_completions[pending_count].result = 0;
@@ -563,7 +682,7 @@ bool EpollBackend::add_connect(i32 fd, u32 conn_id, const void* addr, u32 addr_l
         return true;
     }
 
-    if (pending_count < 64) {
+    if (pending_count < kPendingCap) {
         pending_completions[pending_count].conn_id = conn_id;
         pending_completions[pending_count].type = IoEventType::UpstreamConnect;
         pending_completions[pending_count].result = -errno;
@@ -664,11 +783,13 @@ u32 EpollBackend::wait(IoEvent* events, u32 max_events, Connection* conns, u32 m
                 events[out].aux = 0;
                 out++;
             }
-        } else if (type == IoEventType::UpstreamConnect && has_write) {
+        } else if (type == IoEventType::UpstreamConnect && (has_read || has_write)) {
             i32 err = 0;
             socklen_t errlen = sizeof(err);
             i32 cfd = (conn_id < kMaxFdMap) ? upstream_fd_map[conn_id] : -1;
-            if (cfd >= 0) getsockopt(cfd, SOL_SOCKET, SO_ERROR, &err, &errlen);
+            const bool tls_handshake = conn_id < max_conns && conns[conn_id].upstream_tls &&
+                                       !conns[conn_id].upstream_tls_handshake_complete;
+            if (!tls_handshake && cfd >= 0) getsockopt(cfd, SOL_SOCKET, SO_ERROR, &err, &errlen);
             events[out].conn_id = conn_id;
             events[out].type = IoEventType::UpstreamConnect;
             events[out].result = err ? -err : 0;
@@ -678,9 +799,6 @@ u32 EpollBackend::wait(IoEvent* events, u32 max_events, Connection* conns, u32 m
             events[out].aux = 0;
             out++;
             continue;
-        } else if (type == IoEventType::Recv && conn_id < max_conns && conns[conn_id].tls_active &&
-                   (has_read || has_write)) {
-            goto handle_epollin;
         } else if (type == IoEventType::Send && conn_id < kMaxFdMap && send_state[conn_id].tls &&
                    send_state[conn_id].remaining > 0) {
             auto& ss = send_state[conn_id];
@@ -688,6 +806,28 @@ u32 EpollBackend::wait(IoEvent* events, u32 max_events, Connection* conns, u32 m
                 goto handle_epollout;
             }
             if (has_read) goto handle_epollin;
+        } else if (type == IoEventType::UpstreamRecv && conn_id < kMaxFdMap &&
+                   upstream_send_state[conn_id].tls && upstream_send_state[conn_id].remaining > 0) {
+            auto& ss = upstream_send_state[conn_id];
+            if (has_write || (has_read && ss.tls_wait_events == EPOLLIN)) {
+                goto handle_epollout;
+            }
+            if (has_read) goto handle_epollin;
+        } else if (type == IoEventType::UpstreamRecv && conn_id < max_conns &&
+                   conns[conn_id].upstream_tls && conns[conn_id].pending_handler_fn != nullptr &&
+                   conns[conn_id].pending_yield_kind != jit::YieldKind::UpstreamRecv &&
+                   (ep_events[i].events & (EPOLLHUP | EPOLLERR | EPOLLRDHUP)) != 0) {
+            // A mismatched explicit yield will not consume this terminal read
+            // completion. HUP/ERR are level-triggered even with no EPOLLIN
+            // interest, so remove the fd until the handler explicitly resumes
+            // upstream I/O or tears the episode down.
+            i32 fd = upstream_fd_map[conn_id];
+            if (fd >= 0) epoll_ctl(epoll_fd, EPOLL_CTL_DEL, fd, nullptr);
+            continue;
+        } else if (conn_id < max_conns && (has_read || has_write) &&
+                   ((type == IoEventType::Recv && conns[conn_id].tls_active) ||
+                    (type == IoEventType::UpstreamRecv && conns[conn_id].upstream_tls))) {
+            goto handle_epollin;
         } else if (has_read) {
         handle_epollin:
             IoEventType recv_type = type;
@@ -704,12 +844,13 @@ u32 EpollBackend::wait(IoEvent* events, u32 max_events, Connection* conns, u32 m
                 (recv_type == IoEventType::UpstreamRecv) ? conn.upstream_recv_buf : conn.recv_buf;
             i32 result = -EINVAL;
 
-            if (conn.tls_active && recv_type == IoEventType::Recv) {
-                SSL* ssl = conn.tls;
+            if ((conn.tls_active && recv_type == IoEventType::Recv) ||
+                (conn.upstream_tls && recv_type == IoEventType::UpstreamRecv)) {
+                SSL* ssl = recv_type == IoEventType::UpstreamRecv ? conn.upstream_tls : conn.tls;
                 if (!ssl) {
                     result = -EINVAL;
                 } else {
-                    if (!conn.tls_handshake_complete) {
+                    if (recv_type == IoEventType::Recv && !conn.tls_handshake_complete) {
                         errno = 0;
                         i32 rc = get_tls_hooks()->ssl_accept(ssl);
                         if (rc == 1) {
@@ -742,6 +883,24 @@ u32 EpollBackend::wait(IoEvent* events, u32 max_events, Connection* conns, u32 m
 
                     u32 avail = buf.write_avail();
                     if (avail == 0) {
+                        // An explicit handler may be waiting on a different
+                        // event (for example a timer) while upstream TLS data
+                        // accumulates. Once its buffer is full, leaving EPOLLIN
+                        // armed produces an endless stream of ignored -ENOBUFS
+                        // completions. The later explicit recv delivers the
+                        // buffered bytes; an episode teardown resets the buffer.
+                        if (type == IoEventType::UpstreamRecv &&
+                            conn.pending_handler_fn != nullptr &&
+                            conn.pending_yield_kind != jit::YieldKind::UpstreamRecv) {
+                            const bool terminal =
+                                (ep_events[i].events & (EPOLLHUP | EPOLLERR | EPOLLRDHUP)) != 0;
+                            if (terminal) {
+                                epoll_ctl(epoll_fd, EPOLL_CTL_DEL, fd, nullptr);
+                                continue;
+                            }
+                            set_fd_interest(epoll_fd, fd, conn_id, type, 0);
+                            continue;
+                        }
                         result = -ENOBUFS;
                     } else {
                         errno = 0;
@@ -750,27 +909,35 @@ u32 EpollBackend::wait(IoEvent* events, u32 max_events, Connection* conns, u32 m
                         if (nr > 0) {
                             buf.commit(static_cast<u32>(nr));
                             result = nr;
-                            if (type == IoEventType::Send && conn_id < kMaxFdMap &&
-                                send_state[conn_id].remaining > 0) {
+                            const auto* pending_send = conn_id < kMaxFdMap
+                                                           ? (type == IoEventType::UpstreamRecv
+                                                                  ? &upstream_send_state[conn_id]
+                                                                  : &send_state[conn_id])
+                                                           : nullptr;
+                            if (pending_send != nullptr && pending_send->remaining > 0) {
                                 set_fd_interest(epoll_fd,
                                                 fd,
                                                 conn_id,
                                                 type,
-                                                tls_send_interest_for_state(send_state[conn_id]));
+                                                tls_send_interest_for_state(*pending_send));
                             } else {
                                 set_fd_interest(epoll_fd, fd, conn_id, type, EPOLLIN);
                             }
                         } else {
                             i32 ssl_err = get_tls_hooks()->ssl_get_error(ssl, nr);
                             if (ssl_err == SSL_ERROR_WANT_READ || ssl_err == SSL_ERROR_WANT_WRITE) {
-                                if (type == IoEventType::Send && conn_id < kMaxFdMap &&
-                                    send_state[conn_id].remaining > 0) {
-                                    set_fd_interest(
-                                        epoll_fd,
-                                        fd,
-                                        conn_id,
-                                        type,
-                                        tls_send_interest_for_state(send_state[conn_id]));
+                                const auto* pending_send =
+                                    conn_id < kMaxFdMap ? (type == IoEventType::UpstreamRecv
+                                                               ? &upstream_send_state[conn_id]
+                                                               : &send_state[conn_id])
+                                                        : nullptr;
+                                if (pending_send != nullptr && pending_send->remaining > 0) {
+                                    set_fd_interest(epoll_fd,
+                                                    fd,
+                                                    conn_id,
+                                                    type,
+                                                    tls_send_interest_for_state(*pending_send) |
+                                                        tls_interest_for_error(ssl_err));
                                 } else {
                                     set_fd_interest(epoll_fd,
                                                     fd,
@@ -837,7 +1004,7 @@ u32 EpollBackend::wait(IoEvent* events, u32 max_events, Connection* conns, u32 m
 
             if (ss.tls) {
                 auto& conn = conns[conn_id];
-                SSL* ssl = conn.tls;
+                SSL* ssl = ss.type == IoEventType::UpstreamSend ? conn.upstream_tls : conn.tls;
                 if (!ssl) {
                     result = -EINVAL;
                 } else {
@@ -853,15 +1020,18 @@ u32 EpollBackend::wait(IoEvent* events, u32 max_events, Connection* conns, u32 m
                         i32 ssl_err = get_tls_hooks()->ssl_get_error(ssl, nw);
                         if (ssl_err == SSL_ERROR_WANT_READ || ssl_err == SSL_ERROR_WANT_WRITE) {
                             ss.tls_wait_events = tls_interest_for_error(ssl_err);
-                            set_fd_interest(epoll_fd,
-                                            ss.fd,
-                                            conn_id,
-                                            ss.type,
-                                            tls_send_interest_for_error(ssl_err));
+                            const bool upstream_recv_paused =
+                                ss.type == IoEventType::UpstreamSend && conn_id < max_conns &&
+                                conns[conn_id].ws_client_send_pending;
+                            const u32 interest =
+                                upstream_recv_paused && ssl_err == SSL_ERROR_WANT_WRITE
+                                    ? EPOLLOUT
+                                    : tls_send_interest_for_error(ssl_err);
+                            set_fd_interest(epoll_fd, ss.fd, conn_id, ss.type, interest);
                             pending_retry = true;
                             break;
                         }
-                        result = map_tls_error(ssl, nw);
+                        result = map_tls_error(ssl, nw, true);
                         ss.remaining = 0;
                         break;
                     }

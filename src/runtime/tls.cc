@@ -145,4 +145,76 @@ void destroy_tls_server_ssl(SSL* ssl) {
     if (ssl) SSL_free(ssl);
 }
 
+core::Expected<TlsClientContext*, Error> create_tls_client_context(const char* ca_file) {
+    TRY_VOID(tls_init_once());
+    SSL_CTX* ssl_ctx = SSL_CTX_new(TLS_client_method());
+    if (!ssl_ctx) return core::make_unexpected(Error::make(EIO, Error::Source::Socket));
+    SSL_CTX_set_min_proto_version(ssl_ctx, TLS1_2_VERSION);
+    SSL_CTX_set_mode(ssl_ctx, SSL_MODE_RELEASE_BUFFERS);
+    SSL_CTX_set_verify(ssl_ctx, SSL_VERIFY_PEER, nullptr);
+    i32 loaded = 0;
+    if (ca_file) {
+        loaded = SSL_CTX_load_verify_locations(ssl_ctx, ca_file, nullptr);
+    } else {
+        // BoringSSL's default-path helper does not populate a platform trust
+        // store. Load the standard Linux bundle explicitly instead.
+        static constexpr const char* kSystemCaBundles[] = {
+            "/etc/ssl/certs/ca-certificates.crt",
+            "/etc/pki/tls/certs/ca-bundle.crt",
+            "/etc/ssl/ca-bundle.pem",
+        };
+        for (const char* path : kSystemCaBundles) {
+            if (SSL_CTX_load_verify_locations(ssl_ctx, path, nullptr) == 1) {
+                loaded = 1;
+                break;
+            }
+        }
+    }
+    if (loaded != 1) {
+        SSL_CTX_free(ssl_ctx);
+        return core::make_unexpected(Error::make(EINVAL, Error::Source::Socket));
+    }
+    auto* ctx = static_cast<TlsClientContext*>(malloc(sizeof(TlsClientContext)));
+    if (!ctx) {
+        SSL_CTX_free(ssl_ctx);
+        return core::make_unexpected(Error::make(ENOMEM, Error::Source::Socket));
+    }
+    ctx->ssl_ctx = ssl_ctx;
+    return ctx;
+}
+
+void destroy_tls_client_context(TlsClientContext* ctx) {
+    if (!ctx) return;
+    if (ctx->ssl_ctx) SSL_CTX_free(ctx->ssl_ctx);
+    free(ctx);
+}
+
+core::Expected<SSL*, Error> create_tls_client_ssl(TlsClientContext* ctx,
+                                                  i32 fd,
+                                                  const char* server_name) {
+    if (!ctx || !ctx->ssl_ctx || fd < 0 || !server_name || server_name[0] == '\0')
+        return core::make_unexpected(Error::make(EINVAL, Error::Source::Socket));
+    SSL* ssl = SSL_new(ctx->ssl_ctx);
+    if (!ssl) return core::make_unexpected(Error::make(EIO, Error::Source::Socket));
+    BIO* bio = BIO_new_socket(fd, BIO_NOCLOSE);
+    if (!bio) {
+        SSL_free(ssl);
+        return core::make_unexpected(Error::make(EIO, Error::Source::Socket));
+    }
+    SSL_set_bio(ssl, bio, bio);
+    if (SSL_set_tlsext_host_name(ssl, server_name) != 1 || SSL_set1_host(ssl, server_name) != 1) {
+        SSL_free(ssl);
+        return core::make_unexpected(Error::make(EINVAL, Error::Source::Socket));
+    }
+    SSL_set_connect_state(ssl);
+    SSL_set_mode(ssl,
+                 SSL_MODE_ENABLE_PARTIAL_WRITE | SSL_MODE_ACCEPT_MOVING_WRITE_BUFFER |
+                     SSL_MODE_RELEASE_BUFFERS);
+    return ssl;
+}
+
+void destroy_tls_client_ssl(SSL* ssl) {
+    if (ssl) SSL_free(ssl);
+}
+
 }  // namespace rut

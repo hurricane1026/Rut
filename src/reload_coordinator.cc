@@ -190,7 +190,8 @@ bool ProcessReloadCoordinator::init(ControlPlaneMutationPort* mutation,
                                     void* loader_context,
                                     ReloadCancellationCheck cancellation_check,
                                     void* cancellation_context,
-                                    bool supports_active_health_probes) {
+                                    bool supports_active_health_probes,
+                                    bool supports_upstream_tls) {
     if (mutation == nullptr || source_path == nullptr || active == nullptr || spare == nullptr ||
         active == spare || shards == nullptr || shard_count == 0 || shard_count > kMaxShards ||
         active->config.config_generation == 0 ||
@@ -215,6 +216,7 @@ bool ProcessReloadCoordinator::init(ControlPlaneMutationPort* mutation,
     cancellation_check_ = cancellation_check;
     cancellation_context_ = cancellation_context;
     supports_active_health_probes_ = supports_active_health_probes;
+    supports_upstream_tls_ = supports_upstream_tls;
     clear_source_snapshots();
     if (default_loader_selected_) (void)refresh_source_snapshot();
     mutation_->set_reload_source_version_capture(&capture_source_version, this);
@@ -241,10 +243,12 @@ bool ProcessReloadCoordinator::finish_activation_for_shutdown() {
 bool ProcessReloadCoordinator::compatible(const RouteConfig& active,
                                           RouteConfig& candidate,
                                           u32 shard_count,
-                                          bool supports_active_health_probes) {
+                                          bool supports_active_health_probes,
+                                          bool supports_upstream_tls) {
     if (shard_count == 0 || candidate.first_out_of_range_timer_shard(shard_count) >= 0)
         return false;
     if (!supports_active_health_probes && candidate.requires_active_health_probes()) return false;
+    if (!supports_upstream_tls && candidate.has_tls_upstreams()) return false;
     if (!active.same_firewall_policy(candidate)) return false;
     if (active.cache_instance_count != candidate.cache_instance_count) return false;
     for (u32 i = 0; i < active.cache_instance_count; i++) {
@@ -260,12 +264,19 @@ bool ProcessReloadCoordinator::compatible(const RouteConfig& active,
     // invalid endpoint for a full new interval. Reject until warming exists.
     for (u32 old_upstream = 0; old_upstream < active.upstream_count; old_upstream++) {
         const auto& old_target = active.upstreams[old_upstream];
+        // Idle upstream sockets are keyed by declaration index and backend index.
+        // A rename does not make a TLS-mode change safe: it could otherwise borrow
+        // a plaintext socket for a newly configured TLS target (or vice versa).
+        if (old_upstream < candidate.upstream_count &&
+            old_target.tls_enabled != candidate.upstreams[old_upstream].tls_enabled)
+            return false;
         for (u32 new_upstream = 0; new_upstream < candidate.upstream_count; new_upstream++) {
             const auto& new_target = candidate.upstreams[new_upstream];
             if (old_target.name_identity != 0 &&
                 old_target.name_identity == new_target.name_identity &&
                 (!same_health_policy(old_target, new_target) ||
-                 !same_upstream_endpoints(old_target, new_target)))
+                 !same_upstream_endpoints(old_target, new_target) ||
+                 old_target.tls_enabled != new_target.tls_enabled))
                 return false;
         }
     }
@@ -423,8 +434,11 @@ ReloadCoordinatorPoll ProcessReloadCoordinator::poll() {
         mutation_->stop();
         return ReloadCoordinatorPoll::Stopped;
     }
-    if (!compatible(
-            active_->config, spare_->config, shard_count_, supports_active_health_probes_) ||
+    if (!compatible(active_->config,
+                    spare_->config,
+                    shard_count_,
+                    supports_active_health_probes_,
+                    supports_upstream_tls_) ||
         old_generation_ >= ControlPlaneMutationPort::kMaxGeneration) {
         spare_->destroy();
         (void)mutation_->complete_reload(

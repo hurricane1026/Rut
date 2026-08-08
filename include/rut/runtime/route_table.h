@@ -138,6 +138,7 @@ struct UpstreamEndpoint {
 struct UpstreamTarget {
     static constexpr u32 kMaxUpstreamNameLen = 32;
     static constexpr u32 kMaxBackends = 8;  // endpoints per upstream (LB pool)
+    static constexpr u32 kMaxTlsServerNameLen = 253;
 
     UpstreamEndpoint addrs[kMaxBackends];
     u32 addr_count;
@@ -153,6 +154,9 @@ struct UpstreamTarget {
     // Enforced cluster-wide via the shared UpstreamConcurrency gauge; over the
     // cap the runtime answers 503 before connecting.
     u32 max_inflight = 0;
+    bool tls_enabled = false;
+    char tls_server_name[kMaxTlsServerNameLen + 1]{};
+    u32 tls_server_name_len = 0;
 
     // Active health-check config from `health_check: { ... }` (data only — no
     // probing wired up yet). hc_enabled gates the rest; hc_path is the probe
@@ -250,6 +254,12 @@ struct RouteEntry {
 struct RouteConfig {
     static constexpr u32 kMaxRoutes = 128;
     static constexpr u32 kMaxUpstreams = 64;
+
+    [[nodiscard]] bool has_tls_upstreams() const {
+        for (u32 i = 0; i < upstream_count; i++)
+            if (upstreams[i].tls_enabled) return true;
+        return false;
+    }
     // Response-body table. Populated at compile/config time; referenced
     // by JIT handlers via a 1-based index packed into
     // HandlerResult.upstream_id for ReturnStatus (0 = no custom body,
@@ -825,8 +835,45 @@ struct RouteConfig {
         return true;
     }
 
-    // Attach active health-check config to an upstream (by id). `path` (length
-    // `path_len`, not required to be
+    bool set_upstream_tls(u32 uid, const char* server_name, u32 server_name_len) {
+        if (uid >= upstream_count || server_name == nullptr || server_name_len == 0 ||
+            server_name_len > UpstreamTarget::kMaxTlsServerNameLen)
+            return false;
+        UpstreamTarget& up = upstreams[uid];
+        // Active probes currently speak plaintext HTTP. Reject the combination
+        // at config construction instead of probing a TLS port with cleartext.
+        if (up.hc_enabled) return false;
+        for (u32 i = 0; i < server_name_len; i++) {
+            const unsigned char ch = static_cast<unsigned char>(server_name[i]);
+            if (ch <= 0x20 || ch == 0x7f || ch == '\0') return false;
+        }
+        IpAddress literal{};
+        if (parse_ip_address({server_name, server_name_len}, &literal)) return false;
+        u32 label_len = 0;
+        for (u32 i = 0; i < server_name_len; i++) {
+            const unsigned char ch = static_cast<unsigned char>(server_name[i]);
+            if (ch == '.') {
+                if (label_len == 0 || server_name[i - 1] == '-') return false;
+                label_len = 0;
+                continue;
+            }
+            const bool alnum =
+                (ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z') || (ch >= '0' && ch <= '9');
+            if ((!alnum && ch != '-') || (label_len == 0 && ch == '-')) return false;
+            if (++label_len > 63) return false;
+        }
+        if (label_len == 0 || server_name[server_name_len - 1] == '-') return false;
+        for (u32 i = 0; i < server_name_len; i++) {
+            up.tls_server_name[i] = server_name[i];
+        }
+        up.tls_server_name[server_name_len] = '\0';
+        up.tls_server_name_len = server_name_len;
+        up.tls_enabled = true;
+        return true;
+    }
+
+    // Attach active health-check config to an upstream (by id). Data only — no
+    // probing is performed yet. `path` (length `path_len`, not required to be
     // NUL-terminated) is the probe path; `interval_ms` the probe period;
     // `status` the status code that marks a backend healthy. Returns false on a
     // bad upstream id, an over-long path, a non-origin-form path (empty, missing
@@ -836,6 +883,7 @@ struct RouteConfig {
         u32 uid, const char* path, u32 path_len, u32 interval_ms, u16 status) {
         if (uid >= upstream_count) return false;
         UpstreamTarget& up = upstreams[uid];
+        if (up.tls_enabled) return false;
         if (path == nullptr) return false;
         if (path_len >= sizeof(up.hc_path)) return false;
         if (interval_ms == 0) return false;

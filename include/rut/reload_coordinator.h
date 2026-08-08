@@ -50,7 +50,8 @@ public:
                             void* loader_context = nullptr,
                             ReloadCancellationCheck cancellation_check = nullptr,
                             void* cancellation_context = nullptr,
-                            bool supports_active_health_probes = true);
+                            bool supports_active_health_probes = true,
+                            bool supports_upstream_tls = true);
 
     [[nodiscard]] bool request_signal(u64* request_id = nullptr);
     ReloadCoordinatorPoll poll();
@@ -67,7 +68,8 @@ public:
     static bool compatible(const RouteConfig& active,
                            RouteConfig& candidate,
                            u32 shard_count,
-                           bool supports_active_health_probes = true);
+                           bool supports_active_health_probes = true,
+                           bool supports_upstream_tls = true);
 
 private:
     static bool default_loader(void* context,
@@ -94,6 +96,7 @@ private:
     void* cancellation_context_ = nullptr;
     bool default_loader_selected_ = false;
     bool supports_active_health_probes_ = true;
+    bool supports_upstream_tls_ = true;
     std::string cached_provider_version_;
     std::string cached_snapshot_source_;
     std::string source_snapshot_root_;

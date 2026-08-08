@@ -101,6 +101,11 @@ Notes:
   are resolved to A/AAAA addresses before the configuration is published;
   failure rejects the load, and resolved addresses count toward the eight
   backend limit.
+  To connect to an HTTPS origin, add
+  `tls: { server_name: "api.example.com" }` to the dictionary form. Rut sends
+  that name as SNI and requires the origin certificate to match it and chain to
+  the system trust store. TLS upstreams use the epoll backend and are not placed
+  in the bare-fd keep-alive pool.
   A name-only upstream makes the program fail to load (fail-closed).
 - Requests that match no route return `404`. Running without a `.rut` program
   retains the route-less `200` response used for basic listener checks.

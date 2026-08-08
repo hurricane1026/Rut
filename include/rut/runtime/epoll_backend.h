@@ -42,11 +42,11 @@ struct EpollBackend {
     i32 downstream_fd_map[kMaxFdMap];  // downstream (client) fd per conn_id
     i32 upstream_fd_map[kMaxFdMap];    // upstream (origin) fd per conn_id
 
-    // Pending synthetic completion events (from immediate sends). FIXED ring:
-    // queue_pending_completion drops past kPendingCap, so producers (incl. the
-    // health-probe sweep) must bound how many synchronous completions they emit
-    // per dispatch — see EventLoopCRTP::sweep_health_probes.
-    static constexpr u32 kPendingCap = 64;
+    // Pending synthetic completion events from immediate sends. A timer-yield
+    // fan-out can resume every live connection from one HandlerTimer event, so
+    // the bound is the connection table rather than one epoll batch. wait()
+    // drains this queue in caller-sized batches before polling epoll again.
+    static constexpr u32 kPendingCap = kMaxFdMap;
     IoEvent pending_completions[kPendingCap];
     u32 pending_count = 0;
 
@@ -114,7 +114,10 @@ struct EpollBackend {
     // Try immediate send. If partial/EAGAIN, register EPOLLOUT.
     bool add_send(i32 fd, u32 conn_id, const u8* buf, u32 len);
     bool add_send_upstream(i32 fd, u32 conn_id, const u8* buf, u32 len);
+    bool add_send_upstream_tls(Connection& c, const u8* buf, u32 len);
     bool add_send_tls(Connection& c, const u8* buf, u32 len);
+    bool add_recv_upstream_tls(Connection& c);
+    bool arm_upstream_tls_handshake(Connection& c, u32 events);
 
     // Register fd for connect completion (EPOLLOUT).
     bool add_connect(i32 fd, u32 conn_id, const void* addr, u32 addr_len);

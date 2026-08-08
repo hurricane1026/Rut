@@ -396,6 +396,36 @@ TEST(send, keepalive_loop) {
     CHECK_EQ(loop.backend.count_ops(MockOp::Recv), 1u);
 }
 
+TEST(send, keepalive_response_releases_tls_upstream_receive_state) {
+    SmallLoop loop;
+    loop.setup();
+    loop.inject_and_dispatch(make_ev(0, IoEventType::Accept, 42));
+    auto* c = loop.find_fd(42);
+    REQUIRE(c != nullptr);
+    loop.inject_and_dispatch(make_ev(c->id, IoEventType::Recv, 50));
+    REQUIRE_EQ(c->on_send, &on_response_sent<SmallLoop>);
+
+    REQUIRE(loop.alloc_upstream_buf(*c));
+    static constexpr u8 kBuffered[] = {'o', 'k'};
+    REQUIRE(c->upstream_recv_buf.write(kBuffered, sizeof(kBuffered)));
+    c->upstream_jit_recv_delivered = sizeof(kBuffered);
+    c->upstream_fd = dup(2);
+    REQUIRE(c->upstream_fd >= 0);
+    SSL_CTX* tls_ctx = SSL_CTX_new(TLS_method());
+    REQUIRE(tls_ctx != nullptr);
+    c->upstream_tls = SSL_new(tls_ctx);
+    REQUIRE(c->upstream_tls != nullptr);
+
+    loop.inject_and_dispatch(
+        make_ev(c->id, IoEventType::Send, static_cast<i32>(c->send_buf.len())));
+
+    CHECK_EQ(c->upstream_fd, -1);
+    CHECK_EQ(c->upstream_tls, nullptr);
+    CHECK_EQ(c->upstream_recv_buf.len(), 0u);
+    CHECK_EQ(c->upstream_jit_recv_delivered, 0u);
+    SSL_CTX_free(tls_ctx);
+}
+
 TEST(send, error_epipe) {
     SmallLoop loop;
     loop.setup();
@@ -4765,6 +4795,62 @@ TEST(upstream_reuse, reusable_true_for_clean_keepalive) {
     CHECK(rut::proxy_upstream_reusable(&loop, *c));
 }
 
+TEST(upstream_reuse, tls_connection_is_closed_instead_of_being_pooled) {
+    SmallLoop loop;
+    loop.setup();
+    auto* c = loop.alloc_conn();
+    REQUIRE(c != nullptr);
+    RouteConfig cfg{};
+    const RouteConfig* active = &cfg;
+    loop.config_ptr = &active;
+    c->request_config = &cfg;
+    c->upstream_keep_alive = true;
+    c->req_body_mode = BodyMode::None;
+    c->upstream_tls = reinterpret_cast<SSL*>(0x1);
+
+    CHECK(!rut::proxy_upstream_reusable(&loop, *c));
+    c->upstream_tls = nullptr;
+}
+
+TEST(upstream_reuse, reusable_rejects_incomplete_chunked_upload) {
+    SmallLoop loop;
+    loop.setup();
+    auto* c = loop.alloc_conn();
+    REQUIRE(c != nullptr);
+    RouteConfig cfg{};
+    const RouteConfig* active = &cfg;
+    loop.config_ptr = &active;
+    c->request_config = &cfg;
+    c->upstream_keep_alive = true;
+    c->req_body_mode = BodyMode::Chunked;
+    c->req_chunk_parser.state = ChunkedParser::State::Size;
+
+    CHECK(!rut::proxy_upstream_reusable(&loop, *c));
+}
+
+TEST(upstream_reuse, release_closes_tls_state_and_upstream_fd) {
+    SmallLoop loop;
+    loop.setup();
+    auto* c = loop.alloc_conn();
+    REQUIRE(c != nullptr);
+    SSL_CTX* tls_ctx = SSL_CTX_new(TLS_method());
+    REQUIRE(tls_ctx != nullptr);
+    c->upstream_tls = SSL_new(tls_ctx);
+    REQUIRE(c->upstream_tls != nullptr);
+    c->upstream_fd = dup(2);
+    REQUIRE(c->upstream_fd >= 0);
+    c->upstream_recv_armed = true;
+    c->upstream_send_armed = true;
+
+    rut::release_upstream_conn(&loop, *c);
+
+    CHECK_EQ(c->upstream_tls, nullptr);
+    CHECK_EQ(c->upstream_fd, -1);
+    CHECK_FALSE(c->upstream_recv_armed);
+    CHECK_FALSE(c->upstream_send_armed);
+    SSL_CTX_free(tls_ctx);
+}
+
 // A request that ran on a now-replaced config must not be pooled (hot reload may
 // have repointed the (upstream_idx, backend_idx) endpoint to a different backend).
 TEST(upstream_reuse, reusable_rejects_stale_config) {
@@ -4845,6 +4931,37 @@ TEST(upstream_reuse, fallback_skips_upgrade_request) {
     CHECK(!rut::retry_reused_upstream(&loop, *c));
     CHECK_EQ(loop.backend.count_ops(MockOp::Connect), 0u);
     if (c->upstream_fd >= 0) close(c->upstream_fd);
+}
+
+TEST(upstream_reuse, retry_reused_tls_connection_discards_tls_state) {
+    SmallLoop loop;
+    loop.setup();
+    auto* c = loop.alloc_conn();
+    REQUIRE(c != nullptr);
+    REQUIRE(loop.alloc_upstream_buf(*c));
+    RouteConfig cfg{};
+    auto uid = cfg.add_upstream("api", 0x7F000001, 8080);
+    REQUIRE(uid.has_value());
+    c->request_config = &cfg;
+    c->upstream_idx = static_cast<u16>(uid.value());
+    c->req_method = static_cast<u8>(LogHttpMethod::Get);
+    static constexpr char kRequest[] = "GET / HTTP/1.1\r\n\r\n";
+    c->recv_buf.write(reinterpret_cast<const u8*>(kRequest), sizeof(kRequest) - 1);
+    c->req_initial_send_len = c->recv_buf.len();
+    c->upstream_reused = true;
+    c->upstream_fd = dup(2);
+    REQUIRE(c->upstream_fd >= 0);
+    SSL_CTX* tls_ctx = SSL_CTX_new(TLS_method());
+    REQUIRE(tls_ctx != nullptr);
+    c->upstream_tls = SSL_new(tls_ctx);
+    REQUIRE(c->upstream_tls != nullptr);
+
+    REQUIRE(rut::retry_reused_upstream(&loop, *c));
+
+    CHECK_EQ(c->upstream_tls, nullptr);
+    CHECK_EQ(loop.backend.count_ops(MockOp::Connect), 1u);
+    if (c->upstream_fd >= 0) close(c->upstream_fd);
+    SSL_CTX_free(tls_ctx);
 }
 
 // An upstream that sends bytes beyond its declared Content-Length is desynced —
@@ -14038,6 +14155,152 @@ TEST(buffered_forward, h2_rejects_body_longer_than_content_length) {
     c->h2 = nullptr;
 }
 
+TEST(buffered_forward, h2_tls_send_failure_arms_tls_aware_upstream_read) {
+    SmallLoop loop;
+    loop.setup();
+    loop.inject_and_dispatch(make_ev(0, IoEventType::Accept, 42));
+    auto* c = loop.find_fd(42);
+    REQUIRE(c != nullptr);
+
+    Http2Conn h2{};
+    h2.init();
+    h2.async_stream = 1;
+    h2.async_kind = H2AsyncKind::Proxy;
+    c->h2 = &h2;
+    c->protocol = ConnProtocol::Http2;
+    c->state = ConnState::Proxying;
+    c->upstream_fd = 7;
+    c->upstream_tls = reinterpret_cast<SSL*>(0x1);
+    c->set_slots(nullptr, nullptr, nullptr, &h2_on_upstream_request_sent<SmallLoop>);
+
+    h2_on_upstream_request_sent<SmallLoop>(
+        &loop, *c, make_ev(c->id, IoEventType::UpstreamSend, -EPIPE));
+
+    CHECK_EQ(c->on_upstream_recv, &h2_on_upstream_response<SmallLoop>);
+    CHECK_EQ(c->on_upstream_send, nullptr);
+    c->h2 = nullptr;
+    c->upstream_tls = nullptr;
+}
+
+TEST(buffered_forward, h2_tls_send_failure_fails_when_tls_read_cannot_arm) {
+    SmallLoop loop;
+    loop.setup();
+    loop.backend.fail_upstream_recv = true;
+    loop.inject_and_dispatch(make_ev(0, IoEventType::Accept, 42));
+    auto* c = loop.find_fd(42);
+    REQUIRE(c != nullptr);
+
+    SSL_CTX* tls_ctx = SSL_CTX_new(TLS_method());
+    REQUIRE(tls_ctx != nullptr);
+    SSL* tls = SSL_new(tls_ctx);
+    REQUIRE(tls != nullptr);
+    Http2Conn h2{};
+    h2.init();
+    h2.async_stream = 1;
+    h2.async_kind = H2AsyncKind::Proxy;
+    c->h2 = &h2;
+    c->protocol = ConnProtocol::Http2;
+    c->state = ConnState::Proxying;
+    c->upstream_fd = dup(2);
+    REQUIRE(c->upstream_fd >= 0);
+    c->upstream_tls = tls;
+    c->set_slots(nullptr, nullptr, nullptr, &h2_on_upstream_request_sent<SmallLoop>);
+
+    h2_on_upstream_request_sent<SmallLoop>(
+        &loop, *c, make_ev(c->id, IoEventType::UpstreamSend, -EPIPE));
+
+    CHECK_EQ(c->on_send, &on_h2_sent<SmallLoop>);
+    CHECK_GT(c->send_buf.len(), 0u);
+    CHECK_EQ(c->upstream_tls, nullptr);
+    CHECK_EQ(h2.async_stream, 0u);
+    c->h2 = nullptr;
+    SSL_CTX_free(tls_ctx);
+}
+
+TEST(buffered_forward, upstream_tls_send_failure_arms_tls_aware_upstream_read) {
+    SmallLoop loop;
+    loop.setup();
+    loop.inject_and_dispatch(make_ev(0, IoEventType::Accept, 42));
+    auto* c = loop.find_fd(42);
+    REQUIRE(c != nullptr);
+
+    c->state = ConnState::Proxying;
+    c->upstream_fd = 7;
+    c->upstream_tls = reinterpret_cast<SSL*>(0x1);
+
+    on_upstream_request_sent<SmallLoop>(
+        &loop, *c, make_ev(c->id, IoEventType::UpstreamSend, -EPIPE));
+
+    CHECK_EQ(c->on_upstream_recv, &on_upstream_response<SmallLoop>);
+    CHECK_EQ(c->on_upstream_send, nullptr);
+    c->upstream_tls = nullptr;
+}
+
+TEST(buffered_forward, upstream_tls_body_send_failure_arms_tls_aware_upstream_read) {
+    SmallLoop loop;
+    loop.setup();
+    loop.inject_and_dispatch(make_ev(0, IoEventType::Accept, 42));
+    auto* c = loop.find_fd(42);
+    REQUIRE(c != nullptr);
+
+    c->state = ConnState::Proxying;
+    c->upstream_fd = 7;
+    c->upstream_tls = reinterpret_cast<SSL*>(0x1);
+
+    on_request_body_sent<SmallLoop>(&loop, *c, make_ev(c->id, IoEventType::UpstreamSend, -EPIPE));
+
+    CHECK_EQ(c->on_upstream_recv, &on_upstream_response<SmallLoop>);
+    CHECK_EQ(c->on_upstream_send, nullptr);
+    c->upstream_tls = nullptr;
+}
+
+TEST(buffered_forward, upstream_tls_send_failure_closes_when_read_cannot_arm) {
+    SmallLoop loop;
+    loop.setup();
+    loop.backend.fail_upstream_recv = true;
+    loop.inject_and_dispatch(make_ev(0, IoEventType::Accept, 42));
+    auto* c = loop.find_fd(42);
+    REQUIRE(c != nullptr);
+
+    SSL_CTX* tls_ctx = SSL_CTX_new(TLS_method());
+    REQUIRE(tls_ctx != nullptr);
+    c->state = ConnState::Proxying;
+    c->upstream_fd = dup(2);
+    REQUIRE(c->upstream_fd >= 0);
+    c->upstream_tls = SSL_new(tls_ctx);
+    REQUIRE(c->upstream_tls != nullptr);
+
+    on_upstream_request_sent<SmallLoop>(
+        &loop, *c, make_ev(c->id, IoEventType::UpstreamSend, -EPIPE));
+
+    CHECK_EQ(c->upstream_tls, nullptr);
+    CHECK_EQ(c->upstream_fd, -1);
+    SSL_CTX_free(tls_ctx);
+}
+
+TEST(proxy_tls, final_handshake_failure_closes_upstream_socket) {
+    SmallLoop loop;
+    loop.setup();
+    loop.inject_and_dispatch(make_ev(0, IoEventType::Accept, 42));
+    auto* c = loop.find_fd(42);
+    REQUIRE(c != nullptr);
+
+    RouteConfig cfg;
+    auto upstream = cfg.add_upstream("secure", 0x7f000001u, 443);
+    REQUIRE(upstream.has_value());
+    REQUIRE(cfg.set_upstream_tls(upstream.value(), "localhost", 9));
+    c->request_config = &cfg;
+    c->upstream_idx = upstream.value();
+    c->upstream_attempts = kMaxConnectAttempts;
+    c->upstream_fd = dup(2);
+    REQUIRE(c->upstream_fd >= 0);
+
+    on_upstream_connected<SmallLoop>(&loop, *c, make_ev(c->id, IoEventType::UpstreamConnect, 0));
+
+    CHECK_EQ(c->upstream_fd, -1);
+    CHECK_EQ(c->on_send, &on_response_sent<SmallLoop>);
+}
+
 TEST(state_invariant, proxy_timeout_clears_proxy_slots) {
     SmallLoop loop;
     loop.setup();
@@ -15151,6 +15414,11 @@ TEST(state_invariant, jit_upstream_connect_resets_old_upstream_armed_state) {
     c->upstream_idx = 0;
     c->upstream_recv_armed = true;
     c->upstream_send_armed = true;
+    SSL_CTX* tls_ctx = SSL_CTX_new(TLS_method());
+    REQUIRE(tls_ctx != nullptr);
+    c->upstream_tls = SSL_new(tls_ctx);
+    REQUIRE(c->upstream_tls != nullptr);
+    c->upstream_tls_handshake_complete = true;
 
     JitDispatchOutcome outcome{};
     outcome.kind = JitDispatchOutcome::Kind::EventYield;
@@ -15163,12 +15431,15 @@ TEST(state_invariant, jit_upstream_connect_resets_old_upstream_armed_state) {
     CHECK_EQ(c->upstream_recv_armed, false);
     CHECK_EQ(c->upstream_send_armed, false);
     CHECK_EQ(c->upstream_idx, upstream.value());
+    CHECK_EQ(c->upstream_tls, nullptr);
+    CHECK_FALSE(c->upstream_tls_handshake_complete);
     CHECK_EQ(loop.backend.count_ops(MockOp::Connect), 1u);
     CHECK_EQ(loop.backend.count_ops(MockOp::PauseRecv), 1u);
     if (c->upstream_fd >= 0) {
         close(c->upstream_fd);
         c->upstream_fd = -1;
     }
+    SSL_CTX_free(tls_ctx);
 }
 
 TEST(state_invariant, jit_forward_closes_prior_wait_connect_socket) {
@@ -15192,6 +15463,11 @@ TEST(state_invariant, jit_forward_closes_prior_wait_connect_socket) {
     c->upstream_idx = upstream.value();
     c->upstream_recv_armed = true;
     c->upstream_send_armed = true;
+    SSL_CTX* tls_ctx = SSL_CTX_new(TLS_method());
+    REQUIRE(tls_ctx != nullptr);
+    c->upstream_tls = SSL_new(tls_ctx);
+    REQUIRE(c->upstream_tls != nullptr);
+    c->upstream_tls_handshake_complete = true;
 
     JitDispatchOutcome outcome{};
     outcome.kind = JitDispatchOutcome::Kind::Forward;
@@ -15204,6 +15480,8 @@ TEST(state_invariant, jit_forward_closes_prior_wait_connect_socket) {
     CHECK_EQ(c->upstream_fd, new_fds[0]);
     CHECK_EQ(c->upstream_recv_armed, false);
     CHECK_EQ(c->upstream_send_armed, false);
+    CHECK_EQ(c->upstream_tls, nullptr);
+    CHECK_FALSE(c->upstream_tls_handshake_complete);
     CHECK_EQ(loop.backend.count_ops(MockOp::Connect), 1u);
 
     if (c->upstream_fd >= 0) {
@@ -15212,6 +15490,7 @@ TEST(state_invariant, jit_forward_closes_prior_wait_connect_socket) {
     }
     close(old_fds[0]);
     close(new_fds[1]);
+    SSL_CTX_free(tls_ctx);
 }
 
 TEST(state_invariant, jit_forward_connect_submit_failure_sends_502) {

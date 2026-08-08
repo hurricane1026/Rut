@@ -1014,6 +1014,11 @@ public:
             c.tls_active = false;
             c.tls_handshake_complete = false;
         }
+        if (c.upstream_tls) {
+            destroy_tls_client_ssl(c.upstream_tls);
+            c.upstream_tls = nullptr;
+            c.upstream_tls_handshake_complete = false;
+        }
         if (c.upstream_fd >= 0) {
             ::close(c.upstream_fd);
             c.upstream_fd = -1;
