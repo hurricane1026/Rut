@@ -253,6 +253,8 @@ bool ProcessReloadCoordinator::init(ControlPlaneMutationPort* mutation,
 
 bool ProcessReloadCoordinator::request_signal(u64* request_id) {
     if (mutation_ == nullptr) return false;
+    if (mutation_->state() != ReloadAdmissionState::Idle)
+        return mutation_->request_reload(ReloadRequestSource::Signal, request_id);
     // Signals are processed by the control thread, so they may synchronously
     // materialize the current immutable source version before admission. A
     // refresh failure still enters the mutation port so SIGHUP receives its
