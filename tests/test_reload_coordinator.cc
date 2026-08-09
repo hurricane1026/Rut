@@ -429,6 +429,9 @@ TEST(reload_coordinator, route_admission_rejects_a_stale_snapshot_until_control_
         fs::create_symlink(root / "v2" / "app.rut", root / "current.rut");
         CHECK_FALSE(mutation.request_reload(ReloadRequestSource::Route));
         CHECK_EQ(coordinator.poll(), ReloadCoordinatorPoll::Idle);
+        // The control loop owns provider resolution; allow it to complete the
+        // refresh boundary before admitting the replacement route snapshot.
+        CHECK_EQ(coordinator.poll(), ReloadCoordinatorPoll::Idle);
         REQUIRE(mutation.request_reload(ReloadRequestSource::Route));
         CHECK_EQ(coordinator.poll(), ReloadCoordinatorPoll::Published);
         const auto* next = coordinator.active_program();
