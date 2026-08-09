@@ -150,16 +150,11 @@ bool ProcessReloadCoordinator::refresh_source_snapshot() {
     std::string previous_root;
     {
         std::lock_guard lock(source_snapshot_mutex_);
-        if (cached_provider_version_.size() == version_len &&
-            __builtin_memcmp(cached_provider_version_.data(), version, version_len) == 0) {
-            previous_root.assign(snapshot_root, root_len);
-        } else {
-            previous_root = std::move(source_snapshot_root_);
-            source_snapshot_root_.assign(snapshot_root, root_len);
-            cached_provider_version_.assign(version, version_len);
-            cached_snapshot_source_.assign(snapshot_source, source_len);
-            source_snapshot_epoch_.fetch_add(1, std::memory_order_release);
-        }
+        previous_root = std::move(source_snapshot_root_);
+        source_snapshot_root_.assign(snapshot_root, root_len);
+        cached_provider_version_.assign(version, version_len);
+        cached_snapshot_source_.assign(snapshot_source, source_len);
+        source_snapshot_epoch_.fetch_add(1, std::memory_order_release);
     }
     if (!previous_root.empty()) {
         std::lock_guard lock(source_snapshot_mutex_);
