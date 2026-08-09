@@ -87,7 +87,11 @@ struct ReloadRequest {
     char source_version[kMaxSourceVersion]{};
 };
 
-using ReloadSourceVersionCapture = bool (*)(void* context, char* out, u32 capacity, u32* out_len);
+using ReloadSourceVersionCapture = bool (*)(void* context,
+                                            ReloadRequestSource source,
+                                            char* out,
+                                            u32 capacity,
+                                            u32* out_len);
 
 struct ReloadTerminalRecord {
     bool valid = false;
@@ -440,11 +444,12 @@ public:
                 bool snapshot_recorded = false;
                 bool snapshot_capture_failed = false;
                 if (source_version_capture_ != nullptr) {
-                    snapshot_capture_failed =
-                        !source_version_capture_(source_version_capture_context_,
-                                                 source_version,
-                                                 ReloadRequest::kMaxSourceVersion,
-                                                 &source_version_len);
+                        snapshot_capture_failed =
+                            !source_version_capture_(source_version_capture_context_,
+                                                     source,
+                                                     source_version,
+                                                     ReloadRequest::kMaxSourceVersion,
+                                                     &source_version_len);
                     snapshot_capture_failed |=
                         source_version_len >= ReloadRequest::kMaxSourceVersion;
                 }

@@ -76,9 +76,14 @@ private:
                                LoadedProgram& output,
                                LoadError& error,
                                jit::OptLevel opt);
-    static bool capture_source_version(void* context, char* out, u32 capacity, u32* out_len);
+    static bool capture_source_version(void* context,
+                                       ReloadRequestSource source,
+                                       char* out,
+                                       u32 capacity,
+                                       u32* out_len);
     bool refresh_source_snapshot();
     void clear_source_snapshots();
+    void reclaim_retired_snapshots();
     bool all_shards_acknowledged(u64 generation) const;
 
     ControlPlaneMutationPort* mutation_ = nullptr;
@@ -103,6 +108,7 @@ private:
     // installed. Route workers use it to copy a stable prepared path without
     // resolving the source provider or touching the filesystem.
     std::atomic<u64> source_snapshot_epoch_{0};
+    std::atomic<bool> route_snapshot_armed_{false};
     mutable std::mutex source_snapshot_mutex_;
     ReloadRequest request_{};
     u64 old_generation_ = 0;

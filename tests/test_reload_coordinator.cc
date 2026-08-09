@@ -51,7 +51,11 @@ struct MutableSourceVersion {
     const char* current = nullptr;
 };
 
-bool capture_mutable_source_version(void* context, char* out, u32 capacity, u32* out_len) {
+bool capture_mutable_source_version(void* context,
+                                    ReloadRequestSource,
+                                    char* out,
+                                    u32 capacity,
+                                    u32* out_len) {
     const char* current = static_cast<MutableSourceVersion*>(context)->current;
     const u32 len = static_cast<u32>(__builtin_strlen(current));
     if (len >= capacity) return false;

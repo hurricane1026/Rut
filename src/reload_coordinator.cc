@@ -80,6 +80,22 @@ void ProcessReloadCoordinator::clear_source_snapshots() {
         cached_snapshot_source_.clear();
         cached_provider_version_.clear();
         source_snapshot_epoch_.store(0, std::memory_order_release);
+        route_snapshot_armed_.store(false, std::memory_order_release);
+        roots.swap(retired_snapshot_roots_);
+    }
+    for (const auto& root : roots) {
+        std::error_code ignored;
+        std::filesystem::remove_all(root, ignored);
+    }
+}
+
+void ProcessReloadCoordinator::reclaim_retired_snapshots() {
+    if (mutation_ == nullptr || mutation_->state() != ReloadAdmissionState::Idle ||
+        mutation_->admission_in_progress())
+        return;
+    std::vector<std::string> roots;
+    {
+        std::lock_guard lock(source_snapshot_mutex_);
         roots.swap(retired_snapshot_roots_);
     }
     for (const auto& root : roots) {
@@ -103,7 +119,11 @@ bool ProcessReloadCoordinator::refresh_source_snapshot() {
         std::lock_guard lock(source_snapshot_mutex_);
         if (cached_provider_version_.size() == version_len &&
             __builtin_memcmp(cached_provider_version_.data(), version, version_len) == 0)
+        {
+            route_snapshot_armed_.store(true, std::memory_order_release);
+            reclaim_retired_snapshots();
             return true;
+        }
     }
     char snapshot_source[ReloadRequest::kMaxSourceVersion]{};
     char snapshot_root[ReloadRequest::kMaxSourceVersion]{};
@@ -142,26 +162,13 @@ bool ProcessReloadCoordinator::refresh_source_snapshot() {
         std::lock_guard lock(source_snapshot_mutex_);
         retired_snapshot_roots_.push_back(std::move(previous_root));
     }
-    // A previous request may have completed without going through poll() (the
-    // mutation port is also used directly by tests/integrations). Reclaim
-    // retired roots only once admission is idle; Pending/InFlight requests may
-    // still hold a pathname into one of them.
-    if (mutation_ != nullptr && mutation_->state() == ReloadAdmissionState::Idle &&
-        !mutation_->admission_in_progress()) {
-        std::vector<std::string> roots;
-        {
-            std::lock_guard lock(source_snapshot_mutex_);
-            roots.swap(retired_snapshot_roots_);
-        }
-        for (const auto& root : roots) {
-            std::error_code ignored;
-            std::filesystem::remove_all(root, ignored);
-        }
-    }
+    route_snapshot_armed_.store(true, std::memory_order_release);
+    reclaim_retired_snapshots();
     return true;
 }
 
 bool ProcessReloadCoordinator::capture_source_version(void* context,
+                                                      ReloadRequestSource source,
                                                       char* out,
                                                       u32 capacity,
                                                       u32* out_len) {
@@ -173,6 +180,9 @@ bool ProcessReloadCoordinator::capture_source_version(void* context,
         // resolution and snapshot materialization stay off the shard thread.
         const u64 epoch = coordinator->source_snapshot_epoch_.load(std::memory_order_acquire);
         if (epoch == 0) return false;
+        if (source == ReloadRequestSource::Route &&
+            !coordinator->route_snapshot_armed_.load(std::memory_order_acquire))
+            return false;
         std::unique_lock lock(coordinator->source_snapshot_mutex_, std::try_to_lock);
         if (!lock.owns_lock()) return false;
         if (epoch != coordinator->source_snapshot_epoch_.load(std::memory_order_acquire)) return false;
@@ -228,6 +238,9 @@ bool ProcessReloadCoordinator::init(ControlPlaneMutationPort* mutation,
     supports_active_health_probes_ = supports_active_health_probes;
     clear_source_snapshots();
     if (default_loader_selected_) (void)refresh_source_snapshot();
+    // Startup preparation establishes the source snapshot but does not arm
+    // route-triggered reload until the control loop has observed that boundary.
+    route_snapshot_armed_.store(false, std::memory_order_release);
     mutation_->set_reload_source_version_capture(&capture_source_version, this);
     request_ = {};
     old_generation_ = 0;
