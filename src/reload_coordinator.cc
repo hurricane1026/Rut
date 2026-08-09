@@ -116,19 +116,6 @@ bool ProcessReloadCoordinator::refresh_source_snapshot() {
         route_snapshot_armed_.store(false, std::memory_order_release);
         return false;
     }
-    bool cache_hit = false;
-    {
-        std::lock_guard lock(source_snapshot_mutex_);
-        if (cached_provider_version_.size() == version_len &&
-            __builtin_memcmp(cached_provider_version_.data(), version, version_len) == 0) {
-            cache_hit = true;
-        }
-    }
-    if (cache_hit) {
-        route_snapshot_armed_.store(true, std::memory_order_release);
-        reclaim_retired_snapshots();
-        return true;
-    }
     char snapshot_source[ReloadRequest::kMaxSourceVersion]{};
     char snapshot_root[ReloadRequest::kMaxSourceVersion]{};
     u32 source_len = 0;
