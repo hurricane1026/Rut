@@ -113,17 +113,21 @@ bool ProcessReloadCoordinator::refresh_source_snapshot() {
         cached_snapshot_source_.clear();
         cached_provider_version_.clear();
         source_snapshot_epoch_.store(0, std::memory_order_release);
+        route_snapshot_armed_.store(false, std::memory_order_release);
         return false;
     }
+    bool cache_hit = false;
     {
         std::lock_guard lock(source_snapshot_mutex_);
         if (cached_provider_version_.size() == version_len &&
-            __builtin_memcmp(cached_provider_version_.data(), version, version_len) == 0)
-        {
-            route_snapshot_armed_.store(true, std::memory_order_release);
-            reclaim_retired_snapshots();
-            return true;
+            __builtin_memcmp(cached_provider_version_.data(), version, version_len) == 0) {
+            cache_hit = true;
         }
+    }
+    if (cache_hit) {
+        route_snapshot_armed_.store(true, std::memory_order_release);
+        reclaim_retired_snapshots();
+        return true;
     }
     char snapshot_source[ReloadRequest::kMaxSourceVersion]{};
     char snapshot_root[ReloadRequest::kMaxSourceVersion]{};
@@ -140,6 +144,7 @@ bool ProcessReloadCoordinator::refresh_source_snapshot() {
         cached_snapshot_source_.clear();
         cached_provider_version_.clear();
         source_snapshot_epoch_.store(0, std::memory_order_release);
+        route_snapshot_armed_.store(false, std::memory_order_release);
         if (!source_snapshot_root_.empty())
             retired_snapshot_roots_.push_back(std::move(source_snapshot_root_));
         return false;
@@ -167,11 +172,8 @@ bool ProcessReloadCoordinator::refresh_source_snapshot() {
     return true;
 }
 
-bool ProcessReloadCoordinator::capture_source_version(void* context,
-                                                      ReloadRequestSource source,
-                                                      char* out,
-                                                      u32 capacity,
-                                                      u32* out_len) {
+bool ProcessReloadCoordinator::capture_source_version(
+    void* context, ReloadRequestSource source, char* out, u32 capacity, u32* out_len) {
     auto* coordinator = static_cast<ProcessReloadCoordinator*>(context);
     if (coordinator == nullptr) return false;
     if (coordinator->default_loader_selected_) {
@@ -185,7 +187,8 @@ bool ProcessReloadCoordinator::capture_source_version(void* context,
             return false;
         std::unique_lock lock(coordinator->source_snapshot_mutex_, std::try_to_lock);
         if (!lock.owns_lock()) return false;
-        if (epoch != coordinator->source_snapshot_epoch_.load(std::memory_order_acquire)) return false;
+        if (epoch != coordinator->source_snapshot_epoch_.load(std::memory_order_acquire))
+            return false;
         const u32 len = static_cast<u32>(coordinator->cached_snapshot_source_.size());
         if (len == 0 || len >= capacity) return false;
         __builtin_memcpy(out, coordinator->cached_snapshot_source_.data(), len);

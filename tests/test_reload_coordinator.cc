@@ -51,11 +51,8 @@ struct MutableSourceVersion {
     const char* current = nullptr;
 };
 
-bool capture_mutable_source_version(void* context,
-                                    ReloadRequestSource,
-                                    char* out,
-                                    u32 capacity,
-                                    u32* out_len) {
+bool capture_mutable_source_version(
+    void* context, ReloadRequestSource, char* out, u32 capacity, u32* out_len) {
     const char* current = static_cast<MutableSourceVersion*>(context)->current;
     const u32 len = static_cast<u32>(__builtin_strlen(current));
     if (len >= capacity) return false;
@@ -439,9 +436,11 @@ TEST(reload_coordinator, route_admission_rejects_a_stale_snapshot_until_control_
         REQUIRE_EQ(next->config.route_count, 1u);
         CHECK_EQ(next->config.routes[0].status_code, 202u);
 
-        const RouteConfig* pending = control.pending_config.exchange(nullptr, std::memory_order_acq_rel);
+        const RouteConfig* pending =
+            control.pending_config.exchange(nullptr, std::memory_order_acq_rel);
         REQUIRE(pending != nullptr);
-        control.acknowledged_generation.store(pending->config_generation, std::memory_order_release);
+        control.acknowledged_generation.store(pending->config_generation,
+                                              std::memory_order_release);
         CHECK_EQ(coordinator.poll(), ReloadCoordinatorPoll::Activated);
     }
     active.destroy();

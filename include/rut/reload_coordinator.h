@@ -76,11 +76,8 @@ private:
                                LoadedProgram& output,
                                LoadError& error,
                                jit::OptLevel opt);
-    static bool capture_source_version(void* context,
-                                       ReloadRequestSource source,
-                                       char* out,
-                                       u32 capacity,
-                                       u32* out_len);
+    static bool capture_source_version(
+        void* context, ReloadRequestSource source, char* out, u32 capacity, u32* out_len);
     bool refresh_source_snapshot();
     void clear_source_snapshots();
     void reclaim_retired_snapshots();

@@ -9,7 +9,8 @@ using namespace rut;
 static bool failed_source_capture(void*, ReloadRequestSource, char*, u32, u32*) {
     return false;
 }
-static bool oversized_source_capture(void*, ReloadRequestSource, char*, u32 capacity, u32* out_len) {
+static bool oversized_source_capture(
+    void*, ReloadRequestSource, char*, u32 capacity, u32* out_len) {
     *out_len = capacity;
     return true;
 }
