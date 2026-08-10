@@ -2533,11 +2533,13 @@ TEST(control_plane_mutation, signal_snapshot_capture_failures_are_terminalized) 
 }
 
 TEST(control_plane_mutation, route_snapshot_capture_failure_is_rejected_without_record) {
-    ControlPlaneMutationPort port;
-    port.reset(1, true);
-    port.set_reload_source_version_capture(failed_source_capture, nullptr);
-    CHECK_FALSE(port.request_reload(ReloadRequestSource::Route));
-    CHECK_FALSE(port.last_record().valid);
+    for (auto capture : {failed_source_capture, oversized_source_capture}) {
+        ControlPlaneMutationPort port;
+        port.reset(1, true);
+        port.set_reload_source_version_capture(capture, nullptr);
+        CHECK_FALSE(port.request_reload(ReloadRequestSource::Route));
+        CHECK_FALSE(port.last_record().valid);
+    }
 }
 
 TEST(control_plane_mutation, source_version_capture_only_clears_for_its_registration) {
