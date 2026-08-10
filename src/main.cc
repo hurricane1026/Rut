@@ -690,7 +690,7 @@ int main(int argc, char** argv) {
                 break;
         }
         LoadError load_err;
-        if (!load_rut_program(config_path, program, load_err, olvl)) {
+        if (!load_rut_program_snapshot(config_path, program, load_err, olvl)) {
             char msg[512];
             format_load_error(load_err, msg, sizeof(msg));
             write_str("Failed to load ");

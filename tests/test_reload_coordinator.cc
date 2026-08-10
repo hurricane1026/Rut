@@ -384,11 +384,12 @@ TEST(reload_coordinator, default_source_snapshot_is_captured_by_the_winning_requ
         REQUIRE(mutation.request_reload(ReloadRequestSource::Route));
         REQUIRE(mutation.take_reload(&request));
         second_snapshot_root = fs::path(request.source_version).parent_path();
-        CHECK_FALSE(fs::exists(first_snapshot_root));
+        CHECK(fs::exists(first_snapshot_root));
         CHECK(fs::exists(second_snapshot_root));
         REQUIRE(mutation.complete_reload(
             request.id, request.source, ReloadTerminalOutcome::CompileFailed));
     }
+    CHECK_FALSE(fs::exists(first_snapshot_root));
     CHECK_FALSE(fs::exists(second_snapshot_root));
 
     // The destroyed coordinator detached its callback; the surviving port does
