@@ -89,10 +89,11 @@ bool load_rut_program(const char* path,
                       jit::OptLevel opt = jit::OptLevel::O2,
                       u64 max_source_bytes = ~u64{0});
 
-// Resolve an atomically replaced symlink once, then capture its root and
-// relative imports from the provider-owned immutable version tree. Regular
-// mutable paths are rejected for live reload; all imports must remain inside
-// the selected version tree.
+// For a symlink provider, resolve it once and capture the root plus relative
+// imports from the provider-owned immutable version tree. A regular path uses
+// direct loading for startup compatibility and therefore does not provide an
+// immutable snapshot. Live reload still requires a symlink version provider;
+// all imports in a captured version must remain inside the selected tree.
 bool load_rut_program_snapshot(const char* path,
                                LoadedProgram& out,
                                LoadError& err,
