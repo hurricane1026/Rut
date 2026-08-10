@@ -410,12 +410,11 @@ ReloadCoordinatorPoll ProcessReloadCoordinator::poll() {
         return ReloadCoordinatorPoll::Activated;
     }
 
-    // Observe provider changes before taking a pending request. Admission has
-    // already captured its immutable source path, so this refresh cannot alter
-    // an in-flight request; it only arms the next route admission boundary.
-    (void)refresh_source_snapshot();
     ReloadRequest request{};
     if (!mutation_->take_reload(&request)) {
+        // Do not delay an admitted request by materializing a newer provider
+        // tree. Refresh only when the control port has no pending request.
+        (void)refresh_source_snapshot();
         return ReloadCoordinatorPoll::Idle;
     }
     request_ = request;
