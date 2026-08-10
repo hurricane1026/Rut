@@ -69,6 +69,15 @@ ProcessReloadCoordinator::~ProcessReloadCoordinator() {
     if (mutation_ != nullptr)
         mutation_->clear_reload_source_version_capture(&capture_source_version, this);
     clear_source_snapshots();
+    std::vector<std::string> roots;
+    {
+        std::lock_guard lock(source_snapshot_mutex_);
+        roots.swap(retired_snapshot_roots_);
+    }
+    for (const auto& root : roots) {
+        std::error_code ignored;
+        std::filesystem::remove_all(root, ignored);
+    }
 }
 
 void ProcessReloadCoordinator::clear_source_snapshots() {
