@@ -565,7 +565,7 @@ TEST(serve_loader, reload_snapshot_rejects_unrepresentable_source_before_allocat
     std::filesystem::remove_all(dir, error);
 }
 
-TEST(serve_loader, reload_snapshot_rejects_unversioned_import_graph) {
+TEST(serve_loader, snapshot_loader_accepts_regular_import_graph) {
     const std::string dir = "/tmp/rut_serve_loader_unversioned_import";
     write_file(dir, "auth.rut", "func jwtAuth() -> i32 => 200\n");
     const std::string path = write_file(dir,
@@ -574,9 +574,12 @@ TEST(serve_loader, reload_snapshot_rejects_unversioned_import_graph) {
                                         "route GET \"/users\" { return jwtAuth() }\n");
     LoadedProgram program;
     LoadError err;
-    CHECK_FALSE(load_rut_program_snapshot(path.c_str(), program, err));
-    CHECK_EQ(err.stage, LoadStage::Read);
+    REQUIRE(load_rut_program_snapshot(path.c_str(), program, err));
+    REQUIRE_EQ(program.config.route_count, 1u);
+    CHECK_EQ(program.config.routes[0].status_code, 200u);
     program.destroy();
+    std::error_code ignored;
+    std::filesystem::remove_all(dir, ignored);
 }
 
 TEST(serve_loader, reload_snapshot_resolution_failure_clears_stale_diagnostic) {
