@@ -2570,6 +2570,17 @@ TEST(control_plane_mutation, admission_in_progress_tracks_reserved_identity) {
     CHECK(port.admission_in_progress());
 }
 
+TEST(control_plane_mutation, signal_during_reserved_admission_is_busy) {
+    ControlPlaneMutationPort port;
+    port.reset(1, true);
+    const u64 request_id = ControlPlaneMutationPortTestAccess::reserve_admission_identity(port);
+    REQUIRE_NE(request_id, 0u);
+    u64 signal_id = 0;
+    CHECK_FALSE(port.request_reload(ReloadRequestSource::Signal, &signal_id));
+    CHECK_NE(signal_id, 0u);
+    CHECK_EQ(port.last_record().outcome, ReloadTerminalOutcome::Busy);
+}
+
 TEST(control_plane_mutation, zero_generation_health_snapshot_is_empty) {
     ControlPlaneMutationPort port;
     port.reset(1, true);
