@@ -93,18 +93,9 @@ void ProcessReloadCoordinator::clear_source_snapshots() {
 }
 
 void ProcessReloadCoordinator::reclaim_retired_snapshots() {
-    if (mutation_ == nullptr || mutation_->state() != ReloadAdmissionState::Idle ||
-        mutation_->admission_in_progress())
-        return;
-    std::vector<std::string> roots;
-    {
-        std::lock_guard lock(source_snapshot_mutex_);
-        roots.swap(retired_snapshot_roots_);
-    }
-    for (const auto& root : roots) {
-        std::error_code ignored;
-        std::filesystem::remove_all(root, ignored);
-    }
+    // Admission and snapshot capture are separate lock-free operations. Keep
+    // retired roots until teardown rather than attempting a racy runtime
+    // reclamation between those operations.
 }
 
 bool ProcessReloadCoordinator::refresh_source_snapshot() {
