@@ -72,10 +72,6 @@ ProcessReloadCoordinator::~ProcessReloadCoordinator() {
 }
 
 void ProcessReloadCoordinator::clear_source_snapshots() {
-    std::vector<std::string> roots;
-    const bool can_reclaim =
-        mutation_ == nullptr ||
-        (mutation_->state() == ReloadAdmissionState::Idle && !mutation_->admission_in_progress());
     {
         std::lock_guard lock(source_snapshot_mutex_);
         if (!source_snapshot_root_.empty())
@@ -84,11 +80,6 @@ void ProcessReloadCoordinator::clear_source_snapshots() {
         cached_provider_version_.clear();
         source_snapshot_epoch_.store(0, std::memory_order_release);
         route_snapshot_armed_.store(false, std::memory_order_release);
-        if (can_reclaim) roots.swap(retired_snapshot_roots_);
-    }
-    for (const auto& root : roots) {
-        std::error_code ignored;
-        std::filesystem::remove_all(root, ignored);
     }
 }
 
@@ -253,7 +244,7 @@ bool ProcessReloadCoordinator::init(ControlPlaneMutationPort* mutation,
 
 bool ProcessReloadCoordinator::request_signal(u64* request_id) {
     if (mutation_ == nullptr) return false;
-    if (mutation_->state() != ReloadAdmissionState::Idle)
+    if (mutation_->state() != ReloadAdmissionState::Idle || mutation_->admission_in_progress())
         return mutation_->request_reload(ReloadRequestSource::Signal, request_id);
     // Signals are processed by the control thread, so they may synchronously
     // materialize the current immutable source version before admission. A
