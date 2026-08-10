@@ -73,6 +73,9 @@ ProcessReloadCoordinator::~ProcessReloadCoordinator() {
 
 void ProcessReloadCoordinator::clear_source_snapshots() {
     std::vector<std::string> roots;
+    const bool can_reclaim =
+        mutation_ == nullptr ||
+        (mutation_->state() == ReloadAdmissionState::Idle && !mutation_->admission_in_progress());
     {
         std::lock_guard lock(source_snapshot_mutex_);
         if (!source_snapshot_root_.empty())
@@ -81,7 +84,7 @@ void ProcessReloadCoordinator::clear_source_snapshots() {
         cached_provider_version_.clear();
         source_snapshot_epoch_.store(0, std::memory_order_release);
         route_snapshot_armed_.store(false, std::memory_order_release);
-        roots.swap(retired_snapshot_roots_);
+        if (can_reclaim) roots.swap(retired_snapshot_roots_);
     }
     for (const auto& root : roots) {
         std::error_code ignored;
