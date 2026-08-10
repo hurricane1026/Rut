@@ -127,6 +127,10 @@ bool ProcessReloadCoordinator::refresh_source_snapshot() {
         reclaim_retired_snapshots();
         return true;
     }
+    // A provider version change invalidates the old admission boundary. Drop
+    // the cached path before materializing the replacement so no route can
+    // observe the previous snapshot after the control thread refreshes.
+    clear_source_snapshots();
     char snapshot_source[ReloadRequest::kMaxSourceVersion]{};
     char snapshot_root[ReloadRequest::kMaxSourceVersion]{};
     u32 source_len = 0;
