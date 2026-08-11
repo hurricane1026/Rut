@@ -48,6 +48,8 @@ enum class MirValueKind : u8 {
     ReqQueryAll,
     ReqHeaderAll,
     ReqQueryString,
+    StrHasPrefix,
+    StrTrimPrefix,
     StrListLen,
     StrListIsEmpty,
     StrListGet,

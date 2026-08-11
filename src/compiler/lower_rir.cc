@@ -1446,6 +1446,42 @@ static FrontendResult<rir::ValueId> materialize_value(const MirValue& value,
         if (!v) return frontend_error(FrontendError::OutOfMemory, span);
         return v.value();
     }
+    if (value.kind == MirValueKind::StrHasPrefix || value.kind == MirValueKind::StrTrimPrefix) {
+        auto lhs = materialize_value(*value.lhs,
+                                     mir,
+                                     variant_infos,
+                                     tuple_infos,
+                                     tuple_info_count,
+                                     error_scalar_infos,
+                                     error_variant_infos,
+                                     error_struct_infos,
+                                     user_struct_defs,
+                                     b,
+                                     locals,
+                                     local_count,
+                                     span);
+        if (!lhs) return core::make_unexpected(lhs.error());
+        auto rhs = materialize_value(*value.rhs,
+                                     mir,
+                                     variant_infos,
+                                     tuple_infos,
+                                     tuple_info_count,
+                                     error_scalar_infos,
+                                     error_variant_infos,
+                                     error_struct_infos,
+                                     user_struct_defs,
+                                     b,
+                                     locals,
+                                     local_count,
+                                     span);
+        if (!rhs) return core::make_unexpected(rhs.error());
+        auto lowered =
+            value.kind == MirValueKind::StrHasPrefix
+                ? b.emit_str_has_prefix(lhs.value(), rhs.value(), {span.line, span.col})
+                : b.emit_str_trim_prefix(lhs.value(), rhs.value(), {span.line, span.col});
+        if (!lowered) return frontend_error(FrontendError::OutOfMemory, span);
+        return lowered.value();
+    }
     if (value.kind == MirValueKind::Tuple) {
         const auto tuple_shape = resolved_shape(mir, value);
         auto tuple_info =

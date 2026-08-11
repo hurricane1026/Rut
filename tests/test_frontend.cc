@@ -7186,6 +7186,94 @@ TEST(frontend, parse_req_path_regex_match_lowers_to_rir) {
     rir.destroy();
 }
 
+TEST(frontend, string_prefix_builtins_lower_through_the_frontend) {
+    const char* src =
+        "route GET \"/\" { let tail = req.path.trimPrefix(\"/api\") guard "
+        "tail.hasPrefix(\"/v1\") else { return 404 } return 200 }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    REQUIRE_EQ(hir->routes.len, 1u);
+    REQUIRE_EQ(hir->routes[0].locals.len, 1u);
+    CHECK_EQ(hir->routes[0].locals[0].init.kind, HirExprKind::StrTrimPrefix);
+    CHECK_EQ(hir->routes[0].locals[0].type, HirTypeKind::Str);
+    REQUIRE_EQ(hir->routes[0].guards.len, 1u);
+    CHECK_EQ(hir->routes[0].guards[0].cond.kind, HirExprKind::StrHasPrefix);
+    CHECK_EQ(hir->routes[0].guards[0].cond.type, HirTypeKind::Bool);
+
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    REQUIRE_EQ(mir->functions[0].locals.len, 1u);
+    CHECK_EQ(mir->functions[0].locals[0].init.kind, MirValueKind::StrTrimPrefix);
+
+    FrontendRirModule rir{};
+    REQUIRE(lower_to_rir(mir.value(), rir));
+    REQUIRE_EQ(rir.module.func_count, 1u);
+    CHECK(function_has_op(rir.module.functions[0], rir::Opcode::StrTrimPrefix));
+    CHECK(function_has_op(rir.module.functions[0], rir::Opcode::StrHasPrefix));
+    rir.destroy();
+}
+
+TEST(frontend, string_prefix_builtins_validate_arity_and_string_operands) {
+    const char* sources[] = {
+        "route GET \"/\" { let x = req.path.hasPrefix() return 200 }\n",
+        "route GET \"/\" { let x = req.path.hasPrefix(1) return 200 }\n",
+        "route GET \"/\" { let x = req.path.trimPrefix(\"/\", \"api\") return 200 }\n",
+        ("route GET \"/\" { let p = req.query(\"p\") let x = req.path.trimPrefix(p) return 200 "
+         "}\n"),
+    };
+    for (const char* src : sources) {
+        auto lexed = lex(lit(src));
+        REQUIRE(lexed);
+        auto ast = parse_file_heap(lexed.value());
+        REQUIRE(ast);
+        auto hir = analyze_file_heap(ast.value());
+        REQUIRE_FALSE(hir);
+        CHECK_EQ(hir.error().code, FrontendError::UnsupportedSyntax);
+        CHECK(hir.error().detail.eq(
+            lit("string hasPrefix/trimPrefix expects one non-optional string")));
+    }
+}
+
+TEST(frontend, string_prefix_builtins_require_unwrapped_receiver) {
+    const char* src =
+        "route GET \"/\" { let p = req.query(\"p\") let x = p.hasPrefix(\"/api\") return 200 "
+        "}\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE_FALSE(hir);
+    CHECK_EQ(hir.error().code, FrontendError::UnsupportedSyntax);
+}
+
+TEST(frontend, string_prefix_argument_cannot_mutate_after_response_read) {
+    const char* src = R"rut(
+func mutate(_ resp: Response) -> str {
+    resp.status = 202
+    "/api"
+}
+route GET "/" {
+    let resp = response(200)
+    resp.status = 201
+    let ok = resp.body.hasPrefix(mutate(resp))
+    return resp
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE_FALSE(hir);
+    CHECK(hir.error().detail.eq(
+        lit("a response-mutating prefix argument cannot follow a Response field read")));
+}
+
 TEST(frontend, req_path_regex_match_alias_lowers_to_str_regex) {
     const char* src =
         "route GET \"/\" { let p = req.path guard p.matches(re\"^/v[0-9]+/users$\") else { "

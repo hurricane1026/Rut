@@ -509,7 +509,7 @@ target library:
 
 | Status | Surface | Current boundary |
 |---|---|---|
-| ✅ | `s.matches(re"")` | Compile-time validated regex and runtime match |
+| ✅ | `s.hasPrefix(prefix)`, `s.trimPrefix(prefix)`, `s.matches(re"")` | Bounded non-owning string views; compile-time validated regex |
 | ✅ | string-list `len`, `isEmpty`, `first`, `at(i)` | Available on bounded `[str]` request views |
 | ✅ | `bitwise.and/or/xor/flip/shiftLeft/shiftRight` | Same-width `i32`/`i64` operations |
 | ✅ | `.or(default)`, compatibility `any(lhs, rhs)` | Eager fallback: return `lhs` when usable, otherwise `rhs` |
@@ -522,10 +522,10 @@ target library:
 | 🧩 | `upstream.mark(server, healthy:) -> bool` | Timer-only compiler/runtime plumbing; production activation waits on replay lowering |
 
 The following names are ⏳ target library surface and are **not current source
-built-ins**: string length/case/trim/prefix/suffix/replace/split/slice helpers;
-MD5, SHA, FNV and HMAC helpers; JWT; AES-GCM; `randomBytes` and `uuid`; Base64,
-base64url, hex, URL, HTML and Unicode codecs; `env`; structured logging; and
-`upstream_status`, `config_dump`, and `shard_stats`. An opcode or design entry
+built-ins**: remaining string length/case/trim/suffix/contains/replace/split/slice
+helpers; MD5, SHA, FNV and HMAC helpers; JWT; AES-GCM; `randomBytes` and `uuid`;
+Base64, base64url, hex, URL, HTML and Unicode codecs; `env`; structured logging;
+and `upstream_status`, `config_dump`, and `shard_stats`. An opcode or design entry
 without analyzer, lowering, JIT, and execution coverage is not an available
 Rutlang builtin.
 

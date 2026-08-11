@@ -52,6 +52,42 @@ TEST(serve_loader, status_routes_load) {
     program.destroy();
 }
 
+TEST(serve_loader, string_prefix_builtins_execute_end_to_end) {
+    const std::string dir = "/tmp/rut_serve_loader_string_prefix";
+    const std::string path = write_file(
+        dir,
+        "app.rut",
+        "route GET \"/\" { let tail = req.path.trimPrefix(\"/api\") if "
+        "req.path.hasPrefix(\"/api\") && tail == \"/v1/users\" { return 200 } else { return 404 "
+        "} }\n");
+
+    LoadedProgram program;
+    LoadError err;
+    REQUIRE(load_rut_program(path.c_str(), program, err));
+    REQUIRE_EQ(program.config.route_count, 1u);
+    const auto& route = program.config.routes[0];
+    REQUIRE_EQ(route.action, RouteAction::JitHandler);
+    REQUIRE(route.fn != nullptr);
+
+    const char* requests[] = {
+        "GET /api/v1/users HTTP/1.1\r\nHost: example\r\n\r\n",
+        "GET /api/v2/users HTTP/1.1\r\nHost: example\r\n\r\n",
+        "GET /v1/users HTTP/1.1\r\nHost: example\r\n\r\n",
+    };
+    const u16 expected[] = {200, 404, 404};
+    for (u32 i = 0; i < 3; i++) {
+        const auto result = jit::HandlerResult::unpack(
+            route.fn(nullptr,
+                     nullptr,
+                     reinterpret_cast<const u8*>(requests[i]),
+                     static_cast<u32>(std::char_traits<char>::length(requests[i])),
+                     nullptr));
+        CHECK_EQ(result.action, jit::HandlerAction::ReturnStatus);
+        CHECK_EQ(result.status_code, expected[i]);
+    }
+    program.destroy();
+}
+
 #if RUT_ENABLE_WEBSOCKET
 TEST(serve_loader, websocket_terminate_route_registers_and_runs) {
     // End-to-end (Phase 4 D/E): a `websocket(x){ frame in frame.drop() }` route compiles, its
