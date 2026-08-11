@@ -58,6 +58,15 @@ bool same_upstream_endpoints(const UpstreamTarget& lhs, const UpstreamTarget& rh
     return true;
 }
 
+bool release_snapshot_lease(std::atomic<u32>& leases) {
+    u32 current = leases.load(std::memory_order_acquire);
+    while (current != 0 &&
+           !leases.compare_exchange_weak(
+               current, current - 1, std::memory_order_acq_rel, std::memory_order_acquire)) {
+    }
+    return current != 0;
+}
+
 }  // namespace
 
 bool ProcessReloadCoordinator::default_loader(
@@ -93,9 +102,20 @@ void ProcessReloadCoordinator::clear_source_snapshots() {
 }
 
 void ProcessReloadCoordinator::reclaim_retired_snapshots() {
-    // Admission and snapshot capture are separate lock-free operations. Keep
-    // retired roots until teardown rather than attempting a racy runtime
-    // reclamation between those operations.
+    std::vector<std::string> roots;
+    {
+        std::lock_guard lock(source_snapshot_mutex_);
+        if (source_snapshot_leases_.load(std::memory_order_acquire) != 0) return;
+        roots.swap(retired_snapshot_roots_);
+    }
+    for (const auto& root : roots) {
+        std::error_code ignored;
+        std::filesystem::remove_all(root, ignored);
+    }
+}
+
+void ProcessReloadCoordinator::release_source_snapshot() {
+    if (release_snapshot_lease(source_snapshot_leases_)) reclaim_retired_snapshots();
 }
 
 bool ProcessReloadCoordinator::refresh_source_snapshot() {
@@ -163,14 +183,20 @@ bool ProcessReloadCoordinator::refresh_source_snapshot() {
     return true;
 }
 
-bool ProcessReloadCoordinator::capture_source_version(
-    void* context, ReloadRequestSource source, char* out, u32 capacity, u32* out_len) {
+bool ProcessReloadCoordinator::capture_source_version(void* context,
+                                                      ReloadRequestSource source,
+                                                      char* out,
+                                                      u32 capacity,
+                                                      u32* out_len,
+                                                      ReloadSourceVersionCaptureLease* lease) {
     auto* coordinator = static_cast<ProcessReloadCoordinator*>(context);
     if (coordinator == nullptr) return false;
     if (coordinator->default_loader_selected_) {
-        // This callback can run on a route worker. It uses only the immutable
-        // snapshot epoch published by the control thread; filesystem/provider
-        // resolution and snapshot materialization stay off the shard thread.
+        char version[ReloadRequest::kMaxSourceVersion]{};
+        u32 version_len = 0;
+        if (!resolve_rut_program_source_version(
+                coordinator->source_path_, version, sizeof(version), &version_len))
+            return false;
         const u64 epoch = coordinator->source_snapshot_epoch_.load(std::memory_order_acquire);
         if (epoch == 0) return false;
         if (source == ReloadRequestSource::Route &&
@@ -180,8 +206,15 @@ bool ProcessReloadCoordinator::capture_source_version(
         if (!lock.owns_lock()) return false;
         if (epoch != coordinator->source_snapshot_epoch_.load(std::memory_order_acquire))
             return false;
+        if (coordinator->cached_provider_version_.size() != version_len ||
+            __builtin_memcmp(coordinator->cached_provider_version_.data(), version, version_len) !=
+                0)
+            return false;
         const u32 len = static_cast<u32>(coordinator->cached_snapshot_source_.size());
-        if (len == 0 || len >= capacity) return false;
+        if (len == 0 || len >= capacity || lease == nullptr) return false;
+        coordinator->source_snapshot_leases_.fetch_add(1, std::memory_order_acq_rel);
+        lease->finalizer = &finalize_source_version_capture;
+        lease->context = coordinator;
         __builtin_memcpy(out, coordinator->cached_snapshot_source_.data(), len);
         out[len] = '\0';
         *out_len = len;
@@ -192,6 +225,13 @@ bool ProcessReloadCoordinator::capture_source_version(
     __builtin_memcpy(out, coordinator->source_path_, len + 1);
     *out_len = len;
     return true;
+}
+
+void ProcessReloadCoordinator::finalize_source_version_capture(void* context, bool admitted) {
+    if (admitted) return;
+    auto* coordinator = static_cast<ProcessReloadCoordinator*>(context);
+    if (coordinator == nullptr || !coordinator->default_loader_selected_) return;
+    (void)release_snapshot_lease(coordinator->source_snapshot_leases_);
 }
 
 bool ProcessReloadCoordinator::init(ControlPlaneMutationPort* mutation,
@@ -423,28 +463,17 @@ ReloadCoordinatorPoll ProcessReloadCoordinator::poll() {
     // The admission callback captured this immutable source-version handle.
     // Never refresh the provider cache here: doing so could compile a newer
     // version than the one associated with the admitted request.
-    auto reclaim_retired_snapshots = [&] {
-        std::vector<std::string> roots;
-        {
-            std::lock_guard lock(source_snapshot_mutex_);
-            roots.swap(retired_snapshot_roots_);
-        }
-        for (const auto& root : roots) {
-            std::error_code ignored;
-            std::filesystem::remove_all(root, ignored);
-        }
-    };
     if (source_path == nullptr || source_path[0] == '\0' ||
         !loader_(loader_context_, source_path, *spare_, last_load_error_, opt_)) {
         spare_->destroy();
-        reclaim_retired_snapshots();
+        if (default_loader_selected_) release_source_snapshot();
         (void)mutation_->complete_reload(
             request.id, request.source, ReloadTerminalOutcome::CompileFailed);
         return ReloadCoordinatorPoll::CompileFailed;
     }
     // The admitted request has finished reading its source. Older snapshot
     // roots retained across a cache swap can now be reclaimed safely.
-    reclaim_retired_snapshots();
+    if (default_loader_selected_) release_source_snapshot();
     if (cancellation_check_ != nullptr && cancellation_check_(cancellation_context_)) {
         spare_->destroy();
         mutation_->stop();

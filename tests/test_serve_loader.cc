@@ -571,12 +571,18 @@ TEST(serve_loader, snapshot_loader_accepts_regular_import_graph) {
     const std::string path = write_file(dir,
                                         "main.rut",
                                         "import \"auth.rut\"\n"
-                                        "route GET \"/users\" { return jwtAuth() }\n");
+                                        "route GET \"/users\" { if jwtAuth() == 200 { return 200 } "
+                                        "else { return 500 } }\n");
     LoadedProgram program;
     LoadError err;
     REQUIRE(load_rut_program_snapshot(path.c_str(), program, err));
     REQUIRE_EQ(program.config.route_count, 1u);
-    CHECK_EQ(program.config.routes[0].status_code, 200u);
+    const auto& route = program.config.routes[0];
+    REQUIRE_EQ(route.action, RouteAction::JitHandler);
+    REQUIRE(route.fn != nullptr);
+    const auto result = jit::HandlerResult::unpack(route.fn(nullptr, nullptr, nullptr, 0, nullptr));
+    CHECK_EQ(result.action, jit::HandlerAction::ReturnStatus);
+    CHECK_EQ(result.status_code, 200u);
     program.destroy();
     std::error_code ignored;
     std::filesystem::remove_all(dir, ignored);

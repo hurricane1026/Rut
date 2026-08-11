@@ -51,8 +51,12 @@ struct MutableSourceVersion {
     const char* current = nullptr;
 };
 
-bool capture_mutable_source_version(
-    void* context, ReloadRequestSource, char* out, u32 capacity, u32* out_len) {
+bool capture_mutable_source_version(void* context,
+                                    ReloadRequestSource,
+                                    char* out,
+                                    u32 capacity,
+                                    u32* out_len,
+                                    ReloadSourceVersionCaptureLease*) {
     const char* current = static_cast<MutableSourceVersion*>(context)->current;
     const u32 len = static_cast<u32>(__builtin_strlen(current));
     if (len >= capacity) return false;
@@ -426,6 +430,9 @@ TEST(reload_coordinator, route_admission_rejects_a_stale_snapshot_until_control_
         REQUIRE(coordinator.init(
             &mutation, source_path.c_str(), jit::OptLevel::O0, &active, &spare, &shard, 1));
 
+        // An idle control-loop observation arms v1. A later provider swap must
+        // invalidate that admission boundary even before the next poll.
+        CHECK_EQ(coordinator.poll(), ReloadCoordinatorPoll::Idle);
         fs::remove(root / "current.rut");
         fs::create_symlink(root / "v2" / "app.rut", root / "current.rut");
         CHECK_FALSE(mutation.request_reload(ReloadRequestSource::Route));
@@ -438,7 +445,13 @@ TEST(reload_coordinator, route_admission_rejects_a_stale_snapshot_until_control_
         const auto* next = coordinator.active_program();
         REQUIRE(next != nullptr);
         REQUIRE_EQ(next->config.route_count, 1u);
-        CHECK_EQ(next->config.routes[0].status_code, 202u);
+        const auto& route = next->config.routes[0];
+        REQUIRE_EQ(route.action, RouteAction::JitHandler);
+        REQUIRE(route.fn != nullptr);
+        const auto result =
+            jit::HandlerResult::unpack(route.fn(nullptr, nullptr, nullptr, 0, nullptr));
+        CHECK_EQ(result.action, jit::HandlerAction::ReturnStatus);
+        CHECK_EQ(result.status_code, 202u);
 
         const RouteConfig* pending =
             control.pending_config.exchange(nullptr, std::memory_order_acq_rel);
