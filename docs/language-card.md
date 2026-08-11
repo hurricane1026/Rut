@@ -356,7 +356,8 @@ declarations. The grouped `route { ... }` surface (middleware pattern
 bindings, host/path groups, method unions, typed captures, expression entries,
 and `_` catch-all) is ⏳ target syntax and must not be emitted yet.
 
-Precedence: literal segment > `:param` > `*rest`; exact host > wildcard > `_`.
+Current path precedence: literal segment > `:param` > `*rest`.
+⏳ Target host precedence: exact host > wildcard > `_`.
 ⏳ Target diagnostic: indistinguishable routes are a compile error. Current
 route tables accept duplicate method/path keys and keep the first inserted
 route. Stable middleware uses an explicit `chain` direction:
