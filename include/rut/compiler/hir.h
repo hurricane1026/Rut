@@ -136,6 +136,10 @@ enum class HirExprKind : u8 {
     ReqQueryAll,
     ReqHeaderAll,
     ReqQueryString,
+    // Bounded string-view operations. Both preserve request-owned storage;
+    // trimPrefix returns the original view when the prefix does not match.
+    StrHasPrefix,
+    StrTrimPrefix,
     StrListLen,
     StrListIsEmpty,
     StrListGet,

@@ -5106,6 +5106,44 @@ static FrontendResult<HirExpr> analyze_method_call_expr(
     if (recv.may_nil || recv.may_error)
         return frontend_error(FrontendError::UnsupportedSyntax, expr.span);
 
+    if (recv.type == HirTypeKind::Str &&
+        (expr.name.eq({"hasPrefix", 9}) || expr.name.eq({"trimPrefix", 10}))) {
+        if (expr.args.len != 1 || expr.args[0] == nullptr)
+            return frontend_error(
+                FrontendError::UnsupportedSyntax,
+                expr.span,
+                lit_str("string hasPrefix/trimPrefix expects one non-optional string"));
+        const u32 locals_before_prefix = route->locals.len;
+        auto prefix = analyze_expr(*expr.args[0], route, mod, locals, local_count, binding);
+        if (!prefix) return core::make_unexpected(prefix.error());
+        if (hir_expr_reads_response_field(recv)) {
+            for (u32 li = locals_before_prefix; li < route->locals.len; li++) {
+                if (!is_response_effect(route->locals[li].init.kind)) continue;
+                return frontend_error(
+                    FrontendError::UnsupportedSyntax,
+                    expr.args[0]->span,
+                    lit_str("a response-mutating prefix argument cannot follow a Response field "
+                            "read"));
+            }
+        }
+        if (prefix->type != HirTypeKind::Str || prefix->may_nil || prefix->may_error)
+            return frontend_error(
+                FrontendError::UnsupportedSyntax,
+                expr.args[0]->span,
+                lit_str("string hasPrefix/trimPrefix expects one non-optional string"));
+        HirExpr out{};
+        out.kind =
+            expr.name.eq({"hasPrefix", 9}) ? HirExprKind::StrHasPrefix : HirExprKind::StrTrimPrefix;
+        out.type = expr.name.eq({"hasPrefix", 9}) ? HirTypeKind::Bool : HirTypeKind::Str;
+        out.span = expr.span;
+        if (!route->exprs.push(recv)) return frontend_error(FrontendError::TooManyItems, expr.span);
+        out.lhs = &route->exprs[route->exprs.len - 1];
+        if (!route->exprs.push(prefix.value()))
+            return frontend_error(FrontendError::TooManyItems, expr.span);
+        out.rhs = &route->exprs[route->exprs.len - 1];
+        return out;
+    }
+
     if (recv.type == HirTypeKind::StrList &&
         (expr.name.eq({"first", 5}) || expr.name.eq({"at", 2}))) {
         if ((expr.name.eq({"first", 5}) && expr.args.len != 0) ||
