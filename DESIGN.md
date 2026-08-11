@@ -44,7 +44,7 @@ This is intentionally coarse-grained. It exists to separate "designed" from
 | Route conflict analysis and full diagnostics | **Designed** | Mentioned throughout this doc, not fully enforced end-to-end today |
 | Full surface language in examples below | **Designed** | Many examples are target syntax, not necessarily accepted by current code |
 | Cross-shard language primitives (`notify`, `consistent`) | **Designed** | Runtime direction is defined here; treat semantics as target contract |
-| Strict `Hash` + owner-shard atomic update | **Designed** | Lossless in-process contract is fixed in `docs/hash-state.md`; not implemented |
+| Strict `Hash` + owner-shard atomic update | **Partial / designed** | Failure-atomic fixed-capacity table substrate is implemented; DSL exposure and owner-shard protocol remain designed in `docs/hash-state.md` |
 | External state backends (`backend: .redis`) | **Designed** | Not a current repository guarantee |
 | Zero-downtime hot reload of full `.rut` programs | **Partially designed / partial runtime pieces** | Runtime has design direction; full language-level flow is not complete yet |
 

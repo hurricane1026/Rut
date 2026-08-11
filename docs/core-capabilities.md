@@ -5,12 +5,32 @@ capability needs one canonical syntax and one verifier-visible meaning.
 
 ## Core Surface
 
+### Current implementation boundary
+
+This table describes the current repository, rather than the broader target in
+`DESIGN.md`. "Front end" alone means a form may parse or type-check but is not a
+deployment capability until lowering and runtime coverage exist.
+
+| Capability | Status | Current boundary |
+|---|---|---|
+| Routes, request inspection, direct responses | **Implemented** | Repeated method/path routes, bounded request views, status/body/header responses |
+| Upstreams and forwarding | **Implemented** | IPv4/IPv6/DNS backends, verified upstream TLS, terminal and bounded buffered forwarding |
+| HTTP/2 | **Implemented with bounds** | Static/JIT routes, timer waits, buffered forwarding, and proxy request bodies; separate but mutually exclusive pending-body and async states per connection |
+| Control flow and reuse | **Partial** | `let`, guard/if/match, bounded static `for`, functions/chains; mutable `var`, defer, and general runtime iteration are target surface |
+| Types | **Partial** | Small named annotation set plus compiler-known domain carriers; the full design type list is not source-declarable |
+| State | **Partial** | Lossy per-shard `Cache<IP,i64>` is exposed; strict Hash table substrate exists but Hash DSL and owner-shard protocol do not |
+| Built-ins | **Partial** | Numeric/bitwise/fallback/time/JSON/snapshots/reload and regex match; crypto, codecs, broad strings, env, and logging are target surface |
+| Async | **Partial** | Timer-oriented waits and bounded forwarding; outbound HTTP, submit/fire, raw sockets, and lifecycle hooks are not end to end |
+
+The detailed spelling and per-form status live in `language-card.md`; transport
+limits live in `usage.md`.
+
 The stable core surface should prioritize features that lower directly to a
 route automaton:
 
 - route matching,
 - domain-typed request inspection,
-- `let` and handler-local `var`,
+- immutable `let` bindings (`var` remains target surface),
 - `guard`, `if`, and `match`,
 - terminal `return`,
 - terminal `return forward(upstream)`,

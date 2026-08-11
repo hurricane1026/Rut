@@ -43,8 +43,9 @@ and route-only `reload()` lowering with explicit CLI authority are connected.
 limit.
 
 **Work**:
-- Implement fixed-capacity, no-eviction owner tables with visible
-  `full`/`placementLimit` failures.
+- Integrate the implemented fixed-capacity, no-eviction, failure-atomic table
+  substrate into shard-owned state and expose visible `full`/`placementLimit`
+  failures through the DSL.
 - Implement per-key atomic `Hash.update` using a pure bounded updater thunk.
 - Route `consistent: true` operations to the process owner shard with bounded
   queues, completion credits, deadlines, and definite-not-applied failures.
@@ -89,6 +90,9 @@ implementation promise.
 - Upstream error/timeout and free/reset paths assert resource and slot cleanup.
 - Coverage CI keeps first-party area summaries, changed-file output, and the
   lowest-covered runtime files visible; gate exclusions remain labeled.
+- Every shipped capability claim identifies its strongest verified layer
+  (front end, MIR/RIR lowering, JIT, or runtime), and documentation CI executes
+  that layer instead of treating parse-and-typecheck coverage as runtime proof.
 - Review findings that reveal a recurring class add one scoped backlog item with
   an acceptance criterion, not a historical incident log.
 

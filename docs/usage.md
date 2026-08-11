@@ -216,18 +216,36 @@ curl -s -o /dev/null -w "%{http_code}\n" http://127.0.0.1:8080/   # 200
 - **HTTP/2 has distinct cleartext and TLS admission paths.** Cleartext h2c
   prior knowledge is accepted automatically; `--h2` only enables TLS ALPN
   advertisement. HTTP/2 supports static routes, JIT handlers (including timer
-  waits), buffered JIT forwarding, and no-body proxy requests. Unbuffered JIT
-  forwarding, non-timer event waits, and proxy requests with bodies return
-  `503`. One shared async slot is available per HTTP/2 connection, so a second
-  stream requiring a timer wait, buffered forward, or no-body proxy while that
-  slot is occupied also returns `503`. HTTP/3 is not implemented.
+  waits), buffered JIT forwarding, and proxy requests with or without bodies.
+  Proxy request bodies are buffered before the HTTP/1 upstream request is
+  issued. The synthesized HTTP/1 request has a 16 KiB buffer shared by its
+  request line, headers, and body, so the effective body limit is less than
+  16 KiB and varies with header size; an overflow returns `413`. Only one stream
+  per connection may wait for request-body DATA at a time. A second body-bearing
+  stream that also needs deferral while this pending-body slot is occupied
+  returns `503`, so concurrent/interleaved uploads on one connection are not
+  supported. Unbuffered JIT forwarding and non-timer event waits return `503`.
+  One async execution slot is available per connection for a timer wait,
+  buffered forward, or proxy. The pending-body and async slots are distinct
+  states but cannot be occupied together because they share request scratch
+  storage. While a body wait is active, other request frames are still processed,
+  but a bodyless stream that reaches one of those async operations returns `503`.
+  Conversely, while the async slot is occupied, subsequent request frames
+  ordinarily remain buffered until the parked stream resumes, causing
+  per-connection head-of-line blocking. HTTP/3 is not implemented.
 - **WebSocket support is HTTP/1.1 upgrade only.** Passthrough and bounded
   terminate-mode frame handlers are available when built with
   `RUT_ENABLE_WEBSOCKET=ON`. Terminate mode accepts only a single unfragmented
   frame of roughly 16 KiB or less; larger or fragmented messages fail closed.
   HTTP/2 extended CONNECT is not implemented.
-- **Server TLS only.** ALPN is supported for the opt-in HTTP/2 path; SNI,
-  mTLS, and kTLS are not implemented.
+- **Inbound and verified upstream TLS are supported.** ALPN is available for the
+  opt-in HTTP/2 server path. Upstream TLS sends configured SNI and verifies the
+  certificate against the system trust store on the epoll backend. Set
+  `RUT_UPSTREAM_TLS_CA_FILE` to a non-empty CA bundle path to replace the system
+  trust roots for private PKI. Inbound certificate selection by SNI, mTLS,
+  upstream client certificates, insecure upstream verification, and kTLS are
+  not implemented. A TLS upstream cannot also enable `health_check`: active
+  probes currently send plaintext HTTP, so that combination fails program load.
 - **DNS is resolved at configuration load time.** TTL-based refresh, SRV
   records, and dynamic service discovery are not supported yet.
 - **Hot reload is bounded and source-based.** `SIGHUP` reloads a loaded
