@@ -14,13 +14,14 @@ deployment capability until lowering and runtime coverage exist.
 | Capability | Status | Current boundary |
 |---|---|---|
 | Routes, request inspection, direct responses | **Implemented** | Repeated method/path routes, bounded request views, status/body/header responses |
-| Upstreams and forwarding | **Implemented** | IPv4/IPv6/DNS backends, verified upstream TLS, terminal and bounded buffered forwarding |
+| Upstreams and forwarding | **Implemented** | IPv4/IPv6/DNS backends, verified upstream TLS with process-wide custom CA/client identity, terminal and bounded buffered forwarding |
 | HTTP/2 | **Implemented with bounds** | Static/JIT routes, timer waits, buffered forwarding, and proxy request bodies; separate but mutually exclusive pending-body and async states per connection |
 | Control flow and reuse | **Partial** | `let`, guard/if/match, bounded static `for`, functions/chains; mutable `var`, defer, and general runtime iteration are target surface |
 | Types | **Partial** | Small named annotation set plus compiler-known domain carriers; the full design type list is not source-declarable |
 | State | **Partial** | Lossy per-shard `Cache<IP,i64>` is exposed; strict Hash table substrate exists but Hash DSL and owner-shard protocol do not |
 | Built-ins | **Partial** | Numeric/bitwise/fallback/time/JSON/snapshots/reload and regex match; crypto, codecs, broad strings, env, and logging are target surface |
 | Async | **Partial** | Timer-oriented waits and bounded forwarding; outbound HTTP, submit/fire, raw sockets, and lifecycle hooks are not end to end |
+| TLS identities | **Implemented with bounds** | Default plus 16 exact inbound SNI identities, optional process-wide inbound mTLS, and process-wide upstream CA/client identity; wildcard/dynamic SNI maps and per-upstream profiles remain target surface |
 
 The detailed spelling and per-form status live in `language-card.md`; transport
 limits live in `usage.md`.

@@ -155,6 +155,11 @@ gracefully before exiting.
 | `--backend MODE` | I/O backend: `auto`, `io_uring`, or `epoll` | `auto` |
 | `--tls-cert PATH` | TLS certificate (PEM); enables TLS | off |
 | `--tls-key PATH` | TLS private key (PEM); required with `--tls-cert` | off |
+| `--tls-client-ca PATH` | Trust bundle for required inbound client certificates (mTLS) | off |
+| `--tls-sni NAME CERT KEY` | Add an exact SNI certificate identity; repeatable up to 16 | none |
+| `--upstream-tls-ca PATH` | Trust bundle for verified upstream TLS | system trust store |
+| `--upstream-tls-cert PATH` | Client certificate chain presented to TLS upstreams | off |
+| `--upstream-tls-key PATH` | Client private key; required with `--upstream-tls-cert` | off |
 | `--access-log PATH` | Write access logs to PATH | off |
 | `--access-log-compress` | zstd-compress access logs | off |
 | `--access-log-level N` | Access log verbosity | build default |
@@ -162,9 +167,21 @@ gracefully before exiting.
 | `--metrics` | Serve the built-in Prometheus endpoint at HTTP/1.1 `GET /metrics` | off |
 | `--allow-route-reload` | Permit source routes to call `reload()` | off |
 
-`--tls-cert`/`--tls-key` must be given together. Both backends support server
-TLS. In `auto` mode, Rut prefers io_uring when available unless the program
-configures active upstream health checks, which currently require epoll.
+`--tls-cert`/`--tls-key` must be given together. `--tls-client-ca` enables
+inbound mTLS and is valid only when that server identity is configured; every
+inbound TLS connection must then present a certificate chaining to the supplied
+PEM bundle. `--tls-sni NAME CERT KEY` adds a case-insensitive exact hostname
+mapping and requires the default certificate/key. Unknown hostnames and clients
+without SNI receive the default identity. Wildcard mappings are intentionally
+rejected; up to 16 identities are preloaded at startup, and all identities use
+the same ALPN and inbound mTLS policy. Both backends support server TLS.
+
+`--upstream-tls-cert`/`--upstream-tls-key` must also be given together. The
+upstream trust bundle and optional client identity are process-wide and apply to
+every TLS upstream. `RUT_UPSTREAM_TLS_CA_FILE` remains an environment equivalent
+for the CA bundle, with the command-line option taking precedence. Upstream TLS
+currently requires epoll. In `auto` mode, Rut also selects epoll when the program
+configures active upstream health checks.
 
 With a loaded `.rut` program, `SIGHUP` requests a hot reload through the same
 single-flight coordinator used by `reload()`. The program path must be a
@@ -198,6 +215,35 @@ Example with TLS:
   --tls-cert server.pem --tls-key server.key \
   app.rut
 curl -k https://127.0.0.1:8443/
+```
+
+Require inbound client certificates:
+
+```bash
+./build/src/rut 8443 \
+  --tls-cert server.pem --tls-key server.key \
+  --tls-client-ca client-ca.pem \
+  app.rut
+```
+
+Serve an additional certificate selected by SNI:
+
+```bash
+./build/src/rut 8443 \
+  --tls-cert default.pem --tls-key default.key \
+  --tls-sni api.example.com api.pem api.key \
+  --tls-sni admin.example.com admin.pem admin.key \
+  app.rut
+```
+
+Present a client identity to mTLS upstreams while using a private trust bundle:
+
+```bash
+./build/src/rut 8080 \
+  --upstream-tls-ca upstream-ca.pem \
+  --upstream-tls-cert gateway-client.pem \
+  --upstream-tls-key gateway-client.key \
+  app.rut
 ```
 
 ## 4. Verify a change actually serves
@@ -239,13 +285,14 @@ curl -s -o /dev/null -w "%{http_code}\n" http://127.0.0.1:8080/   # 200
   frame of roughly 16 KiB or less; larger or fragmented messages fail closed.
   HTTP/2 extended CONNECT is not implemented.
 - **Inbound and verified upstream TLS are supported.** ALPN is available for the
-  opt-in HTTP/2 server path. Upstream TLS sends configured SNI and verifies the
-  certificate against the system trust store on the epoll backend. Set
-  `RUT_UPSTREAM_TLS_CA_FILE` to a non-empty CA bundle path to replace the system
-  trust roots for private PKI. Inbound certificate selection by SNI, mTLS,
-  upstream client certificates, insecure upstream verification, and kTLS are
-  not implemented. A TLS upstream cannot also enable `health_check`: active
-  probes currently send plaintext HTTP, so that combination fails program load.
+  opt-in HTTP/2 server path. Inbound mTLS can require a process-wide client CA.
+  Up to 16 exact inbound SNI certificate mappings can be preloaded at startup.
+  Upstream TLS sends configured SNI, supports a process-wide custom CA and
+  optional client identity, and verifies the origin on the epoll backend.
+  Wildcard/dynamically reloaded certificate maps, per-upstream TLS profiles,
+  insecure upstream verification, and kTLS are not implemented. A TLS upstream
+  cannot also enable `health_check`: active probes currently send plaintext
+  HTTP, so that combination fails program load.
 - **DNS is resolved at configuration load time.** TTL-based refresh, SRV
   records, and dynamic service discovery are not supported yet.
 - **Hot reload is bounded and source-based.** `SIGHUP` reloads a loaded

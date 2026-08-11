@@ -26,6 +26,7 @@ find_package(Python3 REQUIRED COMPONENTS Interpreter)
 set(RUT_TLS_TESTDATA_DIR ${CMAKE_CURRENT_BINARY_DIR}/testdata)
 set(RUT_TLS_TEST_CERT ${RUT_TLS_TESTDATA_DIR}/localhost_cert.pem)
 set(RUT_TLS_TEST_KEY ${RUT_TLS_TESTDATA_DIR}/localhost_key.pem)
+set(RUT_TLS_TEST_SNI_CERT ${RUT_TLS_TESTDATA_DIR}/api_example_cert.pem)
 
 file(MAKE_DIRECTORY ${RUT_TLS_TESTDATA_DIR})
 configure_file(
@@ -38,8 +39,16 @@ configure_file(
     ${RUT_TLS_TEST_KEY}
     COPYONLY
 )
+configure_file(
+    ${CMAKE_CURRENT_SOURCE_DIR}/fixtures/api_example_cert.pem
+    ${RUT_TLS_TEST_SNI_CERT}
+    COPYONLY
+)
 
-add_custom_target(test_tls_fixtures DEPENDS ${RUT_TLS_TEST_CERT} ${RUT_TLS_TEST_KEY})
+add_custom_target(
+    test_tls_fixtures
+    DEPENDS ${RUT_TLS_TEST_CERT} ${RUT_TLS_TEST_KEY} ${RUT_TLS_TEST_SNI_CERT}
+)
 
 add_executable(test_integration
     test_integration.cc

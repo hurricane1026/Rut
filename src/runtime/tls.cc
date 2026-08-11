@@ -58,6 +58,91 @@ int alpn_select_cb(
     return SSL_TLSEXT_ERR_NOACK;
 }
 
+char ascii_lower(char ch) {
+    return ch >= 'A' && ch <= 'Z' ? static_cast<char>(ch + ('a' - 'A')) : ch;
+}
+
+bool valid_sni_server_name(const char* name, u32* len_out) {
+    if (name == nullptr || name[0] == '\0') return false;
+    u32 len = 0;
+    u32 label_len = 0;
+    bool has_alpha = false;
+    while (name[len] != '\0') {
+        if (len >= TlsServerContext::kMaxServerNameLen) return false;
+        const unsigned char ch = static_cast<unsigned char>(name[len]);
+        if (ch == '.') {
+            if (label_len == 0 || name[len - 1] == '-') return false;
+            label_len = 0;
+        } else {
+            const bool alpha = (ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z');
+            const bool digit = ch >= '0' && ch <= '9';
+            if ((!alpha && !digit && ch != '-') || (label_len == 0 && ch == '-')) return false;
+            if (++label_len > 63) return false;
+            has_alpha = has_alpha || alpha;
+        }
+        len++;
+    }
+    if (label_len == 0 || name[len - 1] == '-' || !has_alpha) return false;
+    *len_out = len;
+    return true;
+}
+
+bool sni_name_eq(const char* lhs, u32 lhs_len, const char* rhs) {
+    if (rhs == nullptr) return false;
+    u32 i = 0;
+    for (; i < lhs_len && rhs[i] != '\0'; i++) {
+        if (ascii_lower(lhs[i]) != ascii_lower(rhs[i])) return false;
+    }
+    return i == lhs_len && rhs[i] == '\0';
+}
+
+core::Expected<SSL_CTX*, Error> create_server_ssl_ctx(const char* cert_path,
+                                                      const char* key_path,
+                                                      const char* client_ca_file) {
+    if (cert_path == nullptr || key_path == nullptr || cert_path[0] == '\0' || key_path[0] == '\0')
+        return core::make_unexpected(Error::make(EINVAL, Error::Source::Socket));
+    SSL_CTX* ssl_ctx = SSL_CTX_new(TLS_server_method());
+    if (!ssl_ctx) return core::make_unexpected(Error::make(EIO, Error::Source::Socket));
+
+    SSL_CTX_set_min_proto_version(ssl_ctx, TLS1_2_VERSION);
+    SSL_CTX_set_mode(ssl_ctx, SSL_MODE_RELEASE_BUFFERS);
+    if (SSL_CTX_use_certificate_chain_file(ssl_ctx, cert_path) != 1 ||
+        SSL_CTX_use_PrivateKey_file(ssl_ctx, key_path, SSL_FILETYPE_PEM) != 1 ||
+        SSL_CTX_check_private_key(ssl_ctx) != 1) {
+        SSL_CTX_free(ssl_ctx);
+        return core::make_unexpected(Error::make(EINVAL, Error::Source::Socket));
+    }
+    if (client_ca_file != nullptr) {
+        if (client_ca_file[0] == '\0' ||
+            SSL_CTX_load_verify_locations(ssl_ctx, client_ca_file, nullptr) != 1) {
+            SSL_CTX_free(ssl_ctx);
+            return core::make_unexpected(Error::make(EINVAL, Error::Source::Socket));
+        }
+        STACK_OF(X509_NAME)* client_ca_names = SSL_load_client_CA_file(client_ca_file);
+        if (client_ca_names == nullptr) {
+            SSL_CTX_free(ssl_ctx);
+            return core::make_unexpected(Error::make(EINVAL, Error::Source::Socket));
+        }
+        SSL_CTX_set_client_CA_list(ssl_ctx, client_ca_names);
+        SSL_CTX_set_verify(ssl_ctx, SSL_VERIFY_PEER | SSL_VERIFY_FAIL_IF_NO_PEER_CERT, nullptr);
+    }
+    return ssl_ctx;
+}
+
+int sni_select_cb(SSL* ssl, int* /*alert*/, void* arg) {
+    auto* ctx = static_cast<TlsServerContext*>(arg);
+    if (ctx == nullptr) return SSL_TLSEXT_ERR_NOACK;
+    const char* requested = SSL_get_servername(ssl, TLSEXT_NAMETYPE_host_name);
+    if (requested == nullptr) return SSL_TLSEXT_ERR_NOACK;
+    for (u32 i = 0; i < ctx->sni_identity_count; i++) {
+        const auto& identity = ctx->sni_identities[i];
+        if (!sni_name_eq(identity.server_name, identity.server_name_len, requested)) continue;
+        return SSL_set_SSL_CTX(ssl, identity.ssl_ctx) != nullptr ? SSL_TLSEXT_ERR_OK
+                                                                 : SSL_TLSEXT_ERR_ALERT_FATAL;
+    }
+    return SSL_TLSEXT_ERR_NOACK;
+}
+
 }  // namespace
 
 AlpnProtocol alpn_pick(bool offer_h2, const u8* client_protos, u32 client_len) {
@@ -80,27 +165,13 @@ AlpnProtocol tls_negotiated_protocol(SSL* ssl) {
 
 core::Expected<TlsServerContext*, Error> create_tls_server_context(const char* cert_path,
                                                                    const char* key_path,
-                                                                   bool offer_h2) {
+                                                                   bool offer_h2,
+                                                                   const char* client_ca_file) {
     TRY_VOID(tls_init_once());
 
-    SSL_CTX* ssl_ctx = SSL_CTX_new(TLS_server_method());
-    if (!ssl_ctx) return core::make_unexpected(Error::make(EIO, Error::Source::Socket));
-
-    SSL_CTX_set_min_proto_version(ssl_ctx, TLS1_2_VERSION);
-    SSL_CTX_set_mode(ssl_ctx, SSL_MODE_RELEASE_BUFFERS);
-
-    if (SSL_CTX_use_certificate_chain_file(ssl_ctx, cert_path) != 1) {
-        SSL_CTX_free(ssl_ctx);
-        return core::make_unexpected(Error::make(EINVAL, Error::Source::Socket));
-    }
-    if (SSL_CTX_use_PrivateKey_file(ssl_ctx, key_path, SSL_FILETYPE_PEM) != 1) {
-        SSL_CTX_free(ssl_ctx);
-        return core::make_unexpected(Error::make(EINVAL, Error::Source::Socket));
-    }
-    if (SSL_CTX_check_private_key(ssl_ctx) != 1) {
-        SSL_CTX_free(ssl_ctx);
-        return core::make_unexpected(Error::make(EINVAL, Error::Source::Socket));
-    }
+    auto ssl_ctx_result = create_server_ssl_ctx(cert_path, key_path, client_ca_file);
+    if (!ssl_ctx_result) return core::make_unexpected(ssl_ctx_result.error());
+    SSL_CTX* ssl_ctx = ssl_ctx_result.value();
 
     auto* ctx = static_cast<TlsServerContext*>(malloc(sizeof(TlsServerContext)));
     if (!ctx) {
@@ -109,14 +180,50 @@ core::Expected<TlsServerContext*, Error> create_tls_server_context(const char* c
     }
     ctx->ssl_ctx = ssl_ctx;
     ctx->offer_h2 = offer_h2;
+    ctx->sni_identity_count = 0;
     // Register ALPN negotiation. arg = ctx so the callback can read offer_h2.
     // ctx outlives ssl_ctx (freed together in destroy_tls_server_context).
     SSL_CTX_set_alpn_select_cb(ssl_ctx, alpn_select_cb, ctx);
+    SSL_CTX_set_tlsext_servername_callback(ssl_ctx, sni_select_cb);
+    SSL_CTX_set_tlsext_servername_arg(ssl_ctx, ctx);
     return ctx;
+}
+
+core::Expected<void, Error> add_tls_server_sni_identity(TlsServerContext* ctx,
+                                                        const char* server_name,
+                                                        const char* cert_path,
+                                                        const char* key_path,
+                                                        const char* client_ca_file) {
+    if (ctx == nullptr || ctx->ssl_ctx == nullptr ||
+        ctx->sni_identity_count >= TlsServerContext::kMaxSniIdentities)
+        return core::make_unexpected(Error::make(EINVAL, Error::Source::Socket));
+    u32 server_name_len = 0;
+    if (!valid_sni_server_name(server_name, &server_name_len))
+        return core::make_unexpected(Error::make(EINVAL, Error::Source::Socket));
+    for (u32 i = 0; i < ctx->sni_identity_count; i++) {
+        if (sni_name_eq(ctx->sni_identities[i].server_name,
+                        ctx->sni_identities[i].server_name_len,
+                        server_name))
+            return core::make_unexpected(Error::make(EEXIST, Error::Source::Socket));
+    }
+    auto ssl_ctx_result = create_server_ssl_ctx(cert_path, key_path, client_ca_file);
+    if (!ssl_ctx_result) return core::make_unexpected(ssl_ctx_result.error());
+
+    auto& identity = ctx->sni_identities[ctx->sni_identity_count];
+    identity.ssl_ctx = ssl_ctx_result.value();
+    identity.server_name_len = server_name_len;
+    for (u32 i = 0; i < server_name_len; i++) identity.server_name[i] = ascii_lower(server_name[i]);
+    identity.server_name[server_name_len] = '\0';
+    SSL_CTX_set_alpn_select_cb(identity.ssl_ctx, alpn_select_cb, ctx);
+    ctx->sni_identity_count++;
+    return {};
 }
 
 void destroy_tls_server_context(TlsServerContext* ctx) {
     if (!ctx) return;
+    for (u32 i = 0; i < ctx->sni_identity_count; i++) {
+        if (ctx->sni_identities[i].ssl_ctx) SSL_CTX_free(ctx->sni_identities[i].ssl_ctx);
+    }
     if (ctx->ssl_ctx) SSL_CTX_free(ctx->ssl_ctx);
     free(ctx);
 }
@@ -145,8 +252,13 @@ void destroy_tls_server_ssl(SSL* ssl) {
     if (ssl) SSL_free(ssl);
 }
 
-core::Expected<TlsClientContext*, Error> create_tls_client_context(const char* ca_file) {
+core::Expected<TlsClientContext*, Error> create_tls_client_context(const char* ca_file,
+                                                                   const char* cert_path,
+                                                                   const char* key_path) {
     TRY_VOID(tls_init_once());
+    if ((cert_path == nullptr) != (key_path == nullptr) ||
+        (cert_path != nullptr && (cert_path[0] == '\0' || key_path[0] == '\0')))
+        return core::make_unexpected(Error::make(EINVAL, Error::Source::Socket));
     SSL_CTX* ssl_ctx = SSL_CTX_new(TLS_client_method());
     if (!ssl_ctx) return core::make_unexpected(Error::make(EIO, Error::Source::Socket));
     SSL_CTX_set_min_proto_version(ssl_ctx, TLS1_2_VERSION);
@@ -173,6 +285,14 @@ core::Expected<TlsClientContext*, Error> create_tls_client_context(const char* c
     if (loaded != 1) {
         SSL_CTX_free(ssl_ctx);
         return core::make_unexpected(Error::make(EINVAL, Error::Source::Socket));
+    }
+    if (cert_path != nullptr) {
+        if (SSL_CTX_use_certificate_chain_file(ssl_ctx, cert_path) != 1 ||
+            SSL_CTX_use_PrivateKey_file(ssl_ctx, key_path, SSL_FILETYPE_PEM) != 1 ||
+            SSL_CTX_check_private_key(ssl_ctx) != 1) {
+            SSL_CTX_free(ssl_ctx);
+            return core::make_unexpected(Error::make(EINVAL, Error::Source::Socket));
+        }
     }
     auto* ctx = static_cast<TlsClientContext*>(malloc(sizeof(TlsClientContext)));
     if (!ctx) {

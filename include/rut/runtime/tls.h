@@ -17,21 +17,38 @@ enum class AlpnProtocol : u8 {
 };
 
 struct TlsServerContext {
+    static constexpr u32 kMaxSniIdentities = 16;
+    static constexpr u32 kMaxServerNameLen = 253;
+
+    struct SniIdentity {
+        SSL_CTX* ssl_ctx = nullptr;
+        char server_name[kMaxServerNameLen + 1]{};
+        u32 server_name_len = 0;
+    };
+
     SSL_CTX* ssl_ctx;
     // Whether the ALPN select callback advertises "h2". When false the server
     // only ever selects "http/1.1", so an h2-capable client downgrades.
     bool offer_h2;
+    SniIdentity sni_identities[kMaxSniIdentities];
+    u32 sni_identity_count;
 };
 
 struct TlsClientContext {
     SSL_CTX* ssl_ctx;
 };
 
-// offer_h2: advertise HTTP/2 over ALPN. Leave false until the HTTP/2 data
-// path is wired, otherwise an h2 client would be handed to the HTTP/1 parser.
-core::Expected<TlsServerContext*, Error> create_tls_server_context(const char* cert_path,
-                                                                   const char* key_path,
-                                                                   bool offer_h2 = false);
+// offer_h2 advertises HTTP/2 over ALPN; false limits TLS negotiation to HTTP/1.1.
+core::Expected<TlsServerContext*, Error> create_tls_server_context(
+    const char* cert_path,
+    const char* key_path,
+    bool offer_h2 = false,
+    const char* client_ca_file = nullptr);
+core::Expected<void, Error> add_tls_server_sni_identity(TlsServerContext* ctx,
+                                                        const char* server_name,
+                                                        const char* cert_path,
+                                                        const char* key_path,
+                                                        const char* client_ca_file = nullptr);
 void destroy_tls_server_context(TlsServerContext* ctx);
 core::Expected<SSL*, Error> create_tls_server_ssl(TlsServerContext* ctx, i32 fd);
 void destroy_tls_server_ssl(SSL* ssl);
@@ -46,9 +63,12 @@ AlpnProtocol alpn_pick(bool offer_h2, const u8* client_protos, u32 client_len);
 // handshake selected no ALPN protocol (plain HTTP/1.1).
 AlpnProtocol tls_negotiated_protocol(SSL* ssl);
 
-// Verified upstream TLS. A null ca_file uses the platform trust store; tests
-// and private deployments may provide an explicit PEM bundle.
-core::Expected<TlsClientContext*, Error> create_tls_client_context(const char* ca_file = nullptr);
+// Verified upstream TLS. A null ca_file uses the platform trust store. The
+// client certificate and key are optional, but must be supplied together when
+// the upstream requires mutual TLS.
+core::Expected<TlsClientContext*, Error> create_tls_client_context(const char* ca_file = nullptr,
+                                                                   const char* cert_path = nullptr,
+                                                                   const char* key_path = nullptr);
 void destroy_tls_client_context(TlsClientContext* ctx);
 core::Expected<SSL*, Error> create_tls_client_ssl(TlsClientContext* ctx,
                                                   i32 fd,
