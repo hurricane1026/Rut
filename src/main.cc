@@ -387,7 +387,10 @@ static i32 run_shards(u16 port,
         }
         if (reload_enabled) {
             const ReloadCoordinatorPoll result = reload_coordinator.poll();
-            if (result == ReloadCoordinatorPoll::CompileFailed) {
+            if (result == ReloadCoordinatorPoll::SnapshotUnavailable) {
+                write_str("Reload request unavailable: source snapshot could not be prepared\n");
+                write_reload_record(control_plane_mutation.last_record());
+            } else if (result == ReloadCoordinatorPoll::CompileFailed) {
                 char msg[512];
                 format_load_error(reload_coordinator.last_load_error(), msg, sizeof(msg));
                 write_str("Reload failed: ");

@@ -6,50 +6,12 @@
 
 using namespace rut;
 
-struct SourceCaptureFinalization {
-    u32 calls = 0;
-    bool admitted = false;
-};
-
-static void record_source_capture_finalization(void* context, bool admitted) {
-    auto* result = static_cast<SourceCaptureFinalization*>(context);
-    result->calls++;
-    result->admitted = admitted;
-}
-
-static bool failed_source_capture(
-    void*, ReloadRequestSource, char*, u32, u32*, ReloadSourceVersionCaptureLease*) {
+static bool failed_source_capture(void*, ReloadRequestSource, char*, u32, u32*) {
     return false;
 }
-static bool oversized_source_capture(void* context,
-                                     ReloadRequestSource,
-                                     char*,
-                                     u32 capacity,
-                                     u32* out_len,
-                                     ReloadSourceVersionCaptureLease* lease) {
+static bool oversized_source_capture(
+    void*, ReloadRequestSource, char*, u32 capacity, u32* out_len) {
     *out_len = capacity;
-    if (lease != nullptr && context != nullptr) {
-        lease->finalizer = record_source_capture_finalization;
-        lease->context = context;
-    }
-    return true;
-}
-
-static bool successful_source_capture(void* context,
-                                      ReloadRequestSource,
-                                      char* out,
-                                      u32 capacity,
-                                      u32* out_len,
-                                      ReloadSourceVersionCaptureLease* lease) {
-    if (capacity < 4) return false;
-    out[0] = 'v';
-    out[1] = '1';
-    out[2] = '\0';
-    *out_len = 2;
-    if (lease != nullptr && context != nullptr) {
-        lease->finalizer = record_source_capture_finalization;
-        lease->context = context;
-    }
     return true;
 }
 
@@ -2578,32 +2540,6 @@ TEST(control_plane_mutation, route_snapshot_capture_failure_is_rejected_without_
         CHECK_FALSE(port.request_reload(ReloadRequestSource::Route));
         CHECK_FALSE(port.last_record().valid);
     }
-}
-
-TEST(control_plane_mutation, source_capture_finalizer_tracks_admission_ownership) {
-    ControlPlaneMutationPort port;
-    port.reset(1, true);
-    SourceCaptureFinalization result;
-    port.set_reload_source_version_capture(successful_source_capture, &result);
-
-    REQUIRE(port.request_reload(ReloadRequestSource::Route));
-    CHECK_EQ(result.calls, 1u);
-    CHECK(result.admitted);
-}
-
-TEST(control_plane_mutation, source_capture_finalizer_releases_rejected_capture) {
-    ControlPlaneMutationPort port;
-    port.reset(1, true);
-    SourceCaptureFinalization result;
-    port.set_reload_source_version_capture(oversized_source_capture, &result);
-
-    CHECK_FALSE(port.request_reload(ReloadRequestSource::Route));
-    CHECK_EQ(result.calls, 1u);
-    CHECK_FALSE(result.admitted);
-
-    port.set_reload_source_version_capture(failed_source_capture, &result);
-    CHECK_FALSE(port.request_reload(ReloadRequestSource::Route));
-    CHECK_EQ(result.calls, 1u);
 }
 
 TEST(control_plane_mutation, source_version_capture_only_clears_for_its_registration) {

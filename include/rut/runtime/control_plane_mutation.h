@@ -87,24 +87,8 @@ struct ReloadRequest {
     char source_version[kMaxSourceVersion]{};
 };
 
-using ReloadSourceVersionCaptureFinalizer = void (*)(void* context, bool admitted);
-struct ReloadSourceVersionCaptureLease {
-    ReloadSourceVersionCaptureFinalizer finalizer = nullptr;
-    void* context = nullptr;
-
-    void finish(bool admitted) const {
-        if (finalizer != nullptr) finalizer(context, admitted);
-    }
-};
-// A successful capture may return a lease that spans the admission CAS. The
-// port finalizes rejected captures immediately; an admitted request's consumer
-// releases its retained snapshot after loading the captured path.
-using ReloadSourceVersionCapture = bool (*)(void* context,
-                                            ReloadRequestSource source,
-                                            char* out,
-                                            u32 capacity,
-                                            u32* out_len,
-                                            ReloadSourceVersionCaptureLease* lease);
+using ReloadSourceVersionCapture =
+    bool (*)(void* context, ReloadRequestSource source, char* out, u32 capacity, u32* out_len);
 
 struct ReloadTerminalRecord {
     bool valid = false;
@@ -450,28 +434,23 @@ public:
                     continue;
                 }
                 // Capture only after this caller owns the single admission
-                // slot. This lets a provider bind an immutable source snapshot
-                // to the winning request without doing work for Busy callers.
+                // slot. The callback must remain bounded and allocation-free;
+                // the coordinator prepares default-loader snapshots later.
                 char source_version[ReloadRequest::kMaxSourceVersion]{};
                 u32 source_version_len = 0;
                 bool snapshot_recorded = false;
-                bool source_version_captured = false;
                 bool snapshot_capture_failed = false;
-                ReloadSourceVersionCaptureLease source_version_lease{};
                 if (source_version_capture_ != nullptr) {
-                    source_version_captured =
-                        source_version_capture_(source_version_capture_context_,
-                                                source,
-                                                source_version,
-                                                ReloadRequest::kMaxSourceVersion,
-                                                &source_version_len,
-                                                &source_version_lease);
-                    snapshot_capture_failed = !source_version_captured;
+                    snapshot_capture_failed =
+                        !source_version_capture_(source_version_capture_context_,
+                                                 source,
+                                                 source_version,
+                                                 ReloadRequest::kMaxSourceVersion,
+                                                 &source_version_len);
                     snapshot_capture_failed |=
                         source_version_len >= ReloadRequest::kMaxSourceVersion;
                 }
                 if (snapshot_capture_failed) {
-                    if (source_version_captured) source_version_lease.finish(false);
                     if (source == ReloadRequestSource::Signal) {
                         ClaimedRecordSlot snapshot_slot{};
                         const u64 snapshot_id = reserve_request_identity(&snapshot_slot);
@@ -498,7 +477,6 @@ public:
                 ClaimedRecordSlot identity_slot{};
                 const u64 id = reserve_request_identity(&identity_slot);
                 if (id == 0) {
-                    source_version_lease.finish(false);
                     release_request_identity_claim();
                     unlock_terminal_publication();
                     if (source == ReloadRequestSource::Signal)
@@ -519,7 +497,6 @@ public:
                 for (u32 i = 0; i < source_version_len; i++) source_version_[i] = source_version[i];
                 const bool admitted = reload_word_.compare_exchange_strong(
                     observed, desired, std::memory_order_acq_rel, std::memory_order_acquire);
-                source_version_lease.finish(admitted);
                 if (admitted) {
                     // The accepted request keeps its identity but does not
                     // consume a terminal-history ticket until completion.

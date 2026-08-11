@@ -16,6 +16,7 @@ struct ReloadShardEndpoint {
 
 enum class ReloadCoordinatorPoll : u8 {
     Idle = 0,
+    SnapshotUnavailable,
     CompileFailed,
     ValidationFailed,
     Published,
@@ -34,8 +35,8 @@ using ReloadCancellationCheck = bool (*)(void* context);
 // Single process owner for source compilation, generation publication, shard
 // acknowledgements, and LoadedProgram lifetime. poll() is called only by the
 // process control thread. Request admission remains allocation-free through
-// ControlPlaneMutationPort; default-loader admission also validates the
-// provider identity before leasing the control thread's prepared snapshot.
+// ControlPlaneMutationPort; after a request wins admission, the control thread
+// binds it to the current immutable provider snapshot before compilation.
 class ProcessReloadCoordinator {
 public:
     static constexpr u32 kMaxShards = 256;
@@ -77,17 +78,11 @@ private:
                                LoadedProgram& output,
                                LoadError& error,
                                jit::OptLevel opt);
-    static bool capture_source_version(void* context,
-                                       ReloadRequestSource source,
-                                       char* out,
-                                       u32 capacity,
-                                       u32* out_len,
-                                       ReloadSourceVersionCaptureLease* lease);
-    static void finalize_source_version_capture(void* context, bool admitted);
+    static bool capture_source_version(
+        void* context, ReloadRequestSource source, char* out, u32 capacity, u32* out_len);
     bool refresh_source_snapshot();
     void clear_source_snapshots();
     void reclaim_retired_snapshots();
-    void release_source_snapshot();
     bool all_shards_acknowledged(u64 generation) const;
 
     ControlPlaneMutationPort* mutation_ = nullptr;
@@ -108,13 +103,6 @@ private:
     std::string cached_snapshot_source_;
     std::string source_snapshot_root_;
     std::vector<std::string> retired_snapshot_roots_;
-    // Published by the control thread after a complete immutable snapshot is
-    // installed. Route workers validate only the provider identity, then copy
-    // this prepared path; source-tree reads and materialization stay on the
-    // control thread.
-    std::atomic<u64> source_snapshot_epoch_{0};
-    std::atomic<bool> route_snapshot_armed_{false};
-    std::atomic<u32> source_snapshot_leases_{0};
     mutable std::mutex source_snapshot_mutex_;
     ReloadRequest request_{};
     u64 old_generation_ = 0;

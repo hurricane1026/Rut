@@ -58,15 +58,6 @@ bool same_upstream_endpoints(const UpstreamTarget& lhs, const UpstreamTarget& rh
     return true;
 }
 
-bool release_snapshot_lease(std::atomic<u32>& leases) {
-    u32 current = leases.load(std::memory_order_acquire);
-    while (current != 0 &&
-           !leases.compare_exchange_weak(
-               current, current - 1, std::memory_order_acq_rel, std::memory_order_acquire)) {
-    }
-    return current != 0;
-}
-
 }  // namespace
 
 bool ProcessReloadCoordinator::default_loader(
@@ -96,16 +87,14 @@ void ProcessReloadCoordinator::clear_source_snapshots() {
             retired_snapshot_roots_.push_back(std::move(source_snapshot_root_));
         cached_snapshot_source_.clear();
         cached_provider_version_.clear();
-        source_snapshot_epoch_.store(0, std::memory_order_release);
-        route_snapshot_armed_.store(false, std::memory_order_release);
     }
+    reclaim_retired_snapshots();
 }
 
 void ProcessReloadCoordinator::reclaim_retired_snapshots() {
     std::vector<std::string> roots;
     {
         std::lock_guard lock(source_snapshot_mutex_);
-        if (source_snapshot_leases_.load(std::memory_order_acquire) != 0) return;
         roots.swap(retired_snapshot_roots_);
     }
     for (const auto& root : roots) {
@@ -114,20 +103,12 @@ void ProcessReloadCoordinator::reclaim_retired_snapshots() {
     }
 }
 
-void ProcessReloadCoordinator::release_source_snapshot() {
-    if (release_snapshot_lease(source_snapshot_leases_)) reclaim_retired_snapshots();
-}
-
 bool ProcessReloadCoordinator::refresh_source_snapshot() {
     if (!default_loader_selected_) return true;
     char version[ReloadRequest::kMaxSourceVersion]{};
     u32 version_len = 0;
     if (!resolve_rut_program_source_version(source_path_, version, sizeof(version), &version_len)) {
-        std::lock_guard lock(source_snapshot_mutex_);
-        cached_snapshot_source_.clear();
-        cached_provider_version_.clear();
-        source_snapshot_epoch_.store(0, std::memory_order_release);
-        route_snapshot_armed_.store(false, std::memory_order_release);
+        clear_source_snapshots();
         return false;
     }
     bool cache_hit = false;
@@ -136,15 +117,7 @@ bool ProcessReloadCoordinator::refresh_source_snapshot() {
         cache_hit = cached_provider_version_.size() == version_len &&
                     __builtin_memcmp(cached_provider_version_.data(), version, version_len) == 0;
     }
-    if (cache_hit) {
-        route_snapshot_armed_.store(true, std::memory_order_release);
-        reclaim_retired_snapshots();
-        return true;
-    }
-    // A provider version change invalidates the old admission boundary. Drop
-    // the cached path before materializing the replacement so no route can
-    // observe the previous snapshot after the control thread refreshes.
-    clear_source_snapshots();
+    if (cache_hit) return true;
     char snapshot_source[ReloadRequest::kMaxSourceVersion]{};
     char snapshot_root[ReloadRequest::kMaxSourceVersion]{};
     u32 source_len = 0;
@@ -156,13 +129,7 @@ bool ProcessReloadCoordinator::refresh_source_snapshot() {
                                                  snapshot_root,
                                                  sizeof(snapshot_root),
                                                  &root_len)) {
-        std::lock_guard lock(source_snapshot_mutex_);
-        cached_snapshot_source_.clear();
-        cached_provider_version_.clear();
-        source_snapshot_epoch_.store(0, std::memory_order_release);
-        route_snapshot_armed_.store(false, std::memory_order_release);
-        if (!source_snapshot_root_.empty())
-            retired_snapshot_roots_.push_back(std::move(source_snapshot_root_));
+        clear_source_snapshots();
         return false;
     }
     std::string previous_root;
@@ -172,52 +139,25 @@ bool ProcessReloadCoordinator::refresh_source_snapshot() {
         source_snapshot_root_.assign(snapshot_root, root_len);
         cached_provider_version_.assign(version, version_len);
         cached_snapshot_source_.assign(snapshot_source, source_len);
-        source_snapshot_epoch_.fetch_add(1, std::memory_order_release);
     }
     if (!previous_root.empty()) {
         std::lock_guard lock(source_snapshot_mutex_);
         retired_snapshot_roots_.push_back(std::move(previous_root));
     }
-    route_snapshot_armed_.store(true, std::memory_order_release);
     reclaim_retired_snapshots();
     return true;
 }
 
-bool ProcessReloadCoordinator::capture_source_version(void* context,
-                                                      ReloadRequestSource source,
-                                                      char* out,
-                                                      u32 capacity,
-                                                      u32* out_len,
-                                                      ReloadSourceVersionCaptureLease* lease) {
+bool ProcessReloadCoordinator::capture_source_version(
+    void* context, ReloadRequestSource, char* out, u32 capacity, u32* out_len) {
     auto* coordinator = static_cast<ProcessReloadCoordinator*>(context);
-    if (coordinator == nullptr) return false;
+    if (coordinator == nullptr || out == nullptr || out_len == nullptr || capacity == 0)
+        return false;
     if (coordinator->default_loader_selected_) {
-        char version[ReloadRequest::kMaxSourceVersion]{};
-        u32 version_len = 0;
-        if (!resolve_rut_program_source_version(
-                coordinator->source_path_, version, sizeof(version), &version_len))
-            return false;
-        const u64 epoch = coordinator->source_snapshot_epoch_.load(std::memory_order_acquire);
-        if (epoch == 0) return false;
-        if (source == ReloadRequestSource::Route &&
-            !coordinator->route_snapshot_armed_.load(std::memory_order_acquire))
-            return false;
-        std::unique_lock lock(coordinator->source_snapshot_mutex_, std::try_to_lock);
-        if (!lock.owns_lock()) return false;
-        if (epoch != coordinator->source_snapshot_epoch_.load(std::memory_order_acquire))
-            return false;
-        if (coordinator->cached_provider_version_.size() != version_len ||
-            __builtin_memcmp(coordinator->cached_provider_version_.data(), version, version_len) !=
-                0)
-            return false;
-        const u32 len = static_cast<u32>(coordinator->cached_snapshot_source_.size());
-        if (len == 0 || len >= capacity || lease == nullptr) return false;
-        coordinator->source_snapshot_leases_.fetch_add(1, std::memory_order_acq_rel);
-        lease->finalizer = &finalize_source_version_capture;
-        lease->context = coordinator;
-        __builtin_memcpy(out, coordinator->cached_snapshot_source_.data(), len);
-        out[len] = '\0';
-        *out_len = len;
+        // Default-loader requests reserve the admission slot without touching
+        // the filesystem. poll() binds the winner to the current provider.
+        out[0] = '\0';
+        *out_len = 0;
         return true;
     }
     const u32 len = static_cast<u32>(__builtin_strlen(coordinator->source_path_));
@@ -225,13 +165,6 @@ bool ProcessReloadCoordinator::capture_source_version(void* context,
     __builtin_memcpy(out, coordinator->source_path_, len + 1);
     *out_len = len;
     return true;
-}
-
-void ProcessReloadCoordinator::finalize_source_version_capture(void* context, bool admitted) {
-    if (admitted) return;
-    auto* coordinator = static_cast<ProcessReloadCoordinator*>(context);
-    if (coordinator == nullptr || !coordinator->default_loader_selected_) return;
-    (void)release_snapshot_lease(coordinator->source_snapshot_leases_);
 }
 
 bool ProcessReloadCoordinator::init(ControlPlaneMutationPort* mutation,
@@ -271,10 +204,6 @@ bool ProcessReloadCoordinator::init(ControlPlaneMutationPort* mutation,
     cancellation_context_ = cancellation_context;
     supports_active_health_probes_ = supports_active_health_probes;
     clear_source_snapshots();
-    if (default_loader_selected_) (void)refresh_source_snapshot();
-    // Startup preparation establishes the source snapshot but does not arm
-    // route-triggered reload until the control loop has observed that boundary.
-    route_snapshot_armed_.store(false, std::memory_order_release);
     mutation_->set_reload_source_version_capture(&capture_source_version, this);
     request_ = {};
     old_generation_ = 0;
@@ -284,13 +213,6 @@ bool ProcessReloadCoordinator::init(ControlPlaneMutationPort* mutation,
 
 bool ProcessReloadCoordinator::request_signal(u64* request_id) {
     if (mutation_ == nullptr) return false;
-    if (mutation_->state() != ReloadAdmissionState::Idle || mutation_->admission_in_progress())
-        return mutation_->request_reload(ReloadRequestSource::Signal, request_id);
-    // Signals are processed by the control thread, so they may synchronously
-    // materialize the current immutable source version before admission. A
-    // refresh failure still enters the mutation port so SIGHUP receives its
-    // required SnapshotUnavailable terminal record.
-    if (default_loader_selected_) (void)refresh_source_snapshot();
     return mutation_->request_reload(ReloadRequestSource::Signal, request_id);
 }
 
@@ -449,31 +371,33 @@ ReloadCoordinatorPoll ProcessReloadCoordinator::poll() {
     }
 
     ReloadRequest request{};
-    if (!mutation_->take_reload(&request)) {
-        // Do not delay an admitted request by materializing a newer provider
-        // tree. Refresh only when the control port has no pending request.
-        (void)refresh_source_snapshot();
-        return ReloadCoordinatorPoll::Idle;
-    }
+    if (!mutation_->take_reload(&request)) return ReloadCoordinatorPoll::Idle;
     request_ = request;
     old_generation_ = active_->config.config_generation;
     spare_->destroy();
     last_load_error_ = {};
+    std::string prepared_source;
     const char* source_path = request.source_version;
-    // The admission callback captured this immutable source-version handle.
-    // Never refresh the provider cache here: doing so could compile a newer
-    // version than the one associated with the admitted request.
+    if (default_loader_selected_) {
+        if (!refresh_source_snapshot()) {
+            spare_->destroy();
+            (void)mutation_->complete_reload(
+                request.id, request.source, ReloadTerminalOutcome::SnapshotUnavailable);
+            return ReloadCoordinatorPoll::SnapshotUnavailable;
+        }
+        {
+            std::lock_guard lock(source_snapshot_mutex_);
+            prepared_source = cached_snapshot_source_;
+        }
+        source_path = prepared_source.c_str();
+    }
     if (source_path == nullptr || source_path[0] == '\0' ||
         !loader_(loader_context_, source_path, *spare_, last_load_error_, opt_)) {
         spare_->destroy();
-        if (default_loader_selected_) release_source_snapshot();
         (void)mutation_->complete_reload(
             request.id, request.source, ReloadTerminalOutcome::CompileFailed);
         return ReloadCoordinatorPoll::CompileFailed;
     }
-    // The admitted request has finished reading its source. Older snapshot
-    // roots retained across a cache swap can now be reclaimed safely.
-    if (default_loader_selected_) release_source_snapshot();
     if (cancellation_check_ != nullptr && cancellation_check_(cancellation_context_)) {
         spare_->destroy();
         mutation_->stop();
