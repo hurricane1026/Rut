@@ -602,6 +602,24 @@ TEST(serve_loader, reload_snapshot_resolution_failure_clears_stale_diagnostic) {
     program.destroy();
 }
 
+TEST(serve_loader, snapshot_loaders_reject_null_paths) {
+    LoadedProgram program;
+    LoadError error;
+    error.stage = LoadStage::Parse;
+    error.has_diag = true;
+
+    CHECK_FALSE(load_rut_program_snapshot(nullptr, program, error));
+    CHECK_EQ(error.stage, LoadStage::Read);
+    CHECK_FALSE(error.has_diag);
+
+    error.stage = LoadStage::Parse;
+    error.has_diag = true;
+    CHECK_FALSE(load_rut_program_source_version(nullptr, program, error));
+    CHECK_EQ(error.stage, LoadStage::Read);
+    CHECK_FALSE(error.has_diag);
+    program.destroy();
+}
+
 TEST(serve_loader, reload_snapshot_rejects_import_symlink_escape) {
     const std::string dir = "/tmp/rut_serve_loader_snapshot_escape";
     const std::string version_dir = dir + "/releases/v1";

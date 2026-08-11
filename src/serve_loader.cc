@@ -309,6 +309,7 @@ bool load_rut_program_snapshot(
     const char* path, LoadedProgram& out, LoadError& err, jit::OptLevel opt, u64 max_source_bytes) {
     err = LoadError{};
     err.stage = LoadStage::Read;
+    if (path == nullptr) return false;
     std::error_code path_error;
     const auto status = std::filesystem::symlink_status(path, path_error);
     if (path_error) return false;
@@ -344,6 +345,7 @@ bool load_rut_program_source_version(const char* source_version,
                                      u64 max_source_bytes) {
     err = LoadError{};
     err.stage = LoadStage::Read;
+    if (source_version == nullptr) return false;
     char directory[] = "/tmp/rut-source-snapshot-XXXXXX";
     char* created = mkdtemp(directory);
     if (created == nullptr) return false;
