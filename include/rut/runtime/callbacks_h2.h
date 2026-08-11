@@ -7,11 +7,11 @@
 // Serves: static (return-status) routes, the route-less default 200, synchronous JIT
 // handlers (status + optional body/headers + request bodies), timer-yielding JIT
 // handlers (wait(ms) — suspended on the async slot, resumed via the yield timer),
-// and no-body proxy routes (forwarded to the h1 upstream, response buffered and
-// re-framed). One suspended stream per connection (others queue). Still 503:
-// forwarding/event-yield JIT handlers, and proxy with a request body. HTTP/1 is
-// untouched: this path is only entered when conn.protocol == Http2 (ALPN) or the
-// cleartext h2c preface is detected.
+// buffered JIT forwarding, and proxy routes with or without request bodies
+// (forwarded to the h1 upstream, response buffered and re-framed). One suspended
+// stream per connection (others queue). Unbuffered JIT forwarding and non-timer
+// event yields still return 503. HTTP/1 is untouched: this path is only entered
+// when conn.protocol == Http2 (ALPN) or the cleartext h2c preface is detected.
 
 #include "rut/runtime/access_log.h"  // monotonic_us
 #include "rut/runtime/connection.h"

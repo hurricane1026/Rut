@@ -8,11 +8,17 @@ Core contract: **Swift-exact or absent** — anything that looks like Swift
 behaves exactly like Swift; near-miss variants do not exist in this language.
 
 **Implementation status**: this card documents both shipped Core and the target
-surface. Forms marked ⏳ are specified but **not yet accepted by the current
-compiler** — they fail to compile today rather than misbehave. Every `rut`
-fence is a front-end fixture unless it is immediately preceded by a reasoned
-`<!-- rut-example: skip ... -->` marker; skipped survey blocks contain target
-or fragment syntax, while every unmarked example parses and type-checks in CI.
+surface. `✅` means the form lowers to an exercised runtime path, `🧩` means the
+front end or runtime substrate exists but the form is gated or incomplete, and
+`⏳` means target syntax that must not be emitted for a current deployment. An
+unmarked form without a status marker is shipped Core; a form in a target survey
+does not become current merely because the parser can recognize part of it.
+
+Every `rut` fence is a **front-end** fixture unless it is immediately preceded
+by a reasoned `<!-- rut-example: skip ... -->` marker. Unmarked examples parse
+and type-check in CI, but that gate alone does not prove MIR/RIR lowering, JIT
+code generation, or runtime support. Runtime claims below are backed by focused
+lowering or integration tests.
 
 ## File anatomy
 
@@ -38,7 +44,8 @@ init { ... }    shutdown { ... }  // lifecycle hooks
 route GET "/health" { return 200 } // zero or more top-level route declarations
 ```
 
-`var` is allowed only inside func/handler bodies — never at top level.
+`var` is ⏳ target syntax for func/handler-local mutation and is never valid at
+top level. Current code uses immutable `let` bindings.
 
 ## Lexical
 
@@ -184,9 +191,18 @@ All functions inline at compile time.
 
 ## Types
 
-Domain types are first-class: `Duration ByteSize StatusCode Method IP CIDR Port
-MediaType Regex Time`. Numeric: `i8..i64 u8..u64 f32 f64`, `str`, `[T]`,
-tuples `(a, b)` — ⏳ `.0`/`.1` projection and `let (x, y) = pair` destructuring pending.
+Current named source annotations are `bool`, `i32`, `str`, `Response`, `Json`,
+`Server`, and declared struct/variant types. `i64` is a runtime value carrier
+produced by large literals, `i64(x)`, time, and `Cache`; it is not a general
+user-written annotation yet. Request fields also carry compiler-known domain
+types such as `IP`, but those internal carriers are not all declarable source
+types. Bounded array `[T]` and tuple annotations are accepted when their element
+shapes are composed from supported types.
+
+General first-class `Duration ByteSize StatusCode Method IP CIDR Port MediaType
+Regex Time` and the remaining numeric types `i8 i16 i64 u8..u64 f32 f64` are ⏳
+target surface as user-written annotations. Tuple `.0`/`.1` projection and
+`let (x, y) = pair` destructuring are also ⏳.
 
 <!-- rut-example: skip type survey contains fragments and experimental protocol syntax -->
 ```rut
@@ -361,6 +377,22 @@ or incrementally editing an upstream buffered body remains ⏳.
 
 ## I/O
 
+Current upstream declarations accept packed endpoints, dictionary-form
+IPv4/IPv6/DNS endpoints, bounded backend lists, and verified upstream TLS:
+
+```rut
+upstream plain at "127.0.0.1:8080"
+upstream secure {
+    host: "api.example.com",
+    port: 443,
+    tls: { server_name: "api.example.com" }
+}
+```
+
+The TLS `server_name` is sent as SNI and verified against the system trust
+store. Upstream client TLS currently uses the epoll path; client certificates,
+custom trust roots, and insecure verification modes are ⏳.
+
 <!-- rut-example: skip I-O survey intentionally includes pending capabilities -->
 ```rut
 // Proxy — the ONLY three forms
@@ -467,26 +499,31 @@ route GET "/api" {
   wait; branch writes in static-for routes remain unsupported. Per-shard state:
   effective limits ≈ limit × shard count.
 
-## Built-ins (call them, never reimplement)
+## Built-ins
 
-```
-string:  s.len s.isEmpty s.hasPrefix/hasSuffix/contains s.upper()/lower()/trim()
-         s.trimPrefix/trimSuffix/replace/split/slice s.matches(re"") s.match(re"")
-hash:    md5 sha1 sha256 sha384 sha512 fnv32 fnv64 | hmacSha256/384/512
-jwt:     jwtDecode(tok, secret:|publicKey:) jwtEncode(claims, ..., alg: .HS256)
-crypto:  aesGcmEncrypt/Decrypt randomBytes(n) uuid()
-encode:  base64 base64url hex urlEncode urlDecode htmlDecode unicodeNormalize
-time:    time.nowMicros() -> i64 (monotonic µs; latched per invocation — all
-         uses in one request see the same value)  max(a, b)  min(a, b)
-         — now()/time(s)/Duration arithmetic still ⏳
-misc:    env(k) json(v) log.info/warn/error(msg, key: val, ...)
-admin:   stats() metrics() ✅ bounded JSON snapshots; reload() -> bool
-         (route-only, capability-gated by --allow-route-reload) ✅ runtime;
-         upstream.mark(server, healthy: bool) -> bool ⏳ compiler/runtime plumbing only:
-         timer-only, explicit shard, statically declared backends; production
-         activation is gated pending replay lowering; upstream_status()
-         config_dump() shard_stats() ⏳
-```
+The current source-to-runtime built-ins are deliberately smaller than the
+target library:
+
+| Status | Surface | Current boundary |
+|---|---|---|
+| ✅ | `s.matches(re"")` | Compile-time validated regex and runtime match |
+| ✅ | string-list `len`, `isEmpty`, `first`, `at(i)` | Available on bounded `[str]` request views |
+| ✅ | `bitwise.and/or/xor/flip/shiftLeft/shiftRight` | Same-width `i32`/`i64` operations |
+| ✅ | `.or(default)`, compatibility `any`/`all` | Eager fallback semantics documented above |
+| ✅ | `i64(x)`, `max(a,b)`, `min(a,b)` | Integer conversion/min/max only |
+| ✅ | `time.nowMicros()` | Monotonic `i64`, latched per invocation; blocked in wait routes |
+| ✅ | `json(v)` | Bounded JSON values and response serialization |
+| ✅ | `stats()`, `metrics()` | Bounded, value-only snapshots |
+| ✅ | `reload() -> bool` | Route-only and capability-gated by `--allow-route-reload` |
+| 🧩 | `upstream.mark(server, healthy:) -> bool` | Timer-only compiler/runtime plumbing; production activation waits on replay lowering |
+
+The following names are ⏳ target library surface and are **not current source
+built-ins**: string length/case/trim/prefix/suffix/replace/split/slice helpers;
+MD5, SHA, FNV and HMAC helpers; JWT; AES-GCM; `randomBytes` and `uuid`; Base64,
+base64url, hex, URL, HTML and Unicode codecs; `env`; structured logging; and
+`upstream_status`, `config_dump`, and `shard_stats`. An opcode or design entry
+without analyzer, lowering, JIT, and execution coverage is not an available
+Rutlang builtin.
 
 `json(stats())` is a handler-entry snapshot for the invoking shard;
 `json(metrics())` is the process aggregate captured at the same boundary. Both
