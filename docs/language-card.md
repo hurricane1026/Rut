@@ -357,8 +357,9 @@ bindings, host/path groups, method unions, typed captures, expression entries,
 and `_` catch-all) is ⏳ target syntax and must not be emitted yet.
 
 Precedence: literal segment > `:param` > `*rest`; exact host > wildcard > `_`.
-Indistinguishable routes are a compile error. Stable middleware uses an explicit
-`chain` direction:
+⏳ Target diagnostic: indistinguishable routes are a compile error. Current
+route tables accept duplicate method/path keys and keep the first inserted
+route. Stable middleware uses an explicit `chain` direction:
 
 <!-- rut-example: skip chain surface is a focused fragment with external helpers -->
 ```rut
