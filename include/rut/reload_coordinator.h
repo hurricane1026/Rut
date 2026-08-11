@@ -3,6 +3,7 @@
 #include "rut/runtime/control_plane_mutation.h"
 #include "rut/runtime/shard_control.h"
 #include "rut/serve_loader.h"
+#include <atomic>
 #include <mutex>
 #include <string>
 #include <vector>
@@ -15,6 +16,7 @@ struct ReloadShardEndpoint {
 
 enum class ReloadCoordinatorPoll : u8 {
     Idle = 0,
+    SnapshotUnavailable,
     CompileFailed,
     ValidationFailed,
     Published,
@@ -32,8 +34,9 @@ using ReloadCancellationCheck = bool (*)(void* context);
 
 // Single process owner for source compilation, generation publication, shard
 // acknowledgements, and LoadedProgram lifetime. poll() is called only by the
-// process control thread; request admission itself remains lock-free through
-// ControlPlaneMutationPort.
+// process control thread. Request admission remains allocation-free through
+// ControlPlaneMutationPort; after a request wins admission, the control thread
+// binds it to the current immutable provider snapshot before compilation.
 class ProcessReloadCoordinator {
 public:
     static constexpr u32 kMaxShards = 256;
@@ -77,9 +80,11 @@ private:
                                LoadedProgram& output,
                                LoadError& error,
                                jit::OptLevel opt);
-    static bool capture_source_version(void* context, char* out, u32 capacity, u32* out_len);
+    static bool capture_source_version(
+        void* context, ReloadRequestSource source, char* out, u32 capacity, u32* out_len);
     bool refresh_source_snapshot();
     void clear_source_snapshots();
+    void reclaim_retired_snapshots();
     bool all_shards_acknowledged(u64 generation) const;
 
     ControlPlaneMutationPort* mutation_ = nullptr;

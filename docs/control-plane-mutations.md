@@ -3,8 +3,9 @@
 Status: accepted contract. The shared mutation port, handler ABI capability,
 JIT helper boundary, production event-loop injection, deterministic harness
 fixture, shard-pinned `upstream.mark` source lowering, generation installation
-acknowledgements, and exact program pins are implemented. The process reload
-coordinator remains staged in TODO.md.
+acknowledgements, exact program pins, and the process reload coordinator are
+implemented. `upstream.mark` remains unavailable in production compiler output
+until capture artifacts persist its ordered replay events.
 
 Rut exposes control-plane reads (`stats()` and `metrics()`) as bounded values
 latched at handler entry. Mutations are different: they change process-wide
@@ -65,8 +66,8 @@ statement-only special cases, so a route or timer can fail closed.
 
 ## Authority
 
-Route-triggered reload is disabled by default and requires an explicit process
-capability (the production CLI spelling will be `--allow-route-reload`). This
+Route-triggered reload is disabled by default and requires the explicit process
+capability `--allow-route-reload`. This
 prevents a source typo or an accidentally exposed route from gaining process
 mutation authority merely because the binary supports hot reload.
 
@@ -107,14 +108,19 @@ directly.
 
 The coordinator executes one request at a time:
 
-1. Admit the request into the single slot and assign a monotonically increasing
-   request id (busy SIGHUP attempts use the explicit terminal path below). At
-   this boundary the source provider creates a provider-owned immutable
-   snapshot and binds its version handle to the request id. All root and import
-   resolution for the request occurs inside that one snapshot; later filesystem
+1. Admit the reload intent into the single slot and assign a monotonically
+   increasing request id (busy SIGHUP attempts use the explicit terminal path
+   below). Admission is bounded and allocation-free; in particular, a route
+   shard does not resolve or read the source provider.
+2. After the process control thread takes the winning request, resolve the
+   configured provider once and create a provider-owned immutable snapshot.
+   This control-thread resolution is the source-version linearization point:
+   an accepted intent reloads the version current when processing begins, not
+   necessarily the version visible when the caller requested admission. All
+   root and import resolution occurs inside that snapshot; later filesystem
    contents are never consulted.
-2. Compile/JIT a candidate without changing live registries or shard pointers.
-3. Validate the candidate before publication:
+3. Compile/JIT a candidate without changing live registries or shard pointers.
+4. Validate the candidate before publication:
    - every timer shard selector is valid for the unchanged process shard count;
    - listener resources are immutable across hot reload: bind address/port,
      transport/TLS policy, connection limits, and other accept-path security
@@ -176,12 +182,12 @@ The coordinator executes one request at a time:
      after invocations, sessions, and detached operations drain. Publication
      never clears or reuses storage still reachable from `N`;
    - every runtime capability required by the candidate is available.
-4. Publish the candidate's immutable config and handler bundle with one new
+5. Publish the candidate's immutable config and handler bundle with one new
    generation number, then send one indivisible shard-install command carrying
    `(generation, config, handler bundle, generation-local runtime tables)` to
    every shard. Config and generated handlers are never separate mailboxes or
    separately observable swaps.
-5. Wait for every shard to acknowledge installation at an event-loop command
+6. Wait for every shard to acknowledge installation at an event-loop command
    boundary. Before accepting another reload, also require that publishing it
    would not retain more than two adjacent generations. If generation `N`
    still has invocation or session pins after `N+1` is active, the coordinator
@@ -191,7 +197,7 @@ The coordinator executes one request at a time:
    receives a request id and immediate terminal `generation-limit` record; a
    file-watch attempt also follows the dirty-slot rule below. No source waits in
    the slot for an unbounded predecessor lifetime.
-6. Reclaim an old program only after all shards acknowledged a newer generation
+7. Reclaim an old program only after all shards acknowledged a newer generation
    and every invocation pin reached zero. Pins include HTTP/1 requests, HTTP/2
    streams, lifecycle invocations such as health timers that can suspend and
    later resume into the program, and terminate-mode WebSocket sessions that
@@ -207,14 +213,15 @@ The coordinator executes one request at a time:
 The snapshot provider resolves the root and iteratively discovered imports to a
 closed manifest containing each canonical path, exact bytes, content identity,
 and import edge. Parsing may discover the closure incrementally, but every read
-uses the request's immutable provider version. Before compilation succeeds, the
+uses the immutable provider version bound by the control thread. Before
+compilation succeeds, the
 provider seals the complete transitive manifest and rejects path aliases,
 resolution outside the snapshot namespace, or an import absent from that
 version. The candidate generation records the sealed manifest identity.
 Mapping the root and later opening imports from the mutable live filesystem is
 forbidden, even if per-file metadata appears unchanged. If the configured
 provider cannot supply an atomic immutable view of the entire resolution
-namespace, reload admission fails with a source-snapshot terminal error; it
+namespace, the admitted attempt terminates with a source-snapshot error; it
 never compiles a best-effort mixture of revisions.
 
 The generation whose process-startup `init` hook ran is a separate lifecycle
@@ -470,12 +477,15 @@ Missing, reordered, or incompatible randomized-selection input is
 `Unsupported`.
 
 SIGHUP, file-watch reload, and an accepted `reload()` request use this one
-coordinator and the same validation path. The production SIGHUP source provider
-resolves the configured source symlink exactly once. The symlink target is a
+coordinator and the same validation path. After the control thread takes the
+winning intent, the production source provider resolves the configured source
+symlink exactly once. The symlink target at that processing boundary is a
 provider-owned immutable version tree, and every relative import must remain
-inside it; mutable regular paths are rejected for live reload. Deployments publish
-a new version by atomically replacing the symlink, never by editing an already
-published target tree in place.
+inside it; mutable regular paths are rejected for live reload. Deployments
+publish a new version by atomically replacing the symlink, never by editing an
+already published target tree in place. An API that must deploy one particular
+version must carry an opaque provider-version handle rather than using the
+versionless SIGHUP or route builtin.
 
 For SIGHUP, the observable attempt
 boundary is one record read from `signalfd`: Linux may coalesce multiple standard
@@ -1210,12 +1220,12 @@ artifacts, state effects, arbitration decisions, and terminal records.
 
 1. [x] Add the control-plane mutation port and deterministic admission/override
    model to the handler ABI and harness.
-2. Implement `Server` identities, `Upstream.servers`, and the shared manual
+2. [x] Implement `Server` identities, `Upstream.servers`, and the shared manual
    health override consulted by both network backends.
 3. [x] Lower and execute timer-only, shard-pinned `upstream.mark`.
 4. [x] Add generation acknowledgements and exact HTTP/1 request, suspended
    HTTP/2 stream, and terminate-mode WebSocket session program pins.
-5. Implement the reload coordinator, compatibility validation, SIGHUP, and
+5. [x] Implement the reload coordinator, compatibility validation, SIGHUP, and
    process-harness coverage.
-6. Lower route-only `reload()` after the same coordinator is the sole activation
-   path.
+6. [x] Lower route-only `reload()` after the same coordinator is the sole
+   activation path.

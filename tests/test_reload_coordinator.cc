@@ -51,7 +51,8 @@ struct MutableSourceVersion {
     const char* current = nullptr;
 };
 
-bool capture_mutable_source_version(void* context, char* out, u32 capacity, u32* out_len) {
+bool capture_mutable_source_version(
+    void* context, ReloadRequestSource, char* out, u32 capacity, u32* out_len) {
     const char* current = static_cast<MutableSourceVersion*>(context)->current;
     const u32 len = static_cast<u32>(__builtin_strlen(current));
     if (len >= capacity) return false;
@@ -358,7 +359,7 @@ TEST(reload_coordinator, request_keeps_its_admission_time_source_version) {
     f.cleanup();
 }
 
-TEST(reload_coordinator, default_source_snapshot_is_captured_by_the_winning_request) {
+TEST(reload_coordinator, default_source_snapshot_is_bound_by_the_control_thread) {
     namespace fs = std::filesystem;
     const fs::path root = "/tmp/rut_reload_coordinator_source_capture";
     fs::remove_all(root);
@@ -378,45 +379,138 @@ TEST(reload_coordinator, default_source_snapshot_is_captured_by_the_winning_requ
     ShardControlBlock control{};
     control.acknowledged_generation.store(1, std::memory_order_relaxed);
     ReloadShardEndpoint shard{&control};
-    std::string first_snapshot_root;
-    std::string second_snapshot_root;
     {
         ProcessReloadCoordinator coordinator;
-        // Initialization must remain valid even for ordinary regular paths;
-        // immutable provider resolution is deferred until a reload attempt.
         REQUIRE(coordinator.init(
             &mutation, source_path.c_str(), jit::OptLevel::O2, &active, &spare, &shard, 1));
 
         fs::remove(root / "current.rut");
         fs::create_symlink(root / "v2" / "app.rut", root / "current.rut");
-        CHECK_EQ(coordinator.poll(), ReloadCoordinatorPoll::Idle);
         REQUIRE(mutation.request_reload(ReloadRequestSource::Route));
-        ReloadRequest request{};
-        REQUIRE(mutation.take_reload(&request));
-        std::ifstream captured(request.source_version);
-        std::string contents((std::istreambuf_iterator<char>(captured)), {});
-        CHECK(contents.find("return 202") != std::string::npos);
-        first_snapshot_root = fs::path(request.source_version).parent_path();
-        REQUIRE(mutation.complete_reload(
-            request.id, request.source, ReloadTerminalOutcome::CompileFailed));
+        CHECK_EQ(coordinator.poll(), ReloadCoordinatorPoll::Published);
+        const auto* next = coordinator.active_program();
+        REQUIRE(next != nullptr);
+        REQUIRE_EQ(next->config.route_count, 1u);
+        const auto result = jit::HandlerResult::unpack(
+            next->config.routes[0].fn(nullptr, nullptr, nullptr, 0, nullptr));
+        CHECK_EQ(result.action, jit::HandlerAction::ReturnStatus);
+        CHECK_EQ(result.status_code, 202u);
+        const RouteConfig* pending =
+            control.pending_config.exchange(nullptr, std::memory_order_acq_rel);
+        REQUIRE(pending != nullptr);
+        control.acknowledged_generation.store(pending->config_generation,
+                                              std::memory_order_release);
+        CHECK_EQ(coordinator.poll(), ReloadCoordinatorPoll::Activated);
 
         fs::remove(root / "current.rut");
         fs::create_symlink(root / "v1" / "app.rut", root / "current.rut");
-        CHECK_EQ(coordinator.poll(), ReloadCoordinatorPoll::Idle);
         REQUIRE(mutation.request_reload(ReloadRequestSource::Route));
-        REQUIRE(mutation.take_reload(&request));
-        second_snapshot_root = fs::path(request.source_version).parent_path();
-        CHECK_FALSE(fs::exists(first_snapshot_root));
-        CHECK(fs::exists(second_snapshot_root));
-        REQUIRE(mutation.complete_reload(
-            request.id, request.source, ReloadTerminalOutcome::CompileFailed));
+        CHECK_EQ(coordinator.poll(), ReloadCoordinatorPoll::Published);
+        next = coordinator.active_program();
+        REQUIRE(next != nullptr);
+        REQUIRE_EQ(next->config.route_count, 1u);
+        const auto second_result = jit::HandlerResult::unpack(
+            next->config.routes[0].fn(nullptr, nullptr, nullptr, 0, nullptr));
+        CHECK_EQ(second_result.action, jit::HandlerAction::ReturnStatus);
+        CHECK_EQ(second_result.status_code, 201u);
+        pending = control.pending_config.exchange(nullptr, std::memory_order_acq_rel);
+        REQUIRE(pending != nullptr);
+        control.acknowledged_generation.store(pending->config_generation,
+                                              std::memory_order_release);
+        CHECK_EQ(coordinator.poll(), ReloadCoordinatorPoll::Activated);
     }
-    CHECK_FALSE(fs::exists(second_snapshot_root));
 
     // The destroyed coordinator detached its callback; the surviving port does
     // not call through freed coordinator state.
     REQUIRE(mutation.request_reload(ReloadRequestSource::Route));
     mutation.stop();
+    active.destroy();
+    spare.destroy();
+    fs::remove_all(root);
+}
+
+TEST(reload_coordinator, route_admission_loads_the_current_provider) {
+    namespace fs = std::filesystem;
+    const fs::path root = "/tmp/rut_reload_coordinator_admission_refresh";
+    fs::remove_all(root);
+    fs::create_directories(root / "v1");
+    fs::create_directories(root / "v2");
+    std::ofstream(root / "v1" / "app.rut") << "route GET \"/\" { return 201 }\n";
+    std::ofstream(root / "v2" / "app.rut") << "route GET \"/\" { return 202 }\n";
+    fs::create_symlink(root / "v1" / "app.rut", root / "current.rut");
+    const std::string source_path = (root / "current.rut").string();
+
+    ControlPlaneMutationPort mutation;
+    mutation.reset(1, true);
+    LoadedProgram active;
+    LoadedProgram spare;
+    active.config.config_generation = 1;
+    active.config.program_pins = &active.pins;
+    ShardControlBlock control{};
+    control.acknowledged_generation.store(1, std::memory_order_relaxed);
+    ReloadShardEndpoint shard{&control};
+    {
+        ProcessReloadCoordinator coordinator;
+        REQUIRE(coordinator.init(
+            &mutation, source_path.c_str(), jit::OptLevel::O0, &active, &spare, &shard, 1));
+
+        fs::remove(root / "current.rut");
+        fs::create_symlink(root / "v2" / "app.rut", root / "current.rut");
+        REQUIRE(mutation.request_reload(ReloadRequestSource::Route));
+        CHECK_EQ(coordinator.poll(), ReloadCoordinatorPoll::Published);
+        const auto* next = coordinator.active_program();
+        REQUIRE(next != nullptr);
+        REQUIRE_EQ(next->config.route_count, 1u);
+        const auto& route = next->config.routes[0];
+        REQUIRE_EQ(route.action, RouteAction::JitHandler);
+        REQUIRE(route.fn != nullptr);
+        const auto result =
+            jit::HandlerResult::unpack(route.fn(nullptr, nullptr, nullptr, 0, nullptr));
+        CHECK_EQ(result.action, jit::HandlerAction::ReturnStatus);
+        CHECK_EQ(result.status_code, 202u);
+
+        const RouteConfig* pending =
+            control.pending_config.exchange(nullptr, std::memory_order_acq_rel);
+        REQUIRE(pending != nullptr);
+        control.acknowledged_generation.store(pending->config_generation,
+                                              std::memory_order_release);
+        CHECK_EQ(coordinator.poll(), ReloadCoordinatorPoll::Activated);
+    }
+    active.destroy();
+    spare.destroy();
+    fs::remove_all(root);
+}
+
+TEST(reload_coordinator, signal_snapshot_refresh_failure_is_terminalized) {
+    namespace fs = std::filesystem;
+    const fs::path root = "/tmp/rut_reload_coordinator_snapshot_failure";
+    fs::remove_all(root);
+    fs::create_directories(root);
+    const fs::path source = root / "regular.rut";
+    std::ofstream(source) << "route GET \"/\" { return 200 }\n";
+
+    ControlPlaneMutationPort mutation;
+    mutation.reset(1, true);
+    LoadedProgram active;
+    LoadedProgram spare;
+    active.config.config_generation = 1;
+    active.config.program_pins = &active.pins;
+    ShardControlBlock control{};
+    control.acknowledged_generation.store(1, std::memory_order_relaxed);
+    ReloadShardEndpoint shard{&control};
+    {
+        ProcessReloadCoordinator coordinator;
+        REQUIRE(coordinator.init(
+            &mutation, source.c_str(), jit::OptLevel::O0, &active, &spare, &shard, 1));
+        u64 request_id = 0;
+        REQUIRE(coordinator.request_signal(&request_id));
+        CHECK_NE(request_id, 0u);
+        CHECK_EQ(coordinator.poll(), ReloadCoordinatorPoll::SnapshotUnavailable);
+        const auto record = mutation.last_record();
+        REQUIRE(record.valid);
+        CHECK_EQ(record.request_id, request_id);
+        CHECK_EQ(record.outcome, ReloadTerminalOutcome::SnapshotUnavailable);
+    }
     active.destroy();
     spare.destroy();
     fs::remove_all(root);

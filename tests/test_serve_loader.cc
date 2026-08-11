@@ -565,18 +565,27 @@ TEST(serve_loader, reload_snapshot_rejects_unrepresentable_source_before_allocat
     std::filesystem::remove_all(dir, error);
 }
 
-TEST(serve_loader, reload_snapshot_rejects_unversioned_import_graph) {
+TEST(serve_loader, snapshot_loader_accepts_regular_import_graph) {
     const std::string dir = "/tmp/rut_serve_loader_unversioned_import";
     write_file(dir, "auth.rut", "func jwtAuth() -> i32 => 200\n");
     const std::string path = write_file(dir,
                                         "main.rut",
                                         "import \"auth.rut\"\n"
-                                        "route GET \"/users\" { return jwtAuth() }\n");
+                                        "route GET \"/users\" { if jwtAuth() == 200 { return 200 } "
+                                        "else { return 500 } }\n");
     LoadedProgram program;
     LoadError err;
-    CHECK_FALSE(load_rut_program_snapshot(path.c_str(), program, err));
-    CHECK_EQ(err.stage, LoadStage::Read);
+    REQUIRE(load_rut_program_snapshot(path.c_str(), program, err));
+    REQUIRE_EQ(program.config.route_count, 1u);
+    const auto& route = program.config.routes[0];
+    REQUIRE_EQ(route.action, RouteAction::JitHandler);
+    REQUIRE(route.fn != nullptr);
+    const auto result = jit::HandlerResult::unpack(route.fn(nullptr, nullptr, nullptr, 0, nullptr));
+    CHECK_EQ(result.action, jit::HandlerAction::ReturnStatus);
+    CHECK_EQ(result.status_code, 200u);
     program.destroy();
+    std::error_code ignored;
+    std::filesystem::remove_all(dir, ignored);
 }
 
 TEST(serve_loader, reload_snapshot_resolution_failure_clears_stale_diagnostic) {
@@ -588,6 +597,24 @@ TEST(serve_loader, reload_snapshot_resolution_failure_clears_stale_diagnostic) {
     error.detail_buf[1] = '\0';
     error.diag.detail = Str{error.detail_buf, 1};
     CHECK_FALSE(load_rut_program_snapshot("/tmp/rut_missing_version_link", program, error));
+    CHECK_EQ(error.stage, LoadStage::Read);
+    CHECK_FALSE(error.has_diag);
+    program.destroy();
+}
+
+TEST(serve_loader, snapshot_loaders_reject_null_paths) {
+    LoadedProgram program;
+    LoadError error;
+    error.stage = LoadStage::Parse;
+    error.has_diag = true;
+
+    CHECK_FALSE(load_rut_program_snapshot(nullptr, program, error));
+    CHECK_EQ(error.stage, LoadStage::Read);
+    CHECK_FALSE(error.has_diag);
+
+    error.stage = LoadStage::Parse;
+    error.has_diag = true;
+    CHECK_FALSE(load_rut_program_source_version(nullptr, program, error));
     CHECK_EQ(error.stage, LoadStage::Read);
     CHECK_FALSE(error.has_diag);
     program.destroy();

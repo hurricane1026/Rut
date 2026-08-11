@@ -496,6 +496,8 @@ jobs:
           LLVM_PROFILE_FILE=build/test_rir.profraw ./build/tests/test_rir
           LLVM_PROFILE_FILE=build/test_frontend.profraw ./build/tests/test_frontend
           LLVM_PROFILE_FILE=build/test_control_plane_mutation.profraw ./build/tests/test_control_plane_mutation
+          LLVM_PROFILE_FILE=build/test_reload_coordinator.profraw ./build/tests/test_reload_coordinator
+          LLVM_PROFILE_FILE=build/test_serve_loader.profraw ./build/tests/test_serve_loader
           LLVM_PROFILE_FILE=build/test_shard_control.profraw ./build/tests/test_shard_control
           LLVM_PROFILE_FILE=build/test_traffic_capture.profraw ./build/tests/test_traffic_capture
           LLVM_PROFILE_FILE=build/test_traffic_replay.profraw ./build/tests/test_traffic_replay
@@ -569,6 +571,8 @@ jobs:
             build/tests/test_rir \
             build/tests/test_frontend \
             build/tests/test_control_plane_mutation \
+            build/tests/test_reload_coordinator \
+            build/tests/test_serve_loader \
             build/tests/test_jit \
             build/tests/test_simulate_engine \
             build/tests/test_route_trie \

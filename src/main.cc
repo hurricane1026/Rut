@@ -382,13 +382,21 @@ static i32 run_shards(u16 port,
             if (!reload_enabled) {
                 write_str("SIGHUP ignored: no .rut program is loaded\n");
             } else if (!reload_coordinator.request_signal()) {
-                write_str("Reload request ignored: another reload is pending\n");
-                write_reload_record(control_plane_mutation.last_record());
+                const ReloadTerminalRecord record = control_plane_mutation.last_record();
+                if (record.valid && record.outcome == ReloadTerminalOutcome::SnapshotUnavailable)
+                    write_str(
+                        "Reload request unavailable: source snapshot could not be prepared\n");
+                else
+                    write_str("Reload request ignored: another reload is pending\n");
+                write_reload_record(record);
             }
         }
         if (reload_enabled) {
             const ReloadCoordinatorPoll result = reload_coordinator.poll();
-            if (result == ReloadCoordinatorPoll::CompileFailed) {
+            if (result == ReloadCoordinatorPoll::SnapshotUnavailable) {
+                write_str("Reload request unavailable: source snapshot could not be prepared\n");
+                write_reload_record(control_plane_mutation.last_record());
+            } else if (result == ReloadCoordinatorPoll::CompileFailed) {
                 char msg[512];
                 format_load_error(reload_coordinator.last_load_error(), msg, sizeof(msg));
                 write_str("Reload failed: ");
@@ -700,7 +708,7 @@ int main(int argc, char** argv) {
                 break;
         }
         LoadError load_err;
-        if (!load_rut_program(config_path, program, load_err, olvl)) {
+        if (!load_rut_program_snapshot(config_path, program, load_err, olvl)) {
             char msg[512];
             format_load_error(load_err, msg, sizeof(msg));
             write_str("Failed to load ");

@@ -87,7 +87,8 @@ struct ReloadRequest {
     char source_version[kMaxSourceVersion]{};
 };
 
-using ReloadSourceVersionCapture = bool (*)(void* context, char* out, u32 capacity, u32* out_len);
+using ReloadSourceVersionCapture =
+    bool (*)(void* context, ReloadRequestSource source, char* out, u32 capacity, u32* out_len);
 
 struct ReloadTerminalRecord {
     bool valid = false;
@@ -433,8 +434,8 @@ public:
                     continue;
                 }
                 // Capture only after this caller owns the single admission
-                // slot. This lets a provider bind an immutable source snapshot
-                // to the winning request without doing work for Busy callers.
+                // slot. The callback must remain bounded and allocation-free;
+                // the coordinator prepares default-loader snapshots later.
                 char source_version[ReloadRequest::kMaxSourceVersion]{};
                 u32 source_version_len = 0;
                 bool snapshot_recorded = false;
@@ -442,6 +443,7 @@ public:
                 if (source_version_capture_ != nullptr) {
                     snapshot_capture_failed =
                         !source_version_capture_(source_version_capture_context_,
+                                                 source,
                                                  source_version,
                                                  ReloadRequest::kMaxSourceVersion,
                                                  &source_version_len);

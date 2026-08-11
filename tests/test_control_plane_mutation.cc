@@ -6,10 +6,11 @@
 
 using namespace rut;
 
-static bool failed_source_capture(void*, char*, u32, u32*) {
+static bool failed_source_capture(void*, ReloadRequestSource, char*, u32, u32*) {
     return false;
 }
-static bool oversized_source_capture(void*, char*, u32 capacity, u32* out_len) {
+static bool oversized_source_capture(
+    void*, ReloadRequestSource, char*, u32 capacity, u32* out_len) {
     *out_len = capacity;
     return true;
 }
@@ -192,6 +193,15 @@ struct ControlPlaneMutationPortTestAccess {
         release_authority_update(port);
         return port.publish_authority_contended_signal_record(
             generation, reserved_id, slot, request_id);
+    }
+
+    static bool publish_authority_contended_signal(ControlPlaneMutationPort& port,
+                                                   u64* request_id) {
+        return port.publish_authority_contended_signal(request_id);
+    }
+
+    static bool admit_contended_idle_signal(ControlPlaneMutationPort& port, u64* request_id) {
+        return port.admit_contended_idle_signal(request_id);
     }
 
     static void exhaust_event_counters(ControlPlaneMutationPort& port) {
@@ -2515,6 +2525,52 @@ TEST(control_plane_mutation, terminal_outcome_names_are_explicit_and_stable) {
              "counter_exhausted");
     CHECK_EQ(std::string(reload_terminal_outcome_name(ReloadTerminalOutcome::SnapshotUnavailable)),
              "snapshot_unavailable");
+    CHECK_EQ(std::string(reload_terminal_outcome_name(static_cast<ReloadTerminalOutcome>(255))),
+             "none");
+}
+
+TEST(control_plane_mutation, failure_completion_rejects_generation_metadata) {
+    ControlPlaneMutationPort port;
+    port.reset(7, true);
+    u64 request_id = 0;
+    REQUIRE(port.request_reload(ReloadRequestSource::Route, &request_id));
+    ReloadRequest request{};
+    REQUIRE(port.take_reload(&request));
+
+    CHECK_FALSE(port.complete_reload(request_id,
+                                     request.source,
+                                     ReloadTerminalOutcome::CompileFailed,
+                                     port.active_generation()));
+    CHECK_FALSE(port.complete_reload(request_id,
+                                     request.source,
+                                     ReloadTerminalOutcome::CompileFailed,
+                                     ControlPlaneMutationPort::kMaxGeneration + 1));
+    REQUIRE(port.complete_reload(request_id, request.source, ReloadTerminalOutcome::CompileFailed));
+}
+
+TEST(control_plane_mutation, contended_signal_helpers_terminalize_counter_exhaustion) {
+    {
+        ControlPlaneMutationPort port;
+        port.reset(1, true);
+        REQUIRE(ControlPlaneMutationPortTestAccess::claim_authority_update(port));
+        ControlPlaneMutationPortTestAccess::exhaust_event_counters(port);
+        u64 request_id = 99;
+        CHECK_FALSE(ControlPlaneMutationPortTestAccess::publish_authority_contended_signal(
+            port, &request_id));
+        CHECK_EQ(request_id, ControlPlaneMutationPort::kCounterExhaustedRequestId);
+        CHECK_EQ(port.last_record().outcome, ReloadTerminalOutcome::CounterExhausted);
+        ControlPlaneMutationPortTestAccess::release_authority_update(port);
+    }
+    {
+        ControlPlaneMutationPort port;
+        port.reset(1, true);
+        ControlPlaneMutationPortTestAccess::exhaust_event_counters(port);
+        u64 request_id = 99;
+        CHECK_FALSE(
+            ControlPlaneMutationPortTestAccess::admit_contended_idle_signal(port, &request_id));
+        CHECK_EQ(request_id, ControlPlaneMutationPort::kCounterExhaustedRequestId);
+        CHECK_EQ(port.last_record().outcome, ReloadTerminalOutcome::CounterExhausted);
+    }
 }
 
 TEST(control_plane_mutation, signal_snapshot_capture_failures_are_terminalized) {
@@ -2528,6 +2584,16 @@ TEST(control_plane_mutation, signal_snapshot_capture_failures_are_terminalized) 
         CHECK(port.last_record().valid);
         CHECK_EQ(port.last_record().request_id, request_id);
         CHECK_EQ(port.last_record().outcome, ReloadTerminalOutcome::SnapshotUnavailable);
+    }
+}
+
+TEST(control_plane_mutation, route_snapshot_capture_failure_is_rejected_without_record) {
+    for (auto capture : {failed_source_capture, oversized_source_capture}) {
+        ControlPlaneMutationPort port;
+        port.reset(1, true);
+        port.set_reload_source_version_capture(capture, nullptr);
+        CHECK_FALSE(port.request_reload(ReloadRequestSource::Route));
+        CHECK_FALSE(port.last_record().valid);
     }
 }
 
@@ -2557,6 +2623,17 @@ TEST(control_plane_mutation, admission_in_progress_tracks_reserved_identity) {
     const u64 request_id = ControlPlaneMutationPortTestAccess::reserve_admission_identity(port);
     REQUIRE_NE(request_id, 0u);
     CHECK(port.admission_in_progress());
+}
+
+TEST(control_plane_mutation, signal_during_reserved_admission_is_busy) {
+    ControlPlaneMutationPort port;
+    port.reset(1, true);
+    const u64 request_id = ControlPlaneMutationPortTestAccess::reserve_admission_identity(port);
+    REQUIRE_NE(request_id, 0u);
+    u64 signal_id = 0;
+    CHECK_FALSE(port.request_reload(ReloadRequestSource::Signal, &signal_id));
+    CHECK_NE(signal_id, 0u);
+    CHECK_EQ(port.last_record().outcome, ReloadTerminalOutcome::Busy);
 }
 
 TEST(control_plane_mutation, zero_generation_health_snapshot_is_empty) {

@@ -69,8 +69,9 @@ optimizes the per-program handlers at startup.
 
 ## 2. Write a `.rut` program
 
-A program is a set of routes. The two route outcomes that are wired end
-to end today are **returning a status** and **forwarding to an upstream**.
+A program is a set of routes. Common outcomes wired end to end include
+**returning a status**, **forwarding to an upstream**, and WebSocket upgrade
+handling.
 
 ```rut
 // app.rut
@@ -157,10 +158,25 @@ gracefully before exiting.
 | `--access-log PATH` | Write access logs to PATH | off |
 | `--access-log-compress` | zstd-compress access logs | off |
 | `--access-log-level N` | Access log verbosity | build default |
+| `--h2` | Advertise HTTP/2 via TLS ALPN | off |
+| `--metrics` | Serve the built-in Prometheus endpoint at HTTP/1.1 `GET /metrics` | off |
+| `--allow-route-reload` | Permit source routes to call `reload()` | off |
 
 `--tls-cert`/`--tls-key` must be given together. Both backends support server
 TLS. In `auto` mode, Rut prefers io_uring when available unless the program
 configures active upstream health checks, which currently require epoll.
+
+With a loaded `.rut` program, `SIGHUP` requests a hot reload through the same
+single-flight coordinator used by `reload()`. The program path must be a
+single symlink to an immutable version tree; deploy a new version by atomically
+replacing that symlink. Route-triggered reload stays disabled unless
+`--allow-route-reload` is set; that flag is an operator capability, not
+application authentication. Immediately after a symlink replacement, a route
+`reload()` or SIGHUP admits a reload intent without reading the filesystem. The
+control thread resolves the symlink once after it takes the winning request, so
+the reload uses the immutable version current when processing begins. Do not
+replace the symlink again until that reload reports its terminal result when a
+deployment must activate one specific version.
 
 `--opt` selects how hard the JIT optimizes each handler at startup:
 
@@ -197,11 +213,31 @@ curl -s -o /dev/null -w "%{http_code}\n" http://127.0.0.1:8080/   # 200
 
 ## Caveats / current limits
 
-- **HTTP/1.1 only.** No HTTP/2, HTTP/3, or WebSocket upgrade yet.
-- **Server TLS only.** No SNI / ALPN / mTLS / kTLS.
+- **HTTP/2 has distinct cleartext and TLS admission paths.** Cleartext h2c
+  prior knowledge is accepted automatically; `--h2` only enables TLS ALPN
+  advertisement. HTTP/2 supports static routes, JIT handlers (including timer
+  waits), buffered JIT forwarding, and no-body proxy requests. Unbuffered JIT
+  forwarding, non-timer event waits, and proxy requests with bodies return
+  `503`. One shared async slot is available per HTTP/2 connection, so a second
+  stream requiring a timer wait, buffered forward, or no-body proxy while that
+  slot is occupied also returns `503`. HTTP/3 is not implemented.
+- **WebSocket support is HTTP/1.1 upgrade only.** Passthrough and bounded
+  terminate-mode frame handlers are available when built with
+  `RUT_ENABLE_WEBSOCKET=ON`. Terminate mode accepts only a single unfragmented
+  frame of roughly 16 KiB or less; larger or fragmented messages fail closed.
+  HTTP/2 extended CONNECT is not implemented.
+- **Server TLS only.** ALPN is supported for the opt-in HTTP/2 path; SNI,
+  mTLS, and kTLS are not implemented.
 - **DNS is resolved at configuration load time.** TTL-based refresh, SRV
   records, and dynamic service discovery are not supported yet.
-- **No hot reload of `.rut` at runtime.** Restart to apply changes.
+- **Hot reload is bounded and source-based.** `SIGHUP` reloads a loaded
+  program, and routes can request the same operation only with
+  `--allow-route-reload`. The loaded path must be a single symlink to an
+  immutable version tree. File watching, AOT program artifacts, and mutable
+  source trees are not live-reload inputs.
+- **The built-in Prometheus endpoint is HTTP/1.1-only.** With `--metrics`,
+  `GET /metrics` is intercepted ahead of HTTP/1 route matching; HTTP/2 uses
+  ordinary route dispatch for that path.
 - Some environments (containers/sandboxes) can set up io_uring but not
   complete its operations; if requests connect but never respond, use
   `--backend epoll`, or run on a host with working io_uring.
