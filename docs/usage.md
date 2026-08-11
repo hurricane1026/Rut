@@ -220,11 +220,15 @@ curl -s -o /dev/null -w "%{http_code}\n" http://127.0.0.1:8080/   # 200
   Proxy request bodies are buffered before the HTTP/1 upstream request is
   issued. The synthesized HTTP/1 request has a 16 KiB buffer shared by its
   request line, headers, and body, so the effective body limit is less than
-  16 KiB and varies with header size; an overflow returns `413`. Unbuffered JIT
-  forwarding and non-timer event waits return `503`. One shared async slot is
-  available per HTTP/2 connection, so a second stream requiring a timer wait,
-  buffered forward, or proxy while that slot is occupied also returns `503`.
-  HTTP/3 is not implemented.
+  16 KiB and varies with header size; an overflow returns `413`. Only one stream
+  per connection may wait for request-body DATA at a time. A second body-bearing
+  stream that also needs deferral while this pending-body slot is occupied
+  returns `503`, so concurrent/interleaved uploads on one connection are not
+  supported. Unbuffered JIT forwarding and non-timer event waits return `503`.
+  One separate async execution slot is available per connection for a timer
+  wait, buffered forward, or proxy. While it is occupied, subsequent request
+  frames ordinarily remain buffered until the parked stream resumes, causing
+  per-connection head-of-line blocking. HTTP/3 is not implemented.
 - **WebSocket support is HTTP/1.1 upgrade only.** Passthrough and bounded
   terminate-mode frame handlers are available when built with
   `RUT_ENABLE_WEBSOCKET=ON`. Terminate mode accepts only a single unfragmented
@@ -236,7 +240,8 @@ curl -s -o /dev/null -w "%{http_code}\n" http://127.0.0.1:8080/   # 200
   `RUT_UPSTREAM_TLS_CA_FILE` to a non-empty CA bundle path to replace the system
   trust roots for private PKI. Inbound certificate selection by SNI, mTLS,
   upstream client certificates, insecure upstream verification, and kTLS are
-  not implemented.
+  not implemented. A TLS upstream cannot also enable `health_check`: active
+  probes currently send plaintext HTTP, so that combination fails program load.
 - **DNS is resolved at configuration load time.** TTL-based refresh, SRV
   records, and dynamic service discovery are not supported yet.
 - **Hot reload is bounded and source-based.** `SIGHUP` reloads a loaded
