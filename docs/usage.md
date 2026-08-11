@@ -225,9 +225,13 @@ curl -s -o /dev/null -w "%{http_code}\n" http://127.0.0.1:8080/   # 200
   stream that also needs deferral while this pending-body slot is occupied
   returns `503`, so concurrent/interleaved uploads on one connection are not
   supported. Unbuffered JIT forwarding and non-timer event waits return `503`.
-  One separate async execution slot is available per connection for a timer
-  wait, buffered forward, or proxy. While it is occupied, subsequent request
-  frames ordinarily remain buffered until the parked stream resumes, causing
+  One async execution slot is available per connection for a timer wait,
+  buffered forward, or proxy. The pending-body and async slots are distinct
+  states but cannot be occupied together because they share request scratch
+  storage. While a body wait is active, other request frames are still processed,
+  but a bodyless stream that reaches one of those async operations returns `503`.
+  Conversely, while the async slot is occupied, subsequent request frames
+  ordinarily remain buffered until the parked stream resumes, causing
   per-connection head-of-line blocking. HTTP/3 is not implemented.
 - **WebSocket support is HTTP/1.1 upgrade only.** Passthrough and bounded
   terminate-mode frame handlers are available when built with
