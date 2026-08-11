@@ -167,8 +167,11 @@ single symlink to an immutable version tree; deploy a new version by atomically
 replacing that symlink. Route-triggered reload stays disabled unless
 `--allow-route-reload` is set; that flag is an operator capability, not
 application authentication. Immediately after a symlink replacement, a route
-`reload()` uses the latest immutable snapshot published by the control loop;
-use SIGHUP to synchronously prepare and admit a just-deployed version.
+`reload()` or SIGHUP admits a reload intent without reading the filesystem. The
+control thread resolves the symlink once after it takes the winning request, so
+the reload uses the immutable version current when processing begins. Do not
+replace the symlink again until that reload reports its terminal result when a
+deployment must activate one specific version.
 
 `--opt` selects how hard the JIT optimizes each handler at startup:
 
