@@ -512,7 +512,8 @@ target library:
 | ✅ | `s.matches(re"")` | Compile-time validated regex and runtime match |
 | ✅ | string-list `len`, `isEmpty`, `first`, `at(i)` | Available on bounded `[str]` request views |
 | ✅ | `bitwise.and/or/xor/flip/shiftLeft/shiftRight` | Same-width `i32`/`i64` operations |
-| ✅ | `.or(default)`, compatibility `any`/`all` | Eager fallback semantics documented above |
+| ✅ | `.or(default)`, compatibility `any(lhs, rhs)` | Eager fallback: return `lhs` when usable, otherwise `rhs` |
+| ✅ | compatibility `all(lhs, rhs)` | Eager presence sequencing: return `rhs` when `lhs` is usable; otherwise propagate the `lhs` nil/error |
 | ✅ | `i64(x)`, `max(a,b)`, `min(a,b)` | Integer conversion/min/max only |
 | ✅ | `time.nowMicros()` | Monotonic `i64`, latched per invocation; blocked in wait routes |
 | ✅ | `json(v)` | Bounded JSON values and response serialization |
