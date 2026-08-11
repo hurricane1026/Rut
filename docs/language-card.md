@@ -392,9 +392,16 @@ upstream secure {
 ```
 
 The TLS `server_name` is sent as SNI and verified against the system trust
-store by default. A non-empty `RUT_UPSTREAM_TLS_CA_FILE` replaces that store
-with a custom CA bundle for private PKI. Upstream client TLS currently uses the
-epoll path; client certificates and insecure verification modes are ⏳.
+store by default. Operators may configure a process-wide custom trust bundle
+and client certificate/key with `--upstream-tls-ca`, `--upstream-tls-cert`, and
+`--upstream-tls-key`; `RUT_UPSTREAM_TLS_CA_FILE` remains an environment
+equivalent for the CA bundle, with the CLI option taking precedence. Upstream
+client TLS currently uses the epoll path.
+Per-upstream trust/identity profiles and insecure verification modes are ⏳.
+Inbound certificates remain operator configuration rather than `.rut` syntax:
+`--tls-cert`/`--tls-key` provide the default identity, repeatable `--tls-sni`
+adds up to 16 exact hostname identities, and `--tls-client-ca` requires a
+trusted client certificate across all of them.
 
 <!-- rut-example: skip I-O survey intentionally includes pending capabilities -->
 ```rut

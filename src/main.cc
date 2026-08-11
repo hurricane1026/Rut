@@ -500,12 +500,22 @@ int main(int argc, char** argv) {
     u32 pool_prealloc = 0;  // 0 = fully lazy
     const char* tls_cert_path = nullptr;
     const char* tls_key_path = nullptr;
+    const char* tls_client_ca_file = nullptr;
+    struct TlsSniArg {
+        const char* server_name = nullptr;
+        const char* cert_path = nullptr;
+        const char* key_path = nullptr;
+    };
+    TlsSniArg tls_sni_args[TlsServerContext::kMaxSniIdentities]{};
+    u32 tls_sni_arg_count = 0;
     const char* config_path = nullptr;
     const char* access_log_path = nullptr;
     bool access_log_compress = false;
     const char* upstream_tls_ca_file = nullptr;
-    // Advertise HTTP/2 over ALPN. Opt-in for now: h2 serves static/return-status
-    // routes; JIT-handler and proxy routes answer 503 over h2 (follow-up).
+    const char* upstream_tls_cert_path = nullptr;
+    const char* upstream_tls_key_path = nullptr;
+    // Advertise HTTP/2 over ALPN. Cleartext h2c prior knowledge is detected
+    // independently; TLS clients need this opt-in advertisement.
     bool offer_h2 = false;
     // Serve an aggregated Prometheus exposition at GET /metrics on the data
     // listener. Opt-in (internal metrics shouldn't be public by default).
@@ -518,6 +528,9 @@ int main(int argc, char** argv) {
     // Simple arg parsing: [port] [--shards N] [--no-pin] [--drain N]
     //                      [--backend auto|io_uring|epoll]
     //                      [--tls-cert PATH] [--tls-key PATH]
+    //                      [--tls-client-ca PATH] [--tls-sni NAME CERT KEY]...
+    //                      [--upstream-tls-ca PATH]
+    //                      [--upstream-tls-cert PATH] [--upstream-tls-key PATH]
     //                      [--access-log PATH] [--access-log-compress]
     //                      [--metrics]
     // --metrics: serve an aggregated Prometheus exposition at GET /metrics.
@@ -584,6 +597,46 @@ int main(int argc, char** argv) {
                 }
                 i++;
                 tls_key_path = argv[i];
+            } else if (str_eq(argv[i], "--tls-client-ca")) {
+                if (i + 1 >= argc || starts_with_dash_dash(argv[i + 1])) {
+                    write_str("--tls-client-ca requires a path argument\n");
+                    return 1;
+                }
+                i++;
+                tls_client_ca_file = argv[i];
+            } else if (str_eq(argv[i], "--upstream-tls-ca")) {
+                if (i + 1 >= argc || starts_with_dash_dash(argv[i + 1])) {
+                    write_str("--upstream-tls-ca requires a path argument\n");
+                    return 1;
+                }
+                i++;
+                upstream_tls_ca_file = argv[i];
+            } else if (str_eq(argv[i], "--upstream-tls-cert")) {
+                if (i + 1 >= argc || starts_with_dash_dash(argv[i + 1])) {
+                    write_str("--upstream-tls-cert requires a path argument\n");
+                    return 1;
+                }
+                i++;
+                upstream_tls_cert_path = argv[i];
+            } else if (str_eq(argv[i], "--upstream-tls-key")) {
+                if (i + 1 >= argc || starts_with_dash_dash(argv[i + 1])) {
+                    write_str("--upstream-tls-key requires a path argument\n");
+                    return 1;
+                }
+                i++;
+                upstream_tls_key_path = argv[i];
+            } else if (str_eq(argv[i], "--tls-sni")) {
+                if (i + 3 >= argc || starts_with_dash_dash(argv[i + 1]) ||
+                    starts_with_dash_dash(argv[i + 2]) || starts_with_dash_dash(argv[i + 3])) {
+                    write_str("--tls-sni requires NAME CERT_PATH KEY_PATH\n");
+                    return 1;
+                }
+                if (tls_sni_arg_count >= TlsServerContext::kMaxSniIdentities) {
+                    write_str("too many --tls-sni identities\n");
+                    return 1;
+                }
+                tls_sni_args[tls_sni_arg_count++] = {argv[i + 1], argv[i + 2], argv[i + 3]};
+                i += 3;
             } else if (str_eq(argv[i], "--access-log-level")) {
                 if (argv[i + 1][0] < '0' || argv[i + 1][0] > '9') {
                     write_str("--access-log-level requires a numeric argument\n");
@@ -629,9 +682,11 @@ int main(int argc, char** argv) {
         if (i + 1 >= argc) {
             if (str_eq(argv[i], "--shards") || str_eq(argv[i], "--drain") ||
                 str_eq(argv[i], "--pool-prealloc") || str_eq(argv[i], "--tls-cert") ||
-                str_eq(argv[i], "--tls-key") || str_eq(argv[i], "--access-log") ||
-                str_eq(argv[i], "--access-log-level") || str_eq(argv[i], "--opt") ||
-                str_eq(argv[i], "--backend")) {
+                str_eq(argv[i], "--tls-key") || str_eq(argv[i], "--tls-client-ca") ||
+                str_eq(argv[i], "--tls-sni") || str_eq(argv[i], "--upstream-tls-ca") ||
+                str_eq(argv[i], "--upstream-tls-cert") || str_eq(argv[i], "--upstream-tls-key") ||
+                str_eq(argv[i], "--access-log") || str_eq(argv[i], "--access-log-level") ||
+                str_eq(argv[i], "--opt") || str_eq(argv[i], "--backend")) {
                 write_str(argv[i]);
                 write_str(" requires an argument\n");
                 return 1;
@@ -652,7 +707,8 @@ int main(int argc, char** argv) {
         }
         static constexpr char kUpstreamTlsCaPrefix[] = "RUT_UPSTREAM_TLS_CA_FILE=";
         for (char** e = environ; *e; e++) {
-            if (strncmp(*e, kUpstreamTlsCaPrefix, sizeof(kUpstreamTlsCaPrefix) - 1) == 0 &&
+            if (upstream_tls_ca_file == nullptr &&
+                strncmp(*e, kUpstreamTlsCaPrefix, sizeof(kUpstreamTlsCaPrefix) - 1) == 0 &&
                 (*e)[sizeof(kUpstreamTlsCaPrefix) - 1] != '\0') {
                 upstream_tls_ca_file = *e + sizeof(kUpstreamTlsCaPrefix) - 1;
                 break;
@@ -667,15 +723,41 @@ int main(int argc, char** argv) {
         write_str("--tls-cert and --tls-key must be provided together\n");
         return 1;
     }
+    if (tls_client_ca_file != nullptr && tls_cert_path == nullptr) {
+        write_str("--tls-client-ca requires --tls-cert and --tls-key\n");
+        return 1;
+    }
+    if (tls_sni_arg_count != 0 && tls_cert_path == nullptr) {
+        write_str("--tls-sni requires a default --tls-cert and --tls-key identity\n");
+        return 1;
+    }
+    if ((upstream_tls_cert_path && !upstream_tls_key_path) ||
+        (!upstream_tls_cert_path && upstream_tls_key_path)) {
+        write_str("--upstream-tls-cert and --upstream-tls-key must be provided together\n");
+        return 1;
+    }
 
     TlsServerContext* tls_server = nullptr;
     if (tls_cert_path && tls_key_path) {
-        auto tls_result = create_tls_server_context(tls_cert_path, tls_key_path, offer_h2);
+        auto tls_result =
+            create_tls_server_context(tls_cert_path, tls_key_path, offer_h2, tls_client_ca_file);
         if (!tls_result) {
             write_error("Failed to initialize TLS", tls_result.error());
             return 1;
         }
         tls_server = tls_result.value();
+        for (u32 i = 0; i < tls_sni_arg_count; i++) {
+            auto added = add_tls_server_sni_identity(tls_server,
+                                                     tls_sni_args[i].server_name,
+                                                     tls_sni_args[i].cert_path,
+                                                     tls_sni_args[i].key_path,
+                                                     tls_client_ca_file);
+            if (!added) {
+                write_error("Failed to initialize TLS SNI identity", added.error());
+                destroy_tls_server_context(tls_server);
+                return 1;
+            }
+        }
         write_str("TLS: enabled\n");
     }
 
@@ -800,11 +882,15 @@ int main(int argc, char** argv) {
 
     i32 rc = 0;
     TlsClientContext* tls_client = nullptr;
-    auto tls_client_result = create_tls_client_context(upstream_tls_ca_file);
+    const bool has_upstream_tls_credentials = upstream_tls_ca_file != nullptr ||
+                                              upstream_tls_cert_path != nullptr ||
+                                              upstream_tls_key_path != nullptr;
+    auto tls_client_result = create_tls_client_context(
+        upstream_tls_ca_file, upstream_tls_cert_path, upstream_tls_key_path);
     if (tls_client_result) {
         tls_client = tls_client_result.value();
-    } else if (has_upstream_tls) {
-        write_error("Failed to initialize upstream TLS trust store", tls_client_result.error());
+    } else if (has_upstream_tls || has_upstream_tls_credentials) {
+        write_error("Failed to initialize upstream TLS context", tls_client_result.error());
         destroy_tls_server_context(tls_server);
         return 1;
     }

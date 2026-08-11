@@ -507,6 +507,7 @@ static void run_upstream_tls_send_want_write_while_recv_paused_case(
 
 static constexpr char kTestCertPath[] = RUT_TESTDATA_DIR "/localhost_cert.pem";
 static constexpr char kTestKeyPath[] = RUT_TESTDATA_DIR "/localhost_key.pem";
+static constexpr char kTestSniCertPath[] = RUT_TESTDATA_DIR "/api_example_cert.pem";
 
 static bool ssl_write_all(SSL* ssl, const char* data, u32 len);
 static void set_socket_timeouts(i32 fd, i32 secs);
@@ -552,8 +553,9 @@ struct TlsOriginServer {
         return nullptr;
     }
 
-    bool setup() {
-        auto tls_result = create_tls_server_context(kTestCertPath, kTestKeyPath);
+    bool setup(const char* client_ca_file = nullptr) {
+        auto tls_result = create_tls_server_context(
+            kTestCertPath, kTestKeyPath, /*offer_h2=*/false, client_ca_file);
         if (!tls_result) return false;
         tls = tls_result.value();
         auto lfd = create_listen_socket(0);
@@ -6073,6 +6075,48 @@ TEST(shard, proxies_to_verified_tls_upstream) {
     destroy_tls_client_context(tls_client.value());
 }
 
+TEST(shard, proxies_to_mtls_upstream_with_client_identity) {
+    TlsOriginServer origin;
+    REQUIRE(origin.setup(kTestCertPath));
+    auto tls_client = create_tls_client_context(kTestCertPath, kTestCertPath, kTestKeyPath);
+    REQUIRE(tls_client.has_value());
+
+    RouteConfig config{};
+    auto upstream = config.add_upstream("secure", 0x7f000001u, origin.port);
+    REQUIRE(upstream.has_value());
+    REQUIRE(config.set_upstream_tls(upstream.value(), "localhost", 9));
+    REQUIRE(config.add_proxy("/secure", 0, static_cast<u16>(upstream.value())));
+
+    Shard<EpollEventLoop> shard;
+    i32 lfd = create_listen_socket(0).value_or(-1);
+    REQUIRE(lfd >= 0);
+    const u16 port = get_port(lfd);
+    REQUIRE(shard.init(0, lfd).has_value());
+    shard.loop->tls_client = tls_client.value();
+    shard.route_config = &config;
+    REQUIRE(shard.spawn(-1).has_value());
+    usleep(50000);
+
+    i32 client = connect_to(port);
+    REQUIRE(client >= 0);
+    static constexpr char kRequest[] =
+        "GET /secure HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n";
+    REQUIRE(send_all(client, kRequest, sizeof(kRequest) - 1));
+    char response[4097];
+    const i32 n = recv_timeout(client, response, sizeof(response) - 1, 3000);
+    REQUIRE(n > 0);
+    response[n] = '\0';
+    CHECK(has_200(response, n));
+    CHECK(strstr(response, "secure") != nullptr);
+    close(client);
+
+    shard.stop();
+    shard.join();
+    shard.shutdown();
+    close(lfd);
+    destroy_tls_client_context(tls_client.value());
+}
+
 static u64 wait_upstream_connect_result_handler(
     void* /*conn*/, rut::jit::HandlerCtx* ctx, const u8* /*req*/, u32 /*len*/, void* /*arena*/) {
     if (ctx->state == 0) {
@@ -6177,6 +6221,162 @@ TEST(tls, client_context_loads_system_ca_bundle_when_unspecified) {
 TEST(tls, client_context_rejects_unreadable_ca_bundle) {
     auto tls_ctx = create_tls_client_context("/tmp/rut-missing-ca.pem");
     CHECK(!tls_ctx.has_value());
+}
+
+TEST(tls, contexts_reject_incomplete_or_invalid_mtls_credentials) {
+    CHECK(!create_tls_client_context(kTestCertPath, kTestCertPath, nullptr).has_value());
+    CHECK(!create_tls_client_context(kTestCertPath, nullptr, kTestKeyPath).has_value());
+    CHECK(!create_tls_client_context(kTestCertPath, "", kTestKeyPath).has_value());
+    CHECK(!create_tls_client_context(kTestCertPath, kTestCertPath, kTestCertPath).has_value());
+    CHECK(!create_tls_server_context(kTestCertPath,
+                                     kTestKeyPath,
+                                     /*offer_h2=*/false,
+                                     "/tmp/rut-missing-client-ca.pem")
+               .has_value());
+}
+
+TEST(tls, sni_identity_rejects_invalid_and_duplicate_names) {
+    auto tls_server = create_tls_server_context(kTestCertPath, kTestKeyPath);
+    REQUIRE(tls_server.has_value());
+    CHECK(!add_tls_server_sni_identity(nullptr, "api.example.test", kTestSniCertPath, kTestKeyPath)
+               .has_value());
+    CHECK(!add_tls_server_sni_identity(
+               tls_server.value(), "*.example.test", kTestSniCertPath, kTestKeyPath)
+               .has_value());
+    CHECK(!add_tls_server_sni_identity(
+               tls_server.value(), "127.0.0.1", kTestSniCertPath, kTestKeyPath)
+               .has_value());
+    REQUIRE(add_tls_server_sni_identity(
+                tls_server.value(), "api.example.test", kTestSniCertPath, kTestKeyPath)
+                .has_value());
+    CHECK(!add_tls_server_sni_identity(
+               tls_server.value(), "API.EXAMPLE.TEST", kTestSniCertPath, kTestKeyPath)
+               .has_value());
+    const u32 saved_count = tls_server.value()->sni_identity_count;
+    tls_server.value()->sni_identity_count = TlsServerContext::kMaxSniIdentities;
+    CHECK(!add_tls_server_sni_identity(
+               tls_server.value(), "full.example.test", kTestSniCertPath, kTestKeyPath)
+               .has_value());
+    tls_server.value()->sni_identity_count = saved_count;
+    CHECK(!add_tls_server_sni_identity(
+               tls_server.value(), "other.example.test", kTestSniCertPath, kTestCertPath)
+               .has_value());
+    destroy_tls_server_context(tls_server.value());
+}
+
+TEST(tls, server_selects_certificate_by_sni) {
+    auto tls_server = create_tls_server_context(kTestCertPath, kTestKeyPath);
+    REQUIRE(tls_server.has_value());
+    REQUIRE(add_tls_server_sni_identity(
+                tls_server.value(), "api.example.test", kTestSniCertPath, kTestKeyPath)
+                .has_value());
+
+    Shard<EpollEventLoop> shard;
+    i32 lfd = create_listen_socket(0).value_or(-1);
+    REQUIRE(lfd >= 0);
+    const u16 port = get_port(lfd);
+    REQUIRE(shard.init(0, lfd).has_value());
+    shard.loop->tls_server = tls_server.value();
+    REQUIRE(shard.spawn(-1).has_value());
+    usleep(50000);
+
+    SSL_CTX* client_ctx = create_test_client_ctx();
+    REQUIRE(client_ctx != nullptr);
+    i32 client_fd = connect_to(port);
+    REQUIRE(client_fd >= 0);
+    set_socket_timeouts(client_fd, 2);
+    SSL* client = SSL_new(client_ctx);
+    REQUIRE(client != nullptr);
+    REQUIRE(SSL_set_tlsext_host_name(client, "API.EXAMPLE.TEST") == 1);
+    REQUIRE(SSL_set_fd(client, client_fd) == 1);
+    REQUIRE(SSL_connect(client) == 1);
+
+    X509* peer = SSL_get_peer_certificate(client);
+    REQUIRE(peer != nullptr);
+    char common_name[64]{};
+    REQUIRE(X509_NAME_get_text_by_NID(
+                X509_get_subject_name(peer), NID_commonName, common_name, sizeof(common_name)) > 0);
+    CHECK_EQ(strcmp(common_name, "api.example.test"), 0);
+    X509_free(peer);
+
+    REQUIRE(ssl_write_all(client, HTTP_REQ, HTTP_REQ_LEN));
+    char response[4096];
+    const i32 n = SSL_read(client, response, sizeof(response));
+    REQUIRE(n > 0);
+    CHECK(has_200(response, n));
+
+    SSL_free(client);
+    close(client_fd);
+    SSL_CTX_free(client_ctx);
+    shard.stop();
+    shard.join();
+    shard.shutdown();
+    close(lfd);
+    destroy_tls_server_context(tls_server.value());
+}
+
+TEST(tls, server_requires_trusted_client_certificate_when_mtls_enabled) {
+    auto tls_server =
+        create_tls_server_context(kTestCertPath, kTestKeyPath, /*offer_h2=*/false, kTestCertPath);
+    REQUIRE(tls_server.has_value());
+    REQUIRE(
+        add_tls_server_sni_identity(
+            tls_server.value(), "api.example.test", kTestSniCertPath, kTestKeyPath, kTestCertPath)
+            .has_value());
+    CHECK((SSL_CTX_get_verify_mode(tls_server.value()->sni_identities[0].ssl_ctx) &
+           SSL_VERIFY_FAIL_IF_NO_PEER_CERT) != 0);
+
+    Shard<EpollEventLoop> shard;
+    i32 lfd = create_listen_socket(0).value_or(-1);
+    REQUIRE(lfd >= 0);
+    const u16 port = get_port(lfd);
+    REQUIRE(shard.init(0, lfd).has_value());
+    shard.loop->tls_server = tls_server.value();
+    REQUIRE(shard.spawn(-1).has_value());
+    usleep(50000);
+
+    SSL_CTX* anonymous_ctx = create_test_client_ctx();
+    REQUIRE(anonymous_ctx != nullptr);
+    i32 anonymous_fd = connect_to(port);
+    REQUIRE(anonymous_fd >= 0);
+    set_socket_timeouts(anonymous_fd, 2);
+    SSL* anonymous = SSL_new(anonymous_ctx);
+    REQUIRE(anonymous != nullptr);
+    REQUIRE(SSL_set_tlsext_host_name(anonymous, "api.example.test") == 1);
+    REQUIRE(SSL_set_fd(anonymous, anonymous_fd) == 1);
+    bool anonymous_received_200 = false;
+    if (SSL_connect(anonymous) == 1 && ssl_write_all(anonymous, HTTP_REQ, HTTP_REQ_LEN)) {
+        char response[4096];
+        const i32 n = SSL_read(anonymous, response, sizeof(response));
+        anonymous_received_200 = n > 0 && has_200(response, n);
+    }
+    CHECK_FALSE(anonymous_received_200);
+    SSL_free(anonymous);
+    close(anonymous_fd);
+    SSL_CTX_free(anonymous_ctx);
+
+    auto client_ctx = create_tls_client_context(kTestCertPath, kTestCertPath, kTestKeyPath);
+    REQUIRE(client_ctx.has_value());
+    i32 client_fd = connect_to(port);
+    REQUIRE(client_fd >= 0);
+    set_socket_timeouts(client_fd, 2);
+    auto client = create_tls_client_ssl(client_ctx.value(), client_fd, "localhost");
+    REQUIRE(client.has_value());
+    REQUIRE(SSL_connect(client.value()) == 1);
+    REQUIRE(ssl_write_all(client.value(), HTTP_REQ, HTTP_REQ_LEN));
+    char response[4096];
+    const i32 n = SSL_read(client.value(), response, sizeof(response));
+    REQUIRE(n > 0);
+    CHECK(has_200(response, n));
+
+    destroy_tls_client_ssl(client.value());
+    close(client_fd);
+    destroy_tls_client_context(client_ctx.value());
+    shard.stop();
+    shard.join();
+    shard.shutdown();
+    close(lfd);
+    destroy_tls_server_context(tls_server.value());
 }
 
 TEST(tls, server_ssl_rejects_missing_context) {
