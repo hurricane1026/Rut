@@ -15,7 +15,7 @@ deployment capability until lowering and runtime coverage exist.
 |---|---|---|
 | Routes, request inspection, direct responses | **Implemented** | Repeated method/path routes, bounded request views, status/body/header responses |
 | Upstreams and forwarding | **Implemented** | IPv4/IPv6/DNS backends, verified upstream TLS, terminal and bounded buffered forwarding |
-| HTTP/2 | **Implemented with bounds** | Static/JIT routes, timer waits, buffered forwarding, and proxy request bodies; one shared async slot per connection |
+| HTTP/2 | **Implemented with bounds** | Static/JIT routes, timer waits, buffered forwarding, and proxy request bodies; separate but mutually exclusive pending-body and async states per connection |
 | Control flow and reuse | **Partial** | `let`, guard/if/match, bounded static `for`, functions/chains; mutable `var`, defer, and general runtime iteration are target surface |
 | Types | **Partial** | Small named annotation set plus compiler-known domain carriers; the full design type list is not source-declarable |
 | State | **Partial** | Lossy per-shard `Cache<IP,i64>` is exposed; strict Hash table substrate exists but Hash DSL and owner-shard protocol do not |
