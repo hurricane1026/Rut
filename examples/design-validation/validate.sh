@@ -255,6 +255,8 @@ start_rut "$ROOT/examples/design-validation/routing.rut" "$port" \
 request "$port" "/health" 204 ""
 request "$port" "/api/users/42?mode=read" 200 \
     '{"id":"42","mode":"read","path":"users/42"}'
+request "$port" "/api/users/42" 200 \
+    '{"id":"42","mode":"read","path":"users/42"}'
 request "$port" "/api/users/41" 404 'Not Found'
 request "$port" "/search?tag=design&tag=rut" 204 "" \
     -H 'Accept: text/plain' -H 'Accept: application/json'
@@ -270,6 +272,7 @@ printf 'PASS routing.rut\n'
 
 port=$((BASE_PORT + 13))
 start_rut "$ROOT/examples/design-validation/routing.rut" "$port" --shards 2
+grep -Fq 'with 2 shard(s)' "$TMP/rut.log" || fail "Rut did not start with two shards"
 python3 "$ROOT/examples/design-validation/probe.py" concurrency --port "$port" --count 64 ||
     fail "multi-shard concurrency probe failed"
 stop_rut
@@ -418,9 +421,13 @@ port=$((BASE_PORT + 10))
 start_rut "$ROOT/examples/design-validation/proxy.rut" "$port"
 request "$port" "/proxy" 202 'origin-ok'
 grep -Fqi 'X-Rut-Proxy: validated' "$TMP/headers" || fail "proxy response header missing"
+grep -Fqi 'X-Origin: local' "$TMP/headers" || fail "buffered origin response header missing"
 request "$port" "/stream" 200 'origin-ok'
+grep -Fqi 'X-Origin: local' "$TMP/headers" || fail "streaming origin response header missing"
 stream_body=$(printf '%17000s' '' | tr ' ' x)
 request "$port" "/stream-oversized" 200 "$stream_body"
+grep -Fqi 'X-Origin: local' "$TMP/headers" ||
+    fail "oversized streaming origin response header missing"
 request "$port" "/rewrite" 200 '/rewritten|yes'
 request_url "http://127.0.0.1:$port/proxy" 202 'origin-ok' --http2-prior-knowledge
 assert_http_version "http://127.0.0.1:$port/proxy" 2 --http2-prior-knowledge
