@@ -257,6 +257,20 @@ sleep 1
 curl -s -o /dev/null -w "%{http_code}\n" http://127.0.0.1:8080/   # 200
 ```
 
+For the complete black-box conformance suite of the currently implemented
+design surface, run:
+
+```bash
+./examples/design-validation/validate.sh ./build/src/rut
+# or through CTest:
+ctest --test-dir build -R '^test_design_validation$' --output-on-failure
+```
+
+The suite JIT-loads standalone Rut programs and exercises language, state,
+HTTP/1, HTTP/2, TLS/mTLS, forwarding, WebSocket, failure, and reload behavior.
+Its exact coverage and target-surface exclusions are documented in
+`examples/design-validation/README.md`.
+
 ## Caveats / current limits
 
 - **HTTP/2 has distinct cleartext and TLS admission paths.** Cleartext h2c

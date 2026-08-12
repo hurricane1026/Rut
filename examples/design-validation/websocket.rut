@@ -1,0 +1,5 @@
+upstream socket_origin at "127.0.0.1:19892"
+
+route GET "/ws" {
+    return websocket(socket_origin)
+}

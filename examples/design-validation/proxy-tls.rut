@@ -1,0 +1,9 @@
+upstream secure_origin {
+    host: "127.0.0.1",
+    port: 19893,
+    tls: { server_name: "localhost" }
+}
+
+route GET "/secure-proxy" {
+    return forward(secure_origin)
+}

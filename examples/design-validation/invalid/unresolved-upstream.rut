@@ -1,0 +1,5 @@
+upstream origin
+
+route GET "/" {
+    return forward(origin)
+}

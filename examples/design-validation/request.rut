@@ -1,0 +1,21 @@
+route POST "/upload" {
+    let token = req.header("X-Token").or("")
+    let session = req.cookie("sid").or("")
+    guard req.hasContentLength else { return 411 }
+    guard req.body == "payload" else { return 400 }
+    guard token == "secret" && session == "ok" else { return 401 }
+    return 201, json({ body: req.body, token: token, session: session })
+}
+
+route GET "/headers" {
+    let values = req.getAll("X-Value")
+    return 200, json({ values: values, host: req.host.or("") })
+}
+
+route GET "/version" {
+    if req.http11 && req.keepAlive {
+        return 204
+    } else {
+        return 505
+    }
+}

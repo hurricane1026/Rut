@@ -1,0 +1,9 @@
+import "policy.rut"
+
+route GET "/imported" {
+    if importedStatus() == 202 {
+        return 202, json({ imported: true })
+    } else {
+        return 500
+    }
+}

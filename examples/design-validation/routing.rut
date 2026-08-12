@@ -1,0 +1,22 @@
+route GET "/health" {
+    return 204
+}
+
+route GET "/api/users/:id" {
+    let path = req.pathOnly.trimPrefix("/api").trimPrefix("/")
+    let masked = 6 | bitwise.and(_, 3)
+    let mode = req.query("mode").or("read")
+    guard path == "users/42" && masked == 2 else { return 404 }
+    match mode {
+        "read" => return 200, json({ id: req.params.id, mode: mode, path: path })
+        _ => return 400
+    }
+}
+
+route GET "/search" {
+    let tags = req.queryAll("tag")
+    let accepts = req.getAll("Accept")
+    guard tags.len == 2 && accepts.len == 2 else { return 400 }
+    guard tags.at(1).or("") == "rut" else { return 422 }
+    return 204
+}

@@ -1,0 +1,23 @@
+struct Meta { ok: bool }
+struct Payload { path: str, answer: i32, tags: [str], meta: Meta }
+variant Result { ok(Payload), err }
+
+func makePayload(_ path: str, tags: [str]) -> Payload {
+    Payload(path: path, answer: 40 + 2, tags: tags, meta: Meta(ok: true))
+}
+
+route GET "/data" {
+    let state = Result.ok(makePayload(req.path, req.queryAll("tag")))
+    match state {
+        .ok(payload) => return 200, json(payload)
+        .err => return 500
+    }
+}
+
+route GET "/error" {
+    let state = Result.err
+    match state {
+        .ok(payload) => return 200, json(payload)
+        .err => return 503, json({ ok: false })
+    }
+}

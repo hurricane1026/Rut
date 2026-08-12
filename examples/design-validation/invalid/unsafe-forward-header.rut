@@ -1,0 +1,5 @@
+upstream origin at "127.0.0.1:19890"
+
+route GET "/" {
+    return forward(origin, set_header: { "Content-Length": "9" })
+}

@@ -1,0 +1,7 @@
+route GET "/stats" {
+    return 200, json(stats())
+}
+
+route GET "/runtime-metrics" {
+    return 200, json(metrics())
+}

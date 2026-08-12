@@ -1,0 +1,5 @@
+route GET "/transport" {
+    let saved = req.pathOnly
+    wait(5)
+    return 200, json({ path: saved, http11: req.http11 })
+}

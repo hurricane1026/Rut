@@ -1,0 +1,3 @@
+route GET "/" {
+    return 200, json({ value: 1, value: 2 })
+}
