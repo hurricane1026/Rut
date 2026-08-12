@@ -5106,8 +5106,23 @@ static FrontendResult<HirExpr> analyze_method_call_expr(
     if (recv.may_nil || recv.may_error)
         return frontend_error(FrontendError::UnsupportedSyntax, expr.span);
 
+    const auto receiver_has_user_method = [&](Str name) {
+        for (u32 ii = 0; ii < mod.impls.len; ii++) {
+            const auto& impl = mod.impls[ii];
+            if (!impl_matches_type(mod, impl, recv.type, recv.struct_index)) continue;
+            if (find_impl_method(impl, name) != nullptr) return true;
+        }
+        for (u32 ci = 0; ci < mod.conformances.len; ci++) {
+            const auto& conf = mod.conformances[ci];
+            if (conf.type != recv.type || conf.protocol_index >= mod.protocols.len) continue;
+            const auto* method = find_protocol_method(mod.protocols[conf.protocol_index], name);
+            if (method != nullptr && method->function_index != 0xffffffffu) return true;
+        }
+        return false;
+    };
     if (recv.type == HirTypeKind::Str &&
-        (expr.name.eq({"hasPrefix", 9}) || expr.name.eq({"trimPrefix", 10}))) {
+        (expr.name.eq({"hasPrefix", 9}) || expr.name.eq({"trimPrefix", 10})) &&
+        !receiver_has_user_method(expr.name)) {
         if (expr.args.len != 1 || expr.args[0] == nullptr)
             return frontend_error(
                 FrontendError::UnsupportedSyntax,
@@ -6227,9 +6242,18 @@ static FrontendResult<HirExpr> instantiate_function_expr(const HirExpr& expr,
         out.lhs = &route->exprs[route->exprs.len - 1];
     }
     if (expr.rhs != nullptr) {
+        const u32 locals_before_rhs = route->locals.len;
         auto rhs = instantiate_function_expr(
             *expr.rhs, route, mod, args, arg_count, generic_bindings, generic_binding_count);
         if (!rhs) return core::make_unexpected(rhs.error());
+        if ((expr.kind == HirExprKind::StrHasPrefix || expr.kind == HirExprKind::StrTrimPrefix) &&
+            out.lhs != nullptr && hir_expr_reads_response_field(*out.lhs) &&
+            route_appended_response_effect(*route, locals_before_rhs))
+            return frontend_error(
+                FrontendError::UnsupportedSyntax,
+                expr.rhs->span,
+                lit_str("a response-mutating prefix argument cannot follow a Response field "
+                        "read"));
         if (!route->exprs.push(rhs.value()))
             return frontend_error(FrontendError::TooManyItems, expr.span);
         out.rhs = &route->exprs[route->exprs.len - 1];
@@ -9719,6 +9743,19 @@ static FrontendResult<HirExpr> analyze_expr_impl(const AstExpr& expr,
                     HirExpr ret{};
                     ret.type = HirTypeKind::Bool;
                     return ret;
+                }
+                const bool is_has_prefix = method_stage.name.eq({"hasPrefix", 9});
+                const bool is_trim_prefix = method_stage.name.eq({"trimPrefix", 10});
+                if (lhs->type == HirTypeKind::Unknown && (is_has_prefix || is_trim_prefix)) {
+                    HirExpr recv{};
+                    recv.kind = HirExprKind::ValueOf;
+                    recv.type = HirTypeKind::Str;
+                    recv.span = lhs->span;
+                    const auto checkpoint = checkpoint_route_expr_probe(*route);
+                    auto ret = analyze_conditional_method_stage_call(recv);
+                    rollback_route_expr_probe(*route, checkpoint);
+                    if (!ret) return core::make_unexpected(ret.error());
+                    return shape_only_result(ret.value());
                 }
 
                 HirExpr recv = lhs.value();

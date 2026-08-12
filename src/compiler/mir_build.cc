@@ -342,6 +342,7 @@ static FrontendResult<MirValue> mir_value(const HirExpr& expr,
         if (!lhs) return core::make_unexpected(lhs.error());
         if (!fn->values.push(lhs.value()))
             return frontend_error(FrontendError::TooManyItems, expr.span);
+        MirValue* lhs_ptr = &fn->values[fn->values.len - 1];
         auto rhs = mir_value(*expr.rhs, module, fn, ctx);
         if (!rhs) return core::make_unexpected(rhs.error());
         if (!fn->values.push(rhs.value()))
@@ -349,7 +350,7 @@ static FrontendResult<MirValue> mir_value(const HirExpr& expr,
         v.kind = expr.kind == HirExprKind::StrHasPrefix ? MirValueKind::StrHasPrefix
                                                         : MirValueKind::StrTrimPrefix;
         v.type = expr.kind == HirExprKind::StrHasPrefix ? MirTypeKind::Bool : MirTypeKind::Str;
-        v.lhs = &fn->values[fn->values.len - 2];
+        v.lhs = lhs_ptr;
         v.rhs = &fn->values[fn->values.len - 1];
         return v;
     }

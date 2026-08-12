@@ -7217,6 +7217,54 @@ TEST(frontend, string_prefix_builtins_lower_through_the_frontend) {
     rir.destroy();
 }
 
+TEST(frontend, nested_string_prefix_lowering_preserves_outer_receiver) {
+    const char* src =
+        "route GET \"/\" { let ok = "
+        "req.path.hasPrefix(\"/api\".trimPrefix(\"/\")) return 200 }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    REQUIRE_EQ(mir->functions[0].locals.len, 1u);
+    const auto& init = mir->functions[0].locals[0].init;
+    REQUIRE_EQ(init.kind, MirValueKind::StrHasPrefix);
+    REQUIRE(init.lhs != nullptr);
+    CHECK_EQ(init.lhs->kind, MirValueKind::ReqPath);
+    REQUIRE(init.rhs != nullptr);
+    CHECK_EQ(init.rhs->kind, MirValueKind::StrTrimPrefix);
+}
+
+TEST(frontend, user_defined_string_prefix_methods_win_over_builtins) {
+    const char* src = R"rut(
+protocol CustomPrefix {
+    func hasPrefix(value: i32) -> i32
+    func trimPrefix(value: str) -> i32
+}
+str impl CustomPrefix {
+    func hasPrefix(self: str, value: i32) -> i32 => value
+    func trimPrefix(self: str, value: str) -> i32 => 7
+}
+route GET "/" {
+    let first = "value".hasPrefix(41)
+    let second = "value".trimPrefix("v")
+    if first + second == 48 { return 200 } else { return 500 }
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    REQUIRE_EQ(hir->routes[0].locals.len, 2u);
+    CHECK_EQ(hir->routes[0].locals[0].type, HirTypeKind::I32);
+    CHECK_EQ(hir->routes[0].locals[1].type, HirTypeKind::I32);
+}
+
 TEST(frontend, string_prefix_builtins_validate_arity_and_string_operands) {
     const char* sources[] = {
         "route GET \"/\" { let x = req.path.hasPrefix() return 200 }\n",
@@ -7251,6 +7299,111 @@ TEST(frontend, string_prefix_builtins_require_unwrapped_receiver) {
     CHECK_EQ(hir.error().code, FrontendError::UnsupportedSyntax);
 }
 
+TEST(frontend, string_prefix_pipe_stages_infer_known_missing_result_types) {
+    const char* src = R"rut(
+route GET "/" {
+    let missing = nil | _.hasPrefix("/api")
+    let failed = error(.timeout)
+    let tail = failed | _.trimPrefix("/api")
+    let ok = any(missing, false)
+    let safe = any(tail, "")
+    if ok || safe == "" { return 200 } else { return 500 }
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    REQUIRE_EQ(hir->routes[0].locals.len, 5u);
+    CHECK_EQ(hir->routes[0].locals[0].type, HirTypeKind::Bool);
+    CHECK(hir->routes[0].locals[0].may_nil);
+    CHECK_EQ(hir->routes[0].locals[2].type, HirTypeKind::Str);
+    CHECK(hir->routes[0].locals[2].may_error);
+    CHECK_EQ(hir->routes[0].locals[2].error_variant_index,
+             hir->routes[0].locals[1].error_variant_index);
+    CHECK_EQ(hir->routes[0].locals[3].type, HirTypeKind::Bool);
+    CHECK_FALSE(hir->routes[0].locals[3].may_nil);
+    CHECK_EQ(hir->routes[0].locals[4].type, HirTypeKind::Str);
+    CHECK_FALSE(hir->routes[0].locals[4].may_error);
+}
+
+TEST(frontend, missing_prefix_pipe_stages_respect_user_defined_methods) {
+    const char* src = R"rut(
+protocol CustomPrefix {
+    func hasPrefix(value: i32) -> i32
+    func trimPrefix(value: str) -> i32
+}
+str impl CustomPrefix {
+    func hasPrefix(self: str, value: i32) -> i32 => value
+    func trimPrefix(self: str, value: str) -> i32 => 7
+}
+route GET "/" {
+    let missing = nil | _.hasPrefix(41)
+    let failed = error(.timeout) | _.trimPrefix("x")
+    let safeMissing = any(missing, 0)
+    let safeFailed = any(failed, 0)
+    if safeMissing + safeFailed == 0 { return 200 } else { return 500 }
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    REQUIRE_EQ(hir->routes[0].locals.len, 4u);
+    CHECK_EQ(hir->routes[0].locals[0].type, HirTypeKind::I32);
+    CHECK(hir->routes[0].locals[0].may_nil);
+    CHECK_EQ(hir->routes[0].locals[1].type, HirTypeKind::I32);
+    CHECK(hir->routes[0].locals[1].may_error);
+    CHECK_EQ(hir->routes[0].locals[2].type, HirTypeKind::I32);
+    CHECK_EQ(hir->routes[0].locals[3].type, HirTypeKind::I32);
+}
+
+TEST(frontend, missing_prefix_pipe_stages_respect_user_defined_arity) {
+    const char* src = R"rut(
+protocol CustomPrefix { func hasPrefix() -> i32 }
+str impl CustomPrefix { func hasPrefix(self: str) -> i32 => 7 }
+route GET "/" {
+    let present = "value".hasPrefix()
+    let missing = nil | _.hasPrefix()
+    let safe = any(missing, 0)
+    if present == 7 && safe == 0 { return 200 } else { return 500 }
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    REQUIRE_EQ(hir->routes[0].locals.len, 3u);
+    CHECK_EQ(hir->routes[0].locals[0].type, HirTypeKind::I32);
+    CHECK_EQ(hir->routes[0].locals[1].type, HirTypeKind::I32);
+    CHECK(hir->routes[0].locals[1].may_nil);
+    CHECK_EQ(hir->routes[0].locals[2].type, HirTypeKind::I32);
+}
+
+TEST(frontend, repeated_missing_prefix_stages_reclaim_shape_probe_expressions) {
+    std::string src = "route GET \"/\" {\n";
+    for (u32 i = 0; i < 12; i++) {
+        src += "let p" + std::to_string(i) +
+               " = nil | "
+               "_.hasPrefix(\"/api\".trimPrefix(\"/\").trimPrefix(\"/\").trimPrefix(\"/\")"
+               ".trimPrefix(\"/\"))\n";
+    }
+    src += "return 200\n}\n";
+    auto lexed = lex({src.data(), static_cast<u32>(src.size())});
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    CHECK_EQ(hir->routes[0].locals.len, 12u);
+}
+
 TEST(frontend, string_prefix_argument_cannot_mutate_after_response_read) {
     const char* src = R"rut(
 func mutate(_ resp: Response) -> str {
@@ -7272,6 +7425,59 @@ route GET "/" {
     REQUIRE_FALSE(hir);
     CHECK(hir.error().detail.eq(
         lit("a response-mutating prefix argument cannot follow a Response field read")));
+}
+
+TEST(frontend, deferred_protocol_prefix_argument_cannot_mutate_after_response_read) {
+    const char* src = R"rut(
+protocol Prefix { func prefix(_ resp: Response) -> str }
+struct Box { value: str }
+Box impl Prefix {
+    func prefix(self: Box, _ resp: Response) -> str {
+        resp.body = self.value
+        self.value
+    }
+}
+func starts<T: Prefix>(body: str, value: T, _ resp: Response) -> bool {
+    let selected = value.prefix(resp)
+    body.hasPrefix(selected)
+}
+route GET "/" {
+    let resp = response(200)
+    resp.body = req.path
+    let ok = starts(resp.body, Box(value: "/api"), resp)
+    return resp
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE_FALSE(hir);
+    CHECK(hir.error().detail.eq(
+        lit("a response-mutating prefix argument cannot follow a Response field read")));
+}
+
+TEST(frontend, deferred_protocol_prefix_argument_without_response_effect_is_allowed) {
+    const char* src = R"rut(
+protocol Prefix { func prefix() -> str }
+struct Box { value: str }
+Box impl Prefix {
+    func prefix(self: Box) -> str => self.value
+}
+func starts<T: Prefix>(body: str, value: T) -> bool {
+    body.hasPrefix(value.prefix())
+}
+route GET "/" {
+    if starts(req.path, Box(value: "/api")) { return 200 } else { return 404 }
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
 }
 
 TEST(frontend, req_path_regex_match_alias_lowers_to_str_regex) {
