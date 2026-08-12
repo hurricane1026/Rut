@@ -2,6 +2,11 @@ route GET "/health" {
     return 204
 }
 
+route GET "/concurrent" {
+    wait(100)
+    return 204
+}
+
 route GET "/api/users/:id" {
     let path = req.pathOnly.trimPrefix("/api").trimPrefix("/")
     let masked = 6 | bitwise.and(_, 3)

@@ -333,13 +333,11 @@ assert_http_version "https://127.0.0.1:$port/transport" 2 --insecure --http2
 request_url "https://api.example.test:$port/transport" 200 \
     '{"path":"/transport","http11":true}' --cacert "$sni_cert" --http1.1 \
     --resolve "api.example.test:$port:127.0.0.1"
-peer_subject=$(
-    openssl s_client -connect "127.0.0.1:$port" -servername api.example.test \
-        -CAfile "$sni_cert" </dev/null 2>/dev/null |
-        openssl x509 -noout -subject
-)
-[[ "$peer_subject" == *'CN=api.example.test'* ]] ||
-    fail "SNI selected unexpected peer certificate: $peer_subject"
+openssl s_client -connect "127.0.0.1:$port" -servername api.example.test \
+    -CAfile "$sni_cert" </dev/null 2>/dev/null |
+    openssl x509 -outform PEM >"$TMP/sni-peer.pem"
+openssl x509 -in "$TMP/sni-peer.pem" -noout -checkhost api.example.test >/dev/null ||
+    fail "SNI peer certificate does not match api.example.test"
 stop_rut
 printf 'PASS transport.rut TLS/ALPN/SNI\n'
 
@@ -352,6 +350,14 @@ curl --silent --show-error --noproxy '*' --max-time 3 --insecure \
 missing_client_status=$?
 set -e
 [[ "$missing_client_status" -ne 0 ]] || fail "mTLS accepted a client without a certificate"
+set +e
+curl --silent --show-error --noproxy '*' --max-time 3 --insecure \
+    --cert "$sni_cert" --key "$key" \
+    --output /dev/null "https://127.0.0.1:$port/transport" >/dev/null 2>&1
+untrusted_client_status=$?
+set -e
+[[ "$untrusted_client_status" -ne 0 ]] ||
+    fail "mTLS accepted a client certificate outside the configured CA"
 request_url "https://127.0.0.1:$port/transport" 200 \
     '{"path":"/transport","http11":true}' --insecure --http1.1 \
     --cert "$cert" --key "$key"

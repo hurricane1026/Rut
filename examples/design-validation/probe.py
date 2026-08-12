@@ -4,6 +4,7 @@ import concurrent.futures
 import http.client
 import os
 import socket
+import threading
 import time
 
 
@@ -40,17 +41,30 @@ def keepalive(port):
 
 
 def concurrency(port, count):
+    workers = min(count, 16)
+    require(count % workers == 0, "concurrency count must be divisible by worker count")
+    barrier = threading.Barrier(workers, timeout=3)
+
     def one(_):
+        barrier.wait()
         conn = http.client.HTTPConnection("127.0.0.1", port, timeout=3)
-        conn.request("GET", "/health")
+        conn.request("GET", "/concurrent")
         response = conn.getresponse()
         response.read()
         conn.close()
         return response.status
 
-    with concurrent.futures.ThreadPoolExecutor(max_workers=min(count, 16)) as pool:
+    started = time.monotonic()
+    with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as pool:
         statuses = list(pool.map(one, range(count)))
+    elapsed = time.monotonic() - started
     require(statuses == [204] * count, f"concurrent response statuses: {statuses}")
+    serialized_seconds = count * 0.1
+    require(
+        elapsed < serialized_seconds * 0.5,
+        f"concurrent timer requests took {elapsed:.3f}s; serialized bound is "
+        f"{serialized_seconds * 0.5:.3f}s",
+    )
 
 
 def pipeline(port):
@@ -112,6 +126,23 @@ def websocket(port):
         header_end = response.index(b"\r\n\r\n") + 4
         text = response[:header_end].decode("latin1")
         require(text.startswith("HTTP/1.1 101 "), text)
+        headers = {}
+        for line in text.split("\r\n")[1:]:
+            if not line:
+                continue
+            name, separator, value = line.partition(":")
+            require(bool(separator), f"malformed WebSocket response header: {line!r}")
+            headers.setdefault(name.strip().lower(), []).append(value.strip())
+        require(
+            any(value.lower() == "websocket" for value in headers.get("upgrade", [])),
+            f"missing Upgrade: websocket response header: {text}",
+        )
+        connection_tokens = {
+            token.strip().lower()
+            for value in headers.get("connection", [])
+            for token in value.split(",")
+        }
+        require("upgrade" in connection_tokens, f"missing Connection: Upgrade token: {text}")
         require(
             "sec-websocket-accept: s3pplmbitxaq9kygzzhzrbk+xoo=" in text.lower(),
             text,
