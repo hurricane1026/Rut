@@ -11,6 +11,10 @@ route GET "/stream" {
     return forward(origin)
 }
 
+route GET "/stream-oversized" {
+    return forward(origin, set_path: "/oversized")
+}
+
 route GET "/rewrite" {
     return forward(origin, set_path: "/rewritten", set_header: { "X-Inject": "yes" })
 }

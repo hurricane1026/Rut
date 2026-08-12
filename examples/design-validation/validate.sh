@@ -9,29 +9,43 @@ ORIGIN_PORT=19890
 UNAVAILABLE_PORT=19891
 WS_ORIGIN_PORT=19892
 TLS_ORIGIN_PORT=19893
+VALIDATE_WEBSOCKET=${RUT_VALIDATION_WEBSOCKET:-1}
 TMP=$(mktemp -d)
 RUT_PID=
 ORIGIN_PID=
 WS_ORIGIN_PID=
 TLS_ORIGIN_PID=
 
+wait_for_exit() {
+    local pid=$1
+    local attempts=${2:-100}
+    local attempt
+    for ((attempt = 0; attempt < attempts; attempt++)); do
+        if ! kill -0 "$pid" 2>/dev/null; then
+            return 0
+        fi
+        sleep 0.05
+    done
+    return 1
+}
+
+terminate_process() {
+    local pid=$1
+    if [[ -z "$pid" ]]; then
+        return 0
+    fi
+    kill -TERM "$pid" 2>/dev/null || true
+    if ! wait_for_exit "$pid"; then
+        kill -KILL "$pid" 2>/dev/null || true
+    fi
+    wait "$pid" 2>/dev/null || true
+}
+
 cleanup() {
-    if [[ -n "$RUT_PID" ]]; then
-        kill "$RUT_PID" 2>/dev/null || true
-        wait "$RUT_PID" 2>/dev/null || true
-    fi
-    if [[ -n "$ORIGIN_PID" ]]; then
-        kill "$ORIGIN_PID" 2>/dev/null || true
-        wait "$ORIGIN_PID" 2>/dev/null || true
-    fi
-    if [[ -n "$WS_ORIGIN_PID" ]]; then
-        kill "$WS_ORIGIN_PID" 2>/dev/null || true
-        wait "$WS_ORIGIN_PID" 2>/dev/null || true
-    fi
-    if [[ -n "$TLS_ORIGIN_PID" ]]; then
-        kill "$TLS_ORIGIN_PID" 2>/dev/null || true
-        wait "$TLS_ORIGIN_PID" 2>/dev/null || true
-    fi
+    terminate_process "$RUT_PID"
+    terminate_process "$ORIGIN_PID"
+    terminate_process "$WS_ORIGIN_PID"
+    terminate_process "$TLS_ORIGIN_PID"
     rm -rf "$TMP"
 }
 trap cleanup EXIT
@@ -46,9 +60,18 @@ fail() {
 
 stop_rut() {
     if [[ -n "$RUT_PID" ]]; then
-        kill -TERM "$RUT_PID" 2>/dev/null || true
-        wait "$RUT_PID" 2>/dev/null || true
+        local pid=$RUT_PID
+        kill -TERM "$pid" 2>/dev/null || true
+        if ! wait_for_exit "$pid"; then
+            kill -KILL "$pid" 2>/dev/null || true
+            wait "$pid" 2>/dev/null || true
+            RUT_PID=
+            fail "rut did not stop within 5 seconds and was killed"
+        fi
+        local status
+        if wait "$pid"; then status=0; else status=$?; fi
         RUT_PID=
+        [[ "$status" -eq 0 ]] || fail "rut exited with status $status during shutdown"
     fi
 }
 
@@ -89,6 +112,19 @@ start_rut() {
     fail "$file did not become ready"
 }
 
+assert_body_equals() {
+    local context=$1
+    local expected=$2
+    local expected_file="$TMP/expected-body"
+    printf '%s' "$expected" >"$expected_file"
+    if ! cmp -s "$expected_file" "$TMP/body"; then
+        local actual_size expected_size
+        actual_size=$(wc -c <"$TMP/body")
+        expected_size=$(wc -c <"$expected_file")
+        fail "$context returned an unexpected body ($actual_size bytes, expected $expected_size)"
+    fi
+}
+
 request() {
     local port=$1
     local path=$2
@@ -102,8 +138,7 @@ request() {
         --write-out '%{http_code}' "$@" "http://127.0.0.1:$port$path")
     [[ "$status" == "$expected_status" ]] ||
         fail "$path returned $status, expected $expected_status"
-    [[ "$(<"$TMP/body")" == "$expected_body" ]] ||
-        fail "$path returned unexpected body: $(<"$TMP/body")"
+    assert_body_equals "$path" "$expected_body"
 }
 
 request_url() {
@@ -118,8 +153,7 @@ request_url() {
         --write-out '%{http_code}' "$@" "$url")
     [[ "$status" == "$expected_status" ]] ||
         fail "$url returned $status, expected $expected_status"
-    [[ "$(<"$TMP/body")" == "$expected_body" ]] ||
-        fail "$url returned unexpected body: $(<"$TMP/body")"
+    assert_body_equals "$url" "$expected_body"
 }
 
 request_contains() {
@@ -158,9 +192,9 @@ expect_load_failure() {
     RUT_PID=$!
     for _ in $(seq 1 200); do
         if grep -Fq 'Listening on port' "$TMP/rut.log"; then
-            kill -TERM "$RUT_PID" 2>/dev/null || true
-            wait "$RUT_PID" 2>/dev/null || true
+            local pid=$RUT_PID
             RUT_PID=
+            terminate_process "$pid"
             fail "$file unexpectedly loaded"
         fi
         if ! kill -0 "$RUT_PID" 2>/dev/null; then
@@ -174,25 +208,33 @@ expect_load_failure() {
         fi
         sleep 0.05
     done
-    kill -TERM "$RUT_PID" 2>/dev/null || true
-    wait "$RUT_PID" 2>/dev/null || true
+    local pid=$RUT_PID
     RUT_PID=
+    terminate_process "$pid"
     fail "$file did not finish its negative load probe within 10 seconds"
 }
 
 [[ -x "$BIN" ]] || fail "rut binary is not executable: $BIN"
 command -v curl >/dev/null || fail "curl is required"
+command -v cmp >/dev/null || fail "cmp is required"
 command -v python3 >/dev/null || fail "python3 is required"
 command -v openssl >/dev/null || fail "openssl is required"
 
 ports=(
     "$ORIGIN_PORT"
     "$UNAVAILABLE_PORT"
-    "$WS_ORIGIN_PORT"
     "$TLS_ORIGIN_PORT"
     "$((BASE_PORT + 30))"
 )
-for offset in $(seq 0 15); do ports+=("$((BASE_PORT + offset))"); done
+for offset in $(seq 0 15); do
+    if [[ "$VALIDATE_WEBSOCKET" == 0 && "$offset" -eq 11 ]]; then
+        continue
+    fi
+    ports+=("$((BASE_PORT + offset))")
+done
+if [[ "$VALIDATE_WEBSOCKET" != 0 ]]; then
+    ports+=("$WS_ORIGIN_PORT")
+fi
 python3 - "${ports[@]}" <<'PY' || fail "one or more validation ports are unavailable"
 import socket
 import sys
@@ -374,6 +416,8 @@ start_rut "$ROOT/examples/design-validation/proxy.rut" "$port"
 request "$port" "/proxy" 202 'origin-ok'
 grep -Fqi 'X-Rut-Proxy: validated' "$TMP/headers" || fail "proxy response header missing"
 request "$port" "/stream" 200 'origin-ok'
+stream_body=$(printf '%17000s' '' | tr ' ' x)
+request "$port" "/stream-oversized" 200 "$stream_body"
 request "$port" "/rewrite" 200 '/rewritten|yes'
 request_url "http://127.0.0.1:$port/proxy" 202 'origin-ok' --http2-prior-knowledge
 assert_http_version "http://127.0.0.1:$port/proxy" 2 --http2-prior-knowledge
@@ -396,7 +440,7 @@ request "$port" "/secure-proxy" 200 'origin-ok'
 stop_rut
 printf 'PASS proxy-tls.rut verified TLS/mTLS origin\n'
 
-if [[ ${RUT_VALIDATION_WEBSOCKET:-1} != 0 ]]; then
+if [[ "$VALIDATE_WEBSOCKET" != 0 ]]; then
     python3 "$ROOT/examples/design-validation/origin.py" --port "$WS_ORIGIN_PORT" \
         >"$TMP/ws-origin.log" 2>&1 &
     WS_ORIGIN_PID=$!
