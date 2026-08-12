@@ -219,6 +219,7 @@ command -v curl >/dev/null || fail "curl is required"
 command -v cmp >/dev/null || fail "cmp is required"
 command -v python3 >/dev/null || fail "python3 is required"
 command -v openssl >/dev/null || fail "openssl is required"
+command -v timeout >/dev/null || fail "timeout is required"
 
 ports=(
     "$ORIGIN_PORT"
@@ -375,9 +376,11 @@ assert_http_version "https://127.0.0.1:$port/transport" 2 --insecure --http2
 request_url "https://api.example.test:$port/transport" 200 \
     '{"path":"/transport","http11":true}' --cacert "$sni_cert" --http1.1 \
     --resolve "api.example.test:$port:127.0.0.1"
-openssl s_client -connect "127.0.0.1:$port" -servername api.example.test \
-    -CAfile "$sni_cert" </dev/null 2>/dev/null |
-    openssl x509 -outform PEM >"$TMP/sni-peer.pem"
+if ! timeout 5 openssl s_client -connect "127.0.0.1:$port" \
+    -servername api.example.test -CAfile "$sni_cert" </dev/null 2>/dev/null |
+    openssl x509 -outform PEM >"$TMP/sni-peer.pem"; then
+    fail "SNI certificate probe did not complete within 5 seconds"
+fi
 openssl x509 -in "$TMP/sni-peer.pem" -noout -checkhost api.example.test >/dev/null ||
     fail "SNI peer certificate does not match api.example.test"
 stop_rut
