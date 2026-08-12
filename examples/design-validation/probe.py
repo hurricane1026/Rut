@@ -2,7 +2,26 @@
 import argparse
 import concurrent.futures
 import http.client
+import os
 import socket
+import time
+
+
+def require(condition, message):
+    if not condition:
+        raise RuntimeError(message)
+
+
+def recv_exact(conn, length):
+    chunks = []
+    remaining = length
+    while remaining:
+        chunk = conn.recv(remaining)
+        if not chunk:
+            raise RuntimeError(f"connection closed with {remaining} bytes remaining")
+        chunks.append(chunk)
+        remaining -= len(chunk)
+    return b"".join(chunks)
 
 
 def keepalive(port):
@@ -10,13 +29,13 @@ def keepalive(port):
     conn.request("GET", "/health")
     first = conn.getresponse()
     first.read()
-    assert first.status == 204, first.status
+    require(first.status == 204, f"first keep-alive response returned {first.status}")
     local_port = conn.sock.getsockname()[1]
     conn.request("GET", "/health")
     second = conn.getresponse()
     second.read()
-    assert second.status == 204, second.status
-    assert conn.sock.getsockname()[1] == local_port
+    require(second.status == 204, f"second keep-alive response returned {second.status}")
+    require(conn.sock.getsockname()[1] == local_port, "second request opened a new connection")
     conn.close()
 
 
@@ -31,7 +50,7 @@ def concurrency(port, count):
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=min(count, 16)) as pool:
         statuses = list(pool.map(one, range(count)))
-    assert statuses == [204] * count, statuses
+    require(statuses == [204] * count, f"concurrent response statuses: {statuses}")
 
 
 def pipeline(port):
@@ -50,7 +69,27 @@ def pipeline(port):
             if b"".join(chunks).count(b"HTTP/1.1 204 No Content") == 2:
                 break
     response = b"".join(chunks)
-    assert response.count(b"HTTP/1.1 204 No Content") == 2, response.decode("latin1")
+    require(
+        response.count(b"HTTP/1.1 204 No Content") == 2,
+        f"incomplete pipelined response: {response.decode('latin1')}",
+    )
+
+
+def wait_port(port, pid, timeout):
+    deadline = time.monotonic() + timeout
+    last_error = None
+    while time.monotonic() < deadline:
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError as error:
+            raise RuntimeError(f"fixture process {pid} exited before listening") from error
+        try:
+            with socket.create_connection(("127.0.0.1", port), timeout=0.1):
+                return
+        except OSError as error:
+            last_error = error
+            time.sleep(0.05)
+    raise RuntimeError(f"fixture process {pid} did not listen on port {port}: {last_error}")
 
 
 def websocket(port):
@@ -64,17 +103,46 @@ def websocket(port):
     ).encode()
     with socket.create_connection(("127.0.0.1", port), timeout=3) as conn:
         conn.sendall(request)
-        response = conn.recv(4096)
-    text = response.decode("latin1")
-    assert text.startswith("HTTP/1.1 101 "), text
-    assert "sec-websocket-accept: s3pplmbitxaq9kygzzhzrbk+xoo=" in text.lower(), text
+        response = bytearray()
+        while b"\r\n\r\n" not in response:
+            chunk = conn.recv(4096)
+            if not chunk:
+                raise RuntimeError("connection closed before the WebSocket handshake completed")
+            response.extend(chunk)
+        header_end = response.index(b"\r\n\r\n") + 4
+        text = response[:header_end].decode("latin1")
+        require(text.startswith("HTTP/1.1 101 "), text)
+        require(
+            "sec-websocket-accept: s3pplmbitxaq9kygzzhzrbk+xoo=" in text.lower(),
+            text,
+        )
+
+        payload = b"rut"
+        mask = b"\x01\x02\x03\x04"
+        masked = bytes(value ^ mask[index % 4] for index, value in enumerate(payload))
+        conn.sendall(bytes((0x81, 0x80 | len(payload))) + mask + masked)
+        frame = bytes(response[header_end:])
+        if len(frame) < 2:
+            frame += recv_exact(conn, 2 - len(frame))
+        require(frame[0] == 0x81, f"unexpected WebSocket opcode: {frame[0]:#x}")
+        length = frame[1] & 0x7F
+        require((frame[1] & 0x80) == 0, "origin echo frame must not be masked")
+        require(length < 126, f"unexpected WebSocket echo length: {length}")
+        body = frame[2:]
+        if len(body) < length:
+            body += recv_exact(conn, length - len(body))
+        require(body[:length] == payload, f"unexpected WebSocket echo payload: {body[:length]!r}")
 
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("probe", choices=("keepalive", "pipeline", "concurrency", "websocket"))
+    parser.add_argument(
+        "probe", choices=("keepalive", "pipeline", "concurrency", "websocket", "wait-port")
+    )
     parser.add_argument("--port", type=int, required=True)
     parser.add_argument("--count", type=int, default=32)
+    parser.add_argument("--pid", type=int)
+    parser.add_argument("--timeout", type=float, default=5)
     args = parser.parse_args()
     if args.probe == "keepalive":
         keepalive(args.port)
@@ -82,6 +150,9 @@ def main():
         pipeline(args.port)
     elif args.probe == "concurrency":
         concurrency(args.port, args.count)
+    elif args.probe == "wait-port":
+        require(args.pid is not None, "wait-port requires --pid")
+        wait_port(args.port, args.pid, args.timeout)
     else:
         websocket(args.port)
 

@@ -20,6 +20,24 @@ class OriginHandler(BaseHTTPRequestHandler):
             self.send_header("Connection", "Upgrade")
             self.send_header("Sec-WebSocket-Accept", accept)
             self.end_headers()
+            self.wfile.flush()
+            header = self.rfile.read(2)
+            if len(header) != 2:
+                self.close_connection = True
+                return
+            length = header[1] & 0x7F
+            if (header[1] & 0x80) == 0 or length >= 126:
+                self.close_connection = True
+                return
+            mask = self.rfile.read(4)
+            payload = self.rfile.read(length)
+            if len(mask) != 4 or len(payload) != length:
+                self.close_connection = True
+                return
+            decoded = bytes(value ^ mask[index % 4] for index, value in enumerate(payload))
+            self.wfile.write(bytes((0x81, len(decoded))) + decoded)
+            self.wfile.flush()
+            self.close_connection = True
             return
 
         if self.path == "/oversized":

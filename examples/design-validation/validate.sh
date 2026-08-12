@@ -6,6 +6,7 @@ BIN=${1:-"$ROOT/build/src/rut"}
 BASE_PORT=${RUT_VALIDATION_BASE_PORT:-19840}
 OPT_LEVEL=${RUT_VALIDATION_OPT:-2}
 ORIGIN_PORT=19890
+UNAVAILABLE_PORT=19891
 WS_ORIGIN_PORT=19892
 TLS_ORIGIN_PORT=19893
 TMP=$(mktemp -d)
@@ -48,6 +49,18 @@ stop_rut() {
         kill -TERM "$RUT_PID" 2>/dev/null || true
         wait "$RUT_PID" 2>/dev/null || true
         RUT_PID=
+    fi
+}
+
+wait_fixture() {
+    local pid=$1
+    local port=$2
+    local log=$3
+    local name=$4
+    if ! python3 "$ROOT/examples/design-validation/probe.py" wait-port \
+        --pid "$pid" --port "$port" --timeout 5; then
+        sed -n '1,120p' "$log" >&2
+        fail "$name fixture did not become ready"
     fi
 }
 
@@ -140,21 +153,45 @@ expect_load_failure() {
     local expected=$2
     local port=$((BASE_PORT + 30))
     : >"$TMP/rut.log"
-    set +e
     "$BIN" "$port" --backend epoll --shards 1 --no-pin --drain 0 --opt 0 "$file" \
-        >"$TMP/rut.log" 2>&1
-    local status=$?
-    set -e
-    [[ "$status" -ne 0 ]] || fail "$file unexpectedly loaded"
-    grep -Fq "$expected" "$TMP/rut.log" ||
-        fail "$file failed without expected diagnostic: $expected"
+        >"$TMP/rut.log" 2>&1 &
+    RUT_PID=$!
+    for _ in $(seq 1 200); do
+        if grep -Fq 'Listening on port' "$TMP/rut.log"; then
+            kill -TERM "$RUT_PID" 2>/dev/null || true
+            wait "$RUT_PID" 2>/dev/null || true
+            RUT_PID=
+            fail "$file unexpectedly loaded"
+        fi
+        if ! kill -0 "$RUT_PID" 2>/dev/null; then
+            local status
+            if wait "$RUT_PID"; then status=0; else status=$?; fi
+            RUT_PID=
+            [[ "$status" -ne 0 ]] || fail "$file unexpectedly exited successfully"
+            grep -Fq "$expected" "$TMP/rut.log" ||
+                fail "$file failed without expected diagnostic: $expected"
+            return
+        fi
+        sleep 0.05
+    done
+    kill -TERM "$RUT_PID" 2>/dev/null || true
+    wait "$RUT_PID" 2>/dev/null || true
+    RUT_PID=
+    fail "$file did not finish its negative load probe within 10 seconds"
 }
 
 [[ -x "$BIN" ]] || fail "rut binary is not executable: $BIN"
 command -v curl >/dev/null || fail "curl is required"
 command -v python3 >/dev/null || fail "python3 is required"
+command -v openssl >/dev/null || fail "openssl is required"
 
-ports=("$ORIGIN_PORT" "$WS_ORIGIN_PORT" "$TLS_ORIGIN_PORT" "$((BASE_PORT + 30))")
+ports=(
+    "$ORIGIN_PORT"
+    "$UNAVAILABLE_PORT"
+    "$WS_ORIGIN_PORT"
+    "$TLS_ORIGIN_PORT"
+    "$((BASE_PORT + 30))"
+)
 for offset in $(seq 0 15); do ports+=("$((BASE_PORT + offset))"); done
 python3 - "${ports[@]}" <<'PY' || fail "one or more validation ports are unavailable"
 import socket
@@ -284,16 +321,25 @@ printf 'PASS transport.rut h2c/metrics\n'
 port=$((BASE_PORT + 9))
 cert="$ROOT/tests/fixtures/localhost_cert.pem"
 key="$ROOT/tests/fixtures/localhost_key.pem"
+sni_cert="$ROOT/tests/fixtures/api_example_cert.pem"
 start_rut "$ROOT/examples/design-validation/transport.rut" "$port" \
-    --tls-cert "$cert" --tls-key "$key" --tls-sni alt.local "$cert" "$key" --h2
+    --tls-cert "$cert" --tls-key "$key" \
+    --tls-sni api.example.test "$sni_cert" "$key" --h2
 request_url "https://127.0.0.1:$port/transport" 200 \
     '{"path":"/transport","http11":true}' --insecure --http1.1
 request_url "https://127.0.0.1:$port/transport" 200 \
     '{"path":"/transport","http11":true}' --insecure --http2
 assert_http_version "https://127.0.0.1:$port/transport" 2 --insecure --http2
-request_url "https://alt.local:$port/transport" 200 \
-    '{"path":"/transport","http11":true}' --insecure --http1.1 \
-    --resolve "alt.local:$port:127.0.0.1"
+request_url "https://api.example.test:$port/transport" 200 \
+    '{"path":"/transport","http11":true}' --cacert "$sni_cert" --http1.1 \
+    --resolve "api.example.test:$port:127.0.0.1"
+peer_subject=$(
+    openssl s_client -connect "127.0.0.1:$port" -servername api.example.test \
+        -CAfile "$sni_cert" </dev/null 2>/dev/null |
+        openssl x509 -noout -subject
+)
+[[ "$peer_subject" == *'CN=api.example.test'* ]] ||
+    fail "SNI selected unexpected peer certificate: $peer_subject"
 stop_rut
 printf 'PASS transport.rut TLS/ALPN/SNI\n'
 
@@ -315,7 +361,7 @@ printf 'PASS transport.rut mTLS\n'
 python3 "$ROOT/examples/design-validation/origin.py" --port "$ORIGIN_PORT" \
     >"$TMP/origin.log" 2>&1 &
 ORIGIN_PID=$!
-sleep 0.2
+wait_fixture "$ORIGIN_PID" "$ORIGIN_PORT" "$TMP/origin.log" "HTTP origin"
 
 port=$((BASE_PORT + 10))
 start_rut "$ROOT/examples/design-validation/proxy.rut" "$port"
@@ -335,10 +381,11 @@ printf 'PASS proxy.rut\n'
 python3 "$ROOT/examples/design-validation/origin.py" --port "$TLS_ORIGIN_PORT" \
     --cert "$cert" --key "$key" --client-ca "$cert" >"$TMP/tls-origin.log" 2>&1 &
 TLS_ORIGIN_PID=$!
-sleep 0.2
+wait_fixture "$TLS_ORIGIN_PID" "$TLS_ORIGIN_PORT" "$TMP/tls-origin.log" "TLS origin"
 port=$((BASE_PORT + 14))
 start_rut "$ROOT/examples/design-validation/proxy-tls.rut" "$port" \
     --upstream-tls-ca "$cert" --upstream-tls-cert "$cert" --upstream-tls-key "$key"
+request "$port" "/mismatched-proxy" 502 'Bad Gateway'
 request "$port" "/secure-proxy" 200 'origin-ok'
 stop_rut
 printf 'PASS proxy-tls.rut verified TLS/mTLS origin\n'
@@ -347,7 +394,7 @@ if [[ ${RUT_VALIDATION_WEBSOCKET:-1} != 0 ]]; then
     python3 "$ROOT/examples/design-validation/origin.py" --port "$WS_ORIGIN_PORT" \
         >"$TMP/ws-origin.log" 2>&1 &
     WS_ORIGIN_PID=$!
-    sleep 0.2
+    wait_fixture "$WS_ORIGIN_PID" "$WS_ORIGIN_PORT" "$TMP/ws-origin.log" "WebSocket origin"
     port=$((BASE_PORT + 11))
     start_rut "$ROOT/examples/design-validation/websocket.rut" "$port"
     python3 "$ROOT/examples/design-validation/probe.py" websocket --port "$port" ||

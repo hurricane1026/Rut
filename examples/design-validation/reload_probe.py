@@ -43,6 +43,17 @@ def request(port, method, path):
     return status
 
 
+def require_status(actual, expected, context):
+    if actual != expected:
+        raise RuntimeError(f"{context} returned {actual}, expected {expected}")
+
+
+def stop_process(process):
+    process.send_signal(signal.SIGTERM)
+    if process.wait(timeout=10) != 0:
+        raise RuntimeError(f"rut shutdown returned {process.returncode}")
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--rut", required=True)
@@ -59,6 +70,35 @@ def main():
         source = root / "app.rut"
         source.symlink_to(v1.relative_to(root))
         log_path = root / "rut.log"
+
+        disabled_log_path = root / "rut-disabled.log"
+        with disabled_log_path.open("w+b") as log:
+            disabled = subprocess.Popen(
+                [
+                    args.rut,
+                    "0",
+                    "--backend",
+                    "epoll",
+                    "--shards",
+                    "1",
+                    "--no-pin",
+                    "--drain",
+                    "0",
+                    str(source),
+                ],
+                stdout=subprocess.DEVNULL,
+                stderr=log,
+            )
+            try:
+                match = wait_for(disabled_log_path, r"Listening on port ([0-9]+)", disabled)
+                port = int(match.group(1))
+                require_status(request(port, "POST", "/reload"), 503, "disabled reload route")
+                stop_process(disabled)
+            except Exception:
+                if disabled.poll() is None:
+                    disabled.kill()
+                    disabled.wait()
+                raise
 
         with log_path.open("w+b") as log:
             process = subprocess.Popen(
@@ -81,18 +121,16 @@ def main():
             try:
                 match = wait_for(log_path, r"Listening on port ([0-9]+)", process)
                 port = int(match.group(1))
-                assert request(port, "GET", "/") == 200
+                require_status(request(port, "GET", "/"), 200, "initial generation")
 
                 replacement = root / "app.next"
                 replacement.symlink_to(v2.relative_to(root))
                 os.replace(replacement, source)
-                assert request(port, "POST", "/reload") == 202
+                require_status(request(port, "POST", "/reload"), 202, "enabled reload route")
                 wait_for(log_path, r"Reload activated", process)
-                assert request(port, "GET", "/") == 201
+                require_status(request(port, "GET", "/"), 201, "reloaded generation")
 
-                process.send_signal(signal.SIGTERM)
-                if process.wait(timeout=10) != 0:
-                    raise RuntimeError(f"rut shutdown returned {process.returncode}")
+                stop_process(process)
             except Exception:
                 if process.poll() is None:
                     process.kill()

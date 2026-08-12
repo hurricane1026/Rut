@@ -31,10 +31,10 @@ The suite provides capability-level coverage of the public implementation bounda
 | `modules/main.rut` | relative imports and imported function symbols |
 | `operations.rut` | shard `stats()` and process `metrics()` snapshots |
 | `limits.rut` | JSON/body/status limits and runtime fail-closed behavior |
-| `transport.rut` | h2c, TLS ALPN, exact SNI, inbound mTLS and Prometheus endpoint |
+| `transport.rut` | h2c, TLS ALPN, distinct exact-SNI certificate selection, inbound mTLS and Prometheus endpoint |
 | `proxy.rut` | streaming/buffered forwarding, request rewrite, HTTP/2 body forwarding, origin failure and response overflow |
-| `proxy-tls.rut` | verified TLS origin with a required upstream client identity |
-| `websocket.rut` | HTTP/1.1 WebSocket passthrough upgrade |
+| `proxy-tls.rut` | verified TLS origin, hostname-mismatch rejection and required upstream client identity |
+| `websocket.rut` | HTTP/1.1 WebSocket passthrough upgrade plus masked client frame and origin echo relay |
 | `invalid/*.rut` | duplicate JSON keys, pending `Hash`, invalid regex, unsafe rewrite header and unresolved upstream diagnostics |
 | `reload_probe.py` | capability-gated route reload, immutable symlink activation and generation behavior |
 
