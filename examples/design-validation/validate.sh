@@ -361,7 +361,7 @@ request "$port" "/optional" 200 '{"value":"present"}' -H 'X-Value: present'
 request "$port" "/optional" 404 'Not Found'
 request "$port" "/response" 202 '{"status":202,"observed":"/response"}'
 assert_header_values X-Path /response tail
-grep -Fqi 'X-Observed: /response' "$TMP/headers" || fail "response header read missing"
+assert_header_values X-Observed /response
 if grep -Fqi 'X-Discard:' "$TMP/headers"; then fail "response remove header failed"; fi
 stop_rut
 printf 'PASS core.rut\n'
