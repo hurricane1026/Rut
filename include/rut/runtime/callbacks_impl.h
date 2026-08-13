@@ -5936,12 +5936,8 @@ void on_upstream_response(void* lp, Connection& conn, IoEvent ev) {
     ParseStatus ps =
         resp_parser.parse(conn.upstream_recv_buf.data(), conn.upstream_recv_buf.len(), &resp);
     if (ps == ParseStatus::Incomplete) {
-        if (ev.result <= 0)
-            ps = ParseStatus::Error;
-        else if (loop->submit_recv_upstream(conn)) {
-            return;
-        } else
-            ps = ParseStatus::Error;
+        if (ev.result > 0 && loop->submit_recv_upstream(conn)) return;
+        ps = ParseStatus::Error;
     }
     if (ps == ParseStatus::Error) {
         if (conn.upstream_fd >= 0) {
