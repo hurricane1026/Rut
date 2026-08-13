@@ -59,12 +59,34 @@ def concurrency(port, count):
         statuses = list(pool.map(one, range(count)))
     elapsed = time.monotonic() - started
     require(statuses == [204] * count, f"concurrent response statuses: {statuses}")
-    require(elapsed >= 0.08, f"concurrent timer requests completed too quickly: {elapsed:.3f}s")
     serialized_seconds = count * 0.1
     require(
         elapsed < serialized_seconds * 0.5,
         f"concurrent timer requests took {elapsed:.3f}s; serialized bound is "
         f"{serialized_seconds * 0.5:.3f}s",
+    )
+
+
+def timer_wait(port):
+    conn = http.client.HTTPConnection("127.0.0.1", port, timeout=3)
+
+    def elapsed(path):
+        started = time.monotonic()
+        conn.request("GET", path)
+        response = conn.getresponse()
+        response.read()
+        duration = time.monotonic() - started
+        require(response.status == 204, f"{path} returned {response.status}")
+        return duration
+
+    elapsed("/health")
+    control = min(elapsed("/health") for _ in range(3))
+    timer = elapsed("/concurrent")
+    conn.close()
+    require(timer >= 0.08, f"timer request completed too quickly: {timer:.3f}s")
+    require(
+        timer - control >= 0.06,
+        f"timer request ({timer:.3f}s) was not delayed relative to control ({control:.3f}s)",
     )
 
 
@@ -205,6 +227,7 @@ def main():
             "pipeline",
             "concurrency",
             "no-content-length",
+            "timer-wait",
             "websocket",
             "wait-port",
         ),
@@ -222,6 +245,8 @@ def main():
         concurrency(args.port, args.count)
     elif args.probe == "no-content-length":
         no_content_length(args.port)
+    elif args.probe == "timer-wait":
+        timer_wait(args.port)
     elif args.probe == "wait-port":
         require(args.pid is not None, "wait-port requires --pid")
         wait_port(args.port, args.pid, args.timeout)

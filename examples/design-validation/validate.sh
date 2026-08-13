@@ -10,6 +10,7 @@ UNAVAILABLE_PORT=19891
 WS_ORIGIN_PORT=19892
 TLS_ORIGIN_PORT=19893
 VALIDATE_WEBSOCKET=${RUT_VALIDATION_WEBSOCKET:-1}
+VALIDATE_AUTO_BACKEND=${RUT_VALIDATION_AUTO_BACKEND:-1}
 TMP=$(mktemp -d)
 RUT_PID=
 ORIGIN_PID=
@@ -87,12 +88,13 @@ wait_fixture() {
     fi
 }
 
-start_rut() {
+start_rut_backend() {
     local file=$1
     local port=$2
-    shift 2
+    local backend=$3
+    shift 3
     : >"$TMP/rut.log"
-    "$BIN" "$port" --backend epoll --shards 1 --no-pin --drain 0 --opt "$OPT_LEVEL" "$@" \
+    "$BIN" "$port" --backend "$backend" --shards 1 --no-pin --drain 0 --opt "$OPT_LEVEL" "$@" \
         "$file" \
         >"$TMP/rut.log" 2>&1 &
     RUT_PID=$!
@@ -110,6 +112,13 @@ start_rut() {
         sleep 0.05
     done
     fail "$file did not become ready"
+}
+
+start_rut() {
+    local file=$1
+    local port=$2
+    shift 2
+    start_rut_backend "$file" "$port" epoll "$@"
 }
 
 assert_body_equals() {
@@ -313,6 +322,8 @@ request "$port" "/search?tag=design&tag=rut" 204 "" \
     -H 'Accept: text/plain' -H 'Accept: application/json'
 python3 "$ROOT/examples/design-validation/probe.py" keepalive --port "$port" ||
     fail "HTTP/1.1 keep-alive probe failed"
+python3 "$ROOT/examples/design-validation/probe.py" timer-wait --port "$port" ||
+    fail "timer wait probe failed"
 python3 "$ROOT/examples/design-validation/probe.py" pipeline --port "$port" ||
     fail "HTTP/1.1 pipeline probe failed"
 python3 "$ROOT/examples/design-validation/probe.py" concurrency --port "$port" --count 32 ||
@@ -328,6 +339,17 @@ python3 "$ROOT/examples/design-validation/probe.py" concurrency --port "$port" -
     fail "multi-shard concurrency probe failed"
 stop_rut
 printf 'PASS routing.rut multi-shard\n'
+
+if [[ "$VALIDATE_AUTO_BACKEND" != 0 ]]; then
+    start_rut_backend "$ROOT/examples/design-validation/routing.rut" "$port" auto
+    grep -Eq '^Backend: (io_uring|epoll)' "$TMP/rut.log" ||
+        fail "auto backend selection was not reported"
+    request "$port" "/health" 204 ""
+    python3 "$ROOT/examples/design-validation/probe.py" timer-wait --port "$port" ||
+        fail "timer wait probe failed on the auto-selected backend"
+    stop_rut
+    printf 'PASS routing.rut auto backend\n'
+fi
 
 port=$((BASE_PORT + 1))
 start_rut "$ROOT/examples/design-validation/core.rut" "$port"
@@ -480,13 +502,12 @@ port=$((BASE_PORT + 10))
 start_rut "$ROOT/examples/design-validation/proxy.rut" "$port"
 request "$port" "/proxy" 202 'origin-ok'
 grep -Fqi 'X-Rut-Proxy: validated' "$TMP/headers" || fail "proxy response header missing"
-grep -Fqi 'X-Origin: local' "$TMP/headers" || fail "buffered origin response header missing"
+assert_header_values X-Origin local
 request "$port" "/stream" 200 'origin-ok'
-grep -Fqi 'X-Origin: local' "$TMP/headers" || fail "streaming origin response header missing"
+assert_header_values X-Origin local
 stream_body=$(printf '%17000s' '' | tr ' ' x)
 request "$port" "/stream-oversized" 200 "$stream_body"
-grep -Fqi 'X-Origin: local' "$TMP/headers" ||
-    fail "oversized streaming origin response header missing"
+assert_header_values X-Origin local
 request "$port" "/rewrite" 200 '/rewritten|yes'
 request_url "http://127.0.0.1:$port/proxy" 202 'origin-ok' --http2-prior-knowledge
 assert_http_version "http://127.0.0.1:$port/proxy" 2 --http2-prior-knowledge
