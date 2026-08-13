@@ -115,7 +115,10 @@ core::Expected<void, Error> IoUringBackend::init(u32 /*shard_id*/, i32 lfd) {
     // Setup io_uring with desired flags
     struct io_uring_params params;
     memset(&params, 0, sizeof(params));
-    params.flags = IORING_SETUP_COOP_TASKRUN | IORING_SETUP_SINGLE_ISSUER;
+    // init() runs on the control thread, while io_uring_enter() runs on the
+    // spawned shard thread. SINGLE_ISSUER would bind submissions to the setup
+    // task and make the kernel reject shard submissions with EEXIST.
+    params.flags = IORING_SETUP_COOP_TASKRUN;
     // Note: SQPOLL requires CAP_SYS_NICE or io_uring_register credentials.
     // Omit for now, add as optimization later.
 

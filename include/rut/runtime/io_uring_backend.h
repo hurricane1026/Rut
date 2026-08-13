@@ -23,7 +23,7 @@ using Connection = ConnectionBase;  // alias (matches connection.h)
 //   [*] IORING_RECV_MULTISHOT     — one SQE continuously receives per connection
 //   [*] IOSQE_BUFFER_SELECT       — kernel picks buffer from provided ring
 //   [ ] IORING_SETUP_SQPOLL       — kernel-side SQ polling (needs CAP_SYS_NICE)
-//   [*] IORING_SETUP_SINGLE_ISSUER — single-thread optimization
+//   [ ] IORING_SETUP_SINGLE_ISSUER — ring setup and submission use different threads
 //   [ ] IORING_OP_SEND_ZC         — zero-copy send (future optimization)
 //   [*] IORING_SETUP_COOP_TASKRUN — cooperative task running
 //
