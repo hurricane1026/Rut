@@ -5737,11 +5737,41 @@ TEST(uring, upstream_recv_cancel_on_closed_conn_reclaims_slot) {
     conn.upstream_recv_armed = true;
     loop->free_top = 0;  // pretend the table is fully allocated (room for one reclaim)
     loop->pending_free[loop->pending_free_count++] = conn.id;  // close_conn deferred this slot
+    loop->pending_free_queued[conn.id] = true;
+    loop->slot_is_free[conn.id] = false;
 
     loop->dispatch(make_ev(conn.id, IoEventType::UpstreamRecv, -ECANCELED));
     CHECK_EQ(conn.pending_ops, 0u);
     CHECK_EQ(loop->pending_free_count, 0u);  // reclaim removed it from the pending-free list
     CHECK_EQ(loop->free_top, 1u);            // and pushed the slot back onto the free stack
+    loop->shutdown();
+}
+
+// Multiple teardown paths can observe the same closed slot while cancel CQEs
+// drain. It must be queued and returned to free_stack exactly once.
+TEST(uring, duplicate_deferred_free_is_idempotent) {
+    auto loop = std::make_unique<IoUringEventLoop>();
+    if (!loop->init(0, -1)) {
+        CHECK(true);
+        return;
+    }
+    Connection* conn = loop->alloc_conn();
+    REQUIRE(conn != nullptr);
+    const u32 cid = conn->id;
+    const u32 free_before = loop->free_top;
+    conn->pending_ops = 1;
+
+    loop->free_conn(*conn);
+    CHECK_EQ(loop->pending_free_count, 1u);
+    loop->free_conn(loop->conns[cid]);
+    CHECK_EQ(loop->pending_free_count, 1u);
+    CHECK_EQ(loop->free_top, free_before);
+
+    loop->conns[cid].pending_ops = 0;
+    loop->reclaim_pending();
+    loop->reclaim_slot(cid);
+    CHECK_EQ(loop->pending_free_count, 0u);
+    CHECK_EQ(loop->free_top, free_before + 1);
     loop->shutdown();
 }
 
@@ -7880,9 +7910,8 @@ static u32 run_keepalive_reuse(const char* req, u32 req_len, u32 kBody, u32 kReq
 TEST(proxy_tls_iouring, keepalive_reuse_no_cancel_collision) {
     if (!iouring_socket_live()) SKIP("io_uring async socket ops unavailable in this environment");
     const char kReq[] = "GET /dl HTTP/1.1\r\nHost: x\r\n\r\n";
-    // 8 KiB body: comfortably under the 16 KiB upstream_recv_buf even with headers,
-    // so a one-batch loopback harvest can't -ENOBUFS-truncate the tail and masquerade
-    // as a cancel-collision. Still a real multi-recv stream that pauses per request.
+    // 8 KiB is still a real multi-recv stream that pauses at every request boundary,
+    // while keeping this stress focused on fd reuse and cancel ordering.
     CHECK_EQ(run_keepalive_reuse(kReq, sizeof(kReq) - 1, 8u * 1024u, 30u), 30u);
 }
 
@@ -7893,9 +7922,8 @@ TEST(proxy_tls_iouring, keepalive_reuse_post_body_no_cancel_collision) {
     if (!iouring_socket_live()) SKIP("io_uring async socket ops unavailable in this environment");
     const char kReq[] =
         "POST /dl HTTP/1.1\r\nHost: x\r\nContent-Length: 16\r\n\r\n0123456789abcdef";
-    // 8 KiB body: comfortably under the 16 KiB upstream_recv_buf even with headers,
-    // so a one-batch loopback harvest can't -ENOBUFS-truncate the tail and masquerade
-    // as a cancel-collision. Still a real multi-recv stream that pauses per request.
+    // 8 KiB is still a real multi-recv stream that pauses at every request boundary,
+    // while keeping this stress focused on fd reuse and cancel ordering.
     CHECK_EQ(run_keepalive_reuse(kReq, sizeof(kReq) - 1, 8u * 1024u, 30u), 30u);
 }
 

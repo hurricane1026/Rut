@@ -20,7 +20,7 @@ using Connection = ConnectionBase;  // alias (matches connection.h)
 //
 // io_uring features (Linux 6.0+). Currently enabled marked with [*]:
 //   [*] IORING_ACCEPT_MULTISHOT   — one SQE continuously accepts
-//   [*] IORING_RECV_MULTISHOT     — one SQE continuously receives per connection
+//   [*] IORING_RECV_MULTISHOT     — downstream request receives
 //   [*] IOSQE_BUFFER_SELECT       — kernel picks buffer from provided ring
 //   [ ] IORING_SETUP_SQPOLL       — kernel-side SQ polling (needs CAP_SYS_NICE)
 //   [ ] IORING_SETUP_SINGLE_ISSUER — ring setup and submission use different threads
@@ -101,14 +101,15 @@ struct IoUringBackend {
     // Returns false if SQ is full (no SQE submitted).
     bool add_recv(i32 fd, u32 conn_id);
 
-    // Same as add_recv but encodes UpstreamRecv in user_data so dispatch
-    // can distinguish upstream vs client recv CQEs.
+    // Submit a single-shot upstream recv. Unlike request input, proxy response
+    // reads need callback-driven re-arming so downstream backpressure can stop
+    // the kernel before it consumes another provided buffer.
     bool add_recv_upstream(i32 fd, u32 conn_id);
 
     // Pause downstream recv while a send wait is pending.
     // Uses a silent cancel CQE so the event loop does not have to special-case it.
     bool pause_recv(i32 fd, u32 conn_id);
-    // Cancel the multishot upstream recv by user_data (recv-only). The cancel's own
+    // Cancel an armed upstream recv by user_data (recv-only). The cancel's own
     // completion is tagged kPauseCancelAux so dispatch re-arms only once it drains.
     bool pause_upstream_recv(i32 fd, u32 conn_id);
 
