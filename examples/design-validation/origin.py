@@ -11,6 +11,17 @@ class OriginHandler(BaseHTTPRequestHandler):
 
     def do_GET(self):
         if self.headers.get("Upgrade", "").lower() == "websocket":
+            connection_tokens = {
+                token.strip().lower()
+                for value in self.headers.get_all("Connection", [])
+                for token in value.split(",")
+            }
+            if (
+                "upgrade" not in connection_tokens
+                or self.headers.get("Sec-WebSocket-Version") != "13"
+            ):
+                self.send_error(400, "Invalid WebSocket upgrade")
+                return
             key = self.headers.get("Sec-WebSocket-Key", "")
             accept = base64.b64encode(
                 hashlib.sha1((key + "258EAFA5-E914-47DA-95CA-C5AB0DC85B11").encode()).digest()

@@ -143,9 +143,10 @@ def websocket(port):
             for token in value.split(",")
         }
         require("upgrade" in connection_tokens, f"missing Connection: Upgrade token: {text}")
+        expected_accept = "s3pPLMBiTxaQ9kYGzzhZRbK+xOo="
         require(
-            "sec-websocket-accept: s3pplmbitxaq9kygzzhzrbk+xoo=" in text.lower(),
-            text,
+            headers.get("sec-websocket-accept") == [expected_accept],
+            f"invalid Sec-WebSocket-Accept response header: {text}",
         )
 
         payload = b"rut"
