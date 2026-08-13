@@ -1,0 +1,4 @@
+@rateLimit(limit: 2, window: 1m, scope: global, by: header("X-Client"))
+route GET "/global-limit" {
+    return 204
+}

@@ -16424,6 +16424,35 @@ TEST(route, manual_healthy_override_remains_subject_to_local_ejection) {
     CHECK_EQ(select_backend_with_control_plane(&loop, 0, 2, 1'000'002, &config), 0u);
 }
 
+TEST(route, active_health_excludes_a_single_backend) {
+    using namespace rut;
+    RouteConfig config;
+    auto upstream = config.add_upstream("active-down", 0x7f000001u, 8084);
+    REQUIRE(upstream);
+    REQUIRE(config.set_upstream_health_check(upstream.value(), "/health", 7, 1'000, 200));
+    ControlPlaneMutationPort mutation;
+    mutation.reset(11, true, &config);
+    struct SelectionLoop {
+        ControlPlaneMutationPort* control_plane_mutation;
+    } loop{&mutation};
+
+    const u16 allocation = mutation.endpoint_allocation_for_config(&config, 0, 0);
+    const u64 incarnation = mutation.endpoint_incarnation_for_config(&config, 0, 0);
+    for (u16 i = 0; i < kBackendFailThreshold; i++)
+        record_backend_result_allocation(
+            allocation, false, 1'000'000, &config.upstreams[0], 0, incarnation);
+    CHECK_EQ(select_backend_with_control_plane(&loop, 0, 1, 1'000'001, &config), 0u);
+
+    record_active_probe_result_allocation(
+        allocation, false, 1'000'002, &config.upstreams[0], 0, incarnation);
+    CHECK_EQ(select_backend_with_control_plane(&loop, 0, 1, 1'000'003, &config), ~u32{0});
+
+    SelectionLoop legacy{nullptr};
+    record_active_probe_result(0, 0, false, 1'000'004);
+    CHECK_EQ(select_backend_with_control_plane(&legacy, 0, 1, 1'000'005, &config), ~u32{0});
+    record_active_probe_result(0, 0, true, 1'000'006);
+}
+
 TEST(route, compatible_reload_preserves_round_robin_cursor) {
     RouteConfig old_config;
     REQUIRE(old_config.add_upstream("cursor-reload", 0x7f000001u, 8180).has_value());

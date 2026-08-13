@@ -9,6 +9,7 @@ ORIGIN_PORT=19890
 UNAVAILABLE_PORT=19891
 WS_ORIGIN_PORT=19892
 TLS_ORIGIN_PORT=19893
+HEALTH_ORIGIN_PORT=19894
 VALIDATE_WEBSOCKET=${RUT_VALIDATION_WEBSOCKET:-1}
 VALIDATE_AUTO_BACKEND=${RUT_VALIDATION_AUTO_BACKEND:-1}
 TMP=$(mktemp -d)
@@ -16,6 +17,7 @@ RUT_PID=
 ORIGIN_PID=
 WS_ORIGIN_PID=
 TLS_ORIGIN_PID=
+HEALTH_ORIGIN_PID=
 
 wait_for_exit() {
     local pid=$1
@@ -47,6 +49,7 @@ cleanup() {
     terminate_process "$ORIGIN_PID"
     terminate_process "$WS_ORIGIN_PID"
     terminate_process "$TLS_ORIGIN_PID"
+    terminate_process "$HEALTH_ORIGIN_PID"
     rm -rf "$TMP"
 }
 trap cleanup EXIT
@@ -284,9 +287,10 @@ ports=(
     "$ORIGIN_PORT"
     "$UNAVAILABLE_PORT"
     "$TLS_ORIGIN_PORT"
+    "$HEALTH_ORIGIN_PORT"
     "$((BASE_PORT + 30))"
 )
-for offset in $(seq 0 15); do
+for offset in $(seq 0 17); do
     if [[ "$VALIDATE_WEBSOCKET" == 0 && "$offset" -eq 11 ]]; then
         continue
     fi
@@ -407,6 +411,15 @@ request "$port" "/limited" 429 'Too Many Requests'
 stop_rut
 printf 'PASS state.rut\n'
 
+port=$((BASE_PORT + 16))
+start_rut "$ROOT/examples/design-validation/policy.rut" "$port" --shards 2 \
+    --access-log "$TMP/policy-access.log"
+python3 "$ROOT/examples/design-validation/probe.py" global-rate-limit \
+    --port "$port" --count 64 --access-log "$TMP/policy-access.log" ||
+    fail "global keyed rate-limit probe failed"
+stop_rut
+printf 'PASS policy.rut global rate limit\n'
+
 port=$((BASE_PORT + 6))
 start_rut "$ROOT/examples/design-validation/modules/main.rut" "$port"
 request "$port" "/imported" 202 '{"imported":true}'
@@ -498,6 +511,21 @@ python3 "$ROOT/examples/design-validation/origin.py" --port "$ORIGIN_PORT" \
 ORIGIN_PID=$!
 wait_fixture "$ORIGIN_PID" "$ORIGIN_PORT" "$TMP/origin.log" "HTTP origin"
 
+printf 'down\n' >"$TMP/health-state"
+python3 "$ROOT/examples/design-validation/origin.py" --port "$HEALTH_ORIGIN_PORT" \
+    --health-file "$TMP/health-state" >"$TMP/health-origin.log" 2>&1 &
+HEALTH_ORIGIN_PID=$!
+wait_fixture "$HEALTH_ORIGIN_PID" "$HEALTH_ORIGIN_PORT" "$TMP/health-origin.log" \
+    "health origin"
+port=$((BASE_PORT + 17))
+start_rut "$ROOT/examples/design-validation/health.rut" "$port"
+python3 "$ROOT/examples/design-validation/probe.py" active-health \
+    --port "$port" --state-file "$TMP/health-state" || fail "active health probe failed"
+stop_rut
+terminate_process "$HEALTH_ORIGIN_PID"
+HEALTH_ORIGIN_PID=
+printf 'PASS health.rut active ejection/recovery\n'
+
 port=$((BASE_PORT + 10))
 start_rut "$ROOT/examples/design-validation/proxy.rut" "$port"
 request "$port" "/proxy" 202 'origin-ok'
@@ -539,6 +567,8 @@ if [[ "$VALIDATE_WEBSOCKET" != 0 ]]; then
     start_rut "$ROOT/examples/design-validation/websocket.rut" "$port"
     python3 "$ROOT/examples/design-validation/probe.py" websocket --port "$port" ||
         fail "WebSocket upgrade probe failed"
+    python3 "$ROOT/examples/design-validation/probe.py" websocket-filter --port "$port" ||
+        fail "WebSocket terminate filter probe failed"
     stop_rut
     printf 'PASS websocket.rut\n'
 fi
