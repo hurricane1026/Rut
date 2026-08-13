@@ -80,11 +80,16 @@ def pipeline(port):
             if not chunk:
                 break
             chunks.append(chunk)
-            if b"".join(chunks).count(b"HTTP/1.1 204 No Content") == 2:
+            if b"".join(chunks).count(b"\r\n\r\n") >= 2:
                 break
     response = b"".join(chunks)
+    header_blocks = response.split(b"\r\n\r\n")
     require(
-        response.count(b"HTTP/1.1 204 No Content") == 2,
+        len(header_blocks) >= 3,
+        f"incomplete pipelined headers: {response.decode('latin1')}",
+    )
+    require(
+        all(block.startswith(b"HTTP/1.1 204 No Content\r\n") for block in header_blocks[:2]),
         f"incomplete pipelined response: {response.decode('latin1')}",
     )
 

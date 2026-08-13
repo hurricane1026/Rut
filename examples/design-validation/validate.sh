@@ -171,6 +171,33 @@ request_contains() {
     grep -Fq "$expected_text" "$TMP/body" || fail "$path body did not contain: $expected_text"
 }
 
+request_json_field() {
+    local port=$1
+    local path=$2
+    local expected_status=$3
+    local field=$4
+    local expected_value=$5
+    local status
+    status=$(curl --silent --show-error --noproxy '*' --max-time 5 \
+        --dump-header "$TMP/headers" --output "$TMP/body" \
+        --write-out '%{http_code}' "http://127.0.0.1:$port$path")
+    [[ "$status" == "$expected_status" ]] ||
+        fail "$path returned $status, expected $expected_status"
+    if ! python3 - "$TMP/body" "$field" "$expected_value" <<'PY'
+import json
+import sys
+
+with open(sys.argv[1], encoding="utf-8") as body:
+    payload = json.load(body)
+actual = payload.get(sys.argv[2]) if isinstance(payload, dict) else None
+if actual != sys.argv[3]:
+    raise SystemExit(f"field {sys.argv[2]!r} was {actual!r}, expected {sys.argv[3]!r}")
+PY
+    then
+        fail "$path did not return valid JSON with $field=$expected_value"
+    fi
+}
+
 assert_http_version() {
     local url=$1
     local expected=$2
@@ -258,6 +285,7 @@ request "$port" "/api/users/42?mode=read" 200 \
 request "$port" "/api/users/42" 200 \
     '{"id":"42","mode":"read","path":"users/42"}'
 request "$port" "/api/users/41" 404 'Not Found'
+request "$port" "/missing" 404 'Not Found'
 request "$port" "/search?tag=design&tag=rut" 204 "" \
     -H 'Accept: text/plain' -H 'Accept: application/json'
 python3 "$ROOT/examples/design-validation/probe.py" keepalive --port "$port" ||
@@ -340,8 +368,8 @@ printf 'PASS modules/main.rut\n'
 
 port=$((BASE_PORT + 15))
 start_rut "$ROOT/examples/design-validation/operations.rut" "$port"
-request_contains "$port" "/stats" 200 '"scope":"shard"'
-request_contains "$port" "/runtime-metrics" 200 '"scope":"process"'
+request_json_field "$port" "/stats" 200 scope shard
+request_json_field "$port" "/runtime-metrics" 200 scope process
 stop_rut
 printf 'PASS operations.rut snapshots\n'
 
@@ -361,6 +389,8 @@ request_url "http://127.0.0.1:$port/transport" 200 \
     '{"path":"/transport","http11":true}' --http2-prior-knowledge
 assert_http_version "http://127.0.0.1:$port/transport" 2 --http2-prior-knowledge
 request_contains "$port" "/metrics" 200 'rut_requests_total'
+grep -Eq '^rut_requests_total [0-9]+$' "$TMP/body" ||
+    fail "/metrics did not contain a numeric rut_requests_total sample"
 stop_rut
 printf 'PASS transport.rut h2c/metrics\n'
 
@@ -384,7 +414,8 @@ if ! timeout 5 openssl s_client -connect "127.0.0.1:$port" \
     openssl x509 -outform PEM >"$TMP/sni-peer.pem"; then
     fail "SNI certificate probe did not complete within 5 seconds"
 fi
-openssl x509 -in "$TMP/sni-peer.pem" -noout -checkhost api.example.test >/dev/null ||
+openssl verify -CAfile "$sni_cert" -verify_hostname api.example.test \
+    "$TMP/sni-peer.pem" >/dev/null ||
     fail "SNI peer certificate does not match api.example.test"
 stop_rut
 printf 'PASS transport.rut TLS/ALPN/SNI\n'
