@@ -1,0 +1,9 @@
+upstream health_origin {
+    host: "127.0.0.1",
+    port: 19894,
+    health_check: { path: "/health", interval: 1s, status: 200 }
+}
+
+route GET "/health-proxy" {
+    return forward(health_origin)
+}

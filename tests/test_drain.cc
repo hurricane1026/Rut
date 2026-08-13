@@ -264,6 +264,9 @@ TEST(health_probe, config_helpers_fall_back_without_a_mutation_port) {
 
     record_backend_result_for_config<SmallLoop>(nullptr, &config, 0, 0, true, 1);
     record_active_probe_result_for_config<SmallLoop>(nullptr, &config, 0, 0, false, 2);
+    CHECK(backend_ejected(0, 0, 2));
+    record_active_probe_result_for_config<SmallLoop>(nullptr, &config, 0, 0, true, 3);
+    CHECK_FALSE(backend_ejected(0, 0, 3));
 }
 
 TEST(event_loop, lazily_allocates_and_reclaims_proxy_and_terminate_buffers) {

@@ -160,6 +160,18 @@ inline bool backend_ejected_allocation(
     return h != nullptr && (h->active_down || now_us < h->eject_until_us);
 }
 
+inline bool backend_active_down_allocation(
+    u16 allocation,
+    const UpstreamTarget* target = nullptr,
+    u32 backend_idx = 0,
+    u64 incarnation = 0,
+    u16 seed_allocation = ControlPlaneMutationPort::kInvalidAllocation,
+    u64 seed_incarnation = 0) {
+    const BackendHealth* h = backend_health_allocation(
+        allocation, target, backend_idx, incarnation, seed_allocation, seed_incarnation);
+    return h != nullptr && h->active_down;
+}
+
 inline bool backend_ejected(u64 generation, u16 upstream_id, u32 backend_idx, u64 now_us) {
     const BackendHealth* h = backend_health(generation, upstream_id, backend_idx);
     if (h == nullptr) return false;
@@ -412,10 +424,26 @@ inline u32 select_backend_with_control_plane(Loop* loop,
         }
     }
     // Preserve the historical all-passively-ejected fallback, but never let it
-    // override an explicit manual exclusion.
+    // override an explicit manual exclusion or an active health-check failure.
     for (u32 step = 0; step < backend_count; step++) {
         const u32 idx = (cell.cursor + step) % backend_count;
         if (manual[idx] == ManualHealthOverride::Unhealthy) continue;
+        const u16 allocation = mutation == nullptr ? ControlPlaneMutationPort::kInvalidAllocation
+                                                   : mutation->endpoint_allocation_for_config(
+                                                         allocation_config, upstream_id, idx);
+        const bool active_down = allocation == ControlPlaneMutationPort::kInvalidAllocation
+                                     ? backend_health(generation, upstream_id, idx)->active_down
+                                     : backend_active_down_allocation(
+                                           allocation,
+                                           &allocation_config->upstreams[upstream_id],
+                                           idx,
+                                           mutation->endpoint_incarnation_for_config(
+                                               allocation_config, upstream_id, idx),
+                                           mutation->endpoint_health_seed_allocation_for_config(
+                                               allocation_config, upstream_id, idx),
+                                           mutation->endpoint_health_seed_incarnation_for_config(
+                                               allocation_config, upstream_id, idx));
+        if (active_down) continue;
         cell.cursor = static_cast<u16>((idx + 1) % backend_count);
         return idx;
     }

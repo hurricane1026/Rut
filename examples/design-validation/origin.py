@@ -4,6 +4,7 @@ import base64
 import hashlib
 import ssl
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
 
 
 class OriginHandler(BaseHTTPRequestHandler):
@@ -51,6 +52,15 @@ class OriginHandler(BaseHTTPRequestHandler):
             self.close_connection = True
             return
 
+        if self.path == "/health" and self.server.health_file:
+            healthy = Path(self.server.health_file).read_text().strip() == "up"
+            body = b"up" if healthy else b"down"
+            self.send_response(200 if healthy else 503)
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+            return
+
         if self.path == "/oversized":
             body = b"x" * 17000
         elif self.path == "/rewritten":
@@ -82,8 +92,10 @@ def main():
     parser.add_argument("--cert")
     parser.add_argument("--key")
     parser.add_argument("--client-ca")
+    parser.add_argument("--health-file")
     args = parser.parse_args()
     server = ThreadingHTTPServer(("127.0.0.1", args.port), OriginHandler)
+    server.health_file = args.health_file
     if args.cert or args.key:
         if not args.cert or not args.key:
             parser.error("--cert and --key must be provided together")

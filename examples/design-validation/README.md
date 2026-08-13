@@ -28,13 +28,15 @@ The suite provides capability-level coverage of the public implementation bounda
 | `request.rut` | request body, cookies, repeated headers, host and HTTP version flags |
 | `middleware.rut` | chain `before`/`after`, response status/body/header mutation, timer wait |
 | `state.rut` | bounded per-shard `Cache<IP,i64>`, time, arithmetic, and branch-local writes |
+| `policy.rut` | process-global keyed rate limiting across concurrent connections and shards |
 | `modules/main.rut` | relative imports and imported function symbols |
 | `operations.rut` | shard `stats()` and process `metrics()` snapshots |
 | `limits.rut` | JSON/body/status limits and runtime fail-closed behavior |
 | `transport.rut` | h2c, TLS ALPN, distinct exact-SNI certificate selection, inbound mTLS and Prometheus endpoint |
 | `proxy.rut` | streaming/buffered forwarding, request rewrite, HTTP/2 body forwarding, origin failure and response overflow |
 | `proxy-tls.rut` | verified TLS origin, hostname-mismatch rejection and required upstream client identity |
-| `websocket.rut` | HTTP/1.1 WebSocket passthrough upgrade plus masked client frame and origin echo relay |
+| `health.rut` | active upstream health ejection and recovery against a mutable origin fixture |
+| `websocket.rut` | HTTP/1.1 WebSocket passthrough plus terminate-mode content filtering |
 | `invalid/*.rut` | duplicate JSON keys, pending `Hash`, invalid regex, unsafe rewrite header and unresolved upstream diagnostics |
 | `reload_probe.py` | capability-gated route reload, immutable symlink activation and generation behavior |
 
@@ -70,7 +72,7 @@ JIT dispatch, so `req.http11` is currently true on h2 routes. The runner checks
 the negotiated wire protocol separately using curl's `http_version` result.
 
 Override listener ports with `RUT_VALIDATION_BASE_PORT`. Local origins use
-`19890`, `19892`, and `19893`; those are fixed because upstream addresses are
+`19890`, `19892`, `19893`, and `19894`; those are fixed because upstream addresses are
 compile-time configuration. Set `RUT_VALIDATION_WEBSOCKET=0` to skip the
 optional WebSocket build surface or `RUT_VALIDATION_PROCESS_TESTS=0` to skip
 the standalone SIGHUP/backend probes.
