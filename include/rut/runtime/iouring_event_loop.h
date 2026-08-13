@@ -111,6 +111,10 @@ public:
     // Pending-free list: slots closed during the current dispatch batch.
     u32 pending_free[kMaxConns];
     u32 pending_free_count;
+    // Explicit slot ownership prevents duplicate close/CQE paths from queueing
+    // or reclaiming the same id twice and overflowing free_stack.
+    bool pending_free_queued[kMaxConns];
+    bool slot_is_free[kMaxConns];
 
     // Deferred accepts: accepted fds that couldn't be allocated during
     // dispatch because all slots were in pending_free.
@@ -193,6 +197,8 @@ public:
             conns[i].id = i;
             conns[i].shard_id = static_cast<u8>(id);
             free_stack[i] = i;
+            pending_free_queued[i] = false;
+            slot_is_free[i] = true;
         }
         // Plaintext needs recv + send + lazy upstream_recv. TLS termination adds
         // one long-lived ciphertext output slice per connection. TLS input uses
@@ -344,9 +350,8 @@ public:
         return true;
     }
 
-    // Return conn.upstream_fd to the idle pool at proxy completion. Unlike epoll's
-    // synchronous detach, the multishot upstream recv (IORING_RECV_MULTISHOT) is
-    // still armed here, so the fd can't be handed out until that recv stops — a new
+    // Return conn.upstream_fd to the idle pool at proxy completion. If an asynchronous
+    // upstream recv is still armed here, the fd can't be handed out until it stops — a new
     // borrower's recv would otherwise race the old one on the same socket. We cancel
     // the recv and DEFER the pool-return (idle_return_fd) until its terminal CQE
     // drains; try_deferred_upstream_rearm parks it then. If no recv is armed we park
@@ -369,7 +374,7 @@ public:
         // terminal or positive CQE from it must be quarantined and dropped.
         c.upstream_recv_terminal_stale = true;
         c.upstream_recv_idle_stale_bytes = false;
-        // Cancel the armed multishot recv; if the cancel SQE can't be queued, leave
+        // Cancel the armed recv; if the cancel SQE can't be queued, leave
         // the fd closed/detached but keep the old recv as an in-flight stale terminal
         // barrier; otherwise a later CQE can be delivered to the next request.
         if (c.upstream_recv_armed && !pause_upstream_recv_impl(c)) {
@@ -466,6 +471,7 @@ public:
     }
 
     void reclaim_slot(u32 cid) {
+        if (cid >= kMaxConns || slot_is_free[cid]) return;
         if (conns[cid].request_capture_slice) {
             pool.free(conns[cid].request_capture_slice);
             conns[cid].request_capture_slice = nullptr;
@@ -484,6 +490,7 @@ public:
         }
         free_tls_in_buf(conns[cid]);
         free_tls_out_buf(conns[cid]);
+        slot_is_free[cid] = true;
         free_stack[free_top++] = cid;
         for (u32 i = 0; i < pending_free_count; i++) {
             if (pending_free[i] == cid) {
@@ -491,6 +498,7 @@ public:
                 break;
             }
         }
+        pending_free_queued[cid] = false;
     }
 
     void reclaim_pending() {
@@ -516,7 +524,11 @@ public:
                 }
                 free_tls_in_buf(conns[cid]);
                 free_tls_out_buf(conns[cid]);
-                free_stack[free_top++] = cid;
+                if (!slot_is_free[cid]) {
+                    slot_is_free[cid] = true;
+                    free_stack[free_top++] = cid;
+                }
+                pending_free_queued[cid] = false;
             } else {
                 pending_free[remaining++] = cid;
             }
@@ -536,6 +548,8 @@ public:
             return nullptr;
         }
         u32 id = free_stack[--free_top];
+        slot_is_free[id] = false;
+        pending_free_queued[id] = false;
         conns[id].reset();
         conns[id].id = id;
         conns[id].shard_id = static_cast<u8>(shard_id);
@@ -558,6 +572,7 @@ public:
 
     void free_conn_impl(Connection& c) {
         u32 cid = c.id;
+        if (cid >= kMaxConns || slot_is_free[cid] || pending_free_queued[cid]) return;
         timer.remove(&c);
         if (c.response_capture_slice) {
             pool.free(c.response_capture_slice);
@@ -600,6 +615,8 @@ public:
             free_tls_in_buf(c);
             free_tls_out_buf(c);
             c.reset();
+            c.id = cid;
+            slot_is_free[cid] = true;
             free_stack[free_top++] = cid;
             return;
         }
@@ -614,6 +631,7 @@ public:
         u8* tout = c.tls_out_slice;
         u32 ops = c.pending_ops;
         c.reset();
+        c.id = cid;
         conns[cid].recv_slice = rs;
         conns[cid].send_slice = ss;
         conns[cid].upstream_recv_slice = us;
@@ -621,6 +639,7 @@ public:
         conns[cid].tls_in_slice = tin;
         conns[cid].tls_out_slice = tout;
         conns[cid].pending_ops = ops;
+        pending_free_queued[cid] = true;
         pending_free[pending_free_count++] = cid;
     }
 
@@ -738,7 +757,7 @@ public:
         // Defer-until-drains: a prior pause's cancel SQE and/or the cancelled recv are
         // still in flight even though upstream_recv_armed is clear (proxy_stream_complete
         // clears it at the keep-alive boundary while both are still pending). Arming a new
-        // multishot recv now would give it the same (conn_id, UpstreamRecv) user_data the
+        // recv now would give it the same (conn_id, UpstreamRecv) user_data the
         // stale cancel matches, OR let the stale recv terminal clobber the fresh recv's
         // armed flag. Wait: the cancel CQE clears cancel_pending and the recv terminal
         // clears cancel_inflight; try_deferred_upstream_rearm re-arms once both are clear.
@@ -768,7 +787,7 @@ public:
                 c.upstream_recv_terminal_stale || c.resp_fully_buffered;
             return true;
         }
-        // Cancel the multishot recv by user_data — recv-only, so a concurrent upstream
+        // Cancel the recv by user_data — recv-only, so a concurrent upstream
         // send (WS tunnel, overlapping body upload) is never touched. The cancel is
         // COUNTED in pending_ops and its own completion (tagged kPauseCancelAux) is what
         // re-arms the recv (see try_deferred_upstream_rearm): the recv is re-armed only
@@ -796,7 +815,7 @@ public:
     // fires from whichever lands second. No-op unless a re-arm was actually deferred.
     // Returns false only if the re-arm failed under SQ pressure (caller must close).
     bool try_deferred_upstream_rearm(Connection& c) {
-        // Deferred idle-pool return (return_idle_upstream): the cancelled multishot
+        // Deferred idle-pool return (return_idle_upstream): the cancelled
         // recv has now fully drained (both the cancel and the recv terminal cleared
         // their flags), so the fd parked in idle_return_fd is safe to hand to the
         // pool — no recv can fire on it anymore. Runs at every recv-terminal drain

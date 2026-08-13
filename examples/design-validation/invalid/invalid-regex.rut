@@ -1,0 +1,4 @@
+route GET "/" {
+    guard req.path.matches(re"[") else { return 404 }
+    return 200
+}

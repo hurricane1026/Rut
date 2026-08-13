@@ -145,7 +145,7 @@ struct ConnectionBase {
     SSL* upstream_tls;
     bool upstream_tls_handshake_complete;
     // io_uring-only deferred idle-pool return: an upstream fd to park in the pool
-    // once its cancelled multishot recv terminal drains (handing the fd out while a
+    // once its cancelled recv terminal drains (handing the fd out while a
     // recv is still draining on it would let two recvs race the same socket). -1 =
     // none. epoll detaches synchronously and never uses this. See
     // IoUringEventLoop::return_idle_upstream / try_deferred_upstream_rearm.
@@ -174,7 +174,7 @@ struct ConnectionBase {
     // close_conn to the minimal probe teardown (no metrics/epoch/access-log).
     bool is_health_probe;
     // io_uring h2-proxy reuse guards (epoll is synchronous → both stay false there).
-    // h2_proxy_recv_draining: a multishot upstream recv from a torn-down h2 proxy
+    // h2_proxy_recv_draining: an upstream recv from a torn-down h2 proxy
     // episode may still deliver a terminal CQE; the next episode must not arm its
     // own recv (which shares the conn_id/type user_data) until that terminal drains,
     // or the stale CQE would be misrouted to the new stream. Cleared when the
@@ -470,10 +470,9 @@ struct ConnectionBase {
     u32 resp_body_sent;               // total response body bytes sent (for access log)
     u32 upstream_send_len;            // bytes from upstream_recv_buf in current client send
 
-    // io_uring multishot recv tracking: true while the multishot SQE is
-    // armed in the kernel (set on submit, cleared on final CQE without
-    // IORING_CQE_F_MORE). Separate flags for client and upstream to avoid
-    // an upstream recv CQE clearing the client's armed state.
+    // io_uring recv tracking: true while the SQE is armed in the kernel
+    // (downstream reads are multishot; upstream reads are single-shot).
+    // Separate flags avoid an upstream CQE clearing the client's armed state.
     bool recv_armed;
     bool send_armed;
     bool upstream_recv_armed;
@@ -554,11 +553,6 @@ struct ConnectionBase {
     // don't decrement). Used to drive CQE-based slice reclamation:
     // a closed connection's pooled slices are only returned to the pool
     // after all in-flight ops have completed (pending_ops reaches 0).
-    //
-    // u32: multishot recv stays armed across keep-alive cycles, but
-    // on_response_sent re-submits submit_recv each cycle, growing the
-    // counter by ~1 per request. u32 avoids wraparound (~4B requests).
-    // The proper fix is to not re-arm multishot recv on keep-alive.
     u32 pending_ops;
 
     // Recv/send buffers — backed by SlicePool slices (16KB each).

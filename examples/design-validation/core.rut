@@ -1,0 +1,39 @@
+route GET "/loop/accepted" {
+    for item in [1, 2, 3] {
+        guard item > 0 else { return 400 }
+    }
+    return 204
+}
+
+route GET "/loop/rejected" {
+    for item in [1, 0, 3] {
+        guard item > 0 else { return 422 }
+    }
+    return 204
+}
+
+route GET "/regex/:value" {
+    guard req.pathOnly.matches(re"^/regex/[a-z]+$") else { return 404 }
+    return 204
+}
+
+route GET "/optional" {
+    if let value = req.header("X-Value") {
+        return 200, json({ value: value })
+    } else {
+        return 404
+    }
+}
+
+route GET "/response" {
+    let resp = response(200)
+    resp.add("X-Discard", "old")
+    resp.set("X-Path", req.pathOnly)
+    resp.add("X-Path", "tail")
+    let observed = resp.header("X-Path").or("missing")
+    resp.set("X-Observed", observed)
+    resp.remove("X-Discard")
+    resp.status = 202
+    resp.body = json({ status: resp.status, observed: observed })
+    return resp
+}

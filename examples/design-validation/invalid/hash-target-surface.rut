@@ -1,0 +1,5 @@
+let sessions = Hash<str, str>(capacity: 1024)
+
+route GET "/" {
+    return 200
+}

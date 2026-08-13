@@ -1,0 +1,18 @@
+func requireHttp11(_ req: i32) -> bool => req.http11
+
+func finalize(_ resp: Response) -> i32 {
+    resp.status = 201
+    resp.body = json({ stage: "after", ok: true })
+    resp.set("X-Rut-Stage", "after-wait")
+    0
+}
+
+chain guarded {
+    before requireHttp11(req) else 505
+    after finalize(resp)
+}
+
+route GET "/chain" use chain guarded {
+    wait(5)
+    return 200, "before"
+}

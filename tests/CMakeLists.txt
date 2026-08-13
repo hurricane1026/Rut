@@ -389,6 +389,25 @@ if(RUT_ENABLE_JIT)
                 --rut $<TARGET_FILE:rut>
     )
     set_tests_properties(test_backend_selection PROPERTIES LABELS "integration;process;jit;network")
+
+    add_test(
+        NAME test_design_validation
+        COMMAND ${PROJECT_SOURCE_DIR}/examples/design-validation/validate.sh $<TARGET_FILE:rut>
+    )
+    if(RUT_ENABLE_WEBSOCKET)
+        set(_RUT_VALIDATION_WEBSOCKET 1)
+    else()
+        set(_RUT_VALIDATION_WEBSOCKET 0)
+    endif()
+    set_tests_properties(
+        test_design_validation
+        PROPERTIES
+            ENVIRONMENT
+                "RUT_VALIDATION_WEBSOCKET=${_RUT_VALIDATION_WEBSOCKET};RUT_VALIDATION_PROCESS_TESTS=0"
+            LABELS "integration;process;jit;network;conformance"
+            RUN_SERIAL TRUE
+            TIMEOUT 120
+    )
 endif()
 
 add_executable(test_traffic_capture

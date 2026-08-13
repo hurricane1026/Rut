@@ -115,7 +115,10 @@ core::Expected<void, Error> IoUringBackend::init(u32 /*shard_id*/, i32 lfd) {
     // Setup io_uring with desired flags
     struct io_uring_params params;
     memset(&params, 0, sizeof(params));
-    params.flags = IORING_SETUP_COOP_TASKRUN | IORING_SETUP_SINGLE_ISSUER;
+    // init() runs on the control thread, while io_uring_enter() runs on the
+    // spawned shard thread. SINGLE_ISSUER would bind submissions to the setup
+    // task and make the kernel reject shard submissions with EEXIST.
+    params.flags = IORING_SETUP_COOP_TASKRUN;
     // Note: SQPOLL requires CAP_SYS_NICE or io_uring_register credentials.
     // Omit for now, add as optimization later.
 
@@ -340,7 +343,12 @@ bool IoUringBackend::add_recv_upstream(i32 fd, u32 conn_id) {
     sqe->len = kProvidedBufSize;
     sqe->buf_group = kBufGroupId;
     sqe->flags = IOSQE_BUFFER_SELECT;
-    sqe->ioprio = IORING_RECV_MULTISHOT;
+    // Deliberately single-shot. A multishot recv can place several CQEs in the
+    // completion ring before the event loop gets to drain the first one. wait()
+    // must copy and return each provided buffer while harvesting, so that burst
+    // can overflow the per-connection buffer and irreversibly discard bytes.
+    // Re-arming from the response callback gives TLS/watermark/throttle paths
+    // real read backpressure while retaining provided-buffer selection.
     sqe->user_data = encode_user_data(conn_id, IoEventType::UpstreamRecv);
 
     sqe_advance_tail(sq_tail);
@@ -354,7 +362,7 @@ bool IoUringBackend::pause_recv(i32 fd, u32 conn_id) {
         encode_user_data(conn_id, IoEventType::Recv), kCancelConnId, IoEventType::Recv);
 }
 
-// Pause the multishot upstream recv by cancelling it by user_data (recv-only — it
+// Pause an armed upstream recv by cancelling it by user_data (recv-only — it
 // never touches a concurrent upstream send, unlike a cancel-by-fd). The cancel's OWN
 // completion is tagged with the real conn_id + kPauseCancelAux, so it routes to the
 // connection rather than being silently dropped: the loop counts it in pending_ops

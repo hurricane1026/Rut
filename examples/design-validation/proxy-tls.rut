@@ -1,0 +1,20 @@
+upstream secure_origin {
+    host: "127.0.0.1",
+    port: 19893,
+    tls: { server_name: "localhost" }
+}
+
+upstream mismatched_origin {
+    host: "127.0.0.1",
+    port: 19893,
+    tls: { server_name: "api.example.test" }
+}
+
+route GET "/secure-proxy" {
+    return forward(secure_origin)
+}
+
+
+route GET "/mismatched-proxy" {
+    return forward(mismatched_origin)
+}

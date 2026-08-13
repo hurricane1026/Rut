@@ -1,0 +1,15 @@
+route GET "/json" {
+    return 200, json({ value: req.header("X-Large").or("") })
+}
+
+route GET "/body" {
+    let resp = response(200)
+    resp.body = req.header("X-Large").or("")
+    return resp
+}
+
+route GET "/status" {
+    let resp = response(200)
+    resp.status = req.queryAll("item").len
+    return resp
+}

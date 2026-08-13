@@ -915,6 +915,7 @@ TEST(proxy, connect_fail_502) {
     loop.inject_and_dispatch(make_ev(conn->id, IoEventType::Recv, 100));
     conn->upstream_fd = 100;
     conn->on_upstream_send = &on_upstream_connected<SmallLoop>;
+    conn->upstream_slot_held = true;
 
     // Connect fails
     loop.inject_and_dispatch(make_ev(conn->id, IoEventType::UpstreamConnect, -111));
@@ -933,6 +934,9 @@ TEST(proxy, connect_fail_502) {
         }
     }
     CHECK(has_502);
+    // The backend attempt is already terminal. A subsequent request must not wait
+    // for this downstream response's Send completion before acquiring the slot.
+    CHECK(!conn->upstream_slot_held);
     // 502 sets keep_alive=false → on_response_sent will close, not loop
     CHECK_EQ(conn->keep_alive, false);
     // Simulate send completion → connection should be closed
@@ -9613,6 +9617,28 @@ TEST(streaming, upstream_response_incomplete_waits) {
     CHECK_EQ(c->on_upstream_recv, &on_upstream_response<SmallLoop>);
 }
 
+TEST(streaming, upstream_response_incomplete_rearm_failure_returns_502) {
+    SmallLoop loop;
+    loop.setup();
+    auto* c = setup_proxy_conn(loop);
+    REQUIRE(c != nullptr);
+
+    static const char partial[] = "HTTP/1.1 200 OK\r\nContent-Len";
+    c->upstream_recv_buf.reset();
+    REQUIRE_EQ(
+        c->upstream_recv_buf.write(reinterpret_cast<const u8*>(partial), sizeof(partial) - 1),
+        sizeof(partial) - 1);
+    loop.backend.fail_upstream_recv = true;
+    on_upstream_response<SmallLoop>(
+        &loop,
+        *c,
+        make_ev(c->id, IoEventType::UpstreamRecv, static_cast<i32>(sizeof(partial) - 1)));
+
+    CHECK_EQ(c->resp_status, kStatusBadGateway);
+    CHECK_EQ(c->state, ConnState::Sending);
+    CHECK_EQ(c->on_send, &on_response_sent<SmallLoop>);
+}
+
 TEST(streaming, upstream_response_client_recv_during_proxy) {
     SmallLoop loop;
     loop.setup();
@@ -10887,6 +10913,27 @@ TEST(streaming, 1xx_continue_no_remaining_data) {
     for (u32 i = 0; i < n; i++) loop.dispatch(events[i]);
     // Should re-arm for final response
     CHECK_EQ(c->on_upstream_recv, &on_upstream_response<SmallLoop>);
+}
+
+TEST(streaming, 1xx_continue_rearm_failure_closes) {
+    SmallLoop loop;
+    loop.setup();
+    auto* c = setup_proxy_conn(loop);
+    REQUIRE(c != nullptr);
+    const u32 cid = c->id;
+
+    static const char resp100[] = "HTTP/1.1 100 Continue\r\n\r\n";
+    c->upstream_recv_buf.reset();
+    REQUIRE_EQ(
+        c->upstream_recv_buf.write(reinterpret_cast<const u8*>(resp100), sizeof(resp100) - 1),
+        sizeof(resp100) - 1);
+    loop.backend.fail_upstream_recv = true;
+    on_upstream_response<SmallLoop>(
+        &loop,
+        *c,
+        make_ev(c->id, IoEventType::UpstreamRecv, static_cast<i32>(sizeof(resp100) - 1)));
+
+    CHECK_EQ(loop.conns[cid].fd, -1);
 }
 
 // === Coverage: incomplete HTTP with fallback path parsing ===

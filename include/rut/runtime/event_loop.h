@@ -83,12 +83,12 @@ public:
     // proxy body pump between byte-rate windows). On backends with a persistent
     // level-triggered registration (epoll) this disarms EPOLLIN so pending
     // upstream data can't drive the pipeline past the pause; on submission-based
-    // backends (io_uring) simply not re-arming the recv is enough, so this is a
-    // no-op there. submit_recv_upstream re-arms on resume.
-    // [[nodiscard]]: on io_uring this pause is an async cancel SQE that can fail to
+    // backends (io_uring) not re-arming a completed single-shot recv is enough;
+    // an already-armed recv is cancelled. submit_recv_upstream re-arms on resume.
+    // [[nodiscard]]: on io_uring that cancel SQE can fail to
     // queue under SQ pressure (returns false) — every caller MUST fail closed (or
     // explicitly (void) it where best-effort teardown is acceptable), or a failed
-    // pause lets the multishot recv keep discarding upstream bytes (truncation) and
+    // pause leaves an outstanding recv able to cross the requested backpressure boundary and
     // the defer-until-cancel-drains path can stall. The attribute turns any future
     // caller that ignores the result into a compile error. (epoll's pause can't
     // fail and returns true, so fail-closed checks are no-ops there.)

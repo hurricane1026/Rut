@@ -1,0 +1,34 @@
+upstream origin at "127.0.0.1:19890"
+
+route GET "/proxy" {
+    let resp = forward(origin, buffered: true)
+    resp.status = 202
+    resp.set("X-Rut-Proxy", "validated")
+    return resp
+}
+
+route GET "/stream" {
+    return forward(origin)
+}
+
+route GET "/stream-oversized" {
+    return forward(origin, set_path: "/oversized")
+}
+
+route GET "/rewrite" {
+    return forward(origin, set_path: "/rewritten", set_header: { "X-Inject": "yes" })
+}
+
+route POST "/post" {
+    return forward(origin, buffered: true)
+}
+
+route GET "/oversized" {
+    return forward(origin, buffered: true)
+}
+
+upstream unavailable at "127.0.0.1:19891"
+
+route GET "/unavailable" {
+    return forward(unavailable)
+}
