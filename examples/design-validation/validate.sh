@@ -403,6 +403,9 @@ start_rut "$ROOT/examples/design-validation/transport.rut" "$port" \
     --tls-sni api.example.test "$sni_cert" "$key" --h2
 request_url "https://127.0.0.1:$port/transport" 200 \
     '{"path":"/transport","http11":true}' --insecure --http1.1
+request_url "https://localhost:$port/transport" 200 \
+    '{"path":"/transport","http11":true}' --cacert "$cert" --http1.1 \
+    --resolve "localhost:$port:127.0.0.1"
 request_url "https://127.0.0.1:$port/transport" 200 \
     '{"path":"/transport","http11":true}' --insecure --http2
 assert_http_version "https://127.0.0.1:$port/transport" 2 --insecure --http2
