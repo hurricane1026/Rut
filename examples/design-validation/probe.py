@@ -59,6 +59,7 @@ def concurrency(port, count):
         statuses = list(pool.map(one, range(count)))
     elapsed = time.monotonic() - started
     require(statuses == [204] * count, f"concurrent response statuses: {statuses}")
+    require(elapsed >= 0.08, f"concurrent timer requests completed too quickly: {elapsed:.3f}s")
     serialized_seconds = count * 0.1
     require(
         elapsed < serialized_seconds * 0.5,
@@ -92,6 +93,30 @@ def pipeline(port):
         all(block.startswith(b"HTTP/1.1 204 No Content\r\n") for block in header_blocks[:2]),
         f"incomplete pipelined response: {response.decode('latin1')}",
     )
+
+
+def no_content_length(port):
+    request = b"POST /upload HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n"
+    with socket.create_connection(("127.0.0.1", port), timeout=3) as conn:
+        conn.sendall(request)
+        response = bytearray()
+        while b"\r\n\r\n" not in response:
+            chunk = conn.recv(4096)
+            if not chunk:
+                raise RuntimeError("connection closed before the response headers completed")
+            response.extend(chunk)
+        header, body = bytes(response).split(b"\r\n\r\n", 1)
+        lines = header.split(b"\r\n")
+        require(lines[0].startswith(b"HTTP/1.1 411 "), header.decode("latin1"))
+        content_lengths = [
+            value.strip()
+            for name, separator, value in (line.partition(b":") for line in lines[1:])
+            if separator and name.strip().lower() == b"content-length"
+        ]
+        require(content_lengths == [b"7"], f"invalid Content-Length response: {header!r}")
+        if len(body) < 7:
+            body += recv_exact(conn, 7 - len(body))
+        require(body == b"Unknown", f"unexpected no-Content-Length response body: {body!r}")
 
 
 def wait_port(port, pid, timeout):
@@ -174,7 +199,15 @@ def websocket(port):
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument(
-        "probe", choices=("keepalive", "pipeline", "concurrency", "websocket", "wait-port")
+        "probe",
+        choices=(
+            "keepalive",
+            "pipeline",
+            "concurrency",
+            "no-content-length",
+            "websocket",
+            "wait-port",
+        ),
     )
     parser.add_argument("--port", type=int, required=True)
     parser.add_argument("--count", type=int, default=32)
@@ -187,6 +220,8 @@ def main():
         pipeline(args.port)
     elif args.probe == "concurrency":
         concurrency(args.port, args.count)
+    elif args.probe == "no-content-length":
+        no_content_length(args.port)
     elif args.probe == "wait-port":
         require(args.pid is not None, "wait-port requires --pid")
         wait_port(args.port, args.pid, args.timeout)

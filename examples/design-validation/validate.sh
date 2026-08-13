@@ -198,6 +198,29 @@ PY
     fi
 }
 
+assert_header_values() {
+    local name=$1
+    shift
+    if ! python3 - "$TMP/headers" "$name" "$@" <<'PY'
+import sys
+
+with open(sys.argv[1], encoding="latin1") as header_file:
+    lines = header_file.read().splitlines()
+name = sys.argv[2].lower()
+actual = []
+for line in lines:
+    field, separator, value = line.partition(":")
+    if separator and field.strip().lower() == name:
+        actual.append(value.strip())
+expected = sys.argv[3:]
+if actual != expected:
+    raise SystemExit(f"header {sys.argv[2]!r} values were {actual!r}, expected {expected!r}")
+PY
+    then
+        fail "$name response header values were incorrect"
+    fi
+}
+
 assert_http_version() {
     local url=$1
     local expected=$2
@@ -315,8 +338,7 @@ request "$port" "/regex/123" 404 'Not Found'
 request "$port" "/optional" 200 '{"value":"present"}' -H 'X-Value: present'
 request "$port" "/optional" 404 'Not Found'
 request "$port" "/response" 202 '{"status":202,"observed":"/response"}'
-grep -Fqi 'X-Path: /response' "$TMP/headers" || fail "response set header missing"
-grep -Fqi 'X-Path: tail' "$TMP/headers" || fail "response add header missing"
+assert_header_values X-Path /response tail
 grep -Fqi 'X-Observed: /response' "$TMP/headers" || fail "response header read missing"
 if grep -Fqi 'X-Discard:' "$TMP/headers"; then fail "response remove header failed"; fi
 stop_rut
@@ -337,6 +359,8 @@ request "$port" "/upload" 201 \
     -X POST --data-binary 'payload' -H 'X-Token: secret' -H 'Cookie: sid=ok'
 request "$port" "/upload" 401 'Unauthorized' \
     -X POST --data-binary 'payload' -H 'X-Token: wrong' -H 'Cookie: sid=ok'
+python3 "$ROOT/examples/design-validation/probe.py" no-content-length --port "$port" ||
+    fail "request without Content-Length did not return 411"
 request "$port" "/headers" 200 \
     '{"values":["one","two"],"host":"127.0.0.1"}' \
     -H 'Host: 127.0.0.1' -H 'X-Value: one' -H 'X-Value: two'
@@ -347,6 +371,7 @@ printf 'PASS request.rut\n'
 
 port=$((BASE_PORT + 4))
 start_rut "$ROOT/examples/design-validation/middleware.rut" "$port"
+request "$port" "/chain" 505 'Unknown' --http1.0
 request "$port" "/chain" 201 '{"stage":"after","ok":true}'
 grep -Fqi 'X-Rut-Stage: after-wait' "$TMP/headers" || fail "chain response header missing"
 stop_rut
