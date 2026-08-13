@@ -615,6 +615,7 @@ public:
             free_tls_in_buf(c);
             free_tls_out_buf(c);
             c.reset();
+            c.id = cid;
             slot_is_free[cid] = true;
             free_stack[free_top++] = cid;
             return;
@@ -630,6 +631,7 @@ public:
         u8* tout = c.tls_out_slice;
         u32 ops = c.pending_ops;
         c.reset();
+        c.id = cid;
         conns[cid].recv_slice = rs;
         conns[cid].send_slice = ss;
         conns[cid].upstream_recv_slice = us;

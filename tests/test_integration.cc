@@ -5763,6 +5763,7 @@ TEST(uring, duplicate_deferred_free_is_idempotent) {
     conn->pending_ops = 1;
 
     loop->free_conn(*conn);
+    CHECK_EQ(loop->conns[cid].id, cid);
     CHECK_EQ(loop->pending_free_count, 1u);
     loop->free_conn(loop->conns[cid]);
     CHECK_EQ(loop->pending_free_count, 1u);
@@ -5772,6 +5773,28 @@ TEST(uring, duplicate_deferred_free_is_idempotent) {
     loop->reclaim_pending();
     loop->reclaim_slot(cid);
     CHECK_EQ(loop->pending_free_count, 0u);
+    CHECK_EQ(loop->free_top, free_before + 1);
+    loop->shutdown();
+}
+
+// reset() clears Connection::id, but a released Connection object still represents its
+// original pool slot. A repeated teardown must consult that slot's free marker rather than
+// accidentally inspecting (and potentially releasing) slot zero.
+TEST(uring, duplicate_immediate_free_preserves_slot_identity) {
+    auto loop = std::make_unique<IoUringEventLoop>();
+    if (!loop->init(0, -1)) {
+        CHECK(true);
+        return;
+    }
+    Connection* conn = loop->alloc_conn();
+    REQUIRE(conn != nullptr);
+    const u32 cid = conn->id;
+    const u32 free_before = loop->free_top;
+
+    loop->free_conn(*conn);
+    CHECK_EQ(conn->id, cid);
+    CHECK_EQ(loop->free_top, free_before + 1);
+    loop->free_conn(*conn);
     CHECK_EQ(loop->free_top, free_before + 1);
     loop->shutdown();
 }
