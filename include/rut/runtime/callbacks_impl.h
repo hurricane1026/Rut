@@ -3102,6 +3102,11 @@ void on_upstream_connected(void* lp, Connection& conn, IoEvent ev) {
                                          /*success=*/false,
                                          monotonic_us());
         if (try_connect_next_backend(loop, conn)) return;
+        // No upstream attempt remains once the retry budget is exhausted. Release
+        // the concurrency slot before publishing the 502 to the client: waiting for
+        // the downstream Send completion leaves a window where a sequential request
+        // observes the finished attempt as still in flight and is incorrectly shed.
+        release_upstream_slot(loop, conn);
         format_static_response(
             conn, 502, false, conn.req_method == static_cast<u8>(LogHttpMethod::Head));
         conn.keep_alive = false;
@@ -3311,7 +3316,7 @@ void on_upstream_request_sent(void* lp, Connection& conn, IoEvent ev) {
         if (conn.upstream_recv_armed) {
             prepare_early_response_state(conn);
             conn.set_slots(nullptr, nullptr, &on_upstream_response<Loop>, nullptr);
-            loop->submit_recv_upstream(conn);
+            if (!loop->submit_recv_upstream(conn)) loop->close_conn(conn);
             return;
         }
         if (conn.upstream_tls) {
@@ -3360,8 +3365,7 @@ void on_upstream_request_sent(void* lp, Connection& conn, IoEvent ev) {
         conn.recv_buf.reset();
         conn.set_slots(
             &on_request_body_recvd<Loop>, nullptr, &on_early_upstream_recvd<Loop>, nullptr);
-        loop->submit_recv(conn);
-        loop->submit_recv_upstream(conn);
+        if (!loop->submit_recv(conn) || !loop->submit_recv_upstream(conn)) loop->close_conn(conn);
         return;
     }
 
@@ -3415,7 +3419,7 @@ void on_upstream_request_sent(void* lp, Connection& conn, IoEvent ev) {
                          0};
         on_upstream_response<Loop>(lp, conn, synth);
     } else {
-        loop->submit_recv_upstream(conn);
+        if (!loop->submit_recv_upstream(conn)) loop->close_conn(conn);
     }
 }
 
@@ -4221,7 +4225,7 @@ void on_response_header_sent(void* lp, Connection& conn, IoEvent ev) {
         IoEvent synth = {conn.id, static_cast<i32>(kRemaining), 0, 0, IoEventType::UpstreamRecv, 0};
         on_response_body_recvd<Loop>(lp, conn, synth);
     } else {
-        loop->submit_recv_upstream(conn);
+        if (!loop->submit_recv_upstream(conn)) loop->close_conn(conn);
     }
 }
 
@@ -4566,7 +4570,7 @@ void on_response_body_sent(void* lp, Connection& conn, IoEvent ev) {
         IoEvent synth = {conn.id, static_cast<i32>(kRemaining), 0, 0, IoEventType::UpstreamRecv, 0};
         on_response_body_recvd<Loop>(lp, conn, synth);
     } else {
-        loop->submit_recv_upstream(conn);
+        if (!loop->submit_recv_upstream(conn)) loop->close_conn(conn);
     }
 }
 
@@ -4596,7 +4600,7 @@ void handle_early_upstream_recv(Loop* loop, Connection& conn, IoEvent ev, bool s
         resp_parser.parse(conn.upstream_recv_buf.data(), conn.upstream_recv_buf.len(), &resp);
     const bool kCanRearm = !conn.upstream_recv_armed && !send_in_flight;
     if (kParseStatus == ParseStatus::Incomplete) {
-        if (kCanRearm) loop->submit_recv_upstream(conn);
+        if (kCanRearm && !loop->submit_recv_upstream(conn)) loop->close_conn(conn);
         return;
     }
     if (kParseStatus == ParseStatus::Complete && resp.status_code >= 100 &&
@@ -4614,7 +4618,7 @@ void handle_early_upstream_recv(Loop* loop, Connection& conn, IoEvent ev, bool s
             return;
         }
         conn.upstream_recv_buf.reset();
-        if (kCanRearm) loop->submit_recv_upstream(conn);
+        if (kCanRearm && !loop->submit_recv_upstream(conn)) loop->close_conn(conn);
         return;
     }
     conn.on_upstream_send = &on_body_send_with_early_response<Loop>;
@@ -4672,7 +4676,7 @@ void on_request_body_sent(void* lp, Connection& conn, IoEvent ev) {
         if (conn.upstream_recv_armed) {
             prepare_early_response_state(conn);
             conn.set_slots(nullptr, nullptr, &on_upstream_response<Loop>, nullptr);
-            loop->submit_recv_upstream(conn);
+            if (!loop->submit_recv_upstream(conn)) loop->close_conn(conn);
             return;
         }
         if (conn.upstream_tls) {
@@ -4726,15 +4730,14 @@ void on_request_body_sent(void* lp, Connection& conn, IoEvent ev) {
                              0};
             on_upstream_response<Loop>(lp, conn, synth);
         } else {
-            loop->submit_recv_upstream(conn);
+            if (!loop->submit_recv_upstream(conn)) loop->close_conn(conn);
         }
         return;
     }
 
     conn.recv_buf.reset();
     conn.set_slots(&on_request_body_recvd<Loop>, nullptr, &on_early_upstream_recvd<Loop>, nullptr);
-    loop->submit_recv(conn);
-    loop->submit_recv_upstream(conn);
+    if (!loop->submit_recv(conn) || !loop->submit_recv_upstream(conn)) loop->close_conn(conn);
 }
 
 template <typename Loop>
@@ -5935,10 +5938,10 @@ void on_upstream_response(void* lp, Connection& conn, IoEvent ev) {
     if (ps == ParseStatus::Incomplete) {
         if (ev.result <= 0)
             ps = ParseStatus::Error;
-        else {
-            loop->submit_recv_upstream(conn);
+        else if (loop->submit_recv_upstream(conn)) {
             return;
-        }
+        } else
+            ps = ParseStatus::Error;
     }
     if (ps == ParseStatus::Error) {
         if (conn.upstream_fd >= 0) {
@@ -6047,7 +6050,7 @@ void on_upstream_response(void* lp, Connection& conn, IoEvent ev) {
             return;
         }
         conn.upstream_recv_buf.reset();
-        loop->submit_recv_upstream(conn);
+        if (!loop->submit_recv_upstream(conn)) loop->close_conn(conn);
         return;
     }
 

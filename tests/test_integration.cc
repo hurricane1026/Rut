@@ -2566,6 +2566,7 @@ TEST(upstream_concurrency_e2e, slot_released_on_upstream_failure) {
         return rc;
     };
     CHECK_EQ(one_shot(), 502);  // connect refused
+    CHECK_EQ(cc.inflight[id.value()].load(std::memory_order_relaxed), 0u);
     CHECK_EQ(one_shot(), 502);  // slot was released → not stuck at 503
 
     lt.stop();
