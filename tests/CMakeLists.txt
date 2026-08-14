@@ -23,6 +23,27 @@ set_tests_properties(test_network PROPERTIES LABELS "unit;network")
 find_package(Threads REQUIRED)
 find_package(Python3 REQUIRED COMPONENTS Interpreter)
 
+add_test(
+    NAME test_design_validation_contract
+    COMMAND ${Python3_EXECUTABLE}
+            ${PROJECT_SOURCE_DIR}/examples/design-validation/audit.py
+            --manifest ${PROJECT_SOURCE_DIR}/examples/design-validation/capabilities.json
+            --root ${PROJECT_SOURCE_DIR}
+)
+set_tests_properties(
+    test_design_validation_contract
+    PROPERTIES LABELS "unit;conformance"
+)
+add_test(
+    NAME test_design_validation_contract_self_test
+    COMMAND ${Python3_EXECUTABLE}
+            ${PROJECT_SOURCE_DIR}/examples/design-validation/test_audit.py
+)
+set_tests_properties(
+    test_design_validation_contract_self_test
+    PROPERTIES LABELS "unit;conformance"
+)
+
 set(RUT_TLS_TESTDATA_DIR ${CMAKE_CURRENT_BINARY_DIR}/testdata)
 set(RUT_TLS_TEST_CERT ${RUT_TLS_TESTDATA_DIR}/localhost_cert.pem)
 set(RUT_TLS_TEST_KEY ${RUT_TLS_TESTDATA_DIR}/localhost_key.pem)
@@ -405,6 +426,22 @@ if(RUT_ENABLE_JIT)
             ENVIRONMENT
                 "RUT_VALIDATION_WEBSOCKET=${_RUT_VALIDATION_WEBSOCKET};RUT_VALIDATION_PROCESS_TESTS=0"
             LABELS "integration;process;jit;network;conformance"
+            RUN_SERIAL TRUE
+            TIMEOUT 120
+    )
+
+    add_test(
+        NAME test_design_validation_sensitivity
+        COMMAND ${Python3_EXECUTABLE}
+                ${PROJECT_SOURCE_DIR}/examples/design-validation/sensitivity.py
+                --rut $<TARGET_FILE:rut>
+                --root ${PROJECT_SOURCE_DIR}
+                --websocket ${_RUT_VALIDATION_WEBSOCKET}
+    )
+    set_tests_properties(
+        test_design_validation_sensitivity
+        PROPERTIES
+            LABELS "integration;process;jit;network;conformance;mutation"
             RUN_SERIAL TRUE
             TIMEOUT 120
     )
