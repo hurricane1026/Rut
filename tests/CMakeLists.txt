@@ -43,6 +43,15 @@ set_tests_properties(
     test_design_validation_contract_self_test
     PROPERTIES LABELS "unit;conformance"
 )
+add_test(
+    NAME test_design_validation_sensitivity_self_test
+    COMMAND ${Python3_EXECUTABLE}
+            ${PROJECT_SOURCE_DIR}/examples/design-validation/test_sensitivity.py
+)
+set_tests_properties(
+    test_design_validation_sensitivity_self_test
+    PROPERTIES LABELS "unit;conformance;mutation"
+)
 
 set(RUT_TLS_TESTDATA_DIR ${CMAKE_CURRENT_BINARY_DIR}/testdata)
 set(RUT_TLS_TEST_CERT ${RUT_TLS_TESTDATA_DIR}/localhost_cert.pem)

@@ -51,6 +51,8 @@ def stop_process(process):
 
 
 def require_ports_available(ports):
+    if len(ports) != len(set(ports)):
+        raise RuntimeError("sensitivity port configuration overlaps")
     sockets = []
     try:
         for port in ports:
@@ -356,7 +358,7 @@ def main():
                 "status: 204",
                 lambda port: probe.active_health(port, health_state),
                 executed,
-                expected_error="active health never returned",
+                expected_error=probe.ACTIVE_HEALTH_RECOVERY_FAILURE,
             )
 
         if args.websocket == "1":
