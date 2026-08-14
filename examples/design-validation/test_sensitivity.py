@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 import importlib.util
+import sys
 import unittest
 from pathlib import Path
 
@@ -19,6 +20,12 @@ SENSITIVITY = load_module("rut_design_sensitivity_test", ROOT / "sensitivity.py"
 
 
 class SensitivityHarnessTest(unittest.TestCase):
+    def test_child_processes_reuse_current_interpreter(self):
+        self.assertEqual(
+            SENSITIVITY.python_command(Path("fixture.py"), "--port", 19890),
+            [sys.executable, "fixture.py", "--port", "19890"],
+        )
+
     def test_rejects_overlapping_ports_before_binding(self):
         with self.assertRaisesRegex(RuntimeError, "port configuration overlaps"):
             SENSITIVITY.require_ports_available([19890, 19890])

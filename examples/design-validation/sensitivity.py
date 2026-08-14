@@ -6,6 +6,7 @@ import importlib.util
 import os
 import socket
 import subprocess
+import sys
 import tempfile
 import time
 from pathlib import Path
@@ -20,6 +21,10 @@ def load_probe(path):
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     return module
+
+
+def python_command(script, *args):
+    return [sys.executable, str(script), *map(str, args)]
 
 
 def wait_for_port(process, port, log_path, label):
@@ -313,12 +318,11 @@ def main():
         )
 
         origin_log = temp_root / "origin.log"
-        origin_command = [
-            "python3",
-            str(source_root / "origin.py"),
+        origin_command = python_command(
+            source_root / "origin.py",
             "--port",
             "19890",
-        ]
+        )
         with fixture_process(origin_command, 19890, origin_log, "HTTP origin"):
             run_simple_mutant(
                 binary,
@@ -337,14 +341,13 @@ def main():
         health_state = temp_root / "health-state"
         health_state.write_text("down\n")
         health_log = temp_root / "health-origin.log"
-        health_command = [
-            "python3",
-            str(source_root / "origin.py"),
+        health_command = python_command(
+            source_root / "origin.py",
             "--port",
             "19894",
             "--health-file",
             str(health_state),
-        ]
+        )
         with fixture_process(health_command, 19894, health_log, "health origin"):
             run_simple_mutant(
                 binary,
@@ -363,12 +366,11 @@ def main():
 
         if args.websocket == "1":
             websocket_log = temp_root / "websocket-origin.log"
-            websocket_command = [
-                "python3",
-                str(source_root / "origin.py"),
+            websocket_command = python_command(
+                source_root / "origin.py",
                 "--port",
                 "19892",
-            ]
+            )
             with fixture_process(
                 websocket_command,
                 19892,
@@ -392,16 +394,15 @@ def main():
 
         executed_path = temp_root / "executed-sentinels"
         executed_path.write_text("".join(f"{sentinel}\n" for sentinel in executed))
-        audit_command = [
-            "python3",
-            str(source_root / "audit.py"),
+        audit_command = python_command(
+            source_root / "audit.py",
             "--manifest",
             str(source_root / "capabilities.json"),
             "--root",
             str(root),
             "--executed-sentinels",
             str(executed_path),
-        ]
+        )
         if args.websocket == "0":
             audit_command.extend(("--disable", "websocket"))
         subprocess.run(audit_command, check=True)
