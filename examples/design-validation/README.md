@@ -44,6 +44,30 @@ CTest registers this as `test_design_validation`, labeled `conformance`. The
 CTest form skips process probes already registered separately and disables the
 WebSocket fixture when Rut is configured with `RUT_ENABLE_WEBSOCKET=OFF`.
 
+`capabilities.json` is the machine-checked deployment contract. Every row in
+the current implementation boundary in `docs/core-capabilities.md` must own at
+least one named capability, every capability must cite an executable scenario,
+and every `.rut` fixture must belong to a scenario. `validate.sh` records the
+scenarios it actually completes and fails if a required scenario was skipped.
+This makes adding a capability to the deployment contract without black-box
+evidence a CI failure.
+
+CTest also registers `test_design_validation_sensitivity`. It creates
+compilable variants of the canonical programs with one behavior deliberately
+damaged at a time, then requires the corresponding black-box oracle to reject
+each variant. The sentinels cover direct responses, response mutation, typed
+JSON, middleware after-effects, state writes, global cross-shard policy,
+request rewriting, health recovery, and WebSocket terminate filtering. A
+sentinel that unexpectedly passes is reported as a surviving mutation.
+
+Run the contract and sensitivity checks directly with:
+
+```bash
+python3 examples/design-validation/audit.py \
+    --manifest examples/design-validation/capabilities.json --root .
+python3 examples/design-validation/sensitivity.py --rut ./build/src/rut
+```
+
 ## Scope Boundary
 
 Passing means the maintained public implementation boundary works end to end;

@@ -13,6 +13,7 @@ HEALTH_ORIGIN_PORT=19894
 VALIDATE_WEBSOCKET=${RUT_VALIDATION_WEBSOCKET:-1}
 VALIDATE_AUTO_BACKEND=${RUT_VALIDATION_AUTO_BACKEND:-1}
 TMP=$(mktemp -d)
+EXECUTED_SCENARIOS="$TMP/executed-scenarios"
 RUT_PID=
 ORIGIN_PID=
 WS_ORIGIN_PID=
@@ -60,6 +61,13 @@ fail() {
         sed -n '1,160p' "$TMP/rut.log" >&2
     fi
     exit 1
+}
+
+pass_case() {
+    local id=$1
+    shift
+    printf '%s\n' "$id" >>"$EXECUTED_SCENARIOS"
+    printf 'PASS %s\n' "$*"
 }
 
 stop_rut() {
@@ -282,6 +290,10 @@ command -v cmp >/dev/null || fail "cmp is required"
 command -v python3 >/dev/null || fail "python3 is required"
 command -v openssl >/dev/null || fail "openssl is required"
 command -v timeout >/dev/null || fail "timeout is required"
+: >"$EXECUTED_SCENARIOS"
+python3 "$ROOT/examples/design-validation/audit.py" \
+    --manifest "$ROOT/examples/design-validation/capabilities.json" \
+    --root "$ROOT" || fail "capability contract audit failed"
 
 ports=(
     "$ORIGIN_PORT"
@@ -334,7 +346,7 @@ python3 "$ROOT/examples/design-validation/probe.py" concurrency --port "$port" -
     fail "concurrency probe failed"
 stop_rut
 grep -Fq 'GET /health 204' "$TMP/access.log" || fail "access log did not record /health"
-printf 'PASS routing.rut\n'
+pass_case routing.http1 routing.rut
 
 port=$((BASE_PORT + 13))
 start_rut "$ROOT/examples/design-validation/routing.rut" "$port" --shards 2
@@ -342,7 +354,7 @@ grep -Fq 'with 2 shard(s)' "$TMP/rut.log" || fail "Rut did not start with two sh
 python3 "$ROOT/examples/design-validation/probe.py" concurrency --port "$port" --count 64 ||
     fail "multi-shard concurrency probe failed"
 stop_rut
-printf 'PASS routing.rut multi-shard\n'
+pass_case routing.multishard 'routing.rut multi-shard'
 
 if [[ "$VALIDATE_AUTO_BACKEND" != 0 ]]; then
     start_rut_backend "$ROOT/examples/design-validation/routing.rut" "$port" auto
@@ -352,7 +364,7 @@ if [[ "$VALIDATE_AUTO_BACKEND" != 0 ]]; then
     python3 "$ROOT/examples/design-validation/probe.py" timer-wait --port "$port" ||
         fail "timer wait probe failed on the auto-selected backend"
     stop_rut
-    printf 'PASS routing.rut auto backend\n'
+    pass_case routing.auto-backend 'routing.rut auto backend'
 fi
 
 port=$((BASE_PORT + 1))
@@ -368,7 +380,7 @@ assert_header_values X-Path /response tail
 assert_header_values X-Observed /response
 if grep -Fqi 'X-Discard:' "$TMP/headers"; then fail "response remove header failed"; fi
 stop_rut
-printf 'PASS core.rut\n'
+pass_case language.core core.rut
 
 port=$((BASE_PORT + 2))
 start_rut "$ROOT/examples/design-validation/data.rut" "$port"
@@ -376,7 +388,7 @@ request "$port" "/data?tag=core&tag=jit" 200 \
     '{"path":"/data?tag=core&tag=jit","answer":42,"tags":["core","jit"],"meta":{"ok":true}}'
 request "$port" "/error" 503 '{"ok":false}'
 stop_rut
-printf 'PASS data.rut\n'
+pass_case language.data data.rut
 
 port=$((BASE_PORT + 3))
 start_rut "$ROOT/examples/design-validation/request.rut" "$port"
@@ -393,7 +405,7 @@ request "$port" "/headers" 200 \
 request "$port" "/version" 204 ""
 request "$port" "/version" 505 'Unknown' --http1.0
 stop_rut
-printf 'PASS request.rut\n'
+pass_case request.views request.rut
 
 port=$((BASE_PORT + 4))
 start_rut "$ROOT/examples/design-validation/middleware.rut" "$port"
@@ -401,7 +413,7 @@ request "$port" "/chain" 505 'Unknown' --http1.0
 request "$port" "/chain" 201 '{"stage":"after","ok":true}'
 grep -Fqi 'X-Rut-Stage: after-wait' "$TMP/headers" || fail "chain response header missing"
 stop_rut
-printf 'PASS middleware.rut\n'
+pass_case middleware.chain middleware.rut
 
 port=$((BASE_PORT + 5))
 start_rut "$ROOT/examples/design-validation/state.rut" "$port"
@@ -409,7 +421,7 @@ request "$port" "/limited" 200 'OK'
 request "$port" "/limited" 200 'OK'
 request "$port" "/limited" 429 'Too Many Requests'
 stop_rut
-printf 'PASS state.rut\n'
+pass_case state.cache state.rut
 
 port=$((BASE_PORT + 16))
 start_rut "$ROOT/examples/design-validation/policy.rut" "$port" --shards 2 \
@@ -418,20 +430,20 @@ python3 "$ROOT/examples/design-validation/probe.py" global-rate-limit \
     --port "$port" --count 64 --access-log "$TMP/policy-access.log" ||
     fail "global keyed rate-limit probe failed"
 stop_rut
-printf 'PASS policy.rut global rate limit\n'
+pass_case policy.global-rate-limit 'policy.rut global rate limit'
 
 port=$((BASE_PORT + 6))
 start_rut "$ROOT/examples/design-validation/modules/main.rut" "$port"
 request "$port" "/imported" 202 '{"imported":true}'
 stop_rut
-printf 'PASS modules/main.rut\n'
+pass_case modules.import modules/main.rut
 
 port=$((BASE_PORT + 15))
 start_rut "$ROOT/examples/design-validation/operations.rut" "$port"
 request_json_field "$port" "/stats" 200 scope shard
 request_json_field "$port" "/runtime-metrics" 200 scope process
 stop_rut
-printf 'PASS operations.rut snapshots\n'
+pass_case operations.snapshots 'operations.rut snapshots'
 
 port=$((BASE_PORT + 7))
 start_rut "$ROOT/examples/design-validation/limits.rut" "$port"
@@ -441,7 +453,7 @@ request "$port" "/json" 500 'Internal Server Error' -H "X-Large: $large"
 request "$port" "/body" 500 'Internal Server Error' -H "X-Large: $large"
 request "$port" "/status?item=one" 500 'Internal Server Error'
 stop_rut
-printf 'PASS limits.rut\n'
+pass_case limits.fail-closed limits.rut
 
 port=$((BASE_PORT + 8))
 start_rut "$ROOT/examples/design-validation/transport.rut" "$port" --metrics
@@ -452,7 +464,7 @@ request_contains "$port" "/metrics" 200 'rut_requests_total'
 grep -Eq '^rut_requests_total [0-9]+$' "$TMP/body" ||
     fail "/metrics did not contain a numeric rut_requests_total sample"
 stop_rut
-printf 'PASS transport.rut h2c/metrics\n'
+pass_case transport.h2c-metrics 'transport.rut h2c/metrics'
 
 port=$((BASE_PORT + 9))
 cert="$ROOT/tests/fixtures/localhost_cert.pem"
@@ -481,7 +493,7 @@ openssl verify -CAfile "$sni_cert" -verify_hostname api.example.test \
     "$TMP/sni-peer.pem" >/dev/null ||
     fail "SNI peer certificate does not match api.example.test"
 stop_rut
-printf 'PASS transport.rut TLS/ALPN/SNI\n'
+pass_case transport.tls-alpn-sni 'transport.rut TLS/ALPN/SNI'
 
 port=$((BASE_PORT + 12))
 start_rut "$ROOT/examples/design-validation/transport.rut" "$port" \
@@ -504,7 +516,7 @@ request_url "https://127.0.0.1:$port/transport" 200 \
     '{"path":"/transport","http11":true}' --insecure --http1.1 \
     --cert "$cert" --key "$key"
 stop_rut
-printf 'PASS transport.rut mTLS\n'
+pass_case transport.mtls 'transport.rut mTLS'
 
 python3 "$ROOT/examples/design-validation/origin.py" --port "$ORIGIN_PORT" \
     >"$TMP/origin.log" 2>&1 &
@@ -524,7 +536,7 @@ python3 "$ROOT/examples/design-validation/probe.py" active-health \
 stop_rut
 terminate_process "$HEALTH_ORIGIN_PID"
 HEALTH_ORIGIN_PID=
-printf 'PASS health.rut active ejection/recovery\n'
+pass_case upstream.active-health 'health.rut active ejection/recovery'
 
 port=$((BASE_PORT + 10))
 start_rut "$ROOT/examples/design-validation/proxy.rut" "$port"
@@ -544,7 +556,7 @@ request_url "http://127.0.0.1:$port/post" 200 '/post|payload' \
 request "$port" "/oversized" 502 'Bad Gateway'
 request "$port" "/unavailable" 502 'Bad Gateway'
 stop_rut
-printf 'PASS proxy.rut\n'
+pass_case proxy.http proxy.rut
 
 python3 "$ROOT/examples/design-validation/origin.py" --port "$TLS_ORIGIN_PORT" \
     --cert "$cert" --key "$key" --client-ca "$cert" >"$TMP/tls-origin.log" 2>&1 &
@@ -556,7 +568,7 @@ start_rut "$ROOT/examples/design-validation/proxy-tls.rut" "$port" \
 request "$port" "/mismatched-proxy" 502 'Bad Gateway'
 request "$port" "/secure-proxy" 200 'origin-ok'
 stop_rut
-printf 'PASS proxy-tls.rut verified TLS/mTLS origin\n'
+pass_case proxy.tls 'proxy-tls.rut verified TLS/mTLS origin'
 
 if [[ "$VALIDATE_WEBSOCKET" != 0 ]]; then
     python3 "$ROOT/examples/design-validation/origin.py" --port "$WS_ORIGIN_PORT" \
@@ -567,32 +579,49 @@ if [[ "$VALIDATE_WEBSOCKET" != 0 ]]; then
     start_rut "$ROOT/examples/design-validation/websocket.rut" "$port"
     python3 "$ROOT/examples/design-validation/probe.py" websocket --port "$port" ||
         fail "WebSocket upgrade probe failed"
+    pass_case websocket.passthrough 'websocket.rut passthrough'
     python3 "$ROOT/examples/design-validation/probe.py" websocket-filter --port "$port" ||
         fail "WebSocket terminate filter probe failed"
+    pass_case websocket.terminate 'websocket.rut terminate filter'
     stop_rut
-    printf 'PASS websocket.rut\n'
 fi
 
 expect_load_failure "$ROOT/examples/design-validation/invalid/duplicate-json-key.rut" \
     'json object field names must be unique'
+pass_case invalid.duplicate-json-key 'duplicate JSON key rejection'
 expect_load_failure "$ROOT/examples/design-validation/invalid/hash-target-surface.rut" \
     'only Cache<IP, i64>(capacity: N) is supported'
+pass_case invalid.hash-target-surface 'pending Hash rejection'
 expect_load_failure "$ROOT/examples/design-validation/invalid/invalid-regex.rut" 'invalid regex'
+pass_case invalid.regex 'invalid regex rejection'
 expect_load_failure "$ROOT/examples/design-validation/invalid/unsafe-forward-header.rut" \
     'Content-Length'
+pass_case invalid.forward-header 'unsafe forward header rejection'
 expect_load_failure "$ROOT/examples/design-validation/invalid/unresolved-upstream.rut" \
     'register routes failed'
-printf 'PASS expected compile/load failures\n'
+pass_case invalid.unresolved-upstream 'unresolved upstream rejection'
 
 python3 "$ROOT/examples/design-validation/reload_probe.py" --rut "$BIN" ||
     fail "route-triggered reload failed"
-printf 'PASS route-triggered reload\n'
+pass_case reload.route 'route-triggered reload'
 
 if [[ ${RUT_VALIDATION_PROCESS_TESTS:-1} != 0 ]]; then
     python3 "$ROOT/tests/test_process_reload.py" --rut "$BIN" || fail "process reload failed"
+    pass_case reload.process 'process reload'
     python3 "$ROOT/tests/test_backend_selection.py" --rut "$BIN" ||
         fail "backend selection failed"
-    printf 'PASS reload/backend process behavior\n'
+    pass_case backend.selection 'backend selection'
 fi
+
+audit_args=(
+    --manifest "$ROOT/examples/design-validation/capabilities.json"
+    --root "$ROOT"
+    --executed-scenarios "$EXECUTED_SCENARIOS"
+)
+if [[ "$VALIDATE_WEBSOCKET" == 0 ]]; then audit_args+=(--disable websocket); fi
+if [[ "$VALIDATE_AUTO_BACKEND" == 0 ]]; then audit_args+=(--disable auto-backend); fi
+if [[ ${RUT_VALIDATION_PROCESS_TESTS:-1} == 0 ]]; then audit_args+=(--disable process); fi
+python3 "$ROOT/examples/design-validation/audit.py" "${audit_args[@]}" ||
+    fail "executed capability scenario audit failed"
 
 printf 'All Rut design validation programs compiled and served successfully.\n'

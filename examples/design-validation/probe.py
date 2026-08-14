@@ -9,6 +9,10 @@ import time
 from pathlib import Path
 
 
+ACTIVE_HEALTH_EJECTION_FAILURE = "active health did not eject unhealthy origin"
+ACTIVE_HEALTH_RECOVERY_FAILURE = "active health did not recover healthy origin"
+
+
 def require(condition, message):
     if not condition:
         raise RuntimeError(message)
@@ -299,6 +303,18 @@ def global_rate_limit(port, count, access_log):
     require(response.status == 204, f"independent rate-limit key returned {response.status}")
 
 
+def _wait_for_active_health(result, expected, failure, timeout=5):
+    deadline = time.monotonic() + timeout
+    observed = []
+    while time.monotonic() < deadline:
+        current = result()
+        observed.append(current)
+        if current == expected:
+            return
+        time.sleep(0.1)
+    raise RuntimeError(f"{failure}; expected {expected}, observed {observed}")
+
+
 def active_health(port, state_file):
     def result():
         conn = http.client.HTTPConnection("127.0.0.1", port, timeout=3)
@@ -308,20 +324,17 @@ def active_health(port, state_file):
         conn.close()
         return response.status, body
 
-    def wait_for(expected):
-        deadline = time.monotonic() + 5
-        observed = []
-        while time.monotonic() < deadline:
-            current = result()
-            observed.append(current)
-            if current == expected:
-                return
-            time.sleep(0.1)
-        raise RuntimeError(f"active health never returned {expected}; observed {observed}")
-
-    wait_for((503, b"Service Unavailable"))
+    _wait_for_active_health(
+        result,
+        (503, b"Service Unavailable"),
+        ACTIVE_HEALTH_EJECTION_FAILURE,
+    )
     Path(state_file).write_text("up\n")
-    wait_for((200, b"origin-ok"))
+    _wait_for_active_health(
+        result,
+        (200, b"origin-ok"),
+        ACTIVE_HEALTH_RECOVERY_FAILURE,
+    )
 
 
 def main():
