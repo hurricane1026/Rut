@@ -30,6 +30,17 @@ class SensitivityHarnessTest(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "port configuration overlaps"):
             SENSITIVITY.require_ports_available([19890, 19890])
 
+    def test_disabled_websocket_excludes_its_mutant_port(self):
+        ports = SENSITIVITY.sensitivity_ports(19882, websocket_enabled=False)
+        self.assertEqual(len(ports), len(set(ports)))
+        self.assertNotIn(19890, ports[:8])
+
+        websocket_ports = SENSITIVITY.sensitivity_ports(
+            19882,
+            websocket_enabled=True,
+        )
+        self.assertNotEqual(len(websocket_ports), len(set(websocket_ports)))
+
     def test_active_health_phase_failures_are_distinct(self):
         failures = (
             PROBE.ACTIVE_HEALTH_EJECTION_FAILURE,

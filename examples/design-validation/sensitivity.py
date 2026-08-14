@@ -70,6 +70,15 @@ def require_ports_available(ports):
             listener.close()
 
 
+def sensitivity_ports(base_port, websocket_enabled):
+    mutant_count = 9 if websocket_enabled else 8
+    ports = [base_port + index for index in range(mutant_count)]
+    ports.extend((19890, 19894))
+    if websocket_enabled:
+        ports.append(19892)
+    return ports
+
+
 @contextlib.contextmanager
 def fixture_process(command, port, log_path, label):
     with log_path.open("wb") as log:
@@ -199,11 +208,9 @@ def main():
         raise SystemExit(f"Rut binary is not executable: {binary}")
     probe = load_probe(source_root / "probe.py")
     executed = []
-    ports = [args.base_port + index for index in range(9)]
-    ports.extend((19890, 19894))
-    if args.websocket == "1":
-        ports.append(19892)
-    require_ports_available(ports)
+    require_ports_available(
+        sensitivity_ports(args.base_port, args.websocket == "1")
+    )
 
     with tempfile.TemporaryDirectory(prefix="rut-design-sensitivity-") as temp_name:
         temp_root = Path(temp_name)
