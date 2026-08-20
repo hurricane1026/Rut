@@ -116,34 +116,80 @@ FrontendResult<RutSource> lower_to_rut(const Server& server) {
     if (!put("listen :") || !writer.put_u16(server.listen.port) || !put("\n") ||
         !put("upstream nginx_upstream at \"") ||
         !writer.put_ipv4(server.location.proxy_pass.address) || !put(":") ||
-        !writer.put_u16(proxy.port) || !put("\"\n") ||
-        (is_root ? !put("route \"/\" {\n") : !put("route \"/api\" {\n")) ||
-        (is_root ? !put("    return forward(nginx_upstream, request_policy: {\n")
-                : !put("    return forward(nginx_upstream, target_transform: {\n"
-                       "        strip_prefix: \"/api/\",\n"
-                       "        replace_prefix: \"/\"\n"
-                       "    }, request_policy: {\n")) ||
-        !put("        version: \"HTTP/1.1\",\n") ||
-        !put("        host: \"upstream\",\n") ||
-        !put("        connection: \"omit\",\n") ||
-        !put("        strip_headers: [\"Connection\", \"Keep-Alive\", \"TE\", \"Expect\", \"Upgrade\"]\n") ||
-        !put("    }, response_policy: {\n") ||
-        !put("        version: \"HTTP/1.1\",\n") ||
-        !put("        framing: \"content_length\",\n") ||
-        !put("        connection: \"request\",\n") ||
-        !put("        server: \"nginx/1.29.7\",\n") ||
-        !put("        date: \"current\",\n") ||
-        !put("        hide_headers: [\"Date\", \"Server\", \"X-Pad\"]\n") ||
-        !put("    }, failure_policy: {\n") ||
-        !put("        version: \"HTTP/1.1\",\n") ||
-        !put("        status: 502,\n") ||
-        !put("        reason: \"Bad Gateway\",\n") ||
-        !put("        content_type: \"text/html\",\n") ||
-        !put("        server: \"nginx/1.29.7\",\n") ||
-        !put("        date: \"current\",\n") ||
-        !put("        connection: \"request\",\n") ||
-        !put("        body: b\"<html>\\r\\n<head><title>502 Bad Gateway</title></head>\\r\\n<body>\\r\\n<center><h1>502 Bad Gateway</h1></center>\\r\\n<hr><center>nginx/1.29.7</center>\\r\\n</body>\\r\\n</html>\\r\\n\"\n") ||
-        !put("    })\n") || !put("}\n"))
+        !writer.put_u16(proxy.port) || !put("\"\n"))
+        return fail_overflow();
+
+    if (is_root) {
+        if (!put("route \"/\" {\n") ||
+            !put("    return forward(nginx_upstream, request_policy: {\n") ||
+            !put("        version: \"HTTP/1.1\",\n") ||
+            !put("        host: \"upstream\",\n") ||
+            !put("        connection: \"omit\",\n") ||
+            !put("        strip_headers: [\"Connection\", \"Keep-Alive\", \"TE\", \"Expect\", \"Upgrade\"]\n") ||
+            !put("    }, response_policy: {\n") ||
+            !put("        version: \"HTTP/1.1\",\n") ||
+            !put("        framing: \"content_length\",\n") ||
+            !put("        connection: \"request\",\n") ||
+            !put("        server: \"nginx/1.29.7\",\n") ||
+            !put("        date: \"current\",\n") ||
+            !put("        hide_headers: [\"Date\", \"Server\", \"X-Pad\"]\n") ||
+            !put("    }, failure_policy: {\n") ||
+            !put("        version: \"HTTP/1.1\",\n") ||
+            !put("        status: 502,\n") ||
+            !put("        reason: \"Bad Gateway\",\n") ||
+            !put("        content_type: \"text/html\",\n") ||
+            !put("        server: \"nginx/1.29.7\",\n") ||
+            !put("        date: \"current\",\n") ||
+            !put("        connection: \"request\",\n") ||
+            !put("        body: b\"<html>\\r\\n<head><title>502 Bad Gateway</title></head>\\r\\n<body>\\r\\n<center><h1>502 Bad Gateway</h1></center>\\r\\n<hr><center>nginx/1.29.7</center>\\r\\n</body>\\r\\n</html>\\r\\n\"\n") ||
+            !put("    })\n") || !put("}\n"))
+            return fail_overflow();
+        return output;
+    }
+
+    static constexpr char kRedirectBody[] =
+        "<html>\\r\\n"
+        "<head><title>301 Moved Permanently</title></head>\\r\\n"
+        "<body>\\r\\n"
+        "<center><h1>301 Moved Permanently</h1></center>\\r\\n"
+        "<hr><center>nginx/1.29.7</center>\\r\\n"
+        "</body>\\r\\n"
+        "</html>\\r\\n";
+    if (!put("route \"/api\" {\n") ||
+        !put("    if req.method == GET && req.pathOnly == \"/api\" {\n") ||
+        !put("        return redirect({scheme: \"http\", authority: \"request_host\", port: \"actual_listener\",\n") ||
+        !put("            path: \"static\", query: \"preserve_raw\", date: \"current\", connection: \"close\",\n") ||
+        !put("            status: 301, reason: \"Moved Permanently\", server: \"nginx/1.29.7\",\n") ||
+        !put("            content_type: \"text/html\", target_path: \"/api/\", body: b\"") ||
+        !writer.put_lit(kRedirectBody, static_cast<u32>(__builtin_strlen(kRedirectBody))) ||
+        !put("\"})\n") ||
+        !put("    } else {\n") ||
+        !put("        return forward(nginx_upstream, target_transform: {\n") ||
+        !put("            strip_prefix: \"/api/\",\n") ||
+        !put("            replace_prefix: \"/\"\n") ||
+        !put("        }, request_policy: {\n") ||
+        !put("            version: \"HTTP/1.1\",\n") ||
+        !put("            host: \"upstream\",\n") ||
+        !put("            connection: \"omit\",\n") ||
+        !put("            strip_headers: [\"Connection\", \"Keep-Alive\", \"TE\", \"Expect\", \"Upgrade\"]\n") ||
+        !put("        }, response_policy: {\n") ||
+        !put("            version: \"HTTP/1.1\",\n") ||
+        !put("            framing: \"content_length\",\n") ||
+        !put("            connection: \"request\",\n") ||
+        !put("            server: \"nginx/1.29.7\",\n") ||
+        !put("            date: \"current\",\n") ||
+        !put("            hide_headers: [\"Date\", \"Server\", \"X-Pad\"]\n") ||
+        !put("        }, failure_policy: {\n") ||
+        !put("            version: \"HTTP/1.1\",\n") ||
+        !put("            status: 502,\n") ||
+        !put("            reason: \"Bad Gateway\",\n") ||
+        !put("            content_type: \"text/html\",\n") ||
+        !put("            server: \"nginx/1.29.7\",\n") ||
+        !put("            date: \"current\",\n") ||
+        !put("            connection: \"request\",\n") ||
+        !put("            body: b\"<html>\\r\\n<head><title>502 Bad Gateway</title></head>\\r\\n<body>\\r\\n<center><h1>502 Bad Gateway</h1></center>\\r\\n<hr><center>nginx/1.29.7</center>\\r\\n</body>\\r\\n</html>\\r\\n\"\n") ||
+        !put("        })\n") ||
+        !put("    }\n") || !put("}\n"))
         return fail_overflow();
     return output;
 }

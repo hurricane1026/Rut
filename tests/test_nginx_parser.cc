@@ -410,31 +410,44 @@ TEST(nginx_converter, lowers_api_model_to_stable_target_transform_source) {
         "listen :8080\n"
         "upstream nginx_upstream at \"127.0.0.1:9000\"\n"
         "route \"/api\" {\n"
-        "    return forward(nginx_upstream, target_transform: {\n"
-        "        strip_prefix: \"/api/\",\n"
-        "        replace_prefix: \"/\"\n"
-        "    }, request_policy: {\n"
-        "        version: \"HTTP/1.1\",\n"
-        "        host: \"upstream\",\n"
-        "        connection: \"omit\",\n"
-        "        strip_headers: [\"Connection\", \"Keep-Alive\", \"TE\", \"Expect\", \"Upgrade\"]\n"
-        "    }, response_policy: {\n"
-        "        version: \"HTTP/1.1\",\n"
-        "        framing: \"content_length\",\n"
-        "        connection: \"request\",\n"
-        "        server: \"nginx/1.29.7\",\n"
-        "        date: \"current\",\n"
-        "        hide_headers: [\"Date\", \"Server\", \"X-Pad\"]\n"
-        "    }, failure_policy: {\n"
-        "        version: \"HTTP/1.1\",\n"
-        "        status: 502,\n"
-        "        reason: \"Bad Gateway\",\n"
-        "        content_type: \"text/html\",\n"
-        "        server: \"nginx/1.29.7\",\n"
-        "        date: \"current\",\n"
-        "        connection: \"request\",\n"
-        "        body: b\"<html>\\r\\n<head><title>502 Bad Gateway</title></head>\\r\\n<body>\\r\\n<center><h1>502 Bad Gateway</h1></center>\\r\\n<hr><center>nginx/1.29.7</center>\\r\\n</body>\\r\\n</html>\\r\\n\"\n"
-        "    })\n"
+        "    if req.method == GET && req.pathOnly == \"/api\" {\n"
+        "        return redirect({scheme: \"http\", authority: \"request_host\", port: \"actual_listener\",\n"
+        "            path: \"static\", query: \"preserve_raw\", date: \"current\", connection: \"close\",\n"
+        "            status: 301, reason: \"Moved Permanently\", server: \"nginx/1.29.7\",\n"
+        "            content_type: \"text/html\", target_path: \"/api/\", body: b\"<html>\\r\\n"
+        "<head><title>301 Moved Permanently</title></head>\\r\\n"
+        "<body>\\r\\n"
+        "<center><h1>301 Moved Permanently</h1></center>\\r\\n"
+        "<hr><center>nginx/1.29.7</center>\\r\\n"
+        "</body>\\r\\n"
+        "</html>\\r\\n\"})\n"
+        "    } else {\n"
+        "        return forward(nginx_upstream, target_transform: {\n"
+        "            strip_prefix: \"/api/\",\n"
+        "            replace_prefix: \"/\"\n"
+        "        }, request_policy: {\n"
+        "            version: \"HTTP/1.1\",\n"
+        "            host: \"upstream\",\n"
+        "            connection: \"omit\",\n"
+        "            strip_headers: [\"Connection\", \"Keep-Alive\", \"TE\", \"Expect\", \"Upgrade\"]\n"
+        "        }, response_policy: {\n"
+        "            version: \"HTTP/1.1\",\n"
+        "            framing: \"content_length\",\n"
+        "            connection: \"request\",\n"
+        "            server: \"nginx/1.29.7\",\n"
+        "            date: \"current\",\n"
+        "            hide_headers: [\"Date\", \"Server\", \"X-Pad\"]\n"
+        "        }, failure_policy: {\n"
+        "            version: \"HTTP/1.1\",\n"
+        "            status: 502,\n"
+        "            reason: \"Bad Gateway\",\n"
+        "            content_type: \"text/html\",\n"
+        "            server: \"nginx/1.29.7\",\n"
+        "            date: \"current\",\n"
+        "            connection: \"request\",\n"
+        "            body: b\"<html>\\r\\n<head><title>502 Bad Gateway</title></head>\\r\\n<body>\\r\\n<center><h1>502 Bad Gateway</h1></center>\\r\\n<hr><center>nginx/1.29.7</center>\\r\\n</body>\\r\\n</html>\\r\\n\"\n"
+        "        })\n"
+        "    }\n"
         "}\n";
     CHECK_EQ(result.value().len, static_cast<u32>(sizeof(kExpected) - 1));
     CHECK_GT(result.value().len, 1024u);
@@ -590,23 +603,41 @@ TEST(nginx_converter, emitted_api_source_reaches_rir_with_target_transform) {
     REQUIRE(hir);
     std::unique_ptr<HirModule> hir_owned(hir.value());
     REQUIRE_EQ(hir_owned->routes.len, 1u);
-    const auto& hir_term = hir_owned->routes[0].control.direct_term;
-    REQUIRE(hir_term.has_forward_target_transform);
-    CHECK(hir_term.forward_target_transform.strip_prefix.eq(lit_str("/api/")));
-    CHECK(hir_term.forward_target_transform.replace_prefix.eq(lit_str("/")));
-    CHECK_EQ(hir_term.forward_request_policy_id, 1u);
-    CHECK_EQ(hir_term.forward_response_policy_id, 1u);
-    CHECK_EQ(hir_term.forward_failure_policy_id, 1u);
+    CHECK_EQ(hir_owned->routes[0].control.kind, HirControlKind::If);
+    const auto& hir_redirect = hir_owned->routes[0].control.then_term;
+    const auto& hir_forward = hir_owned->routes[0].control.else_term;
+    CHECK(hir_redirect.kind == HirTerminatorKind::Redirect);
+    CHECK_EQ(hir_redirect.redirect_policy_id, 1u);
+    REQUIRE(hir_forward.kind == HirTerminatorKind::ForwardUpstream);
+    REQUIRE(hir_forward.has_forward_target_transform);
+    CHECK(hir_forward.forward_target_transform.strip_prefix.eq(lit_str("/api/")));
+    CHECK(hir_forward.forward_target_transform.replace_prefix.eq(lit_str("/")));
+    CHECK_EQ(hir_forward.forward_request_policy_id, 1u);
+    CHECK_EQ(hir_forward.forward_response_policy_id, 1u);
+    CHECK_EQ(hir_forward.forward_failure_policy_id, 1u);
 
     auto mir = build_mir(*hir_owned);
     REQUIRE(mir);
     std::unique_ptr<MirModule> mir_owned(mir.value());
     CHECK(mir_owned->functions[0].path.eq(lit_str("/api")));
-    const auto& mir_term = mir_owned->functions[0].blocks[0].term;
-    CHECK(mir_term.has_forward_target_transform);
-    CHECK_EQ(mir_term.forward_request_policy_id, 1u);
-    CHECK_EQ(mir_term.forward_response_policy_id, 1u);
-    CHECK_EQ(mir_term.forward_failure_policy_id, 1u);
+    bool mir_redirect = false;
+    bool mir_forward = false;
+    for (u32 bi = 0; bi < mir_owned->functions[0].blocks.len; bi++) {
+        const auto& term = mir_owned->functions[0].blocks[bi].term;
+        if (term.kind == MirTerminatorKind::Redirect) {
+            mir_redirect = true;
+            CHECK_EQ(term.redirect_policy_id, 1u);
+        }
+        if (term.kind == MirTerminatorKind::ForwardUpstream) {
+            mir_forward = true;
+            CHECK(term.has_forward_target_transform);
+            CHECK_EQ(term.forward_request_policy_id, 1u);
+            CHECK_EQ(term.forward_response_policy_id, 1u);
+            CHECK_EQ(term.forward_failure_policy_id, 1u);
+        }
+    }
+    CHECK(mir_redirect);
+    CHECK(mir_forward);
 
     FrontendRirModule rir{};
     RirGuard rir_guard{rir};
@@ -616,29 +647,71 @@ TEST(nginx_converter, emitted_api_source_reaches_rir_with_target_transform) {
     REQUIRE_EQ(rir.module.target_transform_count, 1u);
     CHECK(rir.module.target_transforms[0].strip_prefix.eq(lit_str("/api/")));
     CHECK(rir.module.target_transforms[0].replace_prefix.eq(lit_str("/")));
+    REQUIRE_EQ(rir.module.redirect_policy_count, 1u);
+    const auto& redirect = rir.module.redirect_policies[0];
+    CHECK(redirect.scheme == RedirectPolicyScheme::Http);
+    CHECK(redirect.authority == RedirectPolicyAuthority::RequestHost);
+    CHECK(redirect.port == RedirectPolicyPort::ActualListener);
+    CHECK(redirect.path == RedirectPolicyPath::Static);
+    CHECK(redirect.query == RedirectPolicyQuery::PreserveRaw);
+    CHECK(redirect.date == RedirectPolicyDate::Current);
+    CHECK(redirect.connection == RedirectPolicyConnection::Close);
+    CHECK_EQ(redirect.status_code, 301u);
+    CHECK(redirect.reason.eq(lit_str("Moved Permanently")));
+    CHECK(redirect.server.eq(lit_str("nginx/1.29.7")));
+    CHECK(redirect.content_type.eq(lit_str("text/html")));
+    CHECK(redirect.target_path.eq(lit_str("/api/")));
+    static constexpr char kRedirectBody[] =
+        "<html>\r\n"
+        "<head><title>301 Moved Permanently</title></head>\r\n"
+        "<body>\r\n"
+        "<center><h1>301 Moved Permanently</h1></center>\r\n"
+        "<hr><center>nginx/1.29.7</center>\r\n"
+        "</body>\r\n"
+        "</html>\r\n";
+    CHECK(redirect.body.eq({kRedirectBody, sizeof(kRedirectBody) - 1}));
     REQUIRE_EQ(rir.module.response_policy_count, 1u);
     REQUIRE_EQ(rir.module.failure_policy_count, 1u);
     REQUIRE_EQ(rir.module.policy_bundle_count, 1u);
     CHECK_EQ(rir.module.policy_bundles[0].response_policy_id, 1u);
     CHECK_EQ(rir.module.policy_bundles[0].failure_policy_id, 1u);
 
-    const auto& block = rir.module.functions[0].blocks[0];
-    REQUIRE_EQ(block.inst_count, 6u);
-    CHECK_EQ(block.insts[0].op, rir::Opcode::ConstI32);
-    CHECK_EQ(block.insts[0].imm.i32_val, 0);
-    CHECK_EQ(block.insts[1].op, rir::Opcode::ConstI32);
-    CHECK_EQ(block.insts[1].imm.i32_val, 1);
-    CHECK_EQ(block.insts[2].op, rir::Opcode::ConstI32);
-    CHECK_EQ(block.insts[2].imm.i32_val, 1);
-    CHECK_EQ(block.insts[3].op, rir::Opcode::ConstI32);
-    CHECK_EQ(block.insts[3].imm.i32_val, 1);
-    CHECK_EQ(block.insts[4].op, rir::Opcode::ReqSetTargetTransform);
-    CHECK_EQ(block.insts[4].imm.i32_val, 1);
-    CHECK_EQ(block.insts[5].op, rir::Opcode::RetForwardBundle);
-    CHECK_EQ(block.insts[5].operand_count, 3u);
-    CHECK_EQ(block.insts[5].operands[0].id, block.insts[0].result.id);
-    CHECK_EQ(block.insts[5].operands[1].id, block.insts[1].result.id);
-    CHECK_EQ(block.insts[5].operands[2].id, block.insts[3].result.id);
+    const auto& function = rir.module.functions[0];
+    CHECK(function.route_pattern.eq(lit_str("/api")));
+    CHECK_EQ(function.http_method, 0u);
+    bool saw_branch = false;
+    bool saw_redirect = false;
+    bool saw_forward = false;
+    for (u32 bi = 0; bi < function.block_count; bi++) {
+        const auto& block = function.blocks[bi];
+        for (u32 ii = 0; ii < block.inst_count; ii++) {
+            const auto& instruction = block.insts[ii];
+            if (instruction.op == rir::Opcode::Br) saw_branch = true;
+            if (instruction.op == rir::Opcode::RetRedirect) {
+                saw_redirect = true;
+                CHECK_EQ(instruction.operand_count, 0u);
+                CHECK_EQ(instruction.imm.i32_val, 1);
+            }
+            if (instruction.op != rir::Opcode::RetForwardBundle) continue;
+            saw_forward = true;
+            REQUIRE_EQ(instruction.operand_count, 3u);
+            i32 upstream_id = -1;
+            i32 request_policy_id = -1;
+            i32 bundle_id = -1;
+            REQUIRE(find_const_i32(function, instruction.operand(0), upstream_id));
+            REQUIRE(find_const_i32(function, instruction.operand(1), request_policy_id));
+            REQUIRE(find_const_i32(function, instruction.operand(2), bundle_id));
+            CHECK_EQ(upstream_id, 0);
+            CHECK_EQ(request_policy_id, 1);
+            CHECK_EQ(bundle_id, 1);
+            REQUIRE(ii > 0);
+            CHECK_EQ(block.insts[ii - 1].op, rir::Opcode::ReqSetTargetTransform);
+            CHECK_EQ(block.insts[ii - 1].imm.i32_val, 1);
+        }
+    }
+    CHECK(saw_branch);
+    CHECK(saw_redirect);
+    CHECK(saw_forward);
 }
 
 TEST(nginx_converter, rejects_forged_invalid_models_without_output) {
