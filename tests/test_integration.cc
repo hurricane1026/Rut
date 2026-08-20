@@ -9181,7 +9181,7 @@ struct H2TargetTransformJit {
         return {text, len};
     }
 
-    bool init(bool with_timer) {
+    bool init(bool with_timer, bool with_request_policy = false) {
         if (!rir.init(2, 1)) return false;
         rir::Builder b;
         b.init(&rir.module);
@@ -9195,12 +9195,18 @@ struct H2TargetTransformJit {
         auto entry_result = b.create_block(fn, literal("entry"));
         if (!entry_result) return false;
         const auto entry = entry_result.value();
+        auto emit_forward = [&](rir::ValueId upstream) -> rir::VoidResult {
+            if (!with_request_policy) return b.emit_ret_forward(upstream);
+            auto policy = b.emit_const_i32(1);
+            if (!policy) return rir::err(rir::RirError::InvalidState);
+            return b.emit_ret_forward(upstream, policy.value());
+        };
 
         if (!with_timer) {
             b.set_insert_point(fn, entry);
             if (!b.emit_req_set_target_transform(1)) return false;
             auto upstream = b.emit_const_i32(0);
-            if (!upstream || !b.emit_ret_forward(upstream.value())) return false;
+            if (!upstream || !emit_forward(upstream.value())) return false;
         } else {
             auto resume_result = b.create_block(fn, literal("resume"));
             if (!resume_result) return false;
@@ -9216,7 +9222,7 @@ struct H2TargetTransformJit {
             b.set_insert_point(fn, resume);
             if (!b.emit_req_set_target_transform(1)) return false;
             auto upstream = b.emit_const_i32(0);
-            if (!upstream || !b.emit_ret_forward(upstream.value())) return false;
+            if (!upstream || !emit_forward(upstream.value())) return false;
         }
 
         auto cg = jit::codegen(rir.module);
@@ -9254,6 +9260,7 @@ struct H2TargetTransformShardGuard {
         if (listen_fd >= 0) close(listen_fd);
     }
 };
+
 #endif
 
 // End-to-end: a JIT handler returning Forward must kick off the same
@@ -16544,6 +16551,94 @@ TEST(shard, serves_http2_jit_target_transform_after_timer_resume_fails_closed) {
         if (h2_status_for_stream(second_response, second_response_len, 3) != 0) break;
     }
     CHECK_EQ(h2_status_for_stream(second_response, second_response_len, 3), 200u);
+}
+TEST(route, target_transform_jit_rebuilds_request_policy_h1_wire) {
+    H2TargetTransformJit compiled;
+    REQUIRE(compiled.init(/*with_timer=*/false, /*with_request_policy=*/true));
+
+    RecordingUpstream backend;
+    REQUIRE(backend.setup());
+    RouteConfig cfg{};
+    char strip[] = "/api/";
+    char replace[] = "/";
+    REQUIRE_EQ(cfg.add_target_transform({{strip, 5}, {replace, 1}}), 1u);
+    auto upstream = cfg.add_upstream("backend", 0x7F000001, backend.port);
+    REQUIRE(upstream.has_value());
+    REQUIRE_EQ(upstream.value(), 0u);
+    REQUIRE(cfg.add_jit_handler("/api", 'G', compiled.handler_fn));
+    const RouteConfig* active = &cfg;
+
+    ScopedProxyLoop proxy;
+    REQUIRE(proxy.setup(&active, 1000));
+    struct ClientFdGuard {
+        i32 fd;
+        ~ClientFdGuard() {
+            if (fd >= 0) close(fd);
+        }
+    };
+
+    struct Vector {
+        const char* target;
+        const char* expected_target;
+    } vectors[] = {{"/api/", "/"}, {"/api/x", "/x"}, {"/api/x?y=1", "/x?y=1"}};
+    for (u32 i = 0; i < 3; i++) {
+        char request[512];
+        const int request_len = snprintf(request,
+                                         sizeof(request),
+                                         "GET %s HTTP/1.1\r\n"
+                                         "Host: client.example\r\n"
+                                         "X-Test: one\r\n\r\n",
+                                         vectors[i].target);
+        REQUIRE_GT(request_len, 0);
+        REQUIRE_LT(request_len, static_cast<int>(sizeof(request)));
+        ClientFdGuard client{connect_to(proxy.port)};
+        REQUIRE_GE(client.fd, 0);
+        set_socket_timeouts(client.fd, 2);
+        char response[1024];
+        REQUIRE(send_all(client.fd, request, static_cast<u32>(request_len)));
+        const i32 response_len = recv_timeout(client.fd, response, sizeof(response), 2000);
+        CHECK_GT(response_len, 0);
+        if (response_len > 0)
+            CHECK(buf_contains(response, static_cast<u32>(response_len), "HTTP/1.1 200", 12));
+
+        const u32 expected_count = i + 1;
+        for (u32 waited = 0;
+             waited < 400 && backend.request_count.load(std::memory_order_acquire) < expected_count;
+             waited++)
+            usleep(5000);
+        REQUIRE_EQ(backend.accepted_count.load(std::memory_order_acquire), expected_count);
+        REQUIRE_EQ(backend.request_count.load(std::memory_order_acquire), expected_count);
+
+        char expected[512];
+        const int expected_len = snprintf(expected,
+                                          sizeof(expected),
+                                          "GET %s HTTP/1.1\r\n"
+                                          "Host: 127.0.0.1:%u\r\n"
+                                          "X-Test: one\r\n\r\n",
+                                          vectors[i].expected_target,
+                                          backend.port);
+        REQUIRE_GT(expected_len, 0);
+        REQUIRE_LT(expected_len, static_cast<int>(sizeof(expected)));
+        CHECK_EQ(backend.request_history_len[i], static_cast<u32>(expected_len));
+        CHECK_EQ(memcmp(backend.request_history[i], expected, static_cast<size_t>(expected_len)), 0);
+    }
+
+    const u32 accepted_before = backend.accepted_count.load(std::memory_order_acquire);
+    const u32 requests_before = backend.request_count.load(std::memory_order_acquire);
+    static constexpr char kInvalid[] =
+        "GET /api/%7Euser HTTP/1.1\r\nHost: client.example\r\nX-Test: one\r\n\r\n";
+    ClientFdGuard client{connect_to(proxy.port)};
+    REQUIRE_GE(client.fd, 0);
+    set_socket_timeouts(client.fd, 2);
+    REQUIRE(send_all(client.fd, kInvalid, sizeof(kInvalid) - 1));
+    char response[1024];
+    const i32 response_len = recv_timeout(client.fd, response, sizeof(response), 2000);
+    CHECK_GT(response_len, 0);
+    if (response_len > 0)
+        CHECK(buf_contains(response, static_cast<u32>(response_len), "HTTP/1.1 400", 12));
+    usleep(100000);
+    CHECK_EQ(backend.accepted_count.load(std::memory_order_acquire), accepted_before);
+    CHECK_EQ(backend.request_count.load(std::memory_order_acquire), requests_before);
 }
 #endif
 
