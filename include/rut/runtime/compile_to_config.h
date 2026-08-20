@@ -184,7 +184,8 @@ inline bool populate_route_config(RouteConfig& cfg, const rir::Module& mod) {
     // would break the compile-time body_idx / headers_idx invariants.
     if (cfg.route_count != 0 || cfg.response_body_count != 0 ||
         cfg.response_header_set_count != 0 || cfg.response_policy_count != 0 ||
-        cfg.failure_policy_count != 0 || cfg.policy_bundle_count != 0) {
+        cfg.failure_policy_count != 0 || cfg.policy_bundle_count != 0 ||
+        cfg.target_transform_count != 0 || cfg.target_transform_bytes_used != 0) {
         return false;
     }
 
@@ -209,7 +210,8 @@ inline bool populate_route_config(RouteConfig& cfg, const rir::Module& mod) {
         if (!response_policy_spec_valid(mod.response_policies[i])) return false;
     }
     if (mod.failure_policy_count > kMaxForwardFailurePolicies ||
-        mod.policy_bundle_count > RouteConfig::kMaxForwardPolicyBundles)
+        mod.policy_bundle_count > RouteConfig::kMaxForwardPolicyBundles ||
+        mod.target_transform_count > kMaxForwardTargetTransforms)
         return false;
     for (u32 i = 0; i < mod.failure_policy_count; i++) {
         if (!forward_failure_policy_spec_valid(mod.failure_policies[i])) return false;
@@ -227,6 +229,9 @@ inline bool populate_route_config(RouteConfig& cfg, const rir::Module& mod) {
                   mod.response_policies[bundle.response_policy_id - 1]))))
             return false;
     }
+    if (!forward_target_transform_table_valid(mod.target_transforms,
+                                              mod.target_transform_count))
+        return false;
     for (u32 i = 0; i < mod.header_set_count; i++) {
         const auto& ref = mod.header_sets[i];
         if (static_cast<u32>(ref.offset) + ref.count > mod.header_pool_used) return false;
@@ -371,6 +376,10 @@ inline bool populate_route_config(RouteConfig& cfg, const rir::Module& mod) {
     for (u32 i = 0; i < mod.policy_bundle_count; i++) {
         const auto& bundle = mod.policy_bundles[i];
         u16 idx = cfg.add_policy_bundle(bundle.response_policy_id, bundle.failure_policy_id);
+        if (idx == 0 || idx != i + 1) return false;
+    }
+    for (u32 i = 0; i < mod.target_transform_count; i++) {
+        u16 idx = cfg.add_target_transform(mod.target_transforms[i]);
         if (idx == 0 || idx != i + 1) return false;
     }
 

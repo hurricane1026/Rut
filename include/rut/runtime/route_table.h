@@ -4,6 +4,7 @@
 #include "rut/common/http_header_validation.h"
 #include "rut/common/response_policy.h"
 #include "rut/common/failure_policy.h"
+#include "rut/common/forward_target_transform.h"
 #include "rut/common/types.h"
 #include "rut/jit/art_jit_codegen.h"  // ArtJitMatchFn typedef (LLVM-free)
 #include "rut/jit/handler_abi.h"
@@ -490,6 +491,10 @@ struct RouteConfig {
     u32 failure_policy_bytes_used = 0;
     ForwardPolicyBundle policy_bundles[kMaxForwardPolicyBundles]{};
     u32 policy_bundle_count = 0;
+    ForwardTargetTransformSpec target_transforms[kMaxForwardTargetTransforms]{};
+    u32 target_transform_count = 0;
+    char target_transform_bytes[kForwardTargetTransformBytes];
+    u32 target_transform_bytes_used = 0;
 
     // Populate the active dispatch's state with a newly-written
     // routes[route_count] entry. Returns false on:
@@ -957,6 +962,40 @@ struct RouteConfig {
         const auto& b = policy_bundles[id - 1];
         return (b.response_policy_id == 0 || response_policy_id_is_valid(b.response_policy_id)) &&
                failure_policy_id_is_valid(b.failure_policy_id);
+    }
+
+    // Register foundation-only target-transform metadata. Strings are copied
+    // into RouteConfig-owned storage; no compiler/RIR pointer escapes here.
+    u16 add_target_transform(const ForwardTargetTransformSpec& spec) {
+        if (!forward_target_transform_spec_valid(spec)) return 0;
+        if (target_transform_count > kMaxForwardTargetTransforms ||
+            target_transform_bytes_used > kForwardTargetTransformBytes)
+            return 0;
+        for (u32 i = 0; i < target_transform_count; i++) {
+            if (forward_target_transform_spec_equal(target_transforms[i], spec))
+                return static_cast<u16>(i + 1);
+        }
+        if (target_transform_count >= kMaxForwardTargetTransforms) return 0;
+        if (spec.strip_prefix.len > kForwardTargetTransformBytes - target_transform_bytes_used)
+            return 0;
+        const u32 after_strip = target_transform_bytes_used + spec.strip_prefix.len;
+        if (spec.replace_prefix.len > kForwardTargetTransformBytes - after_strip) return 0;
+        auto copy = [&](Str src, Str& dst) {
+            char* out = target_transform_bytes + target_transform_bytes_used;
+            for (u32 i = 0; i < src.len; i++) out[i] = src.ptr[i];
+            target_transform_bytes_used += src.len;
+            dst = {out, src.len};
+        };
+        auto& dst = target_transforms[target_transform_count];
+        copy(spec.strip_prefix, dst.strip_prefix);
+        copy(spec.replace_prefix, dst.replace_prefix);
+        target_transform_count++;
+        return static_cast<u16>(target_transform_count);
+    }
+
+    bool target_transform_id_is_valid(u16 id) const {
+        return forward_target_transform_id_is_valid(id, target_transform_count) &&
+               forward_target_transform_spec_valid(target_transforms[id - 1]);
     }
 
     // Add an upstream target. Returns its index, or error if at capacity.

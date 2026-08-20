@@ -4,6 +4,7 @@
 #include "rut/common/rate_limit_key_spec.h"
 #include "rut/common/response_policy.h"
 #include "rut/common/failure_policy.h"
+#include "rut/common/forward_target_transform.h"
 #include "rut/common/types.h"
 #include "rut/runtime/arena.h"
 
@@ -476,6 +477,12 @@ struct Module {
     u32 failure_policy_count = 0;
     ForwardPolicyBundle policy_bundles[kMaxForwardFailurePolicies]{};
     u32 policy_bundle_count = 0;
+
+    // Foundation-only target transforms. Strings are copied into the RIR arena
+    // and copied again into RouteConfig during activation; no runtime materializer
+    // consumes them in this increment.
+    ForwardTargetTransformSpec target_transforms[kMaxForwardTargetTransforms]{};
+    u32 target_transform_count = 0;
 
     // Upstream declarations carried verbatim from the DSL so a
     // compile→config helper can translate them into

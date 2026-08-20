@@ -20,6 +20,16 @@ target_compile_definitions(test_network PRIVATE RUT_TESTING=1)
 add_test(NAME test_network COMMAND test_network)
 set_tests_properties(test_network PROPERTIES LABELS "unit;network")
 
+add_executable(test_target_transform test_target_transform.cc)
+target_link_libraries(test_target_transform rut_runtime)
+target_include_directories(test_target_transform PRIVATE
+    ${PROJECT_SOURCE_DIR}/include
+    ${PROJECT_SOURCE_DIR}/testing
+    ${CMAKE_CURRENT_SOURCE_DIR}
+)
+add_test(NAME test_target_transform COMMAND test_target_transform)
+set_tests_properties(test_target_transform PROPERTIES LABELS "unit")
+
 find_package(Threads REQUIRED)
 find_package(Python3 REQUIRED COMPONENTS Interpreter)
 
