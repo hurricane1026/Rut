@@ -23,7 +23,7 @@ Allowed states are `SUPPORTED`, `PARTIAL`, `BLOCKED_BY_RUT`,
 | exact, `^~`, regex, or nested locations | no | no | no nginx selection semantics | no | NOT_PLANNED |
 | exact `/api/` + proxy URI `/`, clean bounded H1 request domain | yes | yes | yes: bounded prefix replacement; #259 closed | pinned converter-generated `/api/`, `/api/x`, and query differentials; four out-of-domain targets fail before upstream | SUPPORTED |
 | broader `proxy_pass` URI replacement and nginx URI normalization | partial | no | partial: clean raw-target transform only | nginx baselines only for repeated slash/dot/percent forms | PARTIAL |
-| automatic slash redirect for proxied prefix location (`/api` → `/api/`) | implicit in accepted location/proxy model | yes for exact `/api/` + proxy URI `/` model | yes for bounded GET/cleartext-H1/close source/runtime slice; #261 closed | separate pinned nginx full-wire baseline and public-RUT production evidence; converter-generated differential pending | PARTIAL |
+| automatic slash redirect for exact accepted `/api/` + proxy URI `/`, bounded GET/cleartext-H1/close domain (`/api` → `/api/`) | implicit in accepted location/proxy model | yes | yes for declared bounds; #261 closed | pinned converter-generated two-vector full-wire/EOF differential with zero upstream activity; #260 closed | SUPPORTED |
 | multiple servers / `server_name` / `default_server` | no | no | no virtual-server selection | no | NOT_PLANNED |
 | variables, rewrite, or internal redirects | no | no | insufficient nginx phase semantics | no | NOT_PLANNED |
 | HTTPS/DNS/IPv6/Unix-socket upstreams | no | no | fixed IPv4 HTTP only | no | NOT_PLANNED |
@@ -39,6 +39,10 @@ Allowed states are `SUPPORTED`, `PARTIAL`, `BLOCKED_BY_RUT`,
   fail-closed first transform slice; normalization and slash redirect behavior
   remain outside it, so #258 cannot become broadly `SUPPORTED` from clean-vector
   evidence alone.
+- The automatic slash-redirect `SUPPORTED` row is limited to GET, cleartext
+  H1, explicit close, and the exact accepted `/api/` model. It does not cover
+  HEAD/POST, keep-alive Redirect, TLS/H2, arbitrary prefixes, or broader nginx
+  URI normalization.
 - nginx prefix matching is byte-prefix based; RUT routing is segment-aware.
   The root `/` case overlaps, but broader prefix support cannot reuse that fact.
 - A `proxy_pass` without a URI suffix must not accidentally forward the
