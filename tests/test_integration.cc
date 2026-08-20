@@ -17019,6 +17019,47 @@ TEST(route, response_policy_request_connection_preserves_client_intent) {
         close(client);
         CHECK_EQ(backend.request_count.load(std::memory_order_acquire), 1u);
     }
+
+    // A response-policy request intent must still honor the server lifecycle
+    // gate. Warm the downstream connection before entering drain so the test
+    // does not depend on an accept racing the drain transition.
+    {
+        RecordingUpstream backend;
+        REQUIRE(backend.setup());
+        RouteConfig cfg{};
+        REQUIRE(cfg.add_static("/warm", 'G', 200));
+        REQUIRE(cfg.add_upstream("backend", 0x7F000001, backend.port).has_value());
+        REQUIRE_EQ(cfg.add_response_policy(test_response_policy_request_spec()), 1u);
+        REQUIRE(cfg.add_jit_handler("/api", 'G', &forward_request_and_response_policy_handler));
+        const RouteConfig* active = &cfg;
+        ScopedProxyLoop proxy;
+        REQUIRE(proxy.setup(&active, 1000));
+        i32 client = connect_to(proxy.port);
+        REQUIRE_GE(client, 0);
+        set_socket_timeouts(client, 2);
+        static constexpr char kWarm[] = "GET /warm HTTP/1.1\r\nHost: client.example\r\n\r\n";
+        REQUIRE(send_all(client, kWarm, sizeof(kWarm) - 1));
+        char warm_response[512];
+        const i32 warm_len = recv_timeout(client, warm_response, sizeof(warm_response), 2000);
+        REQUIRE_GT(warm_len, 0);
+        CHECK(buf_contains(warm_response,
+                           static_cast<u32>(warm_len),
+                           "200",
+                           static_cast<u32>(strlen("200"))));
+
+        proxy.loop->drain(1);
+        static constexpr char kDraining[] =
+            "GET /api HTTP/1.1\r\nHost: client.example\r\n\r\n";
+        REQUIRE(send_all(client, kDraining, sizeof(kDraining) - 1));
+        char response[2048]{};
+        const u32 response_len = read_response(client, response, sizeof(response));
+        REQUIRE_GT(response_len, 0u);
+        normalize_and_check(response, response_len, "close");
+        char tail[16];
+        CHECK_EQ(recv_timeout(client, tail, sizeof(tail), 2000), 0);
+        close(client);
+        CHECK_EQ(backend.request_count.load(std::memory_order_acquire), 1u);
+    }
 }
 
 TEST(route, response_policy_admits_buffered_request_policy_body) {

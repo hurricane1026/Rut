@@ -319,9 +319,13 @@ return forward(users, request_policy: {
 // framing, or unsupported status/header controls fail closed; transparent
 // forward(...) remains the default for all other routes.
 return forward(users, response_policy: {
-    version: "HTTP/1.1", framing: "content_length", connection: "keep_alive",
+    version: "HTTP/1.1", framing: "content_length", connection: "request",
     server: "nginx/1.29.7", date: "current", hide_headers: ["Date", "Server", "X-Pad"]
 })
+// response_policy.connection: "keep_alive" requires a keep-alive downstream
+// request and emits keep-alive. "request" follows the parsed downstream
+// HTTP/1.1 intent, emitting keep-alive by default and close for
+// Connection: close. The strict response-domain limits above remain unchanged.
 // Valid downstream Upgrade requests are rejected by this policy; Upgrade
 // passthrough remains PARTIAL in the first slice.
 let resp = forward(users, buffered: true)      // buffered Response, then return resp

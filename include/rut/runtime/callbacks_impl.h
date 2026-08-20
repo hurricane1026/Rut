@@ -5264,13 +5264,14 @@ inline bool build_strict_response_headers(Connection& conn, const RouteConfig& c
     if (date_len == 0 || !put(date, date_len) || !put_lit("\r\nContent-Length: ")) return false;
     const u32 num_len = strict_response_dec(num, resp.content_length);
     if (!put(num, num_len) || !put_lit("\r\nConnection: ")) return false;
-    const bool downstream_keep_alive =
+    const bool policy_keep_alive =
         policy.connection == ResponsePolicyConnection::KeepAlive ||
         (policy.connection == ResponsePolicyConnection::Request && conn.req_client_keep_alive);
     // Preserve the server lifecycle gate set at the request boundary: a
     // draining connection must not be reopened by a response policy intent.
-    conn.keep_alive = conn.keep_alive && downstream_keep_alive;
-    if (!put_lit(downstream_keep_alive ? "keep-alive\r\n" : "close\r\n")) return false;
+    const bool effective_keep_alive = conn.keep_alive && policy_keep_alive;
+    conn.keep_alive = effective_keep_alive;
+    if (!put_lit(effective_keep_alive ? "keep-alive\r\n" : "close\r\n")) return false;
     for (u32 i = 0; i < resp.header_count; i++) {
         const Header& h = resp.headers[i];
         if (response_policy_name_eq(h.name, "connection", 10) ||

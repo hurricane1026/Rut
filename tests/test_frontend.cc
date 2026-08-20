@@ -32462,6 +32462,28 @@ TEST(frontend, response_policy_rejects_invalid_values_duplicates_and_missing_fie
     }
 }
 
+TEST(frontend, response_policy_rejects_invalid_and_duplicate_connection_fields) {
+    struct InvalidCase {
+        const char* source;
+        FrontendError code;
+    };
+    static constexpr InvalidCase kCases[] = {
+        {"upstream b\nroute GET \"/\" { return forward(b, response_policy: { version: \"HTTP/1.1\", framing: \"content_length\", connection: \"close\", server: \"nginx\", date: \"current\", hide_headers: [] }) }\n",
+         FrontendError::UnsupportedSyntax},
+        {"upstream b\nroute GET \"/\" { return forward(b, response_policy: { version: \"HTTP/1.1\", framing: \"content_length\", connection: \"keep_alive\", connection: \"request\", server: \"nginx\", date: \"current\", hide_headers: [] }) }\n",
+         FrontendError::UnexpectedToken},
+    };
+    for (const InvalidCase& test : kCases) {
+        auto lexed = lex(lit(test.source));
+        REQUIRE(lexed);
+        auto ast = parse_file_heap(lexed.value());
+        REQUIRE_FALSE(ast.has_value());
+        CHECK_EQ(ast.error().code, test.code);
+        CHECK_GT(ast.error().span.line, 0u);
+        CHECK_GT(ast.error().span.col, 0u);
+    }
+}
+
 TEST(frontend, response_policy_rejects_response_mutation_combination) {
     const char* src = R"rut(
 upstream backend at "127.0.0.1:9000"
