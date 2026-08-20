@@ -5635,6 +5635,38 @@ bool iouring_socket_live() {
     close(lfd);
     return live;
 }
+
+// Regression for cross-thread ring ownership: init() runs on the control thread,
+// while the accept/recv/send submissions run on the spawned shard thread. A ring
+// that initializes but cannot submit from the worker must fail this test rather
+// than being mistaken for an unavailable io_uring environment.
+TEST(shard, serves_http1_cleartext_iouring_cross_thread) {
+    Shard<IoUringEventLoop> shard;
+    i32 lfd = create_listen_socket(0).value_or(-1);
+    REQUIRE(lfd >= 0);
+    auto initialized = shard.init(0, lfd);
+    if (!initialized) {
+        close(lfd);
+        SKIP("io_uring cannot initialize in this environment");
+    }
+    const u16 port = get_port(lfd);
+    REQUIRE(shard.spawn(-1).has_value());
+
+    i32 c = connect_to(port);
+    REQUIRE(c >= 0);
+    set_socket_timeouts(c, 2);
+    REQUIRE(send_all(c, HTTP_REQ, HTTP_REQ_LEN));
+    char buf[1024];
+    const i32 n = recv_timeout(c, buf, sizeof(buf), 2000);
+    REQUIRE_GT(n, 0);
+    CHECK(buf_contains(buf, static_cast<u32>(n), "200", 3));
+
+    close(c);
+    shard.stop();
+    shard.join();
+    shard.shutdown();
+    close(lfd);
+}
 }  // namespace
 
 // HTTP/2 over io_uring uses the identical callbacks_h2.h serving path as epoll;

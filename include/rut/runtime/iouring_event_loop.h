@@ -221,6 +221,13 @@ public:
 
         while (is_running()) {
             u32 n = backend.wait(events, kMaxEventsPerWait, conns, kMaxConns);
+            if (backend.failed()) {
+                // A zero-event wait is valid; a sticky backend error is not. Stop
+                // this shard so an io_uring_enter failure cannot become a silent
+                // request stall or an endless busy loop.
+                running_.store(false, std::memory_order_release);
+                break;
+            }
             for (u32 i = 0; i < n; i++) {
                 dispatch(events[i]);
             }

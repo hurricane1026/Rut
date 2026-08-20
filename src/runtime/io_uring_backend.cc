@@ -107,6 +107,7 @@ core::Expected<void, Error> IoUringBackend::init(u32 /*shard_id*/, i32 lfd) {
     ring_fd = -1;
     timer_fd = -1;
     timer_read_armed = false;
+    fatal_error = 0;
     for (u32 i = 0; i < kMaxSendState; i++) {
         send_state[i] = {nullptr, -1, 0, 0, IoEventType::Send};
         upstream_send_state[i] = {nullptr, -1, 0, 0, IoEventType::UpstreamSend};
@@ -115,7 +116,7 @@ core::Expected<void, Error> IoUringBackend::init(u32 /*shard_id*/, i32 lfd) {
     // Setup io_uring with desired flags
     struct io_uring_params params;
     memset(&params, 0, sizeof(params));
-    params.flags = IORING_SETUP_COOP_TASKRUN | IORING_SETUP_SINGLE_ISSUER;
+    params.flags = IORING_SETUP_COOP_TASKRUN;
     // Note: SQPOLL requires CAP_SYS_NICE or io_uring_register credentials.
     // Omit for now, add as optimization later.
 
@@ -437,6 +438,7 @@ bool IoUringBackend::add_yield_timeout(u32 conn_id, Connection& conn, u32 ms) {
         if (pending > 0) {
             i32 flushed = io_uring_enter(ring_fd, pending, 0, IORING_ENTER_SQ_WAKEUP);
             if (flushed > 0) pending -= static_cast<u32>(flushed);
+            else if (flushed < 0) record_enter_error(flushed);
         }
         sqe = get_sqe();
         if (!sqe) return false;
@@ -482,6 +484,7 @@ void IoUringBackend::cancel_accept() {
     if (pending > 0) {
         i32 ret = io_uring_enter(ring_fd, pending, 0, IORING_ENTER_SQ_WAKEUP);
         if (ret > 0) pending -= static_cast<u32>(ret);
+        else if (ret < 0) record_enter_error(ret);
     }
 }
 
@@ -494,6 +497,7 @@ bool IoUringBackend::cancel_by_user_data(u64 target, u32 conn_id, IoEventType ty
         if (pending > 0) {
             i32 flushed = io_uring_enter(ring_fd, pending, 0, IORING_ENTER_SQ_WAKEUP);
             if (flushed > 0) pending -= static_cast<u32>(flushed);
+            else if (flushed < 0) record_enter_error(flushed);
         }
         sqe = get_sqe();
         if (!sqe) return false;
@@ -585,7 +589,8 @@ u32 IoUringBackend::cancel(i32 /*fd*/,
             break;
         }
         if (ret == -EINTR) continue;
-        break;  // other error — SQEs remain pending for next wait()
+        record_enter_error(ret);
+        break;  // other error — event loop will stop instead of retrying forever
     }
     return submitted;
 }
@@ -593,6 +598,7 @@ u32 IoUringBackend::cancel(i32 /*fd*/,
 // --- Wait (submit + harvest) ---
 
 u32 IoUringBackend::wait(IoEvent* events, u32 max_events, Connection* conns, u32 max_conns) {
+    if (failed()) return 0;
     // Retry timer read if previous submit_timer_read() failed (SQ was full)
     if (timer_fd >= 0 && !timer_read_armed) submit_timer_read();
 
@@ -608,7 +614,8 @@ u32 IoUringBackend::wait(IoEvent* events, u32 max_events, Connection* conns, u32
         }
         if (ret >= 0) break;
         if (ret == -EINTR) continue;
-        return 0;  // real error
+        record_enter_error(ret);
+        return 0;
     }
 
     // Harvest CQEs

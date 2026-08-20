@@ -6,6 +6,7 @@
 #include "rut/runtime/io_backend.h"
 
 #include <linux/io_uring.h>
+#include <errno.h>
 #include <sys/mman.h>
 #include <sys/syscall.h>
 #include <unistd.h>
@@ -23,9 +24,10 @@ using Connection = ConnectionBase;  // alias (matches connection.h)
 //   [*] IORING_RECV_MULTISHOT     — one SQE continuously receives per connection
 //   [*] IOSQE_BUFFER_SELECT       — kernel picks buffer from provided ring
 //   [ ] IORING_SETUP_SQPOLL       — kernel-side SQ polling (needs CAP_SYS_NICE)
-//   [*] IORING_SETUP_SINGLE_ISSUER — single-thread optimization
 //   [ ] IORING_OP_SEND_ZC         — zero-copy send (future optimization)
 //   [*] IORING_SETUP_COOP_TASKRUN — cooperative task running
+// Ring setup runs before the shard thread starts, so SINGLE_ISSUER is intentionally
+// not used: submissions and enters may come from the spawned shard thread.
 //
 struct IoUringBackend {
     // io_uring is async: the kernel may still access user buffers between
@@ -87,6 +89,10 @@ struct IoUringBackend {
 
     // Pending SQE count (for submission)
     u32 pending = 0;
+
+    // Sticky fatal error from io_uring_enter. A zero-event wait is otherwise a
+    // legitimate result, so the event loop must inspect this separately.
+    i32 fatal_error = 0;
 
     // --- Interface methods ---
 
@@ -156,6 +162,8 @@ struct IoUringBackend {
     // copied into conns[conn_id].recv_buf. max_conns: table size for bounds checking.
     u32 wait(IoEvent* events, u32 max_events, Connection* conns, u32 max_conns);
 
+    bool failed() const { return fatal_error != 0; }
+
     // Shutdown and unmap all resources.
     void shutdown();
 
@@ -189,6 +197,10 @@ private:
 
     // Submit IORING_OP_READ on timer_fd to receive next tick.
     void submit_timer_read();
+
+    void record_enter_error(i32 result) {
+        if (result < 0 && result != -EINTR) fatal_error = -result;
+    }
 };
 
 }  // namespace rut
