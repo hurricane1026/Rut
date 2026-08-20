@@ -265,6 +265,19 @@ void rut_helper_req_set_path(void* conn, const char* path, u32 len) {
     c->req_path_override = Str{path, len};
 }
 
+void rut_helper_req_set_target_transform(void* conn, u32 transform_id) {
+    auto* c = static_cast<ConnectionBase*>(conn);
+    if (c->target_transform_recorded) {
+        c->target_transform_id = kInvalidForwardTargetTransformId;
+        return;
+    }
+    c->target_transform_recorded = true;
+    c->target_transform_id =
+        (transform_id == 0 || transform_id > kMaxForwardTargetTransforms)
+            ? kInvalidForwardTargetTransformId
+            : static_cast<u16>(transform_id);
+}
+
 static void record_req_header(
     void* conn, const char* name, u32 nlen, const char* val, u32 vlen, bool append) {
     auto* c = static_cast<ConnectionBase*>(conn);

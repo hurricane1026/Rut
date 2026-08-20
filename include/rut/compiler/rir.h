@@ -180,6 +180,7 @@ enum class Opcode : u8 {
     RespRemoveHeader,   // resp.remove_header "Name"
     RespCommitHeaders,  // publish pending Response-builder mutations
     ReqSetPath,         // req.set_path %path
+    ReqSetTargetTransform, // req.set_target_transform <1-based transform id>
     CtxStoreSlotI32,    // if i < ctx.slot_count: ctx.slot[i] = %val
                         // Stored as a zero-extended i64 slot. If no slot
                         // is available, the write is ignored.

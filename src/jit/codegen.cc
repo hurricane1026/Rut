@@ -317,6 +317,18 @@ struct Ctx {
         return fn_req_set_path;
     }
 
+    // void rut_helper_req_set_target_transform(ptr conn, i32 id)
+    LLVMValueRef fn_req_set_target_transform = nullptr;
+    LLVMValueRef get_req_set_target_transform() {
+        if (!fn_req_set_target_transform) {
+            LLVMTypeRef params[] = {ptr_ty, i32_ty};
+            LLVMTypeRef ft = LLVMFunctionType(void_ty, params, 2, 0);
+            fn_req_set_target_transform =
+                LLVMAddFunction(llvm_mod, "rut_helper_req_set_target_transform", ft);
+        }
+        return fn_req_set_target_transform;
+    }
+
     // void rut_helper_req_set_header(ptr conn, ptr name, i32 nlen, ptr val, i32 vlen)
     LLVMValueRef fn_req_set_header = nullptr;
     LLVMValueRef get_req_set_header() {
@@ -999,6 +1011,21 @@ static void emit_instruction(Ctx& c, const rir::Instruction& inst) {
                            c.get_req_set_path(),
                            args,
                            3,
+                           "");
+            break;
+        }
+        case rir::Opcode::ReqSetTargetTransform: {
+            // Preserve forged negative i32 immediates as unsigned bits; the
+            // helper records them as a fail-closed sentinel rather than
+            // collapsing them into the no-effect state.
+            LLVMValueRef id = LLVMConstInt(
+                c.i32_ty, static_cast<u32>(inst.imm.i32_val), /*sign_extend=*/0);
+            LLVMValueRef args[] = {c.param_conn, id};
+            LLVMBuildCall2(c.builder,
+                           LLVMGlobalGetValueType(c.get_req_set_target_transform()),
+                           c.get_req_set_target_transform(),
+                           args,
+                           2,
                            "");
             break;
         }

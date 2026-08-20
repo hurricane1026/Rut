@@ -223,6 +223,9 @@ void print_opcode(PrintBuf& buf, Opcode op) {
         case Opcode::ReqSetPath:
             buf.put_cstr("req.set_path");
             break;
+        case Opcode::ReqSetTargetTransform:
+            buf.put_cstr("req.set_target_transform");
+            break;
         case Opcode::CtxStoreSlotI32:
             buf.put_cstr("ctx.store_slot_i32");
             break;
@@ -608,6 +611,10 @@ void print_instruction(PrintBuf& buf, const Instruction& inst, const Function& f
         case Opcode::SextI64:
             buf.put(' ');
             print_value_ref(buf, inst.operands[0]);
+            break;
+        case Opcode::ReqSetTargetTransform:
+            buf.put(' ');
+            buf.put_i64(static_cast<i64>(inst.imm.i32_val));
             break;
         case Opcode::CtxStoreSlotI32:
             buf.put(' ');

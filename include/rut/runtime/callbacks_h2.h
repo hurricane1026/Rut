@@ -36,6 +36,8 @@ bool h2_apply_forward_request_overrides(Connection& conn);
 inline void h2_reset_request_mutations(Connection& conn) {
     conn.req_path_overridden = false;
     conn.req_path_override = {nullptr, 0};
+    conn.target_transform_id = 0;
+    conn.target_transform_recorded = false;
     conn.req_header_override_count = 0;
     conn.req_header_append_mask = 0;
     conn.req_header_override_overflow = false;
@@ -738,6 +740,10 @@ void h2_invoke_emit(H2Dispatch<Loop>& d,
 
     const JitDispatchOutcome kOutcome = invoke_jit_handler(
         route->fn, static_cast<void*>(d.conn), *ctx, synth, synth_len, /*arena=*/nullptr);
+    if (d.conn->target_transform_recorded) {
+        h2_emit_status(d, stream_id, 400);
+        return;
+    }
     if (kOutcome.kind == JitDispatchOutcome::Kind::TimerYield) {
         if (!h2_suspend_timer(d,
                               stream_id,
@@ -1431,6 +1437,26 @@ void h2_resume_jit_handler(Loop* loop, Connection& conn) {
                                                            h2->pending_synth,
                                                            h2->async_synth_len,
                                                            /*arena=*/nullptr);
+
+    if (conn.target_transform_recorded) {
+        u8 resp[8192];
+        H2Dispatch<Loop> d{loop, &conn, resp, sizeof(resp), 0, false};
+        h2_emit_status(d, kStreamId, 400);
+        conn.pending_handler_fn = nullptr;
+        h2_clear_async(*h2);
+        h2_async_epoch_leave(loop, conn);
+        if (d.resp_len == 0 || d.overflow) {
+            loop->close_conn(conn);
+            return;
+        }
+        conn.send_progress = 0;
+        conn.send_buf.reset();
+        conn.send_buf.write(resp, d.resp_len);
+        conn.keep_alive = true;
+        conn.transition_to_sending(&on_h2_sent<Loop>);
+        loop->submit_send(conn, conn.send_buf.data(), conn.send_buf.len());
+        return;
+    }
 
     // Another wait(): keep the stream parked and re-arm without flushing.
     if (kOutcome.kind == JitDispatchOutcome::Kind::TimerYield) {

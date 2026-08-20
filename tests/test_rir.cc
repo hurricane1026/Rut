@@ -461,6 +461,11 @@ TEST(RirPrinter, OpcodeNames) {
     CHECK(got1.eq(lit("cmp.eq")));
 
     buf.len = 0;
+    print_opcode(buf, Opcode::ReqSetTargetTransform);
+    Str got_transform = {buf.data, buf.len};
+    CHECK(got_transform.eq(lit("req.set_target_transform")));
+
+    buf.len = 0;
     print_opcode(buf, Opcode::YieldHttpGet);
     Str got2 = {buf.data, buf.len};
     CHECK(got2.eq(lit("yield.http_get")));

@@ -641,6 +641,14 @@ struct Builder {
         return {};
     }
 
+    VoidResult emit_req_set_target_transform(u32 transform_id, SourceLoc loc = {}) {
+        if (transform_id == 0 || transform_id > kMaxForwardTargetTransforms)
+            return err(RirError::InvalidState);
+        auto r = TRY(emit(Opcode::ReqSetTargetTransform, nullptr, loc));
+        r.inst->imm.i32_val = static_cast<i32>(transform_id);
+        return {};
+    }
+
     VoidResult emit_ctx_store_slot_i32(u32 slot, ValueId value, SourceLoc loc = {}) {
         if (!val_has_type(value, TypeKind::I32)) return err(RirError::InvalidState);
         auto r = TRY(emit(Opcode::CtxStoreSlotI32, nullptr, loc));

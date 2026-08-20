@@ -730,6 +730,8 @@ static void copy_sim_connection_state(Connection& dst, const Connection& src) {
     dst.peer_port = src.peer_port;
     copy_char_array(dst.req_path, src.req_path);
     dst.req_path_canon = copy_req_path_canon(src, dst);
+    dst.target_transform_id = src.target_transform_id;
+    dst.target_transform_recorded = src.target_transform_recorded;
     dst.upstream_us = src.upstream_us;
     copy_char_array(dst.upstream_name, src.upstream_name);
     dst.upstream_start_us = src.upstream_start_us;
@@ -782,6 +784,10 @@ static SimulateResult drive_handler_to_completion(const Engine& engine,
     for (u32 iter = result.yield_count; iter < max_yields; iter++) {
         execution.connection = &conn;
         unpacked = execution.invoke();
+        if (conn.target_transform_recorded) {
+            result.verdict = Verdict::Unsupported;
+            return result;
+        }
         if (unpacked.action != jit::HandlerAction::Yield) break;
         result.yield_count++;
 

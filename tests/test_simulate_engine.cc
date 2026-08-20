@@ -784,6 +784,34 @@ TEST(simulate_engine, forward_bundle_is_explicitly_unsupported) {
     rir.destroy();
 }
 
+TEST(simulate_engine, recorded_target_transform_is_unsupported_before_forward) {
+    const char* src =
+        "upstream backend\nroute GET \"/api\" { return forward(backend) }\n";
+    FrontendRirModule rir{};
+    REQUIRE(compile_to_rir(src, rir));
+    REQUIRE(rir.module.func_count == 1);
+    auto& fn = rir.module.functions[0];
+    REQUIRE(fn.entry() != nullptr);
+    REQUIRE(fn.entry()->inst_count > 0);
+    REQUIRE(fn.entry()->inst_count < fn.entry()->inst_cap);
+    const u32 terminator = fn.entry()->inst_count - 1;
+    for (u32 i = fn.entry()->inst_count; i > terminator; i--)
+        fn.entry()->insts[i] = fn.entry()->insts[i - 1];
+    fn.entry()->insts[terminator] = {};
+    fn.entry()->insts[terminator].op = rir::Opcode::ReqSetTargetTransform;
+    fn.entry()->insts[terminator].imm.i32_val = 1;
+    fn.entry()->inst_count++;
+
+    Engine engine;
+    REQUIRE(engine.init(rir.module, nullptr, 0));
+    const auto result =
+        simulate_one(engine, make_entry("GET /api HTTP/1.1\r\nHost: x\r\n\r\n", 502));
+    CHECK_EQ(result.verdict, Verdict::Unsupported);
+    CHECK(result.action != jit::HandlerAction::Forward);
+    engine.shutdown();
+    rir.destroy();
+}
+
 TEST(simulate_engine, default_200_when_no_route_matches) {
     Manifest manifest{};
 

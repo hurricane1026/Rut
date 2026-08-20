@@ -9683,6 +9683,67 @@ TEST(jit, ret_forward) {
     tc.destroy();
 }
 
+TEST(jit, target_transform_effect_records_and_fails_closed) {
+    TestContext tc;
+    REQUIRE(tc.init());
+    Builder b;
+    b.init(&tc.mod);
+
+    auto add = [&](const char* name, i32 encoded_id, bool duplicate) {
+        auto* fn = V(b.create_function(lit(name), lit("/"), 'G'));
+        auto entry = V(b.create_block(fn, lit("entry")));
+        b.set_insert_point(fn, entry);
+        VOK(b.emit_req_set_target_transform(1));
+        fn->entry()->insts[0].imm.i32_val = encoded_id;
+        if (duplicate) VOK(b.emit_req_set_target_transform(1));
+        auto upstream = V(b.emit_const_i32(3));
+        VOK(b.emit_ret_forward(upstream));
+    };
+    add("proxy_transform_valid", 1, false);
+    add("proxy_transform_zero", 0, false);
+    add("proxy_transform_wide", static_cast<i32>(kMaxForwardTargetTransforms + 1), false);
+    add("proxy_transform_duplicate", 1, true);
+
+    auto* bounds = V(b.create_function(lit("proxy_transform_bounds"), lit("/"), 'G'));
+    auto bounds_entry = V(b.create_block(bounds, lit("entry")));
+    b.set_insert_point(bounds, bounds_entry);
+    CHECK_FALSE(b.emit_req_set_target_transform(0));
+    CHECK_FALSE(b.emit_req_set_target_transform(kMaxForwardTargetTransforms + 1));
+    auto upstream = V(b.emit_const_i32(3));
+    VOK(b.emit_ret_forward(upstream));
+
+    auto cg = codegen(tc.mod);
+    REQUIRE(cg.ok);
+    JitEngine engine;
+    REQUIRE(engine.init());
+    REQUIRE(engine.compile(cg.mod, cg.ctx));
+
+    const char* names[] = {"handler_proxy_transform_valid",
+                           "handler_proxy_transform_zero",
+                           "handler_proxy_transform_wide",
+                           "handler_proxy_transform_duplicate"};
+    const u16 ids[] = {1, kInvalidForwardTargetTransformId, kInvalidForwardTargetTransformId,
+                       kInvalidForwardTargetTransformId};
+    for (u32 i = 0; i < 4; i++) {
+        Connection conn;
+        conn.reset();
+        auto handler = reinterpret_cast<HandlerFn>(engine.lookup(names[i]));
+        REQUIRE(handler != nullptr);
+        const auto result = HandlerResult::unpack(handler(
+            &conn,
+            nullptr,
+            reinterpret_cast<const u8*>(kGetApiRequest),
+            sizeof(kGetApiRequest) - 1,
+            nullptr));
+        CHECK(result.action == HandlerAction::Forward);
+        CHECK(conn.target_transform_recorded);
+        CHECK_EQ(conn.target_transform_id, ids[i]);
+    }
+
+    engine.shutdown();
+    tc.destroy();
+}
+
 TEST(jit, ret_forward_request_policy_abi_fails_closed) {
     TestContext tc;
     REQUIRE(tc.init());

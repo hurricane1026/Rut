@@ -85,6 +85,17 @@ u32 count_occurrences(const u8* buf, u32 len, const char* needle) {
 bool buf_has(const u8* buf, u32 len, const char* needle) {
     return count_occurrences(buf, len, needle) > 0;
 }
+
+u64 h2_target_transform_handler(void* opaque,
+                                jit::HandlerCtx*,
+                                const u8*,
+                                u32,
+                                void*) {
+    auto* conn = static_cast<Connection*>(opaque);
+    conn->target_transform_id = 1;
+    conn->target_transform_recorded = true;
+    return jit::HandlerResult::make_forward(0).pack();
+}
 }  // namespace
 
 // Replacing a header the client sent twice must replace the first AND drop the
@@ -299,6 +310,86 @@ TEST(set_path, snapshots_response_mutations_before_request_rewrite) {
     CHECK(c->resp_header_mutations[0].value.eq({"/original", 9}));
     CHECK(buf_has(c->recv_buf.data(), c->recv_buf.len(), "GET /forwarded HTTP/1.1\r\n"));
     CHECK_FALSE(c->retry_req_snapshot_replayable);
+}
+
+TEST(target_transform, h1_forward_rejects_before_upstream_side_effects) {
+    SmallLoop loop;
+    loop.setup();
+    RouteConfig cfg{};
+    REQUIRE(cfg.add_upstream("backend", 0x7F000001, 8080).has_value());
+    char strip[] = "/api/";
+    char replace[] = "/v1/";
+    REQUIRE_EQ(cfg.add_target_transform({{strip, 5}, {replace, 4}}), 1u);
+
+    const u16 ids[] = {1, kInvalidForwardTargetTransformId,
+                       kInvalidForwardTargetTransformId, kInvalidForwardTargetTransformId};
+    for (u16 id : ids) {
+        auto* conn = loop.alloc_conn();
+        REQUIRE(conn != nullptr);
+        conn->request_config = &cfg;
+        conn->keep_alive = true;
+        conn->target_transform_id = id;
+        conn->target_transform_recorded = true;
+        JitDispatchOutcome outcome{};
+        outcome.kind = JitDispatchOutcome::Kind::Forward;
+        outcome.upstream_id = 0;
+        loop.backend.clear_ops();
+
+        handle_jit_outcome<SmallLoop>(&loop, *conn, outcome, nullptr, true);
+
+        CHECK_EQ(conn->resp_status, 400u);
+        CHECK_EQ(conn->upstream_fd, -1);
+        CHECK_FALSE(conn->upstream_slot_held);
+        CHECK_EQ(loop.backend.count_ops(MockOp::Connect), 0u);
+        CHECK_EQ(loop.backend.count_ops(MockOp::Send), 1u);
+        conn->reset();
+        CHECK_FALSE(conn->target_transform_recorded);
+        CHECK_EQ(conn->target_transform_id, 0u);
+    }
+}
+
+TEST(target_transform, h2_request_boundary_clears_recorded_effect) {
+    Connection conn;
+    conn.reset();
+    conn.target_transform_id = 1;
+    conn.target_transform_recorded = true;
+    h2_reset_request_mutations(conn);
+    CHECK_FALSE(conn.target_transform_recorded);
+    CHECK_EQ(conn.target_transform_id, 0u);
+}
+
+TEST(target_transform, h2_forward_rejects_recorded_effect_before_proxy) {
+    SmallLoop loop;
+    loop.setup();
+    auto* conn = loop.alloc_conn();
+    REQUIRE(conn != nullptr);
+    RouteConfig cfg{};
+    REQUIRE(cfg.add_upstream("backend", 0x7F000001, 8080).has_value());
+    Http2Conn h2{};
+    h2.init();
+    conn->h2 = &h2;
+    RouteEntry route{};
+    route.fn = &h2_target_transform_handler;
+    const u8 synth[] = "GET / HTTP/1.1\r\nHost: x\r\n\r\n";
+    u8 response[8192]{};
+    H2Dispatch<SmallLoop> dispatch{&loop, conn, response, sizeof(response), 0, false};
+    loop.backend.clear_ops();
+
+    h2_invoke_emit(dispatch,
+                   1,
+                   &route,
+                   nullptr,
+                   0,
+                   &cfg,
+                   synth,
+                   sizeof(synth) - 1,
+                   false,
+                   true);
+
+    CHECK(conn->target_transform_recorded);
+    CHECK(dispatch.resp_len > 0);  // local 400 is staged, never proxied
+    CHECK_EQ(loop.backend.count_ops(MockOp::Connect), 0u);
+    CHECK_EQ(loop.backend.count_ops(MockOp::Send), 0u);
 }
 
 TEST(set_path, streamed_pipeline_stash_preserves_response_mutation_snapshot) {

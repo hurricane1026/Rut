@@ -1053,6 +1053,8 @@ void on_header_received(void* lp, Connection& conn, IoEvent ev) {
     // exactly once per complete request, before route matching / handler dispatch.
     conn.req_path_overridden = false;
     conn.req_path_override = {nullptr, 0};
+    conn.target_transform_id = 0;
+    conn.target_transform_recorded = false;
     conn.req_header_override_count = 0;  // forward(set_header:) — same leak risk
     conn.req_header_append_mask = 0;
     conn.req_header_override_overflow = false;
@@ -2161,6 +2163,19 @@ void handle_jit_outcome(Loop* loop,
             // pick up a post-swap config whose upstream table doesn't
             // match the indexing the handler compiled against.
             const RouteConfig* config = conn.request_config;
+            if (conn.target_transform_recorded) {
+                // Resolve the pinned table before rejecting. Forged/malformed
+                // IDs fail here; valid future transforms are also unsupported
+                // until materialization exists. Both cases precede target
+                // access and every upstream side effect.
+                if (config == nullptr ||
+                    !config->target_transform_id_is_valid(conn.target_transform_id)) {
+                    reject_request_policy(loop, conn);
+                    return;
+                }
+                reject_request_policy(loop, conn);
+                return;
+            }
             if (!config || outcome.upstream_id >= config->upstream_count) {
                 // Unresolvable upstream id — handler returned a value
                 // the config doesn't know. Fail closed with 502 rather

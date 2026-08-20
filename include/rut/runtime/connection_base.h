@@ -4,6 +4,7 @@
 #include "rut/common/http_header_validation.h"
 #include "rut/common/request_policy.h"
 #include "rut/common/types.h"
+#include "rut/common/forward_target_transform.h"
 #include "rut/common/wait_limits.h"
 #include "rut/jit/handler_abi.h"
 #include "rut/runtime/chunked_parser.h"
@@ -188,6 +189,11 @@ struct ConnectionBase {
     // line in recv_buf before forwarding. Reset per request.
     bool req_path_overridden;
     Str req_path_override;
+    // Foundation-only target-transform effect. The recorded flag distinguishes
+    // no effect from a forged zero/sentinel ID; every recorded effect is rejected
+    // before upstream selection until target materialization exists.
+    u16 target_transform_id;
+    bool target_transform_recorded;
     // forward(set_header:) request mutation: rut_helper_req_set_header records
     // (name, value) overrides (views into stable JIT constant memory);
     // on_upstream_connected injects/replaces those header lines in recv_buf before
@@ -699,6 +705,8 @@ struct ConnectionBase {
         h2_proxy_synth_quarantined = false;
         req_path_overridden = false;
         req_path_override = {nullptr, 0};
+        target_transform_id = 0;
+        target_transform_recorded = false;
         req_header_override_count = 0;
         req_header_append_mask = 0;
         req_header_override_overflow = false;
