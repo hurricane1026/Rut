@@ -16134,7 +16134,8 @@ TEST(route, response_policy_rejects_strict_invalid_final_vectors) {
         "HTTP/1.1 200 OK\r\n\r\n",
         "HTTP/1.1 200 OK\r\nContent-Length: 0\r\nContent-Length: 0\r\n\r\n",
         "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n",
-        "HTTP/1.1 200 OK\r\nConnection: close\r\nContent-Length: 0\r\n\r\n",
+        ("HTTP/1.1 200 OK\r\nConnection: keep-alive\r\nConnection: close\r\n"
+         "Content-Length: 0\r\n\r\n"),
         "HTTP/1.1 200 OK\r\nProxy-Connection: keep-alive\r\nContent-Length: 0\r\n\r\n",
         "HTTP/1.1 200 OK\r\nX-Accel-Redirect: /private\r\nContent-Length: 0\r\n\r\n",
         "HTTP/1.1 200 OK\r\nLocation: /private\r\nContent-Length: 0\r\n\r\n",
@@ -16813,6 +16814,87 @@ TEST(route, response_policy_serializes_strict_h1_final_response) {
     CHECK(memcmp(normalized, kExpected, sizeof(kExpected) - 1) == 0);
     CHECK_EQ(backend.accepted_count.load(std::memory_order_acquire), 1u);
     CHECK_EQ(backend.request_count.load(std::memory_order_acquire), 1u);
+}
+
+TEST(route, response_policy_consumes_one_upstream_connection_header) {
+    using namespace rut;
+    struct Case {
+        const char* response;
+        bool preserve_x_hop;
+    };
+    static constexpr Case kCases[] = {
+        {"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n", false},
+        {"HTTP/1.1 200 OK\r\nConnection: keep-alive\r\nContent-Length: 0\r\n\r\n",
+         false},
+        {"HTTP/1.1 200 OK\r\nConnection: close\r\nContent-Length: 0\r\n\r\n", false},
+        {"HTTP/1.1 200 OK\r\nConnection: X-Hop\r\nX-Hop: secret\r\n"
+         "Content-Length: 0\r\n\r\n",
+         true},
+    };
+
+    for (const Case& test : kCases) {
+        RecordingUpstream backend;
+        backend.response = test.response;
+        backend.response_len = static_cast<u32>(strlen(test.response));
+        REQUIRE(backend.setup());
+        RouteConfig cfg{};
+        auto id = cfg.add_upstream("backend", 0x7F000001, backend.port);
+        REQUIRE(id.has_value());
+        REQUIRE_EQ(cfg.add_response_policy(test_response_policy_spec()), 1u);
+        REQUIRE(cfg.add_jit_handler("/api", 'G', &forward_response_policy_1_handler));
+        const RouteConfig* active = &cfg;
+        ScopedProxyLoop proxy;
+        REQUIRE(proxy.setup(&active, 1000));
+
+        i32 client = connect_to(proxy.port);
+        REQUIRE_GE(client, 0);
+        set_socket_timeouts(client, 2);
+        static constexpr char kRequest[] = "GET /api HTTP/1.1\r\nHost: client.example\r\n\r\n";
+        REQUIRE(send_all(client, kRequest, sizeof(kRequest) - 1));
+        char response[2048]{};
+        u32 n = 0;
+        for (u32 attempt = 0; attempt < 8 && n < sizeof(response); attempt++) {
+            const i32 got = recv_timeout(client, response + n, sizeof(response) - n, 2000);
+            if (got <= 0) break;
+            n += static_cast<u32>(got);
+            if (buf_contains(response, n, "\r\n\r\n", 4)) break;
+        }
+        close(client);
+        REQUIRE_GT(n, 0u);
+
+        char normalized[2048]{};
+        REQUIRE_LT(n, static_cast<u32>(sizeof(normalized)));
+        memcpy(normalized, response, n);
+        char* date = strstr(normalized, "Date: ");
+        REQUIRE(date != nullptr);
+        for (u32 i = 0; i < 29 && date[6 + i] != '\r'; i++) date[6 + i] = 'X';
+        char expected[512];
+        const int expected_len = snprintf(
+            expected,
+            sizeof(expected),
+            "HTTP/1.1 200 OK\r\n"
+            "Server: nginx/1.29.7\r\n"
+            "Date: XXXXXXXXXXXXXXXXXXXXXXXXXXXXX\r\n"
+            "Content-Length: 0\r\n"
+            "Connection: keep-alive\r\n"
+            "%s"
+            "\r\n",
+            test.preserve_x_hop ? "X-Hop: secret\r\n" : "");
+        REQUIRE_GT(expected_len, 0);
+        REQUIRE_LT(expected_len, static_cast<int>(sizeof(expected)));
+        CHECK_EQ(n, static_cast<u32>(expected_len));
+        CHECK(memcmp(normalized, expected, static_cast<size_t>(expected_len)) == 0);
+
+        u32 connection_lines = 0;
+        for (u32 pos = 0; pos + sizeof("Connection:") - 1 <= n; pos++) {
+            if (memcmp(normalized + pos, "Connection:", sizeof("Connection:") - 1) == 0)
+                connection_lines++;
+        }
+        CHECK_EQ(connection_lines, 1u);
+        if (test.preserve_x_hop) CHECK(buf_contains(normalized, n, "X-Hop: secret\r\n", 15));
+        CHECK_EQ(backend.accepted_count.load(std::memory_order_acquire), 1u);
+        CHECK_EQ(backend.request_count.load(std::memory_order_acquire), 1u);
+    }
 }
 
 TEST(route, response_policy_admits_buffered_request_policy_body) {

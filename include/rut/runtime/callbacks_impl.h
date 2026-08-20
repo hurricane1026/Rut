@@ -5154,8 +5154,7 @@ inline bool strict_response_upload_ready(const Connection& conn) {
 }
 
 inline bool strict_response_forbidden(Str name) {
-    if (response_policy_name_eq(name, "connection", 10) ||
-        response_policy_name_eq(name, "keep-alive", 10) ||
+    if (response_policy_name_eq(name, "keep-alive", 10) ||
         response_policy_name_eq(name, "te", 2) || response_policy_name_eq(name, "trailer", 7) ||
         response_policy_name_eq(name, "transfer-encoding", 17) ||
         response_policy_name_eq(name, "upgrade", 7) ||
@@ -5227,9 +5226,17 @@ inline bool build_strict_response_headers(Connection& conn, const RouteConfig& c
         const u8 c = static_cast<u8>(resp.reason.ptr[i]);
         if ((c < 0x20 && c != '\t') || c == 0x7f) return false;
     }
+    u32 connection_count = 0;
     for (u32 i = 0; i < resp.header_count; i++) {
         const Str name = resp.headers[i].name;
-        if (strict_response_forbidden(name)) return false;
+        if (response_policy_name_eq(name, "connection", 10)) {
+            // The policy always synthesizes the sole downstream Connection
+            // field. Consume at most one upstream field; duplicate hop-by-hop
+            // metadata is ambiguous and remains fail-closed.
+            if (++connection_count > 1) return false;
+        } else if (strict_response_forbidden(name)) {
+            return false;
+        }
     }
     conn.response_header_buf.reset();
     auto put = [&](const char* p, u32 n) {
@@ -5252,7 +5259,8 @@ inline bool build_strict_response_headers(Connection& conn, const RouteConfig& c
     if (!put(num, num_len) || !put_lit("\r\nConnection: keep-alive\r\n")) return false;
     for (u32 i = 0; i < resp.header_count; i++) {
         const Header& h = resp.headers[i];
-        if (response_policy_name_eq(h.name, "date", 4) || response_policy_name_eq(h.name, "server", 6) ||
+        if (response_policy_name_eq(h.name, "connection", 10) ||
+            response_policy_name_eq(h.name, "date", 4) || response_policy_name_eq(h.name, "server", 6) ||
             response_policy_name_eq(h.name, "content-length", 14) || response_policy_hides(policy, h.name))
             continue;
         if (!put(h.name.ptr, h.name.len) || !put_lit(": ")) return false;
