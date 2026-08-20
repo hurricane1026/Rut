@@ -8,6 +8,7 @@ Allowed states are `SUPPORTED`, `PARTIAL`, `BLOCKED_BY_RUT`,
 
 | nginx feature | parser | converter | RUT capability | behavior test | status |
 | --- | --- | --- | --- | --- | --- |
+| exact minimal fragment: one wildcard listener, root location, literal IPv4 no-URI proxy, bounded H1 domain | yes | yes | yes for declared bounds | pinned generated-RUT GET/query/percent-target, fixed-CL POST, response, close, and gateway differentials | SUPPORTED |
 | server fragment, exactly one server | yes | yes | partial: exact single-server model only; no server selection model | bounded pinned generated-RUT GET and POST differentials | PARTIAL |
 | `listen <port>` IPv4 wildcard | yes | yes | yes: one source `listen :<port>` declaration | pinned nginx/generated-RUT bind and request | SUPPORTED |
 | ordinary prefix `location /` | yes | yes | partial: root catch-all exists | bounded pinned generated-RUT GET differential | PARTIAL |
@@ -63,7 +64,9 @@ Allowed states are `SUPPORTED`, `PARTIAL`, `BLOCKED_BY_RUT`,
   exact-Content-Length upstream response, custom reason, hidden/synthesized
   headers, duplicate response headers, and preserved trailing value whitespace.
   Dynamic Date is the only normalized response field. This does not cover the
-  unavailable-upstream case required to complete #254.
+  unavailable-upstream case required to complete #254. A separate `%7E`
+  encoded-unreserved vector also preserves the complete raw upstream target and
+  matches the downstream response; encoded slash/dot/malformed cases remain open.
 - Pinned nginx consumes an upstream `Connection` header for absent,
   `keep-alive`, `close`, and token-list vectors, synthesizes one downstream
   connection field, and preserves token-nominated ordinary response headers.

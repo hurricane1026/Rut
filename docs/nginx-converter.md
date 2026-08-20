@@ -128,6 +128,7 @@ downstream responses matched the pinned expected response after normalizing
 only the generated Date.
 
 This is a real nginx -> converter -> RUT -> runtime loop, not general
-`proxy_pass` support. Success GET/POST and bounded unavailable-upstream vectors
-now pass; #254 remains open only while its explicit percent-encoded target
-acceptance vector is audited.
+`proxy_pass` support. The exact bounded #254 fragment now passes success GET,
+encoded-unreserved raw target, fixed-CL POST, response-policy, connection-close,
+and unavailable-upstream vectors. Broader directive semantics remain partial or
+unsupported as recorded in the compatibility matrix.
