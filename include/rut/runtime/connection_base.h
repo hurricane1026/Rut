@@ -512,6 +512,10 @@ struct ConnectionBase {
     // This is reset at the request boundary and is deliberately separate from
     // the route/config lifetime: the bytes are owned by this connection slice.
     u16 request_policy_id;
+    // Non-zero selects the strict H1 response serializer for this request.
+    u16 response_policy_id;
+    // Exact parsed request HTTP version (HttpVersion underlying value).
+    u8 req_http_version; // HttpVersion::Http10/Http11, 255 when unknown.
     // Request-side keep-alive intent of the CURRENT request, as parsed from its
     // request line + Connection header (HTTP/1.1 default true, HTTP/1.0 default
     // false, "Connection: close" → false). The proxy forwards the client's
@@ -769,6 +773,8 @@ struct ConnectionBase {
         response_mutations_snapshotted = false;
         req_malformed = false;
         request_policy_id = 0;
+        response_policy_id = 0;
+        req_http_version = 255;
         req_keep_alive = false;
         req_wants_upgrade = false;
         req_upgrade_is_websocket = false;

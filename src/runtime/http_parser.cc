@@ -383,6 +383,7 @@ ParseStatus HttpParser::parse(const u8* buf, u32 len, ParsedRequest* req) {
         if (UNLIKELY(colon_pos == name_start)) return ParseStatus::Error;
         u32 name_len = colon_pos - name_start;
         pos = colon_pos + 1;
+        const u32 raw_value_start = pos;
 
         // Skip OWS — hot path: single space after colon
         if (UNLIKELY(pos >= len)) goto maybe_incomplete;
@@ -415,6 +416,8 @@ ParseStatus HttpParser::parse(const u8* buf, u32 len, ParsedRequest* req) {
             headers[hdr_count].name = {reinterpret_cast<const char*>(buf + name_start), name_len};
             headers[hdr_count].value = {reinterpret_cast<const char*>(buf + value_start),
                                         value_end - value_start};
+            headers[hdr_count].raw_value = {reinterpret_cast<const char*>(buf + raw_value_start),
+                                            cr_pos - raw_value_start};
             hdr_count++;
 
             // Semantic header detection
@@ -545,8 +548,10 @@ ParseStatus HttpResponseParser::parse(const u8* buf, u32 len, ParsedResponse* re
 
         u8 ver_digit = buf[pos + 7];
         if (LIKELY(ver_digit == '1')) {
+            resp->version = HttpVersion::Http11;
             resp->keep_alive = true;  // HTTP/1.1 default
         } else if (ver_digit == '0') {
+            resp->version = HttpVersion::Http10;
             resp->keep_alive = false;  // HTTP/1.0 default
         } else {
             return ParseStatus::Error;
@@ -571,15 +576,16 @@ ParseStatus HttpResponseParser::parse(const u8* buf, u32 len, ParsedResponse* re
     }
     pos += 3;
 
-    // Skip reason phrase until \r\n
-    // After the 3-digit status code, there should be a SP or \r
+    // Require the RFC status-line separator, then retain the exact reason phrase.
     if (UNLIKELY(pos >= len)) return ParseStatus::Incomplete;
-    // Allow SP before reason phrase, or \r for missing reason
+    if (buf[pos] != ' ' && buf[pos] != '\r') return ParseStatus::Error;
     {
+        const u32 reason_start = (buf[pos] == ' ') ? pos + 1 : pos;
         u32 scan = pos;
         while (scan < len && buf[scan] != '\r') scan++;
         if (UNLIKELY(scan + 1 >= len)) return ParseStatus::Incomplete;
         if (UNLIKELY(buf[scan + 1] != '\n')) return ParseStatus::Error;
+        resp->reason = {reinterpret_cast<const char*>(buf + reason_start), scan - reason_start};
         pos = scan + 2;  // past \r\n
     }
 
@@ -605,6 +611,7 @@ ParseStatus HttpResponseParser::parse(const u8* buf, u32 len, ParsedResponse* re
         if (UNLIKELY(colon_pos == name_start)) return ParseStatus::Error;
         u32 name_len = colon_pos - name_start;
         pos = colon_pos + 1;
+        const u32 raw_value_start = pos;
 
         // Skip OWS
         if (UNLIKELY(pos >= len)) goto maybe_incomplete;
@@ -639,6 +646,8 @@ ParseStatus HttpResponseParser::parse(const u8* buf, u32 len, ParsedResponse* re
                                            name_len};
                 headers[hdr_count].value = {reinterpret_cast<const char*>(buf + value_start),
                                             value_end - value_start};
+                headers[hdr_count].raw_value = {reinterpret_cast<const char*>(buf + raw_value_start),
+                                                cr_pos - raw_value_start};
                 hdr_count++;
             } else {
                 // Beyond capacity: keep parsing (semantic headers still apply
@@ -650,6 +659,9 @@ ParseStatus HttpResponseParser::parse(const u8* buf, u32 len, ParsedResponse* re
             ParseStatus sem = apply_semantic_header_response(
                 buf + name_start, name_len, buf + value_start, value_end - value_start, resp);
             if (UNLIKELY(sem == ParseStatus::Error)) return ParseStatus::Error;
+            if (name_len == 14 && str_ci_eq(buf + name_start + 1, "ontent-length", 13)) {
+                if (resp->content_length_count != 255) resp->content_length_count++;
+            }
         }
 
         pos += 2;  // skip \r\n

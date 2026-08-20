@@ -28,6 +28,9 @@ enum class HttpVersion : u8 {
 struct Header {
     Str name;
     Str value;
+    // Complete wire value after the colon, before semantic OWS trimming.
+    // `value` remains the historical trimmed semantic view.
+    Str raw_value;
 };
 
 // Maximum headers we store per request. Beyond this, parsing returns error.
@@ -109,11 +112,14 @@ struct HttpParser {
 // Parsed HTTP response — all Str fields point into the original recv buffer.
 // Zero-copy: no allocations, no memcpy for headers.
 struct ParsedResponse {
+    HttpVersion version;
+    Str reason;
     u16 status_code;  // 100-599
     u32 header_count;
     Header headers[kMaxHeaders];
     u32 content_length;
     bool has_content_length;
+    u8 content_length_count;
     bool chunked;
     bool keep_alive;        // HTTP/1.1 default true, HTTP/1.0 default false
     bool connection_close;  // explicit Connection: close
@@ -126,10 +132,13 @@ struct ParsedResponse {
     bool headers_truncated;
 
     void reset() {
+        version = HttpVersion::Unknown;
+        reason = {nullptr, 0};
         status_code = 0;
         header_count = 0;
         content_length = 0;
         has_content_length = false;
+        content_length_count = 0;
         chunked = false;
         keep_alive = true;  // HTTP/1.1 default
         connection_close = false;

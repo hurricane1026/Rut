@@ -8973,6 +8973,14 @@ static u64 forward_response_policy_1_handler(void* /*conn*/,
     return rut::jit::HandlerResult::make_forward_with_policies(0, 0, 1).pack();
 }
 
+static u64 forward_request_and_response_policy_handler(void* /*conn*/,
+                                                        rut::jit::HandlerCtx* /*ctx*/,
+                                                        const u8* /*req*/,
+                                                        u32 /*len*/,
+                                                        void* /*arena*/) {
+    return rut::jit::HandlerResult::make_forward_with_policies(0, 1, 1).pack();
+}
+
 static u64 forward_response_policy_with_pending_mutation_handler(
     void* raw_conn, rut::jit::HandlerCtx* /*ctx*/, const u8* /*req*/, u32 /*len*/, void* /*arena*/) {
     auto* conn = static_cast<rut::Connection*>(raw_conn);
@@ -15910,6 +15918,8 @@ struct RecordingUpstream {
     std::atomic<u32> request_count{0};
     char request[8192]{};
     u32 request_len = 0;
+    const char* response = nullptr;
+    u32 response_len = 0;
     bool started = false;
     pthread_t thread{};
 
@@ -15941,7 +15951,9 @@ struct RecordingUpstream {
             s->request_count.fetch_add(1, std::memory_order_release);
             static const char kResponse[] =
                 "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok";
-            (void)send_all(client, kResponse, sizeof(kResponse) - 1);
+            const char* out = s->response ? s->response : kResponse;
+            const u32 out_len = s->response ? s->response_len : sizeof(kResponse) - 1;
+            (void)send_all(client, out, out_len);
             close(client);
         }
         return nullptr;
@@ -16182,6 +16194,7 @@ TEST(route, response_policy_rejects_before_upstream_accept) {
     RouteConfig cfg{};
     auto id = cfg.add_upstream("backend", 0x7F000001, backend.port);
     REQUIRE(id.has_value());
+    REQUIRE(cfg.add_upstream_backend(id.value(), 0x7F000001, backend.port));
     REQUIRE_EQ(cfg.add_response_policy(test_response_policy_spec()), 1u);
     REQUIRE(cfg.add_jit_handler("/api", 'G', &forward_response_policy_1_handler));
     const RouteConfig* active = &cfg;
@@ -16208,6 +16221,64 @@ TEST(route, response_policy_rejects_before_upstream_accept) {
     usleep(100000);
     CHECK_EQ(backend.accepted_count.load(std::memory_order_acquire), 0u);
     CHECK_EQ(backend.request_count.load(std::memory_order_acquire), 0u);
+}
+
+TEST(route, response_policy_serializes_strict_h1_final_response) {
+    using namespace rut;
+    RecordingUpstream backend;
+    static constexpr char kUpstreamResponse[] =
+        "HTTP/1.1 200 Custom Reason\r\n"
+        "Server: upstream\r\n"
+        "Date: Tue, 01 Jan 2030 00:00:00 GMT\r\n"
+        "Content-Length: 2\r\n"
+        "X-TrAcE:  one \t\r\n"
+        "Set-Cookie: a=1\r\n"
+        "Set-Cookie: b=2\r\n"
+        "X-Pad: hidden\r\n\r\nok";
+    backend.response = kUpstreamResponse;
+    backend.response_len = sizeof(kUpstreamResponse) - 1;
+    REQUIRE(backend.setup());
+    RouteConfig cfg{};
+    auto id = cfg.add_upstream("backend", 0x7F000001, backend.port);
+    REQUIRE(id.has_value());
+    auto policy = test_response_policy_spec();
+    policy.hide_headers[policy.hide_header_count++] = {"X-Pad", 5};
+    REQUIRE_EQ(cfg.add_response_policy(policy), 1u);
+    REQUIRE(cfg.add_jit_handler("/api", 'G', &forward_request_and_response_policy_handler));
+    const RouteConfig* active = &cfg;
+    ScopedProxyLoop proxy;
+    REQUIRE(proxy.setup(&active, 1000));
+
+    i32 client = connect_to(proxy.port);
+    REQUIRE_GE(client, 0);
+    set_socket_timeouts(client, 2);
+    static constexpr char kRequest[] = "GET /api HTTP/1.1\r\nHost: client.example\r\n\r\n";
+    REQUIRE(send_all(client, kRequest, sizeof(kRequest) - 1));
+    char response[2048]{};
+    const i32 n = recv_timeout(client, response, sizeof(response), 2000);
+    close(client);
+    REQUIRE_GT(n, 0);
+    // Date is intentionally current and therefore the only dynamic field. Mask
+    // its fixed IMF-fixdate bytes, then compare the complete serialized response.
+    char normalized[2048]{};
+    REQUIRE_LT(static_cast<u32>(n), static_cast<u32>(sizeof(normalized)));
+    memcpy(normalized, response, static_cast<size_t>(n));
+    char* date = strstr(normalized, "Date: ");
+    REQUIRE(date != nullptr);
+    for (u32 i = 0; i < 29 && date[6 + i] != '\r'; i++) date[6 + i] = 'X';
+    static constexpr char kExpected[] =
+        "HTTP/1.1 200 Custom Reason\r\n"
+        "Server: nginx\r\n"
+        "Date: XXXXXXXXXXXXXXXXXXXXXXXXXXXXX\r\n"
+        "Content-Length: 2\r\n"
+        "Connection: keep-alive\r\n"
+        "X-TrAcE: one \t\r\n"
+        "Set-Cookie: a=1\r\n"
+        "Set-Cookie: b=2\r\n\r\nok";
+    CHECK_EQ(static_cast<u32>(n), static_cast<u32>(sizeof(kExpected) - 1));
+    CHECK(memcmp(normalized, kExpected, sizeof(kExpected) - 1) == 0);
+    CHECK_EQ(backend.accepted_count.load(std::memory_order_acquire), 1u);
+    CHECK_EQ(backend.request_count.load(std::memory_order_acquire), 1u);
 }
 
 TEST(route, response_policy_rejects_pending_response_mutation_before_upstream_accept) {

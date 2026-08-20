@@ -17,7 +17,7 @@ Allowed states are `SUPPORTED`, `PARTIAL`, `BLOCKED_BY_RUT`,
 | preserve request method and body | no | no | partial: proxy streaming exists | RUT-only tests, no nginx diff | PARTIAL |
 | nginx default upstream HTTP version and request headers | no | no | partial: explicit fixed HTTP/1.1 header-only policy; #252 | RUT exact recording-upstream and H1/H2 fail-closed tests; no nginx diff | PARTIAL |
 | proxied response status and body | no | no | partial: streaming proxy exists | RUT-only tests, no nginx diff | PARTIAL |
-| nginx default proxied response header policy | no | no | metadata/fail-closed foundation only; serializer missing; #253 | H1/H2 no-fallback tests only | BLOCKED_BY_RUT |
+| nginx default proxied response header policy | no | no | partial: bounded strict H1.1 final-response/content-length serializer; #253 | RUT exact serializer and fail-closed tests; no nginx diff | PARTIAL |
 | single unavailable upstream gateway error | no | no | partial: 502/504 paths exist | RUT-only tests, no nginx diff | PARTIAL |
 | exact, `^~`, regex, or nested locations | no | no | no nginx selection semantics | no | NOT_PLANNED |
 | `proxy_pass` with URI replacement | no | no | literal path rewrite only | no | NOT_PLANNED |
@@ -44,4 +44,9 @@ Allowed states are `SUPPORTED`, `PARTIAL`, `BLOCKED_BY_RUT`,
 - Valid downstream Upgrade requests are intentionally rejected before upstream
   connect in this header-only slice; nginx 1.29.7 strips and proxies Upgrade,
   so that behavior remains PARTIAL.
+- Response policy is intentionally limited to non-HEAD HTTP/1.1 requests and
+  one final HTTP/1.1 response with exact Content-Length. Bodies, Upgrade,
+  absolute-form targets, HTTP/1.0, HTTP/2, interim/no-body statuses, chunking,
+  close-delimited framing, and response mutations remain fail-closed PARTIAL
+  limits.
 - RUT's current unmatched-route response is not nginx's normal 404 behavior.

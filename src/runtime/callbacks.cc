@@ -118,6 +118,7 @@ void capture_request_metadata(Connection& conn) {
     // keep-alive request flips this true. A request we can't strictly parse
     // (fallback path below) must never qualify its upstream fd for pooling.
     conn.req_keep_alive = false;
+    conn.req_http_version = 255;
     conn.req_wants_upgrade = false;
     conn.req_upgrade_is_websocket = false;
     conn.req_header_end = 0;
@@ -133,6 +134,7 @@ void capture_request_metadata(Connection& conn) {
     parser.reset();
     if (parser.parse(data, kLen, &req) == ParseStatus::Complete) {
         conn.req_header_end = parser.header_end;
+        conn.req_http_version = static_cast<u8>(req.version);
         // Require BOTH Connection: upgrade and an Upgrade header — Connection is
         // hop-by-hop, so the token alone is not a valid client upgrade request.
         conn.req_wants_upgrade = req.upgrade && req.has_upgrade_header;

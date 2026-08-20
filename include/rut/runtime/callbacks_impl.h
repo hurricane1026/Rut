@@ -22,6 +22,7 @@
 
 #include <errno.h>
 #include <arpa/inet.h>
+#include <ctime>
 #include <openssl/rand.h>  // RAND_bytes — fresh outbound mask-key seed (terminate mode)
 #include <sys/socket.h>
 #include <unistd.h>
@@ -1044,6 +1045,7 @@ void on_header_received(void* lp, Connection& conn, IoEvent ev) {
     conn.req_header_append_mask = 0;
     conn.req_header_override_overflow = false;
     conn.request_policy_id = 0;
+    conn.response_policy_id = 0;
     conn.resp_header_mutation_pending_count = 0;
     conn.resp_header_mutation_pending_overflow = false;
     conn.resp_header_mutation_count = 0;
@@ -2129,13 +2131,16 @@ void handle_jit_outcome(Loop* loop,
                 reject_request_policy(loop, conn);
                 return;
             }
-            // Response-policy metadata is carried independently from the
-            // request policy. Until response serialization exists, reject
-            // every non-zero response policy before slot allocation/connect;
-            // an invalid ID or a mutation combination must never fall back to
-            // transparent forwarding.
+            // Response-policy metadata is carried independently from the request
+            // policy. The strict serializer owns the response header bytes, so
+            // reserve its slice before allocating a slot or connecting.
             if (outcome.response_policy_id != 0 &&
                 (!config->response_policy_id_is_valid(outcome.response_policy_id) ||
+                 conn.req_http_version != static_cast<u8>(HttpVersion::Http11) ||
+                 conn.req_method == static_cast<u8>(LogHttpMethod::Head) ||
+                 conn.req_path_canon.ptr == nullptr ||
+                 conn.req_wants_upgrade || conn.req_body_mode != BodyMode::None ||
+                 target.addr_count != 1 || target.addrs[0].sin_family != AF_INET ||
                  conn.resp_header_mutation_count != 0 ||
                  conn.resp_header_mutation_pending_count != 0 ||
                  conn.resp_header_mutation_pending_overflow ||
@@ -2144,8 +2149,15 @@ void handle_jit_outcome(Loop* loop,
                 return;
             }
             if (outcome.response_policy_id != 0) {
-                reject_response_policy(loop, conn);
-                return;
+                if (!loop->alloc_response_header_buf(conn)) {
+                    conn.resp_status = kStatusBadGateway;
+                    format_static_response(conn, 502, /*keep_alive=*/false);
+                    conn.keep_alive = false;
+                    conn.transition_to_sending(&on_response_sent<Loop>);
+                    client_send(loop, conn, conn.send_buf.data(), conn.send_buf.len());
+                    return;
+                }
+                conn.response_policy_id = outcome.response_policy_id;
             }
             if (conn.resp_header_mutation_count != 0 && !loop->alloc_response_header_buf(conn)) {
                 conn.resp_status = kStatusInternalServerError;
@@ -3725,6 +3737,14 @@ void on_response_body_recvd(void* lp, Connection& conn, IoEvent ev) {
     if (conn.tls_proxy_stream && conn.tls_send_src) return;
 
     const u32 kDataLen = conn.upstream_recv_buf.len();
+    if (conn.response_policy_id != 0 && conn.resp_body_mode == BodyMode::ContentLength &&
+        kDataLen > conn.resp_body_remaining) {
+        // The strict profile cannot safely recover from bytes beyond its exact
+        // framing. Once headers are committed, close both legs rather than pool
+        // or expose a desynchronized downstream stream.
+        loop->close_conn(conn);
+        return;
+    }
     u32 send_len = kDataLen;
 
     if (conn.resp_body_mode == BodyMode::ContentLength) {
@@ -3871,6 +3891,10 @@ void proxy_stream_complete(Loop* loop, Connection& conn) {
     // check there to avoid needlessly dropping a reusable connection.)
     if (!conn.tls_proxy_stream && conn.upstream_recv_buf.len() > 0)
         conn.upstream_keep_alive = false;
+    if (conn.response_policy_id != 0 && conn.upstream_recv_buf.len() > 0) {
+        loop->close_conn(conn);
+        return;
+    }
     conn.upstream_recv_buf.reset();
     release_upstream_slot(loop, conn);  // free the backend slot promptly
 
@@ -4928,6 +4952,138 @@ inline bool ws_value_has_token(const char* v, u32 vlen, const char* tok, u32 tle
 }
 #endif  // RUT_ENABLE_WEBSOCKET
 
+inline bool response_policy_name_eq(Str name, const char* literal, u32 len) {
+    return name.len == len && http_header_name_eq_ci(name.ptr, name.len, literal, len);
+}
+
+inline bool strict_response_forbidden(Str name) {
+    if (response_policy_name_eq(name, "connection", 10) ||
+        response_policy_name_eq(name, "keep-alive", 10) ||
+        response_policy_name_eq(name, "te", 2) || response_policy_name_eq(name, "trailer", 7) ||
+        response_policy_name_eq(name, "transfer-encoding", 17) ||
+        response_policy_name_eq(name, "upgrade", 7) ||
+        response_policy_name_eq(name, "proxy-connection", 17) ||
+        response_policy_name_eq(name, "location", 8) || response_policy_name_eq(name, "refresh", 7) ||
+        response_policy_name_eq(name, "content-type", 12) ||
+        response_policy_name_eq(name, "last-modified", 13))
+        return true;
+    if (name.len >= 8 && http_header_name_eq_ci(name.ptr, 8, "x-accel-", 8)) return true;
+    return false;
+}
+
+inline bool response_policy_hides(const ForwardResponsePolicySpec& policy, Str name) {
+    for (u32 i = 0; i < policy.hide_header_count; i++) {
+        const Str hidden = policy.hide_headers[i];
+        if (hidden.len == name.len &&
+            http_header_name_eq_ci(hidden.ptr, hidden.len, name.ptr, name.len))
+            return true;
+    }
+    return false;
+}
+
+inline u32 strict_response_dec(char* out, u32 value) {
+    char tmp[10];
+    u32 n = 0;
+    do {
+        tmp[n++] = static_cast<char>('0' + (value % 10));
+        value /= 10;
+    } while (value != 0);
+    for (u32 i = 0; i < n; i++) out[i] = tmp[n - i - 1];
+    return n;
+}
+
+inline u32 strict_response_date(char* out, u64 now_us) {
+    static constexpr const char* kWeek[] = {"Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"};
+    static constexpr const char* kMonth[] = {"Jan", "Feb", "Mar", "Apr", "May", "Jun",
+                                             "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"};
+    time_t t = static_cast<time_t>(now_us / 1000000ULL);
+    struct tm tm;
+    if (gmtime_r(&t, &tm) == nullptr) return 0;
+    char* p = out;
+    auto two = [&](int v) {
+        *p++ = static_cast<char>('0' + v / 10);
+        *p++ = static_cast<char>('0' + v % 10);
+    };
+    for (const char* s = kWeek[tm.tm_wday]; *s; ++s) *p++ = *s;
+    *p++ = ','; *p++ = ' '; two(tm.tm_mday); *p++ = ' ';
+    for (const char* s = kMonth[tm.tm_mon]; *s; ++s) *p++ = *s;
+    *p++ = ' '; int year = tm.tm_year + 1900;
+    *p++ = static_cast<char>('0' + year / 1000); *p++ = static_cast<char>('0' + (year / 100) % 10);
+    *p++ = static_cast<char>('0' + (year / 10) % 10); *p++ = static_cast<char>('0' + year % 10);
+    *p++ = ' '; two(tm.tm_hour); *p++ = ':'; two(tm.tm_min); *p++ = ':'; two(tm.tm_sec);
+    *p++ = ' '; *p++ = 'G'; *p++ = 'M'; *p++ = 'T';
+    return static_cast<u32>(p - out);
+}
+
+inline bool build_strict_response_headers(Connection& conn, const RouteConfig& config,
+                                          const ParsedResponse& resp) {
+    if (conn.response_policy_id == 0 || conn.response_policy_id > config.response_policy_count)
+        return false;
+    const auto& policy = config.response_policies[conn.response_policy_id - 1];
+    if (!response_policy_spec_valid(policy) || resp.version != HttpVersion::Http11 ||
+        resp.status_code < 200 || resp.status_code > 599 || resp.status_code == 204 ||
+        resp.status_code == 205 || resp.status_code == 304 || resp.headers_truncated ||
+        resp.content_length_count != 1 || !resp.has_content_length || resp.chunked)
+        return false;
+    for (u32 i = 0; i < resp.reason.len; i++) {
+        const u8 c = static_cast<u8>(resp.reason.ptr[i]);
+        if ((c < 0x20 && c != '\t') || c == 0x7f) return false;
+    }
+    for (u32 i = 0; i < resp.header_count; i++) {
+        const Str name = resp.headers[i].name;
+        if (strict_response_forbidden(name)) return false;
+    }
+    conn.response_header_buf.reset();
+    auto put = [&](const char* p, u32 n) {
+        return conn.response_header_buf.write(reinterpret_cast<const u8*>(p), n) == n;
+    };
+    auto put_lit = [&](const char* p) { return put(p, static_cast<u32>(__builtin_strlen(p))); };
+    char num[10];
+    char line[32];
+    line[0] = static_cast<char>('0' + resp.status_code / 100);
+    line[1] = static_cast<char>('0' + (resp.status_code / 10) % 10);
+    line[2] = static_cast<char>('0' + resp.status_code % 10);
+    if (!put_lit("HTTP/1.1 ") || !put(line, 3) || !put_lit(" ") ||
+        !put(resp.reason.ptr, resp.reason.len) || !put_lit("\r\nServer: ") ||
+        !put(policy.server.ptr, policy.server.len) || !put_lit("\r\nDate: "))
+        return false;
+    char date[32];
+    const u32 date_len = strict_response_date(date, realtime_us());
+    if (date_len == 0 || !put(date, date_len) || !put_lit("\r\nContent-Length: ")) return false;
+    const u32 num_len = strict_response_dec(num, resp.content_length);
+    if (!put(num, num_len) || !put_lit("\r\nConnection: keep-alive\r\n")) return false;
+    for (u32 i = 0; i < resp.header_count; i++) {
+        const Header& h = resp.headers[i];
+        if (response_policy_name_eq(h.name, "date", 4) || response_policy_name_eq(h.name, "server", 6) ||
+            response_policy_name_eq(h.name, "content-length", 14) || response_policy_hides(policy, h.name))
+            continue;
+        if (!put(h.name.ptr, h.name.len) || !put_lit(": ")) return false;
+        u32 start = 0;
+        while (start < h.raw_value.len && (h.raw_value.ptr[start] == ' ' || h.raw_value.ptr[start] == '\t'))
+            start++;
+        if (!put(h.raw_value.ptr + start, h.raw_value.len - start) || !put_lit("\r\n")) return false;
+    }
+    return put_lit("\r\n");
+}
+
+template <typename Loop>
+inline void reject_strict_response(Loop* loop, Connection& conn) {
+    if (conn.upstream_fd >= 0) {
+        ::close(conn.upstream_fd);
+        conn.upstream_fd = -1;
+        loop->clear_upstream_fd(conn.id);
+    }
+    static const char k502[] = "HTTP/1.1 502 Bad Gateway\r\nContent-Length: 11\r\n"
+                                "Connection: close\r\n\r\nBad Gateway";
+    conn.send_buf.reset();
+    conn.send_buf.write(reinterpret_cast<const u8*>(k502), sizeof(k502) - 1);
+    conn.keep_alive = false;
+    conn.resp_status = kStatusBadGateway;
+    conn.upstream_keep_alive = false;
+    conn.transition_to_sending(&on_response_sent<Loop>);
+    client_send(loop, conn, conn.send_buf.data(), conn.send_buf.len());
+}
+
 template <typename Loop>
 void on_upstream_response(void* lp, Connection& conn, IoEvent ev) {
     auto* loop = static_cast<Loop*>(lp);
@@ -4982,6 +5138,10 @@ void on_upstream_response(void* lp, Connection& conn, IoEvent ev) {
         }
     }
     if (ps == ParseStatus::Error) {
+        if (conn.response_policy_id != 0) {
+            reject_strict_response(loop, conn);
+            return;
+        }
         if (conn.upstream_fd >= 0) {
             ::close(conn.upstream_fd);
             conn.upstream_fd = -1;
@@ -5001,6 +5161,11 @@ void on_upstream_response(void* lp, Connection& conn, IoEvent ev) {
         return;
     }
     conn.resp_status = resp.status_code;
+
+    if (conn.response_policy_id != 0 && resp.status_code == 101) {
+        reject_strict_response(loop, conn);
+        return;
+    }
 
 #if RUT_ENABLE_WEBSOCKET
     // 101 Switching Protocols → WebSocket/Upgrade passthrough. Forward the 101
@@ -5095,6 +5260,36 @@ void on_upstream_response(void* lp, Connection& conn, IoEvent ev) {
         }
         conn.upstream_recv_buf.reset();
         loop->submit_recv_upstream(conn);
+        return;
+    }
+
+    if (conn.response_policy_id != 0) {
+        // This profile is deliberately narrower than transparent forwarding:
+        // only an origin-form HTTP/1.1 non-HEAD request may select it, and the
+        // final response must be a strict self-framed HTTP/1.1 response.
+        if (conn.req_http_version != static_cast<u8>(HttpVersion::Http11) ||
+            conn.req_method == static_cast<u8>(LogHttpMethod::Head) || resp.status_code == 101 ||
+            (resp.status_code >= 100 && resp.status_code < 200) ||
+            conn.resp_header_mutation_count != 0 || conn.resp_header_mutation_pending_count != 0 ||
+            conn.resp_header_mutation_pending_overflow || conn.resp_header_mutation_overflow ||
+            !conn.request_config ||
+            (conn.upstream_recv_buf.len() > resp_parser.header_end &&
+             conn.upstream_recv_buf.len() - resp_parser.header_end > resp.content_length) ||
+            !build_strict_response_headers(conn, *conn.request_config, resp)) {
+            reject_strict_response(loop, conn);
+            return;
+        }
+        conn.resp_body_mode = BodyMode::ContentLength;
+        conn.resp_body_remaining = resp.content_length;
+        conn.upstream_keep_alive = conn.req_keep_alive;
+        const u32 header_len = resp_parser.header_end;
+        conn.upstream_send_len = header_len;
+        conn.resp_body_sent = conn.response_header_buf.len();
+        conn.proxy_resp_started = true;
+        const bool complete = conn.resp_body_remaining == 0;
+        conn.transition_to_sending(complete ? &on_proxy_response_sent<Loop>
+                                             : &on_response_header_sent<Loop>);
+        client_send(loop, conn, conn.response_header_buf.data(), conn.response_header_buf.len());
         return;
     }
 

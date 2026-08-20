@@ -2,6 +2,8 @@
 #include "rut/runtime/simd/simd.h"
 #include "test.h"
 
+#include <string.h>
+
 using namespace rut;
 
 // ============================================================================
@@ -3556,6 +3558,26 @@ TEST(response_parser, basic_200) {
         "\r\n"
         "hello";
     CHECK_EQ(raw[parser.header_end], 'h');
+}
+
+TEST(response_parser, preserves_version_reason_raw_ows_and_cl_count) {
+    HttpResponseParser parser;
+    ParsedResponse resp;
+    auto s = parse_response(
+        "HTTP/1.1 200 Custom Reason\r\n"
+        "X-TrAcE:  one \t\r\n"
+        "Content-Length: 2\r\n"
+        "Content-Length: 2\r\n"
+        "\r\nok",
+        &resp,
+        &parser);
+    CHECK_EQ(static_cast<u8>(s), static_cast<u8>(ParseStatus::Complete));
+    CHECK_EQ(static_cast<u8>(resp.version), static_cast<u8>(HttpVersion::Http11));
+    CHECK_EQ(resp.reason.len, 13u);
+    CHECK(memcmp(resp.reason.ptr, "Custom Reason", 13) == 0);
+    CHECK_EQ(resp.content_length_count, 2u);
+    CHECK_EQ(resp.headers[0].raw_value.len, 7u);
+    CHECK(memcmp(resp.headers[0].raw_value.ptr, "  one \t", 7) == 0);
 }
 
 TEST(response_parser, 404) {
