@@ -713,6 +713,25 @@ static bool starts_with_200(const std::vector<char>& response) {
            memcmp(response.data(), kStatus, sizeof(kStatus) - 1) == 0;
 }
 
+static bool starts_with_400(const std::vector<char>& response) {
+    static constexpr char kStatus[] = "HTTP/1.1 400 ";
+    return response.size() >= sizeof(kStatus) - 1 &&
+           memcmp(response.data(), kStatus, sizeof(kStatus) - 1) == 0;
+}
+
+static void settle_for_invalid_target_side_effects() {
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(500);
+    for (;;) {
+        const auto remaining =
+            std::chrono::duration_cast<std::chrono::milliseconds>(
+                deadline - std::chrono::steady_clock::now())
+                .count();
+        if (remaining <= 0) return;
+        const int wait_ms = remaining > 50 ? 50 : static_cast<int>(remaining);
+        (void)poll(nullptr, 0, wait_ms > 0 ? wait_ms : 1);
+    }
+}
+
 static int missing_prerequisite(const char* message) {
     std::cerr << "SKIP: " << message << "\n";
     const char* required = getenv("RUT_NGINX_DIFFERENTIAL_REQUIRED");
@@ -1015,6 +1034,76 @@ static bool capture_api_case(u16 frontend_port,
                           rut_upstream,
                           error))
         return false;
+    return true;
+}
+
+static bool capture_api_invalid_case(u16 frontend_port,
+                                     u16 backend_port,
+                                     const std::string& source_path,
+                                     const std::string& rut_log_path,
+                                     const std::string& rut_path,
+                                     std::vector<std::vector<char>>& responses,
+                                     std::string& error) {
+    static constexpr const char* kInvalidTargets[] = {
+        "/api", "/api//x", "/api/./x", "/api/%7Euser"};
+    Recorder recorder;
+    if (!recorder.setup(backend_port, 1)) {
+        error = "API invalid-target backend recorder setup failed";
+        return false;
+    }
+
+    ChildGuard process;
+    if (!spawn_child({rut_path, source_path, "--shards", "1", "--no-pin", "--drain", "0"},
+                     rut_log_path,
+                     process.child)) {
+        error = "failed to start production RUT for API invalid-target case";
+        return false;
+    }
+    if (!wait_ready(frontend_port, process.child, error)) return false;
+
+    responses.clear();
+    responses.reserve(4);
+    for (size_t i = 0; i < sizeof(kInvalidTargets) / sizeof(kInvalidTargets[0]); i++) {
+        const std::string request = api_request(kInvalidTargets[i]);
+        const int client = connect_once(frontend_port);
+        std::vector<char> response;
+        std::string vector_error;
+        bool ok = client >= 0;
+        if (ok) ok = send_all(client, request.data(), request.size());
+        if (ok) ok = read_response(client, response, vector_error);
+        if (ok && !starts_with_400(response)) {
+            vector_error = "expected complete HTTP/1.1 400 status line";
+            ok = false;
+        }
+        if (ok) ok = read_eof(client, vector_error);
+        if (client >= 0) close(client);
+        responses.push_back(std::move(response));
+        if (!ok) {
+            error = "RUT invalid-target API vector " + std::to_string(i + 1) + " (" +
+                    kInvalidTargets[i] + ") failed: " +
+                    (vector_error.empty() ? "connect/send failed" : vector_error);
+            return false;
+        }
+    }
+
+    // Keep the RUT process and recorder alive for a fixed interval. Any delayed
+    // connect is a failure, even if no complete request reaches the recorder.
+    settle_for_invalid_target_side_effects();
+    recorder.stop();
+    if (recorder.accepted.load(std::memory_order_acquire) != 0 ||
+        recorder.requests.load(std::memory_order_acquire) != 0 || !recorder.history.empty()) {
+        error = "RUT invalid-target API phase caused an upstream side effect";
+        return false;
+    }
+    if (!stop_child(process.child)) {
+        error = "failed to stop production RUT after API invalid-target case";
+        return false;
+    }
+    if (recorder.accepted.load(std::memory_order_acquire) != 0 ||
+        recorder.requests.load(std::memory_order_acquire) != 0 || !recorder.history.empty()) {
+        error = "RUT invalid-target recorder changed during teardown";
+        return false;
+    }
     return true;
 }
 
@@ -1335,6 +1424,24 @@ int main(int argc, char** argv) {
         }
     }
     std::cerr << "PASS: pinned nginx and RUT /api/ proxy URI replacement case (3 vectors)\n";
+
+    std::vector<std::vector<char>> invalid_api_responses;
+    std::string invalid_api_error;
+    if (!capture_api_invalid_case(api_frontend_port,
+                                  api_backend_port,
+                                  temp.source,
+                                  temp.rut_log,
+                                  argv[1],
+                                  invalid_api_responses,
+                                  invalid_api_error)) {
+        std::cerr << "FAIL [api invalid-target boundary]: " << invalid_api_error << "\n";
+        for (size_t i = 0; i < invalid_api_responses.size(); i++)
+            dump_wire(("RUT invalid-target API response " + std::to_string(i + 1)).c_str(),
+                      invalid_api_responses[i]);
+        dump_log(temp.rut_log, "RUT log");
+        return 1;
+    }
+    std::cerr << "PASS: RUT /api/ out-of-slice targets fail closed (4 vectors, no upstream side effects)\n";
     return 0;
 #endif
 }
