@@ -107,6 +107,10 @@ static u64 h2_timer_then_redirect_handler(void*,
     return jit::HandlerResult::make_yield(7, jit::YieldKind::Timer).pack();
 }
 
+static u64 h2_immediate_redirect_handler(void*, jit::HandlerCtx*, const u8*, u32, void*) {
+    return jit::HandlerResult::make_redirect(1).pack();
+}
+
 static u64 h1_timer_then_redirect_handler(void*,
                                           jit::HandlerCtx* ctx,
                                           const u8*,
@@ -115,6 +119,57 @@ static u64 h1_timer_then_redirect_handler(void*,
     if (ctx != nullptr && ctx->state == 7) return jit::HandlerResult::make_redirect(1).pack();
     return jit::HandlerResult::make_yield(7, jit::YieldKind::Timer).pack();
 }
+
+// Decode the status from a locally staged H2 HEADERS response.  Redirect
+// rejection is deliberately a status-only response, so one complete HEADERS
+// frame is sufficient; malformed/truncated output returns 0 instead of making
+// a weaker length-only assertion pass.
+static u16 h2_staged_status(const u8* data, u32 len, u32 stream_id) {
+    u32 pos = 0;
+    hpack::DynamicTable dyn;
+    dyn.init(kDefaultHeaderTableSize);
+    while (pos + kFrameHeaderSize <= len) {
+        Http2FrameHeader frame;
+        if (parse_frame_header(data + pos, len - pos, &frame) != ParseStatus::Complete) return 0;
+        const u32 frame_total = kFrameHeaderSize + frame.length;
+        if (frame_total < kFrameHeaderSize || frame_total > len - pos) return 0;
+        if (frame.type == static_cast<u8>(Http2FrameType::Headers) &&
+            frame.stream_id == stream_id) {
+            hpack::Header headers[16];
+            u8 scratch[1024];
+            u32 count = 0;
+            if (!hpack::decode_header_block(dyn,
+                                            data + pos + kFrameHeaderSize,
+                                            frame.length,
+                                            scratch,
+                                            sizeof(scratch),
+                                            headers,
+                                            16,
+                                            &count))
+                return 0;
+            for (u32 i = 0; i < count; i++) {
+                if (!headers[i].name.eq({":status", 7})) continue;
+                if (headers[i].value.len != 3) return 0;
+                u16 status = 0;
+                for (u32 j = 0; j < headers[i].value.len; j++) {
+                    if (headers[i].value.ptr[j] < '0' || headers[i].value.ptr[j] > '9') return 0;
+                    status = static_cast<u16>(status * 10 + headers[i].value.ptr[j] - '0');
+                }
+                return status;
+            }
+            return 0;
+        }
+        pos += frame_total;
+    }
+    return 0;
+}
+
+static constexpr char kRedirectRejectedH1[] =
+    "HTTP/1.1 400 Bad Request\r\n"
+    "Content-Length: 11\r\n"
+    "Connection: close\r\n"
+    "\r\n"
+    "Bad Request";
 }  // namespace
 
 // Replacing a header the client sent twice must replace the first AND drop the
@@ -718,21 +773,38 @@ TEST(redirect, h1_foundation_action_rejects_before_upstream) {
     REQUIRE_EQ(cfg.add_redirect_policy(policy), 1u);
 
     const char request[] = "GET /api HTTP/1.1\r\nHost: client\r\n\r\n";
-    auto* conn = setup_target_transform_request(loop, cfg, request, sizeof(request) - 1);
-    REQUIRE(conn != nullptr);
-    conn->request_config = &cfg;
-    loop.backend.clear_ops();
-    JitDispatchOutcome outcome{};
-    outcome.kind = JitDispatchOutcome::Kind::Redirect;
-    outcome.redirect_policy_id = 1;
-    handle_jit_outcome<SmallLoop>(&loop, *conn, outcome, nullptr, true);
+    const u16 policy_ids[] = {0, 1, 2};  // invalid, valid-but-foundation-only, invalid
+    for (const u16 policy_id : policy_ids) {
+        auto* conn = setup_target_transform_request(loop, cfg, request, sizeof(request) - 1);
+        REQUIRE(conn != nullptr);
+        const u32 conn_id = conn->id;
+        conn->request_config = &cfg;
+        loop.backend.clear_ops();
+        JitDispatchOutcome outcome{};
+        outcome.kind = JitDispatchOutcome::Kind::Redirect;
+        outcome.redirect_policy_id = policy_id;
+        handle_jit_outcome<SmallLoop>(&loop, *conn, outcome, nullptr, true);
 
-    CHECK_EQ(conn->resp_status, 400u);
-    CHECK_EQ(conn->state, ConnState::Sending);
-    CHECK_EQ(conn->pending_handler_fn, nullptr);
-    CHECK_EQ(loop.backend.count_ops(MockOp::Connect), 0u);
-    CHECK_EQ(loop.backend.count_ops(MockOp::Send), 1u);
-    loop.free_conn(*conn);
+        CHECK_EQ(conn->resp_status, 400u);
+        CHECK_EQ(conn->state, ConnState::Sending);
+        CHECK_EQ(conn->pending_handler_fn, nullptr);
+        CHECK_EQ(conn->upstream_fd, -1);
+        CHECK_FALSE(conn->upstream_slot_held);
+        CHECK_EQ(loop.backend.count_ops(MockOp::Connect), 0u);
+        CHECK_EQ(loop.backend.count_ops(MockOp::Send), 1u);
+        CHECK_EQ(conn->send_buf.len(), sizeof(kRedirectRejectedH1) - 1);
+        CHECK_EQ(__builtin_memcmp(conn->send_buf.data(),
+                                  kRedirectRejectedH1,
+                                  sizeof(kRedirectRejectedH1) - 1),
+                 0);
+
+        // Complete the local send so the normal non-keepalive close path runs;
+        // merely inspecting ConnState::Sending would not prove cleanup.
+        const u32 response_len = conn->send_buf.len();
+        loop.inject_and_dispatch(
+            make_ev(conn_id, IoEventType::Send, static_cast<i32>(response_len)));
+        CHECK_EQ(loop.free_top, SmallLoop::kMaxConns);
+    }
 }
 
 TEST(target_transform, h2_request_boundary_clears_recorded_effect) {
@@ -819,16 +891,78 @@ TEST(redirect, h2_initial_and_timer_resume_reject_without_proxy) {
                    false,
                    true);
     CHECK_EQ(h2.async_stream, 1u);
+    CHECK_EQ(dispatch.resp_len, 0u);
     CHECK_EQ(loop.backend.count_ops(MockOp::Connect), 0u);
+    CHECK_EQ(loop.backend.count_ops(MockOp::Send), 0u);
 
     conn->pending_handler_fn = &h2_timer_then_redirect_handler;
     conn->handler_state = 7;
     loop.backend.clear_ops();
     h2_resume_jit_handler(&loop, *conn);
     CHECK_EQ(h2.async_stream, 0u);
+    CHECK_EQ(h2.pending_stream, 0u);
+    CHECK_EQ(h2.async_kind, H2AsyncKind::None);
+    CHECK_EQ(h2.async_cfg, nullptr);
+    CHECK_EQ(h2.async_fn, nullptr);
     CHECK_FALSE(conn->epoch_held);
+    CHECK_EQ(conn->pending_handler_fn, nullptr);
     CHECK_EQ(loop.backend.count_ops(MockOp::Connect), 0u);
     CHECK_EQ(loop.backend.count_ops(MockOp::Send), 1u);
+    CHECK_EQ(h2_staged_status(conn->send_buf.data(), conn->send_buf.len(), 1), 400u);
+    loop.free_conn(*conn);
+}
+
+TEST(redirect, h2_immediate_rejects_before_async_or_proxy) {
+    SmallLoop loop;
+    loop.setup();
+    auto* conn = loop.alloc_conn();
+    REQUIRE(conn != nullptr);
+    RouteConfig cfg{};
+    RedirectPolicySpec policy{};
+    policy.scheme = RedirectPolicyScheme::Http;
+    policy.authority = RedirectPolicyAuthority::RequestHost;
+    policy.port = RedirectPolicyPort::ActualListener;
+    policy.path = RedirectPolicyPath::Static;
+    policy.query = RedirectPolicyQuery::PreserveRaw;
+    policy.date = RedirectPolicyDate::Current;
+    policy.connection = RedirectPolicyConnection::Close;
+    policy.status_code = 301;
+    policy.reason = {"Moved Permanently", 16};
+    policy.server = {"rut", 3};
+    policy.content_type = {"text/html", 9};
+    policy.target_path = {"/api/", 5};
+    REQUIRE_EQ(cfg.add_redirect_policy(policy), 1u);
+    Http2Conn h2{};
+    h2.init();
+    conn->h2 = &h2;
+    RouteEntry route{};
+    route.fn = &h2_immediate_redirect_handler;
+    const u8 synth[] = "GET /api HTTP/1.1\r\nHost: x\r\n\r\n";
+    u8 response[8192]{};
+    H2Dispatch<SmallLoop> dispatch{&loop, conn, response, sizeof(response), 0, false};
+    loop.backend.clear_ops();
+
+    h2_invoke_emit(dispatch,
+                   1,
+                   &route,
+                   nullptr,
+                   0,
+                   &cfg,
+                   synth,
+                   sizeof(synth) - 1,
+                   false,
+                   true);
+
+    CHECK_EQ(h2_staged_status(dispatch.resp, dispatch.resp_len, 1), 400u);
+    CHECK_EQ(h2.async_stream, 0u);
+    CHECK_EQ(h2.pending_stream, 0u);
+    CHECK_EQ(h2.async_kind, H2AsyncKind::None);
+    CHECK_EQ(h2.async_cfg, nullptr);
+    CHECK_EQ(h2.async_fn, nullptr);
+    CHECK_FALSE(conn->epoch_held);
+    CHECK_EQ(conn->pending_handler_fn, nullptr);
+    CHECK_EQ(loop.backend.count_ops(MockOp::Connect), 0u);
+    CHECK_EQ(loop.backend.count_ops(MockOp::Send), 0u);
     loop.free_conn(*conn);
 }
 
@@ -873,6 +1007,11 @@ TEST(redirect, h1_timer_resume_rejects_without_proxy) {
     CHECK_EQ(conn->pending_handler_fn, nullptr);
     CHECK_EQ(loop.backend.count_ops(MockOp::Connect), 0u);
     CHECK_EQ(loop.backend.count_ops(MockOp::Send), 1u);
+    CHECK_EQ(conn->send_buf.len(), sizeof(kRedirectRejectedH1) - 1);
+    CHECK_EQ(__builtin_memcmp(conn->send_buf.data(),
+                              kRedirectRejectedH1,
+                              sizeof(kRedirectRejectedH1) - 1),
+             0);
     loop.free_conn(*conn);
 }
 
