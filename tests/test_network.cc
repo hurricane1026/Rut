@@ -1219,6 +1219,8 @@ TEST(redirect, h1_timer_resume_uses_pinned_config_and_succeeds) {
         "http://example.test:8080/api/");
     CHECK_EQ(conn->send_buf.len(), static_cast<u32>(expected.size()));
     CHECK_EQ(__builtin_memcmp(normalized, expected.data(), expected.size()), 0);
+    CHECK_EQ(conn->upstream_fd, -1);
+    CHECK_FALSE(conn->upstream_slot_held);
     CHECK_EQ(loop.backend.count_ops(MockOp::Connect), 0u);
     CHECK_EQ(count_upstream_send_ops(loop, *conn), 0u);
     CHECK_EQ(loop.backend.count_ops(MockOp::Send), 1u);
