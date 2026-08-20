@@ -547,10 +547,15 @@ int main(int argc, char** argv) {
     }
 #endif
 
+    const ListenerTransport cli_transport =
+        tls_server != nullptr ? ListenerTransport::Tls : ListenerTransport::Cleartext;
     auto resolved_listener = resolve_listener_spec(
-        source_listener_present, source_listener, cli_port_present, cli_port);
+        source_listener_present, source_listener, cli_port_present, cli_port, cli_transport);
     if (!resolved_listener) {
-        write_str("Conflicting source and CLI listen ports\n");
+        if (resolved_listener.error() == ListenerResolutionError::ConflictingTransport)
+            write_str("Conflicting source cleartext listener and CLI TLS\n");
+        else
+            write_str("Conflicting source and CLI listen ports\n");
 #ifdef RUT_ENABLE_JIT
         program.destroy();
 #endif
@@ -558,6 +563,14 @@ int main(int argc, char** argv) {
         return 1;
     }
     const ListenerSpec listener = resolved_listener.value();
+    if ((listener.transport == ListenerTransport::Tls) != (tls_server != nullptr)) {
+        write_str("Resolved listener transport does not match CLI TLS settings\n");
+#ifdef RUT_ENABLE_JIT
+        program.destroy();
+#endif
+        destroy_tls_server_context(tls_server);
+        return 1;
+    }
 #ifdef RUT_ENABLE_JIT
     if (route_config != nullptr) {
         // Loading is side-effect free with respect to live Cache state. This

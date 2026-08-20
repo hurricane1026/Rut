@@ -126,6 +126,9 @@ route GET "/health" { return 200 }
 
 An explicit CLI port may repeat an equivalent source declaration. If both are
 present and differ, startup fails rather than silently choosing one.
+Because a source listener is explicitly cleartext, `--tls-cert`/`--tls-key`
+cannot be combined with a source `listen` declaration; CLI-only TLS remains
+supported.
 
 Then:
 

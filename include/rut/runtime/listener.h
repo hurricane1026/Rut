@@ -15,6 +15,7 @@ enum class ListenerAddress : u8 {
 
 enum class ListenerTransport : u8 {
     Cleartext,
+    Tls,
 };
 
 struct ListenerSpec {
@@ -29,6 +30,7 @@ struct ListenerSpec {
 
 enum class ListenerResolutionError : u8 {
     ConflictingPorts,
+    ConflictingTransport,
 };
 
 // Resolve immutable startup listener metadata from the optional source
@@ -39,13 +41,18 @@ inline core::Expected<ListenerSpec, ListenerResolutionError> resolve_listener_sp
     bool source_present,
     const ListenerSpec& source,
     bool cli_present,
-    u16 cli_port) {
-    if (!source_present && !cli_present) return ListenerSpec{};
+    u16 cli_port,
+    ListenerTransport cli_transport = ListenerTransport::Cleartext) {
+    const bool cli_listener_present = cli_present || cli_transport == ListenerTransport::Tls;
+    if (!source_present && !cli_listener_present) return ListenerSpec{};
     if (!source_present) {
         ListenerSpec result{};
-        result.port = cli_port;
+        result.port = cli_present ? cli_port : ListenerSpec{}.port;
+        result.transport = cli_transport;
         return result;
     }
+    if (cli_listener_present && source.transport != cli_transport)
+        return core::make_unexpected(ListenerResolutionError::ConflictingTransport);
     if (!cli_present) return source;
     ListenerSpec cli = source;
     cli.port = cli_port;
