@@ -86,6 +86,10 @@ auto invalid(Span span, Str detail) {
     return frontend_error(FrontendError::UnexpectedToken, span, detail);
 }
 
+auto invalid_integer(Span span, Str detail) {
+    return frontend_error(FrontendError::InvalidInteger, span, detail);
+}
+
 auto unsupported(Span span, Str detail) {
     return frontend_error(FrontendError::UnsupportedSyntax, span, detail);
 }
@@ -103,7 +107,7 @@ public:
         if (cur_.kind != TokenKind::Word) return invalid(cur_.span, lit_str("expected server"));
         if (eq(cur_.text, "http", 4) || eq(cur_.text, "events", 6))
             return unsupported(cur_.span, lit_str("http/events wrappers are unsupported"));
-        if (!eq(cur_.text, "server", 6)) return unsupported(cur_.span, lit_str("expected server"));
+        if (!eq(cur_.text, "server", 6)) return invalid(cur_.span, lit_str("expected server"));
 
         const Span start = cur_.span;
         advance();
@@ -168,8 +172,15 @@ private:
         const Token port = cur_;
         if (contains(port.text, '$')) return unsupported(port.span, lit_str("variables are unsupported"));
         u16 value = 0;
-        if (!parse_port(port.text, &value)) return invalid(port.span, lit_str("invalid listen port"));
+        if (!parse_port(port.text, &value))
+            return invalid_integer(port.span, lit_str("invalid listen port"));
         advance();
+        if (cur_.kind == TokenKind::End)
+            return missing(cur_.span, lit_str("expected ';' after listen"));
+        if (cur_.kind == TokenKind::Word &&
+            (eq(cur_.text, "listen", 6) || eq(cur_.text, "location", 8) ||
+             eq(cur_.text, "server", 6)))
+            return invalid(cur_.span, lit_str("expected ';' after listen"));
         if (cur_.kind != TokenKind::Semicolon)
             return unsupported(cur_.span, lit_str("listen options are unsupported"));
         const Span end = cur_.span;
@@ -180,7 +191,10 @@ private:
     FrontendResult<Location> parse_location() {
         const Span start = cur_.span;
         advance();
-        if (cur_.kind != TokenKind::Word) return missing(cur_.span, lit_str("location requires a path"));
+        if (cur_.kind == TokenKind::End)
+            return missing(cur_.span, lit_str("location requires a path"));
+        if (cur_.kind != TokenKind::Word)
+            return invalid(cur_.span, lit_str("location requires a path"));
         const Token path = cur_;
         if (eq(path.text, "=", 1) || eq(path.text, "^~", 2) || eq(path.text, "~", 1) ||
             eq(path.text, "~*", 2))
@@ -217,15 +231,25 @@ private:
     FrontendResult<ProxyPass> parse_proxy_pass() {
         const Span start = cur_.span;
         advance();
-        if (cur_.kind != TokenKind::Word) return missing(cur_.span, lit_str("proxy_pass requires an upstream"));
+        if (cur_.kind == TokenKind::End)
+            return missing(cur_.span, lit_str("proxy_pass requires an upstream"));
+        if (cur_.kind != TokenKind::Word)
+            return invalid(cur_.span, lit_str("proxy_pass requires an upstream"));
         const Token url = cur_;
         if (contains(url.text, '$')) return unsupported(url.span, lit_str("variables are unsupported"));
         ProxyPass result{};
-        if (!parse_url(url.text, result))
+        const UrlParseStatus url_status = parse_url(url.text, result);
+        if (url_status == UrlParseStatus::InvalidInteger)
+            return invalid_integer(url.span, lit_str("invalid upstream IPv4 address or port"));
+        if (url_status == UrlParseStatus::UriSuffix)
+            return unsupported(url.span, lit_str("proxy_pass URI suffixes are unsupported"));
+        if (url_status != UrlParseStatus::Ok)
             return unsupported(url.span, lit_str("only literal IPv4 HTTP upstreams are supported"));
         advance();
+        if (cur_.kind == TokenKind::End)
+            return missing(cur_.span, lit_str("expected ';' after proxy_pass"));
         if (cur_.kind != TokenKind::Semicolon)
-            return unsupported(cur_.span, lit_str("proxy_pass URI suffix/options are unsupported"));
+            return invalid(cur_.span, lit_str("expected ';' after proxy_pass"));
         const Span end = cur_.span;
         advance();
         result.span = Span{start.start, end.end, start.line, start.col};
@@ -245,28 +269,37 @@ private:
         return true;
     }
 
-    static bool parse_url(Str text, ProxyPass& out) {
+    enum class UrlParseStatus : u8 { Ok, InvalidInteger, UriSuffix, Unsupported };
+
+    static UrlParseStatus parse_url(Str text, ProxyPass& out) {
         constexpr Str kPrefix = lit_str("http://");
-        if (text.len <= kPrefix.len || !text.slice(0, kPrefix.len).eq(kPrefix)) return false;
+        if (text.len <= kPrefix.len || !text.slice(0, kPrefix.len).eq(kPrefix))
+            return UrlParseStatus::Unsupported;
         u32 pos = kPrefix.len;
+        if (text.ptr[pos] < '0' || text.ptr[pos] > '9') return UrlParseStatus::Unsupported;
         for (u32 octet = 0; octet < 4; octet++) {
-            if (pos >= text.len) return false;
+            if (pos >= text.len) return UrlParseStatus::InvalidInteger;
             u32 value = 0;
             u32 digits = 0;
             while (pos < text.len && text.ptr[pos] >= '0' && text.ptr[pos] <= '9') {
                 value = value * 10u + static_cast<u32>(text.ptr[pos++] - '0');
-                if (++digits > 3 || value > 255u) return false;
+                if (++digits > 3 || value > 255u) return UrlParseStatus::InvalidInteger;
             }
-            if (digits == 0) return false;
+            if (digits == 0) return UrlParseStatus::InvalidInteger;
             out.address[octet] = static_cast<u8>(value);
             if (octet < 3) {
-                if (pos >= text.len || text.ptr[pos++] != '.') return false;
+                if (pos >= text.len || text.ptr[pos++] != '.')
+                    return UrlParseStatus::InvalidInteger;
             }
         }
-        if (pos >= text.len || text.ptr[pos++] != ':') return false;
-        const Str port = text.slice(pos, text.len);
-        if (!parse_port(port, &out.port)) return false;
-        return true;
+        if (pos >= text.len || text.ptr[pos++] != ':') return UrlParseStatus::InvalidInteger;
+        const u32 port_start = pos;
+        while (pos < text.len && text.ptr[pos] >= '0' && text.ptr[pos] <= '9') pos++;
+        if (port_start == pos) return UrlParseStatus::InvalidInteger;
+        if (!parse_port(text.slice(port_start, pos), &out.port))
+            return UrlParseStatus::InvalidInteger;
+        if (pos == text.len) return UrlParseStatus::Ok;
+        return text.ptr[pos] == '/' ? UrlParseStatus::UriSuffix : UrlParseStatus::InvalidInteger;
     }
 
     Lexer lexer_;
