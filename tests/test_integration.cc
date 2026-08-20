@@ -15933,12 +15933,15 @@ struct RecordingUpstream {
     std::atomic<bool> running{false};
     std::atomic<u32> accepted_count{0};
     std::atomic<u32> request_count{0};
-    char request[8192]{};
+    // Match the production connection slice so the exact fixed-CL boundary can
+    // be recorded without truncating the request under test.
+    static constexpr u32 kRequestCapacity = SlicePool::kSliceSize;
+    char request[kRequestCapacity]{};
     u32 request_len = 0;
     u32 request_header_len = 0;
     u32 request_body_len = 0;
     static constexpr u32 kMaxRecordedRequests = 8;
-    char request_history[kMaxRecordedRequests][8192]{};
+    char request_history[kMaxRecordedRequests][kRequestCapacity]{};
     u32 request_history_len[kMaxRecordedRequests]{};
     u32 request_history_header_len[kMaxRecordedRequests]{};
     const char* response = nullptr;
@@ -15970,7 +15973,7 @@ struct RecordingUpstream {
                 break;
             }
             s->accepted_count.fetch_add(1, std::memory_order_release);
-            char buf[8192];
+            char buf[kRequestCapacity];
             u32 total = 0;
             u32 want = 0;
             while (total < sizeof(buf)) {
@@ -16416,6 +16419,11 @@ TEST(route, request_policy_buffers_fixed_content_length_body) {
         {"POST /api HTTP/1.1\r\nHost: x\r\nContent-Length: 5\r\n"
          "Content-Length: 5\r\n\r\nhello",
          0},
+        // Hop/control fields are rejected even when no Content-Length is
+        // present; they must not bypass the policy preflight's no-CL path.
+        {"POST /api HTTP/1.1\r\nHost: x\r\nTE: trailers\r\n\r\n", 0},
+        {"POST /api HTTP/1.1\r\nHost: x\r\nExpect: 100-continue\r\n\r\n", 0},
+        {"POST /api HTTP/1.1\r\nHost: x\r\nUpgrade: websocket\r\n\r\n", 0},
         {"POST /api HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: identity\r\n\r\n",
          0},
         {"POST /api HTTP/1.1\r\nHost: x\r\nTE: trailers\r\nContent-Length: 0\r\n\r\n",
@@ -16455,6 +16463,125 @@ TEST(route, request_policy_buffers_fixed_content_length_body) {
     CHECK_EQ(backend.accepted_count.load(std::memory_order_acquire), accepted_before);
     CHECK_EQ(backend.request_count.load(std::memory_order_acquire), requests_before);
     close(client);
+}
+
+TEST(route, request_policy_fixed_body_exact_buffer_boundary) {
+    using namespace rut;
+    RecordingUpstream backend;
+    REQUIRE(backend.setup());
+    RouteConfig cfg{};
+    auto id = cfg.add_upstream("backend", 0x7F000001, backend.port);
+    REQUIRE(id.has_value());
+    REQUIRE(cfg.add_jit_handler("/api", 0, &forward_request_policy_1_handler));
+    const RouteConfig* active = &cfg;
+    ScopedProxyLoop proxy;
+    REQUIRE(proxy.setup(&active, 1000));
+
+    // The preflight and materializer each have a 16 KiB slice. The original
+    // request uses a short client Host while the rebuilt request uses the
+    // selected IPv4:port authority, so derive the actual maximum from both
+    // header lengths rather than assuming the two layouts are equal. The
+    // Content-Length digit count is part of each header, so iterate to the
+    // fixed point at the decimal-width boundary.
+    // Include the actual runtime recorder port in the rebuilt authority.
+    auto actual_header_len = [&](u32 body_len, bool rebuilt) -> u32 {
+        char header[256];
+        const int n = snprintf(header,
+                               sizeof(header),
+                               "POST /api HTTP/1.1\r\nHost: %s\r\nContent-Length: %u\r\n\r\n",
+                               rebuilt ? "127.0.0.1" : "x",
+                               body_len);
+        CHECK_GT(n, 0);
+        if (n <= 0) return 0;
+        u32 result = static_cast<u32>(n);
+        if (rebuilt && backend.port != 80) {
+            // The production policy appends :<port> to the IPv4 authority for
+            // this non-default test port.
+            char authority[32];
+            const int authority_len = snprintf(authority, sizeof(authority), ":%u", backend.port);
+            CHECK_GT(authority_len, 0);
+            if (authority_len <= 0) return result;
+            result += static_cast<u32>(authority_len);
+        }
+        return result;
+    };
+    u32 body_len = SlicePool::kSliceSize;
+    for (u32 i = 0; i < 8; i++) {
+        const u32 original = actual_header_len(body_len, false);
+        const u32 rebuilt = actual_header_len(body_len, true);
+        const u32 next = SlicePool::kSliceSize - std::max(original, rebuilt);
+        if (next == body_len) break;
+        body_len = next;
+    }
+    const u32 original_header_len = actual_header_len(body_len, false);
+    const u32 rebuilt_header_len = actual_header_len(body_len, true);
+    REQUIRE_EQ(body_len + std::max(original_header_len, rebuilt_header_len),
+               SlicePool::kSliceSize);
+
+    char request_header[256];
+    const int request_header_len = snprintf(request_header,
+                                            sizeof(request_header),
+                                            "POST /api HTTP/1.1\r\nHost: x\r\n"
+                                            "Content-Length: %u\r\n\r\n",
+                                            body_len);
+    REQUIRE_GT(request_header_len, 0);
+    const u32 request_len = static_cast<u32>(request_header_len) + body_len;
+    std::unique_ptr<u8[]> request(new u8[request_len]);
+    memcpy(request.get(), request_header, static_cast<size_t>(request_header_len));
+    for (u32 i = 0; i < body_len; i++) request[request_header_len + i] = static_cast<u8>(i * 29u + 7u);
+
+    i32 client = connect_to(proxy.port);
+    REQUIRE_GE(client, 0);
+    set_socket_timeouts(client, 3);
+    REQUIRE(send_all(client,
+                     reinterpret_cast<const char*>(request.get()),
+                     request_len));
+    char response[512];
+    const i32 response_len = recv_timeout(client, response, sizeof(response), 3000);
+    REQUIRE_GT(response_len, 0);
+    CHECK(buf_contains(response, static_cast<u32>(response_len), "200", 3));
+    close(client);
+
+    for (u32 i = 0; i < 400 && backend.request_count.load(std::memory_order_acquire) < 1; i++)
+        usleep(5000);
+    REQUIRE_EQ(backend.accepted_count.load(std::memory_order_acquire), 1u);
+    REQUIRE_EQ(backend.request_count.load(std::memory_order_acquire), 1u);
+    CHECK_EQ(backend.request_len, SlicePool::kSliceSize);
+    CHECK_EQ(backend.request_body_len, body_len);
+    CHECK_EQ(backend.request_header_len, rebuilt_header_len);
+    for (u32 i = 0; i < body_len; i++)
+        CHECK_EQ(static_cast<u8>(backend.request[backend.request_header_len + i]),
+                 static_cast<u8>(i * 29u + 7u));
+
+    // The adjacent value must fail policy validation before an upstream accept.
+    // This specifically covers the one-byte boundary, not merely a distant
+    // large Content-Length rejection.
+    const u32 accepted_before = backend.accepted_count.load(std::memory_order_acquire);
+    const u32 requests_before = backend.request_count.load(std::memory_order_acquire);
+    char over_header[256];
+    const u32 over_body_len = body_len + 1;
+    const int over_header_len = snprintf(over_header,
+                                         sizeof(over_header),
+                                         "POST /api HTTP/1.1\r\nHost: x\r\n"
+                                         "Content-Length: %u\r\n\r\n",
+                                         over_body_len);
+    REQUIRE_GT(over_header_len, 0);
+    const u32 over_len = static_cast<u32>(over_header_len) + over_body_len;
+    std::unique_ptr<u8[]> over_request(new u8[over_len]);
+    memcpy(over_request.get(), over_header, static_cast<size_t>(over_header_len));
+    memset(over_request.get() + over_header_len, 0xA5, over_body_len);
+    client = connect_to(proxy.port);
+    REQUIRE_GE(client, 0);
+    set_socket_timeouts(client, 2);
+    REQUIRE(send_all(client, reinterpret_cast<const char*>(over_request.get()), over_len));
+    char rejected[512];
+    const i32 rejected_len = recv_timeout(client, rejected, sizeof(rejected), 2000);
+    CHECK(rejected_len > 0 &&
+          buf_contains(rejected, static_cast<u32>(rejected_len), "400", 3));
+    close(client);
+    usleep(100000);
+    CHECK_EQ(backend.accepted_count.load(std::memory_order_acquire), accepted_before);
+    CHECK_EQ(backend.request_count.load(std::memory_order_acquire), requests_before);
 }
 
 TEST(shard, serves_http2_jit_request_policy_fails_closed) {
