@@ -17,7 +17,7 @@ Allowed states are `SUPPORTED`, `PARTIAL`, `BLOCKED_BY_RUT`,
 | preserve request method and body | no | no | partial: proxy streaming exists | RUT-only tests, no nginx diff | PARTIAL |
 | nginx default upstream HTTP version and request headers | no | no | partial: explicit fixed HTTP/1.1 header-only policy; #252 | RUT exact recording-upstream and H1/H2 fail-closed tests; no nginx diff | PARTIAL |
 | proxied response status and body | no | no | partial: streaming proxy exists | RUT-only tests, no nginx diff | PARTIAL |
-| nginx default proxied response header policy | no | no | missing response policy; #253 | no | BLOCKED_BY_RUT |
+| nginx default proxied response header policy | no | no | metadata/fail-closed foundation only; serializer missing; #253 | H1/H2 no-fallback tests only | BLOCKED_BY_RUT |
 | single unavailable upstream gateway error | no | no | partial: 502/504 paths exist | RUT-only tests, no nginx diff | PARTIAL |
 | exact, `^~`, regex, or nested locations | no | no | no nginx selection semantics | no | NOT_PLANNED |
 | `proxy_pass` with URI replacement | no | no | literal path rewrite only | no | NOT_PLANNED |
