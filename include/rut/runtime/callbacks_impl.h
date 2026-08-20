@@ -2165,8 +2165,61 @@ void handle_jit_outcome(Loop* loop,
             // match the indexing the handler compiled against.
             const RouteConfig* config = conn.request_config;
             if (conn.target_transform_recorded) {
-                // Resolve and materialize against the pinned table before target
-                // access and every upstream side effect. Forged IDs and inputs
+                // Validate every deterministic Forward reference and the bounded
+                // transform domain before touching recv_buf. The transform is
+                // deliberately last: policy rebuilding and response snapshots
+                // must never observe a partially or incorrectly validated target.
+                if (config == nullptr || outcome.upstream_id >= config->upstream_count) {
+                    reject_request_policy(loop, conn);
+                    return;
+                }
+                u16 target_response_policy_id = outcome.response_policy_id;
+                u16 target_failure_policy_id = outcome.failure_policy_id;
+                if (outcome.policy_bundle_id != 0) {
+                    if (!config->policy_bundle_id_is_valid(outcome.policy_bundle_id)) {
+                        reject_response_policy(loop, conn);
+                        return;
+                    }
+                    const auto& bundle = config->policy_bundles[outcome.policy_bundle_id - 1];
+                    target_response_policy_id = bundle.response_policy_id;
+                    target_failure_policy_id = bundle.failure_policy_id;
+                }
+                if ((target_response_policy_id != 0 &&
+                     !config->response_policy_id_is_valid(target_response_policy_id)) ||
+                    (target_failure_policy_id != 0 &&
+                     !config->failure_policy_id_is_valid(target_failure_policy_id)) ||
+                    (outcome.request_policy_id != 0 &&
+                     (!request_policy_is_supported(outcome.request_policy_id) ||
+                      inspect_request_policy_body(conn, outcome.request_policy_id) !=
+                          RequestPolicyBodyState::Complete))) {
+                    reject_response_policy(loop, conn);
+                    return;
+                }
+                const auto& target = config->upstreams[outcome.upstream_id];
+                bool response_policy_request_connection = false;
+                if (target_response_policy_id != 0) {
+                    response_policy_request_connection =
+                        config->response_policies[target_response_policy_id - 1].connection ==
+                        ResponsePolicyConnection::Request;
+                }
+                if (target.addr_count != 1 || target.addrs[0].sin_family != AF_INET ||
+                    conn.req_http_version != static_cast<u8>(HttpVersion::Http11) ||
+                    conn.req_method == static_cast<u8>(LogHttpMethod::Head) || conn.tls_active ||
+                    conn.req_path_canon.ptr == nullptr || conn.req_wants_upgrade ||
+                    conn.req_body_mode != BodyMode::None || conn.req_body_remaining != 0 ||
+                    conn.request_body_fully_buffered ||
+                    (target_response_policy_id != 0 && !response_policy_request_connection &&
+                     !conn.req_keep_alive) ||
+                    conn.req_header_override_count != 0 || conn.req_header_override_overflow ||
+                    conn.resp_header_mutation_count != 0 ||
+                    conn.resp_header_mutation_pending_count != 0 ||
+                    conn.resp_header_mutation_pending_overflow ||
+                    conn.resp_header_mutation_overflow) {
+                    reject_request_policy(loop, conn);
+                    return;
+                }
+                // Resolve and materialize against the pinned table only after all
+                // references and domain guards have passed. Forged IDs and inputs
                 // outside the bounded clean H1 domain remain fail-closed.
                 if (config == nullptr || !materialize_request_target_transform(conn, *config)) {
                     reject_request_policy(loop, conn);
@@ -2810,8 +2863,12 @@ inline bool materialize_request_target_transform(Connection& conn, const RouteCo
     if (!conn.target_transform_recorded) return true;
     if (!config.target_transform_id_is_valid(conn.target_transform_id) ||
         conn.protocol == ConnProtocol::Http2 || conn.tls_active || conn.req_path_overridden ||
+        conn.req_http_version != static_cast<u8>(HttpVersion::Http11) ||
+        conn.req_method == static_cast<u8>(LogHttpMethod::Head) ||
         conn.req_body_mode != BodyMode::None || conn.req_body_remaining != 0 ||
-        conn.req_malformed || conn.req_wants_upgrade ||
+        conn.request_body_fully_buffered || conn.req_malformed || conn.req_wants_upgrade ||
+        conn.req_header_override_count != 0 || conn.req_header_override_overflow ||
+        conn.resp_header_mutation_count != 0 ||
         conn.resp_header_mutation_pending_count != 0 ||
         conn.resp_header_mutation_pending_overflow || conn.resp_header_mutation_overflow)
         return false;
@@ -2828,7 +2885,24 @@ inline bool materialize_request_target_transform(Connection& conn, const RouteCo
         req.upgrade || req.has_upgrade_header || parser.header_end != conn.req_header_end ||
         conn.req_initial_send_len != parser.header_end)
         return false;
-    if (req.version != HttpVersion::Http10 && req.version != HttpVersion::Http11) return false;
+    auto header_name_eq = [](const Str& name, const char* literal, u32 literal_len) {
+        if (name.len != literal_len) return false;
+        for (u32 i = 0; i < name.len; i++) {
+            u8 a = static_cast<u8>(name.ptr[i]);
+            u8 b = static_cast<u8>(literal[i]);
+            if (a >= 'A' && a <= 'Z') a = static_cast<u8>(a + ('a' - 'A'));
+            if (b >= 'A' && b <= 'Z') b = static_cast<u8>(b + ('a' - 'A'));
+            if (a != b) return false;
+        }
+        return true;
+    };
+    for (u32 i = 0; i < req.header_count; i++) {
+        const Str name = req.headers[i].name;
+        if (header_name_eq(name, "transfer-encoding", 17) ||
+            header_name_eq(name, "te", 2) || header_name_eq(name, "expect", 6))
+            return false;
+    }
+    if (req.version != HttpVersion::Http11) return false;
 
     const uintptr_t base = reinterpret_cast<uintptr_t>(data);
     const uintptr_t limit = base + total;
@@ -2838,6 +2912,10 @@ inline bool materialize_request_target_transform(Connection& conn, const RouteCo
     const u32 target_start = static_cast<u32>(path_addr - base);
     const u32 target_len = req.path.len;
     if (target_len == 0 || data[target_start] != '/') return false;
+
+    for (u32 i = 0; i < target_len; i++) {
+        if (data[target_start + i] == '#') return false;
+    }
 
     u32 path_len = target_len;
     for (u32 i = 0; i < target_len; i++) {
@@ -2878,13 +2956,6 @@ inline bool materialize_request_target_transform(Connection& conn, const RouteCo
     if (new_target_len > 0xffffffffu || final_total < 0 ||
         static_cast<u64>(final_total) > conn.recv_buf.capacity())
         return false;
-
-    // Response mutation values may borrow recv_buf. Pin them before the target
-    // splice, and make any later reused-socket retry non-replayable because the
-    // snapshot necessarily predates this independent target transform.
-    if (conn.resp_header_mutation_count != 0) {
-        if (!snapshot_response_mutations_before_request_rewrite(conn)) return false;
-    }
 
     const u32 target_end = target_start + target_len;
     const u32 new_target_end = target_start + static_cast<u32>(new_target_len);

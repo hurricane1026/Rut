@@ -518,6 +518,142 @@ TEST(target_transform, h1_invalid_materialization_has_no_upstream_side_effect) {
     loop.free_conn(*conn);
 }
 
+TEST(target_transform, h1_forward_preflight_rejects_before_materialization) {
+    SmallLoop loop;
+    loop.setup();
+    RouteConfig cfg{};
+    REQUIRE(cfg.add_upstream("backend", 0x7F000001, 8080).has_value());
+    char strip[] = "/api/";
+    char replace[] = "/v1/";
+    REQUIRE_EQ(cfg.add_target_transform({{strip, 5}, {replace, 4}}), 1u);
+
+    auto reject = [&](const char* request, auto&& mutate, auto&& mutate_outcome) {
+        auto* conn = setup_target_transform_request(loop, cfg, request,
+                                                     static_cast<u32>(strlen(request)));
+        if (conn == nullptr) {
+            CHECK(conn != nullptr);
+            return;
+        }
+        JitDispatchOutcome outcome{};
+        outcome.kind = JitDispatchOutcome::Kind::Forward;
+        outcome.upstream_id = 0;
+        mutate(*conn);
+        mutate_outcome(outcome);
+        const u32 before_len = conn->recv_buf.len();
+        const u32 before_header_end = conn->req_header_end;
+        const u32 before_send_len = conn->req_initial_send_len;
+        u8 before[SmallLoop::kBufSize];
+        __builtin_memcpy(before, conn->recv_buf.data(), before_len);
+        loop.backend.clear_ops();
+        handle_jit_outcome<SmallLoop>(&loop, *conn, outcome, nullptr, true);
+        CHECK_EQ(conn->resp_status, 400u);
+        CHECK_EQ(conn->recv_buf.len(), before_len);
+        CHECK_EQ(conn->req_header_end, before_header_end);
+        CHECK_EQ(conn->req_initial_send_len, before_send_len);
+        CHECK_EQ(__builtin_memcmp(conn->recv_buf.data(), before, before_len), 0);
+        CHECK(conn->target_transform_recorded);
+        CHECK_EQ(conn->target_transform_id, 1u);
+        CHECK_EQ(conn->upstream_fd, -1);
+        CHECK_FALSE(conn->upstream_slot_held);
+        CHECK_EQ(loop.backend.count_ops(MockOp::Connect), 0u);
+        loop.free_conn(*conn);
+    };
+
+    const char kRequest[] = "GET /api/x?tag=a%2Fb HTTP/1.1\r\nHost: client\r\n\r\n";
+    reject(kRequest, [](Connection&) {}, [](JitDispatchOutcome& o) { o.upstream_id = 1; });
+    reject(kRequest, [](Connection&) {}, [](JitDispatchOutcome& o) { o.response_policy_id = 1; });
+    reject(kRequest, [](Connection&) {}, [](JitDispatchOutcome& o) { o.failure_policy_id = 1; });
+    reject(kRequest, [](Connection&) {}, [](JitDispatchOutcome& o) { o.policy_bundle_id = 1; });
+    reject(kRequest, [](Connection&) {}, [](JitDispatchOutcome& o) { o.request_policy_id = 99; });
+    reject("GET /api/x HTTP/1.0\r\nHost: client\r\n\r\n",
+           [](Connection&) {}, [](JitDispatchOutcome&) {});
+    reject("HEAD /api/x HTTP/1.1\r\nHost: client\r\n\r\n",
+           [](Connection&) {}, [](JitDispatchOutcome&) {});
+    reject("POST /api/x HTTP/1.1\r\nHost: client\r\nContent-Length: 1\r\n\r\na",
+           [](Connection&) {}, [](JitDispatchOutcome&) {});
+    reject(kRequest,
+           [](Connection& c) {
+               c.req_header_overrides[0] = {{"X-Test", 6}, {"value", 5}};
+               c.req_header_override_count = 1;
+           },
+           [](JitDispatchOutcome&) {});
+    reject(kRequest,
+           [](Connection& c) { c.req_header_override_overflow = true; },
+           [](JitDispatchOutcome&) {});
+    reject(kRequest,
+           [](Connection& c) {
+               c.resp_header_mutations[0] = {{"X-Test", 6}, {"value", 5},
+                                              ConnectionBase::RespHeaderMutationMode::Set};
+               c.resp_header_mutation_count = 1;
+           },
+           [](JitDispatchOutcome&) {});
+    reject(kRequest,
+           [](Connection& c) { c.resp_header_mutation_pending_count = 1; },
+           [](JitDispatchOutcome&) {});
+    reject(kRequest,
+           [](Connection& c) { c.resp_header_mutation_pending_overflow = true; },
+           [](JitDispatchOutcome&) {});
+    reject(kRequest,
+           [](Connection& c) { c.resp_header_mutation_overflow = true; },
+           [](JitDispatchOutcome&) {});
+    reject("GET /api/x?tag=ok#fragment HTTP/1.1\r\nHost: client\r\n\r\n",
+           [](Connection&) {}, [](JitDispatchOutcome&) {});
+    reject("GET /api/x HTTP/1.1\r\nHost: client\r\n"
+           "Transfer-Encoding: identity\r\n\r\n",
+           [](Connection&) {}, [](JitDispatchOutcome&) {});
+    reject("GET /api/x HTTP/1.1\r\nHost: client\r\nTE: trailers\r\n\r\n",
+           [](Connection&) {}, [](JitDispatchOutcome&) {});
+    reject("GET /api/x HTTP/1.1\r\nHost: client\r\nExpect: 100-continue\r\n\r\n",
+           [](Connection&) {}, [](JitDispatchOutcome&) {});
+
+    cfg.upstreams[0].addr_count = 2;
+    cfg.upstreams[0].addrs[1] = cfg.upstreams[0].addrs[0];
+    reject(kRequest, [](Connection&) {}, [](JitDispatchOutcome&) {});
+    cfg.upstreams[0].addr_count = 1;
+    cfg.upstreams[0].addrs[0].sin_family = AF_INET6;
+    reject(kRequest, [](Connection&) {}, [](JitDispatchOutcome&) {});
+}
+
+TEST(target_transform, h1_transform_precedes_request_policy_materialization) {
+    SmallLoop loop;
+    loop.setup();
+    RouteConfig cfg{};
+    REQUIRE(cfg.add_upstream("backend", 0x7F000001, 9000).has_value());
+    char strip[] = "/api/";
+    char replace[] = "/v1/";
+    REQUIRE_EQ(cfg.add_target_transform({{strip, 5}, {replace, 4}}), 1u);
+
+    const char request[] =
+        "GET /api/x?tag=a%2Fb HTTP/1.1\r\nHost: client\r\nX-Test: keep\r\n\r\n";
+    auto* conn = setup_target_transform_request(loop, cfg, request, sizeof(request) - 1);
+    REQUIRE(conn != nullptr);
+    conn->request_config = &cfg;
+    JitDispatchOutcome outcome{};
+    outcome.kind = JitDispatchOutcome::Kind::Forward;
+    outcome.upstream_id = 0;
+    outcome.request_policy_id = 1;
+    loop.backend.clear_ops();
+    handle_jit_outcome<SmallLoop>(&loop, *conn, outcome, nullptr, true);
+
+    CHECK_FALSE(conn->target_transform_recorded);
+    CHECK(buf_has(conn->recv_buf.data(), conn->recv_buf.len(),
+                  "GET /v1/x?tag=a%2Fb HTTP/1.1\r\n"));
+    const std::string rewritten(reinterpret_cast<const char*>(conn->send_buf.data()),
+                                conn->send_buf.len());
+    CHECK(buf_has(reinterpret_cast<const u8*>(rewritten.data()), rewritten.size(),
+                  "GET /v1/x?tag=a%2Fb HTTP/1.1\r\n"));
+    CHECK(buf_has(reinterpret_cast<const u8*>(rewritten.data()), rewritten.size(),
+                  "Host: 127.0.0.1:9000\r\n"));
+    CHECK(buf_has(reinterpret_cast<const u8*>(rewritten.data()), rewritten.size(),
+                  "X-Test: keep\r\n"));
+    CHECK_EQ(loop.backend.count_ops(MockOp::Connect), 1u);
+    if (conn->upstream_fd >= 0) {
+        close(conn->upstream_fd);
+        conn->upstream_fd = -1;
+    }
+    loop.free_conn(*conn);
+}
+
 TEST(target_transform, h1_valid_materialization_reaches_upstream_selection) {
     SmallLoop loop;
     loop.setup();
