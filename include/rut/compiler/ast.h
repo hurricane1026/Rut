@@ -6,6 +6,7 @@
 #include "rut/common/types.h"
 #include "rut/common/request_policy.h"
 #include "rut/common/forward_target_transform.h"
+#include "rut/common/redirect_policy.h"
 #include "rut/compiler/diagnostic.h"
 
 namespace rut {
@@ -41,6 +42,7 @@ enum class AstStmtKind : u8 {
     ReturnStatus,
     RespondStatus,
     ForwardUpstream,
+    Redirect,
     // `websocket(<upstream>) { <frame-handler> }` — terminate mode (vs the bare
     // `websocket(x)` passthrough, which stays ForwardUpstream). `name` = upstream
     // identifier; `then_stmt` = the parsed frame-handler body block (reused like For).
@@ -281,6 +283,9 @@ struct AstStatement {
     bool has_forward_response_policy = false;
     u16 forward_failure_policy_id = 0;
     bool has_forward_failure_policy = false;
+    // `return redirect({...})`: immutable redirect policy table id (1-based).
+    u16 redirect_policy_id = 0;
+    bool has_redirect_policy = false;
     AstStatement* then_stmt = nullptr;
     AstStatement* else_stmt = nullptr;
     static constexpr u32 kMaxBlockStatements = 8;
@@ -614,6 +619,8 @@ struct AstFile {
     static constexpr u32 kMaxTypePool = 256;
     static constexpr u32 kFailurePolicyBodyPoolBytes =
         kMaxForwardFailurePolicies * kMaxFailurePolicyBodyLen;
+    static constexpr u32 kRedirectPolicyBodyPoolBytes =
+        kMaxRedirectPolicies * kMaxRedirectBodyLen;
     FixedVec<AstItem, kMaxItems> items;
     FixedVec<AstExpr, kMaxExprPool> expr_pool;
     FixedVec<AstStatement, kMaxStmtPool> stmt_pool;
@@ -621,6 +628,8 @@ struct AstFile {
     FixedVec<ForwardResponsePolicySpec, kMaxResponsePolicies> response_policies;
     FixedVec<ForwardFailurePolicySpec, kMaxForwardFailurePolicies> failure_policies;
     FixedVec<u8, kFailurePolicyBodyPoolBytes> failure_policy_body_pool;
+    FixedVec<RedirectPolicySpec, kMaxRedirectPolicies> redirect_policies;
+    FixedVec<u8, kRedirectPolicyBodyPoolBytes> redirect_policy_body_pool;
     bool has_package_decl = false;
     Span package_span{};
     Str package_name{};
@@ -633,7 +642,9 @@ struct AstFile {
           type_pool(other.type_pool),
           response_policies(other.response_policies),
           failure_policies(other.failure_policies),
-          failure_policy_body_pool(other.failure_policy_body_pool) {
+          failure_policy_body_pool(other.failure_policy_body_pool),
+          redirect_policies(other.redirect_policies),
+          redirect_policy_body_pool(other.redirect_policy_body_pool) {
         rebase_from(other);
     }
     AstFile& operator=(const AstFile& other) {
@@ -645,6 +656,8 @@ struct AstFile {
         response_policies = other.response_policies;
         failure_policies = other.failure_policies;
         failure_policy_body_pool = other.failure_policy_body_pool;
+        redirect_policies = other.redirect_policies;
+        redirect_policy_body_pool = other.redirect_policy_body_pool;
         rebase_from(other);
         return *this;
     }
@@ -655,7 +668,9 @@ struct AstFile {
           type_pool(other.type_pool),
           response_policies(other.response_policies),
           failure_policies(other.failure_policies),
-          failure_policy_body_pool(other.failure_policy_body_pool) {
+          failure_policy_body_pool(other.failure_policy_body_pool),
+          redirect_policies(other.redirect_policies),
+          redirect_policy_body_pool(other.redirect_policy_body_pool) {
         rebase_from(other);
     }
     AstFile& operator=(AstFile&& other) noexcept {
@@ -667,6 +682,8 @@ struct AstFile {
         response_policies = other.response_policies;
         failure_policies = other.failure_policies;
         failure_policy_body_pool = other.failure_policy_body_pool;
+        redirect_policies = other.redirect_policies;
+        redirect_policy_body_pool = other.redirect_policy_body_pool;
         rebase_from(other);
         return *this;
     }
@@ -700,6 +717,46 @@ struct AstFile {
         }
         out = {reinterpret_cast<const char*>(&failure_policy_body_pool.data[start]), len};
         return true;
+    }
+
+    bool add_redirect_policy_body(const u8* bytes, u32 len, Str& out) {
+        if ((bytes == nullptr && len != 0) || len > kMaxRedirectBodyLen ||
+            redirect_policy_body_pool.len > kRedirectPolicyBodyPoolBytes ||
+            len > kRedirectPolicyBodyPoolBytes - redirect_policy_body_pool.len)
+            return false;
+        const u32 start = redirect_policy_body_pool.len;
+        for (u32 i = 0; i < len; i++) {
+            if (!redirect_policy_body_pool.push(bytes[i])) return false;
+        }
+        // An empty literal still receives a non-null pointer into the owned
+        // pool, preserving the explicit-body distinction across AstFile moves.
+        out = {reinterpret_cast<const char*>(&redirect_policy_body_pool.data[start]), len};
+        return true;
+    }
+
+    u16 add_redirect_policy(const RedirectPolicySpec& policy) {
+        if (!redirect_policy_spec_valid(policy)) return 0;
+        for (u32 i = 0; i < redirect_policies.len; i++) {
+            if (redirect_policy_spec_equal(redirect_policies[i], policy))
+                return static_cast<u16>(i + 1);
+        }
+        u32 total = 0;
+        for (u32 i = 0; i < redirect_policies.len; i++) {
+            const auto& p = redirect_policies[i];
+            const Str fields[] = {p.reason, p.server, p.content_type, p.target_path, p.body};
+            for (const Str field : fields) {
+                if (field.len > kRedirectPolicyBytes - total) return 0;
+                total += field.len;
+            }
+        }
+        const Str fields[] = {policy.reason, policy.server, policy.content_type,
+                              policy.target_path, policy.body};
+        for (const Str field : fields) {
+            if (field.len > kRedirectPolicyBytes - total) return 0;
+            total += field.len;
+        }
+        if (!redirect_policies.push(policy)) return 0;
+        return static_cast<u16>(redirect_policies.len);
     }
 
 private:
@@ -739,6 +796,15 @@ private:
         if (policy.body.ptr < begin || policy.body.ptr > end) return;
         const u32 index = static_cast<u32>(policy.body.ptr - begin);
         policy.body.ptr = reinterpret_cast<const char*>(&failure_policy_body_pool.data[index]);
+    }
+
+    void rebase_redirect_policy(const AstFile& other, RedirectPolicySpec& policy) {
+        if (policy.body.ptr == nullptr) return;
+        const char* begin = reinterpret_cast<const char*>(&other.redirect_policy_body_pool.data[0]);
+        const char* end = begin + other.redirect_policy_body_pool.len;
+        if (policy.body.ptr < begin || policy.body.ptr > end) return;
+        const u32 index = static_cast<u32>(policy.body.ptr - begin);
+        policy.body.ptr = reinterpret_cast<const char*>(&redirect_policy_body_pool.data[index]);
     }
 
     void rebase_type_ref(const AstFile& other, AstTypeRef& type) {
@@ -837,6 +903,8 @@ private:
     void rebase_from(const AstFile& other) {
         for (u32 i = 0; i < failure_policies.len; i++)
             rebase_failure_policy(other, failure_policies[i]);
+        for (u32 i = 0; i < redirect_policies.len; i++)
+            rebase_redirect_policy(other, redirect_policies[i]);
         for (u32 i = 0; i < type_pool.len; i++) rebase_type_ref(other, type_pool[i]);
         for (u32 i = 0; i < expr_pool.len; i++) rebase_expr(other, expr_pool[i]);
         for (u32 i = 0; i < stmt_pool.len; i++) rebase_stmt(other, stmt_pool[i]);

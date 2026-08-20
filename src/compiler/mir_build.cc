@@ -855,6 +855,10 @@ FrontendResult<MirModule*> build_mir(const HirModule& module) {
         if (!mir->failure_policies.push(module.failure_policies[i]))
             return frontend_error(FrontendError::TooManyItems, {});
     }
+    for (u32 i = 0; i < module.redirect_policies.len; i++) {
+        if (!mir->redirect_policies.push(module.redirect_policies[i]))
+            return frontend_error(FrontendError::TooManyItems, {});
+    }
 
     for (u32 i = 0; i < module.type_shapes.len; i++) {
         MirTypeShape shape{};
@@ -1018,6 +1022,7 @@ FrontendResult<MirModule*> build_mir(const HirModule& module) {
             shape_carrier_ready(*mir, i, struct_ready, variant_ready);
     }
 
+    bool invalid_redirect_policy = false;
     for (u32 i = 0; i < module.routes.len; i++) {
 #if RUT_ENABLE_WEBSOCKET
         // WebSocket terminate-mode frame handlers don't go through the HTTP MIR/RIR pipeline —
@@ -1113,14 +1118,22 @@ FrontendResult<MirModule*> build_mir(const HirModule& module) {
                 return frontend_error(FrontendError::TooManyItems, local.span);
         }
 
-        auto set_term_from_hir = [](MirTerminator* out, const HirTerminator& term) {
+        auto set_term_from_hir = [&](MirTerminator* out, const HirTerminator& term) {
+            if (term.kind == HirTerminatorKind::Redirect &&
+                (term.redirect_policy_id == 0 ||
+                 term.redirect_policy_id > module.redirect_policies.len ||
+                 !redirect_policy_spec_valid(
+                     module.redirect_policies[term.redirect_policy_id - 1])))
+                invalid_redirect_policy = true;
             out->span = term.span;
             out->status_code = term.status_code;
             out->commit_response_mutations = term.commit_response_mutations;
             out->upstream_index = term.upstream_index;
             out->kind = term.kind == HirTerminatorKind::ReturnStatus
                             ? MirTerminatorKind::ReturnStatus
-                            : MirTerminatorKind::ForwardUpstream;
+                            : term.kind == HirTerminatorKind::Redirect
+                                  ? MirTerminatorKind::Redirect
+                                  : MirTerminatorKind::ForwardUpstream;
             out->source_kind = term.source_kind == HirTerminatorSourceKind::LocalRef
                                    ? MirTerminatorSourceKind::LocalRef
                                    : MirTerminatorSourceKind::Literal;
@@ -1130,6 +1143,7 @@ FrontendResult<MirModule*> build_mir(const HirModule& module) {
             out->forward_request_policy_id = term.forward_request_policy_id;
             out->forward_response_policy_id = term.forward_response_policy_id;
             out->forward_failure_policy_id = term.forward_failure_policy_id;
+            out->redirect_policy_id = term.redirect_policy_id;
             out->has_forward_target_transform = term.has_forward_target_transform;
             out->forward_target_transform = term.forward_target_transform;
             out->response_headers.len = 0;
@@ -3163,6 +3177,8 @@ FrontendResult<MirModule*> build_mir(const HirModule& module) {
         if (!mir->functions.push(fn)) return frontend_error(FrontendError::TooManyItems, fn.span);
     }
 
+    if (invalid_redirect_policy)
+        return frontend_error(FrontendError::UnsupportedSyntax);
     return mir;
 }
 

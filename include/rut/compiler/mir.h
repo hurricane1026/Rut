@@ -6,6 +6,7 @@
 #include "rut/common/types.h"
 #include "rut/common/request_policy.h"
 #include "rut/common/forward_target_transform.h"
+#include "rut/common/redirect_policy.h"
 #include "rut/common/wait_limits.h"
 #include "rut/compiler/ast.h"
 #include "rut/compiler/diagnostic.h"
@@ -18,6 +19,7 @@ enum class MirTerminatorKind : u8 {
     Branch,
     ReturnStatus,
     ForwardUpstream,
+    Redirect,
     YieldTimer,
 };
 
@@ -285,6 +287,7 @@ struct MirTerminator {
     u16 forward_request_policy_id = 0;
     u16 forward_response_policy_id = 0;
     u16 forward_failure_policy_id = 0;
+    u16 redirect_policy_id = 0;
     // Internal compiler-only target transform metadata copied losslessly from
     // HIR. Presence is explicit; lowering validates the complete descriptor.
     bool has_forward_target_transform = false;
@@ -507,6 +510,7 @@ struct MirModule {
     FixedVec<MirUpstream, kMaxUpstreams> upstreams;
     FixedVec<ForwardResponsePolicySpec, kMaxResponsePolicies> response_policies;
     FixedVec<ForwardFailurePolicySpec, kMaxForwardFailurePolicies> failure_policies;
+    FixedVec<RedirectPolicySpec, kMaxRedirectPolicies> redirect_policies;
     FixedVec<MirCacheInstance, kMaxCaches> caches;
     FixedVec<MirStruct, kMaxStructs> structs;
     FixedVec<MirVariant, kMaxVariants> variants;
@@ -518,6 +522,7 @@ struct MirModule {
         : upstreams(other.upstreams),
           response_policies(other.response_policies),
           failure_policies(other.failure_policies),
+          redirect_policies(other.redirect_policies),
           caches(other.caches),
           structs(other.structs),
           variants(other.variants),
@@ -528,6 +533,7 @@ struct MirModule {
         upstreams = other.upstreams;
         response_policies = other.response_policies;
         failure_policies = other.failure_policies;
+        redirect_policies = other.redirect_policies;
         caches = other.caches;
         structs = other.structs;
         variants = other.variants;
@@ -539,6 +545,7 @@ struct MirModule {
         : upstreams(other.upstreams),
           response_policies(other.response_policies),
           failure_policies(other.failure_policies),
+          redirect_policies(other.redirect_policies),
           caches(other.caches),
           structs(other.structs),
           variants(other.variants),
@@ -549,6 +556,7 @@ struct MirModule {
         upstreams = other.upstreams;
         response_policies = other.response_policies;
         failure_policies = other.failure_policies;
+        redirect_policies = other.redirect_policies;
         caches = other.caches;
         structs = other.structs;
         variants = other.variants;

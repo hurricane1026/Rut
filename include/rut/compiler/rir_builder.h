@@ -1193,9 +1193,8 @@ struct Builder {
         return {};
     }
 
-    // Emit a foundation-only redirect terminator. The policy id is a
-    // validated 1-based RouteConfig redirect-policy id; serialization is
-    // intentionally unavailable in this increment.
+    // Emit a redirect terminator. The policy id is a validated 1-based
+    // redirect-policy id; runtime admission validates the active config.
     VoidResult emit_ret_redirect(u16 policy_id, SourceLoc loc = {}) {
         if (policy_id == 0) return err(RirError::InvalidState);
         auto r = TRY(emit(Opcode::RetRedirect, nullptr, loc));

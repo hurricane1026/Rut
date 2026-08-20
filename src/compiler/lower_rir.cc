@@ -3082,6 +3082,16 @@ static FrontendResult<void> emit_term(const MirTerminator& term,
             return frontend_error(FrontendError::OutOfMemory, term.span);
         return {};
     }
+    if (term.kind == MirTerminatorKind::Redirect) {
+        if (term.commit_response_mutations || term.redirect_policy_id == 0 ||
+            term.redirect_policy_id > mir.redirect_policies.len ||
+            !redirect_policy_spec_valid(mir.redirect_policies[term.redirect_policy_id - 1]))
+            return frontend_error(FrontendError::UnsupportedSyntax, term.span);
+        if (!b.emit_ret_redirect(term.redirect_policy_id,
+                                 {term.span.line, term.span.col}))
+            return frontend_error(FrontendError::OutOfMemory, term.span);
+        return {};
+    }
     if (term.kind == MirTerminatorKind::ForwardUpstream) {
         // forward(set_path: "..."): emit ReqSetPath(const-str) before the
         // terminator so the handler records the path override at runtime.
@@ -3352,6 +3362,34 @@ FrontendResult<void> lower_to_rir(const MirModule& mir, FrontendRirModule& out) 
             return frontend_error(FrontendError::OutOfMemory);
     }
     out.module.failure_policy_count = mir.failure_policies.len;
+
+    if (mir.redirect_policies.len > kMaxRedirectPolicies)
+        return frontend_error(FrontendError::TooManyItems);
+    for (u32 i = 0; i < mir.redirect_policies.len; i++) {
+        const auto& src = mir.redirect_policies[i];
+        if (!redirect_policy_spec_valid(src))
+            return frontend_error(FrontendError::UnsupportedSyntax);
+        auto& dst = out.module.redirect_policies[i];
+        dst = src;
+        auto copy_redirect_str = [&](Str value, Str& out_str) {
+            if (value.len > 0 && value.ptr == nullptr) return false;
+            char* ptr = nullptr;
+            if (value.len > 0) {
+                ptr = out.module.arena->alloc_array<char>(value.len);
+                if (!ptr) return false;
+                for (u32 j = 0; j < value.len; j++) ptr[j] = value.ptr[j];
+            }
+            out_str = {ptr, value.len};
+            return true;
+        };
+        if (!copy_redirect_str(src.reason, dst.reason) ||
+            !copy_redirect_str(src.server, dst.server) ||
+            !copy_redirect_str(src.content_type, dst.content_type) ||
+            !copy_redirect_str(src.target_path, dst.target_path) ||
+            !copy_redirect_str(src.body, dst.body))
+            return frontend_error(FrontendError::OutOfMemory);
+    }
+    out.module.redirect_policy_count = mir.redirect_policies.len;
 
     // Cache instance descriptors, names arena-copied like upstream names.
     if (mir.caches.len > rir::Module::kMaxCacheInstances) {

@@ -328,6 +328,18 @@ return forward(users, response_policy: {
 // Connection: close. The strict response-domain limits above remain unchanged.
 // Valid downstream Upgrade requests are rejected by this policy; Upgrade
 // passthrough remains PARTIAL in the first slice.
+
+// Explicit request-derived redirects are fully specified (no defaults). The
+// first source slice accepts the generic Redirect terminator in the existing
+// terminal route/control forms; H1 cleartext serialization is bounded by the
+// policy/runtime domain above, while H2 and simulator execution remain
+// unsupported.
+return redirect({
+    scheme: "http", authority: "request_host", port: "actual_listener",
+    path: "static", query: "preserve_raw", date: "current", connection: "close",
+    status: 301, reason: "Moved Permanently", server: "nginx/1.29.7",
+    content_type: "text/html", target_path: "/api/", body: b"<p>moved</p>"
+})
 let resp = forward(users, buffered: true)      // buffered Response, then return resp
 return forward(users, streaming: true)         // large bodies, no buffering
 

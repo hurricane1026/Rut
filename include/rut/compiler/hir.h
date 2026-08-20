@@ -5,6 +5,7 @@
 #include "rut/common/failure_policy.h"
 #include "rut/common/request_policy.h"
 #include "rut/common/forward_target_transform.h"
+#include "rut/common/redirect_policy.h"
 #include "rut/common/wait_limits.h"
 #include "rut/compiler/ast.h"
 #include "rut/compiler/diagnostic.h"
@@ -752,6 +753,7 @@ struct HirLocal {
 enum class HirTerminatorKind : u8 {
     ReturnStatus,
     ForwardUpstream,
+    Redirect,
 };
 
 // Where the runtime status value comes from, when kind == ReturnStatus.
@@ -802,6 +804,7 @@ struct HirTerminator {
     u16 forward_request_policy_id = 0;
     u16 forward_response_policy_id = 0;
     u16 forward_failure_policy_id = 0;
+    u16 redirect_policy_id = 0;
     // Internal compiler-only target transform metadata. There is intentionally
     // no parser/source syntax yet; presence is explicit so a forged partial
     // descriptor is not mistaken for the no-transform case.
@@ -1387,6 +1390,7 @@ struct HirModule {
     FixedVec<HirUpstream, kMaxUpstreams> upstreams;
     FixedVec<ForwardResponsePolicySpec, kMaxResponsePolicies> response_policies;
     FixedVec<ForwardFailurePolicySpec, kMaxForwardFailurePolicies> failure_policies;
+    FixedVec<RedirectPolicySpec, kMaxRedirectPolicies> redirect_policies;
     bool has_listener = false;
     HirListener listener{};
     FixedVec<HirCacheDecl, kMaxCaches> caches;
@@ -1414,6 +1418,7 @@ struct HirModule {
         : upstreams(other.upstreams),
           response_policies(other.response_policies),
           failure_policies(other.failure_policies),
+          redirect_policies(other.redirect_policies),
           has_listener(other.has_listener),
           listener(other.listener),
           caches(other.caches),
@@ -1441,6 +1446,7 @@ struct HirModule {
         upstreams = other.upstreams;
         response_policies = other.response_policies;
         failure_policies = other.failure_policies;
+        redirect_policies = other.redirect_policies;
         has_listener = other.has_listener;
         listener = other.listener;
         caches = other.caches;

@@ -488,9 +488,8 @@ struct Module {
     ForwardTargetTransformSpec target_transforms[kMaxForwardTargetTransforms]{};
     u32 target_transform_count = 0;
 
-    // Foundation-only redirect metadata. Strings are borrowed by the RIR
-    // module and copied into RouteConfig during activation; no action or
-    // runtime path consumes them in this increment.
+    // Redirect metadata. Strings are borrowed by the RIR module and copied
+    // into RouteConfig during activation; RetRedirect carries a 1-based ID.
     RedirectPolicySpec redirect_policies[kMaxRedirectPolicies]{};
     u32 redirect_policy_count = 0;
 

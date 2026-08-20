@@ -150,6 +150,68 @@ struct Parser {
         return owned;
     }
 
+    FrontendResult<Str> parse_redirect_body_literal() {
+        if (cur().type == TokenType::Eof)
+            return frontend_error(FrontendError::UnexpectedEof, span_from(cur()));
+        if (cur().type != TokenType::Ident || !cur().text.eq({"b", 1}))
+            return frontend_error(FrontendError::UnexpectedToken, span_from(cur()), cur().text);
+        const Token& prefix = toks->tokens[pos++];
+        auto literal = expect(TokenType::StringLit);
+        if (!literal) return core::make_unexpected(literal.error());
+        if (literal.value()->start != prefix.end + 1)
+            return frontend_error(FrontendError::UnexpectedToken,
+                                  span_from(*literal.value()), literal.value()->text);
+        u8 decoded[kMaxRedirectBodyLen];
+        u32 decoded_len = 0;
+        const Str raw = literal.value()->text;
+        auto hex = [](u8 c, u8& out) {
+            if (c >= '0' && c <= '9') { out = static_cast<u8>(c - '0'); return true; }
+            if (c >= 'a' && c <= 'f') { out = static_cast<u8>(c - 'a' + 10); return true; }
+            if (c >= 'A' && c <= 'F') { out = static_cast<u8>(c - 'A' + 10); return true; }
+            return false;
+        };
+        for (u32 i = 0; i < raw.len; i++) {
+            u8 value = static_cast<u8>(raw.ptr[i]);
+            if (value == '\\') {
+                if (++i >= raw.len)
+                    return frontend_error(FrontendError::UnexpectedToken,
+                                          span_from(*literal.value()), raw);
+                const u8 esc = static_cast<u8>(raw.ptr[i]);
+                switch (esc) {
+                    case 'n': value = '\n'; break;
+                    case 'r': value = '\r'; break;
+                    case 't': value = '\t'; break;
+                    case '\\': value = '\\'; break;
+                    case '"': value = '"'; break;
+                    case 'x': {
+                        if (i + 2 >= raw.len)
+                            return frontend_error(FrontendError::UnexpectedToken,
+                                                  span_from(*literal.value()), raw);
+                        u8 hi = 0, lo = 0;
+                        if (!hex(static_cast<u8>(raw.ptr[i + 1]), hi) ||
+                            !hex(static_cast<u8>(raw.ptr[i + 2]), lo))
+                            return frontend_error(FrontendError::UnexpectedToken,
+                                                  span_from(*literal.value()), raw);
+                        value = static_cast<u8>((hi << 4) | lo);
+                        i += 2;
+                        break;
+                    }
+                    default:
+                        return frontend_error(FrontendError::UnexpectedToken,
+                                              span_from(*literal.value()), raw);
+                }
+            }
+            if (decoded_len >= kMaxRedirectBodyLen)
+                return frontend_error(FrontendError::TooManyItems,
+                                      span_from(*literal.value()), raw);
+            decoded[decoded_len++] = value;
+        }
+        Str owned{};
+        if (!file->add_redirect_policy_body(decoded, decoded_len, owned))
+            return frontend_error(FrontendError::TooManyItems, span_from(prefix), raw);
+        return owned;
+    }
+
     FrontendResult<AstExpr*> alloc_expr(const AstExpr& expr) {
         if (!file->expr_pool.push(expr))
             return frontend_error(FrontendError::TooManyItems, expr.span);
@@ -1382,7 +1444,8 @@ struct Parser {
                     if (!arm_stmt) return core::make_unexpected(arm_stmt.error());
                     if (arm_stmt->kind != AstStmtKind::ReturnStatus &&
                         arm_stmt->kind != AstStmtKind::RespondStatus &&
-                        arm_stmt->kind != AstStmtKind::ForwardUpstream) {
+                        arm_stmt->kind != AstStmtKind::ForwardUpstream &&
+                        arm_stmt->kind != AstStmtKind::Redirect) {
                         return frontend_error(FrontendError::UnsupportedSyntax, span_from(start));
                     }
                     auto arm_ptr = alloc_stmt(arm_stmt.value());
@@ -1482,6 +1545,163 @@ struct Parser {
                 }
                 return value;
             };
+
+            // `return redirect({...})` is intentionally contextual: redirect is
+            // not a global keyword, and the complete object is required so no
+            // default policy can be inferred accidentally.
+            if (cur().type == TokenType::Ident && cur().text.eq({"redirect", 8}) &&
+                peek().type == TokenType::LParen) {
+                pos++;  // redirect
+                auto lparen = expect(TokenType::LParen);
+                if (!lparen) return core::make_unexpected(lparen.error());
+                auto lbrace = expect(TokenType::LBrace);
+                if (!lbrace) return core::make_unexpected(lbrace.error());
+                if (cur().type == TokenType::RBrace)
+                    return frontend_error(FrontendError::UnsupportedSyntax,
+                                          span_from(cur()), lit_str("redirect"));
+                RedirectPolicySpec policy{};
+                bool have_scheme = false, have_authority = false, have_port = false;
+                bool have_path = false, have_query = false, have_date = false;
+                bool have_connection = false, have_status = false, have_reason = false;
+                bool have_server = false, have_content_type = false, have_target_path = false;
+                bool have_body = false;
+                while (true) {
+                    auto field = expect(TokenType::Ident);
+                    if (!field) return core::make_unexpected(field.error());
+                    const Str name = field.value()->text;
+                    auto colon = expect(TokenType::Colon);
+                    if (!colon) return core::make_unexpected(colon.error());
+                    bool* seen = nullptr;
+                    if (name.eq({"scheme", 6})) {
+                        seen = &have_scheme;
+                        auto v = expect(TokenType::StringLit);
+                        if (!v) return core::make_unexpected(v.error());
+                        if (!v.value()->text.eq({"http", 4}))
+                            return frontend_error(FrontendError::UnsupportedSyntax,
+                                                  span_from(*v.value()), v.value()->text);
+                        policy.scheme = RedirectPolicyScheme::Http;
+                    } else if (name.eq({"authority", 9})) {
+                        seen = &have_authority;
+                        auto v = expect(TokenType::StringLit);
+                        if (!v) return core::make_unexpected(v.error());
+                        if (!v.value()->text.eq({"request_host", 12}))
+                            return frontend_error(FrontendError::UnsupportedSyntax,
+                                                  span_from(*v.value()), v.value()->text);
+                        policy.authority = RedirectPolicyAuthority::RequestHost;
+                    } else if (name.eq({"port", 4})) {
+                        seen = &have_port;
+                        auto v = expect(TokenType::StringLit);
+                        if (!v) return core::make_unexpected(v.error());
+                        if (!v.value()->text.eq({"actual_listener", 15}))
+                            return frontend_error(FrontendError::UnsupportedSyntax,
+                                                  span_from(*v.value()), v.value()->text);
+                        policy.port = RedirectPolicyPort::ActualListener;
+                    } else if (name.eq({"path", 4})) {
+                        seen = &have_path;
+                        auto v = expect(TokenType::StringLit);
+                        if (!v) return core::make_unexpected(v.error());
+                        if (!v.value()->text.eq({"static", 6}))
+                            return frontend_error(FrontendError::UnsupportedSyntax,
+                                                  span_from(*v.value()), v.value()->text);
+                        policy.path = RedirectPolicyPath::Static;
+                    } else if (name.eq({"query", 5})) {
+                        seen = &have_query;
+                        auto v = expect(TokenType::StringLit);
+                        if (!v) return core::make_unexpected(v.error());
+                        if (!v.value()->text.eq({"preserve_raw", 12}))
+                            return frontend_error(FrontendError::UnsupportedSyntax,
+                                                  span_from(*v.value()), v.value()->text);
+                        policy.query = RedirectPolicyQuery::PreserveRaw;
+                    } else if (name.eq({"date", 4})) {
+                        seen = &have_date;
+                        auto v = expect(TokenType::StringLit);
+                        if (!v) return core::make_unexpected(v.error());
+                        if (!v.value()->text.eq({"current", 7}))
+                            return frontend_error(FrontendError::UnsupportedSyntax,
+                                                  span_from(*v.value()), v.value()->text);
+                        policy.date = RedirectPolicyDate::Current;
+                    } else if (name.eq({"connection", 10})) {
+                        seen = &have_connection;
+                        auto v = expect(TokenType::StringLit);
+                        if (!v) return core::make_unexpected(v.error());
+                        if (!v.value()->text.eq({"close", 5}))
+                            return frontend_error(FrontendError::UnsupportedSyntax,
+                                                  span_from(*v.value()), v.value()->text);
+                        policy.connection = RedirectPolicyConnection::Close;
+                    } else if (name.eq({"status", 6})) {
+                        seen = &have_status;
+                        auto v = expect(TokenType::IntLit);
+                        if (!v) return core::make_unexpected(v.error());
+                        auto status = parse_status_i32(*v.value());
+                        if (!status || status.value() < 300 || status.value() > 399)
+                            return frontend_error(FrontendError::InvalidStatusCode,
+                                                  span_from(*v.value()), v.value()->text);
+                        policy.status_code = static_cast<u16>(status.value());
+                    } else if (name.eq({"reason", 6})) {
+                        seen = &have_reason;
+                        auto v = expect(TokenType::StringLit);
+                        if (!v) return core::make_unexpected(v.error());
+                        policy.reason = v.value()->text;
+                    } else if (name.eq({"server", 6})) {
+                        seen = &have_server;
+                        auto v = expect(TokenType::StringLit);
+                        if (!v) return core::make_unexpected(v.error());
+                        policy.server = v.value()->text;
+                    } else if (name.eq({"content_type", 12})) {
+                        seen = &have_content_type;
+                        auto v = expect(TokenType::StringLit);
+                        if (!v) return core::make_unexpected(v.error());
+                        policy.content_type = v.value()->text;
+                    } else if (name.eq({"target_path", 11})) {
+                        seen = &have_target_path;
+                        auto v = expect(TokenType::StringLit);
+                        if (!v) return core::make_unexpected(v.error());
+                        policy.target_path = v.value()->text;
+                    } else if (name.eq({"body", 4})) {
+                        seen = &have_body;
+                        auto v = parse_redirect_body_literal();
+                        if (!v) return core::make_unexpected(v.error());
+                        policy.body = v.value();
+                    } else {
+                        return frontend_error(FrontendError::UnexpectedToken,
+                                              span_from(*field.value()), name);
+                    }
+                    if (*seen)
+                        return frontend_error(FrontendError::UnexpectedToken,
+                                              span_from(*field.value()), name);
+                    *seen = true;
+                    if (!take(TokenType::Comma)) break;
+                    if (cur().type == TokenType::RBrace) break;
+                }
+                auto rbrace = expect(TokenType::RBrace);
+                if (!rbrace) return core::make_unexpected(rbrace.error());
+                if (!have_scheme || !have_authority || !have_port || !have_path ||
+                    !have_query || !have_date || !have_connection || !have_status ||
+                    !have_reason || !have_server || !have_content_type || !have_target_path ||
+                    !have_body || !redirect_policy_spec_valid(policy))
+                    return frontend_error(FrontendError::UnsupportedSyntax,
+                                          span_from(*rbrace.value()), lit_str("redirect"));
+                const u32 body_pool_before = file->redirect_policy_body_pool.len;
+                const u32 policy_count_before = file->redirect_policies.len;
+                const u16 policy_id = file->add_redirect_policy(policy);
+                if (policy_id == 0) {
+                    file->redirect_policy_body_pool.len = body_pool_before;
+                    return frontend_error(FrontendError::TooManyItems,
+                                          span_from(*lparen.value()), lit_str("redirect"));
+                }
+                // A duplicate policy reuses its first stable ID. Its decoded
+                // body was only provisional and must not consume the owned
+                // pool or alter aggregate-capacity accounting.
+                if (policy_id <= policy_count_before)
+                    file->redirect_policy_body_pool.len = body_pool_before;
+                auto rparen = expect(TokenType::RParen);
+                if (!rparen) return core::make_unexpected(rparen.error());
+                stmt.kind = AstStmtKind::Redirect;
+                stmt.redirect_policy_id = policy_id;
+                stmt.has_redirect_policy = true;
+                stmt.span = Span{start.start, rparen.value()->end, start.line, start.col};
+                return stmt;
+            }
 
             // Peek for the forward builder. `forward` is a keyword, so
             // `return forward(<name>)` is unambiguous. Analyze later

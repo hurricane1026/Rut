@@ -5,9 +5,9 @@
 
 namespace rut {
 
-// Redirect policies are bounded, caller-supplied metadata for a future
-// dedicated Redirect action.  They are intentionally not tied to nginx and
-// are not executable in this foundation increment.
+// Redirect policies are bounded, caller-supplied metadata for the generic
+// Redirect action. They are intentionally not tied to nginx; source and
+// converter callers provide the concrete text/body values.
 static constexpr u32 kMaxRedirectPolicies = 16;
 static constexpr u32 kMaxRedirectReasonLen = 64;
 static constexpr u32 kMaxRedirectServerLen = 64;

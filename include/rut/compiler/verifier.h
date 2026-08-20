@@ -1006,11 +1006,30 @@ inline VerifyResult verify_module(const Module& mod, VerifyOptions options = {})
     VerifySummary summary{};
     summary.function_count = mod.func_count;
 
+    if (!redirect_policy_table_valid(mod.redirect_policies, mod.redirect_policy_count))
+        return verify_fail(summary, VerifyIssueCode::InvalidRedirectPolicyId, 0);
+
     if (mod.func_count > 0 && mod.functions == nullptr) {
         return verify_fail(summary, VerifyIssueCode::MissingFunction, 0);
     }
 
     for (u32 fi = 0; fi < mod.func_count; fi++) {
+        for (u32 bi = 0; bi < mod.functions[fi].block_count; bi++) {
+            const auto& block = mod.functions[fi].blocks[bi];
+            if (block.inst_count == 0 || block.insts == nullptr) continue;
+            const auto& term = block.insts[block.inst_count - 1];
+            if (term.op == Opcode::RetRedirect) {
+                const i64 id = term.imm.i32_val;
+                if (id <= 0 || static_cast<u64>(id) > mod.redirect_policy_count ||
+                    !redirect_policy_spec_valid(mod.redirect_policies[id - 1]))
+                    return verify_fail(summary,
+                                       VerifyIssueCode::InvalidRedirectPolicyId,
+                                       fi,
+                                       bi,
+                                       block.inst_count - 1,
+                                       static_cast<u32>(id));
+            }
+        }
         VerifyResult result = verify_function(&mod.functions[fi], fi, options);
         if (!result.ok) return result;
         summary.block_count += result.summary.block_count;

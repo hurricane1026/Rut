@@ -9711,6 +9711,23 @@ static FrontendResult<HirTerminator> analyze_term(const AstStatement& stmt, cons
         return frontend_error(FrontendError::UnsupportedSyntax, stmt.span);
     }
 
+    if (stmt.kind == AstStmtKind::Redirect) {
+        if (!stmt.has_redirect_policy || stmt.redirect_policy_id == 0 ||
+            stmt.redirect_policy_id > mod.redirect_policies.len ||
+            !redirect_policy_spec_valid(mod.redirect_policies[stmt.redirect_policy_id - 1]))
+            return frontend_error(FrontendError::UnsupportedSyntax,
+                                  stmt.span,
+                                  lit_str("invalid redirect policy"));
+        if (stmt.response_headers.len != 0 || stmt.forward_set_path.len != 0 ||
+            stmt.forward_set_headers.len != 0)
+            return frontend_error(FrontendError::UnsupportedSyntax,
+                                  stmt.span,
+                                  lit_str("redirect cannot carry response or request mutations"));
+        term.kind = HirTerminatorKind::Redirect;
+        term.redirect_policy_id = stmt.redirect_policy_id;
+        return term;
+    }
+
     auto upstream_index = find_upstream_index_by_name(mod, stmt.name, stmt.span);
     if (!upstream_index) return core::make_unexpected(upstream_index.error());
     term.kind = HirTerminatorKind::ForwardUpstream;
@@ -9743,7 +9760,7 @@ static FrontendResult<HirTerminator> analyze_term(const AstStatement& stmt, cons
 
 static bool is_ast_hir_terminator(const AstStatement& stmt) {
     return stmt.kind == AstStmtKind::ReturnStatus || stmt.kind == AstStmtKind::RespondStatus ||
-           stmt.kind == AstStmtKind::ForwardUpstream;
+           stmt.kind == AstStmtKind::ForwardUpstream || stmt.kind == AstStmtKind::Redirect;
 }
 
 static bool terminator_reads_any_local(const HirTerminator& term,
@@ -14268,7 +14285,8 @@ static FrontendResult<void> validate_timer_route(const HirRoute& route,
         return {};
     };
     auto check_term = [&](const HirTerminator& t) -> FrontendResult<void> {
-        if (t.kind == HirTerminatorKind::ForwardUpstream)
+        if (t.kind == HirTerminatorKind::ForwardUpstream ||
+            t.kind == HirTerminatorKind::Redirect)
             return frontend_error(FrontendError::UnsupportedSyntax, body_span, kTimerReqDetail);
         return {};
     };
@@ -14551,6 +14569,13 @@ static FrontendResult<HirModule*> analyze_file_internal(
     for (u32 i = 0; i < file.failure_policies.len; i++) {
         if (!forward_failure_policy_spec_valid(file.failure_policies[i]) ||
             !mod.failure_policies.push(file.failure_policies[i]))
+            return frontend_error(FrontendError::UnsupportedSyntax, {});
+    }
+    if (file.redirect_policies.len > kMaxRedirectPolicies)
+        return frontend_error(FrontendError::TooManyItems, {});
+    for (u32 i = 0; i < file.redirect_policies.len; i++) {
+        if (!redirect_policy_spec_valid(file.redirect_policies[i]) ||
+            !mod.redirect_policies.push(file.redirect_policies[i]))
             return frontend_error(FrontendError::UnsupportedSyntax, {});
     }
 
@@ -18796,6 +18821,9 @@ static FrontendResult<HirModule*> analyze_file_internal(
             // source boundary; the runtime has a matching fail-closed guard for
             // direct-RIR callers.
             auto policy_mutation_conflict = [](const HirTerminator& term) {
+                if (term.kind == HirTerminatorKind::Redirect &&
+                    term.commit_response_mutations)
+                    return true;
                 return term.kind == HirTerminatorKind::ForwardUpstream &&
                        ((term.has_forward_target_transform && term.commit_response_mutations) ||
                         (term.forward_request_policy_id != 0 && term.commit_response_mutations) ||

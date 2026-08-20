@@ -33118,6 +33118,107 @@ TEST(frontend, target_transform_invalid_presence_rejects_and_absence_is_transpar
     plain.destroy();
 }
 
+TEST(frontend, inline_redirect_source_reaches_rir_and_owned_config) {
+    const char source[] =
+        "upstream backend at \"127.0.0.1:9000\"\n"
+        "route GET \"/api\" {\n"
+        "  return redirect({"
+        "scheme: \"http\", authority: \"request_host\", port: \"actual_listener\", "
+        "path: \"static\", query: \"preserve_raw\", date: \"current\", "
+        "connection: \"close\", status: 301, reason: \"Moved Permanently\", "
+        "server: \"nginx/1.29.7\", content_type: \"text/html\", target_path: \"/api/\", "
+        "body: b\"OK\\n\\x00\"})\n"
+        "}\n"
+        "route POST \"/other\" { return redirect({"
+        "scheme: \"http\", authority: \"request_host\", port: \"actual_listener\", "
+        "path: \"static\", query: \"preserve_raw\", date: \"current\", "
+        "connection: \"close\", status: 301, reason: \"Moved Permanently\", "
+        "server: \"nginx/1.29.7\", content_type: \"text/html\", target_path: \"/api/\", "
+        "body: b\"OK\\n\\x00\"})\n"
+        "}\n";
+    auto lexed = lex(lit(source));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    REQUIRE_EQ(ast->redirect_policies.len, 1u);
+    CHECK_EQ(ast->redirect_policies[0].status_code, 301u);
+    CHECK_EQ(ast->redirect_policies[0].body.len, 4u);
+    CHECK_EQ(static_cast<unsigned char>(ast->redirect_policies[0].body.ptr[3]), 0u);
+    auto* ast_copy = new AstFile(ast.value());
+    CHECK(ast_copy->redirect_policies[0].body.ptr != ast->redirect_policies[0].body.ptr);
+    CHECK_EQ(ast_copy->redirect_policies[0].body.ptr[0], 'O');
+    delete ast_copy;
+    auto* ast_stmt = ast->items[1].route.statements[0];
+    ast_stmt->redirect_policy_id = 2;
+    auto forged_hir = analyze_file_heap(ast.value());
+    CHECK_FALSE(forged_hir.has_value());
+    ast_stmt->redirect_policy_id = 1;
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    REQUIRE_EQ(hir->redirect_policies.len, 1u);
+    CHECK_EQ(hir->routes[0].control.direct_term.kind, HirTerminatorKind::Redirect);
+    CHECK_EQ(hir->routes[0].control.direct_term.redirect_policy_id, 1u);
+    hir->routes[0].control.direct_term.redirect_policy_id = 2;
+    auto forged_mir = build_mir_heap(hir.value());
+    CHECK_FALSE(forged_mir.has_value());
+    hir->routes[0].control.direct_term.redirect_policy_id = 1;
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    REQUIRE_EQ(mir->redirect_policies.len, 1u);
+    CHECK_EQ(mir->functions[0].blocks[0].term.kind, MirTerminatorKind::Redirect);
+    CHECK_EQ(mir->functions[0].blocks[0].term.redirect_policy_id, 1u);
+    FrontendRirModule rir{};
+    REQUIRE(lower_to_rir(mir.value(), rir));
+    REQUIRE_EQ(rir.module.redirect_policy_count, 1u);
+    CHECK_EQ(rir.module.redirect_policies[0].body.len, 4u);
+    auto* ret = find_first_op(rir.module.functions[0], rir::Opcode::RetRedirect);
+    REQUIRE(ret != nullptr);
+    CHECK_EQ(ret->operand_count, 0u);
+    CHECK_EQ(ret->imm.i32_val, 1);
+    auto verified = rir::verify_module(rir.module);
+    CHECK(verified.ok);
+    ret->imm.i32_val = 2;
+    CHECK_FALSE(rir::verify_module(rir.module).ok);
+    ret->imm.i32_val = 1;
+    rir.destroy();
+}
+
+TEST(frontend, inline_redirect_rejects_invalid_shape_and_duplicate_fields) {
+    const char* sources[] = {
+        "route GET \"/\" { return redirect({scheme: \"http\"}) }",
+        "route GET \"/\" { return redirect({scheme: \"https\", authority: \"request_host\", port: \"actual_listener\", path: \"static\", query: \"preserve_raw\", date: \"current\", connection: \"close\", status: 301, reason: \"Moved Permanently\", server: \"s\", content_type: \"text/html\", target_path: \"/x\", body: b\"\"}) }",
+        "route GET \"/\" { return redirect({scheme: \"http\", scheme: \"http\", authority: \"request_host\", port: \"actual_listener\", path: \"static\", query: \"preserve_raw\", date: \"current\", connection: \"close\", status: 301, reason: \"Moved Permanently\", server: \"s\", content_type: \"text/html\", target_path: \"/x\", body: b\"\"}) }",
+        "route GET \"/\" { return redirect({scheme: \"http\", authority: \"request_host\", port: \"actual_listener\", path: \"static\", query: \"preserve_raw\", date: \"current\", connection: \"close\", status: 200, reason: \"Moved Permanently\", server: \"s\", content_type: \"text/html\", target_path: \"/x\", body: b\"\"}) }",
+    };
+    for (const char* source : sources) {
+        auto lexed = lex(lit(source));
+        REQUIRE(lexed);
+        auto ast = parse_file_heap(lexed.value());
+        CHECK_FALSE(ast.has_value());
+    }
+}
+
+TEST(frontend, inline_redirect_supports_method_omitted_terminal_if_with_forward_sibling) {
+    const char source[] =
+        "upstream backend at \"127.0.0.1:9000\"\n"
+        "route \"/\" { if req.method == GET && req.pathOnly == \"/api\" { "
+        "return redirect({scheme: \"http\", authority: \"request_host\", "
+        "port: \"actual_listener\", path: \"static\", query: \"preserve_raw\", "
+        "date: \"current\", connection: \"close\", status: 301, "
+        "reason: \"Moved Permanently\", server: \"s\", content_type: \"text/html\", "
+        "target_path: \"/api/\", body: b\"\"}) } else { return forward(backend) } }\n";
+    auto lexed = lex(lit(source));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    REQUIRE_EQ(hir->routes[0].control.kind, HirControlKind::If);
+    CHECK_EQ(hir->routes[0].control.then_term.kind, HirTerminatorKind::Redirect);
+    CHECK_EQ(hir->routes[0].control.then_term.redirect_policy_id, 1u);
+    CHECK_EQ(hir->routes[0].control.else_term.kind, HirTerminatorKind::ForwardUpstream);
+}
+
 int main(int argc, char** argv) {
     return rut::test::run_all(argc, argv);
 }
