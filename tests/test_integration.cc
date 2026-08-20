@@ -16873,8 +16873,10 @@ TEST(route, failure_policy_bundle_invalid_id_rejects_before_upstream_side_effect
 }
 
 TEST(route, failure_policy_connect_error_serializes_binary_body_and_releases_slot) {
+    DeadEndpoint dead;
+    REQUIRE(dead.reserve());
     RouteConfig cfg{};
-    REQUIRE(cfg.add_upstream("backend", 0x7F000001, 9999).has_value());
+    REQUIRE(cfg.add_upstream("backend", 0x7F000001, dead.port).has_value());
     cfg.upstreams[0].max_inflight = 1;
     auto failure = test_failure_policy_spec();
     const char body[] = {'u', '\0', '\n', 'x'};
@@ -16948,8 +16950,10 @@ TEST(route, failure_policy_connect_error_serializes_binary_body_and_releases_slo
 }
 
 TEST(route, failure_policy_close_intent_emits_close_and_eof) {
+    DeadEndpoint dead;
+    REQUIRE(dead.reserve());
     RouteConfig cfg{};
-    REQUIRE(cfg.add_upstream("backend", 0x7F000001, 9999).has_value());
+    REQUIRE(cfg.add_upstream("backend", 0x7F000001, dead.port).has_value());
     auto failure = test_failure_policy_spec();
     failure.body = {"x", 1};
     REQUIRE_EQ(cfg.add_failure_policy(failure), 1u);
@@ -16964,21 +16968,46 @@ TEST(route, failure_policy_close_intent_emits_close_and_eof) {
     static constexpr char kRequest[] =
         "GET /api HTTP/1.1\r\nHost: client.example\r\nConnection: close\r\n\r\n";
     REQUIRE(send_all(client, kRequest, sizeof(kRequest) - 1));
-    char response[1024];
-    const i32 response_len = recv_timeout(client, response, sizeof(response), 2000);
-    REQUIRE_GT(response_len, 0);
-    CHECK(buf_contains(response,
-                       static_cast<u32>(response_len),
-                       "Connection: close\r\n",
-                       19));
+    char response[1024]{};
+    u32 response_len = 0;
+    u32 body_start = 0;
+    while (response_len < sizeof(response)) {
+        const i32 got = recv_timeout(client,
+                                     response + response_len,
+                                     sizeof(response) - response_len,
+                                     2000);
+        REQUIRE_GT(got, 0);
+        response_len += static_cast<u32>(got);
+        if (body_start == 0) {
+            for (u32 i = 0; i + 3 < response_len; i++) {
+                if (response[i] == '\r' && response[i + 1] == '\n' &&
+                    response[i + 2] == '\r' && response[i + 3] == '\n') {
+                    body_start = i + 4;
+                    break;
+                }
+            }
+        }
+        if (body_start != 0 && response_len >= body_start + 1) break;
+    }
+    REQUIRE_NE(body_start, 0u);
+    CHECK_EQ(response_len, body_start + 1);
+    CHECK(buf_contains(response, response_len, "HTTP/1.1 502 Bad Gateway\r\n", 26));
+    CHECK(buf_contains(response, response_len, "Server: rut\r\n", 13));
+    CHECK(buf_contains(response, response_len, "Content-Type: text/plain\r\n", 26));
+    CHECK(buf_contains(response, response_len, "Content-Length: 1\r\n", 19));
+    CHECK(buf_contains(response, response_len, "Connection: close\r\n", 19));
+    CHECK_EQ(memcmp(response + response_len - 1, "x", 1), 0);
+    CHECK_FALSE(buf_contains(response, response_len, "Content-Length: 11\r\n", 20));
     const i32 eof = recv_timeout(client, response, sizeof(response), 2000);
     CHECK_EQ(eof, 0);
     close(client);
 }
 
 TEST(route, failure_policy_body_waits_for_complete_request_before_connect_error) {
+    DeadEndpoint dead;
+    REQUIRE(dead.reserve());
     RouteConfig cfg{};
-    REQUIRE(cfg.add_upstream("backend", 0x7F000001, 9999).has_value());
+    REQUIRE(cfg.add_upstream("backend", 0x7F000001, dead.port).has_value());
     auto failure = test_failure_policy_spec();
     failure.body = {"body", 4};
     REQUIRE_EQ(cfg.add_failure_policy(failure), 1u);
@@ -17094,6 +17123,86 @@ TEST(route, response_policy_serializes_strict_h1_final_response) {
     REQUIRE_GT(n, 0);
     // Date is intentionally current and therefore the only dynamic field. Mask
     // its fixed IMF-fixdate bytes, then compare the complete serialized response.
+    char normalized[2048]{};
+    REQUIRE_LT(n, static_cast<u32>(sizeof(normalized)));
+    memcpy(normalized, response, n);
+    char* date = strstr(normalized, "Date: ");
+    REQUIRE(date != nullptr);
+    for (u32 i = 0; i < 29 && date[6 + i] != '\r'; i++) date[6 + i] = 'X';
+    static constexpr char kExpected[] =
+        "HTTP/1.1 200 Custom Reason\r\n"
+        "Server: nginx/1.29.7\r\n"
+        "Date: XXXXXXXXXXXXXXXXXXXXXXXXXXXXX\r\n"
+        "Content-Length: 2\r\n"
+        "Connection: keep-alive\r\n"
+        "X-TrAcE: one \t\r\n"
+        "Set-Cookie: a=1\r\n"
+        "Set-Cookie: b=2\r\n\r\nok";
+    CHECK_EQ(n, static_cast<u32>(sizeof(kExpected) - 1));
+    CHECK(memcmp(normalized, kExpected, sizeof(kExpected) - 1) == 0);
+    CHECK_EQ(backend.accepted_count.load(std::memory_order_acquire), 1u);
+    CHECK_EQ(backend.request_count.load(std::memory_order_acquire), 1u);
+}
+
+TEST(route, response_and_failure_bundle_serializes_live_success_response) {
+    using namespace rut;
+    RecordingUpstream backend;
+    static constexpr char kUpstreamResponse[] =
+        "HTTP/1.1 200 Custom Reason\r\n"
+        "Server: upstream\r\n"
+        "Date: Tue, 01 Jan 2030 00:00:00 GMT\r\n"
+        "Content-Length: 2\r\n"
+        "X-TrAcE:  one \t\r\n"
+        "Set-Cookie: a=1\r\n"
+        "Set-Cookie: b=2\r\n"
+        "X-Pad: hidden\r\n\r\nok";
+    backend.response = kUpstreamResponse;
+    backend.response_len = sizeof(kUpstreamResponse) - 1;
+    backend.response_chunk_size = 5;
+    REQUIRE(backend.setup());
+
+    RouteConfig cfg{};
+    auto id = cfg.add_upstream("backend", 0x7F000001, backend.port);
+    REQUIRE(id.has_value());
+    REQUIRE_EQ(cfg.add_failure_policy(test_failure_policy_spec()), 1u);
+    REQUIRE_EQ(cfg.add_response_policy(test_response_policy_spec()), 1u);
+    REQUIRE_EQ(cfg.add_policy_bundle(0, 1), 1u);
+    REQUIRE(cfg.add_jit_handler("/api", 'G', &forward_failure_bundle_two_handler));
+    // The handler returns bundle 2, which intentionally proves response+failure
+    // metadata can be selected together rather than only failure-only bundle 1.
+    REQUIRE_EQ(cfg.add_policy_bundle(1, 1), 2u);
+    const RouteConfig* active = &cfg;
+    ScopedProxyLoop proxy;
+    REQUIRE(proxy.setup(&active, 1000));
+
+    i32 client = connect_to(proxy.port);
+    REQUIRE_GE(client, 0);
+    set_socket_timeouts(client, 2);
+    static constexpr char kRequest[] = "GET /api HTTP/1.1\r\nHost: client.example\r\n\r\n";
+    REQUIRE(send_all(client, kRequest, sizeof(kRequest) - 1));
+    char response[2048]{};
+    u32 n = 0;
+    u32 body_start = 0;
+    while (n < sizeof(response)) {
+        const i32 got = recv_timeout(client, response + n, sizeof(response) - n, 2000);
+        REQUIRE_GT(got, 0);
+        n += static_cast<u32>(got);
+        if (body_start == 0) {
+            for (u32 i = 0; i + 3 < n; i++) {
+                if (response[i] == '\r' && response[i + 1] == '\n' &&
+                    response[i + 2] == '\r' && response[i + 3] == '\n') {
+                    body_start = i + 4;
+                    break;
+                }
+            }
+        }
+        if (body_start != 0 && n >= body_start + 2) break;
+    }
+    close(client);
+    REQUIRE_GT(n, 0u);
+    REQUIRE_NE(body_start, 0u);
+    CHECK_EQ(n, body_start + 2);
+
     char normalized[2048]{};
     REQUIRE_LT(n, static_cast<u32>(sizeof(normalized)));
     memcpy(normalized, response, n);

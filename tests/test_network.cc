@@ -13842,6 +13842,77 @@ TEST(state_invariant, jit_forward_connect_submit_failure_sends_502) {
     close(fds[1]);
 }
 
+TEST(state_invariant, jit_forward_failure_bundle_connect_submit_serializes_and_cleans_up) {
+    RouteConfig cfg;
+    auto upstream = cfg.add_upstream("api", 0x7F000001, 9000);
+    REQUIRE(upstream.has_value());
+    cfg.upstreams[upstream.value()].max_inflight = 1;
+
+    ForwardFailurePolicySpec failure{};
+    static constexpr char kReason[] = "Bad Gateway";
+    static constexpr char kContentType[] = "text/plain";
+    static constexpr char kServer[] = "rut";
+    static constexpr char kBody[] = {'e', 'r', 'r'};
+    failure.version = ForwardFailurePolicyVersion::Http11;
+    failure.status_code = 502;
+    failure.date = ForwardFailurePolicyDate::Current;
+    failure.connection = ForwardFailurePolicyConnection::Request;
+    failure.reason = {kReason, sizeof(kReason) - 1};
+    failure.content_type = {kContentType, sizeof(kContentType) - 1};
+    failure.server = {kServer, sizeof(kServer) - 1};
+    failure.body = {kBody, sizeof(kBody)};
+    REQUIRE_EQ(cfg.add_failure_policy(failure), 1u);
+    REQUIRE_EQ(cfg.add_policy_bundle(0, 1), 1u);
+
+    SmallLoop loop;
+    loop.setup();
+    i32 fds[2];
+    REQUIRE(socketpair(AF_UNIX, SOCK_STREAM, 0, fds) == 0);
+    ScopedFakeSocket fake_socket(fds[0]);
+
+    loop.inject_and_dispatch(make_ev(0, IoEventType::Accept, 42));
+    auto* c = loop.find_fd(42);
+    REQUIRE(c != nullptr);
+    c->request_config = &cfg;
+    c->keep_alive = true;
+    c->req_client_keep_alive = true;
+    c->req_keep_alive = true;
+    c->req_http_version = static_cast<u8>(HttpVersion::Http11);
+    c->req_method = static_cast<u8>(LogHttpMethod::Get);
+    c->req_path_canon = {"api", 3};
+
+    JitDispatchOutcome outcome{};
+    outcome.kind = JitDispatchOutcome::Kind::Forward;
+    outcome.upstream_id = upstream.value();
+    outcome.policy_bundle_id = 1;
+    loop.backend.clear_ops();
+    loop.backend.fail_connect = true;
+
+    handle_jit_outcome<SmallLoop>(&loop, *c, outcome, &state_invariant_wait_recv_then_status, true);
+
+    CHECK_EQ(c->failure_policy_id, 1u);
+    CHECK_EQ(c->upstream_fd, -1);
+    CHECK(!c->upstream_recv_armed);
+    CHECK(!c->upstream_send_armed);
+    CHECK(!c->upstream_slot_held);
+    CHECK_EQ(c->on_upstream_send, nullptr);
+    CHECK_EQ(c->on_upstream_recv, nullptr);
+    CHECK_EQ(c->resp_status, kStatusBadGateway);
+    CHECK_EQ(c->state, ConnState::Sending);
+    CHECK_EQ(c->on_send, &on_response_sent<SmallLoop>);
+    CHECK_EQ(loop.backend.count_ops(MockOp::Connect), 0u);
+    CHECK_EQ(loop.backend.count_ops(MockOp::Send), 1u);
+    CHECK(buf_has(c->send_buf.data(), c->send_buf.len(), "HTTP/1.1 502 Bad Gateway\r\n"));
+    CHECK(buf_has(c->send_buf.data(), c->send_buf.len(), "Content-Length: 3\r\n"));
+    REQUIRE(c->send_buf.len() >= sizeof(kBody));
+    CHECK(memcmp(c->send_buf.data() + c->send_buf.len() - sizeof(kBody),
+                 kBody,
+                 sizeof(kBody)) == 0);
+
+    close(fds[1]);
+    loop.close_conn(*c);
+}
+
 TEST(state_invariant, backend_retry_connect_submit_failure_closes_retry_fd) {
     RouteConfig cfg;
     auto upstream = cfg.add_upstream("api", 0x7F000001, 9000);
