@@ -8,17 +8,17 @@ Allowed states are `SUPPORTED`, `PARTIAL`, `BLOCKED_BY_RUT`,
 
 | nginx feature | parser | converter | RUT capability | behavior test | status |
 | --- | --- | --- | --- | --- | --- |
-| server fragment, exactly one server | yes | no | partial: no server selection model | no | NOT_IMPLEMENTED |
-| `listen <port>` IPv4 wildcard | yes | no | yes: one source `listen :<port>` declaration | RUT production request test; no nginx diff | NOT_IMPLEMENTED |
-| ordinary prefix `location /` | yes | no | partial: root catch-all exists | no | NOT_IMPLEMENTED |
-| location applies to every method | yes | no | yes: method-omitted route source form; converter not yet | no | NOT_IMPLEMENTED |
-| fixed IPv4 HTTP `proxy_pass`, no URI suffix | yes | no | partial: fixed `forward` exists | no | NOT_IMPLEMENTED |
-| preserve raw request-target and query | no | no | partial: forward currently sends original bytes | RUT-only tests, no nginx diff | PARTIAL |
-| preserve request method and body | no | no | partial: proxy streaming exists | RUT-only tests, no nginx diff | PARTIAL |
-| nginx default upstream HTTP version and request headers | no | no | partial: explicit fixed HTTP/1.1 header-only policy; #252 | RUT exact recording-upstream and H1/H2 fail-closed tests; pinned manual nginx/RUT vector | PARTIAL |
-| proxied response status and body | no | no | partial: streaming proxy exists | RUT-only tests, no nginx diff | PARTIAL |
-| nginx default proxied response header policy | no | no | partial: bounded strict H1.1 final-response/content-length serializer; #253 | RUT exact serializer/fail-closed tests and pinned manual nginx/RUT vector | PARTIAL |
-| single unavailable upstream gateway error | no | no | partial: 502/504 paths exist | RUT-only tests, no nginx diff | PARTIAL |
+| server fragment, exactly one server | yes | yes | partial: exact single-server model only; no server selection model | bounded pinned generated-RUT GET differential | PARTIAL |
+| `listen <port>` IPv4 wildcard | yes | yes | yes: one source `listen :<port>` declaration | pinned nginx/generated-RUT bind and request | SUPPORTED |
+| ordinary prefix `location /` | yes | yes | partial: root catch-all exists | bounded pinned generated-RUT GET differential | PARTIAL |
+| location applies to every method | yes | yes | yes: method-omitted route source form | RUT route tests; nginx differential only GET | PARTIAL |
+| fixed IPv4 HTTP `proxy_pass`, no URI suffix | yes | yes | partial: fixed `forward` plus bounded policies | pinned generated-RUT GET/query/header differential | PARTIAL |
+| preserve raw request-target and query | implicit | yes | partial: origin-form forward sends original bytes | pinned query differential; broader normalization untested | PARTIAL |
+| preserve request method and body | implicit | partial: method yes, body policy blocks | partial: transparent streaming exists; policy body support absent | generated-RUT differential only GET | PARTIAL |
+| nginx default upstream HTTP version and request headers | implicit | yes | partial: explicit fixed HTTP/1.1 header-only policy; #252 | exact RUT tests and pinned generated-RUT GET differential | PARTIAL |
+| proxied response status and body | implicit | yes | partial: strict final H1.1 exact-Content-Length streaming | exact RUT tests and pinned generated-RUT GET differential | PARTIAL |
+| nginx default proxied response header policy | implicit | yes | partial: bounded strict H1.1 final-response/content-length serializer; #253 | exact RUT tests and pinned generated-RUT GET differential | PARTIAL |
+| single unavailable upstream gateway error | implicit | yes | partial: 502/504 paths exist | RUT-only tests, no nginx diff | PARTIAL |
 | exact, `^~`, regex, or nested locations | no | no | no nginx selection semantics | no | NOT_PLANNED |
 | `proxy_pass` with URI replacement | no | no | literal path rewrite only | no | NOT_PLANNED |
 | multiple servers / `server_name` / `default_server` | no | no | no virtual-server selection | no | NOT_PLANNED |
@@ -44,6 +44,12 @@ Allowed states are `SUPPORTED`, `PARTIAL`, `BLOCKED_BY_RUT`,
 - Valid downstream Upgrade requests are intentionally rejected before upstream
   connect in this header-only slice; nginx 1.29.7 strips and proxies Upgrade,
   so that behavior remains PARTIAL.
+- The first converter-generated differential covers an origin-form header-only
+  GET with a query, custom Host, duplicate ordinary request headers, one final
+  exact-Content-Length upstream response, custom reason, hidden/synthesized
+  headers, duplicate response headers, and preserved trailing value whitespace.
+  Dynamic Date is the only normalized response field. This does not cover the
+  POST/body or unavailable-upstream cases required to complete #254.
 - Response policy is intentionally limited to non-HEAD HTTP/1.1 requests and
   one final HTTP/1.1 response with exact Content-Length. Bodies, Upgrade,
   absolute-form targets, HTTP/1.0, HTTP/2, interim/no-body statuses, chunking,

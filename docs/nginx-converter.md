@@ -95,12 +95,29 @@ evidence must use a pinned nginx build and cannot treat that skip as a pass.
    still need resolution.
 3. Add capability validation and deterministic RUT lowering for the minimal
    model after listener and proxy policy dependencies are explicitly resolved;
-   then add the first serialized differential smoke case.
+   then add the first serialized differential smoke case. This increment is
+   complete for the bounded header-only H1.1 GET/final-Content-Length vector;
+   it does not complete the broader minimal-fragment behavior claim.
 
 ## Known capability dependencies
 
 - #250 (closed): downstream listener capability is available for one source
-  wildcard listener; converter lowering and nginx differential evidence remain
-  pending in #254.
-- #252: upstream HTTP request policy for `forward`.
-- #253: proxied response header policy.
+  wildcard listener; bounded converter lowering and nginx differential evidence
+  are complete, while broader #254 acceptance remains pending.
+- #252: a bounded header-only H1.1 upstream request policy is available;
+  Content-Length bodies and broader request behavior remain `PARTIAL`.
+- #253: a bounded final-H1.1 exact-Content-Length response policy is available;
+  broader response framing/control behavior remains `PARTIAL`.
+
+## First process-loop evidence
+
+Using pinned nginx 1.29.7 at digest
+`sha256:1854da86e82d5dfb49a8f3d78b099adcc7e36608b207146ed95cd47937938a40`,
+the same server fragment was included by nginx and parsed/lowered by the
+converter API. A header-only GET/query request with duplicate ordinary headers
+produced byte-identical recorded upstream requests. Both downstream responses
+matched the pinned expected response after normalizing only the generated Date.
+
+This is the first real nginx -> converter -> RUT -> runtime loop, not completion
+of issue #254. POST bodies and unavailable-upstream behavior remain required by
+that issue's acceptance test, and no general `proxy_pass` support is claimed.
