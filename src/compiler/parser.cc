@@ -1848,10 +1848,64 @@ struct Parser {
                                                   kw_text);
                         stmt.forward_failure_policy_id = policy_id;
                         stmt.has_forward_failure_policy = true;
+                    } else if (kw_text.eq({"target_transform", 16})) {
+                        if (stmt.has_forward_target_transform)
+                            return frontend_error(
+                                FrontendError::UnexpectedToken, span_from(*kw.value()), kw_text);
+                        if (stmt.has_forward_set_path || stmt.forward_set_headers.len != 0)
+                            return frontend_error(FrontendError::UnsupportedSyntax,
+                                                  span_from(*kw.value()), kw_text);
+                        auto lbrace = expect(TokenType::LBrace);
+                        if (!lbrace) return core::make_unexpected(lbrace.error());
+                        if (cur().type == TokenType::RBrace)
+                            return frontend_error(FrontendError::UnsupportedSyntax,
+                                                  span_from(cur()), kw_text);
+                        ForwardTargetTransformSpec transform{};
+                        bool have_strip_prefix = false;
+                        bool have_replace_prefix = false;
+                        while (true) {
+                            auto field = expect(TokenType::Ident);
+                            if (!field) return core::make_unexpected(field.error());
+                            const Str field_name = field.value()->text;
+                            auto fcolon = expect(TokenType::Colon);
+                            if (!fcolon) return core::make_unexpected(fcolon.error());
+                            bool* seen = nullptr;
+                            if (field_name.eq({"strip_prefix", 12})) {
+                                seen = &have_strip_prefix;
+                                auto value = expect(TokenType::StringLit);
+                                if (!value) return core::make_unexpected(value.error());
+                                transform.strip_prefix = value.value()->text;
+                            } else if (field_name.eq({"replace_prefix", 14})) {
+                                seen = &have_replace_prefix;
+                                auto value = expect(TokenType::StringLit);
+                                if (!value) return core::make_unexpected(value.error());
+                                transform.replace_prefix = value.value()->text;
+                            } else {
+                                return frontend_error(FrontendError::UnexpectedToken,
+                                                      span_from(*field.value()), field_name);
+                            }
+                            if (*seen)
+                                return frontend_error(FrontendError::UnexpectedToken,
+                                                      span_from(*field.value()), field_name);
+                            *seen = true;
+                            if (!take(TokenType::Comma)) break;
+                            if (cur().type == TokenType::RBrace) break;
+                        }
+                        auto rbrace = expect(TokenType::RBrace);
+                        if (!rbrace) return core::make_unexpected(rbrace.error());
+                        if (!have_strip_prefix || !have_replace_prefix ||
+                            !forward_target_transform_spec_valid(transform))
+                            return frontend_error(FrontendError::UnsupportedSyntax,
+                                                  span_from(*rbrace.value()), kw_text);
+                        stmt.forward_target_transform = transform;
+                        stmt.has_forward_target_transform = true;
                     } else if (kw_text.eq({"set_path", 8})) {
                         if (stmt.has_forward_set_path)
                             return frontend_error(
                                 FrontendError::UnexpectedToken, span_from(*kw.value()), kw_text);
+                        if (stmt.has_forward_target_transform)
+                            return frontend_error(FrontendError::UnsupportedSyntax,
+                                                  span_from(*kw.value()), kw_text);
                         auto val = expect(TokenType::StringLit);
                         if (!val) return core::make_unexpected(val.error());
                         stmt.forward_set_path = val.value()->text;
@@ -1863,6 +1917,9 @@ struct Parser {
                         if (stmt.forward_set_headers.len != 0)
                             return frontend_error(
                                 FrontendError::UnexpectedToken, span_from(*kw.value()), kw_text);
+                        if (stmt.has_forward_target_transform)
+                            return frontend_error(FrontendError::UnsupportedSyntax,
+                                                  span_from(*kw.value()), kw_text);
                         auto lbrace = expect(TokenType::LBrace);
                         if (!lbrace) return core::make_unexpected(lbrace.error());
                         if (cur().type == TokenType::RBrace)  // empty dict → omit the kwarg
@@ -1913,7 +1970,7 @@ struct Parser {
                         return frontend_error(
                             FrontendError::UnexpectedToken, span_from(*kw.value()), kw_text);
                     }
-                    if (stmt.has_forward_request_policy &&
+                    if ((stmt.has_forward_request_policy || stmt.has_forward_target_transform) &&
                         (stmt.has_forward_set_path || stmt.forward_set_headers.len != 0))
                         return frontend_error(FrontendError::UnsupportedSyntax,
                                               span_from(*kw.value()), kw_text);

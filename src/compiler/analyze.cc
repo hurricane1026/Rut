@@ -9722,6 +9722,16 @@ static FrontendResult<HirTerminator> analyze_term(const AstStatement& stmt, cons
         term.forward_response_policy_id = stmt.forward_response_policy_id;
     if (stmt.has_forward_failure_policy)
         term.forward_failure_policy_id = stmt.forward_failure_policy_id;
+    if (stmt.has_forward_target_transform) {
+        if (!forward_target_transform_spec_valid(stmt.forward_target_transform) ||
+            stmt.has_forward_set_path || stmt.forward_set_headers.len != 0)
+            return frontend_error(
+                FrontendError::UnsupportedSyntax,
+                stmt.span,
+                lit_str("target_transform cannot be combined with request target or header overrides"));
+        term.has_forward_target_transform = true;
+        term.forward_target_transform = stmt.forward_target_transform;
+    }
     // Carry forward(set_header:) overrides verbatim (parser validated + deduped).
     for (u32 i = 0; i < stmt.forward_set_headers.len; i++) {
         const auto& p = stmt.forward_set_headers[i];
@@ -18787,7 +18797,8 @@ static FrontendResult<HirModule*> analyze_file_internal(
             // direct-RIR callers.
             auto policy_mutation_conflict = [](const HirTerminator& term) {
                 return term.kind == HirTerminatorKind::ForwardUpstream &&
-                       ((term.forward_request_policy_id != 0 && term.commit_response_mutations) ||
+                       ((term.has_forward_target_transform && term.commit_response_mutations) ||
+                        (term.forward_request_policy_id != 0 && term.commit_response_mutations) ||
                         (term.forward_response_policy_id != 0 &&
                          term.commit_response_mutations));
             };
@@ -18821,7 +18832,9 @@ static FrontendResult<HirModule*> analyze_file_internal(
                 return frontend_error(
                     FrontendError::UnsupportedSyntax,
                     conflict->span,
-                    conflict->forward_response_policy_id != 0
+                    conflict->has_forward_target_transform
+                        ? lit_str("target_transform cannot be combined with response header mutations")
+                        : conflict->forward_response_policy_id != 0
                         ? lit_str("response_policy cannot be combined with response header mutations")
                         : lit_str("request_policy cannot be combined with response header mutations"));
         }

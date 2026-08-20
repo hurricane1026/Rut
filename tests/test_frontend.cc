@@ -32710,6 +32710,130 @@ TEST(frontend, target_transform_internal_metadata_reaches_rir_and_preserves_poli
     rir.destroy();
 }
 
+TEST(frontend, target_transform_source_reaches_rir_and_preserves_all_forward_policies) {
+    const char source[] = R"rut(
+upstream backend at "127.0.0.1:9000"
+route GET "/api" {
+    return forward(backend,
+        target_transform: { strip_prefix: "/api/", replace_prefix: "/" },
+        request_policy: {
+            version: "HTTP/1.1", host: "upstream", connection: "omit",
+            strip_headers: ["Connection", "Keep-Alive", "TE", "Expect", "Upgrade"]
+        },
+        response_policy: {
+            version: "HTTP/1.1", framing: "content_length", connection: "keep_alive",
+            server: "rut", date: "current", hide_headers: []
+        },
+        failure_policy: {
+            version: "HTTP/1.1", status: 502, reason: "Bad Gateway",
+            content_type: "text/plain", server: "rut", date: "current",
+            connection: "request", body: b"unavailable"
+        })
+}
+)rut";
+    auto lexed = lex(lit(source));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto* stmt = ast->items[1].route.statements[0];
+    REQUIRE(stmt != nullptr);
+    REQUIRE(stmt->has_forward_target_transform);
+    CHECK(stmt->forward_target_transform.strip_prefix.eq(lit("/api/")));
+    CHECK(stmt->forward_target_transform.replace_prefix.eq(lit("/")));
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    const auto& hterm = hir->routes[0].control.direct_term;
+    REQUIRE(hterm.has_forward_target_transform);
+    CHECK(hterm.forward_target_transform.strip_prefix.eq(lit("/api/")));
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    const auto& mterm = mir->functions[0].blocks[0].term;
+    REQUIRE(mterm.has_forward_target_transform);
+    CHECK_EQ(mterm.forward_request_policy_id, 1u);
+    CHECK_EQ(mterm.forward_response_policy_id, 1u);
+    CHECK_EQ(mterm.forward_failure_policy_id, 1u);
+    FrontendRirModule rir{};
+    REQUIRE(lower_to_rir(mir.value(), rir));
+    REQUIRE_EQ(rir.module.target_transform_count, 1u);
+    CHECK(rir.module.target_transforms[0].strip_prefix.eq(lit("/api/")));
+    const auto& block = rir.module.functions[0].blocks[0];
+    REQUIRE_GE(block.inst_count, 2u);
+    CHECK_EQ(block.insts[block.inst_count - 2].op, rir::Opcode::ReqSetTargetTransform);
+    CHECK_EQ(block.insts[block.inst_count - 2].imm.i32_val, 1);
+    CHECK_EQ(block.insts[block.inst_count - 1].op, rir::Opcode::RetForwardBundle);
+    CHECK_EQ(block.insts[block.inst_count - 1].operand_count, 3u);
+    rir.destroy();
+}
+
+TEST(frontend, target_transform_source_rejects_invalid_objects_and_compositions) {
+    const char* invalid[] = {
+        "upstream b\nroute GET \"/\" { return forward(b, target_transform: {}) }\n",
+        "upstream b\nroute GET \"/\" { return forward(b, target_transform: { strip_prefix: \"/api/\" }) }\n",
+        "upstream b\nroute GET \"/\" { return forward(b, target_transform: { replace_prefix: \"/\" }) }\n",
+        "upstream b\nroute GET \"/\" { return forward(b, target_transform: { strip_prefix: \"/api/\", strip_prefix: \"/x/\", replace_prefix: \"/\" }) }\n",
+        "upstream b\nroute GET \"/\" { return forward(b, target_transform: { strip_prefix: \"/api/\", replace_prefix: \"/\", extra: \"/x/\" }) }\n",
+        "upstream b\nroute GET \"/\" { return forward(b, target_transform: { strip_prefix: 1, replace_prefix: \"/\" }) }\n",
+        "upstream b\nroute GET \"/\" { return forward(b, target_transform: { strip_prefix: \"api/\", replace_prefix: \"/\" }) }\n",
+        "upstream b\nroute GET \"/\" { return forward(b, target_transform: { strip_prefix: \"/api/\", replace_prefix: \"/x\" }) }\n",
+        "upstream b\nroute GET \"/\" { return forward(b, target_transform: { strip_prefix: \"/api/\", replace_prefix: \"/\" }, target_transform: { strip_prefix: \"/web/\", replace_prefix: \"/\" }) }\n",
+        "upstream b\nroute GET \"/\" { return forward(b, target_transform: { strip_prefix: \"/api/\", replace_prefix: \"/\" }, set_path: \"/x\") }\n",
+        "upstream b\nroute GET \"/\" { return forward(b, set_path: \"/x\", target_transform: { strip_prefix: \"/api/\", replace_prefix: \"/\" }) }\n",
+        "upstream b\nroute GET \"/\" { return forward(b, target_transform: { strip_prefix: \"/api/\", replace_prefix: \"/\" }, set_header: { \"X-Test\": \"v\" }) }\n",
+    };
+    for (const char* source : invalid) {
+        auto lexed = lex(lit(source));
+        REQUIRE(lexed);
+        auto ast = parse_file_heap(lexed.value());
+        CHECK_FALSE(ast.has_value());
+        if (!ast) CHECK_GT(ast.error().span.line, 0u);
+    }
+}
+
+TEST(frontend, target_transform_analyzer_defends_forged_spec) {
+    const char source[] =
+        "upstream b\nroute GET \"/\" { return forward(b, target_transform: { strip_prefix: \"/api/\", replace_prefix: \"/\" }) }\n";
+    auto lexed = lex(lit(source));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto* stmt = ast->items[1].route.statements[0];
+    REQUIRE(stmt != nullptr);
+    stmt->forward_target_transform.strip_prefix = {nullptr, 5};
+    auto hir = analyze_file_heap(ast.value());
+    CHECK_FALSE(hir.has_value());
+    CHECK_EQ(hir.error().code, FrontendError::UnsupportedSyntax);
+}
+
+TEST(frontend, target_transform_rejects_response_mutations_in_direct_and_if_control) {
+    const char* sources[] = {
+        R"rut(
+upstream b
+func add_header(_ resp: Response) -> i32 { resp.set("X-Test", "v") 0 }
+chain access { after add_header(resp) }
+route GET "/" use chain access { return forward(b, target_transform: { strip_prefix: "/api/", replace_prefix: "/" }) }
+)rut",
+        R"rut(
+upstream b
+func add_header(_ resp: Response) -> i32 { resp.set("X-Test", "v") 0 }
+chain access { after add_header(resp) }
+route GET "/" use chain access {
+    if req.http11 {
+        return forward(b, target_transform: { strip_prefix: "/api/", replace_prefix: "/" })
+    } else { return 200 }
+}
+)rut"};
+    for (const char* source : sources) {
+        auto lexed = lex(lit(source));
+        REQUIRE(lexed);
+        auto ast = parse_file_heap(lexed.value());
+        REQUIRE(ast);
+        auto hir = analyze_file_heap(ast.value());
+        CHECK_FALSE(hir.has_value());
+        if (!hir) CHECK(hir.error().detail.eq(
+            lit("target_transform cannot be combined with response header mutations")));
+    }
+}
+
 TEST(frontend, target_transform_duplicates_reuse_stable_first_ids) {
     std::string source = "upstream backend at \"127.0.0.1:9000\"\n";
     for (u32 i = 0; i < 3; i++) {

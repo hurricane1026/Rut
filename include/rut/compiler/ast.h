@@ -5,6 +5,7 @@
 #include "rut/common/failure_policy.h"
 #include "rut/common/types.h"
 #include "rut/common/request_policy.h"
+#include "rut/common/forward_target_transform.h"
 #include "rut/compiler/diagnostic.h"
 
 namespace rut {
@@ -264,6 +265,11 @@ struct AstStatement {
     // `forward_set_headers.len == 0` means "no kwarg" (empty dict is rejected).
     static constexpr u32 kMaxForwardSetHeaders = 16;
     FixedVec<AstHeaderKV, kMaxForwardSetHeaders> forward_set_headers;
+    // `forward(target_transform: { ... })`: bounded clean-prefix rewrite.
+    // Literal strings use the same borrowed-source lifetime as the other AST
+    // literals; analyzer/lowering validate again before RIR ownership.
+    bool has_forward_target_transform = false;
+    ForwardTargetTransformSpec forward_target_transform{};
     // `forward(request_policy: {...})`: non-zero immutable policy id. The
     // parser requires the complete first normalized HTTP/1 policy object.
     u16 forward_request_policy_id = 0;
