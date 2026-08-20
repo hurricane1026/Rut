@@ -9052,6 +9052,14 @@ static u64 forward_failure_bundle_handler(void* /*conn*/,
     return rut::jit::HandlerResult::make_forward_with_bundle(0, 0, 1).pack();
 }
 
+static u64 forward_invalid_bundle_handler(void* /*conn*/,
+                                          rut::jit::HandlerCtx* /*ctx*/,
+                                          const u8* /*req*/,
+                                          u32 /*len*/,
+                                          void* /*arena*/) {
+    return rut::jit::HandlerResult::make_forward_with_bundle(0, 0, 99).pack();
+}
+
 // Runtime defense-in-depth vector: source analysis rejects this combination,
 // so a direct handler leaves a pending response mutation for handle_jit_outcome
 // to reject before apply_request_policy can rewrite recv_buf.
@@ -16787,6 +16795,9 @@ TEST(route, failure_policy_bundle_rejects_before_upstream_side_effects_and_owns_
     REQUIRE_EQ(cfg.add_policy_bundle(0, 1), 1u);
     REQUIRE_EQ(cfg.add_response_policy(test_response_policy_spec()), 1u);
     REQUIRE_EQ(cfg.add_policy_bundle(1, 1), 2u);
+    CHECK(!cfg.policy_bundle_id_is_valid(0));
+    CHECK(cfg.policy_bundle_id_is_valid(1));
+    CHECK(!cfg.policy_bundle_id_is_valid(99));
     REQUIRE(cfg.failure_policies[0].body.ptr != original_body);
     CHECK(cfg.failure_policies[0].reason.ptr != failure.reason.ptr);
     CHECK(cfg.failure_policies[0].content_type.ptr != failure.content_type.ptr);
@@ -16798,6 +16809,7 @@ TEST(route, failure_policy_bundle_rejects_before_upstream_side_effects_and_owns_
     CHECK(cfg.failure_policies[0].body.ptr[2] == '\n');
     CHECK(cfg.failure_policies[0].body.ptr[3] == 'x');
     REQUIRE(cfg.add_jit_handler("/api", 'G', &forward_failure_bundle_handler));
+    REQUIRE(cfg.add_jit_handler("/bad", 'G', &forward_invalid_bundle_handler));
     const RouteConfig* active = &cfg;
     ScopedProxyLoop proxy;
     REQUIRE(proxy.setup(&active, 1000));
@@ -16811,6 +16823,27 @@ TEST(route, failure_policy_bundle_rejects_before_upstream_side_effects_and_owns_
     close(client);
     CHECK_GT(response_len, 0);
     CHECK(buf_contains(response, static_cast<u32>(response_len), "400", 3));
+    usleep(100000);
+    CHECK_EQ(backend.accepted_count.load(std::memory_order_acquire), 0u);
+    CHECK_EQ(backend.request_count.load(std::memory_order_acquire), 0u);
+
+    // Direct-RIR callers can return an out-of-range bundle id.  The runtime
+    // must reject it before selecting a backend or opening an upstream fd.
+    i32 invalid_client = connect_to(proxy.port);
+    REQUIRE_GE(invalid_client, 0);
+    set_socket_timeouts(invalid_client, 2);
+    static constexpr char kInvalidRequest[] =
+        "GET /bad HTTP/1.1\r\nHost: client.example\r\n\r\n";
+    REQUIRE(send_all(invalid_client, kInvalidRequest, sizeof(kInvalidRequest) - 1));
+    char invalid_response[512];
+    const i32 invalid_response_len =
+        recv_timeout(invalid_client, invalid_response, sizeof(invalid_response), 2000);
+    close(invalid_client);
+    CHECK_GT(invalid_response_len, 0);
+    CHECK(buf_contains(invalid_response,
+                       static_cast<u32>(invalid_response_len),
+                       "400",
+                       static_cast<u32>(strlen("400"))));
     usleep(100000);
     CHECK_EQ(backend.accepted_count.load(std::memory_order_acquire), 0u);
     CHECK_EQ(backend.request_count.load(std::memory_order_acquire), 0u);

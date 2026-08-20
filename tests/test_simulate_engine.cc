@@ -769,6 +769,21 @@ TEST(simulate_engine, forward_upstream_match) {
     ctx.destroy();
 }
 
+TEST(simulate_engine, forward_bundle_is_explicitly_unsupported) {
+    const char* src =
+        "upstream backend\nroute GET \"/api\" { return forward(backend, failure_policy: { version: \"HTTP/1.1\", status: 502, reason: \"Bad Gateway\", content_type: \"text/plain\", server: \"nginx\", date: \"current\", connection: \"request\", body: b\"unavailable\" }) }\n";
+    FrontendRirModule rir{};
+    REQUIRE(compile_to_rir(src, rir));
+    Engine engine;
+    REQUIRE(engine.init(rir.module, nullptr, 0));
+    const auto result =
+        simulate_one(engine, make_entry("GET /api HTTP/1.1\r\nHost: x\r\n\r\n", 502));
+    CHECK_EQ(result.action, jit::HandlerAction::ForwardBundle);
+    CHECK_EQ(result.verdict, Verdict::Unsupported);
+    engine.shutdown();
+    rir.destroy();
+}
+
 TEST(simulate_engine, default_200_when_no_route_matches) {
     Manifest manifest{};
 
