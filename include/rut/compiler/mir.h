@@ -2,6 +2,7 @@
 
 #include "rut/common/rate_limit_key_spec.h"
 #include "rut/common/types.h"
+#include "rut/common/request_policy.h"
 #include "rut/common/wait_limits.h"
 #include "rut/compiler/ast.h"
 #include "rut/compiler/diagnostic.h"
@@ -278,6 +279,7 @@ struct MirTerminator {
     // Request-header overrides for forward(set_header:) — carried verbatim from
     // HIR. len > 0 → lower_rir emits one ReqSetHeader per entry before RetForward.
     FixedVec<MirHeaderKV, kMaxHeaders> forward_set_headers;
+    u8 forward_request_policy_id = 0;
 };
 
 struct MirBlock {

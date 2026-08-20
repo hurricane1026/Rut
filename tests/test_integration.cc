@@ -15842,6 +15842,192 @@ struct EchoHeaderServer {
     }
 };
 
+struct RecordingUpstream {
+    i32 listen_fd = -1;
+    u16 port = 0;
+    std::atomic<bool> running{false};
+    std::atomic<u32> request_count{0};
+    char request[8192]{};
+    u32 request_len = 0;
+    bool started = false;
+    pthread_t thread{};
+
+    ~RecordingUpstream() { teardown(); }
+
+    static void* run(void* arg) {
+        auto* s = static_cast<RecordingUpstream*>(arg);
+        while (s->running.load(std::memory_order_acquire)) {
+            i32 client = accept(s->listen_fd, nullptr, nullptr);
+            if (client < 0) {
+                if (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK) {
+                    usleep(1000);
+                    continue;
+                }
+                break;
+            }
+            char buf[8192];
+            u32 total = 0;
+            while (total < sizeof(buf)) {
+                i32 n = recv_timeout(client, buf + total, sizeof(buf) - total, 1000);
+                if (n <= 0) break;
+                total += static_cast<u32>(n);
+                if (buf_contains(buf, total, "\r\n\r\n", 4)) break;
+            }
+            if (total > sizeof(s->request)) total = sizeof(s->request);
+            memcpy(s->request, buf, total);
+            s->request_len = total;
+            s->request_count.fetch_add(1, std::memory_order_release);
+            static const char kResponse[] =
+                "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok";
+            (void)send_all(client, kResponse, sizeof(kResponse) - 1);
+            close(client);
+        }
+        return nullptr;
+    }
+
+    bool setup() {
+        auto lfd = create_listen_socket(0);
+        if (!lfd.has_value()) return false;
+        listen_fd = lfd.value();
+        port = get_port(listen_fd);
+        running.store(true, std::memory_order_release);
+        if (pthread_create(&thread, nullptr, run, this) != 0) {
+            running.store(false, std::memory_order_release);
+            close(listen_fd);
+            listen_fd = -1;
+            return false;
+        }
+        started = true;
+        return true;
+    }
+
+    void teardown() {
+        running.store(false, std::memory_order_release);
+        if (started) {
+            pthread_join(thread, nullptr);
+            started = false;
+        }
+        if (listen_fd >= 0) {
+            close(listen_fd);
+            listen_fd = -1;
+        }
+    }
+};
+
+TEST(route, forward_request_policy_rebuilds_nginx_h11_headers) {
+    using namespace rut;
+    RecordingUpstream upstream;
+    REQUIRE(upstream.setup());
+    char source[1024];
+    const int source_len = snprintf(
+        source,
+        sizeof(source),
+        "upstream backend at \"127.0.0.1:%u\"\n"
+        "route GET \"/api\" { return forward(backend, request_policy: { "
+        "version: \"HTTP/1.1\", host: \"upstream\", connection: \"omit\", "
+        "strip_headers: [\"Connection\", \"Keep-Alive\", \"TE\", \"Expect\", \"Upgrade\"] }) }\n",
+        upstream.port);
+    REQUIRE_GT(source_len, 0);
+    REQUIRE_LT(source_len, static_cast<int>(sizeof(source)));
+    auto lexed = lex(Str{source, static_cast<u32>(source_len)});
+    REQUIRE(lexed);
+    auto ast = parse_file(lexed.value());
+    REQUIRE(ast);
+    std::unique_ptr<AstFile> ast_owned(ast.value());
+    auto hir = analyze_file(*ast_owned);
+    REQUIRE(hir);
+    std::unique_ptr<HirModule> hir_owned(hir.value());
+    auto mir = build_mir(*hir_owned);
+    REQUIRE(mir);
+    std::unique_ptr<MirModule> mir_owned(mir.value());
+    FrontendRirModule rir{};
+    REQUIRE(lower_to_rir(*mir_owned, rir));
+    auto cg = jit::codegen(rir.module);
+    REQUIRE(cg.ok);
+    jit::JitEngine engine;
+    REQUIRE(engine.init());
+    REQUIRE(engine.compile(cg.mod, cg.ctx));
+    RouteConfig cfg{};
+    REQUIRE(populate_route_config(cfg, rir.module));
+    REQUIRE(register_jit_routes(cfg, rir.module, engine));
+    const RouteConfig* active = &cfg;
+    ScopedProxyLoop proxy;
+    REQUIRE(proxy.setup(&active, 1000));
+
+    const char request[] =
+        "GET /api?q=raw%2Fquery HTTP/1.1\r\n"
+        "Host: client.example\r\n"
+        "Connection: Foo, Bar\r\n"
+        "Foo: retained-one\r\n"
+        "Bar: retained-two\r\n"
+        "Keep-Alive: timeout=5\r\n"
+        "TE: trailers\r\n"
+        "Expect: 100-continue\r\n"
+        "Upgrade: websocket\r\n"
+        "Proxy-Connection: keep-alive\r\n"
+        "Trailer: X-Trailer\r\n"
+        "X-Duplicate: one\r\n"
+        "X-Duplicate: two\r\n\r\n";
+    i32 client = connect_to(proxy.port);
+    REQUIRE_GE(client, 0);
+    REQUIRE(send_all(client, request, sizeof(request) - 1));
+    char response[1024];
+    const i32 response_read = recv_timeout(client, response, sizeof(response), 2000);
+    const u32 response_len = response_read > 0 ? static_cast<u32>(response_read) : 0;
+    close(client);
+    CHECK_GT(response_len, 0u);
+
+    for (u32 i = 0; i < 200 && upstream.request_count.load(std::memory_order_acquire) == 0; i++)
+        usleep(5000);
+    REQUIRE_EQ(upstream.request_count.load(std::memory_order_acquire), 1u);
+    const Str forwarded{upstream.request, upstream.request_len};
+    CHECK(buf_contains(forwarded.ptr,
+                       forwarded.len,
+                       "GET /api?q=raw%2Fquery HTTP/1.1\r\n",
+                       static_cast<u32>(strlen("GET /api?q=raw%2Fquery HTTP/1.1\r\n"))));
+    char expected_host[64];
+    const int host_len = snprintf(expected_host, sizeof(expected_host), "Host: 127.0.0.1:%u\r\n", upstream.port);
+    REQUIRE_GT(host_len, 0);
+    CHECK(buf_contains(forwarded.ptr, forwarded.len, expected_host, static_cast<u32>(host_len)));
+    CHECK(!buf_contains(forwarded.ptr,
+                        forwarded.len,
+                        "HTTP/1.1\r\nConnection:",
+                        strlen("HTTP/1.1\r\nConnection:")));
+    CHECK(!buf_contains(forwarded.ptr,
+                        forwarded.len,
+                        "\r\nConnection:",
+                        strlen("\r\nConnection:")));
+    CHECK(!buf_contains(forwarded.ptr, forwarded.len, "Keep-Alive:", strlen("Keep-Alive:")));
+    CHECK(!buf_contains(forwarded.ptr, forwarded.len, "TE:", strlen("TE:")));
+    CHECK(!buf_contains(forwarded.ptr, forwarded.len, "Expect:", strlen("Expect:")));
+    CHECK(!buf_contains(forwarded.ptr, forwarded.len, "Upgrade:", strlen("Upgrade:")));
+    CHECK(buf_contains(forwarded.ptr, forwarded.len, "Foo: retained-one\r\n", strlen("Foo: retained-one\r\n")));
+    CHECK(buf_contains(forwarded.ptr, forwarded.len, "Bar: retained-two\r\n", strlen("Bar: retained-two\r\n")));
+    CHECK(buf_contains(forwarded.ptr, forwarded.len, "Proxy-Connection: keep-alive\r\n", strlen("Proxy-Connection: keep-alive\r\n")));
+    CHECK(buf_contains(forwarded.ptr, forwarded.len, "Trailer: X-Trailer\r\n", strlen("Trailer: X-Trailer\r\n")));
+    CHECK(buf_contains(forwarded.ptr, forwarded.len, "X-Duplicate: one\r\nX-Duplicate: two\r\n", strlen("X-Duplicate: one\r\nX-Duplicate: two\r\n")));
+
+    // Header-only policy rejects framing before opening or writing an upstream
+    // socket; the recorder must see no second request.
+    const char body_request[] =
+        "GET /api HTTP/1.1\r\nHost: client.example\r\nContent-Length: 0\r\n\r\n";
+    client = connect_to(proxy.port);
+    REQUIRE_GE(client, 0);
+    REQUIRE(send_all(client, body_request, sizeof(body_request) - 1));
+    char body_response[512];
+    const i32 body_response_len = recv_timeout(client, body_response, sizeof(body_response), 2000);
+    close(client);
+    CHECK_GT(body_response_len, 0);
+    CHECK(buf_contains(body_response,
+                       static_cast<u32>(body_response_len),
+                       "400",
+                       static_cast<u32>(strlen("400"))));
+    usleep(100000);
+    CHECK_EQ(upstream.request_count.load(std::memory_order_acquire), 1u);
+    engine.shutdown();
+    rir.destroy();
+}
+
 // Compile `forward(backend, set_header: <dict>)`, drive one GET /api through the
 // proxy, and return true iff the upstream's echo of `echo_header` contained
 // `expect`. Plain bool result (no REQUIRE/CHECK) so it can run as a free helper.

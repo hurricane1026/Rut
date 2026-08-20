@@ -3052,10 +3052,17 @@ static FrontendResult<void> emit_term(const MirTerminator& term,
         auto upstream =
             b.emit_const_i32(static_cast<i32>(upstream_id), {term.span.line, term.span.col});
         if (!upstream) return frontend_error(FrontendError::OutOfMemory, term.span);
+        rir::ValueId policy = rir::kNoValue;
+        if (term.forward_request_policy_id != 0) {
+            auto p = b.emit_const_i32(static_cast<i32>(term.forward_request_policy_id),
+                                      {term.span.line, term.span.col});
+            if (!p) return frontend_error(FrontendError::OutOfMemory, term.span);
+            policy = p.value();
+        }
         if (term.commit_response_mutations &&
             !b.emit_resp_commit_headers({term.span.line, term.span.col}))
             return frontend_error(FrontendError::OutOfMemory, term.span);
-        if (!b.emit_ret_forward(upstream.value(), {term.span.line, term.span.col}))
+        if (!b.emit_ret_forward(upstream.value(), policy, {term.span.line, term.span.col}))
             return frontend_error(FrontendError::OutOfMemory, term.span);
         return {};
     }

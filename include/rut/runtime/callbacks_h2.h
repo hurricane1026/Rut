@@ -753,6 +753,10 @@ void h2_invoke_emit(H2Dispatch<Loop>& d,
         return;
     }
     if (kOutcome.kind == JitDispatchOutcome::Kind::Forward) {
+        if (kOutcome.request_policy_id != 0) {
+            h2_emit_status(d, stream_id, 400);
+            return;
+        }
         if (request_body_followed && open_request == nullptr) {
             h2_emit_status(d, stream_id, 503);
             return;
@@ -1417,7 +1421,8 @@ void h2_resume_jit_handler(Loop* loop, Connection& conn) {
 
     if (kOutcome.kind == JitDispatchOutcome::Kind::Forward) {
         u16 failure_status = 0;
-        if (h2->async_request_body_followed && !h2->async_request_stream_open) {
+        if (kOutcome.request_policy_id != 0) failure_status = 400;
+        if (failure_status == 0 && h2->async_request_body_followed && !h2->async_request_stream_open) {
             failure_status = 503;
         } else if (!h2->async_request_forwardable) {
             failure_status = 400;

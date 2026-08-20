@@ -1121,14 +1121,25 @@ struct Builder {
         return {};
     }
 
-    VoidResult emit_ret_forward(ValueId upstream, SourceLoc loc = {}) {
+    VoidResult emit_ret_forward(ValueId upstream,
+                                ValueId request_policy = kNoValue,
+                                SourceLoc loc = {}) {
         if (!valid_val(upstream)) return err(RirError::InvalidState);
         // Upstream operand must be an integer type (upstream id).
         if (!val_has_type(upstream, TypeKind::I32) && !val_has_type(upstream, TypeKind::U32))
             return err(RirError::InvalidState);
+        if (request_policy != kNoValue &&
+            (!valid_val(request_policy) ||
+             (!val_has_type(request_policy, TypeKind::I32) &&
+              !val_has_type(request_policy, TypeKind::U32))))
+            return err(RirError::InvalidState);
         auto r = TRY(emit(Opcode::RetForward, nullptr, loc));
         r.inst->operands[0] = upstream;
         r.inst->operand_count = 1;
+        if (request_policy != kNoValue) {
+            r.inst->operands[1] = request_policy;
+            r.inst->operand_count = 2;
+        }
         return {};
     }
 

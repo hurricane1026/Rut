@@ -21,6 +21,7 @@
 #include "rut/runtime/ws_terminate.h"  // ws_inspect for terminate-mode tunnels
 
 #include <errno.h>
+#include <arpa/inet.h>
 #include <openssl/rand.h>  // RAND_bytes — fresh outbound mask-key seed (terminate mode)
 #include <sys/socket.h>
 #include <unistd.h>
@@ -492,6 +493,9 @@ void format_response_with_body_and_headers(Connection& conn,
                                            bool keep_alive,
                                            bool body_is_fallback_reason_phrase = false,
                                            bool suppress_default_content_type = false);
+inline bool apply_request_policy(Connection& conn, const sockaddr_in& endpoint, u8 policy_id);
+template <typename Loop>
+inline void reject_request_policy(Loop* loop, Connection& conn);
 void prepare_early_response_state(Connection& conn);
 u32 consume_upstream_sent(Connection& conn);
 
@@ -1037,6 +1041,7 @@ void on_header_received(void* lp, Connection& conn, IoEvent ev) {
     conn.req_header_override_count = 0;  // forward(set_header:) — same leak risk
     conn.req_header_append_mask = 0;
     conn.req_header_override_overflow = false;
+    conn.request_policy_id = 0;
     conn.resp_header_mutation_pending_count = 0;
     conn.resp_header_mutation_pending_overflow = false;
     conn.resp_header_mutation_count = 0;
@@ -2158,6 +2163,19 @@ void handle_jit_outcome(Loop* loop,
                 static_cast<u16>(outcome.upstream_id), target.addr_count, conn.upstream_start_us);
             conn.upstream_backend_idx = static_cast<u8>(kBackend);
 
+            conn.request_policy_id = outcome.request_policy_id;
+            if (conn.request_policy_id != 0) {
+                // The source compiler rejects these combinations. Keep the
+                // runtime guard for direct-RIR/JIT callers so policy never
+                // silently loses precedence against an in-place mutation.
+                if (conn.req_path_overridden || conn.req_header_override_count != 0 ||
+                    conn.req_header_override_overflow ||
+                    !apply_request_policy(conn, target.addrs[kBackend], conn.request_policy_id)) {
+                    reject_request_policy(loop, conn);
+                    return;
+                }
+            }
+
             // Idle reuse (mirrors the direct RouteAction::Proxy path): borrow a live
             // pooled socket to this endpoint and skip the connect. Without this take
             // path, JIT forward(...) completions would deposit idle fds the pool never
@@ -2595,6 +2613,166 @@ inline bool snapshot_response_mutations_before_request_rewrite(Connection& conn)
     conn.retry_req_snapshot_replayable =
         !conn.req_path_overridden && conn.req_header_override_count == 0;
     return true;
+}
+
+// Validate and materialise the first explicit upstream request policy. This runs
+// before slot acquisition and before a TCP connect, so unsupported input cannot
+// accidentally fall back to transparent forwarding or touch the upstream.
+inline bool apply_request_policy(Connection& conn, const sockaddr_in& endpoint, u8 policy_id) {
+    if (policy_id == 0) return true;
+    if (!request_policy_is_supported(policy_id) || conn.protocol == ConnProtocol::Http2)
+        return false;
+    if (conn.recv_slice == nullptr || conn.send_slice == nullptr) return false;
+
+    const u8* data = conn.recv_buf.data();
+    const u32 len = conn.recv_buf.len();
+    HttpParser parser;
+    ParsedRequest req;
+    parser.reset();
+    if (parser.parse(data, len, &req) != ParseStatus::Complete || req.path.ptr == nullptr ||
+        req.path.len == 0 || req.path.ptr[0] != '/')
+        return false;
+    // The first policy is header-only. Any framing declaration is rejected,
+    // including Content-Length: 0, because it is still an explicit body/framing
+    // input that this slice does not reconstruct.
+    if (req.has_content_length || req.chunked || conn.req_body_mode != BodyMode::None)
+        return false;
+    // Never allow the policy path to enter the WebSocket tunnel. Connection token
+    // parsing remains the HTTP parser's upgrade detector; it is not used for
+    // dynamic header stripping below.
+    if (conn.req_wants_upgrade) return false;
+
+    const u8* end = data + parser.header_end;
+    const u8* line_end = data;
+    while (line_end + 1 < end && !(line_end[0] == '\r' && line_end[1] == '\n')) line_end++;
+    const u8* path_ptr = reinterpret_cast<const u8*>(req.path.ptr);
+    if (line_end + 1 >= end || path_ptr < data || path_ptr + req.path.len > line_end)
+        return false;
+
+    auto ci_eq = [](const u8* p, u32 n, const char* q, u32 qn) {
+        if (n != qn) return false;
+        for (u32 i = 0; i < n; i++) {
+            u8 a = p[i];
+            u8 b = static_cast<u8>(q[i]);
+            if (a >= 'A' && a <= 'Z') a = static_cast<u8>(a + ('a' - 'A'));
+            if (b >= 'A' && b <= 'Z') b = static_cast<u8>(b + ('a' - 'A'));
+            if (a != b) return false;
+        }
+        return true;
+    };
+    auto is_named = [&](const u8* p, u32 n, const char* q) {
+        u32 qn = 0;
+        while (q[qn] != '\0') qn++;
+        return ci_eq(p, n, q, qn);
+    };
+
+    const u8* hs = line_end + 2;
+    const u8* header_end = end - 2;  // exclude the final CRLF of the empty line
+    while (hs < header_end) {
+        const u8* le = hs;
+        while (le + 1 < end && !(le[0] == '\r' && le[1] == '\n')) le++;
+        if (le + 1 >= end || le <= hs) return false;
+        const u8* colon = hs;
+        while (colon < le && *colon != ':') colon++;
+        if (colon == hs || colon == le) return false;
+        const u8* vs = colon + 1;
+        while (vs < le && (*vs == ' ' || *vs == '\t')) vs++;
+        const u8* ve = le;
+        while (ve > vs && (ve[-1] == ' ' || ve[-1] == '\t')) ve--;
+        const u32 value_len = static_cast<u32>(ve - vs);
+        (void)vs;
+        (void)value_len;
+        hs = le + 2;
+    }
+
+    auto append = [&](const u8* p, u32 n) {
+        return n <= conn.send_buf.capacity() - conn.send_buf.len() &&
+               conn.send_buf.write(p, n) == n;
+    };
+    auto append_lit = [&](const char* p, u32 n) {
+        return append(reinterpret_cast<const u8*>(p), n);
+    };
+
+    conn.send_buf.reset();
+    const u32 method_prefix = static_cast<u32>(path_ptr - data);
+    if (!append(data, method_prefix) || !append(reinterpret_cast<const u8*>(req.path.ptr), req.path.len))
+        return false;
+    if (!append_lit(" ", 1) || !append_lit(request_policy_version(policy_id), 8) ||
+        !append_lit("\r\n", 2))
+        return false;
+
+    // Fixed IPv4 authority: omit the default HTTP port, retain every non-default
+    // port so the upstream sees the same authority selected by the target.
+    char authority[32];
+    u32 authority_len = 0;
+    const u32 ip = ntohl(endpoint.sin_addr.s_addr);
+    const u8 octets[4] = {static_cast<u8>(ip >> 24), static_cast<u8>(ip >> 16),
+                          static_cast<u8>(ip >> 8), static_cast<u8>(ip)};
+    for (u32 oi = 0; oi < 4; oi++) {
+        if (oi != 0) authority[authority_len++] = '.';
+        u32 v = octets[oi];
+        char digits[3];
+        u32 dn = 0;
+        do { digits[dn++] = static_cast<char>('0' + (v % 10)); v /= 10; } while (v != 0);
+        while (dn > 0) authority[authority_len++] = digits[--dn];
+    }
+    const u16 port = ntohs(endpoint.sin_port);
+    if (port != 80) {
+        authority[authority_len++] = ':';
+        char digits[5];
+        u32 dn = 0, v = port;
+        do { digits[dn++] = static_cast<char>('0' + (v % 10)); v /= 10; } while (v != 0);
+        while (dn > 0) authority[authority_len++] = digits[--dn];
+    }
+    if (!append_lit("Host: ", 6) || !append(reinterpret_cast<const u8*>(authority), authority_len) ||
+        !append_lit("\r\n", 2))
+        return false;
+
+    // Preserve ordinary fields byte-for-byte (including duplicate fields), while
+    // applying nginx's fixed first-slice skip set. Connection token values are
+    // deliberately not interpreted: fields they name remain ordinary fields.
+    hs = line_end + 2;
+    while (hs < header_end) {
+        const u8* le = hs;
+        while (le + 1 < end && !(le[0] == '\r' && le[1] == '\n')) le++;
+        const u8* colon = hs;
+        while (colon < le && *colon != ':') colon++;
+        const u32 name_len = static_cast<u32>(colon - hs);
+        const bool drop = is_named(hs, name_len, "host") ||
+                          is_named(hs, name_len, "connection") ||
+                          is_named(hs, name_len, "keep-alive") ||
+                          is_named(hs, name_len, "te") || is_named(hs, name_len, "expect") ||
+                          is_named(hs, name_len, "upgrade");
+        if (!drop && !append(hs, static_cast<u32>(le + 2 - hs))) return false;
+        hs = le + 2;
+    }
+    if (!append_lit("\r\n", 2)) return false;
+    const u32 new_header_len = conn.send_buf.len();
+    const u32 trailing = len - parser.header_end;
+    if (!append(data + parser.header_end, trailing)) return false;
+    if (conn.send_buf.len() > conn.recv_buf.capacity()) return false;
+    conn.recv_buf.reset();
+    if (conn.recv_buf.write(conn.send_buf.data(), conn.send_buf.len()) != conn.send_buf.len())
+        return false;
+    conn.req_header_end = new_header_len;
+    conn.req_initial_send_len = new_header_len;
+    conn.req_size = new_header_len;
+    // The upstream wire request is HTTP/1.1 without Connection, so it is
+    // eligible for normal response-framed pooling. Downstream close intent is
+    // handled independently by conn.keep_alive.
+    conn.req_keep_alive = true;
+    conn.request_policy_id = policy_id;
+    return true;
+}
+
+template <typename Loop>
+inline void reject_request_policy(Loop* loop, Connection& conn) {
+    release_upstream_slot(loop, conn);
+    conn.resp_status = 400;
+    format_static_response(conn, 400, /*keep_alive=*/false);
+    conn.keep_alive = false;
+    conn.transition_to_sending(&on_response_sent<Loop>);
+    client_send(loop, conn, conn.send_buf.data(), conn.send_buf.len());
 }
 
 // Keep a snapshotted request prefix pinned while pipeline_stash appends later

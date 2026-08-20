@@ -15,7 +15,7 @@ Allowed states are `SUPPORTED`, `PARTIAL`, `BLOCKED_BY_RUT`,
 | fixed IPv4 HTTP `proxy_pass`, no URI suffix | yes | no | partial: fixed `forward` exists | no | NOT_IMPLEMENTED |
 | preserve raw request-target and query | no | no | partial: forward currently sends original bytes | RUT-only tests, no nginx diff | PARTIAL |
 | preserve request method and body | no | no | partial: proxy streaming exists | RUT-only tests, no nginx diff | PARTIAL |
-| nginx default upstream HTTP version and request headers | no | no | missing request policy; #252 | no | BLOCKED_BY_RUT |
+| nginx default upstream HTTP version and request headers | no | no | partial: explicit fixed HTTP/1.1 header-only policy; #252 | RUT recording-upstream test; no nginx diff | PARTIAL |
 | proxied response status and body | no | no | partial: streaming proxy exists | RUT-only tests, no nginx diff | PARTIAL |
 | nginx default proxied response header policy | no | no | missing response policy; #253 | no | BLOCKED_BY_RUT |
 | single unavailable upstream gateway error | no | no | partial: 502/504 paths exist | RUT-only tests, no nginx diff | PARTIAL |
@@ -36,4 +36,7 @@ Allowed states are `SUPPORTED`, `PARTIAL`, `BLOCKED_BY_RUT`,
 - nginx proxy request defaults are version-dependent beginning at 1.29.7.
 - Default request and response hop-by-hop/header behavior is not transparent
   byte forwarding.
+- The first request-policy slice rejects bodies/framing, HTTP/2, and
+  non-origin-form targets before upstream connect. nginx absolute-form target
+  normalization remains a follow-up.
 - RUT's current unmatched-route response is not nginx's normal 404 behavior.

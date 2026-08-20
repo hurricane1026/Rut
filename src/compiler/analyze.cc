@@ -9716,6 +9716,8 @@ static FrontendResult<HirTerminator> analyze_term(const AstStatement& stmt, cons
     term.kind = HirTerminatorKind::ForwardUpstream;
     term.upstream_index = upstream_index.value();
     if (stmt.has_forward_set_path) term.forward_set_path = stmt.forward_set_path;
+    if (stmt.has_forward_request_policy)
+        term.forward_request_policy_id = stmt.forward_request_policy_id;
     // Carry forward(set_header:) overrides verbatim (parser validated + deduped).
     for (u32 i = 0; i < stmt.forward_set_headers.len; i++) {
         const auto& p = stmt.forward_set_headers[i];

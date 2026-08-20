@@ -2,6 +2,7 @@
 
 #include "rut/common/rate_limit_key_spec.h"
 #include "rut/common/types.h"
+#include "rut/common/request_policy.h"
 #include "rut/compiler/diagnostic.h"
 
 namespace rut {
@@ -261,6 +262,10 @@ struct AstStatement {
     // `forward_set_headers.len == 0` means "no kwarg" (empty dict is rejected).
     static constexpr u32 kMaxForwardSetHeaders = 16;
     FixedVec<AstHeaderKV, kMaxForwardSetHeaders> forward_set_headers;
+    // `forward(request_policy: {...})`: non-zero immutable policy id. The
+    // parser requires the complete first normalized HTTP/1 policy object.
+    u8 forward_request_policy_id = 0;
+    bool has_forward_request_policy = false;
     AstStatement* then_stmt = nullptr;
     AstStatement* else_stmt = nullptr;
     static constexpr u32 kMaxBlockStatements = 8;

@@ -32338,6 +32338,40 @@ route GET "/x" {
     REQUIRE_FALSE(hir.has_value());
 }
 
+TEST(frontend, forward_request_policy_requires_exact_fixed_strip_contract) {
+    const char* valid = R"rut(
+upstream backend at "127.0.0.1:9000"
+route GET "/" {
+    return forward(backend, request_policy: {
+        version: "HTTP/1.1",
+        host: "upstream",
+        connection: "omit",
+        strip_headers: ["Connection", "Keep-Alive", "TE", "Expect", "Upgrade"]
+    })
+}
+)rut";
+    auto lexed = lex(lit(valid));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+
+    const char* invalid[] = {
+        "upstream b at \"127.0.0.1:9000\"\nroute GET \"/\" { return forward(b, request_policy: { version: \"HTTP/1.0\", host: \"upstream\", connection: \"omit\", strip_headers: [\"Connection\", \"Keep-Alive\", \"TE\", \"Expect\", \"Upgrade\"] }) }\n",
+        "upstream b at \"127.0.0.1:9000\"\nroute GET \"/\" { return forward(b, request_policy: { version: \"HTTP/1.1\", host: \"upstream\", connection: \"close\", strip_headers: [\"Connection\", \"Keep-Alive\", \"TE\", \"Expect\", \"Upgrade\"] }) }\n",
+        "upstream b at \"127.0.0.1:9000\"\nroute GET \"/\" { return forward(b, request_policy: { version: \"HTTP/1.1\", host: \"upstream\", connection: \"omit\", strip_headers: [\"Connection\", \"Keep-Alive\"] }) }\n",
+        "upstream b at \"127.0.0.1:9000\"\nroute GET \"/\" { return forward(b, request_policy: { version: \"HTTP/1.1\", host: \"upstream\", connection: \"omit\", strip_headers: [\"Connection\", \"Keep-Alive\", \"TE\", \"Expect\", \"Upgrade\", \"Foo\"] }) }\n",
+        "upstream b at \"127.0.0.1:9000\"\nroute GET \"/\" { return forward(b, request_policy: { version: \"HTTP/1.1\", host: \"upstream\", connection: \"omit\", strip_headers: [\"Connection\", \"Keep-Alive\", \"TE\", \"Expect\", \"Upgrade\"] }, set_path: \"/x\") }\n",
+    };
+    for (const char* src : invalid) {
+        auto bad_lex = lex(lit(src));
+        REQUIRE(bad_lex);
+        auto bad_ast = parse_file_heap(bad_lex.value());
+        CHECK_FALSE(bad_ast.has_value());
+    }
+}
+
 int main(int argc, char** argv) {
     return rut::test::run_all(argc, argv);
 }

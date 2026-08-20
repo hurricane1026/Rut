@@ -1,6 +1,7 @@
 #pragma once
 
 #include "rut/common/types.h"
+#include "rut/common/request_policy.h"
 #include "rut/common/wait_limits.h"
 #include "rut/compiler/ast.h"
 #include "rut/compiler/diagnostic.h"
@@ -795,6 +796,7 @@ struct HirTerminator {
     // Request-header overrides for `forward(name, set_header: {...})`. len == 0
     // means none; lowering emits one ReqSetHeader per entry before RetForward.
     FixedVec<HirHeaderKV, kMaxHeaders> forward_set_headers;
+    u8 forward_request_policy_id = 0;
 };
 
 struct HirGuardBody {

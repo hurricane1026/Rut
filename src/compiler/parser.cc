@@ -1440,7 +1440,111 @@ struct Parser {
                     const Str kw_text = kw.value()->text;
                     auto colon = expect(TokenType::Colon);
                     if (!colon) return core::make_unexpected(colon.error());
-                    if (kw_text.eq({"set_path", 8})) {
+                    if (kw_text.eq({"request_policy", 14})) {
+                        if (stmt.has_forward_request_policy)
+                            return frontend_error(
+                                FrontendError::UnexpectedToken, span_from(*kw.value()), kw_text);
+                        if (stmt.has_forward_set_path || stmt.forward_set_headers.len != 0)
+                            return frontend_error(FrontendError::UnsupportedSyntax,
+                                                  span_from(*kw.value()), kw_text);
+                        auto lbrace = expect(TokenType::LBrace);
+                        if (!lbrace) return core::make_unexpected(lbrace.error());
+                        if (cur().type == TokenType::RBrace)
+                            return frontend_error(FrontendError::UnsupportedSyntax,
+                                                  span_from(cur()), kw_text);
+                        bool have_version = false;
+                        bool have_host = false;
+                        bool have_connection = false;
+                        bool have_strip_headers = false;
+                        while (true) {
+                            auto field = expect(TokenType::Ident);
+                            if (!field) return core::make_unexpected(field.error());
+                            const Str field_name = field.value()->text;
+                            auto fcolon = expect(TokenType::Colon);
+                            if (!fcolon) return core::make_unexpected(fcolon.error());
+                            bool* seen = nullptr;
+                            if (field_name.eq({"version", 7})) {
+                                seen = &have_version;
+                                auto value = expect(TokenType::StringLit);
+                                if (!value) return core::make_unexpected(value.error());
+                                const Str v = value.value()->text;
+                                if (!v.eq({"HTTP/1.1", 8}))
+                                    return frontend_error(FrontendError::UnsupportedSyntax,
+                                                          span_from(*value.value()), v);
+                                stmt.forward_request_policy_id =
+                                    static_cast<u8>(RequestPolicyId::Http11FixedStrip);
+                            } else if (field_name.eq({"host", 4})) {
+                                seen = &have_host;
+                                auto value = expect(TokenType::StringLit);
+                                if (!value) return core::make_unexpected(value.error());
+                                const Str v = value.value()->text;
+                                if (!v.eq({"upstream", 8}))
+                                    return frontend_error(FrontendError::UnsupportedSyntax,
+                                                          span_from(*value.value()), v);
+                            } else if (field_name.eq({"connection", 10})) {
+                                seen = &have_connection;
+                                auto value = expect(TokenType::StringLit);
+                                if (!value) return core::make_unexpected(value.error());
+                                const Str v = value.value()->text;
+                                if (!v.eq({"omit", 4}))
+                                    return frontend_error(FrontendError::UnsupportedSyntax,
+                                                          span_from(*value.value()), v);
+                            } else if (field_name.eq({"strip_headers", 13})) {
+                                seen = &have_strip_headers;
+                                auto lbracket = expect(TokenType::LBracket);
+                                if (!lbracket) return core::make_unexpected(lbracket.error());
+                                static constexpr const char* kStrip[] = {
+                                    "Connection", "Keep-Alive", "TE", "Expect", "Upgrade"};
+                                bool found[5] = {};
+                                u32 count = 0;
+                                if (cur().type == TokenType::RBracket)
+                                    return frontend_error(FrontendError::UnsupportedSyntax,
+                                                          span_from(cur()), field_name);
+                                while (true) {
+                                    auto item = expect(TokenType::StringLit);
+                                    if (!item) return core::make_unexpected(item.error());
+                                    u32 match = 5;
+                                    for (u32 si = 0; si < 5; si++) {
+                                        if (item.value()->text.eq({kStrip[si],
+                                                                   static_cast<u32>(__builtin_strlen(kStrip[si]))})) {
+                                            match = si;
+                                            break;
+                                        }
+                                    }
+                                    if (match == 5 || found[match] || count >= 5)
+                                        return frontend_error(FrontendError::UnsupportedSyntax,
+                                                              span_from(*item.value()),
+                                                              item.value()->text);
+                                    found[match] = true;
+                                    count++;
+                                    if (!take(TokenType::Comma)) break;
+                                    if (cur().type == TokenType::RBracket) break;
+                                }
+                                auto rbracket = expect(TokenType::RBracket);
+                                if (!rbracket) return core::make_unexpected(rbracket.error());
+                                if (count != 5)
+                                    return frontend_error(FrontendError::UnsupportedSyntax,
+                                                          span_from(*rbracket.value()), field_name);
+                            } else {
+                                // The strip list is the only non-scalar field.
+                                return frontend_error(FrontendError::UnexpectedToken,
+                                                      span_from(*field.value()), field_name);
+                            }
+                            if (*seen) {
+                                return frontend_error(FrontendError::UnexpectedToken,
+                                                      span_from(*field.value()), field_name);
+                            }
+                            *seen = true;
+                            if (!take(TokenType::Comma)) break;
+                            if (cur().type == TokenType::RBrace) break;
+                        }
+                        auto rbrace = expect(TokenType::RBrace);
+                        if (!rbrace) return core::make_unexpected(rbrace.error());
+                        if (!have_version || !have_host || !have_connection || !have_strip_headers)
+                            return frontend_error(FrontendError::UnsupportedSyntax,
+                                                  span_from(*rbrace.value()), kw_text);
+                        stmt.has_forward_request_policy = true;
+                    } else if (kw_text.eq({"set_path", 8})) {
                         if (stmt.has_forward_set_path)
                             return frontend_error(
                                 FrontendError::UnexpectedToken, span_from(*kw.value()), kw_text);
@@ -1505,6 +1609,10 @@ struct Parser {
                         return frontend_error(
                             FrontendError::UnexpectedToken, span_from(*kw.value()), kw_text);
                     }
+                    if (stmt.has_forward_request_policy &&
+                        (stmt.has_forward_set_path || stmt.forward_set_headers.len != 0))
+                        return frontend_error(FrontendError::UnsupportedSyntax,
+                                              span_from(*kw.value()), kw_text);
                 }
                 auto rparen = expect(TokenType::RParen);
                 if (!rparen) return core::make_unexpected(rparen.error());

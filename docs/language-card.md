@@ -306,8 +306,12 @@ effects only. Full buffered body/status middleware remains ⏳.
 ## I/O
 
 ```swift
-// Proxy — the ONLY three forms
+// Proxy — the transparent forms plus the explicit header-only policy form
 return forward(users)                          // zero-copy, terminal
+return forward(users, request_policy: {
+    version: "HTTP/1.1", host: "upstream", connection: "omit",
+    strip_headers: ["Connection", "Keep-Alive", "TE", "Expect", "Upgrade"]
+})                                               // fixed header-only rebuild
 let resp = forward(users, buffered: true)      // buffered Response, then return resp
 return forward(users, streaming: true)         // large bodies, no buffering
 
