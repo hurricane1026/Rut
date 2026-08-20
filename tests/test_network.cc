@@ -4245,7 +4245,7 @@ TEST(response_policy, buffered_request_requires_successful_upload) {
     policy.server = {kServer, sizeof(kServer) - 1};
     REQUIRE_EQ(cfg.add_response_policy(policy), 1u);
 
-    auto prepare = [&](Connection* c) {
+    auto prepare = [&](Connection* c, bool zero_content_length = false) {
         REQUIRE(c != nullptr);
         REQUIRE(loop.alloc_upstream_buf(*c));
         c->request_config = &cfg;
@@ -4253,7 +4253,7 @@ TEST(response_policy, buffered_request_requires_successful_upload) {
         c->request_policy_id = 1;
         c->request_body_fully_buffered = true;
         c->request_policy_body_pending = false;
-        c->req_body_mode = BodyMode::ContentLength;
+        c->req_body_mode = zero_content_length ? BodyMode::None : BodyMode::ContentLength;
         c->req_body_remaining = 0;
         c->req_body_streamed = false;
         c->req_http_version = static_cast<u8>(HttpVersion::Http11);
@@ -4266,8 +4266,13 @@ TEST(response_policy, buffered_request_requires_successful_upload) {
         c->upstream_slot_uid = 1;
         static constexpr char kRequest[] =
             "POST /api HTTP/1.1\r\nHost: x\r\nContent-Length: 1\r\n\r\nX";
-        REQUIRE_EQ(c->recv_buf.write(reinterpret_cast<const u8*>(kRequest), sizeof(kRequest) - 1),
-                   sizeof(kRequest) - 1);
+        static constexpr char kRequestZero[] =
+            "POST /api HTTP/1.1\r\nHost: x\r\nContent-Length: 0\r\n\r\n";
+        const char* request = zero_content_length ? kRequestZero : kRequest;
+        const u32 request_len = zero_content_length
+                                    ? static_cast<u32>(sizeof(kRequestZero) - 1)
+                                    : static_cast<u32>(sizeof(kRequest) - 1);
+        REQUIRE_EQ(c->recv_buf.write(reinterpret_cast<const u8*>(request), request_len), request_len);
         c->req_initial_send_len = c->recv_buf.len();
         c->upstream_fd = dup(2);
         REQUIRE(c->upstream_fd >= 0);
@@ -4299,28 +4304,34 @@ TEST(response_policy, buffered_request_requires_successful_upload) {
     // If the response CQE was delivered before the terminal full-send CQE,
     // the positive completion still proves the complete buffered request was
     // uploaded. The old callback left request_upload_complete false here and
-    // incorrectly rejected the otherwise valid strict response.
-    auto* complete = loop.alloc_conn();
-    prepare(complete);
-    const u32 full_send_len = complete->req_initial_send_len;
-    on_body_send_with_early_response<SmallLoop>(
-        static_cast<void*>(&loop),
-        *complete,
-        make_ev(complete->id, IoEventType::UpstreamSend, static_cast<i32>(full_send_len)));
-    CHECK_EQ(complete->resp_status, 200u);
-    CHECK(complete->request_upload_complete);
-    CHECK(!complete->upstream_request_incomplete);
-    CHECK(buf_has(complete->response_header_buf.data(),
-                  complete->response_header_buf.len(),
-                  "HTTP/1.1 200 OK"));
-    on_proxy_response_sent<SmallLoop>(static_cast<void*>(&loop),
-                                      *complete,
-                                      make_ev(complete->id,
-                                              IoEventType::Send,
-                                              static_cast<i32>(complete->response_header_buf.len())));
-    CHECK(!complete->upstream_slot_held);
-    CHECK_EQ(complete->upstream_fd, -1);
-    loop.close_conn(*complete);
+    // incorrectly rejected the otherwise valid strict response. Cover both a
+    // nonzero fixed body and explicit Content-Length: 0 (BodyMode::None).
+    auto complete_success = [&](bool zero_content_length) {
+        auto* complete = loop.alloc_conn();
+        prepare(complete, zero_content_length);
+        const u32 full_send_len = complete->req_initial_send_len;
+        on_body_send_with_early_response<SmallLoop>(
+            static_cast<void*>(&loop),
+            *complete,
+            make_ev(complete->id, IoEventType::UpstreamSend, static_cast<i32>(full_send_len)));
+        CHECK_EQ(complete->resp_status, 200u);
+        CHECK(complete->request_upload_complete);
+        CHECK(!complete->upstream_request_incomplete);
+        CHECK(buf_has(complete->response_header_buf.data(),
+                      complete->response_header_buf.len(),
+                      "HTTP/1.1 200 OK"));
+        on_proxy_response_sent<SmallLoop>(
+            static_cast<void*>(&loop),
+            *complete,
+            make_ev(complete->id,
+                    IoEventType::Send,
+                    static_cast<i32>(complete->response_header_buf.len())));
+        CHECK(!complete->upstream_slot_held);
+        CHECK_EQ(complete->upstream_fd, -1);
+        loop.close_conn(*complete);
+    };
+    complete_success(false);
+    complete_success(true);
 }
 
 // Finding 4: a stale same-batch UpstreamSend dispatched into the on_upstream_connected
