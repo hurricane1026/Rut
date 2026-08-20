@@ -15675,6 +15675,106 @@ TEST(route, set_path_does_not_leak_across_keepalive) {
     rir.destroy();
 }
 
+// Regression for #259's foundation effect: a transform recorded by request 1
+// must be cleared by the real per-request boundary before request 2. The first
+// route is deliberately a local response, so the recorded effect is never
+// consumed by a Forward dispatch; request 2 then proves that a plain forward on
+// the SAME downstream socket is not rejected as stale transform state. The
+// effect is inserted into RIR and executed through the actual JIT helper,
+// rather than setting Connection fields directly.
+TEST(route, target_transform_effect_does_not_leak_across_keepalive) {
+    using namespace rut;
+    EchoPathServer echo;
+    REQUIRE(echo.setup());
+
+    char src_buf[384];
+    const int src_len =
+        snprintf(src_buf,
+                 sizeof(src_buf),
+                 "upstream backend at \"127.0.0.1:%u\"\n"
+                 "route GET \"/local\" { return 200 }\n"
+                 "route GET \"/plain\" { return forward(backend) }\n",
+                 echo.port);
+    REQUIRE(src_len > 0 && src_len < static_cast<int>(sizeof(src_buf)));
+    auto lexed = lex(Str{src_buf, static_cast<u32>(src_len)});
+    REQUIRE(lexed);
+    auto ast = parse_file(lexed.value());
+    REQUIRE(ast);
+    std::unique_ptr<AstFile> ast_owned(ast.value());
+    auto hir = analyze_file(*ast_owned);
+    REQUIRE(hir);
+    std::unique_ptr<HirModule> hir_owned(hir.value());
+    auto mir = build_mir(*hir_owned);
+    REQUIRE(mir);
+    std::unique_ptr<MirModule> mir_owned(mir.value());
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(*mir_owned, rir);
+    REQUIRE(lowered);
+
+    char strip[] = "/api/";
+    char replace[] = "/v1/";
+    rir.module.target_transform_count = 1;
+    rir.module.target_transforms[0] = {{strip, 5}, {replace, 4}};
+
+    bool injected = false;
+    for (u32 i = 0; i < rir.module.func_count; i++) {
+        auto& fn = rir.module.functions[i];
+        if (!fn.route_pattern.eq(Str{"/local", 6})) continue;
+        auto* block = fn.entry();
+        REQUIRE(block != nullptr);
+        REQUIRE(block->inst_count > 0);
+        REQUIRE(block->inst_count < block->inst_cap);
+        const u32 terminator = block->inst_count - 1;
+        REQUIRE(block->insts[terminator].is_terminator());
+        for (u32 j = block->inst_count; j > terminator; j--)
+            block->insts[j] = block->insts[j - 1];
+        block->insts[terminator] = {};
+        block->insts[terminator].op = rir::Opcode::ReqSetTargetTransform;
+        block->insts[terminator].imm.i32_val = 1;
+        block->inst_count++;
+        injected = true;
+        break;
+    }
+    REQUIRE(injected);
+
+    auto cg = jit::codegen(rir.module);
+    REQUIRE(cg.ok);
+    jit::JitEngine engine;
+    REQUIRE(engine.init());
+    REQUIRE(engine.compile(cg.mod, cg.ctx));
+    RouteConfig cfg{};
+    REQUIRE(populate_route_config(cfg, rir.module));
+    REQUIRE(register_jit_routes(cfg, rir.module, engine));
+    const RouteConfig* active = &cfg;
+
+    {
+        ScopedProxyLoop proxy;
+        REQUIRE(proxy.setup(&active, 1000));
+        i32 c = connect_to(proxy.port);
+        REQUIRE(c >= 0);
+        set_socket_timeouts(c, 3);
+
+        const char kR1[] = "GET /local HTTP/1.1\r\nHost: x\r\n\r\n";
+        REQUIRE(send_all(c, kR1, sizeof(kR1) - 1));
+        char b1[1024];
+        const u32 n1 = read_until_token(c, b1, sizeof(b1), "HTTP/1.1 200", 12);
+        CHECK(buf_contains(b1, n1, "HTTP/1.1 200", 12));
+        CHECK(buf_contains(b1, n1, "Connection: keep-alive",
+                           sizeof("Connection: keep-alive") - 1));
+
+        const char kR2[] = "GET /plain HTTP/1.1\r\nHost: x\r\n\r\n";
+        REQUIRE(send_all(c, kR2, sizeof(kR2) - 1));
+        char b2[1024];
+        const u32 n2 = read_until_token(c, b2, sizeof(b2), "/plain", 6);
+        CHECK(buf_contains(b2, n2, "HTTP/1.1 200", 12));
+        CHECK(buf_contains(b2, n2, "/plain", 6));
+        CHECK(!buf_contains(b2, n2, "400 Bad Request", 15));
+        close(c);
+    }
+    engine.shutdown();
+    rir.destroy();
+}
+
 // A backend that reads a full request (headers + Content-Length body) and
 // echoes "<path>|<body>" so a test can verify both survive a set_path rewrite.
 struct PostEchoServer {
