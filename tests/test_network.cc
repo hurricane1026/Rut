@@ -4271,8 +4271,9 @@ TEST(response_policy, buffered_request_requires_successful_upload) {
         c->req_initial_send_len = c->recv_buf.len();
         c->upstream_fd = dup(2);
         REQUIRE(c->upstream_fd >= 0);
+        REQUIRE(loop.alloc_response_header_buf(*c));
         static constexpr char kResponse[] =
-            "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok";
+            "HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n";
         REQUIRE_EQ(c->upstream_recv_buf.write(reinterpret_cast<const u8*>(kResponse),
                                               sizeof(kResponse) - 1),
                    sizeof(kResponse) - 1);
@@ -4294,6 +4295,32 @@ TEST(response_policy, buffered_request_requires_successful_upload) {
     CHECK(failed->upstream_request_incomplete);
     CHECK_EQ(failed->upstream_fd, -1);
     CHECK(!failed->upstream_slot_held);
+
+    // If the response CQE was delivered before the terminal full-send CQE,
+    // the positive completion still proves the complete buffered request was
+    // uploaded. The old callback left request_upload_complete false here and
+    // incorrectly rejected the otherwise valid strict response.
+    auto* complete = loop.alloc_conn();
+    prepare(complete);
+    const u32 full_send_len = complete->req_initial_send_len;
+    on_body_send_with_early_response<SmallLoop>(
+        static_cast<void*>(&loop),
+        *complete,
+        make_ev(complete->id, IoEventType::UpstreamSend, static_cast<i32>(full_send_len)));
+    CHECK_EQ(complete->resp_status, 200u);
+    CHECK(complete->request_upload_complete);
+    CHECK(!complete->upstream_request_incomplete);
+    CHECK(buf_has(complete->response_header_buf.data(),
+                  complete->response_header_buf.len(),
+                  "HTTP/1.1 200 OK"));
+    on_proxy_response_sent<SmallLoop>(static_cast<void*>(&loop),
+                                      *complete,
+                                      make_ev(complete->id,
+                                              IoEventType::Send,
+                                              static_cast<i32>(complete->response_header_buf.len())));
+    CHECK(!complete->upstream_slot_held);
+    CHECK_EQ(complete->upstream_fd, -1);
+    loop.close_conn(*complete);
 }
 
 // Finding 4: a stale same-batch UpstreamSend dispatched into the on_upstream_connected

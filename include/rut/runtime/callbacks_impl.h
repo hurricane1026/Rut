@@ -4211,6 +4211,17 @@ void on_body_send_with_early_response(void* lp, Connection& conn, IoEvent ev) {
     if (ev.result < 0) {
         conn.upstream_request_incomplete = true;
         conn.request_upload_complete = false;
+    } else if (request_policy_body_response_domain(conn) &&
+               conn.req_initial_send_len > 0 &&
+               static_cast<u32>(ev.result) == conn.req_initial_send_len &&
+               conn.req_body_mode == BodyMode::ContentLength &&
+               conn.req_body_remaining == 0 && !conn.req_body_streamed) {
+        // The send callback is emitted only after the backend has accepted the
+        // complete submitted request (both epoll and io_uring enforce full-send
+        // semantics). A response CQE may have arrived first, so publish the
+        // successful upload here before strict response admission. A partial
+        // positive result remains an early response and stays fail-closed.
+        conn.request_upload_complete = true;
     }
 
     reserve_response_mutation_snapshot(conn);
