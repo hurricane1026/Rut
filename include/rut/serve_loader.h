@@ -25,6 +25,7 @@
 #include "rut/compiler/diagnostic.h"
 #include "rut/compiler/lower_rir.h"
 #include "rut/jit/jit_engine.h"
+#include "rut/runtime/listener.h"
 #include "rut/runtime/route_table.h"
 
 namespace rut {
@@ -67,6 +68,11 @@ struct LoadedProgram {
     FrontendRirModule rir;  // owns the lowered module + its arena
     jit::JitEngine engine;  // owns the native handler code
     bool jit_inited = false;
+    // Immutable process-start listener metadata copied out of HIR before the
+    // temporary frontend modules are released. It is intentionally separate
+    // from RouteConfig, which participates in route hot reload.
+    bool has_listener = false;
+    ListenerSpec listener{};
     RouteConfig config;  // what the shards read (1.28 MB — heap/BSS only)
 
     void destroy();

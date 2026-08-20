@@ -2319,6 +2319,38 @@ struct Parser {
         return item;
     }
 
+    FrontendResult<AstItem> parse_listen() {
+        auto kw = expect(TokenType::KwListen);
+        if (!kw) return core::make_unexpected(kw.error());
+        auto colon = expect(TokenType::Colon);
+        if (!colon) return core::make_unexpected(colon.error());
+        auto port = expect(TokenType::IntLit);
+        if (!port) return core::make_unexpected(port.error());
+
+        u32 value = 0;
+        for (u32 i = 0; i < port.value()->text.len; i++) {
+            const char c = port.value()->text.ptr[i];
+            const u32 digit = static_cast<u32>(c - '0');
+            if (value > (65535u - digit) / 10u)
+                return frontend_error(FrontendError::InvalidInteger,
+                                      span_from(*port.value()),
+                                      port.value()->text);
+            value = value * 10u + digit;
+        }
+        if (cur().type == TokenType::Ident || cur().type == TokenType::Comma)
+            return frontend_error(FrontendError::UnexpectedToken, span_from(cur()), cur().text);
+
+        AstItem item{};
+        item.kind = AstItemKind::Listen;
+        item.listen.port = value;
+        item.listen.span = Span{kw.value()->start,
+                                port.value()->end,
+                                kw.value()->line,
+                                kw.value()->col};
+        item.span = item.listen.span;
+        return item;
+    }
+
     FrontendResult<AstStatement> parse_func_body_stmt() {
         if (cur().type == TokenType::KwReturn && peek().type == TokenType::IntLit)
             return frontend_error(FrontendError::UnsupportedSyntax,
@@ -3780,6 +3812,9 @@ FrontendResult<AstFile*> parse_file(const LexedTokens& tokens) {
         FrontendResult<AstItem> item = frontend_error(
             FrontendError::UnexpectedToken, Parser::span_from(p.cur()), p.cur().text);
         switch (p.cur().type) {
+            case TokenType::KwListen:
+                item = p.parse_listen();
+                break;
             case TokenType::KwUpstream:
                 item = p.parse_upstream();
                 break;

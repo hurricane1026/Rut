@@ -3,6 +3,7 @@
 // JIT) into a RouteConfig, plus its fail-closed error reporting.
 
 #include "rut/runtime/cache_table.h"
+#include "rut/runtime/listener.h"
 #include "rut/runtime/route_method.h"
 #include "rut/serve_loader.h"
 #include "test.h"
@@ -46,6 +47,23 @@ TEST(serve_loader, status_routes_load) {
     REQUIRE(load_rut_program(path.c_str(), program, err));
     // Both routes registered into the config the shards will serve.
     CHECK_EQ(program.config.route_count, 2u);
+    program.destroy();
+}
+
+TEST(serve_loader, source_listener_metadata_is_owned_by_loaded_program) {
+    const std::string dir = "/tmp/rut_serve_loader_listener";
+    const std::string path = write_file(dir,
+                                        "app.rut",
+                                        "listen :0\n"
+                                        "route GET \"/\" { return 200 }\n");
+
+    LoadedProgram program;
+    LoadError err;
+    REQUIRE(load_rut_program(path.c_str(), program, err));
+    CHECK(program.has_listener);
+    CHECK_EQ(program.listener.port, 0u);
+    CHECK(program.listener.address == ListenerAddress::IPv4Wildcard);
+    CHECK(program.listener.transport == ListenerTransport::Cleartext);
     program.destroy();
 }
 

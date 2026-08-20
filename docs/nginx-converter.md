@@ -98,6 +98,7 @@ evidence must use a pinned nginx build and cannot treat that skip as a pass.
 
 ## Known capability dependencies
 
-- #250: downstream listeners in RUT source/config.
+- #250: downstream listener capability is available for one source wildcard
+  listener; converter lowering and differential evidence remain pending.
 - #252: upstream HTTP request policy for `forward`.
 - #253: proxied response header policy.

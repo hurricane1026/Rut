@@ -244,6 +244,14 @@ target_include_directories(test_frontend PRIVATE
 add_test(NAME test_frontend COMMAND test_frontend)
 set_tests_properties(test_frontend PROPERTIES LABELS "unit;compiler")
 
+add_executable(test_listener test_listener.cc ${PROJECT_SOURCE_DIR}/src/placement_new.cc)
+target_include_directories(test_listener PRIVATE
+    ${PROJECT_SOURCE_DIR}/include
+    ${PROJECT_SOURCE_DIR}/testing
+)
+add_test(NAME test_listener COMMAND test_listener)
+set_tests_properties(test_listener PROPERTIES LABELS "unit;runtime")
+
 add_executable(test_nginx_parser test_nginx_parser.cc)
 target_link_libraries(test_nginx_parser rut_nginx)
 target_include_directories(test_nginx_parser PRIVATE

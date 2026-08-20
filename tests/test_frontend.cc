@@ -5,6 +5,7 @@
 #include "rut/compiler/parser.h"
 #include "rut/compiler/verifier.h"
 #include "rut/runtime/route_method.h"
+#include "rut/runtime/listener.h"
 #include "test.h"
 #include <cstdio>
 #include <filesystem>
@@ -141,6 +142,63 @@ static HeapFrontendResult<MirModule> build_mir_heap(const HirModule& module) {
     auto mir = build_mir(module);
     if (!mir) return {core::make_unexpected(mir.error())};
     return {mir.value()};
+}
+
+TEST(frontend, listen_declaration_preserves_span_and_bounds) {
+    const char source[] = "listen :0\n";
+    auto lexed = lex(lit(source));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    REQUIRE_EQ(ast->items.len, 1u);
+    CHECK(ast->items[0].kind == AstItemKind::Listen);
+    CHECK_EQ(ast->items[0].listen.port, 0u);
+    CHECK_EQ(ast->items[0].listen.span.line, 1u);
+    CHECK_EQ(ast->items[0].listen.span.col, 1u);
+
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    CHECK(hir->has_listener);
+    CHECK_EQ(hir->listener.port, 0u);
+    CHECK_EQ(hir->listener.span.line, 1u);
+    CHECK_EQ(hir->listener.span.col, 1u);
+}
+
+TEST(frontend, listen_rejects_invalid_shape_and_multiple_declarations) {
+    const struct {
+        const char* source;
+        FrontendError code;
+        u32 col;
+    } parse_cases[] = {
+        {"listen 8080\n", FrontendError::UnexpectedToken, 8},
+        {"listen :65536\n", FrontendError::InvalidInteger, 9},
+        {"listen :8080 default_server\n", FrontendError::UnexpectedToken, 14},
+        {"listen :8080, tls\n", FrontendError::UnexpectedToken, 13},
+    };
+    for (const auto& tc : parse_cases) {
+        auto lexed = lex(lit(tc.source));
+        REQUIRE(lexed);
+        auto ast = parse_file_heap(lexed.value());
+        CHECK(!ast);
+        if (!ast) {
+            CHECK_EQ(ast.error().code, tc.code);
+            CHECK_EQ(ast.error().span.line, 1u);
+            CHECK_EQ(ast.error().span.col, tc.col);
+        }
+    }
+
+    const char duplicate_source[] = "listen :8080\nlisten :8081\n";
+    auto lexed = lex(lit(duplicate_source));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    CHECK(!hir);
+    if (!hir) {
+        CHECK_EQ(hir.error().code, FrontendError::UnsupportedSyntax);
+        CHECK_EQ(hir.error().span.line, 2u);
+        CHECK_EQ(hir.error().span.col, 1u);
+    }
 }
 
 static bool lower_src_to_rir(const char* src, FrontendRirModule& rir) {

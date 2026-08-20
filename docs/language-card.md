@@ -20,7 +20,7 @@ A `.rut` file is a flat list of top-level declarations (any order, no `main`):
 // PR #184 adds standalone examples; no tokenBucket helper is importable yet.
 import "middleware/auth.rut"                        // file stem = namespace: auth.jwtAuth
 
-listen :443                       // ⏳ ports (no top-level listen yet)
+listen :8080                      // one cleartext IPv4 wildcard listener
 tls "api.example.com", cert: env("CERT"), key: env("KEY")
 defaults { clientMaxBodySize: 10mb }
 
@@ -448,7 +448,7 @@ admin:   stats() metrics() reload() upstream_status() config_dump() shard_stats(
 ## Minimal complete example
 
 ```swift
-listen :80                         // ⏳ (no top-level listen yet)
+listen :80                         // one cleartext IPv4 wildcard listener
 let users = upstream { "10.0.0.1:8080" }
 // A standalone Cache/GCRA implementation lives in examples/ratelimit.rut.
 // ⚠ Unmatched methods/paths currently use Rut's default 200 OK handler; there

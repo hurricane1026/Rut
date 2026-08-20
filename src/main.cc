@@ -1,6 +1,7 @@
 #include "rut/common/shard_limits.h"
 #include "rut/runtime/epoll_event_loop.h"
 #include "rut/runtime/iouring_event_loop.h"
+#include "rut/runtime/listener.h"
 #include "rut/runtime/shard.h"
 #include "rut/runtime/socket.h"
 #include "rut/runtime/tls.h"
@@ -23,7 +24,6 @@ using namespace rut;
 // kMaxShards moved to rut/common/shard_limits.h (shared with the
 // compiler front-end, which validates `shard:` selectors against it).
 static constexpr u32 kDefaultDrainSecs = 30;
-static constexpr u16 kDefaultPort = 8080;
 
 // Status messages go to stderr to avoid mixing with structured JSON access logs on stdout.
 static void write_str(const char* s) {
@@ -66,6 +66,18 @@ static bool is_all_digits(const char* s) {
     return true;
 }
 
+static bool parse_cli_port(const char* s, u16& out) {
+    if (!is_all_digits(s)) return false;
+    u32 value = 0;
+    for (const char* p = s; *p; p++) {
+        const u32 digit = static_cast<u32>(*p - '0');
+        if (value > (65535u - digit) / 10u) return false;
+        value = value * 10u + digit;
+    }
+    out = static_cast<u16>(value);
+    return true;
+}
+
 static bool detect_io_uring() {
     struct io_uring_params params;
     memset(&params, 0, sizeof(params));
@@ -89,7 +101,7 @@ static void write_error(const char* prefix, const rut::Error& err) {
 }
 
 template <typename EventLoopType>
-static i32 run_shards(u16 port,
+static i32 run_shards(ListenerSpec listener,
                       u32 shard_count,
                       bool pin_cpus,
                       u32 drain_secs,
@@ -100,6 +112,7 @@ static i32 run_shards(u16 port,
                       i32 access_log_level,
                       const RouteConfig* route_config,
                       bool serve_metrics) {
+    u16 port = listener.port;
     Shard<EventLoopType> shards[kMaxShards];
     // Cross-shard metrics registry for the built-in /metrics endpoint. Lives
     // for the whole serve duration (outlives the shard threads, which join
@@ -308,7 +321,8 @@ static i32 run_shards(u16 port,
 }
 
 int main(int argc, char** argv) {
-    u16 port = kDefaultPort;
+    bool cli_port_present = false;
+    u16 cli_port = 0;
     u32 shard_count = 0;  // 0 = auto-detect
     bool pin_cpus = true;
     u32 drain_secs = kDefaultDrainSecs;
@@ -316,6 +330,8 @@ int main(int argc, char** argv) {
     const char* tls_cert_path = nullptr;
     const char* tls_key_path = nullptr;
     const char* config_path = nullptr;
+    ListenerSpec source_listener{};
+    bool source_listener_present = false;
     const char* access_log_path = nullptr;
     bool access_log_compress = false;
     // Advertise HTTP/2 over ALPN. Opt-in for now: h2 serves static/return-status
@@ -337,9 +353,11 @@ int main(int argc, char** argv) {
     //   shadowing any user route on that path. Non-GET methods are unaffected.
     for (int i = 1; i < argc; i++) {
         if (is_all_digits(argv[i])) {
-            port = 0;
-            for (const char* p = argv[i]; *p >= '0' && *p <= '9'; p++)
-                port = port * 10 + static_cast<u16>(*p - '0');
+            if (!parse_cli_port(argv[i], cli_port)) {
+                write_str("CLI listen port must be between 0 and 65535\n");
+                return 1;
+            }
+            cli_port_present = true;
         } else if (argv[i][0] != '-') {
             // A bare positional that isn't a pure number is the .rut program
             // path (e.g. "404.rut"). Flag values are consumed via i++ in the
@@ -508,11 +526,8 @@ int main(int argc, char** argv) {
             return 1;
         }
         route_config = &program.config;
-        // Loading is side-effect free with respect to live Cache state.
-        // This startup installation is the activation boundary (no shard
-        // exists yet); live reload must pair the same call with its config
-        // swap and RCU lifetime handoff.
-        activate_rut_program(program);
+        source_listener_present = program.has_listener;
+        if (source_listener_present) source_listener = program.listener;
         write_str("Loaded program: ");
         write_str(config_path);
         write_str(" (opt O");
@@ -529,6 +544,27 @@ int main(int argc, char** argv) {
         write_str("\n");
         destroy_tls_server_context(tls_server);
         return 1;
+    }
+#endif
+
+    auto resolved_listener = resolve_listener_spec(
+        source_listener_present, source_listener, cli_port_present, cli_port);
+    if (!resolved_listener) {
+        write_str("Conflicting source and CLI listen ports\n");
+#ifdef RUT_ENABLE_JIT
+        program.destroy();
+#endif
+        destroy_tls_server_context(tls_server);
+        return 1;
+    }
+    const ListenerSpec listener = resolved_listener.value();
+#ifdef RUT_ENABLE_JIT
+    if (route_config != nullptr) {
+        // Loading is side-effect free with respect to live Cache state. This
+        // startup installation is the activation boundary (no shard exists
+        // yet); live reload must pair the same call with its config swap and
+        // RCU lifetime handoff.
+        activate_rut_program(program);
     }
 #endif
 
@@ -554,7 +590,7 @@ int main(int argc, char** argv) {
     // whenever available — TLS no longer forces the epoll fallback.
     if (detect_io_uring()) {
         write_str(tls_server ? "Backend: io_uring (TLS)\n" : "Backend: io_uring\n");
-        rc = run_shards<IoUringEventLoop>(port,
+        rc = run_shards<IoUringEventLoop>(listener,
                                           shard_count,
                                           pin_cpus,
                                           drain_secs,
@@ -567,7 +603,7 @@ int main(int argc, char** argv) {
                                           serve_metrics);
         if (rc != 0 && tls_server) {
             write_str("Backend: io_uring TLS startup failed; falling back to epoll (TLS)\n");
-            rc = run_shards<EpollEventLoop>(port,
+            rc = run_shards<EpollEventLoop>(listener,
                                             shard_count,
                                             pin_cpus,
                                             drain_secs,
@@ -581,7 +617,7 @@ int main(int argc, char** argv) {
         }
     } else {
         write_str(tls_server ? "Backend: epoll (TLS)\n" : "Backend: epoll\n");
-        rc = run_shards<EpollEventLoop>(port,
+        rc = run_shards<EpollEventLoop>(listener,
                                         shard_count,
                                         pin_cpus,
                                         drain_secs,

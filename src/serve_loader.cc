@@ -37,6 +37,8 @@ void LoadedProgram::destroy() {
     }
     config.~RouteConfig();
     new (&config) RouteConfig();
+    has_listener = false;
+    listener = ListenerSpec{};
 }
 
 namespace {
@@ -116,6 +118,8 @@ void set_load_diag(LoadError& err, const Diagnostic& diag) {
 bool load_rut_program(
     const char* path, LoadedProgram& out, LoadError& err, jit::OptLevel opt, u64 max_source_bytes) {
     err = LoadError{};
+    out.has_listener = false;
+    out.listener = ListenerSpec{};
 
     err.stage = LoadStage::Read;
     if (!map_source(path, out)) return false;
@@ -167,6 +171,10 @@ bool load_rut_program(
         return false;
     }
     ir.hir = hir.value();
+    if (ir.hir->has_listener) {
+        out.has_listener = true;
+        out.listener.port = ir.hir->listener.port;
+    }
 
     err.stage = LoadStage::BuildMir;
     auto mir = build_mir(*ir.hir);

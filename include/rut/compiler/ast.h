@@ -7,6 +7,7 @@
 namespace rut {
 
 enum class AstItemKind : u8 {
+    Listen,
     Upstream,
     Import,
     Func,
@@ -22,6 +23,11 @@ enum class AstItemKind : u8 {
     // Top-level `let <name> = <expr>` — state declaration (currently only
     // `Cache<IP, i64>(capacity: N)` inits are accepted; analyze validates).
     State,
+};
+
+struct AstListenDecl {
+    Span span{};
+    u32 port = 0;
 };
 
 enum class AstStmtKind : u8 {
@@ -558,6 +564,7 @@ struct AstStateDecl {
 struct AstItem {
     AstItemKind kind = AstItemKind::Upstream;
     Span span{};
+    AstListenDecl listen{};
     AstStateDecl state{};
     AstUpstreamDecl upstream{};
     AstImportDecl import_decl{};
@@ -754,6 +761,8 @@ private:
         for (u32 i = 0; i < stmt_pool.len; i++) rebase_stmt(other, stmt_pool[i]);
         for (u32 i = 0; i < items.len; i++) {
             switch (items[i].kind) {
+                case AstItemKind::Listen:
+                    break;
                 case AstItemKind::Func:
                     rebase_func(other, items[i].func);
                     break;

@@ -1457,6 +1457,8 @@ static FrontendResult<void> validate_import_namespace_bindings(
         for (u32 i = 0; i < file.items.len; i++) {
             const auto& item = file.items[i];
             switch (item.kind) {
+                case AstItemKind::Listen:
+                    break;
                 case AstItemKind::Func:
                     if (item.func.name.eq(ns))
                         return frontend_error(FrontendError::UnsupportedSyntax, item.func.span, ns);
@@ -12735,7 +12737,12 @@ static FrontendResult<void> load_imported_modules(
                                               imported_decorator_names,
                                               source_budget);
         if (!imported) return core::make_unexpected(imported.error());
-        imported_storage.push_back(std::unique_ptr<HirModule>(imported.value()));
+        std::unique_ptr<HirModule> imported_module(imported.value());
+        if (imported_module->has_listener)
+            return frontend_error(FrontendError::UnsupportedSyntax,
+                                  item.import_decl.span,
+                                  lit_str("listen declarations must be in the main source"));
+        imported_storage.push_back(std::move(imported_module));
         ImportedModuleInfo info{};
         info.span = item.import_decl.span;
         info.path = kept_path;
@@ -14516,6 +14523,21 @@ static FrontendResult<HirModule*> analyze_file_internal(
     mod.has_package_decl = file.has_package_decl;
     mod.package_span = file.package_span;
     mod.package_name = file.package_name;
+
+    // Listener declarations are startup metadata, not route declarations. A
+    // program has one process listener in this slice; imported modules cannot
+    // contribute one because their declarations do not own process startup.
+    for (u32 i = 0; i < file.items.len; i++) {
+        const auto& item = file.items[i];
+        if (item.kind != AstItemKind::Listen) continue;
+        if (mod.has_listener)
+            return frontend_error(FrontendError::UnsupportedSyntax,
+                                  item.listen.span,
+                                  lit_str("only one listen declaration is supported"));
+        mod.has_listener = true;
+        mod.listener.span = item.listen.span;
+        mod.listener.port = static_cast<u16>(item.listen.port);
+    }
     std::string normalized_source;
     if (source_path.len != 0) {
         normalized_source =

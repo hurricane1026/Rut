@@ -46,6 +46,11 @@ struct HirUpstream {
     u32 hc_interval_ms = 0;
     u16 hc_expected_status = 200;
 };
+
+struct HirListener {
+    Span span{};
+    u16 port = 0;
+};
 struct HirImport {
     Span span{};
     Str path{};
@@ -1368,6 +1373,8 @@ struct HirModule {
     static constexpr u32 kMaxCaches = 8;
 
     FixedVec<HirUpstream, kMaxUpstreams> upstreams;
+    bool has_listener = false;
+    HirListener listener{};
     FixedVec<HirCacheDecl, kMaxCaches> caches;
     FixedVec<HirImport, kMaxImports> imports;
     FixedVec<HirAlias, kMaxAliases> aliases;
@@ -1391,6 +1398,8 @@ struct HirModule {
     HirModule() = default;
     HirModule(const HirModule& other)
         : upstreams(other.upstreams),
+          has_listener(other.has_listener),
+          listener(other.listener),
           caches(other.caches),
           imports(other.imports),
           aliases(other.aliases),
@@ -1414,6 +1423,8 @@ struct HirModule {
     HirModule& operator=(const HirModule& other) {
         if (this == &other) return *this;
         upstreams = other.upstreams;
+        has_listener = other.has_listener;
+        listener = other.listener;
         caches = other.caches;
         imports = other.imports;
         aliases = other.aliases;
