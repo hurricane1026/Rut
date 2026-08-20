@@ -1065,11 +1065,15 @@ static std::vector<char> expected_api_redirect(u16 frontend_port, const char* ta
     return std::vector<char>(response.begin(), response.end());
 }
 
-static bool capture_api_redirect_case(u16 frontend_port,
+static bool capture_api_redirect_side(u16 frontend_port,
                                       u16 backend_port,
+                                      const std::string& source_path,
                                       const std::string& nginx_config_path,
                                       const std::string& nginx_log_path,
+                                      const std::string& rut_log_path,
+                                      const std::string& rut_path,
                                       const std::string& container_name,
+                                      bool pinned_nginx,
                                       std::vector<std::vector<char>>& responses,
                                       std::string& error) {
     static constexpr const char* kTargets[] = {"/api", "/api?x=1"};
@@ -1081,16 +1085,24 @@ static bool capture_api_redirect_case(u16 frontend_port,
     }
 
     DockerGuard docker(container_name);
-    ChildGuard nginx;
-    if (!spawn_child({"docker", "run", "--pull=never", "--network", "host", "--name",
-                      container_name, "-v", nginx_config_path + ":/etc/nginx/nginx.conf:ro",
-                      kNginxImage, "nginx", "-g", "daemon off;"},
-                     nginx_log_path,
-                     nginx.child)) {
-        error = "failed to start pinned nginx for API redirect case";
+    docker.active = pinned_nginx;
+    ChildGuard process;
+    if (pinned_nginx) {
+        if (!spawn_child({"docker", "run", "--pull=never", "--network", "host", "--name",
+                          container_name, "-v", nginx_config_path + ":/etc/nginx/nginx.conf:ro",
+                          kNginxImage, "nginx", "-g", "daemon off;"},
+                         nginx_log_path,
+                         process.child)) {
+            error = "failed to start pinned nginx for API redirect case";
+            return false;
+        }
+    } else if (!spawn_child({rut_path, source_path, "--shards", "1", "--no-pin", "--drain", "0"},
+                            rut_log_path,
+                            process.child)) {
+        error = "failed to start production RUT for API redirect case";
         return false;
     }
-    if (!wait_ready(frontend_port, nginx.child, error)) return false;
+    if (!wait_ready(frontend_port, process.child, error)) return false;
 
     responses.clear();
     responses.reserve(2);
@@ -1109,28 +1121,31 @@ static bool capture_api_redirect_case(u16 frontend_port,
         if (client >= 0) close(client);
         responses.push_back(std::move(response));
         if (!ok) {
-            error = "nginx API redirect vector " + std::to_string(i + 1) + " failed: " +
+            error = std::string(pinned_nginx ? "nginx" : "RUT") +
+                    " API redirect vector " + std::to_string(i + 1) + " failed: " +
                     (vector_error.empty() ? "connect/send failed" : vector_error);
             return false;
         }
     }
 
-    // Keep nginx and the recorder alive during the bounded late-connect window.
+    // Keep the process and recorder alive during the bounded late-connect window.
     settle_for_invalid_target_side_effects();
-    const bool nginx_stopped = stop_child(nginx.child);
+    const bool process_stopped = stop_child(process.child);
     recorder.stop();
     const bool side_effect_free =
         recorder.accepted.load(std::memory_order_acquire) == 0 &&
         recorder.requests.load(std::memory_order_acquire) == 0 && recorder.history.empty();
     if (!side_effect_free) {
-        error = "nginx API redirect phase caused an upstream side effect";
+        error = std::string(pinned_nginx ? "nginx" : "RUT") +
+                " API redirect phase caused an upstream side effect";
         return false;
     }
-    if (!nginx_stopped) {
-        error = "failed to stop nginx after API redirect case";
+    if (!process_stopped) {
+        error = std::string("failed to stop ") + (pinned_nginx ? "nginx" : "production RUT") +
+                " after API redirect case";
         return false;
     }
-    if (!docker.remove()) {
+    if (pinned_nginx && !docker.remove()) {
         error = "docker rm -f failed after nginx API redirect case";
         return false;
     }
@@ -1138,8 +1153,60 @@ static bool capture_api_redirect_case(u16 frontend_port,
         std::vector<char> normalized = responses[i];
         const std::vector<char> expected = expected_api_redirect(frontend_port, kLocationSuffixes[i]);
         if (!normalize_date(normalized) || normalized != expected) {
-            error = "nginx API redirect vector " + std::to_string(i + 1) +
+            error = std::string(pinned_nginx ? "nginx" : "RUT") + " API redirect vector " +
+                    std::to_string(i + 1) +
                     " did not match the exact pinned response baseline";
+            return false;
+        }
+    }
+    return true;
+}
+
+static bool capture_api_redirect_case(u16 frontend_port,
+                                      u16 backend_port,
+                                      const std::string& source_path,
+                                      const std::string& nginx_config_path,
+                                      const std::string& nginx_log_path,
+                                      const std::string& rut_log_path,
+                                      const std::string& rut_path,
+                                      const std::string& container_name,
+                                      std::vector<std::vector<char>>& nginx_responses,
+                                      std::vector<std::vector<char>>& rut_responses,
+                                      std::string& error) {
+    if (!capture_api_redirect_side(frontend_port,
+                                   backend_port,
+                                   source_path,
+                                   nginx_config_path,
+                                   nginx_log_path,
+                                   rut_log_path,
+                                   rut_path,
+                                   container_name,
+                                   true,
+                                   nginx_responses,
+                                   error))
+        return false;
+    if (!capture_api_redirect_side(frontend_port,
+                                   backend_port,
+                                   source_path,
+                                   nginx_config_path,
+                                   nginx_log_path,
+                                   rut_log_path,
+                                   rut_path,
+                                   container_name + "-rut",
+                                   false,
+                                   rut_responses,
+                                   error))
+        return false;
+    if (nginx_responses.size() != rut_responses.size()) {
+        error = "nginx and RUT API redirect vector counts differ";
+        return false;
+    }
+    for (size_t i = 0; i < nginx_responses.size(); i++) {
+        std::vector<char> normalized_nginx = nginx_responses[i];
+        std::vector<char> normalized_rut = rut_responses[i];
+        if (!normalize_date(normalized_nginx) || !normalize_date(normalized_rut) ||
+            normalized_nginx != normalized_rut) {
+            error = "nginx and RUT API redirect responses differ after Date normalization";
             return false;
         }
     }
@@ -1153,8 +1220,7 @@ static bool capture_api_invalid_case(u16 frontend_port,
                                      const std::string& rut_path,
                                      std::vector<std::vector<char>>& responses,
                                      std::string& error) {
-    static constexpr const char* kInvalidTargets[] = {
-        "/api", "/api//x", "/api/./x", "/api/%7Euser"};
+    static constexpr const char* kInvalidTargets[] = {"/api//x", "/api/./x", "/api/%7Euser"};
     Recorder recorder;
     if (!recorder.setup(backend_port, 1)) {
         error = "API invalid-target backend recorder setup failed";
@@ -1171,7 +1237,7 @@ static bool capture_api_invalid_case(u16 frontend_port,
     if (!wait_ready(frontend_port, process.child, error)) return false;
 
     responses.clear();
-    responses.reserve(4);
+    responses.reserve(3);
     for (size_t i = 0; i < sizeof(kInvalidTargets) / sizeof(kInvalidTargets[0]); i++) {
         const std::string request = api_request(kInvalidTargets[i]);
         const int client = connect_once(frontend_port);
@@ -1443,6 +1509,23 @@ int main(int argc, char** argv) {
                   << api_lowered.error().span.line << ":" << api_lowered.error().span.col << "\n";
         return 1;
     }
+    const std::string generated_api_source(api_lowered.value().data, api_lowered.value().len);
+    static constexpr const char* kGeneratedApiRequirements[] = {
+        "route \"/api\" {",
+        "if req.method == GET && req.pathOnly == \"/api\"",
+        "return redirect({",
+        "target_transform: {",
+        "request_policy: {",
+        "response_policy: {",
+        "failure_policy: {"};
+    for (const char* requirement : kGeneratedApiRequirements) {
+        if (generated_api_source.find(requirement) == std::string::npos) {
+            std::cerr << "FAIL [api source]: converter output lacks required redirect/forward "
+                         "artifact: "
+                      << requirement << "\n";
+            return 1;
+        }
+    }
     if (!write_file(temp.source, api_lowered.value().data, api_lowered.value().len)) {
         std::cerr << "FAIL [api source]: secure generated source overwrite failed\n";
         return 1;
@@ -1535,21 +1618,31 @@ int main(int argc, char** argv) {
     std::vector<std::vector<char>> api_redirect_responses;
     std::string api_redirect_error;
     const std::string api_redirect_container = container + "-api-redirect";
+    std::vector<std::vector<char>> rut_api_redirect_responses;
     if (!capture_api_redirect_case(api_frontend_port,
                                    api_backend_port,
+                                   temp.source,
                                    temp.nginx_config,
                                    temp.nginx_log,
+                                   temp.rut_log,
+                                   argv[1],
                                    api_redirect_container,
                                    api_redirect_responses,
+                                   rut_api_redirect_responses,
                                    api_redirect_error)) {
-        std::cerr << "FAIL [api redirect baseline]: " << api_redirect_error << "\n";
+        std::cerr << "FAIL [api redirect differential]: " << api_redirect_error << "\n";
         for (size_t i = 0; i < api_redirect_responses.size(); i++)
             dump_wire(("nginx API redirect response " + std::to_string(i + 1)).c_str(),
                       api_redirect_responses[i]);
+        for (size_t i = 0; i < rut_api_redirect_responses.size(); i++)
+            dump_wire(("RUT API redirect response " + std::to_string(i + 1)).c_str(),
+                      rut_api_redirect_responses[i]);
         dump_log(temp.nginx_log, "nginx log");
+        dump_log(temp.rut_log, "RUT log");
         return 1;
     }
-    std::cerr << "PASS: pinned nginx /api automatic slash redirect baseline (2 vectors, no upstream side effects)\n";
+    std::cerr << "PASS: pinned nginx and converter-generated RUT /api automatic slash redirect "
+                 "case (2 vectors, no upstream side effects)\n";
 
     std::vector<std::vector<char>> invalid_api_responses;
     std::string invalid_api_error;
@@ -1567,7 +1660,7 @@ int main(int argc, char** argv) {
         dump_log(temp.rut_log, "RUT log");
         return 1;
     }
-    std::cerr << "PASS: RUT /api/ out-of-slice targets fail closed (4 vectors, no upstream side effects)\n";
+    std::cerr << "PASS: RUT /api/ out-of-slice targets fail closed (3 vectors, no upstream side effects)\n";
     return 0;
 #endif
 }
