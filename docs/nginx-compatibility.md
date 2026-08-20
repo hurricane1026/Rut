@@ -23,7 +23,7 @@ Allowed states are `SUPPORTED`, `PARTIAL`, `BLOCKED_BY_RUT`,
 | exact, `^~`, regex, or nested locations | no | no | no nginx selection semantics | no | NOT_PLANNED |
 | exact `/api/` + proxy URI `/`, clean bounded H1 request domain | yes | yes | yes: bounded prefix replacement; #259 closed | pinned converter-generated `/api/`, `/api/x`, and query differentials; four out-of-domain targets fail before upstream | SUPPORTED |
 | broader `proxy_pass` URI replacement and nginx URI normalization | partial | no | partial: clean raw-target transform only | nginx baselines only for repeated slash/dot/percent forms | PARTIAL |
-| automatic slash redirect for proxied prefix location (`/api` → `/api/`) | no | no | under investigation in #260 | pinned observation only; no converter differential | NOT_IMPLEMENTED |
+| automatic slash redirect for proxied prefix location (`/api` → `/api/`) | no | no | missing request-derived redirect primitive; #261 blocks #260 | official semantics identified; exact pinned wire baseline pending | BLOCKED_BY_RUT |
 | multiple servers / `server_name` / `default_server` | no | no | no virtual-server selection | no | NOT_PLANNED |
 | variables, rewrite, or internal redirects | no | no | insufficient nginx phase semantics | no | NOT_PLANNED |
 | HTTPS/DNS/IPv6/Unix-socket upstreams | no | no | fixed IPv4 HTTP only | no | NOT_PLANNED |
