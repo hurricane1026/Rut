@@ -5,6 +5,7 @@
 #include "rut/runtime/error.h"
 #include "rut/runtime/io_backend.h"
 
+#include <atomic>
 #include <linux/io_uring.h>
 #include <errno.h>
 #include <sys/mman.h>
@@ -91,8 +92,9 @@ struct IoUringBackend {
     u32 pending = 0;
 
     // Sticky fatal error from io_uring_enter. A zero-event wait is otherwise a
-    // legitimate result, so the event loop must inspect this separately.
-    i32 fatal_error = 0;
+    // legitimate result, so the event loop/control plane must inspect this
+    // separately. The worker writes it; the control thread polls it.
+    std::atomic<i32> fatal_error{0};
 
     // --- Interface methods ---
 
@@ -162,7 +164,7 @@ struct IoUringBackend {
     // copied into conns[conn_id].recv_buf. max_conns: table size for bounds checking.
     u32 wait(IoEvent* events, u32 max_events, Connection* conns, u32 max_conns);
 
-    bool failed() const { return fatal_error != 0; }
+    i32 failure_code() const { return fatal_error.load(std::memory_order_acquire); }
 
     // Shutdown and unmap all resources.
     void shutdown();
@@ -199,7 +201,8 @@ private:
     void submit_timer_read();
 
     void record_enter_error(i32 result) {
-        if (result < 0 && result != -EINTR) fatal_error = -result;
+        if (result < 0 && result != -EINTR)
+            fatal_error.store(-result, std::memory_order_release);
     }
 };
 

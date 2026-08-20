@@ -266,6 +266,16 @@ struct Shard {
         if (loop) loop->stop();
     }
 
+    // Generic control-plane hook for backends that can fail independently of
+    // the shard's stop flag. Event loops without such a backend return zero.
+    i32 backend_failure_code() const {
+        if (!loop) return 0;
+        if constexpr (requires { loop->backend.failure_code(); }) {
+            return loop->backend.failure_code();
+        }
+        return 0;
+    }
+
     // Begin graceful drain (safe to call from any thread).
     // Shard will close idle connections probabilistically over period_secs,
     // respond with Connection: close on new requests, and exit the run loop

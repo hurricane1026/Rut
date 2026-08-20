@@ -5649,11 +5649,24 @@ TEST(shard, serves_http1_cleartext_iouring_cross_thread) {
         close(lfd);
         SKIP("io_uring cannot initialize in this environment");
     }
+    struct ShardGuard {
+        Shard<IoUringEventLoop>& shard;
+        i32& listen_fd;
+        i32 client_fd = -1;
+        ~ShardGuard() {
+            if (client_fd >= 0) close(client_fd);
+            shard.stop();
+            shard.join();
+            shard.shutdown();
+            if (listen_fd >= 0) close(listen_fd);
+        }
+    } guard{shard, lfd};
     const u16 port = get_port(lfd);
     REQUIRE(shard.spawn(-1).has_value());
 
     i32 c = connect_to(port);
     REQUIRE(c >= 0);
+    guard.client_fd = c;
     set_socket_timeouts(c, 2);
     REQUIRE(send_all(c, HTTP_REQ, HTTP_REQ_LEN));
     char buf[1024];
@@ -5661,11 +5674,6 @@ TEST(shard, serves_http1_cleartext_iouring_cross_thread) {
     REQUIRE_GT(n, 0);
     CHECK(buf_contains(buf, static_cast<u32>(n), "200", 3));
 
-    close(c);
-    shard.stop();
-    shard.join();
-    shard.shutdown();
-    close(lfd);
 }
 }  // namespace
 

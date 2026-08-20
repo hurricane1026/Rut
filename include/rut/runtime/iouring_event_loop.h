@@ -221,7 +221,7 @@ public:
 
         while (is_running()) {
             u32 n = backend.wait(events, kMaxEventsPerWait, conns, kMaxConns);
-            if (backend.failed()) {
+            if (backend.failure_code() != 0) {
                 // A zero-event wait is valid; a sticky backend error is not. Stop
                 // this shard so an io_uring_enter failure cannot become a silent
                 // request stall or an endless busy loop.

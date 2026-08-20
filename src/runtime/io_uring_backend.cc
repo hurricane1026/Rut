@@ -107,7 +107,7 @@ core::Expected<void, Error> IoUringBackend::init(u32 /*shard_id*/, i32 lfd) {
     ring_fd = -1;
     timer_fd = -1;
     timer_read_armed = false;
-    fatal_error = 0;
+    fatal_error.store(0, std::memory_order_relaxed);
     for (u32 i = 0; i < kMaxSendState; i++) {
         send_state[i] = {nullptr, -1, 0, 0, IoEventType::Send};
         upstream_send_state[i] = {nullptr, -1, 0, 0, IoEventType::UpstreamSend};
@@ -598,7 +598,7 @@ u32 IoUringBackend::cancel(i32 /*fd*/,
 // --- Wait (submit + harvest) ---
 
 u32 IoUringBackend::wait(IoEvent* events, u32 max_events, Connection* conns, u32 max_conns) {
-    if (failed()) return 0;
+    if (failure_code() != 0) return 0;
     // Retry timer read if previous submit_timer_read() failed (SQ was full)
     if (timer_fd >= 0 && !timer_read_armed) submit_timer_read();
 

@@ -11,12 +11,14 @@
 #endif
 
 #include <fcntl.h>
+#include <errno.h>
 #include <linux/io_uring.h>
 #include <netinet/in.h>
 #include <signal.h>
 #include <string.h>
 #include <sys/socket.h>
 #include <sys/syscall.h>
+#include <time.h>
 #include <unistd.h>
 
 using namespace rut;
@@ -290,9 +292,52 @@ static i32 run_shards(ListenerSpec listener,
         }
     }
 
-    // Wait for SIGINT/SIGTERM — sigwait() is race-free (signal is blocked).
+    auto stop_all_shards = [&]() {
+        for (u32 i = 0; i < shard_count; i++) shards[i].stop();
+        for (u32 i = 0; i < shard_count; i++) shards[i].join();
+        if (access_log_fd >= 0) {
+            log_flusher.stop();
+            close(access_log_fd);
+            access_log_fd = -1;
+        }
+        for (u32 i = 0; i < shard_count; i++) shards[i].shutdown();
+    };
+
+    // Poll for SIGINT/SIGTERM — signals remain blocked and sigtimedwait() is
+    // race-free, while the bounded timeout lets the control thread observe a
+    // fatal backend error from a shard instead of waiting forever in sigwait().
     i32 sig = 0;
-    sigwait(&wait_set, &sig);
+    u32 failed_shard = shard_count;
+    i32 backend_error = 0;
+    for (;;) {
+        struct timespec timeout = {0, 100'000'000};  // 100ms control-plane poll
+        sig = sigtimedwait(&wait_set, nullptr, &timeout);
+        if (sig == SIGINT || sig == SIGTERM) break;
+        if (sig < 0 && errno != EAGAIN && errno != EINTR) {
+            write_str("Failed to wait for shutdown signal\n");
+            stop_all_shards();
+            return 1;
+        }
+        for (u32 i = 0; i < shard_count; i++) {
+            const i32 code = shards[i].backend_failure_code();
+            if (code != 0) {
+                failed_shard = i;
+                backend_error = code;
+                break;
+            }
+        }
+        if (backend_error != 0) break;
+    }
+
+    if (backend_error != 0) {
+        write_str("Fatal I/O backend failure on shard ");
+        write_u32(failed_shard);
+        write_str(" (errno=");
+        write_u32(static_cast<u32>(backend_error));
+        write_str(")\n");
+        stop_all_shards();
+        return 1;
+    }
 
     write_str("Draining connections (");
     write_u32(drain_secs);
