@@ -32611,7 +32611,7 @@ TEST(frontend, failure_policy_rejects_invalid_fields_and_caps) {
     auto empty_ast = parse_file_heap(empty_lexed.value());
     REQUIRE(empty_ast);
     CHECK_EQ(empty_ast->failure_policies[0].body.len, 0u);
-    auto empty_copy = std::make_unique<AstFile>(*empty_ast);
+    auto empty_copy = std::make_unique<AstFile>(empty_ast.value());
     CHECK(empty_copy->failure_policies[0].body.ptr !=
           empty_ast->failure_policies[0].body.ptr);
     CHECK_EQ(empty_copy->failure_policies[0].body.len, 0u);
