@@ -21,7 +21,7 @@ Allowed states are `SUPPORTED`, `PARTIAL`, `BLOCKED_BY_RUT`,
 | nginx default proxied response header policy | implicit | yes | partial: bounded strict H1.1 final-response/content-length serializer; consumes one upstream `Connection`; downstream connection follows request; #253 | exact RUT/token tests plus pinned generated-RUT GET, POST, and close differentials | PARTIAL |
 | single unavailable upstream gateway error | implicit | yes | yes for bounded H1 single-IPv4 connect failures; #256 | committed pinned close/EOF differential plus pinned keep-alive and split-POST evidence | SUPPORTED |
 | exact, `^~`, regex, or nested locations | no | no | no nginx selection semantics | no | NOT_PLANNED |
-| `proxy_pass` with URI replacement | no | no | blocked: literal full-path rewrite cannot preserve a dynamic suffix/query; #259 blocks #258 | pinned nginx `/api/` replacement baseline only | BLOCKED_BY_RUT |
+| `proxy_pass` with URI replacement | no | no | yes for bounded clean H1 prefix replacement; #259 closed | pinned nginx baseline plus generic RUT source→JIT wire evidence; no converter differential yet | NOT_IMPLEMENTED |
 | multiple servers / `server_name` / `default_server` | no | no | no virtual-server selection | no | NOT_PLANNED |
 | variables, rewrite, or internal redirects | no | no | insufficient nginx phase semantics | no | NOT_PLANNED |
 | HTTPS/DNS/IPv6/Unix-socket upstreams | no | no | fixed IPv4 HTTP only | no | NOT_PLANNED |
@@ -33,8 +33,10 @@ Allowed states are `SUPPORTED`, `PARTIAL`, `BLOCKED_BY_RUT`,
 - With `location /api/` and a `/` URI in `proxy_pass`, pinned nginx sends `/`,
   `/x`, and `/x?y=1` upstream for `/api/`, `/api/x`, and `/api/x?y=1`.
   It redirects `/api`, collapses repeated slash/dot-segment inputs, and decodes
-  `%7E` to `~` before replacement. #259 covers only a clean, fail-closed first
-  transform slice; normalization and slash redirect behavior remain outside it.
+  `%7E` to `~` before replacement. Closed #259 provides only a clean,
+  fail-closed first transform slice; normalization and slash redirect behavior
+  remain outside it, so #258 cannot become broadly `SUPPORTED` from clean-vector
+  evidence alone.
 - nginx prefix matching is byte-prefix based; RUT routing is segment-aware.
   The root `/` case overlaps, but broader prefix support cannot reuse that fact.
 - A `proxy_pass` without a URI suffix must not accidentally forward the
