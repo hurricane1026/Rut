@@ -1130,6 +1130,8 @@ FrontendResult<MirModule*> build_mir(const HirModule& module) {
             out->forward_request_policy_id = term.forward_request_policy_id;
             out->forward_response_policy_id = term.forward_response_policy_id;
             out->forward_failure_policy_id = term.forward_failure_policy_id;
+            out->has_forward_target_transform = term.has_forward_target_transform;
+            out->forward_target_transform = term.forward_target_transform;
             out->response_headers.len = 0;
             // Both HIR and MIR cap at 16 headers per terminator, so a
             // straight copy cannot truncate. Static-assert the cap

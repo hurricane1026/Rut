@@ -5,6 +5,7 @@
 #include "rut/common/failure_policy.h"
 #include "rut/common/types.h"
 #include "rut/common/request_policy.h"
+#include "rut/common/forward_target_transform.h"
 #include "rut/common/wait_limits.h"
 #include "rut/compiler/ast.h"
 #include "rut/compiler/diagnostic.h"
@@ -284,6 +285,10 @@ struct MirTerminator {
     u16 forward_request_policy_id = 0;
     u16 forward_response_policy_id = 0;
     u16 forward_failure_policy_id = 0;
+    // Internal compiler-only target transform metadata copied losslessly from
+    // HIR. Presence is explicit; lowering validates the complete descriptor.
+    bool has_forward_target_transform = false;
+    ForwardTargetTransformSpec forward_target_transform{};
 };
 
 struct MirBlock {

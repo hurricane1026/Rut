@@ -103,6 +103,57 @@ static Str lit(const char* s) {
     return {s, n};
 }
 
+// Intern a compiler-only target transform into the RIR-owned arena.  The table
+// entry is published only after both literal copies succeed; an arena
+// allocation that fails may consume unreclaimable arena space, but cannot
+// leave a partially visible transform or advance the stable ID sequence.
+static FrontendResult<u16> intern_target_transform(rir::Module& mod,
+                                                   const ForwardTargetTransformSpec& spec,
+                                                   Span span) {
+    if (!forward_target_transform_spec_valid(spec))
+        return frontend_error(FrontendError::UnsupportedSyntax, span);
+
+    for (u32 i = 0; i < mod.target_transform_count; i++) {
+        if (forward_target_transform_spec_equal(mod.target_transforms[i], spec))
+            return static_cast<u16>(i + 1);
+    }
+    if (mod.target_transform_count >= kMaxForwardTargetTransforms)
+        return frontend_error(FrontendError::TooManyItems, span);
+
+    u32 used = 0;
+    for (u32 i = 0; i < mod.target_transform_count; i++) {
+        const auto& existing = mod.target_transforms[i];
+        if (used > kForwardTargetTransformBytes ||
+            existing.strip_prefix.len > kForwardTargetTransformBytes - used)
+            return frontend_error(FrontendError::TooManyItems, span);
+        used += existing.strip_prefix.len;
+        if (existing.replace_prefix.len > kForwardTargetTransformBytes - used)
+            return frontend_error(FrontendError::TooManyItems, span);
+        used += existing.replace_prefix.len;
+    }
+    if (spec.strip_prefix.len > kForwardTargetTransformBytes - used)
+        return frontend_error(FrontendError::TooManyItems, span);
+    used += spec.strip_prefix.len;
+    if (spec.replace_prefix.len > kForwardTargetTransformBytes - used)
+        return frontend_error(FrontendError::TooManyItems, span);
+
+    auto copy = [&](Str src) -> Str {
+        char* dst = mod.arena->alloc_array<char>(src.len);
+        if (!dst) return {nullptr, 0xffffffffu};
+        for (u32 i = 0; i < src.len; i++) dst[i] = src.ptr[i];
+        return {dst, src.len};
+    };
+    const Str strip = copy(spec.strip_prefix);
+    if (strip.len == 0xffffffffu) return frontend_error(FrontendError::OutOfMemory, span);
+    const Str replace = copy(spec.replace_prefix);
+    if (replace.len == 0xffffffffu) return frontend_error(FrontendError::OutOfMemory, span);
+
+    const u32 index = mod.target_transform_count;
+    mod.target_transforms[index] = {strip, replace};
+    mod.target_transform_count++;
+    return static_cast<u16>(index + 1);
+}
+
 static Str payload_field_name(MirTypeKind kind) {
     if (kind == MirTypeKind::Bool) return lit("payload_bool");
     if (kind == MirTypeKind::Str) return lit("payload_str");
@@ -3099,16 +3150,40 @@ static FrontendResult<void> emit_term(const MirTerminator& term,
                 if (!p0) return frontend_error(FrontendError::OutOfMemory, term.span);
                 policy = p0.value();
             }
+            u16 target_transform_id = 0;
+            if (term.has_forward_target_transform) {
+                auto transform = intern_target_transform(*b.mod,
+                                                         term.forward_target_transform,
+                                                         term.span);
+                if (!transform) return core::make_unexpected(transform.error());
+                target_transform_id = transform.value();
+            }
             if (term.commit_response_mutations &&
                 !b.emit_resp_commit_headers({term.span.line, term.span.col}))
+                return frontend_error(FrontendError::OutOfMemory, term.span);
+            if (target_transform_id != 0 &&
+                !b.emit_req_set_target_transform(target_transform_id,
+                                                 {term.span.line, term.span.col}))
                 return frontend_error(FrontendError::OutOfMemory, term.span);
             if (!b.emit_ret_forward_bundle(upstream.value(), policy, bundle.value(),
                                            {term.span.line, term.span.col}))
                 return frontend_error(FrontendError::OutOfMemory, term.span);
             return {};
         }
+        u16 target_transform_id = 0;
+        if (term.has_forward_target_transform) {
+            auto transform = intern_target_transform(*b.mod,
+                                                     term.forward_target_transform,
+                                                     term.span);
+            if (!transform) return core::make_unexpected(transform.error());
+            target_transform_id = transform.value();
+        }
         if (term.commit_response_mutations &&
             !b.emit_resp_commit_headers({term.span.line, term.span.col}))
+            return frontend_error(FrontendError::OutOfMemory, term.span);
+        if (target_transform_id != 0 &&
+            !b.emit_req_set_target_transform(target_transform_id,
+                                             {term.span.line, term.span.col}))
             return frontend_error(FrontendError::OutOfMemory, term.span);
         if (!b.emit_ret_forward(upstream.value(),
                                 policy,

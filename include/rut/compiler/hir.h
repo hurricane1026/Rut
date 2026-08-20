@@ -4,6 +4,7 @@
 #include "rut/common/response_policy.h"
 #include "rut/common/failure_policy.h"
 #include "rut/common/request_policy.h"
+#include "rut/common/forward_target_transform.h"
 #include "rut/common/wait_limits.h"
 #include "rut/compiler/ast.h"
 #include "rut/compiler/diagnostic.h"
@@ -801,6 +802,11 @@ struct HirTerminator {
     u16 forward_request_policy_id = 0;
     u16 forward_response_policy_id = 0;
     u16 forward_failure_policy_id = 0;
+    // Internal compiler-only target transform metadata. There is intentionally
+    // no parser/source syntax yet; presence is explicit so a forged partial
+    // descriptor is not mistaken for the no-transform case.
+    bool has_forward_target_transform = false;
+    ForwardTargetTransformSpec forward_target_transform{};
 };
 
 struct HirGuardBody {

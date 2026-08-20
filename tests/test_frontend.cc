@@ -11,6 +11,7 @@
 #include <filesystem>
 #include <fstream>
 #include <string>
+#include <vector>
 using namespace rut;
 
 TEST(hir, function_moves_preserve_non_response_statement_effect) {
@@ -32662,6 +32663,303 @@ TEST(frontend, failure_policy_byte_body_reaches_rir_and_keeps_nul_lf) {
     CHECK(static_cast<u8>(body.ptr[2]) == '\n');
     CHECK(static_cast<u8>(body.ptr[3]) == 'B');
     rir.destroy();
+}
+
+TEST(frontend, target_transform_internal_metadata_reaches_rir_and_preserves_policy) {
+    const char source[] =
+        "upstream backend at \"127.0.0.1:9000\"\n"
+        "route GET \"/api\" { return forward(backend) }\n";
+    auto lexed = lex(lit(source));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+
+    char strip[] = "/api/";
+    char replace[] = "/v1/";
+    auto& hir_term = hir->routes[0].control.direct_term;
+    hir_term.has_forward_target_transform = true;
+    hir_term.forward_target_transform = {{strip, 5}, {replace, 4}};
+    hir_term.forward_request_policy_id = 1;
+
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    const auto& mir_term = mir->functions[0].blocks[0].term;
+    CHECK(mir_term.has_forward_target_transform);
+    CHECK(mir_term.forward_target_transform.strip_prefix.eq({strip, 5}));
+    CHECK(mir_term.forward_target_transform.replace_prefix.eq({replace, 4}));
+
+    FrontendRirModule rir{};
+    REQUIRE(lower_to_rir(mir.value(), rir));
+    REQUIRE_EQ(rir.module.target_transform_count, 1u);
+    CHECK(rir.module.target_transforms[0].strip_prefix.ptr != strip);
+    CHECK(rir.module.target_transforms[0].replace_prefix.ptr != replace);
+    CHECK(rir.module.target_transforms[0].strip_prefix.eq({strip, 5}));
+    CHECK(rir.module.target_transforms[0].replace_prefix.eq({replace, 4}));
+
+    const auto& block = rir.module.functions[0].blocks[0];
+    REQUIRE_EQ(block.inst_count, 4u);
+    CHECK(block.insts[0].op == rir::Opcode::ConstI32);
+    CHECK(block.insts[1].op == rir::Opcode::ConstI32);
+    CHECK(block.insts[2].op == rir::Opcode::ReqSetTargetTransform);
+    CHECK_EQ(block.insts[2].imm.i32_val, 1);
+    CHECK(block.insts[3].op == rir::Opcode::RetForward);
+    CHECK_EQ(block.insts[3].operand_count, 2u);
+    CHECK_EQ(block.insts[1].imm.i32_val, 1);
+    rir.destroy();
+}
+
+TEST(frontend, target_transform_duplicates_reuse_stable_first_ids) {
+    std::string source = "upstream backend at \"127.0.0.1:9000\"\n";
+    for (u32 i = 0; i < 3; i++) {
+        source += "route GET \"/r" + std::to_string(i) +
+                  "\" { return forward(backend) }\n";
+    }
+    auto lexed = lex({source.data(), static_cast<u32>(source.size())});
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    char strip_a[] = "/api/";
+    char replace_a[] = "/v1/";
+    char strip_b[] = "/web/";
+    char replace_b[] = "/edge/";
+    hir->routes[0].control.direct_term.has_forward_target_transform = true;
+    hir->routes[0].control.direct_term.forward_target_transform = {{strip_a, 5}, {replace_a, 4}};
+    hir->routes[1].control.direct_term.has_forward_target_transform = true;
+    hir->routes[1].control.direct_term.forward_target_transform = {{strip_a, 5}, {replace_a, 4}};
+    hir->routes[2].control.direct_term.has_forward_target_transform = true;
+    hir->routes[2].control.direct_term.forward_target_transform = {{strip_b, 5}, {replace_b, 6}};
+
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    REQUIRE(lower_to_rir(mir.value(), rir));
+    REQUIRE_EQ(rir.module.target_transform_count, 2u);
+    for (u32 i = 0; i < 3; i++) {
+        const auto* effect = find_first_op(rir.module.functions[i],
+                                           rir::Opcode::ReqSetTargetTransform);
+        REQUIRE(effect != nullptr);
+        CHECK_EQ(effect->imm.i32_val, i == 2 ? 2 : 1);
+    }
+    rir.destroy();
+}
+
+TEST(frontend, target_transform_precedes_forward_bundle_and_preserves_operands) {
+    const char source[] = R"rut(
+upstream backend at "127.0.0.1:9000"
+route GET "/api" {
+    return forward(backend, response_policy: {
+        version: "HTTP/1.1",
+        framing: "content_length",
+        connection: "keep_alive",
+        server: "rut",
+        date: "current",
+        hide_headers: []
+    }, failure_policy: {
+        version: "HTTP/1.1",
+        status: 502,
+        reason: "Bad Gateway",
+        content_type: "text/plain",
+        server: "rut",
+        date: "current",
+        connection: "request",
+        body: b"unavailable"
+    })
+}
+)rut";
+    auto lexed = lex(lit(source));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    char strip[] = "/api/";
+    char replace[] = "/v1/";
+    hir->routes[0].control.direct_term.has_forward_target_transform = true;
+    hir->routes[0].control.direct_term.forward_target_transform = {{strip, 5}, {replace, 4}};
+
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    REQUIRE(lower_to_rir(mir.value(), rir));
+    REQUIRE_EQ(rir.module.target_transform_count, 1u);
+    REQUIRE_EQ(rir.module.policy_bundle_count, 1u);
+    const auto& block = rir.module.functions[0].blocks[0];
+    REQUIRE_GE(block.inst_count, 5u);
+    const auto& ret = block.insts[block.inst_count - 1];
+    REQUIRE_EQ(static_cast<u8>(ret.op), static_cast<u8>(rir::Opcode::RetForwardBundle));
+    REQUIRE_EQ(ret.operand_count, 3u);
+    const auto& transform = block.insts[block.inst_count - 2];
+    CHECK_EQ(static_cast<u8>(transform.op), static_cast<u8>(rir::Opcode::ReqSetTargetTransform));
+    CHECK_EQ(transform.imm.i32_val, 1);
+    CHECK_EQ(block.insts[block.inst_count - 3].op, rir::Opcode::ConstI32);
+    // The bundle branch carries an explicit zero request-policy operand,
+    // followed by the response/failure bundle ID.
+    CHECK_EQ(ret.operands[1].id, block.insts[block.inst_count - 5].result.id);
+    CHECK_EQ(ret.operands[2].id, block.insts[block.inst_count - 3].result.id);
+    CHECK_EQ(rir.module.policy_bundles[0].response_policy_id, 1u);
+    CHECK_EQ(rir.module.policy_bundles[0].failure_policy_id, 1u);
+    rir.destroy();
+}
+
+TEST(frontend, target_transform_count_and_aggregate_boundaries_are_atomic) {
+    auto make_source = [](u32 count) {
+        std::string source = "upstream backend at \"127.0.0.1:9000\"\n";
+        for (u32 i = 0; i < count; i++)
+            source += "route GET \"/r" + std::to_string(i) + "\" { return forward(backend) }\n";
+        return source;
+    };
+
+    {
+        std::string source = make_source(16);
+        auto lexed = lex({source.data(), static_cast<u32>(source.size())});
+        REQUIRE(lexed);
+        auto ast = parse_file_heap(lexed.value());
+        REQUIRE(ast);
+        auto hir = analyze_file_heap(ast.value());
+        REQUIRE(hir);
+        std::vector<std::string> strips(16), replaces(16);
+        for (u32 i = 0; i < 16; i++) {
+            strips[i] = "/" + std::string(1, static_cast<char>('a' + i)) + "/";
+            replaces[i] = "/" + std::string(1, static_cast<char>('A' + i)) + "/";
+            hir->routes[i].control.direct_term.has_forward_target_transform = true;
+            hir->routes[i].control.direct_term.forward_target_transform = {
+                {strips[i].data(), static_cast<u32>(strips[i].size())},
+                {replaces[i].data(), static_cast<u32>(replaces[i].size())}};
+        }
+        auto mir = build_mir_heap(hir.value());
+        REQUIRE(mir);
+        FrontendRirModule rir{};
+        REQUIRE(lower_to_rir(mir.value(), rir));
+        CHECK_EQ(rir.module.target_transform_count, 16u);
+        CHECK(rir.module.target_transforms[15].replace_prefix.eq({replaces[15].data(), 3}));
+        rir.destroy();
+
+        source = make_source(17);
+        lexed = lex({source.data(), static_cast<u32>(source.size())});
+        REQUIRE(lexed);
+        ast = parse_file_heap(lexed.value());
+        REQUIRE(ast);
+        hir = analyze_file_heap(ast.value());
+        REQUIRE(hir);
+        strips.assign(17, {});
+        replaces.assign(17, {});
+        for (u32 i = 0; i < 17; i++) {
+            strips[i] = "/" + std::string(1, static_cast<char>('a' + i)) + "/";
+            replaces[i] = "/" + std::string(1, static_cast<char>('A' + i)) + "/";
+            hir->routes[i].control.direct_term.has_forward_target_transform = true;
+            hir->routes[i].control.direct_term.forward_target_transform = {
+                {strips[i].data(), static_cast<u32>(strips[i].size())},
+                {replaces[i].data(), static_cast<u32>(replaces[i].size())}};
+        }
+        mir = build_mir_heap(hir.value());
+        REQUIRE(mir);
+        FrontendRirModule rir_overflow{};
+        auto lowered = lower_to_rir(mir.value(), rir_overflow);
+        REQUIRE_FALSE(lowered.has_value());
+        CHECK_EQ(lowered.error().code, FrontendError::TooManyItems);
+        CHECK_GT(lowered.error().span.line, 0u);
+        CHECK_EQ(rir_overflow.module.target_transform_count, 0u);
+        rir_overflow.destroy();
+    }
+
+    {
+        std::string source = make_source(8);
+        auto lexed = lex({source.data(), static_cast<u32>(source.size())});
+        REQUIRE(lexed);
+        auto ast = parse_file_heap(lexed.value());
+        REQUIRE(ast);
+        auto hir = analyze_file_heap(ast.value());
+        REQUIRE(hir);
+        std::vector<std::string> strips(8), replaces(8);
+        for (u32 i = 0; i < 8; i++) {
+            strips[i] = "/" + std::string(126, static_cast<char>('a' + i)) + "/";
+            replaces[i] = "/" + std::string(126, static_cast<char>('A' + i)) + "/";
+            hir->routes[i].control.direct_term.has_forward_target_transform = true;
+            hir->routes[i].control.direct_term.forward_target_transform = {
+                {strips[i].data(), 128}, {replaces[i].data(), 128}};
+        }
+        auto mir = build_mir_heap(hir.value());
+        REQUIRE(mir);
+        FrontendRirModule exact{};
+        REQUIRE(lower_to_rir(mir.value(), exact));
+        REQUIRE_EQ(exact.module.target_transform_count, 8u);
+        u32 exact_bytes = 0;
+        for (u32 i = 0; i < exact.module.target_transform_count; i++) {
+            exact_bytes += exact.module.target_transforms[i].strip_prefix.len;
+            exact_bytes += exact.module.target_transforms[i].replace_prefix.len;
+        }
+        CHECK_EQ(exact_bytes, kForwardTargetTransformBytes);
+        exact.destroy();
+
+        source = make_source(9);
+        lexed = lex({source.data(), static_cast<u32>(source.size())});
+        REQUIRE(lexed);
+        ast = parse_file_heap(lexed.value());
+        REQUIRE(ast);
+        hir = analyze_file_heap(ast.value());
+        REQUIRE(hir);
+        strips.assign(9, {});
+        replaces.assign(9, {});
+        for (u32 i = 0; i < 9; i++) {
+            strips[i] = "/" + std::string(126, static_cast<char>('a' + i)) + "/";
+            replaces[i] = "/" + std::string(126, static_cast<char>('A' + i)) + "/";
+            hir->routes[i].control.direct_term.has_forward_target_transform = true;
+            hir->routes[i].control.direct_term.forward_target_transform = {
+                {strips[i].data(), 128}, {replaces[i].data(), 128}};
+        }
+        mir = build_mir_heap(hir.value());
+        REQUIRE(mir);
+        FrontendRirModule rir{};
+        auto lowered = lower_to_rir(mir.value(), rir);
+        REQUIRE_FALSE(lowered.has_value());
+        CHECK_EQ(lowered.error().code, FrontendError::TooManyItems);
+        CHECK_GT(lowered.error().span.line, 0u);
+        CHECK_EQ(rir.module.target_transform_count, 0u);
+        rir.destroy();
+    }
+}
+
+TEST(frontend, target_transform_invalid_presence_rejects_and_absence_is_transparent) {
+    const char source[] =
+        "upstream backend at \"127.0.0.1:9000\"\n"
+        "route GET \"/api\" { return forward(backend) }\n";
+    auto lexed = lex(lit(source));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    char replace[] = "/v1/";
+    hir->routes[0].control.direct_term.has_forward_target_transform = true;
+    hir->routes[0].control.direct_term.forward_target_transform = {{nullptr, 1}, {replace, 4}};
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rejected{};
+    auto lowered = lower_to_rir(mir.value(), rejected);
+    REQUIRE_FALSE(lowered.has_value());
+    CHECK_EQ(lowered.error().code, FrontendError::UnsupportedSyntax);
+    CHECK_EQ(rejected.module.target_transform_count, 0u);
+    rejected.destroy();
+
+    auto ast_plain = parse_file_heap(lexed.value());
+    REQUIRE(ast_plain);
+    auto hir_plain = analyze_file_heap(ast_plain.value());
+    REQUIRE(hir_plain);
+    hir_plain->routes[0].control.direct_term.forward_target_transform = {{nullptr, 1}, {replace, 4}};
+    auto mir_plain = build_mir_heap(hir_plain.value());
+    REQUIRE(mir_plain);
+    FrontendRirModule plain{};
+    REQUIRE(lower_to_rir(mir_plain.value(), plain));
+    CHECK_EQ(plain.module.target_transform_count, 0u);
+    CHECK_FALSE(function_has_op(plain.module.functions[0], rir::Opcode::ReqSetTargetTransform));
+    const auto* ret = find_first_op(plain.module.functions[0], rir::Opcode::RetForward);
+    REQUIRE(ret != nullptr);
+    CHECK_EQ(ret->operand_count, 1u);
+    plain.destroy();
 }
 
 int main(int argc, char** argv) {
