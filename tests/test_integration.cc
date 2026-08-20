@@ -8950,6 +8950,31 @@ static u64 forward_upstream_0_handler(void* /*conn*/,
     return r.pack();
 }
 
+// Direct-RIR-style policy result used by runtime and HTTP/2 fail-closed tests.
+// The status slot is the request-policy ABI field for Forward outcomes.
+static u64 forward_request_policy_1_handler(void* /*conn*/,
+                                             rut::jit::HandlerCtx* /*ctx*/,
+                                             const u8* /*req*/,
+                                             u32 /*len*/,
+                                             void* /*arena*/) {
+    rut::jit::HandlerResult r{rut::jit::HandlerAction::Forward,
+                              /*request_policy_id=*/1,
+                              /*upstream_id=*/0,
+                              /*next_state=*/0,
+                              rut::jit::YieldKind::HttpGet};
+    return r.pack();
+}
+
+// Runtime defense-in-depth vector: source analysis rejects this combination,
+// so a direct handler leaves a pending response mutation for handle_jit_outcome
+// to reject before apply_request_policy can rewrite recv_buf.
+static u64 forward_request_policy_with_pending_mutation_handler(
+    void* raw_conn, rut::jit::HandlerCtx* /*ctx*/, const u8* /*req*/, u32 /*len*/, void* /*arena*/) {
+    auto* conn = static_cast<rut::Connection*>(raw_conn);
+    conn->resp_header_mutation_pending_count = 1;
+    return forward_request_policy_1_handler(nullptr, nullptr, nullptr, 0, nullptr);
+}
+
 // Mirrors a compiled chain that mutates response headers and then forwards.
 // X-Path deliberately borrows the synthesized request target so the h2 proxy
 // must keep it stable after pending_synth is reused for response frames.
@@ -15918,6 +15943,14 @@ struct RecordingUpstream {
 
 TEST(route, forward_request_policy_rebuilds_nginx_h11_headers) {
     using namespace rut;
+    struct JitResources {
+        FrontendRirModule rir{};
+        jit::JitEngine engine{};
+        ~JitResources() {
+            engine.shutdown();
+            rir.destroy();
+        }
+    } resources;
     RecordingUpstream upstream;
     REQUIRE(upstream.setup());
     char source[1024];
@@ -15942,11 +15975,11 @@ TEST(route, forward_request_policy_rebuilds_nginx_h11_headers) {
     auto mir = build_mir(*hir_owned);
     REQUIRE(mir);
     std::unique_ptr<MirModule> mir_owned(mir.value());
-    FrontendRirModule rir{};
+    auto& rir = resources.rir;
     REQUIRE(lower_to_rir(*mir_owned, rir));
     auto cg = jit::codegen(rir.module);
     REQUIRE(cg.ok);
-    jit::JitEngine engine;
+    auto& engine = resources.engine;
     REQUIRE(engine.init());
     REQUIRE(engine.compile(cg.mod, cg.ctx));
     RouteConfig cfg{};
@@ -16039,8 +16072,142 @@ TEST(route, forward_request_policy_rebuilds_nginx_h11_headers) {
         CHECK_EQ(upstream.accepted_count.load(std::memory_order_acquire), accepted_before);
         CHECK_EQ(upstream.request_count.load(std::memory_order_acquire), requests_before);
     }
-    engine.shutdown();
-    rir.destroy();
+}
+
+TEST(shard, serves_http2_jit_request_policy_fails_closed) {
+    using namespace rut;
+    RecordingUpstream backend;
+    REQUIRE(backend.setup());
+
+    RouteConfig cfg{};
+    auto id = cfg.add_upstream("backend", 0x7F000001, backend.port);
+    REQUIRE(id.has_value());
+    REQUIRE(cfg.add_jit_handler("/api", 'G', &forward_request_policy_1_handler));
+
+    Shard<EpollEventLoop> shard;
+    i32 lfd = create_listen_socket(0).value_or(-1);
+    REQUIRE(lfd >= 0);
+    struct FdGuard {
+        i32 fd;
+        ~FdGuard() {
+            if (fd >= 0) close(fd);
+        }
+    } listener{lfd};
+    REQUIRE(shard.init(0, lfd).has_value());
+    shard.route_config = &cfg;
+    struct ShardGuard {
+        Shard<EpollEventLoop>& shard;
+        i32& listen_fd;
+        i32 client_fd = -1;
+        bool spawned = false;
+        ~ShardGuard() {
+            if (client_fd >= 0) close(client_fd);
+            if (spawned) {
+                shard.stop();
+                shard.join();
+            }
+            shard.shutdown();
+            if (listen_fd >= 0) close(listen_fd);
+        }
+    } guard{shard, lfd};
+    listener.fd = -1;
+    REQUIRE(shard.spawn(-1).has_value());
+    guard.spawned = true;
+    usleep(50000);
+
+    guard.client_fd = connect_to(get_port(lfd));
+    REQUIRE(guard.client_fd >= 0);
+    set_socket_timeouts(guard.client_fd, 2);
+    u8 out[512];
+    u32 n = h2_client_prologue(out);
+    n += h2_client_get(out + n, sizeof(out) - n, 1, "/api", 4);
+    REQUIRE(write_all_fd(guard.client_fd, out, n));
+
+    u8 response[4096];
+    u32 total = 0;
+    for (int attempt = 0; attempt < 8 && total < sizeof(response); attempt++) {
+        i32 got = recv_timeout(guard.client_fd,
+                               reinterpret_cast<char*>(response + total),
+                               sizeof(response) - total,
+                               2000);
+        if (got <= 0) break;
+        total += static_cast<u32>(got);
+        if (h2_status_for_stream(response, total, 1) != 0) break;
+    }
+    CHECK_EQ(h2_status_for_stream(response, total, 1), 400u);
+    usleep(100000);
+    CHECK_EQ(backend.accepted_count.load(std::memory_order_acquire), 0u);
+    CHECK_EQ(backend.request_count.load(std::memory_order_acquire), 0u);
+}
+
+TEST(route, request_policy_rejects_multi_address_before_upstream_accept) {
+    using namespace rut;
+    RecordingUpstream backend;
+    REQUIRE(backend.setup());
+    RouteConfig cfg{};
+    auto id = cfg.add_upstream("backend", 0x7F000001, backend.port);
+    REQUIRE(id.has_value());
+    REQUIRE(cfg.add_upstream_backend(id.value(), 0x7F000001, backend.port));
+    REQUIRE(cfg.add_jit_handler("/api", 'G', &forward_request_policy_1_handler));
+    const RouteConfig* active = &cfg;
+    ScopedProxyLoop proxy;
+    REQUIRE(proxy.setup(&active, 1000));
+
+    struct ClientGuard {
+        i32 fd;
+        ~ClientGuard() {
+            if (fd >= 0) close(fd);
+        }
+    } client{connect_to(proxy.port)};
+    REQUIRE(client.fd >= 0);
+    set_socket_timeouts(client.fd, 2);
+    static constexpr char kRequest[] = "GET /api HTTP/1.1\r\nHost: client.example\r\n\r\n";
+    REQUIRE(send_all(client.fd, kRequest, sizeof(kRequest) - 1));
+    char response[512];
+    const i32 response_len = recv_timeout(client.fd, response, sizeof(response), 2000);
+    CHECK_GT(response_len, 0);
+    CHECK(buf_contains(response,
+                       static_cast<u32>(response_len),
+                       "400",
+                       static_cast<u32>(strlen("400"))));
+    usleep(100000);
+    CHECK_EQ(backend.accepted_count.load(std::memory_order_acquire), 0u);
+    CHECK_EQ(backend.request_count.load(std::memory_order_acquire), 0u);
+}
+
+TEST(route, request_policy_rejects_pending_response_mutation_before_rewrite) {
+    using namespace rut;
+    RecordingUpstream backend;
+    REQUIRE(backend.setup());
+    RouteConfig cfg{};
+    auto id = cfg.add_upstream("backend", 0x7F000001, backend.port);
+    REQUIRE(id.has_value());
+    REQUIRE(cfg.add_jit_handler(
+        "/api", 'G', &forward_request_policy_with_pending_mutation_handler));
+    const RouteConfig* active = &cfg;
+    ScopedProxyLoop proxy;
+    REQUIRE(proxy.setup(&active, 1000));
+
+    struct ClientGuard {
+        i32 fd;
+        ~ClientGuard() {
+            if (fd >= 0) close(fd);
+        }
+    } client{connect_to(proxy.port)};
+    REQUIRE(client.fd >= 0);
+    set_socket_timeouts(client.fd, 2);
+    static constexpr char kRequest[] = "GET /api HTTP/1.1\r\nHost: client.example\r\n\r\n";
+    REQUIRE(send_all(client.fd, kRequest, sizeof(kRequest) - 1));
+    char response[512];
+    const i32 response_len = recv_timeout(client.fd, response, sizeof(response), 2000);
+    CHECK_GT(response_len, 0);
+    CHECK(buf_contains(response,
+                       static_cast<u32>(response_len),
+                       "400",
+                       static_cast<u32>(strlen("400"))));
+    usleep(100000);
+    CHECK_EQ(backend.accepted_count.load(std::memory_order_acquire), 0u);
+    CHECK_EQ(backend.request_count.load(std::memory_order_acquire), 0u);
 }
 
 // Compile `forward(backend, set_header: <dict>)`, drive one GET /api through the
