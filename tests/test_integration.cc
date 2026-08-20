@@ -15762,25 +15762,11 @@ TEST(route, target_transform_effect_does_not_leak_across_keepalive) {
         CHECK(buf_contains(b1, n1, "Connection: keep-alive",
                            sizeof("Connection: keep-alive") - 1));
 
-        // The response proves the local route completed, but it would not
-        // prove codegen emitted the effect: an omitted helper would still
-        // produce the same local 200 and let request 2 forward. Inspect the
-        // live server-side connection after the response, boundedly allowing
-        // the loop thread to publish the completed handler state.
-        bool helper_recorded = false;
-        u16 helper_id = 0;
-        for (int attempt = 0; attempt < 100 && !helper_recorded; attempt++) {
-            for (u32 i = 0; i < RealLoop::kMaxConns; i++) {
-                const auto& server_conn = proxy.loop->conns[i];
-                if (server_conn.fd < 0 || !server_conn.target_transform_recorded) continue;
-                helper_recorded = true;
-                helper_id = server_conn.target_transform_id;
-                break;
-            }
-            if (!helper_recorded) usleep(1000);
-        }
-        REQUIRE(helper_recorded);
-        CHECK_EQ(helper_id, 1u);
+        // The companion jit.target_transform_effect_records_and_fails_closed
+        // test synchronously proves that this RIR opcode reaches codegen and
+        // the real helper records ID 1. This socket-level half of the proof
+        // deliberately avoids racing the loop thread: it proves the recorded
+        // effect does not leak into request 2 across the actual H1 boundary.
 
         const char kR2[] = "GET /plain HTTP/1.1\r\nHost: x\r\n\r\n";
         REQUIRE(send_all(c, kR2, sizeof(kR2) - 1));
