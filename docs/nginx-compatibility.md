@@ -21,7 +21,7 @@ Allowed states are `SUPPORTED`, `PARTIAL`, `BLOCKED_BY_RUT`,
 | nginx default proxied response header policy | implicit | yes | partial: bounded strict H1.1 final-response/content-length serializer; consumes one upstream `Connection`; downstream connection follows request; #253 | exact RUT/token tests plus pinned generated-RUT GET, POST, and close differentials | PARTIAL |
 | single unavailable upstream gateway error | implicit | yes | yes for bounded H1 single-IPv4 connect failures; #256 | committed pinned close/EOF differential plus pinned keep-alive and split-POST evidence | SUPPORTED |
 | exact, `^~`, regex, or nested locations | no | no | no nginx selection semantics | no | NOT_PLANNED |
-| `proxy_pass` with URI replacement | yes for exact `/api/` + URI `/` pair | yes for exact clean slice | yes for bounded clean H1 prefix replacement; #259 closed | parser/golden/verified-RIR plus generic RUT source→JIT wire evidence; converter differential pending | PARTIAL |
+| `proxy_pass` with URI replacement | yes for exact `/api/` + URI `/` pair | yes for exact clean slice | yes for bounded clean H1 prefix replacement; #259 closed | pinned converter-generated differentials for `/api/`, `/api/x`, and query preservation; fail-closed vectors pending | PARTIAL |
 | multiple servers / `server_name` / `default_server` | no | no | no virtual-server selection | no | NOT_PLANNED |
 | variables, rewrite, or internal redirects | no | no | insufficient nginx phase semantics | no | NOT_PLANNED |
 | HTTPS/DNS/IPv6/Unix-socket upstreams | no | no | fixed IPv4 HTTP only | no | NOT_PLANNED |
