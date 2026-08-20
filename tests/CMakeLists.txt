@@ -328,6 +328,24 @@ add_test(NAME test_shard_control COMMAND test_shard_control)
 set_tests_properties(test_shard_control PROPERTIES LABELS "unit")
 
 if(RUT_ENABLE_JIT)
+    add_executable(test_nginx_differential test_nginx_differential.cc)
+    target_link_libraries(test_nginx_differential PRIVATE rut_nginx Threads::Threads)
+    target_include_directories(test_nginx_differential PRIVATE
+        ${PROJECT_SOURCE_DIR}/include
+    )
+    add_dependencies(test_nginx_differential rut)
+    add_test(
+        NAME test_nginx_differential
+        COMMAND test_nginx_differential $<TARGET_FILE:rut>
+    )
+    set_tests_properties(test_nginx_differential PROPERTIES
+        LABELS "integration;nginx;docker"
+        RUN_SERIAL TRUE
+        RESOURCE_LOCK nginx-differential
+        TIMEOUT 120
+        SKIP_RETURN_CODE 77
+    )
+
     add_executable(test_jit test_jit.cc ${PROJECT_SOURCE_DIR}/src/placement_new.cc)
     target_link_libraries(test_jit rut_jit rut_compiler)
     target_include_directories(test_jit PRIVATE
