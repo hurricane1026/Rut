@@ -1,3 +1,7 @@
+#include "rut/compiler/analyze.h"
+#include "rut/compiler/lexer.h"
+#include "rut/compiler/parser.h"
+#include "rut/nginx/converter.h"
 #include "rut/nginx/parser.h"
 #include "test.h"
 
@@ -227,6 +231,112 @@ TEST(nginx_parser, reports_missing_listen_semicolon_at_brace) {
     CHECK_EQ(result.error().span.line, 1);
     CHECK_EQ(result.error().span.col, 22);
     CHECK(result.error().detail.eq(lit_str("expected ';' after listen")));
+}
+
+static nginx::Server canonical_server() {
+    nginx::Server server{};
+    server.listen.port = 8080;
+    server.listen.span = Span{0, 13, 1, 1};
+    server.location.path = lit_str("/");
+    server.location.path_span = Span{22, 23, 1, 23};
+    server.location.span = server.location.path_span;
+    server.location.proxy_pass.address[0] = 127;
+    server.location.proxy_pass.address[1] = 0;
+    server.location.proxy_pass.address[2] = 0;
+    server.location.proxy_pass.address[3] = 1;
+    server.location.proxy_pass.port = 9000;
+    server.location.proxy_pass.span = Span{26, 52, 1, 26};
+    server.span = Span{0, 54, 1, 1};
+    return server;
+}
+
+TEST(nginx_converter, lowers_canonical_model_to_stable_rut_source) {
+    const auto result = nginx::lower_to_rut(canonical_server());
+    REQUIRE(result);
+    static constexpr char kExpected[] =
+        "listen :8080\n"
+        "upstream nginx_upstream at \"127.0.0.1:9000\"\n"
+        "route \"/\" {\n"
+        "    return forward(nginx_upstream, request_policy: {\n"
+        "        version: \"HTTP/1.1\",\n"
+        "        host: \"upstream\",\n"
+        "        connection: \"omit\",\n"
+        "        strip_headers: [\"Connection\", \"Keep-Alive\", \"TE\", \"Expect\", \"Upgrade\"]\n"
+        "    }, response_policy: {\n"
+        "        version: \"HTTP/1.1\",\n"
+        "        framing: \"content_length\",\n"
+        "        connection: \"keep_alive\",\n"
+        "        server: \"nginx/1.29.7\",\n"
+        "        date: \"current\",\n"
+        "        hide_headers: [\"Date\", \"Server\", \"X-Pad\"]\n"
+        "    })\n"
+        "}\n";
+    CHECK_EQ(result.value().len, static_cast<u32>(sizeof(kExpected) - 1));
+    CHECK(result.value().view().eq({kExpected, sizeof(kExpected) - 1}));
+}
+
+TEST(nginx_converter, formatting_and_comments_do_not_change_lowering) {
+    const char compact[] =
+        "server { listen 8080; location / { proxy_pass http://127.0.0.1:9000; } }";
+    const char formatted[] =
+        "# same model\n"
+        "server {\n"
+        "  listen 8080; # wildcard cleartext\n"
+        "  location\t/ {\n"
+        "    proxy_pass http://127.0.0.1:9000;\n"
+        "  }\n"
+        "}\n";
+    auto compact_parsed = nginx::parse({compact, sizeof(compact) - 1});
+    auto formatted_parsed = nginx::parse({formatted, sizeof(formatted) - 1});
+    REQUIRE(compact_parsed);
+    REQUIRE(formatted_parsed);
+    auto compact_lowered = nginx::lower_to_rut(compact_parsed.value());
+    auto formatted_lowered = nginx::lower_to_rut(formatted_parsed.value());
+    REQUIRE(compact_lowered);
+    REQUIRE(formatted_lowered);
+    CHECK(compact_lowered.value().view().eq(formatted_lowered.value().view()));
+}
+
+TEST(nginx_converter, emitted_source_compiles_through_frontend) {
+    auto lowered = nginx::lower_to_rut(canonical_server());
+    REQUIRE(lowered);
+    auto lexed = lex(lowered.value().view());
+    REQUIRE(lexed);
+    auto ast = parse_file(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file(*ast.value());
+    REQUIRE(hir);
+    delete ast.value();
+    delete hir.value();
+}
+
+TEST(nginx_converter, rejects_forged_invalid_models_without_output) {
+    auto invalid_listen = canonical_server();
+    invalid_listen.listen.port = 0;
+    auto bad_listen = nginx::lower_to_rut(invalid_listen);
+    CHECK(!bad_listen);
+    if (!bad_listen) {
+        CHECK_EQ(bad_listen.error().code, FrontendError::InvalidInteger);
+        CHECK_EQ(bad_listen.error().span.line, 1u);
+    }
+
+    auto invalid_upstream = canonical_server();
+    invalid_upstream.location.proxy_pass.port = 0;
+    auto bad_upstream = nginx::lower_to_rut(invalid_upstream);
+    CHECK(!bad_upstream);
+    if (!bad_upstream) CHECK_EQ(bad_upstream.error().code, FrontendError::InvalidInteger);
+
+    auto invalid_path = canonical_server();
+    invalid_path.location.path = lit_str("/api");
+    auto bad_path = nginx::lower_to_rut(invalid_path);
+    CHECK(!bad_path);
+    if (!bad_path) CHECK_EQ(bad_path.error().code, FrontendError::UnsupportedSyntax);
+
+    auto null_path = canonical_server();
+    null_path.location.path = {nullptr, 1};
+    auto bad_null_path = nginx::lower_to_rut(null_path);
+    CHECK(!bad_null_path);
+    if (!bad_null_path) CHECK_EQ(bad_null_path.error().code, FrontendError::UnsupportedSyntax);
 }
 
 int main(int argc, char** argv) { return rut::test::run_all(argc, argv); }

@@ -191,6 +191,7 @@ target_include_directories(rut_harness_core PUBLIC
 # runtime/lowering libraries.
 add_library(rut_nginx STATIC
     nginx/parser.cc
+    nginx/converter.cc
 )
 target_include_directories(rut_nginx PUBLIC
     ${PROJECT_SOURCE_DIR}/include
