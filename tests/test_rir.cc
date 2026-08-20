@@ -471,6 +471,49 @@ TEST(RirPrinter, OpcodeNames) {
     CHECK(got2.eq(lit("yield.http_get")));
 }
 
+TEST(RirPrinter, TargetTransformInstructionPrintsImmediateInFunction) {
+    TestContext ctx;
+    REQUIRE(ctx.init());
+    Builder b;
+    b.init(&ctx.mod);
+    auto* fn = V(b.create_function(lit("target_transform"), lit("/api"), 'G'));
+    auto entry = V(b.create_block(fn, lit("entry")));
+    b.set_insert_point(fn, entry);
+    VOK(b.emit_req_set_target_transform(1));
+
+    char print_data[512];
+    PrintBuf pb;
+    pb.init(print_data, sizeof(print_data), -1);
+    print_function(pb, *fn);
+    Str output{pb.data, pb.len};
+    const Str expected = lit("req.set_target_transform 1");
+    bool found = false;
+    for (u32 i = 0; i + expected.len <= output.len; i++) {
+        if (output.slice(i, i + expected.len).eq(expected)) {
+            found = true;
+            break;
+        }
+    }
+    CHECK(found);
+
+    // A directly forged negative immediate must remain visible in complete
+    // function output instead of being treated as an absent transform.
+    fn->entry()->insts[0].imm.i32_val = -1;
+    pb.len = 0;
+    print_function(pb, *fn);
+    output = {pb.data, pb.len};
+    const Str forged = lit("req.set_target_transform -1");
+    found = false;
+    for (u32 i = 0; i + forged.len <= output.len; i++) {
+        if (output.slice(i, i + forged.len).eq(forged)) {
+            found = true;
+            break;
+        }
+    }
+    CHECK(found);
+    ctx.destroy();
+}
+
 TEST(RirPrinter, TypeNames) {
     TestContext ctx;
     REQUIRE(ctx.init());
