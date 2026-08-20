@@ -8,7 +8,7 @@ Allowed states are `SUPPORTED`, `PARTIAL`, `BLOCKED_BY_RUT`,
 
 | nginx feature | parser | converter | RUT capability | behavior test | status |
 | --- | --- | --- | --- | --- | --- |
-| exact minimal fragment: one wildcard listener, root location, literal IPv4 no-URI proxy, bounded H1 domain | yes | yes | yes for declared bounds | pinned generated-RUT GET/query/percent-target, fixed-CL POST, response, close, and gateway differentials | SUPPORTED |
+| exact minimal fragment: one wildcard listener, root location, literal IPv4 no-URI proxy, bounded H1 domain | yes | yes | yes for declared bounds | committed pinned `%7E` success differential plus pinned generated-RUT fixed-CL POST, close, and gateway differentials | SUPPORTED |
 | server fragment, exactly one server | yes | yes | partial: exact single-server model only; no server selection model | bounded pinned generated-RUT GET and POST differentials | PARTIAL |
 | `listen <port>` IPv4 wildcard | yes | yes | yes: one source `listen :<port>` declaration | pinned nginx/generated-RUT bind and request | SUPPORTED |
 | ordinary prefix `location /` | yes | yes | partial: root catch-all exists | bounded pinned generated-RUT GET differential | PARTIAL |
@@ -63,10 +63,10 @@ Allowed states are `SUPPORTED`, `PARTIAL`, `BLOCKED_BY_RUT`,
   request headers, one final
   exact-Content-Length upstream response, custom reason, hidden/synthesized
   headers, duplicate response headers, and preserved trailing value whitespace.
-  Dynamic Date is the only normalized response field. This does not cover the
-  unavailable-upstream case required to complete #254. A separate `%7E`
-  encoded-unreserved vector also preserves the complete raw upstream target and
-  matches the downstream response; encoded slash/dot/malformed cases remain open.
+  Dynamic Date is the only normalized response field. The `%7E`
+  encoded-unreserved vector is now a committed serial pinned-nginx CTest; it
+  preserves the complete raw upstream target and matches the downstream
+  response. Encoded slash/dot/malformed cases remain open.
 - Pinned nginx consumes an upstream `Connection` header for absent,
   `keep-alive`, `close`, and token-list vectors, synthesizes one downstream
   connection field, and preserves token-nominated ordinary response headers.
@@ -78,11 +78,12 @@ Allowed states are `SUPPORTED`, `PARTIAL`, `BLOCKED_BY_RUT`,
   the close vector and continues stripping the client Connection upstream.
 - For one unavailable fixed upstream, pinned nginx waits for the complete
   fixed-CL request and emits a 157-byte HTML 502 with Server, Date,
-  Content-Type, and request-derived keep-alive. RUT currently emits an 11-byte
-  close response. Converter-generated RUT now matches the complete response
-  after normalizing only Date, preserves keep-alive for a second request,
-  closes on explicit client intent, and waits through the split-body window.
-  The claim remains limited to the bounded H1 single-IPv4 connect-failure domain.
+  Content-Type, and request-derived keep-alive. Before #256, RUT emitted an
+  11-byte close response; converter-generated RUT now matches the complete
+  response after normalizing only Date, preserves keep-alive for a second
+  request, closes on explicit client intent, and waits through the split-body
+  window. The claim remains limited to the bounded H1 single-IPv4
+  connect-failure domain.
 - Response policy is intentionally limited to non-HEAD HTTP/1.1 requests and
   one final HTTP/1.1 response with exact Content-Length. Bodies, Upgrade,
   absolute-form targets, HTTP/1.0, HTTP/2, interim/no-body statuses, chunking,
