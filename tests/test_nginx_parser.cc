@@ -312,7 +312,7 @@ TEST(nginx_converter, lowers_canonical_model_to_stable_rut_source) {
         "        server: \"nginx/1.29.7\",\n"
         "        date: \"current\",\n"
         "        connection: \"request\",\n"
-        "        body: b\"<html>\\n<head><title>502 Bad Gateway</title></head>\\n<body>\\n<center><h1>502 Bad Gateway</h1></center>\\n<hr><center>nginx/1.29.7</center>\\n</body>\\n</html>\\n\"\n"
+        "        body: b\"<html>\\r\\n<head><title>502 Bad Gateway</title></head>\\r\\n<body>\\r\\n<center><h1>502 Bad Gateway</h1></center>\\r\\n<hr><center>nginx/1.29.7</center>\\r\\n</body>\\r\\n</html>\\r\\n\"\n"
         "    })\n"
         "}\n";
     CHECK_EQ(result.value().len, static_cast<u32>(sizeof(kExpected) - 1));
@@ -422,13 +422,14 @@ TEST(nginx_converter, emitted_source_reaches_rir_with_source_metadata) {
     CHECK(failure_policy.content_type.eq(lit_str("text/html")));
     CHECK(failure_policy.server.eq(lit_str("nginx/1.29.7")));
     static constexpr char kFailureBody[] =
-        "<html>\n"
-        "<head><title>502 Bad Gateway</title></head>\n"
-        "<body>\n"
-        "<center><h1>502 Bad Gateway</h1></center>\n"
-        "<hr><center>nginx/1.29.7</center>\n"
-        "</body>\n"
-        "</html>\n";
+        "<html>\r\n"
+        "<head><title>502 Bad Gateway</title></head>\r\n"
+        "<body>\r\n"
+        "<center><h1>502 Bad Gateway</h1></center>\r\n"
+        "<hr><center>nginx/1.29.7</center>\r\n"
+        "</body>\r\n"
+        "</html>\r\n";
+    CHECK_EQ(failure_policy.body.len, 157u);
     CHECK_EQ(failure_policy.body.len, static_cast<u32>(sizeof(kFailureBody) - 1));
     CHECK(failure_policy.body.eq({kFailureBody, sizeof(kFailureBody) - 1}));
 

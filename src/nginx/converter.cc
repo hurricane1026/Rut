@@ -119,7 +119,7 @@ FrontendResult<RutSource> lower_to_rut(const Server& server) {
         !put("        server: \"nginx/1.29.7\",\n") ||
         !put("        date: \"current\",\n") ||
         !put("        connection: \"request\",\n") ||
-        !put("        body: b\"<html>\\n<head><title>502 Bad Gateway</title></head>\\n<body>\\n<center><h1>502 Bad Gateway</h1></center>\\n<hr><center>nginx/1.29.7</center>\\n</body>\\n</html>\\n\"\n") ||
+        !put("        body: b\"<html>\\r\\n<head><title>502 Bad Gateway</title></head>\\r\\n<body>\\r\\n<center><h1>502 Bad Gateway</h1></center>\\r\\n<hr><center>nginx/1.29.7</center>\\r\\n</body>\\r\\n</html>\\r\\n\"\n") ||
         !put("    })\n") || !put("}\n"))
         return fail_overflow();
     return output;
