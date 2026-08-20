@@ -32491,6 +32491,7 @@ func add_header(_ resp: Response) -> i32 {
     resp.set("X-Proxy", "rut")
     0
 }
+
 chain access { after add_header(resp) }
 route GET "/" use chain access {
     return forward(backend, response_policy: {
@@ -32507,6 +32508,93 @@ route GET "/" use chain access {
     REQUIRE_FALSE(hir.has_value());
     CHECK(hir.error().detail.eq(
         lit("response_policy cannot be combined with response header mutations")));
+}
+
+TEST(frontend, failure_policy_bundle_is_carried_and_route_owned) {
+    const char* src = R"rut(
+upstream backend at "127.0.0.1:9000"
+route GET "/" {
+    return forward(backend, request_policy: {
+        version: "HTTP/1.1",
+        host: "upstream",
+        connection: "omit",
+        strip_headers: ["Connection", "Keep-Alive", "TE", "Expect", "Upgrade"]
+    }, response_policy: {
+        version: "HTTP/1.1",
+        framing: "content_length",
+        connection: "keep_alive",
+        server: "rut",
+        date: "current",
+        hide_headers: ["Date", "Server"]
+    }, failure_policy: {
+        version: "HTTP/1.1",
+        status: 502,
+        reason: "Bad Gateway",
+        content_type: "text/plain",
+        server: "rut",
+        date: "current",
+        connection: "request",
+        body: "unavailable"
+    })
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    REQUIRE_EQ(ast->failure_policies.len, 1u);
+    REQUIRE_EQ(ast->items[1].route.statements[0]->forward_failure_policy_id, 1u);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    REQUIRE_EQ(hir->failure_policies.len, 1u);
+    CHECK_EQ(hir->routes[0].control.direct_term.forward_failure_policy_id, 1u);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    REQUIRE_EQ(mir->failure_policies.len, 1u);
+    CHECK_EQ(mir->functions[0].blocks[0].term.forward_failure_policy_id, 1u);
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(mir.value(), rir);
+    REQUIRE(lowered);
+    REQUIRE_EQ(rir.module.failure_policy_count, 1u);
+    REQUIRE_EQ(rir.module.policy_bundle_count, 1u);
+    CHECK_EQ(rir.module.policy_bundles[0].response_policy_id, 1u);
+    CHECK_EQ(rir.module.policy_bundles[0].failure_policy_id, 1u);
+    CHECK(rir.module.failure_policies[0].body.eq(lit("unavailable")));
+    const auto& block = rir.module.functions[0].blocks[0];
+    const auto& ret = block.insts[block.inst_count - 1];
+    CHECK_EQ(static_cast<u8>(ret.op), static_cast<u8>(rir::Opcode::RetForwardBundle));
+    CHECK_EQ(ret.operand_count, 3u);
+    rir.destroy();
+}
+
+TEST(frontend, failure_policy_rejects_invalid_fields_and_caps) {
+    const char* invalid[] = {
+        "upstream b\nroute GET \"/\" { return forward(b, response_policy: { version: \"HTTP/1.1\", framing: \"content_length\", connection: \"keep_alive\", server: \"nginx\", date: \"current\", hide_headers: [] }, failure_policy: { version: \"HTTP/1.1\", status: 500, reason: \"Bad Gateway\", content_type: \"text/plain\", server: \"nginx\", date: \"current\", connection: \"request\", body: \"x\" }) }\n",
+        "upstream b\nroute GET \"/\" { return forward(b, response_policy: { version: \"HTTP/1.1\", framing: \"content_length\", connection: \"keep_alive\", server: \"nginx\", date: \"current\", hide_headers: [] }, failure_policy: { version: \"HTTP/1.1\", status: 502, reason: \"Bad Gateway\", content_type: \"text/plain\", server: \"nginx\", date: \"current\", connection: \"request\", body: \"x\", nope: \"x\" }) }\n",
+        "upstream b\nroute GET \"/\" { return forward(b, response_policy: { version: \"HTTP/1.1\", framing: \"content_length\", connection: \"keep_alive\", server: \"nginx\", date: \"current\", hide_headers: [] }, failure_policy: { version: \"HTTP/1.1\", status: 502, reason: \"Bad Gateway\", content_type: \"text/plain\", server: \"nginx\", date: \"current\", connection: \"request\", body: \"x\", body: \"y\" }) }\n",
+        "upstream b\nroute GET \"/\" { return forward(b, response_policy: { version: \"HTTP/1.1\", framing: \"content_length\", connection: \"keep_alive\", server: \"nginx\", date: \"current\", hide_headers: [] }, failure_policy: { version: \"HTTP/1.1\", status: 502, reason: \"Bad Gateway\", content_type: \"text/plain\", server: \"nginx\", date: \"current\", connection: \"request\" }) }\n",
+        "upstream b\nroute GET \"/\" { return forward(b, failure_policy: { version: \"HTTP/1.1\", status: 502, reason: \"Bad Gateway\", content_type: \"text/plain\", server: \"nginx\", date: \"current\", connection: \"request\", body: \"x\" }) }\n",
+    };
+    for (const char* src : invalid) {
+        auto lexed = lex(lit(src));
+        REQUIRE(lexed);
+        auto ast = parse_file_heap(lexed.value());
+        CHECK_FALSE(ast.has_value());
+    }
+    char long_reason[kMaxFailurePolicyReasonLen + 2];
+    for (u32 i = 0; i < sizeof(long_reason) - 1; i++) long_reason[i] = 'x';
+    long_reason[sizeof(long_reason) - 1] = '\0';
+    ForwardFailurePolicySpec spec{};
+    spec.version = ForwardFailurePolicyVersion::Http11;
+    spec.status_code = 502;
+    spec.reason = {long_reason, sizeof(long_reason) - 1};
+    spec.content_type = lit("text/plain");
+    spec.server = lit("nginx");
+    spec.date = ForwardFailurePolicyDate::Current;
+    spec.connection = ForwardFailurePolicyConnection::Request;
+    CHECK_FALSE(forward_failure_policy_spec_valid(spec));
+    spec.reason = lit("Bad\rGateway");
+    CHECK_FALSE(forward_failure_policy_spec_valid(spec));
 }
 
 int main(int argc, char** argv) {

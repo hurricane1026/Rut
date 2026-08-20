@@ -2166,6 +2166,18 @@ void handle_jit_outcome(Loop* loop,
                 client_send(loop, conn, conn.send_buf.data(), conn.send_buf.len());
                 return;
             }
+            // Failure-policy serialization is intentionally not part of this
+            // foundation slice. A bundle must therefore be rejected before
+            // request materialisation, slot acquisition, socket creation, or
+            // connect; never silently execute the success-only forward path.
+            if (outcome.policy_bundle_id != 0) {
+                if (!config->policy_bundle_id_is_valid(outcome.policy_bundle_id)) {
+                    reject_response_policy(loop, conn);
+                    return;
+                }
+                reject_response_policy(loop, conn);
+                return;
+            }
             auto& target = config->upstreams[outcome.upstream_id];
             // Policy rewriting uses the request buffers before the response
             // mutation snapshot is established. Reject combinations and

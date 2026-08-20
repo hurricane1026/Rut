@@ -2,6 +2,7 @@
 
 #include "rut/common/rate_limit_key_spec.h"
 #include "rut/common/response_policy.h"
+#include "rut/common/failure_policy.h"
 #include "rut/common/types.h"
 #include "rut/common/request_policy.h"
 #include "rut/common/wait_limits.h"
@@ -282,6 +283,7 @@ struct MirTerminator {
     FixedVec<MirHeaderKV, kMaxHeaders> forward_set_headers;
     u16 forward_request_policy_id = 0;
     u16 forward_response_policy_id = 0;
+    u16 forward_failure_policy_id = 0;
 };
 
 struct MirBlock {
@@ -499,6 +501,7 @@ struct MirModule {
 
     FixedVec<MirUpstream, kMaxUpstreams> upstreams;
     FixedVec<ForwardResponsePolicySpec, kMaxResponsePolicies> response_policies;
+    FixedVec<ForwardFailurePolicySpec, kMaxForwardFailurePolicies> failure_policies;
     FixedVec<MirCacheInstance, kMaxCaches> caches;
     FixedVec<MirStruct, kMaxStructs> structs;
     FixedVec<MirVariant, kMaxVariants> variants;
@@ -509,6 +512,7 @@ struct MirModule {
     MirModule(const MirModule& other)
         : upstreams(other.upstreams),
           response_policies(other.response_policies),
+          failure_policies(other.failure_policies),
           caches(other.caches),
           structs(other.structs),
           variants(other.variants),
@@ -518,6 +522,7 @@ struct MirModule {
         if (this == &other) return *this;
         upstreams = other.upstreams;
         response_policies = other.response_policies;
+        failure_policies = other.failure_policies;
         caches = other.caches;
         structs = other.structs;
         variants = other.variants;
@@ -528,6 +533,7 @@ struct MirModule {
     MirModule(MirModule&& other) noexcept
         : upstreams(other.upstreams),
           response_policies(other.response_policies),
+          failure_policies(other.failure_policies),
           caches(other.caches),
           structs(other.structs),
           variants(other.variants),
@@ -537,6 +543,7 @@ struct MirModule {
         if (this == &other) return *this;
         upstreams = other.upstreams;
         response_policies = other.response_policies;
+        failure_policies = other.failure_policies;
         caches = other.caches;
         structs = other.structs;
         variants = other.variants;

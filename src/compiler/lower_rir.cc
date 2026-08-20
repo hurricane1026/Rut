@@ -3071,6 +3071,43 @@ static FrontendResult<void> emit_term(const MirTerminator& term,
             if (!p) return frontend_error(FrontendError::OutOfMemory, term.span);
             response_policy = p.value();
         }
+        if (term.forward_failure_policy_id != 0) {
+            if (term.forward_response_policy_id == 0 ||
+                term.forward_response_policy_id > b.mod->response_policy_count ||
+                term.forward_failure_policy_id > b.mod->failure_policy_count)
+                return frontend_error(FrontendError::UnsupportedSyntax, term.span);
+            u16 bundle_id = 0;
+            for (u32 i = 0; i < b.mod->policy_bundle_count; i++) {
+                const auto& existing = b.mod->policy_bundles[i];
+                if (existing.response_policy_id == term.forward_response_policy_id &&
+                    existing.failure_policy_id == term.forward_failure_policy_id) {
+                    bundle_id = static_cast<u16>(i + 1);
+                    break;
+                }
+            }
+            if (bundle_id == 0) {
+                if (b.mod->policy_bundle_count >= kMaxForwardFailurePolicies)
+                    return frontend_error(FrontendError::TooManyItems, term.span);
+                bundle_id = static_cast<u16>(++b.mod->policy_bundle_count);
+                b.mod->policy_bundles[bundle_id - 1] = {
+                    term.forward_response_policy_id, term.forward_failure_policy_id};
+            }
+            auto bundle = b.emit_const_i32(static_cast<i32>(bundle_id),
+                                           {term.span.line, term.span.col});
+            if (!bundle) return frontend_error(FrontendError::OutOfMemory, term.span);
+            if (policy == rir::kNoValue) {
+                auto p0 = b.emit_const_i32(0, {term.span.line, term.span.col});
+                if (!p0) return frontend_error(FrontendError::OutOfMemory, term.span);
+                policy = p0.value();
+            }
+            if (term.commit_response_mutations &&
+                !b.emit_resp_commit_headers({term.span.line, term.span.col}))
+                return frontend_error(FrontendError::OutOfMemory, term.span);
+            if (!b.emit_ret_forward_bundle(upstream.value(), policy, bundle.value(),
+                                           {term.span.line, term.span.col}))
+                return frontend_error(FrontendError::OutOfMemory, term.span);
+            return {};
+        }
         if (term.commit_response_mutations &&
             !b.emit_resp_commit_headers({term.span.line, term.span.col}))
             return frontend_error(FrontendError::OutOfMemory, term.span);
@@ -3211,6 +3248,36 @@ FrontendResult<void> lower_to_rir(const MirModule& mir, FrontendRirModule& out) 
         }
     }
     out.module.response_policy_count = mir.response_policies.len;
+
+    if (mir.failure_policies.len > kMaxForwardFailurePolicies)
+        return frontend_error(FrontendError::TooManyItems);
+    auto copy_failure_str = [&](Str src, Str& dst) {
+        if (src.len > 0 && src.ptr == nullptr) return false;
+        char* buf = nullptr;
+        if (src.len > 0) {
+            buf = out.module.arena->alloc_array<char>(src.len);
+            if (!buf) return false;
+            for (u32 k = 0; k < src.len; k++) buf[k] = src.ptr[k];
+        }
+        dst = {buf, src.len};
+        return true;
+    };
+    for (u32 i = 0; i < mir.failure_policies.len; i++) {
+        const auto& src = mir.failure_policies[i];
+        if (!forward_failure_policy_spec_valid(src))
+            return frontend_error(FrontendError::UnsupportedSyntax);
+        auto& dst = out.module.failure_policies[i];
+        dst.version = src.version;
+        dst.status_code = src.status_code;
+        dst.date = src.date;
+        dst.connection = src.connection;
+        if (!copy_failure_str(src.reason, dst.reason) ||
+            !copy_failure_str(src.content_type, dst.content_type) ||
+            !copy_failure_str(src.server, dst.server) ||
+            !copy_failure_str(src.body, dst.body))
+            return frontend_error(FrontendError::OutOfMemory);
+    }
+    out.module.failure_policy_count = mir.failure_policies.len;
 
     // Cache instance descriptors, names arena-copied like upstream names.
     if (mir.caches.len > rir::Module::kMaxCacheInstances) {

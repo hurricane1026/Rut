@@ -1672,6 +1672,118 @@ struct Parser {
                                                   span_from(*kw.value()), kw_text);
                         stmt.forward_response_policy_id = policy_id;
                         stmt.has_forward_response_policy = true;
+                    } else if (kw_text.eq({"failure_policy", 14})) {
+                        if (stmt.has_forward_failure_policy)
+                            return frontend_error(
+                                FrontendError::UnexpectedToken, span_from(*kw.value()), kw_text);
+                        auto lbrace = expect(TokenType::LBrace);
+                        if (!lbrace) return core::make_unexpected(lbrace.error());
+                        if (cur().type == TokenType::RBrace)
+                            return frontend_error(FrontendError::UnsupportedSyntax,
+                                                  span_from(cur()),
+                                                  kw_text);
+                        ForwardFailurePolicySpec policy{};
+                        bool have_version = false;
+                        bool have_status = false;
+                        bool have_reason = false;
+                        bool have_content_type = false;
+                        bool have_server = false;
+                        bool have_date = false;
+                        bool have_connection = false;
+                        bool have_body = false;
+                        while (true) {
+                            auto field = expect(TokenType::Ident);
+                            if (!field) return core::make_unexpected(field.error());
+                            const Str field_name = field.value()->text;
+                            auto fcolon = expect(TokenType::Colon);
+                            if (!fcolon) return core::make_unexpected(fcolon.error());
+                            bool* seen = nullptr;
+                            if (field_name.eq({"version", 7})) {
+                                seen = &have_version;
+                                auto value = expect(TokenType::StringLit);
+                                if (!value) return core::make_unexpected(value.error());
+                                if (!value.value()->text.eq({"HTTP/1.1", 8}))
+                                    return frontend_error(FrontendError::UnsupportedSyntax,
+                                                          span_from(*value.value()),
+                                                          value.value()->text);
+                                policy.version = ForwardFailurePolicyVersion::Http11;
+                            } else if (field_name.eq({"status", 6})) {
+                                seen = &have_status;
+                                auto value = expect(TokenType::IntLit);
+                                if (!value) return core::make_unexpected(value.error());
+                                auto status = parse_status_i32(*value.value());
+                                if (!status || status.value() != 502)
+                                    return frontend_error(FrontendError::UnsupportedSyntax,
+                                                          span_from(*value.value()),
+                                                          value.value()->text);
+                                policy.status_code = 502;
+                            } else if (field_name.eq({"reason", 6})) {
+                                seen = &have_reason;
+                                auto value = expect(TokenType::StringLit);
+                                if (!value) return core::make_unexpected(value.error());
+                                policy.reason = value.value()->text;
+                            } else if (field_name.eq({"content_type", 12})) {
+                                seen = &have_content_type;
+                                auto value = expect(TokenType::StringLit);
+                                if (!value) return core::make_unexpected(value.error());
+                                policy.content_type = value.value()->text;
+                            } else if (field_name.eq({"server", 6})) {
+                                seen = &have_server;
+                                auto value = expect(TokenType::StringLit);
+                                if (!value) return core::make_unexpected(value.error());
+                                policy.server = value.value()->text;
+                            } else if (field_name.eq({"date", 4})) {
+                                seen = &have_date;
+                                auto value = expect(TokenType::StringLit);
+                                if (!value) return core::make_unexpected(value.error());
+                                if (!value.value()->text.eq({"current", 7}))
+                                    return frontend_error(FrontendError::UnsupportedSyntax,
+                                                          span_from(*value.value()),
+                                                          value.value()->text);
+                                policy.date = ForwardFailurePolicyDate::Current;
+                            } else if (field_name.eq({"connection", 10})) {
+                                seen = &have_connection;
+                                auto value = expect(TokenType::StringLit);
+                                if (!value) return core::make_unexpected(value.error());
+                                if (!value.value()->text.eq({"request", 7}))
+                                    return frontend_error(FrontendError::UnsupportedSyntax,
+                                                          span_from(*value.value()),
+                                                          value.value()->text);
+                                policy.connection = ForwardFailurePolicyConnection::Request;
+                            } else if (field_name.eq({"body", 4})) {
+                                seen = &have_body;
+                                auto value = expect(TokenType::StringLit);
+                                if (!value) return core::make_unexpected(value.error());
+                                policy.body = value.value()->text;
+                            } else {
+                                return frontend_error(FrontendError::UnexpectedToken,
+                                                      span_from(*field.value()),
+                                                      field_name);
+                            }
+                            if (*seen)
+                                return frontend_error(FrontendError::UnexpectedToken,
+                                                      span_from(*field.value()),
+                                                      field_name);
+                            *seen = true;
+                            if (!take(TokenType::Comma)) break;
+                            if (cur().type == TokenType::RBrace) break;
+                        }
+                        auto rbrace = expect(TokenType::RBrace);
+                        if (!rbrace) return core::make_unexpected(rbrace.error());
+                        if (!have_version || !have_status || !have_reason ||
+                            !have_content_type || !have_server || !have_date ||
+                            !have_connection || !have_body ||
+                            !forward_failure_policy_spec_valid(policy))
+                            return frontend_error(FrontendError::UnsupportedSyntax,
+                                                  span_from(*rbrace.value()),
+                                                  kw_text);
+                        const u16 policy_id = file->add_failure_policy(policy);
+                        if (policy_id == 0)
+                            return frontend_error(FrontendError::TooManyItems,
+                                                  span_from(*kw.value()),
+                                                  kw_text);
+                        stmt.forward_failure_policy_id = policy_id;
+                        stmt.has_forward_failure_policy = true;
                     } else if (kw_text.eq({"set_path", 8})) {
                         if (stmt.has_forward_set_path)
                             return frontend_error(
@@ -1744,6 +1856,10 @@ struct Parser {
                 }
                 auto rparen = expect(TokenType::RParen);
                 if (!rparen) return core::make_unexpected(rparen.error());
+                if (stmt.has_forward_failure_policy && !stmt.has_forward_response_policy)
+                    return frontend_error(FrontendError::UnsupportedSyntax,
+                                          span_from(*rparen.value()),
+                                          lit_str("failure_policy requires response_policy"));
                 stmt.span = Span{start.start, rparen.value()->end, start.line, start.col};
                 return stmt;
             }

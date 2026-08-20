@@ -8167,6 +8167,35 @@ TEST(result, pack_unpack_forward) {
     CHECK(r2.status_code == 0);
 }
 
+TEST(result, pack_unpack_forward_bundle_preserves_16bit_ids) {
+    auto r = HandlerResult::make_forward_with_bundle(0xFFFFu, 0xFFFFu, 0xFFFFu);
+    auto r2 = HandlerResult::unpack(r.pack());
+    CHECK(r2.action == HandlerAction::ForwardBundle);
+    CHECK(r2.upstream_id == 0xFFFFu);
+    CHECK(r2.status_code == 0xFFFFu);
+    CHECK(r2.next_state == 0xFFFFu);
+    auto legacy = HandlerResult::make_forward_with_policies(0xFFFFu, 0xFFFFu, 0xFFFFu);
+    auto legacy2 = HandlerResult::unpack(legacy.pack());
+    CHECK(legacy2.action == HandlerAction::Forward);
+    CHECK(legacy2.upstream_id == 0xFFFFu);
+    CHECK(legacy2.status_code == 0xFFFFu);
+    CHECK(legacy2.next_state == 0xFFFFu);
+}
+
+static u64 test_forward_bundle_handler(void*, HandlerCtx*, const u8*, u32, void*) {
+    return HandlerResult::make_forward_with_bundle(7, 9, 11).pack();
+}
+
+TEST(jit_dispatch, forward_bundle_keeps_request_and_bundle_ids_independent) {
+    HandlerCtx ctx{};
+    auto out = invoke_jit_handler(&test_forward_bundle_handler, nullptr, ctx, nullptr, 0, nullptr);
+    CHECK(out.kind == JitDispatchOutcome::Kind::Forward);
+    CHECK(out.upstream_id == 7);
+    CHECK(out.request_policy_id == 9);
+    CHECK(out.policy_bundle_id == 11);
+    CHECK(out.response_policy_id == 0);
+}
+
 TEST(result, pack_unpack_yield) {
     auto r = HandlerResult::make_yield(3, YieldKind::Forward);
     u64 packed = r.pack();

@@ -183,7 +183,8 @@ inline bool populate_route_config(RouteConfig& cfg, const rir::Module& mod) {
     // no "merge" semantics for those tables, and a non-zero count
     // would break the compile-time body_idx / headers_idx invariants.
     if (cfg.route_count != 0 || cfg.response_body_count != 0 ||
-        cfg.response_header_set_count != 0 || cfg.response_policy_count != 0) {
+        cfg.response_header_set_count != 0 || cfg.response_policy_count != 0 ||
+        cfg.failure_policy_count != 0 || cfg.policy_bundle_count != 0) {
         return false;
     }
 
@@ -206,6 +207,12 @@ inline bool populate_route_config(RouteConfig& cfg, const rir::Module& mod) {
     if (mod.response_policy_count > kMaxResponsePolicies) return false;
     for (u32 i = 0; i < mod.response_policy_count; i++) {
         if (!response_policy_spec_valid(mod.response_policies[i])) return false;
+    }
+    if (mod.failure_policy_count > kMaxForwardFailurePolicies ||
+        mod.policy_bundle_count > RouteConfig::kMaxForwardPolicyBundles)
+        return false;
+    for (u32 i = 0; i < mod.failure_policy_count; i++) {
+        if (!forward_failure_policy_spec_valid(mod.failure_policies[i])) return false;
     }
     for (u32 i = 0; i < mod.header_set_count; i++) {
         const auto& ref = mod.header_sets[i];
@@ -342,6 +349,15 @@ inline bool populate_route_config(RouteConfig& cfg, const rir::Module& mod) {
     // string into its own pool before the RIR/compiler arena can be released.
     for (u32 i = 0; i < mod.response_policy_count; i++) {
         u16 idx = cfg.add_response_policy(mod.response_policies[i]);
+        if (idx == 0 || idx != i + 1) return false;
+    }
+    for (u32 i = 0; i < mod.failure_policy_count; i++) {
+        u16 idx = cfg.add_failure_policy(mod.failure_policies[i]);
+        if (idx == 0 || idx != i + 1) return false;
+    }
+    for (u32 i = 0; i < mod.policy_bundle_count; i++) {
+        const auto& bundle = mod.policy_bundles[i];
+        u16 idx = cfg.add_policy_bundle(bundle.response_policy_id, bundle.failure_policy_id);
         if (idx == 0 || idx != i + 1) return false;
     }
 

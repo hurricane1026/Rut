@@ -1759,7 +1759,8 @@ static void emit_instruction(Ctx& c, const rir::Instruction& inst) {
             LLVMBuildRet(c.builder, result);
             break;
         }
-        case rir::Opcode::RetForward: {
+        case rir::Opcode::RetForward:
+        case rir::Opcode::RetForwardBundle: {
             // Pack: action=Forward, upstream_id from operand. For the explicit
             // request-policy slice, operand 1 carries the compact policy id in
             // the otherwise-unused status slot.
@@ -1772,8 +1773,12 @@ static void emit_instruction(Ctx& c, const rir::Instruction& inst) {
             } else {
                 upstream = LLVMConstInt(c.i32_ty, 0, 0);
             }
-            LLVMValueRef action =
-                LLVMConstInt(c.i64_ty, static_cast<u64>(HandlerAction::Forward), 0);
+            const bool is_bundle = inst.op == rir::Opcode::RetForwardBundle;
+            LLVMValueRef action = LLVMConstInt(
+                c.i64_ty,
+                static_cast<u64>(is_bundle ? HandlerAction::ForwardBundle
+                                           : HandlerAction::Forward),
+                0);
             LLVMValueRef up_ext = LLVMBuildZExt(c.builder, upstream, c.i64_ty, "up.e");
             LLVMValueRef shifted =
                 LLVMBuildShl(c.builder, up_ext, LLVMConstInt(c.i64_ty, 24, 0), "up.shl");

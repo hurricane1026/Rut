@@ -13,6 +13,7 @@ enum class HandlerAction : u8 {
     ReturnStatus = 0,  // Send HTTP response with status_code
     Forward = 1,       // Forward request to upstream_id
     Yield = 2,         // Suspend: initiate I/O, resume at next_state
+    ForwardBundle = 3, // Forward with a 1-based response/failure bundle id
 };
 
 // ── Yield Kind ─────────────────────────────────────────────────────
@@ -103,6 +104,16 @@ struct HandlerResult {
                 request_policy,
                 upstream,
                 response_policy,
+                YieldKind::HttpGet};
+    }
+
+    static HandlerResult make_forward_with_bundle(u16 upstream,
+                                                  u16 request_policy,
+                                                  u16 bundle_id) {
+        return {HandlerAction::ForwardBundle,
+                request_policy,
+                upstream,
+                bundle_id,
                 YieldKind::HttpGet};
     }
 

@@ -3,6 +3,7 @@
 #include "core/expected.h"
 #include "rut/common/http_header_validation.h"
 #include "rut/common/response_policy.h"
+#include "rut/common/failure_policy.h"
 #include "rut/common/types.h"
 #include "rut/jit/art_jit_codegen.h"  // ArtJitMatchFn typedef (LLVM-free)
 #include "rut/jit/handler_abi.h"
@@ -147,6 +148,8 @@ struct RouteConfig {
     // zero is transparent forwarding.
     static constexpr u32 kMaxResponsePolicies = rut::kMaxResponsePolicies;
     static constexpr u32 kResponsePolicyBytesPoolBytes = 4 * 1024;
+    static constexpr u32 kMaxForwardPolicyBundles = kMaxForwardFailurePolicies;
+    static constexpr u32 kFailurePolicyBytesPoolBytes = 8 * 1024;
     // Per-response cap for header count. Bigger than what the AST
     // permits (16) so hand-built RouteConfigs — tests, future
     // compile→config helper — have headroom, but small enough that the
@@ -481,6 +484,12 @@ struct RouteConfig {
     u32 response_policy_count = 0;
     char response_policy_bytes[kResponsePolicyBytesPoolBytes];
     u32 response_policy_bytes_used = 0;
+    ForwardFailurePolicySpec failure_policies[kMaxForwardFailurePolicies]{};
+    u32 failure_policy_count = 0;
+    char failure_policy_bytes[kFailurePolicyBytesPoolBytes];
+    u32 failure_policy_bytes_used = 0;
+    ForwardPolicyBundle policy_bundles[kMaxForwardPolicyBundles]{};
+    u32 policy_bundle_count = 0;
 
     // Populate the active dispatch's state with a newly-written
     // routes[route_count] entry. Returns false on:
@@ -880,6 +889,74 @@ struct RouteConfig {
     bool response_policy_id_is_valid(u16 id) const {
         return id != 0 && id <= response_policy_count &&
                response_policy_spec_valid(response_policies[id - 1]);
+    }
+
+    u16 add_failure_policy(const ForwardFailurePolicySpec& policy) {
+        if (!forward_failure_policy_spec_valid(policy)) return 0;
+        if (failure_policy_count > kMaxForwardFailurePolicies ||
+            failure_policy_bytes_used > kFailurePolicyBytesPoolBytes)
+            return 0;
+        for (u32 i = 0; i < failure_policy_count; i++)
+            if (forward_failure_policy_spec_equal(failure_policies[i], policy))
+                return static_cast<u16>(i + 1);
+        if (failure_policy_count >= kMaxForwardFailurePolicies) return 0;
+        u32 total = policy.reason.len;
+        if (total > kFailurePolicyBytesPoolBytes - failure_policy_bytes_used) return 0;
+        if (policy.content_type.len > 0xffffffffu - total) return 0;
+        total += policy.content_type.len;
+        if (policy.server.len > 0xffffffffu - total) return 0;
+        total += policy.server.len;
+        if (policy.body.len > 0xffffffffu - total) return 0;
+        total += policy.body.len;
+        if (total > kFailurePolicyBytesPoolBytes - failure_policy_bytes_used) return 0;
+        auto copy = [&](Str src, Str& dst) {
+            char* out = failure_policy_bytes + failure_policy_bytes_used;
+            for (u32 i = 0; i < src.len; i++) out[i] = src.ptr[i];
+            failure_policy_bytes_used += src.len;
+            dst = {out, src.len};
+        };
+        auto& dst = failure_policies[failure_policy_count];
+        dst.version = policy.version;
+        dst.status_code = policy.status_code;
+        dst.date = policy.date;
+        dst.connection = policy.connection;
+        copy(policy.reason, dst.reason);
+        copy(policy.content_type, dst.content_type);
+        copy(policy.server, dst.server);
+        copy(policy.body, dst.body);
+        failure_policy_count++;
+        return static_cast<u16>(failure_policy_count);
+    }
+
+    u16 add_policy_bundle(u16 response_policy_id, u16 failure_policy_id) {
+        if (response_policy_id == 0 || failure_policy_id == 0 ||
+            !response_policy_id_is_valid(response_policy_id) ||
+            !failure_policy_id_is_valid(failure_policy_id))
+            return 0;
+        if (policy_bundle_count > kMaxForwardPolicyBundles) return 0;
+        for (u32 i = 0; i < policy_bundle_count; i++) {
+            if (policy_bundles[i].response_policy_id == response_policy_id &&
+                policy_bundles[i].failure_policy_id == failure_policy_id)
+                return static_cast<u16>(i + 1);
+        }
+        if (policy_bundle_count >= kMaxForwardPolicyBundles) return 0;
+        policy_bundles[policy_bundle_count] = {response_policy_id, failure_policy_id};
+        return static_cast<u16>(++policy_bundle_count);
+    }
+
+    bool failure_policy_id_is_valid(u16 id) const {
+        return failure_policy_count <= kMaxForwardFailurePolicies && id != 0 &&
+               id <= failure_policy_count &&
+               forward_failure_policy_spec_valid(failure_policies[id - 1]);
+    }
+
+    bool policy_bundle_id_is_valid(u16 id) const {
+        if (policy_bundle_count > kMaxForwardPolicyBundles || id == 0 ||
+            id > policy_bundle_count)
+            return false;
+        const auto& b = policy_bundles[id - 1];
+        return response_policy_id_is_valid(b.response_policy_id) &&
+               failure_policy_id_is_valid(b.failure_policy_id);
     }
 
     // Add an upstream target. Returns its index, or error if at capacity.

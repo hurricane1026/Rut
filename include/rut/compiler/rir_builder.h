@@ -1163,6 +1163,28 @@ struct Builder {
         return {};
     }
 
+    VoidResult emit_ret_forward_bundle(ValueId upstream,
+                                       ValueId request_policy,
+                                       ValueId bundle,
+                                       SourceLoc loc = {}) {
+        if (!valid_val(upstream) || !valid_val(request_policy) || !valid_val(bundle))
+            return err(RirError::InvalidState);
+        if ((!val_has_type(upstream, TypeKind::I32) && !val_has_type(upstream, TypeKind::U32)) ||
+            (!val_has_type(request_policy, TypeKind::I32) &&
+             !val_has_type(request_policy, TypeKind::U32) &&
+             !val_has_type(request_policy, TypeKind::I64) &&
+             !val_has_type(request_policy, TypeKind::U64)) ||
+            (!val_has_type(bundle, TypeKind::I32) && !val_has_type(bundle, TypeKind::U32) &&
+             !val_has_type(bundle, TypeKind::I64) && !val_has_type(bundle, TypeKind::U64)))
+            return err(RirError::InvalidState);
+        auto r = TRY(emit(Opcode::RetForwardBundle, nullptr, loc));
+        r.inst->operands[0] = upstream;
+        r.inst->operands[1] = request_policy;
+        r.inst->operands[2] = bundle;
+        r.inst->operand_count = 3;
+        return {};
+    }
+
     // ── Yields (I/O suspend points) ────────────────────────────────
 
     Result<ValueId> emit_yield_http_get(Str url, ValueId headers, SourceLoc loc = {}) {

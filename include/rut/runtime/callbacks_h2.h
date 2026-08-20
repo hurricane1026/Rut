@@ -753,6 +753,12 @@ void h2_invoke_emit(H2Dispatch<Loop>& d,
         return;
     }
     if (kOutcome.kind == JitDispatchOutcome::Kind::Forward) {
+        // Failure-policy serialization is not implemented in the H2 path;
+        // never reinterpret a bundle as transparent forwarding.
+        if (kOutcome.policy_bundle_id != 0) {
+            h2_emit_status(d, stream_id, 400);
+            return;
+        }
         if (kOutcome.response_policy_id != 0 &&
             (cfg == nullptr || !cfg->response_policy_id_is_valid(kOutcome.response_policy_id) ||
              d.conn->resp_header_mutation_count != 0 ||
@@ -1436,6 +1442,7 @@ void h2_resume_jit_handler(Loop* loop, Connection& conn) {
 
     if (kOutcome.kind == JitDispatchOutcome::Kind::Forward) {
         u16 failure_status = 0;
+        if (kOutcome.policy_bundle_id != 0) failure_status = 400;
         if (kOutcome.response_policy_id != 0 &&
             (h2->async_cfg == nullptr ||
              !h2->async_cfg->response_policy_id_is_valid(kOutcome.response_policy_id) ||

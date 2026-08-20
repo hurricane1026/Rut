@@ -9720,6 +9720,8 @@ static FrontendResult<HirTerminator> analyze_term(const AstStatement& stmt, cons
         term.forward_request_policy_id = stmt.forward_request_policy_id;
     if (stmt.has_forward_response_policy)
         term.forward_response_policy_id = stmt.forward_response_policy_id;
+    if (stmt.has_forward_failure_policy)
+        term.forward_failure_policy_id = stmt.forward_failure_policy_id;
     // Carry forward(set_header:) overrides verbatim (parser validated + deduped).
     for (u32 i = 0; i < stmt.forward_set_headers.len; i++) {
         const auto& p = stmt.forward_set_headers[i];
@@ -14532,6 +14534,13 @@ static FrontendResult<HirModule*> analyze_file_internal(
     for (u32 i = 0; i < file.response_policies.len; i++) {
         if (!response_policy_spec_valid(file.response_policies[i]) ||
             !mod.response_policies.push(file.response_policies[i]))
+            return frontend_error(FrontendError::UnsupportedSyntax, {});
+    }
+    if (file.failure_policies.len > kMaxForwardFailurePolicies)
+        return frontend_error(FrontendError::TooManyItems, {});
+    for (u32 i = 0; i < file.failure_policies.len; i++) {
+        if (!forward_failure_policy_spec_valid(file.failure_policies[i]) ||
+            !mod.failure_policies.push(file.failure_policies[i]))
             return frontend_error(FrontendError::UnsupportedSyntax, {});
     }
 

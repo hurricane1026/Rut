@@ -3,6 +3,7 @@
 #include "core/expected.h"
 #include "rut/common/rate_limit_key_spec.h"
 #include "rut/common/response_policy.h"
+#include "rut/common/failure_policy.h"
 #include "rut/common/types.h"
 #include "rut/runtime/arena.h"
 
@@ -271,6 +272,7 @@ enum class Opcode : u8 {
     // The optional policy operands are contiguous; a response policy with no
     // request policy uses an explicit zero request operand.
     RetForward,
+    RetForwardBundle,
 
     // ── Yield (I/O suspend → state machine boundary) ──
     YieldTimer,     // yield.timer ms, next_state
@@ -340,7 +342,7 @@ struct Instruction {
     // than range check so opcode reordering can't silently break semantics.
     bool is_terminator() const {
         return op == Opcode::Br || op == Opcode::Jmp || op == Opcode::RetStatus ||
-               op == Opcode::RetForward || is_yield();
+               op == Opcode::RetForward || op == Opcode::RetForwardBundle || is_yield();
     }
 };
 
@@ -470,6 +472,10 @@ struct Module {
     // and are copied into RouteConfig before the compiler arena is released.
     ForwardResponsePolicySpec response_policies[kMaxResponsePolicies]{};
     u32 response_policy_count = 0;
+    ForwardFailurePolicySpec failure_policies[kMaxForwardFailurePolicies]{};
+    u32 failure_policy_count = 0;
+    ForwardPolicyBundle policy_bundles[kMaxForwardFailurePolicies]{};
+    u32 policy_bundle_count = 0;
 
     // Upstream declarations carried verbatim from the DSL so a
     // compile→config helper can translate them into

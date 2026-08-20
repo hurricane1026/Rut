@@ -329,6 +329,8 @@ static const char* action_str(jit::HandlerAction action) {
             return "status";
         case jit::HandlerAction::Forward:
             return "forward";
+        case jit::HandlerAction::ForwardBundle:
+            return "forward_bundle";
         case jit::HandlerAction::Yield:
             return "yield";
     }

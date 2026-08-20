@@ -2,6 +2,7 @@
 
 #include "rut/common/types.h"
 #include "rut/common/response_policy.h"
+#include "rut/common/failure_policy.h"
 #include "rut/common/request_policy.h"
 #include "rut/common/wait_limits.h"
 #include "rut/compiler/ast.h"
@@ -799,6 +800,7 @@ struct HirTerminator {
     FixedVec<HirHeaderKV, kMaxHeaders> forward_set_headers;
     u16 forward_request_policy_id = 0;
     u16 forward_response_policy_id = 0;
+    u16 forward_failure_policy_id = 0;
 };
 
 struct HirGuardBody {
@@ -1378,6 +1380,7 @@ struct HirModule {
 
     FixedVec<HirUpstream, kMaxUpstreams> upstreams;
     FixedVec<ForwardResponsePolicySpec, kMaxResponsePolicies> response_policies;
+    FixedVec<ForwardFailurePolicySpec, kMaxForwardFailurePolicies> failure_policies;
     bool has_listener = false;
     HirListener listener{};
     FixedVec<HirCacheDecl, kMaxCaches> caches;
@@ -1404,6 +1407,7 @@ struct HirModule {
     HirModule(const HirModule& other)
         : upstreams(other.upstreams),
           response_policies(other.response_policies),
+          failure_policies(other.failure_policies),
           has_listener(other.has_listener),
           listener(other.listener),
           caches(other.caches),
@@ -1430,6 +1434,7 @@ struct HirModule {
         if (this == &other) return *this;
         upstreams = other.upstreams;
         response_policies = other.response_policies;
+        failure_policies = other.failure_policies;
         has_listener = other.has_listener;
         listener = other.listener;
         caches = other.caches;

@@ -851,6 +851,10 @@ FrontendResult<MirModule*> build_mir(const HirModule& module) {
         if (!mir->response_policies.push(module.response_policies[i]))
             return frontend_error(FrontendError::TooManyItems, {});
     }
+    for (u32 i = 0; i < module.failure_policies.len; i++) {
+        if (!mir->failure_policies.push(module.failure_policies[i]))
+            return frontend_error(FrontendError::TooManyItems, {});
+    }
 
     for (u32 i = 0; i < module.type_shapes.len; i++) {
         MirTypeShape shape{};
@@ -1125,6 +1129,7 @@ FrontendResult<MirModule*> build_mir(const HirModule& module) {
             out->forward_set_path = term.forward_set_path;
             out->forward_request_policy_id = term.forward_request_policy_id;
             out->forward_response_policy_id = term.forward_response_policy_id;
+            out->forward_failure_policy_id = term.forward_failure_policy_id;
             out->response_headers.len = 0;
             // Both HIR and MIR cap at 16 headers per terminator, so a
             // straight copy cannot truncate. Static-assert the cap
