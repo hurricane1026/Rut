@@ -111,9 +111,9 @@ evidence must use a pinned nginx build and cannot treat that skip as a pass.
   fixed-CL request-body admission, one upstream `Connection` field, and
   request-derived downstream keep-alive/close behavior are now covered, while
   broader response behavior remains `PARTIAL`.
-- #256: a configurable synthetic forward-failure response is required for the
-  unavailable-upstream acceptance case. Current hard-coded RUT gateway errors
-  cannot express nginx's body, headers, or downstream keep-alive behavior.
+- #256 (closed): the converter emits an explicit bounded forward-failure policy.
+  For single-IPv4 H1 connect failure it matches nginx 1.29.7's 157-byte CRLF
+  error body, synthesized headers, request-derived connection, and body wait.
 
 ## First process-loop evidence
 
@@ -127,6 +127,7 @@ available and produced byte-identical upstream bytes. Both GET and POST
 downstream responses matched the pinned expected response after normalizing
 only the generated Date.
 
-This is the first real nginx -> converter -> RUT -> runtime loop, not completion
-of issue #254. Unavailable-upstream behavior remains required by that issue's
-acceptance test, and no general `proxy_pass` or request-body support is claimed.
+This is a real nginx -> converter -> RUT -> runtime loop, not general
+`proxy_pass` support. Success GET/POST and bounded unavailable-upstream vectors
+now pass; #254 remains open only while its explicit percent-encoded target
+acceptance vector is audited.
