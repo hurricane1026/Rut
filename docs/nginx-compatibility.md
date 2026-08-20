@@ -14,8 +14,8 @@ Allowed states are `SUPPORTED`, `PARTIAL`, `BLOCKED_BY_RUT`,
 | location applies to every method | yes | yes | yes: method-omitted route source form | RUT route tests; nginx differential only GET | PARTIAL |
 | fixed IPv4 HTTP `proxy_pass`, no URI suffix | yes | yes | partial: fixed `forward` plus bounded policies | pinned generated-RUT GET/query/header differential | PARTIAL |
 | preserve raw request-target and query | implicit | yes | partial: origin-form forward sends original bytes | pinned query differential; broader normalization untested | PARTIAL |
-| preserve request method and body | implicit | partial: method yes, body policy blocks | partial: transparent streaming exists; policy body support absent | generated-RUT differential only GET | PARTIAL |
-| nginx default upstream HTTP version and request headers | implicit | yes | partial: explicit fixed HTTP/1.1 header-only policy; #252 | exact RUT tests and pinned generated-RUT GET differential | PARTIAL |
+| preserve request method and body | implicit | yes | partial: fixed-CL body is staged before connect within one 16 KiB composite slice | RUT exact binary/segmented/boundary tests; nginx baseline, no generated-RUT POST diff | PARTIAL |
+| nginx default upstream HTTP version and request headers | implicit | yes | partial: explicit fixed HTTP/1.1 policy with bounded fixed-CL buffering; #252 | exact RUT tests, pinned GET differential, pinned nginx POST baseline | PARTIAL |
 | proxied response status and body | implicit | yes | partial: strict final H1.1 exact-Content-Length streaming | exact RUT tests and pinned generated-RUT GET differential | PARTIAL |
 | nginx default proxied response header policy | implicit | yes | partial: bounded strict H1.1 final-response/content-length serializer; #253 | exact RUT tests and pinned generated-RUT GET differential | PARTIAL |
 | single unavailable upstream gateway error | implicit | yes | partial: 502/504 paths exist | RUT-only tests, no nginx diff | PARTIAL |
@@ -45,6 +45,11 @@ Allowed states are `SUPPORTED`, `PARTIAL`, `BLOCKED_BY_RUT`,
   before accepting the upstream connection under the minimal default config.
   The planned RUT body slice must therefore stage the complete body before
   upstream slot/connect; transparent early-connect streaming is not equivalent.
+- The first RUT body increment now stages a complete fixed-CL request within the
+  existing 16 KiB connection slice, preserves a pipeline suffix, and tracks
+  local buffering separately from successful upstream upload. Exact-cap and
+  cap+1 behavior are tested. Larger bodies and file-backed buffering remain
+  unsupported, so the feature stays `PARTIAL`.
 - Valid downstream Upgrade requests are intentionally rejected before upstream
   connect in this header-only slice; nginx 1.29.7 strips and proxies Upgrade,
   so that behavior remains PARTIAL.

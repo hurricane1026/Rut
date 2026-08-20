@@ -104,10 +104,11 @@ evidence must use a pinned nginx build and cannot treat that skip as a pass.
 - #250 (closed): downstream listener capability is available for one source
   wildcard listener; bounded converter lowering and nginx differential evidence
   are complete, while broader #254 acceptance remains pending.
-- #252: a bounded header-only H1.1 upstream request policy is available;
-  Content-Length bodies and broader request behavior remain `PARTIAL`.
+- #252: a bounded H1.1 upstream request policy now stages one fixed-CL request
+  within the existing 16 KiB composite slice before connect; larger bodies and
+  broader request behavior remain `PARTIAL`.
 - #253: a bounded final-H1.1 exact-Content-Length response policy is available;
-  broader response framing/control behavior remains `PARTIAL`.
+  its request-body admission and broader response behavior remain `PARTIAL`.
 
 ## First process-loop evidence
 
