@@ -16481,6 +16481,7 @@ TEST(shard, serves_http2_jit_target_transform_after_timer_resume_fails_closed) {
     REQUIRE(shard.spawn(-1).has_value());
     guard.spawned = true;
     usleep(50000);
+    const u32 epoch_before = shard.epoch.epoch.load(std::memory_order_acquire);
 
     guard.client_fd = connect_to(port);
     REQUIRE(guard.client_fd >= 0);
@@ -16506,6 +16507,11 @@ TEST(shard, serves_http2_jit_target_transform_after_timer_resume_fails_closed) {
         if (h2_status_for_stream(response, response_len, 1) != 0) break;
     }
     CHECK_EQ(h2_status_for_stream(response, response_len, 1), 400u);
+    const u32 epoch_after = shard.epoch.epoch.load(std::memory_order_acquire);
+    // This isolated request has exactly one async epoch enter when the timer
+    // is armed and one leave in h2_resume_jit_handler's local-400 branch.
+    // A missing epoch_leave therefore cannot satisfy this assertion.
+    CHECK_EQ(epoch_after, epoch_before + 2u);
     usleep(100000);
     CHECK_EQ(backend.accepted_count.load(std::memory_order_acquire), 0u);
     CHECK_EQ(backend.request_count.load(std::memory_order_acquire), 0u);
