@@ -181,6 +181,8 @@ private:
             (eq(cur_.text, "listen", 6) || eq(cur_.text, "location", 8) ||
              eq(cur_.text, "server", 6)))
             return invalid(cur_.span, lit_str("expected ';' after listen"));
+        if (cur_.kind != TokenKind::Word && cur_.kind != TokenKind::Semicolon)
+            return invalid(cur_.span, lit_str("expected ';' after listen"));
         if (cur_.kind != TokenKind::Semicolon)
             return unsupported(cur_.span, lit_str("listen options are unsupported"));
         const Span end = cur_.span;

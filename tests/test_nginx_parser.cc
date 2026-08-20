@@ -219,4 +219,14 @@ TEST(nginx_parser, rejects_modifiers_variables_and_non_http_upstreams) {
                    lit_str("only literal IPv4 HTTP upstreams are supported")));
 }
 
+TEST(nginx_parser, reports_missing_listen_semicolon_at_brace) {
+    const char source[] = "server { listen 8080 }";
+    const auto result = nginx::parse({source, sizeof(source) - 1});
+    REQUIRE(!result);
+    CHECK_EQ(result.error().code, FrontendError::UnexpectedToken);
+    CHECK_EQ(result.error().span.line, 1);
+    CHECK_EQ(result.error().span.col, 22);
+    CHECK(result.error().detail.eq(lit_str("expected ';' after listen")));
+}
+
 int main(int argc, char** argv) { return rut::test::run_all(argc, argv); }
