@@ -1,6 +1,7 @@
 #pragma once
 
 #include "rut/common/rate_limit_key_spec.h"
+#include "rut/common/response_policy.h"
 #include "rut/common/types.h"
 #include "rut/common/request_policy.h"
 #include "rut/common/wait_limits.h"
@@ -280,6 +281,7 @@ struct MirTerminator {
     // HIR. len > 0 → lower_rir emits one ReqSetHeader per entry before RetForward.
     FixedVec<MirHeaderKV, kMaxHeaders> forward_set_headers;
     u16 forward_request_policy_id = 0;
+    u16 forward_response_policy_id = 0;
 };
 
 struct MirBlock {
@@ -496,6 +498,7 @@ struct MirModule {
     static constexpr u32 kMaxTypeShapes = 256;
 
     FixedVec<MirUpstream, kMaxUpstreams> upstreams;
+    FixedVec<ForwardResponsePolicySpec, kMaxResponsePolicies> response_policies;
     FixedVec<MirCacheInstance, kMaxCaches> caches;
     FixedVec<MirStruct, kMaxStructs> structs;
     FixedVec<MirVariant, kMaxVariants> variants;
@@ -505,6 +508,7 @@ struct MirModule {
     MirModule() = default;
     MirModule(const MirModule& other)
         : upstreams(other.upstreams),
+          response_policies(other.response_policies),
           caches(other.caches),
           structs(other.structs),
           variants(other.variants),
@@ -513,6 +517,7 @@ struct MirModule {
     MirModule& operator=(const MirModule& other) {
         if (this == &other) return *this;
         upstreams = other.upstreams;
+        response_policies = other.response_policies;
         caches = other.caches;
         structs = other.structs;
         variants = other.variants;
@@ -522,6 +527,7 @@ struct MirModule {
     }
     MirModule(MirModule&& other) noexcept
         : upstreams(other.upstreams),
+          response_policies(other.response_policies),
           caches(other.caches),
           structs(other.structs),
           variants(other.variants),
@@ -530,6 +536,7 @@ struct MirModule {
     MirModule& operator=(MirModule&& other) noexcept {
         if (this == &other) return *this;
         upstreams = other.upstreams;
+        response_policies = other.response_policies;
         caches = other.caches;
         structs = other.structs;
         variants = other.variants;

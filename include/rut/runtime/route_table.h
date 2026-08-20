@@ -2,6 +2,7 @@
 
 #include "core/expected.h"
 #include "rut/common/http_header_validation.h"
+#include "rut/common/response_policy.h"
 #include "rut/common/types.h"
 #include "rut/jit/art_jit_codegen.h"  // ArtJitMatchFn typedef (LLVM-free)
 #include "rut/jit/handler_abi.h"
@@ -141,6 +142,11 @@ struct RouteConfig {
     static constexpr u32 kMaxResponseHeaderSets = 128;
     static constexpr u32 kMaxHeaderPoolEntries = 512;
     static constexpr u32 kResponseHeaderBytesPoolBytes = 8 * 1024;
+    // Response-policy metadata is copied into this config-owned pool so the
+    // compiler/RIR arena can be reclaimed after activation. IDs are 1-based;
+    // zero is transparent forwarding.
+    static constexpr u32 kMaxResponsePolicies = rut::kMaxResponsePolicies;
+    static constexpr u32 kResponsePolicyBytesPoolBytes = 4 * 1024;
     // Per-response cap for header count. Bigger than what the AST
     // permits (16) so hand-built RouteConfigs — tests, future
     // compile→config helper — have headroom, but small enough that the
@@ -471,6 +477,10 @@ struct RouteConfig {
     u32 response_header_set_count = 0;
     char header_bytes_pool[kResponseHeaderBytesPoolBytes];
     u32 header_bytes_pool_used = 0;
+    ForwardResponsePolicySpec response_policies[kMaxResponsePolicies]{};
+    u32 response_policy_count = 0;
+    char response_policy_bytes[kResponsePolicyBytesPoolBytes];
+    u32 response_policy_bytes_used = 0;
 
     // Populate the active dispatch's state with a newly-written
     // routes[route_count] entry. Returns false on:
@@ -828,6 +838,48 @@ struct RouteConfig {
         const u32 idx = response_header_set_count++;
         response_header_sets[idx] = {offset, static_cast<u16>(count)};
         return static_cast<u16>(idx + 1);  // 1-based; 0 reserved
+    }
+
+    // Register a validated response-policy object. All string fields are
+    // copied into RouteConfig-owned storage; no compiler-arena pointer escapes
+    // into the active config. Returns a 1-based ID, or zero on rejection.
+    u16 add_response_policy(const ForwardResponsePolicySpec& policy) {
+        if (!response_policy_spec_valid(policy)) return 0;
+        for (u32 i = 0; i < response_policy_count; i++) {
+            if (response_policy_spec_equal(response_policies[i], policy))
+                return static_cast<u16>(i + 1);
+        }
+        if (response_policy_count >= kMaxResponsePolicies) return 0;
+        u32 total = policy.server.len;
+        if (total > kResponsePolicyBytesPoolBytes - response_policy_bytes_used) return 0;
+        for (u32 i = 0; i < policy.hide_header_count; i++) {
+            if (policy.hide_headers[i].len > 0xffffffffu - total) return 0;
+            total += policy.hide_headers[i].len;
+        }
+        if (total > kResponsePolicyBytesPoolBytes - response_policy_bytes_used) return 0;
+
+        auto copy = [&](Str src, Str& dst) {
+            char* out = response_policy_bytes + response_policy_bytes_used;
+            for (u32 i = 0; i < src.len; i++) out[i] = src.ptr[i];
+            response_policy_bytes_used += src.len;
+            dst = {out, src.len};
+        };
+        auto& dst = response_policies[response_policy_count];
+        dst.version = policy.version;
+        dst.framing = policy.framing;
+        dst.connection = policy.connection;
+        dst.date = policy.date;
+        copy(policy.server, dst.server);
+        dst.hide_header_count = policy.hide_header_count;
+        for (u32 i = 0; i < policy.hide_header_count; i++)
+            copy(policy.hide_headers[i], dst.hide_headers[i]);
+        response_policy_count++;
+        return static_cast<u16>(response_policy_count);
+    }
+
+    bool response_policy_id_is_valid(u16 id) const {
+        return id != 0 && id <= response_policy_count &&
+               response_policy_spec_valid(response_policies[id - 1]);
     }
 
     // Add an upstream target. Returns its index, or error if at capacity.

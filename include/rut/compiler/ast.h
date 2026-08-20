@@ -1,6 +1,7 @@
 #pragma once
 
 #include "rut/common/rate_limit_key_spec.h"
+#include "rut/common/response_policy.h"
 #include "rut/common/types.h"
 #include "rut/common/request_policy.h"
 #include "rut/compiler/diagnostic.h"
@@ -266,6 +267,11 @@ struct AstStatement {
     // parser requires the complete first normalized HTTP/1 policy object.
     u16 forward_request_policy_id = 0;
     bool has_forward_request_policy = false;
+    // `forward(response_policy: {...})`: non-zero immutable policy id. The
+    // policy remains a foundation only; runtime rejects it before connect
+    // until a response serializer is implemented.
+    u16 forward_response_policy_id = 0;
+    bool has_forward_response_policy = false;
     AstStatement* then_stmt = nullptr;
     AstStatement* else_stmt = nullptr;
     static constexpr u32 kMaxBlockStatements = 8;
@@ -601,6 +607,7 @@ struct AstFile {
     FixedVec<AstExpr, kMaxExprPool> expr_pool;
     FixedVec<AstStatement, kMaxStmtPool> stmt_pool;
     FixedVec<AstTypeRef, kMaxTypePool> type_pool;
+    FixedVec<ForwardResponsePolicySpec, kMaxResponsePolicies> response_policies;
     bool has_package_decl = false;
     Span package_span{};
     Str package_name{};
@@ -610,7 +617,8 @@ struct AstFile {
         : items(other.items),
           expr_pool(other.expr_pool),
           stmt_pool(other.stmt_pool),
-          type_pool(other.type_pool) {
+          type_pool(other.type_pool),
+          response_policies(other.response_policies) {
         rebase_from(other);
     }
     AstFile& operator=(const AstFile& other) {
@@ -619,6 +627,7 @@ struct AstFile {
         expr_pool = other.expr_pool;
         stmt_pool = other.stmt_pool;
         type_pool = other.type_pool;
+        response_policies = other.response_policies;
         rebase_from(other);
         return *this;
     }
@@ -626,7 +635,8 @@ struct AstFile {
         : items(other.items),
           expr_pool(other.expr_pool),
           stmt_pool(other.stmt_pool),
-          type_pool(other.type_pool) {
+          type_pool(other.type_pool),
+          response_policies(other.response_policies) {
         rebase_from(other);
     }
     AstFile& operator=(AstFile&& other) noexcept {
@@ -635,8 +645,18 @@ struct AstFile {
         expr_pool = other.expr_pool;
         stmt_pool = other.stmt_pool;
         type_pool = other.type_pool;
+        response_policies = other.response_policies;
         rebase_from(other);
         return *this;
+    }
+
+    u16 add_response_policy(const ForwardResponsePolicySpec& policy) {
+        for (u32 i = 0; i < response_policies.len; i++) {
+            if (response_policy_spec_equal(response_policies[i], policy))
+                return static_cast<u16>(i + 1);
+        }
+        if (!response_policies.push(policy)) return 0;
+        return static_cast<u16>(response_policies.len);
     }
 
 private:

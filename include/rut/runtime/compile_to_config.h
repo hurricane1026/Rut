@@ -183,7 +183,7 @@ inline bool populate_route_config(RouteConfig& cfg, const rir::Module& mod) {
     // no "merge" semantics for those tables, and a non-zero count
     // would break the compile-time body_idx / headers_idx invariants.
     if (cfg.route_count != 0 || cfg.response_body_count != 0 ||
-        cfg.response_header_set_count != 0) {
+        cfg.response_header_set_count != 0 || cfg.response_policy_count != 0) {
         return false;
     }
 
@@ -203,6 +203,10 @@ inline bool populate_route_config(RouteConfig& cfg, const rir::Module& mod) {
     if (mod.response_body_count > rir::Module::kMaxResponseBodies) return false;
     if (mod.header_set_count > rir::Module::kMaxHeaderSets) return false;
     if (mod.header_pool_used > rir::Module::kMaxHeaderPoolEntries) return false;
+    if (mod.response_policy_count > kMaxResponsePolicies) return false;
+    for (u32 i = 0; i < mod.response_policy_count; i++) {
+        if (!response_policy_spec_valid(mod.response_policies[i])) return false;
+    }
     for (u32 i = 0; i < mod.header_set_count; i++) {
         const auto& ref = mod.header_sets[i];
         if (static_cast<u32>(ref.offset) + ref.count > mod.header_pool_used) return false;
@@ -332,6 +336,13 @@ inline bool populate_route_config(RouteConfig& cfg, const rir::Module& mod) {
         u16 idx = cfg.add_response_header_set(keys, key_lens, vals, val_lens, ref.count);
         if (idx == 0) return false;
         if (idx != i + 1) return false;
+    }
+
+    // Response policies (1-based IDs preserved). RouteConfig copies every
+    // string into its own pool before the RIR/compiler arena can be released.
+    for (u32 i = 0; i < mod.response_policy_count; i++) {
+        u16 idx = cfg.add_response_policy(mod.response_policies[i]);
+        if (idx == 0 || idx != i + 1) return false;
     }
 
     // Cache instance descriptors — declaration order defines the instance

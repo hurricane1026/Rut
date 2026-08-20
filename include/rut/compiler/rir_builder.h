@@ -1123,7 +1123,11 @@ struct Builder {
 
     VoidResult emit_ret_forward(ValueId upstream,
                                 ValueId request_policy = kNoValue,
+                                ValueId response_policy = kNoValue,
                                 SourceLoc loc = {}) {
+        // A response operand is slot 2 in RIR and the ABI next_state field;
+        // callers must pass request_policy explicitly (zero is the transparent
+        // request-policy value) when carrying response_policy.
         if (!valid_val(upstream)) return err(RirError::InvalidState);
         // Upstream operand must be an integer type (upstream id).
         if (!val_has_type(upstream, TypeKind::I32) && !val_has_type(upstream, TypeKind::U32))
@@ -1141,6 +1145,16 @@ struct Builder {
         if (request_policy != kNoValue) {
             r.inst->operands[1] = request_policy;
             r.inst->operand_count = 2;
+        }
+        if (response_policy != kNoValue) {
+            if (!valid_val(response_policy) ||
+                (!val_has_type(response_policy, TypeKind::I32) &&
+                 !val_has_type(response_policy, TypeKind::U32) &&
+                 !val_has_type(response_policy, TypeKind::I64) &&
+                 !val_has_type(response_policy, TypeKind::U64)))
+                return err(RirError::InvalidState);
+            r.inst->operands[2] = response_policy;
+            r.inst->operand_count = 3;
         }
         return {};
     }

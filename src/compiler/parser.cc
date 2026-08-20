@@ -1544,6 +1544,130 @@ struct Parser {
                             return frontend_error(FrontendError::UnsupportedSyntax,
                                                   span_from(*rbrace.value()), kw_text);
                         stmt.has_forward_request_policy = true;
+                    } else if (kw_text.eq({"response_policy", 15})) {
+                        if (stmt.has_forward_response_policy)
+                            return frontend_error(
+                                FrontendError::UnexpectedToken, span_from(*kw.value()), kw_text);
+                        auto lbrace = expect(TokenType::LBrace);
+                        if (!lbrace) return core::make_unexpected(lbrace.error());
+                        if (cur().type == TokenType::RBrace)
+                            return frontend_error(FrontendError::UnsupportedSyntax,
+                                                  span_from(cur()), kw_text);
+                        ForwardResponsePolicySpec policy{};
+                        bool have_version = false;
+                        bool have_framing = false;
+                        bool have_connection = false;
+                        bool have_server = false;
+                        bool have_date = false;
+                        bool have_hide_headers = false;
+                        while (true) {
+                            auto field = expect(TokenType::Ident);
+                            if (!field) return core::make_unexpected(field.error());
+                            const Str field_name = field.value()->text;
+                            auto fcolon = expect(TokenType::Colon);
+                            if (!fcolon) return core::make_unexpected(fcolon.error());
+                            bool* seen = nullptr;
+                            if (field_name.eq({"version", 7})) {
+                                seen = &have_version;
+                                auto value = expect(TokenType::StringLit);
+                                if (!value) return core::make_unexpected(value.error());
+                                if (!value.value()->text.eq({"HTTP/1.1", 8}))
+                                    return frontend_error(FrontendError::UnsupportedSyntax,
+                                                          span_from(*value.value()),
+                                                          value.value()->text);
+                                policy.version = ResponsePolicyVersion::Http11;
+                            } else if (field_name.eq({"framing", 7})) {
+                                seen = &have_framing;
+                                auto value = expect(TokenType::StringLit);
+                                if (!value) return core::make_unexpected(value.error());
+                                if (!value.value()->text.eq({"content_length", 14}))
+                                    return frontend_error(FrontendError::UnsupportedSyntax,
+                                                          span_from(*value.value()),
+                                                          value.value()->text);
+                                policy.framing = ResponsePolicyFraming::ContentLength;
+                            } else if (field_name.eq({"connection", 10})) {
+                                seen = &have_connection;
+                                auto value = expect(TokenType::StringLit);
+                                if (!value) return core::make_unexpected(value.error());
+                                if (!value.value()->text.eq({"keep_alive", 10}))
+                                    return frontend_error(FrontendError::UnsupportedSyntax,
+                                                          span_from(*value.value()),
+                                                          value.value()->text);
+                                policy.connection = ResponsePolicyConnection::KeepAlive;
+                            } else if (field_name.eq({"server", 6})) {
+                                seen = &have_server;
+                                auto value = expect(TokenType::StringLit);
+                                if (!value) return core::make_unexpected(value.error());
+                                if (!response_policy_safe_server(value.value()->text))
+                                    return frontend_error(FrontendError::UnsupportedSyntax,
+                                                          span_from(*value.value()),
+                                                          value.value()->text);
+                                policy.server = value.value()->text;
+                            } else if (field_name.eq({"date", 4})) {
+                                seen = &have_date;
+                                auto value = expect(TokenType::StringLit);
+                                if (!value) return core::make_unexpected(value.error());
+                                if (!value.value()->text.eq({"current", 7}))
+                                    return frontend_error(FrontendError::UnsupportedSyntax,
+                                                          span_from(*value.value()),
+                                                          value.value()->text);
+                                policy.date = ResponsePolicyDate::Current;
+                            } else if (field_name.eq({"hide_headers", 12})) {
+                                seen = &have_hide_headers;
+                                auto lbracket = expect(TokenType::LBracket);
+                                if (!lbracket) return core::make_unexpected(lbracket.error());
+                                if (cur().type != TokenType::RBracket) {
+                                    while (true) {
+                                        auto item = expect(TokenType::StringLit);
+                                        if (!item) return core::make_unexpected(item.error());
+                                        const Str name = item.value()->text;
+                                        if (!response_policy_safe_header_name(name))
+                                            return frontend_error(FrontendError::UnsupportedSyntax,
+                                                                  span_from(*item.value()), name);
+                                        if (policy.hide_header_count >=
+                                            kMaxResponsePolicyHideHeaders)
+                                            return frontend_error(FrontendError::TooManyItems,
+                                                                  span_from(*item.value()), name);
+                                        for (u32 i = 0; i < policy.hide_header_count; i++) {
+                                            if (http_header_name_eq_ci(name.ptr,
+                                                                       name.len,
+                                                                       policy.hide_headers[i].ptr,
+                                                                       policy.hide_headers[i].len))
+                                                return frontend_error(FrontendError::UnexpectedToken,
+                                                                      span_from(*item.value()),
+                                                                      name);
+                                        }
+                                        policy.hide_headers[policy.hide_header_count++] = name;
+                                        if (!take(TokenType::Comma)) break;
+                                        if (cur().type == TokenType::RBracket) break;
+                                    }
+                                }
+                                auto rbracket = expect(TokenType::RBracket);
+                                if (!rbracket) return core::make_unexpected(rbracket.error());
+                            } else {
+                                return frontend_error(FrontendError::UnexpectedToken,
+                                                      span_from(*field.value()), field_name);
+                            }
+                            if (*seen) {
+                                return frontend_error(FrontendError::UnexpectedToken,
+                                                      span_from(*field.value()), field_name);
+                            }
+                            *seen = true;
+                            if (!take(TokenType::Comma)) break;
+                            if (cur().type == TokenType::RBrace) break;
+                        }
+                        auto rbrace = expect(TokenType::RBrace);
+                        if (!rbrace) return core::make_unexpected(rbrace.error());
+                        if (!have_version || !have_framing || !have_connection || !have_server ||
+                            !have_date || !have_hide_headers || !response_policy_spec_valid(policy))
+                            return frontend_error(FrontendError::UnsupportedSyntax,
+                                                  span_from(*rbrace.value()), kw_text);
+                        const u16 policy_id = file->add_response_policy(policy);
+                        if (policy_id == 0)
+                            return frontend_error(FrontendError::TooManyItems,
+                                                  span_from(*kw.value()), kw_text);
+                        stmt.forward_response_policy_id = policy_id;
+                        stmt.has_forward_response_policy = true;
                     } else if (kw_text.eq({"set_path", 8})) {
                         if (stmt.has_forward_set_path)
                             return frontend_error(

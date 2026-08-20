@@ -40,6 +40,9 @@ struct JitDispatchOutcome {
     // Compact immutable request-policy id carried in HandlerResult.status_code
     // for Forward outcomes; zero preserves transparent forwarding.
     u16 request_policy_id = 0;
+    // Compact immutable response-policy id carried in HandlerResult.next_state
+    // for Forward outcomes; zero preserves transparent forwarding.
+    u16 response_policy_id = 0;
     u16 next_state = 0;
     jit::YieldKind yield_kind = jit::YieldKind::Timer;
     u32 timer_ms = 0;  // raw ms payload; callers pick their own precision
@@ -164,6 +167,7 @@ inline JitDispatchOutcome invoke_jit_handler(jit::HandlerFn fn,
             out.kind = JitDispatchOutcome::Kind::Forward;
             out.upstream_id = r.upstream_id;
             out.request_policy_id = r.status_code;
+            out.response_policy_id = r.next_state;
             return out;
         case jit::HandlerAction::Yield:
             out.next_state = r.next_state;

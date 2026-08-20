@@ -50,7 +50,9 @@ enum class YieldKind : u8 {
 //   - ReturnStatus: upstream_id carries a 1-based index into
 //                   RouteConfig::response_bodies (0 = no custom body,
 //                   runtime uses default status-reason phrase).
-//   - Forward:      upstream_id is the real upstream index.
+//   - Forward:      upstream_id is the real upstream index, status_code carries
+//                   the request-policy id, and next_state carries the response-
+//                   policy id. Both policy ids are zero when absent.
 //
 // IMPORTANT: We use u64 as the function return type (not a struct)
 // because clang uses sret (hidden pointer) for packed structs even
@@ -92,6 +94,16 @@ struct HandlerResult {
 
     static HandlerResult make_forward(u16 upstream) {
         return {HandlerAction::Forward, 0, upstream, 0, YieldKind::HttpGet};
+    }
+
+    static HandlerResult make_forward_with_policies(u16 upstream,
+                                                    u16 request_policy,
+                                                    u16 response_policy) {
+        return {HandlerAction::Forward,
+                request_policy,
+                upstream,
+                response_policy,
+                YieldKind::HttpGet};
     }
 
     static HandlerResult make_yield(u16 state, YieldKind kind) {

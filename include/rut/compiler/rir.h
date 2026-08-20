@@ -2,6 +2,7 @@
 
 #include "core/expected.h"
 #include "rut/common/rate_limit_key_spec.h"
+#include "rut/common/response_policy.h"
 #include "rut/common/types.h"
 #include "rut/runtime/arena.h"
 
@@ -266,7 +267,10 @@ enum class Opcode : u8 {
                  //   reading imm.i64_val — doing otherwise will print
                  //   garbage for the value form and miss body/header idx
                  //   in the literal form.
-    RetForward,  // ret.forward upstream [, options]
+    // ret.forward upstream [, request_policy_id [, response_policy_id]].
+    // The optional policy operands are contiguous; a response policy with no
+    // request policy uses an explicit zero request operand.
+    RetForward,
 
     // ── Yield (I/O suspend → state machine boundary) ──
     YieldTimer,     // yield.timer ms, next_state
@@ -461,6 +465,11 @@ struct Module {
     u32 header_pool_used = 0;
     HeaderSetRef header_sets[kMaxHeaderSets];
     u32 header_set_count = 0;
+
+    // Validated response-policy metadata. IDs are 1-based in the RIR module
+    // and are copied into RouteConfig before the compiler arena is released.
+    ForwardResponsePolicySpec response_policies[kMaxResponsePolicies]{};
+    u32 response_policy_count = 0;
 
     // Upstream declarations carried verbatim from the DSL so a
     // compile→config helper can translate them into

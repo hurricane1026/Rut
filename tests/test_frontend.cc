@@ -32399,6 +32399,94 @@ route GET "/" use chain access {
         lit("request_policy cannot be combined with response header mutations")));
 }
 
+TEST(frontend, response_policy_metadata_is_bounded_and_carried_to_rir) {
+    const char* src = R"rut(
+upstream backend at "127.0.0.1:9000"
+route GET "/" {
+    return forward(backend, request_policy: {
+        version: "HTTP/1.1",
+        host: "upstream",
+        connection: "omit",
+        strip_headers: ["Connection", "Keep-Alive", "TE", "Expect", "Upgrade"]
+    }, response_policy: {
+        version: "HTTP/1.1",
+        framing: "content_length",
+        connection: "keep_alive",
+        server: "nginx",
+        date: "current",
+        hide_headers: ["Date", "Server", "X-Pad"]
+    })
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    REQUIRE_EQ(ast->response_policies.len, 1u);
+    REQUIRE_EQ(ast->items[1].route.statements[0]->forward_response_policy_id, 1u);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    REQUIRE_EQ(hir->response_policies.len, 1u);
+    CHECK_EQ(hir->routes[0].control.direct_term.forward_response_policy_id, 1u);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    REQUIRE_EQ(mir->response_policies.len, 1u);
+    CHECK_EQ(mir->functions[0].blocks[0].term.forward_response_policy_id, 1u);
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(mir.value(), rir);
+    REQUIRE(lowered);
+    REQUIRE_EQ(rir.module.response_policy_count, 1u);
+    CHECK(rir.module.response_policies[0].server.eq(lit("nginx")));
+    const auto& block = rir.module.functions[0].blocks[0];
+    const auto& ret = block.insts[block.inst_count - 1];
+    CHECK_EQ(static_cast<u8>(ret.op), static_cast<u8>(rir::Opcode::RetForward));
+    CHECK_EQ(ret.operand_count, 3u);
+    CHECK_EQ(block.insts[1].imm.i32_val, 1);
+    CHECK_EQ(block.insts[2].imm.i32_val, 1);
+    rir.destroy();
+}
+
+TEST(frontend, response_policy_rejects_invalid_values_duplicates_and_missing_fields) {
+    const char* invalid[] = {
+        "upstream b\nroute GET \"/\" { return forward(b, response_policy: { version: \"HTTP/1.0\", framing: \"content_length\", connection: \"keep_alive\", server: \"nginx\", date: \"current\", hide_headers: [] }) }\n",
+        "upstream b\nroute GET \"/\" { return forward(b, response_policy: { version: \"HTTP/1.1\", framing: \"chunked\", connection: \"keep_alive\", server: \"nginx\", date: \"current\", hide_headers: [] }) }\n",
+        "upstream b\nroute GET \"/\" { return forward(b, response_policy: { version: \"HTTP/1.1\", framing: \"content_length\", connection: \"keep_alive\", server: \"nginx\", date: \"current\", hide_headers: [\"Date\", \"date\"] }) }\n",
+        "upstream b\nroute GET \"/\" { return forward(b, response_policy: { version: \"HTTP/1.1\", framing: \"content_length\", connection: \"keep_alive\", server: \"nginx\", hide_headers: [] }) }\n",
+        "upstream b\nroute GET \"/\" { return forward(b, response_policy: { version: \"HTTP/1.1\", framing: \"content_length\", connection: \"keep_alive\", server: \"bad\rvalue\", date: \"current\", hide_headers: [] }) }\n",
+    };
+    for (const char* src : invalid) {
+        auto lexed = lex(lit(src));
+        REQUIRE(lexed);
+        auto ast = parse_file_heap(lexed.value());
+        CHECK_FALSE(ast.has_value());
+    }
+}
+
+TEST(frontend, response_policy_rejects_response_mutation_combination) {
+    const char* src = R"rut(
+upstream backend at "127.0.0.1:9000"
+func add_header(_ resp: Response) -> i32 {
+    resp.set("X-Proxy", "rut")
+    0
+}
+chain access { after add_header(resp) }
+route GET "/" use chain access {
+    return forward(backend, response_policy: {
+        version: "HTTP/1.1", framing: "content_length", connection: "keep_alive",
+        server: "nginx", date: "current", hide_headers: ["Date"]
+    })
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE_FALSE(hir.has_value());
+    CHECK(hir.error().detail.eq(
+        lit("response_policy cannot be combined with response header mutations")));
+}
+
 int main(int argc, char** argv) {
     return rut::test::run_all(argc, argv);
 }

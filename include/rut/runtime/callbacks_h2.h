@@ -753,6 +753,21 @@ void h2_invoke_emit(H2Dispatch<Loop>& d,
         return;
     }
     if (kOutcome.kind == JitDispatchOutcome::Kind::Forward) {
+        if (kOutcome.response_policy_id != 0 &&
+            (cfg == nullptr || !cfg->response_policy_id_is_valid(kOutcome.response_policy_id) ||
+             d.conn->resp_header_mutation_count != 0 ||
+             d.conn->resp_header_mutation_pending_count != 0 ||
+             d.conn->resp_header_mutation_pending_overflow ||
+             d.conn->resp_header_mutation_overflow)) {
+            h2_emit_status(d, stream_id, 400);
+            return;
+        }
+        // Response serialization is not implemented yet. Never silently
+        // downgrade a valid non-zero policy to transparent forwarding.
+        if (kOutcome.response_policy_id != 0) {
+            h2_emit_status(d, stream_id, 400);
+            return;
+        }
         if (kOutcome.request_policy_id != 0) {
             h2_emit_status(d, stream_id, 400);
             return;
@@ -1421,6 +1436,15 @@ void h2_resume_jit_handler(Loop* loop, Connection& conn) {
 
     if (kOutcome.kind == JitDispatchOutcome::Kind::Forward) {
         u16 failure_status = 0;
+        if (kOutcome.response_policy_id != 0 &&
+            (h2->async_cfg == nullptr ||
+             !h2->async_cfg->response_policy_id_is_valid(kOutcome.response_policy_id) ||
+             conn.resp_header_mutation_count != 0 ||
+             conn.resp_header_mutation_pending_count != 0 ||
+             conn.resp_header_mutation_pending_overflow ||
+             conn.resp_header_mutation_overflow))
+            failure_status = 400;
+        if (failure_status == 0 && kOutcome.response_policy_id != 0) failure_status = 400;
         if (kOutcome.request_policy_id != 0) failure_status = 400;
         if (failure_status == 0 && h2->async_request_body_followed && !h2->async_request_stream_open) {
             failure_status = 503;

@@ -9718,6 +9718,8 @@ static FrontendResult<HirTerminator> analyze_term(const AstStatement& stmt, cons
     if (stmt.has_forward_set_path) term.forward_set_path = stmt.forward_set_path;
     if (stmt.has_forward_request_policy)
         term.forward_request_policy_id = stmt.forward_request_policy_id;
+    if (stmt.has_forward_response_policy)
+        term.forward_response_policy_id = stmt.forward_response_policy_id;
     // Carry forward(set_header:) overrides verbatim (parser validated + deduped).
     for (u32 i = 0; i < stmt.forward_set_headers.len; i++) {
         const auto& p = stmt.forward_set_headers[i];
@@ -14525,6 +14527,13 @@ static FrontendResult<HirModule*> analyze_file_internal(
     mod.has_package_decl = file.has_package_decl;
     mod.package_span = file.package_span;
     mod.package_name = file.package_name;
+    if (file.response_policies.len > kMaxResponsePolicies)
+        return frontend_error(FrontendError::TooManyItems, {});
+    for (u32 i = 0; i < file.response_policies.len; i++) {
+        if (!response_policy_spec_valid(file.response_policies[i]) ||
+            !mod.response_policies.push(file.response_policies[i]))
+            return frontend_error(FrontendError::UnsupportedSyntax, {});
+    }
 
     // Listener declarations are startup metadata, not route declarations. A
     // program has one process listener in this slice; imported modules cannot
@@ -18769,8 +18778,9 @@ static FrontendResult<HirModule*> analyze_file_internal(
             // direct-RIR callers.
             auto policy_mutation_conflict = [](const HirTerminator& term) {
                 return term.kind == HirTerminatorKind::ForwardUpstream &&
-                       term.forward_request_policy_id != 0 &&
-                       term.commit_response_mutations;
+                       ((term.forward_request_policy_id != 0 && term.commit_response_mutations) ||
+                        (term.forward_response_policy_id != 0 &&
+                         term.commit_response_mutations));
             };
             const HirTerminator* conflict = nullptr;
             if (route.control.kind == HirControlKind::Direct) {
@@ -18802,7 +18812,9 @@ static FrontendResult<HirModule*> analyze_file_internal(
                 return frontend_error(
                     FrontendError::UnsupportedSyntax,
                     conflict->span,
-                    lit_str("request_policy cannot be combined with response header mutations"));
+                    conflict->forward_response_policy_id != 0
+                        ? lit_str("response_policy cannot be combined with response header mutations")
+                        : lit_str("request_policy cannot be combined with response header mutations"));
         }
 
         // Wait-route backstop: the creation-time gates (kTimeWaitDetail /

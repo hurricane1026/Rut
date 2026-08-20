@@ -3059,10 +3059,25 @@ static FrontendResult<void> emit_term(const MirTerminator& term,
             if (!p) return frontend_error(FrontendError::OutOfMemory, term.span);
             policy = p.value();
         }
+        rir::ValueId response_policy = rir::kNoValue;
+        if (term.forward_response_policy_id != 0) {
+            if (policy == rir::kNoValue) {
+                auto p0 = b.emit_const_i32(0, {term.span.line, term.span.col});
+                if (!p0) return frontend_error(FrontendError::OutOfMemory, term.span);
+                policy = p0.value();
+            }
+            auto p = b.emit_const_i32(static_cast<i32>(term.forward_response_policy_id),
+                                      {term.span.line, term.span.col});
+            if (!p) return frontend_error(FrontendError::OutOfMemory, term.span);
+            response_policy = p.value();
+        }
         if (term.commit_response_mutations &&
             !b.emit_resp_commit_headers({term.span.line, term.span.col}))
             return frontend_error(FrontendError::OutOfMemory, term.span);
-        if (!b.emit_ret_forward(upstream.value(), policy, {term.span.line, term.span.col}))
+        if (!b.emit_ret_forward(upstream.value(),
+                                policy,
+                                response_policy,
+                                {term.span.line, term.span.col}))
             return frontend_error(FrontendError::OutOfMemory, term.span);
         return {};
     }
@@ -3161,6 +3176,41 @@ FrontendResult<void> lower_to_rir(const MirModule& mir, FrontendRirModule& out) 
         out.module.upstreams[i].hc_expected_status = mir.upstreams[i].hc_expected_status;
     }
     out.module.upstream_count = mir.upstreams.len;
+
+    // Copy validated response-policy metadata into the RIR arena. The
+    // compiler's source/HIR/MIR storage may be temporary; the RIR module is
+    // the owner that survives until RouteConfig activation.
+    if (mir.response_policies.len > kMaxResponsePolicies)
+        return frontend_error(FrontendError::TooManyItems, {});
+    auto copy_policy_str = [&](Str src, Str& dst) {
+        if (src.len > 0 && src.ptr == nullptr) return false;
+        char* buf = nullptr;
+        if (src.len > 0) {
+            buf = out.module.arena->alloc_array<char>(src.len);
+            if (!buf) return false;
+            for (u32 k = 0; k < src.len; k++) buf[k] = src.ptr[k];
+        }
+        dst = {buf, src.len};
+        return true;
+    };
+    for (u32 i = 0; i < mir.response_policies.len; i++) {
+        const auto& src = mir.response_policies[i];
+        if (!response_policy_spec_valid(src))
+            return frontend_error(FrontendError::UnsupportedSyntax);
+        auto& dst = out.module.response_policies[i];
+        dst.version = src.version;
+        dst.framing = src.framing;
+        dst.connection = src.connection;
+        dst.date = src.date;
+        if (!copy_policy_str(src.server, dst.server))
+            return frontend_error(FrontendError::OutOfMemory);
+        dst.hide_header_count = src.hide_header_count;
+        for (u32 h = 0; h < src.hide_header_count; h++) {
+            if (!copy_policy_str(src.hide_headers[h], dst.hide_headers[h]))
+                return frontend_error(FrontendError::OutOfMemory);
+        }
+    }
+    out.module.response_policy_count = mir.response_policies.len;
 
     // Cache instance descriptors, names arena-copied like upstream names.
     if (mir.caches.len > rir::Module::kMaxCacheInstances) {

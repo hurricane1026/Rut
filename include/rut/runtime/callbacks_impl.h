@@ -496,6 +496,8 @@ void format_response_with_body_and_headers(Connection& conn,
 inline bool apply_request_policy(Connection& conn, const sockaddr_in& endpoint, u16 policy_id);
 template <typename Loop>
 inline void reject_request_policy(Loop* loop, Connection& conn);
+template <typename Loop>
+inline void reject_response_policy(Loop* loop, Connection& conn);
 void prepare_early_response_state(Connection& conn);
 u32 consume_upstream_sent(Connection& conn);
 
@@ -2127,6 +2129,24 @@ void handle_jit_outcome(Loop* loop,
                 reject_request_policy(loop, conn);
                 return;
             }
+            // Response-policy metadata is carried independently from the
+            // request policy. Until response serialization exists, reject
+            // every non-zero response policy before slot allocation/connect;
+            // an invalid ID or a mutation combination must never fall back to
+            // transparent forwarding.
+            if (outcome.response_policy_id != 0 &&
+                (!config->response_policy_id_is_valid(outcome.response_policy_id) ||
+                 conn.resp_header_mutation_count != 0 ||
+                 conn.resp_header_mutation_pending_count != 0 ||
+                 conn.resp_header_mutation_pending_overflow ||
+                 conn.resp_header_mutation_overflow)) {
+                reject_response_policy(loop, conn);
+                return;
+            }
+            if (outcome.response_policy_id != 0) {
+                reject_response_policy(loop, conn);
+                return;
+            }
             if (conn.resp_header_mutation_count != 0 && !loop->alloc_response_header_buf(conn)) {
                 conn.resp_status = kStatusInternalServerError;
                 format_static_response(conn, 500, /*keep_alive=*/false);
@@ -2798,6 +2818,16 @@ inline bool apply_request_policy(Connection& conn, const sockaddr_in& endpoint, 
 
 template <typename Loop>
 inline void reject_request_policy(Loop* loop, Connection& conn) {
+    release_upstream_slot(loop, conn);
+    conn.resp_status = 400;
+    format_static_response(conn, 400, /*keep_alive=*/false);
+    conn.keep_alive = false;
+    conn.transition_to_sending(&on_response_sent<Loop>);
+    client_send(loop, conn, conn.send_buf.data(), conn.send_buf.len());
+}
+
+template <typename Loop>
+inline void reject_response_policy(Loop* loop, Connection& conn) {
     release_upstream_slot(loop, conn);
     conn.resp_status = 400;
     format_static_response(conn, 400, /*keep_alive=*/false);
