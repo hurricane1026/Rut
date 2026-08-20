@@ -1,9 +1,14 @@
 #include "rut/compiler/analyze.h"
 #include "rut/compiler/lexer.h"
+#include "rut/compiler/lower_rir.h"
+#include "rut/compiler/mir_build.h"
 #include "rut/compiler/parser.h"
 #include "rut/nginx/converter.h"
 #include "rut/nginx/parser.h"
+#include "rut/runtime/listener.h"
 #include "test.h"
+
+#include <memory>
 
 using namespace rut;
 
@@ -20,6 +25,35 @@ static bool is_error(const FrontendResult<nginx::Server>& result,
         return false;
     return detail.empty() || diagnostic.detail.eq(detail);
 }
+
+static const rir::Instruction* find_ret_forward(const rir::Function& function) {
+    for (u32 bi = 0; bi < function.block_count; bi++) {
+        const auto& block = function.blocks[bi];
+        for (u32 ii = 0; ii < block.inst_count; ii++) {
+            if (block.insts[ii].op == rir::Opcode::RetForward) return &block.insts[ii];
+        }
+    }
+    return nullptr;
+}
+
+static bool find_const_i32(const rir::Function& function, rir::ValueId value, i32& out) {
+    for (u32 bi = 0; bi < function.block_count; bi++) {
+        const auto& block = function.blocks[bi];
+        for (u32 ii = 0; ii < block.inst_count; ii++) {
+            const auto& instruction = block.insts[ii];
+            if (instruction.op == rir::Opcode::ConstI32 && instruction.result == value) {
+                out = instruction.imm.i32_val;
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
+struct RirGuard {
+    FrontendRirModule& module;
+    ~RirGuard() { module.destroy(); }
+};
 
 }  // namespace
 
@@ -297,17 +331,91 @@ TEST(nginx_converter, formatting_and_comments_do_not_change_lowering) {
     CHECK(compact_lowered.value().view().eq(formatted_lowered.value().view()));
 }
 
-TEST(nginx_converter, emitted_source_compiles_through_frontend) {
+TEST(nginx_converter, emitted_source_reaches_rir_with_source_metadata) {
     auto lowered = nginx::lower_to_rut(canonical_server());
     REQUIRE(lowered);
     auto lexed = lex(lowered.value().view());
     REQUIRE(lexed);
     auto ast = parse_file(lexed.value());
     REQUIRE(ast);
-    auto hir = analyze_file(*ast.value());
+    std::unique_ptr<AstFile> ast_owned(ast.value());
+    REQUIRE_EQ(ast_owned->items.len, 3u);
+    CHECK(ast_owned->items[0].kind == AstItemKind::Listen);
+    CHECK_EQ(ast_owned->items[0].listen.port, 8080u);
+    auto hir = analyze_file(*ast_owned);
     REQUIRE(hir);
-    delete ast.value();
-    delete hir.value();
+    std::unique_ptr<HirModule> hir_owned(hir.value());
+    REQUIRE(hir_owned->has_listener);
+    CHECK_EQ(hir_owned->listener.port, 8080u);
+    // Listener declarations are startup metadata rather than RIR route state;
+    // exercise the same source-to-startup resolution boundary used by main.
+    ListenerSpec source_listener{};
+    source_listener.port = hir_owned->listener.port;
+    auto resolved_listener = resolve_listener_spec(true, source_listener, false, 0);
+    REQUIRE(resolved_listener);
+    CHECK_EQ(resolved_listener.value().port, 8080u);
+    REQUIRE_EQ(hir_owned->upstreams.len, 1u);
+    CHECK(hir_owned->upstreams[0].name.eq(lit_str("nginx_upstream")));
+    CHECK(hir_owned->upstreams[0].has_address);
+    CHECK_EQ(hir_owned->upstreams[0].ip, 0x7F000001u);
+    CHECK_EQ(hir_owned->upstreams[0].port, 9000u);
+    REQUIRE_EQ(hir_owned->response_policies.len, 1u);
+    auto mir = build_mir(*hir_owned);
+    REQUIRE(mir);
+    std::unique_ptr<MirModule> mir_owned(mir.value());
+    REQUIRE_EQ(mir_owned->upstreams.len, 1u);
+    CHECK_EQ(mir_owned->upstreams[0].ip, 0x7F000001u);
+    CHECK_EQ(mir_owned->upstreams[0].port, 9000u);
+    REQUIRE_EQ(mir_owned->response_policies.len, 1u);
+    REQUIRE_EQ(mir_owned->functions.len, 1u);
+    CHECK_EQ(mir_owned->functions[0].method, 0u);
+    CHECK(mir_owned->functions[0].path.eq(lit_str("/")));
+    CHECK_EQ(mir_owned->functions[0].blocks[0].term.forward_request_policy_id, 1u);
+    CHECK(request_policy_is_supported(
+        mir_owned->functions[0].blocks[0].term.forward_request_policy_id));
+    const char* request_version = request_policy_version(
+        mir_owned->functions[0].blocks[0].term.forward_request_policy_id);
+    REQUIRE(request_version != nullptr);
+    const Str request_version_str{request_version, 8};
+    CHECK(request_version_str.eq(lit_str("HTTP/1.1")));
+    CHECK_EQ(mir_owned->functions[0].blocks[0].term.forward_response_policy_id, 1u);
+
+    FrontendRirModule rir{};
+    RirGuard rir_guard{rir};
+    REQUIRE(lower_to_rir(*mir_owned, rir));
+    REQUIRE_EQ(rir.module.upstream_count, 1u);
+    CHECK(rir.module.upstreams[0].name.eq(lit_str("nginx_upstream")));
+    CHECK(rir.module.upstreams[0].has_address);
+    CHECK_EQ(rir.module.upstreams[0].ip, 0x7F000001u);
+    CHECK_EQ(rir.module.upstreams[0].port, 9000u);
+    REQUIRE_EQ(rir.module.response_policy_count, 1u);
+    const auto& response_policy = rir.module.response_policies[0];
+    CHECK(response_policy.version == ResponsePolicyVersion::Http11);
+    CHECK(response_policy.framing == ResponsePolicyFraming::ContentLength);
+    CHECK(response_policy.connection == ResponsePolicyConnection::KeepAlive);
+    CHECK(response_policy.date == ResponsePolicyDate::Current);
+    CHECK(response_policy.server.eq(lit_str("nginx/1.29.7")));
+    REQUIRE_EQ(response_policy.hide_header_count, 3u);
+    CHECK(response_policy.hide_headers[0].eq(lit_str("Date")));
+    CHECK(response_policy.hide_headers[1].eq(lit_str("Server")));
+    CHECK(response_policy.hide_headers[2].eq(lit_str("X-Pad")));
+
+    REQUIRE_EQ(rir.module.func_count, 1u);
+    const auto& function = rir.module.functions[0];
+    CHECK(function.route_pattern.eq(lit_str("/")));
+    CHECK_EQ(function.http_method, 0u);
+    const auto* ret = find_ret_forward(function);
+    REQUIRE(ret != nullptr);
+    REQUIRE_EQ(ret->operand_count, 3u);
+    i32 upstream_id = -1;
+    i32 request_policy_id = -1;
+    i32 response_policy_id = -1;
+    REQUIRE(find_const_i32(function, ret->operand(0), upstream_id));
+    REQUIRE(find_const_i32(function, ret->operand(1), request_policy_id));
+    REQUIRE(find_const_i32(function, ret->operand(2), response_policy_id));
+    CHECK_EQ(upstream_id, 0);
+    CHECK_EQ(request_policy_id, 1);
+    CHECK_EQ(response_policy_id, 1);
 }
 
 TEST(nginx_converter, rejects_forged_invalid_models_without_output) {
