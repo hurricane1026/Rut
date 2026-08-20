@@ -5,6 +5,7 @@
 #include "rut/compiler/lower_rir.h"
 #include "rut/compiler/mir_build.h"
 #include "rut/compiler/parser.h"
+#include "rut/compiler/rir_builder.h"
 #if RUT_ENABLE_JIT_TESTS
 #include "rut/jit/codegen.h"
 #include "rut/jit/jit_engine.h"
@@ -9159,6 +9160,102 @@ static u64 wait_then_forward_with_request_overrides_handler(
         .pack();
 }
 
+#if RUT_ENABLE_JIT_TESTS
+// Test-only RIR/JIT fixture for target-transform H2 coverage.  There is
+// intentionally no source syntax for this effect yet, so these handlers are
+// built from the real RIR opcode and compiled through the production JIT.
+struct H2TargetTransformJit {
+    FrontendRirModule rir{};
+    jit::JitEngine engine{};
+    jit::HandlerFn handler_fn = nullptr;
+    bool engine_ready = false;
+
+    ~H2TargetTransformJit() {
+        if (engine_ready) engine.shutdown();
+        rir.destroy();
+    }
+
+    static Str literal(const char* text) {
+        u32 len = 0;
+        while (text[len] != '\0') len++;
+        return {text, len};
+    }
+
+    bool init(bool with_timer) {
+        if (!rir.init(2, 1)) return false;
+        rir::Builder b;
+        b.init(&rir.module);
+
+        auto fn_result = b.create_function(with_timer ? literal("target_resume")
+                                                            : literal("target_initial"),
+                                           literal("/api"),
+                                           'G');
+        if (!fn_result) return false;
+        auto* fn = fn_result.value();
+        auto entry_result = b.create_block(fn, literal("entry"));
+        if (!entry_result) return false;
+        const auto entry = entry_result.value();
+
+        if (!with_timer) {
+            b.set_insert_point(fn, entry);
+            if (!b.emit_req_set_target_transform(1)) return false;
+            auto upstream = b.emit_const_i32(0);
+            if (!upstream || !b.emit_ret_forward(upstream.value())) return false;
+        } else {
+            auto resume_result = b.create_block(fn, literal("resume"));
+            if (!resume_result) return false;
+            const auto resume = resume_result.value();
+            const u32 payloads[] = {20};
+            const u8 kinds[] = {static_cast<u8>(jit::YieldKind::Timer)};
+            if (!b.set_yield_payload(fn, payloads, 1, kinds)) return false;
+            const rir::BlockId resume_blocks[] = {entry, resume};
+            if (!b.set_explicit_resume_blocks(fn, resume_blocks, 2)) return false;
+
+            b.set_insert_point(fn, entry);
+            if (!b.emit_yield_timer(20, 1)) return false;
+            b.set_insert_point(fn, resume);
+            if (!b.emit_req_set_target_transform(1)) return false;
+            auto upstream = b.emit_const_i32(0);
+            if (!upstream || !b.emit_ret_forward(upstream.value())) return false;
+        }
+
+        auto cg = jit::codegen(rir.module);
+        if (!cg.ok || !engine.init()) return false;
+        engine_ready = true;
+        if (!engine.compile(cg.mod, cg.ctx)) return false;
+        const char* symbol = with_timer ? "handler_target_resume" : "handler_target_initial";
+        handler_fn = reinterpret_cast<jit::HandlerFn>(engine.lookup(symbol));
+        return handler_fn != nullptr;
+    }
+};
+
+static u64 h2_target_transform_plain_200_handler(void* /*conn*/,
+                                                 jit::HandlerCtx* /*ctx*/,
+                                                 const u8* /*req*/,
+                                                 u32 /*len*/,
+                                                 void* /*arena*/) {
+    return jit::HandlerResult::make_status(200).pack();
+}
+
+template <typename Loop>
+struct H2TargetTransformShardGuard {
+    Shard<Loop>& shard;
+    i32& listen_fd;
+    i32 client_fd = -1;
+    bool spawned = false;
+
+    ~H2TargetTransformShardGuard() {
+        if (client_fd >= 0) close(client_fd);
+        if (spawned) {
+            shard.stop();
+            shard.join();
+        }
+        shard.shutdown();
+        if (listen_fd >= 0) close(listen_fd);
+    }
+};
+#endif
+
 // End-to-end: a JIT handler returning Forward must kick off the same
 // proxy flow as a RouteAction::Proxy match. Before the JIT forward wire-up,
 // handle_jit_outcome::Forward returned 500; this test guards against that
@@ -16287,6 +16384,158 @@ struct RecordingUpstream {
         }
     }
 };
+
+#if RUT_ENABLE_JIT_TESTS
+TEST(shard, serves_http2_jit_target_transform_initial_fails_closed) {
+    H2TargetTransformJit compiled;
+    REQUIRE(compiled.init(/*with_timer=*/false));
+
+    RecordingUpstream backend;
+    REQUIRE(backend.setup());
+    RouteConfig cfg{};
+    REQUIRE_EQ(cfg.add_target_transform({{"/api/", 5}, {"/v1/", 4}}), 1u);
+    auto upstream = cfg.add_upstream("backend", 0x7F000001, backend.port);
+    REQUIRE(upstream.has_value());
+    REQUIRE_EQ(upstream.value(), 0u);
+    REQUIRE(cfg.add_jit_handler("/api", 'G', compiled.handler_fn));
+
+    Shard<EpollEventLoop> shard;
+    i32 listen_fd = create_listen_socket(0).value_or(-1);
+    REQUIRE(listen_fd >= 0);
+    H2TargetTransformShardGuard<EpollEventLoop> guard{shard, listen_fd};
+    const u16 port = get_port(listen_fd);
+    REQUIRE(shard.init(0, listen_fd).has_value());
+    shard.route_config = &cfg;
+    REQUIRE(shard.spawn(-1).has_value());
+    guard.spawned = true;
+    usleep(50000);
+
+    guard.client_fd = connect_to(port);
+    REQUIRE(guard.client_fd >= 0);
+    set_socket_timeouts(guard.client_fd, 2);
+    u8 request[512];
+    u32 request_len = h2_client_prologue(request);
+    request_len += h2_client_get(request + request_len,
+                                  sizeof(request) - request_len,
+                                  1,
+                                  "/api",
+                                  4);
+    REQUIRE(write_all_fd(guard.client_fd, request, request_len));
+
+    u8 response[4096];
+    u32 response_len = 0;
+    for (int attempt = 0; attempt < 10 && response_len < sizeof(response); attempt++) {
+        const i32 got = recv_timeout(guard.client_fd,
+                                      reinterpret_cast<char*>(response + response_len),
+                                      sizeof(response) - response_len,
+                                      2000);
+        if (got <= 0) break;
+        response_len += static_cast<u32>(got);
+        if (h2_status_for_stream(response, response_len, 1) != 0) break;
+    }
+    CHECK_EQ(h2_status_for_stream(response, response_len, 1), 400u);
+    usleep(100000);
+    CHECK_EQ(backend.accepted_count.load(std::memory_order_acquire), 0u);
+    CHECK_EQ(backend.request_count.load(std::memory_order_acquire), 0u);
+}
+
+TEST(shard, serves_http2_jit_target_transform_after_timer_resume_fails_closed) {
+    H2TargetTransformJit compiled;
+    REQUIRE(compiled.init(/*with_timer=*/true));
+
+    // Pin the first invocation's contract independently of socket timing: the
+    // compiled entry block yields and must not record the effect. The real
+    // request below still drives both initial dispatch and timer resume.
+    Connection probe;
+    probe.reset();
+    jit::HandlerCtx probe_ctx{};
+    static constexpr char kProbeRequest[] =
+        "GET /api HTTP/1.1\r\nHost: localhost\r\n\r\n";
+    const auto first = jit::HandlerResult::unpack(
+        compiled.handler_fn(&probe,
+                            &probe_ctx,
+                            reinterpret_cast<const u8*>(kProbeRequest),
+                            sizeof(kProbeRequest) - 1,
+                            nullptr));
+    CHECK_EQ(first.action, jit::HandlerAction::Yield);
+    CHECK_EQ(first.yield_kind, jit::YieldKind::Timer);
+    CHECK_FALSE(probe.target_transform_recorded);
+
+    RecordingUpstream backend;
+    REQUIRE(backend.setup());
+    RouteConfig cfg{};
+    REQUIRE_EQ(cfg.add_target_transform({{"/api/", 5}, {"/v1/", 4}}), 1u);
+    auto upstream = cfg.add_upstream("backend", 0x7F000001, backend.port);
+    REQUIRE(upstream.has_value());
+    REQUIRE_EQ(upstream.value(), 0u);
+    REQUIRE(cfg.add_jit_handler("/api", 'G', compiled.handler_fn));
+    REQUIRE(cfg.add_jit_handler("/plain", 'G', &h2_target_transform_plain_200_handler));
+
+    Shard<EpollEventLoop> shard;
+    i32 listen_fd = create_listen_socket(0).value_or(-1);
+    REQUIRE(listen_fd >= 0);
+    H2TargetTransformShardGuard<EpollEventLoop> guard{shard, listen_fd};
+    const u16 port = get_port(listen_fd);
+    REQUIRE(shard.init(0, listen_fd).has_value());
+    shard.route_config = &cfg;
+    REQUIRE(shard.spawn(-1).has_value());
+    guard.spawned = true;
+    usleep(50000);
+
+    guard.client_fd = connect_to(port);
+    REQUIRE(guard.client_fd >= 0);
+    set_socket_timeouts(guard.client_fd, 2);
+    u8 request[512];
+    u32 request_len = h2_client_prologue(request);
+    request_len += h2_client_get(request + request_len,
+                                  sizeof(request) - request_len,
+                                  1,
+                                  "/api",
+                                  4);
+    REQUIRE(write_all_fd(guard.client_fd, request, request_len));
+
+    u8 response[4096];
+    u32 response_len = 0;
+    for (int attempt = 0; attempt < 12 && response_len < sizeof(response); attempt++) {
+        const i32 got = recv_timeout(guard.client_fd,
+                                      reinterpret_cast<char*>(response + response_len),
+                                      sizeof(response) - response_len,
+                                      2000);
+        if (got <= 0) break;
+        response_len += static_cast<u32>(got);
+        if (h2_status_for_stream(response, response_len, 1) != 0) break;
+    }
+    CHECK_EQ(h2_status_for_stream(response, response_len, 1), 400u);
+    usleep(100000);
+    CHECK_EQ(backend.accepted_count.load(std::memory_order_acquire), 0u);
+    CHECK_EQ(backend.request_count.load(std::memory_order_acquire), 0u);
+
+    // The resumed target-transform branch must clear the H2 async slot and
+    // config epoch before sending its local 400. A second stream on the same
+    // connection is the externally visible proof of that cleanup.
+    u8 second_request[256];
+    const u32 second_len = h2_client_get(second_request,
+                                         sizeof(second_request),
+                                         3,
+                                         "/plain",
+                                         6);
+    REQUIRE(write_all_fd(guard.client_fd, second_request, second_len));
+    u8 second_response[4096];
+    u32 second_response_len = 0;
+    for (int attempt = 0;
+         attempt < 10 && second_response_len < sizeof(second_response);
+         attempt++) {
+        const i32 got = recv_timeout(guard.client_fd,
+                                      reinterpret_cast<char*>(second_response + second_response_len),
+                                      sizeof(second_response) - second_response_len,
+                                      2000);
+        if (got <= 0) break;
+        second_response_len += static_cast<u32>(got);
+        if (h2_status_for_stream(second_response, second_response_len, 3) != 0) break;
+    }
+    CHECK_EQ(h2_status_for_stream(second_response, second_response_len, 3), 200u);
+}
+#endif
 
 static bool run_strict_response_rejection_case(const char* response) {
     RecordingUpstream backend;
