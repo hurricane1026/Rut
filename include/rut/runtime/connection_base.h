@@ -519,6 +519,7 @@ struct ConnectionBase {
     u16 pending_forward_upstream_id;
     u16 pending_forward_request_policy_id;
     u16 pending_forward_response_policy_id;
+    u16 pending_forward_failure_policy_id;
     // Semantic request facts kept separate from the transport's counters:
     // buffered means the complete fixed-CL request is staged, while upload
     // complete is published only after the upstream send finishes.
@@ -526,6 +527,8 @@ struct ConnectionBase {
     bool request_upload_complete;
     // Non-zero selects the strict H1 response serializer for this request.
     u16 response_policy_id;
+    // Non-zero selects the bounded H1 failure serializer for connect failures.
+    u16 failure_policy_id;
     // Exact parsed request HTTP version (HttpVersion underlying value).
     u8 req_http_version; // HttpVersion::Http10/Http11, 255 when unknown.
     // Request-side keep-alive intent of the CURRENT request, as parsed from its
@@ -792,9 +795,11 @@ struct ConnectionBase {
         pending_forward_upstream_id = 0;
         pending_forward_request_policy_id = 0;
         pending_forward_response_policy_id = 0;
+        pending_forward_failure_policy_id = 0;
         request_body_fully_buffered = false;
         request_upload_complete = false;
         response_policy_id = 0;
+        failure_policy_id = 0;
         req_http_version = 255;
         req_keep_alive = false;
         req_client_keep_alive = false;

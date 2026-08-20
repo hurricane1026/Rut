@@ -505,6 +505,8 @@ template <typename Loop>
 inline void reject_request_policy(Loop* loop, Connection& conn);
 template <typename Loop>
 inline void reject_response_policy(Loop* loop, Connection& conn);
+template <typename Loop>
+inline void respond_upstream_connect_failure(Loop* loop, Connection& conn);
 void prepare_early_response_state(Connection& conn);
 u32 consume_upstream_sent(Connection& conn);
 
@@ -1059,9 +1061,11 @@ void on_header_received(void* lp, Connection& conn, IoEvent ev) {
     conn.pending_forward_upstream_id = 0;
     conn.pending_forward_request_policy_id = 0;
     conn.pending_forward_response_policy_id = 0;
+    conn.pending_forward_failure_policy_id = 0;
     conn.request_body_fully_buffered = false;
     conn.request_upload_complete = false;
     conn.response_policy_id = 0;
+    conn.failure_policy_id = 0;
     conn.resp_header_mutation_pending_count = 0;
     conn.resp_header_mutation_pending_overflow = false;
     conn.resp_header_mutation_count = 0;
@@ -1425,10 +1429,12 @@ void on_request_policy_body_recvd(void* lp, Connection& conn, IoEvent ev) {
     outcome.upstream_id = conn.pending_forward_upstream_id;
     outcome.request_policy_id = conn.pending_forward_request_policy_id;
     outcome.response_policy_id = conn.pending_forward_response_policy_id;
+    outcome.failure_policy_id = conn.pending_forward_failure_policy_id;
     conn.request_policy_body_pending = false;
     conn.pending_forward_upstream_id = 0;
     conn.pending_forward_request_policy_id = 0;
     conn.pending_forward_response_policy_id = 0;
+    conn.pending_forward_failure_policy_id = 0;
     // No handler is re-entered: the Forward outcome and pinned request config
     // are sufficient for the normal dispatch path to validate/rebuild once.
     handle_jit_outcome<Loop>(loop, conn, outcome, nullptr, conn.keep_alive);
@@ -2166,15 +2172,18 @@ void handle_jit_outcome(Loop* loop,
                 client_send(loop, conn, conn.send_buf.data(), conn.send_buf.len());
                 return;
             }
-            // Failure-policy serialization is intentionally not part of this
-            // foundation slice. A bundle must therefore be rejected before
-            // request materialisation, slot acquisition, socket creation, or
-            // connect; never silently execute the success-only forward path.
+            u16 forward_response_policy_id = outcome.response_policy_id;
+            u16 forward_failure_policy_id = outcome.failure_policy_id;
             if (outcome.policy_bundle_id != 0) {
                 if (!config->policy_bundle_id_is_valid(outcome.policy_bundle_id)) {
                     reject_response_policy(loop, conn);
                     return;
                 }
+                const auto& bundle = config->policy_bundles[outcome.policy_bundle_id - 1];
+                forward_response_policy_id = bundle.response_policy_id;
+                forward_failure_policy_id = bundle.failure_policy_id;
+            } else if (forward_failure_policy_id != 0 &&
+                       !config->failure_policy_id_is_valid(forward_failure_policy_id)) {
                 reject_response_policy(loop, conn);
                 return;
             }
@@ -2212,7 +2221,8 @@ void handle_jit_outcome(Loop* loop,
                     conn.request_policy_body_pending = true;
                     conn.pending_forward_upstream_id = outcome.upstream_id;
                     conn.pending_forward_request_policy_id = outcome.request_policy_id;
-                    conn.pending_forward_response_policy_id = outcome.response_policy_id;
+                    conn.pending_forward_response_policy_id = forward_response_policy_id;
+                    conn.pending_forward_failure_policy_id = forward_failure_policy_id;
                     conn.request_policy_id = outcome.request_policy_id;
                     conn.transition_to_reading_body(&on_request_policy_body_recvd<Loop>);
                     if (!loop->submit_recv(conn)) loop->close_conn(conn);
@@ -2228,17 +2238,22 @@ void handle_jit_outcome(Loop* loop,
             // Response-policy metadata is carried independently from the request
             // policy. The strict serializer owns the response header bytes, so
             // reserve its slice before allocating a slot or connecting.
+            const bool has_failure_policy = forward_failure_policy_id != 0;
             bool response_policy_request_connection = false;
-            if (outcome.response_policy_id != 0 &&
-                config->response_policy_id_is_valid(outcome.response_policy_id)) {
+            if (forward_response_policy_id != 0 &&
+                config->response_policy_id_is_valid(forward_response_policy_id)) {
                 response_policy_request_connection =
-                    config->response_policies[outcome.response_policy_id - 1].connection ==
+                    config->response_policies[forward_response_policy_id - 1].connection ==
                     ResponsePolicyConnection::Request;
             }
-            if (outcome.response_policy_id != 0 &&
-                (!config->response_policy_id_is_valid(outcome.response_policy_id) ||
+            if ((forward_response_policy_id != 0 || has_failure_policy) &&
+                ((forward_response_policy_id != 0 &&
+                  !config->response_policy_id_is_valid(forward_response_policy_id)) ||
+                 (has_failure_policy &&
+                  !config->failure_policy_id_is_valid(forward_failure_policy_id)) ||
                  conn.req_http_version != static_cast<u8>(HttpVersion::Http11) ||
-                 (!response_policy_request_connection && !conn.req_keep_alive) ||
+                 (forward_response_policy_id != 0 &&
+                  !response_policy_request_connection && !conn.req_keep_alive) ||
                  conn.req_method == static_cast<u8>(LogHttpMethod::Head) ||
                  conn.tls_active ||
                  conn.req_path_canon.ptr == nullptr ||
@@ -2254,7 +2269,7 @@ void handle_jit_outcome(Loop* loop,
                 reject_response_policy(loop, conn);
                 return;
             }
-            if (outcome.response_policy_id != 0) {
+            if (forward_response_policy_id != 0) {
                 if (!loop->alloc_response_header_buf(conn)) {
                     conn.resp_status = kStatusBadGateway;
                     format_static_response(conn, 502, /*keep_alive=*/false);
@@ -2263,8 +2278,9 @@ void handle_jit_outcome(Loop* loop,
                     client_send(loop, conn, conn.send_buf.data(), conn.send_buf.len());
                     return;
                 }
-                conn.response_policy_id = outcome.response_policy_id;
+                conn.response_policy_id = forward_response_policy_id;
             }
+            conn.failure_policy_id = forward_failure_policy_id;
             if (conn.resp_header_mutation_count != 0 && !loop->alloc_response_header_buf(conn)) {
                 conn.resp_status = kStatusInternalServerError;
                 format_static_response(conn, 500, /*keep_alive=*/false);
@@ -2354,26 +2370,34 @@ void handle_jit_outcome(Loop* loop,
 
             const i32 kUpstreamFd = UpstreamPool::create_socket();
             if (kUpstreamFd < 0) {
-                conn.resp_status = kStatusBadGateway;
-                format_static_response(conn, 502, /*keep_alive=*/false);
-                conn.keep_alive = false;
-                conn.transition_to_sending(&on_response_sent<Loop>);
-                client_send(loop, conn, conn.send_buf.data(), conn.send_buf.len());
+                if (conn.failure_policy_id != 0) {
+                    respond_upstream_connect_failure(loop, conn);
+                } else {
+                    conn.resp_status = kStatusBadGateway;
+                    format_static_response(conn, 502, /*keep_alive=*/false);
+                    conn.keep_alive = false;
+                    conn.transition_to_sending(&on_response_sent<Loop>);
+                    client_send(loop, conn, conn.send_buf.data(), conn.send_buf.len());
+                }
                 return;
             }
             conn.upstream_fd = kUpstreamFd;
             conn.set_slots(nullptr, nullptr, nullptr, &on_upstream_connected<Loop>);
             if (!loop->submit_connect(
                     conn, &target.addrs[kBackend], sizeof(target.addrs[kBackend]))) {
-                ::close(conn.upstream_fd);
-                conn.upstream_fd = -1;
-                conn.upstream_idx = 0;
-                loop->clear_upstream_fd(conn.id);
-                conn.resp_status = kStatusBadGateway;
-                format_static_response(conn, 502, /*keep_alive=*/false);
-                conn.keep_alive = false;
-                conn.transition_to_sending(&on_response_sent<Loop>);
-                client_send(loop, conn, conn.send_buf.data(), conn.send_buf.len());
+                if (conn.failure_policy_id != 0) {
+                    respond_upstream_connect_failure(loop, conn);
+                } else {
+                    ::close(conn.upstream_fd);
+                    conn.upstream_fd = -1;
+                    conn.upstream_idx = 0;
+                    loop->clear_upstream_fd(conn.id);
+                    conn.resp_status = kStatusBadGateway;
+                    format_static_response(conn, 502, /*keep_alive=*/false);
+                    conn.keep_alive = false;
+                    conn.transition_to_sending(&on_response_sent<Loop>);
+                    client_send(loop, conn, conn.send_buf.data(), conn.send_buf.len());
+                }
                 return;
             }
             return;
@@ -3028,18 +3052,22 @@ void on_upstream_connected(void* lp, Connection& conn, IoEvent ev) {
         record_backend_result(
             conn.upstream_idx, conn.upstream_backend_idx, /*success=*/false, monotonic_us());
         if (try_connect_next_backend(loop, conn)) return;
-        static const char k502[] =
-            "HTTP/1.1 502 Bad Gateway\r\n"
-            "Content-Length: 11\r\n"
-            "Connection: close\r\n"
-            "\r\n"
-            "Bad Gateway";
-        conn.send_buf.reset();
-        conn.send_buf.write(reinterpret_cast<const u8*>(k502), sizeof(k502) - 1);
-        conn.keep_alive = false;
-        conn.resp_status = kStatusBadGateway;
-        conn.transition_to_sending(&on_response_sent<Loop>);
-        client_send(loop, conn, conn.send_buf.data(), conn.send_buf.len());
+        if (conn.failure_policy_id != 0) {
+            respond_upstream_connect_failure(loop, conn);
+        } else {
+            static const char k502[] =
+                "HTTP/1.1 502 Bad Gateway\r\n"
+                "Content-Length: 11\r\n"
+                "Connection: close\r\n"
+                "\r\n"
+                "Bad Gateway";
+            conn.send_buf.reset();
+            conn.send_buf.write(reinterpret_cast<const u8*>(k502), sizeof(k502) - 1);
+            conn.keep_alive = false;
+            conn.resp_status = kStatusBadGateway;
+            conn.transition_to_sending(&on_response_sent<Loop>);
+            client_send(loop, conn, conn.send_buf.data(), conn.send_buf.len());
+        }
         return;
     }
 
@@ -5170,6 +5198,89 @@ inline bool strict_response_upload_ready(const Connection& conn) {
            !conn.req_body_streamed &&
            conn.pipeline_stash_len == 0 && conn.retry_req_send_len == 0 &&
            conn.recv_buf.len() == 0 && !conn.upstream_reused;
+}
+
+inline u32 strict_response_dec(char* out, u32 value);
+inline u32 strict_response_date(char* out, u64 now_us);
+
+inline bool build_failure_policy_response(Connection& conn, const RouteConfig& config) {
+    if (conn.failure_policy_id == 0 ||
+        !config.failure_policy_id_is_valid(conn.failure_policy_id))
+        return false;
+    const auto& policy = config.failure_policies[conn.failure_policy_id - 1];
+    conn.send_buf.reset();
+    auto put = [&](const u8* data, u32 len) {
+        return conn.send_buf.write(data, len) == len;
+    };
+    auto put_lit = [&](const char* text) {
+        return put(reinterpret_cast<const u8*>(text), static_cast<u32>(__builtin_strlen(text)));
+    };
+    char status[3] = {static_cast<char>('0' + policy.status_code / 100),
+                      static_cast<char>('0' + (policy.status_code / 10) % 10),
+                      static_cast<char>('0' + policy.status_code % 10)};
+    char date[32];
+    char length[10];
+    const u32 date_len = strict_response_date(date, realtime_us());
+    const u32 length_len = strict_response_dec(length, policy.body.len);
+    if (date_len == 0 || !put_lit("HTTP/1.1 ") ||
+        !put(reinterpret_cast<const u8*>(status), 3) || !put_lit(" ") ||
+        !put(reinterpret_cast<const u8*>(policy.reason.ptr), policy.reason.len) ||
+        !put_lit("\r\nServer: ") ||
+        !put(reinterpret_cast<const u8*>(policy.server.ptr), policy.server.len) ||
+        !put_lit("\r\nDate: ") || !put(reinterpret_cast<const u8*>(date), date_len) ||
+        !put_lit("\r\nContent-Type: ") ||
+        !put(reinterpret_cast<const u8*>(policy.content_type.ptr), policy.content_type.len) ||
+        !put_lit("\r\nContent-Length: ") ||
+        !put(reinterpret_cast<const u8*>(length), length_len) ||
+        !put_lit("\r\nConnection: "))
+        return false;
+    const bool keep_alive = conn.keep_alive && conn.req_client_keep_alive;
+    conn.keep_alive = keep_alive;
+    if (!put_lit(keep_alive ? "keep-alive\r\n\r\n" : "close\r\n\r\n") ||
+        !put(reinterpret_cast<const u8*>(policy.body.ptr), policy.body.len))
+        return false;
+    return true;
+}
+
+template <typename Loop>
+inline void respond_upstream_connect_failure(Loop* loop, Connection& conn) {
+    conn.upstream_abandoned = true;
+    conn.upstream_keep_alive = false;
+    conn.upstream_start_us = 0;
+    conn.set_slots(nullptr, nullptr, nullptr, nullptr);
+    if constexpr (requires { loop->discard_upstream_send(conn); }) {
+        loop->discard_upstream_send(conn);
+    }
+    if (conn.upstream_fd >= 0) {
+        ::close(conn.upstream_fd);
+        conn.upstream_fd = -1;
+        loop->clear_upstream_fd(conn.id);
+    }
+    conn.upstream_recv_armed = false;
+    conn.upstream_send_armed = false;
+    release_upstream_slot(loop, conn);
+
+    bool serialized = false;
+    if (conn.failure_policy_id != 0 && conn.request_config != nullptr)
+        serialized = build_failure_policy_response(conn, *conn.request_config);
+    if (!serialized) {
+        static constexpr char k502[] =
+            "HTTP/1.1 502 Bad Gateway\r\n"
+            "Content-Length: 11\r\n"
+            "Connection: close\r\n"
+            "\r\n"
+            "Bad Gateway";
+        conn.send_buf.reset();
+        if (conn.send_buf.write(reinterpret_cast<const u8*>(k502), sizeof(k502) - 1) !=
+            sizeof(k502) - 1) {
+            loop->close_conn(conn);
+            return;
+        }
+        conn.keep_alive = false;
+    }
+    conn.resp_status = kStatusBadGateway;
+    conn.transition_to_sending(&on_response_sent<Loop>);
+    client_send(loop, conn, conn.send_buf.data(), conn.send_buf.len());
 }
 
 inline bool strict_response_forbidden(Str name) {

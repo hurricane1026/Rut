@@ -45,6 +45,9 @@ struct JitDispatchOutcome {
     u16 response_policy_id = 0;
     // 1-based RouteConfig::policy_bundles index for ForwardBundle outcomes.
     u16 policy_bundle_id = 0;
+    // Resolved failure-policy id retained across the fixed-body wait. This is
+    // runtime metadata, not an additional legacy HandlerResult ABI slot.
+    u16 failure_policy_id = 0;
     u16 next_state = 0;
     jit::YieldKind yield_kind = jit::YieldKind::Timer;
     u32 timer_ms = 0;  // raw ms payload; callers pick their own precision

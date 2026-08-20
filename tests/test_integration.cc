@@ -9052,6 +9052,22 @@ static u64 forward_failure_bundle_handler(void* /*conn*/,
     return rut::jit::HandlerResult::make_forward_with_bundle(0, 0, 1).pack();
 }
 
+static u64 forward_failure_bundle_two_handler(void* /*conn*/,
+                                              rut::jit::HandlerCtx* /*ctx*/,
+                                              const u8* /*req*/,
+                                              u32 /*len*/,
+                                              void* /*arena*/) {
+    return rut::jit::HandlerResult::make_forward_with_bundle(0, 0, 2).pack();
+}
+
+static u64 forward_request_failure_bundle_handler(void* /*conn*/,
+                                                  rut::jit::HandlerCtx* /*ctx*/,
+                                                  const u8* /*req*/,
+                                                  u32 /*len*/,
+                                                  void* /*arena*/) {
+    return rut::jit::HandlerResult::make_forward_with_bundle(0, 1, 1).pack();
+}
+
 static u64 forward_invalid_bundle_handler(void* /*conn*/,
                                           rut::jit::HandlerCtx* /*ctx*/,
                                           const u8* /*req*/,
@@ -16777,7 +16793,7 @@ TEST(route, response_policy_rejects_before_upstream_accept) {
     }
 }
 
-TEST(route, failure_policy_bundle_rejects_before_upstream_side_effects_and_owns_bytes) {
+TEST(route, failure_policy_bundle_invalid_id_rejects_before_upstream_side_effects_and_owns_bytes) {
     RecordingUpstream backend;
     REQUIRE(backend.setup());
     RouteConfig cfg{};
@@ -16808,25 +16824,10 @@ TEST(route, failure_policy_bundle_rejects_before_upstream_side_effects_and_owns_
     CHECK(static_cast<u8>(cfg.failure_policies[0].body.ptr[1]) == 0);
     CHECK(cfg.failure_policies[0].body.ptr[2] == '\n');
     CHECK(cfg.failure_policies[0].body.ptr[3] == 'x');
-    REQUIRE(cfg.add_jit_handler("/api", 'G', &forward_failure_bundle_handler));
     REQUIRE(cfg.add_jit_handler("/bad", 'G', &forward_invalid_bundle_handler));
     const RouteConfig* active = &cfg;
     ScopedProxyLoop proxy;
     REQUIRE(proxy.setup(&active, 1000));
-    i32 client = connect_to(proxy.port);
-    REQUIRE_GE(client, 0);
-    set_socket_timeouts(client, 2);
-    static constexpr char kRequest[] = "GET /api HTTP/1.1\r\nHost: client.example\r\n\r\n";
-    REQUIRE(send_all(client, kRequest, sizeof(kRequest) - 1));
-    char response[512];
-    const i32 response_len = recv_timeout(client, response, sizeof(response), 2000);
-    close(client);
-    CHECK_GT(response_len, 0);
-    CHECK(buf_contains(response, static_cast<u32>(response_len), "400", 3));
-    usleep(100000);
-    CHECK_EQ(backend.accepted_count.load(std::memory_order_acquire), 0u);
-    CHECK_EQ(backend.request_count.load(std::memory_order_acquire), 0u);
-
     // Direct-RIR callers can return an out-of-range bundle id.  The runtime
     // must reject it before selecting a backend or opening an upstream fd.
     i32 invalid_client = connect_to(proxy.port);
@@ -16847,6 +16848,162 @@ TEST(route, failure_policy_bundle_rejects_before_upstream_side_effects_and_owns_
     usleep(100000);
     CHECK_EQ(backend.accepted_count.load(std::memory_order_acquire), 0u);
     CHECK_EQ(backend.request_count.load(std::memory_order_acquire), 0u);
+
+    // A valid bundle on an unsupported HEAD domain is also rejected before
+    // opening the backend; only the bounded non-HEAD H1 domain is admitted.
+    REQUIRE(cfg.add_jit_handler("/head", 'H', &forward_failure_bundle_handler));
+    i32 head_client = connect_to(proxy.port);
+    REQUIRE_GE(head_client, 0);
+    set_socket_timeouts(head_client, 2);
+    static constexpr char kHeadRequest[] =
+        "HEAD /head HTTP/1.1\r\nHost: client.example\r\n\r\n";
+    REQUIRE(send_all(head_client, kHeadRequest, sizeof(kHeadRequest) - 1));
+    char head_response[512];
+    const i32 head_response_len =
+        recv_timeout(head_client, head_response, sizeof(head_response), 2000);
+    close(head_client);
+    CHECK_GT(head_response_len, 0);
+    CHECK(buf_contains(head_response,
+                       static_cast<u32>(head_response_len),
+                       "400",
+                       static_cast<u32>(strlen("400"))));
+    usleep(100000);
+    CHECK_EQ(backend.accepted_count.load(std::memory_order_acquire), 0u);
+    CHECK_EQ(backend.request_count.load(std::memory_order_acquire), 0u);
+}
+
+TEST(route, failure_policy_connect_error_serializes_binary_body_and_releases_slot) {
+    RouteConfig cfg{};
+    REQUIRE(cfg.add_upstream("backend", 0x7F000001, 9999).has_value());
+    cfg.upstreams[0].max_inflight = 1;
+    auto failure = test_failure_policy_spec();
+    const char body[] = {'u', '\0', '\n', 'x'};
+    failure.body = {body, sizeof(body)};
+    REQUIRE_EQ(cfg.add_failure_policy(failure), 1u);
+    REQUIRE_EQ(cfg.add_policy_bundle(0, 1), 1u);
+    REQUIRE_EQ(cfg.add_response_policy(test_response_policy_spec()), 1u);
+    REQUIRE_EQ(cfg.add_policy_bundle(1, 1), 2u);
+    REQUIRE(cfg.add_jit_handler("/api", 'G', &forward_failure_bundle_two_handler));
+    const RouteConfig* active = &cfg;
+    ScopedProxyLoop proxy;
+    REQUIRE(proxy.setup(&active, 1000));
+    i32 client = connect_to(proxy.port);
+    REQUIRE_GE(client, 0);
+    set_socket_timeouts(client, 2);
+
+    auto read_response = [&](char* out, u32 cap) -> i32 {
+        u32 total = 0;
+        u32 body_start = 0;
+        while (total < cap) {
+            const i32 n = recv_timeout(client,
+                                       out + total,
+                                       cap - total,
+                                       2000);
+            if (n <= 0) return n;
+            total += static_cast<u32>(n);
+            if (body_start == 0) {
+                for (u32 i = 0; i + 3 < total; i++) {
+                    if (out[i] == '\r' && out[i + 1] == '\n' && out[i + 2] == '\r' &&
+                        out[i + 3] == '\n') {
+                        body_start = i + 4;
+                        break;
+                    }
+                }
+            }
+            if (body_start != 0 && total >= body_start + sizeof(body)) return static_cast<i32>(total);
+        }
+        return static_cast<i32>(total);
+    };
+
+    static constexpr char kRequest[] = "GET /api HTTP/1.1\r\nHost: client.example\r\n\r\n";
+    REQUIRE(send_all(client, kRequest, sizeof(kRequest) - 1));
+    char response[1024];
+    i32 response_len = read_response(response, sizeof(response));
+    REQUIRE_GT(response_len, 0);
+    const u32 response_size = static_cast<u32>(response_len);
+    CHECK(buf_contains(response, response_size, "HTTP/1.1 502 Bad Gateway\r\n", 26));
+    CHECK(buf_contains(response, response_size, "Server: rut\r\n", 13));
+    CHECK(buf_contains(response, response_size, "Content-Type: text/plain\r\n", 26));
+    CHECK(buf_contains(response, response_size, "Content-Length: 4\r\n", 19));
+    CHECK(buf_contains(response, response_size, "Connection: keep-alive\r\n", 24));
+    const char* body_ptr = nullptr;
+    for (u32 i = 0; i + 3 < response_size; i++) {
+        if (response[i] == '\r' && response[i + 1] == '\n' && response[i + 2] == '\r' &&
+            response[i + 3] == '\n') {
+            body_ptr = response + i + 4;
+            CHECK_EQ(response_size - (i + 4), sizeof(body));
+            break;
+        }
+    }
+    REQUIRE(body_ptr != nullptr);
+    CHECK(memcmp(body_ptr, body, sizeof(body)) == 0);
+
+    // A second request proves the failure response honored request-derived
+    // keep-alive and that the held upstream slot was released.
+    REQUIRE(send_all(client, kRequest, sizeof(kRequest) - 1));
+    response_len = read_response(response, sizeof(response));
+    CHECK_GT(response_len, 0);
+    CHECK(buf_contains(response, static_cast<u32>(response_len), "HTTP/1.1 502", 12));
+    close(client);
+}
+
+TEST(route, failure_policy_close_intent_emits_close_and_eof) {
+    RouteConfig cfg{};
+    REQUIRE(cfg.add_upstream("backend", 0x7F000001, 9999).has_value());
+    auto failure = test_failure_policy_spec();
+    failure.body = {"x", 1};
+    REQUIRE_EQ(cfg.add_failure_policy(failure), 1u);
+    REQUIRE_EQ(cfg.add_policy_bundle(0, 1), 1u);
+    REQUIRE(cfg.add_jit_handler("/api", 'G', &forward_failure_bundle_handler));
+    const RouteConfig* active = &cfg;
+    ScopedProxyLoop proxy;
+    REQUIRE(proxy.setup(&active, 1000));
+    i32 client = connect_to(proxy.port);
+    REQUIRE_GE(client, 0);
+    set_socket_timeouts(client, 2);
+    static constexpr char kRequest[] =
+        "GET /api HTTP/1.1\r\nHost: client.example\r\nConnection: close\r\n\r\n";
+    REQUIRE(send_all(client, kRequest, sizeof(kRequest) - 1));
+    char response[1024];
+    const i32 response_len = recv_timeout(client, response, sizeof(response), 2000);
+    REQUIRE_GT(response_len, 0);
+    CHECK(buf_contains(response,
+                       static_cast<u32>(response_len),
+                       "Connection: close\r\n",
+                       19));
+    const i32 eof = recv_timeout(client, response, sizeof(response), 2000);
+    CHECK_EQ(eof, 0);
+    close(client);
+}
+
+TEST(route, failure_policy_body_waits_for_complete_request_before_connect_error) {
+    RouteConfig cfg{};
+    REQUIRE(cfg.add_upstream("backend", 0x7F000001, 9999).has_value());
+    auto failure = test_failure_policy_spec();
+    failure.body = {"body", 4};
+    REQUIRE_EQ(cfg.add_failure_policy(failure), 1u);
+    REQUIRE_EQ(cfg.add_policy_bundle(0, 1), 1u);
+    REQUIRE(cfg.add_jit_handler("/api", 0, &forward_request_failure_bundle_handler));
+    const RouteConfig* active = &cfg;
+    ScopedProxyLoop proxy;
+    REQUIRE(proxy.setup(&active, 1000));
+    i32 client = connect_to(proxy.port);
+    REQUIRE_GE(client, 0);
+    set_socket_timeouts(client, 2);
+    static constexpr char kHeaders[] =
+        "POST /api HTTP/1.1\r\nHost: client.example\r\nContent-Length: 3\r\n\r\n";
+    REQUIRE(send_all(client, kHeaders, sizeof(kHeaders) - 1));
+    char response[1024];
+    const i32 before_body = recv_timeout(client, response, sizeof(response), 100);
+    CHECK(before_body < 0);
+    REQUIRE(send_all(client, "abc", 3));
+    const i32 response_len = recv_timeout(client, response, sizeof(response), 2000);
+    REQUIRE_GT(response_len, 0);
+    CHECK(buf_contains(response,
+                       static_cast<u32>(response_len),
+                       "HTTP/1.1 502 Bad Gateway\r\n",
+                       26));
+    close(client);
 }
 
 TEST(route, response_policy_rejects_tls_admission_before_upstream_accept) {
