@@ -17,8 +17,8 @@ Allowed states are `SUPPORTED`, `PARTIAL`, `BLOCKED_BY_RUT`,
 | preserve raw request-target and query | implicit | yes | partial: origin-form forward sends original bytes | pinned query differential; broader normalization untested | PARTIAL |
 | preserve request method and body | implicit | yes | partial: fixed-CL body is staged before connect within one 16 KiB composite slice | RUT exact binary/segmented/boundary tests and pinned generated-RUT binary POST differential | PARTIAL |
 | nginx default upstream HTTP version and request headers | implicit | yes | partial: explicit fixed HTTP/1.1 policy with bounded fixed-CL buffering; #252 | exact RUT tests plus pinned generated-RUT GET and POST differentials | PARTIAL |
-| proxied response status and body | implicit | yes | partial: strict final H1.1 exact-Content-Length streaming | exact RUT tests plus pinned generated-RUT GET and POST differentials | PARTIAL |
-| nginx default proxied response header policy | implicit | yes | partial: bounded strict H1.1 final-response/content-length serializer; consumes one upstream `Connection`; downstream connection follows request; #253 | exact RUT/token tests plus pinned generated-RUT GET, POST, and close differentials | PARTIAL |
+| proxied response status and body | implicit | yes | partial: strict final H1.1 exact-Content-Length streaming; policy-bearing HEAD currently rejected | exact RUT tests plus pinned generated-RUT GET/POST differentials and nginx-only HEAD baseline | PARTIAL |
+| nginx default proxied response header policy | implicit | yes | partial: bounded strict H1.1 final-response/content-length serializer; consumes one upstream `Connection`; downstream connection follows request; #253 | exact RUT/token tests, pinned generated-RUT GET/POST/close differentials, and nginx-only HEAD baseline | PARTIAL |
 | single unavailable upstream gateway error | implicit | yes | yes for bounded H1 single-IPv4 connect failures; #256 | committed pinned close/EOF differential plus pinned keep-alive and split-POST evidence | SUPPORTED |
 | exact, `^~`, regex, or nested locations | no | no | no nginx selection semantics | no | NOT_PLANNED |
 | exact `/api/` + proxy URI `/`, clean bounded H1 request domain | yes | yes | yes: bounded prefix replacement; #259 closed | pinned converter-generated `/api/`, `/api/x`, and query differentials; four out-of-domain targets fail before upstream | SUPPORTED |
@@ -50,6 +50,10 @@ Allowed states are `SUPPORTED`, `PARTIAL`, `BLOCKED_BY_RUT`,
 - nginx proxy request defaults are version-dependent beginning at 1.29.7.
 - Default request and response hop-by-hop/header behavior is not transparent
   byte forwarding.
+- Pinned nginx 1.29.7 forwards an explicit-close HEAD upstream as HEAD and
+  retains an upstream `Content-Length: 5` in the downstream headers while
+  emitting no body bytes and closing the client. Policy-bearing RUT Forward
+  currently rejects HEAD before upstream connect; #253 tracks the general gap.
 - The first request-policy slice rejects body/framing inputs (including
   `Content-Length` and every `Transfer-Encoding` value), HTTP/2, and
   non-origin-form targets before upstream connect. These are intentional
