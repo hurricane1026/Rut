@@ -13,6 +13,9 @@ struct Listen {
 struct ProxyPass {
     u8 address[4]{};
     u16 port = 0;
+    bool has_uri = false;
+    Str uri{};
+    Span uri_span{};
     Span span{};
 };
 

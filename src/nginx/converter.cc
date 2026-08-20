@@ -80,12 +80,31 @@ FrontendResult<RutSource> lower_to_rut(const Server& server) {
     if (server.listen.port == 0)
         return invalid_integer(server.listen.span,
                                lit_str("invalid model listen port"));
-    if (server.location.path.ptr == nullptr || !eq(server.location.path, "/", 1))
+    const bool is_root = server.location.path.ptr != nullptr &&
+                         eq(server.location.path, "/", 1);
+    const bool is_api = server.location.path.ptr != nullptr &&
+                        eq(server.location.path, "/api/", 5);
+    if (!is_root && !is_api)
         return unsupported(server.location.path_span,
-                           lit_str("converter requires location /"));
-    if (server.location.proxy_pass.port == 0)
+                           lit_str("converter requires location / or /api/"));
+    const ProxyPass& proxy = server.location.proxy_pass;
+    if (proxy.port == 0)
         return invalid_integer(server.location.proxy_pass.span,
                                lit_str("invalid model upstream port"));
+    if (proxy.has_uri) {
+        if (proxy.uri.ptr == nullptr || proxy.uri.len != 1 || proxy.uri.ptr[0] != '/')
+            return unsupported(proxy.uri_span,
+                               lit_str("converter requires proxy_pass URI /"));
+        if (!is_api)
+            return unsupported(proxy.uri_span,
+                               lit_str("location / cannot use a proxy_pass URI"));
+    } else {
+        if (proxy.uri.ptr != nullptr || proxy.uri.len != 0)
+            return unsupported(proxy.span, lit_str("invalid proxy_pass URI state"));
+        if (!is_root)
+            return unsupported(server.location.path_span,
+                               lit_str("location /api/ requires proxy_pass URI /"));
+    }
 
     RutSource output{};
     Writer writer(output);
@@ -97,9 +116,13 @@ FrontendResult<RutSource> lower_to_rut(const Server& server) {
     if (!put("listen :") || !writer.put_u16(server.listen.port) || !put("\n") ||
         !put("upstream nginx_upstream at \"") ||
         !writer.put_ipv4(server.location.proxy_pass.address) || !put(":") ||
-        !writer.put_u16(server.location.proxy_pass.port) || !put("\"\n") ||
-        !put("route \"/\" {\n") ||
-        !put("    return forward(nginx_upstream, request_policy: {\n") ||
+        !writer.put_u16(proxy.port) || !put("\"\n") ||
+        (is_root ? !put("route \"/\" {\n") : !put("route \"/api\" {\n")) ||
+        (is_root ? !put("    return forward(nginx_upstream, request_policy: {\n")
+                : !put("    return forward(nginx_upstream, target_transform: {\n"
+                       "        strip_prefix: \"/api/\",\n"
+                       "        replace_prefix: \"/\"\n"
+                       "    }, request_policy: {\n")) ||
         !put("        version: \"HTTP/1.1\",\n") ||
         !put("        host: \"upstream\",\n") ||
         !put("        connection: \"omit\",\n") ||

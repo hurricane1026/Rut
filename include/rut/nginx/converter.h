@@ -10,7 +10,7 @@ namespace rut::nginx {
 // parsed nginx source is released and makes overflow a diagnostic rather than
 // a truncated program.
 struct RutSource {
-    static constexpr u32 kCapacity = 1024;
+    static constexpr u32 kCapacity = 1280;
     char data[kCapacity]{};
     u32 len = 0;
 

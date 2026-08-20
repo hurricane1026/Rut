@@ -5,6 +5,7 @@
 #include "rut/compiler/parser.h"
 #include "rut/nginx/converter.h"
 #include "rut/nginx/parser.h"
+#include "rut/compiler/verifier.h"
 #include "rut/runtime/listener.h"
 #include "test.h"
 
@@ -77,7 +78,79 @@ TEST(nginx_parser, parses_minimal_server_and_spans) {
     CHECK_EQ(result.value().location.proxy_pass.address[0], 127);
     CHECK_EQ(result.value().location.proxy_pass.address[3], 1);
     CHECK_EQ(result.value().location.proxy_pass.port, 9000);
+    CHECK_FALSE(result.value().location.proxy_pass.has_uri);
+    CHECK_EQ(result.value().location.proxy_pass.uri.len, 0u);
     CHECK_EQ(result.value().location.proxy_pass.span.line, 4);
+}
+
+TEST(nginx_parser, parses_api_location_and_proxy_uri_with_spans) {
+    const char source[] =
+        "server {\n"
+        "  listen 8080;\n"
+        "  location /api/ {\n"
+        "    proxy_pass http://127.0.0.1:9000/;\n"
+        "  }\n"
+        "}\n";
+    const auto result = nginx::parse({source, sizeof(source) - 1});
+    REQUIRE(result);
+    const auto& location = result.value().location;
+    CHECK(location.path.eq(lit_str("/api/")));
+    CHECK_EQ(location.path_span.line, 3u);
+    CHECK_EQ(location.proxy_pass.port, 9000u);
+    CHECK(location.proxy_pass.has_uri);
+    CHECK(location.proxy_pass.uri.eq(lit_str("/")));
+    CHECK_EQ(location.proxy_pass.uri_span.line, 4u);
+    CHECK_EQ(location.proxy_pass.uri_span.start + 1, location.proxy_pass.uri_span.end);
+    CHECK_LT(location.proxy_pass.uri_span.end, location.proxy_pass.span.end);
+}
+
+TEST(nginx_parser, rejects_unmatched_location_and_proxy_uri_shapes) {
+    const char root_with_uri[] =
+        "server { listen 8080; location / { proxy_pass http://127.0.0.1:1/; } }";
+    CHECK(is_error(nginx::parse({root_with_uri, sizeof(root_with_uri) - 1}),
+                   FrontendError::UnsupportedSyntax, 1, 65,
+                   lit_str("location / cannot use a proxy_pass URI")));
+
+    const char api_without_uri[] =
+        "server { listen 8080; location /api/ { proxy_pass http://127.0.0.1:1; } }";
+    CHECK(is_error(nginx::parse({api_without_uri, sizeof(api_without_uri) - 1}),
+                   FrontendError::UnsupportedSyntax, 1, 32,
+                   lit_str("location /api/ requires proxy_pass URI /")));
+
+    const char api_without_trailing_slash[] =
+        "server { listen 8080; location /api { proxy_pass http://127.0.0.1:1/; } }";
+    CHECK(is_error(nginx::parse({api_without_trailing_slash,
+                                 sizeof(api_without_trailing_slash) - 1}),
+                   FrontendError::UnsupportedSyntax, 1, 32,
+                   lit_str("only location / or /api/ is supported")));
+
+    const char other_uri[] =
+        "server { listen 8080; location /api/ { proxy_pass http://127.0.0.1:1/v1; } }";
+    CHECK(is_error(nginx::parse({other_uri, sizeof(other_uri) - 1}),
+                   FrontendError::UnsupportedSyntax, 1, 51,
+                   lit_str("proxy_pass URI suffixes are unsupported")));
+
+    const char variable_uri[] =
+        "server { listen 8080; location /api/ { proxy_pass http://127.0.0.1:1/$x; } }";
+    CHECK(is_error(nginx::parse({variable_uri, sizeof(variable_uri) - 1}),
+                   FrontendError::UnsupportedSyntax, 1, 51,
+                   lit_str("variables are unsupported")));
+
+    const char query_uri[] =
+        "server { listen 8080; location /api/ { proxy_pass http://127.0.0.1:1/?x; } }";
+    CHECK(is_error(nginx::parse({query_uri, sizeof(query_uri) - 1}),
+                   FrontendError::UnsupportedSyntax, 1, 51,
+                   lit_str("proxy_pass URI suffixes are unsupported")));
+
+    const char fragment_uri[] =
+        "server { listen 8080; location /api/ { proxy_pass http://127.0.0.1:1/#x; } }";
+    const auto fragment_result = nginx::parse({fragment_uri, sizeof(fragment_uri) - 1});
+    CHECK_FALSE(fragment_result);
+    if (!fragment_result) {
+        CHECK_EQ(fragment_result.error().code, FrontendError::UnexpectedEof);
+        CHECK_EQ(fragment_result.error().span.line, 1u);
+        CHECK(fragment_result.error().detail.eq(lit_str("expected ';' after proxy_pass")));
+    }
 }
 
 TEST(nginx_parser, accepts_comments_whitespace_and_boundaries) {
@@ -183,7 +256,7 @@ TEST(nginx_parser, rejects_out_of_scope_contexts_and_values) {
         "server { listen 8080; location /api { proxy_pass http://127.0.0.1:1; } }";
     CHECK(is_error(nginx::parse({bad_path, sizeof(bad_path) - 1}),
                    FrontendError::UnsupportedSyntax, 1, 32,
-                   lit_str("only location / is supported")));
+                   lit_str("only location / or /api/ is supported")));
 
     const char dns[] =
         "server { listen 8080; location / { proxy_pass http://backend:1; } }";
@@ -285,6 +358,17 @@ static nginx::Server canonical_server() {
     return server;
 }
 
+static nginx::Server api_server() {
+    nginx::Server server = canonical_server();
+    server.location.path = lit_str("/api/");
+    server.location.path_span = Span{22, 27, 1, 23};
+    static constexpr char kProxyUri[] = "/";
+    server.location.proxy_pass.has_uri = true;
+    server.location.proxy_pass.uri = {kProxyUri, 1};
+    server.location.proxy_pass.uri_span = Span{53, 54, 1, 54};
+    return server;
+}
+
 TEST(nginx_converter, lowers_canonical_model_to_stable_rut_source) {
     const auto result = nginx::lower_to_rut(canonical_server());
     REQUIRE(result);
@@ -316,6 +400,45 @@ TEST(nginx_converter, lowers_canonical_model_to_stable_rut_source) {
         "    })\n"
         "}\n";
     CHECK_EQ(result.value().len, static_cast<u32>(sizeof(kExpected) - 1));
+    CHECK(result.value().view().eq({kExpected, sizeof(kExpected) - 1}));
+}
+
+TEST(nginx_converter, lowers_api_model_to_stable_target_transform_source) {
+    const auto result = nginx::lower_to_rut(api_server());
+    REQUIRE(result);
+    static constexpr char kExpected[] =
+        "listen :8080\n"
+        "upstream nginx_upstream at \"127.0.0.1:9000\"\n"
+        "route \"/api\" {\n"
+        "    return forward(nginx_upstream, target_transform: {\n"
+        "        strip_prefix: \"/api/\",\n"
+        "        replace_prefix: \"/\"\n"
+        "    }, request_policy: {\n"
+        "        version: \"HTTP/1.1\",\n"
+        "        host: \"upstream\",\n"
+        "        connection: \"omit\",\n"
+        "        strip_headers: [\"Connection\", \"Keep-Alive\", \"TE\", \"Expect\", \"Upgrade\"]\n"
+        "    }, response_policy: {\n"
+        "        version: \"HTTP/1.1\",\n"
+        "        framing: \"content_length\",\n"
+        "        connection: \"request\",\n"
+        "        server: \"nginx/1.29.7\",\n"
+        "        date: \"current\",\n"
+        "        hide_headers: [\"Date\", \"Server\", \"X-Pad\"]\n"
+        "    }, failure_policy: {\n"
+        "        version: \"HTTP/1.1\",\n"
+        "        status: 502,\n"
+        "        reason: \"Bad Gateway\",\n"
+        "        content_type: \"text/html\",\n"
+        "        server: \"nginx/1.29.7\",\n"
+        "        date: \"current\",\n"
+        "        connection: \"request\",\n"
+        "        body: b\"<html>\\r\\n<head><title>502 Bad Gateway</title></head>\\r\\n<body>\\r\\n<center><h1>502 Bad Gateway</h1></center>\\r\\n<hr><center>nginx/1.29.7</center>\\r\\n</body>\\r\\n</html>\\r\\n\"\n"
+        "    })\n"
+        "}\n";
+    CHECK_EQ(result.value().len, static_cast<u32>(sizeof(kExpected) - 1));
+    CHECK_GT(result.value().len, 1024u);
+    CHECK_LT(result.value().len, nginx::RutSource::kCapacity);
     CHECK(result.value().view().eq({kExpected, sizeof(kExpected) - 1}));
 }
 
@@ -455,6 +578,69 @@ TEST(nginx_converter, emitted_source_reaches_rir_with_source_metadata) {
     CHECK_EQ(bundle_id, 1);
 }
 
+TEST(nginx_converter, emitted_api_source_reaches_rir_with_target_transform) {
+    auto lowered = nginx::lower_to_rut(api_server());
+    REQUIRE(lowered);
+    auto lexed = lex(lowered.value().view());
+    REQUIRE(lexed);
+    auto ast = parse_file(lexed.value());
+    REQUIRE(ast);
+    std::unique_ptr<AstFile> ast_owned(ast.value());
+    auto hir = analyze_file(*ast_owned);
+    REQUIRE(hir);
+    std::unique_ptr<HirModule> hir_owned(hir.value());
+    REQUIRE_EQ(hir_owned->routes.len, 1u);
+    const auto& hir_term = hir_owned->routes[0].control.direct_term;
+    REQUIRE(hir_term.has_forward_target_transform);
+    CHECK(hir_term.forward_target_transform.strip_prefix.eq(lit_str("/api/")));
+    CHECK(hir_term.forward_target_transform.replace_prefix.eq(lit_str("/")));
+    CHECK_EQ(hir_term.forward_request_policy_id, 1u);
+    CHECK_EQ(hir_term.forward_response_policy_id, 1u);
+    CHECK_EQ(hir_term.forward_failure_policy_id, 1u);
+
+    auto mir = build_mir(*hir_owned);
+    REQUIRE(mir);
+    std::unique_ptr<MirModule> mir_owned(mir.value());
+    CHECK(mir_owned->functions[0].path.eq(lit_str("/api")));
+    const auto& mir_term = mir_owned->functions[0].blocks[0].term;
+    CHECK(mir_term.has_forward_target_transform);
+    CHECK_EQ(mir_term.forward_request_policy_id, 1u);
+    CHECK_EQ(mir_term.forward_response_policy_id, 1u);
+    CHECK_EQ(mir_term.forward_failure_policy_id, 1u);
+
+    FrontendRirModule rir{};
+    RirGuard rir_guard{rir};
+    REQUIRE(lower_to_rir(*mir_owned, rir));
+    auto verified = rir::verify_module(rir.module);
+    REQUIRE(verified.ok);
+    REQUIRE_EQ(rir.module.target_transform_count, 1u);
+    CHECK(rir.module.target_transforms[0].strip_prefix.eq(lit_str("/api/")));
+    CHECK(rir.module.target_transforms[0].replace_prefix.eq(lit_str("/")));
+    REQUIRE_EQ(rir.module.response_policy_count, 1u);
+    REQUIRE_EQ(rir.module.failure_policy_count, 1u);
+    REQUIRE_EQ(rir.module.policy_bundle_count, 1u);
+    CHECK_EQ(rir.module.policy_bundles[0].response_policy_id, 1u);
+    CHECK_EQ(rir.module.policy_bundles[0].failure_policy_id, 1u);
+
+    const auto& block = rir.module.functions[0].blocks[0];
+    REQUIRE_EQ(block.inst_count, 6u);
+    CHECK_EQ(block.insts[0].op, rir::Opcode::ConstI32);
+    CHECK_EQ(block.insts[0].imm.i32_val, 0);
+    CHECK_EQ(block.insts[1].op, rir::Opcode::ConstI32);
+    CHECK_EQ(block.insts[1].imm.i32_val, 1);
+    CHECK_EQ(block.insts[2].op, rir::Opcode::ConstI32);
+    CHECK_EQ(block.insts[2].imm.i32_val, 1);
+    CHECK_EQ(block.insts[3].op, rir::Opcode::ConstI32);
+    CHECK_EQ(block.insts[3].imm.i32_val, 1);
+    CHECK_EQ(block.insts[4].op, rir::Opcode::ReqSetTargetTransform);
+    CHECK_EQ(block.insts[4].imm.i32_val, 1);
+    CHECK_EQ(block.insts[5].op, rir::Opcode::RetForwardBundle);
+    CHECK_EQ(block.insts[5].operand_count, 3u);
+    CHECK_EQ(block.insts[5].operands[0].id, block.insts[0].result.id);
+    CHECK_EQ(block.insts[5].operands[1].id, block.insts[1].result.id);
+    CHECK_EQ(block.insts[5].operands[2].id, block.insts[3].result.id);
+}
+
 TEST(nginx_converter, rejects_forged_invalid_models_without_output) {
     auto invalid_listen = canonical_server();
     invalid_listen.listen.port = 0;
@@ -482,6 +668,43 @@ TEST(nginx_converter, rejects_forged_invalid_models_without_output) {
     auto bad_null_path = nginx::lower_to_rut(null_path);
     CHECK(!bad_null_path);
     if (!bad_null_path) CHECK_EQ(bad_null_path.error().code, FrontendError::UnsupportedSyntax);
+
+    auto api_without_uri = api_server();
+    api_without_uri.location.proxy_pass.has_uri = false;
+    api_without_uri.location.proxy_pass.uri = {};
+    auto bad_api_without_uri = nginx::lower_to_rut(api_without_uri);
+    CHECK(!bad_api_without_uri);
+    if (!bad_api_without_uri)
+        CHECK_EQ(bad_api_without_uri.error().code, FrontendError::UnsupportedSyntax);
+
+    auto root_with_uri = canonical_server();
+    static constexpr char kSlash[] = "/";
+    root_with_uri.location.proxy_pass.has_uri = true;
+    root_with_uri.location.proxy_pass.uri = {kSlash, 1};
+    auto bad_root_with_uri = nginx::lower_to_rut(root_with_uri);
+    CHECK(!bad_root_with_uri);
+    if (!bad_root_with_uri)
+        CHECK_EQ(bad_root_with_uri.error().code, FrontendError::UnsupportedSyntax);
+
+    auto null_uri = api_server();
+    null_uri.location.proxy_pass.uri = {nullptr, 1};
+    auto bad_null_uri = nginx::lower_to_rut(null_uri);
+    CHECK(!bad_null_uri);
+    if (!bad_null_uri) CHECK_EQ(bad_null_uri.error().code, FrontendError::UnsupportedSyntax);
+
+    auto invalid_uri = api_server();
+    static constexpr char kBadUri[] = "/v1";
+    invalid_uri.location.proxy_pass.uri = {kBadUri, 3};
+    auto bad_uri = nginx::lower_to_rut(invalid_uri);
+    CHECK(!bad_uri);
+    if (!bad_uri) CHECK_EQ(bad_uri.error().code, FrontendError::UnsupportedSyntax);
+
+    auto stale_uri_view = canonical_server();
+    stale_uri_view.location.proxy_pass.uri = {kSlash, 1};
+    auto bad_stale_uri_view = nginx::lower_to_rut(stale_uri_view);
+    CHECK(!bad_stale_uri_view);
+    if (!bad_stale_uri_view)
+        CHECK_EQ(bad_stale_uri_view.error().code, FrontendError::UnsupportedSyntax);
 }
 
 int main(int argc, char** argv) { return rut::test::run_all(argc, argv); }

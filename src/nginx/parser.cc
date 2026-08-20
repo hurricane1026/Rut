@@ -202,7 +202,8 @@ private:
             eq(path.text, "~*", 2))
             return unsupported(path.span, lit_str("location modifiers are unsupported"));
         if (contains(path.text, '$')) return unsupported(path.span, lit_str("variables are unsupported"));
-        if (!eq(path.text, "/", 1)) return unsupported(path.span, lit_str("only location / is supported"));
+        if (!eq(path.text, "/", 1) && !eq(path.text, "/api/", 5))
+            return unsupported(path.span, lit_str("only location / or /api/ is supported"));
         advance();
         if (!expect(TokenKind::LBrace, lit_str("expected '{' after location path")))
             return core::make_unexpected(error_);
@@ -226,6 +227,13 @@ private:
         const Span end = cur_.span;
         advance();
         if (!have_proxy) return unsupported(end, lit_str("missing proxy_pass"));
+        const bool is_root = eq(result.path, "/", 1);
+        if (is_root && result.proxy_pass.has_uri)
+            return unsupported(result.proxy_pass.uri_span,
+                               lit_str("location / cannot use a proxy_pass URI"));
+        if (!is_root && !result.proxy_pass.has_uri)
+            return unsupported(result.path_span,
+                               lit_str("location /api/ requires proxy_pass URI /"));
         result.span = Span{start.start, end.end, start.line, start.col};
         return result;
     }
@@ -240,7 +248,7 @@ private:
         const Token url = cur_;
         if (contains(url.text, '$')) return unsupported(url.span, lit_str("variables are unsupported"));
         ProxyPass result{};
-        const UrlParseStatus url_status = parse_url(url.text, result);
+        const UrlParseStatus url_status = parse_url(url.text, url.span, result);
         if (url_status == UrlParseStatus::InvalidInteger)
             return invalid_integer(url.span, lit_str("invalid upstream IPv4 address or port"));
         if (url_status == UrlParseStatus::UriSuffix)
@@ -273,7 +281,7 @@ private:
 
     enum class UrlParseStatus : u8 { Ok, InvalidInteger, UriSuffix, Unsupported };
 
-    static UrlParseStatus parse_url(Str text, ProxyPass& out) {
+    static UrlParseStatus parse_url(Str text, Span span, ProxyPass& out) {
         constexpr Str kPrefix = lit_str("http://");
         if (text.len <= kPrefix.len || !text.slice(0, kPrefix.len).eq(kPrefix))
             return UrlParseStatus::Unsupported;
@@ -301,7 +309,12 @@ private:
         if (!parse_port(text.slice(port_start, pos), &out.port))
             return UrlParseStatus::InvalidInteger;
         if (pos == text.len) return UrlParseStatus::Ok;
-        return text.ptr[pos] == '/' ? UrlParseStatus::UriSuffix : UrlParseStatus::InvalidInteger;
+        if (text.ptr[pos] != '/') return UrlParseStatus::InvalidInteger;
+        if (pos + 1 != text.len) return UrlParseStatus::UriSuffix;
+        out.has_uri = true;
+        out.uri = text.slice(pos, text.len);
+        out.uri_span = Span{span.start + pos, span.end, span.line, span.col + pos};
+        return UrlParseStatus::Ok;
     }
 
     Lexer lexer_;
