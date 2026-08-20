@@ -9025,6 +9025,12 @@ static rut::ForwardResponsePolicySpec test_response_policy_spec() {
     return policy;
 }
 
+static rut::ForwardResponsePolicySpec test_response_policy_request_spec() {
+    auto policy = test_response_policy_spec();
+    policy.connection = rut::ResponsePolicyConnection::Request;
+    return policy;
+}
+
 // Runtime defense-in-depth vector: source analysis rejects this combination,
 // so a direct handler leaves a pending response mutation for handle_jit_outcome
 // to reject before apply_request_policy can rewrite recv_buf.
@@ -16903,6 +16909,114 @@ TEST(route, response_policy_consumes_one_upstream_connection_header) {
         CHECK_EQ(connection_lines, 1u);
         if (test.preserve_x_hop) CHECK(buf_contains(normalized, n, "X-Hop: secret\r\n", 15));
         CHECK_EQ(backend.accepted_count.load(std::memory_order_acquire), 1u);
+        CHECK_EQ(backend.request_count.load(std::memory_order_acquire), 1u);
+    }
+}
+
+TEST(route, response_policy_request_connection_preserves_client_intent) {
+    using namespace rut;
+    auto read_response = [](i32 fd, char* out, u32 capacity) -> u32 {
+        u32 total = 0;
+        while (total < capacity) {
+            const i32 got = recv_timeout(fd, out + total, capacity - total, 2000);
+            if (got <= 0) break;
+            total += static_cast<u32>(got);
+            if (buf_contains(out, total, "\r\n\r\nok", 6)) break;
+        }
+        return total;
+    };
+    auto normalize_and_check = [&](char* response, u32 length, const char* connection) {
+        char normalized[2048]{};
+        REQUIRE_LT(length, static_cast<u32>(sizeof(normalized)));
+        memcpy(normalized, response, length);
+        char* date = strstr(normalized, "Date: ");
+        REQUIRE(date != nullptr);
+        for (u32 i = 0; i < 29 && date[6 + i] != '\r'; i++) date[6 + i] = 'X';
+        char expected[512];
+        const int expected_len = snprintf(
+            expected,
+            sizeof(expected),
+            "HTTP/1.1 200 OK\r\n"
+            "Server: nginx/1.29.7\r\n"
+            "Date: XXXXXXXXXXXXXXXXXXXXXXXXXXXXX\r\n"
+            "Content-Length: 2\r\n"
+            "Connection: %s\r\n\r\nok",
+            connection);
+        REQUIRE_GT(expected_len, 0);
+        REQUIRE_LT(expected_len, static_cast<int>(sizeof(expected)));
+        CHECK_EQ(length, static_cast<u32>(expected_len));
+        CHECK(memcmp(normalized, expected, static_cast<size_t>(expected_len)) == 0);
+    };
+
+    // Keep-alive intent must survive request-policy rewriting and permit a
+    // second request on the same downstream socket. The upstream request
+    // policy still strips the client Connection field on both requests.
+    {
+        RecordingUpstream backend;
+        REQUIRE(backend.setup());
+        RouteConfig cfg{};
+        REQUIRE(cfg.add_upstream("backend", 0x7F000001, backend.port).has_value());
+        REQUIRE_EQ(cfg.add_response_policy(test_response_policy_request_spec()), 1u);
+        REQUIRE(cfg.add_jit_handler("/api", 'G', &forward_request_and_response_policy_handler));
+        const RouteConfig* active = &cfg;
+        ScopedProxyLoop proxy;
+        REQUIRE(proxy.setup(&active, 1000));
+        i32 client = connect_to(proxy.port);
+        REQUIRE_GE(client, 0);
+        set_socket_timeouts(client, 2);
+        static constexpr char kFirst[] = "GET /api HTTP/1.1\r\nHost: client.example\r\n\r\n";
+        static constexpr char kSecond[] =
+            "GET /api HTTP/1.1\r\nHost: client.example\r\nConnection: keep-alive\r\n\r\n";
+        REQUIRE(send_all(client, kFirst, sizeof(kFirst) - 1));
+        char response[2048]{};
+        u32 response_len = read_response(client, response, sizeof(response));
+        REQUIRE_GT(response_len, 0u);
+        normalize_and_check(response, response_len, "keep-alive");
+        REQUIRE(send_all(client, kSecond, sizeof(kSecond) - 1));
+        memset(response, 0, sizeof(response));
+        response_len = read_response(client, response, sizeof(response));
+        REQUIRE_GT(response_len, 0u);
+        normalize_and_check(response, response_len, "keep-alive");
+        close(client);
+        for (u32 i = 0; i < 200 && backend.request_count.load(std::memory_order_acquire) < 2;
+             i++)
+            usleep(5000);
+        CHECK_EQ(backend.accepted_count.load(std::memory_order_acquire), 2u);
+        CHECK_EQ(backend.request_count.load(std::memory_order_acquire), 2u);
+        for (u32 i = 0; i < 2; i++) {
+            const Str request{backend.request_history[i], backend.request_history_len[i]};
+            CHECK(!buf_contains(request.ptr,
+                                request.len,
+                                "Connection:",
+                                static_cast<u32>(strlen("Connection:"))));
+        }
+    }
+
+    // A client Connection: close must be reflected downstream and close the
+    // client only after the strict response body has been sent.
+    {
+        RecordingUpstream backend;
+        REQUIRE(backend.setup());
+        RouteConfig cfg{};
+        REQUIRE(cfg.add_upstream("backend", 0x7F000001, backend.port).has_value());
+        REQUIRE_EQ(cfg.add_response_policy(test_response_policy_request_spec()), 1u);
+        REQUIRE(cfg.add_jit_handler("/api", 'G', &forward_request_and_response_policy_handler));
+        const RouteConfig* active = &cfg;
+        ScopedProxyLoop proxy;
+        REQUIRE(proxy.setup(&active, 1000));
+        i32 client = connect_to(proxy.port);
+        REQUIRE_GE(client, 0);
+        set_socket_timeouts(client, 2);
+        static constexpr char kClose[] =
+            "GET /api HTTP/1.1\r\nHost: client.example\r\nConnection: close\r\n\r\n";
+        REQUIRE(send_all(client, kClose, sizeof(kClose) - 1));
+        char response[2048]{};
+        const u32 response_len = read_response(client, response, sizeof(response));
+        REQUIRE_GT(response_len, 0u);
+        normalize_and_check(response, response_len, "close");
+        char tail[16];
+        CHECK_EQ(recv_timeout(client, tail, sizeof(tail), 2000), 0);
+        close(client);
         CHECK_EQ(backend.request_count.load(std::memory_order_acquire), 1u);
     }
 }

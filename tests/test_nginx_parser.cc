@@ -299,7 +299,7 @@ TEST(nginx_converter, lowers_canonical_model_to_stable_rut_source) {
         "    }, response_policy: {\n"
         "        version: \"HTTP/1.1\",\n"
         "        framing: \"content_length\",\n"
-        "        connection: \"keep_alive\",\n"
+        "        connection: \"request\",\n"
         "        server: \"nginx/1.29.7\",\n"
         "        date: \"current\",\n"
         "        hide_headers: [\"Date\", \"Server\", \"X-Pad\"]\n"
@@ -392,7 +392,7 @@ TEST(nginx_converter, emitted_source_reaches_rir_with_source_metadata) {
     const auto& response_policy = rir.module.response_policies[0];
     CHECK(response_policy.version == ResponsePolicyVersion::Http11);
     CHECK(response_policy.framing == ResponsePolicyFraming::ContentLength);
-    CHECK(response_policy.connection == ResponsePolicyConnection::KeepAlive);
+    CHECK(response_policy.connection == ResponsePolicyConnection::Request);
     CHECK(response_policy.date == ResponsePolicyDate::Current);
     CHECK(response_policy.server.eq(lit_str("nginx/1.29.7")));
     REQUIRE_EQ(response_policy.hide_header_count, 3u);

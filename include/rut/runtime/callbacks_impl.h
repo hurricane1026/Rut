@@ -2216,10 +2216,17 @@ void handle_jit_outcome(Loop* loop,
             // Response-policy metadata is carried independently from the request
             // policy. The strict serializer owns the response header bytes, so
             // reserve its slice before allocating a slot or connecting.
+            bool response_policy_request_connection = false;
+            if (outcome.response_policy_id != 0 &&
+                config->response_policy_id_is_valid(outcome.response_policy_id)) {
+                response_policy_request_connection =
+                    config->response_policies[outcome.response_policy_id - 1].connection ==
+                    ResponsePolicyConnection::Request;
+            }
             if (outcome.response_policy_id != 0 &&
                 (!config->response_policy_id_is_valid(outcome.response_policy_id) ||
                  conn.req_http_version != static_cast<u8>(HttpVersion::Http11) ||
-                 !conn.req_keep_alive ||
+                 (!response_policy_request_connection && !conn.req_keep_alive) ||
                  conn.req_method == static_cast<u8>(LogHttpMethod::Head) ||
                  conn.tls_active ||
                  conn.req_path_canon.ptr == nullptr ||
@@ -5256,7 +5263,14 @@ inline bool build_strict_response_headers(Connection& conn, const RouteConfig& c
     const u32 date_len = strict_response_date(date, realtime_us());
     if (date_len == 0 || !put(date, date_len) || !put_lit("\r\nContent-Length: ")) return false;
     const u32 num_len = strict_response_dec(num, resp.content_length);
-    if (!put(num, num_len) || !put_lit("\r\nConnection: keep-alive\r\n")) return false;
+    if (!put(num, num_len) || !put_lit("\r\nConnection: ")) return false;
+    const bool downstream_keep_alive =
+        policy.connection == ResponsePolicyConnection::KeepAlive ||
+        (policy.connection == ResponsePolicyConnection::Request && conn.req_client_keep_alive);
+    // Preserve the server lifecycle gate set at the request boundary: a
+    // draining connection must not be reopened by a response policy intent.
+    conn.keep_alive = conn.keep_alive && downstream_keep_alive;
+    if (!put_lit(downstream_keep_alive ? "keep-alive\r\n" : "close\r\n")) return false;
     for (u32 i = 0; i < resp.header_count; i++) {
         const Header& h = resp.headers[i];
         if (response_policy_name_eq(h.name, "connection", 10) ||

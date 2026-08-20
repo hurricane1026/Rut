@@ -26,6 +26,7 @@ enum class ResponsePolicyFraming : u8 {
 enum class ResponsePolicyConnection : u8 {
     Invalid = 0,
     KeepAlive = 1,
+    Request = 2,
 };
 
 enum class ResponsePolicyDate : u8 {
@@ -65,7 +66,8 @@ inline bool response_policy_safe_header_name(Str value) {
 inline bool response_policy_spec_valid(const ForwardResponsePolicySpec& policy) {
     if (policy.version != ResponsePolicyVersion::Http11 ||
         policy.framing != ResponsePolicyFraming::ContentLength ||
-        policy.connection != ResponsePolicyConnection::KeepAlive ||
+        (policy.connection != ResponsePolicyConnection::KeepAlive &&
+         policy.connection != ResponsePolicyConnection::Request) ||
         policy.date != ResponsePolicyDate::Current || !response_policy_safe_server(policy.server) ||
         policy.hide_header_count > kMaxResponsePolicyHideHeaders)
         return false;

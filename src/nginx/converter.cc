@@ -107,7 +107,7 @@ FrontendResult<RutSource> lower_to_rut(const Server& server) {
         !put("    }, response_policy: {\n") ||
         !put("        version: \"HTTP/1.1\",\n") ||
         !put("        framing: \"content_length\",\n") ||
-        !put("        connection: \"keep_alive\",\n") ||
+        !put("        connection: \"request\",\n") ||
         !put("        server: \"nginx/1.29.7\",\n") ||
         !put("        date: \"current\",\n") ||
         !put("        hide_headers: [\"Date\", \"Server\", \"X-Pad\"]\n") ||

@@ -1589,11 +1589,15 @@ struct Parser {
                                 seen = &have_connection;
                                 auto value = expect(TokenType::StringLit);
                                 if (!value) return core::make_unexpected(value.error());
-                                if (!value.value()->text.eq({"keep_alive", 10}))
+                                if (value.value()->text.eq({"keep_alive", 10})) {
+                                    policy.connection = ResponsePolicyConnection::KeepAlive;
+                                } else if (value.value()->text.eq({"request", 7})) {
+                                    policy.connection = ResponsePolicyConnection::Request;
+                                } else {
                                     return frontend_error(FrontendError::UnsupportedSyntax,
                                                           span_from(*value.value()),
                                                           value.value()->text);
-                                policy.connection = ResponsePolicyConnection::KeepAlive;
+                                }
                             } else if (field_name.eq({"server", 6})) {
                                 seen = &have_server;
                                 auto value = expect(TokenType::StringLit);

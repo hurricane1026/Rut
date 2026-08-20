@@ -536,6 +536,9 @@ struct ConnectionBase {
     // upstream idle-pooling on THIS, not on conn.keep_alive (which is derived from
     // drain state, not the request). Recorded by capture_request_metadata.
     bool req_keep_alive;
+    // Parsed downstream intent preserved across request-policy materialisation,
+    // which rewrites req_keep_alive for the upstream request.
+    bool req_client_keep_alive;
     bool req_wants_upgrade;          // client sent Connection: upgrade (gates 101 tunnel)
     bool req_upgrade_is_websocket;   // the request Upgrade list offered "websocket"
     bool resp_upgrade_is_websocket;  // the backend 101 selected "websocket" (gates terminate)
@@ -794,6 +797,7 @@ struct ConnectionBase {
         response_policy_id = 0;
         req_http_version = 255;
         req_keep_alive = false;
+        req_client_keep_alive = false;
         req_wants_upgrade = false;
         req_upgrade_is_websocket = false;
         resp_upgrade_is_websocket = false;
