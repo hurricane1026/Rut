@@ -41,6 +41,10 @@ Allowed states are `SUPPORTED`, `PARTIAL`, `BLOCKED_BY_RUT`,
   non-origin-form targets before upstream connect. These are intentional
   fail-closed `PARTIAL` limits; nginx absolute-form/body normalization remains
   a follow-up.
+- Pinned nginx 1.29.7 waits for a fixed-Content-Length request body to complete
+  before accepting the upstream connection under the minimal default config.
+  The planned RUT body slice must therefore stage the complete body before
+  upstream slot/connect; transparent early-connect streaming is not equivalent.
 - Valid downstream Upgrade requests are intentionally rejected before upstream
   connect in this header-only slice; nginx 1.29.7 strips and proxies Upgrade,
   so that behavior remains PARTIAL.
