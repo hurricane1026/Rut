@@ -17954,8 +17954,9 @@ static FrontendResult<HirModule*> analyze_file_internal(
         HirRoute route{};
         route.span = route_decl.span;
         route.path = route_decl.path;
-        route.method = route_method_key_from_token(route_decl.method);
-        if (route.method == 0)
+        route.method = route_decl.method_is_any ? kRouteMethodAny
+                                                : route_method_key_from_token(route_decl.method);
+        if (!route_decl.method_is_any && route.method == kRouteMethodAny)
             return frontend_error(FrontendError::UnsupportedSyntax, route_decl.span);
         route.is_timer = is_timer_item;
         if (is_timer_item) {
@@ -19355,6 +19356,16 @@ static FrontendResult<HirModule*> analyze_file_internal(
         // (and mod.routes.len counts both, so track HTTP routes separately).
         if (!route.is_timer && http_route_count >= HirModule::kMaxRoutes)
             return frontend_error(FrontendError::TooManyItems, route_decl.span);
+        if (!route.is_timer) {
+            for (u32 ri = 0; ri < mod.routes.len; ri++) {
+                const HirRoute& existing = mod.routes[ri];
+                if (!existing.is_timer && existing.method == route.method &&
+                    existing.path.eq(route.path))
+                    return frontend_error(FrontendError::UnsupportedSyntax,
+                                          route_decl.span,
+                                          lit_str("duplicate route path and method"));
+            }
+        }
         if (!route.is_timer) http_route_count++;
         if (!mod.routes.push(route))
             return frontend_error(FrontendError::TooManyItems, route_decl.span);

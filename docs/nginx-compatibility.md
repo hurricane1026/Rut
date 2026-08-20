@@ -11,7 +11,7 @@ Allowed states are `SUPPORTED`, `PARTIAL`, `BLOCKED_BY_RUT`,
 | server fragment, exactly one server | yes | no | partial: no server selection model | no | NOT_IMPLEMENTED |
 | `listen <port>` IPv4 wildcard | yes | no | no source/config listener; #250 | no | BLOCKED_BY_RUT |
 | ordinary prefix `location /` | yes | no | partial: root catch-all exists | no | NOT_IMPLEMENTED |
-| location applies to every method | yes | no | runtime yes, source no; #251 | no | BLOCKED_BY_RUT |
+| location applies to every method | yes | no | yes: method-omitted route source form; converter not yet | no | NOT_IMPLEMENTED |
 | fixed IPv4 HTTP `proxy_pass`, no URI suffix | yes | no | partial: fixed `forward` exists | no | NOT_IMPLEMENTED |
 | preserve raw request-target and query | no | no | partial: forward currently sends original bytes | RUT-only tests, no nginx diff | PARTIAL |
 | preserve request method and body | no | no | partial: proxy streaming exists | RUT-only tests, no nginx diff | PARTIAL |

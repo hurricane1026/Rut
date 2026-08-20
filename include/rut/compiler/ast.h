@@ -509,6 +509,11 @@ struct AstChainUse {
 struct AstRouteDecl {
     Span span{};
     Span body_span{};
+    // Omitted method spelling (`route "/path" { ... }`) is the explicit
+    // source representation of the runtime any-method key. Keep this
+    // separate from `method` so an uninitialized/invalid token can never
+    // accidentally become an any-method route during analysis.
+    bool method_is_any = false;
     u8 method = 0;
     Str path{};
     // A Response builder may need one declaration, 16 header mutations, and

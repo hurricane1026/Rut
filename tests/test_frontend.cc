@@ -4,6 +4,7 @@
 #include "rut/compiler/mir_build.h"
 #include "rut/compiler/parser.h"
 #include "rut/compiler/verifier.h"
+#include "rut/runtime/route_method.h"
 #include "test.h"
 #include <cstdio>
 #include <filesystem>
@@ -4545,6 +4546,71 @@ TEST(frontend, parse_upstream_at_is_contextual_not_reserved) {
     CHECK(hir->upstreams[0].has_address);
 }
 
+TEST(frontend, omitted_route_method_is_explicit_any_method_through_rir) {
+    const char* src = "route \"/\" { return 200 }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    REQUIRE_EQ(ast->items.len, 1u);
+    CHECK(ast->items[0].route.method_is_any);
+    CHECK_EQ(ast->items[0].route.method, 0u);
+
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    REQUIRE_EQ(hir->routes.len, 1u);
+    CHECK_EQ(hir->routes[0].method, kRouteMethodAny);
+
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    REQUIRE_EQ(mir->functions.len, 1u);
+    CHECK_EQ(mir->functions[0].method, kRouteMethodAny);
+
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(mir.value(), rir);
+    REQUIRE(lowered);
+    REQUIRE_EQ(rir.module.func_count, 1u);
+    CHECK_EQ(rir.module.functions[0].http_method, kRouteMethodAny);
+    rir.destroy();
+}
+
+TEST(frontend, route_any_keyword_is_rejected_with_omission_fix) {
+    const char* src = "route ANY \"/\" { return 200 }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(!ast);
+    CHECK_EQ(ast.error().code, FrontendError::UnsupportedSyntax);
+    CHECK(ast.error().detail.eq(lit("`ANY` is not a route keyword; omit the method")));
+}
+
+TEST(frontend, analyze_rejects_duplicate_route_keys_but_allows_any_plus_method) {
+    struct Case {
+        const char* src;
+        bool expect_success;
+    };
+    const Case cases[] = {
+        {"route \"/x\" { return 200 }\nroute \"/x\" { return 201 }\n", false},
+        {"route GET \"/x\" { return 200 }\nroute GET \"/x\" { return 201 }\n", false},
+        {"route \"/x\" { return 200 }\nroute GET \"/x\" { return 201 }\n", true},
+    };
+    for (const auto& tc : cases) {
+        auto lexed = lex(lit(tc.src));
+        REQUIRE(lexed);
+        auto ast = parse_file_heap(lexed.value());
+        REQUIRE(ast);
+        auto hir = analyze_file_heap(ast.value());
+        if (tc.expect_success) {
+            REQUIRE(hir);
+            REQUIRE_EQ(hir->routes.len, 2u);
+        } else {
+            REQUIRE(!hir);
+            CHECK_EQ(hir.error().code, FrontendError::UnsupportedSyntax);
+            CHECK(hir.error().detail.eq(lit("duplicate route path and method")));
+        }
+    }
+}
+
 TEST(frontend, parse_upstream_dict_rejects_unknown_field) {
     const char* src =
         "upstream api { host: \"127.0.0.1\", port: 80, weight: 3 }\n"
@@ -6198,6 +6264,15 @@ TEST(frontend, parse_route_block_single_entry_no_decorators) {
     CHECK_EQ(static_cast<u8>(ast->items[0].kind), static_cast<u8>(AstItemKind::Route));
     CHECK(ast->items[0].route.path.eq(lit("/users")));
     CHECK_EQ(ast->items[0].route.decorators.len, 0u);
+}
+
+TEST(frontend, parse_route_block_rejects_omitted_method) {
+    const char* src = "route { \"/users\" { return 200 } }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(!ast);
+    CHECK_EQ(ast.error().code, FrontendError::UnexpectedToken);
 }
 
 TEST(frontend, parse_route_block_multiple_entries) {

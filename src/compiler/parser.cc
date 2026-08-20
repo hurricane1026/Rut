@@ -3521,13 +3521,21 @@ struct Parser {
         return true;
     }
 
-    FrontendResult<AstItem> parse_route_entry(const Token& kw_route) {
+    FrontendResult<AstItem> parse_route_entry(const Token& kw_route, bool allow_any_method) {
         AstItem item{};
         item.kind = AstItemKind::Route;
         const Token* method = nullptr;
-        if (!is_method_keyword(cur().type))
-            return frontend_error(FrontendError::UnexpectedToken, span_from(cur()), cur().text);
-        method = &toks->tokens[pos++];
+        if (allow_any_method && cur().type == TokenType::StringLit) {
+            item.route.method_is_any = true;
+        } else {
+            if (cur().type == TokenType::Ident && cur().text.eq({"ANY", 3}))
+                return frontend_error(FrontendError::UnsupportedSyntax,
+                                      span_from(cur()),
+                                      lit_str("`ANY` is not a route keyword; omit the method"));
+            if (!is_method_keyword(cur().type))
+                return frontend_error(FrontendError::UnexpectedToken, span_from(cur()), cur().text);
+            method = &toks->tokens[pos++];
+        }
         auto path = expect(TokenType::StringLit);
         if (!path) return core::make_unexpected(path.error());
         while (is_use_chain_start()) {
@@ -3558,7 +3566,7 @@ struct Parser {
         item.route.span = item.span;
         item.route.body_span = Span{
             lbrace.value()->start, rbrace.value()->end, lbrace.value()->line, lbrace.value()->col};
-        item.route.method = static_cast<u8>(method->type);
+        if (method != nullptr) item.route.method = static_cast<u8>(method->type);
         item.route.path = path.value()->text;
         return item;
     }
@@ -3566,7 +3574,7 @@ struct Parser {
     FrontendResult<AstItem> parse_route() {
         auto kw = expect(TokenType::KwRoute);
         if (!kw) return core::make_unexpected(kw.error());
-        return parse_route_entry(*kw.value());
+        return parse_route_entry(*kw.value(), true);
     }
 
     // Convert a DurLit token ("5s", "100ms", "1m", "1h") to milliseconds. 0 = bad
@@ -3715,7 +3723,7 @@ struct Parser {
                 if (!entry_decorators.push(deco.value()))
                     return frontend_error(FrontendError::TooManyItems, deco->span);
             }
-            auto entry = parse_route_entry(*kw.value());
+            auto entry = parse_route_entry(*kw.value(), false);
             if (!entry) return core::make_unexpected(entry.error());
             FixedVec<AstChainUse, AstRouteDecl::kMaxChains> entry_chains = entry->route.chains;
             entry->route.chains.len = 0;

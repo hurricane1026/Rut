@@ -90,8 +90,8 @@ evidence must use a pinned nginx build and cannot treat that skip as a pass.
 
 1. Add the minimal nginx lexer/parser and semantic model, with strict rejection
    of everything outside the initial boundary. No RUT emission.
-2. Investigate and then implement the general any-method RUT route required by
-   issue #251, followed by independent review.
+2. Use the shipped method-omitted RUT route form for all-method locations;
+   listener and proxy policy dependencies still need resolution.
 3. Add capability validation and deterministic RUT lowering for the minimal
    model after listener and proxy policy dependencies are explicitly resolved;
    then add the first serialized differential smoke case.
@@ -99,7 +99,5 @@ evidence must use a pinned nginx build and cannot treat that skip as a pass.
 ## Known capability dependencies
 
 - #250: downstream listeners in RUT source/config.
-- #251: any-method source routes.
 - #252: upstream HTTP request policy for `forward`.
 - #253: proxied response header policy.
-

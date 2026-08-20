@@ -311,6 +311,21 @@ TEST(route_trie, method_specific_beats_any_slot) {
     CHECK_EQ(canon_match(t, S("/x"), 'D'), 10u);  // DELETE → any slot
 }
 
+TEST(route_trie, any_method_precedence_covers_all_runtime_methods_and_order) {
+    const Insert orders[][2] = {
+        {{"/x", kRouteMethodAny, 10}, {"/x", kRouteMethodGet, 20}},
+        {{"/x", kRouteMethodGet, 20}, {"/x", kRouteMethodAny, 10}},
+    };
+    for (const auto& items : orders) {
+        RouteTrie t;
+        REQUIRE(build_ok(t, items, 2));
+        CHECK_EQ(canon_match(t, S("/x"), kRouteMethodGet), 20u);
+        CHECK_EQ(canon_match(t, S("/x"), kRouteMethodPost), 10u);
+        CHECK_EQ(canon_match(t, S("/x"), kRouteMethodTrace), 10u);
+        CHECK_EQ(canon_match(t, S("/x"), kRouteMethodConnect), 10u);
+    }
+}
+
 TEST(route_trie, match_strips_query_and_fragment) {
     // Stripping '?' / '#' from the incoming request is match()'s job
     // (tokenize_segments stays pure). A route registered at "/api"

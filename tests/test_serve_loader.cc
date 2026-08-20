@@ -3,6 +3,7 @@
 // JIT) into a RouteConfig, plus its fail-closed error reporting.
 
 #include "rut/runtime/cache_table.h"
+#include "rut/runtime/route_method.h"
 #include "rut/serve_loader.h"
 #include "test.h"
 #if RUT_ENABLE_WEBSOCKET
@@ -45,6 +46,38 @@ TEST(serve_loader, status_routes_load) {
     REQUIRE(load_rut_program(path.c_str(), program, err));
     // Both routes registered into the config the shards will serve.
     CHECK_EQ(program.config.route_count, 2u);
+    program.destroy();
+}
+
+TEST(serve_loader, omitted_method_route_registers_any_key_and_preserves_specific_precedence) {
+    const std::string dir = "/tmp/rut_serve_loader_any_method";
+    const std::string path = write_file(dir,
+                                        "app.rut",
+                                        "route \"/\" { return 200 }\n"
+                                        "route GET \"/\" { return 201 }\n");
+
+    LoadedProgram program;
+    LoadError err;
+    REQUIRE(load_rut_program(path.c_str(), program, err));
+    REQUIRE_EQ(program.config.route_count, 2u);
+
+    const char root[] = "/";
+    const RouteEntry* get = program.config.match(
+        reinterpret_cast<const u8*>(root), 1, kRouteMethodGet);
+    const RouteEntry* post = program.config.match(
+        reinterpret_cast<const u8*>(root), 1, kRouteMethodPost);
+    const RouteEntry* trace = program.config.match(
+        reinterpret_cast<const u8*>(root), 1, kRouteMethodTrace);
+    const RouteEntry* connect = program.config.match(
+        reinterpret_cast<const u8*>(root), 1, kRouteMethodConnect);
+    REQUIRE(get != nullptr);
+    REQUIRE(post != nullptr);
+    REQUIRE(trace != nullptr);
+    REQUIRE(connect != nullptr);
+    CHECK_EQ(get->method, kRouteMethodGet);
+    CHECK_EQ(post->method, kRouteMethodAny);
+    CHECK_EQ(trace->method, kRouteMethodAny);
+    CHECK_EQ(connect->method, kRouteMethodAny);
     program.destroy();
 }
 

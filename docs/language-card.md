@@ -271,6 +271,7 @@ notify(ip) blacklist.add(ip)      // to owner shard by key hash (expr form;
 
 ```swift
 route GET "/health" { return 200 }
+route "/" { return 404 }                          // all methods (omit METHOD)
 route GET "/users/:id" {                         // capture: req.params.id
     return forward(userService)
 }
@@ -280,7 +281,9 @@ route POST "/form" { return 204 }                 // to this one route
 ```
 
 The shipped parser accepts repeated top-level `route METHOD "pattern"`
-declarations. The grouped `route { ... }` surface (middleware pattern
+declarations and the method-omitted form `route "pattern"`, which matches all
+HTTP methods. There is no `ANY` route keyword; write the omitted-method form.
+The grouped `route { ... }` surface (middleware pattern
 bindings, host/path groups, method unions, typed captures, expression entries,
 and `_` catch-all) is ⏳ target syntax and must not be emitted yet.
 
