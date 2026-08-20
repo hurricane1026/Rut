@@ -15935,6 +15935,12 @@ struct RecordingUpstream {
     std::atomic<u32> request_count{0};
     char request[8192]{};
     u32 request_len = 0;
+    u32 request_header_len = 0;
+    u32 request_body_len = 0;
+    static constexpr u32 kMaxRecordedRequests = 8;
+    char request_history[kMaxRecordedRequests][8192]{};
+    u32 request_history_len[kMaxRecordedRequests]{};
+    u32 request_history_header_len[kMaxRecordedRequests]{};
     const char* response = nullptr;
     u32 response_len = 0;
     // Optional deliberately segmented response wire vector. A non-zero size
@@ -15966,15 +15972,58 @@ struct RecordingUpstream {
             s->accepted_count.fetch_add(1, std::memory_order_release);
             char buf[8192];
             u32 total = 0;
+            u32 want = 0;
             while (total < sizeof(buf)) {
                 i32 n = recv_timeout(client, buf + total, sizeof(buf) - total, 1000);
                 if (n <= 0) break;
                 total += static_cast<u32>(n);
-                if (buf_contains(buf, total, "\r\n\r\n", 4)) break;
+                if (want == 0 && buf_contains(buf, total, "\r\n\r\n", 4)) {
+                    for (u32 k = 0; k + 3 < total; k++) {
+                        if (buf[k] == '\r' && buf[k + 1] == '\n' && buf[k + 2] == '\r' &&
+                            buf[k + 3] == '\n') {
+                            s->request_header_len = k + 4;
+                            want = s->request_header_len;
+                            for (u32 a = 0; a + 15 < s->request_header_len; a++) {
+                                bool match = true;
+                                static constexpr char kCl[] = "content-length:";
+                                for (u32 b = 0; b < 15; b++) {
+                                    char c = buf[a + b];
+                                    if (c >= 'A' && c <= 'Z') c = static_cast<char>(c + 32);
+                                    if (c != kCl[b]) {
+                                        match = false;
+                                        break;
+                                    }
+                                }
+                                if (!match) continue;
+                                u32 p = a + 15;
+                                while (p < s->request_header_len &&
+                                       (buf[p] == ' ' || buf[p] == '\t'))
+                                    p++;
+                                u32 cl = 0;
+                                while (p < s->request_header_len && buf[p] >= '0' &&
+                                       buf[p] <= '9')
+                                    cl = cl * 10u + static_cast<u32>(buf[p++] - '0');
+                                want += cl;
+                                break;
+                            }
+                            break;
+                        }
+                    }
+                }
+                if (want != 0 && total >= want) break;
             }
             if (total > sizeof(s->request)) total = sizeof(s->request);
             memcpy(s->request, buf, total);
             s->request_len = total;
+            s->request_body_len = s->request_header_len > 0 && total >= s->request_header_len
+                                      ? total - s->request_header_len
+                                      : 0;
+            const u32 history_slot = s->request_count.load(std::memory_order_relaxed);
+            if (history_slot < kMaxRecordedRequests) {
+                memcpy(s->request_history[history_slot], buf, total);
+                s->request_history_len[history_slot] = total;
+                s->request_history_header_len[history_slot] = s->request_header_len;
+            }
             s->request_count.fetch_add(1, std::memory_order_release);
             static const char kResponse[] =
                 "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok";
@@ -16218,7 +16267,6 @@ TEST(route, forward_request_policy_rebuilds_nginx_h11_headers) {
     const RejectedVector rejected[] = {
         {"GET /api HTTP/1.1\r\nHost: client.example\r\ntRaNsFeR-EnCoDiNg: identity\r\n\r\n",
          "400"},
-        {"GET /api HTTP/1.1\r\nHost: client.example\r\nContent-Length: 0\r\n\r\n", "400"},
         // Absolute-form cannot route to this origin-form entry, so the existing
         // unmatched-route fallback is 200; importantly it still never connects.
         {"GET http://client.example/api HTTP/1.1\r\nHost: client.example\r\n\r\n", "200"},
@@ -16245,6 +16293,168 @@ TEST(route, forward_request_policy_rebuilds_nginx_h11_headers) {
         CHECK_EQ(upstream.accepted_count.load(std::memory_order_acquire), accepted_before);
         CHECK_EQ(upstream.request_count.load(std::memory_order_acquire), requests_before);
     }
+}
+
+TEST(route, request_policy_buffers_fixed_content_length_body) {
+    using namespace rut;
+    RecordingUpstream backend;
+    REQUIRE(backend.setup());
+    RouteConfig cfg{};
+    auto id = cfg.add_upstream("backend", 0x7F000001, backend.port);
+    REQUIRE(id.has_value());
+    // Any-method registration is the direct equivalent of the converter's
+    // method-omitted route and lets this test exercise POST without another ABI.
+    REQUIRE(cfg.add_jit_handler("/api", 0, &forward_request_policy_1_handler));
+    const RouteConfig* active = &cfg;
+    ScopedProxyLoop proxy;
+    REQUIRE(proxy.setup(&active, 1000));
+
+    auto read_response = [](i32 fd) {
+        char response[512];
+        const i32 n = recv_timeout(fd, response, sizeof(response), 2000);
+        return n > 0 && buf_contains(response, static_cast<u32>(n), "200", 3);
+    };
+    auto wait_requests = [&](u32 count) {
+        for (u32 i = 0; i < 400 && backend.request_count.load(std::memory_order_acquire) < count;
+             i++)
+            usleep(5000);
+    };
+
+    // Coalesced header + binary body. The recorder is binary-safe and the
+    // gateway must not allocate/connect before the complete body is available.
+    const u8 coalesced_body[] = {0x00, 0x61, 0x0d, 0x0a, 0xff, 0x7f};
+    char coalesced[512];
+    const int coalesced_head = snprintf(
+        coalesced,
+        sizeof(coalesced),
+        "POST /api?q=body HTTP/1.1\r\nHost: client.example\r\n"
+        "Content-Length: 6\r\nX-Test: yes\r\n\r\n");
+    REQUIRE_GT(coalesced_head, 0);
+    REQUIRE_LT(static_cast<u32>(coalesced_head) + sizeof(coalesced_body),
+               static_cast<u32>(sizeof(coalesced)));
+    memcpy(coalesced + coalesced_head, coalesced_body, sizeof(coalesced_body));
+    i32 client = connect_to(proxy.port);
+    REQUIRE_GE(client, 0);
+    set_socket_timeouts(client, 2);
+    REQUIRE(send_all(client, coalesced, static_cast<u32>(coalesced_head) + sizeof(coalesced_body)));
+    CHECK(read_response(client));
+    close(client);
+    wait_requests(1);
+    REQUIRE_EQ(backend.accepted_count.load(std::memory_order_acquire), 1u);
+    REQUIRE_EQ(backend.request_count.load(std::memory_order_acquire), 1u);
+    CHECK_EQ(backend.request_body_len, static_cast<u32>(sizeof(coalesced_body)));
+    CHECK(memcmp(backend.request + backend.request_header_len,
+                 coalesced_body,
+                 sizeof(coalesced_body)) == 0);
+    CHECK(buf_contains(backend.request,
+                       backend.request_header_len,
+                       "Content-Length: 6\r\n",
+                       static_cast<u32>(strlen("Content-Length: 6\r\n"))));
+
+    // Segmented body: no backend accept is allowed after the header and a
+    // prefix, then the final bytes complete exactly one upstream request.
+    static constexpr char kSegmentedHead[] =
+        "POST /api HTTP/1.1\r\nHost: client.example\r\nContent-Length: 5\r\n\r\n";
+    client = connect_to(proxy.port);
+    REQUIRE_GE(client, 0);
+    set_socket_timeouts(client, 2);
+    REQUIRE(send_all(client, kSegmentedHead, sizeof(kSegmentedHead) - 1));
+    REQUIRE(send_all(client, "he", 2));
+    usleep(100000);
+    CHECK_EQ(backend.accepted_count.load(std::memory_order_acquire), 1u);
+    CHECK_EQ(backend.request_count.load(std::memory_order_acquire), 1u);
+    REQUIRE(send_all(client, "llo", 3));
+    CHECK(read_response(client));
+    close(client);
+    wait_requests(2);
+    REQUIRE_EQ(backend.accepted_count.load(std::memory_order_acquire), 2u);
+    REQUIRE_EQ(backend.request_count.load(std::memory_order_acquire), 2u);
+    CHECK_EQ(backend.request_body_len, 5u);
+    CHECK(memcmp(backend.request + backend.request_header_len, "hello", 5) == 0);
+
+    // Explicit zero is a completed fixed body, not the old header-only reject.
+    static constexpr char kZero[] =
+        "POST /api HTTP/1.1\r\nHost: client.example\r\nContent-Length: 0\r\n\r\n";
+    client = connect_to(proxy.port);
+    REQUIRE_GE(client, 0);
+    set_socket_timeouts(client, 2);
+    REQUIRE(send_all(client, kZero, sizeof(kZero) - 1));
+    CHECK(read_response(client));
+    close(client);
+    wait_requests(3);
+    REQUIRE_EQ(backend.accepted_count.load(std::memory_order_acquire), 3u);
+    CHECK_EQ(backend.request_body_len, 0u);
+    CHECK(buf_contains(backend.request,
+                       backend.request_header_len,
+                       "Content-Length: 0\r\n",
+                       static_cast<u32>(strlen("Content-Length: 0\r\n"))));
+
+    // Bytes after the declared body are retained as a separate downstream
+    // suffix; they must not become part of request 1's upstream body.
+    static constexpr char kWithSuffix[] =
+        "POST /api HTTP/1.1\r\nHost: client.example\r\nContent-Length: 3\r\n\r\n"
+        "abcGET /api HTTP/1.1\r\nHost: client.example\r\n\r\n";
+    client = connect_to(proxy.port);
+    REQUIRE_GE(client, 0);
+    set_socket_timeouts(client, 2);
+    REQUIRE(send_all(client, kWithSuffix, sizeof(kWithSuffix) - 1));
+    CHECK(read_response(client));
+    wait_requests(5);
+    REQUIRE_EQ(backend.accepted_count.load(std::memory_order_acquire), 5u);
+    REQUIRE_EQ(backend.request_count.load(std::memory_order_acquire), 5u);
+    CHECK_EQ(backend.request_history_header_len[3] + 3u, backend.request_history_len[3]);
+    CHECK(memcmp(backend.request_history[3] + backend.request_history_header_len[3], "abc", 3) == 0);
+    CHECK_EQ(backend.request_history_header_len[4], backend.request_history_len[4]);
+    close(client);
+
+    const u32 accepted_before = backend.accepted_count.load(std::memory_order_acquire);
+    const u32 requests_before = backend.request_count.load(std::memory_order_acquire);
+    struct Rejected {
+        const char* wire;
+        u32 len;
+    } rejected[] = {
+        {"POST /api HTTP/1.1\r\nHost: x\r\nContent-Length: 5\r\n"
+         "Content-Length: 5\r\n\r\nhello",
+         0},
+        {"POST /api HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: identity\r\n\r\n",
+         0},
+        {"POST /api HTTP/1.1\r\nHost: x\r\nTE: trailers\r\nContent-Length: 0\r\n\r\n",
+         0},
+        {"POST /api HTTP/1.1\r\nHost: x\r\nExpect: 100-continue\r\n"
+         "Content-Length: 0\r\n\r\n",
+         0},
+        {"POST /api HTTP/1.1\r\nHost: x\r\nUpgrade: websocket\r\n"
+         "Content-Length: 0\r\n\r\n",
+         0},
+        {"POST /api HTTP/1.1\r\nHost: x\r\nContent-Length: 20000\r\n\r\n", 0},
+    };
+    for (auto& vector : rejected) {
+        vector.len = static_cast<u32>(strlen(vector.wire));
+        client = connect_to(proxy.port);
+        REQUIRE_GE(client, 0);
+        set_socket_timeouts(client, 2);
+        REQUIRE(send_all(client, vector.wire, vector.len));
+        char response[512];
+        const i32 n = recv_timeout(client, response, sizeof(response), 2000);
+        CHECK(n > 0 && buf_contains(response, static_cast<u32>(n), "400", 3));
+        close(client);
+        usleep(50000);
+        CHECK_EQ(backend.accepted_count.load(std::memory_order_acquire), accepted_before);
+        CHECK_EQ(backend.request_count.load(std::memory_order_acquire), requests_before);
+    }
+
+    // EOF before the declared body is complete must not create an upstream.
+    client = connect_to(proxy.port);
+    REQUIRE_GE(client, 0);
+    set_socket_timeouts(client, 2);
+    static constexpr char kTruncated[] =
+        "POST /api HTTP/1.1\r\nHost: x\r\nContent-Length: 5\r\n\r\nhe";
+    REQUIRE(send_all(client, kTruncated, sizeof(kTruncated) - 1));
+    shutdown(client, SHUT_WR);
+    usleep(150000);
+    CHECK_EQ(backend.accepted_count.load(std::memory_order_acquire), accepted_before);
+    CHECK_EQ(backend.request_count.load(std::memory_order_acquire), requests_before);
+    close(client);
 }
 
 TEST(shard, serves_http2_jit_request_policy_fails_closed) {

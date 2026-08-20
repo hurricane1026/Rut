@@ -512,6 +512,18 @@ struct ConnectionBase {
     // This is reset at the request boundary and is deliberately separate from
     // the route/config lifetime: the bytes are owned by this connection slice.
     u16 request_policy_id;
+    // A policy Forward whose fixed Content-Length body has not arrived yet.
+    // The JIT handler is invoked once; these compact fields retain its immutable
+    // Forward outcome while the pinned request_config/epoch waits for the body.
+    bool request_policy_body_pending;
+    u16 pending_forward_upstream_id;
+    u16 pending_forward_request_policy_id;
+    u16 pending_forward_response_policy_id;
+    // Semantic request facts kept separate from the transport's counters:
+    // buffered means the complete fixed-CL request is staged, while upload
+    // complete is published only after the upstream send finishes.
+    bool request_body_fully_buffered;
+    bool request_upload_complete;
     // Non-zero selects the strict H1 response serializer for this request.
     u16 response_policy_id;
     // Exact parsed request HTTP version (HttpVersion underlying value).
@@ -773,6 +785,12 @@ struct ConnectionBase {
         response_mutations_snapshotted = false;
         req_malformed = false;
         request_policy_id = 0;
+        request_policy_body_pending = false;
+        pending_forward_upstream_id = 0;
+        pending_forward_request_policy_id = 0;
+        pending_forward_response_policy_id = 0;
+        request_body_fully_buffered = false;
+        request_upload_complete = false;
         response_policy_id = 0;
         req_http_version = 255;
         req_keep_alive = false;
