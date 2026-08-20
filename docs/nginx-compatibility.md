@@ -18,7 +18,7 @@ Allowed states are `SUPPORTED`, `PARTIAL`, `BLOCKED_BY_RUT`,
 | nginx default upstream HTTP version and request headers | implicit | yes | partial: explicit fixed HTTP/1.1 policy with bounded fixed-CL buffering; #252 | exact RUT tests plus pinned generated-RUT GET and POST differentials | PARTIAL |
 | proxied response status and body | implicit | yes | partial: strict final H1.1 exact-Content-Length streaming | exact RUT tests plus pinned generated-RUT GET and POST differentials | PARTIAL |
 | nginx default proxied response header policy | implicit | yes | partial: bounded strict H1.1 final-response/content-length serializer; consumes one upstream `Connection`; downstream connection follows request; #253 | exact RUT/token tests plus pinned generated-RUT GET, POST, and close differentials | PARTIAL |
-| single unavailable upstream gateway error | implicit | yes | no equivalent configurable local failure response; #256 | pinned nginx/RUT mismatch evidence | BLOCKED_BY_RUT |
+| single unavailable upstream gateway error | implicit | yes | metadata/ABI foundation only; serializer and failure-site integration pending in #256 | pinned nginx/RUT mismatch evidence | BLOCKED_BY_RUT |
 | exact, `^~`, regex, or nested locations | no | no | no nginx selection semantics | no | NOT_PLANNED |
 | `proxy_pass` with URI replacement | no | no | literal path rewrite only | no | NOT_PLANNED |
 | multiple servers / `server_name` / `default_server` | no | no | no virtual-server selection | no | NOT_PLANNED |
