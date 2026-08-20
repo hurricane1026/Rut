@@ -1131,7 +1131,9 @@ struct Builder {
         if (request_policy != kNoValue &&
             (!valid_val(request_policy) ||
              (!val_has_type(request_policy, TypeKind::I32) &&
-              !val_has_type(request_policy, TypeKind::U32))))
+              !val_has_type(request_policy, TypeKind::U32) &&
+              !val_has_type(request_policy, TypeKind::I64) &&
+              !val_has_type(request_policy, TypeKind::U64))))
             return err(RirError::InvalidState);
         auto r = TRY(emit(Opcode::RetForward, nullptr, loc));
         r.inst->operands[0] = upstream;

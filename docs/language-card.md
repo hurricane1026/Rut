@@ -312,6 +312,8 @@ return forward(users, request_policy: {
     version: "HTTP/1.1", host: "upstream", connection: "omit",
     strip_headers: ["Connection", "Keep-Alive", "TE", "Expect", "Upgrade"]
 })                                               // fixed header-only rebuild
+// Valid downstream Upgrade requests are rejected by this policy; Upgrade
+// passthrough remains PARTIAL in the first slice.
 let resp = forward(users, buffered: true)      // buffered Response, then return resp
 return forward(users, streaming: true)         // large bodies, no buffering
 

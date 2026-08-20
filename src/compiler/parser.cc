@@ -1472,7 +1472,7 @@ struct Parser {
                                     return frontend_error(FrontendError::UnsupportedSyntax,
                                                           span_from(*value.value()), v);
                                 stmt.forward_request_policy_id =
-                                    static_cast<u8>(RequestPolicyId::Http11FixedStrip);
+                                    static_cast<u16>(RequestPolicyId::Http11FixedStrip);
                             } else if (field_name.eq({"host", 4})) {
                                 seen = &have_host;
                                 auto value = expect(TokenType::StringLit);

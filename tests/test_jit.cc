@@ -9621,6 +9621,50 @@ TEST(jit, ret_forward) {
     tc.destroy();
 }
 
+TEST(jit, ret_forward_request_policy_abi_fails_closed) {
+    TestContext tc;
+    REQUIRE(tc.init());
+
+    Builder b;
+    b.init(&tc.mod);
+    auto add = [&](const char* name, bool wide, i64 value) {
+        auto* fn = V(b.create_function(lit(name), lit("/"), 'G'));
+        auto entry = V(b.create_block(fn, lit("entry")));
+        b.set_insert_point(fn, entry);
+        auto upstream = V(b.emit_const_i32(7));
+        auto policy = wide ? V(b.emit_const_i64(value)) : V(b.emit_const_i32(static_cast<i32>(value)));
+        VOK(b.emit_ret_forward(upstream, policy));
+    };
+    add("proxy_policy_valid", false, 1);
+    add("proxy_policy_u16_overflow", false, 256);
+    add("proxy_policy_negative", false, -1);
+    add("proxy_policy_i64_overflow", true, 65536);
+
+    auto cg = codegen(tc.mod);
+    REQUIRE(cg.ok);
+    JitEngine engine;
+    REQUIRE(engine.init());
+    REQUIRE(engine.compile(cg.mod, cg.ctx));
+
+    const char* names[] = {"handler_proxy_policy_valid",
+                           "handler_proxy_policy_u16_overflow",
+                           "handler_proxy_policy_negative",
+                           "handler_proxy_policy_i64_overflow"};
+    const u16 policies[] = {1, 256, 0xffffu, 0xffffu};
+    for (u32 i = 0; i < 4; i++) {
+        auto handler = reinterpret_cast<HandlerFn>(engine.lookup(names[i]));
+        REQUIRE(handler != nullptr);
+        const auto result = HandlerResult::unpack(handler(
+            nullptr, nullptr, reinterpret_cast<const u8*>(kGetApiRequest), sizeof(kGetApiRequest) - 1, nullptr));
+        CHECK(result.action == HandlerAction::Forward);
+        CHECK_EQ(result.upstream_id, 7u);
+        CHECK_EQ(result.status_code, policies[i]);
+    }
+
+    engine.shutdown();
+    tc.destroy();
+}
+
 // ── Complex: multi-guard handler ──────────────────────────────────
 
 // Simulates a realistic middleware chain:

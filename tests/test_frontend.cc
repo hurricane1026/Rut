@@ -32372,6 +32372,33 @@ route GET "/" {
     }
 }
 
+TEST(frontend, request_policy_rejects_response_mutation_combination) {
+    const char* src = R"rut(
+upstream backend at "127.0.0.1:9000"
+func add_header(_ resp: Response) -> i32 {
+    resp.set("X-Proxy", "rut")
+    0
+}
+chain access { after add_header(resp) }
+route GET "/" use chain access {
+    return forward(backend, request_policy: {
+        version: "HTTP/1.1",
+        host: "upstream",
+        connection: "omit",
+        strip_headers: ["Connection", "Keep-Alive", "TE", "Expect", "Upgrade"]
+    })
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE_FALSE(hir.has_value());
+    CHECK(hir.error().detail.eq(
+        lit("request_policy cannot be combined with response header mutations")));
+}
+
 int main(int argc, char** argv) {
     return rut::test::run_all(argc, argv);
 }

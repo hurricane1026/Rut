@@ -15846,6 +15846,7 @@ struct RecordingUpstream {
     i32 listen_fd = -1;
     u16 port = 0;
     std::atomic<bool> running{false};
+    std::atomic<u32> accepted_count{0};
     std::atomic<u32> request_count{0};
     char request[8192]{};
     u32 request_len = 0;
@@ -15865,6 +15866,7 @@ struct RecordingUpstream {
                 }
                 break;
             }
+            s->accepted_count.fetch_add(1, std::memory_order_release);
             char buf[8192];
             u32 total = 0;
             while (total < sizeof(buf)) {
@@ -15956,18 +15958,19 @@ TEST(route, forward_request_policy_rebuilds_nginx_h11_headers) {
 
     const char request[] =
         "GET /api?q=raw%2Fquery HTTP/1.1\r\n"
-        "Host: client.example\r\n"
+        "Host:\tclient.example \t\r\n"
         "Connection: Foo, Bar\r\n"
-        "Foo: retained-one\r\n"
-        "Bar: retained-two\r\n"
+        "Connection:\tBaz\t\r\n"
+        "Foo:\t retained-one \t\r\n"
+        "Bar:retained-two\r\n"
         "Keep-Alive: timeout=5\r\n"
         "TE: trailers\r\n"
         "Expect: 100-continue\r\n"
         "Upgrade: websocket\r\n"
-        "Proxy-Connection: keep-alive\r\n"
-        "Trailer: X-Trailer\r\n"
+        "Proxy-Connection:\tkeep-alive \t\r\n"
+        "Trailer:\tX-Trailer\t\r\n"
         "X-Duplicate: one\r\n"
-        "X-Duplicate: two\r\n\r\n";
+        "X-Duplicate:\t two \t\r\n\r\n";
     i32 client = connect_to(proxy.port);
     REQUIRE_GE(client, 0);
     REQUIRE(send_all(client, request, sizeof(request) - 1));
@@ -15981,49 +15984,61 @@ TEST(route, forward_request_policy_rebuilds_nginx_h11_headers) {
         usleep(5000);
     REQUIRE_EQ(upstream.request_count.load(std::memory_order_acquire), 1u);
     const Str forwarded{upstream.request, upstream.request_len};
-    CHECK(buf_contains(forwarded.ptr,
-                       forwarded.len,
-                       "GET /api?q=raw%2Fquery HTTP/1.1\r\n",
-                       static_cast<u32>(strlen("GET /api?q=raw%2Fquery HTTP/1.1\r\n"))));
-    char expected_host[64];
-    const int host_len = snprintf(expected_host, sizeof(expected_host), "Host: 127.0.0.1:%u\r\n", upstream.port);
-    REQUIRE_GT(host_len, 0);
-    CHECK(buf_contains(forwarded.ptr, forwarded.len, expected_host, static_cast<u32>(host_len)));
-    CHECK(!buf_contains(forwarded.ptr,
-                        forwarded.len,
-                        "HTTP/1.1\r\nConnection:",
-                        strlen("HTTP/1.1\r\nConnection:")));
-    CHECK(!buf_contains(forwarded.ptr,
-                        forwarded.len,
-                        "\r\nConnection:",
-                        strlen("\r\nConnection:")));
-    CHECK(!buf_contains(forwarded.ptr, forwarded.len, "Keep-Alive:", strlen("Keep-Alive:")));
-    CHECK(!buf_contains(forwarded.ptr, forwarded.len, "TE:", strlen("TE:")));
-    CHECK(!buf_contains(forwarded.ptr, forwarded.len, "Expect:", strlen("Expect:")));
-    CHECK(!buf_contains(forwarded.ptr, forwarded.len, "Upgrade:", strlen("Upgrade:")));
-    CHECK(buf_contains(forwarded.ptr, forwarded.len, "Foo: retained-one\r\n", strlen("Foo: retained-one\r\n")));
-    CHECK(buf_contains(forwarded.ptr, forwarded.len, "Bar: retained-two\r\n", strlen("Bar: retained-two\r\n")));
-    CHECK(buf_contains(forwarded.ptr, forwarded.len, "Proxy-Connection: keep-alive\r\n", strlen("Proxy-Connection: keep-alive\r\n")));
-    CHECK(buf_contains(forwarded.ptr, forwarded.len, "Trailer: X-Trailer\r\n", strlen("Trailer: X-Trailer\r\n")));
-    CHECK(buf_contains(forwarded.ptr, forwarded.len, "X-Duplicate: one\r\nX-Duplicate: two\r\n", strlen("X-Duplicate: one\r\nX-Duplicate: two\r\n")));
+    char expected[2048];
+    const int expected_len = snprintf(
+        expected,
+        sizeof(expected),
+        "GET /api?q=raw%%2Fquery HTTP/1.1\r\n"
+        "Host: 127.0.0.1:%u\r\n"
+        "Foo: retained-one\r\n"
+        "Bar: retained-two\r\n"
+        "Proxy-Connection: keep-alive\r\n"
+        "Trailer: X-Trailer\r\n"
+        "X-Duplicate: one\r\n"
+        "X-Duplicate: two\r\n\r\n",
+        upstream.port);
+    REQUIRE_GT(expected_len, 0);
+    REQUIRE_LT(expected_len, static_cast<int>(sizeof(expected)));
+    CHECK_EQ(forwarded.len, static_cast<u32>(expected_len));
+    CHECK(memcmp(forwarded.ptr, expected, static_cast<size_t>(expected_len)) == 0);
 
-    // Header-only policy rejects framing before opening or writing an upstream
-    // socket; the recorder must see no second request.
-    const char body_request[] =
-        "GET /api HTTP/1.1\r\nHost: client.example\r\nContent-Length: 0\r\n\r\n";
-    client = connect_to(proxy.port);
-    REQUIRE_GE(client, 0);
-    REQUIRE(send_all(client, body_request, sizeof(body_request) - 1));
-    char body_response[512];
-    const i32 body_response_len = recv_timeout(client, body_response, sizeof(body_response), 2000);
-    close(client);
-    CHECK_GT(body_response_len, 0);
-    CHECK(buf_contains(body_response,
-                       static_cast<u32>(body_response_len),
-                       "400",
-                       static_cast<u32>(strlen("400"))));
-    usleep(100000);
-    CHECK_EQ(upstream.request_count.load(std::memory_order_acquire), 1u);
+    // Header-only policy rejects framing, upgrade, and non-origin targets before
+    // opening or writing an upstream socket. The recorder must see no second
+    // accept or request for any of these fail-closed vectors.
+    struct RejectedVector {
+        const char* request;
+        const char* expected_status;
+    };
+    const RejectedVector rejected[] = {
+        {"GET /api HTTP/1.1\r\nHost: client.example\r\ntRaNsFeR-EnCoDiNg: identity\r\n\r\n",
+         "400"},
+        {"GET /api HTTP/1.1\r\nHost: client.example\r\nContent-Length: 0\r\n\r\n", "400"},
+        // Absolute-form cannot route to this origin-form entry, so the existing
+        // unmatched-route fallback is 200; importantly it still never connects.
+        {"GET http://client.example/api HTTP/1.1\r\nHost: client.example\r\n\r\n", "200"},
+        {"GET /api HTTP/1.1\r\nHost: client.example\r\nConnection: Upgrade\r\n"
+         "Upgrade: websocket\r\n\r\n",
+         "400"},
+    };
+    for (const RejectedVector& vector : rejected) {
+        const u32 accepted_before = upstream.accepted_count.load(std::memory_order_acquire);
+        const u32 requests_before = upstream.request_count.load(std::memory_order_acquire);
+        client = connect_to(proxy.port);
+        REQUIRE_GE(client, 0);
+        REQUIRE(send_all(client, vector.request, static_cast<u32>(strlen(vector.request))));
+        char reject_response[512];
+        const i32 reject_response_len =
+            recv_timeout(client, reject_response, sizeof(reject_response), 2000);
+        close(client);
+        CHECK_GT(reject_response_len, 0);
+        CHECK(buf_contains(reject_response,
+                           static_cast<u32>(reject_response_len),
+                           vector.expected_status,
+                           static_cast<u32>(strlen(vector.expected_status))));
+        usleep(100000);
+        CHECK_EQ(upstream.accepted_count.load(std::memory_order_acquire), accepted_before);
+        CHECK_EQ(upstream.request_count.load(std::memory_order_acquire), requests_before);
+    }
     engine.shutdown();
     rir.destroy();
 }

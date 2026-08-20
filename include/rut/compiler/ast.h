@@ -264,7 +264,7 @@ struct AstStatement {
     FixedVec<AstHeaderKV, kMaxForwardSetHeaders> forward_set_headers;
     // `forward(request_policy: {...})`: non-zero immutable policy id. The
     // parser requires the complete first normalized HTTP/1 policy object.
-    u8 forward_request_policy_id = 0;
+    u16 forward_request_policy_id = 0;
     bool has_forward_request_policy = false;
     AstStatement* then_stmt = nullptr;
     AstStatement* else_stmt = nullptr;

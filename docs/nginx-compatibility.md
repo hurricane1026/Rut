@@ -36,7 +36,12 @@ Allowed states are `SUPPORTED`, `PARTIAL`, `BLOCKED_BY_RUT`,
 - nginx proxy request defaults are version-dependent beginning at 1.29.7.
 - Default request and response hop-by-hop/header behavior is not transparent
   byte forwarding.
-- The first request-policy slice rejects bodies/framing, HTTP/2, and
-  non-origin-form targets before upstream connect. nginx absolute-form target
-  normalization remains a follow-up.
+- The first request-policy slice rejects body/framing inputs (including
+  `Content-Length` and every `Transfer-Encoding` value), HTTP/2, and
+  non-origin-form targets before upstream connect. These are intentional
+  fail-closed `PARTIAL` limits; nginx absolute-form/body normalization remains
+  a follow-up.
+- Valid downstream Upgrade requests are intentionally rejected before upstream
+  connect in this header-only slice; nginx 1.29.7 strips and proxies Upgrade,
+  so that behavior remains PARTIAL.
 - RUT's current unmatched-route response is not nginx's normal 404 behavior.

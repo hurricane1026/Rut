@@ -511,7 +511,7 @@ struct ConnectionBase {
     // Non-zero when the explicit source request policy has rewritten recv_buf.
     // This is reset at the request boundary and is deliberately separate from
     // the route/config lifetime: the bytes are owned by this connection slice.
-    u8 request_policy_id;
+    u16 request_policy_id;
     // Request-side keep-alive intent of the CURRENT request, as parsed from its
     // request line + Connection header (HTTP/1.1 default true, HTTP/1.0 default
     // false, "Connection: close" → false). The proxy forwards the client's

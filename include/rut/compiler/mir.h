@@ -279,7 +279,7 @@ struct MirTerminator {
     // Request-header overrides for forward(set_header:) — carried verbatim from
     // HIR. len > 0 → lower_rir emits one ReqSetHeader per entry before RetForward.
     FixedVec<MirHeaderKV, kMaxHeaders> forward_set_headers;
-    u8 forward_request_policy_id = 0;
+    u16 forward_request_policy_id = 0;
 };
 
 struct MirBlock {

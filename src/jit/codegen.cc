@@ -1779,12 +1779,49 @@ static void emit_instruction(Ctx& c, const rir::Instruction& inst) {
                 LLVMBuildShl(c.builder, up_ext, LLVMConstInt(c.i64_ty, 24, 0), "up.shl");
             LLVMValueRef result = LLVMBuildOr(c.builder, action, shifted, "result");
             if (inst.operand_count > 1) {
-                LLVMValueRef policy = c.get_value(inst.operands[1]);
-                if (LLVMTypeOf(policy) != c.i32_ty)
-                    policy = LLVMBuildZExt(c.builder, policy, c.i32_ty, "policy.ext");
-                LLVMValueRef policy_ext = LLVMBuildZExt(c.builder, policy, c.i64_ty, "policy.e");
+                // The policy occupies the full 16-bit status slot. Direct RIR
+                // callers may provide signed or wider integer values, so do
+                // not truncate before validating the range: 256 must remain
+                // 256 (unsupported), and negative/wider values become the
+                // invalid sentinel rather than transparent policy 0.
+                LLVMValueRef policy_raw = c.get_value(inst.operands[1]);
+                LLVMValueRef policy_ext = nullptr;
+                const rir::Type* policy_ty =
+                    c.cur_fn ? c.cur_fn->values[inst.operands[1].id].type : nullptr;
+                if (policy_ty) {
+                    switch (policy_ty->kind) {
+                        case rir::TypeKind::I32:
+                            policy_ext = LLVMBuildSExt(c.builder, policy_raw, c.i64_ty, "policy.sext");
+                            break;
+                        case rir::TypeKind::U32:
+                            policy_ext = LLVMBuildZExt(c.builder, policy_raw, c.i64_ty, "policy.zext");
+                            break;
+                        case rir::TypeKind::I64:
+                        case rir::TypeKind::U64:
+                            policy_ext = policy_raw;
+                            break;
+                        default:
+                            break;
+                    }
+                }
+                if (!policy_ext) {
+                    policy_ext = LLVMConstInt(c.i64_ty, 0xffffu, 0);
+                }
+                LLVMValueRef at_least_one = LLVMBuildICmp(
+                    c.builder, LLVMIntSGE, policy_ext, LLVMConstInt(c.i64_ty, 1, 0), "policy.ge1");
+                LLVMValueRef at_most_u16 = LLVMBuildICmp(
+                    c.builder, LLVMIntSLE, policy_ext, LLVMConstInt(c.i64_ty, 0xffffu, 0), "policy.le16");
+                LLVMValueRef in_range = LLVMBuildAnd(c.builder, at_least_one, at_most_u16, "policy.range");
+                LLVMValueRef safe_policy = LLVMBuildSelect(
+                    c.builder, in_range, policy_ext, LLVMConstInt(c.i64_ty, 0xffffu, 0), "policy.clamped");
+                // Keep the policy confined to the 16-bit status slot before
+                // shifting it.  The range select above makes this redundant
+                // for well-typed values, but the explicit mask is an ABI
+                // boundary: no direct-RIR policy bits may reach upstream_id.
+                safe_policy = LLVMBuildAnd(
+                    c.builder, safe_policy, LLVMConstInt(c.i64_ty, 0xffffu, 0), "policy.mask");
                 LLVMValueRef policy_shifted =
-                    LLVMBuildShl(c.builder, policy_ext, LLVMConstInt(c.i64_ty, 8, 0), "policy.shl");
+                    LLVMBuildShl(c.builder, safe_policy, LLVMConstInt(c.i64_ty, 8, 0), "policy.shl");
                 result = LLVMBuildOr(c.builder, result, policy_shifted, "result.policy");
             }
             c.emit_parse_unprime();

@@ -493,7 +493,7 @@ void format_response_with_body_and_headers(Connection& conn,
                                            bool keep_alive,
                                            bool body_is_fallback_reason_phrase = false,
                                            bool suppress_default_content_type = false);
-inline bool apply_request_policy(Connection& conn, const sockaddr_in& endpoint, u8 policy_id);
+inline bool apply_request_policy(Connection& conn, const sockaddr_in& endpoint, u16 policy_id);
 template <typename Loop>
 inline void reject_request_policy(Loop* loop, Connection& conn);
 void prepare_early_response_state(Connection& conn);
@@ -2111,6 +2111,22 @@ void handle_jit_outcome(Loop* loop,
                 client_send(loop, conn, conn.send_buf.data(), conn.send_buf.len());
                 return;
             }
+            auto& target = config->upstreams[outcome.upstream_id];
+            // Policy rewriting uses the request buffers before the response
+            // mutation snapshot is established. Reject combinations and
+            // multi-endpoint targets before allocating slots or selecting an
+            // endpoint; never emit a Host for an endpoint that may differ on
+            // retry.
+            if (outcome.request_policy_id != 0 &&
+                (!request_policy_is_supported(outcome.request_policy_id) ||
+                 target.addr_count != 1 || conn.resp_header_mutation_count != 0 ||
+                 conn.resp_header_mutation_pending_count != 0 ||
+                 conn.resp_header_mutation_pending_overflow ||
+                 conn.resp_header_mutation_overflow || conn.req_path_overridden ||
+                 conn.req_header_override_count != 0 || conn.req_header_override_overflow)) {
+                reject_request_policy(loop, conn);
+                return;
+            }
             if (conn.resp_header_mutation_count != 0 && !loop->alloc_response_header_buf(conn)) {
                 conn.resp_status = kStatusInternalServerError;
                 format_static_response(conn, 500, /*keep_alive=*/false);
@@ -2120,7 +2136,6 @@ void handle_jit_outcome(Loop* loop,
                 return;
             }
             conn.state = ConnState::Proxying;
-            auto& target = config->upstreams[outcome.upstream_id];
             // Upstream concurrency cap — same as the direct RouteAction::Proxy
             // path (a `return forward(...)` JIT route must honor max_inflight too,
             // or JIT-implemented routes could exceed the backend's in-flight cap).
@@ -2618,7 +2633,7 @@ inline bool snapshot_response_mutations_before_request_rewrite(Connection& conn)
 // Validate and materialise the first explicit upstream request policy. This runs
 // before slot acquisition and before a TCP connect, so unsupported input cannot
 // accidentally fall back to transparent forwarding or touch the upstream.
-inline bool apply_request_policy(Connection& conn, const sockaddr_in& endpoint, u8 policy_id) {
+inline bool apply_request_policy(Connection& conn, const sockaddr_in& endpoint, u16 policy_id) {
     if (policy_id == 0) return true;
     if (!request_policy_is_supported(policy_id) || conn.protocol == ConnProtocol::Http2)
         return false;
@@ -2682,6 +2697,10 @@ inline bool apply_request_policy(Connection& conn, const sockaddr_in& endpoint, 
         const u32 value_len = static_cast<u32>(ve - vs);
         (void)vs;
         (void)value_len;
+        // HttpParser tracks chunked framing, but every Transfer-Encoding is
+        // outside this header-only policy (including identity and unknown
+        // codings). Inspect the raw fields before any upstream side effect.
+        if (is_named(hs, static_cast<u32>(colon - hs), "transfer-encoding")) return false;
         hs = le + 2;
     }
 
@@ -2728,9 +2747,11 @@ inline bool apply_request_policy(Connection& conn, const sockaddr_in& endpoint, 
         !append_lit("\r\n", 2))
         return false;
 
-    // Preserve ordinary fields byte-for-byte (including duplicate fields), while
-    // applying nginx's fixed first-slice skip set. Connection token values are
-    // deliberately not interpreted: fields they name remain ordinary fields.
+    // Preserve ordinary fields in order (including duplicates), while
+    // applying nginx's fixed first-slice skip set. Rebuild each retained field
+    // with its original name and normalized ": " separator/value OWS. Connection
+    // token values are deliberately not interpreted: fields they name remain
+    // ordinary fields.
     hs = line_end + 2;
     while (hs < header_end) {
         const u8* le = hs;
@@ -2743,7 +2764,17 @@ inline bool apply_request_policy(Connection& conn, const sockaddr_in& endpoint, 
                           is_named(hs, name_len, "keep-alive") ||
                           is_named(hs, name_len, "te") || is_named(hs, name_len, "expect") ||
                           is_named(hs, name_len, "upgrade");
-        if (!drop && !append(hs, static_cast<u32>(le + 2 - hs))) return false;
+        if (!drop) {
+            const u8* value_start = colon + 1;
+            while (value_start < le && (*value_start == ' ' || *value_start == '\t')) value_start++;
+            const u8* value_end = le;
+            while (value_end > value_start &&
+                   (value_end[-1] == ' ' || value_end[-1] == '\t')) value_end--;
+            if (!append(hs, name_len) || !append_lit(": ", 2) ||
+                !append(value_start, static_cast<u32>(value_end - value_start)) ||
+                !append_lit("\r\n", 2))
+                return false;
+        }
         hs = le + 2;
     }
     if (!append_lit("\r\n", 2)) return false;

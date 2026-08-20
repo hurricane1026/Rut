@@ -796,7 +796,7 @@ struct HirTerminator {
     // Request-header overrides for `forward(name, set_header: {...})`. len == 0
     // means none; lowering emits one ReqSetHeader per entry before RetForward.
     FixedVec<HirHeaderKV, kMaxHeaders> forward_set_headers;
-    u8 forward_request_policy_id = 0;
+    u16 forward_request_policy_id = 0;
 };
 
 struct HirGuardBody {

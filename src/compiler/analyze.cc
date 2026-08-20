@@ -18762,6 +18762,47 @@ static FrontendResult<HirModule*> analyze_file_internal(
                     }
                 }
             }
+
+            // Request-policy rewriting changes recv_buf before response-header
+            // mutation pointers are snapshotted.  Keep this unsupported at the
+            // source boundary; the runtime has a matching fail-closed guard for
+            // direct-RIR callers.
+            auto policy_mutation_conflict = [](const HirTerminator& term) {
+                return term.kind == HirTerminatorKind::ForwardUpstream &&
+                       term.forward_request_policy_id != 0 &&
+                       term.commit_response_mutations;
+            };
+            const HirTerminator* conflict = nullptr;
+            if (route.control.kind == HirControlKind::Direct) {
+                if (policy_mutation_conflict(route.control.direct_term))
+                    conflict = &route.control.direct_term;
+            } else if (route.control.kind == HirControlKind::If) {
+                if (policy_mutation_conflict(route.control.then_term))
+                    conflict = &route.control.then_term;
+                else if (policy_mutation_conflict(route.control.else_term))
+                    conflict = &route.control.else_term;
+            } else {
+                for (u32 ai = 0; ai < route.control.match_arms.len; ai++) {
+                    const auto& arm = route.control.match_arms[ai];
+                    if (policy_mutation_conflict(arm.direct_term)) {
+                        conflict = &arm.direct_term;
+                        break;
+                    }
+                    if (policy_mutation_conflict(arm.then_term)) {
+                        conflict = &arm.then_term;
+                        break;
+                    }
+                    if (policy_mutation_conflict(arm.else_term)) {
+                        conflict = &arm.else_term;
+                        break;
+                    }
+                }
+            }
+            if (conflict != nullptr)
+                return frontend_error(
+                    FrontendError::UnsupportedSyntax,
+                    conflict->span,
+                    lit_str("request_policy cannot be combined with response header mutations"));
         }
 
         // Wait-route backstop: the creation-time gates (kTimeWaitDetail /
