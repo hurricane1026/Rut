@@ -309,32 +309,41 @@ static i32 run_shards(ListenerSpec listener,
     i32 sig = 0;
     u32 failed_shard = shard_count;
     i32 backend_error = 0;
+    auto observe_backend_failure = [&]() {
+        if (backend_error != 0) return true;
+        for (u32 i = 0; i < shard_count; i++) {
+            const i32 code = shards[i].backend_failure_code();
+            if (code != 0) {
+                failed_shard = i;
+                backend_error = code;
+                return true;
+            }
+        }
+        return false;
+    };
+    auto report_backend_failure = [&]() {
+        write_str("Fatal I/O backend failure on shard ");
+        write_u32(failed_shard);
+        write_str(" (errno=");
+        write_u32(static_cast<u32>(backend_error));
+        write_str(")\n");
+    };
     for (;;) {
         struct timespec timeout = {0, 100'000'000};  // 100ms control-plane poll
         sig = sigtimedwait(&wait_set, nullptr, &timeout);
+        // A fatal backend state takes precedence over a concurrently queued
+        // shutdown signal; otherwise the process could report a graceful exit.
+        if (observe_backend_failure()) break;
         if (sig == SIGINT || sig == SIGTERM) break;
         if (sig < 0 && errno != EAGAIN && errno != EINTR) {
             write_str("Failed to wait for shutdown signal\n");
             stop_all_shards();
             return 1;
         }
-        for (u32 i = 0; i < shard_count; i++) {
-            const i32 code = shards[i].backend_failure_code();
-            if (code != 0) {
-                failed_shard = i;
-                backend_error = code;
-                break;
-            }
-        }
-        if (backend_error != 0) break;
     }
 
     if (backend_error != 0) {
-        write_str("Fatal I/O backend failure on shard ");
-        write_u32(failed_shard);
-        write_str(" (errno=");
-        write_u32(static_cast<u32>(backend_error));
-        write_str(")\n");
+        report_backend_failure();
         stop_all_shards();
         return 1;
     }
@@ -351,6 +360,7 @@ static i32 run_shards(ListenerSpec listener,
 
     // Wait for all shard threads to finish (they exit after drain completes).
     for (u32 i = 0; i < shard_count; i++) shards[i].join();
+    const bool backend_failed_during_drain = observe_backend_failure();
 
     // Stop access log flusher (final flush of remaining entries).
     if (access_log_fd >= 0) {
@@ -360,6 +370,11 @@ static i32 run_shards(ListenerSpec listener,
 
     // Release resources.
     for (u32 i = 0; i < shard_count; i++) shards[i].shutdown();
+
+    if (backend_failed_during_drain) {
+        report_backend_failure();
+        return 1;
+    }
 
     write_str("Shutdown complete.\n");
     return 0;
