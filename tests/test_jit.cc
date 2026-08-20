@@ -9671,20 +9671,21 @@ TEST(jit, ret_forward_response_policy_abi_uses_next_state_and_fails_closed) {
 
     Builder b;
     b.init(&tc.mod);
-    auto add = [&](const char* name, bool wide, i64 value) {
+    auto add = [&](const char* name, i32 request_value, bool wide, i64 value) {
         auto* fn = V(b.create_function(lit(name), lit("/"), 'G'));
         auto entry = V(b.create_block(fn, lit("entry")));
         b.set_insert_point(fn, entry);
         auto upstream = V(b.emit_const_i32(7));
-        auto request = V(b.emit_const_i32(0));
+        auto request = V(b.emit_const_i32(request_value));
         auto response =
             wide ? V(b.emit_const_i64(value)) : V(b.emit_const_i32(static_cast<i32>(value)));
         VOK(b.emit_ret_forward(upstream, request, response));
     };
-    add("proxy_response_policy_valid", false, 1);
-    add("proxy_response_policy_u16_overflow", false, 65536);
-    add("proxy_response_policy_negative", false, -1);
-    add("proxy_response_policy_i64_overflow", true, 0x100000000LL);
+    add("proxy_response_policy_valid", 7, false, 1);
+    add("proxy_response_policy_u16_boundary", 9, false, 256);
+    add("proxy_response_policy_u16_overflow", 11, false, 65536);
+    add("proxy_response_policy_negative", 13, false, -1);
+    add("proxy_response_policy_i64_overflow", 15, true, 0x100000000LL);
 
     auto cg = codegen(tc.mod);
     REQUIRE(cg.ok);
@@ -9693,19 +9694,21 @@ TEST(jit, ret_forward_response_policy_abi_uses_next_state_and_fails_closed) {
     REQUIRE(engine.compile(cg.mod, cg.ctx));
 
     const char* names[] = {"handler_proxy_response_policy_valid",
+                           "handler_proxy_response_policy_u16_boundary",
                            "handler_proxy_response_policy_u16_overflow",
                            "handler_proxy_response_policy_negative",
                            "handler_proxy_response_policy_i64_overflow"};
-    const u16 policies[] = {1, 0xffffu, 0xffffu, 0xffffu};
-    for (u32 i = 0; i < 4; i++) {
+    const u16 request_policies[] = {7, 9, 11, 13, 15};
+    const u16 response_policies[] = {1, 256, 0xffffu, 0xffffu, 0xffffu};
+    for (u32 i = 0; i < 5; i++) {
         auto handler = reinterpret_cast<HandlerFn>(engine.lookup(names[i]));
         REQUIRE(handler != nullptr);
         const auto result = HandlerResult::unpack(handler(
             nullptr, nullptr, reinterpret_cast<const u8*>(kGetApiRequest), sizeof(kGetApiRequest) - 1, nullptr));
         CHECK(result.action == HandlerAction::Forward);
         CHECK_EQ(result.upstream_id, 7u);
-        CHECK_EQ(result.status_code, 0u);
-        CHECK_EQ(result.next_state, policies[i]);
+        CHECK_EQ(result.status_code, request_policies[i]);
+        CHECK_EQ(result.next_state, response_policies[i]);
     }
     auto dispatch_handler = reinterpret_cast<HandlerFn>(engine.lookup(names[0]));
     jit::HandlerCtx dispatch_ctx{};
@@ -9716,10 +9719,36 @@ TEST(jit, ret_forward_response_policy_abi_uses_next_state_and_fails_closed) {
                                        sizeof(kGetApiRequest) - 1,
                                        nullptr);
     CHECK(dispatch.kind == JitDispatchOutcome::Kind::Forward);
-    CHECK_EQ(dispatch.request_policy_id, 0u);
+    CHECK_EQ(dispatch.request_policy_id, 7u);
     CHECK_EQ(dispatch.response_policy_id, 1u);
 
     engine.shutdown();
+    tc.destroy();
+}
+
+TEST(jit, ret_forward_response_policy_builder_rejects_noncontiguous_and_invalid_atomically) {
+    TestContext tc;
+    REQUIRE(tc.init());
+
+    Builder b;
+    b.init(&tc.mod);
+    auto* fn = V(b.create_function(lit("proxy_response_policy_builder"), lit("/"), 'G'));
+    auto entry = V(b.create_block(fn, lit("entry")));
+    b.set_insert_point(fn, entry);
+    auto upstream = V(b.emit_const_i32(7));
+    auto request = V(b.emit_const_i32(1));
+    auto response = V(b.emit_const_i32(1));
+    const u32 before = fn->blocks[entry.id].inst_count;
+
+    auto response_only = b.emit_ret_forward(upstream, rir::kNoValue, response);
+    CHECK_FALSE(response_only.has_value());
+    CHECK_EQ(fn->blocks[entry.id].inst_count, before);
+
+    const u32 before_invalid = fn->blocks[entry.id].inst_count;
+    auto invalid = b.emit_ret_forward(upstream, request, ValueId{0xfffffffeu});
+    CHECK_FALSE(invalid.has_value());
+    CHECK_EQ(fn->blocks[entry.id].inst_count, before_invalid);
+
     tc.destroy();
 }
 

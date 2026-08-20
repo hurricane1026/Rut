@@ -8973,6 +8973,20 @@ static u64 forward_response_policy_1_handler(void* /*conn*/,
     return rut::jit::HandlerResult::make_forward_with_policies(0, 0, 1).pack();
 }
 
+static u64 forward_response_policy_with_pending_mutation_handler(
+    void* raw_conn, rut::jit::HandlerCtx* /*ctx*/, const u8* /*req*/, u32 /*len*/, void* /*arena*/) {
+    auto* conn = static_cast<rut::Connection*>(raw_conn);
+    conn->resp_header_mutation_pending_count = 1;
+    return rut::jit::HandlerResult::make_forward_with_policies(0, 0, 1).pack();
+}
+
+static u64 forward_response_policy_with_committed_mutation_handler(
+    void* raw_conn, rut::jit::HandlerCtx* /*ctx*/, const u8* /*req*/, u32 /*len*/, void* /*arena*/) {
+    auto* conn = static_cast<rut::Connection*>(raw_conn);
+    conn->resp_header_mutation_count = 1;
+    return rut::jit::HandlerResult::make_forward_with_policies(0, 0, 1).pack();
+}
+
 static rut::ForwardResponsePolicySpec test_response_policy_spec() {
     rut::ForwardResponsePolicySpec policy{};
     policy.version = rut::ResponsePolicyVersion::Http11;
@@ -16196,6 +16210,42 @@ TEST(route, response_policy_rejects_before_upstream_accept) {
     CHECK_EQ(backend.request_count.load(std::memory_order_acquire), 0u);
 }
 
+TEST(route, response_policy_rejects_pending_response_mutation_before_upstream_accept) {
+    using namespace rut;
+    RecordingUpstream backend;
+    REQUIRE(backend.setup());
+    RouteConfig cfg{};
+    auto id = cfg.add_upstream("backend", 0x7F000001, backend.port);
+    REQUIRE(id.has_value());
+    REQUIRE_EQ(cfg.add_response_policy(test_response_policy_spec()), 1u);
+    REQUIRE(cfg.add_jit_handler(
+        "/api", 'G', &forward_response_policy_with_pending_mutation_handler));
+    const RouteConfig* active = &cfg;
+    ScopedProxyLoop proxy;
+    REQUIRE(proxy.setup(&active, 1000));
+
+    struct ClientGuard {
+        i32 fd;
+        ~ClientGuard() {
+            if (fd >= 0) close(fd);
+        }
+    } client{connect_to(proxy.port)};
+    REQUIRE(client.fd >= 0);
+    set_socket_timeouts(client.fd, 2);
+    static constexpr char kRequest[] = "GET /api HTTP/1.1\r\nHost: client.example\r\n\r\n";
+    REQUIRE(send_all(client.fd, kRequest, sizeof(kRequest) - 1));
+    char response[512];
+    const i32 response_len = recv_timeout(client.fd, response, sizeof(response), 2000);
+    CHECK_GT(response_len, 0);
+    CHECK(buf_contains(response,
+                       static_cast<u32>(response_len),
+                       "400",
+                       static_cast<u32>(strlen("400"))));
+    usleep(100000);
+    CHECK_EQ(backend.accepted_count.load(std::memory_order_acquire), 0u);
+    CHECK_EQ(backend.request_count.load(std::memory_order_acquire), 0u);
+}
+
 TEST(shard, serves_http2_jit_response_policy_fails_closed) {
     using namespace rut;
     RecordingUpstream backend;
@@ -16206,6 +16256,74 @@ TEST(shard, serves_http2_jit_response_policy_fails_closed) {
     REQUIRE(id.has_value());
     REQUIRE_EQ(cfg.add_response_policy(test_response_policy_spec()), 1u);
     REQUIRE(cfg.add_jit_handler("/api", 'G', &forward_response_policy_1_handler));
+
+    Shard<EpollEventLoop> shard;
+    i32 lfd = create_listen_socket(0).value_or(-1);
+    REQUIRE(lfd >= 0);
+    struct FdGuard {
+        i32 fd;
+        ~FdGuard() {
+            if (fd >= 0) close(fd);
+        }
+    } listener{lfd};
+    REQUIRE(shard.init(0, lfd).has_value());
+    shard.route_config = &cfg;
+    struct ShardGuard {
+        Shard<EpollEventLoop>& shard;
+        i32& listen_fd;
+        i32 client_fd = -1;
+        bool spawned = false;
+        ~ShardGuard() {
+            if (client_fd >= 0) close(client_fd);
+            if (spawned) {
+                shard.stop();
+                shard.join();
+            }
+            shard.shutdown();
+            if (listen_fd >= 0) close(listen_fd);
+        }
+    } guard{shard, lfd};
+    listener.fd = -1;
+    REQUIRE(shard.spawn(-1).has_value());
+    guard.spawned = true;
+    usleep(50000);
+
+    guard.client_fd = connect_to(get_port(lfd));
+    REQUIRE(guard.client_fd >= 0);
+    set_socket_timeouts(guard.client_fd, 2);
+    u8 out[512];
+    u32 n = h2_client_prologue(out);
+    n += h2_client_get(out + n, sizeof(out) - n, 1, "/api", 4);
+    REQUIRE(write_all_fd(guard.client_fd, out, n));
+
+    u8 response[4096];
+    u32 total = 0;
+    for (int attempt = 0; attempt < 8 && total < sizeof(response); attempt++) {
+        i32 got = recv_timeout(guard.client_fd,
+                               reinterpret_cast<char*>(response + total),
+                               sizeof(response) - total,
+                               2000);
+        if (got <= 0) break;
+        total += static_cast<u32>(got);
+        if (h2_status_for_stream(response, total, 1) != 0) break;
+    }
+    CHECK_EQ(h2_status_for_stream(response, total, 1), 400u);
+    usleep(100000);
+    CHECK_EQ(backend.accepted_count.load(std::memory_order_acquire), 0u);
+    CHECK_EQ(backend.request_count.load(std::memory_order_acquire), 0u);
+}
+
+TEST(shard, serves_http2_response_policy_with_committed_mutation_fails_closed) {
+    using namespace rut;
+    RecordingUpstream backend;
+    REQUIRE(backend.setup());
+
+    RouteConfig cfg{};
+    auto id = cfg.add_upstream("backend", 0x7F000001, backend.port);
+    REQUIRE(id.has_value());
+    REQUIRE_EQ(cfg.add_response_policy(test_response_policy_spec()), 1u);
+    REQUIRE(cfg.add_jit_handler(
+        "/api", 'G', &forward_response_policy_with_committed_mutation_handler));
 
     Shard<EpollEventLoop> shard;
     i32 lfd = create_listen_socket(0).value_or(-1);

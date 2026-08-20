@@ -1127,7 +1127,8 @@ struct Builder {
                                 SourceLoc loc = {}) {
         // A response operand is slot 2 in RIR and the ABI next_state field;
         // callers must pass request_policy explicitly (zero is the transparent
-        // request-policy value) when carrying response_policy.
+        // request-policy value) when carrying response_policy. Reject the
+        // non-contiguous form instead of leaving operand slot 1 implicit.
         if (!valid_val(upstream)) return err(RirError::InvalidState);
         // Upstream operand must be an integer type (upstream id).
         if (!val_has_type(upstream, TypeKind::I32) && !val_has_type(upstream, TypeKind::U32))
@@ -1139,6 +1140,15 @@ struct Builder {
               !val_has_type(request_policy, TypeKind::I64) &&
               !val_has_type(request_policy, TypeKind::U64))))
             return err(RirError::InvalidState);
+        if (response_policy != kNoValue && request_policy == kNoValue)
+            return err(RirError::InvalidState);
+        if (response_policy != kNoValue &&
+            (!valid_val(response_policy) ||
+             (!val_has_type(response_policy, TypeKind::I32) &&
+              !val_has_type(response_policy, TypeKind::U32) &&
+              !val_has_type(response_policy, TypeKind::I64) &&
+              !val_has_type(response_policy, TypeKind::U64))))
+            return err(RirError::InvalidState);
         auto r = TRY(emit(Opcode::RetForward, nullptr, loc));
         r.inst->operands[0] = upstream;
         r.inst->operand_count = 1;
@@ -1147,12 +1157,6 @@ struct Builder {
             r.inst->operand_count = 2;
         }
         if (response_policy != kNoValue) {
-            if (!valid_val(response_policy) ||
-                (!val_has_type(response_policy, TypeKind::I32) &&
-                 !val_has_type(response_policy, TypeKind::U32) &&
-                 !val_has_type(response_policy, TypeKind::I64) &&
-                 !val_has_type(response_policy, TypeKind::U64)))
-                return err(RirError::InvalidState);
             r.inst->operands[2] = response_policy;
             r.inst->operand_count = 3;
         }
