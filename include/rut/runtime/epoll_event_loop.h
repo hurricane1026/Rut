@@ -266,6 +266,7 @@ public:
     core::Expected<void, Error> init(u32 id, i32 lfd, u32 pool_prealloc = 0) {
         shard_id = id;
         listen_fd = lfd;
+        this->listener_context = {};
         running_.store(true, std::memory_order_relaxed);
         draining_.store(false, std::memory_order_relaxed);
         drain_start_.store(0, std::memory_order_relaxed);

@@ -2,9 +2,11 @@
 
 #include "core/expected.h"
 #include "rut/runtime/listener.h"
+#include "rut/runtime/socket.h"
 
 #include <netinet/in.h>
 #include <sys/socket.h>
+#include <unistd.h>
 
 namespace rut {
 
@@ -53,6 +55,36 @@ inline core::Expected<ListenerContext, ListenerContextError> derive_listener_con
     ListenerContext result{declared.address, declared.transport, ntohs(bound.sin_port)};
     if (!result.valid()) return core::make_unexpected(ListenerContextError::InvalidBoundAddress);
     return result;
+}
+
+// Bind one shard listener and derive its actual immutable context.  The first
+// caller passes expected == nullptr; later SO_REUSEPORT shards pass the first
+// context and must resolve to the same address/transport/port.  On every
+// context failure this helper closes the just-created fd, leaving ownership
+// with the caller only on success.
+inline core::Expected<i32, Error> bind_listener_shard(const ListenerSpec& declared,
+                                                      u16 requested_port,
+                                                      const ListenerContext* expected,
+                                                      ListenerContext* out_context) {
+    if (out_context == nullptr)
+        return core::make_unexpected(Error::make(EINVAL, Error::Source::Socket));
+    *out_context = {};
+
+    auto fd_result = create_listen_socket(requested_port);
+    if (!fd_result) return fd_result;
+    const i32 fd = fd_result.value();
+
+    auto context = derive_listener_context(fd, declared);
+    if (!context) {
+        close(fd);
+        return core::make_unexpected(Error::make(EINVAL, Error::Source::Socket));
+    }
+    if (expected != nullptr && !context.value().equivalent(*expected)) {
+        close(fd);
+        return core::make_unexpected(Error::make(EADDRINUSE, Error::Source::Socket));
+    }
+    *out_context = context.value();
+    return fd;
 }
 
 }  // namespace rut

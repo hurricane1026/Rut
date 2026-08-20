@@ -136,7 +136,9 @@ static i32 run_shards(ListenerSpec listener,
     // If port==0 (ephemeral), create shard 0 first to get the assigned port,
     // then create remaining sockets on that concrete port.
     for (u32 i = 0; i < shard_count; i++) {
-        auto lfd_result = create_listen_socket(port);
+        ListenerContext derived_context{};
+        const ListenerContext* expected_context = i == 0 ? nullptr : &bound_listener_context;
+        auto lfd_result = bind_listener_shard(listener, port, expected_context, &derived_context);
         if (!lfd_result) {
             write_str("Failed to create listen socket for shard ");
             write_u32(i);
@@ -150,29 +152,9 @@ static i32 run_shards(ListenerSpec listener,
             return 1;
         }
         i32 lfd = lfd_result.value();
-        auto derived_context = derive_listener_context(lfd, listener);
-        if (!derived_context) {
-            write_str("Failed to derive bounded listener context\n");
-            close(lfd);
-            for (u32 j = 0; j < i; j++) {
-                shards[j].stop();
-                shards[j].join();
-                shards[j].shutdown();
-            }
-            return 1;
-        }
         if (i == 0) {
-            bound_listener_context = derived_context.value();
+            bound_listener_context = derived_context;
             port = bound_listener_context.port;
-        } else if (!derived_context.value().equivalent(bound_listener_context)) {
-            write_str("Listener shards resolved different bound contexts\n");
-            close(lfd);
-            for (u32 j = 0; j < i; j++) {
-                shards[j].stop();
-                shards[j].join();
-                shards[j].shutdown();
-            }
-            return 1;
         }
         shards[i].owns_listen_fd = true;
 

@@ -32,16 +32,31 @@ TEST(listener_context, resolves_ephemeral_and_explicit_bound_ports) {
 
     ListenerSpec declared{};
     declared.port = 0;
-    auto ephemeral_fd = create_listen_socket(declared.port);
-    REQUIRE(ephemeral_fd.has_value());
-    const i32 ephemeral = ephemeral_fd.value();
+    ListenerContext first_context{};
+    auto first_fd_result =
+        bind_listener_shard(declared, declared.port, nullptr, &first_context);
+    CHECK(first_fd_result.has_value());
+    if (!first_fd_result) return;
+    const i32 first_fd = first_fd_result.value();
+    CHECK(first_context.valid());
+    CHECK_EQ(first_context.address, ListenerAddress::IPv4Wildcard);
+    CHECK_EQ(first_context.transport, ListenerTransport::Cleartext);
+    CHECK_NE(first_context.port, static_cast<u16>(0));
 
-    auto ephemeral_context = derive_listener_context(ephemeral, declared);
-    REQUIRE(ephemeral_context.has_value());
-    CHECK(ephemeral_context.value().valid());
-    CHECK_EQ(ephemeral_context.value().address, ListenerAddress::IPv4Wildcard);
-    CHECK_EQ(ephemeral_context.value().transport, ListenerTransport::Cleartext);
-    CHECK_NE(ephemeral_context.value().port, static_cast<u16>(0));
+    // This is the same first-context/explicit-port sequence used by
+    // run_shards(): the second reuse-port socket must not independently
+    // resolve another ephemeral port.
+    ListenerContext second_context{};
+    auto second_fd_result =
+        bind_listener_shard(declared, first_context.port, &first_context, &second_context);
+    CHECK(second_fd_result.has_value());
+    if (!second_fd_result) {
+        close(first_fd);
+        return;
+    }
+    const i32 second_fd = second_fd_result.value();
+    CHECK(second_context.valid());
+    CHECK(second_context.equivalent(first_context));
 
     ListenerSpec bad_address = declared;
     bad_address.address = static_cast<ListenerAddress>(0xff);
@@ -50,26 +65,33 @@ TEST(listener_context, resolves_ephemeral_and_explicit_bound_ports) {
     bad_transport.transport = static_cast<ListenerTransport>(0xff);
     CHECK(!derive_listener_context(-1, bad_transport).has_value());
 
-    // A later SO_REUSEPORT shard binds the concrete port obtained from the
-    // first socket, rather than independently asking the kernel for another
-    // ephemeral port.
-    ListenerSpec explicit_declared = declared;
-    explicit_declared.port = ephemeral_context.value().port;
-    auto explicit_fd = create_listen_socket(explicit_declared.port);
-    REQUIRE(explicit_fd.has_value());
-    const i32 explicit_socket = explicit_fd.value();
-    auto explicit_context = derive_listener_context(explicit_socket, explicit_declared);
-    REQUIRE(explicit_context.has_value());
-    CHECK(explicit_context.value().equivalent(ephemeral_context.value()));
-
-    close(explicit_socket);
-    close(ephemeral);
+    close(second_fd);
+    close(first_fd);
 }
 
 TEST(listener_context, loop_allocators_copy_reset_and_preserve_context) {
-    const ListenerContext expected{ListenerAddress::IPv4Wildcard,
-                                   ListenerTransport::Cleartext,
-                                   static_cast<u16>(43127)};
+    struct ListenerFdPair {
+        i32 first = -1;
+        i32 second = -1;
+        ~ListenerFdPair() {
+            if (second >= 0) close(second);
+            if (first >= 0) close(first);
+        }
+    } fds;
+    ListenerSpec declared{};
+    declared.port = 0;
+    ListenerContext expected{};
+    auto first_result = bind_listener_shard(declared, declared.port, nullptr, &expected);
+    CHECK(first_result.has_value());
+    if (!first_result) return;
+    fds.first = first_result.value();
+    ListenerContext second_context{};
+    auto second_result =
+        bind_listener_shard(declared, expected.port, &expected, &second_context);
+    CHECK(second_result.has_value());
+    if (!second_result) return;
+    fds.second = second_result.value();
+    CHECK(second_context.equivalent(expected));
 
     // The legacy template loop is still used by a few embedders and tests.
     auto legacy = std::make_unique<EventLoop<MockBackend>>();
@@ -86,10 +108,19 @@ TEST(listener_context, loop_allocators_copy_reset_and_preserve_context) {
     CHECK(legacy_reused->listener_context.equivalent(expected));
     legacy->free_conn(*legacy_reused);
     legacy->shutdown();
+    // Reinitialization must not retain a context from the previous lifetime.
+    legacy->listener_context = expected;
+    REQUIRE(legacy->init(0, -1).has_value());
+    CHECK(!legacy->listener_context.valid());
+    legacy->shutdown();
 
     // Both production loop implementations use the same value-copy contract.
     auto epoll = std::make_unique<EpollEventLoop>();
     REQUIRE(epoll->init(0, -1).has_value());
+    epoll->listener_context = expected;
+    epoll->shutdown();
+    REQUIRE(epoll->init(0, -1).has_value());
+    CHECK(!epoll->listener_context.valid());
     epoll->listener_context = expected;
     auto* epoll_conn = epoll->alloc_conn();
     REQUIRE(epoll_conn != nullptr);
@@ -99,6 +130,10 @@ TEST(listener_context, loop_allocators_copy_reset_and_preserve_context) {
 
     auto io_uring = std::make_unique<IoUringEventLoop>();
     REQUIRE(io_uring->init(0, -1).has_value());
+    io_uring->listener_context = expected;
+    io_uring->shutdown();
+    REQUIRE(io_uring->init(0, -1).has_value());
+    CHECK(!io_uring->listener_context.valid());
     io_uring->listener_context = expected;
     auto* io_uring_conn = io_uring->alloc_conn();
     REQUIRE(io_uring_conn != nullptr);
