@@ -17,7 +17,7 @@ Allowed states are `SUPPORTED`, `PARTIAL`, `BLOCKED_BY_RUT`,
 | preserve request method and body | implicit | yes | partial: fixed-CL body is staged before connect within one 16 KiB composite slice | RUT exact binary/segmented/boundary tests and pinned generated-RUT binary POST differential | PARTIAL |
 | nginx default upstream HTTP version and request headers | implicit | yes | partial: explicit fixed HTTP/1.1 policy with bounded fixed-CL buffering; #252 | exact RUT tests plus pinned generated-RUT GET and POST differentials | PARTIAL |
 | proxied response status and body | implicit | yes | partial: strict final H1.1 exact-Content-Length streaming | exact RUT tests plus pinned generated-RUT GET and POST differentials | PARTIAL |
-| nginx default proxied response header policy | implicit | yes | partial: bounded strict H1.1 final-response/content-length serializer; consumes one upstream `Connection`; #253 | exact RUT/token tests plus pinned generated-RUT GET and POST differentials | PARTIAL |
+| nginx default proxied response header policy | implicit | yes | partial: bounded strict H1.1 final-response/content-length serializer; consumes one upstream `Connection`; downstream connection follows request; #253 | exact RUT/token tests plus pinned generated-RUT GET, POST, and close differentials | PARTIAL |
 | single unavailable upstream gateway error | implicit | yes | no equivalent configurable local failure response; #256 | pinned nginx/RUT mismatch evidence | BLOCKED_BY_RUT |
 | exact, `^~`, regex, or nested locations | no | no | no nginx selection semantics | no | NOT_PLANNED |
 | `proxy_pass` with URI replacement | no | no | literal path rewrite only | no | NOT_PLANNED |
@@ -69,6 +69,10 @@ Allowed states are `SUPPORTED`, `PARTIAL`, `BLOCKED_BY_RUT`,
   connection field, and preserves token-nominated ordinary response headers.
   The bounded strict serializer matches one such field and rejects duplicates;
   other hop-by-hop response behavior remains unclaimed.
+- Pinned nginx success responses follow the downstream HTTP/1.1 request intent:
+  default/explicit keep-alive remains reusable, while explicit close emits
+  `Connection: close` and EOF after the body. Converter-generated RUT now matches
+  the close vector and continues stripping the client Connection upstream.
 - For one unavailable fixed upstream, pinned nginx waits for the complete
   fixed-CL request and emits a 157-byte HTML 502 with Server, Date,
   Content-Type, and request-derived keep-alive. RUT currently emits an 11-byte
