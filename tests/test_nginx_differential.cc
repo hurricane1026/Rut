@@ -38,6 +38,13 @@ static constexpr char kBackendResponse[] =
     "Server: differential-backend\r\n"
     "Date: Tue, 01 Jan 2030 00:00:00 GMT\r\n"
     "Content-Length: 2\r\n\r\nok";
+static constexpr char kApiResponseNormalized[] =
+    "HTTP/1.1 200 OK\r\n"
+    "Server: nginx/1.29.7\r\n"
+    "Date: XXXXXXXXXXXXXXXXXXXXXXXXXXXXX\r\n"
+    "Content-Length: 2\r\n"
+    "Connection: close\r\n"
+    "\r\nok";
 static constexpr char kGatewayResponseNormalized[] =
     "HTTP/1.1 502 Bad Gateway\r\n"
     "Server: nginx/1.29.7\r\n"
@@ -462,10 +469,12 @@ struct DeadPort {
 struct Recorder {
     int listen_fd = -1;
     u16 port = 0;
+    u32 expected_requests = 1;
     std::atomic<bool> running{false};
     std::atomic<u32> accepted{0};
     std::atomic<u32> requests{0};
     std::vector<char> request;
+    std::vector<std::vector<char>> history;
     pthread_t thread{};
     bool thread_started = false;
 
@@ -517,19 +526,24 @@ struct Recorder {
             }
             const bool complete = header_end(wire) != 0;
             if (complete) {
-                self->request = wire;
+                self->history.push_back(wire);
+                if (self->history.size() == 1) self->request = wire;
                 self->requests.fetch_add(1, std::memory_order_release);
                 (void)send_all(client, kBackendResponse, sizeof(kBackendResponse) - 1);
             }
             shutdown(client, SHUT_RDWR);
             close(client);
-            self->running.store(false, std::memory_order_release);
-            break;
+            if (self->requests.load(std::memory_order_acquire) >= self->expected_requests) {
+                self->running.store(false, std::memory_order_release);
+                break;
+            }
         }
         return nullptr;
     }
 
-    bool setup(u16 requested_port = 0) {
+    bool setup(u16 requested_port = 0, u32 expected = 1) {
+        if (expected == 0 || expected > 3) return false;
+        expected_requests = expected;
         for (int attempt = 0; attempt < 8; attempt++) {
             listen_fd = socket(AF_INET, SOCK_STREAM, 0);
             if (listen_fd < 0) continue;
@@ -561,6 +575,7 @@ struct Recorder {
             accepted.store(0, std::memory_order_relaxed);
             requests.store(0, std::memory_order_relaxed);
             request.clear();
+            history.clear();
             running.store(true, std::memory_order_release);
             if (pthread_create(&thread, nullptr, &Recorder::run, this) == 0) {
                 thread_started = true;
@@ -854,6 +869,136 @@ static bool capture_gateway_case(u16 frontend_port,
     return true;
 }
 
+static std::string api_request(const char* target) {
+    return std::string("GET ") + target + " HTTP/1.1\r\n"
+           "Host: client.example\r\n"
+           "X-Dup: one\r\n"
+           "X-Dup: two\r\n"
+           "Connection: close\r\n\r\n";
+}
+
+static bool capture_api_side(u16 frontend_port,
+                             u16 backend_port,
+                             const std::string& source_path,
+                             const std::string& nginx_config_path,
+                             const std::string& nginx_log_path,
+                             const std::string& rut_log_path,
+                             const std::string& rut_path,
+                             const std::string& container_name,
+                             bool pinned_nginx,
+                             std::vector<std::vector<char>>& downstream,
+                             std::vector<std::vector<char>>& upstream,
+                             std::string& error) {
+    static constexpr const char* kTargets[] = {"/api/", "/api/x", "/api/x?y=1"};
+    Recorder recorder;
+    if (!recorder.setup(backend_port, 3)) {
+        error = "API backend recorder setup failed";
+        return false;
+    }
+
+    // Keep the same cleanup ordering as the existing captures: the child is
+    // stopped before its Docker container is removed on every return path.
+    DockerGuard docker(container_name);
+    docker.active = pinned_nginx;
+    ChildGuard process;
+    if (pinned_nginx) {
+        if (!spawn_child({"docker", "run", "--pull=never", "--network", "host", "--name",
+                          container_name, "-v", nginx_config_path + ":/etc/nginx/nginx.conf:ro",
+                          kNginxImage, "nginx", "-g", "daemon off;"},
+                         nginx_log_path,
+                         process.child)) {
+            error = "failed to start pinned nginx for API case";
+            return false;
+        }
+    } else if (!spawn_child({rut_path, source_path, "--shards", "1", "--no-pin", "--drain", "0"},
+                            rut_log_path,
+                            process.child)) {
+        error = "failed to start production RUT for API case";
+        return false;
+    }
+    if (!wait_ready(frontend_port, process.child, error)) return false;
+
+    downstream.clear();
+    downstream.reserve(3);
+    for (size_t i = 0; i < 3; i++) {
+        const std::string request = api_request(kTargets[i]);
+        const int client = connect_once(frontend_port);
+        std::vector<char> response;
+        std::string vector_error;
+        const bool ok = client >= 0 && send_all(client, request.data(), request.size()) &&
+                        read_response(client, response, vector_error) && read_eof(client, vector_error);
+        if (client >= 0) close(client);
+        if (!ok) {
+            error = std::string(pinned_nginx ? "nginx" : "RUT") +
+                    " API vector " + std::to_string(i + 1) + " failed: " +
+                    (vector_error.empty() ? "connect/send failed" : vector_error);
+            return false;
+        }
+        downstream.push_back(std::move(response));
+    }
+
+    if (!stop_child(process.child)) {
+        error = std::string("failed to stop ") + (pinned_nginx ? "nginx" : "production RUT") +
+                " after API case";
+        return false;
+    }
+    if (pinned_nginx && !docker.remove()) {
+        error = "docker rm -f failed after nginx API case";
+        return false;
+    }
+    recorder.stop();
+    if (recorder.accepted.load(std::memory_order_acquire) != 3 ||
+        recorder.requests.load(std::memory_order_acquire) != 3 || recorder.history.size() != 3) {
+        error = std::string(pinned_nginx ? "nginx" : "RUT") +
+                " API recorder did not observe exactly three requests";
+        return false;
+    }
+    upstream = recorder.history;
+    return true;
+}
+
+static bool capture_api_case(u16 frontend_port,
+                             u16 backend_port,
+                             const std::string& source_path,
+                             const std::string& nginx_config_path,
+                             const std::string& nginx_log_path,
+                             const std::string& rut_log_path,
+                             const std::string& rut_path,
+                             const std::string& nginx_container_name,
+                             std::vector<std::vector<char>>& nginx_downstream,
+                             std::vector<std::vector<char>>& nginx_upstream,
+                             std::vector<std::vector<char>>& rut_downstream,
+                             std::vector<std::vector<char>>& rut_upstream,
+                             std::string& error) {
+    if (!capture_api_side(frontend_port,
+                          backend_port,
+                          source_path,
+                          nginx_config_path,
+                          nginx_log_path,
+                          rut_log_path,
+                          rut_path,
+                          nginx_container_name,
+                          true,
+                          nginx_downstream,
+                          nginx_upstream,
+                          error))
+        return false;
+    if (!capture_api_side(frontend_port,
+                          backend_port,
+                          source_path,
+                          nginx_config_path,
+                          nginx_log_path,
+                          rut_log_path,
+                          rut_path,
+                          nginx_container_name + "-rut",
+                          false,
+                          rut_downstream,
+                          rut_upstream,
+                          error))
+        return false;
+    return true;
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -1058,6 +1203,119 @@ int main(int argc, char** argv) {
         return 1;
     }
     std::cerr << "PASS: pinned nginx and RUT unavailable-upstream gateway case (502 + EOF)\n";
+
+    u16 api_frontend_port = 0;
+    u16 api_backend_port = 0;
+    if (!allocate_port(api_frontend_port) || !allocate_port(api_backend_port) ||
+        api_frontend_port == api_backend_port) {
+        std::cerr << "FAIL [api preflight]: bounded dynamic port allocation failed\n";
+        return 1;
+    }
+    const std::string api_fragment =
+        "server {\n  listen " + std::to_string(api_frontend_port) +
+        ";\n  location /api/ {\n    proxy_pass http://127.0.0.1:" +
+        std::to_string(api_backend_port) + "/;\n  }\n}\n";
+    auto api_parsed = rut::nginx::parse(
+        {api_fragment.data(), static_cast<rut::u32>(api_fragment.size())});
+    if (!api_parsed) {
+        std::cerr << "FAIL [api parse]: nginx fragment rejected at " << api_parsed.error().span.line
+                  << ":" << api_parsed.error().span.col << "\n";
+        return 1;
+    }
+    auto api_lowered = rut::nginx::lower_to_rut(api_parsed.value());
+    if (!api_lowered) {
+        std::cerr << "FAIL [api lower]: converter rejected model at "
+                  << api_lowered.error().span.line << ":" << api_lowered.error().span.col << "\n";
+        return 1;
+    }
+    if (!write_file(temp.source, api_lowered.value().data, api_lowered.value().len)) {
+        std::cerr << "FAIL [api source]: secure generated source overwrite failed\n";
+        return 1;
+    }
+    const std::string api_nginx_config =
+        "events {}\nhttp {\n" + api_fragment + "}\n";
+    if (!write_file(temp.nginx_config, api_nginx_config.data(), api_nginx_config.size())) {
+        std::cerr << "FAIL [api nginx-config]: config overwrite failed\n";
+        return 1;
+    }
+
+    std::vector<std::vector<char>> nginx_api_responses;
+    std::vector<std::vector<char>> nginx_api_requests;
+    std::vector<std::vector<char>> rut_api_responses;
+    std::vector<std::vector<char>> rut_api_requests;
+    std::string api_error;
+    const std::string api_container = container + "-api";
+    if (!capture_api_case(api_frontend_port,
+                          api_backend_port,
+                          temp.source,
+                          temp.nginx_config,
+                          temp.nginx_log,
+                          temp.rut_log,
+                          argv[1],
+                          api_container,
+                          nginx_api_responses,
+                          nginx_api_requests,
+                          rut_api_responses,
+                          rut_api_requests,
+                          api_error)) {
+        std::cerr << "FAIL [api differential]: " << api_error << "\n";
+        for (size_t i = 0; i < nginx_api_responses.size(); i++)
+            dump_wire(("nginx API response " + std::to_string(i + 1)).c_str(),
+                      nginx_api_responses[i]);
+        for (size_t i = 0; i < rut_api_responses.size(); i++)
+            dump_wire(("RUT API response " + std::to_string(i + 1)).c_str(),
+                      rut_api_responses[i]);
+        dump_log(temp.nginx_log, "nginx log");
+        dump_log(temp.rut_log, "RUT log");
+        return 1;
+    }
+
+    static constexpr const char* kApiTargets[] = {"/", "/x", "/x?y=1"};
+    for (size_t i = 0; i < 3; i++) {
+        if (!starts_with_200(nginx_api_responses[i]) || !starts_with_200(rut_api_responses[i])) {
+            std::cerr << "FAIL [api compare " << (i + 1)
+                      << "]: expected HTTP/1.1 200 response\n";
+            dump_wire("nginx API response", nginx_api_responses[i]);
+            dump_wire("RUT API response", rut_api_responses[i]);
+            dump_log(temp.nginx_log, "nginx log");
+            dump_log(temp.rut_log, "RUT log");
+            return 1;
+        }
+        std::vector<char> normalized_nginx_api = nginx_api_responses[i];
+        std::vector<char> normalized_rut_api = rut_api_responses[i];
+        if (!normalize_date(normalized_nginx_api) || !normalize_date(normalized_rut_api) ||
+            normalized_nginx_api != normalized_rut_api ||
+            normalized_nginx_api.size() != sizeof(kApiResponseNormalized) - 1 ||
+            memcmp(normalized_nginx_api.data(),
+                   kApiResponseNormalized,
+                   sizeof(kApiResponseNormalized) - 1) != 0) {
+            std::cerr << "FAIL [api compare " << (i + 1)
+                      << "]: downstream response mismatch after Date normalization\n";
+            dump_wire("nginx API response", nginx_api_responses[i]);
+            dump_wire("RUT API response", rut_api_responses[i]);
+            dump_log(temp.nginx_log, "nginx log");
+            dump_log(temp.rut_log, "RUT log");
+            return 1;
+        }
+        const std::string expected_request =
+            std::string("GET ") + kApiTargets[i] + " HTTP/1.1\r\n" +
+            "Host: 127.0.0.1:" + std::to_string(api_backend_port) + "\r\n" +
+            "X-Dup: one\r\n"
+            "X-Dup: two\r\n"
+            "\r\n";
+        const std::vector<char> expected_wire(expected_request.begin(), expected_request.end());
+        if (nginx_api_requests[i] != expected_wire || rut_api_requests[i] != expected_wire) {
+            std::cerr << "FAIL [api compare " << (i + 1)
+                      << "]: exact upstream request wire mismatch\n";
+            dump_wire("expected API request", expected_wire);
+            dump_wire("nginx API request", nginx_api_requests[i]);
+            dump_wire("RUT API request", rut_api_requests[i]);
+            dump_log(temp.nginx_log, "nginx log");
+            dump_log(temp.rut_log, "RUT log");
+            return 1;
+        }
+    }
+    std::cerr << "PASS: pinned nginx and RUT /api/ proxy URI replacement case (3 vectors)\n";
     return 0;
 #endif
 }
