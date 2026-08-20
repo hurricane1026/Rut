@@ -108,7 +108,8 @@ evidence must use a pinned nginx build and cannot treat that skip as a pass.
   within the existing 16 KiB composite slice before connect; larger bodies and
   broader request behavior remain `PARTIAL`.
 - #253: a bounded final-H1.1 exact-Content-Length response policy is available;
-  its request-body admission and broader response behavior remain `PARTIAL`.
+  fixed-CL request-body admission and one upstream `Connection` field are now
+  covered, while broader response behavior remains `PARTIAL`.
 
 ## First process-loop evidence
 
@@ -116,9 +117,12 @@ Using pinned nginx 1.29.7 at digest
 `sha256:1854da86e82d5dfb49a8f3d78b099adcc7e36608b207146ed95cd47937938a40`,
 the same server fragment was included by nginx and parsed/lowered by the
 converter API. A header-only GET/query request with duplicate ordinary headers
-produced byte-identical recorded upstream requests. Both downstream responses
-matched the pinned expected response after normalizing only the generated Date.
+produced byte-identical recorded upstream requests. A split four-byte binary
+fixed-Content-Length POST also delayed backend accept until the full body was
+available and produced byte-identical upstream bytes. Both GET and POST
+downstream responses matched the pinned expected response after normalizing
+only the generated Date.
 
 This is the first real nginx -> converter -> RUT -> runtime loop, not completion
-of issue #254. POST bodies and unavailable-upstream behavior remain required by
-that issue's acceptance test, and no general `proxy_pass` support is claimed.
+of issue #254. Unavailable-upstream behavior remains required by that issue's
+acceptance test, and no general `proxy_pass` or request-body support is claimed.

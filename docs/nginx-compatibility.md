@@ -8,16 +8,16 @@ Allowed states are `SUPPORTED`, `PARTIAL`, `BLOCKED_BY_RUT`,
 
 | nginx feature | parser | converter | RUT capability | behavior test | status |
 | --- | --- | --- | --- | --- | --- |
-| server fragment, exactly one server | yes | yes | partial: exact single-server model only; no server selection model | bounded pinned generated-RUT GET differential | PARTIAL |
+| server fragment, exactly one server | yes | yes | partial: exact single-server model only; no server selection model | bounded pinned generated-RUT GET and POST differentials | PARTIAL |
 | `listen <port>` IPv4 wildcard | yes | yes | yes: one source `listen :<port>` declaration | pinned nginx/generated-RUT bind and request | SUPPORTED |
 | ordinary prefix `location /` | yes | yes | partial: root catch-all exists | bounded pinned generated-RUT GET differential | PARTIAL |
-| location applies to every method | yes | yes | yes: method-omitted route source form | RUT route tests; nginx differential only GET | PARTIAL |
-| fixed IPv4 HTTP `proxy_pass`, no URI suffix | yes | yes | partial: fixed `forward` plus bounded policies | pinned generated-RUT GET/query/header differential | PARTIAL |
+| location applies to every method | yes | yes | yes: method-omitted route source form | RUT route tests; pinned GET and POST differentials | PARTIAL |
+| fixed IPv4 HTTP `proxy_pass`, no URI suffix | yes | yes | partial: fixed `forward` plus bounded policies | pinned generated-RUT GET/query/header and fixed-CL POST differentials | PARTIAL |
 | preserve raw request-target and query | implicit | yes | partial: origin-form forward sends original bytes | pinned query differential; broader normalization untested | PARTIAL |
-| preserve request method and body | implicit | yes | partial: fixed-CL body is staged before connect within one 16 KiB composite slice | RUT exact binary/segmented/boundary tests; nginx baseline, no generated-RUT POST diff | PARTIAL |
-| nginx default upstream HTTP version and request headers | implicit | yes | partial: explicit fixed HTTP/1.1 policy with bounded fixed-CL buffering; #252 | exact RUT tests, pinned GET differential, pinned nginx POST baseline | PARTIAL |
-| proxied response status and body | implicit | yes | partial: strict final H1.1 exact-Content-Length streaming | exact RUT tests and pinned generated-RUT GET differential | PARTIAL |
-| nginx default proxied response header policy | implicit | yes | partial: bounded strict H1.1 final-response/content-length serializer; #253 | exact RUT tests and pinned generated-RUT GET differential | PARTIAL |
+| preserve request method and body | implicit | yes | partial: fixed-CL body is staged before connect within one 16 KiB composite slice | RUT exact binary/segmented/boundary tests and pinned generated-RUT binary POST differential | PARTIAL |
+| nginx default upstream HTTP version and request headers | implicit | yes | partial: explicit fixed HTTP/1.1 policy with bounded fixed-CL buffering; #252 | exact RUT tests plus pinned generated-RUT GET and POST differentials | PARTIAL |
+| proxied response status and body | implicit | yes | partial: strict final H1.1 exact-Content-Length streaming | exact RUT tests plus pinned generated-RUT GET and POST differentials | PARTIAL |
+| nginx default proxied response header policy | implicit | yes | partial: bounded strict H1.1 final-response/content-length serializer; consumes one upstream `Connection`; #253 | exact RUT/token tests plus pinned generated-RUT GET and POST differentials | PARTIAL |
 | single unavailable upstream gateway error | implicit | yes | partial: 502/504 paths exist | RUT-only tests, no nginx diff | PARTIAL |
 | exact, `^~`, regex, or nested locations | no | no | no nginx selection semantics | no | NOT_PLANNED |
 | `proxy_pass` with URI replacement | no | no | literal path rewrite only | no | NOT_PLANNED |
@@ -50,15 +50,25 @@ Allowed states are `SUPPORTED`, `PARTIAL`, `BLOCKED_BY_RUT`,
   local buffering separately from successful upstream upload. Exact-cap and
   cap+1 behavior are tested. Larger bodies and file-backed buffering remain
   unsupported, so the feature stays `PARTIAL`.
+- A converter-generated split binary POST now matches pinned nginx in exact
+  upstream bytes and Date-normalized downstream bytes. Both delay backend
+  accept until the complete body is locally available. This proves only the
+  bounded fixed-CL vector, not larger or alternate-framing bodies.
 - Valid downstream Upgrade requests are intentionally rejected before upstream
   connect in this header-only slice; nginx 1.29.7 strips and proxies Upgrade,
   so that behavior remains PARTIAL.
-- The first converter-generated differential covers an origin-form header-only
-  GET with a query, custom Host, duplicate ordinary request headers, one final
+- The converter-generated differentials cover an origin-form header-only GET
+  and a split fixed-CL binary POST with a query, custom Host, duplicate ordinary
+  request headers, one final
   exact-Content-Length upstream response, custom reason, hidden/synthesized
   headers, duplicate response headers, and preserved trailing value whitespace.
   Dynamic Date is the only normalized response field. This does not cover the
-  POST/body or unavailable-upstream cases required to complete #254.
+  unavailable-upstream case required to complete #254.
+- Pinned nginx consumes an upstream `Connection` header for absent,
+  `keep-alive`, `close`, and token-list vectors, synthesizes one downstream
+  connection field, and preserves token-nominated ordinary response headers.
+  The bounded strict serializer matches one such field and rejects duplicates;
+  other hop-by-hop response behavior remains unclaimed.
 - Response policy is intentionally limited to non-HEAD HTTP/1.1 requests and
   one final HTTP/1.1 response with exact Content-Length. Bodies, Upgrade,
   absolute-form targets, HTTP/1.0, HTTP/2, interim/no-body statuses, chunking,
