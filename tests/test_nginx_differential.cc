@@ -47,6 +47,22 @@ static constexpr char kBackendResponse[] =
     "Server: differential-backend\r\n"
     "Date: Tue, 01 Jan 2030 00:00:00 GMT\r\n"
     "Content-Length: 2\r\n\r\nok";
+static constexpr char kHeadRequest[] =
+    "HEAD /head?q=1 HTTP/1.1\r\n"
+    "Host: client.example\r\n"
+    "Connection: close\r\n\r\n";
+static constexpr char kHeadBackendResponse[] =
+    "HTTP/1.1 200 OK\r\n"
+    "Server: origin-head\r\n"
+    "Date: Tue, 01 Jan 2030 00:00:00 GMT\r\n"
+    "Content-Length: 5\r\n\r\n"
+    "hello";
+static constexpr char kHeadResponseNormalized[] =
+    "HTTP/1.1 200 OK\r\n"
+    "Server: nginx/1.29.7\r\n"
+    "Date: XXXXXXXXXXXXXXXXXXXXXXXXXXXXX\r\n"
+    "Content-Length: 5\r\n"
+    "Connection: close\r\n\r\n";
 static constexpr char kApiResponseNormalized[] =
     "HTTP/1.1 200 OK\r\n"
     "Server: nginx/1.29.7\r\n"
@@ -443,6 +459,38 @@ static bool read_response(int fd, std::vector<char>& bytes, std::string& error) 
     }
 }
 
+static bool read_head_response(int fd, std::vector<char>& bytes, std::string& error) {
+    using Clock = std::chrono::steady_clock;
+    static constexpr auto kResponseReadBudget = std::chrono::seconds(5);
+    const Clock::time_point deadline = Clock::now() + kResponseReadBudget;
+
+    bytes.clear();
+    bytes.reserve(1024);
+    for (;;) {
+        if (Clock::now() >= deadline) {
+            error = "HEAD response deadline exceeded";
+            return false;
+        }
+        char buf[1024];
+        const ssize_t n = recv(fd, buf, sizeof(buf), 0);
+        if (n > 0) {
+            bytes.insert(bytes.end(), buf, buf + n);
+            const size_t end = header_end(bytes);
+            if (end != 0) {
+                if (bytes.size() != end) {
+                    error = "HEAD response included body bytes with headers";
+                    return false;
+                }
+                return true;
+            }
+            continue;
+        }
+        if (n < 0 && (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK)) continue;
+        error = n == 0 ? "HEAD response ended before headers" : "HEAD response read failed";
+        return false;
+    }
+}
+
 static bool read_eof(int fd, std::string& error) {
     for (int attempt = 0; attempt < 40; attempt++) {
         pollfd p{fd, POLLIN | POLLHUP | POLLERR, 0};
@@ -502,6 +550,8 @@ struct Recorder {
     std::atomic<u32> requests{0};
     std::vector<char> request;
     std::vector<std::vector<char>> history;
+    const char* response_bytes = kBackendResponse;
+    u32 response_bytes_len = sizeof(kBackendResponse) - 1;
     pthread_t thread{};
     bool thread_started = false;
 
@@ -556,7 +606,7 @@ struct Recorder {
                 self->history.push_back(wire);
                 if (self->history.size() == 1) self->request = wire;
                 self->requests.fetch_add(1, std::memory_order_release);
-                (void)send_all(client, kBackendResponse, sizeof(kBackendResponse) - 1);
+                (void)send_all(client, self->response_bytes, self->response_bytes_len);
             }
             shutdown(client, SHUT_RDWR);
             close(client);
@@ -568,9 +618,16 @@ struct Recorder {
         return nullptr;
     }
 
-    bool setup(u16 requested_port = 0, u32 expected = 1) {
+    bool setup(u16 requested_port = 0,
+               u32 expected = 1,
+               const char* response_override = nullptr,
+               u32 response_override_len = 0) {
         if (expected == 0 || expected > 3) return false;
+        if ((response_override == nullptr) != (response_override_len == 0)) return false;
         expected_requests = expected;
+        response_bytes = response_override != nullptr ? response_override : kBackendResponse;
+        response_bytes_len = response_override != nullptr ? response_override_len
+                                                           : sizeof(kBackendResponse) - 1;
         for (int attempt = 0; attempt < 8; attempt++) {
             listen_fd = socket(AF_INET, SOCK_STREAM, 0);
             if (listen_fd < 0) continue;
@@ -842,6 +899,88 @@ static bool capture_case(u16 frontend_port,
         error = "upstream wire mismatch";
         dump_wire("nginx upstream", nginx_upstream);
         dump_wire("RUT upstream", rut_upstream);
+        return false;
+    }
+    return true;
+}
+
+static bool capture_head_case(u16 frontend_port,
+                              u16 backend_port,
+                              const std::string& nginx_config_path,
+                              const std::string& nginx_log_path,
+                              const std::string& container_name,
+                              std::vector<char>& downstream,
+                              std::vector<char>& upstream,
+                              std::string& error) {
+    Recorder recorder;
+    if (!recorder.setup(backend_port,
+                        1,
+                        kHeadBackendResponse,
+                        sizeof(kHeadBackendResponse) - 1)) {
+        error = "HEAD backend recorder setup failed";
+        return false;
+    }
+
+    DockerGuard docker(container_name);
+    ChildGuard nginx;
+    if (!spawn_child({"docker", "run", "--pull=never", "--network", "host", "--name",
+                      container_name, "-v", nginx_config_path + ":/etc/nginx/nginx.conf:ro",
+                      kNginxImage, "nginx", "-g", "daemon off;"},
+                     nginx_log_path,
+                     nginx.child)) {
+        error = "failed to start pinned nginx for HEAD case";
+        return false;
+    }
+    if (!wait_ready(frontend_port, nginx.child, error)) return false;
+
+    const int client = connect_once(frontend_port);
+    bool ok = client >= 0;
+    if (ok) ok = send_all(client, kHeadRequest, sizeof(kHeadRequest) - 1);
+    if (ok) ok = read_head_response(client, downstream, error);
+    if (ok) ok = read_eof(client, error);
+    if (client >= 0) close(client);
+    if (!ok) {
+        error = "nginx HEAD response/EOF failed: " + error;
+        return false;
+    }
+
+    const bool nginx_stopped = stop_child(nginx.child);
+    const bool container_removed = docker.remove();
+    recorder.stop();
+    if (!nginx_stopped) {
+        error = "failed to stop nginx after HEAD case";
+        return false;
+    }
+    if (!container_removed) {
+        error = "docker rm -f failed after HEAD case";
+        return false;
+    }
+    if (recorder.accepted.load(std::memory_order_acquire) != 1 ||
+        recorder.requests.load(std::memory_order_acquire) != 1 || recorder.history.size() != 1) {
+        error = "HEAD recorder did not observe exactly one request";
+        return false;
+    }
+
+    const std::string expected_request =
+        std::string("HEAD /head?q=1 HTTP/1.1\r\n") +
+        "Host: 127.0.0.1:" + std::to_string(backend_port) + "\r\n\r\n";
+    upstream = recorder.history[0];
+    const std::vector<char> expected_wire(expected_request.begin(), expected_request.end());
+    if (upstream != expected_wire) {
+        error = "HEAD upstream request wire mismatch";
+        dump_wire("expected HEAD upstream", expected_wire);
+        dump_wire("actual HEAD upstream", upstream);
+        return false;
+    }
+
+    std::vector<char> normalized = downstream;
+    const std::vector<char> expected_response(kHeadResponseNormalized,
+                                               kHeadResponseNormalized +
+                                                   sizeof(kHeadResponseNormalized) - 1);
+    if (!normalize_date(normalized) || normalized != expected_response) {
+        error = "HEAD downstream response did not match the exact pinned header-only baseline";
+        dump_wire("expected HEAD response", expected_response);
+        dump_wire("actual HEAD response", downstream);
         return false;
     }
     return true;
@@ -1484,6 +1623,27 @@ int main(int argc, char** argv) {
         return 1;
     }
     std::cerr << "PASS: pinned nginx and RUT unavailable-upstream gateway case (502 + EOF)\n";
+
+    std::vector<char> nginx_head_response;
+    std::vector<char> nginx_head_request;
+    std::string head_error;
+    const std::string head_container = container + "-head";
+    if (!capture_head_case(frontend_port,
+                           backend_port,
+                           temp.nginx_config,
+                           temp.nginx_log,
+                           head_container,
+                           nginx_head_response,
+                           nginx_head_request,
+                           head_error)) {
+        std::cerr << "FAIL [HEAD baseline]: " << head_error << "\n";
+        dump_wire("nginx HEAD response", nginx_head_response);
+        dump_wire("nginx HEAD request", nginx_head_request);
+        dump_log(temp.nginx_log, "nginx log");
+        return 1;
+    }
+    std::cerr << "PASS: pinned nginx HEAD proxy response baseline (header-only downstream, "
+                 "one upstream request)\n";
 
     u16 api_frontend_port = 0;
     u16 api_backend_port = 0;
