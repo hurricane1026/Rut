@@ -714,7 +714,7 @@ static bool starts_with_200(const std::vector<char>& response) {
 }
 
 static bool starts_with_400(const std::vector<char>& response) {
-    static constexpr char kStatus[] = "HTTP/1.1 400 ";
+    static constexpr char kStatus[] = "HTTP/1.1 400 Bad Request\r\n";
     return response.size() >= sizeof(kStatus) - 1 &&
            memcmp(response.data(), kStatus, sizeof(kStatus) - 1) == 0;
 }
@@ -1089,19 +1089,17 @@ static bool capture_api_invalid_case(u16 frontend_port,
     // Keep the RUT process and recorder alive for a fixed interval. Any delayed
     // connect is a failure, even if no complete request reaches the recorder.
     settle_for_invalid_target_side_effects();
+    const bool process_stopped = stop_child(process.child);
     recorder.stop();
-    if (recorder.accepted.load(std::memory_order_acquire) != 0 ||
-        recorder.requests.load(std::memory_order_acquire) != 0 || !recorder.history.empty()) {
+    const bool side_effect_free =
+        recorder.accepted.load(std::memory_order_acquire) == 0 &&
+        recorder.requests.load(std::memory_order_acquire) == 0 && recorder.history.empty();
+    if (!side_effect_free) {
         error = "RUT invalid-target API phase caused an upstream side effect";
         return false;
     }
-    if (!stop_child(process.child)) {
+    if (!process_stopped) {
         error = "failed to stop production RUT after API invalid-target case";
-        return false;
-    }
-    if (recorder.accepted.load(std::memory_order_acquire) != 0 ||
-        recorder.requests.load(std::memory_order_acquire) != 0 || !recorder.history.empty()) {
-        error = "RUT invalid-target recorder changed during teardown";
         return false;
     }
     return true;
