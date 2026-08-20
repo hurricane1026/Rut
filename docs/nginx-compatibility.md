@@ -8,11 +8,11 @@ Allowed states are `SUPPORTED`, `PARTIAL`, `BLOCKED_BY_RUT`,
 
 | nginx feature | parser | converter | RUT capability | behavior test | status |
 | --- | --- | --- | --- | --- | --- |
-| server fragment, exactly one server | no | no | partial: no server selection model | no | NOT_IMPLEMENTED |
-| `listen <port>` IPv4 wildcard | no | no | no source/config listener; #250 | no | BLOCKED_BY_RUT |
-| ordinary prefix `location /` | no | no | partial: root catch-all exists | no | NOT_IMPLEMENTED |
-| location applies to every method | no | no | runtime yes, source no; #251 | no | BLOCKED_BY_RUT |
-| fixed IPv4 HTTP `proxy_pass`, no URI suffix | no | no | partial: fixed `forward` exists | no | NOT_IMPLEMENTED |
+| server fragment, exactly one server | yes | no | partial: no server selection model | no | NOT_IMPLEMENTED |
+| `listen <port>` IPv4 wildcard | yes | no | no source/config listener; #250 | no | BLOCKED_BY_RUT |
+| ordinary prefix `location /` | yes | no | partial: root catch-all exists | no | NOT_IMPLEMENTED |
+| location applies to every method | yes | no | runtime yes, source no; #251 | no | BLOCKED_BY_RUT |
+| fixed IPv4 HTTP `proxy_pass`, no URI suffix | yes | no | partial: fixed `forward` exists | no | NOT_IMPLEMENTED |
 | preserve raw request-target and query | no | no | partial: forward currently sends original bytes | RUT-only tests, no nginx diff | PARTIAL |
 | preserve request method and body | no | no | partial: proxy streaming exists | RUT-only tests, no nginx diff | PARTIAL |
 | nginx default upstream HTTP version and request headers | no | no | missing request policy; #252 | no | BLOCKED_BY_RUT |
@@ -37,4 +37,3 @@ Allowed states are `SUPPORTED`, `PARTIAL`, `BLOCKED_BY_RUT`,
 - Default request and response hop-by-hop/header behavior is not transparent
   byte forwarding.
 - RUT's current unmatched-route response is not nginx's normal 404 behavior.
-

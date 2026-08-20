@@ -186,6 +186,16 @@ target_include_directories(rut_harness_core PUBLIC
     ${PROJECT_SOURCE_DIR}/include
 )
 
+# Standalone nginx compatibility frontend. It owns only nginx syntax and the
+# minimal semantic model; it deliberately does not depend on the Rut grammar or
+# runtime/lowering libraries.
+add_library(rut_nginx STATIC
+    nginx/parser.cc
+)
+target_include_directories(rut_nginx PUBLIC
+    ${PROJECT_SOURCE_DIR}/include
+)
+
 # SIMD source needs to find simd.h and char_tables.h via "simd.h" include
 target_include_directories(rut_runtime PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}
