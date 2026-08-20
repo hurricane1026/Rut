@@ -5702,7 +5702,7 @@ inline bool build_redirect_response(const Connection& conn,
                                    u32* out_len) {
     if (out_len == nullptr) return false;
     *out_len = 0;
-    if (out == nullptr || !conn.listener_context.valid() ||
+    if (out == nullptr || conn.tls_active || !conn.listener_context.valid() ||
         conn.listener_context.transport != ListenerTransport::Cleartext ||
         !config.redirect_policy_id_is_valid(policy_id))
         return false;
