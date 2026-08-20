@@ -8973,6 +8973,12 @@ static u64 forward_response_policy_1_handler(void* /*conn*/,
     return rut::jit::HandlerResult::make_forward_with_policies(0, 0, 1).pack();
 }
 
+static u64 forward_response_policy_with_tls_flag_handler(
+    void* raw_conn, rut::jit::HandlerCtx* /*ctx*/, const u8* /*req*/, u32 /*len*/, void* /*arena*/) {
+    static_cast<rut::Connection*>(raw_conn)->tls_active = true;
+    return rut::jit::HandlerResult::make_forward_with_policies(0, 0, 1).pack();
+}
+
 static u64 forward_request_and_response_policy_handler(void* /*conn*/,
                                                         rut::jit::HandlerCtx* /*ctx*/,
                                                         const u8* /*req*/,
@@ -15937,6 +15943,7 @@ struct RecordingUpstream {
     u32 response_chunk_size = 0;
     u32 response_chunk_delay_us = 0;
     u32 response_split_offset = 0;
+    bool keep_open = false;
     bool started = false;
     pthread_t thread{};
 
@@ -15987,6 +15994,7 @@ struct RecordingUpstream {
                     if (s->response_chunk_delay_us != 0) usleep(s->response_chunk_delay_us);
                 }
             }
+            if (s->keep_open) usleep(150000);
             close(client);
         }
         return nullptr;
@@ -16054,6 +16062,7 @@ TEST(route, response_policy_rejects_strict_invalid_final_vectors) {
         "HTTP/1.1 100 Continue\r\nContent-Length: 0\r\n\r\n",
         "HTTP/1.1 103 Early Hints\r\nContent-Length: 0\r\n\r\n",
         "HTTP/1.1 101 Switching Protocols\r\nContent-Length: 0\r\n\r\n",
+        "HTTP/1.0 200 OK\r\nContent-Length: 0\r\n\r\n",
         "HTTP/1.1 200\r\nContent-Length: 0\r\n\r\n",
         "HTTP/1.1 200 OK\r\n\r\n",
         "HTTP/1.1 200 OK\r\nContent-Length: 0\r\nContent-Length: 0\r\n\r\n",
@@ -16066,6 +16075,28 @@ TEST(route, response_policy_rejects_strict_invalid_final_vectors) {
         "HTTP/1.1 200 OK\r\nContent-Length: 1\r\n\r\nxx",
     };
     for (const char* response : kCases) CHECK(run_strict_response_rejection_case(response));
+
+    char truncated[4096]{};
+    u32 truncated_len = 0;
+    const int prefix_len = snprintf(truncated, sizeof(truncated), "HTTP/1.1 200 OK\r\n");
+    REQUIRE_GT(prefix_len, 0);
+    truncated_len = static_cast<u32>(prefix_len);
+    for (u32 i = 0; i < 70; i++) {
+        const int written = snprintf(truncated + truncated_len,
+                                     sizeof(truncated) - truncated_len,
+                                     "X-Fill-%u: v\r\n",
+                                     i);
+        REQUIRE_GT(written, 0);
+        truncated_len += static_cast<u32>(written);
+        REQUIRE_LT(truncated_len, static_cast<u32>(sizeof(truncated)));
+    }
+    const int suffix_len = snprintf(truncated + truncated_len,
+                                    sizeof(truncated) - truncated_len,
+                                    "Content-Length: 0\r\n\r\n");
+    REQUIRE_GT(suffix_len, 0);
+    truncated_len += static_cast<u32>(suffix_len);
+    REQUIRE_LT(truncated_len, static_cast<u32>(sizeof(truncated)));
+    CHECK(run_strict_response_rejection_case(truncated));
 }
 
 TEST(route, forward_request_policy_rebuilds_nginx_h11_headers) {
@@ -16328,6 +16359,41 @@ TEST(route, response_policy_rejects_before_upstream_accept) {
     }
 }
 
+TEST(route, response_policy_rejects_tls_admission_before_upstream_accept) {
+    using namespace rut;
+    RecordingUpstream backend;
+    REQUIRE(backend.setup());
+    RouteConfig cfg{};
+    auto id = cfg.add_upstream("backend", 0x7F000001, backend.port);
+    REQUIRE(id.has_value());
+    REQUIRE_EQ(cfg.add_response_policy(test_response_policy_spec()), 1u);
+    REQUIRE(cfg.add_jit_handler("/api", 'G', &forward_response_policy_with_tls_flag_handler));
+    const RouteConfig* active = &cfg;
+    ScopedProxyLoop proxy;
+    REQUIRE(proxy.setup(&active, 1000));
+
+    struct ClientFdGuard {
+        i32 fd;
+        ~ClientFdGuard() {
+            if (fd >= 0) close(fd);
+        }
+    } client{connect_to(proxy.port)};
+    REQUIRE_GE(client.fd, 0);
+    set_socket_timeouts(client.fd, 2);
+    static constexpr char kRequest[] = "GET /api HTTP/1.1\r\nHost: client.example\r\n\r\n";
+    REQUIRE(send_all(client.fd, kRequest, sizeof(kRequest) - 1));
+    char response[512];
+    const i32 response_len = recv_timeout(client.fd, response, sizeof(response), 2000);
+    CHECK_GT(response_len, 0);
+    CHECK(buf_contains(response,
+                       static_cast<u32>(response_len),
+                       "400",
+                       static_cast<u32>(strlen("400"))));
+    usleep(100000);
+    CHECK_EQ(backend.accepted_count.load(std::memory_order_acquire), 0u);
+    CHECK_EQ(backend.request_count.load(std::memory_order_acquire), 0u);
+}
+
 TEST(route, response_policy_serializes_strict_h1_final_response) {
     using namespace rut;
     RecordingUpstream backend;
@@ -16402,54 +16468,112 @@ TEST(route, response_policy_serializes_strict_h1_final_response) {
     CHECK_EQ(backend.request_count.load(std::memory_order_acquire), 1u);
 }
 
-TEST(route, response_policy_postcommit_teardown_releases_slot) {
-    auto run_case = [](const char* upstream_response, u32 split_offset) {
+TEST(route, response_policy_never_pools_and_short_body_closes) {
+    static constexpr char kRequest[] = "GET /api HTTP/1.1\r\nHost: client.example\r\n\r\n";
+    struct ClientFdGuard {
+        i32 fd;
+        ~ClientFdGuard() {
+            if (fd >= 0) close(fd);
+        }
+    };
+
+    // A backend that keeps the first socket open makes an accidental upstream
+    // pool hit observable: the second request would be written to the same
+    // recorder connection, which does not read a second request or emit a
+    // second response. Strict policy must close that socket after each valid
+    // Content-Length response.
+    {
         RecordingUpstream backend;
-        backend.response = upstream_response;
-        backend.response_len = static_cast<u32>(strlen(upstream_response));
-        backend.response_split_offset = split_offset;
-        backend.response_chunk_delay_us = 50000;
-        if (!backend.setup()) return false;
+        backend.keep_open = true;
+        REQUIRE(backend.setup());
         RouteConfig cfg{};
         auto id = cfg.add_upstream("backend", 0x7F000001, backend.port);
-        if (!id.has_value()) return false;
+        REQUIRE(id.has_value());
         cfg.upstreams[id.value()].max_inflight = 1;
-        if (cfg.add_response_policy(test_response_policy_spec()) != 1u ||
-            !cfg.add_jit_handler("/api", 'G', &forward_request_and_response_policy_handler))
-            return false;
+        REQUIRE_EQ(cfg.add_response_policy(test_response_policy_spec()), 1u);
+        REQUIRE(cfg.add_jit_handler("/api", 'G', &forward_request_and_response_policy_handler));
         const RouteConfig* active = &cfg;
         ScopedProxyLoop proxy;
-        if (!proxy.setup(&active, 1000)) return false;
-        static constexpr char kRequest[] = "GET /api HTTP/1.1\r\nHost: client.example\r\n\r\n";
+        REQUIRE(proxy.setup(&active, 1000, /*enable_reuse=*/true));
+
         for (u32 attempt = 0; attempt < 2; attempt++) {
-            i32 client = connect_to(proxy.port);
-            if (client < 0 || !send_all(client, kRequest, sizeof(kRequest) - 1)) {
-                if (client >= 0) close(client);
-                return false;
+            ClientFdGuard client{connect_to(proxy.port)};
+            REQUIRE_GE(client.fd, 0);
+            set_socket_timeouts(client.fd, 2);
+            REQUIRE(send_all(client.fd, kRequest, sizeof(kRequest) - 1));
+            char response[2048]{};
+            u32 total = 0;
+            for (u32 read = 0; read < 16 && total < sizeof(response); read++) {
+                const i32 got = recv_timeout(client.fd,
+                                             response + total,
+                                             sizeof(response) - total,
+                                             2000);
+                if (got <= 0) break;
+                total += static_cast<u32>(got);
+                if (buf_contains(response, total, "\r\n\r\nok", 6)) break;
             }
-            set_socket_timeouts(client, 2);
-            char response[2048];
-            (void)recv_timeout(client, response, sizeof(response), 2000);
-            // Leave the first connection alive long enough for the delayed
-            // excess vector to arrive after its framed body started draining.
-            if (split_offset != 0) usleep(150000);
-            close(client);
+            CHECK(buf_contains(response, total, "HTTP/1.1 200", 12));
+            CHECK(buf_contains(response, total, "\r\n\r\nok", 6));
             for (u32 spin = 0;
                  spin < 100 && backend.accepted_count.load(std::memory_order_acquire) <= attempt;
                  spin++)
                 usleep(10000);
+            CHECK_EQ(backend.accepted_count.load(std::memory_order_acquire), attempt + 1);
         }
-        return backend.accepted_count.load(std::memory_order_acquire) == 2u;
-    };
-    static constexpr char kShort[] =
-        "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\no";
-    CHECK(run_case(kShort, 0));
-    static constexpr char kExcess[] =
-        "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nokEXCESS";
-    const char* body_end = strstr(kExcess, "\r\n\r\n");
-    REQUIRE(body_end != nullptr);
-    const u32 split = static_cast<u32>(body_end - kExcess) + 6;
-    CHECK(run_case(kExcess, split));
+    }
+
+    // A short post-commit body must close the downstream connection, not be
+    // mistaken for a successful response. Repeating the request with
+    // max_inflight=1 proves the slot is released after the truncation.
+    {
+        static constexpr char kShort[] =
+            "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\no";
+        RecordingUpstream backend;
+        backend.response = kShort;
+        backend.response_len = sizeof(kShort) - 1;
+        backend.keep_open = true;
+        REQUIRE(backend.setup());
+        RouteConfig cfg{};
+        auto id = cfg.add_upstream("backend", 0x7F000001, backend.port);
+        REQUIRE(id.has_value());
+        cfg.upstreams[id.value()].max_inflight = 1;
+        REQUIRE_EQ(cfg.add_response_policy(test_response_policy_spec()), 1u);
+        REQUIRE(cfg.add_jit_handler("/api", 'G', &forward_request_and_response_policy_handler));
+        const RouteConfig* active = &cfg;
+        ScopedProxyLoop proxy;
+        REQUIRE(proxy.setup(&active, 1000, /*enable_reuse=*/true));
+
+        for (u32 attempt = 0; attempt < 2; attempt++) {
+            ClientFdGuard client{connect_to(proxy.port)};
+            REQUIRE_GE(client.fd, 0);
+            set_socket_timeouts(client.fd, 2);
+            REQUIRE(send_all(client.fd, kRequest, sizeof(kRequest) - 1));
+            char response[2048]{};
+            u32 total = 0;
+            bool saw_eof = false;
+            for (u32 read = 0; read < 16 && total < sizeof(response); read++) {
+                const i32 got = recv_timeout(client.fd,
+                                             response + total,
+                                             sizeof(response) - total,
+                                             2000);
+                if (got == 0) {
+                    saw_eof = true;
+                    break;
+                }
+                if (got < 0) break;
+                total += static_cast<u32>(got);
+            }
+            CHECK(!buf_contains(response, total, "\r\n\r\nok", 6));
+            CHECK(saw_eof);
+            // The gateway closes after upstream EOF; the next iteration can
+            // only acquire max_inflight=1 if that failure released its slot.
+            for (u32 spin = 0;
+                 spin < 100 && backend.accepted_count.load(std::memory_order_acquire) <= attempt;
+                 spin++)
+                usleep(10000);
+            CHECK_EQ(backend.accepted_count.load(std::memory_order_acquire), attempt + 1);
+        }
+    }
 }
 
 TEST(route, response_policy_rejects_pending_response_mutation_before_upstream_accept) {
@@ -16568,22 +16692,38 @@ TEST(shard, serves_http2_timer_resume_response_policy_fails_closed) {
     Shard<EpollEventLoop> shard;
     i32 lfd = create_listen_socket(0).value_or(-1);
     REQUIRE(lfd >= 0);
+    struct ShardGuard {
+        Shard<EpollEventLoop>& shard;
+        i32& listen_fd;
+        i32 client_fd = -1;
+        bool spawned = false;
+        ~ShardGuard() {
+            if (client_fd >= 0) close(client_fd);
+            if (spawned) {
+                shard.stop();
+                shard.join();
+            }
+            shard.shutdown();
+            if (listen_fd >= 0) close(listen_fd);
+        }
+    } guard{shard, lfd};
     REQUIRE(shard.init(0, lfd).has_value());
     shard.route_config = &cfg;
     REQUIRE(shard.spawn(-1).has_value());
+    guard.spawned = true;
     usleep(50000);
 
-    i32 client = connect_to(get_port(lfd));
-    REQUIRE(client >= 0);
-    set_socket_timeouts(client, 2);
+    guard.client_fd = connect_to(get_port(lfd));
+    REQUIRE(guard.client_fd >= 0);
+    set_socket_timeouts(guard.client_fd, 2);
     u8 request[512];
     u32 request_len = h2_client_prologue(request);
     request_len += h2_client_get(request + request_len, sizeof(request) - request_len, 1, "/api", 4);
-    REQUIRE(write_all_fd(client, request, request_len));
+    REQUIRE(write_all_fd(guard.client_fd, request, request_len));
     u8 response[4096];
     u32 total = 0;
     for (u32 attempt = 0; attempt < 12 && total < sizeof(response); attempt++) {
-        const i32 got = recv_timeout(client,
+        const i32 got = recv_timeout(guard.client_fd,
                                      reinterpret_cast<char*>(response + total),
                                      sizeof(response) - total,
                                      2000);
@@ -16592,11 +16732,6 @@ TEST(shard, serves_http2_timer_resume_response_policy_fails_closed) {
         if (h2_status_for_stream(response, total, 1) != 0) break;
     }
     CHECK_EQ(h2_status_for_stream(response, total, 1), 400u);
-    close(client);
-    shard.stop();
-    shard.join();
-    shard.shutdown();
-    close(lfd);
     CHECK_EQ(backend.accepted_count.load(std::memory_order_acquire), 0u);
     CHECK_EQ(backend.request_count.load(std::memory_order_acquire), 0u);
 }

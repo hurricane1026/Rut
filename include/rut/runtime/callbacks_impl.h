@@ -3893,10 +3893,12 @@ void proxy_stream_complete(Loop* loop, Connection& conn) {
     // check there to avoid needlessly dropping a reusable connection.)
     if (!conn.tls_proxy_stream && conn.upstream_recv_buf.len() > 0)
         conn.upstream_keep_alive = false;
-    if (conn.response_policy_id != 0 && conn.upstream_recv_buf.len() > 0) {
-        loop->close_conn(conn);
-        return;
-    }
+    // The strict response profile deliberately never parks an upstream socket:
+    // nginx's literal proxy_pass opens a fresh backend connection for each
+    // request in the pinned compatibility experiment.  Any bytes beyond the
+    // declared body are discarded after the downstream response completed;
+    // bytes observed before completion are still rejected by the body pump.
+    if (conn.response_policy_id != 0) conn.upstream_keep_alive = false;
     conn.upstream_recv_buf.reset();
     release_upstream_slot(loop, conn);  // free the backend slot promptly
 
@@ -5595,6 +5597,11 @@ void on_proxy_response_sent(void* lp, Connection& conn, IoEvent ev) {
         loop->close_conn(conn);
         return;
     }
+
+    // Strict response-policy upstreams are intentionally never pooled.  The
+    // downstream HTTP/1.1 connection may remain keep-alive; only the backend
+    // socket is closed by release_upstream_conn below.
+    if (conn.response_policy_id != 0) conn.upstream_keep_alive = false;
 
     // Surplus upstream bytes beyond the one-shot response we sent
     // (upstream_send_len) mean a desynced stream — refuse reuse, mirroring
