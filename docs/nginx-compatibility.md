@@ -15,9 +15,9 @@ Allowed states are `SUPPORTED`, `PARTIAL`, `BLOCKED_BY_RUT`,
 | fixed IPv4 HTTP `proxy_pass`, no URI suffix | yes | no | partial: fixed `forward` exists | no | NOT_IMPLEMENTED |
 | preserve raw request-target and query | no | no | partial: forward currently sends original bytes | RUT-only tests, no nginx diff | PARTIAL |
 | preserve request method and body | no | no | partial: proxy streaming exists | RUT-only tests, no nginx diff | PARTIAL |
-| nginx default upstream HTTP version and request headers | no | no | partial: explicit fixed HTTP/1.1 header-only policy; #252 | RUT exact recording-upstream and H1/H2 fail-closed tests; no nginx diff | PARTIAL |
+| nginx default upstream HTTP version and request headers | no | no | partial: explicit fixed HTTP/1.1 header-only policy; #252 | RUT exact recording-upstream and H1/H2 fail-closed tests; pinned manual nginx/RUT vector | PARTIAL |
 | proxied response status and body | no | no | partial: streaming proxy exists | RUT-only tests, no nginx diff | PARTIAL |
-| nginx default proxied response header policy | no | no | partial: bounded strict H1.1 final-response/content-length serializer; #253 | RUT exact serializer and fail-closed tests; no nginx diff | PARTIAL |
+| nginx default proxied response header policy | no | no | partial: bounded strict H1.1 final-response/content-length serializer; #253 | RUT exact serializer/fail-closed tests and pinned manual nginx/RUT vector | PARTIAL |
 | single unavailable upstream gateway error | no | no | partial: 502/504 paths exist | RUT-only tests, no nginx diff | PARTIAL |
 | exact, `^~`, regex, or nested locations | no | no | no nginx selection semantics | no | NOT_PLANNED |
 | `proxy_pass` with URI replacement | no | no | literal path rewrite only | no | NOT_PLANNED |
