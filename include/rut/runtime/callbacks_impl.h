@@ -498,6 +498,9 @@ inline bool apply_request_policy(Connection& conn, const sockaddr_in& endpoint, 
 enum class RequestPolicyBodyState : u8 { Invalid, Complete, Waiting };
 RequestPolicyBodyState inspect_request_policy_body(const Connection& conn,
                                                    u16 policy_id);
+inline bool request_policy_body_response_domain(const Connection& conn);
+inline bool request_policy_body_response_admitted(const Connection& conn);
+inline bool strict_response_upload_ready(const Connection& conn);
 template <typename Loop>
 inline void reject_request_policy(Loop* loop, Connection& conn);
 template <typename Loop>
@@ -2220,7 +2223,10 @@ void handle_jit_outcome(Loop* loop,
                  conn.req_method == static_cast<u8>(LogHttpMethod::Head) ||
                  conn.tls_active ||
                  conn.req_path_canon.ptr == nullptr ||
-                 conn.req_wants_upgrade || conn.req_body_mode != BodyMode::None ||
+                 conn.req_wants_upgrade ||
+                 ((conn.req_body_mode != BodyMode::None ||
+                   conn.request_body_fully_buffered) &&
+                  !request_policy_body_response_admitted(conn)) ||
                  target.addr_count != 1 || target.addrs[0].sin_family != AF_INET ||
                  conn.resp_header_mutation_count != 0 ||
                  conn.resp_header_mutation_pending_count != 0 ||
@@ -3764,6 +3770,10 @@ void on_response_header_sent(void* lp, Connection& conn, IoEvent ev) {
         loop->close_conn(conn);
         return;
     }
+    if (conn.response_policy_id != 0 && !strict_response_upload_ready(conn)) {
+        loop->close_conn(conn);
+        return;
+    }
 
     conn.set_slots(nullptr, nullptr, &on_response_body_recvd<Loop>, nullptr);
     const u32 kRemaining = consume_upstream_sent(conn);
@@ -4001,6 +4011,10 @@ void on_response_body_recvd(void* lp, Connection& conn, IoEvent ev) {
 // resp_fully_buffered are per-response — cleared here, the keep-alive boundary.
 template <typename Loop>
 void proxy_stream_complete(Loop* loop, Connection& conn) {
+    if (conn.response_policy_id != 0 && !strict_response_upload_ready(conn)) {
+        loop->close_conn(conn);
+        return;
+    }
     conn.tls_proxy_stream = false;
     conn.resp_fully_buffered = false;
     conn.tls_recv_paused_hw = false;  // per-response; must not leak into the next request
@@ -4102,6 +4116,11 @@ void on_response_body_sent(void* lp, Connection& conn, IoEvent ev) {
     auto* loop = static_cast<Loop*>(lp);
 
     if (ev.result <= 0) {
+        loop->close_conn(conn);
+        return;
+    }
+
+    if (conn.response_policy_id != 0 && !strict_response_upload_ready(conn)) {
         loop->close_conn(conn);
         return;
     }
@@ -5091,6 +5110,37 @@ inline bool response_policy_name_eq(Str name, const char* literal, u32 len) {
     return name.len == len && http_header_name_eq_ci(name.ptr, name.len, literal, len);
 }
 
+// The #252 body slice is eligible for the strict #253 response profile only
+// after request-policy materialisation has proved a fixed Content-Length request
+// is complete and no client pipeline suffix was included in that request. A
+// header-only request remains outside this predicate and keeps the original
+// response-policy admission path.
+inline bool request_policy_body_response_domain(const Connection& conn) {
+    return conn.request_policy_id != 0 && conn.request_body_fully_buffered;
+}
+
+inline bool request_policy_body_response_admitted(const Connection& conn) {
+    if (!request_policy_body_response_domain(conn) || conn.request_policy_body_pending ||
+        conn.req_body_streamed || conn.req_body_remaining != 0 ||
+        (conn.req_body_mode != BodyMode::None && conn.req_body_mode != BodyMode::ContentLength) ||
+        conn.recv_buf.len() != conn.req_initial_send_len)
+        return false;
+    return request_policy_is_supported(conn.request_policy_id);
+}
+
+// Check immediately before strict response headers are committed. The body
+// counters are advanced before asynchronous upstream writes, so they cannot
+// by themselves prove that the complete buffered request was uploaded.
+inline bool strict_response_upload_ready(const Connection& conn) {
+    if (!request_policy_body_response_domain(conn)) return true;
+    return !conn.request_policy_body_pending && conn.req_body_remaining == 0 &&
+           (conn.req_body_mode == BodyMode::None || conn.req_body_mode == BodyMode::ContentLength) &&
+           conn.request_upload_complete && !conn.upstream_request_incomplete &&
+           !conn.req_body_streamed &&
+           conn.pipeline_stash_len == 0 && conn.retry_req_send_len == 0 &&
+           conn.recv_buf.len() == 0 && !conn.upstream_reused;
+}
+
 inline bool strict_response_forbidden(Str name) {
     if (response_policy_name_eq(name, "connection", 10) ||
         response_policy_name_eq(name, "keep-alive", 10) ||
@@ -5428,6 +5478,7 @@ void on_upstream_response(void* lp, Connection& conn, IoEvent ev) {
             conn.resp_header_mutation_count != 0 || conn.resp_header_mutation_pending_count != 0 ||
             conn.resp_header_mutation_pending_overflow || conn.resp_header_mutation_overflow ||
             !conn.request_config ||
+            !strict_response_upload_ready(conn) ||
             (conn.upstream_recv_buf.len() > resp_parser.header_end &&
              conn.upstream_recv_buf.len() - resp_parser.header_end > resp.content_length) ||
             !build_strict_response_headers(conn, *conn.request_config, resp)) {
@@ -5710,6 +5761,11 @@ void on_proxy_response_sent(void* lp, Connection& conn, IoEvent ev) {
     conn.clear_slots();
 
     if (ev.result < 0) {
+        loop->close_conn(conn);
+        return;
+    }
+
+    if (conn.response_policy_id != 0 && !strict_response_upload_ready(conn)) {
         loop->close_conn(conn);
         return;
     }

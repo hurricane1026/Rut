@@ -4228,6 +4228,70 @@ TEST(upstream_reuse, early_response_failed_body_send_marks_incomplete) {
     if (c->upstream_fd >= 0) close(c->upstream_fd);
 }
 
+// A buffered request-policy body must not select the strict response serializer
+// merely because its body counters read complete. Both an early final response
+// while the request send is still in flight and a failed request send fail closed
+// with 502, release the slot marker, and close the upstream fd.
+TEST(response_policy, buffered_request_requires_successful_upload) {
+    SmallLoop loop;
+    loop.setup();
+    RouteConfig cfg{};
+    ForwardResponsePolicySpec policy{};
+    static constexpr char kServer[] = "nginx/1.29.7";
+    policy.version = ResponsePolicyVersion::Http11;
+    policy.framing = ResponsePolicyFraming::ContentLength;
+    policy.connection = ResponsePolicyConnection::KeepAlive;
+    policy.date = ResponsePolicyDate::Current;
+    policy.server = {kServer, sizeof(kServer) - 1};
+    REQUIRE_EQ(cfg.add_response_policy(policy), 1u);
+
+    auto prepare = [&](Connection* c) {
+        REQUIRE(c != nullptr);
+        REQUIRE(loop.alloc_upstream_buf(*c));
+        c->request_config = &cfg;
+        c->response_policy_id = 1;
+        c->request_policy_id = 1;
+        c->request_body_fully_buffered = true;
+        c->request_policy_body_pending = false;
+        c->req_body_mode = BodyMode::ContentLength;
+        c->req_body_remaining = 0;
+        c->req_body_streamed = false;
+        c->req_http_version = static_cast<u8>(HttpVersion::Http11);
+        c->req_method = static_cast<u8>(LogHttpMethod::Post);
+        c->req_keep_alive = true;
+        c->req_path_canon = {"api", 3};
+        static constexpr char kRequest[] =
+            "POST /api HTTP/1.1\r\nHost: x\r\nContent-Length: 1\r\n\r\nX";
+        REQUIRE_EQ(c->recv_buf.write(reinterpret_cast<const u8*>(kRequest), sizeof(kRequest) - 1),
+                   sizeof(kRequest) - 1);
+        c->req_initial_send_len = c->recv_buf.len();
+        c->upstream_fd = dup(2);
+        REQUIRE(c->upstream_fd >= 0);
+        static constexpr char kResponse[] =
+            "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok";
+        REQUIRE_EQ(c->upstream_recv_buf.write(reinterpret_cast<const u8*>(kResponse),
+                                              sizeof(kResponse) - 1),
+                   sizeof(kResponse) - 1);
+    };
+
+    auto* early = loop.alloc_conn();
+    prepare(early);
+    on_body_send_with_early_response<SmallLoop>(
+        static_cast<void*>(&loop), *early, make_ev(early->id, IoEventType::UpstreamSend, 1));
+    CHECK_EQ(early->resp_status, kStatusBadGateway);
+    CHECK_EQ(early->upstream_fd, -1);
+    CHECK(!early->upstream_slot_held);
+
+    auto* failed = loop.alloc_conn();
+    prepare(failed);
+    on_upstream_request_sent<SmallLoop>(
+        static_cast<void*>(&loop), *failed, make_ev(failed->id, IoEventType::UpstreamSend, -EPIPE));
+    CHECK_EQ(failed->resp_status, kStatusBadGateway);
+    CHECK(failed->upstream_request_incomplete);
+    CHECK_EQ(failed->upstream_fd, -1);
+    CHECK(!failed->upstream_slot_held);
+}
+
 // Finding 4: a stale same-batch UpstreamSend dispatched into the on_upstream_connected
 // slot (after a retry swapped the slot) must be ignored — it is the old fd's send
 // completion, not a connect result. on_upstream_connected only ever handles connect

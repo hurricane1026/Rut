@@ -16815,6 +16815,128 @@ TEST(route, response_policy_serializes_strict_h1_final_response) {
     CHECK_EQ(backend.request_count.load(std::memory_order_acquire), 1u);
 }
 
+TEST(route, response_policy_admits_buffered_request_policy_body) {
+    using namespace rut;
+    RecordingUpstream backend;
+    REQUIRE(backend.setup());
+    RouteConfig cfg{};
+    auto id = cfg.add_upstream("backend", 0x7F000001, backend.port);
+    REQUIRE(id.has_value());
+    REQUIRE_EQ(cfg.add_response_policy(test_response_policy_spec()), 1u);
+    REQUIRE(cfg.add_jit_handler("/api", 0, &forward_request_and_response_policy_handler));
+    const RouteConfig* active = &cfg;
+    ScopedProxyLoop proxy;
+    REQUIRE(proxy.setup(&active, 1000));
+
+    auto read_strict_response = [](i32 fd) {
+        char response[2048]{};
+        u32 n = 0;
+        for (u32 attempt = 0; attempt < 16 && n < sizeof(response); attempt++) {
+            const i32 got = recv_timeout(fd, response + n, sizeof(response) - n, 2000);
+            if (got <= 0) break;
+            n += static_cast<u32>(got);
+            if (buf_contains(response, n, "\r\n\r\nok", 6)) break;
+        }
+        if (n == 0 || !buf_contains(response, n, "HTTP/1.1 200 OK", 15)) return false;
+        char normalized[2048]{};
+        if (n >= sizeof(normalized)) return false;
+        memcpy(normalized, response, n);
+        char* date = strstr(normalized, "Date: ");
+        if (!date) return false;
+        for (u32 i = 0; i < 29 && date[6 + i] != '\r'; i++) date[6 + i] = 'X';
+        static constexpr char kExpected[] =
+            "HTTP/1.1 200 OK\r\n"
+            "Server: nginx/1.29.7\r\n"
+            "Date: XXXXXXXXXXXXXXXXXXXXXXXXXXXXX\r\n"
+            "Content-Length: 2\r\n"
+            "Connection: keep-alive\r\n"
+            "\r\nok";
+        return n == sizeof(kExpected) - 1 &&
+               memcmp(normalized, kExpected, sizeof(kExpected) - 1) == 0;
+    };
+    auto wait_requests = [&](u32 count) {
+        for (u32 spin = 0;
+             spin < 400 && backend.request_count.load(std::memory_order_acquire) < count;
+             spin++)
+            usleep(5000);
+    };
+
+    // Coalesced binary body: the strict response policy is selected together
+    // with the request policy and must not fall back to transparent forwarding.
+    static constexpr char kHead[] =
+        "POST /api HTTP/1.1\r\nHost: client.example\r\nContent-Length: 6\r\n\r\n";
+    const u8 body[] = {0x00, 0xff, 0x0d, 0x0a, 0x61, 0x7f};
+    char request[sizeof(kHead) - 1 + sizeof(body)];
+    memcpy(request, kHead, sizeof(kHead) - 1);
+    memcpy(request + sizeof(kHead) - 1, body, sizeof(body));
+    i32 client = connect_to(proxy.port);
+    REQUIRE_GE(client, 0);
+    set_socket_timeouts(client, 3);
+    REQUIRE(send_all(client, request, sizeof(request)));
+    CHECK(read_strict_response(client));
+    close(client);
+    wait_requests(1);
+    REQUIRE_EQ(backend.accepted_count.load(std::memory_order_acquire), 1u);
+    REQUIRE_EQ(backend.request_count.load(std::memory_order_acquire), 1u);
+    CHECK_EQ(backend.request_body_len, static_cast<u32>(sizeof(body)));
+    CHECK(memcmp(backend.request + backend.request_header_len, body, sizeof(body)) == 0);
+
+    // Segmented body: no backend accept is allowed after only a body prefix.
+    static constexpr char kSegmentedHead[] =
+        "POST /api HTTP/1.1\r\nHost: client.example\r\nContent-Length: 5\r\n\r\n";
+    client = connect_to(proxy.port);
+    REQUIRE_GE(client, 0);
+    set_socket_timeouts(client, 3);
+    REQUIRE(send_all(client, kSegmentedHead, sizeof(kSegmentedHead) - 1));
+    REQUIRE(send_all(client, "he", 2));
+    usleep(100000);
+    CHECK_EQ(backend.accepted_count.load(std::memory_order_acquire), 1u);
+    CHECK_EQ(backend.request_count.load(std::memory_order_acquire), 1u);
+    REQUIRE(send_all(client, "llo", 3));
+    CHECK(read_strict_response(client));
+    close(client);
+    wait_requests(2);
+    REQUIRE_EQ(backend.accepted_count.load(std::memory_order_acquire), 2u);
+    REQUIRE_EQ(backend.request_count.load(std::memory_order_acquire), 2u);
+    CHECK_EQ(backend.request_body_len, 5u);
+    CHECK(memcmp(backend.request + backend.request_header_len, "hello", 5) == 0);
+
+    // Explicit Content-Length: 0 is a completed buffered request-policy body.
+    static constexpr char kZero[] =
+        "POST /api HTTP/1.1\r\nHost: client.example\r\nContent-Length: 0\r\n\r\n";
+    client = connect_to(proxy.port);
+    REQUIRE_GE(client, 0);
+    set_socket_timeouts(client, 3);
+    REQUIRE(send_all(client, kZero, sizeof(kZero) - 1));
+    CHECK(read_strict_response(client));
+    close(client);
+    wait_requests(3);
+    REQUIRE_EQ(backend.accepted_count.load(std::memory_order_acquire), 3u);
+    REQUIRE_EQ(backend.request_count.load(std::memory_order_acquire), 3u);
+    CHECK_EQ(backend.request_body_len, 0u);
+
+    // The first body slice deliberately rejects an initial pipeline suffix
+    // before connecting, rather than allowing strict response serialization to
+    // guess whether the suffix was uploaded.
+    const u32 accepted_before = backend.accepted_count.load(std::memory_order_acquire);
+    const u32 requests_before = backend.request_count.load(std::memory_order_acquire);
+    static constexpr char kPipelined[] =
+        "POST /api HTTP/1.1\r\nHost: client.example\r\nContent-Length: 3\r\n\r\n"
+        "abcGET /api HTTP/1.1\r\nHost: client.example\r\n\r\n";
+    client = connect_to(proxy.port);
+    REQUIRE_GE(client, 0);
+    set_socket_timeouts(client, 3);
+    REQUIRE(send_all(client, kPipelined, sizeof(kPipelined) - 1));
+    char rejected[512];
+    const i32 rejected_len = recv_timeout(client, rejected, sizeof(rejected), 2000);
+    CHECK(rejected_len > 0 &&
+          buf_contains(rejected, static_cast<u32>(rejected_len), "400", 3));
+    close(client);
+    usleep(100000);
+    CHECK_EQ(backend.accepted_count.load(std::memory_order_acquire), accepted_before);
+    CHECK_EQ(backend.request_count.load(std::memory_order_acquire), requests_before);
+}
+
 TEST(route, response_policy_never_pools_and_short_body_closes) {
     static constexpr char kRequest[] = "GET /api HTTP/1.1\r\nHost: client.example\r\n\r\n";
     struct ClientFdGuard {
