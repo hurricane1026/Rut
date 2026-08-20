@@ -15944,6 +15944,9 @@ struct RecordingUpstream {
     u32 response_chunk_delay_us = 0;
     u32 response_split_offset = 0;
     bool keep_open = false;
+    static constexpr u32 kMaxHeldFds = 8;
+    i32 held_fds[kMaxHeldFds]{};
+    u32 held_fd_count = 0;
     bool started = false;
     pthread_t thread{};
 
@@ -15994,8 +15997,15 @@ struct RecordingUpstream {
                     if (s->response_chunk_delay_us != 0) usleep(s->response_chunk_delay_us);
                 }
             }
-            if (s->keep_open) usleep(150000);
-            close(client);
+            if (s->keep_open && s->held_fd_count < kMaxHeldFds) {
+                // Keep the backend connection open and deliberately unread after
+                // one response. The accept loop remains free to service a second
+                // connection, while accidental gateway pooling cannot recover by
+                // waiting for this fixture to close the first socket.
+                s->held_fds[s->held_fd_count++] = client;
+            } else {
+                close(client);
+            }
         }
         return nullptr;
     }
@@ -16022,6 +16032,11 @@ struct RecordingUpstream {
             pthread_join(thread, nullptr);
             started = false;
         }
+        for (u32 i = 0; i < held_fd_count; i++) {
+            if (held_fds[i] >= 0) close(held_fds[i]);
+            held_fds[i] = -1;
+        }
+        held_fd_count = 0;
         if (listen_fd >= 0) {
             close(listen_fd);
             listen_fd = -1;
@@ -16496,30 +16511,34 @@ TEST(route, response_policy_never_pools_and_short_body_closes) {
         ScopedProxyLoop proxy;
         REQUIRE(proxy.setup(&active, 1000, /*enable_reuse=*/true));
 
-        for (u32 attempt = 0; attempt < 2; attempt++) {
-            ClientFdGuard client{connect_to(proxy.port)};
-            REQUIRE_GE(client.fd, 0);
-            set_socket_timeouts(client.fd, 2);
-            REQUIRE(send_all(client.fd, kRequest, sizeof(kRequest) - 1));
+        ClientFdGuard client{connect_to(proxy.port)};
+        REQUIRE_GE(client.fd, 0);
+        set_socket_timeouts(client.fd, 2);
+        auto read_response = [&](i32 fd) {
             char response[2048]{};
             u32 total = 0;
             for (u32 read = 0; read < 16 && total < sizeof(response); read++) {
-                const i32 got = recv_timeout(client.fd,
+                const i32 got = recv_timeout(fd,
                                              response + total,
                                              sizeof(response) - total,
                                              2000);
-                if (got <= 0) break;
+                if (got <= 0) return false;
                 total += static_cast<u32>(got);
                 if (buf_contains(response, total, "\r\n\r\nok", 6)) break;
             }
-            CHECK(buf_contains(response, total, "HTTP/1.1 200", 12));
-            CHECK(buf_contains(response, total, "\r\n\r\nok", 6));
-            for (u32 spin = 0;
-                 spin < 100 && backend.accepted_count.load(std::memory_order_acquire) <= attempt;
-                 spin++)
-                usleep(10000);
-            CHECK_EQ(backend.accepted_count.load(std::memory_order_acquire), attempt + 1);
-        }
+            return buf_contains(response, total, "HTTP/1.1 200", 12) &&
+                   buf_contains(response, total, "\r\n\r\nok", 6);
+        };
+        REQUIRE(send_all(client.fd, kRequest, sizeof(kRequest) - 1));
+        REQUIRE(read_response(client.fd));
+        REQUIRE(send_all(client.fd, kRequest, sizeof(kRequest) - 1));
+        REQUIRE(read_response(client.fd));
+        for (u32 spin = 0;
+             spin < 100 && backend.accepted_count.load(std::memory_order_acquire) < 2;
+             spin++)
+            usleep(10000);
+        CHECK_EQ(backend.accepted_count.load(std::memory_order_acquire), 2u);
+        CHECK_EQ(backend.request_count.load(std::memory_order_acquire), 2u);
     }
 
     // A short post-commit body must close the downstream connection, not be
@@ -16531,7 +16550,6 @@ TEST(route, response_policy_never_pools_and_short_body_closes) {
         RecordingUpstream backend;
         backend.response = kShort;
         backend.response_len = sizeof(kShort) - 1;
-        backend.keep_open = true;
         REQUIRE(backend.setup());
         RouteConfig cfg{};
         auto id = cfg.add_upstream("backend", 0x7F000001, backend.port);
