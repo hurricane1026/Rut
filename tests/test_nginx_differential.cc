@@ -34,6 +34,14 @@ static constexpr char kGatewayRequest[] =
     "GET /missing?q=1 HTTP/1.1\r\n"
     "Host: client.example\r\n"
     "Connection: close\r\n\r\n";
+static constexpr char kApiRedirectBody[] =
+    "<html>\r\n"
+    "<head><title>301 Moved Permanently</title></head>\r\n"
+    "<body>\r\n"
+    "<center><h1>301 Moved Permanently</h1></center>\r\n"
+    "<hr><center>nginx/1.29.7</center>\r\n"
+    "</body>\r\n"
+    "</html>\r\n";
 static constexpr char kBackendResponse[] =
     "HTTP/1.1 200 OK\r\n"
     "Server: differential-backend\r\n"
@@ -1037,6 +1045,107 @@ static bool capture_api_case(u16 frontend_port,
     return true;
 }
 
+static std::string api_redirect_request(const char* target, const char* host) {
+    return std::string("GET ") + target + " HTTP/1.1\r\nHost: " + host +
+           "\r\nConnection: close\r\n\r\n";
+}
+
+static std::vector<char> expected_api_redirect(u16 frontend_port, const char* target_suffix) {
+    const std::string response =
+        "HTTP/1.1 301 Moved Permanently\r\n"
+        "Server: nginx/1.29.7\r\n"
+        "Date: XXXXXXXXXXXXXXXXXXXXXXXXXXXXX\r\n"
+        "Content-Type: text/html\r\n"
+        "Content-Length: 169\r\n"
+        "Location: http://client.example:" + std::to_string(frontend_port) + "/api/" +
+        target_suffix + "\r\n"
+        "Connection: close\r\n"
+        "\r\n" +
+        kApiRedirectBody;
+    return std::vector<char>(response.begin(), response.end());
+}
+
+static bool capture_api_redirect_case(u16 frontend_port,
+                                      u16 backend_port,
+                                      const std::string& nginx_config_path,
+                                      const std::string& nginx_log_path,
+                                      const std::string& container_name,
+                                      std::vector<std::vector<char>>& responses,
+                                      std::string& error) {
+    static constexpr const char* kTargets[] = {"/api", "/api?x=1"};
+    static constexpr const char* kLocationSuffixes[] = {"", "?x=1"};
+    Recorder recorder;
+    if (!recorder.setup(backend_port, 1)) {
+        error = "API redirect backend recorder setup failed";
+        return false;
+    }
+
+    DockerGuard docker(container_name);
+    ChildGuard nginx;
+    if (!spawn_child({"docker", "run", "--pull=never", "--network", "host", "--name",
+                      container_name, "-v", nginx_config_path + ":/etc/nginx/nginx.conf:ro",
+                      kNginxImage, "nginx", "-g", "daemon off;"},
+                     nginx_log_path,
+                     nginx.child)) {
+        error = "failed to start pinned nginx for API redirect case";
+        return false;
+    }
+    if (!wait_ready(frontend_port, nginx.child, error)) return false;
+
+    responses.clear();
+    responses.reserve(2);
+    for (size_t i = 0; i < 2; i++) {
+        const std::string host = i == 0
+                                     ? "client.example"
+                                     : "client.example:" + std::to_string(frontend_port);
+        const std::string request = api_redirect_request(kTargets[i], host.c_str());
+        const int client = connect_once(frontend_port);
+        std::vector<char> response;
+        std::string vector_error;
+        bool ok = client >= 0;
+        if (ok) ok = send_all(client, request.data(), request.size());
+        if (ok) ok = read_response(client, response, vector_error);
+        if (ok) ok = read_eof(client, vector_error);
+        if (client >= 0) close(client);
+        responses.push_back(std::move(response));
+        if (!ok) {
+            error = "nginx API redirect vector " + std::to_string(i + 1) + " failed: " +
+                    (vector_error.empty() ? "connect/send failed" : vector_error);
+            return false;
+        }
+    }
+
+    // Keep nginx and the recorder alive during the bounded late-connect window.
+    settle_for_invalid_target_side_effects();
+    const bool nginx_stopped = stop_child(nginx.child);
+    recorder.stop();
+    const bool side_effect_free =
+        recorder.accepted.load(std::memory_order_acquire) == 0 &&
+        recorder.requests.load(std::memory_order_acquire) == 0 && recorder.history.empty();
+    if (!side_effect_free) {
+        error = "nginx API redirect phase caused an upstream side effect";
+        return false;
+    }
+    if (!nginx_stopped) {
+        error = "failed to stop nginx after API redirect case";
+        return false;
+    }
+    if (!docker.remove()) {
+        error = "docker rm -f failed after nginx API redirect case";
+        return false;
+    }
+    for (size_t i = 0; i < responses.size(); i++) {
+        std::vector<char> normalized = responses[i];
+        const std::vector<char> expected = expected_api_redirect(frontend_port, kLocationSuffixes[i]);
+        if (!normalize_date(normalized) || normalized != expected) {
+            error = "nginx API redirect vector " + std::to_string(i + 1) +
+                    " did not match the exact pinned response baseline";
+            return false;
+        }
+    }
+    return true;
+}
+
 static bool capture_api_invalid_case(u16 frontend_port,
                                      u16 backend_port,
                                      const std::string& source_path,
@@ -1422,6 +1531,25 @@ int main(int argc, char** argv) {
         }
     }
     std::cerr << "PASS: pinned nginx and RUT /api/ proxy URI replacement case (3 vectors)\n";
+
+    std::vector<std::vector<char>> api_redirect_responses;
+    std::string api_redirect_error;
+    const std::string api_redirect_container = container + "-api-redirect";
+    if (!capture_api_redirect_case(api_frontend_port,
+                                   api_backend_port,
+                                   temp.nginx_config,
+                                   temp.nginx_log,
+                                   api_redirect_container,
+                                   api_redirect_responses,
+                                   api_redirect_error)) {
+        std::cerr << "FAIL [api redirect baseline]: " << api_redirect_error << "\n";
+        for (size_t i = 0; i < api_redirect_responses.size(); i++)
+            dump_wire(("nginx API redirect response " + std::to_string(i + 1)).c_str(),
+                      api_redirect_responses[i]);
+        dump_log(temp.nginx_log, "nginx log");
+        return 1;
+    }
+    std::cerr << "PASS: pinned nginx /api automatic slash redirect baseline (2 vectors, no upstream side effects)\n";
 
     std::vector<std::vector<char>> invalid_api_responses;
     std::string invalid_api_error;
