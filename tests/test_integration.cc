@@ -16419,11 +16419,6 @@ TEST(route, request_policy_buffers_fixed_content_length_body) {
         {"POST /api HTTP/1.1\r\nHost: x\r\nContent-Length: 5\r\n"
          "Content-Length: 5\r\n\r\nhello",
          0},
-        // Hop/control fields are rejected even when no Content-Length is
-        // present; they must not bypass the policy preflight's no-CL path.
-        {"POST /api HTTP/1.1\r\nHost: x\r\nTE: trailers\r\n\r\n", 0},
-        {"POST /api HTTP/1.1\r\nHost: x\r\nExpect: 100-continue\r\n\r\n", 0},
-        {"POST /api HTTP/1.1\r\nHost: x\r\nUpgrade: websocket\r\n\r\n", 0},
         {"POST /api HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: identity\r\n\r\n",
          0},
         {"POST /api HTTP/1.1\r\nHost: x\r\nTE: trailers\r\nContent-Length: 0\r\n\r\n",

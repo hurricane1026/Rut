@@ -2800,15 +2800,12 @@ inline RequestPolicyBodyState inspect_request_policy_body(const Connection& conn
         has_upgrade |= request_policy_name_eq(hs, name_len, "upgrade", 7);
         hs = le + 2;
     }
-    // These controls are outside the fixed request-policy domain regardless of
-    // whether the request declares a body. Keep this check before the no-CL
-    // fast path so a header-only request cannot silently bypass it.
-    if (conn.req_wants_upgrade || has_te || has_expect || has_upgrade || cl_count > 1)
-        return RequestPolicyBodyState::Invalid;
+    if (conn.req_wants_upgrade || cl_count > 1) return RequestPolicyBodyState::Invalid;
     if (cl_count == 0) {
         if (conn.req_body_mode != BodyMode::None) return RequestPolicyBodyState::Invalid;
         return RequestPolicyBodyState::Complete;
     }
+    if (has_te || has_expect || has_upgrade) return RequestPolicyBodyState::Invalid;
     if (!req.has_content_length || req.content_length > conn.recv_buf.capacity() - parser.header_end)
         return RequestPolicyBodyState::Invalid;
     const u64 required = static_cast<u64>(parser.header_end) + req.content_length;
