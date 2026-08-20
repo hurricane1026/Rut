@@ -19213,7 +19213,9 @@ TEST(route, inline_redirect_source_reaches_production_h1_and_forward_sibling) {
     };
     auto backend_quiet = [](const RecordingUpstream& backend, u32 accepted, u32 requests) {
         bool quiet = true;
-        for (u32 i = 0; i < 20; i++) {
+        // Keep the recorder live for a fixed 500 ms settle.  Counter snapshots
+        // are the only state read while its worker may still publish a request.
+        for (u32 i = 0; i < 100; i++) {
             if (backend.accepted_count.load(std::memory_order_acquire) != accepted ||
                 backend.request_count.load(std::memory_order_acquire) != requests)
                 quiet = false;
@@ -19373,14 +19375,15 @@ route "/api" {
         const bool quiet = backend_quiet(backend, 0, 0);
         CHECK(quiet);
         if (!quiet) return false;
-        CHECK_EQ(backend.request_history_len[0], 0u);
-        return backend.request_history_len[0] == 0;
+        return true;
     };
     REQUIRE(run_redirect("/api", "client.example", ""));
     const std::string explicit_host = "client.example:" + std::to_string(actual_port);
     REQUIRE(run_redirect("/api?x=1", explicit_host.c_str(), "?x=1"));
 
-    auto run_forward = [&](const char* target, const char* expected_target, u32 history_slot) {
+    auto run_forward = [&](const char* target) {
+        const u32 expected_count =
+            backend.request_count.load(std::memory_order_acquire) + 1;
         ClientFdGuard client{connect_to(actual_port)};
         if (client.fd < 0) return false;
         set_socket_timeouts(client.fd, 2);
@@ -19400,7 +19403,6 @@ route "/api" {
         CHECK(response_ok);
         if (!response_ok) return false;
 
-        const u32 expected_count = history_slot + 1;
         for (u32 waited = 0;
              waited < 400 && backend.request_count.load(std::memory_order_acquire) < expected_count;
              waited++)
@@ -19410,21 +19412,10 @@ route "/api" {
             backend.request_count.load(std::memory_order_acquire) == expected_count;
         CHECK(counts_ok);
         if (!counts_ok) return false;
-        char expected[256];
-        const int expected_len = snprintf(expected,
-                                          sizeof(expected),
-                                          "GET %s HTTP/1.1\r\nHost: 127.0.0.1:%u\r\n"
-                                          "X-Test: one\r\n\r\n",
-                                          expected_target,
-                                          backend.port);
-        if (expected_len <= 0 || expected_len >= static_cast<int>(sizeof(expected))) return false;
-        CHECK_EQ(backend.request_history_len[history_slot], static_cast<u32>(expected_len));
-        CHECK_EQ(memcmp(backend.request_history[history_slot], expected, expected_len), 0);
-        return backend.request_history_len[history_slot] == static_cast<u32>(expected_len) &&
-               memcmp(backend.request_history[history_slot], expected, expected_len) == 0;
+        return true;
     };
-    REQUIRE(run_forward("/api/", "/", 0));
-    REQUIRE(run_forward("/api/x?y=1", "/x?y=1", 1));
+    REQUIRE(run_forward("/api/"));
+    REQUIRE(run_forward("/api/x?y=1"));
 
     auto run_rejected = [&](const char* target) {
         const u32 accepted_before = backend.accepted_count.load(std::memory_order_acquire);
@@ -19453,6 +19444,40 @@ route "/api" {
     };
     REQUIRE(run_rejected("/api#fragment"));
     REQUIRE(run_rejected("/api/%7Euser"));
+
+    // Stop the proxy before the final recorder settle so no late connect can be
+    // initiated while the history arrays are still owned by its worker.
+    proxy.teardown();
+    const bool final_quiet = backend_quiet(backend, 2, 2);
+    CHECK(final_quiet);
+    REQUIRE(final_quiet);
+    backend.teardown();
+
+    auto check_forward_history = [&](u32 history_slot, const char* expected_target) {
+        char expected[256];
+        const int expected_len = snprintf(expected,
+                                          sizeof(expected),
+                                          "GET %s HTTP/1.1\r\nHost: 127.0.0.1:%u\r\n"
+                                          "X-Test: one\r\n\r\n",
+                                          expected_target,
+                                          backend.port);
+        if (expected_len <= 0 || expected_len >= static_cast<int>(sizeof(expected))) return false;
+        CHECK_EQ(backend.request_history_len[history_slot], static_cast<u32>(expected_len));
+        CHECK_EQ(backend.request_history_header_len[history_slot], static_cast<u32>(expected_len));
+        CHECK(memcmp(backend.request_history[history_slot], expected, expected_len) == 0);
+        return backend.request_history_len[history_slot] == static_cast<u32>(expected_len) &&
+               backend.request_history_header_len[history_slot] == static_cast<u32>(expected_len) &&
+               memcmp(backend.request_history[history_slot], expected, expected_len) == 0;
+    };
+    REQUIRE(check_forward_history(0, "/"));
+    REQUIRE(check_forward_history(1, "/x?y=1"));
+    for (u32 slot = 2; slot < RecordingUpstream::kMaxRecordedRequests; slot++) {
+        bool zero = backend.request_history_len[slot] == 0 &&
+                    backend.request_history_header_len[slot] == 0;
+        for (u32 i = 0; zero && i < RecordingUpstream::kRequestCapacity; i++)
+            zero = backend.request_history[slot][i] == '\0';
+        CHECK(zero);
+    }
 #endif
 }
 
