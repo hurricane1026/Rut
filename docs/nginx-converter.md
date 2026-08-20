@@ -91,14 +91,16 @@ evidence must use a pinned nginx build and cannot treat that skip as a pass.
 1. Add the minimal nginx lexer/parser and semantic model, with strict rejection
    of everything outside the initial boundary. No RUT emission.
 2. Use the shipped method-omitted RUT route form for all-method locations;
-   listener and proxy policy dependencies still need resolution.
+   the source listener dependency is resolved, while proxy policy dependencies
+   still need resolution.
 3. Add capability validation and deterministic RUT lowering for the minimal
    model after listener and proxy policy dependencies are explicitly resolved;
    then add the first serialized differential smoke case.
 
 ## Known capability dependencies
 
-- #250: downstream listener capability is available for one source wildcard
-  listener; converter lowering and differential evidence remain pending.
+- #250 (closed): downstream listener capability is available for one source
+  wildcard listener; converter lowering and nginx differential evidence remain
+  pending in #254.
 - #252: upstream HTTP request policy for `forward`.
 - #253: proxied response header policy.
