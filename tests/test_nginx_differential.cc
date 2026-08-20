@@ -29,11 +29,30 @@ static constexpr char kRequest[] =
     "X-Dup: one\r\n"
     "X-Dup: two\r\n"
     "Connection: close\r\n\r\n";
+static constexpr char kGatewayRequest[] =
+    "GET /missing?q=1 HTTP/1.1\r\n"
+    "Host: client.example\r\n"
+    "Connection: close\r\n\r\n";
 static constexpr char kBackendResponse[] =
     "HTTP/1.1 200 OK\r\n"
     "Server: differential-backend\r\n"
     "Date: Tue, 01 Jan 2030 00:00:00 GMT\r\n"
     "Content-Length: 2\r\n\r\nok";
+static constexpr char kGatewayResponseNormalized[] =
+    "HTTP/1.1 502 Bad Gateway\r\n"
+    "Server: nginx/1.29.7\r\n"
+    "Date: XXXXXXXXXXXXXXXXXXXXXXXXXXXXX\r\n"
+    "Content-Type: text/html\r\n"
+    "Content-Length: 157\r\n"
+    "Connection: close\r\n"
+    "\r\n"
+    "<html>\r\n"
+    "<head><title>502 Bad Gateway</title></head>\r\n"
+    "<body>\r\n"
+    "<center><h1>502 Bad Gateway</h1></center>\r\n"
+    "<hr><center>nginx/1.29.7</center>\r\n"
+    "</body>\r\n"
+    "</html>\r\n";
 
 struct Child {
     pid_t pid = -1;
@@ -390,6 +409,56 @@ static bool read_response(int fd, std::vector<char>& bytes, std::string& error) 
     return false;
 }
 
+static bool read_eof(int fd, std::string& error) {
+    for (int attempt = 0; attempt < 40; attempt++) {
+        pollfd p{fd, POLLIN | POLLHUP | POLLERR, 0};
+        const int ready = poll(&p, 1, 50);
+        if (ready < 0) {
+            if (errno == EINTR) continue;
+            error = "EOF poll failed";
+            return false;
+        }
+        if (ready == 0) continue;
+        char extra[256];
+        const ssize_t n = recv(fd, extra, sizeof(extra), 0);
+        if (n == 0) return true;
+        if (n > 0) {
+            error = "bytes arrived after the Content-Length response";
+            return false;
+        }
+        if (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK) continue;
+        error = "EOF recv failed";
+        return false;
+    }
+    error = "EOF timeout";
+    return false;
+}
+
+struct DeadPort {
+    int fd = -1;
+
+    bool reserve(u16 port) {
+        fd = socket(AF_INET, SOCK_STREAM, 0);
+        if (fd < 0) return false;
+        int one = 1;
+        (void)setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
+        sockaddr_in addr{};
+        addr.sin_family = AF_INET;
+        addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+        addr.sin_port = htons(port);
+        if (bind(fd, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) != 0) {
+            close(fd);
+            fd = -1;
+            return false;
+        }
+        return true;  // Deliberately do not listen: connect gets ECONNREFUSED.
+    }
+
+    ~DeadPort() {
+        if (fd >= 0) close(fd);
+    }
+};
+
 struct Recorder {
     int listen_fd = -1;
     u16 port = 0;
@@ -717,6 +786,74 @@ static bool capture_case(u16 frontend_port,
     return true;
 }
 
+static bool capture_gateway_case(u16 frontend_port,
+                                 u16 backend_port,
+                                 const std::string& source_path,
+                                 const std::string& nginx_config_path,
+                                 const std::string& nginx_log_path,
+                                 const std::string& rut_log_path,
+                                 const std::string& rut_path,
+                                 const std::string& container_name,
+                                 std::vector<char>& nginx_response,
+                                 std::vector<char>& rut_response,
+                                 std::string& error) {
+    DeadPort dead;
+    if (!dead.reserve(backend_port)) {
+        error = "failed to reserve unavailable upstream port";
+        return false;
+    }
+
+    DockerGuard docker(container_name);
+    ChildGuard nginx;
+    if (!spawn_child({"docker", "run", "--pull=never", "--network", "host", "--name",
+                      container_name, "-v", nginx_config_path + ":/etc/nginx/nginx.conf:ro",
+                      kNginxImage, "nginx", "-g", "daemon off;"},
+                     nginx_log_path,
+                     nginx.child)) {
+        error = "failed to start pinned nginx for gateway case";
+        return false;
+    }
+    if (!wait_ready(frontend_port, nginx.child, error)) return false;
+    const int nginx_client = connect_once(frontend_port);
+    if (nginx_client < 0 || !send_all(nginx_client, kGatewayRequest, sizeof(kGatewayRequest) - 1) ||
+        !read_response(nginx_client, nginx_response, error) || !read_eof(nginx_client, error)) {
+        if (nginx_client >= 0) close(nginx_client);
+        error = "nginx gateway response/EOF failed: " + error;
+        return false;
+    }
+    close(nginx_client);
+    if (!stop_child(nginx.child)) {
+        error = "failed to stop nginx after gateway case";
+        return false;
+    }
+    if (!docker.remove()) {
+        error = "docker rm -f failed after nginx gateway case";
+        return false;
+    }
+
+    ChildGuard rut;
+    if (!spawn_child({rut_path, source_path, "--shards", "1", "--no-pin", "--drain", "0"},
+                     rut_log_path,
+                     rut.child)) {
+        error = "failed to start production RUT for gateway case";
+        return false;
+    }
+    if (!wait_ready(frontend_port, rut.child, error)) return false;
+    const int rut_client = connect_once(frontend_port);
+    if (rut_client < 0 || !send_all(rut_client, kGatewayRequest, sizeof(kGatewayRequest) - 1) ||
+        !read_response(rut_client, rut_response, error) || !read_eof(rut_client, error)) {
+        if (rut_client >= 0) close(rut_client);
+        error = "RUT gateway response/EOF failed: " + error;
+        return false;
+    }
+    close(rut_client);
+    if (!stop_child(rut.child)) {
+        error = "failed to stop production RUT after gateway case";
+        return false;
+    }
+    return true;
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -871,6 +1008,56 @@ int main(int argc, char** argv) {
         return 1;
     }
     std::cerr << "PASS: pinned nginx and RUT differential success case\n";
+    std::vector<char> nginx_gateway_response;
+    std::vector<char> rut_gateway_response;
+    std::string gateway_error;
+    const std::string gateway_container = container + "-gateway";
+    if (!capture_gateway_case(frontend_port,
+                              backend_port,
+                              temp.source,
+                              temp.nginx_config,
+                              temp.nginx_log,
+                              temp.rut_log,
+                              argv[1],
+                              gateway_container,
+                              nginx_gateway_response,
+                              rut_gateway_response,
+                              gateway_error)) {
+        std::cerr << "FAIL [gateway differential]: " << gateway_error << "\n";
+        dump_wire("nginx gateway response", nginx_gateway_response);
+        dump_wire("RUT gateway response", rut_gateway_response);
+        dump_log(temp.nginx_log, "nginx log");
+        dump_log(temp.rut_log, "RUT log");
+        return 1;
+    }
+    static constexpr char kGatewayStatus[] = "HTTP/1.1 502 Bad Gateway\r\n";
+    if (nginx_gateway_response.size() < sizeof(kGatewayStatus) - 1 ||
+        rut_gateway_response.size() < sizeof(kGatewayStatus) - 1 ||
+        memcmp(nginx_gateway_response.data(), kGatewayStatus, sizeof(kGatewayStatus) - 1) != 0 ||
+        memcmp(rut_gateway_response.data(), kGatewayStatus, sizeof(kGatewayStatus) - 1) != 0) {
+        std::cerr << "FAIL [gateway compare]: expected exact HTTP/1.1 502 status\n";
+        dump_wire("nginx gateway response", nginx_gateway_response);
+        dump_wire("RUT gateway response", rut_gateway_response);
+        dump_log(temp.nginx_log, "nginx log");
+        dump_log(temp.rut_log, "RUT log");
+        return 1;
+    }
+    std::vector<char> normalized_nginx_gateway = nginx_gateway_response;
+    std::vector<char> normalized_rut_gateway = rut_gateway_response;
+    if (!normalize_date(normalized_nginx_gateway) || !normalize_date(normalized_rut_gateway) ||
+        normalized_nginx_gateway != normalized_rut_gateway ||
+        normalized_nginx_gateway.size() != sizeof(kGatewayResponseNormalized) - 1 ||
+        memcmp(normalized_nginx_gateway.data(),
+               kGatewayResponseNormalized,
+               sizeof(kGatewayResponseNormalized) - 1) != 0) {
+        std::cerr << "FAIL [gateway compare]: exact 502 response mismatch after Date normalization\n";
+        dump_wire("nginx gateway response", nginx_gateway_response);
+        dump_wire("RUT gateway response", rut_gateway_response);
+        dump_log(temp.nginx_log, "nginx log");
+        dump_log(temp.rut_log, "RUT log");
+        return 1;
+    }
+    std::cerr << "PASS: pinned nginx and RUT unavailable-upstream gateway case (502 + EOF)\n";
     return 0;
 #endif
 }
