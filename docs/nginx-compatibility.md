@@ -18,7 +18,7 @@ Allowed states are `SUPPORTED`, `PARTIAL`, `BLOCKED_BY_RUT`,
 | nginx default upstream HTTP version and request headers | implicit | yes | partial: explicit fixed HTTP/1.1 policy with bounded fixed-CL buffering; #252 | exact RUT tests plus pinned generated-RUT GET and POST differentials | PARTIAL |
 | proxied response status and body | implicit | yes | partial: strict final H1.1 exact-Content-Length streaming | exact RUT tests plus pinned generated-RUT GET and POST differentials | PARTIAL |
 | nginx default proxied response header policy | implicit | yes | partial: bounded strict H1.1 final-response/content-length serializer; consumes one upstream `Connection`; downstream connection follows request; #253 | exact RUT/token tests plus pinned generated-RUT GET, POST, and close differentials | PARTIAL |
-| single unavailable upstream gateway error | implicit | yes | metadata/ABI foundation only; serializer and failure-site integration pending in #256 | pinned nginx/RUT mismatch evidence | BLOCKED_BY_RUT |
+| single unavailable upstream gateway error | implicit | no | yes for bounded H1 single-IPv4 connect failures; #256 | pinned nginx baseline plus RUT runtime tests; generated differential pending | NOT_IMPLEMENTED |
 | exact, `^~`, regex, or nested locations | no | no | no nginx selection semantics | no | NOT_PLANNED |
 | `proxy_pass` with URI replacement | no | no | literal path rewrite only | no | NOT_PLANNED |
 | multiple servers / `server_name` / `default_server` | no | no | no virtual-server selection | no | NOT_PLANNED |
@@ -76,8 +76,9 @@ Allowed states are `SUPPORTED`, `PARTIAL`, `BLOCKED_BY_RUT`,
 - For one unavailable fixed upstream, pinned nginx waits for the complete
   fixed-CL request and emits a 157-byte HTML 502 with Server, Date,
   Content-Type, and request-derived keep-alive. RUT currently emits an 11-byte
-  close response. This is an explicit `BLOCKED_BY_RUT` mismatch tracked by
-  #256, not a converter fallback opportunity.
+  close response. The bounded RUT primitive now exists under #256, but converter
+  lowering and generated differential evidence are still required; this is
+  `NOT_IMPLEMENTED`, not a fallback opportunity.
 - Response policy is intentionally limited to non-HEAD HTTP/1.1 requests and
   one final HTTP/1.1 response with exact Content-Length. Bodies, Upgrade,
   absolute-form targets, HTTP/1.0, HTTP/2, interim/no-body statuses, chunking,
