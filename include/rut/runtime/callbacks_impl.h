@@ -495,6 +495,7 @@ void format_response_with_body_and_headers(Connection& conn,
                                            bool body_is_fallback_reason_phrase = false,
                                            bool suppress_default_content_type = false);
 inline bool apply_request_policy(Connection& conn, const sockaddr_in& endpoint, u16 policy_id);
+inline bool materialize_request_target_transform(Connection& conn, const RouteConfig& config);
 enum class RequestPolicyBodyState : u8 { Invalid, Complete, Waiting };
 RequestPolicyBodyState inspect_request_policy_body(const Connection& conn,
                                                    u16 policy_id);
@@ -2164,17 +2165,13 @@ void handle_jit_outcome(Loop* loop,
             // match the indexing the handler compiled against.
             const RouteConfig* config = conn.request_config;
             if (conn.target_transform_recorded) {
-                // Resolve the pinned table before rejecting. Forged/malformed
-                // IDs fail here; valid future transforms are also unsupported
-                // until materialization exists. Both cases precede target
-                // access and every upstream side effect.
-                if (config == nullptr ||
-                    !config->target_transform_id_is_valid(conn.target_transform_id)) {
+                // Resolve and materialize against the pinned table before target
+                // access and every upstream side effect. Forged IDs and inputs
+                // outside the bounded clean H1 domain remain fail-closed.
+                if (config == nullptr || !materialize_request_target_transform(conn, *config)) {
                     reject_request_policy(loop, conn);
                     return;
                 }
-                reject_request_policy(loop, conn);
-                return;
             }
             if (!config || outcome.upstream_id >= config->upstream_count) {
                 // Unresolvable upstream id — handler returned a value
@@ -2802,6 +2799,116 @@ inline bool snapshot_response_mutations_before_request_rewrite(Connection& conn)
     conn.response_mutations_snapshotted = true;
     conn.retry_req_snapshot_replayable =
         !conn.req_path_overridden && conn.req_header_override_count == 0;
+    return true;
+}
+
+// Materialize the foundation target-transform effect for the first supported
+// domain.  This deliberately runs before target selection, policy materializa-
+// tion, slot acquisition, idle reuse, and socket/connect side effects.  Every
+// validation and size check happens before the first recv_buf mutation.
+inline bool materialize_request_target_transform(Connection& conn, const RouteConfig& config) {
+    if (!conn.target_transform_recorded) return true;
+    if (!config.target_transform_id_is_valid(conn.target_transform_id) ||
+        conn.protocol == ConnProtocol::Http2 || conn.tls_active || conn.req_path_overridden ||
+        conn.req_body_mode != BodyMode::None || conn.req_body_remaining != 0 ||
+        conn.req_malformed || conn.req_wants_upgrade ||
+        conn.resp_header_mutation_pending_count != 0 ||
+        conn.resp_header_mutation_pending_overflow || conn.resp_header_mutation_overflow)
+        return false;
+
+    u8* data = conn.recv_slice;
+    const u32 total = conn.recv_buf.len();
+    if (data == nullptr || conn.recv_buf.data() != data || total == 0) return false;
+
+    HttpParser parser;
+    ParsedRequest req;
+    parser.reset();
+    if (parser.parse(data, total, &req) != ParseStatus::Complete ||
+        req.version == HttpVersion::Unknown || req.has_content_length || req.chunked ||
+        req.upgrade || req.has_upgrade_header || parser.header_end != conn.req_header_end ||
+        conn.req_initial_send_len != parser.header_end)
+        return false;
+    if (req.version != HttpVersion::Http10 && req.version != HttpVersion::Http11) return false;
+
+    const uintptr_t base = reinterpret_cast<uintptr_t>(data);
+    const uintptr_t limit = base + total;
+    const uintptr_t path_addr = reinterpret_cast<uintptr_t>(req.path.ptr);
+    if (path_addr < base || path_addr > limit || req.path.len > limit - path_addr)
+        return false;
+    const u32 target_start = static_cast<u32>(path_addr - base);
+    const u32 target_len = req.path.len;
+    if (target_len == 0 || data[target_start] != '/') return false;
+
+    u32 path_len = target_len;
+    for (u32 i = 0; i < target_len; i++) {
+        if (data[target_start + i] == '?') {
+            path_len = i;
+            break;
+        }
+    }
+    if (path_len == 0) return false;
+
+    const u8* path = data + target_start;
+    for (u32 i = 0; i < path_len; i++) {
+        const u8 c = path[i];
+        if (c < 0x21 || c == 0x7f || c == '%' || c == '#') return false;
+        if (i > 0 && c == '/' && path[i - 1] == '/') return false;
+    }
+    u32 segment_start = 1;
+    for (u32 i = 1; i <= path_len; i++) {
+        if (i != path_len && path[i] != '/') continue;
+        const u32 segment_len = i - segment_start;
+        if ((segment_len == 1 && path[segment_start] == '.') ||
+            (segment_len == 2 && path[segment_start] == '.' &&
+             path[segment_start + 1] == '.'))
+            return false;
+        segment_start = i + 1;
+    }
+
+    const auto& spec = config.target_transforms[conn.target_transform_id - 1];
+    if (!forward_target_transform_spec_valid(spec) || path_len < spec.strip_prefix.len ||
+        __builtin_memcmp(path, spec.strip_prefix.ptr, spec.strip_prefix.len) != 0)
+        return false;
+
+    const u32 suffix_len = path_len - spec.strip_prefix.len;
+    const u32 query_len = target_len - path_len;
+    const u64 new_target_len = static_cast<u64>(spec.replace_prefix.len) + suffix_len + query_len;
+    const i64 delta = static_cast<i64>(new_target_len) - static_cast<i64>(target_len);
+    const i64 final_total = static_cast<i64>(total) + delta;
+    if (new_target_len > 0xffffffffu || final_total < 0 ||
+        static_cast<u64>(final_total) > conn.recv_buf.capacity())
+        return false;
+
+    // Response mutation values may borrow recv_buf. Pin them before the target
+    // splice, and make any later reused-socket retry non-replayable because the
+    // snapshot necessarily predates this independent target transform.
+    if (conn.resp_header_mutation_count != 0) {
+        if (!snapshot_response_mutations_before_request_rewrite(conn)) return false;
+    }
+
+    const u32 target_end = target_start + target_len;
+    const u32 new_target_end = target_start + static_cast<u32>(new_target_len);
+    const u32 suffix_start = target_start + spec.strip_prefix.len;
+    const u32 suffix_dest = target_start + spec.replace_prefix.len;
+    if (delta < 0) {
+        __builtin_memmove(data + suffix_dest, data + suffix_start, suffix_len + query_len);
+        __builtin_memmove(data + new_target_end,
+                          data + target_end,
+                          static_cast<size_t>(total - target_end));
+    } else {
+        __builtin_memmove(data + target_end + delta,
+                          data + target_end,
+                          static_cast<size_t>(total - target_end));
+        __builtin_memmove(data + suffix_dest, data + suffix_start, suffix_len + query_len);
+    }
+    __builtin_memcpy(data + target_start, spec.replace_prefix.ptr, spec.replace_prefix.len);
+    conn.recv_buf.set_len(static_cast<u32>(final_total));
+    conn.req_header_end = static_cast<u32>(static_cast<i64>(conn.req_header_end) + delta);
+    conn.req_initial_send_len =
+        static_cast<u32>(static_cast<i64>(conn.req_initial_send_len) + delta);
+    if (conn.response_mutations_snapshotted) conn.retry_req_snapshot_replayable = false;
+    conn.target_transform_recorded = false;
+    conn.target_transform_id = 0;
     return true;
 }
 

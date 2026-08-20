@@ -16,6 +16,7 @@
 #include "test.h"
 #include "test_helpers.h"
 #include <memory>
+#include <string>
 #include <vector>
 
 #include <errno.h>
@@ -346,6 +347,199 @@ TEST(target_transform, h1_forward_rejects_before_upstream_side_effects) {
         CHECK_FALSE(conn->target_transform_recorded);
         CHECK_EQ(conn->target_transform_id, 0u);
     }
+}
+
+static Connection* setup_target_transform_request(SmallLoop& loop,
+                                                   RouteConfig& cfg,
+                                                   const char* request,
+                                                   u32 request_len,
+                                                   bool path_override = false) {
+    auto* conn = loop.alloc_conn();
+    if (!conn || conn->recv_buf.write(reinterpret_cast<const u8*>(request), request_len) !=
+                    request_len)
+        return nullptr;
+    capture_request_metadata(*conn);
+    conn->request_config = &cfg;
+    conn->target_transform_id = 1;
+    conn->target_transform_recorded = true;
+    conn->req_path_overridden = path_override;
+    return conn;
+}
+
+TEST(target_transform, h1_materializes_clean_origin_form_and_preserves_query) {
+    SmallLoop loop;
+    loop.setup();
+    RouteConfig cfg{};
+    char strip[] = "/api/";
+    char replace[] = "/";
+    REQUIRE_EQ(cfg.add_target_transform({{strip, 5}, {replace, 1}}), 1u);
+
+    struct Vector {
+        const char* target;
+        const char* expected;
+    } vectors[] = {{"/api/", "/"},
+                   {"/api/x", "/x"},
+                   {"/api/x?y=1", "/x?y=1"},
+                   {"/api/x?tag=a%2Fb", "/x?tag=a%2Fb"},
+                   {"/api/x?", "/x?"}};
+    for (const auto& v : vectors) {
+        std::string request = std::string("GET ") + v.target +
+                              " HTTP/1.1\r\nHost: client\r\n\r\n";
+        auto* conn = setup_target_transform_request(loop, cfg, request.data(),
+                                                     static_cast<u32>(request.size()));
+        REQUIRE(conn != nullptr);
+        REQUIRE(materialize_request_target_transform(*conn, cfg));
+        std::string expected = std::string("GET ") + v.expected + " HTTP/1.1\r\n";
+        CHECK(conn->recv_buf.len() >= expected.size());
+        CHECK_EQ(__builtin_memcmp(conn->recv_buf.data(), expected.data(), expected.size()), 0);
+        CHECK_FALSE(conn->target_transform_recorded);
+        CHECK_EQ(conn->target_transform_id, 0u);
+        CHECK_EQ(conn->req_header_end, conn->req_initial_send_len);
+        loop.free_conn(*conn);
+    }
+}
+
+TEST(target_transform, h1_materialization_rejects_atomically_outside_clean_domain) {
+    SmallLoop loop;
+    loop.setup();
+    RouteConfig cfg{};
+    char strip[] = "/api/";
+    char replace[] = "/";
+    REQUIRE_EQ(cfg.add_target_transform({{strip, 5}, {replace, 1}}), 1u);
+    const char* requests[] = {
+        "GET /api HTTP/1.1\r\nHost: client\r\n\r\n",       // no slash-boundary prefix
+        "GET * HTTP/1.1\r\nHost: client\r\n\r\n",           // non-origin-form
+        "GET /api/%7E HTTP/1.1\r\nHost: client\r\n\r\n",  // encoded path
+        "GET /api//x HTTP/1.1\r\nHost: client\r\n\r\n",   // repeated slash
+        "GET /api/./x HTTP/1.1\r\nHost: client\r\n\r\n",   // dot segment
+        "GET /api/x/.. HTTP/1.1\r\nHost: client\r\n\r\n",  // dot segment
+        "GET /api/x#frag HTTP/1.1\r\nHost: client\r\n\r\n", // fragment
+        "POST /api/x HTTP/1.1\r\nHost: client\r\nContent-Length: 1\r\n\r\na",
+        "GET /api/x HTTP/1.1\r\nHost: client\r\nContent-Length: 0\r\n\r\n",
+        "GET /api/x HTTP/1.1\r\nHost: client\r\nUpgrade: websocket\r\n\r\n",
+    };
+    for (const char* request : requests) {
+        auto* conn = setup_target_transform_request(loop, cfg, request,
+                                                     static_cast<u32>(strlen(request)));
+        REQUIRE(conn != nullptr);
+        u8 before[SmallLoop::kBufSize];
+        const u32 before_len = conn->recv_buf.len();
+        const u32 before_header_end = conn->req_header_end;
+        const u32 before_send_len = conn->req_initial_send_len;
+        __builtin_memcpy(before, conn->recv_buf.data(), before_len);
+        CHECK_FALSE(materialize_request_target_transform(*conn, cfg));
+        CHECK_EQ(conn->recv_buf.len(), before_len);
+        CHECK_EQ(conn->req_header_end, before_header_end);
+        CHECK_EQ(conn->req_initial_send_len, before_send_len);
+        CHECK_EQ(__builtin_memcmp(conn->recv_buf.data(), before, before_len), 0);
+        CHECK(conn->target_transform_recorded);
+        CHECK_EQ(conn->target_transform_id, 1u);
+        loop.free_conn(*conn);
+    }
+
+    const char kTlsRequest[] = "GET /api/x HTTP/1.1\r\nHost: client\r\n\r\n";
+    auto* tls = setup_target_transform_request(loop, cfg, kTlsRequest,
+                                                sizeof(kTlsRequest) - 1);
+    REQUIRE(tls != nullptr);
+    tls->tls_active = true;
+    CHECK_FALSE(materialize_request_target_transform(*tls, cfg));
+    loop.free_conn(*tls);
+
+    const char kSetPathRequest[] = "GET /api/x HTTP/1.1\r\nHost: client\r\n\r\n";
+    auto* set_path = setup_target_transform_request(loop, cfg, kSetPathRequest,
+                                                    sizeof(kSetPathRequest) - 1, true);
+    REQUIRE(set_path != nullptr);
+    CHECK_FALSE(materialize_request_target_transform(*set_path, cfg));
+    loop.free_conn(*set_path);
+}
+
+TEST(target_transform, h1_materialization_capacity_boundary_is_atomic) {
+    SmallLoop loop;
+    loop.setup();
+    RouteConfig cfg{};
+    char strip[] = "/api/";
+    char replace[] = "/expanded/";
+    REQUIRE_EQ(cfg.add_target_transform({{strip, 5}, {replace, 10}}), 1u);
+
+    auto make_request = [](u32 total) -> std::string {
+        const std::string prefix = "GET /api/x?";
+        const std::string suffix = " HTTP/1.1\r\nHost: c\r\n\r\n";
+        if (total <= prefix.size() + suffix.size()) return {};
+        std::string request = prefix;
+        request.append(total - prefix.size() - suffix.size(), 'a');
+        request += suffix;
+        return request;
+    };
+    const u32 capacity = SmallLoop::kBufSize;
+    for (const u32 requested : {capacity - 5, capacity - 4}) {
+        std::string request = make_request(requested);
+        auto* conn = setup_target_transform_request(loop, cfg, request.data(),
+                                                     static_cast<u32>(request.size()));
+        REQUIRE(conn != nullptr);
+        u8 before[SmallLoop::kBufSize];
+        const u32 before_len = conn->recv_buf.len();
+        __builtin_memcpy(before, conn->recv_buf.data(), before_len);
+        const bool materialized = materialize_request_target_transform(*conn, cfg);
+        if (requested == capacity - 5) {
+            CHECK(materialized);
+            CHECK_EQ(conn->recv_buf.len(), capacity);
+            CHECK(buf_has(conn->recv_buf.data(), conn->recv_buf.len(),
+                          "GET /expanded/x?"));
+        } else {
+            CHECK_FALSE(materialized);
+            CHECK_EQ(conn->recv_buf.len(), before_len);
+            CHECK_EQ(__builtin_memcmp(conn->recv_buf.data(), before, before_len), 0);
+            CHECK(conn->target_transform_recorded);
+        }
+        loop.free_conn(*conn);
+    }
+}
+
+TEST(target_transform, h1_invalid_materialization_has_no_upstream_side_effect) {
+    SmallLoop loop;
+    loop.setup();
+    RouteConfig cfg{};
+    REQUIRE(cfg.add_upstream("backend", 0x7F000001, 8080).has_value());
+    char strip[] = "/api/";
+    char replace[] = "/";
+    REQUIRE_EQ(cfg.add_target_transform({{strip, 5}, {replace, 1}}), 1u);
+    const char request[] = "GET /wrong HTTP/1.1\r\nHost: client\r\n\r\n";
+    auto* conn = setup_target_transform_request(loop, cfg, request, sizeof(request) - 1);
+    REQUIRE(conn != nullptr);
+    conn->request_config = &cfg;
+    JitDispatchOutcome outcome{};
+    outcome.kind = JitDispatchOutcome::Kind::Forward;
+    outcome.upstream_id = 0;
+    loop.backend.clear_ops();
+    handle_jit_outcome<SmallLoop>(&loop, *conn, outcome, nullptr, true);
+    CHECK_EQ(conn->resp_status, 400u);
+    CHECK_EQ(loop.backend.count_ops(MockOp::Connect), 0u);
+    CHECK_FALSE(conn->upstream_slot_held);
+    loop.free_conn(*conn);
+}
+
+TEST(target_transform, h1_valid_materialization_reaches_upstream_selection) {
+    SmallLoop loop;
+    loop.setup();
+    RouteConfig cfg{};
+    REQUIRE(cfg.add_upstream("backend", 0x7F000001, 8080).has_value());
+    char strip[] = "/api/";
+    char replace[] = "/";
+    REQUIRE_EQ(cfg.add_target_transform({{strip, 5}, {replace, 1}}), 1u);
+    const char request[] = "GET /api/x?tag=a%2Fb HTTP/1.1\r\nHost: client\r\n\r\n";
+    auto* conn = setup_target_transform_request(loop, cfg, request, sizeof(request) - 1);
+    REQUIRE(conn != nullptr);
+    conn->request_config = &cfg;
+    JitDispatchOutcome outcome{};
+    outcome.kind = JitDispatchOutcome::Kind::Forward;
+    outcome.upstream_id = 0;
+    loop.backend.clear_ops();
+    handle_jit_outcome<SmallLoop>(&loop, *conn, outcome, nullptr, true);
+    CHECK_FALSE(conn->target_transform_recorded);
+    CHECK(buf_has(conn->recv_buf.data(), conn->recv_buf.len(),
+                  "GET /x?tag=a%2Fb HTTP/1.1\r\n"));
+    CHECK_EQ(loop.backend.count_ops(MockOp::Connect), 1u);
+    loop.free_conn(*conn);
 }
 
 TEST(target_transform, h2_request_boundary_clears_recorded_effect) {
