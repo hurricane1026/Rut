@@ -16684,10 +16684,17 @@ TEST(route, target_transform_public_source_reaches_h1_backend_wire) {
     CHECK(resources.rir.module.target_transforms[0].replace_prefix.eq({"/", 1}));
 
     const auto& block = resources.rir.module.functions[0].blocks[0];
-    REQUIRE_GE(block.inst_count, 2u);
-    CHECK_EQ(block.insts[block.inst_count - 2].op, rir::Opcode::ReqSetTargetTransform);
-    CHECK_EQ(block.insts[block.inst_count - 2].imm.i32_val, 1);
-    CHECK_EQ(block.insts[block.inst_count - 1].op, rir::Opcode::RetForward);
+    REQUIRE_EQ(block.inst_count, 4u);
+    CHECK_EQ(block.insts[0].op, rir::Opcode::ConstI32);
+    CHECK_EQ(block.insts[0].imm.i32_val, 0);
+    CHECK_EQ(block.insts[1].op, rir::Opcode::ConstI32);
+    CHECK_EQ(block.insts[1].imm.i32_val, 1);
+    CHECK_EQ(block.insts[2].op, rir::Opcode::ReqSetTargetTransform);
+    CHECK_EQ(block.insts[2].imm.i32_val, 1);
+    CHECK_EQ(block.insts[3].op, rir::Opcode::RetForward);
+    CHECK_EQ(block.insts[3].operand_count, 2u);
+    CHECK_EQ(block.insts[3].operands[0].id, block.insts[0].result.id);
+    CHECK_EQ(block.insts[3].operands[1].id, block.insts[1].result.id);
 
     auto cg = jit::codegen(resources.rir.module);
     REQUIRE(cg.ok);
@@ -16718,7 +16725,7 @@ TEST(route, target_transform_public_source_reaches_h1_backend_wire) {
         const int request_len = snprintf(request,
                                          sizeof(request),
                                          "GET %s HTTP/1.1\r\nHost: client.example\r\n"
-                                         "X-Test: one\r\n\r\n",
+                                         "Connection: keep-alive\r\nX-Test: one\r\n\r\n",
                                          vectors[i].target);
         REQUIRE_GT(request_len, 0);
         REQUIRE_LT(request_len, static_cast<int>(sizeof(request)));
@@ -16770,12 +16777,14 @@ TEST(route, target_transform_public_source_reaches_h1_backend_wire) {
                          static_cast<u32>(invalid_len),
                          "HTTP/1.1 400",
                          sizeof("HTTP/1.1 400") - 1));
-    for (u32 waited = 0;
-         waited < 100 &&
-         (backend.accepted_count.load(std::memory_order_acquire) != accepted_before ||
-          backend.request_count.load(std::memory_order_acquire) != requests_before);
-         waited++)
+    bool invalid_backend_clean = true;
+    for (u32 waited = 0; waited < 100; waited++) {
+        if (backend.accepted_count.load(std::memory_order_acquire) != accepted_before ||
+            backend.request_count.load(std::memory_order_acquire) != requests_before)
+            invalid_backend_clean = false;
         usleep(5000);
+    }
+    CHECK(invalid_backend_clean);
     CHECK_EQ(backend.accepted_count.load(std::memory_order_acquire), accepted_before);
     CHECK_EQ(backend.request_count.load(std::memory_order_acquire), requests_before);
 }
