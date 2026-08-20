@@ -5,6 +5,7 @@
 #include "rut/common/response_policy.h"
 #include "rut/common/failure_policy.h"
 #include "rut/common/forward_target_transform.h"
+#include "rut/common/redirect_policy.h"
 #include "rut/common/types.h"
 #include "rut/runtime/arena.h"
 
@@ -484,6 +485,12 @@ struct Module {
     // consumes them in this increment.
     ForwardTargetTransformSpec target_transforms[kMaxForwardTargetTransforms]{};
     u32 target_transform_count = 0;
+
+    // Foundation-only redirect metadata. Strings are borrowed by the RIR
+    // module and copied into RouteConfig during activation; no action or
+    // runtime path consumes them in this increment.
+    RedirectPolicySpec redirect_policies[kMaxRedirectPolicies]{};
+    u32 redirect_policy_count = 0;
 
     // Upstream declarations carried verbatim from the DSL so a
     // compile→config helper can translate them into

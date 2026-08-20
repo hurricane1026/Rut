@@ -185,7 +185,8 @@ inline bool populate_route_config(RouteConfig& cfg, const rir::Module& mod) {
     if (cfg.route_count != 0 || cfg.response_body_count != 0 ||
         cfg.response_header_set_count != 0 || cfg.response_policy_count != 0 ||
         cfg.failure_policy_count != 0 || cfg.policy_bundle_count != 0 ||
-        cfg.target_transform_count != 0 || cfg.target_transform_bytes_used != 0) {
+        cfg.target_transform_count != 0 || cfg.target_transform_bytes_used != 0 ||
+        cfg.redirect_policy_count != 0 || cfg.redirect_policy_bytes_used != 0) {
         return false;
     }
 
@@ -211,7 +212,8 @@ inline bool populate_route_config(RouteConfig& cfg, const rir::Module& mod) {
     }
     if (mod.failure_policy_count > kMaxForwardFailurePolicies ||
         mod.policy_bundle_count > RouteConfig::kMaxForwardPolicyBundles ||
-        mod.target_transform_count > kMaxForwardTargetTransforms)
+        mod.target_transform_count > kMaxForwardTargetTransforms ||
+        mod.redirect_policy_count > kMaxRedirectPolicies)
         return false;
     for (u32 i = 0; i < mod.failure_policy_count; i++) {
         if (!forward_failure_policy_spec_valid(mod.failure_policies[i])) return false;
@@ -231,6 +233,8 @@ inline bool populate_route_config(RouteConfig& cfg, const rir::Module& mod) {
     }
     if (!forward_target_transform_table_valid(mod.target_transforms,
                                               mod.target_transform_count))
+        return false;
+    if (!redirect_policy_table_valid(mod.redirect_policies, mod.redirect_policy_count))
         return false;
     for (u32 i = 0; i < mod.header_set_count; i++) {
         const auto& ref = mod.header_sets[i];
@@ -396,6 +400,8 @@ inline bool populate_route_config(RouteConfig& cfg, const rir::Module& mod) {
         u16 idx = cfg.add_target_transform(mod.target_transforms[i]);
         if (idx == 0 || idx != i + 1) return false;
     }
+    if (!cfg.add_redirect_policy_table(mod.redirect_policies, mod.redirect_policy_count))
+        return false;
     return true;
 }
 

@@ -5,6 +5,7 @@
 #include "rut/common/response_policy.h"
 #include "rut/common/failure_policy.h"
 #include "rut/common/forward_target_transform.h"
+#include "rut/common/redirect_policy.h"
 #include "rut/common/types.h"
 #include "rut/jit/art_jit_codegen.h"  // ArtJitMatchFn typedef (LLVM-free)
 #include "rut/jit/handler_abi.h"
@@ -151,6 +152,8 @@ struct RouteConfig {
     static constexpr u32 kResponsePolicyBytesPoolBytes = 4 * 1024;
     static constexpr u32 kMaxForwardPolicyBundles = kMaxForwardFailurePolicies;
     static constexpr u32 kFailurePolicyBytesPoolBytes = 8 * 1024;
+    static constexpr u32 kMaxRedirectPolicies = rut::kMaxRedirectPolicies;
+    static constexpr u32 kRedirectPolicyBytesPoolBytes = rut::kRedirectPolicyBytes;
     // Per-response cap for header count. Bigger than what the AST
     // permits (16) so hand-built RouteConfigs — tests, future
     // compile→config helper — have headroom, but small enough that the
@@ -495,6 +498,10 @@ struct RouteConfig {
     u32 target_transform_count = 0;
     char target_transform_bytes[kForwardTargetTransformBytes];
     u32 target_transform_bytes_used = 0;
+    RedirectPolicySpec redirect_policies[kMaxRedirectPolicies]{};
+    u32 redirect_policy_count = 0;
+    char redirect_policy_bytes[kRedirectPolicyBytesPoolBytes];
+    u32 redirect_policy_bytes_used = 0;
 
     // Populate the active dispatch's state with a newly-written
     // routes[route_count] entry. Returns false on:
@@ -996,6 +1003,110 @@ struct RouteConfig {
     bool target_transform_id_is_valid(u16 id) const {
         return forward_target_transform_id_is_valid(id, target_transform_count) &&
                forward_target_transform_spec_valid(target_transforms[id - 1]);
+    }
+
+    // Register foundation-only redirect metadata. Strings are copied into
+    // RouteConfig-owned storage; no compiler/RIR pointer escapes here.
+    u16 add_redirect_policy(const RedirectPolicySpec& policy) {
+        if (!redirect_policy_spec_valid(policy)) return 0;
+        for (u32 i = 0; i < redirect_policy_count; i++) {
+            if (redirect_policy_spec_equal(redirect_policies[i], policy))
+                return static_cast<u16>(i + 1);
+        }
+        if (redirect_policy_count >= kMaxRedirectPolicies ||
+            redirect_policy_bytes_used > kRedirectPolicyBytesPoolBytes)
+            return 0;
+        const Str fields[] = {policy.reason,
+                              policy.server,
+                              policy.content_type,
+                              policy.target_path,
+                              policy.body};
+        u32 total = 0;
+        for (const Str field : fields) {
+            if (field.len > kRedirectPolicyBytesPoolBytes - redirect_policy_bytes_used - total)
+                return 0;
+            total += field.len;
+        }
+        auto copy = [&](Str src, Str& dst) {
+            char* out = redirect_policy_bytes + redirect_policy_bytes_used;
+            for (u32 i = 0; i < src.len; i++) out[i] = src.ptr[i];
+            redirect_policy_bytes_used += src.len;
+            dst = {out, src.len};
+        };
+        auto& dst = redirect_policies[redirect_policy_count];
+        dst.scheme = policy.scheme;
+        dst.authority = policy.authority;
+        dst.port = policy.port;
+        dst.path = policy.path;
+        dst.query = policy.query;
+        dst.date = policy.date;
+        dst.connection = policy.connection;
+        dst.status_code = policy.status_code;
+        copy(policy.reason, dst.reason);
+        copy(policy.server, dst.server);
+        copy(policy.content_type, dst.content_type);
+        copy(policy.target_path, dst.target_path);
+        copy(policy.body, dst.body);
+        redirect_policy_count++;
+        return static_cast<u16>(redirect_policy_count);
+    }
+
+    // Validate and publish a complete borrowed table. The count and byte
+    // watermark are committed only after every entry has been prevalidated,
+    // so a malformed table cannot become partially visible in cfg.
+    bool add_redirect_policy_table(const RedirectPolicySpec* specs, u32 count) {
+        if (redirect_policy_count != 0 || redirect_policy_bytes_used != 0 ||
+            !redirect_policy_table_valid(specs, count))
+            return false;
+        u32 total = 0;
+        for (u32 i = 0; i < count; i++) {
+            const Str fields[] = {specs[i].reason,
+                                  specs[i].server,
+                                  specs[i].content_type,
+                                  specs[i].target_path,
+                                  specs[i].body};
+            for (const Str field : fields) {
+                if (field.len > kRedirectPolicyBytesPoolBytes - total) return false;
+                total += field.len;
+            }
+        }
+        u32 used = 0;
+        for (u32 i = 0; i < count; i++) {
+            const auto& src = specs[i];
+            auto& dst = redirect_policies[i];
+            dst.scheme = src.scheme;
+            dst.authority = src.authority;
+            dst.port = src.port;
+            dst.path = src.path;
+            dst.query = src.query;
+            dst.date = src.date;
+            dst.connection = src.connection;
+            dst.status_code = src.status_code;
+            const Str fields[] = {src.reason,
+                                  src.server,
+                                  src.content_type,
+                                  src.target_path,
+                                  src.body};
+            Str* destinations[] = {&dst.reason,
+                                   &dst.server,
+                                   &dst.content_type,
+                                   &dst.target_path,
+                                   &dst.body};
+            for (u32 field = 0; field < 5; field++) {
+                char* out = redirect_policy_bytes + used;
+                for (u32 j = 0; j < fields[field].len; j++) out[j] = fields[field].ptr[j];
+                *destinations[field] = {out, fields[field].len};
+                used += fields[field].len;
+            }
+        }
+        redirect_policy_bytes_used = used;
+        redirect_policy_count = count;
+        return true;
+    }
+
+    bool redirect_policy_id_is_valid(u16 id) const {
+        return id != 0 && id <= redirect_policy_count &&
+               redirect_policy_spec_valid(redirect_policies[id - 1]);
     }
 
     // Add an upstream target. Returns its index, or error if at capacity.

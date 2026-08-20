@@ -514,6 +514,79 @@ static void print_quoted_str(PrintBuf& buf, Str s) {
     buf.put('"');
 }
 
+static void print_redirect_body(PrintBuf& buf, Str body) {
+    buf.put_cstr("b\"");
+    for (u32 i = 0; i < body.len; i++) {
+        const u8 c = static_cast<u8>(body.ptr[i]);
+        switch (c) {
+            case '\\':
+                buf.put_cstr("\\\\");
+                break;
+            case '"':
+                buf.put_cstr("\\\"");
+                break;
+            case '\n':
+                buf.put_cstr("\\n");
+                break;
+            case '\r':
+                buf.put_cstr("\\r");
+                break;
+            case '\t':
+                buf.put_cstr("\\t");
+                break;
+            default: {
+                const char hex[] = "0123456789ABCDEF";
+                if (c >= 0x20 && c <= 0x7e) {
+                    buf.put(static_cast<char>(c));
+                } else {
+                    buf.put_cstr("\\x");
+                    buf.put(hex[(c >> 4) & 0x0F]);
+                    buf.put(hex[c & 0x0F]);
+                }
+                break;
+            }
+        }
+    }
+    buf.put_cstr("\" (len=");
+    buf.put_u32(body.len);
+    buf.put(')');
+}
+
+static void print_redirect_scheme(PrintBuf& buf, RedirectPolicyScheme value) {
+    if (value == RedirectPolicyScheme::Http) buf.put_cstr("http");
+    else buf.put_cstr("invalid");
+}
+
+static void print_redirect_authority(PrintBuf& buf, RedirectPolicyAuthority value) {
+    if (value == RedirectPolicyAuthority::RequestHost) buf.put_cstr("request_host");
+    else buf.put_cstr("invalid");
+}
+
+static void print_redirect_port(PrintBuf& buf, RedirectPolicyPort value) {
+    if (value == RedirectPolicyPort::ActualListener) buf.put_cstr("actual_listener");
+    else buf.put_cstr("invalid");
+}
+
+static void print_redirect_path(PrintBuf& buf, RedirectPolicyPath value) {
+    if (value == RedirectPolicyPath::Static) buf.put_cstr("static");
+    else buf.put_cstr("invalid");
+}
+
+static void print_redirect_query(PrintBuf& buf, RedirectPolicyQuery value) {
+    if (value == RedirectPolicyQuery::PreserveRaw) buf.put_cstr("preserve_raw");
+    else buf.put_cstr("invalid");
+}
+
+static void print_redirect_date(PrintBuf& buf, RedirectPolicyDate value) {
+    if (value == RedirectPolicyDate::Current) buf.put_cstr("current");
+    else buf.put_cstr("invalid");
+}
+
+static void print_redirect_connection(PrintBuf& buf, RedirectPolicyConnection value) {
+    if (value == RedirectPolicyConnection::Close) buf.put_cstr("close");
+    else buf.put_cstr("invalid");
+}
+
 static void print_block_ref(PrintBuf& buf, BlockId bid, const Function& fn) {
     if (bid.id < fn.block_count) {
         buf.put_str(fn.blocks[bid.id].label);
@@ -890,6 +963,44 @@ void print_module(PrintBuf& buf, const Module& mod) {
     for (u32 i = 0; i < mod.func_count; i++) {
         if (i > 0) buf.newline();
         print_function(buf, mod.functions[i]);
+    }
+    if (mod.redirect_policy_count != 0) {
+        if (mod.func_count != 0) buf.newline();
+        buf.put_cstr("redirect_policies: ");
+        buf.put_u32(mod.redirect_policy_count);
+        buf.newline();
+        for (u32 i = 0; i < mod.redirect_policy_count; i++) {
+            const auto& policy = mod.redirect_policies[i];
+            buf.put_cstr("  redirect_policy#");
+            buf.put_u32(i + 1);
+            buf.put_cstr(": scheme=");
+            print_redirect_scheme(buf, policy.scheme);
+            buf.put_cstr(", authority=");
+            print_redirect_authority(buf, policy.authority);
+            buf.put_cstr(", port=");
+            print_redirect_port(buf, policy.port);
+            buf.put_cstr(", path=");
+            print_redirect_path(buf, policy.path);
+            buf.put_cstr(", query=");
+            print_redirect_query(buf, policy.query);
+            buf.put_cstr(", date=");
+            print_redirect_date(buf, policy.date);
+            buf.put_cstr(", connection=");
+            print_redirect_connection(buf, policy.connection);
+            buf.put_cstr(", status=");
+            buf.put_u32(policy.status_code);
+            buf.put_cstr(", reason=");
+            print_quoted_str(buf, policy.reason);
+            buf.put_cstr(", server=");
+            print_quoted_str(buf, policy.server);
+            buf.put_cstr(", content_type=");
+            print_quoted_str(buf, policy.content_type);
+            buf.put_cstr(", target_path=");
+            print_quoted_str(buf, policy.target_path);
+            buf.put_cstr(", body=");
+            print_redirect_body(buf, policy.body);
+            buf.newline();
+        }
     }
     buf.flush();
 }
