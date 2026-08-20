@@ -478,8 +478,8 @@ struct Module {
     ForwardPolicyBundle policy_bundles[kMaxForwardFailurePolicies]{};
     u32 policy_bundle_count = 0;
 
-    // Foundation-only target transforms. Strings are copied into the RIR arena
-    // and copied again into RouteConfig during activation; no runtime materializer
+    // Foundation-only target transforms. Strings are borrowed by the RIR module
+    // and copied into RouteConfig during activation; no runtime materializer
     // consumes them in this increment.
     ForwardTargetTransformSpec target_transforms[kMaxForwardTargetTransforms]{};
     u32 target_transform_count = 0;

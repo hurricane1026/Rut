@@ -62,6 +62,23 @@ TEST(target_transform, populate_copies_owned_metadata_and_ids) {
     CHECK(cfg.target_transforms[0].replace_prefix.eq({"/v1/", 4}));
 }
 
+TEST(target_transform, duplicate_add_is_stable_and_does_not_consume_storage) {
+    char strip[] = "/api/";
+    char replace[] = "/v1/";
+    char other_strip[] = "/other/";
+    char other_replace[] = "/v2/";
+    RouteConfig cfg{};
+    const auto spec = transform({strip, 5}, {replace, 4});
+    REQUIRE_EQ(cfg.add_target_transform(spec), 1u);
+    const u32 bytes = cfg.target_transform_bytes_used;
+    REQUIRE_EQ(cfg.add_target_transform(transform({"/api/", 5}, {"/v1/", 4})), 1u);
+    CHECK_EQ(cfg.target_transform_count, 1u);
+    CHECK_EQ(cfg.target_transform_bytes_used, bytes);
+    REQUIRE_EQ(cfg.add_target_transform(transform({other_strip, 7}, {other_replace, 4})), 2u);
+    CHECK_EQ(cfg.target_transform_count, 2u);
+    CHECK_EQ(cfg.target_transform_bytes_used, bytes + 11u);
+}
+
 TEST(target_transform, zero_entries_preserve_empty_config) {
     rir::Module mod{};
     RouteConfig cfg{};
@@ -135,6 +152,34 @@ TEST(target_transform, count_and_aggregate_caps_are_bounded) {
     CHECK_EQ(aggregate_cfg.add_target_transform(exact[8]), 0u);
 }
 
+TEST(target_transform, adjacent_aggregate_overflow_is_rejected_atomically) {
+    char strips[9][129];
+    char replaces[9][129];
+    ForwardTargetTransformSpec specs[9];
+    for (u32 i = 0; i < 8; i++) {
+        make_full_transform(strips[i], replaces[i], i);
+        specs[i] = transform({strips[i], 128}, {replaces[i], 128});
+    }
+    // Reduce one valid prefix by one byte, then append the valid one-byte
+    // prefixes. The complete table is exactly 2049 bytes, adjacent to the
+    // accepted 2048-byte boundary.
+    strips[0][126] = '/';
+    specs[0].strip_prefix.len = 127;
+    strips[8][0] = '/';
+    replaces[8][0] = '/';
+    specs[8] = transform({strips[8], 1}, {replaces[8], 1});
+    for (const auto& spec : specs) CHECK(forward_target_transform_spec_valid(spec));
+    CHECK_FALSE(forward_target_transform_table_valid(specs, 9));
+
+    rir::Module mod{};
+    mod.target_transform_count = 9;
+    for (u32 i = 0; i < 9; i++) mod.target_transforms[i] = specs[i];
+    RouteConfig cfg{};
+    CHECK_FALSE(populate_route_config(cfg, mod));
+    CHECK_EQ(cfg.target_transform_count, 0u);
+    CHECK_EQ(cfg.target_transform_bytes_used, 0u);
+}
+
 TEST(target_transform, populate_validation_is_atomic) {
     char good_strip[] = "/good/";
     char good_replace[] = "/new/";
@@ -145,6 +190,34 @@ TEST(target_transform, populate_validation_is_atomic) {
     mod.target_transforms[0] = transform({good_strip, 6}, {good_replace, 5});
     mod.target_transforms[1] = transform({bad_strip, 4}, {bad_replace, 5});
 
+    RouteConfig cfg{};
+    CHECK_FALSE(populate_route_config(cfg, mod));
+    CHECK_EQ(cfg.target_transform_count, 0u);
+    CHECK_EQ(cfg.target_transform_bytes_used, 0u);
+}
+
+TEST(target_transform, later_cache_failure_does_not_publish_metadata) {
+    char strip[] = "/api/";
+    char replace[] = "/v1/";
+    rir::Module mod{};
+    mod.target_transform_count = 1;
+    mod.target_transforms[0] = transform({strip, 5}, {replace, 4});
+    mod.cache_instance_count = 1;
+    mod.cache_instances[0].name = {nullptr, 1};
+
+    RouteConfig cfg{};
+    CHECK_FALSE(populate_route_config(cfg, mod));
+    CHECK_EQ(cfg.target_transform_count, 0u);
+    CHECK_EQ(cfg.target_transform_bytes_used, 0u);
+}
+
+TEST(target_transform, populate_rejects_duplicate_module_ids_atomically) {
+    char strip[] = "/api/";
+    char replace[] = "/v1/";
+    rir::Module mod{};
+    mod.target_transform_count = 2;
+    mod.target_transforms[0] = transform({strip, 5}, {replace, 4});
+    mod.target_transforms[1] = transform({strip, 5}, {replace, 4});
     RouteConfig cfg{};
     CHECK_FALSE(populate_route_config(cfg, mod));
     CHECK_EQ(cfg.target_transform_count, 0u);

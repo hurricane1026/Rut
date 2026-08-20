@@ -378,11 +378,6 @@ inline bool populate_route_config(RouteConfig& cfg, const rir::Module& mod) {
         u16 idx = cfg.add_policy_bundle(bundle.response_policy_id, bundle.failure_policy_id);
         if (idx == 0 || idx != i + 1) return false;
     }
-    for (u32 i = 0; i < mod.target_transform_count; i++) {
-        u16 idx = cfg.add_target_transform(mod.target_transforms[i]);
-        if (idx == 0 || idx != i + 1) return false;
-    }
-
     // Cache instance descriptors — declaration order defines the instance
     // index compiled into CacheGet/CacheSet, so the copy must be exact and
     // the target table empty.
@@ -392,6 +387,14 @@ inline bool populate_route_config(RouteConfig& cfg, const rir::Module& mod) {
         const auto& ci = mod.cache_instances[i];
         if (ci.name.len > 0 && ci.name.ptr == nullptr) return false;
         if (!cfg.add_cache_instance(ci.name.ptr, ci.name.len, ci.capacity)) return false;
+    }
+
+    // Target-transform metadata is copied last.  Every operation above can
+    // still fail; keeping this final means a failed population never leaves
+    // partially published transform metadata in the destination config.
+    for (u32 i = 0; i < mod.target_transform_count; i++) {
+        u16 idx = cfg.add_target_transform(mod.target_transforms[i]);
+        if (idx == 0 || idx != i + 1) return false;
     }
     return true;
 }
