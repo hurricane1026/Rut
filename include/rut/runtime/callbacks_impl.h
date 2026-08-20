@@ -496,6 +496,15 @@ void format_response_with_body_and_headers(Connection& conn,
                                            bool suppress_default_content_type = false);
 inline bool apply_request_policy(Connection& conn, const sockaddr_in& endpoint, u16 policy_id);
 inline bool materialize_request_target_transform(Connection& conn, const RouteConfig& config);
+inline bool build_redirect_response(const Connection& conn,
+                                    const RouteConfig& config,
+                                    u16 policy_id,
+                                    u8* out,
+                                    u32 out_cap,
+                                    u32* out_len);
+inline bool stage_redirect_response(Connection& conn,
+                                    const RouteConfig& config,
+                                    u16 policy_id);
 enum class RequestPolicyBodyState : u8 { Invalid, Complete, Waiting };
 RequestPolicyBodyState inspect_request_policy_body(const Connection& conn,
                                                    u16 policy_id);
@@ -1931,10 +1940,10 @@ void handle_jit_outcome(Loop* loop,
             return;
         }
         case JitDispatchOutcome::Kind::Redirect: {
-            // Redirect serialization is intentionally not part of this
-            // increment. Validate the pinned metadata reference, then reject
-            // locally before request-policy handling or any upstream side
-            // effect. A malformed/forged id follows the same fail-closed path.
+            // Redirects are local responses: resolve only against the pinned
+            // request config and publish a complete response before any
+            // request-policy or upstream path can run. Unsupported input uses
+            // the existing exact 400/close fallback.
             conn.pending_handler_fn = nullptr;
             const RouteConfig* config = conn.request_config;
             if (config == nullptr ||
@@ -1942,7 +1951,14 @@ void handle_jit_outcome(Loop* loop,
                 reject_response_policy(loop, conn);
                 return;
             }
-            reject_response_policy(loop, conn);
+            if (!stage_redirect_response(conn, *config, outcome.redirect_policy_id)) {
+                reject_response_policy(loop, conn);
+                return;
+            }
+            conn.resp_status = config->redirect_policies[outcome.redirect_policy_id - 1].status_code;
+            conn.keep_alive = false;
+            conn.transition_to_sending(&on_response_sent<Loop>);
+            client_send(loop, conn, conn.send_buf.data(), conn.send_buf.len());
             return;
         }
         case JitDispatchOutcome::Kind::TimerYield: {
@@ -5547,6 +5563,228 @@ inline u32 strict_response_date(char* out, u64 now_us) {
     *p++ = ' '; two(tm.tm_hour); *p++ = ':'; two(tm.tm_min); *p++ = ':'; two(tm.tm_sec);
     *p++ = ' '; *p++ = 'G'; *p++ = 'M'; *p++ = 'T';
     return static_cast<u32>(p - out);
+}
+
+struct RedirectAuthorityView {
+    Str value{};
+    bool has_port = false;
+};
+
+inline bool redirect_name_eq(Str name, const char* literal, u32 literal_len) {
+    return name.len == literal_len &&
+           http_header_name_eq_ci(name.ptr, name.len, literal, literal_len);
+}
+
+inline bool redirect_connection_close(Str value) {
+    u32 start = 0;
+    while (start < value.len && (value.ptr[start] == ' ' || value.ptr[start] == '\t')) start++;
+    u32 end = value.len;
+    while (end > start && (value.ptr[end - 1] == ' ' || value.ptr[end - 1] == '\t')) end--;
+    return end - start == 5 && http_header_name_eq_ci(value.ptr + start, 5, "close", 5);
+}
+
+inline bool redirect_authority_valid(Str value,
+                                     u16 actual_port,
+                                     RedirectAuthorityView* out) {
+    if (out == nullptr || value.ptr == nullptr || value.len == 0 || value.len > 255 ||
+        actual_port == 0)
+        return false;
+    u32 colon = value.len;
+    for (u32 i = 0; i < value.len; i++) {
+        const u8 c = static_cast<u8>(value.ptr[i]);
+        if (c <= 0x20 || c == 0x7f || c == '/' || c == '?' || c == '#' || c == '@' ||
+            c == '[' || c == ']' || c == ',' || c == '\\')
+            return false;
+        if (c == ':') {
+            if (colon != value.len) return false;
+            colon = i;
+        }
+    }
+    if (colon == 0) return false;
+    const bool has_port = colon != value.len;
+    if (has_port) {
+        if (colon + 1 == value.len) return false;
+        u32 parsed = 0;
+        for (u32 i = colon + 1; i < value.len; i++) {
+            const u8 c = static_cast<u8>(value.ptr[i]);
+            if (c < '0' || c > '9') return false;
+            if (parsed > 6553u || (parsed == 6553u && c > '5')) return false;
+            parsed = parsed * 10u + static_cast<u32>(c - '0');
+        }
+        if (parsed == 0 || parsed != actual_port) return false;
+    }
+    const u32 host_len = has_port ? colon : value.len;
+    for (u32 i = 0; i < host_len; i++) {
+        const u8 c = static_cast<u8>(value.ptr[i]);
+        const bool alpha_num = (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+                               (c >= '0' && c <= '9');
+        if (!alpha_num && c != '.' && c != '-' && c != '_') return false;
+    }
+    out->value = value;
+    out->has_port = has_port;
+    return true;
+}
+
+inline bool redirect_origin_request_valid(const Connection& conn,
+                                          ParsedRequest* out_req,
+                                          u32* out_target_start,
+                                          u32* out_path_len,
+                                          u32* out_query_len,
+                                          RedirectAuthorityView* out_authority) {
+    if (out_req == nullptr || out_target_start == nullptr || out_path_len == nullptr ||
+        out_query_len == nullptr || out_authority == nullptr || conn.recv_slice == nullptr ||
+        conn.recv_buf.data() != conn.recv_slice || conn.recv_buf.len() == 0 ||
+        conn.req_body_mode != BodyMode::None || conn.req_body_remaining != 0 ||
+        conn.req_header_end == 0 || conn.recv_buf.len() != conn.req_header_end)
+        return false;
+    HttpParser parser;
+    parser.reset();
+    if (parser.parse(conn.recv_buf.data(), conn.recv_buf.len(), out_req) != ParseStatus::Complete ||
+        parser.header_end != conn.req_header_end || out_req->method != HttpMethod::GET ||
+        out_req->version != HttpVersion::Http11 || out_req->has_content_length || out_req->chunked ||
+        out_req->upgrade || out_req->has_upgrade_header)
+        return false;
+    const uintptr_t base = reinterpret_cast<uintptr_t>(conn.recv_buf.data());
+    const uintptr_t path_addr = reinterpret_cast<uintptr_t>(out_req->path.ptr);
+    if (path_addr < base || path_addr - base > conn.recv_buf.len() ||
+        out_req->path.len > conn.recv_buf.len() - static_cast<u32>(path_addr - base))
+        return false;
+    const u32 target_start = static_cast<u32>(path_addr - base);
+    const u32 target_len = out_req->path.len;
+    if (target_len == 0 || out_req->path.ptr[0] != '/') return false;
+
+    u32 host_count = 0;
+    u32 connection_count = 0;
+    const Header* host = nullptr;
+    for (u32 i = 0; i < out_req->header_count; i++) {
+        const Header& header = out_req->headers[i];
+        if (redirect_name_eq(header.name, "host", 4)) {
+            if (++host_count > 1) return false;
+            host = &header;
+        } else if (redirect_name_eq(header.name, "connection", 10)) {
+            if (++connection_count > 1 || !redirect_connection_close(header.value)) return false;
+        } else if (redirect_name_eq(header.name, "content-length", 14) ||
+                   redirect_name_eq(header.name, "transfer-encoding", 17) ||
+                   redirect_name_eq(header.name, "te", 2) || redirect_name_eq(header.name, "expect", 6) ||
+                   redirect_name_eq(header.name, "upgrade", 7)) {
+            return false;
+        }
+    }
+    if (host_count != 1 || connection_count != 1 || host == nullptr ||
+        !redirect_authority_valid(host->value, conn.listener_context.port, out_authority))
+        return false;
+
+    u32 path_len = target_len;
+    for (u32 i = 0; i < target_len; i++) {
+        const u8 c = static_cast<u8>(out_req->path.ptr[i]);
+        if (c == '?') {
+            path_len = i;
+            break;
+        }
+        if (c == '#' || c < 0x21 || c == 0x7f) return false;
+    }
+    for (u32 i = path_len; i < target_len; i++) {
+        const u8 c = static_cast<u8>(out_req->path.ptr[i]);
+        if (c == '#' || c < 0x21 || c == 0x7f) return false;
+    }
+    if (path_len == 0) return false;
+    *out_target_start = target_start;
+    *out_path_len = path_len;
+    *out_query_len = target_len - path_len;
+    return true;
+}
+
+inline bool build_redirect_response(const Connection& conn,
+                                   const RouteConfig& config,
+                                   u16 policy_id,
+                                   u8* out,
+                                   u32 out_cap,
+                                   u32* out_len) {
+    if (out_len == nullptr) return false;
+    *out_len = 0;
+    if (out == nullptr || !conn.listener_context.valid() ||
+        conn.listener_context.transport != ListenerTransport::Cleartext ||
+        !config.redirect_policy_id_is_valid(policy_id))
+        return false;
+    const auto& policy = config.redirect_policies[policy_id - 1];
+    if (!redirect_policy_spec_valid(policy)) return false;
+
+    ParsedRequest req{};
+    u32 target_start = 0, path_len = 0, query_len = 0;
+    RedirectAuthorityView authority{};
+    if (!redirect_origin_request_valid(conn,
+                                       &req,
+                                       &target_start,
+                                       &path_len,
+                                       &query_len,
+                                       &authority))
+        return false;
+
+    char status[3] = {static_cast<char>('0' + policy.status_code / 100),
+                      static_cast<char>('0' + (policy.status_code / 10) % 10),
+                      static_cast<char>('0' + policy.status_code % 10)};
+    char date[32];
+    char body_len[10];
+    char actual_port[10];
+    const u32 date_len = strict_response_date(date, realtime_us());
+    const u32 body_len_digits = strict_response_dec(body_len, policy.body.len);
+    const u32 actual_port_digits = strict_response_dec(actual_port, conn.listener_context.port);
+    if (date_len == 0 || actual_port_digits == 0) return false;
+
+    const u32 authority_len = authority.value.len +
+                              (authority.has_port ? 0u : 1u + actual_port_digits);
+    u64 required = 0;
+    auto add = [&](u64 n) {
+        if (n > 0xffffffffu - required) return false;
+        required += n;
+        return true;
+    };
+    static constexpr char kLocationPrefix[] = "\r\nLocation: http://";
+    static constexpr char kTail[] = "\r\nConnection: close\r\n\r\n";
+    if (!add(9 + 3 + 1 + policy.reason.len + 2) || !add(10 + policy.server.len) ||
+        !add(8 + date_len) || !add(16 + policy.content_type.len) ||
+        !add(18 + body_len_digits) || !add(sizeof(kLocationPrefix) - 1 + authority_len) ||
+        !add(policy.target_path.len + query_len) || !add(sizeof(kTail) - 1) ||
+        !add(policy.body.len) || required > out_cap)
+        return false;
+
+    u32 pos = 0;
+    auto put = [&](const void* data, u32 len) {
+        if (len > out_cap - pos) return false;
+        if (len != 0) __builtin_memcpy(out + pos, data, len);
+        pos += len;
+        return true;
+    };
+    auto put_lit = [&](const char* value) {
+        return put(value, static_cast<u32>(__builtin_strlen(value)));
+    };
+    if (!put_lit("HTTP/1.1 ") || !put(status, 3) || !put_lit(" ") ||
+        !put(policy.reason.ptr, policy.reason.len) || !put_lit("\r\nServer: ") ||
+        !put(policy.server.ptr, policy.server.len) || !put_lit("\r\nDate: ") ||
+        !put(date, date_len) || !put_lit("\r\nContent-Type: ") ||
+        !put(policy.content_type.ptr, policy.content_type.len) ||
+        !put_lit("\r\nContent-Length: ") || !put(body_len, body_len_digits) ||
+        !put(kLocationPrefix, sizeof(kLocationPrefix) - 1) ||
+        !put(authority.value.ptr, authority.value.len) ||
+        (!authority.has_port && (!put_lit(":") || !put(actual_port, actual_port_digits))) ||
+        !put(policy.target_path.ptr, policy.target_path.len) ||
+        !put(conn.recv_buf.data() + target_start + path_len, query_len) ||
+        !put(kTail, sizeof(kTail) - 1) || !put(policy.body.ptr, policy.body.len))
+        return false;
+    *out_len = pos;
+    return true;
+}
+
+inline bool stage_redirect_response(Connection& conn,
+                                   const RouteConfig& config,
+                                   u16 policy_id) {
+    u8 scratch[SlicePool::kSliceSize];
+    const u32 cap = conn.send_buf.capacity() < sizeof(scratch) ? conn.send_buf.capacity()
+                                                                : sizeof(scratch);
+    u32 len = 0;
+    if (!build_redirect_response(conn, config, policy_id, scratch, cap, &len)) return false;
+    conn.send_buf.reset();
+    return conn.send_buf.write(scratch, len) == len;
 }
 
 inline bool build_strict_response_headers(Connection& conn, const RouteConfig& config,
