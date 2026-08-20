@@ -312,12 +312,15 @@ return forward(users, request_policy: {
     version: "HTTP/1.1", host: "upstream", connection: "omit",
     strip_headers: ["Connection", "Keep-Alive", "TE", "Expect", "Upgrade"]
 })                                               // fixed header-only rebuild
-// Response-policy metadata is currently a fail-closed foundation: any
-// non-zero response policy returns 400 before an upstream connection. It does
-// not yet reconstruct or filter upstream responses.
+// Bounded response-policy serialization currently accepts only a cleartext
+// HTTP/1.1, origin-form, bodyless non-HEAD request and one final upstream
+// HTTP/1.1 response framed by exactly one Content-Length. Requests with a
+// body, TLS/H2, interim/Upgrade responses, chunking/trailers, close-delimited
+// framing, or unsupported status/header controls fail closed; transparent
+// forward(...) remains the default for all other routes.
 return forward(users, response_policy: {
     version: "HTTP/1.1", framing: "content_length", connection: "keep_alive",
-    server: "nginx", date: "current", hide_headers: ["Date", "Server"]
+    server: "nginx/1.29.7", date: "current", hide_headers: ["Date", "Server", "X-Pad"]
 })
 // Valid downstream Upgrade requests are rejected by this policy; Upgrade
 // passthrough remains PARTIAL in the first slice.

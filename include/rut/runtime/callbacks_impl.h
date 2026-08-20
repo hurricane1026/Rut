@@ -2137,7 +2137,9 @@ void handle_jit_outcome(Loop* loop,
             if (outcome.response_policy_id != 0 &&
                 (!config->response_policy_id_is_valid(outcome.response_policy_id) ||
                  conn.req_http_version != static_cast<u8>(HttpVersion::Http11) ||
+                 !conn.req_keep_alive ||
                  conn.req_method == static_cast<u8>(LogHttpMethod::Head) ||
+                 conn.tls_active ||
                  conn.req_path_canon.ptr == nullptr ||
                  conn.req_wants_upgrade || conn.req_body_mode != BodyMode::None ||
                  target.addr_count != 1 || target.addrs[0].sin_family != AF_INET ||
@@ -4962,7 +4964,7 @@ inline bool strict_response_forbidden(Str name) {
         response_policy_name_eq(name, "te", 2) || response_policy_name_eq(name, "trailer", 7) ||
         response_policy_name_eq(name, "transfer-encoding", 17) ||
         response_policy_name_eq(name, "upgrade", 7) ||
-        response_policy_name_eq(name, "proxy-connection", 17) ||
+        response_policy_name_eq(name, "proxy-connection", 16) ||
         response_policy_name_eq(name, "location", 8) || response_policy_name_eq(name, "refresh", 7) ||
         response_policy_name_eq(name, "content-type", 12) ||
         response_policy_name_eq(name, "last-modified", 13))
@@ -5023,7 +5025,8 @@ inline bool build_strict_response_headers(Connection& conn, const RouteConfig& c
     if (!response_policy_spec_valid(policy) || resp.version != HttpVersion::Http11 ||
         resp.status_code < 200 || resp.status_code > 599 || resp.status_code == 204 ||
         resp.status_code == 205 || resp.status_code == 304 || resp.headers_truncated ||
-        resp.content_length_count != 1 || !resp.has_content_length || resp.chunked)
+        resp.content_length_count != 1 || !resp.has_content_length || resp.chunked ||
+        resp.reason.len == 0)
         return false;
     for (u32 i = 0; i < resp.reason.len; i++) {
         const u8 c = static_cast<u8>(resp.reason.ptr[i]);
@@ -5068,11 +5071,25 @@ inline bool build_strict_response_headers(Connection& conn, const RouteConfig& c
 
 template <typename Loop>
 inline void reject_strict_response(Loop* loop, Connection& conn) {
+    // This is the response-policy equivalent of the upstream timeout path:
+    // publish abandonment before closing the fd so late CQEs cannot dispatch
+    // into the old upstream callback, and detach every callback/epoll state
+    // before the client-side 502 is sent.  The slot is released here rather
+    // than waiting for client close; close_conn's held bit makes this idempotent.
+    conn.upstream_abandoned = true;
+    conn.upstream_keep_alive = false;
+    conn.set_slots(nullptr, nullptr, nullptr, nullptr);
+    if constexpr (requires { loop->discard_upstream_send(conn); }) {
+        loop->discard_upstream_send(conn);
+    }
     if (conn.upstream_fd >= 0) {
         ::close(conn.upstream_fd);
         conn.upstream_fd = -1;
         loop->clear_upstream_fd(conn.id);
     }
+    conn.upstream_recv_armed = false;
+    conn.upstream_send_armed = false;
+    release_upstream_slot(loop, conn);
     static const char k502[] = "HTTP/1.1 502 Bad Gateway\r\nContent-Length: 11\r\n"
                                 "Connection: close\r\n\r\nBad Gateway";
     conn.send_buf.reset();
@@ -5162,7 +5179,12 @@ void on_upstream_response(void* lp, Connection& conn, IoEvent ev) {
     }
     conn.resp_status = resp.status_code;
 
-    if (conn.response_policy_id != 0 && resp.status_code == 101) {
+    // A strict policy has no interim-response or Upgrade domain.  Reject all
+    // 1xx statuses before the transparent interim-discard/WebSocket branches;
+    // otherwise a 103/100 could be consumed and a later final response would
+    // incorrectly make the policy appear successful.
+    if (conn.response_policy_id != 0 && resp.status_code >= 100 &&
+        resp.status_code < 200) {
         reject_strict_response(loop, conn);
         return;
     }
