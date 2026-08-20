@@ -4260,6 +4260,10 @@ TEST(response_policy, buffered_request_requires_successful_upload) {
         c->req_method = static_cast<u8>(LogHttpMethod::Post);
         c->req_keep_alive = true;
         c->req_path_canon = {"api", 3};
+        // Mirror proxy dispatch: both callbacks below are failure exits after
+        // the upstream concurrency slot has already been acquired.
+        c->upstream_slot_held = true;
+        c->upstream_slot_uid = 1;
         static constexpr char kRequest[] =
             "POST /api HTTP/1.1\r\nHost: x\r\nContent-Length: 1\r\n\r\nX";
         REQUIRE_EQ(c->recv_buf.write(reinterpret_cast<const u8*>(kRequest), sizeof(kRequest) - 1),
