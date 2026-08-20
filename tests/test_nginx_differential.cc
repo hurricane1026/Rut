@@ -3,6 +3,7 @@
 
 #include <arpa/inet.h>
 #include <atomic>
+#include <chrono>
 #include <cerrno>
 #include <cstring>
 #include <fcntl.h>
@@ -387,9 +388,19 @@ static bool parse_content_length(const std::vector<char>& bytes, size_t end, siz
 }
 
 static bool read_response(int fd, std::vector<char>& bytes, std::string& error) {
+    using Clock = std::chrono::steady_clock;
+    static constexpr auto kResponseReadBudget = std::chrono::seconds(5);
+    const Clock::time_point deadline = Clock::now() + kResponseReadBudget;
+    const auto deadline_expired = [&]() { return Clock::now() >= deadline; };
+
     bytes.clear();
     bytes.reserve(4096);
-    for (int attempt = 0; attempt < 100; attempt++) {
+    for (;;) {
+        if (deadline_expired()) {
+            error = "response deadline exceeded";
+            return false;
+        }
+
         char buf[4096];
         const ssize_t n = recv(fd, buf, sizeof(buf), 0);
         if (n > 0) {
@@ -406,14 +417,22 @@ static bool read_response(int fd, std::vector<char>& bytes, std::string& error) 
                     return bytes.size() == end + body_len;
                 }
             }
+            if (deadline_expired()) {
+                error = "response deadline exceeded";
+                return false;
+            }
             continue;
         }
-        if (n < 0 && errno == EINTR) continue;
+        if (n < 0 && (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK)) {
+            if (deadline_expired()) {
+                error = "response deadline exceeded";
+                return false;
+            }
+            continue;
+        }
         error = n == 0 ? "response ended before Content-Length body" : "response read failed";
         return false;
     }
-    error = "response read timeout";
-    return false;
 }
 
 static bool read_eof(int fd, std::string& error) {
