@@ -8,7 +8,7 @@ Allowed states are `SUPPORTED`, `PARTIAL`, `BLOCKED_BY_RUT`,
 
 | nginx feature | parser | converter | RUT capability | behavior test | status |
 | --- | --- | --- | --- | --- | --- |
-| exact minimal fragment: one wildcard listener, root location, literal IPv4 no-URI proxy, bounded H1 domain | yes | yes | yes for declared bounds | committed pinned `%7E` success differential plus pinned generated-RUT fixed-CL POST, close, and gateway differentials | SUPPORTED |
+| exact minimal fragment: one wildcard listener, root location, literal IPv4 no-URI proxy, bounded H1 domain | yes | yes | yes for declared bounds | committed pinned `%7E` success and explicit-close gateway differentials; pinned fixed-CL POST and keep-alive evidence | SUPPORTED |
 | server fragment, exactly one server | yes | yes | partial: exact single-server model only; no server selection model | bounded pinned generated-RUT GET and POST differentials | PARTIAL |
 | `listen <port>` IPv4 wildcard | yes | yes | yes: one source `listen :<port>` declaration | pinned nginx/generated-RUT bind and request | SUPPORTED |
 | ordinary prefix `location /` | yes | yes | partial: root catch-all exists | bounded pinned generated-RUT GET differential | PARTIAL |
@@ -19,7 +19,7 @@ Allowed states are `SUPPORTED`, `PARTIAL`, `BLOCKED_BY_RUT`,
 | nginx default upstream HTTP version and request headers | implicit | yes | partial: explicit fixed HTTP/1.1 policy with bounded fixed-CL buffering; #252 | exact RUT tests plus pinned generated-RUT GET and POST differentials | PARTIAL |
 | proxied response status and body | implicit | yes | partial: strict final H1.1 exact-Content-Length streaming | exact RUT tests plus pinned generated-RUT GET and POST differentials | PARTIAL |
 | nginx default proxied response header policy | implicit | yes | partial: bounded strict H1.1 final-response/content-length serializer; consumes one upstream `Connection`; downstream connection follows request; #253 | exact RUT/token tests plus pinned generated-RUT GET, POST, and close differentials | PARTIAL |
-| single unavailable upstream gateway error | implicit | yes | yes for bounded H1 single-IPv4 connect failures; #256 | pinned generated-RUT keep-alive, close/EOF, and split-POST differentials | SUPPORTED |
+| single unavailable upstream gateway error | implicit | yes | yes for bounded H1 single-IPv4 connect failures; #256 | committed pinned close/EOF differential plus pinned keep-alive and split-POST evidence | SUPPORTED |
 | exact, `^~`, regex, or nested locations | no | no | no nginx selection semantics | no | NOT_PLANNED |
 | `proxy_pass` with URI replacement | no | no | literal path rewrite only | no | NOT_PLANNED |
 | multiple servers / `server_name` / `default_server` | no | no | no virtual-server selection | no | NOT_PLANNED |
@@ -82,8 +82,9 @@ Allowed states are `SUPPORTED`, `PARTIAL`, `BLOCKED_BY_RUT`,
   11-byte close response; converter-generated RUT now matches the complete
   response after normalizing only Date, preserves keep-alive for a second
   request, closes on explicit client intent, and waits through the split-body
-  window. The claim remains limited to the bounded H1 single-IPv4
-  connect-failure domain.
+  window. The explicit-close 502/EOF vector is now a committed serial CTest.
+  The claim remains limited to the bounded H1 single-IPv4 connect-failure
+  domain.
 - Response policy is intentionally limited to non-HEAD HTTP/1.1 requests and
   one final HTTP/1.1 response with exact Content-Length. Bodies, Upgrade,
   absolute-form targets, HTTP/1.0, HTTP/2, interim/no-body statuses, chunking,
