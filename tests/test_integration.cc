@@ -16134,7 +16134,7 @@ TEST(route, response_policy_rejects_strict_invalid_final_vectors) {
         "HTTP/1.1 200 OK\r\n\r\n",
         "HTTP/1.1 200 OK\r\nContent-Length: 0\r\nContent-Length: 0\r\n\r\n",
         "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n",
-        ("HTTP/1.1 200 OK\r\nConnection: keep-alive\r\nConnection: close\r\n"
+        ("HTTP/1.1 200 OK\r\nConnection: Foo\r\ncOnNeCtIoN: Bar\r\n"
          "Content-Length: 0\r\n\r\n"),
         "HTTP/1.1 200 OK\r\nProxy-Connection: keep-alive\r\nContent-Length: 0\r\n\r\n",
         "HTTP/1.1 200 OK\r\nX-Accel-Redirect: /private\r\nContent-Length: 0\r\n\r\n",
@@ -16821,15 +16821,24 @@ TEST(route, response_policy_consumes_one_upstream_connection_header) {
     struct Case {
         const char* response;
         bool preserve_x_hop;
+        const char* preserve_headers;
     };
     static constexpr Case kCases[] = {
-        {"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n", false},
+        {"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n", false, nullptr},
         {"HTTP/1.1 200 OK\r\nConnection: keep-alive\r\nContent-Length: 0\r\n\r\n",
-         false},
-        {"HTTP/1.1 200 OK\r\nConnection: close\r\nContent-Length: 0\r\n\r\n", false},
+         false,
+         nullptr},
+        {"HTTP/1.1 200 OK\r\nConnection: close\r\nContent-Length: 0\r\n\r\n",
+         false,
+         nullptr},
         {"HTTP/1.1 200 OK\r\nConnection: X-Hop\r\nX-Hop: secret\r\n"
          "Content-Length: 0\r\n\r\n",
-         true},
+         true,
+         nullptr},
+        {"HTTP/1.1 200 OK\r\nConnection: Foo, Bar\r\nFoo: one\r\nBar: two\r\n"
+         "Content-Length: 0\r\n\r\n",
+         false,
+         "Foo: one\r\nBar: two\r\n"},
     };
 
     for (const Case& test : kCases) {
@@ -16877,9 +16886,10 @@ TEST(route, response_policy_consumes_one_upstream_connection_header) {
             "Date: XXXXXXXXXXXXXXXXXXXXXXXXXXXXX\r\n"
             "Content-Length: 0\r\n"
             "Connection: keep-alive\r\n"
-            "%s"
+            "%s%s"
             "\r\n",
-            test.preserve_x_hop ? "X-Hop: secret\r\n" : "");
+            test.preserve_x_hop ? "X-Hop: secret\r\n" : "",
+            test.preserve_headers ? test.preserve_headers : "");
         REQUIRE_GT(expected_len, 0);
         REQUIRE_LT(expected_len, static_cast<int>(sizeof(expected)));
         CHECK_EQ(n, static_cast<u32>(expected_len));
