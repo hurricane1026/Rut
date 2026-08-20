@@ -26,6 +26,100 @@ using rut::test_fault::ScopedFakeSocket;
 using rut::test_fault::ScopedMemoryFault;
 using rut::test_fault::ScopedRecvData;
 
+TEST(listener_context, resolves_ephemeral_and_explicit_bound_ports) {
+    ListenerContext invalid{};
+    CHECK(!invalid.valid());
+
+    ListenerSpec declared{};
+    declared.port = 0;
+    auto ephemeral_fd = create_listen_socket(declared.port);
+    REQUIRE(ephemeral_fd.has_value());
+    const i32 ephemeral = ephemeral_fd.value();
+
+    auto ephemeral_context = derive_listener_context(ephemeral, declared);
+    REQUIRE(ephemeral_context.has_value());
+    CHECK(ephemeral_context.value().valid());
+    CHECK_EQ(ephemeral_context.value().address, ListenerAddress::IPv4Wildcard);
+    CHECK_EQ(ephemeral_context.value().transport, ListenerTransport::Cleartext);
+    CHECK_NE(ephemeral_context.value().port, static_cast<u16>(0));
+
+    ListenerSpec bad_address = declared;
+    bad_address.address = static_cast<ListenerAddress>(0xff);
+    CHECK(!derive_listener_context(-1, bad_address).has_value());
+    ListenerSpec bad_transport = declared;
+    bad_transport.transport = static_cast<ListenerTransport>(0xff);
+    CHECK(!derive_listener_context(-1, bad_transport).has_value());
+
+    // A later SO_REUSEPORT shard binds the concrete port obtained from the
+    // first socket, rather than independently asking the kernel for another
+    // ephemeral port.
+    ListenerSpec explicit_declared = declared;
+    explicit_declared.port = ephemeral_context.value().port;
+    auto explicit_fd = create_listen_socket(explicit_declared.port);
+    REQUIRE(explicit_fd.has_value());
+    const i32 explicit_socket = explicit_fd.value();
+    auto explicit_context = derive_listener_context(explicit_socket, explicit_declared);
+    REQUIRE(explicit_context.has_value());
+    CHECK(explicit_context.value().equivalent(ephemeral_context.value()));
+
+    close(explicit_socket);
+    close(ephemeral);
+}
+
+TEST(listener_context, loop_allocators_copy_reset_and_preserve_context) {
+    const ListenerContext expected{ListenerAddress::IPv4Wildcard,
+                                   ListenerTransport::Cleartext,
+                                   static_cast<u16>(43127)};
+
+    // The legacy template loop is still used by a few embedders and tests.
+    auto legacy = std::make_unique<EventLoop<MockBackend>>();
+    REQUIRE(legacy->init(0, -1).has_value());
+    legacy->listener_context = expected;
+    auto* legacy_conn = legacy->alloc_conn();
+    REQUIRE(legacy_conn != nullptr);
+    CHECK(legacy_conn->listener_context.equivalent(expected));
+    legacy_conn->reset();
+    CHECK(!legacy_conn->listener_context.valid());
+    legacy->free_conn(*legacy_conn);
+    auto* legacy_reused = legacy->alloc_conn();
+    REQUIRE(legacy_reused != nullptr);
+    CHECK(legacy_reused->listener_context.equivalent(expected));
+    legacy->free_conn(*legacy_reused);
+    legacy->shutdown();
+
+    // Both production loop implementations use the same value-copy contract.
+    auto epoll = std::make_unique<EpollEventLoop>();
+    REQUIRE(epoll->init(0, -1).has_value());
+    epoll->listener_context = expected;
+    auto* epoll_conn = epoll->alloc_conn();
+    REQUIRE(epoll_conn != nullptr);
+    CHECK(epoll_conn->listener_context.equivalent(expected));
+    epoll->free_conn(*epoll_conn);
+    epoll->shutdown();
+
+    auto io_uring = std::make_unique<IoUringEventLoop>();
+    REQUIRE(io_uring->init(0, -1).has_value());
+    io_uring->listener_context = expected;
+    auto* io_uring_conn = io_uring->alloc_conn();
+    REQUIRE(io_uring_conn != nullptr);
+    CHECK(io_uring_conn->listener_context.equivalent(expected));
+    io_uring->free_conn(*io_uring_conn);
+    io_uring->shutdown();
+
+    // Request-boundary metadata capture must not clear connection-level
+    // listener identity, which is needed by later local responses on keepalive.
+    SmallLoop loop;
+    loop.setup();
+    loop.listener_context = expected;
+    auto* conn = loop.alloc_conn();
+    REQUIRE(conn != nullptr);
+    const char request[] = "GET / HTTP/1.1\r\nHost: example\r\n\r\n";
+    REQUIRE_EQ(conn->recv_buf.write(reinterpret_cast<const u8*>(request), sizeof(request) - 1),
+               sizeof(request) - 1);
+    capture_request_metadata(*conn);
+    CHECK(conn->listener_context.equivalent(expected));
+}
+
 // === Accept ===
 
 TEST(accept, basic) {

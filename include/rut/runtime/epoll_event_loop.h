@@ -556,6 +556,7 @@ public:
         conns[id].reset();
         conns[id].id = id;
         conns[id].shard_id = static_cast<u8>(shard_id);
+        conns[id].listener_context = this->listener_context;
         conns[id].recv_slice = rs;
         conns[id].send_slice = ss;
         conns[id].recv_buf.bind(rs, SlicePool::kSliceSize);

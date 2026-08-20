@@ -140,6 +140,7 @@ struct SmallLoop : EventLoopCRTP<SmallLoop> {
         u32 id = free_stack[--free_top];
         conns[id].reset();
         conns[id].id = id;
+        conns[id].listener_context = this->listener_context;
         conns[id].recv_slice = recv_storage[id];
         conns[id].send_slice = send_storage[id];
         conns[id].recv_buf.bind(recv_storage[id], kBufSize);

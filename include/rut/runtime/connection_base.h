@@ -9,6 +9,7 @@
 #include "rut/jit/handler_abi.h"
 #include "rut/runtime/chunked_parser.h"
 #include "rut/runtime/io_event.h"
+#include "rut/runtime/listener_context.h"
 #include "rut/runtime/tls_engine.h"
 #include "rut/runtime/ws_terminate.h"
 
@@ -435,6 +436,11 @@ struct ConnectionBase {
     // against the post-swap config. Cleared by reset().
     const RouteConfig* request_config;
 
+    // Immutable process/listener identity copied at accept-time. Unlike
+    // request_config this survives keep-alive request boundaries and is
+    // cleared only when the connection slot is reset.
+    ListenerContext listener_context;
+
     // Per-connection timespec storage for IORING_OP_TIMEOUT yields. The
     // kernel reads this asynchronously after SQE submission, so it must
     // outlive the submit call — on-connection storage is the simplest
@@ -761,6 +767,7 @@ struct ConnectionBase {
         // recycled reliably fails the generation match. It's
         // initialized at accept-time via EventLoop::alloc_conn_impl.
         request_config = nullptr;
+        listener_context = {};
         pending_handler_fn = nullptr;
         yield_timespec.tv_sec = 0;
         yield_timespec.tv_nsec = 0;

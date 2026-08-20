@@ -10,6 +10,7 @@
 #include "rut/runtime/io_backend.h"
 #include "rut/runtime/io_event.h"
 #include "rut/runtime/jit_dispatch.h"  // jit::HandlerCtx for fire_due_timers
+#include "rut/runtime/listener_context.h"
 #include "rut/runtime/metrics.h"
 #include "rut/runtime/rate_limit.h"
 #include "rut/runtime/route_table.h"  // RouteConfig::kMaxTimers / timers[] for fire_due_timers
@@ -48,6 +49,10 @@ class EventLoopCRTP {
     Derived& self() { return static_cast<Derived&>(*this); }
 
 public:
+    // Set once after the kernel listener has been bound and before shard
+    // threads accept connections. It is copied into each allocated connection.
+    ListenerContext listener_context{};
+
     bool submit_recv(Connection& c) { return self().submit_recv_impl(c); }
     bool submit_send(Connection& c, const u8* buf, u32 len) {
         return self().submit_send_impl(c, buf, len);
@@ -741,6 +746,7 @@ public:
         conns[id].reset();
         conns[id].id = id;
         conns[id].shard_id = static_cast<u8>(shard_id);
+        conns[id].listener_context = this->listener_context;
         conns[id].recv_slice = rs;
         conns[id].send_slice = ss;
         conns[id].recv_buf.bind(rs, SlicePool::kSliceSize);

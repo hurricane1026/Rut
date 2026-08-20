@@ -2,6 +2,7 @@
 #include "rut/runtime/epoll_event_loop.h"
 #include "rut/runtime/iouring_event_loop.h"
 #include "rut/runtime/listener.h"
+#include "rut/runtime/listener_context.h"
 #include "rut/runtime/shard.h"
 #include "rut/runtime/socket.h"
 #include "rut/runtime/tls.h"
@@ -115,6 +116,7 @@ static i32 run_shards(ListenerSpec listener,
                       const RouteConfig* route_config,
                       bool serve_metrics) {
     u16 port = listener.port;
+    ListenerContext bound_listener_context{};
     Shard<EventLoopType> shards[kMaxShards];
     // Cross-shard metrics registry for the built-in /metrics endpoint. Lives
     // for the whole serve duration (outlives the shard threads, which join
@@ -135,17 +137,6 @@ static i32 run_shards(ListenerSpec listener,
     // then create remaining sockets on that concrete port.
     for (u32 i = 0; i < shard_count; i++) {
         auto lfd_result = create_listen_socket(port);
-        // After shard 0, resolve ephemeral port so remaining shards bind the same port.
-        if (i == 0 && port == 0 && lfd_result) {
-            struct sockaddr_in a;
-            socklen_t al = sizeof(a);
-            if (getsockname(lfd_result.value(), reinterpret_cast<struct sockaddr*>(&a), &al) < 0) {
-                write_str("Failed to resolve ephemeral port\n");
-                close(lfd_result.value());
-                return 1;
-            }
-            port = __builtin_bswap16(a.sin_port);
-        }
         if (!lfd_result) {
             write_str("Failed to create listen socket for shard ");
             write_u32(i);
@@ -159,6 +150,30 @@ static i32 run_shards(ListenerSpec listener,
             return 1;
         }
         i32 lfd = lfd_result.value();
+        auto derived_context = derive_listener_context(lfd, listener);
+        if (!derived_context) {
+            write_str("Failed to derive bounded listener context\n");
+            close(lfd);
+            for (u32 j = 0; j < i; j++) {
+                shards[j].stop();
+                shards[j].join();
+                shards[j].shutdown();
+            }
+            return 1;
+        }
+        if (i == 0) {
+            bound_listener_context = derived_context.value();
+            port = bound_listener_context.port;
+        } else if (!derived_context.value().equivalent(bound_listener_context)) {
+            write_str("Listener shards resolved different bound contexts\n");
+            close(lfd);
+            for (u32 j = 0; j < i; j++) {
+                shards[j].stop();
+                shards[j].join();
+                shards[j].shutdown();
+            }
+            return 1;
+        }
         shards[i].owns_listen_fd = true;
 
         auto rc = shards[i].init(i, lfd, pool_prealloc);
@@ -185,6 +200,7 @@ static i32 run_shards(ListenerSpec listener,
         if constexpr (requires { shards[i].loop->upstream_cc; }) {
             shards[i].loop->upstream_cc = &upstream_cc;
         }
+        shards[i].loop->listener_context = bound_listener_context;
 
         // Hand the compiled routes to the shard. Read-only and shared by
         // every shard (share-nothing applies to mutable per-request
@@ -207,17 +223,6 @@ static i32 run_shards(ListenerSpec listener,
         }
         write_str("Metrics: built-in GET /metrics enabled (reserved path — shadows user routes)\n");
     }
-
-    // Get actual port from first shard's socket
-    struct sockaddr_in bound_addr;
-    socklen_t addr_len = sizeof(bound_addr);
-    if (getsockname(
-            shards[0].listen_fd, reinterpret_cast<struct sockaddr*>(&bound_addr), &addr_len) < 0) {
-        write_str("Failed to get bound address\n");
-        for (u32 j = 0; j < shard_count; j++) shards[j].shutdown();
-        return 1;
-    }
-    port = __builtin_bswap16(bound_addr.sin_port);
 
     // Set up access log flusher if --access-log was specified.
     AccessLogFlusher log_flusher;
