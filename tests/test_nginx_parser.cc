@@ -26,11 +26,12 @@ static bool is_error(const FrontendResult<nginx::Server>& result,
     return detail.empty() || diagnostic.detail.eq(detail);
 }
 
-static const rir::Instruction* find_ret_forward(const rir::Function& function) {
+static const rir::Instruction* find_ret_forward_bundle(const rir::Function& function) {
     for (u32 bi = 0; bi < function.block_count; bi++) {
         const auto& block = function.blocks[bi];
         for (u32 ii = 0; ii < block.inst_count; ii++) {
-            if (block.insts[ii].op == rir::Opcode::RetForward) return &block.insts[ii];
+            if (block.insts[ii].op == rir::Opcode::RetForwardBundle)
+                return &block.insts[ii];
         }
     }
     return nullptr;
@@ -303,6 +304,15 @@ TEST(nginx_converter, lowers_canonical_model_to_stable_rut_source) {
         "        server: \"nginx/1.29.7\",\n"
         "        date: \"current\",\n"
         "        hide_headers: [\"Date\", \"Server\", \"X-Pad\"]\n"
+        "    }, failure_policy: {\n"
+        "        version: \"HTTP/1.1\",\n"
+        "        status: 502,\n"
+        "        reason: \"Bad Gateway\",\n"
+        "        content_type: \"text/html\",\n"
+        "        server: \"nginx/1.29.7\",\n"
+        "        date: \"current\",\n"
+        "        connection: \"request\",\n"
+        "        body: b\"<html>\\n<head><title>502 Bad Gateway</title></head>\\n<body>\\n<center><h1>502 Bad Gateway</h1></center>\\n<hr><center>nginx/1.29.7</center>\\n</body>\\n</html>\\n\"\n"
         "    })\n"
         "}\n";
     CHECK_EQ(result.value().len, static_cast<u32>(sizeof(kExpected) - 1));
@@ -360,6 +370,7 @@ TEST(nginx_converter, emitted_source_reaches_rir_with_source_metadata) {
     CHECK_EQ(hir_owned->upstreams[0].ip, 0x7F000001u);
     CHECK_EQ(hir_owned->upstreams[0].port, 9000u);
     REQUIRE_EQ(hir_owned->response_policies.len, 1u);
+    REQUIRE_EQ(hir_owned->failure_policies.len, 1u);
     auto mir = build_mir(*hir_owned);
     REQUIRE(mir);
     std::unique_ptr<MirModule> mir_owned(mir.value());
@@ -367,6 +378,7 @@ TEST(nginx_converter, emitted_source_reaches_rir_with_source_metadata) {
     CHECK_EQ(mir_owned->upstreams[0].ip, 0x7F000001u);
     CHECK_EQ(mir_owned->upstreams[0].port, 9000u);
     REQUIRE_EQ(mir_owned->response_policies.len, 1u);
+    REQUIRE_EQ(mir_owned->failure_policies.len, 1u);
     REQUIRE_EQ(mir_owned->functions.len, 1u);
     CHECK_EQ(mir_owned->functions[0].method, 0u);
     CHECK(mir_owned->functions[0].path.eq(lit_str("/")));
@@ -400,22 +412,46 @@ TEST(nginx_converter, emitted_source_reaches_rir_with_source_metadata) {
     CHECK(response_policy.hide_headers[1].eq(lit_str("Server")));
     CHECK(response_policy.hide_headers[2].eq(lit_str("X-Pad")));
 
+    REQUIRE_EQ(rir.module.failure_policy_count, 1u);
+    const auto& failure_policy = rir.module.failure_policies[0];
+    CHECK(failure_policy.version == ForwardFailurePolicyVersion::Http11);
+    CHECK_EQ(failure_policy.status_code, 502u);
+    CHECK(failure_policy.date == ForwardFailurePolicyDate::Current);
+    CHECK(failure_policy.connection == ForwardFailurePolicyConnection::Request);
+    CHECK(failure_policy.reason.eq(lit_str("Bad Gateway")));
+    CHECK(failure_policy.content_type.eq(lit_str("text/html")));
+    CHECK(failure_policy.server.eq(lit_str("nginx/1.29.7")));
+    static constexpr char kFailureBody[] =
+        "<html>\n"
+        "<head><title>502 Bad Gateway</title></head>\n"
+        "<body>\n"
+        "<center><h1>502 Bad Gateway</h1></center>\n"
+        "<hr><center>nginx/1.29.7</center>\n"
+        "</body>\n"
+        "</html>\n";
+    CHECK_EQ(failure_policy.body.len, static_cast<u32>(sizeof(kFailureBody) - 1));
+    CHECK(failure_policy.body.eq({kFailureBody, sizeof(kFailureBody) - 1}));
+
+    REQUIRE_EQ(rir.module.policy_bundle_count, 1u);
+    CHECK_EQ(rir.module.policy_bundles[0].response_policy_id, 1u);
+    CHECK_EQ(rir.module.policy_bundles[0].failure_policy_id, 1u);
+
     REQUIRE_EQ(rir.module.func_count, 1u);
     const auto& function = rir.module.functions[0];
     CHECK(function.route_pattern.eq(lit_str("/")));
     CHECK_EQ(function.http_method, 0u);
-    const auto* ret = find_ret_forward(function);
+    const auto* ret = find_ret_forward_bundle(function);
     REQUIRE(ret != nullptr);
     REQUIRE_EQ(ret->operand_count, 3u);
     i32 upstream_id = -1;
     i32 request_policy_id = -1;
-    i32 response_policy_id = -1;
+    i32 bundle_id = -1;
     REQUIRE(find_const_i32(function, ret->operand(0), upstream_id));
     REQUIRE(find_const_i32(function, ret->operand(1), request_policy_id));
-    REQUIRE(find_const_i32(function, ret->operand(2), response_policy_id));
+    REQUIRE(find_const_i32(function, ret->operand(2), bundle_id));
     CHECK_EQ(upstream_id, 0);
     CHECK_EQ(request_policy_id, 1);
-    CHECK_EQ(response_policy_id, 1);
+    CHECK_EQ(bundle_id, 1);
 }
 
 TEST(nginx_converter, rejects_forged_invalid_models_without_output) {
