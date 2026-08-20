@@ -6,6 +6,7 @@
 #include "rut/compiler/mir_build.h"
 #include "rut/compiler/parser.h"
 #include "rut/compiler/rir_builder.h"
+#include "rut/compiler/verifier.h"
 #if RUT_ENABLE_JIT_TESTS
 #include "rut/jit/codegen.h"
 #include "rut/jit/jit_engine.h"
@@ -9698,7 +9699,10 @@ struct ScopedProxyLoop {
 
     ~ScopedProxyLoop() { teardown(); }
 
-    bool setup(const RouteConfig** active, i32 iters, bool enable_reuse = false) {
+    bool setup(const RouteConfig** active,
+               i32 iters,
+               bool enable_reuse = false,
+               const ListenerSpec* declared_listener = nullptr) {
         loop = create_real_loop();
         if (loop == nullptr) return false;
         auto lfd_result = create_listen_socket(0);
@@ -9717,6 +9721,16 @@ struct ScopedProxyLoop {
             pool = new UpstreamPool();
             pool->init();
             loop->upstream = pool;  // enable HTTP/1 idle upstream connection reuse
+        }
+        if (declared_listener != nullptr) {
+            auto context = derive_listener_context(listen_fd, *declared_listener);
+            if (!context) {
+                teardown();
+                return false;
+            }
+            // Install before the loop thread starts, matching run_shards()'s
+            // post-init/pre-spawn listener-context contract.
+            loop->listener_context = context.value();
         }
         lt.loop = loop;
         lt.thread = {};
@@ -19134,6 +19148,312 @@ TEST(io, serves_h2c_prior_knowledge) {
     CHECK_EQ(status, 200u);
     close(c);
     srv.teardown();
+}
+
+TEST(route, inline_redirect_source_reaches_production_h1_and_forward_sibling) {
+#if !RUT_ENABLE_JIT_TESTS
+    return;
+#else
+    struct JitResources {
+        FrontendRirModule rir{};
+        jit::JitEngine engine{};
+        ~JitResources() {
+            engine.shutdown();
+            rir.destroy();
+        }
+    } resources;
+
+    static constexpr char kRedirectBody[] =
+        "<html>\r\n"
+        "<head><title>301 Moved Permanently</title></head>\r\n"
+        "<body>\r\n"
+        "<center><h1>301 Moved Permanently</h1></center>\r\n"
+        "<hr><center>nginx/1.29.7</center>\r\n"
+        "</body>\r\n"
+        "</html>\r\n";
+    static constexpr char kRejected[] =
+        "HTTP/1.1 400 Bad Request\r\n"
+        "Content-Length: 11\r\n"
+        "Connection: close\r\n"
+        "\r\n"
+        "Bad Request";
+
+    auto read_to_eof = [](i32 fd, char* out, u32 capacity, u32& length) {
+        length = 0;
+        for (u32 attempt = 0; attempt < 16 && length < capacity; attempt++) {
+            const i32 got = recv_timeout(fd, out + length, capacity - length, 1000);
+            if (got < 0) return false;
+            if (got == 0) return true;
+            length += static_cast<u32>(got);
+        }
+        return false;
+    };
+    auto normalize_date = [](char* data, u32 length) {
+        static constexpr char kPrefix[] = "\r\nDate: ";
+        constexpr u32 kPrefixLen = sizeof(kPrefix) - 1;
+        constexpr u32 kDateLen = 29;
+        u32 found = 0;
+        for (u32 i = 0; i + kPrefixLen + kDateLen + 2 <= length; i++) {
+            if (memcmp(data + i, kPrefix, kPrefixLen) != 0) continue;
+            found++;
+            const u32 start = i + kPrefixLen;
+            if (data[start + kDateLen] != '\r' || data[start + kDateLen + 1] != '\n')
+                return false;
+            for (u32 j = 0; j < kDateLen; j++) data[start + j] = 'X';
+        }
+        return found == 1;
+    };
+    auto expected_redirect = [](const char* authority, const char* query) {
+        return std::string("HTTP/1.1 301 Moved Permanently\r\n") +
+               "Server: nginx/1.29.7\r\n"
+               "Date: XXXXXXXXXXXXXXXXXXXXXXXXXXXXX\r\n"
+               "Content-Type: text/html\r\n"
+               "Content-Length: 169\r\nLocation: http://" + authority + "/api/" + query +
+               "\r\nConnection: close\r\n\r\n" + kRedirectBody;
+    };
+    auto backend_quiet = [](const RecordingUpstream& backend, u32 accepted, u32 requests) {
+        bool quiet = true;
+        for (u32 i = 0; i < 20; i++) {
+            if (backend.accepted_count.load(std::memory_order_acquire) != accepted ||
+                backend.request_count.load(std::memory_order_acquire) != requests)
+                quiet = false;
+            usleep(5000);
+        }
+        return quiet && backend.accepted_count.load(std::memory_order_acquire) == accepted &&
+               backend.request_count.load(std::memory_order_acquire) == requests;
+    };
+
+    RecordingUpstream backend;
+    REQUIRE(backend.setup());
+    std::string source = "upstream backend at \"127.0.0.1:" + std::to_string(backend.port) +
+                         "\"\n";
+    source += R"rut(
+route "/api" {
+  if req.method == GET && req.pathOnly == "/api" {
+    return redirect({scheme: "http", authority: "request_host", port: "actual_listener",
+      path: "static", query: "preserve_raw", date: "current", connection: "close",
+      status: 301, reason: "Moved Permanently", server: "nginx/1.29.7",
+      content_type: "text/html", target_path: "/api/", body: b"<html>\r\n<head><title>301 Moved Permanently</title></head>\r\n<body>\r\n<center><h1>301 Moved Permanently</h1></center>\r\n<hr><center>nginx/1.29.7</center>\r\n</body>\r\n</html>\r\n"})
+  } else {
+    return forward(backend,
+      target_transform: { strip_prefix: "/api/", replace_prefix: "/" },
+      request_policy: { version: "HTTP/1.1", host: "upstream", connection: "omit",
+        strip_headers: ["Connection", "Keep-Alive", "TE", "Expect", "Upgrade"] },
+      response_policy: { version: "HTTP/1.1", framing: "content_length", connection: "request",
+        server: "nginx/1.29.7", date: "current", hide_headers: [] },
+      failure_policy: { version: "HTTP/1.1", status: 502, reason: "Bad Gateway",
+        content_type: "text/html", server: "nginx/1.29.7", date: "current",
+        connection: "request", body: b"unavailable" })
+  }
+}
+)rut";
+
+    auto lexed = lex({source.data(), static_cast<u32>(source.size())});
+    REQUIRE(lexed);
+    auto ast = parse_file(lexed.value());
+    REQUIRE(ast);
+    std::unique_ptr<AstFile> ast_owned(ast.value());
+    auto hir = analyze_file(*ast_owned);
+    REQUIRE(hir);
+    std::unique_ptr<HirModule> hir_owned(hir.value());
+    auto mir = build_mir(*hir_owned);
+    REQUIRE(mir);
+    std::unique_ptr<MirModule> mir_owned(mir.value());
+    REQUIRE(lower_to_rir(*mir_owned, resources.rir));
+
+    const auto& module = resources.rir.module;
+    REQUIRE_EQ(module.functions[0].http_method, 0u);
+    REQUIRE(module.functions[0].route_pattern.eq({"/api", 4}));
+    REQUIRE_EQ(module.redirect_policy_count, 1u);
+    REQUIRE_EQ(module.target_transform_count, 1u);
+    REQUIRE(module.target_transforms[0].strip_prefix.eq({"/api/", 5}));
+    REQUIRE(module.target_transforms[0].replace_prefix.eq({"/", 1}));
+    REQUIRE_EQ(module.response_policy_count, 1u);
+    REQUIRE_EQ(module.failure_policy_count, 1u);
+    REQUIRE_EQ(module.policy_bundle_count, 1u);
+
+    bool saw_redirect = false;
+    bool saw_forward = false;
+    auto const_i32 = [](const rir::Block& block, rir::ValueId id, i32& value) {
+        for (u32 i = 0; i < block.inst_count; i++) {
+            if (block.insts[i].result == id && block.insts[i].op == rir::Opcode::ConstI32) {
+                value = block.insts[i].imm.i32_val;
+                return true;
+            }
+        }
+        return false;
+    };
+    for (u32 fi = 0; fi < module.func_count; fi++) {
+        const auto& fn = module.functions[fi];
+        for (u32 bi = 0; bi < fn.block_count; bi++) {
+            const auto& block = fn.blocks[bi];
+            for (u32 ii = 0; ii < block.inst_count; ii++) {
+                const auto& inst = block.insts[ii];
+                if (inst.op == rir::Opcode::RetRedirect) {
+                    saw_redirect = true;
+                    CHECK_EQ(inst.operand_count, 0u);
+                    CHECK_EQ(inst.imm.i32_val, 1);
+                } else if (inst.op == rir::Opcode::RetForwardBundle) {
+                    saw_forward = true;
+                    REQUIRE_EQ(inst.operand_count, 3u);
+                    i32 request_id = -1;
+                    i32 bundle_id = -1;
+                    REQUIRE(const_i32(block, inst.operands[1], request_id));
+                    REQUIRE(const_i32(block, inst.operands[2], bundle_id));
+                    CHECK_EQ(request_id, 1);
+                    CHECK_EQ(bundle_id, 1);
+                    REQUIRE(ii > 0);
+                    CHECK_EQ(block.insts[ii - 1].op, rir::Opcode::ReqSetTargetTransform);
+                    CHECK_EQ(block.insts[ii - 1].imm.i32_val, 1);
+                }
+            }
+        }
+    }
+    REQUIRE(saw_redirect);
+    REQUIRE(saw_forward);
+    REQUIRE_EQ(module.policy_bundles[0].response_policy_id, 1u);
+    REQUIRE_EQ(module.policy_bundles[0].failure_policy_id, 1u);
+    REQUIRE(rir::verify_module(module).ok);
+
+    auto cg = jit::codegen(module);
+    REQUIRE(cg.ok);
+    REQUIRE(resources.engine.init());
+    REQUIRE(resources.engine.compile(cg.mod, cg.ctx));
+    RouteConfig cfg{};
+    REQUIRE(populate_route_config(cfg, module));
+    REQUIRE_EQ(cfg.redirect_policy_count, 1u);
+    REQUIRE_EQ(cfg.target_transform_count, 1u);
+    REQUIRE_EQ(cfg.response_policy_count, 1u);
+    REQUIRE_EQ(cfg.failure_policy_count, 1u);
+    REQUIRE_EQ(cfg.policy_bundle_count, 1u);
+    REQUIRE(register_jit_routes(cfg, module, resources.engine));
+    const RouteConfig* active = &cfg;
+
+    ListenerSpec declared_listener{};
+    declared_listener.port = 0;
+    ScopedProxyLoop proxy;
+    REQUIRE(proxy.setup(&active, 4000, false, &declared_listener));
+    REQUIRE(proxy.loop->listener_context.valid());
+    const u16 actual_port = proxy.loop->listener_context.port;
+    REQUIRE_NE(actual_port, 0u);
+
+    struct ClientFdGuard {
+        i32 fd = -1;
+        ~ClientFdGuard() {
+            if (fd >= 0) close(fd);
+        }
+    };
+    auto run_redirect = [&](const char* target, const char* host, const char* query) {
+        ClientFdGuard client{connect_to(actual_port)};
+        if (client.fd < 0) return false;
+        set_socket_timeouts(client.fd, 2);
+        char request[256];
+        const int request_len = snprintf(request,
+                                         sizeof(request),
+                                         "GET %s HTTP/1.1\r\nHost: %s\r\n"
+                                         "Connection: close\r\n\r\n",
+                                         target,
+                                         host);
+        if (request_len <= 0 || request_len >= static_cast<int>(sizeof(request))) return false;
+        if (!send_all(client.fd, request, static_cast<u32>(request_len))) return false;
+        char response[1024]{};
+        u32 response_len = 0;
+        if (!read_to_eof(client.fd, response, sizeof(response), response_len)) return false;
+        char normalized[1024]{};
+        if (response_len >= sizeof(normalized)) return false;
+        memcpy(normalized, response, response_len);
+        if (!normalize_date(normalized, response_len)) return false;
+        std::string authority(host);
+        if (strchr(host, ':') == nullptr) authority += ":" + std::to_string(actual_port);
+        const std::string expected = expected_redirect(authority.c_str(), query);
+        const bool exact = response_len == expected.size() &&
+                           memcmp(normalized, expected.data(), expected.size()) == 0;
+        CHECK(exact);
+        if (!exact) return false;
+        const bool quiet = backend_quiet(backend, 0, 0);
+        CHECK(quiet);
+        if (!quiet) return false;
+        CHECK_EQ(backend.request_history_len[0], 0u);
+        return backend.request_history_len[0] == 0;
+    };
+    REQUIRE(run_redirect("/api", "client.example", ""));
+    const std::string explicit_host = "client.example:" + std::to_string(actual_port);
+    REQUIRE(run_redirect("/api?x=1", explicit_host.c_str(), "?x=1"));
+
+    auto run_forward = [&](const char* target, const char* expected_target, u32 history_slot) {
+        ClientFdGuard client{connect_to(actual_port)};
+        if (client.fd < 0) return false;
+        set_socket_timeouts(client.fd, 2);
+        char request[256];
+        const int request_len = snprintf(request,
+                                         sizeof(request),
+                                         "GET %s HTTP/1.1\r\nHost: client.example\r\n"
+                                         "Connection: close\r\nX-Test: one\r\n\r\n",
+                                         target);
+        if (request_len <= 0 || request_len >= static_cast<int>(sizeof(request))) return false;
+        if (!send_all(client.fd, request, static_cast<u32>(request_len))) return false;
+        char response[1024]{};
+        u32 response_len = 0;
+        if (!read_to_eof(client.fd, response, sizeof(response), response_len)) return false;
+        if (response_len == 0) return false;
+        const bool response_ok = buf_contains(response, response_len, "HTTP/1.1 200", 12);
+        CHECK(response_ok);
+        if (!response_ok) return false;
+
+        const u32 expected_count = history_slot + 1;
+        for (u32 waited = 0;
+             waited < 400 && backend.request_count.load(std::memory_order_acquire) < expected_count;
+             waited++)
+            usleep(5000);
+        const bool counts_ok =
+            backend.accepted_count.load(std::memory_order_acquire) == expected_count &&
+            backend.request_count.load(std::memory_order_acquire) == expected_count;
+        CHECK(counts_ok);
+        if (!counts_ok) return false;
+        char expected[256];
+        const int expected_len = snprintf(expected,
+                                          sizeof(expected),
+                                          "GET %s HTTP/1.1\r\nHost: 127.0.0.1:%u\r\n"
+                                          "X-Test: one\r\n\r\n",
+                                          expected_target,
+                                          backend.port);
+        if (expected_len <= 0 || expected_len >= static_cast<int>(sizeof(expected))) return false;
+        CHECK_EQ(backend.request_history_len[history_slot], static_cast<u32>(expected_len));
+        CHECK_EQ(memcmp(backend.request_history[history_slot], expected, expected_len), 0);
+        return backend.request_history_len[history_slot] == static_cast<u32>(expected_len) &&
+               memcmp(backend.request_history[history_slot], expected, expected_len) == 0;
+    };
+    REQUIRE(run_forward("/api/", "/", 0));
+    REQUIRE(run_forward("/api/x?y=1", "/x?y=1", 1));
+
+    auto run_rejected = [&](const char* target) {
+        const u32 accepted_before = backend.accepted_count.load(std::memory_order_acquire);
+        const u32 requests_before = backend.request_count.load(std::memory_order_acquire);
+        ClientFdGuard client{connect_to(actual_port)};
+        if (client.fd < 0) return false;
+        set_socket_timeouts(client.fd, 2);
+        char request[256];
+        const int request_len = snprintf(request,
+                                         sizeof(request),
+                                         "GET %s HTTP/1.1\r\nHost: client.example\r\n"
+                                         "Connection: close\r\n\r\n",
+                                         target);
+        if (request_len <= 0 || request_len >= static_cast<int>(sizeof(request))) return false;
+        if (!send_all(client.fd, request, static_cast<u32>(request_len))) return false;
+        char response[256]{};
+        u32 response_len = 0;
+        if (!read_to_eof(client.fd, response, sizeof(response), response_len)) return false;
+        const bool exact = response_len == sizeof(kRejected) - 1 &&
+                           memcmp(response, kRejected, sizeof(kRejected) - 1) == 0;
+        CHECK(exact);
+        if (!exact) return false;
+        const bool quiet = backend_quiet(backend, accepted_before, requests_before);
+        CHECK(quiet);
+        return quiet;
+    };
+    REQUIRE(run_rejected("/api#fragment"));
+    REQUIRE(run_rejected("/api/%7Euser"));
+#endif
 }
 
 int main(int argc, char** argv) {
