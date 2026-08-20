@@ -56,6 +56,30 @@ struct Parser {
         NestedDelimiterGuard& operator=(const NestedDelimiterGuard&) = delete;
     };
 
+    // Redirect policy bodies are decoded into AstFile-owned storage while the
+    // object is being parsed.  Keep the whole statement transactional: a
+    // malformed field, closing delimiter, duplicate/capacity failure, or any
+    // later parser error must not publish provisional bytes or a table entry.
+    struct RedirectParseTransaction {
+        AstFile* file;
+        u32 body_len;
+        u32 policy_len;
+        bool committed = false;
+
+        explicit RedirectParseTransaction(AstFile* f)
+            : file(f), body_len(f->redirect_policy_body_pool.len), policy_len(f->redirect_policies.len) {}
+        ~RedirectParseTransaction() {
+            if (!committed) {
+                file->redirect_policy_body_pool.len = body_len;
+                file->redirect_policies.len = policy_len;
+            }
+        }
+        void discard_provisional_body() { file->redirect_policy_body_pool.len = body_len; }
+        void commit() { committed = true; }
+        RedirectParseTransaction(const RedirectParseTransaction&) = delete;
+        RedirectParseTransaction& operator=(const RedirectParseTransaction&) = delete;
+    };
+
     const Token& cur() const { return toks->tokens[pos]; }
     const Token& prev() const { return toks->tokens[pos - 1]; }
     const Token& peek(u32 offset = 1) const {
@@ -1556,6 +1580,7 @@ struct Parser {
                 if (!lparen) return core::make_unexpected(lparen.error());
                 auto lbrace = expect(TokenType::LBrace);
                 if (!lbrace) return core::make_unexpected(lbrace.error());
+                RedirectParseTransaction transaction(file);
                 if (cur().type == TokenType::RBrace)
                     return frontend_error(FrontendError::UnsupportedSyntax,
                                           span_from(cur()), lit_str("redirect"));
@@ -1681,21 +1706,17 @@ struct Parser {
                     !have_body || !redirect_policy_spec_valid(policy))
                     return frontend_error(FrontendError::UnsupportedSyntax,
                                           span_from(*rbrace.value()), lit_str("redirect"));
-                const u32 body_pool_before = file->redirect_policy_body_pool.len;
                 const u32 policy_count_before = file->redirect_policies.len;
                 const u16 policy_id = file->add_redirect_policy(policy);
-                if (policy_id == 0) {
-                    file->redirect_policy_body_pool.len = body_pool_before;
+                if (policy_id == 0)
                     return frontend_error(FrontendError::TooManyItems,
                                           span_from(*lparen.value()), lit_str("redirect"));
-                }
-                // A duplicate policy reuses its first stable ID. Its decoded
-                // body was only provisional and must not consume the owned
-                // pool or alter aggregate-capacity accounting.
-                if (policy_id <= policy_count_before)
-                    file->redirect_policy_body_pool.len = body_pool_before;
+                // The table reuses an equivalent policy, but its decoded body
+                // was provisional and must not consume pool capacity.
+                if (policy_id <= policy_count_before) transaction.discard_provisional_body();
                 auto rparen = expect(TokenType::RParen);
                 if (!rparen) return core::make_unexpected(rparen.error());
+                transaction.commit();
                 stmt.kind = AstStmtKind::Redirect;
                 stmt.redirect_policy_id = policy_id;
                 stmt.has_redirect_policy = true;

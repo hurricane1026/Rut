@@ -1,8 +1,14 @@
 #include "rut/compiler/rir.h"
 #include "rut/compiler/rir_printer.h"
+#include "rut/compiler/analyze.h"
+#include "rut/compiler/lexer.h"
+#include "rut/compiler/lower_rir.h"
+#include "rut/compiler/mir_build.h"
+#include "rut/compiler/parser.h"
 #include "rut/runtime/compile_to_config.h"
 #include "rut/runtime/route_table.h"
 #include "test.h"
+#include <memory>
 
 using namespace rut;
 
@@ -31,6 +37,12 @@ bool equal_bytes(const char* actual, u32 actual_len, const char* expected, u32 e
     for (u32 i = 0; i < actual_len; i++)
         if (actual[i] != expected[i]) return false;
     return true;
+}
+
+Str source_lit(const char* value) {
+    u32 len = 0;
+    while (value[len]) len++;
+    return {value, len};
 }
 
 }  // namespace
@@ -261,6 +273,68 @@ TEST(redirect_policy, empty_table_is_transparent) {
     CHECK_EQ(cfg.redirect_policy_bytes_used, 0u);
     CHECK_FALSE(cfg.redirect_policy_id_is_valid(0));
     CHECK_FALSE(cfg.redirect_policy_id_is_valid(1));
+}
+
+TEST(redirect_policy, publication_rejects_forged_ret_redirect_before_config_mutation) {
+    rir::Module mod{};
+    mod.redirect_policy_count = 1;
+    mod.redirect_policies[0] = policy();
+
+    rir::Instruction instruction{};
+    instruction.op = rir::Opcode::RetRedirect;
+    instruction.operand_count = 0;
+    instruction.imm.i32_val = 2;
+    rir::Block block{};
+    block.insts = &instruction;
+    block.inst_count = 1;
+    rir::Function function{};
+    function.blocks = &block;
+    function.block_count = 1;
+    mod.functions = &function;
+    mod.func_count = 1;
+
+    RouteConfig cfg{};
+    CHECK_FALSE(populate_route_config(cfg, mod));
+    CHECK_EQ(cfg.redirect_policy_count, 0u);
+    CHECK_EQ(cfg.redirect_policy_bytes_used, 0u);
+
+    instruction.imm.i32_val = 1;
+    REQUIRE(populate_route_config(cfg, mod));
+    CHECK_EQ(cfg.redirect_policy_count, 1u);
+}
+
+TEST(redirect_policy, source_redirect_reaches_owned_route_config) {
+    const char source[] =
+        "route GET \"/api\" { return redirect({"
+        "scheme: \"http\", authority: \"request_host\", port: \"actual_listener\", "
+        "path: \"static\", query: \"preserve_raw\", date: \"current\", "
+        "connection: \"close\", status: 301, reason: \"Moved Permanently\", "
+        "server: \"nginx/1.29.7\", content_type: \"text/html\", "
+        "target_path: \"/api/\", body: b\"OK\\n\\x00\"}) }\n";
+    auto lexed = lex(source_lit(source));
+    REQUIRE(lexed);
+    auto ast_result = parse_file(lexed.value());
+    REQUIRE(ast_result);
+    std::unique_ptr<AstFile> ast(ast_result.value());
+    auto hir_result = analyze_file(*ast);
+    REQUIRE(hir_result);
+    std::unique_ptr<HirModule> hir(hir_result.value());
+    auto mir_result = build_mir(*hir);
+    REQUIRE(mir_result);
+    std::unique_ptr<MirModule> mir(mir_result.value());
+
+    FrontendRirModule rir{};
+    REQUIRE(lower_to_rir(*mir, rir));
+    REQUIRE_EQ(rir.module.redirect_policy_count, 1u);
+    RouteConfig cfg{};
+    REQUIRE(populate_route_config(cfg, rir.module));
+    REQUIRE_EQ(cfg.redirect_policy_count, 1u);
+    CHECK_NE(cfg.redirect_policies[0].body.ptr, rir.module.redirect_policies[0].body.ptr);
+    CHECK(equal_bytes(cfg.redirect_policies[0].body.ptr, cfg.redirect_policies[0].body.len,
+                      "OK\n\0", 4));
+    CHECK(equal_bytes(cfg.redirect_policies[0].target_path.ptr, cfg.redirect_policies[0].target_path.len,
+                      "/api/", 5));
+    rir.destroy();
 }
 
 int main(int argc, char** argv) {

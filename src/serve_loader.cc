@@ -190,6 +190,10 @@ bool load_rut_program(
         set_load_diag(err, lowered.error());
         return false;
     }
+    // RetRedirect carries a table ID in the terminator itself.  Reject a
+    // forged/mismatched reference before handing the module to codegen or
+    // beginning config publication.
+    if (!redirect_references_valid(out.rir.module)) return false;
 
     // ── Backend: RIR → LLVM IR → native code ────────────────────────
     err.stage = LoadStage::Codegen;

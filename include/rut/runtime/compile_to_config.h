@@ -57,6 +57,35 @@
 
 namespace rut {
 
+// Redirect IDs are embedded in RIR terminators, so validating only the
+// metadata table is insufficient: a forged instruction could otherwise reach
+// codegen or route registration with an out-of-range reference.  Keep this
+// narrow publication-boundary check shared by the loader and the config
+// population helper.
+inline bool redirect_references_valid(const rir::Module& mod) {
+    if (!redirect_policy_table_valid(mod.redirect_policies, mod.redirect_policy_count))
+        return false;
+    if (mod.func_count != 0 && mod.functions == nullptr) return false;
+    for (u32 fi = 0; fi < mod.func_count; fi++) {
+        const auto& fn = mod.functions[fi];
+        if (fn.block_count != 0 && fn.blocks == nullptr) return false;
+        for (u32 bi = 0; bi < fn.block_count; bi++) {
+            const auto& block = fn.blocks[bi];
+            if (block.inst_count != 0 && block.insts == nullptr) return false;
+            for (u32 ii = 0; ii < block.inst_count; ii++) {
+                const auto& inst = block.insts[ii];
+                if (inst.op != rir::Opcode::RetRedirect) continue;
+                const i64 id = inst.imm.i32_val;
+                if (inst.operand_count != 0 || id <= 0 ||
+                    static_cast<u64>(id) > mod.redirect_policy_count ||
+                    !redirect_policy_spec_valid(mod.redirect_policies[id - 1]))
+                    return false;
+            }
+        }
+    }
+    return true;
+}
+
 // The frontend (analyze.cc) caps declared timers at HirModule::kMaxTimers so a
 // surplus is a deterministic DSL error; that cap must fit the runtime table, or
 // RouteConfig::add_timer would still reject the overflow at load time.
@@ -189,6 +218,8 @@ inline bool populate_route_config(RouteConfig& cfg, const rir::Module& mod) {
         cfg.redirect_policy_count != 0 || cfg.redirect_policy_bytes_used != 0) {
         return false;
     }
+
+    if (!redirect_references_valid(mod)) return false;
 
     // Upstreams admit one of two shapes (see file docstring):
     //   - Fully empty: helper adds every upstream itself.

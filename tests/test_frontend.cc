@@ -33189,6 +33189,10 @@ TEST(frontend, inline_redirect_rejects_invalid_shape_and_duplicate_fields) {
         "route GET \"/\" { return redirect({scheme: \"https\", authority: \"request_host\", port: \"actual_listener\", path: \"static\", query: \"preserve_raw\", date: \"current\", connection: \"close\", status: 301, reason: \"Moved Permanently\", server: \"s\", content_type: \"text/html\", target_path: \"/x\", body: b\"\"}) }",
         "route GET \"/\" { return redirect({scheme: \"http\", scheme: \"http\", authority: \"request_host\", port: \"actual_listener\", path: \"static\", query: \"preserve_raw\", date: \"current\", connection: \"close\", status: 301, reason: \"Moved Permanently\", server: \"s\", content_type: \"text/html\", target_path: \"/x\", body: b\"\"}) }",
         "route GET \"/\" { return redirect({scheme: \"http\", authority: \"request_host\", port: \"actual_listener\", path: \"static\", query: \"preserve_raw\", date: \"current\", connection: \"close\", status: 200, reason: \"Moved Permanently\", server: \"s\", content_type: \"text/html\", target_path: \"/x\", body: b\"\"}) }",
+        "route GET \"/\" { return redirect({scheme: \"http\", authority: \"request_host\", port: \"actual_listener\", path: \"static\", query: \"preserve_raw\", date: \"current\", connection: \"close\", status: 301, reason: \"Moved Permanently\", server: \"s\", content_type: \"text/html\", target_path: \"/x\", body: b\"\", extra: 1}) }",
+        "route GET \"/\" { return redirect({scheme: \"http\", authority: \"request_host\", port: \"actual_listener\", path: \"static\", query: \"preserve_raw\", date: \"current\", connection: \"close\", status: \"301\", reason: \"Moved Permanently\", server: \"s\", content_type: \"text/html\", target_path: \"/x\", body: b\"\"}) }",
+        "route GET \"/\" { return redirect({scheme: \"http\", authority: \"request_host\", port: \"actual_listener\", path: \"static\", query: \"preserve_raw\", date: \"current\", connection: \"close\", status: 301, reason: \"Moved Permanently\", server: \"s\", content_type: \"text/html\", target_path: \"/x?y=1\", body: b\"\"}) }",
+        "route GET \"/\" { return redirect({scheme: \"http\", authority: \"request_host\", port: \"actual_listener\", path: \"static\", query: \"preserve_raw\", date: \"current\", connection: \"close\", status: 301, reason: \"Moved Permanently\", server: \"s\", content_type: \"text/html\", target_path: \"/x\", body: b\"\\xZZ\"}) }",
     };
     for (const char* source : sources) {
         auto lexed = lex(lit(source));
@@ -33198,15 +33202,82 @@ TEST(frontend, inline_redirect_rejects_invalid_shape_and_duplicate_fields) {
     }
 }
 
+TEST(frontend, inline_redirect_duplicate_policy_is_transactional_and_stable) {
+    const char source[] = R"rut(
+route GET "/a" { return redirect({scheme: "http", authority: "request_host", port: "actual_listener", path: "static", query: "preserve_raw", date: "current", connection: "close", status: 301, reason: "Moved Permanently", server: "s", content_type: "text/html", target_path: "/api/", body: b"same"}) }
+route GET "/b" { return redirect({scheme: "http", authority: "request_host", port: "actual_listener", path: "static", query: "preserve_raw", date: "current", connection: "close", status: 301, reason: "Moved Permanently", server: "s", content_type: "text/html", target_path: "/api/", body: b"same"}) }
+route GET "/c" { return redirect({scheme: "http", authority: "request_host", port: "actual_listener", path: "static", query: "preserve_raw", date: "current", connection: "close", status: 301, reason: "Moved Permanently", server: "s", content_type: "text/html", target_path: "/api/", body: b"unique"}) }
+)rut";
+    auto lexed = lex(lit(source));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    REQUIRE_EQ(ast->redirect_policies.len, 2u);
+    CHECK_EQ(ast->items[0].route.statements[0]->redirect_policy_id, 1u);
+    CHECK_EQ(ast->items[1].route.statements[0]->redirect_policy_id, 1u);
+    CHECK_EQ(ast->items[2].route.statements[0]->redirect_policy_id, 2u);
+    CHECK_EQ(ast->redirect_policy_body_pool.len, 10u);
+    CHECK(ast->redirect_policies[0].body.eq(lit_str("same")));
+    CHECK(ast->redirect_policies[1].body.eq(lit_str("unique")));
+}
+
+TEST(frontend, inline_redirect_chain_after_rejects_guard_and_control_paths) {
+    const char* sources[] = {
+        R"rut(
+func after_headers(_ resp: Response) -> i32 { resp.set("X-Test", "v") 0 }
+chain access { after after_headers(resp) }
+route "/" use chain access { return redirect({scheme: "http", authority: "request_host", port: "actual_listener", path: "static", query: "preserve_raw", date: "current", connection: "close", status: 301, reason: "Moved Permanently", server: "s", content_type: "text/html", target_path: "/x", body: b""}) }
+)rut",
+        R"rut(
+upstream b at "127.0.0.1:9000"
+func after_headers(_ resp: Response) -> i32 { resp.set("X-Test", "v") 0 }
+chain access { after after_headers(resp) }
+route "/" use chain access { if req.method == GET { return redirect({scheme: "http", authority: "request_host", port: "actual_listener", path: "static", query: "preserve_raw", date: "current", connection: "close", status: 301, reason: "Moved Permanently", server: "s", content_type: "text/html", target_path: "/x", body: b""}) } else { return forward(b) } }
+)rut",
+        R"rut(
+upstream b at "127.0.0.1:9000"
+func after_headers(_ resp: Response) -> i32 { resp.set("X-Test", "v") 0 }
+chain access { after after_headers(resp) }
+route "/" use chain access { match req.method { GET => return redirect({scheme: "http", authority: "request_host", port: "actual_listener", path: "static", query: "preserve_raw", date: "current", connection: "close", status: 301, reason: "Moved Permanently", server: "s", content_type: "text/html", target_path: "/x", body: b""}) _ => return forward(b) } }
+)rut",
+        R"rut(
+upstream b at "127.0.0.1:9000"
+func after_headers(_ resp: Response) -> i32 { resp.set("X-Test", "v") 0 }
+chain access { after after_headers(resp) }
+route "/" use chain access { guard req.http11 else { return redirect({scheme: "http", authority: "request_host", port: "actual_listener", path: "static", query: "preserve_raw", date: "current", connection: "close", status: 301, reason: "Moved Permanently", server: "s", content_type: "text/html", target_path: "/x", body: b""}) } return forward(b) }
+)rut",
+    };
+    for (const char* source : sources) {
+        auto lexed = lex(lit(source));
+        REQUIRE(lexed);
+        auto ast = parse_file_heap(lexed.value());
+        REQUIRE(ast);
+        CHECK_FALSE(analyze_file_heap(ast.value()).has_value());
+    }
+}
+
 TEST(frontend, inline_redirect_supports_method_omitted_terminal_if_with_forward_sibling) {
-    const char source[] =
-        "upstream backend at \"127.0.0.1:9000\"\n"
-        "route \"/\" { if req.method == GET && req.pathOnly == \"/api\" { "
-        "return redirect({scheme: \"http\", authority: \"request_host\", "
-        "port: \"actual_listener\", path: \"static\", query: \"preserve_raw\", "
-        "date: \"current\", connection: \"close\", status: 301, "
-        "reason: \"Moved Permanently\", server: \"s\", content_type: \"text/html\", "
-        "target_path: \"/api/\", body: b\"\"}) } else { return forward(backend) } }\n";
+    const char source[] = R"rut(
+upstream backend at "127.0.0.1:9000"
+route "/" {
+  if req.method == GET && req.pathOnly == "/api" {
+    return redirect({scheme: "http", authority: "request_host", port: "actual_listener",
+      path: "static", query: "preserve_raw", date: "current", connection: "close",
+      status: 301, reason: "Moved Permanently", server: "s", content_type: "text/html",
+      target_path: "/api/", body: b"redirect"})
+  } else {
+    return forward(backend,
+      target_transform: { strip_prefix: "/api/", replace_prefix: "/" },
+      request_policy: { version: "HTTP/1.1", host: "upstream", connection: "omit",
+        strip_headers: ["Connection", "Keep-Alive", "TE", "Expect", "Upgrade"] },
+      response_policy: { version: "HTTP/1.1", framing: "content_length",
+        connection: "keep_alive", server: "s", date: "current", hide_headers: [] },
+      failure_policy: { version: "HTTP/1.1", status: 502, reason: "Bad Gateway",
+        content_type: "text/plain", server: "s", date: "current", connection: "request",
+        body: b"unavailable" })
+  }
+}
+)rut";
     auto lexed = lex(lit(source));
     REQUIRE(lexed);
     auto ast = parse_file_heap(lexed.value());
@@ -33217,6 +33288,66 @@ TEST(frontend, inline_redirect_supports_method_omitted_terminal_if_with_forward_
     CHECK_EQ(hir->routes[0].control.then_term.kind, HirTerminatorKind::Redirect);
     CHECK_EQ(hir->routes[0].control.then_term.redirect_policy_id, 1u);
     CHECK_EQ(hir->routes[0].control.else_term.kind, HirTerminatorKind::ForwardUpstream);
+
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    CHECK_EQ(mir->functions[0].blocks[0].term.kind, MirTerminatorKind::Branch);
+    auto* mir_redirect = static_cast<MirTerminator*>(nullptr);
+    auto* mir_forward = static_cast<MirTerminator*>(nullptr);
+    for (u32 bi = 0; bi < mir->functions[0].blocks.len; bi++) {
+        auto& term = mir->functions[0].blocks[bi].term;
+        if (term.kind == MirTerminatorKind::Redirect) mir_redirect = &term;
+        if (term.kind == MirTerminatorKind::ForwardUpstream) mir_forward = &term;
+    }
+    REQUIRE(mir_redirect != nullptr);
+    REQUIRE(mir_forward != nullptr);
+    CHECK_EQ(mir_redirect->redirect_policy_id, 1u);
+    CHECK_EQ(mir_forward->forward_request_policy_id, 1u);
+    CHECK_EQ(mir_forward->forward_response_policy_id, 1u);
+    CHECK_EQ(mir_forward->forward_failure_policy_id, 1u);
+    CHECK(mir_forward->has_forward_target_transform);
+
+    FrontendRirModule rir{};
+    REQUIRE(lower_to_rir(mir.value(), rir));
+    REQUIRE_EQ(rir.module.redirect_policy_count, 1u);
+    REQUIRE_EQ(rir.module.policy_bundle_count, 1u);
+    CHECK_EQ(rir.module.policy_bundles[0].response_policy_id, 1u);
+    CHECK_EQ(rir.module.policy_bundles[0].failure_policy_id, 1u);
+    bool saw_redirect = false;
+    bool saw_forward = false;
+    auto const_i32_value = [](const rir::Block& block, rir::ValueId id) -> i32 {
+        for (u32 i = 0; i < block.inst_count; i++) {
+            if (block.insts[i].result == id && block.insts[i].op == rir::Opcode::ConstI32)
+                return block.insts[i].imm.i32_val;
+        }
+        return -1;
+    };
+    for (u32 fi = 0; fi < rir.module.func_count; fi++) {
+        const auto& fn = rir.module.functions[fi];
+        for (u32 bi = 0; bi < fn.block_count; bi++) {
+            const auto& block = fn.blocks[bi];
+            for (u32 ii = 0; ii < block.inst_count; ii++) {
+                const auto& inst = block.insts[ii];
+                if (inst.op == rir::Opcode::RetRedirect) {
+                    saw_redirect = true;
+                    CHECK_EQ(inst.imm.i32_val, 1);
+                    CHECK_EQ(inst.operand_count, 0u);
+                }
+                if (inst.op != rir::Opcode::RetForwardBundle) continue;
+                saw_forward = true;
+                CHECK_EQ(inst.operand_count, 3u);
+                CHECK_EQ(const_i32_value(block, inst.operands[1]), 1);
+                CHECK_EQ(const_i32_value(block, inst.operands[2]), 1);
+                REQUIRE(ii > 0);
+                CHECK_EQ(block.insts[ii - 1].op, rir::Opcode::ReqSetTargetTransform);
+                CHECK_EQ(block.insts[ii - 1].imm.i32_val, 1);
+            }
+        }
+    }
+    CHECK(saw_redirect);
+    CHECK(saw_forward);
+    REQUIRE(rir::verify_module(rir.module).ok);
+    rir.destroy();
 }
 
 int main(int argc, char** argv) {
