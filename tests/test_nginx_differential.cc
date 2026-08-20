@@ -154,8 +154,8 @@ struct ChildGuard {
     ~ChildGuard() { (void)stop_child(child); }
 };
 
-static void docker_remove(const std::string& name) {
-    (void)command_ok({"docker", "rm", "-f", name});
+static bool docker_remove(const std::string& name) {
+    return command_ok({"docker", "rm", "-f", name});
 }
 
 struct DockerGuard {
@@ -163,14 +163,50 @@ struct DockerGuard {
     std::string name;
     bool active = true;
 
-    void remove() {
-        if (!active) return;
-        docker_remove(name);
+    bool remove() {
+        if (!active) return true;
+        if (!docker_remove(name)) return false;
         active = false;
+        return true;
     }
 
-    ~DockerGuard() { remove(); }
+    ~DockerGuard() {
+        if (active) (void)docker_remove(name);
+    }
 };
+
+static bool run_named_docker_probe(const std::string& name,
+                                   const std::string& log_path,
+                                   std::string& error) {
+    Child probe;
+    bool probe_ok = false;
+    if (spawn_child({"docker", "run", "--pull=never", "--network", "host", "--name", name,
+                     kNginxImage, "nginx", "-v"},
+                    log_path,
+                    probe)) {
+        if (wait_child(probe, 10'000)) {
+            probe_ok = probe.status_valid && WIFEXITED(probe.status) &&
+                       WEXITSTATUS(probe.status) == 0;
+            probe.pid = -1;
+        } else {
+            // Reap the CLI before rm -f so a timed-out docker client cannot
+            // race the explicit container cleanup.
+            (void)stop_child(probe);
+        }
+    } else {
+        error = "failed to start host-network probe CLI";
+    }
+    const bool removed = docker_remove(name);
+    if (!removed) {
+        error = "docker rm -f failed for host-network probe " + name;
+        return false;
+    }
+    if (!probe_ok) {
+        if (error.empty()) error = "host-network startup probe failed";
+        return false;
+    }
+    return true;
+}
 
 struct TempDir {
     char path[64] = "/tmp/rut-nginx-differential-XXXXXX";
@@ -603,7 +639,7 @@ static bool capture_case(u16 frontend_port,
     // docker client before removing its container on every return path.
     DockerGuard docker(container_name);
     ChildGuard nginx;
-    if (!spawn_child({"docker", "run", "--rm", "--pull=never", "--network", "host", "--name",
+    if (!spawn_child({"docker", "run", "--pull=never", "--network", "host", "--name",
                      container_name, "-v", nginx_config_path + ":/etc/nginx/nginx.conf:ro",
                      kNginxImage, "nginx", "-g", "daemon off;"},
                      nginx_log_path,
@@ -626,7 +662,10 @@ static bool capture_case(u16 frontend_port,
         error = "failed to stop nginx";
         return false;
     }
-    docker.remove();
+    if (!docker.remove()) {
+        error = "docker rm -f failed after nginx run";
+        return false;
+    }
     recorder.stop();
     if (recorder.accepted.load(std::memory_order_acquire) != 1 ||
         recorder.requests.load(std::memory_order_acquire) != 1) {
@@ -693,6 +732,9 @@ int main(int argc, char** argv) {
         std::cerr << "FAIL [preflight]: secure temporary directory creation failed\n";
         return 1;
     }
+    const char* suffix = strrchr(temp.path, '/');
+    const std::string probe_name =
+        "rut-nginx-probe-" + std::to_string(getpid()) + "-" + (suffix ? suffix + 1 : "tmp");
     if (!command_ok({"docker", "info"}, temp.preflight_log)) {
         if (log_contains(temp.preflight_log, "Cannot connect to the Docker daemon") ||
             log_contains(temp.preflight_log, "Is the docker daemon running") ||
@@ -716,9 +758,10 @@ int main(int argc, char** argv) {
     // This is a real host-network startup probe. Once daemon and image
     // inspection succeeded, all failures here are test failures rather than
     // silently becoming a skipped compatibility result.
-    if (!command_ok({"docker", "run", "--rm", "--pull=never", "--network", "host", kNginxImage,
-                     "nginx", "-v"}, temp.preflight_log)) {
+    std::string probe_error;
+    if (!run_named_docker_probe(probe_name, temp.preflight_log, probe_error)) {
         std::cerr << "FAIL [preflight]: Docker host-network startup probe failed\n";
+        if (!probe_error.empty()) std::cerr << probe_error << "\n";
         dump_log(temp.preflight_log, "Docker preflight log");
         return 1;
     }
@@ -760,9 +803,10 @@ int main(int argc, char** argv) {
     std::vector<char> nginx_request;
     std::vector<char> rut_request;
     std::string error;
-    const char* suffix = strrchr(temp.path, '/');
-    suffix = suffix ? suffix + 1 : temp.path;
-    const std::string container = "rut-nginx-diff-" + std::to_string(getpid()) + "-" + suffix;
+    const char* source_suffix = strrchr(temp.path, '/');
+    source_suffix = source_suffix ? source_suffix + 1 : temp.path;
+    const std::string container =
+        "rut-nginx-diff-" + std::to_string(getpid()) + "-" + source_suffix;
     if (!capture_case(frontend_port,
                       backend_port,
                       temp.source,
