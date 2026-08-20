@@ -929,8 +929,8 @@ struct RouteConfig {
     }
 
     u16 add_policy_bundle(u16 response_policy_id, u16 failure_policy_id) {
-        if (response_policy_id == 0 || failure_policy_id == 0 ||
-            !response_policy_id_is_valid(response_policy_id) ||
+        if (failure_policy_id == 0 ||
+            (response_policy_id != 0 && !response_policy_id_is_valid(response_policy_id)) ||
             !failure_policy_id_is_valid(failure_policy_id))
             return 0;
         if (policy_bundle_count > kMaxForwardPolicyBundles) return 0;
@@ -955,7 +955,7 @@ struct RouteConfig {
             id > policy_bundle_count)
             return false;
         const auto& b = policy_bundles[id - 1];
-        return response_policy_id_is_valid(b.response_policy_id) &&
+        return (b.response_policy_id == 0 || response_policy_id_is_valid(b.response_policy_id)) &&
                failure_policy_id_is_valid(b.failure_policy_id);
     }
 

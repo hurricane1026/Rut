@@ -13579,6 +13579,41 @@ TEST(route, populate_route_config_rejects_partial_cfg) {
     rir.destroy();
 }
 
+TEST(route, populate_route_config_accepts_failure_only_bundle_and_rejects_bad_ids) {
+    using namespace rut;
+    FrontendRirModule rir{};
+    REQUIRE(rir.init(1, 1));
+    rir.module.failure_policies[0] = test_failure_policy_spec();
+    rir.module.failure_policy_count = 1;
+    rir.module.policy_bundles[0] = {0, 1};
+    rir.module.policy_bundle_count = 1;
+    RouteConfig cfg{};
+    REQUIRE(populate_route_config(cfg, rir.module));
+    REQUIRE_EQ(cfg.failure_policy_count, 1u);
+    REQUIRE_EQ(cfg.policy_bundle_count, 1u);
+    CHECK_EQ(cfg.policy_bundles[0].response_policy_id, 0u);
+    CHECK(cfg.failure_policies[0].body.eq({"unavailable", 11}));
+    rir.destroy();
+
+    FrontendRirModule bad_response{};
+    REQUIRE(bad_response.init(1, 1));
+    bad_response.module.failure_policies[0] = test_failure_policy_spec();
+    bad_response.module.failure_policy_count = 1;
+    bad_response.module.policy_bundles[0] = {1, 1};
+    bad_response.module.policy_bundle_count = 1;
+    RouteConfig bad_cfg{};
+    CHECK(!populate_route_config(bad_cfg, bad_response.module));
+    bad_response.destroy();
+
+    FrontendRirModule bad_failure{};
+    REQUIRE(bad_failure.init(1, 1));
+    bad_failure.module.policy_bundles[0] = {0, 1};
+    bad_failure.module.policy_bundle_count = 1;
+    RouteConfig bad_failure_cfg{};
+    CHECK(!populate_route_config(bad_failure_cfg, bad_failure.module));
+    bad_failure.destroy();
+}
+
 // Pre-bound upstream mode: caller registers upstreams manually (e.g.
 // because the DSL declared them name-only, addresses come from a
 // runtime config file), then the helper fills in bodies / header
@@ -16741,15 +16776,27 @@ TEST(route, failure_policy_bundle_rejects_before_upstream_side_effects_and_owns_
     auto id = cfg.add_upstream("backend", 0x7F000001, backend.port);
     REQUIRE(id.has_value());
     auto failure = test_failure_policy_spec();
-    char mutable_body[] = "unavailable";
-    failure.body = {mutable_body, sizeof(mutable_body) - 1};
+    char mutable_body[] = {'u', '\0', '\n', 'x'};
+    failure.body = {mutable_body, sizeof(mutable_body)};
     const char* original_body = failure.body.ptr;
-    REQUIRE_EQ(cfg.add_response_policy(test_response_policy_spec()), 1u);
     REQUIRE_EQ(cfg.add_failure_policy(failure), 1u);
-    REQUIRE_EQ(cfg.add_policy_bundle(1, 1), 1u);
+    // A failure policy is independently selectable; response id 0 means no
+    // response serializer is bundled, while the failure id remains required.
+    CHECK_EQ(cfg.add_policy_bundle(99, 1), 0u);
+    CHECK_EQ(cfg.add_policy_bundle(0, 99), 0u);
+    REQUIRE_EQ(cfg.add_policy_bundle(0, 1), 1u);
+    REQUIRE_EQ(cfg.add_response_policy(test_response_policy_spec()), 1u);
+    REQUIRE_EQ(cfg.add_policy_bundle(1, 1), 2u);
     REQUIRE(cfg.failure_policies[0].body.ptr != original_body);
+    CHECK(cfg.failure_policies[0].reason.ptr != failure.reason.ptr);
+    CHECK(cfg.failure_policies[0].content_type.ptr != failure.content_type.ptr);
+    CHECK(cfg.failure_policies[0].server.ptr != failure.server.ptr);
     mutable_body[0] = 'X';
-    CHECK(cfg.failure_policies[0].body.eq({"unavailable", 11}));
+    CHECK(cfg.failure_policies[0].body.len == sizeof(mutable_body));
+    CHECK(cfg.failure_policies[0].body.ptr[0] == 'u');
+    CHECK(static_cast<u8>(cfg.failure_policies[0].body.ptr[1]) == 0);
+    CHECK(cfg.failure_policies[0].body.ptr[2] == '\n');
+    CHECK(cfg.failure_policies[0].body.ptr[3] == 'x');
     REQUIRE(cfg.add_jit_handler("/api", 'G', &forward_failure_bundle_handler));
     const RouteConfig* active = &cfg;
     ScopedProxyLoop proxy;

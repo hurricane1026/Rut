@@ -606,12 +606,15 @@ struct AstFile {
     // pools cost heap, not stack.
     static constexpr u32 kMaxStmtPool = 4096;
     static constexpr u32 kMaxTypePool = 256;
+    static constexpr u32 kFailurePolicyBodyPoolBytes =
+        kMaxForwardFailurePolicies * kMaxFailurePolicyBodyLen;
     FixedVec<AstItem, kMaxItems> items;
     FixedVec<AstExpr, kMaxExprPool> expr_pool;
     FixedVec<AstStatement, kMaxStmtPool> stmt_pool;
     FixedVec<AstTypeRef, kMaxTypePool> type_pool;
     FixedVec<ForwardResponsePolicySpec, kMaxResponsePolicies> response_policies;
     FixedVec<ForwardFailurePolicySpec, kMaxForwardFailurePolicies> failure_policies;
+    FixedVec<u8, kFailurePolicyBodyPoolBytes> failure_policy_body_pool;
     bool has_package_decl = false;
     Span package_span{};
     Str package_name{};
@@ -623,7 +626,8 @@ struct AstFile {
           stmt_pool(other.stmt_pool),
           type_pool(other.type_pool),
           response_policies(other.response_policies),
-          failure_policies(other.failure_policies) {
+          failure_policies(other.failure_policies),
+          failure_policy_body_pool(other.failure_policy_body_pool) {
         rebase_from(other);
     }
     AstFile& operator=(const AstFile& other) {
@@ -634,6 +638,7 @@ struct AstFile {
         type_pool = other.type_pool;
         response_policies = other.response_policies;
         failure_policies = other.failure_policies;
+        failure_policy_body_pool = other.failure_policy_body_pool;
         rebase_from(other);
         return *this;
     }
@@ -643,7 +648,8 @@ struct AstFile {
           stmt_pool(other.stmt_pool),
           type_pool(other.type_pool),
           response_policies(other.response_policies),
-          failure_policies(other.failure_policies) {
+          failure_policies(other.failure_policies),
+          failure_policy_body_pool(other.failure_policy_body_pool) {
         rebase_from(other);
     }
     AstFile& operator=(AstFile&& other) noexcept {
@@ -654,6 +660,7 @@ struct AstFile {
         type_pool = other.type_pool;
         response_policies = other.response_policies;
         failure_policies = other.failure_policies;
+        failure_policy_body_pool = other.failure_policy_body_pool;
         rebase_from(other);
         return *this;
     }
@@ -674,6 +681,19 @@ struct AstFile {
                 return static_cast<u16>(i + 1);
         if (!failure_policies.push(policy)) return 0;
         return static_cast<u16>(failure_policies.len);
+    }
+
+    bool add_failure_policy_body(const u8* bytes, u32 len, Str& out) {
+        if ((bytes == nullptr && len != 0) || len > kMaxFailurePolicyBodyLen ||
+            failure_policy_body_pool.len > kFailurePolicyBodyPoolBytes ||
+            len > kFailurePolicyBodyPoolBytes - failure_policy_body_pool.len)
+            return false;
+        const u32 start = failure_policy_body_pool.len;
+        for (u32 i = 0; i < len; i++) {
+            if (!failure_policy_body_pool.push(bytes[i])) return false;
+        }
+        out = {reinterpret_cast<const char*>(&failure_policy_body_pool.data[start]), len};
+        return true;
     }
 
 private:
@@ -702,6 +722,17 @@ private:
         if (ptr < begin || ptr >= end) return;
         const u32 index = static_cast<u32>(ptr - begin);
         ptr = &stmt_pool.data[index];
+    }
+
+    void rebase_failure_policy(const AstFile& other, ForwardFailurePolicySpec& policy) {
+        if (policy.body.ptr == nullptr) return;
+        const char* begin = reinterpret_cast<const char*>(&other.failure_policy_body_pool.data[0]);
+        const char* end = begin + other.failure_policy_body_pool.len;
+        // Include the one-past-end pointer used by an owned empty literal so
+        // copies never leave even a zero-length body pointing into `other`.
+        if (policy.body.ptr < begin || policy.body.ptr > end) return;
+        const u32 index = static_cast<u32>(policy.body.ptr - begin);
+        policy.body.ptr = reinterpret_cast<const char*>(&failure_policy_body_pool.data[index]);
     }
 
     void rebase_type_ref(const AstFile& other, AstTypeRef& type) {
@@ -798,6 +829,8 @@ private:
     }
 
     void rebase_from(const AstFile& other) {
+        for (u32 i = 0; i < failure_policies.len; i++)
+            rebase_failure_policy(other, failure_policies[i]);
         for (u32 i = 0; i < type_pool.len; i++) rebase_type_ref(other, type_pool[i]);
         for (u32 i = 0; i < expr_pool.len; i++) rebase_expr(other, expr_pool[i]);
         for (u32 i = 0; i < stmt_pool.len; i++) rebase_stmt(other, stmt_pool[i]);

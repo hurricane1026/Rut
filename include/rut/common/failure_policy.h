@@ -42,6 +42,12 @@ inline bool failure_policy_safe_text(Str value, u32 cap, bool allow_empty = fals
     return true;
 }
 
+// Failure bodies are byte payloads, not header/text fields.  In particular,
+// NUL and LF are valid here; the serializer will frame them by Content-Length.
+inline bool failure_policy_safe_body(Str value) {
+    return (value.ptr != nullptr || value.len == 0) && value.len <= kMaxFailurePolicyBodyLen;
+}
+
 inline bool forward_failure_policy_spec_valid(const ForwardFailurePolicySpec& policy) {
     if (policy.version != ForwardFailurePolicyVersion::Http11 || policy.status_code != 502 ||
         policy.date != ForwardFailurePolicyDate::Current ||
@@ -49,7 +55,7 @@ inline bool forward_failure_policy_spec_valid(const ForwardFailurePolicySpec& po
         !failure_policy_safe_text(policy.reason, kMaxFailurePolicyReasonLen) ||
         !failure_policy_safe_text(policy.content_type, kMaxFailurePolicyContentTypeLen) ||
         !failure_policy_safe_text(policy.server, kMaxFailurePolicyServerLen) ||
-        !failure_policy_safe_text(policy.body, kMaxFailurePolicyBodyLen, true))
+        !failure_policy_safe_body(policy.body))
         return false;
     return validate_response_header("Content-Type",
                                    12,

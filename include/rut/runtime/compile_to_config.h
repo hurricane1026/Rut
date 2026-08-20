@@ -214,6 +214,19 @@ inline bool populate_route_config(RouteConfig& cfg, const rir::Module& mod) {
     for (u32 i = 0; i < mod.failure_policy_count; i++) {
         if (!forward_failure_policy_spec_valid(mod.failure_policies[i])) return false;
     }
+    // A failure policy can stand alone.  A zero response-policy id is the
+    // explicit absence of response serialization, not an invalid table ref;
+    // the failure id itself remains mandatory and must resolve above.
+    for (u32 i = 0; i < mod.policy_bundle_count; i++) {
+        const auto& bundle = mod.policy_bundles[i];
+        if (bundle.failure_policy_id == 0 ||
+            bundle.failure_policy_id > mod.failure_policy_count ||
+            (bundle.response_policy_id != 0 &&
+             (bundle.response_policy_id > mod.response_policy_count ||
+              !response_policy_spec_valid(
+                  mod.response_policies[bundle.response_policy_id - 1]))))
+            return false;
+    }
     for (u32 i = 0; i < mod.header_set_count; i++) {
         const auto& ref = mod.header_sets[i];
         if (static_cast<u32>(ref.offset) + ref.count > mod.header_pool_used) return false;

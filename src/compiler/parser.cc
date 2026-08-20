@@ -86,6 +86,70 @@ struct Parser {
         return frontend_error(FrontendError::UnexpectedToken, span_from(cur()), cur().text);
     }
 
+    FrontendResult<Str> parse_failure_body_literal() {
+        if (cur().type == TokenType::Eof)
+            return frontend_error(FrontendError::UnexpectedEof, span_from(cur()));
+        if (cur().type != TokenType::Ident || !cur().text.eq({"b", 1}))
+            return frontend_error(FrontendError::UnexpectedToken, span_from(cur()), cur().text);
+        const Token& prefix = toks->tokens[pos++];
+        auto literal = expect(TokenType::StringLit);
+        if (!literal) return core::make_unexpected(literal.error());
+        if (literal.value()->start != prefix.end + 1)
+            return frontend_error(FrontendError::UnexpectedToken,
+                                  span_from(*literal.value()),
+                                  literal.value()->text);
+
+        u8 decoded[kMaxFailurePolicyBodyLen];
+        u32 decoded_len = 0;
+        const Str raw = literal.value()->text;
+        auto hex = [](u8 c, u8& out) {
+            if (c >= '0' && c <= '9') { out = static_cast<u8>(c - '0'); return true; }
+            if (c >= 'a' && c <= 'f') { out = static_cast<u8>(c - 'a' + 10); return true; }
+            if (c >= 'A' && c <= 'F') { out = static_cast<u8>(c - 'A' + 10); return true; }
+            return false;
+        };
+        for (u32 i = 0; i < raw.len; i++) {
+            u8 value = static_cast<u8>(raw.ptr[i]);
+            if (value == '\\') {
+                if (++i >= raw.len)
+                    return frontend_error(FrontendError::UnexpectedToken,
+                                          span_from(*literal.value()), raw);
+                const u8 esc = static_cast<u8>(raw.ptr[i]);
+                switch (esc) {
+                    case 'n': value = '\n'; break;
+                    case 'r': value = '\r'; break;
+                    case 't': value = '\t'; break;
+                    case '\\': value = '\\'; break;
+                    case '"': value = '"'; break;
+                    case 'x': {
+                        if (i + 2 >= raw.len)
+                            return frontend_error(FrontendError::UnexpectedToken,
+                                                  span_from(*literal.value()), raw);
+                        u8 hi = 0, lo = 0;
+                        if (!hex(static_cast<u8>(raw.ptr[i + 1]), hi) ||
+                            !hex(static_cast<u8>(raw.ptr[i + 2]), lo))
+                            return frontend_error(FrontendError::UnexpectedToken,
+                                                  span_from(*literal.value()), raw);
+                        value = static_cast<u8>((hi << 4) | lo);
+                        i += 2;
+                        break;
+                    }
+                    default:
+                        return frontend_error(FrontendError::UnexpectedToken,
+                                              span_from(*literal.value()), raw);
+                }
+            }
+            if (decoded_len >= kMaxFailurePolicyBodyLen)
+                return frontend_error(FrontendError::TooManyItems,
+                                      span_from(*literal.value()), raw);
+            decoded[decoded_len++] = value;
+        }
+        Str owned{};
+        if (!file->add_failure_policy_body(decoded, decoded_len, owned))
+            return frontend_error(FrontendError::TooManyItems, span_from(prefix), raw);
+        return owned;
+    }
+
     FrontendResult<AstExpr*> alloc_expr(const AstExpr& expr) {
         if (!file->expr_pool.push(expr))
             return frontend_error(FrontendError::TooManyItems, expr.span);
@@ -1752,9 +1816,9 @@ struct Parser {
                                 policy.connection = ForwardFailurePolicyConnection::Request;
                             } else if (field_name.eq({"body", 4})) {
                                 seen = &have_body;
-                                auto value = expect(TokenType::StringLit);
+                                auto value = parse_failure_body_literal();
                                 if (!value) return core::make_unexpected(value.error());
-                                policy.body = value.value()->text;
+                                policy.body = value.value();
                             } else {
                                 return frontend_error(FrontendError::UnexpectedToken,
                                                       span_from(*field.value()),
@@ -1856,10 +1920,6 @@ struct Parser {
                 }
                 auto rparen = expect(TokenType::RParen);
                 if (!rparen) return core::make_unexpected(rparen.error());
-                if (stmt.has_forward_failure_policy && !stmt.has_forward_response_policy)
-                    return frontend_error(FrontendError::UnsupportedSyntax,
-                                          span_from(*rparen.value()),
-                                          lit_str("failure_policy requires response_policy"));
                 stmt.span = Span{start.start, rparen.value()->end, start.line, start.col};
                 return stmt;
             }

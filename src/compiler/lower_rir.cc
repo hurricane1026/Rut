@@ -3072,8 +3072,7 @@ static FrontendResult<void> emit_term(const MirTerminator& term,
             response_policy = p.value();
         }
         if (term.forward_failure_policy_id != 0) {
-            if (term.forward_response_policy_id == 0 ||
-                term.forward_response_policy_id > b.mod->response_policy_count ||
+            if (term.forward_response_policy_id > b.mod->response_policy_count ||
                 term.forward_failure_policy_id > b.mod->failure_policy_count)
                 return frontend_error(FrontendError::UnsupportedSyntax, term.span);
             u16 bundle_id = 0;
