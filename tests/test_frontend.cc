@@ -32754,14 +32754,32 @@ route GET "/api" {
     CHECK_EQ(mterm.forward_failure_policy_id, 1u);
     FrontendRirModule rir{};
     REQUIRE(lower_to_rir(mir.value(), rir));
+    auto verified = rir::verify_module(rir.module);
+    REQUIRE(verified.ok);
     REQUIRE_EQ(rir.module.target_transform_count, 1u);
     CHECK(rir.module.target_transforms[0].strip_prefix.eq(lit("/api/")));
+    CHECK(rir.module.target_transforms[0].replace_prefix.eq(lit("/")));
+    REQUIRE_EQ(rir.module.policy_bundle_count, 1u);
+    CHECK_EQ(rir.module.policy_bundles[0].response_policy_id, 1u);
+    CHECK_EQ(rir.module.policy_bundles[0].failure_policy_id, 1u);
     const auto& block = rir.module.functions[0].blocks[0];
-    REQUIRE_GE(block.inst_count, 2u);
+    REQUIRE_EQ(block.inst_count, 6u);
+    CHECK_EQ(block.insts[0].op, rir::Opcode::ConstI32);
+    CHECK_EQ(block.insts[0].imm.i32_val, 0);
+    CHECK_EQ(block.insts[1].op, rir::Opcode::ConstI32);
+    CHECK_EQ(block.insts[1].imm.i32_val, 1);
+    CHECK_EQ(block.insts[2].op, rir::Opcode::ConstI32);
+    CHECK_EQ(block.insts[2].imm.i32_val, 1);
+    CHECK_EQ(block.insts[3].op, rir::Opcode::ConstI32);
+    CHECK_EQ(block.insts[3].imm.i32_val, 1);
     CHECK_EQ(block.insts[block.inst_count - 2].op, rir::Opcode::ReqSetTargetTransform);
     CHECK_EQ(block.insts[block.inst_count - 2].imm.i32_val, 1);
-    CHECK_EQ(block.insts[block.inst_count - 1].op, rir::Opcode::RetForwardBundle);
-    CHECK_EQ(block.insts[block.inst_count - 1].operand_count, 3u);
+    const auto& ret = block.insts[block.inst_count - 1];
+    CHECK_EQ(ret.op, rir::Opcode::RetForwardBundle);
+    CHECK_EQ(ret.operand_count, 3u);
+    CHECK_EQ(ret.operands[0].id, block.insts[0].result.id);
+    CHECK_EQ(ret.operands[1].id, block.insts[1].result.id);
+    CHECK_EQ(ret.operands[2].id, block.insts[3].result.id);
     rir.destroy();
 }
 
@@ -32779,6 +32797,7 @@ TEST(frontend, target_transform_source_rejects_invalid_objects_and_compositions)
         "upstream b\nroute GET \"/\" { return forward(b, target_transform: { strip_prefix: \"/api/\", replace_prefix: \"/\" }, set_path: \"/x\") }\n",
         "upstream b\nroute GET \"/\" { return forward(b, set_path: \"/x\", target_transform: { strip_prefix: \"/api/\", replace_prefix: \"/\" }) }\n",
         "upstream b\nroute GET \"/\" { return forward(b, target_transform: { strip_prefix: \"/api/\", replace_prefix: \"/\" }, set_header: { \"X-Test\": \"v\" }) }\n",
+        "upstream b\nroute GET \"/\" { return forward(b, set_header: { \"X-Test\": \"v\" }, target_transform: { strip_prefix: \"/api/\", replace_prefix: \"/\" }) }\n",
     };
     for (const char* source : invalid) {
         auto lexed = lex(lit(source));
@@ -32820,6 +32839,19 @@ route GET "/" use chain access {
     if req.http11 {
         return forward(b, target_transform: { strip_prefix: "/api/", replace_prefix: "/" })
     } else { return 200 }
+}
+)rut",
+        R"rut(
+upstream b
+func add_header(_ resp: Response) -> i32 { resp.set("X-Test", "v") 0 }
+chain access { after add_header(resp) }
+route GET "/" use chain access {
+    match req.http11 {
+        true => {
+            return forward(b, target_transform: { strip_prefix: "/api/", replace_prefix: "/" })
+        }
+        _ => return 200
+    }
 }
 )rut"};
     for (const char* source : sources) {
