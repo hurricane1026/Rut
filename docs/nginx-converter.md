@@ -110,6 +110,9 @@ evidence must use a pinned nginx build and cannot treat that skip as a pass.
 - #253: a bounded final-H1.1 exact-Content-Length response policy is available;
   fixed-CL request-body admission and one upstream `Connection` field are now
   covered, while broader response behavior remains `PARTIAL`.
+- #256: a configurable synthetic forward-failure response is required for the
+  unavailable-upstream acceptance case. Current hard-coded RUT gateway errors
+  cannot express nginx's body, headers, or downstream keep-alive behavior.
 
 ## First process-loop evidence
 
