@@ -331,6 +331,8 @@ static const char* action_str(jit::HandlerAction action) {
             return "forward";
         case jit::HandlerAction::ForwardBundle:
             return "forward_bundle";
+        case jit::HandlerAction::Redirect:
+            return "redirect";
         case jit::HandlerAction::Yield:
             return "yield";
     }
@@ -641,6 +643,11 @@ static SimulateResult finalize_handler_result(const Engine& engine,
         result.verdict = streq(result.actual_upstream, result.expected_upstream)
                              ? Verdict::Match
                              : Verdict::Mismatch;
+        return result;
+    }
+
+    if (unpacked.action == jit::HandlerAction::Redirect) {
+        result.verdict = Verdict::Unsupported;
         return result;
     }
 

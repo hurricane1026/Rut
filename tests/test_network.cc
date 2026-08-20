@@ -97,6 +97,24 @@ u64 h2_target_transform_handler(void* opaque,
     conn->target_transform_recorded = true;
     return jit::HandlerResult::make_forward(0).pack();
 }
+
+static u64 h2_timer_then_redirect_handler(void*,
+                                          jit::HandlerCtx* ctx,
+                                          const u8*,
+                                          u32,
+                                          void*) {
+    if (ctx != nullptr && ctx->state == 7) return jit::HandlerResult::make_redirect(1).pack();
+    return jit::HandlerResult::make_yield(7, jit::YieldKind::Timer).pack();
+}
+
+static u64 h1_timer_then_redirect_handler(void*,
+                                          jit::HandlerCtx* ctx,
+                                          const u8*,
+                                          u32,
+                                          void*) {
+    if (ctx != nullptr && ctx->state == 7) return jit::HandlerResult::make_redirect(1).pack();
+    return jit::HandlerResult::make_yield(7, jit::YieldKind::Timer).pack();
+}
 }  // namespace
 
 // Replacing a header the client sent twice must replace the first AND drop the
@@ -678,6 +696,45 @@ TEST(target_transform, h1_valid_materialization_reaches_upstream_selection) {
     loop.free_conn(*conn);
 }
 
+TEST(redirect, h1_foundation_action_rejects_before_upstream) {
+    SmallLoop loop;
+    loop.setup();
+    RouteConfig cfg{};
+    REQUIRE(cfg.add_upstream("backend", 0x7F000001, 9000).has_value());
+    RedirectPolicySpec policy{};
+    policy.scheme = RedirectPolicyScheme::Http;
+    policy.authority = RedirectPolicyAuthority::RequestHost;
+    policy.port = RedirectPolicyPort::ActualListener;
+    policy.path = RedirectPolicyPath::Static;
+    policy.query = RedirectPolicyQuery::PreserveRaw;
+    policy.date = RedirectPolicyDate::Current;
+    policy.connection = RedirectPolicyConnection::Close;
+    policy.status_code = 301;
+    policy.reason = {"Moved Permanently", 16};
+    policy.server = {"rut", 3};
+    policy.content_type = {"text/html", 9};
+    policy.target_path = {"/api/", 5};
+    policy.body = {"", 0};
+    REQUIRE_EQ(cfg.add_redirect_policy(policy), 1u);
+
+    const char request[] = "GET /api HTTP/1.1\r\nHost: client\r\n\r\n";
+    auto* conn = setup_target_transform_request(loop, cfg, request, sizeof(request) - 1);
+    REQUIRE(conn != nullptr);
+    conn->request_config = &cfg;
+    loop.backend.clear_ops();
+    JitDispatchOutcome outcome{};
+    outcome.kind = JitDispatchOutcome::Kind::Redirect;
+    outcome.redirect_policy_id = 1;
+    handle_jit_outcome<SmallLoop>(&loop, *conn, outcome, nullptr, true);
+
+    CHECK_EQ(conn->resp_status, 400u);
+    CHECK_EQ(conn->state, ConnState::Sending);
+    CHECK_EQ(conn->pending_handler_fn, nullptr);
+    CHECK_EQ(loop.backend.count_ops(MockOp::Connect), 0u);
+    CHECK_EQ(loop.backend.count_ops(MockOp::Send), 1u);
+    loop.free_conn(*conn);
+}
+
 TEST(target_transform, h2_request_boundary_clears_recorded_effect) {
     Connection conn;
     conn.reset();
@@ -720,6 +777,103 @@ TEST(target_transform, h2_forward_rejects_recorded_effect_before_proxy) {
     CHECK(dispatch.resp_len > 0);  // local 400 is staged, never proxied
     CHECK_EQ(loop.backend.count_ops(MockOp::Connect), 0u);
     CHECK_EQ(loop.backend.count_ops(MockOp::Send), 0u);
+}
+
+TEST(redirect, h2_initial_and_timer_resume_reject_without_proxy) {
+    SmallLoop loop;
+    loop.setup();
+    auto* conn = loop.alloc_conn();
+    REQUIRE(conn != nullptr);
+    RouteConfig cfg{};
+    RedirectPolicySpec policy{};
+    policy.scheme = RedirectPolicyScheme::Http;
+    policy.authority = RedirectPolicyAuthority::RequestHost;
+    policy.port = RedirectPolicyPort::ActualListener;
+    policy.path = RedirectPolicyPath::Static;
+    policy.query = RedirectPolicyQuery::PreserveRaw;
+    policy.date = RedirectPolicyDate::Current;
+    policy.connection = RedirectPolicyConnection::Close;
+    policy.status_code = 301;
+    policy.reason = {"Moved Permanently", 16};
+    policy.server = {"rut", 3};
+    policy.content_type = {"text/html", 9};
+    policy.target_path = {"/api/", 5};
+    REQUIRE_EQ(cfg.add_redirect_policy(policy), 1u);
+    Http2Conn h2{};
+    h2.init();
+    conn->h2 = &h2;
+    RouteEntry route{};
+    route.fn = &h2_timer_then_redirect_handler;
+    const u8 synth[] = "GET /api HTTP/1.1\r\nHost: x\r\n\r\n";
+    u8 response[8192]{};
+    H2Dispatch<SmallLoop> dispatch{&loop, conn, response, sizeof(response), 0, false};
+    loop.backend.clear_ops();
+    h2_invoke_emit(dispatch,
+                   1,
+                   &route,
+                   nullptr,
+                   0,
+                   &cfg,
+                   synth,
+                   sizeof(synth) - 1,
+                   false,
+                   true);
+    CHECK_EQ(h2.async_stream, 1u);
+    CHECK_EQ(loop.backend.count_ops(MockOp::Connect), 0u);
+
+    conn->pending_handler_fn = &h2_timer_then_redirect_handler;
+    conn->handler_state = 7;
+    loop.backend.clear_ops();
+    h2_resume_jit_handler(&loop, *conn);
+    CHECK_EQ(h2.async_stream, 0u);
+    CHECK_FALSE(conn->epoch_held);
+    CHECK_EQ(loop.backend.count_ops(MockOp::Connect), 0u);
+    CHECK_EQ(loop.backend.count_ops(MockOp::Send), 1u);
+    loop.free_conn(*conn);
+}
+
+TEST(redirect, h1_timer_resume_rejects_without_proxy) {
+    SmallLoop loop;
+    loop.setup();
+    RouteConfig cfg{};
+    REQUIRE(cfg.add_upstream("backend", 0x7F000001, 9000).has_value());
+    RedirectPolicySpec policy{};
+    policy.scheme = RedirectPolicyScheme::Http;
+    policy.authority = RedirectPolicyAuthority::RequestHost;
+    policy.port = RedirectPolicyPort::ActualListener;
+    policy.path = RedirectPolicyPath::Static;
+    policy.query = RedirectPolicyQuery::PreserveRaw;
+    policy.date = RedirectPolicyDate::Current;
+    policy.connection = RedirectPolicyConnection::Close;
+    policy.status_code = 301;
+    policy.reason = {"Moved Permanently", 16};
+    policy.server = {"rut", 3};
+    policy.content_type = {"text/html", 9};
+    policy.target_path = {"/api/", 5};
+    REQUIRE_EQ(cfg.add_redirect_policy(policy), 1u);
+    REQUIRE(cfg.add_jit_handler("/api", 'G', &h1_timer_then_redirect_handler, false));
+    const RouteConfig* active = &cfg;
+    loop.config_ptr = &active;
+    loop.inject_and_dispatch(make_ev(0, IoEventType::Accept, 42));
+    auto* conn = loop.find_fd(42);
+    REQUIRE(conn != nullptr);
+    const char request[] = "GET /api HTTP/1.1\r\nHost: client\r\n\r\n";
+    REQUIRE_EQ(conn->recv_buf.write(reinterpret_cast<const u8*>(request), sizeof(request) - 1),
+                sizeof(request) - 1);
+    loop.backend.inject(make_ev(conn->id, IoEventType::Recv, sizeof(request) - 1));
+    IoEvent events[8];
+    const u32 count = loop.backend.wait(events, 8);
+    for (u32 i = 0; i < count; i++) loop.dispatch(events[i]);
+    CHECK_EQ(conn->state, ConnState::ExecHandler);
+    CHECK_EQ(conn->pending_handler_fn, &h1_timer_then_redirect_handler);
+    loop.backend.clear_ops();
+    resume_jit_handler(&loop, *conn);
+    CHECK_EQ(conn->resp_status, 400u);
+    CHECK_EQ(conn->state, ConnState::Sending);
+    CHECK_EQ(conn->pending_handler_fn, nullptr);
+    CHECK_EQ(loop.backend.count_ops(MockOp::Connect), 0u);
+    CHECK_EQ(loop.backend.count_ops(MockOp::Send), 1u);
+    loop.free_conn(*conn);
 }
 
 TEST(set_path, streamed_pipeline_stash_preserves_response_mutation_snapshot) {

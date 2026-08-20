@@ -276,6 +276,7 @@ enum class Opcode : u8 {
     // request policy uses an explicit zero request operand.
     RetForward,
     RetForwardBundle,
+    RetRedirect,  // ret.redirect policy_id (1-based redirect policy table id)
 
     // ── Yield (I/O suspend → state machine boundary) ──
     YieldTimer,     // yield.timer ms, next_state
@@ -345,7 +346,8 @@ struct Instruction {
     // than range check so opcode reordering can't silently break semantics.
     bool is_terminator() const {
         return op == Opcode::Br || op == Opcode::Jmp || op == Opcode::RetStatus ||
-               op == Opcode::RetForward || op == Opcode::RetForwardBundle || is_yield();
+               op == Opcode::RetForward || op == Opcode::RetForwardBundle ||
+               op == Opcode::RetRedirect || is_yield();
     }
 };
 

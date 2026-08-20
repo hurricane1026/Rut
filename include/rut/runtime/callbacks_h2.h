@@ -744,6 +744,18 @@ void h2_invoke_emit(H2Dispatch<Loop>& d,
         h2_emit_status(d, stream_id, 400);
         return;
     }
+    if (kOutcome.kind == JitDispatchOutcome::Kind::Redirect) {
+        // Redirect serialization is deliberately unavailable in this
+        // increment. Validate the pinned table reference, then reject before
+        // creating any H2 proxy/async state or upstream work.
+        if (cfg == nullptr ||
+            !cfg->redirect_policy_id_is_valid(kOutcome.redirect_policy_id)) {
+            h2_emit_status(d, stream_id, 400);
+            return;
+        }
+        h2_emit_status(d, stream_id, 400);
+        return;
+    }
     if (kOutcome.kind == JitDispatchOutcome::Kind::TimerYield) {
         if (!h2_suspend_timer(d,
                               stream_id,
@@ -1463,6 +1475,34 @@ void h2_resume_jit_handler(Loop* loop, Connection& conn) {
         h2->async_timer_ms = kOutcome.timer_ms;
         h2->async_state = static_cast<u16>(kOutcome.next_state);
         if (!h2_arm_async_timer<Loop>(loop, conn)) loop->close_conn(conn);
+        return;
+    }
+
+    if (kOutcome.kind == JitDispatchOutcome::Kind::Redirect) {
+        // The timer owns the async slot and config epoch. Reject the
+        // foundation-only action and release both before sending status.
+        u8 resp[8192];
+        H2Dispatch<Loop> d{loop, &conn, resp, sizeof(resp), 0, false};
+        // Resolve the pinned id even though both valid and invalid ids are
+        // rejected until H2 serialization exists.
+        const bool valid = h2->async_cfg != nullptr &&
+                           h2->async_cfg->redirect_policy_id_is_valid(
+                               kOutcome.redirect_policy_id);
+        (void)valid;
+        h2_emit_status(d, kStreamId, 400);
+        conn.pending_handler_fn = nullptr;
+        h2_clear_async(*h2);
+        h2_async_epoch_leave(loop, conn);
+        if (d.resp_len == 0 || d.overflow) {
+            loop->close_conn(conn);
+            return;
+        }
+        conn.send_progress = 0;
+        conn.send_buf.reset();
+        conn.send_buf.write(resp, d.resp_len);
+        conn.keep_alive = true;
+        conn.transition_to_sending(&on_h2_sent<Loop>);
+        loop->submit_send(conn, conn.send_buf.data(), conn.send_buf.len());
         return;
     }
 

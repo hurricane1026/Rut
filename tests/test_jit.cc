@@ -36,6 +36,16 @@ static Str lit(const char* s) {
     return {s, n};
 }
 
+static u64 invalid_redirect_handler(void*, HandlerCtx*, const u8*, u32, void*) {
+    auto result = HandlerResult::make_redirect(1);
+    result.status_code = 1;
+    return result.pack();
+}
+
+static u64 invalid_action_handler(void*, HandlerCtx*, const u8*, u32, void*) {
+    return 0xffu;
+}
+
 struct TestHandlerCtxFrame {
     HandlerCtx ctx{};
     u64 slots[ConnectionBase::kMaxJitHandlerSlots]{};
@@ -261,6 +271,73 @@ TEST(jit, return_200) {
     CHECK(result.action == HandlerAction::ReturnStatus);
     CHECK(result.status_code == 200);
 
+    engine.shutdown();
+    tc.destroy();
+}
+
+TEST(jit, redirect_abi_and_compiled_action_are_fail_closed) {
+    for (u16 id : {static_cast<u16>(1), static_cast<u16>(65535)}) {
+        const auto packed = HandlerResult::make_redirect(id).pack();
+        const auto decoded = HandlerResult::unpack(packed);
+        CHECK(HandlerResult::redirect_fields_valid(decoded));
+        CHECK_EQ(decoded.upstream_id, id);
+        CHECK_EQ(decoded.status_code, 0u);
+        CHECK_EQ(decoded.next_state, 0u);
+        CHECK_EQ(decoded.yield_kind, YieldKind::HttpGet);
+    }
+    auto zero = HandlerResult::make_redirect(0);
+    CHECK_FALSE(HandlerResult::redirect_fields_valid(zero));
+    auto bad_status = HandlerResult::make_redirect(1);
+    bad_status.status_code = 1;
+    CHECK_FALSE(HandlerResult::redirect_fields_valid(bad_status));
+    auto bad_next = HandlerResult::make_redirect(1);
+    bad_next.next_state = 1;
+    CHECK_FALSE(HandlerResult::redirect_fields_valid(bad_next));
+    auto bad_kind = HandlerResult::make_redirect(1);
+    bad_kind.yield_kind = YieldKind::Timer;
+    CHECK_FALSE(HandlerResult::redirect_fields_valid(bad_kind));
+    HandlerCtx invalid_ctx{};
+    const u8 request[] = "GET / HTTP/1.1\r\nHost: x\r\n\r\n";
+    auto invalid_outcome = invoke_jit_handler(&invalid_redirect_handler,
+                                               nullptr,
+                                               invalid_ctx,
+                                               request,
+                                               sizeof(request) - 1,
+                                               nullptr);
+    CHECK_EQ(invalid_outcome.kind, JitDispatchOutcome::Kind::Error);
+    invalid_outcome = invoke_jit_handler(&invalid_action_handler,
+                                         nullptr,
+                                         invalid_ctx,
+                                         request,
+                                         sizeof(request) - 1,
+                                         nullptr);
+    CHECK_EQ(invalid_outcome.kind, JitDispatchOutcome::Kind::Error);
+
+    TestContext tc;
+    REQUIRE(tc.init());
+    Builder b;
+    b.init(&tc.mod);
+    auto* fn = V(b.create_function(lit("redirect"), lit("/api"), 0));
+    auto entry = V(b.create_block(fn, lit("entry")));
+    b.set_insert_point(fn, entry);
+    VOK(b.emit_ret_redirect(65535));
+    auto cg = codegen(tc.mod);
+    REQUIRE(cg.ok);
+    JitEngine engine;
+    REQUIRE(engine.init());
+    REQUIRE(engine.compile(cg.mod, cg.ctx));
+    auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_redirect"));
+    REQUIRE(handler != nullptr);
+    HandlerCtx ctx{};
+    const u8 redirect_request[] = "GET /api HTTP/1.1\r\nHost: x\r\n\r\n";
+    const auto outcome = invoke_jit_handler(handler,
+                                             nullptr,
+                                             ctx,
+                                             redirect_request,
+                                             sizeof(redirect_request) - 1,
+                                             nullptr);
+    CHECK_EQ(outcome.kind, JitDispatchOutcome::Kind::Redirect);
+    CHECK_EQ(outcome.redirect_policy_id, 65535u);
     engine.shutdown();
     tc.destroy();
 }

@@ -784,6 +784,27 @@ TEST(simulate_engine, forward_bundle_is_explicitly_unsupported) {
     rir.destroy();
 }
 
+TEST(simulate_engine, redirect_action_is_explicitly_unsupported) {
+    FrontendRirModule rir{};
+    REQUIRE(compile_to_rir("route GET \"/api\" { return 200 }\n", rir));
+    REQUIRE(rir.module.func_count == 1);
+    auto& fn = rir.module.functions[0];
+    REQUIRE(fn.entry() != nullptr);
+    auto& term = fn.entry()->insts[fn.entry()->inst_count - 1];
+    term.op = rir::Opcode::RetRedirect;
+    term.operand_count = 0;
+    term.imm.i32_val = 1;
+
+    Engine engine;
+    REQUIRE(engine.init(rir.module, nullptr, 0));
+    const auto result =
+        simulate_one(engine, make_entry("GET /api HTTP/1.1\r\nHost: x\r\n\r\n", 301));
+    CHECK_EQ(result.action, jit::HandlerAction::Redirect);
+    CHECK_EQ(result.verdict, Verdict::Unsupported);
+    engine.shutdown();
+    rir.destroy();
+}
+
 TEST(simulate_engine, recorded_target_transform_is_unsupported_before_forward) {
     const char* src =
         "upstream backend\nroute GET \"/api\" { return forward(backend) }\n";

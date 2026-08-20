@@ -14,6 +14,8 @@ namespace rut {
 //
 //   - ReturnStatus: send HTTP response with `status_code` and finish.
 //   - Forward:     proxy to upstream #`upstream_id`.
+//   - Redirect:    validated redirect-policy id; this foundation rejects it
+//                  locally because response serialization is not present.
 //   - TimerYield:  schedule a wake `timer_ms` from now and resume the
 //                   same handler with `ctx.state = next_state`. The
 //                   handler was paused at a `wait(ms)` (or later
@@ -31,6 +33,7 @@ struct JitDispatchOutcome {
         Forward,
         TimerYield,
         EventYield,
+        Redirect,
         Error,
     };
 
@@ -45,6 +48,8 @@ struct JitDispatchOutcome {
     u16 response_policy_id = 0;
     // 1-based RouteConfig::policy_bundles index for ForwardBundle outcomes.
     u16 policy_bundle_id = 0;
+    // 1-based RouteConfig::redirect_policies index for Redirect outcomes.
+    u16 redirect_policy_id = 0;
     // Resolved failure-policy id retained across the fixed-body wait. This is
     // runtime metadata, not an additional legacy HandlerResult ABI slot.
     u16 failure_policy_id = 0;
@@ -178,6 +183,11 @@ inline JitDispatchOutcome invoke_jit_handler(jit::HandlerFn fn,
             } else {
                 out.response_policy_id = r.next_state;
             }
+            return out;
+        case jit::HandlerAction::Redirect:
+            if (!jit::HandlerResult::redirect_fields_valid(r)) return out;
+            out.kind = JitDispatchOutcome::Kind::Redirect;
+            out.redirect_policy_id = r.upstream_id;
             return out;
         case jit::HandlerAction::Yield:
             out.next_state = r.next_state;

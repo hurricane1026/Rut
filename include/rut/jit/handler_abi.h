@@ -14,6 +14,7 @@ enum class HandlerAction : u8 {
     Forward = 1,       // Forward request to upstream_id
     Yield = 2,         // Suspend: initiate I/O, resume at next_state
     ForwardBundle = 3, // Forward with a 1-based response/failure bundle id
+    Redirect = 4,      // Foundation redirect policy id in upstream_id
 };
 
 // ── Yield Kind ─────────────────────────────────────────────────────
@@ -115,6 +116,16 @@ struct HandlerResult {
                 upstream,
                 bundle_id,
                 YieldKind::HttpGet};
+    }
+
+    static HandlerResult make_redirect(u16 policy_id) {
+        return {HandlerAction::Redirect, 0, policy_id, 0, YieldKind::HttpGet};
+    }
+
+    static bool redirect_fields_valid(const HandlerResult& result) {
+        return result.action == HandlerAction::Redirect && result.upstream_id != 0 &&
+               result.status_code == 0 && result.next_state == 0 &&
+               result.yield_kind == YieldKind::HttpGet;
     }
 
     static HandlerResult make_yield(u16 state, YieldKind kind) {

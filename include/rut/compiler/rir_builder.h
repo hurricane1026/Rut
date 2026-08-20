@@ -1193,6 +1193,17 @@ struct Builder {
         return {};
     }
 
+    // Emit a foundation-only redirect terminator. The policy id is a
+    // validated 1-based RouteConfig redirect-policy id; serialization is
+    // intentionally unavailable in this increment.
+    VoidResult emit_ret_redirect(u16 policy_id, SourceLoc loc = {}) {
+        if (policy_id == 0) return err(RirError::InvalidState);
+        auto r = TRY(emit(Opcode::RetRedirect, nullptr, loc));
+        r.inst->operand_count = 0;
+        r.inst->imm.i32_val = static_cast<i32>(policy_id);
+        return {};
+    }
+
     // ── Yields (I/O suspend points) ────────────────────────────────
 
     Result<ValueId> emit_yield_http_get(Str url, ValueId headers, SourceLoc loc = {}) {

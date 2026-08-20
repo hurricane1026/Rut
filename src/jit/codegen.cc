@@ -1786,6 +1786,19 @@ static void emit_instruction(Ctx& c, const rir::Instruction& inst) {
             LLVMBuildRet(c.builder, result);
             break;
         }
+        case rir::Opcode::RetRedirect: {
+            // The verifier rejects malformed redirect immediates. Keep the
+            // codegen boundary fail-closed too: an unverified zero/negative/
+            // wide value produces a Redirect with id 0, which dispatch rejects.
+            const i64 raw_id = inst.imm.i32_val;
+            const u64 policy_id = (raw_id > 0 && raw_id <= 0xffff) ?
+                                      static_cast<u64>(raw_id) : 0;
+            const u64 packed = static_cast<u64>(HandlerAction::Redirect) |
+                               (policy_id << 24);
+            c.emit_parse_unprime();
+            LLVMBuildRet(c.builder, LLVMConstInt(c.i64_ty, packed, 0));
+            break;
+        }
         case rir::Opcode::RetForward:
         case rir::Opcode::RetForwardBundle: {
             // Pack: action=Forward, upstream_id from operand. For the explicit

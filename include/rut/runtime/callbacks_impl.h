@@ -1930,6 +1930,21 @@ void handle_jit_outcome(Loop* loop,
             client_send(loop, conn, conn.send_buf.data(), conn.send_buf.len());
             return;
         }
+        case JitDispatchOutcome::Kind::Redirect: {
+            // Redirect serialization is intentionally not part of this
+            // increment. Validate the pinned metadata reference, then reject
+            // locally before request-policy handling or any upstream side
+            // effect. A malformed/forged id follows the same fail-closed path.
+            conn.pending_handler_fn = nullptr;
+            const RouteConfig* config = conn.request_config;
+            if (config == nullptr ||
+                !config->redirect_policy_id_is_valid(outcome.redirect_policy_id)) {
+                reject_response_policy(loop, conn);
+                return;
+            }
+            reject_response_policy(loop, conn);
+            return;
+        }
         case JitDispatchOutcome::Kind::TimerYield: {
             // Stash fn + next_state so the resume path can re-enter the
             // handler with ctx.state = handler_state. Slots stay clear —

@@ -18,6 +18,7 @@ enum class VerifyIssueCode : u8 {
     TerminatorBeforeEnd,
     InvalidBranchTarget,
     InvalidJumpTarget,
+    InvalidRedirectPolicyId,
     InvalidStateZeroEntry,
     InvalidResumeBlock,
     MissingYieldResumeMapping,
@@ -773,6 +774,16 @@ inline VerifyResult verify_function(const Function* fn,
                                    block.inst_count - 1,
                                    term.imm.block_targets[0].id);
             }
+        } else if (term.op == Opcode::RetRedirect) {
+            const i64 policy_id = term.imm.i32_val;
+            if (term.operand_count != 0 || policy_id <= 0 || policy_id > 0xffff) {
+                return verify_fail(summary,
+                                   VerifyIssueCode::InvalidRedirectPolicyId,
+                                   function_index,
+                                   bi,
+                                   block.inst_count - 1,
+                                   static_cast<u32>(policy_id));
+            }
         } else if (term.is_yield()) {
             if (term.op != Opcode::YieldTimer) {
                 return verify_fail(summary,
@@ -1037,6 +1048,8 @@ inline const char* verify_issue_code_name(VerifyIssueCode code) {
             return "InvalidBranchTarget";
         case VerifyIssueCode::InvalidJumpTarget:
             return "InvalidJumpTarget";
+        case VerifyIssueCode::InvalidRedirectPolicyId:
+            return "InvalidRedirectPolicyId";
         case VerifyIssueCode::InvalidStateZeroEntry:
             return "InvalidStateZeroEntry";
         case VerifyIssueCode::InvalidResumeBlock:

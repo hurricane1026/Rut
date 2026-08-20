@@ -514,6 +514,47 @@ TEST(RirPrinter, TargetTransformInstructionPrintsImmediateInFunction) {
     ctx.destroy();
 }
 
+TEST(RirRedirect, BuilderVerifierAndPrinterRejectInvalidIds) {
+    TestContext ctx;
+    REQUIRE(ctx.init());
+    Builder b;
+    b.init(&ctx.mod);
+    auto* fn = V(b.create_function(lit("redirect"), lit("/api"), 0));
+    auto entry = V(b.create_block(fn, lit("entry")));
+    b.set_insert_point(fn, entry);
+    CHECK_FALSE(static_cast<bool>(b.emit_ret_redirect(0)));
+    VOK(b.emit_ret_redirect(65535));
+    auto verify = verify_function(fn);
+    REQUIRE(verify.ok);
+    CHECK_EQ(fn->entry()->terminator()->op, Opcode::RetRedirect);
+    CHECK_EQ(fn->entry()->terminator()->imm.i32_val, 65535);
+
+    char data[512];
+    PrintBuf pb;
+    pb.init(data, sizeof(data), -1);
+    print_function(pb, *fn);
+    const Str output{pb.data, pb.len};
+    const Str expected = lit("ret.redirect 65535");
+    bool found = false;
+    for (u32 i = 0; i + expected.len <= output.len; i++) {
+        if (output.slice(i, i + expected.len).eq(expected)) {
+            found = true;
+            break;
+        }
+    }
+    CHECK(found);
+
+    fn->entry()->insts[fn->entry()->inst_count - 1].imm.i32_val = 0;
+    verify = verify_function(fn);
+    CHECK_FALSE(verify.ok);
+    CHECK_EQ(verify.issue.code, VerifyIssueCode::InvalidRedirectPolicyId);
+    fn->entry()->insts[fn->entry()->inst_count - 1].imm.i32_val = -1;
+    verify = verify_function(fn);
+    CHECK_FALSE(verify.ok);
+    CHECK_EQ(verify.issue.code, VerifyIssueCode::InvalidRedirectPolicyId);
+    ctx.destroy();
+}
+
 TEST(RirPrinter, TypeNames) {
     TestContext ctx;
     REQUIRE(ctx.init());
