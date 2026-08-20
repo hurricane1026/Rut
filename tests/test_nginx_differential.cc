@@ -7,6 +7,7 @@
 #include <cstring>
 #include <fcntl.h>
 #include <iostream>
+#include <poll.h>
 #include <pthread.h>
 #include <signal.h>
 #include <string>
@@ -37,14 +38,34 @@ static constexpr char kBackendResponse[] =
 struct Child {
     pid_t pid = -1;
     std::string log_path;
+    int status = 0;
+    bool reaped = false;
+    bool status_valid = false;
 };
 
-static bool wait_child(pid_t pid, int& status, int timeout_ms) {
+static bool poll_child(Child& child) {
+    if (child.pid < 0) return child.reaped;
+    if (child.reaped) return true;
+    int status = 0;
+    const pid_t rc = waitpid(child.pid, &status, WNOHANG);
+    if (rc == child.pid) {
+        child.status = status;
+        child.status_valid = true;
+        child.reaped = true;
+        return true;
+    }
+    if (rc < 0 && errno == EINTR) return false;
+    if (rc < 0) {
+        child.reaped = true;
+        child.status_valid = false;
+        return true;
+    }
+    return false;
+}
+
+static bool wait_child(Child& child, int timeout_ms) {
     for (int elapsed = 0; elapsed < timeout_ms; elapsed += 20) {
-        const pid_t rc = waitpid(pid, &status, WNOHANG);
-        if (rc == pid) return true;
-        if (rc < 0 && errno == ECHILD) return true;
-        if (rc < 0 && errno != EINTR) return false;
+        if (poll_child(child)) return true;
         usleep(20'000);
     }
     return false;
@@ -69,37 +90,63 @@ static bool spawn_child(const std::vector<std::string>& args,
     }
     child.pid = pid;
     child.log_path = log_path;
+    child.status = 0;
+    child.reaped = false;
+    child.status_valid = false;
     return true;
 }
 
 static bool stop_child(Child& child) {
     if (child.pid < 0) return true;
-    kill(child.pid, SIGTERM);
-    int status = 0;
-    if (!wait_child(child.pid, status, 3000)) {
+    if (poll_child(child)) {
+        child.pid = -1;
+        return false;
+    }
+    if (kill(child.pid, SIGTERM) != 0) {
+        if (errno != ESRCH) {
+            (void)kill(child.pid, SIGKILL);
+            (void)wait_child(child, 2000);
+        } else {
+            (void)poll_child(child);
+        }
+        child.pid = -1;
+        return false;
+    }
+    if (!wait_child(child, 3000)) {
         kill(child.pid, SIGKILL);
-        if (!wait_child(child.pid, status, 2000)) {
-            (void)waitpid(child.pid, &status, 0);
+        const bool reaped = wait_child(child, 2000);
+        if (!reaped) {
+            const pid_t rc = waitpid(child.pid, &child.status, 0);
+            child.reaped = rc == child.pid;
+            child.status_valid = child.reaped;
             child.pid = -1;
             return false;
         }
+        child.pid = -1;
+        // SIGKILL was needed for cleanup; this is always a test failure.
+        return false;
     }
+    const bool clean = child.status_valid &&
+                       ((WIFEXITED(child.status) && WEXITSTATUS(child.status) == 0) ||
+                        (WIFSIGNALED(child.status) && WTERMSIG(child.status) == SIGTERM));
     child.pid = -1;
-    return WIFEXITED(status) || WIFSIGNALED(status);
+    return clean;
 }
 
-static bool command_ok(const std::vector<std::string>& args) {
+static bool command_ok(const std::vector<std::string>& args,
+                       const std::string& log_path = "/dev/null") {
     Child child;
-    if (!spawn_child(args, "/dev/null", child)) return false;
-    int status = 0;
-    if (!wait_child(child.pid, status, 10'000)) {
+    if (!spawn_child(args, log_path, child)) return false;
+    if (!wait_child(child, 10'000)) {
         kill(child.pid, SIGKILL);
-        waitpid(child.pid, &status, 0);
+        const pid_t rc = waitpid(child.pid, &child.status, 0);
+        child.reaped = rc == child.pid;
+        child.status_valid = child.reaped;
         child.pid = -1;
         return false;
     }
     child.pid = -1;
-    return WIFEXITED(status) && WEXITSTATUS(status) == 0;
+    return child.status_valid && WIFEXITED(child.status) && WEXITSTATUS(child.status) == 0;
 }
 
 struct ChildGuard {
@@ -132,6 +179,7 @@ struct TempDir {
     std::string nginx_config;
     std::string nginx_log;
     std::string rut_log;
+    std::string preflight_log;
 
     bool create() {
         if (!mkdtemp(path)) return false;
@@ -140,6 +188,7 @@ struct TempDir {
         nginx_config = std::string(path) + "/nginx.conf";
         nginx_log = std::string(path) + "/nginx.log";
         rut_log = std::string(path) + "/rut.log";
+        preflight_log = std::string(path) + "/preflight.log";
         return true;
     }
 
@@ -149,6 +198,7 @@ struct TempDir {
             unlink(nginx_config.c_str());
             unlink(nginx_log.c_str());
             unlink(rut_log.c_str());
+            unlink(preflight_log.c_str());
             rmdir(path);
         }
     }
@@ -206,11 +256,9 @@ static int connect_once(u16 port) {
     return fd;
 }
 
-static bool wait_ready(u16 port, const Child& child, std::string& error) {
+static bool wait_ready(u16 port, Child& child, std::string& error) {
     for (int attempt = 0; attempt < 200; attempt++) {
-        int status = 0;
-        const pid_t rc = waitpid(child.pid, &status, WNOHANG);
-        if (rc == child.pid) {
+        if (poll_child(child)) {
             error = "process exited before readiness";
             return false;
         }
@@ -320,30 +368,54 @@ struct Recorder {
         auto* self = static_cast<Recorder*>(opaque);
         const int fd = self->listen_fd;
         while (self->running.load(std::memory_order_acquire)) {
-            const int client = accept(fd, nullptr, nullptr);
-            if (client < 0) {
+            pollfd listener_poll{fd, POLLIN, 0};
+            const int ready = poll(&listener_poll, 1, 50);
+            if (ready < 0) {
                 if (errno == EINTR) continue;
                 break;
             }
+            if (!self->running.load(std::memory_order_acquire)) break;
+            if (ready == 0 || !(listener_poll.revents & POLLIN)) continue;
+            const int client = accept(fd, nullptr, nullptr);
+            if (client < 0) {
+                if (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK) continue;
+                break;
+            }
             self->accepted.fetch_add(1, std::memory_order_release);
-            timeval timeout{2, 0};
-            setsockopt(client, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
+            const int flags = fcntl(client, F_GETFL, 0);
+            if (flags < 0 || fcntl(client, F_SETFL, flags | O_NONBLOCK) != 0) {
+                close(client);
+                continue;
+            }
+            timeval send_timeout{0, 200000};
+            (void)setsockopt(client, SOL_SOCKET, SO_SNDTIMEO, &send_timeout, sizeof(send_timeout));
             std::vector<char> wire;
             char buf[4096];
-            for (int attempt = 0; attempt < 100; attempt++) {
+            for (;;) {
+                pollfd client_poll{client, POLLIN, 0};
+                const int client_ready = poll(&client_poll, 1, 50);
+                if (client_ready < 0) {
+                    if (errno == EINTR) continue;
+                    break;
+                }
+                if (!self->running.load(std::memory_order_acquire)) break;
+                if (client_ready == 0) continue;
                 const ssize_t n = recv(client, buf, sizeof(buf), 0);
                 if (n > 0) {
                     wire.insert(wire.end(), buf, buf + n);
                     if (header_end(wire) != 0) break;
-                } else if (n < 0 && errno == EINTR) {
+                } else if (n < 0 && (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK)) {
                     continue;
                 } else {
                     break;
                 }
             }
-            self->request = wire;
-            self->requests.fetch_add(1, std::memory_order_release);
-            (void)send_all(client, kBackendResponse, sizeof(kBackendResponse) - 1);
+            const bool complete = header_end(wire) != 0;
+            if (complete) {
+                self->request = wire;
+                self->requests.fetch_add(1, std::memory_order_release);
+                (void)send_all(client, kBackendResponse, sizeof(kBackendResponse) - 1);
+            }
             shutdown(client, SHUT_RDWR);
             close(client);
             self->running.store(false, std::memory_order_release);
@@ -374,6 +446,12 @@ struct Recorder {
                 listen_fd = -1;
                 continue;
             }
+            const int flags = fcntl(listen_fd, F_GETFL, 0);
+            if (flags < 0 || fcntl(listen_fd, F_SETFL, flags | O_NONBLOCK) != 0) {
+                close(listen_fd);
+                listen_fd = -1;
+                continue;
+            }
             port = ntohs(addr.sin_port);
             accepted.store(0, std::memory_order_relaxed);
             requests.store(0, std::memory_order_relaxed);
@@ -393,14 +471,14 @@ struct Recorder {
 
     void stop() {
         running.store(false, std::memory_order_release);
+        if (thread_started) {
+            pthread_join(thread, nullptr);
+            thread_started = false;
+        }
         if (listen_fd >= 0) {
             shutdown(listen_fd, SHUT_RDWR);
             close(listen_fd);
             listen_fd = -1;
-        }
-        if (thread_started) {
-            pthread_join(thread, nullptr);
-            thread_started = false;
         }
     }
 
@@ -437,6 +515,65 @@ static void dump_wire(const char* label, const std::vector<char>& wire) {
     std::cerr << std::dec << "\n";
 }
 
+static void dump_log(const std::string& path, const char* label) {
+    const int fd = open(path.c_str(), O_RDONLY);
+    std::cerr << label << " (max 8192 bytes):\n";
+    if (fd < 0) {
+        std::cerr << "<unavailable>\n";
+        return;
+    }
+    char buf[1024];
+    size_t total = 0;
+    while (total < 8192) {
+        const size_t want = sizeof(buf) < 8192 - total ? sizeof(buf) : 8192 - total;
+        const ssize_t n = read(fd, buf, want);
+        if (n > 0) {
+            std::cerr.write(buf, n);
+            total += static_cast<size_t>(n);
+            continue;
+        }
+        if (n < 0 && errno == EINTR) continue;
+        break;
+    }
+    if (total == 0) std::cerr << "<empty>\n";
+    else if (total == 8192) std::cerr << "\n<truncated>\n";
+    close(fd);
+}
+
+static bool log_contains(const std::string& path, const char* needle) {
+    const int fd = open(path.c_str(), O_RDONLY);
+    if (fd < 0) return false;
+    std::string contents;
+    char buf[1024];
+    while (contents.size() < 8192) {
+        const size_t want = sizeof(buf) < 8192 - contents.size() ? sizeof(buf) : 8192 - contents.size();
+        const ssize_t n = read(fd, buf, want);
+        if (n > 0) {
+            contents.append(buf, static_cast<size_t>(n));
+            continue;
+        }
+        if (n < 0 && errno == EINTR) continue;
+        break;
+    }
+    close(fd);
+    return contents.find(needle) != std::string::npos;
+}
+
+static bool log_empty(const std::string& path) {
+    const int fd = open(path.c_str(), O_RDONLY);
+    if (fd < 0) return true;
+    char byte = 0;
+    const ssize_t n = read(fd, &byte, 1);
+    close(fd);
+    return n == 0;
+}
+
+static bool starts_with_200(const std::vector<char>& response) {
+    static constexpr char kStatus[] = "HTTP/1.1 200 ";
+    return response.size() >= sizeof(kStatus) - 1 &&
+           memcmp(response.data(), kStatus, sizeof(kStatus) - 1) == 0;
+}
+
 static int missing_prerequisite(const char* message) {
     std::cerr << "SKIP: " << message << "\n";
     const char* required = getenv("RUT_NGINX_DIFFERENTIAL_REQUIRED");
@@ -447,7 +584,8 @@ static bool capture_case(u16 frontend_port,
                          u16 backend_port,
                          const std::string& source_path,
                          const std::string& nginx_config_path,
-                         const std::string& log_path,
+                         const std::string& nginx_log_path,
+                         const std::string& rut_log_path,
                          const std::string& rut_path,
                          const std::string& container_name,
                          std::vector<char>& nginx_downstream,
@@ -466,9 +604,9 @@ static bool capture_case(u16 frontend_port,
     DockerGuard docker(container_name);
     ChildGuard nginx;
     if (!spawn_child({"docker", "run", "--rm", "--pull=never", "--network", "host", "--name",
-                      container_name, "-v", nginx_config_path + ":/etc/nginx/nginx.conf:ro",
-                      kNginxImage, "nginx", "-g", "daemon off;"},
-                     log_path,
+                     container_name, "-v", nginx_config_path + ":/etc/nginx/nginx.conf:ro",
+                     kNginxImage, "nginx", "-g", "daemon off;"},
+                     nginx_log_path,
                      nginx.child)) {
         error = "failed to start pinned nginx";
         return false;
@@ -504,7 +642,7 @@ static bool capture_case(u16 frontend_port,
     }
     ChildGuard rut;
     if (!spawn_child({rut_path, source_path, "--shards", "1", "--no-pin", "--drain", "0"},
-                     log_path,
+                     rut_log_path,
                      rut.child)) {
         error = "failed to start production RUT";
         return false;
@@ -550,14 +688,38 @@ int main(int argc, char** argv) {
 #ifndef __linux__
     return missing_prerequisite("pinned nginx differential requires Linux host networking");
 #else
-    if (!command_ok({"docker", "info"}) || !command_ok({"docker", "image", "inspect", kNginxImage}) ||
-        !command_ok({"docker", "run", "--rm", "--pull=never", "--network", "host", kNginxImage,
-                     "nginx", "-v"}))
-        return missing_prerequisite("Docker daemon, exact local image, or host networking unavailable");
-
     TempDir temp;
     if (!temp.create()) {
         std::cerr << "FAIL [preflight]: secure temporary directory creation failed\n";
+        return 1;
+    }
+    if (!command_ok({"docker", "info"}, temp.preflight_log)) {
+        if (log_contains(temp.preflight_log, "Cannot connect to the Docker daemon") ||
+            log_contains(temp.preflight_log, "Is the docker daemon running") ||
+            log_empty(temp.preflight_log) ||
+            access(temp.preflight_log.c_str(), F_OK) != 0)
+            return missing_prerequisite("Docker daemon unavailable");
+        std::cerr << "FAIL [preflight]: Docker daemon probe failed\n";
+        dump_log(temp.preflight_log, "Docker preflight log");
+        return 1;
+    }
+    if (!command_ok({"docker", "image", "inspect", kNginxImage}, temp.preflight_log)) {
+        if (log_contains(temp.preflight_log, "No such image") ||
+            log_contains(temp.preflight_log, "No such object") ||
+            log_contains(temp.preflight_log, "not found"))
+            return missing_prerequisite("exact pinned nginx image is not available locally");
+        std::cerr << "FAIL [preflight]: exact pinned nginx image inspection failed\n";
+        dump_log(temp.preflight_log, "Docker preflight log");
+        return 1;
+    }
+
+    // This is a real host-network startup probe. Once daemon and image
+    // inspection succeeded, all failures here are test failures rather than
+    // silently becoming a skipped compatibility result.
+    if (!command_ok({"docker", "run", "--rm", "--pull=never", "--network", "host", kNginxImage,
+                     "nginx", "-v"}, temp.preflight_log)) {
+        std::cerr << "FAIL [preflight]: Docker host-network startup probe failed\n";
+        dump_log(temp.preflight_log, "Docker preflight log");
         return 1;
     }
     u16 frontend_port = 0;
@@ -598,12 +760,15 @@ int main(int argc, char** argv) {
     std::vector<char> nginx_request;
     std::vector<char> rut_request;
     std::string error;
-    const std::string container = "rut-nginx-diff-" + std::to_string(getpid());
+    const char* suffix = strrchr(temp.path, '/');
+    suffix = suffix ? suffix + 1 : temp.path;
+    const std::string container = "rut-nginx-diff-" + std::to_string(getpid()) + "-" + suffix;
     if (!capture_case(frontend_port,
                       backend_port,
                       temp.source,
                       temp.nginx_config,
                       temp.nginx_log,
+                      temp.rut_log,
                       argv[1],
                       container,
                       nginx_response,
@@ -613,6 +778,17 @@ int main(int argc, char** argv) {
                       error)) {
         std::cerr << "FAIL [differential]: " << error << "\n";
         dump_wire("nginx response", nginx_response);
+        dump_wire("RUT response", rut_response);
+        dump_log(temp.nginx_log, "nginx log");
+        dump_log(temp.rut_log, "RUT log");
+        return 1;
+    }
+    if (!starts_with_200(nginx_response) || !starts_with_200(rut_response)) {
+        std::cerr << "FAIL [compare]: one or both complete responses were not HTTP/1.1 200\n";
+        dump_wire("nginx response", nginx_response);
+        dump_wire("RUT response", rut_response);
+        dump_log(temp.nginx_log, "nginx log");
+        dump_log(temp.rut_log, "RUT log");
         return 1;
     }
     std::vector<char> normalized_nginx = nginx_response;
@@ -622,6 +798,8 @@ int main(int argc, char** argv) {
         std::cerr << "FAIL [compare]: downstream response mismatch after Date normalization\n";
         dump_wire("nginx response", nginx_response);
         dump_wire("RUT response", rut_response);
+        dump_log(temp.nginx_log, "nginx log");
+        dump_log(temp.rut_log, "RUT log");
         return 1;
     }
     const std::string request(nginx_request.begin(), nginx_request.end());
@@ -631,6 +809,8 @@ int main(int argc, char** argv) {
         std::cerr << "FAIL [compare]: upstream request mismatch or target was decoded\n";
         dump_wire("nginx request", nginx_request);
         dump_wire("RUT request", rut_request);
+        dump_log(temp.nginx_log, "nginx log");
+        dump_log(temp.rut_log, "RUT log");
         return 1;
     }
     const std::string expected_request =
@@ -642,6 +822,8 @@ int main(int argc, char** argv) {
     if (request != expected_request) {
         std::cerr << "FAIL [assertions]: upstream request policy invariant failed\n";
         dump_wire("upstream request", nginx_request);
+        dump_log(temp.nginx_log, "nginx log");
+        dump_log(temp.rut_log, "RUT log");
         return 1;
     }
     std::cerr << "PASS: pinned nginx and RUT differential success case\n";
