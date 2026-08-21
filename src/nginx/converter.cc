@@ -121,28 +121,56 @@ FrontendResult<RutSource> lower_to_rut(const Server& server) {
 
     if (is_root) {
         if (!put("route \"/\" {\n") ||
-            !put("    return forward(nginx_upstream, request_policy: {\n") ||
-            !put("        version: \"HTTP/1.1\",\n") ||
-            !put("        host: \"upstream\",\n") ||
-            !put("        connection: \"omit\",\n") ||
-            !put("        strip_headers: [\"Connection\", \"Keep-Alive\", \"TE\", \"Expect\", \"Upgrade\"]\n") ||
-            !put("    }, response_policy: {\n") ||
-            !put("        version: \"HTTP/1.1\",\n") ||
-            !put("        framing: \"content_length\",\n") ||
-            !put("        connection: \"request\",\n") ||
-            !put("        server: \"nginx/1.29.7\",\n") ||
-            !put("        date: \"current\",\n") ||
-            !put("        hide_headers: [\"Date\", \"Server\", \"X-Pad\"]\n") ||
-            !put("    }, failure_policy: {\n") ||
-            !put("        version: \"HTTP/1.1\",\n") ||
-            !put("        status: 502,\n") ||
-            !put("        reason: \"Bad Gateway\",\n") ||
-            !put("        content_type: \"text/html\",\n") ||
-            !put("        server: \"nginx/1.29.7\",\n") ||
-            !put("        date: \"current\",\n") ||
-            !put("        connection: \"request\",\n") ||
-            !put("        body: b\"<html>\\r\\n<head><title>502 Bad Gateway</title></head>\\r\\n<body>\\r\\n<center><h1>502 Bad Gateway</h1></center>\\r\\n<hr><center>nginx/1.29.7</center>\\r\\n</body>\\r\\n</html>\\r\\n\"\n") ||
-            !put("    })\n") || !put("}\n"))
+            !put("    if req.method == HEAD {\n") ||
+            !put("        return forward(nginx_upstream, request_policy: {\n") ||
+            !put("            version: \"HTTP/1.1\",\n") ||
+            !put("            host: \"upstream\",\n") ||
+            !put("            connection: \"omit\",\n") ||
+            !put("            strip_headers: [\"Connection\", \"Keep-Alive\", \"TE\", \"Expect\", \"Upgrade\"]\n") ||
+            !put("        }, response_policy: {\n") ||
+            !put("            version: \"HTTP/1.1\",\n") ||
+            !put("            framing: \"content_length\",\n") ||
+            !put("            connection: \"request\",\n") ||
+            !put("            head_mode: \"suppress_body\",\n") ||
+            !put("            server: \"nginx/1.29.7\",\n") ||
+            !put("            date: \"current\",\n") ||
+            !put("            hide_headers: [\"Date\", \"Server\", \"X-Pad\"]\n") ||
+            !put("        }, failure_policy: {\n") ||
+            !put("            version: \"HTTP/1.1\",\n") ||
+            !put("            status: 502,\n") ||
+            !put("            reason: \"Bad Gateway\",\n") ||
+            !put("            content_type: \"text/html\",\n") ||
+            !put("            server: \"nginx/1.29.7\",\n") ||
+            !put("            date: \"current\",\n") ||
+            !put("            connection: \"request\",\n") ||
+            !put("            head_mode: \"suppress_body\",\n") ||
+            !put("            body: b\"<html>\\r\\n<head><title>502 Bad Gateway</title></head>\\r\\n<body>\\r\\n<center><h1>502 Bad Gateway</h1></center>\\r\\n<hr><center>nginx/1.29.7</center>\\r\\n</body>\\r\\n</html>\\r\\n\"\n") ||
+            !put("        })\n") ||
+            !put("    } else {\n") ||
+            !put("        return forward(nginx_upstream, request_policy: {\n") ||
+            !put("            version: \"HTTP/1.1\",\n") ||
+            !put("            host: \"upstream\",\n") ||
+            !put("            connection: \"omit\",\n") ||
+            !put("            strip_headers: [\"Connection\", \"Keep-Alive\", \"TE\", \"Expect\", \"Upgrade\"]\n") ||
+            !put("        }, response_policy: {\n") ||
+            !put("            version: \"HTTP/1.1\",\n") ||
+            !put("            framing: \"content_length\",\n") ||
+            !put("            connection: \"request\",\n") ||
+            !put("            server: \"nginx/1.29.7\",\n") ||
+            !put("            date: \"current\",\n") ||
+            !put("            hide_headers: [\"Date\", \"Server\", \"X-Pad\"]\n") ||
+            !put("        }, failure_policy: {\n") ||
+            !put("            version: \"HTTP/1.1\",\n") ||
+            !put("            status: 502,\n") ||
+            !put("            reason: \"Bad Gateway\",\n") ||
+            !put("            content_type: \"text/html\",\n") ||
+            !put("            server: \"nginx/1.29.7\",\n") ||
+            !put("            date: \"current\",\n") ||
+            !put("            connection: \"request\",\n") ||
+            !put("            body: b\"<html>\\r\\n<head><title>502 Bad Gateway</title></head>\\r\\n<body>\\r\\n<center><h1>502 Bad Gateway</h1></center>\\r\\n<hr><center>nginx/1.29.7</center>\\r\\n</body>\\r\\n</html>\\r\\n\"\n") ||
+            !put("        })\n") ||
+            !put("    }\n") ||
+            !put("}\n"))
             return fail_overflow();
         return output;
     }
