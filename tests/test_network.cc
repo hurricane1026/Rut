@@ -11696,6 +11696,63 @@ bool connect_real_upstream(RealEpollEpisodeGuard& guard,
     if (!accept_real_upstream_peer(listener_fd, peer_fd)) return false;
     return wait_for_real_upstream_completion(loop, completion);
 }
+
+bool fill_real_tcp_send_queue(i32 sender, i32 peer, u8 pattern, u32& accepted) {
+    static constexpr u32 kMaxFill = 4u * 1024u * 1024u;
+    static constexpr u32 kMaxSendCalls = 65536;
+    i32 small_buffer = 4096;
+    if (setsockopt(sender, SOL_SOCKET, SO_SNDBUF, &small_buffer, sizeof(small_buffer)) != 0 ||
+        setsockopt(peer, SOL_SOCKET, SO_RCVBUF, &small_buffer, sizeof(small_buffer)) != 0)
+        return false;
+
+    u8 filler[4096];
+    __builtin_memset(filler, pattern, sizeof(filler));
+    accepted = 0;
+    for (u32 call = 0; call < kMaxSendCalls && accepted < kMaxFill; call++) {
+        const u32 requested = std::min<u32>(sizeof(filler), static_cast<u32>(kMaxFill - accepted));
+        const ssize_t nw = send(sender, filler, requested, MSG_NOSIGNAL);
+        if (nw > 0) {
+            accepted += static_cast<u32>(nw);
+            continue;
+        }
+        if (nw < 0 && errno == EINTR) continue;
+        if (nw < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+            struct pollfd writable{sender, POLLOUT, 0};
+            return accepted > 0 && poll(&writable, 1, 0) == 0;
+        }
+        return false;
+    }
+    return false;
+}
+
+bool drain_exact_tcp_filler(i32 peer, u32 expected, u8 pattern) {
+    static constexpr u32 kMaxPolls = 64;
+    static constexpr u32 kMaxRecvCalls = 65536;
+    u8 observed[8192];
+    u32 received = 0;
+    u32 recv_calls = 0;
+    for (u32 poll_attempt = 0;
+         poll_attempt < kMaxPolls && received < expected && recv_calls < kMaxRecvCalls;
+         poll_attempt++) {
+        struct pollfd readable{peer, POLLIN, 0};
+        if (poll(&readable, 1, 100) <= 0) continue;
+        while (received < expected && recv_calls++ < kMaxRecvCalls) {
+            const u32 wanted = std::min<u32>(sizeof(observed), expected - received);
+            const ssize_t nr = recv(peer, observed, wanted, MSG_DONTWAIT);
+            if (nr > 0) {
+                for (ssize_t i = 0; i < nr; i++) {
+                    if (observed[i] != pattern) return false;
+                }
+                received += static_cast<u32>(nr);
+                continue;
+            }
+            if (nr < 0 && errno == EINTR) continue;
+            if (nr < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) break;
+            return false;
+        }
+    }
+    return received == expected;
+}
 }  // namespace
 
 TEST(epoll_episode, dispatch_rejects_stale_tag_before_callback) {
@@ -12546,6 +12603,379 @@ TEST(epoll_episode_lifecycle, harvested_raw_connect_is_fenced_across_terminal_sa
     CHECK_EQ(g_epoll_episode_callback_count, 1u);
     CHECK(held.replay_consumed());
     CHECK_FALSE(held.failed_closed());
+}
+
+TEST(epoll_episode_lifecycle, harvested_raw_partial_send_is_fenced_across_terminal_same_fd_reuse) {
+    const u8 first_payload[] = {'e', 'p', 'i', 's', 'o', 'd', 'e', '-', 'o', 'n', 'e'};
+    const u8 current_payload[] = {'e',
+                                  'p',
+                                  'i',
+                                  's',
+                                  'o',
+                                  'd',
+                                  'e',
+                                  '-',
+                                  't',
+                                  'w',
+                                  'o',
+                                  '-',
+                                  'c',
+                                  'u',
+                                  'r',
+                                  'r',
+                                  'e',
+                                  'n',
+                                  't'};
+    static constexpr u8 kFirstFiller = 0x51;
+    static constexpr u8 kCurrentFiller = 0xa7;
+
+    RealEpollEpisodeGuard guard{};
+    REQUIRE(guard.create());
+    REQUIRE(guard.init());
+    auto* loop = guard.loop;
+    struct itimerspec disarmed_timer{};
+    REQUIRE_EQ(timerfd_settime(loop->backend.timer_fd, 0, &disarmed_timer, nullptr), 0);
+    REQUIRE_EQ(timerfd_settime(loop->backend.yield_timer_fd, 0, &disarmed_timer, nullptr), 0);
+
+    auto listener_result = create_listen_socket(0);
+    REQUIRE(listener_result.has_value());
+    guard.listener_fd = listener_result.value();
+    const i32 listener_fd = guard.listener_fd;
+
+    Connection* first_conn = guard.alloc_conn();
+    REQUIRE(first_conn != nullptr);
+    const u32 conn_id = first_conn->id;
+    const u32 first_episode = first_conn->upstream_episode;
+    REQUIRE_EQ(first_episode, 1u);
+    IoEvent first_connect{};
+    REQUIRE(
+        connect_real_upstream(guard, *first_conn, listener_fd, guard.peer_fds[0], first_connect));
+    REQUIRE_EQ(first_connect.type, IoEventType::UpstreamConnect);
+    REQUIRE_EQ(first_connect.result, 0);
+    REQUIRE_EQ(first_connect.conn_id, conn_id);
+    REQUIRE_EQ(first_connect.upstream_episode, first_episode);
+    REQUIRE_EQ(loop->backend.pending_count, 0u);
+    const i32 first_fd = first_conn->upstream_fd;
+    REQUIRE_GE(first_fd, 0);
+    REQUIRE_EQ(loop->backend.active_upstream_episode[conn_id], first_episode);
+    REQUIRE_EQ(loop->backend.upstream_fd_map[conn_id], first_fd);
+    g_epoll_episode_callback_count = 0;
+    first_conn->on_upstream_send = &epoll_episode_counting_callback;
+    loop->dispatch(first_connect);
+    REQUIRE_EQ(g_epoll_episode_callback_count, 1u);
+
+    u32 first_filler_bytes = 0;
+    REQUIRE(
+        fill_real_tcp_send_queue(first_fd, guard.peer_fds[0], kFirstFiller, first_filler_bytes));
+    REQUIRE_GT(first_filler_bytes, 0u);
+    REQUIRE(loop->submit_send_upstream(*first_conn, first_payload, sizeof(first_payload)));
+    REQUIRE_EQ(loop->backend.pending_count, 0u);
+    const auto& first_send = loop->backend.upstream_send_state[conn_id];
+    REQUIRE_EQ(first_send.src, first_payload);
+    REQUIRE_EQ(first_send.fd, first_fd);
+    REQUIRE_EQ(first_send.offset, 0u);
+    REQUIRE_EQ(first_send.remaining, sizeof(first_payload));
+    REQUIRE_EQ(first_send.type, IoEventType::UpstreamSend);
+    REQUIRE_FALSE(first_send.tls);
+    REQUIRE_EQ(first_send.tls_wait_events, 0u);
+    REQUIRE_EQ(first_send.upstream_episode, first_episode);
+
+    {
+        ScopedHeldEpollEvent held(loop->backend.epoll_fd);
+        REQUIRE(held.owns_state());
+        REQUIRE(held.arm_capture_once());
+        REQUIRE(drain_exact_tcp_filler(guard.peer_fds[0], first_filler_bytes, kFirstFiller));
+        char unexpected_byte = 0;
+        errno = 0;
+        REQUIRE_EQ(recv(guard.peer_fds[0], &unexpected_byte, 1, MSG_PEEK | MSG_DONTWAIT), -1);
+        REQUIRE(errno == EAGAIN || errno == EWOULDBLOCK);
+        struct pollfd first_sender_ready{first_fd, POLLOUT, 0};
+        REQUIRE_GT(poll(&first_sender_ready, 1, 1000), 0);
+        REQUIRE_NE(first_sender_ready.revents & POLLOUT, 0);
+        struct pollfd first_epoll_ready{loop->backend.epoll_fd, POLLIN, 0};
+        REQUIRE_GT(poll(&first_epoll_ready, 1, 1000), 0);
+        REQUIRE_NE(first_epoll_ready.revents & POLLIN, 0);
+
+        IoEvent suppressed{};
+        REQUIRE_EQ(loop->backend.wait(&suppressed, 1, loop->conns, EpollEventLoop::kMaxConns), 0u);
+        REQUIRE(held.captured());
+        REQUIRE_FALSE(held.capture_armed());
+        REQUIRE_FALSE(held.failed_closed());
+        const u32 captured_raw_events = held.captured_events();
+        const u64 captured_raw_data = held.captured_data();
+        REQUIRE_NE(captured_raw_events & EPOLLOUT, 0u);
+        REQUIRE_EQ(captured_raw_events & (EPOLLHUP | EPOLLERR | EPOLLRDHUP), 0u);
+        UpstreamEventToken captured_token{};
+        REQUIRE(decode_upstream_event_token(captured_raw_data, &captured_token));
+        REQUIRE_EQ(captured_token.conn_id, conn_id);
+        REQUIRE_EQ(captured_token.type, IoEventType::UpstreamRecv);
+        REQUIRE_EQ(captured_token.episode, first_episode);
+        REQUIRE_EQ(captured_token.aux, 0u);
+        const auto& first_send_after_capture = loop->backend.upstream_send_state[conn_id];
+        REQUIRE_EQ(first_send_after_capture.src, first_payload);
+        REQUIRE_EQ(first_send_after_capture.fd, first_fd);
+        REQUIRE_EQ(first_send_after_capture.offset, 0u);
+        REQUIRE_EQ(first_send_after_capture.remaining, sizeof(first_payload));
+        REQUIRE_EQ(first_send_after_capture.type, IoEventType::UpstreamSend);
+        REQUIRE_FALSE(first_send_after_capture.tls);
+        REQUIRE_EQ(first_send_after_capture.tls_wait_events, 0u);
+        REQUIRE_EQ(first_send_after_capture.upstream_episode, first_episode);
+        errno = 0;
+        REQUIRE_EQ(recv(guard.peer_fds[0], &unexpected_byte, 1, MSG_PEEK | MSG_DONTWAIT), -1);
+        REQUIRE(errno == EAGAIN || errno == EWOULDBLOCK);
+
+        // Production terminal teardown removes the live registration, drops
+        // partial-send state, retires episode 1, closes the socket, and frees
+        // the allocator slot before the same numeric fd is reused.
+        guard.close_conn(*first_conn);
+        REQUIRE_EQ(loop->backend.active_upstream_episode[conn_id], 0u);
+        REQUIRE_EQ(loop->backend.upstream_fd_map[conn_id], -1);
+        const auto& retired_first_send = loop->backend.upstream_send_state[conn_id];
+        REQUIRE_EQ(retired_first_send.src, nullptr);
+        REQUIRE_EQ(retired_first_send.fd, -1);
+        REQUIRE_EQ(retired_first_send.offset, 0u);
+        REQUIRE_EQ(retired_first_send.remaining, 0u);
+        REQUIRE_EQ(retired_first_send.type, IoEventType::UpstreamSend);
+        REQUIRE_FALSE(retired_first_send.tls);
+        REQUIRE_EQ(retired_first_send.tls_wait_events, 0u);
+        REQUIRE_EQ(retired_first_send.upstream_episode, 0u);
+        errno = 0;
+        REQUIRE_EQ(fcntl(first_fd, F_GETFD), -1);
+        REQUIRE_EQ(errno, EBADF);
+
+        Connection* current_conn = guard.alloc_conn();
+        REQUIRE(current_conn != nullptr);
+        REQUIRE_EQ(current_conn, first_conn);
+        REQUIRE_EQ(current_conn->id, conn_id);
+        const u32 current_episode = current_conn->upstream_episode;
+        REQUIRE_EQ(current_episode, first_episode + 1);
+        IoEvent current_connect{};
+        REQUIRE(connect_real_upstream(
+            guard, *current_conn, listener_fd, guard.peer_fds[1], current_connect));
+        const i32 current_fd = current_conn->upstream_fd;
+        REQUIRE_EQ(current_fd, first_fd);
+        REQUIRE_EQ(current_connect.type, IoEventType::UpstreamConnect);
+        REQUIRE_EQ(current_connect.result, 0);
+        REQUIRE_EQ(current_connect.conn_id, conn_id);
+        REQUIRE_EQ(current_connect.upstream_episode, current_episode);
+        REQUIRE_EQ(loop->backend.pending_count, 0u);
+        REQUIRE_EQ(loop->backend.active_upstream_episode[conn_id], current_episode);
+        REQUIRE_EQ(loop->backend.upstream_fd_map[conn_id], current_fd);
+        g_epoll_episode_callback_count = 0;
+        current_conn->on_upstream_send = &epoll_episode_counting_callback;
+        loop->dispatch(current_connect);
+        REQUIRE_EQ(g_epoll_episode_callback_count, 1u);
+
+        u32 current_filler_bytes = 0;
+        REQUIRE(fill_real_tcp_send_queue(
+            current_fd, guard.peer_fds[1], kCurrentFiller, current_filler_bytes));
+        REQUIRE_GT(current_filler_bytes, 0u);
+        REQUIRE(
+            loop->submit_send_upstream(*current_conn, current_payload, sizeof(current_payload)));
+        REQUIRE_EQ(loop->backend.pending_count, 0u);
+        const auto& current_send = loop->backend.upstream_send_state[conn_id];
+        REQUIRE_EQ(current_send.src, current_payload);
+        REQUIRE_EQ(current_send.fd, current_fd);
+        REQUIRE_EQ(current_send.offset, 0u);
+        REQUIRE_EQ(current_send.remaining, sizeof(current_payload));
+        REQUIRE_EQ(current_send.type, IoEventType::UpstreamSend);
+        REQUIRE_FALSE(current_send.tls);
+        REQUIRE_EQ(current_send.tls_wait_events, 0u);
+        REQUIRE_EQ(current_send.upstream_episode, current_episode);
+        REQUIRE_EQ(loop->backend.active_upstream_episode[conn_id], current_episode);
+        REQUIRE_EQ(loop->backend.upstream_fd_map[conn_id], current_fd);
+        REQUIRE(drain_exact_tcp_filler(guard.peer_fds[1], current_filler_bytes, kCurrentFiller));
+        errno = 0;
+        REQUIRE_EQ(recv(guard.peer_fds[1], &unexpected_byte, 1, MSG_PEEK | MSG_DONTWAIT), -1);
+        REQUIRE(errno == EAGAIN || errno == EWOULDBLOCK);
+        struct pollfd current_sender_ready{current_fd, POLLOUT, 0};
+        REQUIRE_GT(poll(&current_sender_ready, 1, 1000), 0);
+        REQUIRE_NE(current_sender_ready.revents & POLLOUT, 0);
+        struct pollfd current_epoll_ready{loop->backend.epoll_fd, POLLIN, 0};
+        REQUIRE_GT(poll(&current_epoll_ready, 1, 1000), 0);
+        REQUIRE_NE(current_epoll_ready.revents & POLLIN, 0);
+
+        Connection* timer_anchor = guard.alloc_conn();
+        REQUIRE(timer_anchor != nullptr);
+        loop->timer.add(current_conn, 5);
+        loop->timer.add(timer_anchor, 5);
+        REQUIRE(loop->alloc_upstream_buf(*current_conn));
+        static constexpr char kRecvSentinel[] = "send-current-recv";
+        static constexpr char kSendSentinel[] = "send-current-send";
+        static constexpr char kUpstreamSentinel[] = "send-current-upstream";
+        REQUIRE_EQ(current_conn->recv_buf.write(reinterpret_cast<const u8*>(kRecvSentinel),
+                                                sizeof(kRecvSentinel) - 1),
+                   sizeof(kRecvSentinel) - 1);
+        REQUIRE_EQ(current_conn->send_buf.write(reinterpret_cast<const u8*>(kSendSentinel),
+                                                sizeof(kSendSentinel) - 1),
+                   sizeof(kSendSentinel) - 1);
+        REQUIRE_EQ(
+            current_conn->upstream_recv_buf.write(reinterpret_cast<const u8*>(kUpstreamSentinel),
+                                                  sizeof(kUpstreamSentinel) - 1),
+            sizeof(kUpstreamSentinel) - 1);
+        current_conn->on_recv = &epoll_episode_counting_callback;
+        current_conn->on_send = &epoll_episode_counting_callback;
+        current_conn->on_upstream_recv = &epoll_episode_counting_callback;
+        current_conn->on_upstream_send = &epoll_episode_counting_callback;
+        current_conn->state = ConnState::Proxying;
+        current_conn->pending_ops = 7;
+        current_conn->upstream_recv_armed = true;
+        current_conn->upstream_send_armed = true;
+        g_epoll_episode_callback_count = 0;
+
+        const Connection* ptr_before = current_conn;
+        const u32 id_before = current_conn->id;
+        const i32 fd_before = current_conn->upstream_fd;
+        const i32 map_before = loop->backend.upstream_fd_map[conn_id];
+        const u32 owner_before = loop->backend.active_upstream_episode[conn_id];
+        const u32 token_before = current_conn->upstream_episode;
+        const auto upstream_send_before = loop->backend.upstream_send_state[conn_id];
+        const auto downstream_send_before = loop->backend.send_state[conn_id];
+        const auto on_recv_before = current_conn->on_recv;
+        const auto on_send_before = current_conn->on_send;
+        const auto on_upstream_recv_before = current_conn->on_upstream_recv;
+        const auto on_upstream_send_before = current_conn->on_upstream_send;
+        const ListNode* timer_prev_before = current_conn->timer_node.prev;
+        const ListNode* timer_next_before = current_conn->timer_node.next;
+        const u16 timer_slot_before = current_conn->timer_slot;
+        const u32 pending_before = loop->backend.pending_count;
+        const u32 pending_streak_before = loop->backend.pending_streak;
+        const u32 recv_len_before = current_conn->recv_buf.len();
+        const u32 send_len_before = current_conn->send_buf.len();
+        const u32 upstream_len_before = current_conn->upstream_recv_buf.len();
+        const u32 pending_ops_before = current_conn->pending_ops;
+        const bool upstream_recv_armed_before = current_conn->upstream_recv_armed;
+        const bool upstream_send_armed_before = current_conn->upstream_send_armed;
+        const ConnState state_before = current_conn->state;
+
+        // The send-state episode check also prevents an old-token wire write.
+        // That lower fence is not sufficient by itself: without the top owner
+        // fence this raw record could still rearm/drop the current registration
+        // under episode 1. Replay therefore proves defense in depth, exact state
+        // preservation, and subsequent progress; it does not attribute zero
+        // stale wire bytes to only one of those two layers.
+        REQUIRE(held.replay_once());
+        IoEvent stale_output{0x00ffffffu,
+                             -1234,
+                             0xffffu,
+                             1,
+                             IoEventType::Count,
+                             1,
+                             0xff,
+                             kInvalidUpstreamEventEpisode};
+        REQUIRE_EQ(loop->backend.wait(&stale_output, 1, loop->conns, EpollEventLoop::kMaxConns),
+                   0u);
+        CHECK(held.replay_consumed());
+        CHECK_FALSE(held.replay_armed());
+        CHECK_FALSE(held.failed_closed());
+        CHECK_EQ(held.captured_events(), captured_raw_events);
+        CHECK_EQ(held.captured_data(), captured_raw_data);
+        CHECK_EQ(stale_output.conn_id, 0x00ffffffu);
+        CHECK_EQ(stale_output.result, -1234);
+        CHECK_EQ(stale_output.buf_id, 0xffffu);
+        CHECK_EQ(stale_output.has_buf, 1);
+        CHECK_EQ(stale_output.type, IoEventType::Count);
+        CHECK_EQ(stale_output.more, 1);
+        CHECK_EQ(stale_output.aux, 0xff);
+        CHECK_EQ(stale_output.upstream_episode, kInvalidUpstreamEventEpisode);
+        CHECK_EQ(g_epoll_episode_callback_count, 0u);
+        CHECK_EQ(current_conn, ptr_before);
+        CHECK_EQ(current_conn->id, id_before);
+        CHECK_EQ(current_conn->upstream_fd, fd_before);
+        CHECK_EQ(loop->backend.upstream_fd_map[conn_id], map_before);
+        CHECK_EQ(loop->backend.active_upstream_episode[conn_id], owner_before);
+        CHECK_EQ(current_conn->upstream_episode, token_before);
+        const auto& upstream_send_after = loop->backend.upstream_send_state[conn_id];
+        CHECK_EQ(upstream_send_after.src, upstream_send_before.src);
+        CHECK_EQ(upstream_send_after.fd, upstream_send_before.fd);
+        CHECK_EQ(upstream_send_after.offset, upstream_send_before.offset);
+        CHECK_EQ(upstream_send_after.remaining, upstream_send_before.remaining);
+        CHECK_EQ(upstream_send_after.type, upstream_send_before.type);
+        CHECK_EQ(upstream_send_after.tls, upstream_send_before.tls);
+        CHECK_EQ(upstream_send_after.tls_wait_events, upstream_send_before.tls_wait_events);
+        CHECK_EQ(upstream_send_after.upstream_episode, upstream_send_before.upstream_episode);
+        const auto& downstream_send_after = loop->backend.send_state[conn_id];
+        CHECK_EQ(downstream_send_after.src, downstream_send_before.src);
+        CHECK_EQ(downstream_send_after.fd, downstream_send_before.fd);
+        CHECK_EQ(downstream_send_after.offset, downstream_send_before.offset);
+        CHECK_EQ(downstream_send_after.remaining, downstream_send_before.remaining);
+        CHECK_EQ(downstream_send_after.type, downstream_send_before.type);
+        CHECK_EQ(downstream_send_after.tls, downstream_send_before.tls);
+        CHECK_EQ(downstream_send_after.tls_wait_events, downstream_send_before.tls_wait_events);
+        CHECK_EQ(downstream_send_after.upstream_episode, downstream_send_before.upstream_episode);
+        CHECK_EQ(current_conn->on_recv, on_recv_before);
+        CHECK_EQ(current_conn->on_send, on_send_before);
+        CHECK_EQ(current_conn->on_upstream_recv, on_upstream_recv_before);
+        CHECK_EQ(current_conn->on_upstream_send, on_upstream_send_before);
+        CHECK_EQ(current_conn->timer_node.prev, timer_prev_before);
+        CHECK_EQ(current_conn->timer_node.next, timer_next_before);
+        CHECK_EQ(current_conn->timer_slot, timer_slot_before);
+        CHECK_EQ(loop->backend.pending_count, pending_before);
+        CHECK_EQ(loop->backend.pending_streak, pending_streak_before);
+        CHECK_EQ(current_conn->recv_buf.len(), recv_len_before);
+        CHECK_EQ(__builtin_memcmp(
+                     current_conn->recv_buf.data(), kRecvSentinel, sizeof(kRecvSentinel) - 1),
+                 0);
+        CHECK_EQ(current_conn->send_buf.len(), send_len_before);
+        CHECK_EQ(__builtin_memcmp(
+                     current_conn->send_buf.data(), kSendSentinel, sizeof(kSendSentinel) - 1),
+                 0);
+        CHECK_EQ(current_conn->upstream_recv_buf.len(), upstream_len_before);
+        CHECK_EQ(__builtin_memcmp(current_conn->upstream_recv_buf.data(),
+                                  kUpstreamSentinel,
+                                  sizeof(kUpstreamSentinel) - 1),
+                 0);
+        CHECK_EQ(current_conn->pending_ops, pending_ops_before);
+        CHECK_EQ(current_conn->upstream_recv_armed, upstream_recv_armed_before);
+        CHECK_EQ(current_conn->upstream_send_armed, upstream_send_armed_before);
+        CHECK_EQ(current_conn->state, state_before);
+        errno = 0;
+        CHECK_EQ(recv(guard.peer_fds[1], &unexpected_byte, 1, MSG_PEEK | MSG_DONTWAIT), -1);
+        CHECK(errno == EAGAIN || errno == EWOULDBLOCK);
+        struct pollfd sender_still_ready{current_fd, POLLOUT, 0};
+        REQUIRE_GT(poll(&sender_still_ready, 1, 1000), 0);
+        REQUIRE_NE(sender_still_ready.revents & POLLOUT, 0);
+        struct pollfd epoll_still_ready{loop->backend.epoll_fd, POLLIN, 0};
+        REQUIRE_GT(poll(&epoll_still_ready, 1, 1000), 0);
+        REQUIRE_NE(epoll_still_ready.revents & POLLIN, 0);
+
+        IoEvent current_send_completion{};
+        REQUIRE_EQ(
+            loop->backend.wait(&current_send_completion, 1, loop->conns, EpollEventLoop::kMaxConns),
+            1u);
+        REQUIRE_EQ(current_send_completion.conn_id, conn_id);
+        REQUIRE_EQ(current_send_completion.type, IoEventType::UpstreamSend);
+        REQUIRE_EQ(current_send_completion.result, static_cast<i32>(sizeof(current_payload)));
+        REQUIRE_EQ(current_send_completion.aux, 0u);
+        REQUIRE_EQ(current_send_completion.upstream_episode, current_episode);
+        const auto& completed_send = loop->backend.upstream_send_state[conn_id];
+        REQUIRE_EQ(completed_send.src, nullptr);
+        REQUIRE_EQ(completed_send.fd, -1);
+        REQUIRE_EQ(completed_send.offset, 0u);
+        REQUIRE_EQ(completed_send.remaining, 0u);
+        REQUIRE_EQ(completed_send.type, IoEventType::UpstreamSend);
+        REQUIRE_FALSE(completed_send.tls);
+        REQUIRE_EQ(completed_send.tls_wait_events, 0u);
+        REQUIRE_EQ(completed_send.upstream_episode, 0u);
+        char observed_payload[sizeof(current_payload)]{};
+        REQUIRE(recv_exact_from_real_peer(
+            guard.peer_fds[1], observed_payload, sizeof(observed_payload)));
+        REQUIRE_EQ(__builtin_memcmp(observed_payload, current_payload, sizeof(current_payload)), 0);
+        errno = 0;
+        REQUIRE_EQ(recv(guard.peer_fds[1], &unexpected_byte, 1, MSG_PEEK | MSG_DONTWAIT), -1);
+        REQUIRE(errno == EAGAIN || errno == EWOULDBLOCK);
+        loop->dispatch(current_send_completion);
+        REQUIRE_EQ(g_epoll_episode_callback_count, 1u);
+
+        guard.close_conn(*current_conn);
+        REQUIRE_EQ(loop->backend.active_upstream_episode[conn_id], 0u);
+        REQUIRE_EQ(loop->backend.upstream_fd_map[conn_id], -1);
+        REQUIRE_EQ(current_conn->upstream_episode, current_episode + 1);
+        errno = 0;
+        REQUIRE_EQ(fcntl(current_fd, F_GETFD), -1);
+        REQUIRE_EQ(errno, EBADF);
+        guard.free_conn(*timer_anchor);
+    }
 }
 
 TEST(epoll_episode, stale_tls_send_cannot_rearm_or_hijack_current_recv) {
