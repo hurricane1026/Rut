@@ -598,7 +598,7 @@ public:
         if (c.ws_c2u_msg) pool.free(c.ws_c2u_msg);
         if (c.ws_u2c_msg) pool.free(c.ws_u2c_msg);
         if (c.h2) h2_pool.free(c.h2);
-        backend.reset_upstream_episode_state(cid);
+        backend.quarantine_upstream_episode_on_slot_release(cid);
         c.reset();
         free_stack[free_top++] = cid;
     }

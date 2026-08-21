@@ -103,19 +103,6 @@ static bool upstream_send_state_detached(const EpollBackend::SendState& state) {
            state.upstream_episode == 0;
 }
 
-static bool pending_has_upstream_episode(const IoEvent* pending_completions,
-                                         u32 pending_count,
-                                         u32 conn_id,
-                                         u32 episode) {
-    for (u32 i = 0; i < pending_count; i++) {
-        const IoEvent& event = pending_completions[i];
-        if (event.conn_id == conn_id && io_event_is_upstream(event.type) &&
-            event.upstream_episode == episode)
-            return true;
-    }
-    return false;
-}
-
 static i32 set_fd_interest(i32 epoll_fd,
                            i32 fd,
                            u32 conn_id,
@@ -356,29 +343,31 @@ bool EpollBackend::retire_upstream_episode_after_detach(Connection& conn,
         !upstream_send_state_detached(upstream_send_state[conn_id]))
         return false;
 
-    const u32 candidate = expected_episode == kIoUserDataMaxUpstreamEpisode
-                              ? 1u
-                              : expected_episode + 1u;
-    // A synthetic completion can outlive its producer's detach. Never wrap
-    // into a token that is still queued for this connection: poison ownership
-    // with a value outside the 24-bit token domain and fail closed. The
-    // connection token remains unchanged, so no caller can mistake this for a
-    // successful transition.
-    if (pending_has_upstream_episode(pending_completions, pending_count, conn_id, candidate)) {
+    // The max token cannot wrap safely: an old kernel readiness record or a
+    // future synthetic completion is not necessarily visible in this queue.
+    // Preserve the connection token and quarantine ownership instead.
+    if (expected_episode == kIoUserDataMaxUpstreamEpisode) {
         active_upstream_episode[conn_id] = kUpstreamEpisodeExhausted;
         return false;
     }
 
-    // No concurrent producer exists on an epoll shard. Clear ownership before
-    // advancing the connection token so the old token ceases to be current at
-    // the lifecycle boundary itself.
+    // No concurrent producer exists on an epoll shard. Advance first; the
+    // checked helper cannot fail after the non-max preconditions above, but a
+    // failure still quarantines ownership rather than exposing a partial
+    // transition.
+    if (!conn.next_upstream_episode()) {
+        active_upstream_episode[conn_id] = kUpstreamEpisodeExhausted;
+        return false;
+    }
     active_upstream_episode[conn_id] = 0;
-    conn.next_upstream_episode();
     return true;
 }
 
-void EpollBackend::reset_upstream_episode_state(u32 conn_id) {
-    if (conn_id < kMaxFdMap) active_upstream_episode[conn_id] = 0;
+void EpollBackend::quarantine_upstream_episode_on_slot_release(u32 conn_id) {
+    if (conn_id >= kMaxFdMap) return;
+    const u32 owner = active_upstream_episode[conn_id];
+    if (owner != 0 && owner != kUpstreamEpisodeExhausted)
+        active_upstream_episode[conn_id] = kUpstreamEpisodeExhausted;
 }
 
 void EpollBackend::pause_recv(u32 conn_id, bool preserve_send_interest) {

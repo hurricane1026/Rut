@@ -133,10 +133,11 @@ struct EpollBackend {
     bool begin_upstream_episode(u32 conn_id, u32 episode);
     bool retire_upstream_episode_after_detach(Connection& conn, u32 expected_episode);
 
-    // Connection-slot reset hook. This is not a lifecycle transition: it
-    // deterministically drops epoll-owned foundation state when a slot is
-    // released or the backend is reinitialized.
-    void reset_upstream_episode_state(u32 conn_id);
+    // Quarantine ownership when a live epoll connection slot is released.
+    // Inactive ownership remains zero; any live or malformed nonzero owner is
+    // permanently exhausted so a reused conn_id cannot accept an old token.
+    // Backend init/shutdown clear the whole table as part of backend rebuild.
+    void quarantine_upstream_episode_on_slot_release(u32 conn_id);
 
     // Try immediate send. If partial/EAGAIN, register EPOLLOUT.
     bool add_send(i32 fd, u32 conn_id, const u8* buf, u32 len);

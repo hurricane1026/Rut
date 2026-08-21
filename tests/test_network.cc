@@ -10811,7 +10811,10 @@ TEST(epoll_episode_lifecycle, clean_begin_and_strict_preconditions) {
     CHECK_FALSE(backend.begin_upstream_episode(conn.id, conn.upstream_episode));
     CHECK_EQ(backend.active_upstream_episode[conn.id], 1u);
 
-    backend.reset_upstream_episode_state(conn.id);
+    // Only a backend rebuild clears the ownership table. A live slot release
+    // quarantines nonzero ownership instead of rewinding it.
+    backend.shutdown();
+    REQUIRE(backend.init(0, -1).has_value());
     CHECK_FALSE(backend.begin_upstream_episode(EpollBackend::kMaxFdMap, 1));
     CHECK_FALSE(backend.begin_upstream_episode(conn.id, 0));
     CHECK_FALSE(backend.begin_upstream_episode(conn.id, kInvalidUpstreamEventEpisode));
@@ -10885,7 +10888,7 @@ TEST(epoll_episode_lifecycle, retire_requires_matching_detached_current_state) {
     backend.shutdown();
 }
 
-TEST(epoll_episode_lifecycle, wrap_never_uses_zero_or_reuses_pending_candidate) {
+TEST(epoll_episode_lifecycle, max_token_quarantines_without_wrap) {
     EpollBackend backend{};
     REQUIRE(backend.init(0, -1).has_value());
 
@@ -10895,34 +10898,102 @@ TEST(epoll_episode_lifecycle, wrap_never_uses_zero_or_reuses_pending_candidate) 
     conn.upstream_episode = kIoUserDataMaxUpstreamEpisode;
     REQUIRE(backend.begin_upstream_episode(conn.id, conn.upstream_episode));
 
-    // The bounded pending ring contains the exact max->1 candidate. Retire
-    // must fail closed and poison ownership, rather than silently reusing 1.
-    backend.pending_completions[0] = {
-        conn.id, 0, 0, 0, IoEventType::UpstreamRecv, 0, 0, 1};
-    backend.pending_count = 1;
-    CHECK_FALSE(backend.retire_upstream_episode_after_detach(
-        conn, kIoUserDataMaxUpstreamEpisode));
+    // The max token cannot be reused safely. Retire must fail closed and
+    // poison ownership, rather than silently wrapping to one.
+    CHECK_FALSE(backend.retire_upstream_episode_after_detach(conn,
+                                                              kIoUserDataMaxUpstreamEpisode));
     CHECK_EQ(backend.active_upstream_episode[conn.id], EpollBackend::kUpstreamEpisodeExhausted);
     CHECK_EQ(conn.upstream_episode, kIoUserDataMaxUpstreamEpisode);
     CHECK_FALSE(backend.begin_upstream_episode(conn.id, conn.upstream_episode));
     CHECK_NE(backend.active_upstream_episode[conn.id], 0u);
     CHECK_NE(backend.active_upstream_episode[conn.id], 1u);
 
-    // With no pending candidate, max wraps directly to one and never emits
-    // episode zero. A reset clears only ownership; it does not rewind conn.
-    backend.pending_count = 0;
-    backend.reset_upstream_episode_state(conn.id);
-    REQUIRE(backend.begin_upstream_episode(conn.id, conn.upstream_episode));
-    CHECK(backend.retire_upstream_episode_after_detach(
-        conn, kIoUserDataMaxUpstreamEpisode));
-    CHECK_EQ(conn.upstream_episode, 1u);
-    CHECK_NE(conn.upstream_episode, 0u);
-    CHECK_EQ(backend.active_upstream_episode[conn.id], 0u);
-
-    // The next clean begin uses exactly the advanced token.
-    CHECK(backend.begin_upstream_episode(conn.id, conn.upstream_episode));
-    CHECK_EQ(backend.active_upstream_episode[conn.id], 1u);
+    // A non-max token still advances normally, including to the max token;
+    // only retiring that final token quarantines ownership.
+    Connection normal{};
+    normal.reset();
+    normal.id = 6;
+    normal.upstream_episode = kIoUserDataMaxUpstreamEpisode - 1u;
+    REQUIRE(backend.begin_upstream_episode(normal.id, normal.upstream_episode));
+    CHECK(backend.retire_upstream_episode_after_detach(normal,
+                                                        kIoUserDataMaxUpstreamEpisode - 1u));
+    CHECK_EQ(normal.upstream_episode, kIoUserDataMaxUpstreamEpisode);
+    CHECK_EQ(backend.active_upstream_episode[normal.id], 0u);
+    REQUIRE(backend.begin_upstream_episode(normal.id, normal.upstream_episode));
+    CHECK_FALSE(backend.retire_upstream_episode_after_detach(normal,
+                                                               kIoUserDataMaxUpstreamEpisode));
+    CHECK_EQ(normal.upstream_episode, kIoUserDataMaxUpstreamEpisode);
+    CHECK_EQ(backend.active_upstream_episode[normal.id],
+             EpollBackend::kUpstreamEpisodeExhausted);
     backend.shutdown();
+}
+
+TEST(epoll_episode_lifecycle, slot_release_quarantines_episode_owner) {
+    auto* loop = create_real_loop();
+    REQUIRE(loop != nullptr);
+    REQUIRE(loop->init(0, -1, 0).has_value());
+
+    auto* inactive = loop->alloc_conn();
+    REQUIRE(inactive != nullptr);
+    const u32 inactive_id = inactive->id;
+    CHECK_EQ(loop->backend.active_upstream_episode[inactive_id], 0u);
+
+    auto* active = loop->alloc_conn();
+    REQUIRE(active != nullptr);
+    const u32 cid = active->id;
+    active->upstream_episode = 17;
+    REQUIRE(loop->begin_upstream_episode(*active));
+    loop->free_conn(*active);
+    CHECK_EQ(loop->backend.active_upstream_episode[cid],
+             EpollBackend::kUpstreamEpisodeExhausted);
+
+    auto* reused = loop->alloc_conn();
+    REQUIRE(reused != nullptr);
+    CHECK_EQ(reused->id, cid);
+    CHECK_EQ(loop->backend.active_upstream_episode[cid],
+             EpollBackend::kUpstreamEpisodeExhausted);
+    CHECK_FALSE(loop->begin_upstream_episode(*reused));
+    loop->free_conn(*reused);
+
+    // Exhausted ownership is sticky across another ordinary free/reallocate
+    // cycle, while a never-used slot remains inactive.
+    auto* exhausted_again = loop->alloc_conn();
+    REQUIRE(exhausted_again != nullptr);
+    CHECK_EQ(exhausted_again->id, cid);
+    CHECK_EQ(loop->backend.active_upstream_episode[cid],
+             EpollBackend::kUpstreamEpisodeExhausted);
+    loop->free_conn(*exhausted_again);
+
+    // The never-used slot was held throughout the active slot's reuse cycle.
+    CHECK_EQ(loop->backend.active_upstream_episode[inactive_id], 0u);
+    loop->free_conn(*inactive);
+    auto* inactive_reused = loop->alloc_conn();
+    REQUIRE(inactive_reused != nullptr);
+    CHECK_EQ(inactive_reused->id, inactive_id);
+    CHECK_EQ(loop->backend.active_upstream_episode[inactive_id], 0u);
+    loop->free_conn(*inactive_reused);
+
+    loop->shutdown();
+    destroy_real_loop(loop);
+}
+
+TEST(epoll_episode_lifecycle, abnormal_nonzero_owner_is_quarantined_on_release) {
+    auto* loop = create_real_loop();
+    REQUIRE(loop != nullptr);
+    REQUIRE(loop->init(0, -1, 0).has_value());
+    auto* c = loop->alloc_conn();
+    REQUIRE(c != nullptr);
+    const u32 cid = c->id;
+    loop->backend.active_upstream_episode[cid] = 0x80000000u;
+    loop->free_conn(*c);
+    CHECK_EQ(loop->backend.active_upstream_episode[cid],
+             EpollBackend::kUpstreamEpisodeExhausted);
+    auto* reused = loop->alloc_conn();
+    REQUIRE(reused != nullptr);
+    CHECK_FALSE(loop->begin_upstream_episode(*reused));
+    loop->free_conn(*reused);
+    loop->shutdown();
+    destroy_real_loop(loop);
 }
 
 TEST(epoll_episode, stale_raw_recv_does_not_touch_buffer_and_current_token_recovers) {
@@ -15525,7 +15596,7 @@ TEST(state_invariant, upstream_event_token_layout_round_trips_and_separates_gene
              kInvalidIoUserData);
 }
 
-TEST(state_invariant, upstream_episode_wraps_and_survives_connection_reset) {
+TEST(state_invariant, upstream_episode_checked_increment_and_reset) {
     ConnectionBase conn{};
     conn.upstream_episode = kIoUserDataMaxUpstreamEpisode;
     conn.fd = 42;
@@ -15535,14 +15606,19 @@ TEST(state_invariant, upstream_episode_wraps_and_survives_connection_reset) {
     CHECK_EQ(conn.fd, -1);
     CHECK_EQ(conn.handler_gen, 9u);
 
-    CHECK_EQ(conn.next_upstream_episode(), 1u);
-    CHECK_EQ(conn.upstream_episode, 1u);
+    CHECK_FALSE(conn.next_upstream_episode());
+    CHECK_EQ(conn.upstream_episode, kIoUserDataMaxUpstreamEpisode);
     conn.reset();
-    CHECK_EQ(conn.upstream_episode, 1u);
+    CHECK_EQ(conn.upstream_episode, kIoUserDataMaxUpstreamEpisode);
+
+    conn.upstream_episode = 0;
+    CHECK_FALSE(conn.next_upstream_episode());
+    CHECK_EQ(conn.upstream_episode, 0u);
 
     conn.upstream_episode = 17;
     const u32 old_episode = conn.upstream_episode;
-    CHECK_EQ(conn.next_upstream_episode(), old_episode + 1u);
+    CHECK(conn.next_upstream_episode());
+    CHECK_EQ(conn.upstream_episode, old_episode + 1u);
     CHECK_EQ(conn.fd, -1);
 }
 

@@ -434,12 +434,15 @@ struct ConnectionBase {
     // upstream episode so stale completions cannot match a later episode.
     u32 upstream_episode = 1;
 
-    u32 next_upstream_episode() {
-        if (upstream_episode == 0 || upstream_episode >= kIoUserDataMaxUpstreamEpisode)
-            upstream_episode = 1;
-        else
-            ++upstream_episode;
-        return upstream_episode;
+    // Advance the token without wrapping. Zero is the invalid sentinel and
+    // max is the final representable token; callers must quarantine the
+    // episode owner when this returns false rather than reusing an old token.
+    bool next_upstream_episode() {
+        if (!valid_upstream_episode(upstream_episode) ||
+            upstream_episode == kIoUserDataMaxUpstreamEpisode)
+            return false;
+        ++upstream_episode;
+        return true;
     }
 
     // Route config pinned for the lifetime of the current request. Set
