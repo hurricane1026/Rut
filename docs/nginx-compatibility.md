@@ -17,8 +17,8 @@ Allowed states are `SUPPORTED`, `PARTIAL`, `BLOCKED_BY_RUT`,
 | preserve raw request-target and query | implicit | yes | partial: origin-form forward sends original bytes | pinned query differential; broader normalization untested | PARTIAL |
 | preserve request method and body | implicit | yes | partial: fixed-CL body is staged before connect within one 16 KiB composite slice | RUT exact binary/segmented/boundary tests and pinned generated-RUT binary POST differential | PARTIAL |
 | nginx default upstream HTTP version and request headers | implicit | yes | partial: explicit fixed HTTP/1.1 policy with bounded fixed-CL buffering; #252 | exact RUT tests plus pinned generated-RUT GET and POST differentials | PARTIAL |
-| proxied response status and body | implicit | yes, including method-isolated root HEAD lowering | partial: strict final H1.1 exact-Content-Length streaming plus paired explicit-close HEAD success/connect-failure serialization | exact public-source production-JIT HEAD success/failure and non-HEAD sibling wires, internal lifecycle tests, and pinned generated-RUT GET/POST plus explicit-close HEAD success/unavailable-upstream differentials | PARTIAL |
-| nginx default proxied response header policy | implicit | yes, including method-isolated root HEAD lowering | partial: bounded strict H1.1 final-response/content-length serializer and paired explicit-close HEAD success/connect-failure policy; #253 | exact public-source production-JIT HEAD success/failure/no-pool tests, internal token/lifecycle tests, and pinned generated-RUT GET/POST/close plus explicit-close HEAD success/unavailable-upstream differentials | PARTIAL |
+| proxied response status and body | implicit | yes, including method-isolated root HEAD lowering | partial: strict final H1.1 exact-Content-Length streaming plus paired explicit-close HEAD success/connect-failure serialization; keep-alive HEAD rejected | exact public-source production-JIT HEAD success/failure and non-HEAD sibling wires, internal lifecycle tests, pinned generated-RUT GET/POST plus explicit-close HEAD success/unavailable-upstream differentials, and exact nginx-only two-request keep-alive HEAD baselines | PARTIAL |
+| nginx default proxied response header policy | implicit | yes, including method-isolated root HEAD lowering | partial: bounded strict H1.1 final-response/content-length serializer and paired explicit-close HEAD success/connect-failure policy; keep-alive HEAD gap in #253 | exact public-source production-JIT HEAD success/failure/no-pool tests, internal token/lifecycle tests, pinned generated-RUT GET/POST/close plus explicit-close HEAD success/unavailable-upstream differentials, and exact nginx-only keep-alive HEAD success/502 baselines | PARTIAL |
 | single unavailable upstream gateway error | implicit | yes | yes for bounded H1 single-IPv4 connect failures; #256 | committed pinned close/EOF differential plus pinned keep-alive and split-POST evidence | SUPPORTED |
 | exact, `^~`, regex, or nested locations | no | no | no nginx selection semantics | no | NOT_PLANNED |
 | exact `/api/` + proxy URI `/`, clean bounded H1 request domain | yes | yes | yes: bounded prefix replacement; #259 closed | pinned converter-generated `/api/`, `/api/x`, and query differentials; four out-of-domain targets fail before upstream | SUPPORTED |
@@ -58,7 +58,8 @@ Allowed states are `SUPPORTED`, `PARTIAL`, `BLOCKED_BY_RUT`,
   now emits the method-isolated pair. The pinned nginx-vs-generated-RUT
   differential proves the exact Date-normalized downstream response, EOF, and
   rebuilt upstream HEAD request for this explicit-close slice. #253 remains
-  `PARTIAL` because keep-alive HEAD and broader response domains are absent.
+  `PARTIAL` because RUT keep-alive HEAD support and broader response domains are
+  absent.
 - Pinned nginx also suppresses the 157-byte generated 502 body for an
   explicit-close HEAD when the single upstream connect fails, while retaining
   `Content-Length: 157`. RUT now carries a public paired HEAD disposition in
@@ -71,6 +72,15 @@ Allowed states are `SUPPORTED`, `PARTIAL`, `BLOCKED_BY_RUT`,
   now matches the exact header-only 502/EOF baseline while a single reserved
   non-listening endpoint is held across both implementations; it does not claim
   an unobserved RUT syscall count.
+- Pinned nginx keep-alive HEAD behavior is now exact: a default-keepalive HEAD
+  emits a header-only 200 retaining `Content-Length: 5` and keeps the downstream
+  quiet/reusable; a second close-intent HEAD emits the exact close headers and
+  EOF. nginx uses two distinct upstream connections and sends one exact rebuilt
+  HEAD wire on each. With the upstream unavailable, the first header-only 502
+  retains `Content-Length: 157` and downstream keep-alive, while the second
+  close-intent request emits the exact close 502/EOF and produces the second
+  scoped connect-failure record. Current RUT rejects this reusable HEAD domain,
+  so the evidence defines the next #253 capability gap rather than support.
 - The first request-policy slice rejects body/framing inputs (including
   `Content-Length` and every `Transfer-Encoding` value), HTTP/2, and
   non-origin-form targets before upstream connect. These are intentional
