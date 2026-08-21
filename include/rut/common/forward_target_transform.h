@@ -18,8 +18,8 @@ struct ForwardTargetTransformSpec {
 };
 
 inline bool forward_target_transform_clean_prefix(Str value) {
-    if (value.ptr == nullptr || value.len == 0 ||
-        value.len > kMaxForwardTargetTransformPrefixLen || value.ptr[0] != '/')
+    if (value.ptr == nullptr || value.len == 0 || value.len > kMaxForwardTargetTransformPrefixLen ||
+        value.ptr[0] != '/')
         return false;
     if (value.len > 1 && value.ptr[value.len - 1] != '/') return false;
     for (u32 i = 0; i < value.len; i++) {

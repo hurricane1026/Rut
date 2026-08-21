@@ -55,8 +55,7 @@ inline bool failure_policy_safe_body(Str value) {
 
 inline bool forward_failure_policy_spec_shape_valid(const ForwardFailurePolicySpec& policy) {
     if (policy.version != ForwardFailurePolicyVersion::Http11 || policy.status_code < 400 ||
-        policy.status_code > 599 ||
-        policy.date != ForwardFailurePolicyDate::Current ||
+        policy.status_code > 599 || policy.date != ForwardFailurePolicyDate::Current ||
         policy.connection != ForwardFailurePolicyConnection::Request ||
         (policy.head_mode != FailurePolicyHeadMode::Reject &&
          policy.head_mode != FailurePolicyHeadMode::SuppressBody) ||
@@ -65,10 +64,9 @@ inline bool forward_failure_policy_spec_shape_valid(const ForwardFailurePolicySp
         !failure_policy_safe_text(policy.server, kMaxFailurePolicyServerLen) ||
         !failure_policy_safe_body(policy.body))
         return false;
-    return validate_response_header("Content-Type",
-                                   12,
-                                   policy.content_type.ptr,
-                                   policy.content_type.len) == HttpHeaderValidation::Ok;
+    return validate_response_header(
+               "Content-Type", 12, policy.content_type.ptr, policy.content_type.len) ==
+           HttpHeaderValidation::Ok;
 }
 
 // The existing default failure-policy contract remains the exact 502 shape.

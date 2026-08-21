@@ -1,21 +1,21 @@
 #include "rut/nginx/converter.h"
 #include "rut/nginx/parser.h"
+#include <atomic>
+#include <cerrno>
+#include <chrono>
+#include <cstring>
+#include <iostream>
+#include <string>
+#include <vector>
 
 #include <arpa/inet.h>
-#include <atomic>
-#include <chrono>
-#include <cerrno>
-#include <cstring>
 #include <fcntl.h>
-#include <iostream>
 #include <poll.h>
 #include <pthread.h>
 #include <signal.h>
-#include <string>
 #include <sys/socket.h>
 #include <sys/wait.h>
 #include <unistd.h>
-#include <vector>
 
 using rut::u16;
 using rut::u32;
@@ -215,9 +215,9 @@ static bool stop_child(Child& child) {
         // SIGKILL was needed for cleanup; this is always a test failure.
         return false;
     }
-    const bool clean = child.status_valid &&
-                       ((WIFEXITED(child.status) && WEXITSTATUS(child.status) == 0) ||
-                        (WIFSIGNALED(child.status) && WTERMSIG(child.status) == SIGTERM));
+    const bool clean =
+        child.status_valid && ((WIFEXITED(child.status) && WEXITSTATUS(child.status) == 0) ||
+                               (WIFSIGNALED(child.status) && WTERMSIG(child.status) == SIGTERM));
     child.pid = -1;
     return clean;
 }
@@ -269,13 +269,21 @@ static bool run_named_docker_probe(const std::string& name,
                                    std::string& error) {
     Child probe;
     bool probe_ok = false;
-    if (spawn_child({"docker", "run", "--pull=never", "--network", "host", "--name", name,
-                     kNginxImage, "nginx", "-v"},
+    if (spawn_child({"docker",
+                     "run",
+                     "--pull=never",
+                     "--network",
+                     "host",
+                     "--name",
+                     name,
+                     kNginxImage,
+                     "nginx",
+                     "-v"},
                     log_path,
                     probe)) {
         if (wait_child(probe, 10'000)) {
-            probe_ok = probe.status_valid && WIFEXITED(probe.status) &&
-                       WEXITSTATUS(probe.status) == 0;
+            probe_ok =
+                probe.status_valid && WIFEXITED(probe.status) && WEXITSTATUS(probe.status) == 0;
             probe.pid = -1;
         } else {
             // Reap the CLI before rm -f so a timed-out docker client cannot
@@ -573,10 +581,7 @@ static bool read_eof(int fd, std::string& error) {
     return false;
 }
 
-static bool wait_keepalive_quiet_or_eof(int fd,
-                                        int quiet_ms,
-                                        bool& eof,
-                                        std::string& error) {
+static bool wait_keepalive_quiet_or_eof(int fd, int quiet_ms, bool& eof, std::string& error) {
     using Clock = std::chrono::steady_clock;
     const Clock::time_point deadline = Clock::now() + std::chrono::milliseconds(quiet_ms);
     eof = false;
@@ -724,8 +729,8 @@ struct Recorder {
         if ((response_override == nullptr) != (response_override_len == 0)) return false;
         expected_requests = expected;
         response_bytes = response_override != nullptr ? response_override : kBackendResponse;
-        response_bytes_len = response_override != nullptr ? response_override_len
-                                                           : sizeof(kBackendResponse) - 1;
+        response_bytes_len =
+            response_override != nullptr ? response_override_len : sizeof(kBackendResponse) - 1;
         for (int attempt = 0; attempt < 8; attempt++) {
             listen_fd = socket(AF_INET, SOCK_STREAM, 0);
             if (listen_fd < 0) continue;
@@ -818,8 +823,7 @@ struct KeepAlivePinnedRecorder {
         Close,
         Abort,
     };
-    explicit KeepAlivePinnedRecorder(
-        FirstResponseMode mode = FirstResponseMode::Normal)
+    explicit KeepAlivePinnedRecorder(FirstResponseMode mode = FirstResponseMode::Normal)
         : first_response_mode(mode) {}
     struct Entry {
         u32 connection_id = 0;
@@ -902,8 +906,7 @@ struct KeepAlivePinnedRecorder {
         const size_t end = find_header_end(item.wire, item.parsed);
         if (end == 0) return true;
         const bool first_request = self.requests.load(std::memory_order_relaxed) == 0;
-        std::vector<char> request(item.wire.begin() + item.parsed,
-                                  item.wire.begin() + end);
+        std::vector<char> request(item.wire.begin() + item.parsed, item.wire.begin() + end);
         self.history.push_back({item.connection_id, request});
         self.requests.fetch_add(1, std::memory_order_release);
         item.parsed = end;
@@ -922,24 +925,22 @@ struct KeepAlivePinnedRecorder {
             self.first_malformed_sent_open.store(true, std::memory_order_release);
             return true;
         }
-        if (self.first_response_mode == FirstResponseMode::IncompleteWaitGate &&
-            first_request) {
-            static constexpr char kIncomplete[] =
-                "HTTP/1.1 200 OK\r\nContent-Length: 7\r\n";
+        if (self.first_response_mode == FirstResponseMode::IncompleteWaitGate && first_request) {
+            static constexpr char kIncomplete[] = "HTTP/1.1 200 OK\r\nContent-Length: 7\r\n";
             if (self.incomplete_gate_command.load(std::memory_order_acquire) ==
                 IncompleteGateCommand::Abort) {
                 item.wait_kind = ActiveWaitKind::IncompleteAbortHold;
                 return true;
             }
             if (item.wire.size() != end) {
-                self.incomplete_gate_state.store(
-                    IncompleteGateState::UnexpectedDataBeforeGate, std::memory_order_release);
+                self.incomplete_gate_state.store(IncompleteGateState::UnexpectedDataBeforeGate,
+                                                 std::memory_order_release);
                 item.wait_kind = ActiveWaitKind::IncompleteAbortHold;
                 return true;
             }
             if (!send_all(item.fd, kIncomplete, sizeof(kIncomplete) - 1)) {
-                self.incomplete_gate_state.store(
-                    IncompleteGateState::SendFailed, std::memory_order_release);
+                self.incomplete_gate_state.store(IncompleteGateState::SendFailed,
+                                                 std::memory_order_release);
                 item.wait_kind = ActiveWaitKind::IncompleteAbortHold;
                 return true;
             }
@@ -948,8 +949,8 @@ struct KeepAlivePinnedRecorder {
                 IncompleteGateCommand::Abort) {
                 item.wait_kind = ActiveWaitKind::IncompleteAbortHold;
             } else {
-                self.incomplete_gate_state.store(
-                    IncompleteGateState::SentOpenWaitingGate, std::memory_order_release);
+                self.incomplete_gate_state.store(IncompleteGateState::SentOpenWaitingGate,
+                                                 std::memory_order_release);
             }
             return true;
         }
@@ -977,15 +978,16 @@ struct KeepAlivePinnedRecorder {
             }
             // This release is the recorder-thread acknowledgement: every live
             // incomplete item is parked before callers may tear down the proxy.
-            self->incomplete_gate_state.store(
-                IncompleteGateState::Aborted, std::memory_order_release);
+            self->incomplete_gate_state.store(IncompleteGateState::Aborted,
+                                              std::memory_order_release);
         };
         while (self->running.load(std::memory_order_acquire)) {
             acknowledge_incomplete_abort();
             std::vector<pollfd> polls;
             polls.reserve(active.size() + 1);
             polls.push_back({self->listen_fd, POLLIN, 0});
-            for (const auto& item : active) polls.push_back({item.fd, POLLIN | POLLERR | POLLHUP, 0});
+            for (const auto& item : active)
+                polls.push_back({item.fd, POLLIN | POLLERR | POLLHUP, 0});
             const size_t polled_active_count = active.size();
             const int ready = poll(polls.data(), polls.size(), 25);
             if (ready < 0) {
@@ -1009,8 +1011,7 @@ struct KeepAlivePinnedRecorder {
                     (void)setsockopt(client, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
                     (void)setsockopt(client, SOL_SOCKET, SO_SNDTIMEO, &timeout, sizeof(timeout));
                     const u32 id = next_connection_id++;
-                    active.push_back(
-                        {client, id, {}, 0, false, ActiveWaitKind::None, {}});
+                    active.push_back({client, id, {}, 0, false, ActiveWaitKind::None, {}});
                     self->accepted.fetch_add(1, std::memory_order_release);
                 }
             }
@@ -1029,16 +1030,13 @@ struct KeepAlivePinnedRecorder {
                         acknowledge_incomplete_abort();
                     } else {
                         PeerProbe probe = probe_peer_nonblocking(item.fd);
-                        if (probe == PeerProbe::Open &&
-                            (polls[poll_index].revents & POLLHUP))
+                        if (probe == PeerProbe::Open && (polls[poll_index].revents & POLLHUP))
                             probe = PeerProbe::Closed;
-                        if (probe == PeerProbe::Open &&
-                            (polls[poll_index].revents & POLLERR))
+                        if (probe == PeerProbe::Open && (polls[poll_index].revents & POLLERR))
                             probe = PeerProbe::Failed;
                         // Abort wins over any observation made by a probe that
                         // was already in progress when teardown requested it.
-                        command =
-                            self->incomplete_gate_command.load(std::memory_order_acquire);
+                        command = self->incomplete_gate_command.load(std::memory_order_acquire);
                         if (command == IncompleteGateCommand::Abort) {
                             item.wait_kind = ActiveWaitKind::IncompleteAbortHold;
                             acknowledge_incomplete_abort();
@@ -1056,8 +1054,8 @@ struct KeepAlivePinnedRecorder {
                             acknowledge_incomplete_abort();
                         } else if (probe == PeerProbe::Failed) {
                             item.wait_kind = ActiveWaitKind::IncompleteAbortHold;
-                            self->incomplete_gate_state.store(
-                                IncompleteGateState::ProbeFailed, std::memory_order_release);
+                            self->incomplete_gate_state.store(IncompleteGateState::ProbeFailed,
+                                                              std::memory_order_release);
                             acknowledge_incomplete_abort();
                         } else if (command == IncompleteGateCommand::Close) {
                             // The final open/no-data probe and the close occur in
@@ -1067,15 +1065,14 @@ struct KeepAlivePinnedRecorder {
                             const int fd = item.fd;
                             item.fd = -1;
                             (void)close(fd);
-                            self->incomplete_gate_state.store(
-                                IncompleteGateState::ClosedByGate,
-                                std::memory_order_release);
+                            self->incomplete_gate_state.store(IncompleteGateState::ClosedByGate,
+                                                              std::memory_order_release);
                             remove = true;
                         }
                     }
                 }
-                if (item.wait_kind != ActiveWaitKind::IncompleteAbortHold &&
-                    item.body_pending && now >= item.body_due) {
+                if (item.wait_kind != ActiveWaitKind::IncompleteAbortHold && item.body_pending &&
+                    now >= item.body_due) {
                     if (!send_head_body(item.fd)) remove = true;
                     item.body_pending = false;
                     // A second request may already be in the same upstream
@@ -1103,8 +1100,7 @@ struct KeepAlivePinnedRecorder {
                         remove = true;
                     }
                 }
-                if (!remove && !item.body_pending &&
-                    item.wait_kind == ActiveWaitKind::None &&
+                if (!remove && !item.body_pending && item.wait_kind == ActiveWaitKind::None &&
                     (polls[poll_index].revents & POLLIN)) {
                     char buf[4096];
                     const ssize_t n = recv(item.fd, buf, sizeof(buf), 0);
@@ -1144,8 +1140,8 @@ struct KeepAlivePinnedRecorder {
                         item.wait_kind == ActiveWaitKind::IncompleteGate)
                         item.wait_kind = ActiveWaitKind::IncompleteAbortHold;
                 }
-                self->incomplete_gate_state.store(
-                    IncompleteGateState::Aborted, std::memory_order_release);
+                self->incomplete_gate_state.store(IncompleteGateState::Aborted,
+                                                  std::memory_order_release);
             }
         }
         for (auto& item : active) {
@@ -1233,8 +1229,8 @@ struct KeepAlivePinnedRecorder {
 };
 
 static bool wait_pinned_requests(KeepAlivePinnedRecorder& recorder,
-                                      u32 expected,
-                                      std::string& error) {
+                                 u32 expected,
+                                 std::string& error) {
     const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
     while (std::chrono::steady_clock::now() < deadline) {
         const u32 requests = recorder.requests.load(std::memory_order_acquire);
@@ -1251,8 +1247,7 @@ static bool wait_pinned_requests(KeepAlivePinnedRecorder& recorder,
 
 static void settle_for_invalid_target_side_effects();
 
-static bool wait_first_malformed_peer_close(KeepAlivePinnedRecorder& recorder,
-                                            std::string& error) {
+static bool wait_first_malformed_peer_close(KeepAlivePinnedRecorder& recorder, std::string& error) {
     const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
     while (std::chrono::steady_clock::now() < deadline) {
         if (recorder.first_malformed_send_failed.load(std::memory_order_acquire)) {
@@ -1296,9 +1291,8 @@ static bool exercise_malformed_head_reuse(u16 frontend_port,
             if (fd >= 0) close(fd);
         }
     } client{connect_once(frontend_port)};
-    if (client.fd < 0 || !send_all(client.fd,
-                                   kHeadKeepAliveRequest1,
-                                   sizeof(kHeadKeepAliveRequest1) - 1)) {
+    if (client.fd < 0 ||
+        !send_all(client.fd, kHeadKeepAliveRequest1, sizeof(kHeadKeepAliveRequest1) - 1)) {
         error = std::string(side) + " malformed HEAD request 1 send failed";
         return false;
     }
@@ -1374,8 +1368,7 @@ static bool exercise_malformed_head_reuse(u16 frontend_port,
     return true;
 }
 
-static const char* incomplete_gate_state_name(
-    KeepAlivePinnedRecorder::IncompleteGateState state) {
+static const char* incomplete_gate_state_name(KeepAlivePinnedRecorder::IncompleteGateState state) {
     using State = KeepAlivePinnedRecorder::IncompleteGateState;
     switch (state) {
         case State::Idle:
@@ -1398,19 +1391,17 @@ static const char* incomplete_gate_state_name(
     return "unknown";
 }
 
-static bool wait_incomplete_gate_state(
-    KeepAlivePinnedRecorder& recorder,
-    KeepAlivePinnedRecorder::IncompleteGateState expected,
-    std::string& error) {
+static bool wait_incomplete_gate_state(KeepAlivePinnedRecorder& recorder,
+                                       KeepAlivePinnedRecorder::IncompleteGateState expected,
+                                       std::string& error) {
     using State = KeepAlivePinnedRecorder::IncompleteGateState;
     const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
     while (std::chrono::steady_clock::now() < deadline) {
         const State state = recorder.incomplete_gate_state.load(std::memory_order_acquire);
         if (state == expected) return true;
-        const bool transitional =
-            expected == State::SentOpenWaitingGate
-                ? state == State::Idle
-                : state == State::SentOpenWaitingGate;
+        const bool transitional = expected == State::SentOpenWaitingGate
+                                      ? state == State::Idle
+                                      : state == State::SentOpenWaitingGate;
         if (!transitional) {
             error = std::string("incomplete origin gate entered ") +
                     incomplete_gate_state_name(state) + " while waiting for " +
@@ -1432,8 +1423,7 @@ static bool wait_incomplete_gate_state(
 static bool abort_incomplete_gate_and_wait(KeepAlivePinnedRecorder& recorder,
                                            std::chrono::milliseconds budget) {
     using State = KeepAlivePinnedRecorder::IncompleteGateState;
-    if (recorder.incomplete_gate_state.load(std::memory_order_acquire) ==
-        State::ClosedByGate)
+    if (recorder.incomplete_gate_state.load(std::memory_order_acquire) == State::ClosedByGate)
         return true;
     recorder.abort_incomplete_gate();
     const auto deadline = std::chrono::steady_clock::now() + budget;
@@ -1445,12 +1435,11 @@ static bool abort_incomplete_gate_and_wait(KeepAlivePinnedRecorder& recorder,
     return false;
 }
 
-static bool exercise_incomplete_eof_head_reuse(
-    u16 frontend_port,
-    KeepAlivePinnedRecorder& recorder,
-    const char* side,
-    std::vector<std::vector<char>>& responses,
-    std::string& error) {
+static bool exercise_incomplete_eof_head_reuse(u16 frontend_port,
+                                               KeepAlivePinnedRecorder& recorder,
+                                               const char* side,
+                                               std::vector<std::vector<char>>& responses,
+                                               std::string& error) {
     using Command = KeepAlivePinnedRecorder::IncompleteGateCommand;
     using State = KeepAlivePinnedRecorder::IncompleteGateState;
     struct ClientGuard {
@@ -1467,9 +1456,8 @@ static bool exercise_incomplete_eof_head_reuse(
             (void)abort_incomplete_gate_and_wait(recorder, std::chrono::seconds(1));
         }
     } gate_guard{recorder};
-    if (client.fd < 0 || !send_all(client.fd,
-                                   kHeadKeepAliveRequest1,
-                                   sizeof(kHeadKeepAliveRequest1) - 1)) {
+    if (client.fd < 0 ||
+        !send_all(client.fd, kHeadKeepAliveRequest1, sizeof(kHeadKeepAliveRequest1) - 1)) {
         error = std::string(side) + " incomplete HEAD request 1 send failed";
         return false;
     }
@@ -1587,14 +1575,21 @@ static void dump_wire(const char* label, const std::vector<char>& wire) {
     std::cerr << label << " length=" << wire.size() << " escaped=";
     for (size_t i = 0; i < n; i++) {
         const unsigned char c = static_cast<unsigned char>(wire[i]);
-        if (c == '\r') std::cerr << "\\r";
-        else if (c == '\n') std::cerr << "\\n";
-        else if (c == '\t') std::cerr << "\\t";
-        else if (c >= 0x20 && c < 0x7f) std::cerr << static_cast<char>(c);
-        else std::cerr << "\\x" << std::hex << static_cast<int>(c) << std::dec;
+        if (c == '\r')
+            std::cerr << "\\r";
+        else if (c == '\n')
+            std::cerr << "\\n";
+        else if (c == '\t')
+            std::cerr << "\\t";
+        else if (c >= 0x20 && c < 0x7f)
+            std::cerr << static_cast<char>(c);
+        else
+            std::cerr << "\\x" << std::hex << static_cast<int>(c) << std::dec;
     }
     std::cerr << "\n" << label << " hex=" << std::hex;
-    for (size_t i = 0; i < n; i++) std::cerr << (i ? " " : "") << (static_cast<int>(static_cast<unsigned char>(wire[i])) & 0xff);
+    for (size_t i = 0; i < n; i++)
+        std::cerr << (i ? " " : "")
+                  << (static_cast<int>(static_cast<unsigned char>(wire[i])) & 0xff);
     std::cerr << std::dec << "\n";
 }
 
@@ -1618,8 +1613,10 @@ static void dump_log(const std::string& path, const char* label) {
         if (n < 0 && errno == EINTR) continue;
         break;
     }
-    if (total == 0) std::cerr << "<empty>\n";
-    else if (total == 8192) std::cerr << "\n<truncated>\n";
+    if (total == 0)
+        std::cerr << "<empty>\n";
+    else if (total == 8192)
+        std::cerr << "\n<truncated>\n";
     close(fd);
 }
 
@@ -1629,7 +1626,8 @@ static bool log_contains(const std::string& path, const char* needle) {
     std::string contents;
     char buf[1024];
     while (contents.size() < 8192) {
-        const size_t want = sizeof(buf) < 8192 - contents.size() ? sizeof(buf) : 8192 - contents.size();
+        const size_t want =
+            sizeof(buf) < 8192 - contents.size() ? sizeof(buf) : 8192 - contents.size();
         const ssize_t n = read(fd, buf, want);
         if (n > 0) {
             contents.append(buf, static_cast<size_t>(n));
@@ -1651,8 +1649,8 @@ static bool log_count_line_with(const std::string& path,
     std::string contents;
     char buf[1024];
     while (contents.size() < 8192) {
-        const size_t want = sizeof(buf) < 8192 - contents.size() ? sizeof(buf)
-                                                                  : 8192 - contents.size();
+        const size_t want =
+            sizeof(buf) < 8192 - contents.size() ? sizeof(buf) : 8192 - contents.size();
         const ssize_t n = read(fd, buf, want);
         if (n > 0) {
             contents.append(buf, static_cast<size_t>(n));
@@ -1706,10 +1704,9 @@ static bool starts_with_400(const std::vector<char>& response) {
 static void settle_for_invalid_target_side_effects() {
     const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(500);
     for (;;) {
-        const auto remaining =
-            std::chrono::duration_cast<std::chrono::milliseconds>(
-                deadline - std::chrono::steady_clock::now())
-                .count();
+        const auto remaining = std::chrono::duration_cast<std::chrono::milliseconds>(
+                                   deadline - std::chrono::steady_clock::now())
+                                   .count();
         if (remaining <= 0) return;
         const int wait_ms = remaining > 50 ? 50 : static_cast<int>(remaining);
         (void)poll(nullptr, 0, wait_ms > 0 ? wait_ms : 1);
@@ -1722,19 +1719,28 @@ static int missing_prerequisite(const char* message) {
     return required && strcmp(required, "1") == 0 ? 1 : 77;
 }
 
-static bool capture_nginx_head_keepalive_success(
-    u16 frontend_port,
-    const std::string& nginx_config_path,
-    const std::string& nginx_log_path,
-    const std::string& container_name,
-    KeepAlivePinnedRecorder& recorder,
-    std::vector<std::vector<char>>& responses,
-    std::string& error) {
+static bool capture_nginx_head_keepalive_success(u16 frontend_port,
+                                                 const std::string& nginx_config_path,
+                                                 const std::string& nginx_log_path,
+                                                 const std::string& container_name,
+                                                 KeepAlivePinnedRecorder& recorder,
+                                                 std::vector<std::vector<char>>& responses,
+                                                 std::string& error) {
     DockerGuard docker(container_name);
     ChildGuard nginx;
-    if (!spawn_child({"docker", "run", "--pull=never", "--network", "host", "--name",
-                      container_name, "-v", nginx_config_path + ":/etc/nginx/nginx.conf:ro",
-                      kNginxImage, "nginx", "-g", "daemon off;"},
+    if (!spawn_child({"docker",
+                      "run",
+                      "--pull=never",
+                      "--network",
+                      "host",
+                      "--name",
+                      container_name,
+                      "-v",
+                      nginx_config_path + ":/etc/nginx/nginx.conf:ro",
+                      kNginxImage,
+                      "nginx",
+                      "-g",
+                      "daemon off;"},
                      nginx_log_path,
                      nginx.child)) {
         error = "failed to start pinned nginx for pinned keep-alive HEAD baseline";
@@ -1748,9 +1754,8 @@ static bool capture_nginx_head_keepalive_success(
             if (fd >= 0) close(fd);
         }
     } client{connect_once(frontend_port)};
-    if (client.fd < 0 || !send_all(client.fd,
-                                   kHeadKeepAliveRequest1,
-                                   sizeof(kHeadKeepAliveRequest1) - 1)) {
+    if (client.fd < 0 ||
+        !send_all(client.fd, kHeadKeepAliveRequest1, sizeof(kHeadKeepAliveRequest1) - 1)) {
         error = "failed to send first pinned keep-alive HEAD request";
         return false;
     }
@@ -1795,25 +1800,34 @@ static bool capture_nginx_head_keepalive_success(
     return true;
 }
 
-static bool capture_nginx_head_keepalive_gateway(
-    u16 frontend_port,
-    u16 backend_port,
-    const std::string& nginx_config_path,
-    const std::string& nginx_log_path,
-    const std::string& container_name,
-    DeadPort& dead,
-    std::vector<std::vector<char>>& responses,
-    u32& connect_failure_count,
-    std::string& error) {
+static bool capture_nginx_head_keepalive_gateway(u16 frontend_port,
+                                                 u16 backend_port,
+                                                 const std::string& nginx_config_path,
+                                                 const std::string& nginx_log_path,
+                                                 const std::string& container_name,
+                                                 DeadPort& dead,
+                                                 std::vector<std::vector<char>>& responses,
+                                                 u32& connect_failure_count,
+                                                 std::string& error) {
     if (dead.fd < 0) {
         error = "pinned HEAD gateway dead port is not reserved";
         return false;
     }
     DockerGuard docker(container_name);
     ChildGuard nginx;
-    if (!spawn_child({"docker", "run", "--pull=never", "--network", "host", "--name",
-                      container_name, "-v", nginx_config_path + ":/etc/nginx/nginx.conf:ro",
-                      kNginxImage, "nginx", "-g", "daemon off;"},
+    if (!spawn_child({"docker",
+                      "run",
+                      "--pull=never",
+                      "--network",
+                      "host",
+                      "--name",
+                      container_name,
+                      "-v",
+                      nginx_config_path + ":/etc/nginx/nginx.conf:ro",
+                      kNginxImage,
+                      "nginx",
+                      "-g",
+                      "daemon off;"},
                      nginx_log_path,
                      nginx.child)) {
         error = "failed to start pinned nginx for keep-alive HEAD gateway baseline";
@@ -1827,17 +1841,16 @@ static bool capture_nginx_head_keepalive_gateway(
             if (fd >= 0) close(fd);
         }
     } client{connect_once(frontend_port)};
-    if (client.fd < 0 || !send_all(client.fd,
-                                   kHeadGatewayKeepAliveRequest1,
-                                   sizeof(kHeadGatewayKeepAliveRequest1) - 1)) {
+    if (client.fd < 0 ||
+        !send_all(
+            client.fd, kHeadGatewayKeepAliveRequest1, sizeof(kHeadGatewayKeepAliveRequest1) - 1)) {
         error = "failed to send first pinned HEAD gateway request";
         return false;
     }
     responses.clear();
     std::vector<char> first;
     if (!read_head_response(client.fd, first, error)) return false;
-    if (!validate_exact_normalized_response(
-            first, kHeadGatewayKeepAliveResponseNormalized, error))
+    if (!validate_exact_normalized_response(first, kHeadGatewayKeepAliveResponseNormalized, error))
         return false;
     responses.push_back(std::move(first));
     bool eof = false;
@@ -1845,9 +1858,8 @@ static bool capture_nginx_head_keepalive_gateway(
         if (error.empty()) error = "nginx closed first pinned HEAD gateway response";
         return false;
     }
-    if (!send_all(client.fd,
-                  kHeadGatewayKeepAliveRequest2,
-                  sizeof(kHeadGatewayKeepAliveRequest2) - 1)) {
+    if (!send_all(
+            client.fd, kHeadGatewayKeepAliveRequest2, sizeof(kHeadGatewayKeepAliveRequest2) - 1)) {
         error = "failed to send second pinned HEAD gateway request";
         return false;
     }
@@ -1860,10 +1872,8 @@ static bool capture_nginx_head_keepalive_gateway(
     const bool nginx_stopped = stop_child(nginx.child);
     const bool container_removed = docker.remove();
     const std::string upstream_context = "127.0.0.1:" + std::to_string(backend_port);
-    const bool log_readable = log_count_line_with(nginx_log_path,
-                                                  "connect() failed",
-                                                  upstream_context.c_str(),
-                                                  connect_failure_count);
+    const bool log_readable = log_count_line_with(
+        nginx_log_path, "connect() failed", upstream_context.c_str(), connect_failure_count);
     if (!nginx_stopped) {
         error = "failed to stop nginx after pinned HEAD gateway baseline";
         return false;
@@ -1877,22 +1887,22 @@ static bool capture_nginx_head_keepalive_gateway(
         return false;
     }
     if (!log_readable || connect_failure_count != 2) {
-        error = "pinned HEAD gateway baseline did not produce exactly two scoped connect failures "
-                "(actual " +
-                std::to_string(connect_failure_count) + ")";
+        error =
+            "pinned HEAD gateway baseline did not produce exactly two scoped connect failures "
+            "(actual " +
+            std::to_string(connect_failure_count) + ")";
         return false;
     }
     return true;
 }
 
-static bool capture_rut_head_keepalive_success(
-    u16 frontend_port,
-    const std::string& source_path,
-    const std::string& rut_log_path,
-    const std::string& rut_path,
-    KeepAlivePinnedRecorder& recorder,
-    std::vector<std::vector<char>>& responses,
-    std::string& error) {
+static bool capture_rut_head_keepalive_success(u16 frontend_port,
+                                               const std::string& source_path,
+                                               const std::string& rut_log_path,
+                                               const std::string& rut_path,
+                                               KeepAlivePinnedRecorder& recorder,
+                                               std::vector<std::vector<char>>& responses,
+                                               std::string& error) {
     ChildGuard rut;
     if (!spawn_child({rut_path, source_path, "--shards", "1", "--no-pin", "--drain", "0"},
                      rut_log_path,
@@ -1911,9 +1921,8 @@ static bool capture_rut_head_keepalive_success(
             if (fd >= 0) close(fd);
         }
     } client{connect_once(frontend_port)};
-    if (client.fd < 0 || !send_all(client.fd,
-                                   kHeadKeepAliveRequest1,
-                                   sizeof(kHeadKeepAliveRequest1) - 1)) {
+    if (client.fd < 0 ||
+        !send_all(client.fd, kHeadKeepAliveRequest1, sizeof(kHeadKeepAliveRequest1) - 1)) {
         error = "RUT reusable HEAD success request 1 send failed";
         return false;
     }
@@ -1973,14 +1982,13 @@ static bool capture_rut_head_keepalive_success(
     return true;
 }
 
-static bool capture_rut_head_keepalive_gateway(
-    u16 frontend_port,
-    const std::string& source_path,
-    const std::string& rut_log_path,
-    const std::string& rut_path,
-    DeadPort& dead,
-    std::vector<std::vector<char>>& responses,
-    std::string& error) {
+static bool capture_rut_head_keepalive_gateway(u16 frontend_port,
+                                               const std::string& source_path,
+                                               const std::string& rut_log_path,
+                                               const std::string& rut_path,
+                                               DeadPort& dead,
+                                               std::vector<std::vector<char>>& responses,
+                                               std::string& error) {
     if (dead.fd < 0) {
         error = "RUT reusable HEAD gateway dead port is not reserved";
         return false;
@@ -2003,9 +2011,9 @@ static bool capture_rut_head_keepalive_gateway(
             if (fd >= 0) close(fd);
         }
     } client{connect_once(frontend_port)};
-    if (client.fd < 0 || !send_all(client.fd,
-                                   kHeadGatewayKeepAliveRequest1,
-                                   sizeof(kHeadGatewayKeepAliveRequest1) - 1)) {
+    if (client.fd < 0 ||
+        !send_all(
+            client.fd, kHeadGatewayKeepAliveRequest1, sizeof(kHeadGatewayKeepAliveRequest1) - 1)) {
         error = "RUT reusable HEAD gateway request 1 send failed";
         return false;
     }
@@ -2029,9 +2037,8 @@ static bool capture_rut_head_keepalive_gateway(
     }
     responses.push_back(std::move(first));
 
-    if (!send_all(client.fd,
-                  kHeadGatewayKeepAliveRequest2,
-                  sizeof(kHeadGatewayKeepAliveRequest2) - 1)) {
+    if (!send_all(
+            client.fd, kHeadGatewayKeepAliveRequest2, sizeof(kHeadGatewayKeepAliveRequest2) - 1)) {
         error = "RUT reusable HEAD gateway request 2 send failed";
         return false;
     }
@@ -2062,19 +2069,28 @@ static bool capture_rut_head_keepalive_gateway(
     return true;
 }
 
-static bool capture_nginx_head_malformed_reuse(
-    u16 frontend_port,
-    const std::string& nginx_config_path,
-    const std::string& nginx_log_path,
-    const std::string& container_name,
-    KeepAlivePinnedRecorder& recorder,
-    std::vector<std::vector<char>>& responses,
-    std::string& error) {
+static bool capture_nginx_head_malformed_reuse(u16 frontend_port,
+                                               const std::string& nginx_config_path,
+                                               const std::string& nginx_log_path,
+                                               const std::string& container_name,
+                                               KeepAlivePinnedRecorder& recorder,
+                                               std::vector<std::vector<char>>& responses,
+                                               std::string& error) {
     DockerGuard docker(container_name);
     ChildGuard nginx;
-    if (!spawn_child({"docker", "run", "--pull=never", "--network", "host", "--name",
-                      container_name, "-v", nginx_config_path + ":/etc/nginx/nginx.conf:ro",
-                      kNginxImage, "nginx", "-g", "daemon off;"},
+    if (!spawn_child({"docker",
+                      "run",
+                      "--pull=never",
+                      "--network",
+                      "host",
+                      "--name",
+                      container_name,
+                      "-v",
+                      nginx_config_path + ":/etc/nginx/nginx.conf:ro",
+                      kNginxImage,
+                      "nginx",
+                      "-g",
+                      "daemon off;"},
                      nginx_log_path,
                      nginx.child)) {
         error = "failed to start pinned nginx for malformed reusable HEAD differential";
@@ -2098,14 +2114,13 @@ static bool capture_nginx_head_malformed_reuse(
     return true;
 }
 
-static bool capture_rut_head_malformed_reuse(
-    u16 frontend_port,
-    const std::string& source_path,
-    const std::string& rut_log_path,
-    const std::string& rut_path,
-    KeepAlivePinnedRecorder& recorder,
-    std::vector<std::vector<char>>& responses,
-    std::string& error) {
+static bool capture_rut_head_malformed_reuse(u16 frontend_port,
+                                             const std::string& source_path,
+                                             const std::string& rut_log_path,
+                                             const std::string& rut_path,
+                                             KeepAlivePinnedRecorder& recorder,
+                                             std::vector<std::vector<char>>& responses,
+                                             std::string& error) {
     ChildGuard rut;
     if (!spawn_child({rut_path, source_path, "--shards", "1", "--no-pin", "--drain", "0"},
                      rut_log_path,
@@ -2129,19 +2144,28 @@ static bool capture_rut_head_malformed_reuse(
     return true;
 }
 
-static bool capture_nginx_head_incomplete_eof_reuse(
-    u16 frontend_port,
-    const std::string& nginx_config_path,
-    const std::string& nginx_log_path,
-    const std::string& container_name,
-    KeepAlivePinnedRecorder& recorder,
-    std::vector<std::vector<char>>& responses,
-    std::string& error) {
+static bool capture_nginx_head_incomplete_eof_reuse(u16 frontend_port,
+                                                    const std::string& nginx_config_path,
+                                                    const std::string& nginx_log_path,
+                                                    const std::string& container_name,
+                                                    KeepAlivePinnedRecorder& recorder,
+                                                    std::vector<std::vector<char>>& responses,
+                                                    std::string& error) {
     DockerGuard docker(container_name);
     ChildGuard nginx;
-    if (!spawn_child({"docker", "run", "--pull=never", "--network", "host", "--name",
-                      container_name, "-v", nginx_config_path + ":/etc/nginx/nginx.conf:ro",
-                      kNginxImage, "nginx", "-g", "daemon off;"},
+    if (!spawn_child({"docker",
+                      "run",
+                      "--pull=never",
+                      "--network",
+                      "host",
+                      "--name",
+                      container_name,
+                      "-v",
+                      nginx_config_path + ":/etc/nginx/nginx.conf:ro",
+                      kNginxImage,
+                      "nginx",
+                      "-g",
+                      "daemon off;"},
                      nginx_log_path,
                      nginx.child)) {
         error = "failed to start pinned nginx for incomplete-EOF reusable HEAD differential";
@@ -2153,8 +2177,8 @@ static bool capture_nginx_head_incomplete_eof_reuse(
         return false;
     }
 
-    const bool exercised = exercise_incomplete_eof_head_reuse(
-        frontend_port, recorder, "nginx", responses, error);
+    const bool exercised =
+        exercise_incomplete_eof_head_reuse(frontend_port, recorder, "nginx", responses, error);
     const bool abort_acknowledged =
         exercised || abort_incomplete_gate_and_wait(recorder, std::chrono::seconds(4));
     const bool nginx_stopped = stop_child(nginx.child);
@@ -2175,14 +2199,13 @@ static bool capture_nginx_head_incomplete_eof_reuse(
     return true;
 }
 
-static bool capture_rut_head_incomplete_eof_reuse(
-    u16 frontend_port,
-    const std::string& source_path,
-    const std::string& rut_log_path,
-    const std::string& rut_path,
-    KeepAlivePinnedRecorder& recorder,
-    std::vector<std::vector<char>>& responses,
-    std::string& error) {
+static bool capture_rut_head_incomplete_eof_reuse(u16 frontend_port,
+                                                  const std::string& source_path,
+                                                  const std::string& rut_log_path,
+                                                  const std::string& rut_path,
+                                                  KeepAlivePinnedRecorder& recorder,
+                                                  std::vector<std::vector<char>>& responses,
+                                                  std::string& error) {
     ChildGuard rut;
     if (!spawn_child({rut_path, source_path, "--shards", "1", "--no-pin", "--drain", "0"},
                      rut_log_path,
@@ -2197,8 +2220,8 @@ static bool capture_rut_head_incomplete_eof_reuse(
         return false;
     }
 
-    const bool exercised = exercise_incomplete_eof_head_reuse(
-        frontend_port, recorder, "RUT", responses, error);
+    const bool exercised =
+        exercise_incomplete_eof_head_reuse(frontend_port, recorder, "RUT", responses, error);
     const bool abort_acknowledged =
         exercised || abort_incomplete_gate_and_wait(recorder, std::chrono::seconds(4));
     const bool rut_stopped = stop_child(rut.child);
@@ -2216,13 +2239,12 @@ static bool capture_rut_head_incomplete_eof_reuse(
 
 static void dump_pinned_history(const KeepAlivePinnedRecorder& recorder,
                                 const char* side = "PINNED") {
-    std::cerr << side << " upstream accepted="
-              << recorder.accepted.load(std::memory_order_acquire) << " requests="
-              << recorder.requests.load(std::memory_order_acquire)
+    std::cerr << side << " upstream accepted=" << recorder.accepted.load(std::memory_order_acquire)
+              << " requests=" << recorder.requests.load(std::memory_order_acquire)
               << " history=" << recorder.history.size() << "\n";
     for (size_t i = 0; i < recorder.history.size(); i++) {
-        std::cerr << side << " upstream history[" << i << "] connection_id="
-                  << recorder.history[i].connection_id << "\n";
+        std::cerr << side << " upstream history[" << i
+                  << "] connection_id=" << recorder.history[i].connection_id << "\n";
         const std::string label = std::string(side) + " upstream request";
         dump_wire(label.c_str(), recorder.history[i].wire);
     }
@@ -2251,9 +2273,19 @@ static bool capture_case(u16 frontend_port,
     // docker client before removing its container on every return path.
     DockerGuard docker(container_name);
     ChildGuard nginx;
-    if (!spawn_child({"docker", "run", "--pull=never", "--network", "host", "--name",
-                     container_name, "-v", nginx_config_path + ":/etc/nginx/nginx.conf:ro",
-                     kNginxImage, "nginx", "-g", "daemon off;"},
+    if (!spawn_child({"docker",
+                      "run",
+                      "--pull=never",
+                      "--network",
+                      "host",
+                      "--name",
+                      container_name,
+                      "-v",
+                      nginx_config_path + ":/etc/nginx/nginx.conf:ro",
+                      kNginxImage,
+                      "nginx",
+                      "-g",
+                      "daemon off;"},
                      nginx_log_path,
                      nginx.child)) {
         error = "failed to start pinned nginx";
@@ -2338,19 +2370,26 @@ static bool capture_head_case(u16 frontend_port,
                               std::vector<char>& upstream,
                               std::string& error) {
     Recorder recorder;
-    if (!recorder.setup(backend_port,
-                        1,
-                        kHeadBackendResponse,
-                        sizeof(kHeadBackendResponse) - 1)) {
+    if (!recorder.setup(backend_port, 1, kHeadBackendResponse, sizeof(kHeadBackendResponse) - 1)) {
         error = "HEAD backend recorder setup failed";
         return false;
     }
 
     DockerGuard docker(container_name);
     ChildGuard nginx;
-    if (!spawn_child({"docker", "run", "--pull=never", "--network", "host", "--name",
-                      container_name, "-v", nginx_config_path + ":/etc/nginx/nginx.conf:ro",
-                      kNginxImage, "nginx", "-g", "daemon off;"},
+    if (!spawn_child({"docker",
+                      "run",
+                      "--pull=never",
+                      "--network",
+                      "host",
+                      "--name",
+                      container_name,
+                      "-v",
+                      nginx_config_path + ":/etc/nginx/nginx.conf:ro",
+                      kNginxImage,
+                      "nginx",
+                      "-g",
+                      "daemon off;"},
                      nginx_log_path,
                      nginx.child)) {
         error = "failed to start pinned nginx for HEAD case";
@@ -2386,9 +2425,9 @@ static bool capture_head_case(u16 frontend_port,
         return false;
     }
 
-    const std::string expected_request =
-        std::string("HEAD /head?q=1 HTTP/1.1\r\n") +
-        "Host: 127.0.0.1:" + std::to_string(backend_port) + "\r\n\r\n";
+    const std::string expected_request = std::string("HEAD /head?q=1 HTTP/1.1\r\n") +
+                                         "Host: 127.0.0.1:" + std::to_string(backend_port) +
+                                         "\r\n\r\n";
     upstream = recorder.history[0];
     const std::vector<char> expected_wire(expected_request.begin(), expected_request.end());
     if (upstream != expected_wire) {
@@ -2399,9 +2438,8 @@ static bool capture_head_case(u16 frontend_port,
     }
 
     std::vector<char> normalized = downstream;
-    const std::vector<char> expected_response(kHeadResponseNormalized,
-                                               kHeadResponseNormalized +
-                                                   sizeof(kHeadResponseNormalized) - 1);
+    const std::vector<char> expected_response(
+        kHeadResponseNormalized, kHeadResponseNormalized + sizeof(kHeadResponseNormalized) - 1);
     if (!normalize_date(normalized) || normalized != expected_response) {
         error = "HEAD downstream response did not match the exact pinned header-only baseline";
         dump_wire("expected HEAD response", expected_response);
@@ -2420,10 +2458,7 @@ static bool capture_head_rut_case(u16 frontend_port,
                                   std::vector<char>& upstream,
                                   std::string& error) {
     Recorder recorder;
-    if (!recorder.setup(backend_port,
-                        1,
-                        kHeadBackendResponse,
-                        sizeof(kHeadBackendResponse) - 1)) {
+    if (!recorder.setup(backend_port, 1, kHeadBackendResponse, sizeof(kHeadBackendResponse) - 1)) {
         error = "HEAD RUT backend recorder setup failed";
         return false;
     }
@@ -2457,9 +2492,9 @@ static bool capture_head_rut_case(u16 frontend_port,
         error = "RUT HEAD recorder did not observe exactly one request";
         return false;
     }
-    const std::string expected_request =
-        std::string("HEAD /head?q=1 HTTP/1.1\r\n") +
-        "Host: 127.0.0.1:" + std::to_string(backend_port) + "\r\n\r\n";
+    const std::string expected_request = std::string("HEAD /head?q=1 HTTP/1.1\r\n") +
+                                         "Host: 127.0.0.1:" + std::to_string(backend_port) +
+                                         "\r\n\r\n";
     upstream = recorder.history[0];
     const std::vector<char> expected_wire(expected_request.begin(), expected_request.end());
     if (upstream != expected_wire) {
@@ -2468,9 +2503,8 @@ static bool capture_head_rut_case(u16 frontend_port,
         dump_wire("actual RUT HEAD upstream", upstream);
         return false;
     }
-    const std::vector<char> expected_response(kHeadResponseNormalized,
-                                              kHeadResponseNormalized +
-                                                  sizeof(kHeadResponseNormalized) - 1);
+    const std::vector<char> expected_response(
+        kHeadResponseNormalized, kHeadResponseNormalized + sizeof(kHeadResponseNormalized) - 1);
     std::vector<char> normalized = downstream;
     if (!normalize_date(normalized) || normalized != expected_response) {
         error = "RUT HEAD downstream response did not match the exact pinned header-only baseline";
@@ -2505,9 +2539,19 @@ static bool capture_head_gateway_case(u16 frontend_port,
 
     DockerGuard docker(container_name);
     ChildGuard nginx;
-    if (!spawn_child({"docker", "run", "--pull=never", "--network", "host", "--name",
-                      container_name, "-v", nginx_config_path + ":/etc/nginx/nginx.conf:ro",
-                      kNginxImage, "nginx", "-g", "daemon off;"},
+    if (!spawn_child({"docker",
+                      "run",
+                      "--pull=never",
+                      "--network",
+                      "host",
+                      "--name",
+                      container_name,
+                      "-v",
+                      nginx_config_path + ":/etc/nginx/nginx.conf:ro",
+                      kNginxImage,
+                      "nginx",
+                      "-g",
+                      "daemon off;"},
                      nginx_log_path,
                      nginx.child)) {
         error = "failed to start pinned nginx for HEAD gateway case";
@@ -2530,10 +2574,8 @@ static bool capture_head_gateway_case(u16 frontend_port,
     const bool container_removed = docker.remove();
     const std::string upstream_context = "127.0.0.1:" + std::to_string(backend_port);
     u32 connect_failure_record_count = 0;
-    const bool log_readable = log_count_line_with(nginx_log_path,
-                                                  "connect() failed",
-                                                  upstream_context.c_str(),
-                                                  connect_failure_record_count);
+    const bool log_readable = log_count_line_with(
+        nginx_log_path, "connect() failed", upstream_context.c_str(), connect_failure_record_count);
     if (!nginx_stopped) {
         error = "failed to stop nginx after HEAD gateway case";
         return false;
@@ -2543,14 +2585,16 @@ static bool capture_head_gateway_case(u16 frontend_port,
         return false;
     }
     if (!log_readable || connect_failure_record_count != 1) {
-        error = "HEAD gateway log did not contain exactly one line-scoped pinned upstream connect failure";
+        error =
+            "HEAD gateway log did not contain exactly one line-scoped pinned upstream connect "
+            "failure";
         return false;
     }
 
     std::vector<char> normalized = downstream;
-    const std::vector<char> expected(kHeadGatewayResponseNormalized,
-                                     kHeadGatewayResponseNormalized +
-                                         sizeof(kHeadGatewayResponseNormalized) - 1);
+    const std::vector<char> expected(
+        kHeadGatewayResponseNormalized,
+        kHeadGatewayResponseNormalized + sizeof(kHeadGatewayResponseNormalized) - 1);
     if (!normalize_date(normalized) || normalized != expected) {
         error = "HEAD gateway response did not match the exact pinned header-only baseline";
         dump_wire("expected HEAD gateway response", expected);
@@ -2595,9 +2639,9 @@ static bool capture_head_gateway_rut_case(u16 frontend_port,
         return false;
     }
     std::vector<char> normalized = downstream;
-    const std::vector<char> expected(kHeadGatewayResponseNormalized,
-                                     kHeadGatewayResponseNormalized +
-                                         sizeof(kHeadGatewayResponseNormalized) - 1);
+    const std::vector<char> expected(
+        kHeadGatewayResponseNormalized,
+        kHeadGatewayResponseNormalized + sizeof(kHeadGatewayResponseNormalized) - 1);
     if (!normalize_date(normalized) || normalized != expected) {
         error = "RUT HEAD gateway response did not match the exact pinned header-only baseline";
         dump_wire("expected RUT HEAD gateway response", expected);
@@ -2628,9 +2672,19 @@ static bool capture_gateway_case(u16 frontend_port,
 
     DockerGuard docker(container_name);
     ChildGuard nginx;
-    if (!spawn_child({"docker", "run", "--pull=never", "--network", "host", "--name",
-                      container_name, "-v", nginx_config_path + ":/etc/nginx/nginx.conf:ro",
-                      kNginxImage, "nginx", "-g", "daemon off;"},
+    if (!spawn_child({"docker",
+                      "run",
+                      "--pull=never",
+                      "--network",
+                      "host",
+                      "--name",
+                      container_name,
+                      "-v",
+                      nginx_config_path + ":/etc/nginx/nginx.conf:ro",
+                      kNginxImage,
+                      "nginx",
+                      "-g",
+                      "daemon off;"},
                      nginx_log_path,
                      nginx.child)) {
         error = "failed to start pinned nginx for gateway case";
@@ -2678,7 +2732,8 @@ static bool capture_gateway_case(u16 frontend_port,
 }
 
 static std::string api_request(const char* target) {
-    return std::string("GET ") + target + " HTTP/1.1\r\n"
+    return std::string("GET ") + target +
+           " HTTP/1.1\r\n"
            "Host: client.example\r\n"
            "X-Dup: one\r\n"
            "X-Dup: two\r\n"
@@ -2710,9 +2765,19 @@ static bool capture_api_side(u16 frontend_port,
     docker.active = pinned_nginx;
     ChildGuard process;
     if (pinned_nginx) {
-        if (!spawn_child({"docker", "run", "--pull=never", "--network", "host", "--name",
-                          container_name, "-v", nginx_config_path + ":/etc/nginx/nginx.conf:ro",
-                          kNginxImage, "nginx", "-g", "daemon off;"},
+        if (!spawn_child({"docker",
+                          "run",
+                          "--pull=never",
+                          "--network",
+                          "host",
+                          "--name",
+                          container_name,
+                          "-v",
+                          nginx_config_path + ":/etc/nginx/nginx.conf:ro",
+                          kNginxImage,
+                          "nginx",
+                          "-g",
+                          "daemon off;"},
                          nginx_log_path,
                          process.child)) {
             error = "failed to start pinned nginx for API case";
@@ -2734,12 +2799,13 @@ static bool capture_api_side(u16 frontend_port,
         std::vector<char> response;
         std::string vector_error;
         const bool ok = client >= 0 && send_all(client, request.data(), request.size()) &&
-                        read_response(client, response, vector_error) && read_eof(client, vector_error);
+                        read_response(client, response, vector_error) &&
+                        read_eof(client, vector_error);
         if (client >= 0) close(client);
         if (!ok) {
-            error = std::string(pinned_nginx ? "nginx" : "RUT") +
-                    " API vector " + std::to_string(i + 1) + " failed: " +
-                    (vector_error.empty() ? "connect/send failed" : vector_error);
+            error = std::string(pinned_nginx ? "nginx" : "RUT") + " API vector " +
+                    std::to_string(i + 1) +
+                    " failed: " + (vector_error.empty() ? "connect/send failed" : vector_error);
             return false;
         }
         downstream.push_back(std::move(response));
@@ -2819,8 +2885,9 @@ static std::vector<char> expected_api_redirect(u16 frontend_port, const char* ta
         "Date: XXXXXXXXXXXXXXXXXXXXXXXXXXXXX\r\n"
         "Content-Type: text/html\r\n"
         "Content-Length: 169\r\n"
-        "Location: http://client.example:" + std::to_string(frontend_port) + "/api/" +
-        target_suffix + "\r\n"
+        "Location: http://client.example:" +
+        std::to_string(frontend_port) + "/api/" + target_suffix +
+        "\r\n"
         "Connection: close\r\n"
         "\r\n" +
         kApiRedirectBody;
@@ -2850,9 +2917,19 @@ static bool capture_api_redirect_side(u16 frontend_port,
     docker.active = pinned_nginx;
     ChildGuard process;
     if (pinned_nginx) {
-        if (!spawn_child({"docker", "run", "--pull=never", "--network", "host", "--name",
-                          container_name, "-v", nginx_config_path + ":/etc/nginx/nginx.conf:ro",
-                          kNginxImage, "nginx", "-g", "daemon off;"},
+        if (!spawn_child({"docker",
+                          "run",
+                          "--pull=never",
+                          "--network",
+                          "host",
+                          "--name",
+                          container_name,
+                          "-v",
+                          nginx_config_path + ":/etc/nginx/nginx.conf:ro",
+                          kNginxImage,
+                          "nginx",
+                          "-g",
+                          "daemon off;"},
                          nginx_log_path,
                          process.child)) {
             error = "failed to start pinned nginx for API redirect case";
@@ -2869,9 +2946,8 @@ static bool capture_api_redirect_side(u16 frontend_port,
     responses.clear();
     responses.reserve(2);
     for (size_t i = 0; i < 2; i++) {
-        const std::string host = i == 0
-                                     ? "client.example"
-                                     : "client.example:" + std::to_string(frontend_port);
+        const std::string host =
+            i == 0 ? "client.example" : "client.example:" + std::to_string(frontend_port);
         const std::string request = api_redirect_request(kTargets[i], host.c_str());
         const int client = connect_once(frontend_port);
         std::vector<char> response;
@@ -2883,9 +2959,9 @@ static bool capture_api_redirect_side(u16 frontend_port,
         if (client >= 0) close(client);
         responses.push_back(std::move(response));
         if (!ok) {
-            error = std::string(pinned_nginx ? "nginx" : "RUT") +
-                    " API redirect vector " + std::to_string(i + 1) + " failed: " +
-                    (vector_error.empty() ? "connect/send failed" : vector_error);
+            error = std::string(pinned_nginx ? "nginx" : "RUT") + " API redirect vector " +
+                    std::to_string(i + 1) +
+                    " failed: " + (vector_error.empty() ? "connect/send failed" : vector_error);
             return false;
         }
     }
@@ -2894,9 +2970,9 @@ static bool capture_api_redirect_side(u16 frontend_port,
     settle_for_invalid_target_side_effects();
     const bool process_stopped = stop_child(process.child);
     recorder.stop();
-    const bool side_effect_free =
-        recorder.accepted.load(std::memory_order_acquire) == 0 &&
-        recorder.requests.load(std::memory_order_acquire) == 0 && recorder.history.empty();
+    const bool side_effect_free = recorder.accepted.load(std::memory_order_acquire) == 0 &&
+                                  recorder.requests.load(std::memory_order_acquire) == 0 &&
+                                  recorder.history.empty();
     if (!side_effect_free) {
         error = std::string(pinned_nginx ? "nginx" : "RUT") +
                 " API redirect phase caused an upstream side effect";
@@ -2913,11 +2989,11 @@ static bool capture_api_redirect_side(u16 frontend_port,
     }
     for (size_t i = 0; i < responses.size(); i++) {
         std::vector<char> normalized = responses[i];
-        const std::vector<char> expected = expected_api_redirect(frontend_port, kLocationSuffixes[i]);
+        const std::vector<char> expected =
+            expected_api_redirect(frontend_port, kLocationSuffixes[i]);
         if (!normalize_date(normalized) || normalized != expected) {
             error = std::string(pinned_nginx ? "nginx" : "RUT") + " API redirect vector " +
-                    std::to_string(i + 1) +
-                    " did not match the exact pinned response baseline";
+                    std::to_string(i + 1) + " did not match the exact pinned response baseline";
             return false;
         }
     }
@@ -3017,8 +3093,8 @@ static bool capture_api_invalid_case(u16 frontend_port,
         responses.push_back(std::move(response));
         if (!ok) {
             error = "RUT invalid-target API vector " + std::to_string(i + 1) + " (" +
-                    kInvalidTargets[i] + ") failed: " +
-                    (vector_error.empty() ? "connect/send failed" : vector_error);
+                    kInvalidTargets[i] +
+                    ") failed: " + (vector_error.empty() ? "connect/send failed" : vector_error);
             return false;
         }
     }
@@ -3028,9 +3104,9 @@ static bool capture_api_invalid_case(u16 frontend_port,
     settle_for_invalid_target_side_effects();
     const bool process_stopped = stop_child(process.child);
     recorder.stop();
-    const bool side_effect_free =
-        recorder.accepted.load(std::memory_order_acquire) == 0 &&
-        recorder.requests.load(std::memory_order_acquire) == 0 && recorder.history.empty();
+    const bool side_effect_free = recorder.accepted.load(std::memory_order_acquire) == 0 &&
+                                  recorder.requests.load(std::memory_order_acquire) == 0 &&
+                                  recorder.history.empty();
     if (!side_effect_free) {
         error = "RUT invalid-target API phase caused an upstream side effect";
         return false;
@@ -3063,8 +3139,7 @@ int main(int argc, char** argv) {
     if (!command_ok({"docker", "info"}, temp.preflight_log)) {
         if (log_contains(temp.preflight_log, "Cannot connect to the Docker daemon") ||
             log_contains(temp.preflight_log, "Is the docker daemon running") ||
-            log_empty(temp.preflight_log) ||
-            access(temp.preflight_log.c_str(), F_OK) != 0)
+            log_empty(temp.preflight_log) || access(temp.preflight_log.c_str(), F_OK) != 0)
             return missing_prerequisite("Docker daemon unavailable");
         std::cerr << "FAIL [preflight]: Docker daemon probe failed\n";
         dump_log(temp.preflight_log, "Docker preflight log");
@@ -3092,14 +3167,16 @@ int main(int argc, char** argv) {
     }
     u16 frontend_port = 0;
     u16 backend_port = 0;
-    if (!allocate_port(frontend_port) || !allocate_port(backend_port) || frontend_port == backend_port) {
+    if (!allocate_port(frontend_port) || !allocate_port(backend_port) ||
+        frontend_port == backend_port) {
         std::cerr << "FAIL [preflight]: bounded dynamic port allocation failed\n";
         return 1;
     }
 
-    std::string fragment = "server {\n  listen " + std::to_string(frontend_port) +
-                           ";\n  location / {\n    proxy_pass http://127.0.0.1:" +
-                           std::to_string(backend_port) + ";\n  }\n}\n";
+    std::string fragment =
+        "server {\n  listen " + std::to_string(frontend_port) +
+        ";\n  location / {\n    proxy_pass http://127.0.0.1:" + std::to_string(backend_port) +
+        ";\n  }\n}\n";
     auto parsed = rut::nginx::parse({fragment.data(), static_cast<rut::u32>(fragment.size())});
     if (!parsed) {
         std::cerr << "FAIL [parse]: nginx fragment rejected at " << parsed.error().span.line << ":"
@@ -3108,8 +3185,8 @@ int main(int argc, char** argv) {
     }
     auto lowered = rut::nginx::lower_to_rut(parsed.value());
     if (!lowered) {
-        std::cerr << "FAIL [lower]: converter rejected model at " << lowered.error().span.line << ":"
-                  << lowered.error().span.col << "\n";
+        std::cerr << "FAIL [lower]: converter rejected model at " << lowered.error().span.line
+                  << ":" << lowered.error().span.col << "\n";
         return 1;
     }
     if (!write_file(temp.source, lowered.value().data, lowered.value().len)) {
@@ -3173,8 +3250,7 @@ int main(int argc, char** argv) {
     }
     const std::string request(nginx_request.begin(), nginx_request.end());
     if (nginx_request.empty() || nginx_request != rut_request ||
-        request.find("GET /encoded/%7Euser?tag=unreserved HTTP/1.1\r\n") ==
-            std::string::npos) {
+        request.find("GET /encoded/%7Euser?tag=unreserved HTTP/1.1\r\n") == std::string::npos) {
         std::cerr << "FAIL [compare]: upstream request mismatch or target was decoded\n";
         dump_wire("nginx request", nginx_request);
         dump_wire("RUT request", rut_request);
@@ -3238,7 +3314,8 @@ int main(int argc, char** argv) {
         memcmp(normalized_nginx_gateway.data(),
                kGatewayResponseNormalized,
                sizeof(kGatewayResponseNormalized) - 1) != 0) {
-        std::cerr << "FAIL [gateway compare]: exact 502 response mismatch after Date normalization\n";
+        std::cerr
+            << "FAIL [gateway compare]: exact 502 response mismatch after Date normalization\n";
         dump_wire("nginx gateway response", nginx_gateway_response);
         dump_wire("RUT gateway response", rut_gateway_response);
         dump_log(temp.nginx_log, "nginx log");
@@ -3315,8 +3392,10 @@ int main(int argc, char** argv) {
         keepalive_recorder.requests.load(std::memory_order_acquire) != 2 ||
         keepalive_recorder.history[0].connection_id != 1 ||
         keepalive_recorder.history[1].connection_id != 2 ||
-        keepalive_recorder.history[0].connection_id == keepalive_recorder.history[1].connection_id) {
-        std::cerr << "FAIL [pinned HEAD keep-alive]: exact upstream count/connection mapping failed\n";
+        keepalive_recorder.history[0].connection_id ==
+            keepalive_recorder.history[1].connection_id) {
+        std::cerr
+            << "FAIL [pinned HEAD keep-alive]: exact upstream count/connection mapping failed\n";
         for (const auto& response : keepalive_responses)
             dump_wire("pinned HEAD downstream", response);
         dump_pinned_history(keepalive_recorder);
@@ -3333,17 +3412,15 @@ int main(int argc, char** argv) {
             memcmp(normalized.data(), expected_keepalive_responses[i], expected_len) != 0) {
             std::cerr << "FAIL [pinned HEAD keep-alive]: exact response " << (i + 1)
                       << " mismatch\n";
-            dump_wire("expected pinned HEAD response", std::vector<char>(
-                                                            expected_keepalive_responses[i],
-                                                            expected_keepalive_responses[i] +
-                                                                expected_len));
+            dump_wire("expected pinned HEAD response",
+                      std::vector<char>(expected_keepalive_responses[i],
+                                        expected_keepalive_responses[i] + expected_len));
             dump_wire("actual pinned HEAD response", keepalive_responses[i]);
             dump_pinned_history(keepalive_recorder);
             return 1;
         }
         const std::string expected_request =
-            std::string(i == 0 ? "HEAD /head?q=1 HTTP/1.1\r\n"
-                               : "HEAD /head?q=2 HTTP/1.1\r\n") +
+            std::string(i == 0 ? "HEAD /head?q=1 HTTP/1.1\r\n" : "HEAD /head?q=2 HTTP/1.1\r\n") +
             "Host: 127.0.0.1:" + std::to_string(backend_port) + "\r\n\r\n";
         const std::vector<char> expected_wire(expected_request.begin(), expected_request.end());
         if (keepalive_recorder.history[i].wire != expected_wire) {
@@ -3375,8 +3452,7 @@ int main(int argc, char** argv) {
                                             rut_keepalive_error)) {
         std::cerr << "FAIL [reusable HEAD success RUT]: " << rut_keepalive_error << "\n";
         for (size_t i = 0; i < rut_keepalive_responses.size(); i++) {
-            const std::string label =
-                "RUT reusable HEAD success response " + std::to_string(i + 1);
+            const std::string label = "RUT reusable HEAD success response " + std::to_string(i + 1);
             dump_wire(label.c_str(), rut_keepalive_responses[i]);
         }
         rut_keepalive_recorder.stop();
@@ -3404,8 +3480,7 @@ int main(int argc, char** argv) {
         const char* expected_response = expected_keepalive_responses[i];
         const size_t expected_len = strlen(expected_response);
         const std::string expected_request =
-            std::string(i == 0 ? "HEAD /head?q=1 HTTP/1.1\r\n"
-                               : "HEAD /head?q=2 HTTP/1.1\r\n") +
+            std::string(i == 0 ? "HEAD /head?q=1 HTTP/1.1\r\n" : "HEAD /head?q=2 HTTP/1.1\r\n") +
             "Host: 127.0.0.1:" + std::to_string(backend_port) + "\r\n\r\n";
         const std::vector<char> expected_wire(expected_request.begin(), expected_request.end());
         if (!normalize_date(normalized_nginx) || !normalize_date(normalized_rut) ||
@@ -3422,8 +3497,7 @@ int main(int argc, char** argv) {
             dump_wire("RUT reusable HEAD response", rut_keepalive_responses[i]);
             dump_wire("expected reusable HEAD upstream request", expected_wire);
             dump_wire("nginx reusable HEAD upstream request", keepalive_recorder.history[i].wire);
-            dump_wire("RUT reusable HEAD upstream request",
-                      rut_keepalive_recorder.history[i].wire);
+            dump_wire("RUT reusable HEAD upstream request", rut_keepalive_recorder.history[i].wire);
             dump_pinned_history(keepalive_recorder, "nginx reusable HEAD success");
             dump_pinned_history(rut_keepalive_recorder, "RUT reusable HEAD success");
             dump_log(temp.nginx_log, "nginx reusable HEAD success log");
@@ -3518,8 +3592,7 @@ int main(int argc, char** argv) {
         const char* expected_response = expected_malformed_responses[i];
         const size_t expected_len = strlen(expected_response);
         const std::string expected_request =
-            std::string(i == 0 ? "HEAD /head?q=1 HTTP/1.1\r\n"
-                               : "HEAD /head?q=2 HTTP/1.1\r\n") +
+            std::string(i == 0 ? "HEAD /head?q=1 HTTP/1.1\r\n" : "HEAD /head?q=2 HTTP/1.1\r\n") +
             "Host: 127.0.0.1:" + std::to_string(backend_port) + "\r\n\r\n";
         const std::vector<char> expected_wire(expected_request.begin(), expected_request.end());
         if (!normalize_date(normalized_nginx) || !normalize_date(normalized_rut) ||
@@ -3529,8 +3602,7 @@ int main(int argc, char** argv) {
             normalized_nginx != normalized_rut ||
             nginx_malformed_recorder.history[i].wire != expected_wire ||
             rut_malformed_recorder.history[i].wire != expected_wire ||
-            nginx_malformed_recorder.history[i].wire !=
-                rut_malformed_recorder.history[i].wire) {
+            nginx_malformed_recorder.history[i].wire != rut_malformed_recorder.history[i].wire) {
             std::cerr << "FAIL [malformed HEAD differential]: request " << (i + 1)
                       << " nginx/generated-RUT observable wire mismatch\n";
             dump_wire("expected malformed HEAD response",
@@ -3635,8 +3707,7 @@ int main(int argc, char** argv) {
         const char* expected_response = expected_incomplete_responses[i];
         const size_t expected_len = strlen(expected_response);
         const std::string expected_request =
-            std::string(i == 0 ? "HEAD /head?q=1 HTTP/1.1\r\n"
-                               : "HEAD /head?q=2 HTTP/1.1\r\n") +
+            std::string(i == 0 ? "HEAD /head?q=1 HTTP/1.1\r\n" : "HEAD /head?q=2 HTTP/1.1\r\n") +
             "Host: 127.0.0.1:" + std::to_string(backend_port) + "\r\n\r\n";
         const std::vector<char> expected_wire(expected_request.begin(), expected_request.end());
         if (!normalize_date(normalized_nginx) || !normalize_date(normalized_rut) ||
@@ -3646,8 +3717,7 @@ int main(int argc, char** argv) {
             normalized_nginx != normalized_rut ||
             nginx_incomplete_recorder.history[i].wire != expected_wire ||
             rut_incomplete_recorder.history[i].wire != expected_wire ||
-            nginx_incomplete_recorder.history[i].wire !=
-                rut_incomplete_recorder.history[i].wire) {
+            nginx_incomplete_recorder.history[i].wire != rut_incomplete_recorder.history[i].wire) {
             std::cerr << "FAIL [incomplete-EOF HEAD differential]: request " << (i + 1)
                       << " nginx/generated-RUT observable wire mismatch\n";
             dump_wire("expected incomplete-EOF HEAD response",
@@ -3678,16 +3748,15 @@ int main(int argc, char** argv) {
     std::vector<std::vector<char>> keepalive_gateway_responses;
     u32 keepalive_gateway_failures = 0;
     std::string keepalive_gateway_error;
-    if (!capture_nginx_head_keepalive_gateway(
-            frontend_port,
-            backend_port,
-            temp.nginx_config,
-            temp.nginx_log,
-            container + "-head-gateway-keepalive",
-            keepalive_dead,
-            keepalive_gateway_responses,
-            keepalive_gateway_failures,
-            keepalive_gateway_error)) {
+    if (!capture_nginx_head_keepalive_gateway(frontend_port,
+                                              backend_port,
+                                              temp.nginx_config,
+                                              temp.nginx_log,
+                                              container + "-head-gateway-keepalive",
+                                              keepalive_dead,
+                                              keepalive_gateway_responses,
+                                              keepalive_gateway_failures,
+                                              keepalive_gateway_error)) {
         std::cerr << "FAIL [pinned HEAD gateway keep-alive]: " << keepalive_gateway_error << "\n";
         for (const auto& response : keepalive_gateway_responses)
             dump_wire("pinned HEAD gateway downstream", response);
@@ -3738,8 +3807,7 @@ int main(int argc, char** argv) {
                                             rut_keepalive_gateway_error)) {
         std::cerr << "FAIL [reusable HEAD gateway RUT]: " << rut_keepalive_gateway_error << "\n";
         for (size_t i = 0; i < rut_keepalive_gateway_responses.size(); i++) {
-            const std::string label =
-                "RUT reusable HEAD gateway response " + std::to_string(i + 1);
+            const std::string label = "RUT reusable HEAD gateway response " + std::to_string(i + 1);
             dump_wire(label.c_str(), rut_keepalive_gateway_responses[i]);
         }
         dump_log(temp.nginx_log, "nginx reusable HEAD gateway log");
@@ -3765,8 +3833,7 @@ int main(int argc, char** argv) {
             dump_wire("expected reusable HEAD gateway response",
                       std::vector<char>(expected_response, expected_response + expected_len));
             dump_wire("nginx reusable HEAD gateway response", keepalive_gateway_responses[i]);
-            dump_wire("RUT reusable HEAD gateway response",
-                      rut_keepalive_gateway_responses[i]);
+            dump_wire("RUT reusable HEAD gateway response", rut_keepalive_gateway_responses[i]);
             dump_log(temp.nginx_log, "nginx reusable HEAD gateway log");
             dump_log(temp.rut_log, "RUT reusable HEAD gateway log");
             return 1;
@@ -3798,12 +3865,11 @@ int main(int argc, char** argv) {
         dump_log(temp.rut_log, "RUT HEAD log");
         return 1;
     }
-    const std::vector<char> expected_head_response(kHeadResponseNormalized,
-                                                   kHeadResponseNormalized +
-                                                       sizeof(kHeadResponseNormalized) - 1);
-    const std::string expected_head_request =
-        std::string("HEAD /head?q=1 HTTP/1.1\r\n") +
-        "Host: 127.0.0.1:" + std::to_string(backend_port) + "\r\n\r\n";
+    const std::vector<char> expected_head_response(
+        kHeadResponseNormalized, kHeadResponseNormalized + sizeof(kHeadResponseNormalized) - 1);
+    const std::string expected_head_request = std::string("HEAD /head?q=1 HTTP/1.1\r\n") +
+                                              "Host: 127.0.0.1:" + std::to_string(backend_port) +
+                                              "\r\n\r\n";
     const std::vector<char> expected_head_wire(expected_head_request.begin(),
                                                expected_head_request.end());
     std::vector<char> normalized_nginx_head = nginx_head_response;
@@ -3828,7 +3894,8 @@ int main(int argc, char** argv) {
 
     DeadPort head_gateway_dead;
     if (!head_gateway_dead.reserve(backend_port)) {
-        std::cerr << "FAIL [HEAD gateway differential]: failed to reserve unavailable upstream port\n";
+        std::cerr
+            << "FAIL [HEAD gateway differential]: failed to reserve unavailable upstream port\n";
         return 1;
     }
     std::vector<char> nginx_head_gateway_differential_response;
@@ -3858,8 +3925,8 @@ int main(int argc, char** argv) {
                                        head_gateway_dead,
                                        rut_head_gateway_differential_response,
                                        rut_head_gateway_differential_error)) {
-        std::cerr << "FAIL [HEAD gateway differential RUT]: "
-                  << rut_head_gateway_differential_error << "\n";
+        std::cerr << "FAIL [HEAD gateway differential RUT]: " << rut_head_gateway_differential_error
+                  << "\n";
         dump_wire("nginx HEAD gateway response", nginx_head_gateway_differential_response);
         dump_wire("RUT HEAD gateway response", rut_head_gateway_differential_response);
         dump_log(temp.rut_log, "RUT HEAD gateway log");
@@ -3883,7 +3950,8 @@ int main(int argc, char** argv) {
         dump_log(temp.rut_log, "RUT HEAD gateway log");
         return 1;
     }
-    std::cerr << "PASS: converter-generated RUT HEAD unavailable-upstream gateway matches pinned nginx\n";
+    std::cerr
+        << "PASS: converter-generated RUT HEAD unavailable-upstream gateway matches pinned nginx\n";
 
     u16 api_frontend_port = 0;
     u16 api_backend_port = 0;
@@ -3892,12 +3960,11 @@ int main(int argc, char** argv) {
         std::cerr << "FAIL [api preflight]: bounded dynamic port allocation failed\n";
         return 1;
     }
-    const std::string api_fragment =
-        "server {\n  listen " + std::to_string(api_frontend_port) +
-        ";\n  location /api/ {\n    proxy_pass http://127.0.0.1:" +
-        std::to_string(api_backend_port) + "/;\n  }\n}\n";
-    auto api_parsed = rut::nginx::parse(
-        {api_fragment.data(), static_cast<rut::u32>(api_fragment.size())});
+    const std::string api_fragment = "server {\n  listen " + std::to_string(api_frontend_port) +
+                                     ";\n  location /api/ {\n    proxy_pass http://127.0.0.1:" +
+                                     std::to_string(api_backend_port) + "/;\n  }\n}\n";
+    auto api_parsed =
+        rut::nginx::parse({api_fragment.data(), static_cast<rut::u32>(api_fragment.size())});
     if (!api_parsed) {
         std::cerr << "FAIL [api parse]: nginx fragment rejected at " << api_parsed.error().span.line
                   << ":" << api_parsed.error().span.col << "\n";
@@ -3930,8 +3997,7 @@ int main(int argc, char** argv) {
         std::cerr << "FAIL [api source]: secure generated source overwrite failed\n";
         return 1;
     }
-    const std::string api_nginx_config =
-        "events {}\nhttp {\n" + api_fragment + "}\n";
+    const std::string api_nginx_config = "events {}\nhttp {\n" + api_fragment + "}\n";
     if (!write_file(temp.nginx_config, api_nginx_config.data(), api_nginx_config.size())) {
         std::cerr << "FAIL [api nginx-config]: config overwrite failed\n";
         return 1;
@@ -3961,8 +4027,7 @@ int main(int argc, char** argv) {
             dump_wire(("nginx API response " + std::to_string(i + 1)).c_str(),
                       nginx_api_responses[i]);
         for (size_t i = 0; i < rut_api_responses.size(); i++)
-            dump_wire(("RUT API response " + std::to_string(i + 1)).c_str(),
-                      rut_api_responses[i]);
+            dump_wire(("RUT API response " + std::to_string(i + 1)).c_str(), rut_api_responses[i]);
         dump_log(temp.nginx_log, "nginx log");
         dump_log(temp.rut_log, "RUT log");
         return 1;
@@ -3971,8 +4036,7 @@ int main(int argc, char** argv) {
     static constexpr const char* kApiTargets[] = {"/", "/x", "/x?y=1"};
     for (size_t i = 0; i < 3; i++) {
         if (!starts_with_200(nginx_api_responses[i]) || !starts_with_200(rut_api_responses[i])) {
-            std::cerr << "FAIL [api compare " << (i + 1)
-                      << "]: expected HTTP/1.1 200 response\n";
+            std::cerr << "FAIL [api compare " << (i + 1) << "]: expected HTTP/1.1 200 response\n";
             dump_wire("nginx API response", nginx_api_responses[i]);
             dump_wire("RUT API response", rut_api_responses[i]);
             dump_log(temp.nginx_log, "nginx log");
@@ -4060,7 +4124,8 @@ int main(int argc, char** argv) {
         dump_log(temp.rut_log, "RUT log");
         return 1;
     }
-    std::cerr << "PASS: RUT /api/ out-of-slice targets fail closed (3 vectors, no upstream side effects)\n";
+    std::cerr << "PASS: RUT /api/ out-of-slice targets fail closed (3 vectors, no upstream side "
+                 "effects)\n";
     return 0;
 #endif
 }

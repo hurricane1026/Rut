@@ -4,10 +4,10 @@
 #include "rut/common/types.h"
 #include "rut/runtime/error.h"
 #include "rut/runtime/io_backend.h"
-
 #include <atomic>
-#include <linux/io_uring.h>
+
 #include <errno.h>
+#include <linux/io_uring.h>
 #include <sys/mman.h>
 #include <sys/syscall.h>
 #include <unistd.h>
@@ -124,12 +124,9 @@ struct IoUringBackend {
     // cancel's own CQE retains the selected operation type and is tagged
     // separately from pause/rearm cancellation. Returns true only after the
     // cancel SQE has actually been queued.
-    bool cancel_retiring_upstream(u32 conn_id,
-                                  IoEventType type,
-                                  u32 upstream_episode);
+    bool cancel_retiring_upstream(u32 conn_id, IoEventType type, u32 upstream_episode);
     bool cancel_retiring_upstream_recv(u32 conn_id, u32 upstream_episode) {
-        return cancel_retiring_upstream(
-            conn_id, IoEventType::UpstreamRecv, upstream_episode);
+        return cancel_retiring_upstream(conn_id, IoEventType::UpstreamRecv, upstream_episode);
     }
 
     // Submit a send (or zero-copy send).
@@ -137,19 +134,11 @@ struct IoUringBackend {
     bool add_send(i32 fd, u32 conn_id, const u8* buf, u32 len);
 
     // Same as add_send but encodes UpstreamSend in user_data.
-    bool add_send_upstream(i32 fd,
-                           u32 conn_id,
-                           const u8* buf,
-                           u32 len,
-                           u32 upstream_episode = 1);
+    bool add_send_upstream(i32 fd, u32 conn_id, const u8* buf, u32 len, u32 upstream_episode = 1);
 
     // Submit a connect to upstream.
     // Returns false if SQ is full (no SQE submitted).
-    bool add_connect(i32 fd,
-                     u32 conn_id,
-                     const void* addr,
-                     u32 addr_len,
-                     u32 upstream_episode = 1);
+    bool add_connect(i32 fd, u32 conn_id, const void* addr, u32 addr_len, u32 upstream_episode = 1);
 
     // Submit IORING_OP_TIMEOUT for a JIT handler yield. ms granularity —
     // the timespec storage lives on the Connection because the kernel
@@ -210,22 +199,16 @@ private:
                                          u8 aux = 0);
     static void decode_user_data(u64 data, u32& conn_id, IoEventType& type);
     static void decode_user_data(u64 data, u32& conn_id, IoEventType& type, u32& aux);
-    static void decode_user_data(u64 data,
-                                 u32& conn_id,
-                                 IoEventType& type,
-                                 u32& aux,
-                                 u32& upstream_episode);
+    static void decode_user_data(
+        u64 data, u32& conn_id, IoEventType& type, u32& aux, u32& upstream_episode);
 
 private:
     // Submit a cancel SQE matching a specific user_data value.
     // conn_id/type/aux are encoded in the cancel CQE's user_data. Pass the real
     // conn_id for tracked close-path cancels, or kCancelConnId for fire-and-
     // forget cancels that should be consumed silently.
-    bool cancel_by_user_data(u64 target,
-                             u32 conn_id,
-                             IoEventType type,
-                             u32 aux = 0,
-                             u32 upstream_episode = 0);
+    bool cancel_by_user_data(
+        u64 target, u32 conn_id, IoEventType type, u32 aux = 0, u32 upstream_episode = 0);
 
     // Get next available SQE. Returns nullptr if SQ is full.
     io_uring_sqe* get_sqe();
@@ -237,8 +220,7 @@ private:
     void submit_timer_read();
 
     void record_enter_error(i32 result) {
-        if (result < 0 && result != -EINTR)
-            fatal_error.store(-result, std::memory_order_release);
+        if (result < 0 && result != -EINTR) fatal_error.store(-result, std::memory_order_release);
     }
 };
 

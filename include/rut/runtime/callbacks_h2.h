@@ -748,8 +748,7 @@ void h2_invoke_emit(H2Dispatch<Loop>& d,
         // Redirect serialization is deliberately unavailable in this
         // increment. Validate the pinned table reference, then reject before
         // creating any H2 proxy/async state or upstream work.
-        if (cfg == nullptr ||
-            !cfg->redirect_policy_id_is_valid(kOutcome.redirect_policy_id)) {
+        if (cfg == nullptr || !cfg->redirect_policy_id_is_valid(kOutcome.redirect_policy_id)) {
             h2_emit_status(d, stream_id, 400);
             return;
         }
@@ -1486,8 +1485,7 @@ void h2_resume_jit_handler(Loop* loop, Connection& conn) {
         // Resolve the pinned id even though both valid and invalid ids are
         // rejected until H2 serialization exists.
         const bool valid = h2->async_cfg != nullptr &&
-                           h2->async_cfg->redirect_policy_id_is_valid(
-                               kOutcome.redirect_policy_id);
+                           h2->async_cfg->redirect_policy_id_is_valid(kOutcome.redirect_policy_id);
         (void)valid;
         h2_emit_status(d, kStreamId, 400);
         conn.pending_handler_fn = nullptr;
@@ -1512,14 +1510,13 @@ void h2_resume_jit_handler(Loop* loop, Connection& conn) {
         if (kOutcome.response_policy_id != 0 &&
             (h2->async_cfg == nullptr ||
              !h2->async_cfg->response_policy_id_is_valid(kOutcome.response_policy_id) ||
-             conn.resp_header_mutation_count != 0 ||
-             conn.resp_header_mutation_pending_count != 0 ||
-             conn.resp_header_mutation_pending_overflow ||
-             conn.resp_header_mutation_overflow))
+             conn.resp_header_mutation_count != 0 || conn.resp_header_mutation_pending_count != 0 ||
+             conn.resp_header_mutation_pending_overflow || conn.resp_header_mutation_overflow))
             failure_status = 400;
         if (failure_status == 0 && kOutcome.response_policy_id != 0) failure_status = 400;
         if (kOutcome.request_policy_id != 0) failure_status = 400;
-        if (failure_status == 0 && h2->async_request_body_followed && !h2->async_request_stream_open) {
+        if (failure_status == 0 && h2->async_request_body_followed &&
+            !h2->async_request_stream_open) {
             failure_status = 503;
         } else if (!h2->async_request_forwardable) {
             failure_status = 400;

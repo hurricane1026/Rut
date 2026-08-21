@@ -846,17 +846,10 @@ public:
     bool submit_connect_impl(Connection& c, const void* addr, u32 addr_len) {
         const bool submitted = [&] {
             if constexpr (requires {
-                              backend.add_connect(c.upstream_fd,
-                                                   c.id,
-                                                   addr,
-                                                   addr_len,
-                                                   c.upstream_episode);
+                              backend.add_connect(
+                                  c.upstream_fd, c.id, addr, addr_len, c.upstream_episode);
                           }) {
-                return backend.add_connect(c.upstream_fd,
-                                           c.id,
-                                           addr,
-                                           addr_len,
-                                           c.upstream_episode);
+                return backend.add_connect(c.upstream_fd, c.id, addr, addr_len, c.upstream_episode);
             } else {
                 return backend.add_connect(c.upstream_fd, c.id, addr, addr_len);
             }
@@ -870,17 +863,10 @@ public:
     bool submit_send_upstream_impl(Connection& c, const u8* buf, u32 len) {
         const bool submitted = [&] {
             if constexpr (requires {
-                              backend.add_send_upstream(c.upstream_fd,
-                                                        c.id,
-                                                        buf,
-                                                        len,
-                                                        c.upstream_episode);
+                              backend.add_send_upstream(
+                                  c.upstream_fd, c.id, buf, len, c.upstream_episode);
                           }) {
-                return backend.add_send_upstream(c.upstream_fd,
-                                                 c.id,
-                                                 buf,
-                                                 len,
-                                                 c.upstream_episode);
+                return backend.add_send_upstream(c.upstream_fd, c.id, buf, len, c.upstream_episode);
             } else {
                 return backend.add_send_upstream(c.upstream_fd, c.id, buf, len);
             }
@@ -896,9 +882,7 @@ public:
     }
     void pause_upstream_recv_impl(Connection& c) {
         if constexpr (requires {
-                          backend.pause_upstream_recv(c.upstream_fd,
-                                                      c.id,
-                                                      c.upstream_episode);
+                          backend.pause_upstream_recv(c.upstream_fd, c.id, c.upstream_episode);
                       }) {
             backend.pause_upstream_recv(c.upstream_fd, c.id, c.upstream_episode);
         } else if constexpr (requires { backend.pause_upstream_recv(c.id); }) {
@@ -912,9 +896,7 @@ public:
         }
         const bool submitted = [&] {
             if constexpr (requires {
-                              backend.add_recv_upstream(c.upstream_fd,
-                                                        c.id,
-                                                        c.upstream_episode);
+                              backend.add_recv_upstream(c.upstream_fd, c.id, c.upstream_episode);
                           }) {
                 return backend.add_recv_upstream(c.upstream_fd, c.id, c.upstream_episode);
             } else {

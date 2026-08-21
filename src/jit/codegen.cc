@@ -1018,8 +1018,8 @@ static void emit_instruction(Ctx& c, const rir::Instruction& inst) {
             // Preserve forged negative i32 immediates as unsigned bits; the
             // helper records them as a fail-closed sentinel rather than
             // collapsing them into the no-effect state.
-            LLVMValueRef id = LLVMConstInt(
-                c.i32_ty, static_cast<u32>(inst.imm.i32_val), /*sign_extend=*/0);
+            LLVMValueRef id =
+                LLVMConstInt(c.i32_ty, static_cast<u32>(inst.imm.i32_val), /*sign_extend=*/0);
             LLVMValueRef args[] = {c.param_conn, id};
             LLVMBuildCall2(c.builder,
                            LLVMGlobalGetValueType(c.get_req_set_target_transform()),
@@ -1791,10 +1791,8 @@ static void emit_instruction(Ctx& c, const rir::Instruction& inst) {
             // codegen boundary fail-closed too: an unverified zero/negative/
             // wide value produces a Redirect with id 0, which dispatch rejects.
             const i64 raw_id = inst.imm.i32_val;
-            const u64 policy_id = (raw_id > 0 && raw_id <= 0xffff) ?
-                                      static_cast<u64>(raw_id) : 0;
-            const u64 packed = static_cast<u64>(HandlerAction::Redirect) |
-                               (policy_id << 24);
+            const u64 policy_id = (raw_id > 0 && raw_id <= 0xffff) ? static_cast<u64>(raw_id) : 0;
+            const u64 packed = static_cast<u64>(HandlerAction::Redirect) | (policy_id << 24);
             c.emit_parse_unprime();
             LLVMBuildRet(c.builder, LLVMConstInt(c.i64_ty, packed, 0));
             break;
@@ -1816,8 +1814,7 @@ static void emit_instruction(Ctx& c, const rir::Instruction& inst) {
             const bool is_bundle = inst.op == rir::Opcode::RetForwardBundle;
             LLVMValueRef action = LLVMConstInt(
                 c.i64_ty,
-                static_cast<u64>(is_bundle ? HandlerAction::ForwardBundle
-                                           : HandlerAction::Forward),
+                static_cast<u64>(is_bundle ? HandlerAction::ForwardBundle : HandlerAction::Forward),
                 0);
             LLVMValueRef up_ext = LLVMBuildZExt(c.builder, upstream, c.i64_ty, "up.e");
             LLVMValueRef shifted =
@@ -1836,10 +1833,12 @@ static void emit_instruction(Ctx& c, const rir::Instruction& inst) {
                 if (policy_ty) {
                     switch (policy_ty->kind) {
                         case rir::TypeKind::I32:
-                            policy_ext = LLVMBuildSExt(c.builder, policy_raw, c.i64_ty, "policy.sext");
+                            policy_ext =
+                                LLVMBuildSExt(c.builder, policy_raw, c.i64_ty, "policy.sext");
                             break;
                         case rir::TypeKind::U32:
-                            policy_ext = LLVMBuildZExt(c.builder, policy_raw, c.i64_ty, "policy.zext");
+                            policy_ext =
+                                LLVMBuildZExt(c.builder, policy_raw, c.i64_ty, "policy.zext");
                             break;
                         case rir::TypeKind::I64:
                         case rir::TypeKind::U64:
@@ -1854,19 +1853,26 @@ static void emit_instruction(Ctx& c, const rir::Instruction& inst) {
                 }
                 LLVMValueRef at_least_zero = LLVMBuildICmp(
                     c.builder, LLVMIntSGE, policy_ext, LLVMConstInt(c.i64_ty, 0, 0), "policy.ge0");
-                LLVMValueRef at_most_u16 = LLVMBuildICmp(
-                    c.builder, LLVMIntSLE, policy_ext, LLVMConstInt(c.i64_ty, 0xffffu, 0), "policy.le16");
-                LLVMValueRef in_range = LLVMBuildAnd(c.builder, at_least_zero, at_most_u16, "policy.range");
-                LLVMValueRef safe_policy = LLVMBuildSelect(
-                    c.builder, in_range, policy_ext, LLVMConstInt(c.i64_ty, 0xffffu, 0), "policy.clamped");
+                LLVMValueRef at_most_u16 = LLVMBuildICmp(c.builder,
+                                                         LLVMIntSLE,
+                                                         policy_ext,
+                                                         LLVMConstInt(c.i64_ty, 0xffffu, 0),
+                                                         "policy.le16");
+                LLVMValueRef in_range =
+                    LLVMBuildAnd(c.builder, at_least_zero, at_most_u16, "policy.range");
+                LLVMValueRef safe_policy = LLVMBuildSelect(c.builder,
+                                                           in_range,
+                                                           policy_ext,
+                                                           LLVMConstInt(c.i64_ty, 0xffffu, 0),
+                                                           "policy.clamped");
                 // Keep the policy confined to the 16-bit status slot before
                 // shifting it.  The range select above makes this redundant
                 // for well-typed values, but the explicit mask is an ABI
                 // boundary: no direct-RIR policy bits may reach upstream_id.
                 safe_policy = LLVMBuildAnd(
                     c.builder, safe_policy, LLVMConstInt(c.i64_ty, 0xffffu, 0), "policy.mask");
-                LLVMValueRef policy_shifted =
-                    LLVMBuildShl(c.builder, safe_policy, LLVMConstInt(c.i64_ty, 8, 0), "policy.shl");
+                LLVMValueRef policy_shifted = LLVMBuildShl(
+                    c.builder, safe_policy, LLVMConstInt(c.i64_ty, 8, 0), "policy.shl");
                 result = LLVMBuildOr(c.builder, result, policy_shifted, "result.policy");
             }
             if (inst.operand_count > 2) {
@@ -1897,27 +1903,24 @@ static void emit_instruction(Ctx& c, const rir::Instruction& inst) {
                             break;
                     }
                 }
-                if (!response_ext)
-                    response_ext = LLVMConstInt(c.i64_ty, 0xffffu, 0);
-                LLVMValueRef response_ge_zero = LLVMBuildICmp(
-                    c.builder,
-                    LLVMIntSGE,
-                    response_ext,
-                    LLVMConstInt(c.i64_ty, 0, 0),
-                    "response_policy.ge0");
-                LLVMValueRef response_le_u16 = LLVMBuildICmp(
-                    c.builder,
-                    LLVMIntSLE,
-                    response_ext,
-                    LLVMConstInt(c.i64_ty, 0xffffu, 0),
-                    "response_policy.le16");
+                if (!response_ext) response_ext = LLVMConstInt(c.i64_ty, 0xffffu, 0);
+                LLVMValueRef response_ge_zero = LLVMBuildICmp(c.builder,
+                                                              LLVMIntSGE,
+                                                              response_ext,
+                                                              LLVMConstInt(c.i64_ty, 0, 0),
+                                                              "response_policy.ge0");
+                LLVMValueRef response_le_u16 = LLVMBuildICmp(c.builder,
+                                                             LLVMIntSLE,
+                                                             response_ext,
+                                                             LLVMConstInt(c.i64_ty, 0xffffu, 0),
+                                                             "response_policy.le16");
                 LLVMValueRef response_in_range = LLVMBuildAnd(
                     c.builder, response_ge_zero, response_le_u16, "response_policy.range");
                 LLVMValueRef safe_response = LLVMBuildSelect(c.builder,
-                                                              response_in_range,
-                                                              response_ext,
-                                                              LLVMConstInt(c.i64_ty, 0xffffu, 0),
-                                                              "response_policy.clamped");
+                                                             response_in_range,
+                                                             response_ext,
+                                                             LLVMConstInt(c.i64_ty, 0xffffu, 0),
+                                                             "response_policy.clamped");
                 safe_response = LLVMBuildAnd(c.builder,
                                              safe_response,
                                              LLVMConstInt(c.i64_ty, 0xffffu, 0),

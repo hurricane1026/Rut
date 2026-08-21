@@ -298,19 +298,11 @@ TEST(jit, redirect_abi_and_compiled_action_are_fail_closed) {
     CHECK_FALSE(HandlerResult::redirect_fields_valid(bad_kind));
     HandlerCtx invalid_ctx{};
     const u8 request[] = "GET / HTTP/1.1\r\nHost: x\r\n\r\n";
-    auto invalid_outcome = invoke_jit_handler(&invalid_redirect_handler,
-                                               nullptr,
-                                               invalid_ctx,
-                                               request,
-                                               sizeof(request) - 1,
-                                               nullptr);
+    auto invalid_outcome = invoke_jit_handler(
+        &invalid_redirect_handler, nullptr, invalid_ctx, request, sizeof(request) - 1, nullptr);
     CHECK_EQ(invalid_outcome.kind, JitDispatchOutcome::Kind::Error);
-    invalid_outcome = invoke_jit_handler(&invalid_action_handler,
-                                         nullptr,
-                                         invalid_ctx,
-                                         request,
-                                         sizeof(request) - 1,
-                                         nullptr);
+    invalid_outcome = invoke_jit_handler(
+        &invalid_action_handler, nullptr, invalid_ctx, request, sizeof(request) - 1, nullptr);
     CHECK_EQ(invalid_outcome.kind, JitDispatchOutcome::Kind::Error);
 
     TestContext tc;
@@ -330,12 +322,8 @@ TEST(jit, redirect_abi_and_compiled_action_are_fail_closed) {
     REQUIRE(handler != nullptr);
     HandlerCtx ctx{};
     const u8 redirect_request[] = "GET /api HTTP/1.1\r\nHost: x\r\n\r\n";
-    const auto outcome = invoke_jit_handler(handler,
-                                             nullptr,
-                                             ctx,
-                                             redirect_request,
-                                             sizeof(redirect_request) - 1,
-                                             nullptr);
+    const auto outcome = invoke_jit_handler(
+        handler, nullptr, ctx, redirect_request, sizeof(redirect_request) - 1, nullptr);
     CHECK_EQ(outcome.kind, JitDispatchOutcome::Kind::Redirect);
     CHECK_EQ(outcome.redirect_policy_id, 65535u);
     engine.shutdown();
@@ -8275,7 +8263,9 @@ TEST(jit_dispatch, forward_bundle_keeps_request_and_bundle_ids_independent) {
 
 TEST(jit, compiled_failure_only_forward_bundle_preserves_zero_response_id) {
     const char* src =
-        "upstream b\nroute GET \"/\" { return forward(b, failure_policy: { version: \"HTTP/1.1\", status: 502, reason: \"Bad Gateway\", content_type: \"text/plain\", server: \"nginx\", date: \"current\", connection: \"request\", body: b\"x\" }) }\n";
+        "upstream b\nroute GET \"/\" { return forward(b, failure_policy: { version: \"HTTP/1.1\", "
+        "status: 502, reason: \"Bad Gateway\", content_type: \"text/plain\", server: \"nginx\", "
+        "date: \"current\", connection: \"request\", body: b\"x\" }) }\n";
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
     auto ast = parse_file_heap(lexed.value());
@@ -9848,19 +9838,21 @@ TEST(jit, target_transform_effect_records_and_fails_closed) {
                            "handler_proxy_transform_zero",
                            "handler_proxy_transform_wide",
                            "handler_proxy_transform_duplicate"};
-    const u16 ids[] = {1, kInvalidForwardTargetTransformId, kInvalidForwardTargetTransformId,
+    const u16 ids[] = {1,
+                       kInvalidForwardTargetTransformId,
+                       kInvalidForwardTargetTransformId,
                        kInvalidForwardTargetTransformId};
     for (u32 i = 0; i < 4; i++) {
         Connection conn;
         conn.reset();
         auto handler = reinterpret_cast<HandlerFn>(engine.lookup(names[i]));
         REQUIRE(handler != nullptr);
-        const auto result = HandlerResult::unpack(handler(
-            &conn,
-            nullptr,
-            reinterpret_cast<const u8*>(kGetApiRequest),
-            sizeof(kGetApiRequest) - 1,
-            nullptr));
+        const auto result =
+            HandlerResult::unpack(handler(&conn,
+                                          nullptr,
+                                          reinterpret_cast<const u8*>(kGetApiRequest),
+                                          sizeof(kGetApiRequest) - 1,
+                                          nullptr));
         CHECK(result.action == HandlerAction::Forward);
         CHECK(conn.target_transform_recorded);
         CHECK_EQ(conn.target_transform_id, ids[i]);
@@ -9881,7 +9873,8 @@ TEST(jit, ret_forward_request_policy_abi_fails_closed) {
         auto entry = V(b.create_block(fn, lit("entry")));
         b.set_insert_point(fn, entry);
         auto upstream = V(b.emit_const_i32(7));
-        auto policy = wide ? V(b.emit_const_i64(value)) : V(b.emit_const_i32(static_cast<i32>(value)));
+        auto policy =
+            wide ? V(b.emit_const_i64(value)) : V(b.emit_const_i32(static_cast<i32>(value)));
         VOK(b.emit_ret_forward(upstream, policy));
     };
     add("proxy_policy_valid", false, 1);
@@ -9903,8 +9896,12 @@ TEST(jit, ret_forward_request_policy_abi_fails_closed) {
     for (u32 i = 0; i < 4; i++) {
         auto handler = reinterpret_cast<HandlerFn>(engine.lookup(names[i]));
         REQUIRE(handler != nullptr);
-        const auto result = HandlerResult::unpack(handler(
-            nullptr, nullptr, reinterpret_cast<const u8*>(kGetApiRequest), sizeof(kGetApiRequest) - 1, nullptr));
+        const auto result =
+            HandlerResult::unpack(handler(nullptr,
+                                          nullptr,
+                                          reinterpret_cast<const u8*>(kGetApiRequest),
+                                          sizeof(kGetApiRequest) - 1,
+                                          nullptr));
         CHECK(result.action == HandlerAction::Forward);
         CHECK_EQ(result.upstream_id, 7u);
         CHECK_EQ(result.status_code, policies[i]);
@@ -9952,8 +9949,12 @@ TEST(jit, ret_forward_response_policy_abi_uses_next_state_and_fails_closed) {
     for (u32 i = 0; i < 5; i++) {
         auto handler = reinterpret_cast<HandlerFn>(engine.lookup(names[i]));
         REQUIRE(handler != nullptr);
-        const auto result = HandlerResult::unpack(handler(
-            nullptr, nullptr, reinterpret_cast<const u8*>(kGetApiRequest), sizeof(kGetApiRequest) - 1, nullptr));
+        const auto result =
+            HandlerResult::unpack(handler(nullptr,
+                                          nullptr,
+                                          reinterpret_cast<const u8*>(kGetApiRequest),
+                                          sizeof(kGetApiRequest) - 1,
+                                          nullptr));
         CHECK(result.action == HandlerAction::Forward);
         CHECK_EQ(result.upstream_id, 7u);
         CHECK_EQ(result.status_code, request_policies[i]);

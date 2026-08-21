@@ -3,13 +3,12 @@
 #include "rut/compiler/lower_rir.h"
 #include "rut/compiler/mir_build.h"
 #include "rut/compiler/parser.h"
+#include "rut/compiler/verifier.h"
 #include "rut/nginx/converter.h"
 #include "rut/nginx/parser.h"
-#include "rut/compiler/verifier.h"
 #include "rut/runtime/compile_to_config.h"
 #include "rut/runtime/listener.h"
 #include "test.h"
-
 #include <memory>
 
 using namespace rut;
@@ -98,38 +97,50 @@ TEST(nginx_parser, rejects_unmatched_location_and_proxy_uri_shapes) {
     const char root_with_uri[] =
         "server { listen 8080; location / { proxy_pass http://127.0.0.1:1/; } }";
     CHECK(is_error(nginx::parse({root_with_uri, sizeof(root_with_uri) - 1}),
-                   FrontendError::UnsupportedSyntax, 1, 65,
+                   FrontendError::UnsupportedSyntax,
+                   1,
+                   65,
                    lit_str("location / cannot use a proxy_pass URI")));
 
     const char api_without_uri[] =
         "server { listen 8080; location /api/ { proxy_pass http://127.0.0.1:1; } }";
     CHECK(is_error(nginx::parse({api_without_uri, sizeof(api_without_uri) - 1}),
-                   FrontendError::UnsupportedSyntax, 1, 32,
+                   FrontendError::UnsupportedSyntax,
+                   1,
+                   32,
                    lit_str("location /api/ requires proxy_pass URI /")));
 
     const char api_without_trailing_slash[] =
         "server { listen 8080; location /api { proxy_pass http://127.0.0.1:1/; } }";
-    CHECK(is_error(nginx::parse({api_without_trailing_slash,
-                                 sizeof(api_without_trailing_slash) - 1}),
-                   FrontendError::UnsupportedSyntax, 1, 32,
-                   lit_str("only location / or /api/ is supported")));
+    CHECK(
+        is_error(nginx::parse({api_without_trailing_slash, sizeof(api_without_trailing_slash) - 1}),
+                 FrontendError::UnsupportedSyntax,
+                 1,
+                 32,
+                 lit_str("only location / or /api/ is supported")));
 
     const char other_uri[] =
         "server { listen 8080; location /api/ { proxy_pass http://127.0.0.1:1/v1; } }";
     CHECK(is_error(nginx::parse({other_uri, sizeof(other_uri) - 1}),
-                   FrontendError::UnsupportedSyntax, 1, 51,
+                   FrontendError::UnsupportedSyntax,
+                   1,
+                   51,
                    lit_str("proxy_pass URI suffixes are unsupported")));
 
     const char variable_uri[] =
         "server { listen 8080; location /api/ { proxy_pass http://127.0.0.1:1/$x; } }";
     CHECK(is_error(nginx::parse({variable_uri, sizeof(variable_uri) - 1}),
-                   FrontendError::UnsupportedSyntax, 1, 51,
+                   FrontendError::UnsupportedSyntax,
+                   1,
+                   51,
                    lit_str("variables are unsupported")));
 
     const char query_uri[] =
         "server { listen 8080; location /api/ { proxy_pass http://127.0.0.1:1/?x; } }";
     CHECK(is_error(nginx::parse({query_uri, sizeof(query_uri) - 1}),
-                   FrontendError::UnsupportedSyntax, 1, 51,
+                   FrontendError::UnsupportedSyntax,
+                   1,
+                   51,
                    lit_str("proxy_pass URI suffixes are unsupported")));
 
     const char fragment_uri[] =
@@ -158,47 +169,74 @@ TEST(nginx_parser, accepts_comments_whitespace_and_boundaries) {
 TEST(nginx_parser, rejects_missing_and_duplicate_directives) {
     const char no_listen[] = "server { location / { proxy_pass http://127.0.0.1:1; } }";
     CHECK(is_error(nginx::parse({no_listen, sizeof(no_listen) - 1}),
-                   FrontendError::UnsupportedSyntax, 1, 1, lit_str("missing listen")));
+                   FrontendError::UnsupportedSyntax,
+                   1,
+                   1,
+                   lit_str("missing listen")));
 
     const char duplicate_listen[] =
         "server { listen 8080; listen 8081; location / { proxy_pass http://127.0.0.1:1; } }";
     CHECK(is_error(nginx::parse({duplicate_listen, sizeof(duplicate_listen) - 1}),
-                   FrontendError::UnsupportedSyntax, 1, 23, lit_str("duplicate listen")));
+                   FrontendError::UnsupportedSyntax,
+                   1,
+                   23,
+                   lit_str("duplicate listen")));
 
     const char no_location[] = "server { listen 8080; }";
     CHECK(is_error(nginx::parse({no_location, sizeof(no_location) - 1}),
-                   FrontendError::UnsupportedSyntax, 1, 1, lit_str("missing location")));
+                   FrontendError::UnsupportedSyntax,
+                   1,
+                   1,
+                   lit_str("missing location")));
 
     const char duplicate_location[] =
-        "server { listen 8080; location / { proxy_pass http://127.0.0.1:1; } location / { proxy_pass http://127.0.0.1:2; } }";
+        "server { listen 8080; location / { proxy_pass http://127.0.0.1:1; } location / { "
+        "proxy_pass http://127.0.0.1:2; } }";
     CHECK(is_error(nginx::parse({duplicate_location, sizeof(duplicate_location) - 1}),
-                   FrontendError::UnsupportedSyntax, 1, 69, lit_str("duplicate location")));
+                   FrontendError::UnsupportedSyntax,
+                   1,
+                   69,
+                   lit_str("duplicate location")));
 
     const char no_proxy[] = "server { listen 8080; location / { } }";
     CHECK(is_error(nginx::parse({no_proxy, sizeof(no_proxy) - 1}),
-                   FrontendError::UnsupportedSyntax, 1, 36, lit_str("missing proxy_pass")));
+                   FrontendError::UnsupportedSyntax,
+                   1,
+                   36,
+                   lit_str("missing proxy_pass")));
 
     const char duplicate_proxy[] =
-        "server { listen 8080; location / { proxy_pass http://127.0.0.1:1; proxy_pass http://127.0.0.1:2; } }";
+        "server { listen 8080; location / { proxy_pass http://127.0.0.1:1; proxy_pass "
+        "http://127.0.0.1:2; } }";
     CHECK(is_error(nginx::parse({duplicate_proxy, sizeof(duplicate_proxy) - 1}),
-                   FrontendError::UnsupportedSyntax, 1, 67, lit_str("duplicate proxy_pass")));
+                   FrontendError::UnsupportedSyntax,
+                   1,
+                   67,
+                   lit_str("duplicate proxy_pass")));
 }
 
 TEST(nginx_parser, rejects_unknown_directives_and_multiple_servers) {
     const char unknown_server[] = "server { listen 8080; worker_processes 1; }";
     CHECK(is_error(nginx::parse({unknown_server, sizeof(unknown_server) - 1}),
-                   FrontendError::UnsupportedSyntax, 1, 23,
+                   FrontendError::UnsupportedSyntax,
+                   1,
+                   23,
                    lit_str("unknown server directive")));
 
     const char unknown_location[] = "server { listen 8080; location / { return 200; } }";
     CHECK(is_error(nginx::parse({unknown_location, sizeof(unknown_location) - 1}),
-                   FrontendError::UnsupportedSyntax, 1, 36,
+                   FrontendError::UnsupportedSyntax,
+                   1,
+                   36,
                    lit_str("unknown location directive")));
 
     const char second_server[] =
-        "server { listen 8080; location / { proxy_pass http://127.0.0.1:1; } } server { listen 8081; }";
+        "server { listen 8080; location / { proxy_pass http://127.0.0.1:1; } } server { listen "
+        "8081; }";
     CHECK(is_error(nginx::parse({second_server, sizeof(second_server) - 1}),
-                   FrontendError::UnsupportedSyntax, 1, 71,
+                   FrontendError::UnsupportedSyntax,
+                   1,
+                   71,
                    lit_str("multiple servers are unsupported")));
 }
 
@@ -206,87 +244,111 @@ TEST(nginx_parser, rejects_missing_braces_and_semicolons) {
     const char missing_server_brace[] =
         "server { listen 8080; location / { proxy_pass http://127.0.0.1:1; }";
     CHECK(is_error(nginx::parse({missing_server_brace, sizeof(missing_server_brace) - 1}),
-                   FrontendError::UnexpectedEof, 1, 68,
+                   FrontendError::UnexpectedEof,
+                   1,
+                   68,
                    lit_str("missing '}' for server")));
 
     const char missing_location_brace[] =
         "server { listen 8080; location / { proxy_pass http://127.0.0.1:1; ";
     CHECK(is_error(nginx::parse({missing_location_brace, sizeof(missing_location_brace) - 1}),
-                   FrontendError::UnexpectedEof, 1, 67,
+                   FrontendError::UnexpectedEof,
+                   1,
+                   67,
                    lit_str("missing '}' for location")));
 
     const char missing_listen_semicolon[] =
         "server { listen 8080 location / { proxy_pass http://127.0.0.1:1; } }";
-    CHECK(is_error(nginx::parse({missing_listen_semicolon,
-                                 sizeof(missing_listen_semicolon) - 1}),
-                   FrontendError::UnexpectedToken, 1, 22,
+    CHECK(is_error(nginx::parse({missing_listen_semicolon, sizeof(missing_listen_semicolon) - 1}),
+                   FrontendError::UnexpectedToken,
+                   1,
+                   22,
                    lit_str("expected ';' after listen")));
 
     const char missing_proxy_semicolon[] =
         "server { listen 8080; location / { proxy_pass http://127.0.0.1:1 } }";
-    CHECK(is_error(nginx::parse({missing_proxy_semicolon,
-                                 sizeof(missing_proxy_semicolon) - 1}),
-                   FrontendError::UnexpectedToken, 1, 66,
+    CHECK(is_error(nginx::parse({missing_proxy_semicolon, sizeof(missing_proxy_semicolon) - 1}),
+                   FrontendError::UnexpectedToken,
+                   1,
+                   66,
                    lit_str("expected ';' after proxy_pass")));
 
     const char missing_final_semicolon[] =
         "server { listen 8080; location / { proxy_pass http://127.0.0.1:1";
-    CHECK(is_error(nginx::parse({missing_final_semicolon,
-                                 sizeof(missing_final_semicolon) - 1}),
-                   FrontendError::UnexpectedEof, 1, 65,
+    CHECK(is_error(nginx::parse({missing_final_semicolon, sizeof(missing_final_semicolon) - 1}),
+                   FrontendError::UnexpectedEof,
+                   1,
+                   65,
                    lit_str("expected ';' after proxy_pass")));
 }
 
 TEST(nginx_parser, rejects_out_of_scope_contexts_and_values) {
     const char wrappers[] = "http { server { listen 8080; } }";
-    CHECK(is_error(nginx::parse({wrappers, sizeof(wrappers) - 1}),
-                   FrontendError::UnsupportedSyntax, 1, 1));
+    CHECK(is_error(
+        nginx::parse({wrappers, sizeof(wrappers) - 1}), FrontendError::UnsupportedSyntax, 1, 1));
 
     const char bad_path[] =
         "server { listen 8080; location /api { proxy_pass http://127.0.0.1:1; } }";
     CHECK(is_error(nginx::parse({bad_path, sizeof(bad_path) - 1}),
-                   FrontendError::UnsupportedSyntax, 1, 32,
+                   FrontendError::UnsupportedSyntax,
+                   1,
+                   32,
                    lit_str("only location / or /api/ is supported")));
 
-    const char dns[] =
-        "server { listen 8080; location / { proxy_pass http://backend:1; } }";
+    const char dns[] = "server { listen 8080; location / { proxy_pass http://backend:1; } }";
     CHECK(is_error(nginx::parse({dns, sizeof(dns) - 1}),
-                   FrontendError::UnsupportedSyntax, 1, 47,
+                   FrontendError::UnsupportedSyntax,
+                   1,
+                   47,
                    lit_str("only literal IPv4 HTTP upstreams are supported")));
 
     const char suffix[] =
         "server { listen 8080; location / { proxy_pass http://127.0.0.1:1/api; } }";
     CHECK(is_error(nginx::parse({suffix, sizeof(suffix) - 1}),
-                   FrontendError::UnsupportedSyntax, 1, 47,
+                   FrontendError::UnsupportedSyntax,
+                   1,
+                   47,
                    lit_str("proxy_pass URI suffixes are unsupported")));
 }
 
 TEST(nginx_parser, rejects_invalid_ports_ip_and_trailing_tokens) {
     const char port[] = "server { listen 0; location / { proxy_pass http://127.0.0.1:1; } }";
     CHECK(is_error(nginx::parse({port, sizeof(port) - 1}),
-                   FrontendError::InvalidInteger, 1, 17, lit_str("invalid listen port")));
+                   FrontendError::InvalidInteger,
+                   1,
+                   17,
+                   lit_str("invalid listen port")));
 
-    const char ip[] =
-        "server { listen 8080; location / { proxy_pass http://127.0.0.256:1; } }";
-    CHECK(is_error(nginx::parse({ip, sizeof(ip) - 1}), FrontendError::InvalidInteger, 1, 47,
+    const char ip[] = "server { listen 8080; location / { proxy_pass http://127.0.0.256:1; } }";
+    CHECK(is_error(nginx::parse({ip, sizeof(ip) - 1}),
+                   FrontendError::InvalidInteger,
+                   1,
+                   47,
                    lit_str("invalid upstream IPv4 address or port")));
 
     const char upstream_port[] =
         "server { listen 8080; location / { proxy_pass http://127.0.0.1:65536; } }";
     CHECK(is_error(nginx::parse({upstream_port, sizeof(upstream_port) - 1}),
-                   FrontendError::InvalidInteger, 1, 47,
+                   FrontendError::InvalidInteger,
+                   1,
+                   47,
                    lit_str("invalid upstream IPv4 address or port")));
 
     const char trailing[] =
         "server { listen 8080; location / { proxy_pass http://127.0.0.1:1; } } junk";
     CHECK(is_error(nginx::parse({trailing, sizeof(trailing) - 1}),
-                   FrontendError::UnexpectedToken, 1, 71,
+                   FrontendError::UnexpectedToken,
+                   1,
+                   71,
                    lit_str("trailing unexpected tokens")));
 
     const char too_large[] =
         "server { listen 65536; location / { proxy_pass http://127.0.0.1:1; } }";
     CHECK(is_error(nginx::parse({too_large, sizeof(too_large) - 1}),
-                   FrontendError::InvalidInteger, 1, 17, lit_str("invalid listen port")));
+                   FrontendError::InvalidInteger,
+                   1,
+                   17,
+                   lit_str("invalid listen port")));
 }
 
 TEST(nginx_parser, rejects_modifiers_variables_and_non_http_upstreams) {
@@ -298,26 +360,33 @@ TEST(nginx_parser, rejects_modifiers_variables_and_non_http_upstreams) {
     };
     for (u32 i = 0; i < 4; i++) {
         CHECK(is_error(nginx::parse({modifiers[i], sizeof(modifiers[i]) - 1}),
-                       FrontendError::UnsupportedSyntax, 1, 32,
+                       FrontendError::UnsupportedSyntax,
+                       1,
+                       32,
                        lit_str("location modifiers are unsupported")));
     }
 
     const char variable[] =
         "server { listen $port; location / { proxy_pass http://127.0.0.1:1; } }";
     CHECK(is_error(nginx::parse({variable, sizeof(variable) - 1}),
-                   FrontendError::UnsupportedSyntax, 1, 17,
+                   FrontendError::UnsupportedSyntax,
+                   1,
+                   17,
                    lit_str("variables are unsupported")));
 
     const char proxy_variable[] =
         "server { listen 8080; location / { proxy_pass http://$backend:1; } }";
     CHECK(is_error(nginx::parse({proxy_variable, sizeof(proxy_variable) - 1}),
-                   FrontendError::UnsupportedSyntax, 1, 47,
+                   FrontendError::UnsupportedSyntax,
+                   1,
+                   47,
                    lit_str("variables are unsupported")));
 
-    const char https[] =
-        "server { listen 8080; location / { proxy_pass https://127.0.0.1:1; } }";
+    const char https[] = "server { listen 8080; location / { proxy_pass https://127.0.0.1:1; } }";
     CHECK(is_error(nginx::parse({https, sizeof(https) - 1}),
-                   FrontendError::UnsupportedSyntax, 1, 47,
+                   FrontendError::UnsupportedSyntax,
+                   1,
+                   47,
                    lit_str("only literal IPv4 HTTP upstreams are supported")));
 }
 
@@ -371,7 +440,8 @@ TEST(nginx_converter, lowers_canonical_model_to_stable_rut_source) {
         "            version: \"HTTP/1.1\",\n"
         "            host: \"upstream\",\n"
         "            connection: \"omit\",\n"
-        "            strip_headers: [\"Connection\", \"Keep-Alive\", \"TE\", \"Expect\", \"Upgrade\"]\n"
+        "            strip_headers: [\"Connection\", \"Keep-Alive\", \"TE\", \"Expect\", "
+        "\"Upgrade\"]\n"
         "        }, response_policy: {\n"
         "            version: \"HTTP/1.1\",\n"
         "            framing: \"content_length\",\n"
@@ -389,14 +459,18 @@ TEST(nginx_converter, lowers_canonical_model_to_stable_rut_source) {
         "            date: \"current\",\n"
         "            connection: \"request\",\n"
         "            head_mode: \"suppress_body\",\n"
-        "            body: b\"<html>\\r\\n<head><title>502 Bad Gateway</title></head>\\r\\n<body>\\r\\n<center><h1>502 Bad Gateway</h1></center>\\r\\n<hr><center>nginx/1.29.7</center>\\r\\n</body>\\r\\n</html>\\r\\n\"\n"
+        "            body: b\"<html>\\r\\n<head><title>502 Bad "
+        "Gateway</title></head>\\r\\n<body>\\r\\n<center><h1>502 Bad "
+        "Gateway</h1></center>\\r\\n<hr><center>nginx/1.29.7</center>\\r\\n</body>\\r\\n</"
+        "html>\\r\\n\"\n"
         "        })\n"
         "    } else {\n"
         "        return forward(nginx_upstream, request_policy: {\n"
         "            version: \"HTTP/1.1\",\n"
         "            host: \"upstream\",\n"
         "            connection: \"omit\",\n"
-        "            strip_headers: [\"Connection\", \"Keep-Alive\", \"TE\", \"Expect\", \"Upgrade\"]\n"
+        "            strip_headers: [\"Connection\", \"Keep-Alive\", \"TE\", \"Expect\", "
+        "\"Upgrade\"]\n"
         "        }, response_policy: {\n"
         "            version: \"HTTP/1.1\",\n"
         "            framing: \"content_length\",\n"
@@ -412,7 +486,10 @@ TEST(nginx_converter, lowers_canonical_model_to_stable_rut_source) {
         "            server: \"nginx/1.29.7\",\n"
         "            date: \"current\",\n"
         "            connection: \"request\",\n"
-        "            body: b\"<html>\\r\\n<head><title>502 Bad Gateway</title></head>\\r\\n<body>\\r\\n<center><h1>502 Bad Gateway</h1></center>\\r\\n<hr><center>nginx/1.29.7</center>\\r\\n</body>\\r\\n</html>\\r\\n\"\n"
+        "            body: b\"<html>\\r\\n<head><title>502 Bad "
+        "Gateway</title></head>\\r\\n<body>\\r\\n<center><h1>502 Bad "
+        "Gateway</h1></center>\\r\\n<hr><center>nginx/1.29.7</center>\\r\\n</body>\\r\\n</"
+        "html>\\r\\n\"\n"
         "        })\n"
         "    }\n"
         "}\n";
@@ -429,8 +506,10 @@ TEST(nginx_converter, lowers_api_model_to_stable_target_transform_source) {
         "upstream nginx_upstream at \"127.0.0.1:9000\"\n"
         "route \"/api\" {\n"
         "    if req.method == GET && req.pathOnly == \"/api\" {\n"
-        "        return redirect({scheme: \"http\", authority: \"request_host\", port: \"actual_listener\",\n"
-        "            path: \"static\", query: \"preserve_raw\", date: \"current\", connection: \"close\",\n"
+        "        return redirect({scheme: \"http\", authority: \"request_host\", port: "
+        "\"actual_listener\",\n"
+        "            path: \"static\", query: \"preserve_raw\", date: \"current\", connection: "
+        "\"close\",\n"
         "            status: 301, reason: \"Moved Permanently\", server: \"nginx/1.29.7\",\n"
         "            content_type: \"text/html\", target_path: \"/api/\", body: b\"<html>\\r\\n"
         "<head><title>301 Moved Permanently</title></head>\\r\\n"
@@ -447,7 +526,8 @@ TEST(nginx_converter, lowers_api_model_to_stable_target_transform_source) {
         "            version: \"HTTP/1.1\",\n"
         "            host: \"upstream\",\n"
         "            connection: \"omit\",\n"
-        "            strip_headers: [\"Connection\", \"Keep-Alive\", \"TE\", \"Expect\", \"Upgrade\"]\n"
+        "            strip_headers: [\"Connection\", \"Keep-Alive\", \"TE\", \"Expect\", "
+        "\"Upgrade\"]\n"
         "        }, response_policy: {\n"
         "            version: \"HTTP/1.1\",\n"
         "            framing: \"content_length\",\n"
@@ -463,7 +543,10 @@ TEST(nginx_converter, lowers_api_model_to_stable_target_transform_source) {
         "            server: \"nginx/1.29.7\",\n"
         "            date: \"current\",\n"
         "            connection: \"request\",\n"
-        "            body: b\"<html>\\r\\n<head><title>502 Bad Gateway</title></head>\\r\\n<body>\\r\\n<center><h1>502 Bad Gateway</h1></center>\\r\\n<hr><center>nginx/1.29.7</center>\\r\\n</body>\\r\\n</html>\\r\\n\"\n"
+        "            body: b\"<html>\\r\\n<head><title>502 Bad "
+        "Gateway</title></head>\\r\\n<body>\\r\\n<center><h1>502 Bad "
+        "Gateway</h1></center>\\r\\n<hr><center>nginx/1.29.7</center>\\r\\n</body>\\r\\n</"
+        "html>\\r\\n\"\n"
         "        })\n"
         "    }\n"
         "}\n";
@@ -860,4 +943,6 @@ TEST(nginx_converter, rejects_forged_invalid_models_without_output) {
         CHECK_EQ(bad_stale_uri_view.error().code, FrontendError::UnsupportedSyntax);
 }
 
-int main(int argc, char** argv) { return rut::test::run_all(argc, argv); }
+int main(int argc, char** argv) {
+    return rut::test::run_all(argc, argv);
+}

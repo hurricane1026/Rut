@@ -11,8 +11,8 @@
 #include "rut/serve_loader.h"
 #endif
 
-#include <fcntl.h>
 #include <errno.h>
+#include <fcntl.h>
 #include <linux/io_uring.h>
 #include <netinet/in.h>
 #include <signal.h>

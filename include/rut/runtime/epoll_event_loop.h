@@ -518,8 +518,7 @@ public:
     // io_uring needs no equivalent (a cancelled recv does not re-fire), so this
     // method is epoll-only and the WS callback reaches it via a requires-guard.
     void ws_unpoll_upstream(Connection& c) {
-        if (c.upstream_fd >= 0)
-            backend.quiesce_recv(c.id, /*upstream=*/true, c.upstream_episode);
+        if (c.upstream_fd >= 0) backend.quiesce_recv(c.id, /*upstream=*/true, c.upstream_episode);
     }
 
     // Symmetric to ws_unpoll_upstream for the downstream (client) fd: stop epoll

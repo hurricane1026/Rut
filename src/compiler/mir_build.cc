@@ -1129,11 +1129,10 @@ FrontendResult<MirModule*> build_mir(const HirModule& module) {
             out->status_code = term.status_code;
             out->commit_response_mutations = term.commit_response_mutations;
             out->upstream_index = term.upstream_index;
-            out->kind = term.kind == HirTerminatorKind::ReturnStatus
-                            ? MirTerminatorKind::ReturnStatus
-                            : term.kind == HirTerminatorKind::Redirect
-                                  ? MirTerminatorKind::Redirect
-                                  : MirTerminatorKind::ForwardUpstream;
+            out->kind =
+                term.kind == HirTerminatorKind::ReturnStatus ? MirTerminatorKind::ReturnStatus
+                : term.kind == HirTerminatorKind::Redirect   ? MirTerminatorKind::Redirect
+                                                             : MirTerminatorKind::ForwardUpstream;
             out->source_kind = term.source_kind == HirTerminatorSourceKind::LocalRef
                                    ? MirTerminatorSourceKind::LocalRef
                                    : MirTerminatorSourceKind::Literal;
@@ -1143,8 +1142,7 @@ FrontendResult<MirModule*> build_mir(const HirModule& module) {
             out->forward_request_policy_id = term.forward_request_policy_id;
             out->forward_response_policy_id = term.forward_response_policy_id;
             out->forward_failure_policy_id = term.forward_failure_policy_id;
-            out->forward_timeout_failure_policy_id =
-                term.forward_timeout_failure_policy_id;
+            out->forward_timeout_failure_policy_id = term.forward_timeout_failure_policy_id;
             out->redirect_policy_id = term.redirect_policy_id;
             out->has_forward_target_transform = term.has_forward_target_transform;
             out->forward_target_transform = term.forward_target_transform;
@@ -3179,8 +3177,7 @@ FrontendResult<MirModule*> build_mir(const HirModule& module) {
         if (!mir->functions.push(fn)) return frontend_error(FrontendError::TooManyItems, fn.span);
     }
 
-    if (invalid_redirect_policy)
-        return frontend_error(FrontendError::UnsupportedSyntax);
+    if (invalid_redirect_policy) return frontend_error(FrontendError::UnsupportedSyntax);
     return mir;
 }
 

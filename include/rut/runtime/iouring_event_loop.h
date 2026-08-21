@@ -347,8 +347,7 @@ public:
 
     static bool strict_upstream_retirement_blocks_reclaim(const Connection& c) {
         return c.upstream_retirement_active || c.upstream_retirement_target_owned != 0 ||
-               c.upstream_retirement_cancel_owned != 0 ||
-               c.upstream_retirement_cancel_retry != 0 ||
+               c.upstream_retirement_cancel_owned != 0 || c.upstream_retirement_cancel_retry != 0 ||
                c.upstream_close_target_owned != 0 || c.upstream_close_cancel_owned != 0 ||
                c.upstream_close_pause_cancel_owned;
     }
@@ -397,13 +396,12 @@ public:
     }
 
     static bool current_successor_event_is_valid(const Connection& c, const IoEvent& ev) {
-        if (!io_event_is_upstream(ev.type) ||
-            !valid_upstream_episode(ev.upstream_episode) ||
+        if (!io_event_is_upstream(ev.type) || !valid_upstream_episode(ev.upstream_episode) ||
             ev.upstream_episode != c.upstream_episode)
             return false;
         if (ev.aux == kPauseCancelAux)
-            return ev.type == IoEventType::UpstreamRecv &&
-                   c.upstream_recv_pause_cancel_pending && c.pending_ops > 0;
+            return ev.type == IoEventType::UpstreamRecv && c.upstream_recv_pause_cancel_pending &&
+                   c.pending_ops > 0;
         if (ev.aux == kLocalSubmitFailureAux) {
             if (c.pending_ops == 0) return false;
             if (ev.type == IoEventType::UpstreamConnect)
@@ -413,8 +411,8 @@ public:
             // A local recv-registration failure is the completion of the new
             // submitted target itself; unlike an old terminal racing a pause,
             // cancel_inflight alone is not ownership of this synthetic record.
-            return ev.type == IoEventType::UpstreamRecv &&
-                   c.on_upstream_recv != nullptr && c.upstream_recv_armed;
+            return ev.type == IoEventType::UpstreamRecv && c.on_upstream_recv != nullptr &&
+                   c.upstream_recv_armed;
         }
         if (ev.aux != 0 || c.pending_ops == 0) return false;
         if (ev.type == IoEventType::UpstreamConnect)
@@ -540,15 +538,13 @@ private:
                                                       u8 selected_targets,
                                                       bool detached_recv_callback,
                                                       bool transfer_live_state) {
-        constexpr u8 kAllUpstreamOps =
-            kUpstreamOpConnect | kUpstreamOpRecv | kUpstreamOpSend;
+        constexpr u8 kAllUpstreamOps = kUpstreamOpConnect | kUpstreamOpRecv | kUpstreamOpSend;
         const u32 previous_tombstone = c.upstream_retiring_episode;
         const bool replaceable_tombstone =
             previous_tombstone == 0 ||
             (valid_upstream_episode(previous_tombstone) &&
              previous_tombstone < c.upstream_episode && !c.upstream_retirement_active &&
-             c.upstream_retirement_target_owned == 0 &&
-             c.upstream_retirement_cancel_owned == 0 &&
+             c.upstream_retirement_target_owned == 0 && c.upstream_retirement_cancel_owned == 0 &&
              c.upstream_retirement_cancel_retry == 0);
         if (c.id >= kMaxConns || c.upstream_episode_quarantined ||
             !valid_upstream_episode(c.upstream_episode) || !replaceable_tombstone ||
@@ -587,8 +583,7 @@ private:
 
         if ((selected_targets & kUpstreamOpSend) != 0) {
             if (upstream_send.src == nullptr || upstream_send.fd != c.upstream_fd ||
-                upstream_send.remaining == 0 ||
-                upstream_send.type != IoEventType::UpstreamSend ||
+                upstream_send.remaining == 0 || upstream_send.type != IoEventType::UpstreamSend ||
                 upstream_send.upstream_episode != c.upstream_episode)
                 return false;
         } else if (upstream_send.remaining != 0) {
@@ -618,14 +613,12 @@ private:
         // callback was already detached and abandon_strict_upstream clears the
         // recv flag synchronously before returning to the event loop.
         if (transfer_live_state) {
-            if ((selected_targets & kUpstreamOpConnect) != 0)
-                c.upstream_connect_armed = false;
+            if ((selected_targets & kUpstreamOpConnect) != 0) c.upstream_connect_armed = false;
             if ((selected_targets & kUpstreamOpRecv) != 0) {
                 c.upstream_recv_armed = false;
                 c.on_upstream_recv = nullptr;
             }
-            if ((selected_targets & kUpstreamOpSend) != 0)
-                c.upstream_send_armed = false;
+            if ((selected_targets & kUpstreamOpSend) != 0) c.upstream_send_armed = false;
             if ((selected_targets & (kUpstreamOpConnect | kUpstreamOpSend)) != 0)
                 c.on_upstream_send = nullptr;
         }
@@ -854,8 +847,7 @@ public:
         if (!io_event_is_upstream(ev.type)) return false;
 
         const u8 retirement_op = upstream_op_for_event(ev.type);
-        const bool matching_retirement = retirement_op != 0 &&
-                                         c.upstream_retiring_episode != 0 &&
+        const bool matching_retirement = retirement_op != 0 && c.upstream_retiring_episode != 0 &&
                                          ev.upstream_episode == c.upstream_retiring_episode;
         if (matching_retirement) {
             // Keep the token as a tombstone after completion: matching
@@ -863,7 +855,8 @@ public:
             if (!c.upstream_retirement_active) return true;
 
             u8* owned = nullptr;
-            if (ev.aux == 0) owned = &c.upstream_retirement_target_owned;
+            if (ev.aux == 0)
+                owned = &c.upstream_retirement_target_owned;
             else if (ev.aux == kUpstreamRetirementCancelAux)
                 owned = &c.upstream_retirement_cancel_owned;
             if (owned == nullptr || (*owned & retirement_op) == 0 || ev.more) return true;
@@ -882,8 +875,7 @@ public:
             if (ev.aux == 0 && retirement_op == kUpstreamOpSend)
                 backend.upstream_send_state[c.id] = {};
             c.pending_ops--;
-            if (ev.aux == 0 &&
-                (c.upstream_retirement_cancel_retry & retirement_op) != 0) {
+            if (ev.aux == 0 && (c.upstream_retirement_cancel_retry & retirement_op) != 0) {
                 // The target reached its terminal CQE before an initially-full
                 // SQ could accept the cancel. No kernel recv remains to cancel,
                 // so retire the retry obligation synchronously and keep the
@@ -925,8 +917,7 @@ public:
         // flight concurrently. Both were counted independently, so route only
         // the exact episode/type/aux owner and leave duplicates or forged
         // records unable to decrement aggregate pending_ops.
-        if (c.upstream_close_episode != 0 &&
-            ev.upstream_episode == c.upstream_close_episode) {
+        if (c.upstream_close_episode != 0 && ev.upstream_episode == c.upstream_close_episode) {
             const u8 op = upstream_op_for_event(ev.type);
 
             bool owned = false;
@@ -949,8 +940,7 @@ public:
                 return true;
             }
             c.pending_ops--;
-            if (c.fd < 0 && c.pending_ops == 0 &&
-                !strict_upstream_retirement_blocks_reclaim(c))
+            if (c.fd < 0 && c.pending_ops == 0 && !strict_upstream_retirement_blocks_reclaim(c))
                 reclaim_slot(c.id);
             return true;
         }
@@ -1018,13 +1008,12 @@ public:
             const bool has_request_callback =
                 c.on_send || c.on_upstream_recv || c.on_upstream_send ||
                 (c.uses_iouring_tls() ? c.tls_pending_on_recv != nullptr : c.on_recv != nullptr);
-            const bool valid = c.id == id && c.fd >= 0 && !is_draining() &&
-                               !c.upstream_episode_quarantined &&
-                               !strict_upstream_retirement_blocks_reclaim(c) &&
-                               valid_upstream_episode(expected_episode) &&
-                               c.upstream_episode == expected_episode &&
-                               c.state == ConnState::Sending && !c.send_armed &&
-                               c.req_start_us == 0 && !has_request_callback;
+            const bool valid =
+                c.id == id && c.fd >= 0 && !is_draining() && !c.upstream_episode_quarantined &&
+                !strict_upstream_retirement_blocks_reclaim(c) &&
+                valid_upstream_episode(expected_episode) &&
+                c.upstream_episode == expected_episode && c.state == ConnState::Sending &&
+                !c.send_armed && c.req_start_us == 0 && !has_request_callback;
             if (!valid) {
                 if (c.fd >= 0) close_conn(c);
                 continue;
@@ -1618,9 +1607,9 @@ public:
         // Preserve exact live-successor ownership across free_conn::reset().
         // The old C1 token remains in its separate tombstone; this ledger is
         // only for operations submitted under the current successor token.
-        const bool successor_close_already_owned =
-            c.upstream_close_target_owned != 0 || c.upstream_close_cancel_owned != 0 ||
-            c.upstream_close_pause_cancel_owned;
+        const bool successor_close_already_owned = c.upstream_close_target_owned != 0 ||
+                                                   c.upstream_close_cancel_owned != 0 ||
+                                                   c.upstream_close_pause_cancel_owned;
         if (!idle_return_recv_draining && !successor_close_already_owned &&
             valid_upstream_episode(c.upstream_episode)) {
             u8 targets = 0;
@@ -1631,8 +1620,7 @@ public:
             if (targets != 0 || c.upstream_recv_pause_cancel_pending) {
                 c.upstream_close_episode = c.upstream_episode;
                 c.upstream_close_target_owned = targets;
-                c.upstream_close_pause_cancel_owned =
-                    c.upstream_recv_pause_cancel_pending;
+                c.upstream_close_pause_cancel_owned = c.upstream_recv_pause_cancel_pending;
             }
         }
         // Only cancel when ops are in flight.
@@ -1646,17 +1634,17 @@ public:
                                               !idle_return_recv_draining;
             u8 close_cancel_mask = 0;
             const u32 submitted = backend.cancel(c.fd,
-                                                  c.id,
-                                                  c.recv_armed,
-                                                  c.send_armed,
-                                                  c.upstream_connect_armed,
-                                                  cancel_upstream_recv,
-                                                  c.upstream_send_armed,
-                                                  c.upstream_fd >= 0,
-                                                  c.upstream_episode,
-                                                  c.yield_timeout_armed,
-                                                  c.yield_timer_gen,
-                                                  &close_cancel_mask);
+                                                 c.id,
+                                                 c.recv_armed,
+                                                 c.send_armed,
+                                                 c.upstream_connect_armed,
+                                                 cancel_upstream_recv,
+                                                 c.upstream_send_armed,
+                                                 c.upstream_fd >= 0,
+                                                 c.upstream_episode,
+                                                 c.yield_timeout_armed,
+                                                 c.yield_timer_gen,
+                                                 &close_cancel_mask);
             c.upstream_close_cancel_owned |= close_cancel_mask;
             c.pending_ops += submitted;
         }
@@ -1945,8 +1933,7 @@ public:
                         // not touch current callbacks, armed flags, timers, or
                         // handler state.
                         if (!ev.more && conn.pending_ops > 0) conn.pending_ops--;
-                        if (conn.fd < 0 && conn.pending_ops == 0)
-                            reclaim_slot(conn.id);
+                        if (conn.fd < 0 && conn.pending_ops == 0) reclaim_slot(conn.id);
                         break;
                     }
                     // A strict-retirement boundary may coexist with the

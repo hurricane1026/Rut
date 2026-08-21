@@ -126,8 +126,7 @@ TEST(target_transform, count_and_aggregate_caps_are_bounded) {
     RouteConfig count_cfg{};
     for (u32 i = 0; i < kMaxForwardTargetTransforms; i++) {
         make_short_transform(strips[i], replaces[i], i);
-        REQUIRE_EQ(count_cfg.add_target_transform(
-                       transform({strips[i], 4}, {replaces[i], 4})),
+        REQUIRE_EQ(count_cfg.add_target_transform(transform({strips[i], 4}, {replaces[i], 4})),
                    i + 1);
     }
     CHECK_EQ(count_cfg.target_transform_count, kMaxForwardTargetTransforms);
@@ -146,8 +145,7 @@ TEST(target_transform, count_and_aggregate_caps_are_bounded) {
     CHECK_FALSE(forward_target_transform_table_valid(exact, 9));
 
     RouteConfig aggregate_cfg{};
-    for (u32 i = 0; i < 8; i++)
-        REQUIRE_EQ(aggregate_cfg.add_target_transform(exact[i]), i + 1);
+    for (u32 i = 0; i < 8; i++) REQUIRE_EQ(aggregate_cfg.add_target_transform(exact[i]), i + 1);
     CHECK_EQ(aggregate_cfg.target_transform_bytes_used, kForwardTargetTransformBytes);
     CHECK_EQ(aggregate_cfg.add_target_transform(exact[8]), 0u);
 }

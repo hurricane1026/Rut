@@ -771,7 +771,9 @@ TEST(simulate_engine, forward_upstream_match) {
 
 TEST(simulate_engine, forward_bundle_is_explicitly_unsupported) {
     const char* src =
-        "upstream backend\nroute GET \"/api\" { return forward(backend, failure_policy: { version: \"HTTP/1.1\", status: 502, reason: \"Bad Gateway\", content_type: \"text/plain\", server: \"nginx\", date: \"current\", connection: \"request\", body: b\"unavailable\" }) }\n";
+        "upstream backend\nroute GET \"/api\" { return forward(backend, failure_policy: { version: "
+        "\"HTTP/1.1\", status: 502, reason: \"Bad Gateway\", content_type: \"text/plain\", server: "
+        "\"nginx\", date: \"current\", connection: \"request\", body: b\"unavailable\" }) }\n";
     FrontendRirModule rir{};
     REQUIRE(compile_to_rir(src, rir));
     Engine engine;
@@ -806,8 +808,7 @@ TEST(simulate_engine, redirect_action_is_explicitly_unsupported) {
 }
 
 TEST(simulate_engine, recorded_target_transform_is_unsupported_before_forward) {
-    const char* src =
-        "upstream backend\nroute GET \"/api\" { return forward(backend) }\n";
+    const char* src = "upstream backend\nroute GET \"/api\" { return forward(backend) }\n";
     FrontendRirModule rir{};
     REQUIRE(compile_to_rir(src, rir));
     REQUIRE(rir.module.func_count == 1);

@@ -1,10 +1,10 @@
 #pragma once
 
 #include "rut/common/buffer.h"
+#include "rut/common/forward_target_transform.h"
 #include "rut/common/http_header_validation.h"
 #include "rut/common/request_policy.h"
 #include "rut/common/types.h"
-#include "rut/common/forward_target_transform.h"
 #include "rut/common/wait_limits.h"
 #include "rut/jit/handler_abi.h"
 #include "rut/runtime/chunked_parser.h"
@@ -587,7 +587,7 @@ struct ConnectionBase {
     // change how an already selected connect failure is serialized.
     bool failure_policy_suppress_body;
     // Exact parsed request HTTP version (HttpVersion underlying value).
-    u8 req_http_version; // HttpVersion::Http10/Http11, 255 when unknown.
+    u8 req_http_version;  // HttpVersion::Http10/Http11, 255 when unknown.
     // Request-side keep-alive intent of the CURRENT request, as parsed from its
     // request line + Connection header (HTTP/1.1 default true, HTTP/1.0 default
     // false, "Connection: close" → false). The proxy forwards the client's

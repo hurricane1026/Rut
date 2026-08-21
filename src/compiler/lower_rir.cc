@@ -3087,8 +3087,7 @@ static FrontendResult<void> emit_term(const MirTerminator& term,
             term.redirect_policy_id > mir.redirect_policies.len ||
             !redirect_policy_spec_valid(mir.redirect_policies[term.redirect_policy_id - 1]))
             return frontend_error(FrontendError::UnsupportedSyntax, term.span);
-        if (!b.emit_ret_redirect(term.redirect_policy_id,
-                                 {term.span.line, term.span.col}))
+        if (!b.emit_ret_redirect(term.redirect_policy_id, {term.span.line, term.span.col}))
             return frontend_error(FrontendError::OutOfMemory, term.span);
         return {};
     }
@@ -3132,8 +3131,7 @@ static FrontendResult<void> emit_term(const MirTerminator& term,
             if (!p) return frontend_error(FrontendError::OutOfMemory, term.span);
             response_policy = p.value();
         }
-        if (term.forward_failure_policy_id != 0 ||
-            term.forward_timeout_failure_policy_id != 0) {
+        if (term.forward_failure_policy_id != 0 || term.forward_timeout_failure_policy_id != 0) {
             if (term.forward_failure_policy_id == 0 ||
                 term.forward_response_policy_id > b.mod->response_policy_count ||
                 term.forward_failure_policy_id > b.mod->failure_policy_count ||
@@ -3152,8 +3150,7 @@ static FrontendResult<void> emit_term(const MirTerminator& term,
                 const auto& existing = b.mod->policy_bundles[i];
                 if (existing.response_policy_id == term.forward_response_policy_id &&
                     existing.failure_policy_id == term.forward_failure_policy_id &&
-                    existing.timeout_failure_policy_id ==
-                        term.forward_timeout_failure_policy_id) {
+                    existing.timeout_failure_policy_id == term.forward_timeout_failure_policy_id) {
                     bundle_id = static_cast<u16>(i + 1);
                     break;
                 }
@@ -3162,13 +3159,12 @@ static FrontendResult<void> emit_term(const MirTerminator& term,
                 if (b.mod->policy_bundle_count >= kMaxForwardFailurePolicies)
                     return frontend_error(FrontendError::TooManyItems, term.span);
                 bundle_id = static_cast<u16>(++b.mod->policy_bundle_count);
-                b.mod->policy_bundles[bundle_id - 1] = {
-                    term.forward_response_policy_id,
-                    term.forward_failure_policy_id,
-                    term.forward_timeout_failure_policy_id};
+                b.mod->policy_bundles[bundle_id - 1] = {term.forward_response_policy_id,
+                                                        term.forward_failure_policy_id,
+                                                        term.forward_timeout_failure_policy_id};
             }
-            auto bundle = b.emit_const_i32(static_cast<i32>(bundle_id),
-                                           {term.span.line, term.span.col});
+            auto bundle =
+                b.emit_const_i32(static_cast<i32>(bundle_id), {term.span.line, term.span.col});
             if (!bundle) return frontend_error(FrontendError::OutOfMemory, term.span);
             if (policy == rir::kNoValue) {
                 auto p0 = b.emit_const_i32(0, {term.span.line, term.span.col});
@@ -3177,9 +3173,8 @@ static FrontendResult<void> emit_term(const MirTerminator& term,
             }
             u16 target_transform_id = 0;
             if (term.has_forward_target_transform) {
-                auto transform = intern_target_transform(*b.mod,
-                                                         term.forward_target_transform,
-                                                         term.span);
+                auto transform =
+                    intern_target_transform(*b.mod, term.forward_target_transform, term.span);
                 if (!transform) return core::make_unexpected(transform.error());
                 target_transform_id = transform.value();
             }
@@ -3190,16 +3185,15 @@ static FrontendResult<void> emit_term(const MirTerminator& term,
                 !b.emit_req_set_target_transform(target_transform_id,
                                                  {term.span.line, term.span.col}))
                 return frontend_error(FrontendError::OutOfMemory, term.span);
-            if (!b.emit_ret_forward_bundle(upstream.value(), policy, bundle.value(),
-                                           {term.span.line, term.span.col}))
+            if (!b.emit_ret_forward_bundle(
+                    upstream.value(), policy, bundle.value(), {term.span.line, term.span.col}))
                 return frontend_error(FrontendError::OutOfMemory, term.span);
             return {};
         }
         u16 target_transform_id = 0;
         if (term.has_forward_target_transform) {
-            auto transform = intern_target_transform(*b.mod,
-                                                     term.forward_target_transform,
-                                                     term.span);
+            auto transform =
+                intern_target_transform(*b.mod, term.forward_target_transform, term.span);
             if (!transform) return core::make_unexpected(transform.error());
             target_transform_id = transform.value();
         }
@@ -3207,13 +3201,10 @@ static FrontendResult<void> emit_term(const MirTerminator& term,
             !b.emit_resp_commit_headers({term.span.line, term.span.col}))
             return frontend_error(FrontendError::OutOfMemory, term.span);
         if (target_transform_id != 0 &&
-            !b.emit_req_set_target_transform(target_transform_id,
-                                             {term.span.line, term.span.col}))
+            !b.emit_req_set_target_transform(target_transform_id, {term.span.line, term.span.col}))
             return frontend_error(FrontendError::OutOfMemory, term.span);
-        if (!b.emit_ret_forward(upstream.value(),
-                                policy,
-                                response_policy,
-                                {term.span.line, term.span.col}))
+        if (!b.emit_ret_forward(
+                upstream.value(), policy, response_policy, {term.span.line, term.span.col}))
             return frontend_error(FrontendError::OutOfMemory, term.span);
         return {};
     }
@@ -3374,8 +3365,7 @@ FrontendResult<void> lower_to_rir(const MirModule& mir, FrontendRirModule& out) 
         dst.head_mode = src.head_mode;
         if (!copy_failure_str(src.reason, dst.reason) ||
             !copy_failure_str(src.content_type, dst.content_type) ||
-            !copy_failure_str(src.server, dst.server) ||
-            !copy_failure_str(src.body, dst.body))
+            !copy_failure_str(src.server, dst.server) || !copy_failure_str(src.body, dst.body))
             return frontend_error(FrontendError::OutOfMemory);
     }
     out.module.failure_policy_count = mir.failure_policies.len;

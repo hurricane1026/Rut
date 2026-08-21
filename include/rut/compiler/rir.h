@@ -1,11 +1,11 @@
 #pragma once
 
 #include "core/expected.h"
-#include "rut/common/rate_limit_key_spec.h"
-#include "rut/common/response_policy.h"
 #include "rut/common/failure_policy.h"
 #include "rut/common/forward_target_transform.h"
+#include "rut/common/rate_limit_key_spec.h"
 #include "rut/common/redirect_policy.h"
+#include "rut/common/response_policy.h"
 #include "rut/common/types.h"
 #include "rut/runtime/arena.h"
 
@@ -173,18 +173,18 @@ enum class Opcode : u8 {
     ReqCookie,            // %r = req.cookie "name"        → Optional(str)
 
     // ── Request mutation ──
-    ReqSetHeader,       // req.set_header "Name", %val
-    ReqAddHeader,       // req.add_header "Name", %val
-    RespHeader,         // %opt = resp.header "Name", %fallback_opt
-    RespSetHeader,      // resp.set_header "Name", %val
-    RespAddHeader,      // resp.add_header "Name", %val
-    RespRemoveHeader,   // resp.remove_header "Name"
-    RespCommitHeaders,  // publish pending Response-builder mutations
-    ReqSetPath,         // req.set_path %path
-    ReqSetTargetTransform, // req.set_target_transform <1-based transform id>
-    CtxStoreSlotI32,    // if i < ctx.slot_count: ctx.slot[i] = %val
-                        // Stored as a zero-extended i64 slot. If no slot
-                        // is available, the write is ignored.
+    ReqSetHeader,           // req.set_header "Name", %val
+    ReqAddHeader,           // req.add_header "Name", %val
+    RespHeader,             // %opt = resp.header "Name", %fallback_opt
+    RespSetHeader,          // resp.set_header "Name", %val
+    RespAddHeader,          // resp.add_header "Name", %val
+    RespRemoveHeader,       // resp.remove_header "Name"
+    RespCommitHeaders,      // publish pending Response-builder mutations
+    ReqSetPath,             // req.set_path %path
+    ReqSetTargetTransform,  // req.set_target_transform <1-based transform id>
+    CtxStoreSlotI32,        // if i < ctx.slot_count: ctx.slot[i] = %val
+                            // Stored as a zero-extended i64 slot. If no slot
+                            // is available, the write is ignored.
 
     // ── String operations ──
     StrHasPrefix,    // %r = str.has_prefix %s, %pfx    → bool
@@ -253,24 +253,24 @@ enum class Opcode : u8 {
     AccessLogWrite,
 
     // ── Terminators ── (must be last instruction in a block)
-    Br,          // br %cond, then_block, else_block
-    Jmp,         // jmp target_block
-    RetStatus,   // ret.status — two encodings, disambiguated by operand_count:
-                 //   operand_count == 0 (literal form): imm.i64_val holds
-                 //     a packed (status | body_idx<<16 | headers_idx<<32):
-                 //       bits [ 0:16): HTTP status code (0..65535)
-                 //       bits [16:32): 1-based response_bodies index,
-                 //                     0 = no custom body
-                 //       bits [32:48): 1-based response header_sets index,
-                 //                     0 = no custom headers
-                 //       bits [48:64): reserved (must be 0)
-                 //   operand_count >  0 (value form):   operands[0] is an
-                 //     SSA i32 status code; imm is unused and both
-                 //     body_idx and headers_idx are implicitly 0.
-                 //   Printers/decoders MUST branch on operand_count before
-                 //   reading imm.i64_val — doing otherwise will print
-                 //   garbage for the value form and miss body/header idx
-                 //   in the literal form.
+    Br,         // br %cond, then_block, else_block
+    Jmp,        // jmp target_block
+    RetStatus,  // ret.status — two encodings, disambiguated by operand_count:
+                //   operand_count == 0 (literal form): imm.i64_val holds
+                //     a packed (status | body_idx<<16 | headers_idx<<32):
+                //       bits [ 0:16): HTTP status code (0..65535)
+                //       bits [16:32): 1-based response_bodies index,
+                //                     0 = no custom body
+                //       bits [32:48): 1-based response header_sets index,
+                //                     0 = no custom headers
+                //       bits [48:64): reserved (must be 0)
+                //   operand_count >  0 (value form):   operands[0] is an
+                //     SSA i32 status code; imm is unused and both
+                //     body_idx and headers_idx are implicitly 0.
+                //   Printers/decoders MUST branch on operand_count before
+                //   reading imm.i64_val — doing otherwise will print
+                //   garbage for the value form and miss body/header idx
+                //   in the literal form.
     // ret.forward upstream [, request_policy_id [, response_policy_id]].
     // The optional policy operands are contiguous; a response policy with no
     // request policy uses an explicit zero request operand.

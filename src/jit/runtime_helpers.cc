@@ -272,10 +272,9 @@ void rut_helper_req_set_target_transform(void* conn, u32 transform_id) {
         return;
     }
     c->target_transform_recorded = true;
-    c->target_transform_id =
-        (transform_id == 0 || transform_id > kMaxForwardTargetTransforms)
-            ? kInvalidForwardTargetTransformId
-            : static_cast<u16>(transform_id);
+    c->target_transform_id = (transform_id == 0 || transform_id > kMaxForwardTargetTransforms)
+                                 ? kInvalidForwardTargetTransformId
+                                 : static_cast<u16>(transform_id);
 }
 
 static void record_req_header(

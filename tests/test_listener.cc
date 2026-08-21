@@ -19,8 +19,7 @@ TEST(listener, source_and_cli_resolution) {
     REQUIRE(cli_only);
     CHECK_EQ(cli_only.value().port, 9100u);
 
-    auto equivalent =
-        resolve_listener_spec(true, source, true, 9000, ListenerTransport::Cleartext);
+    auto equivalent = resolve_listener_spec(true, source, true, 9000, ListenerTransport::Cleartext);
     REQUIRE(equivalent);
     CHECK_EQ(equivalent.value().port, 9000u);
 
@@ -40,23 +39,17 @@ TEST(listener, cli_tls_resolution_rejects_source_cleartext) {
     ListenerSpec source{};
     source.port = 8080;
 
-    auto cli_tls = resolve_listener_spec(false,
-                                         source,
-                                         false,
-                                         0,
-                                         ListenerTransport::Tls);
+    auto cli_tls = resolve_listener_spec(false, source, false, 0, ListenerTransport::Tls);
     REQUIRE(cli_tls);
     CHECK_EQ(cli_tls.value().port, 8080u);
     CHECK(cli_tls.value().transport == ListenerTransport::Tls);
 
-    auto source_and_tls = resolve_listener_spec(true,
-                                                source,
-                                                false,
-                                                0,
-                                                ListenerTransport::Tls);
+    auto source_and_tls = resolve_listener_spec(true, source, false, 0, ListenerTransport::Tls);
     CHECK(!source_and_tls);
     if (!source_and_tls)
         CHECK(source_and_tls.error() == ListenerResolutionError::ConflictingTransport);
 }
 
-int main(int argc, char** argv) { return rut::test::run_all(argc, argv); }
+int main(int argc, char** argv) {
+    return rut::test::run_all(argc, argv);
+}

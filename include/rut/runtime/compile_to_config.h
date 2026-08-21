@@ -254,14 +254,12 @@ inline bool populate_route_config(RouteConfig& cfg, const rir::Module& mod) {
     // the failure id itself remains mandatory and must resolve above.
     for (u32 i = 0; i < mod.policy_bundle_count; i++) {
         const auto& bundle = mod.policy_bundles[i];
-        if (bundle.failure_policy_id == 0 ||
-            bundle.failure_policy_id > mod.failure_policy_count ||
+        if (bundle.failure_policy_id == 0 || bundle.failure_policy_id > mod.failure_policy_count ||
             !forward_failure_policy_spec_valid(
                 mod.failure_policies[bundle.failure_policy_id - 1]) ||
             (bundle.response_policy_id != 0 &&
              (bundle.response_policy_id > mod.response_policy_count ||
-              !response_policy_spec_valid(
-                  mod.response_policies[bundle.response_policy_id - 1]))))
+              !response_policy_spec_valid(mod.response_policies[bundle.response_policy_id - 1]))))
             return false;
         if (bundle.timeout_failure_policy_id != 0) {
             if (bundle.response_policy_id == 0 ||
@@ -278,13 +276,11 @@ inline bool populate_route_config(RouteConfig& cfg, const rir::Module& mod) {
             const bool timeout_suppress =
                 mod.failure_policies[bundle.timeout_failure_policy_id - 1].head_mode ==
                 FailurePolicyHeadMode::SuppressBody;
-            if (response_suppress != failure_suppress ||
-                failure_suppress != timeout_suppress)
+            if (response_suppress != failure_suppress || failure_suppress != timeout_suppress)
                 return false;
         }
     }
-    if (!forward_target_transform_table_valid(mod.target_transforms,
-                                              mod.target_transform_count))
+    if (!forward_target_transform_table_valid(mod.target_transforms, mod.target_transform_count))
         return false;
     if (!redirect_policy_table_valid(mod.redirect_policies, mod.redirect_policy_count))
         return false;
@@ -431,9 +427,8 @@ inline bool populate_route_config(RouteConfig& cfg, const rir::Module& mod) {
     }
     for (u32 i = 0; i < mod.policy_bundle_count; i++) {
         const auto& bundle = mod.policy_bundles[i];
-        u16 idx = cfg.add_policy_bundle(bundle.response_policy_id,
-                                        bundle.failure_policy_id,
-                                        bundle.timeout_failure_policy_id);
+        u16 idx = cfg.add_policy_bundle(
+            bundle.response_policy_id, bundle.failure_policy_id, bundle.timeout_failure_policy_id);
         if (idx == 0 || idx != i + 1) return false;
     }
     // Cache instance descriptors — declaration order defines the instance

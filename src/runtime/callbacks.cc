@@ -160,30 +160,22 @@ void capture_request_metadata(Connection& conn) {
             conn.req_client_has_transfer_encoding |=
                 http_header_name_eq_ci(name.ptr, name.len, "transfer-encoding", 17);
             conn.req_client_has_te |= http_header_name_eq_ci(name.ptr, name.len, "te", 2);
-            conn.req_client_has_expect |=
-                http_header_name_eq_ci(name.ptr, name.len, "expect", 6);
+            conn.req_client_has_expect |= http_header_name_eq_ci(name.ptr, name.len, "expect", 6);
             conn.req_client_has_upgrade_header |=
                 http_header_name_eq_ci(name.ptr, name.len, "upgrade", 7);
-            if (http_header_name_eq_ci(req.headers[i].name.ptr,
-                                       req.headers[i].name.len,
-                                       "connection",
-                                       10)) {
-                if (conn.req_client_connection_count < 255)
-                    conn.req_client_connection_count++;
+            if (http_header_name_eq_ci(
+                    req.headers[i].name.ptr, req.headers[i].name.len, "connection", 10)) {
+                if (conn.req_client_connection_count < 255) conn.req_client_connection_count++;
             }
         }
         if (conn.req_client_connection_count == 1) {
             for (u32 i = 0; i < req.header_count; i++) {
-                if (http_header_name_eq_ci(req.headers[i].name.ptr,
-                                           req.headers[i].name.len,
-                                           "connection",
-                                           10)) {
+                if (http_header_name_eq_ci(
+                        req.headers[i].name.ptr, req.headers[i].name.len, "connection", 10)) {
                     conn.req_client_connection_close_exact =
                         req.headers[i].value.len == 5 &&
-                        http_header_name_eq_ci(req.headers[i].value.ptr,
-                                               req.headers[i].value.len,
-                                               "close",
-                                               5);
+                        http_header_name_eq_ci(
+                            req.headers[i].value.ptr, req.headers[i].value.len, "close", 5);
                     break;
                 }
             }

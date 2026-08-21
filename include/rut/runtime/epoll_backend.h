@@ -106,7 +106,9 @@ struct EpollBackend {
     // pending upstream data would otherwise keep firing UpstreamRecv and drive the
     // pipeline past the pause. submit_recv_upstream re-arms EPOLLIN on resume.
     // No-op if the conn_id has no registered upstream fd.
-    void pause_upstream_recv(u32 conn_id, u32 upstream_episode, bool preserve_send_interest = false);
+    void pause_upstream_recv(u32 conn_id,
+                             u32 upstream_episode,
+                             bool preserve_send_interest = false);
 
     // Stop polling a tunnel fd's READ side (drop EPOLLIN/EPOLLRDHUP so a
     // level-triggered half-close can't re-fire) while PRESERVING any in-flight
@@ -147,19 +149,11 @@ struct EpollBackend {
 
     // Try immediate send. If partial/EAGAIN, register EPOLLOUT.
     bool add_send(i32 fd, u32 conn_id, const u8* buf, u32 len);
-    bool add_send_upstream(i32 fd,
-                           u32 conn_id,
-                           const u8* buf,
-                           u32 len,
-                           u32 upstream_episode);
+    bool add_send_upstream(i32 fd, u32 conn_id, const u8* buf, u32 len, u32 upstream_episode);
     bool add_send_tls(Connection& c, const u8* buf, u32 len);
 
     // Register fd for connect completion (EPOLLOUT).
-    bool add_connect(i32 fd,
-                     u32 conn_id,
-                     const void* addr,
-                     u32 addr_len,
-                     u32 upstream_episode);
+    bool add_connect(i32 fd, u32 conn_id, const void* addr, u32 addr_len, u32 upstream_episode);
 
     // Remove fd from epoll.
     u32 cancel(i32 fd,

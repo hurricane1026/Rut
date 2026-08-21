@@ -10,11 +10,11 @@ namespace jit {
 // What the runtime should do after a JIT handler returns.
 
 enum class HandlerAction : u8 {
-    ReturnStatus = 0,  // Send HTTP response with status_code
-    Forward = 1,       // Forward request to upstream_id
-    Yield = 2,         // Suspend: initiate I/O, resume at next_state
-    ForwardBundle = 3, // Forward with a 1-based response/failure bundle id
-    Redirect = 4,      // Foundation redirect policy id in upstream_id
+    ReturnStatus = 0,   // Send HTTP response with status_code
+    Forward = 1,        // Forward request to upstream_id
+    Yield = 2,          // Suspend: initiate I/O, resume at next_state
+    ForwardBundle = 3,  // Forward with a 1-based response/failure bundle id
+    Redirect = 4,       // Foundation redirect policy id in upstream_id
 };
 
 // ── Yield Kind ─────────────────────────────────────────────────────
@@ -101,21 +101,13 @@ struct HandlerResult {
     static HandlerResult make_forward_with_policies(u16 upstream,
                                                     u16 request_policy,
                                                     u16 response_policy) {
-        return {HandlerAction::Forward,
-                request_policy,
-                upstream,
-                response_policy,
-                YieldKind::HttpGet};
+        return {
+            HandlerAction::Forward, request_policy, upstream, response_policy, YieldKind::HttpGet};
     }
 
-    static HandlerResult make_forward_with_bundle(u16 upstream,
-                                                  u16 request_policy,
-                                                  u16 bundle_id) {
-        return {HandlerAction::ForwardBundle,
-                request_policy,
-                upstream,
-                bundle_id,
-                YieldKind::HttpGet};
+    static HandlerResult make_forward_with_bundle(u16 upstream, u16 request_policy, u16 bundle_id) {
+        return {
+            HandlerAction::ForwardBundle, request_policy, upstream, bundle_id, YieldKind::HttpGet};
     }
 
     static HandlerResult make_redirect(u16 policy_id) {

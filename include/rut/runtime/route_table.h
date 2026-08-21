@@ -1,11 +1,11 @@
 #pragma once
 
 #include "core/expected.h"
-#include "rut/common/http_header_validation.h"
-#include "rut/common/response_policy.h"
 #include "rut/common/failure_policy.h"
 #include "rut/common/forward_target_transform.h"
+#include "rut/common/http_header_validation.h"
 #include "rut/common/redirect_policy.h"
+#include "rut/common/response_policy.h"
 #include "rut/common/types.h"
 #include "rut/jit/art_jit_codegen.h"  // ArtJitMatchFn typedef (LLVM-free)
 #include "rut/jit/handler_abi.h"
@@ -953,17 +953,14 @@ struct RouteConfig {
             if (response_policy_id == 0 ||
                 !timeout_failure_policy_id_is_valid(timeout_failure_policy_id))
                 return 0;
-            const bool response_suppress =
-                response_policies[response_policy_id - 1].head_mode ==
-                ResponsePolicyHeadMode::SuppressBody;
-            const bool failure_suppress =
-                failure_policies[failure_policy_id - 1].head_mode ==
-                FailurePolicyHeadMode::SuppressBody;
+            const bool response_suppress = response_policies[response_policy_id - 1].head_mode ==
+                                           ResponsePolicyHeadMode::SuppressBody;
+            const bool failure_suppress = failure_policies[failure_policy_id - 1].head_mode ==
+                                          FailurePolicyHeadMode::SuppressBody;
             const bool timeout_suppress =
                 failure_policies[timeout_failure_policy_id - 1].head_mode ==
                 FailurePolicyHeadMode::SuppressBody;
-            if (response_suppress != failure_suppress ||
-                failure_suppress != timeout_suppress)
+            if (response_suppress != failure_suppress || failure_suppress != timeout_suppress)
                 return 0;
         }
         if (policy_bundle_count > kMaxForwardPolicyBundles) return 0;
@@ -992,29 +989,23 @@ struct RouteConfig {
     }
 
     bool policy_bundle_id_is_valid(u16 id) const {
-        if (policy_bundle_count > kMaxForwardPolicyBundles || id == 0 ||
-            id > policy_bundle_count)
+        if (policy_bundle_count > kMaxForwardPolicyBundles || id == 0 || id > policy_bundle_count)
             return false;
         const auto& b = policy_bundles[id - 1];
-        if ((b.response_policy_id != 0 &&
-             !response_policy_id_is_valid(b.response_policy_id)) ||
+        if ((b.response_policy_id != 0 && !response_policy_id_is_valid(b.response_policy_id)) ||
             !failure_policy_id_is_valid(b.failure_policy_id))
             return false;
         if (b.timeout_failure_policy_id == 0) return true;
         if (b.response_policy_id == 0 ||
             !timeout_failure_policy_id_is_valid(b.timeout_failure_policy_id))
             return false;
-        const bool response_suppress =
-            response_policies[b.response_policy_id - 1].head_mode ==
-            ResponsePolicyHeadMode::SuppressBody;
-        const bool failure_suppress =
-            failure_policies[b.failure_policy_id - 1].head_mode ==
-            FailurePolicyHeadMode::SuppressBody;
-        const bool timeout_suppress =
-            failure_policies[b.timeout_failure_policy_id - 1].head_mode ==
-            FailurePolicyHeadMode::SuppressBody;
-        return response_suppress == failure_suppress &&
-               failure_suppress == timeout_suppress;
+        const bool response_suppress = response_policies[b.response_policy_id - 1].head_mode ==
+                                       ResponsePolicyHeadMode::SuppressBody;
+        const bool failure_suppress = failure_policies[b.failure_policy_id - 1].head_mode ==
+                                      FailurePolicyHeadMode::SuppressBody;
+        const bool timeout_suppress = failure_policies[b.timeout_failure_policy_id - 1].head_mode ==
+                                      FailurePolicyHeadMode::SuppressBody;
+        return response_suppress == failure_suppress && failure_suppress == timeout_suppress;
     }
 
     // Register foundation-only target-transform metadata. Strings are copied
@@ -1062,11 +1053,8 @@ struct RouteConfig {
         if (redirect_policy_count >= kMaxRedirectPolicies ||
             redirect_policy_bytes_used > kRedirectPolicyBytesPoolBytes)
             return 0;
-        const Str fields[] = {policy.reason,
-                              policy.server,
-                              policy.content_type,
-                              policy.target_path,
-                              policy.body};
+        const Str fields[] = {
+            policy.reason, policy.server, policy.content_type, policy.target_path, policy.body};
         u32 total = 0;
         for (const Str field : fields) {
             if (field.len > kRedirectPolicyBytesPoolBytes - redirect_policy_bytes_used - total)
@@ -1128,16 +1116,10 @@ struct RouteConfig {
             dst.date = src.date;
             dst.connection = src.connection;
             dst.status_code = src.status_code;
-            const Str fields[] = {src.reason,
-                                  src.server,
-                                  src.content_type,
-                                  src.target_path,
-                                  src.body};
-            Str* destinations[] = {&dst.reason,
-                                   &dst.server,
-                                   &dst.content_type,
-                                   &dst.target_path,
-                                   &dst.body};
+            const Str fields[] = {
+                src.reason, src.server, src.content_type, src.target_path, src.body};
+            Str* destinations[] = {
+                &dst.reason, &dst.server, &dst.content_type, &dst.target_path, &dst.body};
             for (u32 field = 0; field < 5; field++) {
                 char* out = redirect_policy_bytes + used;
                 for (u32 j = 0; j < fields[field].len; j++) out[j] = fields[field].ptr[j];

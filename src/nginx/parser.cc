@@ -25,8 +25,9 @@ public:
         const char c = source_.ptr[pos_];
         if (c == '{' || c == '}' || c == ';') {
             advance();
-            const TokenKind kind = c == '{' ? TokenKind::LBrace
-                                           : c == '}' ? TokenKind::RBrace : TokenKind::Semicolon;
+            const TokenKind kind = c == '{'   ? TokenKind::LBrace
+                                   : c == '}' ? TokenKind::RBrace
+                                              : TokenKind::Semicolon;
             return {kind, source_.slice(start, pos_), Span{start, pos_, line, col}};
         }
 
@@ -103,7 +104,8 @@ public:
     explicit Parser(Str source) : lexer_(source) { advance(); }
 
     FrontendResult<Server> run() {
-        if (cur_.kind == TokenKind::End) return missing(cur_.span, lit_str("server fragment is empty"));
+        if (cur_.kind == TokenKind::End)
+            return missing(cur_.span, lit_str("server fragment is empty"));
         if (cur_.kind != TokenKind::Word) return invalid(cur_.span, lit_str("expected server"));
         if (eq(cur_.text, "http", 4) || eq(cur_.text, "events", 6))
             return unsupported(cur_.span, lit_str("http/events wrappers are unsupported"));
@@ -138,7 +140,8 @@ public:
                 return unsupported(cur_.span, lit_str("unknown server directive"));
             }
         }
-        if (cur_.kind == TokenKind::End) return missing(cur_.span, lit_str("missing '}' for server"));
+        if (cur_.kind == TokenKind::End)
+            return missing(cur_.span, lit_str("missing '}' for server"));
         result.span.end = cur_.span.end;
         advance();
         if (!have_listen) return unsupported(result.span, lit_str("missing listen"));
@@ -168,9 +171,11 @@ private:
     FrontendResult<Listen> parse_listen() {
         const Span start = cur_.span;
         advance();
-        if (cur_.kind != TokenKind::Word) return invalid(cur_.span, lit_str("listen requires a port"));
+        if (cur_.kind != TokenKind::Word)
+            return invalid(cur_.span, lit_str("listen requires a port"));
         const Token port = cur_;
-        if (contains(port.text, '$')) return unsupported(port.span, lit_str("variables are unsupported"));
+        if (contains(port.text, '$'))
+            return unsupported(port.span, lit_str("variables are unsupported"));
         u16 value = 0;
         if (!parse_port(port.text, &value))
             return invalid_integer(port.span, lit_str("invalid listen port"));
@@ -201,7 +206,8 @@ private:
         if (eq(path.text, "=", 1) || eq(path.text, "^~", 2) || eq(path.text, "~", 1) ||
             eq(path.text, "~*", 2))
             return unsupported(path.span, lit_str("location modifiers are unsupported"));
-        if (contains(path.text, '$')) return unsupported(path.span, lit_str("variables are unsupported"));
+        if (contains(path.text, '$'))
+            return unsupported(path.span, lit_str("variables are unsupported"));
         if (!eq(path.text, "/", 1) && !eq(path.text, "/api/", 5))
             return unsupported(path.span, lit_str("only location / or /api/ is supported"));
         advance();
@@ -223,7 +229,8 @@ private:
             result.proxy_pass = proxy.value();
             have_proxy = true;
         }
-        if (cur_.kind == TokenKind::End) return missing(cur_.span, lit_str("missing '}' for location"));
+        if (cur_.kind == TokenKind::End)
+            return missing(cur_.span, lit_str("missing '}' for location"));
         const Span end = cur_.span;
         advance();
         if (!have_proxy) return unsupported(end, lit_str("missing proxy_pass"));
@@ -246,7 +253,8 @@ private:
         if (cur_.kind != TokenKind::Word)
             return invalid(cur_.span, lit_str("proxy_pass requires an upstream"));
         const Token url = cur_;
-        if (contains(url.text, '$')) return unsupported(url.span, lit_str("variables are unsupported"));
+        if (contains(url.text, '$'))
+            return unsupported(url.span, lit_str("variables are unsupported"));
         ProxyPass result{};
         const UrlParseStatus url_status = parse_url(url.text, url.span, result);
         if (url_status == UrlParseStatus::InvalidInteger)
@@ -324,6 +332,8 @@ private:
 
 }  // namespace
 
-FrontendResult<Server> parse(Str source) { return Parser(source).run(); }
+FrontendResult<Server> parse(Str source) {
+    return Parser(source).run();
+}
 
 }  // namespace rut::nginx

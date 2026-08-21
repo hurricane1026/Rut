@@ -70,10 +70,8 @@ inline constexpr bool valid_upstream_episode(u32 episode) {
 
 inline constexpr u64 encode_upstream_event_token(const UpstreamEventToken& token) {
     if (!valid_upstream_event_token(token)) return kInvalidIoUserData;
-    return static_cast<u64>(static_cast<u8>(token.type)) |
-           (static_cast<u64>(token.conn_id) << 8) |
-           (static_cast<u64>(token.episode) << 32) |
-           (static_cast<u64>(token.aux) << 56);
+    return static_cast<u64>(static_cast<u8>(token.type)) | (static_cast<u64>(token.conn_id) << 8) |
+           (static_cast<u64>(token.episode) << 32) | (static_cast<u64>(token.aux) << 56);
 }
 
 inline constexpr bool decode_upstream_event_token(u64 data, UpstreamEventToken* out) {
@@ -96,8 +94,7 @@ inline constexpr bool valid_non_upstream_user_data(const NonUpstreamUserData& va
 
 inline constexpr u64 encode_non_upstream_user_data(const NonUpstreamUserData& value) {
     if (!valid_non_upstream_user_data(value)) return kInvalidIoUserData;
-    return static_cast<u64>(static_cast<u8>(value.type)) |
-           (static_cast<u64>(value.conn_id) << 8) |
+    return static_cast<u64>(static_cast<u8>(value.type)) | (static_cast<u64>(value.conn_id) << 8) |
            (static_cast<u64>(value.generation) << 32);
 }
 
@@ -139,9 +136,9 @@ struct IoEvent {
     u16 buf_id;  // provided buffer id (io_uring only; valid iff has_buf != 0)
     u8 has_buf;  // non-zero if this event owns a provided buffer in buf_id
     IoEventType type;
-    u8 more;     // non-zero if the SQE will produce more CQEs (multishot recv)
-    u8 aux = 0;  // decoded user_data aux tag; kPauseCancelAux marks a pause cancel's
-                 // own completion (distinct from the recv CQE it cancels)
+    u8 more;                   // non-zero if the SQE will produce more CQEs (multishot recv)
+    u8 aux = 0;                // decoded user_data aux tag; kPauseCancelAux marks a pause cancel's
+                               // own completion (distinct from the recv CQE it cancels)
     u32 upstream_episode = 0;  // neutral for non-upstream/legacy backend events
 };
 

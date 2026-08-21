@@ -101,20 +101,19 @@ inline bool redirect_policy_spec_valid(const RedirectPolicySpec& policy) {
         policy.query != RedirectPolicyQuery::PreserveRaw ||
         policy.date != RedirectPolicyDate::Current ||
         policy.connection != RedirectPolicyConnection::Close || policy.status_code < 300 ||
-        policy.status_code > 399 || !redirect_policy_safe_text(policy.reason, kMaxRedirectReasonLen) ||
+        policy.status_code > 399 ||
+        !redirect_policy_safe_text(policy.reason, kMaxRedirectReasonLen) ||
         !redirect_policy_safe_text(policy.server, kMaxRedirectServerLen) ||
         !redirect_policy_safe_text(policy.content_type, kMaxRedirectContentTypeLen) ||
         !redirect_policy_safe_target_path(policy.target_path) ||
         !redirect_policy_safe_body(policy.body))
         return false;
-    return validate_response_header("Content-Type",
-                                   12,
-                                   policy.content_type.ptr,
-                                   policy.content_type.len) == HttpHeaderValidation::Ok;
+    return validate_response_header(
+               "Content-Type", 12, policy.content_type.ptr, policy.content_type.len) ==
+           HttpHeaderValidation::Ok;
 }
 
-inline bool redirect_policy_spec_equal(const RedirectPolicySpec& a,
-                                       const RedirectPolicySpec& b) {
+inline bool redirect_policy_spec_equal(const RedirectPolicySpec& a, const RedirectPolicySpec& b) {
     return a.scheme == b.scheme && a.authority == b.authority && a.port == b.port &&
            a.path == b.path && a.query == b.query && a.date == b.date &&
            a.connection == b.connection && a.status_code == b.status_code &&

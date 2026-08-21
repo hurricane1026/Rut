@@ -556,38 +556,52 @@ static void print_redirect_body(PrintBuf& buf, Str body) {
 }
 
 static void print_redirect_scheme(PrintBuf& buf, RedirectPolicyScheme value) {
-    if (value == RedirectPolicyScheme::Http) buf.put_cstr("http");
-    else buf.put_cstr("invalid");
+    if (value == RedirectPolicyScheme::Http)
+        buf.put_cstr("http");
+    else
+        buf.put_cstr("invalid");
 }
 
 static void print_redirect_authority(PrintBuf& buf, RedirectPolicyAuthority value) {
-    if (value == RedirectPolicyAuthority::RequestHost) buf.put_cstr("request_host");
-    else buf.put_cstr("invalid");
+    if (value == RedirectPolicyAuthority::RequestHost)
+        buf.put_cstr("request_host");
+    else
+        buf.put_cstr("invalid");
 }
 
 static void print_redirect_port(PrintBuf& buf, RedirectPolicyPort value) {
-    if (value == RedirectPolicyPort::ActualListener) buf.put_cstr("actual_listener");
-    else buf.put_cstr("invalid");
+    if (value == RedirectPolicyPort::ActualListener)
+        buf.put_cstr("actual_listener");
+    else
+        buf.put_cstr("invalid");
 }
 
 static void print_redirect_path(PrintBuf& buf, RedirectPolicyPath value) {
-    if (value == RedirectPolicyPath::Static) buf.put_cstr("static");
-    else buf.put_cstr("invalid");
+    if (value == RedirectPolicyPath::Static)
+        buf.put_cstr("static");
+    else
+        buf.put_cstr("invalid");
 }
 
 static void print_redirect_query(PrintBuf& buf, RedirectPolicyQuery value) {
-    if (value == RedirectPolicyQuery::PreserveRaw) buf.put_cstr("preserve_raw");
-    else buf.put_cstr("invalid");
+    if (value == RedirectPolicyQuery::PreserveRaw)
+        buf.put_cstr("preserve_raw");
+    else
+        buf.put_cstr("invalid");
 }
 
 static void print_redirect_date(PrintBuf& buf, RedirectPolicyDate value) {
-    if (value == RedirectPolicyDate::Current) buf.put_cstr("current");
-    else buf.put_cstr("invalid");
+    if (value == RedirectPolicyDate::Current)
+        buf.put_cstr("current");
+    else
+        buf.put_cstr("invalid");
 }
 
 static void print_redirect_connection(PrintBuf& buf, RedirectPolicyConnection value) {
-    if (value == RedirectPolicyConnection::Close) buf.put_cstr("close");
-    else buf.put_cstr("invalid");
+    if (value == RedirectPolicyConnection::Close)
+        buf.put_cstr("close");
+    else
+        buf.put_cstr("invalid");
 }
 
 static void print_block_ref(PrintBuf& buf, BlockId bid, const Function& fn) {
@@ -968,18 +982,24 @@ void print_function(PrintBuf& buf, const Function& fn) {
 
 static const char* response_policy_head_mode_name(ResponsePolicyHeadMode mode) {
     switch (mode) {
-        case ResponsePolicyHeadMode::Reject: return "reject";
-        case ResponsePolicyHeadMode::SuppressBody: return "suppress_body";
-        case ResponsePolicyHeadMode::Invalid: break;
+        case ResponsePolicyHeadMode::Reject:
+            return "reject";
+        case ResponsePolicyHeadMode::SuppressBody:
+            return "suppress_body";
+        case ResponsePolicyHeadMode::Invalid:
+            break;
     }
     return "invalid";
 }
 
 static const char* failure_policy_head_mode_name(FailurePolicyHeadMode mode) {
     switch (mode) {
-        case FailurePolicyHeadMode::Reject: return "reject";
-        case FailurePolicyHeadMode::SuppressBody: return "suppress_body";
-        case FailurePolicyHeadMode::Invalid: break;
+        case FailurePolicyHeadMode::Reject:
+            return "reject";
+        case FailurePolicyHeadMode::SuppressBody:
+            return "suppress_body";
+        case FailurePolicyHeadMode::Invalid:
+            break;
     }
     return "invalid";
 }
@@ -1018,8 +1038,7 @@ void print_module(PrintBuf& buf, const Module& mod) {
         }
     }
     if (mod.redirect_policy_count != 0) {
-        if (mod.func_count != 0 || mod.response_policy_count != 0 ||
-            mod.failure_policy_count != 0)
+        if (mod.func_count != 0 || mod.response_policy_count != 0 || mod.failure_policy_count != 0)
             buf.newline();
         buf.put_cstr("redirect_policies: ");
         buf.put_u32(mod.redirect_policy_count);

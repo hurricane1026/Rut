@@ -1,12 +1,12 @@
 #pragma once
 
-#include "rut/common/rate_limit_key_spec.h"
-#include "rut/common/response_policy.h"
 #include "rut/common/failure_policy.h"
-#include "rut/common/types.h"
-#include "rut/common/request_policy.h"
 #include "rut/common/forward_target_transform.h"
+#include "rut/common/rate_limit_key_spec.h"
 #include "rut/common/redirect_policy.h"
+#include "rut/common/request_policy.h"
+#include "rut/common/response_policy.h"
+#include "rut/common/types.h"
 #include "rut/compiler/diagnostic.h"
 
 namespace rut {
@@ -621,8 +621,7 @@ struct AstFile {
     static constexpr u32 kMaxTypePool = 256;
     static constexpr u32 kFailurePolicyBodyPoolBytes =
         kMaxForwardFailurePolicies * kMaxFailurePolicyBodyLen;
-    static constexpr u32 kRedirectPolicyBodyPoolBytes =
-        kMaxRedirectPolicies * kMaxRedirectBodyLen;
+    static constexpr u32 kRedirectPolicyBodyPoolBytes = kMaxRedirectPolicies * kMaxRedirectBodyLen;
     FixedVec<AstItem, kMaxItems> items;
     FixedVec<AstExpr, kMaxExprPool> expr_pool;
     FixedVec<AstStatement, kMaxStmtPool> stmt_pool;
@@ -751,8 +750,8 @@ struct AstFile {
                 total += field.len;
             }
         }
-        const Str fields[] = {policy.reason, policy.server, policy.content_type,
-                              policy.target_path, policy.body};
+        const Str fields[] = {
+            policy.reason, policy.server, policy.content_type, policy.target_path, policy.body};
         for (const Str field : fields) {
             if (field.len > kRedirectPolicyBytes - total) return 0;
             total += field.len;

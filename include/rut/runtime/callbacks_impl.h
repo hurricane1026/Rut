@@ -512,25 +512,21 @@ inline bool build_redirect_response(const Connection& conn,
                                     u8* out,
                                     u32 out_cap,
                                     u32* out_len);
-inline bool stage_redirect_response(Connection& conn,
-                                    const RouteConfig& config,
-                                    u16 policy_id);
+inline bool stage_redirect_response(Connection& conn, const RouteConfig& config, u16 policy_id);
 enum class RequestPolicyBodyState : u8 { Invalid, Complete, Waiting };
-RequestPolicyBodyState inspect_request_policy_body(const Connection& conn,
-                                                   u16 policy_id);
+RequestPolicyBodyState inspect_request_policy_body(const Connection& conn, u16 policy_id);
 inline bool request_policy_body_response_domain(const Connection& conn);
 inline bool request_policy_body_response_admitted(const Connection& conn);
 inline bool strict_response_upload_ready(const Connection& conn);
 inline bool response_policy_runtime_supported(const ForwardResponsePolicySpec& policy);
 inline bool failure_policy_runtime_supported(const ForwardFailurePolicySpec& policy);
 inline bool forward_policy_head_modes_compatible(const RouteConfig& config,
-                                                  u16 response_policy_id,
-                                                  u16 failure_policy_id,
-                                                  u16 timeout_failure_policy_id = 0);
-inline bool response_policy_suppress_head_admitted(
-    const Connection& conn,
-    const ForwardResponsePolicySpec& policy,
-    bool paired_failure);
+                                                 u16 response_policy_id,
+                                                 u16 failure_policy_id,
+                                                 u16 timeout_failure_policy_id = 0);
+inline bool response_policy_suppress_head_admitted(const Connection& conn,
+                                                   const ForwardResponsePolicySpec& policy,
+                                                   bool paired_failure);
 inline bool build_timeout_failure_policy_response(const Connection& conn,
                                                   const RouteConfig& config,
                                                   bool suppress_body,
@@ -1349,11 +1345,16 @@ void on_header_received(void* lp, Connection& conn, IoEvent ev) {
                 if constexpr (requires { loop->timer.refresh(&conn, loop->upstream_timeout); }) {
                     loop->timer.refresh(&conn, loop->upstream_timeout);
                 }
-                on_upstream_connected<Loop>(
-                    static_cast<void*>(loop),
-                    conn,
-                    IoEvent{conn.id, 0, 0, 0, IoEventType::UpstreamConnect, 0, 0,
-                            conn.upstream_episode});
+                on_upstream_connected<Loop>(static_cast<void*>(loop),
+                                            conn,
+                                            IoEvent{conn.id,
+                                                    0,
+                                                    0,
+                                                    0,
+                                                    IoEventType::UpstreamConnect,
+                                                    0,
+                                                    0,
+                                                    conn.upstream_episode});
                 return;
             }
         }
@@ -1515,8 +1516,7 @@ void on_request_policy_body_recvd(void* lp, Connection& conn, IoEvent ev) {
     outcome.request_policy_id = conn.pending_forward_request_policy_id;
     outcome.response_policy_id = conn.pending_forward_response_policy_id;
     outcome.failure_policy_id = conn.pending_forward_failure_policy_id;
-    outcome.timeout_failure_policy_id =
-        conn.pending_forward_timeout_failure_policy_id;
+    outcome.timeout_failure_policy_id = conn.pending_forward_timeout_failure_policy_id;
     conn.request_policy_body_pending = false;
     conn.pending_forward_upstream_id = 0;
     conn.pending_forward_request_policy_id = 0;
@@ -2025,7 +2025,8 @@ void handle_jit_outcome(Loop* loop,
                 reject_response_policy(loop, conn);
                 return;
             }
-            conn.resp_status = config->redirect_policies[outcome.redirect_policy_id - 1].status_code;
+            conn.resp_status =
+                config->redirect_policies[outcome.redirect_policy_id - 1].status_code;
             conn.keep_alive = false;
             conn.transition_to_sending(&on_response_sent<Loop>);
             client_send(loop, conn, conn.send_buf.data(), conn.send_buf.len());
@@ -2384,11 +2385,10 @@ void handle_jit_outcome(Loop* loop,
                 reject_response_policy(loop, conn);
                 return;
             }
-            if (!forward_policy_head_modes_compatible(
-                    *config,
-                    forward_response_policy_id,
-                    forward_failure_policy_id,
-                    forward_timeout_failure_policy_id)) {
+            if (!forward_policy_head_modes_compatible(*config,
+                                                      forward_response_policy_id,
+                                                      forward_failure_policy_id,
+                                                      forward_timeout_failure_policy_id)) {
                 // A failure SuppressBody policy is meaningful only when the
                 // success policy carries the same disposition.  Response-only
                 // SuppressBody remains valid for the existing HEAD success
@@ -2409,7 +2409,8 @@ void handle_jit_outcome(Loop* loop,
                 config->response_policies[forward_response_policy_id - 1].head_mode ==
                     ResponsePolicyHeadMode::SuppressBody &&
                 config->failure_policies[forward_failure_policy_id - 1].head_mode ==
-                    FailurePolicyHeadMode::SuppressBody && suppress_body_head;
+                    FailurePolicyHeadMode::SuppressBody &&
+                suppress_body_head;
             // Validate the selected failure disposition before request-body
             // waiting, policy rewriting, target materialisation, or any
             // upstream resource can be touched. Only the paired SuppressBody
@@ -2422,8 +2423,7 @@ void handle_jit_outcome(Loop* loop,
                 return;
             }
             if (forward_timeout_failure_policy_id != 0 &&
-                (!config->timeout_failure_policy_id_is_valid(
-                     forward_timeout_failure_policy_id) ||
+                (!config->timeout_failure_policy_id_is_valid(forward_timeout_failure_policy_id) ||
                  (!failure_policy_runtime_supported(
                       config->failure_policies[forward_timeout_failure_policy_id - 1]) &&
                   !suppress_failure_head))) {
@@ -2451,19 +2451,18 @@ void handle_jit_outcome(Loop* loop,
                 (!request_policy_is_supported(outcome.request_policy_id) ||
                  target.addr_count != 1 || conn.resp_header_mutation_count != 0 ||
                  conn.resp_header_mutation_pending_count != 0 ||
-                 conn.resp_header_mutation_pending_overflow ||
-                 conn.resp_header_mutation_overflow || conn.req_path_overridden ||
-                 conn.req_header_override_count != 0 || conn.req_header_override_overflow)) {
+                 conn.resp_header_mutation_pending_overflow || conn.resp_header_mutation_overflow ||
+                 conn.req_path_overridden || conn.req_header_override_count != 0 ||
+                 conn.req_header_override_overflow)) {
                 reject_request_policy(loop, conn);
                 return;
             }
-            const u32 kBackend = select_backend(static_cast<u16>(outcome.upstream_id),
-                                                target.addr_count,
-                                                monotonic_us());
+            const u32 kBackend = select_backend(
+                static_cast<u16>(outcome.upstream_id), target.addr_count, monotonic_us());
             bool request_policy_prepared = false;
             if (outcome.request_policy_id != 0) {
-                const RequestPolicyBodyState body_state = inspect_request_policy_body(
-                    conn, outcome.request_policy_id);
+                const RequestPolicyBodyState body_state =
+                    inspect_request_policy_body(conn, outcome.request_policy_id);
                 if (body_state == RequestPolicyBodyState::Invalid) {
                     reject_request_policy(loop, conn);
                     return;
@@ -2495,8 +2494,7 @@ void handle_jit_outcome(Loop* loop,
             // policy. The strict serializer owns the response header bytes, so
             // reserve its slice before allocating a slot or connecting.
             const bool has_failure_policy = forward_failure_policy_id != 0;
-            const bool has_timeout_failure_policy =
-                forward_timeout_failure_policy_id != 0;
+            const bool has_timeout_failure_policy = forward_timeout_failure_policy_id != 0;
             bool response_policy_request_connection = false;
             if (forward_response_policy_id != 0 &&
                 config->response_policy_id_is_valid(forward_response_policy_id)) {
@@ -2510,18 +2508,13 @@ void handle_jit_outcome(Loop* loop,
                  (has_failure_policy &&
                   !config->failure_policy_id_is_valid(forward_failure_policy_id)) ||
                  (has_timeout_failure_policy &&
-                  !config->timeout_failure_policy_id_is_valid(
-                      forward_timeout_failure_policy_id)) ||
+                  !config->timeout_failure_policy_id_is_valid(forward_timeout_failure_policy_id)) ||
                  conn.req_http_version != static_cast<u8>(HttpVersion::Http11) ||
-                 (forward_response_policy_id != 0 &&
-                  !response_policy_request_connection && !conn.req_keep_alive) ||
-                 (!suppress_body_head &&
-                  conn.req_method == static_cast<u8>(LogHttpMethod::Head)) ||
-                 conn.tls_active ||
-                 conn.req_path_canon.ptr == nullptr ||
-                 conn.req_wants_upgrade ||
-                 ((conn.req_body_mode != BodyMode::None ||
-                   conn.request_body_fully_buffered) &&
+                 (forward_response_policy_id != 0 && !response_policy_request_connection &&
+                  !conn.req_keep_alive) ||
+                 (!suppress_body_head && conn.req_method == static_cast<u8>(LogHttpMethod::Head)) ||
+                 conn.tls_active || conn.req_path_canon.ptr == nullptr || conn.req_wants_upgrade ||
+                 ((conn.req_body_mode != BodyMode::None || conn.request_body_fully_buffered) &&
                   !request_policy_body_response_admitted(conn)) ||
                  target.addr_count != 1 || target.addrs[0].sin_family != AF_INET ||
                  conn.resp_header_mutation_count != 0 ||
@@ -2641,11 +2634,16 @@ void handle_jit_outcome(Loop* loop,
                                   }) {
                         loop->timer.refresh(&conn, loop->upstream_timeout);
                     }
-                    on_upstream_connected<Loop>(
-                        static_cast<void*>(loop),
-                        conn,
-                        IoEvent{conn.id, 0, 0, 0, IoEventType::UpstreamConnect, 0, 0,
-                                conn.upstream_episode});
+                    on_upstream_connected<Loop>(static_cast<void*>(loop),
+                                                conn,
+                                                IoEvent{conn.id,
+                                                        0,
+                                                        0,
+                                                        0,
+                                                        IoEventType::UpstreamConnect,
+                                                        0,
+                                                        0,
+                                                        conn.upstream_episode});
                     return;
                 }
             }
@@ -3209,8 +3207,7 @@ inline bool materialize_request_target_transform(Connection& conn, const RouteCo
         conn.req_body_mode != BodyMode::None || conn.req_body_remaining != 0 ||
         conn.request_body_fully_buffered || conn.req_malformed || conn.req_wants_upgrade ||
         conn.req_header_override_count != 0 || conn.req_header_override_overflow ||
-        conn.resp_header_mutation_count != 0 ||
-        conn.resp_header_mutation_pending_count != 0 ||
+        conn.resp_header_mutation_count != 0 || conn.resp_header_mutation_pending_count != 0 ||
         conn.resp_header_mutation_pending_overflow || conn.resp_header_mutation_overflow)
         return false;
 
@@ -3239,8 +3236,8 @@ inline bool materialize_request_target_transform(Connection& conn, const RouteCo
     };
     for (u32 i = 0; i < req.header_count; i++) {
         const Str name = req.headers[i].name;
-        if (header_name_eq(name, "transfer-encoding", 17) ||
-            header_name_eq(name, "te", 2) || header_name_eq(name, "expect", 6))
+        if (header_name_eq(name, "transfer-encoding", 17) || header_name_eq(name, "te", 2) ||
+            header_name_eq(name, "expect", 6))
             return false;
     }
     if (req.version != HttpVersion::Http11) return false;
@@ -3248,8 +3245,7 @@ inline bool materialize_request_target_transform(Connection& conn, const RouteCo
     const uintptr_t base = reinterpret_cast<uintptr_t>(data);
     const uintptr_t limit = base + total;
     const uintptr_t path_addr = reinterpret_cast<uintptr_t>(req.path.ptr);
-    if (path_addr < base || path_addr > limit || req.path.len > limit - path_addr)
-        return false;
+    if (path_addr < base || path_addr > limit || req.path.len > limit - path_addr) return false;
     const u32 target_start = static_cast<u32>(path_addr - base);
     const u32 target_len = req.path.len;
     if (target_len == 0 || data[target_start] != '/') return false;
@@ -3278,8 +3274,7 @@ inline bool materialize_request_target_transform(Connection& conn, const RouteCo
         if (i != path_len && path[i] != '/') continue;
         const u32 segment_len = i - segment_start;
         if ((segment_len == 1 && path[segment_start] == '.') ||
-            (segment_len == 2 && path[segment_start] == '.' &&
-             path[segment_start + 1] == '.'))
+            (segment_len == 2 && path[segment_start] == '.' && path[segment_start + 1] == '.'))
             return false;
         segment_start = i + 1;
     }
@@ -3304,13 +3299,11 @@ inline bool materialize_request_target_transform(Connection& conn, const RouteCo
     const u32 suffix_dest = target_start + spec.replace_prefix.len;
     if (delta < 0) {
         __builtin_memmove(data + suffix_dest, data + suffix_start, suffix_len + query_len);
-        __builtin_memmove(data + new_target_end,
-                          data + target_end,
-                          static_cast<size_t>(total - target_end));
+        __builtin_memmove(
+            data + new_target_end, data + target_end, static_cast<size_t>(total - target_end));
     } else {
-        __builtin_memmove(data + target_end + delta,
-                          data + target_end,
-                          static_cast<size_t>(total - target_end));
+        __builtin_memmove(
+            data + target_end + delta, data + target_end, static_cast<size_t>(total - target_end));
         __builtin_memmove(data + suffix_dest, data + suffix_start, suffix_len + query_len);
     }
     __builtin_memcpy(data + target_start, spec.replace_prefix.ptr, spec.replace_prefix.len);
@@ -3340,10 +3333,9 @@ inline bool request_policy_name_eq(const u8* p, u32 n, const char* q, u32 qn) {
 // slot. The existing HTTP parser intentionally accepts identical duplicate
 // Content-Length fields; nginx's fixed policy does not, so count the raw fields
 // here and fail closed. The request buffer remains untouched by this function.
-inline RequestPolicyBodyState inspect_request_policy_body(const Connection& conn,
-                                                          u16 policy_id) {
-    if (policy_id == 0 ||
-        !request_policy_is_supported(policy_id) || conn.protocol == ConnProtocol::Http2 ||
+inline RequestPolicyBodyState inspect_request_policy_body(const Connection& conn, u16 policy_id) {
+    if (policy_id == 0 || !request_policy_is_supported(policy_id) ||
+        conn.protocol == ConnProtocol::Http2 ||
         conn.req_http_version != static_cast<u8>(HttpVersion::Http11) ||
         conn.recv_slice == nullptr || conn.send_slice == nullptr)
         return RequestPolicyBodyState::Invalid;
@@ -3389,7 +3381,8 @@ inline RequestPolicyBodyState inspect_request_policy_body(const Connection& conn
         return RequestPolicyBodyState::Complete;
     }
     if (has_te || has_expect || has_upgrade) return RequestPolicyBodyState::Invalid;
-    if (!req.has_content_length || req.content_length > conn.recv_buf.capacity() - parser.header_end)
+    if (!req.has_content_length ||
+        req.content_length > conn.recv_buf.capacity() - parser.header_end)
         return RequestPolicyBodyState::Invalid;
     const u64 required = static_cast<u64>(parser.header_end) + req.content_length;
     if (required > conn.recv_buf.capacity()) return RequestPolicyBodyState::Invalid;
@@ -3406,8 +3399,7 @@ inline RequestPolicyBodyState inspect_request_policy_body(const Connection& conn
 // accidentally fall back to transparent forwarding or touch the upstream.
 inline bool apply_request_policy(Connection& conn, const sockaddr_in& endpoint, u16 policy_id) {
     if (policy_id == 0) return true;
-    if (inspect_request_policy_body(conn, policy_id) !=
-        RequestPolicyBodyState::Complete)
+    if (inspect_request_policy_body(conn, policy_id) != RequestPolicyBodyState::Complete)
         return false;
 
     const u8* data = conn.recv_buf.data();
@@ -3421,8 +3413,7 @@ inline bool apply_request_policy(Connection& conn, const sockaddr_in& endpoint, 
     const u8* line_end = data;
     while (line_end + 1 < end && !(line_end[0] == '\r' && line_end[1] == '\n')) line_end++;
     const u8* path_ptr = reinterpret_cast<const u8*>(req.path.ptr);
-    if (line_end + 1 >= end || path_ptr < data || path_ptr + req.path.len > line_end)
-        return false;
+    if (line_end + 1 >= end || path_ptr < data || path_ptr + req.path.len > line_end) return false;
 
     auto append = [&](const u8* p, u32 n) {
         return n <= conn.send_buf.capacity() - conn.send_buf.len() &&
@@ -3446,22 +3437,26 @@ inline bool apply_request_policy(Connection& conn, const sockaddr_in& endpoint, 
 
     conn.send_buf.reset();
     const u32 method_prefix = static_cast<u32>(path_ptr - data);
-    if (!append(data, method_prefix) || !append(path_ptr, req.path.len) ||
-        !append_lit(" ", 1) || !append_lit(request_policy_version(policy_id), 8) ||
-        !append_lit("\r\n", 2))
+    if (!append(data, method_prefix) || !append(path_ptr, req.path.len) || !append_lit(" ", 1) ||
+        !append_lit(request_policy_version(policy_id), 8) || !append_lit("\r\n", 2))
         return false;
 
     char authority[32];
     u32 authority_len = 0;
     const u32 ip = ntohl(endpoint.sin_addr.s_addr);
-    const u8 octets[4] = {static_cast<u8>(ip >> 24), static_cast<u8>(ip >> 16),
-                          static_cast<u8>(ip >> 8), static_cast<u8>(ip)};
+    const u8 octets[4] = {static_cast<u8>(ip >> 24),
+                          static_cast<u8>(ip >> 16),
+                          static_cast<u8>(ip >> 8),
+                          static_cast<u8>(ip)};
     for (u32 oi = 0; oi < 4; oi++) {
         if (oi != 0) authority[authority_len++] = '.';
         u32 v = octets[oi];
         char digits[3];
         u32 dn = 0;
-        do { digits[dn++] = static_cast<char>('0' + (v % 10)); v /= 10; } while (v != 0);
+        do {
+            digits[dn++] = static_cast<char>('0' + (v % 10));
+            v /= 10;
+        } while (v != 0);
         while (dn > 0) authority[authority_len++] = digits[--dn];
     }
     const u16 port = ntohs(endpoint.sin_port);
@@ -3469,11 +3464,14 @@ inline bool apply_request_policy(Connection& conn, const sockaddr_in& endpoint, 
         authority[authority_len++] = ':';
         char digits[5];
         u32 dn = 0, v = port;
-        do { digits[dn++] = static_cast<char>('0' + (v % 10)); v /= 10; } while (v != 0);
+        do {
+            digits[dn++] = static_cast<char>('0' + (v % 10));
+            v /= 10;
+        } while (v != 0);
         while (dn > 0) authority[authority_len++] = digits[--dn];
     }
-    if (!append_lit("Host: ", 6) || !append(reinterpret_cast<const u8*>(authority), authority_len) ||
-        !append_lit("\r\n", 2))
+    if (!append_lit("Host: ", 6) ||
+        !append(reinterpret_cast<const u8*>(authority), authority_len) || !append_lit("\r\n", 2))
         return false;
 
     const u8* hs = line_end + 2;
@@ -3500,8 +3498,8 @@ inline bool apply_request_policy(Connection& conn, const sockaddr_in& endpoint, 
             const u8* value_start = colon + 1;
             while (value_start < le && (*value_start == ' ' || *value_start == '\t')) value_start++;
             const u8* value_end = le;
-            while (value_end > value_start &&
-                   (value_end[-1] == ' ' || value_end[-1] == '\t')) value_end--;
+            while (value_end > value_start && (value_end[-1] == ' ' || value_end[-1] == '\t'))
+                value_end--;
             if (!append(hs, name_len) || !append_lit(": ", 2) ||
                 !append(value_start, static_cast<u32>(value_end - value_start)) ||
                 !append_lit("\r\n", 2))
@@ -3693,8 +3691,8 @@ void on_upstream_connected(void* lp, Connection& conn, IoEvent ev) {
                    &on_early_upstream_recvd_send_inflight<Loop>,
                    &on_upstream_request_sent<Loop>);
     if (!loop->submit_send_upstream(conn, req_src, req_send_len)) {
-        IoEvent synth = {conn.id, -EIO, 0, 0, IoEventType::UpstreamSend, 0, 0,
-                         conn.upstream_episode};
+        IoEvent synth = {
+            conn.id, -EIO, 0, 0, IoEventType::UpstreamSend, 0, 0, conn.upstream_episode};
         on_upstream_request_sent<Loop>(lp, conn, synth);
     }
 }
@@ -3748,15 +3746,14 @@ void on_upstream_request_sent(void* lp, Connection& conn, IoEvent ev) {
                     conn.upstream_recv_buf.commit(static_cast<u32>(nr));
                     prepare_early_response_state(conn);
                     conn.set_slots(nullptr, nullptr, &on_upstream_response<Loop>, nullptr);
-                    IoEvent synth = {
-                        conn.id,
-                        static_cast<i32>(nr),
-                        0,
-                        0,
-                        IoEventType::UpstreamRecv,
-                        0,
-                        0,
-                        conn.upstream_episode};
+                    IoEvent synth = {conn.id,
+                                     static_cast<i32>(nr),
+                                     0,
+                                     0,
+                                     IoEventType::UpstreamRecv,
+                                     0,
+                                     0,
+                                     conn.upstream_episode};
                     on_upstream_response<Loop>(lp, conn, synth);
                     return;
                 }
@@ -4218,8 +4215,7 @@ void h2_on_upstream_request_sent(void* lp, Connection& conn, IoEvent ev) {
         // 502 a truncated one; it never re-arms a recv on the now-dead fd.
         if (conn.upstream_recv_buf.len() > 0) {
             conn.set_slots(nullptr, nullptr, &h2_on_upstream_response<Loop>, nullptr);
-            IoEvent eof{conn.id, 0, 0, 0, IoEventType::UpstreamRecv, 0, 0,
-                        conn.upstream_episode};
+            IoEvent eof{conn.id, 0, 0, 0, IoEventType::UpstreamRecv, 0, 0, conn.upstream_episode};
             h2_on_upstream_response<Loop>(lp, conn, eof);
             return;
         }
@@ -4387,8 +4383,14 @@ void on_response_header_sent(void* lp, Connection& conn, IoEvent ev) {
     const u32 kRemaining = consume_upstream_sent(conn);
     if (throttle_pause_before_pump(loop, conn, kRemaining)) return;
     if (kRemaining > 0) {
-        IoEvent synth = {conn.id, static_cast<i32>(kRemaining), 0, 0, IoEventType::UpstreamRecv,
-                         0, 0, conn.upstream_episode};
+        IoEvent synth = {conn.id,
+                         static_cast<i32>(kRemaining),
+                         0,
+                         0,
+                         IoEventType::UpstreamRecv,
+                         0,
+                         0,
+                         conn.upstream_episode};
         on_response_body_recvd<Loop>(lp, conn, synth);
     } else {
         loop->submit_recv_upstream(conn);
@@ -4758,8 +4760,14 @@ void on_response_body_sent(void* lp, Connection& conn, IoEvent ev) {
     conn.set_slots(nullptr, nullptr, &on_response_body_recvd<Loop>, nullptr);
     if (throttle_pause_before_pump(loop, conn, kRemaining)) return;
     if (kRemaining > 0) {
-        IoEvent synth = {conn.id, static_cast<i32>(kRemaining), 0, 0, IoEventType::UpstreamRecv,
-                         0, 0, conn.upstream_episode};
+        IoEvent synth = {conn.id,
+                         static_cast<i32>(kRemaining),
+                         0,
+                         0,
+                         IoEventType::UpstreamRecv,
+                         0,
+                         0,
+                         conn.upstream_episode};
         on_response_body_recvd<Loop>(lp, conn, synth);
     } else {
         loop->submit_recv_upstream(conn);
@@ -4827,8 +4835,7 @@ void on_body_send_with_early_response(void* lp, Connection& conn, IoEvent ev) {
     if (ev.result < 0) {
         conn.upstream_request_incomplete = true;
         conn.request_upload_complete = false;
-    } else if (request_policy_body_response_domain(conn) &&
-               conn.req_initial_send_len > 0 &&
+    } else if (request_policy_body_response_domain(conn) && conn.req_initial_send_len > 0 &&
                static_cast<u32>(ev.result) == conn.req_initial_send_len &&
                (conn.req_body_mode == BodyMode::None ||
                 conn.req_body_mode == BodyMode::ContentLength) &&
@@ -4854,8 +4861,8 @@ void on_body_send_with_early_response(void* lp, Connection& conn, IoEvent ev) {
     const i32 kSynthResult = (kParseStatus == ParseStatus::Incomplete)
                                  ? 0
                                  : static_cast<i32>(conn.upstream_recv_buf.len());
-    IoEvent synth = {conn.id, kSynthResult, 0, 0, IoEventType::UpstreamRecv, 0, 0,
-                     conn.upstream_episode};
+    IoEvent synth = {
+        conn.id, kSynthResult, 0, 0, IoEventType::UpstreamRecv, 0, 0, conn.upstream_episode};
     on_upstream_response<Loop>(lp, conn, synth);
 }
 
@@ -5780,11 +5787,11 @@ inline bool strict_response_upload_ready(const Connection& conn) {
         return false;
     if (!request_policy_body_response_domain(conn)) return true;
     return !conn.request_policy_body_pending && conn.req_body_remaining == 0 &&
-           (conn.req_body_mode == BodyMode::None || conn.req_body_mode == BodyMode::ContentLength) &&
+           (conn.req_body_mode == BodyMode::None ||
+            conn.req_body_mode == BodyMode::ContentLength) &&
            conn.request_upload_complete && !conn.upstream_request_incomplete &&
-           !conn.req_body_streamed &&
-           conn.pipeline_stash_len == 0 && conn.retry_req_send_len == 0 &&
-           conn.recv_buf.len() == 0 && !conn.upstream_reused;
+           !conn.req_body_streamed && conn.pipeline_stash_len == 0 &&
+           conn.retry_req_send_len == 0 && conn.recv_buf.len() == 0 && !conn.upstream_reused;
 }
 
 // SuppressBody is supported only in the bounded cleartext H1 HEAD/explicit-
@@ -5803,24 +5810,21 @@ inline bool failure_policy_runtime_supported(const ForwardFailurePolicySpec& pol
 // suppression disposition requires the matching response disposition so a
 // connect failure can never silently fall back to a normal-body policy.
 inline bool forward_policy_head_modes_compatible(const RouteConfig& config,
-                                                  u16 response_policy_id,
-                                                  u16 failure_policy_id,
-                                                  u16 timeout_failure_policy_id) {
+                                                 u16 response_policy_id,
+                                                 u16 failure_policy_id,
+                                                 u16 timeout_failure_policy_id) {
     const bool response_suppress =
-        response_policy_id != 0 &&
-        config.response_policies[response_policy_id - 1].head_mode ==
-            ResponsePolicyHeadMode::SuppressBody;
+        response_policy_id != 0 && config.response_policies[response_policy_id - 1].head_mode ==
+                                       ResponsePolicyHeadMode::SuppressBody;
     const bool failure_suppress =
-        failure_policy_id != 0 &&
-        config.failure_policies[failure_policy_id - 1].head_mode ==
-            FailurePolicyHeadMode::SuppressBody;
+        failure_policy_id != 0 && config.failure_policies[failure_policy_id - 1].head_mode ==
+                                      FailurePolicyHeadMode::SuppressBody;
     const bool timeout_failure_suppress =
         timeout_failure_policy_id != 0 &&
         config.failure_policies[timeout_failure_policy_id - 1].head_mode ==
             FailurePolicyHeadMode::SuppressBody;
-    if (timeout_failure_policy_id != 0 &&
-        (response_policy_id == 0 || failure_policy_id == 0 ||
-         timeout_failure_suppress != failure_suppress))
+    if (timeout_failure_policy_id != 0 && (response_policy_id == 0 || failure_policy_id == 0 ||
+                                           timeout_failure_suppress != failure_suppress))
         return false;
     if (failure_suppress && !response_suppress) return false;
     // Response-only SuppressBody is an existing success-only capability; once
@@ -5832,10 +5836,9 @@ inline bool forward_policy_head_modes_compatible(const RouteConfig& config,
     return true;
 }
 
-inline bool response_policy_suppress_head_admitted(
-    const Connection& conn,
-    const ForwardResponsePolicySpec& policy,
-    bool paired_failure) {
+inline bool response_policy_suppress_head_admitted(const Connection& conn,
+                                                   const ForwardResponsePolicySpec& policy,
+                                                   bool paired_failure) {
     // This is intentionally the complete bounded HEAD domain. Response-only
     // suppression keeps its original explicit-close shape. A paired failure
     // policy additionally admits the ordinary HTTP/1.1 default keep-alive
@@ -5894,9 +5897,7 @@ inline bool response_policy_suppress_head_admitted(
             u32 port = 0;
             for (u32 i = colon + 1; i < value.len; i++) {
                 const u8 c = static_cast<u8>(value.ptr[i]);
-                if (c < '0' || c > '9' || port > 6553u ||
-                    (port == 6553u && c > '5'))
-                    return false;
+                if (c < '0' || c > '9' || port > 6553u || (port == 6553u && c > '5')) return false;
                 port = port * 10u + static_cast<u32>(c - '0');
             }
             if (port == 0) return false;
@@ -5904,15 +5905,14 @@ inline bool response_policy_suppress_head_admitted(
         const u32 host_len = has_port ? colon : value.len;
         for (u32 i = 0; i < host_len; i++) {
             const u8 c = static_cast<u8>(value.ptr[i]);
-            const bool alpha_num = (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
-                                   (c >= '0' && c <= '9');
+            const bool alpha_num =
+                (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9');
             if (!alpha_num && c != '.' && c != '-' && c != '_') return false;
         }
         return true;
     };
-    if (paired_failure &&
-        (host_count != 1 || connection_count > 1 || host == nullptr ||
-         !valid_authority(host->value)))
+    if (paired_failure && (host_count != 1 || connection_count > 1 || host == nullptr ||
+                           !valid_authority(host->value)))
         return false;
     const bool explicit_close_shape =
         !conn.req_client_keep_alive && conn.req_client_connection_close &&
@@ -5920,8 +5920,7 @@ inline bool response_policy_suppress_head_admitted(
     const bool default_keep_alive_shape =
         paired_failure && conn.req_client_keep_alive && !conn.req_client_connection_close &&
         !conn.req_client_connection_close_exact && conn.req_client_connection_count == 0;
-    return
-           policy.connection == ResponsePolicyConnection::Request &&
+    return policy.connection == ResponsePolicyConnection::Request &&
            conn.req_method == static_cast<u8>(LogHttpMethod::Head) &&
            conn.req_http_version == static_cast<u8>(HttpVersion::Http11) &&
            (explicit_close_shape || default_keep_alive_shape) &&
@@ -5930,10 +5929,9 @@ inline bool response_policy_suppress_head_admitted(
            !conn.req_client_has_expect && !conn.req_client_has_upgrade_header &&
            conn.protocol == ConnProtocol::Http11 && conn.req_path_canon.ptr != nullptr &&
            conn.req_body_mode == BodyMode::None && conn.req_body_remaining == 0 &&
-           !conn.request_body_fully_buffered && !conn.req_malformed &&
-           !conn.req_wants_upgrade && conn.req_header_override_count == 0 &&
-           !conn.req_header_override_overflow && conn.resp_header_mutation_count == 0 &&
-           conn.resp_header_mutation_pending_count == 0 &&
+           !conn.request_body_fully_buffered && !conn.req_malformed && !conn.req_wants_upgrade &&
+           conn.req_header_override_count == 0 && !conn.req_header_override_overflow &&
+           conn.resp_header_mutation_count == 0 && conn.resp_header_mutation_pending_count == 0 &&
            !conn.resp_header_mutation_pending_overflow && !conn.resp_header_mutation_overflow &&
            conn.pipeline_stash_len == 0 && conn.req_initial_send_len != 0 &&
            conn.recv_buf.len() == conn.req_initial_send_len;
@@ -5953,8 +5951,7 @@ inline bool build_failure_policy_response_from_spec(const Connection& conn,
     if (out == nullptr) return false;
     u32 pos = 0;
     auto put = [&](const u8* data, u32 len) {
-        if ((data == nullptr && len != 0) ||
-            len > out_cap - (pos <= out_cap ? pos : out_cap))
+        if ((data == nullptr && len != 0) || len > out_cap - (pos <= out_cap ? pos : out_cap))
             return false;
         for (u32 i = 0; i < len; i++) out[pos + i] = data[i];
         pos += len;
@@ -5970,16 +5967,14 @@ inline bool build_failure_policy_response_from_spec(const Connection& conn,
     char length[10];
     const u32 date_len = strict_response_date(date, realtime_us());
     const u32 length_len = strict_response_dec(length, policy.body.len);
-    if (date_len == 0 || !put_lit("HTTP/1.1 ") ||
-        !put(reinterpret_cast<const u8*>(status), 3) || !put_lit(" ") ||
-        !put(reinterpret_cast<const u8*>(policy.reason.ptr), policy.reason.len) ||
+    if (date_len == 0 || !put_lit("HTTP/1.1 ") || !put(reinterpret_cast<const u8*>(status), 3) ||
+        !put_lit(" ") || !put(reinterpret_cast<const u8*>(policy.reason.ptr), policy.reason.len) ||
         !put_lit("\r\nServer: ") ||
         !put(reinterpret_cast<const u8*>(policy.server.ptr), policy.server.len) ||
         !put_lit("\r\nDate: ") || !put(reinterpret_cast<const u8*>(date), date_len) ||
         !put_lit("\r\nContent-Type: ") ||
         !put(reinterpret_cast<const u8*>(policy.content_type.ptr), policy.content_type.len) ||
-        !put_lit("\r\nContent-Length: ") ||
-        !put(reinterpret_cast<const u8*>(length), length_len) ||
+        !put_lit("\r\nContent-Length: ") || !put(reinterpret_cast<const u8*>(length), length_len) ||
         !put_lit("\r\nConnection: "))
         return false;
     // Body disposition and downstream persistence are orthogonal: paired HEAD
@@ -6087,12 +6082,13 @@ inline void respond_upstream_connect_failure(Loop* loop, Connection& conn) {
 }
 
 inline bool strict_response_forbidden(Str name) {
-    if (response_policy_name_eq(name, "keep-alive", 10) ||
-        response_policy_name_eq(name, "te", 2) || response_policy_name_eq(name, "trailer", 7) ||
+    if (response_policy_name_eq(name, "keep-alive", 10) || response_policy_name_eq(name, "te", 2) ||
+        response_policy_name_eq(name, "trailer", 7) ||
         response_policy_name_eq(name, "transfer-encoding", 17) ||
         response_policy_name_eq(name, "upgrade", 7) ||
         response_policy_name_eq(name, "proxy-connection", 16) ||
-        response_policy_name_eq(name, "location", 8) || response_policy_name_eq(name, "refresh", 7) ||
+        response_policy_name_eq(name, "location", 8) ||
+        response_policy_name_eq(name, "refresh", 7) ||
         response_policy_name_eq(name, "content-type", 12) ||
         response_policy_name_eq(name, "last-modified", 13))
         return true;
@@ -6123,8 +6119,8 @@ inline u32 strict_response_dec(char* out, u32 value) {
 
 inline u32 strict_response_date(char* out, u64 now_us) {
     static constexpr const char* kWeek[] = {"Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"};
-    static constexpr const char* kMonth[] = {"Jan", "Feb", "Mar", "Apr", "May", "Jun",
-                                             "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"};
+    static constexpr const char* kMonth[] = {
+        "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"};
     time_t t = static_cast<time_t>(now_us / 1000000ULL);
     struct tm tm;
     if (gmtime_r(&t, &tm) == nullptr) return 0;
@@ -6134,13 +6130,27 @@ inline u32 strict_response_date(char* out, u64 now_us) {
         *p++ = static_cast<char>('0' + v % 10);
     };
     for (const char* s = kWeek[tm.tm_wday]; *s; ++s) *p++ = *s;
-    *p++ = ','; *p++ = ' '; two(tm.tm_mday); *p++ = ' ';
+    *p++ = ',';
+    *p++ = ' ';
+    two(tm.tm_mday);
+    *p++ = ' ';
     for (const char* s = kMonth[tm.tm_mon]; *s; ++s) *p++ = *s;
-    *p++ = ' '; int year = tm.tm_year + 1900;
-    *p++ = static_cast<char>('0' + year / 1000); *p++ = static_cast<char>('0' + (year / 100) % 10);
-    *p++ = static_cast<char>('0' + (year / 10) % 10); *p++ = static_cast<char>('0' + year % 10);
-    *p++ = ' '; two(tm.tm_hour); *p++ = ':'; two(tm.tm_min); *p++ = ':'; two(tm.tm_sec);
-    *p++ = ' '; *p++ = 'G'; *p++ = 'M'; *p++ = 'T';
+    *p++ = ' ';
+    int year = tm.tm_year + 1900;
+    *p++ = static_cast<char>('0' + year / 1000);
+    *p++ = static_cast<char>('0' + (year / 100) % 10);
+    *p++ = static_cast<char>('0' + (year / 10) % 10);
+    *p++ = static_cast<char>('0' + year % 10);
+    *p++ = ' ';
+    two(tm.tm_hour);
+    *p++ = ':';
+    two(tm.tm_min);
+    *p++ = ':';
+    two(tm.tm_sec);
+    *p++ = ' ';
+    *p++ = 'G';
+    *p++ = 'M';
+    *p++ = 'T';
     return static_cast<u32>(p - out);
 }
 
@@ -6162,17 +6172,15 @@ inline bool redirect_connection_close(Str value) {
     return end - start == 5 && http_header_name_eq_ci(value.ptr + start, 5, "close", 5);
 }
 
-inline bool redirect_authority_valid(Str value,
-                                     u16 actual_port,
-                                     RedirectAuthorityView* out) {
+inline bool redirect_authority_valid(Str value, u16 actual_port, RedirectAuthorityView* out) {
     if (out == nullptr || value.ptr == nullptr || value.len == 0 || value.len > 255 ||
         actual_port == 0)
         return false;
     u32 colon = value.len;
     for (u32 i = 0; i < value.len; i++) {
         const u8 c = static_cast<u8>(value.ptr[i]);
-        if (c <= 0x20 || c == 0x7f || c == '/' || c == '?' || c == '#' || c == '@' ||
-            c == '[' || c == ']' || c == ',' || c == '\\')
+        if (c <= 0x20 || c == 0x7f || c == '/' || c == '?' || c == '#' || c == '@' || c == '[' ||
+            c == ']' || c == ',' || c == '\\')
             return false;
         if (c == ':') {
             if (colon != value.len) return false;
@@ -6195,8 +6203,8 @@ inline bool redirect_authority_valid(Str value,
     const u32 host_len = has_port ? colon : value.len;
     for (u32 i = 0; i < host_len; i++) {
         const u8 c = static_cast<u8>(value.ptr[i]);
-        const bool alpha_num = (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
-                               (c >= '0' && c <= '9');
+        const bool alpha_num =
+            (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9');
         if (!alpha_num && c != '.' && c != '-' && c != '_') return false;
     }
     out->value = value;
@@ -6220,8 +6228,8 @@ inline bool redirect_origin_request_valid(const Connection& conn,
     parser.reset();
     if (parser.parse(conn.recv_buf.data(), conn.recv_buf.len(), out_req) != ParseStatus::Complete ||
         parser.header_end != conn.req_header_end || out_req->method != HttpMethod::GET ||
-        out_req->version != HttpVersion::Http11 || out_req->has_content_length || out_req->chunked ||
-        out_req->upgrade || out_req->has_upgrade_header)
+        out_req->version != HttpVersion::Http11 || out_req->has_content_length ||
+        out_req->chunked || out_req->upgrade || out_req->has_upgrade_header)
         return false;
     const uintptr_t base = reinterpret_cast<uintptr_t>(conn.recv_buf.data());
     const uintptr_t path_addr = reinterpret_cast<uintptr_t>(out_req->path.ptr);
@@ -6244,7 +6252,8 @@ inline bool redirect_origin_request_valid(const Connection& conn,
             if (++connection_count > 1 || !redirect_connection_close(header.value)) return false;
         } else if (redirect_name_eq(header.name, "content-length", 14) ||
                    redirect_name_eq(header.name, "transfer-encoding", 17) ||
-                   redirect_name_eq(header.name, "te", 2) || redirect_name_eq(header.name, "expect", 6) ||
+                   redirect_name_eq(header.name, "te", 2) ||
+                   redirect_name_eq(header.name, "expect", 6) ||
                    redirect_name_eq(header.name, "upgrade", 7)) {
             return false;
         }
@@ -6274,11 +6283,11 @@ inline bool redirect_origin_request_valid(const Connection& conn,
 }
 
 inline bool build_redirect_response(const Connection& conn,
-                                   const RouteConfig& config,
-                                   u16 policy_id,
-                                   u8* out,
-                                   u32 out_cap,
-                                   u32* out_len) {
+                                    const RouteConfig& config,
+                                    u16 policy_id,
+                                    u8* out,
+                                    u32 out_cap,
+                                    u32* out_len) {
     if (out_len == nullptr) return false;
     *out_len = 0;
     if (out == nullptr || conn.tls_active || !conn.listener_context.valid() ||
@@ -6291,12 +6300,8 @@ inline bool build_redirect_response(const Connection& conn,
     ParsedRequest req{};
     u32 target_start = 0, path_len = 0, query_len = 0;
     RedirectAuthorityView authority{};
-    if (!redirect_origin_request_valid(conn,
-                                       &req,
-                                       &target_start,
-                                       &path_len,
-                                       &query_len,
-                                       &authority))
+    if (!redirect_origin_request_valid(
+            conn, &req, &target_start, &path_len, &query_len, &authority))
         return false;
 
     char status[3] = {static_cast<char>('0' + policy.status_code / 100),
@@ -6310,8 +6315,8 @@ inline bool build_redirect_response(const Connection& conn,
     const u32 actual_port_digits = strict_response_dec(actual_port, conn.listener_context.port);
     if (date_len == 0 || actual_port_digits == 0) return false;
 
-    const u32 authority_len = authority.value.len +
-                              (authority.has_port ? 0u : 1u + actual_port_digits);
+    const u32 authority_len =
+        authority.value.len + (authority.has_port ? 0u : 1u + actual_port_digits);
     u64 required = 0;
     auto add = [&](u64 n) {
         if (n > 0xffffffffu - required) return false;
@@ -6321,8 +6326,8 @@ inline bool build_redirect_response(const Connection& conn,
     static constexpr char kLocationPrefix[] = "\r\nLocation: http://";
     static constexpr char kTail[] = "\r\nConnection: close\r\n\r\n";
     if (!add(9 + 3 + 1 + policy.reason.len + 2) || !add(10 + policy.server.len) ||
-        !add(8 + date_len) || !add(16 + policy.content_type.len) ||
-        !add(18 + body_len_digits) || !add(sizeof(kLocationPrefix) - 1 + authority_len) ||
+        !add(8 + date_len) || !add(16 + policy.content_type.len) || !add(18 + body_len_digits) ||
+        !add(sizeof(kLocationPrefix) - 1 + authority_len) ||
         !add(policy.target_path.len + query_len) || !add(sizeof(kTail) - 1) ||
         !add(policy.body.len) || required > out_cap)
         return false;
@@ -6354,19 +6359,18 @@ inline bool build_redirect_response(const Connection& conn,
     return true;
 }
 
-inline bool stage_redirect_response(Connection& conn,
-                                   const RouteConfig& config,
-                                   u16 policy_id) {
+inline bool stage_redirect_response(Connection& conn, const RouteConfig& config, u16 policy_id) {
     u8 scratch[SlicePool::kSliceSize];
-    const u32 cap = conn.send_buf.capacity() < sizeof(scratch) ? conn.send_buf.capacity()
-                                                                : sizeof(scratch);
+    const u32 cap =
+        conn.send_buf.capacity() < sizeof(scratch) ? conn.send_buf.capacity() : sizeof(scratch);
     u32 len = 0;
     if (!build_redirect_response(conn, config, policy_id, scratch, cap, &len)) return false;
     conn.send_buf.reset();
     return conn.send_buf.write(scratch, len) == len;
 }
 
-inline bool build_strict_response_headers(Connection& conn, const RouteConfig& config,
+inline bool build_strict_response_headers(Connection& conn,
+                                          const RouteConfig& config,
                                           const ParsedResponse& resp) {
     if (conn.response_policy_id == 0 || conn.response_policy_id > config.response_policy_count)
         return false;
@@ -6423,14 +6427,18 @@ inline bool build_strict_response_headers(Connection& conn, const RouteConfig& c
     for (u32 i = 0; i < resp.header_count; i++) {
         const Header& h = resp.headers[i];
         if (response_policy_name_eq(h.name, "connection", 10) ||
-            response_policy_name_eq(h.name, "date", 4) || response_policy_name_eq(h.name, "server", 6) ||
-            response_policy_name_eq(h.name, "content-length", 14) || response_policy_hides(policy, h.name))
+            response_policy_name_eq(h.name, "date", 4) ||
+            response_policy_name_eq(h.name, "server", 6) ||
+            response_policy_name_eq(h.name, "content-length", 14) ||
+            response_policy_hides(policy, h.name))
             continue;
         if (!put(h.name.ptr, h.name.len) || !put_lit(": ")) return false;
         u32 start = 0;
-        while (start < h.raw_value.len && (h.raw_value.ptr[start] == ' ' || h.raw_value.ptr[start] == '\t'))
+        while (start < h.raw_value.len &&
+               (h.raw_value.ptr[start] == ' ' || h.raw_value.ptr[start] == '\t'))
             start++;
-        if (!put(h.raw_value.ptr + start, h.raw_value.len - start) || !put_lit("\r\n")) return false;
+        if (!put(h.raw_value.ptr + start, h.raw_value.len - start) || !put_lit("\r\n"))
+            return false;
     }
     return put_lit("\r\n");
 }
@@ -6470,10 +6478,7 @@ template <typename Loop>
 inline bool try_prebuilt_strict_parse_failure(Loop* loop, Connection& conn) {
     if constexpr (!requires(Loop* candidate, Connection& c) {
                       candidate->begin_prebuilt_http1_response(
-                          c,
-                          u8{},
-                          Http1RequestBufferDisposition::ExistingPipeline,
-                          u32{});
+                          c, u8{}, Http1RequestBufferDisposition::ExistingPipeline, u32{});
                   }) {
         return false;
     } else {
@@ -6488,20 +6493,17 @@ inline bool try_prebuilt_strict_parse_failure(Loop* loop, Connection& conn) {
             !conn.response_policy_suppress_body || !conn.failure_policy_suppress_body ||
             conn.protocol != ConnProtocol::Http11 || conn.tls_active ||
             conn.req_http_version != static_cast<u8>(HttpVersion::Http11) ||
-            conn.req_method != static_cast<u8>(LogHttpMethod::Head) ||
-            !conn.keep_alive || !conn.req_client_keep_alive ||
-            conn.req_client_connection_close || conn.req_client_connection_close_exact ||
-            conn.req_client_connection_count != 0 || conn.req_client_has_content_length ||
-            conn.req_client_has_transfer_encoding || conn.req_client_has_te ||
-            conn.req_client_has_expect || conn.req_client_has_upgrade_header ||
-            conn.req_malformed || conn.req_wants_upgrade ||
+            conn.req_method != static_cast<u8>(LogHttpMethod::Head) || !conn.keep_alive ||
+            !conn.req_client_keep_alive || conn.req_client_connection_close ||
+            conn.req_client_connection_close_exact || conn.req_client_connection_count != 0 ||
+            conn.req_client_has_content_length || conn.req_client_has_transfer_encoding ||
+            conn.req_client_has_te || conn.req_client_has_expect ||
+            conn.req_client_has_upgrade_header || conn.req_malformed || conn.req_wants_upgrade ||
             conn.req_header_override_count != 0 || conn.req_header_override_overflow ||
-            conn.resp_header_mutation_count != 0 ||
-            conn.resp_header_mutation_pending_count != 0 ||
-            conn.resp_header_mutation_pending_overflow ||
-            conn.resp_header_mutation_overflow || conn.req_body_mode != BodyMode::None ||
-            conn.req_body_remaining != 0 || conn.req_body_streamed ||
-            conn.state != ConnState::Proxying || conn.req_start_us == 0 ||
+            conn.resp_header_mutation_count != 0 || conn.resp_header_mutation_pending_count != 0 ||
+            conn.resp_header_mutation_pending_overflow || conn.resp_header_mutation_overflow ||
+            conn.req_body_mode != BodyMode::None || conn.req_body_remaining != 0 ||
+            conn.req_body_streamed || conn.state != ConnState::Proxying || conn.req_start_us == 0 ||
             conn.proxy_resp_started || conn.resp_body_sent != 0 || conn.send_progress != 0 ||
             conn.send_armed || conn.on_send != nullptr || !conn.request_upload_complete ||
             conn.upstream_request_incomplete || conn.upstream_connect_armed ||
@@ -6509,10 +6511,8 @@ inline bool try_prebuilt_strict_parse_failure(Loop* loop, Connection& conn) {
             !conn.response_header_buf.valid())
             return false;
 
-        const auto& response =
-            conn.request_config->response_policies[conn.response_policy_id - 1];
-        const auto& failure =
-            conn.request_config->failure_policies[conn.failure_policy_id - 1];
+        const auto& response = conn.request_config->response_policies[conn.response_policy_id - 1];
+        const auto& failure = conn.request_config->failure_policies[conn.failure_policy_id - 1];
         if (response.version != ResponsePolicyVersion::Http11 ||
             response.framing != ResponsePolicyFraming::ContentLength ||
             response.connection != ResponsePolicyConnection::Request ||
@@ -6547,13 +6547,11 @@ inline bool try_prebuilt_strict_parse_failure(Loop* loop, Connection& conn) {
         conn.resp_body_sent = 0;
         conn.upstream_send_len = 0;
 
-        const u8 selected_targets =
-            conn.upstream_recv_armed ? kUpstreamOpRecv : static_cast<u8>(0);
-        if (!loop->begin_prebuilt_http1_response(
-                conn,
-                selected_targets,
-                Http1RequestBufferDisposition::ExistingPipeline,
-                conn.retry_req_send_len)) {
+        const u8 selected_targets = conn.upstream_recv_armed ? kUpstreamOpRecv : static_cast<u8>(0);
+        if (!loop->begin_prebuilt_http1_response(conn,
+                                                 selected_targets,
+                                                 Http1RequestBufferDisposition::ExistingPipeline,
+                                                 conn.retry_req_send_len)) {
             // D2 may already have closed on an episode-exhaustion or submit
             // failure.  Do not run close bookkeeping twice.
             if (conn.fd >= 0) loop->close_conn(conn);
@@ -6582,8 +6580,9 @@ inline void reject_strict_response(
         return;
     }
     if (!abandon_strict_upstream(loop, conn)) return;
-    static const char k502[] = "HTTP/1.1 502 Bad Gateway\r\nContent-Length: 11\r\n"
-                                "Connection: close\r\n\r\nBad Gateway";
+    static const char k502[] =
+        "HTTP/1.1 502 Bad Gateway\r\nContent-Length: 11\r\n"
+        "Connection: close\r\n\r\nBad Gateway";
     conn.send_buf.reset();
     conn.send_buf.write(reinterpret_cast<const u8*>(k502), sizeof(k502) - 1);
     conn.keep_alive = false;
@@ -6677,8 +6676,7 @@ void on_upstream_response(void* lp, Connection& conn, IoEvent ev) {
     // 1xx statuses before the transparent interim-discard/WebSocket branches;
     // otherwise a 103/100 could be consumed and a later final response would
     // incorrectly make the policy appear successful.
-    if (conn.response_policy_id != 0 && resp.status_code >= 100 &&
-        resp.status_code < 200) {
+    if (conn.response_policy_id != 0 && resp.status_code >= 100 && resp.status_code < 200) {
         reject_strict_response(loop, conn);
         return;
     }
@@ -6790,12 +6788,10 @@ void on_upstream_response(void* lp, Connection& conn, IoEvent ev) {
              conn.req_method == static_cast<u8>(LogHttpMethod::Head)) ||
             (conn.response_policy_suppress_body &&
              conn.req_method != static_cast<u8>(LogHttpMethod::Head)) ||
-            resp.status_code == 101 ||
-            (resp.status_code >= 100 && resp.status_code < 200) ||
+            resp.status_code == 101 || (resp.status_code >= 100 && resp.status_code < 200) ||
             conn.resp_header_mutation_count != 0 || conn.resp_header_mutation_pending_count != 0 ||
             conn.resp_header_mutation_pending_overflow || conn.resp_header_mutation_overflow ||
-            !conn.request_config ||
-            !strict_response_upload_ready(conn) ||
+            !conn.request_config || !strict_response_upload_ready(conn) ||
             (conn.upstream_recv_buf.len() > resp_parser.header_end &&
              conn.upstream_recv_buf.len() - resp_parser.header_end > resp.content_length) ||
             !build_strict_response_headers(conn, *conn.request_config, resp)) {
@@ -6827,12 +6823,13 @@ void on_upstream_response(void* lp, Connection& conn, IoEvent ev) {
             conn.upstream_recv_buf.reset();
             if (!abandon_strict_upstream(loop, conn)) return;
             conn.transition_to_sending(&on_proxy_response_sent<Loop>);
-            client_send(loop, conn, conn.response_header_buf.data(), conn.response_header_buf.len());
+            client_send(
+                loop, conn, conn.response_header_buf.data(), conn.response_header_buf.len());
             return;
         }
         const bool complete = conn.resp_body_remaining == 0;
         conn.transition_to_sending(complete ? &on_proxy_response_sent<Loop>
-                                             : &on_response_header_sent<Loop>);
+                                            : &on_response_header_sent<Loop>);
         client_send(loop, conn, conn.response_header_buf.data(), conn.response_header_buf.len());
         return;
     }

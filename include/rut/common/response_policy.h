@@ -1,7 +1,7 @@
 #pragma once
 
-#include "rut/common/http_header_validation.h"
 #include "rut/common/forward_policy_head_mode.h"
+#include "rut/common/http_header_validation.h"
 #include "rut/common/types.h"
 
 namespace rut {

@@ -9715,9 +9715,8 @@ static FrontendResult<HirTerminator> analyze_term(const AstStatement& stmt, cons
         if (!stmt.has_redirect_policy || stmt.redirect_policy_id == 0 ||
             stmt.redirect_policy_id > mod.redirect_policies.len ||
             !redirect_policy_spec_valid(mod.redirect_policies[stmt.redirect_policy_id - 1]))
-            return frontend_error(FrontendError::UnsupportedSyntax,
-                                  stmt.span,
-                                  lit_str("invalid redirect policy"));
+            return frontend_error(
+                FrontendError::UnsupportedSyntax, stmt.span, lit_str("invalid redirect policy"));
         if (stmt.response_headers.len != 0 || stmt.forward_set_path.len != 0 ||
             stmt.forward_set_headers.len != 0)
             return frontend_error(FrontendError::UnsupportedSyntax,
@@ -9738,26 +9737,22 @@ static FrontendResult<HirTerminator> analyze_term(const AstStatement& stmt, cons
     if (stmt.has_forward_response_policy) {
         if (stmt.forward_response_policy_id == 0 ||
             stmt.forward_response_policy_id > mod.response_policies.len)
-            return frontend_error(FrontendError::UnsupportedSyntax,
-                                  stmt.span,
-                                  lit_str("invalid response policy"));
+            return frontend_error(
+                FrontendError::UnsupportedSyntax, stmt.span, lit_str("invalid response policy"));
         response_policy = &mod.response_policies[stmt.forward_response_policy_id - 1];
         if (!response_policy_spec_valid(*response_policy))
-            return frontend_error(FrontendError::UnsupportedSyntax,
-                                  stmt.span,
-                                  lit_str("invalid response policy"));
+            return frontend_error(
+                FrontendError::UnsupportedSyntax, stmt.span, lit_str("invalid response policy"));
     }
     if (stmt.has_forward_failure_policy) {
         if (stmt.forward_failure_policy_id == 0 ||
             stmt.forward_failure_policy_id > mod.failure_policies.len)
-            return frontend_error(FrontendError::UnsupportedSyntax,
-                                  stmt.span,
-                                  lit_str("invalid failure policy"));
+            return frontend_error(
+                FrontendError::UnsupportedSyntax, stmt.span, lit_str("invalid failure policy"));
         failure_policy = &mod.failure_policies[stmt.forward_failure_policy_id - 1];
         if (!forward_failure_policy_spec_valid(*failure_policy))
-            return frontend_error(FrontendError::UnsupportedSyntax,
-                                  stmt.span,
-                                  lit_str("invalid failure policy"));
+            return frontend_error(
+                FrontendError::UnsupportedSyntax, stmt.span, lit_str("invalid failure policy"));
     }
     if (stmt.has_forward_timeout_failure_policy) {
         if (!stmt.has_forward_response_policy || !stmt.has_forward_failure_policy ||
@@ -9766,8 +9761,7 @@ static FrontendResult<HirTerminator> analyze_term(const AstStatement& stmt, cons
             return frontend_error(FrontendError::UnsupportedSyntax,
                                   stmt.span,
                                   lit_str("invalid timeout failure policy bundle"));
-        timeout_failure_policy =
-            &mod.failure_policies[stmt.forward_timeout_failure_policy_id - 1];
+        timeout_failure_policy = &mod.failure_policies[stmt.forward_timeout_failure_policy_id - 1];
         if (!forward_timeout_failure_policy_spec_valid(*timeout_failure_policy))
             return frontend_error(FrontendError::UnsupportedSyntax,
                                   stmt.span,
@@ -9780,25 +9774,28 @@ static FrontendResult<HirTerminator> analyze_term(const AstStatement& stmt, cons
     const bool response_suppress =
         response_policy != nullptr &&
         response_policy->head_mode == ResponsePolicyHeadMode::SuppressBody;
-    const bool failure_suppress =
-        failure_policy != nullptr && failure_policy->head_mode == FailurePolicyHeadMode::SuppressBody;
+    const bool failure_suppress = failure_policy != nullptr &&
+                                  failure_policy->head_mode == FailurePolicyHeadMode::SuppressBody;
     const bool timeout_failure_suppress =
         timeout_failure_policy != nullptr &&
         timeout_failure_policy->head_mode == FailurePolicyHeadMode::SuppressBody;
     if (response_suppress || failure_suppress || timeout_failure_suppress) {
         if (!response_suppress || !failure_suppress ||
             (timeout_failure_policy != nullptr && !timeout_failure_suppress))
-            return frontend_error(FrontendError::UnsupportedSyntax,
-                                  stmt.span,
-                                  lit_str("public HEAD suppression requires paired response and failure policies"));
+            return frontend_error(
+                FrontendError::UnsupportedSyntax,
+                stmt.span,
+                lit_str("public HEAD suppression requires paired response and failure policies"));
         if (response_policy->connection != ResponsePolicyConnection::Request)
-            return frontend_error(FrontendError::UnsupportedSyntax,
-                                  stmt.span,
-                                  lit_str("public HEAD suppression requires response connection request"));
+            return frontend_error(
+                FrontendError::UnsupportedSyntax,
+                stmt.span,
+                lit_str("public HEAD suppression requires response connection request"));
         if (stmt.has_forward_target_transform)
-            return frontend_error(FrontendError::UnsupportedSyntax,
-                                  stmt.span,
-                                  lit_str("public HEAD suppression cannot be combined with target_transform"));
+            return frontend_error(
+                FrontendError::UnsupportedSyntax,
+                stmt.span,
+                lit_str("public HEAD suppression cannot be combined with target_transform"));
     }
 
     auto upstream_index = find_upstream_index_by_name(mod, stmt.name, stmt.span);
@@ -9820,7 +9817,8 @@ static FrontendResult<HirTerminator> analyze_term(const AstStatement& stmt, cons
             return frontend_error(
                 FrontendError::UnsupportedSyntax,
                 stmt.span,
-                lit_str("target_transform cannot be combined with request target or header overrides"));
+                lit_str(
+                    "target_transform cannot be combined with request target or header overrides"));
         term.has_forward_target_transform = true;
         term.forward_target_transform = stmt.forward_target_transform;
     }
@@ -14360,8 +14358,7 @@ static FrontendResult<void> validate_timer_route(const HirRoute& route,
         return {};
     };
     auto check_term = [&](const HirTerminator& t) -> FrontendResult<void> {
-        if (t.kind == HirTerminatorKind::ForwardUpstream ||
-            t.kind == HirTerminatorKind::Redirect)
+        if (t.kind == HirTerminatorKind::ForwardUpstream || t.kind == HirTerminatorKind::Redirect)
             return frontend_error(FrontendError::UnsupportedSyntax, body_span, kTimerReqDetail);
         return {};
     };
@@ -18919,14 +18916,12 @@ static FrontendResult<HirModule*> analyze_file_internal(
             // source boundary; the runtime has a matching fail-closed guard for
             // direct-RIR callers.
             auto policy_mutation_conflict = [](const HirTerminator& term) {
-                if (term.kind == HirTerminatorKind::Redirect &&
-                    term.commit_response_mutations)
+                if (term.kind == HirTerminatorKind::Redirect && term.commit_response_mutations)
                     return true;
                 return term.kind == HirTerminatorKind::ForwardUpstream &&
                        ((term.has_forward_target_transform && term.commit_response_mutations) ||
                         (term.forward_request_policy_id != 0 && term.commit_response_mutations) ||
-                        (term.forward_response_policy_id != 0 &&
-                         term.commit_response_mutations));
+                        (term.forward_response_policy_id != 0 && term.commit_response_mutations));
             };
             auto find_guard_conflict = [&](const HirGuard& guard) -> const HirTerminator* {
                 if (guard.fail_kind == HirGuard::FailKind::Term) {
@@ -18985,11 +18980,14 @@ static FrontendResult<HirModule*> analyze_file_internal(
                     conflict->span,
                     conflict->kind == HirTerminatorKind::Redirect
                         ? lit_str("redirect cannot be combined with response header mutations")
-                        : conflict->has_forward_target_transform
-                        ? lit_str("target_transform cannot be combined with response header mutations")
-                        : conflict->forward_response_policy_id != 0
-                        ? lit_str("response_policy cannot be combined with response header mutations")
-                        : lit_str("request_policy cannot be combined with response header mutations"));
+                    : conflict->has_forward_target_transform
+                        ? lit_str(
+                              "target_transform cannot be combined with response header mutations")
+                    : conflict->forward_response_policy_id != 0
+                        ? lit_str(
+                              "response_policy cannot be combined with response header mutations")
+                        : lit_str(
+                              "request_policy cannot be combined with response header mutations"));
         }
 
         // Wait-route backstop: the creation-time gates (kTimeWaitDetail /

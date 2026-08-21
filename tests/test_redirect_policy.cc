@@ -1,10 +1,10 @@
-#include "rut/compiler/rir.h"
-#include "rut/compiler/rir_printer.h"
 #include "rut/compiler/analyze.h"
 #include "rut/compiler/lexer.h"
 #include "rut/compiler/lower_rir.h"
 #include "rut/compiler/mir_build.h"
 #include "rut/compiler/parser.h"
+#include "rut/compiler/rir.h"
+#include "rut/compiler/rir_printer.h"
 #include "rut/runtime/compile_to_config.h"
 #include "rut/runtime/route_table.h"
 #include "test.h"
@@ -162,9 +162,9 @@ TEST(redirect_policy, exact_field_count_and_aggregate_boundaries_are_bounded) {
         for (u32 j = 0; j < kMaxRedirectBodyLen; j++) bodies[i][j] = 'x';
         exact[i] = policy({bodies[i], kMaxRedirectBodyLen});
         exact[i].status_code = static_cast<u16>(300 + i);
-        exact[i].target_path = i == 0 ? lit_str("/a/") : (i == 1 ? lit_str("/b/")
-                                                                  : (i == 2 ? lit_str("/c/")
-                                                                            : lit_str("/d/")));
+        exact[i].target_path =
+            i == 0 ? lit_str("/a/")
+                   : (i == 1 ? lit_str("/b/") : (i == 2 ? lit_str("/c/") : lit_str("/d/")));
     }
     exact[3].body.len = 3932;
     CHECK(redirect_policy_table_valid(exact, 4));
@@ -330,10 +330,12 @@ TEST(redirect_policy, source_redirect_reaches_owned_route_config) {
     REQUIRE(populate_route_config(cfg, rir.module));
     REQUIRE_EQ(cfg.redirect_policy_count, 1u);
     CHECK_NE(cfg.redirect_policies[0].body.ptr, rir.module.redirect_policies[0].body.ptr);
-    CHECK(equal_bytes(cfg.redirect_policies[0].body.ptr, cfg.redirect_policies[0].body.len,
-                      "OK\n\0", 4));
-    CHECK(equal_bytes(cfg.redirect_policies[0].target_path.ptr, cfg.redirect_policies[0].target_path.len,
-                      "/api/", 5));
+    CHECK(equal_bytes(
+        cfg.redirect_policies[0].body.ptr, cfg.redirect_policies[0].body.len, "OK\n\0", 4));
+    CHECK(equal_bytes(cfg.redirect_policies[0].target_path.ptr,
+                      cfg.redirect_policies[0].target_path.len,
+                      "/api/",
+                      5));
     rir.destroy();
 }
 

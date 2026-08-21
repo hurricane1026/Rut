@@ -5,8 +5,8 @@
 #include "rut/compiler/parser.h"
 #include "rut/compiler/rir_printer.h"
 #include "rut/compiler/verifier.h"
-#include "rut/runtime/route_method.h"
 #include "rut/runtime/listener.h"
+#include "rut/runtime/route_method.h"
 #include "test.h"
 #include <cstdio>
 #include <cstring>
@@ -32361,11 +32361,22 @@ route GET "/" {
     REQUIRE(hir);
 
     const char* invalid[] = {
-        "upstream b at \"127.0.0.1:9000\"\nroute GET \"/\" { return forward(b, request_policy: { version: \"HTTP/1.0\", host: \"upstream\", connection: \"omit\", strip_headers: [\"Connection\", \"Keep-Alive\", \"TE\", \"Expect\", \"Upgrade\"] }) }\n",
-        "upstream b at \"127.0.0.1:9000\"\nroute GET \"/\" { return forward(b, request_policy: { version: \"HTTP/1.1\", host: \"upstream\", connection: \"close\", strip_headers: [\"Connection\", \"Keep-Alive\", \"TE\", \"Expect\", \"Upgrade\"] }) }\n",
-        "upstream b at \"127.0.0.1:9000\"\nroute GET \"/\" { return forward(b, request_policy: { version: \"HTTP/1.1\", host: \"upstream\", connection: \"omit\", strip_headers: [\"Connection\", \"Keep-Alive\"] }) }\n",
-        "upstream b at \"127.0.0.1:9000\"\nroute GET \"/\" { return forward(b, request_policy: { version: \"HTTP/1.1\", host: \"upstream\", connection: \"omit\", strip_headers: [\"Connection\", \"Keep-Alive\", \"TE\", \"Expect\", \"Upgrade\", \"Foo\"] }) }\n",
-        "upstream b at \"127.0.0.1:9000\"\nroute GET \"/\" { return forward(b, request_policy: { version: \"HTTP/1.1\", host: \"upstream\", connection: \"omit\", strip_headers: [\"Connection\", \"Keep-Alive\", \"TE\", \"Expect\", \"Upgrade\"] }, set_path: \"/x\") }\n",
+        "upstream b at \"127.0.0.1:9000\"\nroute GET \"/\" { return forward(b, request_policy: { "
+        "version: \"HTTP/1.0\", host: \"upstream\", connection: \"omit\", strip_headers: "
+        "[\"Connection\", \"Keep-Alive\", \"TE\", \"Expect\", \"Upgrade\"] }) }\n",
+        "upstream b at \"127.0.0.1:9000\"\nroute GET \"/\" { return forward(b, request_policy: { "
+        "version: \"HTTP/1.1\", host: \"upstream\", connection: \"close\", strip_headers: "
+        "[\"Connection\", \"Keep-Alive\", \"TE\", \"Expect\", \"Upgrade\"] }) }\n",
+        "upstream b at \"127.0.0.1:9000\"\nroute GET \"/\" { return forward(b, request_policy: { "
+        "version: \"HTTP/1.1\", host: \"upstream\", connection: \"omit\", strip_headers: "
+        "[\"Connection\", \"Keep-Alive\"] }) }\n",
+        "upstream b at \"127.0.0.1:9000\"\nroute GET \"/\" { return forward(b, request_policy: { "
+        "version: \"HTTP/1.1\", host: \"upstream\", connection: \"omit\", strip_headers: "
+        "[\"Connection\", \"Keep-Alive\", \"TE\", \"Expect\", \"Upgrade\", \"Foo\"] }) }\n",
+        "upstream b at \"127.0.0.1:9000\"\nroute GET \"/\" { return forward(b, request_policy: { "
+        "version: \"HTTP/1.1\", host: \"upstream\", connection: \"omit\", strip_headers: "
+        "[\"Connection\", \"Keep-Alive\", \"TE\", \"Expect\", \"Upgrade\"] }, set_path: \"/x\") "
+        "}\n",
     };
     for (const char* src : invalid) {
         auto bad_lex = lex(lit(src));
@@ -32440,8 +32451,7 @@ route GET "/" {
     REQUIRE(lowered);
     REQUIRE_EQ(rir.module.response_policy_count, 1u);
     CHECK(rir.module.response_policies[0].server.eq(lit("nginx")));
-    CHECK(rir.module.response_policies[0].head_mode ==
-          ResponsePolicyHeadMode::Reject);
+    CHECK(rir.module.response_policies[0].head_mode == ResponsePolicyHeadMode::Reject);
     const auto& block = rir.module.functions[0].blocks[0];
     const auto& ret = block.insts[block.inst_count - 1];
     CHECK_EQ(static_cast<u8>(ret.op), static_cast<u8>(rir::Opcode::RetForward));
@@ -32494,16 +32504,25 @@ TEST(response_policy, head_mode_is_owned_deduplicated_and_printed) {
     CHECK_FALSE(buf.overflow);
     CHECK_EQ(buf.len, static_cast<u32>(sizeof(expected) - 1));
     CHECK(__builtin_memcmp(buf.data, expected, sizeof(expected) - 1) == 0);
-
 }
 
 TEST(frontend, response_policy_rejects_invalid_values_duplicates_and_missing_fields) {
     const char* invalid[] = {
-        "upstream b\nroute GET \"/\" { return forward(b, response_policy: { version: \"HTTP/1.0\", framing: \"content_length\", connection: \"keep_alive\", server: \"nginx\", date: \"current\", hide_headers: [] }) }\n",
-        "upstream b\nroute GET \"/\" { return forward(b, response_policy: { version: \"HTTP/1.1\", framing: \"chunked\", connection: \"keep_alive\", server: \"nginx\", date: \"current\", hide_headers: [] }) }\n",
-        "upstream b\nroute GET \"/\" { return forward(b, response_policy: { version: \"HTTP/1.1\", framing: \"content_length\", connection: \"keep_alive\", server: \"nginx\", date: \"current\", hide_headers: [\"Date\", \"date\"] }) }\n",
-        "upstream b\nroute GET \"/\" { return forward(b, response_policy: { version: \"HTTP/1.1\", framing: \"content_length\", connection: \"keep_alive\", server: \"nginx\", hide_headers: [] }) }\n",
-        "upstream b\nroute GET \"/\" { return forward(b, response_policy: { version: \"HTTP/1.1\", framing: \"content_length\", connection: \"keep_alive\", server: \"bad\rvalue\", date: \"current\", hide_headers: [] }) }\n",
+        "upstream b\nroute GET \"/\" { return forward(b, response_policy: { version: \"HTTP/1.0\", "
+        "framing: \"content_length\", connection: \"keep_alive\", server: \"nginx\", date: "
+        "\"current\", hide_headers: [] }) }\n",
+        "upstream b\nroute GET \"/\" { return forward(b, response_policy: { version: \"HTTP/1.1\", "
+        "framing: \"chunked\", connection: \"keep_alive\", server: \"nginx\", date: \"current\", "
+        "hide_headers: [] }) }\n",
+        "upstream b\nroute GET \"/\" { return forward(b, response_policy: { version: \"HTTP/1.1\", "
+        "framing: \"content_length\", connection: \"keep_alive\", server: \"nginx\", date: "
+        "\"current\", hide_headers: [\"Date\", \"date\"] }) }\n",
+        "upstream b\nroute GET \"/\" { return forward(b, response_policy: { version: \"HTTP/1.1\", "
+        "framing: \"content_length\", connection: \"keep_alive\", server: \"nginx\", hide_headers: "
+        "[] }) }\n",
+        "upstream b\nroute GET \"/\" { return forward(b, response_policy: { version: \"HTTP/1.1\", "
+        "framing: \"content_length\", connection: \"keep_alive\", server: \"bad\rvalue\", date: "
+        "\"current\", hide_headers: [] }) }\n",
     };
     for (const char* src : invalid) {
         auto lexed = lex(lit(src));
@@ -32609,7 +32628,11 @@ route GET "/" {
 
 TEST(frontend, public_head_mode_applies_through_nested_control_paths) {
     const char* forward =
-        "return forward(b, response_policy: { version: \"HTTP/1.1\", framing: \"content_length\", connection: \"request\", head_mode: \"suppress_body\", server: \"s\", date: \"current\", hide_headers: [] }, failure_policy: { version: \"HTTP/1.1\", status: 502, reason: \"Bad Gateway\", content_type: \"text/plain\", server: \"s\", date: \"current\", connection: \"request\", head_mode: \"suppress_body\", body: b\"x\" })";
+        "return forward(b, response_policy: { version: \"HTTP/1.1\", framing: \"content_length\", "
+        "connection: \"request\", head_mode: \"suppress_body\", server: \"s\", date: \"current\", "
+        "hide_headers: [] }, failure_policy: { version: \"HTTP/1.1\", status: 502, reason: \"Bad "
+        "Gateway\", content_type: \"text/plain\", server: \"s\", date: \"current\", connection: "
+        "\"request\", head_mode: \"suppress_body\", body: b\"x\" })";
     const std::string prefix = "upstream b at \"127.0.0.1:9000\"\n";
     const std::string sources[] = {
         prefix + "route \"/\" { if req.method == GET { " + forward + " } else { return 404 } }\n",
@@ -32699,10 +32722,29 @@ route GET "/" {
 
 TEST(frontend, public_head_mode_parser_rejects_duplicate_unknown_and_invalid_values) {
     const char* invalid[] = {
-        "upstream b\nroute GET \"/\" { return forward(b, response_policy: { version: \"HTTP/1.1\", framing: \"content_length\", connection: \"request\", head_mode: \"bogus\", server: \"s\", date: \"current\", hide_headers: [] }, failure_policy: { version: \"HTTP/1.1\", status: 502, reason: \"Bad Gateway\", content_type: \"text/plain\", server: \"s\", date: \"current\", connection: \"request\", head_mode: \"suppress_body\", body: b\"x\" }) }\n",
-        "upstream b\nroute GET \"/\" { return forward(b, response_policy: { version: \"HTTP/1.1\", framing: \"content_length\", connection: \"request\", head_mode: \"suppress_body\", head_mode: \"reject\", server: \"s\", date: \"current\", hide_headers: [] }, failure_policy: { version: \"HTTP/1.1\", status: 502, reason: \"Bad Gateway\", content_type: \"text/plain\", server: \"s\", date: \"current\", connection: \"request\", head_mode: \"suppress_body\", body: b\"x\" }) }\n",
-        "upstream b\nroute GET \"/\" { return forward(b, response_policy: { version: \"HTTP/1.1\", framing: \"content_length\", connection: \"request\", head_mode: \"suppress_body\", nope: \"x\", server: \"s\", date: \"current\", hide_headers: [] }, failure_policy: { version: \"HTTP/1.1\", status: 502, reason: \"Bad Gateway\", content_type: \"text/plain\", server: \"s\", date: \"current\", connection: \"request\", head_mode: \"suppress_body\", body: b\"x\" }) }\n",
-        "upstream b\nroute GET \"/\" { return forward(b, response_policy: { version: \"HTTP/1.1\", framing: \"content_length\", connection: \"request\", head_mode: \"suppress_body\", server: \"s\", date: \"current\", hide_headers: [] }, failure_policy: { version: \"HTTP/1.1\", status: 502, reason: \"Bad Gateway\", content_type: \"text/plain\", server: \"s\", date: \"current\", connection: \"request\", head_mode: \"bogus\", body: b\"x\" }) }\n",
+        "upstream b\nroute GET \"/\" { return forward(b, response_policy: { version: \"HTTP/1.1\", "
+        "framing: \"content_length\", connection: \"request\", head_mode: \"bogus\", server: "
+        "\"s\", date: \"current\", hide_headers: [] }, failure_policy: { version: \"HTTP/1.1\", "
+        "status: 502, reason: \"Bad Gateway\", content_type: \"text/plain\", server: \"s\", date: "
+        "\"current\", connection: \"request\", head_mode: \"suppress_body\", body: b\"x\" }) }\n",
+        "upstream b\nroute GET \"/\" { return forward(b, response_policy: { version: \"HTTP/1.1\", "
+        "framing: \"content_length\", connection: \"request\", head_mode: \"suppress_body\", "
+        "head_mode: \"reject\", server: \"s\", date: \"current\", hide_headers: [] }, "
+        "failure_policy: { version: \"HTTP/1.1\", status: 502, reason: \"Bad Gateway\", "
+        "content_type: \"text/plain\", server: \"s\", date: \"current\", connection: \"request\", "
+        "head_mode: \"suppress_body\", body: b\"x\" }) }\n",
+        "upstream b\nroute GET \"/\" { return forward(b, response_policy: { version: \"HTTP/1.1\", "
+        "framing: \"content_length\", connection: \"request\", head_mode: \"suppress_body\", nope: "
+        "\"x\", server: \"s\", date: \"current\", hide_headers: [] }, failure_policy: { version: "
+        "\"HTTP/1.1\", status: 502, reason: \"Bad Gateway\", content_type: \"text/plain\", server: "
+        "\"s\", date: \"current\", connection: \"request\", head_mode: \"suppress_body\", body: "
+        "b\"x\" }) }\n",
+        "upstream b\nroute GET \"/\" { return forward(b, response_policy: { version: \"HTTP/1.1\", "
+        "framing: \"content_length\", connection: \"request\", head_mode: \"suppress_body\", "
+        "server: \"s\", date: \"current\", hide_headers: [] }, failure_policy: { version: "
+        "\"HTTP/1.1\", status: 502, reason: \"Bad Gateway\", content_type: \"text/plain\", server: "
+        "\"s\", date: \"current\", connection: \"request\", head_mode: \"bogus\", body: b\"x\" }) "
+        "}\n",
     };
     for (const char* source : invalid) {
         auto lexed = lex(lit(source));
@@ -32710,9 +32752,8 @@ TEST(frontend, public_head_mode_parser_rejects_duplicate_unknown_and_invalid_val
         auto ast = parse_file_heap(lexed.value());
         REQUIRE_FALSE(ast.has_value());
         CHECK_EQ(ast.error().code,
-                 strstr(source, "bogus") != nullptr
-                     ? FrontendError::UnsupportedSyntax
-                     : FrontendError::UnexpectedToken);
+                 strstr(source, "bogus") != nullptr ? FrontendError::UnsupportedSyntax
+                                                    : FrontendError::UnexpectedToken);
         CHECK_GT(ast.error().span.line, 0u);
         CHECK_GT(ast.error().span.col, 0u);
     }
@@ -32725,10 +32766,13 @@ TEST(frontend, public_head_mode_rejects_unpaired_or_unsupported_combinations) {
                           bool failure,
                           const char* failure_mode,
                           bool target_transform) {
-        std::string source = "upstream b at \"127.0.0.1:9000\"\nroute GET \"/\" { return forward(b, ";
+        std::string source =
+            "upstream b at \"127.0.0.1:9000\"\nroute GET \"/\" { return forward(b, ";
         bool comma = false;
         if (response) {
-            source += "response_policy: { version: \"HTTP/1.1\", framing: \"content_length\", connection: \"";
+            source +=
+                "response_policy: { version: \"HTTP/1.1\", framing: \"content_length\", "
+                "connection: \"";
             source += response_connection;
             source += "\", head_mode: \"";
             source += response_mode;
@@ -32737,7 +32781,10 @@ TEST(frontend, public_head_mode_rejects_unpaired_or_unsupported_combinations) {
         }
         if (failure) {
             if (comma) source += ", ";
-            source += "failure_policy: { version: \"HTTP/1.1\", status: 502, reason: \"Bad Gateway\", content_type: \"text/plain\", server: \"s\", date: \"current\", connection: \"request\", head_mode: \"";
+            source +=
+                "failure_policy: { version: \"HTTP/1.1\", status: 502, reason: \"Bad Gateway\", "
+                "content_type: \"text/plain\", server: \"s\", date: \"current\", connection: "
+                "\"request\", head_mode: \"";
             source += failure_mode;
             source += "\", body: b\"x\" }";
             comma = true;
@@ -32831,9 +32878,13 @@ TEST(frontend, response_policy_rejects_invalid_and_duplicate_connection_fields) 
         FrontendError code;
     };
     static constexpr InvalidCase kCases[] = {
-        {"upstream b\nroute GET \"/\" { return forward(b, response_policy: { version: \"HTTP/1.1\", framing: \"content_length\", connection: \"close\", server: \"nginx\", date: \"current\", hide_headers: [] }) }\n",
+        {"upstream b\nroute GET \"/\" { return forward(b, response_policy: { version: "
+         "\"HTTP/1.1\", framing: \"content_length\", connection: \"close\", server: \"nginx\", "
+         "date: \"current\", hide_headers: [] }) }\n",
          FrontendError::UnsupportedSyntax},
-        {"upstream b\nroute GET \"/\" { return forward(b, response_policy: { version: \"HTTP/1.1\", framing: \"content_length\", connection: \"keep_alive\", connection: \"request\", server: \"nginx\", date: \"current\", hide_headers: [] }) }\n",
+        {"upstream b\nroute GET \"/\" { return forward(b, response_policy: { version: "
+         "\"HTTP/1.1\", framing: \"content_length\", connection: \"keep_alive\", connection: "
+         "\"request\", server: \"nginx\", date: \"current\", hide_headers: [] }) }\n",
          FrontendError::UnexpectedToken},
     };
     for (const InvalidCase& test : kCases) {
@@ -33031,14 +33082,38 @@ TEST(frontend, timeout_failure_policy_rejects_missing_peers_duplicate_status_and
 
 TEST(frontend, failure_policy_rejects_invalid_fields_and_caps) {
     const char* invalid[] = {
-        "upstream b\nroute GET \"/\" { return forward(b, response_policy: { version: \"HTTP/1.1\", framing: \"content_length\", connection: \"keep_alive\", server: \"nginx\", date: \"current\", hide_headers: [] }, failure_policy: { version: \"HTTP/1.1\", status: 500, reason: \"Bad Gateway\", content_type: \"text/plain\", server: \"nginx\", date: \"current\", connection: \"request\", body: b\"x\" }) }\n",
-        "upstream b\nroute GET \"/\" { return forward(b, response_policy: { version: \"HTTP/1.1\", framing: \"content_length\", connection: \"keep_alive\", server: \"nginx\", date: \"current\", hide_headers: [] }, failure_policy: { version: \"HTTP/1.1\", status: 502, reason: \"Bad Gateway\", content_type: \"text/plain\", server: \"nginx\", date: \"current\", connection: \"request\", body: b\"x\", nope: \"x\" }) }\n",
-        "upstream b\nroute GET \"/\" { return forward(b, response_policy: { version: \"HTTP/1.1\", framing: \"content_length\", connection: \"keep_alive\", server: \"nginx\", date: \"current\", hide_headers: [] }, failure_policy: { version: \"HTTP/1.1\", status: 502, reason: \"Bad Gateway\", content_type: \"text/plain\", server: \"nginx\", date: \"current\", connection: \"request\", body: b\"x\", body: b\"y\" }) }\n",
-        "upstream b\nroute GET \"/\" { return forward(b, response_policy: { version: \"HTTP/1.1\", framing: \"content_length\", connection: \"keep_alive\", server: \"nginx\", date: \"current\", hide_headers: [] }, failure_policy: { version: \"HTTP/1.1\", status: 502, reason: \"Bad Gateway\", content_type: \"text/plain\", server: \"nginx\", date: \"current\", connection: \"request\" }) }\n",
-        "upstream b\nroute GET \"/\" { return forward(b, failure_policy: { version: \"HTTP/1.1\", status: 502, reason: \"Bad Gateway\", content_type: \"text/plain\", server: \"nginx\", date: \"current\", connection: \"request\", body: \"x\" }) }\n",
-        "upstream b\nroute GET \"/\" { return forward(b, failure_policy: { version: \"HTTP/1.1\", status: 502, reason: \"Bad Gateway\", content_type: \"text/plain\", server: \"nginx\", date: \"current\", connection: \"request\", body: b\"\\q\" }) }\n",
-        "upstream b\nroute GET \"/\" { return forward(b, failure_policy: { version: \"HTTP/1.1\", status: 502, reason: \"Bad Gateway\", content_type: \"text/plain\", server: \"nginx\", date: \"current\", connection: \"request\", body: b\"\\x0\" }) }\n",
-        "upstream b\nroute GET \"/\" { return forward(b, failure_policy: { version: \"HTTP/1.1\", status: 502, reason: \"Bad Gateway\", content_type: \"text/plain\", server: \"nginx\", date: \"current\", connection: \"request\", body: b\"\\xGG\" }) }\n",
+        "upstream b\nroute GET \"/\" { return forward(b, response_policy: { version: \"HTTP/1.1\", "
+        "framing: \"content_length\", connection: \"keep_alive\", server: \"nginx\", date: "
+        "\"current\", hide_headers: [] }, failure_policy: { version: \"HTTP/1.1\", status: 500, "
+        "reason: \"Bad Gateway\", content_type: \"text/plain\", server: \"nginx\", date: "
+        "\"current\", connection: \"request\", body: b\"x\" }) }\n",
+        "upstream b\nroute GET \"/\" { return forward(b, response_policy: { version: \"HTTP/1.1\", "
+        "framing: \"content_length\", connection: \"keep_alive\", server: \"nginx\", date: "
+        "\"current\", hide_headers: [] }, failure_policy: { version: \"HTTP/1.1\", status: 502, "
+        "reason: \"Bad Gateway\", content_type: \"text/plain\", server: \"nginx\", date: "
+        "\"current\", connection: \"request\", body: b\"x\", nope: \"x\" }) }\n",
+        "upstream b\nroute GET \"/\" { return forward(b, response_policy: { version: \"HTTP/1.1\", "
+        "framing: \"content_length\", connection: \"keep_alive\", server: \"nginx\", date: "
+        "\"current\", hide_headers: [] }, failure_policy: { version: \"HTTP/1.1\", status: 502, "
+        "reason: \"Bad Gateway\", content_type: \"text/plain\", server: \"nginx\", date: "
+        "\"current\", connection: \"request\", body: b\"x\", body: b\"y\" }) }\n",
+        "upstream b\nroute GET \"/\" { return forward(b, response_policy: { version: \"HTTP/1.1\", "
+        "framing: \"content_length\", connection: \"keep_alive\", server: \"nginx\", date: "
+        "\"current\", hide_headers: [] }, failure_policy: { version: \"HTTP/1.1\", status: 502, "
+        "reason: \"Bad Gateway\", content_type: \"text/plain\", server: \"nginx\", date: "
+        "\"current\", connection: \"request\" }) }\n",
+        "upstream b\nroute GET \"/\" { return forward(b, failure_policy: { version: \"HTTP/1.1\", "
+        "status: 502, reason: \"Bad Gateway\", content_type: \"text/plain\", server: \"nginx\", "
+        "date: \"current\", connection: \"request\", body: \"x\" }) }\n",
+        "upstream b\nroute GET \"/\" { return forward(b, failure_policy: { version: \"HTTP/1.1\", "
+        "status: 502, reason: \"Bad Gateway\", content_type: \"text/plain\", server: \"nginx\", "
+        "date: \"current\", connection: \"request\", body: b\"\\q\" }) }\n",
+        "upstream b\nroute GET \"/\" { return forward(b, failure_policy: { version: \"HTTP/1.1\", "
+        "status: 502, reason: \"Bad Gateway\", content_type: \"text/plain\", server: \"nginx\", "
+        "date: \"current\", connection: \"request\", body: b\"\\x0\" }) }\n",
+        "upstream b\nroute GET \"/\" { return forward(b, failure_policy: { version: \"HTTP/1.1\", "
+        "status: 502, reason: \"Bad Gateway\", content_type: \"text/plain\", server: \"nginx\", "
+        "date: \"current\", connection: \"request\", body: b\"\\xGG\" }) }\n",
     };
     for (const char* src : invalid) {
         auto lexed = lex(lit(src));
@@ -33047,7 +33122,9 @@ TEST(frontend, failure_policy_rejects_invalid_fields_and_caps) {
         CHECK_FALSE(ast.has_value());
     }
     const char* independent =
-        "upstream b\nroute GET \"/\" { return forward(b, failure_policy: { version: \"HTTP/1.1\", status: 502, reason: \"Bad Gateway\", content_type: \"text/plain\", server: \"nginx\", date: \"current\", connection: \"request\", body: b\"x\" }) }\n";
+        "upstream b\nroute GET \"/\" { return forward(b, failure_policy: { version: \"HTTP/1.1\", "
+        "status: 502, reason: \"Bad Gateway\", content_type: \"text/plain\", server: \"nginx\", "
+        "date: \"current\", connection: \"request\", body: b\"x\" }) }\n";
     auto independent_lexed = lex(lit(independent));
     REQUIRE(independent_lexed);
     auto independent_ast = parse_file_heap(independent_lexed.value());
@@ -33057,7 +33134,9 @@ TEST(frontend, failure_policy_rejects_invalid_fields_and_caps) {
     CHECK_EQ(independent_ast->failure_policies[0].head_mode, FailurePolicyHeadMode::Reject);
 
     const char* bytes =
-        "upstream b\nroute GET \"/\" { return forward(b, failure_policy: { version: \"HTTP/1.1\", status: 502, reason: \"Bad Gateway\", content_type: \"text/plain\", server: \"nginx\", date: \"current\", connection: \"request\", body: b\"\\x00\\n\\xff\" }) }\n";
+        "upstream b\nroute GET \"/\" { return forward(b, failure_policy: { version: \"HTTP/1.1\", "
+        "status: 502, reason: \"Bad Gateway\", content_type: \"text/plain\", server: \"nginx\", "
+        "date: \"current\", connection: \"request\", body: b\"\\x00\\n\\xff\" }) }\n";
     auto bytes_lexed = lex(lit(bytes));
     REQUIRE(bytes_lexed);
     auto bytes_ast = parse_file_heap(bytes_lexed.value());
@@ -33068,19 +33147,22 @@ TEST(frontend, failure_policy_rejects_invalid_fields_and_caps) {
     CHECK(static_cast<u8>(bytes_ast->failure_policies[0].body.ptr[2]) == 0xff);
 
     const char* empty =
-        "upstream b\nroute GET \"/\" { return forward(b, failure_policy: { version: \"HTTP/1.1\", status: 502, reason: \"Bad Gateway\", content_type: \"text/plain\", server: \"nginx\", date: \"current\", connection: \"request\", body: b\"\" }) }\n";
+        "upstream b\nroute GET \"/\" { return forward(b, failure_policy: { version: \"HTTP/1.1\", "
+        "status: 502, reason: \"Bad Gateway\", content_type: \"text/plain\", server: \"nginx\", "
+        "date: \"current\", connection: \"request\", body: b\"\" }) }\n";
     auto empty_lexed = lex(lit(empty));
     REQUIRE(empty_lexed);
     auto empty_ast = parse_file_heap(empty_lexed.value());
     REQUIRE(empty_ast);
     CHECK_EQ(empty_ast->failure_policies[0].body.len, 0u);
     auto empty_copy = std::make_unique<AstFile>(empty_ast.value());
-    CHECK(empty_copy->failure_policies[0].body.ptr !=
-          empty_ast->failure_policies[0].body.ptr);
+    CHECK(empty_copy->failure_policies[0].body.ptr != empty_ast->failure_policies[0].body.ptr);
     CHECK_EQ(empty_copy->failure_policies[0].body.len, 0u);
 
     std::string oversized =
-        "upstream b\nroute GET \"/\" { return forward(b, failure_policy: { version: \"HTTP/1.1\", status: 502, reason: \"Bad Gateway\", content_type: \"text/plain\", server: \"nginx\", date: \"current\", connection: \"request\", body: b\"";
+        "upstream b\nroute GET \"/\" { return forward(b, failure_policy: { version: \"HTTP/1.1\", "
+        "status: 502, reason: \"Bad Gateway\", content_type: \"text/plain\", server: \"nginx\", "
+        "date: \"current\", connection: \"request\", body: b\"";
     oversized.append(kMaxFailurePolicyBodyLen + 1, 'x');
     oversized += "\" }) }\n";
     auto oversized_lexed = lex({oversized.data(), static_cast<u32>(oversized.size())});
@@ -33111,7 +33193,9 @@ TEST(frontend, failure_policy_rejects_invalid_fields_and_caps) {
 
 TEST(frontend, failure_policy_byte_body_reaches_rir_and_keeps_nul_lf) {
     const char* src =
-        "upstream b\nroute GET \"/\" { return forward(b, failure_policy: { version: \"HTTP/1.1\", status: 502, reason: \"Bad Gateway\", content_type: \"text/plain\", server: \"nginx\", date: \"current\", connection: \"request\", body: b\"A\\x00\\nB\" }) }\n";
+        "upstream b\nroute GET \"/\" { return forward(b, failure_policy: { version: \"HTTP/1.1\", "
+        "status: 502, reason: \"Bad Gateway\", content_type: \"text/plain\", server: \"nginx\", "
+        "date: \"current\", connection: \"request\", body: b\"A\\x00\\nB\" }) }\n";
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
     auto ast = parse_file_heap(lexed.value());
@@ -33302,18 +33386,31 @@ route GET "/api" {
 TEST(frontend, target_transform_source_rejects_invalid_objects_and_compositions) {
     const char* invalid[] = {
         "upstream b\nroute GET \"/\" { return forward(b, target_transform: {}) }\n",
-        "upstream b\nroute GET \"/\" { return forward(b, target_transform: { strip_prefix: \"/api/\" }) }\n",
-        "upstream b\nroute GET \"/\" { return forward(b, target_transform: { replace_prefix: \"/\" }) }\n",
-        "upstream b\nroute GET \"/\" { return forward(b, target_transform: { strip_prefix: \"/api/\", strip_prefix: \"/x/\", replace_prefix: \"/\" }) }\n",
-        "upstream b\nroute GET \"/\" { return forward(b, target_transform: { strip_prefix: \"/api/\", replace_prefix: \"/\", extra: \"/x/\" }) }\n",
-        "upstream b\nroute GET \"/\" { return forward(b, target_transform: { strip_prefix: 1, replace_prefix: \"/\" }) }\n",
-        "upstream b\nroute GET \"/\" { return forward(b, target_transform: { strip_prefix: \"api/\", replace_prefix: \"/\" }) }\n",
-        "upstream b\nroute GET \"/\" { return forward(b, target_transform: { strip_prefix: \"/api/\", replace_prefix: \"/x\" }) }\n",
-        "upstream b\nroute GET \"/\" { return forward(b, target_transform: { strip_prefix: \"/api/\", replace_prefix: \"/\" }, target_transform: { strip_prefix: \"/web/\", replace_prefix: \"/\" }) }\n",
-        "upstream b\nroute GET \"/\" { return forward(b, target_transform: { strip_prefix: \"/api/\", replace_prefix: \"/\" }, set_path: \"/x\") }\n",
-        "upstream b\nroute GET \"/\" { return forward(b, set_path: \"/x\", target_transform: { strip_prefix: \"/api/\", replace_prefix: \"/\" }) }\n",
-        "upstream b\nroute GET \"/\" { return forward(b, target_transform: { strip_prefix: \"/api/\", replace_prefix: \"/\" }, set_header: { \"X-Test\": \"v\" }) }\n",
-        "upstream b\nroute GET \"/\" { return forward(b, set_header: { \"X-Test\": \"v\" }, target_transform: { strip_prefix: \"/api/\", replace_prefix: \"/\" }) }\n",
+        "upstream b\nroute GET \"/\" { return forward(b, target_transform: { strip_prefix: "
+        "\"/api/\" }) }\n",
+        "upstream b\nroute GET \"/\" { return forward(b, target_transform: { replace_prefix: \"/\" "
+        "}) }\n",
+        "upstream b\nroute GET \"/\" { return forward(b, target_transform: { strip_prefix: "
+        "\"/api/\", strip_prefix: \"/x/\", replace_prefix: \"/\" }) }\n",
+        "upstream b\nroute GET \"/\" { return forward(b, target_transform: { strip_prefix: "
+        "\"/api/\", replace_prefix: \"/\", extra: \"/x/\" }) }\n",
+        "upstream b\nroute GET \"/\" { return forward(b, target_transform: { strip_prefix: 1, "
+        "replace_prefix: \"/\" }) }\n",
+        "upstream b\nroute GET \"/\" { return forward(b, target_transform: { strip_prefix: "
+        "\"api/\", replace_prefix: \"/\" }) }\n",
+        "upstream b\nroute GET \"/\" { return forward(b, target_transform: { strip_prefix: "
+        "\"/api/\", replace_prefix: \"/x\" }) }\n",
+        "upstream b\nroute GET \"/\" { return forward(b, target_transform: { strip_prefix: "
+        "\"/api/\", replace_prefix: \"/\" }, target_transform: { strip_prefix: \"/web/\", "
+        "replace_prefix: \"/\" }) }\n",
+        "upstream b\nroute GET \"/\" { return forward(b, target_transform: { strip_prefix: "
+        "\"/api/\", replace_prefix: \"/\" }, set_path: \"/x\") }\n",
+        "upstream b\nroute GET \"/\" { return forward(b, set_path: \"/x\", target_transform: { "
+        "strip_prefix: \"/api/\", replace_prefix: \"/\" }) }\n",
+        "upstream b\nroute GET \"/\" { return forward(b, target_transform: { strip_prefix: "
+        "\"/api/\", replace_prefix: \"/\" }, set_header: { \"X-Test\": \"v\" }) }\n",
+        "upstream b\nroute GET \"/\" { return forward(b, set_header: { \"X-Test\": \"v\" }, "
+        "target_transform: { strip_prefix: \"/api/\", replace_prefix: \"/\" }) }\n",
     };
     for (const char* source : invalid) {
         auto lexed = lex(lit(source));
@@ -33326,7 +33423,8 @@ TEST(frontend, target_transform_source_rejects_invalid_objects_and_compositions)
 
 TEST(frontend, target_transform_analyzer_defends_forged_spec) {
     const char source[] =
-        "upstream b\nroute GET \"/\" { return forward(b, target_transform: { strip_prefix: \"/api/\", replace_prefix: \"/\" }) }\n";
+        "upstream b\nroute GET \"/\" { return forward(b, target_transform: { strip_prefix: "
+        "\"/api/\", replace_prefix: \"/\" }) }\n";
     auto lexed = lex(lit(source));
     REQUIRE(lexed);
     auto ast = parse_file_heap(lexed.value());
@@ -33377,16 +33475,16 @@ route GET "/" use chain access {
         REQUIRE(ast);
         auto hir = analyze_file_heap(ast.value());
         CHECK_FALSE(hir.has_value());
-        if (!hir) CHECK(hir.error().detail.eq(
-            lit("target_transform cannot be combined with response header mutations")));
+        if (!hir)
+            CHECK(hir.error().detail.eq(
+                lit("target_transform cannot be combined with response header mutations")));
     }
 }
 
 TEST(frontend, target_transform_duplicates_reuse_stable_first_ids) {
     std::string source = "upstream backend at \"127.0.0.1:9000\"\n";
     for (u32 i = 0; i < 3; i++) {
-        source += "route GET \"/r" + std::to_string(i) +
-                  "\" { return forward(backend) }\n";
+        source += "route GET \"/r" + std::to_string(i) + "\" { return forward(backend) }\n";
     }
     auto lexed = lex({source.data(), static_cast<u32>(source.size())});
     REQUIRE(lexed);
@@ -33411,8 +33509,8 @@ TEST(frontend, target_transform_duplicates_reuse_stable_first_ids) {
     REQUIRE(lower_to_rir(mir.value(), rir));
     REQUIRE_EQ(rir.module.target_transform_count, 2u);
     for (u32 i = 0; i < 3; i++) {
-        const auto* effect = find_first_op(rir.module.functions[i],
-                                           rir::Opcode::ReqSetTargetTransform);
+        const auto* effect =
+            find_first_op(rir.module.functions[i], rir::Opcode::ReqSetTargetTransform);
         REQUIRE(effect != nullptr);
         CHECK_EQ(effect->imm.i32_val, i == 2 ? 2 : 1);
     }
@@ -33621,7 +33719,8 @@ TEST(frontend, target_transform_invalid_presence_rejects_and_absence_is_transpar
     REQUIRE(ast_plain);
     auto hir_plain = analyze_file_heap(ast_plain.value());
     REQUIRE(hir_plain);
-    hir_plain->routes[0].control.direct_term.forward_target_transform = {{nullptr, 1}, {replace, 4}};
+    hir_plain->routes[0].control.direct_term.forward_target_transform = {{nullptr, 1},
+                                                                         {replace, 4}};
     auto mir_plain = build_mir_heap(hir_plain.value());
     REQUIRE(mir_plain);
     FrontendRirModule plain{};
@@ -33702,13 +33801,34 @@ TEST(frontend, inline_redirect_source_reaches_rir_and_owned_config) {
 TEST(frontend, inline_redirect_rejects_invalid_shape_and_duplicate_fields) {
     const char* sources[] = {
         "route GET \"/\" { return redirect({scheme: \"http\"}) }",
-        "route GET \"/\" { return redirect({scheme: \"https\", authority: \"request_host\", port: \"actual_listener\", path: \"static\", query: \"preserve_raw\", date: \"current\", connection: \"close\", status: 301, reason: \"Moved Permanently\", server: \"s\", content_type: \"text/html\", target_path: \"/x\", body: b\"\"}) }",
-        "route GET \"/\" { return redirect({scheme: \"http\", scheme: \"http\", authority: \"request_host\", port: \"actual_listener\", path: \"static\", query: \"preserve_raw\", date: \"current\", connection: \"close\", status: 301, reason: \"Moved Permanently\", server: \"s\", content_type: \"text/html\", target_path: \"/x\", body: b\"\"}) }",
-        "route GET \"/\" { return redirect({scheme: \"http\", authority: \"request_host\", port: \"actual_listener\", path: \"static\", query: \"preserve_raw\", date: \"current\", connection: \"close\", status: 200, reason: \"Moved Permanently\", server: \"s\", content_type: \"text/html\", target_path: \"/x\", body: b\"\"}) }",
-        "route GET \"/\" { return redirect({scheme: \"http\", authority: \"request_host\", port: \"actual_listener\", path: \"static\", query: \"preserve_raw\", date: \"current\", connection: \"close\", status: 301, reason: \"Moved Permanently\", server: \"s\", content_type: \"text/html\", target_path: \"/x\", body: b\"\", extra: 1}) }",
-        "route GET \"/\" { return redirect({scheme: \"http\", authority: \"request_host\", port: \"actual_listener\", path: \"static\", query: \"preserve_raw\", date: \"current\", connection: \"close\", status: \"301\", reason: \"Moved Permanently\", server: \"s\", content_type: \"text/html\", target_path: \"/x\", body: b\"\"}) }",
-        "route GET \"/\" { return redirect({scheme: \"http\", authority: \"request_host\", port: \"actual_listener\", path: \"static\", query: \"preserve_raw\", date: \"current\", connection: \"close\", status: 301, reason: \"Moved Permanently\", server: \"s\", content_type: \"text/html\", target_path: \"/x?y=1\", body: b\"\"}) }",
-        "route GET \"/\" { return redirect({scheme: \"http\", authority: \"request_host\", port: \"actual_listener\", path: \"static\", query: \"preserve_raw\", date: \"current\", connection: \"close\", status: 301, reason: \"Moved Permanently\", server: \"s\", content_type: \"text/html\", target_path: \"/x\", body: b\"\\xZZ\"}) }",
+        "route GET \"/\" { return redirect({scheme: \"https\", authority: \"request_host\", port: "
+        "\"actual_listener\", path: \"static\", query: \"preserve_raw\", date: \"current\", "
+        "connection: \"close\", status: 301, reason: \"Moved Permanently\", server: \"s\", "
+        "content_type: \"text/html\", target_path: \"/x\", body: b\"\"}) }",
+        "route GET \"/\" { return redirect({scheme: \"http\", scheme: \"http\", authority: "
+        "\"request_host\", port: \"actual_listener\", path: \"static\", query: \"preserve_raw\", "
+        "date: \"current\", connection: \"close\", status: 301, reason: \"Moved Permanently\", "
+        "server: \"s\", content_type: \"text/html\", target_path: \"/x\", body: b\"\"}) }",
+        "route GET \"/\" { return redirect({scheme: \"http\", authority: \"request_host\", port: "
+        "\"actual_listener\", path: \"static\", query: \"preserve_raw\", date: \"current\", "
+        "connection: \"close\", status: 200, reason: \"Moved Permanently\", server: \"s\", "
+        "content_type: \"text/html\", target_path: \"/x\", body: b\"\"}) }",
+        "route GET \"/\" { return redirect({scheme: \"http\", authority: \"request_host\", port: "
+        "\"actual_listener\", path: \"static\", query: \"preserve_raw\", date: \"current\", "
+        "connection: \"close\", status: 301, reason: \"Moved Permanently\", server: \"s\", "
+        "content_type: \"text/html\", target_path: \"/x\", body: b\"\", extra: 1}) }",
+        "route GET \"/\" { return redirect({scheme: \"http\", authority: \"request_host\", port: "
+        "\"actual_listener\", path: \"static\", query: \"preserve_raw\", date: \"current\", "
+        "connection: \"close\", status: \"301\", reason: \"Moved Permanently\", server: \"s\", "
+        "content_type: \"text/html\", target_path: \"/x\", body: b\"\"}) }",
+        "route GET \"/\" { return redirect({scheme: \"http\", authority: \"request_host\", port: "
+        "\"actual_listener\", path: \"static\", query: \"preserve_raw\", date: \"current\", "
+        "connection: \"close\", status: 301, reason: \"Moved Permanently\", server: \"s\", "
+        "content_type: \"text/html\", target_path: \"/x?y=1\", body: b\"\"}) }",
+        "route GET \"/\" { return redirect({scheme: \"http\", authority: \"request_host\", port: "
+        "\"actual_listener\", path: \"static\", query: \"preserve_raw\", date: \"current\", "
+        "connection: \"close\", status: 301, reason: \"Moved Permanently\", server: \"s\", "
+        "content_type: \"text/html\", target_path: \"/x\", body: b\"\\xZZ\"}) }",
     };
     for (const char* source : sources) {
         auto lexed = lex(lit(source));

@@ -646,8 +646,8 @@ ParseStatus HttpResponseParser::parse(const u8* buf, u32 len, ParsedResponse* re
                                            name_len};
                 headers[hdr_count].value = {reinterpret_cast<const char*>(buf + value_start),
                                             value_end - value_start};
-                headers[hdr_count].raw_value = {reinterpret_cast<const char*>(buf + raw_value_start),
-                                                cr_pos - raw_value_start};
+                headers[hdr_count].raw_value = {
+                    reinterpret_cast<const char*>(buf + raw_value_start), cr_pos - raw_value_start};
                 hdr_count++;
             } else {
                 // Beyond capacity: keep parsing (semantic headers still apply

@@ -378,20 +378,14 @@ struct AsyncMockBackend {
         return true;
     }
 
-    bool add_send_upstream(i32 fd,
-                           u32 conn_id,
-                           const u8* buf,
-                           u32 len,
-                           u32 /*upstream_episode*/ = 1) {
+    bool add_send_upstream(
+        i32 fd, u32 conn_id, const u8* buf, u32 len, u32 /*upstream_episode*/ = 1) {
         if (fail_upstream_send) return false;
         return add_send(fd, conn_id, buf, len);
     }
 
-    bool add_connect(i32 fd,
-                     u32 conn_id,
-                     const void* /*addr*/,
-                     u32 /*len*/,
-                     u32 /*upstream_episode*/ = 1) {
+    bool add_connect(
+        i32 fd, u32 conn_id, const void* /*addr*/, u32 /*len*/, u32 /*upstream_episode*/ = 1) {
         if (fail_connect) return false;
         if (op_count < kMaxOps) {
             ops[op_count++] = {MockOp::Connect, fd, conn_id, nullptr, 0};

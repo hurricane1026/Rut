@@ -4310,14 +4310,8 @@ TEST(epoll_wait_boundary, pending_is_lifo_bounded_and_kernel_ready_wins_after_qu
 
     // Eight synthetic completions are consumed one at a time, newest first.
     for (u32 i = 0; i < 9; i++)
-        backend.pending_completions[i] = {100u + i,
-                                          static_cast<i32>(100 + i),
-                                          0,
-                                          0,
-                                          IoEventType::Recv,
-                                          0,
-                                          0,
-                                          0};
+        backend.pending_completions[i] = {
+            100u + i, static_cast<i32>(100 + i), 0, 0, IoEventType::Recv, 0, 0, 0};
     backend.pending_count = 9;
     for (u32 i = 0; i < EpollBackend::kPendingBurstQuota; i++) {
         REQUIRE_EQ(backend.wait(&event, 1, nullptr, 0), 1u);
@@ -4566,11 +4560,7 @@ TEST(epoll_pending_capacity, scoped_producers_reject_invalid_conn_ids_before_sid
     addr.sin_family = AF_INET;
     addr.sin_port = __builtin_bswap16(get_port(listener));
     addr.sin_addr.s_addr = __builtin_bswap32(0x7F000001);
-    CHECK_FALSE(backend.add_connect(connect_fd,
-                                    bad_id,
-                                    &addr,
-                                    static_cast<u32>(sizeof(addr)),
-                                    1));
+    CHECK_FALSE(backend.add_connect(connect_fd, bad_id, &addr, static_cast<u32>(sizeof(addr)), 1));
 
     TestConn tc;
     tc.init(bad_id, fds[0]);
@@ -5286,8 +5276,7 @@ TEST(uring, close_with_idle_return_drain_skips_second_upstream_recv_cancel) {
     conn.upstream_recv_armed = true;  // owned by the old parked recv drain
     conn.upstream_recv_cancel_inflight = true;
 
-    const u32 sq_tail_before =
-        __atomic_load_n(loop->backend.sq_tail, __ATOMIC_ACQUIRE);
+    const u32 sq_tail_before = __atomic_load_n(loop->backend.sq_tail, __ATOMIC_ACQUIRE);
     loop->close_conn_impl(conn);
 
     CHECK(conn.close_after_idle_return);
@@ -6183,7 +6172,6 @@ TEST(shard, serves_http1_cleartext_iouring_cross_thread) {
     const i32 n = recv_timeout(c, buf, sizeof(buf), 2000);
     REQUIRE_GT(n, 0);
     CHECK(buf_contains(buf, static_cast<u32>(n), "200", 3));
-
 }
 }  // namespace
 
@@ -9463,10 +9451,10 @@ static u64 forward_upstream_0_handler(void* /*conn*/,
 // Direct-RIR-style policy result used by runtime and HTTP/2 fail-closed tests.
 // The status slot is the request-policy ABI field for Forward outcomes.
 static u64 forward_request_policy_1_handler(void* /*conn*/,
-                                             rut::jit::HandlerCtx* /*ctx*/,
-                                             const u8* /*req*/,
-                                             u32 /*len*/,
-                                             void* /*arena*/) {
+                                            rut::jit::HandlerCtx* /*ctx*/,
+                                            const u8* /*req*/,
+                                            u32 /*len*/,
+                                            void* /*arena*/) {
     rut::jit::HandlerResult r{rut::jit::HandlerAction::Forward,
                               /*request_policy_id=*/1,
                               /*upstream_id=*/0,
@@ -9476,36 +9464,45 @@ static u64 forward_request_policy_1_handler(void* /*conn*/,
 }
 
 static u64 forward_response_policy_1_handler(void* /*conn*/,
-                                              rut::jit::HandlerCtx* /*ctx*/,
-                                              const u8* /*req*/,
-                                              u32 /*len*/,
-                                              void* /*arena*/) {
+                                             rut::jit::HandlerCtx* /*ctx*/,
+                                             const u8* /*req*/,
+                                             u32 /*len*/,
+                                             void* /*arena*/) {
     return rut::jit::HandlerResult::make_forward_with_policies(0, 0, 1).pack();
 }
 
-static u64 forward_response_policy_with_tls_flag_handler(
-    void* raw_conn, rut::jit::HandlerCtx* /*ctx*/, const u8* /*req*/, u32 /*len*/, void* /*arena*/) {
+static u64 forward_response_policy_with_tls_flag_handler(void* raw_conn,
+                                                         rut::jit::HandlerCtx* /*ctx*/,
+                                                         const u8* /*req*/,
+                                                         u32 /*len*/,
+                                                         void* /*arena*/) {
     static_cast<rut::Connection*>(raw_conn)->tls_active = true;
     return rut::jit::HandlerResult::make_forward_with_policies(0, 0, 1).pack();
 }
 
 static u64 forward_request_and_response_policy_handler(void* /*conn*/,
-                                                        rut::jit::HandlerCtx* /*ctx*/,
-                                                        const u8* /*req*/,
-                                                        u32 /*len*/,
-                                                        void* /*arena*/) {
+                                                       rut::jit::HandlerCtx* /*ctx*/,
+                                                       const u8* /*req*/,
+                                                       u32 /*len*/,
+                                                       void* /*arena*/) {
     return rut::jit::HandlerResult::make_forward_with_policies(0, 1, 1).pack();
 }
 
-static u64 forward_response_policy_with_pending_mutation_handler(
-    void* raw_conn, rut::jit::HandlerCtx* /*ctx*/, const u8* /*req*/, u32 /*len*/, void* /*arena*/) {
+static u64 forward_response_policy_with_pending_mutation_handler(void* raw_conn,
+                                                                 rut::jit::HandlerCtx* /*ctx*/,
+                                                                 const u8* /*req*/,
+                                                                 u32 /*len*/,
+                                                                 void* /*arena*/) {
     auto* conn = static_cast<rut::Connection*>(raw_conn);
     conn->resp_header_mutation_pending_count = 1;
     return rut::jit::HandlerResult::make_forward_with_policies(0, 0, 1).pack();
 }
 
-static u64 forward_response_policy_with_committed_mutation_handler(
-    void* raw_conn, rut::jit::HandlerCtx* /*ctx*/, const u8* /*req*/, u32 /*len*/, void* /*arena*/) {
+static u64 forward_response_policy_with_committed_mutation_handler(void* raw_conn,
+                                                                   rut::jit::HandlerCtx* /*ctx*/,
+                                                                   const u8* /*req*/,
+                                                                   u32 /*len*/,
+                                                                   void* /*arena*/) {
     auto* conn = static_cast<rut::Connection*>(raw_conn);
     conn->resp_header_mutation_count = 1;
     return rut::jit::HandlerResult::make_forward_with_policies(0, 0, 1).pack();
@@ -9555,12 +9552,11 @@ static u64 forward_head_response_policy_handler(void* /*conn*/,
     return rut::jit::HandlerResult::make_forward_with_policies(0, 0, 1).pack();
 }
 
-static u64 forward_request_and_head_response_policy_handler(
-    void* /*conn*/,
-    rut::jit::HandlerCtx* /*ctx*/,
-    const u8* /*req*/,
-    u32 /*len*/,
-    void* /*arena*/) {
+static u64 forward_request_and_head_response_policy_handler(void* /*conn*/,
+                                                            rut::jit::HandlerCtx* /*ctx*/,
+                                                            const u8* /*req*/,
+                                                            u32 /*len*/,
+                                                            void* /*arena*/) {
     return rut::jit::HandlerResult::make_forward_with_policies(0, 1, 1).pack();
 }
 
@@ -9612,8 +9608,11 @@ static u64 forward_invalid_bundle_handler(void* /*conn*/,
 // Runtime defense-in-depth vector: source analysis rejects this combination,
 // so a direct handler leaves a pending response mutation for handle_jit_outcome
 // to reject before apply_request_policy can rewrite recv_buf.
-static u64 forward_request_policy_with_pending_mutation_handler(
-    void* raw_conn, rut::jit::HandlerCtx* /*ctx*/, const u8* /*req*/, u32 /*len*/, void* /*arena*/) {
+static u64 forward_request_policy_with_pending_mutation_handler(void* raw_conn,
+                                                                rut::jit::HandlerCtx* /*ctx*/,
+                                                                const u8* /*req*/,
+                                                                u32 /*len*/,
+                                                                void* /*arena*/) {
     auto* conn = static_cast<rut::Connection*>(raw_conn);
     conn->resp_header_mutation_pending_count = 1;
     return forward_request_policy_1_handler(nullptr, nullptr, nullptr, 0, nullptr);
@@ -9718,10 +9717,10 @@ struct H2TargetTransformJit {
         rir::Builder b;
         b.init(&rir.module);
 
-        auto fn_result = b.create_function(with_timer ? literal("target_resume")
-                                                            : literal("target_initial"),
-                                           literal("/api"),
-                                           'G');
+        auto fn_result =
+            b.create_function(with_timer ? literal("target_resume") : literal("target_initial"),
+                              literal("/api"),
+                              'G');
         if (!fn_result) return false;
         auto* fn = fn_result.value();
         auto entry_result = b.create_block(fn, literal("entry"));
@@ -9767,11 +9766,8 @@ struct H2TargetTransformJit {
     }
 };
 
-static u64 h2_target_transform_plain_200_handler(void* /*conn*/,
-                                                 jit::HandlerCtx* /*ctx*/,
-                                                 const u8* /*req*/,
-                                                 u32 /*len*/,
-                                                 void* /*arena*/) {
+static u64 h2_target_transform_plain_200_handler(
+    void* /*conn*/, jit::HandlerCtx* /*ctx*/, const u8* /*req*/, u32 /*len*/, void* /*arena*/) {
     return jit::HandlerResult::make_status(200).pack();
 }
 
@@ -16337,13 +16333,12 @@ TEST(route, target_transform_effect_does_not_leak_across_keepalive) {
     REQUIRE(echo.setup());
 
     char src_buf[384];
-    const int src_len =
-        snprintf(src_buf,
-                 sizeof(src_buf),
-                 "upstream backend at \"127.0.0.1:%u\"\n"
-                 "route GET \"/local\" { return 200 }\n"
-                 "route GET \"/plain\" { return forward(backend) }\n",
-                 echo.port);
+    const int src_len = snprintf(src_buf,
+                                 sizeof(src_buf),
+                                 "upstream backend at \"127.0.0.1:%u\"\n"
+                                 "route GET \"/local\" { return 200 }\n"
+                                 "route GET \"/plain\" { return forward(backend) }\n",
+                                 echo.port);
     REQUIRE(src_len > 0 && src_len < static_cast<int>(sizeof(src_buf)));
     auto lexed = lex(Str{src_buf, static_cast<u32>(src_len)});
     REQUIRE(lexed);
@@ -16375,8 +16370,7 @@ TEST(route, target_transform_effect_does_not_leak_across_keepalive) {
         REQUIRE(block->inst_count < block->inst_cap);
         const u32 terminator = block->inst_count - 1;
         REQUIRE(block->insts[terminator].is_terminator());
-        for (u32 j = block->inst_count; j > terminator; j--)
-            block->insts[j] = block->insts[j - 1];
+        for (u32 j = block->inst_count; j > terminator; j--) block->insts[j] = block->insts[j - 1];
         block->insts[terminator] = {};
         block->insts[terminator].op = rir::Opcode::ReqSetTargetTransform;
         block->insts[terminator].imm.i32_val = 1;
@@ -16408,8 +16402,7 @@ TEST(route, target_transform_effect_does_not_leak_across_keepalive) {
         char b1[1024];
         const u32 n1 = read_until_token(c, b1, sizeof(b1), "HTTP/1.1 200", 12);
         CHECK(buf_contains(b1, n1, "HTTP/1.1 200", 12));
-        CHECK(buf_contains(b1, n1, "Connection: keep-alive",
-                           sizeof("Connection: keep-alive") - 1));
+        CHECK(buf_contains(b1, n1, "Connection: keep-alive", sizeof("Connection: keep-alive") - 1));
 
         // The companion jit.target_transform_effect_records_and_fails_closed
         // test synchronously proves that this RIR opcode reaches codegen and
@@ -16879,8 +16872,7 @@ struct RecordingUpstream {
                                        (buf[p] == ' ' || buf[p] == '\t'))
                                     p++;
                                 u32 cl = 0;
-                                while (p < s->request_header_len && buf[p] >= '0' &&
-                                       buf[p] <= '9')
+                                while (p < s->request_header_len && buf[p] >= '0' && buf[p] <= '9')
                                     cl = cl * 10u + static_cast<u32>(buf[p++] - '0');
                                 want += cl;
                                 break;
@@ -16904,14 +16896,12 @@ struct RecordingUpstream {
                 s->request_history_header_len[history_slot] = s->request_header_len;
             }
             s->request_count.fetch_add(1, std::memory_order_release);
-            static const char kResponse[] =
-                "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok";
+            static const char kResponse[] = "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok";
             const bool use_later = history_slot > 0 && s->response_after_first != nullptr;
-            const char* out = use_later ? s->response_after_first
-                                        : (s->response ? s->response : kResponse);
+            const char* out =
+                use_later ? s->response_after_first : (s->response ? s->response : kResponse);
             const u32 out_len = use_later ? s->response_after_first_len
-                                          : (s->response ? s->response_len
-                                                         : sizeof(kResponse) - 1);
+                                          : (s->response ? s->response_len : sizeof(kResponse) - 1);
             const bool stall_first_response =
                 history_slot == 0 && s->stall_first_response_for_peer_close;
             bool response_sent = stall_first_response;
@@ -16920,15 +16910,14 @@ struct RecordingUpstream {
             } else if (s->response_split_offset > 0 && s->response_split_offset < out_len) {
                 const bool first_sent = send_all(client, out, s->response_split_offset);
                 if (s->response_chunk_delay_us != 0) usleep(s->response_chunk_delay_us);
-                const bool second_sent = send_all(client,
-                                                  out + s->response_split_offset,
-                                                  out_len - s->response_split_offset);
+                const bool second_sent = send_all(
+                    client, out + s->response_split_offset, out_len - s->response_split_offset);
                 response_sent = first_sent && second_sent;
             } else if (s->response_chunk_size == 0) {
                 response_sent = send_all(client, out, out_len);
             } else {
                 response_sent = true;
-                for (u32 off = 0; off < out_len; ) {
+                for (u32 off = 0; off < out_len;) {
                     const u32 len = (out_len - off < s->response_chunk_size)
                                         ? out_len - off
                                         : s->response_chunk_size;
@@ -16954,13 +16943,13 @@ struct RecordingUpstream {
                 };
 
                 if (!response_sent) {
-                    s->first_response_close_gate_state.store(
-                        GateState::SendFailed, std::memory_order_release);
+                    s->first_response_close_gate_state.store(GateState::SendFailed,
+                                                             std::memory_order_release);
                     close(client);
                     continue;
                 }
-                s->first_response_close_gate_state.store(
-                    GateState::SentOpenWaitingGate, std::memory_order_release);
+                s->first_response_close_gate_state.store(GateState::SentOpenWaitingGate,
+                                                         std::memory_order_release);
 
                 bool close_allowed = false;
                 GateState state = GateState::SentOpenWaitingGate;
@@ -16984,11 +16973,10 @@ struct RecordingUpstream {
                     state = probe_peer(client);
                     if (state == GateState::SentOpenWaitingGate) {
                         close(client);
-                        s->first_response_close_gate_state.store(
-                            GateState::ClosedByGate, std::memory_order_release);
+                        s->first_response_close_gate_state.store(GateState::ClosedByGate,
+                                                                 std::memory_order_release);
                     } else {
-                        s->first_response_close_gate_state.store(
-                            state, std::memory_order_release);
+                        s->first_response_close_gate_state.store(state, std::memory_order_release);
                         if (state == GateState::PeerClosedBeforeGate) {
                             close(client);
                         } else if (s->held_fd_count < kMaxHeldFds) {
@@ -17007,17 +16995,15 @@ struct RecordingUpstream {
                         close(client);
                     }
                 }
-            } else if (history_slot == 0 &&
-                       (s->wait_first_response_for_peer_close ||
-                        s->stall_first_response_for_peer_close)) {
+            } else if (history_slot == 0 && (s->wait_first_response_for_peer_close ||
+                                             s->stall_first_response_for_peer_close)) {
                 if (response_sent && !stall_first_response)
                     s->first_response_sent_open.store(true, std::memory_order_release);
                 char unexpected[64];
                 bool observed = false;
                 for (u32 waited = 0; waited < 60; waited++) {
                     if (!s->running.load(std::memory_order_acquire)) {
-                        s->first_peer_observation_aborted.store(true,
-                                                               std::memory_order_release);
+                        s->first_peer_observation_aborted.store(true, std::memory_order_release);
                         observed = true;
                         break;
                     }
@@ -17029,8 +17015,7 @@ struct RecordingUpstream {
                     } else if (peer_result > 0) {
                         s->first_peer_unexpected_data.store(true, std::memory_order_release);
                     } else {
-                        s->first_peer_observation_aborted.store(true,
-                                                               std::memory_order_release);
+                        s->first_peer_observation_aborted.store(true, std::memory_order_release);
                     }
                     observed = true;
                     break;
@@ -17120,8 +17105,8 @@ struct PublicPairedHeadSourceResources {
         static_assert(sizeof(kGatewayBody) - 1 == 157);
         static_assert(sizeof(kTimeoutBody) - 1 == 167);
 
-        std::string source = "upstream backend at \"127.0.0.1:" +
-                             std::to_string(backend_port) + "\"\n";
+        std::string source =
+            "upstream backend at \"127.0.0.1:" + std::to_string(backend_port) + "\"\n";
         source += R"rut(
 route "/" {
   if req.method == HEAD && req.pathOnly == "/head" {
@@ -17183,8 +17168,7 @@ route "/" {
                    term.forward_failure_policy_id == failure_id &&
                    term.forward_timeout_failure_policy_id == timeout_failure_id;
         };
-        if (!branch_is(control.then_term, 1, 1, 1, 2) ||
-            !branch_is(control.else_term, 1, 2, 3, 0))
+        if (!branch_is(control.then_term, 1, 1, 1, 2) || !branch_is(control.else_term, 1, 2, 3, 0))
             return false;
 
         auto mir = rut::build_mir(*hir_owned);
@@ -17225,11 +17209,8 @@ route "/" {
     bool start(bool enable_reuse) { return proxy.setup(&active, 1800, enable_reuse); }
 };
 
-static bool read_public_close_response(i32 fd,
-                                       u32 expected_body_len,
-                                       char* out,
-                                       u32 capacity,
-                                       u32& length) {
+static bool read_public_close_response(
+    i32 fd, u32 expected_body_len, char* out, u32 capacity, u32& length) {
     length = 0;
     u32 header_end = 0;
     for (u32 attempt = 0; attempt < 32 && length < capacity; attempt++) {
@@ -17256,11 +17237,8 @@ static bool read_public_close_response(i32 fd,
     return recv_timeout(fd, eof_buf, sizeof(eof_buf), 3000) == 0;
 }
 
-static bool read_public_head_response(i32 fd,
-                                      bool expect_eof,
-                                      char* out,
-                                      u32 capacity,
-                                      u32& length) {
+static bool read_public_head_response(
+    i32 fd, bool expect_eof, char* out, u32 capacity, u32& length) {
     length = 0;
     u32 header_end = 0;
     for (u32 attempt = 0; attempt < 32 && length < capacity; attempt++) {
@@ -17268,8 +17246,7 @@ static bool read_public_head_response(i32 fd,
         if (got <= 0) return false;
         length += static_cast<u32>(got);
         for (u32 i = 0; i + 3 < length; i++) {
-            if (out[i] == '\r' && out[i + 1] == '\n' && out[i + 2] == '\r' &&
-                out[i + 3] == '\n') {
+            if (out[i] == '\r' && out[i + 1] == '\n' && out[i + 2] == '\r' && out[i + 3] == '\n') {
                 header_end = i + 4;
                 break;
             }
@@ -17291,8 +17268,8 @@ static bool normalize_public_date(char* data, u32 length) {
             continue;
         }
         count++;
-        if (i < 2 || length - i < 37 || data[i - 2] != '\r' ||
-            data[i + 35] != '\r' || data[i + 36] != '\n')
+        if (i < 2 || length - i < 37 || data[i - 2] != '\r' || data[i + 35] != '\r' ||
+            data[i + 36] != '\n')
             return false;
         for (u32 j = 0; j < 29; j++) data[i + 6 + j] = 'X';
         i += 6;
@@ -17331,20 +17308,17 @@ TEST(shard, serves_http2_jit_target_transform_initial_fails_closed) {
     set_socket_timeouts(guard.client_fd, 2);
     u8 request[512];
     u32 request_len = h2_client_prologue(request);
-    request_len += h2_client_get(request + request_len,
-                                  sizeof(request) - request_len,
-                                  1,
-                                  "/api",
-                                  4);
+    request_len +=
+        h2_client_get(request + request_len, sizeof(request) - request_len, 1, "/api", 4);
     REQUIRE(write_all_fd(guard.client_fd, request, request_len));
 
     u8 response[4096];
     u32 response_len = 0;
     for (int attempt = 0; attempt < 10 && response_len < sizeof(response); attempt++) {
         const i32 got = recv_timeout(guard.client_fd,
-                                      reinterpret_cast<char*>(response + response_len),
-                                      sizeof(response) - response_len,
-                                      2000);
+                                     reinterpret_cast<char*>(response + response_len),
+                                     sizeof(response) - response_len,
+                                     2000);
         if (got <= 0) break;
         response_len += static_cast<u32>(got);
         if (h2_status_for_stream(response, response_len, 1) != 0) break;
@@ -17365,14 +17339,13 @@ TEST(shard, serves_http2_jit_target_transform_after_timer_resume_fails_closed) {
     Connection probe;
     probe.reset();
     jit::HandlerCtx probe_ctx{};
-    static constexpr char kProbeRequest[] =
-        "GET /api HTTP/1.1\r\nHost: localhost\r\n\r\n";
-    const auto first = jit::HandlerResult::unpack(
-        compiled.handler_fn(&probe,
-                            &probe_ctx,
-                            reinterpret_cast<const u8*>(kProbeRequest),
-                            sizeof(kProbeRequest) - 1,
-                            nullptr));
+    static constexpr char kProbeRequest[] = "GET /api HTTP/1.1\r\nHost: localhost\r\n\r\n";
+    const auto first =
+        jit::HandlerResult::unpack(compiled.handler_fn(&probe,
+                                                       &probe_ctx,
+                                                       reinterpret_cast<const u8*>(kProbeRequest),
+                                                       sizeof(kProbeRequest) - 1,
+                                                       nullptr));
     CHECK_EQ(first.action, jit::HandlerAction::Yield);
     CHECK_EQ(first.yield_kind, jit::YieldKind::Timer);
     CHECK_FALSE(probe.target_transform_recorded);
@@ -17404,20 +17377,17 @@ TEST(shard, serves_http2_jit_target_transform_after_timer_resume_fails_closed) {
     set_socket_timeouts(guard.client_fd, 2);
     u8 request[512];
     u32 request_len = h2_client_prologue(request);
-    request_len += h2_client_get(request + request_len,
-                                  sizeof(request) - request_len,
-                                  1,
-                                  "/api",
-                                  4);
+    request_len +=
+        h2_client_get(request + request_len, sizeof(request) - request_len, 1, "/api", 4);
     REQUIRE(write_all_fd(guard.client_fd, request, request_len));
 
     u8 response[4096];
     u32 response_len = 0;
     for (int attempt = 0; attempt < 12 && response_len < sizeof(response); attempt++) {
         const i32 got = recv_timeout(guard.client_fd,
-                                      reinterpret_cast<char*>(response + response_len),
-                                      sizeof(response) - response_len,
-                                      2000);
+                                     reinterpret_cast<char*>(response + response_len),
+                                     sizeof(response) - response_len,
+                                     2000);
         if (got <= 0) break;
         response_len += static_cast<u32>(got);
         if (h2_status_for_stream(response, response_len, 1) != 0) break;
@@ -17440,21 +17410,16 @@ TEST(shard, serves_http2_jit_target_transform_after_timer_resume_fails_closed) {
     // config epoch before sending its local 400. A second stream on the same
     // connection is the externally visible proof of that cleanup.
     u8 second_request[256];
-    const u32 second_len = h2_client_get(second_request,
-                                         sizeof(second_request),
-                                         3,
-                                         "/plain",
-                                         6);
+    const u32 second_len = h2_client_get(second_request, sizeof(second_request), 3, "/plain", 6);
     REQUIRE(write_all_fd(guard.client_fd, second_request, second_len));
     u8 second_response[4096];
     u32 second_response_len = 0;
-    for (int attempt = 0;
-         attempt < 10 && second_response_len < sizeof(second_response);
+    for (int attempt = 0; attempt < 10 && second_response_len < sizeof(second_response);
          attempt++) {
         const i32 got = recv_timeout(guard.client_fd,
-                                      reinterpret_cast<char*>(second_response + second_response_len),
-                                      sizeof(second_response) - second_response_len,
-                                      2000);
+                                     reinterpret_cast<char*>(second_response + second_response_len),
+                                     sizeof(second_response) - second_response_len,
+                                     2000);
         if (got <= 0) break;
         second_response_len += static_cast<u32>(got);
         if (h2_status_for_stream(second_response, second_response_len, 3) != 0) break;
@@ -17529,7 +17494,8 @@ TEST(route, target_transform_jit_rebuilds_request_policy_h1_wire) {
         REQUIRE_GT(expected_len, 0);
         REQUIRE_LT(expected_len, static_cast<int>(sizeof(expected)));
         CHECK_EQ(backend.request_history_len[i], static_cast<u32>(expected_len));
-        CHECK_EQ(memcmp(backend.request_history[i], expected, static_cast<size_t>(expected_len)), 0);
+        CHECK_EQ(memcmp(backend.request_history[i], expected, static_cast<size_t>(expected_len)),
+                 0);
     }
 
     const u32 accepted_before = backend.accepted_count.load(std::memory_order_acquire);
@@ -17563,16 +17529,16 @@ TEST(route, target_transform_public_source_reaches_h1_backend_wire) {
     REQUIRE(backend.setup());
 
     char source[1600];
-    const int source_len = snprintf(
-        source,
-        sizeof(source),
-        "upstream backend at \"127.0.0.1:%u\"\n"
-        "route GET \"/api\" { return forward(backend, "
-        "target_transform: { strip_prefix: \"/api/\", replace_prefix: \"/\" }, "
-        "request_policy: { version: \"HTTP/1.1\", host: \"upstream\", "
-        "connection: \"omit\", strip_headers: [\"Connection\", \"Keep-Alive\", "
-        "\"TE\", \"Expect\", \"Upgrade\"] }) }\n",
-        backend.port);
+    const int source_len =
+        snprintf(source,
+                 sizeof(source),
+                 "upstream backend at \"127.0.0.1:%u\"\n"
+                 "route GET \"/api\" { return forward(backend, "
+                 "target_transform: { strip_prefix: \"/api/\", replace_prefix: \"/\" }, "
+                 "request_policy: { version: \"HTTP/1.1\", host: \"upstream\", "
+                 "connection: \"omit\", strip_headers: [\"Connection\", \"Keep-Alive\", "
+                 "\"TE\", \"Expect\", \"Upgrade\"] }) }\n",
+                 backend.port);
     REQUIRE_GT(source_len, 0);
     REQUIRE_LT(source_len, static_cast<int>(sizeof(source)));
 
@@ -17649,8 +17615,7 @@ TEST(route, target_transform_public_source_reaches_h1_backend_wire) {
 
         const u32 expected_count = i + 1;
         for (u32 waited = 0;
-             waited < 400 &&
-             backend.request_count.load(std::memory_order_acquire) < expected_count;
+             waited < 400 && backend.request_count.load(std::memory_order_acquire) < expected_count;
              waited++)
             usleep(5000);
         REQUIRE_EQ(backend.accepted_count.load(std::memory_order_acquire), expected_count);
@@ -17753,17 +17718,14 @@ TEST(route, response_policy_rejects_strict_invalid_final_vectors) {
     REQUIRE_GT(prefix_len, 0);
     truncated_len = static_cast<u32>(prefix_len);
     for (u32 i = 0; i < 70; i++) {
-        const int written = snprintf(truncated + truncated_len,
-                                     sizeof(truncated) - truncated_len,
-                                     "X-Fill-%u: v\r\n",
-                                     i);
+        const int written = snprintf(
+            truncated + truncated_len, sizeof(truncated) - truncated_len, "X-Fill-%u: v\r\n", i);
         REQUIRE_GT(written, 0);
         truncated_len += static_cast<u32>(written);
         REQUIRE_LT(truncated_len, static_cast<u32>(sizeof(truncated)));
     }
-    const int suffix_len = snprintf(truncated + truncated_len,
-                                    sizeof(truncated) - truncated_len,
-                                    "Content-Length: 0\r\n\r\n");
+    const int suffix_len = snprintf(
+        truncated + truncated_len, sizeof(truncated) - truncated_len, "Content-Length: 0\r\n\r\n");
     REQUIRE_GT(suffix_len, 0);
     truncated_len += static_cast<u32>(suffix_len);
     REQUIRE_LT(truncated_len, static_cast<u32>(sizeof(truncated)));
@@ -17847,18 +17809,17 @@ TEST(route, forward_request_policy_rebuilds_nginx_h11_headers) {
     REQUIRE_EQ(upstream.request_count.load(std::memory_order_acquire), 1u);
     const Str forwarded{upstream.request, upstream.request_len};
     char expected[2048];
-    const int expected_len = snprintf(
-        expected,
-        sizeof(expected),
-        "GET /api?q=raw%%2Fquery HTTP/1.1\r\n"
-        "Host: 127.0.0.1:%u\r\n"
-        "Foo: retained-one\r\n"
-        "Bar: retained-two\r\n"
-        "Proxy-Connection: keep-alive\r\n"
-        "Trailer: X-Trailer\r\n"
-        "X-Duplicate: one\r\n"
-        "X-Duplicate: two\r\n\r\n",
-        upstream.port);
+    const int expected_len = snprintf(expected,
+                                      sizeof(expected),
+                                      "GET /api?q=raw%%2Fquery HTTP/1.1\r\n"
+                                      "Host: 127.0.0.1:%u\r\n"
+                                      "Foo: retained-one\r\n"
+                                      "Bar: retained-two\r\n"
+                                      "Proxy-Connection: keep-alive\r\n"
+                                      "Trailer: X-Trailer\r\n"
+                                      "X-Duplicate: one\r\n"
+                                      "X-Duplicate: two\r\n\r\n",
+                                      upstream.port);
     REQUIRE_GT(expected_len, 0);
     REQUIRE_LT(expected_len, static_cast<int>(sizeof(expected)));
     CHECK_EQ(forwarded.len, static_cast<u32>(expected_len));
@@ -17872,8 +17833,7 @@ TEST(route, forward_request_policy_rebuilds_nginx_h11_headers) {
         const char* expected_status;
     };
     const RejectedVector rejected[] = {
-        {"GET /api HTTP/1.1\r\nHost: client.example\r\ntRaNsFeR-EnCoDiNg: identity\r\n\r\n",
-         "400"},
+        {"GET /api HTTP/1.1\r\nHost: client.example\r\ntRaNsFeR-EnCoDiNg: identity\r\n\r\n", "400"},
         // Absolute-form cannot route to this origin-form entry, so the existing
         // unmatched-route fallback is 200; importantly it still never connects.
         {"GET http://client.example/api HTTP/1.1\r\nHost: client.example\r\n\r\n", "200"},
@@ -17931,11 +17891,10 @@ TEST(route, request_policy_buffers_fixed_content_length_body) {
     // gateway must not allocate/connect before the complete body is available.
     const u8 coalesced_body[] = {0x00, 0x61, 0x0d, 0x0a, 0xff, 0x7f};
     char coalesced[512];
-    const int coalesced_head = snprintf(
-        coalesced,
-        sizeof(coalesced),
-        "POST /api?q=body HTTP/1.1\r\nHost: client.example\r\n"
-        "Content-Length: 6\r\nX-Test: yes\r\n\r\n");
+    const int coalesced_head = snprintf(coalesced,
+                                        sizeof(coalesced),
+                                        "POST /api?q=body HTTP/1.1\r\nHost: client.example\r\n"
+                                        "Content-Length: 6\r\nX-Test: yes\r\n\r\n");
     REQUIRE_GT(coalesced_head, 0);
     REQUIRE_LT(static_cast<u32>(coalesced_head) + sizeof(coalesced_body),
                static_cast<u32>(sizeof(coalesced)));
@@ -18010,7 +17969,8 @@ TEST(route, request_policy_buffers_fixed_content_length_body) {
     REQUIRE_EQ(backend.accepted_count.load(std::memory_order_acquire), 5u);
     REQUIRE_EQ(backend.request_count.load(std::memory_order_acquire), 5u);
     CHECK_EQ(backend.request_history_header_len[3] + 3u, backend.request_history_len[3]);
-    CHECK(memcmp(backend.request_history[3] + backend.request_history_header_len[3], "abc", 3) == 0);
+    CHECK(memcmp(backend.request_history[3] + backend.request_history_header_len[3], "abc", 3) ==
+          0);
     CHECK_EQ(backend.request_history_header_len[4], backend.request_history_len[4]);
     close(client);
 
@@ -18023,10 +17983,8 @@ TEST(route, request_policy_buffers_fixed_content_length_body) {
         {"POST /api HTTP/1.1\r\nHost: x\r\nContent-Length: 5\r\n"
          "Content-Length: 5\r\n\r\nhello",
          0},
-        {"POST /api HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: identity\r\n\r\n",
-         0},
-        {"POST /api HTTP/1.1\r\nHost: x\r\nTE: trailers\r\nContent-Length: 0\r\n\r\n",
-         0},
+        {"POST /api HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: identity\r\n\r\n", 0},
+        {"POST /api HTTP/1.1\r\nHost: x\r\nTE: trailers\r\nContent-Length: 0\r\n\r\n", 0},
         {"POST /api HTTP/1.1\r\nHost: x\r\nExpect: 100-continue\r\n"
          "Content-Length: 0\r\n\r\n",
          0},
@@ -18114,8 +18072,7 @@ TEST(route, request_policy_fixed_body_exact_buffer_boundary) {
     }
     const u32 original_header_len = actual_header_len(body_len, false);
     const u32 rebuilt_header_len = actual_header_len(body_len, true);
-    REQUIRE_EQ(body_len + std::max(original_header_len, rebuilt_header_len),
-               SlicePool::kSliceSize);
+    REQUIRE_EQ(body_len + std::max(original_header_len, rebuilt_header_len), SlicePool::kSliceSize);
 
     char request_header[256];
     const int request_header_len = snprintf(request_header,
@@ -18127,14 +18084,13 @@ TEST(route, request_policy_fixed_body_exact_buffer_boundary) {
     const u32 request_len = static_cast<u32>(request_header_len) + body_len;
     std::unique_ptr<u8[]> request(new u8[request_len]);
     memcpy(request.get(), request_header, static_cast<size_t>(request_header_len));
-    for (u32 i = 0; i < body_len; i++) request[request_header_len + i] = static_cast<u8>(i * 29u + 7u);
+    for (u32 i = 0; i < body_len; i++)
+        request[request_header_len + i] = static_cast<u8>(i * 29u + 7u);
 
     i32 client = connect_to(proxy.port);
     REQUIRE_GE(client, 0);
     set_socket_timeouts(client, 3);
-    REQUIRE(send_all(client,
-                     reinterpret_cast<const char*>(request.get()),
-                     request_len));
+    REQUIRE(send_all(client, reinterpret_cast<const char*>(request.get()), request_len));
     char response[512];
     const i32 response_len = recv_timeout(client, response, sizeof(response), 3000);
     REQUIRE_GT(response_len, 0);
@@ -18175,8 +18131,7 @@ TEST(route, request_policy_fixed_body_exact_buffer_boundary) {
     REQUIRE(send_all(client, reinterpret_cast<const char*>(over_request.get()), over_len));
     char rejected[512];
     const i32 rejected_len = recv_timeout(client, rejected, sizeof(rejected), 2000);
-    CHECK(rejected_len > 0 &&
-          buf_contains(rejected, static_cast<u32>(rejected_len), "400", 3));
+    CHECK(rejected_len > 0 && buf_contains(rejected, static_cast<u32>(rejected_len), "400", 3));
     close(client);
     usleep(100000);
     CHECK_EQ(backend.accepted_count.load(std::memory_order_acquire), accepted_before);
@@ -18276,10 +18231,8 @@ TEST(route, response_policy_rejects_before_upstream_accept) {
     char response[512];
     const i32 response_len = recv_timeout(client.fd, response, sizeof(response), 2000);
     CHECK_GT(response_len, 0);
-    CHECK(buf_contains(response,
-                       static_cast<u32>(response_len),
-                       "400",
-                       static_cast<u32>(strlen("400"))));
+    CHECK(buf_contains(
+        response, static_cast<u32>(response_len), "400", static_cast<u32>(strlen("400"))));
     usleep(100000);
     CHECK_EQ(backend.accepted_count.load(std::memory_order_acquire), 0u);
     CHECK_EQ(backend.request_count.load(std::memory_order_acquire), 0u);
@@ -18300,10 +18253,8 @@ TEST(route, response_policy_rejects_before_upstream_accept) {
         const i32 reject_len = recv_timeout(rejected_client, reject, sizeof(reject), 2000);
         close(rejected_client);
         CHECK_GT(reject_len, 0);
-        CHECK(buf_contains(reject,
-                           static_cast<u32>(reject_len),
-                           "400",
-                           static_cast<u32>(strlen("400"))));
+        CHECK(buf_contains(
+            reject, static_cast<u32>(reject_len), "400", static_cast<u32>(strlen("400"))));
         usleep(50000);
         CHECK_EQ(backend.accepted_count.load(std::memory_order_acquire), 0u);
         CHECK_EQ(backend.request_count.load(std::memory_order_acquire), 0u);
@@ -18350,8 +18301,7 @@ TEST(route, failure_policy_bundle_invalid_id_rejects_before_upstream_side_effect
     i32 invalid_client = connect_to(proxy.port);
     REQUIRE_GE(invalid_client, 0);
     set_socket_timeouts(invalid_client, 2);
-    static constexpr char kInvalidRequest[] =
-        "GET /bad HTTP/1.1\r\nHost: client.example\r\n\r\n";
+    static constexpr char kInvalidRequest[] = "GET /bad HTTP/1.1\r\nHost: client.example\r\n\r\n";
     REQUIRE(send_all(invalid_client, kInvalidRequest, sizeof(kInvalidRequest) - 1));
     char invalid_response[512];
     const i32 invalid_response_len =
@@ -18372,8 +18322,7 @@ TEST(route, failure_policy_bundle_invalid_id_rejects_before_upstream_side_effect
     i32 head_client = connect_to(proxy.port);
     REQUIRE_GE(head_client, 0);
     set_socket_timeouts(head_client, 2);
-    static constexpr char kHeadRequest[] =
-        "HEAD /head HTTP/1.1\r\nHost: client.example\r\n\r\n";
+    static constexpr char kHeadRequest[] = "HEAD /head HTTP/1.1\r\nHost: client.example\r\n\r\n";
     REQUIRE(send_all(head_client, kHeadRequest, sizeof(kHeadRequest) - 1));
     char head_response[512];
     const i32 head_response_len =
@@ -18414,10 +18363,7 @@ TEST(route, failure_policy_connect_error_serializes_binary_body_and_releases_slo
         u32 total = 0;
         u32 body_start = 0;
         while (total < cap) {
-            const i32 n = recv_timeout(client,
-                                       out + total,
-                                       cap - total,
-                                       2000);
+            const i32 n = recv_timeout(client, out + total, cap - total, 2000);
             if (n <= 0) return n;
             total += static_cast<u32>(n);
             if (body_start == 0) {
@@ -18429,7 +18375,8 @@ TEST(route, failure_policy_connect_error_serializes_binary_body_and_releases_slo
                     }
                 }
             }
-            if (body_start != 0 && total >= body_start + sizeof(body)) return static_cast<i32>(total);
+            if (body_start != 0 && total >= body_start + sizeof(body))
+                return static_cast<i32>(total);
         }
         return static_cast<i32>(total);
     };
@@ -18489,16 +18436,14 @@ TEST(route, failure_policy_close_intent_emits_close_and_eof) {
     u32 response_len = 0;
     u32 body_start = 0;
     while (response_len < sizeof(response)) {
-        const i32 got = recv_timeout(client,
-                                     response + response_len,
-                                     sizeof(response) - response_len,
-                                     2000);
+        const i32 got =
+            recv_timeout(client, response + response_len, sizeof(response) - response_len, 2000);
         REQUIRE_GT(got, 0);
         response_len += static_cast<u32>(got);
         if (body_start == 0) {
             for (u32 i = 0; i + 3 < response_len; i++) {
-                if (response[i] == '\r' && response[i + 1] == '\n' &&
-                    response[i + 2] == '\r' && response[i + 3] == '\n') {
+                if (response[i] == '\r' && response[i + 1] == '\n' && response[i + 2] == '\r' &&
+                    response[i + 3] == '\n') {
                     body_start = i + 4;
                     break;
                 }
@@ -18545,10 +18490,8 @@ TEST(route, failure_policy_body_waits_for_complete_request_before_connect_error)
     REQUIRE(send_all(client, "abc", 3));
     const i32 response_len = recv_timeout(client, response, sizeof(response), 2000);
     REQUIRE_GT(response_len, 0);
-    CHECK(buf_contains(response,
-                       static_cast<u32>(response_len),
-                       "HTTP/1.1 502 Bad Gateway\r\n",
-                       26));
+    CHECK(
+        buf_contains(response, static_cast<u32>(response_len), "HTTP/1.1 502 Bad Gateway\r\n", 26));
     close(client);
 }
 
@@ -18626,8 +18569,11 @@ TEST(route, failure_policy_suppress_body_connect_error_serializes_head_bundle) {
                 if (header_end != 0) break;
             }
             if (header_end == 0 || response_len != header_end) {
-                fprintf(stderr, "paired-head: header=%u response=%u attempt=%u\n",
-                        header_end, response_len, attempt);
+                fprintf(stderr,
+                        "paired-head: header=%u response=%u attempt=%u\n",
+                        header_end,
+                        response_len,
+                        attempt);
                 close(client);
                 return false;
             }
@@ -18649,8 +18595,12 @@ TEST(route, failure_policy_suppress_body_connect_error_serializes_head_bundle) {
             for (u32 i = 0; i < 29; i++) normalized[(date - normalized) + 6 + i] = 'X';
             if (response_len != sizeof(kExpected) - 1 ||
                 memcmp(normalized, kExpected, sizeof(kExpected) - 1) != 0) {
-                fprintf(stderr, "paired-head: wire len=%u expected=%zu\n%.*s\n",
-                        response_len, sizeof(kExpected) - 1, response_len, normalized);
+                fprintf(stderr,
+                        "paired-head: wire len=%u expected=%zu\n%.*s\n",
+                        response_len,
+                        sizeof(kExpected) - 1,
+                        response_len,
+                        normalized);
                 close(client);
                 return false;
             }
@@ -18688,10 +18638,8 @@ TEST(route, response_policy_rejects_tls_admission_before_upstream_accept) {
     char response[512];
     const i32 response_len = recv_timeout(client.fd, response, sizeof(response), 2000);
     CHECK_GT(response_len, 0);
-    CHECK(buf_contains(response,
-                       static_cast<u32>(response_len),
-                       "400",
-                       static_cast<u32>(strlen("400"))));
+    CHECK(buf_contains(
+        response, static_cast<u32>(response_len), "400", static_cast<u32>(strlen("400"))));
     usleep(100000);
     CHECK_EQ(backend.accepted_count.load(std::memory_order_acquire), 0u);
     CHECK_EQ(backend.request_count.load(std::memory_order_acquire), 0u);
@@ -18743,8 +18691,7 @@ TEST(route, response_policy_suppress_body_serializes_explicit_close_head) {
         char response[2048]{};
         u32 response_len = 0;
         const i32 first_timeout_ms = split_delay_us != 0 ? 200 : 2000;
-        const i32 first = recv_timeout(
-            client, response, sizeof(response), first_timeout_ms);
+        const i32 first = recv_timeout(client, response, sizeof(response), first_timeout_ms);
         if (first <= 0) {
             close(client);
             return false;
@@ -18763,8 +18710,8 @@ TEST(route, response_policy_suppress_body_serializes_explicit_close_head) {
         const bool has_header_end = buf_contains(response, response_len, "\r\n\r\n", 4);
         bool eof = false;
         if (has_header_end) {
-            const i32 tail = recv_timeout(client, response + response_len,
-                                          sizeof(response) - response_len, 2000);
+            const i32 tail = recv_timeout(
+                client, response + response_len, sizeof(response) - response_len, 2000);
             eof = tail == 0;
             if (tail > 0) response_len += static_cast<u32>(tail);
         }
@@ -18780,15 +18727,14 @@ TEST(route, response_policy_suppress_body_serializes_explicit_close_head) {
             date[6 + i] = 'X';
         }
         char expected[512]{};
-        const int expected_len = snprintf(
-            expected,
-            sizeof(expected),
-            "HTTP/1.1 200 OK\r\n"
-            "Server: nginx/1.29.7\r\n"
-            "Date: XXXXXXXXXXXXXXXXXXXXXXXXXXXXX\r\n"
-            "Content-Length: %u\r\n"
-            "Connection: close\r\n\r\n",
-            expected_content_length);
+        const int expected_len = snprintf(expected,
+                                          sizeof(expected),
+                                          "HTTP/1.1 200 OK\r\n"
+                                          "Server: nginx/1.29.7\r\n"
+                                          "Date: XXXXXXXXXXXXXXXXXXXXXXXXXXXXX\r\n"
+                                          "Content-Length: %u\r\n"
+                                          "Connection: close\r\n\r\n",
+                                          expected_content_length);
         if (expected_len <= 0 || static_cast<u32>(expected_len) != response_len ||
             memcmp(normalized, expected, static_cast<size_t>(expected_len)) != 0)
             return false;
@@ -18800,14 +18746,15 @@ TEST(route, response_policy_suppress_body_serializes_explicit_close_head) {
         backend.teardown();
         if (with_request_policy) {
             char expected_request[256]{};
-            const int expected_request_len = snprintf(
-                expected_request,
-                sizeof(expected_request),
-                "HEAD /head?q=1 HTTP/1.1\r\nHost: 127.0.0.1:%u\r\n\r\n",
-                backend.port);
-            if (expected_request_len <= 0 || backend.request_history_len[0] !=
-                                                    static_cast<u32>(expected_request_len) ||
-                memcmp(backend.request_history[0], expected_request,
+            const int expected_request_len =
+                snprintf(expected_request,
+                         sizeof(expected_request),
+                         "HEAD /head?q=1 HTTP/1.1\r\nHost: 127.0.0.1:%u\r\n\r\n",
+                         backend.port);
+            if (expected_request_len <= 0 ||
+                backend.request_history_len[0] != static_cast<u32>(expected_request_len) ||
+                memcmp(backend.request_history[0],
+                       expected_request,
                        static_cast<size_t>(expected_request_len)) != 0) {
                 return false;
             }
@@ -18898,16 +18845,14 @@ TEST(route, response_and_failure_bundle_suppress_head_serializes_live_success) {
         u32 response_len = 0;
         u32 header_end = 0;
         for (u32 read = 0; read < 16 && response_len < sizeof(response); read++) {
-            const i32 got = recv_timeout(client.fd,
-                                         response + response_len,
-                                         sizeof(response) - response_len,
-                                         3000);
+            const i32 got = recv_timeout(
+                client.fd, response + response_len, sizeof(response) - response_len, 3000);
             REQUIRE_GT(got, 0);
             response_len += static_cast<u32>(got);
             if (buf_contains(response, response_len, "\r\n\r\n", 4)) {
                 for (u32 i = 0; i + 3 < response_len; i++) {
-                    if (response[i] == '\r' && response[i + 1] == '\n' &&
-                        response[i + 2] == '\r' && response[i + 3] == '\n') {
+                    if (response[i] == '\r' && response[i + 1] == '\n' && response[i + 2] == '\r' &&
+                        response[i + 3] == '\n') {
                         header_end = i + 4;
                         break;
                     }
@@ -18927,9 +18872,8 @@ TEST(route, response_and_failure_bundle_suppress_head_serializes_live_success) {
         CHECK_EQ(recv_timeout(client.fd, response, sizeof(response), 3000), 0);
 
         const u32 expected_requests = attempt + 1;
-        for (u32 waited = 0;
-             waited < 600 &&
-             backend.request_count.load(std::memory_order_acquire) < expected_requests;
+        for (u32 waited = 0; waited < 600 && backend.request_count.load(std::memory_order_acquire) <
+                                                 expected_requests;
              waited++)
             usleep(5000);
         REQUIRE_EQ(backend.accepted_count.load(std::memory_order_acquire), expected_requests);
@@ -18989,10 +18933,8 @@ TEST(route, response_policy_suppress_body_rejects_coalesced_excess) {
     char response[512]{};
     u32 response_len = 0;
     for (u32 attempt = 0; attempt < 8 && response_len < sizeof(response); attempt++) {
-        const i32 got = recv_timeout(client.fd,
-                                     response + response_len,
-                                     sizeof(response) - response_len,
-                                     2000);
+        const i32 got =
+            recv_timeout(client.fd, response + response_len, sizeof(response) - response_len, 2000);
         if (got <= 0) break;
         response_len += static_cast<u32>(got);
     }
@@ -19130,8 +19072,8 @@ TEST(route, response_and_failure_bundle_serializes_live_success_response) {
         n += static_cast<u32>(got);
         if (body_start == 0) {
             for (u32 i = 0; i + 3 < n; i++) {
-                if (response[i] == '\r' && response[i + 1] == '\n' &&
-                    response[i + 2] == '\r' && response[i + 3] == '\n') {
+                if (response[i] == '\r' && response[i + 1] == '\n' && response[i + 2] == '\r' &&
+                    response[i + 3] == '\n') {
                     body_start = i + 4;
                     break;
                 }
@@ -19174,12 +19116,8 @@ TEST(route, response_policy_consumes_one_upstream_connection_header) {
     };
     static constexpr Case kCases[] = {
         {"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n", false, nullptr},
-        {"HTTP/1.1 200 OK\r\nConnection: keep-alive\r\nContent-Length: 0\r\n\r\n",
-         false,
-         nullptr},
-        {"HTTP/1.1 200 OK\r\nConnection: close\r\nContent-Length: 0\r\n\r\n",
-         false,
-         nullptr},
+        {"HTTP/1.1 200 OK\r\nConnection: keep-alive\r\nContent-Length: 0\r\n\r\n", false, nullptr},
+        {"HTTP/1.1 200 OK\r\nConnection: close\r\nContent-Length: 0\r\n\r\n", false, nullptr},
         {"HTTP/1.1 200 OK\r\nConnection: X-Hop\r\nX-Hop: secret\r\n"
          "Content-Length: 0\r\n\r\n",
          true,
@@ -19227,18 +19165,17 @@ TEST(route, response_policy_consumes_one_upstream_connection_header) {
         REQUIRE(date != nullptr);
         for (u32 i = 0; i < 29 && date[6 + i] != '\r'; i++) date[6 + i] = 'X';
         char expected[512];
-        const int expected_len = snprintf(
-            expected,
-            sizeof(expected),
-            "HTTP/1.1 200 OK\r\n"
-            "Server: nginx/1.29.7\r\n"
-            "Date: XXXXXXXXXXXXXXXXXXXXXXXXXXXXX\r\n"
-            "Content-Length: 0\r\n"
-            "Connection: keep-alive\r\n"
-            "%s%s"
-            "\r\n",
-            test.preserve_x_hop ? "X-Hop: secret\r\n" : "",
-            test.preserve_headers ? test.preserve_headers : "");
+        const int expected_len = snprintf(expected,
+                                          sizeof(expected),
+                                          "HTTP/1.1 200 OK\r\n"
+                                          "Server: nginx/1.29.7\r\n"
+                                          "Date: XXXXXXXXXXXXXXXXXXXXXXXXXXXXX\r\n"
+                                          "Content-Length: 0\r\n"
+                                          "Connection: keep-alive\r\n"
+                                          "%s%s"
+                                          "\r\n",
+                                          test.preserve_x_hop ? "X-Hop: secret\r\n" : "",
+                                          test.preserve_headers ? test.preserve_headers : "");
         REQUIRE_GT(expected_len, 0);
         REQUIRE_LT(expected_len, static_cast<int>(sizeof(expected)));
         CHECK_EQ(n, static_cast<u32>(expected_len));
@@ -19276,15 +19213,14 @@ TEST(route, response_policy_request_connection_preserves_client_intent) {
         REQUIRE(date != nullptr);
         for (u32 i = 0; i < 29 && date[6 + i] != '\r'; i++) date[6 + i] = 'X';
         char expected[512];
-        const int expected_len = snprintf(
-            expected,
-            sizeof(expected),
-            "HTTP/1.1 200 OK\r\n"
-            "Server: nginx/1.29.7\r\n"
-            "Date: XXXXXXXXXXXXXXXXXXXXXXXXXXXXX\r\n"
-            "Content-Length: 2\r\n"
-            "Connection: %s\r\n\r\nok",
-            connection);
+        const int expected_len = snprintf(expected,
+                                          sizeof(expected),
+                                          "HTTP/1.1 200 OK\r\n"
+                                          "Server: nginx/1.29.7\r\n"
+                                          "Date: XXXXXXXXXXXXXXXXXXXXXXXXXXXXX\r\n"
+                                          "Content-Length: 2\r\n"
+                                          "Connection: %s\r\n\r\nok",
+                                          connection);
         REQUIRE_GT(expected_len, 0);
         REQUIRE_LT(expected_len, static_cast<int>(sizeof(expected)));
         CHECK_EQ(length, static_cast<u32>(expected_len));
@@ -19321,17 +19257,14 @@ TEST(route, response_policy_request_connection_preserves_client_intent) {
         REQUIRE_GT(response_len, 0u);
         normalize_and_check(response, response_len, "keep-alive");
         close(client);
-        for (u32 i = 0; i < 200 && backend.request_count.load(std::memory_order_acquire) < 2;
-             i++)
+        for (u32 i = 0; i < 200 && backend.request_count.load(std::memory_order_acquire) < 2; i++)
             usleep(5000);
         CHECK_EQ(backend.accepted_count.load(std::memory_order_acquire), 2u);
         CHECK_EQ(backend.request_count.load(std::memory_order_acquire), 2u);
         for (u32 i = 0; i < 2; i++) {
             const Str request{backend.request_history[i], backend.request_history_len[i]};
-            CHECK(!buf_contains(request.ptr,
-                                request.len,
-                                "Connection:",
-                                static_cast<u32>(strlen("Connection:"))));
+            CHECK(!buf_contains(
+                request.ptr, request.len, "Connection:", static_cast<u32>(strlen("Connection:"))));
         }
     }
 
@@ -19385,14 +19318,11 @@ TEST(route, response_policy_request_connection_preserves_client_intent) {
         char warm_response[512];
         const i32 warm_len = recv_timeout(client, warm_response, sizeof(warm_response), 2000);
         REQUIRE_GT(warm_len, 0);
-        CHECK(buf_contains(warm_response,
-                           static_cast<u32>(warm_len),
-                           "200",
-                           static_cast<u32>(strlen("200"))));
+        CHECK(buf_contains(
+            warm_response, static_cast<u32>(warm_len), "200", static_cast<u32>(strlen("200"))));
 
         proxy.loop->drain(1);
-        static constexpr char kDraining[] =
-            "GET /api HTTP/1.1\r\nHost: client.example\r\n\r\n";
+        static constexpr char kDraining[] = "GET /api HTTP/1.1\r\nHost: client.example\r\n\r\n";
         REQUIRE(send_all(client, kDraining, sizeof(kDraining) - 1));
         char response[2048]{};
         const u32 response_len = read_response(client, response, sizeof(response));
@@ -19519,8 +19449,7 @@ TEST(route, response_policy_admits_buffered_request_policy_body) {
     REQUIRE(send_all(client, kPipelined, sizeof(kPipelined) - 1));
     char rejected[512];
     const i32 rejected_len = recv_timeout(client, rejected, sizeof(rejected), 2000);
-    CHECK(rejected_len > 0 &&
-          buf_contains(rejected, static_cast<u32>(rejected_len), "400", 3));
+    CHECK(rejected_len > 0 && buf_contains(rejected, static_cast<u32>(rejected_len), "400", 3));
     close(client);
     usleep(100000);
     CHECK_EQ(backend.accepted_count.load(std::memory_order_acquire), accepted_before);
@@ -19562,10 +19491,7 @@ TEST(route, response_policy_never_pools_and_short_body_closes) {
             char response[2048]{};
             u32 total = 0;
             for (u32 read = 0; read < 16 && total < sizeof(response); read++) {
-                const i32 got = recv_timeout(fd,
-                                             response + total,
-                                             sizeof(response) - total,
-                                             2000);
+                const i32 got = recv_timeout(fd, response + total, sizeof(response) - total, 2000);
                 if (got <= 0) return false;
                 total += static_cast<u32>(got);
                 if (buf_contains(response, total, "\r\n\r\nok", 6)) break;
@@ -19577,8 +19503,7 @@ TEST(route, response_policy_never_pools_and_short_body_closes) {
         REQUIRE(read_response(client.fd));
         REQUIRE(send_all(client.fd, kRequest, sizeof(kRequest) - 1));
         REQUIRE(read_response(client.fd));
-        for (u32 spin = 0;
-             spin < 100 && backend.accepted_count.load(std::memory_order_acquire) < 2;
+        for (u32 spin = 0; spin < 100 && backend.accepted_count.load(std::memory_order_acquire) < 2;
              spin++)
             usleep(10000);
         CHECK_EQ(backend.accepted_count.load(std::memory_order_acquire), 2u);
@@ -19589,8 +19514,7 @@ TEST(route, response_policy_never_pools_and_short_body_closes) {
     // mistaken for a successful response. Repeating the request with
     // max_inflight=1 proves the slot is released after the truncation.
     {
-        static constexpr char kShort[] =
-            "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\no";
+        static constexpr char kShort[] = "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\no";
         RecordingUpstream backend;
         backend.response = kShort;
         backend.response_len = sizeof(kShort) - 1;
@@ -19614,10 +19538,8 @@ TEST(route, response_policy_never_pools_and_short_body_closes) {
             u32 total = 0;
             bool saw_eof = false;
             for (u32 read = 0; read < 16 && total < sizeof(response); read++) {
-                const i32 got = recv_timeout(client.fd,
-                                             response + total,
-                                             sizeof(response) - total,
-                                             2000);
+                const i32 got =
+                    recv_timeout(client.fd, response + total, sizeof(response) - total, 2000);
                 if (got == 0) {
                     saw_eof = true;
                     break;
@@ -19646,8 +19568,8 @@ TEST(route, response_policy_rejects_pending_response_mutation_before_upstream_ac
     auto id = cfg.add_upstream("backend", 0x7F000001, backend.port);
     REQUIRE(id.has_value());
     REQUIRE_EQ(cfg.add_response_policy(test_response_policy_spec()), 1u);
-    REQUIRE(cfg.add_jit_handler(
-        "/api", 'G', &forward_response_policy_with_pending_mutation_handler));
+    REQUIRE(
+        cfg.add_jit_handler("/api", 'G', &forward_response_policy_with_pending_mutation_handler));
     const RouteConfig* active = &cfg;
     ScopedProxyLoop proxy;
     REQUIRE(proxy.setup(&active, 1000));
@@ -19665,10 +19587,8 @@ TEST(route, response_policy_rejects_pending_response_mutation_before_upstream_ac
     char response[512];
     const i32 response_len = recv_timeout(client.fd, response, sizeof(response), 2000);
     CHECK_GT(response_len, 0);
-    CHECK(buf_contains(response,
-                       static_cast<u32>(response_len),
-                       "400",
-                       static_cast<u32>(strlen("400"))));
+    CHECK(buf_contains(
+        response, static_cast<u32>(response_len), "400", static_cast<u32>(strlen("400"))));
     usleep(100000);
     CHECK_EQ(backend.accepted_count.load(std::memory_order_acquire), 0u);
     CHECK_EQ(backend.request_count.load(std::memory_order_acquire), 0u);
@@ -19780,7 +19700,8 @@ TEST(shard, serves_http2_timer_resume_response_policy_fails_closed) {
     set_socket_timeouts(guard.client_fd, 2);
     u8 request[512];
     u32 request_len = h2_client_prologue(request);
-    request_len += h2_client_get(request + request_len, sizeof(request) - request_len, 1, "/api", 4);
+    request_len +=
+        h2_client_get(request + request_len, sizeof(request) - request_len, 1, "/api", 4);
     REQUIRE(write_all_fd(guard.client_fd, request, request_len));
     u8 response[4096];
     u32 total = 0;
@@ -19807,8 +19728,8 @@ TEST(shard, serves_http2_response_policy_with_committed_mutation_fails_closed) {
     auto id = cfg.add_upstream("backend", 0x7F000001, backend.port);
     REQUIRE(id.has_value());
     REQUIRE_EQ(cfg.add_response_policy(test_response_policy_spec()), 1u);
-    REQUIRE(cfg.add_jit_handler(
-        "/api", 'G', &forward_response_policy_with_committed_mutation_handler));
+    REQUIRE(
+        cfg.add_jit_handler("/api", 'G', &forward_response_policy_with_committed_mutation_handler));
 
     Shard<EpollEventLoop> shard;
     i32 lfd = create_listen_socket(0).value_or(-1);
@@ -19892,10 +19813,8 @@ TEST(route, request_policy_rejects_multi_address_before_upstream_accept) {
     char response[512];
     const i32 response_len = recv_timeout(client.fd, response, sizeof(response), 2000);
     CHECK_GT(response_len, 0);
-    CHECK(buf_contains(response,
-                       static_cast<u32>(response_len),
-                       "400",
-                       static_cast<u32>(strlen("400"))));
+    CHECK(buf_contains(
+        response, static_cast<u32>(response_len), "400", static_cast<u32>(strlen("400"))));
     usleep(100000);
     CHECK_EQ(backend.accepted_count.load(std::memory_order_acquire), 0u);
     CHECK_EQ(backend.request_count.load(std::memory_order_acquire), 0u);
@@ -19908,8 +19827,8 @@ TEST(route, request_policy_rejects_pending_response_mutation_before_rewrite) {
     RouteConfig cfg{};
     auto id = cfg.add_upstream("backend", 0x7F000001, backend.port);
     REQUIRE(id.has_value());
-    REQUIRE(cfg.add_jit_handler(
-        "/api", 'G', &forward_request_policy_with_pending_mutation_handler));
+    REQUIRE(
+        cfg.add_jit_handler("/api", 'G', &forward_request_policy_with_pending_mutation_handler));
     const RouteConfig* active = &cfg;
     ScopedProxyLoop proxy;
     REQUIRE(proxy.setup(&active, 1000));
@@ -19927,10 +19846,8 @@ TEST(route, request_policy_rejects_pending_response_mutation_before_rewrite) {
     char response[512];
     const i32 response_len = recv_timeout(client.fd, response, sizeof(response), 2000);
     CHECK_GT(response_len, 0);
-    CHECK(buf_contains(response,
-                       static_cast<u32>(response_len),
-                       "400",
-                       static_cast<u32>(strlen("400"))));
+    CHECK(buf_contains(
+        response, static_cast<u32>(response_len), "400", static_cast<u32>(strlen("400"))));
     usleep(100000);
     CHECK_EQ(backend.accepted_count.load(std::memory_order_acquire), 0u);
     CHECK_EQ(backend.request_count.load(std::memory_order_acquire), 0u);
@@ -20516,8 +20433,7 @@ TEST(route, inline_redirect_source_reaches_production_h1_and_forward_sibling) {
             if (memcmp(data + i, kPrefix, kPrefixLen) != 0) continue;
             found++;
             const u32 start = i + kPrefixLen;
-            if (data[start + kDateLen] != '\r' || data[start + kDateLen + 1] != '\n')
-                return false;
+            if (data[start + kDateLen] != '\r' || data[start + kDateLen + 1] != '\n') return false;
             for (u32 j = 0; j < kDateLen; j++) data[start + j] = 'X';
         }
         return found == 1;
@@ -20527,8 +20443,8 @@ TEST(route, inline_redirect_source_reaches_production_h1_and_forward_sibling) {
                "Server: nginx/1.29.7\r\n"
                "Date: XXXXXXXXXXXXXXXXXXXXXXXXXXXXX\r\n"
                "Content-Type: text/html\r\n"
-               "Content-Length: 169\r\nLocation: http://" + authority + "/api/" + query +
-               "\r\nConnection: close\r\n\r\n" + kRedirectBody;
+               "Content-Length: 169\r\nLocation: http://" +
+               authority + "/api/" + query + "\r\nConnection: close\r\n\r\n" + kRedirectBody;
     };
     auto backend_quiet = [](const RecordingUpstream& backend, u32 accepted, u32 requests) {
         bool quiet = true;
@@ -20546,8 +20462,7 @@ TEST(route, inline_redirect_source_reaches_production_h1_and_forward_sibling) {
 
     RecordingUpstream backend;
     REQUIRE(backend.setup());
-    std::string source = "upstream backend at \"127.0.0.1:" + std::to_string(backend.port) +
-                         "\"\n";
+    std::string source = "upstream backend at \"127.0.0.1:" + std::to_string(backend.port) + "\"\n";
     source += R"rut(
 route "/api" {
   if req.method == GET && req.pathOnly == "/api" {
@@ -20701,8 +20616,7 @@ route "/api" {
     REQUIRE(run_redirect("/api?x=1", explicit_host.c_str(), "?x=1"));
 
     auto run_forward = [&](const char* target) {
-        const u32 expected_count =
-            backend.request_count.load(std::memory_order_acquire) + 1;
+        const u32 expected_count = backend.request_count.load(std::memory_order_acquire) + 1;
         ClientFdGuard client{connect_to(actual_port)};
         if (client.fd < 0) return false;
         set_socket_timeouts(client.fd, 2);
@@ -20791,8 +20705,8 @@ route "/api" {
     REQUIRE(check_forward_history(0, "/"));
     REQUIRE(check_forward_history(1, "/x?y=1"));
     for (u32 slot = 2; slot < RecordingUpstream::kMaxRecordedRequests; slot++) {
-        bool zero = backend.request_history_len[slot] == 0 &&
-                    backend.request_history_header_len[slot] == 0;
+        bool zero =
+            backend.request_history_len[slot] == 0 && backend.request_history_header_len[slot] == 0;
         for (u32 i = 0; zero && i < RecordingUpstream::kRequestCapacity; i++)
             zero = backend.request_history[slot][i] == '\0';
         CHECK(zero);
@@ -20911,8 +20825,7 @@ TEST(route, public_paired_head_source_success_and_forward_wire) {
     };
     auto wait_backend_count = [&](u32 expected_count) {
         for (u32 waited = 0;
-             waited < 600 &&
-             backend.request_count.load(std::memory_order_acquire) < expected_count;
+             waited < 600 && backend.request_count.load(std::memory_order_acquire) < expected_count;
              waited++)
             usleep(5000);
         return backend.accepted_count.load(std::memory_order_acquire) == expected_count &&
@@ -20937,11 +20850,8 @@ TEST(route, public_paired_head_source_success_and_forward_wire) {
         if (!send_all(client.fd, request, static_cast<u32>(request_len))) return false;
         char response[1024]{};
         u32 response_len = 0;
-        if (!read_public_close_response(client.fd,
-                                        expected_body_len,
-                                        response,
-                                        sizeof(response),
-                                        response_len))
+        if (!read_public_close_response(
+                client.fd, expected_body_len, response, sizeof(response), response_len))
             return false;
         if (!normalize_public_date(response, response_len)) return false;
         if (response_len != static_cast<u32>(strlen(expected)) ||
@@ -20961,11 +20871,8 @@ TEST(route, public_paired_head_source_success_and_forward_wire) {
     REQUIRE(send_all(head_client.fd, kHead1, sizeof(kHead1) - 1));
     char head_response[1024]{};
     u32 head_response_len = 0;
-    REQUIRE(read_public_head_response(head_client.fd,
-                                      false,
-                                      head_response,
-                                      sizeof(head_response),
-                                      head_response_len));
+    REQUIRE(read_public_head_response(
+        head_client.fd, false, head_response, sizeof(head_response), head_response_len));
     REQUIRE(normalize_public_date(head_response, head_response_len));
     REQUIRE_EQ(head_response_len, static_cast<u32>(strlen(kHeadKeepAliveExpected)));
     CHECK_EQ(memcmp(head_response, kHeadKeepAliveExpected, head_response_len), 0);
@@ -20973,11 +20880,8 @@ TEST(route, public_paired_head_source_success_and_forward_wire) {
 
     REQUIRE(send_all(head_client.fd, kHead2, sizeof(kHead2) - 1));
     memset(head_response, 0, sizeof(head_response));
-    REQUIRE(read_public_head_response(head_client.fd,
-                                      true,
-                                      head_response,
-                                      sizeof(head_response),
-                                      head_response_len));
+    REQUIRE(read_public_head_response(
+        head_client.fd, true, head_response, sizeof(head_response), head_response_len));
     REQUIRE(normalize_public_date(head_response, head_response_len));
     REQUIRE_EQ(head_response_len, static_cast<u32>(strlen(kHeadCloseExpected)));
     CHECK_EQ(memcmp(head_response, kHeadCloseExpected, head_response_len), 0);
@@ -21080,22 +20984,19 @@ TEST(route, public_paired_head_source_reuses_downstream_iouring) {
     char response[1024]{};
     u32 response_len = 0;
     REQUIRE(send_all(client.fd, kRequest1, sizeof(kRequest1) - 1));
-    REQUIRE(read_public_head_response(
-        client.fd, false, response, sizeof(response), response_len));
+    REQUIRE(read_public_head_response(client.fd, false, response, sizeof(response), response_len));
     REQUIRE(normalize_public_date(response, response_len));
     REQUIRE_EQ(response_len, static_cast<u32>(strlen(kFirstExpected)));
     CHECK_EQ(memcmp(response, kFirstExpected, response_len), 0);
 
     REQUIRE(send_all(client.fd, kRequest2, sizeof(kRequest2) - 1));
     memset(response, 0, sizeof(response));
-    REQUIRE(read_public_head_response(
-        client.fd, true, response, sizeof(response), response_len));
+    REQUIRE(read_public_head_response(client.fd, true, response, sizeof(response), response_len));
     REQUIRE(normalize_public_date(response, response_len));
     REQUIRE_EQ(response_len, static_cast<u32>(strlen(kSecondExpected)));
     CHECK_EQ(memcmp(response, kSecondExpected, response_len), 0);
 
-    for (u32 waited = 0;
-         waited < 600 && backend.request_count.load(std::memory_order_acquire) < 2;
+    for (u32 waited = 0; waited < 600 && backend.request_count.load(std::memory_order_acquire) < 2;
          waited++)
         usleep(5000);
     REQUIRE_EQ(backend.accepted_count.load(std::memory_order_acquire), 2u);
@@ -21214,9 +21115,8 @@ TEST(route, public_paired_head_source_recv_timeout_reuses_downstream_iouring) {
 
     REQUIRE(send_all(client.fd, kRequest1, sizeof(kRequest1) - 1));
     for (u32 waited = 0;
-         waited < 600 &&
-         (!backend.first_response_stalled_open.load(std::memory_order_acquire) ||
-          backend.request_count.load(std::memory_order_acquire) < 1);
+         waited < 600 && (!backend.first_response_stalled_open.load(std::memory_order_acquire) ||
+                          backend.request_count.load(std::memory_order_acquire) < 1);
          waited++)
         usleep(5000);
     REQUIRE(backend.first_response_stalled_open.load(std::memory_order_acquire));
@@ -21224,19 +21124,18 @@ TEST(route, public_paired_head_source_recv_timeout_reuses_downstream_iouring) {
     REQUIRE_EQ(backend.request_count.load(std::memory_order_acquire), 1u);
 
     char expected_request[256]{};
-    int expected_request_len = snprintf(
-        expected_request,
-        sizeof(expected_request),
-        "HEAD /head?timeout=1 HTTP/1.1\r\nHost: 127.0.0.1:%u\r\nX-Test: slow\r\n\r\n",
-        backend.port);
+    int expected_request_len =
+        snprintf(expected_request,
+                 sizeof(expected_request),
+                 "HEAD /head?timeout=1 HTTP/1.1\r\nHost: 127.0.0.1:%u\r\nX-Test: slow\r\n\r\n",
+                 backend.port);
     REQUIRE_GT(expected_request_len, 0);
     REQUIRE_EQ(backend.request_history_len[0], static_cast<u32>(expected_request_len));
     CHECK_EQ(memcmp(backend.request_history[0], expected_request, expected_request_len), 0);
 
     char response[1024]{};
     u32 response_len = 0;
-    REQUIRE(read_public_head_response(
-        client.fd, false, response, sizeof(response), response_len));
+    REQUIRE(read_public_head_response(client.fd, false, response, sizeof(response), response_len));
     REQUIRE(normalize_public_date(response, response_len));
     REQUIRE_EQ(response_len, static_cast<u32>(strlen(kTimeoutExpected)));
     CHECK_EQ(memcmp(response, kTimeoutExpected, response_len), 0);
@@ -21257,23 +21156,21 @@ TEST(route, public_paired_head_source_recv_timeout_reuses_downstream_iouring) {
 
     REQUIRE(send_all(client.fd, kRequest2, sizeof(kRequest2) - 1));
     memset(response, 0, sizeof(response));
-    REQUIRE(read_public_head_response(
-        client.fd, true, response, sizeof(response), response_len));
+    REQUIRE(read_public_head_response(client.fd, true, response, sizeof(response), response_len));
     REQUIRE(normalize_public_date(response, response_len));
     REQUIRE_EQ(response_len, static_cast<u32>(strlen(kSecondExpected)));
     CHECK_EQ(memcmp(response, kSecondExpected, response_len), 0);
 
-    for (u32 waited = 0;
-         waited < 600 && backend.request_count.load(std::memory_order_acquire) < 2;
+    for (u32 waited = 0; waited < 600 && backend.request_count.load(std::memory_order_acquire) < 2;
          waited++)
         usleep(5000);
     REQUIRE_EQ(backend.accepted_count.load(std::memory_order_acquire), 2u);
     REQUIRE_EQ(backend.request_count.load(std::memory_order_acquire), 2u);
-    expected_request_len = snprintf(
-        expected_request,
-        sizeof(expected_request),
-        "HEAD /head?complete=2 HTTP/1.1\r\nHost: 127.0.0.1:%u\r\nX-Test: final\r\n\r\n",
-        backend.port);
+    expected_request_len =
+        snprintf(expected_request,
+                 sizeof(expected_request),
+                 "HEAD /head?complete=2 HTTP/1.1\r\nHost: 127.0.0.1:%u\r\nX-Test: final\r\n\r\n",
+                 backend.port);
     REQUIRE_GT(expected_request_len, 0);
     REQUIRE_EQ(backend.request_history_len[1], static_cast<u32>(expected_request_len));
     CHECK_EQ(memcmp(backend.request_history[1], expected_request, expected_request_len), 0);
@@ -21281,8 +21178,8 @@ TEST(route, public_paired_head_source_recv_timeout_reuses_downstream_iouring) {
     CHECK_EQ(backend.accepted_count.load(std::memory_order_acquire), 2u);
     CHECK_EQ(backend.request_count.load(std::memory_order_acquire), 2u);
     for (u32 slot = 2; slot < RecordingUpstream::kMaxRecordedRequests; slot++) {
-        bool zero = backend.request_history_len[slot] == 0 &&
-                    backend.request_history_header_len[slot] == 0;
+        bool zero =
+            backend.request_history_len[slot] == 0 && backend.request_history_header_len[slot] == 0;
         for (u32 i = 0; zero && i < RecordingUpstream::kRequestCapacity; i++)
             zero = backend.request_history[slot][i] == '\0';
         CHECK(zero);
@@ -21378,8 +21275,7 @@ TEST(route, public_paired_head_source_malformed_open_peer_reuses_downstream_iour
     char response[1024]{};
     u32 response_len = 0;
     REQUIRE(send_all(client.fd, kRequest1, sizeof(kRequest1) - 1));
-    REQUIRE(read_public_head_response(
-        client.fd, false, response, sizeof(response), response_len));
+    REQUIRE(read_public_head_response(client.fd, false, response, sizeof(response), response_len));
     REQUIRE(normalize_public_date(response, response_len));
     REQUIRE_EQ(response_len, static_cast<u32>(strlen(kFirstExpected)));
     CHECK_EQ(memcmp(response, kFirstExpected, response_len), 0);
@@ -21399,14 +21295,12 @@ TEST(route, public_paired_head_source_malformed_open_peer_reuses_downstream_iour
 
     REQUIRE(send_all(client.fd, kRequest2, sizeof(kRequest2) - 1));
     memset(response, 0, sizeof(response));
-    REQUIRE(read_public_head_response(
-        client.fd, true, response, sizeof(response), response_len));
+    REQUIRE(read_public_head_response(client.fd, true, response, sizeof(response), response_len));
     REQUIRE(normalize_public_date(response, response_len));
     REQUIRE_EQ(response_len, static_cast<u32>(strlen(kSecondExpected)));
     CHECK_EQ(memcmp(response, kSecondExpected, response_len), 0);
 
-    for (u32 waited = 0;
-         waited < 600 && backend.request_count.load(std::memory_order_acquire) < 2;
+    for (u32 waited = 0; waited < 600 && backend.request_count.load(std::memory_order_acquire) < 2;
          waited++)
         usleep(5000);
     REQUIRE_EQ(backend.accepted_count.load(std::memory_order_acquire), 2u);
@@ -21435,8 +21329,7 @@ TEST(route, public_paired_head_source_incomplete_then_eof_reuses_downstream_iour
     using namespace rut;
     if (!iouring_socket_live()) SKIP("io_uring async socket ops unavailable in this environment");
     using GateState = RecordingUpstream::FirstResponseCloseGateState;
-    static constexpr char kIncompleteOrigin[] =
-        "HTTP/1.1 200 OK\r\nContent-Length: 7\r\n";
+    static constexpr char kIncompleteOrigin[] = "HTTP/1.1 200 OK\r\nContent-Length: 7\r\n";
     static constexpr char kSecondOrigin[] =
         "HTTP/1.1 200 OK\r\nServer: origin\r\n"
         "Date: Tue, 01 Jan 2030 00:00:00 GMT\r\n"
@@ -21510,10 +21403,9 @@ TEST(route, public_paired_head_source_incomplete_then_eof_reuses_downstream_iour
 
     REQUIRE(send_all(client.fd, kRequest1, sizeof(kRequest1) - 1));
     for (u32 waited = 0;
-         waited < 600 &&
-         (backend.first_response_close_gate_state.load(std::memory_order_acquire) ==
-              GateState::Idle ||
-          backend.request_count.load(std::memory_order_acquire) < 1);
+         waited < 600 && (backend.first_response_close_gate_state.load(std::memory_order_acquire) ==
+                              GateState::Idle ||
+                          backend.request_count.load(std::memory_order_acquire) < 1);
          waited++)
         usleep(5000);
     REQUIRE_EQ(backend.first_response_close_gate_state.load(std::memory_order_acquire),
@@ -21522,12 +21414,12 @@ TEST(route, public_paired_head_source_incomplete_then_eof_reuses_downstream_iour
     REQUIRE_EQ(backend.request_count.load(std::memory_order_acquire), 1u);
 
     char expected_request[256]{};
-    const int expected_request_len = snprintf(
-        expected_request,
-        sizeof(expected_request),
-        "HEAD /head?incomplete=1 HTTP/1.1\r\nHost: 127.0.0.1:%u\r\n"
-        "X-Test: partial\r\n\r\n",
-        backend.port);
+    const int expected_request_len =
+        snprintf(expected_request,
+                 sizeof(expected_request),
+                 "HEAD /head?incomplete=1 HTTP/1.1\r\nHost: 127.0.0.1:%u\r\n"
+                 "X-Test: partial\r\n\r\n",
+                 backend.port);
     REQUIRE_GT(expected_request_len, 0);
     REQUIRE_EQ(backend.request_history_len[0], static_cast<u32>(expected_request_len));
     CHECK_EQ(memcmp(backend.request_history[0], expected_request, expected_request_len), 0);
@@ -21540,9 +21432,8 @@ TEST(route, public_paired_head_source_incomplete_then_eof_reuses_downstream_iour
                GateState::SentOpenWaitingGate);
     backend.allow_first_response_close.store(true, std::memory_order_release);
     for (u32 waited = 0;
-         waited < 600 &&
-         backend.first_response_close_gate_state.load(std::memory_order_acquire) ==
-             GateState::SentOpenWaitingGate;
+         waited < 600 && backend.first_response_close_gate_state.load(std::memory_order_acquire) ==
+                             GateState::SentOpenWaitingGate;
          waited++)
         usleep(5000);
     REQUIRE_EQ(backend.first_response_close_gate_state.load(std::memory_order_acquire),
@@ -21550,22 +21441,19 @@ TEST(route, public_paired_head_source_incomplete_then_eof_reuses_downstream_iour
 
     char response[1024]{};
     u32 response_len = 0;
-    REQUIRE(read_public_head_response(
-        client.fd, false, response, sizeof(response), response_len));
+    REQUIRE(read_public_head_response(client.fd, false, response, sizeof(response), response_len));
     REQUIRE(normalize_public_date(response, response_len));
     REQUIRE_EQ(response_len, static_cast<u32>(strlen(kFirstExpected)));
     CHECK_EQ(memcmp(response, kFirstExpected, response_len), 0);
 
     REQUIRE(send_all(client.fd, kRequest2, sizeof(kRequest2) - 1));
     memset(response, 0, sizeof(response));
-    REQUIRE(read_public_head_response(
-        client.fd, true, response, sizeof(response), response_len));
+    REQUIRE(read_public_head_response(client.fd, true, response, sizeof(response), response_len));
     REQUIRE(normalize_public_date(response, response_len));
     REQUIRE_EQ(response_len, static_cast<u32>(strlen(kSecondExpected)));
     CHECK_EQ(memcmp(response, kSecondExpected, response_len), 0);
 
-    for (u32 waited = 0;
-         waited < 600 && backend.request_count.load(std::memory_order_acquire) < 2;
+    for (u32 waited = 0; waited < 600 && backend.request_count.load(std::memory_order_acquire) < 2;
          waited++)
         usleep(5000);
     REQUIRE_EQ(backend.accepted_count.load(std::memory_order_acquire), 2u);
@@ -21631,8 +21519,7 @@ TEST(route, public_paired_head_source_connect_failure) {
     REQUIRE(send_all(client.fd, kRequest1, sizeof(kRequest1) - 1));
     char response[1024]{};
     u32 response_len = 0;
-    REQUIRE(read_public_head_response(
-        client.fd, false, response, sizeof(response), response_len));
+    REQUIRE(read_public_head_response(client.fd, false, response, sizeof(response), response_len));
     REQUIRE(normalize_public_date(response, response_len));
     REQUIRE_EQ(response_len, static_cast<u32>(strlen(kKeepAliveExpected)));
     CHECK_EQ(memcmp(response, kKeepAliveExpected, response_len), 0);

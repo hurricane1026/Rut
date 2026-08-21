@@ -1142,20 +1142,18 @@ struct Builder {
         if (!val_has_type(upstream, TypeKind::I32) && !val_has_type(upstream, TypeKind::U32))
             return err(RirError::InvalidState);
         if (request_policy != kNoValue &&
-            (!valid_val(request_policy) ||
-             (!val_has_type(request_policy, TypeKind::I32) &&
-              !val_has_type(request_policy, TypeKind::U32) &&
-              !val_has_type(request_policy, TypeKind::I64) &&
-              !val_has_type(request_policy, TypeKind::U64))))
+            (!valid_val(request_policy) || (!val_has_type(request_policy, TypeKind::I32) &&
+                                            !val_has_type(request_policy, TypeKind::U32) &&
+                                            !val_has_type(request_policy, TypeKind::I64) &&
+                                            !val_has_type(request_policy, TypeKind::U64))))
             return err(RirError::InvalidState);
         if (response_policy != kNoValue && request_policy == kNoValue)
             return err(RirError::InvalidState);
         if (response_policy != kNoValue &&
-            (!valid_val(response_policy) ||
-             (!val_has_type(response_policy, TypeKind::I32) &&
-              !val_has_type(response_policy, TypeKind::U32) &&
-              !val_has_type(response_policy, TypeKind::I64) &&
-              !val_has_type(response_policy, TypeKind::U64))))
+            (!valid_val(response_policy) || (!val_has_type(response_policy, TypeKind::I32) &&
+                                             !val_has_type(response_policy, TypeKind::U32) &&
+                                             !val_has_type(response_policy, TypeKind::I64) &&
+                                             !val_has_type(response_policy, TypeKind::U64))))
             return err(RirError::InvalidState);
         auto r = TRY(emit(Opcode::RetForward, nullptr, loc));
         r.inst->operands[0] = upstream;

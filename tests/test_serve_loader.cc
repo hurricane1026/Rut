@@ -72,10 +72,12 @@ TEST(serve_loader, omitted_method_route_registers_any_key_and_preserves_specific
         const char* name;
         const char* source;
     } cases[] = {
-        {"any_first", "route \"/\" { return 200 }\n"
-                      "route GET \"/\" { return 201 }\n"},
-        {"get_first", "route GET \"/\" { return 201 }\n"
-                      "route \"/\" { return 200 }\n"},
+        {"any_first",
+         "route \"/\" { return 200 }\n"
+         "route GET \"/\" { return 201 }\n"},
+        {"get_first",
+         "route GET \"/\" { return 201 }\n"
+         "route \"/\" { return 200 }\n"},
     };
     for (const auto& tc : cases) {
         const std::string dir = std::string("/tmp/rut_serve_loader_any_method/") + tc.name;
@@ -87,14 +89,14 @@ TEST(serve_loader, omitted_method_route_registers_any_key_and_preserves_specific
         REQUIRE_EQ(program.config.route_count, 2u);
 
         const char root[] = "/";
-        const RouteEntry* get = program.config.match(
-            reinterpret_cast<const u8*>(root), 1, kRouteMethodGet);
-        const RouteEntry* post = program.config.match(
-            reinterpret_cast<const u8*>(root), 1, kRouteMethodPost);
-        const RouteEntry* trace = program.config.match(
-            reinterpret_cast<const u8*>(root), 1, kRouteMethodTrace);
-        const RouteEntry* connect = program.config.match(
-            reinterpret_cast<const u8*>(root), 1, kRouteMethodConnect);
+        const RouteEntry* get =
+            program.config.match(reinterpret_cast<const u8*>(root), 1, kRouteMethodGet);
+        const RouteEntry* post =
+            program.config.match(reinterpret_cast<const u8*>(root), 1, kRouteMethodPost);
+        const RouteEntry* trace =
+            program.config.match(reinterpret_cast<const u8*>(root), 1, kRouteMethodTrace);
+        const RouteEntry* connect =
+            program.config.match(reinterpret_cast<const u8*>(root), 1, kRouteMethodConnect);
         REQUIRE(get != nullptr);
         REQUIRE(post != nullptr);
         REQUIRE(trace != nullptr);
