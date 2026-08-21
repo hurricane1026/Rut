@@ -347,7 +347,8 @@ add_test(NAME test_shard_control COMMAND test_shard_control)
 set_tests_properties(test_shard_control PROPERTIES LABELS "unit")
 
 if(RUT_ENABLE_JIT)
-    add_executable(test_nginx_differential test_nginx_differential.cc)
+    add_executable(test_nginx_differential test_nginx_differential.cc
+                   ${PROJECT_SOURCE_DIR}/src/placement_new.cc)
     target_link_libraries(test_nginx_differential PRIVATE rut_nginx Threads::Threads)
     target_include_directories(test_nginx_differential PRIVATE
         ${PROJECT_SOURCE_DIR}/include

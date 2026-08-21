@@ -774,7 +774,10 @@ static bool log_contains(const std::string& path, const char* needle) {
     return contents.find(needle) != std::string::npos;
 }
 
-static bool log_count(const std::string& path, const char* needle, u32& count) {
+static bool log_count_line_with(const std::string& path,
+                                const char* marker,
+                                const char* context,
+                                u32& count) {
     const int fd = open(path.c_str(), O_RDONLY);
     if (fd < 0) return false;
     std::string contents;
@@ -796,13 +799,17 @@ static bool log_count(const std::string& path, const char* needle, u32& count) {
     }
     close(fd);
     count = 0;
-    const std::string target(needle);
-    if (target.empty()) return false;
-    for (size_t pos = 0;;) {
-        pos = contents.find(target, pos);
-        if (pos == std::string::npos) break;
-        count++;
-        pos += target.size();
+    const std::string marker_text(marker);
+    const std::string context_text(context);
+    if (marker_text.empty() || context_text.empty()) return false;
+    for (size_t line_start = 0;;) {
+        const size_t line_end = contents.find('\n', line_start);
+        if (line_end == std::string::npos) break;
+        const std::string line = contents.substr(line_start, line_end - line_start);
+        if (line.find(marker_text) != std::string::npos &&
+            line.find(context_text) != std::string::npos)
+            count++;
+        line_start = line_end + 1;
     }
     return true;
 }
@@ -1071,10 +1078,12 @@ static bool capture_head_gateway_case(u16 frontend_port,
 
     const bool nginx_stopped = stop_child(nginx.child);
     const bool container_removed = docker.remove();
-    u32 connect_failure_count = 0;
-    const bool log_readable = log_count(nginx_log_path, "connect() failed", connect_failure_count);
     const std::string upstream_context = "127.0.0.1:" + std::to_string(backend_port);
-    const bool has_upstream_context = log_contains(nginx_log_path, upstream_context.c_str());
+    u32 connect_failure_record_count = 0;
+    const bool log_readable = log_count_line_with(nginx_log_path,
+                                                  "connect() failed",
+                                                  upstream_context.c_str(),
+                                                  connect_failure_record_count);
     if (!nginx_stopped) {
         error = "failed to stop nginx after HEAD gateway case";
         return false;
@@ -1083,8 +1092,8 @@ static bool capture_head_gateway_case(u16 frontend_port,
         error = "docker rm -f failed after HEAD gateway case";
         return false;
     }
-    if (!log_readable || connect_failure_count != 1 || !has_upstream_context) {
-        error = "HEAD gateway log did not contain exactly one pinned upstream connect failure";
+    if (!log_readable || connect_failure_record_count != 1) {
+        error = "HEAD gateway log did not contain exactly one line-scoped pinned upstream connect failure";
         return false;
     }
 
