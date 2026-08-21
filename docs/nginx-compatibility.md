@@ -97,11 +97,12 @@ Allowed states are `SUPPORTED`, `PARTIAL`, `BLOCKED_BY_RUT`,
   while the current completion sends the exact request to a real peer. Two real
   active-health probes additionally prove production begin/terminal retirement,
   same-slot/same-fd reprobe, stale-completion isolation, and a current-token wire
-  control. A literal #262 acceptance audit still requires a non-vacuous active-
-  episode quiesce regression plus raw stale send/connect readiness across
-  production detach/reuse, so #262 stays open. This transport work alone does not
-  imply keep-alive HEAD support; cancellation/drain lifecycle and the remaining
-  #253 response semantics are still required.
+  control. A production-owned active-episode regression now also proves upstream
+  quiesce removes genuine HUP readiness while owner/token/map remain current, then
+  retires cleanly. A literal #262 acceptance audit still requires captured raw
+  send/connect readiness across production detach/reuse, so #262 stays open. This
+  transport work alone does not imply keep-alive HEAD support; cancellation/drain
+  lifecycle and the remaining #253 response semantics are still required.
 - The first request-policy slice rejects body/framing inputs (including
   `Content-Length` and every `Transfer-Encoding` value), HTTP/2, and
   non-origin-form targets before upstream connect. These are intentional
