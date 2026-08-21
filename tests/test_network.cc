@@ -11597,15 +11597,18 @@ Connection* track_single_health_probe(RealEpollEpisodeGuard& guard,
                                       u16 upstream_idx,
                                       u32 backend_idx) {
     Connection* found = nullptr;
+    u32 match_count = 0;
+    bool all_tracked = true;
     for (u32 i = 0; i < EpollEventLoop::kMaxConns; i++) {
         Connection& conn = guard.loop->conns[i];
         if (!conn.is_health_probe || conn.upstream_idx != upstream_idx ||
             conn.upstream_backend_idx != backend_idx)
             continue;
-        if (found != nullptr) return nullptr;
-        found = &conn;
+        if (found == nullptr) found = &conn;
+        match_count++;
+        if (!guard.track_conn(conn)) all_tracked = false;
     }
-    return found != nullptr && guard.track_conn(*found) ? found : nullptr;
+    return match_count == 1 && all_tracked ? found : nullptr;
 }
 
 bool recv_exact_from_real_peer(i32 fd, char* dst, u32 len) {
