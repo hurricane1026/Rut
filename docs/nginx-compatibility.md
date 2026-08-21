@@ -58,7 +58,11 @@ Allowed states are `SUPPORTED`, `PARTIAL`, `BLOCKED_BY_RUT`,
 - Pinned nginx also suppresses the 157-byte generated 502 body for an
   explicit-close HEAD when the single upstream connect fails, while retaining
   `Content-Length: 157`. Current RUT failure-policy serialization does not yet
-  express that behavior.
+  express that behavior. The reviewed RUT design adds an explicit shared HEAD
+  disposition to response and failure policies: legacy policies remain
+  `Reject`, mismatched dispositions fail before body waiting/upstream effects,
+  and only a paired `SuppressBody` selection may enter the future bounded
+  header-only connect-failure path. No public source/converter claim exists yet.
 - The first request-policy slice rejects body/framing inputs (including
   `Content-Length` and every `Transfer-Encoding` value), HTTP/2, and
   non-origin-form targets before upstream connect. These are intentional
