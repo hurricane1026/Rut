@@ -25,6 +25,7 @@
 #include <unistd.h>
 
 using rut::test_fault::ScopedFakeSocket;
+using rut::test_fault::ScopedIoFault;
 using rut::test_fault::ScopedMemoryFault;
 using rut::test_fault::ScopedRecvData;
 using rut::test_fault::ScopedSyscallFault;
@@ -11084,6 +11085,68 @@ TEST(epoll_episode_lifecycle, already_unregistered_del_is_reusable) {
     close(detached_fd);
     close(fds[1]);
     backend.shutdown();
+}
+
+TEST(epoll_episode_lifecycle, unexpected_del_and_close_failure_quarantines_slot) {
+    auto* loop = create_real_loop();
+    REQUIRE(loop != nullptr);
+    REQUIRE(loop->init(0, -1, 0).has_value());
+
+    i32 fds[2] = {-1, -1};
+    REQUIRE_EQ(socketpair(AF_UNIX, SOCK_STREAM | SOCK_NONBLOCK, 0, fds), 0);
+    auto* conn = loop->alloc_conn();
+    REQUIRE(conn != nullptr);
+    const u32 cid = conn->id;
+    conn->upstream_episode = 1;
+    REQUIRE(loop->begin_upstream_episode(*conn));
+    conn->upstream_fd = fds[0];
+    REQUIRE(loop->backend.add_recv_upstream(fds[0], cid, conn->upstream_episode));
+
+    SyscallFaultConfig del_fault;
+    del_fault.epoll_ctl_errno = EINVAL;
+    del_fault.epoll_ctl_failures = 1;
+    auto close_fault = rut::test_fault::io_fault_for_fd(fds[0]);
+    close_fault.close_errno = EINTR;
+    close_fault.close_failures = 1;
+    i32 detached_fd = 123;
+    {
+        ScopedIoFault close_scope(close_fault);
+        ScopedSyscallFault del_scope(del_fault);
+        CHECK_FALSE(loop->detach_upstream_for_pool(*conn, detached_fd));
+    }
+
+    CHECK_EQ(detached_fd, -1);
+    CHECK_EQ(conn->upstream_fd, -1);
+    CHECK_EQ(loop->backend.upstream_fd_map[cid], -1);
+    CHECK_EQ(loop->backend.active_upstream_episode[cid],
+             EpollBackend::kUpstreamEpisodeExhausted);
+    CHECK_EQ(conn->upstream_episode, 1u);
+    CHECK_GE(fcntl(fds[0], F_GETFD), 0);
+
+    // A later fd-less cleanup must not retire the quarantined owner or expose
+    // the consumed descriptor to a pool caller.
+    i32 second_detached_fd = 456;
+    CHECK_FALSE(loop->detach_upstream_for_pool(*conn, second_detached_fd));
+    CHECK_EQ(second_detached_fd, -1);
+    CHECK_EQ(loop->backend.active_upstream_episode[cid],
+             EpollBackend::kUpstreamEpisodeExhausted);
+    CHECK_EQ(conn->upstream_episode, 1u);
+
+    loop->free_conn(*conn);
+    auto* reused = loop->alloc_conn();
+    REQUIRE(reused != nullptr);
+    CHECK_EQ(reused->id, cid);
+    CHECK_EQ(loop->backend.active_upstream_episode[cid],
+             EpollBackend::kUpstreamEpisodeExhausted);
+    CHECK_FALSE(loop->begin_upstream_episode(*reused));
+    loop->free_conn(*reused);
+
+    // The injected close failure treats the descriptor as consumed, but this
+    // test still owns the raw fd and can release it after the fault scope.
+    close(fds[0]);
+    close(fds[1]);
+    loop->shutdown();
+    destroy_real_loop(loop);
 }
 
 TEST(epoll_episode_lifecycle, max_token_quarantines_without_wrap) {

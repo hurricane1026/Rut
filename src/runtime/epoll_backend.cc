@@ -393,6 +393,16 @@ bool EpollBackend::detach_upstream(Connection& conn, i32* detached_fd) {
         close_failed = (::close(fd) < 0);
     }
 
+    // DEL failed and close also failed: the kernel registration may still be
+    // live, while the numeric descriptor may be reused by unrelated code.
+    // The descriptor is consumed by this cleanup attempt; do not retry close
+    // and do not leave ownership eligible for a later fd-less detach. The
+    // quarantine is intentionally sticky until the backend is rebuilt, and a
+    // close failure may leave the descriptor leaked by the injected/observed
+    // contract.
+    if (close_failed && conn.id < kMaxFdMap)
+        active_upstream_episode[conn.id] = kUpstreamEpisodeExhausted;
+
     const bool retired =
         !close_failed && retire_upstream_episode_after_detach(conn, expected_episode);
     const bool reusable = del_ok && retired;
