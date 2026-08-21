@@ -719,6 +719,76 @@ static Connection* setup_target_transform_request(SmallLoop& loop,
     return conn;
 }
 
+TEST(response_policy, target_transform_bundle_suppress_body_fails_before_materialization) {
+    SmallLoop loop;
+    loop.setup();
+    RouteConfig cfg{};
+    REQUIRE(cfg.add_upstream("backend", 0x7F000001, 8080).has_value());
+    char strip[] = "/api/";
+    char replace[] = "/v1/";
+    REQUIRE_EQ(cfg.add_target_transform({{strip, 5}, {replace, 4}}), 1u);
+
+    static constexpr char kServer[] = "server";
+    static constexpr char kReason[] = "Bad Gateway";
+    static constexpr char kType[] = "text/plain";
+    static constexpr char kBody[] = "unavailable";
+    ForwardResponsePolicySpec response{};
+    response.version = ResponsePolicyVersion::Http11;
+    response.framing = ResponsePolicyFraming::ContentLength;
+    response.connection = ResponsePolicyConnection::Request;
+    response.date = ResponsePolicyDate::Current;
+    response.head_mode = ResponsePolicyHeadMode::SuppressBody;
+    response.server = {kServer, sizeof(kServer) - 1};
+    REQUIRE_EQ(cfg.add_response_policy(response), 1u);
+
+    ForwardFailurePolicySpec failure{};
+    failure.version = ForwardFailurePolicyVersion::Http11;
+    failure.status_code = 502;
+    failure.date = ForwardFailurePolicyDate::Current;
+    failure.connection = ForwardFailurePolicyConnection::Request;
+    failure.reason = {kReason, sizeof(kReason) - 1};
+    failure.content_type = {kType, sizeof(kType) - 1};
+    failure.server = {kServer, sizeof(kServer) - 1};
+    failure.body = {kBody, sizeof(kBody) - 1};
+    REQUIRE_EQ(cfg.add_failure_policy(failure), 1u);
+    REQUIRE_EQ(cfg.add_policy_bundle(1, 1), 1u);
+    CHECK_EQ(cfg.policy_bundles[0].response_policy_id, 1u);
+    CHECK_EQ(cfg.policy_bundles[0].failure_policy_id, 1u);
+
+    const char request[] = "GET /api/x?tag=a%2Fb HTTP/1.1\r\nHost: client\r\n\r\n";
+    const u32 request_len = sizeof(request) - 1;
+    for (const bool use_bundle : {false, true}) {
+        auto* conn = setup_target_transform_request(loop, cfg, request, request_len);
+        REQUIRE(conn != nullptr);
+        const u32 before_len = conn->recv_buf.len();
+        u8 before[SmallLoop::kBufSize];
+        __builtin_memcpy(before, conn->recv_buf.data(), before_len);
+
+        JitDispatchOutcome outcome{};
+        outcome.kind = JitDispatchOutcome::Kind::Forward;
+        outcome.upstream_id = 0;
+        if (use_bundle)
+            outcome.policy_bundle_id = 1;
+        else
+            outcome.response_policy_id = 1;
+        loop.backend.clear_ops();
+        handle_jit_outcome<SmallLoop>(&loop, *conn, outcome, nullptr, true);
+
+        CHECK_EQ(conn->resp_status, 400u);
+        CHECK_EQ(conn->upstream_fd, -1);
+        CHECK_FALSE(conn->upstream_slot_held);
+        CHECK_EQ(loop.backend.count_ops(MockOp::Connect), 0u);
+        CHECK_EQ(loop.backend.count_ops(MockOp::Send), 1u);
+        CHECK_EQ(conn->recv_buf.len(), before_len);
+        CHECK_EQ(__builtin_memcmp(conn->recv_buf.data(), before, before_len), 0);
+        CHECK(conn->target_transform_recorded);
+        CHECK_EQ(conn->target_transform_id, 1u);
+        CHECK_FALSE(conn->req_path_overridden);
+        CHECK_FALSE(conn->upstream_send_armed);
+        loop.free_conn(*conn);
+    }
+}
+
 TEST(target_transform, h1_materializes_clean_origin_form_and_preserves_query) {
     SmallLoop loop;
     loop.setup();
