@@ -11519,6 +11519,13 @@ private:
     }
 };
 
+struct ScopedBackendHealthReset {
+    ScopedBackendHealthReset() { reset_backend_health(); }
+    ScopedBackendHealthReset(const ScopedBackendHealthReset&) = delete;
+    ScopedBackendHealthReset& operator=(const ScopedBackendHealthReset&) = delete;
+    ~ScopedBackendHealthReset() { reset_backend_health(); }
+};
+
 struct EpollEpisodeSocketGuard {
     EpollBackend* backend;
     i32* fds;
@@ -11702,6 +11709,173 @@ TEST(epoll_episode_lifecycle, pooled_same_fd_stale_raw_readiness_is_fenced_befor
     CHECK_EQ(errno, EBADF);
     CHECK_EQ(upstream_pool.idle_count.load(std::memory_order_acquire), 0u);
     CHECK_EQ(upstream_pool.free_top, UpstreamPool::kMaxConns);
+}
+
+TEST(epoll_episode_lifecycle, failed_connect_retry_retires_before_replacement_begin) {
+    ScopedBackendHealthReset health_reset{};
+    RouteConfig cfg{};
+    const RouteConfig* active = &cfg;
+    RealEpollEpisodeGuard guard{};
+    REQUIRE(guard.create());
+    REQUIRE(guard.init());
+    auto* loop = guard.loop;
+
+    auto listener_result = create_listen_socket(0);
+    REQUIRE(listener_result.has_value());
+    guard.listener_fd = listener_result.value();
+    const i32 listener_fd = guard.listener_fd;
+    const u16 listener_port = get_port(listener_fd);
+
+    auto upstream_id = cfg.add_upstream("retry", 0x7F000001, listener_port);
+    REQUIRE(upstream_id.has_value());
+    REQUIRE(cfg.add_upstream_backend(upstream_id.value(), 0x7F000001, listener_port));
+    REQUIRE(cfg.add_proxy("/api", 0, upstream_id.value()));
+    loop->config_ptr = &active;
+
+    auto* conn = guard.alloc_conn();
+    REQUIRE(conn != nullptr);
+    const u32 conn_id = conn->id;
+    const u32 first_episode = conn->upstream_episode;
+    REQUIRE_EQ(first_episode, 1u);
+    conn->state = ConnState::ReadingHeader;
+    conn->keep_alive = true;
+    conn->on_recv = &on_header_received<EpollEventLoop>;
+    loop->timer.add(conn, loop->keepalive_timeout);
+
+    static constexpr char kRequest[] = "GET /api HTTP/1.1\r\nHost: x\r\n\r\n";
+    REQUIRE_EQ(conn->recv_buf.write(reinterpret_cast<const u8*>(kRequest), sizeof(kRequest) - 1),
+               sizeof(kRequest) - 1);
+
+    // Only the initial request dispatch is faulted. The first production
+    // create_socket() therefore gets a real descriptor, but its connect queues a
+    // real epoll-backend failure completion. The retry runs after this scope.
+    rut::test_fault::IoFaultConfig connect_fault{};
+    connect_fault.fd = rut::test_fault::kMatchAllIoFds;
+    connect_fault.connect_errno = ECONNREFUSED;
+    connect_fault.connect_failures = 1;
+    {
+        ScopedIoFault fault_scope(connect_fault);
+        loop->dispatch(make_ev(conn_id, IoEventType::Recv, sizeof(kRequest) - 1));
+        REQUIRE_EQ(fault_scope.remaining_connect_failures(), 0);
+    }
+
+    const u8 first_backend = conn->upstream_backend_idx;
+    REQUIRE_LT(first_backend, 2u);
+    BackendHealth* first_health = backend_health(upstream_id.value(), first_backend);
+    BackendHealth* other_health = backend_health(upstream_id.value(), first_backend ^ 1u);
+    REQUIRE(first_health != nullptr);
+    REQUIRE(other_health != nullptr);
+    CHECK_EQ(first_health->fails, 0u);
+    CHECK_EQ(first_health->eject_until_us, 0u);
+    CHECK_FALSE(first_health->active_down);
+    CHECK_EQ(other_health->fails, 0u);
+    CHECK_EQ(other_health->eject_until_us, 0u);
+    CHECK_FALSE(other_health->active_down);
+
+    IoEvent first_failure{};
+    REQUIRE(wait_for_real_upstream_completion(*loop, first_failure));
+    REQUIRE_EQ(first_failure.type, IoEventType::UpstreamConnect);
+    REQUIRE_EQ(first_failure.result, -ECONNREFUSED);
+    REQUIRE_EQ(first_failure.conn_id, conn_id);
+    REQUIRE_EQ(first_failure.upstream_episode, first_episode);
+    const i32 first_fd = conn->upstream_fd;
+    REQUIRE_GE(first_fd, 0);
+    CHECK_EQ(conn->upstream_attempts, 1u);
+    CHECK_EQ(conn->upstream_episode, first_episode);
+    CHECK_EQ(loop->backend.active_upstream_episode[conn_id], first_episode);
+    CHECK_EQ(loop->backend.upstream_fd_map[conn_id], first_fd);
+    CHECK_EQ(conn->on_upstream_send, &on_upstream_connected<EpollEventLoop>);
+
+    // This is the production failure callback: record passive health, detach and
+    // retire episode 1, then begin and submit episode 2 on the same Connection.
+    loop->dispatch(first_failure);
+    const u32 second_episode = conn->upstream_episode;
+    REQUIRE_EQ(conn->id, conn_id);
+    REQUIRE_EQ(second_episode, first_episode + 1);
+    REQUIRE_EQ(conn->upstream_attempts, 2u);
+    const u8 second_backend = conn->upstream_backend_idx;
+    REQUIRE_LT(second_backend, 2u);
+    REQUIRE_NE(second_backend, first_backend);
+    const i32 second_fd = conn->upstream_fd;
+    REQUIRE_GE(second_fd, 0);
+    CHECK_EQ(second_fd, first_fd);
+    CHECK_EQ(loop->backend.active_upstream_episode[conn_id], second_episode);
+    CHECK_EQ(loop->backend.upstream_fd_map[conn_id], second_fd);
+    CHECK_EQ(conn->on_upstream_send, &on_upstream_connected<EpollEventLoop>);
+    CHECK_FALSE(conn->upstream_recv_armed);
+    CHECK_FALSE(conn->upstream_send_armed);
+    const auto& replacement_send_state = loop->backend.upstream_send_state[conn_id];
+    CHECK_EQ(replacement_send_state.src, nullptr);
+    CHECK_EQ(replacement_send_state.fd, -1);
+    CHECK_EQ(replacement_send_state.offset, 0u);
+    CHECK_EQ(replacement_send_state.remaining, 0u);
+    CHECK_EQ(replacement_send_state.upstream_episode, 0u);
+    CHECK_EQ(first_health->fails, 1u);
+    CHECK_EQ(first_health->eject_until_us, 0u);
+    CHECK_FALSE(first_health->active_down);
+    CHECK_EQ(other_health->fails, 0u);
+
+    REQUIRE(accept_real_upstream_peer(listener_fd, guard.peer_fds[0]));
+    IoEvent second_success{};
+    REQUIRE(wait_for_real_upstream_completion(*loop, second_success));
+    REQUIRE_EQ(second_success.type, IoEventType::UpstreamConnect);
+    REQUIRE_EQ(second_success.result, 0);
+    REQUIRE_EQ(second_success.conn_id, conn_id);
+    REQUIRE_EQ(second_success.upstream_episode, second_episode);
+
+    // A saved episode-1 completion cannot re-enter the retry callback after the
+    // slot has moved to episode 2. Snapshot every externally-visible transition
+    // point, then prove both the Connection and passive health stay unchanged.
+    const u8 attempts_before_stale = conn->upstream_attempts;
+    const u8 backend_before_stale = conn->upstream_backend_idx;
+    const u16 status_before_stale = conn->resp_status;
+    const i32 fd_before_stale = conn->upstream_fd;
+    const i32 map_before_stale = loop->backend.upstream_fd_map[conn_id];
+    const u32 owner_before_stale = loop->backend.active_upstream_episode[conn_id];
+    const u32 token_before_stale = conn->upstream_episode;
+    const auto callback_before_stale = conn->on_upstream_send;
+    const BackendHealth first_health_before_stale = *first_health;
+    const BackendHealth other_health_before_stale = *other_health;
+
+    loop->dispatch(first_failure);
+    CHECK_EQ(conn->upstream_attempts, attempts_before_stale);
+    CHECK_EQ(conn->upstream_backend_idx, backend_before_stale);
+    CHECK_EQ(conn->resp_status, status_before_stale);
+    CHECK_EQ(conn->upstream_fd, fd_before_stale);
+    CHECK_EQ(loop->backend.upstream_fd_map[conn_id], map_before_stale);
+    CHECK_EQ(loop->backend.active_upstream_episode[conn_id], owner_before_stale);
+    CHECK_EQ(conn->upstream_episode, token_before_stale);
+    CHECK_EQ(conn->on_upstream_send, callback_before_stale);
+    CHECK_EQ(first_health->fails, first_health_before_stale.fails);
+    CHECK_EQ(first_health->eject_until_us, first_health_before_stale.eject_until_us);
+    CHECK_EQ(first_health->active_down, first_health_before_stale.active_down);
+    CHECK_EQ(other_health->fails, other_health_before_stale.fails);
+    CHECK_EQ(other_health->eject_until_us, other_health_before_stale.eject_until_us);
+    CHECK_EQ(other_health->active_down, other_health_before_stale.active_down);
+    struct pollfd unexpected_retry{listener_fd, POLLIN, 0};
+    CHECK_EQ(poll(&unexpected_retry, 1, 0), 0);
+
+    // The current success is the positive control: production advances to the
+    // request-send callbacks and the real peer receives the original bytes.
+    loop->dispatch(second_success);
+    CHECK_EQ(conn->state, ConnState::Proxying);
+    CHECK_EQ(conn->on_upstream_recv, &on_early_upstream_recvd_send_inflight<EpollEventLoop>);
+    CHECK_EQ(conn->on_upstream_send, &on_upstream_request_sent<EpollEventLoop>);
+
+    char observed[sizeof(kRequest) - 1]{};
+    u32 observed_len = 0;
+    while (observed_len < sizeof(observed)) {
+        struct pollfd readable{guard.peer_fds[0], POLLIN, 0};
+        REQUIRE_GT(poll(&readable, 1, 1000), 0);
+        const ssize_t nr = recv(guard.peer_fds[0],
+                                observed + observed_len,
+                                sizeof(observed) - observed_len,
+                                MSG_DONTWAIT);
+        REQUIRE_GT(nr, 0);
+        observed_len += static_cast<u32>(nr);
+    }
+    CHECK_EQ(observed_len, sizeof(kRequest) - 1);
+    CHECK_EQ(__builtin_memcmp(observed, kRequest, sizeof(kRequest) - 1), 0);
 }
 
 TEST(epoll_episode_lifecycle, recycled_slot_rejects_old_completion_before_dispatch_mutation) {
