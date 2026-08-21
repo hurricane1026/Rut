@@ -25,6 +25,83 @@ enum class IoEventType : u8 {
 static_assert(static_cast<u8>(IoEventType::Count) == 8u,
               "IoEventType should keep all runtime event tags and remain small");
 
+// Future upstream-event token layout in the existing 64-bit user_data budget:
+// [63:56] aux (8 bits) | [55:32] upstream episode (24 bits) |
+// [31:8] conn_id (24 bits) | [7:0] event type.
+// Non-upstream events retain the existing [63:32] full generation field. These
+// helpers are pure and deliberately unused by the transport in this foundation
+// slice. Episode zero is reserved; a future counter wraps max -> 1.
+inline constexpr u32 kIoUserDataMaxConnId = 0x00FFFFFFu;
+inline constexpr u32 kIoUserDataMaxUpstreamEpisode = 0x00FFFFFFu;
+inline constexpr u64 kInvalidIoUserData = ~static_cast<u64>(0);
+
+inline constexpr bool io_event_is_upstream(IoEventType type) {
+    return type == IoEventType::UpstreamConnect || type == IoEventType::UpstreamRecv ||
+           type == IoEventType::UpstreamSend;
+}
+
+struct UpstreamEventToken {
+    u32 conn_id = 0;
+    IoEventType type = IoEventType::Count;
+    u32 episode = 0;
+    u8 aux = 0;
+};
+
+struct NonUpstreamUserData {
+    u32 conn_id = 0;
+    IoEventType type = IoEventType::Count;
+    u32 generation = 0;
+};
+
+inline constexpr bool valid_upstream_event_token(const UpstreamEventToken& token) {
+    return token.conn_id <= kIoUserDataMaxConnId && io_event_is_upstream(token.type) &&
+           token.episode != 0 && token.episode <= kIoUserDataMaxUpstreamEpisode;
+}
+
+inline constexpr u64 encode_upstream_event_token(const UpstreamEventToken& token) {
+    if (!valid_upstream_event_token(token)) return kInvalidIoUserData;
+    return static_cast<u64>(static_cast<u8>(token.type)) |
+           (static_cast<u64>(token.conn_id) << 8) |
+           (static_cast<u64>(token.episode) << 32) |
+           (static_cast<u64>(token.aux) << 56);
+}
+
+inline constexpr bool decode_upstream_event_token(u64 data, UpstreamEventToken* out) {
+    if (out == nullptr) return false;
+    UpstreamEventToken token;
+    token.type = static_cast<IoEventType>(data & 0xFFu);
+    token.conn_id = static_cast<u32>((data >> 8) & kIoUserDataMaxConnId);
+    token.episode = static_cast<u32>((data >> 32) & kIoUserDataMaxUpstreamEpisode);
+    token.aux = static_cast<u8>(data >> 56);
+    if (!valid_upstream_event_token(token)) return false;
+    *out = token;
+    return true;
+}
+
+inline constexpr bool valid_non_upstream_user_data(const NonUpstreamUserData& value) {
+    return value.conn_id <= kIoUserDataMaxConnId &&
+           static_cast<u8>(value.type) < static_cast<u8>(IoEventType::Count) &&
+           !io_event_is_upstream(value.type);
+}
+
+inline constexpr u64 encode_non_upstream_user_data(const NonUpstreamUserData& value) {
+    if (!valid_non_upstream_user_data(value)) return kInvalidIoUserData;
+    return static_cast<u64>(static_cast<u8>(value.type)) |
+           (static_cast<u64>(value.conn_id) << 8) |
+           (static_cast<u64>(value.generation) << 32);
+}
+
+inline constexpr bool decode_non_upstream_user_data(u64 data, NonUpstreamUserData* out) {
+    if (out == nullptr) return false;
+    NonUpstreamUserData value;
+    value.type = static_cast<IoEventType>(data & 0xFFu);
+    value.conn_id = static_cast<u32>((data >> 8) & kIoUserDataMaxConnId);
+    value.generation = static_cast<u32>(data >> 32);
+    if (!valid_non_upstream_user_data(value)) return false;
+    *out = value;
+    return true;
+}
+
 // user_data aux tag marking a pause cancel's OWN completion (vs the recv CQE it
 // cancels, aux 0). Shared by the io_uring backend (sets it) and the event loop
 // (recognizes it via IoEvent::aux to re-arm only after the cancel has drained).
@@ -43,6 +120,7 @@ struct IoEvent {
     u8 more;     // non-zero if the SQE will produce more CQEs (multishot recv)
     u8 aux = 0;  // decoded user_data aux tag; kPauseCancelAux marks a pause cancel's
                  // own completion (distinct from the recv CQE it cancels)
+    u32 upstream_episode = 0;  // neutral until backend episode propagation is enabled
 };
 
 }  // namespace rut

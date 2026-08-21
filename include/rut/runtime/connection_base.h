@@ -429,6 +429,19 @@ struct ConnectionBase {
     // given slot is distinct (first use: 0 → 1; reuse: N → N+1; …).
     u32 handler_gen = 0;
 
+    // Reserved for upstream I/O episode fencing. Deliberately preserved by
+    // reset()/slot reuse; the transport slices will advance it before each
+    // upstream episode so stale completions cannot match a later episode.
+    u32 upstream_episode = 1;
+
+    u32 next_upstream_episode() {
+        if (upstream_episode == 0 || upstream_episode >= kIoUserDataMaxUpstreamEpisode)
+            upstream_episode = 1;
+        else
+            ++upstream_episode;
+        return upstream_episode;
+    }
+
     // Route config pinned for the lifetime of the current request. Set
     // in on_header_received from the loop's config pointer; referenced
     // by handle_jit_outcome (e.g., Forward upstream resolution) so a
@@ -784,6 +797,8 @@ struct ConnectionBase {
         // reset() so a stale YieldHeap entry whose target slot was
         // recycled reliably fails the generation match. It's
         // initialized at accept-time via EventLoop::alloc_conn_impl.
+        // upstream_episode follows the same persistence rule for the future
+        // upstream-event token contract and is intentionally not reset here.
         request_config = nullptr;
         listener_context = {};
         pending_handler_fn = nullptr;

@@ -15097,6 +15097,74 @@ TEST(state_invariant, iouring_user_data_preserves_full_timer_generation) {
     CHECK_EQ(aux, 0x80000000u);
 }
 
+TEST(state_invariant, upstream_event_token_layout_round_trips_and_separates_generations) {
+    for (const IoEventType type : {IoEventType::UpstreamConnect,
+                                   IoEventType::UpstreamRecv,
+                                   IoEventType::UpstreamSend}) {
+        for (const u8 aux : {static_cast<u8>(0), kPauseCancelAux, kLocalSubmitFailureAux}) {
+            for (const u32 conn_id : {0u, kIoUserDataMaxConnId}) {
+                for (const u32 episode : {1u, kIoUserDataMaxUpstreamEpisode}) {
+                    const UpstreamEventToken source{conn_id, type, episode, aux};
+                    const u64 data = encode_upstream_event_token(source);
+                    CHECK_NE(data, kInvalidIoUserData);
+                    UpstreamEventToken decoded;
+                    REQUIRE(decode_upstream_event_token(data, &decoded));
+                    CHECK_EQ(decoded.conn_id, conn_id);
+                    CHECK_EQ(static_cast<u8>(decoded.type), static_cast<u8>(type));
+                    CHECK_EQ(decoded.episode, episode);
+                    CHECK_EQ(decoded.aux, aux);
+                    NonUpstreamUserData wrong_domain;
+                    CHECK_FALSE(decode_non_upstream_user_data(data, &wrong_domain));
+                }
+            }
+        }
+    }
+
+    const NonUpstreamUserData timer{0x00FFFFFFu, IoEventType::HandlerTimer, 0xFFFFFFFFu};
+    const u64 timer_data = encode_non_upstream_user_data(timer);
+    CHECK_NE(timer_data, kInvalidIoUserData);
+    NonUpstreamUserData decoded_timer;
+    REQUIRE(decode_non_upstream_user_data(timer_data, &decoded_timer));
+    CHECK_EQ(decoded_timer.conn_id, timer.conn_id);
+    CHECK_EQ(static_cast<u8>(decoded_timer.type), static_cast<u8>(timer.type));
+    CHECK_EQ(decoded_timer.generation, timer.generation);
+    UpstreamEventToken wrong_domain;
+    CHECK_FALSE(decode_upstream_event_token(timer_data, &wrong_domain));
+
+    CHECK_EQ(encode_upstream_event_token({0, IoEventType::UpstreamRecv, 0, 0}),
+             kInvalidIoUserData);
+    CHECK_EQ(encode_upstream_event_token(
+                 {0x01000000u, IoEventType::UpstreamRecv, 1, 0}),
+             kInvalidIoUserData);
+    CHECK_EQ(encode_upstream_event_token(
+                 {0, IoEventType::UpstreamRecv, 0x01000000u, 0}),
+             kInvalidIoUserData);
+    CHECK_EQ(encode_upstream_event_token({0, IoEventType::Recv, 1, 0}), kInvalidIoUserData);
+    CHECK_EQ(encode_non_upstream_user_data({0, IoEventType::UpstreamRecv, 0}),
+             kInvalidIoUserData);
+}
+
+TEST(state_invariant, upstream_episode_wraps_and_survives_connection_reset) {
+    ConnectionBase conn{};
+    conn.upstream_episode = kIoUserDataMaxUpstreamEpisode;
+    conn.fd = 42;
+    conn.handler_gen = 9;
+    conn.reset();
+    CHECK_EQ(conn.upstream_episode, kIoUserDataMaxUpstreamEpisode);
+    CHECK_EQ(conn.fd, -1);
+    CHECK_EQ(conn.handler_gen, 9u);
+
+    CHECK_EQ(conn.next_upstream_episode(), 1u);
+    CHECK_EQ(conn.upstream_episode, 1u);
+    conn.reset();
+    CHECK_EQ(conn.upstream_episode, 1u);
+
+    conn.upstream_episode = 17;
+    const u32 old_episode = conn.upstream_episode;
+    CHECK_EQ(conn.next_upstream_episode(), old_episode + 1u);
+    CHECK_EQ(conn.fd, -1);
+}
+
 TEST(state_invariant, stale_handler_timer_keeps_active_yield_armed) {
     AsyncSmallLoop loop;
     loop.setup();
