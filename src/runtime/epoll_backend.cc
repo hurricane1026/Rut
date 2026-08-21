@@ -351,7 +351,7 @@ bool EpollBackend::add_send_upstream(i32 fd, u32 conn_id, const u8* buf, u32 len
         rc = epoll_ctl(epoll_fd, EPOLL_CTL_ADD, fd, &ev);
     }
     if (rc < 0) {
-        const i32 registration_error = rc;
+        const i32 registration_error = -errno;
         if (conn_id < kMaxFdMap) {
             upstream_send_state[conn_id] = {nullptr, -1, 0, 0, IoEventType::UpstreamSend, false, 0};
         }

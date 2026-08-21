@@ -4023,16 +4023,16 @@ TEST(tls_state_machine, send_rejects_out_of_range_conn_id) {
     ScopedTlsHooks hooks(tls_state);
 
     static const u8 kPayload[] = {'b', 'a', 'd'};
-    REQUIRE(backend.add_send_tls(conn, kPayload, sizeof(kPayload)));
-    CHECK_EQ(tls_state.write_calls, 1);
-    REQUIRE_EQ(backend.pending_count, 1u);
-
-    IoEvent events[8];
-    u32 n = backend.wait(events, 8, &conn, 1);
-    REQUIRE_EQ(n, 1u);
-    CHECK_EQ(events[0].conn_id, EpollBackend::kMaxFdMap);
-    CHECK_EQ(events[0].type, IoEventType::Send);
-    CHECK_EQ(events[0].result, -EINVAL);
+    CHECK_FALSE(backend.add_send_tls(conn, kPayload, sizeof(kPayload)));
+    CHECK_EQ(tls_state.write_calls, 0);
+    CHECK_EQ(backend.pending_count, 0u);
+    CHECK_EQ(backend.send_state[EpollBackend::kMaxFdMap - 1].src, nullptr);
+    CHECK_EQ(backend.send_state[EpollBackend::kMaxFdMap - 1].fd, -1);
+    CHECK_EQ(backend.send_state[EpollBackend::kMaxFdMap - 1].offset, 0u);
+    CHECK_EQ(backend.send_state[EpollBackend::kMaxFdMap - 1].remaining, 0u);
+    CHECK_EQ(backend.send_state[EpollBackend::kMaxFdMap - 1].type, IoEventType::Send);
+    CHECK_FALSE(backend.send_state[EpollBackend::kMaxFdMap - 1].tls);
+    CHECK_EQ(backend.send_state[EpollBackend::kMaxFdMap - 1].tls_wait_events, 0u);
 
     close(fds[0]);
     close(fds[1]);
@@ -4371,6 +4371,7 @@ TEST(epoll_pending_capacity, upstream_partial_send_registration_failure_queues_t
     REQUIRE_EQ(socketpair(AF_UNIX, SOCK_STREAM | SOCK_NONBLOCK, 0, fds), 0);
     const u32 prefilled = fill_socket_send_buffer(fds[0], fds[1]);
     REQUIRE_GT(prefilled, 0u);
+    close(backend.epoll_fd);
     backend.epoll_fd = -1;  // force the partial-send registration to fail
 
     static const u8 payload[] = {'p', 'a', 'r', 't', 'i', 'a', 'l'};
@@ -4378,12 +4379,16 @@ TEST(epoll_pending_capacity, upstream_partial_send_registration_failure_queues_t
     CHECK_EQ(backend.pending_count, 1u);
     CHECK_EQ(backend.upstream_send_state[0].src, nullptr);
     CHECK_EQ(backend.upstream_send_state[0].fd, -1);
+    CHECK_EQ(backend.upstream_send_state[0].offset, 0u);
     CHECK_EQ(backend.upstream_send_state[0].remaining, 0u);
+    CHECK_EQ(backend.upstream_send_state[0].type, IoEventType::UpstreamSend);
+    CHECK_FALSE(backend.upstream_send_state[0].tls);
+    CHECK_EQ(backend.upstream_send_state[0].tls_wait_events, 0u);
 
     IoEvent events[2]{};
     CHECK_EQ(backend.wait(events, 2, nullptr, 0), 1u);
     CHECK_EQ(events[0].type, IoEventType::UpstreamSend);
-    CHECK_LT(events[0].result, 0);
+    CHECK_EQ(events[0].result, -EBADF);
     CHECK_EQ(backend.pending_count, 0u);
 
     close(fds[0]);
