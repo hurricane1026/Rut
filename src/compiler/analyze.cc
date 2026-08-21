@@ -18871,28 +18871,6 @@ static FrontendResult<HirModule*> analyze_file_internal(
                     route_decl.span,
                     lit_str("chain after Response effects are not supported on WebSocket routes"));
             auto mark_commit = [](HirTerminator& term) { term.commit_response_mutations = true; };
-            auto* guard_match_arms =
-                const_cast<FixedVec<HirGuardMatchArm, HirModule::kMaxGuardMatchArms>*>(
-                    &mod.guard_match_arms);
-            auto mark_guard = [&](HirGuard& guard) -> void {
-                if (guard.fail_kind == HirGuard::FailKind::Term) {
-                    mark_commit(guard.fail_term);
-                } else if (guard.fail_kind == HirGuard::FailKind::Body) {
-                    if (guard.fail_body.body_kind == HirGuardBody::BodyKind::If) {
-                        mark_commit(guard.fail_body.then_term);
-                        mark_commit(guard.fail_body.else_term);
-                    } else {
-                        mark_commit(guard.fail_body.direct_term);
-                    }
-                } else {
-                    for (u32 ai = 0; ai < guard.fail_match_count; ai++)
-                        mark_commit((*guard_match_arms)[guard.fail_match_start + ai].direct_term);
-                }
-            };
-            // `chain after` runs on every request path. Mark terminals reached
-            // through top-level and nested guard failures too; otherwise a
-            // Redirect hidden behind a guard could bypass the conflict gate.
-            for (u32 gi = 0; gi < route.guards.len; gi++) mark_guard(route.guards[gi]);
             if (route.control.kind == HirControlKind::Direct) {
                 mark_commit(route.control.direct_term);
             } else if (route.control.kind == HirControlKind::If) {
@@ -18901,7 +18879,6 @@ static FrontendResult<HirModule*> analyze_file_internal(
             } else {
                 for (u32 ai = 0; ai < route.control.match_arms.len; ai++) {
                     auto& arm = route.control.match_arms[ai];
-                    for (u32 gi = 0; gi < arm.guards.len; gi++) mark_guard(arm.guards[gi]);
                     if (arm.body_kind == HirMatchArm::BodyKind::Direct) {
                         mark_commit(arm.direct_term);
                     } else {
@@ -18923,30 +18900,7 @@ static FrontendResult<HirModule*> analyze_file_internal(
                         (term.forward_request_policy_id != 0 && term.commit_response_mutations) ||
                         (term.forward_response_policy_id != 0 && term.commit_response_mutations));
             };
-            auto find_guard_conflict = [&](const HirGuard& guard) -> const HirTerminator* {
-                if (guard.fail_kind == HirGuard::FailKind::Term) {
-                    return policy_mutation_conflict(guard.fail_term) ? &guard.fail_term : nullptr;
-                }
-                if (guard.fail_kind == HirGuard::FailKind::Body) {
-                    if (guard.fail_body.body_kind == HirGuardBody::BodyKind::If) {
-                        if (policy_mutation_conflict(guard.fail_body.then_term))
-                            return &guard.fail_body.then_term;
-                        if (policy_mutation_conflict(guard.fail_body.else_term))
-                            return &guard.fail_body.else_term;
-                    } else if (policy_mutation_conflict(guard.fail_body.direct_term)) {
-                        return &guard.fail_body.direct_term;
-                    }
-                    return nullptr;
-                }
-                for (u32 ai = 0; ai < guard.fail_match_count; ai++) {
-                    const auto& arm = (*guard_match_arms)[guard.fail_match_start + ai];
-                    if (policy_mutation_conflict(arm.direct_term)) return &arm.direct_term;
-                }
-                return nullptr;
-            };
             const HirTerminator* conflict = nullptr;
-            for (u32 gi = 0; gi < route.guards.len && conflict == nullptr; gi++)
-                conflict = find_guard_conflict(route.guards[gi]);
             if (route.control.kind == HirControlKind::Direct) {
                 if (policy_mutation_conflict(route.control.direct_term))
                     conflict = &route.control.direct_term;
@@ -18958,8 +18912,6 @@ static FrontendResult<HirModule*> analyze_file_internal(
             } else {
                 for (u32 ai = 0; ai < route.control.match_arms.len; ai++) {
                     const auto& arm = route.control.match_arms[ai];
-                    for (u32 gi = 0; gi < arm.guards.len && conflict == nullptr; gi++)
-                        conflict = find_guard_conflict(arm.guards[gi]);
                     if (policy_mutation_conflict(arm.direct_term)) {
                         conflict = &arm.direct_term;
                         break;

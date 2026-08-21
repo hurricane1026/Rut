@@ -6740,6 +6740,68 @@ route {
     rir.destroy();
 }
 
+TEST(frontend, chain_after_never_commits_on_guard_failure_shapes) {
+    const char source[] = R"rut(
+variant Result { ok, err }
+func after_headers(_ resp: Response) -> i32 { resp.set("X-Test", "v") 0 }
+chain access { after after_headers(resp) }
+route "/" use chain access {
+    guard false else { return 401 }
+    guard false else { let code = 402 return 402 }
+    guard false else { let code = 403 if code == 403 { return 403 } else { return 503 } }
+    let failed = error(.timeout)
+    guard match failed else { .timeout => return 404 _ => return 504 }
+    let state = Result.ok
+    match state {
+        .ok => {
+            guard false else { return 405 }
+            return 200
+        }
+        .err => return 204
+    }
+}
+)rut";
+
+    auto check_fail_terms = [&](const HirModule& module, const HirGuard& guard) {
+        if (guard.fail_kind == HirGuard::FailKind::Term) {
+            CHECK_FALSE(guard.fail_term.commit_response_mutations);
+        } else if (guard.fail_kind == HirGuard::FailKind::Body) {
+            if (guard.fail_body.body_kind == HirGuardBody::BodyKind::If) {
+                CHECK_FALSE(guard.fail_body.then_term.commit_response_mutations);
+                CHECK_FALSE(guard.fail_body.else_term.commit_response_mutations);
+            } else {
+                CHECK_FALSE(guard.fail_body.direct_term.commit_response_mutations);
+            }
+        } else {
+            for (u32 ai = 0; ai < guard.fail_match_count; ai++)
+                CHECK_FALSE(module.guard_match_arms[guard.fail_match_start + ai]
+                                .direct_term.commit_response_mutations);
+        }
+    };
+
+    auto lexed = lex(lit(source));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    REQUIRE_EQ(hir->routes.len, 1u);
+    const auto& route = hir->routes[0];
+    REQUIRE_EQ(route.guards.len, 4u);
+    CHECK_EQ(route.guards[0].fail_kind, HirGuard::FailKind::Term);
+    CHECK_EQ(route.guards[1].fail_body.body_kind, HirGuardBody::BodyKind::Direct);
+    CHECK_EQ(route.guards[2].fail_body.body_kind, HirGuardBody::BodyKind::If);
+    CHECK_EQ(route.guards[3].fail_kind, HirGuard::FailKind::Match);
+    for (u32 gi = 0; gi < route.guards.len; gi++) check_fail_terms(hir.value(), route.guards[gi]);
+
+    REQUIRE_EQ(route.control.kind, HirControlKind::Match);
+    REQUIRE_EQ(route.control.match_arms.len, 2u);
+    REQUIRE_EQ(route.control.match_arms[0].guards.len, 1u);
+    check_fail_terms(hir.value(), route.control.match_arms[0].guards[0]);
+    CHECK(route.control.match_arms[0].direct_term.commit_response_mutations);
+    CHECK(route.control.match_arms[1].direct_term.commit_response_mutations);
+}
+
 TEST(frontend, response_builder_alias_is_not_the_chain_response_parameter) {
     const char* src = R"rut(
 func build_local(_ resp: Response) -> i32 {
@@ -33857,7 +33919,7 @@ route GET "/c" { return redirect({scheme: "http", authority: "request_host", por
     CHECK(ast->redirect_policies[1].body.eq(lit_str("unique")));
 }
 
-TEST(frontend, inline_redirect_chain_after_rejects_guard_and_control_paths) {
+TEST(frontend, inline_redirect_chain_after_rejects_selected_control_paths) {
     const char* sources[] = {
         R"rut(
 func after_headers(_ resp: Response) -> i32 { resp.set("X-Test", "v") 0 }
@@ -33876,12 +33938,6 @@ func after_headers(_ resp: Response) -> i32 { resp.set("X-Test", "v") 0 }
 chain access { after after_headers(resp) }
 route "/" use chain access { match req.method { GET => return redirect({scheme: "http", authority: "request_host", port: "actual_listener", path: "static", query: "preserve_raw", date: "current", connection: "close", status: 301, reason: "Moved Permanently", server: "s", content_type: "text/html", target_path: "/x", body: b""}) _ => return forward(b) } }
 )rut",
-        R"rut(
-upstream b at "127.0.0.1:9000"
-func after_headers(_ resp: Response) -> i32 { resp.set("X-Test", "v") 0 }
-chain access { after after_headers(resp) }
-route "/" use chain access { guard req.http11 else { return redirect({scheme: "http", authority: "request_host", port: "actual_listener", path: "static", query: "preserve_raw", date: "current", connection: "close", status: 301, reason: "Moved Permanently", server: "s", content_type: "text/html", target_path: "/x", body: b""}) } return forward(b) }
-)rut",
     };
     for (const char* source : sources) {
         auto lexed = lex(lit(source));
@@ -33890,6 +33946,64 @@ route "/" use chain access { guard req.http11 else { return redirect({scheme: "h
         REQUIRE(ast);
         CHECK_FALSE(analyze_file_heap(ast.value()).has_value());
     }
+}
+
+TEST(frontend, inline_redirect_chain_after_guard_failure_does_not_commit) {
+    const char source[] = R"rut(
+upstream b at "127.0.0.1:9000"
+func after_headers(_ resp: Response) -> i32 { resp.set("X-Test", "v") 0 }
+chain access { after after_headers(resp) }
+route "/" use chain access {
+    guard req.http11 else {
+        return redirect({scheme: "http", authority: "request_host", port: "actual_listener", path: "static", query: "preserve_raw", date: "current", connection: "close", status: 301, reason: "Moved Permanently", server: "s", content_type: "text/html", target_path: "/x", body: b""})
+    }
+    return forward(b)
+}
+)rut";
+    auto lexed = lex(lit(source));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    REQUIRE_EQ(hir->routes[0].guards.len, 1u);
+    const auto& guard_redirect = hir->routes[0].guards[0].fail_term;
+    CHECK_EQ(guard_redirect.kind, HirTerminatorKind::Redirect);
+    CHECK_FALSE(guard_redirect.commit_response_mutations);
+    CHECK_EQ(hir->routes[0].control.direct_term.kind, HirTerminatorKind::ForwardUpstream);
+    CHECK(hir->routes[0].control.direct_term.commit_response_mutations);
+
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    const MirTerminator* mir_redirect = nullptr;
+    const MirTerminator* mir_forward = nullptr;
+    for (u32 bi = 0; bi < mir->functions[0].blocks.len; bi++) {
+        const auto& term = mir->functions[0].blocks[bi].term;
+        if (term.kind == MirTerminatorKind::Redirect) mir_redirect = &term;
+        if (term.kind == MirTerminatorKind::ForwardUpstream) mir_forward = &term;
+    }
+    REQUIRE(mir_redirect != nullptr);
+    REQUIRE(mir_forward != nullptr);
+    CHECK_FALSE(mir_redirect->commit_response_mutations);
+    CHECK(mir_forward->commit_response_mutations);
+
+    FrontendRirModule rir{};
+    REQUIRE(lower_to_rir(mir.value(), rir));
+    u32 redirects = 0;
+    u32 forwards = 0;
+    u32 commits = 0;
+    for (u32 bi = 0; bi < rir.module.functions[0].block_count; bi++) {
+        const auto& block = rir.module.functions[0].blocks[bi];
+        for (u32 ii = 0; ii < block.inst_count; ii++) {
+            redirects += block.insts[ii].op == rir::Opcode::RetRedirect;
+            forwards += block.insts[ii].op == rir::Opcode::RetForward;
+            commits += block.insts[ii].op == rir::Opcode::RespCommitHeaders;
+        }
+    }
+    CHECK_EQ(redirects, 1u);
+    CHECK_EQ(forwards, 1u);
+    CHECK_EQ(commits, 1u);
+    rir.destroy();
 }
 
 TEST(frontend, inline_redirect_supports_method_omitted_terminal_if_with_forward_sibling) {
