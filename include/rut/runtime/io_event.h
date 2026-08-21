@@ -119,6 +119,10 @@ inline constexpr u8 kPauseCancelAux = 1;
 // Local backend submission/registration failure. The completion is synthetic: real
 // proxy paths fail closed, while health probes drop it without recording backend health.
 inline constexpr u8 kLocalSubmitFailureAux = 2;
+// The cancel SQE owned by strict upstream-episode retirement. It is distinct
+// from the retiring recv target (aux 0) and from pause/rearm cancellation: its
+// final CQE retires only the explicit C1 cancel ownership.
+inline constexpr u8 kUpstreamRetirementCancelAux = 3;
 
 // Unified completion event — field order optimized for minimal padding.
 struct IoEvent {

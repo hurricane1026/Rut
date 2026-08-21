@@ -6164,24 +6164,35 @@ inline bool build_strict_response_headers(Connection& conn, const RouteConfig& c
 }
 
 template <typename Loop>
-inline void abandon_strict_upstream(Loop* loop, Connection& conn) {
+inline bool abandon_strict_upstream(Loop* loop, Connection& conn) {
     // Publish abandonment before closing the fd so late CQEs cannot dispatch
     // into the old upstream callback. Detach every callback/epoll state before
     // the downstream response is sent, and release the slot exactly once.
     conn.upstream_abandoned = true;
     conn.upstream_keep_alive = false;
     conn.set_slots(nullptr, nullptr, nullptr, nullptr);
+    if constexpr (requires { loop->begin_strict_upstream_retirement(conn); }) {
+        // io_uring's strict path must establish its recv-only drain ownership
+        // before close clears the old armed state. Failure means the bounded C1
+        // preconditions were not proven: close the entire request rather than
+        // publish a response over an unsafe retirement.
+        if (!loop->begin_strict_upstream_retirement(conn)) {
+            loop->close_conn(conn);
+            return false;
+        }
+    }
     if constexpr (requires { loop->discard_upstream_send(conn); }) {
         loop->discard_upstream_send(conn);
     }
     (void)detach_upstream_close(loop, conn);
     release_upstream_slot(loop, conn);
+    return true;
 }
 
 template <typename Loop>
 inline void reject_strict_response(Loop* loop, Connection& conn) {
     // This is the response-policy equivalent of the upstream timeout path.
-    abandon_strict_upstream(loop, conn);
+    if (!abandon_strict_upstream(loop, conn)) return;
     static const char k502[] = "HTTP/1.1 502 Bad Gateway\r\nContent-Length: 11\r\n"
                                 "Connection: close\r\n\r\nBad Gateway";
     conn.send_buf.reset();
@@ -6425,7 +6436,7 @@ void on_upstream_response(void* lp, Connection& conn, IoEvent ev) {
             // upstream before publishing those headers; a delayed body or
             // late CQE therefore cannot append bytes or release the slot twice.
             conn.upstream_recv_buf.reset();
-            abandon_strict_upstream(loop, conn);
+            if (!abandon_strict_upstream(loop, conn)) return;
             conn.transition_to_sending(&on_proxy_response_sent<Loop>);
             client_send(loop, conn, conn.response_header_buf.data(), conn.response_header_buf.len());
             return;

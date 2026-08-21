@@ -110,6 +110,10 @@ public:
     // Pending-free list: slots closed during the current dispatch batch.
     u32 pending_free[kMaxConns];
     u32 pending_free_count;
+    // Normally zero. A strict retirement cancel that could not acquire an SQE
+    // is retried before the next blocking wait; the count avoids scanning the
+    // full connection table on the ordinary hot path.
+    u32 upstream_retirement_retry_count;
 
     // Deferred accepts: accepted fds that couldn't be allocated during
     // dispatch because all slots were in pending_free.
@@ -182,6 +186,7 @@ public:
         jit_code_ptr = nullptr;
         free_top = kMaxConns;
         pending_free_count = 0;
+        upstream_retirement_retry_count = 0;
         deferred_accept_count = 0;
         timer.init();
         for (u32 i = 0; i < kMaxConns; i++) {
@@ -221,6 +226,7 @@ public:
         IoEvent events[kMaxEventsPerWait];
 
         while (is_running()) {
+            retry_strict_upstream_retirement_cancels();
             u32 n = backend.wait(events, kMaxEventsPerWait, conns, kMaxConns);
             if (backend.failure_code() != 0) {
                 // A zero-event wait is valid; a sticky backend error is not. Stop
@@ -329,6 +335,153 @@ public:
     // Only called when a connection starts proxying — non-proxy connections
     // No-op for io_uring (no fd_map to clear).
     void clear_upstream_fd(u32 /*conn_id*/) {}
+
+    static bool strict_upstream_retirement_blocks_reclaim(const Connection& c) {
+        return c.upstream_retirement_active || c.upstream_retirement_recv_owned ||
+               c.upstream_retirement_cancel_owned || c.upstream_retirement_cancel_retry;
+    }
+
+    // Begin the bounded recv-only retirement used by strict HEAD abandonment.
+    // This is deliberately not a general begin/end lifecycle: it accepts only
+    // the already-proven strict callback point where the request connect/send
+    // have completed and at most the downstream multishot recv plus the current
+    // upstream multishot recv remain accounted.
+    [[nodiscard]] bool begin_strict_upstream_retirement(Connection& c) {
+        if (c.id >= kMaxConns || c.upstream_episode_quarantined ||
+            !valid_upstream_episode(c.upstream_episode) || c.upstream_retiring_episode != 0 ||
+            c.upstream_retirement_active || c.upstream_retirement_recv_owned ||
+            c.upstream_retirement_cancel_owned || c.upstream_retirement_cancel_retry ||
+            c.upstream_fd < 0 || c.send_armed || c.upstream_send_armed || c.yield_timeout_armed ||
+            c.recv_pause_cancel_pending || c.recv_pause_rearm_pending ||
+            c.upstream_recv_paused_for_send || c.upstream_recv_pause_cancel_pending ||
+            c.upstream_recv_pause_rearm_pending || c.upstream_recv_cancel_inflight)
+            return false;
+
+        const auto& send = backend.upstream_send_state[c.id];
+        if (send.remaining != 0) return false;
+
+        // Every live operation at this strict pre-send point is represented by
+        // one of these two multishot targets. Exact equality excludes an
+        // unretired connect, upstream/downstream send, yield, or cancel CQE.
+        const u32 expected_pending = static_cast<u32>(c.recv_armed) +
+                                     static_cast<u32>(c.upstream_recv_armed);
+        if (c.pending_ops != expected_pending) return false;
+
+        const u32 retiring_episode = c.upstream_episode;
+        c.upstream_retiring_episode = retiring_episode;
+        c.upstream_retirement_active = c.upstream_recv_armed;
+        c.upstream_retirement_recv_owned = c.upstream_recv_armed;
+        c.upstream_retirement_cancel_owned = false;
+        c.upstream_retirement_cancel_retry = false;
+
+        // Publish a different current token before another backend wait can
+        // inspect a provided-buffer CQE. At exhaustion, use an unrepresentable
+        // current token and permanently quarantine the allocator slot.
+        if (!c.next_upstream_episode()) {
+            c.upstream_episode = kInvalidUpstreamEventEpisode;
+            c.upstream_episode_quarantined = true;
+        }
+
+        if (!c.upstream_retirement_recv_owned) {
+            c.upstream_retirement_active = false;
+            return true;
+        }
+
+        if (backend.cancel_retiring_upstream_recv(c.id, retiring_episode)) {
+            c.upstream_retirement_cancel_owned = true;
+            c.pending_ops++;
+        } else {
+            c.upstream_retirement_cancel_retry = true;
+            upstream_retirement_retry_count++;
+        }
+        return true;
+    }
+
+    // Safe retry point: called before backend.wait submits/blocks. A full SQ
+    // necessarily has work for wait() to advance; a sticky enter failure stops
+    // the shard through the existing explicit fatal path.
+    void retry_strict_upstream_retirement_cancels() {
+        if (upstream_retirement_retry_count == 0) return;
+        for (u32 id = 0; id < kMaxConns && upstream_retirement_retry_count != 0; id++) {
+            Connection& c = conns[id];
+            if (!c.upstream_retirement_cancel_retry) continue;
+            if (!c.upstream_retirement_active || c.upstream_retirement_cancel_owned ||
+                !valid_upstream_episode(c.upstream_retiring_episode)) {
+                // Corrupt retirement ownership cannot be repaired safely.
+                backend.fatal_error.store(EPROTO, std::memory_order_release);
+                running_.store(false, std::memory_order_release);
+                return;
+            }
+            if (!backend.cancel_retiring_upstream_recv(c.id, c.upstream_retiring_episode))
+                continue;
+            c.upstream_retirement_cancel_retry = false;
+            c.upstream_retirement_cancel_owned = true;
+            c.pending_ops++;
+            upstream_retirement_retry_count--;
+        }
+    }
+
+    // Route strict-retirement CQEs before generic stale accounting. Returning
+    // true means the event was consumed without entering callbacks, timer
+    // refresh, armed-flag changes, send state, or current request buffers.
+    bool consume_strict_upstream_retirement_event(Connection& c, const IoEvent& ev) {
+        if (c.upstream_retiring_episode == 0) return false;
+
+        const bool matching_recv = ev.type == IoEventType::UpstreamRecv &&
+                                   ev.upstream_episode == c.upstream_retiring_episode;
+        if (matching_recv) {
+            // Keep the token as a tombstone after completion: matching
+            // duplicates remain consumed and cannot steal generic accounting.
+            if (!c.upstream_retirement_active) return true;
+
+            bool* owned = nullptr;
+            if (ev.aux == 0)
+                owned = &c.upstream_retirement_recv_owned;
+            else if (ev.aux == kUpstreamRetirementCancelAux)
+                owned = &c.upstream_retirement_cancel_owned;
+            if (owned == nullptr || !*owned || ev.more) return true;
+
+            // Ownership is counted when the target was armed or after the
+            // cancel SQE was queued. A zero aggregate here is corrupt state;
+            // fail the shard explicitly without inventing a decrement.
+            if (c.pending_ops == 0) {
+                c.upstream_episode = kInvalidUpstreamEventEpisode;
+                c.upstream_episode_quarantined = true;
+                backend.fatal_error.store(EPROTO, std::memory_order_release);
+                running_.store(false, std::memory_order_release);
+                return true;
+            }
+            *owned = false;
+            c.pending_ops--;
+            if (ev.aux == 0 && c.upstream_retirement_cancel_retry) {
+                // The target reached its terminal CQE before an initially-full
+                // SQ could accept the cancel. No kernel recv remains to cancel,
+                // so retire the retry obligation synchronously and keep the
+                // loop-level scan count exact.
+                if (upstream_retirement_retry_count == 0) {
+                    c.upstream_episode = kInvalidUpstreamEventEpisode;
+                    c.upstream_episode_quarantined = true;
+                    backend.fatal_error.store(EPROTO, std::memory_order_release);
+                    running_.store(false, std::memory_order_release);
+                    return true;
+                }
+                c.upstream_retirement_cancel_retry = false;
+                upstream_retirement_retry_count--;
+            }
+            if (!c.upstream_retirement_recv_owned &&
+                !c.upstream_retirement_cancel_owned &&
+                !c.upstream_retirement_cancel_retry) {
+                c.upstream_retirement_active = false;
+                if (c.fd < 0 && c.pending_ops == 0) reclaim_slot(c.id);
+            }
+            return true;
+        }
+
+        // C1's exact precondition proves there is no other upstream operation
+        // in this retirement. Wrong type/episode/aux and malformed upstream
+        // records therefore own none of its aggregate accounting.
+        return io_event_is_upstream(ev.type);
+    }
 
     // --- HTTP/1 idle upstream connection reuse (per-shard pool) ---
 
@@ -474,6 +627,18 @@ public:
     }
 
     void reclaim_slot(u32 cid) {
+        if (cid >= kMaxConns || strict_upstream_retirement_blocks_reclaim(conns[cid])) return;
+        bool was_pending = false;
+        for (u32 i = 0; i < pending_free_count; i++) {
+            if (pending_free[i] == cid) {
+                pending_free[i] = pending_free[--pending_free_count];
+                was_pending = true;
+                break;
+            }
+        }
+        // Every deferred slot enters pending_free in free_conn_impl. Refusing
+        // an unowned reclaim makes duplicate finals idempotent.
+        if (!was_pending) return;
         if (conns[cid].recv_slice) {
             pool.free(conns[cid].recv_slice);
             conns[cid].recv_slice = nullptr;
@@ -492,20 +657,15 @@ public:
         }
         free_tls_in_buf(conns[cid]);
         free_tls_out_buf(conns[cid]);
-        free_stack[free_top++] = cid;
-        for (u32 i = 0; i < pending_free_count; i++) {
-            if (pending_free[i] == cid) {
-                pending_free[i] = pending_free[--pending_free_count];
-                break;
-            }
-        }
+        if (!conns[cid].upstream_episode_quarantined) free_stack[free_top++] = cid;
     }
 
     void reclaim_pending() {
         u32 remaining = 0;
         for (u32 i = 0; i < pending_free_count; i++) {
             u32 cid = pending_free[i];
-            if (conns[cid].pending_ops == 0) {
+            if (conns[cid].pending_ops == 0 &&
+                !strict_upstream_retirement_blocks_reclaim(conns[cid])) {
                 if (conns[cid].recv_slice) {
                     pool.free(conns[cid].recv_slice);
                     conns[cid].recv_slice = nullptr;
@@ -524,7 +684,7 @@ public:
                 }
                 free_tls_in_buf(conns[cid]);
                 free_tls_out_buf(conns[cid]);
-                free_stack[free_top++] = cid;
+                if (!conns[cid].upstream_episode_quarantined) free_stack[free_top++] = cid;
             } else {
                 pending_free[remaining++] = cid;
             }
@@ -589,7 +749,7 @@ public:
             c.ws_u2c_msg = nullptr;
         }
         // If no ops are in flight, reclaim immediately.
-        if (c.pending_ops == 0) {
+        if (c.pending_ops == 0 && !strict_upstream_retirement_blocks_reclaim(c)) {
             if (c.recv_slice) pool.free(c.recv_slice);
             if (c.send_slice) pool.free(c.send_slice);
             if (c.upstream_recv_slice) pool.free(c.upstream_recv_slice);
@@ -597,7 +757,7 @@ public:
             free_tls_in_buf(c);
             free_tls_out_buf(c);
             c.reset();
-            free_stack[free_top++] = cid;
+            if (!c.upstream_episode_quarantined) free_stack[free_top++] = cid;
             return;
         }
         // Ops still in flight: defer until CQEs arrive.
@@ -608,7 +768,15 @@ public:
         u8* tin = c.tls_in_slice;
         u8* tout = c.tls_out_slice;
         u32 ops = c.pending_ops;
+        const u8 allocated_shard = c.shard_id;
+        const u32 retiring_episode = c.upstream_retiring_episode;
+        const bool retirement_active = c.upstream_retirement_active;
+        const bool retirement_recv_owned = c.upstream_retirement_recv_owned;
+        const bool retirement_cancel_owned = c.upstream_retirement_cancel_owned;
+        const bool retirement_cancel_retry = c.upstream_retirement_cancel_retry;
         c.reset();
+        conns[cid].id = cid;
+        conns[cid].shard_id = allocated_shard;
         conns[cid].recv_slice = rs;
         conns[cid].send_slice = ss;
         conns[cid].upstream_recv_slice = us;
@@ -616,6 +784,11 @@ public:
         conns[cid].tls_in_slice = tin;
         conns[cid].tls_out_slice = tout;
         conns[cid].pending_ops = ops;
+        conns[cid].upstream_retiring_episode = retiring_episode;
+        conns[cid].upstream_retirement_active = retirement_active;
+        conns[cid].upstream_retirement_recv_owned = retirement_recv_owned;
+        conns[cid].upstream_retirement_cancel_owned = retirement_cancel_owned;
+        conns[cid].upstream_retirement_cancel_retry = retirement_cancel_retry;
         pending_free[pending_free_count++] = cid;
     }
 
@@ -1166,6 +1339,7 @@ public:
             case IoEventType::UpstreamSend:
                 if (ev.conn_id < kMaxConns) {
                     auto& conn = conns[ev.conn_id];
+                    if (consume_strict_upstream_retirement_event(conn, ev)) break;
                     const bool stale_tagged_upstream =
                         io_event_is_tagged_stale(ev, conn.upstream_episode);
                     if (stale_tagged_upstream) {

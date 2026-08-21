@@ -120,6 +120,10 @@ struct IoUringBackend {
     // Cancel the multishot upstream recv by user_data (recv-only). The cancel's own
     // completion is tagged kPauseCancelAux so dispatch re-arms only once it drains.
     bool pause_upstream_recv(i32 fd, u32 conn_id, u32 upstream_episode = 1);
+    // Exact-token cancel used by strict upstream-episode retirement. The
+    // cancel's own CQE is tagged separately from pause/rearm cancellation.
+    // Returns true only after the cancel SQE has actually been queued.
+    bool cancel_retiring_upstream_recv(u32 conn_id, u32 upstream_episode);
 
     // Submit a send (or zero-copy send).
     // Returns false if SQ is full (no SQE submitted).

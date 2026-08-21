@@ -406,6 +406,17 @@ bool IoUringBackend::pause_upstream_recv(i32 fd, u32 conn_id, u32 upstream_episo
                                upstream_episode);
 }
 
+bool IoUringBackend::cancel_retiring_upstream_recv(u32 conn_id, u32 upstream_episode) {
+    if (conn_id >= kMaxSendState || !valid_upstream_episode(upstream_episode)) return false;
+    return cancel_by_user_data(encode_upstream_user_data(conn_id,
+                                                         IoEventType::UpstreamRecv,
+                                                         upstream_episode),
+                               conn_id,
+                               IoEventType::UpstreamRecv,
+                               kUpstreamRetirementCancelAux,
+                               upstream_episode);
+}
+
 bool IoUringBackend::add_send(i32 fd, u32 conn_id, const u8* buf, u32 len) {
     io_uring_sqe* sqe = get_sqe();
     if (!sqe) return false;  // SQ full — don't record send_state without a submitted SQE

@@ -434,6 +434,11 @@ struct ConnectionBase {
     // upstream episode so stale completions cannot match a later episode.
     u32 upstream_episode = 1;
 
+    // Fail-closed terminal state for an exhausted io_uring episode token. Like
+    // upstream_episode, this deliberately survives reset(): a quarantined slot
+    // must never return to the allocator or wrap back to an old kernel token.
+    bool upstream_episode_quarantined = false;
+
     // Advance the token without wrapping. Zero is the invalid sentinel and
     // max is the final representable token; callers must quarantine the
     // episode owner when this returns false rather than reusing an old token.
@@ -635,6 +640,16 @@ struct ConnectionBase {
     // proxy_stream_complete clears resp_fully_buffered before that terminal drains, so
     // the live flag is unreliable. Cleared with upstream_recv_cancel_inflight.
     bool upstream_recv_terminal_stale;
+    // Bounded io_uring C1 retirement state for strict upstream abandonment.
+    // The retiring token remains as a tombstone after both owned finals drain,
+    // so a duplicate final cannot fall into generic stale-CQE accounting. The
+    // active/ownership/retry fields are preserved explicitly by io_uring's
+    // deferred-free path while kernel work still pins the connection storage.
+    u32 upstream_retiring_episode;
+    bool upstream_retirement_active;
+    bool upstream_retirement_recv_owned;
+    bool upstream_retirement_cancel_owned;
+    bool upstream_retirement_cancel_retry;
     // True when an idle-return stale upstream recv CQE carried bytes. The stale branch
     // rolls those bytes back out of upstream_recv_buf, so the deferred pool-return path
     // needs this separate marker to close rather than reuse a desynced fd.
@@ -888,6 +903,11 @@ struct ConnectionBase {
         upstream_recv_pause_rearm_pending = false;
         upstream_recv_cancel_inflight = false;
         upstream_recv_terminal_stale = false;
+        upstream_retiring_episode = 0;
+        upstream_retirement_active = false;
+        upstream_retirement_recv_owned = false;
+        upstream_retirement_cancel_owned = false;
+        upstream_retirement_cancel_retry = false;
         upstream_recv_idle_stale_bytes = false;
         yield_armed = false;
         yield_timeout_armed = false;
