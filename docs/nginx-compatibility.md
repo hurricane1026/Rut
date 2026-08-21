@@ -115,9 +115,15 @@ Allowed states are `SUPPORTED`, `PARTIAL`, `BLOCKED_BY_RUT`,
   io_uring episode cancellation/drain and deferred request admission are tracked
   in #264. Its first recv-only retirement slice now protects the existing
   explicit-close strict-abandon path, including cancel retry, token exhaustion,
-  provided-buffer isolation, and deferred close/reclaim, but it still does not
-  admit or resume a second downstream request. The remaining response semantics
-  stay under #253.
+  provided-buffer isolation, and deferred close/reclaim. Its second bounded
+  runtime slice now completes request-1 bookkeeping before parking the generic
+  HTTP/1 boundary, buffers request-2 bytes without parse/route/timer/callback
+  effects, and resumes exactly once after the retirement-final CQE batch. Exact
+  successor ownership also fences provided-buffer/partial-send mutation and
+  survives close through a per-type target/cancel ledger. Public reusable HEAD
+  admission and a second strict retirement remain rejected until the repeated-
+  episode lifecycle is proven, so #264 remains open and the remaining response
+  semantics stay under #253.
 - The first request-policy slice rejects body/framing inputs (including
   `Content-Length` and every `Transfer-Encoding` value), HTTP/2, and
   non-origin-form targets before upstream connect. These are intentional
