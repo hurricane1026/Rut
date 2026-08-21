@@ -114,6 +114,10 @@ public:
     // is retried before the next blocking wait; the count avoids scanning the
     // full connection table on the ordinary hot path.
     u32 upstream_retirement_retry_count;
+    // Set only when a final owned retirement CQE makes at least one parked
+    // HTTP/1 boundary eligible. The ordinary hot path avoids a connection-table
+    // scan; the run loop consumes this after the complete wait batch.
+    bool http1_boundary_ready_pending;
 
     // Deferred accepts: accepted fds that couldn't be allocated during
     // dispatch because all slots were in pending_free.
@@ -187,6 +191,7 @@ public:
         free_top = kMaxConns;
         pending_free_count = 0;
         upstream_retirement_retry_count = 0;
+        http1_boundary_ready_pending = false;
         deferred_accept_count = 0;
         timer.init();
         for (u32 i = 0; i < kMaxConns; i++) {
@@ -238,6 +243,10 @@ public:
             for (u32 i = 0; i < n; i++) {
                 dispatch(events[i]);
             }
+            // Retirement finals publish only readiness during dispatch. Admit
+            // parked HTTP/1 request boundaries after every CQE in this wait
+            // batch has been observed, before reclamation or accept reuse.
+            resume_deferred_http1_boundaries();
             reclaim_pending();
             retry_deferred_accepts();
             poll_command();
@@ -338,7 +347,64 @@ public:
 
     static bool strict_upstream_retirement_blocks_reclaim(const Connection& c) {
         return c.upstream_retirement_active || c.upstream_retirement_recv_owned ||
-               c.upstream_retirement_cancel_owned || c.upstream_retirement_cancel_retry;
+               c.upstream_retirement_cancel_owned || c.upstream_retirement_cancel_retry ||
+               c.upstream_close_target_owned != 0 || c.upstream_close_cancel_owned != 0 ||
+               c.upstream_close_pause_cancel_owned;
+    }
+
+    // Park only the post-response request-boundary tail. Every request-1 side
+    // effect (metrics/log/epoch/upstream release) has already completed before
+    // this hook is called from on_proxy_response_sent.
+    [[nodiscard]] bool defer_http1_request_boundary(Connection& c) {
+        // Exhausting the episode space quarantines the slot even when C1 had
+        // no recv owner to drain. Never admit request 2 under an invalid token.
+        if (c.upstream_episode_quarantined || !valid_upstream_episode(c.upstream_episode)) {
+            close_conn(c);
+            return true;
+        }
+        if (!strict_upstream_retirement_blocks_reclaim(c)) return false;
+        if (c.http1_boundary_deferred || c.http1_boundary_ready) {
+            // A duplicate rendezvous cannot be resumed safely. Keep it parked;
+            // the normal close path will clear it.
+            close_conn(c);
+            return true;
+        }
+        c.http1_boundary_deferred = true;
+        c.http1_boundary_ready = false;
+        c.http1_boundary_successor_episode = c.upstream_episode;
+        return true;
+    }
+
+    static bool current_successor_event_is_valid(const Connection& c, const IoEvent& ev) {
+        if (!io_event_is_upstream(ev.type) ||
+            !valid_upstream_episode(ev.upstream_episode) ||
+            ev.upstream_episode != c.upstream_episode)
+            return false;
+        if (ev.aux == kPauseCancelAux)
+            return ev.type == IoEventType::UpstreamRecv &&
+                   c.upstream_recv_pause_cancel_pending && c.pending_ops > 0;
+        if (ev.aux == kLocalSubmitFailureAux) {
+            if (c.pending_ops == 0) return false;
+            if (ev.type == IoEventType::UpstreamConnect)
+                return c.on_upstream_send != nullptr && c.upstream_connect_armed;
+            if (ev.type == IoEventType::UpstreamSend)
+                return c.on_upstream_send != nullptr && c.upstream_send_armed;
+            // A local recv-registration failure is the completion of the new
+            // submitted target itself; unlike an old terminal racing a pause,
+            // cancel_inflight alone is not ownership of this synthetic record.
+            return ev.type == IoEventType::UpstreamRecv &&
+                   c.on_upstream_recv != nullptr && c.upstream_recv_armed;
+        }
+        if (ev.aux != 0 || c.pending_ops == 0) return false;
+        if (ev.type == IoEventType::UpstreamConnect)
+            return c.on_upstream_send != nullptr && c.upstream_connect_armed;
+        if (ev.type == IoEventType::UpstreamSend)
+            return c.on_upstream_send != nullptr && c.upstream_send_armed;
+        // A pause/body-completion path may clear armed before the old recv
+        // target terminal drains, but cancel_inflight still proves its exact
+        // current ownership and must reach the stale-data branch.
+        return ev.type == IoEventType::UpstreamRecv &&
+               (c.upstream_recv_armed || c.upstream_recv_cancel_inflight);
     }
 
     // Begin the bounded recv-only retirement used by strict HEAD abandonment.
@@ -353,6 +419,7 @@ public:
             c.upstream_retirement_cancel_owned || c.upstream_retirement_cancel_retry ||
             c.upstream_fd < 0 || c.send_armed || c.upstream_send_armed || c.yield_timeout_armed ||
             c.recv_pause_cancel_pending || c.recv_pause_rearm_pending ||
+            c.upstream_connect_armed ||
             c.upstream_recv_paused_for_send || c.upstream_recv_pause_cancel_pending ||
             c.upstream_recv_pause_rearm_pending || c.upstream_recv_cancel_inflight)
             return false;
@@ -425,9 +492,10 @@ public:
     // true means the event was consumed without entering callbacks, timer
     // refresh, armed-flag changes, send state, or current request buffers.
     bool consume_strict_upstream_retirement_event(Connection& c, const IoEvent& ev) {
-        if (c.upstream_retiring_episode == 0) return false;
+        if (!io_event_is_upstream(ev.type)) return false;
 
         const bool matching_recv = ev.type == IoEventType::UpstreamRecv &&
+                                   c.upstream_retiring_episode != 0 &&
                                    ev.upstream_episode == c.upstream_retiring_episode;
         if (matching_recv) {
             // Keep the token as a tombstone after completion: matching
@@ -472,15 +540,98 @@ public:
                 !c.upstream_retirement_cancel_owned &&
                 !c.upstream_retirement_cancel_retry) {
                 c.upstream_retirement_active = false;
+                if (c.http1_boundary_deferred && !c.http1_boundary_ready) {
+                    c.http1_boundary_ready = true;
+                    http1_boundary_ready_pending = true;
+                }
                 if (c.fd < 0 && c.pending_ops == 0) reclaim_slot(c.id);
             }
             return true;
         }
 
+        // A live successor can have an operation and its close-path cancel in
+        // flight concurrently. Both were counted independently, so route only
+        // the exact episode/type/aux owner and leave duplicates or forged
+        // records unable to decrement aggregate pending_ops.
+        if (c.upstream_close_episode != 0 &&
+            ev.upstream_episode == c.upstream_close_episode) {
+            u8 op = 0;
+            if (ev.type == IoEventType::UpstreamConnect)
+                op = kUpstreamOpConnect;
+            else if (ev.type == IoEventType::UpstreamRecv)
+                op = kUpstreamOpRecv;
+            else if (ev.type == IoEventType::UpstreamSend)
+                op = kUpstreamOpSend;
+
+            bool owned = false;
+            if (ev.aux == 0) {
+                owned = (c.upstream_close_target_owned & op) != 0;
+                if (owned && !ev.more) c.upstream_close_target_owned &= static_cast<u8>(~op);
+            } else if (ev.aux == kUpstreamCloseCancelAux) {
+                owned = (c.upstream_close_cancel_owned & op) != 0;
+                if (owned && !ev.more) c.upstream_close_cancel_owned &= static_cast<u8>(~op);
+            } else if (ev.aux == kPauseCancelAux && op == kUpstreamOpRecv) {
+                owned = c.upstream_close_pause_cancel_owned;
+                if (owned && !ev.more) c.upstream_close_pause_cancel_owned = false;
+            }
+            if (!owned || ev.more) return true;
+            if (c.pending_ops == 0) {
+                c.upstream_episode = kInvalidUpstreamEventEpisode;
+                c.upstream_episode_quarantined = true;
+                backend.fatal_error.store(EPROTO, std::memory_order_release);
+                running_.store(false, std::memory_order_release);
+                return true;
+            }
+            c.pending_ops--;
+            if (c.fd < 0 && c.pending_ops == 0 &&
+                !strict_upstream_retirement_blocks_reclaim(c))
+                reclaim_slot(c.id);
+            return true;
+        }
+
         // C1's exact precondition proves there is no other upstream operation
-        // in this retirement. Wrong type/episode/aux and malformed upstream
-        // records therefore own none of its aggregate accounting.
-        return io_event_is_upstream(ev.type);
+        // while retirement is active. Once inactive, retain the old token as a
+        // tombstone but admit documented production completions carrying the
+        // exact current successor token. Retirement-only, unknown, malformed,
+        // and stale records own no aggregate accounting and remain swallowed.
+        if (c.upstream_retiring_episode == 0) return false;
+        if (c.upstream_retirement_active) return true;
+        return !current_successor_event_is_valid(c, ev);
+    }
+
+    // Consume every ready marker before invoking the factored continuation.
+    // Called only after all CQEs returned by the current backend.wait batch.
+    // Public for focused production-dispatch tests; run() is the only runtime
+    // scheduler.
+    void resume_deferred_http1_boundaries() {
+        if (!http1_boundary_ready_pending) return;
+        http1_boundary_ready_pending = false;
+        for (u32 id = 0; id < kMaxConns; id++) {
+            Connection& c = conns[id];
+            if (!c.http1_boundary_ready) continue;
+
+            c.http1_boundary_ready = false;
+            if (!c.http1_boundary_deferred) continue;
+            const u32 expected_episode = c.http1_boundary_successor_episode;
+            c.http1_boundary_deferred = false;
+            c.http1_boundary_successor_episode = 0;
+
+            const bool has_request_callback =
+                c.on_send || c.on_upstream_recv || c.on_upstream_send ||
+                (c.uses_iouring_tls() ? c.tls_pending_on_recv != nullptr : c.on_recv != nullptr);
+            const bool valid = c.id == id && c.fd >= 0 && !is_draining() &&
+                               !c.upstream_episode_quarantined &&
+                               !strict_upstream_retirement_blocks_reclaim(c) &&
+                               valid_upstream_episode(expected_episode) &&
+                               c.upstream_episode == expected_episode &&
+                               c.state == ConnState::Sending && !c.send_armed &&
+                               c.req_start_us == 0 && !has_request_callback;
+            if (!valid) {
+                if (c.fd >= 0) close_conn(c);
+                continue;
+            }
+            continue_http1_request_boundary<IoUringEventLoop>(this, c);
+        }
     }
 
     // --- HTTP/1 idle upstream connection reuse (per-shard pool) ---
@@ -774,6 +925,10 @@ public:
         const bool retirement_recv_owned = c.upstream_retirement_recv_owned;
         const bool retirement_cancel_owned = c.upstream_retirement_cancel_owned;
         const bool retirement_cancel_retry = c.upstream_retirement_cancel_retry;
+        const u32 close_episode = c.upstream_close_episode;
+        const u8 close_target_owned = c.upstream_close_target_owned;
+        const u8 close_cancel_owned = c.upstream_close_cancel_owned;
+        const bool close_pause_cancel_owned = c.upstream_close_pause_cancel_owned;
         c.reset();
         conns[cid].id = cid;
         conns[cid].shard_id = allocated_shard;
@@ -789,6 +944,10 @@ public:
         conns[cid].upstream_retirement_recv_owned = retirement_recv_owned;
         conns[cid].upstream_retirement_cancel_owned = retirement_cancel_owned;
         conns[cid].upstream_retirement_cancel_retry = retirement_cancel_retry;
+        conns[cid].upstream_close_episode = close_episode;
+        conns[cid].upstream_close_target_owned = close_target_owned;
+        conns[cid].upstream_close_cancel_owned = close_cancel_owned;
+        conns[cid].upstream_close_pause_cancel_owned = close_pause_cancel_owned;
         pending_free[pending_free_count++] = cid;
     }
 
@@ -875,6 +1034,7 @@ public:
     bool submit_connect_impl(Connection& c, const void* addr, u32 addr_len) {
         if (backend.add_connect(c.upstream_fd, c.id, addr, addr_len, c.upstream_episode)) {
             c.pending_ops++;
+            c.upstream_connect_armed = true;
             return true;
         }
         return false;
@@ -1033,6 +1193,12 @@ public:
     }
 
     void close_conn_impl(Connection& c) {
+        // A close is terminal for a parked request boundary. Readiness may have
+        // been published earlier in the same CQE batch; batch-end scans must see
+        // cleared state and never repeat request-1 completion on a dead slot.
+        c.http1_boundary_deferred = false;
+        c.http1_boundary_ready = false;
+        c.http1_boundary_successor_episode = 0;
         // epoch_held covers a suspended HTTP/2 async (wait/proxy) stream pinning
         // the config epoch without an h1-style req_start_us (see event_loop.h).
         if (c.req_start_us != 0 || c.epoch_held) epoch_leave();
@@ -1046,23 +1212,50 @@ public:
         const bool idle_return_recv_draining =
             c.idle_return_fd >= 0 && (c.upstream_recv_armed || c.upstream_recv_cancel_inflight ||
                                       c.upstream_recv_pause_cancel_pending);
+        // Preserve exact live-successor ownership across free_conn::reset().
+        // The old C1 token remains in its separate tombstone; this ledger is
+        // only for operations submitted under the current successor token.
+        const bool successor_close_already_owned =
+            c.upstream_close_target_owned != 0 || c.upstream_close_cancel_owned != 0 ||
+            c.upstream_close_pause_cancel_owned;
+        if (!idle_return_recv_draining && !successor_close_already_owned &&
+            valid_upstream_episode(c.upstream_episode)) {
+            u8 targets = 0;
+            if (c.upstream_connect_armed) targets |= kUpstreamOpConnect;
+            if (c.upstream_recv_armed || c.upstream_recv_cancel_inflight)
+                targets |= kUpstreamOpRecv;
+            if (c.upstream_send_armed) targets |= kUpstreamOpSend;
+            if (targets != 0 || c.upstream_recv_pause_cancel_pending) {
+                c.upstream_close_episode = c.upstream_episode;
+                c.upstream_close_target_owned = targets;
+                c.upstream_close_pause_cancel_owned =
+                    c.upstream_recv_pause_cancel_pending;
+            }
+        }
         // Only cancel when ops are in flight.
         if (c.pending_ops > 0) {
             // If an idle upstream fd is parked waiting for its old multishot recv to
             // drain, do not submit another close-path UpstreamRecv cancel for a newer
             // upstream_fd on the same conn_id. The parked recv/cancel pair owns these
             // flags until try_deferred_upstream_rearm observes both CQEs.
-            const bool cancel_upstream_recv = c.upstream_recv_armed && !idle_return_recv_draining;
-            c.pending_ops += backend.cancel(c.fd,
-                                            c.id,
-                                            c.recv_armed,
-                                            c.send_armed,
-                                            cancel_upstream_recv,
-                                            c.upstream_send_armed,
-                                            c.upstream_fd >= 0,
-                                            c.upstream_episode,
-                                            c.yield_timeout_armed,
-                                            c.yield_timer_gen);
+            const bool cancel_upstream_recv = c.upstream_recv_armed &&
+                                              !c.upstream_recv_pause_cancel_pending &&
+                                              !idle_return_recv_draining;
+            u8 close_cancel_mask = 0;
+            const u32 submitted = backend.cancel(c.fd,
+                                                  c.id,
+                                                  c.recv_armed,
+                                                  c.send_armed,
+                                                  c.upstream_connect_armed,
+                                                  cancel_upstream_recv,
+                                                  c.upstream_send_armed,
+                                                  c.upstream_fd >= 0,
+                                                  c.upstream_episode,
+                                                  c.yield_timeout_armed,
+                                                  c.yield_timer_gen,
+                                                  &close_cancel_mask);
+            c.upstream_close_cancel_owned |= close_cancel_mask;
+            c.pending_ops += submitted;
         }
         if (c.fd >= 0) {
             ::close(c.fd);
@@ -1352,6 +1545,28 @@ public:
                             reclaim_slot(conn.id);
                         break;
                     }
+                    // A strict-retirement boundary may coexist with the
+                    // long-lived downstream multishot recv. wait() has already
+                    // copied positive provided-buffer bytes into recv_buf; keep
+                    // them byte-exact but do not parse, route, refresh timers,
+                    // invoke callbacks, or alter request state until batch-end
+                    // retirement handoff. Terminal-positive rearms only this
+                    // buffering recv target. EOF/error/cancel fails closed and
+                    // cancels the marker without repeating request completion.
+                    if (ev.type == IoEventType::Recv && conn.http1_boundary_deferred) {
+                        if (!ev.more) {
+                            if (conn.pending_ops > 0) conn.pending_ops--;
+                            conn.recv_armed = false;
+                        }
+                        if (ev.result <= 0) {
+                            this->close_conn(conn);
+                            break;
+                        }
+                        if (!ev.more && !this->submit_recv_impl(conn)) {
+                            this->close_conn(conn);
+                        }
+                        break;
+                    }
                     // Send-wait recv pause: pause_recv() cancels the multishot
                     // recv before a non-empty wait(downstream.send()). Only the
                     // terminal -ECANCELED CQE is special-cased here (flag reset
@@ -1489,6 +1704,8 @@ public:
                         if (conn.pending_ops > 0) conn.pending_ops--;
                         if (ev.type == IoEventType::Recv) conn.recv_armed = false;
                         if (ev.type == IoEventType::Send) conn.send_armed = false;
+                        if (ev.type == IoEventType::UpstreamConnect)
+                            conn.upstream_connect_armed = false;
                         if (ev.type == IoEventType::UpstreamSend) {
                             conn.upstream_send_armed = false;
                             // A torn-down h2-proxy episode's request send has now drained, so

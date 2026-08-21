@@ -123,6 +123,14 @@ inline constexpr u8 kLocalSubmitFailureAux = 2;
 // from the retiring recv target (aux 0) and from pause/rearm cancellation: its
 // final CQE retires only the explicit C1 cancel ownership.
 inline constexpr u8 kUpstreamRetirementCancelAux = 3;
+// Close-path cancel ownership for a live successor episode. Unlike aux 0
+// (the operation target), this completion owns the cancel SQE's pending-op
+// count. Keeping it distinct prevents either record from stealing the other.
+inline constexpr u8 kUpstreamCloseCancelAux = 4;
+
+inline constexpr u8 kUpstreamOpConnect = 1u << 0;
+inline constexpr u8 kUpstreamOpRecv = 1u << 1;
+inline constexpr u8 kUpstreamOpSend = 1u << 2;
 
 // Unified completion event — field order optimized for minimal padding.
 struct IoEvent {

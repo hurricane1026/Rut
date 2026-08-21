@@ -604,13 +604,17 @@ u32 IoUringBackend::cancel(i32 /*fd*/,
                            u32 conn_id,
                            bool recv_armed,
                            bool send_armed,
+                           bool upstream_connect_armed,
                            bool upstream_recv_armed,
                            bool upstream_send_armed,
                            bool has_upstream,
                            u32 upstream_episode,
                            bool yield_armed,
-                           u32 yield_timer_gen) {
-    if ((has_upstream || upstream_recv_armed || upstream_send_armed) &&
+                           u32 yield_timer_gen,
+                           u8* upstream_cancel_mask) {
+    if (upstream_cancel_mask) *upstream_cancel_mask = 0;
+    if ((has_upstream || upstream_connect_armed || upstream_recv_armed ||
+         upstream_send_armed) &&
         !valid_upstream_episode(upstream_episode))
         return 0;
     // Only cancel op types that are actually in flight to avoid wasting
@@ -634,9 +638,11 @@ u32 IoUringBackend::cancel(i32 /*fd*/,
                                                               upstream_episode),
                                     conn_id,
                                     IoEventType::UpstreamRecv,
-                                    0,
-                                    upstream_episode))
+                                    kUpstreamCloseCancelAux,
+                                    upstream_episode)) {
                 submitted++;
+                if (upstream_cancel_mask) *upstream_cancel_mask |= kUpstreamOpRecv;
+            }
         }
         if (upstream_send_armed) {
             if (cancel_by_user_data(encode_upstream_user_data(conn_id,
@@ -644,19 +650,23 @@ u32 IoUringBackend::cancel(i32 /*fd*/,
                                                               upstream_episode),
                                     conn_id,
                                     IoEventType::UpstreamSend,
-                                    0,
-                                    upstream_episode))
+                                    kUpstreamCloseCancelAux,
+                                    upstream_episode)) {
                 submitted++;
+                if (upstream_cancel_mask) *upstream_cancel_mask |= kUpstreamOpSend;
+            }
         }
-        // UpstreamConnect: short-lived, cancel to be safe.
-        if (cancel_by_user_data(encode_upstream_user_data(conn_id,
+        if (upstream_connect_armed &&
+            cancel_by_user_data(encode_upstream_user_data(conn_id,
                                                           IoEventType::UpstreamConnect,
                                                           upstream_episode),
                                 conn_id,
                                 IoEventType::UpstreamConnect,
-                                0,
-                                upstream_episode))
+                                kUpstreamCloseCancelAux,
+                                upstream_episode)) {
             submitted++;
+            if (upstream_cancel_mask) *upstream_cancel_mask |= kUpstreamOpConnect;
+        }
     }
     // JIT handler yield timer (IORING_OP_TIMEOUT) — cancel pins the slot
     // until the target CQE arrives, preventing stale HandlerTimer events
@@ -762,10 +772,22 @@ u32 IoUringBackend::wait(IoEvent* events, u32 max_events, Connection* conns, u32
             // UpstreamRecv → upstream_recv_buf; Recv → recv_buf.
             // Buffer is NOT reset here — callback resets when it consumes data.
             i32 buf_result = cqe->res;
-            const bool stale_upstream =
-                io_event_is_upstream(type) &&
-                (conn_id >= max_conns || upstream_episode == 0 ||
-                 upstream_episode != conns[conn_id].upstream_episode);
+            bool stale_upstream = false;
+            if (io_event_is_upstream(type)) {
+                stale_upstream = conns == nullptr || conn_id >= max_conns ||
+                                 upstream_episode == 0 ||
+                                 upstream_episode != conns[conn_id].upstream_episode;
+                if (!stale_upstream && type == IoEventType::UpstreamRecv) {
+                    const auto& conn = conns[conn_id];
+                    // Episode equality alone is not ownership: a forged or
+                    // duplicate aux-0 CQE must not mutate the live recv buffer,
+                    // and a closed successor's target must drain accounting
+                    // without copying bytes into reset storage.
+                    stale_upstream = aux != 0 || conn.fd < 0 ||
+                                     (!conn.upstream_recv_armed &&
+                                      !conn.upstream_recv_cancel_inflight);
+                }
+            }
             if (cqe->res > 0 && conn_id < max_conns && !stale_upstream) {
                 u32 nbytes = static_cast<u32>(cqe->res);
                 // TLS client connections receive ciphertext: land it in
@@ -806,16 +828,20 @@ u32 IoUringBackend::wait(IoEvent* events, u32 max_events, Connection* conns, u32
         // --- Send completion: enforce full-send proactor semantics ---
         // If IORING_OP_SEND returned partial, re-submit the remainder.
         // Only emit completion when all bytes sent (or error).
-        if ((type == IoEventType::Send || type == IoEventType::UpstreamSend) &&
+        if ((type == IoEventType::Send ||
+             (type == IoEventType::UpstreamSend && aux == 0)) &&
             conn_id < kMaxSendState) {
             auto& ss = (type == IoEventType::UpstreamSend) ? upstream_send_state[conn_id]
                                                            : send_state[conn_id];
-            if (type == IoEventType::UpstreamSend &&
-                (!valid_upstream_episode(upstream_episode) ||
-                 ss.upstream_episode != upstream_episode ||
-                 (conns != nullptr &&
-                  (conn_id >= max_conns ||
-                   conns[conn_id].upstream_episode != upstream_episode)))) {
+            const bool live_upstream_send_owned =
+                type != IoEventType::UpstreamSend ||
+                (valid_upstream_episode(upstream_episode) &&
+                 ss.upstream_episode == upstream_episode &&
+                 (conns == nullptr ||
+                  (conn_id < max_conns && conns[conn_id].fd >= 0 &&
+                   conns[conn_id].upstream_episode == upstream_episode &&
+                   conns[conn_id].upstream_send_armed)));
+            if (!live_upstream_send_owned) {
                 // This CQE belongs to a previous upstream episode (or is
                 // malformed). Never apply its byte count to the state now
                 // installed for this connection ID and never resubmit it.

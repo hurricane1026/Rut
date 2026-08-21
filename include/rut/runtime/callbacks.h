@@ -73,6 +73,12 @@ void on_upstream_response(void* lp, Connection& conn, IoEvent ev);
 template <typename Loop>
 void on_proxy_response_sent(void* lp, Connection& conn, IoEvent ev);
 
+// Run the existing post-proxy-response HTTP/1 pipeline/header tail. io_uring
+// may invoke this at batch end after its old upstream recv episode retires;
+// other loops call it directly from on_proxy_response_sent.
+template <typename Loop>
+void continue_http1_request_boundary(Loop* loop, Connection& conn);
+
 template <typename Loop>
 void on_response_header_sent(void* lp, Connection& conn, IoEvent ev);
 

@@ -4926,7 +4926,9 @@ TEST(uring, pause_upstream_recv_cancels_recv_spares_send) {
 
     static u8 payload[64u * 1024u];
     REQUIRE(backend.add_recv_upstream(fds[0], conn.id));
+    conn.upstream_recv_armed = true;  // mirror submit_recv_upstream_impl ownership
     REQUIRE(backend.add_send_upstream(fds[0], conn.id, payload, sizeof(payload)));
+    conn.upstream_send_armed = true;  // mirror submit_send_upstream_impl ownership
     IoEvent ev[8]{};
     backend.wait(ev, 8, &conn, 1);  // submit; buffer is full so neither completes
 
@@ -5284,12 +5286,22 @@ TEST(uring, close_with_idle_return_drain_skips_second_upstream_recv_cancel) {
     conn.upstream_recv_armed = true;  // owned by the old parked recv drain
     conn.upstream_recv_cancel_inflight = true;
 
+    const u32 sq_tail_before =
+        __atomic_load_n(loop->backend.sq_tail, __ATOMIC_ACQUIRE);
     loop->close_conn_impl(conn);
 
     CHECK(conn.close_after_idle_return);
     CHECK(conn.upstream_recv_armed);
     CHECK(conn.upstream_recv_cancel_inflight);
-    CHECK_EQ(conn.pending_ops, 2u);  // old recv + UpstreamConnect cancel only; no 2nd recv cancel
+    // The only owner is the old parked recv target. No successor connect was
+    // submitted or armed, and the idle-return drain suppresses a second recv
+    // cancel, so close must not invent either cancel ownership.
+    CHECK_EQ(conn.pending_ops, 1u);
+    CHECK_EQ(conn.upstream_close_episode, 0u);
+    CHECK_EQ(conn.upstream_close_target_owned, 0u);
+    CHECK_EQ(conn.upstream_close_cancel_owned, 0u);
+    CHECK_FALSE(conn.upstream_close_pause_cancel_owned);
+    CHECK_EQ(__atomic_load_n(loop->backend.sq_tail, __ATOMIC_ACQUIRE), sq_tail_before);
     CHECK(::close(cli[0]) < 0);
     CHECK(::close(upstream[0]) < 0);
 

@@ -159,12 +159,14 @@ struct IoUringBackend {
                u32 conn_id,
                bool recv_armed,
                bool send_armed,
+               bool upstream_connect_armed,
                bool upstream_recv_armed,
                bool upstream_send_armed,
                bool has_upstream,
                u32 upstream_episode = 1,
                bool yield_armed = false,
-               u32 yield_timer_gen = 0);
+               u32 yield_timer_gen = 0,
+               u8* upstream_cancel_mask = nullptr);
 
     bool cancel_yield_timeout(u32 conn_id, u32 yield_timer_gen);
 

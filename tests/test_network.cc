@@ -17808,6 +17808,98 @@ void prepare_recv_only_retirement(Connection& conn, u32 episode) {
     conn.upstream_recv_armed = true;
     conn.pending_ops = 1;
 }
+
+bool stage_http1_boundary_retirement(IoUringEventLoop* loop,
+                                     const RouteConfig* old_config,
+                                     ShardEpoch* epoch,
+                                     ShardMetrics* metrics,
+                                     const u8* buffered,
+                                     u32 buffered_len,
+                                     Connection** out,
+                                     i32* peer_fd) {
+    if (loop == nullptr || out == nullptr || peer_fd == nullptr) return false;
+    Connection* conn = loop->alloc_conn();
+    if (conn == nullptr || !loop->alloc_upstream_buf(*conn)) return false;
+    i32 pair[2] = {-1, -1};
+    if (socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, pair) != 0) return false;
+    conn->fd = pair[0];
+    *peer_fd = pair[1];
+    conn->upstream_fd = dup(STDERR_FILENO);
+    if (conn->upstream_fd < 0) return false;
+
+    constexpr u32 kEpisode = 101;
+    conn->upstream_episode = kEpisode;
+    conn->recv_armed = true;
+    conn->upstream_recv_armed = true;
+    conn->pending_ops = 2;  // downstream recv + retiring upstream recv
+    if (!loop->begin_strict_upstream_retirement(*conn)) return false;
+
+    // The strict transport handoff has already detached the old upstream and
+    // queued the downstream response. Drive the real production send dispatch
+    // and callback from this exact state; no semantic admission is bypassed.
+    close(conn->upstream_fd);
+    conn->upstream_fd = -1;
+    conn->upstream_recv_armed = false;
+    conn->upstream_abandoned = true;
+    conn->upstream_keep_alive = false;
+    conn->response_policy_id = 0;
+    conn->keep_alive = true;
+    conn->resp_status = 200;
+    conn->resp_body_sent = 2;
+    conn->req_start_us = monotonic_us();
+    conn->request_config = old_config;
+    conn->state = ConnState::Sending;
+    conn->set_slots(nullptr, &on_proxy_response_sent<IoUringEventLoop>, nullptr, nullptr);
+    conn->send_armed = true;
+    conn->pending_ops++;  // downstream response send
+    if (buffered_len > 0 &&
+        conn->recv_buf.write(buffered, buffered_len) != buffered_len)
+        return false;
+
+    loop->epoch = epoch;
+    loop->metrics = metrics;
+    *out = conn;
+    return true;
+}
+
+bool harvest_http1_boundary_recv(IoUringEventLoop* loop,
+                                 Connection& conn,
+                                 const u8* bytes,
+                                 u32 len,
+                                 i32 result,
+                                 bool more,
+                                 IoEvent* out) {
+    if (loop == nullptr || out == nullptr) return false;
+    constexpr u16 kBufId = 29;
+    if (result > 0) {
+        if (bytes == nullptr || len != static_cast<u32>(result) || len > 4096) return false;
+        __builtin_memcpy(loop->backend.buf_base + static_cast<u64>(kBufId) * 4096, bytes, len);
+    }
+    const u32 cq_tail = __atomic_load_n(loop->backend.cq_tail, __ATOMIC_ACQUIRE);
+    auto& cqe = loop->backend.cq_entries[cq_tail & *loop->backend.cq_ring_mask];
+    cqe.user_data = encode_non_upstream_user_data({conn.id, IoEventType::Recv, 0});
+    cqe.res = result;
+    cqe.flags = more ? IORING_CQE_F_MORE : 0;
+    if (result > 0)
+        cqe.flags |= IORING_CQE_F_BUFFER |
+                     (static_cast<u32>(kBufId) << IORING_CQE_BUFFER_SHIFT);
+    __atomic_store_n(loop->backend.cq_tail, cq_tail + 1, __ATOMIC_RELEASE);
+    loop->backend.pending = 0;
+    IoEvent events[2]{};
+    const u32 n = loop->backend.wait(events, 2, loop->conns, IoUringEventLoop::kMaxConns);
+    if (n != 1) return false;
+    *out = events[0];
+    return true;
+}
+
+u32 g_boundary_current_callback_count = 0;
+IoEvent g_boundary_current_event{};
+
+template <typename Loop>
+void boundary_current_callback(void*, Connection&, IoEvent ev) {
+    g_boundary_current_callback_count++;
+    g_boundary_current_event = ev;
+}
 }  // namespace
 
 TEST(iouring_episode, upstream_submissions_carry_episode_and_aux) {
@@ -17907,6 +17999,7 @@ TEST(iouring_episode, invalid_upstream_episodes_do_not_acquire_sqe_or_state) {
                             kConnId,
                             false,
                             false,
+                            false,
                             true,
                             false,
                             true,
@@ -17914,6 +18007,7 @@ TEST(iouring_episode, invalid_upstream_episodes_do_not_acquire_sqe_or_state) {
              0u);
     CHECK_EQ(backend.cancel(-1,
                             kConnId,
+                            false,
                             false,
                             false,
                             true,
@@ -18551,6 +18645,1188 @@ TEST(iouring_retirement, completed_tombstone_isolates_downstream_pending_owner) 
     CHECK_EQ(loop->free_top, free_before + 1u);
 }
 
+TEST(iouring_boundary, send_first_target_first_resumes_once_after_batch_with_current_config) {
+    ScopedIoUringLoopForRetirement guard;
+    if (!guard.init()) SKIP("io_uring unavailable");
+    auto* loop = guard.loop;
+    RouteConfig old_config{};
+    RouteConfig current_config{};
+    REQUIRE(old_config.add_static("/old", 'G', 201));
+    REQUIRE(current_config.add_static("/next", 'G', 207));
+    const RouteConfig* active = &old_config;
+    loop->config_ptr = &active;
+    ShardEpoch epoch{};
+    epoch.epoch.store(1, std::memory_order_relaxed);  // request 1 entered
+    ShardMetrics metrics{};
+    metrics.init();
+    metrics.requests_active = 1;
+    static constexpr char kRequest2[] =
+        "GET /next HTTP/1.1\r\nHost: current.example\r\nConnection: keep-alive\r\n\r\n";
+    Connection* conn = nullptr;
+    i32 peer = -1;
+    REQUIRE(stage_http1_boundary_retirement(loop,
+                                            &old_config,
+                                            &epoch,
+                                            &metrics,
+                                            reinterpret_cast<const u8*>(kRequest2),
+                                            sizeof(kRequest2) - 1,
+                                            &conn,
+                                            &peer));
+    const u32 handler_before = conn->handler_gen;
+    loop->dispatch({conn->id, 2, 0, 0, IoEventType::Send, 0});
+    REQUIRE(conn->http1_boundary_deferred);
+    CHECK_FALSE(conn->http1_boundary_ready);
+    CHECK_EQ(conn->handler_gen, handler_before);
+    CHECK_EQ(conn->req_start_us, 0u);
+    CHECK_EQ(conn->request_config, &old_config);
+    CHECK_EQ(epoch.epoch.load(std::memory_order_acquire), 2u);
+    CHECK_EQ(metrics.requests_total, 1u);
+    CHECK_EQ(metrics.requests_active, 0u);
+
+    // Put another node ahead of this connection. Any forbidden barrier refresh
+    // would remove/reinsert conn at the head and change these exact links.
+    Connection* timer_guard = loop->alloc_conn();
+    REQUIRE(timer_guard != nullptr);
+    loop->timer.add(timer_guard, loop->keepalive_timeout);
+    ListNode* timer_prev = conn->timer_node.prev;
+    ListNode* timer_next = conn->timer_node.next;
+    const u32 timer_slot = conn->timer_slot;
+
+    active = &current_config;
+    constexpr u32 kOld = 101;
+    loop->dispatch({conn->id, -ECANCELED, 0, 0, IoEventType::UpstreamRecv, 0, 0, kOld});
+    CHECK(conn->upstream_retirement_active);
+    CHECK_FALSE(conn->http1_boundary_ready);
+    CHECK_EQ(conn->handler_gen, handler_before);
+    loop->dispatch({conn->id,
+                    -ENOENT,
+                    0,
+                    0,
+                    IoEventType::UpstreamRecv,
+                    0,
+                    kUpstreamRetirementCancelAux,
+                    kOld});
+    REQUIRE_FALSE(conn->upstream_retirement_active);
+    REQUIRE(conn->http1_boundary_ready);
+    CHECK_EQ(conn->handler_gen, handler_before);  // final CQE did not resume inline
+    CHECK_EQ(conn->timer_node.prev, timer_prev);
+    CHECK_EQ(conn->timer_node.next, timer_next);
+    CHECK_EQ(conn->timer_slot, timer_slot);
+
+    loop->resume_deferred_http1_boundaries();
+    REQUIRE_FALSE(conn->http1_boundary_deferred);
+    CHECK_FALSE(conn->http1_boundary_ready);
+    CHECK_EQ(conn->handler_gen, handler_before + 1u);
+    CHECK_EQ(conn->request_config, &current_config);
+    CHECK_EQ(conn->resp_status, 207u);
+    CHECK_EQ(conn->state, ConnState::Sending);
+    CHECK_EQ(epoch.epoch.load(std::memory_order_acquire), 3u);
+    CHECK_EQ(metrics.requests_total, 1u);
+    CHECK_EQ(metrics.requests_active, 1u);
+    const u32 pending_after_resume = conn->pending_ops;
+    loop->resume_deferred_http1_boundaries();
+    CHECK_EQ(conn->handler_gen, handler_before + 1u);
+    CHECK_EQ(conn->pending_ops, pending_after_resume);
+
+    loop->free_conn(*timer_guard);
+    loop->close_conn(*conn);
+    close(peer);
+}
+
+TEST(iouring_boundary, send_first_cancel_first_and_retirement_first_preserve_ordering) {
+    // Send-first, cancel-own first: neither retirement record may parse request 2.
+    {
+        ScopedIoUringLoopForRetirement guard;
+        if (!guard.init()) SKIP("io_uring unavailable");
+        auto* loop = guard.loop;
+        RouteConfig config{};
+        REQUIRE(config.add_static("/cancel-first", 'G', 208));
+        const RouteConfig* active = &config;
+        loop->config_ptr = &active;
+        ShardEpoch epoch{};
+        epoch.epoch.store(1, std::memory_order_relaxed);
+        ShardMetrics metrics{};
+        metrics.init();
+        metrics.requests_active = 1;
+        static constexpr char kRequest[] =
+            "GET /cancel-first HTTP/1.1\r\nHost: x\r\n\r\n";
+        Connection* conn = nullptr;
+        i32 peer = -1;
+        REQUIRE(stage_http1_boundary_retirement(loop,
+                                                &config,
+                                                &epoch,
+                                                &metrics,
+                                                reinterpret_cast<const u8*>(kRequest),
+                                                sizeof(kRequest) - 1,
+                                                &conn,
+                                                &peer));
+        loop->dispatch({conn->id, 2, 0, 0, IoEventType::Send, 0});
+        REQUIRE(conn->http1_boundary_deferred);
+        constexpr u32 kOld = 101;
+        loop->dispatch({conn->id,
+                        -ENOENT,
+                        0,
+                        0,
+                        IoEventType::UpstreamRecv,
+                        0,
+                        kUpstreamRetirementCancelAux,
+                        kOld});
+        CHECK_EQ(conn->handler_gen, 0u);
+        CHECK(conn->upstream_retirement_active);
+        loop->dispatch(
+            {conn->id, -ECANCELED, 0, 0, IoEventType::UpstreamRecv, 0, 0, kOld});
+        CHECK_EQ(conn->handler_gen, 0u);
+        REQUIRE(conn->http1_boundary_ready);
+        loop->resume_deferred_http1_boundaries();
+        CHECK_EQ(conn->handler_gen, 1u);
+        CHECK_EQ(conn->resp_status, 208u);
+        loop->close_conn(*conn);
+        close(peer);
+    }
+
+    // Retirement-first: no marker is published; the later downstream send runs
+    // the same continuation directly.
+    {
+        ScopedIoUringLoopForRetirement guard;
+        if (!guard.init()) SKIP("io_uring unavailable");
+        auto* loop = guard.loop;
+        RouteConfig config{};
+        REQUIRE(config.add_static("/direct", 'G', 209));
+        const RouteConfig* active = &config;
+        loop->config_ptr = &active;
+        ShardEpoch epoch{};
+        epoch.epoch.store(1, std::memory_order_relaxed);
+        ShardMetrics metrics{};
+        metrics.init();
+        metrics.requests_active = 1;
+        static constexpr char kRequest[] = "GET /direct HTTP/1.1\r\nHost: x\r\n\r\n";
+        Connection* conn = nullptr;
+        i32 peer = -1;
+        REQUIRE(stage_http1_boundary_retirement(loop,
+                                                &config,
+                                                &epoch,
+                                                &metrics,
+                                                reinterpret_cast<const u8*>(kRequest),
+                                                sizeof(kRequest) - 1,
+                                                &conn,
+                                                &peer));
+        constexpr u32 kOld = 101;
+        loop->dispatch(
+            {conn->id, -ECANCELED, 0, 0, IoEventType::UpstreamRecv, 0, 0, kOld});
+        loop->dispatch({conn->id,
+                        -ENOENT,
+                        0,
+                        0,
+                        IoEventType::UpstreamRecv,
+                        0,
+                        kUpstreamRetirementCancelAux,
+                        kOld});
+        REQUIRE_FALSE(conn->upstream_retirement_active);
+        CHECK_FALSE(conn->http1_boundary_ready);
+        CHECK_FALSE(loop->http1_boundary_ready_pending);
+        loop->dispatch({conn->id, 2, 0, 0, IoEventType::Send, 0});
+        CHECK_FALSE(conn->http1_boundary_deferred);
+        CHECK_EQ(conn->handler_gen, 1u);
+        CHECK_EQ(conn->resp_status, 209u);
+        loop->resume_deferred_http1_boundaries();
+        CHECK_EQ(conn->handler_gen, 1u);
+        loop->close_conn(*conn);
+        close(peer);
+    }
+}
+
+TEST(iouring_boundary, fragmented_terminal_recv_buffers_rearms_and_preserves_timer) {
+    ScopedIoUringLoopForRetirement guard;
+    if (!guard.init()) SKIP("io_uring unavailable");
+    auto* loop = guard.loop;
+    RouteConfig config{};
+    REQUIRE(config.add_static("/fragment", 'G', 210));
+    const RouteConfig* active = &config;
+    loop->config_ptr = &active;
+    ShardEpoch epoch{};
+    epoch.epoch.store(1, std::memory_order_relaxed);
+    ShardMetrics metrics{};
+    metrics.init();
+    metrics.requests_active = 1;
+    Connection* conn = nullptr;
+    i32 peer = -1;
+    REQUIRE(stage_http1_boundary_retirement(
+        loop, &config, &epoch, &metrics, nullptr, 0, &conn, &peer));
+    loop->dispatch({conn->id, 2, 0, 0, IoEventType::Send, 0});
+    REQUIRE(conn->http1_boundary_deferred);
+    Connection* timer_guard = loop->alloc_conn();
+    REQUIRE(timer_guard != nullptr);
+    loop->timer.add(timer_guard, loop->keepalive_timeout);
+    ListNode* timer_prev = conn->timer_node.prev;
+    ListNode* timer_next = conn->timer_node.next;
+    const u32 timer_slot = conn->timer_slot;
+
+    static constexpr char kFirst[] = "GET /frag";
+    IoEvent first{};
+    REQUIRE(harvest_http1_boundary_recv(loop,
+                                        *conn,
+                                        reinterpret_cast<const u8*>(kFirst),
+                                        sizeof(kFirst) - 1,
+                                        sizeof(kFirst) - 1,
+                                        true,
+                                        &first));
+    const u32 pending_before = conn->pending_ops;
+    loop->dispatch(first);
+    CHECK_EQ(conn->recv_buf.len(), static_cast<u32>(sizeof(kFirst) - 1));
+    CHECK_EQ(conn->handler_gen, 0u);
+    CHECK_EQ(conn->pending_ops, pending_before);
+    CHECK(conn->recv_armed);
+    CHECK_EQ(conn->timer_node.prev, timer_prev);
+    CHECK_EQ(conn->timer_node.next, timer_next);
+    CHECK_EQ(conn->timer_slot, timer_slot);
+
+    static constexpr char kLast[] = "ment HTTP/1.1\r\nHost: x\r\n\r\n";
+    IoEvent last{};
+    REQUIRE(harvest_http1_boundary_recv(loop,
+                                        *conn,
+                                        reinterpret_cast<const u8*>(kLast),
+                                        sizeof(kLast) - 1,
+                                        sizeof(kLast) - 1,
+                                        false,
+                                        &last));
+    const u32 sq_tail_before = __atomic_load_n(loop->backend.sq_tail, __ATOMIC_ACQUIRE);
+    loop->dispatch(last);
+    CHECK_EQ(conn->recv_buf.len(),
+             static_cast<u32>(sizeof(kFirst) + sizeof(kLast) - 2));
+    CHECK_EQ(conn->handler_gen, 0u);
+    CHECK(conn->recv_armed);
+    CHECK_EQ(conn->pending_ops, pending_before);  // old final retired, new recv owns one
+    CHECK_EQ(__atomic_load_n(loop->backend.sq_tail, __ATOMIC_ACQUIRE), sq_tail_before + 1u);
+    CHECK_EQ(conn->timer_node.prev, timer_prev);
+    CHECK_EQ(conn->timer_node.next, timer_next);
+    CHECK_EQ(conn->timer_slot, timer_slot);
+
+    constexpr u32 kOld = 101;
+    loop->dispatch(
+        {conn->id, -ECANCELED, 0, 0, IoEventType::UpstreamRecv, 0, 0, kOld});
+    loop->dispatch({conn->id,
+                    -ENOENT,
+                    0,
+                    0,
+                    IoEventType::UpstreamRecv,
+                    0,
+                    kUpstreamRetirementCancelAux,
+                    kOld});
+    CHECK_EQ(conn->handler_gen, 0u);
+    loop->resume_deferred_http1_boundaries();
+    CHECK_EQ(conn->handler_gen, 1u);
+    CHECK_EQ(conn->resp_status, 210u);
+
+    loop->free_conn(*timer_guard);
+    loop->close_conn(*conn);
+    close(peer);
+}
+
+TEST(iouring_boundary, pipeline_stash_precedes_late_bytes_after_retirement) {
+    ScopedIoUringLoopForRetirement guard;
+    if (!guard.init()) SKIP("io_uring unavailable");
+    auto* loop = guard.loop;
+    RouteConfig config{};
+    REQUIRE(config.add_static("/stash", 'G', 211));
+    const RouteConfig* active = &config;
+    loop->config_ptr = &active;
+    ShardEpoch epoch{};
+    epoch.epoch.store(1, std::memory_order_relaxed);
+    ShardMetrics metrics{};
+    metrics.init();
+    metrics.requests_active = 1;
+    Connection* conn = nullptr;
+    i32 peer = -1;
+    REQUIRE(stage_http1_boundary_retirement(
+        loop, &config, &epoch, &metrics, nullptr, 0, &conn, &peer));
+    static constexpr char kRetryPrefix[] = "old!";
+    static constexpr char kStash[] = "GET /sta";
+    static constexpr char kLate[] = "sh HTTP/1.1\r\nHost: x\r\n\r\n";
+    REQUIRE_EQ(conn->send_buf.write(reinterpret_cast<const u8*>(kRetryPrefix),
+                                    sizeof(kRetryPrefix) - 1),
+               sizeof(kRetryPrefix) - 1);
+    REQUIRE_EQ(conn->send_buf.write(reinterpret_cast<const u8*>(kStash), sizeof(kStash) - 1),
+               sizeof(kStash) - 1);
+    conn->retry_req_send_len = sizeof(kRetryPrefix) - 1;
+    conn->pipeline_stash_len = sizeof(kStash) - 1;
+    REQUIRE_EQ(conn->recv_buf.write(reinterpret_cast<const u8*>(kLate), sizeof(kLate) - 1),
+               sizeof(kLate) - 1);
+
+    loop->dispatch({conn->id, 2, 0, 0, IoEventType::Send, 0});
+    REQUIRE(conn->http1_boundary_deferred);
+    CHECK_EQ(conn->pipeline_stash_len, static_cast<u16>(sizeof(kStash) - 1));
+    CHECK_EQ(conn->retry_req_send_len, static_cast<u32>(sizeof(kRetryPrefix) - 1));
+    constexpr u32 kOld = 101;
+    loop->dispatch(
+        {conn->id, -ECANCELED, 0, 0, IoEventType::UpstreamRecv, 0, 0, kOld});
+    loop->dispatch({conn->id,
+                    -ENOENT,
+                    0,
+                    0,
+                    IoEventType::UpstreamRecv,
+                    0,
+                    kUpstreamRetirementCancelAux,
+                    kOld});
+    loop->resume_deferred_http1_boundaries();
+    CHECK_EQ(conn->handler_gen, 1u);
+    CHECK_EQ(conn->resp_status, 211u);
+    CHECK_STREQ(conn->req_path, "/stash");
+    CHECK_EQ(conn->pipeline_stash_len, 0u);
+    CHECK_EQ(conn->retry_req_send_len, 0u);
+
+    loop->close_conn(*conn);
+    close(peer);
+}
+
+TEST(iouring_boundary, eof_error_and_close_before_final_cancel_without_resume) {
+    // Terminal EOF owns and retires the downstream recv, then the two exact C1
+    // finals reclaim the closed slot without ever admitting request 2.
+    {
+        ScopedIoUringLoopForRetirement guard;
+        if (!guard.init()) SKIP("io_uring unavailable");
+        auto* loop = guard.loop;
+        RouteConfig config{};
+        const RouteConfig* active = &config;
+        loop->config_ptr = &active;
+        ShardEpoch epoch{};
+        epoch.epoch.store(1, std::memory_order_relaxed);
+        ShardMetrics metrics{};
+        metrics.init();
+        metrics.requests_active = 1;
+        const u32 free_before = loop->free_top;
+        Connection* conn = nullptr;
+        i32 peer = -1;
+        REQUIRE(stage_http1_boundary_retirement(
+            loop, &config, &epoch, &metrics, nullptr, 0, &conn, &peer));
+        const u32 id = conn->id;
+        loop->dispatch({id, 2, 0, 0, IoEventType::Send, 0});
+        REQUIRE(conn->http1_boundary_deferred);
+        IoEvent eof{};
+        REQUIRE(harvest_http1_boundary_recv(loop, *conn, nullptr, 0, 0, false, &eof));
+        loop->dispatch(eof);
+        Connection& closed = loop->conns[id];
+        CHECK_EQ(closed.fd, -1);
+        CHECK_FALSE(closed.http1_boundary_deferred);
+        CHECK_FALSE(closed.http1_boundary_ready);
+        CHECK_EQ(closed.handler_gen, 0u);
+        REQUIRE_EQ(loop->pending_free_count, 1u);
+        constexpr u32 kOld = 101;
+        loop->dispatch({id, -ECANCELED, 0, 0, IoEventType::UpstreamRecv, 0, 0, kOld});
+        loop->dispatch({id,
+                        -ENOENT,
+                        0,
+                        0,
+                        IoEventType::UpstreamRecv,
+                        0,
+                        kUpstreamRetirementCancelAux,
+                        kOld});
+        loop->resume_deferred_http1_boundaries();
+        CHECK_EQ(closed.handler_gen, 0u);
+        CHECK_EQ(loop->pending_free_count, 0u);
+        CHECK_EQ(loop->free_top, free_before);
+        close(peer);
+    }
+
+    // An ENOBUFS/error carrying F_MORE is still a live target: close submits
+    // cancellation rather than inventing a terminal decrement, and clears the
+    // boundary marker immediately.
+    {
+        ScopedIoUringLoopForRetirement guard;
+        if (!guard.init()) SKIP("io_uring unavailable");
+        auto* loop = guard.loop;
+        RouteConfig config{};
+        const RouteConfig* active = &config;
+        loop->config_ptr = &active;
+        ShardEpoch epoch{};
+        epoch.epoch.store(1, std::memory_order_relaxed);
+        ShardMetrics metrics{};
+        metrics.init();
+        metrics.requests_active = 1;
+        Connection* conn = nullptr;
+        i32 peer = -1;
+        REQUIRE(stage_http1_boundary_retirement(
+            loop, &config, &epoch, &metrics, nullptr, 0, &conn, &peer));
+        const u32 id = conn->id;
+        loop->dispatch({id, 2, 0, 0, IoEventType::Send, 0});
+        IoEvent error{};
+        REQUIRE(harvest_http1_boundary_recv(
+            loop, *conn, nullptr, 0, -ENOBUFS, true, &error));
+        const u32 pending_before = conn->pending_ops;
+        loop->dispatch(error);
+        Connection& closed = loop->conns[id];
+        CHECK_EQ(closed.fd, -1);
+        CHECK_FALSE(closed.http1_boundary_deferred);
+        CHECK_FALSE(closed.http1_boundary_ready);
+        CHECK_EQ(closed.handler_gen, 0u);
+        CHECK_GE(closed.pending_ops, pending_before);  // target stayed owned; cancel may add one
+        constexpr u32 kOld = 101;
+        loop->dispatch({id, -ECANCELED, 0, 0, IoEventType::UpstreamRecv, 0, 0, kOld});
+        loop->dispatch({id,
+                        -ENOENT,
+                        0,
+                        0,
+                        IoEventType::UpstreamRecv,
+                        0,
+                        kUpstreamRetirementCancelAux,
+                        kOld});
+        loop->resume_deferred_http1_boundaries();
+        CHECK_EQ(closed.handler_gen, 0u);
+        close(peer);
+    }
+
+    // Explicit close after park but before either final similarly cancels the
+    // rendezvous; last C1 records can only drain ownership.
+    {
+        ScopedIoUringLoopForRetirement guard;
+        if (!guard.init()) SKIP("io_uring unavailable");
+        auto* loop = guard.loop;
+        RouteConfig config{};
+        const RouteConfig* active = &config;
+        loop->config_ptr = &active;
+        ShardEpoch epoch{};
+        epoch.epoch.store(1, std::memory_order_relaxed);
+        ShardMetrics metrics{};
+        metrics.init();
+        metrics.requests_active = 1;
+        Connection* conn = nullptr;
+        i32 peer = -1;
+        REQUIRE(stage_http1_boundary_retirement(
+            loop, &config, &epoch, &metrics, nullptr, 0, &conn, &peer));
+        const u32 id = conn->id;
+        loop->dispatch({id, 2, 0, 0, IoEventType::Send, 0});
+        REQUIRE(conn->http1_boundary_deferred);
+        loop->close_conn(*conn);
+        Connection& closed = loop->conns[id];
+        CHECK_FALSE(closed.http1_boundary_deferred);
+        constexpr u32 kOld = 101;
+        loop->dispatch({id, -ECANCELED, 0, 0, IoEventType::UpstreamRecv, 0, 0, kOld});
+        loop->dispatch({id,
+                        -ENOENT,
+                        0,
+                        0,
+                        IoEventType::UpstreamRecv,
+                        0,
+                        kUpstreamRetirementCancelAux,
+                        kOld});
+        loop->resume_deferred_http1_boundaries();
+        CHECK_EQ(closed.handler_gen, 0u);
+        CHECK_FALSE(closed.http1_boundary_ready);
+        close(peer);
+    }
+}
+
+TEST(iouring_boundary, drain_after_park_and_quarantine_close_instead_of_resuming) {
+    for (const bool quarantine : {false, true}) {
+        ScopedIoUringLoopForRetirement guard;
+        if (!guard.init()) SKIP("io_uring unavailable");
+        auto* loop = guard.loop;
+        RouteConfig config{};
+        REQUIRE(config.add_static("/blocked", 'G', 212));
+        const RouteConfig* active = &config;
+        loop->config_ptr = &active;
+        ShardEpoch epoch{};
+        epoch.epoch.store(1, std::memory_order_relaxed);
+        ShardMetrics metrics{};
+        metrics.init();
+        metrics.requests_active = 1;
+        static constexpr char kRequest[] = "GET /blocked HTTP/1.1\r\nHost: x\r\n\r\n";
+        Connection* conn = nullptr;
+        i32 peer = -1;
+        REQUIRE(stage_http1_boundary_retirement(loop,
+                                                &config,
+                                                &epoch,
+                                                &metrics,
+                                                reinterpret_cast<const u8*>(kRequest),
+                                                sizeof(kRequest) - 1,
+                                                &conn,
+                                                &peer));
+        const u32 id = conn->id;
+        loop->dispatch({id, 2, 0, 0, IoEventType::Send, 0});
+        REQUIRE(conn->http1_boundary_deferred);
+        if (quarantine)
+            conn->upstream_episode_quarantined = true;
+        else
+            loop->drain(30);
+        constexpr u32 kOld = 101;
+        loop->dispatch({id, -ECANCELED, 0, 0, IoEventType::UpstreamRecv, 0, 0, kOld});
+        loop->dispatch({id,
+                        -ENOENT,
+                        0,
+                        0,
+                        IoEventType::UpstreamRecv,
+                        0,
+                        kUpstreamRetirementCancelAux,
+                        kOld});
+        REQUIRE(conn->http1_boundary_ready);
+        loop->resume_deferred_http1_boundaries();
+        Connection& closed = loop->conns[id];
+        CHECK_EQ(closed.fd, -1);
+        CHECK_EQ(closed.handler_gen, 0u);
+        CHECK_FALSE(closed.http1_boundary_deferred);
+        CHECK_FALSE(closed.http1_boundary_ready);
+        close(peer);
+    }
+}
+
+TEST(iouring_boundary, max_episode_without_retirement_owner_closes_before_request2_parse) {
+    ScopedIoUringLoopForRetirement guard;
+    if (!guard.init()) SKIP("io_uring unavailable");
+    auto* loop = guard.loop;
+    RouteConfig config{};
+    REQUIRE(config.add_static("/must-not-run", 'G', 213));
+    const RouteConfig* active = &config;
+    loop->config_ptr = &active;
+    ShardEpoch epoch{};
+    epoch.epoch.store(1, std::memory_order_relaxed);
+    ShardMetrics metrics{};
+    metrics.init();
+    metrics.requests_active = 1;
+    loop->epoch = &epoch;
+    loop->metrics = &metrics;
+
+    Connection* conn = loop->alloc_conn();
+    REQUIRE(conn != nullptr);
+    const u32 id = conn->id;
+    const u32 free_before = loop->free_top;
+    i32 pair[2] = {-1, -1};
+    REQUIRE_EQ(socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, pair), 0);
+    conn->fd = pair[0];
+    conn->upstream_fd = dup(STDERR_FILENO);
+    REQUIRE_GE(conn->upstream_fd, 0);
+    conn->upstream_episode = kIoUserDataMaxUpstreamEpisode;
+    conn->pending_ops = 0;
+    conn->upstream_recv_armed = false;
+    REQUIRE(loop->begin_strict_upstream_retirement(*conn));
+    REQUIRE(conn->upstream_episode_quarantined);
+    REQUIRE_FALSE(conn->upstream_retirement_active);
+    close(conn->upstream_fd);
+    conn->upstream_fd = -1;
+
+    static constexpr char kRequest2[] =
+        "GET /must-not-run HTTP/1.1\r\nHost: x\r\n\r\n";
+    REQUIRE_EQ(conn->recv_buf.write(reinterpret_cast<const u8*>(kRequest2),
+                                    sizeof(kRequest2) - 1),
+               sizeof(kRequest2) - 1);
+    conn->keep_alive = true;
+    conn->resp_status = 200;
+    conn->resp_body_sent = 2;
+    conn->req_start_us = monotonic_us();
+    conn->request_config = &config;
+    conn->state = ConnState::Sending;
+    conn->set_slots(nullptr, &on_proxy_response_sent<IoUringEventLoop>, nullptr, nullptr);
+    conn->send_armed = true;
+    conn->pending_ops = 1;
+
+    loop->dispatch({id, 2, 0, 0, IoEventType::Send, 0});
+    Connection& closed = loop->conns[id];
+    CHECK_EQ(closed.fd, -1);
+    CHECK_EQ(closed.handler_gen, 0u);
+    CHECK_FALSE(closed.http1_boundary_deferred);
+    CHECK_FALSE(closed.http1_boundary_ready);
+    CHECK(closed.upstream_episode_quarantined);
+    CHECK_EQ(loop->free_top, free_before);  // quarantined slot is never reused
+    close(pair[1]);
+}
+
+TEST(iouring_boundary, inactive_tombstone_routes_only_documented_current_successor_events) {
+    ScopedIoUringLoopForRetirement guard;
+    if (!guard.init()) SKIP("io_uring unavailable");
+    auto* loop = guard.loop;
+    Connection* conn = loop->alloc_conn();
+    REQUIRE(conn != nullptr);
+    REQUIRE(loop->alloc_upstream_buf(*conn));
+    conn->fd = dup(STDERR_FILENO);
+    REQUIRE_GE(conn->fd, 0);
+    conn->upstream_fd = dup(STDERR_FILENO);
+    REQUIRE_GE(conn->upstream_fd, 0);
+    constexpr u32 kRetired = 301;
+    constexpr u32 kCurrent = 302;
+    conn->upstream_retiring_episode = kRetired;
+    conn->upstream_episode = kCurrent;
+    conn->upstream_retirement_active = false;
+    conn->state = ConnState::Proxying;
+    conn->set_slots(nullptr,
+                    nullptr,
+                    &boundary_current_callback<IoUringEventLoop>,
+                    &boundary_current_callback<IoUringEventLoop>);
+    g_boundary_current_callback_count = 0;
+    g_boundary_current_event = {};
+
+    conn->pending_ops = 1;
+    conn->upstream_connect_armed = true;
+    loop->dispatch(
+        {conn->id, 0, 0, 0, IoEventType::UpstreamConnect, 0, 0, kCurrent});
+    CHECK_EQ(g_boundary_current_callback_count, 1u);
+    CHECK_EQ(g_boundary_current_event.type, IoEventType::UpstreamConnect);
+    CHECK_EQ(conn->pending_ops, 0u);
+
+    // Submit a real successor recv, verify its SQE carries the advanced token,
+    // then harvest and dispatch its production provided-buffer completion.
+    const u32 recv_tail = __atomic_load_n(loop->backend.sq_tail, __ATOMIC_ACQUIRE);
+    REQUIRE(loop->submit_recv_upstream(*conn));
+    UpstreamEventToken successor_token{};
+    REQUIRE(decode_upstream_event_token(
+        loop->backend.sq_entries[recv_tail & *loop->backend.sq_ring_mask].user_data,
+        &successor_token));
+    CHECK_EQ(successor_token.episode, kCurrent);
+    CHECK_EQ(successor_token.type, IoEventType::UpstreamRecv);
+    constexpr u16 kSuccessorBufId = 36;
+    static constexpr char kSuccessorBytes[] = "new";
+    __builtin_memcpy(loop->backend.buf_base + static_cast<u64>(kSuccessorBufId) * 4096,
+                     kSuccessorBytes,
+                     sizeof(kSuccessorBytes) - 1);
+    u32 successor_cq_tail = __atomic_load_n(loop->backend.cq_tail, __ATOMIC_ACQUIRE);
+    auto& successor_cqe =
+        loop->backend.cq_entries[successor_cq_tail & *loop->backend.cq_ring_mask];
+    successor_cqe.user_data = encode_upstream_event_token(
+        {conn->id, IoEventType::UpstreamRecv, kCurrent, 0});
+    successor_cqe.res = sizeof(kSuccessorBytes) - 1;
+    successor_cqe.flags = IORING_CQE_F_BUFFER |
+                          (static_cast<u32>(kSuccessorBufId) << IORING_CQE_BUFFER_SHIFT);
+    __atomic_store_n(loop->backend.cq_tail, successor_cq_tail + 1, __ATOMIC_RELEASE);
+    loop->backend.pending = 0;
+    IoEvent successor_events[2]{};
+    REQUIRE_EQ(loop->backend.wait(successor_events,
+                                  2,
+                                  loop->conns,
+                                  IoUringEventLoop::kMaxConns),
+               1u);
+    CHECK_EQ(conn->upstream_recv_buf.len(), sizeof(kSuccessorBytes) - 1);
+    loop->dispatch(successor_events[0]);
+    CHECK_EQ(g_boundary_current_callback_count, 2u);
+    CHECK_EQ(g_boundary_current_event.type, IoEventType::UpstreamRecv);
+    CHECK_FALSE(conn->upstream_recv_armed);
+    CHECK_EQ(conn->pending_ops, 0u);
+    conn->upstream_recv_buf.reset();
+
+    conn->pending_ops = 1;
+    conn->upstream_send_armed = true;
+    loop->dispatch({conn->id,
+                    -EIO,
+                    0,
+                    0,
+                    IoEventType::UpstreamSend,
+                    0,
+                    kLocalSubmitFailureAux,
+                    kCurrent});
+    CHECK_EQ(g_boundary_current_callback_count, 3u);
+    CHECK_EQ(g_boundary_current_event.type, IoEventType::UpstreamSend);
+    CHECK_EQ(g_boundary_current_event.aux, kLocalSubmitFailureAux);
+    CHECK_FALSE(conn->upstream_send_armed);
+    CHECK_EQ(conn->pending_ops, 0u);
+
+    // Production local-registration failures exist for recv and send. The
+    // synthetic recv completion owns the newly armed recv target exactly.
+    conn->pending_ops = 1;
+    conn->upstream_recv_armed = true;
+    loop->dispatch({conn->id,
+                    -EIO,
+                    0,
+                    0,
+                    IoEventType::UpstreamRecv,
+                    0,
+                    kLocalSubmitFailureAux,
+                    kCurrent});
+    CHECK_EQ(g_boundary_current_callback_count, 4u);
+    CHECK_EQ(g_boundary_current_event.type, IoEventType::UpstreamRecv);
+    CHECK_EQ(g_boundary_current_event.aux, kLocalSubmitFailureAux);
+    CHECK_FALSE(conn->upstream_recv_armed);
+    CHECK_EQ(conn->pending_ops, 0u);
+
+    // A legitimate aux value on the wrong operation type must not borrow a
+    // shared callback or another operation's aggregate pending count.
+    struct WrongLocalOwner {
+        IoEventType event_type;
+        IoEventType armed_type;
+    };
+    const WrongLocalOwner wrong_local_owners[] = {
+        {IoEventType::UpstreamConnect, IoEventType::UpstreamSend},
+        {IoEventType::UpstreamSend, IoEventType::UpstreamConnect},
+        {IoEventType::UpstreamRecv, IoEventType::UpstreamSend},
+    };
+    for (const auto& tc : wrong_local_owners) {
+        conn->upstream_connect_armed = tc.armed_type == IoEventType::UpstreamConnect;
+        conn->upstream_send_armed = tc.armed_type == IoEventType::UpstreamSend;
+        conn->upstream_recv_armed = tc.armed_type == IoEventType::UpstreamRecv;
+        conn->pending_ops = 1;
+        loop->dispatch({conn->id,
+                        -EIO,
+                        0,
+                        0,
+                        tc.event_type,
+                        0,
+                        kLocalSubmitFailureAux,
+                        kCurrent});
+        CHECK_EQ(conn->pending_ops, 1u);
+        CHECK_EQ(conn->upstream_connect_armed,
+                 tc.armed_type == IoEventType::UpstreamConnect);
+        CHECK_EQ(conn->upstream_send_armed, tc.armed_type == IoEventType::UpstreamSend);
+        CHECK_EQ(conn->upstream_recv_armed, tc.armed_type == IoEventType::UpstreamRecv);
+        CHECK_EQ(g_boundary_current_callback_count, 4u);
+    }
+    conn->upstream_connect_armed = false;
+    conn->upstream_send_armed = false;
+    conn->upstream_recv_armed = false;
+    conn->pending_ops = 0;
+
+    // Pause-cancel is a valid current recv control record and reaches its
+    // dedicated production accounting path, not the application callback.
+    conn->pending_ops = 1;
+    conn->upstream_recv_pause_cancel_pending = true;
+    loop->dispatch({conn->id,
+                    0,
+                    0,
+                    0,
+                    IoEventType::UpstreamRecv,
+                    0,
+                    kPauseCancelAux,
+                    kCurrent});
+    CHECK_FALSE(conn->upstream_recv_pause_cancel_pending);
+    CHECK_EQ(conn->pending_ops, 0u);
+    CHECK_EQ(g_boundary_current_callback_count, 4u);
+
+    // Exact-current aux 0 is still unowned once the submitted target drained.
+    // backend.wait must fence mutation before tombstone dispatch swallows it.
+    static constexpr char kUnownedRecvBytes[] = "ghost";
+    constexpr u16 kUnownedBufId = 38;
+    __builtin_memcpy(loop->backend.buf_base + static_cast<u64>(kUnownedBufId) * 4096,
+                     kUnownedRecvBytes,
+                     sizeof(kUnownedRecvBytes) - 1);
+    u32 unowned_cq_tail = __atomic_load_n(loop->backend.cq_tail, __ATOMIC_ACQUIRE);
+    auto& unowned_recv_cqe =
+        loop->backend.cq_entries[unowned_cq_tail & *loop->backend.cq_ring_mask];
+    unowned_recv_cqe.user_data = encode_upstream_event_token(
+        {conn->id, IoEventType::UpstreamRecv, kCurrent, 0});
+    unowned_recv_cqe.res = sizeof(kUnownedRecvBytes) - 1;
+    unowned_recv_cqe.flags = IORING_CQE_F_BUFFER | IORING_CQE_F_MORE |
+                             (static_cast<u32>(kUnownedBufId)
+                              << IORING_CQE_BUFFER_SHIFT);
+    __atomic_store_n(loop->backend.cq_tail, unowned_cq_tail + 1, __ATOMIC_RELEASE);
+    loop->backend.pending = 0;
+    IoEvent unowned_events[2]{};
+    REQUIRE_EQ(loop->backend.wait(unowned_events,
+                                  2,
+                                  loop->conns,
+                                  IoUringEventLoop::kMaxConns),
+               1u);
+    CHECK_EQ(conn->upstream_recv_buf.len(), 0u);
+    conn->pending_ops = 7;
+    loop->dispatch(unowned_events[0]);
+    CHECK_EQ(conn->pending_ops, 7u);
+    CHECK_EQ(g_boundary_current_callback_count, 4u);
+
+    static const u8 kUnownedSendBytes[] = {'g', 'h', 'o', 's', 't'};
+    loop->backend.upstream_send_state[conn->id] = {kUnownedSendBytes,
+                                                   -1,
+                                                   0,
+                                                   sizeof(kUnownedSendBytes),
+                                                   IoEventType::UpstreamSend,
+                                                   kCurrent};
+    const u32 unowned_sq_tail =
+        __atomic_load_n(loop->backend.sq_tail, __ATOMIC_ACQUIRE);
+    unowned_cq_tail = __atomic_load_n(loop->backend.cq_tail, __ATOMIC_ACQUIRE);
+    auto& unowned_send_cqe =
+        loop->backend.cq_entries[unowned_cq_tail & *loop->backend.cq_ring_mask];
+    unowned_send_cqe.user_data = encode_upstream_event_token(
+        {conn->id, IoEventType::UpstreamSend, kCurrent, 0});
+    unowned_send_cqe.res = 2;
+    unowned_send_cqe.flags = 0;
+    __atomic_store_n(loop->backend.cq_tail, unowned_cq_tail + 1, __ATOMIC_RELEASE);
+    loop->backend.pending = 0;
+    REQUIRE_EQ(loop->backend.wait(unowned_events,
+                                  2,
+                                  loop->conns,
+                                  IoUringEventLoop::kMaxConns),
+               1u);
+    CHECK_EQ(unowned_events[0].result, -ESTALE);
+    CHECK_EQ(loop->backend.upstream_send_state[conn->id].offset, 0u);
+    CHECK_EQ(loop->backend.upstream_send_state[conn->id].remaining,
+             static_cast<u32>(sizeof(kUnownedSendBytes)));
+    CHECK_EQ(__atomic_load_n(loop->backend.sq_tail, __ATOMIC_ACQUIRE), unowned_sq_tail);
+    conn->pending_ops = 7;
+    loop->dispatch(unowned_events[0]);
+    CHECK_EQ(conn->pending_ops, 7u);
+    CHECK_EQ(g_boundary_current_callback_count, 4u);
+
+    // Unknown current aux must be fenced before backend.wait can copy a
+    // provided buffer or advance/resubmit partial-send state.
+    static constexpr char kForgedBytes[] = "bad";
+    constexpr u16 kBufId = 37;
+    __builtin_memcpy(loop->backend.buf_base + static_cast<u64>(kBufId) * 4096,
+                     kForgedBytes,
+                     sizeof(kForgedBytes) - 1);
+    u32 cq_tail = __atomic_load_n(loop->backend.cq_tail, __ATOMIC_ACQUIRE);
+    auto& recv_cqe = loop->backend.cq_entries[cq_tail & *loop->backend.cq_ring_mask];
+    recv_cqe.user_data = encode_upstream_event_token(
+        {conn->id, IoEventType::UpstreamRecv, kCurrent, 99});
+    recv_cqe.res = sizeof(kForgedBytes) - 1;
+    recv_cqe.flags = IORING_CQE_F_BUFFER | IORING_CQE_F_MORE |
+                     (static_cast<u32>(kBufId) << IORING_CQE_BUFFER_SHIFT);
+    __atomic_store_n(loop->backend.cq_tail, cq_tail + 1, __ATOMIC_RELEASE);
+    loop->backend.pending = 0;
+    IoEvent harvested[2]{};
+    REQUIRE_EQ(loop->backend.wait(
+                   harvested, 2, loop->conns, IoUringEventLoop::kMaxConns),
+               1u);
+    CHECK_EQ(conn->upstream_recv_buf.len(), 0u);
+    CHECK_EQ(harvested[0].aux, 99u);
+    conn->pending_ops = 7;
+    loop->dispatch(harvested[0]);
+    CHECK_EQ(conn->pending_ops, 7u);
+    CHECK_EQ(g_boundary_current_callback_count, 4u);
+
+    static const u8 kSendBytes[] = {'w', 'i', 'r', 'e'};
+    loop->backend.upstream_send_state[conn->id] = {
+        kSendBytes, -1, 0, sizeof(kSendBytes), IoEventType::UpstreamSend, kCurrent};
+    cq_tail = __atomic_load_n(loop->backend.cq_tail, __ATOMIC_ACQUIRE);
+    auto& send_cqe = loop->backend.cq_entries[cq_tail & *loop->backend.cq_ring_mask];
+    send_cqe.user_data = encode_upstream_event_token(
+        {conn->id, IoEventType::UpstreamSend, kCurrent, 99});
+    send_cqe.res = 2;
+    send_cqe.flags = 0;
+    __atomic_store_n(loop->backend.cq_tail, cq_tail + 1, __ATOMIC_RELEASE);
+    loop->backend.pending = 0;
+    REQUIRE_EQ(loop->backend.wait(
+                   harvested, 2, loop->conns, IoUringEventLoop::kMaxConns),
+               1u);
+    CHECK_EQ(loop->backend.upstream_send_state[conn->id].offset, 0u);
+    CHECK_EQ(loop->backend.upstream_send_state[conn->id].remaining,
+             static_cast<u32>(sizeof(kSendBytes)));
+    CHECK_EQ(harvested[0].aux, 99u);
+    conn->pending_ops = 7;
+    loop->dispatch(harvested[0]);
+    CHECK_EQ(conn->pending_ops, 7u);
+    CHECK_EQ(g_boundary_current_callback_count, 4u);
+
+    const IoEvent swallowed[] = {
+        {conn->id,
+         0,
+         0,
+         0,
+         IoEventType::UpstreamRecv,
+         0,
+         kUpstreamRetirementCancelAux,
+         kCurrent},
+        {conn->id, 0, 0, 0, IoEventType::UpstreamRecv, 0, 99, kCurrent},
+        {conn->id, 0, 0, 0, IoEventType::UpstreamRecv, 0, kPauseCancelAux, kCurrent},
+        {conn->id, 0, 0, 0, IoEventType::UpstreamSend, 0, kPauseCancelAux, kCurrent},
+        {conn->id, 0, 0, 0, IoEventType::UpstreamConnect, 0, 0, kRetired},
+        {conn->id,
+         0,
+         0,
+         0,
+         IoEventType::UpstreamRecv,
+         0,
+         0,
+         kInvalidUpstreamEventEpisode},
+    };
+    for (const IoEvent& ev : swallowed) {
+        conn->pending_ops = 7;
+        loop->dispatch(ev);
+        CHECK_EQ(conn->pending_ops, 7u);
+        CHECK_EQ(g_boundary_current_callback_count, 4u);
+        CHECK_EQ(conn->upstream_retiring_episode, kRetired);
+    }
+
+    // C2 never clears the tombstone and therefore still rejects a second
+    // strict retirement without mutating either token or ownership.
+    conn->upstream_recv_armed = true;
+    conn->pending_ops = 1;
+    CHECK_FALSE(loop->begin_strict_upstream_retirement(*conn));
+    CHECK_EQ(conn->upstream_retiring_episode, kRetired);
+    CHECK_EQ(conn->upstream_episode, kCurrent);
+    CHECK_FALSE(conn->upstream_retirement_active);
+    conn->upstream_recv_armed = false;
+    conn->pending_ops = 0;
+    loop->close_conn(*conn);
+}
+
+TEST(iouring_boundary, close_drains_exact_successor_targets_and_cancels_without_accounting_theft) {
+    struct Case {
+        IoEventType type;
+        u8 bit;
+        bool cancel_first;
+    };
+    const Case cases[] = {
+        {IoEventType::UpstreamConnect, kUpstreamOpConnect, false},
+        {IoEventType::UpstreamRecv, kUpstreamOpRecv, true},
+        {IoEventType::UpstreamSend, kUpstreamOpSend, false},
+    };
+    for (const Case& tc : cases) {
+        ScopedIoUringLoopForRetirement guard;
+        if (!guard.init()) SKIP("io_uring unavailable");
+        auto* loop = guard.loop;
+        Connection* conn = loop->alloc_conn();
+        REQUIRE(conn != nullptr);
+        REQUIRE(loop->alloc_upstream_buf(*conn));
+        const u32 id = conn->id;
+        const u32 free_before = loop->free_top;
+        constexpr u32 kRetired = 401;
+        constexpr u32 kSuccessor = 402;
+        conn->upstream_retiring_episode = kRetired;
+        conn->upstream_episode = kSuccessor;
+        conn->upstream_retirement_active = false;
+        conn->fd = dup(STDERR_FILENO);
+        REQUIRE_GE(conn->fd, 0);
+        conn->upstream_fd = dup(STDERR_FILENO);
+        REQUIRE_GE(conn->upstream_fd, 0);
+        conn->state = ConnState::Proxying;
+        conn->set_slots(nullptr,
+                        nullptr,
+                        &boundary_current_callback<IoUringEventLoop>,
+                        &boundary_current_callback<IoUringEventLoop>);
+        if (tc.type == IoEventType::UpstreamConnect)
+            conn->upstream_connect_armed = true;
+        else if (tc.type == IoEventType::UpstreamRecv)
+            conn->upstream_recv_armed = true;
+        else
+            conn->upstream_send_armed = true;
+        conn->pending_ops = 1;
+        g_boundary_current_callback_count = 0;
+
+        const u32 cancel_tail = __atomic_load_n(loop->backend.sq_tail, __ATOMIC_ACQUIRE);
+        loop->close_conn(*conn);
+        Connection& closed = loop->conns[id];
+        REQUIRE_EQ(closed.fd, -1);
+        REQUIRE_EQ(loop->pending_free_count, 1u);
+        REQUIRE_EQ(closed.upstream_close_episode, kSuccessor);
+        REQUIRE_EQ(closed.upstream_close_target_owned, tc.bit);
+        REQUIRE_EQ(closed.upstream_close_cancel_owned, tc.bit);
+        REQUIRE_EQ(closed.pending_ops, 2u);
+        UpstreamEventToken cancel_token{};
+        REQUIRE(decode_upstream_event_token(
+            loop->backend.sq_entries[cancel_tail & *loop->backend.sq_ring_mask].user_data,
+            &cancel_token));
+        CHECK_EQ(cancel_token.type, tc.type);
+        CHECK_EQ(cancel_token.episode, kSuccessor);
+        CHECK_EQ(cancel_token.aux, kUpstreamCloseCancelAux);
+
+        // Wrong token, wrong operation and unknown aux own no count.
+        loop->dispatch({id, -ECANCELED, 0, 0, tc.type, 0, 0, kSuccessor + 1u});
+        const IoEventType wrong_type = tc.type == IoEventType::UpstreamSend
+                                           ? IoEventType::UpstreamConnect
+                                           : IoEventType::UpstreamSend;
+        loop->dispatch({id, -ECANCELED, 0, 0, wrong_type, 0, 0, kSuccessor});
+        loop->dispatch({id, -ECANCELED, 0, 0, tc.type, 0, 99, kSuccessor});
+        CHECK_EQ(closed.pending_ops, 2u);
+        CHECK_EQ(closed.upstream_close_target_owned, tc.bit);
+        CHECK_EQ(closed.upstream_close_cancel_owned, tc.bit);
+        CHECK_EQ(g_boundary_current_callback_count, 0u);
+
+        const IoEvent target{id, -ECANCELED, 0, 0, tc.type, 0, 0, kSuccessor};
+        const IoEvent cancel{
+            id, -ENOENT, 0, 0, tc.type, 0, kUpstreamCloseCancelAux, kSuccessor};
+        loop->dispatch(tc.cancel_first ? cancel : target);
+        CHECK_EQ(closed.pending_ops, 1u);
+        CHECK_EQ(loop->pending_free_count, 1u);
+        CHECK_EQ(loop->free_top, free_before);
+        loop->dispatch(tc.cancel_first ? target : cancel);
+        CHECK_EQ(closed.pending_ops, 0u);
+        CHECK_EQ(loop->pending_free_count, 0u);
+        CHECK_EQ(loop->free_top, free_before + 1u);
+        CHECK_EQ(closed.upstream_retiring_episode, kRetired);
+        CHECK_EQ(closed.upstream_close_episode, kSuccessor);
+        CHECK_EQ(closed.upstream_close_target_owned, 0u);
+        CHECK_EQ(closed.upstream_close_cancel_owned, 0u);
+
+        // Duplicate exact records see only tombstones and cannot reclaim twice.
+        loop->dispatch(target);
+        loop->dispatch(cancel);
+        CHECK_EQ(closed.pending_ops, 0u);
+        CHECK_EQ(loop->pending_free_count, 0u);
+        CHECK_EQ(loop->free_top, free_before + 1u);
+        CHECK_EQ(g_boundary_current_callback_count, 0u);
+    }
+}
+
+TEST(iouring_boundary, close_drains_recv_target_and_existing_pause_cancel_in_both_orders) {
+    for (const bool pause_first : {false, true}) {
+        ScopedIoUringLoopForRetirement guard;
+        if (!guard.init()) SKIP("io_uring unavailable");
+        auto* loop = guard.loop;
+        Connection* conn = loop->alloc_conn();
+        REQUIRE(conn != nullptr);
+        REQUIRE(loop->alloc_upstream_buf(*conn));
+        const u32 id = conn->id;
+        const u32 free_before = loop->free_top;
+        constexpr u32 kRetired = 451;
+        constexpr u32 kSuccessor = 452;
+        conn->upstream_retiring_episode = kRetired;
+        conn->upstream_episode = kSuccessor;
+        conn->upstream_retirement_active = false;
+        conn->fd = dup(STDERR_FILENO);
+        REQUIRE_GE(conn->fd, 0);
+        conn->upstream_fd = dup(STDERR_FILENO);
+        REQUIRE_GE(conn->upstream_fd, 0);
+        conn->upstream_recv_armed = true;
+        conn->upstream_recv_cancel_inflight = true;
+        conn->upstream_recv_pause_cancel_pending = true;
+        conn->pending_ops = 2;  // recv target + the already-submitted pause cancel
+
+        loop->close_conn(*conn);
+        Connection& closed = loop->conns[id];
+        REQUIRE_EQ(closed.fd, -1);
+        REQUIRE_EQ(loop->pending_free_count, 1u);
+        REQUIRE_EQ(closed.pending_ops, 2u);
+        REQUIRE_EQ(closed.upstream_close_episode, kSuccessor);
+        REQUIRE_EQ(closed.upstream_close_target_owned, kUpstreamOpRecv);
+        REQUIRE_EQ(closed.upstream_close_cancel_owned, 0u);
+        REQUIRE(closed.upstream_close_pause_cancel_owned);
+
+        // A pause aux on the wrong operation type cannot drain either owner.
+        loop->dispatch({id,
+                        -ENOENT,
+                        0,
+                        0,
+                        IoEventType::UpstreamSend,
+                        0,
+                        kPauseCancelAux,
+                        kSuccessor});
+        CHECK_EQ(closed.pending_ops, 2u);
+        const IoEvent target{
+            id, -ECANCELED, 0, 0, IoEventType::UpstreamRecv, 0, 0, kSuccessor};
+        const IoEvent pause{id,
+                            -ENOENT,
+                            0,
+                            0,
+                            IoEventType::UpstreamRecv,
+                            0,
+                            kPauseCancelAux,
+                            kSuccessor};
+        loop->dispatch(pause_first ? pause : target);
+        CHECK_EQ(closed.pending_ops, 1u);
+        CHECK_EQ(loop->pending_free_count, 1u);
+        CHECK_EQ(loop->free_top, free_before);
+        loop->dispatch(pause_first ? target : pause);
+        CHECK_EQ(closed.pending_ops, 0u);
+        CHECK_EQ(loop->pending_free_count, 0u);
+        CHECK_EQ(loop->free_top, free_before + 1u);
+        CHECK_EQ(closed.upstream_retiring_episode, kRetired);
+        CHECK_EQ(closed.upstream_close_episode, kSuccessor);
+        CHECK_EQ(closed.upstream_close_target_owned, 0u);
+        CHECK_FALSE(closed.upstream_close_pause_cancel_owned);
+
+        loop->dispatch(target);
+        loop->dispatch(pause);
+        CHECK_EQ(loop->free_top, free_before + 1u);
+        CHECK_EQ(closed.pending_ops, 0u);
+    }
+}
+
+TEST(iouring_boundary, resumed_forward_connect_closes_and_reclaims_after_exact_successor_drain) {
+    ScopedIoUringLoopForRetirement guard;
+    if (!guard.init()) SKIP("io_uring unavailable");
+    auto* loop = guard.loop;
+    RouteConfig config{};
+    const auto upstream = config.add_upstream("backend", 0x7F000001, 9);
+    REQUIRE(upstream.has_value());
+    REQUIRE(config.add_proxy("/next", 0, upstream.value()));
+    const RouteConfig* active = &config;
+    loop->config_ptr = &active;
+    ShardEpoch epoch{};
+    epoch.epoch.store(1, std::memory_order_relaxed);
+    ShardMetrics metrics{};
+    metrics.init();
+    metrics.requests_active = 1;
+    static constexpr char kRequest2[] = "GET /next HTTP/1.1\r\nHost: x\r\n\r\n";
+    Connection* conn = nullptr;
+    i32 peer = -1;
+    REQUIRE(stage_http1_boundary_retirement(loop,
+                                            &config,
+                                            &epoch,
+                                            &metrics,
+                                            reinterpret_cast<const u8*>(kRequest2),
+                                            sizeof(kRequest2) - 1,
+                                            &conn,
+                                            &peer));
+    const u32 id = conn->id;
+    const u32 free_before = loop->free_top;
+    constexpr u32 kRetired = 101;
+    constexpr u32 kSuccessor = 102;
+
+    loop->dispatch({id, 2, 0, 0, IoEventType::Send, 0});
+    REQUIRE(conn->http1_boundary_deferred);
+    loop->dispatch(
+        {id, -ECANCELED, 0, 0, IoEventType::UpstreamRecv, 0, 0, kRetired});
+    loop->dispatch({id,
+                    -ENOENT,
+                    0,
+                    0,
+                    IoEventType::UpstreamRecv,
+                    0,
+                    kUpstreamRetirementCancelAux,
+                    kRetired});
+    REQUIRE(conn->http1_boundary_ready);
+
+    const u32 connect_tail = __atomic_load_n(loop->backend.sq_tail, __ATOMIC_ACQUIRE);
+    loop->resume_deferred_http1_boundaries();
+    REQUIRE_EQ(conn->state, ConnState::Proxying);
+    REQUIRE(conn->upstream_connect_armed);
+    REQUIRE_GE(conn->upstream_fd, 0);
+    REQUIRE_EQ(conn->upstream_episode, kSuccessor);
+    UpstreamEventToken connect_token{};
+    REQUIRE(decode_upstream_event_token(
+        loop->backend.sq_entries[connect_tail & *loop->backend.sq_ring_mask].user_data,
+        &connect_token));
+    CHECK_EQ(connect_token.type, IoEventType::UpstreamConnect);
+    CHECK_EQ(connect_token.episode, kSuccessor);
+    CHECK_EQ(connect_token.aux, 0u);
+    REQUIRE(conn->recv_armed);  // the original downstream multishot remains live
+    REQUIRE_EQ(conn->pending_ops, 2u);  // downstream recv + successor connect target
+
+    loop->close_conn(*conn);
+    Connection& closed = loop->conns[id];
+    REQUIRE_EQ(closed.fd, -1);
+    REQUIRE_EQ(loop->pending_free_count, 1u);
+    REQUIRE_EQ(closed.upstream_close_episode, kSuccessor);
+    REQUIRE_EQ(closed.upstream_close_target_owned, kUpstreamOpConnect);
+    REQUIRE_EQ(closed.upstream_close_cancel_owned, kUpstreamOpConnect);
+    REQUIRE_EQ(closed.pending_ops, 4u);  // two targets + two close cancels
+
+    // A duplicate/wrong successor record owns nothing; exact target and close
+    // cancel each retire one count while the old C1 tombstone remains intact.
+    loop->dispatch({id,
+                    -ECANCELED,
+                    0,
+                    0,
+                    IoEventType::UpstreamConnect,
+                    0,
+                    0,
+                    kSuccessor + 1u});
+    CHECK_EQ(closed.pending_ops, 4u);
+    const IoEvent connect_target{
+        id, -ECANCELED, 0, 0, IoEventType::UpstreamConnect, 0, 0, kSuccessor};
+    const IoEvent connect_cancel{id,
+                                 -ENOENT,
+                                 0,
+                                 0,
+                                 IoEventType::UpstreamConnect,
+                                 0,
+                                 kUpstreamCloseCancelAux,
+                                 kSuccessor};
+    loop->dispatch(connect_cancel);
+    loop->dispatch(connect_target);
+    CHECK_EQ(closed.pending_ops, 2u);
+    CHECK_EQ(closed.upstream_retiring_episode, kRetired);
+    CHECK_EQ(closed.upstream_close_target_owned, 0u);
+    CHECK_EQ(closed.upstream_close_cancel_owned, 0u);
+    loop->dispatch(connect_target);  // exact duplicate cannot steal downstream ownership
+    CHECK_EQ(closed.pending_ops, 2u);
+
+    // The downstream recv target and its close cancel retain the pre-existing
+    // generic accounting contract (same user_data, two independently counted CQEs).
+    loop->dispatch({id, -ECANCELED, 0, 0, IoEventType::Recv, 0});
+    CHECK_EQ(closed.pending_ops, 1u);
+    CHECK_EQ(loop->pending_free_count, 1u);
+    loop->dispatch({id, -ENOENT, 0, 0, IoEventType::Recv, 0});
+    CHECK_EQ(closed.pending_ops, 0u);
+    CHECK_EQ(loop->pending_free_count, 0u);
+    CHECK_EQ(loop->free_top, free_before + 1u);
+    loop->dispatch(connect_cancel);
+    CHECK_EQ(loop->free_top, free_before + 1u);
+    close(peer);
+}
+
 TEST(iouring_retirement, production_paired_head_success_retires_before_old_precopy) {
     ScopedIoUringLoopForRetirement guard;
     if (!guard.init()) SKIP("io_uring unavailable");
@@ -18860,7 +20136,9 @@ TEST(iouring_episode, current_partial_send_resubmits_with_current_episode) {
     Connection conns[1]{};
     conns[0].reset();
     conns[0].id = kConnId;
+    conns[0].fd = 42;
     conns[0].upstream_episode = kEpisode;
+    conns[0].upstream_send_armed = true;
     const u32 sq_tail_before = __atomic_load_n(backend.sq_tail, __ATOMIC_ACQUIRE);
     const u32 cq_tail = __atomic_load_n(backend.cq_tail, __ATOMIC_ACQUIRE);
     auto& cqe = backend.cq_entries[cq_tail & *backend.cq_ring_mask];

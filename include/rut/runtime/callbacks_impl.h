@@ -6699,6 +6699,45 @@ void on_upstream_response(void* lp, Connection& conn, IoEvent ev) {
 }
 
 template <typename Loop>
+void continue_http1_request_boundary(Loop* loop, Connection& conn) {
+    if (conn.pipeline_stash_len > 0 && conn.recv_buf.len() > 0) {
+        const u16 kStashLen = conn.pipeline_stash_len;
+        const u32 kLateLen = conn.recv_buf.len();
+        if (static_cast<u32>(kStashLen) + kLateLen > conn.recv_buf.capacity()) {
+            conn.pipeline_stash_len = 0;
+            conn.send_buf.reset();
+            loop->close_conn(conn);
+            return;
+        }
+        conn.pipeline_stash_len = 0;
+        conn.upstream_recv_buf.reset();
+        conn.upstream_recv_buf.write(conn.recv_buf.data(), kLateLen);
+        conn.recv_buf.reset();
+        conn.recv_buf.write(conn.send_buf.data() + conn.retry_req_send_len, kStashLen);
+        conn.retry_req_send_len = 0;
+        conn.recv_buf.write(conn.upstream_recv_buf.data(), kLateLen);
+        conn.upstream_recv_buf.reset();
+        conn.send_buf.reset();
+        conn.pipeline_depth++;
+        pipeline_dispatch<Loop>(loop, conn);
+        return;
+    }
+    if (pipeline_recover(conn)) {
+        pipeline_dispatch<Loop>(loop, conn);
+        return;
+    }
+    if (conn.recv_buf.len() > 0) {
+        conn.pipeline_depth++;
+        pipeline_dispatch<Loop>(loop, conn);
+        return;
+    }
+    conn.pipeline_depth = 0;
+    conn.recv_buf.reset();
+    conn.transition_to_reading_header(&on_header_received<Loop>);
+    loop->submit_recv(conn);
+}
+
+template <typename Loop>
 void on_proxy_response_sent(void* lp, Connection& conn, IoEvent ev) {
     auto* loop = static_cast<Loop*>(lp);
     conn.clear_slots();
@@ -6751,41 +6790,14 @@ void on_proxy_response_sent(void* lp, Connection& conn, IoEvent ev) {
         return;
     }
 
-    if (conn.pipeline_stash_len > 0 && conn.recv_buf.len() > 0) {
-        const u16 kStashLen = conn.pipeline_stash_len;
-        const u32 kLateLen = conn.recv_buf.len();
-        if (static_cast<u32>(kStashLen) + kLateLen > conn.recv_buf.capacity()) {
-            conn.pipeline_stash_len = 0;
-            conn.send_buf.reset();
-            loop->close_conn(conn);
-            return;
-        }
-        conn.pipeline_stash_len = 0;
-        conn.upstream_recv_buf.reset();
-        conn.upstream_recv_buf.write(conn.recv_buf.data(), kLateLen);
-        conn.recv_buf.reset();
-        conn.recv_buf.write(conn.send_buf.data() + conn.retry_req_send_len, kStashLen);
-        conn.retry_req_send_len = 0;
-        conn.recv_buf.write(conn.upstream_recv_buf.data(), kLateLen);
-        conn.upstream_recv_buf.reset();
-        conn.send_buf.reset();
-        conn.pipeline_depth++;
-        pipeline_dispatch<Loop>(loop, conn);
-        return;
+    // io_uring may still own the exact old upstream recv target plus its cancel.
+    // Request 1 is fully accounted and detached above; park only the request-2
+    // boundary tail until the loop publishes and consumes retirement readiness.
+    if constexpr (requires { loop->defer_http1_request_boundary(conn); }) {
+        if (loop->defer_http1_request_boundary(conn)) return;
     }
-    if (pipeline_recover(conn)) {
-        pipeline_dispatch<Loop>(loop, conn);
-        return;
-    }
-    if (conn.recv_buf.len() > 0) {
-        conn.pipeline_depth++;
-        pipeline_dispatch<Loop>(loop, conn);
-        return;
-    }
-    conn.pipeline_depth = 0;
-    conn.recv_buf.reset();
-    conn.transition_to_reading_header(&on_header_received<Loop>);
-    loop->submit_recv(conn);
+
+    continue_http1_request_boundary(loop, conn);
 }
 
 }  // namespace rut

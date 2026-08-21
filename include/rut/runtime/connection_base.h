@@ -616,6 +616,7 @@ struct ConnectionBase {
     // an upstream recv CQE clearing the client's armed state.
     bool recv_armed;
     bool send_armed;
+    bool upstream_connect_armed;
     bool upstream_recv_armed;
     bool upstream_send_armed;
     bool recv_paused_for_send;
@@ -650,6 +651,22 @@ struct ConnectionBase {
     bool upstream_retirement_recv_owned;
     bool upstream_retirement_cancel_owned;
     bool upstream_retirement_cancel_retry;
+    // A close may land after C2 admitted the successor episode while its
+    // connect/send/recv is still in flight. Preserve exact target/cancel
+    // ownership through reset so only matching successor CQEs drain accounting.
+    // The episode remains as a tombstone after the masks reach zero.
+    u32 upstream_close_episode;
+    u8 upstream_close_target_owned;
+    u8 upstream_close_cancel_owned;
+    bool upstream_close_pause_cancel_owned;
+    // Generic HTTP/1 request-boundary rendezvous used by io_uring while the
+    // strict upstream recv episode above drains. Request-completion bookkeeping
+    // has already run when deferred is set; buffered downstream bytes must not
+    // enter the next request until the loop consumes ready at batch end. The
+    // successor episode binds the marker to this exact live slot generation.
+    bool http1_boundary_deferred;
+    bool http1_boundary_ready;
+    u32 http1_boundary_successor_episode;
     // True when an idle-return stale upstream recv CQE carried bytes. The stale branch
     // rolls those bytes back out of upstream_recv_buf, so the deferred pool-return path
     // needs this separate marker to close rather than reuse a desynced fd.
@@ -893,6 +910,7 @@ struct ConnectionBase {
         upstream_send_len = 0;
         recv_armed = false;
         send_armed = false;
+        upstream_connect_armed = false;
         upstream_recv_armed = false;
         upstream_send_armed = false;
         recv_paused_for_send = false;
@@ -908,6 +926,13 @@ struct ConnectionBase {
         upstream_retirement_recv_owned = false;
         upstream_retirement_cancel_owned = false;
         upstream_retirement_cancel_retry = false;
+        upstream_close_episode = 0;
+        upstream_close_target_owned = 0;
+        upstream_close_cancel_owned = 0;
+        upstream_close_pause_cancel_owned = false;
+        http1_boundary_deferred = false;
+        http1_boundary_ready = false;
+        http1_boundary_successor_episode = 0;
         upstream_recv_idle_stale_bytes = false;
         yield_armed = false;
         yield_timeout_armed = false;
