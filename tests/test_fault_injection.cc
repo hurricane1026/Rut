@@ -18,7 +18,9 @@
 
 using namespace rut;
 using rut::test_fault::fixed_clock_gettime;
+using rut::test_fault::HeldEpollEventError;
 using rut::test_fault::IoFaultConfig;
+using rut::test_fault::ScopedHeldEpollEvent;
 using rut::test_fault::ScopedIoFault;
 using rut::test_fault::ScopedSyscallFault;
 using rut::test_fault::single_recv_eintr;
@@ -400,6 +402,123 @@ TEST(epoll_fault, wait_retries_injected_eintr) {
     CHECK_EQ(events[0].conn_id, 7u);
     CHECK_EQ(events[0].type, IoEventType::Send);
     backend.shutdown();
+}
+
+TEST(epoll_fault, held_raw_event_is_exact_one_shot_and_fails_closed) {
+    struct FdGuard {
+        i32 epoll_fds[2] = {-1, -1};
+        i32 pipe_fds[2] = {-1, -1};
+        ~FdGuard() {
+            for (i32& fd : pipe_fds) {
+                if (fd >= 0) close(fd);
+            }
+            for (i32& fd : epoll_fds) {
+                if (fd >= 0) close(fd);
+            }
+        }
+    } guard;
+
+    guard.epoll_fds[0] = epoll_create1(EPOLL_CLOEXEC);
+    REQUIRE_GE(guard.epoll_fds[0], 0);
+    guard.epoll_fds[1] = epoll_create1(EPOLL_CLOEXEC);
+    REQUIRE_GE(guard.epoll_fds[1], 0);
+    REQUIRE_EQ(pipe2(guard.pipe_fds, O_NONBLOCK | O_CLOEXEC), 0);
+
+    static constexpr u64 kRawData = 0x123456789abcdef0ull;
+    struct epoll_event registration{};
+    registration.events = EPOLLIN;
+    registration.data.u64 = kRawData;
+    REQUIRE_EQ(epoll_ctl(guard.epoll_fds[0], EPOLL_CTL_ADD, guard.pipe_fds[0], &registration), 0);
+    REQUIRE_EQ(epoll_ctl(guard.epoll_fds[1], EPOLL_CTL_ADD, guard.pipe_fds[0], &registration), 0);
+    const char byte = 'x';
+    REQUIRE_EQ(write(guard.pipe_fds[1], &byte, 1), 1);
+
+    {
+        ScopedHeldEpollEvent invalid_target(-1);
+        CHECK_FALSE(invalid_target.owns_state());
+        CHECK(invalid_target.failed_closed());
+        CHECK_EQ(invalid_target.error(), HeldEpollEventError::InvalidTargetFd);
+    }
+    {
+        ScopedHeldEpollEvent owner(guard.epoll_fds[0]);
+        REQUIRE(owner.owns_state());
+        ScopedHeldEpollEvent nested(guard.epoll_fds[0]);
+        CHECK_FALSE(nested.owns_state());
+        CHECK(nested.failed_closed());
+        CHECK_EQ(nested.error(), HeldEpollEventError::AlreadyOwned);
+        CHECK_FALSE(owner.failed_closed());
+    }
+    {
+        ScopedHeldEpollEvent duplicate_arm(guard.epoll_fds[0]);
+        REQUIRE(duplicate_arm.arm_capture_once());
+        CHECK_FALSE(duplicate_arm.arm_capture_once());
+        CHECK_EQ(duplicate_arm.error(), HeldEpollEventError::DuplicateCaptureArm);
+        CHECK_FALSE(duplicate_arm.capture_armed());
+    }
+    {
+        ScopedHeldEpollEvent missing_capture(guard.epoll_fds[0]);
+        CHECK_FALSE(missing_capture.replay_once());
+        CHECK_EQ(missing_capture.error(), HeldEpollEventError::ReplayWithoutCapture);
+    }
+    {
+        ScopedHeldEpollEvent wrong_fd(guard.epoll_fds[0]);
+        REQUIRE(wrong_fd.arm_capture_once());
+        struct epoll_event other_event{};
+        REQUIRE_EQ(epoll_wait(guard.epoll_fds[1], &other_event, 1, 0), 1);
+        CHECK_EQ(other_event.events & EPOLLIN, static_cast<u32>(EPOLLIN));
+        CHECK_EQ(other_event.data.u64, kRawData);
+        CHECK_EQ(wrong_fd.error(), HeldEpollEventError::WrongEpollFd);
+        CHECK_FALSE(wrong_fd.capture_armed());
+    }
+    {
+        ScopedHeldEpollEvent invalid_output(guard.epoll_fds[0]);
+        REQUIRE(invalid_output.arm_capture_once());
+        struct epoll_event events[2]{};
+        REQUIRE_EQ(epoll_wait(guard.epoll_fds[0], events, 2, 0), 1);
+        CHECK_EQ(events[0].data.u64, kRawData);
+        CHECK_EQ(invalid_output.error(), HeldEpollEventError::InvalidWaitOutput);
+        CHECK_FALSE(invalid_output.capture_armed());
+    }
+    {
+        ScopedHeldEpollEvent duplicate_replay(guard.epoll_fds[0]);
+        REQUIRE(duplicate_replay.arm_capture_once());
+        struct epoll_event suppressed{};
+        REQUIRE_EQ(epoll_wait(guard.epoll_fds[0], &suppressed, 1, 0), 0);
+        REQUIRE(duplicate_replay.captured());
+        REQUIRE(duplicate_replay.replay_once());
+        CHECK_FALSE(duplicate_replay.replay_once());
+        CHECK_EQ(duplicate_replay.error(), HeldEpollEventError::DuplicateReplayArm);
+        CHECK_FALSE(duplicate_replay.replay_armed());
+    }
+    {
+        ScopedHeldEpollEvent held(guard.epoll_fds[0]);
+        REQUIRE(held.arm_capture_once());
+        struct epoll_event suppressed{};
+        REQUIRE_EQ(epoll_wait(guard.epoll_fds[0], &suppressed, 1, 0), 0);
+        REQUIRE(held.captured());
+        CHECK_FALSE(held.capture_armed());
+        const u32 captured_events = held.captured_events();
+        const u64 captured_data = held.captured_data();
+        CHECK_EQ(captured_events & EPOLLIN, static_cast<u32>(EPOLLIN));
+        CHECK_EQ(captured_data, kRawData);
+
+        REQUIRE(held.replay_once());
+        struct epoll_event replayed{};
+        REQUIRE_EQ(epoll_wait(guard.epoll_fds[0], &replayed, 1, 0), 1);
+        CHECK_EQ(replayed.events, captured_events);
+        CHECK_EQ(replayed.data.u64, captured_data);
+        CHECK(held.replay_consumed());
+        CHECK_FALSE(held.replay_armed());
+        CHECK_FALSE(held.failed_closed());
+    }
+
+    char observed = 0;
+    REQUIRE_EQ(read(guard.pipe_fds[0], &observed, 1), 1);
+    CHECK_EQ(observed, byte);
+    REQUIRE_EQ(write(guard.pipe_fds[1], &byte, 1), 1);
+    struct epoll_event transparent{};
+    REQUIRE_EQ(epoll_wait(guard.epoll_fds[0], &transparent, 1, 0), 1);
+    CHECK_EQ(transparent.data.u64, kRawData);
 }
 
 TEST(epoll_fault, accept4_failure_is_injected) {

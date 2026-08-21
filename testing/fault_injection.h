@@ -3,6 +3,7 @@
 #include "rut/common/types.h"
 
 #include <stddef.h>
+#include <stdint.h>
 #include <time.h>
 
 namespace rut::test_fault {
@@ -172,6 +173,45 @@ public:
 
 private:
     SyscallFaultConfig previous_;
+};
+
+// Test-only userspace hold/replay seam for one raw epoll record.  The captured
+// record was produced by the real epoll_wait syscall; this scope merely keeps a
+// copy after harvesting it and can return that copy through a later wrapper
+// call.  It does not model a kernel event surviving EPOLL_CTL_DEL or close.
+enum class HeldEpollEventError : uint8_t {
+    None,
+    InvalidTargetFd,
+    AlreadyOwned,
+    DuplicateCaptureArm,
+    ReplayWithoutCapture,
+    DuplicateReplayArm,
+    WrongEpollFd,
+    InvalidWaitOutput,
+};
+
+class ScopedHeldEpollEvent {
+public:
+    explicit ScopedHeldEpollEvent(int target_epoll_fd);
+    ScopedHeldEpollEvent(const ScopedHeldEpollEvent&) = delete;
+    ScopedHeldEpollEvent& operator=(const ScopedHeldEpollEvent&) = delete;
+    ~ScopedHeldEpollEvent();
+
+    bool arm_capture_once();
+    bool replay_once();
+
+    bool owns_state() const;
+    bool capture_armed() const;
+    bool captured() const;
+    bool replay_armed() const;
+    bool replay_consumed() const;
+    bool failed_closed() const;
+    HeldEpollEventError error() const;
+    uint32_t captured_events() const;
+    uint64_t captured_data() const;
+
+private:
+    HeldEpollEventError local_error_ = HeldEpollEventError::None;
 };
 
 inline ScopedRecvData single_recv_eintr(int fd, const char* data, size_t len) {

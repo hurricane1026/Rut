@@ -23,6 +23,19 @@ namespace {
 
 thread_local FaultState g_state{};
 
+struct HeldEpollEventState {
+    ScopedHeldEpollEvent* owner = nullptr;
+    int target_epoll_fd = -1;
+    bool capture_armed = false;
+    bool captured = false;
+    bool replay_armed = false;
+    bool replay_consumed = false;
+    HeldEpollEventError error = HeldEpollEventError::None;
+    struct epoll_event event{};
+};
+
+thread_local HeldEpollEventState g_held_epoll_event{};
+
 using MmapFn = void* (*)(void*, size_t, int, int, int, off_t);
 using MprotectFn = int (*)(void*, size_t, int);
 using SocketFn = int (*)(int, int, int);
@@ -425,6 +438,89 @@ ScopedSyscallFault::~ScopedSyscallFault() {
     apply_syscall_fault_config(previous_);
 }
 
+ScopedHeldEpollEvent::ScopedHeldEpollEvent(int target_epoll_fd) {
+    if (target_epoll_fd < 0) {
+        local_error_ = HeldEpollEventError::InvalidTargetFd;
+        return;
+    }
+    if (g_held_epoll_event.owner != nullptr) {
+        local_error_ = HeldEpollEventError::AlreadyOwned;
+        return;
+    }
+    g_held_epoll_event = HeldEpollEventState{};
+    g_held_epoll_event.owner = this;
+    g_held_epoll_event.target_epoll_fd = target_epoll_fd;
+}
+
+ScopedHeldEpollEvent::~ScopedHeldEpollEvent() {
+    if (g_held_epoll_event.owner == this) g_held_epoll_event = HeldEpollEventState{};
+}
+
+bool ScopedHeldEpollEvent::arm_capture_once() {
+    if (g_held_epoll_event.owner != this) return false;
+    if (g_held_epoll_event.error != HeldEpollEventError::None) return false;
+    if (g_held_epoll_event.capture_armed || g_held_epoll_event.captured) {
+        g_held_epoll_event.capture_armed = false;
+        g_held_epoll_event.error = HeldEpollEventError::DuplicateCaptureArm;
+        return false;
+    }
+    g_held_epoll_event.capture_armed = true;
+    return true;
+}
+
+bool ScopedHeldEpollEvent::replay_once() {
+    if (g_held_epoll_event.owner != this) return false;
+    if (g_held_epoll_event.error != HeldEpollEventError::None) return false;
+    if (g_held_epoll_event.replay_armed || g_held_epoll_event.replay_consumed) {
+        g_held_epoll_event.replay_armed = false;
+        g_held_epoll_event.error = HeldEpollEventError::DuplicateReplayArm;
+        return false;
+    }
+    if (!g_held_epoll_event.captured) {
+        g_held_epoll_event.capture_armed = false;
+        g_held_epoll_event.error = HeldEpollEventError::ReplayWithoutCapture;
+        return false;
+    }
+    g_held_epoll_event.replay_armed = true;
+    return true;
+}
+
+bool ScopedHeldEpollEvent::owns_state() const {
+    return g_held_epoll_event.owner == this;
+}
+
+bool ScopedHeldEpollEvent::capture_armed() const {
+    return owns_state() && g_held_epoll_event.capture_armed;
+}
+
+bool ScopedHeldEpollEvent::captured() const {
+    return owns_state() && g_held_epoll_event.captured;
+}
+
+bool ScopedHeldEpollEvent::replay_armed() const {
+    return owns_state() && g_held_epoll_event.replay_armed;
+}
+
+bool ScopedHeldEpollEvent::replay_consumed() const {
+    return owns_state() && g_held_epoll_event.replay_consumed;
+}
+
+bool ScopedHeldEpollEvent::failed_closed() const {
+    return error() != HeldEpollEventError::None;
+}
+
+HeldEpollEventError ScopedHeldEpollEvent::error() const {
+    return owns_state() ? g_held_epoll_event.error : local_error_;
+}
+
+uint32_t ScopedHeldEpollEvent::captured_events() const {
+    return captured() ? g_held_epoll_event.event.events : 0;
+}
+
+uint64_t ScopedHeldEpollEvent::captured_data() const {
+    return captured() ? g_held_epoll_event.event.data.u64 : 0;
+}
+
 }  // namespace rut::test_fault
 
 extern "C" void* mmap(void* addr, size_t len, int prot, int flags, int fd, off_t offset) {
@@ -687,6 +783,24 @@ extern "C" int epoll_ctl(int epfd, int op, int fd, struct epoll_event* event) {
 
 extern "C" int epoll_wait(int epfd, struct epoll_event* events, int maxevents, int timeout) {
     pthread_once(&rut::test_fault::g_syscall_once, rut::test_fault::resolve_syscalls);
+    auto& held = rut::test_fault::g_held_epoll_event;
+    const bool hold_operation_armed = held.capture_armed || held.replay_armed;
+    if (held.owner != nullptr && hold_operation_armed) {
+        if (epfd != held.target_epoll_fd) {
+            held.capture_armed = false;
+            held.replay_armed = false;
+            held.error = rut::test_fault::HeldEpollEventError::WrongEpollFd;
+        } else if (rut::test_fault::is_null_ptr(events) || maxevents != 1) {
+            held.capture_armed = false;
+            held.replay_armed = false;
+            held.error = rut::test_fault::HeldEpollEventError::InvalidWaitOutput;
+        } else if (held.replay_armed) {
+            events[0] = held.event;
+            held.replay_armed = false;
+            held.replay_consumed = true;
+            return 1;
+        }
+    }
     if (rut::test_fault::consume_fault(rut::test_fault::g_epoll_wait_eintr_count)) {
         errno = EINTR;
         return -1;
@@ -699,7 +813,15 @@ extern "C" int epoll_wait(int epfd, struct epoll_event* events, int maxevents, i
         errno = ENOSYS;
         return -1;
     }
-    return rut::test_fault::g_real_epoll_wait(epfd, events, maxevents, timeout);
+    const int result = rut::test_fault::g_real_epoll_wait(epfd, events, maxevents, timeout);
+    if (held.owner != nullptr && held.capture_armed && epfd == held.target_epoll_fd &&
+        !rut::test_fault::is_null_ptr(events) && maxevents == 1 && result == 1) {
+        held.event = events[0];
+        held.capture_armed = false;
+        held.captured = true;
+        return 0;
+    }
+    return result;
 }
 
 extern "C" int timerfd_create(int clockid, int flags) {
