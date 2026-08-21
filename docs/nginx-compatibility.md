@@ -82,11 +82,13 @@ Allowed states are `SUPPORTED`, `PARTIAL`, `BLOCKED_BY_RUT`,
   scoped connect-failure record. Current RUT rejects this reusable HEAD domain,
   so the evidence defines the next #253 capability gap rather than support.
 - The reusable HEAD gap also depends on the generic epoll transport capability
-  tracked in #262. Epoll currently performs socket I/O for a readiness batch
-  before dispatching any logical event, so an episode token checked only at
-  dispatch cannot prevent an older event from mutating a later upstream
-  episode. This domain remains fail-closed; the completed io_uring episode
-  transport does not imply epoll or keep-alive HEAD support.
+  tracked in #262. Epoll now exposes at most one logical completion per wait
+  with bounded pending-versus-kernel fairness, removing the former whole-batch
+  pre-dispatch I/O window. It still does not transport or validate an upstream
+  episode before that one event performs socket I/O, so an old readiness record
+  can still mutate a later episode. This domain remains fail-closed; neither the
+  completed io_uring episode transport nor the epoll wait prerequisite implies
+  epoll fencing or keep-alive HEAD support.
 - The first request-policy slice rejects body/framing inputs (including
   `Content-Length` and every `Transfer-Encoding` value), HTTP/2, and
   non-origin-form targets before upstream connect. These are intentional
