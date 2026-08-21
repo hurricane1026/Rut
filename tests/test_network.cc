@@ -10926,6 +10926,24 @@ TEST(epoll_episode, synthetic_upstream_completion_preserves_episode_and_aux) {
     failure_backend.shutdown();
 }
 
+namespace {
+bool g_epoll_episode_callback_called = false;
+
+struct EpollEpisodeSocketGuard {
+    EpollBackend* backend;
+    i32* fds;
+    ~EpollEpisodeSocketGuard() {
+        if (fds[0] >= 0) close(fds[0]);
+        if (fds[1] >= 0) close(fds[1]);
+        backend->shutdown();
+    }
+};
+
+void epoll_episode_callback_probe(void*, ConnectionBase&, IoEvent) {
+    g_epoll_episode_callback_called = true;
+}
+}  // namespace
+
 TEST(epoll_episode, dispatch_rejects_stale_tag_before_callback) {
     auto loop = std::make_unique<EpollEventLoop>();
     REQUIRE(loop->init(0, -1).has_value());
@@ -10935,16 +10953,73 @@ TEST(epoll_episode, dispatch_rejects_stale_tag_before_callback) {
     conn->upstream_episode = 2;
     conn->upstream_recv_armed = true;
     conn->upstream_send_armed = true;
+    g_epoll_episode_callback_called = false;
+    conn->on_upstream_send = &epoll_episode_callback_probe;
     const bool recv_armed_before = conn->upstream_recv_armed;
     const bool send_armed_before = conn->upstream_send_armed;
     loop->timer.add(conn, 5);
     ListNode* timer_node_before = conn->timer_node.prev;
     loop->dispatch({conn->id, 0, 0, 0, IoEventType::UpstreamSend, 0, 0, 1});
     CHECK_EQ(conn->timer_node.prev, timer_node_before);
+    CHECK_FALSE(g_epoll_episode_callback_called);
     CHECK_EQ(conn->upstream_recv_armed, recv_armed_before);
     CHECK_EQ(conn->upstream_send_armed, send_armed_before);
+    // Positive control: the same callback is reached when the token matches.
+    conn->upstream_episode = 1;
+    g_epoll_episode_callback_called = false;
+    loop->dispatch({conn->id, 0, 0, 0, IoEventType::UpstreamSend, 0, 0, 1});
+    CHECK(g_epoll_episode_callback_called);
     loop->free_conn(*conn);
     loop->shutdown();
+}
+
+TEST(epoll_episode, stale_tls_send_cannot_rearm_or_hijack_current_recv) {
+    EpollBackend backend{};
+    REQUIRE(backend.init(0, -1).has_value());
+    i32 fds[2] = {-1, -1};
+    REQUIRE_EQ(socketpair(AF_UNIX, SOCK_STREAM | SOCK_NONBLOCK, 0, fds), 0);
+    EpollEpisodeSocketGuard guard{&backend, fds};
+
+    Connection conns[1]{};
+    conns[0].reset();
+    conns[0].id = 0;
+    conns[0].upstream_episode = 1;
+    u8 storage[64] = {};
+    conns[0].upstream_recv_buf.bind(storage, sizeof(storage));
+    static const u8 payload[] = {'s', 't', 'a', 'l', 'e'};
+    // Register a current EPOLLIN|EPOLLOUT interest, then make only the
+    // stored send state stale. The real fd/readiness path must not perform the
+    // stale TLS write or rearm the old WANT_READ state.
+    backend.upstream_send_state[0] = {
+        payload, fds[0], 0, sizeof(payload), IoEventType::UpstreamSend, true, EPOLLOUT, 1};
+    REQUIRE(backend.add_recv_upstream(fds[0], 0, 1));
+    backend.upstream_send_state[0] = {
+        payload, fds[0], 0, sizeof(payload), IoEventType::UpstreamSend, true, EPOLLIN, 2};
+
+    const auto before = backend.upstream_send_state[0];
+    IoEvent events[1]{};
+    CHECK_EQ(backend.wait(events, 1, conns, 1), 0u);
+    CHECK_EQ(backend.upstream_send_state[0].src, before.src);
+    CHECK_EQ(backend.upstream_send_state[0].fd, before.fd);
+    CHECK_EQ(backend.upstream_send_state[0].offset, before.offset);
+    CHECK_EQ(backend.upstream_send_state[0].remaining, before.remaining);
+    CHECK_EQ(backend.upstream_send_state[0].tls, before.tls);
+    CHECK_EQ(backend.upstream_send_state[0].tls_wait_events, before.tls_wait_events);
+    CHECK_EQ(backend.upstream_send_state[0].upstream_episode, before.upstream_episode);
+    u8 peer_payload[sizeof(payload)] = {};
+    CHECK_EQ(recv(fds[1], peer_payload, sizeof(peer_payload), MSG_DONTWAIT), -1);
+    CHECK(errno == EAGAIN || errno == EWOULDBLOCK);
+
+    const ssize_t nw = write(fds[1], "r", 1);
+    CHECK_EQ(nw, 1);
+    if (nw != 1) return;
+    const u32 event_count = backend.wait(events, 1, conns, 1);
+    CHECK_EQ(event_count, 1u);
+    if (event_count != 1) return;
+    CHECK_EQ(events[0].type, IoEventType::UpstreamRecv);
+    CHECK_EQ(events[0].upstream_episode, 1u);
+    CHECK_EQ(events[0].result, 1);
+    CHECK_EQ(conns[0].upstream_recv_buf.len(), 1u);
 }
 
 TEST(epoll_loop, callbacks_static_route_send_keepalive) {

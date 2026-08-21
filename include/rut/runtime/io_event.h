@@ -29,9 +29,9 @@ static_assert(static_cast<u8>(IoEventType::Count) == 8u,
 // [63:56] aux (8 bits) | [55:32] upstream episode (24 bits) |
 // [31:8] conn_id (24 bits) | [7:0] event type.
 // Non-upstream events retain the existing [63:32] full generation field. These
-// helpers are used by the io_uring upstream transport; epoll and non-upstream
-// events remain on the legacy representation. Episode zero is reserved; a
-// future counter wraps max -> 1.
+// helpers are used by both upstream transports (io_uring user_data and epoll
+// event.data.u64); non-upstream events retain the legacy representation with
+// a neutral episode. Episode zero is reserved; a future counter wraps max -> 1.
 inline constexpr u32 kIoUserDataMaxConnId = 0x00FFFFFFu;
 inline constexpr u32 kIoUserDataMaxUpstreamEpisode = 0x00FFFFFFu;
 // Not representable in the 24-bit token field. Backend decoders use this

@@ -2916,10 +2916,11 @@ TEST(active_health, timeout_sweep_defers_until_batch_drains) {
     // marks a due sweep. The trailing UpstreamRecv is stale for old_cid and must be
     // ignored before the deferred sweep is allowed to allocate the replacement.
     loop->health_probe_deadline_ns[uid] = 0;
+    const u32 old_episode = c->upstream_episode;
     IoEvent batch[3] = {
-        make_ev(old_cid, IoEventType::UpstreamSend, -ECONNRESET),
-        make_ev(0, IoEventType::Timeout, 1),
-        make_ev(old_cid, IoEventType::UpstreamRecv, -ECONNRESET),
+        IoEvent{old_cid, -ECONNRESET, 0, 0, IoEventType::UpstreamSend, 0, 0, old_episode},
+        IoEvent{0, 1, 0, 0, IoEventType::Timeout, 0, 0, 0},
+        IoEvent{old_cid, -ECONNRESET, 0, 0, IoEventType::UpstreamRecv, 0, 0, old_episode},
     };
     loop->dispatch_batch(batch, 3);
 
@@ -3236,6 +3237,7 @@ TEST(active_health, connect_registration_failure_defers_without_downing_backend)
     loop->sweep_health_probes();
 
     CHECK_EQ(loop->active_count(), 0u);
+    CHECK_EQ(loop->backend.pending_count, 0u);
     CHECK(!probe_in_flight(uid, 0));
     CHECK_EQ(loop->health_probe_deadline_ns[uid], 0u);
     CHECK(!backend_ejected(uid, 0, monotonic_us()));

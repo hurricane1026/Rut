@@ -589,15 +589,11 @@ bool EpollBackend::add_connect(i32 fd,
                             IoEventType::UpstreamRecv,
                             EPOLLIN,
                             upstream_episode) < 0) {
-            const i32 registration_error = errno;
             if (conn_id < kMaxFdMap) upstream_fd_map[conn_id] = -1;
-            return queue_pending_completion(pending_completions,
-                                            pending_count,
-                                            conn_id,
-                                            IoEventType::UpstreamConnect,
-                                            -registration_error,
-                                            kLocalSubmitFailureAux,
-                                            upstream_episode);
+            // The probe/connect caller owns registration failure.  In
+            // particular, do not turn this into a synthetic completion: the
+            // pre-C1 health-probe contract treats false as deferred cleanup.
+            return false;
         }
         if (!queue_pending_completion(
                 pending_completions,
@@ -620,15 +616,8 @@ bool EpollBackend::add_connect(i32 fd,
                             IoEventType::UpstreamConnect,
                             EPOLLOUT,
                             upstream_episode) < 0) {
-            const i32 registration_error = errno;
             if (conn_id < kMaxFdMap) upstream_fd_map[conn_id] = -1;
-            return queue_pending_completion(pending_completions,
-                                            pending_count,
-                                            conn_id,
-                                            IoEventType::UpstreamConnect,
-                                            -registration_error,
-                                            kLocalSubmitFailureAux,
-                                            upstream_episode);
+            return false;
         }
         return true;
     }
@@ -951,7 +940,10 @@ u32 EpollBackend::wait(IoEvent* events, u32 max_events, Connection* conns, u32 m
             if (conn_id < kMaxFdMap) {
                 const auto& ss =
                     (type == IoEventType::Send) ? send_state[conn_id] : upstream_send_state[conn_id];
-                if (ss.tls && ss.remaining > 0 && ss.tls_wait_events == EPOLLIN) {
+                const bool upstream_state_current =
+                    !io_event_is_upstream(type) || ss.upstream_episode == upstream_episode;
+                if (ss.tls && ss.remaining > 0 && ss.tls_wait_events == EPOLLIN &&
+                    upstream_state_current) {
                     set_fd_interest(epoll_fd,
                                     ss.fd,
                                     conn_id,
