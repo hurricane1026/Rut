@@ -16799,6 +16799,14 @@ struct RecordingUpstream {
     u32 response_chunk_delay_us = 0;
     u32 response_split_offset = 0;
     bool keep_open = false;
+    // Opt-in synchronization for tests that need the first response bytes to
+    // arrive while the origin peer remains open.  This is only wire evidence;
+    // exact io_uring ownership is covered by the focused network tests.
+    bool wait_first_response_for_peer_close = false;
+    std::atomic<bool> first_response_sent_open{false};
+    std::atomic<bool> first_peer_closed{false};
+    std::atomic<bool> first_peer_unexpected_data{false};
+    std::atomic<bool> first_peer_close_timed_out{false};
     static constexpr u32 kMaxHeldFds = 8;
     i32 held_fds[kMaxHeldFds]{};
     u32 held_fd_count = 0;
@@ -16882,24 +16890,42 @@ struct RecordingUpstream {
             const u32 out_len = use_later ? s->response_after_first_len
                                           : (s->response ? s->response_len
                                                          : sizeof(kResponse) - 1);
+            bool response_sent = false;
             if (s->response_split_offset > 0 && s->response_split_offset < out_len) {
-                (void)send_all(client, out, s->response_split_offset);
+                const bool first_sent = send_all(client, out, s->response_split_offset);
                 if (s->response_chunk_delay_us != 0) usleep(s->response_chunk_delay_us);
-                (void)send_all(client, out + s->response_split_offset,
-                               out_len - s->response_split_offset);
+                const bool second_sent = send_all(client,
+                                                  out + s->response_split_offset,
+                                                  out_len - s->response_split_offset);
+                response_sent = first_sent && second_sent;
             } else if (s->response_chunk_size == 0) {
-                (void)send_all(client, out, out_len);
+                response_sent = send_all(client, out, out_len);
             } else {
+                response_sent = true;
                 for (u32 off = 0; off < out_len; ) {
                     const u32 len = (out_len - off < s->response_chunk_size)
                                         ? out_len - off
                                         : s->response_chunk_size;
-                    (void)send_all(client, out + off, len);
+                    response_sent = send_all(client, out + off, len) && response_sent;
                     off += len;
                     if (s->response_chunk_delay_us != 0) usleep(s->response_chunk_delay_us);
                 }
             }
-            if (s->keep_open && s->held_fd_count < kMaxHeldFds) {
+            if (history_slot == 0 && s->wait_first_response_for_peer_close) {
+                if (response_sent)
+                    s->first_response_sent_open.store(true, std::memory_order_release);
+                char unexpected[64];
+                const i32 peer_result =
+                    recv_timeout(client, unexpected, sizeof(unexpected), 3000);
+                if (peer_result == 0 || peer_result == -ECONNRESET) {
+                    s->first_peer_closed.store(true, std::memory_order_release);
+                } else if (peer_result > 0) {
+                    s->first_peer_unexpected_data.store(true, std::memory_order_release);
+                } else {
+                    s->first_peer_close_timed_out.store(true, std::memory_order_release);
+                }
+                close(client);
+            } else if (s->keep_open && s->held_fd_count < kMaxHeldFds) {
                 // Keep the backend connection open and deliberately unread after
                 // one response. The accept loop remains free to service a second
                 // connection, while accidental gateway pooling cannot recover by
@@ -20941,6 +20967,147 @@ TEST(route, public_paired_head_source_reuses_downstream_iouring) {
         REQUIRE_EQ(backend.request_history_len[i], static_cast<u32>(expected_len));
         CHECK_EQ(memcmp(backend.request_history[i], expected, expected_len), 0);
     }
+}
+
+TEST(route, public_paired_head_source_malformed_open_peer_reuses_downstream_iouring) {
+    using namespace rut;
+    if (!iouring_socket_live()) SKIP("io_uring async socket ops unavailable in this environment");
+    static constexpr char kMalformedOrigin[] = "not-http\r\n\r\n";
+    static constexpr char kSecondOrigin[] =
+        "HTTP/1.1 200 OK\r\nServer: origin\r\n"
+        "Date: Tue, 01 Jan 2030 00:00:00 GMT\r\n"
+        "Content-Length: 7\r\n\r\ngoodbye";
+    static constexpr char kFirstExpected[] =
+        "HTTP/1.1 502 Bad Gateway\r\n"
+        "Server: nginx/1.29.7\r\n"
+        "Date: XXXXXXXXXXXXXXXXXXXXXXXXXXXXX\r\n"
+        "Content-Type: text/html\r\n"
+        "Content-Length: 157\r\n"
+        "Connection: keep-alive\r\n\r\n";
+    static constexpr char kSecondExpected[] =
+        "HTTP/1.1 200 OK\r\n"
+        "Server: nginx/1.29.7\r\n"
+        "Date: XXXXXXXXXXXXXXXXXXXXXXXXXXXXX\r\n"
+        "Content-Length: 7\r\n"
+        "Connection: close\r\n\r\n";
+
+    RecordingUpstream backend;
+    backend.response = kMalformedOrigin;
+    backend.response_len = sizeof(kMalformedOrigin) - 1;
+    backend.response_after_first = kSecondOrigin;
+    backend.response_after_first_len = sizeof(kSecondOrigin) - 1;
+    backend.wait_first_response_for_peer_close = true;
+    REQUIRE(backend.setup());
+
+    PublicPairedHeadSourceResources resources;
+    REQUIRE(resources.compile(backend.port));
+    REQUIRE_EQ(resources.cfg.response_policy_count, 2u);
+    REQUIRE_EQ(resources.cfg.failure_policy_count, 2u);
+    REQUIRE_EQ(resources.cfg.policy_bundle_count, 2u);
+    const auto& response_policy = resources.cfg.response_policies[0];
+    const auto& failure_policy = resources.cfg.failure_policies[0];
+    CHECK_EQ(response_policy.version, ResponsePolicyVersion::Http11);
+    CHECK_EQ(response_policy.framing, ResponsePolicyFraming::ContentLength);
+    CHECK_EQ(response_policy.connection, ResponsePolicyConnection::Request);
+    CHECK_EQ(response_policy.head_mode, ResponsePolicyHeadMode::SuppressBody);
+    CHECK_EQ(failure_policy.version, ForwardFailurePolicyVersion::Http11);
+    CHECK_EQ(failure_policy.status_code, 502u);
+    CHECK_EQ(failure_policy.connection, ForwardFailurePolicyConnection::Request);
+    CHECK_EQ(failure_policy.head_mode, FailurePolicyHeadMode::SuppressBody);
+    CHECK_EQ(resources.cfg.policy_bundles[0].response_policy_id, 1u);
+    CHECK_EQ(resources.cfg.policy_bundles[0].failure_policy_id, 1u);
+
+    Shard<IoUringEventLoop> shard;
+    i32 listen_fd = create_listen_socket(0).value_or(-1);
+    REQUIRE_GE(listen_fd, 0);
+    struct ShardGuard {
+        Shard<IoUringEventLoop>& shard;
+        i32& listen_fd;
+        bool spawned = false;
+        ~ShardGuard() {
+            if (spawned) {
+                shard.stop();
+                shard.join();
+            }
+            shard.shutdown();
+            if (listen_fd >= 0) close(listen_fd);
+        }
+    } shard_guard{shard, listen_fd};
+    const u16 port = get_port(listen_fd);
+    REQUIRE(shard.init(0, listen_fd).has_value());
+    shard.route_config = &resources.cfg;
+    REQUIRE(shard.spawn(-1).has_value());
+    shard_guard.spawned = true;
+    usleep(50000);
+
+    struct ClientGuard {
+        i32 fd;
+        ~ClientGuard() {
+            if (fd >= 0) close(fd);
+        }
+    } client{connect_to(port)};
+    REQUIRE_GE(client.fd, 0);
+    set_socket_timeouts(client.fd, 3);
+    static constexpr char kRequest1[] =
+        "HEAD /head?q=1 HTTP/1.1\r\nHost: client.example\r\nX-Test: one\r\n\r\n";
+    static constexpr char kRequest2[] =
+        "HEAD /head?q=2 HTTP/1.1\r\nHost: client.example\r\n"
+        "Connection: close\r\nX-Test: two\r\n\r\n";
+
+    char response[1024]{};
+    u32 response_len = 0;
+    REQUIRE(send_all(client.fd, kRequest1, sizeof(kRequest1) - 1));
+    REQUIRE(read_public_head_response(
+        client.fd, false, response, sizeof(response), response_len));
+    REQUIRE(normalize_public_date(response, response_len));
+    REQUIRE_EQ(response_len, static_cast<u32>(strlen(kFirstExpected)));
+    CHECK_EQ(memcmp(response, kFirstExpected, response_len), 0);
+
+    for (u32 waited = 0;
+         waited < 600 && !backend.first_peer_closed.load(std::memory_order_acquire) &&
+         !backend.first_peer_unexpected_data.load(std::memory_order_acquire) &&
+         !backend.first_peer_close_timed_out.load(std::memory_order_acquire);
+         waited++)
+        usleep(5000);
+    REQUIRE(backend.first_response_sent_open.load(std::memory_order_acquire));
+    REQUIRE(backend.first_peer_closed.load(std::memory_order_acquire));
+    CHECK_FALSE(backend.first_peer_unexpected_data.load(std::memory_order_acquire));
+    CHECK_FALSE(backend.first_peer_close_timed_out.load(std::memory_order_acquire));
+    REQUIRE_EQ(backend.accepted_count.load(std::memory_order_acquire), 1u);
+    REQUIRE_EQ(backend.request_count.load(std::memory_order_acquire), 1u);
+
+    REQUIRE(send_all(client.fd, kRequest2, sizeof(kRequest2) - 1));
+    memset(response, 0, sizeof(response));
+    REQUIRE(read_public_head_response(
+        client.fd, true, response, sizeof(response), response_len));
+    REQUIRE(normalize_public_date(response, response_len));
+    REQUIRE_EQ(response_len, static_cast<u32>(strlen(kSecondExpected)));
+    CHECK_EQ(memcmp(response, kSecondExpected, response_len), 0);
+
+    for (u32 waited = 0;
+         waited < 600 && backend.request_count.load(std::memory_order_acquire) < 2;
+         waited++)
+        usleep(5000);
+    REQUIRE_EQ(backend.accepted_count.load(std::memory_order_acquire), 2u);
+    REQUIRE_EQ(backend.request_count.load(std::memory_order_acquire), 2u);
+    const char* queries[] = {"?q=1", "?q=2"};
+    const char* extras[] = {"one", "two"};
+    for (u32 i = 0; i < 2; i++) {
+        char expected[256]{};
+        const int expected_len = snprintf(expected,
+                                          sizeof(expected),
+                                          "HEAD /head%s HTTP/1.1\r\nHost: 127.0.0.1:%u\r\n"
+                                          "X-Test: %s\r\n\r\n",
+                                          queries[i],
+                                          backend.port,
+                                          extras[i]);
+        REQUIRE_GT(expected_len, 0);
+        REQUIRE_EQ(backend.request_history_len[i], static_cast<u32>(expected_len));
+        CHECK_EQ(memcmp(backend.request_history[i], expected, expected_len), 0);
+    }
+    usleep(100000);
+    CHECK_EQ(backend.accepted_count.load(std::memory_order_acquire), 2u);
+    CHECK_EQ(backend.request_count.load(std::memory_order_acquire), 2u);
 }
 
 TEST(route, public_paired_head_source_connect_failure) {
