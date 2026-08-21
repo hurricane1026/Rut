@@ -11697,6 +11697,20 @@ bool connect_real_upstream(RealEpollEpisodeGuard& guard,
     return wait_for_real_upstream_completion(loop, completion);
 }
 
+bool poll_ready_without_terminal(i32 fd, short expected, i32 timeout_ms, bool expect_ready) {
+    static constexpr u32 kMaxInterruptedPolls = 8;
+    for (u32 attempt = 0; attempt < kMaxInterruptedPolls; attempt++) {
+        struct pollfd ready{fd, expected, 0};
+        const i32 rc = poll(&ready, 1, timeout_ms);
+        if (rc < 0 && errno == EINTR) continue;
+        if (rc == 0) return !expect_ready;
+        if (rc != 1 || (ready.revents & (POLLERR | POLLHUP | POLLNVAL)) != 0) return false;
+        if (expect_ready) return (ready.revents & expected) == expected;
+        return ready.revents == 0;
+    }
+    return false;
+}
+
 bool fill_real_tcp_send_queue(i32 sender, i32 peer, u8 pattern, u32& accepted) {
     static constexpr u32 kMaxFill = 4u * 1024u * 1024u;
     static constexpr u32 kMaxSendCalls = 65536;
@@ -11716,10 +11730,8 @@ bool fill_real_tcp_send_queue(i32 sender, i32 peer, u8 pattern, u32& accepted) {
             continue;
         }
         if (nw < 0 && errno == EINTR) continue;
-        if (nw < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
-            struct pollfd writable{sender, POLLOUT, 0};
-            return accepted > 0 && poll(&writable, 1, 0) == 0;
-        }
+        if (nw < 0 && (errno == EAGAIN || errno == EWOULDBLOCK))
+            return accepted > 0 && poll_ready_without_terminal(sender, POLLOUT, 0, false);
         return false;
     }
     return false;
@@ -11734,8 +11746,7 @@ bool drain_exact_tcp_filler(i32 peer, u32 expected, u8 pattern) {
     for (u32 poll_attempt = 0;
          poll_attempt < kMaxPolls && received < expected && recv_calls < kMaxRecvCalls;
          poll_attempt++) {
-        struct pollfd readable{peer, POLLIN, 0};
-        if (poll(&readable, 1, 100) <= 0) continue;
+        if (!poll_ready_without_terminal(peer, POLLIN, 100, true)) continue;
         while (received < expected && recv_calls++ < kMaxRecvCalls) {
             const u32 wanted = std::min<u32>(sizeof(observed), expected - received);
             const ssize_t nr = recv(peer, observed, wanted, MSG_DONTWAIT);
@@ -11752,6 +11763,47 @@ bool drain_exact_tcp_filler(i32 peer, u32 expected, u8 pattern) {
         }
     }
     return received == expected;
+}
+
+bool recv_exact_stream_to_eof(i32 peer, const u8* expected, u32 expected_len) {
+    static constexpr u32 kMaxPolls = 64;
+    static constexpr u32 kMaxInterruptedPolls = 8;
+    static constexpr u32 kMaxRecvCalls = 65536;
+    if (expected_len > 0 && expected == nullptr) return false;
+    u8 observed[8192];
+    u32 received = 0;
+    u32 recv_calls = 0;
+    for (u32 poll_attempt = 0; poll_attempt < kMaxPolls && recv_calls < kMaxRecvCalls;
+         poll_attempt++) {
+        struct pollfd readable{peer, POLLIN, 0};
+        i32 poll_rc = -1;
+        for (u32 interrupted = 0; interrupted < kMaxInterruptedPolls; interrupted++) {
+            readable.revents = 0;
+            poll_rc = poll(&readable, 1, 100);
+            if (poll_rc < 0 && errno == EINTR) continue;
+            break;
+        }
+        if (poll_rc == 0) continue;
+        if (poll_rc != 1 || (readable.revents & (POLLERR | POLLNVAL)) != 0 ||
+            (readable.revents & (POLLIN | POLLHUP)) == 0)
+            return false;
+
+        while (recv_calls++ < kMaxRecvCalls) {
+            const ssize_t nr = recv(peer, observed, sizeof(observed), MSG_DONTWAIT);
+            if (nr > 0) {
+                const u32 count = static_cast<u32>(nr);
+                if (received > expected_len || count > expected_len - received) return false;
+                if (__builtin_memcmp(observed, expected + received, count) != 0) return false;
+                received += count;
+                continue;
+            }
+            if (nr == 0) return received == expected_len;
+            if (errno == EINTR) continue;
+            if (errno == EAGAIN || errno == EWOULDBLOCK) break;
+            return false;
+        }
+    }
+    return false;
 }
 }  // namespace
 
@@ -12641,22 +12693,33 @@ TEST(epoll_episode_lifecycle, harvested_raw_partial_send_is_fenced_across_termin
     REQUIRE(listener_result.has_value());
     guard.listener_fd = listener_result.value();
     const i32 listener_fd = guard.listener_fd;
+    sockaddr_in addr{};
+    addr.sin_family = AF_INET;
+    addr.sin_port = __builtin_bswap16(get_port(listener_fd));
+    addr.sin_addr.s_addr = __builtin_bswap32(0x7F000001);
 
     Connection* first_conn = guard.alloc_conn();
     REQUIRE(first_conn != nullptr);
     const u32 conn_id = first_conn->id;
     const u32 first_episode = first_conn->upstream_episode;
     REQUIRE_EQ(first_episode, 1u);
+    first_conn->upstream_fd = UpstreamPool::create_socket();
+    REQUIRE_GE(first_conn->upstream_fd, 0);
+    const i32 first_fd = first_conn->upstream_fd;
+    REQUIRE(loop->submit_connect(*first_conn, &addr, sizeof(addr)));
+    // This assertion is deliberately adjacent to submit_connect and precedes
+    // accept/wait: a synchronous success/error would already have queued a
+    // synthetic completion, so zero proves this is the real EINPROGRESS path.
+    REQUIRE_EQ(loop->backend.pending_count, 0u);
+    REQUIRE_EQ(loop->backend.active_upstream_episode[conn_id], first_episode);
+    REQUIRE_EQ(loop->backend.upstream_fd_map[conn_id], first_fd);
+    REQUIRE(accept_real_upstream_peer(listener_fd, guard.peer_fds[0]));
     IoEvent first_connect{};
-    REQUIRE(
-        connect_real_upstream(guard, *first_conn, listener_fd, guard.peer_fds[0], first_connect));
+    REQUIRE(wait_for_real_upstream_completion(*loop, first_connect));
     REQUIRE_EQ(first_connect.type, IoEventType::UpstreamConnect);
     REQUIRE_EQ(first_connect.result, 0);
     REQUIRE_EQ(first_connect.conn_id, conn_id);
     REQUIRE_EQ(first_connect.upstream_episode, first_episode);
-    REQUIRE_EQ(loop->backend.pending_count, 0u);
-    const i32 first_fd = first_conn->upstream_fd;
-    REQUIRE_GE(first_fd, 0);
     REQUIRE_EQ(loop->backend.active_upstream_episode[conn_id], first_episode);
     REQUIRE_EQ(loop->backend.upstream_fd_map[conn_id], first_fd);
     g_epoll_episode_callback_count = 0;
@@ -12689,12 +12752,8 @@ TEST(epoll_episode_lifecycle, harvested_raw_partial_send_is_fenced_across_termin
         errno = 0;
         REQUIRE_EQ(recv(guard.peer_fds[0], &unexpected_byte, 1, MSG_PEEK | MSG_DONTWAIT), -1);
         REQUIRE(errno == EAGAIN || errno == EWOULDBLOCK);
-        struct pollfd first_sender_ready{first_fd, POLLOUT, 0};
-        REQUIRE_GT(poll(&first_sender_ready, 1, 1000), 0);
-        REQUIRE_NE(first_sender_ready.revents & POLLOUT, 0);
-        struct pollfd first_epoll_ready{loop->backend.epoll_fd, POLLIN, 0};
-        REQUIRE_GT(poll(&first_epoll_ready, 1, 1000), 0);
-        REQUIRE_NE(first_epoll_ready.revents & POLLIN, 0);
+        REQUIRE(poll_ready_without_terminal(first_fd, POLLOUT, 1000, true));
+        REQUIRE(poll_ready_without_terminal(loop->backend.epoll_fd, POLLIN, 1000, true));
 
         IoEvent suppressed{};
         REQUIRE_EQ(loop->backend.wait(&suppressed, 1, loop->conns, EpollEventLoop::kMaxConns), 0u);
@@ -12742,6 +12801,10 @@ TEST(epoll_episode_lifecycle, harvested_raw_partial_send_is_fenced_across_termin
         errno = 0;
         REQUIRE_EQ(fcntl(first_fd, F_GETFD), -1);
         REQUIRE_EQ(errno, EBADF);
+        // Closing the saturated episode after its raw readiness was harvested
+        // must expose EOF with no partial-send payload before the slot/fd is
+        // reused. A momentary EAGAIN above is not the wire-integrity proof.
+        REQUIRE(recv_exact_stream_to_eof(guard.peer_fds[0], nullptr, 0));
 
         Connection* current_conn = guard.alloc_conn();
         REQUIRE(current_conn != nullptr);
@@ -12749,16 +12812,23 @@ TEST(epoll_episode_lifecycle, harvested_raw_partial_send_is_fenced_across_termin
         REQUIRE_EQ(current_conn->id, conn_id);
         const u32 current_episode = current_conn->upstream_episode;
         REQUIRE_EQ(current_episode, first_episode + 1);
-        IoEvent current_connect{};
-        REQUIRE(connect_real_upstream(
-            guard, *current_conn, listener_fd, guard.peer_fds[1], current_connect));
+        current_conn->upstream_fd = UpstreamPool::create_socket();
+        REQUIRE_GE(current_conn->upstream_fd, 0);
         const i32 current_fd = current_conn->upstream_fd;
         REQUIRE_EQ(current_fd, first_fd);
+        REQUIRE(loop->submit_connect(*current_conn, &addr, sizeof(addr)));
+        // As above, observe the production submit result before accept or any
+        // backend wait can consume a synthetic completion.
+        REQUIRE_EQ(loop->backend.pending_count, 0u);
+        REQUIRE_EQ(loop->backend.active_upstream_episode[conn_id], current_episode);
+        REQUIRE_EQ(loop->backend.upstream_fd_map[conn_id], current_fd);
+        REQUIRE(accept_real_upstream_peer(listener_fd, guard.peer_fds[1]));
+        IoEvent current_connect{};
+        REQUIRE(wait_for_real_upstream_completion(*loop, current_connect));
         REQUIRE_EQ(current_connect.type, IoEventType::UpstreamConnect);
         REQUIRE_EQ(current_connect.result, 0);
         REQUIRE_EQ(current_connect.conn_id, conn_id);
         REQUIRE_EQ(current_connect.upstream_episode, current_episode);
-        REQUIRE_EQ(loop->backend.pending_count, 0u);
         REQUIRE_EQ(loop->backend.active_upstream_episode[conn_id], current_episode);
         REQUIRE_EQ(loop->backend.upstream_fd_map[conn_id], current_fd);
         g_epoll_episode_callback_count = 0;
@@ -12788,12 +12858,8 @@ TEST(epoll_episode_lifecycle, harvested_raw_partial_send_is_fenced_across_termin
         errno = 0;
         REQUIRE_EQ(recv(guard.peer_fds[1], &unexpected_byte, 1, MSG_PEEK | MSG_DONTWAIT), -1);
         REQUIRE(errno == EAGAIN || errno == EWOULDBLOCK);
-        struct pollfd current_sender_ready{current_fd, POLLOUT, 0};
-        REQUIRE_GT(poll(&current_sender_ready, 1, 1000), 0);
-        REQUIRE_NE(current_sender_ready.revents & POLLOUT, 0);
-        struct pollfd current_epoll_ready{loop->backend.epoll_fd, POLLIN, 0};
-        REQUIRE_GT(poll(&current_epoll_ready, 1, 1000), 0);
-        REQUIRE_NE(current_epoll_ready.revents & POLLIN, 0);
+        REQUIRE(poll_ready_without_terminal(current_fd, POLLOUT, 1000, true));
+        REQUIRE(poll_ready_without_terminal(loop->backend.epoll_fd, POLLIN, 1000, true));
 
         Connection* timer_anchor = guard.alloc_conn();
         REQUIRE(timer_anchor != nullptr);
@@ -12848,12 +12914,13 @@ TEST(epoll_episode_lifecycle, harvested_raw_partial_send_is_fenced_across_termin
         const bool upstream_send_armed_before = current_conn->upstream_send_armed;
         const ConnState state_before = current_conn->state;
 
-        // The send-state episode check also prevents an old-token wire write.
-        // That lower fence is not sufficient by itself: without the top owner
-        // fence this raw record could still rearm/drop the current registration
-        // under episode 1. Replay therefore proves defense in depth, exact state
-        // preservation, and subsequent progress; it does not attribute zero
-        // stale wire bytes to only one of those two layers.
+        // This replay isolates the top raw owner/token fence: the passing path
+        // never reaches the lower send-state episode check. Without the top
+        // fence, that lower mismatch path could rearm the fd under episode 1 and
+        // strand episode-2 progress. The separate
+        // stale_tls_send_cannot_rearm_or_hijack_current_recv regression directly
+        // exercises the lower fence. Together they give layered coverage; this
+        // replay alone does not execute both layers.
         REQUIRE(held.replay_once());
         IoEvent stale_output{0x00ffffffu,
                              -1234,
@@ -12932,12 +12999,8 @@ TEST(epoll_episode_lifecycle, harvested_raw_partial_send_is_fenced_across_termin
         errno = 0;
         CHECK_EQ(recv(guard.peer_fds[1], &unexpected_byte, 1, MSG_PEEK | MSG_DONTWAIT), -1);
         CHECK(errno == EAGAIN || errno == EWOULDBLOCK);
-        struct pollfd sender_still_ready{current_fd, POLLOUT, 0};
-        REQUIRE_GT(poll(&sender_still_ready, 1, 1000), 0);
-        REQUIRE_NE(sender_still_ready.revents & POLLOUT, 0);
-        struct pollfd epoll_still_ready{loop->backend.epoll_fd, POLLIN, 0};
-        REQUIRE_GT(poll(&epoll_still_ready, 1, 1000), 0);
-        REQUIRE_NE(epoll_still_ready.revents & POLLIN, 0);
+        REQUIRE(poll_ready_without_terminal(current_fd, POLLOUT, 1000, true));
+        REQUIRE(poll_ready_without_terminal(loop->backend.epoll_fd, POLLIN, 1000, true));
 
         IoEvent current_send_completion{};
         REQUIRE_EQ(
@@ -12957,13 +13020,12 @@ TEST(epoll_episode_lifecycle, harvested_raw_partial_send_is_fenced_across_termin
         REQUIRE_FALSE(completed_send.tls);
         REQUIRE_EQ(completed_send.tls_wait_events, 0u);
         REQUIRE_EQ(completed_send.upstream_episode, 0u);
-        char observed_payload[sizeof(current_payload)]{};
-        REQUIRE(recv_exact_from_real_peer(
-            guard.peer_fds[1], observed_payload, sizeof(observed_payload)));
-        REQUIRE_EQ(__builtin_memcmp(observed_payload, current_payload, sizeof(current_payload)), 0);
-        errno = 0;
-        REQUIRE_EQ(recv(guard.peer_fds[1], &unexpected_byte, 1, MSG_PEEK | MSG_DONTWAIT), -1);
-        REQUIRE(errno == EAGAIN || errno == EWOULDBLOCK);
+        // Only after the current partial send has completed, half-close the
+        // producer and verify the complete post-filler stream through recv()==0.
+        // This excludes a hidden prefix, suffix, or duplicate payload.
+        REQUIRE_EQ(shutdown(current_fd, SHUT_WR), 0);
+        REQUIRE(
+            recv_exact_stream_to_eof(guard.peer_fds[1], current_payload, sizeof(current_payload)));
         loop->dispatch(current_send_completion);
         REQUIRE_EQ(g_epoll_episode_callback_count, 1u);
 
