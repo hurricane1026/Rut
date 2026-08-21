@@ -81,6 +81,12 @@ static constexpr char kHeadResponseNormalized[] =
     "Date: XXXXXXXXXXXXXXXXXXXXXXXXXXXXX\r\n"
     "Content-Length: 5\r\n"
     "Connection: close\r\n\r\n";
+static constexpr char kHeadKeepAliveResponseNormalized[] =
+    "HTTP/1.1 200 OK\r\n"
+    "Server: nginx/1.29.7\r\n"
+    "Date: XXXXXXXXXXXXXXXXXXXXXXXXXXXXX\r\n"
+    "Content-Length: 5\r\n"
+    "Connection: keep-alive\r\n\r\n";
 static constexpr char kHeadGatewayResponseNormalized[] =
     "HTTP/1.1 502 Bad Gateway\r\n"
     "Server: nginx/1.29.7\r\n"
@@ -88,6 +94,13 @@ static constexpr char kHeadGatewayResponseNormalized[] =
     "Content-Type: text/html\r\n"
     "Content-Length: 157\r\n"
     "Connection: close\r\n\r\n";
+static constexpr char kHeadGatewayKeepAliveResponseNormalized[] =
+    "HTTP/1.1 502 Bad Gateway\r\n"
+    "Server: nginx/1.29.7\r\n"
+    "Date: XXXXXXXXXXXXXXXXXXXXXXXXXXXXX\r\n"
+    "Content-Type: text/html\r\n"
+    "Content-Length: 157\r\n"
+    "Connection: keep-alive\r\n\r\n";
 static constexpr char kApiResponseNormalized[] =
     "HTTP/1.1 200 OK\r\n"
     "Server: nginx/1.29.7\r\n"
@@ -436,16 +449,20 @@ static bool parse_content_length(const std::vector<char>& bytes, size_t end, siz
     return false;
 }
 
-static bool validate_head_observation_response(const std::vector<char>& bytes,
-                                               const char* status_prefix,
+static bool normalize_date(std::vector<char>& bytes);
+
+static bool validate_exact_normalized_response(const std::vector<char>& bytes,
+                                               const char* expected,
                                                std::string& error) {
-    const size_t end = header_end(bytes);
-    size_t content_length = 0;
-    const size_t status_len = strlen(status_prefix);
-    if (end == 0 || bytes.size() != end || bytes.size() < status_len ||
-        memcmp(bytes.data(), status_prefix, status_len) != 0 ||
-        !parse_content_length(bytes, end, content_length)) {
-        error = "observation response has incomplete/malformed status or Content-Length headers";
+    std::vector<char> normalized = bytes;
+    if (!normalize_date(normalized)) {
+        error = "pinned response has no unique valid Date field";
+        return false;
+    }
+    const size_t expected_len = strlen(expected);
+    if (normalized.size() != expected_len ||
+        memcmp(normalized.data(), expected, expected_len) != 0) {
+        error = "pinned response did not match the exact Date-normalized wire baseline";
         return false;
     }
     return true;
@@ -556,10 +573,10 @@ static bool read_eof(int fd, std::string& error) {
     return false;
 }
 
-static bool observe_no_data_or_eof(int fd,
-                                   int quiet_ms,
-                                   bool& eof,
-                                   std::string& error) {
+static bool wait_keepalive_quiet_or_eof(int fd,
+                                        int quiet_ms,
+                                        bool& eof,
+                                        std::string& error) {
     using Clock = std::chrono::steady_clock;
     const Clock::time_point deadline = Clock::now() + std::chrono::milliseconds(quiet_ms);
     eof = false;
@@ -570,7 +587,7 @@ static bool observe_no_data_or_eof(int fd,
         const int ready = poll(&p, 1, remaining > 50 ? 50 : static_cast<int>(remaining));
         if (ready < 0) {
             if (errno == EINTR) continue;
-            error = "observation poll failed";
+            error = "keep-alive quiet-window poll failed";
             return false;
         }
         if (ready == 0) continue;
@@ -582,15 +599,15 @@ static bool observe_no_data_or_eof(int fd,
                 return true;
             }
             if (n > 0) {
-                error = "unexpected downstream body/data after HEAD headers";
+                error = "unexpected downstream body/data during HEAD quiet window";
                 return false;
             }
             if (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK) continue;
-            error = "observation recv failed";
+            error = "keep-alive quiet-window recv failed";
             return false;
         }
         if (p.revents & POLLERR) {
-            error = "observation socket error";
+            error = "keep-alive quiet-window socket error";
             return false;
         }
     }
@@ -770,11 +787,11 @@ struct Recorder {
     ~Recorder() { stop(); }
 };
 
-// Observation-only backend for two requests on one downstream connection. It
+// Pinned-baseline backend for two requests on one downstream connection. It
 // keeps accepted upstream fds open, records the connection id with every
 // request, and deliberately delays the representation body after the response
 // headers so a HEAD leak cannot be hidden by coalescing.
-struct KeepAliveObservationRecorder {
+struct KeepAlivePinnedRecorder {
     struct Entry {
         u32 connection_id = 0;
         std::vector<char> wire;
@@ -819,7 +836,7 @@ struct KeepAliveObservationRecorder {
 
     static bool send_head_body(int fd) { return send_all(fd, "hello", 5); }
 
-    static bool process_next_request(KeepAliveObservationRecorder& self,
+    static bool process_next_request(KeepAlivePinnedRecorder& self,
                                      Active& item,
                                      std::chrono::steady_clock::time_point now) {
         const size_t end = find_header_end(item.wire, item.parsed);
@@ -836,7 +853,7 @@ struct KeepAliveObservationRecorder {
     }
 
     static void* run(void* opaque) {
-        auto* self = static_cast<KeepAliveObservationRecorder*>(opaque);
+        auto* self = static_cast<KeepAlivePinnedRecorder*>(opaque);
         std::vector<Active> active;
         u32 next_connection_id = 1;
         while (self->running.load(std::memory_order_acquire)) {
@@ -944,7 +961,7 @@ struct KeepAliveObservationRecorder {
         accepted.store(0, std::memory_order_relaxed);
         requests.store(0, std::memory_order_relaxed);
         running.store(true, std::memory_order_release);
-        if (pthread_create(&thread, nullptr, &KeepAliveObservationRecorder::run, this) != 0) {
+        if (pthread_create(&thread, nullptr, &KeepAlivePinnedRecorder::run, this) != 0) {
             running.store(false, std::memory_order_release);
             close(listen_fd);
             listen_fd = -1;
@@ -967,23 +984,23 @@ struct KeepAliveObservationRecorder {
         }
     }
 
-    ~KeepAliveObservationRecorder() { stop(); }
+    ~KeepAlivePinnedRecorder() { stop(); }
 };
 
-static bool wait_observation_requests(KeepAliveObservationRecorder& recorder,
+static bool wait_pinned_requests(KeepAlivePinnedRecorder& recorder,
                                       u32 expected,
                                       std::string& error) {
     const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
     while (std::chrono::steady_clock::now() < deadline) {
         const u32 requests = recorder.requests.load(std::memory_order_acquire);
         if (requests > expected) {
-            error = "observation recorder saw unexpected extra requests";
+            error = "pinned recorder saw unexpected extra requests";
             return false;
         }
         if (requests == expected) return true;
         usleep(5000);
     }
-    error = "observation recorder request deadline exceeded";
+    error = "pinned recorder request deadline exceeded";
     return false;
 }
 
@@ -1141,12 +1158,12 @@ static int missing_prerequisite(const char* message) {
     return required && strcmp(required, "1") == 0 ? 1 : 77;
 }
 
-static bool observe_nginx_head_keepalive_success(
+static bool capture_nginx_head_keepalive_success(
     u16 frontend_port,
     const std::string& nginx_config_path,
     const std::string& nginx_log_path,
     const std::string& container_name,
-    KeepAliveObservationRecorder& recorder,
+    KeepAlivePinnedRecorder& recorder,
     std::vector<std::vector<char>>& responses,
     std::string& error) {
     DockerGuard docker(container_name);
@@ -1156,7 +1173,7 @@ static bool observe_nginx_head_keepalive_success(
                       kNginxImage, "nginx", "-g", "daemon off;"},
                      nginx_log_path,
                      nginx.child)) {
-        error = "failed to start pinned nginx for keep-alive HEAD observation";
+        error = "failed to start pinned nginx for pinned keep-alive HEAD baseline";
         return false;
     }
     if (!wait_ready(frontend_port, nginx.child, error)) return false;
@@ -1170,50 +1187,51 @@ static bool observe_nginx_head_keepalive_success(
     if (client.fd < 0 || !send_all(client.fd,
                                    kHeadKeepAliveRequest1,
                                    sizeof(kHeadKeepAliveRequest1) - 1)) {
-        error = "failed to send first keep-alive HEAD observation request";
+        error = "failed to send first pinned keep-alive HEAD request";
         return false;
     }
     responses.clear();
     std::vector<char> first;
     if (!read_head_response(client.fd, first, error)) return false;
-    if (!validate_head_observation_response(first, "HTTP/1.1 200 ", error)) return false;
+    if (!validate_exact_normalized_response(first, kHeadKeepAliveResponseNormalized, error))
+        return false;
     bool eof = false;
-    if (!observe_no_data_or_eof(client.fd, 750, eof, error) || eof) {
-        if (error.empty()) error = "nginx closed first live HEAD keep-alive response";
+    if (!wait_keepalive_quiet_or_eof(client.fd, 500, eof, error) || eof) {
+        if (error.empty()) error = "nginx closed first pinned HEAD keep-alive response";
         return false;
     }
     responses.push_back(std::move(first));
 
     if (!send_all(client.fd, kHeadKeepAliveRequest2, sizeof(kHeadKeepAliveRequest2) - 1)) {
-        error = "failed to send second close-intent HEAD observation request";
+        error = "failed to send second pinned close-intent HEAD request";
         return false;
     }
     std::vector<char> second;
     if (!read_head_response(client.fd, second, error) || !read_eof(client.fd, error)) return false;
-    if (!validate_head_observation_response(second, "HTTP/1.1 200 ", error)) return false;
+    if (!validate_exact_normalized_response(second, kHeadResponseNormalized, error)) return false;
     responses.push_back(std::move(second));
 
-    if (!wait_observation_requests(recorder, 2, error)) return false;
+    if (!wait_pinned_requests(recorder, 2, error)) return false;
     const bool nginx_stopped = stop_child(nginx.child);
     const bool container_removed = docker.remove();
     if (!nginx_stopped) {
-        error = "failed to stop nginx after keep-alive HEAD observation";
+        error = "failed to stop nginx after pinned keep-alive HEAD baseline";
         return false;
     }
     if (!container_removed) {
-        error = "docker rm -f failed after keep-alive HEAD observation";
+        error = "docker rm -f failed after pinned keep-alive HEAD baseline";
         return false;
     }
     settle_for_invalid_target_side_effects();
     if (recorder.requests.load(std::memory_order_acquire) != 2 ||
         recorder.accepted.load(std::memory_order_acquire) > 2) {
-        error = "keep-alive HEAD observation saw unexpected extra upstream activity";
+        error = "pinned keep-alive HEAD baseline saw unexpected extra upstream activity";
         return false;
     }
     return true;
 }
 
-static bool observe_nginx_head_keepalive_gateway(
+static bool capture_nginx_head_keepalive_gateway(
     u16 frontend_port,
     u16 backend_port,
     const std::string& nginx_config_path,
@@ -1221,11 +1239,10 @@ static bool observe_nginx_head_keepalive_gateway(
     const std::string& container_name,
     DeadPort& dead,
     std::vector<std::vector<char>>& responses,
-    bool& sent_second,
     u32& connect_failure_count,
     std::string& error) {
     if (dead.fd < 0) {
-        error = "gateway observation dead port is not reserved";
+        error = "pinned HEAD gateway dead port is not reserved";
         return false;
     }
     DockerGuard docker(container_name);
@@ -1235,7 +1252,7 @@ static bool observe_nginx_head_keepalive_gateway(
                       kNginxImage, "nginx", "-g", "daemon off;"},
                      nginx_log_path,
                      nginx.child)) {
-        error = "failed to start pinned nginx for keep-alive HEAD gateway observation";
+        error = "failed to start pinned nginx for keep-alive HEAD gateway baseline";
         return false;
     }
     if (!wait_ready(frontend_port, nginx.child, error)) return false;
@@ -1249,30 +1266,32 @@ static bool observe_nginx_head_keepalive_gateway(
     if (client.fd < 0 || !send_all(client.fd,
                                    kHeadGatewayKeepAliveRequest1,
                                    sizeof(kHeadGatewayKeepAliveRequest1) - 1)) {
-        error = "failed to send first keep-alive HEAD gateway observation request";
+        error = "failed to send first pinned HEAD gateway request";
         return false;
     }
     responses.clear();
     std::vector<char> first;
     if (!read_head_response(client.fd, first, error)) return false;
-    if (!validate_head_observation_response(first, "HTTP/1.1 502 ", error)) return false;
+    if (!validate_exact_normalized_response(
+            first, kHeadGatewayKeepAliveResponseNormalized, error))
+        return false;
     responses.push_back(std::move(first));
     bool eof = false;
-    if (!observe_no_data_or_eof(client.fd, 750, eof, error)) return false;
-    sent_second = false;
-    if (!eof) {
-        if (!send_all(client.fd,
-                      kHeadGatewayKeepAliveRequest2,
-                      sizeof(kHeadGatewayKeepAliveRequest2) - 1)) {
-            error = "failed to send second close-intent HEAD gateway observation request";
-            return false;
-        }
-        std::vector<char> second;
-        if (!read_head_response(client.fd, second, error) || !read_eof(client.fd, error)) return false;
-        if (!validate_head_observation_response(second, "HTTP/1.1 502 ", error)) return false;
-        responses.push_back(std::move(second));
-        sent_second = true;
+    if (!wait_keepalive_quiet_or_eof(client.fd, 500, eof, error) || eof) {
+        if (error.empty()) error = "nginx closed first pinned HEAD gateway response";
+        return false;
     }
+    if (!send_all(client.fd,
+                  kHeadGatewayKeepAliveRequest2,
+                  sizeof(kHeadGatewayKeepAliveRequest2) - 1)) {
+        error = "failed to send second pinned HEAD gateway request";
+        return false;
+    }
+    std::vector<char> second;
+    if (!read_head_response(client.fd, second, error) || !read_eof(client.fd, error)) return false;
+    if (!validate_exact_normalized_response(second, kHeadGatewayResponseNormalized, error))
+        return false;
+    responses.push_back(std::move(second));
 
     const bool nginx_stopped = stop_child(nginx.child);
     const bool container_removed = docker.remove();
@@ -1282,36 +1301,35 @@ static bool observe_nginx_head_keepalive_gateway(
                                                   upstream_context.c_str(),
                                                   connect_failure_count);
     if (!nginx_stopped) {
-        error = "failed to stop nginx after keep-alive HEAD gateway observation";
+        error = "failed to stop nginx after pinned HEAD gateway baseline";
         return false;
     }
     if (!container_removed) {
-        error = "docker rm -f failed after keep-alive HEAD gateway observation";
+        error = "docker rm -f failed after pinned HEAD gateway baseline";
         return false;
     }
-    const u32 expected_responses = sent_second ? 2 : 1;
-    if (responses.size() != expected_responses) {
-        error = "gateway observation response count did not match its open/EOF outcome";
+    if (responses.size() != 2) {
+        error = "pinned HEAD gateway baseline did not produce exactly two responses";
         return false;
     }
-    if (!log_readable || connect_failure_count != expected_responses) {
-        error = "gateway observation scoped connect failure count did not match response count " +
-                std::to_string(expected_responses) + " (actual " +
+    if (!log_readable || connect_failure_count != 2) {
+        error = "pinned HEAD gateway baseline did not produce exactly two scoped connect failures "
+                "(actual " +
                 std::to_string(connect_failure_count) + ")";
         return false;
     }
     return true;
 }
 
-static void dump_observation_history(const KeepAliveObservationRecorder& recorder) {
-    std::cerr << "OBSERVE upstream accepted="
+static void dump_pinned_history(const KeepAlivePinnedRecorder& recorder) {
+    std::cerr << "PINNED upstream accepted="
               << recorder.accepted.load(std::memory_order_acquire) << " requests="
               << recorder.requests.load(std::memory_order_acquire)
               << " history=" << recorder.history.size() << "\n";
     for (size_t i = 0; i < recorder.history.size(); i++) {
-        std::cerr << "OBSERVE upstream history[" << i << "] connection_id="
+        std::cerr << "PINNED upstream history[" << i << "] connection_id="
                   << recorder.history[i].connection_id << "\n";
-        dump_wire("OBSERVE upstream request", recorder.history[i].wire);
+        dump_wire("PINNED upstream request", recorder.history[i].wire);
     }
 }
 
@@ -2373,103 +2391,132 @@ int main(int argc, char** argv) {
     std::cerr << "PASS: pinned nginx HEAD unavailable-upstream gateway baseline "
                  "(header-only 502 + EOF)\n";
 
-    const char* observe_keepalive = getenv("RUT_NGINX_HEAD_KEEPALIVE_OBSERVE");
-    if (observe_keepalive != nullptr && strcmp(observe_keepalive, "1") == 0) {
-        KeepAliveObservationRecorder recorder;
-        if (!recorder.setup(backend_port)) {
-            std::cerr << "FAIL [OBSERVE HEAD]: backend recorder setup failed\n";
-            return 1;
-        }
-        std::vector<std::vector<char>> live_responses;
-        std::string live_error;
-        const std::string observe_container = container + "-head-keepalive-observe";
-        if (!observe_nginx_head_keepalive_success(frontend_port,
-                                                  temp.nginx_config,
-                                                  temp.nginx_log,
-                                                  observe_container,
-                                                  recorder,
-                                                  live_responses,
-                                                  live_error)) {
-            std::cerr << "FAIL [OBSERVE HEAD live]: " << live_error << "\n";
-            for (const auto& response : live_responses) dump_wire("OBSERVE downstream", response);
-            recorder.stop();
-            dump_observation_history(recorder);
-            dump_log(temp.nginx_log, "OBSERVE nginx live log");
-            return 1;
-        }
-        recorder.stop();
-        if (live_responses.size() != 2 || recorder.history.size() != 2 ||
-            recorder.accepted.load(std::memory_order_acquire) == 0 ||
-            recorder.accepted.load(std::memory_order_acquire) > 2 ||
-            recorder.requests.load(std::memory_order_acquire) != 2) {
-            std::cerr << "FAIL [OBSERVE HEAD live]: malformed response/history/count observation\n";
-            for (const auto& response : live_responses) dump_wire("OBSERVE downstream", response);
-            dump_observation_history(recorder);
-            return 1;
-        }
-        for (size_t i = 0; i < recorder.history.size(); i++) {
-            const std::string expected =
-                std::string(i == 0 ? "HEAD /head?q=1 HTTP/1.1\r\n"
-                                   : "HEAD /head?q=2 HTTP/1.1\r\n") +
-                "Host: 127.0.0.1:" + std::to_string(backend_port) + "\r\n\r\n";
-            const std::vector<char> expected_wire(expected.begin(), expected.end());
-            if (recorder.history[i].connection_id == 0 ||
-                recorder.history[i].wire != expected_wire) {
-                std::cerr << "FAIL [OBSERVE HEAD live]: malformed upstream history entry\n";
-                std::cerr << "expected upstream history entry " << i << "\n";
-                dump_wire("expected upstream request", expected_wire);
-                dump_observation_history(recorder);
-                return 1;
-            }
-        }
-        for (const auto& response : live_responses) dump_wire("OBSERVE live downstream", response);
-        dump_observation_history(recorder);
-
-        DeadPort observe_dead;
-        if (!observe_dead.reserve(backend_port)) {
-            std::cerr << "FAIL [OBSERVE HEAD gateway]: dead-port reservation failed\n";
-            return 1;
-        }
-        std::vector<std::vector<char>> gateway_responses;
-        bool gateway_sent_second = false;
-        u32 gateway_connect_failures = 0;
-        std::string gateway_error;
-        if (!observe_nginx_head_keepalive_gateway(frontend_port,
-                                                  backend_port,
-                                                  temp.nginx_config,
-                                                  temp.nginx_log,
-                                                  container + "-head-gateway-keepalive-observe",
-                                                  observe_dead,
-                                                  gateway_responses,
-                                                  gateway_sent_second,
-                                                  gateway_connect_failures,
-                                                  gateway_error)) {
-            std::cerr << "FAIL [OBSERVE HEAD gateway]: " << gateway_error << "\n";
-            for (const auto& response : gateway_responses)
-                dump_wire("OBSERVE gateway downstream", response);
-            dump_log(temp.nginx_log, "OBSERVE nginx gateway log");
-            return 1;
-        }
-        const u32 expected_gateway_observations = gateway_sent_second ? 2 : 1;
-        if (gateway_responses.size() != expected_gateway_observations ||
-            gateway_connect_failures != expected_gateway_observations) {
-            std::cerr << "FAIL [OBSERVE HEAD gateway]: response/log count mismatch expected "
-                      << expected_gateway_observations << " responses and scoped failures, got "
-                      << gateway_responses.size() << " and " << gateway_connect_failures << "\n";
-            for (const auto& response : gateway_responses)
-                dump_wire("OBSERVE gateway downstream", response);
-            dump_log(temp.nginx_log, "OBSERVE nginx gateway log");
-            return 1;
-        }
-        for (const auto& response : gateway_responses)
-            dump_wire("OBSERVE gateway downstream", response);
-        std::cerr << "OBSERVE gateway outcome="
-                  << (gateway_sent_second ? "open_then_close" : "closed_after_first")
-                  << " responses=" << gateway_responses.size()
-                  << " scoped_connect_failures=" << gateway_connect_failures << "\n";
-        std::cerr << "OBSERVE keep-alive HEAD probe complete; no compatibility claim made\n";
-        return 0;
+    KeepAlivePinnedRecorder keepalive_recorder;
+    if (!keepalive_recorder.setup(backend_port)) {
+        std::cerr << "FAIL [pinned HEAD keep-alive]: backend recorder setup failed\n";
+        return 1;
     }
+    std::vector<std::vector<char>> keepalive_responses;
+    std::string keepalive_error;
+    const std::string keepalive_container = container + "-head-keepalive";
+    if (!capture_nginx_head_keepalive_success(frontend_port,
+                                              temp.nginx_config,
+                                              temp.nginx_log,
+                                              keepalive_container,
+                                              keepalive_recorder,
+                                              keepalive_responses,
+                                              keepalive_error)) {
+        std::cerr << "FAIL [pinned HEAD keep-alive]: " << keepalive_error << "\n";
+        for (const auto& response : keepalive_responses)
+            dump_wire("pinned HEAD downstream", response);
+        keepalive_recorder.stop();
+        dump_pinned_history(keepalive_recorder);
+        dump_log(temp.nginx_log, "pinned nginx keep-alive log");
+        return 1;
+    }
+    keepalive_recorder.stop();
+    if (keepalive_responses.size() != 2 || keepalive_recorder.history.size() != 2 ||
+        keepalive_recorder.accepted.load(std::memory_order_acquire) != 2 ||
+        keepalive_recorder.requests.load(std::memory_order_acquire) != 2 ||
+        keepalive_recorder.history[0].connection_id != 1 ||
+        keepalive_recorder.history[1].connection_id != 2 ||
+        keepalive_recorder.history[0].connection_id == keepalive_recorder.history[1].connection_id) {
+        std::cerr << "FAIL [pinned HEAD keep-alive]: exact upstream count/connection mapping failed\n";
+        for (const auto& response : keepalive_responses)
+            dump_wire("pinned HEAD downstream", response);
+        dump_pinned_history(keepalive_recorder);
+        return 1;
+    }
+    const char* const expected_keepalive_responses[] = {
+        kHeadKeepAliveResponseNormalized,
+        kHeadResponseNormalized,
+    };
+    for (size_t i = 0; i < 2; i++) {
+        std::vector<char> normalized = keepalive_responses[i];
+        const size_t expected_len = strlen(expected_keepalive_responses[i]);
+        if (!normalize_date(normalized) || normalized.size() != expected_len ||
+            memcmp(normalized.data(), expected_keepalive_responses[i], expected_len) != 0) {
+            std::cerr << "FAIL [pinned HEAD keep-alive]: exact response " << (i + 1)
+                      << " mismatch\n";
+            dump_wire("expected pinned HEAD response", std::vector<char>(
+                                                            expected_keepalive_responses[i],
+                                                            expected_keepalive_responses[i] +
+                                                                expected_len));
+            dump_wire("actual pinned HEAD response", keepalive_responses[i]);
+            dump_pinned_history(keepalive_recorder);
+            return 1;
+        }
+        const std::string expected_request =
+            std::string(i == 0 ? "HEAD /head?q=1 HTTP/1.1\r\n"
+                               : "HEAD /head?q=2 HTTP/1.1\r\n") +
+            "Host: 127.0.0.1:" + std::to_string(backend_port) + "\r\n\r\n";
+        const std::vector<char> expected_wire(expected_request.begin(), expected_request.end());
+        if (keepalive_recorder.history[i].wire != expected_wire) {
+            std::cerr << "FAIL [pinned HEAD keep-alive]: exact upstream request " << (i + 1)
+                      << " mismatch\n";
+            dump_wire("expected pinned upstream request", expected_wire);
+            dump_wire("actual pinned upstream request", keepalive_recorder.history[i].wire);
+            dump_pinned_history(keepalive_recorder);
+            return 1;
+        }
+    }
+    for (const auto& response : keepalive_responses) dump_wire("pinned HEAD downstream", response);
+    dump_pinned_history(keepalive_recorder);
+    std::cerr << "PASS: pinned nginx HEAD keep-alive success baseline (two upstream connections)\n";
+
+    DeadPort keepalive_dead;
+    if (!keepalive_dead.reserve(backend_port)) {
+        std::cerr << "FAIL [pinned HEAD gateway keep-alive]: dead-port reservation failed\n";
+        return 1;
+    }
+    std::vector<std::vector<char>> keepalive_gateway_responses;
+    u32 keepalive_gateway_failures = 0;
+    std::string keepalive_gateway_error;
+    if (!capture_nginx_head_keepalive_gateway(
+            frontend_port,
+            backend_port,
+            temp.nginx_config,
+            temp.nginx_log,
+            container + "-head-gateway-keepalive",
+            keepalive_dead,
+            keepalive_gateway_responses,
+            keepalive_gateway_failures,
+            keepalive_gateway_error)) {
+        std::cerr << "FAIL [pinned HEAD gateway keep-alive]: " << keepalive_gateway_error << "\n";
+        for (const auto& response : keepalive_gateway_responses)
+            dump_wire("pinned HEAD gateway downstream", response);
+        dump_log(temp.nginx_log, "pinned nginx HEAD gateway keep-alive log");
+        return 1;
+    }
+    if (keepalive_gateway_responses.size() != 2 || keepalive_gateway_failures != 2) {
+        std::cerr << "FAIL [pinned HEAD gateway keep-alive]: expected two responses and two "
+                     "scoped connect failures\n";
+        for (const auto& response : keepalive_gateway_responses)
+            dump_wire("pinned HEAD gateway downstream", response);
+        dump_log(temp.nginx_log, "pinned nginx HEAD gateway keep-alive log");
+        return 1;
+    }
+    const char* const expected_gateway_responses[] = {
+        kHeadGatewayKeepAliveResponseNormalized,
+        kHeadGatewayResponseNormalized,
+    };
+    for (size_t i = 0; i < 2; i++) {
+        std::vector<char> normalized = keepalive_gateway_responses[i];
+        const size_t expected_len = strlen(expected_gateway_responses[i]);
+        if (!normalize_date(normalized) || normalized.size() != expected_len ||
+            memcmp(normalized.data(), expected_gateway_responses[i], expected_len) != 0) {
+            std::cerr << "FAIL [pinned HEAD gateway keep-alive]: exact response " << (i + 1)
+                      << " mismatch\n";
+            dump_wire("actual pinned HEAD gateway response", keepalive_gateway_responses[i]);
+            dump_log(temp.nginx_log, "pinned nginx HEAD gateway keep-alive log");
+            return 1;
+        }
+    }
+    for (const auto& response : keepalive_gateway_responses)
+        dump_wire("pinned HEAD gateway downstream", response);
+    std::cerr << "PASS: pinned nginx HEAD keep-alive gateway baseline (two failures + EOF)\n";
+    close(keepalive_dead.fd);
+    keepalive_dead.fd = -1;
 
     std::vector<char> rut_head_response;
     std::vector<char> rut_head_request;
