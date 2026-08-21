@@ -114,9 +114,9 @@ public:
     // is retried before the next blocking wait; the count avoids scanning the
     // full connection table on the ordinary hot path.
     u32 upstream_retirement_retry_count;
-    // Set only when a final owned retirement CQE makes at least one parked
-    // HTTP/1 boundary eligible. The ordinary hot path avoids a connection-table
-    // scan; the run loop consumes this after the complete wait batch.
+    // Set only when exact rendezvous owners make at least one parked HTTP/1
+    // boundary eligible. The ordinary hot path avoids a connection-table scan;
+    // the run loop consumes this after the complete wait batch.
     bool http1_boundary_ready_pending;
 
     // Deferred accepts: accepted fds that couldn't be allocated during
@@ -243,9 +243,9 @@ public:
             for (u32 i = 0; i < n; i++) {
                 dispatch(events[i]);
             }
-            // Retirement finals publish only readiness during dispatch. Admit
-            // parked HTTP/1 request boundaries after every CQE in this wait
-            // batch has been observed, before reclamation or accept reuse.
+            // Retirement/header rendezvous owners publish only readiness during
+            // dispatch. Admit parked HTTP/1 request boundaries after every CQE
+            // in this wait batch, before reclamation or accept reuse.
             resume_deferred_http1_boundaries();
             reclaim_pending();
             retry_deferred_accepts();
@@ -429,6 +429,113 @@ public:
     }
 
 private:
+    static bool prebuilt_http1_header_is_complete(const Connection& c) {
+        const u32 len = c.response_header_buf.len();
+        const u8* data = c.response_header_buf.data();
+        if (data == nullptr || len < 16u || __builtin_memcmp(data, "HTTP/1.1 ", 9) != 0 ||
+            data[9] < '1' || data[9] > '5' || data[10] < '0' || data[10] > '9' || data[11] < '0' ||
+            data[11] > '9' || data[12] != ' ' || data[len - 4] != '\r' || data[len - 3] != '\n' ||
+            data[len - 2] != '\r' || data[len - 1] != '\n')
+            return false;
+        const u16 status =
+            static_cast<u16>((data[9] - '0') * 100u + (data[10] - '0') * 10u + (data[11] - '0'));
+        return status == c.resp_status;
+    }
+
+    bool prebuilt_http1_layout_is_valid(const Connection& c,
+                                        u8 selected_targets,
+                                        Http1RequestBufferDisposition disposition,
+                                        u32 request_prefix_len) const {
+        const bool retiring_connect = (selected_targets & kUpstreamOpConnect) != 0;
+        const bool retiring_send = (selected_targets & kUpstreamOpSend) != 0;
+        const auto& send = backend.upstream_send_state[c.id];
+        auto exact_send_source = [&](const u8* expected, u32 total) {
+            return !retiring_send ||
+                   (expected != nullptr && send.src == expected && send.offset <= total &&
+                    send.remaining == total - send.offset && send.fd == c.upstream_fd &&
+                    send.type == IoEventType::UpstreamSend &&
+                    send.upstream_episode == c.upstream_episode);
+        };
+
+        switch (disposition) {
+            case Http1RequestBufferDisposition::PrefixInRecv:
+                // Before the initial upload completes, request 1 is still the
+                // exact prefix of recv_buf. The only possible transport phases
+                // are connect establishment or a fresh send sourced from that
+                // prefix; a recv-only/owner-free handoff cannot prove this
+                // layout.
+                return !c.request_upload_complete && !c.upstream_request_incomplete &&
+                       (retiring_connect || retiring_send) &&
+                       (!retiring_connect || selected_targets == kUpstreamOpConnect) &&
+                       request_prefix_len != 0 && request_prefix_len == c.req_initial_send_len &&
+                       request_prefix_len <= c.recv_buf.len() && c.retry_req_send_len == 0 &&
+                       c.pipeline_stash_len == 0 &&
+                       exact_send_source(c.recv_buf.data(), request_prefix_len);
+            case Http1RequestBufferDisposition::RetrySendBuf:
+                // A retry snapshot is meaningful only while its exact replay
+                // send is live and sourced from send_buf. Connect ownership is
+                // not evidence that this snapshot is the active request.
+                return !c.request_upload_complete && !c.upstream_request_incomplete &&
+                       !retiring_connect && retiring_send && request_prefix_len != 0 &&
+                       request_prefix_len == c.retry_req_send_len && c.pipeline_stash_len == 0 &&
+                       request_prefix_len <= c.send_buf.len() &&
+                       exact_send_source(c.send_buf.data(), request_prefix_len);
+            case Http1RequestBufferDisposition::ExistingPipeline: {
+                // The upload callback has already removed request 1 from
+                // recv_buf. recv_buf therefore starts at the next-request
+                // boundary, while any retry snapshot/pipeline stash remains in
+                // send_buf until both rendezvous owners drain. A live Send has
+                // not reached that callback and belongs to RetrySendBuf instead.
+                const u32 stored =
+                    static_cast<u32>(c.retry_req_send_len) + static_cast<u32>(c.pipeline_stash_len);
+                return c.request_upload_complete && !c.upstream_request_incomplete &&
+                       !retiring_connect && !retiring_send &&
+                       request_prefix_len == c.retry_req_send_len && stored <= c.send_buf.len();
+            }
+            case Http1RequestBufferDisposition::None:
+                return false;
+        }
+        return false;
+    }
+
+    void publish_prebuilt_http1_ready(Connection& c) {
+        if (c.http1_prebuilt_disposition == Http1RequestBufferDisposition::None ||
+            c.http1_prebuilt_wait != 0 || !c.http1_boundary_deferred || c.http1_boundary_ready)
+            return;
+        c.http1_boundary_ready = true;
+        http1_boundary_ready_pending = true;
+    }
+
+    bool normalize_prebuilt_http1_request_buffer(Connection& c) {
+        const u32 prefix = c.http1_prebuilt_request_prefix_len;
+        switch (c.http1_prebuilt_disposition) {
+            case Http1RequestBufferDisposition::PrefixInRecv: {
+                if (prefix == 0 || prefix != c.req_initial_send_len || prefix > c.recv_buf.len() ||
+                    c.retry_req_send_len != 0 || c.pipeline_stash_len != 0)
+                    return false;
+                const u32 late = c.recv_buf.len() - prefix;
+                if (late != 0) __builtin_memmove(c.recv_slice, c.recv_buf.data() + prefix, late);
+                c.recv_buf.set_len(late);
+                return true;
+            }
+            case Http1RequestBufferDisposition::RetrySendBuf:
+                if (prefix == 0 || prefix != c.retry_req_send_len || c.pipeline_stash_len != 0 ||
+                    prefix > c.send_buf.len())
+                    return false;
+                c.retry_req_send_len = 0;
+                c.send_buf.reset();
+                return true;
+            case Http1RequestBufferDisposition::ExistingPipeline:
+                return prefix == c.retry_req_send_len &&
+                       static_cast<u32>(c.retry_req_send_len) +
+                               static_cast<u32>(c.pipeline_stash_len) <=
+                           c.send_buf.len();
+            case Http1RequestBufferDisposition::None:
+                return false;
+        }
+        return false;
+    }
+
     [[nodiscard]] bool begin_upstream_retirement_impl(Connection& c,
                                                       u8 selected_targets,
                                                       bool detached_recv_callback,
@@ -449,15 +556,14 @@ private:
             ((selected_targets & kUpstreamOpConnect) != 0 &&
              (selected_targets & kUpstreamOpSend) != 0) ||
             c.upstream_retirement_active || c.upstream_retirement_target_owned != 0 ||
-            c.upstream_retirement_cancel_owned != 0 ||
-            c.upstream_retirement_cancel_retry != 0 ||
+            c.upstream_retirement_cancel_owned != 0 || c.upstream_retirement_cancel_retry != 0 ||
             c.upstream_close_episode != 0 || c.upstream_close_target_owned != 0 ||
             c.upstream_close_cancel_owned != 0 || c.upstream_close_pause_cancel_owned ||
-            c.http1_boundary_deferred || c.http1_boundary_ready ||
-            c.http1_boundary_successor_episode != 0 || c.upstream_fd < 0 || c.send_armed ||
-            c.yield_armed ||
-            c.yield_timeout_armed || c.recv_paused_for_send || c.recv_pause_cancel_pending ||
-            c.recv_pause_rearm_pending ||
+            c.http1_boundary_deferred || c.http1_boundary_ready || c.http1_prebuilt_wait != 0 ||
+            c.http1_prebuilt_disposition != Http1RequestBufferDisposition::None ||
+            c.http1_prebuilt_request_prefix_len != 0 || c.http1_boundary_successor_episode != 0 ||
+            c.upstream_fd < 0 || c.send_armed || c.yield_armed || c.yield_timeout_armed ||
+            c.recv_paused_for_send || c.recv_pause_cancel_pending || c.recv_pause_rearm_pending ||
             c.upstream_recv_paused_for_send || c.upstream_recv_pause_cancel_pending ||
             c.upstream_recv_pause_rearm_pending || c.upstream_recv_cancel_inflight ||
             c.upstream_recv_terminal_stale)
@@ -560,6 +666,149 @@ public:
         return begin_upstream_retirement_impl(c, selected_targets, false, true);
     }
 
+    // Advance an exact, owner-free episode into the persistent tombstone. This
+    // is for callbacks that observe a terminal upstream record after normal CQE
+    // accounting has already cleared the final target; it never fabricates an
+    // operation or pending count.
+    [[nodiscard]] bool advance_upstream_retirement_tombstone(Connection& c) {
+        return begin_upstream_retirement_impl(c, 0, false, true);
+    }
+
+    // Internal D2 seam. The complete header is already owned by
+    // response_header_buf; this method proves transport and request-buffer
+    // ownership before advancing the episode or submitting any downstream byte.
+    // No production policy path calls it in this slice.
+    [[nodiscard]] bool begin_prebuilt_http1_response(Connection& c,
+                                                     u8 selected_targets,
+                                                     Http1RequestBufferDisposition disposition,
+                                                     u32 request_prefix_len) {
+        constexpr u8 kAllowed = kUpstreamOpConnect | kUpstreamOpSend | kUpstreamOpRecv;
+        if (c.id >= kMaxConns || c.fd < 0 || c.upstream_fd < 0 ||
+            c.protocol != ConnProtocol::Http11 || c.tls_active || c.state != ConnState::Proxying ||
+            !c.keep_alive || !c.req_client_keep_alive || c.req_start_us == 0 || c.epoch_held ||
+            c.resp_body_mode != BodyMode::None || c.resp_body_remaining != 0 ||
+            c.req_body_mode != BodyMode::None || c.req_body_remaining != 0 || c.req_body_streamed ||
+            c.send_armed || c.on_send != nullptr || c.http1_boundary_deferred ||
+            c.http1_boundary_ready || c.http1_boundary_successor_episode != 0 ||
+            c.http1_prebuilt_wait != 0 ||
+            c.http1_prebuilt_disposition != Http1RequestBufferDisposition::None ||
+            c.http1_prebuilt_request_prefix_len != 0 ||
+            (selected_targets & static_cast<u8>(~kAllowed)) != 0 ||
+            ((selected_targets & kUpstreamOpConnect) != 0 &&
+             (selected_targets & kUpstreamOpSend) != 0) ||
+            !prebuilt_http1_header_is_complete(c) ||
+            !prebuilt_http1_layout_is_valid(c, selected_targets, disposition, request_prefix_len))
+            return false;
+
+        const bool advanced = selected_targets == 0
+                                  ? advance_upstream_retirement_tombstone(c)
+                                  : begin_upstream_retirement(c, selected_targets);
+        if (!advanced) return false;
+        if (c.upstream_episode_quarantined || !valid_upstream_episode(c.upstream_episode)) {
+            close_conn(c);
+            return false;
+        }
+
+        c.http1_prebuilt_wait = kHttp1WaitHeaderSend;
+        if (c.upstream_retirement_active) c.http1_prebuilt_wait |= kHttp1WaitUpstreamRetirement;
+        c.http1_prebuilt_disposition = disposition;
+        c.http1_prebuilt_request_prefix_len = request_prefix_len;
+        c.http1_boundary_successor_episode = c.upstream_episode;
+        c.upstream_abandoned = true;
+        c.upstream_keep_alive = false;
+        c.upstream_start_us = 0;
+        c.proxy_resp_started = true;
+        c.on_upstream_recv = nullptr;
+        c.on_upstream_send = nullptr;
+        ::close(c.upstream_fd);
+        c.upstream_fd = -1;
+        if (c.upstream_slot_held) {
+            upstream_release(c.upstream_slot_uid);
+            c.upstream_slot_held = false;
+        }
+        c.resp_body_sent = c.response_header_buf.len();
+        c.transition_to_sending(&on_prebuilt_http1_header_sent<IoUringEventLoop>);
+        if (!submit_send(c, c.response_header_buf.data(), c.response_header_buf.len())) {
+            close_conn(c);
+            return false;
+        }
+        return true;
+    }
+
+    [[nodiscard]] bool complete_prebuilt_http1_header_send(Connection& c) {
+        if (c.http1_prebuilt_disposition == Http1RequestBufferDisposition::None ||
+            (c.http1_prebuilt_wait != kHttp1WaitHeaderSend &&
+             c.http1_prebuilt_wait != (kHttp1WaitHeaderSend | kHttp1WaitUpstreamRetirement)) ||
+            c.http1_boundary_deferred || c.http1_boundary_ready ||
+            c.http1_boundary_successor_episode != c.upstream_episode)
+            return false;
+        c.http1_prebuilt_wait &= static_cast<u8>(~kHttp1WaitHeaderSend);
+        c.http1_boundary_deferred = true;
+        publish_prebuilt_http1_ready(c);
+        return true;
+    }
+
+    bool prebuilt_http1_header_send_completion_is_valid(const Connection& c,
+                                                        const IoEvent& ev) const {
+        if (c.id >= kMaxConns || ev.conn_id != c.id || ev.type != IoEventType::Send || ev.more ||
+            ev.aux != 0 || ev.result <= 0 ||
+            static_cast<u32>(ev.result) != c.response_header_buf.len() ||
+            c.http1_prebuilt_disposition == Http1RequestBufferDisposition::None ||
+            (c.http1_prebuilt_wait & kHttp1WaitHeaderSend) == 0 || c.state != ConnState::Sending ||
+            c.send_armed || c.req_start_us == 0 || c.epoch_held ||
+            c.on_send != &on_prebuilt_http1_header_sent<IoUringEventLoop>)
+            return false;
+        const auto& send = backend.send_state[c.id];
+        return send.src == c.response_header_buf.data() && send.fd == c.fd &&
+               send.offset == c.response_header_buf.len() && send.remaining == 0 &&
+               send.type == IoEventType::Send;
+    }
+
+    // Fence D2's one downstream HeaderSend target before generic Send
+    // accounting. The first exact full completion continues through the normal
+    // proactor accounting and dedicated callback. Once that owner is cleared,
+    // every duplicate/late Send is swallowed while the two-party rendezvous is
+    // still active and cannot steal the long-lived downstream recv count.
+    bool consume_prebuilt_http1_header_send_event(Connection& c, const IoEvent& ev) {
+        if (ev.type != IoEventType::Send ||
+            c.http1_prebuilt_disposition == Http1RequestBufferDisposition::None)
+            return false;
+        if ((c.http1_prebuilt_wait & kHttp1WaitHeaderSend) == 0) return true;
+
+        const auto& send = backend.send_state[c.id];
+        const bool exact_owner = c.id < kMaxConns && c.state == ConnState::Sending &&
+                                 c.send_armed && c.req_start_us != 0 && !c.epoch_held &&
+                                 c.on_send == &on_prebuilt_http1_header_sent<IoUringEventLoop> &&
+                                 send.src == c.response_header_buf.data() && send.fd == c.fd &&
+                                 send.type == IoEventType::Send;
+        if (!exact_owner || ev.conn_id != c.id || ev.aux != 0 || ev.more) {
+            close_conn(c);
+            return true;
+        }
+
+        const bool full = ev.result > 0 &&
+                          static_cast<u32>(ev.result) == c.response_header_buf.len() &&
+                          send.offset == c.response_header_buf.len() && send.remaining == 0;
+        if (full) return false;
+
+        // A terminal error/invalid short record terminates exactly the owned
+        // HeaderSend target. Retire that one count before close; never let the
+        // generic branch consume a recv or retirement owner. F_MORE above is
+        // non-terminal and remains armed for close-ledger cancellation.
+        if (c.pending_ops == 0) {
+            c.upstream_episode = kInvalidUpstreamEventEpisode;
+            c.upstream_episode_quarantined = true;
+            backend.fatal_error.store(EPROTO, std::memory_order_release);
+            running_.store(false, std::memory_order_release);
+        } else {
+            c.pending_ops--;
+            c.send_armed = false;
+            backend.send_state[c.id] = {};
+        }
+        close_conn(c);
+        return true;
+    }
+
     // Existing production C1 caller: its callback has already been detached,
     // and the proven strict point owns at most one upstream recv target.
     [[nodiscard]] bool begin_strict_upstream_retirement(Connection& c) {
@@ -653,7 +902,17 @@ public:
                 c.upstream_retirement_cancel_owned == 0 &&
                 c.upstream_retirement_cancel_retry == 0) {
                 c.upstream_retirement_active = false;
-                if (c.http1_boundary_deferred && !c.http1_boundary_ready) {
+                if (c.http1_prebuilt_disposition != Http1RequestBufferDisposition::None) {
+                    if ((c.http1_prebuilt_wait & kHttp1WaitUpstreamRetirement) == 0) {
+                        c.upstream_episode = kInvalidUpstreamEventEpisode;
+                        c.upstream_episode_quarantined = true;
+                        backend.fatal_error.store(EPROTO, std::memory_order_release);
+                        running_.store(false, std::memory_order_release);
+                        return true;
+                    }
+                    c.http1_prebuilt_wait &= static_cast<u8>(~kHttp1WaitUpstreamRetirement);
+                    publish_prebuilt_http1_ready(c);
+                } else if (c.http1_boundary_deferred && !c.http1_boundary_ready) {
                     c.http1_boundary_ready = true;
                     http1_boundary_ready_pending = true;
                 }
@@ -721,6 +980,38 @@ public:
             c.http1_boundary_ready = false;
             if (!c.http1_boundary_deferred) continue;
             const u32 expected_episode = c.http1_boundary_successor_episode;
+
+            if (c.http1_prebuilt_disposition != Http1RequestBufferDisposition::None) {
+                const bool has_request_callback =
+                    c.on_send || c.on_upstream_recv || c.on_upstream_send ||
+                    (c.uses_iouring_tls() ? c.tls_pending_on_recv != nullptr
+                                          : c.on_recv != nullptr);
+                const bool valid =
+                    c.id == id && c.fd >= 0 && !is_draining() && !c.upstream_episode_quarantined &&
+                    c.http1_prebuilt_wait == 0 && !strict_upstream_retirement_blocks_reclaim(c) &&
+                    c.upstream_close_episode == 0 && c.upstream_close_target_owned == 0 &&
+                    c.upstream_close_cancel_owned == 0 && !c.upstream_close_pause_cancel_owned &&
+                    valid_upstream_episode(expected_episode) &&
+                    c.upstream_episode == expected_episode && c.upstream_fd < 0 &&
+                    !c.upstream_slot_held && c.state == ConnState::Sending && !c.send_armed &&
+                    c.req_start_us == 0 && c.epoch_held && !c.upstream_connect_armed &&
+                    !c.upstream_send_armed && !c.upstream_recv_armed && !has_request_callback;
+                if (!valid || !normalize_prebuilt_http1_request_buffer(c)) {
+                    if (c.fd >= 0) close_conn(c);
+                    continue;
+                }
+
+                c.http1_boundary_deferred = false;
+                c.http1_boundary_successor_episode = 0;
+                c.http1_prebuilt_wait = 0;
+                c.http1_prebuilt_disposition = Http1RequestBufferDisposition::None;
+                c.http1_prebuilt_request_prefix_len = 0;
+                epoch_leave();
+                c.epoch_held = false;
+                continue_http1_request_boundary<IoUringEventLoop>(this, c);
+                continue;
+            }
+
             c.http1_boundary_deferred = false;
             c.http1_boundary_successor_episode = 0;
 
@@ -1307,8 +1598,12 @@ public:
         c.http1_boundary_deferred = false;
         c.http1_boundary_ready = false;
         c.http1_boundary_successor_episode = 0;
-        // epoch_held covers a suspended HTTP/2 async (wait/proxy) stream pinning
-        // the config epoch without an h1-style req_start_us (see event_loop.h).
+        c.http1_prebuilt_wait = 0;
+        c.http1_prebuilt_disposition = Http1RequestBufferDisposition::None;
+        c.http1_prebuilt_request_prefix_len = 0;
+        // epoch_held covers a suspended continuation pinning the config epoch
+        // after its ordinary req_start_us ownership has ended (or an HTTP/2
+        // async stream which never used h1 request timing).
         if (c.req_start_us != 0 || c.epoch_held) epoch_leave();
         c.epoch_held = false;
         // Release any held upstream concurrency slot (catch-all; held flag makes a
@@ -1641,6 +1936,7 @@ public:
                 if (ev.conn_id < kMaxConns) {
                     auto& conn = conns[ev.conn_id];
                     if (consume_strict_upstream_retirement_event(conn, ev)) break;
+                    if (consume_prebuilt_http1_header_send_event(conn, ev)) break;
                     const bool stale_tagged_upstream =
                         io_event_is_tagged_stale(ev, conn.upstream_episode);
                     if (stale_tagged_upstream) {
@@ -1661,7 +1957,9 @@ public:
                     // retirement handoff. Terminal-positive rearms only this
                     // buffering recv target. EOF/error/cancel fails closed and
                     // cancels the marker without repeating request completion.
-                    if (ev.type == IoEventType::Recv && conn.http1_boundary_deferred) {
+                    if (ev.type == IoEventType::Recv &&
+                        (conn.http1_boundary_deferred ||
+                         conn.http1_prebuilt_disposition != Http1RequestBufferDisposition::None)) {
                         if (!ev.more) {
                             if (conn.pending_ops > 0) conn.pending_ops--;
                             conn.recv_armed = false;

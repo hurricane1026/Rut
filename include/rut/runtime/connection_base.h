@@ -45,6 +45,19 @@ enum class ConnState : u8 {
     Count,
 };
 
+// Request-buffer ownership captured by the internal HTTP/1 prebuilt-response
+// rendezvous.  The value describes where request 1 still lives while an old
+// upstream episode and the downstream header send drain independently.
+enum class Http1RequestBufferDisposition : u8 {
+    None,
+    PrefixInRecv,
+    RetrySendBuf,
+    ExistingPipeline,
+};
+
+static constexpr u8 kHttp1WaitHeaderSend = 1u << 0;
+static constexpr u8 kHttp1WaitUpstreamRetirement = 1u << 1;
+
 static_assert(static_cast<u8>(ConnState::Count) == 6u,
               "ConnState count is part of the static network state contract");
 
@@ -670,6 +683,15 @@ struct ConnectionBase {
     bool http1_boundary_deferred;
     bool http1_boundary_ready;
     u32 http1_boundary_successor_episode;
+    // Internal, policy-agnostic prebuilt-header rendezvous. HeaderSend and
+    // UpstreamRetirement are independently owned wait bits; request 2 is
+    // admitted only after both clear and the batch-end scan consumes readiness.
+    // A non-None disposition is the active marker even after the wait mask is
+    // zero. The exact prefix remains pinned until retirement and header send no
+    // longer reference recv/send slices.
+    u8 http1_prebuilt_wait;
+    Http1RequestBufferDisposition http1_prebuilt_disposition;
+    u32 http1_prebuilt_request_prefix_len;
     // True when an idle-return stale upstream recv CQE carried bytes. The stale branch
     // rolls those bytes back out of upstream_recv_buf, so the deferred pool-return path
     // needs this separate marker to close rather than reuse a desynced fd.
@@ -712,10 +734,11 @@ struct ConnectionBase {
     // Request timing (for access log)
     u64 req_start_us;
 
-    // An HTTP/2 async (wait/proxy) stream pins the RCU config epoch while parked.
-    // It uses this dedicated flag rather than req_start_us so close_conn leaves
-    // the epoch without also decrementing metrics requests_active (the h2 path
-    // doesn't call on_request_start).
+    // Ownership transferred from request timing after completion bookkeeping
+    // but before a deferred continuation releases the RCU config epoch. HTTP/2
+    // async streams use it while parked without h1-style request metrics; the
+    // internal HTTP/1 prebuilt-response rendezvous uses it after req_start_us is
+    // cleared and before batch-end request-boundary admission.
     bool epoch_held;
 
     // Outstanding I/O ops submitted to the backend. Incremented on
@@ -937,6 +960,9 @@ struct ConnectionBase {
         http1_boundary_deferred = false;
         http1_boundary_ready = false;
         http1_boundary_successor_episode = 0;
+        http1_prebuilt_wait = 0;
+        http1_prebuilt_disposition = Http1RequestBufferDisposition::None;
+        http1_prebuilt_request_prefix_len = 0;
         upstream_recv_idle_stale_bytes = false;
         yield_armed = false;
         yield_timeout_armed = false;

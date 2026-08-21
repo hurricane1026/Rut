@@ -6742,6 +6742,37 @@ void on_upstream_response(void* lp, Connection& conn, IoEvent ev) {
 }
 
 template <typename Loop>
+void on_prebuilt_http1_header_sent(void* lp, Connection& conn, IoEvent ev) {
+    auto* loop = static_cast<Loop*>(lp);
+    if constexpr (requires {
+                      loop->prebuilt_http1_header_send_completion_is_valid(conn, ev);
+                      loop->complete_prebuilt_http1_header_send(conn);
+                  }) {
+        // io_uring's send proactor emits one completion only after the complete
+        // header block drains. Validate the exact source/length before claiming
+        // request completion; a stale, short, duplicate, or error event closes
+        // with req_start_us still live.
+        if (!loop->prebuilt_http1_header_send_completion_is_valid(conn, ev)) {
+            loop->close_conn(conn);
+            return;
+        }
+        conn.clear_slots();
+        // Transfer the old request's epoch ownership before on_request_complete
+        // clears req_start_us. Batch-end request-boundary admission releases it.
+        conn.epoch_held = true;
+        on_request_complete(loop, conn, conn.resp_status, conn.response_header_buf.len());
+        if (!loop->complete_prebuilt_http1_header_send(conn)) {
+            loop->close_conn(conn);
+            return;
+        }
+    } else {
+        // D2 is an internal io_uring seam only. Any accidental installation on
+        // another loop fails closed rather than acquiring different semantics.
+        loop->close_conn(conn);
+    }
+}
+
+template <typename Loop>
 void continue_http1_request_boundary(Loop* loop, Connection& conn) {
     if (conn.pipeline_stash_len > 0 && conn.recv_buf.len() > 0) {
         const u16 kStashLen = conn.pipeline_stash_len;

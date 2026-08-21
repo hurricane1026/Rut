@@ -73,6 +73,12 @@ void on_upstream_response(void* lp, Connection& conn, IoEvent ev);
 template <typename Loop>
 void on_proxy_response_sent(void* lp, Connection& conn, IoEvent ev);
 
+// Internal completion for a fully-built, header-only HTTP/1 response whose
+// downstream send races an exact old-upstream retirement. No production policy
+// path selects it until the broader reusable-failure contract is wired.
+template <typename Loop>
+void on_prebuilt_http1_header_sent(void* lp, Connection& conn, IoEvent ev);
+
 // Run the existing post-proxy-response HTTP/1 pipeline/header tail. io_uring
 // may invoke this at batch end after its old upstream recv episode retires;
 // other loops call it directly from on_proxy_response_sent.
