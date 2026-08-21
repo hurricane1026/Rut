@@ -15548,6 +15548,15 @@ TEST(iouring_episode, stale_provided_buffer_is_reusable) {
         backend.shutdown();
         SKIP("socketpair unavailable");
     }
+    struct Cleanup {
+        IoUringBackend* backend;
+        i32* fds;
+        ~Cleanup() {
+            if (fds[0] >= 0) close(fds[0]);
+            if (fds[1] >= 0) close(fds[1]);
+            backend->shutdown();
+        }
+    } cleanup{&backend, fds};
     Connection conns[1]{};
     conns[0].reset();
     conns[0].id = 0;
@@ -15559,6 +15568,7 @@ TEST(iouring_episode, stale_provided_buffer_is_reusable) {
     static const char first[] = "first";
     CHECK_EQ(write(fds[1], first, sizeof(first) - 1),
              static_cast<ssize_t>(sizeof(first) - 1));
+    const u16 first_tail_before = __atomic_load_n(&backend.buf_ring->tail, __ATOMIC_ACQUIRE);
     IoEvent events[8]{};
     bool first_found = false;
     for (u32 attempt = 0; attempt < 3 && !first_found; attempt++) {
@@ -15573,7 +15583,10 @@ TEST(iouring_episode, stale_provided_buffer_is_reusable) {
             }
         }
     }
-    REQUIRE(first_found);
+    CHECK(first_found);
+    if (!first_found) return;
+    const u16 first_tail_after = __atomic_load_n(&backend.buf_ring->tail, __ATOMIC_ACQUIRE);
+    CHECK_EQ(first_tail_after, static_cast<u16>(first_tail_before + 1));
     CHECK_EQ(conns[0].upstream_recv_buf.len(), 0u);
     for (const u8 byte : storage) CHECK_EQ(byte, static_cast<u8>(0xC3));
 
@@ -15582,6 +15595,7 @@ TEST(iouring_episode, stale_provided_buffer_is_reusable) {
     static const char second[] = "second!";
     CHECK_EQ(write(fds[1], second, sizeof(second) - 1),
              static_cast<ssize_t>(sizeof(second) - 1));
+    const u16 second_tail_before = __atomic_load_n(&backend.buf_ring->tail, __ATOMIC_ACQUIRE);
     bool second_found = false;
     for (u32 attempt = 0; attempt < 3 && !second_found; attempt++) {
         const u32 count = backend.wait(events, 8, conns, 1);
@@ -15596,13 +15610,12 @@ TEST(iouring_episode, stale_provided_buffer_is_reusable) {
             }
         }
     }
-    REQUIRE(second_found);
+    CHECK(second_found);
+    if (!second_found) return;
+    const u16 second_tail_after = __atomic_load_n(&backend.buf_ring->tail, __ATOMIC_ACQUIRE);
+    CHECK_EQ(second_tail_after, static_cast<u16>(second_tail_before + 1));
     CHECK_EQ(conns[0].upstream_recv_buf.len(), 0u);
     for (const u8 byte : storage) CHECK_EQ(byte, static_cast<u8>(0xC3));
-
-    close(fds[0]);
-    close(fds[1]);
-    backend.shutdown();
 }
 
 TEST(iouring_episode, malformed_upstream_cqe_is_tagged_stale_and_returns_buffer) {
@@ -15672,7 +15685,17 @@ TEST(iouring_episode, stale_dispatch_preserves_current_upstream_state) {
     conn->upstream_recv_armed = true;
     conn->upstream_send_armed = true;
     conn->pending_ops = 3;
-    conn->fd = -1;
+    // Keep the client side live for this dispatch-only test. The dedicated
+    // generic test above proves closed-slot reclamation; this test must not
+    // reclaim the slot before its final cleanup.
+    conn->fd = dup(STDERR_FILENO);
+    if (conn->fd < 0) {
+        loop->free_conn(*conn);
+        loop->shutdown();
+        loop->~IoUringEventLoop();
+        munmap(storage, sizeof(IoUringEventLoop));
+        SKIP("dup unavailable");
+    }
     conn->upstream_fd = -1;
     conn->on_upstream_recv = &on_response_body_recvd<IoUringEventLoop>;
     loop->timer.add(conn, 5);
@@ -15723,17 +15746,69 @@ TEST(iouring_episode, stale_dispatch_preserves_current_upstream_state) {
                             0,
                             0,
                             IoEventType::UpstreamRecv,
-                            1,
+                            0,
                             0,
                             kInvalidUpstreamEventEpisode};
     loop->dispatch(malformed);
     CHECK_FALSE(g_callback_invoked);
-    CHECK_EQ(conn->pending_ops, 1u);
+    CHECK_EQ(conn->pending_ops, 0u);
+    CHECK_EQ(loop->free_top, IoUringEventLoop::kMaxConns - 1);
 
     conn->upstream_recv_armed = false;
     conn->upstream_send_armed = false;
     conn->pending_ops = 0;
     conn->on_upstream_recv = nullptr;
+    loop->free_conn(*conn);
+    loop->shutdown();
+    loop->~IoUringEventLoop();
+    munmap(storage, sizeof(IoUringEventLoop));
+}
+
+TEST(iouring_episode, current_tagged_dispatch_updates_specialized_loop_state) {
+    void* storage = mmap(nullptr,
+                         sizeof(IoUringEventLoop),
+                         PROT_READ | PROT_WRITE,
+                         MAP_PRIVATE | MAP_ANONYMOUS,
+                         -1,
+                         0);
+    if (storage == MAP_FAILED) SKIP("io_uring loop allocation unavailable");
+    auto* loop = new (storage) IoUringEventLoop();
+    auto initialized = loop->init(0, -1);
+    if (!initialized) {
+        loop->~IoUringEventLoop();
+        munmap(storage, sizeof(IoUringEventLoop));
+        SKIP("io_uring unavailable");
+    }
+    auto* conn = loop->alloc_conn();
+    if (conn == nullptr) {
+        loop->shutdown();
+        loop->~IoUringEventLoop();
+        munmap(storage, sizeof(IoUringEventLoop));
+        SKIP("io_uring connection allocation unavailable");
+    }
+    conn->upstream_episode = 2;
+    conn->upstream_send_armed = true;
+    conn->pending_ops = 1;
+    conn->on_upstream_send = &test_sentinel_callback<IoUringEventLoop>;
+    loop->timer.add(conn, 5);
+    ListNode* timer_bucket_before = conn->timer_node.prev;
+
+    g_callback_invoked = false;
+    const IoEvent current{conn->id,
+                          0,
+                          0,
+                          0,
+                          IoEventType::UpstreamSend,
+                          0,
+                          0,
+                          2};
+    loop->dispatch(current);
+    CHECK(g_callback_invoked);
+    CHECK_FALSE(conn->upstream_send_armed);
+    CHECK_EQ(conn->pending_ops, 0u);
+    CHECK_NE(conn->timer_node.prev, timer_bucket_before);
+
+    conn->on_upstream_send = nullptr;
     loop->free_conn(*conn);
     loop->shutdown();
     loop->~IoUringEventLoop();
