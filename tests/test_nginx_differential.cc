@@ -819,6 +819,22 @@ struct KeepAliveObservationRecorder {
 
     static bool send_head_body(int fd) { return send_all(fd, "hello", 5); }
 
+    static bool process_next_request(KeepAliveObservationRecorder& self,
+                                     Active& item,
+                                     std::chrono::steady_clock::time_point now) {
+        const size_t end = find_header_end(item.wire, item.parsed);
+        if (end == 0) return true;
+        std::vector<char> request(item.wire.begin() + item.parsed,
+                                  item.wire.begin() + end);
+        self.history.push_back({item.connection_id, request});
+        self.requests.fetch_add(1, std::memory_order_release);
+        item.parsed = end;
+        if (!send_head_response(item.fd)) return false;
+        item.body_pending = true;
+        item.body_due = now + std::chrono::milliseconds(self.body_delay_ms);
+        return true;
+    }
+
     static void* run(void* opaque) {
         auto* self = static_cast<KeepAliveObservationRecorder*>(opaque);
         std::vector<Active> active;
@@ -861,28 +877,17 @@ struct KeepAliveObservationRecorder {
                 if (item.body_pending && now >= item.body_due) {
                     if (!send_head_body(item.fd)) remove = true;
                     item.body_pending = false;
+                    // A second request may already be in the same upstream
+                    // recv buffer. Consume at most one complete header now;
+                    // do not rely on a future POLLIN edge for buffered data.
+                    if (!remove && !process_next_request(*self, item, now)) remove = true;
                 }
                 if (!remove && !item.body_pending && (polls[poll_index].revents & POLLIN)) {
                     char buf[4096];
                     const ssize_t n = recv(item.fd, buf, sizeof(buf), 0);
                     if (n > 0) {
                         item.wire.insert(item.wire.end(), buf, buf + n);
-                        for (;;) {
-                            const size_t end = find_header_end(item.wire, item.parsed);
-                            if (end == 0) break;
-                            std::vector<char> request(item.wire.begin() + item.parsed,
-                                                      item.wire.begin() + end);
-                            self->history.push_back({item.connection_id, request});
-                            self->requests.fetch_add(1, std::memory_order_release);
-                            item.parsed = end;
-                            if (!send_head_response(item.fd)) {
-                                remove = true;
-                                break;
-                            }
-                            item.body_pending = true;
-                            item.body_due = now + std::chrono::milliseconds(self->body_delay_ms);
-                            break;  // send the delayed body before the next request
-                        }
+                        if (!process_next_request(*self, item, now)) remove = true;
                     } else if (n == 0 || (n < 0 && errno != EINTR && errno != EAGAIN &&
                                           errno != EWOULDBLOCK)) {
                         remove = true;
@@ -1284,8 +1289,15 @@ static bool observe_nginx_head_keepalive_gateway(
         error = "docker rm -f failed after keep-alive HEAD gateway observation";
         return false;
     }
-    if (!log_readable || connect_failure_count != 1) {
-        error = "gateway observation did not produce exactly one scoped connect failure log line";
+    const u32 expected_responses = sent_second ? 2 : 1;
+    if (responses.size() != expected_responses) {
+        error = "gateway observation response count did not match its open/EOF outcome";
+        return false;
+    }
+    if (!log_readable || connect_failure_count != expected_responses) {
+        error = "gateway observation scoped connect failure count did not match response count " +
+                std::to_string(expected_responses) + " (actual " +
+                std::to_string(connect_failure_count) + ")";
         return false;
     }
     return true;
@@ -2396,13 +2408,16 @@ int main(int argc, char** argv) {
             return 1;
         }
         for (size_t i = 0; i < recorder.history.size(); i++) {
-            const std::string request(recorder.history[i].wire.begin(),
-                                      recorder.history[i].wire.end());
-            const char* expected_target = i == 0 ? "HEAD /head?q=1 HTTP/1.1\r\n"
-                                                 : "HEAD /head?q=2 HTTP/1.1\r\n";
+            const std::string expected =
+                std::string(i == 0 ? "HEAD /head?q=1 HTTP/1.1\r\n"
+                                   : "HEAD /head?q=2 HTTP/1.1\r\n") +
+                "Host: 127.0.0.1:" + std::to_string(backend_port) + "\r\n\r\n";
+            const std::vector<char> expected_wire(expected.begin(), expected.end());
             if (recorder.history[i].connection_id == 0 ||
-                request.find(expected_target) != 0 || header_end(recorder.history[i].wire) == 0) {
+                recorder.history[i].wire != expected_wire) {
                 std::cerr << "FAIL [OBSERVE HEAD live]: malformed upstream history entry\n";
+                std::cerr << "expected upstream history entry " << i << "\n";
+                dump_wire("expected upstream request", expected_wire);
                 dump_observation_history(recorder);
                 return 1;
             }
@@ -2430,6 +2445,17 @@ int main(int argc, char** argv) {
                                                   gateway_connect_failures,
                                                   gateway_error)) {
             std::cerr << "FAIL [OBSERVE HEAD gateway]: " << gateway_error << "\n";
+            for (const auto& response : gateway_responses)
+                dump_wire("OBSERVE gateway downstream", response);
+            dump_log(temp.nginx_log, "OBSERVE nginx gateway log");
+            return 1;
+        }
+        const u32 expected_gateway_observations = gateway_sent_second ? 2 : 1;
+        if (gateway_responses.size() != expected_gateway_observations ||
+            gateway_connect_failures != expected_gateway_observations) {
+            std::cerr << "FAIL [OBSERVE HEAD gateway]: response/log count mismatch expected "
+                      << expected_gateway_observations << " responses and scoped failures, got "
+                      << gateway_responses.size() << " and " << gateway_connect_failures << "\n";
             for (const auto& response : gateway_responses)
                 dump_wire("OBSERVE gateway downstream", response);
             dump_log(temp.nginx_log, "OBSERVE nginx gateway log");
