@@ -1321,15 +1321,194 @@ static bool capture_nginx_head_keepalive_gateway(
     return true;
 }
 
-static void dump_pinned_history(const KeepAlivePinnedRecorder& recorder) {
-    std::cerr << "PINNED upstream accepted="
+static bool capture_rut_head_keepalive_success(
+    u16 frontend_port,
+    const std::string& source_path,
+    const std::string& rut_log_path,
+    const std::string& rut_path,
+    KeepAlivePinnedRecorder& recorder,
+    std::vector<std::vector<char>>& responses,
+    std::string& error) {
+    ChildGuard rut;
+    if (!spawn_child({rut_path, source_path, "--shards", "1", "--no-pin", "--drain", "0"},
+                     rut_log_path,
+                     rut.child)) {
+        error = "failed to start production RUT for reusable HEAD success differential";
+        return false;
+    }
+    if (!wait_ready(frontend_port, rut.child, error)) {
+        error = "RUT reusable HEAD success readiness failed: " + error;
+        return false;
+    }
+
+    struct ClientGuard {
+        int fd = -1;
+        ~ClientGuard() {
+            if (fd >= 0) close(fd);
+        }
+    } client{connect_once(frontend_port)};
+    if (client.fd < 0 || !send_all(client.fd,
+                                   kHeadKeepAliveRequest1,
+                                   sizeof(kHeadKeepAliveRequest1) - 1)) {
+        error = "RUT reusable HEAD success request 1 send failed";
+        return false;
+    }
+    responses.clear();
+    std::vector<char> first;
+    std::string detail;
+    if (!read_head_response(client.fd, first, detail)) {
+        error = "RUT reusable HEAD success response 1 failed: " + detail;
+        return false;
+    }
+    if (!validate_exact_normalized_response(first, kHeadKeepAliveResponseNormalized, detail)) {
+        error = "RUT reusable HEAD success response 1 mismatch: " + detail;
+        return false;
+    }
+    bool eof = false;
+    if (!wait_keepalive_quiet_or_eof(client.fd, 500, eof, detail) || eof) {
+        error = eof ? "RUT reusable HEAD success response 1 closed during quiet window"
+                    : "RUT reusable HEAD success response 1 quiet window failed: " + detail;
+        return false;
+    }
+    responses.push_back(std::move(first));
+
+    if (!send_all(client.fd, kHeadKeepAliveRequest2, sizeof(kHeadKeepAliveRequest2) - 1)) {
+        error = "RUT reusable HEAD success request 2 send failed";
+        return false;
+    }
+    std::vector<char> second;
+    detail.clear();
+    if (!read_head_response(client.fd, second, detail)) {
+        error = "RUT reusable HEAD success response 2 failed: " + detail;
+        return false;
+    }
+    if (!read_eof(client.fd, detail)) {
+        error = "RUT reusable HEAD success response 2 EOF failed: " + detail;
+        return false;
+    }
+    if (!validate_exact_normalized_response(second, kHeadResponseNormalized, detail)) {
+        error = "RUT reusable HEAD success response 2 mismatch: " + detail;
+        return false;
+    }
+    responses.push_back(std::move(second));
+
+    if (!wait_pinned_requests(recorder, 2, detail)) {
+        error = "RUT reusable HEAD success upstream evidence failed: " + detail;
+        return false;
+    }
+    if (!stop_child(rut.child)) {
+        error = "failed to stop production RUT after reusable HEAD success differential";
+        return false;
+    }
+    settle_for_invalid_target_side_effects();
+    if (recorder.requests.load(std::memory_order_acquire) != 2 ||
+        recorder.accepted.load(std::memory_order_acquire) != 2) {
+        error = "RUT reusable HEAD success saw unexpected upstream accept/request count";
+        return false;
+    }
+    return true;
+}
+
+static bool capture_rut_head_keepalive_gateway(
+    u16 frontend_port,
+    const std::string& source_path,
+    const std::string& rut_log_path,
+    const std::string& rut_path,
+    DeadPort& dead,
+    std::vector<std::vector<char>>& responses,
+    std::string& error) {
+    if (dead.fd < 0) {
+        error = "RUT reusable HEAD gateway dead port is not reserved";
+        return false;
+    }
+    ChildGuard rut;
+    if (!spawn_child({rut_path, source_path, "--shards", "1", "--no-pin", "--drain", "0"},
+                     rut_log_path,
+                     rut.child)) {
+        error = "failed to start production RUT for reusable HEAD gateway differential";
+        return false;
+    }
+    if (!wait_ready(frontend_port, rut.child, error)) {
+        error = "RUT reusable HEAD gateway readiness failed: " + error;
+        return false;
+    }
+
+    struct ClientGuard {
+        int fd = -1;
+        ~ClientGuard() {
+            if (fd >= 0) close(fd);
+        }
+    } client{connect_once(frontend_port)};
+    if (client.fd < 0 || !send_all(client.fd,
+                                   kHeadGatewayKeepAliveRequest1,
+                                   sizeof(kHeadGatewayKeepAliveRequest1) - 1)) {
+        error = "RUT reusable HEAD gateway request 1 send failed";
+        return false;
+    }
+    responses.clear();
+    std::vector<char> first;
+    std::string detail;
+    if (!read_head_response(client.fd, first, detail)) {
+        error = "RUT reusable HEAD gateway response 1 failed: " + detail;
+        return false;
+    }
+    if (!validate_exact_normalized_response(
+            first, kHeadGatewayKeepAliveResponseNormalized, detail)) {
+        error = "RUT reusable HEAD gateway response 1 mismatch: " + detail;
+        return false;
+    }
+    bool eof = false;
+    if (!wait_keepalive_quiet_or_eof(client.fd, 500, eof, detail) || eof) {
+        error = eof ? "RUT reusable HEAD gateway response 1 closed during quiet window"
+                    : "RUT reusable HEAD gateway response 1 quiet window failed: " + detail;
+        return false;
+    }
+    responses.push_back(std::move(first));
+
+    if (!send_all(client.fd,
+                  kHeadGatewayKeepAliveRequest2,
+                  sizeof(kHeadGatewayKeepAliveRequest2) - 1)) {
+        error = "RUT reusable HEAD gateway request 2 send failed";
+        return false;
+    }
+    std::vector<char> second;
+    detail.clear();
+    if (!read_head_response(client.fd, second, detail)) {
+        error = "RUT reusable HEAD gateway response 2 failed: " + detail;
+        return false;
+    }
+    if (!read_eof(client.fd, detail)) {
+        error = "RUT reusable HEAD gateway response 2 EOF failed: " + detail;
+        return false;
+    }
+    if (!validate_exact_normalized_response(second, kHeadGatewayResponseNormalized, detail)) {
+        error = "RUT reusable HEAD gateway response 2 mismatch: " + detail;
+        return false;
+    }
+    responses.push_back(std::move(second));
+
+    if (!stop_child(rut.child)) {
+        error = "failed to stop production RUT after reusable HEAD gateway differential";
+        return false;
+    }
+    if (responses.size() != 2) {
+        error = "RUT reusable HEAD gateway did not produce exactly two complete responses";
+        return false;
+    }
+    return true;
+}
+
+static void dump_pinned_history(const KeepAlivePinnedRecorder& recorder,
+                                const char* side = "PINNED") {
+    std::cerr << side << " upstream accepted="
               << recorder.accepted.load(std::memory_order_acquire) << " requests="
               << recorder.requests.load(std::memory_order_acquire)
               << " history=" << recorder.history.size() << "\n";
     for (size_t i = 0; i < recorder.history.size(); i++) {
-        std::cerr << "PINNED upstream history[" << i << "] connection_id="
+        std::cerr << side << " upstream history[" << i << "] connection_id="
                   << recorder.history[i].connection_id << "\n";
-        dump_wire("PINNED upstream request", recorder.history[i].wire);
+        const std::string label = std::string(side) + " upstream request";
+        dump_wire(label.c_str(), recorder.history[i].wire);
     }
 }
 
@@ -2461,8 +2640,83 @@ int main(int argc, char** argv) {
         }
     }
     for (const auto& response : keepalive_responses) dump_wire("pinned HEAD downstream", response);
-    dump_pinned_history(keepalive_recorder);
+    dump_pinned_history(keepalive_recorder, "nginx reusable HEAD success");
     std::cerr << "PASS: pinned nginx HEAD keep-alive success baseline (two upstream connections)\n";
+
+    KeepAlivePinnedRecorder rut_keepalive_recorder;
+    if (!rut_keepalive_recorder.setup(backend_port)) {
+        std::cerr << "FAIL [reusable HEAD success RUT]: backend recorder setup failed\n";
+        return 1;
+    }
+    std::vector<std::vector<char>> rut_keepalive_responses;
+    std::string rut_keepalive_error;
+    if (!capture_rut_head_keepalive_success(frontend_port,
+                                            temp.source,
+                                            temp.rut_log,
+                                            argv[1],
+                                            rut_keepalive_recorder,
+                                            rut_keepalive_responses,
+                                            rut_keepalive_error)) {
+        std::cerr << "FAIL [reusable HEAD success RUT]: " << rut_keepalive_error << "\n";
+        for (size_t i = 0; i < rut_keepalive_responses.size(); i++) {
+            const std::string label =
+                "RUT reusable HEAD success response " + std::to_string(i + 1);
+            dump_wire(label.c_str(), rut_keepalive_responses[i]);
+        }
+        rut_keepalive_recorder.stop();
+        dump_pinned_history(rut_keepalive_recorder, "RUT reusable HEAD success");
+        dump_log(temp.rut_log, "RUT reusable HEAD success log");
+        return 1;
+    }
+    rut_keepalive_recorder.stop();
+    if (rut_keepalive_responses.size() != 2 || rut_keepalive_recorder.history.size() != 2 ||
+        rut_keepalive_recorder.accepted.load(std::memory_order_acquire) != 2 ||
+        rut_keepalive_recorder.requests.load(std::memory_order_acquire) != 2 ||
+        rut_keepalive_recorder.history[0].connection_id != 1 ||
+        rut_keepalive_recorder.history[1].connection_id != 2 ||
+        rut_keepalive_recorder.history[0].connection_id ==
+            rut_keepalive_recorder.history[1].connection_id) {
+        std::cerr << "FAIL [reusable HEAD success RUT]: exact fresh upstream count/connection "
+                     "mapping failed\n";
+        dump_pinned_history(keepalive_recorder, "nginx reusable HEAD success");
+        dump_pinned_history(rut_keepalive_recorder, "RUT reusable HEAD success");
+        return 1;
+    }
+    for (size_t i = 0; i < 2; i++) {
+        std::vector<char> normalized_nginx = keepalive_responses[i];
+        std::vector<char> normalized_rut = rut_keepalive_responses[i];
+        const char* expected_response = expected_keepalive_responses[i];
+        const size_t expected_len = strlen(expected_response);
+        const std::string expected_request =
+            std::string(i == 0 ? "HEAD /head?q=1 HTTP/1.1\r\n"
+                               : "HEAD /head?q=2 HTTP/1.1\r\n") +
+            "Host: 127.0.0.1:" + std::to_string(backend_port) + "\r\n\r\n";
+        const std::vector<char> expected_wire(expected_request.begin(), expected_request.end());
+        if (!normalize_date(normalized_nginx) || !normalize_date(normalized_rut) ||
+            normalized_nginx != normalized_rut || normalized_rut.size() != expected_len ||
+            memcmp(normalized_rut.data(), expected_response, expected_len) != 0 ||
+            keepalive_recorder.history[i].wire != expected_wire ||
+            rut_keepalive_recorder.history[i].wire != expected_wire ||
+            keepalive_recorder.history[i].wire != rut_keepalive_recorder.history[i].wire) {
+            std::cerr << "FAIL [reusable HEAD success differential]: request " << (i + 1)
+                      << " nginx/RUT wire mismatch\n";
+            dump_wire("expected reusable HEAD response",
+                      std::vector<char>(expected_response, expected_response + expected_len));
+            dump_wire("nginx reusable HEAD response", keepalive_responses[i]);
+            dump_wire("RUT reusable HEAD response", rut_keepalive_responses[i]);
+            dump_wire("expected reusable HEAD upstream request", expected_wire);
+            dump_wire("nginx reusable HEAD upstream request", keepalive_recorder.history[i].wire);
+            dump_wire("RUT reusable HEAD upstream request",
+                      rut_keepalive_recorder.history[i].wire);
+            dump_pinned_history(keepalive_recorder, "nginx reusable HEAD success");
+            dump_pinned_history(rut_keepalive_recorder, "RUT reusable HEAD success");
+            dump_log(temp.nginx_log, "nginx reusable HEAD success log");
+            dump_log(temp.rut_log, "RUT reusable HEAD success log");
+            return 1;
+        }
+    }
+    std::cerr << "PASS: converter-generated RUT reusable HEAD success matches pinned nginx "
+                 "(two downstream responses, two fresh upstream connections)\n";
 
     DeadPort keepalive_dead;
     if (!keepalive_dead.reserve(backend_port)) {
@@ -2514,7 +2768,62 @@ int main(int argc, char** argv) {
     }
     for (const auto& response : keepalive_gateway_responses)
         dump_wire("pinned HEAD gateway downstream", response);
-    std::cerr << "PASS: pinned nginx HEAD keep-alive gateway baseline (two failures + EOF)\n";
+    std::cerr << "PASS: pinned nginx HEAD keep-alive gateway baseline "
+                 "(two scoped nginx connect-failure log records + EOF)\n";
+
+    // This differential proves only the two complete observable downstream response wires.
+    // It does not assert a RUT connect-attempt count. The separate focused runtime regression
+    // upstream_reuse.paired_head_failure_never_reconnects_or_replays owns the no-pool/no-replay
+    // invariant.
+    std::vector<std::vector<char>> rut_keepalive_gateway_responses;
+    std::string rut_keepalive_gateway_error;
+    if (!capture_rut_head_keepalive_gateway(frontend_port,
+                                            temp.source,
+                                            temp.rut_log,
+                                            argv[1],
+                                            keepalive_dead,
+                                            rut_keepalive_gateway_responses,
+                                            rut_keepalive_gateway_error)) {
+        std::cerr << "FAIL [reusable HEAD gateway RUT]: " << rut_keepalive_gateway_error << "\n";
+        for (size_t i = 0; i < rut_keepalive_gateway_responses.size(); i++) {
+            const std::string label =
+                "RUT reusable HEAD gateway response " + std::to_string(i + 1);
+            dump_wire(label.c_str(), rut_keepalive_gateway_responses[i]);
+        }
+        dump_log(temp.nginx_log, "nginx reusable HEAD gateway log");
+        dump_log(temp.rut_log, "RUT reusable HEAD gateway log");
+        return 1;
+    }
+    if (rut_keepalive_gateway_responses.size() != 2) {
+        std::cerr << "FAIL [reusable HEAD gateway differential]: RUT produced "
+                  << rut_keepalive_gateway_responses.size() << " responses, expected 2\n";
+        dump_log(temp.rut_log, "RUT reusable HEAD gateway log");
+        return 1;
+    }
+    for (size_t i = 0; i < 2; i++) {
+        std::vector<char> normalized_nginx = keepalive_gateway_responses[i];
+        std::vector<char> normalized_rut = rut_keepalive_gateway_responses[i];
+        const char* expected_response = expected_gateway_responses[i];
+        const size_t expected_len = strlen(expected_response);
+        if (!normalize_date(normalized_nginx) || !normalize_date(normalized_rut) ||
+            normalized_nginx != normalized_rut || normalized_rut.size() != expected_len ||
+            memcmp(normalized_rut.data(), expected_response, expected_len) != 0) {
+            std::cerr << "FAIL [reusable HEAD gateway differential]: response " << (i + 1)
+                      << " nginx/RUT wire mismatch\n";
+            dump_wire("expected reusable HEAD gateway response",
+                      std::vector<char>(expected_response, expected_response + expected_len));
+            dump_wire("nginx reusable HEAD gateway response", keepalive_gateway_responses[i]);
+            dump_wire("RUT reusable HEAD gateway response",
+                      rut_keepalive_gateway_responses[i]);
+            dump_log(temp.nginx_log, "nginx reusable HEAD gateway log");
+            dump_log(temp.rut_log, "RUT reusable HEAD gateway log");
+            return 1;
+        }
+    }
+    std::cerr << "PASS: converter-generated RUT reusable HEAD connect failure matches pinned "
+                 "nginx (two complete observable response wires; RUT connect-attempt count "
+                 "not asserted; no-pool/no-replay covered separately by "
+                 "upstream_reuse.paired_head_failure_never_reconnects_or_replays)\n";
     close(keepalive_dead.fd);
     keepalive_dead.fd = -1;
 
