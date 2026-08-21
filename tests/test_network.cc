@@ -10616,26 +10616,67 @@ TEST(epoll_loop, close_clears_partial_send_state) {
 // readable guarantees wait() returns promptly instead of blocking on the -1
 // timeout, keeping the test from hanging.
 TEST(epoll_loop, ws_unpoll_upstream_deregisters_upstream_fd) {
-    auto* loop = create_real_loop();
+    struct Cleanup {
+        RealLoop* loop = nullptr;
+        bool initialized = false;
+        Connection* upstream = nullptr;
+        Connection* control = nullptr;
+        i32 upstream_peer = -1;
+        i32 control_peer = -1;
+
+        ~Cleanup() {
+            if (initialized) {
+                if (upstream) loop->close_conn(*upstream);
+                if (control) loop->close_conn(*control);
+                loop->shutdown();
+            }
+            if (upstream_peer >= 0) close(upstream_peer);
+            if (control_peer >= 0) close(control_peer);
+            destroy_real_loop(loop);
+        }
+    } cleanup;
+
+    cleanup.loop = create_real_loop();
+    auto* loop = cleanup.loop;
     REQUIRE(loop != nullptr);
     auto res = loop->init(0, -1, 0);
-    REQUIRE(res.has_value());
+    cleanup.initialized = res.has_value();
+    REQUIRE(cleanup.initialized);
+    struct itimerspec disarmed_timer{};
+    REQUIRE_EQ(timerfd_settime(loop->backend.timer_fd, 0, &disarmed_timer, nullptr), 0);
     auto* up = loop->alloc_conn();
-    auto* ctl = loop->alloc_conn();
+    cleanup.upstream = up;
     REQUIRE(up != nullptr);
+    auto* ctl = loop->alloc_conn();
+    cleanup.control = ctl;
     REQUIRE(ctl != nullptr);
     const u32 up_cid = up->id;
+    const u32 active_episode = up->upstream_episode;
 
-    i32 ufds[2], cfds[2];
+    i32 ufds[2] = {-1, -1};
+    i32 cfds[2] = {-1, -1};
     REQUIRE(socketpair(AF_UNIX, SOCK_STREAM, 0, ufds) == 0);
-    REQUIRE(socketpair(AF_UNIX, SOCK_STREAM, 0, cfds) == 0);
     up->upstream_fd = ufds[0];
+    cleanup.upstream_peer = ufds[1];
+    REQUIRE(socketpair(AF_UNIX, SOCK_STREAM, 0, cfds) == 0);
     ctl->fd = cfds[0];
-    REQUIRE(loop->backend.add_recv_upstream(ufds[0], up_cid, loop->conns[up_cid].upstream_episode));
+    cleanup.control_peer = cfds[1];
+
+    REQUIRE(loop->begin_upstream_episode(*up));
+    REQUIRE(loop->backend.add_recv_upstream(ufds[0], up_cid, active_episode));
     REQUIRE(loop->backend.add_recv(cfds[0], ctl->id));
-    close(ufds[1]);  // upstream peer closes → fd reports EPOLLHUP
+    REQUIRE_EQ(loop->backend.active_upstream_episode[up_cid], active_episode);
+    REQUIRE_EQ(loop->backend.upstream_fd_map[up_cid], ufds[0]);
+
+    close(cleanup.upstream_peer);  // upstream peer closes → fd reports EPOLLHUP
+    cleanup.upstream_peer = -1;
+    struct pollfd upstream_ready{ufds[0], POLLIN, 0};
+    REQUIRE_EQ(poll(&upstream_ready, 1, 1000), 1);
+    REQUIRE((upstream_ready.revents & POLLHUP) != 0);
 
     loop->ws_unpoll_upstream(*up);
+    CHECK_EQ(loop->backend.active_upstream_episode[up_cid], active_episode);
+    CHECK_EQ(loop->backend.upstream_fd_map[up_cid], ufds[0]);
 
     const u8 one = 'x';
     REQUIRE(write(cfds[1], &one, 1) == 1);  // keep wait() non-blocking
@@ -10649,19 +10690,25 @@ TEST(epoll_loop, ws_unpoll_upstream_deregisters_upstream_fd) {
     }
     CHECK(saw_ctl);        // wait() ran and returned the ready control fd
     CHECK(!saw_upstream);  // the hung-up upstream fd was deregistered, no spin
+    CHECK_EQ(loop->backend.active_upstream_episode[up_cid], active_episode);
+    CHECK_EQ(loop->backend.upstream_fd_map[up_cid], ufds[0]);
+    struct pollfd epoll_ready{loop->backend.epoll_fd, POLLIN, 0};
+    CHECK_EQ(poll(&epoll_ready, 1, 0), 0);  // no deferred HUP remains after control recv
 
-    // No-op when there is no upstream fd.
-    up->upstream_fd = -1;
+    // Production teardown detaches the already-unpolled fd, retires its owner,
+    // and closes it before the Connection slot is released.
+    REQUIRE(loop->detach_upstream_close(*up));
+    REQUIRE_EQ(up->upstream_fd, -1);
+    REQUIRE_EQ(up->upstream_episode, active_episode + 1);
+    REQUIRE_EQ(loop->backend.active_upstream_episode[up_cid], 0u);
+    REQUIRE_EQ(loop->backend.upstream_fd_map[up_cid], -1);
+
+    // No-op when production lifecycle teardown has removed the upstream fd.
+    const u32 retired_episode = up->upstream_episode;
     loop->ws_unpoll_upstream(*up);
-
-    close(ufds[0]);
-    close(cfds[0]);
-    close(cfds[1]);
-    ctl->fd = -1;
-    loop->free_conn(*up);
-    loop->free_conn(*ctl);
-    loop->shutdown();
-    destroy_real_loop(loop);
+    CHECK_EQ(up->upstream_episode, retired_episode);
+    CHECK_EQ(loop->backend.active_upstream_episode[up_cid], 0u);
+    CHECK_EQ(loop->backend.upstream_fd_map[up_cid], -1);
 }
 
 // Re-arming a recv must preserve a pending opposite-direction send's EPOLLOUT on
