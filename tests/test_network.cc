@@ -237,6 +237,22 @@ static u64 h2_immediate_redirect_handler(void*, jit::HandlerCtx*, const u8*, u32
     return jit::HandlerResult::make_redirect(1).pack();
 }
 
+static u64 h2_response_read_timeout_handler(void*, jit::HandlerCtx*, const u8*, u32, void*) {
+    return jit::HandlerResult::make_forward_with_bundle(0, 0, 1).pack();
+}
+
+static u32 response_read_timeout_preflight_handler_calls = 0;
+static u64 response_read_timeout_preflight_handler(void*, jit::HandlerCtx*, const u8*, u32, void*) {
+    response_read_timeout_preflight_handler_calls++;
+    return jit::HandlerResult::make_forward_with_bundle(0, 1, 1).pack();
+}
+
+static u32 response_read_timeout_later_handler_calls = 0;
+static u64 response_read_timeout_later_handler(void*, jit::HandlerCtx*, const u8*, u32, void*) {
+    response_read_timeout_later_handler_calls++;
+    return jit::HandlerResult::make_status(204).pack();
+}
+
 static u64 h1_timer_then_redirect_handler(void*, jit::HandlerCtx* ctx, const u8*, u32, void*) {
     if (ctx != nullptr && ctx->state == 7) return jit::HandlerResult::make_redirect(1).pack();
     return jit::HandlerResult::make_yield(7, jit::YieldKind::Timer).pack();
@@ -1034,6 +1050,224 @@ TEST(response_policy,
     rejects_transactionally(over_capacity);
 }
 
+TEST(response_policy, response_read_timeout_bundle_config_shapes_are_exact_and_fail_closed) {
+    ForwardResponsePolicySpec response{};
+    response.version = ResponsePolicyVersion::Http11;
+    response.framing = ResponsePolicyFraming::ContentLength;
+    response.connection = ResponsePolicyConnection::Request;
+    response.date = ResponsePolicyDate::Current;
+    response.server = {"rut", 3};
+
+    ForwardFailurePolicySpec failure{};
+    failure.version = ForwardFailurePolicyVersion::Http11;
+    failure.status_code = 502;
+    failure.date = ForwardFailurePolicyDate::Current;
+    failure.connection = ForwardFailurePolicyConnection::Request;
+    failure.reason = {"Bad Gateway", 11};
+    failure.content_type = {"text/plain", 10};
+    failure.server = {"rut", 3};
+    failure.body = {"bad", 3};
+    ForwardFailurePolicySpec timeout = failure;
+    timeout.status_code = 504;
+    timeout.reason = {"Gateway Time-out", 16};
+    timeout.body = {"slow", 4};
+
+    rir::Module module{};
+    module.response_policy_count = 1;
+    module.response_policies[0] = response;
+    module.failure_policy_count = 2;
+    module.failure_policies[0] = failure;
+    module.failure_policies[1] = timeout;
+    module.policy_bundle_count = 4;
+    module.policy_bundles[0] = {0, 0, 0, 1};
+    module.policy_bundles[1] = {0, 0, 0, 2};
+    module.policy_bundles[2] = {1, 0, 0, 2};
+    module.policy_bundles[3] = {1, 1, 2, 3};
+
+    RouteConfig config{};
+    REQUIRE(populate_route_config(config, module));
+    REQUIRE_EQ(config.policy_bundle_count, 4u);
+    for (u32 i = 0; i < 4; i++) {
+        CHECK(config.policy_bundle_id_is_valid(static_cast<u16>(i + 1)));
+        CHECK_EQ(config.policy_bundles[i].response_read_timeout_seconds,
+                 module.policy_bundles[i].response_read_timeout_seconds);
+    }
+    CHECK_EQ(config.add_policy_bundle(0, 0, 0, 1), 1u);
+    CHECK_EQ(config.add_policy_bundle(0, 0, 0, 2), 2u);
+    CHECK_EQ(config.add_policy_bundle(1, 0, 0, 2), 3u);
+    CHECK_EQ(config.add_policy_bundle(1, 1, 2, 3), 4u);
+    CHECK_EQ(config.add_policy_bundle(0, 0), 0u);
+    CHECK_EQ(config.add_policy_bundle(0, 0, 0, 64), 0u);
+
+    auto rejects = [&](const rir::Module& forged) {
+        RouteConfig untouched{};
+        CHECK_FALSE(populate_route_config(untouched, forged));
+        CHECK_EQ(untouched.response_policy_count, 0u);
+        CHECK_EQ(untouched.failure_policy_count, 0u);
+        CHECK_EQ(untouched.policy_bundle_count, 0u);
+    };
+    rir::Module all_zero = module;
+    all_zero.policy_bundles[0] = {};
+    rejects(all_zero);
+    rir::Module out_of_range = module;
+    out_of_range.policy_bundles[0].response_read_timeout_seconds = 64;
+    rejects(out_of_range);
+    rir::Module response_only = module;
+    response_only.policy_bundles[0] = {1, 0, 0, 0};
+    rejects(response_only);
+
+    // Existing failure-only bundle behavior remains valid when duration is absent.
+    RouteConfig legacy{};
+    REQUIRE_EQ(legacy.add_failure_policy(failure), 1u);
+    REQUIRE_EQ(legacy.add_policy_bundle(0, 1), 1u);
+    CHECK(legacy.policy_bundle_id_is_valid(1));
+    CHECK_EQ(legacy.policy_bundles[0].response_read_timeout_seconds, 0u);
+}
+
+TEST(response_read_timeout, h1_rejects_before_every_forward_effect_and_preserves_absence) {
+    RouteConfig config{};
+    REQUIRE(config.add_upstream("backend", 0x7F000001, 9000).has_value());
+    config.upstreams[0].max_inflight = 1;
+    REQUIRE_EQ(config.add_target_transform({{"/api/", 5}, {"/v1/", 4}}), 1u);
+    REQUIRE_EQ(config.add_policy_bundle(0, 0, 0, 5), 1u);
+    auto forged = std::make_unique<RouteConfig>();
+    REQUIRE(forged->add_upstream("backend", 0x7F000001, 9000).has_value());
+    forged->upstreams[0].max_inflight = 1;
+    REQUIRE_EQ(forged->add_target_transform({{"/api/", 5}, {"/v1/", 4}}), 1u);
+    REQUIRE_EQ(forged->add_policy_bundle(0, 0, 0, 5), 1u);
+    forged->policy_bundles[0].response_read_timeout_seconds = 64;
+    CHECK_FALSE(forged->policy_bundle_id_is_valid(1));
+
+    static constexpr char kGet[] = "GET /api/x HTTP/1.1\r\nHost: client\r\n\r\n";
+    static constexpr char kPost[] =
+        "POST /api HTTP/1.1\r\nHost: client\r\nContent-Length: 3\r\n\r\n";
+    struct Vector {
+        const RouteConfig* config;
+        const char* request;
+        u32 request_len;
+        u16 bundle_id;
+        u16 upstream_id;
+        bool body_wait;
+        bool target_transform;
+        bool response_mutation;
+    } vectors[] = {
+        {&config, kGet, sizeof(kGet) - 1, 1, 0, false, false, false},
+        {&config, kPost, sizeof(kPost) - 1, 1, 0, true, false, false},
+        {&config, kGet, sizeof(kGet) - 1, 1, 0, false, true, false},
+        {&config, kGet, sizeof(kGet) - 1, 1, 0, false, false, true},
+        {&config, kGet, sizeof(kGet) - 1, 1, 99, false, false, false},
+        {nullptr, kGet, sizeof(kGet) - 1, 1, 0, false, false, false},
+        {&config, kGet, sizeof(kGet) - 1, 99, 0, false, false, false},
+        {forged.get(), kGet, sizeof(kGet) - 1, 1, 0, false, false, false},
+    };
+
+    SmallLoop loop;
+    loop.setup();
+    for (const auto& vector : vectors) {
+        auto* conn = loop.alloc_conn();
+        REQUIRE(conn != nullptr);
+        REQUIRE_EQ(
+            conn->recv_buf.write(reinterpret_cast<const u8*>(vector.request), vector.request_len),
+            vector.request_len);
+        capture_request_metadata(*conn);
+        conn->request_config = vector.config;
+        if (vector.target_transform) {
+            conn->target_transform_recorded = true;
+            conn->target_transform_id = 1;
+        }
+        if (vector.response_mutation) {
+            conn->resp_header_mutation_pending_count = 1;
+            conn->resp_header_mutation_count = 1;
+        }
+        JitDispatchOutcome outcome{};
+        outcome.kind = JitDispatchOutcome::Kind::Forward;
+        outcome.upstream_id = vector.upstream_id;
+        outcome.policy_bundle_id = vector.bundle_id;
+        outcome.request_policy_id = vector.body_wait ? 1 : 0;
+        loop.backend.clear_ops();
+        handle_jit_outcome<SmallLoop>(&loop, *conn, outcome, nullptr, true);
+        CHECK_EQ(loop.free_top, SmallLoop::kMaxConns);
+        CHECK_EQ(loop.backend.count_ops(MockOp::Send), 0u);
+        CHECK_EQ(loop.backend.count_ops(MockOp::Recv), 0u);
+        CHECK_EQ(loop.backend.count_ops(MockOp::Connect), 0u);
+    }
+
+    // With no explicit duration the existing forwarding path is unchanged.
+    auto* legacy = loop.alloc_conn();
+    REQUIRE(legacy != nullptr);
+    REQUIRE_EQ(legacy->recv_buf.write(reinterpret_cast<const u8*>(kGet), sizeof(kGet) - 1),
+               sizeof(kGet) - 1);
+    capture_request_metadata(*legacy);
+    legacy->request_config = &config;
+    JitDispatchOutcome legacy_outcome{};
+    legacy_outcome.kind = JitDispatchOutcome::Kind::Forward;
+    legacy_outcome.upstream_id = 0;
+    loop.backend.clear_ops();
+    handle_jit_outcome<SmallLoop>(&loop, *legacy, legacy_outcome, nullptr, true);
+    CHECK_EQ(loop.backend.count_ops(MockOp::Connect), 1u);
+    CHECK_EQ(loop.backend.count_ops(MockOp::Send), 0u);
+    CHECK(legacy->upstream_slot_held);
+    loop.close_conn(*legacy);
+}
+
+TEST(response_read_timeout, h1_route_preflight_closes_before_body_wait_or_handler) {
+    SmallLoop loop;
+    loop.setup();
+    RouteConfig config{};
+    REQUIRE(config.add_upstream("backend", 0x7F000001, 9000).has_value());
+    REQUIRE_EQ(config.add_policy_bundle(0, 0, 0, 5), 1u);
+    REQUIRE(
+        config.add_jit_handler("/upload", 'P', &response_read_timeout_preflight_handler, true, 1));
+    const RouteConfig* active = &config;
+    loop.config_ptr = &active;
+    response_read_timeout_preflight_handler_calls = 0;
+
+    auto* conn = loop.alloc_conn();
+    REQUIRE(conn != nullptr);
+    const u32 conn_id = conn->id;
+    static constexpr char kRequest[] =
+        "POST /upload HTTP/1.1\r\nHost: x\r\nContent-Length: 7\r\n\r\npay";
+    REQUIRE_EQ(conn->recv_buf.write(reinterpret_cast<const u8*>(kRequest), sizeof(kRequest) - 1),
+               sizeof(kRequest) - 1);
+    loop.backend.clear_ops();
+    on_header_received<SmallLoop>(
+        &loop, *conn, make_ev(conn_id, IoEventType::Recv, sizeof(kRequest) - 1));
+
+    CHECK_EQ(response_read_timeout_preflight_handler_calls, 0u);
+    CHECK_EQ(loop.free_top, SmallLoop::kMaxConns);
+    CHECK_EQ(loop.backend.count_ops(MockOp::Recv), 0u);
+    CHECK_EQ(loop.backend.count_ops(MockOp::Connect), 0u);
+    CHECK_EQ(loop.backend.count_ops(MockOp::Send), 0u);
+    CHECK_EQ(__builtin_memcmp(loop.recv_storage[conn_id], kRequest, sizeof(kRequest) - 1), 0);
+}
+
+TEST(response_read_timeout, route_preflight_marker_fails_closed_for_every_nonzero_shape) {
+    RouteConfig duration{};
+    REQUIRE_EQ(duration.add_policy_bundle(0, 0, 0, 5), 1u);
+    RouteEntry route{};
+    CHECK_FALSE(route_requires_response_read_timeout_preflight_close(&route, &duration));
+    route.preflight_forward_policy_bundle_id = 1;
+    CHECK(route_requires_response_read_timeout_preflight_close(&route, &duration));
+    CHECK(route_requires_response_read_timeout_preflight_close(&route, nullptr));
+    route.preflight_forward_policy_bundle_id = 99;
+    CHECK(route_requires_response_read_timeout_preflight_close(&route, &duration));
+
+    RouteConfig zero_duration{};
+    ForwardFailurePolicySpec failure{};
+    failure.version = ForwardFailurePolicyVersion::Http11;
+    failure.status_code = 502;
+    failure.date = ForwardFailurePolicyDate::Current;
+    failure.connection = ForwardFailurePolicyConnection::Request;
+    failure.reason = {"Bad Gateway", 11};
+    failure.content_type = {"text/plain", 10};
+    failure.server = {"rut", 3};
+    failure.body = {"bad", 3};
+    REQUIRE_EQ(zero_duration.add_failure_policy(failure), 1u);
+    REQUIRE_EQ(zero_duration.add_policy_bundle(0, 1), 1u);
+    route.preflight_forward_policy_bundle_id = 1;
+    CHECK(route_requires_response_read_timeout_preflight_close(&route, &zero_duration));
+}
+
 static Connection* setup_target_transform_request(SmallLoop& loop,
                                                   RouteConfig& cfg,
                                                   const char* request,
@@ -1599,7 +1833,10 @@ TEST(target_transform, h1_forward_preflight_rejects_before_materialization) {
     char replace[] = "/v1/";
     REQUIRE_EQ(cfg.add_target_transform({{strip, 5}, {replace, 4}}), 1u);
 
-    auto reject = [&](const char* request, auto&& mutate, auto&& mutate_outcome) {
+    auto reject = [&](const char* request,
+                      auto&& mutate,
+                      auto&& mutate_outcome,
+                      bool expect_reclaim = false) {
         auto* conn =
             setup_target_transform_request(loop, cfg, request, static_cast<u32>(strlen(request)));
         if (conn == nullptr) {
@@ -1614,10 +1851,19 @@ TEST(target_transform, h1_forward_preflight_rejects_before_materialization) {
         const u32 before_len = conn->recv_buf.len();
         const u32 before_header_end = conn->req_header_end;
         const u32 before_send_len = conn->req_initial_send_len;
+        const u32 conn_id = conn->id;
+        const u32 free_top_before = loop.free_top;
         u8 before[SmallLoop::kBufSize];
         __builtin_memcpy(before, conn->recv_buf.data(), before_len);
         loop.backend.clear_ops();
         handle_jit_outcome<SmallLoop>(&loop, *conn, outcome, nullptr, true);
+        if (expect_reclaim) {
+            CHECK_EQ(loop.free_top, free_top_before + 1);
+            CHECK_EQ(__builtin_memcmp(loop.recv_storage[conn_id], before, before_len), 0);
+            CHECK_EQ(loop.backend.count_ops(MockOp::Send), 0u);
+            CHECK_EQ(loop.backend.count_ops(MockOp::Connect), 0u);
+            return;
+        }
         CHECK_EQ(conn->resp_status, 400u);
         CHECK_EQ(conn->recv_buf.len(), before_len);
         CHECK_EQ(conn->req_header_end, before_header_end);
@@ -1635,7 +1881,11 @@ TEST(target_transform, h1_forward_preflight_rejects_before_materialization) {
     reject(kRequest, [](Connection&) {}, [](JitDispatchOutcome& o) { o.upstream_id = 1; });
     reject(kRequest, [](Connection&) {}, [](JitDispatchOutcome& o) { o.response_policy_id = 1; });
     reject(kRequest, [](Connection&) {}, [](JitDispatchOutcome& o) { o.failure_policy_id = 1; });
-    reject(kRequest, [](Connection&) {}, [](JitDispatchOutcome& o) { o.policy_bundle_id = 1; });
+    reject(
+        kRequest,
+        [](Connection&) {},
+        [](JitDispatchOutcome& o) { o.policy_bundle_id = 1; },
+        /*expect_reclaim=*/true);
     reject(kRequest, [](Connection&) {}, [](JitDispatchOutcome& o) { o.request_policy_id = 99; });
     reject(
         "GET /api/x HTTP/1.0\r\nHost: client\r\n\r\n",
@@ -2079,6 +2329,172 @@ TEST(target_transform, h2_forward_rejects_recorded_effect_before_proxy) {
     CHECK(dispatch.resp_len > 0);  // local 400 is staged, never proxied
     CHECK_EQ(loop.backend.count_ops(MockOp::Connect), 0u);
     CHECK_EQ(loop.backend.count_ops(MockOp::Send), 0u);
+}
+
+TEST(response_read_timeout, h2_forged_outcomes_set_sticky_close_without_local_status_or_work) {
+    RouteConfig config{};
+    REQUIRE(config.add_upstream("backend", 0x7F000001, 9000).has_value());
+    REQUIRE_EQ(config.add_policy_bundle(0, 0, 0, 5), 1u);
+    static constexpr u8 kSynth[] = "GET / HTTP/1.1\r\nHost: x\r\n\r\n";
+
+    {
+        SmallLoop loop;
+        loop.setup();
+        auto* conn = loop.alloc_conn();
+        REQUIRE(conn != nullptr);
+        Http2Conn h2{};
+        h2.init();
+        conn->h2 = &h2;
+        RouteEntry route{};
+        route.fn = &h2_response_read_timeout_handler;
+        u8 response[8192]{};
+        H2Dispatch<SmallLoop> dispatch{&loop, conn, response, sizeof(response), 0, false};
+        loop.backend.clear_ops();
+        h2_invoke_emit(
+            dispatch, 1, &route, nullptr, 0, &config, kSynth, sizeof(kSynth) - 1, false, true);
+        CHECK(dispatch.close_after_process);
+        CHECK_EQ(dispatch.resp_len, 0u);
+        CHECK_EQ(loop.backend.count_ops(MockOp::Connect), 0u);
+        CHECK_EQ(loop.backend.count_ops(MockOp::Send), 0u);
+        CHECK_EQ(loop.free_top, SmallLoop::kMaxConns - 1);
+        loop.close_conn(*conn);
+        CHECK_EQ(loop.free_top, SmallLoop::kMaxConns);
+    }
+
+    // A forged bundle is rejected at the same zero-byte boundary.
+    {
+        auto forged = std::make_unique<RouteConfig>();
+        REQUIRE(forged->add_upstream("backend", 0x7F000001, 9000).has_value());
+        REQUIRE_EQ(forged->add_policy_bundle(0, 0, 0, 5), 1u);
+        forged->policy_bundles[0].response_read_timeout_seconds = 64;
+        SmallLoop loop;
+        loop.setup();
+        auto* conn = loop.alloc_conn();
+        REQUIRE(conn != nullptr);
+        Http2Conn h2{};
+        h2.init();
+        conn->h2 = &h2;
+        RouteEntry route{};
+        route.fn = &h2_response_read_timeout_handler;
+        u8 response[8192]{};
+        H2Dispatch<SmallLoop> dispatch{&loop, conn, response, sizeof(response), 0, false};
+        loop.backend.clear_ops();
+        h2_invoke_emit(
+            dispatch, 1, &route, nullptr, 0, forged.get(), kSynth, sizeof(kSynth) - 1, false, true);
+        CHECK(dispatch.close_after_process);
+        CHECK_EQ(dispatch.resp_len, 0u);
+        CHECK_EQ(loop.backend.count_ops(MockOp::Connect), 0u);
+        CHECK_EQ(loop.backend.count_ops(MockOp::Send), 0u);
+        CHECK_EQ(loop.free_top, SmallLoop::kMaxConns - 1);
+        loop.close_conn(*conn);
+        CHECK_EQ(loop.free_top, SmallLoop::kMaxConns);
+    }
+}
+
+TEST(response_read_timeout,
+     h2_route_preflight_sticks_across_coalesced_callbacks_and_reclaims_once) {
+    SmallLoop loop;
+    loop.setup();
+    RouteConfig config{};
+    REQUIRE(config.add_upstream("backend", 0x7F000001, 9000).has_value());
+    REQUIRE_EQ(config.add_policy_bundle(0, 0, 0, 5), 1u);
+    REQUIRE(
+        config.add_jit_handler("/upload", 'P', &response_read_timeout_preflight_handler, true, 1));
+    REQUIRE(config.add_jit_handler("/later", 'G', &response_read_timeout_later_handler, false, 0));
+    const RouteConfig* active = &config;
+    loop.config_ptr = &active;
+    response_read_timeout_preflight_handler_calls = 0;
+    response_read_timeout_later_handler_calls = 0;
+
+    auto* conn = loop.alloc_conn();
+    REQUIRE(conn != nullptr);
+    const u32 conn_id = conn->id;
+    Http2Conn h2{};
+    h2.init();
+    // External sentinels make the DATA/RST sticky guards independently
+    // observable after close_conn reclaims the Connection slot. The test owns
+    // this stack Http2Conn, so close_conn only nulls conn->h2 and cannot erase
+    // these witnesses.
+    h2.pending_stream = 1;
+    h2.pending_body_len = 41;
+    conn->h2 = &h2;
+
+    // RST is a control frame and the engine stops request-frame consumption
+    // whenever async_stream is already parked, so exercise its production
+    // dispatch wrapper through the callback seam with an independent witness.
+    Http2Conn reset_h2{};
+    reset_h2.init();
+    reset_h2.async_stream = 3;
+    reset_h2.async_kind = H2AsyncKind::Timer;
+    reset_h2.async_timer_ms = 17;
+    Connection reset_conn{};
+    reset_conn.reset();
+    reset_conn.h2 = &reset_h2;
+    u8 reset_resp[32]{};
+    H2Dispatch<SmallLoop> reset_dispatch{
+        &loop, &reset_conn, reset_resp, sizeof(reset_resp), 0, false};
+    reset_dispatch.close_after_process = true;
+    h2_on_reset_dispatch_cb<SmallLoop>(&reset_dispatch, reset_h2, 3, Http2Error::Cancel);
+    CHECK_EQ(reset_h2.async_stream, 3u);
+    CHECK(reset_h2.async_kind == H2AsyncKind::Timer);
+    CHECK_EQ(reset_h2.async_timer_ms, 17u);
+
+    u8 input[1024]{};
+    u32 input_len = 0;
+    for (u32 i = 0; i < kClientPrefaceLen; i++) input[input_len++] = kClientPreface[i];
+    Http2Settings settings{};
+    settings.set_defaults();
+    input_len += write_settings_frame(input + input_len, settings);
+    const hpack::Header upload[] = {
+        {{":method", 7}, {"POST", 4}},
+        {{":scheme", 7}, {"http", 4}},
+        {{":path", 5}, {"/upload", 7}},
+        {{":authority", 10}, {"x", 1}},
+        {{"content-length", 14}, {"3", 1}},
+    };
+    input_len +=
+        http2_write_headers(input + input_len, sizeof(input) - input_len, 1, upload, 5, false);
+    const hpack::Header later[] = {
+        {{":method", 7}, {"GET", 3}},
+        {{":scheme", 7}, {"http", 4}},
+        {{":path", 5}, {"/later", 6}},
+        {{":authority", 10}, {"x", 1}},
+    };
+    input_len +=
+        http2_write_headers(input + input_len, sizeof(input) - input_len, 3, later, 4, true);
+    auto append_frame =
+        [&](Http2FrameType type, u8 flags, u32 stream_id, const u8* payload, u32 payload_len) {
+            REQUIRE(input_len + kFrameHeaderSize + payload_len <= sizeof(input));
+            Http2FrameHeader header{};
+            header.length = payload_len;
+            header.type = static_cast<u8>(type);
+            header.flags = flags;
+            header.stream_id = stream_id;
+            write_frame_header(input + input_len, header);
+            input_len += kFrameHeaderSize;
+            if (payload_len != 0) __builtin_memcpy(input + input_len, payload, payload_len);
+            input_len += payload_len;
+        };
+    static constexpr u8 kBody[] = {'a', 'b', 'c'};
+    append_frame(Http2FrameType::Data, 0, 1, kBody, sizeof(kBody));
+    static constexpr u8 kCancel[] = {0, 0, 0, 8};
+    append_frame(Http2FrameType::RstStream, 0, 3, kCancel, sizeof(kCancel));
+
+    REQUIRE_EQ(conn->recv_buf.write(input, input_len), input_len);
+    loop.backend.clear_ops();
+    on_h2_data<SmallLoop>(
+        &loop, *conn, make_ev(conn_id, IoEventType::Recv, static_cast<i32>(input_len)));
+
+    CHECK_EQ(response_read_timeout_preflight_handler_calls, 0u);
+    CHECK_EQ(response_read_timeout_later_handler_calls, 0u);
+    CHECK_EQ(loop.free_top, SmallLoop::kMaxConns);
+    CHECK_EQ(loop.backend.count_ops(MockOp::Recv), 0u);
+    CHECK_EQ(loop.backend.count_ops(MockOp::Connect), 0u);
+    CHECK_EQ(loop.backend.count_ops(MockOp::Send), 0u);
+    CHECK_EQ(loop.last_yield_ms, 0u);
+    CHECK_EQ(h2.pending_stream, 1u);
+    CHECK_EQ(h2.pending_body_len, 41u);
+    CHECK_EQ(h2.async_stream, 0u);
 }
 
 TEST(redirect, h2_initial_and_timer_resume_reject_without_proxy) {
@@ -23953,10 +24369,11 @@ TEST(state_invariant, timeout_failure_policy_forged_outcomes_reject_before_any_f
         u16 failure_policy_id;
         u16 timeout_failure_policy_id;
         u16 policy_bundle_id;
+        bool reclaimed;
     } invalid[] = {
-        {0, 0, 2, 0},   // timeout metadata without its required peers
-        {1, 1, 99, 0},  // direct out-of-range timeout id
-        {0, 0, 0, 99},  // invalid packed bundle id
+        {0, 0, 2, 0, false},   // direct metadata keeps its legacy local rejection
+        {1, 1, 99, 0, false},  // direct out-of-range id keeps its legacy local rejection
+        {0, 0, 0, 99, true},   // an unresolvable packed bundle closes with zero bytes
     };
 
     SmallLoop loop;
@@ -23977,37 +24394,56 @@ TEST(state_invariant, timeout_failure_policy_forged_outcomes_reject_before_any_f
             return outcome;
         };
 
+        const u32 body_wait_free_top = loop.free_top;
         auto* body_wait = loop.alloc_conn();
         REQUIRE(body_wait != nullptr);
         REQUIRE_EQ(body_wait->recv_buf.write(reinterpret_cast<const u8*>(kPost), sizeof(kPost) - 1),
                    sizeof(kPost) - 1);
         capture_request_metadata(*body_wait);
         body_wait->request_config = &cfg;
+        const u32 body_wait_id = body_wait->id;
         loop.backend.clear_ops();
         handle_jit_outcome<SmallLoop>(&loop, *body_wait, make_outcome(), nullptr, true);
-        CHECK_FALSE(body_wait->request_policy_body_pending);
-        CHECK_EQ(body_wait->pending_forward_timeout_failure_policy_id, 0u);
-        CHECK_FALSE(body_wait->upstream_slot_held);
-        CHECK_EQ(body_wait->upstream_fd, -1);
+        if (vector.reclaimed) {
+            CHECK_EQ(loop.free_top, body_wait_free_top);
+            CHECK_EQ(loop.backend.count_ops(MockOp::Send), 0u);
+            CHECK_EQ(__builtin_memcmp(loop.recv_storage[body_wait_id], kPost, sizeof(kPost) - 1),
+                     0);
+        } else {
+            CHECK_EQ(loop.free_top, body_wait_free_top - 1);
+            CHECK_FALSE(body_wait->request_policy_body_pending);
+            CHECK_EQ(body_wait->pending_forward_timeout_failure_policy_id, 0u);
+            CHECK_FALSE(body_wait->upstream_slot_held);
+            CHECK_EQ(body_wait->upstream_fd, -1);
+            loop.free_conn(*body_wait);
+        }
         CHECK_EQ(loop.backend.count_ops(MockOp::Recv), 0u);
         CHECK_EQ(loop.backend.count_ops(MockOp::Connect), 0u);
-        loop.free_conn(*body_wait);
 
+        const u32 rewrite_free_top = loop.free_top;
         auto* rewrite = setup_target_transform_request(loop, cfg, kGet, sizeof(kGet) - 1);
         REQUIRE(rewrite != nullptr);
+        const u32 rewrite_id = rewrite->id;
         const u32 before_len = rewrite->recv_buf.len();
         u8 before[SmallLoop::kBufSize];
         __builtin_memcpy(before, rewrite->recv_buf.data(), before_len);
         loop.backend.clear_ops();
         handle_jit_outcome<SmallLoop>(&loop, *rewrite, make_outcome(), nullptr, true);
-        CHECK_FALSE(rewrite->req_path_overridden);
-        CHECK_EQ(rewrite->recv_buf.len(), before_len);
-        CHECK_EQ(__builtin_memcmp(rewrite->recv_buf.data(), before, before_len), 0);
-        CHECK_FALSE(rewrite->upstream_slot_held);
-        CHECK_EQ(rewrite->upstream_fd, -1);
+        if (vector.reclaimed) {
+            CHECK_EQ(loop.free_top, rewrite_free_top);
+            CHECK_EQ(loop.backend.count_ops(MockOp::Send), 0u);
+            CHECK_EQ(__builtin_memcmp(loop.recv_storage[rewrite_id], before, before_len), 0);
+        } else {
+            CHECK_EQ(loop.free_top, rewrite_free_top - 1);
+            CHECK_FALSE(rewrite->req_path_overridden);
+            CHECK_EQ(rewrite->recv_buf.len(), before_len);
+            CHECK_EQ(__builtin_memcmp(rewrite->recv_buf.data(), before, before_len), 0);
+            CHECK_FALSE(rewrite->upstream_slot_held);
+            CHECK_EQ(rewrite->upstream_fd, -1);
+            loop.free_conn(*rewrite);
+        }
         CHECK_EQ(loop.backend.count_ops(MockOp::Recv), 0u);
         CHECK_EQ(loop.backend.count_ops(MockOp::Connect), 0u);
-        loop.free_conn(*rewrite);
     }
 }
 

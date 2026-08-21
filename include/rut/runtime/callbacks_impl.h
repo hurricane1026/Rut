@@ -559,11 +559,8 @@ void on_ws_upstream_recv(void* lp, Connection& conn, IoEvent ev);
 // register timer for resume, or 500). Shared between the initial call
 // (on_header_received) and timer-driven resumes.
 template <typename Loop>
-void handle_jit_outcome(Loop* loop,
-                        Connection& conn,
-                        const JitDispatchOutcome& outcome,
-                        jit::HandlerFn fn,
-                        bool keep_alive);
+void handle_jit_outcome(
+    Loop* loop, Connection& conn, JitDispatchOutcome outcome, jit::HandlerFn fn, bool keep_alive);
 
 template <typename Loop>
 void on_request_policy_body_recvd(void* lp, Connection& conn, IoEvent ev);
@@ -1244,6 +1241,11 @@ void on_header_received(void* lp, Connection& conn, IoEvent ev) {
             conn.req_path_canon, kMethodKey, route_params, &route_param_count, kMaxRouteParams);
     }
 
+    if (route_requires_response_read_timeout_preflight_close(route, config)) {
+        loop->close_conn(conn);
+        return;
+    }
+
     // Per-route rate limit (fixed window). Enforced after route match, before
     // dispatch. A route may stack several rules; a request must pass every one,
     // each metered by its own key tuple (IP / header / query / cookie / param;
@@ -1465,6 +1467,10 @@ void on_jit_request_body_recvd(void* lp, Connection& conn, IoEvent ev) {
         const u8 kMethodKey = route_method_key(static_cast<LogHttpMethod>(conn.req_method));
         route = config->match_canonical(
             conn.req_path_canon, kMethodKey, route_params, &route_param_count, kMaxRouteParams);
+    }
+    if (route_requires_response_read_timeout_preflight_close(route, config)) {
+        loop->close_conn(conn);
+        return;
     }
     if (!route || route->action != RouteAction::JitHandler || !route->fn) {
         loop->close_conn(conn);
@@ -1922,11 +1928,8 @@ inline bool build_h1_forward_response_headers(Connection& conn, u32 header_len, 
 }
 
 template <typename Loop>
-void handle_jit_outcome(Loop* loop,
-                        Connection& conn,
-                        const JitDispatchOutcome& outcome,
-                        jit::HandlerFn fn,
-                        bool keep_alive) {
+void handle_jit_outcome(
+    Loop* loop, Connection& conn, JitDispatchOutcome outcome, jit::HandlerFn fn, bool keep_alive) {
     switch (outcome.kind) {
         case JitDispatchOutcome::Kind::ReturnStatus: {
             conn.pending_handler_fn = nullptr;
@@ -2260,6 +2263,28 @@ void handle_jit_outcome(Loop* loop,
             // pick up a post-swap config whose upstream table doesn't
             // match the indexing the handler compiled against.
             const RouteConfig* config = conn.request_config;
+            u16 forward_response_policy_id = outcome.response_policy_id;
+            u16 forward_failure_policy_id = outcome.failure_policy_id;
+            u16 forward_timeout_failure_policy_id = outcome.timeout_failure_policy_id;
+            if (outcome.policy_bundle_id != 0) {
+                if (config == nullptr ||
+                    !config->policy_bundle_id_is_valid(outcome.policy_bundle_id)) {
+                    loop->close_conn(conn);
+                    return;
+                }
+                const auto& bundle = config->policy_bundles[outcome.policy_bundle_id - 1];
+                forward_response_policy_id = bundle.response_policy_id;
+                forward_failure_policy_id = bundle.failure_policy_id;
+                forward_timeout_failure_policy_id = bundle.timeout_failure_policy_id;
+                outcome.response_read_timeout_seconds = bundle.response_read_timeout_seconds;
+            }
+            if (outcome.response_read_timeout_seconds != 0) {
+                // Metadata is transported honestly, but no deadline lifecycle
+                // exists yet. Reject before target/rewrite materialization,
+                // body wait, allocation, backend selection, or upstream work.
+                loop->close_conn(conn);
+                return;
+            }
             if (conn.target_transform_recorded) {
                 // Validate every deterministic Forward reference and the bounded
                 // transform domain before touching recv_buf. The transform is
@@ -2269,19 +2294,9 @@ void handle_jit_outcome(Loop* loop,
                     reject_request_policy(loop, conn);
                     return;
                 }
-                u16 target_response_policy_id = outcome.response_policy_id;
-                u16 target_failure_policy_id = outcome.failure_policy_id;
-                u16 target_timeout_failure_policy_id = outcome.timeout_failure_policy_id;
-                if (outcome.policy_bundle_id != 0) {
-                    if (!config->policy_bundle_id_is_valid(outcome.policy_bundle_id)) {
-                        reject_response_policy(loop, conn);
-                        return;
-                    }
-                    const auto& bundle = config->policy_bundles[outcome.policy_bundle_id - 1];
-                    target_response_policy_id = bundle.response_policy_id;
-                    target_failure_policy_id = bundle.failure_policy_id;
-                    target_timeout_failure_policy_id = bundle.timeout_failure_policy_id;
-                }
+                const u16 target_response_policy_id = forward_response_policy_id;
+                const u16 target_failure_policy_id = forward_failure_policy_id;
+                const u16 target_timeout_failure_policy_id = forward_timeout_failure_policy_id;
                 if ((target_response_policy_id != 0 &&
                      !config->response_policy_id_is_valid(target_response_policy_id)) ||
                     (target_failure_policy_id != 0 &&
@@ -2354,19 +2369,7 @@ void handle_jit_outcome(Loop* loop,
                 client_send(loop, conn, conn.send_buf.data(), conn.send_buf.len());
                 return;
             }
-            u16 forward_response_policy_id = outcome.response_policy_id;
-            u16 forward_failure_policy_id = outcome.failure_policy_id;
-            u16 forward_timeout_failure_policy_id = outcome.timeout_failure_policy_id;
-            if (outcome.policy_bundle_id != 0) {
-                if (!config->policy_bundle_id_is_valid(outcome.policy_bundle_id)) {
-                    reject_response_policy(loop, conn);
-                    return;
-                }
-                const auto& bundle = config->policy_bundles[outcome.policy_bundle_id - 1];
-                forward_response_policy_id = bundle.response_policy_id;
-                forward_failure_policy_id = bundle.failure_policy_id;
-                forward_timeout_failure_policy_id = bundle.timeout_failure_policy_id;
-            } else {
+            if (outcome.policy_bundle_id == 0) {
                 if ((forward_failure_policy_id != 0 &&
                      !config->failure_policy_id_is_valid(forward_failure_policy_id)) ||
                     (forward_timeout_failure_policy_id != 0 &&

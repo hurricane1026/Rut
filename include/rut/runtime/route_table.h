@@ -118,6 +118,9 @@ struct RouteEntry {
     u32 ws_max_message_size = 0;
     // RFC 6455 status the handler's `frame.close(code)` verdict puts on the wire (1000 default).
     u16 ws_close_code = 1000;
+    // Nonzero only for the bounded static direct-forward timeout preflight.
+    // Resolves through the same pinned RouteConfig as this RouteEntry.
+    u16 preflight_forward_policy_bundle_id = 0;
 };
 
 // RouteConfig — immutable after construction, atomically swappable.
@@ -566,6 +569,7 @@ struct RouteConfig {
         r.status_code = 0;
         r.fn = nullptr;
         r.needs_req_body = false;
+        r.preflight_forward_policy_bundle_id = 0;
         if (!populate_dispatch_state(r)) {
             return false;  // active dispatch at capacity — fail loud
         }
@@ -722,6 +726,7 @@ struct RouteConfig {
         r.status_code = status;
         r.fn = nullptr;
         r.needs_req_body = false;
+        r.preflight_forward_policy_bundle_id = 0;
         if (!populate_dispatch_state(r)) {
             return false;
         }
@@ -735,7 +740,8 @@ struct RouteConfig {
     bool add_jit_handler(const char* path,
                          u8 method,
                          jit::HandlerFn fn,
-                         bool needs_req_body = false) {
+                         bool needs_req_body = false,
+                         u16 preflight_forward_policy_bundle_id = 0) {
         if (route_count >= kMaxRoutes) return false;
         if (fn == nullptr) return false;
         if (!is_routable_path(path)) return false;
@@ -757,6 +763,7 @@ struct RouteConfig {
         r.status_code = 0;
         r.fn = fn;
         r.needs_req_body = needs_req_body;
+        r.preflight_forward_policy_bundle_id = preflight_forward_policy_bundle_id;
         if (!populate_dispatch_state(r)) {
             return false;
         }
@@ -944,13 +951,16 @@ struct RouteConfig {
 
     u16 add_policy_bundle(u16 response_policy_id,
                           u16 failure_policy_id,
-                          u16 timeout_failure_policy_id = 0) {
-        if (failure_policy_id == 0 ||
-            (response_policy_id != 0 && !response_policy_id_is_valid(response_policy_id)) ||
-            !failure_policy_id_is_valid(failure_policy_id))
+                          u16 timeout_failure_policy_id = 0,
+                          u8 response_read_timeout_seconds = 0) {
+        if ((response_policy_id != 0 && !response_policy_id_is_valid(response_policy_id)) ||
+            (failure_policy_id != 0 && !failure_policy_id_is_valid(failure_policy_id)) ||
+            (response_read_timeout_seconds != 0 &&
+             !response_read_timeout_seconds_valid(response_read_timeout_seconds)) ||
+            (response_read_timeout_seconds == 0 && failure_policy_id == 0))
             return 0;
         if (timeout_failure_policy_id != 0) {
-            if (response_policy_id == 0 ||
+            if (response_policy_id == 0 || failure_policy_id == 0 ||
                 !timeout_failure_policy_id_is_valid(timeout_failure_policy_id))
                 return 0;
             const bool response_suppress = response_policies[response_policy_id - 1].head_mode ==
@@ -967,12 +977,15 @@ struct RouteConfig {
         for (u32 i = 0; i < policy_bundle_count; i++) {
             if (policy_bundles[i].response_policy_id == response_policy_id &&
                 policy_bundles[i].failure_policy_id == failure_policy_id &&
-                policy_bundles[i].timeout_failure_policy_id == timeout_failure_policy_id)
+                policy_bundles[i].timeout_failure_policy_id == timeout_failure_policy_id &&
+                policy_bundles[i].response_read_timeout_seconds == response_read_timeout_seconds)
                 return static_cast<u16>(i + 1);
         }
         if (policy_bundle_count >= kMaxForwardPolicyBundles) return 0;
-        policy_bundles[policy_bundle_count] = {
-            response_policy_id, failure_policy_id, timeout_failure_policy_id};
+        policy_bundles[policy_bundle_count] = {response_policy_id,
+                                               failure_policy_id,
+                                               timeout_failure_policy_id,
+                                               response_read_timeout_seconds};
         return static_cast<u16>(++policy_bundle_count);
     }
 
@@ -993,10 +1006,13 @@ struct RouteConfig {
             return false;
         const auto& b = policy_bundles[id - 1];
         if ((b.response_policy_id != 0 && !response_policy_id_is_valid(b.response_policy_id)) ||
-            !failure_policy_id_is_valid(b.failure_policy_id))
+            (b.failure_policy_id != 0 && !failure_policy_id_is_valid(b.failure_policy_id)) ||
+            (b.response_read_timeout_seconds != 0 &&
+             !response_read_timeout_seconds_valid(b.response_read_timeout_seconds)) ||
+            (b.response_read_timeout_seconds == 0 && b.failure_policy_id == 0))
             return false;
         if (b.timeout_failure_policy_id == 0) return true;
-        if (b.response_policy_id == 0 ||
+        if (b.response_policy_id == 0 || b.failure_policy_id == 0 ||
             !timeout_failure_policy_id_is_valid(b.timeout_failure_policy_id))
             return false;
         const bool response_suppress = response_policies[b.response_policy_id - 1].head_mode ==
@@ -1783,5 +1799,18 @@ private:
     // use scalar fallback.
     jit::ArtJitMatchFn art_jit_fn_ = nullptr;
 };
+
+inline bool route_requires_response_read_timeout_preflight_close(const RouteEntry* route,
+                                                                 const RouteConfig* config) {
+    if (route == nullptr || route->preflight_forward_policy_bundle_id == 0) return false;
+    const u16 id = route->preflight_forward_policy_bundle_id;
+    if (config == nullptr || !config->policy_bundle_id_is_valid(id)) return true;
+    const auto& bundle = config->policy_bundles[id - 1];
+    // A forged route marker that points at a legacy zero-duration bundle is
+    // invalid too. Both valid metadata and every invalid shape use the same
+    // zero-byte close boundary.
+    if (!response_read_timeout_seconds_valid(bundle.response_read_timeout_seconds)) return true;
+    return true;
+}
 
 }  // namespace rut

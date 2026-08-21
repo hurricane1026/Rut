@@ -1794,7 +1794,20 @@ struct Parser {
                     const Str kw_text = kw.value()->text;
                     auto colon = expect(TokenType::Colon);
                     if (!colon) return core::make_unexpected(colon.error());
-                    if (kw_text.eq({"request_policy", 14})) {
+                    if (kw_text.eq({"response_read_timeout", 21})) {
+                        if (stmt.has_forward_response_read_timeout)
+                            return frontend_error(
+                                FrontendError::UnexpectedToken, span_from(*kw.value()), kw_text);
+                        auto value = expect(TokenType::DurLit);
+                        if (!value) return core::make_unexpected(value.error());
+                        u8 seconds = 0;
+                        if (!dur_lit_to_exact_response_read_seconds(value.value()->text, &seconds))
+                            return frontend_error(FrontendError::UnsupportedSyntax,
+                                                  span_from(*value.value()),
+                                                  value.value()->text);
+                        stmt.forward_response_read_timeout_seconds = seconds;
+                        stmt.has_forward_response_read_timeout = true;
+                    } else if (kw_text.eq({"request_policy", 14})) {
                         if (stmt.has_forward_request_policy)
                             return frontend_error(
                                 FrontendError::UnexpectedToken, span_from(*kw.value()), kw_text);
@@ -4074,6 +4087,39 @@ struct Parser {
             return 0;
         if (secs == 0 && digits > 0) secs = 1;  // e.g. 1ms → 1s
         return secs > 0xffffffffull ? 0xffffffffu : static_cast<u32>(secs);
+    }
+
+    // Convert a duration literal to the exact whole-second representation used
+    // by response_read_timeout. This intentionally does not share the rounded
+    // decorator conversion above and never clamps or saturates.
+    static bool dur_lit_to_exact_response_read_seconds(Str t, u8* out) {
+        if (out == nullptr) return false;
+        u64 digits = 0;
+        u32 i = 0;
+        for (; i < t.len && t.ptr[i] >= '0' && t.ptr[i] <= '9'; i++) {
+            const u64 digit = static_cast<u64>(t.ptr[i] - '0');
+            if (digits > (0xffffffffffffffffull - digit) / 10ull) return false;
+            digits = digits * 10ull + digit;
+        }
+        const Str unit{t.ptr + i, t.len - i};
+        u64 seconds = 0;
+        if (unit.eq({"ms", 2})) {
+            if (digits % 1000ull != 0) return false;
+            seconds = digits / 1000ull;
+        } else if (unit.eq({"s", 1})) {
+            seconds = digits;
+        } else if (unit.eq({"m", 1})) {
+            if (digits > 63ull / 60ull) return false;
+            seconds = digits * 60ull;
+        } else if (unit.eq({"h", 1})) {
+            if (digits > 63ull / 3600ull) return false;
+            seconds = digits * 3600ull;
+        } else {
+            return false;
+        }
+        if (seconds < 1 || seconds > 63) return false;
+        *out = static_cast<u8>(seconds);
+        return true;
     }
 
     // Parse one official (built-in) decorator: `@name(args)`. Only a fixed

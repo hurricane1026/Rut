@@ -9771,6 +9771,12 @@ static FrontendResult<HirTerminator> analyze_term(const AstStatement& stmt, cons
                                   stmt.span,
                                   lit_str("timeout and default failure HEAD modes must match"));
     }
+    if (stmt.has_forward_response_read_timeout !=
+            (stmt.forward_response_read_timeout_seconds != 0) ||
+        (stmt.has_forward_response_read_timeout &&
+         !response_read_timeout_seconds_valid(stmt.forward_response_read_timeout_seconds)))
+        return frontend_error(
+            FrontendError::UnsupportedSyntax, stmt.span, lit_str("invalid response read timeout"));
     const bool response_suppress =
         response_policy != nullptr &&
         response_policy->head_mode == ResponsePolicyHeadMode::SuppressBody;
@@ -9811,6 +9817,8 @@ static FrontendResult<HirTerminator> analyze_term(const AstStatement& stmt, cons
         term.forward_failure_policy_id = stmt.forward_failure_policy_id;
     if (stmt.has_forward_timeout_failure_policy)
         term.forward_timeout_failure_policy_id = stmt.forward_timeout_failure_policy_id;
+    if (stmt.has_forward_response_read_timeout)
+        term.forward_response_read_timeout_seconds = stmt.forward_response_read_timeout_seconds;
     if (stmt.has_forward_target_transform) {
         if (!forward_target_transform_spec_valid(stmt.forward_target_transform) ||
             stmt.has_forward_set_path || stmt.forward_set_headers.len != 0)
@@ -18940,6 +18948,89 @@ static FrontendResult<HirModule*> analyze_file_internal(
                               "response_policy cannot be combined with response header mutations")
                         : lit_str(
                               "request_policy cannot be combined with response header mutations"));
+        }
+
+        // The first response-read-timeout slice is deliberately narrower than
+        // the general Forward grammar: the runtime must be able to reject from
+        // route metadata before it evaluates any handler code. Find every
+        // timeout-bearing terminal, including short-circuit/control bodies, then
+        // admit only one effect-free whole-route Direct Forward.
+        const HirTerminator* timeout_term = nullptr;
+        auto note_timeout = [&](const HirTerminator& term) {
+            if (term.forward_response_read_timeout_seconds != 0 && timeout_term == nullptr)
+                timeout_term = &term;
+        };
+        auto note_guard = [&](const HirGuard& guard) {
+            if (guard.fail_kind == HirGuard::FailKind::Term) {
+                note_timeout(guard.fail_term);
+            } else if (guard.fail_kind == HirGuard::FailKind::Body) {
+                if (guard.fail_body.body_kind == HirGuardBody::BodyKind::Direct)
+                    note_timeout(guard.fail_body.direct_term);
+                else {
+                    note_timeout(guard.fail_body.then_term);
+                    note_timeout(guard.fail_body.else_term);
+                }
+            } else {
+                for (u32 ai = 0; ai < guard.fail_match_count; ai++)
+                    note_timeout(mod.guard_match_arms[guard.fail_match_start + ai].direct_term);
+            }
+        };
+        if (route.control.kind == HirControlKind::Direct) {
+            note_timeout(route.control.direct_term);
+        } else if (route.control.kind == HirControlKind::If) {
+            note_timeout(route.control.then_term);
+            note_timeout(route.control.else_term);
+        } else {
+            for (u32 ai = 0; ai < route.control.match_arms.len; ai++) {
+                const auto& arm = route.control.match_arms[ai];
+                for (u32 gi = 0; gi < arm.guards.len; gi++) note_guard(arm.guards[gi]);
+                if (arm.body_kind == HirMatchArm::BodyKind::Direct)
+                    note_timeout(arm.direct_term);
+                else {
+                    note_timeout(arm.then_term);
+                    note_timeout(arm.else_term);
+                }
+            }
+        }
+        for (u32 gi = 0; gi < route.guards.len; gi++) note_guard(route.guards[gi]);
+        for (u32 fi = 0; fi < route.for_loops.len; fi++) {
+            const auto& body = route.for_loops[fi].body;
+            if (body.has_term) note_timeout(body.term);
+            for (u32 gi = 0; gi < body.guards.len; gi++) note_guard(body.guards[gi]);
+            for (u32 ii = 0; ii < body.ifs.len; ii++) {
+                note_timeout(body.ifs[ii].then_term);
+                note_timeout(body.ifs[ii].else_term);
+            }
+            for (u32 mi = 0; mi < body.matches.len; mi++) {
+                for (u32 ai = 0; ai < body.matches[mi].arms.len; ai++) {
+                    const auto& arm = body.matches[mi].arms[ai];
+                    for (u32 gi = 0; gi < arm.guards.len; gi++) note_guard(arm.guards[gi]);
+                    if (arm.body_kind == HirForLoopMatchArm::BodyKind::Direct)
+                        note_timeout(arm.direct_term);
+                    else {
+                        note_timeout(arm.then_term);
+                        note_timeout(arm.else_term);
+                    }
+                }
+            }
+        }
+        if (timeout_term != nullptr) {
+            const HirTerminator& direct = route.control.direct_term;
+            const bool canonical =
+                route.control.kind == HirControlKind::Direct && timeout_term == &direct &&
+                direct.kind == HirTerminatorKind::ForwardUpstream && route.locals.len == 0 &&
+                route.exprs.len == 0 && route.guards.len == 0 && route.waits.len == 0 &&
+                route.for_loops.len == 0 && route_decl.chains.len == 0 &&
+                route_decl.decorators.len == 0 && route.rate_limit.count == 0 &&
+                route.throttle_down_bps == 0 && direct.forward_set_path.ptr == nullptr &&
+                direct.forward_set_headers.len == 0 && !direct.has_forward_target_transform &&
+                !direct.commit_response_mutations;
+            if (!canonical)
+                return frontend_error(
+                    FrontendError::UnsupportedSyntax,
+                    timeout_term->span,
+                    lit_str("response_read_timeout currently requires an effect-free direct "
+                            "Forward route"));
         }
 
         // Wait-route backstop: the creation-time gates (kTimeWaitDetail /

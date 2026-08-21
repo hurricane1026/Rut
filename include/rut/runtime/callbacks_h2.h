@@ -90,6 +90,10 @@ struct H2Dispatch {
     u32 resp_cap;
     u32 resp_len;
     bool overflow;
+    // Sticky for the duration of one Http2Conn::process() call. Callbacks may
+    // request connection close, but must not reclaim the connection while the
+    // engine is still walking coalesced frames on its stack.
+    bool close_after_process = false;
 };
 
 // Append a response (HEADERS + optional DATA body) for a stream, encoded with
@@ -738,8 +742,22 @@ void h2_invoke_emit(H2Dispatch<Loop>& d,
     ctx->route_param_count = param_count;
     for (u32 i = 0; i < param_count; i++) ctx->route_params[i] = params[i];
 
-    const JitDispatchOutcome kOutcome = invoke_jit_handler(
+    JitDispatchOutcome kOutcome = invoke_jit_handler(
         route->fn, static_cast<void*>(d.conn), *ctx, synth, synth_len, /*arena=*/nullptr);
+    if (kOutcome.kind == JitDispatchOutcome::Kind::Forward) {
+        if (kOutcome.policy_bundle_id != 0) {
+            if (cfg == nullptr || !cfg->policy_bundle_id_is_valid(kOutcome.policy_bundle_id)) {
+                d.close_after_process = true;
+                return;
+            }
+            kOutcome.response_read_timeout_seconds =
+                cfg->policy_bundles[kOutcome.policy_bundle_id - 1].response_read_timeout_seconds;
+        }
+        if (kOutcome.response_read_timeout_seconds != 0) {
+            d.close_after_process = true;
+            return;
+        }
+    }
     if (d.conn->target_transform_recorded) {
         h2_emit_status(d, stream_id, 400);
         return;
@@ -849,6 +867,7 @@ void h2_invoke_emit(H2Dispatch<Loop>& d,
 // pending_body_len is used for Content-Length validation.
 template <typename Loop>
 void h2_finish_body(H2Dispatch<Loop>& d, u32 stream_id) {
+    if (d.close_after_process) return;
     Http2Conn* h2 = d.conn->h2;
     if (h2->pending_overflow) {
         const bool kBuffered = h2->pending_buffer_body;
@@ -946,6 +965,7 @@ void h2_dispatch_request(H2Dispatch<Loop>& d,
                          const hpack::Header* headers,
                          u32 nheaders,
                          bool end_stream) {
+    if (d.close_after_process) return;
     // A prepared Forward waiting to learn whether its open request stream is
     // actually empty owns both pending_synth and the connection mutation log.
     if (d.conn->h2->pending_prepared_forward) {
@@ -1018,6 +1038,13 @@ void h2_dispatch_request(H2Dispatch<Loop>& d,
             return;
         }
         h2_emit_status(d, stream_id, 200);  // default (matches HTTP/1 catchall)
+        return;
+    }
+
+    if (route_requires_response_read_timeout_preflight_close(route, config)) {
+        d.close_after_process = true;
+        d.resp_len = 0;
+        d.overflow = false;
         return;
     }
 
@@ -1174,6 +1201,7 @@ template <typename Loop>
 void h2_on_headers_cb(
     void* ctx, Http2Conn& /*c*/, u32 stream_id, const hpack::Header* hs, u32 n, bool end) {
     auto* d = static_cast<H2Dispatch<Loop>*>(ctx);
+    if (d->close_after_process) return;
     h2_dispatch_request(*d, stream_id, hs, n, end);
 }
 
@@ -1184,6 +1212,7 @@ template <typename Loop>
 void h2_on_data_cb(
     void* ctx, Http2Conn& c, u32 stream_id, const u8* data, u32 len, bool end_stream) {
     auto* d = static_cast<H2Dispatch<Loop>*>(ctx);
+    if (d->close_after_process) return;
     if (c.pending_stream != stream_id) return;
     if (c.pending_body_len > 0xffffffffu - len) {
         c.pending_overflow = true;
@@ -1206,8 +1235,16 @@ void h2_on_data_cb(
 // cancelled. The timer/upstream are armed only AFTER process() returns, so at RST
 // time there is no in-flight I/O to undo; the config epoch pinned for the suspend
 // is released by the post-process path once async_stream is clear.
-inline void h2_on_reset_cb(void* /*ctx*/, Http2Conn& c, u32 stream_id, Http2Error /*err*/) {
+inline void h2_on_reset_cb(void* ctx, Http2Conn& c, u32 stream_id, Http2Error /*err*/) {
+    (void)ctx;
     if (c.async_stream != 0 && c.async_stream == stream_id) h2_clear_async(c);
+}
+
+template <typename Loop>
+void h2_on_reset_dispatch_cb(void* ctx, Http2Conn& c, u32 stream_id, Http2Error err) {
+    auto* d = static_cast<H2Dispatch<Loop>*>(ctx);
+    if (d->close_after_process) return;
+    h2_on_reset_cb(ctx, c, stream_id, err);
 }
 
 // Forward declaration: defined below; on_h2_data re-arms via this on send done.
@@ -1321,12 +1358,12 @@ void on_h2_data(void* lp, Connection& conn, IoEvent ev) {
     // Response frames produced by the dispatch callback.
     static constexpr u32 kRespCap = 8192;
     u8 resp[kRespCap];
-    H2Dispatch<Loop> d{loop, &conn, resp, kRespCap, 0, false};
+    H2Dispatch<Loop> d{loop, &conn, resp, kRespCap, 0, false, false};
 
     conn.h2->cb_ctx = &d;
     conn.h2->on_headers = &h2_on_headers_cb<Loop>;
-    conn.h2->on_data = &h2_on_data_cb<Loop>;  // accumulates request bodies
-    conn.h2->on_reset = &h2_on_reset_cb;      // cancels a parked stream on RST_STREAM
+    conn.h2->on_data = &h2_on_data_cb<Loop>;             // accumulates request bodies
+    conn.h2->on_reset = &h2_on_reset_dispatch_cb<Loop>;  // cancels a parked stream on RST_STREAM
     // Pin the RCU config epoch BEFORE snapshotting and matching the config, so a
     // hot reload (poll_command runs once per loop iteration, after this dispatch
     // batch) can't reclaim a RouteConfig/RouteEntry that a stream parks on —
@@ -1339,6 +1376,11 @@ void on_h2_data(void* lp, Connection& conn, IoEvent ev) {
     u32 ctrl_len = 0;
     Http2Result r =
         conn.h2->process(conn.recv_buf.data(), conn.recv_buf.len(), ctrl, sizeof(ctrl), &ctrl_len);
+
+    if (d.close_after_process) {
+        loop->close_conn(conn);
+        return;
+    }
 
     // Compact unconsumed bytes (a partial trailing frame) to the front so the
     // next recv appends after them.
@@ -1442,12 +1484,29 @@ void h2_resume_jit_handler(Loop* loop, Connection& conn) {
     ctx->state = conn.handler_state;
     ctx->resume_event_kind = static_cast<u32>(conn.resume_event_kind);
     ctx->resume_event_result = conn.resume_event_result;
-    const JitDispatchOutcome kOutcome = invoke_jit_handler(conn.pending_handler_fn,
-                                                           static_cast<void*>(&conn),
-                                                           *ctx,
-                                                           h2->pending_synth,
-                                                           h2->async_synth_len,
-                                                           /*arena=*/nullptr);
+    JitDispatchOutcome kOutcome = invoke_jit_handler(conn.pending_handler_fn,
+                                                     static_cast<void*>(&conn),
+                                                     *ctx,
+                                                     h2->pending_synth,
+                                                     h2->async_synth_len,
+                                                     /*arena=*/nullptr);
+
+    if (kOutcome.kind == JitDispatchOutcome::Kind::Forward) {
+        if (kOutcome.policy_bundle_id != 0) {
+            if (h2->async_cfg == nullptr ||
+                !h2->async_cfg->policy_bundle_id_is_valid(kOutcome.policy_bundle_id)) {
+                loop->close_conn(conn);
+                return;
+            }
+            kOutcome.response_read_timeout_seconds =
+                h2->async_cfg->policy_bundles[kOutcome.policy_bundle_id - 1]
+                    .response_read_timeout_seconds;
+        }
+        if (kOutcome.response_read_timeout_seconds != 0) {
+            loop->close_conn(conn);
+            return;
+        }
+    }
 
     if (conn.target_transform_recorded) {
         u8 resp[8192];

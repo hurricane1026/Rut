@@ -10,6 +10,7 @@
 #include "rut/jit/jit_engine.h"
 #include "rut/jit/runtime_helpers.h"
 #include "rut/runtime/cache_table.h"
+#include "rut/runtime/compile_to_config.h"
 #include "rut/runtime/connection.h"
 #include "rut/runtime/jit_dispatch.h"
 #if RUT_ENABLE_WEBSOCKET
@@ -18,6 +19,7 @@
 #include "test.h"
 #include <filesystem>
 #include <fstream>
+#include <memory>
 
 #include <pthread.h>
 #include <stdio.h>
@@ -8341,6 +8343,88 @@ route GET "/" {
     CHECK(out.kind == JitDispatchOutcome::Kind::Forward);
     CHECK_EQ(out.policy_bundle_id, 1u);
     CHECK_EQ(out.timeout_failure_policy_id, 0u);
+    engine.shutdown();
+    rir.destroy();
+}
+
+TEST(jit, compiled_response_read_timeout_preserves_single_bundle_and_request_policy_abi) {
+    const char source[] = R"rut(
+upstream b at "127.0.0.1:9000"
+route GET "/" {
+    return forward(b, request_policy: {
+        version: "HTTP/1.1", host: "upstream", connection: "omit",
+        strip_headers: ["Connection", "Keep-Alive", "TE", "Expect", "Upgrade"]
+    }, response_policy: {
+        version: "HTTP/1.1", framing: "content_length", connection: "request",
+        server: "rut", date: "current", hide_headers: []
+    }, response_read_timeout: 7s)
+}
+route GET "/later" { return 204 }
+)rut";
+    auto lexed = lex(lit(source));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    REQUIRE(lower_to_rir(mir.value(), rir));
+    REQUIRE_EQ(rir.module.policy_bundle_count, 1u);
+    REQUIRE_EQ(rir.module.func_count, 2u);
+    CHECK_EQ(rir.module.functions[0].preflight_forward_policy_bundle_id, 1u);
+    CHECK_EQ(rir.module.functions[1].preflight_forward_policy_bundle_id, 0u);
+    CHECK_EQ(rir.module.policy_bundles[0].response_policy_id, 1u);
+    CHECK_EQ(rir.module.policy_bundles[0].failure_policy_id, 0u);
+    CHECK_EQ(rir.module.policy_bundles[0].timeout_failure_policy_id, 0u);
+    CHECK_EQ(rir.module.policy_bundles[0].response_read_timeout_seconds, 7u);
+    auto cg = codegen(rir.module);
+    REQUIRE(cg.ok);
+    JitEngine engine;
+    REQUIRE(engine.init());
+    REQUIRE(engine.compile(cg.mod, cg.ctx));
+    auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
+    REQUIRE(handler != nullptr);
+    const auto raw = HandlerResult::unpack(handler(nullptr, nullptr, nullptr, 0, nullptr));
+    CHECK(raw.action == HandlerAction::ForwardBundle);
+    CHECK_EQ(raw.status_code, 1u);
+    CHECK_EQ(raw.next_state, 1u);
+    HandlerCtx ctx{};
+    const auto out = invoke_jit_handler(handler, nullptr, ctx, nullptr, 0, nullptr);
+    CHECK(out.kind == JitDispatchOutcome::Kind::Forward);
+    CHECK_EQ(out.request_policy_id, 1u);
+    CHECK_EQ(out.policy_bundle_id, 1u);
+    CHECK_EQ(out.response_read_timeout_seconds, 0u);
+
+    auto config = std::make_unique<RouteConfig>();
+    REQUIRE(populate_route_config(*config, rir.module));
+    REQUIRE_EQ(config->response_policy_count, 1u);
+    config->response_policy_count = 0;
+    REQUIRE(config->use_segment_trie());
+    CHECK_FALSE(register_jit_routes(*config, rir.module, engine));
+    CHECK_EQ(config->route_count, 0u);
+    CHECK_EQ(config->timer_count, 0u);
+    CHECK(config->dispatch_kind() == RouteConfig::DispatchKind::SegmentTrie);
+    config->response_policy_count = 1;
+    REQUIRE(config->use_art());
+
+    config->policy_bundles[0].response_read_timeout_seconds = 6;
+    CHECK_FALSE(register_jit_routes(*config, rir.module, engine));
+    CHECK_EQ(config->route_count, 0u);
+    CHECK_EQ(config->timer_count, 0u);
+    config->policy_bundles[0].response_read_timeout_seconds = 7;
+
+    const Str saved_pattern = rir.module.functions[1].route_pattern;
+    rir.module.functions[1].route_pattern = {"/bad?x", 6};
+    CHECK_FALSE(register_jit_routes(*config, rir.module, engine));
+    CHECK_EQ(config->route_count, 0u);
+    CHECK_EQ(config->timer_count, 0u);
+    rir.module.functions[1].route_pattern = saved_pattern;
+    REQUIRE(register_jit_routes(*config, rir.module, engine));
+    REQUIRE_EQ(config->route_count, 2u);
+    CHECK_EQ(config->routes[0].preflight_forward_policy_bundle_id, 1u);
+    CHECK_EQ(config->routes[1].preflight_forward_policy_bundle_id, 0u);
     engine.shutdown();
     rir.destroy();
 }

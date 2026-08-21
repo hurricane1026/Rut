@@ -1,5 +1,6 @@
 #pragma once
 
+#include "rut/common/request_policy.h"
 #include "rut/compiler/rir.h"
 #include "rut/compiler/rir_printer.h"
 #include "rut/jit/handler_abi.h"
@@ -37,6 +38,7 @@ enum class VerifyIssueCode : u8 {
     TooManyYieldStates,
     TooManyBlocks,
     UnreachableBlock,
+    InvalidForwardPreflight,
 };
 
 struct VerifyIssue {
@@ -1009,11 +1011,131 @@ inline VerifyResult verify_module(const Module& mod, VerifyOptions options = {})
     if (!redirect_policy_table_valid(mod.redirect_policies, mod.redirect_policy_count))
         return verify_fail(summary, VerifyIssueCode::InvalidRedirectPolicyId, 0);
 
+    if (mod.response_policy_count > kMaxResponsePolicies ||
+        mod.failure_policy_count > kMaxForwardFailurePolicies ||
+        mod.policy_bundle_count > kMaxForwardFailurePolicies)
+        return verify_fail(summary, VerifyIssueCode::InvalidForwardPreflight, 0);
+    bool module_has_response_read_timeout = false;
+    for (u32 i = 0; i < mod.policy_bundle_count; i++) {
+        const auto& bundle = mod.policy_bundles[i];
+        const u8 seconds = bundle.response_read_timeout_seconds;
+        if ((bundle.response_policy_id != 0 &&
+             (bundle.response_policy_id > mod.response_policy_count ||
+              !response_policy_spec_valid(mod.response_policies[bundle.response_policy_id - 1]))) ||
+            (bundle.failure_policy_id != 0 &&
+             (bundle.failure_policy_id > mod.failure_policy_count ||
+              !forward_failure_policy_spec_valid(
+                  mod.failure_policies[bundle.failure_policy_id - 1]))) ||
+            (seconds != 0 && !response_read_timeout_seconds_valid(seconds)) ||
+            (seconds == 0 && bundle.failure_policy_id == 0))
+            return verify_fail(summary, VerifyIssueCode::InvalidForwardPreflight, 0);
+        if (bundle.timeout_failure_policy_id != 0) {
+            if (bundle.response_policy_id == 0 || bundle.failure_policy_id == 0 ||
+                bundle.timeout_failure_policy_id > mod.failure_policy_count ||
+                !forward_timeout_failure_policy_spec_valid(
+                    mod.failure_policies[bundle.timeout_failure_policy_id - 1]))
+                return verify_fail(summary, VerifyIssueCode::InvalidForwardPreflight, 0);
+            const bool response_suppress =
+                mod.response_policies[bundle.response_policy_id - 1].head_mode ==
+                ResponsePolicyHeadMode::SuppressBody;
+            const bool failure_suppress =
+                mod.failure_policies[bundle.failure_policy_id - 1].head_mode ==
+                FailurePolicyHeadMode::SuppressBody;
+            const bool timeout_suppress =
+                mod.failure_policies[bundle.timeout_failure_policy_id - 1].head_mode ==
+                FailurePolicyHeadMode::SuppressBody;
+            if (response_suppress != failure_suppress || failure_suppress != timeout_suppress)
+                return verify_fail(summary, VerifyIssueCode::InvalidForwardPreflight, 0);
+        }
+        if (seconds != 0) module_has_response_read_timeout = true;
+    }
+
     if (mod.func_count > 0 && mod.functions == nullptr) {
         return verify_fail(summary, VerifyIssueCode::MissingFunction, 0);
     }
 
     for (u32 fi = 0; fi < mod.func_count; fi++) {
+        const Function& fn = mod.functions[fi];
+        const u16 preflight_id = fn.preflight_forward_policy_bundle_id;
+        const bool has_preflight = preflight_id != 0;
+        if (has_preflight &&
+            (preflight_id > mod.policy_bundle_count ||
+             !response_read_timeout_seconds_valid(
+                 mod.policy_bundles[preflight_id - 1].response_read_timeout_seconds)))
+            return verify_fail(summary, VerifyIssueCode::InvalidForwardPreflight, fi);
+
+        const Instruction* sole_timeout_ret = nullptr;
+        u32 sole_timeout_block = 0;
+        auto const_i32 = [&](ValueId id, i32* out) {
+            if (out == nullptr || id == kNoValue || id.id >= fn.value_count || fn.values == nullptr)
+                return false;
+            const Value& value = fn.values[id.id];
+            if (value.def_block.id >= fn.block_count || fn.blocks == nullptr) return false;
+            const Block& block = fn.blocks[value.def_block.id];
+            if (block.insts == nullptr || value.def_inst >= block.inst_count) return false;
+            const Instruction& def = block.insts[value.def_inst];
+            if (def.op != Opcode::ConstI32 || def.result != id || def.operand_count != 0)
+                return false;
+            *out = def.imm.i32_val;
+            return true;
+        };
+        for (u32 bi = 0; bi < fn.block_count; bi++) {
+            const Block& block = fn.blocks[bi];
+            if (block.insts == nullptr) continue;
+            for (u32 ii = 0; ii < block.inst_count; ii++) {
+                const Instruction& inst = block.insts[ii];
+                if (inst.op != Opcode::RetForwardBundle) continue;
+                if (inst.operand_count != 3)
+                    return verify_fail(
+                        summary, VerifyIssueCode::InvalidForwardPreflight, fi, bi, ii);
+                i32 upstream = -1;
+                i32 request_policy = -1;
+                i32 bundle_id = -1;
+                const bool static_operands =
+                    const_i32(inst.operand(0), &upstream) &&
+                    const_i32(inst.operand(1), &request_policy) &&
+                    const_i32(inst.operand(2), &bundle_id) && upstream >= 0 &&
+                    static_cast<u64>(upstream) < mod.upstream_count && request_policy >= 0 &&
+                    request_policy <= 0xffff &&
+                    (request_policy == 0 ||
+                     request_policy_is_supported(static_cast<u16>(request_policy))) &&
+                    bundle_id > 0 && static_cast<u64>(bundle_id) <= mod.policy_bundle_count;
+                if (!static_operands) {
+                    if (has_preflight || module_has_response_read_timeout)
+                        return verify_fail(
+                            summary, VerifyIssueCode::InvalidForwardPreflight, fi, bi, ii);
+                    continue;
+                }
+                const bool duration = response_read_timeout_seconds_valid(
+                    mod.policy_bundles[bundle_id - 1].response_read_timeout_seconds);
+                if (!duration) continue;
+                if (sole_timeout_ret != nullptr || !has_preflight || bundle_id != preflight_id)
+                    return verify_fail(summary,
+                                       VerifyIssueCode::InvalidForwardPreflight,
+                                       fi,
+                                       bi,
+                                       ii,
+                                       static_cast<u32>(bundle_id));
+                sole_timeout_ret = &inst;
+                sole_timeout_block = bi;
+            }
+        }
+        if (has_preflight) {
+            if (sole_timeout_ret == nullptr || fn.is_timer || fn.block_count != 1 ||
+                sole_timeout_block != 0 || fn.blocks == nullptr || fn.blocks[0].inst_count < 4 ||
+                fn.yield_count != 0 || fn.state_zero_enters_entry ||
+                fn.has_explicit_resume_blocks || fn.rate_limit.count != 0 ||
+                fn.throttle_down_bps != 0)
+                return verify_fail(summary, VerifyIssueCode::InvalidForwardPreflight, fi);
+            const Block& block = fn.blocks[0];
+            for (u32 ii = 0; ii + 1 < block.inst_count; ii++) {
+                if (block.insts[ii].op != Opcode::ConstI32)
+                    return verify_fail(
+                        summary, VerifyIssueCode::InvalidForwardPreflight, fi, 0, ii);
+            }
+            if (&block.insts[block.inst_count - 1] != sole_timeout_ret)
+                return verify_fail(summary, VerifyIssueCode::InvalidForwardPreflight, fi);
+        }
         for (u32 bi = 0; bi < mod.functions[fi].block_count; bi++) {
             const auto& block = mod.functions[fi].blocks[bi];
             if (block.inst_count == 0 || block.insts == nullptr) continue;
@@ -1105,6 +1227,8 @@ inline const char* verify_issue_code_name(VerifyIssueCode code) {
             return "TooManyBlocks";
         case VerifyIssueCode::UnreachableBlock:
             return "UnreachableBlock";
+        case VerifyIssueCode::InvalidForwardPreflight:
+            return "InvalidForwardPreflight";
     }
     return "Unknown";
 }

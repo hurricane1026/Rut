@@ -34,7 +34,14 @@ struct ForwardPolicyBundle {
     // Optional cause-specific timeout policy. Zero preserves the original
     // response/default-failure bundle shape and behavior.
     u16 timeout_failure_policy_id = 0;
+    // Optional per-forward upstream response-read inactivity interval. Zero is
+    // internal absence; the current TimerWheel representation is exact 1..63s.
+    u8 response_read_timeout_seconds = 0;
 };
+
+inline bool response_read_timeout_seconds_valid(u8 seconds) {
+    return seconds >= 1 && seconds <= 63;
+}
 
 inline bool failure_policy_safe_text(Str value, u32 cap, bool allow_empty = false) {
     if ((value.ptr == nullptr && !(allow_empty && value.len == 0)) || value.len > cap ||

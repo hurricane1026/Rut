@@ -285,6 +285,8 @@ struct AstStatement {
     bool has_forward_failure_policy = false;
     u16 forward_timeout_failure_policy_id = 0;
     bool has_forward_timeout_failure_policy = false;
+    u8 forward_response_read_timeout_seconds = 0;
+    bool has_forward_response_read_timeout = false;
     // `return redirect({...})`: immutable redirect policy table id (1-based).
     u16 redirect_policy_id = 0;
     bool has_redirect_policy = false;

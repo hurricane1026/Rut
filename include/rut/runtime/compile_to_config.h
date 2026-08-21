@@ -50,10 +50,12 @@
 
 #include "rut/compiler/hir.h"  // HirModule::kMaxTimers (frontend timer cap)
 #include "rut/compiler/rir.h"
+#include "rut/compiler/verifier.h"
 #include "rut/jit/codegen.h"
 #include "rut/jit/jit_engine.h"
 #include "rut/runtime/cache_table.h"
 #include "rut/runtime/route_table.h"
+#include <new>
 
 namespace rut {
 
@@ -133,9 +135,22 @@ inline bool register_jit_routes(RouteConfig& cfg, const rir::Module& mod, jit::J
     // Guard on BOTH tables: a timer-only module never bumps route_count, so a
     // route_count-only precondition would let a second call re-append the same
     // timers (firing them twice per interval).
-    if (cfg.route_count != 0 || cfg.timer_count != 0) return false;
-    if (!configure_route_dispatch(cfg, mod)) return false;
+    if (cfg.route_count != 0 || cfg.timer_count != 0 || !rir::verify_module(mod).ok ||
+        mod.func_count > RouteConfig::kMaxRoutes + RouteConfig::kMaxTimers)
+        return false;
+    if (cfg.policy_bundle_count != mod.policy_bundle_count) return false;
+    for (u32 i = 0; i < mod.policy_bundle_count; i++) {
+        const auto& expected = mod.policy_bundles[i];
+        const auto& actual = cfg.policy_bundles[i];
+        if (!cfg.policy_bundle_id_is_valid(static_cast<u16>(i + 1)) ||
+            expected.response_policy_id != actual.response_policy_id ||
+            expected.failure_policy_id != actual.failure_policy_id ||
+            expected.timeout_failure_policy_id != actual.timeout_failure_policy_id ||
+            expected.response_read_timeout_seconds != actual.response_read_timeout_seconds)
+            return false;
+    }
 
+    jit::HandlerFn handlers[RouteConfig::kMaxRoutes + RouteConfig::kMaxTimers]{};
     for (u32 i = 0; i < mod.func_count; i++) {
         const auto& fn = mod.functions[i];
         if (fn.route_pattern.len >= RouteEntry::kMaxPathLen) return false;
@@ -146,47 +161,68 @@ inline bool register_jit_routes(RouteConfig& cfg, const rir::Module& mod, jit::J
         jit::format_handler_symbol(fn.name, symbol, sizeof(symbol));
         auto* addr = engine.lookup(symbol);
         if (!addr) return false;
-        auto handler = reinterpret_cast<jit::HandlerFn>(addr);
-
-        // A timer compiles like a route but is fired on schedule, not matched
-        // against requests: register it into the timer table (route_pattern holds
-        // the timer name) and skip route registration.
-        if (fn.is_timer) {
-            if (!cfg.add_timer(fn.route_pattern.ptr,
-                               fn.route_pattern.len,
-                               fn.timer_interval_ms,
-                               handler,
-                               fn.timer_shard))
-                return false;
-            continue;
-        }
-
-        char path[RouteEntry::kMaxPathLen];
-        for (u32 j = 0; j < fn.route_pattern.len; j++) path[j] = fn.route_pattern.ptr[j];
-        path[fn.route_pattern.len] = '\0';
-
-        if (!cfg.add_jit_handler(path, fn.http_method, handler, rir_function_needs_req_body(fn)))
-            return false;
-        // @rateLimit decorators → stacked token-bucket rules, each with its own
-        // metering key (the route just added is at index route_count - 1).
-        if (fn.rate_limit.count > 0) {
-            const u32 kRouteIdx = cfg.route_count - 1;
-            for (u32 ri = 0; ri < fn.rate_limit.count; ri++) {
-                const RateLimitRule& rule = fn.rate_limit.rules[ri];
-                cfg.add_route_rate_limit_rule(
-                    kRouteIdx, rule.max, rule.window_sec, rule.scope, rule.burst);
-                for (u32 ki = 0; ki < rule.key.count; ki++) {
-                    const RateLimitKeyComponent& kc = rule.key.comps[ki];
-                    cfg.add_route_rate_limit_key(kRouteIdx, kc.kind, kc.name, kc.name_len);
-                }
-            }
-        }
-        if (fn.throttle_down_bps > 0) {
-            cfg.set_route_throttle(cfg.route_count - 1, fn.throttle_down_bps);
-        }
+        handlers[i] = reinterpret_cast<jit::HandlerFn>(addr);
     }
 
-    return true;
+    auto replay = [&](RouteConfig& target) {
+        if (!configure_route_dispatch(target, mod)) return false;
+        for (u32 i = 0; i < mod.func_count; i++) {
+            const auto& fn = mod.functions[i];
+            const auto handler = handlers[i];
+
+            // A timer compiles like a route but is fired on schedule, not matched
+            // against requests: register it into the timer table (route_pattern holds
+            // the timer name) and skip route registration.
+            if (fn.is_timer) {
+                if (!target.add_timer(fn.route_pattern.ptr,
+                                      fn.route_pattern.len,
+                                      fn.timer_interval_ms,
+                                      handler,
+                                      fn.timer_shard))
+                    return false;
+                continue;
+            }
+
+            char path[RouteEntry::kMaxPathLen];
+            for (u32 j = 0; j < fn.route_pattern.len; j++) path[j] = fn.route_pattern.ptr[j];
+            path[fn.route_pattern.len] = '\0';
+
+            if (!target.add_jit_handler(path,
+                                        fn.http_method,
+                                        handler,
+                                        rir_function_needs_req_body(fn),
+                                        fn.preflight_forward_policy_bundle_id))
+                return false;
+            // @rateLimit decorators → stacked token-bucket rules, each with its own
+            // metering key (the route just added is at index route_count - 1).
+            if (fn.rate_limit.count > 0) {
+                const u32 kRouteIdx = target.route_count - 1;
+                for (u32 ri = 0; ri < fn.rate_limit.count; ri++) {
+                    const RateLimitRule& rule = fn.rate_limit.rules[ri];
+                    if (!target.add_route_rate_limit_rule(
+                            kRouteIdx, rule.max, rule.window_sec, rule.scope, rule.burst))
+                        return false;
+                    for (u32 ki = 0; ki < rule.key.count; ki++) {
+                        const RateLimitKeyComponent& kc = rule.key.comps[ki];
+                        if (!target.add_route_rate_limit_key(
+                                kRouteIdx, kc.kind, kc.name, kc.name_len))
+                            return false;
+                    }
+                }
+            }
+            if (fn.throttle_down_bps > 0 &&
+                !target.set_route_throttle(target.route_count - 1, fn.throttle_down_bps))
+                return false;
+        }
+        return true;
+    };
+
+    RouteConfig* probe = new (std::nothrow) RouteConfig();
+    if (probe == nullptr) return false;
+    const bool staged = replay(*probe);
+    delete probe;
+    if (!staged) return false;
+    return replay(cfg);
 }
 
 // Step 5 of the documented flow (file docstring): publish the config's Cache
@@ -211,6 +247,7 @@ inline bool populate_route_config(RouteConfig& cfg, const rir::Module& mod) {
     // Bodies / header sets / routes must always start empty — there's
     // no "merge" semantics for those tables, and a non-zero count
     // would break the compile-time body_idx / headers_idx invariants.
+    if (!rir::verify_module(mod).ok) return false;
     if (cfg.route_count != 0 || cfg.response_body_count != 0 ||
         cfg.response_header_set_count != 0 || cfg.response_policy_count != 0 ||
         cfg.failure_policy_count != 0 || cfg.policy_bundle_count != 0 ||
@@ -249,20 +286,23 @@ inline bool populate_route_config(RouteConfig& cfg, const rir::Module& mod) {
     for (u32 i = 0; i < mod.failure_policy_count; i++) {
         if (!forward_failure_policy_table_spec_valid(mod.failure_policies[i])) return false;
     }
-    // A failure policy can stand alone.  A zero response-policy id is the
-    // explicit absence of response serialization, not an invalid table ref;
-    // the failure id itself remains mandatory and must resolve above.
+    // A failure policy can stand alone. A duration also makes a bundle
+    // meaningful without either response policy; an all-zero bundle is invalid.
     for (u32 i = 0; i < mod.policy_bundle_count; i++) {
         const auto& bundle = mod.policy_bundles[i];
-        if (bundle.failure_policy_id == 0 || bundle.failure_policy_id > mod.failure_policy_count ||
-            !forward_failure_policy_spec_valid(
-                mod.failure_policies[bundle.failure_policy_id - 1]) ||
+        if ((bundle.failure_policy_id != 0 &&
+             (bundle.failure_policy_id > mod.failure_policy_count ||
+              !forward_failure_policy_spec_valid(
+                  mod.failure_policies[bundle.failure_policy_id - 1]))) ||
             (bundle.response_policy_id != 0 &&
              (bundle.response_policy_id > mod.response_policy_count ||
-              !response_policy_spec_valid(mod.response_policies[bundle.response_policy_id - 1]))))
+              !response_policy_spec_valid(mod.response_policies[bundle.response_policy_id - 1]))) ||
+            (bundle.response_read_timeout_seconds != 0 &&
+             !response_read_timeout_seconds_valid(bundle.response_read_timeout_seconds)) ||
+            (bundle.response_read_timeout_seconds == 0 && bundle.failure_policy_id == 0))
             return false;
         if (bundle.timeout_failure_policy_id != 0) {
-            if (bundle.response_policy_id == 0 ||
+            if (bundle.response_policy_id == 0 || bundle.failure_policy_id == 0 ||
                 bundle.timeout_failure_policy_id > mod.failure_policy_count ||
                 !forward_timeout_failure_policy_spec_valid(
                     mod.failure_policies[bundle.timeout_failure_policy_id - 1]))
@@ -427,8 +467,10 @@ inline bool populate_route_config(RouteConfig& cfg, const rir::Module& mod) {
     }
     for (u32 i = 0; i < mod.policy_bundle_count; i++) {
         const auto& bundle = mod.policy_bundles[i];
-        u16 idx = cfg.add_policy_bundle(
-            bundle.response_policy_id, bundle.failure_policy_id, bundle.timeout_failure_policy_id);
+        u16 idx = cfg.add_policy_bundle(bundle.response_policy_id,
+                                        bundle.failure_policy_id,
+                                        bundle.timeout_failure_policy_id,
+                                        bundle.response_read_timeout_seconds);
         if (idx == 0 || idx != i + 1) return false;
     }
     // Cache instance descriptors — declaration order defines the instance
