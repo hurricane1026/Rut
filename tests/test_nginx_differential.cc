@@ -792,6 +792,35 @@ struct Recorder {
 // request, and deliberately delays the representation body after the response
 // headers so a HEAD leak cannot be hidden by coalescing.
 struct KeepAlivePinnedRecorder {
+    enum class FirstResponseMode : uint8_t {
+        Normal,
+        InvalidHeaderWaitPeerClose,
+        IncompleteWaitGate,
+    };
+    enum class ActiveWaitKind : uint8_t {
+        None,
+        InvalidHeaderPeerClose,
+        IncompleteGate,
+        IncompleteAbortHold,
+    };
+    enum class IncompleteGateState : uint8_t {
+        Idle,
+        SentOpenWaitingGate,
+        SendFailed,
+        PeerClosedBeforeGate,
+        UnexpectedDataBeforeGate,
+        ProbeFailed,
+        ClosedByGate,
+        Aborted,
+    };
+    enum class IncompleteGateCommand : uint8_t {
+        Wait,
+        Close,
+        Abort,
+    };
+    explicit KeepAlivePinnedRecorder(
+        FirstResponseMode mode = FirstResponseMode::Normal)
+        : first_response_mode(mode) {}
     struct Entry {
         u32 connection_id = 0;
         std::vector<char> wire;
@@ -802,7 +831,7 @@ struct KeepAlivePinnedRecorder {
         std::vector<char> wire;
         size_t parsed = 0;
         bool body_pending = false;
-        bool malformed_waiting_peer_close = false;
+        ActiveWaitKind wait_kind = ActiveWaitKind::None;
         std::chrono::steady_clock::time_point body_due{};
     };
 
@@ -813,15 +842,17 @@ struct KeepAlivePinnedRecorder {
     std::atomic<u32> requests{0};
     std::vector<Entry> history;
     u32 body_delay_ms = 250;
-    // Default-off observable malformed-response mode. It deliberately reports
-    // only origin socket behavior; exact io_uring owner-mask evidence belongs
-    // to the focused runtime tests.
-    bool malformed_first = false;
+    // Immutable after setup. These test-only modes deliberately report only
+    // observable origin socket behavior; exact io_uring ownership evidence
+    // belongs to the focused runtime tests.
+    const FirstResponseMode first_response_mode;
     std::atomic<bool> first_malformed_sent_open{false};
     std::atomic<bool> first_malformed_send_failed{false};
     std::atomic<bool> first_peer_closed{false};
     std::atomic<bool> first_peer_unexpected_data{false};
     std::atomic<bool> first_peer_observation_failed{false};
+    std::atomic<IncompleteGateState> incomplete_gate_state{IncompleteGateState::Idle};
+    std::atomic<IncompleteGateCommand> incomplete_gate_command{IncompleteGateCommand::Wait};
     pthread_t thread{};
     bool thread_started = false;
 
@@ -846,17 +877,38 @@ struct KeepAlivePinnedRecorder {
 
     static bool send_head_body(int fd) { return send_all(fd, "hello", 5); }
 
+    enum class PeerProbe : uint8_t {
+        Open,
+        Closed,
+        UnexpectedData,
+        Failed,
+    };
+
+    static PeerProbe probe_peer_nonblocking(int fd) {
+        char byte = 0;
+        ssize_t n;
+        do {
+            n = recv(fd, &byte, 1, MSG_PEEK | MSG_DONTWAIT);
+        } while (n < 0 && errno == EINTR);
+        if (n == 0 || (n < 0 && errno == ECONNRESET)) return PeerProbe::Closed;
+        if (n > 0) return PeerProbe::UnexpectedData;
+        if (errno == EAGAIN || errno == EWOULDBLOCK) return PeerProbe::Open;
+        return PeerProbe::Failed;
+    }
+
     static bool process_next_request(KeepAlivePinnedRecorder& self,
                                      Active& item,
                                      std::chrono::steady_clock::time_point now) {
         const size_t end = find_header_end(item.wire, item.parsed);
         if (end == 0) return true;
+        const bool first_request = self.requests.load(std::memory_order_relaxed) == 0;
         std::vector<char> request(item.wire.begin() + item.parsed,
                                   item.wire.begin() + end);
         self.history.push_back({item.connection_id, request});
         self.requests.fetch_add(1, std::memory_order_release);
         item.parsed = end;
-        if (self.malformed_first && self.history.size() == 1) {
+        if (self.first_response_mode == FirstResponseMode::InvalidHeaderWaitPeerClose &&
+            first_request) {
             static constexpr char kMalformed[] = "HTTP/1.1 200 OK\r\n:\r\n\r\n";
             if (item.wire.size() != end) {
                 self.first_peer_unexpected_data.store(true, std::memory_order_release);
@@ -866,8 +918,39 @@ struct KeepAlivePinnedRecorder {
                 self.first_malformed_send_failed.store(true, std::memory_order_release);
                 return false;
             }
-            item.malformed_waiting_peer_close = true;
+            item.wait_kind = ActiveWaitKind::InvalidHeaderPeerClose;
             self.first_malformed_sent_open.store(true, std::memory_order_release);
+            return true;
+        }
+        if (self.first_response_mode == FirstResponseMode::IncompleteWaitGate &&
+            first_request) {
+            static constexpr char kIncomplete[] =
+                "HTTP/1.1 200 OK\r\nContent-Length: 7\r\n";
+            if (self.incomplete_gate_command.load(std::memory_order_acquire) ==
+                IncompleteGateCommand::Abort) {
+                item.wait_kind = ActiveWaitKind::IncompleteAbortHold;
+                return true;
+            }
+            if (item.wire.size() != end) {
+                self.incomplete_gate_state.store(
+                    IncompleteGateState::UnexpectedDataBeforeGate, std::memory_order_release);
+                item.wait_kind = ActiveWaitKind::IncompleteAbortHold;
+                return true;
+            }
+            if (!send_all(item.fd, kIncomplete, sizeof(kIncomplete) - 1)) {
+                self.incomplete_gate_state.store(
+                    IncompleteGateState::SendFailed, std::memory_order_release);
+                item.wait_kind = ActiveWaitKind::IncompleteAbortHold;
+                return true;
+            }
+            item.wait_kind = ActiveWaitKind::IncompleteGate;
+            if (self.incomplete_gate_command.load(std::memory_order_acquire) ==
+                IncompleteGateCommand::Abort) {
+                item.wait_kind = ActiveWaitKind::IncompleteAbortHold;
+            } else {
+                self.incomplete_gate_state.store(
+                    IncompleteGateState::SentOpenWaitingGate, std::memory_order_release);
+            }
             return true;
         }
         if (!send_head_response(item.fd)) return false;
@@ -880,7 +963,25 @@ struct KeepAlivePinnedRecorder {
         auto* self = static_cast<KeepAlivePinnedRecorder*>(opaque);
         std::vector<Active> active;
         u32 next_connection_id = 1;
+        const auto acknowledge_incomplete_abort = [&]() {
+            if (self->first_response_mode != FirstResponseMode::IncompleteWaitGate ||
+                self->incomplete_gate_command.load(std::memory_order_acquire) !=
+                    IncompleteGateCommand::Abort ||
+                self->incomplete_gate_state.load(std::memory_order_acquire) ==
+                    IncompleteGateState::ClosedByGate)
+                return;
+            for (auto& item : active) {
+                if (item.wait_kind == ActiveWaitKind::None ||
+                    item.wait_kind == ActiveWaitKind::IncompleteGate)
+                    item.wait_kind = ActiveWaitKind::IncompleteAbortHold;
+            }
+            // This release is the recorder-thread acknowledgement: every live
+            // incomplete item is parked before callers may tear down the proxy.
+            self->incomplete_gate_state.store(
+                IncompleteGateState::Aborted, std::memory_order_release);
+        };
         while (self->running.load(std::memory_order_acquire)) {
+            acknowledge_incomplete_abort();
             std::vector<pollfd> polls;
             polls.reserve(active.size() + 1);
             polls.push_back({self->listen_fd, POLLIN, 0});
@@ -891,8 +992,11 @@ struct KeepAlivePinnedRecorder {
                 if (errno == EINTR) continue;
                 break;
             }
+            acknowledge_incomplete_abort();
 
-            if (polls[0].revents & POLLIN) {
+            if (self->incomplete_gate_command.load(std::memory_order_acquire) !=
+                    IncompleteGateCommand::Abort &&
+                (polls[0].revents & POLLIN)) {
                 for (;;) {
                     const int client = accept(self->listen_fd, nullptr, nullptr);
                     if (client < 0) {
@@ -905,7 +1009,8 @@ struct KeepAlivePinnedRecorder {
                     (void)setsockopt(client, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
                     (void)setsockopt(client, SOL_SOCKET, SO_SNDTIMEO, &timeout, sizeof(timeout));
                     const u32 id = next_connection_id++;
-                    active.push_back({client, id, {}, 0, false, false, {}});
+                    active.push_back(
+                        {client, id, {}, 0, false, ActiveWaitKind::None, {}});
                     self->accepted.fetch_add(1, std::memory_order_release);
                 }
             }
@@ -915,15 +1020,71 @@ struct KeepAlivePinnedRecorder {
                 Active& item = active[index - 1];
                 const size_t poll_index = index;
                 bool remove = false;
-                if (item.body_pending && now >= item.body_due) {
+                acknowledge_incomplete_abort();
+                if (item.wait_kind == ActiveWaitKind::IncompleteGate) {
+                    IncompleteGateCommand command =
+                        self->incomplete_gate_command.load(std::memory_order_acquire);
+                    if (command == IncompleteGateCommand::Abort) {
+                        item.wait_kind = ActiveWaitKind::IncompleteAbortHold;
+                        acknowledge_incomplete_abort();
+                    } else {
+                        PeerProbe probe = probe_peer_nonblocking(item.fd);
+                        if (probe == PeerProbe::Open &&
+                            (polls[poll_index].revents & POLLHUP))
+                            probe = PeerProbe::Closed;
+                        if (probe == PeerProbe::Open &&
+                            (polls[poll_index].revents & POLLERR))
+                            probe = PeerProbe::Failed;
+                        // Abort wins over any observation made by a probe that
+                        // was already in progress when teardown requested it.
+                        command =
+                            self->incomplete_gate_command.load(std::memory_order_acquire);
+                        if (command == IncompleteGateCommand::Abort) {
+                            item.wait_kind = ActiveWaitKind::IncompleteAbortHold;
+                            acknowledge_incomplete_abort();
+                        } else if (probe == PeerProbe::Closed) {
+                            item.wait_kind = ActiveWaitKind::IncompleteAbortHold;
+                            self->incomplete_gate_state.store(
+                                IncompleteGateState::PeerClosedBeforeGate,
+                                std::memory_order_release);
+                            acknowledge_incomplete_abort();
+                        } else if (probe == PeerProbe::UnexpectedData) {
+                            item.wait_kind = ActiveWaitKind::IncompleteAbortHold;
+                            self->incomplete_gate_state.store(
+                                IncompleteGateState::UnexpectedDataBeforeGate,
+                                std::memory_order_release);
+                            acknowledge_incomplete_abort();
+                        } else if (probe == PeerProbe::Failed) {
+                            item.wait_kind = ActiveWaitKind::IncompleteAbortHold;
+                            self->incomplete_gate_state.store(
+                                IncompleteGateState::ProbeFailed, std::memory_order_release);
+                            acknowledge_incomplete_abort();
+                        } else if (command == IncompleteGateCommand::Close) {
+                            // The final open/no-data probe and the close occur in
+                            // the recorder thread. ClosedByGate proves only that
+                            // the authorized close happened; the downstream 502
+                            // is the observable evidence that EOF was consumed.
+                            const int fd = item.fd;
+                            item.fd = -1;
+                            (void)close(fd);
+                            self->incomplete_gate_state.store(
+                                IncompleteGateState::ClosedByGate,
+                                std::memory_order_release);
+                            remove = true;
+                        }
+                    }
+                }
+                if (item.wait_kind != ActiveWaitKind::IncompleteAbortHold &&
+                    item.body_pending && now >= item.body_due) {
                     if (!send_head_body(item.fd)) remove = true;
                     item.body_pending = false;
                     // A second request may already be in the same upstream
                     // recv buffer. Consume at most one complete header now;
                     // do not rely on a future POLLIN edge for buffered data.
                     if (!remove && !process_next_request(*self, item, now)) remove = true;
+                    acknowledge_incomplete_abort();
                 }
-                if (!remove && item.malformed_waiting_peer_close &&
+                if (!remove && item.wait_kind == ActiveWaitKind::InvalidHeaderPeerClose &&
                     (polls[poll_index].revents & (POLLIN | POLLERR | POLLHUP))) {
                     char unexpected[256];
                     const ssize_t n = recv(item.fd, unexpected, sizeof(unexpected), 0);
@@ -942,24 +1103,49 @@ struct KeepAlivePinnedRecorder {
                         remove = true;
                     }
                 }
-                if (!remove && !item.body_pending && !item.malformed_waiting_peer_close &&
+                if (!remove && !item.body_pending &&
+                    item.wait_kind == ActiveWaitKind::None &&
                     (polls[poll_index].revents & POLLIN)) {
                     char buf[4096];
                     const ssize_t n = recv(item.fd, buf, sizeof(buf), 0);
                     if (n > 0) {
                         item.wire.insert(item.wire.end(), buf, buf + n);
                         if (!process_next_request(*self, item, now)) remove = true;
+                        acknowledge_incomplete_abort();
                     } else if (n == 0 || (n < 0 && errno != EINTR && errno != EAGAIN &&
                                           errno != EWOULDBLOCK)) {
                         remove = true;
                     }
                 }
-                if (!remove && (polls[poll_index].revents & (POLLERR | POLLHUP))) remove = true;
+                if (!remove && item.wait_kind == ActiveWaitKind::None &&
+                    (polls[poll_index].revents & (POLLERR | POLLHUP)))
+                    remove = true;
                 if (remove) {
-                    shutdown(item.fd, SHUT_RDWR);
-                    close(item.fd);
+                    if (item.fd >= 0) {
+                        shutdown(item.fd, SHUT_RDWR);
+                        close(item.fd);
+                    }
                     active.erase(active.begin() + static_cast<ptrdiff_t>(index - 1));
                 }
+            }
+            acknowledge_incomplete_abort();
+        }
+        if (self->first_response_mode == FirstResponseMode::IncompleteWaitGate) {
+            const IncompleteGateState state =
+                self->incomplete_gate_state.load(std::memory_order_acquire);
+            const bool abort_requested =
+                self->incomplete_gate_command.load(std::memory_order_acquire) ==
+                IncompleteGateCommand::Abort;
+            if ((abort_requested && state != IncompleteGateState::ClosedByGate) ||
+                state == IncompleteGateState::Idle ||
+                state == IncompleteGateState::SentOpenWaitingGate) {
+                for (auto& item : active) {
+                    if (item.wait_kind == ActiveWaitKind::None ||
+                        item.wait_kind == ActiveWaitKind::IncompleteGate)
+                        item.wait_kind = ActiveWaitKind::IncompleteAbortHold;
+                }
+                self->incomplete_gate_state.store(
+                    IncompleteGateState::Aborted, std::memory_order_release);
             }
         }
         for (auto& item : active) {
@@ -1009,6 +1195,8 @@ struct KeepAlivePinnedRecorder {
         first_peer_closed.store(false, std::memory_order_relaxed);
         first_peer_unexpected_data.store(false, std::memory_order_relaxed);
         first_peer_observation_failed.store(false, std::memory_order_relaxed);
+        incomplete_gate_state.store(IncompleteGateState::Idle, std::memory_order_relaxed);
+        incomplete_gate_command.store(IncompleteGateCommand::Wait, std::memory_order_relaxed);
         running.store(true, std::memory_order_release);
         if (pthread_create(&thread, nullptr, &KeepAlivePinnedRecorder::run, this) != 0) {
             running.store(false, std::memory_order_release);
@@ -1020,7 +1208,15 @@ struct KeepAlivePinnedRecorder {
         return true;
     }
 
+    void abort_incomplete_gate() {
+        if (first_response_mode != FirstResponseMode::IncompleteWaitGate) return;
+        // Only the recorder thread may acknowledge Aborted after parking its
+        // active item. Callers publish the command and wait for that release.
+        incomplete_gate_command.store(IncompleteGateCommand::Abort, std::memory_order_release);
+    }
+
     void stop() {
+        abort_incomplete_gate();
         running.store(false, std::memory_order_release);
         if (thread_started) {
             pthread_join(thread, nullptr);
@@ -1173,6 +1369,200 @@ static bool exercise_malformed_head_reuse(u16 frontend_port,
         !recorder.first_malformed_sent_open.load(std::memory_order_acquire) ||
         !recorder.first_peer_closed.load(std::memory_order_acquire)) {
         error = std::string(side) + " malformed phase saw extra or incomplete origin activity";
+        return false;
+    }
+    return true;
+}
+
+static const char* incomplete_gate_state_name(
+    KeepAlivePinnedRecorder::IncompleteGateState state) {
+    using State = KeepAlivePinnedRecorder::IncompleteGateState;
+    switch (state) {
+        case State::Idle:
+            return "Idle";
+        case State::SentOpenWaitingGate:
+            return "SentOpenWaitingGate";
+        case State::SendFailed:
+            return "SendFailed";
+        case State::PeerClosedBeforeGate:
+            return "PeerClosedBeforeGate";
+        case State::UnexpectedDataBeforeGate:
+            return "UnexpectedDataBeforeGate";
+        case State::ProbeFailed:
+            return "ProbeFailed";
+        case State::ClosedByGate:
+            return "ClosedByGate";
+        case State::Aborted:
+            return "Aborted";
+    }
+    return "unknown";
+}
+
+static bool wait_incomplete_gate_state(
+    KeepAlivePinnedRecorder& recorder,
+    KeepAlivePinnedRecorder::IncompleteGateState expected,
+    std::string& error) {
+    using State = KeepAlivePinnedRecorder::IncompleteGateState;
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+    while (std::chrono::steady_clock::now() < deadline) {
+        const State state = recorder.incomplete_gate_state.load(std::memory_order_acquire);
+        if (state == expected) return true;
+        const bool transitional =
+            expected == State::SentOpenWaitingGate
+                ? state == State::Idle
+                : state == State::SentOpenWaitingGate;
+        if (!transitional) {
+            error = std::string("incomplete origin gate entered ") +
+                    incomplete_gate_state_name(state) + " while waiting for " +
+                    incomplete_gate_state_name(expected);
+            return false;
+        }
+        if (recorder.accepted.load(std::memory_order_acquire) > 1 ||
+            recorder.requests.load(std::memory_order_acquire) > 1) {
+            error = "unexpected upstream activity occurred before incomplete gate completion";
+            return false;
+        }
+        usleep(5000);
+    }
+    error = std::string("deadline waiting for incomplete origin gate state ") +
+            incomplete_gate_state_name(expected);
+    return false;
+}
+
+static bool abort_incomplete_gate_and_wait(KeepAlivePinnedRecorder& recorder,
+                                           std::chrono::milliseconds budget) {
+    using State = KeepAlivePinnedRecorder::IncompleteGateState;
+    if (recorder.incomplete_gate_state.load(std::memory_order_acquire) ==
+        State::ClosedByGate)
+        return true;
+    recorder.abort_incomplete_gate();
+    const auto deadline = std::chrono::steady_clock::now() + budget;
+    while (std::chrono::steady_clock::now() < deadline) {
+        const State state = recorder.incomplete_gate_state.load(std::memory_order_acquire);
+        if (state == State::Aborted || state == State::ClosedByGate) return true;
+        usleep(5000);
+    }
+    return false;
+}
+
+static bool exercise_incomplete_eof_head_reuse(
+    u16 frontend_port,
+    KeepAlivePinnedRecorder& recorder,
+    const char* side,
+    std::vector<std::vector<char>>& responses,
+    std::string& error) {
+    using Command = KeepAlivePinnedRecorder::IncompleteGateCommand;
+    using State = KeepAlivePinnedRecorder::IncompleteGateState;
+    struct ClientGuard {
+        int fd = -1;
+        ~ClientGuard() {
+            if (fd >= 0) close(fd);
+        }
+    } client{connect_once(frontend_port)};
+    struct GateAbortGuard {
+        KeepAlivePinnedRecorder& recorder;
+        bool armed = true;
+        ~GateAbortGuard() {
+            if (!armed) return;
+            (void)abort_incomplete_gate_and_wait(recorder, std::chrono::seconds(1));
+        }
+    } gate_guard{recorder};
+    if (client.fd < 0 || !send_all(client.fd,
+                                   kHeadKeepAliveRequest1,
+                                   sizeof(kHeadKeepAliveRequest1) - 1)) {
+        error = std::string(side) + " incomplete HEAD request 1 send failed";
+        return false;
+    }
+
+    responses.clear();
+    std::string detail;
+    if (!wait_incomplete_gate_state(recorder, State::SentOpenWaitingGate, detail)) {
+        error = std::string(side) + " incomplete origin did not reach gate: " + detail;
+        return false;
+    }
+    if (recorder.accepted.load(std::memory_order_acquire) != 1 ||
+        recorder.requests.load(std::memory_order_acquire) != 1) {
+        error = std::string(side) + " incomplete phase did not have exactly one origin request";
+        return false;
+    }
+
+    // Positive incomplete bytes must not publish a response or close the
+    // reusable downstream until this test explicitly authorizes origin EOF.
+    bool eof = false;
+    if (!wait_keepalive_quiet_or_eof(client.fd, 500, eof, detail) || eof) {
+        error = eof ? std::string(side) + " closed downstream before incomplete EOF gate"
+                    : std::string(side) + " incomplete pre-EOF quiet window failed: " + detail;
+        return false;
+    }
+    if (recorder.incomplete_gate_state.load(std::memory_order_acquire) !=
+            State::SentOpenWaitingGate ||
+        recorder.accepted.load(std::memory_order_acquire) != 1 ||
+        recorder.requests.load(std::memory_order_acquire) != 1) {
+        error = std::string(side) + " incomplete origin changed before EOF authorization";
+        return false;
+    }
+
+    recorder.incomplete_gate_command.store(Command::Close, std::memory_order_release);
+    detail.clear();
+    if (!wait_incomplete_gate_state(recorder, State::ClosedByGate, detail)) {
+        error = std::string(side) + " incomplete EOF authorization failed: " + detail;
+        return false;
+    }
+    gate_guard.armed = false;
+
+    std::vector<char> first;
+    if (!read_head_response(client.fd, first, detail)) {
+        error = std::string(side) + " incomplete HEAD response 1 failed: " + detail;
+        return false;
+    }
+    if (!validate_exact_normalized_response(
+            first, kHeadGatewayKeepAliveResponseNormalized, detail)) {
+        error = std::string(side) + " incomplete HEAD response 1 mismatch: " + detail;
+        return false;
+    }
+    eof = false;
+    if (!wait_keepalive_quiet_or_eof(client.fd, 500, eof, detail) || eof) {
+        error = eof ? std::string(side) + " closed downstream after incomplete 502"
+                    : std::string(side) + " incomplete response 1 quiet window failed: " + detail;
+        return false;
+    }
+    responses.push_back(std::move(first));
+
+    if (recorder.accepted.load(std::memory_order_acquire) != 1 ||
+        recorder.requests.load(std::memory_order_acquire) != 1 ||
+        recorder.incomplete_gate_state.load(std::memory_order_acquire) != State::ClosedByGate) {
+        error = std::string(side) + " incomplete phase changed before downstream request 2";
+        return false;
+    }
+    if (!send_all(client.fd, kHeadKeepAliveRequest2, sizeof(kHeadKeepAliveRequest2) - 1)) {
+        error = std::string(side) + " incomplete HEAD request 2 send failed";
+        return false;
+    }
+    std::vector<char> second;
+    detail.clear();
+    if (!read_head_response(client.fd, second, detail)) {
+        error = std::string(side) + " incomplete HEAD response 2 failed: " + detail;
+        return false;
+    }
+    if (!read_eof(client.fd, detail)) {
+        error = std::string(side) + " incomplete HEAD response 2 EOF failed: " + detail;
+        return false;
+    }
+    if (!validate_exact_normalized_response(second, kHeadResponseNormalized, detail)) {
+        error = std::string(side) + " incomplete HEAD response 2 mismatch: " + detail;
+        return false;
+    }
+    responses.push_back(std::move(second));
+
+    if (!wait_pinned_requests(recorder, 2, detail)) {
+        error = std::string(side) + " incomplete request-2 origin evidence failed: " + detail;
+        return false;
+    }
+    settle_for_invalid_target_side_effects();
+    if (recorder.accepted.load(std::memory_order_acquire) != 2 ||
+        recorder.requests.load(std::memory_order_acquire) != 2 ||
+        recorder.incomplete_gate_state.load(std::memory_order_acquire) != State::ClosedByGate) {
+        error = std::string(side) + " incomplete phase saw extra or incomplete origin activity";
         return false;
     }
     return true;
@@ -1734,6 +2124,91 @@ static bool capture_rut_head_malformed_reuse(
     if (!exercised) return false;
     if (!rut_stopped) {
         error = "failed to stop generated RUT after malformed reusable HEAD differential";
+        return false;
+    }
+    return true;
+}
+
+static bool capture_nginx_head_incomplete_eof_reuse(
+    u16 frontend_port,
+    const std::string& nginx_config_path,
+    const std::string& nginx_log_path,
+    const std::string& container_name,
+    KeepAlivePinnedRecorder& recorder,
+    std::vector<std::vector<char>>& responses,
+    std::string& error) {
+    DockerGuard docker(container_name);
+    ChildGuard nginx;
+    if (!spawn_child({"docker", "run", "--pull=never", "--network", "host", "--name",
+                      container_name, "-v", nginx_config_path + ":/etc/nginx/nginx.conf:ro",
+                      kNginxImage, "nginx", "-g", "daemon off;"},
+                     nginx_log_path,
+                     nginx.child)) {
+        error = "failed to start pinned nginx for incomplete-EOF reusable HEAD differential";
+        return false;
+    }
+    if (!wait_ready(frontend_port, nginx.child, error)) {
+        if (!abort_incomplete_gate_and_wait(recorder, std::chrono::seconds(4)))
+            error += " (recorder did not acknowledge incomplete-gate Abort before teardown)";
+        return false;
+    }
+
+    const bool exercised = exercise_incomplete_eof_head_reuse(
+        frontend_port, recorder, "nginx", responses, error);
+    const bool abort_acknowledged =
+        exercised || abort_incomplete_gate_and_wait(recorder, std::chrono::seconds(4));
+    const bool nginx_stopped = stop_child(nginx.child);
+    const bool container_removed = docker.remove();
+    if (!abort_acknowledged) {
+        error += " (recorder did not acknowledge incomplete-gate Abort before teardown)";
+        return false;
+    }
+    if (!exercised) return false;
+    if (!nginx_stopped) {
+        error = "failed to stop nginx after incomplete-EOF reusable HEAD differential";
+        return false;
+    }
+    if (!container_removed) {
+        error = "docker rm -f failed after incomplete-EOF reusable HEAD differential";
+        return false;
+    }
+    return true;
+}
+
+static bool capture_rut_head_incomplete_eof_reuse(
+    u16 frontend_port,
+    const std::string& source_path,
+    const std::string& rut_log_path,
+    const std::string& rut_path,
+    KeepAlivePinnedRecorder& recorder,
+    std::vector<std::vector<char>>& responses,
+    std::string& error) {
+    ChildGuard rut;
+    if (!spawn_child({rut_path, source_path, "--shards", "1", "--no-pin", "--drain", "0"},
+                     rut_log_path,
+                     rut.child)) {
+        error = "failed to start generated RUT for incomplete-EOF reusable HEAD differential";
+        return false;
+    }
+    if (!wait_ready(frontend_port, rut.child, error)) {
+        if (!abort_incomplete_gate_and_wait(recorder, std::chrono::seconds(4)))
+            error += " (recorder did not acknowledge incomplete-gate Abort before teardown)";
+        error = "generated RUT incomplete-EOF reusable HEAD readiness failed: " + error;
+        return false;
+    }
+
+    const bool exercised = exercise_incomplete_eof_head_reuse(
+        frontend_port, recorder, "RUT", responses, error);
+    const bool abort_acknowledged =
+        exercised || abort_incomplete_gate_and_wait(recorder, std::chrono::seconds(4));
+    const bool rut_stopped = stop_child(rut.child);
+    if (!abort_acknowledged) {
+        error += " (recorder did not acknowledge incomplete-gate Abort before teardown)";
+        return false;
+    }
+    if (!exercised) return false;
+    if (!rut_stopped) {
+        error = "failed to stop generated RUT after incomplete-EOF reusable HEAD differential";
         return false;
     }
     return true;
@@ -2959,8 +3434,8 @@ int main(int argc, char** argv) {
     std::cerr << "PASS: converter-generated RUT reusable HEAD success matches pinned nginx "
                  "(two downstream responses, two fresh upstream connections)\n";
 
-    KeepAlivePinnedRecorder nginx_malformed_recorder;
-    nginx_malformed_recorder.malformed_first = true;
+    KeepAlivePinnedRecorder nginx_malformed_recorder(
+        KeepAlivePinnedRecorder::FirstResponseMode::InvalidHeaderWaitPeerClose);
     if (!nginx_malformed_recorder.setup(backend_port)) {
         std::cerr << "FAIL [pinned malformed HEAD]: backend recorder setup failed\n";
         return 1;
@@ -2984,8 +3459,8 @@ int main(int argc, char** argv) {
     }
     nginx_malformed_recorder.stop();
 
-    KeepAlivePinnedRecorder rut_malformed_recorder;
-    rut_malformed_recorder.malformed_first = true;
+    KeepAlivePinnedRecorder rut_malformed_recorder(
+        KeepAlivePinnedRecorder::FirstResponseMode::InvalidHeaderWaitPeerClose);
     if (!rut_malformed_recorder.setup(backend_port)) {
         std::cerr << "FAIL [generated-RUT malformed HEAD]: backend recorder setup failed\n";
         return 1;
@@ -3077,6 +3552,123 @@ int main(int argc, char** argv) {
     std::cerr << "PASS: converter-generated RUT malformed/open-peer reusable HEAD matches pinned "
                  "nginx (two exact responses, fresh origin wires, final EOF; exact io_uring "
                  "owner masks covered separately)\n";
+
+    KeepAlivePinnedRecorder nginx_incomplete_recorder(
+        KeepAlivePinnedRecorder::FirstResponseMode::IncompleteWaitGate);
+    if (!nginx_incomplete_recorder.setup(backend_port)) {
+        std::cerr << "FAIL [pinned incomplete-EOF HEAD]: backend recorder setup failed\n";
+        return 1;
+    }
+    std::vector<std::vector<char>> nginx_incomplete_responses;
+    std::string nginx_incomplete_error;
+    if (!capture_nginx_head_incomplete_eof_reuse(frontend_port,
+                                                 temp.nginx_config,
+                                                 temp.nginx_log,
+                                                 container + "-head-incomplete-eof",
+                                                 nginx_incomplete_recorder,
+                                                 nginx_incomplete_responses,
+                                                 nginx_incomplete_error)) {
+        std::cerr << "FAIL [pinned incomplete-EOF HEAD]: " << nginx_incomplete_error << "\n";
+        for (const auto& response : nginx_incomplete_responses)
+            dump_wire("pinned incomplete-EOF HEAD downstream", response);
+        nginx_incomplete_recorder.stop();
+        dump_pinned_history(nginx_incomplete_recorder, "nginx incomplete-EOF HEAD");
+        dump_log(temp.nginx_log, "pinned nginx incomplete-EOF HEAD log");
+        return 1;
+    }
+    nginx_incomplete_recorder.stop();
+
+    KeepAlivePinnedRecorder rut_incomplete_recorder(
+        KeepAlivePinnedRecorder::FirstResponseMode::IncompleteWaitGate);
+    if (!rut_incomplete_recorder.setup(backend_port)) {
+        std::cerr << "FAIL [generated-RUT incomplete-EOF HEAD]: backend recorder setup failed\n";
+        return 1;
+    }
+    std::vector<std::vector<char>> rut_incomplete_responses;
+    std::string rut_incomplete_error;
+    if (!capture_rut_head_incomplete_eof_reuse(frontend_port,
+                                               temp.source,
+                                               temp.rut_log,
+                                               argv[1],
+                                               rut_incomplete_recorder,
+                                               rut_incomplete_responses,
+                                               rut_incomplete_error)) {
+        std::cerr << "FAIL [generated-RUT incomplete-EOF HEAD]: " << rut_incomplete_error << "\n";
+        for (const auto& response : rut_incomplete_responses)
+            dump_wire("generated-RUT incomplete-EOF HEAD downstream", response);
+        rut_incomplete_recorder.stop();
+        dump_pinned_history(rut_incomplete_recorder, "RUT incomplete-EOF HEAD");
+        dump_log(temp.rut_log, "generated-RUT incomplete-EOF HEAD log");
+        return 1;
+    }
+    rut_incomplete_recorder.stop();
+
+    using IncompleteState = KeepAlivePinnedRecorder::IncompleteGateState;
+    const auto incomplete_recorder_is_exact = [](const KeepAlivePinnedRecorder& recorder) {
+        return recorder.accepted.load(std::memory_order_acquire) == 2 &&
+               recorder.requests.load(std::memory_order_acquire) == 2 &&
+               recorder.history.size() == 2 && recorder.history[0].connection_id == 1 &&
+               recorder.history[1].connection_id == 2 &&
+               recorder.history[0].connection_id != recorder.history[1].connection_id &&
+               recorder.incomplete_gate_state.load(std::memory_order_acquire) ==
+                   IncompleteState::ClosedByGate;
+    };
+    if (nginx_incomplete_responses.size() != 2 || rut_incomplete_responses.size() != 2 ||
+        !incomplete_recorder_is_exact(nginx_incomplete_recorder) ||
+        !incomplete_recorder_is_exact(rut_incomplete_recorder)) {
+        std::cerr << "FAIL [incomplete-EOF HEAD differential]: exact response/origin cardinality "
+                     "or gate evidence failed\n";
+        dump_pinned_history(nginx_incomplete_recorder, "nginx incomplete-EOF HEAD");
+        dump_pinned_history(rut_incomplete_recorder, "RUT incomplete-EOF HEAD");
+        dump_log(temp.nginx_log, "pinned nginx incomplete-EOF HEAD log");
+        dump_log(temp.rut_log, "generated-RUT incomplete-EOF HEAD log");
+        return 1;
+    }
+
+    const char* const expected_incomplete_responses[] = {
+        kHeadGatewayKeepAliveResponseNormalized,
+        kHeadResponseNormalized,
+    };
+    for (size_t i = 0; i < 2; i++) {
+        std::vector<char> normalized_nginx = nginx_incomplete_responses[i];
+        std::vector<char> normalized_rut = rut_incomplete_responses[i];
+        const char* expected_response = expected_incomplete_responses[i];
+        const size_t expected_len = strlen(expected_response);
+        const std::string expected_request =
+            std::string(i == 0 ? "HEAD /head?q=1 HTTP/1.1\r\n"
+                               : "HEAD /head?q=2 HTTP/1.1\r\n") +
+            "Host: 127.0.0.1:" + std::to_string(backend_port) + "\r\n\r\n";
+        const std::vector<char> expected_wire(expected_request.begin(), expected_request.end());
+        if (!normalize_date(normalized_nginx) || !normalize_date(normalized_rut) ||
+            normalized_nginx.size() != expected_len || normalized_rut.size() != expected_len ||
+            memcmp(normalized_nginx.data(), expected_response, expected_len) != 0 ||
+            memcmp(normalized_rut.data(), expected_response, expected_len) != 0 ||
+            normalized_nginx != normalized_rut ||
+            nginx_incomplete_recorder.history[i].wire != expected_wire ||
+            rut_incomplete_recorder.history[i].wire != expected_wire ||
+            nginx_incomplete_recorder.history[i].wire !=
+                rut_incomplete_recorder.history[i].wire) {
+            std::cerr << "FAIL [incomplete-EOF HEAD differential]: request " << (i + 1)
+                      << " nginx/generated-RUT observable wire mismatch\n";
+            dump_wire("expected incomplete-EOF HEAD response",
+                      std::vector<char>(expected_response, expected_response + expected_len));
+            dump_wire("nginx incomplete-EOF HEAD response", nginx_incomplete_responses[i]);
+            dump_wire("generated-RUT incomplete-EOF HEAD response", rut_incomplete_responses[i]);
+            dump_wire("expected incomplete-EOF HEAD upstream request", expected_wire);
+            dump_wire("nginx incomplete-EOF HEAD upstream request",
+                      nginx_incomplete_recorder.history[i].wire);
+            dump_wire("generated-RUT incomplete-EOF HEAD upstream request",
+                      rut_incomplete_recorder.history[i].wire);
+            dump_pinned_history(nginx_incomplete_recorder, "nginx incomplete-EOF HEAD");
+            dump_pinned_history(rut_incomplete_recorder, "RUT incomplete-EOF HEAD");
+            dump_log(temp.nginx_log, "pinned nginx incomplete-EOF HEAD log");
+            dump_log(temp.rut_log, "generated-RUT incomplete-EOF HEAD log");
+            return 1;
+        }
+    }
+    std::cerr << "PASS: converter-generated RUT incomplete-header/test-authorized-EOF reusable "
+                 "HEAD matches pinned nginx (two exact responses, fresh origin wires, final "
+                 "downstream EOF; zero-owner evidence covered separately)\n";
 
     DeadPort keepalive_dead;
     if (!keepalive_dead.reserve(backend_port)) {
