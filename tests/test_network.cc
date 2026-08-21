@@ -634,6 +634,8 @@ TEST(response_policy, suppress_body_metadata_fails_closed_before_upstream_connec
     const char* requests[] = {
         "GET /api HTTP/1.1\r\nHost: client\r\n\r\n",
         "HEAD /api HTTP/1.1\r\nHost: client\r\n\r\n",
+        "HEAD /api HTTP/1.1\r\nHost: client\r\nConnection: close\r\n"
+        "Content-Length: 0\r\n\r\n",
     };
     for (const char* request : requests) {
         auto* conn = loop.alloc_conn();

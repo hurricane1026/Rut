@@ -539,6 +539,9 @@ struct ConnectionBase {
     bool request_upload_complete;
     // Non-zero selects the strict H1 response serializer for this request.
     u16 response_policy_id;
+    // Strict HEAD responses preserve the upstream representation length in the
+    // downstream headers but never forward representation bytes.
+    bool response_policy_suppress_body;
     // Non-zero selects the bounded H1 failure serializer for connect failures.
     u16 failure_policy_id;
     // Exact parsed request HTTP version (HttpVersion underlying value).
@@ -554,6 +557,10 @@ struct ConnectionBase {
     // Parsed downstream intent preserved across request-policy materialisation,
     // which rewrites req_keep_alive for the upstream request.
     bool req_client_keep_alive;
+    bool req_client_connection_close;
+    bool req_client_connection_close_exact;
+    bool req_client_has_content_length;
+    u8 req_client_connection_count;
     bool req_wants_upgrade;          // client sent Connection: upgrade (gates 101 tunnel)
     bool req_upgrade_is_websocket;   // the request Upgrade list offered "websocket"
     bool resp_upgrade_is_websocket;  // the backend 101 selected "websocket" (gates terminate)
@@ -814,10 +821,15 @@ struct ConnectionBase {
         request_body_fully_buffered = false;
         request_upload_complete = false;
         response_policy_id = 0;
+        response_policy_suppress_body = false;
         failure_policy_id = 0;
         req_http_version = 255;
         req_keep_alive = false;
         req_client_keep_alive = false;
+        req_client_connection_close = false;
+        req_client_connection_close_exact = false;
+        req_client_has_content_length = false;
+        req_client_connection_count = 0;
         req_wants_upgrade = false;
         req_upgrade_is_websocket = false;
         resp_upgrade_is_websocket = false;

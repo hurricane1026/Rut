@@ -119,6 +119,10 @@ void capture_request_metadata(Connection& conn) {
     // (fallback path below) must never qualify its upstream fd for pooling.
     conn.req_keep_alive = false;
     conn.req_client_keep_alive = false;
+    conn.req_client_connection_close = false;
+    conn.req_client_connection_close_exact = false;
+    conn.req_client_has_content_length = false;
+    conn.req_client_connection_count = 0;
     conn.req_http_version = 255;
     conn.req_wants_upgrade = false;
     conn.req_upgrade_is_websocket = false;
@@ -145,6 +149,33 @@ void capture_request_metadata(Connection& conn) {
         // forwarded request's keep-alive intent toward the origin.
         conn.req_keep_alive = req.keep_alive && !req.connection_close;
         conn.req_client_keep_alive = conn.req_keep_alive;
+        conn.req_client_connection_close = req.connection_close;
+        conn.req_client_has_content_length = req.has_content_length;
+        for (u32 i = 0; i < req.header_count; i++) {
+            if (http_header_name_eq_ci(req.headers[i].name.ptr,
+                                       req.headers[i].name.len,
+                                       "connection",
+                                       10)) {
+                if (conn.req_client_connection_count < 255)
+                    conn.req_client_connection_count++;
+            }
+        }
+        if (conn.req_client_connection_count == 1) {
+            for (u32 i = 0; i < req.header_count; i++) {
+                if (http_header_name_eq_ci(req.headers[i].name.ptr,
+                                           req.headers[i].name.len,
+                                           "connection",
+                                           10)) {
+                    conn.req_client_connection_close_exact =
+                        req.headers[i].value.len == 5 &&
+                        http_header_name_eq_ci(req.headers[i].value.ptr,
+                                               req.headers[i].value.len,
+                                               "close",
+                                               5);
+                    break;
+                }
+            }
+        }
         conn.req_method = map_log_method(req.method);
         u32 copy_len = req.path.len;
         if (copy_len >= sizeof(conn.req_path)) copy_len = sizeof(conn.req_path) - 1;

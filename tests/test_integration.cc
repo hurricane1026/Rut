@@ -9033,6 +9033,29 @@ static rut::ForwardResponsePolicySpec test_response_policy_request_spec() {
     return policy;
 }
 
+static rut::ForwardResponsePolicySpec test_response_policy_head_spec() {
+    auto policy = test_response_policy_request_spec();
+    policy.head_mode = rut::ResponsePolicyHeadMode::SuppressBody;
+    return policy;
+}
+
+static u64 forward_head_response_policy_handler(void* /*conn*/,
+                                                rut::jit::HandlerCtx* /*ctx*/,
+                                                const u8* /*req*/,
+                                                u32 /*len*/,
+                                                void* /*arena*/) {
+    return rut::jit::HandlerResult::make_forward_with_policies(0, 0, 1).pack();
+}
+
+static u64 forward_request_and_head_response_policy_handler(
+    void* /*conn*/,
+    rut::jit::HandlerCtx* /*ctx*/,
+    const u8* /*req*/,
+    u32 /*len*/,
+    void* /*arena*/) {
+    return rut::jit::HandlerResult::make_forward_with_policies(0, 1, 1).pack();
+}
+
 static rut::ForwardFailurePolicySpec test_failure_policy_spec() {
     rut::ForwardFailurePolicySpec policy{};
     policy.version = rut::ForwardFailurePolicyVersion::Http11;
@@ -17690,6 +17713,146 @@ TEST(route, response_policy_rejects_tls_admission_before_upstream_accept) {
     usleep(100000);
     CHECK_EQ(backend.accepted_count.load(std::memory_order_acquire), 0u);
     CHECK_EQ(backend.request_count.load(std::memory_order_acquire), 0u);
+}
+
+TEST(route, response_policy_suppress_body_serializes_explicit_close_head) {
+    using namespace rut;
+    auto run_case = [](const char* upstream_response,
+                       u32 upstream_response_len,
+                       u32 split_offset,
+                       u32 split_delay_us,
+                       bool with_request_policy,
+                       u32 expected_content_length) -> bool {
+        RecordingUpstream backend;
+        backend.response = upstream_response;
+        backend.response_len = upstream_response_len;
+        backend.response_split_offset = split_offset;
+        backend.response_chunk_delay_us = split_delay_us;
+        if (!backend.setup()) return false;
+
+        RouteConfig cfg{};
+        if (!cfg.add_upstream("backend", 0x7F000001, backend.port).has_value()) return false;
+        if (with_request_policy) {
+            if (cfg.add_response_policy(test_response_policy_head_spec()) != 1u) return false;
+            if (!cfg.add_jit_handler(
+                    "/head", 'H', &forward_request_and_head_response_policy_handler))
+                return false;
+        } else {
+            if (cfg.add_response_policy(test_response_policy_head_spec()) != 1u) return false;
+            if (!cfg.add_jit_handler("/head", 'H', &forward_head_response_policy_handler))
+                return false;
+        }
+        const RouteConfig* active = &cfg;
+        ScopedProxyLoop proxy;
+        if (!proxy.setup(&active, 1000)) return false;
+
+        const i32 client = connect_to(proxy.port);
+        if (client < 0) return false;
+        set_socket_timeouts(client, 2);
+        static constexpr char kRequest[] =
+            "HEAD /head?q=1 HTTP/1.1\r\n"
+            "Host: client.example\r\n"
+            "Connection: close\r\n\r\n";
+        if (!send_all(client, kRequest, sizeof(kRequest) - 1)) {
+            close(client);
+            return false;
+        }
+
+        char response[2048]{};
+        u32 response_len = 0;
+        const i32 first_timeout_ms = split_delay_us != 0 ? 200 : 2000;
+        const i32 first = recv_timeout(
+            client, response, sizeof(response), first_timeout_ms);
+        if (first <= 0) {
+            close(client);
+            return false;
+        }
+        response_len = static_cast<u32>(first);
+        for (u32 attempt = 0; attempt < 16 && response_len < sizeof(response); attempt++) {
+            if (buf_contains(response, response_len, "\r\n\r\n", 4)) break;
+            const i32 got = recv_timeout(
+                client, response + response_len, sizeof(response) - response_len, 2000);
+            if (got <= 0) {
+                close(client);
+                return false;
+            }
+            response_len += static_cast<u32>(got);
+        }
+        const bool has_header_end = buf_contains(response, response_len, "\r\n\r\n", 4);
+        bool eof = false;
+        if (has_header_end) {
+            const i32 tail = recv_timeout(client, response + response_len,
+                                          sizeof(response) - response_len, 2000);
+            eof = tail == 0;
+            if (tail > 0) response_len += static_cast<u32>(tail);
+        }
+        close(client);
+        if (!has_header_end || !eof) return false;
+
+        char normalized[sizeof(response)]{};
+        memcpy(normalized, response, response_len);
+        char* date = strstr(normalized, "Date: ");
+        if (date == nullptr) return false;
+        for (u32 i = 0; i < 29; i++) {
+            if (date[6 + i] == '\0' || date[6 + i] == '\r') return false;
+            date[6 + i] = 'X';
+        }
+        char expected[512]{};
+        const int expected_len = snprintf(
+            expected,
+            sizeof(expected),
+            "HTTP/1.1 200 OK\r\n"
+            "Server: nginx/1.29.7\r\n"
+            "Date: XXXXXXXXXXXXXXXXXXXXXXXXXXXXX\r\n"
+            "Content-Length: %u\r\n"
+            "Connection: close\r\n\r\n",
+            expected_content_length);
+        if (expected_len <= 0 || static_cast<u32>(expected_len) != response_len ||
+            memcmp(normalized, expected, static_cast<size_t>(expected_len)) != 0)
+            return false;
+
+        usleep(100000);
+        if (backend.accepted_count.load(std::memory_order_acquire) != 1u ||
+            backend.request_count.load(std::memory_order_acquire) != 1u)
+            return false;
+        backend.teardown();
+        if (with_request_policy) {
+            char expected_request[256]{};
+            const int expected_request_len = snprintf(
+                expected_request,
+                sizeof(expected_request),
+                "HEAD /head?q=1 HTTP/1.1\r\nHost: 127.0.0.1:%u\r\n\r\n",
+                backend.port);
+            if (expected_request_len <= 0 || backend.request_history_len[0] !=
+                                                    static_cast<u32>(expected_request_len) ||
+                memcmp(backend.request_history[0], expected_request,
+                       static_cast<size_t>(expected_request_len)) != 0) {
+                return false;
+            }
+        }
+        return true;
+    };
+
+    static constexpr char kCoalesced[] =
+        "HTTP/1.1 200 OK\r\nServer: origin-head\r\n"
+        "Date: Tue, 01 Jan 2030 00:00:00 GMT\r\nContent-Length: 5\r\n\r\nhello";
+    CHECK(run_case(kCoalesced, sizeof(kCoalesced) - 1, 0, 0, false, 5));
+
+    static constexpr char kDelayed[] =
+        "HTTP/1.1 200 OK\r\nServer: origin-head\r\n"
+        "Date: Tue, 01 Jan 2030 00:00:00 GMT\r\nContent-Length: 5\r\n\r\nhello";
+    const char* delayed_body = strstr(kDelayed, "\r\n\r\n") + 4;
+    CHECK(run_case(kDelayed,
+                   sizeof(kDelayed) - 1,
+                   static_cast<u32>(delayed_body - kDelayed),
+                   500000,
+                   true,
+                   5));
+
+    static constexpr char kZero[] =
+        "HTTP/1.1 200 OK\r\nServer: origin-head\r\n"
+        "Date: Tue, 01 Jan 2030 00:00:00 GMT\r\nContent-Length: 0\r\n\r\n";
+    CHECK(run_case(kZero, sizeof(kZero) - 1, 0, 0, false, 0));
 }
 
 TEST(route, response_policy_serializes_strict_h1_final_response) {
