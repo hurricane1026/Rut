@@ -17,8 +17,8 @@ Allowed states are `SUPPORTED`, `PARTIAL`, `BLOCKED_BY_RUT`,
 | preserve raw request-target and query | implicit | yes | partial: origin-form forward sends original bytes | pinned query differential; broader normalization untested | PARTIAL |
 | preserve request method and body | implicit | yes | partial: fixed-CL body is staged before connect within one 16 KiB composite slice | RUT exact binary/segmented/boundary tests and pinned generated-RUT binary POST differential | PARTIAL |
 | nginx default upstream HTTP version and request headers | implicit | yes | partial: explicit fixed HTTP/1.1 policy with bounded fixed-CL buffering; #252 | exact RUT tests plus pinned generated-RUT GET and POST differentials | PARTIAL |
-| proxied response status and body | implicit | yes, including method-isolated root HEAD lowering | partial: strict final H1.1 exact-Content-Length streaming plus bounded reusable paired HEAD success/connect-failure serialization; #265 now admits only malformed/incomplete parser failures through the D1/D2 exact-owner rendezvous | exact public-source production-JIT and pinned converter-generated reusable HEAD success/connect-failure, internal parser/lifecycle tests, pinned generated-RUT GET/POST, and exact nginx-only reusable 502/504 failure baselines; no malformed public wire yet | PARTIAL |
-| nginx default proxied response header policy | implicit | yes, including method-isolated root HEAD lowering | partial: bounded strict H1.1 final-response/content-length serializer and reusable paired HEAD success/connect-failure policy; #265 has narrow malformed/incomplete production admission, while timeout remains absent | exact public-source production-JIT and pinned converter-generated reusable HEAD success/failure/no-pool evidence, internal parser/token/lifecycle tests, pinned generated-RUT GET/POST/close, and nginx-only reusable 502/504 failure baselines; no malformed public wire yet | PARTIAL |
+| proxied response status and body | implicit | yes, including method-isolated root HEAD lowering | partial: strict final H1.1 exact-Content-Length streaming plus bounded reusable paired HEAD success/connect-failure serialization; #265 now admits only malformed/incomplete parser failures through the D1/D2 exact-owner rendezvous | exact public-source malformed/open-peer reusable wire, public and pinned converter-generated reusable HEAD success/connect-failure, internal parser/lifecycle tests, pinned generated-RUT GET/POST, and exact nginx-only reusable 502/504 failure baselines; no malformed converter differential yet | PARTIAL |
+| nginx default proxied response header policy | implicit | yes, including method-isolated root HEAD lowering | partial: bounded strict H1.1 final-response/content-length serializer and reusable paired HEAD success/connect-failure policy; #265 has narrow malformed/incomplete production admission, while timeout remains absent | exact public-source malformed/open-peer reusable wire, public and pinned converter-generated reusable HEAD success/failure/no-pool evidence, internal parser/token/lifecycle tests, pinned generated-RUT GET/POST/close, and nginx-only reusable 502/504 failure baselines; no malformed converter differential yet | PARTIAL |
 | single unavailable upstream gateway error | implicit | yes | yes for bounded H1 single-IPv4 connect failures; #256 | committed pinned close/EOF differential plus pinned keep-alive and split-POST evidence | SUPPORTED |
 | exact, `^~`, regex, or nested locations | no | no | no nginx selection semantics | no | NOT_PLANNED |
 | exact `/api/` + proxy URI `/`, clean bounded H1 request domain | yes | yes | yes: bounded prefix replacement; #259 closed | pinned converter-generated `/api/`, `/api/x`, and query differentials; four out-of-domain targets fail before upstream | SUPPORTED |
@@ -96,10 +96,14 @@ Allowed states are `SUPPORTED`, `PARTIAL`, `BLOCKED_BY_RUT`,
   tests prove transactional failure-header construction, live-Recv and
   zero-owner handoff, both completion orders, batch-end-only request-2
   publication, phase-bound buffer normalization, epoch/config pinning, and
-  close/reclaim behavior. Public-source real-socket and converter-generated
-  differential evidence are still absent, and no timeout path calls D2, so these
-  failures remain unsupported; internal production admission alone does not
-  upgrade #264's narrower normal-success and connect-establishment slice.
+  close/reclaim behavior. A public-source production-io_uring real-socket test
+  now proves the malformed/open-peer observable wire: exact header-only
+  keep-alive 502, quiet boundary, old-origin closure, fresh request-2 origin and
+  exact close response/EOF. It intentionally does not claim to observe kernel
+  `CQE_F_MORE`; focused tests supply exact live-Recv ownership evidence.
+  Incomplete-EOF public behavior, converter-generated differentials, and the
+  timeout path remain absent, so parser failures are still unsupported and do
+  not upgrade #264's narrower normal-success/connect-establishment slice.
 - The reusable HEAD gap previously depended on the generic epoll transport
   capability tracked in #262. Epoll now exposes at most one logical completion
   per wait
