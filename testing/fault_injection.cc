@@ -36,6 +36,12 @@ struct HeldEpollEventState {
 
 thread_local HeldEpollEventState g_held_epoll_event{};
 
+void poison_held_epoll_event(HeldEpollEventState& state, HeldEpollEventError error) {
+    state.capture_armed = false;
+    state.replay_armed = false;
+    state.error = error;
+}
+
 using MmapFn = void* (*)(void*, size_t, int, int, int, off_t);
 using MprotectFn = int (*)(void*, size_t, int);
 using SocketFn = int (*)(int, int, int);
@@ -460,8 +466,7 @@ bool ScopedHeldEpollEvent::arm_capture_once() {
     if (g_held_epoll_event.owner != this) return false;
     if (g_held_epoll_event.error != HeldEpollEventError::None) return false;
     if (g_held_epoll_event.capture_armed || g_held_epoll_event.captured) {
-        g_held_epoll_event.capture_armed = false;
-        g_held_epoll_event.error = HeldEpollEventError::DuplicateCaptureArm;
+        poison_held_epoll_event(g_held_epoll_event, HeldEpollEventError::DuplicateCaptureArm);
         return false;
     }
     g_held_epoll_event.capture_armed = true;
@@ -472,13 +477,11 @@ bool ScopedHeldEpollEvent::replay_once() {
     if (g_held_epoll_event.owner != this) return false;
     if (g_held_epoll_event.error != HeldEpollEventError::None) return false;
     if (g_held_epoll_event.replay_armed || g_held_epoll_event.replay_consumed) {
-        g_held_epoll_event.replay_armed = false;
-        g_held_epoll_event.error = HeldEpollEventError::DuplicateReplayArm;
+        poison_held_epoll_event(g_held_epoll_event, HeldEpollEventError::DuplicateReplayArm);
         return false;
     }
     if (!g_held_epoll_event.captured) {
-        g_held_epoll_event.capture_armed = false;
-        g_held_epoll_event.error = HeldEpollEventError::ReplayWithoutCapture;
+        poison_held_epoll_event(g_held_epoll_event, HeldEpollEventError::ReplayWithoutCapture);
         return false;
     }
     g_held_epoll_event.replay_armed = true;
@@ -784,23 +787,20 @@ extern "C" int epoll_ctl(int epfd, int op, int fd, struct epoll_event* event) {
 extern "C" int epoll_wait(int epfd, struct epoll_event* events, int maxevents, int timeout) {
     pthread_once(&rut::test_fault::g_syscall_once, rut::test_fault::resolve_syscalls);
     auto& held = rut::test_fault::g_held_epoll_event;
-    const bool hold_operation_armed = held.capture_armed || held.replay_armed;
+    const bool hold_operation_armed = held.error == rut::test_fault::HeldEpollEventError::None &&
+                                      (held.capture_armed || held.replay_armed);
     if (held.owner != nullptr && hold_operation_armed) {
         if (epfd != held.target_epoll_fd) {
-            held.capture_armed = false;
-            held.replay_armed = false;
-            held.error = rut::test_fault::HeldEpollEventError::WrongEpollFd;
+            rut::test_fault::poison_held_epoll_event(
+                held, rut::test_fault::HeldEpollEventError::WrongEpollFd);
         } else if (rut::test_fault::is_null_ptr(events) || maxevents != 1) {
-            held.capture_armed = false;
-            held.replay_armed = false;
-            held.error = rut::test_fault::HeldEpollEventError::InvalidWaitOutput;
-        } else if (held.replay_armed) {
-            events[0] = held.event;
-            held.replay_armed = false;
-            held.replay_consumed = true;
-            return 1;
+            rut::test_fault::poison_held_epoll_event(
+                held, rut::test_fault::HeldEpollEventError::InvalidWaitOutput);
         }
     }
+    // Preserve the pre-existing fault-injection precedence: an injected wait
+    // result happens before either a legal replay or the real syscall and does
+    // not consume the armed one-shot operation.
     if (rut::test_fault::consume_fault(rut::test_fault::g_epoll_wait_eintr_count)) {
         errno = EINTR;
         return -1;
@@ -809,12 +809,23 @@ extern "C" int epoll_wait(int epfd, struct epoll_event* events, int maxevents, i
         errno = rut::test_fault::fail_errno_or_default(rut::test_fault::g_epoll_wait_errno, EINVAL);
         return -1;
     }
+    if (held.owner != nullptr && held.error == rut::test_fault::HeldEpollEventError::None &&
+        held.replay_armed && epfd == held.target_epoll_fd &&
+        !rut::test_fault::is_null_ptr(events) && maxevents == 1) {
+        events[0] = held.event;
+        held.replay_armed = false;
+        held.replay_consumed = true;
+        return 1;
+    }
     if (!rut::test_fault::g_real_epoll_wait) {
         errno = ENOSYS;
         return -1;
     }
     const int result = rut::test_fault::g_real_epoll_wait(epfd, events, maxevents, timeout);
-    if (held.owner != nullptr && held.capture_armed && epfd == held.target_epoll_fd &&
+    // maxevents == 1 is a capture precondition, so a multi-record real result
+    // is impossible on this path. A zero result leaves capture armed for retry.
+    if (held.owner != nullptr && held.error == rut::test_fault::HeldEpollEventError::None &&
+        held.capture_armed && epfd == held.target_epoll_fd &&
         !rut::test_fault::is_null_ptr(events) && maxevents == 1 && result == 1) {
         held.event = events[0];
         held.capture_armed = false;

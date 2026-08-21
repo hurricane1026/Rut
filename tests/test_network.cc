@@ -12350,6 +12350,8 @@ TEST(epoll_episode_lifecycle, harvested_raw_connect_is_fenced_across_terminal_sa
     REQUIRE(guard.create());
     REQUIRE(guard.init());
     auto* loop = guard.loop;
+    struct itimerspec disarmed_timer{};
+    REQUIRE_EQ(timerfd_settime(loop->backend.timer_fd, 0, &disarmed_timer, nullptr), 0);
 
     auto listener_result = create_listen_socket(0);
     REQUIRE(listener_result.has_value());
