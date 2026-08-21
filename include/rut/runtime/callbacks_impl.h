@@ -5450,10 +5450,8 @@ inline bool strict_response_upload_ready(const Connection& conn) {
            conn.recv_buf.len() == 0 && !conn.upstream_reused;
 }
 
-// SuppressBody is metadata for the next HEAD serializer increment. Until
-// that serializer exists, accepting it would silently execute a different
-// policy than the source requested, so every selected such policy remains
-// fail-closed before upstream allocation/connect.
+// SuppressBody is supported only in the bounded cleartext H1 HEAD/explicit-
+// close domain below. Every other execution path remains fail-closed.
 inline bool response_policy_runtime_supported(const ForwardResponsePolicySpec& policy) {
     return policy.head_mode == ResponsePolicyHeadMode::Reject;
 }
@@ -5495,6 +5493,8 @@ inline bool response_policy_suppress_head_admitted(
            !conn.req_client_keep_alive && conn.req_client_connection_close &&
            conn.req_client_connection_close_exact && conn.req_client_connection_count == 1 &&
            !conn.req_client_has_content_length && !conn.tls_active &&
+           !conn.req_client_has_transfer_encoding && !conn.req_client_has_te &&
+           !conn.req_client_has_expect && !conn.req_client_has_upgrade_header &&
            conn.protocol == ConnProtocol::Http11 && conn.req_path_canon.ptr != nullptr &&
            conn.req_body_mode == BodyMode::None && conn.req_body_remaining == 0 &&
            !conn.request_body_fully_buffered && !conn.req_malformed &&
@@ -5977,6 +5977,11 @@ inline void reject_strict_response(Loop* loop, Connection& conn) {
 template <typename Loop>
 void on_upstream_response(void* lp, Connection& conn, IoEvent ev) {
     auto* loop = static_cast<Loop*>(lp);
+
+    // An old upstream CQE may still be delivered after strict HEAD has
+    // abandoned and closed the backend. Never let a direct or backend-routed
+    // late event re-enter parsing, release state twice, or append bytes.
+    if (conn.upstream_abandoned) return;
 
     if (conn.upstream_start_us != 0) {
         conn.upstream_us = static_cast<u32>(monotonic_us() - conn.upstream_start_us);

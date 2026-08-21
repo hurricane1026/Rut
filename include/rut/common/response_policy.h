@@ -34,9 +34,9 @@ enum class ResponsePolicyDate : u8 {
     Current = 1,
 };
 
-// HEAD-aware serialization is intentionally metadata-only in this increment.
-// Reject is the legacy/source default; SuppressBody is reserved for the
-// subsequent runtime serializer increment and must not be silently ignored.
+// Reject is the legacy/source default. SuppressBody is runtime-supported only
+// for the bounded cleartext HTTP/1.1 explicit-close HEAD domain; all other
+// domains fail closed.
 enum class ResponsePolicyHeadMode : u8 {
     Invalid = 0,
     Reject = 1,

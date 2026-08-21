@@ -17855,6 +17855,63 @@ TEST(route, response_policy_suppress_body_serializes_explicit_close_head) {
     CHECK(run_case(kZero, sizeof(kZero) - 1, 0, 0, false, 0));
 }
 
+TEST(route, response_policy_suppress_body_rejects_coalesced_excess) {
+    using namespace rut;
+    RecordingUpstream backend;
+    static constexpr char kOverlong[] =
+        "HTTP/1.1 200 OK\r\nServer: origin-head\r\n"
+        "Date: Tue, 01 Jan 2030 00:00:00 GMT\r\nContent-Length: 5\r\n\r\nhelloo";
+    backend.response = kOverlong;
+    backend.response_len = sizeof(kOverlong) - 1;
+    REQUIRE(backend.setup());
+
+    RouteConfig cfg{};
+    REQUIRE(cfg.add_upstream("backend", 0x7F000001, backend.port).has_value());
+    REQUIRE_EQ(cfg.add_response_policy(test_response_policy_head_spec()), 1u);
+    REQUIRE(cfg.add_jit_handler("/head", 'H', &forward_head_response_policy_handler));
+    const RouteConfig* active = &cfg;
+    ScopedProxyLoop proxy;
+    REQUIRE(proxy.setup(&active, 1000));
+
+    struct FdGuard {
+        i32 fd;
+        ~FdGuard() {
+            if (fd >= 0) close(fd);
+        }
+    } client{connect_to(proxy.port)};
+    REQUIRE_GE(client.fd, 0);
+    set_socket_timeouts(client.fd, 2);
+    static constexpr char kRequest[] =
+        "HEAD /head?q=1 HTTP/1.1\r\n"
+        "Host: client.example\r\n"
+        "Connection: close\r\n\r\n";
+    REQUIRE(send_all(client.fd, kRequest, sizeof(kRequest) - 1));
+
+    char response[512]{};
+    u32 response_len = 0;
+    for (u32 attempt = 0; attempt < 8 && response_len < sizeof(response); attempt++) {
+        const i32 got = recv_timeout(client.fd,
+                                     response + response_len,
+                                     sizeof(response) - response_len,
+                                     2000);
+        if (got <= 0) break;
+        response_len += static_cast<u32>(got);
+    }
+    CHECK_EQ(recv_timeout(client.fd, response, sizeof(response), 2000), 0);
+
+    static constexpr char kExpected[] =
+        "HTTP/1.1 502 Bad Gateway\r\n"
+        "Content-Length: 11\r\n"
+        "Connection: close\r\n\r\n"
+        "Bad Gateway";
+    CHECK_EQ(response_len, static_cast<u32>(sizeof(kExpected) - 1));
+    CHECK(memcmp(response, kExpected, sizeof(kExpected) - 1) == 0);
+    CHECK_FALSE(buf_contains(response, response_len, "HTTP/1.1 200", 12));
+    usleep(100000);
+    CHECK_EQ(backend.accepted_count.load(std::memory_order_acquire), 1u);
+    CHECK_EQ(backend.request_count.load(std::memory_order_acquire), 1u);
+}
+
 TEST(route, response_policy_serializes_strict_h1_final_response) {
     using namespace rut;
     RecordingUpstream backend;

@@ -122,6 +122,10 @@ void capture_request_metadata(Connection& conn) {
     conn.req_client_connection_close = false;
     conn.req_client_connection_close_exact = false;
     conn.req_client_has_content_length = false;
+    conn.req_client_has_transfer_encoding = false;
+    conn.req_client_has_te = false;
+    conn.req_client_has_expect = false;
+    conn.req_client_has_upgrade_header = false;
     conn.req_client_connection_count = 0;
     conn.req_http_version = 255;
     conn.req_wants_upgrade = false;
@@ -152,6 +156,14 @@ void capture_request_metadata(Connection& conn) {
         conn.req_client_connection_close = req.connection_close;
         conn.req_client_has_content_length = req.has_content_length;
         for (u32 i = 0; i < req.header_count; i++) {
+            const Str name = req.headers[i].name;
+            conn.req_client_has_transfer_encoding |=
+                http_header_name_eq_ci(name.ptr, name.len, "transfer-encoding", 17);
+            conn.req_client_has_te |= http_header_name_eq_ci(name.ptr, name.len, "te", 2);
+            conn.req_client_has_expect |=
+                http_header_name_eq_ci(name.ptr, name.len, "expect", 6);
+            conn.req_client_has_upgrade_header |=
+                http_header_name_eq_ci(name.ptr, name.len, "upgrade", 7);
             if (http_header_name_eq_ci(req.headers[i].name.ptr,
                                        req.headers[i].name.len,
                                        "connection",

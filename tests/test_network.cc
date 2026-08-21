@@ -636,6 +636,14 @@ TEST(response_policy, suppress_body_metadata_fails_closed_before_upstream_connec
         "HEAD /api HTTP/1.1\r\nHost: client\r\n\r\n",
         "HEAD /api HTTP/1.1\r\nHost: client\r\nConnection: close\r\n"
         "Content-Length: 0\r\n\r\n",
+        "HEAD /api HTTP/1.1\r\nHost: client\r\nConnection: close\r\n"
+        "Transfer-Encoding: identity\r\n\r\n",
+        "HEAD /api HTTP/1.1\r\nHost: client\r\nConnection: close\r\n"
+        "TE: trailers\r\n\r\n",
+        "HEAD /api HTTP/1.1\r\nHost: client\r\nConnection: close\r\n"
+        "Expect: 100-continue\r\n\r\n",
+        "HEAD /api HTTP/1.1\r\nHost: client\r\nConnection: close\r\n"
+        "Upgrade: websocket\r\n\r\n",
     };
     for (const char* request : requests) {
         auto* conn = loop.alloc_conn();
@@ -649,6 +657,9 @@ TEST(response_policy, suppress_body_metadata_fails_closed_before_upstream_connec
         JitDispatchOutcome outcome{};
         outcome.kind = JitDispatchOutcome::Kind::Forward;
         outcome.upstream_id = 0;
+        // Exercise the request-policy rewrite before SuppressBody admission;
+        // the original hop-by-hop facts must still reject these vectors.
+        outcome.request_policy_id = 1;
         outcome.response_policy_id = 1;
         loop.backend.clear_ops();
         handle_jit_outcome<SmallLoop>(&loop, *conn, outcome, nullptr, true);
@@ -660,6 +671,128 @@ TEST(response_policy, suppress_body_metadata_fails_closed_before_upstream_connec
         CHECK_EQ(loop.backend.count_ops(MockOp::Send), 1u);
         loop.free_conn(*conn);
     }
+}
+
+TEST(response_policy, suppress_body_abandon_is_idempotent_and_ignores_late_event) {
+    SmallLoop loop;
+    loop.setup();
+    RouteConfig cfg{};
+    REQUIRE(cfg.add_upstream("backend", 0x7F000001, 8080).has_value());
+    ForwardResponsePolicySpec policy{};
+    static constexpr char kServer[] = "server";
+    policy.version = ResponsePolicyVersion::Http11;
+    policy.framing = ResponsePolicyFraming::ContentLength;
+    policy.connection = ResponsePolicyConnection::Request;
+    policy.date = ResponsePolicyDate::Current;
+    policy.head_mode = ResponsePolicyHeadMode::SuppressBody;
+    policy.server = {kServer, sizeof(kServer) - 1};
+    REQUIRE_EQ(cfg.add_response_policy(policy), 1u);
+
+    auto* conn = loop.alloc_conn();
+    REQUIRE(conn != nullptr);
+    struct ConnGuard {
+        SmallLoop* loop;
+        Connection* conn;
+        ~ConnGuard() {
+            if (conn != nullptr && (conn->fd >= 0 || conn->upstream_fd >= 0))
+                loop->close_conn(*conn);
+        }
+    } conn_guard{&loop, conn};
+    static constexpr char kRequest[] =
+        "HEAD /head HTTP/1.1\r\nHost: client\r\nConnection: close\r\n\r\n";
+    REQUIRE_EQ(conn->recv_buf.write(reinterpret_cast<const u8*>(kRequest),
+                                    sizeof(kRequest) - 1),
+               sizeof(kRequest) - 1);
+    capture_request_metadata(*conn);
+    conn->request_config = &cfg;
+    conn->response_policy_id = 1;
+    conn->response_policy_suppress_body = true;
+    conn->req_initial_send_len = conn->recv_buf.len();
+    conn->keep_alive = false;
+    REQUIRE(loop.alloc_upstream_buf(*conn));
+    static constexpr char kResponse[] =
+        "HTTP/1.1 200 OK\r\nServer: origin\r\n"
+        "Date: Tue, 01 Jan 2030 00:00:00 GMT\r\nContent-Length: 5\r\n\r\nhello";
+    REQUIRE_EQ(conn->upstream_recv_buf.write(reinterpret_cast<const u8*>(kResponse),
+                                              sizeof(kResponse) - 1),
+               sizeof(kResponse) - 1);
+    struct FdGuard {
+        i32 fd;
+        ~FdGuard() {
+            if (fd >= 0) close(fd);
+        }
+    } client_fd{dup(STDERR_FILENO)}, upstream_fd{dup(STDERR_FILENO)};
+    REQUIRE_GE(client_fd.fd, 0);
+    REQUIRE_GE(upstream_fd.fd, 0);
+    conn->fd = client_fd.fd;
+    conn->upstream_fd = upstream_fd.fd;
+    client_fd.fd = -1;
+    upstream_fd.fd = -1;
+    conn->upstream_slot_held = true;
+    conn->upstream_slot_uid = 0;
+    conn->upstream_recv_armed = true;
+    conn->upstream_send_armed = true;
+    conn->set_slots(nullptr,
+                    nullptr,
+                    &on_upstream_response<SmallLoop>,
+                    &on_upstream_request_sent<SmallLoop>);
+    loop.backend.clear_ops();
+
+    on_upstream_response<SmallLoop>(
+        &loop,
+        *conn,
+        IoEvent{conn->id,
+                static_cast<i32>(sizeof(kResponse) - 1),
+                0,
+                0,
+                IoEventType::UpstreamRecv,
+                0});
+
+    CHECK(conn->upstream_abandoned);
+    CHECK_FALSE(conn->upstream_keep_alive);
+    CHECK_EQ(conn->upstream_fd, -1);
+    CHECK_FALSE(conn->upstream_slot_held);
+    CHECK_FALSE(conn->upstream_recv_armed);
+    CHECK_FALSE(conn->upstream_send_armed);
+    CHECK(conn->on_upstream_recv == nullptr);
+    CHECK(conn->on_upstream_send == nullptr);
+    const MockOp* sent = loop.backend.last_op(MockOp::Send);
+    REQUIRE(sent != nullptr);
+    const u32 published_len = sent->send_len;
+    CHECK_EQ(published_len, conn->response_header_buf.len());
+    CHECK(buf_contains(reinterpret_cast<const char*>(sent->send_buf),
+                       sent->send_len,
+                       "Content-Length: 5\r\n",
+                       static_cast<u32>(strlen("Content-Length: 5\r\n"))));
+    CHECK_FALSE(buf_contains(reinterpret_cast<const char*>(sent->send_buf),
+                             sent->send_len,
+                             "hello",
+                             5));
+    u8 published[SmallLoop::kBufSize];
+    memcpy(published, sent->send_buf, published_len);
+    const u32 send_ops_before_late = loop.backend.count_ops(MockOp::Send);
+
+    // This models an old callback retained by an already-harvested upstream
+    // event. It must not parse/append or submit another downstream send.
+    on_upstream_response<SmallLoop>(
+        &loop,
+        *conn,
+        IoEvent{conn->id, 5, 0, 0, IoEventType::UpstreamRecv, 0});
+    CHECK_EQ(loop.backend.count_ops(MockOp::Send), send_ops_before_late);
+    CHECK_EQ(conn->response_header_buf.len(), published_len);
+    CHECK(memcmp(conn->response_header_buf.data(), published, published_len) == 0);
+
+    // The normal downstream completion callback now owns only client cleanup;
+    // the upstream slot/fd were already abandoned and must not be released a
+    // second time.
+    const u32 free_before = loop.free_top;
+    on_proxy_response_sent<SmallLoop>(
+        &loop,
+        *conn,
+        IoEvent{conn->id, static_cast<i32>(published_len), 0, 0, IoEventType::Send, 0});
+    CHECK_EQ(loop.free_top, free_before + 1);
+    CHECK_EQ(loop.conns[conn->id].fd, -1);
+    CHECK_FALSE(loop.conns[conn->id].upstream_slot_held);
 }
 
 TEST(response_policy, head_mode_config_copy_is_owned_and_atomic) {

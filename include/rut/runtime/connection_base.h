@@ -560,6 +560,13 @@ struct ConnectionBase {
     bool req_client_connection_close;
     bool req_client_connection_close_exact;
     bool req_client_has_content_length;
+    // Original request framing/upgrade facts captured before any request-policy
+    // rewrite. SuppressBody HEAD admission must not lose these when rewritten
+    // requests strip hop-by-hop fields.
+    bool req_client_has_transfer_encoding;
+    bool req_client_has_te;
+    bool req_client_has_expect;
+    bool req_client_has_upgrade_header;
     u8 req_client_connection_count;
     bool req_wants_upgrade;          // client sent Connection: upgrade (gates 101 tunnel)
     bool req_upgrade_is_websocket;   // the request Upgrade list offered "websocket"
@@ -829,6 +836,10 @@ struct ConnectionBase {
         req_client_connection_close = false;
         req_client_connection_close_exact = false;
         req_client_has_content_length = false;
+        req_client_has_transfer_encoding = false;
+        req_client_has_te = false;
+        req_client_has_expect = false;
+        req_client_has_upgrade_header = false;
         req_client_connection_count = 0;
         req_wants_upgrade = false;
         req_upgrade_is_websocket = false;
