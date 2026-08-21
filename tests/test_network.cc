@@ -879,6 +879,30 @@ TEST(response_policy, failure_head_mode_config_copy_is_owned_and_deduplicated) {
     CHECK_FALSE(populate_route_config(untouched, malformed));
     CHECK_EQ(untouched.failure_policy_count, 0u);
     CHECK_EQ(untouched.failure_policy_bytes_used, 0u);
+
+    // The publication helper also accepts a caller-pre-bound upstream. A
+    // forged policy must fail before disturbing that unrelated state.
+    static constexpr char kBackendName[] = "backend";
+    malformed.upstream_count = 1;
+    malformed.upstreams[0].name = {kBackendName, sizeof(kBackendName) - 1};
+    malformed.upstreams[0].has_address = true;
+    malformed.upstreams[0].ip = 0x7F000001;
+    malformed.upstreams[0].port = 8080;
+    RouteConfig prebound{};
+    REQUIRE(prebound.add_upstream("backend", 0x7F000001, 8080).has_value());
+    const u32 before_upstreams = prebound.upstream_count;
+    const u32 before_addr_count = prebound.upstreams[0].addr_count;
+    const u32 before_ip = prebound.upstreams[0].addrs[0].sin_addr.s_addr;
+    const u16 before_port = prebound.upstreams[0].addrs[0].sin_port;
+    CHECK_FALSE(populate_route_config(prebound, malformed));
+    CHECK_EQ(prebound.upstream_count, before_upstreams);
+    CHECK_EQ(prebound.upstreams[0].addr_count, before_addr_count);
+    CHECK_EQ(prebound.upstreams[0].addrs[0].sin_addr.s_addr, before_ip);
+    CHECK_EQ(prebound.upstreams[0].addrs[0].sin_port, before_port);
+    CHECK_EQ(prebound.upstreams[0].name_len, 7u);
+    CHECK(__builtin_memcmp(prebound.upstreams[0].name, "backend", 7) == 0);
+    CHECK_EQ(prebound.failure_policy_count, 0u);
+    CHECK_EQ(prebound.failure_policy_bytes_used, 0u);
 }
 
 static Connection* setup_target_transform_request(SmallLoop& loop,
@@ -1049,6 +1073,66 @@ TEST(response_policy, failure_suppress_body_fails_closed_before_wait_rewrite_or_
     CHECK_EQ(loop.backend.count_ops(MockOp::Recv), 0u);
     CHECK_EQ(loop.backend.count_ops(MockOp::Send), 1u);
     loop.free_conn(*post);
+}
+
+TEST(response_policy, failure_suppress_body_plain_forward_head_fails_closed) {
+    SmallLoop loop;
+    loop.setup();
+    RouteConfig cfg{};
+    REQUIRE(cfg.add_upstream("backend", 0x7F000001, 8080).has_value());
+    static constexpr char kReason[] = "Bad Gateway";
+    static constexpr char kType[] = "text/plain";
+    static constexpr char kServer[] = "rut";
+    static constexpr char kBody[] = "unavailable";
+    ForwardFailurePolicySpec failure{};
+    failure.version = ForwardFailurePolicyVersion::Http11;
+    failure.status_code = 502;
+    failure.date = ForwardFailurePolicyDate::Current;
+    failure.connection = ForwardFailurePolicyConnection::Request;
+    failure.head_mode = FailurePolicyHeadMode::SuppressBody;
+    failure.reason = {kReason, sizeof(kReason) - 1};
+    failure.content_type = {kType, sizeof(kType) - 1};
+    failure.server = {kServer, sizeof(kServer) - 1};
+    failure.body = {kBody, sizeof(kBody) - 1};
+    REQUIRE_EQ(cfg.add_failure_policy(failure), 1u);
+    REQUIRE_EQ(cfg.add_policy_bundle(0, 1), 1u);
+
+    static constexpr char kRequest[] =
+        "HEAD /head HTTP/1.1\r\nHost: client\r\nConnection: close\r\n\r\n";
+    for (const bool use_bundle : {false, true}) {
+        auto* conn = loop.alloc_conn();
+        REQUIRE(conn != nullptr);
+        REQUIRE_EQ(conn->recv_buf.write(reinterpret_cast<const u8*>(kRequest),
+                                        sizeof(kRequest) - 1),
+                   sizeof(kRequest) - 1);
+        capture_request_metadata(*conn);
+        conn->request_config = &cfg;
+        CHECK_EQ(conn->req_method, static_cast<u8>(LogHttpMethod::Head));
+        CHECK_FALSE(conn->target_transform_recorded);
+        JitDispatchOutcome outcome{};
+        outcome.kind = JitDispatchOutcome::Kind::Forward;
+        outcome.upstream_id = 0;
+        if (use_bundle)
+            outcome.policy_bundle_id = 1;
+        else
+            outcome.failure_policy_id = 1;
+        loop.backend.clear_ops();
+        handle_jit_outcome<SmallLoop>(&loop, *conn, outcome, nullptr, true);
+        CHECK_EQ(conn->resp_status, 400u);
+        CHECK_FALSE(conn->request_policy_body_pending);
+        CHECK_EQ(conn->upstream_fd, -1);
+        CHECK_FALSE(conn->upstream_slot_held);
+        CHECK_FALSE(conn->upstream_reused);
+        CHECK_FALSE(conn->upstream_recv_armed);
+        CHECK_FALSE(conn->upstream_send_armed);
+        CHECK_EQ(loop.backend.count_ops(MockOp::Connect), 0u);
+        CHECK_EQ(loop.backend.count_ops(MockOp::Send), 1u);
+        const MockOp* local_send = loop.backend.last_op(MockOp::Send);
+        REQUIRE(local_send != nullptr);
+        CHECK_EQ(local_send->send_len, conn->send_buf.len());
+        CHECK(buf_has(conn->send_buf.data(), conn->send_buf.len(), "HTTP/1.1 400", 12));
+        loop.free_conn(*conn);
+    }
 }
 
 TEST(target_transform, h1_materializes_clean_origin_form_and_preserves_query) {
