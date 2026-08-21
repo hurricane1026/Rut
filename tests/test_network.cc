@@ -9943,6 +9943,116 @@ TEST(streaming, upstream_response_chunked_initial_error_502) {
     CHECK_EQ(c->on_send, &on_response_sent<SmallLoop>);
 }
 
+TEST(streaming, malformed_response_async_close_preserves_cancel_accounting) {
+    AsyncSmallLoop loop;
+    loop.setup();
+    auto* c = loop.alloc_conn();
+    REQUIRE(c != nullptr);
+    REQUIRE(loop.alloc_upstream_buf(*c));
+
+    struct FdGuard {
+        i32 fd;
+        ~FdGuard() {
+            if (fd >= 0) close(fd);
+        }
+    } client{dup(STDERR_FILENO)}, upstream{dup(STDERR_FILENO)}, replacement{dup(STDERR_FILENO)};
+    REQUIRE_GE(client.fd, 0);
+    REQUIRE_GE(upstream.fd, 0);
+    REQUIRE_GE(replacement.fd, 0);
+    c->fd = client.fd;
+    client.fd = -1;
+    c->upstream_fd = upstream.fd;
+    upstream.fd = -1;
+    c->upstream_recv_armed = true;
+    c->upstream_send_armed = true;
+    c->pending_ops = 2;
+
+    // The close-only helper itself must not erase async armed/accounting state.
+    CHECK(detach_upstream_close_only(&loop, *c));
+    CHECK_EQ(c->upstream_fd, -1);
+    CHECK(c->upstream_recv_armed);
+    CHECK(c->upstream_send_armed);
+    CHECK_EQ(c->pending_ops, 2u);
+
+    c->upstream_fd = replacement.fd;
+    replacement.fd = -1;
+    static constexpr char kMalformed[] = "NOT HTTP\r\n\r\n";
+    CHECK_EQ(c->upstream_recv_buf.write(reinterpret_cast<const u8*>(kMalformed),
+                                        sizeof(kMalformed) - 1),
+             sizeof(kMalformed) - 1);
+    c->set_slots(nullptr, nullptr, &on_upstream_response<AsyncSmallLoop>, nullptr);
+    on_upstream_response<AsyncSmallLoop>(
+        &loop,
+        *c,
+        IoEvent{c->id, static_cast<i32>(sizeof(kMalformed) - 1), 0, 0, IoEventType::UpstreamRecv, 0});
+
+    CHECK_EQ(c->resp_status, kStatusBadGateway);
+    CHECK_EQ(c->upstream_fd, -1);
+    CHECK(c->upstream_recv_armed);
+    CHECK(c->upstream_send_armed);
+    const MockOp* response_send = loop.backend.last_op(MockOp::Send);
+    CHECK(response_send != nullptr);
+    const u32 cancel_before = loop.backend.count_ops(MockOp::Cancel);
+
+    // Normal close still sees the retained async episode state and submits
+    // cancellation before deferred slot reclamation.
+    loop.close_conn(*c);
+    CHECK_GT(loop.backend.count_ops(MockOp::Cancel), cancel_before);
+    CHECK_EQ(loop.pending_free_count, 1u);
+}
+
+TEST(streaming, malformed_response_epoll_detaches_and_retires_episode) {
+    auto* loop = create_real_loop();
+    REQUIRE(loop != nullptr);
+    REQUIRE(loop->init(0, -1, 0).has_value());
+    auto* c = loop->alloc_conn();
+    REQUIRE(c != nullptr);
+    REQUIRE(loop->alloc_upstream_buf(*c));
+    REQUIRE(loop->begin_upstream_episode(*c));
+
+    i32 client_fds[2] = {-1, -1};
+    i32 upstream_fds[2] = {-1, -1};
+    struct FdPairGuard {
+        i32* fds;
+        ~FdPairGuard() {
+            if (fds[0] >= 0) close(fds[0]);
+            if (fds[1] >= 0) close(fds[1]);
+        }
+    } client_guard{client_fds}, upstream_guard{upstream_fds};
+    REQUIRE_EQ(socketpair(AF_UNIX, SOCK_STREAM | SOCK_NONBLOCK, 0, client_fds), 0);
+    REQUIRE_EQ(socketpair(AF_UNIX, SOCK_STREAM | SOCK_NONBLOCK, 0, upstream_fds), 0);
+    c->fd = client_fds[0];
+    client_fds[0] = -1;
+    c->upstream_fd = upstream_fds[0];
+    upstream_fds[0] = -1;
+    c->upstream_recv_armed = true;
+    c->upstream_send_armed = true;
+    static constexpr char kMalformed[] = "NOT HTTP\r\n\r\n";
+    CHECK_EQ(c->upstream_recv_buf.write(reinterpret_cast<const u8*>(kMalformed),
+                                        sizeof(kMalformed) - 1),
+             sizeof(kMalformed) - 1);
+    c->set_slots(nullptr, nullptr, &on_upstream_response<EpollEventLoop>, nullptr);
+    on_upstream_response<EpollEventLoop>(
+        loop,
+        *c,
+        IoEvent{c->id, static_cast<i32>(sizeof(kMalformed) - 1), 0, 0, IoEventType::UpstreamRecv, 0});
+
+    CHECK_EQ(c->resp_status, kStatusBadGateway);
+    CHECK_EQ(c->upstream_fd, -1);
+    CHECK_FALSE(c->upstream_recv_armed);
+    CHECK_FALSE(c->upstream_send_armed);
+    CHECK_EQ(loop->backend.upstream_fd_map[c->id], -1);
+    CHECK_EQ(loop->backend.active_upstream_episode[c->id], 0u);
+    CHECK_EQ(c->upstream_episode, 2u);
+
+    close(client_fds[1]);
+    close(upstream_fds[1]);
+    c->fd = -1;
+    loop->free_conn(*c);
+    loop->shutdown();
+    destroy_real_loop(loop);
+}
+
 TEST(streaming, upstream_response_eof_no_data_closes) {
     SmallLoop loop;
     loop.setup();

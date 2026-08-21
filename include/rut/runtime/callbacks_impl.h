@@ -840,6 +840,23 @@ bool detach_upstream_close(Loop* loop, Connection& conn) {
     }
 }
 
+// Close-only fallback for malformed response paths that can run while an
+// asynchronous upstream recv is still armed. Epoll has synchronous ownership
+// and must use its full detach/retire hook; io_uring, legacy, and mock loops
+// retain the fd/armed state until their normal close/cancel accounting drains.
+template <typename Loop>
+bool detach_upstream_close_only(Loop* loop, Connection& conn) {
+    if constexpr (requires { loop->detach_upstream_close(conn); }) {
+        return loop->detach_upstream_close(conn);
+    } else {
+        if (conn.upstream_fd >= 0) {
+            ::close(conn.upstream_fd);
+            conn.upstream_fd = -1;
+        }
+        return true;
+    }
+}
+
 template <typename Loop>
 void release_upstream_conn(Loop* loop, Connection& conn) {
     if (conn.upstream_fd >= 0 && proxy_upstream_reusable(loop, conn)) {
@@ -6239,7 +6256,7 @@ void on_upstream_response(void* lp, Connection& conn, IoEvent ev) {
             reject_strict_response(loop, conn);
             return;
         }
-        (void)detach_upstream_close(loop, conn);
+        (void)detach_upstream_close_only(loop, conn);
         static const char k502[] =
             "HTTP/1.1 502 Bad Gateway\r\n"
             "Content-Length: 11\r\n"
@@ -6474,7 +6491,7 @@ void on_upstream_response(void* lp, Connection& conn, IoEvent ev) {
                     body_start + pos, kInitialBodyLen - pos, &consumed, &out_start, &out_len);
                 pos += consumed;
                 if (kChunkStatus == ChunkStatus::Error) {
-                    (void)detach_upstream_close(loop, conn);
+                    (void)detach_upstream_close_only(loop, conn);
                     static const char k502[] =
                         "HTTP/1.1 502 Bad Gateway\r\n"
                         "Content-Length: 11\r\n"
@@ -6535,7 +6552,7 @@ void on_upstream_response(void* lp, Connection& conn, IoEvent ev) {
                 break;
             }
             if (kChunkStatus == ChunkStatus::Error) {
-                (void)detach_upstream_close(loop, conn);
+                (void)detach_upstream_close_only(loop, conn);
                 static const char k502[] =
                     "HTTP/1.1 502 Bad Gateway\r\n"
                     "Content-Length: 11\r\n"
