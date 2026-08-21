@@ -433,15 +433,24 @@ public:
         if (conn_id < EpollBackend::kMaxFdMap) backend.upstream_fd_map[conn_id] = -1;
     }
 
-    // Epoll-owned upstream episode lifecycle foundation. Production request
-    // transitions intentionally do not call these yet; C2a only exposes the
-    // strict ownership boundary for the loop owner and its focused tests.
+    // Epoll-owned upstream episode lifecycle boundary used by connect, reuse,
+    // health, retry, and terminal-close owners.
     bool begin_upstream_episode(Connection& c) {
         return backend.begin_upstream_episode(c.id, c.upstream_episode);
     }
 
     bool retire_upstream_episode_after_detach(Connection& c, u32 expected_episode) {
         return backend.retire_upstream_episode_after_detach(c, expected_episode);
+    }
+
+    // Close/detach one logical upstream transport. A pool caller may request
+    // the descriptor back; it is exposed only after synchronous DEL, map/send
+    // cleanup, and strict episode retirement all succeed.
+    bool detach_upstream_close(Connection& c) { return backend.detach_upstream(c); }
+
+    bool detach_upstream_for_pool(Connection& c, i32& fd) {
+        fd = -1;
+        return backend.detach_upstream(c, &fd);
     }
 
     // Drop any partial upstream-send bookkeeping for conn_id. Called before a
@@ -463,6 +472,11 @@ public:
         if (!upstream) return false;
         const i32 fd = upstream->take_idle(upstream_id, backend_idx);
         if (fd < 0) return false;
+        // Establish a new owner before publishing the borrowed fd in the map.
+        if (!backend.begin_upstream_episode(c.id, c.upstream_episode)) {
+            ::close(fd);
+            return false;
+        }
         c.upstream_fd = fd;
         if (c.id < EpollBackend::kMaxFdMap) backend.upstream_fd_map[c.id] = fd;
         return true;
@@ -473,16 +487,13 @@ public:
     // (EPOLL_CTL_DEL + clear send state + clear the fd↔conn map) so no stale event
     // can fire on it while it's parked. Closes the fd if the pool is full. The
     // caller has verified both sides are keep-alive and the response framed cleanly.
-    void return_idle_upstream(Connection& c, u16 upstream_id, u8 backend_idx) {
-        const i32 fd = c.upstream_fd;
-        if (fd < 0 || !upstream) return;                // no pool wired → caller closes the fd
-        backend.clear_send_state(c.id);                 // ensure no pending send
-        backend.quiesce_recv(c.id, /*upstream=*/true, c.upstream_episode);  // EPOLL_CTL_DEL, keep the fd
-        clear_upstream_fd(c.id);                        // drop fd↔conn routing
-        c.upstream_fd = -1;
-        c.upstream_recv_armed = false;
-        c.upstream_send_armed = false;
-        if (!upstream->put_idle(fd, upstream_id, backend_idx, monotonic_secs())) ::close(fd);
+    bool return_idle_upstream(Connection& c, u16 upstream_id, u8 backend_idx) {
+        if (c.upstream_fd < 0 || !upstream) return false;
+        i32 fd = -1;
+        if (!detach_upstream_for_pool(c, fd)) return false;
+        if (fd >= 0 && !upstream->put_idle(fd, upstream_id, backend_idx, monotonic_secs()))
+            ::close(fd);
+        return true;
     }
 
     // Drop any partial/EAGAIN upstream request send still buffered for this
@@ -613,6 +624,7 @@ public:
     }
 
     bool submit_connect_impl(Connection& c, const void* addr, u32 addr_len) {
+        if (!begin_upstream_episode(c)) return false;
         return backend.add_connect(c.upstream_fd, c.id, addr, addr_len, c.upstream_episode);
     }
 
@@ -634,18 +646,10 @@ public:
     // side-effects apply. Removes the probe socket from epoll, closes it, drops
     // the fd-map + send-state bookkeeping, and returns the slot to the free list.
     void free_health_probe(Connection& c) {
-        if (c.upstream_fd >= 0) {
-            backend.cancel(c.upstream_fd, c.id);  // EPOLL_CTL_DEL
-            ::close(c.upstream_fd);
-            c.upstream_fd = -1;
-        }
-        c.upstream_recv_armed = false;
-        c.upstream_send_armed = false;
+        (void)backend.detach_upstream(c);
         if (c.id < EpollBackend::kMaxFdMap) {
-            backend.upstream_fd_map[c.id] = -1;
             backend.downstream_fd_map[c.id] = -1;
         }
-        backend.clear_send_state(c.id);
         this->free_conn(c);  // timer.remove + free slices + return slot (no metrics)
     }
 
@@ -688,12 +692,8 @@ public:
             c.tls_active = false;
             c.tls_handshake_complete = false;
         }
-        if (c.upstream_fd >= 0) {
-            ::close(c.upstream_fd);
-            c.upstream_fd = -1;
-        }
-        // Clear upstream fd map to prevent stale fd matching after reuse.
-        if (c.id < EpollBackend::kMaxFdMap) backend.upstream_fd_map[c.id] = -1;
+        (void)backend.detach_upstream(c);
+        // Clear downstream fd map to prevent stale fd matching after reuse.
         if (c.id < EpollBackend::kMaxFdMap) backend.downstream_fd_map[c.id] = -1;
         // Drop any in-flight partial-send bookkeeping so a reused conn_id+fd
         // cannot resurrect a stale send (see EpollBackend::clear_send_state).
@@ -851,7 +851,8 @@ public:
         // route directly through it.
         if (io_event_is_upstream(ev.type) &&
             (ev.conn_id >= kMaxConns || !valid_upstream_episode(ev.upstream_episode) ||
-             conns[ev.conn_id].upstream_episode != ev.upstream_episode))
+             conns[ev.conn_id].upstream_episode != ev.upstream_episode ||
+             backend.active_upstream_episode[ev.conn_id] != ev.upstream_episode))
             return;
         switch (ev.type) {
             case IoEventType::Accept:

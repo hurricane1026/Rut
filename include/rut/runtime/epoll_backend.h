@@ -124,14 +124,19 @@ struct EpollBackend {
     // and send from the stale ss.src pointer into the new connection's fd.
     void clear_send_state(u32 conn_id);
 
-    // Strict epoll-owned lifecycle foundation. begin records ownership only
+    // Strict epoll-owned lifecycle boundary. begin records ownership only
     // when the fd map and upstream partial-send state are detached. retire
     // requires the expected token to remain current and detached; on success
     // it clears ownership and advances conn.upstream_episode. These helpers
-    // are intentionally not called by registration, retry, pool, health, or
-    // dispatch paths yet.
+    // are invoked by the owning connect, retry, pool, health, and close paths;
+    // backend registration itself remains episode-neutral.
     bool begin_upstream_episode(u32 conn_id, u32 episode);
     bool retire_upstream_episode_after_detach(Connection& conn, u32 expected_episode);
+
+    // Detach the currently owned upstream transport and retire its episode.
+    // When detached_fd is supplied, ownership of the fd is returned only after
+    // a successful retire; any contract failure closes it instead.
+    bool detach_upstream(Connection& conn, i32* detached_fd = nullptr);
 
     // Quarantine ownership when a live epoll connection slot is released.
     // Inactive ownership remains zero; any live or malformed nonzero owner is

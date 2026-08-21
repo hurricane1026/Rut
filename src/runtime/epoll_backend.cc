@@ -363,6 +363,29 @@ bool EpollBackend::retire_upstream_episode_after_detach(Connection& conn,
     return true;
 }
 
+bool EpollBackend::detach_upstream(Connection& conn, i32* detached_fd) {
+    const u32 expected_episode = conn.upstream_episode;
+    const i32 fd = conn.upstream_fd;
+
+    // DEL while the descriptor is still valid.  The remaining operations are
+    // deliberately unconditional so a registration failure also gets a
+    // complete map/send-state detach before retirement is attempted.
+    if (fd >= 0) epoll_ctl(epoll_fd, EPOLL_CTL_DEL, fd, nullptr);
+    clear_send_state(conn.id);
+    if (conn.id < kMaxFdMap) upstream_fd_map[conn.id] = -1;
+    conn.upstream_recv_armed = false;
+    conn.upstream_send_armed = false;
+    conn.upstream_fd = -1;
+
+    const bool retired = retire_upstream_episode_after_detach(conn, expected_episode);
+    if (retired && detached_fd != nullptr && fd >= 0) {
+        *detached_fd = fd;
+    } else if (fd >= 0) {
+        ::close(fd);
+    }
+    return retired;
+}
+
 void EpollBackend::quarantine_upstream_episode_on_slot_release(u32 conn_id) {
     if (conn_id >= kMaxFdMap) return;
     const u32 owner = active_upstream_episode[conn_id];
@@ -713,19 +736,30 @@ void EpollBackend::cancel_accept() {
 u32 EpollBackend::wait(IoEvent* events, u32 max_events, Connection* conns, u32 max_conns) {
     if (max_events == 0) return 0;
 
-    auto pop_pending = [&]() -> u32 {
-        events[0] = pending_completions[--pending_count];
-        if (pending_count == 0)
-            pending_streak = 0;
-        else if (pending_streak < kPendingBurstQuota)
-            pending_streak++;
-        return 1;
+    auto pop_pending = [&](Connection* pending_conns, u32 pending_max_conns) -> u32 {
+        while (pending_count > 0) {
+            IoEvent candidate = pending_completions[--pending_count];
+            if (io_event_is_upstream(candidate.type) &&
+                (candidate.conn_id >= kMaxFdMap ||
+                 active_upstream_episode[candidate.conn_id] != candidate.upstream_episode ||
+                 pending_conns == nullptr || candidate.conn_id >= pending_max_conns ||
+                 pending_conns[candidate.conn_id].upstream_episode != candidate.upstream_episode))
+                continue;
+            events[0] = candidate;
+            if (pending_count == 0)
+                pending_streak = 0;
+            else if (pending_streak < kPendingBurstQuota)
+                pending_streak++;
+            return 1;
+        }
+        pending_streak = 0;
+        return 0;
     };
 
     if (pending_count == 0) {
         pending_streak = 0;
     } else if (pending_streak < kPendingBurstQuota) {
-        return pop_pending();
+        return pop_pending(conns, max_conns);
     }
 
     const bool probe_pending = pending_count > 0;
@@ -737,14 +771,14 @@ u32 EpollBackend::wait(IoEvent* events, u32 max_events, Connection* conns, u32 m
         if (errno == EINTR && !probe_pending) continue;
         if (probe_pending) {
             pending_streak = 0;
-            return pop_pending();
+            return pop_pending(conns, max_conns);
         }
         return 0;
     }
     if (n == 0) {
         if (probe_pending) {
             pending_streak = 0;
-            return pop_pending();
+            return pop_pending(conns, max_conns);
         }
         return 0;
     }
@@ -761,9 +795,10 @@ u32 EpollBackend::wait(IoEvent* events, u32 max_events, Connection* conns, u32 m
         // them before touching maps, socket state, connection buffers, or the
         // partial-send state; a malformed/stale record is simply consumed.
         if (io_event_is_upstream(type) &&
-            (conns == nullptr || conn_id >= max_conns ||
+            (conns == nullptr || conn_id >= max_conns || conn_id >= kMaxFdMap ||
              !valid_upstream_episode(upstream_episode) ||
-             conns[conn_id].upstream_episode != upstream_episode))
+             conns[conn_id].upstream_episode != upstream_episode ||
+             active_upstream_episode[conn_id] != upstream_episode))
             continue;
         // EPOLLHUP/EPOLLERR always fire regardless of the interest mask
         // (per epoll_ctl(2)), so pause_recv(events=0) can't prevent them.

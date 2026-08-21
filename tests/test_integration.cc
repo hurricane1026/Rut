@@ -2777,6 +2777,7 @@ TEST(active_health, fragmented_probe_headers_rearm_until_timeout) {
     c->upstream_idx = uid;
     c->upstream_backend_idx = 0;
     c->request_config = &cfg;
+    REQUIRE(loop->begin_upstream_episode(*c));
     set_probe_in_flight(uid, 0, true);
     record_backend_result(uid, 0, /*success=*/true, monotonic_us());
 
@@ -2909,6 +2910,7 @@ TEST(active_health, timeout_sweep_defers_until_batch_drains) {
     c->upstream_backend_idx = 0;
     c->request_config = &cfg;
     c->set_slots(nullptr, nullptr, nullptr, &on_probe_sent<EpollEventLoop>);
+    REQUIRE(loop->begin_upstream_episode(*c));
     set_probe_in_flight(uid, 0, true);
     const u32 old_cid = c->id;
 
@@ -3278,6 +3280,7 @@ TEST(active_health, send_registration_failure_defers_without_downing_backend) {
     c->upstream_backend_idx = 0;
     c->request_config = &cfg;
     REQUIRE_EQ(c->recv_buf.write(reinterpret_cast<const u8*>("GET / HTTP/1.1\r\n\r\n"), 18), 18u);
+    REQUIRE(loop->begin_upstream_episode(*c));
     set_probe_in_flight(uid, 0, true);
     record_active_probe_result(uid, 0, /*healthy=*/true, monotonic_us());
     const BackendHealth health_before = *backend_health(uid, 0);
@@ -3345,6 +3348,7 @@ TEST(active_health, real_negative_upstream_send_marks_backend_down) {
     c->upstream_idx = uid;
     c->upstream_backend_idx = 0;
     c->request_config = &cfg;
+    REQUIRE(loop->begin_upstream_episode(*c));
     set_probe_in_flight(uid, 0, true);
     record_active_probe_result(uid, 0, /*healthy=*/true, monotonic_us());
 
@@ -3393,6 +3397,7 @@ TEST(active_health, recv_registration_failure_defers_without_downing_backend) {
     c->upstream_idx = uid;
     c->upstream_backend_idx = 0;
     c->request_config = &cfg;
+    REQUIRE(loop->begin_upstream_episode(*c));
     set_probe_in_flight(uid, 0, true);
     record_backend_result(uid, 0, /*success=*/true, monotonic_us());
 
@@ -4628,6 +4633,11 @@ TEST(epoll_pending_capacity, upstream_partial_send_registration_failure_queues_t
     backend.epoll_fd = -1;  // force the partial-send registration to fail
 
     static const u8 payload[] = {'p', 'a', 'r', 't', 'i', 'a', 'l'};
+    Connection conns[1]{};
+    conns[0].reset();
+    conns[0].id = 0;
+    conns[0].upstream_episode = 1;
+    REQUIRE(backend.begin_upstream_episode(0, 1));
     CHECK(backend.add_send_upstream(fds[0], 0, payload, sizeof(payload), 1));
     CHECK_EQ(backend.pending_count, 1u);
     CHECK_EQ(backend.upstream_send_state[0].src, nullptr);
@@ -4639,7 +4649,7 @@ TEST(epoll_pending_capacity, upstream_partial_send_registration_failure_queues_t
     CHECK_EQ(backend.upstream_send_state[0].tls_wait_events, 0u);
 
     IoEvent events[2]{};
-    CHECK_EQ(backend.wait(events, 2, nullptr, 0), 1u);
+    CHECK_EQ(backend.wait(events, 2, conns, 1), 1u);
     CHECK_EQ(events[0].type, IoEventType::UpstreamSend);
     CHECK_EQ(events[0].result, -EBADF);
     CHECK_EQ(events[0].aux, kLocalSubmitFailureAux);

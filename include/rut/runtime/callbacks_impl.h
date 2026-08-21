@@ -821,6 +821,25 @@ bool proxy_upstream_reusable(Loop* loop, Connection& conn) {
     return true;
 }
 
+// Shared upstream teardown hook. Epoll owns the synchronous DEL/map/send-state
+// detach and strict episode retirement; io_uring, legacy, and test loops retain
+// their existing close/accounting behavior through the fallback below.
+template <typename Loop>
+bool detach_upstream_close(Loop* loop, Connection& conn) {
+    if constexpr (requires { loop->detach_upstream_close(conn); }) {
+        return loop->detach_upstream_close(conn);
+    } else {
+        if (conn.upstream_fd >= 0) {
+            ::close(conn.upstream_fd);
+            conn.upstream_fd = -1;
+        }
+        loop->clear_upstream_fd(conn.id);
+        conn.upstream_recv_armed = false;
+        conn.upstream_send_armed = false;
+        return true;
+    }
+}
+
 template <typename Loop>
 void release_upstream_conn(Loop* loop, Connection& conn) {
     if (conn.upstream_fd >= 0 && proxy_upstream_reusable(loop, conn)) {
@@ -832,13 +851,7 @@ void release_upstream_conn(Loop* loop, Connection& conn) {
             if (conn.upstream_fd < 0) return;  // parked (or closed) + cleared by the loop
         }
     }
-    if (conn.upstream_fd >= 0) {
-        ::close(conn.upstream_fd);
-        conn.upstream_fd = -1;
-    }
-    loop->clear_upstream_fd(conn.id);
-    conn.upstream_recv_armed = false;
-    conn.upstream_send_armed = false;
+    (void)detach_upstream_close(loop, conn);
 }
 
 // Body-state half of resendability: the request body must be fully delivered and
@@ -921,11 +934,7 @@ bool retry_reused_upstream(Loop* loop, Connection& conn) {
     const auto& target = cfg->upstreams[conn.upstream_idx];
     if (conn.upstream_backend_idx >= target.addr_count) return false;
 
-    if (conn.upstream_fd >= 0) {
-        ::close(conn.upstream_fd);
-        conn.upstream_fd = -1;
-    }
-    loop->clear_upstream_fd(conn.id);
+    (void)detach_upstream_close(loop, conn);
     // Clear any epoll partial-send bookkeeping for the dead fd before reconnecting:
     // a request send parked on EPOLLOUT leaves upstream_send_state set, which the
     // fresh connect's EPOLLOUT would otherwise resume / misread as the connect
@@ -933,8 +942,6 @@ bool retry_reused_upstream(Loop* loop, Connection& conn) {
     // — its retry is gated on upstream_send_armed instead.
     if constexpr (requires { loop->clear_upstream_send_state(conn.id); })
         loop->clear_upstream_send_state(conn.id);
-    conn.upstream_recv_armed = false;
-    conn.upstream_send_armed = false;
     conn.upstream_recv_buf.reset();
     const i32 fd = UpstreamPool::create_socket();
     if (fd < 0) return false;
@@ -944,9 +951,7 @@ bool retry_reused_upstream(Loop* loop, Connection& conn) {
     if (!loop->submit_connect(conn,
                               &target.addrs[conn.upstream_backend_idx],
                               sizeof(target.addrs[conn.upstream_backend_idx]))) {
-        ::close(conn.upstream_fd);
-        conn.upstream_fd = -1;
-        loop->clear_upstream_fd(conn.id);
+        (void)detach_upstream_close(loop, conn);
         return false;
     }
     return true;
@@ -1336,10 +1341,8 @@ void on_header_received(void* lp, Connection& conn, IoEvent ev) {
         conn.upstream_fd = kUpstreamFd;
         conn.set_slots(nullptr, nullptr, nullptr, &on_upstream_connected<Loop>);
         if (!loop->submit_connect(conn, &target.addrs[kBackend], sizeof(target.addrs[kBackend]))) {
-            ::close(conn.upstream_fd);
-            conn.upstream_fd = -1;
+            (void)detach_upstream_close(loop, conn);
             conn.upstream_idx = 0;
-            loop->clear_upstream_fd(conn.id);
             conn.resp_status = kStatusBadGateway;
             format_static_response(conn, 502, false);
             conn.keep_alive = false;
@@ -1535,14 +1538,8 @@ void on_response_sent(void* lp, Connection& conn, IoEvent ev) {
     conn.send_buf.reset();
     loop->epoch_leave();
 
-    if (conn.upstream_fd >= 0) {
-        ::close(conn.upstream_fd);
-        conn.upstream_fd = -1;
-    }
+    (void)detach_upstream_close(loop, conn);
     conn.upstream_idx = 0;
-    loop->clear_upstream_fd(conn.id);
-    conn.upstream_recv_armed = false;
-    conn.upstream_send_armed = false;
 
     if (!conn.keep_alive) {
         loop->close_conn(conn);
@@ -2123,12 +2120,8 @@ void handle_jit_outcome(Loop* loop,
                     return;
                 }
                 if (conn.upstream_fd >= 0) {
-                    ::close(conn.upstream_fd);
-                    conn.upstream_fd = -1;
+                    (void)detach_upstream_close(loop, conn);
                     conn.upstream_idx = 0;
-                    loop->clear_upstream_fd(conn.id);
-                    conn.upstream_recv_armed = false;
-                    conn.upstream_send_armed = false;
                 }
                 conn.upstream_fd = kUpstreamFd;
                 conn.upstream_idx = static_cast<u16>(upstream_id);
@@ -2138,10 +2131,8 @@ void handle_jit_outcome(Loop* loop,
                 conn.upstream_backend_idx = static_cast<u8>(kBackend);
                 if (!loop->submit_connect(
                         conn, &target.addrs[kBackend], sizeof(target.addrs[kBackend]))) {
-                    ::close(conn.upstream_fd);
-                    conn.upstream_fd = -1;
+                    (void)detach_upstream_close(loop, conn);
                     conn.upstream_idx = 0;
-                    loop->clear_upstream_fd(conn.id);
                     send_bad_gateway();
                     return;
                 }
@@ -2527,12 +2518,8 @@ void handle_jit_outcome(Loop* loop,
             else
                 conn.upstream_name[sizeof(conn.upstream_name) - 1] = '\0';
             if (conn.upstream_fd >= 0) {
-                ::close(conn.upstream_fd);
-                conn.upstream_fd = -1;
+                (void)detach_upstream_close(loop, conn);
                 conn.upstream_idx = 0;
-                loop->clear_upstream_fd(conn.id);
-                conn.upstream_recv_armed = false;
-                conn.upstream_send_armed = false;
             }
             conn.upstream_idx = static_cast<u16>(outcome.upstream_id);
             conn.upstream_attempts = 1;  // initial attempt; on_upstream_connected retries
@@ -2599,10 +2586,8 @@ void handle_jit_outcome(Loop* loop,
                 if (conn.failure_policy_id != 0) {
                     respond_upstream_connect_failure(loop, conn);
                 } else {
-                    ::close(conn.upstream_fd);
-                    conn.upstream_fd = -1;
+                    (void)detach_upstream_close(loop, conn);
                     conn.upstream_idx = 0;
-                    loop->clear_upstream_fd(conn.id);
                     conn.resp_status = kStatusBadGateway;
                     format_static_response(conn, 502, /*keep_alive=*/false);
                     conn.keep_alive = false;
@@ -2678,13 +2663,7 @@ bool try_connect_next_backend(Loop* loop, Connection& conn) {
         target.addr_count < kMaxConnectAttempts ? target.addr_count : kMaxConnectAttempts;
     if (conn.upstream_attempts >= kBudget) return false;  // budget exhausted
 
-    if (conn.upstream_fd >= 0) {
-        ::close(conn.upstream_fd);
-        conn.upstream_fd = -1;
-        loop->clear_upstream_fd(conn.id);
-        conn.upstream_recv_armed = false;
-        conn.upstream_send_armed = false;
-    }
+    (void)detach_upstream_close(loop, conn);
     const i32 kFd = UpstreamPool::create_socket();
     if (kFd < 0) return false;
     conn.upstream_fd = kFd;
@@ -2696,13 +2675,7 @@ bool try_connect_next_backend(Loop* loop, Connection& conn) {
     conn.upstream_backend_idx = static_cast<u8>(kBackend);
     if (loop->submit_connect(conn, &target.addrs[kBackend], sizeof(target.addrs[kBackend])))
         return true;
-    if (conn.upstream_fd >= 0) {
-        ::close(conn.upstream_fd);
-        conn.upstream_fd = -1;
-        loop->clear_upstream_fd(conn.id);
-        conn.upstream_recv_armed = false;
-        conn.upstream_send_armed = false;
-    }
+    (void)detach_upstream_close(loop, conn);
     return false;
 }
 
@@ -2716,13 +2689,7 @@ bool try_connect_next_backend(Loop* loop, Connection& conn) {
 // slots so only the client-send callback runs.
 template <typename Loop>
 void respond_upstream_timeout(Loop* loop, Connection& conn) {
-    if (conn.upstream_fd >= 0) {
-        ::close(conn.upstream_fd);
-        conn.upstream_fd = -1;
-        loop->clear_upstream_fd(conn.id);
-        conn.upstream_recv_armed = false;
-        conn.upstream_send_armed = false;
-    }
+    (void)detach_upstream_close(loop, conn);
     conn.upstream_abandoned = true;
     static const char k504[] =
         "HTTP/1.1 504 Gateway Timeout\r\n"
@@ -3453,11 +3420,7 @@ void on_upstream_connected(void* lp, Connection& conn, IoEvent ev) {
             // client that stalls reading the 500 can't pin an idle upstream fd /
             // concurrency slot until keepalive/timeout (close_conn would otherwise only
             // reap it once the downstream connection finally goes away).
-            if (conn.upstream_fd >= 0) {
-                ::close(conn.upstream_fd);
-                conn.upstream_fd = -1;
-                loop->clear_upstream_fd(conn.id);
-            }
+            (void)detach_upstream_close(loop, conn);
             release_upstream_slot(loop, conn);
             static const char k500[] =
                 "HTTP/1.1 500 Internal Server Error\r\n"
@@ -3732,11 +3695,7 @@ void h2_proxy_teardown_upstream(Loop* loop, Connection& conn) {
     // ever armed there.) close() doesn't cancel these SQEs — their CQEs still come.
     if (conn.upstream_recv_armed) conn.h2_proxy_recv_draining = true;
     if (conn.upstream_send_armed) conn.h2_proxy_synth_quarantined = true;
-    if (conn.upstream_fd >= 0) {
-        ::close(conn.upstream_fd);
-        conn.upstream_fd = -1;
-        loop->clear_upstream_fd(conn.id);
-    }
+    (void)detach_upstream_close(loop, conn);
     // epoll-only: drop any partial upstream send still referencing pending_synth so
     // a later EPOLLOUT on a reused upstream fd can't ship overwritten bytes to the
     // next backend (io_uring uses the h2_proxy_synth_quarantined SQE-drain path).
@@ -5787,13 +5746,7 @@ inline void respond_upstream_connect_failure(Loop* loop, Connection& conn) {
     if constexpr (requires { loop->discard_upstream_send(conn); }) {
         loop->discard_upstream_send(conn);
     }
-    if (conn.upstream_fd >= 0) {
-        ::close(conn.upstream_fd);
-        conn.upstream_fd = -1;
-        loop->clear_upstream_fd(conn.id);
-    }
-    conn.upstream_recv_armed = false;
-    conn.upstream_send_armed = false;
+    (void)detach_upstream_close(loop, conn);
     release_upstream_slot(loop, conn);
 
     bool serialized = false;
@@ -6204,13 +6157,7 @@ inline void abandon_strict_upstream(Loop* loop, Connection& conn) {
     if constexpr (requires { loop->discard_upstream_send(conn); }) {
         loop->discard_upstream_send(conn);
     }
-    if (conn.upstream_fd >= 0) {
-        ::close(conn.upstream_fd);
-        conn.upstream_fd = -1;
-        loop->clear_upstream_fd(conn.id);
-    }
-    conn.upstream_recv_armed = false;
-    conn.upstream_send_armed = false;
+    (void)detach_upstream_close(loop, conn);
     release_upstream_slot(loop, conn);
 }
 
@@ -6292,10 +6239,7 @@ void on_upstream_response(void* lp, Connection& conn, IoEvent ev) {
             reject_strict_response(loop, conn);
             return;
         }
-        if (conn.upstream_fd >= 0) {
-            ::close(conn.upstream_fd);
-            conn.upstream_fd = -1;
-        }
+        (void)detach_upstream_close(loop, conn);
         static const char k502[] =
             "HTTP/1.1 502 Bad Gateway\r\n"
             "Content-Length: 11\r\n"
@@ -6530,10 +6474,7 @@ void on_upstream_response(void* lp, Connection& conn, IoEvent ev) {
                     body_start + pos, kInitialBodyLen - pos, &consumed, &out_start, &out_len);
                 pos += consumed;
                 if (kChunkStatus == ChunkStatus::Error) {
-                    if (conn.upstream_fd >= 0) {
-                        ::close(conn.upstream_fd);
-                        conn.upstream_fd = -1;
-                    }
+                    (void)detach_upstream_close(loop, conn);
                     static const char k502[] =
                         "HTTP/1.1 502 Bad Gateway\r\n"
                         "Content-Length: 11\r\n"
@@ -6594,10 +6535,7 @@ void on_upstream_response(void* lp, Connection& conn, IoEvent ev) {
                 break;
             }
             if (kChunkStatus == ChunkStatus::Error) {
-                if (conn.upstream_fd >= 0) {
-                    ::close(conn.upstream_fd);
-                    conn.upstream_fd = -1;
-                }
+                (void)detach_upstream_close(loop, conn);
                 static const char k502[] =
                     "HTTP/1.1 502 Bad Gateway\r\n"
                     "Content-Length: 11\r\n"

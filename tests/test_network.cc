@@ -10611,6 +10611,7 @@ TEST(epoll_loop, add_recv_preserves_pending_send_epollout) {
     CHECK_EQ(recv(dfds[1], rb, sizeof(rb), MSG_DONTWAIT), static_cast<ssize_t>(sizeof(down)));
 
     // Upstream: symmetric — a client→upstream send pending on the upstream fd.
+    REQUIRE(loop->begin_upstream_episode(*c));
     REQUIRE(loop->backend.add_recv_upstream(ufds[0], cid, loop->conns[cid].upstream_episode));
     static const u8 up[] = {'P', 'I', 'N', 'G'};
     loop->backend.upstream_send_state[cid] = {
@@ -11007,6 +11008,7 @@ TEST(epoll_episode, stale_raw_recv_does_not_touch_buffer_and_current_token_recov
     conns[0].upstream_episode = 2;
     u8 storage[64] = {};
     conns[0].upstream_recv_buf.bind(storage, sizeof(storage));
+    REQUIRE(backend.begin_upstream_episode(0, 1));
     REQUIRE(backend.add_recv_upstream(fds[0], 0, 1));
     static constexpr char kBytes[] = "stale";
     REQUIRE_EQ(write(fds[1], kBytes, sizeof(kBytes) - 1),
@@ -11038,6 +11040,7 @@ TEST(epoll_episode, current_recv_drops_stale_send_interest_without_mutating_stat
     conns[0].upstream_episode = 1;
     u8 storage[64] = {};
     conns[0].upstream_recv_buf.bind(storage, sizeof(storage));
+    REQUIRE(backend.begin_upstream_episode(0, 1));
     static const u8 payload[] = {'o', 'l', 'd'};
     backend.upstream_send_state[0] = {
         payload, fds[0], 0, sizeof(payload), IoEventType::UpstreamSend, false, 0, 2};
@@ -11079,6 +11082,7 @@ TEST(epoll_episode, stale_partial_send_does_not_touch_state_or_wire) {
     conns[0].id = 0;
     conns[0].upstream_episode = 2;
     static const u8 payload[] = {'s', 't', 'a', 'l', 'e'};
+    REQUIRE(backend.begin_upstream_episode(0, 1));
     REQUIRE(backend.add_send_upstream(fds[0], 0, payload, sizeof(payload), 1));
     u8 drained[8192];
     while (recv(fds[1], drained, sizeof(drained), MSG_DONTWAIT) > 0) {}
@@ -11102,9 +11106,14 @@ TEST(epoll_episode, synthetic_upstream_completion_preserves_episode_and_aux) {
     i32 fds[2] = {-1, -1};
     REQUIRE_EQ(socketpair(AF_UNIX, SOCK_STREAM | SOCK_NONBLOCK, 0, fds), 0);
     static const u8 payload[] = {'o', 'k'};
+    Connection conns[1]{};
+    conns[0].reset();
+    conns[0].id = 0;
+    conns[0].upstream_episode = 7;
+    REQUIRE(backend.begin_upstream_episode(0, 7));
     REQUIRE(backend.add_send_upstream(fds[0], 0, payload, sizeof(payload), 7));
     IoEvent events[2]{};
-    REQUIRE_EQ(backend.wait(events, 2, nullptr, 0), 1u);
+    REQUIRE_EQ(backend.wait(events, 2, conns, 1), 1u);
     CHECK_EQ(events[0].type, IoEventType::UpstreamSend);
     CHECK_EQ(events[0].result, static_cast<i32>(sizeof(payload)));
     CHECK_EQ(events[0].upstream_episode, 7u);
@@ -11116,8 +11125,10 @@ TEST(epoll_episode, synthetic_upstream_completion_preserves_episode_and_aux) {
     REQUIRE(failure_backend.init(0, -1).has_value());
     close(failure_backend.epoll_fd);
     failure_backend.epoll_fd = -1;
+    conns[0].upstream_episode = 9;
+    REQUIRE(failure_backend.begin_upstream_episode(0, 9));
     CHECK(failure_backend.add_recv_upstream(-1, 0, 9));
-    REQUIRE_EQ(failure_backend.wait(events, 2, nullptr, 0), 1u);
+    REQUIRE_EQ(failure_backend.wait(events, 2, conns, 1), 1u);
     CHECK_EQ(events[0].type, IoEventType::UpstreamRecv);
     CHECK_EQ(events[0].upstream_episode, 9u);
     CHECK_EQ(events[0].aux, kLocalSubmitFailureAux);
@@ -11148,7 +11159,8 @@ TEST(epoll_episode, dispatch_rejects_stale_tag_before_callback) {
     auto* conn = loop->alloc_conn();
     REQUIRE(conn != nullptr);
     conn->fd = -1;
-    conn->upstream_episode = 2;
+    conn->upstream_episode = 1;
+    REQUIRE(loop->begin_upstream_episode(*conn));
     conn->upstream_recv_armed = true;
     conn->upstream_send_armed = true;
     g_epoll_episode_callback_called = false;
@@ -11157,13 +11169,12 @@ TEST(epoll_episode, dispatch_rejects_stale_tag_before_callback) {
     const bool send_armed_before = conn->upstream_send_armed;
     loop->timer.add(conn, 5);
     ListNode* timer_node_before = conn->timer_node.prev;
-    loop->dispatch({conn->id, 0, 0, 0, IoEventType::UpstreamSend, 0, 0, 1});
+    loop->dispatch({conn->id, 0, 0, 0, IoEventType::UpstreamSend, 0, 0, 2});
     CHECK_EQ(conn->timer_node.prev, timer_node_before);
     CHECK_FALSE(g_epoll_episode_callback_called);
     CHECK_EQ(conn->upstream_recv_armed, recv_armed_before);
     CHECK_EQ(conn->upstream_send_armed, send_armed_before);
     // Positive control: the same callback is reached when the token matches.
-    conn->upstream_episode = 1;
     g_epoll_episode_callback_called = false;
     loop->dispatch({conn->id, 0, 0, 0, IoEventType::UpstreamSend, 0, 0, 1});
     CHECK(g_epoll_episode_callback_called);
@@ -11184,6 +11195,7 @@ TEST(epoll_episode, stale_tls_send_cannot_rearm_or_hijack_current_recv) {
     conns[0].upstream_episode = 1;
     u8 storage[64] = {};
     conns[0].upstream_recv_buf.bind(storage, sizeof(storage));
+    REQUIRE(backend.begin_upstream_episode(0, 1));
     static const u8 payload[] = {'s', 't', 'a', 'l', 'e'};
     // Register a current EPOLLIN|EPOLLOUT interest, then make only the
     // stored send state stale. The real fd/readiness path must not perform the
