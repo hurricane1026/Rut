@@ -17,8 +17,8 @@ Allowed states are `SUPPORTED`, `PARTIAL`, `BLOCKED_BY_RUT`,
 | preserve raw request-target and query | implicit | yes | partial: origin-form forward sends original bytes | pinned query differential; broader normalization untested | PARTIAL |
 | preserve request method and body | implicit | yes | partial: fixed-CL body is staged before connect within one 16 KiB composite slice | RUT exact binary/segmented/boundary tests and pinned generated-RUT binary POST differential | PARTIAL |
 | nginx default upstream HTTP version and request headers | implicit | yes | partial: explicit fixed HTTP/1.1 policy with bounded fixed-CL buffering; #252 | exact RUT tests plus pinned generated-RUT GET and POST differentials | PARTIAL |
-| proxied response status and body | implicit | yes | partial: strict final H1.1 exact-Content-Length streaming plus internal-only explicit-close HEAD success; explicit HEAD failure metadata exists but serializer is absent | exact RUT tests, pinned generated-RUT GET/POST differentials, and nginx-only HEAD success/gateway baselines | PARTIAL |
-| nginx default proxied response header policy | implicit | yes | partial: bounded strict H1.1 final-response/content-length serializer; internal-only explicit-close HEAD success and fail-closed failure metadata; failure runtime/source paths absent; #253 | exact RUT/token/HEAD tests, pinned generated-RUT GET/POST/close differentials, and nginx-only HEAD success/gateway baselines | PARTIAL |
+| proxied response status and body | implicit | yes | partial: strict final H1.1 exact-Content-Length streaming plus internal-only paired explicit-close HEAD success/connect-failure serialization; source selection absent | exact RUT success/failure/lifecycle tests, pinned generated-RUT GET/POST differentials, and nginx-only HEAD success/gateway baselines | PARTIAL |
+| nginx default proxied response header policy | implicit | yes | partial: bounded strict H1.1 final-response/content-length serializer and internal-only paired explicit-close HEAD success/connect-failure policy; public source/converter paths absent; #253 | exact RUT token/HEAD/request-policy/no-pool tests, pinned generated-RUT GET/POST/close differentials, and nginx-only HEAD success/gateway baselines | PARTIAL |
 | single unavailable upstream gateway error | implicit | yes | yes for bounded H1 single-IPv4 connect failures; #256 | committed pinned close/EOF differential plus pinned keep-alive and split-POST evidence | SUPPORTED |
 | exact, `^~`, regex, or nested locations | no | no | no nginx selection semantics | no | NOT_PLANNED |
 | exact `/api/` + proxy URI `/`, clean bounded H1 request domain | yes | yes | yes: bounded prefix replacement; #259 closed | pinned converter-generated `/api/`, `/api/x`, and query differentials; four out-of-domain targets fail before upstream | SUPPORTED |
@@ -58,11 +58,11 @@ Allowed states are `SUPPORTED`, `PARTIAL`, `BLOCKED_BY_RUT`,
 - Pinned nginx also suppresses the 157-byte generated 502 body for an
   explicit-close HEAD when the single upstream connect fails, while retaining
   `Content-Length: 157`. RUT now carries a source-unreachable shared HEAD
-  disposition in response and failure metadata: legacy policies remain
-  `Reject`, and failure `SuppressBody` currently fails before body waiting or
-  upstream effects. Serialization is still absent; only a future paired
-  `SuppressBody` selection may enter the bounded header-only connect-failure
-  path. No public source/converter claim exists yet.
+  disposition in response and failure metadata. Legacy policies remain
+  `Reject`; only paired `SuppressBody` enters a bounded fresh-connect path that
+  emits header-only strict success or configured 502, forces EOF, and never
+  pools/replays the upstream. Mismatches fail before upstream effects. Public
+  source and converter selection are still absent.
 - The first request-policy slice rejects body/framing inputs (including
   `Content-Length` and every `Transfer-Encoding` value), HTTP/2, and
   non-origin-form targets before upstream connect. These are intentional
