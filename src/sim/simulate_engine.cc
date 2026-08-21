@@ -18,6 +18,7 @@
 #include "rut/runtime/traffic_replay.h"
 
 #include <fcntl.h>
+#include <memory>
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <unistd.h>
@@ -25,6 +26,11 @@
 namespace rut::sim {
 
 namespace {
+
+static void reset_module(rir::Module& module) {
+    std::destroy_at(&module);
+    std::construct_at(&module);
+}
 
 static u32 cstr_len(const char* s) {
     u32 n = 0;
@@ -389,14 +395,14 @@ bool ModuleContext::init(u32 func_cap, u32 struct_cap) {
     next.functions = arena.alloc_array<rir::Function>(next.func_cap);
     if (!next.functions) {
         arena.destroy();
-        module = rir::Module{};
+        reset_module(module);
         return false;
     }
     next.struct_cap = struct_cap == 0 ? 1 : struct_cap;
     next.struct_defs = arena.alloc_array<rir::StructDef*>(next.struct_cap);
     if (!next.struct_defs) {
         arena.destroy();
-        module = rir::Module{};
+        reset_module(module);
         return false;
     }
 
@@ -406,7 +412,7 @@ bool ModuleContext::init(u32 func_cap, u32 struct_cap) {
 
 void ModuleContext::destroy() {
     arena.destroy();
-    module = rir::Module{};
+    reset_module(module);
 }
 
 bool load_manifest(const char* path, Manifest& out) {
