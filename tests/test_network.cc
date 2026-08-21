@@ -15393,6 +15393,103 @@ TEST(iouring_episode, current_partial_send_resubmits_with_current_episode) {
     backend.shutdown();
 }
 
+TEST(iouring_episode, generic_async_dispatch_fences_stale_and_neutral_events) {
+    auto loop = std::make_unique<EventLoop<AsyncMockBackend>>();
+    REQUIRE(loop->init(0, -1).has_value());
+    auto* conn = loop->alloc_conn();
+    REQUIRE(conn != nullptr);
+    conn->fd = 42;
+    conn->state = ConnState::Proxying;
+    conn->upstream_episode = 2;
+    conn->on_upstream_send = &test_sentinel_callback<EventLoop<AsyncMockBackend>>;
+    conn->upstream_send_armed = true;
+    conn->pending_ops = 3;
+    loop->timer.add(conn, 5);
+    ListNode* timer_bucket_before = conn->timer_node.prev;
+
+    g_callback_invoked = false;
+    const IoEvent stale_connect{conn->id,
+                                0,
+                                0,
+                                0,
+                                IoEventType::UpstreamConnect,
+                                1,
+                                0,
+                                1};
+    loop->dispatch(stale_connect);
+    CHECK_FALSE(g_callback_invoked);
+    CHECK(conn->upstream_send_armed);
+    CHECK_EQ(conn->pending_ops, 3u);  // intermediate stale CQE stays in flight
+    CHECK_EQ(conn->timer_node.prev, timer_bucket_before);
+
+    const IoEvent stale_send{conn->id,
+                             0,
+                             0,
+                             0,
+                             IoEventType::UpstreamSend,
+                             0,
+                             0,
+                             1};
+    loop->dispatch(stale_send);
+    CHECK_FALSE(g_callback_invoked);
+    CHECK(conn->upstream_send_armed);
+    CHECK_EQ(conn->pending_ops, 2u);  // final stale CQE retires exactly once
+    CHECK_EQ(conn->timer_node.prev, timer_bucket_before);
+
+    g_callback_invoked = false;
+    const IoEvent current_send{conn->id,
+                               0,
+                               0,
+                               0,
+                               IoEventType::UpstreamSend,
+                               0,
+                               0,
+                               2};
+    loop->dispatch(current_send);
+    CHECK(g_callback_invoked);
+    CHECK_FALSE(conn->upstream_send_armed);
+    CHECK_EQ(conn->pending_ops, 1u);
+    CHECK_NE(conn->timer_node.prev, timer_bucket_before);
+
+    // Episode zero is the legacy/mock event representation, not a malformed
+    // io_uring token. Generic EventLoop dispatch must continue to deliver it.
+    conn->upstream_send_armed = true;
+    g_callback_invoked = false;
+    const IoEvent neutral_send{conn->id, 0, 0, 0, IoEventType::UpstreamSend, 0, 0, 0};
+    loop->dispatch(neutral_send);
+    CHECK(g_callback_invoked);
+    CHECK_FALSE(conn->upstream_send_armed);
+    CHECK_EQ(conn->pending_ops, 0u);
+
+    loop->free_conn(*conn);
+    loop->shutdown();
+}
+
+TEST(iouring_episode, generic_async_dispatch_reclaims_closed_stale_slot_once) {
+    auto loop = std::make_unique<EventLoop<AsyncMockBackend>>();
+    REQUIRE(loop->init(0, -1).has_value());
+    auto* conn = loop->alloc_conn();
+    REQUIRE(conn != nullptr);
+    const u32 conn_id = conn->id;
+    const u32 free_top_before = loop->free_top;
+    conn->fd = -1;
+    conn->upstream_episode = 2;
+    conn->pending_ops = 1;
+    loop->free_conn(*conn);
+    CHECK_EQ(loop->pending_free_count, 1u);
+    CHECK_EQ(loop->free_top, free_top_before);
+
+    const IoEvent stale_final{conn_id, 0, 0, 0, IoEventType::UpstreamSend, 0, 0, 1};
+    loop->dispatch(stale_final);
+    CHECK_EQ(loop->pending_free_count, 0u);
+    CHECK_EQ(loop->free_top, free_top_before + 1);
+    auto* reused = loop->alloc_conn();
+    REQUIRE(reused != nullptr);
+    CHECK_EQ(reused->id, conn_id);
+    loop->free_conn(*reused);
+    loop->shutdown();
+}
+
 TEST(iouring_episode, stale_provided_recv_returns_buffer_without_copy) {
     IoUringBackend backend{};
     auto initialized = backend.init(0, -1);
@@ -15435,6 +15532,73 @@ TEST(iouring_episode, stale_provided_recv_returns_buffer_without_copy) {
         CHECK_EQ(conns[0].upstream_recv_buf.len(), 0u);
         for (const u8 byte : storage) CHECK_EQ(byte, static_cast<u8>(0xA5));
     }
+
+    close(fds[0]);
+    close(fds[1]);
+    backend.shutdown();
+}
+
+TEST(iouring_episode, stale_provided_buffer_is_reusable) {
+    IoUringBackend backend{};
+    auto initialized = backend.init(0, -1);
+    if (!initialized) SKIP("io_uring unavailable");
+
+    i32 fds[2] = {-1, -1};
+    if (socketpair(AF_UNIX, SOCK_STREAM, 0, fds) != 0) {
+        backend.shutdown();
+        SKIP("socketpair unavailable");
+    }
+    Connection conns[1]{};
+    conns[0].reset();
+    conns[0].id = 0;
+    conns[0].upstream_episode = 2;
+    u8 storage[64];
+    for (u8& byte : storage) byte = 0xC3;
+    conns[0].upstream_recv_buf.bind(storage, sizeof(storage));
+    CHECK(backend.add_recv_upstream(fds[0], 0, 1));  // stale against live episode 2
+    static const char first[] = "first";
+    CHECK_EQ(write(fds[1], first, sizeof(first) - 1),
+             static_cast<ssize_t>(sizeof(first) - 1));
+    IoEvent events[8]{};
+    bool first_found = false;
+    for (u32 attempt = 0; attempt < 3 && !first_found; attempt++) {
+        const u32 count = backend.wait(events, 8, conns, 1);
+        for (u32 i = 0; i < count; i++) {
+            if (events[i].type == IoEventType::UpstreamRecv && events[i].result > 0) {
+                CHECK_EQ(events[i].result, 5);
+                CHECK_EQ(events[i].upstream_episode, 1u);
+                CHECK(io_event_is_tagged_stale(events[i], conns[0].upstream_episode));
+                first_found = true;
+                break;
+            }
+        }
+    }
+    REQUIRE(first_found);
+    CHECK_EQ(conns[0].upstream_recv_buf.len(), 0u);
+    for (const u8 byte : storage) CHECK_EQ(byte, static_cast<u8>(0xC3));
+
+    // The multishot recv remains armed; a second kernel completion proves the
+    // provided buffer was returned and made available for reuse.
+    static const char second[] = "second!";
+    CHECK_EQ(write(fds[1], second, sizeof(second) - 1),
+             static_cast<ssize_t>(sizeof(second) - 1));
+    bool second_found = false;
+    for (u32 attempt = 0; attempt < 3 && !second_found; attempt++) {
+        const u32 count = backend.wait(events, 8, conns, 1);
+        for (u32 i = 0; i < count; i++) {
+            if (events[i].type == IoEventType::UpstreamRecv && events[i].result > 0) {
+                CHECK_EQ(events[i].result, 7);
+                CHECK_EQ(events[i].upstream_episode, 1u);
+                CHECK(io_event_is_tagged_stale(events[i], conns[0].upstream_episode));
+                CHECK_NE(events[i].result, -ENOBUFS);
+                second_found = true;
+                break;
+            }
+        }
+    }
+    REQUIRE(second_found);
+    CHECK_EQ(conns[0].upstream_recv_buf.len(), 0u);
+    for (const u8 byte : storage) CHECK_EQ(byte, static_cast<u8>(0xC3));
 
     close(fds[0]);
     close(fds[1]);
@@ -15511,6 +15675,8 @@ TEST(iouring_episode, stale_dispatch_preserves_current_upstream_state) {
     conn->fd = -1;
     conn->upstream_fd = -1;
     conn->on_upstream_recv = &on_response_body_recvd<IoUringEventLoop>;
+    loop->timer.add(conn, 5);
+    ListNode* timer_bucket_before = conn->timer_node.prev;
 
     const IoEvent stale{conn->id, 7, 0, 0, IoEventType::UpstreamRecv, 0, 0, 1};
     loop->dispatch(stale);
@@ -15518,6 +15684,37 @@ TEST(iouring_episode, stale_dispatch_preserves_current_upstream_state) {
     CHECK(conn->upstream_send_armed);
     CHECK_EQ(conn->pending_ops, 2u);
     CHECK_EQ(conn->on_upstream_recv, &on_response_body_recvd<IoUringEventLoop>);
+
+    g_callback_invoked = false;
+    conn->on_upstream_send = &test_sentinel_callback<IoUringEventLoop>;
+    conn->upstream_send_armed = true;
+    const IoEvent stale_connect{conn->id,
+                                0,
+                                0,
+                                0,
+                                IoEventType::UpstreamConnect,
+                                1,
+                                0,
+                                1};
+    loop->dispatch(stale_connect);
+    CHECK_FALSE(g_callback_invoked);
+    CHECK(conn->upstream_send_armed);
+    CHECK_EQ(conn->pending_ops, 2u);  // more=1 remains in flight
+    CHECK_EQ(conn->timer_node.prev, timer_bucket_before);
+
+    const IoEvent stale_send{conn->id,
+                             0,
+                             0,
+                             0,
+                             IoEventType::UpstreamSend,
+                             0,
+                             0,
+                             1};
+    loop->dispatch(stale_send);
+    CHECK_FALSE(g_callback_invoked);
+    CHECK(conn->upstream_send_armed);
+    CHECK_EQ(conn->pending_ops, 1u);  // final stale completion retires once
+    CHECK_EQ(conn->timer_node.prev, timer_bucket_before);
 
     g_callback_invoked = false;
     conn->on_upstream_recv = &test_sentinel_callback<IoUringEventLoop>;
@@ -15531,7 +15728,7 @@ TEST(iouring_episode, stale_dispatch_preserves_current_upstream_state) {
                             kInvalidUpstreamEventEpisode};
     loop->dispatch(malformed);
     CHECK_FALSE(g_callback_invoked);
-    CHECK_EQ(conn->pending_ops, 2u);
+    CHECK_EQ(conn->pending_ops, 1u);
 
     conn->upstream_recv_armed = false;
     conn->upstream_send_armed = false;
