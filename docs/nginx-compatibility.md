@@ -99,10 +99,12 @@ Allowed states are `SUPPORTED`, `PARTIAL`, `BLOCKED_BY_RUT`,
   same-slot/same-fd reprobe, stale-completion isolation, and a current-token wire
   control. A production-owned active-episode regression now also proves upstream
   quiesce removes genuine HUP readiness while owner/token/map remain current, then
-  retires cleanly. A literal #262 acceptance audit still requires captured raw
-  send/connect readiness across production detach/reuse, so #262 stays open. This
-  transport work alone does not imply keep-alive HEAD support; cancellation/drain
-  lifecycle and the remaining #253 response semantics are still required.
+  retires cleanly. A kernel-produced raw connect record, held in the test harness,
+  is also rejected before I/O after production same-slot/same-fd reuse while the
+  current completion progresses. Captured raw partial-send readiness remains, so
+  #262 stays open. This transport work alone does not imply keep-alive HEAD
+  support; cancellation/drain lifecycle and the remaining #253 response semantics
+  are still required.
 - The first request-policy slice rejects body/framing inputs (including
   `Content-Length` and every `Transfer-Encoding` value), HTTP/2, and
   non-origin-form targets before upstream connect. These are intentional
