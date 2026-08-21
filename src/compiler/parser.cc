@@ -1865,6 +1865,7 @@ struct Parser {
                         bool have_server = false;
                         bool have_date = false;
                         bool have_hide_headers = false;
+                        bool have_head_mode = false;
                         while (true) {
                             auto field = expect(TokenType::Ident);
                             if (!field) return core::make_unexpected(field.error());
@@ -1921,6 +1922,19 @@ struct Parser {
                                                           span_from(*value.value()),
                                                           value.value()->text);
                                 policy.date = ResponsePolicyDate::Current;
+                            } else if (field_name.eq({"head_mode", 9})) {
+                                seen = &have_head_mode;
+                                auto value = expect(TokenType::StringLit);
+                                if (!value) return core::make_unexpected(value.error());
+                                if (value.value()->text.eq({"reject", 6})) {
+                                    policy.head_mode = ResponsePolicyHeadMode::Reject;
+                                } else if (value.value()->text.eq({"suppress_body", 13})) {
+                                    policy.head_mode = ResponsePolicyHeadMode::SuppressBody;
+                                } else {
+                                    return frontend_error(FrontendError::UnsupportedSyntax,
+                                                          span_from(*value.value()),
+                                                          value.value()->text);
+                                }
                             } else if (field_name.eq({"hide_headers", 12})) {
                                 seen = &have_hide_headers;
                                 auto lbracket = expect(TokenType::LBracket);
@@ -1996,6 +2010,7 @@ struct Parser {
                         bool have_date = false;
                         bool have_connection = false;
                         bool have_body = false;
+                        bool have_head_mode = false;
                         while (true) {
                             auto field = expect(TokenType::Ident);
                             if (!field) return core::make_unexpected(field.error());
@@ -2055,6 +2070,19 @@ struct Parser {
                                                           span_from(*value.value()),
                                                           value.value()->text);
                                 policy.connection = ForwardFailurePolicyConnection::Request;
+                            } else if (field_name.eq({"head_mode", 9})) {
+                                seen = &have_head_mode;
+                                auto value = expect(TokenType::StringLit);
+                                if (!value) return core::make_unexpected(value.error());
+                                if (value.value()->text.eq({"reject", 6})) {
+                                    policy.head_mode = FailurePolicyHeadMode::Reject;
+                                } else if (value.value()->text.eq({"suppress_body", 13})) {
+                                    policy.head_mode = FailurePolicyHeadMode::SuppressBody;
+                                } else {
+                                    return frontend_error(FrontendError::UnsupportedSyntax,
+                                                          span_from(*value.value()),
+                                                          value.value()->text);
+                                }
                             } else if (field_name.eq({"body", 4})) {
                                 seen = &have_body;
                                 auto value = parse_failure_body_literal();

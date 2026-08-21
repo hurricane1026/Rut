@@ -322,6 +322,21 @@ return forward(users, response_policy: {
     version: "HTTP/1.1", framing: "content_length", connection: "request",
     server: "nginx/1.29.7", date: "current", hide_headers: ["Date", "Server", "X-Pad"]
 })
+// Public HEAD suppression is an explicit paired source contract:
+return forward(users,
+    response_policy: {
+        version: "HTTP/1.1", framing: "content_length", connection: "request",
+        head_mode: "suppress_body", server: "nginx/1.29.7", date: "current",
+        hide_headers: ["Date", "Server", "X-Pad"]
+    },
+    failure_policy: {
+        version: "HTTP/1.1", status: 502, reason: "Bad Gateway",
+        content_type: "text/html", server: "nginx/1.29.7", date: "current",
+        connection: "request", head_mode: "suppress_body", body: b"<html>...</html>"
+    })
+// head_mode defaults to "reject". "suppress_body" is accepted in source only
+// when both policies select it; it remains bounded to cleartext H1.1, bodyless
+// explicit-close HEAD, one IPv4 upstream, and connect-establishment failures.
 // response_policy.connection: "keep_alive" requires a keep-alive downstream
 // request and emits keep-alive. "request" follows the parsed downstream
 // HTTP/1.1 intent, emitting keep-alive by default and close for

@@ -9,6 +9,7 @@
 #include "rut/runtime/listener.h"
 #include "test.h"
 #include <cstdio>
+#include <cstring>
 #include <filesystem>
 #include <fstream>
 #include <string>
@@ -32512,6 +32513,285 @@ TEST(frontend, response_policy_rejects_invalid_values_duplicates_and_missing_fie
     }
 }
 
+TEST(frontend, public_head_mode_pair_lowers_with_modes_and_bundle) {
+    const char source[] = R"rut(
+upstream backend at "127.0.0.1:9000"
+route GET "/head" {
+    return forward(backend,
+        response_policy: {
+            version: "HTTP/1.1", framing: "content_length", connection: "request",
+            head_mode: "suppress_body", server: "nginx", date: "current", hide_headers: []
+        },
+        failure_policy: {
+            version: "HTTP/1.1", status: 502, reason: "Bad Gateway",
+            content_type: "text/plain", server: "nginx", date: "current",
+            connection: "request", head_mode: "suppress_body", body: b"x"
+        })
+}
+)rut";
+    auto lexed = lex(lit(source));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    REQUIRE_EQ(ast->response_policies.len, 1u);
+    REQUIRE_EQ(ast->failure_policies.len, 1u);
+    CHECK_EQ(ast->response_policies[0].head_mode, ResponsePolicyHeadMode::SuppressBody);
+    CHECK_EQ(ast->failure_policies[0].head_mode, FailurePolicyHeadMode::SuppressBody);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    CHECK_EQ(hir->routes[0].control.direct_term.forward_response_policy_id, 1u);
+    CHECK_EQ(hir->routes[0].control.direct_term.forward_failure_policy_id, 1u);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    CHECK_EQ(mir->functions[0].blocks[0].term.forward_response_policy_id, 1u);
+    CHECK_EQ(mir->functions[0].blocks[0].term.forward_failure_policy_id, 1u);
+    FrontendRirModule rir{};
+    REQUIRE(lower_to_rir(mir.value(), rir));
+    REQUIRE_EQ(rir.module.policy_bundle_count, 1u);
+    CHECK_EQ(rir.module.policy_bundles[0].response_policy_id, 1u);
+    CHECK_EQ(rir.module.policy_bundles[0].failure_policy_id, 1u);
+    CHECK_EQ(rir.module.response_policies[0].head_mode, ResponsePolicyHeadMode::SuppressBody);
+    CHECK_EQ(rir.module.failure_policies[0].head_mode, FailurePolicyHeadMode::SuppressBody);
+    const auto& block = rir.module.functions[0].blocks[0];
+    CHECK_EQ(block.insts[block.inst_count - 1].op, rir::Opcode::RetForwardBundle);
+    rir.destroy();
+}
+
+TEST(frontend, public_head_mode_omission_and_explicit_reject_preserve_legacy) {
+    const char source[] = R"rut(
+upstream b at "127.0.0.1:9000"
+route GET "/" {
+    return forward(b,
+        response_policy: {
+            version: "HTTP/1.1", framing: "content_length", connection: "request",
+            head_mode: "reject", server: "s", date: "current", hide_headers: []
+        },
+        failure_policy: {
+            version: "HTTP/1.1", status: 502, reason: "Bad Gateway",
+            content_type: "text/plain", server: "s", date: "current",
+            connection: "request", head_mode: "reject", body: b"x"
+        })
+}
+)rut";
+    auto lexed = lex(lit(source));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    CHECK_EQ(ast->response_policies[0].head_mode, ResponsePolicyHeadMode::Reject);
+    CHECK_EQ(ast->failure_policies[0].head_mode, FailurePolicyHeadMode::Reject);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+
+    const char omitted[] = R"rut(
+upstream b at "127.0.0.1:9000"
+route GET "/" {
+    return forward(b,
+        response_policy: {
+            version: "HTTP/1.1", framing: "content_length", connection: "request",
+            server: "s", date: "current", hide_headers: []
+        },
+        failure_policy: {
+            version: "HTTP/1.1", status: 502, reason: "Bad Gateway",
+            content_type: "text/plain", server: "s", date: "current",
+            connection: "request", body: b"x"
+        })
+}
+)rut";
+    lexed = lex(lit(omitted));
+    REQUIRE(lexed);
+    ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    CHECK_EQ(ast->response_policies[0].head_mode, ResponsePolicyHeadMode::Reject);
+    CHECK_EQ(ast->failure_policies[0].head_mode, FailurePolicyHeadMode::Reject);
+    hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+}
+
+TEST(frontend, public_head_mode_applies_through_nested_control_paths) {
+    const char* forward =
+        "return forward(b, response_policy: { version: \"HTTP/1.1\", framing: \"content_length\", connection: \"request\", head_mode: \"suppress_body\", server: \"s\", date: \"current\", hide_headers: [] }, failure_policy: { version: \"HTTP/1.1\", status: 502, reason: \"Bad Gateway\", content_type: \"text/plain\", server: \"s\", date: \"current\", connection: \"request\", head_mode: \"suppress_body\", body: b\"x\" })";
+    const std::string prefix = "upstream b at \"127.0.0.1:9000\"\n";
+    const std::string sources[] = {
+        prefix + "route \"/\" { if req.method == GET { " + forward + " } else { return 404 } }\n",
+        prefix + "route \"/\" { match req.http11 { true => " + forward + " _ => return 404 } }\n",
+        prefix + "route \"/\" { guard req.http11 else { " + forward + " } return 404 }\n",
+    };
+    for (const std::string& source : sources) {
+        auto lexed = lex({source.data(), static_cast<u32>(source.size())});
+        REQUIRE(lexed);
+        auto ast = parse_file_heap(lexed.value());
+        REQUIRE(ast);
+        auto hir = analyze_file_heap(ast.value());
+        REQUIRE(hir);
+        CHECK_EQ(hir->response_policies[0].head_mode, ResponsePolicyHeadMode::SuppressBody);
+        CHECK_EQ(hir->failure_policies[0].head_mode, FailurePolicyHeadMode::SuppressBody);
+    }
+}
+
+TEST(frontend, public_head_mode_analyzer_defends_forged_policy_id) {
+    const char source[] =
+        "upstream b at \"127.0.0.1:9000\"\nroute GET \"/\" { return forward(b) }\n";
+    auto lexed = lex(lit(source));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto* term = ast->items[1].route.statements[0];
+    REQUIRE(term != nullptr);
+    term->has_forward_response_policy = true;
+    term->forward_response_policy_id = 99;
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE_FALSE(hir.has_value());
+    CHECK_EQ(hir.error().code, FrontendError::UnsupportedSyntax);
+
+    const char policy_source[] = R"rut(
+upstream b at "127.0.0.1:9000"
+route GET "/" {
+    return forward(b,
+        response_policy: {
+            version: "HTTP/1.1", framing: "content_length", connection: "request",
+            head_mode: "reject", server: "s", date: "current", hide_headers: []
+        })
+}
+)rut";
+    lexed = lex(lit(policy_source));
+    REQUIRE(lexed);
+    ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    REQUIRE_EQ(ast->response_policies.len, 1u);
+    ast->response_policies[0].head_mode = ResponsePolicyHeadMode::Invalid;
+    auto malformed = analyze_file_heap(ast.value());
+    REQUIRE_FALSE(malformed.has_value());
+    CHECK_EQ(malformed.error().code, FrontendError::UnsupportedSyntax);
+}
+
+TEST(frontend, public_head_mode_parser_rejects_duplicate_unknown_and_invalid_values) {
+    const char* invalid[] = {
+        "upstream b\nroute GET \"/\" { return forward(b, response_policy: { version: \"HTTP/1.1\", framing: \"content_length\", connection: \"request\", head_mode: \"bogus\", server: \"s\", date: \"current\", hide_headers: [] }, failure_policy: { version: \"HTTP/1.1\", status: 502, reason: \"Bad Gateway\", content_type: \"text/plain\", server: \"s\", date: \"current\", connection: \"request\", head_mode: \"suppress_body\", body: b\"x\" }) }\n",
+        "upstream b\nroute GET \"/\" { return forward(b, response_policy: { version: \"HTTP/1.1\", framing: \"content_length\", connection: \"request\", head_mode: \"suppress_body\", head_mode: \"reject\", server: \"s\", date: \"current\", hide_headers: [] }, failure_policy: { version: \"HTTP/1.1\", status: 502, reason: \"Bad Gateway\", content_type: \"text/plain\", server: \"s\", date: \"current\", connection: \"request\", head_mode: \"suppress_body\", body: b\"x\" }) }\n",
+        "upstream b\nroute GET \"/\" { return forward(b, response_policy: { version: \"HTTP/1.1\", framing: \"content_length\", connection: \"request\", head_mode: \"suppress_body\", nope: \"x\", server: \"s\", date: \"current\", hide_headers: [] }, failure_policy: { version: \"HTTP/1.1\", status: 502, reason: \"Bad Gateway\", content_type: \"text/plain\", server: \"s\", date: \"current\", connection: \"request\", head_mode: \"suppress_body\", body: b\"x\" }) }\n",
+        "upstream b\nroute GET \"/\" { return forward(b, response_policy: { version: \"HTTP/1.1\", framing: \"content_length\", connection: \"request\", head_mode: \"suppress_body\", server: \"s\", date: \"current\", hide_headers: [] }, failure_policy: { version: \"HTTP/1.1\", status: 502, reason: \"Bad Gateway\", content_type: \"text/plain\", server: \"s\", date: \"current\", connection: \"request\", head_mode: \"bogus\", body: b\"x\" }) }\n",
+    };
+    for (const char* source : invalid) {
+        auto lexed = lex(lit(source));
+        REQUIRE(lexed);
+        auto ast = parse_file_heap(lexed.value());
+        REQUIRE_FALSE(ast.has_value());
+        CHECK_EQ(ast.error().code,
+                 strstr(source, "bogus") != nullptr
+                     ? FrontendError::UnsupportedSyntax
+                     : FrontendError::UnexpectedToken);
+        CHECK_GT(ast.error().span.line, 0u);
+        CHECK_GT(ast.error().span.col, 0u);
+    }
+}
+
+TEST(frontend, public_head_mode_rejects_unpaired_or_unsupported_combinations) {
+    auto make_source = [](bool response,
+                          const char* response_connection,
+                          const char* response_mode,
+                          bool failure,
+                          const char* failure_mode,
+                          bool target_transform) {
+        std::string source = "upstream b at \"127.0.0.1:9000\"\nroute GET \"/\" { return forward(b, ";
+        bool comma = false;
+        if (response) {
+            source += "response_policy: { version: \"HTTP/1.1\", framing: \"content_length\", connection: \"";
+            source += response_connection;
+            source += "\", head_mode: \"";
+            source += response_mode;
+            source += "\", server: \"s\", date: \"current\", hide_headers: [] }";
+            comma = true;
+        }
+        if (failure) {
+            if (comma) source += ", ";
+            source += "failure_policy: { version: \"HTTP/1.1\", status: 502, reason: \"Bad Gateway\", content_type: \"text/plain\", server: \"s\", date: \"current\", connection: \"request\", head_mode: \"";
+            source += failure_mode;
+            source += "\", body: b\"x\" }";
+            comma = true;
+        }
+        if (target_transform) {
+            if (comma) source += ", ";
+            source += "target_transform: { strip_prefix: \"/api/\", replace_prefix: \"/\" }";
+        }
+        source += ") }\n";
+        return source;
+    };
+    const std::string cases[] = {
+        make_source(true, "request", "suppress_body", false, "reject", false),
+        make_source(false, "request", "reject", true, "suppress_body", false),
+        make_source(true, "request", "suppress_body", true, "reject", false),
+        make_source(true, "request", "reject", true, "suppress_body", false),
+        make_source(true, "keep_alive", "suppress_body", true, "suppress_body", false),
+        make_source(true, "request", "suppress_body", true, "suppress_body", true),
+    };
+    for (const std::string& source : cases) {
+        auto lexed = lex({source.data(), static_cast<u32>(source.size())});
+        REQUIRE(lexed);
+        auto ast = parse_file_heap(lexed.value());
+        REQUIRE(ast);
+        auto hir = analyze_file_heap(ast.value());
+        REQUIRE_FALSE(hir.has_value());
+        CHECK_EQ(hir.error().code, FrontendError::UnsupportedSyntax);
+        CHECK_GT(hir.error().span.line, 0u);
+        CHECK_GT(hir.error().span.col, 0u);
+    }
+}
+
+TEST(frontend, public_head_mode_conditional_keeps_legacy_forward_sibling) {
+    const char source[] = R"rut(
+upstream backend at "127.0.0.1:9000"
+route "/" {
+    if req.method == HEAD && req.pathOnly == "/head" {
+        return forward(backend,
+            response_policy: {
+                version: "HTTP/1.1", framing: "content_length", connection: "request",
+                head_mode: "suppress_body", server: "s", date: "current", hide_headers: []
+            },
+            failure_policy: {
+                version: "HTTP/1.1", status: 502, reason: "Bad Gateway",
+                content_type: "text/plain", server: "s", date: "current",
+                connection: "request", head_mode: "suppress_body", body: b"x"
+            })
+    } else {
+        return forward(backend)
+    }
+}
+)rut";
+    auto lexed = lex(lit(source));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    REQUIRE_EQ(hir->routes[0].control.kind, HirControlKind::If);
+    CHECK_EQ(hir->routes[0].control.then_term.forward_response_policy_id, 1u);
+    CHECK_EQ(hir->routes[0].control.then_term.forward_failure_policy_id, 1u);
+    CHECK_EQ(hir->routes[0].control.else_term.forward_response_policy_id, 0u);
+    CHECK_EQ(hir->routes[0].control.else_term.forward_failure_policy_id, 0u);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    REQUIRE(lower_to_rir(mir.value(), rir));
+    REQUIRE_EQ(rir.module.policy_bundle_count, 1u);
+    CHECK_EQ(rir.module.response_policies[0].head_mode, ResponsePolicyHeadMode::SuppressBody);
+    CHECK_EQ(rir.module.failure_policies[0].head_mode, FailurePolicyHeadMode::SuppressBody);
+    u32 forwards = 0;
+    u32 bundles = 0;
+    for (u32 fi = 0; fi < rir.module.func_count; fi++) {
+        const auto& fn = rir.module.functions[fi];
+        for (u32 bi = 0; bi < fn.block_count; bi++) {
+            const auto& block = fn.blocks[bi];
+            for (u32 ii = 0; ii < block.inst_count; ii++) {
+                if (block.insts[ii].op == rir::Opcode::RetForward) forwards++;
+                if (block.insts[ii].op == rir::Opcode::RetForwardBundle) bundles++;
+            }
+        }
+    }
+    CHECK_EQ(forwards, 1u);
+    CHECK_EQ(bundles, 1u);
+    rir.destroy();
+}
+
 TEST(frontend, response_policy_rejects_invalid_and_duplicate_connection_fields) {
     struct InvalidCase {
         const char* source;
@@ -32706,11 +32986,11 @@ TEST(frontend, failure_policy_byte_body_reaches_rir_and_keeps_nul_lf) {
     auto ast = parse_file_heap(lexed.value());
     REQUIRE(ast);
     CHECK_EQ(ast->failure_policies[0].head_mode, FailurePolicyHeadMode::Reject);
-    // Source has no head_mode key, but a valid internal SuppressBody value
-    // must survive every compiler representation for the later runtime slice.
-    ast->failure_policies[0].head_mode = FailurePolicyHeadMode::SuppressBody;
     auto hir = analyze_file_heap(ast.value());
     REQUIRE(hir);
+    // Source has no head_mode key, but a valid internal SuppressBody value
+    // must survive every compiler representation for the later runtime slice.
+    hir->failure_policies[0].head_mode = FailurePolicyHeadMode::SuppressBody;
     CHECK_EQ(hir->failure_policies[0].head_mode, FailurePolicyHeadMode::SuppressBody);
     auto mir = build_mir_heap(hir.value());
     REQUIRE(mir);

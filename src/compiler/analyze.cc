@@ -9728,6 +9728,56 @@ static FrontendResult<HirTerminator> analyze_term(const AstStatement& stmt, cons
         return term;
     }
 
+    // Public source may select the bounded paired HEAD disposition only when
+    // both policy objects explicitly select SuppressBody.  Keep this source
+    // contract separate from the internal response-only capability used by
+    // direct RIR/runtime tests.
+    const ForwardResponsePolicySpec* response_policy = nullptr;
+    const ForwardFailurePolicySpec* failure_policy = nullptr;
+    if (stmt.has_forward_response_policy) {
+        if (stmt.forward_response_policy_id == 0 ||
+            stmt.forward_response_policy_id > mod.response_policies.len)
+            return frontend_error(FrontendError::UnsupportedSyntax,
+                                  stmt.span,
+                                  lit_str("invalid response policy"));
+        response_policy = &mod.response_policies[stmt.forward_response_policy_id - 1];
+        if (!response_policy_spec_valid(*response_policy))
+            return frontend_error(FrontendError::UnsupportedSyntax,
+                                  stmt.span,
+                                  lit_str("invalid response policy"));
+    }
+    if (stmt.has_forward_failure_policy) {
+        if (stmt.forward_failure_policy_id == 0 ||
+            stmt.forward_failure_policy_id > mod.failure_policies.len)
+            return frontend_error(FrontendError::UnsupportedSyntax,
+                                  stmt.span,
+                                  lit_str("invalid failure policy"));
+        failure_policy = &mod.failure_policies[stmt.forward_failure_policy_id - 1];
+        if (!forward_failure_policy_spec_valid(*failure_policy))
+            return frontend_error(FrontendError::UnsupportedSyntax,
+                                  stmt.span,
+                                  lit_str("invalid failure policy"));
+    }
+    const bool response_suppress =
+        response_policy != nullptr &&
+        response_policy->head_mode == ResponsePolicyHeadMode::SuppressBody;
+    const bool failure_suppress =
+        failure_policy != nullptr && failure_policy->head_mode == FailurePolicyHeadMode::SuppressBody;
+    if (response_suppress || failure_suppress) {
+        if (!response_suppress || !failure_suppress)
+            return frontend_error(FrontendError::UnsupportedSyntax,
+                                  stmt.span,
+                                  lit_str("public HEAD suppression requires paired response and failure policies"));
+        if (response_policy->connection != ResponsePolicyConnection::Request)
+            return frontend_error(FrontendError::UnsupportedSyntax,
+                                  stmt.span,
+                                  lit_str("public HEAD suppression requires response connection request"));
+        if (stmt.has_forward_target_transform)
+            return frontend_error(FrontendError::UnsupportedSyntax,
+                                  stmt.span,
+                                  lit_str("public HEAD suppression cannot be combined with target_transform"));
+    }
+
     auto upstream_index = find_upstream_index_by_name(mod, stmt.name, stmt.span);
     if (!upstream_index) return core::make_unexpected(upstream_index.error());
     term.kind = HirTerminatorKind::ForwardUpstream;
