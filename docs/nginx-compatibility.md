@@ -81,8 +81,9 @@ Allowed states are `SUPPORTED`, `PARTIAL`, `BLOCKED_BY_RUT`,
   close-intent request emits the exact close 502/EOF and produces the second
   scoped connect-failure record. Current RUT rejects this reusable HEAD domain,
   so the evidence defines the next #253 capability gap rather than support.
-- The reusable HEAD gap also depends on the generic epoll transport capability
-  tracked in #262. Epoll now exposes at most one logical completion per wait
+- The reusable HEAD gap previously depended on the generic epoll transport
+  capability tracked in #262. Epoll now exposes at most one logical completion
+  per wait
   with bounded pending-versus-kernel fairness, removing the former whole-batch
   pre-dispatch I/O window. It now also transports explicit upstream episodes and
   rejects stale or malformed records before fd-map/socket/TLS/state access and
@@ -102,10 +103,15 @@ Allowed states are `SUPPORTED`, `PARTIAL`, `BLOCKED_BY_RUT`,
   retires cleanly. A kernel-produced raw connect record, held in the test harness,
   is also rejected before I/O after production same-slot/same-fd reuse while the
   current completion progresses. A second captured kernel record proves the same
-  boundary for a genuinely backpressured partial send, including zero old wire
-  bytes and exact current payload through FIN/EOF. No direct epoll transition gap
-  is now known, but #262 stays open until its full acceptance audit completes.
-  This transport work alone does not imply keep-alive HEAD support;
+  boundary for receive: the episode-2 bytes remain unread after stale replay,
+  then the current record reads the exact payload and dispatches once. A third
+  captured kernel record proves the boundary for a genuinely backpressured
+  partial send, including zero old wire bytes and exact current payload through
+  FIN/EOF. The requirement-by-requirement audit proves all five capability and
+  nine acceptance bullets, so #262 is closed. These tests explicitly hold raw
+  records already harvested into userspace and do not claim kernel retention
+  after successful `EPOLL_CTL_DEL`. This transport work alone does not imply
+  keep-alive HEAD support;
   cancellation/drain lifecycle and the remaining #253 response semantics are
   still required.
 - The first request-policy slice rejects body/framing inputs (including
