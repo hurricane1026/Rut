@@ -3255,7 +3255,7 @@ bool FrontendRirModule::init(u32 func_cap, u32 struct_cap) {
 void FrontendRirModule::destroy() {
     arena.destroy();
     auto saved_source_name = source_name;
-    module = {};
+    module = rir::Module{};
     source_name = saved_source_name;
 }
 
