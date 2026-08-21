@@ -16474,11 +16474,11 @@ route "/" {
       request_policy: { version: "HTTP/1.1", host: "upstream", connection: "omit",
         strip_headers: ["Connection", "Keep-Alive", "TE", "Expect", "Upgrade"] },
       response_policy: { version: "HTTP/1.1", framing: "content_length", connection: "request",
-        head_mode: "reject", server: "nginx/1.29.7", date: "current",
+        server: "nginx/1.29.7", date: "current",
         hide_headers: ["Date", "Server", "X-Pad"] },
       failure_policy: { version: "HTTP/1.1", status: 502, reason: "Bad Gateway",
         content_type: "text/html", server: "nginx/1.29.7", date: "current",
-        connection: "request", head_mode: "reject",
+        connection: "request",
         body: b"<html>\r\n<head><title>502 Bad Gateway</title></head>\r\n<body>\r\n<center><h1>502 Bad Gateway</h1></center>\r\n<hr><center>nginx/1.29.7</center>\r\n</body>\r\n</html>\r\n" })
   }
 }
@@ -16492,6 +16492,28 @@ route "/" {
         auto hir = rut::analyze_file(*ast_owned);
         if (!hir) return false;
         std::unique_ptr<rut::HirModule> hir_owned(hir.value());
+
+        // Inspect the source-level branch operands before HIR/MIR storage is
+        // discarded.  This proves the public if/else selection, rather than
+        // only proving that the later policy tables happen to contain the
+        // expected entries.
+        if (hir_owned->routes.len != 1 ||
+            hir_owned->routes[0].control.kind != rut::HirControlKind::If)
+            return false;
+        const auto& control = hir_owned->routes[0].control;
+        const auto branch_is = [](const rut::HirTerminator& term,
+                                  u16 request_id,
+                                  u16 response_id,
+                                  u16 failure_id) {
+            return term.kind == rut::HirTerminatorKind::ForwardUpstream &&
+                   term.forward_request_policy_id == request_id &&
+                   term.forward_response_policy_id == response_id &&
+                   term.forward_failure_policy_id == failure_id;
+        };
+        if (!branch_is(control.then_term, 1, 1, 1) ||
+            !branch_is(control.else_term, 1, 2, 2))
+            return false;
+
         auto mir = rut::build_mir(*hir_owned);
         if (!mir) return false;
         std::unique_ptr<rut::MirModule> mir_owned(mir.value());
@@ -16549,12 +16571,18 @@ static bool read_public_close_response(i32 fd,
 
 static bool normalize_public_date(char* data, u32 length) {
     u32 count = 0;
-    for (u32 i = 0; i + 35 <= length; i++) {
-        if (memcmp(data + i, "Date: ", 6) != 0) continue;
+    for (u32 i = 0; i < length;) {
+        if (length - i < 6) break;
+        if (memcmp(data + i, "Date: ", 6) != 0) {
+            i++;
+            continue;
+        }
         count++;
-        if (i < 2 || data[i - 2] != '\r' || data[i + 35] != '\r' || data[i + 36] != '\n')
+        if (i < 2 || length - i < 37 || data[i - 2] != '\r' ||
+            data[i + 35] != '\r' || data[i + 36] != '\n')
             return false;
         for (u32 j = 0; j < 29; j++) data[i + 6 + j] = 'X';
+        i += 6;
     }
     return count == 1;
 }
@@ -20111,15 +20139,25 @@ TEST(route, public_paired_head_source_success_and_forward_wire) {
     };
     bool saw_bundle_1 = false;
     bool saw_bundle_2 = false;
+    u32 request_policy_uses = 0;
+    u32 forward_bundle_count = 0;
+    u32 plain_forward_count = 0;
     for (u32 fi = 0; fi < resources.rir.module.func_count; fi++) {
         const auto& fn = resources.rir.module.functions[fi];
         for (u32 bi = 0; bi < fn.block_count; bi++) {
             const auto& block = fn.blocks[bi];
             for (u32 ii = 0; ii < block.inst_count; ii++) {
                 const auto& inst = block.insts[ii];
+                if (inst.op == rir::Opcode::RetForward) {
+                    plain_forward_count++;
+                    continue;
+                }
                 if (inst.op != rir::Opcode::RetForwardBundle) continue;
+                forward_bundle_count++;
                 REQUIRE_EQ(inst.operand_count, 3u);
-                CHECK_EQ(const_i32_value(block, inst.operands[1]), 1);
+                const i32 request_id = const_i32_value(block, inst.operands[1]);
+                CHECK_EQ(request_id, 1);
+                if (request_id == 1) request_policy_uses++;
                 const i32 bundle_id = const_i32_value(block, inst.operands[2]);
                 if (bundle_id == 1) saw_bundle_1 = true;
                 if (bundle_id == 2) saw_bundle_2 = true;
@@ -20127,6 +20165,9 @@ TEST(route, public_paired_head_source_success_and_forward_wire) {
             }
         }
     }
+    REQUIRE_EQ(forward_bundle_count, 2u);
+    REQUIRE_EQ(plain_forward_count, 0u);
+    REQUIRE_EQ(request_policy_uses, 2u);
     REQUIRE(saw_bundle_1);
     REQUIRE(saw_bundle_2);
     REQUIRE(resources.start(/*enable_reuse=*/true));
@@ -20141,9 +20182,9 @@ TEST(route, public_paired_head_source_success_and_forward_wire) {
                            const char* query,
                            const char* expected,
                            u32 expected_body_len,
-                           u32 expected_count) {
+                           u32 expected_count) -> bool {
         ClientGuard client{connect_to(resources.proxy.port)};
-        REQUIRE_GE(client.fd, 0);
+        if (client.fd < 0) return false;
         set_socket_timeouts(client.fd, 3);
         char request[256];
         const int request_len = snprintf(request,
@@ -20152,31 +20193,32 @@ TEST(route, public_paired_head_source_success_and_forward_wire) {
                                          "Connection: close\r\nX-Test: one\r\n\r\n",
                                          method,
                                          query);
-        REQUIRE_GT(request_len, 0);
-        REQUIRE_LT(request_len, static_cast<int>(sizeof(request)));
-        REQUIRE(send_all(client.fd, request, static_cast<u32>(request_len)));
+        if (request_len <= 0 || request_len >= static_cast<int>(sizeof(request))) return false;
+        if (!send_all(client.fd, request, static_cast<u32>(request_len))) return false;
         char response[1024]{};
         u32 response_len = 0;
-        REQUIRE(read_public_close_response(client.fd,
-                                           expected_body_len,
-                                           response,
-                                           sizeof(response),
-                                           response_len));
-        REQUIRE(normalize_public_date(response, response_len));
-        REQUIRE_EQ(response_len, static_cast<u32>(strlen(expected)));
-        CHECK_EQ(memcmp(response, expected, response_len), 0);
+        if (!read_public_close_response(client.fd,
+                                        expected_body_len,
+                                        response,
+                                        sizeof(response),
+                                        response_len))
+            return false;
+        if (!normalize_public_date(response, response_len)) return false;
+        if (response_len != static_cast<u32>(strlen(expected)) ||
+            memcmp(response, expected, response_len) != 0)
+            return false;
         for (u32 waited = 0;
              waited < 600 &&
              backend.request_count.load(std::memory_order_acquire) < expected_count;
              waited++)
             usleep(5000);
-        CHECK_EQ(backend.accepted_count.load(std::memory_order_acquire), expected_count);
-        CHECK_EQ(backend.request_count.load(std::memory_order_acquire), expected_count);
+        return backend.accepted_count.load(std::memory_order_acquire) == expected_count &&
+               backend.request_count.load(std::memory_order_acquire) == expected_count;
     };
 
-    run_request("HEAD", "?q=1", kHeadExpected, 0, 1);
-    run_request("HEAD", "?q=1", kHeadExpected, 0, 2);
-    run_request("GET", "?q=2", kGetExpected, 5, 3);
+    REQUIRE(run_request("HEAD", "?q=1", kHeadExpected, 0, 1));
+    REQUIRE(run_request("HEAD", "?q=1", kHeadExpected, 0, 2));
+    REQUIRE(run_request("GET", "?q=2", kGetExpected, 5, 3));
 
     resources.proxy.teardown();
     backend.teardown();
@@ -20214,6 +20256,7 @@ TEST(route, public_paired_head_source_connect_failure) {
     PublicPairedHeadSourceResources resources;
     REQUIRE(resources.compile(dead.port));
     REQUIRE_EQ(resources.cfg.upstreams[0].addr_count, 1u);
+    REQUIRE_EQ(ntohl(resources.cfg.upstreams[0].addrs[0].sin_addr.s_addr), 0x7F000001u);
     REQUIRE_EQ(ntohs(resources.cfg.upstreams[0].addrs[0].sin_port), dead.port);
     REQUIRE(resources.start(/*enable_reuse=*/false));
 
