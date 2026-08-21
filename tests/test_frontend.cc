@@ -32662,6 +32662,39 @@ route GET "/" {
     auto malformed = analyze_file_heap(ast.value());
     REQUIRE_FALSE(malformed.has_value());
     CHECK_EQ(malformed.error().code, FrontendError::UnsupportedSyntax);
+
+    const char failure_policy_source[] = R"rut(
+upstream b at "127.0.0.1:9000"
+route GET "/" {
+    return forward(b,
+        failure_policy: {
+            version: "HTTP/1.1", status: 502, reason: "Bad Gateway",
+            content_type: "text/plain", server: "s", date: "current",
+            connection: "request", body: b"x"
+        })
+}
+)rut";
+    lexed = lex(lit(failure_policy_source));
+    REQUIRE(lexed);
+    ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto* failure_term = ast->items[1].route.statements[0];
+    REQUIRE(failure_term != nullptr);
+    failure_term->has_forward_failure_policy = true;
+    failure_term->forward_failure_policy_id = 99;
+    auto forged_failure_id = analyze_file_heap(ast.value());
+    REQUIRE_FALSE(forged_failure_id.has_value());
+    CHECK_EQ(forged_failure_id.error().code, FrontendError::UnsupportedSyntax);
+
+    lexed = lex(lit(failure_policy_source));
+    REQUIRE(lexed);
+    ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    REQUIRE_EQ(ast->failure_policies.len, 1u);
+    ast->failure_policies[0].head_mode = FailurePolicyHeadMode::Invalid;
+    auto malformed_failure = analyze_file_heap(ast.value());
+    REQUIRE_FALSE(malformed_failure.has_value());
+    CHECK_EQ(malformed_failure.error().code, FrontendError::UnsupportedSyntax);
 }
 
 TEST(frontend, public_head_mode_parser_rejects_duplicate_unknown_and_invalid_values) {
@@ -32903,7 +32936,6 @@ TEST(frontend, failure_policy_rejects_invalid_fields_and_caps) {
         "upstream b\nroute GET \"/\" { return forward(b, response_policy: { version: \"HTTP/1.1\", framing: \"content_length\", connection: \"keep_alive\", server: \"nginx\", date: \"current\", hide_headers: [] }, failure_policy: { version: \"HTTP/1.1\", status: 502, reason: \"Bad Gateway\", content_type: \"text/plain\", server: \"nginx\", date: \"current\", connection: \"request\", body: b\"x\", nope: \"x\" }) }\n",
         "upstream b\nroute GET \"/\" { return forward(b, response_policy: { version: \"HTTP/1.1\", framing: \"content_length\", connection: \"keep_alive\", server: \"nginx\", date: \"current\", hide_headers: [] }, failure_policy: { version: \"HTTP/1.1\", status: 502, reason: \"Bad Gateway\", content_type: \"text/plain\", server: \"nginx\", date: \"current\", connection: \"request\", body: b\"x\", body: b\"y\" }) }\n",
         "upstream b\nroute GET \"/\" { return forward(b, response_policy: { version: \"HTTP/1.1\", framing: \"content_length\", connection: \"keep_alive\", server: \"nginx\", date: \"current\", hide_headers: [] }, failure_policy: { version: \"HTTP/1.1\", status: 502, reason: \"Bad Gateway\", content_type: \"text/plain\", server: \"nginx\", date: \"current\", connection: \"request\" }) }\n",
-        "upstream b\nroute GET \"/\" { return forward(b, response_policy: { version: \"HTTP/1.1\", framing: \"content_length\", connection: \"keep_alive\", server: \"nginx\", date: \"current\", hide_headers: [] }, failure_policy: { version: \"HTTP/1.1\", status: 502, reason: \"Bad Gateway\", content_type: \"text/plain\", server: \"nginx\", date: \"current\", connection: \"request\", body: b\"x\", head_mode: \"suppress_body\" }) }\n",
         "upstream b\nroute GET \"/\" { return forward(b, failure_policy: { version: \"HTTP/1.1\", status: 502, reason: \"Bad Gateway\", content_type: \"text/plain\", server: \"nginx\", date: \"current\", connection: \"request\", body: \"x\" }) }\n",
         "upstream b\nroute GET \"/\" { return forward(b, failure_policy: { version: \"HTTP/1.1\", status: 502, reason: \"Bad Gateway\", content_type: \"text/plain\", server: \"nginx\", date: \"current\", connection: \"request\", body: b\"\\q\" }) }\n",
         "upstream b\nroute GET \"/\" { return forward(b, failure_policy: { version: \"HTTP/1.1\", status: 502, reason: \"Bad Gateway\", content_type: \"text/plain\", server: \"nginx\", date: \"current\", connection: \"request\", body: b\"\\x0\" }) }\n",
