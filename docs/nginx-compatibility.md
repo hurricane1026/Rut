@@ -121,9 +121,13 @@ Allowed states are `SUPPORTED`, `PARTIAL`, `BLOCKED_BY_RUT`,
   effects, and resumes exactly once after the retirement-final CQE batch. Exact
   successor ownership also fences provided-buffer/partial-send mutation and
   survives close through a per-type target/cancel ledger. Public reusable HEAD
-  admission and a second strict retirement remain rejected until the repeated-
-  episode lifecycle is proven, so #264 remains open and the remaining response
-  semantics stay under #253.
+  admission remains rejected. A third bounded runtime slice now persists and
+  atomically replaces the latest fully drained tombstone, proving two production
+  strict callbacks, two batch-end boundary resumes, older-record isolation,
+  close/reclaim composition, and token-exhaustion quarantine. #264 remains open
+  until public reusable HEAD admission and a real two-request io_uring behavior
+  test pass; converter-generated nginx differential evidence and the remaining
+  response semantics stay under #253.
 - The first request-policy slice rejects body/framing inputs (including
   `Content-Length` and every `Transfer-Encoding` value), HTTP/2, and
   non-origin-form targets before upstream connect. These are intentional
