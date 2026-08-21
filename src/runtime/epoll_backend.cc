@@ -312,6 +312,8 @@ void EpollBackend::pause_upstream_recv(u32 conn_id, bool preserve_send_interest)
 }
 
 bool EpollBackend::add_send_upstream(i32 fd, u32 conn_id, const u8* buf, u32 len) {
+    if (conn_id >= kMaxFdMap) return false;
+
     // This operation can produce at most one synchronous completion.  The
     // producer is single-threaded/non-reentrant, so this entry check reserves
     // its completion slot without needing a separate reservation counter.
@@ -349,15 +351,24 @@ bool EpollBackend::add_send_upstream(i32 fd, u32 conn_id, const u8* buf, u32 len
         rc = epoll_ctl(epoll_fd, EPOLL_CTL_ADD, fd, &ev);
     }
     if (rc < 0) {
+        const i32 registration_error = rc;
         if (conn_id < kMaxFdMap) {
             upstream_send_state[conn_id] = {nullptr, -1, 0, 0, IoEventType::UpstreamSend, false, 0};
         }
-        return false;
+        if (!queue_pending_completion(pending_completions,
+                                      pending_count,
+                                      conn_id,
+                                      IoEventType::UpstreamSend,
+                                      registration_error))
+            return false;
+        return true;
     }
     return true;
 }
 
 bool EpollBackend::add_recv_upstream(i32 fd, u32 conn_id) {
+    if (conn_id >= kMaxFdMap) return false;
+
     // Registration failure emits one local-submit completion, so reserve its
     // slot before changing the fd map or calling epoll_ctl.
     if (pending_count >= kPendingCap) return false;
@@ -394,6 +405,8 @@ bool EpollBackend::add_recv_upstream(i32 fd, u32 conn_id) {
 }
 
 bool EpollBackend::add_send(i32 fd, u32 conn_id, const u8* buf, u32 len) {
+    if (conn_id >= kMaxFdMap) return false;
+
     // One immediate/error completion is the only synchronous result this
     // producer can append; partial/EAGAIN uses epoll and consumes no slot.
     if (pending_count >= kPendingCap) return false;
@@ -438,6 +451,8 @@ bool EpollBackend::add_send(i32 fd, u32 conn_id, const u8* buf, u32 len) {
 }
 
 bool EpollBackend::add_send_tls(Connection& c, const u8* buf, u32 len) {
+    if (c.id >= kMaxFdMap) return false;
+
     if (!c.tls_active || !c.tls) return add_send(c.fd, c.id, buf, len);
 
     // TLS may complete, fail, or hit an invalid connection id synchronously;
@@ -457,10 +472,6 @@ bool EpollBackend::add_send_tls(Connection& c, const u8* buf, u32 len) {
 
         i32 ssl_err = tls_hooks->ssl_get_error(ssl, nw);
         if (ssl_err == SSL_ERROR_WANT_READ || ssl_err == SSL_ERROR_WANT_WRITE) {
-            if (c.id >= kMaxFdMap) {
-                return queue_pending_completion(
-                    pending_completions, pending_count, c.id, IoEventType::Send, -EINVAL);
-            }
             send_state[c.id] = {buf,
                                 c.fd,
                                 sent,
@@ -494,6 +505,8 @@ bool EpollBackend::add_send_tls(Connection& c, const u8* buf, u32 len) {
 }
 
 bool EpollBackend::add_connect(i32 fd, u32 conn_id, const void* addr, u32 addr_len) {
+    if (conn_id >= kMaxFdMap) return false;
+
     // Immediate connect results need one synthetic completion; reserve it
     // before changing the map or entering the kernel.
     if (pending_count >= kPendingCap) return false;

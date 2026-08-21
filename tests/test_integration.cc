@@ -4079,7 +4079,7 @@ TEST(tls_state_machine, send_arm_failure_returns_error_completion) {
     backend.shutdown();
 }
 
-TEST(tls_state_machine, send_rejects_out_of_range_conn_id_with_full_pending_ring) {
+TEST(tls_state_machine, send_preflight_rejects_out_of_range_conn_id_with_full_pending_ring) {
     i32 fds[2];
     REQUIRE_EQ(socketpair(AF_UNIX, SOCK_STREAM | SOCK_NONBLOCK, 0, fds), 0);
 
@@ -4121,7 +4121,7 @@ TEST(tls_state_machine, send_rejects_out_of_range_conn_id_with_full_pending_ring
     backend.shutdown();
 }
 
-TEST(tls_state_machine, send_arm_failure_returns_error_with_full_pending_ring) {
+TEST(tls_state_machine, send_preflight_rejects_full_pending_ring_without_tls_write) {
     i32 fds[2];
     REQUIRE_EQ(socketpair(AF_UNIX, SOCK_STREAM | SOCK_NONBLOCK, 0, fds), 0);
 
@@ -4268,6 +4268,123 @@ TEST(epoll_pending_capacity, scoped_producers_reject_full_ring_before_side_effec
     CHECK_EQ(tls_state.write_calls, 0);
     CHECK_EQ(backend.pending_count, EpollBackend::kPendingCap);
     CHECK_EQ(backend.pending_completions[63].conn_id, 263u);
+
+    close(fds[0]);
+    close(fds[1]);
+    backend.shutdown();
+}
+
+TEST(epoll_pending_capacity, scoped_producers_reject_invalid_conn_ids_before_side_effects) {
+    EpollBackend backend;
+    REQUIRE(backend.init(0, -1).has_value());
+
+    i32 fds[2] = {-1, -1};
+    if (socketpair(AF_UNIX, SOCK_STREAM | SOCK_NONBLOCK, 0, fds) != 0) {
+        backend.shutdown();
+        CHECK(false);
+        return;
+    }
+    i32 listener = create_listen_socket(0).value_or(-1);
+    if (listener < 0) {
+        close(fds[0]);
+        close(fds[1]);
+        backend.shutdown();
+        CHECK(false);
+        return;
+    }
+    const u32 bad_id = EpollBackend::kMaxFdMap;
+    const u32 valid_id = 7;
+    backend.upstream_fd_map[valid_id] = 1234;
+    const auto saved_send = backend.send_state[valid_id];
+    const auto saved_upstream_send = backend.upstream_send_state[valid_id];
+    static const u8 payload[] = {'n', 'o'};
+
+    CHECK_FALSE(backend.add_send(fds[0], bad_id, payload, sizeof(payload)));
+    CHECK_FALSE(backend.add_send_upstream(fds[0], bad_id, payload, sizeof(payload)));
+    CHECK_FALSE(backend.add_recv_upstream(fds[0], bad_id));
+
+    i32 connect_fd = socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK, 0);
+    REQUIRE(connect_fd >= 0);
+    sockaddr_in addr{};
+    addr.sin_family = AF_INET;
+    addr.sin_port = __builtin_bswap16(get_port(listener));
+    addr.sin_addr.s_addr = __builtin_bswap32(0x7F000001);
+    CHECK_FALSE(backend.add_connect(connect_fd,
+                                    bad_id,
+                                    &addr,
+                                    static_cast<u32>(sizeof(addr))));
+
+    TestConn tc;
+    tc.init(bad_id, fds[0]);
+    Connection& conn = tc.conn;
+    conn.tls_active = true;
+    conn.tls_handshake_complete = true;
+    conn.tls = reinterpret_cast<SSL*>(0x1);
+    ScriptedTlsState tls_state;
+    tls_state.write_first_rc = -1;
+    tls_state.write_first_error = SSL_ERROR_WANT_WRITE;
+    ScopedTlsHooks hooks(tls_state);
+    CHECK_FALSE(backend.add_send_tls(conn, payload, sizeof(payload)));
+
+    CHECK_EQ(backend.pending_count, 0u);
+    CHECK_EQ(backend.upstream_fd_map[valid_id], 1234);
+    CHECK_EQ(backend.send_state[valid_id].src, saved_send.src);
+    CHECK_EQ(backend.send_state[valid_id].fd, saved_send.fd);
+    CHECK_EQ(backend.send_state[valid_id].offset, saved_send.offset);
+    CHECK_EQ(backend.send_state[valid_id].remaining, saved_send.remaining);
+    CHECK_EQ(backend.send_state[valid_id].type, saved_send.type);
+    CHECK_EQ(backend.send_state[valid_id].tls, saved_send.tls);
+    CHECK_EQ(backend.send_state[valid_id].tls_wait_events, saved_send.tls_wait_events);
+    CHECK_EQ(backend.upstream_send_state[valid_id].src, saved_upstream_send.src);
+    CHECK_EQ(backend.upstream_send_state[valid_id].fd, saved_upstream_send.fd);
+    CHECK_EQ(backend.upstream_send_state[valid_id].offset, saved_upstream_send.offset);
+    CHECK_EQ(backend.upstream_send_state[valid_id].remaining, saved_upstream_send.remaining);
+    CHECK_EQ(backend.upstream_send_state[valid_id].type, saved_upstream_send.type);
+    CHECK_EQ(backend.upstream_send_state[valid_id].tls, saved_upstream_send.tls);
+    CHECK_EQ(backend.upstream_send_state[valid_id].tls_wait_events,
+             saved_upstream_send.tls_wait_events);
+    CHECK_EQ(tls_state.write_calls, 0);
+    u8 received[sizeof(payload)] = {};
+    CHECK_EQ(recv(fds[1], received, sizeof(received), MSG_DONTWAIT), -1);
+    CHECK(errno == EAGAIN || errno == EWOULDBLOCK);
+
+    i32 accepted = -1;
+    for (u32 attempt = 0; attempt < 20 && accepted < 0; attempt++) {
+        accepted = accept4(listener, nullptr, nullptr, SOCK_NONBLOCK | SOCK_CLOEXEC);
+        if (accepted < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) usleep(1000);
+    }
+    CHECK_EQ(accepted, -1);
+    if (accepted >= 0) close(accepted);
+
+    close(connect_fd);
+    close(listener);
+    close(fds[0]);
+    close(fds[1]);
+    backend.shutdown();
+}
+
+TEST(epoll_pending_capacity, upstream_partial_send_registration_failure_queues_terminal_error) {
+    EpollBackend backend;
+    REQUIRE(backend.init(0, -1).has_value());
+
+    i32 fds[2] = {-1, -1};
+    REQUIRE_EQ(socketpair(AF_UNIX, SOCK_STREAM | SOCK_NONBLOCK, 0, fds), 0);
+    const u32 prefilled = fill_socket_send_buffer(fds[0], fds[1]);
+    REQUIRE_GT(prefilled, 0u);
+    backend.epoll_fd = -1;  // force the partial-send registration to fail
+
+    static const u8 payload[] = {'p', 'a', 'r', 't', 'i', 'a', 'l'};
+    CHECK(backend.add_send_upstream(fds[0], 0, payload, sizeof(payload)));
+    CHECK_EQ(backend.pending_count, 1u);
+    CHECK_EQ(backend.upstream_send_state[0].src, nullptr);
+    CHECK_EQ(backend.upstream_send_state[0].fd, -1);
+    CHECK_EQ(backend.upstream_send_state[0].remaining, 0u);
+
+    IoEvent events[2]{};
+    CHECK_EQ(backend.wait(events, 2, nullptr, 0), 1u);
+    CHECK_EQ(events[0].type, IoEventType::UpstreamSend);
+    CHECK_LT(events[0].result, 0);
+    CHECK_EQ(backend.pending_count, 0u);
 
     close(fds[0]);
     close(fds[1]);
