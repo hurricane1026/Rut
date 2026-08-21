@@ -3323,6 +3323,7 @@ FrontendResult<void> lower_to_rir(const MirModule& mir, FrontendRirModule& out) 
         dst.framing = src.framing;
         dst.connection = src.connection;
         dst.date = src.date;
+        dst.head_mode = src.head_mode;
         if (!copy_policy_str(src.server, dst.server))
             return frontend_error(FrontendError::OutOfMemory);
         dst.hide_header_count = src.hide_header_count;

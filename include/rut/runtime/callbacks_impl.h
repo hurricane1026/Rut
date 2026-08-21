@@ -511,6 +511,7 @@ RequestPolicyBodyState inspect_request_policy_body(const Connection& conn,
 inline bool request_policy_body_response_domain(const Connection& conn);
 inline bool request_policy_body_response_admitted(const Connection& conn);
 inline bool strict_response_upload_ready(const Connection& conn);
+inline bool response_policy_runtime_supported(const ForwardResponsePolicySpec& policy);
 template <typename Loop>
 inline void reject_request_policy(Loop* loop, Connection& conn);
 template <typename Loop>
@@ -2226,6 +2227,12 @@ void handle_jit_outcome(Loop* loop,
                     reject_response_policy(loop, conn);
                     return;
                 }
+                if (target_response_policy_id != 0 &&
+                    !response_policy_runtime_supported(
+                        config->response_policies[target_response_policy_id - 1])) {
+                    reject_response_policy(loop, conn);
+                    return;
+                }
                 const auto& target = config->upstreams[outcome.upstream_id];
                 bool response_policy_request_connection = false;
                 if (target_response_policy_id != 0) {
@@ -2362,6 +2369,12 @@ void handle_jit_outcome(Loop* loop,
                  conn.resp_header_mutation_pending_count != 0 ||
                  conn.resp_header_mutation_pending_overflow ||
                  conn.resp_header_mutation_overflow)) {
+                reject_response_policy(loop, conn);
+                return;
+            }
+            if (forward_response_policy_id != 0 &&
+                !response_policy_runtime_supported(
+                    config->response_policies[forward_response_policy_id - 1])) {
                 reject_response_policy(loop, conn);
                 return;
             }
@@ -5422,6 +5435,14 @@ inline bool strict_response_upload_ready(const Connection& conn) {
            !conn.req_body_streamed &&
            conn.pipeline_stash_len == 0 && conn.retry_req_send_len == 0 &&
            conn.recv_buf.len() == 0 && !conn.upstream_reused;
+}
+
+// SuppressBody is metadata for the next HEAD serializer increment. Until
+// that serializer exists, accepting it would silently execute a different
+// policy than the source requested, so every selected such policy remains
+// fail-closed before upstream allocation/connect.
+inline bool response_policy_runtime_supported(const ForwardResponsePolicySpec& policy) {
+    return policy.head_mode == ResponsePolicyHeadMode::Reject;
 }
 
 inline u32 strict_response_dec(char* out, u32 value);

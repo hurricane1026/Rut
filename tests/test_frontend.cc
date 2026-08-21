@@ -3,6 +3,7 @@
 #include "rut/compiler/lower_rir.h"
 #include "rut/compiler/mir_build.h"
 #include "rut/compiler/parser.h"
+#include "rut/compiler/rir_printer.h"
 #include "rut/compiler/verifier.h"
 #include "rut/runtime/route_method.h"
 #include "rut/runtime/listener.h"
@@ -32438,6 +32439,8 @@ route GET "/" {
     REQUIRE(lowered);
     REQUIRE_EQ(rir.module.response_policy_count, 1u);
     CHECK(rir.module.response_policies[0].server.eq(lit("nginx")));
+    CHECK(rir.module.response_policies[0].head_mode ==
+          ResponsePolicyHeadMode::Reject);
     const auto& block = rir.module.functions[0].blocks[0];
     const auto& ret = block.insts[block.inst_count - 1];
     CHECK_EQ(static_cast<u8>(ret.op), static_cast<u8>(rir::Opcode::RetForward));
@@ -32445,6 +32448,52 @@ route GET "/" {
     CHECK_EQ(block.insts[1].imm.i32_val, 1);
     CHECK_EQ(block.insts[2].imm.i32_val, 1);
     rir.destroy();
+}
+
+TEST(response_policy, head_mode_is_owned_deduplicated_and_printed) {
+    char server[] = "server";
+    char hidden[] = "Date";
+    ForwardResponsePolicySpec reject{};
+    reject.version = ResponsePolicyVersion::Http11;
+    reject.framing = ResponsePolicyFraming::ContentLength;
+    reject.connection = ResponsePolicyConnection::Request;
+    reject.date = ResponsePolicyDate::Current;
+    reject.server = {server, 6};
+    reject.hide_headers[0] = {hidden, 4};
+    reject.hide_header_count = 1;
+    CHECK(response_policy_spec_valid(reject));
+    CHECK_EQ(reject.head_mode, ResponsePolicyHeadMode::Reject);
+
+    auto suppress = reject;
+    suppress.head_mode = ResponsePolicyHeadMode::SuppressBody;
+    CHECK(response_policy_spec_valid(suppress));
+    auto invalid = reject;
+    invalid.head_mode = ResponsePolicyHeadMode::Invalid;
+    CHECK_FALSE(response_policy_spec_valid(invalid));
+    invalid.head_mode = static_cast<ResponsePolicyHeadMode>(3);
+    CHECK_FALSE(response_policy_spec_valid(invalid));
+
+    auto ast = std::make_unique<AstFile>();
+    CHECK_EQ(ast->add_response_policy(reject), 1u);
+    CHECK_EQ(ast->add_response_policy(reject), 1u);
+    CHECK_EQ(ast->add_response_policy(suppress), 2u);
+
+    rir::Module module{};
+    module.response_policy_count = 2;
+    module.response_policies[0] = reject;
+    module.response_policies[1] = suppress;
+    char output[1024];
+    rir::PrintBuf buf;
+    buf.init(output, sizeof(output), -1);
+    rir::print_module(buf, module);
+    static constexpr char expected[] =
+        "response_policies: 2\n"
+        "  response_policy#1: head_mode=reject\n"
+        "  response_policy#2: head_mode=suppress_body\n";
+    CHECK_FALSE(buf.overflow);
+    CHECK_EQ(buf.len, static_cast<u32>(sizeof(expected) - 1));
+    CHECK(__builtin_memcmp(buf.data, expected, sizeof(expected) - 1) == 0);
+
 }
 
 TEST(frontend, response_policy_rejects_invalid_values_duplicates_and_missing_fields) {

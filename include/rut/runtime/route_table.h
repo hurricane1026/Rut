@@ -890,6 +890,7 @@ struct RouteConfig {
         dst.framing = policy.framing;
         dst.connection = policy.connection;
         dst.date = policy.date;
+        dst.head_mode = policy.head_mode;
         copy(policy.server, dst.server);
         dst.hide_header_count = policy.hide_header_count;
         for (u32 i = 0; i < policy.hide_header_count; i++)

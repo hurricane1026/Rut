@@ -616,6 +616,92 @@ TEST(target_transform, h1_forward_rejects_before_upstream_side_effects) {
     }
 }
 
+TEST(response_policy, suppress_body_metadata_fails_closed_before_upstream_connect) {
+    SmallLoop loop;
+    loop.setup();
+    RouteConfig cfg{};
+    REQUIRE(cfg.add_upstream("backend", 0x7F000001, 8080).has_value());
+    static constexpr char kServer[] = "server";
+    ForwardResponsePolicySpec policy{};
+    policy.version = ResponsePolicyVersion::Http11;
+    policy.framing = ResponsePolicyFraming::ContentLength;
+    policy.connection = ResponsePolicyConnection::Request;
+    policy.date = ResponsePolicyDate::Current;
+    policy.head_mode = ResponsePolicyHeadMode::SuppressBody;
+    policy.server = {kServer, sizeof(kServer) - 1};
+    REQUIRE_EQ(cfg.add_response_policy(policy), 1u);
+
+    const char* requests[] = {
+        "GET /api HTTP/1.1\r\nHost: client\r\n\r\n",
+        "HEAD /api HTTP/1.1\r\nHost: client\r\n\r\n",
+    };
+    for (const char* request : requests) {
+        auto* conn = loop.alloc_conn();
+        REQUIRE(conn != nullptr);
+        const u32 request_len = static_cast<u32>(strlen(request));
+        REQUIRE_EQ(conn->recv_buf.write(reinterpret_cast<const u8*>(request), request_len),
+                   request_len);
+        capture_request_metadata(*conn);
+        conn->request_config = &cfg;
+
+        JitDispatchOutcome outcome{};
+        outcome.kind = JitDispatchOutcome::Kind::Forward;
+        outcome.upstream_id = 0;
+        outcome.response_policy_id = 1;
+        loop.backend.clear_ops();
+        handle_jit_outcome<SmallLoop>(&loop, *conn, outcome, nullptr, true);
+
+        CHECK_EQ(conn->resp_status, 400u);
+        CHECK_EQ(conn->upstream_fd, -1);
+        CHECK_FALSE(conn->upstream_slot_held);
+        CHECK_EQ(loop.backend.count_ops(MockOp::Connect), 0u);
+        CHECK_EQ(loop.backend.count_ops(MockOp::Send), 1u);
+        loop.free_conn(*conn);
+    }
+}
+
+TEST(response_policy, head_mode_config_copy_is_owned_and_atomic) {
+    char server[] = "server";
+    char hidden[] = "Date";
+    ForwardResponsePolicySpec reject{};
+    reject.version = ResponsePolicyVersion::Http11;
+    reject.framing = ResponsePolicyFraming::ContentLength;
+    reject.connection = ResponsePolicyConnection::Request;
+    reject.date = ResponsePolicyDate::Current;
+    reject.server = {server, 6};
+    reject.hide_headers[0] = {hidden, 4};
+    reject.hide_header_count = 1;
+    auto suppress = reject;
+    suppress.head_mode = ResponsePolicyHeadMode::SuppressBody;
+
+    rir::Module module{};
+    module.response_policy_count = 2;
+    module.response_policies[0] = reject;
+    module.response_policies[1] = suppress;
+    RouteConfig config{};
+    REQUIRE(populate_route_config(config, module));
+    CHECK_EQ(config.response_policy_count, 2u);
+    CHECK_EQ(config.response_policies[0].head_mode, ResponsePolicyHeadMode::Reject);
+    CHECK_EQ(config.response_policies[1].head_mode, ResponsePolicyHeadMode::SuppressBody);
+    CHECK(config.response_policies[0].server.ptr != server);
+    CHECK(config.response_policies[0].hide_headers[0].ptr != hidden);
+    const u32 bytes_before_duplicate = config.response_policy_bytes_used;
+    CHECK_EQ(config.add_response_policy(suppress), 2u);
+    CHECK_EQ(config.response_policy_bytes_used, bytes_before_duplicate);
+
+    server[0] = 'X';
+    hidden[0] = 'X';
+    CHECK(config.response_policies[0].server.eq({"server", 6}));
+    CHECK(config.response_policies[0].hide_headers[0].eq({"Date", 4}));
+
+    rir::Module malformed = module;
+    malformed.response_policies[1].head_mode = ResponsePolicyHeadMode::Invalid;
+    RouteConfig untouched{};
+    CHECK_FALSE(populate_route_config(untouched, malformed));
+    CHECK_EQ(untouched.response_policy_count, 0u);
+    CHECK_EQ(untouched.response_policy_bytes_used, 0u);
+}
+
 static Connection* setup_target_transform_request(SmallLoop& loop,
                                                    RouteConfig& cfg,
                                                    const char* request,

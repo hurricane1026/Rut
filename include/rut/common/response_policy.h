@@ -6,8 +6,8 @@
 namespace rut {
 
 // Response-policy source objects are deliberately bounded. They describe
-// semantics for a future response serializer; they are not an nginx mode and
-// are not interpreted by the runtime yet.
+// semantics for the response serializer; unsupported future modes are
+// rejected by the runtime rather than silently ignored.
 static constexpr u32 kMaxResponsePolicies = 16;
 static constexpr u32 kMaxResponsePolicyHideHeaders = 8;
 static constexpr u32 kMaxResponsePolicyHeaderNameLen = 64;
@@ -34,11 +34,21 @@ enum class ResponsePolicyDate : u8 {
     Current = 1,
 };
 
+// HEAD-aware serialization is intentionally metadata-only in this increment.
+// Reject is the legacy/source default; SuppressBody is reserved for the
+// subsequent runtime serializer increment and must not be silently ignored.
+enum class ResponsePolicyHeadMode : u8 {
+    Invalid = 0,
+    Reject = 1,
+    SuppressBody = 2,
+};
+
 struct ForwardResponsePolicySpec {
     ResponsePolicyVersion version = ResponsePolicyVersion::Invalid;
     ResponsePolicyFraming framing = ResponsePolicyFraming::Invalid;
     ResponsePolicyConnection connection = ResponsePolicyConnection::Invalid;
     ResponsePolicyDate date = ResponsePolicyDate::Invalid;
+    ResponsePolicyHeadMode head_mode = ResponsePolicyHeadMode::Reject;
     Str server{};
     u32 hide_header_count = 0;
     Str hide_headers[kMaxResponsePolicyHideHeaders]{};
@@ -68,7 +78,10 @@ inline bool response_policy_spec_valid(const ForwardResponsePolicySpec& policy) 
         policy.framing != ResponsePolicyFraming::ContentLength ||
         (policy.connection != ResponsePolicyConnection::KeepAlive &&
          policy.connection != ResponsePolicyConnection::Request) ||
-        policy.date != ResponsePolicyDate::Current || !response_policy_safe_server(policy.server) ||
+        policy.date != ResponsePolicyDate::Current ||
+        (policy.head_mode != ResponsePolicyHeadMode::Reject &&
+         policy.head_mode != ResponsePolicyHeadMode::SuppressBody) ||
+        !response_policy_safe_server(policy.server) ||
         policy.hide_header_count > kMaxResponsePolicyHideHeaders)
         return false;
     for (u32 i = 0; i < policy.hide_header_count; i++) {
@@ -87,7 +100,7 @@ inline bool response_policy_spec_valid(const ForwardResponsePolicySpec& policy) 
 inline bool response_policy_spec_equal(const ForwardResponsePolicySpec& a,
                                        const ForwardResponsePolicySpec& b) {
     if (a.version != b.version || a.framing != b.framing || a.connection != b.connection ||
-        a.date != b.date || !a.server.eq(b.server) ||
+        a.date != b.date || a.head_mode != b.head_mode || !a.server.eq(b.server) ||
         a.hide_header_count != b.hide_header_count)
         return false;
     for (u32 i = 0; i < a.hide_header_count; i++) {
