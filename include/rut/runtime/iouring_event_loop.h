@@ -413,19 +413,32 @@ public:
     // have completed and at most the downstream multishot recv plus the current
     // upstream multishot recv remain accounted.
     [[nodiscard]] bool begin_strict_upstream_retirement(Connection& c) {
+        const u32 previous_tombstone = c.upstream_retiring_episode;
+        const bool replaceable_tombstone =
+            previous_tombstone == 0 ||
+            (valid_upstream_episode(previous_tombstone) &&
+             previous_tombstone < c.upstream_episode && !c.upstream_retirement_active &&
+             !c.upstream_retirement_recv_owned && !c.upstream_retirement_cancel_owned &&
+             !c.upstream_retirement_cancel_retry);
         if (c.id >= kMaxConns || c.upstream_episode_quarantined ||
-            !valid_upstream_episode(c.upstream_episode) || c.upstream_retiring_episode != 0 ||
+            !valid_upstream_episode(c.upstream_episode) || !replaceable_tombstone ||
             c.upstream_retirement_active || c.upstream_retirement_recv_owned ||
             c.upstream_retirement_cancel_owned || c.upstream_retirement_cancel_retry ||
-            c.upstream_fd < 0 || c.send_armed || c.upstream_send_armed || c.yield_timeout_armed ||
-            c.recv_pause_cancel_pending || c.recv_pause_rearm_pending ||
-            c.upstream_connect_armed ||
+            c.upstream_close_episode != 0 || c.upstream_close_target_owned != 0 ||
+            c.upstream_close_cancel_owned != 0 || c.upstream_close_pause_cancel_owned ||
+            c.http1_boundary_deferred || c.http1_boundary_ready ||
+            c.http1_boundary_successor_episode != 0 || c.upstream_fd < 0 || c.send_armed ||
+            c.upstream_connect_armed || c.upstream_send_armed || c.yield_armed ||
+            c.yield_timeout_armed || c.recv_paused_for_send || c.recv_pause_cancel_pending ||
+            c.recv_pause_rearm_pending ||
             c.upstream_recv_paused_for_send || c.upstream_recv_pause_cancel_pending ||
-            c.upstream_recv_pause_rearm_pending || c.upstream_recv_cancel_inflight)
+            c.upstream_recv_pause_rearm_pending || c.upstream_recv_cancel_inflight ||
+            c.upstream_recv_terminal_stale)
             return false;
 
-        const auto& send = backend.upstream_send_state[c.id];
-        if (send.remaining != 0) return false;
+        const auto& downstream_send = backend.send_state[c.id];
+        const auto& upstream_send = backend.upstream_send_state[c.id];
+        if (downstream_send.remaining != 0 || upstream_send.remaining != 0) return false;
 
         // Every live operation at this strict pre-send point is represented by
         // one of these two multishot targets. Exact equality excludes an
@@ -434,6 +447,10 @@ public:
                                      static_cast<u32>(c.upstream_recv_armed);
         if (c.pending_ops != expected_pending) return false;
 
+        // Replace a fully-drained older tombstone directly with the exact
+        // current token. Never clear it through zero: from this assignment on,
+        // every older episode remains default-denied by the latest-retirement
+        // consumer while this exact episode owns the new recv/cancel finals.
         const u32 retiring_episode = c.upstream_episode;
         c.upstream_retiring_episode = retiring_episode;
         c.upstream_retirement_active = c.upstream_recv_armed;
@@ -589,11 +606,12 @@ public:
             return true;
         }
 
-        // C1's exact precondition proves there is no other upstream operation
-        // while retirement is active. Once inactive, retain the old token as a
-        // tombstone but admit documented production completions carrying the
-        // exact current successor token. Retirement-only, unknown, malformed,
-        // and stale records own no aggregate accounting and remain swallowed.
+        // The strict begin precondition proves there is no other upstream
+        // operation while retirement is active. Once inactive, retain the
+        // latest token as a tombstone but admit documented production
+        // completions carrying the exact current successor token. Retirement-
+        // only, unknown, malformed, and older records own no aggregate
+        // accounting and remain swallowed.
         if (c.upstream_retiring_episode == 0) return false;
         if (c.upstream_retirement_active) return true;
         return !current_successor_event_is_valid(c, ev);

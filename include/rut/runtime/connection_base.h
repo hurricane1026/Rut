@@ -641,12 +641,15 @@ struct ConnectionBase {
     // proxy_stream_complete clears resp_fully_buffered before that terminal drains, so
     // the live flag is unreliable. Cleared with upstream_recv_cancel_inflight.
     bool upstream_recv_terminal_stale;
-    // Bounded io_uring C1 retirement state for strict upstream abandonment.
-    // The retiring token remains as a tombstone after both owned finals drain,
-    // so a duplicate final cannot fall into generic stale-CQE accounting. The
-    // active/ownership/retry fields are preserved explicitly by io_uring's
-    // deferred-free path while kernel work still pins the connection storage.
-    u32 upstream_retiring_episode;
+    // Bounded io_uring strict-abandonment retirement state. The latest retiring
+    // token remains as a tombstone after both owned finals drain and across
+    // ordinary reset()/slot reuse, so an old final cannot fall into generic
+    // stale-CQE accounting. A later proven recv-only retirement atomically
+    // replaces it with the then-current token; it is initialized exactly once
+    // here rather than being cleared by reset(). Active ownership/retry fields
+    // are still reset normally and preserved explicitly by io_uring's deferred-
+    // free path while kernel work pins the connection storage.
+    u32 upstream_retiring_episode = 0;
     bool upstream_retirement_active;
     bool upstream_retirement_recv_owned;
     bool upstream_retirement_cancel_owned;
@@ -921,7 +924,8 @@ struct ConnectionBase {
         upstream_recv_pause_rearm_pending = false;
         upstream_recv_cancel_inflight = false;
         upstream_recv_terminal_stale = false;
-        upstream_retiring_episode = 0;
+        // upstream_retiring_episode deliberately persists across reset()/reuse;
+        // see its declaration. Active ownership never does.
         upstream_retirement_active = false;
         upstream_retirement_recv_owned = false;
         upstream_retirement_cancel_owned = false;

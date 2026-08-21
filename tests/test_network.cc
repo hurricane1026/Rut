@@ -17809,6 +17809,30 @@ void prepare_recv_only_retirement(Connection& conn, u32 episode) {
     conn.pending_ops = 1;
 }
 
+void drain_strict_recv_retirement(IoUringEventLoop* loop,
+                                  Connection& conn,
+                                  u32 episode,
+                                  bool cancel_first) {
+    const IoEvent target{conn.id,
+                         -ECANCELED,
+                         0,
+                         0,
+                         IoEventType::UpstreamRecv,
+                         0,
+                         0,
+                         episode};
+    const IoEvent cancel{conn.id,
+                         -ENOENT,
+                         0,
+                         0,
+                         IoEventType::UpstreamRecv,
+                         0,
+                         kUpstreamRetirementCancelAux,
+                         episode};
+    loop->dispatch(cancel_first ? cancel : target);
+    loop->dispatch(cancel_first ? target : cancel);
+}
+
 bool stage_http1_boundary_retirement(IoUringEventLoop* loop,
                                      const RouteConfig* old_config,
                                      ShardEpoch* epoch,
@@ -18444,6 +18468,105 @@ TEST(iouring_retirement, recv_only_preconditions_fail_before_token_or_cancel_mut
     loop->free_conn(*conn);
 }
 
+TEST(iouring_retirement, replacement_preconditions_reject_every_live_owner_before_mutation) {
+    ScopedIoUringLoopForRetirement guard;
+    if (!guard.init()) SKIP("io_uring unavailable");
+    auto* loop = guard.loop;
+    Connection* conn = loop->alloc_conn();
+    REQUIRE(conn != nullptr);
+    constexpr u32 kFirst = 55;
+    constexpr u32 kSecond = 56;
+    prepare_recv_only_retirement(*conn, kFirst);
+    REQUIRE(loop->begin_strict_upstream_retirement(*conn));
+    drain_strict_recv_retirement(loop, *conn, kFirst, false);
+    conn->upstream_recv_armed = false;
+    conn->upstream_fd = 42;
+    conn->upstream_recv_armed = true;
+    conn->pending_ops = 1;
+
+    const u32 tail_before = __atomic_load_n(loop->backend.sq_tail, __ATOMIC_ACQUIRE);
+    const u32 backend_pending_before = loop->backend.pending;
+    auto check_unchanged = [&] {
+        const u32 tombstone_before = conn->upstream_retiring_episode;
+        const u32 episode_before = conn->upstream_episode;
+        const u32 pending_before = conn->pending_ops;
+        CHECK_FALSE(loop->begin_strict_upstream_retirement(*conn));
+        CHECK_EQ(conn->upstream_retiring_episode, tombstone_before);
+        CHECK_EQ(conn->upstream_episode, episode_before);
+        CHECK_EQ(conn->pending_ops, pending_before);
+        CHECK_EQ(__atomic_load_n(loop->backend.sq_tail, __ATOMIC_ACQUIRE), tail_before);
+        CHECK_EQ(loop->backend.pending, backend_pending_before);
+    };
+
+    bool Connection::*bool_blockers[] = {
+        &Connection::upstream_retirement_active,
+        &Connection::upstream_retirement_recv_owned,
+        &Connection::upstream_retirement_cancel_owned,
+        &Connection::upstream_retirement_cancel_retry,
+        &Connection::upstream_close_pause_cancel_owned,
+        &Connection::http1_boundary_deferred,
+        &Connection::http1_boundary_ready,
+        &Connection::send_armed,
+        &Connection::upstream_connect_armed,
+        &Connection::upstream_send_armed,
+        &Connection::yield_armed,
+        &Connection::yield_timeout_armed,
+        &Connection::recv_paused_for_send,
+        &Connection::recv_pause_cancel_pending,
+        &Connection::recv_pause_rearm_pending,
+        &Connection::upstream_recv_paused_for_send,
+        &Connection::upstream_recv_pause_cancel_pending,
+        &Connection::upstream_recv_pause_rearm_pending,
+        &Connection::upstream_recv_cancel_inflight,
+        &Connection::upstream_recv_terminal_stale,
+    };
+    for (bool Connection::*blocker : bool_blockers) {
+        conn->*blocker = true;
+        check_unchanged();
+        conn->*blocker = false;
+    }
+
+    conn->upstream_close_episode = kSecond;
+    check_unchanged();
+    conn->upstream_close_episode = 0;
+    conn->upstream_close_target_owned = kUpstreamOpConnect;
+    check_unchanged();
+    conn->upstream_close_target_owned = 0;
+    conn->upstream_close_cancel_owned = kUpstreamOpRecv;
+    check_unchanged();
+    conn->upstream_close_cancel_owned = 0;
+    conn->http1_boundary_successor_episode = kSecond;
+    check_unchanged();
+    conn->http1_boundary_successor_episode = 0;
+
+    static constexpr u8 kPartial[] = {'p', 'a', 'r', 't'};
+    loop->backend.send_state[conn->id] = {
+        kPartial, 42, 1, 3, IoEventType::Send, 0};
+    check_unchanged();
+    loop->backend.send_state[conn->id] = {
+        nullptr, -1, 0, 0, IoEventType::Send, 0};
+
+    conn->pending_ops = 2;
+    check_unchanged();
+    conn->pending_ops = 1;
+    conn->upstream_fd = -1;
+    check_unchanged();
+    conn->upstream_fd = 42;
+
+    conn->upstream_retiring_episode = kSecond;
+    check_unchanged();
+    conn->upstream_retiring_episode = kSecond + 1u;
+    check_unchanged();
+    conn->upstream_retiring_episode = kInvalidUpstreamEventEpisode;
+    check_unchanged();
+    conn->upstream_retiring_episode = kFirst;
+
+    conn->upstream_recv_armed = false;
+    conn->pending_ops = 0;
+    conn->upstream_fd = -1;
+    loop->free_conn(*conn);
+}
+
 TEST(iouring_retirement, downstream_close_preserves_owners_and_reclaims_once) {
     ScopedIoUringLoopForRetirement guard;
     if (!guard.init()) SKIP("io_uring unavailable");
@@ -18643,6 +18766,405 @@ TEST(iouring_retirement, completed_tombstone_isolates_downstream_pending_owner) 
     loop->dispatch(downstream_final);
     CHECK_EQ(loop->pending_free_count, 0u);
     CHECK_EQ(loop->free_top, free_before + 1u);
+
+    Connection* reused = loop->alloc_conn();
+    REQUIRE(reused != nullptr);
+    REQUIRE_EQ(reused->id, conn_id);
+    CHECK_EQ(reused->upstream_retiring_episode, kRetiringEpisode);
+    CHECK_EQ(reused->upstream_episode, kRetiringEpisode + 1u);
+    loop->free_conn(*reused);
+}
+
+TEST(iouring_retirement, drained_latest_tombstone_replaces_twice_and_denies_older_records) {
+    struct Ordering {
+        bool first_cancel;
+        bool second_cancel;
+    };
+    const Ordering orderings[] = {{false, false}, {false, true}, {true, false}, {true, true}};
+
+    for (const Ordering order : orderings) {
+        ScopedIoUringLoopForRetirement guard;
+        if (!guard.init()) SKIP("io_uring unavailable");
+        auto* loop = guard.loop;
+        Connection* conn = loop->alloc_conn();
+        REQUIRE(conn != nullptr);
+        REQUIRE(loop->alloc_upstream_buf(*conn));
+        constexpr u32 kFirst = 81;
+        constexpr u32 kSecond = 82;
+        constexpr u32 kThird = 83;
+
+        prepare_recv_only_retirement(*conn, kFirst);
+        REQUIRE(loop->begin_strict_upstream_retirement(*conn));
+        drain_strict_recv_retirement(loop, *conn, kFirst, order.first_cancel);
+        REQUIRE_FALSE(conn->upstream_retirement_active);
+        REQUIRE_EQ(conn->upstream_retiring_episode, kFirst);
+        REQUIRE_EQ(conn->upstream_episode, kSecond);
+
+        // Model abandon_strict_upstream's detach before the successor request
+        // installs its own recv target under the current token.
+        conn->upstream_recv_armed = false;
+        conn->upstream_fd = 42;
+        conn->upstream_recv_armed = true;
+        conn->pending_ops = 1;
+        g_callback_invoked = false;
+        conn->on_upstream_recv = &test_sentinel_callback<IoUringEventLoop>;
+        conn->on_upstream_send = &test_sentinel_callback<IoUringEventLoop>;
+
+        REQUIRE(loop->begin_strict_upstream_retirement(*conn));
+        REQUIRE_EQ(conn->upstream_retiring_episode, kSecond);
+        REQUIRE_EQ(conn->upstream_episode, kThird);
+        REQUIRE(conn->upstream_retirement_active);
+        REQUIRE_EQ(conn->pending_ops, 2u);
+
+        const IoEvent old_records[] = {
+            {conn->id, -ECANCELED, 0, 0, IoEventType::UpstreamRecv, 0, 0, kFirst},
+            {conn->id,
+             -ENOENT,
+             0,
+             0,
+             IoEventType::UpstreamRecv,
+             0,
+             kUpstreamRetirementCancelAux,
+             kFirst},
+            {conn->id, -ENOENT, 0, 0, IoEventType::UpstreamRecv, 0, kPauseCancelAux, kFirst},
+            {conn->id,
+             -EIO,
+             0,
+             0,
+             IoEventType::UpstreamSend,
+             0,
+             kLocalSubmitFailureAux,
+             kFirst},
+            {conn->id,
+             -ENOENT,
+             0,
+             0,
+             IoEventType::UpstreamConnect,
+             0,
+             kUpstreamCloseCancelAux,
+             kFirst},
+        };
+        for (const IoEvent& old : old_records) {
+            loop->dispatch(old);
+            CHECK_EQ(conn->pending_ops, 2u);
+            CHECK_EQ(conn->upstream_retiring_episode, kSecond);
+            CHECK(conn->upstream_retirement_recv_owned);
+            CHECK(conn->upstream_retirement_cancel_owned);
+            CHECK_FALSE(g_callback_invoked);
+        }
+
+        // A real provided buffer tagged with E1 is returned but never copied
+        // after the E2 -> E3 replacement.
+        constexpr u16 kOldBufId = 39;
+        static constexpr char kOldBytes[] = "retirement-one-body";
+        __builtin_memcpy(loop->backend.buf_base + static_cast<u64>(kOldBufId) * 4096,
+                         kOldBytes,
+                         sizeof(kOldBytes) - 1);
+        const u16 buf_tail_before =
+            __atomic_load_n(&loop->backend.buf_ring->tail, __ATOMIC_ACQUIRE);
+        u32 cq_tail = __atomic_load_n(loop->backend.cq_tail, __ATOMIC_ACQUIRE);
+        auto& old_recv_cqe = loop->backend.cq_entries[cq_tail & *loop->backend.cq_ring_mask];
+        old_recv_cqe.user_data =
+            encode_upstream_event_token({conn->id, IoEventType::UpstreamRecv, kFirst, 0});
+        old_recv_cqe.res = sizeof(kOldBytes) - 1;
+        old_recv_cqe.flags = IORING_CQE_F_BUFFER | IORING_CQE_F_MORE |
+                             (static_cast<u32>(kOldBufId) << IORING_CQE_BUFFER_SHIFT);
+        __atomic_store_n(loop->backend.cq_tail, cq_tail + 1, __ATOMIC_RELEASE);
+        loop->backend.pending = 0;
+        IoEvent harvested[2]{};
+        REQUIRE_EQ(loop->backend.wait(
+                       harvested, 2, loop->conns, IoUringEventLoop::kMaxConns),
+                   1u);
+        CHECK_EQ(conn->upstream_recv_buf.len(), 0u);
+        CHECK_EQ(__atomic_load_n(&loop->backend.buf_ring->tail, __ATOMIC_ACQUIRE),
+                 static_cast<u16>(buf_tail_before + 1u));
+        loop->dispatch(harvested[0]);
+        CHECK_EQ(conn->pending_ops, 2u);
+
+        // An old partial-send completion must not advance or resubmit the
+        // send-state currently addressable by this allocator slot.
+        static const u8 kWire[] = {'o', 'l', 'd', '-', 'w', 'i', 'r', 'e'};
+        loop->backend.upstream_send_state[conn->id] = {
+            kWire, -1, 0, sizeof(kWire), IoEventType::UpstreamSend, kFirst};
+        const u32 sq_tail_before =
+            __atomic_load_n(loop->backend.sq_tail, __ATOMIC_ACQUIRE);
+        cq_tail = __atomic_load_n(loop->backend.cq_tail, __ATOMIC_ACQUIRE);
+        auto& old_send_cqe = loop->backend.cq_entries[cq_tail & *loop->backend.cq_ring_mask];
+        old_send_cqe.user_data =
+            encode_upstream_event_token({conn->id, IoEventType::UpstreamSend, kFirst, 0});
+        old_send_cqe.res = 3;
+        old_send_cqe.flags = 0;
+        __atomic_store_n(loop->backend.cq_tail, cq_tail + 1, __ATOMIC_RELEASE);
+        loop->backend.pending = 0;
+        REQUIRE_EQ(loop->backend.wait(
+                       harvested, 2, loop->conns, IoUringEventLoop::kMaxConns),
+                   1u);
+        CHECK_EQ(harvested[0].result, -ESTALE);
+        CHECK_EQ(loop->backend.upstream_send_state[conn->id].offset, 0u);
+        CHECK_EQ(loop->backend.upstream_send_state[conn->id].remaining,
+                 static_cast<u32>(sizeof(kWire)));
+        CHECK_EQ(__atomic_load_n(loop->backend.sq_tail, __ATOMIC_ACQUIRE), sq_tail_before);
+        loop->dispatch(harvested[0]);
+        CHECK_EQ(conn->pending_ops, 2u);
+        loop->backend.upstream_send_state[conn->id] = {
+            nullptr, -1, 0, 0, IoEventType::UpstreamSend, 0};
+
+        drain_strict_recv_retirement(loop, *conn, kSecond, order.second_cancel);
+        REQUIRE_FALSE(conn->upstream_retirement_active);
+        REQUIRE_EQ(conn->upstream_retiring_episode, kSecond);
+        REQUIRE_EQ(conn->upstream_episode, kThird);
+        REQUIRE_EQ(conn->pending_ops, 0u);
+
+        // E1 remains default-denied after E2 becomes inactive and while a real
+        // E3 owner exists; it cannot borrow that owner's aggregate count.
+        conn->upstream_recv_armed = false;
+        conn->upstream_connect_armed = true;
+        conn->pending_ops = 1;
+        for (const IoEvent& old : old_records) {
+            loop->dispatch(old);
+            CHECK_EQ(conn->pending_ops, 1u);
+            CHECK(conn->upstream_connect_armed);
+            CHECK_FALSE(g_callback_invoked);
+        }
+        conn->upstream_connect_armed = false;
+        conn->pending_ops = 0;
+        conn->upstream_fd = -1;
+        conn->on_upstream_recv = nullptr;
+        conn->on_upstream_send = nullptr;
+        loop->free_conn(*conn);
+    }
+}
+
+TEST(iouring_retirement, latest_tombstone_persists_across_immediate_reset_and_slot_reuse) {
+    ScopedIoUringLoopForRetirement guard;
+    if (!guard.init()) SKIP("io_uring unavailable");
+    auto* loop = guard.loop;
+    Connection* conn = loop->alloc_conn();
+    REQUIRE(conn != nullptr);
+    REQUIRE_EQ(conn->upstream_retiring_episode, 0u);
+    const u32 id = conn->id;
+    constexpr u32 kRetired = 211;
+    prepare_recv_only_retirement(*conn, kRetired);
+    REQUIRE(loop->begin_strict_upstream_retirement(*conn));
+    drain_strict_recv_retirement(loop, *conn, kRetired, false);
+    conn->upstream_recv_armed = false;
+    conn->upstream_fd = -1;
+    loop->free_conn(*conn);
+
+    Connection* reused = loop->alloc_conn();
+    REQUIRE(reused != nullptr);
+    REQUIRE_EQ(reused->id, id);
+    CHECK_EQ(reused->upstream_retiring_episode, kRetired);
+    CHECK_EQ(reused->upstream_episode, kRetired + 1u);
+    reused->pending_ops = 1;
+    reused->recv_armed = true;
+    reused->on_recv = &test_sentinel_callback<IoUringEventLoop>;
+    g_callback_invoked = false;
+    loop->dispatch(
+        {id, -ECANCELED, 0, 0, IoEventType::UpstreamRecv, 0, 0, kRetired});
+    loop->dispatch({id,
+                    -ENOENT,
+                    0,
+                    0,
+                    IoEventType::UpstreamRecv,
+                    0,
+                    kUpstreamRetirementCancelAux,
+                    kRetired});
+    CHECK_EQ(reused->pending_ops, 1u);
+    CHECK(reused->recv_armed);
+    CHECK_FALSE(g_callback_invoked);
+    reused->pending_ops = 0;
+    reused->recv_armed = false;
+    reused->on_recv = nullptr;
+    loop->free_conn(*reused);
+}
+
+TEST(iouring_retirement, second_retirement_at_max_quarantines_without_third_admission) {
+    ScopedIoUringLoopForRetirement guard;
+    if (!guard.init()) SKIP("io_uring unavailable");
+    auto* loop = guard.loop;
+    Connection* conn = loop->alloc_conn();
+    REQUIRE(conn != nullptr);
+    constexpr u32 kFirst = kIoUserDataMaxUpstreamEpisode - 1u;
+    constexpr u32 kSecond = kIoUserDataMaxUpstreamEpisode;
+    prepare_recv_only_retirement(*conn, kFirst);
+    REQUIRE(loop->begin_strict_upstream_retirement(*conn));
+    drain_strict_recv_retirement(loop, *conn, kFirst, false);
+    conn->upstream_recv_armed = false;
+    conn->upstream_fd = 42;
+    conn->upstream_recv_armed = true;
+    conn->pending_ops = 1;
+
+    REQUIRE(loop->begin_strict_upstream_retirement(*conn));
+    CHECK_EQ(conn->upstream_retiring_episode, kSecond);
+    CHECK_EQ(conn->upstream_episode, kInvalidUpstreamEventEpisode);
+    CHECK(conn->upstream_episode_quarantined);
+    CHECK_FALSE(loop->backend.add_recv_upstream(42, conn->id, conn->upstream_episode));
+    drain_strict_recv_retirement(loop, *conn, kSecond, true);
+    CHECK_FALSE(conn->upstream_retirement_active);
+    CHECK_EQ(conn->upstream_retiring_episode, kSecond);
+    conn->upstream_recv_armed = false;
+    conn->upstream_fd = -1;
+    const u32 free_before = loop->free_top;
+    loop->free_conn(*conn);
+    CHECK_EQ(loop->free_top, free_before);  // quarantined slot is never reused
+}
+
+TEST(iouring_retirement, downstream_close_during_second_retirement_reclaims_exactly_once) {
+    ScopedIoUringLoopForRetirement guard;
+    if (!guard.init()) SKIP("io_uring unavailable");
+    auto* loop = guard.loop;
+    Connection* conn = loop->alloc_conn();
+    REQUIRE(conn != nullptr);
+    const u32 id = conn->id;
+    constexpr u32 kFirst = 221;
+    constexpr u32 kSecond = 222;
+    prepare_recv_only_retirement(*conn, kFirst);
+    REQUIRE(loop->begin_strict_upstream_retirement(*conn));
+    drain_strict_recv_retirement(loop, *conn, kFirst, false);
+    conn->upstream_recv_armed = false;
+
+    i32 downstream[2] = {-1, -1};
+    REQUIRE_EQ(socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, downstream), 0);
+    conn->fd = downstream[0];
+    conn->upstream_fd = dup(STDERR_FILENO);
+    REQUIRE_GE(conn->upstream_fd, 0);
+    conn->recv_armed = true;
+    conn->upstream_recv_armed = true;
+    conn->pending_ops = 2;
+    const u32 free_before = loop->free_top;
+
+    REQUIRE(abandon_strict_upstream(loop, *conn));
+    REQUIRE_EQ(conn->upstream_retiring_episode, kSecond);
+    REQUIRE_EQ(conn->upstream_episode, kSecond + 1u);
+    REQUIRE_EQ(conn->pending_ops, 3u);  // downstream + E2 target + E2 cancel
+    loop->close_conn(*conn);
+    Connection& closed = loop->conns[id];
+    REQUIRE_EQ(loop->pending_free_count, 1u);
+    REQUIRE_EQ(closed.pending_ops, 4u);  // plus downstream close cancel
+    REQUIRE_EQ(loop->free_top, free_before);
+
+    drain_strict_recv_retirement(loop, closed, kSecond, true);
+    CHECK_EQ(closed.pending_ops, 2u);
+    CHECK_EQ(loop->pending_free_count, 1u);
+    loop->dispatch({id, -ECANCELED, 0, 0, IoEventType::Recv, 0});
+    CHECK_EQ(closed.pending_ops, 1u);
+    loop->dispatch({id, -ENOENT, 0, 0, IoEventType::Recv, 0});
+    CHECK_EQ(closed.pending_ops, 0u);
+    CHECK_EQ(loop->pending_free_count, 0u);
+    CHECK_EQ(loop->free_top, free_before + 1u);
+    CHECK_EQ(closed.upstream_retiring_episode, kSecond);
+
+    loop->dispatch({id,
+                    -ENOENT,
+                    0,
+                    0,
+                    IoEventType::UpstreamRecv,
+                    0,
+                    kUpstreamRetirementCancelAux,
+                    kSecond});
+    loop->dispatch({id, -ENOENT, 0, 0, IoEventType::Recv, 0});
+    CHECK_EQ(loop->free_top, free_before + 1u);
+    close(downstream[1]);
+}
+
+TEST(iouring_retirement, latest_tombstone_composes_with_request_three_close_ledger) {
+    ScopedIoUringLoopForRetirement guard;
+    if (!guard.init()) SKIP("io_uring unavailable");
+    auto* loop = guard.loop;
+    Connection* conn = loop->alloc_conn();
+    REQUIRE(conn != nullptr);
+    const u32 id = conn->id;
+    constexpr u32 kFirst = 231;
+    constexpr u32 kSecond = 232;
+    constexpr u32 kThird = 233;
+    prepare_recv_only_retirement(*conn, kFirst);
+    REQUIRE(loop->begin_strict_upstream_retirement(*conn));
+    drain_strict_recv_retirement(loop, *conn, kFirst, false);
+    conn->upstream_recv_armed = false;
+    conn->upstream_fd = 42;
+    conn->upstream_recv_armed = true;
+    conn->pending_ops = 1;
+    REQUIRE(loop->begin_strict_upstream_retirement(*conn));
+    drain_strict_recv_retirement(loop, *conn, kSecond, true);
+    conn->upstream_recv_armed = false;
+    REQUIRE_EQ(conn->upstream_retiring_episode, kSecond);
+    REQUIRE_EQ(conn->upstream_episode, kThird);
+
+    i32 downstream[2] = {-1, -1};
+    REQUIRE_EQ(socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, downstream), 0);
+    conn->fd = downstream[0];
+    conn->upstream_fd = dup(STDERR_FILENO);
+    REQUIRE_GE(conn->upstream_fd, 0);
+    conn->recv_armed = true;
+    conn->upstream_connect_armed = true;
+    conn->on_upstream_send = &test_sentinel_callback<IoUringEventLoop>;
+    conn->pending_ops = 2;  // downstream recv + request-3 connect
+    const u32 free_before = loop->free_top;
+    loop->close_conn(*conn);
+    Connection& closed = loop->conns[id];
+    REQUIRE_EQ(closed.upstream_close_episode, kThird);
+    REQUIRE_EQ(closed.upstream_close_target_owned, kUpstreamOpConnect);
+    REQUIRE_EQ(closed.upstream_close_cancel_owned, kUpstreamOpConnect);
+    REQUIRE_EQ(closed.pending_ops, 4u);
+    REQUIRE_EQ(loop->pending_free_count, 1u);
+
+    const IoEvent old_records[] = {
+        {id, -ECANCELED, 0, 0, IoEventType::UpstreamRecv, 0, 0, kFirst},
+        {id,
+         -ENOENT,
+         0,
+         0,
+         IoEventType::UpstreamRecv,
+         0,
+         kUpstreamRetirementCancelAux,
+         kFirst},
+        {id, -ECANCELED, 0, 0, IoEventType::UpstreamRecv, 0, 0, kSecond},
+        {id,
+         -ENOENT,
+         0,
+         0,
+         IoEventType::UpstreamRecv,
+         0,
+         kUpstreamRetirementCancelAux,
+         kSecond},
+    };
+    for (const IoEvent& old : old_records) {
+        loop->dispatch(old);
+        CHECK_EQ(closed.pending_ops, 4u);
+        CHECK_EQ(closed.upstream_close_target_owned, kUpstreamOpConnect);
+        CHECK_EQ(closed.upstream_close_cancel_owned, kUpstreamOpConnect);
+    }
+
+    loop->dispatch(
+        {id, -ECANCELED, 0, 0, IoEventType::UpstreamConnect, 0, 0, kThird});
+    loop->dispatch({id,
+                    -ENOENT,
+                    0,
+                    0,
+                    IoEventType::UpstreamConnect,
+                    0,
+                    kUpstreamCloseCancelAux,
+                    kThird});
+    CHECK_EQ(closed.pending_ops, 2u);
+    CHECK_EQ(closed.upstream_close_target_owned, 0u);
+    CHECK_EQ(closed.upstream_close_cancel_owned, 0u);
+    loop->dispatch({id, -ECANCELED, 0, 0, IoEventType::Recv, 0});
+    loop->dispatch({id, -ENOENT, 0, 0, IoEventType::Recv, 0});
+    CHECK_EQ(closed.pending_ops, 0u);
+    CHECK_EQ(loop->pending_free_count, 0u);
+    CHECK_EQ(loop->free_top, free_before + 1u);
+    CHECK_EQ(closed.upstream_retiring_episode, kSecond);
+    loop->dispatch({id,
+                    -ENOENT,
+                    0,
+                    0,
+                    IoEventType::UpstreamConnect,
+                    0,
+                    kUpstreamCloseCancelAux,
+                    kThird});
+    CHECK_EQ(loop->free_top, free_before + 1u);
+    close(downstream[1]);
 }
 
 TEST(iouring_boundary, send_first_target_first_resumes_once_after_batch_with_current_config) {
@@ -20011,6 +20533,208 @@ TEST(iouring_retirement, production_paired_head_success_retires_before_old_preco
     CHECK_EQ(loop->pending_free_count, 0u);
     CHECK_EQ(loop->free_top, free_before + 1u);
     CHECK_EQ(concurrency.inflight[0].load(std::memory_order_relaxed), 0u);
+}
+
+TEST(iouring_retirement, production_callbacks_compose_two_boundaries_before_request_three) {
+    ScopedIoUringLoopForRetirement guard;
+    if (!guard.init()) SKIP("io_uring unavailable");
+    auto* loop = guard.loop;
+
+    RouteConfig cfg{};
+    const auto upstream = cfg.add_upstream("backend", 0x7F000001, 9);
+    REQUIRE(upstream.has_value());
+    REQUIRE(cfg.add_proxy("/second", 0, upstream.value()));
+    REQUIRE(cfg.add_static("/third", 0, 209));
+    ForwardResponsePolicySpec response{};
+    response.version = ResponsePolicyVersion::Http11;
+    response.framing = ResponsePolicyFraming::ContentLength;
+    response.connection = ResponsePolicyConnection::Request;
+    response.date = ResponsePolicyDate::Current;
+    response.head_mode = ResponsePolicyHeadMode::SuppressBody;
+    response.server = {"rut", 3};
+    REQUIRE_EQ(cfg.add_response_policy(response), 1u);
+    ForwardFailurePolicySpec failure{};
+    failure.version = ForwardFailurePolicyVersion::Http11;
+    failure.status_code = 502;
+    failure.date = ForwardFailurePolicyDate::Current;
+    failure.connection = ForwardFailurePolicyConnection::Request;
+    failure.head_mode = FailurePolicyHeadMode::SuppressBody;
+    failure.reason = {"Bad Gateway", 11};
+    failure.content_type = {"text/plain", 10};
+    failure.server = {"rut", 3};
+    failure.body = {"bad", 3};
+    REQUIRE_EQ(cfg.add_failure_policy(failure), 1u);
+
+    const RouteConfig* active = &cfg;
+    loop->config_ptr = &active;
+    ShardEpoch epoch{};
+    epoch.epoch.store(1, std::memory_order_relaxed);  // request 1 is already entered
+    ShardMetrics metrics{};
+    metrics.init();
+    metrics.requests_active = 1;
+    loop->epoch = &epoch;
+    loop->metrics = &metrics;
+
+    Connection* conn = loop->alloc_conn();
+    REQUIRE(conn != nullptr);
+    const u32 id = conn->id;
+    i32 downstream[2] = {-1, -1};
+    REQUIRE_EQ(socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, downstream), 0);
+    conn->fd = downstream[0];
+    conn->upstream_fd = dup(STDERR_FILENO);
+    REQUIRE_GE(conn->upstream_fd, 0);
+    REQUIRE(loop->alloc_upstream_buf(*conn));
+    REQUIRE(loop->alloc_response_header_buf(*conn));
+
+    constexpr u32 kFirst = 301;
+    constexpr u32 kSecond = 302;
+    constexpr u32 kThird = 303;
+    static constexpr char kRequest1[] =
+        "HEAD /first HTTP/1.1\r\nHost: x\r\nConnection: keep-alive\r\n\r\n";
+    static constexpr char kRequest2[] =
+        "HEAD /second HTTP/1.1\r\nHost: x\r\nConnection: keep-alive\r\n\r\n";
+    static constexpr char kRequest3[] =
+        "GET /third HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n";
+    static constexpr char kOriginResponse[] =
+        "HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nhe";
+
+    conn->upstream_episode = kFirst;
+    REQUIRE_EQ(conn->recv_buf.write(reinterpret_cast<const u8*>(kRequest1),
+                                    sizeof(kRequest1) - 1),
+               sizeof(kRequest1) - 1);
+    capture_request_metadata(*conn);
+    conn->req_initial_send_len = conn->recv_buf.len();
+    conn->recv_buf.reset();
+    REQUIRE_EQ(conn->recv_buf.write(reinterpret_cast<const u8*>(kRequest2),
+                                    sizeof(kRequest2) - 1),
+               sizeof(kRequest2) - 1);
+    conn->request_config = &cfg;
+    conn->response_policy_id = 1;
+    conn->response_policy_suppress_body = true;
+    conn->failure_policy_id = 1;
+    conn->failure_policy_suppress_body = true;
+    conn->keep_alive = true;
+    conn->recv_armed = true;
+    conn->upstream_recv_armed = true;
+    conn->pending_ops = 2;  // downstream recv + first upstream recv
+    conn->state = ConnState::Proxying;
+    conn->set_slots(nullptr, nullptr, &on_upstream_response<IoUringEventLoop>, nullptr);
+    REQUIRE_EQ(conn->upstream_recv_buf.write(
+                   reinterpret_cast<const u8*>(kOriginResponse), sizeof(kOriginResponse) - 1),
+               sizeof(kOriginResponse) - 1);
+    const u32 sq_tail_before = __atomic_load_n(loop->backend.sq_tail, __ATOMIC_ACQUIRE);
+    const u32 backend_pending_before = loop->backend.pending;
+
+    // Test-seam admission is intentionally limited to this staged live callback:
+    // source/compiler/runtime route admission remains unchanged and still rejects
+    // reusable paired HEAD. Everything after admission is the production path.
+    loop->dispatch({id,
+                    static_cast<i32>(sizeof(kOriginResponse) - 1),
+                    0,
+                    0,
+                    IoEventType::UpstreamRecv,
+                    1,
+                    0,
+                    kFirst});
+    REQUIRE_EQ(conn->upstream_retiring_episode, kFirst);
+    REQUIRE_EQ(conn->upstream_episode, kSecond);
+    REQUIRE(conn->upstream_retirement_active);
+    REQUIRE(conn->send_armed);
+    REQUIRE_EQ(conn->pending_ops, 4u);
+
+    loop->backend.send_state[id] = {nullptr, -1, 0, 0, IoEventType::Send, 0};
+    loop->dispatch({id, 1, 0, 0, IoEventType::Send, 0});
+    REQUIRE(conn->http1_boundary_deferred);
+    REQUIRE_EQ(metrics.requests_total, 1u);
+    REQUIRE_EQ(metrics.requests_active, 0u);
+    REQUIRE_EQ(epoch.epoch.load(std::memory_order_acquire), 2u);
+    drain_strict_recv_retirement(loop, *conn, kFirst, false);
+    REQUIRE(conn->http1_boundary_ready);
+    loop->resume_deferred_http1_boundaries();
+    REQUIRE_FALSE(conn->http1_boundary_deferred);
+    REQUIRE_EQ(conn->handler_gen, 1u);
+    REQUIRE_EQ(conn->state, ConnState::Proxying);
+    REQUIRE(conn->upstream_connect_armed);
+    REQUIRE_EQ(conn->upstream_episode, kSecond);
+    REQUIRE_EQ(conn->pending_ops, 2u);  // downstream recv + second connect
+
+    // Drive request 2's real connect/send callbacks. Direct dispatch bypasses
+    // backend.wait's send-state completion bookkeeping, so mirror only that
+    // bookkeeping before the production callback sees the completion.
+    loop->dispatch({id, 0, 0, 0, IoEventType::UpstreamConnect, 0, 0, kSecond});
+    REQUIRE(conn->upstream_send_armed);
+    REQUIRE_EQ(conn->pending_ops, 2u);
+    const i32 request2_len = static_cast<i32>(conn->req_initial_send_len);
+    loop->backend.upstream_send_state[id] = {
+        nullptr, -1, 0, 0, IoEventType::UpstreamSend, 0};
+    loop->dispatch({id, request2_len, 0, 0, IoEventType::UpstreamSend, 0, 0, kSecond});
+    REQUIRE(conn->upstream_recv_armed);
+    REQUIRE_EQ(conn->pending_ops, 2u);  // downstream recv + second upstream recv
+    REQUIRE_EQ(conn->upstream_recv_buf.len(), 0u);
+
+    // The normal route deliberately has no strict policy. Attach the bounded
+    // test seam only after request 2's production route/connect/send lifecycle,
+    // then deliver its real response callback under E2.
+    conn->response_policy_id = 1;
+    conn->response_policy_suppress_body = true;
+    conn->failure_policy_id = 1;
+    conn->failure_policy_suppress_body = true;
+    REQUIRE_EQ(conn->upstream_recv_buf.write(
+                   reinterpret_cast<const u8*>(kOriginResponse), sizeof(kOriginResponse) - 1),
+               sizeof(kOriginResponse) - 1);
+    loop->dispatch({id,
+                    static_cast<i32>(sizeof(kOriginResponse) - 1),
+                    0,
+                    0,
+                    IoEventType::UpstreamRecv,
+                    1,
+                    0,
+                    kSecond});
+    REQUIRE_EQ(conn->upstream_retiring_episode, kSecond);
+    REQUIRE_EQ(conn->upstream_episode, kThird);
+    REQUIRE(conn->upstream_retirement_active);
+    REQUIRE(conn->send_armed);
+    REQUIRE_EQ(conn->pending_ops, 4u);
+    REQUIRE_EQ(conn->recv_buf.write(reinterpret_cast<const u8*>(kRequest3),
+                                    sizeof(kRequest3) - 1),
+               sizeof(kRequest3) - 1);
+
+    loop->backend.send_state[id] = {nullptr, -1, 0, 0, IoEventType::Send, 0};
+    loop->dispatch({id, 1, 0, 0, IoEventType::Send, 0});
+    REQUIRE(conn->http1_boundary_deferred);
+    REQUIRE_EQ(metrics.requests_total, 2u);
+    REQUIRE_EQ(metrics.requests_active, 0u);
+    REQUIRE_EQ(epoch.epoch.load(std::memory_order_acquire), 4u);
+    drain_strict_recv_retirement(loop, *conn, kSecond, true);
+    REQUIRE(conn->http1_boundary_ready);
+    loop->resume_deferred_http1_boundaries();
+    REQUIRE_FALSE(conn->http1_boundary_deferred);
+    CHECK_EQ(conn->upstream_retiring_episode, kSecond);
+    CHECK_EQ(conn->upstream_episode, kThird);
+    CHECK_EQ(conn->handler_gen, 2u);
+    CHECK_EQ(conn->resp_status, 209u);
+    CHECK_EQ(conn->state, ConnState::Sending);
+    CHECK_EQ(metrics.requests_total, 2u);
+    CHECK_EQ(metrics.requests_active, 1u);
+    CHECK_EQ(epoch.epoch.load(std::memory_order_acquire), 5u);
+    const u32 pending_after_resume = conn->pending_ops;
+    loop->resume_deferred_http1_boundaries();
+    CHECK_EQ(conn->handler_gen, 2u);
+    CHECK_EQ(conn->pending_ops, pending_after_resume);
+
+    // None of the synthetic SQEs in this composition were submitted to the
+    // kernel. Restore the ring producer snapshot, then detach the staged live
+    // targets for deterministic fixture cleanup.
+    __atomic_store_n(loop->backend.sq_tail, sq_tail_before, __ATOMIC_RELEASE);
+    loop->backend.pending = backend_pending_before;
+    conn->send_armed = false;
+    conn->recv_armed = false;
+    conn->pending_ops = 0;
+    close(conn->fd);
+    conn->fd = -1;
+    conn->upstream_fd = -1;
+    loop->free_conn(*conn);
+    close(downstream[1]);
 }
 
 TEST(iouring_retirement, max_episode_quarantines_and_never_reuses_slot) {
