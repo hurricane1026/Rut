@@ -113,7 +113,11 @@ Allowed states are `SUPPORTED`, `PARTIAL`, `BLOCKED_BY_RUT`,
   after successful `EPOLL_CTL_DEL`. This transport work alone does not imply
   keep-alive HEAD support;
   io_uring episode cancellation/drain and deferred request admission are tracked
-  in #264, while the remaining response semantics stay under #253.
+  in #264. Its first recv-only retirement slice now protects the existing
+  explicit-close strict-abandon path, including cancel retry, token exhaustion,
+  provided-buffer isolation, and deferred close/reclaim, but it still does not
+  admit or resume a second downstream request. The remaining response semantics
+  stay under #253.
 - The first request-policy slice rejects body/framing inputs (including
   `Content-Length` and every `Transfer-Encoding` value), HTTP/2, and
   non-origin-form targets before upstream connect. These are intentional
