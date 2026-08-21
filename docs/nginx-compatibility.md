@@ -84,11 +84,12 @@ Allowed states are `SUPPORTED`, `PARTIAL`, `BLOCKED_BY_RUT`,
 - The reusable HEAD gap also depends on the generic epoll transport capability
   tracked in #262. Epoll now exposes at most one logical completion per wait
   with bounded pending-versus-kernel fairness, removing the former whole-batch
-  pre-dispatch I/O window. It still does not transport or validate an upstream
-  episode before that one event performs socket I/O, so an old readiness record
-  can still mutate a later episode. This domain remains fail-closed; neither the
-  completed io_uring episode transport nor the epoll wait prerequisite implies
-  epoll fencing or keep-alive HEAD support.
+  pre-dispatch I/O window. It now also transports explicit upstream episodes and
+  rejects stale or malformed records before fd-map/socket/TLS/state access and
+  before concrete callback dispatch. Production lifecycle boundaries do not yet
+  centrally advance/retire those episodes, and real fd reuse remains unproven.
+  This domain therefore remains fail-closed; transport fencing alone does not
+  imply reusable epoll lifecycles or keep-alive HEAD support.
 - The first request-policy slice rejects body/framing inputs (including
   `Content-Length` and every `Transfer-Encoding` value), HTTP/2, and
   non-origin-form targets before upstream connect. These are intentional
