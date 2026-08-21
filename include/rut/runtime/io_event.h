@@ -34,6 +34,10 @@ static_assert(static_cast<u8>(IoEventType::Count) == 8u,
 // future counter wraps max -> 1.
 inline constexpr u32 kIoUserDataMaxConnId = 0x00FFFFFFu;
 inline constexpr u32 kIoUserDataMaxUpstreamEpisode = 0x00FFFFFFu;
+// Not representable in the 24-bit token field. Backend decoders use this
+// nonzero value for a malformed upstream token so dispatch treats it as stale
+// rather than falling back to a neutral legacy event.
+inline constexpr u32 kInvalidUpstreamEventEpisode = kIoUserDataMaxUpstreamEpisode + 1u;
 inline constexpr u64 kInvalidIoUserData = ~static_cast<u64>(0);
 
 inline constexpr bool io_event_is_upstream(IoEventType type) {
@@ -57,6 +61,10 @@ struct NonUpstreamUserData {
 inline constexpr bool valid_upstream_event_token(const UpstreamEventToken& token) {
     return token.conn_id <= kIoUserDataMaxConnId && io_event_is_upstream(token.type) &&
            token.episode != 0 && token.episode <= kIoUserDataMaxUpstreamEpisode;
+}
+
+inline constexpr bool valid_upstream_episode(u32 episode) {
+    return episode != 0 && episode <= kIoUserDataMaxUpstreamEpisode;
 }
 
 inline constexpr u64 encode_upstream_event_token(const UpstreamEventToken& token) {
@@ -125,8 +133,9 @@ struct IoEvent {
 };
 
 inline constexpr bool io_event_is_tagged_stale(const IoEvent& event, u32 current_episode) {
-    return io_event_is_upstream(event.type) && event.upstream_episode != 0 &&
-           event.upstream_episode != current_episode;
+    return io_event_is_upstream(event.type) &&
+           (event.upstream_episode == kInvalidUpstreamEventEpisode ||
+            (event.upstream_episode != 0 && event.upstream_episode != current_episode));
 }
 
 }  // namespace rut

@@ -15223,6 +15223,166 @@ TEST(iouring_episode, upstream_submissions_carry_episode_and_aux) {
     backend.shutdown();
 }
 
+TEST(iouring_episode, invalid_upstream_episodes_do_not_acquire_sqe_or_state) {
+    IoUringBackend backend{};
+    auto initialized = backend.init(0, -1);
+    if (!initialized) SKIP("io_uring unavailable");
+
+    constexpr u32 kConnId = 3;
+    static const u8 payload[] = {'x', 'y', 'z'};
+    const u32 tail_before = __atomic_load_n(backend.sq_tail, __ATOMIC_ACQUIRE);
+    const u32 pending_before = backend.pending;
+    const auto state_before = backend.upstream_send_state[kConnId];
+
+    CHECK_FALSE(backend.add_connect(-1, kConnId, nullptr, 0, 0));
+    CHECK_FALSE(backend.add_connect(-1, kConnId, nullptr, 0,
+                                    kIoUserDataMaxUpstreamEpisode + 1u));
+    CHECK_FALSE(backend.add_send_upstream(-1, kConnId, payload, sizeof(payload), 0));
+    CHECK_FALSE(backend.add_send_upstream(-1,
+                                         kConnId,
+                                         payload,
+                                         sizeof(payload),
+                                         kIoUserDataMaxUpstreamEpisode + 1u));
+    CHECK_FALSE(backend.add_recv_upstream(-1, kConnId, 0));
+    CHECK_FALSE(backend.add_recv_upstream(-1,
+                                         kConnId,
+                                         kIoUserDataMaxUpstreamEpisode + 1u));
+    CHECK_FALSE(backend.pause_upstream_recv(42, kConnId, 0));
+    CHECK_FALSE(backend.pause_upstream_recv(42,
+                                            kConnId,
+                                            kIoUserDataMaxUpstreamEpisode + 1u));
+    CHECK_EQ(backend.cancel(-1,
+                            kConnId,
+                            false,
+                            false,
+                            true,
+                            false,
+                            true,
+                            0),
+             0u);
+    CHECK_EQ(backend.cancel(-1,
+                            kConnId,
+                            false,
+                            false,
+                            true,
+                            false,
+                            true,
+                            kIoUserDataMaxUpstreamEpisode + 1u),
+             0u);
+    CHECK_EQ(__atomic_load_n(backend.sq_tail, __ATOMIC_ACQUIRE), tail_before);
+    CHECK_EQ(backend.pending, pending_before);
+    CHECK_EQ(backend.upstream_send_state[kConnId].src, state_before.src);
+    CHECK_EQ(backend.upstream_send_state[kConnId].offset, state_before.offset);
+    CHECK_EQ(backend.upstream_send_state[kConnId].remaining, state_before.remaining);
+    CHECK_EQ(backend.upstream_send_state[kConnId].upstream_episode,
+             state_before.upstream_episode);
+
+    // The upper boundary remains a valid representable episode.
+    CHECK(backend.add_send_upstream(-1,
+                                    kConnId,
+                                    payload,
+                                    sizeof(payload),
+                                    kIoUserDataMaxUpstreamEpisode));
+    CHECK_EQ(backend.upstream_send_state[kConnId].upstream_episode,
+             kIoUserDataMaxUpstreamEpisode);
+    backend.shutdown();
+}
+
+TEST(iouring_episode, stale_partial_send_does_not_touch_reused_episode_state) {
+    IoUringBackend backend{};
+    auto initialized = backend.init(0, -1);
+    if (!initialized) SKIP("io_uring unavailable");
+
+    constexpr u32 kConnId = 3;
+    constexpr u32 kOldEpisode = 1;
+    constexpr u32 kCurrentEpisode = 2;
+    static const u8 old_payload[] = {'o', 'l', 'd'};
+    static const u8 current_payload[] = {'n', 'e', 'w', '!', '!', '!', '!', '!', '!'};
+    // Seed the old state through the production submission helper. The SQE is
+    // intentionally left unsubmitted; the synthetic CQE below is the old
+    // completion whose accounting behavior this test isolates.
+    CHECK(backend.add_send_upstream(-1,
+                                    kConnId,
+                                    old_payload,
+                                    sizeof(old_payload),
+                                    kOldEpisode));
+    backend.pending = 0;
+
+    backend.upstream_send_state[kConnId] = {current_payload,
+                                             99,
+                                             4,
+                                             5,
+                                             IoEventType::UpstreamSend,
+                                             kCurrentEpisode};
+    const auto current_before = backend.upstream_send_state[kConnId];
+    const u32 sq_tail_before = __atomic_load_n(backend.sq_tail, __ATOMIC_ACQUIRE);
+    const u32 cq_tail = __atomic_load_n(backend.cq_tail, __ATOMIC_ACQUIRE);
+    const u32 cq_mask = *backend.cq_ring_mask;
+    auto& cqe = backend.cq_entries[cq_tail & cq_mask];
+    cqe.user_data = encode_upstream_event_token(
+        {kConnId, IoEventType::UpstreamSend, kOldEpisode, 0});
+    cqe.res = 2;  // forced partial completion from the old episode
+    cqe.flags = 0;
+    __atomic_store_n(backend.cq_tail, cq_tail + 1, __ATOMIC_RELEASE);
+
+    IoEvent events[8]{};
+    const u32 count = backend.wait(events, 8, nullptr, 0);
+    REQUIRE_EQ(count, 1u);
+    CHECK_EQ(events[0].type, IoEventType::UpstreamSend);
+    CHECK_EQ(events[0].result, -ESTALE);
+    CHECK_EQ(events[0].upstream_episode, kOldEpisode);
+    CHECK_EQ(__atomic_load_n(backend.sq_tail, __ATOMIC_ACQUIRE), sq_tail_before);
+    CHECK_EQ(backend.upstream_send_state[kConnId].src, current_before.src);
+    CHECK_EQ(backend.upstream_send_state[kConnId].fd, current_before.fd);
+    CHECK_EQ(backend.upstream_send_state[kConnId].offset, current_before.offset);
+    CHECK_EQ(backend.upstream_send_state[kConnId].remaining, current_before.remaining);
+    CHECK_EQ(backend.upstream_send_state[kConnId].upstream_episode,
+             current_before.upstream_episode);
+
+    backend.shutdown();
+}
+
+TEST(iouring_episode, current_partial_send_resubmits_with_current_episode) {
+    IoUringBackend backend{};
+    auto initialized = backend.init(0, -1);
+    if (!initialized) SKIP("io_uring unavailable");
+
+    constexpr u32 kConnId = 3;
+    constexpr u32 kEpisode = 7;
+    static const u8 payload[] = {'c', 'u', 'r', 'r', 'e', 'n', 't'};
+    backend.pending = 0;
+    backend.upstream_send_state[kConnId] = {payload,
+                                             101,
+                                             0,
+                                             sizeof(payload),
+                                             IoEventType::UpstreamSend,
+                                             kEpisode};
+    const u32 sq_tail_before = __atomic_load_n(backend.sq_tail, __ATOMIC_ACQUIRE);
+    const u32 cq_tail = __atomic_load_n(backend.cq_tail, __ATOMIC_ACQUIRE);
+    auto& cqe = backend.cq_entries[cq_tail & *backend.cq_ring_mask];
+    cqe.user_data = encode_upstream_event_token(
+        {kConnId, IoEventType::UpstreamSend, kEpisode, 0});
+    cqe.res = 2;
+    cqe.flags = 0;
+    __atomic_store_n(backend.cq_tail, cq_tail + 1, __ATOMIC_RELEASE);
+
+    IoEvent events[8]{};
+    CHECK_EQ(backend.wait(events, 8, nullptr, 0), 0u);
+    CHECK_EQ(backend.upstream_send_state[kConnId].offset, 2u);
+    CHECK_EQ(backend.upstream_send_state[kConnId].remaining,
+             static_cast<u32>(sizeof(payload) - 2));
+    CHECK_EQ(backend.upstream_send_state[kConnId].upstream_episode, kEpisode);
+    CHECK_EQ(__atomic_load_n(backend.sq_tail, __ATOMIC_ACQUIRE), sq_tail_before + 1);
+    const u64 resubmitted = backend.sq_entries[sq_tail_before & *backend.sq_ring_mask].user_data;
+    UpstreamEventToken decoded;
+    REQUIRE(decode_upstream_event_token(resubmitted, &decoded));
+    CHECK_EQ(decoded.conn_id, kConnId);
+    CHECK_EQ(decoded.type, IoEventType::UpstreamSend);
+    CHECK_EQ(decoded.episode, kEpisode);
+
+    backend.shutdown();
+}
+
 TEST(iouring_episode, stale_provided_recv_returns_buffer_without_copy) {
     IoUringBackend backend{};
     auto initialized = backend.init(0, -1);
@@ -15271,6 +15431,47 @@ TEST(iouring_episode, stale_provided_recv_returns_buffer_without_copy) {
     backend.shutdown();
 }
 
+TEST(iouring_episode, malformed_upstream_cqe_is_tagged_stale_and_returns_buffer) {
+    IoUringBackend backend{};
+    auto initialized = backend.init(0, -1);
+    if (!initialized) SKIP("io_uring unavailable");
+
+    Connection conns[1]{};
+    conns[0].reset();
+    conns[0].id = 0;
+    conns[0].upstream_episode = 2;
+    u8 storage[64];
+    for (u8& byte : storage) byte = 0x5A;
+    conns[0].upstream_recv_buf.bind(storage, sizeof(storage));
+    const u16 buf_id = 7;
+    const u16 buf_tail_before = __atomic_load_n(&backend.buf_ring->tail, __ATOMIC_ACQUIRE);
+    for (u32 i = 0; i < 5; i++) backend.buf_base[static_cast<u32>(buf_id) * 4096 + i] = 'x';
+
+    const u32 cq_tail = __atomic_load_n(backend.cq_tail, __ATOMIC_ACQUIRE);
+    auto& cqe = backend.cq_entries[cq_tail & *backend.cq_ring_mask];
+    // Known upstream type with an unrepresentable episode-zero token. Keep
+    // conn/type identity so wait() emits an explicitly stale event.
+    cqe.user_data = static_cast<u64>(static_cast<u8>(IoEventType::UpstreamRecv)) |
+                    (static_cast<u64>(0) << 8);
+    cqe.res = 5;
+    cqe.flags = IORING_CQE_F_BUFFER | (static_cast<u32>(buf_id) << IORING_CQE_BUFFER_SHIFT);
+    __atomic_store_n(backend.cq_tail, cq_tail + 1, __ATOMIC_RELEASE);
+
+    IoEvent events[8]{};
+    const u32 count = backend.wait(events, 8, conns, 1);
+    REQUIRE_EQ(count, 1u);
+    CHECK_EQ(events[0].type, IoEventType::UpstreamRecv);
+    CHECK_EQ(events[0].conn_id, 0u);
+    CHECK_EQ(events[0].upstream_episode, kInvalidUpstreamEventEpisode);
+    CHECK(io_event_is_tagged_stale(events[0], conns[0].upstream_episode));
+    CHECK_EQ(conns[0].upstream_recv_buf.len(), 0u);
+    for (const u8 byte : storage) CHECK_EQ(byte, static_cast<u8>(0x5A));
+    CHECK_EQ(__atomic_load_n(&backend.buf_ring->tail, __ATOMIC_ACQUIRE),
+             static_cast<u16>(buf_tail_before + 1));
+
+    backend.shutdown();
+}
+
 TEST(iouring_episode, stale_dispatch_preserves_current_upstream_state) {
     void* storage = mmap(nullptr,
                          sizeof(IoUringEventLoop),
@@ -15307,6 +15508,20 @@ TEST(iouring_episode, stale_dispatch_preserves_current_upstream_state) {
     CHECK(conn->upstream_send_armed);
     CHECK_EQ(conn->pending_ops, 2u);
     CHECK_EQ(conn->on_upstream_recv, &on_response_body_recvd<IoUringEventLoop>);
+
+    g_callback_invoked = false;
+    conn->on_upstream_recv = &test_sentinel_callback<IoUringEventLoop>;
+    const IoEvent malformed{conn->id,
+                            7,
+                            0,
+                            0,
+                            IoEventType::UpstreamRecv,
+                            1,
+                            0,
+                            kInvalidUpstreamEventEpisode};
+    loop->dispatch(malformed);
+    CHECK_FALSE(g_callback_invoked);
+    CHECK_EQ(conn->pending_ops, 2u);
 
     conn->upstream_recv_armed = false;
     conn->upstream_send_armed = false;
