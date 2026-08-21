@@ -21,6 +21,7 @@
 
 #include <errno.h>
 #include <fcntl.h>
+#include <poll.h>
 #include <sys/socket.h>
 #include <unistd.h>
 
@@ -11397,6 +11398,7 @@ TEST(epoll_episode, synthetic_upstream_completion_preserves_episode_and_aux) {
 
 namespace {
 bool g_epoll_episode_callback_called = false;
+u32 g_epoll_episode_callback_count = 0;
 
 struct EpollEpisodeSocketGuard {
     EpollBackend* backend;
@@ -11410,6 +11412,48 @@ struct EpollEpisodeSocketGuard {
 
 void epoll_episode_callback_probe(void*, ConnectionBase&, IoEvent) {
     g_epoll_episode_callback_called = true;
+}
+
+void epoll_episode_counting_callback(void*, ConnectionBase&, IoEvent) {
+    g_epoll_episode_callback_count++;
+}
+
+bool wait_for_real_upstream_completion(EpollEventLoop& loop, IoEvent& completion) {
+    for (u32 attempt = 0; attempt < 4; attempt++) {
+        if (loop.backend.pending_count == 0) {
+            struct pollfd ready{loop.backend.epoll_fd, POLLIN, 0};
+            if (poll(&ready, 1, 1000) <= 0) return false;
+        }
+        IoEvent event{};
+        const u32 count = loop.backend.wait(&event, 1, loop.conns, EpollEventLoop::kMaxConns);
+        if (count == 0) continue;
+        if (event.type == IoEventType::UpstreamConnect) {
+            completion = event;
+            return true;
+        }
+    }
+    return false;
+}
+
+bool accept_real_upstream_peer(i32 listener_fd, i32& peer_fd) {
+    struct pollfd ready{listener_fd, POLLIN, 0};
+    if (poll(&ready, 1, 1000) <= 0) return false;
+    peer_fd = accept4(listener_fd, nullptr, nullptr, SOCK_NONBLOCK | SOCK_CLOEXEC);
+    return peer_fd >= 0;
+}
+
+bool connect_real_upstream(
+    EpollEventLoop& loop, Connection& conn, i32 listener_fd, i32& peer_fd, IoEvent& completion) {
+    conn.upstream_fd = UpstreamPool::create_socket();
+    if (conn.upstream_fd < 0) return false;
+
+    sockaddr_in addr{};
+    addr.sin_family = AF_INET;
+    addr.sin_port = __builtin_bswap16(get_port(listener_fd));
+    addr.sin_addr.s_addr = __builtin_bswap32(0x7F000001);
+    if (!loop.submit_connect(conn, &addr, sizeof(addr))) return false;
+    if (!accept_real_upstream_peer(listener_fd, peer_fd)) return false;
+    return wait_for_real_upstream_completion(loop, completion);
 }
 }  // namespace
 
@@ -11440,6 +11484,203 @@ TEST(epoll_episode, dispatch_rejects_stale_tag_before_callback) {
     CHECK(g_epoll_episode_callback_called);
     loop->free_conn(*conn);
     loop->shutdown();
+}
+
+TEST(epoll_episode_lifecycle, pooled_same_fd_stale_raw_readiness_is_fenced_before_io) {
+    auto* loop = create_real_loop();
+    REQUIRE(loop != nullptr);
+    REQUIRE(loop->init(0, -1, 0).has_value());
+    UpstreamPool upstream_pool{};
+    upstream_pool.init();
+    loop->upstream = &upstream_pool;
+
+    auto listener_result = create_listen_socket(0);
+    REQUIRE(listener_result.has_value());
+    const i32 listener_fd = listener_result.value();
+    i32 peer_fd = -1;
+
+    auto* conn = loop->alloc_conn();
+    REQUIRE(conn != nullptr);
+    const u32 conn_id = conn->id;
+    const u32 first_episode = conn->upstream_episode;
+    REQUIRE_EQ(first_episode, 1u);
+    CHECK_EQ(loop->backend.active_upstream_episode[conn_id], 0u);
+
+    IoEvent first_connect{};
+    REQUIRE(connect_real_upstream(*loop, *conn, listener_fd, peer_fd, first_connect));
+    REQUIRE_EQ(first_connect.type, IoEventType::UpstreamConnect);
+    REQUIRE_EQ(first_connect.result, 0);
+    REQUIRE_EQ(first_connect.upstream_episode, first_episode);
+    const i32 first_fd = conn->upstream_fd;
+    REQUIRE_GE(first_fd, 0);
+    CHECK_EQ(loop->backend.active_upstream_episode[conn_id], first_episode);
+    CHECK_EQ(loop->backend.upstream_fd_map[conn_id], first_fd);
+
+    // The production pool-return path synchronously detaches the registration,
+    // retires episode 1, and parks the still-connected descriptor.
+    REQUIRE(loop->return_idle_upstream(*conn, 9, 2));
+    CHECK_EQ(conn->upstream_fd, -1);
+    CHECK_EQ(conn->upstream_episode, first_episode + 1);
+    CHECK_EQ(loop->backend.active_upstream_episode[conn_id], 0u);
+    CHECK_EQ(loop->backend.upstream_fd_map[conn_id], -1);
+    CHECK_EQ(upstream_pool.idle_count.load(std::memory_order_acquire), 1u);
+
+    // The production borrow path returns the exact descriptor to the same
+    // Connection slot and begins episode 2 before publishing its fd map entry.
+    REQUIRE(loop->reuse_idle_upstream(*conn, 9, 2));
+    const u32 second_episode = conn->upstream_episode;
+    REQUIRE_EQ(second_episode, first_episode + 1);
+    REQUIRE_EQ(conn->id, conn_id);
+    REQUIRE_EQ(conn->upstream_fd, first_fd);
+    CHECK_EQ(loop->backend.active_upstream_episode[conn_id], second_episode);
+    CHECK_EQ(loop->backend.upstream_fd_map[conn_id], first_fd);
+    CHECK_EQ(upstream_pool.idle_count.load(std::memory_order_acquire), 0u);
+    CHECK_EQ(upstream_pool.free_top, UpstreamPool::kMaxConns);
+    REQUIRE(loop->alloc_upstream_buf(*conn));
+
+    // Install a real epoll readiness record tagged with the retired episode.
+    // Ownership stays on episode 2: only the kernel registration carries token 1.
+    REQUIRE(loop->backend.add_recv_upstream(first_fd, conn_id, first_episode));
+    static constexpr char kPayload[] = "episode-two-payload";
+    REQUIRE_EQ(send(peer_fd, kPayload, sizeof(kPayload) - 1, MSG_NOSIGNAL),
+               static_cast<ssize_t>(sizeof(kPayload) - 1));
+
+    IoEvent stale_events[1]{};
+    CHECK_EQ(loop->backend.wait(stale_events, 1, loop->conns, EpollEventLoop::kMaxConns), 0u);
+    CHECK_EQ(conn->upstream_recv_buf.len(), 0u);
+    CHECK_EQ(conn->upstream_fd, first_fd);
+    CHECK_EQ(conn->upstream_episode, second_episode);
+    CHECK_EQ(loop->backend.active_upstream_episode[conn_id], second_episode);
+    CHECK_EQ(loop->backend.upstream_fd_map[conn_id], first_fd);
+    char peeked[sizeof(kPayload)]{};
+    REQUIRE_EQ(recv(first_fd, peeked, sizeof(kPayload) - 1, MSG_PEEK | MSG_DONTWAIT),
+               static_cast<ssize_t>(sizeof(kPayload) - 1));
+    CHECK_EQ(__builtin_memcmp(peeked, kPayload, sizeof(kPayload) - 1), 0);
+
+    // Positive control: production re-registration with episode 2 consumes the
+    // untouched bytes and dispatches one current completion.
+    REQUIRE(loop->submit_recv_upstream(*conn));
+    IoEvent current{};
+    REQUIRE_EQ(loop->backend.wait(&current, 1, loop->conns, EpollEventLoop::kMaxConns), 1u);
+    REQUIRE_EQ(current.type, IoEventType::UpstreamRecv);
+    REQUIRE_EQ(current.result, static_cast<i32>(sizeof(kPayload) - 1));
+    REQUIRE_EQ(current.upstream_episode, second_episode);
+    REQUIRE_EQ(conn->upstream_recv_buf.len(), sizeof(kPayload) - 1);
+    CHECK_EQ(__builtin_memcmp(conn->upstream_recv_buf.data(), kPayload, sizeof(kPayload) - 1), 0);
+    g_epoll_episode_callback_count = 0;
+    conn->on_upstream_recv = &epoll_episode_counting_callback;
+    loop->dispatch(current);
+    CHECK_EQ(g_epoll_episode_callback_count, 1u);
+
+    loop->close_conn(*conn);
+    errno = 0;
+    CHECK_EQ(fcntl(first_fd, F_GETFD), -1);
+    CHECK_EQ(errno, EBADF);
+    CHECK_EQ(upstream_pool.idle_count.load(std::memory_order_acquire), 0u);
+    CHECK_EQ(upstream_pool.free_top, UpstreamPool::kMaxConns);
+    close(peer_fd);
+    close(listener_fd);
+    upstream_pool.shutdown();
+    loop->shutdown();
+    destroy_real_loop(loop);
+}
+
+TEST(epoll_episode_lifecycle, recycled_slot_rejects_old_completion_before_dispatch_mutation) {
+    auto* loop = create_real_loop();
+    REQUIRE(loop != nullptr);
+    REQUIRE(loop->init(0, -1, 0).has_value());
+    auto listener_result = create_listen_socket(0);
+    REQUIRE(listener_result.has_value());
+    const i32 listener_fd = listener_result.value();
+
+    auto* old_conn = loop->alloc_conn();
+    REQUIRE(old_conn != nullptr);
+    const u32 conn_id = old_conn->id;
+    const u32 first_episode = old_conn->upstream_episode;
+    REQUIRE_EQ(first_episode, 1u);
+    i32 first_peer_fd = -1;
+    IoEvent old_completion{};
+    REQUIRE(connect_real_upstream(*loop, *old_conn, listener_fd, first_peer_fd, old_completion));
+    REQUIRE_EQ(old_completion.type, IoEventType::UpstreamConnect);
+    REQUIRE_EQ(old_completion.result, 0);
+    REQUIRE_EQ(old_completion.conn_id, conn_id);
+    REQUIRE_EQ(old_completion.upstream_episode, first_episode);
+    CHECK_EQ(loop->backend.active_upstream_episode[conn_id], first_episode);
+
+    // Terminal production teardown retires episode 1 and returns this exact
+    // Connection slot to the allocator. Its saved completion remains addressable
+    // only by conn_id + old episode, as a real late completion would be.
+    loop->close_conn(*old_conn);
+    CHECK_EQ(loop->backend.active_upstream_episode[conn_id], 0u);
+    auto* current_conn = loop->alloc_conn();
+    REQUIRE(current_conn != nullptr);
+    REQUIRE_EQ(current_conn->id, conn_id);
+    REQUIRE_EQ(current_conn->upstream_episode, first_episode + 1);
+
+    i32 second_peer_fd = -1;
+    IoEvent current_completion{};
+    REQUIRE(connect_real_upstream(
+        *loop, *current_conn, listener_fd, second_peer_fd, current_completion));
+    const u32 second_episode = current_conn->upstream_episode;
+    REQUIRE_EQ(second_episode, first_episode + 1);
+    REQUIRE_EQ(current_completion.type, IoEventType::UpstreamConnect);
+    REQUIRE_EQ(current_completion.result, 0);
+    REQUIRE_EQ(current_completion.conn_id, conn_id);
+    REQUIRE_EQ(current_completion.upstream_episode, second_episode);
+    CHECK_EQ(loop->backend.active_upstream_episode[conn_id], second_episode);
+
+    auto* timer_anchor = loop->alloc_conn();
+    REQUIRE(timer_anchor != nullptr);
+    loop->timer.add(current_conn, 5);
+    loop->timer.add(timer_anchor, 5);
+    REQUIRE(loop->alloc_upstream_buf(*current_conn));
+    static constexpr char kBufferSentinel[] = "current-buffer";
+    REQUIRE_EQ(current_conn->upstream_recv_buf.write(reinterpret_cast<const u8*>(kBufferSentinel),
+                                                     sizeof(kBufferSentinel) - 1),
+               sizeof(kBufferSentinel) - 1);
+    current_conn->state = ConnState::Proxying;
+    current_conn->upstream_recv_armed = true;
+    current_conn->upstream_send_armed = true;
+    current_conn->on_upstream_send = &epoll_episode_counting_callback;
+    g_epoll_episode_callback_count = 0;
+
+    const i32 current_fd = current_conn->upstream_fd;
+    const i32 current_map = loop->backend.upstream_fd_map[conn_id];
+    const ListNode* timer_prev = current_conn->timer_node.prev;
+    const ListNode* timer_next = current_conn->timer_node.next;
+    const u32 buffer_len = current_conn->upstream_recv_buf.len();
+    const ConnState state = current_conn->state;
+    const bool recv_armed = current_conn->upstream_recv_armed;
+    const bool send_armed = current_conn->upstream_send_armed;
+
+    loop->dispatch(old_completion);
+    CHECK_EQ(g_epoll_episode_callback_count, 0u);
+    CHECK_EQ(current_conn->timer_node.prev, timer_prev);
+    CHECK_EQ(current_conn->timer_node.next, timer_next);
+    CHECK_EQ(current_conn->upstream_recv_armed, recv_armed);
+    CHECK_EQ(current_conn->upstream_send_armed, send_armed);
+    CHECK_EQ(current_conn->upstream_fd, current_fd);
+    CHECK_EQ(loop->backend.upstream_fd_map[conn_id], current_map);
+    CHECK_EQ(loop->backend.active_upstream_episode[conn_id], second_episode);
+    CHECK_EQ(current_conn->upstream_episode, second_episode);
+    CHECK_EQ(current_conn->upstream_recv_buf.len(), buffer_len);
+    CHECK_EQ(
+        __builtin_memcmp(
+            current_conn->upstream_recv_buf.data(), kBufferSentinel, sizeof(kBufferSentinel) - 1),
+        0);
+    CHECK_EQ(current_conn->state, state);
+
+    // Positive control: the completion created by episode 2 reaches the probe.
+    loop->dispatch(current_completion);
+    CHECK_EQ(g_epoll_episode_callback_count, 1u);
+
+    loop->close_conn(*current_conn);
+    loop->free_conn(*timer_anchor);
+    close(first_peer_fd);
+    close(second_peer_fd);
+    close(listener_fd);
+    loop->shutdown();
+    destroy_real_loop(loop);
 }
 
 TEST(epoll_episode, stale_tls_send_cannot_rearm_or_hijack_current_recv) {
