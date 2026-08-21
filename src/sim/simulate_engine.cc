@@ -16,9 +16,9 @@
 #include "rut/runtime/sim_engine.h"
 #include "rut/runtime/traffic_capture.h"
 #include "rut/runtime/traffic_replay.h"
+#include <memory>
 
 #include <fcntl.h>
-#include <memory>
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <unistd.h>
