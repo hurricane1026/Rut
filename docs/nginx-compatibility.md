@@ -91,10 +91,13 @@ Allowed states are `SUPPORTED`, `PARTIAL`, `BLOCKED_BY_RUT`,
   terminal episodes. Real tests prove pool return/borrow with the same numeric fd
   and terminal close/allocation with the same Connection slot: old readiness does
   no socket I/O and old completion dispatch does no timer/callback/state mutation,
-  while current-token controls progress. Production retry and active-health
-  transition evidence remains incomplete, so #262 stays open. This transport
-  work alone does not imply keep-alive HEAD support; cancellation/drain lifecycle
-  and the remaining #253 response semantics are still required.
+  while current-token controls progress. A production failed-connect retry also
+  proves episode 1 is detached/retired before episode 2 begins on the same
+  Connection and numeric fd; replaying its old failure cannot mutate the replacement,
+  while the current completion sends the exact request to a real peer. Active-health
+  production-transition evidence remains incomplete, so #262 stays open. This
+  transport work alone does not imply keep-alive HEAD support; cancellation/drain
+  lifecycle and the remaining #253 response semantics are still required.
 - The first request-policy slice rejects body/framing inputs (including
   `Content-Length` and every `Transfer-Encoding` value), HTTP/2, and
   non-origin-form targets before upstream connect. These are intentional
