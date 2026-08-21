@@ -16430,6 +16430,137 @@ struct RecordingUpstream {
 };
 
 #if RUT_ENABLE_JIT_TESTS
+// A source-owned paired HEAD fixture.  Keeping the compiler artifacts and
+// config beside the proxy loop is intentional: JIT route pointers remain
+// live until every event-loop callback has drained.
+struct PublicPairedHeadSourceResources {
+    rut::FrontendRirModule rir{};
+    rut::jit::JitEngine engine{};
+    rut::RouteConfig cfg{};
+    const rut::RouteConfig* active = nullptr;
+    ScopedProxyLoop proxy{};
+    bool engine_ready = false;
+
+    ~PublicPairedHeadSourceResources() {
+        proxy.teardown();
+        if (engine_ready) engine.shutdown();
+        rir.destroy();
+    }
+
+    bool compile(u16 backend_port) {
+        static constexpr char kGatewayBody[] =
+            "<html>\r\n<head><title>502 Bad Gateway</title></head>\r\n<body>\r\n"
+            "<center><h1>502 Bad Gateway</h1></center>\r\n"
+            "<hr><center>nginx/1.29.7</center>\r\n</body>\r\n</html>\r\n";
+        static_assert(sizeof(kGatewayBody) - 1 == 157);
+
+        std::string source = "upstream backend at \"127.0.0.1:" +
+                             std::to_string(backend_port) + "\"\n";
+        source += R"rut(
+route "/" {
+  if req.method == HEAD && req.pathOnly == "/head" {
+    return forward(backend,
+      request_policy: { version: "HTTP/1.1", host: "upstream", connection: "omit",
+        strip_headers: ["Connection", "Keep-Alive", "TE", "Expect", "Upgrade"] },
+      response_policy: { version: "HTTP/1.1", framing: "content_length", connection: "request",
+        head_mode: "suppress_body", server: "nginx/1.29.7", date: "current",
+        hide_headers: ["Date", "Server", "X-Pad"] },
+      failure_policy: { version: "HTTP/1.1", status: 502, reason: "Bad Gateway",
+        content_type: "text/html", server: "nginx/1.29.7", date: "current",
+        connection: "request", head_mode: "suppress_body",
+        body: b"<html>\r\n<head><title>502 Bad Gateway</title></head>\r\n<body>\r\n<center><h1>502 Bad Gateway</h1></center>\r\n<hr><center>nginx/1.29.7</center>\r\n</body>\r\n</html>\r\n" })
+  } else {
+    return forward(backend,
+      request_policy: { version: "HTTP/1.1", host: "upstream", connection: "omit",
+        strip_headers: ["Connection", "Keep-Alive", "TE", "Expect", "Upgrade"] },
+      response_policy: { version: "HTTP/1.1", framing: "content_length", connection: "request",
+        head_mode: "reject", server: "nginx/1.29.7", date: "current",
+        hide_headers: ["Date", "Server", "X-Pad"] },
+      failure_policy: { version: "HTTP/1.1", status: 502, reason: "Bad Gateway",
+        content_type: "text/html", server: "nginx/1.29.7", date: "current",
+        connection: "request", head_mode: "reject",
+        body: b"<html>\r\n<head><title>502 Bad Gateway</title></head>\r\n<body>\r\n<center><h1>502 Bad Gateway</h1></center>\r\n<hr><center>nginx/1.29.7</center>\r\n</body>\r\n</html>\r\n" })
+  }
+}
+)rut";
+
+        auto lexed = rut::lex({source.data(), static_cast<u32>(source.size())});
+        if (!lexed) return false;
+        auto ast = rut::parse_file(lexed.value());
+        if (!ast) return false;
+        std::unique_ptr<rut::AstFile> ast_owned(ast.value());
+        auto hir = rut::analyze_file(*ast_owned);
+        if (!hir) return false;
+        std::unique_ptr<rut::HirModule> hir_owned(hir.value());
+        auto mir = rut::build_mir(*hir_owned);
+        if (!mir) return false;
+        std::unique_ptr<rut::MirModule> mir_owned(mir.value());
+        if (!rut::lower_to_rir(*mir_owned, rir)) return false;
+        if (rir.module.response_policy_count != 2 || rir.module.failure_policy_count != 2 ||
+            rir.module.policy_bundle_count != 2)
+            return false;
+
+        auto cg = rut::jit::codegen(rir.module);
+        if (!cg.ok || !engine.init()) return false;
+        engine_ready = true;
+        if (!engine.compile(cg.mod, cg.ctx)) return false;
+        if (!rut::populate_route_config(cfg, rir.module)) return false;
+        if (cfg.response_policy_count != 2 || cfg.failure_policy_count != 2 ||
+            cfg.policy_bundle_count != 2)
+            return false;
+        if (!rut::register_jit_routes(cfg, rir.module, engine)) return false;
+        active = &cfg;
+        return true;
+    }
+
+    bool start(bool enable_reuse) { return proxy.setup(&active, 1800, enable_reuse); }
+};
+
+static bool read_public_close_response(i32 fd,
+                                       u32 expected_body_len,
+                                       char* out,
+                                       u32 capacity,
+                                       u32& length) {
+    length = 0;
+    u32 header_end = 0;
+    for (u32 attempt = 0; attempt < 32 && length < capacity; attempt++) {
+        const i32 got = recv_timeout(fd, out + length, static_cast<i32>(capacity - length), 3000);
+        if (got <= 0) return false;
+        length += static_cast<u32>(got);
+        if (header_end == 0) {
+            for (u32 i = 0; i + 3 < length; i++) {
+                if (out[i] == '\r' && out[i + 1] == '\n' && out[i + 2] == '\r' &&
+                    out[i + 3] == '\n') {
+                    header_end = i + 4;
+                    break;
+                }
+            }
+        }
+        if (header_end != 0) {
+            const u32 expected = header_end + expected_body_len;
+            if (length > expected) return false;
+            if (length == expected) break;
+        }
+    }
+    if (header_end == 0 || length != header_end + expected_body_len) return false;
+    char eof_buf[64];
+    return recv_timeout(fd, eof_buf, sizeof(eof_buf), 3000) == 0;
+}
+
+static bool normalize_public_date(char* data, u32 length) {
+    u32 count = 0;
+    for (u32 i = 0; i + 35 <= length; i++) {
+        if (memcmp(data + i, "Date: ", 6) != 0) continue;
+        count++;
+        if (i < 2 || data[i - 2] != '\r' || data[i + 35] != '\r' || data[i + 36] != '\n')
+            return false;
+        for (u32 j = 0; j < 29; j++) data[i + 6 + j] = 'X';
+    }
+    return count == 1;
+}
+#endif
+
+#if RUT_ENABLE_JIT_TESTS
 TEST(shard, serves_http2_jit_target_transform_initial_fails_closed) {
     H2TargetTransformJit compiled;
     REQUIRE(compiled.init(/*with_timer=*/false));
@@ -19927,6 +20058,187 @@ route "/api" {
     }
 #endif
 }
+
+#if RUT_ENABLE_JIT_TESTS
+TEST(route, public_paired_head_source_success_and_forward_wire) {
+    using namespace rut;
+    static constexpr char kUpstreamResponse[] =
+        "HTTP/1.1 200 OK\r\n"
+        "Server: origin\r\n"
+        "Date: Tue, 01 Jan 2030 00:00:00 GMT\r\n"
+        "Content-Length: 5\r\n\r\nhello";
+    static constexpr char kHeadExpected[] =
+        "HTTP/1.1 200 OK\r\n"
+        "Server: nginx/1.29.7\r\n"
+        "Date: XXXXXXXXXXXXXXXXXXXXXXXXXXXXX\r\n"
+        "Content-Length: 5\r\n"
+        "Connection: close\r\n\r\n";
+    static constexpr char kGetExpected[] =
+        "HTTP/1.1 200 OK\r\n"
+        "Server: nginx/1.29.7\r\n"
+        "Date: XXXXXXXXXXXXXXXXXXXXXXXXXXXXX\r\n"
+        "Content-Length: 5\r\n"
+        "Connection: close\r\n\r\nhello";
+
+    RecordingUpstream backend;
+    backend.response = kUpstreamResponse;
+    backend.response_len = sizeof(kUpstreamResponse) - 1;
+    backend.response_chunk_size = 3;
+    backend.keep_open = true;
+    REQUIRE(backend.setup());
+    PublicPairedHeadSourceResources resources;
+    REQUIRE(resources.compile(backend.port));
+    REQUIRE_EQ(resources.rir.module.response_policy_count, 2u);
+    REQUIRE_EQ(resources.rir.module.failure_policy_count, 2u);
+    REQUIRE_EQ(resources.rir.module.policy_bundle_count, 2u);
+    REQUIRE_EQ(resources.cfg.response_policy_count, 2u);
+    REQUIRE_EQ(resources.cfg.failure_policy_count, 2u);
+    REQUIRE_EQ(resources.cfg.policy_bundle_count, 2u);
+    CHECK_EQ(resources.cfg.response_policies[0].head_mode, ResponsePolicyHeadMode::SuppressBody);
+    CHECK_EQ(resources.cfg.response_policies[1].head_mode, ResponsePolicyHeadMode::Reject);
+    CHECK_EQ(resources.cfg.failure_policies[0].head_mode, FailurePolicyHeadMode::SuppressBody);
+    CHECK_EQ(resources.cfg.failure_policies[1].head_mode, FailurePolicyHeadMode::Reject);
+    CHECK_EQ(resources.cfg.policy_bundles[0].response_policy_id, 1u);
+    CHECK_EQ(resources.cfg.policy_bundles[0].failure_policy_id, 1u);
+    CHECK_EQ(resources.cfg.policy_bundles[1].response_policy_id, 2u);
+    CHECK_EQ(resources.cfg.policy_bundles[1].failure_policy_id, 2u);
+    auto const_i32_value = [](const rir::Block& block, rir::ValueId id) -> i32 {
+        for (u32 i = 0; i < block.inst_count; i++) {
+            if (block.insts[i].result == id && block.insts[i].op == rir::Opcode::ConstI32)
+                return block.insts[i].imm.i32_val;
+        }
+        return -1;
+    };
+    bool saw_bundle_1 = false;
+    bool saw_bundle_2 = false;
+    for (u32 fi = 0; fi < resources.rir.module.func_count; fi++) {
+        const auto& fn = resources.rir.module.functions[fi];
+        for (u32 bi = 0; bi < fn.block_count; bi++) {
+            const auto& block = fn.blocks[bi];
+            for (u32 ii = 0; ii < block.inst_count; ii++) {
+                const auto& inst = block.insts[ii];
+                if (inst.op != rir::Opcode::RetForwardBundle) continue;
+                REQUIRE_EQ(inst.operand_count, 3u);
+                CHECK_EQ(const_i32_value(block, inst.operands[1]), 1);
+                const i32 bundle_id = const_i32_value(block, inst.operands[2]);
+                if (bundle_id == 1) saw_bundle_1 = true;
+                if (bundle_id == 2) saw_bundle_2 = true;
+                CHECK(bundle_id == 1 || bundle_id == 2);
+            }
+        }
+    }
+    REQUIRE(saw_bundle_1);
+    REQUIRE(saw_bundle_2);
+    REQUIRE(resources.start(/*enable_reuse=*/true));
+
+    struct ClientGuard {
+        i32 fd;
+        ~ClientGuard() {
+            if (fd >= 0) close(fd);
+        }
+    };
+    auto run_request = [&](const char* method,
+                           const char* query,
+                           const char* expected,
+                           u32 expected_body_len,
+                           u32 expected_count) {
+        ClientGuard client{connect_to(resources.proxy.port)};
+        REQUIRE_GE(client.fd, 0);
+        set_socket_timeouts(client.fd, 3);
+        char request[256];
+        const int request_len = snprintf(request,
+                                         sizeof(request),
+                                         "%s /head%s HTTP/1.1\r\nHost: client.example\r\n"
+                                         "Connection: close\r\nX-Test: one\r\n\r\n",
+                                         method,
+                                         query);
+        REQUIRE_GT(request_len, 0);
+        REQUIRE_LT(request_len, static_cast<int>(sizeof(request)));
+        REQUIRE(send_all(client.fd, request, static_cast<u32>(request_len)));
+        char response[1024]{};
+        u32 response_len = 0;
+        REQUIRE(read_public_close_response(client.fd,
+                                           expected_body_len,
+                                           response,
+                                           sizeof(response),
+                                           response_len));
+        REQUIRE(normalize_public_date(response, response_len));
+        REQUIRE_EQ(response_len, static_cast<u32>(strlen(expected)));
+        CHECK_EQ(memcmp(response, expected, response_len), 0);
+        for (u32 waited = 0;
+             waited < 600 &&
+             backend.request_count.load(std::memory_order_acquire) < expected_count;
+             waited++)
+            usleep(5000);
+        CHECK_EQ(backend.accepted_count.load(std::memory_order_acquire), expected_count);
+        CHECK_EQ(backend.request_count.load(std::memory_order_acquire), expected_count);
+    };
+
+    run_request("HEAD", "?q=1", kHeadExpected, 0, 1);
+    run_request("HEAD", "?q=1", kHeadExpected, 0, 2);
+    run_request("GET", "?q=2", kGetExpected, 5, 3);
+
+    resources.proxy.teardown();
+    backend.teardown();
+    REQUIRE_EQ(backend.accepted_count.load(std::memory_order_acquire), 3u);
+    REQUIRE_EQ(backend.request_count.load(std::memory_order_acquire), 3u);
+    const char* methods[] = {"HEAD", "HEAD", "GET"};
+    const char* queries[] = {"?q=1", "?q=1", "?q=2"};
+    for (u32 i = 0; i < 3; i++) {
+        char expected[256]{};
+        const int expected_len = snprintf(expected,
+                                          sizeof(expected),
+                                          "%s /head%s HTTP/1.1\r\nHost: 127.0.0.1:%u\r\n"
+                                          "X-Test: one\r\n\r\n",
+                                          methods[i],
+                                          queries[i],
+                                          backend.port);
+        REQUIRE_GT(expected_len, 0);
+        REQUIRE_EQ(backend.request_history_len[i], static_cast<u32>(expected_len));
+        CHECK_EQ(memcmp(backend.request_history[i], expected, static_cast<size_t>(expected_len)),
+                 0);
+    }
+}
+
+TEST(route, public_paired_head_source_connect_failure) {
+    using namespace rut;
+    static constexpr char kExpected[] =
+        "HTTP/1.1 502 Bad Gateway\r\n"
+        "Server: nginx/1.29.7\r\n"
+        "Date: XXXXXXXXXXXXXXXXXXXXXXXXXXXXX\r\n"
+        "Content-Type: text/html\r\n"
+        "Content-Length: 157\r\n"
+        "Connection: close\r\n\r\n";
+    DeadEndpoint dead;
+    REQUIRE(dead.reserve());
+    PublicPairedHeadSourceResources resources;
+    REQUIRE(resources.compile(dead.port));
+    REQUIRE_EQ(resources.cfg.upstreams[0].addr_count, 1u);
+    REQUIRE_EQ(ntohs(resources.cfg.upstreams[0].addrs[0].sin_port), dead.port);
+    REQUIRE(resources.start(/*enable_reuse=*/false));
+
+    struct ClientGuard {
+        i32 fd;
+        ~ClientGuard() {
+            if (fd >= 0) close(fd);
+        }
+    } client{connect_to(resources.proxy.port)};
+    REQUIRE_GE(client.fd, 0);
+    set_socket_timeouts(client.fd, 3);
+    static constexpr char kRequest[] =
+        "HEAD /head?q=1 HTTP/1.1\r\nHost: client.example\r\n"
+        "Connection: close\r\nX-Test: one\r\n\r\n";
+    REQUIRE(send_all(client.fd, kRequest, sizeof(kRequest) - 1));
+    char response[1024]{};
+    u32 response_len = 0;
+    REQUIRE(read_public_close_response(client.fd, 0, response, sizeof(response), response_len));
+    REQUIRE(normalize_public_date(response, response_len));
+    REQUIRE_EQ(response_len, static_cast<u32>(strlen(kExpected)));
+    CHECK_EQ(memcmp(response, kExpected, response_len), 0);
+    CHECK_FALSE(buf_contains(response, response_len, "Content-Length: 11\r\n", 20));
+    resources.proxy.teardown();
+}
+#endif
 
 int main(int argc, char** argv) {
     return rut::test::run_all(argc, argv);
