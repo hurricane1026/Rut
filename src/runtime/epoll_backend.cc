@@ -366,24 +366,42 @@ bool EpollBackend::retire_upstream_episode_after_detach(Connection& conn,
 bool EpollBackend::detach_upstream(Connection& conn, i32* detached_fd) {
     const u32 expected_episode = conn.upstream_episode;
     const i32 fd = conn.upstream_fd;
+    if (detached_fd != nullptr) *detached_fd = -1;
 
     // DEL while the descriptor is still valid.  The remaining operations are
     // deliberately unconditional so a registration failure also gets a
-    // complete map/send-state detach before retirement is attempted.
-    if (fd >= 0) epoll_ctl(epoll_fd, EPOLL_CTL_DEL, fd, nullptr);
+    // complete map/send-state detach before retirement is attempted. ENOENT
+    // means the descriptor was already absent, which is a safe detach state;
+    // every other error must fail closed because the registration may remain.
+    bool del_ok = true;
+    if (fd >= 0 && epoll_ctl(epoll_fd, EPOLL_CTL_DEL, fd, nullptr) < 0)
+        del_ok = (errno == ENOENT);
     clear_send_state(conn.id);
     if (conn.id < kMaxFdMap) upstream_fd_map[conn.id] = -1;
     conn.upstream_recv_armed = false;
     conn.upstream_send_armed = false;
     conn.upstream_fd = -1;
 
-    const bool retired = retire_upstream_episode_after_detach(conn, expected_episode);
-    if (retired && detached_fd != nullptr && fd >= 0) {
+    // A failed DEL may have left the registration live. Close before retiring
+    // so the kernel drops that registration before ownership advances. Treat a
+    // close failure as a failed retirement precondition, but never retry close:
+    // the descriptor's ownership has already been consumed by this cleanup.
+    bool fd_closed = false;
+    bool close_failed = false;
+    if (!del_ok && fd >= 0) {
+        fd_closed = true;
+        close_failed = (::close(fd) < 0);
+    }
+
+    const bool retired =
+        !close_failed && retire_upstream_episode_after_detach(conn, expected_episode);
+    const bool reusable = del_ok && retired;
+    if (reusable && detached_fd != nullptr && fd >= 0) {
         *detached_fd = fd;
-    } else if (fd >= 0) {
+    } else if (fd >= 0 && !fd_closed) {
         ::close(fd);
     }
-    return retired;
+    return reusable;
 }
 
 void EpollBackend::quarantine_upstream_episode_on_slot_release(u32 conn_id) {

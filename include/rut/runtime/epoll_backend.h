@@ -135,7 +135,8 @@ struct EpollBackend {
 
     // Detach the currently owned upstream transport and retire its episode.
     // When detached_fd is supplied, ownership of the fd is returned only after
-    // a successful retire; any contract failure closes it instead.
+    // a successful DEL (or already-detached ENOENT) and retire; any failure
+    // closes it instead.
     bool detach_upstream(Connection& conn, i32* detached_fd = nullptr);
 
     // Quarantine ownership when a live epoll connection slot is released.

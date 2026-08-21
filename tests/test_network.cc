@@ -20,11 +20,15 @@
 #include <vector>
 
 #include <errno.h>
+#include <fcntl.h>
 #include <sys/socket.h>
+#include <unistd.h>
 
 using rut::test_fault::ScopedFakeSocket;
 using rut::test_fault::ScopedMemoryFault;
 using rut::test_fault::ScopedRecvData;
+using rut::test_fault::ScopedSyscallFault;
+using rut::test_fault::SyscallFaultConfig;
 
 TEST(listener_context, resolves_ephemeral_and_explicit_bound_ports) {
     ListenerContext invalid{};
@@ -10996,6 +11000,89 @@ TEST(epoll_episode_lifecycle, retire_requires_matching_detached_current_state) {
     conn.reset();
     CHECK_EQ(conn.upstream_episode, 10u);
     CHECK_EQ(backend.active_upstream_episode[conn.id], 0u);
+    backend.shutdown();
+}
+
+TEST(epoll_episode_lifecycle, unexpected_del_failure_closes_and_is_not_reusable) {
+    EpollBackend backend{};
+    REQUIRE(backend.init(0, -1).has_value());
+    i32 fds[2] = {-1, -1};
+    REQUIRE_EQ(socketpair(AF_UNIX, SOCK_STREAM | SOCK_NONBLOCK, 0, fds), 0);
+
+    Connection conn{};
+    conn.reset();
+    conn.id = 0;
+    conn.upstream_episode = 1;
+    REQUIRE(backend.begin_upstream_episode(conn.id, conn.upstream_episode));
+    conn.upstream_fd = fds[0];
+    backend.upstream_fd_map[conn.id] = fds[0];
+    REQUIRE(backend.add_recv_upstream(fds[0], conn.id, conn.upstream_episode));
+    conn.upstream_recv_armed = true;
+    conn.upstream_send_armed = true;
+
+    static const u8 payload[] = {'s', 't', 'a', 'l', 'e'};
+    backend.upstream_send_state[conn.id] = {
+        payload, fds[0], 0, sizeof(payload), IoEventType::UpstreamSend, false, 0, 1};
+
+    // The injected failure is deterministic and occurs on the DEL itself,
+    // after the fd has been registered in epoll.
+    SyscallFaultConfig fault_config;
+    fault_config.epoll_ctl_errno = EINVAL;
+    fault_config.epoll_ctl_failures = 1;
+    i32 detached_fd = 123;
+    {
+        ScopedSyscallFault fault(fault_config);
+        CHECK_FALSE(backend.detach_upstream(conn, &detached_fd));
+    }
+
+    CHECK_EQ(detached_fd, -1);
+    CHECK_EQ(conn.upstream_fd, -1);
+    CHECK_FALSE(conn.upstream_recv_armed);
+    CHECK_FALSE(conn.upstream_send_armed);
+    CHECK_EQ(backend.upstream_fd_map[conn.id], -1);
+    CHECK_EQ(backend.upstream_send_state[conn.id].src, nullptr);
+    CHECK_EQ(backend.upstream_send_state[conn.id].fd, -1);
+    CHECK_EQ(backend.upstream_send_state[conn.id].remaining, 0u);
+    CHECK_EQ(backend.upstream_send_state[conn.id].upstream_episode, 0u);
+    CHECK_EQ(backend.active_upstream_episode[conn.id], 0u);
+    CHECK_EQ(conn.upstream_episode, 2u);
+    errno = 0;
+    CHECK_EQ(fcntl(fds[0], F_GETFD), -1);
+    CHECK_EQ(errno, EBADF);
+    fds[0] = -1;
+
+    close(fds[1]);
+    fds[1] = -1;
+    backend.shutdown();
+}
+
+TEST(epoll_episode_lifecycle, already_unregistered_del_is_reusable) {
+    EpollBackend backend{};
+    REQUIRE(backend.init(0, -1).has_value());
+    i32 fds[2] = {-1, -1};
+    REQUIRE_EQ(socketpair(AF_UNIX, SOCK_STREAM | SOCK_NONBLOCK, 0, fds), 0);
+
+    Connection conn{};
+    conn.reset();
+    conn.id = 1;
+    conn.upstream_episode = 3;
+    REQUIRE(backend.begin_upstream_episode(conn.id, conn.upstream_episode));
+    conn.upstream_fd = fds[0];
+    backend.upstream_fd_map[conn.id] = fds[0];
+
+    // This fd was never registered, so EPOLL_CTL_DEL reports ENOENT. That is
+    // an already-detached state and remains eligible for pool ownership.
+    i32 detached_fd = -1;
+    CHECK(backend.detach_upstream(conn, &detached_fd));
+    CHECK_EQ(detached_fd, fds[0]);
+    CHECK_EQ(conn.upstream_fd, -1);
+    CHECK_EQ(backend.upstream_fd_map[conn.id], -1);
+    CHECK_EQ(backend.active_upstream_episode[conn.id], 0u);
+    CHECK_EQ(conn.upstream_episode, 4u);
+    CHECK_GE(fcntl(detached_fd, F_GETFD), 0);
+
+    close(detached_fd);
+    close(fds[1]);
     backend.shutdown();
 }
 
