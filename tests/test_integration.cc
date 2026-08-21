@@ -17976,6 +17976,10 @@ TEST(route, response_and_failure_bundle_suppress_head_serializes_live_success) {
     backend.response = kUpstreamResponse;
     backend.response_len = sizeof(kUpstreamResponse) - 1;
     backend.response_chunk_size = 3;
+    // Keep each responded upstream fd open in the recorder. The accept loop
+    // remains available for a second connection; an incorrectly pooled first
+    // fd therefore cannot be evicted and replaced while this test passes.
+    backend.keep_open = true;
     REQUIRE(backend.setup());
 
     RouteConfig cfg{};
