@@ -51,6 +51,10 @@ static constexpr char kHeadRequest[] =
     "HEAD /head?q=1 HTTP/1.1\r\n"
     "Host: client.example\r\n"
     "Connection: close\r\n\r\n";
+static constexpr char kHeadGatewayRequest[] =
+    "HEAD /missing?q=1 HTTP/1.1\r\n"
+    "Host: client.example\r\n"
+    "Connection: close\r\n\r\n";
 static constexpr char kHeadBackendResponse[] =
     "HTTP/1.1 200 OK\r\n"
     "Server: origin-head\r\n"
@@ -62,6 +66,13 @@ static constexpr char kHeadResponseNormalized[] =
     "Server: nginx/1.29.7\r\n"
     "Date: XXXXXXXXXXXXXXXXXXXXXXXXXXXXX\r\n"
     "Content-Length: 5\r\n"
+    "Connection: close\r\n\r\n";
+static constexpr char kHeadGatewayResponseNormalized[] =
+    "HTTP/1.1 502 Bad Gateway\r\n"
+    "Server: nginx/1.29.7\r\n"
+    "Date: XXXXXXXXXXXXXXXXXXXXXXXXXXXXX\r\n"
+    "Content-Type: text/html\r\n"
+    "Content-Length: 157\r\n"
     "Connection: close\r\n\r\n";
 static constexpr char kApiResponseNormalized[] =
     "HTTP/1.1 200 OK\r\n"
@@ -763,6 +774,39 @@ static bool log_contains(const std::string& path, const char* needle) {
     return contents.find(needle) != std::string::npos;
 }
 
+static bool log_count(const std::string& path, const char* needle, u32& count) {
+    const int fd = open(path.c_str(), O_RDONLY);
+    if (fd < 0) return false;
+    std::string contents;
+    char buf[1024];
+    while (contents.size() < 8192) {
+        const size_t want = sizeof(buf) < 8192 - contents.size() ? sizeof(buf)
+                                                                  : 8192 - contents.size();
+        const ssize_t n = read(fd, buf, want);
+        if (n > 0) {
+            contents.append(buf, static_cast<size_t>(n));
+            continue;
+        }
+        if (n < 0 && errno == EINTR) continue;
+        if (n < 0) {
+            close(fd);
+            return false;
+        }
+        break;
+    }
+    close(fd);
+    count = 0;
+    const std::string target(needle);
+    if (target.empty()) return false;
+    for (size_t pos = 0;;) {
+        pos = contents.find(target, pos);
+        if (pos == std::string::npos) break;
+        count++;
+        pos += target.size();
+    }
+    return true;
+}
+
 static bool log_empty(const std::string& path) {
     const int fd = open(path.c_str(), O_RDONLY);
     if (fd < 0) return true;
@@ -981,6 +1025,77 @@ static bool capture_head_case(u16 frontend_port,
         error = "HEAD downstream response did not match the exact pinned header-only baseline";
         dump_wire("expected HEAD response", expected_response);
         dump_wire("actual HEAD response", downstream);
+        return false;
+    }
+    return true;
+}
+
+static bool capture_head_gateway_case(u16 frontend_port,
+                                      u16 backend_port,
+                                      const std::string& nginx_config_path,
+                                      const std::string& nginx_log_path,
+                                      const std::string& container_name,
+                                      std::vector<char>& downstream,
+                                      std::string& error) {
+    // Keep the unavailable endpoint reserved through nginx shutdown and log
+    // inspection. This makes the connection failure deterministic and prevents
+    // another process from satisfying the request between those observations.
+    DeadPort dead;
+    if (!dead.reserve(backend_port)) {
+        error = "failed to reserve unavailable HEAD gateway upstream port";
+        return false;
+    }
+
+    DockerGuard docker(container_name);
+    ChildGuard nginx;
+    if (!spawn_child({"docker", "run", "--pull=never", "--network", "host", "--name",
+                      container_name, "-v", nginx_config_path + ":/etc/nginx/nginx.conf:ro",
+                      kNginxImage, "nginx", "-g", "daemon off;"},
+                     nginx_log_path,
+                     nginx.child)) {
+        error = "failed to start pinned nginx for HEAD gateway case";
+        return false;
+    }
+    if (!wait_ready(frontend_port, nginx.child, error)) return false;
+
+    const int client = connect_once(frontend_port);
+    bool ok = client >= 0;
+    if (ok) ok = send_all(client, kHeadGatewayRequest, sizeof(kHeadGatewayRequest) - 1);
+    if (ok) ok = read_head_response(client, downstream, error);
+    if (ok) ok = read_eof(client, error);
+    if (client >= 0) close(client);
+    if (!ok) {
+        error = "nginx HEAD gateway response/EOF failed: " + error;
+        return false;
+    }
+
+    const bool nginx_stopped = stop_child(nginx.child);
+    const bool container_removed = docker.remove();
+    u32 connect_failure_count = 0;
+    const bool log_readable = log_count(nginx_log_path, "connect() failed", connect_failure_count);
+    const std::string upstream_context = "127.0.0.1:" + std::to_string(backend_port);
+    const bool has_upstream_context = log_contains(nginx_log_path, upstream_context.c_str());
+    if (!nginx_stopped) {
+        error = "failed to stop nginx after HEAD gateway case";
+        return false;
+    }
+    if (!container_removed) {
+        error = "docker rm -f failed after HEAD gateway case";
+        return false;
+    }
+    if (!log_readable || connect_failure_count != 1 || !has_upstream_context) {
+        error = "HEAD gateway log did not contain exactly one pinned upstream connect failure";
+        return false;
+    }
+
+    std::vector<char> normalized = downstream;
+    const std::vector<char> expected(kHeadGatewayResponseNormalized,
+                                     kHeadGatewayResponseNormalized +
+                                         sizeof(kHeadGatewayResponseNormalized) - 1);
+    if (!normalize_date(normalized) || normalized != expected) {
+        error = "HEAD gateway response did not match the exact pinned header-only baseline";
+        dump_wire("expected HEAD gateway response", expected);
+        dump_wire("actual HEAD gateway response", downstream);
         return false;
     }
     return true;
@@ -1644,6 +1759,24 @@ int main(int argc, char** argv) {
     }
     std::cerr << "PASS: pinned nginx HEAD proxy response baseline (header-only downstream, "
                  "one upstream request)\n";
+
+    std::vector<char> nginx_head_gateway_response;
+    std::string head_gateway_error;
+    const std::string head_gateway_container = container + "-head-gateway";
+    if (!capture_head_gateway_case(frontend_port,
+                                   backend_port,
+                                   temp.nginx_config,
+                                   temp.nginx_log,
+                                   head_gateway_container,
+                                   nginx_head_gateway_response,
+                                   head_gateway_error)) {
+        std::cerr << "FAIL [HEAD gateway baseline]: " << head_gateway_error << "\n";
+        dump_wire("nginx HEAD gateway response", nginx_head_gateway_response);
+        dump_log(temp.nginx_log, "nginx HEAD gateway log");
+        return 1;
+    }
+    std::cerr << "PASS: pinned nginx HEAD unavailable-upstream gateway baseline "
+                 "(header-only 502 + EOF)\n";
 
     u16 api_frontend_port = 0;
     u16 api_backend_port = 0;
