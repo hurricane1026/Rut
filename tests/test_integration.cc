@@ -17680,6 +17680,116 @@ TEST(route, failure_policy_body_waits_for_complete_request_before_connect_error)
     close(client);
 }
 
+TEST(route, failure_policy_suppress_body_connect_error_serializes_head_bundle) {
+    using namespace rut;
+    static constexpr char kGatewayBody[] =
+        "<html>\r\n<head><title>502 Bad Gateway</title></head>\r\n<body>\r\n"
+        "<center><h1>502 Bad Gateway</h1></center>\r\n"
+        "<hr><center>nginx/1.29.7</center>\r\n</body>\r\n</html>\r\n";
+    static_assert(sizeof(kGatewayBody) - 1 == 157);
+
+    auto run_case = [&]() -> bool {
+        DeadEndpoint dead;
+        if (!dead.reserve()) return false;
+        RouteConfig cfg{};
+        auto upstream = cfg.add_upstream("backend", 0x7F000001, dead.port);
+        if (!upstream.has_value()) return false;
+        cfg.upstreams[upstream.value()].max_inflight = 1;
+
+        if (cfg.add_response_policy(test_response_policy_head_spec()) != 1u) return false;
+        auto failure = test_failure_policy_spec();
+        failure.head_mode = FailurePolicyHeadMode::SuppressBody;
+        failure.server = {"nginx/1.29.7", 12};
+        failure.content_type = {"text/html", 9};
+        failure.body = {kGatewayBody, sizeof(kGatewayBody) - 1};
+        if (cfg.add_failure_policy(failure) != 1u) return false;
+
+        if (cfg.add_policy_bundle(1, 1) != 1u ||
+            !cfg.add_jit_handler("/head", 'H', &forward_failure_bundle_handler))
+            return false;
+
+        const RouteConfig* active = &cfg;
+        ScopedProxyLoop proxy;
+        if (!proxy.setup(&active, 1000)) return false;
+        static constexpr char kRequest[] =
+            "HEAD /head?q=1 HTTP/1.1\r\nHost: client.example\r\n"
+            "Connection: close\r\n\r\n";
+        static constexpr char kExpected[] =
+            "HTTP/1.1 502 Bad Gateway\r\n"
+            "Server: nginx/1.29.7\r\n"
+            "Date: XXXXXXXXXXXXXXXXXXXXXXXXXXXXX\r\n"
+            "Content-Type: text/html\r\n"
+            "Content-Length: 157\r\n"
+            "Connection: close\r\n\r\n";
+
+        for (u32 attempt = 0; attempt < 2; attempt++) {
+            const i32 client = connect_to(proxy.port);
+            if (client < 0) return false;
+            set_socket_timeouts(client, 3);
+            if (!send_all(client, kRequest, sizeof(kRequest) - 1)) {
+                close(client);
+                return false;
+            }
+            char response_wire[1024]{};
+            u32 response_len = 0;
+            u32 header_end = 0;
+            for (u32 read = 0; read < 16 && response_len < sizeof(response_wire); read++) {
+                const i32 got = recv_timeout(client,
+                                             response_wire + response_len,
+                                             sizeof(response_wire) - response_len,
+                                             3000);
+                if (got <= 0) {
+                    fprintf(stderr, "paired-head: recv got %d attempt=%u\n", got, attempt);
+                    close(client);
+                    return false;
+                }
+                response_len += static_cast<u32>(got);
+                for (u32 i = 0; i + 3 < response_len; i++) {
+                    if (response_wire[i] == '\r' && response_wire[i + 1] == '\n' &&
+                        response_wire[i + 2] == '\r' && response_wire[i + 3] == '\n') {
+                        header_end = i + 4;
+                        break;
+                    }
+                }
+                if (header_end != 0) break;
+            }
+            if (header_end == 0 || response_len != header_end) {
+                fprintf(stderr, "paired-head: header=%u response=%u attempt=%u\n",
+                        header_end, response_len, attempt);
+                close(client);
+                return false;
+            }
+            const i32 eof = recv_timeout(client, response_wire, sizeof(response_wire), 3000);
+            if (eof != 0) {
+                fprintf(stderr, "paired-head: eof=%d attempt=%u\n", eof, attempt);
+                close(client);
+                return false;
+            }
+
+            char normalized[sizeof(response_wire)]{};
+            memcpy(normalized, response_wire, response_len);
+            char* date = strstr(normalized, "Date: ");
+            if (date == nullptr || date[6 + 29] != '\r') {
+                fprintf(stderr, "paired-head: date invalid attempt=%u\n", attempt);
+                close(client);
+                return false;
+            }
+            for (u32 i = 0; i < 29; i++) normalized[(date - normalized) + 6 + i] = 'X';
+            if (response_len != sizeof(kExpected) - 1 ||
+                memcmp(normalized, kExpected, sizeof(kExpected) - 1) != 0) {
+                fprintf(stderr, "paired-head: wire len=%u expected=%zu\n%.*s\n",
+                        response_len, sizeof(kExpected) - 1, response_len, normalized);
+                close(client);
+                return false;
+            }
+            close(client);
+        }
+        return true;
+    };
+
+    CHECK(run_case());
+}
+
 TEST(route, response_policy_rejects_tls_admission_before_upstream_accept) {
     using namespace rut;
     RecordingUpstream backend;

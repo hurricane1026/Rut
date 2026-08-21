@@ -1130,9 +1130,130 @@ TEST(response_policy, failure_suppress_body_plain_forward_head_fails_closed) {
         const MockOp* local_send = loop.backend.last_op(MockOp::Send);
         REQUIRE(local_send != nullptr);
         CHECK_EQ(local_send->send_len, conn->send_buf.len());
-        CHECK(buf_has(conn->send_buf.data(), conn->send_buf.len(), "HTTP/1.1 400", 12));
+        CHECK(buf_has(conn->send_buf.data(), conn->send_buf.len(), "HTTP/1.1 400"));
         loop.free_conn(*conn);
     }
+}
+
+TEST(response_policy, paired_suppress_head_rejects_mismatch_and_invalid_original_facts) {
+    SmallLoop loop;
+    loop.setup();
+    RouteConfig cfg{};
+    REQUIRE(cfg.add_upstream("backend", 0x7F000001, 8080).has_value());
+    ForwardResponsePolicySpec response{};
+    response.version = ResponsePolicyVersion::Http11;
+    response.framing = ResponsePolicyFraming::ContentLength;
+    response.connection = ResponsePolicyConnection::Request;
+    response.date = ResponsePolicyDate::Current;
+    response.head_mode = ResponsePolicyHeadMode::SuppressBody;
+    response.server = {"nginx", 5};
+    REQUIRE_EQ(cfg.add_response_policy(response), 1u);
+
+    ForwardFailurePolicySpec reject{};
+    reject.version = ForwardFailurePolicyVersion::Http11;
+    reject.status_code = 502;
+    reject.date = ForwardFailurePolicyDate::Current;
+    reject.connection = ForwardFailurePolicyConnection::Request;
+    reject.reason = {"Bad Gateway", 11};
+    reject.content_type = {"text/plain", 10};
+    reject.server = {"rut", 3};
+    reject.body = {"bad", 3};
+    REQUIRE_EQ(cfg.add_failure_policy(reject), 1u);
+    auto suppress = reject;
+    suppress.head_mode = FailurePolicyHeadMode::SuppressBody;
+    REQUIRE_EQ(cfg.add_failure_policy(suppress), 2u);
+    REQUIRE_EQ(cfg.add_policy_bundle(1, 1), 1u);  // response Suppress + failure Reject
+    REQUIRE_EQ(cfg.add_policy_bundle(1, 2), 2u);  // paired Suppress
+
+    struct Vector {
+        const char* request;
+        bool bundle_mismatch;
+        bool failure_only;
+    } vectors[] = {
+        {"HEAD /head HTTP/1.1\r\nConnection: close\r\n\r\n", false, false},
+        {"HEAD /head HTTP/1.1\r\nHost: a\r\nHost: b\r\nConnection: close\r\n\r\n",
+         false,
+         false},
+        {"HEAD /head HTTP/1.1\r\nHost: a:0\r\nConnection: close\r\n\r\n", false, false},
+        {"HEAD /head HTTP/1.1\r\nHost: a\r\n\r\n", false, false},
+        {"HEAD /head HTTP/1.1\r\nHost: a\r\nConnection: close, keep-alive\r\n\r\n",
+         false,
+         false},
+        {"HEAD /head HTTP/1.1\r\nHost: a\r\nConnection: close\r\n"
+         "cOnNeCtIoN: close\r\n\r\n",
+         false,
+         false},
+        {"HEAD /head HTTP/1.1\r\nHost: a\r\nConnection: close\r\n"
+         "Content-Length: 0\r\n\r\n",
+         false,
+         false},
+        {"HEAD /head HTTP/1.1\r\nHost: a\r\nConnection: close\r\n"
+         "TE: trailers\r\n\r\n",
+         false,
+         false},
+        {"HEAD /head HTTP/1.1\r\nHost: a\r\nConnection: close\r\n"
+         "Expect: 100-continue\r\n\r\n",
+         false,
+         false},
+        {"HEAD /head HTTP/1.1\r\nHost: a\r\nConnection: close\r\n"
+         "Upgrade: websocket\r\n\r\n",
+         false,
+         false},
+        {"GET /head HTTP/1.1\r\nHost: a\r\nConnection: close\r\n\r\n", false, false},
+        {"HEAD /head HTTP/1.1\r\nHost: a\r\nConnection: close\r\n\r\n", true, false},
+        {"HEAD /head HTTP/1.1\r\nHost: a\r\nConnection: close\r\n\r\n", false, true},
+    };
+    for (const auto& vector : vectors) {
+        auto* conn = loop.alloc_conn();
+        REQUIRE(conn != nullptr);
+        const u32 request_len = static_cast<u32>(strlen(vector.request));
+        REQUIRE_EQ(conn->recv_buf.write(reinterpret_cast<const u8*>(vector.request), request_len),
+                   request_len);
+        capture_request_metadata(*conn);
+        conn->request_config = &cfg;
+        conn->req_initial_send_len = conn->recv_buf.len();
+        JitDispatchOutcome outcome{};
+        outcome.kind = JitDispatchOutcome::Kind::Forward;
+        outcome.upstream_id = 0;
+        if (vector.bundle_mismatch)
+            outcome.policy_bundle_id = 1;
+        else {
+            outcome.response_policy_id = vector.failure_only ? 0 : 1;
+            outcome.failure_policy_id = 2;
+        }
+        loop.backend.clear_ops();
+        handle_jit_outcome<SmallLoop>(&loop, *conn, outcome, nullptr, true);
+        CHECK_EQ(conn->resp_status, 400u);
+        CHECK_FALSE(conn->upstream_slot_held);
+        CHECK_EQ(conn->upstream_fd, -1);
+        CHECK_EQ(loop.backend.count_ops(MockOp::Connect), 0u);
+        CHECK_EQ(loop.backend.count_ops(MockOp::Send), 1u);
+        loop.free_conn(*conn);
+    }
+
+    // A matching pair is still restricted to the explicit-close HEAD domain;
+    // mode equality alone must not admit a GET.
+    auto* non_head = loop.alloc_conn();
+    REQUIRE(non_head != nullptr);
+    static constexpr char kGet[] =
+        "GET /head HTTP/1.1\r\nHost: a\r\nConnection: close\r\n\r\n";
+    REQUIRE_EQ(non_head->recv_buf.write(reinterpret_cast<const u8*>(kGet), sizeof(kGet) - 1),
+               sizeof(kGet) - 1);
+    capture_request_metadata(*non_head);
+    non_head->request_config = &cfg;
+    non_head->req_initial_send_len = non_head->recv_buf.len();
+    JitDispatchOutcome non_head_outcome{};
+    non_head_outcome.kind = JitDispatchOutcome::Kind::Forward;
+    non_head_outcome.upstream_id = 0;
+    non_head_outcome.response_policy_id = 1;
+    non_head_outcome.failure_policy_id = 2;
+    // ID 2 is SuppressBody; response id 1 is also SuppressBody.
+    loop.backend.clear_ops();
+    handle_jit_outcome<SmallLoop>(&loop, *non_head, non_head_outcome, nullptr, true);
+    CHECK_EQ(non_head->resp_status, 400u);
+    CHECK_EQ(loop.backend.count_ops(MockOp::Connect), 0u);
+    CHECK_FALSE(non_head->upstream_slot_held);
+    loop.free_conn(*non_head);
 }
 
 TEST(target_transform, h1_materializes_clean_origin_form_and_preserves_query) {
@@ -15551,6 +15672,131 @@ TEST(state_invariant, jit_forward_failure_bundle_connect_submit_serializes_and_c
 
     close(fds[1]);
     loop.close_conn(*c);
+}
+
+TEST(state_invariant, jit_forward_direct_paired_head_connect_submit_serializes_no_body) {
+    RouteConfig cfg;
+    auto upstream = cfg.add_upstream("api", 0x7F000001, 9000);
+    REQUIRE(upstream.has_value());
+    cfg.upstreams[upstream.value()].max_inflight = 1;
+
+    static constexpr char kBody[] =
+        "<html>\r\n<head><title>502 Bad Gateway</title></head>\r\n<body>\r\n"
+        "<center><h1>502 Bad Gateway</h1></center>\r\n"
+        "<hr><center>nginx/1.29.7</center>\r\n</body>\r\n</html>\r\n";
+    static_assert(sizeof(kBody) - 1 == 157);
+    ForwardResponsePolicySpec response{};
+    response.version = ResponsePolicyVersion::Http11;
+    response.framing = ResponsePolicyFraming::ContentLength;
+    response.connection = ResponsePolicyConnection::Request;
+    response.date = ResponsePolicyDate::Current;
+    response.head_mode = ResponsePolicyHeadMode::SuppressBody;
+    response.server = {"nginx/1.29.7", 12};
+    REQUIRE_EQ(cfg.add_response_policy(response), 1u);
+
+    ForwardFailurePolicySpec failure{};
+    failure.version = ForwardFailurePolicyVersion::Http11;
+    failure.status_code = 502;
+    failure.date = ForwardFailurePolicyDate::Current;
+    failure.connection = ForwardFailurePolicyConnection::Request;
+    failure.head_mode = FailurePolicyHeadMode::SuppressBody;
+    failure.reason = {"Bad Gateway", 11};
+    failure.content_type = {"text/html", 9};
+    failure.server = {"nginx/1.29.7", 12};
+    failure.body = {kBody, sizeof(kBody) - 1};
+    REQUIRE_EQ(cfg.add_failure_policy(failure), 1u);
+
+    SmallLoop loop;
+    loop.setup();
+    int fds[2];
+    REQUIRE(socketpair(AF_UNIX, SOCK_STREAM, 0, fds) == 0);
+    ScopedFakeSocket fake_socket(fds[0]);
+    loop.inject_and_dispatch(make_ev(0, IoEventType::Accept, 42));
+    auto* c = loop.find_fd(42);
+    REQUIRE(c != nullptr);
+    c->request_config = &cfg;
+    static constexpr char kRequest[] =
+        "HEAD /missing?q=1 HTTP/1.1\r\nHost: client.example\r\n"
+        "Connection: close\r\n\r\n";
+    REQUIRE_EQ(c->recv_buf.write(reinterpret_cast<const u8*>(kRequest), sizeof(kRequest) - 1),
+               sizeof(kRequest) - 1);
+    capture_request_metadata(*c);
+    c->req_initial_send_len = c->recv_buf.len();
+
+    JitDispatchOutcome outcome{};
+    outcome.kind = JitDispatchOutcome::Kind::Forward;
+    outcome.upstream_id = upstream.value();
+    // The converter's supported header-only request policy may coexist, but
+    // admission must have already validated the original Host/Connection
+    // facts before this rewrite removes those fields.
+    outcome.request_policy_id = 1;
+    outcome.response_policy_id = 1;
+    outcome.failure_policy_id = 1;
+    loop.backend.clear_ops();
+    loop.backend.fail_connect = true;
+    handle_jit_outcome<SmallLoop>(&loop, *c, outcome, nullptr, true);
+
+    CHECK_EQ(c->failure_policy_id, 1u);
+    CHECK(c->failure_policy_suppress_body);
+    CHECK_EQ(c->resp_status, kStatusBadGateway);
+    CHECK_EQ(c->state, ConnState::Sending);
+    CHECK_EQ(c->upstream_fd, -1);
+    CHECK_FALSE(c->upstream_slot_held);
+    CHECK_FALSE(c->upstream_recv_armed);
+    CHECK_FALSE(c->upstream_send_armed);
+    CHECK_EQ(loop.backend.count_ops(MockOp::Connect), 0u);
+    CHECK_EQ(loop.backend.count_ops(MockOp::Send), 1u);
+
+    char normalized[SmallLoop::kBufSize]{};
+    REQUIRE(c->send_buf.len() < sizeof(normalized));
+    const u32 send_len = c->send_buf.len();
+    __builtin_memcpy(normalized, c->send_buf.data(), send_len);
+    char* date = strstr(normalized, "Date: ");
+    REQUIRE(date != nullptr);
+    REQUIRE(date[6 + 29] == '\r');
+    for (u32 i = 0; i < 29; i++) normalized[(date - normalized) + 6 + i] = 'X';
+    static constexpr char kExpected[] =
+        "HTTP/1.1 502 Bad Gateway\r\n"
+        "Server: nginx/1.29.7\r\n"
+        "Date: XXXXXXXXXXXXXXXXXXXXXXXXXXXXX\r\n"
+        "Content-Type: text/html\r\n"
+        "Content-Length: 157\r\n"
+        "Connection: close\r\n\r\n";
+    CHECK_EQ(send_len, static_cast<u32>(sizeof(kExpected) - 1));
+    CHECK_EQ(memcmp(normalized, kExpected, sizeof(kExpected) - 1), 0);
+    close(fds[1]);
+    loop.close_conn(*c);
+}
+
+TEST(state_invariant, failure_policy_serializer_capacity_failure_is_transactional) {
+    RouteConfig cfg;
+    ForwardFailurePolicySpec policy{};
+    policy.version = ForwardFailurePolicyVersion::Http11;
+    policy.status_code = 502;
+    policy.date = ForwardFailurePolicyDate::Current;
+    policy.connection = ForwardFailurePolicyConnection::Request;
+    policy.reason = {"Bad Gateway", 11};
+    policy.content_type = {"text/plain", 10};
+    policy.server = {"rut", 3};
+    policy.body = {"unavailable", 11};
+    REQUIRE(cfg.add_failure_policy(policy) == 1u);
+    SmallLoop loop;
+    loop.setup();
+    auto* c = loop.alloc_conn();
+    REQUIRE(c != nullptr);
+    c->request_config = &cfg;
+    c->failure_policy_id = 1;
+    static constexpr char kSentinel[] = "preexisting";
+    REQUIRE_EQ(c->send_buf.write(reinterpret_cast<const u8*>(kSentinel), sizeof(kSentinel) - 1),
+               sizeof(kSentinel) - 1);
+    u8 staged[8]{};
+    u32 staged_len = 99;
+    CHECK_FALSE(build_failure_policy_response(
+        *c, cfg, false, staged, sizeof(staged), &staged_len));
+    CHECK_EQ(staged_len, 0u);
+    CHECK_EQ(c->send_buf.len(), static_cast<u32>(sizeof(kSentinel) - 1));
+    CHECK_EQ(memcmp(c->send_buf.data(), kSentinel, sizeof(kSentinel) - 1), 0);
+    loop.free_conn(*c);
 }
 
 TEST(state_invariant, backend_retry_connect_submit_failure_closes_retry_fd) {

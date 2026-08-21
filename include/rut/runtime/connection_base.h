@@ -544,6 +544,10 @@ struct ConnectionBase {
     bool response_policy_suppress_body;
     // Non-zero selects the bounded H1 failure serializer for connect failures.
     u16 failure_policy_id;
+    // Pinned per-request failure disposition.  This is deliberately separate
+    // from the policy table so later request rewrites or config swaps cannot
+    // change how an already selected connect failure is serialized.
+    bool failure_policy_suppress_body;
     // Exact parsed request HTTP version (HttpVersion underlying value).
     u8 req_http_version; // HttpVersion::Http10/Http11, 255 when unknown.
     // Request-side keep-alive intent of the CURRENT request, as parsed from its
@@ -830,6 +834,7 @@ struct ConnectionBase {
         response_policy_id = 0;
         response_policy_suppress_body = false;
         failure_policy_id = 0;
+        failure_policy_suppress_body = false;
         req_http_version = 255;
         req_keep_alive = false;
         req_client_keep_alive = false;

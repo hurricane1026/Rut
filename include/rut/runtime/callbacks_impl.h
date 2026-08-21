@@ -513,8 +513,13 @@ inline bool request_policy_body_response_admitted(const Connection& conn);
 inline bool strict_response_upload_ready(const Connection& conn);
 inline bool response_policy_runtime_supported(const ForwardResponsePolicySpec& policy);
 inline bool failure_policy_runtime_supported(const ForwardFailurePolicySpec& policy);
+inline bool forward_policy_head_modes_compatible(const RouteConfig& config,
+                                                  u16 response_policy_id,
+                                                  u16 failure_policy_id);
 inline bool response_policy_suppress_head_admitted(
-    const Connection& conn, const ForwardResponsePolicySpec& policy, bool has_failure_policy);
+    const Connection& conn,
+    const ForwardResponsePolicySpec& policy,
+    bool paired_failure);
 template <typename Loop>
 inline void reject_request_policy(Loop* loop, Connection& conn);
 template <typename Loop>
@@ -1083,6 +1088,7 @@ void on_header_received(void* lp, Connection& conn, IoEvent ev) {
     conn.response_policy_id = 0;
     conn.response_policy_suppress_body = false;
     conn.failure_policy_id = 0;
+    conn.failure_policy_suppress_body = false;
     conn.resp_header_mutation_pending_count = 0;
     conn.resp_header_mutation_pending_overflow = false;
     conn.resp_header_mutation_count = 0;
@@ -2305,14 +2311,48 @@ void handle_jit_outcome(Loop* loop,
                 reject_response_policy(loop, conn);
                 return;
             }
-            // Failure-policy head dispositions are metadata-only in this
-            // increment.  Validate the selected mode before request-body
+            if (!forward_policy_head_modes_compatible(
+                    *config, forward_response_policy_id, forward_failure_policy_id)) {
+                // A failure SuppressBody policy is meaningful only when the
+                // success policy carries the same disposition.  Response-only
+                // SuppressBody remains valid for the existing HEAD success
+                // path, but mismatched pairs fail before any body wait.
+                reject_response_policy(loop, conn);
+                return;
+            }
+            bool suppress_body_head =
+                forward_response_policy_id != 0 &&
+                config->response_policies[forward_response_policy_id - 1].head_mode ==
+                    ResponsePolicyHeadMode::SuppressBody &&
+                response_policy_suppress_head_admitted(
+                    conn,
+                    config->response_policies[forward_response_policy_id - 1],
+                    forward_failure_policy_id != 0);
+            const bool suppress_failure_head =
+                forward_response_policy_id != 0 && forward_failure_policy_id != 0 &&
+                config->response_policies[forward_response_policy_id - 1].head_mode ==
+                    ResponsePolicyHeadMode::SuppressBody &&
+                config->failure_policies[forward_failure_policy_id - 1].head_mode ==
+                    FailurePolicyHeadMode::SuppressBody && suppress_body_head;
+            // Validate the selected failure disposition before request-body
             // waiting, policy rewriting, target materialisation, or any
-            // upstream resource can be touched; SuppressBody is deliberately
-            // fail-closed until its serializer is implemented.
+            // upstream resource can be touched. Only the paired SuppressBody
+            // contract below is executable in this increment.
             if (forward_failure_policy_id != 0 &&
                 !failure_policy_runtime_supported(
-                    config->failure_policies[forward_failure_policy_id - 1])) {
+                    config->failure_policies[forward_failure_policy_id - 1]) &&
+                !suppress_failure_head) {
+                reject_response_policy(loop, conn);
+                return;
+            }
+            // A paired SuppressBody contract is deliberately narrower than
+            // ordinary response-only policy handling: it must prove the full
+            // explicit-close HEAD domain before request-policy body waiting,
+            // rewriting, or any upstream resource is touched.
+            if (forward_failure_policy_id != 0 &&
+                config->failure_policies[forward_failure_policy_id - 1].head_mode ==
+                    FailurePolicyHeadMode::SuppressBody &&
+                !suppress_failure_head) {
                 reject_response_policy(loop, conn);
                 return;
             }
@@ -2375,13 +2415,6 @@ void handle_jit_outcome(Loop* loop,
                     config->response_policies[forward_response_policy_id - 1].connection ==
                     ResponsePolicyConnection::Request;
             }
-            const bool suppress_body_head =
-                forward_response_policy_id != 0 &&
-                config->response_policy_id_is_valid(forward_response_policy_id) &&
-                response_policy_suppress_head_admitted(
-                    conn,
-                    config->response_policies[forward_response_policy_id - 1],
-                    has_failure_policy);
             if ((forward_response_policy_id != 0 || has_failure_policy) &&
                 ((forward_response_policy_id != 0 &&
                   !config->response_policy_id_is_valid(forward_response_policy_id)) ||
@@ -2426,6 +2459,7 @@ void handle_jit_outcome(Loop* loop,
                 conn.response_policy_suppress_body = suppress_body_head;
             }
             conn.failure_policy_id = forward_failure_policy_id;
+            conn.failure_policy_suppress_body = suppress_failure_head;
             if (conn.resp_header_mutation_count != 0 && !loop->alloc_response_header_buf(conn)) {
                 conn.resp_status = kStatusInternalServerError;
                 format_static_response(conn, 500, /*keep_alive=*/false);
@@ -5483,14 +5517,38 @@ inline bool failure_policy_runtime_supported(const ForwardFailurePolicySpec& pol
     return policy.head_mode == FailurePolicyHeadMode::Reject;
 }
 
+// A HEAD suppression disposition is meaningful for the success and failure
+// serializers only as the same per-request contract.  Response-only
+// suppression remains valid for the already supported success path; a failure
+// suppression disposition requires the matching response disposition so a
+// connect failure can never silently fall back to a normal-body policy.
+inline bool forward_policy_head_modes_compatible(const RouteConfig& config,
+                                                  u16 response_policy_id,
+                                                  u16 failure_policy_id) {
+    const bool response_suppress =
+        response_policy_id != 0 &&
+        config.response_policies[response_policy_id - 1].head_mode ==
+            ResponsePolicyHeadMode::SuppressBody;
+    const bool failure_suppress =
+        failure_policy_id != 0 &&
+        config.failure_policies[failure_policy_id - 1].head_mode ==
+            FailurePolicyHeadMode::SuppressBody;
+    if (failure_suppress && !response_suppress) return false;
+    // Response-only SuppressBody is an existing success-only capability; once
+    // a failure policy is present it must carry the same disposition rather
+    // than silently falling back to a body-bearing failure serializer.
+    if (response_suppress && failure_policy_id != 0 && !failure_suppress) return false;
+    return true;
+}
+
 inline bool response_policy_suppress_head_admitted(
     const Connection& conn,
     const ForwardResponsePolicySpec& policy,
-    bool has_failure_policy) {
+    bool paired_failure) {
     // This is intentionally the complete first successful HEAD domain.  In
     // particular, req_client_keep_alive distinguishes an explicit HTTP/1.1
     // Connection: close from the ordinary HTTP/1.1 default keep-alive.
-    if (has_failure_policy || policy.head_mode != ResponsePolicyHeadMode::SuppressBody ||
+    if (policy.head_mode != ResponsePolicyHeadMode::SuppressBody ||
         policy.connection != ResponsePolicyConnection::Request)
         return false;
     if (conn.recv_buf.data() == nullptr || conn.recv_buf.len() == 0) return false;
@@ -5501,18 +5559,69 @@ inline bool response_policy_suppress_head_admitted(
         req.method != HttpMethod::HEAD || req.version != HttpVersion::Http11 ||
         req.path.ptr == nullptr || req.path.len == 0 || req.path.ptr[0] != '/' ||
         req.has_content_length || req.chunked || req.upgrade || req.has_upgrade_header ||
-        (!conn.request_policy_id && !req.connection_close))
+        ((!conn.request_policy_id || paired_failure) && !req.connection_close))
         return false;
-    if (!conn.request_policy_id) {
-        for (u32 i = 0; i < req.header_count; i++) {
-            const Str name = req.headers[i].name;
-            if (http_header_name_eq_ci(name.ptr, name.len, "transfer-encoding", 17) ||
-                http_header_name_eq_ci(name.ptr, name.len, "te", 2) ||
-                http_header_name_eq_ci(name.ptr, name.len, "expect", 6) ||
-                http_header_name_eq_ci(name.ptr, name.len, "upgrade", 7))
+    u32 host_count = 0;
+    u32 connection_count = 0;
+    const Header* host = nullptr;
+    for (u32 i = 0; i < req.header_count; i++) {
+        const Header& header = req.headers[i];
+        const Str name = header.name;
+        if (http_header_name_eq_ci(name.ptr, name.len, "host", 4)) {
+            if (++host_count > 1) return false;
+            host = &header;
+        } else if (http_header_name_eq_ci(name.ptr, name.len, "connection", 10)) {
+            if (++connection_count > 1 || header.value.len != 5 ||
+                !http_header_name_eq_ci(header.value.ptr, header.value.len, "close", 5))
                 return false;
+        } else if (http_header_name_eq_ci(name.ptr, name.len, "content-length", 14) ||
+                   http_header_name_eq_ci(name.ptr, name.len, "transfer-encoding", 17) ||
+                   http_header_name_eq_ci(name.ptr, name.len, "te", 2) ||
+                   http_header_name_eq_ci(name.ptr, name.len, "expect", 6) ||
+                   http_header_name_eq_ci(name.ptr, name.len, "upgrade", 7)) {
+            if (!conn.request_policy_id || paired_failure) return false;
         }
     }
+    auto valid_authority = [](Str value) {
+        if (value.ptr == nullptr || value.len == 0 || value.len > 255) return false;
+        u32 colon = value.len;
+        for (u32 i = 0; i < value.len; i++) {
+            const u8 c = static_cast<u8>(value.ptr[i]);
+            if (c <= 0x20 || c == 0x7f || c == '/' || c == '?' || c == '#' || c == '@' ||
+                c == '[' || c == ']' || c == ',' || c == '\\')
+                return false;
+            if (c == ':') {
+                if (colon != value.len) return false;
+                colon = i;
+            }
+        }
+        if (colon == 0) return false;
+        const bool has_port = colon != value.len;
+        if (has_port) {
+            if (colon + 1 == value.len) return false;
+            u32 port = 0;
+            for (u32 i = colon + 1; i < value.len; i++) {
+                const u8 c = static_cast<u8>(value.ptr[i]);
+                if (c < '0' || c > '9' || port > 6553u ||
+                    (port == 6553u && c > '5'))
+                    return false;
+                port = port * 10u + static_cast<u32>(c - '0');
+            }
+            if (port == 0) return false;
+        }
+        const u32 host_len = has_port ? colon : value.len;
+        for (u32 i = 0; i < host_len; i++) {
+            const u8 c = static_cast<u8>(value.ptr[i]);
+            const bool alpha_num = (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+                                   (c >= '0' && c <= '9');
+            if (!alpha_num && c != '.' && c != '-' && c != '_') return false;
+        }
+        return true;
+    };
+    if (paired_failure &&
+        (host_count != 1 || connection_count != 1 || host == nullptr ||
+         !valid_authority(host->value)))
+        return false;
     return
            policy.connection == ResponsePolicyConnection::Request &&
            conn.req_method == static_cast<u8>(LogHttpMethod::Head) &&
@@ -5536,14 +5645,26 @@ inline bool response_policy_suppress_head_admitted(
 inline u32 strict_response_dec(char* out, u32 value);
 inline u32 strict_response_date(char* out, u64 now_us);
 
-inline bool build_failure_policy_response(Connection& conn, const RouteConfig& config) {
-    if (conn.failure_policy_id == 0 ||
+inline bool build_failure_policy_response(const Connection& conn,
+                                          const RouteConfig& config,
+                                          bool suppress_body,
+                                          u8* out,
+                                          u32 out_cap,
+                                          u32* out_len) {
+    if (out_len == nullptr) return false;
+    *out_len = 0;
+    if (out == nullptr || conn.failure_policy_id == 0 ||
         !config.failure_policy_id_is_valid(conn.failure_policy_id))
         return false;
     const auto& policy = config.failure_policies[conn.failure_policy_id - 1];
-    conn.send_buf.reset();
+    u32 pos = 0;
     auto put = [&](const u8* data, u32 len) {
-        return conn.send_buf.write(data, len) == len;
+        if ((data == nullptr && len != 0) ||
+            len > out_cap - (pos <= out_cap ? pos : out_cap))
+            return false;
+        for (u32 i = 0; i < len; i++) out[pos + i] = data[i];
+        pos += len;
+        return true;
     };
     auto put_lit = [&](const char* text) {
         return put(reinterpret_cast<const u8*>(text), static_cast<u32>(__builtin_strlen(text)));
@@ -5567,11 +5688,11 @@ inline bool build_failure_policy_response(Connection& conn, const RouteConfig& c
         !put(reinterpret_cast<const u8*>(length), length_len) ||
         !put_lit("\r\nConnection: "))
         return false;
-    const bool keep_alive = conn.keep_alive && conn.req_client_keep_alive;
-    conn.keep_alive = keep_alive;
+    const bool keep_alive = !suppress_body && conn.keep_alive && conn.req_client_keep_alive;
     if (!put_lit(keep_alive ? "keep-alive\r\n\r\n" : "close\r\n\r\n") ||
-        !put(reinterpret_cast<const u8*>(policy.body.ptr), policy.body.len))
+        (!suppress_body && !put(reinterpret_cast<const u8*>(policy.body.ptr), policy.body.len)))
         return false;
+    *out_len = pos;
     return true;
 }
 
@@ -5594,9 +5715,34 @@ inline void respond_upstream_connect_failure(Loop* loop, Connection& conn) {
     release_upstream_slot(loop, conn);
 
     bool serialized = false;
-    if (conn.failure_policy_id != 0 && conn.request_config != nullptr)
-        serialized = build_failure_policy_response(conn, *conn.request_config);
+    if (conn.failure_policy_id != 0 && conn.request_config != nullptr) {
+        // Build off-buffer so a capacity/date failure cannot publish a partial
+        // policy response or accidentally fall through to the legacy body.
+        u8 scratch[SlicePool::kSliceSize];
+        u32 serialized_len = 0;
+        if (build_failure_policy_response(conn,
+                                          *conn.request_config,
+                                          conn.failure_policy_suppress_body,
+                                          scratch,
+                                          sizeof(scratch),
+                                          &serialized_len) &&
+            serialized_len <= conn.send_buf.capacity()) {
+            conn.send_buf.reset();
+            serialized = conn.send_buf.write(scratch, serialized_len) == serialized_len;
+        }
+        if (serialized) {
+            conn.keep_alive = !conn.failure_policy_suppress_body && conn.keep_alive &&
+                              conn.req_client_keep_alive;
+            if (conn.failure_policy_suppress_body) conn.keep_alive = false;
+        }
+    }
     if (!serialized) {
+        // A selected policy is never silently approximated by the legacy
+        // 11-byte response.  The fallback remains for policy-free Forward.
+        if (conn.failure_policy_id != 0) {
+            loop->close_conn(conn);
+            return;
+        }
         static constexpr char k502[] =
             "HTTP/1.1 502 Bad Gateway\r\n"
             "Content-Length: 11\r\n"
