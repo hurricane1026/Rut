@@ -84,6 +84,7 @@ struct IoUringBackend {
         u32 offset;
         u32 remaining;
         IoEventType type;
+        u32 upstream_episode;
     };
     SendState send_state[kMaxSendState];
     SendState upstream_send_state[kMaxSendState];
@@ -111,25 +112,33 @@ struct IoUringBackend {
 
     // Same as add_recv but encodes UpstreamRecv in user_data so dispatch
     // can distinguish upstream vs client recv CQEs.
-    bool add_recv_upstream(i32 fd, u32 conn_id);
+    bool add_recv_upstream(i32 fd, u32 conn_id, u32 upstream_episode = 1);
 
     // Pause downstream recv while a send wait is pending.
     // Uses a silent cancel CQE so the event loop does not have to special-case it.
     bool pause_recv(i32 fd, u32 conn_id);
     // Cancel the multishot upstream recv by user_data (recv-only). The cancel's own
     // completion is tagged kPauseCancelAux so dispatch re-arms only once it drains.
-    bool pause_upstream_recv(i32 fd, u32 conn_id);
+    bool pause_upstream_recv(i32 fd, u32 conn_id, u32 upstream_episode = 1);
 
     // Submit a send (or zero-copy send).
     // Returns false if SQ is full (no SQE submitted).
     bool add_send(i32 fd, u32 conn_id, const u8* buf, u32 len);
 
     // Same as add_send but encodes UpstreamSend in user_data.
-    bool add_send_upstream(i32 fd, u32 conn_id, const u8* buf, u32 len);
+    bool add_send_upstream(i32 fd,
+                           u32 conn_id,
+                           const u8* buf,
+                           u32 len,
+                           u32 upstream_episode = 1);
 
     // Submit a connect to upstream.
     // Returns false if SQ is full (no SQE submitted).
-    bool add_connect(i32 fd, u32 conn_id, const void* addr, u32 addr_len);
+    bool add_connect(i32 fd,
+                     u32 conn_id,
+                     const void* addr,
+                     u32 addr_len,
+                     u32 upstream_episode = 1);
 
     // Submit IORING_OP_TIMEOUT for a JIT handler yield. ms granularity —
     // the timespec storage lives on the Connection because the kernel
@@ -149,6 +158,7 @@ struct IoUringBackend {
                bool upstream_recv_armed,
                bool upstream_send_armed,
                bool has_upstream,
+               u32 upstream_episode = 1,
                bool yield_armed = false,
                u32 yield_timer_gen = 0);
 
@@ -181,15 +191,28 @@ private:
     // typed submit/cancel helpers.
     static u64 encode_user_data(u32 conn_id, IoEventType type);
     static u64 encode_user_data(u32 conn_id, IoEventType type, u32 aux);
+    static u64 encode_upstream_user_data(u32 conn_id,
+                                         IoEventType type,
+                                         u32 upstream_episode,
+                                         u8 aux = 0);
     static void decode_user_data(u64 data, u32& conn_id, IoEventType& type);
     static void decode_user_data(u64 data, u32& conn_id, IoEventType& type, u32& aux);
+    static void decode_user_data(u64 data,
+                                 u32& conn_id,
+                                 IoEventType& type,
+                                 u32& aux,
+                                 u32& upstream_episode);
 
 private:
     // Submit a cancel SQE matching a specific user_data value.
     // conn_id/type/aux are encoded in the cancel CQE's user_data. Pass the real
     // conn_id for tracked close-path cancels, or kCancelConnId for fire-and-
     // forget cancels that should be consumed silently.
-    bool cancel_by_user_data(u64 target, u32 conn_id, IoEventType type, u32 aux = 0);
+    bool cancel_by_user_data(u64 target,
+                             u32 conn_id,
+                             IoEventType type,
+                             u32 aux = 0,
+                             u32 upstream_episode = 0);
 
     // Get next available SQE. Returns nullptr if SQ is full.
     io_uring_sqe* get_sqe();

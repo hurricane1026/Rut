@@ -29,8 +29,9 @@ static_assert(static_cast<u8>(IoEventType::Count) == 8u,
 // [63:56] aux (8 bits) | [55:32] upstream episode (24 bits) |
 // [31:8] conn_id (24 bits) | [7:0] event type.
 // Non-upstream events retain the existing [63:32] full generation field. These
-// helpers are pure and deliberately unused by the transport in this foundation
-// slice. Episode zero is reserved; a future counter wraps max -> 1.
+// helpers are used by the io_uring upstream transport; epoll and non-upstream
+// events remain on the legacy representation. Episode zero is reserved; a
+// future counter wraps max -> 1.
 inline constexpr u32 kIoUserDataMaxConnId = 0x00FFFFFFu;
 inline constexpr u32 kIoUserDataMaxUpstreamEpisode = 0x00FFFFFFu;
 inline constexpr u64 kInvalidIoUserData = ~static_cast<u64>(0);
@@ -120,7 +121,12 @@ struct IoEvent {
     u8 more;     // non-zero if the SQE will produce more CQEs (multishot recv)
     u8 aux = 0;  // decoded user_data aux tag; kPauseCancelAux marks a pause cancel's
                  // own completion (distinct from the recv CQE it cancels)
-    u32 upstream_episode = 0;  // neutral until backend episode propagation is enabled
+    u32 upstream_episode = 0;  // neutral for non-upstream/legacy backend events
 };
+
+inline constexpr bool io_event_is_tagged_stale(const IoEvent& event, u32 current_episode) {
+    return io_event_is_upstream(event.type) && event.upstream_episode != 0 &&
+           event.upstream_episode != current_episode;
+}
 
 }  // namespace rut

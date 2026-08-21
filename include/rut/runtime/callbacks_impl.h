@@ -1295,7 +1295,8 @@ void on_header_received(void* lp, Connection& conn, IoEvent ev) {
                 on_upstream_connected<Loop>(
                     static_cast<void*>(loop),
                     conn,
-                    IoEvent{conn.id, 0, 0, 0, IoEventType::UpstreamConnect, 0});
+                    IoEvent{conn.id, 0, 0, 0, IoEventType::UpstreamConnect, 0, 0,
+                            conn.upstream_episode});
                 return;
             }
         }
@@ -2549,7 +2550,8 @@ void handle_jit_outcome(Loop* loop,
                     on_upstream_connected<Loop>(
                         static_cast<void*>(loop),
                         conn,
-                        IoEvent{conn.id, 0, 0, 0, IoEventType::UpstreamConnect, 0});
+                        IoEvent{conn.id, 0, 0, 0, IoEventType::UpstreamConnect, 0, 0,
+                                conn.upstream_episode});
                     return;
                 }
             }

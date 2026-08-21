@@ -700,7 +700,7 @@ public:
     }
 
     bool submit_connect_impl(Connection& c, const void* addr, u32 addr_len) {
-        if (backend.add_connect(c.upstream_fd, c.id, addr, addr_len)) {
+        if (backend.add_connect(c.upstream_fd, c.id, addr, addr_len, c.upstream_episode)) {
             c.pending_ops++;
             return true;
         }
@@ -708,7 +708,7 @@ public:
     }
 
     bool submit_send_upstream_impl(Connection& c, const u8* buf, u32 len) {
-        if (backend.add_send_upstream(c.upstream_fd, c.id, buf, len)) {
+        if (backend.add_send_upstream(c.upstream_fd, c.id, buf, len, c.upstream_episode)) {
             c.pending_ops++;
             c.upstream_send_armed = true;
             return true;
@@ -742,7 +742,7 @@ public:
             c.upstream_recv_pause_rearm_pending = true;
             return true;
         }
-        if (backend.add_recv_upstream(c.upstream_fd, c.id)) {
+        if (backend.add_recv_upstream(c.upstream_fd, c.id, c.upstream_episode)) {
             c.pending_ops++;
             c.upstream_recv_armed = true;
             c.upstream_recv_pause_rearm_pending = false;
@@ -769,7 +769,7 @@ public:
         // re-arms the recv (see try_deferred_upstream_rearm): the recv is re-armed only
         // after the cancel drains, so the in-flight cancel can never match a freshly-
         // armed recv on the reused conn_id, and the slot can't be reclaimed until then.
-        if (!backend.pause_upstream_recv(c.upstream_fd, c.id)) return false;
+        if (!backend.pause_upstream_recv(c.upstream_fd, c.id, c.upstream_episode)) return false;
         c.upstream_recv_pause_cancel_pending = true;
         // The armed recv will now produce a terminal CQE (-ECANCELED, or a normal
         // completion that beat the cancel). Track it independently of upstream_recv_armed
@@ -887,6 +887,7 @@ public:
                                             cancel_upstream_recv,
                                             c.upstream_send_armed,
                                             c.upstream_fd >= 0,
+                                            c.upstream_episode,
                                             c.yield_timeout_armed,
                                             c.yield_timer_gen);
         }
@@ -1165,6 +1166,18 @@ public:
             case IoEventType::UpstreamSend:
                 if (ev.conn_id < kMaxConns) {
                     auto& conn = conns[ev.conn_id];
+                    const bool stale_tagged_upstream =
+                        io_event_is_tagged_stale(ev, conn.upstream_episode);
+                    if (stale_tagged_upstream) {
+                        // The backend has already returned any provided buffer.
+                        // Retire only this completion's lifetime accounting; do
+                        // not touch current callbacks, armed flags, timers, or
+                        // handler state.
+                        if (!ev.more && conn.pending_ops > 0) conn.pending_ops--;
+                        if (conn.fd < 0 && conn.pending_ops == 0)
+                            reclaim_slot(conn.id);
+                        break;
+                    }
                     // Send-wait recv pause: pause_recv() cancels the multishot
                     // recv before a non-empty wait(downstream.send()). Only the
                     // terminal -ECANCELED CQE is special-cased here (flag reset

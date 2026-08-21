@@ -15165,6 +15165,159 @@ TEST(state_invariant, upstream_episode_wraps_and_survives_connection_reset) {
     CHECK_EQ(conn.fd, -1);
 }
 
+TEST(iouring_episode, upstream_submissions_carry_episode_and_aux) {
+    IoUringBackend backend{};
+    auto initialized = backend.init(0, -1);
+    if (!initialized) SKIP("io_uring unavailable");
+
+    const u32 first_tail = __atomic_load_n(backend.sq_tail, __ATOMIC_ACQUIRE);
+    constexpr u32 kConnId = 3;
+    constexpr u32 kEpisode = 0x00123456u;
+    static const u8 payload[] = {'x', 'y', 'z'};
+
+    CHECK(backend.add_connect(-1, kConnId, nullptr, 0, kEpisode));
+    CHECK(backend.add_send_upstream(-1, kConnId, payload, sizeof(payload), kEpisode));
+    CHECK(backend.add_recv_upstream(-1, kConnId, kEpisode));
+    CHECK(backend.pause_upstream_recv(42, kConnId, kEpisode));
+    CHECK_EQ(backend.upstream_send_state[kConnId].upstream_episode, kEpisode);
+
+    // The SQE immediately before first_tail is the non-upstream timer read
+    // installed by init(). It must retain the legacy full-width encoding.
+    u32 decoded_conn = 0;
+    IoEventType decoded_type = IoEventType::Count;
+    u32 decoded_aux = 0;
+    u32 decoded_episode = 0;
+    IoUringBackend::decode_user_data(
+        backend.sq_entries[(first_tail - 1) & *backend.sq_ring_mask].user_data,
+                                     decoded_conn,
+                                     decoded_type,
+                                     decoded_aux,
+                                     decoded_episode);
+    CHECK_EQ(decoded_type, IoEventType::Timeout);
+    CHECK_EQ(decoded_episode, 0u);
+
+    const u32 sq_mask = *backend.sq_ring_mask;
+    const u64 expected[] = {
+        backend.sq_entries[(first_tail + 0) & sq_mask].user_data,
+        backend.sq_entries[(first_tail + 1) & sq_mask].user_data,
+        backend.sq_entries[(first_tail + 2) & sq_mask].user_data,
+        backend.sq_entries[(first_tail + 3) & sq_mask].user_data,
+    };
+    const u8 expected_aux[] = {0, 0, 0, kPauseCancelAux};
+    const IoEventType expected_type[] = {IoEventType::UpstreamConnect,
+                                         IoEventType::UpstreamSend,
+                                         IoEventType::UpstreamRecv,
+                                         IoEventType::UpstreamRecv};
+    for (u32 i = 0; i < 4; i++) {
+        decoded_conn = 0;
+        decoded_type = IoEventType::Count;
+        decoded_aux = 0;
+        decoded_episode = 0;
+        IoUringBackend::decode_user_data(
+            expected[i], decoded_conn, decoded_type, decoded_aux, decoded_episode);
+        CHECK_EQ(decoded_conn, kConnId);
+        CHECK_EQ(decoded_type, expected_type[i]);
+        CHECK_EQ(decoded_aux, static_cast<u32>(expected_aux[i]));
+        CHECK_EQ(decoded_episode, kEpisode);
+    }
+    backend.shutdown();
+}
+
+TEST(iouring_episode, stale_provided_recv_returns_buffer_without_copy) {
+    IoUringBackend backend{};
+    auto initialized = backend.init(0, -1);
+    if (!initialized) SKIP("io_uring unavailable");
+
+    i32 fds[2] = {-1, -1};
+    if (socketpair(AF_UNIX, SOCK_STREAM, 0, fds) != 0) {
+        backend.shutdown();
+        SKIP("socketpair unavailable");
+    }
+    Connection conns[1]{};
+    conns[0].reset();
+    conns[0].id = 0;
+    conns[0].upstream_episode = 2;
+    u8 storage[64];
+    for (u8& byte : storage) byte = 0xA5;
+    conns[0].upstream_recv_buf.bind(storage, sizeof(storage));
+
+    CHECK(backend.add_recv_upstream(fds[0], 0, 1));  // deliberately stale
+    static const char stale_bytes[] = "stale";
+    CHECK_EQ(write(fds[1], stale_bytes, sizeof(stale_bytes) - 1),
+             static_cast<ssize_t>(sizeof(stale_bytes) - 1));
+
+    IoEvent events[8]{};
+    bool found = false;
+    IoEvent stale_event{};
+    for (u32 attempt = 0; attempt < 3 && !found; attempt++) {
+        const u32 count = backend.wait(events, 8, conns, 1);
+        for (u32 i = 0; i < count; i++) {
+            if (events[i].type == IoEventType::UpstreamRecv && events[i].result > 0) {
+                stale_event = events[i];
+                found = true;
+                break;
+            }
+        }
+    }
+    CHECK(found);
+    if (found) {
+        CHECK_EQ(stale_event.upstream_episode, 1u);
+        CHECK_EQ(conns[0].upstream_recv_buf.len(), 0u);
+        for (const u8 byte : storage) CHECK_EQ(byte, static_cast<u8>(0xA5));
+    }
+
+    close(fds[0]);
+    close(fds[1]);
+    backend.shutdown();
+}
+
+TEST(iouring_episode, stale_dispatch_preserves_current_upstream_state) {
+    void* storage = mmap(nullptr,
+                         sizeof(IoUringEventLoop),
+                         PROT_READ | PROT_WRITE,
+                         MAP_PRIVATE | MAP_ANONYMOUS,
+                         -1,
+                         0);
+    if (storage == MAP_FAILED) SKIP("io_uring loop allocation unavailable");
+    auto* loop = new (storage) IoUringEventLoop();
+    auto initialized = loop->init(0, -1);
+    if (!initialized) {
+        loop->~IoUringEventLoop();
+        munmap(storage, sizeof(IoUringEventLoop));
+        SKIP("io_uring unavailable");
+    }
+    auto* conn = loop->alloc_conn();
+    if (conn == nullptr) {
+        loop->shutdown();
+        loop->~IoUringEventLoop();
+        munmap(storage, sizeof(IoUringEventLoop));
+        SKIP("io_uring connection allocation unavailable");
+    }
+    conn->upstream_episode = 2;
+    conn->upstream_recv_armed = true;
+    conn->upstream_send_armed = true;
+    conn->pending_ops = 3;
+    conn->fd = -1;
+    conn->upstream_fd = -1;
+    conn->on_upstream_recv = &on_response_body_recvd<IoUringEventLoop>;
+
+    const IoEvent stale{conn->id, 7, 0, 0, IoEventType::UpstreamRecv, 0, 0, 1};
+    loop->dispatch(stale);
+    CHECK(conn->upstream_recv_armed);
+    CHECK(conn->upstream_send_armed);
+    CHECK_EQ(conn->pending_ops, 2u);
+    CHECK_EQ(conn->on_upstream_recv, &on_response_body_recvd<IoUringEventLoop>);
+
+    conn->upstream_recv_armed = false;
+    conn->upstream_send_armed = false;
+    conn->pending_ops = 0;
+    conn->on_upstream_recv = nullptr;
+    loop->free_conn(*conn);
+    loop->shutdown();
+    loop->~IoUringEventLoop();
+    munmap(storage, sizeof(IoUringEventLoop));
+}
+
 TEST(state_invariant, stale_handler_timer_keeps_active_yield_armed) {
     AsyncSmallLoop loop;
     loop.setup();

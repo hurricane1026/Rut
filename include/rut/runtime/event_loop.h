@@ -106,6 +106,7 @@ public:
     // Called from each concrete EventLoop's dispatch() after timer refresh.
     // Centralizes all "unexpected event" handling in one place.
     void dispatch_event(Connection& conn, const IoEvent& ev) {
+        if (io_event_is_tagged_stale(ev, conn.upstream_episode)) return;
         switch (ev.type) {
             case IoEventType::Recv:
                 if (conn.on_recv) {
@@ -843,14 +844,48 @@ public:
         return false;
     }
     bool submit_connect_impl(Connection& c, const void* addr, u32 addr_len) {
-        if (backend.add_connect(c.upstream_fd, c.id, addr, addr_len)) {
+        const bool submitted = [&] {
+            if constexpr (requires {
+                              backend.add_connect(c.upstream_fd,
+                                                   c.id,
+                                                   addr,
+                                                   addr_len,
+                                                   c.upstream_episode);
+                          }) {
+                return backend.add_connect(c.upstream_fd,
+                                           c.id,
+                                           addr,
+                                           addr_len,
+                                           c.upstream_episode);
+            } else {
+                return backend.add_connect(c.upstream_fd, c.id, addr, addr_len);
+            }
+        }();
+        if (submitted) {
             if constexpr (Backend::kAsyncIo) c.pending_ops++;
             return true;
         }
         return false;
     }
     bool submit_send_upstream_impl(Connection& c, const u8* buf, u32 len) {
-        if (backend.add_send_upstream(c.upstream_fd, c.id, buf, len)) {
+        const bool submitted = [&] {
+            if constexpr (requires {
+                              backend.add_send_upstream(c.upstream_fd,
+                                                        c.id,
+                                                        buf,
+                                                        len,
+                                                        c.upstream_episode);
+                          }) {
+                return backend.add_send_upstream(c.upstream_fd,
+                                                 c.id,
+                                                 buf,
+                                                 len,
+                                                 c.upstream_episode);
+            } else {
+                return backend.add_send_upstream(c.upstream_fd, c.id, buf, len);
+            }
+        }();
+        if (submitted) {
             if constexpr (Backend::kAsyncIo) {
                 c.pending_ops++;
                 c.upstream_send_armed = true;
@@ -860,7 +895,13 @@ public:
         return false;
     }
     void pause_upstream_recv_impl(Connection& c) {
-        if constexpr (requires { backend.pause_upstream_recv(c.id); }) {
+        if constexpr (requires {
+                          backend.pause_upstream_recv(c.upstream_fd,
+                                                      c.id,
+                                                      c.upstream_episode);
+                      }) {
+            backend.pause_upstream_recv(c.upstream_fd, c.id, c.upstream_episode);
+        } else if constexpr (requires { backend.pause_upstream_recv(c.id); }) {
             backend.pause_upstream_recv(c.id);
         }
         if constexpr (Backend::kAsyncIo) c.upstream_recv_armed = false;
@@ -869,7 +910,18 @@ public:
         if constexpr (Backend::kAsyncIo) {
             if (c.upstream_recv_armed) return true;
         }
-        if (backend.add_recv_upstream(c.upstream_fd, c.id)) {
+        const bool submitted = [&] {
+            if constexpr (requires {
+                              backend.add_recv_upstream(c.upstream_fd,
+                                                        c.id,
+                                                        c.upstream_episode);
+                          }) {
+                return backend.add_recv_upstream(c.upstream_fd, c.id, c.upstream_episode);
+            } else {
+                return backend.add_recv_upstream(c.upstream_fd, c.id);
+            }
+        }();
+        if (submitted) {
             if constexpr (Backend::kAsyncIo) {
                 c.pending_ops++;
                 c.upstream_recv_armed = true;
@@ -899,13 +951,36 @@ public:
             // Add cancel count to pending_ops so the slot isn't reclaimed
             // until all cancel CQEs have been processed.
             if (c.pending_ops > 0) {
-                c.pending_ops += backend.cancel(c.fd,
-                                                c.id,
-                                                c.recv_armed,
-                                                c.send_armed,
-                                                c.upstream_recv_armed,
-                                                c.upstream_send_armed,
-                                                c.upstream_fd >= 0);
+                const u32 cancelled = [&] {
+                    if constexpr (requires {
+                                      backend.cancel(c.fd,
+                                                     c.id,
+                                                     c.recv_armed,
+                                                     c.send_armed,
+                                                     c.upstream_recv_armed,
+                                                     c.upstream_send_armed,
+                                                     c.upstream_fd >= 0,
+                                                     c.upstream_episode);
+                                  }) {
+                        return backend.cancel(c.fd,
+                                              c.id,
+                                              c.recv_armed,
+                                              c.send_armed,
+                                              c.upstream_recv_armed,
+                                              c.upstream_send_armed,
+                                              c.upstream_fd >= 0,
+                                              c.upstream_episode);
+                    } else {
+                        return backend.cancel(c.fd,
+                                              c.id,
+                                              c.recv_armed,
+                                              c.send_armed,
+                                              c.upstream_recv_armed,
+                                              c.upstream_send_armed,
+                                              c.upstream_fd >= 0);
+                    }
+                }();
+                c.pending_ops += cancelled;
             }
         }
         if (c.fd >= 0) {
@@ -991,6 +1066,8 @@ public:
             case IoEventType::HandlerTimer:
                 if (ev.conn_id < kMaxConns) {
                     auto& conn = conns[ev.conn_id];
+                    const bool stale_tagged_upstream =
+                        io_event_is_tagged_stale(ev, conn.upstream_episode);
                     if constexpr (Backend::kAsyncIo) {
                         // Decrement pending_ops only on the final CQE for this op.
                         // Multishot recv (IORING_RECV_MULTISHOT) sets ev.more on
@@ -1002,14 +1079,15 @@ public:
                             // event type (not state) to distinguish client vs upstream.
                             if (ev.type == IoEventType::Recv) conn.recv_armed = false;
                             if (ev.type == IoEventType::Send) conn.send_armed = false;
-                            if (ev.type == IoEventType::UpstreamSend)
+                            if (ev.type == IoEventType::UpstreamSend && !stale_tagged_upstream)
                                 conn.upstream_send_armed = false;
-                            if (ev.type == IoEventType::UpstreamRecv)
+                            if (ev.type == IoEventType::UpstreamRecv && !stale_tagged_upstream)
                                 conn.upstream_recv_armed = false;
                         }
                     }
-                    if (conn.on_recv || conn.on_send || conn.on_upstream_recv ||
-                        conn.on_upstream_send) {
+                    if (!stale_tagged_upstream &&
+                        (conn.on_recv || conn.on_send || conn.on_upstream_recv ||
+                         conn.on_upstream_send)) {
                         // See EpollEventLoop: don't let stray events bump a
                         // @throttle-paused connection's byte-rate-window timer back
                         // to the keepalive timeout.
