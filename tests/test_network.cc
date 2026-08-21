@@ -802,6 +802,82 @@ TEST(response_policy, suppress_body_abandon_is_idempotent_and_ignores_late_event
     CHECK_FALSE(loop.conns[conn->id].upstream_slot_held);
 }
 
+TEST(response_policy, paired_reusable_head_post_connect_failures_close_before_bytes) {
+    SmallLoop loop;
+    loop.setup();
+    RouteConfig cfg{};
+    REQUIRE(cfg.add_upstream("backend", 0x7F000001, 8080).has_value());
+    ForwardResponsePolicySpec response{};
+    response.version = ResponsePolicyVersion::Http11;
+    response.framing = ResponsePolicyFraming::ContentLength;
+    response.connection = ResponsePolicyConnection::Request;
+    response.date = ResponsePolicyDate::Current;
+    response.head_mode = ResponsePolicyHeadMode::SuppressBody;
+    response.server = {"nginx", 5};
+    REQUIRE_EQ(cfg.add_response_policy(response), 1u);
+    ForwardFailurePolicySpec failure{};
+    failure.version = ForwardFailurePolicyVersion::Http11;
+    failure.status_code = 502;
+    failure.date = ForwardFailurePolicyDate::Current;
+    failure.connection = ForwardFailurePolicyConnection::Request;
+    failure.head_mode = FailurePolicyHeadMode::SuppressBody;
+    failure.reason = {"Bad Gateway", 11};
+    failure.content_type = {"text/plain", 10};
+    failure.server = {"nginx", 5};
+    failure.body = {"bad", 3};
+    REQUIRE_EQ(cfg.add_failure_policy(failure), 1u);
+
+    struct Vector {
+        const char* wire;
+        i32 result;
+        bool upload_complete;
+    } vectors[] = {
+        {"not-http\r\n\r\n", 12, true},
+        {"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n", 0, true},
+        {"HTTP/1.1 200 OK\r\nContent-Length: 1\r\n\r\nxx", 41, true},
+        {"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok", 40, false},
+    };
+    for (const auto& vector : vectors) {
+        auto* conn = loop.alloc_conn();
+        REQUIRE(conn != nullptr);
+        conn->fd = dup(STDERR_FILENO);
+        conn->upstream_fd = dup(STDERR_FILENO);
+        REQUIRE_GE(conn->fd, 0);
+        REQUIRE_GE(conn->upstream_fd, 0);
+        REQUIRE(loop.alloc_upstream_buf(*conn));
+        REQUIRE(loop.alloc_response_header_buf(*conn));
+        static constexpr char kRequest[] =
+            "HEAD /head HTTP/1.1\r\nHost: client.example\r\n\r\n";
+        REQUIRE_EQ(conn->recv_buf.write(reinterpret_cast<const u8*>(kRequest),
+                                        sizeof(kRequest) - 1),
+                   sizeof(kRequest) - 1);
+        capture_request_metadata(*conn);
+        conn->request_config = &cfg;
+        conn->response_policy_id = 1;
+        conn->response_policy_suppress_body = true;
+        conn->failure_policy_id = 1;
+        conn->failure_policy_suppress_body = true;
+        conn->request_upload_complete = vector.upload_complete;
+        conn->keep_alive = true;
+        conn->state = ConnState::Proxying;
+        conn->set_slots(nullptr, nullptr, &on_upstream_response<SmallLoop>, nullptr);
+        const u32 wire_len = static_cast<u32>(strlen(vector.wire));
+        REQUIRE_EQ(conn->upstream_recv_buf.write(
+                       reinterpret_cast<const u8*>(vector.wire), wire_len),
+                   wire_len);
+        loop.backend.clear_ops();
+
+        on_upstream_response<SmallLoop>(
+            &loop,
+            *conn,
+            {conn->id, vector.result, 0, 0, IoEventType::UpstreamRecv, 0});
+
+        CHECK_EQ(loop.backend.count_ops(MockOp::Send), 0u);
+        CHECK_EQ(conn->fd, -1);
+        CHECK_EQ(conn->upstream_fd, -1);
+    }
+}
+
 TEST(response_policy, head_mode_config_copy_is_owned_and_atomic) {
     char server[] = "server";
     char hidden[] = "Date";
@@ -1182,7 +1258,9 @@ TEST(response_policy, paired_suppress_head_rejects_mismatch_and_invalid_original
          false,
          false},
         {"HEAD /head HTTP/1.1\r\nHost: a:0\r\nConnection: close\r\n\r\n", false, false},
-        {"HEAD /head HTTP/1.1\r\nHost: a\r\n\r\n", false, false},
+        {"HEAD /head HTTP/1.1\r\nHost: a\r\nConnection: keep-alive\r\n\r\n",
+         false,
+         false},
         {"HEAD /head HTTP/1.1\r\nHost: a\r\nConnection: close, keep-alive\r\n\r\n",
          false,
          false},
@@ -1238,8 +1316,8 @@ TEST(response_policy, paired_suppress_head_rejects_mismatch_and_invalid_original
         loop.free_conn(*conn);
     }
 
-    // A matching pair is still restricted to the explicit-close HEAD domain;
-    // mode equality alone must not admit a GET.
+    // A matching pair remains restricted to HEAD; mode equality alone must
+    // not admit a GET.
     auto* non_head = loop.alloc_conn();
     REQUIRE(non_head != nullptr);
     static constexpr char kGet[] =
@@ -1261,6 +1339,70 @@ TEST(response_policy, paired_suppress_head_rejects_mismatch_and_invalid_original
     CHECK_EQ(loop.backend.count_ops(MockOp::Connect), 0u);
     CHECK_FALSE(non_head->upstream_slot_held);
     loop.free_conn(*non_head);
+}
+
+TEST(response_policy, paired_suppress_head_admits_only_default_keepalive_or_exact_close) {
+    SmallLoop loop;
+    loop.setup();
+    RouteConfig cfg{};
+    REQUIRE(cfg.add_upstream("backend", 0x7F000001, 8080).has_value());
+    ForwardResponsePolicySpec response{};
+    response.version = ResponsePolicyVersion::Http11;
+    response.framing = ResponsePolicyFraming::ContentLength;
+    response.connection = ResponsePolicyConnection::Request;
+    response.date = ResponsePolicyDate::Current;
+    response.head_mode = ResponsePolicyHeadMode::SuppressBody;
+    response.server = {"nginx", 5};
+    REQUIRE_EQ(cfg.add_response_policy(response), 1u);
+    ForwardFailurePolicySpec failure{};
+    failure.version = ForwardFailurePolicyVersion::Http11;
+    failure.status_code = 502;
+    failure.date = ForwardFailurePolicyDate::Current;
+    failure.connection = ForwardFailurePolicyConnection::Request;
+    failure.head_mode = FailurePolicyHeadMode::SuppressBody;
+    failure.reason = {"Bad Gateway", 11};
+    failure.content_type = {"text/plain", 10};
+    failure.server = {"nginx", 5};
+    failure.body = {"bad", 3};
+    REQUIRE_EQ(cfg.add_failure_policy(failure), 1u);
+
+    struct Vector {
+        const char* request;
+        bool keep_alive;
+        u8 connection_count;
+        bool exact_close;
+    } vectors[] = {
+        {"HEAD /head HTTP/1.1\r\nHost: a\r\n\r\n", true, 0, false},
+        {"HEAD /head HTTP/1.1\r\nHost: a\r\nConnection: ClOsE\r\n\r\n",
+         false,
+         1,
+         true},
+    };
+    for (const auto& vector : vectors) {
+        auto* conn = loop.alloc_conn();
+        REQUIRE(conn != nullptr);
+        const u32 len = static_cast<u32>(strlen(vector.request));
+        REQUIRE_EQ(conn->recv_buf.write(reinterpret_cast<const u8*>(vector.request), len), len);
+        capture_request_metadata(*conn);
+        conn->request_config = &cfg;
+        conn->keep_alive = true;
+        JitDispatchOutcome outcome{};
+        outcome.kind = JitDispatchOutcome::Kind::Forward;
+        outcome.upstream_id = 0;
+        outcome.response_policy_id = 1;
+        outcome.failure_policy_id = 1;
+        loop.backend.clear_ops();
+
+        handle_jit_outcome<SmallLoop>(&loop, *conn, outcome, nullptr, true);
+
+        CHECK_EQ(loop.backend.count_ops(MockOp::Connect), 1u);
+        CHECK_EQ(loop.backend.count_ops(MockOp::Send), 0u);
+        CHECK(conn->failure_policy_suppress_body);
+        CHECK_EQ(conn->req_client_keep_alive, vector.keep_alive);
+        CHECK_EQ(conn->req_client_connection_count, vector.connection_count);
+        CHECK_EQ(conn->req_client_connection_close_exact, vector.exact_close);
+        loop.close_conn(*conn);
+    }
 }
 
 TEST(target_transform, h1_materializes_clean_origin_form_and_preserves_query) {
@@ -20535,6 +20677,57 @@ TEST(iouring_retirement, production_paired_head_success_retires_before_old_preco
     CHECK_EQ(concurrency.inflight[0].load(std::memory_order_relaxed), 0u);
 }
 
+TEST(iouring_retirement, paired_head_timeout_closes_before_bytes_and_drains_live_recv) {
+    ScopedIoUringLoopForRetirement guard;
+    if (!guard.init()) SKIP("io_uring unavailable");
+    auto* loop = guard.loop;
+    Connection* conn = loop->alloc_conn();
+    REQUIRE(conn != nullptr);
+    const u32 id = conn->id;
+    const u32 free_before = loop->free_top;
+    constexpr u32 kEpisode = 211;
+    conn->fd = dup(STDERR_FILENO);
+    conn->upstream_fd = dup(STDERR_FILENO);
+    REQUIRE_GE(conn->fd, 0);
+    REQUIRE_GE(conn->upstream_fd, 0);
+    conn->upstream_episode = kEpisode;
+    conn->failure_policy_suppress_body = true;
+    conn->state = ConnState::Proxying;
+    conn->upstream_recv_armed = true;
+    conn->pending_ops = 1;
+    conn->set_slots(nullptr, nullptr, &on_upstream_response<IoUringEventLoop>, nullptr);
+    const u32 sq_tail_before = __atomic_load_n(loop->backend.sq_tail, __ATOMIC_ACQUIRE);
+
+    respond_upstream_timeout(loop, *conn);
+
+    Connection& closed = loop->conns[id];
+    CHECK_EQ(closed.fd, -1);
+    CHECK_EQ(closed.upstream_fd, -1);
+    CHECK_EQ(closed.send_buf.len(), 0u);
+    CHECK_EQ(closed.upstream_close_episode, kEpisode);
+    CHECK_EQ(closed.upstream_close_target_owned, kUpstreamOpRecv);
+    CHECK_EQ(closed.upstream_close_cancel_owned, kUpstreamOpRecv);
+    CHECK_EQ(closed.pending_ops, 2u);
+    CHECK_EQ(loop->pending_free_count, 1u);
+    CHECK_EQ(__atomic_load_n(loop->backend.sq_tail, __ATOMIC_ACQUIRE), sq_tail_before + 1u);
+
+    loop->dispatch(
+        {id, -ECANCELED, 0, 0, IoEventType::UpstreamRecv, 0, 0, kEpisode});
+    CHECK_EQ(closed.pending_ops, 1u);
+    CHECK_EQ(loop->free_top, free_before);
+    loop->dispatch({id,
+                    -ENOENT,
+                    0,
+                    0,
+                    IoEventType::UpstreamRecv,
+                    0,
+                    kUpstreamCloseCancelAux,
+                    kEpisode});
+    CHECK_EQ(closed.pending_ops, 0u);
+    CHECK_EQ(loop->pending_free_count, 0u);
+    CHECK_EQ(loop->free_top, free_before + 1u);
+}
+
 TEST(iouring_retirement, production_callbacks_compose_two_boundaries_before_request_three) {
     ScopedIoUringLoopForRetirement guard;
     if (!guard.init()) SKIP("io_uring unavailable");
@@ -20613,6 +20806,7 @@ TEST(iouring_retirement, production_callbacks_compose_two_boundaries_before_requ
     conn->response_policy_suppress_body = true;
     conn->failure_policy_id = 1;
     conn->failure_policy_suppress_body = true;
+    conn->request_upload_complete = true;
     conn->keep_alive = true;
     conn->recv_armed = true;
     conn->upstream_recv_armed = true;
@@ -20625,9 +20819,8 @@ TEST(iouring_retirement, production_callbacks_compose_two_boundaries_before_requ
     const u32 sq_tail_before = __atomic_load_n(loop->backend.sq_tail, __ATOMIC_ACQUIRE);
     const u32 backend_pending_before = loop->backend.pending;
 
-    // Test-seam admission is intentionally limited to this staged live callback:
-    // source/compiler/runtime route admission remains unchanged and still rejects
-    // reusable paired HEAD. Everything after admission is the production path.
+    // The request upload was staged as already complete above; from this live
+    // response CQE onward, exercise the production reusable paired boundary.
     loop->dispatch({id,
                     static_cast<i32>(sizeof(kOriginResponse) - 1),
                     0,
@@ -21930,12 +22123,12 @@ TEST(state_invariant, jit_forward_direct_paired_head_connect_submit_serializes_n
     REQUIRE(c != nullptr);
     c->request_config = &cfg;
     static constexpr char kRequest[] =
-        "HEAD /missing?q=1 HTTP/1.1\r\nHost: client.example\r\n"
-        "Connection: close\r\n\r\n";
+        "HEAD /missing?q=1 HTTP/1.1\r\nHost: client.example\r\n\r\n";
     REQUIRE_EQ(c->recv_buf.write(reinterpret_cast<const u8*>(kRequest), sizeof(kRequest) - 1),
                sizeof(kRequest) - 1);
     capture_request_metadata(*c);
     c->req_initial_send_len = c->recv_buf.len();
+    c->keep_alive = true;
 
     JitDispatchOutcome outcome{};
     outcome.kind = JitDispatchOutcome::Kind::Forward;
@@ -21975,9 +22168,10 @@ TEST(state_invariant, jit_forward_direct_paired_head_connect_submit_serializes_n
         "Date: XXXXXXXXXXXXXXXXXXXXXXXXXXXXX\r\n"
         "Content-Type: text/html\r\n"
         "Content-Length: 157\r\n"
-        "Connection: close\r\n\r\n";
+        "Connection: keep-alive\r\n\r\n";
     CHECK_EQ(send_len, static_cast<u32>(sizeof(kExpected) - 1));
     CHECK_EQ(memcmp(normalized, kExpected, sizeof(kExpected) - 1), 0);
+    CHECK(c->keep_alive);
     close(fds[1]);
     loop.close_conn(*c);
 }
@@ -22023,12 +22217,12 @@ TEST(state_invariant, jit_forward_direct_paired_head_negative_connect_is_idempot
     REQUIRE(c != nullptr);
     c->request_config = &cfg;
     static constexpr char kRequest[] =
-        "HEAD /missing?q=1 HTTP/1.1\r\nHost: client.example\r\n"
-        "Connection: close\r\n\r\n";
+        "HEAD /missing?q=1 HTTP/1.1\r\nHost: client.example\r\n\r\n";
     REQUIRE_EQ(c->recv_buf.write(reinterpret_cast<const u8*>(kRequest), sizeof(kRequest) - 1),
                sizeof(kRequest) - 1);
     capture_request_metadata(*c);
     c->req_initial_send_len = c->recv_buf.len();
+    c->keep_alive = true;
     JitDispatchOutcome outcome{};
     outcome.kind = JitDispatchOutcome::Kind::Forward;
     outcome.upstream_id = upstream.value();
@@ -22066,9 +22260,10 @@ TEST(state_invariant, jit_forward_direct_paired_head_negative_connect_is_idempot
         "Date: XXXXXXXXXXXXXXXXXXXXXXXXXXXXX\r\n"
         "Content-Type: text/html\r\n"
         "Content-Length: 157\r\n"
-        "Connection: close\r\n\r\n";
+        "Connection: keep-alive\r\n\r\n";
     CHECK_EQ(send_len, static_cast<u32>(sizeof(kExpected) - 1));
     CHECK_EQ(memcmp(normalized, kExpected, sizeof(kExpected) - 1), 0);
+    CHECK(c->keep_alive);
 
     const u32 sends_before_late = loop.backend.count_ops(MockOp::Send);
     const u32 slot_state = c->upstream_slot_held ? 1u : 0u;

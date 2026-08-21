@@ -16787,6 +16787,11 @@ struct RecordingUpstream {
     u32 request_history_header_len[kMaxRecordedRequests]{};
     const char* response = nullptr;
     u32 response_len = 0;
+    // Optional response used from the second accepted request onward. This
+    // lets one downstream keep-alive test prove that request boundaries do not
+    // replay request 1's representation metadata.
+    const char* response_after_first = nullptr;
+    u32 response_after_first_len = 0;
     // Optional deliberately segmented response wire vector. A non-zero size
     // forces boundaries through the status/header/body bytes instead of
     // treating one send() as a message boundary.
@@ -16871,8 +16876,12 @@ struct RecordingUpstream {
             s->request_count.fetch_add(1, std::memory_order_release);
             static const char kResponse[] =
                 "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok";
-            const char* out = s->response ? s->response : kResponse;
-            const u32 out_len = s->response ? s->response_len : sizeof(kResponse) - 1;
+            const bool use_later = history_slot > 0 && s->response_after_first != nullptr;
+            const char* out = use_later ? s->response_after_first
+                                        : (s->response ? s->response : kResponse);
+            const u32 out_len = use_later ? s->response_after_first_len
+                                          : (s->response ? s->response_len
+                                                         : sizeof(kResponse) - 1);
             if (s->response_split_offset > 0 && s->response_split_offset < out_len) {
                 (void)send_all(client, out, s->response_split_offset);
                 if (s->response_chunk_delay_us != 0) usleep(s->response_chunk_delay_us);
@@ -17075,6 +17084,32 @@ static bool read_public_close_response(i32 fd,
     if (header_end == 0 || length != header_end + expected_body_len) return false;
     char eof_buf[64];
     return recv_timeout(fd, eof_buf, sizeof(eof_buf), 3000) == 0;
+}
+
+static bool read_public_head_response(i32 fd,
+                                      bool expect_eof,
+                                      char* out,
+                                      u32 capacity,
+                                      u32& length) {
+    length = 0;
+    u32 header_end = 0;
+    for (u32 attempt = 0; attempt < 32 && length < capacity; attempt++) {
+        const i32 got = recv_timeout(fd, out + length, capacity - length, 3000);
+        if (got <= 0) return false;
+        length += static_cast<u32>(got);
+        for (u32 i = 0; i + 3 < length; i++) {
+            if (out[i] == '\r' && out[i + 1] == '\n' && out[i + 2] == '\r' &&
+                out[i + 3] == '\n') {
+                header_end = i + 4;
+                break;
+            }
+        }
+        if (header_end != 0) break;
+    }
+    if (header_end == 0 || length != header_end) return false;
+    char extra[64];
+    const i32 tail = recv_timeout(fd, extra, sizeof(extra), expect_eof ? 3000 : 100);
+    return expect_eof ? tail == 0 : tail == -EAGAIN;
 }
 
 static bool normalize_public_date(char* data, u32 length) {
@@ -20603,23 +20638,37 @@ TEST(route, public_paired_head_source_success_and_forward_wire) {
         "Server: origin\r\n"
         "Date: Tue, 01 Jan 2030 00:00:00 GMT\r\n"
         "Content-Length: 5\r\n\r\nhello";
-    static constexpr char kHeadExpected[] =
+    static constexpr char kLaterUpstreamResponse[] =
+        "HTTP/1.1 200 OK\r\n"
+        "Server: origin\r\n"
+        "Date: Tue, 01 Jan 2030 00:00:00 GMT\r\n"
+        "Content-Length: 7\r\n\r\ngoodbye";
+    static constexpr char kHeadKeepAliveExpected[] =
         "HTTP/1.1 200 OK\r\n"
         "Server: nginx/1.29.7\r\n"
         "Date: XXXXXXXXXXXXXXXXXXXXXXXXXXXXX\r\n"
         "Content-Length: 5\r\n"
+        "Connection: keep-alive\r\n\r\n";
+    static constexpr char kHeadCloseExpected[] =
+        "HTTP/1.1 200 OK\r\n"
+        "Server: nginx/1.29.7\r\n"
+        "Date: XXXXXXXXXXXXXXXXXXXXXXXXXXXXX\r\n"
+        "Content-Length: 7\r\n"
         "Connection: close\r\n\r\n";
     static constexpr char kGetExpected[] =
         "HTTP/1.1 200 OK\r\n"
         "Server: nginx/1.29.7\r\n"
         "Date: XXXXXXXXXXXXXXXXXXXXXXXXXXXXX\r\n"
-        "Content-Length: 5\r\n"
-        "Connection: close\r\n\r\nhello";
+        "Content-Length: 7\r\n"
+        "Connection: close\r\n\r\ngoodbye";
 
     RecordingUpstream backend;
     backend.response = kUpstreamResponse;
     backend.response_len = sizeof(kUpstreamResponse) - 1;
+    backend.response_after_first = kLaterUpstreamResponse;
+    backend.response_after_first_len = sizeof(kLaterUpstreamResponse) - 1;
     backend.response_chunk_size = 3;
+    backend.response_chunk_delay_us = 5000;
     backend.keep_open = true;
     REQUIRE(backend.setup());
     PublicPairedHeadSourceResources resources;
@@ -20686,11 +20735,20 @@ TEST(route, public_paired_head_source_success_and_forward_wire) {
             if (fd >= 0) close(fd);
         }
     };
-    auto run_request = [&](const char* method,
-                           const char* query,
-                           const char* expected,
-                           u32 expected_body_len,
-                           u32 expected_count) -> bool {
+    auto wait_backend_count = [&](u32 expected_count) {
+        for (u32 waited = 0;
+             waited < 600 &&
+             backend.request_count.load(std::memory_order_acquire) < expected_count;
+             waited++)
+            usleep(5000);
+        return backend.accepted_count.load(std::memory_order_acquire) == expected_count &&
+               backend.request_count.load(std::memory_order_acquire) == expected_count;
+    };
+    auto run_close_request = [&](const char* method,
+                                 const char* query,
+                                 const char* expected,
+                                 u32 expected_body_len,
+                                 u32 expected_count) -> bool {
         ClientGuard client{connect_to(resources.proxy.port)};
         if (client.fd < 0) return false;
         set_socket_timeouts(client.fd, 3);
@@ -20715,25 +20773,52 @@ TEST(route, public_paired_head_source_success_and_forward_wire) {
         if (response_len != static_cast<u32>(strlen(expected)) ||
             memcmp(response, expected, response_len) != 0)
             return false;
-        for (u32 waited = 0;
-             waited < 600 &&
-             backend.request_count.load(std::memory_order_acquire) < expected_count;
-             waited++)
-            usleep(5000);
-        return backend.accepted_count.load(std::memory_order_acquire) == expected_count &&
-               backend.request_count.load(std::memory_order_acquire) == expected_count;
+        return wait_backend_count(expected_count);
     };
 
-    REQUIRE(run_request("HEAD", "?q=1", kHeadExpected, 0, 1));
-    REQUIRE(run_request("HEAD", "?q=1", kHeadExpected, 0, 2));
-    REQUIRE(run_request("GET", "?q=2", kGetExpected, 5, 3));
+    ClientGuard head_client{connect_to(resources.proxy.port)};
+    REQUIRE_GE(head_client.fd, 0);
+    set_socket_timeouts(head_client.fd, 3);
+    static constexpr char kHead1[] =
+        "HEAD /head?q=1 HTTP/1.1\r\nHost: client.example\r\nX-Test: one\r\n\r\n";
+    static constexpr char kHead2[] =
+        "HEAD /head?q=2 HTTP/1.1\r\nHost: client.example\r\n"
+        "Connection: close\r\nX-Test: one\r\n\r\n";
+    REQUIRE(send_all(head_client.fd, kHead1, sizeof(kHead1) - 1));
+    char head_response[1024]{};
+    u32 head_response_len = 0;
+    REQUIRE(read_public_head_response(head_client.fd,
+                                      false,
+                                      head_response,
+                                      sizeof(head_response),
+                                      head_response_len));
+    REQUIRE(normalize_public_date(head_response, head_response_len));
+    REQUIRE_EQ(head_response_len, static_cast<u32>(strlen(kHeadKeepAliveExpected)));
+    CHECK_EQ(memcmp(head_response, kHeadKeepAliveExpected, head_response_len), 0);
+    REQUIRE(wait_backend_count(1));
+
+    REQUIRE(send_all(head_client.fd, kHead2, sizeof(kHead2) - 1));
+    memset(head_response, 0, sizeof(head_response));
+    REQUIRE(read_public_head_response(head_client.fd,
+                                      true,
+                                      head_response,
+                                      sizeof(head_response),
+                                      head_response_len));
+    REQUIRE(normalize_public_date(head_response, head_response_len));
+    REQUIRE_EQ(head_response_len, static_cast<u32>(strlen(kHeadCloseExpected)));
+    CHECK_EQ(memcmp(head_response, kHeadCloseExpected, head_response_len), 0);
+    REQUIRE(wait_backend_count(2));
+    close(head_client.fd);
+    head_client.fd = -1;
+
+    REQUIRE(run_close_request("GET", "?q=3", kGetExpected, 7, 3));
 
     resources.proxy.teardown();
     backend.teardown();
     REQUIRE_EQ(backend.accepted_count.load(std::memory_order_acquire), 3u);
     REQUIRE_EQ(backend.request_count.load(std::memory_order_acquire), 3u);
     const char* methods[] = {"HEAD", "HEAD", "GET"};
-    const char* queries[] = {"?q=1", "?q=1", "?q=2"};
+    const char* queries[] = {"?q=1", "?q=2", "?q=3"};
     for (u32 i = 0; i < 3; i++) {
         char expected[256]{};
         const int expected_len = snprintf(expected,
@@ -20750,9 +20835,124 @@ TEST(route, public_paired_head_source_success_and_forward_wire) {
     }
 }
 
+TEST(route, public_paired_head_source_reuses_downstream_iouring) {
+    using namespace rut;
+    if (!iouring_socket_live()) SKIP("io_uring async socket ops unavailable in this environment");
+    static constexpr char kFirstOrigin[] =
+        "HTTP/1.1 200 OK\r\nServer: origin\r\n"
+        "Date: Tue, 01 Jan 2030 00:00:00 GMT\r\n"
+        "Content-Length: 5\r\n\r\nhello";
+    static constexpr char kSecondOrigin[] =
+        "HTTP/1.1 200 OK\r\nServer: origin\r\n"
+        "Date: Tue, 01 Jan 2030 00:00:00 GMT\r\n"
+        "Content-Length: 7\r\n\r\ngoodbye";
+    static constexpr char kFirstExpected[] =
+        "HTTP/1.1 200 OK\r\nServer: nginx/1.29.7\r\n"
+        "Date: XXXXXXXXXXXXXXXXXXXXXXXXXXXXX\r\nContent-Length: 5\r\n"
+        "Connection: keep-alive\r\n\r\n";
+    static constexpr char kSecondExpected[] =
+        "HTTP/1.1 200 OK\r\nServer: nginx/1.29.7\r\n"
+        "Date: XXXXXXXXXXXXXXXXXXXXXXXXXXXXX\r\nContent-Length: 7\r\n"
+        "Connection: close\r\n\r\n";
+
+    RecordingUpstream backend;
+    backend.response = kFirstOrigin;
+    backend.response_len = sizeof(kFirstOrigin) - 1;
+    backend.response_after_first = kSecondOrigin;
+    backend.response_after_first_len = sizeof(kSecondOrigin) - 1;
+    backend.response_chunk_size = 3;
+    backend.response_chunk_delay_us = 5000;
+    backend.keep_open = true;
+    REQUIRE(backend.setup());
+    PublicPairedHeadSourceResources resources;
+    REQUIRE(resources.compile(backend.port));
+
+    Shard<IoUringEventLoop> shard;
+    i32 listen_fd = create_listen_socket(0).value_or(-1);
+    REQUIRE_GE(listen_fd, 0);
+    struct ShardGuard {
+        Shard<IoUringEventLoop>& shard;
+        i32& listen_fd;
+        bool spawned = false;
+        ~ShardGuard() {
+            if (spawned) {
+                shard.stop();
+                shard.join();
+            }
+            shard.shutdown();
+            if (listen_fd >= 0) close(listen_fd);
+        }
+    } shard_guard{shard, listen_fd};
+    const u16 port = get_port(listen_fd);
+    REQUIRE(shard.init(0, listen_fd).has_value());
+    shard.route_config = &resources.cfg;
+    REQUIRE(shard.spawn(-1).has_value());
+    shard_guard.spawned = true;
+    usleep(50000);
+
+    struct ClientGuard {
+        i32 fd;
+        ~ClientGuard() {
+            if (fd >= 0) close(fd);
+        }
+    } client{connect_to(port)};
+    REQUIRE_GE(client.fd, 0);
+    set_socket_timeouts(client.fd, 3);
+    static constexpr char kRequest1[] =
+        "HEAD /head?first=1 HTTP/1.1\r\nHost: client.example\r\nX-Test: one\r\n\r\n";
+    static constexpr char kRequest2[] =
+        "HEAD /head?second=2 HTTP/1.1\r\nHost: client.example\r\n"
+        "Connection: close\r\nX-Test: two\r\n\r\n";
+    char response[1024]{};
+    u32 response_len = 0;
+    REQUIRE(send_all(client.fd, kRequest1, sizeof(kRequest1) - 1));
+    REQUIRE(read_public_head_response(
+        client.fd, false, response, sizeof(response), response_len));
+    REQUIRE(normalize_public_date(response, response_len));
+    REQUIRE_EQ(response_len, static_cast<u32>(strlen(kFirstExpected)));
+    CHECK_EQ(memcmp(response, kFirstExpected, response_len), 0);
+
+    REQUIRE(send_all(client.fd, kRequest2, sizeof(kRequest2) - 1));
+    memset(response, 0, sizeof(response));
+    REQUIRE(read_public_head_response(
+        client.fd, true, response, sizeof(response), response_len));
+    REQUIRE(normalize_public_date(response, response_len));
+    REQUIRE_EQ(response_len, static_cast<u32>(strlen(kSecondExpected)));
+    CHECK_EQ(memcmp(response, kSecondExpected, response_len), 0);
+
+    for (u32 waited = 0;
+         waited < 600 && backend.request_count.load(std::memory_order_acquire) < 2;
+         waited++)
+        usleep(5000);
+    REQUIRE_EQ(backend.accepted_count.load(std::memory_order_acquire), 2u);
+    REQUIRE_EQ(backend.request_count.load(std::memory_order_acquire), 2u);
+    const char* queries[] = {"?first=1", "?second=2"};
+    const char* extras[] = {"one", "two"};
+    for (u32 i = 0; i < 2; i++) {
+        char expected[256]{};
+        const int expected_len = snprintf(expected,
+                                          sizeof(expected),
+                                          "HEAD /head%s HTTP/1.1\r\nHost: 127.0.0.1:%u\r\n"
+                                          "X-Test: %s\r\n\r\n",
+                                          queries[i],
+                                          backend.port,
+                                          extras[i]);
+        REQUIRE_GT(expected_len, 0);
+        REQUIRE_EQ(backend.request_history_len[i], static_cast<u32>(expected_len));
+        CHECK_EQ(memcmp(backend.request_history[i], expected, expected_len), 0);
+    }
+}
+
 TEST(route, public_paired_head_source_connect_failure) {
     using namespace rut;
-    static constexpr char kExpected[] =
+    static constexpr char kKeepAliveExpected[] =
+        "HTTP/1.1 502 Bad Gateway\r\n"
+        "Server: nginx/1.29.7\r\n"
+        "Date: XXXXXXXXXXXXXXXXXXXXXXXXXXXXX\r\n"
+        "Content-Type: text/html\r\n"
+        "Content-Length: 157\r\n"
+        "Connection: keep-alive\r\n\r\n";
+    static constexpr char kCloseExpected[] =
         "HTTP/1.1 502 Bad Gateway\r\n"
         "Server: nginx/1.29.7\r\n"
         "Date: XXXXXXXXXXXXXXXXXXXXXXXXXXXXX\r\n"
@@ -20776,16 +20976,27 @@ TEST(route, public_paired_head_source_connect_failure) {
     } client{connect_to(resources.proxy.port)};
     REQUIRE_GE(client.fd, 0);
     set_socket_timeouts(client.fd, 3);
-    static constexpr char kRequest[] =
-        "HEAD /head?q=1 HTTP/1.1\r\nHost: client.example\r\n"
-        "Connection: close\r\nX-Test: one\r\n\r\n";
-    REQUIRE(send_all(client.fd, kRequest, sizeof(kRequest) - 1));
+    static constexpr char kRequest1[] =
+        "HEAD /head?q=1 HTTP/1.1\r\nHost: client.example\r\nX-Test: one\r\n\r\n";
+    static constexpr char kRequest2[] =
+        "HEAD /head?q=2 HTTP/1.1\r\nHost: client.example\r\n"
+        "Connection: close\r\nX-Test: two\r\n\r\n";
+    REQUIRE(send_all(client.fd, kRequest1, sizeof(kRequest1) - 1));
     char response[1024]{};
     u32 response_len = 0;
-    REQUIRE(read_public_close_response(client.fd, 0, response, sizeof(response), response_len));
+    REQUIRE(read_public_head_response(
+        client.fd, false, response, sizeof(response), response_len));
     REQUIRE(normalize_public_date(response, response_len));
-    REQUIRE_EQ(response_len, static_cast<u32>(strlen(kExpected)));
-    CHECK_EQ(memcmp(response, kExpected, response_len), 0);
+    REQUIRE_EQ(response_len, static_cast<u32>(strlen(kKeepAliveExpected)));
+    CHECK_EQ(memcmp(response, kKeepAliveExpected, response_len), 0);
+    CHECK_FALSE(buf_contains(response, response_len, "Content-Length: 11\r\n", 20));
+
+    REQUIRE(send_all(client.fd, kRequest2, sizeof(kRequest2) - 1));
+    memset(response, 0, sizeof(response));
+    REQUIRE(read_public_head_response(client.fd, true, response, sizeof(response), response_len));
+    REQUIRE(normalize_public_date(response, response_len));
+    REQUIRE_EQ(response_len, static_cast<u32>(strlen(kCloseExpected)));
+    CHECK_EQ(memcmp(response, kCloseExpected, response_len), 0);
     CHECK_FALSE(buf_contains(response, response_len, "Content-Length: 11\r\n", 20));
     resources.proxy.teardown();
 }

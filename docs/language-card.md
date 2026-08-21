@@ -336,7 +336,11 @@ return forward(users,
     })
 // head_mode defaults to "reject". "suppress_body" is accepted in source only
 // when both policies select it; it remains bounded to cleartext H1.1, bodyless
-// explicit-close HEAD, one IPv4 upstream, and connect-establishment failures.
+// HEAD with either no Connection field (the HTTP/1.1 default-keepalive shape)
+// or exactly one `Connection: close`, one IPv4 upstream, strict success, and
+// connect-establishment failure. While the broader failure rendezvous is not
+// part of this contract, timeout, malformed/incomplete/excess response, and
+// upload/send/recv failure close before emitting downstream bytes.
 // response_policy.connection: "keep_alive" requires a keep-alive downstream
 // request and emits keep-alive. "request" follows the parsed downstream
 // HTTP/1.1 intent, emitting keep-alive by default and close for

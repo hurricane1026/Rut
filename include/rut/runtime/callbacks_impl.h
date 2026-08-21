@@ -2486,6 +2486,10 @@ void handle_jit_outcome(Loop* loop,
             }
             if (forward_response_policy_id != 0) {
                 if (!loop->alloc_response_header_buf(conn)) {
+                    if (suppress_failure_head) {
+                        loop->close_conn(conn);
+                        return;
+                    }
                     conn.resp_status = kStatusBadGateway;
                     format_static_response(conn, 502, /*keep_alive=*/false);
                     conn.keep_alive = false;
@@ -2499,6 +2503,10 @@ void handle_jit_outcome(Loop* loop,
             conn.failure_policy_id = forward_failure_policy_id;
             conn.failure_policy_suppress_body = suppress_failure_head;
             if (conn.resp_header_mutation_count != 0 && !loop->alloc_response_header_buf(conn)) {
+                if (conn.failure_policy_suppress_body) {
+                    loop->close_conn(conn);
+                    return;
+                }
                 conn.resp_status = kStatusInternalServerError;
                 format_static_response(conn, 500, /*keep_alive=*/false);
                 conn.keep_alive = false;
@@ -2518,6 +2526,10 @@ void handle_jit_outcome(Loop* loop,
                     acquired = loop->upstream_acquire(outcome.upstream_id, target.max_inflight);
                 }
                 if (!acquired) {
+                    if (conn.failure_policy_suppress_body) {
+                        loop->close_conn(conn);
+                        return;
+                    }
                     conn.resp_status = 503;
                     format_static_response(conn, 503, /*keep_alive=*/false);
                     conn.keep_alive = false;
@@ -2706,6 +2718,14 @@ bool try_connect_next_backend(Loop* loop, Connection& conn) {
 // slots so only the client-send callback runs.
 template <typename Loop>
 void respond_upstream_timeout(Loop* loop, Connection& conn) {
+    // Until #265 supplies a generic all-I/O abandonment rendezvous, a paired
+    // reusable HEAD may serialize only establishment failures. Timeout can
+    // still own any mix of connect/send/recv SQEs, so let close_conn's exact
+    // close ledger drain them without publishing downstream bytes.
+    if (conn.failure_policy_suppress_body) {
+        loop->close_conn(conn);
+        return;
+    }
     (void)detach_upstream_close(loop, conn);
     conn.upstream_abandoned = true;
     static const char k504[] =
@@ -3433,6 +3453,10 @@ void on_upstream_connected(void* lp, Connection& conn, IoEvent ev) {
         // (oversized / no headroom) rather than forwarding the request with a
         // security-sensitive header silently dropped.
         if (!path_rewritten || !apply_request_header_overrides(conn)) {
+            if (conn.failure_policy_suppress_body) {
+                loop->close_conn(conn);
+                return;
+            }
             // The upstream connected but no request will be sent. Release it now so a
             // client that stalls reading the 500 can't pin an idle upstream fd /
             // concurrency slot until keepalive/timeout (close_conn would otherwise only
@@ -5556,6 +5580,13 @@ inline bool request_policy_body_response_admitted(const Connection& conn) {
 // counters are advanced before asynchronous upstream writes, so they cannot
 // by themselves prove that the complete buffered request was uploaded.
 inline bool strict_response_upload_ready(const Connection& conn) {
+    // A reusable paired HEAD may publish request 2 after the strict response
+    // boundary. Do not publish request 1's headers until its complete request
+    // write has actually retired; body counters alone are not ownership
+    // evidence for an asynchronous send.
+    if (conn.failure_policy_suppress_body && conn.req_client_keep_alive &&
+        (!conn.request_upload_complete || conn.upstream_request_incomplete))
+        return false;
     if (!request_policy_body_response_domain(conn)) return true;
     return !conn.request_policy_body_pending && conn.req_body_remaining == 0 &&
            (conn.req_body_mode == BodyMode::None || conn.req_body_mode == BodyMode::ContentLength) &&
@@ -5603,9 +5634,11 @@ inline bool response_policy_suppress_head_admitted(
     const Connection& conn,
     const ForwardResponsePolicySpec& policy,
     bool paired_failure) {
-    // This is intentionally the complete first successful HEAD domain.  In
-    // particular, req_client_keep_alive distinguishes an explicit HTTP/1.1
-    // Connection: close from the ordinary HTTP/1.1 default keep-alive.
+    // This is intentionally the complete bounded HEAD domain. Response-only
+    // suppression keeps its original explicit-close shape. A paired failure
+    // policy additionally admits the ordinary HTTP/1.1 default keep-alive
+    // shape (no Connection field); every explicit keep-alive/token-list shape
+    // still fails below.
     if (policy.head_mode != ResponsePolicyHeadMode::SuppressBody ||
         policy.connection != ResponsePolicyConnection::Request)
         return false;
@@ -5616,8 +5649,7 @@ inline bool response_policy_suppress_head_admitted(
     if (parser.parse(conn.recv_buf.data(), conn.recv_buf.len(), &req) != ParseStatus::Complete ||
         req.method != HttpMethod::HEAD || req.version != HttpVersion::Http11 ||
         req.path.ptr == nullptr || req.path.len == 0 || req.path.ptr[0] != '/' ||
-        req.has_content_length || req.chunked || req.upgrade || req.has_upgrade_header ||
-        ((!conn.request_policy_id || paired_failure) && !req.connection_close))
+        req.has_content_length || req.chunked || req.upgrade || req.has_upgrade_header)
         return false;
     u32 host_count = 0;
     u32 connection_count = 0;
@@ -5677,15 +5709,20 @@ inline bool response_policy_suppress_head_admitted(
         return true;
     };
     if (paired_failure &&
-        (host_count != 1 || connection_count != 1 || host == nullptr ||
+        (host_count != 1 || connection_count > 1 || host == nullptr ||
          !valid_authority(host->value)))
         return false;
+    const bool explicit_close_shape =
+        !conn.req_client_keep_alive && conn.req_client_connection_close &&
+        conn.req_client_connection_close_exact && conn.req_client_connection_count == 1;
+    const bool default_keep_alive_shape =
+        paired_failure && conn.req_client_keep_alive && !conn.req_client_connection_close &&
+        !conn.req_client_connection_close_exact && conn.req_client_connection_count == 0;
     return
            policy.connection == ResponsePolicyConnection::Request &&
            conn.req_method == static_cast<u8>(LogHttpMethod::Head) &&
            conn.req_http_version == static_cast<u8>(HttpVersion::Http11) &&
-           !conn.req_client_keep_alive && conn.req_client_connection_close &&
-           conn.req_client_connection_close_exact && conn.req_client_connection_count == 1 &&
+           (explicit_close_shape || default_keep_alive_shape) &&
            !conn.req_client_has_content_length && !conn.tls_active &&
            !conn.req_client_has_transfer_encoding && !conn.req_client_has_te &&
            !conn.req_client_has_expect && !conn.req_client_has_upgrade_header &&
@@ -5746,7 +5783,10 @@ inline bool build_failure_policy_response(const Connection& conn,
         !put(reinterpret_cast<const u8*>(length), length_len) ||
         !put_lit("\r\nConnection: "))
         return false;
-    const bool keep_alive = !suppress_body && conn.keep_alive && conn.req_client_keep_alive;
+    // Body disposition and downstream persistence are orthogonal: paired HEAD
+    // suppresses configured representation bytes, while connection: request
+    // still follows the parsed client request's lifetime.
+    const bool keep_alive = conn.keep_alive && conn.req_client_keep_alive;
     if (!put_lit(keep_alive ? "keep-alive\r\n\r\n" : "close\r\n\r\n") ||
         (!suppress_body && !put(reinterpret_cast<const u8*>(policy.body.ptr), policy.body.len)))
         return false;
@@ -5782,11 +5822,7 @@ inline void respond_upstream_connect_failure(Loop* loop, Connection& conn) {
             conn.send_buf.reset();
             serialized = conn.send_buf.write(scratch, serialized_len) == serialized_len;
         }
-        if (serialized) {
-            conn.keep_alive = !conn.failure_policy_suppress_body && conn.keep_alive &&
-                              conn.req_client_keep_alive;
-            if (conn.failure_policy_suppress_body) conn.keep_alive = false;
-        }
+        if (serialized) conn.keep_alive = conn.keep_alive && conn.req_client_keep_alive;
     }
     if (!serialized) {
         // A selected policy is never silently approximated by the legacy
@@ -6192,6 +6228,13 @@ inline bool abandon_strict_upstream(Loop* loop, Connection& conn) {
 template <typename Loop>
 inline void reject_strict_response(Loop* loop, Connection& conn) {
     // This is the response-policy equivalent of the upstream timeout path.
+    // The reusable paired HEAD contract has no safe post-establishment failure
+    // serializer until #265: close before detaching, clearing callbacks, or
+    // staging bytes so io_uring's close ledger retains exact ownership.
+    if (conn.failure_policy_suppress_body) {
+        loop->close_conn(conn);
+        return;
+    }
     if (!abandon_strict_upstream(loop, conn)) return;
     static const char k502[] = "HTTP/1.1 502 Bad Gateway\r\nContent-Length: 11\r\n"
                                 "Connection: close\r\n\r\nBad Gateway";
