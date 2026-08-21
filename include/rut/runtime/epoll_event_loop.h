@@ -433,6 +433,17 @@ public:
         if (conn_id < EpollBackend::kMaxFdMap) backend.upstream_fd_map[conn_id] = -1;
     }
 
+    // Epoll-owned upstream episode lifecycle foundation. Production request
+    // transitions intentionally do not call these yet; C2a only exposes the
+    // strict ownership boundary for the loop owner and its focused tests.
+    bool begin_upstream_episode(Connection& c) {
+        return backend.begin_upstream_episode(c.id, c.upstream_episode);
+    }
+
+    bool retire_upstream_episode_after_detach(Connection& c, u32 expected_episode) {
+        return backend.retire_upstream_episode_after_detach(c, expected_episode);
+    }
+
     // Drop any partial upstream-send bookkeeping for conn_id. Called before a
     // reused-fd retry re-connects on a fresh socket: a request send that parked
     // on EPOLLOUT leaves upstream_send_state[conn_id].remaining > 0, and the fresh
@@ -587,6 +598,7 @@ public:
         if (c.ws_c2u_msg) pool.free(c.ws_c2u_msg);
         if (c.ws_u2c_msg) pool.free(c.ws_u2c_msg);
         if (c.h2) h2_pool.free(c.h2);
+        backend.reset_upstream_episode_state(cid);
         c.reset();
         free_stack[free_top++] = cid;
     }

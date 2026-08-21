@@ -42,6 +42,14 @@ struct EpollBackend {
     i32 downstream_fd_map[kMaxFdMap];  // downstream (client) fd per conn_id
     i32 upstream_fd_map[kMaxFdMap];    // upstream (origin) fd per conn_id
 
+    // Epoll-owned upstream episode ownership. Zero means no active episode;
+    // this table is deliberately independent from Connection::upstream_episode
+    // so the lifecycle foundation can be introduced before production owners
+    // start calling it. kUpstreamEpisodeExhausted is outside the 24-bit token
+    // domain and is never passed to an epoll registration.
+    static constexpr u32 kUpstreamEpisodeExhausted = kInvalidUpstreamEventEpisode;
+    u32 active_upstream_episode[kMaxFdMap];
+
     // Pending synthetic completion events (from immediate sends). FIXED LIFO
     // stack. Scoped producers preflight this capacity before their synchronous
     // syscall; they are single-threaded and non-reentrant, so one entry check
@@ -115,6 +123,20 @@ struct EpollBackend {
     // keyed on (remaining > 0 && ss.fd == fd), and would otherwise arm EPOLLOUT
     // and send from the stale ss.src pointer into the new connection's fd.
     void clear_send_state(u32 conn_id);
+
+    // Strict epoll-owned lifecycle foundation. begin records ownership only
+    // when the fd map and upstream partial-send state are detached. retire
+    // requires the expected token to remain current and detached; on success
+    // it clears ownership and advances conn.upstream_episode. These helpers
+    // are intentionally not called by registration, retry, pool, health, or
+    // dispatch paths yet.
+    bool begin_upstream_episode(u32 conn_id, u32 episode);
+    bool retire_upstream_episode_after_detach(Connection& conn, u32 expected_episode);
+
+    // Connection-slot reset hook. This is not a lifecycle transition: it
+    // deterministically drops epoll-owned foundation state when a slot is
+    // released or the backend is reinitialized.
+    void reset_upstream_episode_state(u32 conn_id);
 
     // Try immediate send. If partial/EAGAIN, register EPOLLOUT.
     bool add_send(i32 fd, u32 conn_id, const u8* buf, u32 len);

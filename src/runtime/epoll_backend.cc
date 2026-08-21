@@ -94,6 +94,28 @@ static bool queue_pending_completion(IoEvent* pending_completions,
     return true;
 }
 
+static bool upstream_send_state_detached(const EpollBackend::SendState& state) {
+    // Treat every field as part of the detach contract. In particular, a
+    // zero-length state with a stale source pointer or fd must not be mistaken
+    // for an empty state and later resurrected by EPOLLOUT.
+    return state.src == nullptr && state.fd < 0 && state.offset == 0 && state.remaining == 0 &&
+           state.type == IoEventType::UpstreamSend && !state.tls && state.tls_wait_events == 0 &&
+           state.upstream_episode == 0;
+}
+
+static bool pending_has_upstream_episode(const IoEvent* pending_completions,
+                                         u32 pending_count,
+                                         u32 conn_id,
+                                         u32 episode) {
+    for (u32 i = 0; i < pending_count; i++) {
+        const IoEvent& event = pending_completions[i];
+        if (event.conn_id == conn_id && io_event_is_upstream(event.type) &&
+            event.upstream_episode == episode)
+            return true;
+    }
+    return false;
+}
+
 static i32 set_fd_interest(i32 epoll_fd,
                            i32 fd,
                            u32 conn_id,
@@ -186,6 +208,7 @@ core::Expected<void, Error> EpollBackend::init(u32 /*shard_id*/, i32 lfd) {
     for (u32 i = 0; i < kMaxFdMap; i++) {
         downstream_fd_map[i] = -1;
         upstream_fd_map[i] = -1;
+        active_upstream_episode[i] = 0;
         send_state[i] = {nullptr, -1, 0, 0, IoEventType::Send, false, 0, 0};
         upstream_send_state[i] = {nullptr, -1, 0, 0, IoEventType::UpstreamSend, false, 0, 0};
     }
@@ -310,6 +333,52 @@ void EpollBackend::clear_send_state(u32 conn_id) {
     if (conn_id >= kMaxFdMap) return;
     send_state[conn_id] = {nullptr, -1, 0, 0, IoEventType::Send, false, 0, 0};
     upstream_send_state[conn_id] = {nullptr, -1, 0, 0, IoEventType::UpstreamSend, false, 0, 0};
+}
+
+bool EpollBackend::begin_upstream_episode(u32 conn_id, u32 episode) {
+    if (conn_id >= kMaxFdMap || !valid_upstream_episode(episode)) return false;
+    if (active_upstream_episode[conn_id] != 0) return false;
+    if (upstream_fd_map[conn_id] != -1) return false;
+    if (!upstream_send_state_detached(upstream_send_state[conn_id])) return false;
+
+    active_upstream_episode[conn_id] = episode;
+    return true;
+}
+
+bool EpollBackend::retire_upstream_episode_after_detach(Connection& conn,
+                                                        u32 expected_episode) {
+    const u32 conn_id = conn.id;
+    if (conn_id >= kMaxFdMap || !valid_upstream_episode(expected_episode)) return false;
+    if (active_upstream_episode[conn_id] != expected_episode ||
+        conn.upstream_episode != expected_episode)
+        return false;
+    if (upstream_fd_map[conn_id] != -1 ||
+        !upstream_send_state_detached(upstream_send_state[conn_id]))
+        return false;
+
+    const u32 candidate = expected_episode == kIoUserDataMaxUpstreamEpisode
+                              ? 1u
+                              : expected_episode + 1u;
+    // A synthetic completion can outlive its producer's detach. Never wrap
+    // into a token that is still queued for this connection: poison ownership
+    // with a value outside the 24-bit token domain and fail closed. The
+    // connection token remains unchanged, so no caller can mistake this for a
+    // successful transition.
+    if (pending_has_upstream_episode(pending_completions, pending_count, conn_id, candidate)) {
+        active_upstream_episode[conn_id] = kUpstreamEpisodeExhausted;
+        return false;
+    }
+
+    // No concurrent producer exists on an epoll shard. Clear ownership before
+    // advancing the connection token so the old token ceases to be current at
+    // the lifecycle boundary itself.
+    active_upstream_episode[conn_id] = 0;
+    conn.next_upstream_episode();
+    return true;
+}
+
+void EpollBackend::reset_upstream_episode_state(u32 conn_id) {
+    if (conn_id < kMaxFdMap) active_upstream_episode[conn_id] = 0;
 }
 
 void EpollBackend::pause_recv(u32 conn_id, bool preserve_send_interest) {
@@ -1069,6 +1138,7 @@ u32 EpollBackend::wait(IoEvent* events, u32 max_events, Connection* conns, u32 m
 void EpollBackend::shutdown() {
     pending_count = 0;
     pending_streak = 0;
+    for (u32 i = 0; i < kMaxFdMap; i++) active_upstream_episode[i] = 0;
     if (timer_fd >= 0) {
         close(timer_fd);
         timer_fd = -1;

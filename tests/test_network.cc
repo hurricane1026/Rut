@@ -10798,6 +10798,133 @@ TEST(epoll_episode, invalid_upstream_registration_has_no_side_effects) {
     backend.shutdown();
 }
 
+TEST(epoll_episode_lifecycle, clean_begin_and_strict_preconditions) {
+    EpollBackend backend{};
+    REQUIRE(backend.init(0, -1).has_value());
+    Connection conn{};
+    conn.reset();
+    conn.id = 7;
+    conn.upstream_episode = 1;
+
+    CHECK(backend.begin_upstream_episode(conn.id, conn.upstream_episode));
+    CHECK_EQ(backend.active_upstream_episode[conn.id], 1u);
+    CHECK_FALSE(backend.begin_upstream_episode(conn.id, conn.upstream_episode));
+    CHECK_EQ(backend.active_upstream_episode[conn.id], 1u);
+
+    backend.reset_upstream_episode_state(conn.id);
+    CHECK_FALSE(backend.begin_upstream_episode(EpollBackend::kMaxFdMap, 1));
+    CHECK_FALSE(backend.begin_upstream_episode(conn.id, 0));
+    CHECK_FALSE(backend.begin_upstream_episode(conn.id, kInvalidUpstreamEventEpisode));
+    CHECK_EQ(backend.active_upstream_episode[conn.id], 0u);
+
+    backend.upstream_fd_map[conn.id] = 123;
+    CHECK_FALSE(backend.begin_upstream_episode(conn.id, 1));
+    CHECK_EQ(backend.active_upstream_episode[conn.id], 0u);
+    backend.upstream_fd_map[conn.id] = -1;
+
+    static const u8 payload[] = {'d', 'i', 'r', 't', 'y'};
+    backend.upstream_send_state[conn.id] = {
+        payload, 123, 0, sizeof(payload), IoEventType::UpstreamSend, false, 0, conn.upstream_episode};
+    CHECK_FALSE(backend.begin_upstream_episode(conn.id, 1));
+    CHECK_EQ(backend.active_upstream_episode[conn.id], 0u);
+    backend.clear_send_state(conn.id);
+
+    CHECK(backend.begin_upstream_episode(conn.id, conn.upstream_episode));
+    CHECK_EQ(backend.active_upstream_episode[conn.id], conn.upstream_episode);
+    backend.shutdown();
+    REQUIRE(backend.init(0, -1).has_value());
+    CHECK_EQ(backend.active_upstream_episode[conn.id], 0u);
+    backend.shutdown();
+}
+
+TEST(epoll_episode_lifecycle, retire_requires_matching_detached_current_state) {
+    EpollBackend backend{};
+    REQUIRE(backend.init(0, -1).has_value());
+    Connection conn{};
+    conn.reset();
+    conn.id = 3;
+    conn.upstream_episode = 9;
+    REQUIRE(backend.begin_upstream_episode(conn.id, conn.upstream_episode));
+
+    CHECK_FALSE(backend.retire_upstream_episode_after_detach(conn, 8));
+    CHECK_EQ(backend.active_upstream_episode[conn.id], 9u);
+    CHECK_EQ(conn.upstream_episode, 9u);
+
+    backend.active_upstream_episode[conn.id] = 10;
+    CHECK_FALSE(backend.retire_upstream_episode_after_detach(conn, 9));
+    CHECK_EQ(backend.active_upstream_episode[conn.id], 10u);
+    CHECK_EQ(conn.upstream_episode, 9u);
+    backend.active_upstream_episode[conn.id] = 9;
+
+    backend.upstream_fd_map[conn.id] = 456;
+    CHECK_FALSE(backend.retire_upstream_episode_after_detach(conn, 9));
+    CHECK_EQ(backend.active_upstream_episode[conn.id], 9u);
+    CHECK_EQ(conn.upstream_episode, 9u);
+    backend.upstream_fd_map[conn.id] = -1;
+
+    static const u8 payload[] = {'s', 't', 'a', 'l', 'e'};
+    backend.upstream_send_state[conn.id] = {
+        payload, 456, 0, sizeof(payload), IoEventType::UpstreamSend, false, 0, 9};
+    CHECK_FALSE(backend.retire_upstream_episode_after_detach(conn, 9));
+    CHECK_EQ(backend.active_upstream_episode[conn.id], 9u);
+    CHECK_EQ(conn.upstream_episode, 9u);
+    CHECK_EQ(backend.upstream_send_state[conn.id].upstream_episode, 9u);
+    backend.clear_send_state(conn.id);
+
+    CHECK(backend.retire_upstream_episode_after_detach(conn, 9));
+    CHECK_EQ(backend.active_upstream_episode[conn.id], 0u);
+    CHECK_EQ(conn.upstream_episode, 10u);
+    CHECK_FALSE(backend.retire_upstream_episode_after_detach(conn, 9));
+    CHECK_EQ(backend.active_upstream_episode[conn.id], 0u);
+    CHECK_EQ(conn.upstream_episode, 10u);
+
+    // A reset is not allowed to rewind the generation token.
+    conn.reset();
+    CHECK_EQ(conn.upstream_episode, 10u);
+    CHECK_EQ(backend.active_upstream_episode[conn.id], 0u);
+    backend.shutdown();
+}
+
+TEST(epoll_episode_lifecycle, wrap_never_uses_zero_or_reuses_pending_candidate) {
+    EpollBackend backend{};
+    REQUIRE(backend.init(0, -1).has_value());
+
+    Connection conn{};
+    conn.reset();
+    conn.id = 5;
+    conn.upstream_episode = kIoUserDataMaxUpstreamEpisode;
+    REQUIRE(backend.begin_upstream_episode(conn.id, conn.upstream_episode));
+
+    // The bounded pending ring contains the exact max->1 candidate. Retire
+    // must fail closed and poison ownership, rather than silently reusing 1.
+    backend.pending_completions[0] = {
+        conn.id, 0, 0, 0, IoEventType::UpstreamRecv, 0, 0, 1};
+    backend.pending_count = 1;
+    CHECK_FALSE(backend.retire_upstream_episode_after_detach(
+        conn, kIoUserDataMaxUpstreamEpisode));
+    CHECK_EQ(backend.active_upstream_episode[conn.id], EpollBackend::kUpstreamEpisodeExhausted);
+    CHECK_EQ(conn.upstream_episode, kIoUserDataMaxUpstreamEpisode);
+    CHECK_FALSE(backend.begin_upstream_episode(conn.id, conn.upstream_episode));
+    CHECK_NE(backend.active_upstream_episode[conn.id], 0u);
+    CHECK_NE(backend.active_upstream_episode[conn.id], 1u);
+
+    // With no pending candidate, max wraps directly to one and never emits
+    // episode zero. A reset clears only ownership; it does not rewind conn.
+    backend.pending_count = 0;
+    backend.reset_upstream_episode_state(conn.id);
+    REQUIRE(backend.begin_upstream_episode(conn.id, conn.upstream_episode));
+    CHECK(backend.retire_upstream_episode_after_detach(
+        conn, kIoUserDataMaxUpstreamEpisode));
+    CHECK_EQ(conn.upstream_episode, 1u);
+    CHECK_NE(conn.upstream_episode, 0u);
+    CHECK_EQ(backend.active_upstream_episode[conn.id], 0u);
+
+    // The next clean begin uses exactly the advanced token.
+    CHECK(backend.begin_upstream_episode(conn.id, conn.upstream_episode));
+    CHECK_EQ(backend.active_upstream_episode[conn.id], 1u);
+    backend.shutdown();
+}
+
 TEST(epoll_episode, stale_raw_recv_does_not_touch_buffer_and_current_token_recovers) {
     EpollBackend backend{};
     REQUIRE(backend.init(0, -1).has_value());
