@@ -624,12 +624,17 @@ TEST(nginx_converter, emitted_source_reaches_rir_with_source_metadata) {
     CHECK(function.route_pattern.eq(lit_str("/")));
     CHECK_EQ(function.http_method, 0u);
     u32 ret_count = 0;
+    u32 plain_forward_count = 0;
     bool saw_bundle_one = false;
     bool saw_bundle_two = false;
     for (u32 bi = 0; bi < function.block_count; bi++) {
         const auto& block = function.blocks[bi];
         for (u32 ii = 0; ii < block.inst_count; ii++) {
             const auto& instruction = block.insts[ii];
+            if (instruction.op == rir::Opcode::RetForward) {
+                plain_forward_count++;
+                continue;
+            }
             if (instruction.op != rir::Opcode::RetForwardBundle) continue;
             ret_count++;
             REQUIRE_EQ(instruction.operand_count, 3u);
@@ -647,6 +652,7 @@ TEST(nginx_converter, emitted_source_reaches_rir_with_source_metadata) {
         }
     }
     CHECK_EQ(ret_count, 2u);
+    CHECK_EQ(plain_forward_count, 0u);
     CHECK(saw_bundle_one);
     CHECK(saw_bundle_two);
 
