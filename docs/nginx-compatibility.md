@@ -81,6 +81,12 @@ Allowed states are `SUPPORTED`, `PARTIAL`, `BLOCKED_BY_RUT`,
   close-intent request emits the exact close 502/EOF and produces the second
   scoped connect-failure record. Current RUT rejects this reusable HEAD domain,
   so the evidence defines the next #253 capability gap rather than support.
+- The reusable HEAD gap also depends on the generic epoll transport capability
+  tracked in #262. Epoll currently performs socket I/O for a readiness batch
+  before dispatching any logical event, so an episode token checked only at
+  dispatch cannot prevent an older event from mutating a later upstream
+  episode. This domain remains fail-closed; the completed io_uring episode
+  transport does not imply epoll or keep-alive HEAD support.
 - The first request-policy slice rejects body/framing inputs (including
   `Content-Length` and every `Transfer-Encoding` value), HTTP/2, and
   non-origin-form targets before upstream connect. These are intentional
