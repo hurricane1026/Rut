@@ -17,8 +17,8 @@ Allowed states are `SUPPORTED`, `PARTIAL`, `BLOCKED_BY_RUT`,
 | preserve raw request-target and query | implicit | yes | partial: origin-form forward sends original bytes | pinned query differential; broader normalization untested | PARTIAL |
 | preserve request method and body | implicit | yes | partial: fixed-CL body is staged before connect within one 16 KiB composite slice | RUT exact binary/segmented/boundary tests and pinned generated-RUT binary POST differential | PARTIAL |
 | nginx default upstream HTTP version and request headers | implicit | yes | partial: explicit fixed HTTP/1.1 policy with bounded fixed-CL buffering; #252 | exact RUT tests plus pinned generated-RUT GET and POST differentials | PARTIAL |
-| proxied response status and body | implicit | yes, including method-isolated root HEAD lowering | partial: strict final H1.1 exact-Content-Length streaming plus bounded reusable paired HEAD success/connect-failure serialization; #265 D1/D2 can retire all exact owners and rendezvous a prebuilt header internally, but no broader production failure path calls it | exact public-source production-JIT and pinned converter-generated reusable HEAD success/connect-failure, internal lifecycle tests, pinned generated-RUT GET/POST, and exact nginx-only reusable 502/504 failure baselines | PARTIAL |
-| nginx default proxied response header policy | implicit | yes, including method-isolated root HEAD lowering | partial: bounded strict H1.1 final-response/content-length serializer and reusable paired HEAD success/connect-failure policy; #265 D1/D2 transport/header publication foundations are complete, but timeout/malformed production admission is absent | exact public-source production-JIT and pinned converter-generated reusable HEAD success/failure/no-pool evidence, internal token/lifecycle tests, pinned generated-RUT GET/POST/close, and nginx-only reusable 502/504 failure baselines | PARTIAL |
+| proxied response status and body | implicit | yes, including method-isolated root HEAD lowering | partial: strict final H1.1 exact-Content-Length streaming plus bounded reusable paired HEAD success/connect-failure serialization; #265 now admits only malformed/incomplete parser failures through the D1/D2 exact-owner rendezvous | exact public-source production-JIT and pinned converter-generated reusable HEAD success/connect-failure, internal parser/lifecycle tests, pinned generated-RUT GET/POST, and exact nginx-only reusable 502/504 failure baselines; no malformed public wire yet | PARTIAL |
+| nginx default proxied response header policy | implicit | yes, including method-isolated root HEAD lowering | partial: bounded strict H1.1 final-response/content-length serializer and reusable paired HEAD success/connect-failure policy; #265 has narrow malformed/incomplete production admission, while timeout remains absent | exact public-source production-JIT and pinned converter-generated reusable HEAD success/failure/no-pool evidence, internal parser/token/lifecycle tests, pinned generated-RUT GET/POST/close, and nginx-only reusable 502/504 failure baselines; no malformed public wire yet | PARTIAL |
 | single unavailable upstream gateway error | implicit | yes | yes for bounded H1 single-IPv4 connect failures; #256 | committed pinned close/EOF differential plus pinned keep-alive and split-POST evidence | SUPPORTED |
 | exact, `^~`, regex, or nested locations | no | no | no nginx selection semantics | no | NOT_PLANNED |
 | exact `/api/` + proxy URI `/`, clean bounded H1 request domain | yes | yes | yes: bounded prefix replacement; #259 closed | pinned converter-generated `/api/`, `/api/x`, and query differentials; four out-of-domain targets fail before upstream | SUPPORTED |
@@ -90,13 +90,16 @@ Allowed states are `SUPPORTED`, `PARTIAL`, `BLOCKED_BY_RUT`,
   emits a header-only 504 with `Content-Length: 167`, or a header-only 502 with
   `Content-Length: 157`, then accepts a second close-intent HEAD on a fresh
   upstream connection. Closing before bytes is fail-closed but not equivalent.
-  #265 now has D1 exact-owner Connect/Send/Recv retirement and the D2 internal
-  prebuilt-header/request-epoch rendezvous. D2 proves both completion orders,
-  batch-end-only request-2 publication, phase-bound buffer normalization,
-  zero-owner terminal handoff, epoch/config pinning, and close/reclaim behavior.
-  No timeout or strict-rejection production path calls it yet, so those failures
-  remain unsupported; internal capability alone does not upgrade #264's narrower
-  normal-success and connect-establishment slice.
+  #265 now has D1 exact-owner Connect/Send/Recv retirement, the D2 internal
+  prebuilt-header/request-epoch rendezvous, and one narrow production caller for
+  non-empty malformed reads or incomplete-header terminal EOF/error. Internal
+  tests prove transactional failure-header construction, live-Recv and
+  zero-owner handoff, both completion orders, batch-end-only request-2
+  publication, phase-bound buffer normalization, epoch/config pinning, and
+  close/reclaim behavior. Public-source real-socket and converter-generated
+  differential evidence are still absent, and no timeout path calls D2, so these
+  failures remain unsupported; internal production admission alone does not
+  upgrade #264's narrower normal-success and connect-establishment slice.
 - The reusable HEAD gap previously depended on the generic epoll transport
   capability tracked in #262. Epoll now exposes at most one logical completion
   per wait
