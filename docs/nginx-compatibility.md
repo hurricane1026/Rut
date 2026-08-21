@@ -17,8 +17,8 @@ Allowed states are `SUPPORTED`, `PARTIAL`, `BLOCKED_BY_RUT`,
 | preserve raw request-target and query | implicit | yes | partial: origin-form forward sends original bytes | pinned query differential; broader normalization untested | PARTIAL |
 | preserve request method and body | implicit | yes | partial: fixed-CL body is staged before connect within one 16 KiB composite slice | RUT exact binary/segmented/boundary tests and pinned generated-RUT binary POST differential | PARTIAL |
 | nginx default upstream HTTP version and request headers | implicit | yes | partial: explicit fixed HTTP/1.1 policy with bounded fixed-CL buffering; #252 | exact RUT tests plus pinned generated-RUT GET and POST differentials | PARTIAL |
-| proxied response status and body | implicit | yes, including method-isolated root HEAD lowering | partial: strict final H1.1 exact-Content-Length streaming plus paired explicit-close HEAD success/connect-failure serialization; reusable HEAD admission pending #264 and broader reusable failures blocked by #265 | exact public-source production-JIT HEAD success/failure and non-HEAD sibling wires, internal lifecycle tests, pinned generated-RUT GET/POST plus explicit-close HEAD success/unavailable-upstream differentials, and exact nginx-only reusable HEAD success/502/504 baselines | PARTIAL |
-| nginx default proxied response header policy | implicit | yes, including method-isolated root HEAD lowering | partial: bounded strict H1.1 final-response/content-length serializer and paired explicit-close HEAD success/connect-failure policy; reusable success/connect failure pending #264, timeout/malformed failure retirement gap in #265 | exact public-source production-JIT HEAD success/failure/no-pool tests, internal token/lifecycle tests, pinned generated-RUT GET/POST/close plus explicit-close HEAD differentials, and exact nginx-only reusable HEAD success/502/504 baselines | PARTIAL |
+| proxied response status and body | implicit | yes, including method-isolated root HEAD lowering | partial: strict final H1.1 exact-Content-Length streaming plus bounded reusable paired HEAD success/connect-failure serialization; #264 closed, broader reusable failures blocked by #265 | exact public-source production-JIT reusable HEAD success/connect-failure and non-HEAD sibling wires, internal lifecycle tests, pinned generated-RUT GET/POST plus explicit-close HEAD differentials, and exact nginx-only reusable HEAD success/502/504 baselines | PARTIAL |
+| nginx default proxied response header policy | implicit | yes, including method-isolated root HEAD lowering | partial: bounded strict H1.1 final-response/content-length serializer and reusable paired HEAD success/connect-failure policy; timeout/malformed failure retirement gap in #265 | exact public-source production-JIT reusable HEAD success/failure/no-pool tests, internal token/lifecycle tests, pinned generated-RUT GET/POST/close plus explicit-close HEAD differentials, and exact nginx-only reusable HEAD success/502/504 baselines | PARTIAL |
 | single unavailable upstream gateway error | implicit | yes | yes for bounded H1 single-IPv4 connect failures; #256 | committed pinned close/EOF differential plus pinned keep-alive and split-POST evidence | SUPPORTED |
 | exact, `^~`, regex, or nested locations | no | no | no nginx selection semantics | no | NOT_PLANNED |
 | exact `/api/` + proxy URI `/`, clean bounded H1 request domain | yes | yes | yes: bounded prefix replacement; #259 closed | pinned converter-generated `/api/`, `/api/x`, and query differentials; four out-of-domain targets fail before upstream | SUPPORTED |
@@ -79,8 +79,10 @@ Allowed states are `SUPPORTED`, `PARTIAL`, `BLOCKED_BY_RUT`,
   HEAD wire on each. With the upstream unavailable, the first header-only 502
   retains `Content-Length: 157` and downstream keep-alive, while the second
   close-intent request emits the exact close 502/EOF and produces the second
-  scoped connect-failure record. Current RUT rejects this reusable HEAD domain,
-  so the evidence defines the next #253 capability gap rather than support.
+  scoped connect-failure record. Public RUT now admits this bounded reusable
+  success/connect-establishment domain after #264; converter-generated pinned
+  differential evidence is still required before changing its compatibility
+  claim.
 - Pinned nginx 1.29.7 also keeps a default-keepalive HEAD reusable after a read
   timeout, malformed upstream response header, or incomplete-header EOF. It
   emits a header-only 504 with `Content-Length: 167`, or a header-only 502 with
@@ -119,23 +121,24 @@ Allowed states are `SUPPORTED`, `PARTIAL`, `BLOCKED_BY_RUT`,
   nine acceptance bullets, so #262 is closed. These tests explicitly hold raw
   records already harvested into userspace and do not claim kernel retention
   after successful `EPOLL_CTL_DEL`. This transport work alone does not imply
-  keep-alive HEAD support;
-  io_uring episode cancellation/drain and deferred request admission are tracked
-  in #264. Its first recv-only retirement slice now protects the existing
+  keep-alive HEAD support by itself. The io_uring episode cancellation/drain and
+  deferred request admission work tracked in #264 first protected the existing
   explicit-close strict-abandon path, including cancel retry, token exhaustion,
   provided-buffer isolation, and deferred close/reclaim. Its second bounded
   runtime slice now completes request-1 bookkeeping before parking the generic
   HTTP/1 boundary, buffers request-2 bytes without parse/route/timer/callback
   effects, and resumes exactly once after the retirement-final CQE batch. Exact
   successor ownership also fences provided-buffer/partial-send mutation and
-  survives close through a per-type target/cancel ledger. Public reusable HEAD
-  admission remains rejected. A third bounded runtime slice now persists and
+  survives close through a per-type target/cancel ledger. A third bounded runtime
+  slice persists and
   atomically replaces the latest fully drained tombstone, proving two production
   strict callbacks, two batch-end boundary resumes, older-record isolation,
-  close/reclaim composition, and token-exhaustion quarantine. #264 remains open
-  until public reusable HEAD admission and a real two-request io_uring behavior
-  test pass; converter-generated nginx differential evidence and the remaining
-  response semantics stay under #253.
+  close/reclaim composition, and token-exhaustion quarantine. The final bounded
+  public slice now admits default-keepalive paired HEAD, proves a real two-request
+  io_uring success path plus reusable connect-establishment 502, and fails broader
+  paths closed before bytes. #264 is closed; converter-generated nginx
+  differential evidence and the remaining #265 response semantics stay under
+  #253.
 - The first request-policy slice rejects body/framing inputs (including
   `Content-Length` and every `Transfer-Encoding` value), HTTP/2, and
   non-origin-form targets before upstream connect. These are intentional
