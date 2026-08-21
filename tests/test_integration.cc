@@ -16807,6 +16807,22 @@ struct RecordingUpstream {
     std::atomic<bool> first_peer_closed{false};
     std::atomic<bool> first_peer_unexpected_data{false};
     std::atomic<bool> first_peer_close_timed_out{false};
+    enum class FirstResponseCloseGateState : u8 {
+        Idle,
+        SentOpenWaitingGate,
+        SendFailed,
+        PeerClosedBeforeGate,
+        UnexpectedDataBeforeGate,
+        ClosedByGate,
+        Aborted,
+    };
+    // Separate opt-in for an origin-driven terminal EOF.  A timed-out gate
+    // retains the fd until teardown, so the fixture cannot manufacture the
+    // very EOF the test is meant to authorize.
+    bool gate_first_response_close = false;
+    std::atomic<bool> allow_first_response_close{false};
+    std::atomic<FirstResponseCloseGateState> first_response_close_gate_state{
+        FirstResponseCloseGateState::Idle};
     static constexpr u32 kMaxHeldFds = 8;
     i32 held_fds[kMaxHeldFds]{};
     u32 held_fd_count = 0;
@@ -16911,7 +16927,77 @@ struct RecordingUpstream {
                     if (s->response_chunk_delay_us != 0) usleep(s->response_chunk_delay_us);
                 }
             }
-            if (history_slot == 0 && s->wait_first_response_for_peer_close) {
+            if (history_slot == 0 && s->gate_first_response_close) {
+                using GateState = FirstResponseCloseGateState;
+                auto probe_peer = [](i32 fd) {
+                    char byte = 0;
+                    ssize_t result;
+                    do {
+                        result = recv(fd, &byte, 1, MSG_PEEK | MSG_DONTWAIT);
+                    } while (result < 0 && errno == EINTR);
+                    if (result == 0 || (result < 0 && errno == ECONNRESET))
+                        return GateState::PeerClosedBeforeGate;
+                    if (result > 0) return GateState::UnexpectedDataBeforeGate;
+                    if (errno == EAGAIN || errno == EWOULDBLOCK)
+                        return GateState::SentOpenWaitingGate;
+                    return GateState::Aborted;
+                };
+
+                if (!response_sent) {
+                    s->first_response_close_gate_state.store(
+                        GateState::SendFailed, std::memory_order_release);
+                    close(client);
+                    continue;
+                }
+                s->first_response_close_gate_state.store(
+                    GateState::SentOpenWaitingGate, std::memory_order_release);
+
+                bool close_allowed = false;
+                GateState state = GateState::SentOpenWaitingGate;
+                for (u32 waited = 0; waited < 600; waited++) {
+                    if (!s->running.load(std::memory_order_acquire)) {
+                        state = GateState::Aborted;
+                        break;
+                    }
+                    if (s->allow_first_response_close.load(std::memory_order_acquire)) {
+                        close_allowed = true;
+                        break;
+                    }
+                    state = probe_peer(client);
+                    if (state != GateState::SentOpenWaitingGate) break;
+                    usleep(5000);
+                }
+
+                if (close_allowed) {
+                    // Close only after a final nonblocking proof that the peer
+                    // remained open and sent no unexpected request bytes.
+                    state = probe_peer(client);
+                    if (state == GateState::SentOpenWaitingGate) {
+                        close(client);
+                        s->first_response_close_gate_state.store(
+                            GateState::ClosedByGate, std::memory_order_release);
+                    } else {
+                        s->first_response_close_gate_state.store(
+                            state, std::memory_order_release);
+                        if (state == GateState::PeerClosedBeforeGate) {
+                            close(client);
+                        } else if (s->held_fd_count < kMaxHeldFds) {
+                            s->held_fds[s->held_fd_count++] = client;
+                        } else {
+                            close(client);
+                        }
+                    }
+                } else {
+                    if (state == GateState::SentOpenWaitingGate) state = GateState::Aborted;
+                    s->first_response_close_gate_state.store(state, std::memory_order_release);
+                    if (state != GateState::PeerClosedBeforeGate &&
+                        s->held_fd_count < kMaxHeldFds) {
+                        s->held_fds[s->held_fd_count++] = client;
+                    } else {
+                        close(client);
+                    }
+                }
+            } else if (history_slot == 0 && s->wait_first_response_for_peer_close) {
                 if (response_sent)
                     s->first_response_sent_open.store(true, std::memory_order_release);
                 char unexpected[64];
@@ -16939,6 +17025,7 @@ struct RecordingUpstream {
     }
 
     bool setup() {
+        if (gate_first_response_close && wait_first_response_for_peer_close) return false;
         auto lfd = create_listen_socket(0);
         if (!lfd.has_value()) return false;
         listen_fd = lfd.value();
@@ -21104,6 +21191,165 @@ TEST(route, public_paired_head_source_malformed_open_peer_reuses_downstream_iour
         REQUIRE_GT(expected_len, 0);
         REQUIRE_EQ(backend.request_history_len[i], static_cast<u32>(expected_len));
         CHECK_EQ(memcmp(backend.request_history[i], expected, expected_len), 0);
+    }
+    usleep(100000);
+    CHECK_EQ(backend.accepted_count.load(std::memory_order_acquire), 2u);
+    CHECK_EQ(backend.request_count.load(std::memory_order_acquire), 2u);
+}
+
+TEST(route, public_paired_head_source_incomplete_then_eof_reuses_downstream_iouring) {
+    using namespace rut;
+    if (!iouring_socket_live()) SKIP("io_uring async socket ops unavailable in this environment");
+    using GateState = RecordingUpstream::FirstResponseCloseGateState;
+    static constexpr char kIncompleteOrigin[] =
+        "HTTP/1.1 200 OK\r\nContent-Length: 7\r\n";
+    static constexpr char kSecondOrigin[] =
+        "HTTP/1.1 200 OK\r\nServer: origin\r\n"
+        "Date: Tue, 01 Jan 2030 00:00:00 GMT\r\n"
+        "Content-Length: 7\r\n\r\ngoodbye";
+    static constexpr char kFirstExpected[] =
+        "HTTP/1.1 502 Bad Gateway\r\n"
+        "Server: nginx/1.29.7\r\n"
+        "Date: XXXXXXXXXXXXXXXXXXXXXXXXXXXXX\r\n"
+        "Content-Type: text/html\r\n"
+        "Content-Length: 157\r\n"
+        "Connection: keep-alive\r\n\r\n";
+    static constexpr char kSecondExpected[] =
+        "HTTP/1.1 200 OK\r\n"
+        "Server: nginx/1.29.7\r\n"
+        "Date: XXXXXXXXXXXXXXXXXXXXXXXXXXXXX\r\n"
+        "Content-Length: 7\r\n"
+        "Connection: close\r\n\r\n";
+
+    RecordingUpstream backend;
+    backend.response = kIncompleteOrigin;
+    backend.response_len = sizeof(kIncompleteOrigin) - 1;
+    backend.response_after_first = kSecondOrigin;
+    backend.response_after_first_len = sizeof(kSecondOrigin) - 1;
+    backend.gate_first_response_close = true;
+    backend.keep_open = true;
+    REQUIRE(backend.setup());
+
+    PublicPairedHeadSourceResources resources;
+    REQUIRE(resources.compile(backend.port));
+    REQUIRE_EQ(resources.cfg.response_policy_count, 2u);
+    REQUIRE_EQ(resources.cfg.failure_policy_count, 2u);
+    REQUIRE_EQ(resources.cfg.policy_bundle_count, 2u);
+
+    Shard<IoUringEventLoop> shard;
+    i32 listen_fd = create_listen_socket(0).value_or(-1);
+    REQUIRE_GE(listen_fd, 0);
+    struct ShardGuard {
+        Shard<IoUringEventLoop>& shard;
+        i32& listen_fd;
+        bool spawned = false;
+        ~ShardGuard() {
+            if (spawned) {
+                shard.stop();
+                shard.join();
+            }
+            shard.shutdown();
+            if (listen_fd >= 0) close(listen_fd);
+        }
+    } shard_guard{shard, listen_fd};
+    const u16 port = get_port(listen_fd);
+    REQUIRE(shard.init(0, listen_fd).has_value());
+    shard.route_config = &resources.cfg;
+    REQUIRE(shard.spawn(-1).has_value());
+    shard_guard.spawned = true;
+    usleep(50000);
+
+    struct ClientGuard {
+        i32 fd;
+        ~ClientGuard() {
+            if (fd >= 0) close(fd);
+        }
+    } client{connect_to(port)};
+    REQUIRE_GE(client.fd, 0);
+    set_socket_timeouts(client.fd, 3);
+    static constexpr char kRequest1[] =
+        "HEAD /head?incomplete=1 HTTP/1.1\r\n"
+        "Host: client.example\r\nX-Test: partial\r\n\r\n";
+    static constexpr char kRequest2[] =
+        "HEAD /head?complete=2 HTTP/1.1\r\nHost: client.example\r\n"
+        "Connection: close\r\nX-Test: final\r\n\r\n";
+
+    REQUIRE(send_all(client.fd, kRequest1, sizeof(kRequest1) - 1));
+    for (u32 waited = 0;
+         waited < 600 &&
+         (backend.first_response_close_gate_state.load(std::memory_order_acquire) ==
+              GateState::Idle ||
+          backend.request_count.load(std::memory_order_acquire) < 1);
+         waited++)
+        usleep(5000);
+    REQUIRE_EQ(backend.first_response_close_gate_state.load(std::memory_order_acquire),
+               GateState::SentOpenWaitingGate);
+    REQUIRE_EQ(backend.accepted_count.load(std::memory_order_acquire), 1u);
+    REQUIRE_EQ(backend.request_count.load(std::memory_order_acquire), 1u);
+
+    char expected_request[256]{};
+    const int expected_request_len = snprintf(
+        expected_request,
+        sizeof(expected_request),
+        "HEAD /head?incomplete=1 HTTP/1.1\r\nHost: 127.0.0.1:%u\r\n"
+        "X-Test: partial\r\n\r\n",
+        backend.port);
+    REQUIRE_GT(expected_request_len, 0);
+    REQUIRE_EQ(backend.request_history_len[0], static_cast<u32>(expected_request_len));
+    CHECK_EQ(memcmp(backend.request_history[0], expected_request, expected_request_len), 0);
+
+    // Positive incomplete origin bytes alone must neither publish a failure
+    // response nor close the reusable downstream connection.
+    char quiet[64];
+    REQUIRE_EQ(recv_timeout(client.fd, quiet, sizeof(quiet), 100), -EAGAIN);
+    REQUIRE_EQ(backend.first_response_close_gate_state.load(std::memory_order_acquire),
+               GateState::SentOpenWaitingGate);
+    backend.allow_first_response_close.store(true, std::memory_order_release);
+    for (u32 waited = 0;
+         waited < 600 &&
+         backend.first_response_close_gate_state.load(std::memory_order_acquire) ==
+             GateState::SentOpenWaitingGate;
+         waited++)
+        usleep(5000);
+    REQUIRE_EQ(backend.first_response_close_gate_state.load(std::memory_order_acquire),
+               GateState::ClosedByGate);
+
+    char response[1024]{};
+    u32 response_len = 0;
+    REQUIRE(read_public_head_response(
+        client.fd, false, response, sizeof(response), response_len));
+    REQUIRE(normalize_public_date(response, response_len));
+    REQUIRE_EQ(response_len, static_cast<u32>(strlen(kFirstExpected)));
+    CHECK_EQ(memcmp(response, kFirstExpected, response_len), 0);
+
+    REQUIRE(send_all(client.fd, kRequest2, sizeof(kRequest2) - 1));
+    memset(response, 0, sizeof(response));
+    REQUIRE(read_public_head_response(
+        client.fd, true, response, sizeof(response), response_len));
+    REQUIRE(normalize_public_date(response, response_len));
+    REQUIRE_EQ(response_len, static_cast<u32>(strlen(kSecondExpected)));
+    CHECK_EQ(memcmp(response, kSecondExpected, response_len), 0);
+
+    for (u32 waited = 0;
+         waited < 600 && backend.request_count.load(std::memory_order_acquire) < 2;
+         waited++)
+        usleep(5000);
+    REQUIRE_EQ(backend.accepted_count.load(std::memory_order_acquire), 2u);
+    REQUIRE_EQ(backend.request_count.load(std::memory_order_acquire), 2u);
+    const char* queries[] = {"?incomplete=1", "?complete=2"};
+    const char* extras[] = {"partial", "final"};
+    for (u32 i = 0; i < 2; i++) {
+        memset(expected_request, 0, sizeof(expected_request));
+        const int expected_len = snprintf(expected_request,
+                                          sizeof(expected_request),
+                                          "HEAD /head%s HTTP/1.1\r\nHost: 127.0.0.1:%u\r\n"
+                                          "X-Test: %s\r\n\r\n",
+                                          queries[i],
+                                          backend.port,
+                                          extras[i]);
+        REQUIRE_GT(expected_len, 0);
+        REQUIRE_EQ(backend.request_history_len[i], static_cast<u32>(expected_len));
+        CHECK_EQ(memcmp(backend.request_history[i], expected_request, expected_len), 0);
     }
     usleep(100000);
     CHECK_EQ(backend.accepted_count.load(std::memory_order_acquire), 2u);
