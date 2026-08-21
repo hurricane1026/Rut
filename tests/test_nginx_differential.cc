@@ -802,6 +802,7 @@ struct KeepAlivePinnedRecorder {
         std::vector<char> wire;
         size_t parsed = 0;
         bool body_pending = false;
+        bool malformed_waiting_peer_close = false;
         std::chrono::steady_clock::time_point body_due{};
     };
 
@@ -812,6 +813,15 @@ struct KeepAlivePinnedRecorder {
     std::atomic<u32> requests{0};
     std::vector<Entry> history;
     u32 body_delay_ms = 250;
+    // Default-off observable malformed-response mode. It deliberately reports
+    // only origin socket behavior; exact io_uring owner-mask evidence belongs
+    // to the focused runtime tests.
+    bool malformed_first = false;
+    std::atomic<bool> first_malformed_sent_open{false};
+    std::atomic<bool> first_malformed_send_failed{false};
+    std::atomic<bool> first_peer_closed{false};
+    std::atomic<bool> first_peer_unexpected_data{false};
+    std::atomic<bool> first_peer_observation_failed{false};
     pthread_t thread{};
     bool thread_started = false;
 
@@ -846,6 +856,20 @@ struct KeepAlivePinnedRecorder {
         self.history.push_back({item.connection_id, request});
         self.requests.fetch_add(1, std::memory_order_release);
         item.parsed = end;
+        if (self.malformed_first && self.history.size() == 1) {
+            static constexpr char kMalformed[] = "HTTP/1.1 200 OK\r\n:\r\n\r\n";
+            if (item.wire.size() != end) {
+                self.first_peer_unexpected_data.store(true, std::memory_order_release);
+                return false;
+            }
+            if (!send_all(item.fd, kMalformed, sizeof(kMalformed) - 1)) {
+                self.first_malformed_send_failed.store(true, std::memory_order_release);
+                return false;
+            }
+            item.malformed_waiting_peer_close = true;
+            self.first_malformed_sent_open.store(true, std::memory_order_release);
+            return true;
+        }
         if (!send_head_response(item.fd)) return false;
         item.body_pending = true;
         item.body_due = now + std::chrono::milliseconds(self.body_delay_ms);
@@ -881,7 +905,7 @@ struct KeepAlivePinnedRecorder {
                     (void)setsockopt(client, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
                     (void)setsockopt(client, SOL_SOCKET, SO_SNDTIMEO, &timeout, sizeof(timeout));
                     const u32 id = next_connection_id++;
-                    active.push_back({client, id, {}, 0, false, {}});
+                    active.push_back({client, id, {}, 0, false, false, {}});
                     self->accepted.fetch_add(1, std::memory_order_release);
                 }
             }
@@ -899,7 +923,27 @@ struct KeepAlivePinnedRecorder {
                     // do not rely on a future POLLIN edge for buffered data.
                     if (!remove && !process_next_request(*self, item, now)) remove = true;
                 }
-                if (!remove && !item.body_pending && (polls[poll_index].revents & POLLIN)) {
+                if (!remove && item.malformed_waiting_peer_close &&
+                    (polls[poll_index].revents & (POLLIN | POLLERR | POLLHUP))) {
+                    char unexpected[256];
+                    const ssize_t n = recv(item.fd, unexpected, sizeof(unexpected), 0);
+                    if (n == 0 || (n < 0 && errno == ECONNRESET)) {
+                        self->first_peer_closed.store(true, std::memory_order_release);
+                        remove = true;
+                    } else if (n > 0) {
+                        self->first_peer_unexpected_data.store(true, std::memory_order_release);
+                        remove = true;
+                    } else if ((polls[poll_index].revents & POLLHUP) != 0 &&
+                               (errno == EAGAIN || errno == EWOULDBLOCK)) {
+                        self->first_peer_closed.store(true, std::memory_order_release);
+                        remove = true;
+                    } else if (errno != EINTR && errno != EAGAIN && errno != EWOULDBLOCK) {
+                        self->first_peer_observation_failed.store(true, std::memory_order_release);
+                        remove = true;
+                    }
+                }
+                if (!remove && !item.body_pending && !item.malformed_waiting_peer_close &&
+                    (polls[poll_index].revents & POLLIN)) {
                     char buf[4096];
                     const ssize_t n = recv(item.fd, buf, sizeof(buf), 0);
                     if (n > 0) {
@@ -960,6 +1004,11 @@ struct KeepAlivePinnedRecorder {
         history.clear();
         accepted.store(0, std::memory_order_relaxed);
         requests.store(0, std::memory_order_relaxed);
+        first_malformed_sent_open.store(false, std::memory_order_relaxed);
+        first_malformed_send_failed.store(false, std::memory_order_relaxed);
+        first_peer_closed.store(false, std::memory_order_relaxed);
+        first_peer_unexpected_data.store(false, std::memory_order_relaxed);
+        first_peer_observation_failed.store(false, std::memory_order_relaxed);
         running.store(true, std::memory_order_release);
         if (pthread_create(&thread, nullptr, &KeepAlivePinnedRecorder::run, this) != 0) {
             running.store(false, std::memory_order_release);
@@ -1002,6 +1051,131 @@ static bool wait_pinned_requests(KeepAlivePinnedRecorder& recorder,
     }
     error = "pinned recorder request deadline exceeded";
     return false;
+}
+
+static void settle_for_invalid_target_side_effects();
+
+static bool wait_first_malformed_peer_close(KeepAlivePinnedRecorder& recorder,
+                                            std::string& error) {
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+    while (std::chrono::steady_clock::now() < deadline) {
+        if (recorder.first_malformed_send_failed.load(std::memory_order_acquire)) {
+            error = "origin failed to send the first malformed response";
+            return false;
+        }
+        if (recorder.first_peer_unexpected_data.load(std::memory_order_acquire)) {
+            error = "origin 1 received unexpected bytes after its recorded request";
+            return false;
+        }
+        if (recorder.first_peer_observation_failed.load(std::memory_order_acquire)) {
+            error = "origin 1 peer-close observation failed";
+            return false;
+        }
+        if (recorder.accepted.load(std::memory_order_acquire) > 1 ||
+            recorder.requests.load(std::memory_order_acquire) > 1) {
+            error = "unexpected upstream activity occurred before downstream request 2";
+            return false;
+        }
+        if (recorder.first_peer_closed.load(std::memory_order_acquire)) {
+            if (!recorder.first_malformed_sent_open.load(std::memory_order_acquire)) {
+                error = "origin 1 closed without publishing its malformed response";
+                return false;
+            }
+            return true;
+        }
+        usleep(5000);
+    }
+    error = "proxy did not close origin 1 after the malformed response";
+    return false;
+}
+
+static bool exercise_malformed_head_reuse(u16 frontend_port,
+                                          KeepAlivePinnedRecorder& recorder,
+                                          const char* side,
+                                          std::vector<std::vector<char>>& responses,
+                                          std::string& error) {
+    struct ClientGuard {
+        int fd = -1;
+        ~ClientGuard() {
+            if (fd >= 0) close(fd);
+        }
+    } client{connect_once(frontend_port)};
+    if (client.fd < 0 || !send_all(client.fd,
+                                   kHeadKeepAliveRequest1,
+                                   sizeof(kHeadKeepAliveRequest1) - 1)) {
+        error = std::string(side) + " malformed HEAD request 1 send failed";
+        return false;
+    }
+
+    responses.clear();
+    std::vector<char> first;
+    std::string detail;
+    if (!read_head_response(client.fd, first, detail)) {
+        error = std::string(side) + " malformed HEAD response 1 failed: " + detail;
+        return false;
+    }
+    if (!validate_exact_normalized_response(
+            first, kHeadGatewayKeepAliveResponseNormalized, detail)) {
+        error = std::string(side) + " malformed HEAD response 1 mismatch: " + detail;
+        return false;
+    }
+    bool eof = false;
+    if (!wait_keepalive_quiet_or_eof(client.fd, 500, eof, detail) || eof) {
+        error = eof ? std::string(side) + " closed downstream after malformed response 1"
+                    : std::string(side) + " malformed response 1 quiet window failed: " + detail;
+        return false;
+    }
+    responses.push_back(std::move(first));
+
+    detail.clear();
+    if (!wait_first_malformed_peer_close(recorder, detail)) {
+        error = std::string(side) + " malformed origin-close evidence failed: " + detail;
+        return false;
+    }
+    if (recorder.accepted.load(std::memory_order_acquire) != 1 ||
+        recorder.requests.load(std::memory_order_acquire) != 1) {
+        error = std::string(side) + " did not have exactly one upstream before request 2";
+        return false;
+    }
+
+    if (!send_all(client.fd, kHeadKeepAliveRequest2, sizeof(kHeadKeepAliveRequest2) - 1)) {
+        error = std::string(side) + " malformed HEAD request 2 send failed";
+        return false;
+    }
+    std::vector<char> second;
+    detail.clear();
+    if (!read_head_response(client.fd, second, detail)) {
+        error = std::string(side) + " malformed HEAD response 2 failed: " + detail;
+        return false;
+    }
+    if (!read_eof(client.fd, detail)) {
+        error = std::string(side) + " malformed HEAD response 2 EOF failed: " + detail;
+        return false;
+    }
+    if (!validate_exact_normalized_response(second, kHeadResponseNormalized, detail)) {
+        error = std::string(side) + " malformed HEAD response 2 mismatch: " + detail;
+        return false;
+    }
+    responses.push_back(std::move(second));
+
+    if (!wait_pinned_requests(recorder, 2, detail)) {
+        error = std::string(side) + " malformed request-2 origin evidence failed: " + detail;
+        return false;
+    }
+    // Keep both the proxy and recorder live so a delayed retry, replay, or third
+    // accept remains observable instead of being suppressed by test cleanup.
+    settle_for_invalid_target_side_effects();
+    if (recorder.accepted.load(std::memory_order_acquire) != 2 ||
+        recorder.requests.load(std::memory_order_acquire) != 2 ||
+        recorder.first_malformed_send_failed.load(std::memory_order_acquire) ||
+        recorder.first_peer_unexpected_data.load(std::memory_order_acquire) ||
+        recorder.first_peer_observation_failed.load(std::memory_order_acquire) ||
+        !recorder.first_malformed_sent_open.load(std::memory_order_acquire) ||
+        !recorder.first_peer_closed.load(std::memory_order_acquire)) {
+        error = std::string(side) + " malformed phase saw extra or incomplete origin activity";
+        return false;
+    }
+    return true;
 }
 
 static bool normalize_date(std::vector<char>& bytes) {
@@ -1493,6 +1667,73 @@ static bool capture_rut_head_keepalive_gateway(
     }
     if (responses.size() != 2) {
         error = "RUT reusable HEAD gateway did not produce exactly two complete responses";
+        return false;
+    }
+    return true;
+}
+
+static bool capture_nginx_head_malformed_reuse(
+    u16 frontend_port,
+    const std::string& nginx_config_path,
+    const std::string& nginx_log_path,
+    const std::string& container_name,
+    KeepAlivePinnedRecorder& recorder,
+    std::vector<std::vector<char>>& responses,
+    std::string& error) {
+    DockerGuard docker(container_name);
+    ChildGuard nginx;
+    if (!spawn_child({"docker", "run", "--pull=never", "--network", "host", "--name",
+                      container_name, "-v", nginx_config_path + ":/etc/nginx/nginx.conf:ro",
+                      kNginxImage, "nginx", "-g", "daemon off;"},
+                     nginx_log_path,
+                     nginx.child)) {
+        error = "failed to start pinned nginx for malformed reusable HEAD differential";
+        return false;
+    }
+    if (!wait_ready(frontend_port, nginx.child, error)) return false;
+
+    const bool exercised =
+        exercise_malformed_head_reuse(frontend_port, recorder, "nginx", responses, error);
+    const bool nginx_stopped = stop_child(nginx.child);
+    const bool container_removed = docker.remove();
+    if (!exercised) return false;
+    if (!nginx_stopped) {
+        error = "failed to stop nginx after malformed reusable HEAD differential";
+        return false;
+    }
+    if (!container_removed) {
+        error = "docker rm -f failed after malformed reusable HEAD differential";
+        return false;
+    }
+    return true;
+}
+
+static bool capture_rut_head_malformed_reuse(
+    u16 frontend_port,
+    const std::string& source_path,
+    const std::string& rut_log_path,
+    const std::string& rut_path,
+    KeepAlivePinnedRecorder& recorder,
+    std::vector<std::vector<char>>& responses,
+    std::string& error) {
+    ChildGuard rut;
+    if (!spawn_child({rut_path, source_path, "--shards", "1", "--no-pin", "--drain", "0"},
+                     rut_log_path,
+                     rut.child)) {
+        error = "failed to start generated RUT for malformed reusable HEAD differential";
+        return false;
+    }
+    if (!wait_ready(frontend_port, rut.child, error)) {
+        error = "generated RUT malformed reusable HEAD readiness failed: " + error;
+        return false;
+    }
+
+    const bool exercised =
+        exercise_malformed_head_reuse(frontend_port, recorder, "RUT", responses, error);
+    const bool rut_stopped = stop_child(rut.child);
+    if (!exercised) return false;
+    if (!rut_stopped) {
+        error = "failed to stop generated RUT after malformed reusable HEAD differential";
         return false;
     }
     return true;
@@ -2717,6 +2958,125 @@ int main(int argc, char** argv) {
     }
     std::cerr << "PASS: converter-generated RUT reusable HEAD success matches pinned nginx "
                  "(two downstream responses, two fresh upstream connections)\n";
+
+    KeepAlivePinnedRecorder nginx_malformed_recorder;
+    nginx_malformed_recorder.malformed_first = true;
+    if (!nginx_malformed_recorder.setup(backend_port)) {
+        std::cerr << "FAIL [pinned malformed HEAD]: backend recorder setup failed\n";
+        return 1;
+    }
+    std::vector<std::vector<char>> nginx_malformed_responses;
+    std::string nginx_malformed_error;
+    if (!capture_nginx_head_malformed_reuse(frontend_port,
+                                            temp.nginx_config,
+                                            temp.nginx_log,
+                                            container + "-head-malformed",
+                                            nginx_malformed_recorder,
+                                            nginx_malformed_responses,
+                                            nginx_malformed_error)) {
+        std::cerr << "FAIL [pinned malformed HEAD]: " << nginx_malformed_error << "\n";
+        for (const auto& response : nginx_malformed_responses)
+            dump_wire("pinned malformed HEAD downstream", response);
+        nginx_malformed_recorder.stop();
+        dump_pinned_history(nginx_malformed_recorder, "nginx malformed HEAD");
+        dump_log(temp.nginx_log, "pinned nginx malformed HEAD log");
+        return 1;
+    }
+    nginx_malformed_recorder.stop();
+
+    KeepAlivePinnedRecorder rut_malformed_recorder;
+    rut_malformed_recorder.malformed_first = true;
+    if (!rut_malformed_recorder.setup(backend_port)) {
+        std::cerr << "FAIL [generated-RUT malformed HEAD]: backend recorder setup failed\n";
+        return 1;
+    }
+    std::vector<std::vector<char>> rut_malformed_responses;
+    std::string rut_malformed_error;
+    if (!capture_rut_head_malformed_reuse(frontend_port,
+                                          temp.source,
+                                          temp.rut_log,
+                                          argv[1],
+                                          rut_malformed_recorder,
+                                          rut_malformed_responses,
+                                          rut_malformed_error)) {
+        std::cerr << "FAIL [generated-RUT malformed HEAD]: " << rut_malformed_error << "\n";
+        for (const auto& response : rut_malformed_responses)
+            dump_wire("generated-RUT malformed HEAD downstream", response);
+        rut_malformed_recorder.stop();
+        dump_pinned_history(rut_malformed_recorder, "RUT malformed HEAD");
+        dump_log(temp.rut_log, "generated-RUT malformed HEAD log");
+        return 1;
+    }
+    rut_malformed_recorder.stop();
+
+    const auto malformed_recorder_is_exact = [](const KeepAlivePinnedRecorder& recorder) {
+        return recorder.accepted.load(std::memory_order_acquire) == 2 &&
+               recorder.requests.load(std::memory_order_acquire) == 2 &&
+               recorder.history.size() == 2 && recorder.history[0].connection_id == 1 &&
+               recorder.history[1].connection_id == 2 &&
+               recorder.history[0].connection_id != recorder.history[1].connection_id &&
+               recorder.first_malformed_sent_open.load(std::memory_order_acquire) &&
+               !recorder.first_malformed_send_failed.load(std::memory_order_acquire) &&
+               recorder.first_peer_closed.load(std::memory_order_acquire) &&
+               !recorder.first_peer_unexpected_data.load(std::memory_order_acquire) &&
+               !recorder.first_peer_observation_failed.load(std::memory_order_acquire);
+    };
+    if (nginx_malformed_responses.size() != 2 || rut_malformed_responses.size() != 2 ||
+        !malformed_recorder_is_exact(nginx_malformed_recorder) ||
+        !malformed_recorder_is_exact(rut_malformed_recorder)) {
+        std::cerr << "FAIL [malformed HEAD differential]: exact response/origin cardinality "
+                     "or close evidence failed\n";
+        dump_pinned_history(nginx_malformed_recorder, "nginx malformed HEAD");
+        dump_pinned_history(rut_malformed_recorder, "RUT malformed HEAD");
+        dump_log(temp.nginx_log, "pinned nginx malformed HEAD log");
+        dump_log(temp.rut_log, "generated-RUT malformed HEAD log");
+        return 1;
+    }
+
+    const char* const expected_malformed_responses[] = {
+        kHeadGatewayKeepAliveResponseNormalized,
+        kHeadResponseNormalized,
+    };
+    for (size_t i = 0; i < 2; i++) {
+        std::vector<char> normalized_nginx = nginx_malformed_responses[i];
+        std::vector<char> normalized_rut = rut_malformed_responses[i];
+        const char* expected_response = expected_malformed_responses[i];
+        const size_t expected_len = strlen(expected_response);
+        const std::string expected_request =
+            std::string(i == 0 ? "HEAD /head?q=1 HTTP/1.1\r\n"
+                               : "HEAD /head?q=2 HTTP/1.1\r\n") +
+            "Host: 127.0.0.1:" + std::to_string(backend_port) + "\r\n\r\n";
+        const std::vector<char> expected_wire(expected_request.begin(), expected_request.end());
+        if (!normalize_date(normalized_nginx) || !normalize_date(normalized_rut) ||
+            normalized_nginx.size() != expected_len || normalized_rut.size() != expected_len ||
+            memcmp(normalized_nginx.data(), expected_response, expected_len) != 0 ||
+            memcmp(normalized_rut.data(), expected_response, expected_len) != 0 ||
+            normalized_nginx != normalized_rut ||
+            nginx_malformed_recorder.history[i].wire != expected_wire ||
+            rut_malformed_recorder.history[i].wire != expected_wire ||
+            nginx_malformed_recorder.history[i].wire !=
+                rut_malformed_recorder.history[i].wire) {
+            std::cerr << "FAIL [malformed HEAD differential]: request " << (i + 1)
+                      << " nginx/generated-RUT observable wire mismatch\n";
+            dump_wire("expected malformed HEAD response",
+                      std::vector<char>(expected_response, expected_response + expected_len));
+            dump_wire("nginx malformed HEAD response", nginx_malformed_responses[i]);
+            dump_wire("generated-RUT malformed HEAD response", rut_malformed_responses[i]);
+            dump_wire("expected malformed HEAD upstream request", expected_wire);
+            dump_wire("nginx malformed HEAD upstream request",
+                      nginx_malformed_recorder.history[i].wire);
+            dump_wire("generated-RUT malformed HEAD upstream request",
+                      rut_malformed_recorder.history[i].wire);
+            dump_pinned_history(nginx_malformed_recorder, "nginx malformed HEAD");
+            dump_pinned_history(rut_malformed_recorder, "RUT malformed HEAD");
+            dump_log(temp.nginx_log, "pinned nginx malformed HEAD log");
+            dump_log(temp.rut_log, "generated-RUT malformed HEAD log");
+            return 1;
+        }
+    }
+    std::cerr << "PASS: converter-generated RUT malformed/open-peer reusable HEAD matches pinned "
+                 "nginx (two exact responses, fresh origin wires, final EOF; exact io_uring "
+                 "owner masks covered separately)\n";
 
     DeadPort keepalive_dead;
     if (!keepalive_dead.reserve(backend_port)) {
