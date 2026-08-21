@@ -135,6 +135,7 @@ core::Expected<void, Error> EpollBackend::init(u32 /*shard_id*/, i32 lfd) {
     timer_fd = -1;
     yield_timer_fd = -1;
     pending_count = 0;
+    pending_streak = 0;
     for (u32 i = 0; i < kMaxFdMap; i++) {
         downstream_fd_map[i] = -1;
         upstream_fd_map[i] = -1;
@@ -560,26 +561,46 @@ void EpollBackend::cancel_accept() {
 }
 
 u32 EpollBackend::wait(IoEvent* events, u32 max_events, Connection* conns, u32 max_conns) {
-    u32 out = 0;
+    if (max_events == 0) return 0;
 
-    while (pending_count > 0 && out < max_events) {
-        events[out] = pending_completions[--pending_count];
-        out++;
+    auto pop_pending = [&]() -> u32 {
+        events[0] = pending_completions[--pending_count];
+        if (pending_count == 0)
+            pending_streak = 0;
+        else if (pending_streak < kPendingBurstQuota)
+            pending_streak++;
+        return 1;
+    };
+
+    if (pending_count == 0) {
+        pending_streak = 0;
+    } else if (pending_streak < kPendingBurstQuota) {
+        return pop_pending();
     }
 
-    i32 timeout_ms = (out > 0) ? 0 : -1;
-
-    struct epoll_event ep_events[kMaxEventsPerWait];
-    u32 max_ep = max_events - out;
-    if (max_ep > kMaxEventsPerWait) max_ep = kMaxEventsPerWait;
-
+    const bool probe_pending = pending_count > 0;
+    struct epoll_event ep_events[1];
     i32 n;
     for (;;) {
-        n = epoll_wait(epoll_fd, ep_events, static_cast<i32>(max_ep), timeout_ms);
+        n = epoll_wait(epoll_fd, ep_events, 1, probe_pending ? 0 : -1);
         if (n >= 0) break;
-        if (errno == EINTR) continue;
-        return out;
+        if (errno == EINTR && !probe_pending) continue;
+        if (probe_pending) {
+            pending_streak = 0;
+            return pop_pending();
+        }
+        return 0;
     }
+    if (n == 0) {
+        if (probe_pending) {
+            pending_streak = 0;
+            return pop_pending();
+        }
+        return 0;
+    }
+    pending_streak = 0;
+
+    u32 out = 0;
 
     for (i32 i = 0; i < n && out < max_events; i++) {
         u32 conn_id;
@@ -594,15 +615,23 @@ u32 EpollBackend::wait(IoEvent* events, u32 max_events, Connection* conns, u32 m
         // the kernel would re-deliver it forever (busy loop + slot leak).
         bool has_read = (ep_events[i].events & (EPOLLIN | EPOLLHUP | EPOLLERR | EPOLLRDHUP)) != 0;
         bool has_write = (ep_events[i].events & EPOLLOUT) != 0;
+        bool send_ready = false;
+        if (!(ep_events[i].events & (EPOLLHUP | EPOLLERR | EPOLLRDHUP)) &&
+            conn_id < kMaxFdMap) {
+            const auto& send_state_for_event =
+                (type == IoEventType::Send) ? send_state[conn_id] : upstream_send_state[conn_id];
+            if (send_state_for_event.remaining > 0 && send_state_for_event.src != nullptr &&
+                send_state_for_event.fd >= 0) {
+                send_ready = send_state_for_event.tls
+                                 ? (send_state_for_event.tls_wait_events == EPOLLIN ? has_read
+                                                                                    : has_write)
+                                 : has_write;
+            }
+        }
 
         if (conn_id == kListenConnId) {
-            for (;;) {
-                i32 fd = accept4(listen_fd, nullptr, nullptr, SOCK_NONBLOCK | SOCK_CLOEXEC);
-                if (fd < 0) break;
-                if (out >= max_events) {
-                    close(fd);
-                    break;
-                }
+            i32 fd = accept4(listen_fd, nullptr, nullptr, SOCK_NONBLOCK | SOCK_CLOEXEC);
+            if (fd >= 0) {
                 events[out].conn_id = 0;
                 events[out].type = IoEventType::Accept;
                 events[out].result = fd;
@@ -610,6 +639,7 @@ u32 EpollBackend::wait(IoEvent* events, u32 max_events, Connection* conns, u32 m
                 events[out].has_buf = 0;
                 events[out].more = 0;
                 events[out].aux = 0;
+                events[out].upstream_episode = 0;
                 out++;
             }
         } else if (conn_id == kTimerConnId) {
@@ -628,9 +658,11 @@ u32 EpollBackend::wait(IoEvent* events, u32 max_events, Connection* conns, u32 m
                 events[out].has_buf = 0;
                 events[out].more = 0;
                 events[out].aux = 0;
+                events[out].upstream_episode = 0;
                 out++;
             }
-        } else if (type == IoEventType::UpstreamConnect && has_write) {
+        } else if (type == IoEventType::UpstreamConnect &&
+                   (has_write || (ep_events[i].events & (EPOLLHUP | EPOLLERR | EPOLLRDHUP)))) {
             i32 err = 0;
             socklen_t errlen = sizeof(err);
             i32 cfd = (conn_id < kMaxFdMap) ? upstream_fd_map[conn_id] : -1;
@@ -642,18 +674,15 @@ u32 EpollBackend::wait(IoEvent* events, u32 max_events, Connection* conns, u32 m
             events[out].has_buf = 0;
             events[out].more = 0;
             events[out].aux = 0;
+            events[out].upstream_episode = 0;
             out++;
             continue;
-        } else if (type == IoEventType::Recv && conn_id < max_conns && conns[conn_id].tls_active &&
+        } else if (send_ready) {
+            goto handle_epollout;
+        } else if (type == IoEventType::Recv && conn_id < max_conns && conns != nullptr &&
+                   conns[conn_id].tls_active &&
                    (has_read || has_write)) {
             goto handle_epollin;
-        } else if (type == IoEventType::Send && conn_id < kMaxFdMap && send_state[conn_id].tls &&
-                   send_state[conn_id].remaining > 0) {
-            auto& ss = send_state[conn_id];
-            if (has_write || (has_read && ss.tls_wait_events == EPOLLIN)) {
-                goto handle_epollout;
-            }
-            if (has_read) goto handle_epollin;
         } else if (has_read) {
         handle_epollin:
             IoEventType recv_type = type;
@@ -663,7 +692,7 @@ u32 EpollBackend::wait(IoEvent* events, u32 max_events, Connection* conns, u32 m
                 fd = (recv_type == IoEventType::UpstreamRecv) ? upstream_fd_map[conn_id]
                                                               : downstream_fd_map[conn_id];
             }
-            if (fd < 0 || conn_id >= max_conns) continue;
+            if (fd < 0 || conn_id >= max_conns || conns == nullptr) continue;
 
             auto& conn = conns[conn_id];
             auto& buf =
@@ -701,6 +730,7 @@ u32 EpollBackend::wait(IoEvent* events, u32 max_events, Connection* conns, u32 m
                             events[out].has_buf = 0;
                             events[out].more = 0;
                             events[out].aux = 0;
+                            events[out].upstream_episode = 0;
                             out++;
                             continue;
                         }
@@ -777,20 +807,27 @@ u32 EpollBackend::wait(IoEvent* events, u32 max_events, Connection* conns, u32 m
             events[out].has_buf = 0;
             events[out].more = 0;
             events[out].aux = 0;
+            events[out].upstream_episode = 0;
             out++;
 
-            if (has_write && conn_id < kMaxFdMap && out < max_events) {
-                if ((type == IoEventType::Send && send_state[conn_id].remaining > 0) ||
-                    (type != IoEventType::Send && upstream_send_state[conn_id].remaining > 0)) {
-                    goto handle_epollout;
+        } else if (has_write) {
+            if (conn_id < kMaxFdMap) {
+                const auto& ss =
+                    (type == IoEventType::Send) ? send_state[conn_id] : upstream_send_state[conn_id];
+                if (ss.tls && ss.remaining > 0 && ss.tls_wait_events == EPOLLIN) {
+                    set_fd_interest(epoll_fd,
+                                    ss.fd,
+                                    conn_id,
+                                    ss.type,
+                                    tls_send_interest_for_state(ss));
+                    continue;
                 }
             }
-        } else if (has_write) {
         handle_epollout:
             if (conn_id >= kMaxFdMap) continue;
             auto& ss =
                 (type == IoEventType::Send) ? send_state[conn_id] : upstream_send_state[conn_id];
-            if (ss.tls && conn_id >= max_conns) continue;
+            if (ss.tls && (conns == nullptr || conn_id >= max_conns)) continue;
             if (ss.remaining == 0 || !ss.src || ss.fd < 0) {
                 // No outstanding send associated with this connection.
                 // Drop EPOLLOUT so a stale level-triggered wakeup cannot spin.
@@ -875,6 +912,7 @@ u32 EpollBackend::wait(IoEvent* events, u32 max_events, Connection* conns, u32 m
             events[out].has_buf = 0;
             events[out].more = 0;
             events[out].aux = 0;
+            events[out].upstream_episode = 0;
             out++;
         }
     }
@@ -883,6 +921,8 @@ u32 EpollBackend::wait(IoEvent* events, u32 max_events, Connection* conns, u32 m
 }
 
 void EpollBackend::shutdown() {
+    pending_count = 0;
+    pending_streak = 0;
     if (timer_fd >= 0) {
         close(timer_fd);
         timer_fd = -1;

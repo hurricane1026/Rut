@@ -47,8 +47,12 @@ struct EpollBackend {
     // syscall; they are single-threaded and non-reentrant, so one entry check
     // reserves the only completion slot that operation can need.
     static constexpr u32 kPendingCap = 64;
+    static constexpr u32 kPendingBurstQuota = 8;
     IoEvent pending_completions[kPendingCap];
     u32 pending_count = 0;
+    // Consecutive synthetic completions returned by wait(); once the quota is
+    // reached, wait() performs one nonblocking kernel probe before popping.
+    u32 pending_streak = 0;
 
     // Outstanding partial-send state per connection.
     // When add_send() can't complete immediately (partial write or EAGAIN),

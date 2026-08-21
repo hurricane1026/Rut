@@ -4215,6 +4215,185 @@ TEST(epoll_pending_capacity, immediate_completion_preserves_lifo_and_prior_entri
     backend.shutdown();
 }
 
+TEST(epoll_wait_boundary, pending_is_lifo_bounded_and_kernel_ready_wins_after_quota) {
+    EpollBackend backend;
+    REQUIRE(backend.init(0, -1).has_value());
+
+    // max_events == 0 is a true no-op, including the fairness state.
+    backend.pending_completions[0] = {9, 9, 0, 0, IoEventType::Recv, 0, 0, 0};
+    backend.pending_count = 1;
+    backend.pending_streak = 3;
+    IoEvent event{};
+    CHECK_EQ(backend.wait(&event, 0, nullptr, 0), 0u);
+    CHECK_EQ(backend.pending_count, 1u);
+    CHECK_EQ(backend.pending_streak, 3u);
+    backend.pending_count = 0;
+    backend.pending_streak = 0;
+
+    // Eight synthetic completions are consumed one at a time, newest first.
+    for (u32 i = 0; i < 9; i++)
+        backend.pending_completions[i] = {100u + i,
+                                          static_cast<i32>(100 + i),
+                                          0,
+                                          0,
+                                          IoEventType::Recv,
+                                          0,
+                                          0,
+                                          0};
+    backend.pending_count = 9;
+    for (u32 i = 0; i < EpollBackend::kPendingBurstQuota; i++) {
+        REQUIRE_EQ(backend.wait(&event, 1, nullptr, 0), 1u);
+        CHECK_EQ(event.conn_id, 108u - i);
+        CHECK_EQ(event.result, static_cast<i32>(108 - i));
+        CHECK_EQ(backend.pending_count, 8u - i);
+    }
+    CHECK_EQ(backend.pending_streak, EpollBackend::kPendingBurstQuota);
+
+    // A ready real fd wins the ninth quota probe; the queued completion remains.
+    i32 fds[2] = {-1, -1};
+    REQUIRE_EQ(socketpair(AF_UNIX, SOCK_STREAM | SOCK_NONBLOCK, 0, fds), 0);
+    TestConn tc;
+    tc.init(0, fds[0]);
+    REQUIRE(backend.add_recv(fds[0], 0));
+    REQUIRE(send_byte_with_retry(fds[1], 'r'));
+    REQUIRE_EQ(backend.wait(&event, 1, &tc.conn, 1), 1u);
+    CHECK_EQ(event.type, IoEventType::Recv);
+    CHECK_EQ(event.result, 1);
+    CHECK_EQ(tc.conn.recv_buf.len(), 1u);
+    CHECK_EQ(backend.pending_count, 1u);
+
+    // No-ready quota probe falls back to the pending LIFO entry and resets.
+    backend.cancel(fds[0], 0);
+    backend.pending_completions[1] = {55, 55, 0, 0, IoEventType::Recv, 0, 0, 0};
+    backend.pending_count = 2;
+    backend.pending_streak = EpollBackend::kPendingBurstQuota;
+    CHECK_EQ(backend.wait(&event, 1, nullptr, 0), 1u);
+    CHECK_EQ(event.conn_id, 55u);
+    CHECK_EQ(backend.pending_count, 1u);
+    CHECK_EQ(backend.pending_streak, 1u);
+    CHECK_EQ(backend.wait(&event, 1, nullptr, 0), 1u);
+    CHECK_EQ(event.conn_id, 100u);
+    CHECK_EQ(backend.pending_count, 0u);
+    CHECK_EQ(backend.pending_streak, 0u);
+
+    // Once empty, a newly queued event starts a fresh burst immediately.
+    backend.pending_completions[0] = {77, 77, 0, 0, IoEventType::Recv, 0, 0, 0};
+    backend.pending_count = 1;
+    CHECK_EQ(backend.wait(&event, 1, nullptr, 0), 1u);
+    CHECK_EQ(event.conn_id, 77u);
+    CHECK_EQ(backend.pending_streak, 0u);
+
+    close(fds[0]);
+    close(fds[1]);
+    backend.shutdown();
+}
+
+TEST(epoll_wait_boundary, accept_backlog_emits_one_completion_per_wait) {
+    const i32 listener = create_listen_socket(0).value_or(-1);
+    REQUIRE(listener >= 0);
+    EpollBackend backend;
+    REQUIRE(backend.init(0, listener).has_value());
+    backend.add_accept();
+
+    const u16 port = get_port(listener);
+    const i32 client1 = connect_to(port);
+    const i32 client2 = connect_to(port);
+    REQUIRE(client1 >= 0);
+    REQUIRE(client2 >= 0);
+
+    IoEvent events[2]{};
+    REQUIRE_EQ(backend.wait(events, 2, nullptr, 0), 1u);
+    CHECK_EQ(events[0].type, IoEventType::Accept);
+    CHECK(events[0].result >= 0);
+    const i32 accepted1 = events[0].result;
+    REQUIRE_EQ(backend.wait(events, 2, nullptr, 0), 1u);
+    CHECK_EQ(events[0].type, IoEventType::Accept);
+    CHECK(events[0].result >= 0);
+    const i32 accepted2 = events[0].result;
+    CHECK(accepted1 != accepted2);
+
+    close(accepted1);
+    close(accepted2);
+    close(client1);
+    close(client2);
+    backend.shutdown();
+    close(listener);
+}
+
+TEST(epoll_wait_boundary, ready_send_precedes_read_then_read_is_visible) {
+    EpollBackend backend;
+    REQUIRE(backend.init(0, -1).has_value());
+    i32 fds[2] = {-1, -1};
+    REQUIRE_EQ(socketpair(AF_UNIX, SOCK_STREAM | SOCK_NONBLOCK, 0, fds), 0);
+    TestConn tc;
+    tc.init(0, fds[0]);
+    static const u8 payload[] = {'o', 'k'};
+    static const u8 input[] = {'r'};
+    REQUIRE(backend.add_recv(fds[0], 0));
+    backend.send_state[0] = {payload, fds[0], 0, sizeof(payload), IoEventType::Send, false, 0};
+    REQUIRE(backend.add_recv(fds[0], 0));
+    REQUIRE_EQ(send(fds[1], input, sizeof(input), MSG_NOSIGNAL), 1);
+
+    IoEvent event{};
+    REQUIRE_EQ(backend.wait(&event, 1, &tc.conn, 1), 1u);
+    CHECK_EQ(event.type, IoEventType::Send);
+    CHECK_EQ(event.result, static_cast<i32>(sizeof(payload)));
+    CHECK_EQ(backend.send_state[0].remaining, 0u);
+    u8 received[sizeof(payload)]{};
+    CHECK_EQ(recv(fds[1], received, sizeof(received), MSG_DONTWAIT),
+             static_cast<ssize_t>(sizeof(payload)));
+    CHECK_EQ(received[0], static_cast<u8>('o'));
+    CHECK_EQ(received[1], static_cast<u8>('k'));
+
+    REQUIRE_EQ(backend.wait(&event, 1, &tc.conn, 1), 1u);
+    CHECK_EQ(event.type, IoEventType::Recv);
+    CHECK_EQ(event.result, 1);
+    CHECK_EQ(tc.conn.recv_buf.len(), 1u);
+    CHECK_EQ(tc.conn.recv_buf.data()[0], static_cast<u8>('r'));
+
+    close(fds[0]);
+    close(fds[1]);
+    backend.shutdown();
+}
+
+TEST(epoll_wait_boundary, ordinary_send_waits_for_epollout_when_read_is_only_ready) {
+    EpollBackend backend;
+    REQUIRE(backend.init(0, -1).has_value());
+    i32 fds[2] = {-1, -1};
+    REQUIRE_EQ(socketpair(AF_UNIX, SOCK_STREAM | SOCK_NONBLOCK, 0, fds), 0);
+    TestConn tc;
+    tc.init(0, fds[0]);
+    static const u8 payload[] = {'s', 'e', 'n', 'd'};
+    REQUIRE(backend.add_recv(fds[0], 0));
+    backend.send_state[0] = {payload, fds[0], 0, sizeof(payload), IoEventType::Send, false, 0};
+    struct epoll_event ev{};
+    ev.events = EPOLLIN;
+    ev.data.u64 = static_cast<u64>(IoEventType::Recv);
+    REQUIRE_EQ(epoll_ctl(backend.epoll_fd, EPOLL_CTL_MOD, fds[0], &ev), 0);
+    REQUIRE(send_byte_with_retry(fds[1], 'r'));
+
+    IoEvent event{};
+    REQUIRE_EQ(backend.wait(&event, 1, &tc.conn, 1), 1u);
+    CHECK_EQ(event.type, IoEventType::Recv);
+    CHECK_EQ(event.result, 1);
+    CHECK_EQ(backend.send_state[0].remaining, static_cast<u32>(sizeof(payload)));
+    u8 received[sizeof(payload)]{};
+    CHECK_EQ(recv(fds[1], received, sizeof(received), MSG_DONTWAIT), -1);
+    CHECK(errno == EAGAIN || errno == EWOULDBLOCK);
+
+    ev.events = EPOLLOUT;
+    ev.data.u64 = static_cast<u64>(IoEventType::Send);
+    REQUIRE_EQ(epoll_ctl(backend.epoll_fd, EPOLL_CTL_MOD, fds[0], &ev), 0);
+    REQUIRE_EQ(backend.wait(&event, 1, &tc.conn, 1), 1u);
+    CHECK_EQ(event.type, IoEventType::Send);
+    CHECK_EQ(event.result, static_cast<i32>(sizeof(payload)));
+    CHECK_EQ(backend.send_state[0].remaining, 0u);
+
+    close(fds[0]);
+    close(fds[1]);
+    backend.shutdown();
+}
+
 TEST(epoll_pending_capacity, scoped_producers_reject_full_ring_before_side_effects) {
     EpollBackend backend;
     REQUIRE(backend.init(0, -1).has_value());
