@@ -17,8 +17,8 @@ Allowed states are `SUPPORTED`, `PARTIAL`, `BLOCKED_BY_RUT`,
 | preserve raw request-target and query | implicit | yes | partial: origin-form forward sends original bytes | pinned query differential; broader normalization untested | PARTIAL |
 | preserve request method and body | implicit | yes | partial: fixed-CL body is staged before connect within one 16 KiB composite slice | RUT exact binary/segmented/boundary tests and pinned generated-RUT binary POST differential | PARTIAL |
 | nginx default upstream HTTP version and request headers | implicit | yes | partial: explicit fixed HTTP/1.1 policy with bounded fixed-CL buffering; #252 | exact RUT tests plus pinned generated-RUT GET and POST differentials | PARTIAL |
-| proxied response status and body | implicit | yes | partial: strict final H1.1 exact-Content-Length streaming plus public-source-selectable paired explicit-close HEAD success/connect-failure serialization; converter HEAD selection absent | exact public-source production-JIT HEAD success/failure and non-HEAD sibling wires, internal lifecycle tests, pinned generated-RUT GET/POST differentials, and nginx-only HEAD baselines | PARTIAL |
-| nginx default proxied response header policy | implicit | yes | partial: bounded strict H1.1 final-response/content-length serializer and public-source-selectable paired explicit-close HEAD success/connect-failure policy; converter HEAD path absent; #253 | exact public-source production-JIT HEAD success/failure/no-pool tests, internal token/lifecycle tests, pinned generated-RUT GET/POST/close differentials, and nginx-only HEAD baselines | PARTIAL |
+| proxied response status and body | implicit | yes, including method-isolated root HEAD lowering | partial: strict final H1.1 exact-Content-Length streaming plus paired explicit-close HEAD success/connect-failure serialization | exact public-source production-JIT HEAD success/failure and non-HEAD sibling wires, internal lifecycle tests, pinned generated-RUT GET/POST differentials, and separate nginx-only HEAD baselines; generated-RUT HEAD differential pending | PARTIAL |
+| nginx default proxied response header policy | implicit | yes, including method-isolated root HEAD lowering | partial: bounded strict H1.1 final-response/content-length serializer and paired explicit-close HEAD success/connect-failure policy; #253 | exact public-source production-JIT HEAD success/failure/no-pool tests, internal token/lifecycle tests, pinned generated-RUT GET/POST/close differentials, and separate nginx-only HEAD baselines; generated-RUT HEAD differential pending | PARTIAL |
 | single unavailable upstream gateway error | implicit | yes | yes for bounded H1 single-IPv4 connect failures; #256 | committed pinned close/EOF differential plus pinned keep-alive and split-POST evidence | SUPPORTED |
 | exact, `^~`, regex, or nested locations | no | no | no nginx selection semantics | no | NOT_PLANNED |
 | exact `/api/` + proxy URI `/`, clean bounded H1 request domain | yes | yes | yes: bounded prefix replacement; #259 closed | pinned converter-generated `/api/`, `/api/x`, and query differentials; four out-of-domain targets fail before upstream | SUPPORTED |
@@ -54,9 +54,9 @@ Allowed states are `SUPPORTED`, `PARTIAL`, `BLOCKED_BY_RUT`,
   retains an upstream `Content-Length: 5` in the downstream headers while
   emitting no body bytes and closing the client. Public RUT source can now
   select only a paired success/failure disposition for this bounded slice, and
-  source→JIT→production success/failure wires are now proven. Converter lowering
-  and nginx-vs-generated-RUT HEAD differentials are still absent, so #253
-  remains `PARTIAL`.
+  source→JIT→production success/failure wires are proven, and the root converter
+  now emits the method-isolated pair. nginx-vs-generated-RUT HEAD differentials
+  are still absent, so #253 remains `PARTIAL`.
 - Pinned nginx also suppresses the 157-byte generated 502 body for an
   explicit-close HEAD when the single upstream connect fails, while retaining
   `Content-Length: 157`. RUT now carries a source-unreachable shared HEAD
@@ -64,8 +64,9 @@ Allowed states are `SUPPORTED`, `PARTIAL`, `BLOCKED_BY_RUT`,
   `Reject`; only paired `SuppressBody` enters a bounded fresh-connect path that
   emits header-only strict success or configured 502, forces EOF, and never
   pools/replays the upstream. Mismatches fail before upstream effects. Public
-  source selection enforces the pairing and its production path is proven, but
-  converter lowering remains absent.
+  source selection enforces the pairing, its production path is proven, and the
+  root converter emits it only on HEAD. The pinned generated-RUT differential
+  remains pending.
 - The first request-policy slice rejects body/framing inputs (including
   `Content-Length` and every `Transfer-Encoding` value), HTTP/2, and
   non-origin-form targets before upstream connect. These are intentional
