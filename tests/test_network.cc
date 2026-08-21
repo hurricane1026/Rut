@@ -15768,6 +15768,132 @@ TEST(state_invariant, jit_forward_direct_paired_head_connect_submit_serializes_n
     loop.close_conn(*c);
 }
 
+TEST(state_invariant, jit_forward_direct_paired_head_negative_connect_is_idempotent) {
+    RouteConfig cfg;
+    auto upstream = cfg.add_upstream("api", 0x7F000001, 9000);
+    REQUIRE(upstream.has_value());
+    cfg.upstreams[upstream.value()].max_inflight = 1;
+
+    static constexpr char kBody[] =
+        "<html>\r\n<head><title>502 Bad Gateway</title></head>\r\n<body>\r\n"
+        "<center><h1>502 Bad Gateway</h1></center>\r\n"
+        "<hr><center>nginx/1.29.7</center>\r\n</body>\r\n</html>\r\n";
+    static_assert(sizeof(kBody) - 1 == 157);
+    ForwardResponsePolicySpec response{};
+    response.version = ResponsePolicyVersion::Http11;
+    response.framing = ResponsePolicyFraming::ContentLength;
+    response.connection = ResponsePolicyConnection::Request;
+    response.date = ResponsePolicyDate::Current;
+    response.head_mode = ResponsePolicyHeadMode::SuppressBody;
+    response.server = {"nginx/1.29.7", 12};
+    REQUIRE_EQ(cfg.add_response_policy(response), 1u);
+    ForwardFailurePolicySpec failure{};
+    failure.version = ForwardFailurePolicyVersion::Http11;
+    failure.status_code = 502;
+    failure.date = ForwardFailurePolicyDate::Current;
+    failure.connection = ForwardFailurePolicyConnection::Request;
+    failure.head_mode = FailurePolicyHeadMode::SuppressBody;
+    failure.reason = {"Bad Gateway", 11};
+    failure.content_type = {"text/html", 9};
+    failure.server = {"nginx/1.29.7", 12};
+    failure.body = {kBody, sizeof(kBody) - 1};
+    REQUIRE_EQ(cfg.add_failure_policy(failure), 1u);
+
+    SmallLoop loop;
+    loop.setup();
+    int fds[2];
+    REQUIRE(socketpair(AF_UNIX, SOCK_STREAM, 0, fds) == 0);
+    ScopedFakeSocket fake_socket(fds[0]);
+    loop.inject_and_dispatch(make_ev(0, IoEventType::Accept, 42));
+    auto* c = loop.find_fd(42);
+    REQUIRE(c != nullptr);
+    c->request_config = &cfg;
+    static constexpr char kRequest[] =
+        "HEAD /missing?q=1 HTTP/1.1\r\nHost: client.example\r\n"
+        "Connection: close\r\n\r\n";
+    REQUIRE_EQ(c->recv_buf.write(reinterpret_cast<const u8*>(kRequest), sizeof(kRequest) - 1),
+               sizeof(kRequest) - 1);
+    capture_request_metadata(*c);
+    c->req_initial_send_len = c->recv_buf.len();
+    JitDispatchOutcome outcome{};
+    outcome.kind = JitDispatchOutcome::Kind::Forward;
+    outcome.upstream_id = upstream.value();
+    outcome.response_policy_id = 1;
+    outcome.failure_policy_id = 1;
+    loop.backend.clear_ops();
+    handle_jit_outcome<SmallLoop>(&loop, *c, outcome, nullptr, true);
+    REQUIRE_EQ(loop.backend.count_ops(MockOp::Connect), 1u);
+    REQUIRE(c->upstream_fd >= 0);
+    REQUIRE(c->on_upstream_send != nullptr);
+
+    // Route the negative completion through the mock backend dispatch, as the
+    // production callback slot would receive it.
+    loop.inject_and_dispatch(make_ev(c->id, IoEventType::UpstreamConnect, -ECONNREFUSED));
+    CHECK_EQ(loop.backend.count_ops(MockOp::Send), 1u);
+    CHECK_EQ(c->resp_status, kStatusBadGateway);
+    CHECK_EQ(c->upstream_fd, -1);
+    CHECK(c->upstream_abandoned);
+    CHECK_FALSE(c->upstream_slot_held);
+    CHECK_FALSE(c->upstream_recv_armed);
+    CHECK_FALSE(c->upstream_send_armed);
+    CHECK_EQ(c->on_upstream_recv, nullptr);
+    CHECK_EQ(c->on_upstream_send, nullptr);
+    char normalized[SmallLoop::kBufSize]{};
+    const u32 send_len = c->send_buf.len();
+    REQUIRE_LT(send_len, static_cast<u32>(sizeof(normalized)));
+    memcpy(normalized, c->send_buf.data(), send_len);
+    char* date = strstr(normalized, "Date: ");
+    REQUIRE(date != nullptr);
+    REQUIRE(date[6 + 29] == '\r');
+    for (u32 i = 0; i < 29; i++) date[6 + i] = 'X';
+    static constexpr char kExpected[] =
+        "HTTP/1.1 502 Bad Gateway\r\n"
+        "Server: nginx/1.29.7\r\n"
+        "Date: XXXXXXXXXXXXXXXXXXXXXXXXXXXXX\r\n"
+        "Content-Type: text/html\r\n"
+        "Content-Length: 157\r\n"
+        "Connection: close\r\n\r\n";
+    CHECK_EQ(send_len, static_cast<u32>(sizeof(kExpected) - 1));
+    CHECK_EQ(memcmp(normalized, kExpected, sizeof(kExpected) - 1), 0);
+
+    const u32 sends_before_late = loop.backend.count_ops(MockOp::Send);
+    const u32 slot_state = c->upstream_slot_held ? 1u : 0u;
+    on_upstream_connected<SmallLoop>(
+        &loop,
+        *c,
+        make_ev(c->id, IoEventType::UpstreamConnect, -ECONNREFUSED));
+    CHECK_EQ(loop.backend.count_ops(MockOp::Send), sends_before_late);
+    CHECK_EQ(c->upstream_slot_held ? 1u : 0u, slot_state);
+    CHECK_EQ(c->send_buf.len(), send_len);
+    loop.close_conn(*c);
+    close(fds[1]);
+}
+
+TEST(upstream_reuse, paired_head_failure_never_reconnects_or_replays) {
+    SmallLoop loop;
+    loop.setup();
+    RouteConfig cfg;
+    auto upstream = cfg.add_upstream("api", 0x7F000001, 9000);
+    REQUIRE(upstream.has_value());
+    auto* c = loop.alloc_conn();
+    REQUIRE(c != nullptr);
+    c->request_config = &cfg;
+    c->upstream_idx = static_cast<u16>(upstream.value());
+    c->upstream_backend_idx = 0;
+    c->req_method = static_cast<u8>(LogHttpMethod::Head);
+    c->upstream_reused = true;
+    c->failure_policy_suppress_body = true;
+    c->upstream_fd = dup(STDERR_FILENO);
+    REQUIRE(c->upstream_fd >= 0);
+    loop.backend.clear_ops();
+    CHECK_FALSE(retry_reused_upstream(&loop, *c));
+    CHECK_FALSE(c->upstream_reused);
+    CHECK_EQ(loop.backend.count_ops(MockOp::Connect), 0u);
+    close(c->upstream_fd);
+    c->upstream_fd = -1;
+    loop.free_conn(*c);
+}
+
 TEST(state_invariant, failure_policy_serializer_capacity_failure_is_transactional) {
     RouteConfig cfg;
     ForwardFailurePolicySpec policy{};

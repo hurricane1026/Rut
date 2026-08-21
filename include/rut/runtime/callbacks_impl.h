@@ -867,6 +867,12 @@ inline bool request_fully_resendable(const Connection& conn) {
 template <typename Loop>
 bool retry_reused_upstream(Loop* loop, Connection& conn) {
     if (!conn.upstream_reused) return false;
+    // Paired strict HEAD failures are a one-shot connect-establishment
+    // contract; never replay a request from a pooled socket under that policy.
+    if (conn.failure_policy_suppress_body) {
+        conn.upstream_reused = false;
+        return false;
+    }
     conn.upstream_reused = false;
     // An upgrade request (WebSocket/HTTP Upgrade) is a GET but can open backend
     // session state, so replaying it could create a duplicate session — never retry.
@@ -2531,7 +2537,8 @@ void handle_jit_outcome(Loop* loop,
                                                         static_cast<u16>(outcome.upstream_id),
                                                         static_cast<u8>(kBackend));
                           }) {
-                if (loop->reuse_idle_upstream(
+                if (!conn.failure_policy_suppress_body &&
+                    loop->reuse_idle_upstream(
                         conn, static_cast<u16>(outcome.upstream_id), static_cast<u8>(kBackend))) {
                     conn.upstream_reused = true;
                     if constexpr (requires {
@@ -3350,6 +3357,15 @@ void on_upstream_connected(void* lp, Connection& conn, IoEvent ev) {
     // later batch (EINPROGRESS) or via pending_completions (immediate connect), so a
     // genuine connect result is never swallowed.
     if (ev.type == IoEventType::UpstreamSend) return;
+
+    // A paired strict HEAD connect failure owns the downstream response after
+    // abandoning and clearing the upstream episode.  Ignore only a late
+    // connect event from that fully-cleared episode; fresh connects still have
+    // a live fd or callback slot, and other protocols do not set this mode.
+    if (ev.type == IoEventType::UpstreamConnect && conn.failure_policy_suppress_body &&
+        conn.upstream_abandoned && conn.upstream_fd < 0 && conn.on_upstream_recv == nullptr &&
+        conn.on_upstream_send == nullptr)
+        return;
 
     if (ev.result < 0) {
         // Connect failed (e.g. ECONNREFUSED). Record the failure against this
