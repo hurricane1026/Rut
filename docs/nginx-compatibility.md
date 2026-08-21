@@ -112,8 +112,8 @@ Allowed states are `SUPPORTED`, `PARTIAL`, `BLOCKED_BY_RUT`,
   records already harvested into userspace and do not claim kernel retention
   after successful `EPOLL_CTL_DEL`. This transport work alone does not imply
   keep-alive HEAD support;
-  cancellation/drain lifecycle and the remaining #253 response semantics are
-  still required.
+  io_uring episode cancellation/drain and deferred request admission are tracked
+  in #264, while the remaining response semantics stay under #253.
 - The first request-policy slice rejects body/framing inputs (including
   `Content-Length` and every `Transfer-Encoding` value), HTTP/2, and
   non-origin-form targets before upstream connect. These are intentional
