@@ -933,6 +933,7 @@ struct RouteConfig {
         dst.status_code = policy.status_code;
         dst.date = policy.date;
         dst.connection = policy.connection;
+        dst.head_mode = policy.head_mode;
         copy(policy.reason, dst.reason);
         copy(policy.content_type, dst.content_type);
         copy(policy.server, dst.server);

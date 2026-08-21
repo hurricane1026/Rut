@@ -1,6 +1,7 @@
 #pragma once
 
 #include "rut/common/http_header_validation.h"
+#include "rut/common/forward_policy_head_mode.h"
 #include "rut/common/types.h"
 
 namespace rut {
@@ -32,15 +33,6 @@ enum class ResponsePolicyConnection : u8 {
 enum class ResponsePolicyDate : u8 {
     Invalid = 0,
     Current = 1,
-};
-
-// Reject is the legacy/source default. SuppressBody is runtime-supported only
-// for the bounded cleartext HTTP/1.1 explicit-close HEAD domain; all other
-// domains fail closed.
-enum class ResponsePolicyHeadMode : u8 {
-    Invalid = 0,
-    Reject = 1,
-    SuppressBody = 2,
 };
 
 struct ForwardResponsePolicySpec {

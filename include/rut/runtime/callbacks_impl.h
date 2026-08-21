@@ -512,6 +512,7 @@ inline bool request_policy_body_response_domain(const Connection& conn);
 inline bool request_policy_body_response_admitted(const Connection& conn);
 inline bool strict_response_upload_ready(const Connection& conn);
 inline bool response_policy_runtime_supported(const ForwardResponsePolicySpec& policy);
+inline bool failure_policy_runtime_supported(const ForwardFailurePolicySpec& policy);
 inline bool response_policy_suppress_head_admitted(
     const Connection& conn, const ForwardResponsePolicySpec& policy, bool has_failure_policy);
 template <typename Loop>
@@ -2223,6 +2224,9 @@ void handle_jit_outcome(Loop* loop,
                      !config->response_policy_id_is_valid(target_response_policy_id)) ||
                     (target_failure_policy_id != 0 &&
                      !config->failure_policy_id_is_valid(target_failure_policy_id)) ||
+                    (target_failure_policy_id != 0 &&
+                     !failure_policy_runtime_supported(
+                         config->failure_policies[target_failure_policy_id - 1])) ||
                     (outcome.request_policy_id != 0 &&
                      (!request_policy_is_supported(outcome.request_policy_id) ||
                       inspect_request_policy_body(conn, outcome.request_policy_id) !=
@@ -2290,6 +2294,25 @@ void handle_jit_outcome(Loop* loop,
                 forward_failure_policy_id = bundle.failure_policy_id;
             } else if (forward_failure_policy_id != 0 &&
                        !config->failure_policy_id_is_valid(forward_failure_policy_id)) {
+                reject_response_policy(loop, conn);
+                return;
+            }
+            if (forward_response_policy_id != 0 &&
+                !config->response_policy_id_is_valid(forward_response_policy_id)) {
+                // Validate direct response IDs at the same pre-body boundary
+                // as failure IDs; a malformed ID must not be parked in a
+                // request-policy body wait and resolved later.
+                reject_response_policy(loop, conn);
+                return;
+            }
+            // Failure-policy head dispositions are metadata-only in this
+            // increment.  Validate the selected mode before request-body
+            // waiting, policy rewriting, target materialisation, or any
+            // upstream resource can be touched; SuppressBody is deliberately
+            // fail-closed until its serializer is implemented.
+            if (forward_failure_policy_id != 0 &&
+                !failure_policy_runtime_supported(
+                    config->failure_policies[forward_failure_policy_id - 1])) {
                 reject_response_policy(loop, conn);
                 return;
             }
@@ -5454,6 +5477,10 @@ inline bool strict_response_upload_ready(const Connection& conn) {
 // close domain below. Every other execution path remains fail-closed.
 inline bool response_policy_runtime_supported(const ForwardResponsePolicySpec& policy) {
     return policy.head_mode == ResponsePolicyHeadMode::Reject;
+}
+
+inline bool failure_policy_runtime_supported(const ForwardFailurePolicySpec& policy) {
+    return policy.head_mode == FailurePolicyHeadMode::Reject;
 }
 
 inline bool response_policy_suppress_head_admitted(

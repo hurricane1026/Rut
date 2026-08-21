@@ -975,6 +975,15 @@ static const char* response_policy_head_mode_name(ResponsePolicyHeadMode mode) {
     return "invalid";
 }
 
+static const char* failure_policy_head_mode_name(FailurePolicyHeadMode mode) {
+    switch (mode) {
+        case FailurePolicyHeadMode::Reject: return "reject";
+        case FailurePolicyHeadMode::SuppressBody: return "suppress_body";
+        case FailurePolicyHeadMode::Invalid: break;
+    }
+    return "invalid";
+}
+
 void print_module(PrintBuf& buf, const Module& mod) {
     for (u32 i = 0; i < mod.func_count; i++) {
         if (i > 0) buf.newline();
@@ -994,8 +1003,24 @@ void print_module(PrintBuf& buf, const Module& mod) {
             buf.newline();
         }
     }
-    if (mod.redirect_policy_count != 0) {
+    if (mod.failure_policy_count != 0) {
         if (mod.func_count != 0 || mod.response_policy_count != 0) buf.newline();
+        buf.put_cstr("failure_policies: ");
+        buf.put_u32(mod.failure_policy_count);
+        buf.newline();
+        for (u32 i = 0; i < mod.failure_policy_count; i++) {
+            const auto& policy = mod.failure_policies[i];
+            buf.put_cstr("  failure_policy#");
+            buf.put_u32(i + 1);
+            buf.put_cstr(": head_mode=");
+            buf.put_cstr(failure_policy_head_mode_name(policy.head_mode));
+            buf.newline();
+        }
+    }
+    if (mod.redirect_policy_count != 0) {
+        if (mod.func_count != 0 || mod.response_policy_count != 0 ||
+            mod.failure_policy_count != 0)
+            buf.newline();
         buf.put_cstr("redirect_policies: ");
         buf.put_u32(mod.redirect_policy_count);
         buf.newline();

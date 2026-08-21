@@ -32623,6 +32623,7 @@ TEST(frontend, failure_policy_rejects_invalid_fields_and_caps) {
         "upstream b\nroute GET \"/\" { return forward(b, response_policy: { version: \"HTTP/1.1\", framing: \"content_length\", connection: \"keep_alive\", server: \"nginx\", date: \"current\", hide_headers: [] }, failure_policy: { version: \"HTTP/1.1\", status: 502, reason: \"Bad Gateway\", content_type: \"text/plain\", server: \"nginx\", date: \"current\", connection: \"request\", body: b\"x\", nope: \"x\" }) }\n",
         "upstream b\nroute GET \"/\" { return forward(b, response_policy: { version: \"HTTP/1.1\", framing: \"content_length\", connection: \"keep_alive\", server: \"nginx\", date: \"current\", hide_headers: [] }, failure_policy: { version: \"HTTP/1.1\", status: 502, reason: \"Bad Gateway\", content_type: \"text/plain\", server: \"nginx\", date: \"current\", connection: \"request\", body: b\"x\", body: b\"y\" }) }\n",
         "upstream b\nroute GET \"/\" { return forward(b, response_policy: { version: \"HTTP/1.1\", framing: \"content_length\", connection: \"keep_alive\", server: \"nginx\", date: \"current\", hide_headers: [] }, failure_policy: { version: \"HTTP/1.1\", status: 502, reason: \"Bad Gateway\", content_type: \"text/plain\", server: \"nginx\", date: \"current\", connection: \"request\" }) }\n",
+        "upstream b\nroute GET \"/\" { return forward(b, response_policy: { version: \"HTTP/1.1\", framing: \"content_length\", connection: \"keep_alive\", server: \"nginx\", date: \"current\", hide_headers: [] }, failure_policy: { version: \"HTTP/1.1\", status: 502, reason: \"Bad Gateway\", content_type: \"text/plain\", server: \"nginx\", date: \"current\", connection: \"request\", body: b\"x\", head_mode: \"suppress_body\" }) }\n",
         "upstream b\nroute GET \"/\" { return forward(b, failure_policy: { version: \"HTTP/1.1\", status: 502, reason: \"Bad Gateway\", content_type: \"text/plain\", server: \"nginx\", date: \"current\", connection: \"request\", body: \"x\" }) }\n",
         "upstream b\nroute GET \"/\" { return forward(b, failure_policy: { version: \"HTTP/1.1\", status: 502, reason: \"Bad Gateway\", content_type: \"text/plain\", server: \"nginx\", date: \"current\", connection: \"request\", body: b\"\\q\" }) }\n",
         "upstream b\nroute GET \"/\" { return forward(b, failure_policy: { version: \"HTTP/1.1\", status: 502, reason: \"Bad Gateway\", content_type: \"text/plain\", server: \"nginx\", date: \"current\", connection: \"request\", body: b\"\\x0\" }) }\n",
@@ -32642,6 +32643,7 @@ TEST(frontend, failure_policy_rejects_invalid_fields_and_caps) {
     REQUIRE(independent_ast);
     REQUIRE_EQ(independent_ast->failure_policies.len, 1u);
     CHECK(independent_ast->failure_policies[0].body.eq(lit("x")));
+    CHECK_EQ(independent_ast->failure_policies[0].head_mode, FailurePolicyHeadMode::Reject);
 
     const char* bytes =
         "upstream b\nroute GET \"/\" { return forward(b, failure_policy: { version: \"HTTP/1.1\", status: 502, reason: \"Bad Gateway\", content_type: \"text/plain\", server: \"nginx\", date: \"current\", connection: \"request\", body: b\"\\x00\\n\\xff\" }) }\n";
@@ -32685,6 +32687,13 @@ TEST(frontend, failure_policy_rejects_invalid_fields_and_caps) {
     spec.date = ForwardFailurePolicyDate::Current;
     spec.connection = ForwardFailurePolicyConnection::Request;
     CHECK_FALSE(forward_failure_policy_spec_valid(spec));
+    spec.reason = lit("Bad Gateway");
+    spec.head_mode = FailurePolicyHeadMode::SuppressBody;
+    CHECK(forward_failure_policy_spec_valid(spec));
+    spec.head_mode = FailurePolicyHeadMode::Invalid;
+    CHECK_FALSE(forward_failure_policy_spec_valid(spec));
+    spec.head_mode = static_cast<FailurePolicyHeadMode>(3);
+    CHECK_FALSE(forward_failure_policy_spec_valid(spec));
     spec.reason = lit("Bad\rGateway");
     CHECK_FALSE(forward_failure_policy_spec_valid(spec));
 }
@@ -32696,15 +32705,22 @@ TEST(frontend, failure_policy_byte_body_reaches_rir_and_keeps_nul_lf) {
     REQUIRE(lexed);
     auto ast = parse_file_heap(lexed.value());
     REQUIRE(ast);
+    CHECK_EQ(ast->failure_policies[0].head_mode, FailurePolicyHeadMode::Reject);
+    // Source has no head_mode key, but a valid internal SuppressBody value
+    // must survive every compiler representation for the later runtime slice.
+    ast->failure_policies[0].head_mode = FailurePolicyHeadMode::SuppressBody;
     auto hir = analyze_file_heap(ast.value());
     REQUIRE(hir);
+    CHECK_EQ(hir->failure_policies[0].head_mode, FailurePolicyHeadMode::SuppressBody);
     auto mir = build_mir_heap(hir.value());
     REQUIRE(mir);
+    CHECK_EQ(mir->failure_policies[0].head_mode, FailurePolicyHeadMode::SuppressBody);
     FrontendRirModule rir{};
     REQUIRE(lower_to_rir(mir.value(), rir));
     REQUIRE_EQ(rir.module.policy_bundle_count, 1u);
     CHECK_EQ(rir.module.policy_bundles[0].response_policy_id, 0u);
     CHECK_EQ(rir.module.policy_bundles[0].failure_policy_id, 1u);
+    CHECK_EQ(rir.module.failure_policies[0].head_mode, FailurePolicyHeadMode::SuppressBody);
     const Str body = rir.module.failure_policies[0].body;
     REQUIRE_EQ(body.len, 4u);
     CHECK(static_cast<u8>(body.ptr[0]) == 'A');
@@ -32712,6 +32728,46 @@ TEST(frontend, failure_policy_byte_body_reaches_rir_and_keeps_nul_lf) {
     CHECK(static_cast<u8>(body.ptr[2]) == '\n');
     CHECK(static_cast<u8>(body.ptr[3]) == 'B');
     rir.destroy();
+}
+
+TEST(frontend, failure_policy_head_mode_is_owned_deduplicated_and_printed) {
+    static constexpr char kReason[] = "Bad Gateway";
+    static constexpr char kType[] = "text/plain";
+    static constexpr char kServer[] = "rut";
+    static constexpr char kBody[] = "unavailable";
+    ForwardFailurePolicySpec reject{};
+    reject.version = ForwardFailurePolicyVersion::Http11;
+    reject.status_code = 502;
+    reject.date = ForwardFailurePolicyDate::Current;
+    reject.connection = ForwardFailurePolicyConnection::Request;
+    reject.reason = {kReason, sizeof(kReason) - 1};
+    reject.content_type = {kType, sizeof(kType) - 1};
+    reject.server = {kServer, sizeof(kServer) - 1};
+    reject.body = {kBody, sizeof(kBody) - 1};
+    auto suppress = reject;
+    suppress.head_mode = FailurePolicyHeadMode::SuppressBody;
+    CHECK(forward_failure_policy_spec_valid(reject));
+    CHECK(forward_failure_policy_spec_valid(suppress));
+    auto ast = std::make_unique<AstFile>();
+    CHECK_EQ(ast->add_failure_policy(reject), 1u);
+    CHECK_EQ(ast->add_failure_policy(reject), 1u);
+    CHECK_EQ(ast->add_failure_policy(suppress), 2u);
+
+    rir::Module module{};
+    module.failure_policy_count = 2;
+    module.failure_policies[0] = reject;
+    module.failure_policies[1] = suppress;
+    char output[1024];
+    rir::PrintBuf buf;
+    buf.init(output, sizeof(output), -1);
+    rir::print_module(buf, module);
+    static constexpr char expected[] =
+        "failure_policies: 2\n"
+        "  failure_policy#1: head_mode=reject\n"
+        "  failure_policy#2: head_mode=suppress_body\n";
+    CHECK_FALSE(buf.overflow);
+    CHECK_EQ(buf.len, static_cast<u32>(sizeof(expected) - 1));
+    CHECK(__builtin_memcmp(buf.data, expected, sizeof(expected) - 1) == 0);
 }
 
 TEST(frontend, target_transform_internal_metadata_reaches_rir_and_preserves_policy) {

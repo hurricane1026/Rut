@@ -1,5 +1,6 @@
 #pragma once
 
+#include "rut/common/forward_policy_head_mode.h"
 #include "rut/common/http_header_validation.h"
 #include "rut/common/types.h"
 
@@ -20,6 +21,7 @@ struct ForwardFailurePolicySpec {
     u16 status_code = 0;
     ForwardFailurePolicyDate date = ForwardFailurePolicyDate::Invalid;
     ForwardFailurePolicyConnection connection = ForwardFailurePolicyConnection::Invalid;
+    FailurePolicyHeadMode head_mode = FailurePolicyHeadMode::Reject;
     Str reason{};
     Str content_type{};
     Str server{};
@@ -52,6 +54,8 @@ inline bool forward_failure_policy_spec_valid(const ForwardFailurePolicySpec& po
     if (policy.version != ForwardFailurePolicyVersion::Http11 || policy.status_code != 502 ||
         policy.date != ForwardFailurePolicyDate::Current ||
         policy.connection != ForwardFailurePolicyConnection::Request ||
+        (policy.head_mode != FailurePolicyHeadMode::Reject &&
+         policy.head_mode != FailurePolicyHeadMode::SuppressBody) ||
         !failure_policy_safe_text(policy.reason, kMaxFailurePolicyReasonLen) ||
         !failure_policy_safe_text(policy.content_type, kMaxFailurePolicyContentTypeLen) ||
         !failure_policy_safe_text(policy.server, kMaxFailurePolicyServerLen) ||
@@ -66,7 +70,7 @@ inline bool forward_failure_policy_spec_valid(const ForwardFailurePolicySpec& po
 inline bool forward_failure_policy_spec_equal(const ForwardFailurePolicySpec& a,
                                               const ForwardFailurePolicySpec& b) {
     return a.version == b.version && a.status_code == b.status_code && a.date == b.date &&
-           a.connection == b.connection && a.reason.eq(b.reason) &&
+           a.connection == b.connection && a.head_mode == b.head_mode && a.reason.eq(b.reason) &&
            a.content_type.eq(b.content_type) && a.server.eq(b.server) && a.body.eq(b.body);
 }
 

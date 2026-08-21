@@ -837,6 +837,50 @@ TEST(response_policy, head_mode_config_copy_is_owned_and_atomic) {
     CHECK_EQ(untouched.response_policy_bytes_used, 0u);
 }
 
+TEST(response_policy, failure_head_mode_config_copy_is_owned_and_deduplicated) {
+    char reason[] = "Bad Gateway";
+    char type[] = "text/plain";
+    char server[] = "rut";
+    char body[] = "unavailable";
+    ForwardFailurePolicySpec reject{};
+    reject.version = ForwardFailurePolicyVersion::Http11;
+    reject.status_code = 502;
+    reject.date = ForwardFailurePolicyDate::Current;
+    reject.connection = ForwardFailurePolicyConnection::Request;
+    reject.reason = {reason, 11};
+    reject.content_type = {type, 10};
+    reject.server = {server, 3};
+    reject.body = {body, 11};
+    ForwardFailurePolicySpec suppress = reject;
+    suppress.head_mode = FailurePolicyHeadMode::SuppressBody;
+
+    rir::Module module{};
+    module.failure_policy_count = 2;
+    module.failure_policies[0] = reject;
+    module.failure_policies[1] = suppress;
+    RouteConfig config{};
+    REQUIRE(populate_route_config(config, module));
+    CHECK_EQ(config.failure_policy_count, 2u);
+    CHECK_EQ(config.failure_policies[0].head_mode, FailurePolicyHeadMode::Reject);
+    CHECK_EQ(config.failure_policies[1].head_mode, FailurePolicyHeadMode::SuppressBody);
+    CHECK(config.failure_policies[0].reason.ptr != reason);
+    CHECK(config.failure_policies[0].body.ptr != body);
+    const u32 bytes_before_duplicate = config.failure_policy_bytes_used;
+    CHECK_EQ(config.add_failure_policy(suppress), 2u);
+    CHECK_EQ(config.failure_policy_bytes_used, bytes_before_duplicate);
+    reason[0] = 'X';
+    body[0] = 'X';
+    CHECK(config.failure_policies[0].reason.eq({"Bad Gateway", 11}));
+    CHECK(config.failure_policies[0].body.eq({"unavailable", 11}));
+
+    rir::Module malformed = module;
+    malformed.failure_policies[1].head_mode = FailurePolicyHeadMode::Invalid;
+    RouteConfig untouched{};
+    CHECK_FALSE(populate_route_config(untouched, malformed));
+    CHECK_EQ(untouched.failure_policy_count, 0u);
+    CHECK_EQ(untouched.failure_policy_bytes_used, 0u);
+}
+
 static Connection* setup_target_transform_request(SmallLoop& loop,
                                                    RouteConfig& cfg,
                                                    const char* request,
@@ -922,6 +966,89 @@ TEST(response_policy, target_transform_bundle_suppress_body_fails_before_materia
         CHECK_FALSE(conn->upstream_send_armed);
         loop.free_conn(*conn);
     }
+}
+
+TEST(response_policy, failure_suppress_body_fails_closed_before_wait_rewrite_or_transform) {
+    SmallLoop loop;
+    loop.setup();
+    RouteConfig cfg{};
+    REQUIRE(cfg.add_upstream("backend", 0x7F000001, 8080).has_value());
+    char strip[] = "/api/";
+    char replace[] = "/";
+    REQUIRE_EQ(cfg.add_target_transform({{strip, 5}, {replace, 1}}), 1u);
+    static constexpr char kReason[] = "Bad Gateway";
+    static constexpr char kType[] = "text/plain";
+    static constexpr char kServer[] = "rut";
+    static constexpr char kBody[] = "unavailable";
+    ForwardFailurePolicySpec failure{};
+    failure.version = ForwardFailurePolicyVersion::Http11;
+    failure.status_code = 502;
+    failure.date = ForwardFailurePolicyDate::Current;
+    failure.connection = ForwardFailurePolicyConnection::Request;
+    failure.head_mode = FailurePolicyHeadMode::SuppressBody;
+    failure.reason = {kReason, sizeof(kReason) - 1};
+    failure.content_type = {kType, sizeof(kType) - 1};
+    failure.server = {kServer, sizeof(kServer) - 1};
+    failure.body = {kBody, sizeof(kBody) - 1};
+    REQUIRE_EQ(cfg.add_failure_policy(failure), 1u);
+    REQUIRE_EQ(cfg.add_policy_bundle(0, 1), 1u);
+
+    const char* get_request = "GET /api/x?tag=a%2Fb HTTP/1.1\r\nHost: client\r\n\r\n";
+    for (const bool use_bundle : {false, true}) {
+        auto* conn = setup_target_transform_request(
+            loop, cfg, get_request, static_cast<u32>(strlen(get_request)));
+        REQUIRE(conn != nullptr);
+        const u32 before_len = conn->recv_buf.len();
+        u8 before[SmallLoop::kBufSize];
+        __builtin_memcpy(before, conn->recv_buf.data(), before_len);
+        JitDispatchOutcome outcome{};
+        outcome.kind = JitDispatchOutcome::Kind::Forward;
+        outcome.upstream_id = 0;
+        if (use_bundle)
+            outcome.policy_bundle_id = 1;
+        else
+            outcome.failure_policy_id = 1;
+        loop.backend.clear_ops();
+        handle_jit_outcome<SmallLoop>(&loop, *conn, outcome, nullptr, true);
+        CHECK_EQ(conn->resp_status, 400u);
+        CHECK_EQ(conn->upstream_fd, -1);
+        CHECK_FALSE(conn->upstream_slot_held);
+        CHECK_FALSE(conn->request_policy_body_pending);
+        CHECK_EQ(loop.backend.count_ops(MockOp::Connect), 0u);
+        CHECK_EQ(loop.backend.count_ops(MockOp::Send), 1u);
+        CHECK_EQ(conn->recv_buf.len(), before_len);
+        CHECK_EQ(__builtin_memcmp(conn->recv_buf.data(), before, before_len), 0);
+        CHECK(conn->target_transform_recorded);
+        CHECK_EQ(conn->target_transform_id, 1u);
+        loop.free_conn(*conn);
+    }
+
+    // A fixed Content-Length request with no body is a body-wait candidate.
+    // The failure disposition must reject before entering that state or
+    // submitting a receive, even though policy id 1 itself is otherwise valid.
+    const char post_headers[] =
+        "POST /api HTTP/1.1\r\nHost: client\r\nContent-Length: 3\r\n"
+        "Connection: close\r\n\r\n";
+    auto* post = loop.alloc_conn();
+    REQUIRE(post != nullptr);
+    REQUIRE_EQ(post->recv_buf.write(reinterpret_cast<const u8*>(post_headers),
+                                    sizeof(post_headers) - 1),
+               sizeof(post_headers) - 1);
+    capture_request_metadata(*post);
+    post->request_config = &cfg;
+    JitDispatchOutcome post_outcome{};
+    post_outcome.kind = JitDispatchOutcome::Kind::Forward;
+    post_outcome.upstream_id = 0;
+    post_outcome.request_policy_id = 1;
+    post_outcome.failure_policy_id = 1;
+    loop.backend.clear_ops();
+    handle_jit_outcome<SmallLoop>(&loop, *post, post_outcome, nullptr, true);
+    CHECK_EQ(post->resp_status, 400u);
+    CHECK_FALSE(post->request_policy_body_pending);
+    CHECK_EQ(loop.backend.count_ops(MockOp::Connect), 0u);
+    CHECK_EQ(loop.backend.count_ops(MockOp::Recv), 0u);
+    CHECK_EQ(loop.backend.count_ops(MockOp::Send), 1u);
+    loop.free_conn(*post);
 }
 
 TEST(target_transform, h1_materializes_clean_origin_form_and_preserves_query) {

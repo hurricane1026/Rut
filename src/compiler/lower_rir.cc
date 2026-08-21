@@ -3356,6 +3356,7 @@ FrontendResult<void> lower_to_rir(const MirModule& mir, FrontendRirModule& out) 
         dst.status_code = src.status_code;
         dst.date = src.date;
         dst.connection = src.connection;
+        dst.head_mode = src.head_mode;
         if (!copy_failure_str(src.reason, dst.reason) ||
             !copy_failure_str(src.content_type, dst.content_type) ||
             !copy_failure_str(src.server, dst.server) ||
