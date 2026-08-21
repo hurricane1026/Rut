@@ -1019,7 +1019,7 @@ static void emit_instruction(Ctx& c, const rir::Instruction& inst) {
             // helper records them as a fail-closed sentinel rather than
             // collapsing them into the no-effect state.
             LLVMValueRef id =
-                LLVMConstInt(c.i32_ty, static_cast<u32>(inst.imm.i32_val), /*sign_extend=*/0);
+                LLVMConstInt(c.i32_ty, static_cast<u32>(inst.imm.i32_val), /*SignExtend=*/0);
             LLVMValueRef args[] = {c.param_conn, id};
             LLVMBuildCall2(c.builder,
                            LLVMGlobalGetValueType(c.get_req_set_target_transform()),

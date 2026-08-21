@@ -10,6 +10,8 @@ namespace rut {
 enum class RequestPolicyId : u16 {
     None = 0,
     Http11FixedStrip = 1,
+    // Reserved in the 16-bit forward-result slot for invalid direct-RIR values.
+    Invalid = 0xffffu,
 };
 
 inline bool request_policy_is_supported(u16 id) {

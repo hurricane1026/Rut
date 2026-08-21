@@ -306,11 +306,14 @@ private:
             if (digits == 0) return UrlParseStatus::InvalidInteger;
             out.address[octet] = static_cast<u8>(value);
             if (octet < 3) {
-                if (pos >= text.len || text.ptr[pos++] != '.')
-                    return UrlParseStatus::InvalidInteger;
+                if (pos >= text.len) return UrlParseStatus::InvalidInteger;
+                const char separator = text.ptr[pos++];
+                if (separator != '.') return UrlParseStatus::InvalidInteger;
             }
         }
-        if (pos >= text.len || text.ptr[pos++] != ':') return UrlParseStatus::InvalidInteger;
+        if (pos >= text.len) return UrlParseStatus::InvalidInteger;
+        const char separator = text.ptr[pos++];
+        if (separator != ':') return UrlParseStatus::InvalidInteger;
         const u32 port_start = pos;
         while (pos < text.len && text.ptr[pos] >= '0' && text.ptr[pos] <= '9') pos++;
         if (port_start == pos) return UrlParseStatus::InvalidInteger;
