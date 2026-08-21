@@ -389,14 +389,14 @@ bool ModuleContext::init(u32 func_cap, u32 struct_cap) {
     next.functions = arena.alloc_array<rir::Function>(next.func_cap);
     if (!next.functions) {
         arena.destroy();
-        module = {};
+        module = rir::Module{};
         return false;
     }
     next.struct_cap = struct_cap == 0 ? 1 : struct_cap;
     next.struct_defs = arena.alloc_array<rir::StructDef*>(next.struct_cap);
     if (!next.struct_defs) {
         arena.destroy();
-        module = {};
+        module = rir::Module{};
         return false;
     }
 
@@ -406,7 +406,7 @@ bool ModuleContext::init(u32 func_cap, u32 struct_cap) {
 
 void ModuleContext::destroy() {
     arena.destroy();
-    module = {};
+    module = rir::Module{};
 }
 
 bool load_manifest(const char* path, Manifest& out) {
