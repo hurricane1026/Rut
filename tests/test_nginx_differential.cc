@@ -51,6 +51,20 @@ static constexpr char kHeadRequest[] =
     "HEAD /head?q=1 HTTP/1.1\r\n"
     "Host: client.example\r\n"
     "Connection: close\r\n\r\n";
+static constexpr char kHeadKeepAliveRequest1[] =
+    "HEAD /head?q=1 HTTP/1.1\r\n"
+    "Host: client.example\r\n\r\n";
+static constexpr char kHeadKeepAliveRequest2[] =
+    "HEAD /head?q=2 HTTP/1.1\r\n"
+    "Host: client.example\r\n"
+    "Connection: close\r\n\r\n";
+static constexpr char kHeadGatewayKeepAliveRequest1[] =
+    "HEAD /missing?q=1 HTTP/1.1\r\n"
+    "Host: client.example\r\n\r\n";
+static constexpr char kHeadGatewayKeepAliveRequest2[] =
+    "HEAD /missing?q=2 HTTP/1.1\r\n"
+    "Host: client.example\r\n"
+    "Connection: close\r\n\r\n";
 static constexpr char kHeadGatewayRequest[] =
     "HEAD /missing?q=1 HTTP/1.1\r\n"
     "Host: client.example\r\n"
@@ -422,6 +436,21 @@ static bool parse_content_length(const std::vector<char>& bytes, size_t end, siz
     return false;
 }
 
+static bool validate_head_observation_response(const std::vector<char>& bytes,
+                                               const char* status_prefix,
+                                               std::string& error) {
+    const size_t end = header_end(bytes);
+    size_t content_length = 0;
+    const size_t status_len = strlen(status_prefix);
+    if (end == 0 || bytes.size() != end || bytes.size() < status_len ||
+        memcmp(bytes.data(), status_prefix, status_len) != 0 ||
+        !parse_content_length(bytes, end, content_length)) {
+        error = "observation response has incomplete/malformed status or Content-Length headers";
+        return false;
+    }
+    return true;
+}
+
 static bool read_response(int fd, std::vector<char>& bytes, std::string& error) {
     using Clock = std::chrono::steady_clock;
     static constexpr auto kResponseReadBudget = std::chrono::seconds(5);
@@ -525,6 +554,47 @@ static bool read_eof(int fd, std::string& error) {
     }
     error = "EOF timeout";
     return false;
+}
+
+static bool observe_no_data_or_eof(int fd,
+                                   int quiet_ms,
+                                   bool& eof,
+                                   std::string& error) {
+    using Clock = std::chrono::steady_clock;
+    const Clock::time_point deadline = Clock::now() + std::chrono::milliseconds(quiet_ms);
+    eof = false;
+    while (Clock::now() < deadline) {
+        const auto remaining =
+            std::chrono::duration_cast<std::chrono::milliseconds>(deadline - Clock::now()).count();
+        pollfd p{fd, POLLIN | POLLHUP | POLLERR, 0};
+        const int ready = poll(&p, 1, remaining > 50 ? 50 : static_cast<int>(remaining));
+        if (ready < 0) {
+            if (errno == EINTR) continue;
+            error = "observation poll failed";
+            return false;
+        }
+        if (ready == 0) continue;
+        if (p.revents & (POLLIN | POLLHUP)) {
+            char extra[256];
+            const ssize_t n = recv(fd, extra, sizeof(extra), 0);
+            if (n == 0) {
+                eof = true;
+                return true;
+            }
+            if (n > 0) {
+                error = "unexpected downstream body/data after HEAD headers";
+                return false;
+            }
+            if (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK) continue;
+            error = "observation recv failed";
+            return false;
+        }
+        if (p.revents & POLLERR) {
+            error = "observation socket error";
+            return false;
+        }
+    }
+    return true;
 }
 
 struct DeadPort {
@@ -700,6 +770,218 @@ struct Recorder {
     ~Recorder() { stop(); }
 };
 
+// Observation-only backend for two requests on one downstream connection. It
+// keeps accepted upstream fds open, records the connection id with every
+// request, and deliberately delays the representation body after the response
+// headers so a HEAD leak cannot be hidden by coalescing.
+struct KeepAliveObservationRecorder {
+    struct Entry {
+        u32 connection_id = 0;
+        std::vector<char> wire;
+    };
+    struct Active {
+        int fd = -1;
+        u32 connection_id = 0;
+        std::vector<char> wire;
+        size_t parsed = 0;
+        bool body_pending = false;
+        std::chrono::steady_clock::time_point body_due{};
+    };
+
+    int listen_fd = -1;
+    u16 port = 0;
+    std::atomic<bool> running{false};
+    std::atomic<u32> accepted{0};
+    std::atomic<u32> requests{0};
+    std::vector<Entry> history;
+    u32 body_delay_ms = 250;
+    pthread_t thread{};
+    bool thread_started = false;
+
+    static size_t find_header_end(const std::vector<char>& bytes, size_t from) {
+        if (bytes.size() < from + 4) return 0;
+        for (size_t i = from + 3; i < bytes.size(); i++) {
+            if (bytes[i - 3] == '\r' && bytes[i - 2] == '\n' && bytes[i - 1] == '\r' &&
+                bytes[i] == '\n')
+                return i + 1;
+        }
+        return 0;
+    }
+
+    static bool send_head_response(int fd) {
+        static constexpr char kHeaders[] =
+            "HTTP/1.1 200 OK\r\n"
+            "Server: origin-head\r\n"
+            "Date: Tue, 01 Jan 2030 00:00:00 GMT\r\n"
+            "Content-Length: 5\r\n\r\n";
+        return send_all(fd, kHeaders, sizeof(kHeaders) - 1);
+    }
+
+    static bool send_head_body(int fd) { return send_all(fd, "hello", 5); }
+
+    static void* run(void* opaque) {
+        auto* self = static_cast<KeepAliveObservationRecorder*>(opaque);
+        std::vector<Active> active;
+        u32 next_connection_id = 1;
+        while (self->running.load(std::memory_order_acquire)) {
+            std::vector<pollfd> polls;
+            polls.reserve(active.size() + 1);
+            polls.push_back({self->listen_fd, POLLIN, 0});
+            for (const auto& item : active) polls.push_back({item.fd, POLLIN | POLLERR | POLLHUP, 0});
+            const size_t polled_active_count = active.size();
+            const int ready = poll(polls.data(), polls.size(), 25);
+            if (ready < 0) {
+                if (errno == EINTR) continue;
+                break;
+            }
+
+            if (polls[0].revents & POLLIN) {
+                for (;;) {
+                    const int client = accept(self->listen_fd, nullptr, nullptr);
+                    if (client < 0) {
+                        if (errno == EINTR) continue;
+                        if (errno == EAGAIN || errno == EWOULDBLOCK) break;
+                        self->running.store(false, std::memory_order_release);
+                        break;
+                    }
+                    timeval timeout{0, 500000};
+                    (void)setsockopt(client, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
+                    (void)setsockopt(client, SOL_SOCKET, SO_SNDTIMEO, &timeout, sizeof(timeout));
+                    const u32 id = next_connection_id++;
+                    active.push_back({client, id, {}, 0, false, {}});
+                    self->accepted.fetch_add(1, std::memory_order_release);
+                }
+            }
+
+            const auto now = std::chrono::steady_clock::now();
+            for (size_t index = polled_active_count; index > 0; index--) {
+                Active& item = active[index - 1];
+                const size_t poll_index = index;
+                bool remove = false;
+                if (item.body_pending && now >= item.body_due) {
+                    if (!send_head_body(item.fd)) remove = true;
+                    item.body_pending = false;
+                }
+                if (!remove && !item.body_pending && (polls[poll_index].revents & POLLIN)) {
+                    char buf[4096];
+                    const ssize_t n = recv(item.fd, buf, sizeof(buf), 0);
+                    if (n > 0) {
+                        item.wire.insert(item.wire.end(), buf, buf + n);
+                        for (;;) {
+                            const size_t end = find_header_end(item.wire, item.parsed);
+                            if (end == 0) break;
+                            std::vector<char> request(item.wire.begin() + item.parsed,
+                                                      item.wire.begin() + end);
+                            self->history.push_back({item.connection_id, request});
+                            self->requests.fetch_add(1, std::memory_order_release);
+                            item.parsed = end;
+                            if (!send_head_response(item.fd)) {
+                                remove = true;
+                                break;
+                            }
+                            item.body_pending = true;
+                            item.body_due = now + std::chrono::milliseconds(self->body_delay_ms);
+                            break;  // send the delayed body before the next request
+                        }
+                    } else if (n == 0 || (n < 0 && errno != EINTR && errno != EAGAIN &&
+                                          errno != EWOULDBLOCK)) {
+                        remove = true;
+                    }
+                }
+                if (!remove && (polls[poll_index].revents & (POLLERR | POLLHUP))) remove = true;
+                if (remove) {
+                    shutdown(item.fd, SHUT_RDWR);
+                    close(item.fd);
+                    active.erase(active.begin() + static_cast<ptrdiff_t>(index - 1));
+                }
+            }
+        }
+        for (auto& item : active) {
+            shutdown(item.fd, SHUT_RDWR);
+            close(item.fd);
+        }
+        if (self->listen_fd >= 0) {
+            close(self->listen_fd);
+            self->listen_fd = -1;
+        }
+        return nullptr;
+    }
+
+    bool setup(u16 requested_port) {
+        listen_fd = socket(AF_INET, SOCK_STREAM, 0);
+        if (listen_fd < 0) return false;
+        int one = 1;
+        (void)setsockopt(listen_fd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
+        sockaddr_in addr{};
+        addr.sin_family = AF_INET;
+        addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+        addr.sin_port = htons(requested_port);
+        if (bind(listen_fd, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) != 0 ||
+            listen(listen_fd, 8) != 0) {
+            close(listen_fd);
+            listen_fd = -1;
+            return false;
+        }
+        const int flags = fcntl(listen_fd, F_GETFL, 0);
+        if (flags < 0 || fcntl(listen_fd, F_SETFL, flags | O_NONBLOCK) != 0) {
+            close(listen_fd);
+            listen_fd = -1;
+            return false;
+        }
+        socklen_t len = sizeof(addr);
+        if (getsockname(listen_fd, reinterpret_cast<sockaddr*>(&addr), &len) != 0) {
+            close(listen_fd);
+            listen_fd = -1;
+            return false;
+        }
+        port = ntohs(addr.sin_port);
+        history.clear();
+        accepted.store(0, std::memory_order_relaxed);
+        requests.store(0, std::memory_order_relaxed);
+        running.store(true, std::memory_order_release);
+        if (pthread_create(&thread, nullptr, &KeepAliveObservationRecorder::run, this) != 0) {
+            running.store(false, std::memory_order_release);
+            close(listen_fd);
+            listen_fd = -1;
+            return false;
+        }
+        thread_started = true;
+        return true;
+    }
+
+    void stop() {
+        running.store(false, std::memory_order_release);
+        if (thread_started) {
+            pthread_join(thread, nullptr);
+            thread_started = false;
+        }
+        if (listen_fd >= 0) {
+            shutdown(listen_fd, SHUT_RDWR);
+            close(listen_fd);
+            listen_fd = -1;
+        }
+    }
+
+    ~KeepAliveObservationRecorder() { stop(); }
+};
+
+static bool wait_observation_requests(KeepAliveObservationRecorder& recorder,
+                                      u32 expected,
+                                      std::string& error) {
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+    while (std::chrono::steady_clock::now() < deadline) {
+        const u32 requests = recorder.requests.load(std::memory_order_acquire);
+        if (requests > expected) {
+            error = "observation recorder saw unexpected extra requests";
+            return false;
+        }
+        if (requests == expected) return true;
+        usleep(5000);
+    }
+    error = "observation recorder request deadline exceeded";
+    return false;
+}
+
 static bool normalize_date(std::vector<char>& bytes) {
     const char needle[] = "Date: ";
     for (size_t i = 0; i + sizeof(needle) - 1 + 30 < bytes.size(); i++) {
@@ -852,6 +1134,173 @@ static int missing_prerequisite(const char* message) {
     std::cerr << "SKIP: " << message << "\n";
     const char* required = getenv("RUT_NGINX_DIFFERENTIAL_REQUIRED");
     return required && strcmp(required, "1") == 0 ? 1 : 77;
+}
+
+static bool observe_nginx_head_keepalive_success(
+    u16 frontend_port,
+    const std::string& nginx_config_path,
+    const std::string& nginx_log_path,
+    const std::string& container_name,
+    KeepAliveObservationRecorder& recorder,
+    std::vector<std::vector<char>>& responses,
+    std::string& error) {
+    DockerGuard docker(container_name);
+    ChildGuard nginx;
+    if (!spawn_child({"docker", "run", "--pull=never", "--network", "host", "--name",
+                      container_name, "-v", nginx_config_path + ":/etc/nginx/nginx.conf:ro",
+                      kNginxImage, "nginx", "-g", "daemon off;"},
+                     nginx_log_path,
+                     nginx.child)) {
+        error = "failed to start pinned nginx for keep-alive HEAD observation";
+        return false;
+    }
+    if (!wait_ready(frontend_port, nginx.child, error)) return false;
+
+    struct ClientGuard {
+        int fd = -1;
+        ~ClientGuard() {
+            if (fd >= 0) close(fd);
+        }
+    } client{connect_once(frontend_port)};
+    if (client.fd < 0 || !send_all(client.fd,
+                                   kHeadKeepAliveRequest1,
+                                   sizeof(kHeadKeepAliveRequest1) - 1)) {
+        error = "failed to send first keep-alive HEAD observation request";
+        return false;
+    }
+    responses.clear();
+    std::vector<char> first;
+    if (!read_head_response(client.fd, first, error)) return false;
+    if (!validate_head_observation_response(first, "HTTP/1.1 200 ", error)) return false;
+    bool eof = false;
+    if (!observe_no_data_or_eof(client.fd, 750, eof, error) || eof) {
+        if (error.empty()) error = "nginx closed first live HEAD keep-alive response";
+        return false;
+    }
+    responses.push_back(std::move(first));
+
+    if (!send_all(client.fd, kHeadKeepAliveRequest2, sizeof(kHeadKeepAliveRequest2) - 1)) {
+        error = "failed to send second close-intent HEAD observation request";
+        return false;
+    }
+    std::vector<char> second;
+    if (!read_head_response(client.fd, second, error) || !read_eof(client.fd, error)) return false;
+    if (!validate_head_observation_response(second, "HTTP/1.1 200 ", error)) return false;
+    responses.push_back(std::move(second));
+
+    if (!wait_observation_requests(recorder, 2, error)) return false;
+    const bool nginx_stopped = stop_child(nginx.child);
+    const bool container_removed = docker.remove();
+    if (!nginx_stopped) {
+        error = "failed to stop nginx after keep-alive HEAD observation";
+        return false;
+    }
+    if (!container_removed) {
+        error = "docker rm -f failed after keep-alive HEAD observation";
+        return false;
+    }
+    settle_for_invalid_target_side_effects();
+    if (recorder.requests.load(std::memory_order_acquire) != 2 ||
+        recorder.accepted.load(std::memory_order_acquire) > 2) {
+        error = "keep-alive HEAD observation saw unexpected extra upstream activity";
+        return false;
+    }
+    return true;
+}
+
+static bool observe_nginx_head_keepalive_gateway(
+    u16 frontend_port,
+    u16 backend_port,
+    const std::string& nginx_config_path,
+    const std::string& nginx_log_path,
+    const std::string& container_name,
+    DeadPort& dead,
+    std::vector<std::vector<char>>& responses,
+    bool& sent_second,
+    u32& connect_failure_count,
+    std::string& error) {
+    if (dead.fd < 0) {
+        error = "gateway observation dead port is not reserved";
+        return false;
+    }
+    DockerGuard docker(container_name);
+    ChildGuard nginx;
+    if (!spawn_child({"docker", "run", "--pull=never", "--network", "host", "--name",
+                      container_name, "-v", nginx_config_path + ":/etc/nginx/nginx.conf:ro",
+                      kNginxImage, "nginx", "-g", "daemon off;"},
+                     nginx_log_path,
+                     nginx.child)) {
+        error = "failed to start pinned nginx for keep-alive HEAD gateway observation";
+        return false;
+    }
+    if (!wait_ready(frontend_port, nginx.child, error)) return false;
+
+    struct ClientGuard {
+        int fd = -1;
+        ~ClientGuard() {
+            if (fd >= 0) close(fd);
+        }
+    } client{connect_once(frontend_port)};
+    if (client.fd < 0 || !send_all(client.fd,
+                                   kHeadGatewayKeepAliveRequest1,
+                                   sizeof(kHeadGatewayKeepAliveRequest1) - 1)) {
+        error = "failed to send first keep-alive HEAD gateway observation request";
+        return false;
+    }
+    responses.clear();
+    std::vector<char> first;
+    if (!read_head_response(client.fd, first, error)) return false;
+    if (!validate_head_observation_response(first, "HTTP/1.1 502 ", error)) return false;
+    responses.push_back(std::move(first));
+    bool eof = false;
+    if (!observe_no_data_or_eof(client.fd, 750, eof, error)) return false;
+    sent_second = false;
+    if (!eof) {
+        if (!send_all(client.fd,
+                      kHeadGatewayKeepAliveRequest2,
+                      sizeof(kHeadGatewayKeepAliveRequest2) - 1)) {
+            error = "failed to send second close-intent HEAD gateway observation request";
+            return false;
+        }
+        std::vector<char> second;
+        if (!read_head_response(client.fd, second, error) || !read_eof(client.fd, error)) return false;
+        if (!validate_head_observation_response(second, "HTTP/1.1 502 ", error)) return false;
+        responses.push_back(std::move(second));
+        sent_second = true;
+    }
+
+    const bool nginx_stopped = stop_child(nginx.child);
+    const bool container_removed = docker.remove();
+    const std::string upstream_context = "127.0.0.1:" + std::to_string(backend_port);
+    const bool log_readable = log_count_line_with(nginx_log_path,
+                                                  "connect() failed",
+                                                  upstream_context.c_str(),
+                                                  connect_failure_count);
+    if (!nginx_stopped) {
+        error = "failed to stop nginx after keep-alive HEAD gateway observation";
+        return false;
+    }
+    if (!container_removed) {
+        error = "docker rm -f failed after keep-alive HEAD gateway observation";
+        return false;
+    }
+    if (!log_readable || connect_failure_count != 1) {
+        error = "gateway observation did not produce exactly one scoped connect failure log line";
+        return false;
+    }
+    return true;
+}
+
+static void dump_observation_history(const KeepAliveObservationRecorder& recorder) {
+    std::cerr << "OBSERVE upstream accepted="
+              << recorder.accepted.load(std::memory_order_acquire) << " requests="
+              << recorder.requests.load(std::memory_order_acquire)
+              << " history=" << recorder.history.size() << "\n";
+    for (size_t i = 0; i < recorder.history.size(); i++) {
+        std::cerr << "OBSERVE upstream history[" << i << "] connection_id="
+                  << recorder.history[i].connection_id << "\n";
+        dump_wire("OBSERVE upstream request", recorder.history[i].wire);
+    }
 }
 
 static bool capture_case(u16 frontend_port,
@@ -1911,6 +2360,90 @@ int main(int argc, char** argv) {
     }
     std::cerr << "PASS: pinned nginx HEAD unavailable-upstream gateway baseline "
                  "(header-only 502 + EOF)\n";
+
+    const char* observe_keepalive = getenv("RUT_NGINX_HEAD_KEEPALIVE_OBSERVE");
+    if (observe_keepalive != nullptr && strcmp(observe_keepalive, "1") == 0) {
+        KeepAliveObservationRecorder recorder;
+        if (!recorder.setup(backend_port)) {
+            std::cerr << "FAIL [OBSERVE HEAD]: backend recorder setup failed\n";
+            return 1;
+        }
+        std::vector<std::vector<char>> live_responses;
+        std::string live_error;
+        const std::string observe_container = container + "-head-keepalive-observe";
+        if (!observe_nginx_head_keepalive_success(frontend_port,
+                                                  temp.nginx_config,
+                                                  temp.nginx_log,
+                                                  observe_container,
+                                                  recorder,
+                                                  live_responses,
+                                                  live_error)) {
+            std::cerr << "FAIL [OBSERVE HEAD live]: " << live_error << "\n";
+            for (const auto& response : live_responses) dump_wire("OBSERVE downstream", response);
+            recorder.stop();
+            dump_observation_history(recorder);
+            dump_log(temp.nginx_log, "OBSERVE nginx live log");
+            return 1;
+        }
+        recorder.stop();
+        if (live_responses.size() != 2 || recorder.history.size() != 2 ||
+            recorder.accepted.load(std::memory_order_acquire) == 0 ||
+            recorder.accepted.load(std::memory_order_acquire) > 2 ||
+            recorder.requests.load(std::memory_order_acquire) != 2) {
+            std::cerr << "FAIL [OBSERVE HEAD live]: malformed response/history/count observation\n";
+            for (const auto& response : live_responses) dump_wire("OBSERVE downstream", response);
+            dump_observation_history(recorder);
+            return 1;
+        }
+        for (size_t i = 0; i < recorder.history.size(); i++) {
+            const std::string request(recorder.history[i].wire.begin(),
+                                      recorder.history[i].wire.end());
+            const char* expected_target = i == 0 ? "HEAD /head?q=1 HTTP/1.1\r\n"
+                                                 : "HEAD /head?q=2 HTTP/1.1\r\n";
+            if (recorder.history[i].connection_id == 0 ||
+                request.find(expected_target) != 0 || header_end(recorder.history[i].wire) == 0) {
+                std::cerr << "FAIL [OBSERVE HEAD live]: malformed upstream history entry\n";
+                dump_observation_history(recorder);
+                return 1;
+            }
+        }
+        for (const auto& response : live_responses) dump_wire("OBSERVE live downstream", response);
+        dump_observation_history(recorder);
+
+        DeadPort observe_dead;
+        if (!observe_dead.reserve(backend_port)) {
+            std::cerr << "FAIL [OBSERVE HEAD gateway]: dead-port reservation failed\n";
+            return 1;
+        }
+        std::vector<std::vector<char>> gateway_responses;
+        bool gateway_sent_second = false;
+        u32 gateway_connect_failures = 0;
+        std::string gateway_error;
+        if (!observe_nginx_head_keepalive_gateway(frontend_port,
+                                                  backend_port,
+                                                  temp.nginx_config,
+                                                  temp.nginx_log,
+                                                  container + "-head-gateway-keepalive-observe",
+                                                  observe_dead,
+                                                  gateway_responses,
+                                                  gateway_sent_second,
+                                                  gateway_connect_failures,
+                                                  gateway_error)) {
+            std::cerr << "FAIL [OBSERVE HEAD gateway]: " << gateway_error << "\n";
+            for (const auto& response : gateway_responses)
+                dump_wire("OBSERVE gateway downstream", response);
+            dump_log(temp.nginx_log, "OBSERVE nginx gateway log");
+            return 1;
+        }
+        for (const auto& response : gateway_responses)
+            dump_wire("OBSERVE gateway downstream", response);
+        std::cerr << "OBSERVE gateway outcome="
+                  << (gateway_sent_second ? "open_then_close" : "closed_after_first")
+                  << " responses=" << gateway_responses.size()
+                  << " scoped_connect_failures=" << gateway_connect_failures << "\n";
+        std::cerr << "OBSERVE keep-alive HEAD probe complete; no compatibility claim made\n";
+        return 0;
+    }
 
     std::vector<char> rut_head_response;
     std::vector<char> rut_head_request;
