@@ -39,16 +39,6 @@ struct timespec* opaque_null_timespec() {
     return reinterpret_cast<struct timespec*>(bits);
 }
 
-struct epoll_event* opaque_null_epoll_event() {
-    uintptr_t bits = 0;
-#if defined(__GNUC__) || defined(__clang__)
-    // Keep the null value opaque so the compiler cannot apply a libc nonnull
-    // assumption before the interposed epoll_wait wrapper sees it.
-    asm volatile("" : "+r"(bits));
-#endif
-    return reinterpret_cast<struct epoll_event*>(bits);
-}
-
 struct HeldEpollTestFds {
     i32 epoll_fds[2] = {-1, -1};
     i32 pipe_fds[2] = {-1, -1};
@@ -516,14 +506,17 @@ TEST(epoll_fault, held_raw_event_is_exact_one_shot_and_fails_closed) {
         CHECK_FALSE(invalid_output.replay_armed());
     }
     {
-        ScopedHeldEpollEvent null_output(guard.epoll_fds[0]);
-        REQUIRE(null_output.arm_capture_once());
+        ScopedHeldEpollEvent invalid_maxevents(guard.epoll_fds[0]);
+        REQUIRE(invalid_maxevents.arm_capture_once());
+        // Linux rejects maxevents == 0 with EINVAL even when the output
+        // pointer is valid; the seam must fail closed and disarm capture.
+        struct epoll_event event{};
         errno = 0;
-        CHECK_EQ(epoll_wait(guard.epoll_fds[0], opaque_null_epoll_event(), 1, 0), -1);
-        CHECK_EQ(errno, EFAULT);
-        CHECK_EQ(null_output.error(), HeldEpollEventError::InvalidWaitOutput);
-        CHECK_FALSE(null_output.capture_armed());
-        CHECK_FALSE(null_output.replay_armed());
+        CHECK_EQ(epoll_wait(guard.epoll_fds[0], &event, 0, 0), -1);
+        CHECK_EQ(errno, EINVAL);
+        CHECK_EQ(invalid_maxevents.error(), HeldEpollEventError::InvalidWaitOutput);
+        CHECK_FALSE(invalid_maxevents.capture_armed());
+        CHECK_FALSE(invalid_maxevents.replay_armed());
     }
     {
         ScopedHeldEpollEvent duplicate_capture(guard.epoll_fds[0]);
