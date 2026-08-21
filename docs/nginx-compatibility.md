@@ -86,10 +86,15 @@ Allowed states are `SUPPORTED`, `PARTIAL`, `BLOCKED_BY_RUT`,
   with bounded pending-versus-kernel fairness, removing the former whole-batch
   pre-dispatch I/O window. It now also transports explicit upstream episodes and
   rejects stale or malformed records before fd-map/socket/TLS/state access and
-  before concrete callback dispatch. Production lifecycle boundaries do not yet
-  centrally advance/retire those episodes, and real fd reuse remains unproven.
-  This domain therefore remains fail-closed; transport fencing alone does not
-  imply reusable epoll lifecycles or keep-alive HEAD support.
+  before concrete callback dispatch. Centralized production owners now begin,
+  detach, retire, or quarantine fresh, retry, pooled, health-probe, timeout, and
+  terminal episodes. Real tests prove pool return/borrow with the same numeric fd
+  and terminal close/allocation with the same Connection slot: old readiness does
+  no socket I/O and old completion dispatch does no timer/callback/state mutation,
+  while current-token controls progress. Production retry and active-health
+  transition evidence remains incomplete, so #262 stays open. This transport
+  work alone does not imply keep-alive HEAD support; cancellation/drain lifecycle
+  and the remaining #253 response semantics are still required.
 - The first request-policy slice rejects body/framing inputs (including
   `Content-Length` and every `Transfer-Encoding` value), HTTP/2, and
   non-origin-form targets before upstream connect. These are intentional
