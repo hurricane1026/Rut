@@ -17,8 +17,8 @@ Allowed states are `SUPPORTED`, `PARTIAL`, `BLOCKED_BY_RUT`,
 | preserve raw request-target and query | implicit | yes | partial: origin-form forward sends original bytes | pinned query differential; broader normalization untested | PARTIAL |
 | preserve request method and body | implicit | yes | partial: fixed-CL body is staged before connect within one 16 KiB composite slice | RUT exact binary/segmented/boundary tests and pinned generated-RUT binary POST differential | PARTIAL |
 | nginx default upstream HTTP version and request headers | implicit | yes | partial: explicit fixed HTTP/1.1 policy with bounded fixed-CL buffering; #252 | exact RUT tests plus pinned generated-RUT GET and POST differentials | PARTIAL |
-| proxied response status and body | implicit | yes, including method-isolated root HEAD lowering | partial: strict final H1.1 exact-Content-Length streaming plus bounded reusable paired HEAD success/connect-failure serialization; #264 closed, broader reusable failures blocked by #265 | exact public-source production-JIT and pinned converter-generated reusable HEAD success/connect-failure, internal lifecycle tests, pinned generated-RUT GET/POST, and exact nginx-only reusable 502/504 failure baselines | PARTIAL |
-| nginx default proxied response header policy | implicit | yes, including method-isolated root HEAD lowering | partial: bounded strict H1.1 final-response/content-length serializer and reusable paired HEAD success/connect-failure policy; timeout/malformed failure retirement gap in #265 | exact public-source production-JIT and pinned converter-generated reusable HEAD success/failure/no-pool evidence, internal token/lifecycle tests, pinned generated-RUT GET/POST/close, and nginx-only reusable 502/504 failure baselines | PARTIAL |
+| proxied response status and body | implicit | yes, including method-isolated root HEAD lowering | partial: strict final H1.1 exact-Content-Length streaming plus bounded reusable paired HEAD success/connect-failure serialization; #265 has exact Connect/Send/Recv retirement masks but no header/epoch rendezvous or broader public failure path | exact public-source production-JIT and pinned converter-generated reusable HEAD success/connect-failure, internal lifecycle tests, pinned generated-RUT GET/POST, and exact nginx-only reusable 502/504 failure baselines | PARTIAL |
+| nginx default proxied response header policy | implicit | yes, including method-isolated root HEAD lowering | partial: bounded strict H1.1 final-response/content-length serializer and reusable paired HEAD success/connect-failure policy; #265 D1 transport ownership is complete, but timeout/malformed completion publication is absent | exact public-source production-JIT and pinned converter-generated reusable HEAD success/failure/no-pool evidence, internal token/lifecycle tests, pinned generated-RUT GET/POST/close, and nginx-only reusable 502/504 failure baselines | PARTIAL |
 | single unavailable upstream gateway error | implicit | yes | yes for bounded H1 single-IPv4 connect failures; #256 | committed pinned close/EOF differential plus pinned keep-alive and split-POST evidence | SUPPORTED |
 | exact, `^~`, regex, or nested locations | no | no | no nginx selection semantics | no | NOT_PLANNED |
 | exact `/api/` + proxy URI `/`, clean bounded H1 request domain | yes | yes | yes: bounded prefix replacement; #259 closed | pinned converter-generated `/api/`, `/api/x`, and query differentials; four out-of-domain targets fail before upstream | SUPPORTED |
@@ -90,9 +90,12 @@ Allowed states are `SUPPORTED`, `PARTIAL`, `BLOCKED_BY_RUT`,
   emits a header-only 504 with `Content-Length: 167`, or a header-only 502 with
   `Content-Length: 157`, then accepts a second close-intent HEAD on a fresh
   upstream connection. Closing before bytes is fail-closed but not equivalent.
-  #265 tracks the generic connect/send/recv abandonment rendezvous required for
-  those broader failures; it does not turn #264's narrower normal-success and
-  connect-establishment slice into support by itself.
+  #265 now has its D1 generic exact-owner Connect/Send/Recv retirement masks,
+  per-bit cancel/retry accounting, mutation fences, and close/reset persistence.
+  It still lacks the prebuilt-header/request-epoch completion rendezvous and any
+  broader public failure-policy caller, so those failures remain unsupported;
+  D1 does not turn #264's narrower normal-success and connect-establishment
+  slice into broader support by itself.
 - The reusable HEAD gap previously depended on the generic epoll transport
   capability tracked in #262. Epoll now exposes at most one logical completion
   per wait
