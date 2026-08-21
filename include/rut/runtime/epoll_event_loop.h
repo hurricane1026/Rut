@@ -466,7 +466,7 @@ public:
         const i32 fd = c.upstream_fd;
         if (fd < 0 || !upstream) return;                // no pool wired → caller closes the fd
         backend.clear_send_state(c.id);                 // ensure no pending send
-        backend.quiesce_recv(c.id, /*upstream=*/true);  // EPOLL_CTL_DEL, keep the fd
+        backend.quiesce_recv(c.id, /*upstream=*/true, c.upstream_episode);  // EPOLL_CTL_DEL, keep the fd
         clear_upstream_fd(c.id);                        // drop fd↔conn routing
         c.upstream_fd = -1;
         c.upstream_recv_armed = false;
@@ -486,7 +486,7 @@ public:
     void discard_upstream_send(Connection& c) {
         if (c.id < EpollBackend::kMaxFdMap)
             backend.upstream_send_state[c.id] = {
-                nullptr, -1, 0, 0, IoEventType::UpstreamSend, false, 0};
+                nullptr, -1, 0, 0, IoEventType::UpstreamSend, false, 0, 0};
     }
 
     // Stop polling the upstream fd without closing it (close_conn still ::closes
@@ -496,7 +496,8 @@ public:
     // io_uring needs no equivalent (a cancelled recv does not re-fire), so this
     // method is epoll-only and the WS callback reaches it via a requires-guard.
     void ws_unpoll_upstream(Connection& c) {
-        if (c.upstream_fd >= 0) backend.quiesce_recv(c.id, /*upstream=*/true);
+        if (c.upstream_fd >= 0)
+            backend.quiesce_recv(c.id, /*upstream=*/true, c.upstream_episode);
     }
 
     // Symmetric to ws_unpoll_upstream for the downstream (client) fd: stop epoll
@@ -504,7 +505,7 @@ public:
     // deferred behind a still-draining client→upstream send. close_conn ::closes
     // the fd later.
     void ws_unpoll_client(Connection& c) {
-        if (c.fd >= 0) backend.quiesce_recv(c.id, /*upstream=*/false);
+        if (c.fd >= 0) backend.quiesce_recv(c.id, /*upstream=*/false, 0);
     }
 
     bool alloc_upstream_buf(ConnectionBase& c) {
@@ -600,19 +601,19 @@ public:
     }
 
     bool submit_connect_impl(Connection& c, const void* addr, u32 addr_len) {
-        return backend.add_connect(c.upstream_fd, c.id, addr, addr_len);
+        return backend.add_connect(c.upstream_fd, c.id, addr, addr_len, c.upstream_episode);
     }
 
     bool submit_send_upstream_impl(Connection& c, const u8* buf, u32 len) {
-        return backend.add_send_upstream(c.upstream_fd, c.id, buf, len);
+        return backend.add_send_upstream(c.upstream_fd, c.id, buf, len, c.upstream_episode);
     }
 
     bool submit_recv_upstream_impl(Connection& c) {
-        return backend.add_recv_upstream(c.upstream_fd, c.id);
+        return backend.add_recv_upstream(c.upstream_fd, c.id, c.upstream_episode);
     }
 
     void pause_upstream_recv_impl(Connection& c) {
-        backend.pause_upstream_recv(c.id, c.ws_client_send_pending);
+        backend.pause_upstream_recv(c.id, c.upstream_episode, c.ws_client_send_pending);
     }
 
     // Minimal teardown for a health-probe Connection (fd == -1, no downstream).
@@ -832,6 +833,14 @@ public:
     }
 
     void dispatch(const IoEvent& ev) {
+        // Reject tagged upstream completions before timer refresh, handler
+        // resume, callback dispatch, or armed-state changes. The generic
+        // dispatch_event() fence remains as defense in depth for callers that
+        // route directly through it.
+        if (io_event_is_upstream(ev.type) &&
+            (ev.conn_id >= kMaxConns || !valid_upstream_episode(ev.upstream_episode) ||
+             conns[ev.conn_id].upstream_episode != ev.upstream_episode))
+            return;
         switch (ev.type) {
             case IoEventType::Accept:
                 on_accept(ev);

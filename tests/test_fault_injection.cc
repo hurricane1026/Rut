@@ -500,7 +500,7 @@ TEST(epoll_fault, add_connect_reports_injected_failure) {
     a.sin_port = __builtin_bswap16(19999);
     a.sin_addr.s_addr = __builtin_bswap32(0x7F000001);
 
-    CHECK(backend.add_connect(fd, 0, &a, sizeof(a)));
+    CHECK(backend.add_connect(fd, 0, &a, sizeof(a), 1));
     REQUIRE_EQ(backend.pending_count, 1u);
     CHECK_EQ(backend.pending_completions[0].type, IoEventType::UpstreamConnect);
     CHECK_EQ(backend.pending_completions[0].result, -ECONNREFUSED);

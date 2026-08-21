@@ -4487,9 +4487,9 @@ TEST(epoll_pending_capacity, scoped_producers_reject_full_ring_before_side_effec
 
     static const u8 payload[] = {'n', 'o'};
     CHECK_FALSE(backend.add_send(fds[0], 7, payload, sizeof(payload)));
-    CHECK_FALSE(backend.add_send_upstream(fds[0], 7, payload, sizeof(payload)));
-    CHECK_FALSE(backend.add_connect(fds[0], 7, nullptr, 0));
-    CHECK_FALSE(backend.add_recv_upstream(fds[0], 7));
+    CHECK_FALSE(backend.add_send_upstream(fds[0], 7, payload, sizeof(payload), 1));
+    CHECK_FALSE(backend.add_connect(fds[0], 7, nullptr, 0, 1));
+    CHECK_FALSE(backend.add_recv_upstream(fds[0], 7, 1));
     CHECK_EQ(backend.pending_count, EpollBackend::kPendingCap);
     CHECK_EQ(backend.pending_completions[63].conn_id, 263u);
     CHECK_EQ(backend.pending_completions[63].result, 63);
@@ -4550,8 +4550,8 @@ TEST(epoll_pending_capacity, scoped_producers_reject_invalid_conn_ids_before_sid
     static const u8 payload[] = {'n', 'o'};
 
     CHECK_FALSE(backend.add_send(fds[0], bad_id, payload, sizeof(payload)));
-    CHECK_FALSE(backend.add_send_upstream(fds[0], bad_id, payload, sizeof(payload)));
-    CHECK_FALSE(backend.add_recv_upstream(fds[0], bad_id));
+    CHECK_FALSE(backend.add_send_upstream(fds[0], bad_id, payload, sizeof(payload), 1));
+    CHECK_FALSE(backend.add_recv_upstream(fds[0], bad_id, 1));
 
     i32 connect_fd = socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK, 0);
     REQUIRE(connect_fd >= 0);
@@ -4562,7 +4562,8 @@ TEST(epoll_pending_capacity, scoped_producers_reject_invalid_conn_ids_before_sid
     CHECK_FALSE(backend.add_connect(connect_fd,
                                     bad_id,
                                     &addr,
-                                    static_cast<u32>(sizeof(addr))));
+                                    static_cast<u32>(sizeof(addr)),
+                                    1));
 
     TestConn tc;
     tc.init(bad_id, fds[0]);
@@ -4625,7 +4626,7 @@ TEST(epoll_pending_capacity, upstream_partial_send_registration_failure_queues_t
     backend.epoll_fd = -1;  // force the partial-send registration to fail
 
     static const u8 payload[] = {'p', 'a', 'r', 't', 'i', 'a', 'l'};
-    CHECK(backend.add_send_upstream(fds[0], 0, payload, sizeof(payload)));
+    CHECK(backend.add_send_upstream(fds[0], 0, payload, sizeof(payload), 1));
     CHECK_EQ(backend.pending_count, 1u);
     CHECK_EQ(backend.upstream_send_state[0].src, nullptr);
     CHECK_EQ(backend.upstream_send_state[0].fd, -1);

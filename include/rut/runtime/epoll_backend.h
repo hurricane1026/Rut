@@ -68,6 +68,7 @@ struct EpollBackend {
         IoEventType type;
         bool tls;
         u32 tls_wait_events;
+        u32 upstream_episode;  // 0 for downstream; submission episode upstream
     };
     SendState send_state[kMaxFdMap];
     SendState upstream_send_state[kMaxFdMap];
@@ -82,7 +83,7 @@ struct EpollBackend {
 
     // Register fd for EPOLLIN — actual recv happens inside wait().
     bool add_recv(i32 fd, u32 conn_id);
-    bool add_recv_upstream(i32 fd, u32 conn_id);
+    bool add_recv_upstream(i32 fd, u32 conn_id, u32 upstream_episode);
 
     // Suspend EPOLLIN on the downstream fd for conn_id. Used when a JIT
     // handler yields so client bytes arriving mid-wait don't spin the
@@ -97,7 +98,7 @@ struct EpollBackend {
     // pending upstream data would otherwise keep firing UpstreamRecv and drive the
     // pipeline past the pause. submit_recv_upstream re-arms EPOLLIN on resume.
     // No-op if the conn_id has no registered upstream fd.
-    void pause_upstream_recv(u32 conn_id, bool preserve_send_interest = false);
+    void pause_upstream_recv(u32 conn_id, u32 upstream_episode, bool preserve_send_interest = false);
 
     // Stop polling a tunnel fd's READ side (drop EPOLLIN/EPOLLRDHUP so a
     // level-triggered half-close can't re-fire) while PRESERVING any in-flight
@@ -105,7 +106,7 @@ struct EpollBackend {
     // pending the fd is removed from the epoll set entirely. Used by the
     // nginx-style drain-then-close path. upstream selects the upstream fd /
     // upstream_send_state; otherwise the downstream fd / send_state.
-    void quiesce_recv(u32 conn_id, bool upstream);
+    void quiesce_recv(u32 conn_id, bool upstream, u32 upstream_episode);
 
     // Drop any partial-send bookkeeping for conn_id. MUST be called on close so
     // a leftover send_state entry (a partial send that was still in flight when
@@ -117,11 +118,19 @@ struct EpollBackend {
 
     // Try immediate send. If partial/EAGAIN, register EPOLLOUT.
     bool add_send(i32 fd, u32 conn_id, const u8* buf, u32 len);
-    bool add_send_upstream(i32 fd, u32 conn_id, const u8* buf, u32 len);
+    bool add_send_upstream(i32 fd,
+                           u32 conn_id,
+                           const u8* buf,
+                           u32 len,
+                           u32 upstream_episode);
     bool add_send_tls(Connection& c, const u8* buf, u32 len);
 
     // Register fd for connect completion (EPOLLOUT).
-    bool add_connect(i32 fd, u32 conn_id, const void* addr, u32 addr_len);
+    bool add_connect(i32 fd,
+                     u32 conn_id,
+                     const void* addr,
+                     u32 addr_len,
+                     u32 upstream_episode);
 
     // Remove fd from epoll.
     u32 cancel(i32 fd,
@@ -150,8 +159,8 @@ struct EpollBackend {
 
 private:
     // Encode conn_id + type into epoll_event.data.u64
-    static u64 encode_data(u32 conn_id, IoEventType type);
-    static void decode_data(u64 data, u32& conn_id, IoEventType& type);
+    static u64 encode_data(u32 conn_id, IoEventType type, u32 upstream_episode);
+    static bool decode_data(u64 data, u32& conn_id, IoEventType& type, u32& upstream_episode);
 };
 
 }  // namespace rut

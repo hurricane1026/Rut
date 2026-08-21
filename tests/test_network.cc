@@ -10478,7 +10478,8 @@ TEST(epoll_loop, close_clears_partial_send_state) {
     loop->backend.send_state[cid] = {
         reinterpret_cast<const u8*>(0x1000), 7, 0, 16, IoEventType::Send, false, 0};
     loop->backend.upstream_send_state[cid] = {
-        reinterpret_cast<const u8*>(0x2000), 9, 0, 16, IoEventType::UpstreamSend, false, 0};
+        reinterpret_cast<const u8*>(0x2000), 9, 0, 16, IoEventType::UpstreamSend, false, 0,
+        c->upstream_episode};
 
     loop->close_conn(*c);
 
@@ -10514,7 +10515,7 @@ TEST(epoll_loop, ws_unpoll_upstream_deregisters_upstream_fd) {
     REQUIRE(socketpair(AF_UNIX, SOCK_STREAM, 0, cfds) == 0);
     up->upstream_fd = ufds[0];
     ctl->fd = cfds[0];
-    REQUIRE(loop->backend.add_recv_upstream(ufds[0], up_cid));
+    REQUIRE(loop->backend.add_recv_upstream(ufds[0], up_cid, loop->conns[up_cid].upstream_episode));
     REQUIRE(loop->backend.add_recv(cfds[0], ctl->id));
     close(ufds[1]);  // upstream peer closes → fd reports EPOLLHUP
 
@@ -10564,7 +10565,7 @@ TEST(epoll_loop, ws_pre_tunnel_backend_eof_defers_and_deregisters) {
     i32 fds[2];
     REQUIRE(socketpair(AF_UNIX, SOCK_STREAM, 0, fds) == 0);
     c->upstream_fd = fds[0];
-    REQUIRE(loop->backend.add_recv_upstream(fds[0], c->id));
+    REQUIRE(loop->backend.add_recv_upstream(fds[0], c->id, c->upstream_episode));
 
     on_ws_pre_tunnel_upstream_recv<RealLoop>(
         loop, *c, make_ev(c->id, IoEventType::UpstreamRecv, 0));
@@ -10610,11 +10611,12 @@ TEST(epoll_loop, add_recv_preserves_pending_send_epollout) {
     CHECK_EQ(recv(dfds[1], rb, sizeof(rb), MSG_DONTWAIT), static_cast<ssize_t>(sizeof(down)));
 
     // Upstream: symmetric — a client→upstream send pending on the upstream fd.
-    REQUIRE(loop->backend.add_recv_upstream(ufds[0], cid));
+    REQUIRE(loop->backend.add_recv_upstream(ufds[0], cid, loop->conns[cid].upstream_episode));
     static const u8 up[] = {'P', 'I', 'N', 'G'};
     loop->backend.upstream_send_state[cid] = {
-        up, ufds[0], 0, sizeof(up), IoEventType::UpstreamSend, false, 0};
-    REQUIRE(loop->backend.add_recv_upstream(ufds[0], cid));
+        up, ufds[0], 0, sizeof(up), IoEventType::UpstreamSend, false, 0,
+        loop->conns[cid].upstream_episode};
+    REQUIRE(loop->backend.add_recv_upstream(ufds[0], cid, loop->conns[cid].upstream_episode));
     n = loop->backend.wait(ev, 8, loop->conns, RealLoop::kMaxConns);
     bool saw_usend = false;
     for (u32 i = 0; i < n; i++)
@@ -10631,8 +10633,9 @@ TEST(epoll_loop, add_recv_preserves_pending_send_epollout) {
         down, dfds[0], 0, sizeof(down), IoEventType::Send, true, EPOLLOUT};
     CHECK(loop->backend.add_recv(dfds[0], cid));
     loop->backend.upstream_send_state[cid] = {
-        up, ufds[0], 0, sizeof(up), IoEventType::UpstreamSend, true, EPOLLIN};
-    CHECK(loop->backend.add_recv_upstream(ufds[0], cid));
+        up, ufds[0], 0, sizeof(up), IoEventType::UpstreamSend, true, EPOLLIN,
+        loop->conns[cid].upstream_episode};
+    CHECK(loop->backend.add_recv_upstream(ufds[0], cid, loop->conns[cid].upstream_episode));
 
     loop->backend.clear_send_state(cid);
     close(dfds[0]);
@@ -10669,7 +10672,7 @@ TEST(epoll_loop, upstream_recv_registration_failure_queues_local_error) {
 
     close(loop->backend.epoll_fd);
     loop->backend.epoll_fd = -1;
-    CHECK(loop->backend.add_recv_upstream(fds[0], cid));
+    CHECK(loop->backend.add_recv_upstream(fds[0], cid, loop->conns[cid].upstream_episode));
     REQUIRE_EQ(loop->backend.pending_count, EpollBackend::kPendingCap);
     CHECK_EQ(loop->backend.pending_completions[62].conn_id, 762u);
     CHECK_EQ(loop->backend.pending_completions[63].conn_id, cid);
@@ -10775,6 +10778,173 @@ TEST(epoll_loop, poll_command_config_swap) {
     CHECK_EQ(cfg_ptr, &cfg);
     loop->shutdown();
     destroy_real_loop(loop);
+}
+
+TEST(epoll_episode, invalid_upstream_registration_has_no_side_effects) {
+    EpollBackend backend{};
+    REQUIRE(backend.init(0, -1).has_value());
+    const auto before = backend.upstream_send_state[0];
+    const u32 pending_before = backend.pending_count;
+    CHECK_FALSE(backend.add_recv_upstream(-1, 0, 0));
+    CHECK_FALSE(backend.add_send_upstream(-1, 0, nullptr, 1, kInvalidUpstreamEventEpisode));
+    CHECK_FALSE(backend.add_connect(-1, 0, nullptr, 0, 0));
+    CHECK_EQ(backend.upstream_fd_map[0], -1);
+    CHECK_EQ(backend.pending_count, pending_before);
+    CHECK_EQ(backend.upstream_send_state[0].src, before.src);
+    CHECK_EQ(backend.upstream_send_state[0].upstream_episode, before.upstream_episode);
+    backend.pause_upstream_recv(0, 0, true);
+    backend.quiesce_recv(0, true, kInvalidUpstreamEventEpisode);
+    CHECK_EQ(backend.upstream_fd_map[0], -1);
+    backend.shutdown();
+}
+
+TEST(epoll_episode, stale_raw_recv_does_not_touch_buffer_and_current_token_recovers) {
+    EpollBackend backend{};
+    REQUIRE(backend.init(0, -1).has_value());
+    i32 fds[2] = {-1, -1};
+    REQUIRE_EQ(socketpair(AF_UNIX, SOCK_STREAM | SOCK_NONBLOCK, 0, fds), 0);
+    Connection conns[1]{};
+    conns[0].reset();
+    conns[0].id = 0;
+    conns[0].upstream_episode = 2;
+    u8 storage[64] = {};
+    conns[0].upstream_recv_buf.bind(storage, sizeof(storage));
+    REQUIRE(backend.add_recv_upstream(fds[0], 0, 1));
+    static constexpr char kBytes[] = "stale";
+    REQUIRE_EQ(write(fds[1], kBytes, sizeof(kBytes) - 1),
+                static_cast<ssize_t>(sizeof(kBytes) - 1));
+    IoEvent events[2]{};
+    CHECK_EQ(backend.wait(events, 2, conns, 1), 0u);
+    CHECK_EQ(conns[0].upstream_recv_buf.len(), 0u);
+    // The same registration is now current without an EPOLL_CTL_MOD.
+    conns[0].upstream_episode = 1;
+    const u32 n = backend.wait(events, 2, conns, 1);
+    REQUIRE_EQ(n, 1u);
+    CHECK_EQ(events[0].type, IoEventType::UpstreamRecv);
+    CHECK_EQ(events[0].result, static_cast<i32>(sizeof(kBytes) - 1));
+    CHECK_EQ(events[0].upstream_episode, 1u);
+    CHECK_EQ(conns[0].upstream_recv_buf.len(), sizeof(kBytes) - 1);
+    close(fds[0]);
+    close(fds[1]);
+    backend.shutdown();
+}
+
+TEST(epoll_episode, current_recv_drops_stale_send_interest_without_mutating_state) {
+    EpollBackend backend{};
+    REQUIRE(backend.init(0, -1).has_value());
+    i32 fds[2] = {-1, -1};
+    REQUIRE_EQ(socketpair(AF_UNIX, SOCK_STREAM | SOCK_NONBLOCK, 0, fds), 0);
+    Connection conns[1]{};
+    conns[0].reset();
+    conns[0].id = 0;
+    conns[0].upstream_episode = 1;
+    u8 storage[64] = {};
+    conns[0].upstream_recv_buf.bind(storage, sizeof(storage));
+    static const u8 payload[] = {'o', 'l', 'd'};
+    backend.upstream_send_state[0] = {
+        payload, fds[0], 0, sizeof(payload), IoEventType::UpstreamSend, false, 0, 2};
+    REQUIRE(backend.add_recv_upstream(fds[0], 0, 1));
+    REQUIRE_EQ(write(fds[1], "r", 1), 1);
+    const auto before = backend.upstream_send_state[0];
+    IoEvent events[2]{};
+    REQUIRE_EQ(backend.wait(events, 2, conns, 1), 1u);
+    CHECK_EQ(events[0].type, IoEventType::UpstreamRecv);
+    CHECK_EQ(events[0].result, 1);
+    CHECK_EQ(backend.upstream_send_state[0].src, before.src);
+    CHECK_EQ(backend.upstream_send_state[0].remaining, before.remaining);
+    u8 peer[sizeof(payload)] = {};
+    CHECK_EQ(recv(fds[1], peer, sizeof(peer), MSG_DONTWAIT), -1);
+    CHECK(errno == EAGAIN || errno == EWOULDBLOCK);
+    close(fds[0]);
+    close(fds[1]);
+    backend.shutdown();
+}
+
+TEST(epoll_episode, stale_partial_send_does_not_touch_state_or_wire) {
+    EpollBackend backend{};
+    REQUIRE(backend.init(0, -1).has_value());
+    i32 fds[2] = {-1, -1};
+    REQUIRE_EQ(socketpair(AF_UNIX, SOCK_STREAM | SOCK_NONBLOCK, 0, fds), 0);
+    u32 filled = 0;
+    u8 fill[4096] = {};
+    for (;;) {
+        ssize_t nfill = send(fds[0], fill, sizeof(fill), MSG_NOSIGNAL);
+        if (nfill > 0) {
+            filled += static_cast<u32>(nfill);
+            continue;
+        }
+        break;
+    }
+    REQUIRE_GT(filled, 0u);
+    Connection conns[1]{};
+    conns[0].reset();
+    conns[0].id = 0;
+    conns[0].upstream_episode = 2;
+    static const u8 payload[] = {'s', 't', 'a', 'l', 'e'};
+    REQUIRE(backend.add_send_upstream(fds[0], 0, payload, sizeof(payload), 1));
+    u8 drained[8192];
+    while (recv(fds[1], drained, sizeof(drained), MSG_DONTWAIT) > 0) {}
+    const auto before = backend.upstream_send_state[0];
+    IoEvent events[2]{};
+    CHECK_EQ(backend.wait(events, 2, conns, 1), 0u);
+    CHECK_EQ(backend.upstream_send_state[0].src, before.src);
+    CHECK_EQ(backend.upstream_send_state[0].offset, before.offset);
+    CHECK_EQ(backend.upstream_send_state[0].remaining, before.remaining);
+    CHECK_EQ(backend.upstream_send_state[0].upstream_episode, before.upstream_episode);
+    CHECK_EQ(recv(fds[1], drained, sizeof(drained), MSG_DONTWAIT), -1);
+    CHECK(errno == EAGAIN || errno == EWOULDBLOCK);
+    close(fds[0]);
+    close(fds[1]);
+    backend.shutdown();
+}
+
+TEST(epoll_episode, synthetic_upstream_completion_preserves_episode_and_aux) {
+    EpollBackend backend{};
+    REQUIRE(backend.init(0, -1).has_value());
+    i32 fds[2] = {-1, -1};
+    REQUIRE_EQ(socketpair(AF_UNIX, SOCK_STREAM | SOCK_NONBLOCK, 0, fds), 0);
+    static const u8 payload[] = {'o', 'k'};
+    REQUIRE(backend.add_send_upstream(fds[0], 0, payload, sizeof(payload), 7));
+    IoEvent events[2]{};
+    REQUIRE_EQ(backend.wait(events, 2, nullptr, 0), 1u);
+    CHECK_EQ(events[0].type, IoEventType::UpstreamSend);
+    CHECK_EQ(events[0].result, static_cast<i32>(sizeof(payload)));
+    CHECK_EQ(events[0].upstream_episode, 7u);
+    close(fds[0]);
+    close(fds[1]);
+
+    backend.shutdown();
+    EpollBackend failure_backend{};
+    REQUIRE(failure_backend.init(0, -1).has_value());
+    close(failure_backend.epoll_fd);
+    failure_backend.epoll_fd = -1;
+    CHECK(failure_backend.add_recv_upstream(-1, 0, 9));
+    REQUIRE_EQ(failure_backend.wait(events, 2, nullptr, 0), 1u);
+    CHECK_EQ(events[0].type, IoEventType::UpstreamRecv);
+    CHECK_EQ(events[0].upstream_episode, 9u);
+    CHECK_EQ(events[0].aux, kLocalSubmitFailureAux);
+    failure_backend.shutdown();
+}
+
+TEST(epoll_episode, dispatch_rejects_stale_tag_before_callback) {
+    auto loop = std::make_unique<EpollEventLoop>();
+    REQUIRE(loop->init(0, -1).has_value());
+    auto* conn = loop->alloc_conn();
+    REQUIRE(conn != nullptr);
+    conn->fd = -1;
+    conn->upstream_episode = 2;
+    conn->upstream_recv_armed = true;
+    conn->upstream_send_armed = true;
+    const bool recv_armed_before = conn->upstream_recv_armed;
+    const bool send_armed_before = conn->upstream_send_armed;
+    loop->timer.add(conn, 5);
+    ListNode* timer_node_before = conn->timer_node.prev;
+    loop->dispatch({conn->id, 0, 0, 0, IoEventType::UpstreamSend, 0, 0, 1});
+    CHECK_EQ(conn->timer_node.prev, timer_node_before);
+    CHECK_EQ(conn->upstream_recv_armed, recv_armed_before);
+    CHECK_EQ(conn->upstream_send_armed, send_armed_before);
+    loop->free_conn(*conn);
+    loop->shutdown();
 }
 
 TEST(epoll_loop, callbacks_static_route_send_keepalive) {

@@ -390,7 +390,9 @@ void on_probe_sent(void* lp, Connection& conn, IoEvent ev) {
                          0,
                          0,
                          IoEventType::UpstreamRecv,
-                         0};
+                         0,
+                         0,
+                         conn.upstream_episode};
         on_probe_response<Loop>(lp, conn, synth);
         return;
     }
@@ -642,7 +644,14 @@ void proxy_tls_parked_drained(Loop* loop, Connection& conn, u32 newly) {
         // raced body data parks for the byte budget instead of bursting past the
         // configured rate; they stay in upstream_recv_buf and replay on the timer.
         if (throttle_pause_before_pump<Loop>(loop, conn, kRemaining)) return;
-        IoEvent synth = {conn.id, static_cast<i32>(kRemaining), 0, 0, IoEventType::UpstreamRecv, 0};
+        IoEvent synth = {conn.id,
+                         static_cast<i32>(kRemaining),
+                         0,
+                         0,
+                         IoEventType::UpstreamRecv,
+                         0,
+                         0,
+                         conn.upstream_episode};
         on_response_body_recvd<Loop>(loop, conn, synth);
         return;
     }
@@ -734,7 +743,14 @@ void throttle_resume(Loop* loop, Connection& conn) {
     const u32 kRemaining = conn.throttle_pending_len;
     conn.throttle_pending_len = 0;
     if (kRemaining > 0) {
-        IoEvent synth = {conn.id, static_cast<i32>(kRemaining), 0, 0, IoEventType::UpstreamRecv, 0};
+        IoEvent synth = {conn.id,
+                         static_cast<i32>(kRemaining),
+                         0,
+                         0,
+                         IoEventType::UpstreamRecv,
+                         0,
+                         0,
+                         conn.upstream_episode};
 #if RUT_ENABLE_WEBSOCKET
         if (conn.is_ws_tunnel) {
             on_ws_upstream_recv<Loop>(static_cast<void*>(loop), conn, synth);
@@ -3482,7 +3498,8 @@ void on_upstream_connected(void* lp, Connection& conn, IoEvent ev) {
                    &on_early_upstream_recvd_send_inflight<Loop>,
                    &on_upstream_request_sent<Loop>);
     if (!loop->submit_send_upstream(conn, req_src, req_send_len)) {
-        IoEvent synth = {conn.id, -EIO, 0, 0, IoEventType::UpstreamSend, 0};
+        IoEvent synth = {conn.id, -EIO, 0, 0, IoEventType::UpstreamSend, 0, 0,
+                         conn.upstream_episode};
         on_upstream_request_sent<Loop>(lp, conn, synth);
     }
 }
@@ -3513,7 +3530,9 @@ void on_upstream_request_sent(void* lp, Connection& conn, IoEvent ev) {
                              0,
                              0,
                              IoEventType::UpstreamRecv,
-                             0};
+                             0,
+                             0,
+                             conn.upstream_episode};
             on_upstream_response<Loop>(lp, conn, synth);
             return;
         }
@@ -3535,7 +3554,14 @@ void on_upstream_request_sent(void* lp, Connection& conn, IoEvent ev) {
                     prepare_early_response_state(conn);
                     conn.set_slots(nullptr, nullptr, &on_upstream_response<Loop>, nullptr);
                     IoEvent synth = {
-                        conn.id, static_cast<i32>(nr), 0, 0, IoEventType::UpstreamRecv, 0};
+                        conn.id,
+                        static_cast<i32>(nr),
+                        0,
+                        0,
+                        IoEventType::UpstreamRecv,
+                        0,
+                        0,
+                        conn.upstream_episode};
                     on_upstream_response<Loop>(lp, conn, synth);
                     return;
                 }
@@ -3633,7 +3659,9 @@ void on_upstream_request_sent(void* lp, Connection& conn, IoEvent ev) {
                          0,
                          0,
                          IoEventType::UpstreamRecv,
-                         0};
+                         0,
+                         0,
+                         conn.upstream_episode};
         on_upstream_response<Loop>(lp, conn, synth);
     } else {
         loop->submit_recv_upstream(conn);
@@ -3923,7 +3951,14 @@ void h2_on_upstream_response(void* lp, Connection& conn, IoEvent ev) {
         conn.upstream_recv_buf.reset();
         if (kRem > 0) {
             conn.upstream_recv_buf.commit(kRem);
-            IoEvent synth{conn.id, static_cast<i32>(kRem), 0, 0, IoEventType::UpstreamRecv, 0};
+            IoEvent synth{conn.id,
+                          static_cast<i32>(kRem),
+                          0,
+                          0,
+                          IoEventType::UpstreamRecv,
+                          0,
+                          0,
+                          conn.upstream_episode};
             h2_on_upstream_response<Loop>(lp, conn, synth);
         } else if (!loop->submit_recv_upstream(conn)) {
             h2_proxy_fail(loop, conn, 502);
@@ -3992,7 +4027,8 @@ void h2_on_upstream_request_sent(void* lp, Connection& conn, IoEvent ev) {
         // 502 a truncated one; it never re-arms a recv on the now-dead fd.
         if (conn.upstream_recv_buf.len() > 0) {
             conn.set_slots(nullptr, nullptr, &h2_on_upstream_response<Loop>, nullptr);
-            IoEvent eof{conn.id, 0, 0, 0, IoEventType::UpstreamRecv, 0};
+            IoEvent eof{conn.id, 0, 0, 0, IoEventType::UpstreamRecv, 0, 0,
+                        conn.upstream_episode};
             h2_on_upstream_response<Loop>(lp, conn, eof);
             return;
         }
@@ -4034,7 +4070,9 @@ void h2_on_upstream_request_sent(void* lp, Connection& conn, IoEvent ev) {
                       0,
                       0,
                       IoEventType::UpstreamRecv,
-                      0};
+                      0,
+                      0,
+                      conn.upstream_episode};
         h2_on_upstream_response<Loop>(lp, conn, synth);
         return;
     }
@@ -4158,7 +4196,8 @@ void on_response_header_sent(void* lp, Connection& conn, IoEvent ev) {
     const u32 kRemaining = consume_upstream_sent(conn);
     if (throttle_pause_before_pump(loop, conn, kRemaining)) return;
     if (kRemaining > 0) {
-        IoEvent synth = {conn.id, static_cast<i32>(kRemaining), 0, 0, IoEventType::UpstreamRecv, 0};
+        IoEvent synth = {conn.id, static_cast<i32>(kRemaining), 0, 0, IoEventType::UpstreamRecv,
+                         0, 0, conn.upstream_episode};
         on_response_body_recvd<Loop>(lp, conn, synth);
     } else {
         loop->submit_recv_upstream(conn);
@@ -4350,8 +4389,14 @@ void on_response_body_recvd(void* lp, Connection& conn, IoEvent ev) {
                 if (throttle_pause_before_pump(loop, conn, kRemaining)) return;
                 // Not throttled: encrypt now (memory safety — the watermark only
                 // gates *new* reads; one recv's worth fits under kTlsRecordMax).
-                IoEvent synth = {
-                    conn.id, static_cast<i32>(kRemaining), 0, 0, IoEventType::UpstreamRecv, 0};
+                IoEvent synth = {conn.id,
+                                 static_cast<i32>(kRemaining),
+                                 0,
+                                 0,
+                                 IoEventType::UpstreamRecv,
+                                 0,
+                                 0,
+                                 conn.upstream_episode};
                 on_response_body_recvd<Loop>(lp, conn, synth);  // drain the rest of this recv
                 return;
             }
@@ -4522,7 +4567,8 @@ void on_response_body_sent(void* lp, Connection& conn, IoEvent ev) {
     conn.set_slots(nullptr, nullptr, &on_response_body_recvd<Loop>, nullptr);
     if (throttle_pause_before_pump(loop, conn, kRemaining)) return;
     if (kRemaining > 0) {
-        IoEvent synth = {conn.id, static_cast<i32>(kRemaining), 0, 0, IoEventType::UpstreamRecv, 0};
+        IoEvent synth = {conn.id, static_cast<i32>(kRemaining), 0, 0, IoEventType::UpstreamRecv,
+                         0, 0, conn.upstream_episode};
         on_response_body_recvd<Loop>(lp, conn, synth);
     } else {
         loop->submit_recv_upstream(conn);
@@ -4617,7 +4663,8 @@ void on_body_send_with_early_response(void* lp, Connection& conn, IoEvent ev) {
     const i32 kSynthResult = (kParseStatus == ParseStatus::Incomplete)
                                  ? 0
                                  : static_cast<i32>(conn.upstream_recv_buf.len());
-    IoEvent synth = {conn.id, kSynthResult, 0, 0, IoEventType::UpstreamRecv, 0};
+    IoEvent synth = {conn.id, kSynthResult, 0, 0, IoEventType::UpstreamRecv, 0, 0,
+                     conn.upstream_episode};
     on_upstream_response<Loop>(lp, conn, synth);
 }
 
@@ -4641,7 +4688,9 @@ void on_request_body_sent(void* lp, Connection& conn, IoEvent ev) {
                              0,
                              0,
                              IoEventType::UpstreamRecv,
-                             0};
+                             0,
+                             0,
+                             conn.upstream_episode};
             on_upstream_response<Loop>(lp, conn, synth);
             return;
         }
@@ -4662,8 +4711,14 @@ void on_request_body_sent(void* lp, Connection& conn, IoEvent ev) {
                     conn.upstream_recv_buf.commit(static_cast<u32>(nr));
                     prepare_early_response_state(conn);
                     conn.set_slots(nullptr, nullptr, &on_upstream_response<Loop>, nullptr);
-                    IoEvent synth = {
-                        conn.id, static_cast<i32>(nr), 0, 0, IoEventType::UpstreamRecv, 0};
+                    IoEvent synth = {conn.id,
+                                     static_cast<i32>(nr),
+                                     0,
+                                     0,
+                                     IoEventType::UpstreamRecv,
+                                     0,
+                                     0,
+                                     conn.upstream_episode};
                     on_upstream_response<Loop>(lp, conn, synth);
                     return;
                 }
@@ -4696,7 +4751,9 @@ void on_request_body_sent(void* lp, Connection& conn, IoEvent ev) {
                              0,
                              0,
                              IoEventType::UpstreamRecv,
-                             0};
+                             0,
+                             0,
+                             conn.upstream_episode};
             on_upstream_response<Loop>(lp, conn, synth);
         } else {
             loop->submit_recv_upstream(conn);
