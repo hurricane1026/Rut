@@ -18083,6 +18083,10 @@ TEST(iouring_episode, upstream_submissions_carry_episode_and_aux) {
     CHECK(backend.add_recv_upstream(-1, kConnId, kEpisode));
     CHECK(backend.pause_upstream_recv(42, kConnId, kEpisode));
     CHECK(backend.cancel_retiring_upstream_recv(kConnId, kEpisode));
+    CHECK(backend.cancel_retiring_upstream(
+        kConnId, IoEventType::UpstreamConnect, kEpisode));
+    CHECK(backend.cancel_retiring_upstream(
+        kConnId, IoEventType::UpstreamSend, kEpisode));
     CHECK_EQ(backend.upstream_send_state[kConnId].upstream_episode, kEpisode);
 
     // The SQE immediately before first_tail is the non-upstream timer read
@@ -18107,15 +18111,20 @@ TEST(iouring_episode, upstream_submissions_carry_episode_and_aux) {
         backend.sq_entries[(first_tail + 2) & sq_mask].user_data,
         backend.sq_entries[(first_tail + 3) & sq_mask].user_data,
         backend.sq_entries[(first_tail + 4) & sq_mask].user_data,
+        backend.sq_entries[(first_tail + 5) & sq_mask].user_data,
+        backend.sq_entries[(first_tail + 6) & sq_mask].user_data,
     };
     const u8 expected_aux[] = {
-        0, 0, 0, kPauseCancelAux, kUpstreamRetirementCancelAux};
+        0, 0, 0, kPauseCancelAux, kUpstreamRetirementCancelAux,
+        kUpstreamRetirementCancelAux, kUpstreamRetirementCancelAux};
     const IoEventType expected_type[] = {IoEventType::UpstreamConnect,
                                          IoEventType::UpstreamSend,
                                          IoEventType::UpstreamRecv,
                                          IoEventType::UpstreamRecv,
-                                         IoEventType::UpstreamRecv};
-    for (u32 i = 0; i < 5; i++) {
+                                         IoEventType::UpstreamRecv,
+                                         IoEventType::UpstreamConnect,
+                                         IoEventType::UpstreamSend};
+    for (u32 i = 0; i < 7; i++) {
         decoded_conn = 0;
         decoded_type = IoEventType::Count;
         decoded_aux = 0;
@@ -18161,6 +18170,8 @@ TEST(iouring_episode, invalid_upstream_episodes_do_not_acquire_sqe_or_state) {
     CHECK_FALSE(backend.cancel_retiring_upstream_recv(kConnId, 0));
     CHECK_FALSE(backend.cancel_retiring_upstream_recv(
         kConnId, kIoUserDataMaxUpstreamEpisode + 1u));
+    CHECK_FALSE(backend.cancel_retiring_upstream(
+        kConnId, IoEventType::Recv, 1));
     CHECK_EQ(backend.cancel(-1,
                             kConnId,
                             false,
@@ -18219,7 +18230,7 @@ TEST(iouring_retirement, provided_more_target_first_and_unowned_records_are_isol
     REQUIRE_EQ(conn->upstream_episode, kRetiringEpisode + 1u);
     REQUIRE_EQ(conn->upstream_retiring_episode, kRetiringEpisode);
     REQUIRE(conn->upstream_retirement_active);
-    REQUIRE(conn->upstream_retirement_recv_owned);
+    REQUIRE(conn->upstream_retirement_target_owned & kUpstreamOpRecv);
     REQUIRE(conn->upstream_retirement_cancel_owned);
     REQUIRE_FALSE(conn->upstream_retirement_cancel_retry);
     REQUIRE_EQ(conn->pending_ops, 2u);
@@ -18267,7 +18278,7 @@ TEST(iouring_retirement, provided_more_target_first_and_unowned_records_are_isol
     loop->dispatch(events[0]);
     CHECK_FALSE(g_callback_invoked);
     CHECK_EQ(conn->pending_ops, 2u);
-    CHECK(conn->upstream_retirement_recv_owned);
+    CHECK(conn->upstream_retirement_target_owned & kUpstreamOpRecv);
     CHECK(conn->upstream_retirement_cancel_owned);
     CHECK_EQ(conn->upstream_recv_buf.len(), 0u);
     CHECK_EQ(conn->timer_node.prev, timer_prev);
@@ -18308,7 +18319,7 @@ TEST(iouring_retirement, provided_more_target_first_and_unowned_records_are_isol
     for (const IoEvent& unowned : {wrong_aux, wrong_episode, malformed, wrong_type}) {
         loop->dispatch(unowned);
         CHECK_EQ(conn->pending_ops, 2u);
-        CHECK(conn->upstream_retirement_recv_owned);
+        CHECK(conn->upstream_retirement_target_owned & kUpstreamOpRecv);
         CHECK(conn->upstream_retirement_cancel_owned);
         CHECK_FALSE(g_callback_invoked);
     }
@@ -18323,7 +18334,7 @@ TEST(iouring_retirement, provided_more_target_first_and_unowned_records_are_isol
                                kRetiringEpisode};
     loop->dispatch(target_final);
     CHECK_EQ(conn->pending_ops, 1u);
-    CHECK_FALSE(conn->upstream_retirement_recv_owned);
+    CHECK_EQ(conn->upstream_retirement_target_owned, 0u);
     CHECK(conn->upstream_retirement_cancel_owned);
     CHECK(conn->upstream_retirement_active);
     loop->dispatch(target_final);  // duplicate target final owns nothing
@@ -18377,7 +18388,7 @@ TEST(iouring_retirement, cancel_final_first_retires_each_owner_once) {
     loop->dispatch(cancel_final);
     CHECK_EQ(conn->pending_ops, 1u);
     CHECK_FALSE(conn->upstream_retirement_cancel_owned);
-    CHECK(conn->upstream_retirement_recv_owned);
+    CHECK(conn->upstream_retirement_target_owned & kUpstreamOpRecv);
     CHECK(conn->upstream_retirement_active);
     loop->dispatch(cancel_final);
     CHECK_EQ(conn->pending_ops, 1u);
@@ -18392,7 +18403,7 @@ TEST(iouring_retirement, cancel_final_first_retires_each_owner_once) {
                               kRetiringEpisode};
     loop->dispatch(target_more);
     CHECK_EQ(conn->pending_ops, 1u);
-    CHECK(conn->upstream_retirement_recv_owned);
+    CHECK(conn->upstream_retirement_target_owned & kUpstreamOpRecv);
     const IoEvent target_final{conn->id,
                                -ECANCELED,
                                0,
@@ -18403,7 +18414,7 @@ TEST(iouring_retirement, cancel_final_first_retires_each_owner_once) {
                                kRetiringEpisode};
     loop->dispatch(target_final);
     CHECK_EQ(conn->pending_ops, 0u);
-    CHECK_FALSE(conn->upstream_retirement_recv_owned);
+    CHECK_EQ(conn->upstream_retirement_target_owned, 0u);
     CHECK_FALSE(conn->upstream_retirement_active);
     loop->dispatch(target_final);
     CHECK_EQ(conn->pending_ops, 0u);
@@ -18434,7 +18445,7 @@ TEST(iouring_retirement, cancel_submission_failure_retries_before_wait) {
     REQUIRE(loop->begin_strict_upstream_retirement(*conn));
     CHECK_EQ(conn->upstream_episode, kRetiringEpisode + 1u);
     CHECK(conn->upstream_retirement_active);
-    CHECK(conn->upstream_retirement_recv_owned);
+    CHECK(conn->upstream_retirement_target_owned & kUpstreamOpRecv);
     CHECK_FALSE(conn->upstream_retirement_cancel_owned);
     CHECK(conn->upstream_retirement_cancel_retry);
     CHECK_EQ(conn->pending_ops, 1u);  // no invented cancel ownership/count
@@ -18523,7 +18534,7 @@ TEST(iouring_retirement, target_final_before_cancel_retry_allows_exact_one_reuse
                     kRetiringEpisode});
     CHECK_EQ(conn->pending_ops, 0u);
     CHECK_FALSE(conn->upstream_retirement_active);
-    CHECK_FALSE(conn->upstream_retirement_recv_owned);
+    CHECK_EQ(conn->upstream_retirement_target_owned, 0u);
     CHECK_FALSE(conn->upstream_retirement_cancel_owned);
     CHECK_FALSE(conn->upstream_retirement_cancel_retry);
     CHECK_EQ(loop->upstream_retirement_retry_count, 0u);
@@ -18557,7 +18568,7 @@ TEST(iouring_retirement, already_final_recv_completes_without_cancel) {
     CHECK_EQ(conn->upstream_episode, kRetiringEpisode + 1u);
     CHECK_EQ(conn->upstream_retiring_episode, kRetiringEpisode);
     CHECK_FALSE(conn->upstream_retirement_active);
-    CHECK_FALSE(conn->upstream_retirement_recv_owned);
+    CHECK_EQ(conn->upstream_retirement_target_owned, 0u);
     CHECK_FALSE(conn->upstream_retirement_cancel_owned);
     CHECK_FALSE(conn->upstream_retirement_cancel_retry);
     CHECK_EQ(conn->pending_ops, 0u);
@@ -18566,6 +18577,413 @@ TEST(iouring_retirement, already_final_recv_completes_without_cancel) {
 
     conn->upstream_fd = -1;
     loop->free_conn(*conn);
+}
+
+TEST(iouring_retirement, generic_connect_send_recv_targets_retire_in_both_orders) {
+    struct Case {
+        IoEventType type;
+        u8 op;
+        bool cancel_first;
+    };
+    const Case cases[] = {
+        {IoEventType::UpstreamConnect, kUpstreamOpConnect, false},
+        {IoEventType::UpstreamConnect, kUpstreamOpConnect, true},
+        {IoEventType::UpstreamSend, kUpstreamOpSend, false},
+        {IoEventType::UpstreamSend, kUpstreamOpSend, true},
+        {IoEventType::UpstreamRecv, kUpstreamOpRecv, false},
+        {IoEventType::UpstreamRecv, kUpstreamOpRecv, true},
+    };
+
+    for (u32 i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+        ScopedIoUringLoopForRetirement guard;
+        if (!guard.init()) SKIP("io_uring unavailable");
+        auto* loop = guard.loop;
+        Connection* conn = loop->alloc_conn();
+        REQUIRE(conn != nullptr);
+        constexpr u32 kEpisode = 43;
+        static constexpr u8 kPayload[] = {'h', 'e', 'a', 'd'};
+        conn->upstream_episode = kEpisode;
+        conn->upstream_fd = 42;
+        conn->pending_ops = 1;
+        if (cases[i].op == kUpstreamOpConnect) {
+            conn->upstream_connect_armed = true;
+            conn->on_upstream_send = &boundary_current_callback<IoUringEventLoop>;
+        } else if (cases[i].op == kUpstreamOpSend) {
+            conn->upstream_send_armed = true;
+            conn->on_upstream_send = &boundary_current_callback<IoUringEventLoop>;
+            loop->backend.upstream_send_state[conn->id] = {
+                kPayload, 42, 0, sizeof(kPayload), IoEventType::UpstreamSend, kEpisode};
+        } else {
+            conn->upstream_recv_armed = true;
+            conn->on_upstream_recv = &boundary_current_callback<IoUringEventLoop>;
+        }
+
+        REQUIRE(loop->begin_upstream_retirement(*conn, cases[i].op));
+        CHECK_EQ(conn->upstream_episode, kEpisode + 1u);
+        CHECK_EQ(conn->upstream_retirement_target_owned, cases[i].op);
+        CHECK_EQ(conn->upstream_retirement_cancel_owned, cases[i].op);
+        CHECK_EQ(conn->upstream_retirement_cancel_retry, 0u);
+        REQUIRE_EQ(conn->pending_ops, 2u);
+
+        g_boundary_current_callback_count = 0;
+        loop->dispatch({conn->id,
+                        1,
+                        0,
+                        0,
+                        cases[i].type,
+                        1,
+                        0,
+                        kEpisode});
+        loop->dispatch({conn->id,
+                        -EIO,
+                        0,
+                        0,
+                        cases[i].type,
+                        0,
+                        kLocalSubmitFailureAux,
+                        kEpisode});
+        const IoEventType other_type =
+            cases[i].type == IoEventType::UpstreamConnect
+                ? IoEventType::UpstreamSend
+                : IoEventType::UpstreamConnect;
+        loop->dispatch({conn->id, -EIO, 0, 0, other_type, 0, 0, kEpisode});
+        loop->dispatch({conn->id,
+                        -EIO,
+                        0,
+                        0,
+                        cases[i].type,
+                        0,
+                        0,
+                        kEpisode - 1u});
+        CHECK_EQ(conn->pending_ops, 2u);
+        CHECK_EQ(conn->upstream_retirement_target_owned, cases[i].op);
+        CHECK_EQ(conn->upstream_retirement_cancel_owned, cases[i].op);
+        CHECK_EQ(g_boundary_current_callback_count, 0u);
+
+        const IoEvent target{conn->id,
+                             -ECANCELED,
+                             0,
+                             0,
+                             cases[i].type,
+                             0,
+                             0,
+                             kEpisode};
+        const IoEvent cancel{conn->id,
+                             -ENOENT,
+                             0,
+                             0,
+                             cases[i].type,
+                             0,
+                             kUpstreamRetirementCancelAux,
+                             kEpisode};
+        const IoEvent& first = cases[i].cancel_first ? cancel : target;
+        const IoEvent& second = cases[i].cancel_first ? target : cancel;
+        loop->dispatch(first);
+        CHECK_EQ(conn->pending_ops, 1u);
+        CHECK(conn->upstream_retirement_active);
+        loop->dispatch(first);  // duplicate cannot steal the other owner
+        CHECK_EQ(conn->pending_ops, 1u);
+        loop->dispatch(second);
+        CHECK_EQ(conn->pending_ops, 0u);
+        CHECK_FALSE(conn->upstream_retirement_active);
+        CHECK_EQ(conn->upstream_retirement_target_owned, 0u);
+        CHECK_EQ(conn->upstream_retirement_cancel_owned, 0u);
+        CHECK_EQ(conn->upstream_retiring_episode, kEpisode);
+        loop->dispatch(second);
+        CHECK_EQ(conn->pending_ops, 0u);
+
+        conn->upstream_connect_armed = false;
+        conn->upstream_send_armed = false;
+        conn->upstream_recv_armed = false;
+        conn->upstream_fd = -1;
+        conn->set_slots(nullptr, nullptr, nullptr, nullptr);
+        loop->backend.upstream_send_state[conn->id] = {};
+        loop->free_conn(*conn);
+    }
+}
+
+TEST(iouring_retirement, generic_begin_rejects_unmatched_owner_callback_and_send_state) {
+    ScopedIoUringLoopForRetirement guard;
+    if (!guard.init()) SKIP("io_uring unavailable");
+    auto* loop = guard.loop;
+    Connection* conn = loop->alloc_conn();
+    REQUIRE(conn != nullptr);
+    constexpr u32 kEpisode = 47;
+    static constexpr u8 kPayload[] = {'x'};
+    conn->upstream_episode = kEpisode;
+    conn->upstream_fd = 42;
+    conn->upstream_connect_armed = true;
+    conn->pending_ops = 1;
+
+    const u32 tail_before = __atomic_load_n(loop->backend.sq_tail, __ATOMIC_ACQUIRE);
+    CHECK_FALSE(loop->begin_upstream_retirement(*conn, kUpstreamOpConnect));
+    conn->on_upstream_send = &boundary_current_callback<IoUringEventLoop>;
+    CHECK_FALSE(loop->begin_upstream_retirement(*conn, kUpstreamOpRecv));
+    CHECK_FALSE(loop->begin_upstream_retirement(
+        *conn, kUpstreamOpConnect | kUpstreamOpSend));
+    conn->pending_ops = 2;
+    CHECK_FALSE(loop->begin_upstream_retirement(*conn, kUpstreamOpConnect));
+    CHECK_EQ(conn->upstream_episode, kEpisode);
+    CHECK_EQ(conn->upstream_retiring_episode, 0u);
+    CHECK_EQ(__atomic_load_n(loop->backend.sq_tail, __ATOMIC_ACQUIRE), tail_before);
+
+    conn->pending_ops = 1;
+    conn->upstream_connect_armed = false;
+    conn->upstream_send_armed = true;
+    loop->backend.upstream_send_state[conn->id] = {
+        kPayload, 42, 0, 1, IoEventType::UpstreamSend, kEpisode + 1u};
+    CHECK_FALSE(loop->begin_upstream_retirement(*conn, kUpstreamOpSend));
+    loop->backend.upstream_send_state[conn->id].upstream_episode = kEpisode;
+    loop->backend.upstream_send_state[conn->id].remaining = 0;
+    CHECK_FALSE(loop->begin_upstream_retirement(*conn, kUpstreamOpSend));
+    CHECK_EQ(conn->upstream_episode, kEpisode);
+    CHECK_EQ(conn->upstream_retiring_episode, 0u);
+
+    conn->upstream_send_armed = false;
+    conn->pending_ops = 0;
+    conn->upstream_fd = -1;
+    conn->set_slots(nullptr, nullptr, nullptr, nullptr);
+    loop->backend.upstream_send_state[conn->id] = {};
+    loop->free_conn(*conn);
+}
+
+TEST(iouring_retirement, mixed_partial_cancel_failure_retries_or_collapses_exact_bit) {
+    for (bool target_before_retry : {false, true}) {
+        ScopedIoUringLoopForRetirement guard;
+        if (!guard.init()) SKIP("io_uring unavailable");
+        auto* loop = guard.loop;
+        Connection* conn = loop->alloc_conn();
+        REQUIRE(conn != nullptr);
+        constexpr u32 kEpisode = 48;
+        static constexpr u8 kPayload[] = {'a', 'b'};
+        constexpr u8 kTargets = kUpstreamOpSend | kUpstreamOpRecv;
+        conn->upstream_episode = kEpisode;
+        conn->upstream_fd = 42;
+        conn->upstream_send_armed = true;
+        conn->upstream_recv_armed = true;
+        conn->on_upstream_send = &boundary_current_callback<IoUringEventLoop>;
+        conn->on_upstream_recv = &boundary_current_callback<IoUringEventLoop>;
+        conn->pending_ops = 2;
+        loop->backend.upstream_send_state[conn->id] = {
+            kPayload, 42, 0, sizeof(kPayload), IoEventType::UpstreamSend, kEpisode};
+
+        // Leave exactly one SQ slot and make the opportunistic flush fail. The
+        // Send cancel is owned; the following Recv cancel becomes one retry bit.
+        const u32 sq_head = __atomic_load_n(loop->backend.sq_head, __ATOMIC_ACQUIRE);
+        __atomic_store_n(loop->backend.sq_tail,
+                         sq_head + loop->backend.sq_ring_entries - 1u,
+                         __ATOMIC_RELEASE);
+        loop->backend.pending = 0;
+        const i32 ring_fd = loop->backend.ring_fd;
+        loop->backend.ring_fd = -1;
+        REQUIRE(loop->begin_upstream_retirement(*conn, kTargets));
+        loop->backend.ring_fd = ring_fd;
+        loop->backend.fatal_error.store(0, std::memory_order_release);
+        CHECK_EQ(conn->upstream_retirement_target_owned, kTargets);
+        CHECK_EQ(conn->upstream_retirement_cancel_owned, kUpstreamOpSend);
+        CHECK_EQ(conn->upstream_retirement_cancel_retry, kUpstreamOpRecv);
+        CHECK_EQ(conn->pending_ops, 3u);
+        CHECK_EQ(loop->upstream_retirement_retry_count, 1u);
+
+        if (target_before_retry) {
+            loop->dispatch({conn->id,
+                            -ECANCELED,
+                            0,
+                            0,
+                            IoEventType::UpstreamRecv,
+                            0,
+                            0,
+                            kEpisode});
+            CHECK_EQ(conn->upstream_retirement_target_owned, kUpstreamOpSend);
+            CHECK_EQ(conn->upstream_retirement_cancel_retry, 0u);
+            CHECK_EQ(loop->upstream_retirement_retry_count, 0u);
+            CHECK_EQ(conn->pending_ops, 2u);
+        } else {
+            // Model the kernel consuming the queued Send cancel and expose SQ
+            // capacity. The retry scan may add exactly the missing Recv cancel.
+            const u32 tail = __atomic_load_n(loop->backend.sq_tail, __ATOMIC_ACQUIRE);
+            __atomic_store_n(loop->backend.sq_head, tail, __ATOMIC_RELEASE);
+            loop->retry_strict_upstream_retirement_cancels();
+            CHECK_EQ(conn->upstream_retirement_cancel_owned, kTargets);
+            CHECK_EQ(conn->upstream_retirement_cancel_retry, 0u);
+            CHECK_EQ(loop->upstream_retirement_retry_count, 0u);
+            CHECK_EQ(conn->pending_ops, 4u);
+            loop->dispatch({conn->id,
+                            -ECANCELED,
+                            0,
+                            0,
+                            IoEventType::UpstreamRecv,
+                            0,
+                            0,
+                            kEpisode});
+            loop->dispatch({conn->id,
+                            -ENOENT,
+                            0,
+                            0,
+                            IoEventType::UpstreamRecv,
+                            0,
+                            kUpstreamRetirementCancelAux,
+                            kEpisode});
+        }
+        loop->dispatch({conn->id,
+                        -ECANCELED,
+                        0,
+                        0,
+                        IoEventType::UpstreamSend,
+                        0,
+                        0,
+                        kEpisode});
+        loop->dispatch({conn->id,
+                        -ENOENT,
+                        0,
+                        0,
+                        IoEventType::UpstreamSend,
+                        0,
+                        kUpstreamRetirementCancelAux,
+                        kEpisode});
+        CHECK_EQ(conn->pending_ops, 0u);
+        CHECK_FALSE(conn->upstream_retirement_active);
+        CHECK_EQ(conn->upstream_retirement_target_owned, 0u);
+        CHECK_EQ(conn->upstream_retirement_cancel_owned, 0u);
+
+        loop->backend.pending = 0;
+        conn->upstream_send_armed = false;
+        conn->upstream_recv_armed = false;
+        conn->upstream_fd = -1;
+        conn->set_slots(nullptr, nullptr, nullptr, nullptr);
+        loop->backend.upstream_send_state[conn->id] = {};
+        loop->free_conn(*conn);
+    }
+}
+
+TEST(iouring_retirement, retired_send_partial_cqe_cannot_mutate_or_resubmit) {
+    ScopedIoUringLoopForRetirement guard;
+    if (!guard.init()) SKIP("io_uring unavailable");
+    auto* loop = guard.loop;
+    Connection* conn = loop->alloc_conn();
+    REQUIRE(conn != nullptr);
+    constexpr u32 kEpisode = 49;
+    static constexpr u8 kPayload[] = {'a', 'b', 'c', 'd'};
+    conn->upstream_episode = kEpisode;
+    conn->upstream_fd = 42;
+    conn->upstream_send_armed = true;
+    conn->on_upstream_send = &boundary_current_callback<IoUringEventLoop>;
+    conn->pending_ops = 1;
+    loop->backend.upstream_send_state[conn->id] = {
+        kPayload, 42, 0, sizeof(kPayload), IoEventType::UpstreamSend, kEpisode};
+    REQUIRE(loop->begin_upstream_retirement(*conn, kUpstreamOpSend));
+
+    const u32 sq_tail_before = __atomic_load_n(loop->backend.sq_tail, __ATOMIC_ACQUIRE);
+    const u32 cq_tail = __atomic_load_n(loop->backend.cq_tail, __ATOMIC_ACQUIRE);
+    auto& cqe = loop->backend.cq_entries[cq_tail & *loop->backend.cq_ring_mask];
+    cqe.user_data = encode_upstream_event_token(
+        {conn->id, IoEventType::UpstreamSend, kEpisode, 0});
+    cqe.res = 1;
+    cqe.flags = 0;
+    __atomic_store_n(loop->backend.cq_tail, cq_tail + 1, __ATOMIC_RELEASE);
+    loop->backend.pending = 0;
+    IoEvent event{};
+    REQUIRE_EQ(loop->backend.wait(
+                   &event, 1, loop->conns, IoUringEventLoop::kMaxConns),
+               1u);
+    CHECK_EQ(event.result, -ESTALE);
+    CHECK_EQ(loop->backend.upstream_send_state[conn->id].offset, 0u);
+    CHECK_EQ(loop->backend.upstream_send_state[conn->id].remaining,
+             static_cast<u32>(sizeof(kPayload)));
+    CHECK_EQ(__atomic_load_n(loop->backend.sq_tail, __ATOMIC_ACQUIRE), sq_tail_before);
+    g_boundary_current_callback_count = 0;
+    loop->dispatch(event);
+    CHECK_EQ(g_boundary_current_callback_count, 0u);
+    CHECK_EQ(conn->pending_ops, 1u);
+    loop->dispatch({conn->id,
+                    -ENOENT,
+                    0,
+                    0,
+                    IoEventType::UpstreamSend,
+                    0,
+                    kUpstreamRetirementCancelAux,
+                    kEpisode});
+    CHECK_EQ(conn->pending_ops, 0u);
+
+    conn->upstream_send_armed = false;
+    conn->upstream_fd = -1;
+    conn->set_slots(nullptr, nullptr, nullptr, nullptr);
+    loop->backend.upstream_send_state[conn->id] = {};
+    loop->free_conn(*conn);
+}
+
+TEST(iouring_retirement, generic_masks_survive_close_reset_and_reclaim_each_type) {
+    struct Case { IoEventType type; u8 op; };
+    const Case cases[] = {
+        {IoEventType::UpstreamConnect, kUpstreamOpConnect},
+        {IoEventType::UpstreamSend, kUpstreamOpSend},
+        {IoEventType::UpstreamRecv, kUpstreamOpRecv},
+    };
+    for (const Case& test : cases) {
+        ScopedIoUringLoopForRetirement guard;
+        if (!guard.init()) SKIP("io_uring unavailable");
+        auto* loop = guard.loop;
+        Connection* conn = loop->alloc_conn();
+        REQUIRE(conn != nullptr);
+        const u32 id = conn->id;
+        const u32 free_before = loop->free_top;
+        constexpr u32 kEpisode = 50;
+        static constexpr u8 kPayload[] = {'x'};
+        conn->fd = dup(STDERR_FILENO);
+        conn->upstream_fd = dup(STDERR_FILENO);
+        REQUIRE_GE(conn->fd, 0);
+        REQUIRE_GE(conn->upstream_fd, 0);
+        conn->upstream_episode = kEpisode;
+        conn->pending_ops = 1;
+        if (test.op == kUpstreamOpConnect) {
+            conn->upstream_connect_armed = true;
+            conn->on_upstream_send = &boundary_current_callback<IoUringEventLoop>;
+        } else if (test.op == kUpstreamOpSend) {
+            conn->upstream_send_armed = true;
+            conn->on_upstream_send = &boundary_current_callback<IoUringEventLoop>;
+            loop->backend.upstream_send_state[id] = {
+                kPayload, conn->upstream_fd, 0, 1, IoEventType::UpstreamSend, kEpisode};
+        } else {
+            conn->upstream_recv_armed = true;
+            conn->on_upstream_recv = &boundary_current_callback<IoUringEventLoop>;
+        }
+        REQUIRE(loop->begin_upstream_retirement(*conn, test.op));
+
+        // Begin moved each selected operation out of live dispatch state. A
+        // close immediately afterward must preserve only the retirement ledger
+        // and must not invent successor target/cancel ownership.
+        CHECK_FALSE(conn->upstream_connect_armed);
+        CHECK_FALSE(conn->upstream_send_armed);
+        CHECK_FALSE(conn->upstream_recv_armed);
+        CHECK(conn->on_upstream_send == nullptr);
+        CHECK(conn->on_upstream_recv == nullptr);
+        CHECK_EQ(loop->backend.upstream_send_state[id].remaining,
+                 test.op == kUpstreamOpSend ? 1u : 0u);
+        loop->close_conn(*conn);
+        Connection& closed = loop->conns[id];
+        REQUIRE_EQ(closed.fd, -1);
+        REQUIRE_EQ(loop->pending_free_count, 1u);
+        REQUIRE_EQ(closed.upstream_retirement_target_owned, test.op);
+        REQUIRE_EQ(closed.upstream_retirement_cancel_owned, test.op);
+        REQUIRE_EQ(closed.upstream_close_target_owned, 0u);
+        REQUIRE_EQ(closed.upstream_close_cancel_owned, 0u);
+        REQUIRE_EQ(closed.pending_ops, 2u);
+        loop->dispatch({id, -ECANCELED, 0, 0, test.type, 0, 0, kEpisode});
+        CHECK_EQ(closed.pending_ops, 1u);
+        CHECK_EQ(loop->pending_free_count, 1u);
+        loop->dispatch({id,
+                        -ENOENT,
+                        0,
+                        0,
+                        test.type,
+                        0,
+                        kUpstreamRetirementCancelAux,
+                        kEpisode});
+        CHECK_EQ(closed.pending_ops, 0u);
+        CHECK_EQ(loop->pending_free_count, 0u);
+        CHECK_EQ(loop->free_top, free_before + 1u);
+        CHECK_EQ(closed.upstream_retiring_episode, kEpisode);
+    }
 }
 
 TEST(iouring_retirement, recv_only_preconditions_fail_before_token_or_cancel_mutation) {
@@ -18642,9 +19060,6 @@ TEST(iouring_retirement, replacement_preconditions_reject_every_live_owner_befor
 
     bool Connection::*bool_blockers[] = {
         &Connection::upstream_retirement_active,
-        &Connection::upstream_retirement_recv_owned,
-        &Connection::upstream_retirement_cancel_owned,
-        &Connection::upstream_retirement_cancel_retry,
         &Connection::upstream_close_pause_cancel_owned,
         &Connection::http1_boundary_deferred,
         &Connection::http1_boundary_ready,
@@ -18666,6 +19081,17 @@ TEST(iouring_retirement, replacement_preconditions_reject_every_live_owner_befor
         conn->*blocker = true;
         check_unchanged();
         conn->*blocker = false;
+    }
+
+    u8 Connection::*mask_blockers[] = {
+        &Connection::upstream_retirement_target_owned,
+        &Connection::upstream_retirement_cancel_owned,
+        &Connection::upstream_retirement_cancel_retry,
+    };
+    for (u8 Connection::*blocker : mask_blockers) {
+        conn->*blocker = kUpstreamOpRecv;
+        check_unchanged();
+        conn->*blocker = 0;
     }
 
     conn->upstream_close_episode = kSecond;
@@ -18741,7 +19167,7 @@ TEST(iouring_retirement, downstream_close_preserves_owners_and_reclaims_once) {
     CHECK_EQ(retiring.fd, -1);
     CHECK_EQ(retiring.upstream_retiring_episode, kRetiringEpisode);
     CHECK(retiring.upstream_retirement_active);
-    CHECK(retiring.upstream_retirement_recv_owned);
+    CHECK(retiring.upstream_retirement_target_owned & kUpstreamOpRecv);
     CHECK(retiring.upstream_retirement_cancel_owned);
     CHECK_EQ(retiring.pending_ops, 2u);
     CHECK(retiring.recv_slice != nullptr);
@@ -18990,7 +19416,7 @@ TEST(iouring_retirement, drained_latest_tombstone_replaces_twice_and_denies_olde
             loop->dispatch(old);
             CHECK_EQ(conn->pending_ops, 2u);
             CHECK_EQ(conn->upstream_retiring_episode, kSecond);
-            CHECK(conn->upstream_retirement_recv_owned);
+            CHECK(conn->upstream_retirement_target_owned & kUpstreamOpRecv);
             CHECK(conn->upstream_retirement_cancel_owned);
             CHECK_FALSE(g_callback_invoked);
         }
@@ -20579,7 +21005,7 @@ TEST(iouring_retirement, production_paired_head_success_retires_before_old_preco
     REQUIRE(conn->upstream_abandoned);
     REQUIRE_EQ(conn->upstream_episode, kRetiringEpisode + 1u);
     REQUIRE_EQ(conn->upstream_retiring_episode, kRetiringEpisode);
-    REQUIRE(conn->upstream_retirement_recv_owned);
+    REQUIRE(conn->upstream_retirement_target_owned & kUpstreamOpRecv);
     REQUIRE(conn->upstream_retirement_cancel_owned);
     REQUIRE_EQ(conn->pending_ops, 3u);  // target + cancel-own + downstream send
     CHECK_EQ(conn->upstream_fd, -1);
@@ -20642,7 +21068,7 @@ TEST(iouring_retirement, production_paired_head_success_retires_before_old_preco
              static_cast<u16>(buf_tail_before + 1));
     loop->dispatch(events[0]);
     CHECK_EQ(conn->pending_ops, 3u);
-    CHECK(conn->upstream_retirement_recv_owned);
+    CHECK(conn->upstream_retirement_target_owned & kUpstreamOpRecv);
 
     // Discard the deliberately unsubmitted cancel/send SQEs before synthetic
     // completion dispatch, then drive the unchanged terminal close lifecycle.

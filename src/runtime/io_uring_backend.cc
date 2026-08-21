@@ -406,13 +406,15 @@ bool IoUringBackend::pause_upstream_recv(i32 fd, u32 conn_id, u32 upstream_episo
                                upstream_episode);
 }
 
-bool IoUringBackend::cancel_retiring_upstream_recv(u32 conn_id, u32 upstream_episode) {
-    if (conn_id >= kMaxSendState || !valid_upstream_episode(upstream_episode)) return false;
-    return cancel_by_user_data(encode_upstream_user_data(conn_id,
-                                                         IoEventType::UpstreamRecv,
-                                                         upstream_episode),
+bool IoUringBackend::cancel_retiring_upstream(u32 conn_id,
+                                              IoEventType type,
+                                              u32 upstream_episode) {
+    if (conn_id >= kMaxSendState || !io_event_is_upstream(type) ||
+        !valid_upstream_episode(upstream_episode))
+        return false;
+    return cancel_by_user_data(encode_upstream_user_data(conn_id, type, upstream_episode),
                                conn_id,
-                               IoEventType::UpstreamRecv,
+                               type,
                                kUpstreamRetirementCancelAux,
                                upstream_episode);
 }
