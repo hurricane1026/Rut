@@ -11400,6 +11400,125 @@ namespace {
 bool g_epoll_episode_callback_called = false;
 u32 g_epoll_episode_callback_count = 0;
 
+struct RealEpollEpisodeGuard {
+    struct TrackedConnection {
+        Connection* ptr = nullptr;
+        u32 id = 0;
+        bool live = false;
+    };
+
+    static constexpr u32 kMaxTrackedConnections = 8;
+
+    RealLoop* loop = nullptr;
+    bool initialized = false;
+    UpstreamPool* upstream_pool = nullptr;
+    bool upstream_pool_initialized = false;
+    i32 listener_fd = -1;
+    i32 peer_fds[2] = {-1, -1};
+    TrackedConnection connections[kMaxTrackedConnections]{};
+
+    ~RealEpollEpisodeGuard() {
+        if (initialized && loop) {
+            // close_conn is required even for fd == -1: an upstream-only
+            // connection can still own an active episode or a timer entry.
+            for (u32 i = kMaxTrackedConnections; i > 0; i--) {
+                TrackedConnection& tracked = connections[i - 1];
+                if (!tracked.live) continue;
+                Connection* conn = tracked.ptr;
+                tracked.live = false;
+                loop->close_conn(*conn);
+            }
+            // A borrowed/current upstream fd is owned by its Connection after
+            // take_idle(), so the pool is drained only after conn teardown.
+            if (upstream_pool && upstream_pool_initialized) upstream_pool->shutdown();
+            loop->upstream = nullptr;
+            loop->shutdown();
+        }
+        for (i32& fd : peer_fds) {
+            if (fd >= 0) {
+                close(fd);
+                fd = -1;
+            }
+        }
+        if (listener_fd >= 0) {
+            close(listener_fd);
+            listener_fd = -1;
+        }
+        destroy_real_loop(loop);
+        loop = nullptr;
+    }
+
+    bool create() {
+        loop = create_real_loop();
+        return loop != nullptr;
+    }
+
+    bool init() {
+        if (!loop) return false;
+        auto result = loop->init(0, -1, 0);
+        if (!result.has_value()) return false;
+        initialized = true;
+        return true;
+    }
+
+    void attach_pool(UpstreamPool& pool) {
+        upstream_pool = &pool;
+        upstream_pool->init();
+        upstream_pool_initialized = true;
+        loop->upstream = upstream_pool;
+    }
+
+    Connection* alloc_conn() {
+        if (!loop) return nullptr;
+        Connection* conn = loop->alloc_conn();
+        if (conn && !track_conn(*conn)) {
+            loop->free_conn(*conn);
+            return nullptr;
+        }
+        return conn;
+    }
+
+    // The connect helper also calls this before creating its socket, making
+    // ownership explicit at the first fallible step even if a future caller
+    // does not allocate through alloc_conn().
+    bool track_conn(Connection& conn) {
+        for (u32 i = kMaxTrackedConnections; i > 0; i--) {
+            const TrackedConnection& tracked = connections[i - 1];
+            if (tracked.live && tracked.ptr == &conn && tracked.id == conn.id) return true;
+        }
+        for (TrackedConnection& tracked : connections) {
+            if (!tracked.live) {
+                tracked.ptr = &conn;
+                tracked.id = conn.id;
+                tracked.live = true;
+                return true;
+            }
+        }
+        return false;
+    }
+
+    void close_conn(Connection& conn) {
+        mark_conn_dead(conn);
+        loop->close_conn(conn);
+    }
+
+    void free_conn(Connection& conn) {
+        mark_conn_dead(conn);
+        loop->free_conn(conn);
+    }
+
+private:
+    void mark_conn_dead(Connection& conn) {
+        for (u32 i = kMaxTrackedConnections; i > 0; i--) {
+            TrackedConnection& tracked = connections[i - 1];
+            if (tracked.live && tracked.ptr == &conn && tracked.id == conn.id) {
+                tracked.live = false;
+                return;
+            }
+        }
+    }
+};
+
 struct EpollEpisodeSocketGuard {
     EpollBackend* backend;
     i32* fds;
@@ -11442,8 +11561,13 @@ bool accept_real_upstream_peer(i32 listener_fd, i32& peer_fd) {
     return peer_fd >= 0;
 }
 
-bool connect_real_upstream(
-    EpollEventLoop& loop, Connection& conn, i32 listener_fd, i32& peer_fd, IoEvent& completion) {
+bool connect_real_upstream(RealEpollEpisodeGuard& guard,
+                           Connection& conn,
+                           i32 listener_fd,
+                           i32& peer_fd,
+                           IoEvent& completion) {
+    if (!guard.track_conn(conn)) return false;
+    EpollEventLoop& loop = *guard.loop;
     conn.upstream_fd = UpstreamPool::create_socket();
     if (conn.upstream_fd < 0) return false;
 
@@ -11487,19 +11611,19 @@ TEST(epoll_episode, dispatch_rejects_stale_tag_before_callback) {
 }
 
 TEST(epoll_episode_lifecycle, pooled_same_fd_stale_raw_readiness_is_fenced_before_io) {
-    auto* loop = create_real_loop();
-    REQUIRE(loop != nullptr);
-    REQUIRE(loop->init(0, -1, 0).has_value());
     UpstreamPool upstream_pool{};
-    upstream_pool.init();
-    loop->upstream = &upstream_pool;
+    RealEpollEpisodeGuard guard{};
+    REQUIRE(guard.create());
+    REQUIRE(guard.init());
+    guard.attach_pool(upstream_pool);
+    auto* loop = guard.loop;
 
     auto listener_result = create_listen_socket(0);
     REQUIRE(listener_result.has_value());
-    const i32 listener_fd = listener_result.value();
-    i32 peer_fd = -1;
+    guard.listener_fd = listener_result.value();
+    const i32 listener_fd = guard.listener_fd;
 
-    auto* conn = loop->alloc_conn();
+    auto* conn = guard.alloc_conn();
     REQUIRE(conn != nullptr);
     const u32 conn_id = conn->id;
     const u32 first_episode = conn->upstream_episode;
@@ -11507,7 +11631,7 @@ TEST(epoll_episode_lifecycle, pooled_same_fd_stale_raw_readiness_is_fenced_befor
     CHECK_EQ(loop->backend.active_upstream_episode[conn_id], 0u);
 
     IoEvent first_connect{};
-    REQUIRE(connect_real_upstream(*loop, *conn, listener_fd, peer_fd, first_connect));
+    REQUIRE(connect_real_upstream(guard, *conn, listener_fd, guard.peer_fds[0], first_connect));
     REQUIRE_EQ(first_connect.type, IoEventType::UpstreamConnect);
     REQUIRE_EQ(first_connect.result, 0);
     REQUIRE_EQ(first_connect.upstream_episode, first_episode);
@@ -11542,7 +11666,7 @@ TEST(epoll_episode_lifecycle, pooled_same_fd_stale_raw_readiness_is_fenced_befor
     // Ownership stays on episode 2: only the kernel registration carries token 1.
     REQUIRE(loop->backend.add_recv_upstream(first_fd, conn_id, first_episode));
     static constexpr char kPayload[] = "episode-two-payload";
-    REQUIRE_EQ(send(peer_fd, kPayload, sizeof(kPayload) - 1, MSG_NOSIGNAL),
+    REQUIRE_EQ(send(guard.peer_fds[0], kPayload, sizeof(kPayload) - 1, MSG_NOSIGNAL),
                static_cast<ssize_t>(sizeof(kPayload) - 1));
 
     IoEvent stale_events[1]{};
@@ -11572,35 +11696,32 @@ TEST(epoll_episode_lifecycle, pooled_same_fd_stale_raw_readiness_is_fenced_befor
     loop->dispatch(current);
     CHECK_EQ(g_epoll_episode_callback_count, 1u);
 
-    loop->close_conn(*conn);
+    guard.close_conn(*conn);
     errno = 0;
     CHECK_EQ(fcntl(first_fd, F_GETFD), -1);
     CHECK_EQ(errno, EBADF);
     CHECK_EQ(upstream_pool.idle_count.load(std::memory_order_acquire), 0u);
     CHECK_EQ(upstream_pool.free_top, UpstreamPool::kMaxConns);
-    close(peer_fd);
-    close(listener_fd);
-    upstream_pool.shutdown();
-    loop->shutdown();
-    destroy_real_loop(loop);
 }
 
 TEST(epoll_episode_lifecycle, recycled_slot_rejects_old_completion_before_dispatch_mutation) {
-    auto* loop = create_real_loop();
-    REQUIRE(loop != nullptr);
-    REQUIRE(loop->init(0, -1, 0).has_value());
+    RealEpollEpisodeGuard guard{};
+    REQUIRE(guard.create());
+    REQUIRE(guard.init());
+    auto* loop = guard.loop;
     auto listener_result = create_listen_socket(0);
     REQUIRE(listener_result.has_value());
-    const i32 listener_fd = listener_result.value();
+    guard.listener_fd = listener_result.value();
+    const i32 listener_fd = guard.listener_fd;
 
-    auto* old_conn = loop->alloc_conn();
+    auto* old_conn = guard.alloc_conn();
     REQUIRE(old_conn != nullptr);
     const u32 conn_id = old_conn->id;
     const u32 first_episode = old_conn->upstream_episode;
     REQUIRE_EQ(first_episode, 1u);
-    i32 first_peer_fd = -1;
     IoEvent old_completion{};
-    REQUIRE(connect_real_upstream(*loop, *old_conn, listener_fd, first_peer_fd, old_completion));
+    REQUIRE(
+        connect_real_upstream(guard, *old_conn, listener_fd, guard.peer_fds[0], old_completion));
     REQUIRE_EQ(old_completion.type, IoEventType::UpstreamConnect);
     REQUIRE_EQ(old_completion.result, 0);
     REQUIRE_EQ(old_completion.conn_id, conn_id);
@@ -11610,17 +11731,16 @@ TEST(epoll_episode_lifecycle, recycled_slot_rejects_old_completion_before_dispat
     // Terminal production teardown retires episode 1 and returns this exact
     // Connection slot to the allocator. Its saved completion remains addressable
     // only by conn_id + old episode, as a real late completion would be.
-    loop->close_conn(*old_conn);
+    guard.close_conn(*old_conn);
     CHECK_EQ(loop->backend.active_upstream_episode[conn_id], 0u);
-    auto* current_conn = loop->alloc_conn();
+    auto* current_conn = guard.alloc_conn();
     REQUIRE(current_conn != nullptr);
     REQUIRE_EQ(current_conn->id, conn_id);
     REQUIRE_EQ(current_conn->upstream_episode, first_episode + 1);
 
-    i32 second_peer_fd = -1;
     IoEvent current_completion{};
     REQUIRE(connect_real_upstream(
-        *loop, *current_conn, listener_fd, second_peer_fd, current_completion));
+        guard, *current_conn, listener_fd, guard.peer_fds[1], current_completion));
     const u32 second_episode = current_conn->upstream_episode;
     REQUIRE_EQ(second_episode, first_episode + 1);
     REQUIRE_EQ(current_completion.type, IoEventType::UpstreamConnect);
@@ -11629,7 +11749,7 @@ TEST(epoll_episode_lifecycle, recycled_slot_rejects_old_completion_before_dispat
     REQUIRE_EQ(current_completion.upstream_episode, second_episode);
     CHECK_EQ(loop->backend.active_upstream_episode[conn_id], second_episode);
 
-    auto* timer_anchor = loop->alloc_conn();
+    auto* timer_anchor = guard.alloc_conn();
     REQUIRE(timer_anchor != nullptr);
     loop->timer.add(current_conn, 5);
     loop->timer.add(timer_anchor, 5);
@@ -11674,13 +11794,8 @@ TEST(epoll_episode_lifecycle, recycled_slot_rejects_old_completion_before_dispat
     loop->dispatch(current_completion);
     CHECK_EQ(g_epoll_episode_callback_count, 1u);
 
-    loop->close_conn(*current_conn);
-    loop->free_conn(*timer_anchor);
-    close(first_peer_fd);
-    close(second_peer_fd);
-    close(listener_fd);
-    loop->shutdown();
-    destroy_real_loop(loop);
+    guard.close_conn(*current_conn);
+    guard.free_conn(*timer_anchor);
 }
 
 TEST(epoll_episode, stale_tls_send_cannot_rearm_or_hijack_current_recv) {
