@@ -1037,18 +1037,94 @@ static bool capture_head_case(u16 frontend_port,
     return true;
 }
 
+static bool capture_head_rut_case(u16 frontend_port,
+                                  u16 backend_port,
+                                  const std::string& source_path,
+                                  const std::string& rut_log_path,
+                                  const std::string& rut_path,
+                                  std::vector<char>& downstream,
+                                  std::vector<char>& upstream,
+                                  std::string& error) {
+    Recorder recorder;
+    if (!recorder.setup(backend_port,
+                        1,
+                        kHeadBackendResponse,
+                        sizeof(kHeadBackendResponse) - 1)) {
+        error = "HEAD RUT backend recorder setup failed";
+        return false;
+    }
+
+    ChildGuard rut;
+    if (!spawn_child({rut_path, source_path, "--shards", "1", "--no-pin", "--drain", "0"},
+                     rut_log_path,
+                     rut.child)) {
+        error = "failed to start production RUT for HEAD case";
+        return false;
+    }
+    if (!wait_ready(frontend_port, rut.child, error)) return false;
+
+    const int client = connect_once(frontend_port);
+    bool ok = client >= 0;
+    if (ok) ok = send_all(client, kHeadRequest, sizeof(kHeadRequest) - 1);
+    if (ok) ok = read_head_response(client, downstream, error);
+    if (ok) ok = read_eof(client, error);
+    if (client >= 0) close(client);
+    if (!ok) {
+        error = "RUT HEAD response/EOF failed: " + error;
+        return false;
+    }
+    if (!stop_child(rut.child)) {
+        error = "failed to stop production RUT after HEAD case";
+        return false;
+    }
+    recorder.stop();
+    if (recorder.accepted.load(std::memory_order_acquire) != 1 ||
+        recorder.requests.load(std::memory_order_acquire) != 1 || recorder.history.size() != 1) {
+        error = "RUT HEAD recorder did not observe exactly one request";
+        return false;
+    }
+    const std::string expected_request =
+        std::string("HEAD /head?q=1 HTTP/1.1\r\n") +
+        "Host: 127.0.0.1:" + std::to_string(backend_port) + "\r\n\r\n";
+    upstream = recorder.history[0];
+    const std::vector<char> expected_wire(expected_request.begin(), expected_request.end());
+    if (upstream != expected_wire) {
+        error = "RUT HEAD upstream request wire mismatch";
+        dump_wire("expected RUT HEAD upstream", expected_wire);
+        dump_wire("actual RUT HEAD upstream", upstream);
+        return false;
+    }
+    const std::vector<char> expected_response(kHeadResponseNormalized,
+                                              kHeadResponseNormalized +
+                                                  sizeof(kHeadResponseNormalized) - 1);
+    std::vector<char> normalized = downstream;
+    if (!normalize_date(normalized) || normalized != expected_response) {
+        error = "RUT HEAD downstream response did not match the exact pinned header-only baseline";
+        dump_wire("expected RUT HEAD response", expected_response);
+        dump_wire("actual RUT HEAD response", downstream);
+        return false;
+    }
+    return true;
+}
+
 static bool capture_head_gateway_case(u16 frontend_port,
                                       u16 backend_port,
                                       const std::string& nginx_config_path,
                                       const std::string& nginx_log_path,
                                       const std::string& container_name,
                                       std::vector<char>& downstream,
-                                      std::string& error) {
+                                      std::string& error,
+                                      DeadPort* held_dead = nullptr) {
     // Keep the unavailable endpoint reserved through nginx shutdown and log
     // inspection. This makes the connection failure deterministic and prevents
     // another process from satisfying the request between those observations.
-    DeadPort dead;
-    if (!dead.reserve(backend_port)) {
+    DeadPort local_dead;
+    DeadPort& dead = held_dead != nullptr ? *held_dead : local_dead;
+    if (held_dead == nullptr && !dead.reserve(backend_port)) {
+        error = "failed to reserve unavailable HEAD gateway upstream port";
+        return false;
+    }
+    if (held_dead != nullptr && dead.fd < 0 && !dead.reserve(backend_port)) {
         error = "failed to reserve unavailable HEAD gateway upstream port";
         return false;
     }
@@ -1107,6 +1183,55 @@ static bool capture_head_gateway_case(u16 frontend_port,
         dump_wire("actual HEAD gateway response", downstream);
         return false;
     }
+    return true;
+}
+
+static bool capture_head_gateway_rut_case(u16 frontend_port,
+                                          u16 backend_port,
+                                          const std::string& source_path,
+                                          const std::string& rut_log_path,
+                                          const std::string& rut_path,
+                                          DeadPort& dead,
+                                          std::vector<char>& downstream,
+                                          std::string& error) {
+    if (dead.fd < 0) {
+        error = "HEAD RUT gateway dead port was not reserved";
+        return false;
+    }
+    ChildGuard rut;
+    if (!spawn_child({rut_path, source_path, "--shards", "1", "--no-pin", "--drain", "0"},
+                     rut_log_path,
+                     rut.child)) {
+        error = "failed to start production RUT for HEAD gateway case";
+        return false;
+    }
+    if (!wait_ready(frontend_port, rut.child, error)) return false;
+    const int client = connect_once(frontend_port);
+    bool ok = client >= 0;
+    if (ok) ok = send_all(client, kHeadGatewayRequest, sizeof(kHeadGatewayRequest) - 1);
+    if (ok) ok = read_head_response(client, downstream, error);
+    if (ok) ok = read_eof(client, error);
+    if (client >= 0) close(client);
+    if (!ok) {
+        error = "RUT HEAD gateway response/EOF failed: " + error;
+        return false;
+    }
+    if (!stop_child(rut.child)) {
+        error = "failed to stop production RUT after HEAD gateway case";
+        return false;
+    }
+    std::vector<char> normalized = downstream;
+    const std::vector<char> expected(kHeadGatewayResponseNormalized,
+                                     kHeadGatewayResponseNormalized +
+                                         sizeof(kHeadGatewayResponseNormalized) - 1);
+    if (!normalize_date(normalized) || normalized != expected) {
+        error = "RUT HEAD gateway response did not match the exact pinned header-only baseline";
+        dump_wire("expected RUT HEAD gateway response", expected);
+        dump_wire("actual RUT HEAD gateway response", downstream);
+        dump_log(rut_log_path, "RUT HEAD gateway log");
+        return false;
+    }
+    (void)backend_port;
     return true;
 }
 
@@ -1786,6 +1911,112 @@ int main(int argc, char** argv) {
     }
     std::cerr << "PASS: pinned nginx HEAD unavailable-upstream gateway baseline "
                  "(header-only 502 + EOF)\n";
+
+    std::vector<char> rut_head_response;
+    std::vector<char> rut_head_request;
+    std::string rut_head_error;
+    if (!capture_head_rut_case(frontend_port,
+                               backend_port,
+                               temp.source,
+                               temp.rut_log,
+                               argv[1],
+                               rut_head_response,
+                               rut_head_request,
+                               rut_head_error)) {
+        std::cerr << "FAIL [HEAD RUT differential]: " << rut_head_error << "\n";
+        dump_wire("nginx HEAD response", nginx_head_response);
+        dump_wire("RUT HEAD response", rut_head_response);
+        dump_wire("nginx HEAD request", nginx_head_request);
+        dump_wire("RUT HEAD request", rut_head_request);
+        dump_log(temp.rut_log, "RUT HEAD log");
+        return 1;
+    }
+    const std::vector<char> expected_head_response(kHeadResponseNormalized,
+                                                   kHeadResponseNormalized +
+                                                       sizeof(kHeadResponseNormalized) - 1);
+    const std::string expected_head_request =
+        std::string("HEAD /head?q=1 HTTP/1.1\r\n") +
+        "Host: 127.0.0.1:" + std::to_string(backend_port) + "\r\n\r\n";
+    const std::vector<char> expected_head_wire(expected_head_request.begin(),
+                                               expected_head_request.end());
+    std::vector<char> normalized_nginx_head = nginx_head_response;
+    std::vector<char> normalized_rut_head = rut_head_response;
+    if (!normalize_date(normalized_nginx_head) || !normalize_date(normalized_rut_head) ||
+        normalized_nginx_head != expected_head_response ||
+        normalized_rut_head != expected_head_response ||
+        normalized_nginx_head != normalized_rut_head || nginx_head_request != expected_head_wire ||
+        rut_head_request != expected_head_wire || nginx_head_request != rut_head_request) {
+        std::cerr << "FAIL [HEAD differential]: exact nginx/RUT HEAD mismatch\n";
+        dump_wire("expected HEAD response", expected_head_response);
+        dump_wire("nginx HEAD response", nginx_head_response);
+        dump_wire("RUT HEAD response", rut_head_response);
+        dump_wire("expected HEAD upstream", expected_head_wire);
+        dump_wire("nginx HEAD upstream", nginx_head_request);
+        dump_wire("RUT HEAD upstream", rut_head_request);
+        dump_log(temp.nginx_log, "nginx HEAD log");
+        dump_log(temp.rut_log, "RUT HEAD log");
+        return 1;
+    }
+    std::cerr << "PASS: converter-generated RUT HEAD success matches pinned nginx\n";
+
+    DeadPort head_gateway_dead;
+    if (!head_gateway_dead.reserve(backend_port)) {
+        std::cerr << "FAIL [HEAD gateway differential]: failed to reserve unavailable upstream port\n";
+        return 1;
+    }
+    std::vector<char> nginx_head_gateway_differential_response;
+    std::string nginx_head_gateway_differential_error;
+    const std::string head_gateway_differential_container = container + "-head-differential";
+    if (!capture_head_gateway_case(frontend_port,
+                                   backend_port,
+                                   temp.nginx_config,
+                                   temp.nginx_log,
+                                   head_gateway_differential_container,
+                                   nginx_head_gateway_differential_response,
+                                   nginx_head_gateway_differential_error,
+                                   &head_gateway_dead)) {
+        std::cerr << "FAIL [HEAD gateway differential nginx]: "
+                  << nginx_head_gateway_differential_error << "\n";
+        dump_wire("nginx HEAD gateway response", nginx_head_gateway_differential_response);
+        dump_log(temp.nginx_log, "nginx HEAD gateway log");
+        return 1;
+    }
+    std::vector<char> rut_head_gateway_differential_response;
+    std::string rut_head_gateway_differential_error;
+    if (!capture_head_gateway_rut_case(frontend_port,
+                                       backend_port,
+                                       temp.source,
+                                       temp.rut_log,
+                                       argv[1],
+                                       head_gateway_dead,
+                                       rut_head_gateway_differential_response,
+                                       rut_head_gateway_differential_error)) {
+        std::cerr << "FAIL [HEAD gateway differential RUT]: "
+                  << rut_head_gateway_differential_error << "\n";
+        dump_wire("nginx HEAD gateway response", nginx_head_gateway_differential_response);
+        dump_wire("RUT HEAD gateway response", rut_head_gateway_differential_response);
+        dump_log(temp.rut_log, "RUT HEAD gateway log");
+        return 1;
+    }
+    const std::vector<char> expected_head_gateway_response(
+        kHeadGatewayResponseNormalized,
+        kHeadGatewayResponseNormalized + sizeof(kHeadGatewayResponseNormalized) - 1);
+    std::vector<char> normalized_nginx_head_gateway = nginx_head_gateway_differential_response;
+    std::vector<char> normalized_rut_head_gateway = rut_head_gateway_differential_response;
+    if (!normalize_date(normalized_nginx_head_gateway) ||
+        !normalize_date(normalized_rut_head_gateway) ||
+        normalized_nginx_head_gateway != expected_head_gateway_response ||
+        normalized_rut_head_gateway != expected_head_gateway_response ||
+        normalized_nginx_head_gateway != normalized_rut_head_gateway) {
+        std::cerr << "FAIL [HEAD gateway differential]: exact nginx/RUT mismatch\n";
+        dump_wire("expected HEAD gateway response", expected_head_gateway_response);
+        dump_wire("nginx HEAD gateway response", nginx_head_gateway_differential_response);
+        dump_wire("RUT HEAD gateway response", rut_head_gateway_differential_response);
+        dump_log(temp.nginx_log, "nginx HEAD gateway log");
+        dump_log(temp.rut_log, "RUT HEAD gateway log");
+        return 1;
+    }
+    std::cerr << "PASS: converter-generated RUT HEAD unavailable-upstream gateway matches pinned nginx\n";
 
     u16 api_frontend_port = 0;
     u16 api_backend_port = 0;
