@@ -32922,12 +32922,111 @@ route GET "/" {
     REQUIRE_EQ(rir.module.policy_bundle_count, 1u);
     CHECK_EQ(rir.module.policy_bundles[0].response_policy_id, 1u);
     CHECK_EQ(rir.module.policy_bundles[0].failure_policy_id, 1u);
+    CHECK_EQ(rir.module.policy_bundles[0].timeout_failure_policy_id, 0u);
     CHECK(rir.module.failure_policies[0].body.eq(lit("unavailable")));
     const auto& block = rir.module.functions[0].blocks[0];
     const auto& ret = block.insts[block.inst_count - 1];
     CHECK_EQ(static_cast<u8>(ret.op), static_cast<u8>(rir::Opcode::RetForwardBundle));
     CHECK_EQ(ret.operand_count, 3u);
     rir.destroy();
+}
+
+TEST(frontend, timeout_failure_policy_is_carried_as_a_deduplicated_triple_bundle) {
+    const char* src = R"rut(
+upstream backend at "127.0.0.1:9000"
+route GET "/one" {
+    return forward(backend, response_policy: {
+        version: "HTTP/1.1", framing: "content_length", connection: "request",
+        head_mode: "suppress_body", server: "rut", date: "current", hide_headers: []
+    }, failure_policy: {
+        version: "HTTP/1.1", status: 502, reason: "Bad Gateway",
+        content_type: "text/plain", server: "rut", date: "current",
+        connection: "request", head_mode: "suppress_body", body: b"bad"
+    }, timeout_failure_policy: {
+        version: "HTTP/1.1", status: 504, reason: "Gateway Time-out",
+        content_type: "text/plain", server: "rut", date: "current",
+        connection: "request", head_mode: "suppress_body", body: b"slow"
+    })
+}
+route GET "/two" {
+    return forward(backend, response_policy: {
+        version: "HTTP/1.1", framing: "content_length", connection: "request",
+        head_mode: "suppress_body", server: "rut", date: "current", hide_headers: []
+    }, failure_policy: {
+        version: "HTTP/1.1", status: 502, reason: "Bad Gateway",
+        content_type: "text/plain", server: "rut", date: "current",
+        connection: "request", head_mode: "suppress_body", body: b"bad"
+    }, timeout_failure_policy: {
+        version: "HTTP/1.1", status: 504, reason: "Gateway Time-out",
+        content_type: "text/plain", server: "rut", date: "current",
+        connection: "request", head_mode: "suppress_body", body: b"slow"
+    })
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    REQUIRE_EQ(ast->failure_policies.len, 2u);
+    for (u32 i = 1; i < 3; i++) {
+        const auto* stmt = ast->items[i].route.statements[0];
+        CHECK_EQ(stmt->forward_failure_policy_id, 1u);
+        CHECK_EQ(stmt->forward_timeout_failure_policy_id, 2u);
+    }
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    CHECK_EQ(hir->routes[0].control.direct_term.forward_timeout_failure_policy_id, 2u);
+    CHECK_EQ(hir->routes[1].control.direct_term.forward_timeout_failure_policy_id, 2u);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    CHECK_EQ(mir->functions[0].blocks[0].term.forward_timeout_failure_policy_id, 2u);
+    CHECK_EQ(mir->functions[1].blocks[0].term.forward_timeout_failure_policy_id, 2u);
+    FrontendRirModule rir{};
+    REQUIRE(lower_to_rir(mir.value(), rir));
+    REQUIRE_EQ(rir.module.failure_policy_count, 2u);
+    REQUIRE_EQ(rir.module.policy_bundle_count, 1u);
+    CHECK_EQ(rir.module.failure_policies[0].status_code, 502u);
+    CHECK_EQ(rir.module.failure_policies[1].status_code, 504u);
+    CHECK_EQ(rir.module.policy_bundles[0].response_policy_id, 1u);
+    CHECK_EQ(rir.module.policy_bundles[0].failure_policy_id, 1u);
+    CHECK_EQ(rir.module.policy_bundles[0].timeout_failure_policy_id, 2u);
+    rir.destroy();
+}
+
+TEST(frontend, timeout_failure_policy_rejects_missing_peers_duplicate_status_and_head_mismatch) {
+    const char* response =
+        "response_policy: { version: \"HTTP/1.1\", framing: \"content_length\", "
+        "connection: \"request\", head_mode: \"suppress_body\", server: \"s\", "
+        "date: \"current\", hide_headers: [] }";
+    const char* failure =
+        "failure_policy: { version: \"HTTP/1.1\", status: 502, reason: \"Bad Gateway\", "
+        "content_type: \"text/plain\", server: \"s\", date: \"current\", "
+        "connection: \"request\", head_mode: \"suppress_body\", body: b\"bad\" }";
+    auto timeout = [](u32 status, const char* head) {
+        return std::string("timeout_failure_policy: { version: \"HTTP/1.1\", status: ") +
+               std::to_string(status) +
+               ", reason: \"Gateway Time-out\", content_type: \"text/plain\", "
+               "server: \"s\", date: \"current\", connection: \"request\", head_mode: \"" +
+               head + "\", body: b\"slow\" }";
+    };
+    const std::string prefix = "upstream b\nroute GET \"/\" { return forward(b, ";
+    const std::string suffix = ") }\n";
+    const std::string valid_timeout = timeout(504, "suppress_body");
+    const std::string invalid[] = {
+        prefix + valid_timeout + suffix,
+        prefix + response + ", " + valid_timeout + suffix,
+        prefix + response + ", " + failure + ", " + timeout(399, "suppress_body") + suffix,
+        prefix + response + ", " + failure + ", " + timeout(600, "suppress_body") + suffix,
+        prefix + response + ", " + failure + ", " + timeout(504, "reject") + suffix,
+        prefix + response + ", " + failure + ", " + valid_timeout + ", " + valid_timeout + suffix,
+    };
+    for (const auto& source : invalid) {
+        auto lexed = lex({source.data(), static_cast<u32>(source.size())});
+        REQUIRE(lexed);
+        auto ast = parse_file_heap(lexed.value());
+        if (!ast) continue;
+        CHECK_FALSE(analyze_file_heap(ast.value()).has_value());
+    }
 }
 
 TEST(frontend, failure_policy_rejects_invalid_fields_and_caps) {

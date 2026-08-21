@@ -905,7 +905,7 @@ struct RouteConfig {
     }
 
     u16 add_failure_policy(const ForwardFailurePolicySpec& policy) {
-        if (!forward_failure_policy_spec_valid(policy)) return 0;
+        if (!forward_failure_policy_table_spec_valid(policy)) return 0;
         if (failure_policy_count > kMaxForwardFailurePolicies ||
             failure_policy_bytes_used > kFailurePolicyBytesPoolBytes)
             return 0;
@@ -942,19 +942,40 @@ struct RouteConfig {
         return static_cast<u16>(failure_policy_count);
     }
 
-    u16 add_policy_bundle(u16 response_policy_id, u16 failure_policy_id) {
+    u16 add_policy_bundle(u16 response_policy_id,
+                          u16 failure_policy_id,
+                          u16 timeout_failure_policy_id = 0) {
         if (failure_policy_id == 0 ||
             (response_policy_id != 0 && !response_policy_id_is_valid(response_policy_id)) ||
             !failure_policy_id_is_valid(failure_policy_id))
             return 0;
+        if (timeout_failure_policy_id != 0) {
+            if (response_policy_id == 0 ||
+                !timeout_failure_policy_id_is_valid(timeout_failure_policy_id))
+                return 0;
+            const bool response_suppress =
+                response_policies[response_policy_id - 1].head_mode ==
+                ResponsePolicyHeadMode::SuppressBody;
+            const bool failure_suppress =
+                failure_policies[failure_policy_id - 1].head_mode ==
+                FailurePolicyHeadMode::SuppressBody;
+            const bool timeout_suppress =
+                failure_policies[timeout_failure_policy_id - 1].head_mode ==
+                FailurePolicyHeadMode::SuppressBody;
+            if (response_suppress != failure_suppress ||
+                failure_suppress != timeout_suppress)
+                return 0;
+        }
         if (policy_bundle_count > kMaxForwardPolicyBundles) return 0;
         for (u32 i = 0; i < policy_bundle_count; i++) {
             if (policy_bundles[i].response_policy_id == response_policy_id &&
-                policy_bundles[i].failure_policy_id == failure_policy_id)
+                policy_bundles[i].failure_policy_id == failure_policy_id &&
+                policy_bundles[i].timeout_failure_policy_id == timeout_failure_policy_id)
                 return static_cast<u16>(i + 1);
         }
         if (policy_bundle_count >= kMaxForwardPolicyBundles) return 0;
-        policy_bundles[policy_bundle_count] = {response_policy_id, failure_policy_id};
+        policy_bundles[policy_bundle_count] = {
+            response_policy_id, failure_policy_id, timeout_failure_policy_id};
         return static_cast<u16>(++policy_bundle_count);
     }
 
@@ -964,13 +985,36 @@ struct RouteConfig {
                forward_failure_policy_spec_valid(failure_policies[id - 1]);
     }
 
+    bool timeout_failure_policy_id_is_valid(u16 id) const {
+        return failure_policy_count <= kMaxForwardFailurePolicies && id != 0 &&
+               id <= failure_policy_count &&
+               forward_timeout_failure_policy_spec_valid(failure_policies[id - 1]);
+    }
+
     bool policy_bundle_id_is_valid(u16 id) const {
         if (policy_bundle_count > kMaxForwardPolicyBundles || id == 0 ||
             id > policy_bundle_count)
             return false;
         const auto& b = policy_bundles[id - 1];
-        return (b.response_policy_id == 0 || response_policy_id_is_valid(b.response_policy_id)) &&
-               failure_policy_id_is_valid(b.failure_policy_id);
+        if ((b.response_policy_id != 0 &&
+             !response_policy_id_is_valid(b.response_policy_id)) ||
+            !failure_policy_id_is_valid(b.failure_policy_id))
+            return false;
+        if (b.timeout_failure_policy_id == 0) return true;
+        if (b.response_policy_id == 0 ||
+            !timeout_failure_policy_id_is_valid(b.timeout_failure_policy_id))
+            return false;
+        const bool response_suppress =
+            response_policies[b.response_policy_id - 1].head_mode ==
+            ResponsePolicyHeadMode::SuppressBody;
+        const bool failure_suppress =
+            failure_policies[b.failure_policy_id - 1].head_mode ==
+            FailurePolicyHeadMode::SuppressBody;
+        const bool timeout_suppress =
+            failure_policies[b.timeout_failure_policy_id - 1].head_mode ==
+            FailurePolicyHeadMode::SuppressBody;
+        return response_suppress == failure_suppress &&
+               failure_suppress == timeout_suppress;
     }
 
     // Register foundation-only target-transform metadata. Strings are copied

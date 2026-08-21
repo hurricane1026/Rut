@@ -988,6 +988,77 @@ TEST(response_policy, failure_head_mode_config_copy_is_owned_and_deduplicated) {
     CHECK_EQ(prebound.failure_policy_bytes_used, 0u);
 }
 
+TEST(response_policy, timeout_failure_policy_triple_bundle_config_is_owned_deduplicated_and_validated) {
+    ForwardResponsePolicySpec response{};
+    response.version = ResponsePolicyVersion::Http11;
+    response.framing = ResponsePolicyFraming::ContentLength;
+    response.connection = ResponsePolicyConnection::Request;
+    response.date = ResponsePolicyDate::Current;
+    response.server = {"rut", 3};
+
+    ForwardFailurePolicySpec failure{};
+    failure.version = ForwardFailurePolicyVersion::Http11;
+    failure.status_code = 502;
+    failure.date = ForwardFailurePolicyDate::Current;
+    failure.connection = ForwardFailurePolicyConnection::Request;
+    failure.reason = {"Bad Gateway", 11};
+    failure.content_type = {"text/plain", 10};
+    failure.server = {"rut", 3};
+    failure.body = {"bad", 3};
+    ForwardFailurePolicySpec timeout = failure;
+    timeout.status_code = 504;
+    timeout.reason = {"Gateway Time-out", 16};
+    timeout.body = {"slow", 4};
+
+    rir::Module module{};
+    module.response_policy_count = 1;
+    module.response_policies[0] = response;
+    module.failure_policy_count = 2;
+    module.failure_policies[0] = failure;
+    module.failure_policies[1] = timeout;
+    module.policy_bundle_count = 2;
+    module.policy_bundles[0] = {1, 1, 0};
+    module.policy_bundles[1] = {1, 1, 2};
+
+    RouteConfig config{};
+    REQUIRE(populate_route_config(config, module));
+    REQUIRE_EQ(config.failure_policy_count, 2u);
+    REQUIRE_EQ(config.policy_bundle_count, 2u);
+    CHECK_EQ(config.failure_policies[1].status_code, 504u);
+    CHECK_EQ(config.policy_bundles[0].timeout_failure_policy_id, 0u);
+    CHECK_EQ(config.policy_bundles[1].timeout_failure_policy_id, 2u);
+    CHECK(config.policy_bundle_id_is_valid(1));
+    CHECK(config.policy_bundle_id_is_valid(2));
+    const u32 policy_bytes = config.failure_policy_bytes_used;
+    CHECK_EQ(config.add_failure_policy(timeout), 2u);
+    CHECK_EQ(config.failure_policy_bytes_used, policy_bytes);
+    CHECK_EQ(config.add_policy_bundle(1, 1, 2), 2u);
+
+    auto rejects_transactionally = [&](const rir::Module& forged) {
+        RouteConfig untouched{};
+        CHECK_FALSE(populate_route_config(untouched, forged));
+        CHECK_EQ(untouched.response_policy_count, 0u);
+        CHECK_EQ(untouched.failure_policy_count, 0u);
+        CHECK_EQ(untouched.policy_bundle_count, 0u);
+        CHECK_EQ(untouched.failure_policy_bytes_used, 0u);
+    };
+    rir::Module forged_id = module;
+    forged_id.policy_bundles[1].timeout_failure_policy_id = 3;
+    rejects_transactionally(forged_id);
+    rir::Module wrong_role = module;
+    wrong_role.policy_bundles[1].failure_policy_id = 2;
+    rejects_transactionally(wrong_role);
+    rir::Module incompatible = module;
+    incompatible.failure_policies[1].head_mode = FailurePolicyHeadMode::SuppressBody;
+    rejects_transactionally(incompatible);
+    rir::Module bad_status = module;
+    bad_status.failure_policies[1].status_code = 600;
+    rejects_transactionally(bad_status);
+    rir::Module over_capacity = module;
+    over_capacity.failure_policy_count = kMaxForwardFailurePolicies + 1;
+    rejects_transactionally(over_capacity);
+}
+
 static Connection* setup_target_transform_request(SmallLoop& loop,
                                                    RouteConfig& cfg,
                                                    const char* request,
@@ -23728,6 +23799,236 @@ TEST(state_invariant, jit_forward_failure_bundle_connect_submit_serializes_and_c
 
     close(fds[1]);
     loop.close_conn(*c);
+}
+
+TEST(state_invariant, timeout_failure_policy_id_is_pinned_through_body_wait_and_reset) {
+    RouteConfig cfg{};
+    auto upstream = cfg.add_upstream("api", 0x7F000001, 9000);
+    REQUIRE(upstream.has_value());
+    ForwardResponsePolicySpec response{};
+    response.version = ResponsePolicyVersion::Http11;
+    response.framing = ResponsePolicyFraming::ContentLength;
+    response.connection = ResponsePolicyConnection::Request;
+    response.date = ResponsePolicyDate::Current;
+    response.server = {"rut", 3};
+    REQUIRE_EQ(cfg.add_response_policy(response), 1u);
+    ForwardFailurePolicySpec failure{};
+    failure.version = ForwardFailurePolicyVersion::Http11;
+    failure.status_code = 502;
+    failure.date = ForwardFailurePolicyDate::Current;
+    failure.connection = ForwardFailurePolicyConnection::Request;
+    failure.reason = {"Bad Gateway", 11};
+    failure.content_type = {"text/plain", 10};
+    failure.server = {"rut", 3};
+    failure.body = {"bad", 3};
+    REQUIRE_EQ(cfg.add_failure_policy(failure), 1u);
+    auto timeout = failure;
+    timeout.status_code = 504;
+    timeout.reason = {"Gateway Time-out", 16};
+    timeout.body = {"slow", 4};
+    REQUIRE_EQ(cfg.add_failure_policy(timeout), 2u);
+    REQUIRE_EQ(cfg.add_policy_bundle(1, 1, 2), 1u);
+
+    SmallLoop loop;
+    loop.setup();
+    RouteConfig replacement{};
+    const RouteConfig* active = &cfg;
+    loop.config_ptr = &active;
+    static constexpr char kGet[] = "GET /api HTTP/1.1\r\nHost: client\r\n\r\n";
+    auto* current = loop.alloc_conn();
+    REQUIRE(current != nullptr);
+    REQUIRE_EQ(current->recv_buf.write(reinterpret_cast<const u8*>(kGet), sizeof(kGet) - 1),
+               sizeof(kGet) - 1);
+    capture_request_metadata(*current);
+    current->request_config = &cfg;
+    JitDispatchOutcome current_outcome{};
+    current_outcome.kind = JitDispatchOutcome::Kind::Forward;
+    current_outcome.upstream_id = upstream.value();
+    current_outcome.policy_bundle_id = 1;
+    loop.backend.clear_ops();
+    handle_jit_outcome<SmallLoop>(&loop, *current, current_outcome, nullptr, true);
+    CHECK_EQ(current->failure_policy_id, 1u);
+    CHECK_EQ(current->timeout_failure_policy_id, 2u);
+    CHECK_EQ(loop.backend.count_ops(MockOp::Connect), 1u);
+    loop.close_conn(*current);
+
+    static constexpr char kPost[] =
+        "POST /api HTTP/1.1\r\nHost: client\r\nContent-Length: 3\r\n\r\n";
+    auto* pending = loop.alloc_conn();
+    REQUIRE(pending != nullptr);
+    REQUIRE_EQ(pending->recv_buf.write(reinterpret_cast<const u8*>(kPost), sizeof(kPost) - 1),
+               sizeof(kPost) - 1);
+    capture_request_metadata(*pending);
+    pending->request_config = &cfg;
+    JitDispatchOutcome pending_outcome{};
+    pending_outcome.kind = JitDispatchOutcome::Kind::Forward;
+    pending_outcome.upstream_id = upstream.value();
+    pending_outcome.request_policy_id = 1;
+    pending_outcome.policy_bundle_id = 1;
+    loop.backend.clear_ops();
+    handle_jit_outcome<SmallLoop>(&loop, *pending, pending_outcome, nullptr, true);
+    REQUIRE(pending->request_policy_body_pending);
+    CHECK_EQ(pending->pending_forward_failure_policy_id, 1u);
+    CHECK_EQ(pending->pending_forward_timeout_failure_policy_id, 2u);
+    CHECK_EQ(pending->timeout_failure_policy_id, 0u);
+    active = &replacement;
+    CHECK_EQ(*loop.config_ptr, &replacement);
+    CHECK_EQ(pending->request_config, &cfg);
+    REQUIRE_EQ(pending->recv_buf.write(reinterpret_cast<const u8*>("abc"), 3), 3u);
+    on_request_policy_body_recvd<SmallLoop>(
+        &loop, *pending, {pending->id, 3, 0, 0, IoEventType::Recv, 0});
+    CHECK_FALSE(pending->request_policy_body_pending);
+    CHECK_EQ(pending->pending_forward_timeout_failure_policy_id, 0u);
+    CHECK_EQ(pending->failure_policy_id, 1u);
+    CHECK_EQ(pending->timeout_failure_policy_id, 2u);
+    REQUIRE(pending->request_config != nullptr);
+    CHECK_EQ(pending->request_config->failure_policies[pending->timeout_failure_policy_id - 1]
+                 .status_code,
+             504u);
+    loop.close_conn(*pending);
+
+    Connection reset_probe{};
+    reset_probe.pending_forward_timeout_failure_policy_id = 2;
+    reset_probe.timeout_failure_policy_id = 2;
+    reset_probe.reset();
+    CHECK_EQ(reset_probe.pending_forward_timeout_failure_policy_id, 0u);
+    CHECK_EQ(reset_probe.timeout_failure_policy_id, 0u);
+}
+
+TEST(state_invariant, timeout_failure_policy_forged_outcomes_reject_before_any_forward_effect) {
+    RouteConfig cfg{};
+    REQUIRE(cfg.add_upstream("api", 0x7F000001, 9000).has_value());
+    REQUIRE_EQ(cfg.add_target_transform({{"/api/", 5}, {"/v1/", 4}}), 1u);
+    ForwardResponsePolicySpec response{};
+    response.version = ResponsePolicyVersion::Http11;
+    response.framing = ResponsePolicyFraming::ContentLength;
+    response.connection = ResponsePolicyConnection::Request;
+    response.date = ResponsePolicyDate::Current;
+    response.server = {"rut", 3};
+    REQUIRE_EQ(cfg.add_response_policy(response), 1u);
+    ForwardFailurePolicySpec failure{};
+    failure.version = ForwardFailurePolicyVersion::Http11;
+    failure.status_code = 502;
+    failure.date = ForwardFailurePolicyDate::Current;
+    failure.connection = ForwardFailurePolicyConnection::Request;
+    failure.reason = {"Bad Gateway", 11};
+    failure.content_type = {"text/plain", 10};
+    failure.server = {"rut", 3};
+    failure.body = {"bad", 3};
+    REQUIRE_EQ(cfg.add_failure_policy(failure), 1u);
+    auto timeout = failure;
+    timeout.status_code = 504;
+    timeout.reason = {"Gateway Time-out", 16};
+    timeout.body = {"slow", 4};
+    REQUIRE_EQ(cfg.add_failure_policy(timeout), 2u);
+    REQUIRE_EQ(cfg.add_policy_bundle(1, 1, 2), 1u);
+
+    struct InvalidOutcome {
+        u16 response_policy_id;
+        u16 failure_policy_id;
+        u16 timeout_failure_policy_id;
+        u16 policy_bundle_id;
+    } invalid[] = {
+        {0, 0, 2, 0},   // timeout metadata without its required peers
+        {1, 1, 99, 0},  // direct out-of-range timeout id
+        {0, 0, 0, 99},  // invalid packed bundle id
+    };
+
+    SmallLoop loop;
+    loop.setup();
+    static constexpr char kPost[] =
+        "POST /api HTTP/1.1\r\nHost: client\r\nContent-Length: 3\r\n\r\n";
+    static constexpr char kGet[] =
+        "GET /api/x HTTP/1.1\r\nHost: client\r\n\r\n";
+    for (const auto& vector : invalid) {
+        auto make_outcome = [&]() {
+            JitDispatchOutcome outcome{};
+            outcome.kind = JitDispatchOutcome::Kind::Forward;
+            outcome.upstream_id = 0;
+            outcome.request_policy_id = 1;
+            outcome.response_policy_id = vector.response_policy_id;
+            outcome.failure_policy_id = vector.failure_policy_id;
+            outcome.timeout_failure_policy_id = vector.timeout_failure_policy_id;
+            outcome.policy_bundle_id = vector.policy_bundle_id;
+            return outcome;
+        };
+
+        auto* body_wait = loop.alloc_conn();
+        REQUIRE(body_wait != nullptr);
+        REQUIRE_EQ(body_wait->recv_buf.write(reinterpret_cast<const u8*>(kPost),
+                                             sizeof(kPost) - 1),
+                   sizeof(kPost) - 1);
+        capture_request_metadata(*body_wait);
+        body_wait->request_config = &cfg;
+        loop.backend.clear_ops();
+        handle_jit_outcome<SmallLoop>(&loop, *body_wait, make_outcome(), nullptr, true);
+        CHECK_FALSE(body_wait->request_policy_body_pending);
+        CHECK_EQ(body_wait->pending_forward_timeout_failure_policy_id, 0u);
+        CHECK_FALSE(body_wait->upstream_slot_held);
+        CHECK_EQ(body_wait->upstream_fd, -1);
+        CHECK_EQ(loop.backend.count_ops(MockOp::Recv), 0u);
+        CHECK_EQ(loop.backend.count_ops(MockOp::Connect), 0u);
+        loop.free_conn(*body_wait);
+
+        auto* rewrite = setup_target_transform_request(
+            loop, cfg, kGet, sizeof(kGet) - 1);
+        REQUIRE(rewrite != nullptr);
+        const u32 before_len = rewrite->recv_buf.len();
+        u8 before[SmallLoop::kBufSize];
+        __builtin_memcpy(before, rewrite->recv_buf.data(), before_len);
+        loop.backend.clear_ops();
+        handle_jit_outcome<SmallLoop>(&loop, *rewrite, make_outcome(), nullptr, true);
+        CHECK_FALSE(rewrite->req_path_overridden);
+        CHECK_EQ(rewrite->recv_buf.len(), before_len);
+        CHECK_EQ(__builtin_memcmp(rewrite->recv_buf.data(), before, before_len), 0);
+        CHECK_FALSE(rewrite->upstream_slot_held);
+        CHECK_EQ(rewrite->upstream_fd, -1);
+        CHECK_EQ(loop.backend.count_ops(MockOp::Recv), 0u);
+        CHECK_EQ(loop.backend.count_ops(MockOp::Connect), 0u);
+        loop.free_conn(*rewrite);
+    }
+}
+
+TEST(state_invariant, configured_timeout_policy_fails_closed_before_legacy_504) {
+    SmallLoop loop;
+    loop.setup();
+    auto* configured = loop.alloc_conn();
+    REQUIRE(configured != nullptr);
+    configured->fd = dup(STDERR_FILENO);
+    REQUIRE_GE(configured->fd, 0);
+    configured->state = ConnState::Proxying;
+    configured->timeout_failure_policy_id = 2;
+    loop.backend.clear_ops();
+    respond_upstream_timeout(&loop, *configured);
+    CHECK_EQ(configured->fd, -1);
+    CHECK_EQ(configured->send_buf.len(), 0u);
+    CHECK_EQ(loop.backend.count_ops(MockOp::Send), 0u);
+
+    auto* suppress = loop.alloc_conn();
+    REQUIRE(suppress != nullptr);
+    suppress->fd = dup(STDERR_FILENO);
+    REQUIRE_GE(suppress->fd, 0);
+    suppress->state = ConnState::Proxying;
+    suppress->timeout_failure_policy_id = 2;
+    suppress->failure_policy_suppress_body = true;
+    loop.backend.clear_ops();
+    respond_upstream_timeout(&loop, *suppress);
+    CHECK_EQ(suppress->fd, -1);
+    CHECK_EQ(suppress->send_buf.len(), 0u);
+    CHECK_EQ(loop.backend.count_ops(MockOp::Send), 0u);
+
+    auto* legacy = loop.alloc_conn();
+    REQUIRE(legacy != nullptr);
+    legacy->fd = dup(STDERR_FILENO);
+    REQUIRE_GE(legacy->fd, 0);
+    legacy->state = ConnState::Proxying;
+    loop.backend.clear_ops();
+    respond_upstream_timeout(&loop, *legacy);
+    CHECK_EQ(legacy->resp_status, 504u);
+    CHECK_EQ(legacy->state, ConnState::Sending);
+    CHECK_EQ(loop.backend.count_ops(MockOp::Send), 1u);
+    CHECK(buf_has(legacy->send_buf.data(), legacy->send_buf.len(), "Gateway Timeout"));
+    loop.close_conn(*legacy);
 }
 
 TEST(state_invariant, jit_forward_direct_paired_head_connect_submit_serializes_no_body) {

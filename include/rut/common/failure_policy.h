@@ -31,6 +31,9 @@ struct ForwardFailurePolicySpec {
 struct ForwardPolicyBundle {
     u16 response_policy_id = 0;
     u16 failure_policy_id = 0;
+    // Optional cause-specific timeout policy. Zero preserves the original
+    // response/default-failure bundle shape and behavior.
+    u16 timeout_failure_policy_id = 0;
 };
 
 inline bool failure_policy_safe_text(Str value, u32 cap, bool allow_empty = false) {
@@ -50,8 +53,9 @@ inline bool failure_policy_safe_body(Str value) {
     return (value.ptr != nullptr || value.len == 0) && value.len <= kMaxFailurePolicyBodyLen;
 }
 
-inline bool forward_failure_policy_spec_valid(const ForwardFailurePolicySpec& policy) {
-    if (policy.version != ForwardFailurePolicyVersion::Http11 || policy.status_code != 502 ||
+inline bool forward_failure_policy_spec_shape_valid(const ForwardFailurePolicySpec& policy) {
+    if (policy.version != ForwardFailurePolicyVersion::Http11 || policy.status_code < 400 ||
+        policy.status_code > 599 ||
         policy.date != ForwardFailurePolicyDate::Current ||
         policy.connection != ForwardFailurePolicyConnection::Request ||
         (policy.head_mode != FailurePolicyHeadMode::Reject &&
@@ -65,6 +69,24 @@ inline bool forward_failure_policy_spec_valid(const ForwardFailurePolicySpec& po
                                    12,
                                    policy.content_type.ptr,
                                    policy.content_type.len) == HttpHeaderValidation::Ok;
+}
+
+// The existing default failure-policy contract remains the exact 502 shape.
+inline bool forward_failure_policy_spec_valid(const ForwardFailurePolicySpec& policy) {
+    return policy.status_code == 502 && forward_failure_policy_spec_shape_valid(policy);
+}
+
+// A timeout policy is a complete immutable error response. Its status is
+// intentionally bounded to HTTP error statuses, without inheriting from the
+// default 502 policy.
+inline bool forward_timeout_failure_policy_spec_valid(const ForwardFailurePolicySpec& policy) {
+    return forward_failure_policy_spec_shape_valid(policy);
+}
+
+// Shared policy tables contain both roles; bundle validation applies the
+// stricter role-specific predicate to every referenced ID.
+inline bool forward_failure_policy_table_spec_valid(const ForwardFailurePolicySpec& policy) {
+    return forward_timeout_failure_policy_spec_valid(policy);
 }
 
 inline bool forward_failure_policy_spec_equal(const ForwardFailurePolicySpec& a,

@@ -283,6 +283,8 @@ struct AstStatement {
     bool has_forward_response_policy = false;
     u16 forward_failure_policy_id = 0;
     bool has_forward_failure_policy = false;
+    u16 forward_timeout_failure_policy_id = 0;
+    bool has_forward_timeout_failure_policy = false;
     // `return redirect({...})`: immutable redirect policy table id (1-based).
     u16 redirect_policy_id = 0;
     bool has_redirect_policy = false;
@@ -698,7 +700,7 @@ struct AstFile {
     }
 
     u16 add_failure_policy(const ForwardFailurePolicySpec& policy) {
-        if (!forward_failure_policy_spec_valid(policy)) return 0;
+        if (!forward_failure_policy_table_spec_valid(policy)) return 0;
         for (u32 i = 0; i < failure_policies.len; i++)
             if (forward_failure_policy_spec_equal(failure_policies[i], policy))
                 return static_cast<u16>(i + 1);

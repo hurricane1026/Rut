@@ -566,6 +566,7 @@ struct ConnectionBase {
     u16 pending_forward_request_policy_id;
     u16 pending_forward_response_policy_id;
     u16 pending_forward_failure_policy_id;
+    u16 pending_forward_timeout_failure_policy_id;
     // Semantic request facts kept separate from the transport's counters:
     // buffered means the complete fixed-CL request is staged, while upload
     // complete is published only after the upstream send finishes.
@@ -578,6 +579,9 @@ struct ConnectionBase {
     bool response_policy_suppress_body;
     // Non-zero selects the bounded H1 failure serializer for connect failures.
     u16 failure_policy_id;
+    // Optional cause-specific timeout response selected with this request.
+    // Foundation metadata only until #267 runtime wiring consumes it.
+    u16 timeout_failure_policy_id;
     // Pinned per-request failure disposition.  This is deliberately separate
     // from the policy table so later request rewrites or config swaps cannot
     // change how an already selected connect failure is serialized.
@@ -905,11 +909,13 @@ struct ConnectionBase {
         pending_forward_request_policy_id = 0;
         pending_forward_response_policy_id = 0;
         pending_forward_failure_policy_id = 0;
+        pending_forward_timeout_failure_policy_id = 0;
         request_body_fully_buffered = false;
         request_upload_complete = false;
         response_policy_id = 0;
         response_policy_suppress_body = false;
         failure_policy_id = 0;
+        timeout_failure_policy_id = 0;
         failure_policy_suppress_body = false;
         req_http_version = 255;
         req_keep_alive = false;

@@ -524,7 +524,8 @@ inline bool response_policy_runtime_supported(const ForwardResponsePolicySpec& p
 inline bool failure_policy_runtime_supported(const ForwardFailurePolicySpec& policy);
 inline bool forward_policy_head_modes_compatible(const RouteConfig& config,
                                                   u16 response_policy_id,
-                                                  u16 failure_policy_id);
+                                                  u16 failure_policy_id,
+                                                  u16 timeout_failure_policy_id = 0);
 inline bool response_policy_suppress_head_admitted(
     const Connection& conn,
     const ForwardResponsePolicySpec& policy,
@@ -1134,11 +1135,13 @@ void on_header_received(void* lp, Connection& conn, IoEvent ev) {
     conn.pending_forward_request_policy_id = 0;
     conn.pending_forward_response_policy_id = 0;
     conn.pending_forward_failure_policy_id = 0;
+    conn.pending_forward_timeout_failure_policy_id = 0;
     conn.request_body_fully_buffered = false;
     conn.request_upload_complete = false;
     conn.response_policy_id = 0;
     conn.response_policy_suppress_body = false;
     conn.failure_policy_id = 0;
+    conn.timeout_failure_policy_id = 0;
     conn.failure_policy_suppress_body = false;
     conn.resp_header_mutation_pending_count = 0;
     conn.resp_header_mutation_pending_overflow = false;
@@ -1503,11 +1506,14 @@ void on_request_policy_body_recvd(void* lp, Connection& conn, IoEvent ev) {
     outcome.request_policy_id = conn.pending_forward_request_policy_id;
     outcome.response_policy_id = conn.pending_forward_response_policy_id;
     outcome.failure_policy_id = conn.pending_forward_failure_policy_id;
+    outcome.timeout_failure_policy_id =
+        conn.pending_forward_timeout_failure_policy_id;
     conn.request_policy_body_pending = false;
     conn.pending_forward_upstream_id = 0;
     conn.pending_forward_request_policy_id = 0;
     conn.pending_forward_response_policy_id = 0;
     conn.pending_forward_failure_policy_id = 0;
+    conn.pending_forward_timeout_failure_policy_id = 0;
     // No handler is re-entered: the Forward outcome and pinned request config
     // are sufficient for the normal dispatch path to validate/rebuild once.
     handle_jit_outcome<Loop>(loop, conn, outcome, nullptr, conn.keep_alive);
@@ -2255,6 +2261,7 @@ void handle_jit_outcome(Loop* loop,
                 }
                 u16 target_response_policy_id = outcome.response_policy_id;
                 u16 target_failure_policy_id = outcome.failure_policy_id;
+                u16 target_timeout_failure_policy_id = outcome.timeout_failure_policy_id;
                 if (outcome.policy_bundle_id != 0) {
                     if (!config->policy_bundle_id_is_valid(outcome.policy_bundle_id)) {
                         reject_response_policy(loop, conn);
@@ -2263,14 +2270,25 @@ void handle_jit_outcome(Loop* loop,
                     const auto& bundle = config->policy_bundles[outcome.policy_bundle_id - 1];
                     target_response_policy_id = bundle.response_policy_id;
                     target_failure_policy_id = bundle.failure_policy_id;
+                    target_timeout_failure_policy_id = bundle.timeout_failure_policy_id;
                 }
                 if ((target_response_policy_id != 0 &&
                      !config->response_policy_id_is_valid(target_response_policy_id)) ||
                     (target_failure_policy_id != 0 &&
                      !config->failure_policy_id_is_valid(target_failure_policy_id)) ||
+                    (target_timeout_failure_policy_id != 0 &&
+                     !config->timeout_failure_policy_id_is_valid(
+                         target_timeout_failure_policy_id)) ||
                     (target_failure_policy_id != 0 &&
                      !failure_policy_runtime_supported(
                          config->failure_policies[target_failure_policy_id - 1])) ||
+                    (target_timeout_failure_policy_id != 0 &&
+                     !failure_policy_runtime_supported(
+                         config->failure_policies[target_timeout_failure_policy_id - 1])) ||
+                    !forward_policy_head_modes_compatible(*config,
+                                                          target_response_policy_id,
+                                                          target_failure_policy_id,
+                                                          target_timeout_failure_policy_id) ||
                     (outcome.request_policy_id != 0 &&
                      (!request_policy_is_supported(outcome.request_policy_id) ||
                       inspect_request_policy_body(conn, outcome.request_policy_id) !=
@@ -2328,6 +2346,7 @@ void handle_jit_outcome(Loop* loop,
             }
             u16 forward_response_policy_id = outcome.response_policy_id;
             u16 forward_failure_policy_id = outcome.failure_policy_id;
+            u16 forward_timeout_failure_policy_id = outcome.timeout_failure_policy_id;
             if (outcome.policy_bundle_id != 0) {
                 if (!config->policy_bundle_id_is_valid(outcome.policy_bundle_id)) {
                     reject_response_policy(loop, conn);
@@ -2336,10 +2355,17 @@ void handle_jit_outcome(Loop* loop,
                 const auto& bundle = config->policy_bundles[outcome.policy_bundle_id - 1];
                 forward_response_policy_id = bundle.response_policy_id;
                 forward_failure_policy_id = bundle.failure_policy_id;
-            } else if (forward_failure_policy_id != 0 &&
-                       !config->failure_policy_id_is_valid(forward_failure_policy_id)) {
-                reject_response_policy(loop, conn);
-                return;
+                forward_timeout_failure_policy_id = bundle.timeout_failure_policy_id;
+            } else {
+                if ((forward_failure_policy_id != 0 &&
+                     !config->failure_policy_id_is_valid(forward_failure_policy_id)) ||
+                    (forward_timeout_failure_policy_id != 0 &&
+                     (forward_response_policy_id == 0 || forward_failure_policy_id == 0 ||
+                      !config->timeout_failure_policy_id_is_valid(
+                          forward_timeout_failure_policy_id)))) {
+                    reject_response_policy(loop, conn);
+                    return;
+                }
             }
             if (forward_response_policy_id != 0 &&
                 !config->response_policy_id_is_valid(forward_response_policy_id)) {
@@ -2350,7 +2376,10 @@ void handle_jit_outcome(Loop* loop,
                 return;
             }
             if (!forward_policy_head_modes_compatible(
-                    *config, forward_response_policy_id, forward_failure_policy_id)) {
+                    *config,
+                    forward_response_policy_id,
+                    forward_failure_policy_id,
+                    forward_timeout_failure_policy_id)) {
                 // A failure SuppressBody policy is meaningful only when the
                 // success policy carries the same disposition.  Response-only
                 // SuppressBody remains valid for the existing HEAD success
@@ -2380,6 +2409,15 @@ void handle_jit_outcome(Loop* loop,
                 !failure_policy_runtime_supported(
                     config->failure_policies[forward_failure_policy_id - 1]) &&
                 !suppress_failure_head) {
+                reject_response_policy(loop, conn);
+                return;
+            }
+            if (forward_timeout_failure_policy_id != 0 &&
+                (!config->timeout_failure_policy_id_is_valid(
+                     forward_timeout_failure_policy_id) ||
+                 (!failure_policy_runtime_supported(
+                      config->failure_policies[forward_timeout_failure_policy_id - 1]) &&
+                  !suppress_failure_head))) {
                 reject_response_policy(loop, conn);
                 return;
             }
@@ -2430,6 +2468,8 @@ void handle_jit_outcome(Loop* loop,
                     conn.pending_forward_request_policy_id = outcome.request_policy_id;
                     conn.pending_forward_response_policy_id = forward_response_policy_id;
                     conn.pending_forward_failure_policy_id = forward_failure_policy_id;
+                    conn.pending_forward_timeout_failure_policy_id =
+                        forward_timeout_failure_policy_id;
                     conn.request_policy_id = outcome.request_policy_id;
                     conn.transition_to_reading_body(&on_request_policy_body_recvd<Loop>);
                     if (!loop->submit_recv(conn)) loop->close_conn(conn);
@@ -2446,6 +2486,8 @@ void handle_jit_outcome(Loop* loop,
             // policy. The strict serializer owns the response header bytes, so
             // reserve its slice before allocating a slot or connecting.
             const bool has_failure_policy = forward_failure_policy_id != 0;
+            const bool has_timeout_failure_policy =
+                forward_timeout_failure_policy_id != 0;
             bool response_policy_request_connection = false;
             if (forward_response_policy_id != 0 &&
                 config->response_policy_id_is_valid(forward_response_policy_id)) {
@@ -2458,6 +2500,9 @@ void handle_jit_outcome(Loop* loop,
                   !config->response_policy_id_is_valid(forward_response_policy_id)) ||
                  (has_failure_policy &&
                   !config->failure_policy_id_is_valid(forward_failure_policy_id)) ||
+                 (has_timeout_failure_policy &&
+                  !config->timeout_failure_policy_id_is_valid(
+                      forward_timeout_failure_policy_id)) ||
                  conn.req_http_version != static_cast<u8>(HttpVersion::Http11) ||
                  (forward_response_policy_id != 0 &&
                   !response_policy_request_connection && !conn.req_keep_alive) ||
@@ -2501,6 +2546,7 @@ void handle_jit_outcome(Loop* loop,
                 conn.response_policy_suppress_body = suppress_body_head;
             }
             conn.failure_policy_id = forward_failure_policy_id;
+            conn.timeout_failure_policy_id = forward_timeout_failure_policy_id;
             conn.failure_policy_suppress_body = suppress_failure_head;
             if (conn.resp_header_mutation_count != 0 && !loop->alloc_response_header_buf(conn)) {
                 if (conn.failure_policy_suppress_body) {
@@ -2718,6 +2764,14 @@ bool try_connect_next_backend(Loop* loop, Connection& conn) {
 // slots so only the client-send callback runs.
 template <typename Loop>
 void respond_upstream_timeout(Loop* loop, Connection& conn) {
+    // The additive timeout-policy metadata is carried end-to-end, but its
+    // configured serializer/retirement rendezvous is a later #267 increment.
+    // Never silently substitute the legacy hard-coded 504 (or the default 502)
+    // for an explicitly selected policy: close with zero downstream bytes.
+    if (conn.timeout_failure_policy_id != 0) {
+        loop->close_conn(conn);
+        return;
+    }
     // Until #265 supplies a generic all-I/O abandonment rendezvous, a paired
     // reusable HEAD may serialize only establishment failures. Timeout can
     // still own any mix of connect/send/recv SQEs, so let close_conn's exact
@@ -5613,7 +5667,8 @@ inline bool failure_policy_runtime_supported(const ForwardFailurePolicySpec& pol
 // connect failure can never silently fall back to a normal-body policy.
 inline bool forward_policy_head_modes_compatible(const RouteConfig& config,
                                                   u16 response_policy_id,
-                                                  u16 failure_policy_id) {
+                                                  u16 failure_policy_id,
+                                                  u16 timeout_failure_policy_id) {
     const bool response_suppress =
         response_policy_id != 0 &&
         config.response_policies[response_policy_id - 1].head_mode ==
@@ -5622,11 +5677,21 @@ inline bool forward_policy_head_modes_compatible(const RouteConfig& config,
         failure_policy_id != 0 &&
         config.failure_policies[failure_policy_id - 1].head_mode ==
             FailurePolicyHeadMode::SuppressBody;
+    const bool timeout_failure_suppress =
+        timeout_failure_policy_id != 0 &&
+        config.failure_policies[timeout_failure_policy_id - 1].head_mode ==
+            FailurePolicyHeadMode::SuppressBody;
+    if (timeout_failure_policy_id != 0 &&
+        (response_policy_id == 0 || failure_policy_id == 0 ||
+         timeout_failure_suppress != failure_suppress))
+        return false;
     if (failure_suppress && !response_suppress) return false;
     // Response-only SuppressBody is an existing success-only capability; once
     // a failure policy is present it must carry the same disposition rather
     // than silently falling back to a body-bearing failure serializer.
     if (response_suppress && failure_policy_id != 0 && !failure_suppress) return false;
+    if (timeout_failure_policy_id != 0 && response_suppress != timeout_failure_suppress)
+        return false;
     return true;
 }
 

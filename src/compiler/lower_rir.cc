@@ -3132,15 +3132,28 @@ static FrontendResult<void> emit_term(const MirTerminator& term,
             if (!p) return frontend_error(FrontendError::OutOfMemory, term.span);
             response_policy = p.value();
         }
-        if (term.forward_failure_policy_id != 0) {
-            if (term.forward_response_policy_id > b.mod->response_policy_count ||
-                term.forward_failure_policy_id > b.mod->failure_policy_count)
+        if (term.forward_failure_policy_id != 0 ||
+            term.forward_timeout_failure_policy_id != 0) {
+            if (term.forward_failure_policy_id == 0 ||
+                term.forward_response_policy_id > b.mod->response_policy_count ||
+                term.forward_failure_policy_id > b.mod->failure_policy_count ||
+                term.forward_timeout_failure_policy_id > b.mod->failure_policy_count)
+                return frontend_error(FrontendError::UnsupportedSyntax, term.span);
+            if (!forward_failure_policy_spec_valid(
+                    b.mod->failure_policies[term.forward_failure_policy_id - 1]))
+                return frontend_error(FrontendError::UnsupportedSyntax, term.span);
+            if (term.forward_timeout_failure_policy_id != 0 &&
+                (term.forward_response_policy_id == 0 ||
+                 !forward_timeout_failure_policy_spec_valid(
+                     b.mod->failure_policies[term.forward_timeout_failure_policy_id - 1])))
                 return frontend_error(FrontendError::UnsupportedSyntax, term.span);
             u16 bundle_id = 0;
             for (u32 i = 0; i < b.mod->policy_bundle_count; i++) {
                 const auto& existing = b.mod->policy_bundles[i];
                 if (existing.response_policy_id == term.forward_response_policy_id &&
-                    existing.failure_policy_id == term.forward_failure_policy_id) {
+                    existing.failure_policy_id == term.forward_failure_policy_id &&
+                    existing.timeout_failure_policy_id ==
+                        term.forward_timeout_failure_policy_id) {
                     bundle_id = static_cast<u16>(i + 1);
                     break;
                 }
@@ -3150,7 +3163,9 @@ static FrontendResult<void> emit_term(const MirTerminator& term,
                     return frontend_error(FrontendError::TooManyItems, term.span);
                 bundle_id = static_cast<u16>(++b.mod->policy_bundle_count);
                 b.mod->policy_bundles[bundle_id - 1] = {
-                    term.forward_response_policy_id, term.forward_failure_policy_id};
+                    term.forward_response_policy_id,
+                    term.forward_failure_policy_id,
+                    term.forward_timeout_failure_policy_id};
             }
             auto bundle = b.emit_const_i32(static_cast<i32>(bundle_id),
                                            {term.span.line, term.span.col});
@@ -3349,7 +3364,7 @@ FrontendResult<void> lower_to_rir(const MirModule& mir, FrontendRirModule& out) 
     };
     for (u32 i = 0; i < mir.failure_policies.len; i++) {
         const auto& src = mir.failure_policies[i];
-        if (!forward_failure_policy_spec_valid(src))
+        if (!forward_failure_policy_table_spec_valid(src))
             return frontend_error(FrontendError::UnsupportedSyntax);
         auto& dst = out.module.failure_policies[i];
         dst.version = src.version;

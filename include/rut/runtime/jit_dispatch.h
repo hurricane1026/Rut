@@ -53,6 +53,8 @@ struct JitDispatchOutcome {
     // Resolved failure-policy id retained across the fixed-body wait. This is
     // runtime metadata, not an additional legacy HandlerResult ABI slot.
     u16 failure_policy_id = 0;
+    // Resolved optional timeout-failure id from the same packed policy bundle.
+    u16 timeout_failure_policy_id = 0;
     u16 next_state = 0;
     jit::YieldKind yield_kind = jit::YieldKind::Timer;
     u32 timer_ms = 0;  // raw ms payload; callers pick their own precision

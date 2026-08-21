@@ -9734,6 +9734,7 @@ static FrontendResult<HirTerminator> analyze_term(const AstStatement& stmt, cons
     // direct RIR/runtime tests.
     const ForwardResponsePolicySpec* response_policy = nullptr;
     const ForwardFailurePolicySpec* failure_policy = nullptr;
+    const ForwardFailurePolicySpec* timeout_failure_policy = nullptr;
     if (stmt.has_forward_response_policy) {
         if (stmt.forward_response_policy_id == 0 ||
             stmt.forward_response_policy_id > mod.response_policies.len)
@@ -9758,13 +9759,35 @@ static FrontendResult<HirTerminator> analyze_term(const AstStatement& stmt, cons
                                   stmt.span,
                                   lit_str("invalid failure policy"));
     }
+    if (stmt.has_forward_timeout_failure_policy) {
+        if (!stmt.has_forward_response_policy || !stmt.has_forward_failure_policy ||
+            stmt.forward_timeout_failure_policy_id == 0 ||
+            stmt.forward_timeout_failure_policy_id > mod.failure_policies.len)
+            return frontend_error(FrontendError::UnsupportedSyntax,
+                                  stmt.span,
+                                  lit_str("invalid timeout failure policy bundle"));
+        timeout_failure_policy =
+            &mod.failure_policies[stmt.forward_timeout_failure_policy_id - 1];
+        if (!forward_timeout_failure_policy_spec_valid(*timeout_failure_policy))
+            return frontend_error(FrontendError::UnsupportedSyntax,
+                                  stmt.span,
+                                  lit_str("invalid timeout failure policy"));
+        if (timeout_failure_policy->head_mode != failure_policy->head_mode)
+            return frontend_error(FrontendError::UnsupportedSyntax,
+                                  stmt.span,
+                                  lit_str("timeout and default failure HEAD modes must match"));
+    }
     const bool response_suppress =
         response_policy != nullptr &&
         response_policy->head_mode == ResponsePolicyHeadMode::SuppressBody;
     const bool failure_suppress =
         failure_policy != nullptr && failure_policy->head_mode == FailurePolicyHeadMode::SuppressBody;
-    if (response_suppress || failure_suppress) {
-        if (!response_suppress || !failure_suppress)
+    const bool timeout_failure_suppress =
+        timeout_failure_policy != nullptr &&
+        timeout_failure_policy->head_mode == FailurePolicyHeadMode::SuppressBody;
+    if (response_suppress || failure_suppress || timeout_failure_suppress) {
+        if (!response_suppress || !failure_suppress ||
+            (timeout_failure_policy != nullptr && !timeout_failure_suppress))
             return frontend_error(FrontendError::UnsupportedSyntax,
                                   stmt.span,
                                   lit_str("public HEAD suppression requires paired response and failure policies"));
@@ -9789,6 +9812,8 @@ static FrontendResult<HirTerminator> analyze_term(const AstStatement& stmt, cons
         term.forward_response_policy_id = stmt.forward_response_policy_id;
     if (stmt.has_forward_failure_policy)
         term.forward_failure_policy_id = stmt.forward_failure_policy_id;
+    if (stmt.has_forward_timeout_failure_policy)
+        term.forward_timeout_failure_policy_id = stmt.forward_timeout_failure_policy_id;
     if (stmt.has_forward_target_transform) {
         if (!forward_target_transform_spec_valid(stmt.forward_target_transform) ||
             stmt.has_forward_set_path || stmt.forward_set_headers.len != 0)
@@ -14617,7 +14642,7 @@ static FrontendResult<HirModule*> analyze_file_internal(
     if (file.failure_policies.len > kMaxForwardFailurePolicies)
         return frontend_error(FrontendError::TooManyItems, {});
     for (u32 i = 0; i < file.failure_policies.len; i++) {
-        if (!forward_failure_policy_spec_valid(file.failure_policies[i]) ||
+        if (!forward_failure_policy_table_spec_valid(file.failure_policies[i]) ||
             !mod.failure_policies.push(file.failure_policies[i]))
             return frontend_error(FrontendError::UnsupportedSyntax, {});
     }

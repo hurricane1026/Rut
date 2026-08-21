@@ -1991,8 +1991,12 @@ struct Parser {
                                                   span_from(*kw.value()), kw_text);
                         stmt.forward_response_policy_id = policy_id;
                         stmt.has_forward_response_policy = true;
-                    } else if (kw_text.eq({"failure_policy", 14})) {
-                        if (stmt.has_forward_failure_policy)
+                    } else if (kw_text.eq({"failure_policy", 14}) ||
+                               kw_text.eq({"timeout_failure_policy", 22})) {
+                        const bool is_timeout_policy =
+                            kw_text.eq({"timeout_failure_policy", 22});
+                        if ((!is_timeout_policy && stmt.has_forward_failure_policy) ||
+                            (is_timeout_policy && stmt.has_forward_timeout_failure_policy))
                             return frontend_error(
                                 FrontendError::UnexpectedToken, span_from(*kw.value()), kw_text);
                         auto lbrace = expect(TokenType::LBrace);
@@ -2032,11 +2036,14 @@ struct Parser {
                                 auto value = expect(TokenType::IntLit);
                                 if (!value) return core::make_unexpected(value.error());
                                 auto status = parse_status_i32(*value.value());
-                                if (!status || status.value() != 502)
+                                if (!status ||
+                                    (!is_timeout_policy && status.value() != 502) ||
+                                    (is_timeout_policy &&
+                                     (status.value() < 400 || status.value() > 599)))
                                     return frontend_error(FrontendError::UnsupportedSyntax,
                                                           span_from(*value.value()),
                                                           value.value()->text);
-                                policy.status_code = 502;
+                                policy.status_code = static_cast<u16>(status.value());
                             } else if (field_name.eq({"reason", 6})) {
                                 seen = &have_reason;
                                 auto value = expect(TokenType::StringLit);
@@ -2106,7 +2113,9 @@ struct Parser {
                         if (!have_version || !have_status || !have_reason ||
                             !have_content_type || !have_server || !have_date ||
                             !have_connection || !have_body ||
-                            !forward_failure_policy_spec_valid(policy))
+                            (is_timeout_policy
+                                 ? !forward_timeout_failure_policy_spec_valid(policy)
+                                 : !forward_failure_policy_spec_valid(policy)))
                             return frontend_error(FrontendError::UnsupportedSyntax,
                                                   span_from(*rbrace.value()),
                                                   kw_text);
@@ -2115,8 +2124,13 @@ struct Parser {
                             return frontend_error(FrontendError::TooManyItems,
                                                   span_from(*kw.value()),
                                                   kw_text);
-                        stmt.forward_failure_policy_id = policy_id;
-                        stmt.has_forward_failure_policy = true;
+                        if (is_timeout_policy) {
+                            stmt.forward_timeout_failure_policy_id = policy_id;
+                            stmt.has_forward_timeout_failure_policy = true;
+                        } else {
+                            stmt.forward_failure_policy_id = policy_id;
+                            stmt.has_forward_failure_policy = true;
+                        }
                     } else if (kw_text.eq({"target_transform", 16})) {
                         if (stmt.has_forward_target_transform)
                             return frontend_error(
@@ -2244,6 +2258,11 @@ struct Parser {
                         return frontend_error(FrontendError::UnsupportedSyntax,
                                               span_from(*kw.value()), kw_text);
                 }
+                if (stmt.has_forward_timeout_failure_policy &&
+                    (!stmt.has_forward_response_policy || !stmt.has_forward_failure_policy))
+                    return frontend_error(FrontendError::UnsupportedSyntax,
+                                          span_from(start),
+                                          lit_str("timeout_failure_policy requires response_policy and failure_policy"));
                 auto rparen = expect(TokenType::RParen);
                 if (!rparen) return core::make_unexpected(rparen.error());
                 stmt.span = Span{start.start, rparen.value()->end, start.line, start.col};

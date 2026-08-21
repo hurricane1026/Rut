@@ -287,6 +287,7 @@ struct MirTerminator {
     u16 forward_request_policy_id = 0;
     u16 forward_response_policy_id = 0;
     u16 forward_failure_policy_id = 0;
+    u16 forward_timeout_failure_policy_id = 0;
     u16 redirect_policy_id = 0;
     // Internal compiler-only target transform metadata copied losslessly from
     // HIR. Presence is explicit; lowering validates the complete descriptor.
