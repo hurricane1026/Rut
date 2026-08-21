@@ -3277,17 +3277,85 @@ TEST(active_health, send_registration_failure_defers_without_downing_backend) {
     c->request_config = &cfg;
     REQUIRE_EQ(c->recv_buf.write(reinterpret_cast<const u8*>("GET / HTTP/1.1\r\n\r\n"), 18), 18u);
     set_probe_in_flight(uid, 0, true);
-    record_backend_result(uid, 0, /*success=*/true, monotonic_us());
+    record_active_probe_result(uid, 0, /*healthy=*/true, monotonic_us());
+    const BackendHealth health_before = *backend_health(uid, 0);
 
     close(loop->backend.epoll_fd);
     loop->backend.epoll_fd = -1;  // force add_send_upstream's epoll registration to fail
     on_probe_connected<EpollEventLoop>(
         loop, *c, IoEvent{c->id, 0, 0, 0, IoEventType::UpstreamConnect, 0});
 
+    REQUIRE_EQ(loop->backend.pending_count, 1u);
+    CHECK_EQ(loop->backend.pending_completions[0].type, IoEventType::UpstreamSend);
+    CHECK_EQ(loop->backend.pending_completions[0].result, -EBADF);
+    CHECK_EQ(loop->backend.pending_completions[0].aux, kLocalSubmitFailureAux);
+
+    IoEvent local_failure{};
+    REQUIRE_EQ(loop->backend.wait(&local_failure, 1, loop->conns, RealLoop::kMaxConns), 1u);
+    CHECK_EQ(loop->backend.pending_count, 0u);
+    CHECK_EQ(local_failure.type, IoEventType::UpstreamSend);
+    CHECK_EQ(local_failure.result, -EBADF);
+    CHECK_EQ(local_failure.aux, kLocalSubmitFailureAux);
+    CHECK_EQ(backend_health(uid, 0)->fails, health_before.fails);
+    CHECK_EQ(backend_health(uid, 0)->eject_until_us, health_before.eject_until_us);
+    CHECK_EQ(backend_health(uid, 0)->active_down, health_before.active_down);
+
+    loop->dispatch(local_failure);
+
+    CHECK_EQ(backend_health(uid, 0)->fails, health_before.fails);
+    CHECK_EQ(backend_health(uid, 0)->eject_until_us, health_before.eject_until_us);
+    CHECK_EQ(backend_health(uid, 0)->active_down, health_before.active_down);
     CHECK_EQ(loop->active_count(), 0u);
     CHECK(!probe_in_flight(uid, 0));
     CHECK(!backend_ejected(uid, 0, monotonic_us()));
     CHECK_EQ(::fcntl(fds[0], F_GETFD), -1);
+
+    close(fds[1]);
+    loop->shutdown();
+    close(listen_fd);
+    destroy_real_loop(loop);
+}
+
+TEST(active_health, real_negative_upstream_send_marks_backend_down) {
+    using namespace rut;
+    constexpr u16 uid = 0;
+    RouteConfig cfg{};
+    auto id = cfg.add_upstream("b", 0x7F000001, 1);
+    REQUIRE(id.has_value());
+    REQUIRE(cfg.set_upstream_health_check(uid, "/health", 7, /*interval_ms=*/1000, /*status=*/200));
+    const RouteConfig* active = &cfg;
+
+    RealLoop* loop = create_real_loop();
+    REQUIRE(loop != nullptr);
+    auto lfd = create_listen_socket(0);
+    REQUIRE(lfd.has_value());
+    const i32 listen_fd = lfd.value();
+    REQUIRE(loop->init(0, listen_fd).has_value());
+    loop->config_ptr = &active;
+
+    i32 fds[2];
+    REQUIRE_EQ(socketpair(AF_UNIX, SOCK_STREAM | SOCK_NONBLOCK, 0, fds), 0);
+    Connection* c = loop->alloc_conn();
+    REQUIRE(c != nullptr);
+    c->is_health_probe = true;
+    c->fd = -1;
+    c->upstream_fd = fds[0];
+    c->upstream_idx = uid;
+    c->upstream_backend_idx = 0;
+    c->request_config = &cfg;
+    set_probe_in_flight(uid, 0, true);
+    record_active_probe_result(uid, 0, /*healthy=*/true, monotonic_us());
+
+    on_probe_sent<EpollEventLoop>(
+        loop, *c, IoEvent{c->id, -ECONNRESET, 0, 0, IoEventType::UpstreamSend, 0});
+
+    CHECK(backend_ejected(uid, 0, monotonic_us()));
+    CHECK(backend_health(uid, 0)->active_down);
+    CHECK_EQ(loop->active_count(), 0u);
+    CHECK(!probe_in_flight(uid, 0));
+    CHECK_EQ(::fcntl(fds[0], F_GETFD), -1);
+    record_active_probe_result(uid, 0, /*healthy=*/true, monotonic_us());
+    CHECK_FALSE(backend_ejected(uid, 0, monotonic_us()));
 
     close(fds[1]);
     loop->shutdown();
@@ -3330,8 +3398,11 @@ TEST(active_health, recv_registration_failure_defers_without_downing_backend) {
     loop->backend.epoll_fd = -1;  // force add_recv_upstream's epoll registration to fail
     on_probe_sent<EpollEventLoop>(loop, *c, IoEvent{c->id, 18, 0, 0, IoEventType::UpstreamSend, 0});
     REQUIRE_EQ(loop->backend.pending_count, 1u);
-    IoEvent local_failure = loop->backend.pending_completions[0];
+    IoEvent local_failure{};
+    REQUIRE_EQ(loop->backend.wait(&local_failure, 1, loop->conns, RealLoop::kMaxConns), 1u);
+    CHECK_EQ(loop->backend.pending_count, 0u);
     CHECK_EQ(local_failure.type, IoEventType::UpstreamRecv);
+    CHECK_LT(local_failure.result, 0);
     CHECK_EQ(local_failure.aux, kLocalSubmitFailureAux);
     loop->dispatch(local_failure);
 
@@ -4568,6 +4639,7 @@ TEST(epoll_pending_capacity, upstream_partial_send_registration_failure_queues_t
     CHECK_EQ(backend.wait(events, 2, nullptr, 0), 1u);
     CHECK_EQ(events[0].type, IoEventType::UpstreamSend);
     CHECK_EQ(events[0].result, -EBADF);
+    CHECK_EQ(events[0].aux, kLocalSubmitFailureAux);
     CHECK_EQ(backend.pending_count, 0u);
 
     close(fds[0]);

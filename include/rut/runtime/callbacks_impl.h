@@ -371,6 +371,13 @@ void on_probe_connected(void* lp, Connection& conn, IoEvent ev) {
 template <typename Loop>
 void on_probe_sent(void* lp, Connection& conn, IoEvent ev) {
     auto* loop = static_cast<Loop*>(lp);
+    // A local epoll submission failure is not evidence that the backend is
+    // unhealthy.  The queued completion still owns normal probe teardown, but
+    // must not enter the health failure accounting below.
+    if (ev.aux == kLocalSubmitFailureAux) {
+        free_probe_conn(loop, conn);
+        return;
+    }
     if (ev.result < 0) {
         record_probe_if_current(loop, conn, /*healthy=*/false, monotonic_us());
         free_probe_conn(loop, conn);

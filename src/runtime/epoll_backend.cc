@@ -360,7 +360,8 @@ bool EpollBackend::add_send_upstream(i32 fd, u32 conn_id, const u8* buf, u32 len
                                       pending_count,
                                       conn_id,
                                       IoEventType::UpstreamSend,
-                                      registration_error))
+                                      registration_error,
+                                      kLocalSubmitFailureAux))
             return false;
         return true;
     }
