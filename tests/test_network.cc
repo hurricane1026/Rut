@@ -18275,6 +18275,88 @@ void cleanup_prebuilt_d2(IoUringEventLoop* loop, PrebuiltD2Fixture& fixture) {
     fixture.peer_fd = -1;
     fixture.conn = nullptr;
 }
+
+bool add_paired_head_failure_policies(RouteConfig& config) {
+    ForwardResponsePolicySpec response{};
+    response.version = ResponsePolicyVersion::Http11;
+    response.framing = ResponsePolicyFraming::ContentLength;
+    response.connection = ResponsePolicyConnection::Request;
+    response.date = ResponsePolicyDate::Current;
+    response.head_mode = ResponsePolicyHeadMode::SuppressBody;
+    response.server = {"rut-parser-test", 15};
+    if (config.add_response_policy(response) != 1) return false;
+    ForwardFailurePolicySpec failure{};
+    failure.version = ForwardFailurePolicyVersion::Http11;
+    failure.status_code = 502;
+    failure.date = ForwardFailurePolicyDate::Current;
+    failure.connection = ForwardFailurePolicyConnection::Request;
+    failure.head_mode = FailurePolicyHeadMode::SuppressBody;
+    failure.reason = {"Bad Gateway", 11};
+    failure.content_type = {"text/plain", 10};
+    failure.server = {"rut-parser-test", 15};
+    failure.body = {"origin representation", 21};
+    return config.add_failure_policy(failure) == 1;
+}
+
+bool stage_strict_parse_failure(IoUringEventLoop* loop,
+                                const RouteConfig* request_config,
+                                const u8* origin,
+                                u32 origin_len,
+                                bool live_upstream_recv,
+                                const u8* late_downstream,
+                                u32 late_downstream_len,
+                                PrebuiltD2Fixture* out) {
+    if (loop == nullptr || request_config == nullptr || origin == nullptr || origin_len == 0 ||
+        out == nullptr)
+        return false;
+    Connection* conn = loop->alloc_conn();
+    if (conn == nullptr || !loop->alloc_upstream_buf(*conn) ||
+        !loop->alloc_response_header_buf(*conn))
+        return false;
+    i32 pair[2] = {-1, -1};
+    if (socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, pair) != 0) return false;
+    conn->fd = pair[0];
+    out->peer_fd = pair[1];
+    conn->upstream_fd = dup(STDERR_FILENO);
+    if (conn->upstream_fd < 0) return false;
+
+    static constexpr u8 kRequest[] =
+        "HEAD /one HTTP/1.1\r\nHost: old.example\r\n\r\n";
+    if (conn->recv_buf.write(kRequest, sizeof(kRequest) - 1u) != sizeof(kRequest) - 1u)
+        return false;
+    capture_request_metadata(*conn);
+    conn->req_initial_send_len = conn->recv_buf.len();
+    conn->recv_buf.reset();
+    if (late_downstream_len != 0 &&
+        (late_downstream == nullptr ||
+         conn->recv_buf.write(late_downstream, late_downstream_len) != late_downstream_len))
+        return false;
+    if (conn->upstream_recv_buf.write(origin, origin_len) != origin_len) return false;
+
+    conn->upstream_episode = out->episode;
+    conn->recv_armed = true;
+    conn->upstream_recv_armed = live_upstream_recv;
+    conn->pending_ops = 1u + static_cast<u32>(live_upstream_recv);
+    conn->set_slots(nullptr,
+                    nullptr,
+                    live_upstream_recv ? &on_upstream_response<IoUringEventLoop> : nullptr,
+                    nullptr);
+    conn->request_config = request_config;
+    conn->response_policy_id = 1;
+    conn->response_policy_suppress_body = true;
+    conn->failure_policy_id = 1;
+    conn->failure_policy_suppress_body = true;
+    conn->request_upload_complete = true;
+    conn->keep_alive = true;
+    conn->req_start_us = monotonic_us();
+    conn->state = ConnState::Proxying;
+    conn->req_body_mode = BodyMode::None;
+    conn->resp_body_mode = BodyMode::None;
+    out->sq_tail_before = __atomic_load_n(loop->backend.sq_tail, __ATOMIC_ACQUIRE);
+    out->backend_pending_before = loop->backend.pending;
+    out->conn = conn;
+    return true;
+}
 }  // namespace
 
 TEST(iouring_prebuilt, send_and_retirement_orderings_resume_only_at_batch_end) {
@@ -18965,6 +19047,248 @@ TEST(iouring_prebuilt, close_after_header_bookkeeping_pins_retired_send_sources)
     close(fixture.peer_fd);
     fixture.peer_fd = -1;
     fixture.conn = nullptr;
+}
+
+TEST(iouring_parse_failure, malformed_positive_uses_d2_and_resumes_once_after_both_parties) {
+    static constexpr u8 kMalformed[] = "not-http\r\n\r\n";
+    static constexpr u8 kRequest2[] =
+        "GET /two HTTP/1.1\r\nHost: new.example\r\nConnection: close\r\n\r\n";
+    for (bool header_first : {true, false}) {
+        ScopedIoUringLoopForRetirement guard;
+        if (!guard.init()) SKIP("io_uring unavailable");
+        auto* loop = guard.loop;
+        RouteConfig old_config{};
+        REQUIRE(add_paired_head_failure_policies(old_config));
+        RouteConfig current_config{};
+        REQUIRE(current_config.add_static("/two", 0, header_first ? 218 : 219));
+        const RouteConfig* active = &current_config;
+        ShardEpoch epoch{};
+        epoch.epoch.store(1, std::memory_order_relaxed);
+        ShardMetrics metrics{};
+        metrics.init();
+        metrics.requests_active = 1;
+        loop->config_ptr = &active;
+        loop->epoch = &epoch;
+        loop->metrics = &metrics;
+        UpstreamConcurrency concurrency{};
+        concurrency.reset();
+        REQUIRE(concurrency.try_acquire(0, 1));
+        loop->upstream_cc = &concurrency;
+
+        PrebuiltD2Fixture fixture{};
+        REQUIRE(stage_strict_parse_failure(loop,
+                                           &old_config,
+                                           kMalformed,
+                                           sizeof(kMalformed) - 1u,
+                                           true,
+                                           kRequest2,
+                                           sizeof(kRequest2) - 1u,
+                                           &fixture));
+        Connection& conn = *fixture.conn;
+        conn.upstream_slot_held = true;
+        conn.upstream_slot_uid = 0;
+        loop->dispatch({conn.id,
+                        static_cast<i32>(sizeof(kMalformed) - 1u),
+                        0,
+                        0,
+                        IoEventType::UpstreamRecv,
+                        1,
+                        0,
+                        fixture.episode});
+
+        REQUIRE_EQ(conn.http1_prebuilt_disposition,
+                   Http1RequestBufferDisposition::ExistingPipeline);
+        REQUIRE_EQ(conn.http1_prebuilt_wait,
+                   kHttp1WaitHeaderSend | kHttp1WaitUpstreamRetirement);
+        REQUIRE_EQ(conn.upstream_retiring_episode, fixture.episode);
+        REQUIRE_EQ(conn.upstream_retirement_target_owned, kUpstreamOpRecv);
+        REQUIRE_EQ(conn.upstream_recv_buf.len(), 0u);
+        CHECK_FALSE(conn.upstream_slot_held);
+        CHECK_EQ(concurrency.inflight[0].load(std::memory_order_relaxed), 0u);
+        CHECK_EQ(conn.resp_status, 502u);
+        CHECK(buf_has(conn.response_header_buf.data(),
+                      conn.response_header_buf.len(),
+                      "Content-Length: 21\r\n"));
+        CHECK(buf_has(conn.response_header_buf.data(),
+                      conn.response_header_buf.len(),
+                      "Connection: keep-alive\r\n"));
+        CHECK_FALSE(buf_has(conn.response_header_buf.data(),
+                            conn.response_header_buf.len(),
+                            "origin representation"));
+
+        if (header_first)
+            complete_prebuilt_d2_header(loop, conn);
+        else
+            drain_prebuilt_d2_retirement(loop, conn, kUpstreamOpRecv, true);
+        CHECK_EQ(conn.handler_gen, 0u);
+        CHECK_FALSE(conn.http1_boundary_ready);
+        if (header_first)
+            drain_prebuilt_d2_retirement(loop, conn, kUpstreamOpRecv, false);
+        else
+            complete_prebuilt_d2_header(loop, conn);
+        REQUIRE(conn.http1_boundary_ready);
+        CHECK_EQ(conn.handler_gen, 0u);
+        CHECK_EQ(metrics.requests_total, 1u);
+        CHECK_EQ(metrics.requests_active, 0u);
+        CHECK(conn.epoch_held);
+
+        loop->resume_deferred_http1_boundaries();
+        CHECK_EQ(conn.handler_gen, 1u);
+        CHECK_EQ(conn.resp_status, header_first ? 218u : 219u);
+        CHECK_EQ(conn.request_config, &current_config);
+        CHECK_FALSE(conn.epoch_held);
+        CHECK_EQ(epoch.epoch.load(std::memory_order_acquire), 3u);
+        const u32 gen = conn.handler_gen;
+        loop->resume_deferred_http1_boundaries();
+        CHECK_EQ(conn.handler_gen, gen);
+        cleanup_prebuilt_d2(loop, fixture);
+    }
+}
+
+TEST(iouring_parse_failure, terminal_and_incomplete_eof_use_zero_owner_only_after_error) {
+    struct Case {
+        const u8* bytes;
+        u32 len;
+        bool split;
+        i32 terminal_result;
+    };
+    static constexpr u8 kMalformed[] = "not-http\r\n\r\n";
+    static constexpr u8 kPartial[] = "HTTP/1.1 200 OK\r\nContent-Length: 4\r\n";
+    const Case cases[] = {{kMalformed, sizeof(kMalformed) - 1u, false, 0},
+                          {kPartial, sizeof(kPartial) - 1u, true, 0},
+                          {kPartial, sizeof(kPartial) - 1u, true, -ECONNRESET}};
+    for (const Case& test : cases) {
+        ScopedIoUringLoopForRetirement guard;
+        if (!guard.init()) SKIP("io_uring unavailable");
+        auto* loop = guard.loop;
+        RouteConfig config{};
+        REQUIRE(add_paired_head_failure_policies(config));
+        const RouteConfig* active = &config;
+        ShardEpoch epoch{};
+        epoch.epoch.store(1, std::memory_order_relaxed);
+        ShardMetrics metrics{};
+        metrics.init();
+        metrics.requests_active = 1;
+        loop->config_ptr = &active;
+        loop->epoch = &epoch;
+        loop->metrics = &metrics;
+
+        PrebuiltD2Fixture fixture{};
+        REQUIRE(stage_strict_parse_failure(
+            loop, &config, test.bytes, test.len, true, nullptr, 0, &fixture));
+        Connection& conn = *fixture.conn;
+        if (test.split) {
+            loop->dispatch({conn.id,
+                            static_cast<i32>(test.len),
+                            0,
+                            0,
+                            IoEventType::UpstreamRecv,
+                            1,
+                            0,
+                            fixture.episode});
+            CHECK_EQ(conn.http1_prebuilt_disposition, Http1RequestBufferDisposition::None);
+            CHECK(conn.upstream_recv_armed);
+            CHECK_FALSE(conn.send_armed);
+            CHECK_EQ(conn.upstream_recv_buf.len(), test.len);
+            loop->dispatch({conn.id,
+                            test.terminal_result,
+                            0,
+                            0,
+                            IoEventType::UpstreamRecv,
+                            0,
+                            0,
+                            fixture.episode});
+        } else {
+            loop->dispatch({conn.id,
+                            static_cast<i32>(test.len),
+                            0,
+                            0,
+                            IoEventType::UpstreamRecv,
+                            0,
+                            0,
+                            fixture.episode});
+        }
+
+        REQUIRE_EQ(conn.http1_prebuilt_disposition,
+                   Http1RequestBufferDisposition::ExistingPipeline);
+        CHECK_EQ(conn.http1_prebuilt_wait, kHttp1WaitHeaderSend);
+        CHECK_FALSE(conn.upstream_retirement_active);
+        CHECK_EQ(conn.upstream_retiring_episode, fixture.episode);
+        CHECK_EQ(conn.upstream_retirement_target_owned, 0u);
+        CHECK_EQ(conn.upstream_retirement_cancel_owned, 0u);
+        CHECK_EQ(conn.pending_ops, 2u);  // downstream recv + header send
+        complete_prebuilt_d2_header(loop, conn);
+        REQUIRE(conn.http1_boundary_ready);
+        CHECK_EQ(metrics.requests_total, 1u);
+        loop->resume_deferred_http1_boundaries();
+        CHECK_EQ(conn.state, ConnState::ReadingHeader);
+        CHECK_EQ(conn.handler_gen, 0u);
+        CHECK_EQ(conn.pending_ops, 1u);  // the existing multishot downstream recv
+        cleanup_prebuilt_d2(loop, fixture);
+    }
+}
+
+TEST(iouring_parse_failure, non_admissible_causes_and_upload_state_close_before_bytes) {
+    static constexpr u8 kMalformed[] = "not-http\r\n\r\n";
+    static constexpr u8 kInterim[] = "HTTP/1.1 100 Continue\r\n\r\n";
+    struct Case {
+        const u8* bytes;
+        u32 len;
+        bool upload_complete;
+    };
+    const Case cases[] = {{kMalformed, sizeof(kMalformed) - 1u, false},
+                          {kInterim, sizeof(kInterim) - 1u, true}};
+    for (const Case& test : cases) {
+        ScopedIoUringLoopForRetirement guard;
+        if (!guard.init()) SKIP("io_uring unavailable");
+        auto* loop = guard.loop;
+        RouteConfig config{};
+        REQUIRE(add_paired_head_failure_policies(config));
+        PrebuiltD2Fixture fixture{};
+        REQUIRE(stage_strict_parse_failure(
+            loop, &config, test.bytes, test.len, true, nullptr, 0, &fixture));
+        const u32 id = fixture.conn->id;
+        fixture.conn->request_upload_complete = test.upload_complete;
+        loop->dispatch({id,
+                        static_cast<i32>(test.len),
+                        0,
+                        0,
+                        IoEventType::UpstreamRecv,
+                        1,
+                        0,
+                        fixture.episode});
+        Connection& closed = loop->conns[id];
+        CHECK_EQ(closed.fd, -1);
+        CHECK_EQ(closed.send_buf.len(), 0u);
+        CHECK_EQ(closed.response_header_buf.len(), 0u);
+        CHECK_EQ(closed.http1_prebuilt_disposition, Http1RequestBufferDisposition::None);
+        CHECK_EQ(closed.upstream_retiring_episode, 0u);
+        __atomic_store_n(loop->backend.sq_tail, fixture.sq_tail_before, __ATOMIC_RELEASE);
+        loop->backend.pending = fixture.backend_pending_before;
+        // close_conn owns the live upstream target/cancel exactly; drain them
+        // without letting the fixture leak a slot into the next case.
+        loop->dispatch({id,
+                        -ECANCELED,
+                        0,
+                        0,
+                        IoEventType::UpstreamRecv,
+                        0,
+                        0,
+                        fixture.episode});
+        loop->dispatch({id,
+                        -ENOENT,
+                        0,
+                        0,
+                        IoEventType::UpstreamRecv,
+                        0,
+                        kUpstreamCloseCancelAux,
+                        fixture.episode});
+        loop->dispatch({id, -ECANCELED, 0, 0, IoEventType::Recv, 0});
+        loop->dispatch({id, -ENOENT, 0, 0, IoEventType::Recv, 0});
+        close(fixture.peer_fd);
+        fixture.peer_fd = -1;
+        fixture.conn = nullptr;
+    }
 }
 
 TEST(iouring_episode, upstream_submissions_carry_episode_and_aux) {

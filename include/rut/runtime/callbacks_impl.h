@@ -6225,13 +6225,123 @@ inline bool abandon_strict_upstream(Loop* loop, Connection& conn) {
     return true;
 }
 
+enum class StrictResponseRejectionCause : u8 {
+    Default = 0,
+    UpstreamParse,
+};
+
 template <typename Loop>
-inline void reject_strict_response(Loop* loop, Connection& conn) {
-    // This is the response-policy equivalent of the upstream timeout path.
-    // The reusable paired HEAD contract has no safe post-establishment failure
-    // serializer until #265: close before detaching, clearing callbacks, or
-    // staging bytes so io_uring's close ledger retains exact ownership.
+inline bool try_prebuilt_strict_parse_failure(Loop* loop, Connection& conn) {
+    if constexpr (!requires(Loop* candidate, Connection& c) {
+                      candidate->begin_prebuilt_http1_response(
+                          c,
+                          u8{},
+                          Http1RequestBufferDisposition::ExistingPipeline,
+                          u32{});
+                  }) {
+        return false;
+    } else {
+        // This is deliberately narrower than the general strict rejection
+        // path.  Only the paired, reusable, bodyless HEAD contract may publish
+        // its configured 502 while an old recv episode drains through D2.
+        // Every check before scratch serialization is mutation-free.
+        if (conn.upstream_recv_buf.len() == 0 || conn.request_config == nullptr ||
+            conn.response_policy_id == 0 || conn.failure_policy_id == 0 ||
+            !conn.request_config->response_policy_id_is_valid(conn.response_policy_id) ||
+            !conn.request_config->failure_policy_id_is_valid(conn.failure_policy_id) ||
+            !conn.response_policy_suppress_body || !conn.failure_policy_suppress_body ||
+            conn.protocol != ConnProtocol::Http11 || conn.tls_active ||
+            conn.req_http_version != static_cast<u8>(HttpVersion::Http11) ||
+            conn.req_method != static_cast<u8>(LogHttpMethod::Head) ||
+            !conn.keep_alive || !conn.req_client_keep_alive ||
+            conn.req_client_connection_close || conn.req_client_connection_close_exact ||
+            conn.req_client_connection_count != 0 || conn.req_client_has_content_length ||
+            conn.req_client_has_transfer_encoding || conn.req_client_has_te ||
+            conn.req_client_has_expect || conn.req_client_has_upgrade_header ||
+            conn.req_malformed || conn.req_wants_upgrade ||
+            conn.req_header_override_count != 0 || conn.req_header_override_overflow ||
+            conn.resp_header_mutation_count != 0 ||
+            conn.resp_header_mutation_pending_count != 0 ||
+            conn.resp_header_mutation_pending_overflow ||
+            conn.resp_header_mutation_overflow || conn.req_body_mode != BodyMode::None ||
+            conn.req_body_remaining != 0 || conn.req_body_streamed ||
+            conn.state != ConnState::Proxying || conn.req_start_us == 0 ||
+            conn.proxy_resp_started || conn.resp_body_sent != 0 || conn.send_progress != 0 ||
+            conn.send_armed || conn.on_send != nullptr || !conn.request_upload_complete ||
+            conn.upstream_request_incomplete || conn.upstream_connect_armed ||
+            conn.upstream_send_armed || conn.response_header_buf.is_released() ||
+            !conn.response_header_buf.valid())
+            return false;
+
+        const auto& response =
+            conn.request_config->response_policies[conn.response_policy_id - 1];
+        const auto& failure =
+            conn.request_config->failure_policies[conn.failure_policy_id - 1];
+        if (response.version != ResponsePolicyVersion::Http11 ||
+            response.framing != ResponsePolicyFraming::ContentLength ||
+            response.connection != ResponsePolicyConnection::Request ||
+            response.head_mode != ResponsePolicyHeadMode::SuppressBody ||
+            failure.version != ForwardFailurePolicyVersion::Http11 ||
+            failure.status_code != kStatusBadGateway ||
+            failure.connection != ForwardFailurePolicyConnection::Request ||
+            failure.head_mode != FailurePolicyHeadMode::SuppressBody)
+            return false;
+
+        u8 scratch[SlicePool::kSliceSize];
+        u32 header_len = 0;
+        if (!build_failure_policy_response(conn,
+                                           *conn.request_config,
+                                           /*suppress_body=*/true,
+                                           scratch,
+                                           sizeof(scratch),
+                                           &header_len) ||
+            header_len == 0 || header_len > conn.response_header_buf.capacity())
+            return false;
+
+        // Serialization and capacity are now proven.  Publish the exact
+        // header-only failure state before transferring ownership to D2.
+        conn.response_header_buf.reset();
+        if (conn.response_header_buf.write(scratch, header_len) != header_len) {
+            loop->close_conn(conn);
+            return true;
+        }
+        conn.resp_status = kStatusBadGateway;
+        conn.resp_body_mode = BodyMode::None;
+        conn.resp_body_remaining = 0;
+        conn.resp_body_sent = 0;
+        conn.upstream_send_len = 0;
+
+        const u8 selected_targets =
+            conn.upstream_recv_armed ? kUpstreamOpRecv : static_cast<u8>(0);
+        if (!loop->begin_prebuilt_http1_response(
+                conn,
+                selected_targets,
+                Http1RequestBufferDisposition::ExistingPipeline,
+                conn.retry_req_send_len)) {
+            // D2 may already have closed on an episode-exhaustion or submit
+            // failure.  Do not run close bookkeeping twice.
+            if (conn.fd >= 0) loop->close_conn(conn);
+            return true;
+        }
+        // Invalid origin bytes are no longer authoritative after D2 owns the
+        // complete downstream header and the old upstream episode.
+        conn.upstream_recv_buf.reset();
+        return true;
+    }
+}
+
+template <typename Loop>
+inline void reject_strict_response(
+    Loop* loop,
+    Connection& conn,
+    StrictResponseRejectionCause cause = StrictResponseRejectionCause::Default) {
+    // Only a non-empty parser error has the bounded D2 admission below. Every
+    // other reusable paired HEAD rejection still closes before detaching,
+    // clearing callbacks, or staging downstream bytes.
     if (conn.failure_policy_suppress_body) {
+        if (cause == StrictResponseRejectionCause::UpstreamParse &&
+            try_prebuilt_strict_parse_failure(loop, conn))
+            return;
         loop->close_conn(conn);
         return;
     }
@@ -6307,7 +6417,7 @@ void on_upstream_response(void* lp, Connection& conn, IoEvent ev) {
     }
     if (ps == ParseStatus::Error) {
         if (conn.response_policy_id != 0) {
-            reject_strict_response(loop, conn);
+            reject_strict_response(loop, conn, StrictResponseRejectionCause::UpstreamParse);
             return;
         }
         (void)detach_upstream_close_only(loop, conn);
