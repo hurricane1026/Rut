@@ -3723,6 +3723,9 @@ TEST(partial_send, real_epollout_completion) {
     if (backend.send_state[0].remaining == 0) {
         SKIP("socketpair buffered the full payload; send-wait EPOLLOUT preservation not exercised");
     }
+    // A partial/EAGAIN send is registered with epoll and does not consume a
+    // synthetic completion slot.
+    CHECK_EQ(backend.pending_count, 0u);
 
     // Check for immediate completion via synthetic pending events (non-blocking).
     // If add_send succeeded fully, pending_count > 0 with the completion.
@@ -4106,12 +4109,12 @@ TEST(tls_state_machine, send_rejects_out_of_range_conn_id_with_full_pending_ring
     ScopedTlsHooks hooks(tls_state);
 
     static const u8 kPayload[] = {'f', 'u', 'l', 'l'};
-    REQUIRE(backend.add_send_tls(conn, kPayload, sizeof(kPayload)));
-    CHECK_EQ(tls_state.write_calls, 1);
+    CHECK_FALSE(backend.add_send_tls(conn, kPayload, sizeof(kPayload)));
+    CHECK_EQ(tls_state.write_calls, 0);
     REQUIRE_EQ(backend.pending_count, 64u);
-    CHECK_EQ(backend.pending_completions[63].conn_id, EpollBackend::kMaxFdMap);
-    CHECK_EQ(backend.pending_completions[63].type, IoEventType::Send);
-    CHECK_EQ(backend.pending_completions[63].result, -EINVAL);
+    CHECK_EQ(backend.pending_completions[63].conn_id, 63u);
+    CHECK_EQ(backend.pending_completions[63].type, IoEventType::Recv);
+    CHECK_EQ(backend.pending_completions[63].result, 63);
 
     close(fds[0]);
     close(fds[1]);
@@ -4151,15 +4154,122 @@ TEST(tls_state_machine, send_arm_failure_returns_error_with_full_pending_ring) {
     conn.fd = fds[0];
 
     static const u8 kPayload[] = {'f', 'a', 'i', 'l'};
-    REQUIRE(backend.add_send_tls(conn, kPayload, sizeof(kPayload)));
-    CHECK_EQ(tls_state.write_calls, 1);
+    CHECK_FALSE(backend.add_send_tls(conn, kPayload, sizeof(kPayload)));
+    CHECK_EQ(tls_state.write_calls, 0);
     CHECK_EQ(backend.send_state[0].remaining, 0u);
     CHECK_EQ(backend.send_state[0].fd, -1);
     REQUIRE_EQ(backend.pending_count, 64u);
-    CHECK_EQ(backend.pending_completions[63].conn_id, 0u);
-    CHECK_EQ(backend.pending_completions[63].type, IoEventType::Send);
-    CHECK_EQ(backend.pending_completions[63].result, -EBADF);
+    CHECK_EQ(backend.pending_completions[63].conn_id, 63u);
+    CHECK_EQ(backend.pending_completions[63].type, IoEventType::Recv);
+    CHECK_EQ(backend.pending_completions[63].result, 63);
 
+    close(fds[1]);
+    backend.shutdown();
+}
+
+TEST(epoll_pending_capacity, immediate_completion_preserves_lifo_and_prior_entries) {
+    EpollBackend backend;
+    REQUIRE(backend.init(0, -1).has_value());
+
+    i32 fds[2] = {-1, -1};
+    if (socketpair(AF_UNIX, SOCK_STREAM | SOCK_NONBLOCK, 0, fds) != 0) {
+        backend.shutdown();
+        CHECK(false);
+        return;
+    }
+
+    for (u32 i = 0; i < EpollBackend::kPendingCap - 1; i++) {
+        backend.pending_completions[i] = {
+            100u + i, static_cast<i32>(i), 7, 1, IoEventType::Recv, 1, kPauseCancelAux, 0};
+    }
+    backend.pending_count = EpollBackend::kPendingCap - 1;
+
+    static const u8 payload[] = {'o', 'k'};
+    CHECK(backend.add_send(fds[0], 7, payload, sizeof(payload)));
+    CHECK_EQ(backend.pending_count, EpollBackend::kPendingCap);
+    CHECK_EQ(backend.pending_completions[63].conn_id, 7u);
+    CHECK_EQ(backend.pending_completions[63].type, IoEventType::Send);
+    CHECK_EQ(backend.pending_completions[63].result, 2);
+    CHECK_EQ(backend.pending_completions[63].aux, 0);
+    CHECK_EQ(backend.pending_completions[63].upstream_episode, 0u);
+    for (u32 i = 0; i < EpollBackend::kPendingCap - 1; i++) {
+        CHECK_EQ(backend.pending_completions[i].conn_id, 100u + i);
+        CHECK_EQ(backend.pending_completions[i].result, static_cast<i32>(i));
+        CHECK_EQ(backend.pending_completions[i].aux, kPauseCancelAux);
+    }
+
+    u8 received[sizeof(payload)] = {};
+    CHECK_EQ(recv(fds[1], received, sizeof(received), MSG_DONTWAIT),
+             static_cast<ssize_t>(sizeof(payload)));
+    CHECK_EQ(received[0], static_cast<u8>('o'));
+    CHECK_EQ(received[1], static_cast<u8>('k'));
+
+    IoEvent event;
+    CHECK_EQ(backend.wait(&event, 1, nullptr, 0), 1u);
+    CHECK_EQ(event.conn_id, 7u);
+    CHECK_EQ(event.type, IoEventType::Send);
+    CHECK_EQ(backend.pending_count, EpollBackend::kPendingCap - 1);
+
+    close(fds[0]);
+    close(fds[1]);
+    backend.shutdown();
+}
+
+TEST(epoll_pending_capacity, scoped_producers_reject_full_ring_before_side_effects) {
+    EpollBackend backend;
+    REQUIRE(backend.init(0, -1).has_value());
+
+    i32 fds[2] = {-1, -1};
+    if (socketpair(AF_UNIX, SOCK_STREAM | SOCK_NONBLOCK, 0, fds) != 0) {
+        backend.shutdown();
+        CHECK(false);
+        return;
+    }
+
+    for (u32 i = 0; i < EpollBackend::kPendingCap; i++) {
+        backend.pending_completions[i] = {
+            200u + i, static_cast<i32>(i), 9, 1, IoEventType::Recv, 1, kPauseCancelAux, 0};
+    }
+    backend.pending_count = EpollBackend::kPendingCap;
+    backend.upstream_fd_map[7] = 1234;
+    const auto saved_send = backend.send_state[7];
+    const auto saved_upstream_send = backend.upstream_send_state[7];
+
+    static const u8 payload[] = {'n', 'o'};
+    CHECK_FALSE(backend.add_send(fds[0], 7, payload, sizeof(payload)));
+    CHECK_FALSE(backend.add_send_upstream(fds[0], 7, payload, sizeof(payload)));
+    CHECK_FALSE(backend.add_connect(fds[0], 7, nullptr, 0));
+    CHECK_FALSE(backend.add_recv_upstream(fds[0], 7));
+    CHECK_EQ(backend.pending_count, EpollBackend::kPendingCap);
+    CHECK_EQ(backend.pending_completions[63].conn_id, 263u);
+    CHECK_EQ(backend.pending_completions[63].result, 63);
+    CHECK_EQ(backend.upstream_fd_map[7], 1234);
+    CHECK_EQ(backend.send_state[7].src, saved_send.src);
+    CHECK_EQ(backend.send_state[7].fd, saved_send.fd);
+    CHECK_EQ(backend.send_state[7].remaining, saved_send.remaining);
+    CHECK_EQ(backend.upstream_send_state[7].src, saved_upstream_send.src);
+    CHECK_EQ(backend.upstream_send_state[7].fd, saved_upstream_send.fd);
+    CHECK_EQ(backend.upstream_send_state[7].remaining, saved_upstream_send.remaining);
+    u8 received[sizeof(payload)] = {};
+    CHECK_EQ(recv(fds[1], received, sizeof(received), MSG_DONTWAIT), -1);
+    CHECK(errno == EAGAIN || errno == EWOULDBLOCK);
+
+    TestConn tc;
+    tc.init(0, fds[0]);
+    Connection& conn = tc.conn;
+    conn.tls_active = true;
+    conn.tls_handshake_complete = true;
+    conn.tls = reinterpret_cast<SSL*>(0x1);
+    ScriptedTlsState tls_state;
+    tls_state.write_first_rc = -1;
+    tls_state.write_first_error = SSL_ERROR_WANT_WRITE;
+    ScopedTlsHooks hooks(tls_state);
+    CHECK_FALSE(backend.add_send_tls(conn, payload, sizeof(payload)));
+    CHECK_EQ(tls_state.write_calls, 0);
+    CHECK_EQ(backend.pending_count, EpollBackend::kPendingCap);
+    CHECK_EQ(backend.pending_completions[63].conn_id, 263u);
+
+    close(fds[0]);
     close(fds[1]);
     backend.shutdown();
 }

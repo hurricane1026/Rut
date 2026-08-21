@@ -42,10 +42,10 @@ struct EpollBackend {
     i32 downstream_fd_map[kMaxFdMap];  // downstream (client) fd per conn_id
     i32 upstream_fd_map[kMaxFdMap];    // upstream (origin) fd per conn_id
 
-    // Pending synthetic completion events (from immediate sends). FIXED ring:
-    // queue_pending_completion drops past kPendingCap, so producers (incl. the
-    // health-probe sweep) must bound how many synchronous completions they emit
-    // per dispatch — see EventLoopCRTP::sweep_health_probes.
+    // Pending synthetic completion events (from immediate sends). FIXED LIFO
+    // stack. Scoped producers preflight this capacity before their synchronous
+    // syscall; they are single-threaded and non-reentrant, so one entry check
+    // reserves the only completion slot that operation can need.
     static constexpr u32 kPendingCap = 64;
     IoEvent pending_completions[kPendingCap];
     u32 pending_count = 0;

@@ -10659,14 +10659,23 @@ TEST(epoll_loop, upstream_recv_registration_failure_queues_local_error) {
     REQUIRE(socketpair(AF_UNIX, SOCK_STREAM, 0, fds) == 0);
     c->upstream_fd = fds[0];
 
+    // Leave exactly one completion slot for the registration-failure event;
+    // older entries must remain intact.
+    for (u32 i = 0; i < EpollBackend::kPendingCap - 1; i++) {
+        loop->backend.pending_completions[i] = {
+            700u + i, static_cast<i32>(i), 0, 0, IoEventType::Recv, 0, 0, 0};
+    }
+    loop->backend.pending_count = EpollBackend::kPendingCap - 1;
+
     close(loop->backend.epoll_fd);
     loop->backend.epoll_fd = -1;
     CHECK(loop->backend.add_recv_upstream(fds[0], cid));
-    REQUIRE_EQ(loop->backend.pending_count, 1u);
-    CHECK_EQ(loop->backend.pending_completions[0].conn_id, cid);
-    CHECK_EQ(loop->backend.pending_completions[0].type, IoEventType::UpstreamRecv);
-    CHECK_LT(loop->backend.pending_completions[0].result, 0);
-    CHECK_EQ(loop->backend.pending_completions[0].aux, kLocalSubmitFailureAux);
+    REQUIRE_EQ(loop->backend.pending_count, EpollBackend::kPendingCap);
+    CHECK_EQ(loop->backend.pending_completions[62].conn_id, 762u);
+    CHECK_EQ(loop->backend.pending_completions[63].conn_id, cid);
+    CHECK_EQ(loop->backend.pending_completions[63].type, IoEventType::UpstreamRecv);
+    CHECK_LT(loop->backend.pending_completions[63].result, 0);
+    CHECK_EQ(loop->backend.pending_completions[63].aux, kLocalSubmitFailureAux);
     CHECK_EQ(loop->backend.upstream_fd_map[cid], -1);
 
     close(fds[0]);

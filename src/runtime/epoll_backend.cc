@@ -76,25 +76,18 @@ static u32 tls_send_interest_for_state(const EpollBackend::SendState& ss) {
     return EPOLLIN | (ss.tls_wait_events ? ss.tls_wait_events : EPOLLIN);
 }
 
-static void queue_pending_completion(IoEvent* pending_completions,
+static bool queue_pending_completion(IoEvent* pending_completions,
                                      u32& pending_count,
                                      u32 conn_id,
                                      IoEventType type,
                                      i32 result,
-                                     bool force_slot = false) {
-    if (pending_count >= 64) {
-        if (!force_slot) return;
-        pending_count = 63;
-    }
+                                     u8 aux = 0) {
+    if (pending_count >= EpollBackend::kPendingCap) return false;
 
-    pending_completions[pending_count].conn_id = conn_id;
-    pending_completions[pending_count].type = type;
-    pending_completions[pending_count].result = result;
-    pending_completions[pending_count].buf_id = 0;
-    pending_completions[pending_count].has_buf = 0;
-    pending_completions[pending_count].more = 0;
-    pending_completions[pending_count].aux = 0;
+    pending_completions[pending_count] = {
+        conn_id, result, 0, 0, type, 0, aux, 0};
     pending_count++;
+    return true;
 }
 
 static i32 set_fd_interest(i32 epoll_fd, i32 fd, u32 conn_id, IoEventType type, u32 events) {
@@ -319,34 +312,27 @@ void EpollBackend::pause_upstream_recv(u32 conn_id, bool preserve_send_interest)
 }
 
 bool EpollBackend::add_send_upstream(i32 fd, u32 conn_id, const u8* buf, u32 len) {
+    // This operation can produce at most one synchronous completion.  The
+    // producer is single-threaded/non-reentrant, so this entry check reserves
+    // its completion slot without needing a separate reservation counter.
+    if (pending_count >= kPendingCap) return false;
+
     ssize_t nw = send(fd, buf, len, MSG_NOSIGNAL);
 
     if (nw == static_cast<ssize_t>(len)) {
-        if (pending_count < 64) {
-            pending_completions[pending_count].conn_id = conn_id;
-            pending_completions[pending_count].type = IoEventType::UpstreamSend;
-            pending_completions[pending_count].result = static_cast<i32>(nw);
-            pending_completions[pending_count].buf_id = 0;
-            pending_completions[pending_count].has_buf = 0;
-            pending_completions[pending_count].more = 0;
-            pending_completions[pending_count].aux = 0;
-            pending_count++;
-        }
-        return true;
+        return queue_pending_completion(pending_completions,
+                                        pending_count,
+                                        conn_id,
+                                        IoEventType::UpstreamSend,
+                                        static_cast<i32>(nw));
     }
 
     if (nw < 0 && errno != EAGAIN && errno != EWOULDBLOCK) {
-        if (pending_count < 64) {
-            pending_completions[pending_count].conn_id = conn_id;
-            pending_completions[pending_count].type = IoEventType::UpstreamSend;
-            pending_completions[pending_count].result = -errno;
-            pending_completions[pending_count].buf_id = 0;
-            pending_completions[pending_count].has_buf = 0;
-            pending_completions[pending_count].more = 0;
-            pending_completions[pending_count].aux = 0;
-            pending_count++;
-        }
-        return true;
+        return queue_pending_completion(pending_completions,
+                                        pending_count,
+                                        conn_id,
+                                        IoEventType::UpstreamSend,
+                                        -errno);
     }
 
     u32 sent = (nw > 0) ? static_cast<u32>(nw) : 0;
@@ -372,6 +358,10 @@ bool EpollBackend::add_send_upstream(i32 fd, u32 conn_id, const u8* buf, u32 len
 }
 
 bool EpollBackend::add_recv_upstream(i32 fd, u32 conn_id) {
+    // Registration failure emits one local-submit completion, so reserve its
+    // slot before changing the fd map or calling epoll_ctl.
+    if (pending_count >= kPendingCap) return false;
+
     if (conn_id < kMaxFdMap) upstream_fd_map[conn_id] = fd;
     // Symmetric to add_recv: preserve a pending client→upstream send's EPOLLOUT
     // when resuming upstream reads, so the upstream→client send completing does
@@ -393,51 +383,34 @@ bool EpollBackend::add_recv_upstream(i32 fd, u32 conn_id) {
     if (set_fd_interest(epoll_fd, fd, conn_id, type, events) < 0) {
         const i32 err = errno;
         if (conn_id < kMaxFdMap) upstream_fd_map[conn_id] = -1;
-        if (pending_count < kPendingCap) {
-            pending_completions[pending_count].conn_id = conn_id;
-            pending_completions[pending_count].type = IoEventType::UpstreamRecv;
-            pending_completions[pending_count].result = -err;
-            pending_completions[pending_count].buf_id = 0;
-            pending_completions[pending_count].has_buf = 0;
-            pending_completions[pending_count].more = 0;
-            pending_completions[pending_count].aux = kLocalSubmitFailureAux;
-            pending_count++;
-            return true;
-        }
-        return false;
+        return queue_pending_completion(pending_completions,
+                                        pending_count,
+                                        conn_id,
+                                        IoEventType::UpstreamRecv,
+                                        -err,
+                                        kLocalSubmitFailureAux);
     }
     return true;
 }
 
 bool EpollBackend::add_send(i32 fd, u32 conn_id, const u8* buf, u32 len) {
+    // One immediate/error completion is the only synchronous result this
+    // producer can append; partial/EAGAIN uses epoll and consumes no slot.
+    if (pending_count >= kPendingCap) return false;
+
     ssize_t nw = send(fd, buf, len, MSG_NOSIGNAL);
 
     if (nw == static_cast<ssize_t>(len)) {
-        if (pending_count < 64) {
-            pending_completions[pending_count].conn_id = conn_id;
-            pending_completions[pending_count].type = IoEventType::Send;
-            pending_completions[pending_count].result = static_cast<i32>(nw);
-            pending_completions[pending_count].buf_id = 0;
-            pending_completions[pending_count].has_buf = 0;
-            pending_completions[pending_count].more = 0;
-            pending_completions[pending_count].aux = 0;
-            pending_count++;
-        }
-        return true;
+        return queue_pending_completion(pending_completions,
+                                        pending_count,
+                                        conn_id,
+                                        IoEventType::Send,
+                                        static_cast<i32>(nw));
     }
 
     if (nw < 0 && errno != EAGAIN && errno != EWOULDBLOCK) {
-        if (pending_count < 64) {
-            pending_completions[pending_count].conn_id = conn_id;
-            pending_completions[pending_count].type = IoEventType::Send;
-            pending_completions[pending_count].result = -errno;
-            pending_completions[pending_count].buf_id = 0;
-            pending_completions[pending_count].has_buf = 0;
-            pending_completions[pending_count].more = 0;
-            pending_completions[pending_count].aux = 0;
-            pending_count++;
-        }
-        return true;
+        return queue_pending_completion(
+            pending_completions, pending_count, conn_id, IoEventType::Send, -errno);
     }
 
     u32 sent = (nw > 0) ? static_cast<u32>(nw) : 0;
@@ -457,21 +430,19 @@ bool EpollBackend::add_send(i32 fd, u32 conn_id, const u8* buf, u32 len) {
         if (conn_id < kMaxFdMap) {
             send_state[conn_id] = {nullptr, -1, 0, 0, IoEventType::Send, false, 0};
         }
-        if (pending_count >= 64) pending_count = 63;
-        pending_completions[pending_count].conn_id = conn_id;
-        pending_completions[pending_count].type = IoEventType::Send;
-        pending_completions[pending_count].result = -err;
-        pending_completions[pending_count].buf_id = 0;
-        pending_completions[pending_count].has_buf = 0;
-        pending_completions[pending_count].more = 0;
-        pending_completions[pending_count].aux = 0;
-        pending_count++;
+        if (!queue_pending_completion(
+                pending_completions, pending_count, conn_id, IoEventType::Send, -err))
+            return false;
     }
     return true;
 }
 
 bool EpollBackend::add_send_tls(Connection& c, const u8* buf, u32 len) {
     if (!c.tls_active || !c.tls) return add_send(c.fd, c.id, buf, len);
+
+    // TLS may complete, fail, or hit an invalid connection id synchronously;
+    // reserve the one possible completion before the first SSL_write.
+    if (pending_count >= kPendingCap) return false;
 
     SSL* ssl = c.tls;
     const EpollTlsHooks* tls_hooks = get_tls_hooks();
@@ -487,9 +458,8 @@ bool EpollBackend::add_send_tls(Connection& c, const u8* buf, u32 len) {
         i32 ssl_err = tls_hooks->ssl_get_error(ssl, nw);
         if (ssl_err == SSL_ERROR_WANT_READ || ssl_err == SSL_ERROR_WANT_WRITE) {
             if (c.id >= kMaxFdMap) {
-                queue_pending_completion(
-                    pending_completions, pending_count, c.id, IoEventType::Send, -EINVAL, true);
-                return true;
+                return queue_pending_completion(
+                    pending_completions, pending_count, c.id, IoEventType::Send, -EINVAL);
             }
             send_state[c.id] = {buf,
                                 c.fd,
@@ -502,39 +472,32 @@ bool EpollBackend::add_send_tls(Connection& c, const u8* buf, u32 len) {
                 epoll_fd, c.fd, c.id, IoEventType::Send, tls_send_interest_for_error(ssl_err));
             if (rc < 0) {
                 send_state[c.id] = {nullptr, -1, 0, 0, IoEventType::Send, false, 0};
-                queue_pending_completion(
-                    pending_completions, pending_count, c.id, IoEventType::Send, rc, true);
+                if (!queue_pending_completion(
+                        pending_completions, pending_count, c.id, IoEventType::Send, rc))
+                    return false;
             }
             return true;
         }
 
-        if (pending_count < 64) {
-            pending_completions[pending_count].conn_id = c.id;
-            pending_completions[pending_count].type = IoEventType::Send;
-            pending_completions[pending_count].result = map_tls_error(ssl, nw);
-            pending_completions[pending_count].buf_id = 0;
-            pending_completions[pending_count].has_buf = 0;
-            pending_completions[pending_count].more = 0;
-            pending_completions[pending_count].aux = 0;
-            pending_count++;
-        }
-        return true;
+        return queue_pending_completion(pending_completions,
+                                        pending_count,
+                                        c.id,
+                                        IoEventType::Send,
+                                        map_tls_error(ssl, nw));
     }
 
-    if (pending_count < 64) {
-        pending_completions[pending_count].conn_id = c.id;
-        pending_completions[pending_count].type = IoEventType::Send;
-        pending_completions[pending_count].result = static_cast<i32>(len);
-        pending_completions[pending_count].buf_id = 0;
-        pending_completions[pending_count].has_buf = 0;
-        pending_completions[pending_count].more = 0;
-        pending_completions[pending_count].aux = 0;
-        pending_count++;
-    }
-    return true;
+    return queue_pending_completion(pending_completions,
+                                    pending_count,
+                                    c.id,
+                                    IoEventType::Send,
+                                    static_cast<i32>(len));
 }
 
 bool EpollBackend::add_connect(i32 fd, u32 conn_id, const void* addr, u32 addr_len) {
+    // Immediate connect results need one synthetic completion; reserve it
+    // before changing the map or entering the kernel.
+    if (pending_count >= kPendingCap) return false;
+
     if (conn_id < kMaxFdMap) upstream_fd_map[conn_id] = fd;
     i32 rc = connect(fd, static_cast<const struct sockaddr*>(addr), addr_len);
     if (rc == 0) {
@@ -542,15 +505,10 @@ bool EpollBackend::add_connect(i32 fd, u32 conn_id, const void* addr, u32 addr_l
             if (conn_id < kMaxFdMap) upstream_fd_map[conn_id] = -1;
             return false;
         }
-        if (pending_count < 64) {
-            pending_completions[pending_count].conn_id = conn_id;
-            pending_completions[pending_count].type = IoEventType::UpstreamConnect;
-            pending_completions[pending_count].result = 0;
-            pending_completions[pending_count].buf_id = 0;
-            pending_completions[pending_count].has_buf = 0;
-            pending_completions[pending_count].more = 0;
-            pending_completions[pending_count].aux = 0;
-            pending_count++;
+        if (!queue_pending_completion(
+                pending_completions, pending_count, conn_id, IoEventType::UpstreamConnect, 0)) {
+            if (conn_id < kMaxFdMap) upstream_fd_map[conn_id] = -1;
+            return false;
         }
         return true;
     }
@@ -563,15 +521,10 @@ bool EpollBackend::add_connect(i32 fd, u32 conn_id, const void* addr, u32 addr_l
         return true;
     }
 
-    if (pending_count < 64) {
-        pending_completions[pending_count].conn_id = conn_id;
-        pending_completions[pending_count].type = IoEventType::UpstreamConnect;
-        pending_completions[pending_count].result = -errno;
-        pending_completions[pending_count].buf_id = 0;
-        pending_completions[pending_count].has_buf = 0;
-        pending_completions[pending_count].more = 0;
-        pending_completions[pending_count].aux = 0;
-        pending_count++;
+    if (!queue_pending_completion(
+            pending_completions, pending_count, conn_id, IoEventType::UpstreamConnect, -errno)) {
+        if (conn_id < kMaxFdMap) upstream_fd_map[conn_id] = -1;
+        return false;
     }
     return true;
 }
