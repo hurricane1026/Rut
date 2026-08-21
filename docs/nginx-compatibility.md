@@ -17,8 +17,8 @@ Allowed states are `SUPPORTED`, `PARTIAL`, `BLOCKED_BY_RUT`,
 | preserve raw request-target and query | implicit | yes | partial: origin-form forward sends original bytes | pinned query differential; broader normalization untested | PARTIAL |
 | preserve request method and body | implicit | yes | partial: fixed-CL body is staged before connect within one 16 KiB composite slice | RUT exact binary/segmented/boundary tests and pinned generated-RUT binary POST differential | PARTIAL |
 | nginx default upstream HTTP version and request headers | implicit | yes | partial: explicit fixed HTTP/1.1 policy with bounded fixed-CL buffering; #252 | exact RUT tests plus pinned generated-RUT GET and POST differentials | PARTIAL |
-| proxied response status and body | implicit | yes, including method-isolated root HEAD lowering | partial: strict final H1.1 exact-Content-Length streaming plus bounded reusable paired HEAD success/connect-failure serialization; #265 admits malformed/incomplete parser failures through D1/D2, #267/#268 track timeout policy/timing, and #266 tracks nginx HTTP/0.9 fallback | exact converter-generated valid-status/invalid-header and incomplete-header/EOF reusable differentials; public RUT invalid-prefix/open-peer and incomplete/EOF wires; reusable success/connect-failure differentials; internal parser/lifecycle and generated-RUT GET/POST evidence | PARTIAL |
-| nginx default proxied response header policy | implicit | yes, including method-isolated root HEAD lowering | partial: bounded strict H1.1 final-response/content-length serializer and reusable paired HEAD success/connect-failure policy; #265 has narrow malformed/incomplete production admission, #267/#268 track timeout policy/timing, and #266 tracks invalid-status fallback | exact converter-generated valid-status/invalid-header and incomplete-header/EOF reusable differentials; public RUT parser-failure wires; reusable success/failure/no-pool differentials; internal parser/token/lifecycle and generated-RUT GET/POST/close evidence | PARTIAL |
+| proxied response status and body | implicit | yes, including method-isolated root HEAD lowering | partial: strict final H1.1 exact-Content-Length streaming plus bounded reusable paired HEAD success/connect-failure serialization; #265 admits malformed/incomplete parser failures through D1/D2; #267 now carries timeout-policy metadata but runtime selection is zero-byte fail-closed; #268 tracks timing; #266 tracks nginx HTTP/0.9 fallback | exact converter-generated valid-status/invalid-header and incomplete-header/EOF reusable differentials; public RUT invalid-prefix/open-peer and incomplete/EOF wires; reusable success/connect-failure differentials; internal parser/lifecycle and generated-RUT GET/POST evidence | PARTIAL |
+| nginx default proxied response header policy | implicit | yes, including method-isolated root HEAD lowering | partial: bounded strict H1.1 final-response/content-length serializer and reusable paired HEAD success/connect-failure policy; #265 has narrow malformed/incomplete production admission; #267 metadata exists but configured timeout response execution does not; #268 tracks timing; #266 tracks invalid-status fallback | exact converter-generated valid-status/invalid-header and incomplete-header/EOF reusable differentials; public RUT parser-failure wires; reusable success/failure/no-pool differentials; internal parser/token/lifecycle and generated-RUT GET/POST/close evidence | PARTIAL |
 | single unavailable upstream gateway error | implicit | yes | yes for bounded H1 single-IPv4 connect failures; #256 | committed pinned close/EOF differential plus pinned keep-alive and split-POST evidence | SUPPORTED |
 | exact, `^~`, regex, or nested locations | no | no | no nginx selection semantics | no | NOT_PLANNED |
 | exact `/api/` + proxy URI `/`, clean bounded H1 request domain | yes | yes | yes: bounded prefix replacement; #259 closed | pinned converter-generated `/api/`, `/api/x`, and query differentials; four out-of-domain targets fail before upstream | SUPPORTED |
@@ -119,9 +119,12 @@ Allowed states are `SUPPORTED`, `PARTIAL`, `BLOCKED_BY_RUT`,
   An invalid status prefix is different: nginx falls back to HTTP/0.9-style
   close-delimited behavior while RUT rejects immediately, so #266 tracks that
   real gap. The timeout/504 path remains absent: #267 tracks selection of a
-  distinct configured timeout failure response, while #268 tracks per-forward
-  read-timeout timing semantics. The broader failure domain stays unsupported
-  and does not upgrade
+  distinct configured timeout failure response. Its ordinary-RUT metadata now
+  survives compiler/config/JIT and request pinning, but an explicit timeout
+  policy deliberately zero-byte fails closed until runtime serialization and
+  #265 retirement wiring land. #268 separately tracks per-forward read-timeout
+  timing semantics. The broader failure domain stays unsupported and does not
+  upgrade
   #264's narrower normal-success/connect-establishment slice.
 - The reusable HEAD gap previously depended on the generic epoll transport
   capability tracked in #262. Epoll now exposes at most one logical completion
