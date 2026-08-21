@@ -801,7 +801,10 @@ u32 IoUringBackend::wait(IoEvent* events, u32 max_events, Connection* conns, u32
                                                            : send_state[conn_id];
             if (type == IoEventType::UpstreamSend &&
                 (!valid_upstream_episode(upstream_episode) ||
-                 ss.upstream_episode != upstream_episode)) {
+                 ss.upstream_episode != upstream_episode ||
+                 (conns != nullptr &&
+                  (conn_id >= max_conns ||
+                   conns[conn_id].upstream_episode != upstream_episode)))) {
                 // This CQE belongs to a previous upstream episode (or is
                 // malformed). Never apply its byte count to the state now
                 // installed for this connection ID and never resubmit it.

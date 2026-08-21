@@ -15293,18 +15293,17 @@ TEST(iouring_episode, stale_partial_send_does_not_touch_reused_episode_state) {
     auto initialized = backend.init(0, -1);
     if (!initialized) SKIP("io_uring unavailable");
 
-    constexpr u32 kConnId = 3;
+    constexpr u32 kConnId = 0;
     constexpr u32 kOldEpisode = 1;
     constexpr u32 kCurrentEpisode = 2;
-    static const u8 old_payload[] = {'o', 'l', 'd'};
     static const u8 current_payload[] = {'n', 'e', 'w', '!', '!', '!', '!', '!', '!'};
-    // Seed the old state through the production submission helper. The SQE is
-    // intentionally left unsubmitted; the synthetic CQE below is the old
+    // Seed an old SendState through the production submission helper. The SQE
+    // is intentionally left unsubmitted; the synthetic CQE below is the old
     // completion whose accounting behavior this test isolates.
     CHECK(backend.add_send_upstream(-1,
                                     kConnId,
-                                    old_payload,
-                                    sizeof(old_payload),
+                                    current_payload,
+                                    sizeof(current_payload),
                                     kOldEpisode));
     backend.pending = 0;
 
@@ -15313,7 +15312,14 @@ TEST(iouring_episode, stale_partial_send_does_not_touch_reused_episode_state) {
                                              4,
                                              5,
                                              IoEventType::UpstreamSend,
-                                             kCurrentEpisode};
+                                             kOldEpisode};
+    Connection conns[1]{};
+    conns[0].reset();
+    conns[0].id = kConnId;
+    // The live connection has advanced, but the old SendState is still
+    // episode 1. The CQE therefore matches SendState and must be rejected by
+    // the live ConnectionBase episode check.
+    conns[0].upstream_episode = kCurrentEpisode;
     const auto current_before = backend.upstream_send_state[kConnId];
     const u32 sq_tail_before = __atomic_load_n(backend.sq_tail, __ATOMIC_ACQUIRE);
     const u32 cq_tail = __atomic_load_n(backend.cq_tail, __ATOMIC_ACQUIRE);
@@ -15326,7 +15332,7 @@ TEST(iouring_episode, stale_partial_send_does_not_touch_reused_episode_state) {
     __atomic_store_n(backend.cq_tail, cq_tail + 1, __ATOMIC_RELEASE);
 
     IoEvent events[8]{};
-    const u32 count = backend.wait(events, 8, nullptr, 0);
+    const u32 count = backend.wait(events, 8, conns, 1);
     REQUIRE_EQ(count, 1u);
     CHECK_EQ(events[0].type, IoEventType::UpstreamSend);
     CHECK_EQ(events[0].result, -ESTALE);
@@ -15347,7 +15353,7 @@ TEST(iouring_episode, current_partial_send_resubmits_with_current_episode) {
     auto initialized = backend.init(0, -1);
     if (!initialized) SKIP("io_uring unavailable");
 
-    constexpr u32 kConnId = 3;
+    constexpr u32 kConnId = 0;
     constexpr u32 kEpisode = 7;
     static const u8 payload[] = {'c', 'u', 'r', 'r', 'e', 'n', 't'};
     backend.pending = 0;
@@ -15357,6 +15363,10 @@ TEST(iouring_episode, current_partial_send_resubmits_with_current_episode) {
                                              sizeof(payload),
                                              IoEventType::UpstreamSend,
                                              kEpisode};
+    Connection conns[1]{};
+    conns[0].reset();
+    conns[0].id = kConnId;
+    conns[0].upstream_episode = kEpisode;
     const u32 sq_tail_before = __atomic_load_n(backend.sq_tail, __ATOMIC_ACQUIRE);
     const u32 cq_tail = __atomic_load_n(backend.cq_tail, __ATOMIC_ACQUIRE);
     auto& cqe = backend.cq_entries[cq_tail & *backend.cq_ring_mask];
@@ -15367,7 +15377,7 @@ TEST(iouring_episode, current_partial_send_resubmits_with_current_episode) {
     __atomic_store_n(backend.cq_tail, cq_tail + 1, __ATOMIC_RELEASE);
 
     IoEvent events[8]{};
-    CHECK_EQ(backend.wait(events, 8, nullptr, 0), 0u);
+    CHECK_EQ(backend.wait(events, 8, conns, 1), 0u);
     CHECK_EQ(backend.upstream_send_state[kConnId].offset, 2u);
     CHECK_EQ(backend.upstream_send_state[kConnId].remaining,
              static_cast<u32>(sizeof(payload) - 2));
