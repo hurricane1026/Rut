@@ -18369,6 +18369,94 @@ bool add_paired_head_failure_policies(RouteConfig& config) {
     return config.add_failure_policy(failure) == 1;
 }
 
+bool add_paired_head_timeout_policies(RouteConfig& config) {
+    ForwardResponsePolicySpec response{};
+    response.version = ResponsePolicyVersion::Http11;
+    response.framing = ResponsePolicyFraming::ContentLength;
+    response.connection = ResponsePolicyConnection::Request;
+    response.date = ResponsePolicyDate::Current;
+    response.head_mode = ResponsePolicyHeadMode::SuppressBody;
+    response.server = {"rut-timeout-test", 16};
+    if (config.add_response_policy(response) != 1) return false;
+
+    ForwardFailurePolicySpec failure{};
+    failure.version = ForwardFailurePolicyVersion::Http11;
+    failure.status_code = 502;
+    failure.date = ForwardFailurePolicyDate::Current;
+    failure.connection = ForwardFailurePolicyConnection::Request;
+    failure.head_mode = FailurePolicyHeadMode::SuppressBody;
+    failure.reason = {"Bad Gateway", 11};
+    failure.content_type = {"text/plain", 10};
+    failure.server = {"rut-timeout-test", 16};
+    failure.body = {"default representation", 22};
+    if (config.add_failure_policy(failure) != 1) return false;
+
+    ForwardFailurePolicySpec timeout = failure;
+    timeout.status_code = 504;
+    timeout.reason = {"Gateway Time-out", 16};
+    timeout.body = {"timeout", 7};
+    if (config.add_failure_policy(timeout) != 2) return false;
+    return config.add_policy_bundle(1, 1, 2) == 1;
+}
+
+bool stage_strict_read_timeout(IoUringEventLoop* loop,
+                               const RouteConfig* request_config,
+                               const u8* late_downstream,
+                               u32 late_downstream_len,
+                               PrebuiltD2Fixture* out) {
+    if (loop == nullptr || request_config == nullptr || out == nullptr ||
+        request_config->upstream_count == 0)
+        return false;
+    Connection* conn = loop->alloc_conn();
+    if (conn == nullptr || !loop->alloc_upstream_buf(*conn) ||
+        !loop->alloc_response_header_buf(*conn))
+        return false;
+    i32 downstream[2] = {-1, -1};
+    i32 upstream[2] = {-1, -1};
+    if (socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, downstream) != 0 ||
+        socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, upstream) != 0)
+        return false;
+    conn->fd = downstream[0];
+    out->peer_fd = downstream[1];
+    conn->upstream_fd = upstream[0];
+    close(upstream[1]);
+
+    static constexpr u8 kRequest[] = "HEAD /one HTTP/1.1\r\nHost: old.example\r\n\r\n";
+    if (conn->recv_buf.write(kRequest, sizeof(kRequest) - 1u) != sizeof(kRequest) - 1u)
+        return false;
+    capture_request_metadata(*conn);
+    conn->req_initial_send_len = conn->recv_buf.len();
+    conn->recv_buf.reset();
+    if (late_downstream_len != 0 &&
+        (late_downstream == nullptr ||
+         conn->recv_buf.write(late_downstream, late_downstream_len) != late_downstream_len))
+        return false;
+
+    conn->upstream_episode = out->episode;
+    conn->recv_armed = true;
+    conn->upstream_recv_armed = true;
+    conn->pending_ops = 2;
+    conn->set_slots(nullptr, nullptr, &on_upstream_response<IoUringEventLoop>, nullptr);
+    conn->request_config = request_config;
+    conn->response_policy_id = 1;
+    conn->response_policy_suppress_body = true;
+    conn->failure_policy_id = 1;
+    conn->timeout_failure_policy_id = 2;
+    conn->failure_policy_suppress_body = true;
+    conn->request_upload_complete = true;
+    conn->keep_alive = true;
+    conn->req_start_us = monotonic_us();
+    conn->upstream_start_us = monotonic_us();
+    conn->upstream_idx = 0;
+    conn->state = ConnState::Proxying;
+    conn->req_body_mode = BodyMode::None;
+    conn->resp_body_mode = BodyMode::None;
+    out->sq_tail_before = __atomic_load_n(loop->backend.sq_tail, __ATOMIC_ACQUIRE);
+    out->backend_pending_before = loop->backend.pending;
+    out->conn = conn;
+    return true;
+}
+
 bool stage_strict_parse_failure(IoUringEventLoop* loop,
                                 const RouteConfig* request_config,
                                 const u8* origin,
@@ -19360,6 +19448,486 @@ TEST(iouring_parse_failure, non_admissible_causes_and_upload_state_close_before_
         fixture.peer_fd = -1;
         fixture.conn = nullptr;
     }
+}
+
+TEST(iouring_timeout_policy, explicit_serializer_selects_timeout_without_mutating_ids) {
+    RouteConfig config{};
+    REQUIRE(add_paired_head_timeout_policies(config));
+    Connection conn{};
+    conn.keep_alive = true;
+    conn.req_client_keep_alive = true;
+    conn.failure_policy_id = 1;
+    conn.timeout_failure_policy_id = 2;
+    u8 default_wire[512]{};
+    u8 timeout_wire[512]{};
+    u32 default_len = 0;
+    u32 timeout_len = 0;
+
+    REQUIRE(build_failure_policy_response(
+        conn, config, true, default_wire, sizeof(default_wire), &default_len));
+    REQUIRE(build_timeout_failure_policy_response(
+        conn, config, true, timeout_wire, sizeof(timeout_wire), &timeout_len));
+    CHECK(buf_has(default_wire, default_len, "HTTP/1.1 502 Bad Gateway\r\n"));
+    CHECK(buf_has(default_wire, default_len, "Content-Length: 22\r\n"));
+    CHECK_FALSE(buf_has(default_wire, default_len, "default representation"));
+    CHECK(buf_has(timeout_wire, timeout_len, "HTTP/1.1 504 Gateway Time-out\r\n"));
+    CHECK(buf_has(timeout_wire, timeout_len, "Content-Length: 7\r\n"));
+    CHECK_FALSE(buf_has(timeout_wire, timeout_len, "\r\n\r\ntimeout"));
+    CHECK_EQ(conn.failure_policy_id, 1u);
+    CHECK_EQ(conn.timeout_failure_policy_id, 2u);
+
+    timeout_len = 99;
+    CHECK_FALSE(
+        build_timeout_failure_policy_response(conn, config, true, timeout_wire, 8, &timeout_len));
+    CHECK_EQ(timeout_len, 0u);
+    CHECK_EQ(conn.failure_policy_id, 1u);
+    CHECK_EQ(conn.timeout_failure_policy_id, 2u);
+}
+
+TEST(iouring_timeout_policy, production_jit_forward_reaches_recv_only_timer_admission) {
+    ScopedIoUringLoopForRetirement guard;
+    if (!guard.init()) SKIP("io_uring unavailable");
+    auto* loop = guard.loop;
+    loop->keepalive_timeout = 1;
+    // Production Connect/Send dispatch refreshes the request timer with this
+    // value. Zero deliberately places that real node in the next wheel slot;
+    // the test then expires the node through the ordinary Timeout dispatch.
+    loop->upstream_timeout = 0;
+
+    RouteConfig config{};
+    const auto upstream = config.add_upstream("backend", 0x7F000001, 9000);
+    REQUIRE(upstream.has_value());
+    config.upstreams[upstream.value()].max_inflight = 1;
+    REQUIRE(add_paired_head_timeout_policies(config));
+    const RouteConfig* active = &config;
+    ShardEpoch epoch{};
+    epoch.epoch.store(1, std::memory_order_relaxed);
+    ShardMetrics metrics{};
+    metrics.init();
+    metrics.requests_active = 1;
+    UpstreamConcurrency concurrency{};
+    concurrency.reset();
+    loop->config_ptr = &active;
+    loop->epoch = &epoch;
+    loop->metrics = &metrics;
+    loop->upstream_cc = &concurrency;
+
+    Connection* conn = loop->alloc_conn();
+    REQUIRE(conn != nullptr);
+    i32 downstream[2] = {-1, -1};
+    REQUIRE_EQ(socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, downstream), 0);
+    conn->fd = downstream[0];
+    static constexpr u8 kRequest[] = "HEAD /one HTTP/1.1\r\nHost: old.example\r\n\r\n";
+    REQUIRE_EQ(conn->recv_buf.write(kRequest, sizeof(kRequest) - 1u), sizeof(kRequest) - 1u);
+    capture_request_metadata(*conn);
+    REQUIRE_EQ(conn->req_method, static_cast<u8>(LogHttpMethod::Head));
+    REQUIRE_EQ(conn->req_http_version, static_cast<u8>(HttpVersion::Http11));
+    REQUIRE(conn->req_client_keep_alive);
+    REQUIRE_EQ(conn->req_client_connection_count, 0u);
+    conn->keep_alive = true;
+    conn->req_start_us = monotonic_us();
+    conn->request_config = &config;
+    conn->state = ConnState::ExecHandler;
+
+    const u32 sq_tail_before = __atomic_load_n(loop->backend.sq_tail, __ATOMIC_ACQUIRE);
+    const u32 backend_pending_before = loop->backend.pending;
+    // A parsed request reaches handler dispatch with its multishot downstream
+    // Recv still live. Submit it through the production loop instead of
+    // assigning recv_armed/pending_ops in the fixture.
+    REQUIRE(loop->submit_recv(*conn));
+    JitDispatchOutcome outcome{};
+    outcome.kind = JitDispatchOutcome::Kind::Forward;
+    outcome.upstream_id = upstream.value();
+    outcome.policy_bundle_id = 1;
+    handle_jit_outcome<IoUringEventLoop>(loop, *conn, outcome, nullptr, true);
+
+    REQUIRE_EQ(conn->state, ConnState::Proxying);
+    REQUIRE_EQ(conn->response_policy_id, 1u);
+    REQUIRE_EQ(conn->failure_policy_id, 1u);
+    REQUIRE_EQ(conn->timeout_failure_policy_id, 2u);
+    REQUIRE(conn->response_policy_suppress_body);
+    REQUIRE(conn->failure_policy_suppress_body);
+    REQUIRE(conn->upstream_connect_armed);
+    REQUIRE_FALSE(conn->upstream_send_armed);
+    REQUIRE_FALSE(conn->upstream_recv_armed);
+    REQUIRE(conn->recv_armed);
+    REQUIRE_EQ(conn->pending_ops, 2u);  // downstream Recv + upstream Connect
+    REQUIRE(conn->upstream_slot_held);
+    REQUIRE_EQ(conn->upstream_slot_uid, upstream.value());
+    REQUIRE_EQ(concurrency.inflight[upstream.value()].load(std::memory_order_relaxed), 1u);
+
+    auto harvest_upstream = [&](IoEventType type, i32 result, IoEvent* out) {
+        const u32 tail = __atomic_load_n(loop->backend.cq_tail, __ATOMIC_ACQUIRE);
+        auto& cqe = loop->backend.cq_entries[tail & *loop->backend.cq_ring_mask];
+        cqe.user_data =
+            IoUringBackend::encode_upstream_user_data(conn->id, type, conn->upstream_episode);
+        cqe.res = result;
+        cqe.flags = 0;
+        __atomic_store_n(loop->backend.cq_tail, tail + 1u, __ATOMIC_RELEASE);
+        // Keep this focused test deterministic: the SQEs were produced by the
+        // real loop and their connection ownership remains live, but the fake
+        // CQE is harvested without submitting the test's unconnected socket.
+        loop->backend.pending = 0;
+        IoEvent events[2]{};
+        const u32 count = loop->backend.wait(events, 2, loop->conns, IoUringEventLoop::kMaxConns);
+        if (count != 1) return false;
+        *out = events[0];
+        return true;
+    };
+
+    const u32 episode = conn->upstream_episode;
+    IoEvent connected{};
+    REQUIRE(harvest_upstream(IoEventType::UpstreamConnect, 0, &connected));
+    REQUIRE_EQ(connected.upstream_episode, episode);
+    loop->dispatch(connected);
+    REQUIRE_FALSE(conn->upstream_connect_armed);
+    REQUIRE(conn->upstream_send_armed);
+    REQUIRE_FALSE(conn->upstream_recv_armed);
+    REQUIRE_EQ(conn->on_upstream_send, &on_upstream_request_sent<IoUringEventLoop>);
+    REQUIRE_EQ(conn->on_upstream_recv, &on_early_upstream_recvd_send_inflight<IoUringEventLoop>);
+    REQUIRE_EQ(conn->pending_ops, 2u);  // downstream Recv + upstream Send
+
+    const u32 request_wire_len = loop->backend.upstream_send_state[conn->id].remaining;
+    REQUIRE_EQ(request_wire_len, static_cast<u32>(sizeof(kRequest) - 1u));
+    IoEvent request_sent{};
+    REQUIRE(harvest_upstream(
+        IoEventType::UpstreamSend, static_cast<i32>(request_wire_len), &request_sent));
+    REQUIRE_EQ(request_sent.upstream_episode, episode);
+    loop->dispatch(request_sent);
+
+    // These are the decisive timeout admission facts. They must all be
+    // consequences of Forward -> Connect -> complete UpstreamSend, not fixture
+    // assignments, so a production transition regression makes this test fail.
+    REQUIRE(conn->request_upload_complete);
+    REQUIRE_FALSE(conn->upstream_request_incomplete);
+    REQUIRE_EQ(conn->retry_req_send_len, 0u);
+    REQUIRE_FALSE(conn->response_mutations_snapshotted);
+    REQUIRE_FALSE(conn->upstream_connect_armed);
+    REQUIRE_FALSE(conn->upstream_send_armed);
+    REQUIRE(conn->upstream_recv_armed);
+    REQUIRE_EQ(conn->on_upstream_send, nullptr);
+    REQUIRE_EQ(conn->on_upstream_recv, &on_upstream_response<IoUringEventLoop>);
+    REQUIRE_EQ(conn->pending_ops, static_cast<u32>(conn->recv_armed) + 1u);
+    REQUIRE_EQ(loop->backend.upstream_send_state[conn->id].remaining, 0u);
+    REQUIRE_EQ(conn->recv_buf.len(), 0u);
+    REQUIRE_EQ(conn->upstream_recv_buf.len(), 0u);
+    REQUIRE_EQ(conn->response_header_buf.len(), 0u);
+    REQUIRE_NE(conn->timer_node.next, &conn->timer_node);
+
+    loop->dispatch({0, 1, 0, 0, IoEventType::Timeout, 0});
+    REQUIRE_EQ(conn->http1_prebuilt_disposition, Http1RequestBufferDisposition::ExistingPipeline);
+    REQUIRE_EQ(conn->http1_prebuilt_wait, kHttp1WaitHeaderSend | kHttp1WaitUpstreamRetirement);
+    REQUIRE_EQ(conn->upstream_retiring_episode, episode);
+    REQUIRE_EQ(conn->upstream_retirement_target_owned, kUpstreamOpRecv);
+    REQUIRE_EQ(conn->upstream_retirement_cancel_owned, kUpstreamOpRecv);
+    REQUIRE_EQ(conn->resp_status, 504u);
+    REQUIRE(buf_has(conn->response_header_buf.data(),
+                    conn->response_header_buf.len(),
+                    "HTTP/1.1 504 Gateway Time-out\r\n"));
+    REQUIRE(buf_has(conn->response_header_buf.data(),
+                    conn->response_header_buf.len(),
+                    "Content-Length: 7\r\n"));
+    REQUIRE(buf_has(conn->response_header_buf.data(),
+                    conn->response_header_buf.len(),
+                    "Connection: keep-alive\r\n"));
+    REQUIRE_FALSE(buf_has(
+        conn->response_header_buf.data(), conn->response_header_buf.len(), "\r\n\r\ntimeout"));
+    REQUIRE_EQ(concurrency.inflight[upstream.value()].load(std::memory_order_relaxed), 0u);
+
+    complete_prebuilt_d2_header(loop, *conn);
+    drain_prebuilt_d2_retirement(loop, *conn, kUpstreamOpRecv, false);
+    REQUIRE(conn->http1_boundary_ready);
+    loop->resume_deferred_http1_boundaries();
+    REQUIRE_EQ(conn->state, ConnState::ReadingHeader);
+
+    PrebuiltD2Fixture fixture{};
+    fixture.conn = conn;
+    fixture.peer_fd = downstream[1];
+    fixture.sq_tail_before = sq_tail_before;
+    fixture.backend_pending_before = backend_pending_before;
+    cleanup_prebuilt_d2(loop, fixture);
+}
+
+TEST(iouring_timeout_policy, recv_only_timer_uses_d2_and_resumes_once_after_batch) {
+    static constexpr u8 kRequest2[] =
+        "GET /two HTTP/1.1\r\nHost: new.example\r\nConnection: close\r\n\r\n";
+    for (bool header_first : {true, false}) {
+        ScopedIoUringLoopForRetirement guard;
+        if (!guard.init()) SKIP("io_uring unavailable");
+        auto* loop = guard.loop;
+        loop->keepalive_timeout = 1;
+
+        RouteConfig old_config{};
+        const auto upstream = old_config.add_upstream("backend", 0x7F000001, 9000);
+        REQUIRE(upstream.has_value());
+        old_config.upstreams[upstream.value()].max_inflight = 1;
+        REQUIRE(add_paired_head_timeout_policies(old_config));
+        RouteConfig current_config{};
+        REQUIRE(current_config.add_static("/two", 0, header_first ? 226 : 227));
+        const RouteConfig* active = &current_config;
+        ShardEpoch epoch{};
+        epoch.epoch.store(1, std::memory_order_relaxed);
+        ShardMetrics metrics{};
+        metrics.init();
+        metrics.requests_active = 1;
+        UpstreamConcurrency concurrency{};
+        concurrency.reset();
+        REQUIRE(concurrency.try_acquire(0, 1));
+        loop->config_ptr = &active;
+        loop->epoch = &epoch;
+        loop->metrics = &metrics;
+        loop->upstream_cc = &concurrency;
+
+        PrebuiltD2Fixture fixture{};
+        REQUIRE(stage_strict_read_timeout(loop, &old_config, nullptr, 0, &fixture));
+        Connection& conn = *fixture.conn;
+        conn.upstream_slot_held = true;
+        conn.upstream_slot_uid = 0;
+        loop->timer.add(&conn, 0);
+        loop->dispatch({0, 1, 0, 0, IoEventType::Timeout, 0});
+
+        REQUIRE_EQ(conn.http1_prebuilt_disposition,
+                   Http1RequestBufferDisposition::ExistingPipeline);
+        REQUIRE_EQ(conn.http1_prebuilt_wait, kHttp1WaitHeaderSend | kHttp1WaitUpstreamRetirement);
+        CHECK_EQ(conn.resp_status, 504u);
+        CHECK_EQ(conn.failure_policy_id, 1u);
+        CHECK_EQ(conn.timeout_failure_policy_id, 2u);
+        CHECK(buf_has(conn.response_header_buf.data(),
+                      conn.response_header_buf.len(),
+                      "HTTP/1.1 504 Gateway Time-out\r\n"));
+        CHECK(buf_has(conn.response_header_buf.data(),
+                      conn.response_header_buf.len(),
+                      "Content-Length: 7\r\n"));
+        CHECK(buf_has(conn.response_header_buf.data(),
+                      conn.response_header_buf.len(),
+                      "Connection: keep-alive\r\n"));
+        CHECK_FALSE(buf_has(
+            conn.response_header_buf.data(), conn.response_header_buf.len(), "\r\n\r\ntimeout"));
+        CHECK_EQ(conn.upstream_retirement_target_owned, kUpstreamOpRecv);
+        CHECK_EQ(conn.upstream_retirement_cancel_owned, kUpstreamOpRecv);
+        CHECK_EQ(conn.pending_ops, 4u);
+        CHECK_FALSE(conn.upstream_slot_held);
+        CHECK_EQ(concurrency.inflight[0].load(std::memory_order_relaxed), 0u);
+        CHECK_NE(conn.timer_node.next, &conn.timer_node);
+        CHECK_NE(conn.timer_node.prev, &conn.timer_node);
+
+        IoEvent buffered{};
+        REQUIRE(harvest_http1_boundary_recv(loop,
+                                            conn,
+                                            kRequest2,
+                                            sizeof(kRequest2) - 1u,
+                                            sizeof(kRequest2) - 1u,
+                                            true,
+                                            &buffered));
+        loop->dispatch(buffered);
+        CHECK_EQ(conn.handler_gen, 0u);
+        CHECK_EQ(metrics.requests_total, 0u);
+
+        if (header_first)
+            complete_prebuilt_d2_header(loop, conn);
+        else
+            drain_prebuilt_d2_retirement(loop, conn, kUpstreamOpRecv, true);
+        CHECK_FALSE(conn.http1_boundary_ready);
+        CHECK_EQ(conn.handler_gen, 0u);
+        if (header_first)
+            drain_prebuilt_d2_retirement(loop, conn, kUpstreamOpRecv, false);
+        else
+            complete_prebuilt_d2_header(loop, conn);
+        REQUIRE(conn.http1_boundary_ready);
+        CHECK_EQ(metrics.requests_total, 1u);
+        CHECK_EQ(metrics.requests_active, 0u);
+        CHECK(conn.epoch_held);
+        CHECK_EQ(conn.handler_gen, 0u);
+
+        loop->resume_deferred_http1_boundaries();
+        CHECK_EQ(conn.handler_gen, 1u);
+        CHECK_EQ(conn.resp_status, header_first ? 226u : 227u);
+        CHECK_EQ(conn.request_config, &current_config);
+        CHECK_FALSE(conn.epoch_held);
+        CHECK_EQ(epoch.epoch.load(std::memory_order_acquire), 3u);
+        const u32 pending = conn.pending_ops;
+        loop->dispatch(
+            {conn.id, -ECANCELED, 0, 0, IoEventType::UpstreamRecv, 0, 0, fixture.episode});
+        loop->dispatch({conn.id,
+                        -ENOENT,
+                        0,
+                        0,
+                        IoEventType::UpstreamRecv,
+                        0,
+                        kUpstreamRetirementCancelAux,
+                        fixture.episode});
+        CHECK_EQ(conn.pending_ops, pending);
+        const u32 generation = conn.handler_gen;
+        loop->resume_deferred_http1_boundaries();
+        CHECK_EQ(conn.handler_gen, generation);
+        cleanup_prebuilt_d2(loop, fixture);
+    }
+}
+
+TEST(iouring_timeout_policy, unsupported_read_phases_close_before_any_header_send) {
+    enum class Mutant : u8 {
+        NoRecvOwner,
+        MixedOwner,
+        NonemptyResponse,
+        UploadIncomplete,
+        WrongCallback,
+        InvalidTimeoutStatus,
+        MismatchedHeadMode,
+        HeaderCapacity,
+        InvalidEpisode,
+        ZeroKeepaliveTimeout,
+    };
+    const Mutant mutants[] = {Mutant::NoRecvOwner,
+                              Mutant::MixedOwner,
+                              Mutant::NonemptyResponse,
+                              Mutant::UploadIncomplete,
+                              Mutant::WrongCallback,
+                              Mutant::InvalidTimeoutStatus,
+                              Mutant::MismatchedHeadMode,
+                              Mutant::HeaderCapacity,
+                              Mutant::InvalidEpisode,
+                              Mutant::ZeroKeepaliveTimeout};
+    for (Mutant mutant : mutants) {
+        ScopedIoUringLoopForRetirement guard;
+        if (!guard.init()) SKIP("io_uring unavailable");
+        auto* loop = guard.loop;
+        loop->keepalive_timeout = 1;
+        RouteConfig config{};
+        const auto upstream = config.add_upstream("backend", 0x7F000001, 9000);
+        REQUIRE(upstream.has_value());
+        config.upstreams[upstream.value()].max_inflight = 1;
+        REQUIRE(add_paired_head_timeout_policies(config));
+        UpstreamConcurrency concurrency{};
+        concurrency.reset();
+        REQUIRE(concurrency.try_acquire(0, 1));
+        loop->upstream_cc = &concurrency;
+        PrebuiltD2Fixture fixture{};
+        REQUIRE(stage_strict_read_timeout(loop, &config, nullptr, 0, &fixture));
+        Connection& conn = *fixture.conn;
+        const u32 id = conn.id;
+        conn.upstream_slot_held = true;
+        conn.upstream_slot_uid = 0;
+        switch (mutant) {
+            case Mutant::NoRecvOwner:
+                conn.upstream_recv_armed = false;
+                conn.pending_ops = 1;
+                break;
+            case Mutant::MixedOwner:
+                conn.upstream_connect_armed = true;
+                conn.on_upstream_send = &boundary_current_callback<IoUringEventLoop>;
+                conn.pending_ops = 3;
+                break;
+            case Mutant::NonemptyResponse:
+                REQUIRE_EQ(conn.upstream_recv_buf.write(reinterpret_cast<const u8*>("x"), 1), 1u);
+                break;
+            case Mutant::UploadIncomplete:
+                conn.request_upload_complete = false;
+                break;
+            case Mutant::WrongCallback:
+                conn.on_upstream_recv = &boundary_current_callback<IoUringEventLoop>;
+                break;
+            case Mutant::InvalidTimeoutStatus:
+                config.failure_policies[1].status_code = 600;
+                break;
+            case Mutant::MismatchedHeadMode:
+                config.failure_policies[1].head_mode = FailurePolicyHeadMode::Reject;
+                break;
+            case Mutant::HeaderCapacity:
+                conn.response_header_buf.bind(conn.response_header_slice, 8);
+                break;
+            case Mutant::InvalidEpisode:
+                conn.upstream_episode = 0;
+                break;
+            case Mutant::ZeroKeepaliveTimeout:
+                loop->keepalive_timeout = 0;
+                break;
+        }
+        CHECK_EQ(conn.timer_node.next, &conn.timer_node);
+        const u32 sq_tail = __atomic_load_n(loop->backend.sq_tail, __ATOMIC_ACQUIRE);
+        respond_upstream_timeout(loop, conn);
+
+        Connection& closed = loop->conns[id];
+        CHECK_EQ(closed.fd, -1);
+        CHECK_EQ(closed.response_header_buf.len(), 0u);
+        CHECK_EQ(closed.http1_prebuilt_disposition, Http1RequestBufferDisposition::None);
+        CHECK_EQ(loop->backend.send_state[id].remaining, 0u);
+        CHECK_EQ(concurrency.inflight[0].load(std::memory_order_relaxed), 0u);
+        CHECK_EQ(closed.timer_node.next, &closed.timer_node);
+        CHECK_GE(__atomic_load_n(loop->backend.sq_tail, __ATOMIC_ACQUIRE), sq_tail);
+        u8 byte = 0;
+        CHECK_EQ(recv(fixture.peer_fd, &byte, 1, MSG_DONTWAIT), 0);
+        close(fixture.peer_fd);
+        fixture.peer_fd = -1;
+        fixture.conn = nullptr;
+    }
+}
+
+TEST(iouring_timeout_policy, timer_rearm_bounds_a_stuck_rendezvous) {
+    ScopedIoUringLoopForRetirement guard;
+    if (!guard.init()) SKIP("io_uring unavailable");
+    auto* loop = guard.loop;
+    loop->keepalive_timeout = 1;
+    RouteConfig config{};
+    const auto upstream = config.add_upstream("backend", 0x7F000001, 9000);
+    REQUIRE(upstream.has_value());
+    REQUIRE(add_paired_head_timeout_policies(config));
+    ShardEpoch epoch{};
+    epoch.epoch.store(1, std::memory_order_relaxed);
+    ShardMetrics metrics{};
+    metrics.init();
+    metrics.requests_active = 1;
+    loop->epoch = &epoch;
+    loop->metrics = &metrics;
+    PrebuiltD2Fixture fixture{};
+    REQUIRE(stage_strict_read_timeout(loop, &config, nullptr, 0, &fixture));
+    Connection& conn = *fixture.conn;
+    const u32 id = conn.id;
+    const u32 free_before = loop->free_top;
+    loop->timer.add(&conn, 0);
+    loop->dispatch({0, 1, 0, 0, IoEventType::Timeout, 0});
+    REQUIRE_EQ(conn.http1_prebuilt_wait, kHttp1WaitHeaderSend | kHttp1WaitUpstreamRetirement);
+    CHECK_NE(conn.timer_node.next, &conn.timer_node);
+
+    // The next tick reaches the one-second deadline rearmed by the timeout
+    // caller. No rendezvous owner completed, so it closes without request 2.
+    loop->dispatch({0, 1, 0, 0, IoEventType::Timeout, 0});
+    Connection& closed = loop->conns[id];
+    CHECK_EQ(closed.fd, -1);
+    CHECK_EQ(metrics.requests_total, 0u);
+    CHECK_EQ(closed.http1_boundary_ready, false);
+    CHECK_EQ(loop->pending_free_count, 1u);
+
+    __atomic_store_n(loop->backend.sq_tail, fixture.sq_tail_before, __ATOMIC_RELEASE);
+    loop->backend.pending = fixture.backend_pending_before;
+    drain_prebuilt_d2_retirement(loop, closed, kUpstreamOpRecv, false);
+    loop->dispatch({id, -ECANCELED, 0, 0, IoEventType::Send, 0});
+    loop->dispatch({id, -ENOENT, 0, 0, IoEventType::Send, 0});
+    loop->dispatch({id, -ECANCELED, 0, 0, IoEventType::Recv, 0});
+    loop->dispatch({id, -ENOENT, 0, 0, IoEventType::Recv, 0});
+    CHECK_EQ(loop->pending_free_count, 0u);
+    CHECK_EQ(loop->free_top, free_before + 1u);
+    close(fixture.peer_fd);
+    fixture.peer_fd = -1;
+    fixture.conn = nullptr;
+}
+
+TEST(timeout_policy, explicit_policy_epoll_remains_zero_byte_fail_closed) {
+    auto loop = std::make_unique<EpollEventLoop>();
+    REQUIRE(loop->init(0, -1).has_value());
+    Connection* conn = loop->alloc_conn();
+    REQUIRE(conn != nullptr);
+    const u32 id = conn->id;
+    conn->fd = dup(STDERR_FILENO);
+    REQUIRE_GE(conn->fd, 0);
+    conn->state = ConnState::Proxying;
+    conn->timeout_failure_policy_id = 2;
+
+    respond_upstream_timeout(loop.get(), *conn);
+
+    CHECK_EQ(loop->conns[id].fd, -1);
+    CHECK_EQ(loop->conns[id].send_buf.len(), 0u);
+    CHECK_EQ(loop->conns[id].state, ConnState::Idle);
+    loop->shutdown();
 }
 
 TEST(iouring_episode, upstream_submissions_carry_episode_and_aux) {

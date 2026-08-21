@@ -14,15 +14,16 @@
 #include "rut/runtime/rate_limit.h"
 #include "rut/runtime/rate_limit_enforce.h"
 #include "rut/runtime/route_table.h"
-#include "rut/runtime/slice_pool.h"   // SlicePool::kSliceSize (terminate reassembly cap)
+#include "rut/runtime/slice_pool.h"  // SlicePool::kSliceSize (terminate reassembly cap)
+#include "rut/runtime/timer_wheel.h"
 #include "rut/runtime/tls_iouring.h"  // tls_fill_output / TlsFill for the io_uring-TLS proxy path
 #include "rut/runtime/traffic_capture.h"
 #include "rut/runtime/upstream_pool.h"
 #include "rut/runtime/ws_terminate.h"  // ws_inspect for terminate-mode tunnels
-
-#include <errno.h>
-#include <arpa/inet.h>
 #include <ctime>
+
+#include <arpa/inet.h>
+#include <errno.h>
 #include <openssl/rand.h>  // RAND_bytes — fresh outbound mask-key seed (terminate mode)
 #include <sys/socket.h>
 #include <unistd.h>
@@ -530,6 +531,12 @@ inline bool response_policy_suppress_head_admitted(
     const Connection& conn,
     const ForwardResponsePolicySpec& policy,
     bool paired_failure);
+inline bool build_timeout_failure_policy_response(const Connection& conn,
+                                                  const RouteConfig& config,
+                                                  bool suppress_body,
+                                                  u8* out,
+                                                  u32 out_cap,
+                                                  u32* out_len);
 template <typename Loop>
 inline void reject_request_policy(Loop* loop, Connection& conn);
 template <typename Loop>
@@ -571,11 +578,13 @@ void on_request_policy_body_recvd(void* lp, Connection& conn, IoEvent ev);
 template <typename Loop>
 void resume_jit_handler(Loop* loop, Connection& conn);
 
-// Emit 504 Gateway Timeout for a proxying connection whose upstream stalled.
-// Defined below; forward-declared so the per-shard timer tick (in the event
-// loop headers) can call it.
+// Handle a proxying connection whose upstream deadline expired. Explicit
+// timeout policy is selected only in the bounded D2 domain below; policy-free
+// requests retain the legacy close-only 504.
 template <typename Loop>
 void respond_upstream_timeout(Loop* loop, Connection& conn);
+template <typename Loop>
+inline bool try_prebuilt_strict_read_timeout(Loop* loop, Connection& conn);
 
 template <typename Loop>
 void pipeline_dispatch(Loop* loop, Connection& conn);
@@ -2754,28 +2763,156 @@ bool try_connect_next_backend(Loop* loop, Connection& conn) {
     return false;
 }
 
-// The upstream timed out before any response bytes reached the client → emit
-// 504 Gateway Timeout and tear down the upstream side. Called from the timer
-// tick for a proxying connection past its upstream deadline (and only while
-// proxy_resp_started is false — once response bytes are in flight we can't
-// inject a new status, so the tick closes instead). Safe w.r.t. in-flight
-// upstream I/O: closing the upstream fd + upstream_abandoned makes dispatch
-// ignore late upstream CQEs, and transition_to_sending clears the upstream
-// slots so only the client-send callback runs.
+// Admit only the first bounded timeout-policy runtime slice: a complete,
+// bodyless paired HEAD request has reached the strict upstream-header read and
+// the one exact live upstream Recv has produced no byte. Everything else keeps
+// the explicit-policy zero-byte fail-close contract.
+template <typename Loop>
+inline bool try_prebuilt_strict_read_timeout(Loop* loop, Connection& conn) {
+    if constexpr (!requires(Loop* candidate, Connection& c) {
+                      candidate->begin_prebuilt_http1_response(
+                          c, u8{}, Http1RequestBufferDisposition::ExistingPipeline, u32{});
+                  }) {
+        return false;
+    } else {
+        const RouteConfig* config = conn.request_config;
+        if (config == nullptr || conn.response_policy_id == 0 || conn.failure_policy_id == 0 ||
+            conn.timeout_failure_policy_id == 0 ||
+            !config->response_policy_id_is_valid(conn.response_policy_id) ||
+            !config->failure_policy_id_is_valid(conn.failure_policy_id) ||
+            !config->timeout_failure_policy_id_is_valid(conn.timeout_failure_policy_id))
+            return false;
+
+        const auto& response = config->response_policies[conn.response_policy_id - 1];
+        const auto& failure = config->failure_policies[conn.failure_policy_id - 1];
+        const auto& timeout = config->failure_policies[conn.timeout_failure_policy_id - 1];
+        if (response.version != ResponsePolicyVersion::Http11 ||
+            response.framing != ResponsePolicyFraming::ContentLength ||
+            response.connection != ResponsePolicyConnection::Request ||
+            response.head_mode != ResponsePolicyHeadMode::SuppressBody ||
+            failure.version != ForwardFailurePolicyVersion::Http11 ||
+            failure.status_code != kStatusBadGateway ||
+            failure.connection != ForwardFailurePolicyConnection::Request ||
+            failure.head_mode != FailurePolicyHeadMode::SuppressBody ||
+            timeout.version != ForwardFailurePolicyVersion::Http11 ||
+            timeout.connection != ForwardFailurePolicyConnection::Request ||
+            timeout.head_mode != FailurePolicyHeadMode::SuppressBody ||
+            !conn.response_policy_suppress_body || !conn.failure_policy_suppress_body)
+            return false;
+
+        // The original request bytes were removed after the complete upload, so
+        // use the pinned admission latch plus captured request facts instead of
+        // re-running response_policy_suppress_head_admitted against recv_buf.
+        if (conn.protocol != ConnProtocol::Http11 || conn.tls_active ||
+            conn.req_http_version != static_cast<u8>(HttpVersion::Http11) ||
+            conn.req_method != static_cast<u8>(LogHttpMethod::Head) || !conn.keep_alive ||
+            !conn.req_keep_alive || !conn.req_client_keep_alive ||
+            conn.req_client_connection_close || conn.req_client_connection_close_exact ||
+            conn.req_client_connection_count != 0 || conn.req_client_has_content_length ||
+            conn.req_client_has_transfer_encoding || conn.req_client_has_te ||
+            conn.req_client_has_expect || conn.req_client_has_upgrade_header ||
+            conn.req_malformed || conn.req_wants_upgrade || conn.req_path_canon.ptr == nullptr ||
+            conn.req_body_mode != BodyMode::None || conn.req_body_remaining != 0 ||
+            conn.request_body_fully_buffered || conn.req_body_streamed ||
+            conn.req_header_override_count != 0 || conn.req_header_override_overflow ||
+            conn.resp_header_mutation_count != 0 || conn.resp_header_mutation_pending_count != 0 ||
+            conn.resp_header_mutation_pending_overflow || conn.resp_header_mutation_overflow)
+            return false;
+
+        if (conn.state != ConnState::Proxying || conn.req_start_us == 0 || conn.epoch_held ||
+            loop->is_draining() || conn.is_health_probe || conn.pending_handler_fn != nullptr ||
+            conn.yield_armed || conn.yield_timeout_armed || conn.throttle_paused ||
+            conn.upstream_abandoned || conn.upstream_reused || !conn.request_upload_complete ||
+            conn.upstream_request_incomplete || conn.proxy_resp_started || conn.resp_status != 0 ||
+            conn.resp_body_mode != BodyMode::None || conn.resp_body_remaining != 0 ||
+            conn.resp_body_sent != 0 || conn.upstream_send_len != 0 || conn.send_progress != 0 ||
+            conn.send_armed || conn.on_send != nullptr || conn.on_recv != nullptr ||
+            conn.upstream_recv_buf.len() != 0 || conn.response_header_buf.is_released() ||
+            !conn.response_header_buf.valid() || conn.response_header_buf.len() != 0 ||
+            conn.upstream_fd < 0 || conn.upstream_start_us == 0 ||
+            !valid_upstream_episode(conn.upstream_episode) || conn.upstream_episode_quarantined ||
+            !conn.upstream_recv_armed || conn.on_upstream_recv != &on_upstream_response<Loop> ||
+            conn.upstream_connect_armed || conn.upstream_send_armed ||
+            conn.on_upstream_send != nullptr || conn.retry_req_send_len != 0 ||
+            conn.response_mutations_snapshotted || conn.pipeline_depth != 0 ||
+            conn.recv_paused_for_send || conn.recv_pause_cancel_pending ||
+            conn.recv_pause_rearm_pending || conn.upstream_recv_paused_for_send ||
+            conn.upstream_recv_pause_cancel_pending || conn.upstream_recv_pause_rearm_pending ||
+            conn.upstream_recv_cancel_inflight || conn.upstream_recv_terminal_stale ||
+            conn.upstream_retirement_active || conn.upstream_retirement_target_owned != 0 ||
+            conn.upstream_retirement_cancel_owned != 0 ||
+            conn.upstream_retirement_cancel_retry != 0 || conn.upstream_close_episode != 0 ||
+            conn.upstream_close_target_owned != 0 || conn.upstream_close_cancel_owned != 0 ||
+            conn.upstream_close_pause_cancel_owned || conn.http1_boundary_deferred ||
+            conn.http1_boundary_ready || conn.http1_boundary_successor_episode != 0 ||
+            conn.http1_prebuilt_wait != 0 ||
+            conn.http1_prebuilt_disposition != Http1RequestBufferDisposition::None ||
+            conn.http1_prebuilt_request_prefix_len != 0 ||
+            conn.pending_ops != static_cast<u32>(conn.recv_armed) + 1u ||
+            loop->keepalive_timeout == 0 || loop->keepalive_timeout >= TimerWheel::kSlots)
+            return false;
+
+        if (conn.upstream_idx >= config->upstream_count) return false;
+        const auto& target = config->upstreams[conn.upstream_idx];
+        const bool exact_slot =
+            target.max_inflight == 0
+                ? !conn.upstream_slot_held
+                : conn.upstream_slot_held && conn.upstream_slot_uid == conn.upstream_idx;
+        if (!exact_slot) return false;
+
+        u8 scratch[SlicePool::kSliceSize];
+        u32 header_len = 0;
+        if (!build_timeout_failure_policy_response(conn,
+                                                   *config,
+                                                   /*suppress_body=*/true,
+                                                   scratch,
+                                                   sizeof(scratch),
+                                                   &header_len) ||
+            header_len == 0 || header_len > conn.response_header_buf.capacity())
+            return false;
+
+        conn.response_header_buf.reset();
+        if (conn.response_header_buf.write(scratch, header_len) != header_len) {
+            loop->close_conn(conn);
+            return true;
+        }
+        conn.resp_status = timeout.status_code;
+        conn.resp_body_mode = BodyMode::None;
+        conn.resp_body_remaining = 0;
+        conn.resp_body_sent = 0;
+        conn.upstream_send_len = 0;
+        if (!loop->begin_prebuilt_http1_response(conn,
+                                                 kUpstreamOpRecv,
+                                                 Http1RequestBufferDisposition::ExistingPipeline,
+                                                 conn.retry_req_send_len)) {
+            if (conn.fd >= 0) loop->close_conn(conn);
+            return true;
+        }
+
+        // This D2 originates from the wheel expiry itself, whose tick removed
+        // the node before entering this helper. Bound a stuck HeaderSend or
+        // retirement without changing the generic parser-error D2 timer policy.
+        loop->timer.refresh(&conn, loop->keepalive_timeout);
+        return true;
+    }
+}
+
+// Handle a proxying connection past its upstream deadline (only while
+// proxy_resp_started is false). Explicit timeout policy uses the bounded
+// Recv-only D1/D2 path above; policy-free traffic retains the legacy 504.
 template <typename Loop>
 void respond_upstream_timeout(Loop* loop, Connection& conn) {
-    // The additive timeout-policy metadata is carried end-to-end, but its
-    // configured serializer/retirement rendezvous is a later #267 increment.
-    // Never silently substitute the legacy hard-coded 504 (or the default 502)
-    // for an explicitly selected policy: close with zero downstream bytes.
+    // The additive timeout-policy metadata now has one bounded runtime caller:
+    // Recv-only, read-before-bytes paired HEAD through D1/D2. Never silently
+    // substitute the legacy hard-coded 504 (or the default 502) outside it:
+    // unsupported explicit-policy phases close with zero downstream bytes.
     if (conn.timeout_failure_policy_id != 0) {
-        loop->close_conn(conn);
+        if (!try_prebuilt_strict_read_timeout(loop, conn) && conn.fd >= 0) loop->close_conn(conn);
         return;
     }
-    // Until #265 supplies a generic all-I/O abandonment rendezvous, a paired
-    // reusable HEAD may serialize only establishment failures. Timeout can
-    // still own any mix of connect/send/recv SQEs, so let close_conn's exact
-    // close ledger drain them without publishing downstream bytes.
+    // Paired timeout states outside the exact configured Recv-only slice can
+    // still own connect/send or other unsupported transport phases. Let
+    // close_conn's exact ledger drain them without publishing bytes.
     if (conn.failure_policy_suppress_body) {
         loop->close_conn(conn);
         return;
@@ -5805,18 +5942,15 @@ inline bool response_policy_suppress_head_admitted(
 inline u32 strict_response_dec(char* out, u32 value);
 inline u32 strict_response_date(char* out, u64 now_us);
 
-inline bool build_failure_policy_response(const Connection& conn,
-                                          const RouteConfig& config,
-                                          bool suppress_body,
-                                          u8* out,
-                                          u32 out_cap,
-                                          u32* out_len) {
+inline bool build_failure_policy_response_from_spec(const Connection& conn,
+                                                    const ForwardFailurePolicySpec& policy,
+                                                    bool suppress_body,
+                                                    u8* out,
+                                                    u32 out_cap,
+                                                    u32* out_len) {
     if (out_len == nullptr) return false;
     *out_len = 0;
-    if (out == nullptr || conn.failure_policy_id == 0 ||
-        !config.failure_policy_id_is_valid(conn.failure_policy_id))
-        return false;
-    const auto& policy = config.failure_policies[conn.failure_policy_id - 1];
+    if (out == nullptr) return false;
     u32 pos = 0;
     auto put = [&](const u8* data, u32 len) {
         if ((data == nullptr && len != 0) ||
@@ -5857,6 +5991,43 @@ inline bool build_failure_policy_response(const Connection& conn,
         return false;
     *out_len = pos;
     return true;
+}
+
+inline bool build_failure_policy_response(const Connection& conn,
+                                          const RouteConfig& config,
+                                          bool suppress_body,
+                                          u8* out,
+                                          u32 out_cap,
+                                          u32* out_len) {
+    if (out_len != nullptr) *out_len = 0;
+    if (conn.failure_policy_id == 0 || !config.failure_policy_id_is_valid(conn.failure_policy_id))
+        return false;
+    return build_failure_policy_response_from_spec(
+        conn,
+        config.failure_policies[conn.failure_policy_id - 1],
+        suppress_body,
+        out,
+        out_cap,
+        out_len);
+}
+
+inline bool build_timeout_failure_policy_response(const Connection& conn,
+                                                  const RouteConfig& config,
+                                                  bool suppress_body,
+                                                  u8* out,
+                                                  u32 out_cap,
+                                                  u32* out_len) {
+    if (out_len != nullptr) *out_len = 0;
+    if (conn.timeout_failure_policy_id == 0 ||
+        !config.timeout_failure_policy_id_is_valid(conn.timeout_failure_policy_id))
+        return false;
+    return build_failure_policy_response_from_spec(
+        conn,
+        config.failure_policies[conn.timeout_failure_policy_id - 1],
+        suppress_body,
+        out,
+        out_cap,
+        out_len);
 }
 
 template <typename Loop>
