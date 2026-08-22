@@ -18756,6 +18756,45 @@ bool add_response_read_deadline_bundle(RouteConfig& config, u8 seconds = 5) {
            config.add_policy_bundle(1, 1, 2, seconds) == 2;
 }
 
+IoEvent response_read_copy_event(
+    const Connection& conn, i32 result, bool more, u32 begin, u32 end) {
+    IoEvent event{conn.id,
+                  result,
+                  0,
+                  0,
+                  IoEventType::UpstreamRecv,
+                  static_cast<u8>(more),
+                  0,
+                  conn.upstream_episode};
+    event.copy_witness = IoEventCopyWitness::Full;
+    event.copy_deadline_generation = conn.response_read_deadline_generation;
+    event.copy_begin = begin;
+    event.copy_end = end;
+    return event;
+}
+
+bool arm_staged_response_read_deadline(IoUringEventLoop* loop,
+                                       PrebuiltD2Fixture& fixture,
+                                       u8 seconds = 5) {
+    if (loop == nullptr || fixture.conn == nullptr ||
+        !fixture.conn->next_response_read_deadline_generation())
+        return false;
+    Connection& conn = *fixture.conn;
+    conn.upstream_attempts = 1;
+    conn.response_read_deadline_bundle_id = 2;
+    conn.response_read_deadline_seconds = seconds;
+    conn.response_read_deadline_upstream_episode = conn.upstream_episode;
+    conn.response_read_deadline_state = ResponseReadDeadlineState::Armed;
+    loop->timer.add(&conn, seconds);
+    return true;
+}
+
+void release_closed_response_read_fixture(PrebuiltD2Fixture& fixture) {
+    if (fixture.peer_fd >= 0) close(fixture.peer_fd);
+    fixture.peer_fd = -1;
+    fixture.conn = nullptr;
+}
+
 bool stage_strict_read_timeout(IoUringEventLoop* loop,
                                const RouteConfig* request_config,
                                const u8* late_downstream,
@@ -20167,14 +20206,8 @@ TEST(response_read_deadline, matching_response_wins_expiry_in_both_batch_orders)
                    sizeof(kOrigin) - 1u);
 
         const IoEvent timeout{0, 1, 0, 0, IoEventType::Timeout, 0};
-        const IoEvent response{conn.id,
-                               static_cast<i32>(sizeof(kOrigin) - 1u),
-                               0,
-                               0,
-                               IoEventType::UpstreamRecv,
-                               1,
-                               0,
-                               fixture.episode};
+        const IoEvent response = response_read_copy_event(
+            conn, static_cast<i32>(sizeof(kOrigin) - 1u), true, 0, sizeof(kOrigin) - 1u);
         const IoEvent events[2] = {timeout_first ? timeout : response,
                                    timeout_first ? response : timeout};
         loop->dispatch_batch(events, 2);
@@ -20274,7 +20307,7 @@ TEST(response_read_deadline, batch_expiry_revalidates_the_authoritative_bundle) 
     fixture.conn = nullptr;
 }
 
-TEST(response_read_deadline, incomplete_first_batch_closes_without_rearm_or_wire_bytes) {
+TEST(response_read_deadline, fragmented_f_more_headers_refresh_then_complete_cross_batch) {
     ScopedIoUringLoopForRetirement guard;
     if (!guard.init()) SKIP("io_uring unavailable");
     auto* loop = guard.loop;
@@ -20295,36 +20328,29 @@ TEST(response_read_deadline, incomplete_first_batch_closes_without_rearm_or_wire
     REQUIRE_EQ(fixture.conn->upstream_recv_buf.write(kPartial, sizeof(kPartial) - 1u),
                sizeof(kPartial) - 1u);
     const u32 sq_tail = __atomic_load_n(loop->backend.sq_tail, __ATOMIC_ACQUIRE);
-    const IoEvent partial{id,
-                          static_cast<i32>(sizeof(kPartial) - 1u),
-                          0,
-                          0,
-                          IoEventType::UpstreamRecv,
-                          1,
-                          0,
-                          episode};
+    const IoEvent partial = response_read_copy_event(
+        *fixture.conn, static_cast<i32>(sizeof(kPartial) - 1u), true, 0, sizeof(kPartial) - 1u);
     loop->dispatch_batch(&partial, 1);
 
-    Connection& closed = loop->conns[id];
-    CHECK_EQ(closed.fd, -1);
-    CHECK_EQ(closed.response_read_deadline_state, ResponseReadDeadlineState::None);
-    CHECK_EQ(closed.response_header_buf.len(), 0u);
-    CHECK_EQ(loop->backend.send_state[id].remaining, 0u);
-    CHECK_EQ(closed.upstream_close_episode, episode);
-    CHECK_EQ(closed.upstream_close_target_owned, kUpstreamOpRecv);
-    CHECK_EQ(closed.upstream_close_cancel_owned, kUpstreamOpRecv);
-    __atomic_store_n(loop->backend.sq_tail, sq_tail, __ATOMIC_RELEASE);
-    loop->backend.pending = fixture.backend_pending_before;
-    loop->dispatch({id, -ECANCELED, 0, 0, IoEventType::UpstreamRecv, 0, 0, episode});
-    loop->dispatch(
-        {id, -ENOENT, 0, 0, IoEventType::UpstreamRecv, 0, kUpstreamCloseCancelAux, episode});
-    loop->dispatch({id, -ECANCELED, 0, 0, IoEventType::Recv, 0});
-    loop->dispatch({id, -ENOENT, 0, 0, IoEventType::Recv, 0});
-    u8 byte = 0;
-    CHECK_EQ(recv(fixture.peer_fd, &byte, 1, MSG_DONTWAIT), 0);
-    close(fixture.peer_fd);
-    fixture.peer_fd = -1;
-    fixture.conn = nullptr;
+    Connection& conn = loop->conns[id];
+    CHECK_GE(conn.fd, 0);
+    CHECK_EQ(conn.response_read_deadline_state, ResponseReadDeadlineState::Armed);
+    CHECK(conn.upstream_recv_armed);
+    CHECK_EQ(__atomic_load_n(loop->backend.sq_tail, __ATOMIC_ACQUIRE), sq_tail);
+    CHECK_EQ(conn.response_header_buf.len(), 0u);
+    CHECK_EQ(conn.timer_node.prev, &loop->timer.slots[5]);
+
+    static constexpr u8 kFinish[] = "\r\n";
+    const u32 begin = conn.upstream_recv_buf.len();
+    REQUIRE_EQ(conn.upstream_recv_buf.write(kFinish, sizeof(kFinish) - 1u), sizeof(kFinish) - 1u);
+    const IoEvent finish = response_read_copy_event(
+        conn, static_cast<i32>(sizeof(kFinish) - 1u), true, begin, conn.upstream_recv_buf.len());
+    loop->dispatch_batch(&finish, 1);
+    CHECK_EQ(conn.response_read_deadline_state, ResponseReadDeadlineState::None);
+    CHECK_EQ(conn.resp_status, 200u);
+    CHECK(conn.upstream_abandoned);
+    CHECK_GT(conn.response_header_buf.len(), 0u);
+    cleanup_prebuilt_d2(loop, fixture);
 }
 
 TEST(response_read_deadline, terminal_first_batch_handles_complete_error_and_incomplete_once) {
@@ -20361,38 +20387,27 @@ TEST(response_read_deadline, terminal_first_batch_handles_complete_error_and_inc
         REQUIRE_EQ(fixture.conn->upstream_recv_buf.write(vector.origin, vector.origin_len),
                    vector.origin_len);
         const u32 sq_tail = __atomic_load_n(loop->backend.sq_tail, __ATOMIC_ACQUIRE);
-        const IoEvent response{id,
-                               static_cast<i32>(vector.origin_len),
-                               0,
-                               0,
-                               IoEventType::UpstreamRecv,
-                               0,
-                               0,
-                               episode};
+        const IoEvent response = response_read_copy_event(
+            *fixture.conn, static_cast<i32>(vector.origin_len), false, 0, vector.origin_len);
         loop->dispatch_batch(&response, 1);
 
         Connection& result = loop->conns[id];
-        CHECK_EQ(result.response_read_deadline_state, ResponseReadDeadlineState::None);
-        CHECK_FALSE(result.response_read_deadline_first_batch);
         if (vector.expected_status != 0) {
+            CHECK_EQ(result.response_read_deadline_state, ResponseReadDeadlineState::None);
+            CHECK_FALSE(result.response_read_deadline_first_batch);
             CHECK_EQ(result.fd >= 0, true);
             CHECK_EQ(result.resp_status, vector.expected_status);
             CHECK_GT(result.response_header_buf.len(), 0u);
             cleanup_prebuilt_d2(loop, fixture);
             continue;
         }
-        CHECK_EQ(result.fd, -1);
+        CHECK_GE(result.fd, 0);
+        CHECK_EQ(result.response_read_deadline_state, ResponseReadDeadlineState::Armed);
+        CHECK(result.upstream_recv_armed);
         CHECK_EQ(result.response_header_buf.len(), 0u);
         CHECK_EQ(loop->backend.send_state[id].remaining, 0u);
-        __atomic_store_n(loop->backend.sq_tail, sq_tail, __ATOMIC_RELEASE);
-        loop->backend.pending = fixture.backend_pending_before;
-        loop->dispatch({id, -ECANCELED, 0, 0, IoEventType::Recv, 0});
-        loop->dispatch({id, -ENOENT, 0, 0, IoEventType::Recv, 0});
-        u8 byte = 0;
-        CHECK_EQ(recv(fixture.peer_fd, &byte, 1, MSG_DONTWAIT), 0);
-        close(fixture.peer_fd);
-        fixture.peer_fd = -1;
-        fixture.conn = nullptr;
+        CHECK_EQ(__atomic_load_n(loop->backend.sq_tail, __ATOMIC_ACQUIRE), sq_tail + 1u);
+        cleanup_prebuilt_d2(loop, fixture);
     }
 }
 
@@ -20555,6 +20570,669 @@ TEST(response_read_deadline, stale_owner_never_wins_and_client_close_reclaims_on
         fixture.peer_fd = -1;
         fixture.conn = nullptr;
     }
+}
+
+TEST(response_read_deadline, backend_copy_witness_is_atomic_and_reused_slots_clear) {
+    // Non-io_uring producers can never manufacture deadline-copy evidence,
+    // even when the caller deliberately poisons a reused destination slot.
+    MockBackend mock{};
+    REQUIRE(mock.init(0, -1).has_value());
+    mock.inject({7, 1, 0, 0, IoEventType::Recv, 1});
+    IoEvent neutral{};
+    neutral.copy_witness = IoEventCopyWitness::Full;
+    neutral.copy_deadline_generation = 99;
+    neutral.copy_begin = 11;
+    neutral.copy_end = 12;
+    REQUIRE_EQ(mock.wait(&neutral, 1), 1u);
+    CHECK_EQ(neutral.copy_witness, IoEventCopyWitness::None);
+    CHECK_EQ(neutral.copy_deadline_generation, 0u);
+    CHECK_EQ(neutral.copy_begin, 0u);
+    CHECK_EQ(neutral.copy_end, 0u);
+
+    EpollBackend epoll{};
+    REQUIRE(epoll.init(0, -1).has_value());
+    Connection epoll_conn{};
+    epoll_conn.reset();
+    epoll_conn.id = 0;
+    epoll_conn.upstream_episode = 7;
+    REQUIRE(epoll.begin_upstream_episode(0, 7));
+    REQUIRE(epoll.add_recv_upstream(-1, 0, 7));
+    neutral.copy_witness = IoEventCopyWitness::Full;
+    neutral.copy_deadline_generation = 99;
+    neutral.copy_begin = 11;
+    neutral.copy_end = 12;
+    REQUIRE_EQ(epoll.wait(&neutral, 1, &epoll_conn, 1), 1u);
+    CHECK_EQ(neutral.copy_witness, IoEventCopyWitness::None);
+    CHECK_EQ(neutral.copy_deadline_generation, 0u);
+    CHECK_EQ(neutral.copy_begin, 0u);
+    CHECK_EQ(neutral.copy_end, 0u);
+    epoll.shutdown();
+
+    ScopedIoUringLoopForRetirement guard;
+    if (!guard.init()) SKIP("io_uring unavailable");
+    auto* loop = guard.loop;
+    RouteConfig config{};
+    REQUIRE(config.add_upstream("backend", 0x7F000001, 9000).has_value());
+    REQUIRE(add_response_read_deadline_bundle(config));
+    PrebuiltD2Fixture fixture{};
+    REQUIRE(stage_strict_read_timeout(loop, &config, nullptr, 0, &fixture));
+    REQUIRE(arm_staged_response_read_deadline(loop, fixture));
+    Connection& conn = *fixture.conn;
+    const u16 buf_id = 13;
+    static constexpr u8 kFragment[] = "HTTP/1.1";
+    __builtin_memcpy(loop->backend.buf_base + static_cast<u64>(buf_id) * 4096,
+                     kFragment,
+                     sizeof(kFragment) - 1u);
+    auto inject_cqe = [&](i32 result, u32 flags, u32 event_episode = 0, u8 aux = 0) {
+        const u32 tail = __atomic_load_n(loop->backend.cq_tail, __ATOMIC_ACQUIRE);
+        auto& cqe = loop->backend.cq_entries[tail & *loop->backend.cq_ring_mask];
+        cqe.user_data = IoUringBackend::encode_upstream_user_data(
+            conn.id,
+            IoEventType::UpstreamRecv,
+            event_episode == 0 ? conn.upstream_episode : event_episode,
+            aux);
+        cqe.res = result;
+        cqe.flags = flags;
+        __atomic_store_n(loop->backend.cq_tail, tail + 1u, __ATOMIC_RELEASE);
+        loop->backend.pending = 0;
+    };
+    inject_cqe(static_cast<i32>(sizeof(kFragment) - 1u),
+               IORING_CQE_F_BUFFER | IORING_CQE_F_MORE |
+                   (static_cast<u32>(buf_id) << IORING_CQE_BUFFER_SHIFT));
+    neutral.copy_witness = IoEventCopyWitness::Invalid;
+    neutral.copy_deadline_generation = 77;
+    REQUIRE_EQ(loop->backend.wait(&neutral, 1, loop->conns, IoUringEventLoop::kMaxConns), 1u);
+    CHECK_EQ(neutral.copy_witness, IoEventCopyWitness::Full);
+    CHECK_EQ(neutral.copy_deadline_generation, conn.response_read_deadline_generation);
+    CHECK_EQ(neutral.copy_begin, 0u);
+    CHECK_EQ(neutral.copy_end, sizeof(kFragment) - 1u);
+    CHECK_EQ(conn.upstream_recv_buf.len(), sizeof(kFragment) - 1u);
+
+    // A kernel result cannot authorize reading beyond the one selected
+    // provided buffer, even when the destination has ample capacity.
+    const u32 before_oversized = conn.upstream_recv_buf.len();
+    inject_cqe(static_cast<i32>(kProvidedBufSize + 1u),
+               IORING_CQE_F_BUFFER | IORING_CQE_F_MORE |
+                   (static_cast<u32>(buf_id) << IORING_CQE_BUFFER_SHIFT));
+    REQUIRE_EQ(loop->backend.wait(&neutral, 1, loop->conns, IoUringEventLoop::kMaxConns), 1u);
+    CHECK_EQ(neutral.result, -ENOBUFS);
+    CHECK_EQ(neutral.copy_witness, IoEventCopyWitness::Invalid);
+    CHECK_EQ(conn.upstream_recv_buf.len(), before_oversized);
+
+    // A matching active owner whose callback/transport state is ineligible
+    // cannot fall back to the legacy partial-copy rule. Leave exactly two
+    // bytes of capacity and request four: zero bytes must move.
+    REQUIRE_GT(conn.upstream_recv_buf.write_avail(), 2u);
+    conn.upstream_recv_buf.commit(conn.upstream_recv_buf.write_avail() - 2u);
+    const u32 before_ineligible = conn.upstream_recv_buf.len();
+    conn.upstream_recv_paused_for_send = true;
+    inject_cqe(4,
+               IORING_CQE_F_BUFFER | IORING_CQE_F_MORE |
+                   (static_cast<u32>(buf_id) << IORING_CQE_BUFFER_SHIFT));
+    REQUIRE_EQ(loop->backend.wait(&neutral, 1, loop->conns, IoUringEventLoop::kMaxConns), 1u);
+    CHECK_EQ(neutral.result, -ENOBUFS);
+    CHECK_EQ(neutral.copy_witness, IoEventCopyWitness::Invalid);
+    CHECK_EQ(conn.upstream_recv_buf.len(), before_ineligible);
+    conn.upstream_recv_paused_for_send = false;
+
+    // Capacity failure copies no prefix: the cumulative length is unchanged
+    // and the CQE is unusable evidence rather than a partial success.
+    conn.upstream_recv_buf.commit(conn.upstream_recv_buf.write_avail());
+    const u32 full_len = conn.upstream_recv_buf.len();
+    loop->backend.buf_base[static_cast<u64>(buf_id) * 4096] = 'x';
+    inject_cqe(1,
+               IORING_CQE_F_BUFFER | IORING_CQE_F_MORE |
+                   (static_cast<u32>(buf_id) << IORING_CQE_BUFFER_SHIFT));
+    REQUIRE_EQ(loop->backend.wait(&neutral, 1, loop->conns, IoUringEventLoop::kMaxConns), 1u);
+    CHECK_EQ(neutral.result, -ENOBUFS);
+    CHECK_EQ(neutral.copy_witness, IoEventCopyWitness::Invalid);
+    CHECK_EQ(conn.upstream_recv_buf.len(), full_len);
+
+    inject_cqe(1,
+               IORING_CQE_F_BUFFER | IORING_CQE_F_MORE |
+                   (static_cast<u32>(buf_id) << IORING_CQE_BUFFER_SHIFT),
+               conn.upstream_episode - 1u);
+    REQUIRE_EQ(loop->backend.wait(&neutral, 1, loop->conns, IoUringEventLoop::kMaxConns), 1u);
+    CHECK_EQ(neutral.result, 1);
+    CHECK_EQ(neutral.copy_witness, IoEventCopyWitness::Invalid);
+    CHECK_EQ(neutral.copy_deadline_generation, conn.response_read_deadline_generation);
+    CHECK_EQ(conn.upstream_recv_buf.len(), full_len);
+
+    inject_cqe(-ECANCELED, 0);
+    REQUIRE_EQ(loop->backend.wait(&neutral, 1, loop->conns, IoUringEventLoop::kMaxConns), 1u);
+    CHECK_EQ(neutral.copy_witness, IoEventCopyWitness::Invalid);
+    CHECK_EQ(neutral.copy_deadline_generation, conn.response_read_deadline_generation);
+
+    // A subsequent terminal CQE has no copy witness and clears every poisoned
+    // range field in the same reused output slot.
+    neutral.copy_witness = IoEventCopyWitness::Full;
+    neutral.copy_deadline_generation = 88;
+    neutral.copy_begin = 3;
+    neutral.copy_end = 4;
+    inject_cqe(0, 0);
+    REQUIRE_EQ(loop->backend.wait(&neutral, 1, loop->conns, IoUringEventLoop::kMaxConns), 1u);
+    CHECK_EQ(neutral.copy_witness, IoEventCopyWitness::None);
+    CHECK_EQ(neutral.copy_deadline_generation, 0u);
+    CHECK_EQ(neutral.copy_begin, 0u);
+    CHECK_EQ(neutral.copy_end, 0u);
+    cleanup_prebuilt_d2(loop, fixture);
+}
+
+TEST(response_read_deadline, batch_ledger_rejects_ranges_terminals_and_cancel_zero_byte) {
+    enum class Shape : u8 {
+        Gap,
+        Overlap,
+        FinalLength,
+        TerminalBeforePositive,
+        DuplicateTerminal,
+        TerminalThenCancel,
+        Cancel
+    };
+    for (const Shape shape : {Shape::Gap,
+                              Shape::Overlap,
+                              Shape::FinalLength,
+                              Shape::TerminalBeforePositive,
+                              Shape::DuplicateTerminal,
+                              Shape::TerminalThenCancel,
+                              Shape::Cancel}) {
+        ScopedIoUringLoopForRetirement guard;
+        if (!guard.init()) SKIP("io_uring unavailable");
+        auto* loop = guard.loop;
+        RouteConfig config{};
+        REQUIRE(config.add_upstream("backend", 0x7F000001, 9000).has_value());
+        REQUIRE(add_response_read_deadline_bundle(config));
+        PrebuiltD2Fixture fixture{};
+        REQUIRE(stage_strict_read_timeout(loop, &config, nullptr, 0, &fixture));
+        REQUIRE(arm_staged_response_read_deadline(loop, fixture));
+        Connection& conn = *fixture.conn;
+        const u32 id = conn.id;
+        const u32 episode = conn.upstream_episode;
+        static constexpr u8 kBytes[] = "ab";
+        if (shape == Shape::Gap || shape == Shape::Overlap || shape == Shape::FinalLength ||
+            shape == Shape::TerminalBeforePositive)
+            REQUIRE_EQ(conn.upstream_recv_buf.write(kBytes, sizeof(kBytes) - 1u),
+                       sizeof(kBytes) - 1u);
+
+        IoEvent events[2]{};
+        if (shape == Shape::Gap || shape == Shape::Overlap) {
+            events[0] = response_read_copy_event(conn, 1, true, 0, 1);
+            events[1] = response_read_copy_event(
+                conn, 1, true, shape == Shape::Gap ? 2u : 0u, shape == Shape::Gap ? 3u : 1u);
+        } else if (shape == Shape::FinalLength) {
+            events[0] = response_read_copy_event(conn, 1, true, 0, 1);
+        } else if (shape == Shape::TerminalBeforePositive) {
+            events[0] = {id, 0, 0, 0, IoEventType::UpstreamRecv, 0, 0, episode};
+            events[1] = response_read_copy_event(conn, 2, true, 0, 2);
+        } else if (shape == Shape::DuplicateTerminal) {
+            events[0] = {id, 0, 0, 0, IoEventType::UpstreamRecv, 0, 0, episode};
+            events[1] = {id, -ECONNRESET, 0, 0, IoEventType::UpstreamRecv, 0, 0, episode};
+        } else if (shape == Shape::TerminalThenCancel) {
+            events[0] = {id, 0, 0, 0, IoEventType::UpstreamRecv, 0, 0, episode};
+            events[1] = {
+                id, -ECANCELED, 0, 0, IoEventType::UpstreamRecv, 0, kPauseCancelAux, episode};
+        } else {
+            events[0] = {
+                id, -ECANCELED, 0, 0, IoEventType::UpstreamRecv, 0, kPauseCancelAux, episode};
+        }
+        loop->dispatch_batch(events,
+                             shape == Shape::Cancel || shape == Shape::FinalLength ? 1u : 2u);
+        const Connection& closed = loop->conns[id];
+        CHECK_EQ(closed.fd, -1);
+        CHECK_EQ(closed.response_read_deadline_state, ResponseReadDeadlineState::None);
+        CHECK_EQ(closed.response_header_buf.len(), 0u);
+        CHECK_EQ(loop->backend.send_state[id].remaining, 0u);
+        u8 byte = 0;
+        CHECK_EQ(recv(fixture.peer_fd, &byte, 1, MSG_DONTWAIT), 0);
+        release_closed_response_read_fixture(fixture);
+    }
+}
+
+TEST(response_read_deadline, interleaved_owners_parse_once_and_downstream_terminal_vetoes) {
+    {
+        ScopedIoUringLoopForRetirement guard;
+        if (!guard.init()) SKIP("io_uring unavailable");
+        auto* loop = guard.loop;
+        RouteConfig config{};
+        REQUIRE(config.add_upstream("backend", 0x7F000001, 9000).has_value());
+        REQUIRE(add_response_read_deadline_bundle(config));
+        PrebuiltD2Fixture a{};
+        PrebuiltD2Fixture b{};
+        REQUIRE(stage_strict_read_timeout(loop, &config, nullptr, 0, &a));
+        REQUIRE(stage_strict_read_timeout(loop, &config, nullptr, 0, &b));
+        REQUIRE(arm_staged_response_read_deadline(loop, a));
+        REQUIRE(arm_staged_response_read_deadline(loop, b));
+        static constexpr u8 kComplete[] = "HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n";
+        static constexpr u32 kSplit = 12;
+        REQUIRE_EQ(a.conn->upstream_recv_buf.write(kComplete, sizeof(kComplete) - 1u),
+                   sizeof(kComplete) - 1u);
+        REQUIRE_EQ(b.conn->upstream_recv_buf.write(kComplete, sizeof(kComplete) - 1u),
+                   sizeof(kComplete) - 1u);
+        const IoEvent events[] = {
+            response_read_copy_event(*a.conn, kSplit, true, 0, kSplit),
+            response_read_copy_event(
+                *b.conn, sizeof(kComplete) - 1u, true, 0, sizeof(kComplete) - 1u),
+            response_read_copy_event(
+                *a.conn, sizeof(kComplete) - 1u - kSplit, true, kSplit, sizeof(kComplete) - 1u),
+        };
+        loop->dispatch_batch(events, 3);
+        CHECK_EQ(a.conn->resp_status, 200u);
+        CHECK_EQ(b.conn->resp_status, 200u);
+        CHECK(a.conn->upstream_abandoned);
+        CHECK(b.conn->upstream_abandoned);
+        CHECK_EQ(a.conn->response_read_deadline_state, ResponseReadDeadlineState::None);
+        CHECK_EQ(b.conn->response_read_deadline_state, ResponseReadDeadlineState::None);
+        cleanup_prebuilt_d2(loop, a);
+        cleanup_prebuilt_d2(loop, b);
+    }
+
+    for (const bool client_first : {false, true}) {
+        ScopedIoUringLoopForRetirement guard;
+        if (!guard.init()) SKIP("io_uring unavailable");
+        auto* loop = guard.loop;
+        RouteConfig config{};
+        REQUIRE(config.add_upstream("backend", 0x7F000001, 9000).has_value());
+        REQUIRE(add_response_read_deadline_bundle(config));
+        PrebuiltD2Fixture fixture{};
+        REQUIRE(stage_strict_read_timeout(loop, &config, nullptr, 0, &fixture));
+        REQUIRE(arm_staged_response_read_deadline(loop, fixture));
+        const u32 id = fixture.conn->id;
+        static constexpr u8 kComplete[] = "HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n";
+        REQUIRE_EQ(fixture.conn->upstream_recv_buf.write(kComplete, sizeof(kComplete) - 1u),
+                   sizeof(kComplete) - 1u);
+        const IoEvent progress = response_read_copy_event(
+            *fixture.conn, sizeof(kComplete) - 1u, true, 0, sizeof(kComplete) - 1u);
+        const IoEvent client_eof{id, 0, 0, 0, IoEventType::Recv, 0};
+        const IoEvent events[2] = {client_first ? client_eof : progress,
+                                   client_first ? progress : client_eof};
+        loop->dispatch_batch(events, 2);
+        CHECK_EQ(loop->conns[id].fd, -1);
+        CHECK_EQ(loop->conns[id].response_header_buf.len(), 0u);
+        CHECK_EQ(loop->backend.send_state[id].remaining, 0u);
+        release_closed_response_read_fixture(fixture);
+    }
+}
+
+TEST(response_read_deadline, terminal_incomplete_sq_full_closes_and_refreshed_owner_can_expire) {
+    {
+        ScopedIoUringLoopForRetirement guard;
+        if (!guard.init()) SKIP("io_uring unavailable");
+        auto* loop = guard.loop;
+        RouteConfig config{};
+        REQUIRE(config.add_upstream("backend", 0x7F000001, 9000).has_value());
+        REQUIRE(add_response_read_deadline_bundle(config));
+        PrebuiltD2Fixture fixture{};
+        REQUIRE(stage_strict_read_timeout(loop, &config, nullptr, 0, &fixture));
+        REQUIRE(arm_staged_response_read_deadline(loop, fixture));
+        const u32 id = fixture.conn->id;
+        static constexpr u8 kPartial[] = "HTTP/1.1 200 OK\r\n";
+        REQUIRE_EQ(fixture.conn->upstream_recv_buf.write(kPartial, sizeof(kPartial) - 1u),
+                   sizeof(kPartial) - 1u);
+        const IoEvent terminal = response_read_copy_event(
+            *fixture.conn, sizeof(kPartial) - 1u, false, 0, sizeof(kPartial) - 1u);
+        const u32 old_tail = __atomic_load_n(loop->backend.sq_tail, __ATOMIC_ACQUIRE);
+        const u32 head = __atomic_load_n(loop->backend.sq_head, __ATOMIC_ACQUIRE);
+        __atomic_store_n(
+            loop->backend.sq_tail, head + loop->backend.sq_ring_entries, __ATOMIC_RELEASE);
+        loop->dispatch_batch(&terminal, 1);
+        CHECK_EQ(loop->conns[id].fd, -1);
+        CHECK_EQ(loop->conns[id].response_header_buf.len(), 0u);
+        CHECK_EQ(loop->backend.send_state[id].remaining, 0u);
+        __atomic_store_n(loop->backend.sq_tail, old_tail, __ATOMIC_RELEASE);
+        release_closed_response_read_fixture(fixture);
+    }
+
+    {
+        ScopedIoUringLoopForRetirement guard;
+        if (!guard.init()) SKIP("io_uring unavailable");
+        auto* loop = guard.loop;
+        RouteConfig config{};
+        REQUIRE(config.add_upstream("backend", 0x7F000001, 9000).has_value());
+        REQUIRE(add_response_read_deadline_bundle(config));
+        PrebuiltD2Fixture fixture{};
+        REQUIRE(stage_strict_read_timeout(loop, &config, nullptr, 0, &fixture));
+        REQUIRE(arm_staged_response_read_deadline(loop, fixture));
+        static constexpr u8 kPartial[] = "HTTP/1.1";
+        REQUIRE_EQ(fixture.conn->upstream_recv_buf.write(kPartial, sizeof(kPartial) - 1u),
+                   sizeof(kPartial) - 1u);
+        const IoEvent progress = response_read_copy_event(
+            *fixture.conn, sizeof(kPartial) - 1u, true, 0, sizeof(kPartial) - 1u);
+        loop->dispatch_batch(&progress, 1);
+        REQUIRE_EQ(fixture.conn->response_read_deadline_state, ResponseReadDeadlineState::Armed);
+        loop->timer.remove(fixture.conn);
+        loop->timer.add(fixture.conn, 0);
+        const IoEvent timeout{0, 1, 0, 0, IoEventType::Timeout, 0};
+        loop->dispatch_batch(&timeout, 1);
+        CHECK_EQ(fixture.conn->response_read_deadline_state, ResponseReadDeadlineState::None);
+        CHECK_EQ(fixture.conn->resp_status, 504u);
+        CHECK(buf_has(fixture.conn->response_header_buf.data(),
+                      fixture.conn->response_header_buf.len(),
+                      "HTTP/1.1 504 Gateway Time-out\r\n"));
+        cleanup_prebuilt_d2(loop, fixture);
+    }
+}
+
+TEST(response_read_deadline, incomplete_progress_wins_same_batch_timeout_in_both_orders) {
+    for (const bool timeout_first : {false, true}) {
+        ScopedIoUringLoopForRetirement guard;
+        if (!guard.init()) SKIP("io_uring unavailable");
+        auto* loop = guard.loop;
+        RouteConfig config{};
+        REQUIRE(config.add_upstream("backend", 0x7F000001, 9000).has_value());
+        REQUIRE(add_response_read_deadline_bundle(config));
+        PrebuiltD2Fixture fixture{};
+        REQUIRE(stage_strict_read_timeout(loop, &config, nullptr, 0, &fixture));
+        REQUIRE(arm_staged_response_read_deadline(loop, fixture));
+        Connection& conn = *fixture.conn;
+        static constexpr u8 kPartial[] = "HTTP/1.1 200 OK\r\n";
+        REQUIRE_EQ(conn.upstream_recv_buf.write(kPartial, sizeof(kPartial) - 1u),
+                   sizeof(kPartial) - 1u);
+        loop->timer.remove(&conn);
+        loop->timer.add(&conn, 0);
+        const IoEvent progress =
+            response_read_copy_event(conn, sizeof(kPartial) - 1u, true, 0, sizeof(kPartial) - 1u);
+        const IoEvent timeout{0, 1, 0, 0, IoEventType::Timeout, 0};
+        const IoEvent events[2] = {timeout_first ? timeout : progress,
+                                   timeout_first ? progress : timeout};
+        loop->dispatch_batch(events, 2);
+
+        CHECK_GE(conn.fd, 0);
+        CHECK_EQ(conn.response_read_deadline_state, ResponseReadDeadlineState::Armed);
+        CHECK_EQ(conn.response_read_deadline_progress_generation,
+                 conn.response_read_deadline_generation);
+        CHECK_EQ(conn.response_read_deadline_progress_episode, conn.upstream_episode);
+        CHECK_EQ(conn.response_read_deadline_progress_bytes, sizeof(kPartial) - 1u);
+        CHECK_EQ(conn.upstream_recv_buf.len(), sizeof(kPartial) - 1u);
+        CHECK_EQ(conn.response_header_buf.len(), 0u);
+        CHECK_EQ(loop->backend.send_state[conn.id].remaining, 0u);
+        CHECK_EQ(conn.timer_node.prev,
+                 &loop->timer.slots[(loop->timer.cursor + conn.response_read_deadline_seconds) &
+                                    (TimerWheel::kSlots - 1u)]);
+        cleanup_prebuilt_d2(loop, fixture);
+    }
+}
+
+TEST(response_read_deadline, terminal_continuation_completes_once_in_second_batch) {
+    ScopedIoUringLoopForRetirement guard;
+    if (!guard.init()) SKIP("io_uring unavailable");
+    auto* loop = guard.loop;
+    RouteConfig config{};
+    REQUIRE(config.add_upstream("backend", 0x7F000001, 9000).has_value());
+    REQUIRE(add_response_read_deadline_bundle(config));
+    PrebuiltD2Fixture fixture{};
+    REQUIRE(stage_strict_read_timeout(loop, &config, nullptr, 0, &fixture));
+    REQUIRE(arm_staged_response_read_deadline(loop, fixture));
+    Connection& conn = *fixture.conn;
+    const u32 episode = conn.upstream_episode;
+    static constexpr u8 kPartial[] = "HTTP/1.1 200 OK\r\nContent-Length: 0\r\n";
+    REQUIRE_EQ(conn.upstream_recv_buf.write(kPartial, sizeof(kPartial) - 1u),
+               sizeof(kPartial) - 1u);
+    const u32 sq_tail = __atomic_load_n(loop->backend.sq_tail, __ATOMIC_ACQUIRE);
+    const IoEvent terminal =
+        response_read_copy_event(conn, sizeof(kPartial) - 1u, false, 0, sizeof(kPartial) - 1u);
+    loop->dispatch_batch(&terminal, 1);
+    REQUIRE_EQ(conn.response_read_deadline_state, ResponseReadDeadlineState::Armed);
+    REQUIRE(conn.upstream_recv_armed);
+    CHECK_EQ(conn.response_read_deadline_progress_bytes, sizeof(kPartial) - 1u);
+    CHECK_EQ(__atomic_load_n(loop->backend.sq_tail, __ATOMIC_ACQUIRE), sq_tail + 1u);
+
+    UpstreamEventToken continuation{};
+    REQUIRE(decode_upstream_event_token(
+        loop->backend.sq_entries[sq_tail & *loop->backend.sq_ring_mask].user_data, &continuation));
+    CHECK_EQ(continuation.conn_id, conn.id);
+    CHECK_EQ(continuation.type, IoEventType::UpstreamRecv);
+    CHECK_EQ(continuation.episode, episode);
+
+    static constexpr u8 kFinish[] = "\r\n";
+    const u32 begin = conn.upstream_recv_buf.len();
+    REQUIRE_EQ(conn.upstream_recv_buf.write(kFinish, sizeof(kFinish) - 1u), sizeof(kFinish) - 1u);
+    const IoEvent complete = response_read_copy_event(
+        conn, sizeof(kFinish) - 1u, true, begin, conn.upstream_recv_buf.len());
+    loop->dispatch_batch(&complete, 1);
+    REQUIRE_EQ(conn.response_read_deadline_state, ResponseReadDeadlineState::None);
+    CHECK_EQ(conn.resp_status, 200u);
+    CHECK(conn.upstream_abandoned);
+    const u32 response_len = conn.response_header_buf.len();
+    REQUIRE_GT(response_len, 0u);
+
+    // A duplicate completion from the consumed old episode is retirement
+    // accounting only; it cannot parse or publish a second response.
+    IoEvent duplicate = complete;
+    duplicate.more = 0;
+    loop->dispatch_batch(&duplicate, 1);
+    CHECK_EQ(conn.resp_status, 200u);
+    CHECK_EQ(conn.response_header_buf.len(), response_len);
+    cleanup_prebuilt_d2(loop, fixture);
+}
+
+TEST(response_read_deadline, later_expiry_rejects_forged_target_or_path_before_prefix_reset) {
+    for (const bool forge_target : {false, true}) {
+        ScopedIoUringLoopForRetirement guard;
+        if (!guard.init()) SKIP("io_uring unavailable");
+        auto* loop = guard.loop;
+        RouteConfig config{};
+        REQUIRE(config.add_upstream("backend", 0x7F000001, 9000).has_value());
+        REQUIRE(add_response_read_deadline_bundle(config));
+        PrebuiltD2Fixture fixture{};
+        REQUIRE(stage_strict_read_timeout(loop, &config, nullptr, 0, &fixture));
+        REQUIRE(arm_staged_response_read_deadline(loop, fixture));
+        Connection& conn = *fixture.conn;
+        const u32 id = conn.id;
+        static constexpr u8 kPartial[] = "HTTP/1.1";
+        REQUIRE_EQ(conn.upstream_recv_buf.write(kPartial, sizeof(kPartial) - 1u),
+                   sizeof(kPartial) - 1u);
+        const IoEvent progress =
+            response_read_copy_event(conn, sizeof(kPartial) - 1u, true, 0, sizeof(kPartial) - 1u);
+        loop->dispatch_batch(&progress, 1);
+        REQUIRE_EQ(conn.response_read_deadline_state, ResponseReadDeadlineState::Armed);
+        REQUIRE_EQ(conn.response_read_deadline_progress_bytes, sizeof(kPartial) - 1u);
+        if (forge_target)
+            conn.target_transform_recorded = true;
+        else
+            conn.req_path_overridden = true;
+        loop->timer.remove(&conn);
+        loop->timer.add(&conn, 0);
+        const IoEvent timeout{0, 1, 0, 0, IoEventType::Timeout, 0};
+        loop->dispatch_batch(&timeout, 1);
+
+        const Connection& closed = loop->conns[id];
+        CHECK_EQ(closed.fd, -1);
+        CHECK_EQ(closed.response_header_buf.len(), 0u);
+        CHECK_EQ(loop->backend.send_state[id].remaining, 0u);
+        u8 byte = 0;
+        CHECK_EQ(recv(fixture.peer_fd, &byte, 1, MSG_DONTWAIT), 0);
+        release_closed_response_read_fixture(fixture);
+    }
+}
+
+TEST(response_read_deadline, direct_timeout_admission_requires_exact_retained_progress_proof) {
+    enum class Fault : u8 { Generation, Episode, PrefixLength, UpstreamStart };
+    for (const Fault fault :
+         {Fault::Generation, Fault::Episode, Fault::PrefixLength, Fault::UpstreamStart}) {
+        ScopedIoUringLoopForRetirement guard;
+        if (!guard.init()) SKIP("io_uring unavailable");
+        auto* loop = guard.loop;
+        RouteConfig config{};
+        REQUIRE(config.add_upstream("backend", 0x7F000001, 9000).has_value());
+        REQUIRE(add_response_read_deadline_bundle(config));
+        PrebuiltD2Fixture fixture{};
+        REQUIRE(stage_strict_read_timeout(loop, &config, nullptr, 0, &fixture));
+        REQUIRE(arm_staged_response_read_deadline(loop, fixture));
+        Connection& conn = *fixture.conn;
+        const u32 id = conn.id;
+        static constexpr u8 kPartial[] = "HTTP/1.1";
+        REQUIRE_EQ(conn.upstream_recv_buf.write(kPartial, sizeof(kPartial) - 1u),
+                   sizeof(kPartial) - 1u);
+        const IoEvent progress =
+            response_read_copy_event(conn, sizeof(kPartial) - 1u, true, 0, sizeof(kPartial) - 1u);
+        loop->dispatch_batch(&progress, 1);
+        REQUIRE_EQ(conn.response_read_deadline_state, ResponseReadDeadlineState::Armed);
+        REQUIRE_EQ(conn.response_read_deadline_progress_bytes, sizeof(kPartial) - 1u);
+
+        // Model the wheel's non-mutating Armed -> ExpiryPending transition,
+        // then attack the strict-timeout admission API directly.  It must not
+        // trust a caller assertion that progress was previously observed.
+        loop->timer.remove(&conn);
+        conn.response_read_deadline_state = ResponseReadDeadlineState::ExpiryPending;
+        switch (fault) {
+            case Fault::Generation:
+                ++conn.response_read_deadline_progress_generation;
+                break;
+            case Fault::Episode:
+                ++conn.response_read_deadline_progress_episode;
+                break;
+            case Fault::PrefixLength:
+                --conn.response_read_deadline_progress_bytes;
+                break;
+            case Fault::UpstreamStart:
+                conn.upstream_start_us = 1;
+                break;
+        }
+
+        CHECK_FALSE(try_prebuilt_strict_read_timeout(loop, conn));
+        CHECK_EQ(conn.upstream_recv_buf.len(), sizeof(kPartial) - 1u);
+        CHECK_EQ(conn.response_header_buf.len(), 0u);
+        CHECK_EQ(conn.resp_status, 0u);
+        CHECK_EQ(loop->backend.send_state[id].remaining, 0u);
+
+        loop->close_conn(conn);
+        const Connection& closed = loop->conns[id];
+        CHECK_EQ(closed.fd, -1);
+        CHECK_EQ(closed.response_header_buf.len(), 0u);
+        CHECK_EQ(loop->backend.send_state[id].remaining, 0u);
+        u8 byte = 0;
+        CHECK_EQ(recv(fixture.peer_fd, &byte, 1, MSG_DONTWAIT), 0);
+        release_closed_response_read_fixture(fixture);
+    }
+}
+
+TEST(response_read_deadline, owner_mismatch_draining_and_invalid_copy_fail_closed) {
+    enum class Fault : u8 { WitnessGeneration, OwnerGeneration, Episode, Draining, NoBuffer };
+    for (const Fault fault : {Fault::WitnessGeneration,
+                              Fault::OwnerGeneration,
+                              Fault::Episode,
+                              Fault::Draining,
+                              Fault::NoBuffer}) {
+        ScopedIoUringLoopForRetirement guard;
+        if (!guard.init()) SKIP("io_uring unavailable");
+        auto* loop = guard.loop;
+        RouteConfig config{};
+        REQUIRE(config.add_upstream("backend", 0x7F000001, 9000).has_value());
+        REQUIRE(add_response_read_deadline_bundle(config));
+        PrebuiltD2Fixture fixture{};
+        REQUIRE(stage_strict_read_timeout(loop, &config, nullptr, 0, &fixture));
+        REQUIRE(arm_staged_response_read_deadline(loop, fixture));
+        Connection& conn = *fixture.conn;
+        const u32 id = conn.id;
+        static constexpr u8 kByte[] = "H";
+        IoEvent event{};
+        if (fault == Fault::NoBuffer) {
+            event = {id, -ENOBUFS, 0, 0, IoEventType::UpstreamRecv, 1, 0, conn.upstream_episode};
+            event.copy_witness = IoEventCopyWitness::Invalid;
+            event.copy_deadline_generation = conn.response_read_deadline_generation;
+        } else {
+            REQUIRE_EQ(conn.upstream_recv_buf.write(kByte, sizeof(kByte) - 1u), sizeof(kByte) - 1u);
+            event = response_read_copy_event(conn, 1, true, 0, 1);
+        }
+        if (fault == Fault::WitnessGeneration) ++event.copy_deadline_generation;
+        if (fault == Fault::OwnerGeneration) --conn.response_read_deadline_owner_generation;
+        if (fault == Fault::Episode) ++conn.response_read_deadline_upstream_episode;
+        if (fault == Fault::Draining) loop->drain(5);
+        loop->dispatch_batch(&event, 1);
+        CHECK_EQ(loop->conns[id].fd, -1);
+        CHECK_EQ(loop->conns[id].response_header_buf.len(), 0u);
+        CHECK_EQ(loop->backend.send_state[id].remaining, 0u);
+        release_closed_response_read_fixture(fixture);
+    }
+}
+
+TEST(response_read_deadline, progress_then_eof_or_error_uses_complete_or_paired_parse_failure) {
+    static constexpr u8 kComplete[] = "HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n";
+    static constexpr u8 kIncomplete[] = "HTTP/1.1 200 OK\r\nContent-Length: 0\r\n";
+    static constexpr u8 kMalformed[] = "HTTP/1.1 nope\r\n\r\n";
+    struct Shape {
+        const u8* bytes;
+        u32 len;
+        u16 status;
+    };
+    const Shape shapes[] = {{kComplete, sizeof(kComplete) - 1u, 200},
+                            {kIncomplete, sizeof(kIncomplete) - 1u, 502},
+                            {kMalformed, sizeof(kMalformed) - 1u, 502}};
+    for (const i32 terminal_result : {0, -ECONNRESET}) {
+        for (const Shape& shape : shapes) {
+            ScopedIoUringLoopForRetirement guard;
+            if (!guard.init()) SKIP("io_uring unavailable");
+            auto* loop = guard.loop;
+            RouteConfig config{};
+            REQUIRE(config.add_upstream("backend", 0x7F000001, 9000).has_value());
+            REQUIRE(add_response_read_deadline_bundle(config));
+            PrebuiltD2Fixture fixture{};
+            REQUIRE(stage_strict_read_timeout(loop, &config, nullptr, 0, &fixture));
+            REQUIRE(arm_staged_response_read_deadline(loop, fixture));
+            REQUIRE_EQ(fixture.conn->upstream_recv_buf.write(shape.bytes, shape.len), shape.len);
+            const IoEvent progress = response_read_copy_event(
+                *fixture.conn, static_cast<i32>(shape.len), true, 0, shape.len);
+            const IoEvent terminal{fixture.conn->id,
+                                   terminal_result,
+                                   0,
+                                   0,
+                                   IoEventType::UpstreamRecv,
+                                   0,
+                                   0,
+                                   fixture.conn->upstream_episode};
+            const IoEvent events[2] = {progress, terminal};
+            loop->dispatch_batch(events, 2);
+            CHECK_EQ(fixture.conn->response_read_deadline_state, ResponseReadDeadlineState::None);
+            CHECK_EQ(fixture.conn->resp_status, shape.status);
+            CHECK_GT(fixture.conn->response_header_buf.len(), 0u);
+            CHECK_FALSE(buf_has(fixture.conn->response_header_buf.data(),
+                                fixture.conn->response_header_buf.len(),
+                                "504 Gateway Time-out"));
+            cleanup_prebuilt_d2(loop, fixture);
+        }
+    }
+}
+
+TEST(response_read_deadline, invalid_batch_pin_blocks_same_batch_accept_reuse) {
+    ScopedIoUringLoopForRetirement guard;
+    if (!guard.init()) SKIP("io_uring unavailable");
+    auto* loop = guard.loop;
+    RouteConfig config{};
+    REQUIRE(config.add_upstream("backend", 0x7F000001, 9000).has_value());
+    REQUIRE(add_response_read_deadline_bundle(config));
+    PrebuiltD2Fixture fixture{};
+    REQUIRE(stage_strict_read_timeout(loop, &config, nullptr, 0, &fixture));
+    REQUIRE(arm_staged_response_read_deadline(loop, fixture));
+    const u32 id = fixture.conn->id;
+    const u32 episode = fixture.conn->upstream_episode;
+    const u32 sq_tail_before = __atomic_load_n(loop->backend.sq_tail, __ATOMIC_ACQUIRE);
+    const u32 backend_pending_before = loop->backend.pending;
+
+    i32 accepted[2] = {-1, -1};
+    REQUIRE_EQ(socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, accepted), 0);
+    // Model an exhausted shard.  Without the batch pin, the four synthetic
+    // close completions below would publish this exact id before Accept runs.
+    loop->free_top = 0;
+    const IoEvent events[] = {
+        {id, 0, 0, 0, IoEventType::Recv, 0},
+        {id, -ENOENT, 0, 0, IoEventType::Recv, 0},
+        {id, 0, 0, 0, IoEventType::UpstreamRecv, 0, 0, episode},
+        {id, -ENOENT, 0, 0, IoEventType::UpstreamRecv, 0, kUpstreamCloseCancelAux, episode},
+        {0, accepted[0], 0, 0, IoEventType::Accept, 0},
+    };
+    loop->dispatch_batch(events, 5);
+    CHECK_EQ(loop->conns[id].fd, -1);
+    CHECK_EQ(loop->deferred_accept_count, 1u);
+    CHECK_EQ(loop->free_top, 1u);
+    CHECK_EQ(loop->pending_free_count, 0u);
+
+    __atomic_store_n(loop->backend.sq_tail, sq_tail_before, __ATOMIC_RELEASE);
+    loop->backend.pending = backend_pending_before;
+    loop->deferred_accept_count = 0;
+    close(accepted[0]);
+    close(accepted[1]);
+    close(fixture.peer_fd);
+    fixture.peer_fd = -1;
+    fixture.conn = nullptr;
 }
 
 TEST(iouring_timeout_policy, production_jit_forward_reaches_recv_only_timer_admission) {

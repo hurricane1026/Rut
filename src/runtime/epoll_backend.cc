@@ -735,6 +735,7 @@ u32 EpollBackend::wait(IoEvent* events, u32 max_events, Connection* conns, u32 m
                  pending_conns == nullptr || candidate.conn_id >= pending_max_conns ||
                  pending_conns[candidate.conn_id].upstream_episode != candidate.upstream_episode))
                 continue;
+            events[0] = {};
             events[0] = candidate;
             if (pending_count == 0)
                 pending_streak = 0;
@@ -817,6 +818,7 @@ u32 EpollBackend::wait(IoEvent* events, u32 max_events, Connection* conns, u32 m
         if (conn_id == kListenConnId) {
             i32 fd = accept4(listen_fd, nullptr, nullptr, SOCK_NONBLOCK | SOCK_CLOEXEC);
             if (fd >= 0) {
+                events[out] = {};
                 events[out].conn_id = 0;
                 events[out].type = IoEventType::Accept;
                 events[out].result = fd;
@@ -836,6 +838,7 @@ u32 EpollBackend::wait(IoEvent* events, u32 max_events, Connection* conns, u32 m
             ssize_t rr = read(fd, &ticks, sizeof(ticks));
             if (rr != static_cast<ssize_t>(sizeof(ticks))) continue;
             if (out < max_events) {
+                events[out] = {};
                 events[out].conn_id = 0;
                 events[out].type = type;
                 events[out].result = (ticks > 0x7FFFFFFF) ? 0x7FFFFFFF : static_cast<i32>(ticks);
@@ -852,6 +855,7 @@ u32 EpollBackend::wait(IoEvent* events, u32 max_events, Connection* conns, u32 m
             socklen_t errlen = sizeof(err);
             i32 cfd = (conn_id < kMaxFdMap) ? upstream_fd_map[conn_id] : -1;
             if (cfd >= 0) getsockopt(cfd, SOL_SOCKET, SO_ERROR, &err, &errlen);
+            events[out] = {};
             events[out].conn_id = conn_id;
             events[out].type = IoEventType::UpstreamConnect;
             events[out].result = err ? -err : 0;
@@ -911,6 +915,7 @@ u32 EpollBackend::wait(IoEvent* events, u32 max_events, Connection* conns, u32 m
                                 continue;
                             }
                             result = map_tls_error(ssl, rc);
+                            events[out] = {};
                             events[out].conn_id = conn_id;
                             events[out].type = recv_type;
                             events[out].result = result;
@@ -1004,6 +1009,7 @@ u32 EpollBackend::wait(IoEvent* events, u32 max_events, Connection* conns, u32 m
                     epoll_fd, fd, conn_id, IoEventType::UpstreamRecv, interest, upstream_episode);
             }
 
+            events[out] = {};
             events[out].conn_id = conn_id;
             events[out].type = recv_type;
             events[out].result = result;
@@ -1129,6 +1135,7 @@ u32 EpollBackend::wait(IoEvent* events, u32 max_events, Connection* conns, u32 m
                                 EPOLLIN,
                                 io_event_is_upstream(type) ? upstream_episode : 0);
 
+            events[out] = {};
             events[out].conn_id = conn_id;
             events[out].type = emit_type;
             events[out].result = result;

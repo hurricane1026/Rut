@@ -2884,8 +2884,9 @@ bool try_connect_next_backend(Loop* loop, Connection& conn) {
 
 // Admit only the first bounded timeout-policy runtime slice: a complete,
 // bodyless paired HEAD request has reached the strict upstream-header read and
-// the one exact live upstream Recv has produced no byte. Everything else keeps
-// the explicit-policy zero-byte fail-close contract.
+// the one exact live upstream Recv has produced either no byte or only an
+// authoritative retained incomplete prefix. Everything else keeps the
+// explicit-policy zero-byte fail-close contract.
 template <typename Loop>
 inline bool try_prebuilt_strict_read_timeout(Loop* loop, Connection& conn) {
     if constexpr (!requires(Loop* candidate, Connection& c) {
@@ -2894,6 +2895,45 @@ inline bool try_prebuilt_strict_read_timeout(Loop* loop, Connection& conn) {
                   }) {
         return false;
     } else {
+        // Ordinary proxy timeout admission is strictly a zero-progress state.
+        // The io_uring explicit-deadline extension may additionally consume a
+        // private incomplete prefix, but only while this helper can prove the
+        // authoritative retained owner itself.  There is deliberately no
+        // caller-supplied flag capable of bypassing either proof.
+        bool explicit_deadline_expiry = false;
+        bool retained_positive_progress = false;
+        if constexpr (requires(Loop* candidate, const Connection& c) {
+                          Loop::kMaxConns;
+                          candidate->conns[0];
+                          candidate->response_read_deadline_identity_is_stable(c);
+                          candidate->disarm_response_read_deadline(candidate->conns[0]);
+                      }) {
+            if (conn.response_read_deadline_state == ResponseReadDeadlineState::ExpiryPending &&
+                conn.id < Loop::kMaxConns && &loop->conns[conn.id] == &conn &&
+                conn.upstream_recv_armed && loop->response_read_deadline_identity_is_stable(conn)) {
+                const bool no_progress = conn.upstream_recv_buf.len() == 0 &&
+                                         conn.response_read_deadline_progress_generation == 0 &&
+                                         conn.response_read_deadline_progress_episode == 0 &&
+                                         conn.response_read_deadline_progress_bytes == 0 &&
+                                         conn.upstream_start_us != 0;
+                retained_positive_progress =
+                    conn.upstream_recv_buf.len() != 0 &&
+                    conn.response_read_deadline_progress_generation ==
+                        conn.response_read_deadline_generation &&
+                    conn.response_read_deadline_progress_episode == conn.upstream_episode &&
+                    conn.response_read_deadline_progress_bytes == conn.upstream_recv_buf.len() &&
+                    conn.upstream_start_us == 0;
+                explicit_deadline_expiry = no_progress || retained_positive_progress;
+            }
+        }
+        const bool ordinary_zero_progress =
+            conn.response_read_deadline_state == ResponseReadDeadlineState::None &&
+            conn.upstream_recv_buf.len() == 0 &&
+            conn.response_read_deadline_progress_generation == 0 &&
+            conn.response_read_deadline_progress_episode == 0 &&
+            conn.response_read_deadline_progress_bytes == 0 && conn.upstream_start_us != 0;
+        if (!explicit_deadline_expiry && !ordinary_zero_progress) return false;
+
         const RouteConfig* config = conn.request_config;
         if (config == nullptr || conn.response_policy_id == 0 || conn.failure_policy_id == 0 ||
             conn.timeout_failure_policy_id == 0 ||
@@ -2946,9 +2986,8 @@ inline bool try_prebuilt_strict_read_timeout(Loop* loop, Connection& conn) {
             conn.resp_body_mode != BodyMode::None || conn.resp_body_remaining != 0 ||
             conn.resp_body_sent != 0 || conn.upstream_send_len != 0 || conn.send_progress != 0 ||
             conn.send_armed || conn.on_send != nullptr || conn.on_recv != nullptr ||
-            conn.upstream_recv_buf.len() != 0 || conn.response_header_buf.is_released() ||
-            !conn.response_header_buf.valid() || conn.response_header_buf.len() != 0 ||
-            conn.upstream_fd < 0 || conn.upstream_start_us == 0 ||
+            conn.response_header_buf.is_released() || !conn.response_header_buf.valid() ||
+            conn.response_header_buf.len() != 0 || conn.upstream_fd < 0 ||
             !valid_upstream_episode(conn.upstream_episode) || conn.upstream_episode_quarantined ||
             !conn.upstream_recv_armed || conn.on_upstream_recv != &on_upstream_response<Loop> ||
             conn.upstream_connect_armed || conn.upstream_send_armed ||
@@ -2989,6 +3028,14 @@ inline bool try_prebuilt_strict_read_timeout(Loop* loop, Connection& conn) {
                                                    &header_len) ||
             header_len == 0 || header_len > conn.response_header_buf.capacity())
             return false;
+
+        // All admission and response construction checks above are read-only.
+        // Only now may an explicit-deadline expiry consume its private prefix
+        // and retained proof before entering the existing D1/D2 path.
+        if (explicit_deadline_expiry) {
+            if (retained_positive_progress) conn.upstream_recv_buf.reset();
+            loop->disarm_response_read_deadline(conn);
+        }
 
         conn.response_header_buf.reset();
         if (conn.response_header_buf.write(scratch, header_len) != header_len) {
@@ -6739,7 +6786,18 @@ template <typename Loop>
 void on_upstream_response(void* lp, Connection& conn, IoEvent ev) {
     auto* loop = static_cast<Loop*>(lp);
     const bool explicit_first_batch = conn.response_read_deadline_first_batch;
-    auto disarm_explicit_deadline = [&]() { conn.response_read_deadline_first_batch = false; };
+    const bool explicit_progress_batch =
+        conn.response_read_deadline_state == ResponseReadDeadlineState::BatchPending;
+    auto disarm_explicit_deadline = [&]() {
+        if constexpr (requires(Loop* candidate, Connection& c) {
+                          candidate->disarm_response_read_deadline(c);
+                      }) {
+            loop->disarm_response_read_deadline(conn);
+        } else {
+            conn.clear_response_read_deadline();
+            conn.response_read_deadline_first_batch = false;
+        }
+    };
 
     // An old upstream CQE may still be delivered after strict HEAD has
     // abandoned and closed the backend. Never let a direct or backend-routed
@@ -6752,7 +6810,7 @@ void on_upstream_response(void* lp, Connection& conn, IoEvent ev) {
     }
 
     if (ev.result <= 0 && conn.upstream_recv_buf.len() == 0) {
-        if (explicit_first_batch) disarm_explicit_deadline();
+        if (explicit_first_batch || explicit_progress_batch) disarm_explicit_deadline();
         // Post-send first-recv EOF/RST with no response byte. For a reused pooled
         // socket whose origin FIN/RST landed just after take_idle's MSG_PEEK probe,
         // the request write completed locally and the dead socket only surfaces
@@ -6791,7 +6849,17 @@ void on_upstream_response(void* lp, Connection& conn, IoEvent ev) {
     if (ps == ParseStatus::Incomplete) {
         if (ev.result <= 0)
             ps = ParseStatus::Error;
-        else if (explicit_first_batch) {
+        else if (explicit_progress_batch) {
+            if constexpr (requires(Loop* candidate, Connection& c, const IoEvent& event) {
+                              candidate->continue_response_read_deadline_after_incomplete(c, event);
+                          }) {
+                if (!loop->continue_response_read_deadline_after_incomplete(conn, ev))
+                    loop->close_conn(conn);
+            } else {
+                loop->close_conn(conn);
+            }
+            return;
+        } else if (explicit_first_batch) {
             disarm_explicit_deadline();
             loop->close_conn(conn);
             return;
@@ -6801,7 +6869,7 @@ void on_upstream_response(void* lp, Connection& conn, IoEvent ev) {
         }
     }
     if (ps == ParseStatus::Error) {
-        if (explicit_first_batch) disarm_explicit_deadline();
+        if (explicit_first_batch || explicit_progress_batch) disarm_explicit_deadline();
         if (conn.response_policy_id != 0) {
             reject_strict_response(loop, conn, StrictResponseRejectionCause::UpstreamParse);
             return;
@@ -6821,7 +6889,7 @@ void on_upstream_response(void* lp, Connection& conn, IoEvent ev) {
         client_send(loop, conn, conn.send_buf.data(), conn.send_buf.len());
         return;
     }
-    if (explicit_first_batch) disarm_explicit_deadline();
+    if (explicit_first_batch || explicit_progress_batch) disarm_explicit_deadline();
     conn.resp_status = resp.status_code;
 
     // A strict policy has no interim-response or Upgrade domain.  Reject all

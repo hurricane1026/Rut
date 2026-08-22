@@ -129,6 +129,16 @@ inline constexpr u8 kUpstreamOpConnect = 1u << 0;
 inline constexpr u8 kUpstreamOpRecv = 1u << 1;
 inline constexpr u8 kUpstreamOpSend = 1u << 2;
 
+// Backend copy evidence for an upstream response CQE.  The io_uring event
+// loop accepts deadline progress only when the provided-buffer payload was
+// copied atomically into the current response buffer.  All other producers
+// leave this neutral.
+enum class IoEventCopyWitness : u8 {
+    None,
+    Full,
+    Invalid,
+};
+
 // Unified completion event — field order optimized for minimal padding.
 struct IoEvent {
     u32 conn_id;
@@ -140,6 +150,10 @@ struct IoEvent {
     u8 aux = 0;                // decoded user_data aux tag; kPauseCancelAux marks a pause cancel's
                                // own completion (distinct from the recv CQE it cancels)
     u32 upstream_episode = 0;  // neutral for non-upstream/legacy backend events
+    IoEventCopyWitness copy_witness = IoEventCopyWitness::None;
+    u32 copy_deadline_generation = 0;
+    u32 copy_begin = 0;
+    u32 copy_end = 0;
 };
 
 inline constexpr bool io_event_is_tagged_stale(const IoEvent& event, u32 current_episode) {

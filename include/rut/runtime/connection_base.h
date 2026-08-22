@@ -51,6 +51,8 @@ enum class ResponseReadDeadlineState : u8 {
     Validated,
     Armed,
     ExpiryPending,
+    BatchPending,
+    RefreshPending,
 };
 
 // Request-buffer ownership captured by the internal HTTP/1 prebuilt-response
@@ -470,6 +472,12 @@ struct ConnectionBase {
     u8 response_read_deadline_seconds;
     ResponseReadDeadlineState response_read_deadline_state;
     bool response_read_deadline_first_batch;
+    // Exact cumulative positive-copy proof for the current deadline owner.
+    // Set only after whole-batch witness validation and preserved across
+    // incomplete-header re-arms; cleared with active deadline ownership.
+    u32 response_read_deadline_progress_generation;
+    u32 response_read_deadline_progress_episode;
+    u32 response_read_deadline_progress_bytes;
 
     bool next_response_read_deadline_generation() {
         if (response_read_deadline_generation == 0xFFFFFFFFu) return false;
@@ -484,6 +492,9 @@ struct ConnectionBase {
         response_read_deadline_bundle_id = 0;
         response_read_deadline_seconds = 0;
         response_read_deadline_state = ResponseReadDeadlineState::None;
+        response_read_deadline_progress_generation = 0;
+        response_read_deadline_progress_episode = 0;
+        response_read_deadline_progress_bytes = 0;
     }
 
     // Advance the token without wrapping. Zero is the invalid sentinel and

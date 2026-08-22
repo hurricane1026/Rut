@@ -136,7 +136,10 @@ struct MockBackend {
     // conns/max_conns match backend concept but unused in mock (no real recv).
     u32 wait(IoEvent* events, u32 max, Connection* /*conns*/ = nullptr, u32 /*max_conns*/ = 0) {
         u32 n = pending_count < max ? pending_count : max;
-        for (u32 i = 0; i < n; i++) events[i] = pending[i];
+        for (u32 i = 0; i < n; i++) {
+            events[i] = {};
+            events[i] = pending[i];
+        }
         // Shift remaining
         for (u32 i = n; i < pending_count; i++) pending[i - n] = pending[i];
         pending_count -= n;

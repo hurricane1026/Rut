@@ -1,6 +1,7 @@
 #include "rut/runtime/io_uring_backend.h"
 
 #include "core/expected.h"
+#include "rut/runtime/callbacks.h"
 #include "rut/runtime/connection.h"
 #include "rut/runtime/error.h"
 
@@ -24,6 +25,27 @@
 #endif
 
 namespace rut {
+
+static bool response_deadline_copy_owner(const Connection& conn, u32 upstream_episode, u32 aux) {
+    return aux == 0 && conn.fd >= 0 && conn.upstream_fd >= 0 && conn.state == ConnState::Proxying &&
+           conn.protocol == ConnProtocol::Http11 && !conn.tls_active && conn.h2 == nullptr &&
+           conn.response_read_deadline_state == ResponseReadDeadlineState::Armed &&
+           conn.response_read_deadline_owner_generation != 0 &&
+           conn.response_read_deadline_owner_generation == conn.response_read_deadline_generation &&
+           conn.response_read_deadline_upstream_episode == upstream_episode &&
+           conn.upstream_episode == upstream_episode && valid_upstream_episode(upstream_episode) &&
+           conn.upstream_recv_armed &&
+           conn.on_upstream_recv == &on_upstream_response<IoUringEventLoop> &&
+           !conn.upstream_recv_paused_for_send && !conn.upstream_recv_pause_cancel_pending &&
+           !conn.upstream_recv_pause_rearm_pending && !conn.upstream_recv_cancel_inflight &&
+           !conn.upstream_retirement_active && conn.upstream_retirement_target_owned == 0 &&
+           conn.upstream_retirement_cancel_owned == 0 &&
+           conn.upstream_retirement_cancel_retry == 0 && conn.upstream_close_episode == 0 &&
+           conn.upstream_close_target_owned == 0 && conn.upstream_close_cancel_owned == 0 &&
+           !conn.upstream_close_pause_cancel_owned && conn.idle_return_fd < 0 &&
+           conn.idle_return_config == nullptr && !conn.close_after_idle_return &&
+           !conn.h2_proxy_recv_draining && !conn.h2_proxy_synth_quarantined;
+}
 
 // Sentinel conn_id for timer events (same value as epoll backend)
 static constexpr u32 kTimerConnId = 0xFFFFFE;
@@ -734,6 +756,11 @@ u32 IoUringBackend::wait(IoEvent* events, u32 max_events, Connection* conns, u32
     while (head != tail && count < max_events) {
         io_uring_cqe* cqe = &cq_entries[head & mask];
 
+        // The destination array is reused across waits.  Clear the complete
+        // slot before decoding so metadata from a prior CQE can never become
+        // evidence for the current one.
+        events[count] = {};
+
         u32 conn_id;
         IoEventType type;
         u32 aux = 0;
@@ -780,12 +807,28 @@ u32 IoUringBackend::wait(IoEvent* events, u32 max_events, Connection* conns, u32
             // Buffer is NOT reset here — callback resets when it consumes data.
             i32 buf_result = cqe->res;
             bool stale_upstream = false;
+            bool deadline_active = false;
+            bool deadline_owner = false;
+            if (type == IoEventType::UpstreamRecv && conns != nullptr && conn_id < max_conns) {
+                const auto& conn = conns[conn_id];
+                deadline_active =
+                    conn.response_read_deadline_state == ResponseReadDeadlineState::Armed &&
+                    conn.response_read_deadline_owner_generation != 0 &&
+                    conn.response_read_deadline_owner_generation ==
+                        conn.response_read_deadline_generation;
+            }
             if (io_event_is_upstream(type)) {
                 stale_upstream = conns == nullptr || conn_id >= max_conns ||
                                  upstream_episode == 0 ||
                                  upstream_episode != conns[conn_id].upstream_episode;
                 if (!stale_upstream && type == IoEventType::UpstreamRecv) {
                     const auto& conn = conns[conn_id];
+                    deadline_owner =
+                        conn.response_read_deadline_state == ResponseReadDeadlineState::Armed &&
+                        conn.response_read_deadline_upstream_episode == upstream_episode &&
+                        conn.response_read_deadline_owner_generation != 0 &&
+                        conn.response_read_deadline_owner_generation ==
+                            conn.response_read_deadline_generation;
                     // Episode equality alone is not ownership: a forged or
                     // duplicate aux-0 CQE must not mutate the live recv buffer,
                     // and a closed successor's target must drain accounting
@@ -795,7 +838,8 @@ u32 IoUringBackend::wait(IoEvent* events, u32 max_events, Connection* conns, u32
                         (!conn.upstream_recv_armed && !conn.upstream_recv_cancel_inflight);
                 }
             }
-            if (cqe->res > 0 && conn_id < max_conns && !stale_upstream) {
+            const bool valid_buffer_id = buf_id < kProvidedBufCount;
+            if (cqe->res > 0 && conn_id < max_conns && !stale_upstream && valid_buffer_id) {
                 u32 nbytes = static_cast<u32>(cqe->res);
                 // TLS client connections receive ciphertext: land it in
                 // tls_in_buf so the event-loop TLS layer can decrypt into
@@ -806,17 +850,49 @@ u32 IoUringBackend::wait(IoEvent* events, u32 max_events, Connection* conns, u32
                                                                : conns[conn_id].recv_buf;
                 const u8* src = buf_base + static_cast<u64>(buf_id) * kProvidedBufSize;
                 u32 avail = target_buf.write_avail();
-                u32 to_copy = nbytes < avail ? nbytes : avail;
+                const bool deadline_copy_eligible =
+                    type == IoEventType::UpstreamRecv && deadline_owner &&
+                    nbytes <= kProvidedBufSize && nbytes <= avail &&
+                    response_deadline_copy_owner(conns[conn_id], upstream_episode, aux);
+                // A matching explicit-deadline owner never enters the legacy
+                // partial-copy path.  Its provided-buffer payload is one
+                // indivisible witness: exact and fully eligible, or zero bytes.
+                u32 to_copy = deadline_owner ? (deadline_copy_eligible ? nbytes : 0)
+                                             : (nbytes < avail ? nbytes : avail);
+                const u32 copy_begin = target_buf.len();
                 if (to_copy > 0) {
                     __builtin_memcpy(target_buf.write_ptr(), src, to_copy);
                     target_buf.commit(to_copy);
                 }
                 // Report actual bytes copied, not kernel bytes (may differ if buf full)
                 buf_result = (to_copy < nbytes) ? -ENOBUFS : static_cast<i32>(to_copy);
+                if (deadline_owner) {
+                    events[count].copy_witness = deadline_copy_eligible && to_copy == nbytes
+                                                     ? IoEventCopyWitness::Full
+                                                     : IoEventCopyWitness::Invalid;
+                    events[count].copy_deadline_generation =
+                        conns[conn_id].response_read_deadline_generation;
+                    if (events[count].copy_witness == IoEventCopyWitness::Full) {
+                        events[count].copy_begin = copy_begin;
+                        events[count].copy_end = target_buf.len();
+                    }
+                }
+            } else if (cqe->res > 0 && deadline_active) {
+                events[count].copy_witness = IoEventCopyWitness::Invalid;
+                events[count].copy_deadline_generation =
+                    conns[conn_id].response_read_deadline_generation;
+                if (!stale_upstream) buf_result = -ENOBUFS;
+            } else if (cqe->res > 0 && !valid_buffer_id) {
+                buf_result = -ENOBUFS;
+            }
+            if (deadline_active && (stale_upstream || cqe->res == -ECANCELED || aux != 0)) {
+                events[count].copy_witness = IoEventCopyWitness::Invalid;
+                events[count].copy_deadline_generation =
+                    conns[conn_id].response_read_deadline_generation;
             }
 
             // Always return the buffer, even on error
-            return_buffer(buf_id);
+            if (valid_buffer_id) return_buffer(buf_id);
 
             // Emit event (buffer already returned, clear has_buf)
             events[count].conn_id = conn_id;
@@ -929,6 +1005,18 @@ u32 IoUringBackend::wait(IoEvent* events, u32 max_events, Connection* conns, u32
         // completion (UpstreamRecv + kPauseCancelAux); 0 for every normal op.
         events[count].aux = static_cast<u8>(aux);
         events[count].upstream_episode = upstream_episode;
+        if (type == IoEventType::UpstreamRecv && conns != nullptr && conn_id < max_conns &&
+            conns[conn_id].response_read_deadline_state == ResponseReadDeadlineState::Armed &&
+            conns[conn_id].response_read_deadline_owner_generation != 0 &&
+            conns[conn_id].response_read_deadline_owner_generation ==
+                conns[conn_id].response_read_deadline_generation &&
+            (cqe->res > 0 || cqe->res == -ECANCELED || aux != 0)) {
+            events[count].copy_witness = IoEventCopyWitness::Invalid;
+            events[count].copy_deadline_generation =
+                conns[conn_id].response_read_deadline_generation;
+            if (cqe->res > 0 && upstream_episode == conns[conn_id].upstream_episode)
+                events[count].result = -ENOBUFS;
+        }
 
         head++;
         count++;

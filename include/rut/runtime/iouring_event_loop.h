@@ -121,6 +121,27 @@ public:
     bool http1_boundary_ready_pending;
     bool response_read_deadline_expiry_pending;
 
+    struct ResponseReadBatchOwner {
+        u32 conn_id = 0;
+        u32 deadline_generation = 0;
+        u32 upstream_episode = 0;
+        u32 last_relevant = 0;
+        u32 first_copy_begin = 0;
+        u32 expected_copy_end = 0;
+        u32 positive_bytes = 0;
+        bool valid = false;
+        bool saw_relevant = false;
+        bool saw_positive = false;
+        bool saw_terminal = false;
+    };
+    ResponseReadBatchOwner response_read_batch_owners[kMaxEventsPerWait];
+    u16 response_read_batch_event_owner[kMaxEventsPerWait];
+    u32 response_read_batch_owner_count;
+    u32 response_read_batch_event_count;
+    u32 response_read_batch_event_index;
+    u32 response_read_batch_pins[kMaxEventsPerWait];
+    u32 response_read_batch_pin_count;
+
     // Deferred accepts: accepted fds that couldn't be allocated during
     // dispatch because all slots were in pending_free.
     static constexpr u32 kMaxDeferredAccepts = 64;
@@ -195,6 +216,10 @@ public:
         upstream_retirement_retry_count = 0;
         http1_boundary_ready_pending = false;
         response_read_deadline_expiry_pending = false;
+        response_read_batch_owner_count = 0;
+        response_read_batch_event_count = 0;
+        response_read_batch_event_index = 0;
+        response_read_batch_pin_count = 0;
         deferred_accept_count = 0;
         timer.init();
         for (u32 i = 0; i < kMaxConns; i++) {
@@ -1161,8 +1186,24 @@ public:
         c.tls_out_buf.bind(nullptr, 0);
     }
 
+    bool response_read_batch_reuse_pinned(u32 cid) const {
+        for (u32 i = 0; i < response_read_batch_pin_count; ++i) {
+            if (response_read_batch_pins[i] == cid) return true;
+        }
+        return false;
+    }
+
+    void pin_response_read_batch_slot(u32 cid) {
+        if (cid >= kMaxConns || response_read_batch_reuse_pinned(cid) ||
+            response_read_batch_pin_count >= kMaxEventsPerWait)
+            return;
+        response_read_batch_pins[response_read_batch_pin_count++] = cid;
+    }
+
     void reclaim_slot(u32 cid) {
-        if (cid >= kMaxConns || strict_upstream_retirement_blocks_reclaim(conns[cid])) return;
+        if (cid >= kMaxConns || response_read_batch_reuse_pinned(cid) ||
+            strict_upstream_retirement_blocks_reclaim(conns[cid]))
+            return;
         bool was_pending = false;
         for (u32 i = 0; i < pending_free_count; i++) {
             if (pending_free[i] == cid) {
@@ -1199,7 +1240,7 @@ public:
         u32 remaining = 0;
         for (u32 i = 0; i < pending_free_count; i++) {
             u32 cid = pending_free[i];
-            if (conns[cid].pending_ops == 0 &&
+            if (!response_read_batch_reuse_pinned(cid) && conns[cid].pending_ops == 0 &&
                 !strict_upstream_retirement_blocks_reclaim(conns[cid])) {
                 if (conns[cid].recv_slice) {
                     pool.free(conns[cid].recv_slice);
@@ -1284,7 +1325,8 @@ public:
             c.ws_u2c_msg = nullptr;
         }
         // If no ops are in flight, reclaim immediately.
-        if (c.pending_ops == 0 && !strict_upstream_retirement_blocks_reclaim(c)) {
+        if (c.pending_ops == 0 && !response_read_batch_reuse_pinned(cid) &&
+            !strict_upstream_retirement_blocks_reclaim(c)) {
             if (c.recv_slice) pool.free(c.recv_slice);
             if (c.send_slice) pool.free(c.send_slice);
             if (c.upstream_recv_slice) pool.free(c.upstream_recv_slice);
@@ -1474,7 +1516,10 @@ public:
         if (c.response_read_deadline_state != ResponseReadDeadlineState::Validated ||
             c.response_read_deadline_owner_generation == 0 ||
             c.response_read_deadline_owner_generation != c.response_read_deadline_generation ||
-            cfg == nullptr || !cfg->policy_bundle_id_is_valid(bundle_id))
+            c.response_read_deadline_progress_generation != 0 ||
+            c.response_read_deadline_progress_episode != 0 ||
+            c.response_read_deadline_progress_bytes != 0 || cfg == nullptr ||
+            !cfg->policy_bundle_id_is_valid(bundle_id))
             return false;
         const auto& bundle = cfg->policy_bundles[bundle_id - 1];
         if (!response_read_timeout_seconds_valid(bundle.response_read_timeout_seconds) ||
@@ -1530,6 +1575,262 @@ public:
         c.response_read_deadline_first_batch = false;
     }
 
+    bool response_read_deadline_identity_is_stable(const Connection& c) const {
+        const RouteConfig* cfg = c.request_config;
+        const u16 bundle_id = c.response_read_deadline_bundle_id;
+        if (c.id >= kMaxConns || c.fd < 0 || c.upstream_fd < 0 || is_draining() ||
+            c.state != ConnState::Proxying || c.protocol != ConnProtocol::Http11 || c.tls_active ||
+            c.h2 != nullptr || c.response_read_deadline_owner_generation == 0 ||
+            c.response_read_deadline_owner_generation != c.response_read_deadline_generation ||
+            c.response_read_deadline_upstream_episode != c.upstream_episode ||
+            !valid_upstream_episode(c.upstream_episode) || c.upstream_episode_quarantined ||
+            cfg == nullptr || !cfg->policy_bundle_id_is_valid(bundle_id))
+            return false;
+        const auto& bundle = cfg->policy_bundles[bundle_id - 1];
+        if (!response_read_timeout_seconds_valid(bundle.response_read_timeout_seconds) ||
+            bundle.response_read_timeout_seconds != c.response_read_deadline_seconds ||
+            bundle.response_policy_id != c.response_policy_id ||
+            bundle.failure_policy_id != c.failure_policy_id ||
+            bundle.timeout_failure_policy_id != c.timeout_failure_policy_id ||
+            c.upstream_idx >= cfg->upstream_count ||
+            cfg->upstreams[c.upstream_idx].addr_count != 1 ||
+            cfg->upstreams[c.upstream_idx].addrs[0].sin_family != AF_INET)
+            return false;
+        const bool no_progress = c.response_read_deadline_progress_generation == 0 &&
+                                 c.response_read_deadline_progress_episode == 0 &&
+                                 c.response_read_deadline_progress_bytes == 0;
+        const bool exact_progress =
+            c.response_read_deadline_progress_generation == c.response_read_deadline_generation &&
+            c.response_read_deadline_progress_episode == c.upstream_episode &&
+            c.response_read_deadline_progress_bytes != 0;
+        return (no_progress || exact_progress) && c.upstream_attempts == 1 && !c.upstream_reused &&
+               c.request_upload_complete && !c.upstream_request_incomplete &&
+               c.on_upstream_recv == &on_upstream_response<Self> &&
+               c.req_method == static_cast<u8>(LogHttpMethod::Head) &&
+               c.req_http_version == static_cast<u8>(HttpVersion::Http11) && c.req_keep_alive &&
+               c.req_body_mode == BodyMode::None && c.req_body_remaining == 0 &&
+               !c.request_body_fully_buffered && !c.req_client_has_content_length &&
+               !c.req_client_has_transfer_encoding && !c.req_client_has_te &&
+               !c.req_client_has_expect && !c.req_client_has_upgrade_header &&
+               c.req_client_connection_count == 0 && !c.req_wants_upgrade &&
+               c.pipeline_depth == 0 && c.response_policy_suppress_body &&
+               c.failure_policy_suppress_body && !c.target_transform_recorded &&
+               !c.req_path_overridden && c.req_header_override_count == 0 &&
+               !c.req_header_override_overflow && c.resp_header_mutation_count == 0 &&
+               c.resp_header_mutation_pending_count == 0 &&
+               !c.resp_header_mutation_pending_overflow && !c.resp_header_mutation_overflow &&
+               !c.upstream_recv_paused_for_send && !c.upstream_recv_pause_cancel_pending &&
+               !c.upstream_recv_pause_rearm_pending && !c.upstream_recv_cancel_inflight &&
+               !c.upstream_retirement_active && c.upstream_retirement_target_owned == 0 &&
+               c.upstream_retirement_cancel_owned == 0 && c.upstream_retirement_cancel_retry == 0 &&
+               c.upstream_close_episode == 0 && c.upstream_close_target_owned == 0 &&
+               c.upstream_close_cancel_owned == 0 && !c.upstream_close_pause_cancel_owned &&
+               c.idle_return_fd < 0 && c.idle_return_config == nullptr &&
+               !c.close_after_idle_return && !c.h2_proxy_recv_draining &&
+               !c.h2_proxy_synth_quarantined;
+    }
+
+    u16 find_or_add_response_read_batch_owner(u32 cid) {
+        for (u32 i = 0; i < response_read_batch_owner_count; ++i) {
+            if (response_read_batch_owners[i].conn_id == cid) return static_cast<u16>(i + 1);
+        }
+        if (cid >= kMaxConns || response_read_batch_owner_count >= kMaxEventsPerWait) return 0;
+        const Connection& c = conns[cid];
+        if (c.response_read_deadline_state != ResponseReadDeadlineState::Armed &&
+            c.response_read_deadline_state != ResponseReadDeadlineState::ExpiryPending)
+            return 0;
+        auto& owner = response_read_batch_owners[response_read_batch_owner_count];
+        owner = {};
+        owner.conn_id = cid;
+        owner.deadline_generation = c.response_read_deadline_generation;
+        owner.upstream_episode = c.upstream_episode;
+        owner.valid = response_read_deadline_identity_is_stable(c) && c.upstream_recv_armed;
+        return static_cast<u16>(++response_read_batch_owner_count);
+    }
+
+    void prepare_response_read_deadline_batch(const IoEvent* events, u32 count) {
+        response_read_batch_owner_count = 0;
+        response_read_batch_event_count = count;
+        response_read_batch_event_index = 0;
+        response_read_batch_pin_count = 0;
+        for (u32 i = 0; i < count; ++i) response_read_batch_event_owner[i] = 0;
+
+        // Discover only owners touched by this bounded wait batch.  A timer-only
+        // owner remains on the ordinary expiry path; a response or downstream
+        // terminal creates an entry without retaining a Connection pointer.
+        for (u32 i = 0; i < count; ++i) {
+            const IoEvent& ev = events[i];
+            if (ev.conn_id >= kMaxConns) continue;
+            const Connection& c = conns[ev.conn_id];
+            const bool current_upstream =
+                ev.type == IoEventType::UpstreamRecv && ev.upstream_episode == c.upstream_episode;
+            const bool downstream_terminal = ev.type == IoEventType::Recv && ev.result <= 0;
+            if (current_upstream || downstream_terminal)
+                (void)find_or_add_response_read_batch_owner(ev.conn_id);
+        }
+
+        for (u32 i = 0; i < count; ++i) {
+            const IoEvent& ev = events[i];
+            if (ev.conn_id >= kMaxConns) continue;
+            u16 owner_index = 0;
+            for (u32 oi = 0; oi < response_read_batch_owner_count; ++oi) {
+                if (response_read_batch_owners[oi].conn_id == ev.conn_id) {
+                    owner_index = static_cast<u16>(oi + 1);
+                    break;
+                }
+            }
+            if (owner_index == 0) continue;
+            auto& owner = response_read_batch_owners[owner_index - 1];
+            if (ev.type == IoEventType::Recv && ev.result <= 0) {
+                owner.valid = false;
+                continue;
+            }
+            if (ev.type != IoEventType::UpstreamRecv ||
+                ev.upstream_episode != owner.upstream_episode)
+                continue;
+
+            response_read_batch_event_owner[i] = owner_index;
+            owner.last_relevant = i;
+            owner.saw_relevant = true;
+            if (owner.saw_terminal) owner.valid = false;
+            if (ev.aux != 0 || ev.result == -ENOBUFS || ev.result == -ECANCELED ||
+                ev.copy_witness == IoEventCopyWitness::Invalid)
+                owner.valid = false;
+
+            if (ev.result > 0) {
+                if (ev.copy_witness != IoEventCopyWitness::Full ||
+                    ev.copy_deadline_generation != owner.deadline_generation ||
+                    ev.copy_end < ev.copy_begin ||
+                    ev.copy_end - ev.copy_begin != static_cast<u32>(ev.result)) {
+                    owner.valid = false;
+                } else {
+                    if (!owner.saw_positive) {
+                        owner.first_copy_begin = ev.copy_begin;
+                        owner.expected_copy_end = ev.copy_begin;
+                    }
+                    if (ev.copy_begin != owner.expected_copy_end) owner.valid = false;
+                    owner.expected_copy_end = ev.copy_end;
+                    const u32 positive = static_cast<u32>(ev.result);
+                    if (owner.positive_bytes > 0xFFFFFFFFu - positive)
+                        owner.valid = false;
+                    else
+                        owner.positive_bytes += positive;
+                    owner.saw_positive = true;
+                }
+                if (!ev.more) owner.saw_terminal = true;
+            } else {
+                if (ev.more || ev.copy_witness != IoEventCopyWitness::None) owner.valid = false;
+                owner.saw_terminal = true;
+            }
+        }
+
+        // Finish every owner's read-only proof before removing a timer or
+        // closing a connection.  The backend has already appended all Full
+        // copies, so the exact final length proves the first range begins at
+        // the pre-batch cumulative length and that no hidden copy occurred.
+        for (u32 oi = 0; oi < response_read_batch_owner_count; ++oi) {
+            auto& owner = response_read_batch_owners[oi];
+            const Connection& c = conns[owner.conn_id];
+            if (!owner.saw_relevant) owner.valid = false;
+            const u32 pre_batch_bytes =
+                owner.saw_positive ? owner.first_copy_begin : c.upstream_recv_buf.len();
+            const bool no_prior_progress = c.response_read_deadline_progress_generation == 0 &&
+                                           c.response_read_deadline_progress_episode == 0 &&
+                                           c.response_read_deadline_progress_bytes == 0;
+            const bool exact_prior_progress =
+                c.response_read_deadline_progress_generation == owner.deadline_generation &&
+                c.response_read_deadline_progress_episode == owner.upstream_episode &&
+                c.response_read_deadline_progress_bytes == pre_batch_bytes && pre_batch_bytes != 0;
+            if ((pre_batch_bytes == 0 && !no_prior_progress) ||
+                (pre_batch_bytes != 0 && !exact_prior_progress))
+                owner.valid = false;
+            if (owner.saw_positive &&
+                (owner.first_copy_begin > 0xFFFFFFFFu - owner.positive_bytes ||
+                 owner.first_copy_begin + owner.positive_bytes != owner.expected_copy_end ||
+                 owner.expected_copy_end != c.upstream_recv_buf.len()))
+                owner.valid = false;
+        }
+
+        for (u32 oi = 0; oi < response_read_batch_owner_count; ++oi) {
+            auto& owner = response_read_batch_owners[oi];
+            pin_response_read_batch_slot(owner.conn_id);
+            Connection& c = conns[owner.conn_id];
+            const bool key_stable =
+                c.id == owner.conn_id &&
+                c.response_read_deadline_generation == owner.deadline_generation &&
+                c.upstream_episode == owner.upstream_episode &&
+                (c.response_read_deadline_state == ResponseReadDeadlineState::Armed ||
+                 c.response_read_deadline_state == ResponseReadDeadlineState::ExpiryPending);
+            if (!owner.valid || !key_stable) {
+                owner.valid = false;
+                if (c.fd >= 0) close_conn(c);
+                continue;
+            }
+            timer.remove(&c);
+            c.response_read_deadline_state = ResponseReadDeadlineState::BatchPending;
+        }
+    }
+
+    [[nodiscard]] bool continue_response_read_deadline_after_incomplete(Connection& c,
+                                                                        const IoEvent& ev) {
+        if (c.response_read_deadline_state != ResponseReadDeadlineState::BatchPending ||
+            !response_read_deadline_identity_is_stable(c) || ev.type != IoEventType::UpstreamRecv ||
+            ev.result <= 0 || ev.aux != 0 || ev.upstream_episode != c.upstream_episode)
+            return false;
+        if (ev.more) {
+            if (!c.upstream_recv_armed) return false;
+            c.response_read_deadline_state = ResponseReadDeadlineState::RefreshPending;
+            return true;
+        }
+        if (c.upstream_recv_armed || c.upstream_recv_pause_cancel_pending ||
+            c.upstream_recv_pause_rearm_pending || c.upstream_recv_cancel_inflight ||
+            !backend.add_first_response_recv(c.upstream_fd, c.id, c.upstream_episode))
+            return false;
+        c.pending_ops++;
+        c.upstream_recv_armed = true;
+        c.response_read_deadline_state = ResponseReadDeadlineState::RefreshPending;
+        return true;
+    }
+
+    void settle_response_read_deadline_batch() {
+        for (u32 oi = 0; oi < response_read_batch_owner_count; ++oi) {
+            const auto& owner = response_read_batch_owners[oi];
+            if (!owner.valid || owner.conn_id >= kMaxConns) continue;
+            Connection& c = conns[owner.conn_id];
+            const bool key_stable =
+                c.id == owner.conn_id &&
+                c.response_read_deadline_generation == owner.deadline_generation &&
+                c.upstream_episode == owner.upstream_episode;
+            if (key_stable &&
+                c.response_read_deadline_state == ResponseReadDeadlineState::RefreshPending &&
+                c.upstream_recv_armed && response_read_deadline_identity_is_stable(c)) {
+                if (c.upstream_recv_buf.len() == 0) {
+                    close_conn(c);
+                    continue;
+                }
+                c.response_read_deadline_progress_generation = owner.deadline_generation;
+                c.response_read_deadline_progress_episode = owner.upstream_episode;
+                c.response_read_deadline_progress_bytes = c.upstream_recv_buf.len();
+                timer.refresh(&c, c.response_read_deadline_seconds);
+                c.response_read_deadline_state = ResponseReadDeadlineState::Armed;
+            } else if (key_stable &&
+                       c.response_read_deadline_state == ResponseReadDeadlineState::BatchPending) {
+                close_conn(c);
+            } else if (key_stable && c.response_read_deadline_state ==
+                                         ResponseReadDeadlineState::RefreshPending) {
+                close_conn(c);
+            } else if (!key_stable && c.fd >= 0 &&
+                       (c.response_read_deadline_state == ResponseReadDeadlineState::BatchPending ||
+                        c.response_read_deadline_state ==
+                            ResponseReadDeadlineState::RefreshPending)) {
+                // The slot is batch-pinned, so a live mismatched state cannot
+                // belong to a successor allocation.  Fail closed instead of
+                // leaving an owner without a timer.
+                close_conn(c);
+            }
+        }
+    }
+
     void resolve_response_read_deadline_expiries() {
         if (!response_read_deadline_expiry_pending) return;
         response_read_deadline_expiry_pending = false;
@@ -1537,44 +1838,31 @@ public:
             Connection& c = conns[id];
             if (c.response_read_deadline_state != ResponseReadDeadlineState::ExpiryPending)
                 continue;
-            const RouteConfig* cfg = c.request_config;
-            bool valid =
-                c.id == id && c.fd >= 0 && c.state == ConnState::Proxying &&
-                c.response_read_deadline_owner_generation != 0 &&
-                c.response_read_deadline_owner_generation == c.response_read_deadline_generation &&
-                c.response_read_deadline_upstream_episode == c.upstream_episode &&
-                valid_upstream_episode(c.upstream_episode) && c.upstream_recv_armed &&
-                c.on_upstream_recv == &on_upstream_response<Self> && cfg != nullptr &&
-                cfg->policy_bundle_id_is_valid(c.response_read_deadline_bundle_id);
-            if (valid) {
-                const auto& bundle = cfg->policy_bundles[c.response_read_deadline_bundle_id - 1];
-                valid = response_read_timeout_seconds_valid(bundle.response_read_timeout_seconds) &&
-                        bundle.response_read_timeout_seconds == c.response_read_deadline_seconds &&
-                        bundle.response_policy_id == c.response_policy_id &&
-                        bundle.failure_policy_id == c.failure_policy_id &&
-                        bundle.timeout_failure_policy_id == c.timeout_failure_policy_id;
-            }
-            if (valid) {
-                valid = c.upstream_idx < cfg->upstream_count && c.upstream_attempts == 1 &&
-                        cfg->upstreams[c.upstream_idx].addr_count == 1 &&
-                        cfg->upstreams[c.upstream_idx].addrs[0].sin_family == AF_INET;
-            }
-            disarm_response_read_deadline(c);
-            if (!valid || !try_prebuilt_strict_read_timeout<Self>(this, c)) {
-                if (c.fd >= 0) close_conn(c);
-            }
+            // The strict-timeout helper owns the complete non-mutating proof,
+            // private-prefix consumption, and deadline disarm ordering.  No
+            // caller assertion can manufacture positive-progress admission.
+            if (!try_prebuilt_strict_read_timeout<Self>(this, c) && c.fd >= 0) close_conn(c);
         }
     }
 
     // Public deterministic seam used by the production run loop and focused
     // same-batch arbitration tests.
     void dispatch_batch(const IoEvent* events, u32 count) {
-        for (u32 i = 0; i < count; i++) dispatch(events[i]);
+        if (count > kMaxEventsPerWait) count = kMaxEventsPerWait;
+        prepare_response_read_deadline_batch(events, count);
+        for (u32 i = 0; i < count; i++) {
+            response_read_batch_event_index = i;
+            dispatch(events[i]);
+        }
+        settle_response_read_deadline_batch();
         resolve_response_read_deadline_expiries();
         // Retirement/header rendezvous owners publish only readiness during
         // dispatch. Admit parked HTTP/1 request boundaries after every CQE in
         // this wait batch, before reclamation or accept reuse.
         resume_deferred_http1_boundaries();
+        response_read_batch_pin_count = 0;
+        response_read_batch_owner_count = 0;
+        response_read_batch_event_count = 0;
         reclaim_pending();
     }
 
@@ -2262,6 +2550,32 @@ public:
                         }
                     }
                     if (ev.type == IoEventType::UpstreamRecv &&
+                        response_read_batch_event_index < response_read_batch_event_count) {
+                        const u16 owner_index =
+                            response_read_batch_event_owner[response_read_batch_event_index];
+                        if (owner_index != 0 && owner_index <= response_read_batch_owner_count) {
+                            const auto& owner = response_read_batch_owners[owner_index - 1];
+                            if (!owner.valid) break;
+                            const bool key_stable =
+                                conn.id == owner.conn_id &&
+                                conn.response_read_deadline_generation ==
+                                    owner.deadline_generation &&
+                                conn.upstream_episode == owner.upstream_episode &&
+                                conn.response_read_deadline_state ==
+                                    ResponseReadDeadlineState::BatchPending;
+                            if (!key_stable || !response_read_deadline_identity_is_stable(conn)) {
+                                if (conn.fd >= 0) close_conn(conn);
+                                break;
+                            }
+                            // Backend.wait already copied every fragment.  Earlier
+                            // related CQEs own accounting only; parsing the cumulative
+                            // buffer exactly once at the last relevant index prevents
+                            // interleaved owners and F_MORE fragments from observing a
+                            // partial or future range.
+                            if (response_read_batch_event_index != owner.last_relevant) break;
+                        }
+                    }
+                    if (ev.type == IoEventType::UpstreamRecv &&
                         (conn.response_read_deadline_state == ResponseReadDeadlineState::Armed ||
                          conn.response_read_deadline_state ==
                              ResponseReadDeadlineState::ExpiryPending)) {
@@ -2288,7 +2602,11 @@ public:
                         if (!conn.throttle_paused &&
                             conn.response_read_deadline_state != ResponseReadDeadlineState::Armed &&
                             conn.response_read_deadline_state !=
-                                ResponseReadDeadlineState::ExpiryPending)
+                                ResponseReadDeadlineState::ExpiryPending &&
+                            conn.response_read_deadline_state !=
+                                ResponseReadDeadlineState::BatchPending &&
+                            conn.response_read_deadline_state !=
+                                ResponseReadDeadlineState::RefreshPending)
                             timer.refresh(&conn,
                                           conn.state == ConnState::Proxying ? upstream_timeout
                                                                             : keepalive_timeout);
