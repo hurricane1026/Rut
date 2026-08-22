@@ -16791,6 +16791,10 @@ struct RecordingUpstream {
     u32 response_chunk_size = 0;
     u32 response_chunk_delay_us = 0;
     u32 response_split_offset = 0;
+    static constexpr u32 kMaxFirstResponseFragments = 16;
+    std::atomic<u32> first_response_fragment_count{0};
+    std::atomic<u64> first_response_fragment_sent_ns[kMaxFirstResponseFragments]{};
+    std::atomic<u64> first_peer_closed_ns{0};
     bool keep_open = false;
     // Opt-in synchronization for tests that need the first response bytes to
     // arrive while the origin peer remains open.  This is only wire evidence;
@@ -16904,24 +16908,42 @@ struct RecordingUpstream {
                                           : (s->response ? s->response_len : sizeof(kResponse) - 1);
             const bool stall_first_response =
                 history_slot == 0 && s->stall_first_response_for_peer_close;
+            auto record_first_response_fragment = [&](bool sent) {
+                if (history_slot != 0 || !sent) return;
+                const u32 fragment =
+                    s->first_response_fragment_count.load(std::memory_order_relaxed);
+                if (fragment >= kMaxFirstResponseFragments) return;
+                struct timespec now{};
+                if (clock_gettime(CLOCK_MONOTONIC, &now) != 0) return;
+                const u64 timestamp =
+                    static_cast<u64>(now.tv_sec) * 1000000000ull + static_cast<u64>(now.tv_nsec);
+                s->first_response_fragment_sent_ns[fragment].store(timestamp,
+                                                                   std::memory_order_relaxed);
+                s->first_response_fragment_count.store(fragment + 1, std::memory_order_release);
+            };
             bool response_sent = stall_first_response;
             if (stall_first_response) {
                 s->first_response_stalled_open.store(true, std::memory_order_release);
             } else if (s->response_split_offset > 0 && s->response_split_offset < out_len) {
                 const bool first_sent = send_all(client, out, s->response_split_offset);
+                record_first_response_fragment(first_sent);
                 if (s->response_chunk_delay_us != 0) usleep(s->response_chunk_delay_us);
                 const bool second_sent = send_all(
                     client, out + s->response_split_offset, out_len - s->response_split_offset);
+                record_first_response_fragment(second_sent);
                 response_sent = first_sent && second_sent;
             } else if (s->response_chunk_size == 0) {
                 response_sent = send_all(client, out, out_len);
+                record_first_response_fragment(response_sent);
             } else {
                 response_sent = true;
                 for (u32 off = 0; off < out_len;) {
                     const u32 len = (out_len - off < s->response_chunk_size)
                                         ? out_len - off
                                         : s->response_chunk_size;
-                    response_sent = send_all(client, out + off, len) && response_sent;
+                    const bool fragment_sent = send_all(client, out + off, len);
+                    record_first_response_fragment(fragment_sent);
+                    response_sent = fragment_sent && response_sent;
                     off += len;
                     if (s->response_chunk_delay_us != 0) usleep(s->response_chunk_delay_us);
                 }
@@ -17011,6 +17033,12 @@ struct RecordingUpstream {
                         recv_timeout(client, unexpected, sizeof(unexpected), 100);
                     if (peer_result == -EAGAIN) continue;
                     if (peer_result == 0 || peer_result == -ECONNRESET) {
+                        struct timespec now{};
+                        if (clock_gettime(CLOCK_MONOTONIC, &now) == 0) {
+                            const u64 timestamp = static_cast<u64>(now.tv_sec) * 1000000000ull +
+                                                  static_cast<u64>(now.tv_nsec);
+                            s->first_peer_closed_ns.store(timestamp, std::memory_order_release);
+                        }
                         s->first_peer_closed.store(true, std::memory_order_release);
                     } else if (peer_result > 0) {
                         s->first_peer_unexpected_data.store(true, std::memory_order_release);
@@ -21240,6 +21268,137 @@ TEST(route, public_paired_head_source_recv_timeout_reuses_downstream_iouring) {
     }
 }
 
+TEST(route, public_ordinary_source_fragmented_response_deadline_refresh_iouring) {
+    using namespace rut;
+    if (!iouring_socket_live()) SKIP("io_uring async socket ops unavailable in this environment");
+    static constexpr char kOrigin[] =
+        "HTTP/1.1 200 OK\r\nServer: origin\r\n"
+        "Date: Tue, 01 Jan 2030 00:00:00 GMT\r\n"
+        "Content-Length: 5\r\n\r\n";
+    static constexpr char kExpected[] =
+        "HTTP/1.1 200 OK\r\n"
+        "Server: deadline-test\r\n"
+        "Date: XXXXXXXXXXXXXXXXXXXXXXXXXXXXX\r\n"
+        "Content-Length: 5\r\n"
+        "Connection: keep-alive\r\n\r\n";
+    static constexpr u32 kFragmentSize = 16;
+    static constexpr u32 kFragmentDelayUs = 250000;
+    static constexpr u32 kExpectedFragments =
+        (sizeof(kOrigin) - 1 + kFragmentSize - 1) / kFragmentSize;
+    static_assert(kExpectedFragments >= 3);
+
+    RecordingUpstream backend;
+    backend.response = kOrigin;
+    backend.response_len = sizeof(kOrigin) - 1;
+    backend.response_chunk_size = kFragmentSize;
+    backend.response_chunk_delay_us = kFragmentDelayUs;
+    backend.keep_open = true;
+    REQUIRE(backend.setup());
+
+    PublicResponseReadDeadlineSourceResources resources;
+    REQUIRE(resources.compile(backend.port));
+    REQUIRE_EQ(resources.rir.module.policy_bundle_count, 1u);
+    CHECK_EQ(resources.rir.module.policy_bundles[0].response_read_timeout_seconds, 1u);
+    REQUIRE_EQ(resources.cfg.policy_bundle_count, 1u);
+    CHECK_EQ(resources.cfg.policy_bundles[0].response_read_timeout_seconds, 1u);
+    CHECK_EQ(resources.cfg.policy_bundles[0].response_policy_id, 1u);
+    CHECK_EQ(resources.cfg.policy_bundles[0].failure_policy_id, 1u);
+    CHECK_EQ(resources.cfg.policy_bundles[0].timeout_failure_policy_id, 2u);
+
+    Shard<IoUringEventLoop> shard;
+    i32 listen_fd = create_listen_socket(0).value_or(-1);
+    REQUIRE_GE(listen_fd, 0);
+    struct ShardGuard {
+        Shard<IoUringEventLoop>& shard;
+        i32& listen_fd;
+        bool spawned = false;
+        ~ShardGuard() {
+            if (spawned) {
+                shard.stop();
+                shard.join();
+            }
+            shard.shutdown();
+            if (listen_fd >= 0) close(listen_fd);
+        }
+    } shard_guard{shard, listen_fd};
+    const u16 port = get_port(listen_fd);
+    REQUIRE(shard.init(0, listen_fd).has_value());
+    shard.route_config = &resources.cfg;
+    REQUIRE(shard.loop != nullptr);
+    REQUIRE_EQ(shard.loop->upstream_timeout, IoUringEventLoop::kDefaultUpstreamTimeout);
+    REQUIRE_GT(IoUringEventLoop::kDefaultUpstreamTimeout, 8u);
+    REQUIRE(shard.spawn(-1).has_value());
+    shard_guard.spawned = true;
+    usleep(50000);
+
+    struct ClientGuard {
+        i32 fd;
+        ~ClientGuard() {
+            if (fd >= 0) close(fd);
+        }
+    } client{connect_to(port)};
+    REQUIRE_GE(client.fd, 0);
+    set_socket_timeouts(client.fd, 6);
+    static constexpr char kRequest[] =
+        "HEAD /deadline?fragmented=1 HTTP/1.1\r\nHost: client.example\r\n"
+        "X-Test: fragmented\r\n\r\n";
+    REQUIRE(send_all(client.fd, kRequest, sizeof(kRequest) - 1));
+
+    char response[1024]{};
+    u32 response_len = 0;
+    REQUIRE(read_public_head_response(
+        client.fd, false, response, sizeof(response), response_len, 6000));
+    struct timespec client_completed{};
+    REQUIRE_EQ(clock_gettime(CLOCK_MONOTONIC, &client_completed), 0);
+    const u64 client_completed_ns = static_cast<u64>(client_completed.tv_sec) * 1000000000ull +
+                                    static_cast<u64>(client_completed.tv_nsec);
+    REQUIRE(normalize_public_date(response, response_len));
+    REQUIRE_EQ(response_len, static_cast<u32>(strlen(kExpected)));
+    CHECK_EQ(memcmp(response, kExpected, response_len), 0);
+
+    const u32 fragment_count =
+        backend.first_response_fragment_count.load(std::memory_order_acquire);
+    REQUIRE_EQ(fragment_count, kExpectedFragments);
+    u64 fragment_times[RecordingUpstream::kMaxFirstResponseFragments]{};
+    for (u32 i = 0; i < fragment_count; i++) {
+        fragment_times[i] =
+            backend.first_response_fragment_sent_ns[i].load(std::memory_order_acquire);
+        REQUIRE_NE(fragment_times[i], 0u);
+        if (i == 0) continue;
+        const double gap = static_cast<double>(fragment_times[i] - fragment_times[i - 1]) / 1e9;
+        CHECK_GT(gap, 0.10);
+        CHECK_LT(gap, 0.65);
+    }
+    REQUIRE_GT(client_completed_ns, fragment_times[0]);
+    const double client_completion_time =
+        static_cast<double>(client_completed_ns - fragment_times[0]) / 1e9;
+    CHECK_GT(client_completion_time, 1.10);
+    CHECK_LT(client_completion_time, 4.0);
+
+    for (u32 waited = 0; waited < 600 && backend.request_count.load(std::memory_order_acquire) < 1;
+         waited++)
+        usleep(5000);
+    REQUIRE_EQ(backend.accepted_count.load(std::memory_order_acquire), 1u);
+    REQUIRE_EQ(backend.request_count.load(std::memory_order_acquire), 1u);
+    char expected_request[256]{};
+    const int expected_request_len =
+        snprintf(expected_request,
+                 sizeof(expected_request),
+                 "HEAD /deadline?fragmented=1 HTTP/1.1\r\nHost: 127.0.0.1:%u\r\n"
+                 "X-Test: fragmented\r\n\r\n",
+                 backend.port);
+    REQUIRE_GT(expected_request_len, 0);
+    REQUIRE_EQ(backend.request_history_len[0], static_cast<u32>(expected_request_len));
+    REQUIRE_EQ(backend.request_history_header_len[0], static_cast<u32>(expected_request_len));
+    CHECK_EQ(memcmp(backend.request_history[0], expected_request, expected_request_len), 0);
+    CHECK_EQ(backend.request_body_len, 0u);
+    // The recorder sleeps after its final configured fragment. Wait past that
+    // delay so an accidental queued reconnect cannot remain hidden behind it.
+    usleep(350000);
+    CHECK_EQ(backend.accepted_count.load(std::memory_order_acquire), 1u);
+    CHECK_EQ(backend.request_count.load(std::memory_order_acquire), 1u);
+}
+
 TEST(route, public_ordinary_source_narrow_first_response_deadline_iouring) {
     using namespace rut;
     if (!iouring_socket_live()) SKIP("io_uring async socket ops unavailable in this environment");
@@ -21407,6 +21566,177 @@ TEST(route, public_ordinary_source_narrow_first_response_deadline_iouring) {
     REQUIRE_EQ(backend.request_history_header_len[1], static_cast<u32>(expected_request_len));
     CHECK_EQ(memcmp(backend.request_history[1], expected_request, expected_request_len), 0);
     CHECK_EQ(backend.request_body_len, 0u);
+}
+
+TEST(route, public_ordinary_source_progress_then_response_deadline_iouring) {
+    using namespace rut;
+    if (!iouring_socket_live()) SKIP("io_uring async socket ops unavailable in this environment");
+    static constexpr char kIncompleteOrigin[] = "HTTP/1.1 200 OK\r\nX-Progress: one\r\n";
+    static constexpr char kSecondOrigin[] =
+        "HTTP/1.1 200 OK\r\nServer: origin\r\n"
+        "Date: Tue, 01 Jan 2030 00:00:00 GMT\r\n"
+        "Content-Length: 7\r\n\r\n";
+    static constexpr char kDeadlineExpected[] =
+        "HTTP/1.1 504 First Response Deadline\r\n"
+        "Server: deadline-test\r\n"
+        "Date: XXXXXXXXXXXXXXXXXXXXXXXXXXXXX\r\n"
+        "Content-Type: text/plain\r\n"
+        "Content-Length: 20\r\n"
+        "Connection: keep-alive\r\n\r\n";
+    static constexpr char kSecondExpected[] =
+        "HTTP/1.1 200 OK\r\n"
+        "Server: deadline-test\r\n"
+        "Date: XXXXXXXXXXXXXXXXXXXXXXXXXXXXX\r\n"
+        "Content-Length: 7\r\n"
+        "Connection: keep-alive\r\n\r\n";
+
+    RecordingUpstream backend;
+    backend.response = kIncompleteOrigin;
+    backend.response_len = sizeof(kIncompleteOrigin) - 1;
+    backend.response_after_first = kSecondOrigin;
+    backend.response_after_first_len = sizeof(kSecondOrigin) - 1;
+    backend.wait_first_response_for_peer_close = true;
+    REQUIRE(backend.setup());
+
+    PublicResponseReadDeadlineSourceResources resources;
+    REQUIRE(resources.compile(backend.port));
+    REQUIRE_EQ(resources.rir.module.policy_bundle_count, 1u);
+    CHECK_EQ(resources.rir.module.policy_bundles[0].response_read_timeout_seconds, 1u);
+    REQUIRE_EQ(resources.cfg.policy_bundle_count, 1u);
+    CHECK_EQ(resources.cfg.policy_bundles[0].response_read_timeout_seconds, 1u);
+    CHECK_EQ(resources.cfg.policy_bundles[0].response_policy_id, 1u);
+    CHECK_EQ(resources.cfg.policy_bundles[0].failure_policy_id, 1u);
+    CHECK_EQ(resources.cfg.policy_bundles[0].timeout_failure_policy_id, 2u);
+
+    Shard<IoUringEventLoop> shard;
+    i32 listen_fd = create_listen_socket(0).value_or(-1);
+    REQUIRE_GE(listen_fd, 0);
+    struct ShardGuard {
+        Shard<IoUringEventLoop>& shard;
+        i32& listen_fd;
+        bool spawned = false;
+        ~ShardGuard() {
+            if (spawned) {
+                shard.stop();
+                shard.join();
+            }
+            shard.shutdown();
+            if (listen_fd >= 0) close(listen_fd);
+        }
+    } shard_guard{shard, listen_fd};
+    const u16 port = get_port(listen_fd);
+    REQUIRE(shard.init(0, listen_fd).has_value());
+    shard.route_config = &resources.cfg;
+    REQUIRE(shard.loop != nullptr);
+    REQUIRE_EQ(shard.loop->upstream_timeout, IoUringEventLoop::kDefaultUpstreamTimeout);
+    REQUIRE_GT(IoUringEventLoop::kDefaultUpstreamTimeout, 8u);
+    REQUIRE(shard.spawn(-1).has_value());
+    shard_guard.spawned = true;
+    usleep(50000);
+
+    struct ClientGuard {
+        i32 fd;
+        ~ClientGuard() {
+            if (fd >= 0) close(fd);
+        }
+    } client{connect_to(port)};
+    REQUIRE_GE(client.fd, 0);
+    set_socket_timeouts(client.fd, 8);
+    static constexpr char kRequest1[] =
+        "HEAD /deadline?progress=1 HTTP/1.1\r\nHost: client.example\r\n"
+        "X-Test: partial\r\n\r\n";
+    static constexpr char kRequest2[] =
+        "HEAD /deadline?complete=2 HTTP/1.1\r\nHost: client.example\r\n"
+        "X-Test: final\r\n\r\n";
+    REQUIRE(send_all(client.fd, kRequest1, sizeof(kRequest1) - 1));
+    for (u32 waited = 0;
+         waited < 600 && (!backend.first_response_sent_open.load(std::memory_order_acquire) ||
+                          backend.request_count.load(std::memory_order_acquire) < 1);
+         waited++)
+        usleep(5000);
+    REQUIRE(backend.first_response_sent_open.load(std::memory_order_acquire));
+    REQUIRE_EQ(backend.first_response_fragment_count.load(std::memory_order_acquire), 1u);
+    const u64 progress_sent_ns =
+        backend.first_response_fragment_sent_ns[0].load(std::memory_order_acquire);
+    REQUIRE_NE(progress_sent_ns, 0u);
+    REQUIRE_EQ(backend.accepted_count.load(std::memory_order_acquire), 1u);
+    REQUIRE_EQ(backend.request_count.load(std::memory_order_acquire), 1u);
+
+    char expected_request[256]{};
+    int expected_request_len =
+        snprintf(expected_request,
+                 sizeof(expected_request),
+                 "HEAD /deadline?progress=1 HTTP/1.1\r\nHost: 127.0.0.1:%u\r\n"
+                 "X-Test: partial\r\n\r\n",
+                 backend.port);
+    REQUIRE_GT(expected_request_len, 0);
+    REQUIRE_EQ(backend.request_history_len[0], static_cast<u32>(expected_request_len));
+    REQUIRE_EQ(backend.request_history_header_len[0], static_cast<u32>(expected_request_len));
+    CHECK_EQ(memcmp(backend.request_history[0], expected_request, expected_request_len), 0);
+
+    char response[1024]{};
+    u32 response_len = 0;
+    REQUIRE(read_public_head_response(
+        client.fd, false, response, sizeof(response), response_len, 8000));
+    struct timespec response_finished{};
+    REQUIRE_EQ(clock_gettime(CLOCK_MONOTONIC, &response_finished), 0);
+    const u64 response_finished_ns = static_cast<u64>(response_finished.tv_sec) * 1000000000ull +
+                                     static_cast<u64>(response_finished.tv_nsec);
+    const double response_elapsed =
+        static_cast<double>(response_finished_ns - progress_sent_ns) / 1e9;
+    CHECK_GT(response_elapsed, 1.0);
+    CHECK_LT(response_elapsed, 6.0);
+    REQUIRE(normalize_public_date(response, response_len));
+    REQUIRE_EQ(response_len, static_cast<u32>(strlen(kDeadlineExpected)));
+    CHECK_EQ(memcmp(response, kDeadlineExpected, response_len), 0);
+
+    for (u32 waited = 0;
+         waited < 600 && !backend.first_peer_closed.load(std::memory_order_acquire) &&
+         !backend.first_peer_unexpected_data.load(std::memory_order_acquire) &&
+         !backend.first_peer_close_timed_out.load(std::memory_order_acquire) &&
+         !backend.first_peer_observation_aborted.load(std::memory_order_acquire);
+         waited++)
+        usleep(5000);
+    REQUIRE(backend.first_peer_closed.load(std::memory_order_acquire));
+    CHECK_FALSE(backend.first_peer_unexpected_data.load(std::memory_order_acquire));
+    CHECK_FALSE(backend.first_peer_close_timed_out.load(std::memory_order_acquire));
+    CHECK_FALSE(backend.first_peer_observation_aborted.load(std::memory_order_acquire));
+    const u64 peer_closed_ns = backend.first_peer_closed_ns.load(std::memory_order_acquire);
+    REQUIRE_GT(peer_closed_ns, progress_sent_ns);
+    const double origin_quiet_time = static_cast<double>(peer_closed_ns - progress_sent_ns) / 1e9;
+    CHECK_GT(origin_quiet_time, 1.0);
+    CHECK_LT(origin_quiet_time, 6.0);
+    CHECK_EQ(backend.first_response_fragment_count.load(std::memory_order_acquire), 1u);
+    REQUIRE_EQ(backend.accepted_count.load(std::memory_order_acquire), 1u);
+    REQUIRE_EQ(backend.request_count.load(std::memory_order_acquire), 1u);
+
+    REQUIRE(send_all(client.fd, kRequest2, sizeof(kRequest2) - 1));
+    memset(response, 0, sizeof(response));
+    REQUIRE(read_public_head_response(
+        client.fd, false, response, sizeof(response), response_len, 5000));
+    REQUIRE(normalize_public_date(response, response_len));
+    REQUIRE_EQ(response_len, static_cast<u32>(strlen(kSecondExpected)));
+    CHECK_EQ(memcmp(response, kSecondExpected, response_len), 0);
+
+    for (u32 waited = 0; waited < 600 && backend.request_count.load(std::memory_order_acquire) < 2;
+         waited++)
+        usleep(5000);
+    REQUIRE_EQ(backend.accepted_count.load(std::memory_order_acquire), 2u);
+    REQUIRE_EQ(backend.request_count.load(std::memory_order_acquire), 2u);
+    memset(expected_request, 0, sizeof(expected_request));
+    expected_request_len = snprintf(expected_request,
+                                    sizeof(expected_request),
+                                    "HEAD /deadline?complete=2 HTTP/1.1\r\nHost: 127.0.0.1:%u\r\n"
+                                    "X-Test: final\r\n\r\n",
+                                    backend.port);
+    REQUIRE_GT(expected_request_len, 0);
+    REQUIRE_EQ(backend.request_history_len[1], static_cast<u32>(expected_request_len));
+    REQUIRE_EQ(backend.request_history_header_len[1], static_cast<u32>(expected_request_len));
+    CHECK_EQ(memcmp(backend.request_history[1], expected_request, expected_request_len), 0);
+    CHECK_EQ(backend.request_body_len, 0u);
+    usleep(100000);
+    CHECK_EQ(backend.accepted_count.load(std::memory_order_acquire), 2u);
+    CHECK_EQ(backend.request_count.load(std::memory_order_acquire), 2u);
 }
 
 TEST(route, public_paired_head_source_malformed_open_peer_reuses_downstream_iouring) {
