@@ -18296,8 +18296,9 @@ TEST(route, failure_policy_bundle_invalid_id_rejects_before_upstream_side_effect
     const RouteConfig* active = &cfg;
     ScopedProxyLoop proxy;
     REQUIRE(proxy.setup(&active, 1000));
-    // Direct-RIR callers can return an out-of-range bundle id.  The runtime
-    // must reject it before selecting a backend or opening an upstream fd.
+    // Direct-RIR callers can return an out-of-range bundle id. The runtime
+    // rejects it at the zero-byte preflight boundary before selecting a backend
+    // or opening an upstream fd.
     i32 invalid_client = connect_to(proxy.port);
     REQUIRE_GE(invalid_client, 0);
     set_socket_timeouts(invalid_client, 2);
@@ -18307,11 +18308,7 @@ TEST(route, failure_policy_bundle_invalid_id_rejects_before_upstream_side_effect
     const i32 invalid_response_len =
         recv_timeout(invalid_client, invalid_response, sizeof(invalid_response), 2000);
     close(invalid_client);
-    CHECK_GT(invalid_response_len, 0);
-    CHECK(buf_contains(invalid_response,
-                       static_cast<u32>(invalid_response_len),
-                       "400",
-                       static_cast<u32>(strlen("400"))));
+    CHECK_EQ(invalid_response_len, 0);
     usleep(100000);
     CHECK_EQ(backend.accepted_count.load(std::memory_order_acquire), 0u);
     CHECK_EQ(backend.request_count.load(std::memory_order_acquire), 0u);
