@@ -70,6 +70,7 @@ public:
     // io_uring loop doesn't support that yet, so sweep_health_probes only re-arms
     // deadlines here and issues no connects (epoll-only this slice).
     static constexpr bool kSupportsHealthProbe = false;
+    static constexpr bool kSupportsExplicitFirstResponseDeadline = true;
     static constexpr u32 kTlsInputSize = SlicePool::kSliceSize + 1024;
     // Owned ciphertext output buffer + watermark backpressure for proxy-over-TLS
     // streaming on io_uring. See docs/iouring-tls-output-buffer.md.
@@ -118,6 +119,7 @@ public:
     // boundary eligible. The ordinary hot path avoids a connection-table scan;
     // the run loop consumes this after the complete wait batch.
     bool http1_boundary_ready_pending;
+    bool response_read_deadline_expiry_pending;
 
     // Deferred accepts: accepted fds that couldn't be allocated during
     // dispatch because all slots were in pending_free.
@@ -192,6 +194,7 @@ public:
         pending_free_count = 0;
         upstream_retirement_retry_count = 0;
         http1_boundary_ready_pending = false;
+        response_read_deadline_expiry_pending = false;
         deferred_accept_count = 0;
         timer.init();
         for (u32 i = 0; i < kMaxConns; i++) {
@@ -240,14 +243,7 @@ public:
                 running_.store(false, std::memory_order_release);
                 break;
             }
-            for (u32 i = 0; i < n; i++) {
-                dispatch(events[i]);
-            }
-            // Retirement/header rendezvous owners publish only readiness during
-            // dispatch. Admit parked HTTP/1 request boundaries after every CQE
-            // in this wait batch, before reclamation or accept reuse.
-            resume_deferred_http1_boundaries();
-            reclaim_pending();
+            dispatch_batch(events, n);
             retry_deferred_accepts();
             poll_command();
             // Re-arm timers after a possible hot reload (see EpollEventLoop::run).
@@ -1472,6 +1468,116 @@ public:
         return false;
     }
 
+    [[nodiscard]] bool arm_first_response_read_deadline(Connection& c) {
+        const RouteConfig* cfg = c.request_config;
+        const u16 bundle_id = c.response_read_deadline_bundle_id;
+        if (c.response_read_deadline_state != ResponseReadDeadlineState::Validated ||
+            c.response_read_deadline_owner_generation == 0 ||
+            c.response_read_deadline_owner_generation != c.response_read_deadline_generation ||
+            cfg == nullptr || !cfg->policy_bundle_id_is_valid(bundle_id))
+            return false;
+        const auto& bundle = cfg->policy_bundles[bundle_id - 1];
+        if (!response_read_timeout_seconds_valid(bundle.response_read_timeout_seconds) ||
+            bundle.response_read_timeout_seconds != c.response_read_deadline_seconds ||
+            bundle.response_policy_id != c.response_policy_id ||
+            bundle.failure_policy_id != c.failure_policy_id ||
+            bundle.timeout_failure_policy_id != c.timeout_failure_policy_id)
+            return false;
+        if (c.upstream_idx >= cfg->upstream_count ||
+            cfg->upstreams[c.upstream_idx].addr_count != 1 ||
+            cfg->upstreams[c.upstream_idx].addrs[0].sin_family != AF_INET)
+            return false;
+        const u32 ordinary_pending = c.recv_armed ? 1u : 0u;
+        if (c.state != ConnState::Proxying || c.protocol != ConnProtocol::Http11 || c.tls_active ||
+            c.upstream_fd < 0 || c.upstream_reused || c.upstream_attempts != 1 ||
+            !valid_upstream_episode(c.upstream_episode) || c.upstream_episode_quarantined ||
+            !c.request_upload_complete || c.upstream_request_incomplete ||
+            c.upstream_recv_buf.len() != 0 || c.on_upstream_recv != &on_upstream_response<Self> ||
+            c.on_upstream_send != nullptr || c.upstream_connect_armed || c.upstream_send_armed ||
+            c.upstream_recv_armed || c.upstream_recv_paused_for_send ||
+            c.upstream_recv_pause_cancel_pending || c.upstream_recv_pause_rearm_pending ||
+            c.upstream_recv_cancel_inflight || c.upstream_retirement_active ||
+            c.upstream_retirement_target_owned != 0 || c.upstream_retirement_cancel_owned != 0 ||
+            c.upstream_retirement_cancel_retry != 0 || c.upstream_close_episode != 0 ||
+            c.upstream_close_target_owned != 0 || c.upstream_close_cancel_owned != 0 ||
+            c.upstream_close_pause_cancel_owned || c.idle_return_fd >= 0 ||
+            c.idle_return_config != nullptr || c.close_after_idle_return ||
+            c.h2_proxy_recv_draining || c.h2_proxy_synth_quarantined ||
+            c.pending_ops != ordinary_pending)
+            return false;
+        if (!backend.add_first_response_recv(c.upstream_fd, c.id, c.upstream_episode)) {
+            c.clear_response_read_deadline();
+            return false;
+        }
+        c.pending_ops++;
+        c.upstream_recv_armed = true;
+        c.response_read_deadline_upstream_episode = c.upstream_episode;
+        c.response_read_deadline_state = ResponseReadDeadlineState::Armed;
+        timer.refresh(&c, c.response_read_deadline_seconds);
+        return true;
+    }
+
+    void disarm_response_read_deadline(Connection& c) {
+        if (c.response_read_deadline_state == ResponseReadDeadlineState::None) {
+            c.response_read_deadline_first_batch = false;
+            return;
+        }
+        const bool owns_timer =
+            c.response_read_deadline_state == ResponseReadDeadlineState::Armed ||
+            c.response_read_deadline_state == ResponseReadDeadlineState::ExpiryPending;
+        if (owns_timer) timer.remove(&c);
+        c.clear_response_read_deadline();
+        c.response_read_deadline_first_batch = false;
+    }
+
+    void resolve_response_read_deadline_expiries() {
+        if (!response_read_deadline_expiry_pending) return;
+        response_read_deadline_expiry_pending = false;
+        for (u32 id = 0; id < kMaxConns; id++) {
+            Connection& c = conns[id];
+            if (c.response_read_deadline_state != ResponseReadDeadlineState::ExpiryPending)
+                continue;
+            const RouteConfig* cfg = c.request_config;
+            bool valid =
+                c.id == id && c.fd >= 0 && c.state == ConnState::Proxying &&
+                c.response_read_deadline_owner_generation != 0 &&
+                c.response_read_deadline_owner_generation == c.response_read_deadline_generation &&
+                c.response_read_deadline_upstream_episode == c.upstream_episode &&
+                valid_upstream_episode(c.upstream_episode) && c.upstream_recv_armed &&
+                c.on_upstream_recv == &on_upstream_response<Self> && cfg != nullptr &&
+                cfg->policy_bundle_id_is_valid(c.response_read_deadline_bundle_id);
+            if (valid) {
+                const auto& bundle = cfg->policy_bundles[c.response_read_deadline_bundle_id - 1];
+                valid = response_read_timeout_seconds_valid(bundle.response_read_timeout_seconds) &&
+                        bundle.response_read_timeout_seconds == c.response_read_deadline_seconds &&
+                        bundle.response_policy_id == c.response_policy_id &&
+                        bundle.failure_policy_id == c.failure_policy_id &&
+                        bundle.timeout_failure_policy_id == c.timeout_failure_policy_id;
+            }
+            if (valid) {
+                valid = c.upstream_idx < cfg->upstream_count && c.upstream_attempts == 1 &&
+                        cfg->upstreams[c.upstream_idx].addr_count == 1 &&
+                        cfg->upstreams[c.upstream_idx].addrs[0].sin_family == AF_INET;
+            }
+            disarm_response_read_deadline(c);
+            if (!valid || !try_prebuilt_strict_read_timeout<Self>(this, c)) {
+                if (c.fd >= 0) close_conn(c);
+            }
+        }
+    }
+
+    // Public deterministic seam used by the production run loop and focused
+    // same-batch arbitration tests.
+    void dispatch_batch(const IoEvent* events, u32 count) {
+        for (u32 i = 0; i < count; i++) dispatch(events[i]);
+        resolve_response_read_deadline_expiries();
+        // Retirement/header rendezvous owners publish only readiness during
+        // dispatch. Admit parked HTTP/1 request boundaries after every CQE in
+        // this wait batch, before reclamation or accept reuse.
+        resume_deferred_http1_boundaries();
+        reclaim_pending();
+    }
+
     bool pause_upstream_recv_impl(Connection& c) {
         if (!c.upstream_recv_armed) return true;  // nothing armed — no cancel, no CQE
         if (c.upstream_recv_pause_cancel_pending) {
@@ -1581,6 +1687,8 @@ public:
     }
 
     void close_conn_impl(Connection& c) {
+        disarm_response_read_deadline(c);
+        timer.remove(&c);
         // A close is terminal for a parked request boundary. Readiness may have
         // been published earlier in the same CQE batch; batch-end scans must see
         // cleared state and never repeat request-1 completion on a dead slot.
@@ -1860,10 +1968,15 @@ public:
                     timer.tick([this](Connection* c) {
                         // See epoll_event_loop.h: timer fires for keepalive,
                         // wait(ms), or wait-any timeout completion.
-                        if (c->pending_handler_fn &&
-                            (c->pending_yield_kind == jit::YieldKind::Timer ||
-                             (c->yield_armed && yield_kind_matches_event(c->pending_yield_kind,
-                                                                         IoEventType::Timeout)))) {
+                        if (c->response_read_deadline_state == ResponseReadDeadlineState::Armed) {
+                            c->response_read_deadline_state =
+                                ResponseReadDeadlineState::ExpiryPending;
+                            response_read_deadline_expiry_pending = true;
+                        } else if (c->pending_handler_fn &&
+                                   (c->pending_yield_kind == jit::YieldKind::Timer ||
+                                    (c->yield_armed &&
+                                     yield_kind_matches_event(c->pending_yield_kind,
+                                                              IoEventType::Timeout)))) {
                             c->yield_armed = false;
                             c->yield_timeout_armed = false;
                             c->resume_event_kind = jit::YieldKind::Timer;
@@ -2039,6 +2152,13 @@ public:
                             conn.upstream_recv_buf.reset();
                         }
                         if (conn.pending_ops > 0) conn.pending_ops--;
+                        if (conn.response_read_deadline_state == ResponseReadDeadlineState::Armed ||
+                            conn.response_read_deadline_state ==
+                                ResponseReadDeadlineState::ExpiryPending) {
+                            disarm_response_read_deadline(conn);
+                            if (conn.fd >= 0) this->close_conn(conn);
+                            break;
+                        }
                         if (conn.fd < 0) {
                             // Closed conn (e.g. the close-path cancel of an armed upstream
                             // recv): reclaim the slot if this drained the last op, since the
@@ -2141,6 +2261,23 @@ public:
                             }
                         }
                     }
+                    if (ev.type == IoEventType::UpstreamRecv &&
+                        (conn.response_read_deadline_state == ResponseReadDeadlineState::Armed ||
+                         conn.response_read_deadline_state ==
+                             ResponseReadDeadlineState::ExpiryPending)) {
+                        const bool matching_owner =
+                            conn.response_read_deadline_owner_generation != 0 &&
+                            conn.response_read_deadline_owner_generation ==
+                                conn.response_read_deadline_generation &&
+                            conn.response_read_deadline_upstream_episode == conn.upstream_episode &&
+                            ev.upstream_episode == conn.upstream_episode && ev.aux == 0;
+                        if (!matching_owner) {
+                            this->close_conn(conn);
+                            break;
+                        }
+                        disarm_response_read_deadline(conn);
+                        conn.response_read_deadline_first_batch = true;
+                    }
                     const bool has_recv_slot =
                         conn.on_recv && (!conn.uses_iouring_tls() || conn.tls_pending_on_recv);
                     if (has_recv_slot || conn.on_send || conn.on_upstream_recv ||
@@ -2148,7 +2285,10 @@ public:
                         // See EpollEventLoop: don't let stray events bump a
                         // @throttle-paused connection's byte-rate-window timer back
                         // to the keepalive timeout.
-                        if (!conn.throttle_paused)
+                        if (!conn.throttle_paused &&
+                            conn.response_read_deadline_state != ResponseReadDeadlineState::Armed &&
+                            conn.response_read_deadline_state !=
+                                ResponseReadDeadlineState::ExpiryPending)
                             timer.refresh(&conn,
                                           conn.state == ConnState::Proxying ? upstream_timeout
                                                                             : keepalive_timeout);

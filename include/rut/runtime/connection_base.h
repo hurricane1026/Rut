@@ -45,6 +45,14 @@ enum class ConnState : u8 {
     Count,
 };
 
+enum class ResponseReadDeadlineState : u8 {
+    None,
+    Preflight,
+    Validated,
+    Armed,
+    ExpiryPending,
+};
+
 // Request-buffer ownership captured by the internal HTTP/1 prebuilt-response
 // rendezvous.  The value describes where request 1 still lives while an old
 // upstream episode and the downstream header send drain independently.
@@ -451,6 +459,32 @@ struct ConnectionBase {
     // upstream_episode, this deliberately survives reset(): a quarantined slot
     // must never return to the allocator or wrap back to an old kernel token.
     bool upstream_episode_quarantined = false;
+
+    // Persistent generation plus current-owner metadata for the bounded
+    // explicit first-response deadline.  The generation deliberately survives
+    // reset()/slot reuse; active ownership does not.
+    u32 response_read_deadline_generation = 0;
+    u32 response_read_deadline_owner_generation;
+    u32 response_read_deadline_upstream_episode;
+    u16 response_read_deadline_bundle_id;
+    u8 response_read_deadline_seconds;
+    ResponseReadDeadlineState response_read_deadline_state;
+    bool response_read_deadline_first_batch;
+
+    bool next_response_read_deadline_generation() {
+        if (response_read_deadline_generation == 0xFFFFFFFFu) return false;
+        ++response_read_deadline_generation;
+        response_read_deadline_owner_generation = response_read_deadline_generation;
+        return true;
+    }
+
+    void clear_response_read_deadline() {
+        response_read_deadline_owner_generation = 0;
+        response_read_deadline_upstream_episode = 0;
+        response_read_deadline_bundle_id = 0;
+        response_read_deadline_seconds = 0;
+        response_read_deadline_state = ResponseReadDeadlineState::None;
+    }
 
     // Advance the token without wrapping. Zero is the invalid sentinel and
     // max is the final representable token; callers must quarantine the
@@ -864,6 +898,10 @@ struct ConnectionBase {
         // initialized at accept-time via EventLoop::alloc_conn_impl.
         // upstream_episode follows the same persistence rule for the future
         // upstream-event token contract and is intentionally not reset here.
+        // response_read_deadline_generation follows that persistence rule too;
+        // only the live owner is cleared.
+        clear_response_read_deadline();
+        response_read_deadline_first_batch = false;
         request_config = nullptr;
         listener_context = {};
         pending_handler_fn = nullptr;

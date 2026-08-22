@@ -546,6 +546,78 @@ extern const char kResponse200[];
 extern const char kResponse200Close[];
 
 template <typename Loop>
+bool prepare_response_read_deadline_preflight(Loop* loop,
+                                              Connection& conn,
+                                              const RouteEntry* route,
+                                              const RouteConfig* config) {
+    if (route == nullptr || route->preflight_forward_policy_bundle_id == 0) return true;
+    if constexpr (!requires { Loop::kSupportsExplicitFirstResponseDeadline; }) {
+        loop->close_conn(conn);
+        return false;
+    } else if constexpr (!Loop::kSupportsExplicitFirstResponseDeadline) {
+        loop->close_conn(conn);
+        return false;
+    } else {
+        const u16 id = route->preflight_forward_policy_bundle_id;
+        if (config == nullptr || conn.request_config != config ||
+            !config->policy_bundle_id_is_valid(id) || route->action != RouteAction::JitHandler ||
+            route->fn == nullptr || route->needs_req_body || route->rate_limit.count != 0 ||
+            route->throttle_down_bps != 0 || route->ws_terminate ||
+            conn.response_read_deadline_state != ResponseReadDeadlineState::None) {
+            loop->close_conn(conn);
+            return false;
+        }
+        const auto& bundle = config->policy_bundles[id - 1];
+        if (!response_read_timeout_seconds_valid(bundle.response_read_timeout_seconds) ||
+            bundle.response_policy_id == 0 || bundle.failure_policy_id == 0 ||
+            bundle.timeout_failure_policy_id == 0 ||
+            !config->response_policy_id_is_valid(bundle.response_policy_id) ||
+            !config->failure_policy_id_is_valid(bundle.failure_policy_id) ||
+            !config->timeout_failure_policy_id_is_valid(bundle.timeout_failure_policy_id) ||
+            !forward_policy_head_modes_compatible(*config,
+                                                  bundle.response_policy_id,
+                                                  bundle.failure_policy_id,
+                                                  bundle.timeout_failure_policy_id)) {
+            loop->close_conn(conn);
+            return false;
+        }
+        const auto& response = config->response_policies[bundle.response_policy_id - 1];
+        const auto& failure = config->failure_policies[bundle.failure_policy_id - 1];
+        const auto& timeout = config->failure_policies[bundle.timeout_failure_policy_id - 1];
+        if (response.version != ResponsePolicyVersion::Http11 ||
+            response.framing != ResponsePolicyFraming::ContentLength ||
+            response.connection != ResponsePolicyConnection::Request ||
+            response.head_mode != ResponsePolicyHeadMode::SuppressBody ||
+            failure.version != ForwardFailurePolicyVersion::Http11 ||
+            failure.status_code != kStatusBadGateway ||
+            failure.connection != ForwardFailurePolicyConnection::Request ||
+            failure.head_mode != FailurePolicyHeadMode::SuppressBody ||
+            timeout.version != ForwardFailurePolicyVersion::Http11 ||
+            timeout.connection != ForwardFailurePolicyConnection::Request ||
+            timeout.head_mode != FailurePolicyHeadMode::SuppressBody ||
+            conn.protocol != ConnProtocol::Http11 || conn.tls_active || conn.req_malformed ||
+            conn.req_body_mode != BodyMode::None || conn.req_body_remaining != 0 ||
+            conn.request_body_fully_buffered || conn.req_client_has_transfer_encoding ||
+            conn.req_client_has_te || conn.req_client_has_expect ||
+            conn.req_client_has_upgrade_header || conn.req_client_connection_count != 0 ||
+            conn.req_wants_upgrade ||
+            !response_policy_suppress_head_admitted(conn, response, /*paired_failure=*/true) ||
+            conn.pipeline_depth != 0 || conn.recv_buf.len() != conn.req_initial_send_len) {
+            loop->close_conn(conn);
+            return false;
+        }
+        if (!conn.next_response_read_deadline_generation()) {
+            loop->close_conn(conn);
+            return false;
+        }
+        conn.response_read_deadline_bundle_id = id;
+        conn.response_read_deadline_seconds = bundle.response_read_timeout_seconds;
+        conn.response_read_deadline_state = ResponseReadDeadlineState::Preflight;
+        return true;
+    }
+}
+
+template <typename Loop>
 void on_request_complete(Loop* loop, Connection& conn, u16 status, u32 resp_size);
 
 #if RUT_ENABLE_WEBSOCKET
@@ -1138,6 +1210,14 @@ void on_header_received(void* lp, Connection& conn, IoEvent ev) {
     conn.pending_forward_response_policy_id = 0;
     conn.pending_forward_failure_policy_id = 0;
     conn.pending_forward_timeout_failure_policy_id = 0;
+    if constexpr (requires(Loop* candidate, Connection& c) {
+                      candidate->disarm_response_read_deadline(c);
+                  }) {
+        loop->disarm_response_read_deadline(conn);
+    } else {
+        conn.clear_response_read_deadline();
+        conn.response_read_deadline_first_batch = false;
+    }
     conn.request_body_fully_buffered = false;
     conn.request_upload_complete = false;
     conn.response_policy_id = 0;
@@ -1241,10 +1321,7 @@ void on_header_received(void* lp, Connection& conn, IoEvent ev) {
             conn.req_path_canon, kMethodKey, route_params, &route_param_count, kMaxRouteParams);
     }
 
-    if (route_requires_response_read_timeout_preflight_close(route, config)) {
-        loop->close_conn(conn);
-        return;
-    }
+    if (!prepare_response_read_deadline_preflight(loop, conn, route, config)) return;
 
     // Per-route rate limit (fixed window). Enforced after route match, before
     // dispatch. A route may stack several rules; a request must pass every one,
@@ -1468,10 +1545,7 @@ void on_jit_request_body_recvd(void* lp, Connection& conn, IoEvent ev) {
         route = config->match_canonical(
             conn.req_path_canon, kMethodKey, route_params, &route_param_count, kMaxRouteParams);
     }
-    if (route_requires_response_read_timeout_preflight_close(route, config)) {
-        loop->close_conn(conn);
-        return;
-    }
+    if (!prepare_response_read_deadline_preflight(loop, conn, route, config)) return;
     if (!route || route->action != RouteAction::JitHandler || !route->fn) {
         loop->close_conn(conn);
         return;
@@ -1930,6 +2004,11 @@ inline bool build_h1_forward_response_headers(Connection& conn, u32 header_len, 
 template <typename Loop>
 void handle_jit_outcome(
     Loop* loop, Connection& conn, JitDispatchOutcome outcome, jit::HandlerFn fn, bool keep_alive) {
+    if (conn.response_read_deadline_state == ResponseReadDeadlineState::Preflight &&
+        outcome.kind != JitDispatchOutcome::Kind::Forward) {
+        loop->close_conn(conn);
+        return;
+    }
     switch (outcome.kind) {
         case JitDispatchOutcome::Kind::ReturnStatus: {
             conn.pending_handler_fn = nullptr;
@@ -2279,9 +2358,45 @@ void handle_jit_outcome(
                 outcome.response_read_timeout_seconds = bundle.response_read_timeout_seconds;
             }
             if (outcome.response_read_timeout_seconds != 0) {
-                // Metadata is transported honestly, but no deadline lifecycle
-                // exists yet. Reject before target/rewrite materialization,
-                // body wait, allocation, backend selection, or upstream work.
+                const bool loop_supports_deadline = [] {
+                    if constexpr (requires { Loop::kSupportsExplicitFirstResponseDeadline; })
+                        return Loop::kSupportsExplicitFirstResponseDeadline;
+                    return false;
+                }();
+                const bool target_valid =
+                    config != nullptr && outcome.upstream_id < config->upstream_count &&
+                    config->upstreams[outcome.upstream_id].addr_count == 1 &&
+                    config->upstreams[outcome.upstream_id].addrs[0].sin_family == AF_INET;
+                const bool request_policy_complete =
+                    outcome.request_policy_id == 0 ||
+                    (request_policy_is_supported(outcome.request_policy_id) &&
+                     inspect_request_policy_body(conn, outcome.request_policy_id) ==
+                         RequestPolicyBodyState::Complete);
+                if (!loop_supports_deadline ||
+                    conn.response_read_deadline_state != ResponseReadDeadlineState::Preflight ||
+                    conn.response_read_deadline_owner_generation == 0 ||
+                    conn.response_read_deadline_owner_generation !=
+                        conn.response_read_deadline_generation ||
+                    outcome.policy_bundle_id == 0 ||
+                    outcome.policy_bundle_id != conn.response_read_deadline_bundle_id ||
+                    outcome.response_read_timeout_seconds != conn.response_read_deadline_seconds ||
+                    !target_valid || !request_policy_complete || conn.target_transform_recorded ||
+                    conn.req_path_overridden || conn.req_header_override_count != 0 ||
+                    conn.req_header_override_overflow || conn.resp_header_mutation_count != 0 ||
+                    conn.resp_header_mutation_pending_count != 0 ||
+                    conn.resp_header_mutation_pending_overflow ||
+                    conn.resp_header_mutation_overflow || conn.protocol != ConnProtocol::Http11 ||
+                    conn.tls_active || conn.req_method != static_cast<u8>(LogHttpMethod::Head) ||
+                    conn.req_body_mode != BodyMode::None || conn.req_body_remaining != 0 ||
+                    conn.request_body_fully_buffered || conn.pipeline_depth != 0 ||
+                    conn.recv_buf.len() != conn.req_initial_send_len) {
+                    loop->close_conn(conn);
+                    return;
+                }
+                conn.response_read_deadline_state = ResponseReadDeadlineState::Validated;
+            } else if (conn.response_read_deadline_state != ResponseReadDeadlineState::None) {
+                // A preflight-marked route must return the same immutable bundle;
+                // absence or a mismatched outcome cannot silently shed timing.
                 loop->close_conn(conn);
                 return;
             }
@@ -2488,7 +2603,10 @@ void handle_jit_outcome(
                 }
                 if (!apply_request_policy(
                         conn, target.addrs[kBackend], outcome.request_policy_id)) {
-                    reject_request_policy(loop, conn);
+                    if (conn.response_read_deadline_state == ResponseReadDeadlineState::Validated)
+                        loop->close_conn(conn);
+                    else
+                        reject_request_policy(loop, conn);
                     return;
                 }
                 request_policy_prepared = true;
@@ -3848,6 +3966,20 @@ void on_upstream_request_sent(void* lp, Connection& conn, IoEvent ev) {
     }
     conn.upstream_start_us = monotonic_us();
     conn.set_slots(nullptr, nullptr, &on_upstream_response<Loop>, nullptr);
+    if (conn.response_read_deadline_state == ResponseReadDeadlineState::Validated) {
+        if (conn.upstream_recv_buf.len() != 0) {
+            loop->close_conn(conn);
+            return;
+        }
+        if constexpr (requires(Loop* candidate, Connection& c) {
+                          candidate->arm_first_response_read_deadline(c);
+                      }) {
+            if (!loop->arm_first_response_read_deadline(conn)) loop->close_conn(conn);
+        } else {
+            loop->close_conn(conn);
+        }
+        return;
+    }
     if (conn.upstream_recv_buf.len() > 0) {
         IoEvent synth = {conn.id,
                          static_cast<i32>(conn.upstream_recv_buf.len()),
@@ -6030,6 +6162,14 @@ inline bool build_timeout_failure_policy_response(const Connection& conn,
 
 template <typename Loop>
 inline void respond_upstream_connect_failure(Loop* loop, Connection& conn) {
+    if constexpr (requires(Loop* candidate, Connection& c) {
+                      candidate->disarm_response_read_deadline(c);
+                  }) {
+        loop->disarm_response_read_deadline(conn);
+    } else {
+        conn.clear_response_read_deadline();
+        conn.response_read_deadline_first_batch = false;
+    }
     conn.upstream_abandoned = true;
     conn.upstream_keep_alive = false;
     conn.upstream_start_us = 0;
@@ -6598,6 +6738,8 @@ inline void reject_strict_response(
 template <typename Loop>
 void on_upstream_response(void* lp, Connection& conn, IoEvent ev) {
     auto* loop = static_cast<Loop*>(lp);
+    const bool explicit_first_batch = conn.response_read_deadline_first_batch;
+    auto disarm_explicit_deadline = [&]() { conn.response_read_deadline_first_batch = false; };
 
     // An old upstream CQE may still be delivered after strict HEAD has
     // abandoned and closed the backend. Never let a direct or backend-routed
@@ -6610,6 +6752,7 @@ void on_upstream_response(void* lp, Connection& conn, IoEvent ev) {
     }
 
     if (ev.result <= 0 && conn.upstream_recv_buf.len() == 0) {
+        if (explicit_first_batch) disarm_explicit_deadline();
         // Post-send first-recv EOF/RST with no response byte. For a reused pooled
         // socket whose origin FIN/RST landed just after take_idle's MSG_PEEK probe,
         // the request write completed locally and the dead socket only surfaces
@@ -6648,12 +6791,17 @@ void on_upstream_response(void* lp, Connection& conn, IoEvent ev) {
     if (ps == ParseStatus::Incomplete) {
         if (ev.result <= 0)
             ps = ParseStatus::Error;
-        else {
+        else if (explicit_first_batch) {
+            disarm_explicit_deadline();
+            loop->close_conn(conn);
+            return;
+        } else {
             loop->submit_recv_upstream(conn);
             return;
         }
     }
     if (ps == ParseStatus::Error) {
+        if (explicit_first_batch) disarm_explicit_deadline();
         if (conn.response_policy_id != 0) {
             reject_strict_response(loop, conn, StrictResponseRejectionCause::UpstreamParse);
             return;
@@ -6673,6 +6821,7 @@ void on_upstream_response(void* lp, Connection& conn, IoEvent ev) {
         client_send(loop, conn, conn.send_buf.data(), conn.send_buf.len());
         return;
     }
+    if (explicit_first_batch) disarm_explicit_deadline();
     conn.resp_status = resp.status_code;
 
     // A strict policy has no interim-response or Upgrade domain.  Reject all
