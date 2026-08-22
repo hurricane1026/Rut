@@ -19,11 +19,19 @@ struct ProxyPass {
     Span span{};
 };
 
+struct ProxyReadTimeout {
+    bool present = false;
+    u32 milliseconds = 0;
+    Span span{};
+    Span value_span{};
+};
+
 struct Location {
     Str path{};
     Span path_span{};
     Span span{};
     ProxyPass proxy_pass{};
+    ProxyReadTimeout proxy_read_timeout{};
 };
 
 struct Server {

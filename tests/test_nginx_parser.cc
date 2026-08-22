@@ -70,6 +70,264 @@ TEST(nginx_parser, parses_minimal_server_and_spans) {
     CHECK_FALSE(result.value().location.proxy_pass.has_uri);
     CHECK_EQ(result.value().location.proxy_pass.uri.len, 0u);
     CHECK_EQ(result.value().location.proxy_pass.span.line, 4);
+    CHECK_FALSE(result.value().location.proxy_read_timeout.present);
+    CHECK_EQ(result.value().location.proxy_read_timeout.milliseconds, 0u);
+    CHECK_EQ(result.value().location.proxy_read_timeout.span.start, 0u);
+    CHECK_EQ(result.value().location.proxy_read_timeout.span.end, 0u);
+    CHECK_EQ(result.value().location.proxy_read_timeout.span.line, 1u);
+    CHECK_EQ(result.value().location.proxy_read_timeout.span.col, 1u);
+    CHECK_EQ(result.value().location.proxy_read_timeout.value_span.start, 0u);
+    CHECK_EQ(result.value().location.proxy_read_timeout.value_span.end, 0u);
+    CHECK_EQ(result.value().location.proxy_read_timeout.value_span.line, 1u);
+    CHECK_EQ(result.value().location.proxy_read_timeout.value_span.col, 1u);
+}
+
+TEST(nginx_parser, parses_bounded_proxy_read_timeout_in_either_directive_order) {
+    const char timeout_first[] =
+        "server {\n"
+        "  listen 8080;\n"
+        "  location / {\n"
+        "    proxy_read_timeout 1s;\n"
+        "    proxy_pass http://127.0.0.1:9000;\n"
+        "  }\n"
+        "}\n";
+    const auto first = nginx::parse({timeout_first, sizeof(timeout_first) - 1});
+    REQUIRE(first);
+    const auto& first_timeout = first.value().location.proxy_read_timeout;
+    REQUIRE(first_timeout.present);
+    CHECK_EQ(first_timeout.milliseconds, 1000u);
+    const char* first_keyword = strstr(timeout_first, "proxy_read_timeout");
+    const char* first_value = strstr(first_keyword, "1s");
+    const char* first_semicolon = strchr(first_value, ';');
+    REQUIRE(first_keyword != nullptr);
+    REQUIRE(first_value != nullptr);
+    REQUIRE(first_semicolon != nullptr);
+    CHECK_EQ(first_timeout.span.start, static_cast<u32>(first_keyword - timeout_first));
+    CHECK_EQ(first_timeout.span.end, static_cast<u32>(first_semicolon - timeout_first + 1));
+    CHECK_EQ(first_timeout.span.line, 4u);
+    CHECK_EQ(first_timeout.span.col, 5u);
+    CHECK_EQ(first_timeout.value_span.start, static_cast<u32>(first_value - timeout_first));
+    CHECK_EQ(first_timeout.value_span.end, static_cast<u32>(first_value - timeout_first + 2));
+    CHECK_EQ(first_timeout.value_span.line, 4u);
+    CHECK_EQ(first_timeout.value_span.col, 24u);
+
+    const char timeout_last[] =
+        "server { listen 8080; location / { proxy_pass http://127.0.0.1:9000; "
+        "proxy_read_timeout 63s; } }";
+    const auto last = nginx::parse({timeout_last, sizeof(timeout_last) - 1});
+    REQUIRE(last);
+    const auto& last_timeout = last.value().location.proxy_read_timeout;
+    REQUIRE(last_timeout.present);
+    CHECK_EQ(last_timeout.milliseconds, 63000u);
+    const char* last_keyword = strstr(timeout_last, "proxy_read_timeout");
+    const char* last_value = strstr(last_keyword, "63s");
+    const char* last_semicolon = strchr(last_value, ';');
+    REQUIRE(last_keyword != nullptr);
+    REQUIRE(last_value != nullptr);
+    REQUIRE(last_semicolon != nullptr);
+    CHECK_EQ(last_timeout.span.start, static_cast<u32>(last_keyword - timeout_last));
+    CHECK_EQ(last_timeout.span.end, static_cast<u32>(last_semicolon - timeout_last + 1));
+    CHECK_EQ(last_timeout.value_span.start, static_cast<u32>(last_value - timeout_last));
+    CHECK_EQ(last_timeout.value_span.end, static_cast<u32>(last_value - timeout_last + 3));
+}
+
+TEST(nginx_parser, rejects_proxy_read_timeout_bad_arity_and_bounded_values) {
+    struct Vector {
+        const char* source;
+        FrontendError code;
+        const char* at;
+        Str detail;
+    };
+    const Vector vectors[] = {
+        {"server { listen 8080; location / { proxy_read_timeout; proxy_pass "
+         "http://127.0.0.1:1; } }",
+         FrontendError::UnexpectedToken,
+         ";",
+         lit_str("proxy_read_timeout requires a value")},
+        {"server { listen 8080; location / { proxy_read_timeout 1s } }",
+         FrontendError::UnexpectedToken,
+         "}",
+         lit_str("expected ';' after proxy_read_timeout")},
+        {"server { listen 8080; location / { proxy_read_timeout 1s proxy_pass "
+         "http://127.0.0.1:1; } }",
+         FrontendError::UnexpectedToken,
+         "proxy_pass",
+         lit_str("expected ';' after proxy_read_timeout")},
+        {"server { listen 8080; location / { proxy_read_timeout 1s extra; proxy_pass "
+         "http://127.0.0.1:1; } }",
+         FrontendError::UnexpectedToken,
+         "extra",
+         lit_str("proxy_read_timeout accepts exactly one value")},
+        {"server { listen 8080; location / { proxy_read_timeout 0s; proxy_pass "
+         "http://127.0.0.1:1; } }",
+         FrontendError::UnsupportedSyntax,
+         "0s",
+         lit_str("only proxy_read_timeout 1s through 63s is supported")},
+        {"server { listen 8080; location / { proxy_read_timeout 64s; proxy_pass "
+         "http://127.0.0.1:1; } }",
+         FrontendError::UnsupportedSyntax,
+         "64s",
+         lit_str("only proxy_read_timeout 1s through 63s is supported")},
+        {"server { listen 8080; location / { proxy_read_timeout 42949672960s; proxy_pass "
+         "http://127.0.0.1:1; } }",
+         FrontendError::UnsupportedSyntax,
+         "42949672960s",
+         lit_str("only proxy_read_timeout 1s through 63s is supported")},
+        {"server { listen 8080; location / { proxy_read_timeout "
+         "999999999999999999999999999999999999999999999999999999999999999999999999s; "
+         "proxy_pass http://127.0.0.1:1; } }",
+         FrontendError::UnsupportedSyntax,
+         "999999999999999999999999999999999999999999999999999999999999999999999999s",
+         lit_str("only proxy_read_timeout 1s through 63s is supported")},
+    };
+    for (const auto& vector : vectors) {
+        const Str source{vector.source, static_cast<u32>(strlen(vector.source))};
+        const auto result = nginx::parse(source);
+        REQUIRE_FALSE(result);
+        CHECK_EQ(result.error().code, vector.code);
+        CHECK(result.error().detail.eq(vector.detail));
+        const char* keyword = strstr(vector.source, "proxy_read_timeout");
+        REQUIRE(keyword != nullptr);
+        const char* expected = strstr(keyword, vector.at);
+        REQUIRE(expected != nullptr);
+        CHECK_EQ(result.error().span.start, static_cast<u32>(expected - vector.source));
+    }
+
+    const char missing_value_eof[] = "server { listen 8080; location / { proxy_read_timeout";
+    const auto missing_value_result =
+        nginx::parse({missing_value_eof, sizeof(missing_value_eof) - 1});
+    REQUIRE_FALSE(missing_value_result);
+    CHECK_EQ(missing_value_result.error().code, FrontendError::UnexpectedEof);
+    CHECK_EQ(missing_value_result.error().span.start, sizeof(missing_value_eof) - 1);
+    CHECK(missing_value_result.error().detail.eq(lit_str("proxy_read_timeout requires a value")));
+
+    const char missing_semicolon_eof[] = "server { listen 8080; location / { proxy_read_timeout 1s";
+    const auto missing_semicolon_result =
+        nginx::parse({missing_semicolon_eof, sizeof(missing_semicolon_eof) - 1});
+    REQUIRE_FALSE(missing_semicolon_result);
+    CHECK_EQ(missing_semicolon_result.error().code, FrontendError::UnexpectedEof);
+    CHECK_EQ(missing_semicolon_result.error().span.start, sizeof(missing_semicolon_eof) - 1);
+    CHECK(missing_semicolon_result.error().detail.eq(
+        lit_str("expected ';' after proxy_read_timeout")));
+
+    const char duplicate[] =
+        "server { listen 8080; location / { proxy_read_timeout 1s; proxy_pass "
+        "http://127.0.0.1:1; proxy_read_timeout 2s; } }";
+    const auto duplicate_result = nginx::parse({duplicate, sizeof(duplicate) - 1});
+    REQUIRE_FALSE(duplicate_result);
+    CHECK_EQ(duplicate_result.error().code, FrontendError::UnsupportedSyntax);
+    CHECK(duplicate_result.error().detail.eq(lit_str("duplicate proxy_read_timeout")));
+    const char* second = strstr(strstr(duplicate, "proxy_read_timeout") + 1, "proxy_read_timeout");
+    REQUIRE(second != nullptr);
+    CHECK_EQ(duplicate_result.error().span.start, static_cast<u32>(second - duplicate));
+}
+
+TEST(nginx_parser, rejects_excluded_and_invalid_proxy_read_timeout_forms) {
+    struct Vector {
+        const char* value;
+        FrontendError code;
+        Str detail;
+    };
+    const Vector vectors[] = {
+        {"1",
+         FrontendError::UnsupportedSyntax,
+         lit_str("proxy_read_timeout value form is unsupported")},
+        {"1000ms",
+         FrontendError::UnsupportedSyntax,
+         lit_str("proxy_read_timeout value form is unsupported")},
+        {"1m",
+         FrontendError::UnsupportedSyntax,
+         lit_str("proxy_read_timeout value form is unsupported")},
+        {"1m30s",
+         FrontendError::UnsupportedSyntax,
+         lit_str("proxy_read_timeout value form is unsupported")},
+        {"\"1s\"",
+         FrontendError::UnsupportedSyntax,
+         lit_str("proxy_read_timeout value form is unsupported")},
+        {"'1s'",
+         FrontendError::UnsupportedSyntax,
+         lit_str("proxy_read_timeout value form is unsupported")},
+        {"\\1s",
+         FrontendError::UnsupportedSyntax,
+         lit_str("proxy_read_timeout value form is unsupported")},
+        {"1\\s",
+         FrontendError::UnsupportedSyntax,
+         lit_str("proxy_read_timeout value form is unsupported")},
+        {"\"1\\s\"",
+         FrontendError::UnsupportedSyntax,
+         lit_str("proxy_read_timeout value form is unsupported")},
+        {"01s",
+         FrontendError::UnsupportedSyntax,
+         lit_str("proxy_read_timeout value form is unsupported")},
+        {"1.5s", FrontendError::InvalidInteger, lit_str("invalid proxy_read_timeout value")},
+        {"$timeout", FrontendError::InvalidInteger, lit_str("invalid proxy_read_timeout value")},
+    };
+    for (const auto& vector : vectors) {
+        char source[256]{};
+        const int source_len =
+            snprintf(source,
+                     sizeof(source),
+                     "server { listen 8080; location / { proxy_read_timeout %s; proxy_pass "
+                     "http://127.0.0.1:1; } }",
+                     vector.value);
+        REQUIRE_GT(source_len, 0);
+        const auto result = nginx::parse({source, static_cast<u32>(source_len)});
+        REQUIRE_FALSE(result);
+        CHECK_EQ(result.error().code, vector.code);
+        CHECK(result.error().detail.eq(vector.detail));
+        const char* value = strstr(source, vector.value);
+        REQUIRE(value != nullptr);
+        CHECK_EQ(result.error().span.start, static_cast<u32>(value - source));
+    }
+}
+
+TEST(nginx_parser, rejects_proxy_read_timeout_outside_exact_root_location_context) {
+    const char server_level[] =
+        "server { listen 8080; proxy_read_timeout 1s; location / { proxy_pass "
+        "http://127.0.0.1:1; } }";
+    CHECK(is_error(nginx::parse({server_level, sizeof(server_level) - 1}),
+                   FrontendError::UnsupportedSyntax,
+                   1,
+                   23,
+                   lit_str("proxy_read_timeout is unsupported at server level")));
+
+    const char wrapped[] =
+        "http { server { listen 8080; location / { proxy_read_timeout 1s; proxy_pass "
+        "http://127.0.0.1:1; } } }";
+    CHECK(is_error(nginx::parse({wrapped, sizeof(wrapped) - 1}),
+                   FrontendError::UnsupportedSyntax,
+                   1,
+                   1,
+                   lit_str("http/events wrappers are unsupported")));
+
+    const char nested[] =
+        "server { listen 8080; location / { location /nested { proxy_read_timeout 1s; } "
+        "proxy_pass http://127.0.0.1:1; } }";
+    const auto nested_result = nginx::parse({nested, sizeof(nested) - 1});
+    REQUIRE_FALSE(nested_result);
+    CHECK_EQ(nested_result.error().code, FrontendError::UnsupportedSyntax);
+    CHECK(nested_result.error().detail.eq(lit_str("nested locations are unsupported")));
+    CHECK_EQ(nested_result.error().span.start,
+             static_cast<u32>(strstr(strstr(nested, "location") + 1, "location") - nested));
+
+    const char transformed[] =
+        "server { listen 8080; location /api/ { proxy_read_timeout 1s; proxy_pass "
+        "http://127.0.0.1:1/; } }";
+    const auto transformed_result = nginx::parse({transformed, sizeof(transformed) - 1});
+    REQUIRE_FALSE(transformed_result);
+    CHECK_EQ(transformed_result.error().code, FrontendError::UnsupportedSyntax);
+    CHECK(transformed_result.error().detail.eq(
+        lit_str("proxy_read_timeout is unsupported in transformed locations")));
+    CHECK_EQ(transformed_result.error().span.start,
+             static_cast<u32>(strstr(transformed, "proxy_read_timeout") - transformed));
+
+    const char other_location[] =
+        "server { listen 8080; location /other { proxy_read_timeout 1s; proxy_pass "
+        "http://127.0.0.1:1; } }";
+    const auto other_result = nginx::parse({other_location, sizeof(other_location) - 1});
+    REQUIRE_FALSE(other_result);
+    CHECK_EQ(other_result.error().code, FrontendError::UnsupportedSyntax);
+    CHECK(other_result.error().detail.eq(lit_str("only location / or /api/ is supported")));
 }
 
 TEST(nginx_parser, parses_api_location_and_proxy_uri_with_spans) {
@@ -875,6 +1133,117 @@ TEST(nginx_converter, emitted_api_source_reaches_rir_with_target_transform) {
     CHECK(saw_branch);
     CHECK(saw_redirect);
     CHECK(saw_forward);
+}
+
+TEST(nginx_converter, rejects_parsed_proxy_read_timeout_before_lowering) {
+    const char source[] =
+        "server { listen 8080; location / { proxy_read_timeout 1s; proxy_pass "
+        "http://127.0.0.1:9000; } }";
+    const auto parsed = nginx::parse({source, sizeof(source) - 1});
+    REQUIRE(parsed);
+    const auto lowered = nginx::lower_to_rut(parsed.value());
+    REQUIRE_FALSE(lowered);
+    CHECK_EQ(lowered.error().code, FrontendError::UnsupportedSyntax);
+    CHECK(lowered.error().detail.eq(lit_str("proxy_read_timeout lowering is not implemented")));
+    CHECK_EQ(lowered.error().span.start,
+             static_cast<u32>(strstr(source, "proxy_read_timeout") - source));
+}
+
+TEST(nginx_converter, rejects_forged_proxy_read_timeout_model_inconsistencies) {
+    auto valid_present = canonical_server();
+    valid_present.location.proxy_read_timeout.present = true;
+    valid_present.location.proxy_read_timeout.milliseconds = 1000;
+    valid_present.location.span = Span{20, 54, 1, 21};
+    valid_present.location.proxy_read_timeout.span = Span{24, 52, 1, 25};
+    valid_present.location.proxy_read_timeout.value_span = Span{43, 45, 1, 44};
+    valid_present.listen.port = 0;
+    auto guarded_first = nginx::lower_to_rut(valid_present);
+    REQUIRE_FALSE(guarded_first);
+    CHECK_EQ(guarded_first.error().code, FrontendError::UnsupportedSyntax);
+    CHECK_EQ(guarded_first.error().span.start, 24u);
+    CHECK(
+        guarded_first.error().detail.eq(lit_str("proxy_read_timeout lowering is not implemented")));
+
+    auto api_present = valid_present;
+    api_present.listen.port = 8080;
+    api_present.location.path = lit_str("/api/");
+    api_present.location.path_span = Span{22, 27, 1, 23};
+    auto bad_api_present = nginx::lower_to_rut(api_present);
+    REQUIRE_FALSE(bad_api_present);
+    CHECK_EQ(bad_api_present.error().code, FrontendError::UnsupportedSyntax);
+    CHECK_EQ(bad_api_present.error().span.start, 22u);
+    CHECK(bad_api_present.error().detail.eq(lit_str("invalid proxy_read_timeout location model")));
+
+    auto other_present = valid_present;
+    other_present.listen.port = 8080;
+    other_present.location.path = lit_str("/other");
+    other_present.location.path_span = Span{22, 28, 1, 23};
+    auto bad_other_present = nginx::lower_to_rut(other_present);
+    REQUIRE_FALSE(bad_other_present);
+    CHECK_EQ(bad_other_present.error().code, FrontendError::UnsupportedSyntax);
+    CHECK_EQ(bad_other_present.error().span.start, 22u);
+    CHECK(
+        bad_other_present.error().detail.eq(lit_str("invalid proxy_read_timeout location model")));
+
+    auto null_present = valid_present;
+    null_present.listen.port = 8080;
+    null_present.location.path = {nullptr, 1};
+    auto bad_null_present = nginx::lower_to_rut(null_present);
+    REQUIRE_FALSE(bad_null_present);
+    CHECK_EQ(bad_null_present.error().code, FrontendError::UnsupportedSyntax);
+    CHECK_EQ(bad_null_present.error().span.start, 22u);
+    CHECK(bad_null_present.error().detail.eq(lit_str("invalid proxy_read_timeout location model")));
+
+    const u32 invalid_milliseconds[] = {0, 999, 1500, 64000};
+    for (const u32 milliseconds : invalid_milliseconds) {
+        auto invalid = valid_present;
+        invalid.listen.port = 8080;
+        invalid.location.proxy_read_timeout.milliseconds = milliseconds;
+        auto result = nginx::lower_to_rut(invalid);
+        REQUIRE_FALSE(result);
+        CHECK_EQ(result.error().code, FrontendError::UnsupportedSyntax);
+        CHECK_EQ(result.error().span.start, 43u);
+        CHECK(result.error().detail.eq(lit_str("invalid proxy_read_timeout milliseconds")));
+    }
+
+    auto default_directive_span = valid_present;
+    default_directive_span.listen.port = 8080;
+    default_directive_span.location.proxy_read_timeout.span = {};
+    auto bad_directive_span = nginx::lower_to_rut(default_directive_span);
+    REQUIRE_FALSE(bad_directive_span);
+    CHECK_EQ(bad_directive_span.error().code, FrontendError::UnsupportedSyntax);
+    CHECK_EQ(bad_directive_span.error().span.start, default_directive_span.location.span.start);
+    CHECK(bad_directive_span.error().detail.eq(lit_str("invalid proxy_read_timeout spans")));
+
+    auto escaped_value_span = valid_present;
+    escaped_value_span.listen.port = 8080;
+    escaped_value_span.location.proxy_read_timeout.value_span = Span{50, 53, 1, 51};
+    auto bad_value_span = nginx::lower_to_rut(escaped_value_span);
+    REQUIRE_FALSE(bad_value_span);
+    CHECK_EQ(bad_value_span.error().code, FrontendError::UnsupportedSyntax);
+    CHECK(bad_value_span.error().detail.eq(lit_str("invalid proxy_read_timeout spans")));
+
+    auto absent_with_value = canonical_server();
+    absent_with_value.location.proxy_read_timeout.milliseconds = 1000;
+    auto bad_absent_value = nginx::lower_to_rut(absent_with_value);
+    REQUIRE_FALSE(bad_absent_value);
+    CHECK_EQ(bad_absent_value.error().code, FrontendError::UnsupportedSyntax);
+    CHECK_EQ(bad_absent_value.error().span.start, absent_with_value.location.span.start);
+    CHECK(bad_absent_value.error().detail.eq(lit_str("invalid absent proxy_read_timeout model")));
+
+    auto absent_with_span = canonical_server();
+    absent_with_span.location.proxy_read_timeout.span = Span{24, 52, 1, 25};
+    auto bad_absent_span = nginx::lower_to_rut(absent_with_span);
+    REQUIRE_FALSE(bad_absent_span);
+    CHECK_EQ(bad_absent_span.error().code, FrontendError::UnsupportedSyntax);
+    CHECK_EQ(bad_absent_span.error().span.start, 24u);
+
+    auto absent_with_value_span = canonical_server();
+    absent_with_value_span.location.proxy_read_timeout.value_span = Span{43, 45, 1, 44};
+    auto bad_absent_value_span = nginx::lower_to_rut(absent_with_value_span);
+    REQUIRE_FALSE(bad_absent_value_span);
+    CHECK_EQ(bad_absent_value_span.error().code, FrontendError::UnsupportedSyntax);
+    CHECK_EQ(bad_absent_value_span.error().span.start, 43u);
 }
 
 TEST(nginx_converter, rejects_forged_invalid_models_without_output) {

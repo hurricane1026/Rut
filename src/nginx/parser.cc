@@ -136,6 +136,9 @@ public:
                 if (!parsed) return core::make_unexpected(parsed.error());
                 result.location = parsed.value();
                 have_location = true;
+            } else if (eq(cur_.text, "proxy_read_timeout", 18)) {
+                return unsupported(cur_.span,
+                                   lit_str("proxy_read_timeout is unsupported at server level"));
             } else {
                 return unsupported(cur_.span, lit_str("unknown server directive"));
             }
@@ -218,16 +221,32 @@ private:
         result.path = path.text;
         result.path_span = path.span;
         bool have_proxy = false;
+        bool have_proxy_read_timeout = false;
         while (cur_.kind != TokenKind::RBrace && cur_.kind != TokenKind::End) {
             if (cur_.kind != TokenKind::Word)
                 return invalid(cur_.span, lit_str("expected location directive"));
-            if (!eq(cur_.text, "proxy_pass", 10))
+            if (eq(cur_.text, "proxy_pass", 10)) {
+                if (have_proxy) return unsupported(cur_.span, lit_str("duplicate proxy_pass"));
+                auto proxy = parse_proxy_pass();
+                if (!proxy) return core::make_unexpected(proxy.error());
+                result.proxy_pass = proxy.value();
+                have_proxy = true;
+            } else if (eq(cur_.text, "proxy_read_timeout", 18)) {
+                if (!eq(path.text, "/", 1))
+                    return unsupported(
+                        cur_.span,
+                        lit_str("proxy_read_timeout is unsupported in transformed locations"));
+                if (have_proxy_read_timeout)
+                    return unsupported(cur_.span, lit_str("duplicate proxy_read_timeout"));
+                auto timeout = parse_proxy_read_timeout();
+                if (!timeout) return core::make_unexpected(timeout.error());
+                result.proxy_read_timeout = timeout.value();
+                have_proxy_read_timeout = true;
+            } else if (eq(cur_.text, "location", 8)) {
+                return unsupported(cur_.span, lit_str("nested locations are unsupported"));
+            } else {
                 return unsupported(cur_.span, lit_str("unknown location directive"));
-            if (have_proxy) return unsupported(cur_.span, lit_str("duplicate proxy_pass"));
-            auto proxy = parse_proxy_pass();
-            if (!proxy) return core::make_unexpected(proxy.error());
-            result.proxy_pass = proxy.value();
-            have_proxy = true;
+            }
         }
         if (cur_.kind == TokenKind::End)
             return missing(cur_.span, lit_str("missing '}' for location"));
@@ -243,6 +262,48 @@ private:
                                lit_str("location /api/ requires proxy_pass URI /"));
         result.span = Span{start.start, end.end, start.line, start.col};
         return result;
+    }
+
+    FrontendResult<ProxyReadTimeout> parse_proxy_read_timeout() {
+        const Span start = cur_.span;
+        advance();
+        if (cur_.kind == TokenKind::End)
+            return missing(cur_.span, lit_str("proxy_read_timeout requires a value"));
+        if (cur_.kind != TokenKind::Word)
+            return invalid(cur_.span, lit_str("proxy_read_timeout requires a value"));
+        if (eq(cur_.text, "proxy_pass", 10) || eq(cur_.text, "proxy_read_timeout", 18) ||
+            eq(cur_.text, "location", 8) || eq(cur_.text, "server", 6))
+            return invalid(cur_.span, lit_str("proxy_read_timeout requires a value"));
+        const Token value = cur_;
+        if (contains(value.text, '$'))
+            return invalid_integer(value.span, lit_str("invalid proxy_read_timeout value"));
+
+        u32 seconds = 0;
+        const TimeoutParseStatus status = parse_timeout_seconds(value.text, &seconds);
+        if (status == TimeoutParseStatus::Invalid)
+            return invalid_integer(value.span, lit_str("invalid proxy_read_timeout value"));
+        if (status == TimeoutParseStatus::Unsupported)
+            return unsupported(value.span, lit_str("proxy_read_timeout value form is unsupported"));
+        if (seconds == 0 || seconds > 63)
+            return unsupported(value.span,
+                               lit_str("only proxy_read_timeout 1s through 63s is supported"));
+
+        advance();
+        if (cur_.kind == TokenKind::End)
+            return missing(cur_.span, lit_str("expected ';' after proxy_read_timeout"));
+        if (cur_.kind == TokenKind::Word &&
+            (eq(cur_.text, "proxy_pass", 10) || eq(cur_.text, "proxy_read_timeout", 18) ||
+             eq(cur_.text, "location", 8) || eq(cur_.text, "server", 6)))
+            return invalid(cur_.span, lit_str("expected ';' after proxy_read_timeout"));
+        if (cur_.kind != TokenKind::Semicolon) {
+            if (cur_.kind == TokenKind::Word)
+                return invalid(cur_.span, lit_str("proxy_read_timeout accepts exactly one value"));
+            return invalid(cur_.span, lit_str("expected ';' after proxy_read_timeout"));
+        }
+        const Span end = cur_.span;
+        advance();
+        return ProxyReadTimeout{
+            true, seconds * 1000u, Span{start.start, end.end, start.line, start.col}, value.span};
     }
 
     FrontendResult<ProxyPass> parse_proxy_pass() {
@@ -285,6 +346,38 @@ private:
         if (value == 0) return false;
         *out = static_cast<u16>(value);
         return true;
+    }
+
+    enum class TimeoutParseStatus : u8 { Ok, Unsupported, Invalid };
+
+    static TimeoutParseStatus parse_timeout_seconds(Str text, u32* out) {
+        if (text.len == 0) return TimeoutParseStatus::Invalid;
+        for (u32 i = 0; i < text.len; i++) {
+            if (text.ptr[i] == '"' || text.ptr[i] == '\'' || text.ptr[i] == '\\')
+                return TimeoutParseStatus::Unsupported;
+        }
+        if (text.ptr[0] < '0' || text.ptr[0] > '9') return TimeoutParseStatus::Invalid;
+
+        u32 pos = 0;
+        while (pos < text.len && text.ptr[pos] >= '0' && text.ptr[pos] <= '9') pos++;
+        if (pos + 1 == text.len && text.ptr[pos] == 's') {
+            if (text.ptr[0] == '0' && pos > 1) return TimeoutParseStatus::Unsupported;
+            if (pos > 2) {
+                *out = 64;
+                return TimeoutParseStatus::Ok;
+            }
+            u32 seconds = 0;
+            for (u32 i = 0; i < pos; i++)
+                seconds = seconds * 10u + static_cast<u32>(text.ptr[i] - '0');
+            *out = seconds;
+            return TimeoutParseStatus::Ok;
+        }
+        for (u32 i = pos; i < text.len; i++) {
+            if (text.ptr[i] == '.') return TimeoutParseStatus::Invalid;
+        }
+        // nginx accepts bare seconds, other units, quoted values, and compound
+        // time values. They are deliberately excluded from this bounded slice.
+        return TimeoutParseStatus::Unsupported;
     }
 
     enum class UrlParseStatus : u8 { Ok, InvalidInteger, UriSuffix, Unsupported };

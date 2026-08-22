@@ -23,6 +23,69 @@ auto out_of_memory(Span span, Str detail) {
     return frontend_error(FrontendError::OutOfMemory, span, detail);
 }
 
+constexpr bool is_default_span(const Span& span) {
+    return span.start == 0 && span.end == 0 && span.line == 1 && span.col == 1;
+}
+
+constexpr bool is_valid_span(const Span& span) {
+    return span.start < span.end && span.line != 0 && span.col != 0;
+}
+
+constexpr bool span_contains(const Span& outer, const Span& inner) {
+    return outer.start <= inner.start && inner.end <= outer.end;
+}
+
+Span model_span(const Server& server) {
+    if (is_valid_span(server.location.span)) return server.location.span;
+    if (is_valid_span(server.location.path_span)) return server.location.path_span;
+    return server.span;
+}
+
+FrontendResult<bool> validate_proxy_read_timeout(const Server& server) {
+    const ProxyReadTimeout& timeout = server.location.proxy_read_timeout;
+    if (!timeout.present) {
+        if (timeout.milliseconds != 0 || !is_default_span(timeout.span) ||
+            !is_default_span(timeout.value_span)) {
+            const Span span = is_valid_span(timeout.span)         ? timeout.span
+                              : is_valid_span(timeout.value_span) ? timeout.value_span
+                                                                  : model_span(server);
+            return unsupported(span, lit_str("invalid absent proxy_read_timeout model"));
+        }
+        return true;
+    }
+
+    const Location& location = server.location;
+    const u32 path_offset = location.path_span.start - location.span.start;
+    const bool same_line_path_consistent =
+        location.path_span.line != location.span.line ||
+        (path_offset <= 0xFFFFFFFFu - location.span.col &&
+         location.path_span.col == location.span.col + path_offset);
+    if (!eq(location.path, "/", 1) || !is_valid_span(location.span) ||
+        !is_valid_span(location.path_span) || !span_contains(location.span, location.path_span) ||
+        location.path_span.end - location.path_span.start != 1 ||
+        location.path_span.line < location.span.line || !same_line_path_consistent) {
+        const Span span =
+            is_valid_span(location.path_span) ? location.path_span : model_span(server);
+        return unsupported(span, lit_str("invalid proxy_read_timeout location model"));
+    }
+
+    const u32 value_offset = timeout.value_span.start - timeout.span.start;
+    const bool same_line_consistent = timeout.value_span.line != timeout.span.line ||
+                                      (value_offset <= 0xFFFFFFFFu - timeout.span.col &&
+                                       timeout.value_span.col == timeout.span.col + value_offset);
+    if (!is_valid_span(server.location.span) || !is_valid_span(timeout.span) ||
+        !is_valid_span(timeout.value_span) || !span_contains(server.location.span, timeout.span) ||
+        !span_contains(timeout.span, timeout.value_span) ||
+        timeout.value_span.line < timeout.span.line || !same_line_consistent) {
+        return unsupported(model_span(server), lit_str("invalid proxy_read_timeout spans"));
+    }
+    if (timeout.milliseconds < 1000 || timeout.milliseconds > 63000 ||
+        timeout.milliseconds % 1000 != 0) {
+        return unsupported(timeout.value_span, lit_str("invalid proxy_read_timeout milliseconds"));
+    }
+    return unsupported(timeout.span, lit_str("proxy_read_timeout lowering is not implemented"));
+}
+
 class Writer {
 public:
     explicit Writer(RutSource& output) : output_(output) {}
@@ -77,6 +140,8 @@ private:
 }  // namespace
 
 FrontendResult<RutSource> lower_to_rut(const Server& server) {
+    auto timeout = validate_proxy_read_timeout(server);
+    if (!timeout) return core::make_unexpected(timeout.error());
     if (server.listen.port == 0)
         return invalid_integer(server.listen.span, lit_str("invalid model listen port"));
     const bool is_root = server.location.path.ptr != nullptr && eq(server.location.path, "/", 1);
