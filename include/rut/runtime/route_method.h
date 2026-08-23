@@ -37,11 +37,6 @@ inline bool complete_content_length_route_method_is_admitted(u8 method) {
         case kRouteMethodPatch:
         case kRouteMethodOptions:
             return true;
-        case kRouteMethodHead:
-        case kRouteMethodConnect:
-        case kRouteMethodTrace:
-        case kRouteMethodInvalid:
-            return false;
         default:
             return false;
     }
