@@ -113,12 +113,23 @@ static constexpr char kDefaultBufferingCloseCompleteResponseNormalized[] =
 static constexpr char kDefaultBufferingEofRequest[] =
     "GET /buffered-eof?q=1 HTTP/1.1\r\n"
     "Host: client.example\r\n\r\n";
+static constexpr char kDefaultBufferingCloseEofRequest[] =
+    "GET /buffered-close-eof?case=explicit-close HTTP/1.1\r\n"
+    "Host: close-eof-client.example\r\n"
+    "Connection: close\r\n\r\n";
 static constexpr char kDefaultBufferingEofResponseNormalized[] =
     "HTTP/1.1 200 OK\r\n"
     "Server: nginx/1.29.7\r\n"
     "Date: XXXXXXXXXXXXXXXXXXXXXXXXXXXXX\r\n"
     "Content-Length: 12\r\n"
     "Connection: keep-alive\r\n\r\n"
+    "hello";
+static constexpr char kDefaultBufferingCloseEofResponseNormalized[] =
+    "HTTP/1.1 200 OK\r\n"
+    "Server: nginx/1.29.7\r\n"
+    "Date: XXXXXXXXXXXXXXXXXXXXXXXXXXXXX\r\n"
+    "Content-Length: 12\r\n"
+    "Connection: close\r\n\r\n"
     "hello";
 static constexpr char kApiRedirectBody[] =
     "<html>\r\n"
@@ -820,6 +831,7 @@ struct Recorder {
     bool gate_incomplete_response_close = false;
     std::atomic<bool> response_close_permit{false};
     std::atomic<bool> response_closed_by_gate{false};
+    std::atomic<bool> response_close_failed{false};
     std::atomic<u64> response_close_released_ns{0};
     std::atomic<bool> response_sent_open{false};
     std::atomic<bool> response_send_failed{false};
@@ -963,8 +975,11 @@ struct Recorder {
                                 .count());
                         self->response_close_released_ns.store(released_ns,
                                                                std::memory_order_relaxed);
-                        shutdown(client, SHUT_RDWR);
-                        self->response_closed_by_gate.store(true, std::memory_order_release);
+                        if (shutdown(client, SHUT_RDWR) == 0) {
+                            self->response_closed_by_gate.store(true, std::memory_order_release);
+                        } else {
+                            self->response_close_failed.store(true, std::memory_order_release);
+                        }
                     }
                 } else if (response_sent && self->wait_response_peer_close) {
                     bool observed = false;
@@ -1077,6 +1092,7 @@ struct Recorder {
                 sent_ns.store(0, std::memory_order_relaxed);
             response_close_permit.store(false, std::memory_order_relaxed);
             response_closed_by_gate.store(false, std::memory_order_relaxed);
+            response_close_failed.store(false, std::memory_order_relaxed);
             response_close_released_ns.store(0, std::memory_order_relaxed);
             running.store(true, std::memory_order_release);
             if (pthread_create(&thread, nullptr, &Recorder::run, this) == 0) {
@@ -2051,6 +2067,8 @@ struct DefaultBufferingCompleteObservation {
 
 struct DefaultBufferingEofObservation {
     std::vector<char> downstream;
+    u64 origin_close_authorized_ns = 0;
+    u64 origin_close_released_ns = 0;
     u64 first_downstream_byte_ns = 0;
     u64 downstream_eof_ns = 0;
 };
@@ -2519,6 +2537,9 @@ static bool capture_nginx_default_buffering_eof(u16 frontend_port,
                                                 const std::string& nginx_log_path,
                                                 const std::string& container_name,
                                                 Recorder& recorder,
+                                                const char* request,
+                                                u32 request_len,
+                                                const char* expected_response_normalized,
                                                 DefaultBufferingEofObservation& observation,
                                                 std::string& error) {
     DockerGuard docker(container_name);
@@ -2549,9 +2570,8 @@ static bool capture_nginx_default_buffering_eof(u16 frontend_port,
             if (fd >= 0) close(fd);
         }
     } client{connect_once(frontend_port)};
-    if (client.fd < 0 ||
-        !send_all(
-            client.fd, kDefaultBufferingEofRequest, sizeof(kDefaultBufferingEofRequest) - 1)) {
+    if (client.fd < 0 || request == nullptr || request_len == 0 ||
+        expected_response_normalized == nullptr || !send_all(client.fd, request, request_len)) {
         error = "default-buffering EOF downstream request failed";
         return false;
     }
@@ -2595,12 +2615,14 @@ static bool capture_nginx_default_buffering_eof(u16 frontend_port,
         return false;
     }
 
+    observation.origin_close_authorized_ns = steady_now_ns();
     recorder.response_close_permit.store(true, std::memory_order_release);
     const auto close_gate_deadline =
         std::chrono::steady_clock::now() + std::chrono::milliseconds(500);
     while (!recorder.response_closed_by_gate.load(std::memory_order_acquire) &&
            std::chrono::steady_clock::now() < close_gate_deadline) {
-        if (recorder.response_peer_closed.load(std::memory_order_acquire) ||
+        if (recorder.response_close_failed.load(std::memory_order_acquire) ||
+            recorder.response_peer_closed.load(std::memory_order_acquire) ||
             recorder.response_peer_unexpected_data.load(std::memory_order_acquire) ||
             recorder.response_peer_observation_failed.load(std::memory_order_acquire)) {
             error = "origin peer changed instead of completing the authorized clean EOF";
@@ -2610,8 +2632,13 @@ static bool capture_nginx_default_buffering_eof(u16 frontend_port,
     }
     const u64 origin_close_released_ns =
         recorder.response_close_released_ns.load(std::memory_order_acquire);
+    observation.origin_close_released_ns = origin_close_released_ns;
     if (!recorder.response_closed_by_gate.load(std::memory_order_acquire) ||
-        origin_close_released_ns == 0 || origin_close_released_ns < origin_sent_ns) {
+        recorder.response_close_failed.load(std::memory_order_acquire) ||
+        observation.origin_close_authorized_ns == 0 || origin_close_released_ns == 0 ||
+        origin_close_released_ns < observation.origin_close_authorized_ns ||
+        origin_close_released_ns - observation.origin_close_authorized_ns >= 500'000'000ull ||
+        origin_close_released_ns < origin_sent_ns) {
         error = "origin did not complete the authorized clean EOF";
         return false;
     }
@@ -2641,8 +2668,7 @@ static bool capture_nginx_default_buffering_eof(u16 frontend_port,
             if (observation.first_downstream_byte_ns == 0)
                 observation.first_downstream_byte_ns = now_ns;
             observation.downstream.insert(observation.downstream.end(), bytes, bytes + n);
-            if (observation.downstream.size() >
-                sizeof(kDefaultBufferingEofResponseNormalized) - 1) {
+            if (observation.downstream.size() > strlen(expected_response_normalized)) {
                 error = "default-buffering EOF response included trailing bytes";
                 return false;
             }
@@ -2668,7 +2694,7 @@ static bool capture_nginx_default_buffering_eof(u16 frontend_port,
 
     detail.clear();
     if (!validate_exact_normalized_response(
-            observation.downstream, kDefaultBufferingEofResponseNormalized, detail)) {
+            observation.downstream, expected_response_normalized, detail)) {
         error = "default-buffering EOF wire mismatch: " + detail;
         return false;
     }
@@ -2683,6 +2709,7 @@ static bool capture_nginx_default_buffering_eof(u16 frontend_port,
     if (recorder.accepted.load(std::memory_order_acquire) != 1 ||
         recorder.requests.load(std::memory_order_acquire) != 1 ||
         recorder.response_send_failed.load(std::memory_order_acquire) ||
+        recorder.response_close_failed.load(std::memory_order_acquire) ||
         recorder.response_peer_closed.load(std::memory_order_acquire) ||
         recorder.response_peer_unexpected_data.load(std::memory_order_acquire) ||
         recorder.response_peer_observation_failed.load(std::memory_order_acquire)) {
@@ -4717,6 +4744,7 @@ int main(int argc, char** argv) {
         ";\n    location / {\n      proxy_pass http://127.0.0.1:" + std::to_string(backend_port) +
         ";\n      proxy_read_timeout 1s;\n    }\n  }\n}\n";
     if (default_buffering_eof_config.find("proxy_buffering") != std::string::npos ||
+        default_buffering_eof_config.find("proxy_http_version") != std::string::npos ||
         !write_file(temp.nginx_config,
                     default_buffering_eof_config.data(),
                     default_buffering_eof_config.size())) {
@@ -4730,6 +4758,9 @@ int main(int argc, char** argv) {
                                              temp.nginx_log,
                                              container + "-default-buffering-eof",
                                              default_buffering_eof_origin,
+                                             kDefaultBufferingEofRequest,
+                                             sizeof(kDefaultBufferingEofRequest) - 1,
+                                             kDefaultBufferingEofResponseNormalized,
                                              default_buffering_eof_observation,
                                              default_buffering_eof_error)) {
         std::cerr << "FAIL [pinned default buffering EOF]: " << default_buffering_eof_error << "\n";
@@ -4747,7 +4778,11 @@ int main(int argc, char** argv) {
         expected_default_buffering_eof_request.end());
     if (default_buffering_eof_origin.request != expected_default_buffering_eof_request_wire ||
         default_buffering_eof_origin.history.size() != 1 ||
-        default_buffering_eof_origin.history[0] != expected_default_buffering_eof_request_wire) {
+        default_buffering_eof_origin.history[0] != expected_default_buffering_eof_request_wire ||
+        default_buffering_eof_origin.accepted.load(std::memory_order_acquire) != 1 ||
+        default_buffering_eof_origin.requests.load(std::memory_order_acquire) != 1 ||
+        !default_buffering_eof_origin.response_closed_by_gate.load(std::memory_order_acquire) ||
+        default_buffering_eof_origin.response_close_failed.load(std::memory_order_acquire)) {
         std::cerr << "FAIL [pinned default buffering EOF]: exact upstream wire mismatch\n";
         dump_wire("expected default-buffering EOF upstream request",
                   expected_default_buffering_eof_request_wire);
@@ -4771,6 +4806,98 @@ int main(int argc, char** argv) {
                                      eof_origin_released_ns) /
                      1e9
               << ", one upstream request)\n";
+
+    Recorder default_buffering_close_eof_origin;
+    default_buffering_close_eof_origin.gate_incomplete_response_close = true;
+    default_buffering_close_eof_origin.observe_extra_requests_until_stop = true;
+    if (!default_buffering_close_eof_origin.setup(backend_port,
+                                                  1,
+                                                  kDefaultBufferingTimeoutOrigin,
+                                                  sizeof(kDefaultBufferingTimeoutOrigin) - 1)) {
+        std::cerr << "FAIL [pinned default buffering explicit-close EOF]: origin setup failed\n";
+        return 1;
+    }
+    const std::string default_buffering_close_eof_config =
+        "events {}\nhttp {\n  access_log off;\n  server {\n    listen 127.0.0.1:" +
+        std::to_string(frontend_port) +
+        ";\n    location / {\n      proxy_pass http://127.0.0.1:" + std::to_string(backend_port) +
+        ";\n      proxy_read_timeout 1s;\n    }\n  }\n}\n";
+    if (default_buffering_close_eof_config.find("proxy_buffering") != std::string::npos ||
+        default_buffering_close_eof_config.find("proxy_http_version") != std::string::npos ||
+        !write_file(temp.nginx_config,
+                    default_buffering_close_eof_config.data(),
+                    default_buffering_close_eof_config.size())) {
+        std::cerr << "FAIL [pinned default buffering explicit-close EOF]: semantic config write "
+                     "failed\n";
+        return 1;
+    }
+    DefaultBufferingEofObservation default_buffering_close_eof_observation;
+    std::string default_buffering_close_eof_error;
+    if (!capture_nginx_default_buffering_eof(frontend_port,
+                                             temp.nginx_config,
+                                             temp.nginx_log,
+                                             container + "-default-buffering-close-eof",
+                                             default_buffering_close_eof_origin,
+                                             kDefaultBufferingCloseEofRequest,
+                                             sizeof(kDefaultBufferingCloseEofRequest) - 1,
+                                             kDefaultBufferingCloseEofResponseNormalized,
+                                             default_buffering_close_eof_observation,
+                                             default_buffering_close_eof_error)) {
+        std::cerr << "FAIL [pinned default buffering explicit-close EOF]: "
+                  << default_buffering_close_eof_error << "\n";
+        dump_wire("pinned default-buffering explicit-close EOF response",
+                  default_buffering_close_eof_observation.downstream);
+        dump_log(temp.nginx_log, "pinned default-buffering explicit-close EOF nginx log");
+        return 1;
+    }
+    default_buffering_close_eof_origin.stop();
+    const std::string expected_default_buffering_close_eof_request =
+        "GET /buffered-close-eof?case=explicit-close HTTP/1.1\r\nHost: 127.0.0.1:" +
+        std::to_string(backend_port) + "\r\n\r\n";
+    const std::vector<char> expected_default_buffering_close_eof_request_wire(
+        expected_default_buffering_close_eof_request.begin(),
+        expected_default_buffering_close_eof_request.end());
+    if (default_buffering_close_eof_origin.request !=
+            expected_default_buffering_close_eof_request_wire ||
+        default_buffering_close_eof_origin.history.size() != 1 ||
+        default_buffering_close_eof_origin.history[0] !=
+            expected_default_buffering_close_eof_request_wire ||
+        default_buffering_close_eof_origin.accepted.load(std::memory_order_acquire) != 1 ||
+        default_buffering_close_eof_origin.requests.load(std::memory_order_acquire) != 1 ||
+        !default_buffering_close_eof_origin.response_closed_by_gate.load(
+            std::memory_order_acquire) ||
+        default_buffering_close_eof_origin.response_close_failed.load(std::memory_order_acquire)) {
+        std::cerr << "FAIL [pinned default buffering explicit-close EOF]: exact upstream wire or "
+                     "joined origin evidence mismatch\n";
+        dump_wire("expected default-buffering explicit-close EOF upstream request",
+                  expected_default_buffering_close_eof_request_wire);
+        dump_wire("actual default-buffering explicit-close EOF upstream request",
+                  default_buffering_close_eof_origin.request);
+        return 1;
+    }
+    const u64 close_eof_origin_sent_ns =
+        default_buffering_close_eof_origin.response_sent_ns.load(std::memory_order_acquire);
+    const u64 close_eof_origin_authorized_ns =
+        default_buffering_close_eof_observation.origin_close_authorized_ns;
+    const u64 close_eof_origin_released_ns =
+        default_buffering_close_eof_observation.origin_close_released_ns;
+    std::cerr
+        << "PASS: pinned nginx default response buffering honors one explicit downstream close "
+           "after authorized clean origin EOF and publishes the exact incomplete prefix "
+           "(send-to-authorization/authorization-to-release/release-to-first/release-to-EOF "
+           "seconds="
+        << static_cast<double>(close_eof_origin_authorized_ns - close_eof_origin_sent_ns) / 1e9
+        << "/"
+        << static_cast<double>(close_eof_origin_released_ns - close_eof_origin_authorized_ns) / 1e9
+        << "/"
+        << static_cast<double>(default_buffering_close_eof_observation.first_downstream_byte_ns -
+                               close_eof_origin_released_ns) /
+               1e9
+        << "/"
+        << static_cast<double>(default_buffering_close_eof_observation.downstream_eof_ns -
+                               close_eof_origin_released_ns) /
+               1e9
+        << ", one exact upstream request)\n";
 
     // Restore the converter fragment's minimal nginx config for the existing
     // differential cases. The semantic baselines above are intentionally not
