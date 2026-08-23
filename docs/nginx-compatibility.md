@@ -13,8 +13,8 @@ Allowed states are `SUPPORTED`, `PARTIAL`, `BLOCKED_BY_RUT`,
 | `listen <port>` IPv4 wildcard | yes | yes | yes: one source `listen :<port>` declaration | pinned nginx/generated-RUT bind and request | SUPPORTED |
 | ordinary prefix `location /` | yes | yes | partial: root catch-all exists | bounded pinned generated-RUT GET differential | PARTIAL |
 | location applies to every method | yes | yes | yes: method-omitted route source form | RUT route tests; pinned GET and POST differentials | PARTIAL |
-| `OPTIONS *` under the accepted minimal root proxy config | implicit | yes; emits exact OPTIONS 400 plus bounded ANY fail-closed 400 through ordinary RUT `unmatched` declarations | yes for the bounded strict H1.1 exact-method local-response slice; invalid/partial fails closed and configured H2 misses close; #273 remains open for CONNECT evidence | converter golden and source-to-RouteConfig ownership/mapping tests; pinned nginx 1.29.7 exact-close 400/157-byte-body/EOF, matching ordinary-RUT source/JIT/io_uring wire, and converter-generated nginx-vs-RUT differential, all with zero upstream effects | SUPPORTED |
-| authority-form CONNECT under the accepted minimal root proxy config | implicit | yes; emits exact CONNECT 405 plus bounded ANY fail-closed 400 through ordinary RUT `unmatched` declarations | yes for the bounded strict H1.1 exact-method local-response slice; invalid/partial fails closed and configured H2 misses close; #273 remains open | converter golden and source-to-RouteConfig ownership/mapping tests; pinned nginx 1.29.7 exact-close 405/157-byte-body/EOF and matching separate ordinary-RUT source/JIT/io_uring wire, both with zero upstream effects; no generated-RUT differential | NOT_IMPLEMENTED |
+| `OPTIONS *` under the accepted minimal root proxy config | implicit | yes; emits exact OPTIONS 400 plus bounded ANY fail-closed 400 through ordinary RUT `unmatched` declarations | yes for the bounded strict H1.1 exact-method local-response slice; invalid/partial fails closed and configured H2 misses close; #273 closed | converter golden and source-to-RouteConfig ownership/mapping tests; pinned nginx 1.29.7 exact-close 400/157-byte-body/EOF, matching ordinary-RUT source/JIT/io_uring wire, and converter-generated nginx-vs-RUT differential, all with zero upstream effects | SUPPORTED |
+| authority-form CONNECT under the accepted minimal root proxy config | implicit | yes; emits exact CONNECT 405 plus bounded ANY fail-closed 400 through ordinary RUT `unmatched` declarations | yes for the bounded strict H1.1 exact-method local-response slice; invalid/partial fails closed and configured H2 misses close; #273 closed | converter golden and source-to-RouteConfig ownership/mapping tests; pinned nginx 1.29.7 exact-close 405/157-byte-body/EOF, matching ordinary-RUT source/JIT/io_uring wire, and converter-generated nginx-vs-RUT differential, all with zero upstream effects | SUPPORTED |
 | fixed IPv4 HTTP `proxy_pass`, no URI suffix | yes | yes | partial: fixed `forward` plus bounded policies | pinned generated-RUT GET/query/header and fixed-CL POST differentials | PARTIAL |
 | preserve raw request-target and query | implicit | yes | partial: origin-form forward sends original bytes | pinned query differential; broader normalization untested | PARTIAL |
 | preserve request method and body | implicit | yes | partial: fixed-CL body is staged before connect within one 16 KiB composite slice | RUT exact binary/segmented/boundary tests and pinned generated-RUT binary POST differential | PARTIAL |
@@ -47,8 +47,8 @@ Allowed states are `SUPPORTED`, `PARTIAL`, `BLOCKED_BY_RUT`,
   OPTIONS-star and authority-form CONNECT ordinary-source production wires and
   converter lowering/golden/RouteConfig ownership tests are now committed. The
   OPTIONS-star converter-generated differential is also committed, so that
-  exact row is `SUPPORTED`; CONNECT remains `NOT_IMPLEMENTED` until its separate
-  differential lands.
+  exact OPTIONS-star and CONNECT converter-generated differentials are also
+  committed, so both bounded rows are `SUPPORTED` and #273 is closed.
 - With `location /api/` and a `/` URI in `proxy_pass`, pinned nginx sends `/`,
   `/x`, and `/x?y=1` upstream for `/api/`, `/api/x`, and `/api/x?y=1`.
   It redirects `/api`, collapses repeated slash/dot-segment inputs, and decodes
@@ -65,9 +65,9 @@ Allowed states are `SUPPORTED`, `PARTIAL`, `BLOCKED_BY_RUT`,
 - `OPTIONS *` and ordinary authority-form CONNECT do not have a canonical
   origin-form path in current RUT. They miss the converter's method-omitted `/`
   route, then select the generated exact OPTIONS/CONNECT policy before the
-  bounded ANY fail-closed policy. The OPTIONS-star converter-generated
-  differential now proves its exact bounded row; CONNECT still requires a
-  separate differential before it can become `SUPPORTED`.
+  bounded ANY fail-closed policy. Separate converter-generated differentials now
+  prove both exact bounded rows. This does not make CONNECT tunneling or generic
+  request-target handling supported.
 - Complete response buffering currently admits downstream HTTP/1.1 only. The
   accepted nginx configuration syntax does not exclude HTTP/1.0 clients, so the
   omitted-buffering row remains blocked for that version domain as well.
