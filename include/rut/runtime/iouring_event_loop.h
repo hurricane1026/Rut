@@ -127,6 +127,7 @@ public:
         u32 deadline_generation = 0;
         u32 upstream_episode = 0;
         ResponseReadDeadlineProfile profile = ResponseReadDeadlineProfile::None;
+        u8 method = 0xffu;
         u32 last_relevant = 0;
         u32 first_copy_begin = 0;
         u32 expected_copy_end = 0;
@@ -467,6 +468,9 @@ private:
         if (c.http1_prebuilt_response_layout == Http1PrebuiltResponseLayout::None)
             return prebuilt_http1_header_is_complete(c);
         if (c.http1_prebuilt_deadline_profile == ResponseReadDeadlineProfile::None ||
+            c.http1_prebuilt_deadline_method != c.req_method ||
+            !response_read_deadline_route_method_matches(c.http1_prebuilt_deadline_method,
+                                                         c.http1_prebuilt_deadline_route_method) ||
             c.http1_prebuilt_deadline_generation == 0 ||
             c.http1_prebuilt_deadline_generation != c.response_read_deadline_generation ||
             c.http1_prebuilt_deadline_bundle_id == 0 ||
@@ -497,18 +501,19 @@ private:
                        ResponseReadDeadlineProfile::HeaderOnlyHead &&
                    c.http1_prebuilt_response_purpose ==
                        Http1PrebuiltResponsePurpose::ResponseReadTimeout &&
-                   c.req_method == static_cast<u8>(LogHttpMethod::Head) &&
+                   c.http1_prebuilt_deadline_method == static_cast<u8>(LogHttpMethod::Head) &&
                    response.head_mode == ResponsePolicyHeadMode::SuppressBody &&
                    failure.head_mode == FailurePolicyHeadMode::SuppressBody &&
                    timeout.head_mode == FailurePolicyHeadMode::SuppressBody &&
                    c.http1_prebuilt_body_len == 0 &&
                    c.http1_prebuilt_header_end == c.http1_prebuilt_total_len &&
                    prebuilt_http1_header_is_complete(c);
-        if (c.http1_prebuilt_response_layout != Http1PrebuiltResponseLayout::FullContentLengthGet ||
+        if (c.http1_prebuilt_response_layout !=
+                Http1PrebuiltResponseLayout::FullContentLengthNonHead ||
             c.http1_prebuilt_deadline_profile !=
-                ResponseReadDeadlineProfile::BodylessGetContentLengthZero)
+                ResponseReadDeadlineProfile::BodylessNonHeadContentLengthZero)
             return false;
-        if (c.req_method != static_cast<u8>(LogHttpMethod::Get) ||
+        if (!response_read_deadline_non_head_method_admitted(c.http1_prebuilt_deadline_method) ||
             response.head_mode != ResponsePolicyHeadMode::Reject ||
             failure.head_mode != FailurePolicyHeadMode::Reject ||
             timeout.head_mode != FailurePolicyHeadMode::Reject)
@@ -542,7 +547,7 @@ private:
         };
         static constexpr Str kKeepAlive{"keep-alive", 10};
         if (c.http1_prebuilt_response_purpose ==
-            Http1PrebuiltResponsePurpose::StrictGetCl0Success) {
+            Http1PrebuiltResponsePurpose::StrictNonHeadCl0Success) {
             return parsed.status_code == 200 && c.http1_prebuilt_body_len == 0 &&
                    response.head_mode == ResponsePolicyHeadMode::Reject &&
                    exact_header("server", 6, response.server) &&
@@ -1752,6 +1757,7 @@ public:
         owner.deadline_generation = c.response_read_deadline_generation;
         owner.upstream_episode = c.upstream_episode;
         owner.profile = c.response_read_deadline_profile;
+        owner.method = c.response_read_deadline_method;
         owner.valid = response_read_deadline_identity_is_stable(c) && c.upstream_recv_armed;
         return static_cast<u16>(++response_read_batch_owner_count);
     }
@@ -1809,7 +1815,7 @@ public:
                 if (ev.copy_witness != IoEventCopyWitness::Full ||
                     ev.copy_deadline_generation != owner.deadline_generation ||
                     ev.copy_deadline_profile != static_cast<u8>(owner.profile) ||
-                    ev.copy_end < ev.copy_begin ||
+                    ev.copy_deadline_method != owner.method || ev.copy_end < ev.copy_begin ||
                     ev.copy_end - ev.copy_begin != static_cast<u32>(ev.result)) {
                     owner.valid = false;
                 } else {
@@ -1869,6 +1875,7 @@ public:
                 c.response_read_deadline_generation == owner.deadline_generation &&
                 c.upstream_episode == owner.upstream_episode &&
                 c.response_read_deadline_profile == owner.profile &&
+                c.response_read_deadline_method == owner.method &&
                 (c.response_read_deadline_state == ResponseReadDeadlineState::Armed ||
                  c.response_read_deadline_state == ResponseReadDeadlineState::ExpiryPending);
             if (!owner.valid || !key_stable) {
@@ -1911,7 +1918,8 @@ public:
                 c.id == owner.conn_id &&
                 c.response_read_deadline_generation == owner.deadline_generation &&
                 c.upstream_episode == owner.upstream_episode &&
-                c.response_read_deadline_profile == owner.profile;
+                c.response_read_deadline_profile == owner.profile &&
+                c.response_read_deadline_method == owner.method;
             if (key_stable &&
                 c.response_read_deadline_state == ResponseReadDeadlineState::RefreshPending &&
                 c.upstream_recv_armed && response_read_deadline_identity_is_stable(c)) {
@@ -2702,11 +2710,15 @@ public:
                         }
                         const ResponseReadDeadlineProfile first_profile =
                             conn.response_read_deadline_profile;
+                        const u8 first_method = conn.response_read_deadline_method;
+                        const u8 first_route_method = conn.response_read_deadline_route_method;
                         const u32 first_generation = conn.response_read_deadline_generation;
                         const u16 first_bundle = conn.response_read_deadline_bundle_id;
                         disarm_response_read_deadline(conn);
                         conn.response_read_deadline_first_batch = true;
                         conn.response_read_deadline_first_batch_profile = first_profile;
+                        conn.response_read_deadline_first_batch_method = first_method;
+                        conn.response_read_deadline_first_batch_route_method = first_route_method;
                         conn.response_read_deadline_first_batch_generation = first_generation;
                         conn.response_read_deadline_first_batch_bundle_id = first_bundle;
                     }

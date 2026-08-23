@@ -14,6 +14,35 @@ enum class ResponseReadDeadlineOwnerPhase : u8 {
     ActiveAfterCopy
 };
 
+inline bool response_read_deadline_non_head_method_admitted(u8 method) {
+    switch (static_cast<LogHttpMethod>(method)) {
+        case LogHttpMethod::Get:
+        case LogHttpMethod::Post:
+        case LogHttpMethod::Put:
+        case LogHttpMethod::Delete:
+        case LogHttpMethod::Patch:
+        case LogHttpMethod::Options:
+        case LogHttpMethod::Trace:
+            return true;
+        case LogHttpMethod::Head:
+        case LogHttpMethod::Connect:
+        case LogHttpMethod::Other:
+            return false;
+    }
+    return false;
+}
+
+inline bool response_read_deadline_route_method_matches(u8 method, u8 route_method) {
+    const auto parsed = static_cast<LogHttpMethod>(method);
+    const u8 exact = route_method_key(parsed);
+    if (exact == kRouteMethodInvalid || exact == kRouteMethodAny) return false;
+    // TRACE has no explicit route syntax. It is intentionally admitted only
+    // through a method-omitted route, even if a forged RouteEntry contains the
+    // otherwise representable internal TRACE key.
+    if (parsed == LogHttpMethod::Trace) return route_method == kRouteMethodAny;
+    return route_method == kRouteMethodAny || route_method == exact;
+}
+
 inline bool response_read_deadline_owner_is_stable(const Connection& c,
                                                    Connection::Callback expected_upstream_recv,
                                                    ResponseReadDeadlineOwnerPhase phase) {
@@ -23,6 +52,10 @@ inline bool response_read_deadline_owner_is_stable(const Connection& c,
         c.response_read_deadline_owner_generation == 0 ||
         c.response_read_deadline_owner_generation != c.response_read_deadline_generation ||
         !cfg->policy_bundle_id_is_valid(bundle_id))
+        return false;
+    if (c.response_read_deadline_method != c.req_method ||
+        !response_read_deadline_route_method_matches(c.response_read_deadline_method,
+                                                     c.response_read_deadline_route_method))
         return false;
     const auto& bundle = cfg->policy_bundles[bundle_id - 1];
     if (!response_read_timeout_seconds_valid(bundle.response_read_timeout_seconds) ||
@@ -70,8 +103,8 @@ inline bool response_read_deadline_owner_is_stable(const Connection& c,
             timeout.head_mode != FailurePolicyHeadMode::SuppressBody)
             return false;
     } else if (c.response_read_deadline_profile ==
-               ResponseReadDeadlineProfile::BodylessGetContentLengthZero) {
-        if (c.req_method != static_cast<u8>(LogHttpMethod::Get) ||
+               ResponseReadDeadlineProfile::BodylessNonHeadContentLengthZero) {
+        if (!response_read_deadline_non_head_method_admitted(c.response_read_deadline_method) ||
             c.response_policy_suppress_body || c.failure_policy_suppress_body ||
             response.head_mode != ResponsePolicyHeadMode::Reject ||
             failure.head_mode != FailurePolicyHeadMode::Reject ||

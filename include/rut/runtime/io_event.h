@@ -153,6 +153,7 @@ struct IoEvent {
     IoEventCopyWitness copy_witness = IoEventCopyWitness::None;
     u32 copy_deadline_generation = 0;
     u8 copy_deadline_profile = 0;
+    u8 copy_deadline_method = 0xffu;
     u32 copy_begin = 0;
     u32 copy_end = 0;
 };

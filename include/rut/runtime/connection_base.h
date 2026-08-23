@@ -61,19 +61,19 @@ enum class ResponseReadDeadlineState : u8 {
 enum class ResponseReadDeadlineProfile : u8 {
     None,
     HeaderOnlyHead,
-    BodylessGetContentLengthZero,
+    BodylessNonHeadContentLengthZero,
 };
 
 enum class Http1PrebuiltResponseLayout : u8 {
     None,
     HeaderOnlyHead,
-    FullContentLengthGet,
+    FullContentLengthNonHead,
 };
 
 enum class Http1PrebuiltResponsePurpose : u8 {
     None,
     StrictHeadHeaderOnly,
-    StrictGetCl0Success,
+    StrictNonHeadCl0Success,
     ResponseReadTimeout,
 };
 
@@ -493,9 +493,13 @@ struct ConnectionBase {
     u16 response_read_deadline_bundle_id;
     u8 response_read_deadline_seconds;
     ResponseReadDeadlineProfile response_read_deadline_profile;
+    u8 response_read_deadline_method;
+    u8 response_read_deadline_route_method;
     ResponseReadDeadlineState response_read_deadline_state;
     bool response_read_deadline_first_batch;
     ResponseReadDeadlineProfile response_read_deadline_first_batch_profile;
+    u8 response_read_deadline_first_batch_method;
+    u8 response_read_deadline_first_batch_route_method;
     u32 response_read_deadline_first_batch_generation;
     u16 response_read_deadline_first_batch_bundle_id;
     // Exact cumulative positive-copy proof for the current deadline owner.
@@ -518,12 +522,16 @@ struct ConnectionBase {
         response_read_deadline_bundle_id = 0;
         response_read_deadline_seconds = 0;
         response_read_deadline_profile = ResponseReadDeadlineProfile::None;
+        response_read_deadline_method = 0xffu;
+        response_read_deadline_route_method = 0xffu;
         response_read_deadline_state = ResponseReadDeadlineState::None;
         response_read_deadline_progress_generation = 0;
         response_read_deadline_progress_episode = 0;
         response_read_deadline_progress_bytes = 0;
         response_read_deadline_first_batch = false;
         response_read_deadline_first_batch_profile = ResponseReadDeadlineProfile::None;
+        response_read_deadline_first_batch_method = 0xffu;
+        response_read_deadline_first_batch_route_method = 0xffu;
         response_read_deadline_first_batch_generation = 0;
         response_read_deadline_first_batch_bundle_id = 0;
     }
@@ -532,6 +540,8 @@ struct ConnectionBase {
         http1_prebuilt_response_layout = Http1PrebuiltResponseLayout::None;
         http1_prebuilt_response_purpose = Http1PrebuiltResponsePurpose::None;
         http1_prebuilt_deadline_profile = ResponseReadDeadlineProfile::None;
+        http1_prebuilt_deadline_method = 0xffu;
+        http1_prebuilt_deadline_route_method = 0xffu;
         http1_prebuilt_deadline_generation = 0;
         http1_prebuilt_deadline_bundle_id = 0;
         http1_prebuilt_deadline_config = nullptr;
@@ -788,6 +798,8 @@ struct ConnectionBase {
     Http1PrebuiltResponseLayout http1_prebuilt_response_layout;
     Http1PrebuiltResponsePurpose http1_prebuilt_response_purpose;
     ResponseReadDeadlineProfile http1_prebuilt_deadline_profile;
+    u8 http1_prebuilt_deadline_method;
+    u8 http1_prebuilt_deadline_route_method;
     u32 http1_prebuilt_deadline_generation;
     u16 http1_prebuilt_deadline_bundle_id;
     const RouteConfig* http1_prebuilt_deadline_config;

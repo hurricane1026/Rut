@@ -878,6 +878,8 @@ u32 IoUringBackend::wait(IoEvent* events, u32 max_events, Connection* conns, u32
                         conns[conn_id].response_read_deadline_generation;
                     events[count].copy_deadline_profile =
                         static_cast<u8>(conns[conn_id].response_read_deadline_profile);
+                    events[count].copy_deadline_method =
+                        conns[conn_id].response_read_deadline_method;
                     if (events[count].copy_witness == IoEventCopyWitness::Full) {
                         events[count].copy_begin = copy_begin;
                         events[count].copy_end = target_buf.len();
@@ -889,6 +891,7 @@ u32 IoUringBackend::wait(IoEvent* events, u32 max_events, Connection* conns, u32
                     conns[conn_id].response_read_deadline_generation;
                 events[count].copy_deadline_profile =
                     static_cast<u8>(conns[conn_id].response_read_deadline_profile);
+                events[count].copy_deadline_method = conns[conn_id].response_read_deadline_method;
                 if (!stale_upstream) buf_result = -ENOBUFS;
             } else if (cqe->res > 0 && !valid_buffer_id) {
                 buf_result = -ENOBUFS;
@@ -899,6 +902,7 @@ u32 IoUringBackend::wait(IoEvent* events, u32 max_events, Connection* conns, u32
                     conns[conn_id].response_read_deadline_generation;
                 events[count].copy_deadline_profile =
                     static_cast<u8>(conns[conn_id].response_read_deadline_profile);
+                events[count].copy_deadline_method = conns[conn_id].response_read_deadline_method;
             }
 
             // Always return the buffer, even on error
@@ -1026,6 +1030,7 @@ u32 IoUringBackend::wait(IoEvent* events, u32 max_events, Connection* conns, u32
                 conns[conn_id].response_read_deadline_generation;
             events[count].copy_deadline_profile =
                 static_cast<u8>(conns[conn_id].response_read_deadline_profile);
+            events[count].copy_deadline_method = conns[conn_id].response_read_deadline_method;
             if (cqe->res > 0 && upstream_episode == conns[conn_id].upstream_episode)
                 events[count].result = -ENOBUFS;
         }
