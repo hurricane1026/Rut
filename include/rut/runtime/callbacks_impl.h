@@ -730,7 +730,9 @@ bool prepare_response_read_deadline_preflight(Loop* loop,
             conn.req_client_connection_count != 0 || conn.req_wants_upgrade ||
             profile == ResponseReadDeadlineProfile::None ||
             (complete_buffering &&
-             (profile != ResponseReadDeadlineProfile::BodylessNonHeadContentLengthZero ||
+             ((profile != ResponseReadDeadlineProfile::BodylessNonHeadContentLengthZero &&
+               profile !=
+                   ResponseReadDeadlineProfile::FixedContentLengthUploadNonHeadContentLengthZero) ||
               !response_read_deadline_non_head_method_admitted(conn.req_method) ||
               !complete_content_length_route_method_is_admitted(route->method) ||
               !response_read_deadline_route_method_matches(conn.req_method, route->method) ||
@@ -2593,16 +2595,16 @@ void handle_jit_outcome(
                      fn == nullptr && !conn.request_policy_body_pending &&
                      request_body_state == RequestPolicyBodyState::Complete);
                 const bool request_policy_valid =
-                    complete_content_length_buffering
+                    fixed_upload ? outcome.request_policy_id ==
+                                           static_cast<u16>(RequestPolicyId::Http11FixedStrip) &&
+                                       request_body_state != RequestPolicyBodyState::Invalid
+                    : complete_content_length_buffering
                         ? complete_content_length_request_policy_is_admitted(
                               outcome.request_policy_id) &&
                               request_body_state == RequestPolicyBodyState::Complete
-                    : fixed_upload ? outcome.request_policy_id != 0 &&
-                                         request_policy_is_supported(outcome.request_policy_id) &&
-                                         request_body_state != RequestPolicyBodyState::Invalid
-                                   : outcome.request_policy_id == 0 ||
-                                         (request_policy_is_supported(outcome.request_policy_id) &&
-                                          request_body_state == RequestPolicyBodyState::Complete);
+                        : outcome.request_policy_id == 0 ||
+                              (request_policy_is_supported(outcome.request_policy_id) &&
+                               request_body_state == RequestPolicyBodyState::Complete);
                 if (!loop_supports_deadline || !deadline_phase_valid ||
                     conn.response_read_deadline_owner_generation == 0 ||
                     conn.response_read_deadline_owner_generation !=
@@ -7660,11 +7662,19 @@ void on_upstream_response(void* lp, Connection& conn, IoEvent ev) {
         const bool strict_cl0 =
             strict_common && resp.content_length == 0 && raw_header_end == raw_total;
         const bool strict_positive_complete_buffering =
-            strict_common && !fixed_upload &&
+            strict_common &&
             explicit_buffering == ForwardResponseBufferingMode::CompleteContentLength &&
-            response_read_deadline_non_head_method_admitted(explicit_method) &&
-            complete_content_length_route_method_is_admitted(explicit_route_method) &&
-            response_read_deadline_route_method_matches(explicit_method, explicit_route_method) &&
+            (fixed_upload
+                 ? complete_content_length_fixed_upload_materialization_is_stable(
+                       conn,
+                       explicit_upload,
+                       /*require_upload_complete=*/true,
+                       explicit_bundle_id,
+                       explicit_route_method)
+                 : response_read_deadline_non_head_method_admitted(explicit_method) &&
+                       complete_content_length_route_method_is_admitted(explicit_route_method) &&
+                       response_read_deadline_route_method_matches(explicit_method,
+                                                                   explicit_route_method)) &&
             resp.content_length > 0 && raw_header_end <= conn.upstream_recv_buf.capacity() &&
             resp.content_length <= conn.upstream_recv_buf.capacity() - raw_header_end &&
             raw_total - raw_header_end <= resp.content_length;

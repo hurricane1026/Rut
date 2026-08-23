@@ -499,7 +499,15 @@ private:
              (!complete_content_length_request_policy_is_admitted(c.request_policy_id) ||
               !complete_content_length_route_method_is_admitted(
                   c.http1_prebuilt_deadline_route_method) ||
-              c.http1_prebuilt_deadline_upload.request_policy_id != c.request_policy_id)) ||
+              c.http1_prebuilt_deadline_upload.request_policy_id != c.request_policy_id ||
+              (c.http1_prebuilt_deadline_profile ==
+                   ResponseReadDeadlineProfile::FixedContentLengthUploadNonHeadContentLengthZero &&
+               !complete_content_length_fixed_upload_materialization_is_stable(
+                   c,
+                   c.http1_prebuilt_deadline_upload,
+                   /*require_upload_complete=*/true,
+                   c.http1_prebuilt_deadline_bundle_id,
+                   c.http1_prebuilt_deadline_route_method)))) ||
             bundle.response_policy_id != c.response_policy_id ||
             bundle.failure_policy_id != c.failure_policy_id ||
             bundle.timeout_failure_policy_id != c.timeout_failure_policy_id ||
@@ -2236,8 +2244,10 @@ public:
             c.response_read_deadline_buffering !=
                 ForwardResponseBufferingMode::CompleteContentLength ||
             !response_read_deadline_identity_is_stable(c) ||
-            c.response_read_deadline_profile !=
-                ResponseReadDeadlineProfile::BodylessNonHeadContentLengthZero ||
+            (c.response_read_deadline_profile !=
+                 ResponseReadDeadlineProfile::BodylessNonHeadContentLengthZero &&
+             !complete_content_length_fixed_upload_composition_is_stable(
+                 c, c.response_read_deadline_upload, /*require_upload_complete=*/true)) ||
             !response_read_deadline_non_head_method_admitted(c.req_method) ||
             !complete_content_length_route_method_is_admitted(
                 c.response_read_deadline_route_method) ||
