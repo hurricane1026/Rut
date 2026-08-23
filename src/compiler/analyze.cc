@@ -9777,6 +9777,22 @@ static FrontendResult<HirTerminator> analyze_term(const AstStatement& stmt, cons
          !response_read_timeout_seconds_valid(stmt.forward_response_read_timeout_seconds)))
         return frontend_error(
             FrontendError::UnsupportedSyntax, stmt.span, lit_str("invalid response read timeout"));
+    const bool has_response_buffering =
+        stmt.forward_response_buffering != ForwardResponseBufferingMode::None;
+    if (stmt.has_forward_response_buffering != has_response_buffering ||
+        !forward_response_buffering_mode_valid(stmt.forward_response_buffering))
+        return frontend_error(
+            FrontendError::UnsupportedSyntax, stmt.span, lit_str("invalid response buffering"));
+    if (has_response_buffering &&
+        (!stmt.has_forward_response_read_timeout || response_policy == nullptr ||
+         failure_policy == nullptr || timeout_failure_policy == nullptr ||
+         stmt.has_forward_request_policy ||
+         !complete_content_length_buffering_policies_valid(
+             *response_policy, *failure_policy, *timeout_failure_policy)))
+        return frontend_error(
+            FrontendError::UnsupportedSyntax,
+            stmt.span,
+            lit_str("response_buffering requires a complete strict timeout policy bundle"));
     const bool response_suppress =
         response_policy != nullptr &&
         response_policy->head_mode == ResponsePolicyHeadMode::SuppressBody;
@@ -9819,6 +9835,8 @@ static FrontendResult<HirTerminator> analyze_term(const AstStatement& stmt, cons
         term.forward_timeout_failure_policy_id = stmt.forward_timeout_failure_policy_id;
     if (stmt.has_forward_response_read_timeout)
         term.forward_response_read_timeout_seconds = stmt.forward_response_read_timeout_seconds;
+    if (stmt.has_forward_response_buffering)
+        term.forward_response_buffering = stmt.forward_response_buffering;
     if (stmt.has_forward_target_transform) {
         if (!forward_target_transform_spec_valid(stmt.forward_target_transform) ||
             stmt.has_forward_set_path || stmt.forward_set_headers.len != 0)
@@ -19016,6 +19034,8 @@ static FrontendResult<HirModule*> analyze_file_internal(
         }
         if (timeout_term != nullptr) {
             const HirTerminator& direct = route.control.direct_term;
+            const bool complete_buffering = timeout_term->forward_response_buffering ==
+                                            ForwardResponseBufferingMode::CompleteContentLength;
             const bool canonical =
                 route.control.kind == HirControlKind::Direct && timeout_term == &direct &&
                 direct.kind == HirTerminatorKind::ForwardUpstream && route.locals.len == 0 &&
@@ -19024,13 +19044,18 @@ static FrontendResult<HirModule*> analyze_file_internal(
                 route_decl.decorators.len == 0 && route.rate_limit.count == 0 &&
                 route.throttle_down_bps == 0 && direct.forward_set_path.ptr == nullptr &&
                 direct.forward_set_headers.len == 0 && !direct.has_forward_target_transform &&
-                !direct.commit_response_mutations;
+                !direct.commit_response_mutations &&
+                (!complete_buffering ||
+                 (route.method == kRouteMethodGet && direct.forward_request_policy_id == 0));
             if (!canonical)
                 return frontend_error(
                     FrontendError::UnsupportedSyntax,
                     timeout_term->span,
-                    lit_str("response_read_timeout currently requires an effect-free direct "
-                            "Forward route"));
+                    complete_buffering
+                        ? lit_str("response_buffering currently requires an effect-free direct "
+                                  "exact GET Forward route")
+                        : lit_str("response_read_timeout currently requires an effect-free direct "
+                                  "Forward route"));
         }
 
         // Wait-route backstop: the creation-time gates (kTimeWaitDetail /

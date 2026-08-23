@@ -1091,24 +1091,30 @@ TEST(response_policy, response_read_timeout_bundle_config_shapes_are_exact_and_f
     module.failure_policy_count = 2;
     module.failure_policies[0] = failure;
     module.failure_policies[1] = timeout;
-    module.policy_bundle_count = 4;
+    module.policy_bundle_count = 5;
     module.policy_bundles[0] = {0, 0, 0, 1};
     module.policy_bundles[1] = {0, 0, 0, 2};
     module.policy_bundles[2] = {1, 0, 0, 2};
     module.policy_bundles[3] = {1, 1, 2, 3};
+    module.policy_bundles[4] = {1, 1, 2, 3, ForwardResponseBufferingMode::CompleteContentLength};
 
     RouteConfig config{};
     REQUIRE(populate_route_config(config, module));
-    REQUIRE_EQ(config.policy_bundle_count, 4u);
-    for (u32 i = 0; i < 4; i++) {
+    REQUIRE_EQ(config.policy_bundle_count, 5u);
+    for (u32 i = 0; i < 5; i++) {
         CHECK(config.policy_bundle_id_is_valid(static_cast<u16>(i + 1)));
         CHECK_EQ(config.policy_bundles[i].response_read_timeout_seconds,
                  module.policy_bundles[i].response_read_timeout_seconds);
+        CHECK_EQ(config.policy_bundles[i].response_buffering,
+                 module.policy_bundles[i].response_buffering);
     }
     CHECK_EQ(config.add_policy_bundle(0, 0, 0, 1), 1u);
     CHECK_EQ(config.add_policy_bundle(0, 0, 0, 2), 2u);
     CHECK_EQ(config.add_policy_bundle(1, 0, 0, 2), 3u);
     CHECK_EQ(config.add_policy_bundle(1, 1, 2, 3), 4u);
+    CHECK_EQ(
+        config.add_policy_bundle(1, 1, 2, 3, ForwardResponseBufferingMode::CompleteContentLength),
+        5u);
     CHECK_EQ(config.add_policy_bundle(0, 0), 0u);
     CHECK_EQ(config.add_policy_bundle(0, 0, 0, 64), 0u);
 
@@ -1128,6 +1134,13 @@ TEST(response_policy, response_read_timeout_bundle_config_shapes_are_exact_and_f
     rir::Module response_only = module;
     response_only.policy_bundles[0] = {1, 0, 0, 0};
     rejects(response_only);
+    rir::Module forged_buffering = module;
+    forged_buffering.policy_bundles[4].response_buffering =
+        static_cast<ForwardResponseBufferingMode>(2);
+    rejects(forged_buffering);
+    rir::Module buffering_without_timeout = module;
+    buffering_without_timeout.policy_bundles[4].response_read_timeout_seconds = 0;
+    rejects(buffering_without_timeout);
 
     // Existing failure-only bundle behavior remains valid when duration is absent.
     RouteConfig legacy{};
@@ -1240,6 +1253,62 @@ TEST(response_read_timeout, h1_route_preflight_closes_before_body_wait_or_handle
     const u32 conn_id = conn->id;
     static constexpr char kRequest[] =
         "POST /upload HTTP/1.1\r\nHost: x\r\nContent-Length: 7\r\n\r\npay";
+    REQUIRE_EQ(conn->recv_buf.write(reinterpret_cast<const u8*>(kRequest), sizeof(kRequest) - 1),
+               sizeof(kRequest) - 1);
+    loop.backend.clear_ops();
+    on_header_received<SmallLoop>(
+        &loop, *conn, make_ev(conn_id, IoEventType::Recv, sizeof(kRequest) - 1));
+
+    CHECK_EQ(response_read_timeout_preflight_handler_calls, 0u);
+    CHECK_EQ(loop.free_top, SmallLoop::kMaxConns);
+    CHECK_EQ(loop.backend.count_ops(MockOp::Recv), 0u);
+    CHECK_EQ(loop.backend.count_ops(MockOp::Connect), 0u);
+    CHECK_EQ(loop.backend.count_ops(MockOp::Send), 0u);
+    CHECK_EQ(__builtin_memcmp(loop.recv_storage[conn_id], kRequest, sizeof(kRequest) - 1), 0);
+}
+
+TEST(response_buffering, staged_mode_rejects_before_handler_or_forward_effects) {
+    SmallLoop loop;
+    loop.setup();
+    RouteConfig config{};
+    REQUIRE(config.add_upstream("backend", 0x7F000001, 9000).has_value());
+
+    ForwardResponsePolicySpec response{};
+    response.version = ResponsePolicyVersion::Http11;
+    response.framing = ResponsePolicyFraming::ContentLength;
+    response.connection = ResponsePolicyConnection::Request;
+    response.date = ResponsePolicyDate::Current;
+    response.server = {"rut", 3};
+    REQUIRE_EQ(config.add_response_policy(response), 1u);
+
+    ForwardFailurePolicySpec failure{};
+    failure.version = ForwardFailurePolicyVersion::Http11;
+    failure.status_code = 502;
+    failure.date = ForwardFailurePolicyDate::Current;
+    failure.connection = ForwardFailurePolicyConnection::Request;
+    failure.reason = {"Bad Gateway", 11};
+    failure.content_type = {"text/plain", 10};
+    failure.server = {"rut", 3};
+    failure.body = {"bad", 3};
+    REQUIRE_EQ(config.add_failure_policy(failure), 1u);
+    auto timeout = failure;
+    timeout.status_code = 504;
+    timeout.reason = {"Gateway Time-out", 16};
+    timeout.body = {"slow", 4};
+    REQUIRE_EQ(config.add_failure_policy(timeout), 2u);
+    REQUIRE_EQ(
+        config.add_policy_bundle(1, 1, 2, 1, ForwardResponseBufferingMode::CompleteContentLength),
+        1u);
+    REQUIRE(config.add_jit_handler(
+        "/buffered", kRouteMethodGet, &response_read_timeout_preflight_handler, false, 1));
+    const RouteConfig* active = &config;
+    loop.config_ptr = &active;
+    response_read_timeout_preflight_handler_calls = 0;
+
+    auto* conn = loop.alloc_conn();
+    REQUIRE(conn != nullptr);
+    const u32 conn_id = conn->id;
+    static constexpr char kRequest[] = "GET /buffered HTTP/1.1\r\nHost: x\r\n\r\n";
     REQUIRE_EQ(conn->recv_buf.write(reinterpret_cast<const u8*>(kRequest), sizeof(kRequest) - 1),
                sizeof(kRequest) - 1);
     loop.backend.clear_ops();

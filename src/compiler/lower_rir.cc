@@ -2,6 +2,7 @@
 
 #include "rut/compiler/rir_builder.h"
 #include "rut/jit/handler_abi.h"
+#include "rut/runtime/route_method.h"
 
 namespace rut {
 
@@ -3095,6 +3096,24 @@ static FrontendResult<void> emit_term(const MirTerminator& term,
         if (term.forward_response_read_timeout_seconds != 0 &&
             !response_read_timeout_seconds_valid(term.forward_response_read_timeout_seconds))
             return frontend_error(FrontendError::UnsupportedSyntax, term.span);
+        if (!forward_response_buffering_mode_valid(term.forward_response_buffering))
+            return frontend_error(FrontendError::UnsupportedSyntax, term.span);
+        if (term.forward_response_buffering != ForwardResponseBufferingMode::None) {
+            if (term.forward_response_buffering !=
+                    ForwardResponseBufferingMode::CompleteContentLength ||
+                term.forward_response_read_timeout_seconds == 0 ||
+                term.forward_request_policy_id != 0 || term.forward_response_policy_id == 0 ||
+                term.forward_failure_policy_id == 0 ||
+                term.forward_timeout_failure_policy_id == 0 ||
+                term.forward_response_policy_id > b.mod->response_policy_count ||
+                term.forward_failure_policy_id > b.mod->failure_policy_count ||
+                term.forward_timeout_failure_policy_id > b.mod->failure_policy_count ||
+                !complete_content_length_buffering_policies_valid(
+                    b.mod->response_policies[term.forward_response_policy_id - 1],
+                    b.mod->failure_policies[term.forward_failure_policy_id - 1],
+                    b.mod->failure_policies[term.forward_timeout_failure_policy_id - 1]))
+                return frontend_error(FrontendError::UnsupportedSyntax, term.span);
+        }
         // forward(set_path: "..."): emit ReqSetPath(const-str) before the
         // terminator so the handler records the path override at runtime.
         if (term.forward_set_path.ptr != nullptr) {
@@ -3135,7 +3154,8 @@ static FrontendResult<void> emit_term(const MirTerminator& term,
             response_policy = p.value();
         }
         if (term.forward_failure_policy_id != 0 || term.forward_timeout_failure_policy_id != 0 ||
-            term.forward_response_read_timeout_seconds != 0) {
+            term.forward_response_read_timeout_seconds != 0 ||
+            term.forward_response_buffering != ForwardResponseBufferingMode::None) {
             if (term.forward_response_policy_id > b.mod->response_policy_count ||
                 term.forward_failure_policy_id > b.mod->failure_policy_count ||
                 term.forward_timeout_failure_policy_id > b.mod->failure_policy_count)
@@ -3156,7 +3176,8 @@ static FrontendResult<void> emit_term(const MirTerminator& term,
                     existing.failure_policy_id == term.forward_failure_policy_id &&
                     existing.timeout_failure_policy_id == term.forward_timeout_failure_policy_id &&
                     existing.response_read_timeout_seconds ==
-                        term.forward_response_read_timeout_seconds) {
+                        term.forward_response_read_timeout_seconds &&
+                    existing.response_buffering == term.forward_response_buffering) {
                     bundle_id = static_cast<u16>(i + 1);
                     break;
                 }
@@ -3168,7 +3189,8 @@ static FrontendResult<void> emit_term(const MirTerminator& term,
                 b.mod->policy_bundles[bundle_id - 1] = {term.forward_response_policy_id,
                                                         term.forward_failure_policy_id,
                                                         term.forward_timeout_failure_policy_id,
-                                                        term.forward_response_read_timeout_seconds};
+                                                        term.forward_response_read_timeout_seconds,
+                                                        term.forward_response_buffering};
             }
             auto bundle =
                 b.emit_const_i32(static_cast<i32>(bundle_id), {term.span.line, term.span.col});
@@ -3192,7 +3214,8 @@ static FrontendResult<void> emit_term(const MirTerminator& term,
                 !b.emit_req_set_target_transform(target_transform_id,
                                                  {term.span.line, term.span.col}))
                 return frontend_error(FrontendError::OutOfMemory, term.span);
-            if (term.forward_response_read_timeout_seconds != 0) {
+            if (term.forward_response_read_timeout_seconds != 0 ||
+                term.forward_response_buffering != ForwardResponseBufferingMode::None) {
                 if (fn == nullptr || fn->preflight_forward_policy_bundle_id != 0)
                     return frontend_error(FrontendError::UnsupportedSyntax, term.span);
                 fn->preflight_forward_policy_bundle_id = bundle_id;
@@ -3886,6 +3909,8 @@ FrontendResult<void> lower_to_rir(const MirModule& mir, FrontendRirModule& out) 
         }
         if (timeout_term != nullptr) {
             const auto& function = mir.functions[i];
+            const bool complete_buffering = timeout_term->forward_response_buffering ==
+                                            ForwardResponseBufferingMode::CompleteContentLength;
             const bool canonical =
                 function.blocks.len == 1 && &function.blocks[0].term == timeout_term &&
                 timeout_term->kind == MirTerminatorKind::ForwardUpstream &&
@@ -3895,14 +3920,19 @@ FrontendResult<void> lower_to_rir(const MirModule& mir, FrontendRirModule& out) 
                 function.throttle_down_bps == 0 && timeout_term->forward_set_path.ptr == nullptr &&
                 timeout_term->forward_set_headers.len == 0 &&
                 !timeout_term->has_forward_target_transform &&
-                !timeout_term->commit_response_mutations;
+                !timeout_term->commit_response_mutations &&
+                (!complete_buffering || (function.method == kRouteMethodGet &&
+                                         timeout_term->forward_request_policy_id == 0));
             if (!canonical) {
                 out.destroy();
                 return frontend_error(
                     FrontendError::UnsupportedSyntax,
                     timeout_term->span,
-                    lit_str("response_read_timeout currently requires an effect-free direct "
-                            "Forward route"));
+                    complete_buffering
+                        ? lit_str("response_buffering currently requires an effect-free direct "
+                                  "exact GET Forward route")
+                        : lit_str("response_read_timeout currently requires an effect-free direct "
+                                  "Forward route"));
             }
         }
         Str name{};

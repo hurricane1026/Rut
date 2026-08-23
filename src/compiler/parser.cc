@@ -1807,6 +1807,19 @@ struct Parser {
                                                   value.value()->text);
                         stmt.forward_response_read_timeout_seconds = seconds;
                         stmt.has_forward_response_read_timeout = true;
+                    } else if (kw_text.eq({"response_buffering", 18})) {
+                        if (stmt.has_forward_response_buffering)
+                            return frontend_error(
+                                FrontendError::UnexpectedToken, span_from(*kw.value()), kw_text);
+                        auto value = expect(TokenType::StringLit);
+                        if (!value) return core::make_unexpected(value.error());
+                        if (!value.value()->text.eq({"complete_content_length", 23}))
+                            return frontend_error(FrontendError::UnsupportedSyntax,
+                                                  span_from(*value.value()),
+                                                  value.value()->text);
+                        stmt.forward_response_buffering =
+                            ForwardResponseBufferingMode::CompleteContentLength;
+                        stmt.has_forward_response_buffering = true;
                     } else if (kw_text.eq({"request_policy", 14})) {
                         if (stmt.has_forward_request_policy)
                             return frontend_error(

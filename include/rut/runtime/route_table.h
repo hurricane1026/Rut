@@ -949,14 +949,17 @@ struct RouteConfig {
         return static_cast<u16>(failure_policy_count);
     }
 
-    u16 add_policy_bundle(u16 response_policy_id,
-                          u16 failure_policy_id,
-                          u16 timeout_failure_policy_id = 0,
-                          u8 response_read_timeout_seconds = 0) {
+    u16 add_policy_bundle(
+        u16 response_policy_id,
+        u16 failure_policy_id,
+        u16 timeout_failure_policy_id = 0,
+        u8 response_read_timeout_seconds = 0,
+        ForwardResponseBufferingMode response_buffering = ForwardResponseBufferingMode::None) {
         if ((response_policy_id != 0 && !response_policy_id_is_valid(response_policy_id)) ||
             (failure_policy_id != 0 && !failure_policy_id_is_valid(failure_policy_id)) ||
             (response_read_timeout_seconds != 0 &&
              !response_read_timeout_seconds_valid(response_read_timeout_seconds)) ||
+            !forward_response_buffering_mode_valid(response_buffering) ||
             (response_read_timeout_seconds == 0 && failure_policy_id == 0))
             return 0;
         if (timeout_failure_policy_id != 0) {
@@ -973,19 +976,30 @@ struct RouteConfig {
             if (response_suppress != failure_suppress || failure_suppress != timeout_suppress)
                 return 0;
         }
+        if (response_buffering != ForwardResponseBufferingMode::None &&
+            (response_buffering != ForwardResponseBufferingMode::CompleteContentLength ||
+             !response_read_timeout_seconds_valid(response_read_timeout_seconds) ||
+             response_policy_id == 0 || failure_policy_id == 0 || timeout_failure_policy_id == 0 ||
+             !complete_content_length_buffering_policies_valid(
+                 response_policies[response_policy_id - 1],
+                 failure_policies[failure_policy_id - 1],
+                 failure_policies[timeout_failure_policy_id - 1])))
+            return 0;
         if (policy_bundle_count > kMaxForwardPolicyBundles) return 0;
         for (u32 i = 0; i < policy_bundle_count; i++) {
             if (policy_bundles[i].response_policy_id == response_policy_id &&
                 policy_bundles[i].failure_policy_id == failure_policy_id &&
                 policy_bundles[i].timeout_failure_policy_id == timeout_failure_policy_id &&
-                policy_bundles[i].response_read_timeout_seconds == response_read_timeout_seconds)
+                policy_bundles[i].response_read_timeout_seconds == response_read_timeout_seconds &&
+                policy_bundles[i].response_buffering == response_buffering)
                 return static_cast<u16>(i + 1);
         }
         if (policy_bundle_count >= kMaxForwardPolicyBundles) return 0;
         policy_bundles[policy_bundle_count] = {response_policy_id,
                                                failure_policy_id,
                                                timeout_failure_policy_id,
-                                               response_read_timeout_seconds};
+                                               response_read_timeout_seconds,
+                                               response_buffering};
         return static_cast<u16>(++policy_bundle_count);
     }
 
@@ -1009,7 +1023,19 @@ struct RouteConfig {
             (b.failure_policy_id != 0 && !failure_policy_id_is_valid(b.failure_policy_id)) ||
             (b.response_read_timeout_seconds != 0 &&
              !response_read_timeout_seconds_valid(b.response_read_timeout_seconds)) ||
+            !forward_response_buffering_mode_valid(b.response_buffering) ||
             (b.response_read_timeout_seconds == 0 && b.failure_policy_id == 0))
+            return false;
+        if (b.response_buffering != ForwardResponseBufferingMode::None &&
+            (b.response_buffering != ForwardResponseBufferingMode::CompleteContentLength ||
+             !response_read_timeout_seconds_valid(b.response_read_timeout_seconds) ||
+             b.response_policy_id == 0 || b.failure_policy_id == 0 ||
+             b.timeout_failure_policy_id == 0 ||
+             !timeout_failure_policy_id_is_valid(b.timeout_failure_policy_id) ||
+             !complete_content_length_buffering_policies_valid(
+                 response_policies[b.response_policy_id - 1],
+                 failure_policies[b.failure_policy_id - 1],
+                 failure_policies[b.timeout_failure_policy_id - 1])))
             return false;
         if (b.timeout_failure_policy_id == 0) return true;
         if (b.response_policy_id == 0 || b.failure_policy_id == 0 ||

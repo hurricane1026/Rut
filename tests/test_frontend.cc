@@ -33135,6 +33135,226 @@ TEST(frontend, response_read_timeout_accepts_only_exact_whole_seconds_one_throug
     CHECK(mismatched.error().detail.eq(lit("invalid response read timeout")));
 }
 
+TEST(frontend, response_buffering_parses_propagates_deduplicates_and_preserves_packed_abi) {
+    const char source[] = R"rut(
+upstream b at "127.0.0.1:9000"
+route GET "/one" {
+    return forward(b,
+        response_policy: { version: "HTTP/1.1", framing: "content_length",
+            connection: "request", server: "s", date: "current", hide_headers: [] },
+        failure_policy: { version: "HTTP/1.1", status: 502, reason: "Bad Gateway",
+            content_type: "text/plain", server: "s", date: "current",
+            connection: "request", body: b"bad" },
+        timeout_failure_policy: { version: "HTTP/1.1", status: 504,
+            reason: "Gateway Time-out", content_type: "text/plain", server: "s",
+            date: "current", connection: "request", body: b"slow" },
+        response_read_timeout: 1s,
+        response_buffering: "complete_content_length")
+}
+route GET "/same" {
+    return forward(b,
+        response_policy: { version: "HTTP/1.1", framing: "content_length",
+            connection: "request", server: "s", date: "current", hide_headers: [] },
+        failure_policy: { version: "HTTP/1.1", status: 502, reason: "Bad Gateway",
+            content_type: "text/plain", server: "s", date: "current",
+            connection: "request", body: b"bad" },
+        timeout_failure_policy: { version: "HTTP/1.1", status: 504,
+            reason: "Gateway Time-out", content_type: "text/plain", server: "s",
+            date: "current", connection: "request", body: b"slow" },
+        response_read_timeout: 1s,
+        response_buffering: "complete_content_length")
+}
+route GET "/stream" {
+    return forward(b,
+        response_policy: { version: "HTTP/1.1", framing: "content_length",
+            connection: "request", server: "s", date: "current", hide_headers: [] },
+        failure_policy: { version: "HTTP/1.1", status: 502, reason: "Bad Gateway",
+            content_type: "text/plain", server: "s", date: "current",
+            connection: "request", body: b"bad" },
+        timeout_failure_policy: { version: "HTTP/1.1", status: 504,
+            reason: "Gateway Time-out", content_type: "text/plain", server: "s",
+            date: "current", connection: "request", body: b"slow" },
+        response_read_timeout: 1s)
+}
+)rut";
+    auto lexed = lex(lit(source));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    for (u32 i = 0; i < 2; i++) {
+        const auto* stmt = ast->items[i + 1].route.statements[0];
+        REQUIRE(stmt != nullptr);
+        CHECK(stmt->has_forward_response_buffering);
+        CHECK_EQ(stmt->forward_response_buffering,
+                 ForwardResponseBufferingMode::CompleteContentLength);
+    }
+    const auto* omitted = ast->items[3].route.statements[0];
+    REQUIRE(omitted != nullptr);
+    CHECK_FALSE(omitted->has_forward_response_buffering);
+    CHECK_EQ(omitted->forward_response_buffering, ForwardResponseBufferingMode::None);
+
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    CHECK_EQ(hir->routes[0].control.direct_term.forward_response_buffering,
+             ForwardResponseBufferingMode::CompleteContentLength);
+    CHECK_EQ(hir->routes[1].control.direct_term.forward_response_buffering,
+             ForwardResponseBufferingMode::CompleteContentLength);
+    CHECK_EQ(hir->routes[2].control.direct_term.forward_response_buffering,
+             ForwardResponseBufferingMode::None);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    CHECK_EQ(mir->functions[0].blocks[0].term.forward_response_buffering,
+             ForwardResponseBufferingMode::CompleteContentLength);
+    CHECK_EQ(mir->functions[1].blocks[0].term.forward_response_buffering,
+             ForwardResponseBufferingMode::CompleteContentLength);
+    CHECK_EQ(mir->functions[2].blocks[0].term.forward_response_buffering,
+             ForwardResponseBufferingMode::None);
+
+    FrontendRirModule rir{};
+    REQUIRE(lower_to_rir(mir.value(), rir));
+    REQUIRE(rir::verify_module(rir.module).ok);
+    REQUIRE_EQ(rir.module.policy_bundle_count, 2u);
+    CHECK_EQ(rir.module.functions[0].preflight_forward_policy_bundle_id, 1u);
+    CHECK_EQ(rir.module.functions[1].preflight_forward_policy_bundle_id, 1u);
+    CHECK_EQ(rir.module.functions[2].preflight_forward_policy_bundle_id, 2u);
+    CHECK_EQ(rir.module.policy_bundles[0].response_buffering,
+             ForwardResponseBufferingMode::CompleteContentLength);
+    CHECK_EQ(rir.module.policy_bundles[1].response_buffering, ForwardResponseBufferingMode::None);
+
+    const auto packed = jit::HandlerResult::make_forward_with_bundle(7, 0, 1).pack();
+    static_assert(sizeof(packed) == sizeof(u64));
+    const auto unpacked = jit::HandlerResult::unpack(packed);
+    CHECK_EQ(unpacked.action, jit::HandlerAction::ForwardBundle);
+    CHECK_EQ(unpacked.upstream_id, 7u);
+    CHECK_EQ(unpacked.status_code, 0u);
+    CHECK_EQ(unpacked.next_state, 1u);
+    rir.destroy();
+}
+
+TEST(frontend, response_buffering_rejects_bad_syntax_static_shapes_and_forgery) {
+    struct InvalidSyntax {
+        const char* source;
+        FrontendError code;
+        const char* detail;
+    } invalid_syntax[] = {
+        {"upstream b\nroute GET \"/\" { return forward(b, response_buffering: 1) }\n",
+         FrontendError::UnexpectedToken,
+         "1"},
+        {"upstream b\nroute GET \"/\" { return forward(b, response_buffering: \"stream\") }\n",
+         FrontendError::UnsupportedSyntax,
+         "stream"},
+        {"upstream b\nroute GET \"/\" { return forward(b, response_buffering:) }\n",
+         FrontendError::UnexpectedToken,
+         nullptr},
+    };
+    for (const auto& test : invalid_syntax) {
+        auto lexed = lex(lit(test.source));
+        REQUIRE(lexed);
+        auto ast = parse_file_heap(lexed.value());
+        REQUIRE_FALSE(ast.has_value());
+        CHECK_EQ(ast.error().code, test.code);
+        CHECK_GT(ast.error().span.line, 0u);
+        CHECK_GT(ast.error().span.col, 0u);
+        if (test.detail != nullptr) CHECK(ast.error().detail.eq(lit(test.detail)));
+    }
+    const char duplicate[] =
+        "upstream b\nroute GET \"/\" { return forward(b, "
+        "response_buffering: \"complete_content_length\", "
+        "response_buffering: \"complete_content_length\") }\n";
+    auto lexed = lex(lit(duplicate));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE_FALSE(ast.has_value());
+    CHECK_EQ(ast.error().code, FrontendError::UnexpectedToken);
+    CHECK(ast.error().detail.eq(lit("response_buffering")));
+
+    const char incomplete_bundle[] =
+        "upstream b\nroute GET \"/\" { return forward(b, response_read_timeout: 1s, "
+        "response_buffering: \"complete_content_length\") }\n";
+    lexed = lex(lit(incomplete_bundle));
+    REQUIRE(lexed);
+    ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto rejected_hir = analyze_file_heap(ast.value());
+    REQUIRE_FALSE(rejected_hir.has_value());
+    CHECK(rejected_hir.error().detail.eq(
+        lit("response_buffering requires a complete strict timeout policy bundle")));
+
+    const char valid[] = R"rut(
+upstream b
+route GET "/" {
+    return forward(b,
+        response_policy: { version: "HTTP/1.1", framing: "content_length",
+            connection: "request", server: "s", date: "current", hide_headers: [] },
+        failure_policy: { version: "HTTP/1.1", status: 502, reason: "Bad Gateway",
+            content_type: "text/plain", server: "s", date: "current",
+            connection: "request", body: b"bad" },
+        timeout_failure_policy: { version: "HTTP/1.1", status: 504,
+            reason: "Gateway Time-out", content_type: "text/plain", server: "s",
+            date: "current", connection: "request", body: b"slow" },
+        response_read_timeout: 1s,
+        response_buffering: "complete_content_length")
+}
+)rut";
+    lexed = lex(lit(valid));
+    REQUIRE(lexed);
+    ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto* stmt = ast->items[1].route.statements[0];
+    REQUIRE(stmt != nullptr);
+    stmt->forward_response_buffering = static_cast<ForwardResponseBufferingMode>(2);
+    rejected_hir = analyze_file_heap(ast.value());
+    REQUIRE_FALSE(rejected_hir.has_value());
+    CHECK(rejected_hir.error().detail.eq(lit("invalid response buffering")));
+
+    for (const bool any_method : {false, true}) {
+        std::string wrong_method(valid);
+        const auto method = wrong_method.find("route GET");
+        REQUIRE_NE(method, std::string::npos);
+        wrong_method.replace(method, sizeof("route GET") - 1u, any_method ? "route" : "route POST");
+        lexed = lex({wrong_method.data(), static_cast<u32>(wrong_method.size())});
+        REQUIRE(lexed);
+        ast = parse_file_heap(lexed.value());
+        REQUIRE(ast);
+        rejected_hir = analyze_file_heap(ast.value());
+        REQUIRE_FALSE(rejected_hir.has_value());
+        CHECK(rejected_hir.error().detail.eq(
+            lit("response_buffering currently requires an effect-free direct exact GET Forward "
+                "route")));
+    }
+
+    lexed = lex(lit(valid));
+    REQUIRE(lexed);
+    ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    mir->functions[0].blocks[0].term.forward_response_buffering =
+        static_cast<ForwardResponseBufferingMode>(2);
+    FrontendRirModule rejected{};
+    CHECK_FALSE(lower_to_rir(mir.value(), rejected).has_value());
+    mir->functions[0].blocks[0].term.forward_response_buffering =
+        ForwardResponseBufferingMode::CompleteContentLength;
+
+    FrontendRirModule rir{};
+    REQUIRE(lower_to_rir(mir.value(), rir));
+    REQUIRE(rir::verify_module(rir.module).ok);
+    rir.module.policy_bundles[0].response_buffering = static_cast<ForwardResponseBufferingMode>(2);
+    CHECK_FALSE(rir::verify_module(rir.module).ok);
+    rir.module.policy_bundles[0].response_buffering =
+        ForwardResponseBufferingMode::CompleteContentLength;
+    rir.module.policy_bundles[0].response_read_timeout_seconds = 0;
+    CHECK_FALSE(rir::verify_module(rir.module).ok);
+    rir.module.policy_bundles[0].response_read_timeout_seconds = 1;
+    rir.module.functions[0].http_method = kRouteMethodAny;
+    CHECK_FALSE(rir::verify_module(rir.module).ok);
+    rir.module.functions[0].http_method = kRouteMethodGet;
+    CHECK(rir::verify_module(rir.module).ok);
+    rir.destroy();
+}
+
 TEST(frontend, response_read_timeout_bundle_shapes_deduplicate_and_reach_config_exactly) {
     const char source[] = R"rut(
 upstream b at "127.0.0.1:9000"

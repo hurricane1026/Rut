@@ -685,6 +685,14 @@ bool prepare_response_read_deadline_preflight(Loop* loop,
             return false;
         }
         const auto& bundle = config->policy_bundles[id - 1];
+        // Staged #271 metadata is intentionally not executable until the
+        // separately reviewed buffering state machine lands. Reject from
+        // pinned route metadata before invoking the handler or creating any
+        // upstream/downstream effect; never silently stream this mode.
+        if (bundle.response_buffering != ForwardResponseBufferingMode::None) {
+            loop->close_conn(conn);
+            return false;
+        }
         if (!response_read_timeout_seconds_valid(bundle.response_read_timeout_seconds) ||
             bundle.response_policy_id == 0 || bundle.failure_policy_id == 0 ||
             bundle.timeout_failure_policy_id == 0 ||

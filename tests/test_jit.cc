@@ -8429,6 +8429,68 @@ route GET "/later" { return 204 }
     rir.destroy();
 }
 
+TEST(jit, compiled_response_buffering_reaches_config_without_changing_handler_result_abi) {
+    const char source[] = R"rut(
+upstream b at "127.0.0.1:9000"
+route GET "/" {
+    return forward(b,
+        response_policy: { version: "HTTP/1.1", framing: "content_length",
+            connection: "request", server: "s", date: "current", hide_headers: [] },
+        failure_policy: { version: "HTTP/1.1", status: 502, reason: "Bad Gateway",
+            content_type: "text/plain", server: "s", date: "current",
+            connection: "request", body: b"bad" },
+        timeout_failure_policy: { version: "HTTP/1.1", status: 504,
+            reason: "Gateway Time-out", content_type: "text/plain", server: "s",
+            date: "current", connection: "request", body: b"slow" },
+        response_read_timeout: 1s,
+        response_buffering: "complete_content_length")
+}
+)rut";
+    auto lexed = lex(lit(source));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    REQUIRE(lower_to_rir(mir.value(), rir));
+    REQUIRE(rir::verify_module(rir.module).ok);
+    REQUIRE_EQ(rir.module.policy_bundle_count, 1u);
+    CHECK_EQ(rir.module.policy_bundles[0].response_buffering,
+             ForwardResponseBufferingMode::CompleteContentLength);
+
+    auto cg = codegen(rir.module);
+    REQUIRE(cg.ok);
+    JitEngine engine;
+    REQUIRE(engine.init());
+    REQUIRE(engine.compile(cg.mod, cg.ctx));
+    auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
+    REQUIRE(handler != nullptr);
+    const auto raw = HandlerResult::unpack(handler(nullptr, nullptr, nullptr, 0, nullptr));
+    CHECK_EQ(raw.action, HandlerAction::ForwardBundle);
+    CHECK_EQ(raw.status_code, 0u);
+    CHECK_EQ(raw.upstream_id, 0u);
+    CHECK_EQ(raw.next_state, 1u);
+
+    auto config = std::make_unique<RouteConfig>();
+    REQUIRE(populate_route_config(*config, rir.module));
+    REQUIRE_EQ(config->policy_bundle_count, 1u);
+    CHECK_EQ(config->policy_bundles[0].response_buffering,
+             ForwardResponseBufferingMode::CompleteContentLength);
+    config->policy_bundles[0].response_buffering = ForwardResponseBufferingMode::None;
+    CHECK_FALSE(register_jit_routes(*config, rir.module, engine));
+    CHECK_EQ(config->route_count, 0u);
+    config->policy_bundles[0].response_buffering =
+        ForwardResponseBufferingMode::CompleteContentLength;
+    REQUIRE(register_jit_routes(*config, rir.module, engine));
+    REQUIRE_EQ(config->route_count, 1u);
+    CHECK_EQ(config->routes[0].preflight_forward_policy_bundle_id, 1u);
+    engine.shutdown();
+    rir.destroy();
+}
+
 TEST(result, pack_unpack_yield) {
     auto r = HandlerResult::make_yield(3, YieldKind::Forward);
     u64 packed = r.pack();

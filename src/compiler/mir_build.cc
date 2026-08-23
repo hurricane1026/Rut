@@ -1144,6 +1144,7 @@ FrontendResult<MirModule*> build_mir(const HirModule& module) {
             out->forward_failure_policy_id = term.forward_failure_policy_id;
             out->forward_timeout_failure_policy_id = term.forward_timeout_failure_policy_id;
             out->forward_response_read_timeout_seconds = term.forward_response_read_timeout_seconds;
+            out->forward_response_buffering = term.forward_response_buffering;
             out->redirect_policy_id = term.redirect_policy_id;
             out->has_forward_target_transform = term.has_forward_target_transform;
             out->forward_target_transform = term.forward_target_transform;

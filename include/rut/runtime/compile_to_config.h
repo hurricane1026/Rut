@@ -146,7 +146,8 @@ inline bool register_jit_routes(RouteConfig& cfg, const rir::Module& mod, jit::J
             expected.response_policy_id != actual.response_policy_id ||
             expected.failure_policy_id != actual.failure_policy_id ||
             expected.timeout_failure_policy_id != actual.timeout_failure_policy_id ||
-            expected.response_read_timeout_seconds != actual.response_read_timeout_seconds)
+            expected.response_read_timeout_seconds != actual.response_read_timeout_seconds ||
+            expected.response_buffering != actual.response_buffering)
             return false;
     }
 
@@ -299,7 +300,19 @@ inline bool populate_route_config(RouteConfig& cfg, const rir::Module& mod) {
               !response_policy_spec_valid(mod.response_policies[bundle.response_policy_id - 1]))) ||
             (bundle.response_read_timeout_seconds != 0 &&
              !response_read_timeout_seconds_valid(bundle.response_read_timeout_seconds)) ||
+            !forward_response_buffering_mode_valid(bundle.response_buffering) ||
             (bundle.response_read_timeout_seconds == 0 && bundle.failure_policy_id == 0))
+            return false;
+        if (bundle.response_buffering != ForwardResponseBufferingMode::None &&
+            (bundle.response_buffering != ForwardResponseBufferingMode::CompleteContentLength ||
+             !response_read_timeout_seconds_valid(bundle.response_read_timeout_seconds) ||
+             bundle.response_policy_id == 0 || bundle.failure_policy_id == 0 ||
+             bundle.timeout_failure_policy_id == 0 ||
+             bundle.timeout_failure_policy_id > mod.failure_policy_count ||
+             !complete_content_length_buffering_policies_valid(
+                 mod.response_policies[bundle.response_policy_id - 1],
+                 mod.failure_policies[bundle.failure_policy_id - 1],
+                 mod.failure_policies[bundle.timeout_failure_policy_id - 1])))
             return false;
         if (bundle.timeout_failure_policy_id != 0) {
             if (bundle.response_policy_id == 0 || bundle.failure_policy_id == 0 ||
@@ -470,7 +483,8 @@ inline bool populate_route_config(RouteConfig& cfg, const rir::Module& mod) {
         u16 idx = cfg.add_policy_bundle(bundle.response_policy_id,
                                         bundle.failure_policy_id,
                                         bundle.timeout_failure_policy_id,
-                                        bundle.response_read_timeout_seconds);
+                                        bundle.response_read_timeout_seconds,
+                                        bundle.response_buffering);
         if (idx == 0 || idx != i + 1) return false;
     }
     // Cache instance descriptors — declaration order defines the instance

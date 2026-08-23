@@ -4,6 +4,7 @@
 #include "rut/compiler/rir.h"
 #include "rut/compiler/rir_printer.h"
 #include "rut/jit/handler_abi.h"
+#include "rut/runtime/route_method.h"
 
 namespace rut {
 namespace rir {
@@ -1027,7 +1028,18 @@ inline VerifyResult verify_module(const Module& mod, VerifyOptions options = {})
               !forward_failure_policy_spec_valid(
                   mod.failure_policies[bundle.failure_policy_id - 1]))) ||
             (seconds != 0 && !response_read_timeout_seconds_valid(seconds)) ||
+            !forward_response_buffering_mode_valid(bundle.response_buffering) ||
             (seconds == 0 && bundle.failure_policy_id == 0))
+            return verify_fail(summary, VerifyIssueCode::InvalidForwardPreflight, 0);
+        if (bundle.response_buffering != ForwardResponseBufferingMode::None &&
+            (bundle.response_buffering != ForwardResponseBufferingMode::CompleteContentLength ||
+             !response_read_timeout_seconds_valid(seconds) || bundle.response_policy_id == 0 ||
+             bundle.failure_policy_id == 0 || bundle.timeout_failure_policy_id == 0 ||
+             bundle.timeout_failure_policy_id > mod.failure_policy_count ||
+             !complete_content_length_buffering_policies_valid(
+                 mod.response_policies[bundle.response_policy_id - 1],
+                 mod.failure_policies[bundle.failure_policy_id - 1],
+                 mod.failure_policies[bundle.timeout_failure_policy_id - 1])))
             return verify_fail(summary, VerifyIssueCode::InvalidForwardPreflight, 0);
         if (bundle.timeout_failure_policy_id != 0) {
             if (bundle.response_policy_id == 0 || bundle.failure_policy_id == 0 ||
@@ -1109,6 +1121,12 @@ inline VerifyResult verify_module(const Module& mod, VerifyOptions options = {})
                 const bool duration = response_read_timeout_seconds_valid(
                     mod.policy_bundles[bundle_id - 1].response_read_timeout_seconds);
                 if (!duration) continue;
+                const auto buffering = mod.policy_bundles[bundle_id - 1].response_buffering;
+                if (buffering != ForwardResponseBufferingMode::None &&
+                    (buffering != ForwardResponseBufferingMode::CompleteContentLength ||
+                     fn.http_method != kRouteMethodGet || request_policy != 0))
+                    return verify_fail(
+                        summary, VerifyIssueCode::InvalidForwardPreflight, fi, bi, ii);
                 if (sole_timeout_ret != nullptr || !has_preflight || bundle_id != preflight_id)
                     return verify_fail(summary,
                                        VerifyIssueCode::InvalidForwardPreflight,

@@ -2,6 +2,7 @@
 
 #include "rut/common/forward_policy_head_mode.h"
 #include "rut/common/http_header_validation.h"
+#include "rut/common/response_policy.h"
 #include "rut/common/types.h"
 
 namespace rut {
@@ -15,6 +16,16 @@ static constexpr u32 kMaxFailurePolicyBodyLen = 4096;
 enum class ForwardFailurePolicyVersion : u8 { Invalid = 0, Http11 = 1 };
 enum class ForwardFailurePolicyDate : u8 { Invalid = 0, Current = 1 };
 enum class ForwardFailurePolicyConnection : u8 { Invalid = 0, Request = 1 };
+
+enum class ForwardResponseBufferingMode : u8 {
+    None = 0,
+    CompleteContentLength = 1,
+};
+
+inline bool forward_response_buffering_mode_valid(ForwardResponseBufferingMode mode) {
+    return mode == ForwardResponseBufferingMode::None ||
+           mode == ForwardResponseBufferingMode::CompleteContentLength;
+}
 
 struct ForwardFailurePolicySpec {
     ForwardFailurePolicyVersion version = ForwardFailurePolicyVersion::Invalid;
@@ -37,7 +48,13 @@ struct ForwardPolicyBundle {
     // Optional per-forward upstream response-read inactivity interval. Zero is
     // internal absence; the current TimerWheel representation is exact 1..63s.
     u8 response_read_timeout_seconds = 0;
+    // Optional entire-response commit barrier. The packed handler ABI carries
+    // only this bundle's id; zero preserves the existing streaming behavior.
+    ForwardResponseBufferingMode response_buffering = ForwardResponseBufferingMode::None;
 };
+
+static_assert(sizeof(ForwardPolicyBundle) == 8,
+              "ForwardPolicyBundle metadata must remain one compact 8-byte value");
 
 inline bool response_read_timeout_seconds_valid(u8 seconds) {
     return seconds >= 1 && seconds <= 63;
@@ -86,6 +103,21 @@ inline bool forward_failure_policy_spec_valid(const ForwardFailurePolicySpec& po
 // default 502 policy.
 inline bool forward_timeout_failure_policy_spec_valid(const ForwardFailurePolicySpec& policy) {
     return forward_failure_policy_spec_shape_valid(policy);
+}
+
+inline bool complete_content_length_buffering_policies_valid(
+    const ForwardResponsePolicySpec& response,
+    const ForwardFailurePolicySpec& failure,
+    const ForwardFailurePolicySpec& timeout) {
+    return response_policy_spec_valid(response) &&
+           response.version == ResponsePolicyVersion::Http11 &&
+           response.framing == ResponsePolicyFraming::ContentLength &&
+           response.connection == ResponsePolicyConnection::Request &&
+           response.head_mode == ResponsePolicyHeadMode::Reject &&
+           forward_failure_policy_spec_valid(failure) &&
+           failure.head_mode == FailurePolicyHeadMode::Reject &&
+           forward_timeout_failure_policy_spec_valid(timeout) &&
+           timeout.head_mode == FailurePolicyHeadMode::Reject;
 }
 
 // Shared policy tables contain both roles; bundle validation applies the
