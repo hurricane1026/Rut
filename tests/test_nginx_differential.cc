@@ -53,6 +53,17 @@ static constexpr char kDefaultBufferingTimeoutResponseNormalized[] =
 static constexpr char kDefaultBufferingCompleteRequest[] =
     "GET /buffered-complete?q=1 HTTP/1.1\r\n"
     "Host: client.example\r\n\r\n";
+static constexpr char kDefaultBufferingPostCompleteRequestHead[] =
+    "POST /buffered-post-complete?q=1 HTTP/1.1\r\n"
+    "Host: client.example\r\n"
+    "X-Test: binary-defaults\r\n"
+    "Content-Length: 12\r\n\r\n";
+static constexpr unsigned char kDefaultBufferingPostCompleteRequestBody[] = {
+    0x00, 0x61, 0x0d, 0x0a, 0xff, 0x7f, 'x', 0x00, 'N', 'G', 'I', 'X'};
+static constexpr u32 kDefaultBufferingPostCompleteRequestPrefixBody = 5;
+static_assert(sizeof(kDefaultBufferingPostCompleteRequestBody) == 12);
+static_assert(kDefaultBufferingPostCompleteRequestPrefixBody <
+              sizeof(kDefaultBufferingPostCompleteRequestBody));
 static constexpr char kDefaultBufferingCompleteOriginPart1[] =
     "HTTP/1.1 200 OK\r\n"
     "Server: complete-origin\r\n"
@@ -502,6 +513,51 @@ static bool parse_content_length(const std::vector<char>& bytes, size_t end, siz
     return false;
 }
 
+static bool has_exact_single_content_length_12(const std::vector<char>& bytes, size_t end) {
+    if (end < 4 || end > bytes.size()) return false;
+    size_t line_start = 0;
+    while (line_start + 1 < end && !(bytes[line_start] == '\r' && bytes[line_start + 1] == '\n'))
+        line_start++;
+    if (line_start + 1 >= end) return false;
+    line_start += 2;
+
+    u32 content_length_count = 0;
+    while (line_start + 1 < end) {
+        if (bytes[line_start] == '\r' && bytes[line_start + 1] == '\n') break;
+        size_t line_end = line_start;
+        while (line_end + 1 < end && !(bytes[line_end] == '\r' && bytes[line_end + 1] == '\n'))
+            line_end++;
+        if (line_end + 1 >= end) return false;
+        size_t colon = line_start;
+        while (colon < line_end && bytes[colon] != ':') colon++;
+        if (colon == line_end) return false;
+
+        static constexpr char kName[] = "content-length";
+        bool name_matches = colon - line_start == sizeof(kName) - 1;
+        for (size_t i = 0; name_matches && i < sizeof(kName) - 1; i++) {
+            char c = bytes[line_start + i];
+            if (c >= 'A' && c <= 'Z') c = static_cast<char>(c + ('a' - 'A'));
+            name_matches = c == kName[i];
+        }
+        if (name_matches) {
+            content_length_count++;
+            size_t value_begin = colon + 1;
+            while (value_begin < line_end &&
+                   (bytes[value_begin] == ' ' || bytes[value_begin] == '\t'))
+                value_begin++;
+            size_t value_end = line_end;
+            while (value_end > value_begin &&
+                   (bytes[value_end - 1] == ' ' || bytes[value_end - 1] == '\t'))
+                value_end--;
+            if (value_end - value_begin != 2 || bytes[value_begin] != '1' ||
+                bytes[value_begin + 1] != '2')
+                return false;
+        }
+        line_start = line_end + 2;
+    }
+    return content_length_count == 1;
+}
+
 static bool normalize_date(std::vector<char>& bytes);
 
 static bool validate_exact_normalized_response(const std::vector<char>& bytes,
@@ -710,6 +766,9 @@ struct Recorder {
     // application writes make progress timing observable without making any
     // claim about TCP segmentation or nginx read boundaries.
     bool permit_gated_complete_response = false;
+    // Default-off positive-request baseline mode: do not publish the request
+    // or respond until the declared fixed Content-Length body is fully read.
+    bool read_exact_content_length_12_body = false;
     std::atomic<u32> response_fragment_permit{0};
     std::atomic<u32> response_fragments_sent{0};
     std::atomic<u64> response_fragment_sent_ns[4]{};
@@ -769,14 +828,23 @@ struct Recorder {
                 const ssize_t n = recv(client, buf, sizeof(buf), 0);
                 if (n > 0) {
                     wire.insert(wire.end(), buf, buf + n);
-                    if (header_end(wire) != 0) break;
+                    const size_t end = header_end(wire);
+                    if (end != 0) {
+                        if (!self->read_exact_content_length_12_body) break;
+                        if (!has_exact_single_content_length_12(wire, end)) break;
+                        if (wire.size() >= end + 12) break;
+                    }
                 } else if (n < 0 && (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK)) {
                     continue;
                 } else {
                     break;
                 }
             }
-            const bool complete = header_end(wire) != 0;
+            const size_t request_header_end = header_end(wire);
+            const bool complete = request_header_end != 0 &&
+                                  (!self->read_exact_content_length_12_body ||
+                                   (has_exact_single_content_length_12(wire, request_header_end) &&
+                                    wire.size() == request_header_end + 12));
             bool response_sent = false;
             if (complete) {
                 self->history.push_back(wire);
@@ -1942,6 +2010,8 @@ struct DefaultBufferingTimeoutObservation {
 
 struct DefaultBufferingCompleteObservation {
     std::vector<char> downstream;
+    u64 request_prefix_sent_ns = 0;
+    u64 request_suffix_sent_ns = 0;
     u64 first_downstream_byte_ns = 0;
     u64 downstream_complete_ns = 0;
 };
@@ -2148,6 +2218,9 @@ static bool capture_nginx_default_buffering_complete(
     const std::string& nginx_log_path,
     const std::string& container_name,
     Recorder& recorder,
+    const std::vector<char>& request_prefix,
+    const std::vector<char>& request_suffix,
+    u32 request_buffering_observation_ms,
     DefaultBufferingCompleteObservation& observation,
     std::string& error) {
     DockerGuard docker(container_name);
@@ -2178,10 +2251,53 @@ static bool capture_nginx_default_buffering_complete(
             if (fd >= 0) close(fd);
         }
     } client{connect_once(frontend_port)};
-    if (client.fd < 0 || !send_all(client.fd,
-                                   kDefaultBufferingCompleteRequest,
-                                   sizeof(kDefaultBufferingCompleteRequest) - 1)) {
+    if (client.fd < 0 || request_prefix.empty() ||
+        !send_all(client.fd, request_prefix.data(), request_prefix.size())) {
         error = "default-buffering complete downstream request failed";
+        return false;
+    }
+    observation.request_prefix_sent_ns = steady_now_ns();
+    observation.request_suffix_sent_ns = 0;
+    if (observation.request_prefix_sent_ns == 0) {
+        error = "default-buffering request-prefix timestamp failed";
+        return false;
+    }
+    if (request_buffering_observation_ms != 0) {
+        bool eof = false;
+        std::string detail;
+        if (!wait_keepalive_quiet_or_eof(
+                client.fd, static_cast<int>(request_buffering_observation_ms), eof, detail)) {
+            error = "downstream was not quiet during default request buffering: " + detail;
+            return false;
+        }
+        if (eof) {
+            error = "nginx closed downstream during incomplete default-buffered request body";
+            return false;
+        }
+        const u64 observation_complete_ns = steady_now_ns();
+        if (observation_complete_ns < observation.request_prefix_sent_ns ||
+            observation_complete_ns - observation.request_prefix_sent_ns <
+                static_cast<u64>(request_buffering_observation_ms) * 1'000'000ull) {
+            error = "default request-buffering observation ended before its required duration";
+            return false;
+        }
+        if (recorder.accepted.load(std::memory_order_acquire) != 0 ||
+            recorder.requests.load(std::memory_order_acquire) != 0) {
+            error = "nginx contacted the origin before the fixed request body completed";
+            return false;
+        }
+        if (request_suffix.empty() ||
+            !send_all(client.fd, request_suffix.data(), request_suffix.size())) {
+            error = "default-buffering complete request-body suffix send failed";
+            return false;
+        }
+        observation.request_suffix_sent_ns = steady_now_ns();
+        if (observation.request_suffix_sent_ns < observation.request_prefix_sent_ns) {
+            error = "default-buffering request-suffix timestamp failed";
+            return false;
+        }
+    } else if (!request_suffix.empty()) {
+        error = "request suffix requires a finite request-buffering observation";
         return false;
     }
 
@@ -4124,11 +4240,18 @@ int main(int argc, char** argv) {
     }
     DefaultBufferingCompleteObservation default_buffering_complete_observation;
     std::string default_buffering_complete_error;
+    const std::vector<char> default_buffering_complete_request(
+        kDefaultBufferingCompleteRequest,
+        kDefaultBufferingCompleteRequest + sizeof(kDefaultBufferingCompleteRequest) - 1);
+    const std::vector<char> no_request_suffix;
     if (!capture_nginx_default_buffering_complete(frontend_port,
                                                   temp.nginx_config,
                                                   temp.nginx_log,
                                                   container + "-default-buffering-complete",
                                                   default_buffering_complete_origin,
+                                                  default_buffering_complete_request,
+                                                  no_request_suffix,
+                                                  0,
                                                   default_buffering_complete_observation,
                                                   default_buffering_complete_error)) {
         std::cerr << "FAIL [pinned default buffering complete]: "
@@ -4188,6 +4311,129 @@ int main(int argc, char** argv) {
                1e9
         << "/" << static_cast<double>(complete_origin_closed_ns - complete_final_origin_ns) / 1e9
         << ", four origin writes, one upstream request)\n";
+
+    Recorder default_combined_buffering_post_origin;
+    default_combined_buffering_post_origin.wait_response_peer_close = true;
+    default_combined_buffering_post_origin.observe_extra_requests_until_stop = true;
+    default_combined_buffering_post_origin.permit_gated_complete_response = true;
+    default_combined_buffering_post_origin.read_exact_content_length_12_body = true;
+    if (!default_combined_buffering_post_origin.setup(backend_port)) {
+        std::cerr << "FAIL [pinned default combined buffering POST]: origin setup failed\n";
+        return 1;
+    }
+    const std::string default_combined_buffering_post_config =
+        "events {}\nhttp {\n  access_log off;\n  server {\n    listen 127.0.0.1:" +
+        std::to_string(frontend_port) +
+        ";\n    location / {\n      proxy_pass http://127.0.0.1:" + std::to_string(backend_port) +
+        ";\n      proxy_read_timeout 1s;\n    }\n  }\n}\n";
+    if (default_combined_buffering_post_config.find("proxy_request_buffering") !=
+            std::string::npos ||
+        default_combined_buffering_post_config.find("proxy_buffering") != std::string::npos ||
+        default_combined_buffering_post_config.find("proxy_http_version") != std::string::npos ||
+        !write_file(temp.nginx_config,
+                    default_combined_buffering_post_config.data(),
+                    default_combined_buffering_post_config.size())) {
+        std::cerr
+            << "FAIL [pinned default combined buffering POST]: semantic config write failed\n";
+        return 1;
+    }
+    std::vector<char> default_combined_buffering_post_prefix(
+        kDefaultBufferingPostCompleteRequestHead,
+        kDefaultBufferingPostCompleteRequestHead +
+            sizeof(kDefaultBufferingPostCompleteRequestHead) - 1);
+    default_combined_buffering_post_prefix.insert(
+        default_combined_buffering_post_prefix.end(),
+        reinterpret_cast<const char*>(kDefaultBufferingPostCompleteRequestBody),
+        reinterpret_cast<const char*>(kDefaultBufferingPostCompleteRequestBody) +
+            kDefaultBufferingPostCompleteRequestPrefixBody);
+    const std::vector<char> default_combined_buffering_post_suffix(
+        reinterpret_cast<const char*>(kDefaultBufferingPostCompleteRequestBody) +
+            kDefaultBufferingPostCompleteRequestPrefixBody,
+        reinterpret_cast<const char*>(kDefaultBufferingPostCompleteRequestBody) +
+            sizeof(kDefaultBufferingPostCompleteRequestBody));
+    DefaultBufferingCompleteObservation default_combined_buffering_post_observation;
+    std::string default_combined_buffering_post_error;
+    if (!capture_nginx_default_buffering_complete(frontend_port,
+                                                  temp.nginx_config,
+                                                  temp.nginx_log,
+                                                  container + "-default-combined-buffering-post",
+                                                  default_combined_buffering_post_origin,
+                                                  default_combined_buffering_post_prefix,
+                                                  default_combined_buffering_post_suffix,
+                                                  1200,
+                                                  default_combined_buffering_post_observation,
+                                                  default_combined_buffering_post_error)) {
+        std::cerr << "FAIL [pinned default combined buffering POST]: "
+                  << default_combined_buffering_post_error << "\n";
+        dump_wire("pinned default combined-buffering POST response",
+                  default_combined_buffering_post_observation.downstream);
+        dump_log(temp.nginx_log, "pinned default combined-buffering POST nginx log");
+        return 1;
+    }
+    default_combined_buffering_post_origin.stop();
+    const std::string expected_default_combined_buffering_post_head =
+        "POST /buffered-post-complete?q=1 HTTP/1.1\r\nHost: 127.0.0.1:" +
+        std::to_string(backend_port) + "\r\nContent-Length: 12\r\nX-Test: binary-defaults\r\n\r\n";
+    std::vector<char> expected_default_combined_buffering_post_request(
+        expected_default_combined_buffering_post_head.begin(),
+        expected_default_combined_buffering_post_head.end());
+    expected_default_combined_buffering_post_request.insert(
+        expected_default_combined_buffering_post_request.end(),
+        reinterpret_cast<const char*>(kDefaultBufferingPostCompleteRequestBody),
+        reinterpret_cast<const char*>(kDefaultBufferingPostCompleteRequestBody) +
+            sizeof(kDefaultBufferingPostCompleteRequestBody));
+    if (default_combined_buffering_post_origin.request !=
+            expected_default_combined_buffering_post_request ||
+        default_combined_buffering_post_origin.history.size() != 1 ||
+        default_combined_buffering_post_origin.history[0] !=
+            expected_default_combined_buffering_post_request ||
+        default_combined_buffering_post_origin.accepted.load(std::memory_order_acquire) != 1 ||
+        default_combined_buffering_post_origin.requests.load(std::memory_order_acquire) != 1) {
+        std::cerr
+            << "FAIL [pinned default combined buffering POST]: exact upstream wire mismatch\n";
+        dump_wire("expected default combined-buffering POST upstream request",
+                  expected_default_combined_buffering_post_request);
+        dump_wire("actual default combined-buffering POST upstream request",
+                  default_combined_buffering_post_origin.request);
+        return 1;
+    }
+    const u64 combined_part1_origin_ns =
+        default_combined_buffering_post_origin.response_fragment_sent_ns[0].load(
+            std::memory_order_acquire);
+    const u64 combined_part2_origin_ns =
+        default_combined_buffering_post_origin.response_fragment_sent_ns[1].load(
+            std::memory_order_acquire);
+    const u64 combined_part3_origin_ns =
+        default_combined_buffering_post_origin.response_fragment_sent_ns[2].load(
+            std::memory_order_acquire);
+    const u64 combined_part4_origin_ns =
+        default_combined_buffering_post_origin.response_fragment_sent_ns[3].load(
+            std::memory_order_acquire);
+    const u64 combined_origin_closed_ns =
+        default_combined_buffering_post_origin.response_peer_closed_ns.load(
+            std::memory_order_acquire);
+    std::cerr
+        << "PASS: pinned nginx defaults buffer a fragmented positive-CL POST before origin "
+           "connect and withhold its fragmented complete response (request-prefix-to-suffix="
+        << static_cast<double>(default_combined_buffering_post_observation.request_suffix_sent_ns -
+                               default_combined_buffering_post_observation.request_prefix_sent_ns) /
+               1e9
+        << ", origin-gaps="
+        << static_cast<double>(combined_part2_origin_ns - combined_part1_origin_ns) / 1e9 << "/"
+        << static_cast<double>(combined_part3_origin_ns - combined_part2_origin_ns) / 1e9 << "/"
+        << static_cast<double>(combined_part4_origin_ns - combined_part3_origin_ns) / 1e9
+        << ", origin-span/final-to-first/final-to-complete/final-to-origin-close seconds="
+        << static_cast<double>(combined_part4_origin_ns - combined_part1_origin_ns) / 1e9 << "/"
+        << static_cast<double>(
+               default_combined_buffering_post_observation.first_downstream_byte_ns -
+               combined_part4_origin_ns) /
+               1e9
+        << "/"
+        << static_cast<double>(default_combined_buffering_post_observation.downstream_complete_ns -
+                               combined_part4_origin_ns) /
+               1e9
+        << "/" << static_cast<double>(combined_origin_closed_ns - combined_part4_origin_ns) / 1e9
+        << ", four origin writes, one exact binary upstream request)\n";
 
     Recorder default_buffering_eof_origin;
     default_buffering_eof_origin.gate_incomplete_response_close = true;
