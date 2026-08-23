@@ -99,6 +99,10 @@ public:
 
     bool put_lit(const char* text, u32 len) { return put(Str{text, len}); }
 
+    bool put_cstr(const char* text) {
+        return put_lit(text, static_cast<u32>(__builtin_strlen(text)));
+    }
+
     bool put_u16(u16 value) {
         char digits[5];
         u32 count = 0;
@@ -155,6 +159,18 @@ static constexpr char kNotAllowedBody[] =
     "</body>\\r\\n"
     "</html>\\r\\n";
 
+static constexpr char kBadGatewayBody[] =
+    "<html>\\r\\n<head><title>502 Bad Gateway</title></head>\\r\\n"
+    "<body>\\r\\n<center><h1>502 Bad Gateway</h1></center>\\r\\n"
+    "<hr><center>nginx/1.29.7</center>\\r\\n</body>\\r\\n"
+    "</html>\\r\\n";
+
+static constexpr char kGatewayTimeoutBody[] =
+    "<html>\\r\\n<head><title>504 Gateway Time-out</title></head>\\r\\n"
+    "<body>\\r\\n<center><h1>504 Gateway Time-out</h1></center>\\r\\n"
+    "<hr><center>nginx/1.29.7</center>\\r\\n</body>\\r\\n"
+    "</html>\\r\\n";
+
 bool put_unmatched(Writer& writer,
                    const char* selector,
                    u32 selector_len,
@@ -185,6 +201,74 @@ bool put_unmatched(Writer& writer,
            writer.put_lit(kHeadMode, sizeof(kHeadMode) - 1) &&
            writer.put_lit(head_mode, head_mode_len) && writer.put_lit(kBody, sizeof(kBody) - 1) &&
            writer.put_lit(body, body_len) && writer.put_lit(kClose, sizeof(kClose) - 1);
+}
+
+bool put_request_policy(Writer& writer) {
+    return writer.put_cstr("request_policy: {\n") &&
+           writer.put_cstr("            version: \"HTTP/1.1\",\n") &&
+           writer.put_cstr("            host: \"upstream\",\n") &&
+           writer.put_cstr("            connection: \"omit\",\n") &&
+           writer.put_cstr(
+               "            strip_headers: [\"Connection\", \"Keep-Alive\", \"TE\", \"Expect\", "
+               "\"Upgrade\"]\n") &&
+           writer.put_cstr("        },\n");
+}
+
+bool put_response_policy(Writer& writer, bool suppress_body) {
+    return writer.put_cstr("        response_policy: {\n") &&
+           writer.put_cstr("            version: \"HTTP/1.1\",\n") &&
+           writer.put_cstr("            framing: \"content_length\",\n") &&
+           writer.put_cstr("            connection: \"request\",\n") &&
+           (!suppress_body || writer.put_cstr("            head_mode: \"suppress_body\",\n")) &&
+           writer.put_cstr("            server: \"nginx/1.29.7\",\n") &&
+           writer.put_cstr("            date: \"current\",\n") &&
+           writer.put_cstr("            hide_headers: [\"Date\", \"Server\", \"X-Pad\"]\n") &&
+           writer.put_cstr("        },\n");
+}
+
+bool put_failure_policy(Writer& writer, bool suppress_body, bool buffered) {
+    return writer.put_cstr("        failure_policy: {\n") &&
+           writer.put_cstr("            version: \"HTTP/1.1\",\n") &&
+           writer.put_cstr("            status: 502,\n") &&
+           writer.put_cstr("            reason: \"Bad Gateway\",\n") &&
+           writer.put_cstr("            content_type: \"text/html\",\n") &&
+           writer.put_cstr("            server: \"nginx/1.29.7\",\n") &&
+           writer.put_cstr("            date: \"current\",\n") &&
+           writer.put_cstr("            connection: \"request\",\n") &&
+           (!suppress_body || writer.put_cstr("            head_mode: \"suppress_body\",\n")) &&
+           writer.put_cstr("            body: b\"") &&
+           writer.put_lit(kBadGatewayBody, sizeof(kBadGatewayBody) - 1) &&
+           writer.put_cstr("\"\n") && writer.put_cstr(buffered ? "        },\n" : "        }\n");
+}
+
+bool put_timeout_failure_policy(Writer& writer) {
+    return writer.put_cstr("        timeout_failure_policy: {\n") &&
+           writer.put_cstr("            version: \"HTTP/1.1\",\n") &&
+           writer.put_cstr("            status: 504,\n") &&
+           writer.put_cstr("            reason: \"Gateway Time-out\",\n") &&
+           writer.put_cstr("            content_type: \"text/html\",\n") &&
+           writer.put_cstr("            server: \"nginx/1.29.7\",\n") &&
+           writer.put_cstr("            date: \"current\",\n") &&
+           writer.put_cstr("            connection: \"request\",\n") &&
+           writer.put_cstr("            body: b\"") &&
+           writer.put_lit(kGatewayTimeoutBody, sizeof(kGatewayTimeoutBody) - 1) &&
+           writer.put_cstr("\"\n") && writer.put_cstr("        },\n");
+}
+
+bool put_root_forward(
+    Writer& writer, const char* method, u32 method_len, bool suppress_body, bool buffered) {
+    return writer.put_cstr("route ") &&
+           (method_len == 0
+                ? writer.put_cstr("\"/\" {\n")
+                : writer.put_lit(method, method_len) && writer.put_cstr(" \"/\" {\n")) &&
+           writer.put_cstr("    return forward(nginx_upstream, ") && put_request_policy(writer) &&
+           put_response_policy(writer, suppress_body) &&
+           put_failure_policy(writer, suppress_body, buffered) &&
+           (buffered ? put_timeout_failure_policy(writer) : true) &&
+           (buffered ? writer.put_cstr("        response_read_timeout: 60s,\n") : true) &&
+           (buffered ? writer.put_cstr("        response_buffering: \"complete_content_length\"\n")
+                     : true) &&
+           writer.put_cstr("    )\n}\n");
 }
 
 }  // namespace
@@ -261,59 +345,9 @@ FrontendResult<RutSource> lower_to_rut(const Server& server) {
         return fail_overflow();
 
     if (is_root) {
-        if (!put("route \"/\" {\n") || !put("    if req.method == HEAD {\n") ||
-            !put("        return forward(nginx_upstream, request_policy: {\n") ||
-            !put("            version: \"HTTP/1.1\",\n") ||
-            !put("            host: \"upstream\",\n") ||
-            !put("            connection: \"omit\",\n") ||
-            !put("            strip_headers: [\"Connection\", \"Keep-Alive\", \"TE\", \"Expect\", "
-                 "\"Upgrade\"]\n") ||
-            !put("        }, response_policy: {\n") ||
-            !put("            version: \"HTTP/1.1\",\n") ||
-            !put("            framing: \"content_length\",\n") ||
-            !put("            connection: \"request\",\n") ||
-            !put("            head_mode: \"suppress_body\",\n") ||
-            !put("            server: \"nginx/1.29.7\",\n") ||
-            !put("            date: \"current\",\n") ||
-            !put("            hide_headers: [\"Date\", \"Server\", \"X-Pad\"]\n") ||
-            !put("        }, failure_policy: {\n") ||
-            !put("            version: \"HTTP/1.1\",\n") || !put("            status: 502,\n") ||
-            !put("            reason: \"Bad Gateway\",\n") ||
-            !put("            content_type: \"text/html\",\n") ||
-            !put("            server: \"nginx/1.29.7\",\n") ||
-            !put("            date: \"current\",\n") ||
-            !put("            connection: \"request\",\n") ||
-            !put("            head_mode: \"suppress_body\",\n") ||
-            !put("            body: b\"<html>\\r\\n<head><title>502 Bad "
-                 "Gateway</title></head>\\r\\n<body>\\r\\n<center><h1>502 Bad "
-                 "Gateway</h1></center>\\r\\n<hr><center>nginx/1.29.7</center>\\r\\n</body>\\r\\n</"
-                 "html>\\r\\n\"\n") ||
-            !put("        })\n") || !put("    } else {\n") ||
-            !put("        return forward(nginx_upstream, request_policy: {\n") ||
-            !put("            version: \"HTTP/1.1\",\n") ||
-            !put("            host: \"upstream\",\n") ||
-            !put("            connection: \"omit\",\n") ||
-            !put("            strip_headers: [\"Connection\", \"Keep-Alive\", \"TE\", \"Expect\", "
-                 "\"Upgrade\"]\n") ||
-            !put("        }, response_policy: {\n") ||
-            !put("            version: \"HTTP/1.1\",\n") ||
-            !put("            framing: \"content_length\",\n") ||
-            !put("            connection: \"request\",\n") ||
-            !put("            server: \"nginx/1.29.7\",\n") ||
-            !put("            date: \"current\",\n") ||
-            !put("            hide_headers: [\"Date\", \"Server\", \"X-Pad\"]\n") ||
-            !put("        }, failure_policy: {\n") ||
-            !put("            version: \"HTTP/1.1\",\n") || !put("            status: 502,\n") ||
-            !put("            reason: \"Bad Gateway\",\n") ||
-            !put("            content_type: \"text/html\",\n") ||
-            !put("            server: \"nginx/1.29.7\",\n") ||
-            !put("            date: \"current\",\n") ||
-            !put("            connection: \"request\",\n") ||
-            !put("            body: b\"<html>\\r\\n<head><title>502 Bad "
-                 "Gateway</title></head>\\r\\n<body>\\r\\n<center><h1>502 Bad "
-                 "Gateway</h1></center>\\r\\n<hr><center>nginx/1.29.7</center>\\r\\n</body>\\r\\n</"
-                 "html>\\r\\n\"\n") ||
-            !put("        })\n") || !put("    }\n") || !put("}\n"))
+        if (!put_root_forward(writer, "HEAD", 4, true, false) ||
+            !put_root_forward(writer, "GET", 3, false, true) ||
+            !put_root_forward(writer, "", 0, false, false))
             return fail_overflow();
         return output;
     }
