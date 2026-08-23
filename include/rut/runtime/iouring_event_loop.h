@@ -1933,11 +1933,11 @@ public:
                 timer.refresh(&c, c.response_read_deadline_seconds);
                 c.response_read_deadline_state = ResponseReadDeadlineState::Armed;
             } else if (key_stable &&
-                       c.response_read_deadline_state == ResponseReadDeadlineState::BatchPending) {
+                       (c.response_read_deadline_state == ResponseReadDeadlineState::BatchPending ||
+                        c.response_read_deadline_state ==
+                            ResponseReadDeadlineState::RefreshPending)) {
                 close_conn(c);
-            } else if (key_stable && c.response_read_deadline_state ==
-                                         ResponseReadDeadlineState::RefreshPending) {
-                close_conn(c);
+                continue;
             } else if (!key_stable && c.fd >= 0 &&
                        (c.response_read_deadline_state == ResponseReadDeadlineState::BatchPending ||
                         c.response_read_deadline_state ==

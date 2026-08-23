@@ -557,10 +557,13 @@ bool prepare_response_read_deadline_preflight(Loop* loop,
                                               const RouteEntry* route,
                                               const RouteConfig* config) {
     if (route == nullptr || route->preflight_forward_policy_bundle_id == 0) return true;
-    if constexpr (!requires { Loop::kSupportsExplicitFirstResponseDeadline; }) {
-        loop->close_conn(conn);
-        return false;
-    } else if constexpr (!Loop::kSupportsExplicitFirstResponseDeadline) {
+    constexpr bool supports_explicit_deadline = [] {
+        if constexpr (requires { Loop::kSupportsExplicitFirstResponseDeadline; })
+            return Loop::kSupportsExplicitFirstResponseDeadline;
+        else
+            return false;
+    }();
+    if constexpr (!supports_explicit_deadline) {
         loop->close_conn(conn);
         return false;
     } else {
