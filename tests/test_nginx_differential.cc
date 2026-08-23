@@ -3490,6 +3490,73 @@ static bool capture_pinned_local_rejection_case(u16 frontend_port,
     return true;
 }
 
+static bool capture_rut_local_rejection_case(u16 frontend_port,
+                                             u16 backend_port,
+                                             const std::string& source_path,
+                                             const std::string& rut_log_path,
+                                             const std::string& rut_path,
+                                             const char* case_name,
+                                             const char* request,
+                                             size_t request_len,
+                                             const char* expected_response_normalized,
+                                             std::vector<char>& downstream,
+                                             std::string& error) {
+    Recorder recorder;
+    recorder.observe_extra_requests_until_stop = true;
+    if (!recorder.setup(backend_port)) {
+        error = std::string("generated-RUT ") + case_name + " backend recorder setup failed";
+        return false;
+    }
+
+    ChildGuard rut;
+    if (!spawn_child({rut_path, source_path, "--shards", "1", "--no-pin", "--drain", "0"},
+                     rut_log_path,
+                     rut.child)) {
+        error = std::string("failed to start generated RUT for ") + case_name + " case";
+        return false;
+    }
+    if (!wait_ready(frontend_port, rut.child, error)) {
+        error = std::string("generated-RUT ") + case_name + " readiness failed: " + error;
+        return false;
+    }
+
+    const int client = connect_once(frontend_port);
+    bool ok = client >= 0;
+    if (ok) ok = send_all(client, request, request_len);
+    if (ok) ok = read_response(client, downstream, error);
+    if (ok) ok = read_eof(client, error);
+    if (client >= 0) close(client);
+    if (!ok) {
+        error = std::string("generated-RUT ") + case_name + " response/EOF failed: " + error;
+        return false;
+    }
+
+    std::string detail;
+    if (!validate_exact_normalized_response(downstream, expected_response_normalized, detail)) {
+        error =
+            std::string("generated-RUT ") + case_name + " downstream response mismatch: " + detail;
+        return false;
+    }
+
+    // Keep the generated RUT process and recorder live after the complete
+    // response and EOF so delayed forwarding cannot be hidden by cleanup.
+    settle_for_invalid_target_side_effects();
+    const bool rut_stopped = stop_child(rut.child);
+    recorder.stop();
+    if (!rut_stopped) {
+        error = std::string("failed to stop generated RUT after ") + case_name + " case";
+        return false;
+    }
+    if (recorder.accepted.load(std::memory_order_acquire) != 0 ||
+        recorder.requests.load(std::memory_order_acquire) != 0 || !recorder.request.empty() ||
+        !recorder.history.empty()) {
+        error = std::string("generated-RUT ") + case_name +
+                " unexpectedly contacted the configured upstream";
+        return false;
+    }
+    return true;
+}
+
 static bool capture_head_case(u16 frontend_port,
                               u16 backend_port,
                               const std::string& nginx_config_path,
@@ -4360,6 +4427,47 @@ int main(int argc, char** argv) {
     std::cerr << "PASS: pinned nginx rejects explicit-close OPTIONS * before location /, "
                  "returns the exact generated 400 response and EOF, and performs no upstream "
                  "operation\n";
+
+    std::vector<char> rut_options_star_response;
+    std::string rut_options_star_error;
+    if (!capture_rut_local_rejection_case(frontend_port,
+                                          backend_port,
+                                          temp.source,
+                                          temp.rut_log,
+                                          argv[1],
+                                          "OPTIONS-star",
+                                          kOptionsStarRequest,
+                                          sizeof(kOptionsStarRequest) - 1,
+                                          kOptionsStarResponseNormalized,
+                                          rut_options_star_response,
+                                          rut_options_star_error)) {
+        std::cerr << "FAIL [generated-RUT OPTIONS-star]: " << rut_options_star_error << "\n";
+        dump_wire("nginx OPTIONS-star response", options_star_response);
+        dump_wire("generated-RUT OPTIONS-star response", rut_options_star_response);
+        dump_log(temp.nginx_log, "nginx OPTIONS-star log");
+        dump_log(temp.rut_log, "generated-RUT OPTIONS-star log");
+        return 1;
+    }
+    std::vector<char> normalized_nginx_options_star = options_star_response;
+    std::vector<char> normalized_rut_options_star = rut_options_star_response;
+    const std::vector<char> expected_options_star_response(
+        kOptionsStarResponseNormalized,
+        kOptionsStarResponseNormalized + sizeof(kOptionsStarResponseNormalized) - 1);
+    if (!normalize_date(normalized_nginx_options_star) ||
+        !normalize_date(normalized_rut_options_star) ||
+        normalized_nginx_options_star != expected_options_star_response ||
+        normalized_rut_options_star != expected_options_star_response ||
+        normalized_nginx_options_star != normalized_rut_options_star) {
+        std::cerr << "FAIL [OPTIONS-star differential]: exact nginx/generated-RUT mismatch\n";
+        dump_wire("expected OPTIONS-star response", expected_options_star_response);
+        dump_wire("nginx OPTIONS-star response", options_star_response);
+        dump_wire("generated-RUT OPTIONS-star response", rut_options_star_response);
+        dump_log(temp.nginx_log, "nginx OPTIONS-star log");
+        dump_log(temp.rut_log, "generated-RUT OPTIONS-star log");
+        return 1;
+    }
+    std::cerr << "PASS: converter-generated RUT OPTIONS * matches pinned nginx exactly after "
+                 "Date normalization, including EOF and zero upstream effects\n";
 
     std::vector<char> connect_authority_response;
     std::string connect_authority_error;
