@@ -88,7 +88,7 @@ else()
 endif()
 add_dependencies(test_integration test_tls_fixtures)
 add_test(NAME test_integration COMMAND test_integration)
-set_tests_properties(test_integration PROPERTIES LABELS "integration;network")
+set_tests_properties(test_integration PROPERTIES LABELS "integration;network" TIMEOUT 300)
 
 add_executable(test_arena
     test_arena.cc
