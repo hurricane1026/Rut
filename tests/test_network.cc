@@ -26227,6 +26227,225 @@ TEST(response_buffering_runtime, complete_body_wins_clean_eof_in_either_batch_or
 }
 
 TEST(response_buffering_runtime,
+     initial_complete_body_wins_clean_eof_and_due_timeout_in_every_batch_order) {
+    enum EventIndex : u8 { Complete = 0, CleanEof = 1, DueTimeout = 2 };
+    static constexpr u8 kOrders[][3] = {
+        {Complete, CleanEof, DueTimeout},
+        {Complete, DueTimeout, CleanEof},
+        {CleanEof, Complete, DueTimeout},
+        {CleanEof, DueTimeout, Complete},
+        {DueTimeout, Complete, CleanEof},
+        {DueTimeout, CleanEof, Complete},
+    };
+    static constexpr u8 kOrigin[] =
+        "HTTP/1.1 200 OK\r\nContent-Length: 4\r\nX-Pinned: exact\r\n\r\nabcd";
+
+    for (const bool downstream_close : {false, true}) {
+        for (const auto& order : kOrders) {
+            ScopedIoUringLoopForRetirement guard;
+            if (!guard.init()) SKIP("io_uring unavailable");
+            auto* loop = guard.loop;
+            RouteConfig config{};
+            REQUIRE(config.add_upstream("backend", 0x7F000001, 9000).has_value());
+            REQUIRE(add_bodyless_non_head_response_read_deadline_bundle(
+                config, 5, ForwardResponseBufferingMode::CompleteContentLength));
+            PrebuiltD2Fixture fixture{};
+            REQUIRE(stage_strict_read_timeout_method(
+                loop, &config, nullptr, 0, &fixture, LogHttpMethod::Get));
+            Connection& conn = *fixture.conn;
+            if (downstream_close) {
+                conn.req_keep_alive = false;
+                conn.req_client_keep_alive = false;
+                conn.req_client_connection_close = true;
+                conn.req_client_connection_close_exact = true;
+                conn.req_client_connection_count = 1;
+                conn.response_read_deadline_upload.downstream_close = true;
+            }
+            REQUIRE(arm_staged_response_read_deadline(loop, fixture));
+            REQUIRE(response_read_deadline_persistence_owner_is_stable(
+                conn, conn.response_read_deadline_upload));
+
+            const u32 id = conn.id;
+            const u32 deadline_generation = conn.response_read_deadline_generation;
+            const u32 origin_episode = conn.upstream_episode;
+            const u32 origin_len = sizeof(kOrigin) - 1u;
+            REQUIRE_EQ(conn.upstream_recv_buf.write(kOrigin, origin_len), origin_len);
+            const IoEvent complete =
+                response_read_copy_event(conn, origin_len, true, 0, origin_len);
+            const IoEvent eof{id, 0, 0, 0, IoEventType::UpstreamRecv, 0, 0, origin_episode};
+            loop->timer.remove(&conn);
+            loop->timer.add(&conn, 0);
+            const IoEvent timeout{id, 1, 0, 0, IoEventType::Timeout, 0};
+            const IoEvent source[] = {complete, eof, timeout};
+            const IoEvent batch[] = {source[order[0]], source[order[1]], source[order[2]]};
+            loop->dispatch_batch(batch, 3);
+
+            REQUIRE_GE(conn.fd, 0);
+            REQUIRE_EQ(conn.resp_status, 200u);
+            REQUIRE_EQ(conn.response_read_deadline_state, ResponseReadDeadlineState::BodyComplete);
+            REQUIRE_EQ(conn.response_read_deadline_post_commit_phase,
+                       ResponseReadDeadlinePostCommitPhase::HeaderSend);
+            CHECK_EQ(conn.response_read_deadline_post_commit_origin_received, 4u);
+            CHECK_EQ(conn.response_read_deadline_post_commit_declared_body, 4u);
+            CHECK_EQ(conn.response_read_deadline_post_commit_send_body, 4u);
+            CHECK_EQ(conn.response_read_deadline_post_commit_close_after_drain, downstream_close);
+            CHECK_FALSE(
+                buf_has(conn.response_header_buf.data(), conn.response_header_buf.len(), "502"));
+            CHECK_FALSE(
+                buf_has(conn.response_header_buf.data(), conn.response_header_buf.len(), "504"));
+
+            HttpResponseParser parser;
+            ParsedResponse parsed;
+            parser.reset();
+            parsed.reset();
+            REQUIRE_EQ(
+                parser.parse(
+                    conn.response_header_buf.data(), conn.response_header_buf.len(), &parsed),
+                ParseStatus::Complete);
+            REQUIRE_EQ(parser.header_end, conn.response_header_buf.len());
+            REQUIRE_EQ(parsed.version, HttpVersion::Http11);
+            REQUIRE_EQ(parsed.status_code, 200u);
+            REQUIRE_EQ(parsed.header_count, 5u);
+            REQUIRE_EQ(parsed.content_length_count, 1u);
+            REQUIRE_EQ(parsed.content_length, 4u);
+            REQUIRE_FALSE(parsed.chunked);
+            Str date{};
+            u32 date_count = 0;
+            const auto exact_header = [&](const char* name, const char* value) {
+                u32 count = 0;
+                const u32 name_len = static_cast<u32>(__builtin_strlen(name));
+                const u32 value_len = static_cast<u32>(__builtin_strlen(value));
+                for (u32 i = 0; i < parsed.header_count; ++i) {
+                    if (!http_header_name_eq_ci(
+                            parsed.headers[i].name.ptr, parsed.headers[i].name.len, name, name_len))
+                        continue;
+                    ++count;
+                    CHECK_EQ(parsed.headers[i].value.len, value_len);
+                    CHECK_EQ(__builtin_memcmp(parsed.headers[i].value.ptr, value, value_len), 0);
+                }
+                CHECK_EQ(count, 1u);
+            };
+            exact_header("server", "rut-get-timeout");
+            exact_header("content-length", "4");
+            exact_header("connection", downstream_close ? "close" : "keep-alive");
+            exact_header("x-pinned", "exact");
+            for (u32 i = 0; i < parsed.header_count; ++i) {
+                if (!http_header_name_eq_ci(
+                        parsed.headers[i].name.ptr, parsed.headers[i].name.len, "date", 4))
+                    continue;
+                ++date_count;
+                date = parsed.headers[i].value;
+            }
+            REQUIRE_EQ(date_count, 1u);
+            REQUIRE_EQ(date.len, 29u);
+            char expected_header[256]{};
+            const int expected_len = snprintf(expected_header,
+                                              sizeof(expected_header),
+                                              "HTTP/1.1 200 OK\r\n"
+                                              "Server: rut-get-timeout\r\n"
+                                              "Date: %.*s\r\n"
+                                              "Content-Length: 4\r\n"
+                                              "Connection: %s\r\n"
+                                              "X-Pinned: exact\r\n\r\n",
+                                              static_cast<int>(date.len),
+                                              date.ptr,
+                                              downstream_close ? "close" : "keep-alive");
+            REQUIRE_GT(expected_len, 0);
+            REQUIRE_EQ(static_cast<u32>(expected_len), conn.response_header_buf.len());
+            CHECK_EQ(__builtin_memcmp(conn.response_header_buf.data(),
+                                      expected_header,
+                                      static_cast<u32>(expected_len)),
+                     0);
+            REQUIRE(conn.response_read_deadline_send_owner_active);
+            REQUIRE_EQ(loop->backend.send_state[id].remaining, conn.response_header_buf.len());
+            CHECK_EQ(__builtin_memcmp(loop->backend.send_state[id].src,
+                                      conn.response_header_buf.data(),
+                                      conn.response_header_buf.len()),
+                     0);
+
+            CHECK_EQ(conn.pending_ops, 2u);  // downstream Recv plus response-header Send
+            CHECK_EQ(conn.timer_node.prev, &conn.timer_node);
+            CHECK_EQ(conn.timer_node.next, &conn.timer_node);
+            CHECK_EQ(conn.upstream_retiring_episode, origin_episode);
+            CHECK_NE(conn.upstream_episode, origin_episode);
+            CHECK_FALSE(conn.upstream_retirement_active);
+            CHECK_EQ(conn.upstream_retirement_target_owned, 0u);
+            CHECK_EQ(conn.upstream_retirement_cancel_owned, 0u);
+            CHECK_EQ(conn.upstream_retirement_cancel_retry, 0u);
+            CHECK_EQ(conn.upstream_close_episode, 0u);
+            CHECK_EQ(conn.upstream_close_target_owned, 0u);
+            CHECK_EQ(conn.upstream_close_cancel_owned, 0u);
+            CHECK_FALSE(conn.upstream_close_pause_cancel_owned);
+            CHECK_EQ(loop->upstream_retirement_retry_count, 0u);
+            CHECK_EQ(conn.upstream_fd, -1);
+
+            u8 pinned_header[256]{};
+            REQUIRE_LE(conn.response_header_buf.len(), sizeof(pinned_header));
+            __builtin_memcpy(
+                pinned_header, conn.response_header_buf.data(), conn.response_header_buf.len());
+            const u32 pinned_header_len = conn.response_header_buf.len();
+            const u32 send_generation = conn.response_read_deadline_send_owner_generation;
+            const u32 pending_before_stale = conn.pending_ops;
+            const IoEvent stale_positive{
+                id, 1, 0, 0, IoEventType::UpstreamRecv, 1, 0, origin_episode};
+            const IoEvent duplicate_eof{
+                id, 0, 0, 0, IoEventType::UpstreamRecv, 0, 0, origin_episode};
+            const IoEvent stale_batch[] = {stale_positive, duplicate_eof, timeout};
+            loop->dispatch_batch(stale_batch, 3);
+            REQUIRE_GE(conn.fd, 0);
+            CHECK_EQ(conn.response_read_deadline_state, ResponseReadDeadlineState::BodyComplete);
+            CHECK_EQ(conn.response_read_deadline_post_commit_phase,
+                     ResponseReadDeadlinePostCommitPhase::HeaderSend);
+            CHECK_EQ(conn.response_read_deadline_generation, deadline_generation);
+            CHECK_EQ(conn.response_read_deadline_send_owner_generation, send_generation);
+            CHECK_EQ(conn.pending_ops, pending_before_stale);
+            CHECK_EQ(conn.response_header_buf.len(), pinned_header_len);
+            CHECK_EQ(
+                __builtin_memcmp(conn.response_header_buf.data(), pinned_header, pinned_header_len),
+                0);
+            CHECK_EQ(loop->backend.send_state[id].remaining, pinned_header_len);
+
+            IoEvent header_sent = exact_response_deadline_send_event(loop, conn);
+            loop->dispatch_batch(&header_sent, 1);
+            REQUIRE_EQ(conn.response_read_deadline_post_commit_phase,
+                       ResponseReadDeadlinePostCommitPhase::BodySend);
+            REQUIRE_EQ(conn.response_read_deadline_send_len, 4u);
+            REQUIRE_EQ(loop->backend.send_state[id].remaining, 4u);
+            CHECK_EQ(__builtin_memcmp(conn.response_read_deadline_send_src, "abcd", 4), 0);
+            CHECK_EQ(__builtin_memcmp(loop->backend.send_state[id].src, "abcd", 4), 0);
+            CHECK_EQ(conn.pending_ops, 2u);  // downstream Recv plus response-body Send
+
+            IoEvent body_sent = exact_response_deadline_send_event(loop, conn);
+            loop->dispatch_batch(&body_sent, 1);
+            Connection& completed = loop->conns[id];
+            CHECK(completed.response_read_deadline_owner_is_neutral());
+            CHECK_EQ(completed.upstream_retiring_episode, origin_episode);
+            CHECK_NE(completed.upstream_episode, origin_episode);
+            CHECK_FALSE(completed.upstream_retirement_active);
+            CHECK_EQ(completed.upstream_retirement_target_owned, 0u);
+            CHECK_EQ(completed.upstream_retirement_cancel_owned, 0u);
+            CHECK_EQ(completed.upstream_retirement_cancel_retry, 0u);
+            CHECK_EQ(completed.upstream_close_episode, 0u);
+            CHECK_EQ(completed.upstream_close_target_owned, 0u);
+            CHECK_EQ(completed.upstream_close_cancel_owned, 0u);
+            CHECK_FALSE(completed.upstream_close_pause_cancel_owned);
+            CHECK_EQ(loop->upstream_retirement_retry_count, 0u);
+            if (downstream_close) {
+                CHECK_EQ(completed.fd, -1);
+                CHECK_EQ(completed.pending_ops, 2u);  // downstream Recv target plus close cancel
+                release_closed_response_read_fixture(fixture);
+            } else {
+                REQUIRE_GE(completed.fd, 0);
+                CHECK_EQ(completed.state, ConnState::ReadingHeader);
+                CHECK(completed.recv_armed);
+                CHECK_EQ(completed.pending_ops, 1u);
+                cleanup_prebuilt_d2(loop, fixture);
+            }
+        }
+    }
+}
+
+TEST(response_buffering_runtime,
      full_success_retires_origin_before_send_and_rendezvous_handles_either_completion_order) {
     for (const bool retirement_first : {false, true}) {
         ScopedIoUringLoopForRetirement guard;

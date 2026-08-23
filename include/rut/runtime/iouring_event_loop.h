@@ -3480,8 +3480,10 @@ public:
                                 conn.upstream_episode == owner.upstream_episode &&
                                 conn.response_read_deadline_post_commit_phase ==
                                     ResponseReadDeadlinePostCommitPhase::Buffering &&
-                                conn.response_read_deadline_state ==
-                                    ResponseReadDeadlineState::RefreshPending;
+                                (conn.response_read_deadline_state ==
+                                     ResponseReadDeadlineState::RefreshPending ||
+                                 conn.response_read_deadline_state ==
+                                     ResponseReadDeadlineState::BodyComplete);
                             if (retained_initial_clean_eof) break;
                             const bool key_stable =
                                 conn.id == owner.conn_id &&
