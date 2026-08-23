@@ -727,8 +727,12 @@ bool prepare_response_read_deadline_preflight(Loop* loop,
                                conn.req_body_remaining != 0 || conn.request_body_fully_buffered)) ||
             conn.req_client_has_transfer_encoding || conn.req_client_has_te ||
             conn.req_client_has_expect || conn.req_client_has_upgrade_header ||
-            conn.req_client_connection_count != 0 || conn.req_wants_upgrade ||
-            profile == ResponseReadDeadlineProfile::None ||
+            conn.req_wants_upgrade || profile == ResponseReadDeadlineProfile::None ||
+            (conn.req_client_connection_count != 0 &&
+             !(complete_buffering &&
+               profile == ResponseReadDeadlineProfile::BodylessNonHeadContentLengthZero &&
+               !conn.req_client_keep_alive && conn.req_client_connection_close &&
+               conn.req_client_connection_close_exact && conn.req_client_connection_count == 1)) ||
             (complete_buffering &&
              ((profile != ResponseReadDeadlineProfile::BodylessNonHeadContentLengthZero &&
                profile !=
@@ -758,6 +762,11 @@ bool prepare_response_read_deadline_preflight(Loop* loop,
         conn.response_read_deadline_method = conn.req_method;
         conn.response_read_deadline_route_method = route->method;
         conn.response_read_deadline_state = ResponseReadDeadlineState::Preflight;
+        conn.response_read_deadline_upload.downstream_close =
+            complete_buffering &&
+            profile == ResponseReadDeadlineProfile::BodylessNonHeadContentLengthZero &&
+            !conn.req_client_keep_alive && conn.req_client_connection_close &&
+            conn.req_client_connection_close_exact && conn.req_client_connection_count == 1;
         if (fixed_upload) {
             auto& proof = conn.response_read_deadline_upload;
             proof.handler_generation = conn.handler_gen;
@@ -3282,9 +3291,9 @@ inline bool try_prebuilt_strict_read_timeout(Loop* loop, Connection& conn) {
                conn.response_read_deadline_method != conn.req_method ||
                !response_read_deadline_fixed_upload_proof_is_stable(
                    conn, conn.response_read_deadline_upload)))) ||
-            !conn.keep_alive || !conn.req_keep_alive || !conn.req_client_keep_alive ||
-            conn.req_client_connection_close || conn.req_client_connection_close_exact ||
-            conn.req_client_connection_count != 0 ||
+            !conn.keep_alive ||
+            !response_read_deadline_persistence_owner_is_stable(
+                conn, conn.response_read_deadline_upload) ||
             (!fixed_upload && conn.req_client_has_content_length) ||
             conn.req_client_has_transfer_encoding || conn.req_client_has_te ||
             conn.req_client_has_expect || conn.req_client_has_upgrade_header ||
@@ -4996,13 +5005,6 @@ void on_response_header_sent(void* lp, Connection& conn, IoEvent ev) {
         (void)consume_upstream_sent(conn);
         conn.response_read_deadline_post_commit_phase =
             ResponseReadDeadlinePostCommitPhase::WaitingBody;
-        if (conn.response_read_deadline_buffering ==
-                ForwardResponseBufferingMode::CompleteContentLength &&
-            conn.response_read_deadline_post_commit_close_after_drain &&
-            conn.response_read_deadline_post_commit_send_body == 0) {
-            loop->close_conn(conn);
-            return;
-        }
         if constexpr (requires(Loop* candidate, Connection& c) {
                           candidate->defer_response_read_deadline_body_pump(c);
                       }) {
@@ -5066,6 +5068,26 @@ void pump_response_read_deadline_body(Loop* loop, Connection& conn) {
     const u32 available = publish_body - completed;
     if (available == 0) {
         if (complete_buffering && conn.response_read_deadline_post_commit_close_after_drain) {
+            const ResponseReadDeadlineUploadProof close_proof = conn.response_read_deadline_upload;
+            if (!close_proof.downstream_close) {
+                loop->close_conn(conn);
+                return;
+            }
+            if (!complete_content_length_explicit_close_is_stable(conn, close_proof)) {
+                loop->close_conn(conn);
+                return;
+            }
+            conn.clear_slots();
+            on_request_complete(loop, conn, conn.resp_status, conn.resp_body_sent);
+            loop->epoch_leave();
+            conn.http1_prebuilt_deadline_upload = close_proof;
+            conn.clear_response_read_deadline();
+            if constexpr (requires(Loop* candidate, Connection& c) {
+                              candidate->defer_http1_request_boundary(c);
+                          }) {
+                if (conn.upstream_retirement_active && loop->defer_http1_request_boundary(conn))
+                    return;
+            }
             loop->close_conn(conn);
             return;
         }
@@ -6745,24 +6767,26 @@ inline ResponseReadDeadlineProfile classify_response_read_deadline_profile(
         return ResponseReadDeadlineProfile::FixedContentLengthUploadNonHeadContentLengthZero;
 
     // The second admitted profile is deliberately a raw, bodyless HTTP/1.1
-    // origin-form non-HEAD request with default persistence. Captured request
-    // facts are authoritative after upload, so this same predicate can be
-    // re-run without retaining a parser view into recv_buf.
+    // origin-form non-HEAD request. Preflight admits its exact single-close
+    // variant only for complete buffering; other modes retain the default
+    // persistence requirement.
+    const bool default_persistence = response_read_deadline_default_persistence_is_stable(conn);
+    const bool exact_close =
+        !conn.req_keep_alive && !conn.req_client_keep_alive && conn.req_client_connection_close &&
+        conn.req_client_connection_close_exact && conn.req_client_connection_count == 1;
     if (response.head_mode != ResponsePolicyHeadMode::Reject ||
         failure.head_mode != FailurePolicyHeadMode::Reject ||
         timeout.head_mode != FailurePolicyHeadMode::Reject ||
         !response_read_deadline_non_head_method_admitted(conn.req_method) ||
         conn.req_http_version != static_cast<u8>(HttpVersion::Http11) || !conn.keep_alive ||
-        !conn.req_client_keep_alive || conn.req_client_connection_close ||
-        conn.req_client_connection_close_exact || conn.req_client_connection_count != 0 ||
-        conn.req_client_has_content_length || conn.req_client_has_transfer_encoding ||
-        conn.req_client_has_te || conn.req_client_has_expect ||
-        conn.req_client_has_upgrade_header || conn.req_malformed || conn.req_wants_upgrade ||
-        conn.req_path_canon.ptr == nullptr || conn.req_body_mode != BodyMode::None ||
-        conn.req_body_remaining != 0 || conn.request_body_fully_buffered ||
-        conn.req_body_streamed || conn.req_header_override_count != 0 ||
-        conn.req_header_override_overflow || conn.resp_header_mutation_count != 0 ||
-        conn.resp_header_mutation_pending_count != 0 ||
+        (!default_persistence && !exact_close) || conn.req_client_has_content_length ||
+        conn.req_client_has_transfer_encoding || conn.req_client_has_te ||
+        conn.req_client_has_expect || conn.req_client_has_upgrade_header || conn.req_malformed ||
+        conn.req_wants_upgrade || conn.req_path_canon.ptr == nullptr ||
+        conn.req_body_mode != BodyMode::None || conn.req_body_remaining != 0 ||
+        conn.request_body_fully_buffered || conn.req_body_streamed ||
+        conn.req_header_override_count != 0 || conn.req_header_override_overflow ||
+        conn.resp_header_mutation_count != 0 || conn.resp_header_mutation_pending_count != 0 ||
         conn.resp_header_mutation_pending_overflow || conn.resp_header_mutation_overflow ||
         conn.pipeline_stash_len != 0 || conn.protocol != ConnProtocol::Http11 || conn.tls_active)
         return ResponseReadDeadlineProfile::None;
@@ -6780,13 +6804,18 @@ inline ResponseReadDeadlineProfile classify_response_read_deadline_profile(
         request.path.len == 0 || request.path.ptr[0] != '/')
         return ResponseReadDeadlineProfile::None;
     u32 host_count = 0;
+    u32 connection_count = 0;
     for (u32 i = 0; i < request.header_count; ++i) {
         const Str name = request.headers[i].name;
         if (http_header_name_eq_ci(name.ptr, name.len, "host", 4)) {
             if (++host_count > 1 || request.headers[i].value.len == 0)
                 return ResponseReadDeadlineProfile::None;
-        } else if (http_header_name_eq_ci(name.ptr, name.len, "connection", 10) ||
-                   http_header_name_eq_ci(name.ptr, name.len, "content-length", 14) ||
+        } else if (http_header_name_eq_ci(name.ptr, name.len, "connection", 10)) {
+            if (++connection_count > 1 || request.headers[i].value.len != 5 ||
+                !http_header_name_eq_ci(
+                    request.headers[i].value.ptr, request.headers[i].value.len, "close", 5))
+                return ResponseReadDeadlineProfile::None;
+        } else if (http_header_name_eq_ci(name.ptr, name.len, "content-length", 14) ||
                    http_header_name_eq_ci(name.ptr, name.len, "transfer-encoding", 17) ||
                    http_header_name_eq_ci(name.ptr, name.len, "te", 2) ||
                    http_header_name_eq_ci(name.ptr, name.len, "expect", 6) ||
@@ -6794,7 +6823,9 @@ inline ResponseReadDeadlineProfile classify_response_read_deadline_profile(
             return ResponseReadDeadlineProfile::None;
         }
     }
-    if (host_count != 1) return ResponseReadDeadlineProfile::None;
+    if (host_count != 1 ||
+        !((default_persistence && connection_count == 0) || (exact_close && connection_count == 1)))
+        return ResponseReadDeadlineProfile::None;
     return ResponseReadDeadlineProfile::BodylessNonHeadContentLengthZero;
 }
 

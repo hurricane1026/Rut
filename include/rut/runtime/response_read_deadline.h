@@ -83,8 +83,14 @@ inline bool complete_content_length_pinned_header_is_stable(const Connection& c)
         } else if (http_header_name_eq_ci(header.name.ptr, header.name.len, "connection", 10)) {
             ++connection_count;
             static constexpr char kKeepAlive[] = "keep-alive";
-            if (header.value.len != sizeof(kKeepAlive) - 1u ||
-                __builtin_memcmp(header.value.ptr, kKeepAlive, sizeof(kKeepAlive) - 1u) != 0)
+            static constexpr char kClose[] = "close";
+            const char* expected =
+                c.response_read_deadline_upload.downstream_close ? kClose : kKeepAlive;
+            const u32 expected_len = c.response_read_deadline_upload.downstream_close
+                                         ? sizeof(kClose) - 1u
+                                         : sizeof(kKeepAlive) - 1u;
+            if (header.value.len != expected_len ||
+                __builtin_memcmp(header.value.ptr, expected, expected_len) != 0)
                 return false;
         }
     }
@@ -101,7 +107,40 @@ inline bool response_read_deadline_upload_proof_equal(const ResponseReadDeadline
            a.upload_episode == b.upload_episode &&
            a.expected_upload_length == b.expected_upload_length && a.route_index == b.route_index &&
            a.upstream_id == b.upstream_id && a.request_policy_id == b.request_policy_id &&
-           a.route_fn == b.route_fn;
+           a.route_fn == b.route_fn && a.downstream_close == b.downstream_close;
+}
+
+inline bool response_read_deadline_default_persistence_is_stable(const Connection& c) {
+    return c.req_keep_alive && c.req_client_keep_alive && !c.req_client_connection_close &&
+           !c.req_client_connection_close_exact && c.req_client_connection_count == 0;
+}
+
+inline bool complete_content_length_explicit_close_request_is_stable(
+    const Connection& c,
+    const ResponseReadDeadlineUploadProof& proof,
+    ForwardResponseBufferingMode buffering,
+    ResponseReadDeadlineProfile profile) {
+    if (!proof.downstream_close ||
+        buffering != ForwardResponseBufferingMode::CompleteContentLength ||
+        profile != ResponseReadDeadlineProfile::BodylessNonHeadContentLengthZero ||
+        c.req_client_keep_alive || !c.req_client_connection_close ||
+        !c.req_client_connection_close_exact || c.req_client_connection_count != 1)
+        return false;
+    if (proof.request_policy_id == 0) return !c.req_keep_alive;
+    return proof.request_policy_id == static_cast<u16>(RequestPolicyId::Http11FixedStrip) &&
+           c.req_keep_alive;
+}
+
+inline bool complete_content_length_explicit_close_is_stable(
+    const Connection& c, const ResponseReadDeadlineUploadProof& proof) {
+    return complete_content_length_explicit_close_request_is_stable(
+        c, proof, c.response_read_deadline_buffering, c.response_read_deadline_profile);
+}
+
+inline bool response_read_deadline_persistence_owner_is_stable(
+    const Connection& c, const ResponseReadDeadlineUploadProof& proof) {
+    if (proof.downstream_close) return complete_content_length_explicit_close_is_stable(c, proof);
+    return response_read_deadline_default_persistence_is_stable(c);
 }
 
 inline bool complete_content_length_request_policy_owner_is_stable(
@@ -280,9 +319,8 @@ inline bool response_read_deadline_owner_is_stable(const Connection& c,
         return false;
     const bool common_request =
         c.protocol == ConnProtocol::Http11 && !c.tls_active && c.h2 == nullptr &&
-        c.req_http_version == static_cast<u8>(HttpVersion::Http11) && c.req_keep_alive &&
-        c.req_client_keep_alive && !c.req_client_connection_close &&
-        !c.req_client_connection_close_exact && c.req_client_connection_count == 0 &&
+        c.req_http_version == static_cast<u8>(HttpVersion::Http11) &&
+        response_read_deadline_persistence_owner_is_stable(c, c.response_read_deadline_upload) &&
         !c.req_client_has_transfer_encoding && !c.req_client_has_te && !c.req_client_has_expect &&
         !c.req_client_has_upgrade_header && !c.req_malformed && !c.req_wants_upgrade &&
         c.req_path_canon.ptr != nullptr && c.pipeline_depth == 0 && c.pipeline_stash_len == 0 &&
@@ -475,9 +513,8 @@ inline bool response_read_deadline_post_commit_is_stable(const Connection& c) {
             c.response_read_deadline_post_commit_downstream_submitted -
                 c.response_read_deadline_post_commit_downstream_completed ||
         c.protocol != ConnProtocol::Http11 || c.tls_active || c.h2 != nullptr ||
-        c.req_http_version != static_cast<u8>(HttpVersion::Http11) || !c.req_keep_alive ||
-        !c.req_client_keep_alive || c.req_client_connection_close ||
-        c.req_client_connection_close_exact || c.req_client_connection_count != 0 ||
+        c.req_http_version != static_cast<u8>(HttpVersion::Http11) ||
+        !response_read_deadline_persistence_owner_is_stable(c, c.response_read_deadline_upload) ||
         (!fixed_upload && c.req_client_has_content_length) || c.req_client_has_transfer_encoding ||
         c.req_client_has_te || c.req_client_has_expect || c.req_client_has_upgrade_header ||
         (fixed_upload ? c.req_body_mode != BodyMode::ContentLength || c.req_body_remaining != 0 ||

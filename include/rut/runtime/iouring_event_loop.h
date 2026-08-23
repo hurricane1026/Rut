@@ -507,7 +507,13 @@ private:
                    c.http1_prebuilt_deadline_upload,
                    /*require_upload_complete=*/true,
                    c.http1_prebuilt_deadline_bundle_id,
-                   c.http1_prebuilt_deadline_route_method)))) ||
+                   c.http1_prebuilt_deadline_route_method)) ||
+              (c.http1_prebuilt_deadline_upload.downstream_close &&
+               !complete_content_length_explicit_close_request_is_stable(
+                   c,
+                   c.http1_prebuilt_deadline_upload,
+                   bundle.response_buffering,
+                   c.http1_prebuilt_deadline_profile)))) ||
             bundle.response_policy_id != c.response_policy_id ||
             bundle.failure_policy_id != c.failure_policy_id ||
             bundle.timeout_failure_policy_id != c.timeout_failure_policy_id ||
@@ -581,12 +587,15 @@ private:
             return count == 1;
         };
         static constexpr Str kKeepAlive{"keep-alive", 10};
+        static constexpr Str kClose{"close", 5};
+        const Str expected_connection =
+            c.http1_prebuilt_deadline_upload.downstream_close ? kClose : kKeepAlive;
         if (c.http1_prebuilt_response_purpose ==
             Http1PrebuiltResponsePurpose::StrictNonHeadCl0Success) {
             return parsed.status_code == 200 && c.http1_prebuilt_body_len == 0 &&
                    response.head_mode == ResponsePolicyHeadMode::Reject &&
                    exact_header("server", 6, response.server) &&
-                   exact_header("connection", 10, kKeepAlive);
+                   exact_header("connection", 10, expected_connection);
         }
         if (c.http1_prebuilt_response_purpose != Http1PrebuiltResponsePurpose::ResponseReadTimeout)
             return false;
@@ -599,7 +608,7 @@ private:
                 __builtin_memcmp(body, timeout.body.ptr, timeout.body.len) == 0) &&
                exact_header("server", 6, timeout.server) &&
                exact_header("content-type", 12, timeout.content_type) &&
-               exact_header("connection", 10, kKeepAlive);
+               exact_header("connection", 10, expected_connection);
     }
 
     bool prebuilt_http1_layout_is_valid(const Connection& c,
@@ -841,10 +850,22 @@ public:
         const bool fixed_upload =
             c.http1_prebuilt_deadline_profile ==
             ResponseReadDeadlineProfile::FixedContentLengthUploadNonHeadContentLengthZero;
+        const bool explicit_close =
+            c.http1_prebuilt_deadline_config != nullptr &&
+            c.http1_prebuilt_deadline_config->policy_bundle_id_is_valid(
+                c.http1_prebuilt_deadline_bundle_id) &&
+            complete_content_length_explicit_close_request_is_stable(
+                c,
+                c.http1_prebuilt_deadline_upload,
+                c.http1_prebuilt_deadline_config
+                    ->policy_bundles[c.http1_prebuilt_deadline_bundle_id - 1]
+                    .response_buffering,
+                c.http1_prebuilt_deadline_profile);
         if (c.id >= kMaxConns || c.fd < 0 || c.upstream_fd < 0 ||
             c.protocol != ConnProtocol::Http11 || c.tls_active || c.state != ConnState::Proxying ||
-            !c.keep_alive || !c.req_client_keep_alive || c.req_start_us == 0 || c.epoch_held ||
-            c.resp_body_mode != BodyMode::None || c.resp_body_remaining != 0 ||
+            ((!c.keep_alive || !c.req_client_keep_alive) && !explicit_close) ||
+            c.req_start_us == 0 || c.epoch_held || c.resp_body_mode != BodyMode::None ||
+            c.resp_body_remaining != 0 ||
             (fixed_upload ? c.req_body_mode != BodyMode::ContentLength ||
                                 c.req_body_remaining != 0 || !c.request_body_fully_buffered
                           : c.req_body_mode != BodyMode::None || c.req_body_remaining != 0 ||
@@ -1271,8 +1292,27 @@ public:
                     !c.upstream_slot_held && c.state == ConnState::Sending && !c.send_armed &&
                     c.req_start_us == 0 && c.epoch_held && !c.upstream_connect_armed &&
                     !c.upstream_send_armed && !c.upstream_recv_armed && !has_request_callback;
-                if (!valid || !normalize_prebuilt_http1_request_buffer(c)) {
+                const bool explicit_close =
+                    c.http1_prebuilt_deadline_config != nullptr &&
+                    c.http1_prebuilt_deadline_config->policy_bundle_id_is_valid(
+                        c.http1_prebuilt_deadline_bundle_id) &&
+                    complete_content_length_explicit_close_request_is_stable(
+                        c,
+                        c.http1_prebuilt_deadline_upload,
+                        c.http1_prebuilt_deadline_config
+                            ->policy_bundles[c.http1_prebuilt_deadline_bundle_id - 1]
+                            .response_buffering,
+                        c.http1_prebuilt_deadline_profile);
+                if (!valid || (!explicit_close && !normalize_prebuilt_http1_request_buffer(c))) {
                     if (c.fd >= 0) close_conn(c);
+                    continue;
+                }
+
+                if (explicit_close) {
+                    c.http1_boundary_deferred = false;
+                    c.http1_boundary_successor_episode = 0;
+                    c.http1_prebuilt_wait = 0;
+                    close_conn(c);
                     continue;
                 }
 
@@ -1302,6 +1342,21 @@ public:
                 !c.send_armed && c.req_start_us == 0 && !has_request_callback;
             if (!valid) {
                 if (c.fd >= 0) close_conn(c);
+                continue;
+            }
+            const bool explicit_close =
+                c.http1_prebuilt_deadline_upload.downstream_close &&
+                complete_content_length_explicit_close_request_is_stable(
+                    c,
+                    c.http1_prebuilt_deadline_upload,
+                    ForwardResponseBufferingMode::CompleteContentLength,
+                    ResponseReadDeadlineProfile::BodylessNonHeadContentLengthZero);
+            if (c.http1_prebuilt_deadline_upload.downstream_close && !explicit_close) {
+                close_conn(c);
+                continue;
+            }
+            if (explicit_close) {
+                close_conn(c);
                 continue;
             }
             continue_http1_request_boundary<IoUringEventLoop>(this, c);
@@ -2489,9 +2544,11 @@ public:
                     const bool complete = received == declared;
                     if (owner.terminal_error || received > declared ||
                         (!complete && !owner.clean_eof) ||
-                        !start_complete_content_length_send(c,
-                                                            complete ? declared : received,
-                                                            /*close_after_drain=*/!complete))
+                        !start_complete_content_length_send(
+                            c,
+                            complete ? declared : received,
+                            /*close_after_drain=*/
+                            !complete || c.response_read_deadline_upload.downstream_close))
                         close_conn(c);
                 }
             } else if (key_stable && owner.body_complete_at_start &&
@@ -2528,7 +2585,10 @@ public:
                 if (c.response_read_deadline_post_commit_origin_received == declared) {
                     c.response_read_deadline_state = ResponseReadDeadlineState::BodyComplete;
                     if (!start_complete_content_length_send(
-                            c, declared, /*close_after_drain=*/false))
+                            c,
+                            declared,
+                            /*close_after_drain=*/
+                            c.response_read_deadline_upload.downstream_close))
                         close_conn(c);
                     continue;
                 }

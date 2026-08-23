@@ -102,6 +102,10 @@ struct ResponseReadDeadlineUploadProof {
     u16 upstream_id = 0xffffu;
     u16 request_policy_id = 0;
     jit::HandlerFn route_fn = nullptr;
+    // Parser-proven downstream persistence intent. This is admitted only for
+    // the complete-Content-Length bodyless non-HEAD profile and remains part
+    // of the same immutable request-policy identity across every phase.
+    bool downstream_close = false;
 
     template <typename Self, typename Visitor>
     static void visit_owner_fields(Self& proof, Visitor&& visit) {
@@ -117,6 +121,7 @@ struct ResponseReadDeadlineUploadProof {
         visit(proof.upstream_id, u16{0xffffu});
         visit(proof.request_policy_id, u16{0});
         visit(proof.route_fn, static_cast<jit::HandlerFn>(nullptr));
+        visit(proof.downstream_close, false);
     }
 
     [[nodiscard]] bool owner_is_neutral() const {
