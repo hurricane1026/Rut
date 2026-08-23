@@ -40,8 +40,9 @@ Allowed states are `SUPPORTED`, `PARTIAL`, `BLOCKED_BY_RUT`,
   the generated root route, bypass forward preflight, and hit the runtime's
   fixed unmatched `200 OK`. Pinned nginx 1.29.7 rejects `OPTIONS *` with an exact
   local 400 and authority-form CONNECT with an exact local 405, both with zero
-  upstream effects. Generic RUT handling is tracked by #273; its design must not
-  add an nginx-specific runtime mode.
+  upstream effects. #273 now has an independently approved generic method-keyed
+  strict-local-response design with legacy-default and intermediate activation
+  guards; implementation has not landed, so both rows remain `BLOCKED_BY_RUT`.
 - With `location /api/` and a `/` URI in `proxy_pass`, pinned nginx sends `/`,
   `/x`, and `/x?y=1` upstream for `/api/`, `/api/x`, and `/api/x?y=1`.
   It redirects `/api`, collapses repeated slash/dot-segment inputs, and decodes
