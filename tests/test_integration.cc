@@ -21978,6 +21978,239 @@ TEST(route, public_ordinary_source_get_cl0_response_deadline_reuses_downstream_i
     }
 }
 
+TEST(route, public_ordinary_source_get_cl0_progress_then_response_deadline_iouring) {
+    using namespace rut;
+    if (!iouring_socket_live()) SKIP("io_uring async socket ops unavailable in this environment");
+    static constexpr char kIncompleteOrigin[] = "HTTP/1.1 200 OK\r\nX-Progress: get-cl0\r\n";
+    static constexpr char kSecondOrigin[] =
+        "HTTP/1.1 200 OK\r\n"
+        "Server: origin\r\n"
+        "Date: Tue, 01 Jan 2030 00:00:00 GMT\r\n"
+        "Content-Length: 0\r\n\r\n";
+    static constexpr char kTimeoutExpected[] =
+        "HTTP/1.1 504 First Response Deadline\r\n"
+        "Server: deadline-test\r\n"
+        "Date: XXXXXXXXXXXXXXXXXXXXXXXXXXXXX\r\n"
+        "Content-Type: text/plain\r\n"
+        "Content-Length: 20\r\n"
+        "Connection: keep-alive\r\n\r\n"
+        "configured deadline\n";
+    static constexpr char kSecondExpected[] =
+        "HTTP/1.1 200 OK\r\n"
+        "Server: deadline-test\r\n"
+        "Date: XXXXXXXXXXXXXXXXXXXXXXXXXXXXX\r\n"
+        "Content-Length: 0\r\n"
+        "Connection: keep-alive\r\n\r\n";
+    static_assert(sizeof("configured deadline\n") - 1 == 20);
+
+    RecordingUpstream backend;
+    backend.response = kIncompleteOrigin;
+    backend.response_len = sizeof(kIncompleteOrigin) - 1;
+    backend.response_after_first = kSecondOrigin;
+    backend.response_after_first_len = sizeof(kSecondOrigin) - 1;
+    // Origin 1 remains open and quiet after one real positive fragment; origin
+    // 2 also stays open after its exact CL0 frame. Only RUT may retire either.
+    backend.wait_first_response_for_peer_close = true;
+    backend.keep_open = true;
+    REQUIRE(backend.setup());
+
+    PublicGetCl0ResponseReadDeadlineSourceResources resources;
+    REQUIRE(resources.compile(backend.port));
+    REQUIRE_EQ(resources.rir.module.func_count, 1u);
+    REQUIRE_EQ(resources.rir.module.response_policy_count, 1u);
+    REQUIRE_EQ(resources.rir.module.failure_policy_count, 2u);
+    REQUIRE_EQ(resources.rir.module.policy_bundle_count, 1u);
+    const auto& rir_bundle = resources.rir.module.policy_bundles[0];
+    CHECK_EQ(rir_bundle.response_policy_id, 1u);
+    CHECK_EQ(rir_bundle.failure_policy_id, 1u);
+    CHECK_EQ(rir_bundle.timeout_failure_policy_id, 2u);
+    CHECK_EQ(rir_bundle.response_read_timeout_seconds, 1u);
+    CHECK_EQ(resources.rir.module.functions[0].preflight_forward_policy_bundle_id, 1u);
+    REQUIRE_EQ(resources.cfg.response_policy_count, 1u);
+    REQUIRE_EQ(resources.cfg.failure_policy_count, 2u);
+    REQUIRE_EQ(resources.cfg.policy_bundle_count, 1u);
+    const auto& cfg_bundle = resources.cfg.policy_bundles[0];
+    CHECK_EQ(cfg_bundle.response_policy_id, 1u);
+    CHECK_EQ(cfg_bundle.failure_policy_id, 1u);
+    CHECK_EQ(cfg_bundle.timeout_failure_policy_id, 2u);
+    CHECK_EQ(cfg_bundle.response_read_timeout_seconds, 1u);
+    CHECK_EQ(resources.cfg.response_policies[0].head_mode, ResponsePolicyHeadMode::Reject);
+    CHECK_EQ(resources.cfg.failure_policies[0].head_mode, FailurePolicyHeadMode::Reject);
+    CHECK_EQ(resources.cfg.failure_policies[1].head_mode, FailurePolicyHeadMode::Reject);
+    CHECK(resources.cfg.failure_policies[1].body.eq({"configured deadline\n", 20}));
+    REQUIRE_EQ(resources.cfg.route_count, 1u);
+    CHECK_EQ(resources.cfg.routes[0].preflight_forward_policy_bundle_id, 1u);
+
+    Shard<IoUringEventLoop> shard;
+    i32 listen_fd = create_listen_socket(0).value_or(-1);
+    REQUIRE_GE(listen_fd, 0);
+    struct ShardGuard {
+        Shard<IoUringEventLoop>& shard;
+        i32& listen_fd;
+        bool spawned = false;
+        ~ShardGuard() {
+            if (spawned) {
+                shard.stop();
+                shard.join();
+            }
+            shard.shutdown();
+            if (listen_fd >= 0) close(listen_fd);
+        }
+    } shard_guard{shard, listen_fd};
+    const u16 port = get_port(listen_fd);
+    REQUIRE(shard.init(0, listen_fd).has_value());
+    shard.route_config = &resources.cfg;
+    REQUIRE(shard.loop != nullptr);
+    REQUIRE_EQ(shard.loop->upstream_timeout, IoUringEventLoop::kDefaultUpstreamTimeout);
+    REQUIRE_GT(IoUringEventLoop::kDefaultUpstreamTimeout, 8u);
+    REQUIRE(shard.spawn(-1).has_value());
+    shard_guard.spawned = true;
+    usleep(50000);
+
+    struct ClientGuard {
+        i32 fd;
+        ~ClientGuard() {
+            if (fd >= 0) close(fd);
+        }
+    } client{connect_to(port)};
+    REQUIRE_GE(client.fd, 0);
+    set_socket_timeouts(client.fd, 8);
+    static constexpr char kRequest1[] =
+        "GET /deadline?progress=1 HTTP/1.1\r\nHost: client.example\r\n"
+        "X-Test: partial-get\r\n\r\n";
+    static constexpr char kRequest2[] =
+        "GET /deadline?complete=2 HTTP/1.1\r\nHost: client.example\r\n"
+        "X-Test: final-get\r\n\r\n";
+
+    auto read_fixed_response =
+        [](i32 fd, u32 body_len, char* output, u32 capacity, u32& output_len, i32 timeout_ms) {
+            output_len = 0;
+            u32 header_end = 0;
+            for (u32 attempt = 0; attempt < 32 && output_len < capacity; attempt++) {
+                const i32 got =
+                    recv_timeout(fd, output + output_len, capacity - output_len, timeout_ms);
+                if (got <= 0) return false;
+                output_len += static_cast<u32>(got);
+                if (header_end == 0) {
+                    for (u32 i = 0; i + 3 < output_len; i++) {
+                        if (output[i] == '\r' && output[i + 1] == '\n' && output[i + 2] == '\r' &&
+                            output[i + 3] == '\n') {
+                            header_end = i + 4;
+                            break;
+                        }
+                    }
+                }
+                if (header_end != 0) {
+                    const u32 expected = header_end + body_len;
+                    if (output_len > expected) return false;
+                    if (output_len == expected) return true;
+                }
+            }
+            return false;
+        };
+
+    REQUIRE(send_all(client.fd, kRequest1, sizeof(kRequest1) - 1));
+    for (u32 waited = 0;
+         waited < 600 && (!backend.first_response_sent_open.load(std::memory_order_acquire) ||
+                          backend.request_count.load(std::memory_order_acquire) < 1);
+         waited++)
+        usleep(5000);
+    REQUIRE(backend.first_response_sent_open.load(std::memory_order_acquire));
+    REQUIRE_EQ(backend.first_response_fragment_count.load(std::memory_order_acquire), 1u);
+    const u64 progress_sent_ns =
+        backend.first_response_fragment_sent_ns[0].load(std::memory_order_acquire);
+    REQUIRE_NE(progress_sent_ns, 0u);
+    REQUIRE_EQ(backend.accepted_count.load(std::memory_order_acquire), 1u);
+    REQUIRE_EQ(backend.request_count.load(std::memory_order_acquire), 1u);
+
+    char expected_request[256]{};
+    int expected_request_len =
+        snprintf(expected_request,
+                 sizeof(expected_request),
+                 "GET /deadline?progress=1 HTTP/1.1\r\nHost: 127.0.0.1:%u\r\n"
+                 "X-Test: partial-get\r\n\r\n",
+                 backend.port);
+    REQUIRE_GT(expected_request_len, 0);
+    REQUIRE_EQ(backend.request_history_len[0], static_cast<u32>(expected_request_len));
+    REQUIRE_EQ(backend.request_history_header_len[0], static_cast<u32>(expected_request_len));
+    CHECK_EQ(memcmp(backend.request_history[0], expected_request, expected_request_len), 0);
+    CHECK_EQ(backend.request_body_len, 0u);
+
+    char response[1024]{};
+    u32 response_len = 0;
+    REQUIRE(read_fixed_response(client.fd, 20, response, sizeof(response), response_len, 8000));
+    struct timespec client_completed{};
+    REQUIRE_EQ(clock_gettime(CLOCK_MONOTONIC, &client_completed), 0);
+    const u64 client_completed_ns = static_cast<u64>(client_completed.tv_sec) * 1000000000ull +
+                                    static_cast<u64>(client_completed.tv_nsec);
+    REQUIRE_GT(client_completed_ns, progress_sent_ns);
+    const double inactivity_elapsed =
+        static_cast<double>(client_completed_ns - progress_sent_ns) / 1e9;
+    CHECK_GT(inactivity_elapsed, 1.0);
+    CHECK_LT(inactivity_elapsed, 6.0);
+    REQUIRE(normalize_public_date(response, response_len));
+    REQUIRE_EQ(response_len, static_cast<u32>(strlen(kTimeoutExpected)));
+    CHECK_EQ(memcmp(response, kTimeoutExpected, response_len), 0);
+
+    for (u32 waited = 0;
+         waited < 600 && !backend.first_peer_closed.load(std::memory_order_acquire) &&
+         !backend.first_peer_unexpected_data.load(std::memory_order_acquire) &&
+         !backend.first_peer_close_timed_out.load(std::memory_order_acquire) &&
+         !backend.first_peer_observation_aborted.load(std::memory_order_acquire);
+         waited++)
+        usleep(5000);
+    REQUIRE(backend.first_peer_closed.load(std::memory_order_acquire));
+    CHECK_FALSE(backend.first_peer_unexpected_data.load(std::memory_order_acquire));
+    CHECK_FALSE(backend.first_peer_close_timed_out.load(std::memory_order_acquire));
+    CHECK_FALSE(backend.first_peer_observation_aborted.load(std::memory_order_acquire));
+    const u64 peer_closed_ns = backend.first_peer_closed_ns.load(std::memory_order_acquire);
+    REQUIRE_GT(peer_closed_ns, progress_sent_ns);
+    const double origin_quiet_time = static_cast<double>(peer_closed_ns - progress_sent_ns) / 1e9;
+    CHECK_GT(origin_quiet_time, 1.0);
+    CHECK_LT(origin_quiet_time, 6.0);
+    CHECK_EQ(backend.first_response_fragment_count.load(std::memory_order_acquire), 1u);
+    REQUIRE_EQ(backend.accepted_count.load(std::memory_order_acquire), 1u);
+    REQUIRE_EQ(backend.request_count.load(std::memory_order_acquire), 1u);
+
+    // The recorder has observed RUT retire origin 1. Request 2 now reuses this
+    // exact downstream fd but must create a fresh second origin connection.
+    REQUIRE(send_all(client.fd, kRequest2, sizeof(kRequest2) - 1));
+    memset(response, 0, sizeof(response));
+    REQUIRE(read_fixed_response(client.fd, 0, response, sizeof(response), response_len, 5000));
+    REQUIRE(normalize_public_date(response, response_len));
+    REQUIRE_EQ(response_len, static_cast<u32>(strlen(kSecondExpected)));
+    CHECK_EQ(memcmp(response, kSecondExpected, response_len), 0);
+
+    for (u32 waited = 0; waited < 600 && backend.request_count.load(std::memory_order_acquire) < 2;
+         waited++)
+        usleep(5000);
+    REQUIRE_EQ(backend.accepted_count.load(std::memory_order_acquire), 2u);
+    REQUIRE_EQ(backend.request_count.load(std::memory_order_acquire), 2u);
+    memset(expected_request, 0, sizeof(expected_request));
+    expected_request_len = snprintf(expected_request,
+                                    sizeof(expected_request),
+                                    "GET /deadline?complete=2 HTTP/1.1\r\n"
+                                    "Host: 127.0.0.1:%u\r\nX-Test: final-get\r\n\r\n",
+                                    backend.port);
+    REQUIRE_GT(expected_request_len, 0);
+    REQUIRE_EQ(backend.request_history_len[1], static_cast<u32>(expected_request_len));
+    REQUIRE_EQ(backend.request_history_header_len[1], static_cast<u32>(expected_request_len));
+    CHECK_EQ(memcmp(backend.request_history[1], expected_request, expected_request_len), 0);
+    CHECK_EQ(backend.request_body_len, 0u);
+
+    char quiet[16];
+    REQUIRE_EQ(recv_timeout(client.fd, quiet, sizeof(quiet), 100), -EAGAIN);
+    CHECK_EQ(backend.accepted_count.load(std::memory_order_acquire), 2u);
+    CHECK_EQ(backend.request_count.load(std::memory_order_acquire), 2u);
+    for (u32 slot = 2; slot < RecordingUpstream::kMaxRecordedRequests; slot++) {
+        bool zero =
+            backend.request_history_len[slot] == 0 && backend.request_history_header_len[slot] == 0;
+        for (u32 i = 0; zero && i < RecordingUpstream::kRequestCapacity; i++)
+            zero = backend.request_history[slot][i] == '\0';
+        CHECK(zero);
+    }
+}
+
 TEST(route, public_ordinary_source_progress_then_response_deadline_iouring) {
     using namespace rut;
     if (!iouring_socket_live()) SKIP("io_uring async socket ops unavailable in this environment");
