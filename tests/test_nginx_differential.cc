@@ -35,6 +35,24 @@ static constexpr char kGatewayRequest[] =
     "GET /missing?q=1 HTTP/1.1\r\n"
     "Host: client.example\r\n"
     "Connection: close\r\n\r\n";
+static constexpr char kOptionsStarRequest[] =
+    "OPTIONS * HTTP/1.1\r\n"
+    "Host: options-star-client.example\r\n"
+    "Connection: close\r\n\r\n";
+static constexpr char kOptionsStarResponseNormalized[] =
+    "HTTP/1.1 400 Bad Request\r\n"
+    "Server: nginx/1.29.7\r\n"
+    "Date: XXXXXXXXXXXXXXXXXXXXXXXXXXXXX\r\n"
+    "Content-Type: text/html\r\n"
+    "Content-Length: 157\r\n"
+    "Connection: close\r\n\r\n"
+    "<html>\r\n"
+    "<head><title>400 Bad Request</title></head>\r\n"
+    "<body>\r\n"
+    "<center><h1>400 Bad Request</h1></center>\r\n"
+    "<hr><center>nginx/1.29.7</center>\r\n"
+    "</body>\r\n"
+    "</html>\r\n";
 static constexpr char kDefaultBufferingTimeoutRequest[] =
     "GET /buffered-timeout?q=1 HTTP/1.1\r\n"
     "Host: client.example\r\n\r\n";
@@ -3372,6 +3390,82 @@ static bool capture_case(u16 frontend_port,
     return true;
 }
 
+static bool capture_options_star_case(u16 frontend_port,
+                                      u16 backend_port,
+                                      const std::string& nginx_config_path,
+                                      const std::string& nginx_log_path,
+                                      const std::string& container_name,
+                                      std::vector<char>& downstream,
+                                      std::string& error) {
+    Recorder recorder;
+    recorder.observe_extra_requests_until_stop = true;
+    if (!recorder.setup(backend_port)) {
+        error = "OPTIONS-star backend recorder setup failed";
+        return false;
+    }
+
+    DockerGuard docker(container_name);
+    ChildGuard nginx;
+    if (!spawn_child({"docker",
+                      "run",
+                      "--pull=never",
+                      "--network",
+                      "host",
+                      "--name",
+                      container_name,
+                      "-v",
+                      nginx_config_path + ":/etc/nginx/nginx.conf:ro",
+                      kNginxImage,
+                      "nginx",
+                      "-g",
+                      "daemon off;"},
+                     nginx_log_path,
+                     nginx.child)) {
+        error = "failed to start pinned nginx for OPTIONS-star case";
+        return false;
+    }
+    if (!wait_ready(frontend_port, nginx.child, error)) return false;
+
+    const int client = connect_once(frontend_port);
+    bool ok = client >= 0;
+    if (ok) ok = send_all(client, kOptionsStarRequest, sizeof(kOptionsStarRequest) - 1);
+    if (ok) ok = read_response(client, downstream, error);
+    if (ok) ok = read_eof(client, error);
+    if (client >= 0) close(client);
+    if (!ok) {
+        error = "nginx OPTIONS-star response/EOF failed: " + error;
+        return false;
+    }
+
+    std::string detail;
+    if (!validate_exact_normalized_response(downstream, kOptionsStarResponseNormalized, detail)) {
+        error = "OPTIONS-star downstream response mismatch: " + detail;
+        return false;
+    }
+
+    // Keep nginx and the recorder live after the complete response and EOF so
+    // delayed upstream effects cannot be hidden by test cleanup.
+    settle_for_invalid_target_side_effects();
+    const bool nginx_stopped = stop_child(nginx.child);
+    const bool container_removed = docker.remove();
+    recorder.stop();
+    if (!nginx_stopped) {
+        error = "failed to stop nginx after OPTIONS-star case";
+        return false;
+    }
+    if (!container_removed) {
+        error = "docker rm -f failed after OPTIONS-star case";
+        return false;
+    }
+    if (recorder.accepted.load(std::memory_order_acquire) != 0 ||
+        recorder.requests.load(std::memory_order_acquire) != 0 || !recorder.request.empty() ||
+        !recorder.history.empty()) {
+        error = "OPTIONS-star unexpectedly contacted the configured upstream";
+        return false;
+    }
+    return true;
+}
+
 static bool capture_head_case(u16 frontend_port,
                               u16 backend_port,
                               const std::string& nginx_config_path,
@@ -4220,6 +4314,24 @@ int main(int argc, char** argv) {
     source_suffix = source_suffix ? source_suffix + 1 : temp.path;
     const std::string container =
         "rut-nginx-diff-" + std::to_string(getpid()) + "-" + source_suffix;
+
+    std::vector<char> options_star_response;
+    std::string options_star_error;
+    if (!capture_options_star_case(frontend_port,
+                                   backend_port,
+                                   temp.nginx_config,
+                                   temp.nginx_log,
+                                   container + "-options-star",
+                                   options_star_response,
+                                   options_star_error)) {
+        std::cerr << "FAIL [pinned OPTIONS-star]: " << options_star_error << "\n";
+        dump_wire("pinned OPTIONS-star response", options_star_response);
+        dump_log(temp.nginx_log, "pinned OPTIONS-star nginx log");
+        return 1;
+    }
+    std::cerr << "PASS: pinned nginx rejects explicit-close OPTIONS * before location /, "
+                 "returns the exact generated 400 response and EOF, and performs no upstream "
+                 "operation\n";
 
     Recorder default_buffering_timeout_origin;
     default_buffering_timeout_origin.wait_response_peer_close = true;
