@@ -203,6 +203,8 @@ extern template void on_proxy_response_sent<IoUringEventLoop>(void*, Connection&
 extern template void on_response_header_sent<IoUringEventLoop>(void*, Connection&, IoEvent);
 extern template void on_response_body_recvd<IoUringEventLoop>(void*, Connection&, IoEvent);
 extern template void on_response_body_sent<IoUringEventLoop>(void*, Connection&, IoEvent);
+extern template void pump_response_read_deadline_body<IoUringEventLoop>(IoUringEventLoop*,
+                                                                        Connection&);
 extern template void on_request_body_sent<IoUringEventLoop>(void*, Connection&, IoEvent);
 extern template void on_request_body_recvd<IoUringEventLoop>(void*, Connection&, IoEvent);
 extern template void on_jit_request_body_recvd<IoUringEventLoop>(void*, Connection&, IoEvent);
