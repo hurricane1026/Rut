@@ -26226,6 +26226,116 @@ TEST(response_buffering_runtime, complete_body_wins_clean_eof_in_either_batch_or
     }
 }
 
+// Validate the sole dynamic field before masking it for an otherwise byte-exact
+// response-wire comparison. The mutation happens only after the complete header
+// block has been checked, so rejected inputs remain byte-for-byte observable.
+static bool normalize_strict_imf_fixdate_header(u8* data, u32 len) {
+    u32 header_terminator = len;
+    for (u32 i = 0; i + 3u < len; ++i) {
+        if (data[i] == '\r' && data[i + 1u] == '\n' && data[i + 2u] == '\r' &&
+            data[i + 3u] == '\n') {
+            header_terminator = i;
+            break;
+        }
+    }
+    if (header_terminator == len) return false;
+
+    u32 status_end = 0;
+    while (status_end + 1u < header_terminator &&
+           !(data[status_end] == '\r' && data[status_end + 1u] == '\n'))
+        ++status_end;
+    if (status_end + 1u >= header_terminator) return false;
+
+    const auto ascii_lower = [](u8 c) { return c >= 'A' && c <= 'Z' ? c + ('a' - 'A') : c; };
+    u32 date_count = 0;
+    u32 date_start = 0;
+    for (u32 line_start = status_end + 2u; line_start < header_terminator;) {
+        u32 line_end = line_start;
+        while (line_end < header_terminator &&
+               !(data[line_end] == '\r' && data[line_end + 1u] == '\n'))
+            ++line_end;
+        if (data[line_end] != '\r' || data[line_end + 1u] != '\n') return false;
+        const bool is_date =
+            line_end - line_start >= 5u && data[line_start + 4u] == ':' &&
+            ascii_lower(data[line_start]) == 'd' && ascii_lower(data[line_start + 1u]) == 'a' &&
+            ascii_lower(data[line_start + 2u]) == 't' && ascii_lower(data[line_start + 3u]) == 'e';
+        if (is_date) {
+            ++date_count;
+            if (date_count != 1u || line_end - line_start != 35u || data[line_start + 5u] != ' ')
+                return false;
+            date_start = line_start + 6u;
+        }
+        line_start = line_end + 2u;
+    }
+    if (date_count != 1u) return false;
+
+    const u8* date = data + date_start;
+    const auto token_is_one_of = [](const u8* value, const char* const* tokens, u32 count) {
+        for (u32 i = 0; i < count; ++i)
+            if (__builtin_memcmp(value, tokens[i], 3) == 0) return true;
+        return false;
+    };
+    static const char* const kWeekdays[] = {"Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"};
+    static const char* const kMonths[] = {
+        "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"};
+    const auto is_digit = [](u8 c) { return c >= '0' && c <= '9'; };
+    const auto two_digits = [&](u32 offset) {
+        return is_digit(date[offset]) && is_digit(date[offset + 1u])
+                   ? static_cast<u32>((date[offset] - '0') * 10u + date[offset + 1u] - '0')
+                   : 100u;
+    };
+    if (!token_is_one_of(date, kWeekdays, sizeof(kWeekdays) / sizeof(kWeekdays[0])) ||
+        date[3] != ',' || date[4] != ' ' || date[7] != ' ' ||
+        !token_is_one_of(date + 8u, kMonths, sizeof(kMonths) / sizeof(kMonths[0])) ||
+        date[11] != ' ' || date[16] != ' ' || date[19] != ':' || date[22] != ':' ||
+        date[25] != ' ' || __builtin_memcmp(date + 26u, "GMT", 3) != 0)
+        return false;
+    for (u32 i = 12u; i < 16u; ++i)
+        if (!is_digit(date[i])) return false;
+    const u32 day = two_digits(5u);
+    const u32 hour = two_digits(17u);
+    const u32 minute = two_digits(20u);
+    const u32 second = two_digits(23u);
+    if (day < 1u || day > 31u || hour > 23u || minute > 59u || second > 59u) return false;
+
+    for (u32 i = 0; i < 29u; ++i) data[date_start + i] = 'X';
+    return true;
+}
+
+TEST(response_buffering_runtime, strict_date_normalizer_is_transactional_and_header_scoped) {
+    static constexpr char kPrefix[] = "HTTP/1.1 200 OK\r\nDate: ";
+    static constexpr char kDate[] = "Tue, 01 Jan 2030 00:00:00 GMT";
+    static constexpr char kSuffix[] = "\r\nContent-Length: 0\r\n\r\n";
+    const std::string valid_wire = std::string(kPrefix) + kDate + kSuffix;
+
+    std::vector<u8> valid(valid_wire.begin(), valid_wire.end());
+    REQUIRE(normalize_strict_imf_fixdate_header(valid.data(), static_cast<u32>(valid.size())));
+    const std::string normalized(valid.begin(), valid.end());
+    CHECK_EQ(normalized, std::string(kPrefix) + "XXXXXXXXXXXXXXXXXXXXXXXXXXXXX" + kSuffix);
+
+    const auto expect_invalid = [&](const std::string& wire) {
+        std::vector<u8> bytes(wire.begin(), wire.end());
+        const std::vector<u8> before = bytes;
+        CHECK_FALSE(
+            normalize_strict_imf_fixdate_header(bytes.data(), static_cast<u32>(bytes.size())));
+        CHECK(bytes == before);
+    };
+    expect_invalid(std::string(kPrefix) + "Xue, 01 Jan 2030 00:00:00 GMT" + kSuffix);
+    expect_invalid(std::string(kPrefix) + "Tue; 01 Jan 2030 00:00:00 GMT" + kSuffix);
+    expect_invalid(std::string(kPrefix) + "Tue, 00 Jan 2030 00:00:00 GMT" + kSuffix);
+    expect_invalid(std::string(kPrefix) + "Tue, 01 Xxx 2030 00:00:00 GMT" + kSuffix);
+    expect_invalid(std::string(kPrefix) + "Tue, 01 Jan 20X0 00:00:00 GMT" + kSuffix);
+    expect_invalid(std::string(kPrefix) + "Tue, 01 Jan 2030 24:00:00 GMT" + kSuffix);
+    expect_invalid(std::string(kPrefix) + "Tue, 01 Jan 2030 00:60:00 GMT" + kSuffix);
+    expect_invalid(std::string(kPrefix) + "Tue, 01 Jan 2030 00:00:60 GMT" + kSuffix);
+    expect_invalid(std::string(kPrefix) + "Tue, 01 Jan 2030 00:00:00 UTC" + kSuffix);
+    expect_invalid(valid_wire.substr(0, valid_wire.size() - 2u) +
+                   "Date: Tue, 01 Jan 2030 00:00:00 GMT\r\n\r\n");
+    expect_invalid(
+        "HTTP/1.1 200 OK\r\nContent-Length: 35\r\n\r\n"
+        "Date: Tue, 01 Jan 2030 00:00:00 GMT");
+}
+
 TEST(response_buffering_runtime,
      initial_complete_body_wins_clean_eof_and_due_timeout_in_every_batch_order) {
     enum EventIndex : u8 { Complete = 0, CleanEof = 1, DueTimeout = 2 };
@@ -26338,6 +26448,12 @@ TEST(response_buffering_runtime,
             }
             REQUIRE_EQ(date_count, 1u);
             REQUIRE_EQ(date.len, 29u);
+            u8 normalized_header[256]{};
+            REQUIRE_LE(conn.response_header_buf.len(), sizeof(normalized_header));
+            __builtin_memcpy(
+                normalized_header, conn.response_header_buf.data(), conn.response_header_buf.len());
+            REQUIRE(normalize_strict_imf_fixdate_header(normalized_header,
+                                                        conn.response_header_buf.len()));
             char expected_header[256]{};
             const int expected_len = snprintf(expected_header,
                                               sizeof(expected_header),
@@ -26347,14 +26463,13 @@ TEST(response_buffering_runtime,
                                               "Content-Length: 4\r\n"
                                               "Connection: %s\r\n"
                                               "X-Pinned: exact\r\n\r\n",
-                                              static_cast<int>(date.len),
-                                              date.ptr,
+                                              29,
+                                              "XXXXXXXXXXXXXXXXXXXXXXXXXXXXX",
                                               downstream_close ? "close" : "keep-alive");
             REQUIRE_GT(expected_len, 0);
             REQUIRE_EQ(static_cast<u32>(expected_len), conn.response_header_buf.len());
-            CHECK_EQ(__builtin_memcmp(conn.response_header_buf.data(),
-                                      expected_header,
-                                      static_cast<u32>(expected_len)),
+            CHECK_EQ(__builtin_memcmp(
+                         normalized_header, expected_header, static_cast<u32>(expected_len)),
                      0);
             REQUIRE(conn.response_read_deadline_send_owner_active);
             REQUIRE_EQ(loop->backend.send_state[id].remaining, conn.response_header_buf.len());
