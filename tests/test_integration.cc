@@ -18161,6 +18161,219 @@ route "/" { return forward(backend) }
     }
 }
 
+TEST(route, public_ordinary_source_unmatched_connect_authority_nginx_405_zero_upstream_iouring) {
+    using namespace rut;
+    if (!iouring_socket_live()) SKIP("io_uring async socket ops unavailable in this environment");
+
+    static constexpr char kBody[] =
+        "<html>\r\n"
+        "<head><title>405 Not Allowed</title></head>\r\n"
+        "<body>\r\n"
+        "<center><h1>405 Not Allowed</h1></center>\r\n"
+        "<hr><center>nginx/1.29.7</center>\r\n"
+        "</body>\r\n"
+        "</html>\r\n";
+    static constexpr char kExpectedNormalized[] =
+        "HTTP/1.1 405 Not Allowed\r\n"
+        "Server: nginx/1.29.7\r\n"
+        "Date: XXXXXXXXXXXXXXXXXXXXXXXXXXXXX\r\n"
+        "Content-Type: text/html\r\n"
+        "Content-Length: 157\r\n"
+        "Connection: close\r\n\r\n"
+        "<html>\r\n"
+        "<head><title>405 Not Allowed</title></head>\r\n"
+        "<body>\r\n"
+        "<center><h1>405 Not Allowed</h1></center>\r\n"
+        "<hr><center>nginx/1.29.7</center>\r\n"
+        "</body>\r\n"
+        "</html>\r\n";
+    static_assert(sizeof(kBody) - 1u == 157u);
+
+    RecordingUpstream backend;
+    REQUIRE(backend.setup());
+    std::string source =
+        "listen :0\nupstream backend at \"127.0.0.1:" + std::to_string(backend.port) + "\"\n";
+    source += R"rut(
+unmatched CONNECT { return local_response({
+  version: "HTTP/1.1", status: 405, reason: "Not Allowed", server: "nginx/1.29.7",
+  date: "current", content_type: "text/html", connection: "request",
+  head_mode: "reject", body: b"<html>\r\n<head><title>405 Not Allowed</title></head>\r\n<body>\r\n<center><h1>405 Not Allowed</h1></center>\r\n<hr><center>nginx/1.29.7</center>\r\n</body>\r\n</html>\r\n"
+}) }
+route "/" { return forward(backend) }
+)rut";
+
+    const auto check_connect_policy = [&](const auto& policy) {
+        CHECK_EQ(policy.version, StrictLocalResponseVersion::Http11);
+        CHECK_EQ(policy.status_code, 405u);
+        CHECK_EQ(policy.date, StrictLocalResponseDate::Current);
+        CHECK_EQ(policy.connection, StrictLocalResponseConnection::Request);
+        CHECK_EQ(policy.head_mode, StrictLocalResponseHeadMode::Reject);
+        CHECK(policy.reason.eq({"Not Allowed", 11}));
+        CHECK(policy.server.eq({"nginx/1.29.7", 12}));
+        CHECK(policy.content_type.eq({"text/html", 9}));
+        CHECK(policy.body.eq({kBody, sizeof(kBody) - 1u}));
+    };
+    const auto check_connect_table = [&](const auto& policy_ids) {
+        for (u32 slot = 0; slot < kRouteMethodSlots; slot++)
+            CHECK_EQ(policy_ids[slot], slot == kRouteMethodConnect ? 1u : 0u);
+    };
+
+    auto lexed = lex({source.data(), static_cast<u32>(source.size())});
+    REQUIRE(lexed);
+    auto ast = parse_file(lexed.value());
+    REQUIRE(ast);
+    std::unique_ptr<AstFile> ast_owned(ast.value());
+    REQUIRE_EQ(ast_owned->strict_local_response_policies.len, 1u);
+    check_connect_table(ast_owned->unmatched_policy_ids);
+    check_connect_policy(ast_owned->strict_local_response_policies[0]);
+
+    auto hir = analyze_file(*ast_owned);
+    REQUIRE(hir);
+    std::unique_ptr<HirModule> hir_owned(hir.value());
+    REQUIRE(hir_owned->has_listener);
+    CHECK_EQ(hir_owned->listener.port, 0u);
+    REQUIRE_EQ(hir_owned->strict_local_response_policies.len, 1u);
+    check_connect_table(hir_owned->unmatched_policy_ids);
+    check_connect_policy(hir_owned->strict_local_response_policies[0]);
+    REQUIRE_EQ(hir_owned->routes.len, 1u);
+
+    auto mir = build_mir(*hir_owned);
+    REQUIRE(mir);
+    std::unique_ptr<MirModule> mir_owned(mir.value());
+    REQUIRE_EQ(mir_owned->strict_local_response_policies.len, 1u);
+    check_connect_table(mir_owned->unmatched_policy_ids);
+    check_connect_policy(mir_owned->strict_local_response_policies[0]);
+
+    struct CompilerResources {
+        FrontendRirModule rir{};
+        jit::JitEngine engine{};
+        bool engine_ready = false;
+        ~CompilerResources() {
+            if (engine_ready) engine.shutdown();
+            rir.destroy();
+        }
+    } resources;
+    REQUIRE(lower_to_rir(*mir_owned, resources.rir));
+    const auto& module = resources.rir.module;
+    REQUIRE(rir::verify_module(module).ok);
+    REQUIRE_EQ(module.func_count, 1u);
+    CHECK_EQ(module.functions[0].http_method, kRouteMethodAny);
+    REQUIRE(module.functions[0].route_pattern.eq({"/", 1}));
+    REQUIRE_EQ(module.upstream_count, 1u);
+    REQUIRE_EQ(module.strict_local_response_policy_count, 1u);
+    check_connect_table(module.unmatched_policy_ids);
+    const auto& rir_policy = module.strict_local_response_policies[0];
+    check_connect_policy(rir_policy);
+
+    auto cg = jit::codegen(module);
+    REQUIRE(cg.ok);
+    REQUIRE(resources.engine.init());
+    resources.engine_ready = true;
+    REQUIRE(resources.engine.compile(cg.mod, cg.ctx));
+    RouteConfig cfg{};
+    REQUIRE(populate_route_config(cfg, module));
+    REQUIRE(register_jit_routes(cfg, module, resources.engine));
+    REQUIRE_EQ(cfg.upstream_count, 1u);
+    REQUIRE_EQ(cfg.route_count, 1u);
+    CHECK_EQ(cfg.routes[0].method, kRouteMethodAny);
+    CHECK_EQ(cfg.routes[0].action, RouteAction::JitHandler);
+    CHECK_NE(cfg.routes[0].fn, nullptr);
+    REQUIRE_EQ(cfg.strict_local_response_policy_count, 1u);
+    check_connect_table(cfg.unmatched_policy_ids);
+    REQUIRE(cfg.unmatched_policy_table_is_valid());
+    REQUIRE(cfg.strict_local_response_policy_id_is_owned(1u));
+    const auto& cfg_policy = cfg.strict_local_response_policies[0];
+    check_connect_policy(cfg_policy);
+    CHECK_NE(cfg_policy.reason.ptr, rir_policy.reason.ptr);
+    CHECK_NE(cfg_policy.server.ptr, rir_policy.server.ptr);
+    CHECK_NE(cfg_policy.content_type.ptr, rir_policy.content_type.ptr);
+    CHECK_NE(cfg_policy.body.ptr, rir_policy.body.ptr);
+
+    ListenerSpec declared_listener{};
+    declared_listener.port = hir_owned->listener.port;
+    ListenerContext listener_context{};
+    auto listen_result =
+        bind_listener_shard(declared_listener, declared_listener.port, nullptr, &listener_context);
+    REQUIRE(listen_result.has_value());
+    i32 listen_fd = listen_result.value();
+    REQUIRE(listener_context.valid());
+    REQUIRE_NE(listener_context.port, 0u);
+
+    Shard<IoUringEventLoop> shard;
+    struct ShardGuard {
+        Shard<IoUringEventLoop>& shard;
+        i32& listen_fd;
+        bool spawned = false;
+        ~ShardGuard() {
+            if (spawned) {
+                shard.stop();
+                shard.join();
+            }
+            shard.shutdown();
+            if (listen_fd >= 0) close(listen_fd);
+        }
+    } shard_guard{shard, listen_fd};
+    REQUIRE(shard.init(0, listen_fd).has_value());
+    shard.route_config = &cfg;
+    REQUIRE(shard.loop != nullptr);
+    shard.loop->listener_context = listener_context;
+    REQUIRE(shard.spawn(-1).has_value());
+    shard_guard.spawned = true;
+    usleep(50000);
+
+    struct ClientGuard {
+        i32 fd = -1;
+        ~ClientGuard() {
+            if (fd >= 0) close(fd);
+        }
+    } client{connect_to(listener_context.port)};
+    REQUIRE_GE(client.fd, 0);
+    set_socket_timeouts(client.fd, 4);
+    static constexpr char kRequest[] =
+        "CONNECT example.com:443 HTTP/1.1\r\n"
+        "Host: connect-client.example\r\n"
+        "Connection: close\r\n\r\n";
+    REQUIRE(send_all(client.fd, kRequest, sizeof(kRequest) - 1u));
+
+    char response[1024]{};
+    u32 response_len = 0;
+    // Observe exact bytes and real peer EOF while both the production shard
+    // and the deliberately live root-forward recorder can still perform work.
+    REQUIRE(read_public_close_response(
+        client.fd, sizeof(kBody) - 1u, response, sizeof(response), response_len));
+    REQUIRE_EQ(response_len, sizeof(kExpectedNormalized) - 1u);
+    REQUIRE(normalize_public_date(response, response_len));
+    CHECK_EQ(memcmp(response, kExpectedNormalized, response_len), 0);
+
+    // The post-EOF window exposes delayed route/connect/send effects. Join both
+    // actors before inspecting recorder history or shard-owned counters.
+    usleep(500000);
+    shard.stop();
+    shard.join();
+    shard_guard.spawned = false;
+    backend.teardown();
+
+    CHECK_EQ(shard.shard_metrics.connections_total, 1u);
+    CHECK_EQ(shard.shard_metrics.connections_active, 0u);
+    CHECK_EQ(shard.shard_metrics.connections_closed, 1u);
+    CHECK_EQ(shard.shard_metrics.requests_total, 1u);
+    CHECK_EQ(shard.shard_metrics.requests_active, 0u);
+    REQUIRE_EQ(backend.accepted_count.load(std::memory_order_acquire), 0u);
+    REQUIRE_EQ(backend.request_count.load(std::memory_order_acquire), 0u);
+    CHECK_EQ(backend.request_len, 0u);
+    CHECK_EQ(backend.request_header_len, 0u);
+    CHECK_EQ(backend.request_body_len, 0u);
+    for (u32 slot = 0; slot < RecordingUpstream::kMaxRecordedRequests; slot++) {
+        CHECK_EQ(backend.request_history_len[slot], 0u);
+        CHECK_EQ(backend.request_history_header_len[slot], 0u);
+        CHECK_EQ(backend.request_recorded_ns[slot].load(std::memory_order_acquire), 0u);
+        bool empty = true;
+        for (u32 i = 0; empty && i < RecordingUpstream::kRequestCapacity; i++)
+            empty = backend.request_history[slot][i] == '\0';
+        CHECK(empty);
+    }
+}
+
 TEST(shard, serves_http2_jit_target_transform_initial_fails_closed) {
     H2TargetTransformJit compiled;
     REQUIRE(compiled.init(/*with_timer=*/false));
