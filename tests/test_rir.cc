@@ -1898,23 +1898,29 @@ TEST(RirVerifier, StrictLocalResponseRejectsForgedCountsIdsMappingsAndPolicies) 
     forged.head_mode = static_cast<StrictLocalResponseHeadMode>(255);
     check_bad_policy(forged);
 
-    mod = Module{};
-    mod.strict_local_response_policies[0] = policy;
-    mod.strict_local_response_policies[1] = policy;
-    mod.strict_local_response_policy_count = 2;
-    mod.unmatched_policy_ids[kRouteMethodOptions] = 1;
-    CHECK_EQ(verify_module(mod).issue.code, VerifyIssueCode::InvalidUnmatchedPolicyId);
+    {
+        Module multi_mod{};
+        multi_mod.strict_local_response_policies[0] = policy;
+        multi_mod.strict_local_response_policies[1] = policy;
+        multi_mod.strict_local_response_policy_count = 2;
+        multi_mod.unmatched_policy_ids[kRouteMethodOptions] = 1;
+        CHECK_EQ(verify_module(multi_mod).issue.code, VerifyIssueCode::InvalidUnmatchedPolicyId);
+    }
 
     std::string body(kMaxStrictLocalResponseBodyLen, 'x');
-    mod = Module{};
-    mod.strict_local_response_policies[0] = policy;
-    mod.strict_local_response_policies[1] = policy;
-    mod.strict_local_response_policies[0].body = {body.data(), static_cast<u32>(body.size())};
-    mod.strict_local_response_policies[1].body = {body.data(), static_cast<u32>(body.size())};
-    mod.strict_local_response_policy_count = 2;
-    mod.unmatched_policy_ids[kRouteMethodOptions] = 1;
-    mod.unmatched_policy_ids[kRouteMethodConnect] = 2;
-    CHECK_EQ(verify_module(mod).issue.code, VerifyIssueCode::InvalidUnmatchedPolicyId);
+    {
+        Module body_mod{};
+        body_mod.strict_local_response_policies[0] = policy;
+        body_mod.strict_local_response_policies[1] = policy;
+        body_mod.strict_local_response_policies[0].body = {body.data(),
+                                                           static_cast<u32>(body.size())};
+        body_mod.strict_local_response_policies[1].body = {body.data(),
+                                                           static_cast<u32>(body.size())};
+        body_mod.strict_local_response_policy_count = 2;
+        body_mod.unmatched_policy_ids[kRouteMethodOptions] = 1;
+        body_mod.unmatched_policy_ids[kRouteMethodConnect] = 2;
+        CHECK_EQ(verify_module(body_mod).issue.code, VerifyIssueCode::InvalidUnmatchedPolicyId);
+    }
 }
 
 TEST(RirPrinter, StrictLocalResponseForgedMetadataPrintsOneSafeMarker) {
