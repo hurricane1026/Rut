@@ -13,7 +13,8 @@ Allowed states are `SUPPORTED`, `PARTIAL`, `BLOCKED_BY_RUT`,
 | `listen <port>` IPv4 wildcard | yes | yes | yes: one source `listen :<port>` declaration | pinned nginx/generated-RUT bind and request | SUPPORTED |
 | ordinary prefix `location /` | yes | yes | partial: root catch-all exists | bounded pinned generated-RUT GET differential | PARTIAL |
 | location applies to every method | yes | yes | yes: method-omitted route source form | RUT route tests; pinned GET and POST differentials | PARTIAL |
-| `OPTIONS *` under the accepted minimal root proxy config | implicit | no; current generated root route cannot match asterisk-form | no faithful target handling: RUT has no canonical path, bypasses forward preflight, and emits fixed unmatched 200 | pinned nginx 1.29.7 exact-close 400/157-byte-body/EOF with zero upstream effects; no generated-RUT differential | BLOCKED_BY_RUT |
+| `OPTIONS *` under the accepted minimal root proxy config | implicit | no; current generated root route cannot match asterisk-form | no faithful target handling: RUT has no canonical path, bypasses forward preflight, and emits fixed unmatched 200; #273 | pinned nginx 1.29.7 exact-close 400/157-byte-body/EOF with zero upstream effects; no generated-RUT differential | BLOCKED_BY_RUT |
+| authority-form CONNECT under the accepted minimal root proxy config | implicit | no; current generated root route cannot match authority-form | no faithful target handling: RUT has no canonical path, bypasses forward preflight, and emits fixed unmatched 200; #273 | pinned nginx 1.29.7 exact-close 405/157-byte-body/EOF with zero upstream effects; no generated-RUT differential | BLOCKED_BY_RUT |
 | fixed IPv4 HTTP `proxy_pass`, no URI suffix | yes | yes | partial: fixed `forward` plus bounded policies | pinned generated-RUT GET/query/header and fixed-CL POST differentials | PARTIAL |
 | preserve raw request-target and query | implicit | yes | partial: origin-form forward sends original bytes | pinned query differential; broader normalization untested | PARTIAL |
 | preserve request method and body | implicit | yes | partial: fixed-CL body is staged before connect within one 16 KiB composite slice | RUT exact binary/segmented/boundary tests and pinned generated-RUT binary POST differential | PARTIAL |
@@ -38,8 +39,9 @@ Allowed states are `SUPPORTED`, `PARTIAL`, `BLOCKED_BY_RUT`,
 - Non-origin-form request targets currently receive no RUT canonical path, miss
   the generated root route, bypass forward preflight, and hit the runtime's
   fixed unmatched `200 OK`. Pinned nginx 1.29.7 rejects `OPTIONS *` with an exact
-  local 400 and zero upstream effects; authority-form CONNECT remains to be
-  pinned before choosing a generic RUT routing/unmatched action.
+  local 400 and authority-form CONNECT with an exact local 405, both with zero
+  upstream effects. Generic RUT handling is tracked by #273; its design must not
+  add an nginx-specific runtime mode.
 - With `location /api/` and a `/` URI in `proxy_pass`, pinned nginx sends `/`,
   `/x`, and `/x?y=1` upstream for `/api/`, `/api/x`, and `/api/x?y=1`.
   It redirects `/api`, collapses repeated slash/dot-segment inputs, and decodes
