@@ -16913,6 +16913,12 @@ struct RecordingUpstream {
     u32 request_history_len[kMaxRecordedRequests]{};
     u32 request_history_header_len[kMaxRecordedRequests]{};
     std::atomic<u64> request_recorded_ns[kMaxRecordedRequests]{};
+    // Per-accept response-write and close witnesses let real-socket tests pin
+    // application fragmentation and origin episode boundaries without treating
+    // TCP recv or io_uring CQE boundaries as message boundaries.
+    std::atomic<u32> response_application_write_count[kMaxRecordedRequests]{};
+    std::atomic<u64> response_last_application_write_completed_ns[kMaxRecordedRequests]{};
+    std::atomic<u64> response_connection_closed_ns[kMaxRecordedRequests]{};
     const char* response = nullptr;
     u32 response_len = 0;
     // Optional response used from the second accepted request onward. This
@@ -17058,12 +17064,22 @@ struct RecordingUpstream {
                                           : (s->response ? s->response_len : sizeof(kResponse) - 1);
             const bool stall_first_response =
                 history_slot == 0 && s->stall_first_response_for_peer_close;
-            auto record_first_response_fragment = [&](bool sent) {
-                if (history_slot != 0 || !sent) return;
+            auto record_response_application_write = [&](bool sent) {
+                if (!sent) return;
+                struct timespec now{};
+                if (history_slot < kMaxRecordedRequests &&
+                    clock_gettime(CLOCK_MONOTONIC, &now) == 0) {
+                    const u64 timestamp = static_cast<u64>(now.tv_sec) * 1000000000ull +
+                                          static_cast<u64>(now.tv_nsec);
+                    s->response_application_write_count[history_slot].fetch_add(
+                        1, std::memory_order_relaxed);
+                    s->response_last_application_write_completed_ns[history_slot].store(
+                        timestamp, std::memory_order_release);
+                }
+                if (history_slot != 0) return;
                 const u32 fragment =
                     s->first_response_fragment_count.load(std::memory_order_relaxed);
                 if (fragment >= kMaxFirstResponseFragments) return;
-                struct timespec now{};
                 if (clock_gettime(CLOCK_MONOTONIC, &now) != 0) return;
                 const u64 timestamp =
                     static_cast<u64>(now.tv_sec) * 1000000000ull + static_cast<u64>(now.tv_nsec);
@@ -17076,15 +17092,15 @@ struct RecordingUpstream {
                 s->first_response_stalled_open.store(true, std::memory_order_release);
             } else if (s->response_split_offset > 0 && s->response_split_offset < out_len) {
                 const bool first_sent = send_all(client, out, s->response_split_offset);
-                record_first_response_fragment(first_sent);
+                record_response_application_write(first_sent);
                 if (s->response_chunk_delay_us != 0) usleep(s->response_chunk_delay_us);
                 const bool second_sent = send_all(
                     client, out + s->response_split_offset, out_len - s->response_split_offset);
-                record_first_response_fragment(second_sent);
+                record_response_application_write(second_sent);
                 response_sent = first_sent && second_sent;
             } else if (s->response_chunk_size == 0) {
                 response_sent = send_all(client, out, out_len);
-                record_first_response_fragment(response_sent);
+                record_response_application_write(response_sent);
             } else {
                 response_sent = true;
                 for (u32 off = 0; off < out_len;) {
@@ -17104,7 +17120,7 @@ struct RecordingUpstream {
                                         ? out_len - off
                                         : s->response_chunk_size;
                     const bool fragment_sent = send_all(client, out + off, len);
-                    record_first_response_fragment(fragment_sent);
+                    record_response_application_write(fragment_sent);
                     response_sent = fragment_sent && response_sent;
                     off += len;
                     if (s->response_chunk_delay_us != 0) usleep(s->response_chunk_delay_us);
@@ -17247,6 +17263,15 @@ struct RecordingUpstream {
                 s->held_fds[s->held_fd_count++] = client;
             } else {
                 close(client);
+                if (history_slot < kMaxRecordedRequests) {
+                    struct timespec now{};
+                    if (clock_gettime(CLOCK_MONOTONIC, &now) == 0) {
+                        const u64 timestamp = static_cast<u64>(now.tv_sec) * 1000000000ull +
+                                              static_cast<u64>(now.tv_nsec);
+                        s->response_connection_closed_ns[history_slot].store(
+                            timestamp, std::memory_order_release);
+                    }
+                }
             }
         }
         return nullptr;
@@ -23217,6 +23242,259 @@ TEST(
         for (u32 i = 0; zero && i < RecordingUpstream::kRequestCapacity; i++)
             zero = backend.request_history[slot][i] == '\0';
         CHECK(zero);
+    }
+}
+
+TEST(
+    route,
+    public_ordinary_source_complete_content_length_buffering_initial_complete_clean_eof_reuses_then_closes_downstream_iouring) {
+    using namespace rut;
+    if (!iouring_socket_live()) SKIP("io_uring async socket ops unavailable in this environment");
+
+    static constexpr char kOriginOne[] =
+        "HTTP/1.1 200 OK\r\n"
+        "Server: initial-complete-one\r\n"
+        "Date: Tue, 01 Jan 2030 00:00:00 GMT\r\n"
+        "Content-Length: 17\r\n\r\n"
+        "first-complete-ok";
+    static constexpr char kExpectedOne[] =
+        "HTTP/1.1 200 OK\r\n"
+        "Server: buffered-test\r\n"
+        "Date: XXXXXXXXXXXXXXXXXXXXXXXXXXXXX\r\n"
+        "Content-Length: 17\r\n"
+        "Connection: keep-alive\r\n\r\n"
+        "first-complete-ok";
+    static constexpr char kOriginTwo[] =
+        "HTTP/1.1 200 OK\r\n"
+        "Server: initial-complete-two\r\n"
+        "Date: Tue, 01 Jan 2030 00:00:00 GMT\r\n"
+        "Content-Length: 18\r\n\r\n"
+        "second-complete-ok";
+    static constexpr char kExpectedTwo[] =
+        "HTTP/1.1 200 OK\r\n"
+        "Server: buffered-test\r\n"
+        "Date: XXXXXXXXXXXXXXXXXXXXXXXXXXXXX\r\n"
+        "Content-Length: 18\r\n"
+        "Connection: close\r\n\r\n"
+        "second-complete-ok";
+    static_assert(sizeof("first-complete-ok") - 1u == 17u);
+    static_assert(sizeof("second-complete-ok") - 1u == 18u);
+    static_assert(sizeof(kOriginOne) - 1u < SlicePool::kSliceSize);
+    static_assert(sizeof(kOriginTwo) - 1u < SlicePool::kSliceSize);
+
+    // response_chunk_size == 0 makes each complete origin representation one
+    // application-level write. With no keep-open/peer-close fixture mode, the
+    // recorder immediately closes each accepted socket after that write.
+    RecordingUpstream backend;
+    backend.response = kOriginOne;
+    backend.response_len = sizeof(kOriginOne) - 1u;
+    backend.response_after_first = kOriginTwo;
+    backend.response_after_first_len = sizeof(kOriginTwo) - 1u;
+    REQUIRE_EQ(backend.response_chunk_size, 0u);
+    REQUIRE(backend.setup());
+
+    PublicGetCompleteContentLengthBufferingFixedRequestPolicySourceResources resources;
+    REQUIRE(resources.compile(backend.port));
+    REQUIRE_EQ(resources.rir.module.func_count, 1u);
+    const auto& function = resources.rir.module.functions[0];
+    CHECK_EQ(function.http_method, kRouteMethodGet);
+    CHECK_EQ(function.preflight_forward_policy_bundle_id, 1u);
+    REQUIRE_EQ(resources.rir.module.policy_bundle_count, 1u);
+    const auto& rir_bundle = resources.rir.module.policy_bundles[0];
+    CHECK_EQ(rir_bundle.response_policy_id, 1u);
+    CHECK_EQ(rir_bundle.failure_policy_id, 1u);
+    CHECK_EQ(rir_bundle.timeout_failure_policy_id, 2u);
+    CHECK_EQ(rir_bundle.response_read_timeout_seconds, 1u);
+    CHECK_EQ(rir_bundle.response_buffering, ForwardResponseBufferingMode::CompleteContentLength);
+    REQUIRE_EQ(resources.cfg.policy_bundle_count, 1u);
+    const auto& cfg_bundle = resources.cfg.policy_bundles[0];
+    CHECK_EQ(cfg_bundle.response_policy_id, 1u);
+    CHECK_EQ(cfg_bundle.failure_policy_id, 1u);
+    CHECK_EQ(cfg_bundle.timeout_failure_policy_id, 2u);
+    CHECK_EQ(cfg_bundle.response_read_timeout_seconds, 1u);
+    CHECK_EQ(cfg_bundle.response_buffering, ForwardResponseBufferingMode::CompleteContentLength);
+    REQUIRE_EQ(resources.cfg.route_count, 1u);
+    CHECK_EQ(resources.cfg.routes[0].method, kRouteMethodGet);
+    CHECK_EQ(resources.cfg.routes[0].preflight_forward_policy_bundle_id, 1u);
+
+    Shard<IoUringEventLoop> shard;
+    i32 listen_fd = create_listen_socket(0).value_or(-1);
+    REQUIRE_GE(listen_fd, 0);
+    struct ShardGuard {
+        Shard<IoUringEventLoop>& shard;
+        i32& listen_fd;
+        bool spawned = false;
+        ~ShardGuard() {
+            if (spawned) {
+                shard.stop();
+                shard.join();
+            }
+            shard.shutdown();
+            if (listen_fd >= 0) close(listen_fd);
+        }
+    } shard_guard{shard, listen_fd};
+    const u16 port = get_port(listen_fd);
+    REQUIRE(shard.init(0, listen_fd).has_value());
+    shard.route_config = &resources.cfg;
+    REQUIRE(shard.loop != nullptr);
+    REQUIRE_GT(IoUringEventLoop::kDefaultUpstreamTimeout, 8u);
+    REQUIRE(shard.spawn(-1).has_value());
+    shard_guard.spawned = true;
+    usleep(50000);
+
+    struct ClientGuard {
+        i32 fd = -1;
+        ~ClientGuard() {
+            if (fd >= 0) close(fd);
+        }
+    } client{connect_to(port)};
+    REQUIRE_GE(client.fd, 0);
+    set_socket_timeouts(client.fd, 8);
+    static constexpr char kRequestOne[] =
+        "GET /buffered?initial-complete=keep-alive HTTP/1.1\r\n"
+        "Host: client.example\r\n"
+        "Keep-Alive: timeout=5\r\n"
+        "X-Test: initial-one\r\n\r\n";
+    static constexpr char kRequestTwo[] =
+        "GET /buffered?initial-complete=close HTTP/1.1\r\n"
+        "Host: client.example\r\n"
+        "Connection: close\r\n"
+        "X-Test: initial-two\r\n\r\n";
+    REQUIRE(send_all(client.fd, kRequestOne, sizeof(kRequestOne) - 1u));
+
+    char response[sizeof(kExpectedTwo) + 64]{};
+    u32 response_len = 0;
+    const u32 expected_one_len = sizeof(kExpectedOne) - 1u;
+    while (response_len < expected_one_len) {
+        const i32 got =
+            recv_timeout(client.fd, response + response_len, sizeof(response) - response_len, 4000);
+        REQUIRE_GT(got, 0);
+        response_len += static_cast<u32>(got);
+        REQUIRE_LE(response_len, expected_one_len);
+    }
+    REQUIRE(normalize_public_date(response, response_len));
+    REQUIRE_EQ(response_len, expected_one_len);
+    CHECK_EQ(memcmp(response, kExpectedOne, response_len), 0);
+    CHECK_FALSE(buf_contains(response, response_len, "Origin Failed", 13));
+    CHECK_FALSE(buf_contains(response, response_len, "Response Read Deadline", 22));
+    char quiet[32];
+    REQUIRE_EQ(recv_timeout(client.fd, quiet, sizeof(quiet), 100), -EAGAIN);
+
+    // The first complete wire was one recorder write, and its origin socket is
+    // already closed. Hold request 2 until the downstream response boundary is
+    // open and quiet, then require a second accept for a fresh origin episode.
+    REQUIRE_EQ(backend.first_response_fragment_count.load(std::memory_order_acquire), 1u);
+    REQUIRE_NE(backend.first_response_fragment_sent_ns[0].load(std::memory_order_acquire), 0u);
+    REQUIRE_EQ(backend.response_application_write_count[0].load(std::memory_order_acquire), 1u);
+    const u64 origin_one_write_completed_ns =
+        backend.response_last_application_write_completed_ns[0].load(std::memory_order_acquire);
+    const u64 origin_one_closed_ns =
+        backend.response_connection_closed_ns[0].load(std::memory_order_acquire);
+    REQUIRE_NE(origin_one_write_completed_ns, 0u);
+    REQUIRE_GE(origin_one_closed_ns, origin_one_write_completed_ns);
+    REQUIRE_EQ(backend.accepted_count.load(std::memory_order_acquire), 1u);
+    REQUIRE_EQ(backend.request_count.load(std::memory_order_acquire), 1u);
+    char expected_request_one[256]{};
+    const int expected_request_one_len =
+        snprintf(expected_request_one,
+                 sizeof(expected_request_one),
+                 "GET /buffered?initial-complete=keep-alive HTTP/1.1\r\n"
+                 "Host: 127.0.0.1:%u\r\n"
+                 "X-Test: initial-one\r\n\r\n",
+                 backend.port);
+    REQUIRE_GT(expected_request_one_len, 0);
+    REQUIRE_LT(expected_request_one_len, static_cast<int>(sizeof(expected_request_one)));
+
+    const u64 request_two_effects_allowed_ns = monotonic_ns();
+    REQUIRE_GT(request_two_effects_allowed_ns, origin_one_closed_ns);
+    REQUIRE(send_all(client.fd, kRequestTwo, sizeof(kRequestTwo) - 1u));
+    memset(response, 0, sizeof(response));
+    response_len = 0;
+    const u32 expected_two_len = sizeof(kExpectedTwo) - 1u;
+    while (response_len < expected_two_len) {
+        const i32 got =
+            recv_timeout(client.fd, response + response_len, sizeof(response) - response_len, 4000);
+        REQUIRE_GT(got, 0);
+        response_len += static_cast<u32>(got);
+        REQUIRE_LE(response_len, expected_two_len);
+    }
+    REQUIRE(normalize_public_date(response, response_len));
+    REQUIRE_EQ(response_len, expected_two_len);
+    CHECK_EQ(memcmp(response, kExpectedTwo, response_len), 0);
+    CHECK_FALSE(buf_contains(response, response_len, "Origin Failed", 13));
+    CHECK_FALSE(buf_contains(response, response_len, "Response Read Deadline", 22));
+    REQUIRE_EQ(recv_timeout(client.fd, quiet, sizeof(quiet), 500), 0);
+
+    for (u32 waited = 0; waited < 800 && backend.request_count.load(std::memory_order_acquire) < 2;
+         waited++)
+        usleep(5000);
+    REQUIRE_EQ(backend.accepted_count.load(std::memory_order_acquire), 2u);
+    REQUIRE_EQ(backend.request_count.load(std::memory_order_acquire), 2u);
+    char expected_request_two[256]{};
+    const int expected_request_two_len =
+        snprintf(expected_request_two,
+                 sizeof(expected_request_two),
+                 "GET /buffered?initial-complete=close HTTP/1.1\r\n"
+                 "Host: 127.0.0.1:%u\r\n"
+                 "X-Test: initial-two\r\n\r\n",
+                 backend.port);
+    REQUIRE_GT(expected_request_two_len, 0);
+    REQUIRE_LT(expected_request_two_len, static_cast<int>(sizeof(expected_request_two)));
+    REQUIRE_GT(backend.request_recorded_ns[1].load(std::memory_order_acquire),
+               origin_one_closed_ns);
+    REQUIRE_EQ(backend.response_application_write_count[1].load(std::memory_order_acquire), 1u);
+    const u64 origin_two_write_completed_ns =
+        backend.response_last_application_write_completed_ns[1].load(std::memory_order_acquire);
+    const u64 origin_two_closed_ns =
+        backend.response_connection_closed_ns[1].load(std::memory_order_acquire);
+    REQUIRE_NE(origin_two_write_completed_ns, 0u);
+    REQUIRE_GE(origin_two_closed_ns, origin_two_write_completed_ns);
+
+    // Keep both actors live briefly so delayed retries or a third origin
+    // connection become observable. Then join both owners before reading their
+    // non-atomic history and the shard's single-writer accounting.
+    usleep(100000);
+    shard.stop();
+    shard.join();
+    shard_guard.spawned = false;
+    backend.teardown();
+
+    CHECK_EQ(shard.loop->active_count(), 0u);
+    CHECK_EQ(shard.upstream->idle_count.load(std::memory_order_acquire), 0u);
+    CHECK_EQ(shard.upstream->free_top, UpstreamPool::kMaxConns);
+    CHECK_EQ(shard.shard_metrics.connections_total, 1u);
+    CHECK_EQ(shard.shard_metrics.connections_active, 0u);
+    CHECK_EQ(shard.shard_metrics.connections_closed, 1u);
+    CHECK_EQ(shard.shard_metrics.requests_total, 2u);
+    CHECK_EQ(shard.shard_metrics.requests_active, 0u);
+    CHECK_EQ(backend.accepted_count.load(std::memory_order_acquire), 2u);
+    CHECK_EQ(backend.request_count.load(std::memory_order_acquire), 2u);
+    REQUIRE_EQ(backend.request_history_len[0], static_cast<u32>(expected_request_one_len));
+    REQUIRE_EQ(backend.request_history_header_len[0], static_cast<u32>(expected_request_one_len));
+    CHECK_EQ(memcmp(backend.request_history[0], expected_request_one, expected_request_one_len), 0);
+    REQUIRE_EQ(backend.request_history_len[1], static_cast<u32>(expected_request_two_len));
+    REQUIRE_EQ(backend.request_history_header_len[1], static_cast<u32>(expected_request_two_len));
+    CHECK_EQ(memcmp(backend.request_history[1], expected_request_two, expected_request_two_len), 0);
+    CHECK_EQ(backend.request_body_len, 0u);
+    REQUIRE_NE(backend.request_recorded_ns[0].load(std::memory_order_acquire), 0u);
+    REQUIRE_LE(backend.request_recorded_ns[0].load(std::memory_order_acquire),
+               origin_one_write_completed_ns);
+    REQUIRE_LE(backend.request_recorded_ns[1].load(std::memory_order_acquire),
+               origin_two_write_completed_ns);
+    for (u32 slot = 2; slot < RecordingUpstream::kMaxRecordedRequests; slot++) {
+        CHECK_EQ(backend.request_history_len[slot], 0u);
+        CHECK_EQ(backend.request_history_header_len[slot], 0u);
+        CHECK_EQ(backend.request_recorded_ns[slot].load(std::memory_order_acquire), 0u);
+        CHECK_EQ(backend.response_application_write_count[slot].load(std::memory_order_acquire),
+                 0u);
+        CHECK_EQ(backend.response_last_application_write_completed_ns[slot].load(
+                     std::memory_order_acquire),
+                 0u);
+        CHECK_EQ(backend.response_connection_closed_ns[slot].load(std::memory_order_acquire), 0u);
+        bool empty = true;
+        for (u32 i = 0; empty && i < RecordingUpstream::kRequestCapacity; i++)
+            empty = backend.request_history[slot][i] == '\0';
+        CHECK(empty);
     }
 }
 
