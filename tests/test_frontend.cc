@@ -34779,6 +34779,415 @@ route "/" {
     rir.destroy();
 }
 
+TEST(frontend, unmatched_local_response_metadata_reaches_rir_with_canonical_ids) {
+    const char source[] = R"rut(
+unmatched OPTIONS { return local_response({
+  version: "HTTP/1.1", status: 400, reason: "Bad Request", server: "rut",
+  date: "current", content_type: "text/html", connection: "request",
+  head_mode: "reject", body: b"options"
+}) }
+unmatched CONNECT { return local_response({
+  version: "HTTP/1.1", status: 405, reason: "Not Allowed", server: "rut",
+  date: "current", content_type: "text/plain", connection: "request",
+  head_mode: "reject", body: b"connect"
+}) }
+unmatched TRACE { return local_response({
+  version: "HTTP/1.1", status: 403, reason: "Forbidden", server: "rut",
+  date: "current", content_type: "text/plain", connection: "request",
+  head_mode: "suppress_body", body: b"trace"
+}) }
+unmatched { return local_response({
+  version: "HTTP/1.1", status: 404, reason: "Not Found", server: "rut",
+  date: "current", content_type: "text/plain", connection: "request",
+  head_mode: "suppress_body", body: b"A\x00\nB"
+}) }
+)rut";
+    auto lexed = lex(lit(source));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    REQUIRE_EQ(ast->items.len, 4u);
+    REQUIRE_EQ(ast->strict_local_response_policies.len, 4u);
+    CHECK_EQ(ast->items[0].unmatched.method_slot, kRouteMethodOptions);
+    CHECK_EQ(ast->items[0].unmatched.policy_id, 1u);
+    CHECK_EQ(ast->items[1].unmatched.method_slot, kRouteMethodConnect);
+    CHECK_EQ(ast->items[1].unmatched.policy_id, 2u);
+    CHECK_EQ(ast->items[2].unmatched.method_slot, kRouteMethodTrace);
+    CHECK_EQ(ast->items[2].unmatched.policy_id, 3u);
+    CHECK(ast->items[3].unmatched.method_is_any);
+    CHECK_EQ(ast->items[3].unmatched.policy_id, 4u);
+    CHECK_EQ(ast->unmatched_policy_ids[kRouteMethodAny], 4u);
+    CHECK_EQ(ast->unmatched_policy_ids[kRouteMethodOptions], 1u);
+    CHECK_EQ(ast->unmatched_policy_ids[kRouteMethodConnect], 2u);
+    CHECK_EQ(ast->unmatched_policy_ids[kRouteMethodTrace], 3u);
+
+    auto ast_copy = std::make_unique<AstFile>(ast.value());
+    REQUIRE_EQ(ast_copy->strict_local_response_policies[3].body.len, 4u);
+    CHECK(ast_copy->strict_local_response_policies[3].body.ptr !=
+          ast->strict_local_response_policies[3].body.ptr);
+    CHECK(static_cast<u8>(ast_copy->strict_local_response_policies[3].body.ptr[1]) == 0);
+
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    REQUIRE_EQ(hir->strict_local_response_policies.len, 4u);
+    CHECK_EQ(hir->unmatched_policy_ids[kRouteMethodConnect], 2u);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    REQUIRE_EQ(mir->strict_local_response_policies.len, 4u);
+    CHECK_EQ(mir->unmatched_policy_ids[kRouteMethodTrace], 3u);
+
+    FrontendRirModule lowered{};
+    REQUIRE(lower_to_rir(mir.value(), lowered));
+    REQUIRE(rir::verify_module(lowered.module).ok);
+    REQUIRE_EQ(lowered.module.strict_local_response_policy_count, 4u);
+    CHECK_EQ(lowered.module.unmatched_policy_ids[kRouteMethodAny], 4u);
+    CHECK_EQ(lowered.module.unmatched_policy_ids[kRouteMethodConnect], 2u);
+    CHECK(lowered.module.strict_local_response_policies[0].reason.eq(lit("Bad Request")));
+    const Str body = lowered.module.strict_local_response_policies[3].body;
+    REQUIRE_EQ(body.len, 4u);
+    CHECK(static_cast<u8>(body.ptr[0]) == 'A');
+    CHECK(static_cast<u8>(body.ptr[1]) == 0);
+    CHECK(body.ptr[2] == '\n');
+    CHECK(static_cast<u8>(body.ptr[3]) == 'B');
+
+    char output[4096];
+    rir::PrintBuf buf;
+    buf.init(output, sizeof(output), -1);
+    rir::print_module(buf, lowered.module);
+    CHECK_FALSE(buf.overflow);
+    const std::string printed(buf.data, buf.len);
+    const std::string expected =
+        "strict_local_response_policies: 4\n"
+        "  local_response#1: version=HTTP/1.1, status=400, reason=\"Bad Request\", "
+        "server=\"rut\", content_type=\"text/html\", date=current, connection=request, "
+        "head_mode=reject, body=b\"options\" (len=7)\n"
+        "  local_response#2: version=HTTP/1.1, status=405, reason=\"Not Allowed\", "
+        "server=\"rut\", content_type=\"text/plain\", date=current, connection=request, "
+        "head_mode=reject, body=b\"connect\" (len=7)\n"
+        "  local_response#3: version=HTTP/1.1, status=403, reason=\"Forbidden\", "
+        "server=\"rut\", content_type=\"text/plain\", date=current, connection=request, "
+        "head_mode=suppress_body, body=b\"trace\" (len=5)\n"
+        "  local_response#4: version=HTTP/1.1, status=404, reason=\"Not Found\", "
+        "server=\"rut\", content_type=\"text/plain\", date=current, connection=request, "
+        "head_mode=suppress_body, body=b\"A\\x00\\nB\" (len=4)\n"
+        "unmatched:\n"
+        "  ANY -> local_response#4\n"
+        "  OPTIONS -> local_response#1\n"
+        "  CONNECT -> local_response#2\n"
+        "  TRACE -> local_response#3\n";
+    CHECK(printed == expected);
+    lowered.destroy();
+}
+
+TEST(frontend, strict_local_response_ast_copy_move_owns_nonempty_and_empty_bodies) {
+    const char source[] = R"rut(
+unmatched OPTIONS { return local_response({
+  version: "HTTP/1.1", status: 400, reason: "Bad Request", server: "rut",
+  date: "current", content_type: "text/plain", connection: "request",
+  head_mode: "reject", body: b"A\x00B"
+}) }
+unmatched CONNECT { return local_response({
+  version: "HTTP/1.1", status: 405, reason: "Not Allowed", server: "rut",
+  date: "current", content_type: "text/plain", connection: "request",
+  head_mode: "reject", body: b""
+}) }
+)rut";
+    auto lexed = lex(lit(source));
+    REQUIRE(lexed);
+    auto original = parse_file_heap(lexed.value());
+    REQUIRE(original);
+
+    auto check_owned = [&](const AstFile& file, const AstFile& stale_source) {
+        REQUIRE_EQ(file.strict_local_response_policies.len, 2u);
+        REQUIRE_EQ(file.strict_local_response_body_pool.len, 3u);
+        const Str nonempty = file.strict_local_response_policies[0].body;
+        const Str empty = file.strict_local_response_policies[1].body;
+        REQUIRE_EQ(nonempty.len, 3u);
+        REQUIRE_EQ(empty.len, 0u);
+        CHECK(nonempty.ptr ==
+              reinterpret_cast<const char*>(&file.strict_local_response_body_pool.data[0]));
+        CHECK(empty.ptr ==
+              reinterpret_cast<const char*>(&file.strict_local_response_body_pool.data[3]));
+        CHECK(nonempty.ptr != stale_source.strict_local_response_policies[0].body.ptr);
+        CHECK(empty.ptr != stale_source.strict_local_response_policies[1].body.ptr);
+        CHECK(static_cast<u8>(nonempty.ptr[0]) == 'A');
+        CHECK(static_cast<u8>(nonempty.ptr[1]) == 0);
+        CHECK(static_cast<u8>(nonempty.ptr[2]) == 'B');
+    };
+
+    auto copy_constructed = std::make_unique<AstFile>(original.value());
+    check_owned(*copy_constructed, original.value());
+
+    const AstFile& copy_source = *copy_constructed;
+    auto move_constructed = std::make_unique<AstFile>(std::move(*copy_constructed));
+    check_owned(*move_constructed, copy_source);
+    check_owned(*move_constructed, original.value());
+
+    auto copy_assigned = std::make_unique<AstFile>();
+    *copy_assigned = original.value();
+    check_owned(*copy_assigned, original.value());
+
+    const AstFile& assignment_source = *copy_assigned;
+    auto move_assigned = std::make_unique<AstFile>();
+    *move_assigned = std::move(*copy_assigned);
+    check_owned(*move_assigned, assignment_source);
+    check_owned(*move_assigned, original.value());
+}
+
+TEST(frontend, strict_local_response_body_parse_failures_are_transactional) {
+    const char source[] = R"rut(unmatched OPTIONS { return local_response({
+      version: "HTTP/1.1", status: 400, reason: "Bad Request", server: "rut",
+      date: "current", content_type: "text/plain", connection: "request",
+      head_mode: "reject", body: b"ok"
+    }) })rut";
+    auto lexed_result = lex(lit(source));
+    REQUIRE(lexed_result);
+    auto& tokens = lexed_result.value().tokens;
+    u32 body_token = tokens.len;
+    u32 final_rparen = tokens.len;
+    for (u32 i = 0; i < tokens.len; i++) {
+        if (tokens[i].type == TokenType::StringLit && tokens[i].text.eq(lit("ok"))) body_token = i;
+        if (tokens[i].type == TokenType::RParen) final_rparen = i;
+    }
+    REQUIRE(body_token < tokens.len);
+    REQUIRE(final_rparen < tokens.len);
+    const Token original_body = tokens[body_token];
+    const Token original_rparen = tokens[final_rparen];
+
+    const char escape_at_end[] = {'a', '\\'};
+    const char short_hex[] = {'\\', 'x'};
+    const char short_hex_digit[] = {'\\', 'x', '0'};
+    const char invalid_hex[] = {'\\', 'x', '0', 'g'};
+    const char unknown_escape[] = {'\\', 'q'};
+    const Str malformed[] = {
+        {escape_at_end, sizeof(escape_at_end)},
+        {short_hex, sizeof(short_hex)},
+        {short_hex_digit, sizeof(short_hex_digit)},
+        {invalid_hex, sizeof(invalid_hex)},
+        {unknown_escape, sizeof(unknown_escape)},
+    };
+    auto check_valid_after_failure = [&]() {
+        tokens[body_token] = original_body;
+        tokens[final_rparen] = original_rparen;
+        auto parsed = parse_file_heap(lexed_result.value());
+        REQUIRE(parsed);
+        REQUIRE_EQ(parsed->strict_local_response_body_pool.len, 2u);
+        REQUIRE_EQ(parsed->strict_local_response_policies.len, 1u);
+        CHECK_EQ(parsed->unmatched_policy_ids[kRouteMethodOptions], 1u);
+        CHECK(parsed->strict_local_response_policies[0].body.eq(lit("ok")));
+    };
+    for (const Str raw : malformed) {
+        tokens[body_token].text = raw;
+        CHECK_FALSE(parse_file_heap(lexed_result.value()).has_value());
+        check_valid_after_failure();
+    }
+
+    // The body is allocated before this forged closing token is consumed.
+    // The declaration must still fail, and the same token stream must then
+    // parse to exactly one policy/ID after the token is restored.
+    tokens[final_rparen].type = TokenType::Ident;
+    CHECK_FALSE(parse_file_heap(lexed_result.value()).has_value());
+    check_valid_after_failure();
+}
+
+TEST(frontend, unmatched_connect_trace_are_contextual_and_source_shape_is_strict) {
+    const char identifiers[] =
+        "func CONNECT() -> i32 => 1\n"
+        "func TRACE() -> i32 => 2\n";
+    auto lexed = lex(lit(identifiers));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    REQUIRE_EQ(ast->items.len, 2u);
+    CHECK(ast->items[0].func.name.eq(lit("CONNECT")));
+    CHECK(ast->items[1].func.name.eq(lit("TRACE")));
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    REQUIRE_EQ(hir->functions.len, 2u);
+    CHECK(hir->functions[0].name.eq(lit("CONNECT")));
+    CHECK(hir->functions[1].name.eq(lit("TRACE")));
+
+    const char* invalid[] = {
+        "unmatched FOO { return local_response({}) }\n",
+        "unmatched ANY { return local_response({}) }\n",
+        "unmatched OPTIONS { return 400 }\n",
+        "unmatched OPTIONS { return local_response({}) return 500 }\n",
+    };
+    for (const char* source : invalid) {
+        auto bad_lexed = lex(lit(source));
+        REQUIRE(bad_lexed);
+        CHECK_FALSE(parse_file_heap(bad_lexed.value()).has_value());
+    }
+}
+
+TEST(frontend, unmatched_local_response_rejects_fields_selectors_and_aggregate_overflow) {
+    const std::string prefix =
+        "unmatched OPTIONS { return local_response({ version: \"HTTP/1.1\", status: 400, "
+        "reason: \"Bad Request\", server: \"rut\", date: \"current\", content_type: "
+        "\"text/plain\", connection: \"request\", head_mode: \"reject\", body: b\"x\"";
+    const std::string suffix = " }) }\n";
+    auto replace_once = [](std::string value, const char* from, const char* to) {
+        const auto pos = value.find(from);
+        if (pos != std::string::npos) value.replace(pos, std::char_traits<char>::length(from), to);
+        return value;
+    };
+    const std::string bad_version = replace_once(prefix + suffix, "HTTP/1.1", "HTTP/1.0");
+    const std::string bad_date = replace_once(prefix + suffix, "current", "static");
+    const std::string bad_connection = replace_once(prefix + suffix, "request", "close");
+    const std::string bad_head = replace_once(prefix + suffix, "reject", "invalid");
+    const std::string invalid[] = {
+        prefix + ", status: 401" + suffix,
+        prefix + ", extra: \"x\"" + suffix,
+        "unmatched OPTIONS { return local_response({ version: \"HTTP/1.1\", status: 399, "
+        "reason: \"Bad Request\", server: \"rut\", date: \"current\", content_type: "
+        "\"text/plain\", connection: \"request\", head_mode: \"reject\", body: b\"x\" }) }",
+        "unmatched OPTIONS { return local_response({ version: \"HTTP/1.1\", status: 600, "
+        "reason: \"Bad Request\", server: \"rut\", date: \"current\", content_type: "
+        "\"text/plain\", connection: \"request\", head_mode: \"reject\", body: b\"x\" }) }",
+        "unmatched { return local_response({ version: \"HTTP/1.1\", status: 400, reason: "
+        "\"Bad Request\", server: \"rut\", date: \"current\", content_type: "
+        "\"text/plain\", connection: \"request\", head_mode: \"reject\", body: b\"x\" }) }",
+        "unmatched HEAD { return local_response({ version: \"HTTP/1.1\", status: 400, reason: "
+        "\"Bad Request\", server: \"rut\", date: \"current\", content_type: "
+        "\"text/plain\", connection: \"request\", head_mode: \"reject\", body: b\"x\" }) }",
+        prefix + suffix + prefix + suffix,
+        bad_version,
+        bad_date,
+        bad_connection,
+        bad_head,
+    };
+    for (const auto& source : invalid) {
+        auto bad_lexed = lex({source.data(), static_cast<u32>(source.size())});
+        REQUIRE(bad_lexed);
+        CHECK_FALSE(parse_file_heap(bad_lexed.value()).has_value());
+    }
+
+    std::string aggregate;
+    const char* methods[] = {"OPTIONS", "CONNECT"};
+    for (const char* method : methods) {
+        aggregate += "unmatched ";
+        aggregate += method;
+        aggregate +=
+            " { return local_response({ version: \"HTTP/1.1\", status: 400, reason: \"r\", "
+            "server: \"s\", date: \"current\", content_type: \"t\", connection: \"request\", "
+            "head_mode: \"reject\", body: b\"";
+        aggregate.append(kMaxStrictLocalResponseBodyLen, 'x');
+        aggregate += "\" }) }\n";
+    }
+    auto aggregate_lexed = lex({aggregate.data(), static_cast<u32>(aggregate.size())});
+    REQUIRE(aggregate_lexed);
+    CHECK_FALSE(parse_file_heap(aggregate_lexed.value()).has_value());
+}
+
+TEST(frontend, strict_local_response_policy_bounds_and_forged_compiler_metadata_reject) {
+    std::string reason(kMaxStrictLocalResponseReasonLen, 'r');
+    std::string type(kMaxStrictLocalResponseContentTypeLen, 't');
+    std::string server(kMaxStrictLocalResponseServerLen, 's');
+    std::string body(kMaxStrictLocalResponseBodyLen, '\0');
+    StrictLocalResponsePolicySpec policy{};
+    policy.version = StrictLocalResponseVersion::Http11;
+    policy.status_code = 400;
+    policy.date = StrictLocalResponseDate::Current;
+    policy.connection = StrictLocalResponseConnection::Request;
+    policy.head_mode = StrictLocalResponseHeadMode::SuppressBody;
+    policy.reason = {reason.data(), static_cast<u32>(reason.size())};
+    policy.content_type = {type.data(), static_cast<u32>(type.size())};
+    policy.server = {server.data(), static_cast<u32>(server.size())};
+    policy.body = {body.data(), static_cast<u32>(body.size())};
+    CHECK(strict_local_response_policy_spec_valid(policy));
+    policy.status_code = 599;
+    CHECK(strict_local_response_policy_spec_valid(policy));
+    policy.status_code = 399;
+    CHECK_FALSE(strict_local_response_policy_spec_valid(policy));
+    policy.status_code = 600;
+    CHECK_FALSE(strict_local_response_policy_spec_valid(policy));
+    policy.status_code = 400;
+    reason.push_back('r');
+    policy.reason = {reason.data(), static_cast<u32>(reason.size())};
+    CHECK_FALSE(strict_local_response_policy_spec_valid(policy));
+    reason.pop_back();
+    policy.reason = {reason.data(), static_cast<u32>(reason.size())};
+    type.push_back('t');
+    policy.content_type = {type.data(), static_cast<u32>(type.size())};
+    CHECK_FALSE(strict_local_response_policy_spec_valid(policy));
+    type.pop_back();
+    policy.content_type = {type.data(), static_cast<u32>(type.size())};
+    server.push_back('s');
+    policy.server = {server.data(), static_cast<u32>(server.size())};
+    CHECK_FALSE(strict_local_response_policy_spec_valid(policy));
+    server.pop_back();
+    policy.server = {server.data(), static_cast<u32>(server.size())};
+    body.push_back('x');
+    policy.body = {body.data(), static_cast<u32>(body.size())};
+    CHECK_FALSE(strict_local_response_policy_spec_valid(policy));
+    body.pop_back();
+    policy.body = {body.data(), static_cast<u32>(body.size())};
+    reason[0] = '\r';
+    CHECK_FALSE(strict_local_response_policy_spec_valid(policy));
+    reason[0] = 'r';
+    policy.reason = {reason.data(), 0};
+    CHECK_FALSE(strict_local_response_policy_spec_valid(policy));
+    policy.reason = {reason.data(), static_cast<u32>(reason.size())};
+    policy.content_type = {type.data(), 0};
+    CHECK_FALSE(strict_local_response_policy_spec_valid(policy));
+    policy.content_type = {type.data(), static_cast<u32>(type.size())};
+    type[0] = '\r';
+    CHECK_FALSE(strict_local_response_policy_spec_valid(policy));
+    type[0] = 't';
+    policy.server = {server.data(), 0};
+    CHECK_FALSE(strict_local_response_policy_spec_valid(policy));
+    policy.server = {server.data(), static_cast<u32>(server.size())};
+    policy.body = {};
+    CHECK(strict_local_response_policy_spec_valid(policy));
+    policy.body = {body.data(), static_cast<u32>(body.size())};
+    policy.version = StrictLocalResponseVersion::Invalid;
+    CHECK_FALSE(strict_local_response_policy_spec_valid(policy));
+    policy.version = StrictLocalResponseVersion::Http11;
+    policy.date = StrictLocalResponseDate::Invalid;
+    CHECK_FALSE(strict_local_response_policy_spec_valid(policy));
+    policy.date = StrictLocalResponseDate::Current;
+    policy.connection = StrictLocalResponseConnection::Invalid;
+    CHECK_FALSE(strict_local_response_policy_spec_valid(policy));
+    policy.connection = StrictLocalResponseConnection::Request;
+    policy.head_mode = StrictLocalResponseHeadMode::Invalid;
+    CHECK_FALSE(strict_local_response_policy_spec_valid(policy));
+
+    const char valid[] = R"rut(unmatched OPTIONS { return local_response({
+      version: "HTTP/1.1", status: 400, reason: "Bad Request", server: "rut",
+      date: "current", content_type: "text/plain", connection: "request",
+      head_mode: "reject", body: b"x"
+    }) })rut";
+    auto valid_lexed = lex(lit(valid));
+    REQUIRE(valid_lexed);
+    auto ast = parse_file_heap(valid_lexed.value());
+    REQUIRE(ast);
+    ast->unmatched_policy_ids[kRouteMethodOptions] = 2;
+    CHECK_FALSE(analyze_file_heap(ast.value()).has_value());
+    ast->unmatched_policy_ids[kRouteMethodOptions] = 1;
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    hir->unmatched_policy_ids[kRouteMethodConnect] = 1;
+    CHECK_FALSE(build_mir_heap(hir.value()).has_value());
+}
+
+TEST(frontend, imported_unmatched_declaration_is_rejected) {
+    const std::string dir = "/tmp/rut_import_unmatched_frontend";
+    std::filesystem::create_directories(dir);
+    {
+        std::ofstream out(dir + "/fallback.rut", std::ios::binary);
+        out << "unmatched OPTIONS { return local_response({ version: \"HTTP/1.1\", status: 400, "
+               "reason: \"Bad Request\", server: \"rut\", date: \"current\", content_type: "
+               "\"text/plain\", connection: \"request\", head_mode: \"reject\", body: b\"x\" "
+               "}) }\n";
+    }
+    const char main_source[] = "import \"fallback.rut\"\nroute GET \"/\" { return 200 }\n";
+    auto lexed = lex(lit(main_source));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    CHECK_FALSE(analyze_file_heap_with_path(ast.value(), dir + "/main.rut").has_value());
+}
+
 int main(int argc, char** argv) {
     return rut::test::run_all(argc, argv);
 }

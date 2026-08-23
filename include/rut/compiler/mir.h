@@ -6,6 +6,7 @@
 #include "rut/common/redirect_policy.h"
 #include "rut/common/request_policy.h"
 #include "rut/common/response_policy.h"
+#include "rut/common/strict_local_response.h"
 #include "rut/common/types.h"
 #include "rut/common/wait_limits.h"
 #include "rut/compiler/ast.h"
@@ -513,6 +514,9 @@ struct MirModule {
     FixedVec<MirUpstream, kMaxUpstreams> upstreams;
     FixedVec<ForwardResponsePolicySpec, kMaxResponsePolicies> response_policies;
     FixedVec<ForwardFailurePolicySpec, kMaxForwardFailurePolicies> failure_policies;
+    FixedVec<StrictLocalResponsePolicySpec, kMaxStrictLocalResponsePolicies>
+        strict_local_response_policies;
+    u16 unmatched_policy_ids[kStrictLocalResponseMethodSlots]{};
     FixedVec<RedirectPolicySpec, kMaxRedirectPolicies> redirect_policies;
     FixedVec<MirCacheInstance, kMaxCaches> caches;
     FixedVec<MirStruct, kMaxStructs> structs;
@@ -525,17 +529,24 @@ struct MirModule {
         : upstreams(other.upstreams),
           response_policies(other.response_policies),
           failure_policies(other.failure_policies),
+          strict_local_response_policies(other.strict_local_response_policies),
           redirect_policies(other.redirect_policies),
           caches(other.caches),
           structs(other.structs),
           variants(other.variants),
           functions(other.functions),
-          type_shapes(other.type_shapes) {}
+          type_shapes(other.type_shapes) {
+        for (u32 i = 0; i < kStrictLocalResponseMethodSlots; i++)
+            unmatched_policy_ids[i] = other.unmatched_policy_ids[i];
+    }
     MirModule& operator=(const MirModule& other) {
         if (this == &other) return *this;
         upstreams = other.upstreams;
         response_policies = other.response_policies;
         failure_policies = other.failure_policies;
+        strict_local_response_policies = other.strict_local_response_policies;
+        for (u32 i = 0; i < kStrictLocalResponseMethodSlots; i++)
+            unmatched_policy_ids[i] = other.unmatched_policy_ids[i];
         redirect_policies = other.redirect_policies;
         caches = other.caches;
         structs = other.structs;
@@ -548,17 +559,24 @@ struct MirModule {
         : upstreams(other.upstreams),
           response_policies(other.response_policies),
           failure_policies(other.failure_policies),
+          strict_local_response_policies(other.strict_local_response_policies),
           redirect_policies(other.redirect_policies),
           caches(other.caches),
           structs(other.structs),
           variants(other.variants),
           functions(other.functions),
-          type_shapes(other.type_shapes) {}
+          type_shapes(other.type_shapes) {
+        for (u32 i = 0; i < kStrictLocalResponseMethodSlots; i++)
+            unmatched_policy_ids[i] = other.unmatched_policy_ids[i];
+    }
     MirModule& operator=(MirModule&& other) noexcept {
         if (this == &other) return *this;
         upstreams = other.upstreams;
         response_policies = other.response_policies;
         failure_policies = other.failure_policies;
+        strict_local_response_policies = other.strict_local_response_policies;
+        for (u32 i = 0; i < kStrictLocalResponseMethodSlots; i++)
+            unmatched_policy_ids[i] = other.unmatched_policy_ids[i];
         redirect_policies = other.redirect_policies;
         caches = other.caches;
         structs = other.structs;

@@ -3406,6 +3406,27 @@ FrontendResult<void> lower_to_rir(const MirModule& mir, FrontendRirModule& out) 
     }
     out.module.failure_policy_count = mir.failure_policies.len;
 
+    if (!strict_local_response_policy_table_valid(mir.strict_local_response_policies.data,
+                                                  mir.strict_local_response_policies.len,
+                                                  mir.unmatched_policy_ids))
+        return frontend_error(FrontendError::UnsupportedSyntax);
+    for (u32 i = 0; i < mir.strict_local_response_policies.len; i++) {
+        const auto& src = mir.strict_local_response_policies[i];
+        auto& dst = out.module.strict_local_response_policies[i];
+        dst.version = src.version;
+        dst.status_code = src.status_code;
+        dst.date = src.date;
+        dst.connection = src.connection;
+        dst.head_mode = src.head_mode;
+        if (!copy_policy_str(src.reason, dst.reason) ||
+            !copy_policy_str(src.content_type, dst.content_type) ||
+            !copy_policy_str(src.server, dst.server) || !copy_policy_str(src.body, dst.body))
+            return frontend_error(FrontendError::OutOfMemory);
+    }
+    out.module.strict_local_response_policy_count = mir.strict_local_response_policies.len;
+    for (u32 i = 0; i < kStrictLocalResponseMethodSlots; i++)
+        out.module.unmatched_policy_ids[i] = mir.unmatched_policy_ids[i];
+
     if (mir.redirect_policies.len > kMaxRedirectPolicies)
         return frontend_error(FrontendError::TooManyItems);
     for (u32 i = 0; i < mir.redirect_policies.len; i++) {

@@ -5,6 +5,7 @@
 #include "rut/common/redirect_policy.h"
 #include "rut/common/request_policy.h"
 #include "rut/common/response_policy.h"
+#include "rut/common/strict_local_response.h"
 #include "rut/common/types.h"
 #include "rut/common/wait_limits.h"
 #include "rut/compiler/ast.h"
@@ -1393,6 +1394,9 @@ struct HirModule {
     FixedVec<HirUpstream, kMaxUpstreams> upstreams;
     FixedVec<ForwardResponsePolicySpec, kMaxResponsePolicies> response_policies;
     FixedVec<ForwardFailurePolicySpec, kMaxForwardFailurePolicies> failure_policies;
+    FixedVec<StrictLocalResponsePolicySpec, kMaxStrictLocalResponsePolicies>
+        strict_local_response_policies;
+    u16 unmatched_policy_ids[kStrictLocalResponseMethodSlots]{};
     FixedVec<RedirectPolicySpec, kMaxRedirectPolicies> redirect_policies;
     bool has_listener = false;
     HirListener listener{};
@@ -1421,6 +1425,7 @@ struct HirModule {
         : upstreams(other.upstreams),
           response_policies(other.response_policies),
           failure_policies(other.failure_policies),
+          strict_local_response_policies(other.strict_local_response_policies),
           redirect_policies(other.redirect_policies),
           has_listener(other.has_listener),
           listener(other.listener),
@@ -1442,6 +1447,8 @@ struct HirModule {
           has_package_decl(other.has_package_decl),
           package_span(other.package_span),
           package_name(other.package_name) {
+        for (u32 i = 0; i < kStrictLocalResponseMethodSlots; i++)
+            unmatched_policy_ids[i] = other.unmatched_policy_ids[i];
         rebase_type_alias_storage_ptrs(other);
     }
     HirModule& operator=(const HirModule& other) {
@@ -1449,6 +1456,9 @@ struct HirModule {
         upstreams = other.upstreams;
         response_policies = other.response_policies;
         failure_policies = other.failure_policies;
+        strict_local_response_policies = other.strict_local_response_policies;
+        for (u32 i = 0; i < kStrictLocalResponseMethodSlots; i++)
+            unmatched_policy_ids[i] = other.unmatched_policy_ids[i];
         redirect_policies = other.redirect_policies;
         has_listener = other.has_listener;
         listener = other.listener;

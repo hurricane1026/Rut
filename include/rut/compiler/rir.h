@@ -6,6 +6,7 @@
 #include "rut/common/rate_limit_key_spec.h"
 #include "rut/common/redirect_policy.h"
 #include "rut/common/response_policy.h"
+#include "rut/common/strict_local_response.h"
 #include "rut/common/types.h"
 #include "rut/runtime/arena.h"
 
@@ -487,6 +488,12 @@ struct Module {
     u32 failure_policy_count = 0;
     ForwardPolicyBundle policy_bundles[kMaxForwardFailurePolicies]{};
     u32 policy_bundle_count = 0;
+
+    // Program-scoped strict local responses for route misses. IDs are 1-based;
+    // zero in a canonical method slot means no configured action.
+    StrictLocalResponsePolicySpec strict_local_response_policies[kMaxStrictLocalResponsePolicies]{};
+    u32 strict_local_response_policy_count = 0;
+    u16 unmatched_policy_ids[kStrictLocalResponseMethodSlots]{};
 
     // Foundation-only target transforms. Strings are borrowed by the RIR module
     // and copied into RouteConfig during activation; no runtime materializer

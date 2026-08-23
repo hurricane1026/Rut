@@ -12879,6 +12879,10 @@ static FrontendResult<void> load_imported_modules(
             return frontend_error(FrontendError::UnsupportedSyntax,
                                   item.import_decl.span,
                                   lit_str("listen declarations must be in the main source"));
+        if (imported_module->strict_local_response_policies.len != 0)
+            return frontend_error(FrontendError::UnsupportedSyntax,
+                                  item.import_decl.span,
+                                  lit_str("unmatched declarations must be in the main source"));
         imported_storage.push_back(std::move(imported_module));
         ImportedModuleInfo info{};
         info.span = item.import_decl.span;
@@ -14674,6 +14678,37 @@ static FrontendResult<HirModule*> analyze_file_internal(
             !mod.failure_policies.push(file.failure_policies[i]))
             return frontend_error(FrontendError::UnsupportedSyntax, {});
     }
+    static_assert(kRouteMethodSlots == kStrictLocalResponseMethodSlots);
+    if (!strict_local_response_policy_table_valid(file.strict_local_response_policies.data,
+                                                  file.strict_local_response_policies.len,
+                                                  file.unmatched_policy_ids))
+        return frontend_error(FrontendError::UnsupportedSyntax, {});
+    bool unmatched_slots_seen[kStrictLocalResponseMethodSlots]{};
+    u32 unmatched_item_count = 0;
+    for (u32 i = 0; i < file.items.len; i++) {
+        const auto& item = file.items[i];
+        if (item.kind != AstItemKind::Unmatched) continue;
+        const u32 slot = item.unmatched.method_slot;
+        if (slot >= kStrictLocalResponseMethodSlots || unmatched_slots_seen[slot] ||
+            item.unmatched.policy_id == 0 ||
+            item.unmatched.policy_id != file.unmatched_policy_ids[slot] ||
+            item.unmatched.method_is_any != (slot == kRouteMethodAny))
+            return frontend_error(FrontendError::UnsupportedSyntax, item.unmatched.span);
+        const auto& policy = file.strict_local_response_policies[item.unmatched.policy_id - 1];
+        if ((slot == kRouteMethodAny || slot == kRouteMethodHead) &&
+            policy.head_mode != StrictLocalResponseHeadMode::SuppressBody)
+            return frontend_error(FrontendError::UnsupportedSyntax, item.unmatched.span);
+        unmatched_slots_seen[slot] = true;
+        unmatched_item_count++;
+    }
+    if (unmatched_item_count != file.strict_local_response_policies.len)
+        return frontend_error(FrontendError::UnsupportedSyntax, {});
+    for (u32 i = 0; i < file.strict_local_response_policies.len; i++) {
+        if (!mod.strict_local_response_policies.push(file.strict_local_response_policies[i]))
+            return frontend_error(FrontendError::TooManyItems, {});
+    }
+    for (u32 i = 0; i < kStrictLocalResponseMethodSlots; i++)
+        mod.unmatched_policy_ids[i] = file.unmatched_policy_ids[i];
     if (file.redirect_policies.len > kMaxRedirectPolicies)
         return frontend_error(FrontendError::TooManyItems, {});
     for (u32 i = 0; i < file.redirect_policies.len; i++) {

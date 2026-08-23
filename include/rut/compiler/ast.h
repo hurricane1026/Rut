@@ -6,6 +6,7 @@
 #include "rut/common/redirect_policy.h"
 #include "rut/common/request_policy.h"
 #include "rut/common/response_policy.h"
+#include "rut/common/strict_local_response.h"
 #include "rut/common/types.h"
 #include "rut/compiler/diagnostic.h"
 
@@ -24,6 +25,7 @@ enum class AstItemKind : u8 {
     Impl,
     Chain,
     Route,
+    Unmatched,
     Timer,
     // Top-level `let <name> = <expr>` — state declaration (currently only
     // `Cache<IP, i64>(capacity: N)` inits are accepted; analyze validates).
@@ -569,6 +571,14 @@ struct AstRouteDecl {
     FixedVec<AstChainUse, kMaxChains> chains;
 };
 
+struct AstUnmatchedDecl {
+    Span span{};
+    bool method_is_any = false;
+    u8 method = 0;
+    u8 method_slot = 0;
+    u16 policy_id = 0;
+};
+
 // Background periodic task: `timer name, every: <duration> { <body> }`. The body
 // compiles to a no-request/no-response state-machine handler the shard event loop
 // fires every interval. (slice 1: `shard:` selector deferred — runs every shard.)
@@ -608,6 +618,7 @@ struct AstItem {
     AstImplDecl impl_decl{};
     AstChainDecl chain{};
     AstRouteDecl route{};
+    AstUnmatchedDecl unmatched{};
     AstTimerDecl timer{};
 };
 
@@ -625,6 +636,7 @@ struct AstFile {
     static constexpr u32 kMaxTypePool = 256;
     static constexpr u32 kFailurePolicyBodyPoolBytes =
         kMaxForwardFailurePolicies * kMaxFailurePolicyBodyLen;
+    static constexpr u32 kStrictLocalResponseBodyPoolBytes = kMaxStrictLocalResponsePolicyBytes;
     static constexpr u32 kRedirectPolicyBodyPoolBytes = kMaxRedirectPolicies * kMaxRedirectBodyLen;
     FixedVec<AstItem, kMaxItems> items;
     FixedVec<AstExpr, kMaxExprPool> expr_pool;
@@ -633,6 +645,10 @@ struct AstFile {
     FixedVec<ForwardResponsePolicySpec, kMaxResponsePolicies> response_policies;
     FixedVec<ForwardFailurePolicySpec, kMaxForwardFailurePolicies> failure_policies;
     FixedVec<u8, kFailurePolicyBodyPoolBytes> failure_policy_body_pool;
+    FixedVec<StrictLocalResponsePolicySpec, kMaxStrictLocalResponsePolicies>
+        strict_local_response_policies;
+    u16 unmatched_policy_ids[kStrictLocalResponseMethodSlots]{};
+    FixedVec<u8, kStrictLocalResponseBodyPoolBytes> strict_local_response_body_pool;
     FixedVec<RedirectPolicySpec, kMaxRedirectPolicies> redirect_policies;
     FixedVec<u8, kRedirectPolicyBodyPoolBytes> redirect_policy_body_pool;
     bool has_package_decl = false;
@@ -648,8 +664,12 @@ struct AstFile {
           response_policies(other.response_policies),
           failure_policies(other.failure_policies),
           failure_policy_body_pool(other.failure_policy_body_pool),
+          strict_local_response_policies(other.strict_local_response_policies),
+          strict_local_response_body_pool(other.strict_local_response_body_pool),
           redirect_policies(other.redirect_policies),
           redirect_policy_body_pool(other.redirect_policy_body_pool) {
+        for (u32 i = 0; i < kStrictLocalResponseMethodSlots; i++)
+            unmatched_policy_ids[i] = other.unmatched_policy_ids[i];
         rebase_from(other);
     }
     AstFile& operator=(const AstFile& other) {
@@ -661,6 +681,10 @@ struct AstFile {
         response_policies = other.response_policies;
         failure_policies = other.failure_policies;
         failure_policy_body_pool = other.failure_policy_body_pool;
+        strict_local_response_policies = other.strict_local_response_policies;
+        strict_local_response_body_pool = other.strict_local_response_body_pool;
+        for (u32 i = 0; i < kStrictLocalResponseMethodSlots; i++)
+            unmatched_policy_ids[i] = other.unmatched_policy_ids[i];
         redirect_policies = other.redirect_policies;
         redirect_policy_body_pool = other.redirect_policy_body_pool;
         rebase_from(other);
@@ -674,8 +698,12 @@ struct AstFile {
           response_policies(other.response_policies),
           failure_policies(other.failure_policies),
           failure_policy_body_pool(other.failure_policy_body_pool),
+          strict_local_response_policies(other.strict_local_response_policies),
+          strict_local_response_body_pool(other.strict_local_response_body_pool),
           redirect_policies(other.redirect_policies),
           redirect_policy_body_pool(other.redirect_policy_body_pool) {
+        for (u32 i = 0; i < kStrictLocalResponseMethodSlots; i++)
+            unmatched_policy_ids[i] = other.unmatched_policy_ids[i];
         rebase_from(other);
     }
     AstFile& operator=(AstFile&& other) noexcept {
@@ -687,6 +715,10 @@ struct AstFile {
         response_policies = other.response_policies;
         failure_policies = other.failure_policies;
         failure_policy_body_pool = other.failure_policy_body_pool;
+        strict_local_response_policies = other.strict_local_response_policies;
+        strict_local_response_body_pool = other.strict_local_response_body_pool;
+        for (u32 i = 0; i < kStrictLocalResponseMethodSlots; i++)
+            unmatched_policy_ids[i] = other.unmatched_policy_ids[i];
         redirect_policies = other.redirect_policies;
         redirect_policy_body_pool = other.redirect_policy_body_pool;
         rebase_from(other);
@@ -722,6 +754,41 @@ struct AstFile {
         }
         out = {reinterpret_cast<const char*>(&failure_policy_body_pool.data[start]), len};
         return true;
+    }
+
+    bool add_strict_local_response_body(const u8* bytes, u32 len, Str& out) {
+        if ((bytes == nullptr && len != 0) || len > kMaxStrictLocalResponseBodyLen ||
+            strict_local_response_body_pool.len > kStrictLocalResponseBodyPoolBytes ||
+            len > kStrictLocalResponseBodyPoolBytes - strict_local_response_body_pool.len)
+            return false;
+        const u32 start = strict_local_response_body_pool.len;
+        for (u32 i = 0; i < len; i++) {
+            if (!strict_local_response_body_pool.push(bytes[i])) return false;
+        }
+        out = {reinterpret_cast<const char*>(&strict_local_response_body_pool.data[start]), len};
+        return true;
+    }
+
+    u16 add_strict_local_response_policy(const StrictLocalResponsePolicySpec& policy) {
+        if (!strict_local_response_policy_spec_valid(policy) ||
+            strict_local_response_policies.len >= kMaxStrictLocalResponsePolicies)
+            return 0;
+        u32 total = 0;
+        for (u32 i = 0; i < strict_local_response_policies.len; i++) {
+            const auto& p = strict_local_response_policies[i];
+            const Str fields[] = {p.reason, p.content_type, p.server, p.body};
+            for (const Str field : fields) {
+                if (field.len > kMaxStrictLocalResponsePolicyBytes - total) return 0;
+                total += field.len;
+            }
+        }
+        const Str fields[] = {policy.reason, policy.content_type, policy.server, policy.body};
+        for (const Str field : fields) {
+            if (field.len > kMaxStrictLocalResponsePolicyBytes - total) return 0;
+            total += field.len;
+        }
+        if (!strict_local_response_policies.push(policy)) return 0;
+        return static_cast<u16>(strict_local_response_policies.len);
     }
 
     bool add_redirect_policy_body(const u8* bytes, u32 len, Str& out) {
@@ -801,6 +868,18 @@ private:
         if (policy.body.ptr < begin || policy.body.ptr > end) return;
         const u32 index = static_cast<u32>(policy.body.ptr - begin);
         policy.body.ptr = reinterpret_cast<const char*>(&failure_policy_body_pool.data[index]);
+    }
+
+    void rebase_strict_local_response_policy(const AstFile& other,
+                                             StrictLocalResponsePolicySpec& policy) {
+        if (policy.body.ptr == nullptr) return;
+        const char* begin =
+            reinterpret_cast<const char*>(&other.strict_local_response_body_pool.data[0]);
+        const char* end = begin + other.strict_local_response_body_pool.len;
+        if (policy.body.ptr < begin || policy.body.ptr > end) return;
+        const u32 index = static_cast<u32>(policy.body.ptr - begin);
+        policy.body.ptr =
+            reinterpret_cast<const char*>(&strict_local_response_body_pool.data[index]);
     }
 
     void rebase_redirect_policy(const AstFile& other, RedirectPolicySpec& policy) {
@@ -908,6 +987,8 @@ private:
     void rebase_from(const AstFile& other) {
         for (u32 i = 0; i < failure_policies.len; i++)
             rebase_failure_policy(other, failure_policies[i]);
+        for (u32 i = 0; i < strict_local_response_policies.len; i++)
+            rebase_strict_local_response_policy(other, strict_local_response_policies[i]);
         for (u32 i = 0; i < redirect_policies.len; i++)
             rebase_redirect_policy(other, redirect_policies[i]);
         for (u32 i = 0; i < type_pool.len; i++) rebase_type_ref(other, type_pool[i]);
@@ -944,6 +1025,8 @@ private:
                     for (u32 j = 0; j < items[i].route.statements.len; j++) {
                         rebase_stmt_ptr(other, items[i].route.statements[j]);
                     }
+                    break;
+                case AstItemKind::Unmatched:
                     break;
                 case AstItemKind::Timer:
                     // Timer body statements are pooled like route statements.

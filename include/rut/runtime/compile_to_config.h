@@ -245,6 +245,14 @@ inline void cache_registry_publish_config(const RouteConfig& cfg, const void* ow
 }
 
 inline bool populate_route_config(RouteConfig& cfg, const rir::Module& mod) {
+    // Activation guard for compiler-only unmatched metadata. Keep this before
+    // verifier/config validation and before every mutation: until strict H1
+    // dispatch and configured-H2 fail-close land atomically, no nonempty or
+    // forged unmatched table may reach a serving RouteConfig.
+    if (mod.strict_local_response_policy_count != 0) return false;
+    for (u32 slot = 0; slot < kStrictLocalResponseMethodSlots; slot++)
+        if (mod.unmatched_policy_ids[slot] != 0) return false;
+
     // Bodies / header sets / routes must always start empty — there's
     // no "merge" semantics for those tables, and a non-zero count
     // would break the compile-time body_idx / headers_idx invariants.

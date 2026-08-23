@@ -3,6 +3,7 @@
 #include "rut/common/http_header_validation.h"
 #include "rut/common/types.h"  // RUT_ENABLE_WEBSOCKET gate for the websocket() builder
 #include "rut/runtime/http_parser.h"
+#include "rut/runtime/route_method.h"
 #include <memory>
 
 namespace rut {
@@ -80,6 +81,34 @@ struct Parser {
         void commit() { committed = true; }
         RedirectParseTransaction(const RedirectParseTransaction&) = delete;
         RedirectParseTransaction& operator=(const RedirectParseTransaction&) = delete;
+    };
+
+    struct StrictLocalResponseParseTransaction {
+        AstFile* file;
+        u32 body_len;
+        u32 policy_len;
+        u16 method_policy_ids[kStrictLocalResponseMethodSlots]{};
+        bool committed = false;
+
+        explicit StrictLocalResponseParseTransaction(AstFile* f)
+            : file(f),
+              body_len(f->strict_local_response_body_pool.len),
+              policy_len(f->strict_local_response_policies.len) {
+            for (u32 slot = 0; slot < kStrictLocalResponseMethodSlots; slot++)
+                method_policy_ids[slot] = f->unmatched_policy_ids[slot];
+        }
+        ~StrictLocalResponseParseTransaction() {
+            if (!committed) {
+                file->strict_local_response_body_pool.len = body_len;
+                file->strict_local_response_policies.len = policy_len;
+                for (u32 slot = 0; slot < kStrictLocalResponseMethodSlots; slot++)
+                    file->unmatched_policy_ids[slot] = method_policy_ids[slot];
+            }
+        }
+        void commit() { committed = true; }
+        StrictLocalResponseParseTransaction(const StrictLocalResponseParseTransaction&) = delete;
+        StrictLocalResponseParseTransaction& operator=(const StrictLocalResponseParseTransaction&) =
+            delete;
     };
 
     const Token& cur() const { return toks->tokens[pos]; }
@@ -190,6 +219,88 @@ struct Parser {
         }
         Str owned{};
         if (!file->add_failure_policy_body(decoded, decoded_len, owned))
+            return frontend_error(FrontendError::TooManyItems, span_from(prefix), raw);
+        return owned;
+    }
+
+    FrontendResult<Str> parse_strict_local_response_body_literal() {
+        if (cur().type == TokenType::Eof)
+            return frontend_error(FrontendError::UnexpectedEof, span_from(cur()));
+        if (cur().type != TokenType::Ident || !cur().text.eq({"b", 1}))
+            return frontend_error(FrontendError::UnexpectedToken, span_from(cur()), cur().text);
+        const Token& prefix = toks->tokens[pos++];
+        auto literal = expect(TokenType::StringLit);
+        if (!literal) return core::make_unexpected(literal.error());
+        if (literal.value()->start != prefix.end + 1)
+            return frontend_error(
+                FrontendError::UnexpectedToken, span_from(*literal.value()), literal.value()->text);
+
+        u8 decoded[kMaxStrictLocalResponseBodyLen];
+        u32 decoded_len = 0;
+        const Str raw = literal.value()->text;
+        auto hex = [](u8 c, u8& out) {
+            if (c >= '0' && c <= '9') {
+                out = static_cast<u8>(c - '0');
+                return true;
+            }
+            if (c >= 'a' && c <= 'f') {
+                out = static_cast<u8>(c - 'a' + 10);
+                return true;
+            }
+            if (c >= 'A' && c <= 'F') {
+                out = static_cast<u8>(c - 'A' + 10);
+                return true;
+            }
+            return false;
+        };
+        for (u32 i = 0; i < raw.len; i++) {
+            u8 value = static_cast<u8>(raw.ptr[i]);
+            if (value == '\\') {
+                if (++i >= raw.len)
+                    return frontend_error(
+                        FrontendError::UnexpectedToken, span_from(*literal.value()), raw);
+                const u8 esc = static_cast<u8>(raw.ptr[i]);
+                switch (esc) {
+                    case 'n':
+                        value = '\n';
+                        break;
+                    case 'r':
+                        value = '\r';
+                        break;
+                    case 't':
+                        value = '\t';
+                        break;
+                    case '\\':
+                        value = '\\';
+                        break;
+                    case '"':
+                        value = '"';
+                        break;
+                    case 'x': {
+                        if (i + 2 >= raw.len)
+                            return frontend_error(
+                                FrontendError::UnexpectedToken, span_from(*literal.value()), raw);
+                        u8 hi = 0, lo = 0;
+                        if (!hex(static_cast<u8>(raw.ptr[i + 1]), hi) ||
+                            !hex(static_cast<u8>(raw.ptr[i + 2]), lo))
+                            return frontend_error(
+                                FrontendError::UnexpectedToken, span_from(*literal.value()), raw);
+                        value = static_cast<u8>((hi << 4) | lo);
+                        i += 2;
+                        break;
+                    }
+                    default:
+                        return frontend_error(
+                            FrontendError::UnexpectedToken, span_from(*literal.value()), raw);
+                }
+            }
+            if (decoded_len >= kMaxStrictLocalResponseBodyLen)
+                return frontend_error(
+                    FrontendError::TooManyItems, span_from(*literal.value()), raw);
+            decoded[decoded_len++] = value;
+        }
+        Str owned{};
+        if (!file->add_strict_local_response_body(decoded, decoded_len, owned))
             return frontend_error(FrontendError::TooManyItems, span_from(prefix), raw);
         return owned;
     }
@@ -4485,6 +4596,204 @@ struct Parser {
         return parse_route_entry(*kw.value(), true);
     }
 
+    FrontendResult<AstItem> parse_unmatched() {
+        const Token start = cur();
+        if (start.type != TokenType::Ident || !start.text.eq({"unmatched", 9}))
+            return frontend_error(FrontendError::UnexpectedToken, span_from(start), start.text);
+        pos++;
+
+        AstItem item{};
+        item.kind = AstItemKind::Unmatched;
+        item.unmatched.method_is_any = cur().type == TokenType::LBrace;
+        if (item.unmatched.method_is_any) {
+            item.unmatched.method_slot = kRouteMethodAny;
+        } else if (is_method_keyword(cur().type)) {
+            item.unmatched.method = static_cast<u8>(cur().type);
+            switch (cur().type) {
+                case TokenType::KwGet:
+                    item.unmatched.method_slot = kRouteMethodGet;
+                    break;
+                case TokenType::KwPost:
+                    item.unmatched.method_slot = kRouteMethodPost;
+                    break;
+                case TokenType::KwPut:
+                    item.unmatched.method_slot = kRouteMethodPut;
+                    break;
+                case TokenType::KwDelete:
+                    item.unmatched.method_slot = kRouteMethodDelete;
+                    break;
+                case TokenType::KwPatch:
+                    item.unmatched.method_slot = kRouteMethodPatch;
+                    break;
+                case TokenType::KwHead:
+                    item.unmatched.method_slot = kRouteMethodHead;
+                    break;
+                case TokenType::KwOptions:
+                    item.unmatched.method_slot = kRouteMethodOptions;
+                    break;
+                default:
+                    return frontend_error(
+                        FrontendError::UnexpectedToken, span_from(cur()), cur().text);
+            }
+            pos++;
+        } else if (cur().type == TokenType::Ident &&
+                   (cur().text.eq({"CONNECT", 7}) || cur().text.eq({"connect", 7}) ||
+                    cur().text.eq({"TRACE", 5}) || cur().text.eq({"trace", 5}))) {
+            item.unmatched.method = static_cast<u8>(TokenType::Ident);
+            item.unmatched.method_slot =
+                cur().text.len == 7 ? kRouteMethodConnect : kRouteMethodTrace;
+            pos++;
+        } else {
+            return frontend_error(FrontendError::UnsupportedSyntax, span_from(cur()), cur().text);
+        }
+
+        const u32 slot = item.unmatched.method_slot;
+        static_assert(kRouteMethodSlots == kStrictLocalResponseMethodSlots);
+        if (slot >= kStrictLocalResponseMethodSlots)
+            return frontend_error(FrontendError::UnsupportedSyntax, span_from(start), start.text);
+        if (file->unmatched_policy_ids[slot] != 0)
+            return frontend_error(FrontendError::UnsupportedSyntax,
+                                  span_from(start),
+                                  lit_str("duplicate unmatched method selector"));
+
+        auto outer_lbrace = expect(TokenType::LBrace);
+        if (!outer_lbrace) return core::make_unexpected(outer_lbrace.error());
+        auto ret = expect(TokenType::KwReturn);
+        if (!ret) return core::make_unexpected(ret.error());
+        auto builder = expect(TokenType::Ident);
+        if (!builder) return core::make_unexpected(builder.error());
+        if (!builder.value()->text.eq({"local_response", 14}))
+            return frontend_error(FrontendError::UnsupportedSyntax,
+                                  span_from(*builder.value()),
+                                  builder.value()->text);
+        auto lparen = expect(TokenType::LParen);
+        if (!lparen) return core::make_unexpected(lparen.error());
+        auto object_lbrace = expect(TokenType::LBrace);
+        if (!object_lbrace) return core::make_unexpected(object_lbrace.error());
+
+        StrictLocalResponseParseTransaction transaction(file);
+        StrictLocalResponsePolicySpec policy{};
+        u16 fields = 0;
+        while (cur().type != TokenType::RBrace && cur().type != TokenType::Eof) {
+            auto name = expect_field_name();
+            if (!name) return core::make_unexpected(name.error());
+            auto colon = expect(TokenType::Colon);
+            if (!colon) return core::make_unexpected(colon.error());
+
+            u16 bit = 0;
+            const Str field = name.value()->text;
+            if (field.eq({"version", 7})) {
+                bit = 1u << 0;
+                auto value = expect(TokenType::StringLit);
+                if (!value) return core::make_unexpected(value.error());
+                if (!value.value()->text.eq({"HTTP/1.1", 8}))
+                    return frontend_error(FrontendError::UnsupportedSyntax,
+                                          span_from(*value.value()),
+                                          value.value()->text);
+                policy.version = StrictLocalResponseVersion::Http11;
+            } else if (field.eq({"status", 6})) {
+                bit = 1u << 1;
+                auto value = expect(TokenType::IntLit);
+                if (!value) return core::make_unexpected(value.error());
+                u32 status = 0;
+                for (u32 i = 0; i < value.value()->text.len; i++) {
+                    const u32 digit = static_cast<u32>(value.value()->text.ptr[i] - '0');
+                    if (status > (0xffffffffu - digit) / 10)
+                        return frontend_error(FrontendError::InvalidInteger,
+                                              span_from(*value.value()));
+                    status = status * 10 + digit;
+                }
+                if (status < 400 || status > 599)
+                    return frontend_error(FrontendError::InvalidStatusCode,
+                                          span_from(*value.value()));
+                policy.status_code = static_cast<u16>(status);
+            } else if (field.eq({"reason", 6})) {
+                bit = 1u << 2;
+                auto value = expect(TokenType::StringLit);
+                if (!value) return core::make_unexpected(value.error());
+                policy.reason = value.value()->text;
+            } else if (field.eq({"server", 6})) {
+                bit = 1u << 3;
+                auto value = expect(TokenType::StringLit);
+                if (!value) return core::make_unexpected(value.error());
+                policy.server = value.value()->text;
+            } else if (field.eq({"date", 4})) {
+                bit = 1u << 4;
+                auto value = expect(TokenType::StringLit);
+                if (!value) return core::make_unexpected(value.error());
+                if (!value.value()->text.eq({"current", 7}))
+                    return frontend_error(FrontendError::UnsupportedSyntax,
+                                          span_from(*value.value()),
+                                          value.value()->text);
+                policy.date = StrictLocalResponseDate::Current;
+            } else if (field.eq({"content_type", 12})) {
+                bit = 1u << 5;
+                auto value = expect(TokenType::StringLit);
+                if (!value) return core::make_unexpected(value.error());
+                policy.content_type = value.value()->text;
+            } else if (field.eq({"connection", 10})) {
+                bit = 1u << 6;
+                auto value = expect(TokenType::StringLit);
+                if (!value) return core::make_unexpected(value.error());
+                if (!value.value()->text.eq({"request", 7}))
+                    return frontend_error(FrontendError::UnsupportedSyntax,
+                                          span_from(*value.value()),
+                                          value.value()->text);
+                policy.connection = StrictLocalResponseConnection::Request;
+            } else if (field.eq({"head_mode", 9})) {
+                bit = 1u << 7;
+                auto value = expect(TokenType::StringLit);
+                if (!value) return core::make_unexpected(value.error());
+                if (value.value()->text.eq({"reject", 6}))
+                    policy.head_mode = StrictLocalResponseHeadMode::Reject;
+                else if (value.value()->text.eq({"suppress_body", 13}))
+                    policy.head_mode = StrictLocalResponseHeadMode::SuppressBody;
+                else
+                    return frontend_error(FrontendError::UnsupportedSyntax,
+                                          span_from(*value.value()),
+                                          value.value()->text);
+            } else if (field.eq({"body", 4})) {
+                bit = 1u << 8;
+                auto value = parse_strict_local_response_body_literal();
+                if (!value) return core::make_unexpected(value.error());
+                policy.body = value.value();
+            } else {
+                return frontend_error(
+                    FrontendError::UnsupportedSyntax, span_from(*name.value()), field);
+            }
+            if ((fields & bit) != 0)
+                return frontend_error(
+                    FrontendError::UnsupportedSyntax, span_from(*name.value()), field);
+            fields = static_cast<u16>(fields | bit);
+            take(TokenType::Comma);
+        }
+        if (fields != 0x1ffu)
+            return frontend_error(
+                FrontendError::UnsupportedSyntax, span_from(cur()), lit_str("missing field"));
+        auto object_rbrace = expect(TokenType::RBrace);
+        if (!object_rbrace) return core::make_unexpected(object_rbrace.error());
+        auto rparen = expect(TokenType::RParen);
+        if (!rparen) return core::make_unexpected(rparen.error());
+        auto outer_rbrace = expect(TokenType::RBrace);
+        if (!outer_rbrace) return core::make_unexpected(outer_rbrace.error());
+
+        if ((slot == kRouteMethodAny || slot == kRouteMethodHead) &&
+            policy.head_mode != StrictLocalResponseHeadMode::SuppressBody)
+            return frontend_error(FrontendError::UnsupportedSyntax,
+                                  span_from(start),
+                                  lit_str("ANY and HEAD unmatched policies must suppress body"));
+        if (!strict_local_response_policy_spec_valid(policy))
+            return frontend_error(FrontendError::UnsupportedSyntax, span_from(start));
+        const u16 policy_id = file->add_strict_local_response_policy(policy);
+        if (policy_id == 0) return frontend_error(FrontendError::TooManyItems, span_from(start));
+        file->unmatched_policy_ids[slot] = policy_id;
+        item.unmatched.policy_id = policy_id;
+        item.span = Span{start.start, outer_rbrace.value()->end, start.line, start.col};
+        item.unmatched.span = item.span;
+        transaction.commit();
+        return item;
+    }
+
     // Convert a DurLit token ("5s", "100ms", "1m", "1h") to milliseconds. 0 = bad
     // unit / overflow. Unlike dur_lit_to_seconds this preserves sub-second values
     // for forward compatibility (slice 1 fires on the 1s tick regardless).
@@ -4748,6 +5057,10 @@ FrontendResult<AstFile*> parse_file(const LexedTokens& tokens) {
                 break;
             }
             default:
+                if (p.cur().type == TokenType::Ident && p.cur().text.eq({"unmatched", 9})) {
+                    item = p.parse_unmatched();
+                    break;
+                }
                 if (p.is_chain_decl_start()) {
                     item = p.parse_chain();
                     break;

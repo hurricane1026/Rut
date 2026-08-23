@@ -3,6 +3,7 @@
 // JIT) into a RouteConfig, plus its fail-closed error reporting.
 
 #include "rut/runtime/cache_table.h"
+#include "rut/runtime/compile_to_config.h"
 #include "rut/runtime/listener.h"
 #include "rut/runtime/route_method.h"
 #include "rut/serve_loader.h"
@@ -514,6 +515,72 @@ TEST(serve_loader, format_read_stage_without_diag) {
     CHECK_GT(n, 0u);
     CHECK(contains(msg, "read source file"));
     CHECK(contains(msg, "failed"));
+}
+
+TEST(serve_loader, unmatched_source_fails_at_register_before_serving) {
+    const std::string path = write_file(
+        "/tmp/rut_serve_loader_unmatched_guard",
+        "app.rut",
+        "unmatched OPTIONS { return local_response({ version: \"HTTP/1.1\", status: 400, "
+        "reason: \"Bad Request\", server: \"rut\", date: \"current\", content_type: "
+        "\"text/plain\", connection: \"request\", head_mode: \"reject\", body: b\"x\" }) }\n"
+        "route GET \"/\" { return 200 }\n");
+
+    LoadedProgram program;
+    LoadError err;
+    CHECK_FALSE(load_rut_program(path.c_str(), program, err));
+    CHECK(err.stage == LoadStage::Register);
+    CHECK_EQ(program.rir.module.strict_local_response_policy_count, 1u);
+    CHECK_EQ(program.rir.module.unmatched_policy_ids[kRouteMethodOptions], 1u);
+    CHECK_EQ(program.config.route_count, 0u);
+    CHECK_EQ(program.config.upstream_count, 0u);
+    program.destroy();
+}
+
+TEST(serve_loader, unmatched_population_guard_rejects_valid_and_forged_tables_before_mutation) {
+    static constexpr char kReason[] = "Bad Request";
+    static constexpr char kType[] = "text/plain";
+    static constexpr char kServer[] = "rut";
+    static constexpr char kBody[] = "x";
+    rir::Module mod{};
+    auto& policy = mod.strict_local_response_policies[0];
+    policy.version = StrictLocalResponseVersion::Http11;
+    policy.status_code = 400;
+    policy.date = StrictLocalResponseDate::Current;
+    policy.connection = StrictLocalResponseConnection::Request;
+    policy.head_mode = StrictLocalResponseHeadMode::Reject;
+    policy.reason = {kReason, sizeof(kReason) - 1};
+    policy.content_type = {kType, sizeof(kType) - 1};
+    policy.server = {kServer, sizeof(kServer) - 1};
+    policy.body = {kBody, sizeof(kBody) - 1};
+    mod.strict_local_response_policy_count = 1;
+    mod.unmatched_policy_ids[kRouteMethodOptions] = 1;
+    mod.upstream_count = 1;
+    mod.upstreams[0].name = {"would_mutate", 12};
+    mod.upstreams[0].has_address = true;
+    mod.upstreams[0].ip = 0x7f000001u;
+    mod.upstreams[0].port = 9000;
+    REQUIRE(rir::verify_module(mod).ok);
+
+    RouteConfig valid_cfg{};
+    CHECK_FALSE(populate_route_config(valid_cfg, mod));
+    CHECK_EQ(valid_cfg.route_count, 0u);
+    CHECK_EQ(valid_cfg.upstream_count, 0u);
+    CHECK_EQ(valid_cfg.response_body_count, 0u);
+
+    mod.strict_local_response_policy_count = 0;
+    RouteConfig forged_cfg{};
+    CHECK_FALSE(populate_route_config(forged_cfg, mod));
+    CHECK_EQ(forged_cfg.route_count, 0u);
+    CHECK_EQ(forged_cfg.upstream_count, 0u);
+    CHECK_EQ(forged_cfg.response_body_count, 0u);
+
+    mod.unmatched_policy_ids[kRouteMethodOptions] = 0;
+    mod.upstream_count = 0;
+    RouteConfig omitted_cfg{};
+    CHECK(populate_route_config(omitted_cfg, mod));
+    CHECK_EQ(omitted_cfg.route_count, 0u);
+    CHECK_EQ(omitted_cfg.upstream_count, 0u);
 }
 
 int main(int argc, char** argv) {
