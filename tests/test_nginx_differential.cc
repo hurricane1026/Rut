@@ -50,6 +50,25 @@ static constexpr char kDefaultBufferingTimeoutResponseNormalized[] =
     "Date: XXXXXXXXXXXXXXXXXXXXXXXXXXXXX\r\n"
     "Content-Length: 12\r\n"
     "Connection: keep-alive\r\n\r\n";
+static constexpr char kDefaultBufferingCompleteRequest[] =
+    "GET /buffered-complete?q=1 HTTP/1.1\r\n"
+    "Host: client.example\r\n\r\n";
+static constexpr char kDefaultBufferingCompleteOriginPart1[] =
+    "HTTP/1.1 200 OK\r\n"
+    "Server: complete-origin\r\n"
+    "Date: Tue, 01 Jan 2030 00:00:00 GMT\r\n"
+    "Content-Length: 12\r\n\r\n"
+    "abc";
+static constexpr char kDefaultBufferingCompleteOriginPart2[] = "def";
+static constexpr char kDefaultBufferingCompleteOriginPart3[] = "ghi";
+static constexpr char kDefaultBufferingCompleteOriginPart4[] = "jkl";
+static constexpr char kDefaultBufferingCompleteResponseNormalized[] =
+    "HTTP/1.1 200 OK\r\n"
+    "Server: nginx/1.29.7\r\n"
+    "Date: XXXXXXXXXXXXXXXXXXXXXXXXXXXXX\r\n"
+    "Content-Length: 12\r\n"
+    "Connection: keep-alive\r\n\r\n"
+    "abcdefghijkl";
 static constexpr char kApiRedirectBody[] =
     "<html>\r\n"
     "<head><title>301 Moved Permanently</title></head>\r\n"
@@ -677,6 +696,13 @@ struct Recorder {
     // until explicit test cleanup so retries remain observable.
     bool wait_response_peer_close = false;
     bool observe_extra_requests_until_stop = false;
+    // Default-off semantic-baseline mode: four distinct, permit-gated
+    // application writes make progress timing observable without making any
+    // claim about TCP segmentation or nginx read boundaries.
+    bool permit_gated_complete_response = false;
+    std::atomic<u32> response_fragment_permit{0};
+    std::atomic<u32> response_fragments_sent{0};
+    std::atomic<u64> response_fragment_sent_ns[4]{};
     std::atomic<bool> response_sent_open{false};
     std::atomic<bool> response_send_failed{false};
     std::atomic<bool> response_peer_closed{false};
@@ -739,7 +765,43 @@ struct Recorder {
                 self->history.push_back(wire);
                 if (self->history.size() == 1) self->request = wire;
                 self->requests.fetch_add(1, std::memory_order_release);
-                response_sent = send_all(client, self->response_bytes, self->response_bytes_len);
+                if (self->permit_gated_complete_response) {
+                    static constexpr const char* kParts[] = {
+                        kDefaultBufferingCompleteOriginPart1,
+                        kDefaultBufferingCompleteOriginPart2,
+                        kDefaultBufferingCompleteOriginPart3,
+                        kDefaultBufferingCompleteOriginPart4,
+                    };
+                    static constexpr size_t kPartLengths[] = {
+                        sizeof(kDefaultBufferingCompleteOriginPart1) - 1,
+                        sizeof(kDefaultBufferingCompleteOriginPart2) - 1,
+                        sizeof(kDefaultBufferingCompleteOriginPart3) - 1,
+                        sizeof(kDefaultBufferingCompleteOriginPart4) - 1,
+                    };
+                    response_sent = true;
+                    for (u32 part = 0; part < 4; part++) {
+                        while (self->running.load(std::memory_order_acquire) &&
+                               self->response_fragment_permit.load(std::memory_order_acquire) <=
+                                   part) {
+                            usleep(1000);
+                        }
+                        if (!self->running.load(std::memory_order_acquire) ||
+                            !send_all(client, kParts[part], kPartLengths[part])) {
+                            response_sent = false;
+                            break;
+                        }
+                        const u64 sent_ns = static_cast<u64>(
+                            std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                std::chrono::steady_clock::now().time_since_epoch())
+                                .count());
+                        self->response_fragment_sent_ns[part].store(sent_ns,
+                                                                    std::memory_order_relaxed);
+                        self->response_fragments_sent.store(part + 1, std::memory_order_release);
+                    }
+                } else {
+                    response_sent =
+                        send_all(client, self->response_bytes, self->response_bytes_len);
+                }
                 if (self->wait_response_peer_close) {
                     if (!response_sent) {
                         self->response_send_failed.store(true, std::memory_order_release);
@@ -851,6 +913,11 @@ struct Recorder {
             response_peer_observation_failed.store(false, std::memory_order_relaxed);
             response_sent_ns.store(0, std::memory_order_relaxed);
             response_peer_closed_ns.store(0, std::memory_order_relaxed);
+            response_fragment_permit.store(permit_gated_complete_response ? 1u : 0u,
+                                           std::memory_order_relaxed);
+            response_fragments_sent.store(0, std::memory_order_relaxed);
+            for (auto& sent_ns : response_fragment_sent_ns)
+                sent_ns.store(0, std::memory_order_relaxed);
             running.store(true, std::memory_order_release);
             if (pthread_create(&thread, nullptr, &Recorder::run, this) == 0) {
                 thread_started = true;
@@ -1813,6 +1880,12 @@ struct DefaultBufferingTimeoutObservation {
     u64 downstream_eof_ns = 0;
 };
 
+struct DefaultBufferingCompleteObservation {
+    std::vector<char> downstream;
+    u64 first_downstream_byte_ns = 0;
+    u64 downstream_complete_ns = 0;
+};
+
 static u64 steady_now_ns() {
     return static_cast<u64>(std::chrono::duration_cast<std::chrono::nanoseconds>(
                                 std::chrono::steady_clock::now().time_since_epoch())
@@ -1998,6 +2071,212 @@ static bool capture_nginx_default_buffering_timeout(u16 frontend_port,
     }
     if (!container_removed) {
         error = "docker rm -f failed after default-buffering timeout baseline";
+        return false;
+    }
+    return true;
+}
+
+static bool capture_nginx_default_buffering_complete(
+    u16 frontend_port,
+    const std::string& nginx_config_path,
+    const std::string& nginx_log_path,
+    const std::string& container_name,
+    Recorder& recorder,
+    DefaultBufferingCompleteObservation& observation,
+    std::string& error) {
+    DockerGuard docker(container_name);
+    ChildGuard nginx;
+    if (!spawn_child({"docker",
+                      "run",
+                      "--pull=never",
+                      "--network",
+                      "host",
+                      "--name",
+                      container_name,
+                      "-v",
+                      nginx_config_path + ":/etc/nginx/nginx.conf:ro",
+                      kNginxImage,
+                      "nginx",
+                      "-g",
+                      "daemon off;"},
+                     nginx_log_path,
+                     nginx.child)) {
+        error = "failed to start pinned nginx for default-buffering complete baseline";
+        return false;
+    }
+    if (!wait_ready(frontend_port, nginx.child, error)) return false;
+
+    struct ClientGuard {
+        int fd = -1;
+        ~ClientGuard() {
+            if (fd >= 0) close(fd);
+        }
+    } client{connect_once(frontend_port)};
+    if (client.fd < 0 || !send_all(client.fd,
+                                   kDefaultBufferingCompleteRequest,
+                                   sizeof(kDefaultBufferingCompleteRequest) - 1)) {
+        error = "default-buffering complete downstream request failed";
+        return false;
+    }
+
+    const auto wait_for_fragment = [&](u32 expected, int budget_ms) {
+        const auto deadline =
+            std::chrono::steady_clock::now() + std::chrono::milliseconds(budget_ms);
+        while (recorder.response_fragments_sent.load(std::memory_order_acquire) < expected &&
+               std::chrono::steady_clock::now() < deadline) {
+            if (recorder.response_send_failed.load(std::memory_order_acquire) ||
+                recorder.response_peer_observation_failed.load(std::memory_order_acquire) ||
+                recorder.accepted.load(std::memory_order_acquire) > 1 ||
+                recorder.requests.load(std::memory_order_acquire) > 1)
+                return false;
+            usleep(1000);
+        }
+        return recorder.response_fragments_sent.load(std::memory_order_acquire) == expected;
+    };
+    if (!wait_for_fragment(1, 2000)) {
+        error = "origin did not publish the first permit-gated response fragment";
+        return false;
+    }
+
+    for (u32 part = 0; part < 3; part++) {
+        bool eof = false;
+        std::string detail;
+        if (!wait_keepalive_quiet_or_eof(client.fd, 400, eof, detail) || eof) {
+            error = eof ? "nginx closed downstream before the declared body completed"
+                        : "nginx exposed a nonfinal default-buffered response: " + detail;
+            return false;
+        }
+        recorder.response_fragment_permit.store(part + 2, std::memory_order_release);
+        if (!wait_for_fragment(part + 2, 500)) {
+            error = "origin did not publish the next permitted response fragment";
+            return false;
+        }
+    }
+
+    u64 fragment_ns[4]{};
+    for (u32 part = 0; part < 4; part++) {
+        fragment_ns[part] =
+            recorder.response_fragment_sent_ns[part].load(std::memory_order_acquire);
+        if (fragment_ns[part] == 0 ||
+            (part != 0 && (fragment_ns[part] <= fragment_ns[part - 1] ||
+                           fragment_ns[part] - fragment_ns[part - 1] < 350'000'000ull ||
+                           fragment_ns[part] - fragment_ns[part - 1] > 650'000'000ull))) {
+            error = "permit-gated origin fragment timing left the required progress window";
+            return false;
+        }
+    }
+    if (fragment_ns[3] - fragment_ns[0] <= 1'000'000'000ull) {
+        error = "permit-gated response did not span more than one timeout interval";
+        return false;
+    }
+
+    observation.downstream.clear();
+    observation.first_downstream_byte_ns = 0;
+    observation.downstream_complete_ns = 0;
+    const u64 response_deadline_ns = fragment_ns[3] + 500'000'000ull;
+    for (;;) {
+        const u64 now_ns = steady_now_ns();
+        if (now_ns >= response_deadline_ns) {
+            error = "nginx did not emit the completed buffered response within 500ms";
+            return false;
+        }
+        const int remaining_ms = static_cast<int>((response_deadline_ns - now_ns) / 1'000'000ull);
+        pollfd p{client.fd, POLLIN | POLLHUP | POLLERR, 0};
+        const int ready =
+            poll(&p, 1, remaining_ms > 50 ? 50 : (remaining_ms > 0 ? remaining_ms : 1));
+        if (ready < 0) {
+            if (errno == EINTR) continue;
+            error = "completed-buffer response poll failed";
+            return false;
+        }
+        if (ready == 0) continue;
+        char bytes[1024];
+        const ssize_t n = recv(client.fd, bytes, sizeof(bytes), 0);
+        const u64 recv_ns = steady_now_ns();
+        if (n > 0) {
+            if (observation.first_downstream_byte_ns == 0)
+                observation.first_downstream_byte_ns = recv_ns;
+            observation.downstream.insert(observation.downstream.end(), bytes, bytes + n);
+            if (observation.downstream.size() >
+                sizeof(kDefaultBufferingCompleteResponseNormalized) - 1) {
+                error = "completed-buffer response included trailing bytes";
+                return false;
+            }
+            const size_t end = header_end(observation.downstream);
+            size_t body_len = 0;
+            if (end != 0 && parse_content_length(observation.downstream, end, body_len) &&
+                observation.downstream.size() == end + body_len) {
+                observation.downstream_complete_ns = recv_ns;
+                break;
+            }
+            continue;
+        }
+        if (n == 0) {
+            error = "nginx closed downstream before the complete buffered response";
+            return false;
+        }
+        if (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK) continue;
+        error = "completed-buffer response recv failed";
+        return false;
+    }
+    if (observation.first_downstream_byte_ns < fragment_ns[3] ||
+        observation.downstream_complete_ns < fragment_ns[3] ||
+        observation.first_downstream_byte_ns - fragment_ns[3] >= 500'000'000ull ||
+        observation.downstream_complete_ns - fragment_ns[3] >= 500'000'000ull) {
+        error = "completed buffered response left the post-final promptness window";
+        return false;
+    }
+
+    std::string detail;
+    if (!validate_exact_normalized_response(
+            observation.downstream, kDefaultBufferingCompleteResponseNormalized, detail)) {
+        error = "default-buffering complete wire mismatch: " + detail;
+        return false;
+    }
+
+    const auto origin_close_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+    while (!recorder.response_peer_closed.load(std::memory_order_acquire) &&
+           std::chrono::steady_clock::now() < origin_close_deadline) {
+        if (recorder.response_peer_unexpected_data.load(std::memory_order_acquire) ||
+            recorder.response_peer_observation_failed.load(std::memory_order_acquire)) {
+            error = "origin peer-close observation failed after complete response";
+            return false;
+        }
+        usleep(5000);
+    }
+    const u64 origin_closed_ns = recorder.response_peer_closed_ns.load(std::memory_order_acquire);
+    if (!recorder.response_peer_closed.load(std::memory_order_acquire) ||
+        origin_closed_ns < fragment_ns[3]) {
+        error = "nginx did not retire the completed origin before cleanup";
+        return false;
+    }
+
+    bool eof = false;
+    detail.clear();
+    if (!wait_keepalive_quiet_or_eof(client.fd, 200, eof, detail) || eof) {
+        error = eof ? "nginx did not preserve the downstream keep-alive connection"
+                    : "nginx emitted bytes after the exact completed response: " + detail;
+        return false;
+    }
+
+    settle_for_invalid_target_side_effects();
+    if (recorder.accepted.load(std::memory_order_acquire) != 1 ||
+        recorder.requests.load(std::memory_order_acquire) != 1 ||
+        recorder.response_send_failed.load(std::memory_order_acquire) ||
+        recorder.response_peer_unexpected_data.load(std::memory_order_acquire) ||
+        recorder.response_peer_observation_failed.load(std::memory_order_acquire)) {
+        error = "default-buffering complete baseline saw retry or incomplete origin evidence";
+        return false;
+    }
+
+    const bool nginx_stopped = stop_child(nginx.child);
+    const bool container_removed = docker.remove();
+    if (!nginx_stopped) {
+        error = "failed to stop nginx after default-buffering complete baseline";
+        return false;
+    }
+    if (!container_removed) {
+        error = "docker rm -f failed after default-buffering complete baseline";
         return false;
     }
     return true;
@@ -3568,8 +3847,95 @@ int main(int argc, char** argv) {
               << first_byte_seconds << "/" << eof_seconds << "/" << origin_close_seconds
               << ", one upstream request)\n";
 
+    Recorder default_buffering_complete_origin;
+    default_buffering_complete_origin.wait_response_peer_close = true;
+    default_buffering_complete_origin.observe_extra_requests_until_stop = true;
+    default_buffering_complete_origin.permit_gated_complete_response = true;
+    if (!default_buffering_complete_origin.setup(backend_port)) {
+        std::cerr << "FAIL [pinned default buffering complete]: origin setup failed\n";
+        return 1;
+    }
+    const std::string default_buffering_complete_config =
+        "events {}\nhttp {\n  access_log off;\n  server {\n    listen 127.0.0.1:" +
+        std::to_string(frontend_port) +
+        ";\n    location / {\n      proxy_pass http://127.0.0.1:" + std::to_string(backend_port) +
+        ";\n      proxy_read_timeout 1s;\n    }\n  }\n}\n";
+    if (default_buffering_complete_config.find("proxy_buffering") != std::string::npos ||
+        !write_file(temp.nginx_config,
+                    default_buffering_complete_config.data(),
+                    default_buffering_complete_config.size())) {
+        std::cerr << "FAIL [pinned default buffering complete]: semantic config write failed\n";
+        return 1;
+    }
+    DefaultBufferingCompleteObservation default_buffering_complete_observation;
+    std::string default_buffering_complete_error;
+    if (!capture_nginx_default_buffering_complete(frontend_port,
+                                                  temp.nginx_config,
+                                                  temp.nginx_log,
+                                                  container + "-default-buffering-complete",
+                                                  default_buffering_complete_origin,
+                                                  default_buffering_complete_observation,
+                                                  default_buffering_complete_error)) {
+        std::cerr << "FAIL [pinned default buffering complete]: "
+                  << default_buffering_complete_error << "\n";
+        dump_wire("pinned default-buffering complete response",
+                  default_buffering_complete_observation.downstream);
+        dump_log(temp.nginx_log, "pinned default-buffering complete nginx log");
+        return 1;
+    }
+    default_buffering_complete_origin.stop();
+    const std::string expected_default_buffering_complete_request =
+        "GET /buffered-complete?q=1 HTTP/1.1\r\nHost: 127.0.0.1:" + std::to_string(backend_port) +
+        "\r\n\r\n";
+    const std::vector<char> expected_default_buffering_complete_request_wire(
+        expected_default_buffering_complete_request.begin(),
+        expected_default_buffering_complete_request.end());
+    if (default_buffering_complete_origin.request !=
+            expected_default_buffering_complete_request_wire ||
+        default_buffering_complete_origin.history.size() != 1 ||
+        default_buffering_complete_origin.history[0] !=
+            expected_default_buffering_complete_request_wire) {
+        std::cerr << "FAIL [pinned default buffering complete]: exact upstream wire mismatch\n";
+        dump_wire("expected default-buffering complete upstream request",
+                  expected_default_buffering_complete_request_wire);
+        dump_wire("actual default-buffering complete upstream request",
+                  default_buffering_complete_origin.request);
+        return 1;
+    }
+    const u64 complete_first_origin_ns =
+        default_buffering_complete_origin.response_fragment_sent_ns[0].load(
+            std::memory_order_acquire);
+    const u64 complete_final_origin_ns =
+        default_buffering_complete_origin.response_fragment_sent_ns[3].load(
+            std::memory_order_acquire);
+    const u64 complete_origin_closed_ns =
+        default_buffering_complete_origin.response_peer_closed_ns.load(std::memory_order_acquire);
+    const u64 complete_part2_origin_ns =
+        default_buffering_complete_origin.response_fragment_sent_ns[1].load(
+            std::memory_order_acquire);
+    const u64 complete_part3_origin_ns =
+        default_buffering_complete_origin.response_fragment_sent_ns[2].load(
+            std::memory_order_acquire);
+    std::cerr
+        << "PASS: pinned nginx default response buffering withholds fragmented complete "
+           "body, then emits it atomically (origin-gaps="
+        << static_cast<double>(complete_part2_origin_ns - complete_first_origin_ns) / 1e9 << "/"
+        << static_cast<double>(complete_part3_origin_ns - complete_part2_origin_ns) / 1e9 << "/"
+        << static_cast<double>(complete_final_origin_ns - complete_part3_origin_ns) / 1e9
+        << ", origin-span/final-to-first/final-to-complete/final-to-origin-close seconds="
+        << static_cast<double>(complete_final_origin_ns - complete_first_origin_ns) / 1e9 << "/"
+        << static_cast<double>(default_buffering_complete_observation.first_downstream_byte_ns -
+                               complete_final_origin_ns) /
+               1e9
+        << "/"
+        << static_cast<double>(default_buffering_complete_observation.downstream_complete_ns -
+                               complete_final_origin_ns) /
+               1e9
+        << "/" << static_cast<double>(complete_origin_closed_ns - complete_final_origin_ns) / 1e9
+        << ", four origin writes, one upstream request)\n";
+
     // Restore the converter fragment's minimal nginx config for the existing
-    // differential cases. The semantic baseline above is intentionally not
+    // differential cases. The semantic baselines above are intentionally not
     // parsed, lowered, or compared to RUT.
     if (!write_file(temp.nginx_config, nginx_config.data(), nginx_config.size())) {
         std::cerr << "FAIL [nginx-config]: config restore after semantic baseline failed\n";
