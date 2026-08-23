@@ -692,6 +692,30 @@ TEST(nginx_converter, lowers_canonical_model_to_stable_rut_source) {
     static constexpr char kExpected[] =
         "listen :8080\n"
         "upstream nginx_upstream at \"127.0.0.1:9000\"\n"
+        "unmatched OPTIONS { return local_response({\n"
+        "  version: \"HTTP/1.1\", status: 400, reason: \"Bad Request\", server: \"nginx/1.29.7\",\n"
+        "  date: \"current\", content_type: \"text/html\", connection: \"request\",\n"
+        "  head_mode: \"reject\", body: b\"<html>\\r\\n<head><title>400 Bad "
+        "Request</title></head>\\r\\n"
+        "<body>\\r\\n<center><h1>400 Bad Request</h1></center>\\r\\n"
+        "<hr><center>nginx/1.29.7</center>\\r\\n</body>\\r\\n</html>\\r\\n\"\n"
+        "}) }\n"
+        "unmatched CONNECT { return local_response({\n"
+        "  version: \"HTTP/1.1\", status: 405, reason: \"Not Allowed\", server: \"nginx/1.29.7\",\n"
+        "  date: \"current\", content_type: \"text/html\", connection: \"request\",\n"
+        "  head_mode: \"reject\", body: b\"<html>\\r\\n<head><title>405 Not "
+        "Allowed</title></head>\\r\\n"
+        "<body>\\r\\n<center><h1>405 Not Allowed</h1></center>\\r\\n"
+        "<hr><center>nginx/1.29.7</center>\\r\\n</body>\\r\\n</html>\\r\\n\"\n"
+        "}) }\n"
+        "unmatched { return local_response({\n"
+        "  version: \"HTTP/1.1\", status: 400, reason: \"Bad Request\", server: \"nginx/1.29.7\",\n"
+        "  date: \"current\", content_type: \"text/html\", connection: \"request\",\n"
+        "  head_mode: \"suppress_body\", body: b\"<html>\\r\\n<head><title>400 Bad "
+        "Request</title></head>\\r\\n"
+        "<body>\\r\\n<center><h1>400 Bad Request</h1></center>\\r\\n"
+        "<hr><center>nginx/1.29.7</center>\\r\\n</body>\\r\\n</html>\\r\\n\"\n"
+        "}) }\n"
         "route \"/\" {\n"
         "    if req.method == HEAD {\n"
         "        return forward(nginx_upstream, request_policy: {\n"
@@ -762,6 +786,30 @@ TEST(nginx_converter, lowers_api_model_to_stable_target_transform_source) {
     static constexpr char kExpected[] =
         "listen :8080\n"
         "upstream nginx_upstream at \"127.0.0.1:9000\"\n"
+        "unmatched OPTIONS { return local_response({\n"
+        "  version: \"HTTP/1.1\", status: 400, reason: \"Bad Request\", server: \"nginx/1.29.7\",\n"
+        "  date: \"current\", content_type: \"text/html\", connection: \"request\",\n"
+        "  head_mode: \"reject\", body: b\"<html>\\r\\n<head><title>400 Bad "
+        "Request</title></head>\\r\\n"
+        "<body>\\r\\n<center><h1>400 Bad Request</h1></center>\\r\\n"
+        "<hr><center>nginx/1.29.7</center>\\r\\n</body>\\r\\n</html>\\r\\n\"\n"
+        "}) }\n"
+        "unmatched CONNECT { return local_response({\n"
+        "  version: \"HTTP/1.1\", status: 405, reason: \"Not Allowed\", server: \"nginx/1.29.7\",\n"
+        "  date: \"current\", content_type: \"text/html\", connection: \"request\",\n"
+        "  head_mode: \"reject\", body: b\"<html>\\r\\n<head><title>405 Not "
+        "Allowed</title></head>\\r\\n"
+        "<body>\\r\\n<center><h1>405 Not Allowed</h1></center>\\r\\n"
+        "<hr><center>nginx/1.29.7</center>\\r\\n</body>\\r\\n</html>\\r\\n\"\n"
+        "}) }\n"
+        "unmatched { return local_response({\n"
+        "  version: \"HTTP/1.1\", status: 400, reason: \"Bad Request\", server: \"nginx/1.29.7\",\n"
+        "  date: \"current\", content_type: \"text/html\", connection: \"request\",\n"
+        "  head_mode: \"suppress_body\", body: b\"<html>\\r\\n<head><title>400 Bad "
+        "Request</title></head>\\r\\n"
+        "<body>\\r\\n<center><h1>400 Bad Request</h1></center>\\r\\n"
+        "<hr><center>nginx/1.29.7</center>\\r\\n</body>\\r\\n</html>\\r\\n\"\n"
+        "}) }\n"
         "route \"/api\" {\n"
         "    if req.method == GET && req.pathOnly == \"/api\" {\n"
         "        return redirect({scheme: \"http\", authority: \"request_host\", port: "
@@ -844,14 +892,71 @@ TEST(nginx_converter, emitted_source_reaches_rir_with_source_metadata) {
     auto ast = parse_file(lexed.value());
     REQUIRE(ast);
     std::unique_ptr<AstFile> ast_owned(ast.value());
-    REQUIRE_EQ(ast_owned->items.len, 3u);
+    REQUIRE_EQ(ast_owned->items.len, 6u);
     CHECK(ast_owned->items[0].kind == AstItemKind::Listen);
     CHECK_EQ(ast_owned->items[0].listen.port, 8080u);
+    CHECK(ast_owned->items[1].kind == AstItemKind::Upstream);
+    CHECK(ast_owned->items[2].kind == AstItemKind::Unmatched);
+    CHECK(ast_owned->items[3].kind == AstItemKind::Unmatched);
+    CHECK(ast_owned->items[4].kind == AstItemKind::Unmatched);
+    CHECK(ast_owned->items[5].kind == AstItemKind::Route);
+    REQUIRE_EQ(ast_owned->strict_local_response_policies.len, 3u);
+    CHECK_EQ(ast_owned->unmatched_policy_ids[kRouteMethodOptions], 1u);
+    CHECK_EQ(ast_owned->unmatched_policy_ids[kRouteMethodConnect], 2u);
+    CHECK_EQ(ast_owned->unmatched_policy_ids[kRouteMethodAny], 3u);
+    for (u32 slot = 0; slot < kRouteMethodSlots; slot++)
+        CHECK_EQ(ast_owned->unmatched_policy_ids[slot],
+                 slot == kRouteMethodOptions   ? 1u
+                 : slot == kRouteMethodConnect ? 2u
+                 : slot == kRouteMethodAny     ? 3u
+                                               : 0u);
+    static constexpr char kBadRequestBody[] =
+        "<html>\r\n<head><title>400 Bad Request</title></head>\r\n<body>\r\n"
+        "<center><h1>400 Bad Request</h1></center>\r\n<hr><center>nginx/1.29.7</center>\r\n"
+        "</body>\r\n</html>\r\n";
+    static constexpr char kNotAllowedBody[] =
+        "<html>\r\n<head><title>405 Not Allowed</title></head>\r\n<body>\r\n"
+        "<center><h1>405 Not Allowed</h1></center>\r\n<hr><center>nginx/1.29.7</center>\r\n"
+        "</body>\r\n</html>\r\n";
+    const auto check_unmatched_policy = [&](const auto& policy,
+                                            u16 status,
+                                            const char* reason,
+                                            const char* body,
+                                            StrictLocalResponseHeadMode head_mode) {
+        CHECK_EQ(policy.version, StrictLocalResponseVersion::Http11);
+        CHECK_EQ(policy.status_code, status);
+        CHECK_EQ(policy.date, StrictLocalResponseDate::Current);
+        CHECK_EQ(policy.connection, StrictLocalResponseConnection::Request);
+        CHECK_EQ(policy.head_mode, head_mode);
+        CHECK(policy.reason.eq({reason, static_cast<u32>(strlen(reason))}));
+        CHECK(policy.server.eq(lit_str("nginx/1.29.7")));
+        CHECK(policy.content_type.eq(lit_str("text/html")));
+        CHECK(policy.body.eq({body, static_cast<u32>(strlen(body))}));
+    };
+    check_unmatched_policy(ast_owned->strict_local_response_policies[0],
+                           400,
+                           "Bad Request",
+                           kBadRequestBody,
+                           StrictLocalResponseHeadMode::Reject);
+    check_unmatched_policy(ast_owned->strict_local_response_policies[1],
+                           405,
+                           "Not Allowed",
+                           kNotAllowedBody,
+                           StrictLocalResponseHeadMode::Reject);
+    check_unmatched_policy(ast_owned->strict_local_response_policies[2],
+                           400,
+                           "Bad Request",
+                           kBadRequestBody,
+                           StrictLocalResponseHeadMode::SuppressBody);
     auto hir = analyze_file(*ast_owned);
     REQUIRE(hir);
     std::unique_ptr<HirModule> hir_owned(hir.value());
     REQUIRE(hir_owned->has_listener);
     CHECK_EQ(hir_owned->listener.port, 8080u);
+    REQUIRE_EQ(hir_owned->strict_local_response_policies.len, 3u);
+    CHECK_EQ(hir_owned->unmatched_policy_ids[kRouteMethodOptions], 1u);
+    CHECK_EQ(hir_owned->unmatched_policy_ids[kRouteMethodConnect], 2u);
+    CHECK_EQ(hir_owned->unmatched_policy_ids[kRouteMethodAny], 3u);
     // Listener declarations are startup metadata rather than RIR route state;
     // exercise the same source-to-startup resolution boundary used by main.
     ListenerSpec source_listener{};
@@ -886,6 +991,10 @@ TEST(nginx_converter, emitted_source_reaches_rir_with_source_metadata) {
     CHECK_EQ(mir_owned->upstreams[0].port, 9000u);
     REQUIRE_EQ(mir_owned->response_policies.len, 2u);
     REQUIRE_EQ(mir_owned->failure_policies.len, 2u);
+    REQUIRE_EQ(mir_owned->strict_local_response_policies.len, 3u);
+    CHECK_EQ(mir_owned->unmatched_policy_ids[kRouteMethodOptions], 1u);
+    CHECK_EQ(mir_owned->unmatched_policy_ids[kRouteMethodConnect], 2u);
+    CHECK_EQ(mir_owned->unmatched_policy_ids[kRouteMethodAny], 3u);
     REQUIRE_EQ(mir_owned->functions.len, 1u);
     CHECK_EQ(mir_owned->functions[0].method, 0u);
     CHECK(mir_owned->functions[0].path.eq(lit_str("/")));
@@ -913,6 +1022,19 @@ TEST(nginx_converter, emitted_source_reaches_rir_with_source_metadata) {
     RirGuard rir_guard{rir};
     REQUIRE(lower_to_rir(*mir_owned, rir));
     REQUIRE_EQ(rir.module.upstream_count, 1u);
+    REQUIRE_EQ(rir.module.strict_local_response_policy_count, 3u);
+    CHECK_EQ(rir.module.unmatched_policy_ids[kRouteMethodOptions], 1u);
+    CHECK_EQ(rir.module.unmatched_policy_ids[kRouteMethodConnect], 2u);
+    CHECK_EQ(rir.module.unmatched_policy_ids[kRouteMethodAny], 3u);
+    CHECK_EQ(rir.module.strict_local_response_policies[0].status_code, 400u);
+    CHECK_EQ(rir.module.strict_local_response_policies[1].status_code, 405u);
+    CHECK_EQ(rir.module.strict_local_response_policies[2].status_code, 400u);
+    CHECK(rir.module.strict_local_response_policies[0].head_mode ==
+          StrictLocalResponseHeadMode::Reject);
+    CHECK(rir.module.strict_local_response_policies[1].head_mode ==
+          StrictLocalResponseHeadMode::Reject);
+    CHECK(rir.module.strict_local_response_policies[2].head_mode ==
+          StrictLocalResponseHeadMode::SuppressBody);
     CHECK(rir.module.upstreams[0].name.eq(lit_str("nginx_upstream")));
     CHECK(rir.module.upstreams[0].has_address);
     CHECK_EQ(rir.module.upstreams[0].ip, 0x7F000001u);
@@ -1002,6 +1124,20 @@ TEST(nginx_converter, emitted_source_reaches_rir_with_source_metadata) {
     REQUIRE_EQ(populated.response_policy_count, 2u);
     REQUIRE_EQ(populated.failure_policy_count, 2u);
     REQUIRE_EQ(populated.policy_bundle_count, 2u);
+    REQUIRE_EQ(populated.strict_local_response_policy_count, 3u);
+    CHECK_EQ(populated.unmatched_policy_ids[kRouteMethodOptions], 1u);
+    CHECK_EQ(populated.unmatched_policy_ids[kRouteMethodConnect], 2u);
+    CHECK_EQ(populated.unmatched_policy_ids[kRouteMethodAny], 3u);
+    CHECK(populated.unmatched_policy_table_is_valid());
+    CHECK_EQ(populated.strict_local_response_policies[0].body.len, 157u);
+    CHECK_EQ(populated.strict_local_response_policies[1].body.len, 157u);
+    CHECK_EQ(populated.strict_local_response_policies[2].body.len, 157u);
+    CHECK(populated.strict_local_response_policies[0].head_mode ==
+          StrictLocalResponseHeadMode::Reject);
+    CHECK(populated.strict_local_response_policies[1].head_mode ==
+          StrictLocalResponseHeadMode::Reject);
+    CHECK(populated.strict_local_response_policies[2].head_mode ==
+          StrictLocalResponseHeadMode::SuppressBody);
     CHECK(populated.response_policies[0].head_mode == ResponsePolicyHeadMode::SuppressBody);
     CHECK(populated.response_policies[1].head_mode == ResponsePolicyHeadMode::Reject);
     CHECK(populated.failure_policies[0].head_mode == FailurePolicyHeadMode::SuppressBody);
@@ -1020,9 +1156,17 @@ TEST(nginx_converter, emitted_api_source_reaches_rir_with_target_transform) {
     auto ast = parse_file(lexed.value());
     REQUIRE(ast);
     std::unique_ptr<AstFile> ast_owned(ast.value());
+    REQUIRE_EQ(ast_owned->strict_local_response_policies.len, 3u);
+    CHECK_EQ(ast_owned->unmatched_policy_ids[kRouteMethodOptions], 1u);
+    CHECK_EQ(ast_owned->unmatched_policy_ids[kRouteMethodConnect], 2u);
+    CHECK_EQ(ast_owned->unmatched_policy_ids[kRouteMethodAny], 3u);
     auto hir = analyze_file(*ast_owned);
     REQUIRE(hir);
     std::unique_ptr<HirModule> hir_owned(hir.value());
+    REQUIRE_EQ(hir_owned->strict_local_response_policies.len, 3u);
+    CHECK_EQ(hir_owned->unmatched_policy_ids[kRouteMethodOptions], 1u);
+    CHECK_EQ(hir_owned->unmatched_policy_ids[kRouteMethodConnect], 2u);
+    CHECK_EQ(hir_owned->unmatched_policy_ids[kRouteMethodAny], 3u);
     REQUIRE_EQ(hir_owned->routes.len, 1u);
     CHECK_EQ(hir_owned->routes[0].control.kind, HirControlKind::If);
     const auto& hir_redirect = hir_owned->routes[0].control.then_term;
@@ -1040,6 +1184,10 @@ TEST(nginx_converter, emitted_api_source_reaches_rir_with_target_transform) {
     auto mir = build_mir(*hir_owned);
     REQUIRE(mir);
     std::unique_ptr<MirModule> mir_owned(mir.value());
+    REQUIRE_EQ(mir_owned->strict_local_response_policies.len, 3u);
+    CHECK_EQ(mir_owned->unmatched_policy_ids[kRouteMethodOptions], 1u);
+    CHECK_EQ(mir_owned->unmatched_policy_ids[kRouteMethodConnect], 2u);
+    CHECK_EQ(mir_owned->unmatched_policy_ids[kRouteMethodAny], 3u);
     CHECK(mir_owned->functions[0].path.eq(lit_str("/api")));
     bool mir_redirect = false;
     bool mir_forward = false;
@@ -1065,6 +1213,10 @@ TEST(nginx_converter, emitted_api_source_reaches_rir_with_target_transform) {
     REQUIRE(lower_to_rir(*mir_owned, rir));
     auto verified = rir::verify_module(rir.module);
     REQUIRE(verified.ok);
+    REQUIRE_EQ(rir.module.strict_local_response_policy_count, 3u);
+    CHECK_EQ(rir.module.unmatched_policy_ids[kRouteMethodOptions], 1u);
+    CHECK_EQ(rir.module.unmatched_policy_ids[kRouteMethodConnect], 2u);
+    CHECK_EQ(rir.module.unmatched_policy_ids[kRouteMethodAny], 3u);
     REQUIRE_EQ(rir.module.target_transform_count, 1u);
     CHECK(rir.module.target_transforms[0].strip_prefix.eq(lit_str("/api/")));
     CHECK(rir.module.target_transforms[0].replace_prefix.eq(lit_str("/")));
@@ -1133,6 +1285,13 @@ TEST(nginx_converter, emitted_api_source_reaches_rir_with_target_transform) {
     CHECK(saw_branch);
     CHECK(saw_redirect);
     CHECK(saw_forward);
+    RouteConfig populated{};
+    REQUIRE(populate_route_config(populated, rir.module));
+    REQUIRE_EQ(populated.strict_local_response_policy_count, 3u);
+    CHECK_EQ(populated.unmatched_policy_ids[kRouteMethodOptions], 1u);
+    CHECK_EQ(populated.unmatched_policy_ids[kRouteMethodConnect], 2u);
+    CHECK_EQ(populated.unmatched_policy_ids[kRouteMethodAny], 3u);
+    CHECK(populated.unmatched_policy_table_is_valid());
 }
 
 TEST(nginx_converter, rejects_parsed_proxy_read_timeout_before_lowering) {

@@ -10,10 +10,11 @@ namespace rut::nginx {
 // parsed nginx source is released and makes overflow a diagnostic rather than
 // a truncated program.
 struct RutSource {
-    // The API model emits one explicit redirect policy plus the existing
-    // forward policy bundle.  3072 bytes bounds that combined source while
-    // leaving overflow fail-closed for future model growth.
-    static constexpr u32 kCapacity = 3072;
+    // The API model emits three bounded unmatched policies, one explicit
+    // redirect policy, plus the existing forward policy bundle.  4096 bytes
+    // bounds the largest currently accepted output (3324 bytes) while leaving
+    // overflow fail-closed for future model growth.
+    static constexpr u32 kCapacity = 4096;
     char data[kCapacity]{};
     u32 len = 0;
 

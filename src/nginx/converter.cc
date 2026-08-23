@@ -137,6 +137,56 @@ private:
     RutSource& output_;
 };
 
+static constexpr char kBadRequestBody[] =
+    "<html>\\r\\n"
+    "<head><title>400 Bad Request</title></head>\\r\\n"
+    "<body>\\r\\n"
+    "<center><h1>400 Bad Request</h1></center>\\r\\n"
+    "<hr><center>nginx/1.29.7</center>\\r\\n"
+    "</body>\\r\\n"
+    "</html>\\r\\n";
+
+static constexpr char kNotAllowedBody[] =
+    "<html>\\r\\n"
+    "<head><title>405 Not Allowed</title></head>\\r\\n"
+    "<body>\\r\\n"
+    "<center><h1>405 Not Allowed</h1></center>\\r\\n"
+    "<hr><center>nginx/1.29.7</center>\\r\\n"
+    "</body>\\r\\n"
+    "</html>\\r\\n";
+
+bool put_unmatched(Writer& writer,
+                   const char* selector,
+                   u32 selector_len,
+                   u16 status,
+                   const char* reason,
+                   u32 reason_len,
+                   const char* body,
+                   u32 body_len) {
+    static constexpr char kPrefix[] = "unmatched";
+    static constexpr char kOpen[] = " { return local_response({\n";
+    static constexpr char kStatus[] = "  version: \"HTTP/1.1\", status: ";
+    static constexpr char kReason[] = ", reason: \"";
+    static constexpr char kServer[] = "\", server: \"nginx/1.29.7\",\n";
+    static constexpr char kFields[] =
+        "  date: \"current\", content_type: \"text/html\", connection: \"request\",\n";
+    static constexpr char kHeadMode[] = "  head_mode: \"";
+    static constexpr char kBody[] = "\", body: b\"";
+    static constexpr char kClose[] = "\"\n}) }\n";
+    const char* head_mode = selector_len == 0 ? "suppress_body" : "reject";
+    const u32 head_mode_len = selector_len == 0 ? 13u : 6u;
+    return writer.put_lit(kPrefix, sizeof(kPrefix) - 1) &&
+           (selector_len == 0 || writer.put_lit(" ", 1)) &&
+           writer.put_lit(selector, selector_len) && writer.put_lit(kOpen, sizeof(kOpen) - 1) &&
+           writer.put_lit(kStatus, sizeof(kStatus) - 1) && writer.put_u16(status) &&
+           writer.put_lit(kReason, sizeof(kReason) - 1) && writer.put_lit(reason, reason_len) &&
+           writer.put_lit(kServer, sizeof(kServer) - 1) &&
+           writer.put_lit(kFields, sizeof(kFields) - 1) &&
+           writer.put_lit(kHeadMode, sizeof(kHeadMode) - 1) &&
+           writer.put_lit(head_mode, head_mode_len) && writer.put_lit(kBody, sizeof(kBody) - 1) &&
+           writer.put_lit(body, body_len) && writer.put_lit(kClose, sizeof(kClose) - 1);
+}
+
 }  // namespace
 
 FrontendResult<RutSource> lower_to_rut(const Server& server) {
@@ -179,6 +229,35 @@ FrontendResult<RutSource> lower_to_rut(const Server& server) {
         !put("upstream nginx_upstream at \"") ||
         !writer.put_ipv4(server.location.proxy_pass.address) || !put(":") ||
         !writer.put_u16(proxy.port) || !put("\"\n"))
+        return fail_overflow();
+
+    // These policies cover only the converter's bounded unmatched-request
+    // domain. OPTIONS and CONNECT reject exactly, while the method-omitted
+    // policy is a fail-closed 400 and suppresses a possible HEAD body.
+    if (!put_unmatched(writer,
+                       "OPTIONS",
+                       7,
+                       400,
+                       "Bad Request",
+                       11,
+                       kBadRequestBody,
+                       static_cast<u32>(__builtin_strlen(kBadRequestBody))) ||
+        !put_unmatched(writer,
+                       "CONNECT",
+                       7,
+                       405,
+                       "Not Allowed",
+                       11,
+                       kNotAllowedBody,
+                       static_cast<u32>(__builtin_strlen(kNotAllowedBody))) ||
+        !put_unmatched(writer,
+                       "",
+                       0,
+                       400,
+                       "Bad Request",
+                       11,
+                       kBadRequestBody,
+                       static_cast<u32>(__builtin_strlen(kBadRequestBody))))
         return fail_overflow();
 
     if (is_root) {
