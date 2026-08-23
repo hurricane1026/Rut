@@ -23035,6 +23035,96 @@ TEST(response_read_deadline_get_positive_cl,
 }
 
 TEST(response_read_deadline_get_positive_cl,
+     fragmented_header_transition_rebases_zero_or_positive_initial_body_in_timeout_either_order) {
+    for (const u32 initial_body : {0u, 1u}) {
+        for (const bool timeout_first : {false, true}) {
+            ScopedIoUringLoopForRetirement guard;
+            if (!guard.init()) SKIP("io_uring unavailable");
+            auto* loop = guard.loop;
+            RouteConfig config{};
+            REQUIRE(config.add_upstream("backend", 0x7F000001, 9000).has_value());
+            REQUIRE(add_bodyless_non_head_response_read_deadline_bundle(config));
+            PrebuiltD2Fixture fixture{};
+            REQUIRE(stage_strict_read_timeout(loop, &config, nullptr, 0, &fixture, true));
+            REQUIRE(arm_staged_response_read_deadline(loop, fixture));
+            Connection& conn = *fixture.conn;
+            static constexpr u8 kHeader[] = "HTTP/1.1 200 OK\r\nContent-Length: 3\r\n\r\n";
+            static constexpr u8 kBody[] = {'a', 'b', 'c'};
+            constexpr u32 kHeaderLen = sizeof(kHeader) - 1u;
+            constexpr u32 kSplit = 20;
+            REQUIRE_LT(kSplit, kHeaderLen);
+
+            REQUIRE_EQ(conn.upstream_recv_buf.write(kHeader, kSplit), kSplit);
+            const IoEvent first = response_read_copy_event(conn, kSplit, true, 0, kSplit);
+            loop->dispatch_batch(&first, 1);
+            REQUIRE_GE(conn.fd, 0);
+            REQUIRE_EQ(conn.response_read_deadline_state, ResponseReadDeadlineState::Armed);
+            REQUIRE_EQ(conn.response_read_deadline_progress_generation,
+                       conn.response_read_deadline_generation);
+            REQUIRE_EQ(conn.response_read_deadline_progress_episode, conn.upstream_episode);
+            REQUIRE_EQ(conn.response_read_deadline_progress_bytes, kSplit);
+
+            REQUIRE_EQ(conn.upstream_recv_buf.write(kHeader + kSplit, kHeaderLen - kSplit),
+                       kHeaderLen - kSplit);
+            if (initial_body != 0)
+                REQUIRE_EQ(conn.upstream_recv_buf.write(kBody, initial_body), initial_body);
+            const u32 selection_bytes = kHeaderLen - kSplit + initial_body;
+            const IoEvent finish_header = response_read_copy_event(
+                conn, selection_bytes, true, kSplit, kHeaderLen + initial_body);
+            loop->timer.remove(&conn);
+            loop->timer.add(&conn, 0);
+            const IoEvent timeout{0, 1, 0, 0, IoEventType::Timeout, 0};
+            const IoEvent selection_batch[2] = {timeout_first ? timeout : finish_header,
+                                                timeout_first ? finish_header : timeout};
+            loop->dispatch_batch(selection_batch, 2);
+
+            REQUIRE_GE(conn.fd, 0);
+            REQUIRE_EQ(conn.response_read_deadline_post_commit_phase,
+                       ResponseReadDeadlinePostCommitPhase::HeaderSend);
+            REQUIRE_EQ(conn.response_read_deadline_state, ResponseReadDeadlineState::Armed);
+            CHECK_EQ(conn.response_read_deadline_post_commit_origin_received, initial_body);
+            CHECK_EQ(conn.response_read_deadline_progress_generation,
+                     conn.response_read_deadline_generation);
+            CHECK_EQ(conn.response_read_deadline_progress_episode, conn.upstream_episode);
+            CHECK_EQ(conn.response_read_deadline_progress_bytes, initial_body);
+            CHECK_FALSE(
+                buf_has(conn.response_header_buf.data(), conn.response_header_buf.len(), "504"));
+
+            IoEvent header_sent = exact_response_deadline_send_event(loop, conn);
+            loop->dispatch_batch(&header_sent, 1);
+            if (initial_body != 0) {
+                REQUIRE_EQ(conn.response_read_deadline_post_commit_phase,
+                           ResponseReadDeadlinePostCommitPhase::BodySend);
+                REQUIRE_EQ(loop->backend.send_state[conn.id].remaining, initial_body);
+                IoEvent initial_body_sent = exact_response_deadline_send_event(loop, conn);
+                loop->dispatch_batch(&initial_body_sent, 1);
+            }
+            REQUIRE_EQ(conn.response_read_deadline_post_commit_phase,
+                       ResponseReadDeadlinePostCommitPhase::WaitingBody);
+
+            for (u32 i = initial_body; i < sizeof(kBody); ++i) {
+                REQUIRE_EQ(conn.upstream_recv_buf.write(kBody + i, 1), 1u);
+                const IoEvent body = response_read_copy_event(conn, 1, true, 0, 1);
+                loop->dispatch_batch(&body, 1);
+                REQUIRE_EQ(conn.response_read_deadline_post_commit_phase,
+                           ResponseReadDeadlinePostCommitPhase::BodySend);
+                IoEvent body_sent = exact_response_deadline_send_event(loop, conn);
+                loop->dispatch_batch(&body_sent, 1);
+            }
+            REQUIRE(conn.upstream_retirement_active);
+            CHECK_EQ(conn.response_read_deadline_state, ResponseReadDeadlineState::None);
+            CHECK_EQ(conn.response_read_deadline_post_commit_phase,
+                     ResponseReadDeadlinePostCommitPhase::None);
+            drain_prebuilt_d2_retirement(loop, conn, kUpstreamOpRecv, false);
+            REQUIRE(conn.http1_boundary_ready);
+            loop->resume_deferred_http1_boundaries();
+            CHECK_EQ(conn.state, ConnState::ReadingHeader);
+            cleanup_prebuilt_d2(loop, fixture);
+        }
+    }
+}
+
+TEST(response_read_deadline_get_positive_cl,
      progress_while_header_send_is_inflight_completes_owner_without_refresh_timeout) {
     ScopedIoUringLoopForRetirement guard;
     if (!guard.init()) SKIP("io_uring unavailable");

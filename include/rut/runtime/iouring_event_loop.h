@@ -2144,6 +2144,22 @@ public:
             return false;
         const u32 initial_body = c.upstream_recv_buf.len() - raw_header_end;
         if (initial_body > declared_body) return false;
+        const bool fragmented_header_transition =
+            c.response_read_deadline_progress_generation == c.response_read_deadline_generation &&
+            c.response_read_deadline_progress_episode == c.upstream_episode &&
+            c.response_read_deadline_progress_bytes != 0 &&
+            c.response_read_deadline_progress_bytes < raw_header_end;
+
+        // The pre-header ledger records cumulative raw header bytes. Once this
+        // exact batch proves the final header boundary and selects a positive-
+        // CL stream, that prefix is no longer response body progress. Consume
+        // only this generation/episode-bound proof; settle installs the exact
+        // coalesced initial-body count as the new post-commit progress identity.
+        if (fragmented_header_transition) {
+            c.response_read_deadline_progress_generation = 0;
+            c.response_read_deadline_progress_episode = 0;
+            c.response_read_deadline_progress_bytes = 0;
+        }
 
         c.response_read_deadline_post_commit_phase =
             ResponseReadDeadlinePostCommitPhase::HeaderSend;
