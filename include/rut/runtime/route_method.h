@@ -42,8 +42,9 @@ inline bool complete_content_length_route_method_is_admitted(u8 method) {
         case kRouteMethodTrace:
         case kRouteMethodInvalid:
             return false;
+        default:
+            return false;
     }
-    return false;
 }
 
 inline u8 route_method_key(HttpMethod method) {
