@@ -1926,17 +1926,142 @@ static bool exercise_incomplete_eof_head_reuse(u16 frontend_port,
 }
 
 static bool normalize_date(std::vector<char>& bytes) {
-    const char needle[] = "Date: ";
-    for (size_t i = 0; i + sizeof(needle) - 1 + 30 < bytes.size(); i++) {
-        if (memcmp(bytes.data() + i, needle, sizeof(needle) - 1) != 0) continue;
-        if (i != 0 && bytes[i - 1] != '\n') continue;
-        if (bytes[i + sizeof(needle) - 1 + 29] != '\r' ||
-            bytes[i + sizeof(needle) - 1 + 30] != '\n')
-            return false;
-        memset(bytes.data() + i + sizeof(needle) - 1, 'X', 29);
-        return true;
+    const size_t header_length = header_end(bytes);
+    if (header_length == 0) return false;
+
+    size_t date_count = 0;
+    size_t date_start = 0;
+    for (size_t line_start = 0; line_start < header_length;) {
+        size_t line_end = line_start;
+        while (line_end + 1 < header_length &&
+               !(bytes[line_end] == '\r' && bytes[line_end + 1] == '\n'))
+            line_end++;
+        if (line_end + 1 >= header_length) return false;
+        if (line_end == line_start) break;
+        if (line_end - line_start >= 6 &&
+            memcmp(bytes.data() + line_start, "Date: ", sizeof("Date: ") - 1) == 0) {
+            date_count++;
+            if (date_count != 1) return false;
+            date_start = line_start + sizeof("Date: ") - 1;
+            if (line_end - date_start != 29) return false;
+        }
+        line_start = line_end + 2;
     }
-    return false;
+    if (date_count != 1) return false;
+
+    const char* date = bytes.data() + date_start;
+    const auto is_digit = [](char c) { return c >= '0' && c <= '9'; };
+    const auto token_is_one_of = [](const char* value, const char* const* tokens, size_t count) {
+        for (size_t i = 0; i < count; i++)
+            if (memcmp(value, tokens[i], 3) == 0) return true;
+        return false;
+    };
+    static const char* const kWeekdays[] = {"Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"};
+    static const char* const kMonths[] = {
+        "Jan",
+        "Feb",
+        "Mar",
+        "Apr",
+        "May",
+        "Jun",
+        "Jul",
+        "Aug",
+        "Sep",
+        "Oct",
+        "Nov",
+        "Dec",
+    };
+    const auto two_digits = [&](size_t offset) {
+        return is_digit(date[offset]) && is_digit(date[offset + 1])
+                   ? static_cast<unsigned>(date[offset] - '0') * 10u +
+                         static_cast<unsigned>(date[offset + 1] - '0')
+                   : 100u;
+    };
+    if (!token_is_one_of(date, kWeekdays, sizeof(kWeekdays) / sizeof(kWeekdays[0])) ||
+        date[3] != ',' || date[4] != ' ' || date[7] != ' ' ||
+        !token_is_one_of(date + 8, kMonths, sizeof(kMonths) / sizeof(kMonths[0])) ||
+        date[11] != ' ' || date[16] != ' ' || date[19] != ':' || date[22] != ':' ||
+        date[25] != ' ' || memcmp(date + 26, "GMT", 3) != 0)
+        return false;
+    for (size_t i = 12; i < 16; i++)
+        if (!is_digit(date[i])) return false;
+    const unsigned day = two_digits(5);
+    const unsigned hour = two_digits(17);
+    const unsigned minute = two_digits(20);
+    const unsigned second = two_digits(23);
+    if (day < 1 || day > 31 || hour > 23 || minute > 59 || second > 59) return false;
+
+    // Mutation is deliberately last: invalid input remains byte-for-byte unchanged.
+    memset(bytes.data() + date_start, 'X', 29);
+    return true;
+}
+
+static bool run_normalize_date_self_checks() {
+    static constexpr char kValidPrefix[] = "HTTP/1.1 400 Bad Request\r\nDate: ";
+    static constexpr char kValidDate[] = "Tue, 01 Jan 2030 00:00:00 GMT";
+    static constexpr char kValidSuffix[] = "\r\nContent-Length: 0\r\n\r\n";
+    const std::string valid_wire = std::string(kValidPrefix) + kValidDate + kValidSuffix;
+
+    std::vector<char> valid(valid_wire.begin(), valid_wire.end());
+    const std::string valid_body_date = valid_wire + "Date: body-is-not-a-header\r\n";
+    valid.assign(valid_body_date.begin(), valid_body_date.end());
+    const std::vector<char> valid_before = valid;
+    if (!normalize_date(valid) || valid.size() != valid_before.size()) {
+        std::cerr << "FAIL [Date normalizer self-check]: valid Date was rejected\n";
+        return false;
+    }
+    const std::string expected_valid = std::string(kValidPrefix) + "XXXXXXXXXXXXXXXXXXXXXXXXXXXXX" +
+                                       kValidSuffix + "Date: body-is-not-a-header\r\n";
+    if (std::string(valid.begin(), valid.end()) != expected_valid) {
+        std::cerr << "FAIL [Date normalizer self-check]: valid Date mutation was not exact\n";
+        return false;
+    }
+
+    const auto expect_invalid = [](const char* label, const std::string& wire) {
+        std::vector<char> bytes(wire.begin(), wire.end());
+        const std::vector<char> before = bytes;
+        if (normalize_date(bytes) || bytes != before) {
+            std::cerr << "FAIL [Date normalizer self-check]: " << label
+                      << " was accepted or mutated\n";
+            return false;
+        }
+        return true;
+    };
+    if (!expect_invalid("duplicate Date header",
+                        valid_wire.substr(0, valid_wire.size() - 2) +
+                            "Date: Tue, 01 Jan 2030 00:00:00 GMT\r\n\r\n") ||
+        !expect_invalid(
+            "invalid weekday",
+            std::string(kValidPrefix) + "Xue, 01 Jan 2030 00:00:00 GMT" + kValidSuffix) ||
+        !expect_invalid(
+            "invalid punctuation",
+            std::string(kValidPrefix) + "Tue; 01 Jan 2030 00:00:00 GMT" + kValidSuffix) ||
+        !expect_invalid(
+            "invalid day range",
+            std::string(kValidPrefix) + "Tue, 00 Jan 2030 00:00:00 GMT" + kValidSuffix) ||
+        !expect_invalid(
+            "invalid month",
+            std::string(kValidPrefix) + "Tue, 01 Xxx 2030 00:00:00 GMT" + kValidSuffix) ||
+        !expect_invalid(
+            "invalid year digit",
+            std::string(kValidPrefix) + "Tue, 01 Jan 20X0 00:00:00 GMT" + kValidSuffix) ||
+        !expect_invalid(
+            "invalid hour range",
+            std::string(kValidPrefix) + "Tue, 01 Jan 2030 24:00:00 GMT" + kValidSuffix) ||
+        !expect_invalid(
+            "invalid minute range",
+            std::string(kValidPrefix) + "Tue, 01 Jan 2030 00:60:00 GMT" + kValidSuffix) ||
+        !expect_invalid(
+            "invalid second range",
+            std::string(kValidPrefix) + "Tue, 01 Jan 2030 00:00:60 GMT" + kValidSuffix) ||
+        !expect_invalid(
+            "invalid GMT suffix",
+            std::string(kValidPrefix) + "Tue, 01 Jan 2030 00:00:00 GMS" + kValidSuffix) ||
+        !expect_invalid(
+            "invalid fixed-width value",
+            std::string(kValidPrefix) + "Tue, 01 Jan 2030 00:00:00 GMTX" + kValidSuffix))
+        return false;
+    return true;
 }
 
 static void dump_wire(const char* label, const std::vector<char>& wire) {
@@ -4329,6 +4454,7 @@ int main(int argc, char** argv) {
         std::cerr << "FAIL [preflight]: secure temporary directory creation failed\n";
         return 1;
     }
+    if (!run_normalize_date_self_checks()) return 1;
     const char* suffix = strrchr(temp.path, '/');
     const std::string probe_name =
         "rut-nginx-probe-" + std::to_string(getpid()) + "-" + (suffix ? suffix + 1 : "tmp");
@@ -4489,6 +4615,48 @@ int main(int argc, char** argv) {
     }
     std::cerr << "PASS: pinned nginx rejects explicit-close authority-form CONNECT with the "
                  "exact generated 405 response and EOF and performs no upstream operation\n";
+
+    std::vector<char> rut_connect_authority_response;
+    std::string rut_connect_authority_error;
+    if (!capture_rut_local_rejection_case(frontend_port,
+                                          backend_port,
+                                          temp.source,
+                                          temp.rut_log,
+                                          argv[1],
+                                          "CONNECT authority-form",
+                                          kConnectAuthorityRequest,
+                                          sizeof(kConnectAuthorityRequest) - 1,
+                                          kConnectAuthorityResponseNormalized,
+                                          rut_connect_authority_response,
+                                          rut_connect_authority_error)) {
+        std::cerr << "FAIL [generated-RUT CONNECT authority-form]: " << rut_connect_authority_error
+                  << "\n";
+        dump_wire("pinned CONNECT authority-form response", connect_authority_response);
+        dump_wire("generated-RUT CONNECT authority-form response", rut_connect_authority_response);
+        dump_log(temp.nginx_log, "nginx CONNECT authority-form log");
+        dump_log(temp.rut_log, "generated-RUT CONNECT authority-form log");
+        return 1;
+    }
+    std::vector<char> normalized_nginx_connect = connect_authority_response;
+    std::vector<char> normalized_rut_connect = rut_connect_authority_response;
+    const std::vector<char> expected_connect_authority_response(
+        kConnectAuthorityResponseNormalized,
+        kConnectAuthorityResponseNormalized + sizeof(kConnectAuthorityResponseNormalized) - 1);
+    if (!normalize_date(normalized_nginx_connect) || !normalize_date(normalized_rut_connect) ||
+        normalized_nginx_connect != expected_connect_authority_response ||
+        normalized_rut_connect != expected_connect_authority_response ||
+        normalized_nginx_connect != normalized_rut_connect) {
+        std::cerr << "FAIL [CONNECT authority-form differential]: exact nginx/generated-RUT "
+                     "mismatch\n";
+        dump_wire("expected CONNECT authority-form response", expected_connect_authority_response);
+        dump_wire("nginx CONNECT authority-form response", connect_authority_response);
+        dump_wire("generated-RUT CONNECT authority-form response", rut_connect_authority_response);
+        dump_log(temp.nginx_log, "nginx CONNECT authority-form log");
+        dump_log(temp.rut_log, "generated-RUT CONNECT authority-form log");
+        return 1;
+    }
+    std::cerr << "PASS: converter-generated RUT authority-form CONNECT matches pinned nginx "
+                 "exactly after Date normalization, including EOF and zero upstream effects\n";
 
     Recorder default_buffering_timeout_origin;
     default_buffering_timeout_origin.wait_response_peer_close = true;
