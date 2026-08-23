@@ -114,6 +114,11 @@ struct IoUringBackend {
     // Same as add_recv but encodes UpstreamRecv in user_data so dispatch
     // can distinguish upstream vs client recv CQEs.
     bool add_recv_upstream(i32 fd, u32 conn_id, u32 upstream_episode = 1);
+    // One-shot counterpart used by the bounded downstream-TLS HTTP/1 proxy
+    // profile.  It retains provided-buffer selection and episode fencing but
+    // deliberately omits IORING_RECV_MULTISHOT so each CQE is consumed before
+    // another upstream buffer can be selected.
+    bool add_recv_upstream_once(i32 fd, u32 conn_id, u32 upstream_episode = 1);
     // Dedicated single submission point for the bounded explicit
     // first-response deadline.  It intentionally does not inherit the ordinary
     // recv path's idempotent/deferred-rearm semantics.

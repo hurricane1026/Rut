@@ -890,6 +890,7 @@ void proxy_tls_parked_drained(Loop* loop, Connection& conn, u32 newly) {
     // before re-arming the (paused) upstream read.
     if (conn.tls_out_buf.len() >= Loop::kTlsOutHigh) {
         conn.tls_recv_paused_hw = true;  // drain's low-watermark logic re-arms
+        observe_iouring_tls_high_water_pause();
         return;
     }
     if (throttle_pause_before_pump<Loop>(loop, conn, 0)) return;
@@ -4453,7 +4454,7 @@ void on_upstream_request_sent(void* lp, Connection& conn, IoEvent ev) {
                          conn.upstream_episode};
         on_upstream_response<Loop>(lp, conn, synth);
     } else {
-        loop->submit_recv_upstream(conn);
+        if (!loop->submit_recv_upstream(conn)) loop->close_conn(conn);
     }
 }
 
@@ -5035,7 +5036,7 @@ void on_response_header_sent(void* lp, Connection& conn, IoEvent ev) {
                          conn.upstream_episode};
         on_response_body_recvd<Loop>(lp, conn, synth);
     } else {
-        loop->submit_recv_upstream(conn);
+        if (!loop->submit_recv_upstream(conn)) loop->close_conn(conn);
     }
 }
 
@@ -5307,6 +5308,7 @@ void on_response_body_recvd(void* lp, Connection& conn, IoEvent ev) {
             // only drains, so a throttle pause/resume here can't overflow it.
             if (conn.tls_out_buf.len() >= Loop::kTlsOutHigh) {
                 conn.tls_recv_paused_hw = true;
+                observe_iouring_tls_high_water_pause();
                 // Cancel may fail to queue (SQ full) — close rather than let the
                 // multishot keep filling above the stop line.
                 if (!loop->pause_upstream_recv(conn)) loop->close_conn(conn);
@@ -7502,6 +7504,15 @@ void on_upstream_response(void* lp, Connection& conn, IoEvent ev) {
     // late event re-enter parsing, release state twice, or append bytes.
     if (conn.upstream_abandoned) return;
 
+    // io_uring wait may report -ENOBUFS after copying a lossy provided-buffer
+    // prefix into upstream_recv_buf.  Such bytes are not a complete ordered
+    // receive stream and must never reach the HTTP parser or downstream.
+    if (ev.result == -ENOBUFS) {
+        if (explicit_first_batch || explicit_progress_batch) disarm_explicit_deadline();
+        loop->close_conn(conn);
+        return;
+    }
+
     if (conn.upstream_start_us != 0) {
         conn.upstream_us = static_cast<u32>(monotonic_us() - conn.upstream_start_us);
         conn.upstream_start_us = 0;
@@ -7562,7 +7573,7 @@ void on_upstream_response(void* lp, Connection& conn, IoEvent ev) {
             loop->close_conn(conn);
             return;
         } else {
-            loop->submit_recv_upstream(conn);
+            if (!loop->submit_recv_upstream(conn)) loop->close_conn(conn);
             return;
         }
     }
@@ -7908,7 +7919,7 @@ void on_upstream_response(void* lp, Connection& conn, IoEvent ev) {
             return;
         }
         conn.upstream_recv_buf.reset();
-        loop->submit_recv_upstream(conn);
+        if (!loop->submit_recv_upstream(conn)) loop->close_conn(conn);
         return;
     }
 

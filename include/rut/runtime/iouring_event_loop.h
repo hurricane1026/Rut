@@ -1778,6 +1778,43 @@ public:
         return false;
     }
 
+    // A provided-buffer multishot recv can complete several 4 KiB CQEs in one
+    // backend wait before the TLS consumer gets a chance to drain them.  Keep
+    // the mode selection deliberately structural and episode-stable: only the
+    // ordinary, already-uploaded bodyless HTTP/1 proxy path behind downstream
+    // TLS may consume one provided buffer at a time.  Every excluded or
+    // ambiguous owner retains the established multishot path.
+    [[nodiscard]] bool use_one_shot_upstream_recv(const Connection& c) const {
+        const RouteConfig* cfg = c.request_config;
+        const bool ordinary_response_owner = c.on_upstream_recv == &on_upstream_response<Self> ||
+                                             c.on_upstream_recv == &on_response_body_recvd<Self>;
+        const bool normal_state = c.state == ConnState::Proxying || c.state == ConnState::Sending;
+        return c.fd >= 0 && c.upstream_fd >= 0 && c.tls_active && c.tls_handshake_complete &&
+               c.uses_iouring_tls() && c.protocol == ConnProtocol::Http11 && c.h2 == nullptr &&
+               normal_state && cfg != nullptr && c.upstream_idx < cfg->upstream_count &&
+               c.req_start_us != 0 && !c.epoch_held && ordinary_response_owner &&
+               c.on_upstream_send == nullptr && !c.upstream_connect_armed &&
+               !c.upstream_send_armed && valid_upstream_episode(c.upstream_episode) &&
+               !c.upstream_episode_quarantined && c.upstream_attempts == 1 &&
+               c.request_upload_complete && !c.upstream_request_incomplete &&
+               c.req_body_mode == BodyMode::None && c.req_body_remaining == 0 &&
+               !c.req_client_has_content_length && !c.req_client_has_transfer_encoding &&
+               !c.req_client_has_te && !c.req_client_has_expect &&
+               !c.req_client_has_upgrade_header && !c.req_wants_upgrade && !c.req_malformed &&
+               !c.request_policy_body_pending && !c.request_body_fully_buffered &&
+               !c.req_body_streamed && c.pipeline_depth == 0 && c.pipeline_stash_len == 0 &&
+               !c.is_health_probe && !c.h2_proxy_recv_draining && !c.h2_proxy_synth_quarantined &&
+               !c.is_ws_tunnel && !c.is_ws_terminate_route && !c.is_ws_terminate && !c.ws_closing &&
+               c.response_read_deadline_owner_is_neutral() && !c.upstream_abandoned &&
+               !c.upstream_recv_armed && !c.upstream_recv_paused_for_send &&
+               !c.upstream_recv_pause_cancel_pending && !c.upstream_recv_pause_rearm_pending &&
+               !c.upstream_recv_cancel_inflight && !c.upstream_recv_terminal_stale &&
+               !strict_upstream_retirement_blocks_reclaim(c) && c.idle_return_fd < 0 &&
+               c.idle_return_config == nullptr && !c.close_after_idle_return &&
+               !c.upstream_recv_idle_stale_bytes && !c.http1_boundary_deferred &&
+               c.http1_prebuilt_disposition == Http1RequestBufferDisposition::None;
+    }
+
     bool submit_recv_upstream_impl(Connection& c) {
         if (c.upstream_recv_paused_for_send) {
             c.upstream_recv_pause_rearm_pending = true;
@@ -1804,7 +1841,11 @@ public:
             c.upstream_recv_pause_rearm_pending = true;
             return true;
         }
-        if (backend.add_recv_upstream(c.upstream_fd, c.id, c.upstream_episode)) {
+        const bool submitted =
+            use_one_shot_upstream_recv(c)
+                ? backend.add_recv_upstream_once(c.upstream_fd, c.id, c.upstream_episode)
+                : backend.add_recv_upstream(c.upstream_fd, c.id, c.upstream_episode);
+        if (submitted) {
             c.pending_ops++;
             c.upstream_recv_armed = true;
             c.upstream_recv_pause_rearm_pending = false;

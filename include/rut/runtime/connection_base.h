@@ -102,6 +102,35 @@ struct ResponseReadDeadlineUploadProof {
     u16 upstream_id = 0xffffu;
     u16 request_policy_id = 0;
     jit::HandlerFn route_fn = nullptr;
+
+    template <typename Self, typename Visitor>
+    static void visit_owner_fields(Self& proof, Visitor&& visit) {
+        visit(proof.handler_generation, u32{0});
+        visit(proof.raw_header_end, u32{0});
+        visit(proof.raw_content_length, u32{0});
+        visit(proof.raw_total_length, u32{0});
+        visit(proof.rewritten_header_end, u32{0});
+        visit(proof.rewritten_total_length, u32{0});
+        visit(proof.upload_episode, u32{0});
+        visit(proof.expected_upload_length, u32{0});
+        visit(proof.route_index, u16{0xffffu});
+        visit(proof.upstream_id, u16{0xffffu});
+        visit(proof.request_policy_id, u16{0});
+        visit(proof.route_fn, static_cast<jit::HandlerFn>(nullptr));
+    }
+
+    [[nodiscard]] bool owner_is_neutral() const {
+        bool neutral = true;
+        visit_owner_fields(*this, [&](const auto& value, const auto& reset_value) {
+            neutral = neutral && value == reset_value;
+        });
+        return neutral;
+    }
+
+    void clear_owner() {
+        visit_owner_fields(*this,
+                           [](auto& value, const auto& reset_value) { value = reset_value; });
+    }
 };
 
 enum class Http1PrebuiltResponseLayout : u8 {
@@ -596,14 +625,8 @@ struct ConnectionBase {
     }
 
     void clear_response_read_deadline_send_owner() {
-        response_read_deadline_send_owner_generation = 0;
-        response_read_deadline_send_deadline_generation = 0;
-        response_read_deadline_send_upstream_episode = 0;
-        response_read_deadline_send_src = nullptr;
-        response_read_deadline_send_len = 0;
-        response_read_deadline_send_fd = -1;
-        response_read_deadline_send_kind = ResponseReadDeadlineSendKind::None;
-        response_read_deadline_send_owner_active = false;
+        visit_response_read_deadline_send_owner_fields(
+            *this, [](auto& value, const auto& reset_value) { value = reset_value; });
     }
 
     bool next_response_read_deadline_generation() {
@@ -613,41 +636,82 @@ struct ConnectionBase {
         return true;
     }
 
+    // Canonical inventories of active response-read-deadline ownership and
+    // their neutral values. Reset, mode selection, and exhaustive tests consume
+    // these same inventories so a new owner cannot drift between those paths.
+    template <typename Self, typename Visitor>
+    static void visit_response_read_deadline_owner_fields(Self& c, Visitor&& visit) {
+        visit(c.response_read_deadline_owner_generation, u32{0});
+        visit(c.response_read_deadline_upstream_episode, u32{0});
+        visit(c.response_read_deadline_bundle_id, u16{0});
+        visit(c.response_read_deadline_seconds, u8{0});
+        visit(c.response_read_deadline_buffering, ForwardResponseBufferingMode::None);
+        visit(c.response_read_deadline_profile, ResponseReadDeadlineProfile::None);
+        visit(c.response_read_deadline_method, u8{0xffu});
+        visit(c.response_read_deadline_route_method, u8{0xffu});
+        visit(c.response_read_deadline_state, ResponseReadDeadlineState::None);
+        visit(c.response_read_deadline_progress_generation, u32{0});
+        visit(c.response_read_deadline_progress_episode, u32{0});
+        visit(c.response_read_deadline_progress_bytes, u32{0});
+        visit(c.response_read_deadline_post_commit_phase,
+              ResponseReadDeadlinePostCommitPhase::None);
+        visit(c.response_read_deadline_post_commit_generation, u32{0});
+        visit(c.response_read_deadline_post_commit_episode, u32{0});
+        visit(c.response_read_deadline_post_commit_raw_header_end, u32{0});
+        visit(c.response_read_deadline_post_commit_declared_body, u32{0});
+        visit(c.response_read_deadline_post_commit_origin_received, u32{0});
+        visit(c.response_read_deadline_post_commit_downstream_submitted, u32{0});
+        visit(c.response_read_deadline_post_commit_downstream_completed, u32{0});
+        visit(c.response_read_deadline_post_commit_inflight_body, u32{0});
+        visit(c.response_read_deadline_post_commit_send_body, u32{0});
+        visit(c.response_read_deadline_post_commit_close_after_drain, false);
+        visit(c.response_read_deadline_post_commit_pump_pending, false);
+        visit(c.response_read_deadline_first_batch, false);
+        visit(c.response_read_deadline_first_batch_profile, ResponseReadDeadlineProfile::None);
+        visit(c.response_read_deadline_first_batch_method, u8{0xffu});
+        visit(c.response_read_deadline_first_batch_route_method, u8{0xffu});
+        visit(c.response_read_deadline_first_batch_generation, u32{0});
+        visit(c.response_read_deadline_first_batch_bundle_id, u16{0});
+        visit(c.response_read_deadline_first_batch_buffering, ForwardResponseBufferingMode::None);
+    }
+
+    template <typename Self, typename Visitor>
+    static void visit_response_read_deadline_send_owner_fields(Self& c, Visitor&& visit) {
+        visit(c.response_read_deadline_send_owner_generation, u32{0});
+        visit(c.response_read_deadline_send_deadline_generation, u32{0});
+        visit(c.response_read_deadline_send_upstream_episode, u32{0});
+        visit(c.response_read_deadline_send_src, static_cast<const u8*>(nullptr));
+        visit(c.response_read_deadline_send_len, u32{0});
+        visit(c.response_read_deadline_send_fd, i32{-1});
+        visit(c.response_read_deadline_send_kind, ResponseReadDeadlineSendKind::None);
+        visit(c.response_read_deadline_send_owner_active, false);
+    }
+
+    template <typename Self, typename Visitor>
+    static void visit_response_read_deadline_send_close_owner_fields(Self& c, Visitor&& visit) {
+        visit(c.response_read_deadline_send_close_generation, u32{0});
+        visit(c.response_read_deadline_send_close_target_owned, false);
+        visit(c.response_read_deadline_send_close_cancel_owned, false);
+    }
+
+    [[nodiscard]] bool response_read_deadline_owner_is_neutral() const {
+        bool neutral = response_read_deadline_upload.owner_is_neutral() &&
+                       response_read_deadline_first_batch_upload.owner_is_neutral();
+        const auto check = [&](const auto& value, const auto& reset_value) {
+            neutral = neutral && value == reset_value;
+        };
+        visit_response_read_deadline_owner_fields(*this, check);
+        visit_response_read_deadline_send_owner_fields(*this, check);
+        visit_response_read_deadline_send_close_owner_fields(*this, check);
+        return neutral;
+    }
+
     void clear_response_read_deadline() {
-        response_read_deadline_owner_generation = 0;
-        response_read_deadline_upstream_episode = 0;
-        response_read_deadline_bundle_id = 0;
-        response_read_deadline_seconds = 0;
-        response_read_deadline_buffering = ForwardResponseBufferingMode::None;
-        response_read_deadline_profile = ResponseReadDeadlineProfile::None;
-        response_read_deadline_method = 0xffu;
-        response_read_deadline_route_method = 0xffu;
-        response_read_deadline_state = ResponseReadDeadlineState::None;
-        response_read_deadline_progress_generation = 0;
-        response_read_deadline_progress_episode = 0;
-        response_read_deadline_progress_bytes = 0;
-        response_read_deadline_post_commit_phase = ResponseReadDeadlinePostCommitPhase::None;
-        response_read_deadline_post_commit_generation = 0;
-        response_read_deadline_post_commit_episode = 0;
-        response_read_deadline_post_commit_raw_header_end = 0;
-        response_read_deadline_post_commit_declared_body = 0;
-        response_read_deadline_post_commit_origin_received = 0;
-        response_read_deadline_post_commit_downstream_submitted = 0;
-        response_read_deadline_post_commit_downstream_completed = 0;
-        response_read_deadline_post_commit_inflight_body = 0;
-        response_read_deadline_post_commit_send_body = 0;
-        response_read_deadline_post_commit_close_after_drain = false;
-        response_read_deadline_post_commit_pump_pending = false;
+        visit_response_read_deadline_owner_fields(
+            *this, [](auto& value, const auto& reset_value) { value = reset_value; });
         clear_response_read_deadline_send_owner();
-        response_read_deadline_first_batch = false;
-        response_read_deadline_first_batch_profile = ResponseReadDeadlineProfile::None;
-        response_read_deadline_first_batch_method = 0xffu;
-        response_read_deadline_first_batch_route_method = 0xffu;
-        response_read_deadline_first_batch_generation = 0;
-        response_read_deadline_first_batch_bundle_id = 0;
-        response_read_deadline_first_batch_buffering = ForwardResponseBufferingMode::None;
-        response_read_deadline_upload = ResponseReadDeadlineUploadProof{};
-        response_read_deadline_first_batch_upload = ResponseReadDeadlineUploadProof{};
+        response_read_deadline_upload.clear_owner();
+        response_read_deadline_first_batch_upload.clear_owner();
     }
 
     void clear_http1_prebuilt_response_proof() {
@@ -1094,9 +1158,8 @@ struct ConnectionBase {
         // response_read_deadline_generation follows that persistence rule too;
         // only the live owner is cleared.
         clear_response_read_deadline();
-        response_read_deadline_send_close_generation = 0;
-        response_read_deadline_send_close_target_owned = false;
-        response_read_deadline_send_close_cancel_owned = false;
+        visit_response_read_deadline_send_close_owner_fields(
+            *this, [](auto& value, const auto& reset_value) { value = reset_value; });
         request_config = nullptr;
         listener_context = {};
         pending_handler_fn = nullptr;

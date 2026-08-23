@@ -33,6 +33,27 @@
 #include <openssl/ssl.h>
 #include <stdlib.h>
 
+namespace rut {
+
+std::atomic<u32> g_iouring_tls_high_water_pauses_for_test{0};
+std::atomic<u32> g_iouring_tls_low_water_resumes_for_test{0};
+// 0 = disarmed, 1 = arming/resetting counters, 2 = armed.
+std::atomic<u8> g_iouring_tls_watermark_observer_state_for_test{0};
+
+void observe_iouring_tls_high_water_pause_for_test() {
+    if (g_iouring_tls_watermark_observer_state_for_test.load(std::memory_order_acquire) != 2)
+        return;
+    g_iouring_tls_high_water_pauses_for_test.fetch_add(1, std::memory_order_release);
+}
+
+void observe_iouring_tls_low_water_resume_for_test() {
+    if (g_iouring_tls_watermark_observer_state_for_test.load(std::memory_order_acquire) != 2)
+        return;
+    g_iouring_tls_low_water_resumes_for_test.fetch_add(1, std::memory_order_release);
+}
+
+}  // namespace rut
+
 // Helper: Connection with local buffer storage (for tests that use raw backends).
 static constexpr u32 kTestBufSize = 4096;
 
@@ -6793,7 +6814,98 @@ struct PatternBodyUpstream {
         }
     }
 };
+
+struct ScopedWatermarkTestResources {
+    PatternBodyUpstream* backend = nullptr;
+    Shard<IoUringEventLoop>* shard = nullptr;
+    TlsServerContext* tls_server_ctx = nullptr;
+    SSL_CTX* client_ctx = nullptr;
+    SSL* client_ssl = nullptr;
+    i32 client_fd = -1;
+    i32 listen_fd = -1;
+    bool shard_initialized = false;
+    bool observers_armed = false;
+
+    ~ScopedWatermarkTestResources() { cleanup(); }
+
+    bool arm_observers() {
+        u8 expected = 0;
+        if (!g_iouring_tls_watermark_observer_state_for_test.compare_exchange_strong(
+                expected, 1, std::memory_order_acq_rel))
+            return false;
+        g_iouring_tls_high_water_pauses_for_test.store(0, std::memory_order_release);
+        g_iouring_tls_low_water_resumes_for_test.store(0, std::memory_order_release);
+        g_iouring_tls_watermark_observer_state_for_test.store(2, std::memory_order_release);
+        observers_armed = true;
+        return true;
+    }
+
+    void cleanup() {
+        if (observers_armed) {
+            g_iouring_tls_watermark_observer_state_for_test.store(0, std::memory_order_release);
+            observers_armed = false;
+        }
+        if (client_ssl != nullptr) {
+            (void)SSL_shutdown(client_ssl);
+            SSL_free(client_ssl);
+            client_ssl = nullptr;
+        }
+        if (client_fd >= 0) {
+            close(client_fd);
+            client_fd = -1;
+        }
+        if (client_ctx != nullptr) {
+            SSL_CTX_free(client_ctx);
+            client_ctx = nullptr;
+        }
+        if (shard != nullptr && shard_initialized) {
+            shard->stop();
+            shard->join();
+            shard->shutdown();
+            shard_initialized = false;
+        }
+        if (backend != nullptr) backend->teardown();
+        if (listen_fd >= 0) {
+            close(listen_fd);
+            listen_fd = -1;
+        }
+        if (tls_server_ctx != nullptr) {
+            destroy_tls_server_context(tls_server_ctx);
+            tls_server_ctx = nullptr;
+        }
+    }
+};
 }  // namespace
+
+TEST(proxy_tls_iouring, watermark_observer_guard_scopes_callbacks_and_cleanup) {
+    ScopedWatermarkTestResources resources;
+    REQUIRE(resources.arm_observers());
+    rut::observe_iouring_tls_high_water_pause_for_test();
+    rut::observe_iouring_tls_low_water_resume_for_test();
+    REQUIRE_EQ(rut::g_iouring_tls_high_water_pauses_for_test.load(std::memory_order_acquire), 1u);
+    REQUIRE_EQ(rut::g_iouring_tls_low_water_resumes_for_test.load(std::memory_order_acquire), 1u);
+
+    resources.cleanup();
+    resources.cleanup();  // partial/idempotent cleanup is safe
+    rut::observe_iouring_tls_high_water_pause_for_test();
+    rut::observe_iouring_tls_low_water_resume_for_test();
+    CHECK_EQ(rut::g_iouring_tls_high_water_pauses_for_test.load(std::memory_order_acquire), 1u);
+    CHECK_EQ(rut::g_iouring_tls_low_water_resumes_for_test.load(std::memory_order_acquire), 1u);
+
+    const i32 destructor_owned_fd = dup(STDERR_FILENO);
+    REQUIRE_GE(destructor_owned_fd, 0);
+    {
+        ScopedWatermarkTestResources destructor_resources;
+        destructor_resources.listen_fd = destructor_owned_fd;
+        REQUIRE(destructor_resources.arm_observers());
+        rut::observe_iouring_tls_high_water_pause_for_test();
+    }
+    errno = 0;
+    CHECK_EQ(fcntl(destructor_owned_fd, F_GETFD), -1);
+    CHECK_EQ(errno, EBADF);
+    rut::observe_iouring_tls_high_water_pause_for_test();
+    CHECK_EQ(rut::g_iouring_tls_high_water_pauses_for_test.load(std::memory_order_acquire), 1u);
+}
 
 // Phase 5: proxy a body 4x the ciphertext buffer (kTlsOutBufCap = 64 KiB) over
 // io_uring TLS and verify it arrives byte-exact. 256 KiB cannot fit the buffer,
@@ -6819,32 +6931,60 @@ TEST(proxy_tls_iouring, large_body_streams_through_watermark) {
     REQUIRE(tls_ctx.has_value());
 
     Shard<IoUringEventLoop> shard;
+    ScopedWatermarkTestResources resources;
+    resources.backend = &backend;
+    resources.shard = &shard;
+    resources.tls_server_ctx = tls_ctx.value();
     i32 lfd = create_listen_socket(0).value_or(-1);
+    resources.listen_fd = lfd;
     REQUIRE(lfd >= 0);
+    int sndbuf = 16 * 1024;
+    REQUIRE_EQ(setsockopt(lfd, SOL_SOCKET, SO_SNDBUF, &sndbuf, sizeof(sndbuf)), 0);
     u16 port = get_port(lfd);
-    REQUIRE(shard.init(0, lfd).has_value());
+    auto shard_init = shard.init(0, lfd);
+    resources.shard_initialized = shard_init.has_value();
+    REQUIRE(shard_init.has_value());
     shard.loop->tls_server = tls_ctx.value();
     shard.loop->config_ptr = &active;
     REQUIRE(shard.spawn(-1).has_value());
     usleep(50000);
 
-    SSL_CTX* client_ctx = create_test_client_ctx();
-    REQUIRE(client_ctx != nullptr);
-    i32 c = connect_to(port);
-    REQUIRE(c >= 0);
+    resources.client_ctx = create_test_client_ctx();
+    REQUIRE(resources.client_ctx != nullptr);
     // Small downstream socket buffer so the client lags the upstream and the
     // gateway's tls_out_buf actually reaches the high watermark, rather than the
-    // kernel absorbing the whole body.
+    // kernel absorbing the whole body. Set it before connect so TCP negotiates
+    // the bounded receive window instead of retaining an already-scaled window.
+    resources.client_fd = socket(AF_INET, SOCK_STREAM, 0);
+    REQUIRE(resources.client_fd >= 0);
     int rcvbuf = 16 * 1024;
-    setsockopt(c, SOL_SOCKET, SO_RCVBUF, &rcvbuf, sizeof(rcvbuf));
-    set_socket_timeouts(c, 5);
-    SSL* ssl = SSL_new(client_ctx);
-    REQUIRE(ssl != nullptr);
-    REQUIRE(SSL_set_fd(ssl, c) == 1);
-    REQUIRE(SSL_connect(ssl) == 1);
+    REQUIRE_EQ(setsockopt(resources.client_fd, SOL_SOCKET, SO_RCVBUF, &rcvbuf, sizeof(rcvbuf)), 0);
+    sockaddr_in client_addr{};
+    client_addr.sin_family = AF_INET;
+    client_addr.sin_port = __builtin_bswap16(port);
+    client_addr.sin_addr.s_addr = __builtin_bswap32(0x7F000001);
+    REQUIRE_EQ(
+        connect(
+            resources.client_fd, reinterpret_cast<sockaddr*>(&client_addr), sizeof(client_addr)),
+        0);
+    set_socket_timeouts(resources.client_fd, 5);
+    resources.client_ssl = SSL_new(resources.client_ctx);
+    REQUIRE(resources.client_ssl != nullptr);
+    REQUIRE(SSL_set_fd(resources.client_ssl, resources.client_fd) == 1);
+    REQUIRE(SSL_connect(resources.client_ssl) == 1);
+    REQUIRE(resources.arm_observers());
 
     const char kReq[] = "GET /dl HTTP/1.1\r\nHost: x\r\n\r\n";
-    REQUIRE(ssl_write_all(ssl, kReq, sizeof(kReq) - 1));
+    REQUIRE(ssl_write_all(resources.client_ssl, kReq, sizeof(kReq) - 1));
+
+    // Do not begin draining until the production path reports a real high-water
+    // transition. This makes the episode observable and deterministic instead
+    // of inferring it from SO_RCVBUF or payload size.
+    for (u32 i = 0; i < 400 && rut::g_iouring_tls_high_water_pauses_for_test.load(
+                                   std::memory_order_acquire) == 0;
+         ++i)
+        usleep(5000);
+    REQUIRE_GT(rut::g_iouring_tls_high_water_pauses_for_test.load(std::memory_order_acquire), 0u);
 
     static u8 in[300u * 1024u];
     u32 total = 0;
@@ -6852,7 +6992,8 @@ TEST(proxy_tls_iouring, large_body_streams_through_watermark) {
     u32 body_off = 0;
     u32 body_seen = 0;
     while (body_seen < kBody && total < sizeof(in)) {
-        const i32 n = SSL_read(ssl, in + total, static_cast<i32>(sizeof(in) - total));
+        const i32 n =
+            SSL_read(resources.client_ssl, in + total, static_cast<i32>(sizeof(in) - total));
         if (n <= 0) break;
         total += static_cast<u32>(n);
         if (!hdr_done) {
@@ -6868,8 +7009,8 @@ TEST(proxy_tls_iouring, large_body_streams_through_watermark) {
     }
     CHECK(hdr_done);
     CHECK_EQ(body_seen, kBody);  // full body delivered through the watermark
-    bool ok_pattern = hdr_done;
-    for (u32 i = 0; hdr_done && i < body_seen && i < kBody; i += 4093) {  // prime stride
+    bool ok_pattern = hdr_done && body_seen == kBody;
+    for (u32 i = 0; ok_pattern && i < kBody; ++i) {
         if (in[body_off + i] != static_cast<u8>(i & 0xff)) {
             ok_pattern = false;
             break;
@@ -6877,16 +7018,9 @@ TEST(proxy_tls_iouring, large_body_streams_through_watermark) {
     }
     CHECK(ok_pattern);
 
-    SSL_shutdown(ssl);
-    SSL_free(ssl);
-    close(c);
-    SSL_CTX_free(client_ctx);
-    backend.teardown();
-    shard.stop();
-    shard.join();
-    shard.shutdown();
-    close(lfd);
-    destroy_tls_server_context(tls_ctx.value());
+    CHECK_GT(rut::g_iouring_tls_high_water_pauses_for_test.load(std::memory_order_acquire), 0u);
+    CHECK_GT(rut::g_iouring_tls_low_water_resumes_for_test.load(std::memory_order_acquire), 0u);
+    resources.cleanup();
 }
 
 // Serves one Content-Length response per accepted connection, then closes — so each

@@ -412,6 +412,25 @@ bool IoUringBackend::add_recv_upstream(i32 fd, u32 conn_id, u32 upstream_episode
     return true;
 }
 
+bool IoUringBackend::add_recv_upstream_once(i32 fd, u32 conn_id, u32 upstream_episode) {
+    if (conn_id >= kMaxSendState || !valid_upstream_episode(upstream_episode)) return false;
+    io_uring_sqe* sqe = get_sqe();
+    if (!sqe) return false;
+
+    memset(sqe, 0, sizeof(*sqe));
+    sqe->opcode = IORING_OP_RECV;
+    sqe->fd = fd;
+    sqe->len = kProvidedBufSize;
+    sqe->buf_group = kBufGroupId;
+    sqe->flags = IOSQE_BUFFER_SELECT;
+    sqe->user_data =
+        encode_upstream_user_data(conn_id, IoEventType::UpstreamRecv, upstream_episode);
+
+    sqe_advance_tail(sq_tail);
+    pending++;
+    return true;
+}
+
 bool IoUringBackend::add_first_response_recv(i32 fd, u32 conn_id, u32 upstream_episode) {
     if (fd < 0 || conn_id >= kMaxSendState || !valid_upstream_episode(upstream_episode))
         return false;

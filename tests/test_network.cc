@@ -17,10 +17,12 @@
 #include "test_helpers.h"
 #include <memory>
 #include <string>
+#include <type_traits>
 #include <vector>
 
 #include <errno.h>
 #include <fcntl.h>
+#include <openssl/ssl.h>
 #include <poll.h>
 #include <sys/socket.h>
 #include <unistd.h>
@@ -17002,6 +17004,107 @@ TEST(dispatch, null_upstream_recv_enobufs_closes) {
     CHECK_EQ(loop.conns[cid].fd, -1);
 }
 
+TEST(proxy_response, header_enobufs_never_parses_or_publishes_copied_prefix) {
+    static constexpr const char* kLossyPrefixes[] = {
+        "HTTP/1.1 200 OK\r\nContent-Len",
+        "HTTP/1.1 200 OK\r\nContent-Length: 12\r\n\r\nhello",
+    };
+    for (const char* prefix : kLossyPrefixes) {
+        SmallLoop loop;
+        loop.setup();
+        loop.inject_and_dispatch(make_ev(0, IoEventType::Accept, 42));
+        Connection* conn = loop.find_fd(42);
+        REQUIRE(conn != nullptr);
+        REQUIRE(loop.alloc_upstream_buf(*conn));
+        const u32 len = static_cast<u32>(strlen(prefix));
+        REQUIRE_EQ(conn->upstream_recv_buf.write(reinterpret_cast<const u8*>(prefix), len), len);
+        conn->upstream_fd = 100;
+        conn->state = ConnState::Proxying;
+        conn->on_upstream_recv = &on_upstream_response<SmallLoop>;
+        loop.backend.clear_ops();
+        const u32 id = conn->id;
+
+        on_upstream_response<SmallLoop>(
+            &loop, *conn, make_ev(id, IoEventType::UpstreamRecv, -ENOBUFS));
+
+        CHECK_EQ(loop.conns[id].fd, -1);
+        CHECK_EQ(loop.backend.count_ops(MockOp::Send), 0u);
+    }
+}
+
+TEST(proxy_response, ordinary_h1_recv_rearm_failure_closes_at_each_header_transition) {
+    enum class Transition : u8 { Initial, IncompleteHeader, Interim, HeaderToBody };
+    for (const Transition transition : {Transition::Initial,
+                                        Transition::IncompleteHeader,
+                                        Transition::Interim,
+                                        Transition::HeaderToBody}) {
+        AsyncSmallLoop loop;
+        loop.setup();
+        Connection* conn = loop.alloc_conn();
+        REQUIRE(conn != nullptr);
+        REQUIRE(loop.alloc_upstream_buf(*conn));
+        conn->fd = 42;
+        conn->upstream_fd = 100;
+        conn->state = ConnState::Proxying;
+        loop.backend.fail_upstream_recv = true;
+        const u32 id = conn->id;
+
+        switch (transition) {
+            case Transition::Initial: {
+                static constexpr u8 kRequest[] = "GET / HTTP/1.1\r\nHost: test\r\n\r\n";
+                REQUIRE_EQ(conn->recv_buf.write(kRequest, sizeof(kRequest) - 1u),
+                           sizeof(kRequest) - 1u);
+                conn->req_initial_send_len = sizeof(kRequest) - 1u;
+                conn->req_body_mode = BodyMode::None;
+                on_upstream_request_sent<AsyncSmallLoop>(
+                    &loop,
+                    *conn,
+                    make_ev(
+                        id, IoEventType::UpstreamSend, static_cast<i32>(sizeof(kRequest) - 1u)));
+                break;
+            }
+            case Transition::IncompleteHeader: {
+                static constexpr u8 kPartial[] = "HTTP/1.1 200 OK\r\nContent-Len";
+                REQUIRE_EQ(conn->upstream_recv_buf.write(kPartial, sizeof(kPartial) - 1u),
+                           sizeof(kPartial) - 1u);
+                on_upstream_response<AsyncSmallLoop>(
+                    &loop,
+                    *conn,
+                    make_ev(
+                        id, IoEventType::UpstreamRecv, static_cast<i32>(sizeof(kPartial) - 1u)));
+                break;
+            }
+            case Transition::Interim: {
+                static constexpr u8 kInterim[] = "HTTP/1.1 100 Continue\r\n\r\n";
+                REQUIRE_EQ(conn->upstream_recv_buf.write(kInterim, sizeof(kInterim) - 1u),
+                           sizeof(kInterim) - 1u);
+                on_upstream_response<AsyncSmallLoop>(
+                    &loop,
+                    *conn,
+                    make_ev(
+                        id, IoEventType::UpstreamRecv, static_cast<i32>(sizeof(kInterim) - 1u)));
+                break;
+            }
+            case Transition::HeaderToBody: {
+                static constexpr u8 kHeader[] = "HTTP/1.1 200 OK\r\nContent-Length: 12\r\n\r\n";
+                REQUIRE_EQ(conn->upstream_recv_buf.write(kHeader, sizeof(kHeader) - 1u),
+                           sizeof(kHeader) - 1u);
+                conn->upstream_send_len = sizeof(kHeader) - 1u;
+                conn->resp_body_mode = BodyMode::ContentLength;
+                conn->resp_body_remaining = 12;
+                on_response_header_sent<AsyncSmallLoop>(
+                    &loop,
+                    *conn,
+                    make_ev(id, IoEventType::Send, static_cast<i32>(sizeof(kHeader) - 1u)));
+                break;
+            }
+        }
+
+        CHECK_EQ(loop.conns[id].fd, -1);
+        CHECK_EQ(loop.backend.count_ops(MockOp::Recv), 0u);
+    }
+}
+
 TEST(dispatch, stale_upstream_recv_error_after_keepalive_completion_ignored) {
     SmallLoop loop;
     loop.setup();
@@ -18473,6 +18576,549 @@ struct ScopedIoUringLoopForRetirement {
         if (storage != MAP_FAILED) munmap(storage, sizeof(IoUringEventLoop));
     }
 };
+
+static u64 response_read_deadline_neutrality_test_handler(
+    void*, jit::HandlerCtx*, const u8*, u32, void*) {
+    return 0;
+}
+
+template <typename Value>
+void make_response_read_deadline_owner_non_neutral(Value& value, const Value& neutral) {
+    if constexpr (std::is_same_v<Value, bool>) {
+        value = !neutral;
+    } else if constexpr (std::is_same_v<Value, jit::HandlerFn>) {
+        value = &response_read_deadline_neutrality_test_handler;
+    } else if constexpr (std::is_pointer_v<Value>) {
+        static const u8 marker = 0;
+        value = &marker;
+    } else if constexpr (std::is_enum_v<Value>) {
+        using Raw = std::underlying_type_t<Value>;
+        value = static_cast<Value>(static_cast<Raw>(neutral) == 0 ? 1 : 0);
+    } else {
+        value = neutral == Value{0} ? Value{1} : Value{0};
+    }
+}
+
+TEST(iouring_upstream_recv, response_deadline_neutrality_inventory_is_exhaustive) {
+    Connection conn;
+    conn.reset();
+    REQUIRE(conn.response_read_deadline_owner_is_neutral());
+    u32 fields_tested = 0;
+    const auto reject_each = [&](auto& value, const auto& neutral) {
+        using Value = std::remove_cvref_t<decltype(value)>;
+        make_response_read_deadline_owner_non_neutral<Value>(value, neutral);
+        CHECK_FALSE(conn.response_read_deadline_owner_is_neutral());
+        value = neutral;
+        CHECK(conn.response_read_deadline_owner_is_neutral());
+        ++fields_tested;
+    };
+    Connection::visit_response_read_deadline_owner_fields(conn, reject_each);
+    Connection::visit_response_read_deadline_send_owner_fields(conn, reject_each);
+    Connection::visit_response_read_deadline_send_close_owner_fields(conn, reject_each);
+    ResponseReadDeadlineUploadProof::visit_owner_fields(conn.response_read_deadline_upload,
+                                                        reject_each);
+    ResponseReadDeadlineUploadProof::visit_owner_fields(
+        conn.response_read_deadline_first_batch_upload, reject_each);
+    CHECK_EQ(fields_tested, 66u);
+
+    // The same canonical inventory drives both clear paths, including the
+    // separately-lived send-close owner that clear_response_read_deadline()
+    // intentionally preserves until slot reset.
+    Connection::visit_response_read_deadline_owner_fields(conn, [&](auto& value, const auto& n) {
+        make_response_read_deadline_owner_non_neutral(value, n);
+    });
+    Connection::visit_response_read_deadline_send_owner_fields(
+        conn, [&](auto& value, const auto& n) {
+            make_response_read_deadline_owner_non_neutral(value, n);
+        });
+    ResponseReadDeadlineUploadProof::visit_owner_fields(
+        conn.response_read_deadline_upload, [&](auto& value, const auto& n) {
+            make_response_read_deadline_owner_non_neutral(value, n);
+        });
+    ResponseReadDeadlineUploadProof::visit_owner_fields(
+        conn.response_read_deadline_first_batch_upload, [&](auto& value, const auto& n) {
+            make_response_read_deadline_owner_non_neutral(value, n);
+        });
+    conn.clear_response_read_deadline();
+    CHECK(conn.response_read_deadline_owner_is_neutral());
+    Connection::visit_response_read_deadline_send_close_owner_fields(
+        conn, [&](auto& value, const auto& n) {
+            make_response_read_deadline_owner_non_neutral(value, n);
+        });
+    conn.clear_response_read_deadline();
+    CHECK_FALSE(conn.response_read_deadline_owner_is_neutral());
+    conn.reset();
+    CHECK(conn.response_read_deadline_owner_is_neutral());
+}
+
+struct ScopedOneShotSelectorResources {
+    IoUringEventLoop* loop = nullptr;
+    Connection* conn = nullptr;
+    SSL_CTX* ssl_ctx = nullptr;
+    i32 peer_fd = -1;
+    u32 sq_tail_before = 0;
+    u32 backend_pending_before = 0;
+    bool ring_snapshot = false;
+
+    ~ScopedOneShotSelectorResources() {
+        if (loop == nullptr) return;
+        if (ring_snapshot) {
+            __atomic_store_n(loop->backend.sq_tail, sq_tail_before, __ATOMIC_RELEASE);
+            loop->backend.pending = backend_pending_before;
+        }
+        if (conn != nullptr) {
+            conn->pending_ops = 0;
+            conn->upstream_recv_armed = false;
+            if (conn->fd >= 0)
+                loop->close_conn(*conn);
+            else if (conn->recv_slice != nullptr)
+                loop->free_conn(*conn);
+        }
+        if (peer_fd >= 0) close(peer_fd);
+        if (ssl_ctx != nullptr) SSL_CTX_free(ssl_ctx);
+    }
+
+    void snapshot_ring() {
+        sq_tail_before = __atomic_load_n(loop->backend.sq_tail, __ATOMIC_ACQUIRE);
+        backend_pending_before = loop->backend.pending;
+        ring_snapshot = true;
+    }
+};
+
+TEST(iouring_upstream_recv, one_shot_selector_is_narrow_and_episode_stable) {
+    ScopedIoUringLoopForRetirement guard;
+    if (!guard.init()) SKIP("io_uring unavailable");
+    auto* loop = guard.loop;
+    Connection* conn = loop->alloc_conn();
+    REQUIRE(conn != nullptr);
+    ScopedOneShotSelectorResources resources;
+    resources.loop = loop;
+    resources.conn = conn;
+
+    RouteConfig pinned;
+    pinned.upstream_count = 1;
+    RouteConfig hot;
+    hot.upstream_count = 0;
+    const RouteConfig* hot_ptr = &hot;
+    loop->config_ptr = &hot_ptr;
+
+    i32 downstream[2] = {-1, -1};
+    REQUIRE_EQ(socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, downstream), 0);
+    conn->fd = downstream[0];
+    resources.peer_fd = downstream[1];
+    conn->upstream_fd = dup(STDERR_FILENO);
+    REQUIRE_GE(conn->upstream_fd, 0);
+    resources.ssl_ctx = SSL_CTX_new(TLS_server_method());
+    REQUIRE(resources.ssl_ctx != nullptr);
+    conn->tls_engine.ssl = SSL_new(resources.ssl_ctx);
+    REQUIRE(conn->tls_engine.ssl != nullptr);
+    conn->state = ConnState::Proxying;
+    conn->request_config = &pinned;
+    conn->req_start_us = monotonic_us();
+    conn->upstream_attempts = 1;
+    conn->request_upload_complete = true;
+    conn->tls_active = true;
+    conn->tls_handshake_complete = true;
+    conn->protocol = ConnProtocol::Http11;
+    conn->on_upstream_recv = &on_upstream_response<IoUringEventLoop>;
+
+    // Selection is bound to the request-pinned config, not the deliberately
+    // invalid hot active one.
+    CHECK(loop->use_one_shot_upstream_recv(*conn));
+    hot.upstream_count = 1;
+    pinned.upstream_count = 0;
+    CHECK_FALSE(loop->use_one_shot_upstream_recv(*conn));
+    pinned.upstream_count = 1;
+    hot.upstream_count = 0;
+    CHECK(loop->use_one_shot_upstream_recv(*conn));
+    conn->on_upstream_recv = &on_response_body_recvd<IoUringEventLoop>;
+    conn->state = ConnState::Sending;
+    conn->tls_proxy_stream = true;
+    CHECK(loop->use_one_shot_upstream_recv(*conn));
+    conn->on_upstream_recv = &on_upstream_response<IoUringEventLoop>;
+    conn->state = ConnState::Proxying;
+
+    auto rejected_while = [&](auto mutate, auto restore) {
+        mutate();
+        CHECK_FALSE(loop->use_one_shot_upstream_recv(*conn));
+        restore();
+        CHECK(loop->use_one_shot_upstream_recv(*conn));
+    };
+    rejected_while([&] { conn->tls_active = false; }, [&] { conn->tls_active = true; });
+    rejected_while([&] { conn->tls_handshake_complete = false; },
+                   [&] { conn->tls_handshake_complete = true; });
+    rejected_while([&] { conn->protocol = ConnProtocol::Http2; },
+                   [&] { conn->protocol = ConnProtocol::Http11; });
+    rejected_while([&] { conn->request_config = nullptr; },
+                   [&] { conn->request_config = &pinned; });
+    rejected_while([&] { conn->request_upload_complete = false; },
+                   [&] { conn->request_upload_complete = true; });
+    rejected_while([&] { conn->req_client_has_content_length = true; },
+                   [&] { conn->req_client_has_content_length = false; });
+    rejected_while([&] { conn->req_client_has_transfer_encoding = true; },
+                   [&] { conn->req_client_has_transfer_encoding = false; });
+    rejected_while([&] { conn->req_client_has_expect = true; },
+                   [&] { conn->req_client_has_expect = false; });
+    rejected_while([&] { conn->req_body_mode = BodyMode::ContentLength; },
+                   [&] { conn->req_body_mode = BodyMode::None; });
+    rejected_while([&] { conn->req_body_streamed = true; },
+                   [&] { conn->req_body_streamed = false; });
+    rejected_while([&] { conn->req_wants_upgrade = true; },
+                   [&] { conn->req_wants_upgrade = false; });
+    rejected_while([&] { conn->is_health_probe = true; }, [&] { conn->is_health_probe = false; });
+    rejected_while([&] { conn->is_ws_tunnel = true; }, [&] { conn->is_ws_tunnel = false; });
+    rejected_while([&] { conn->response_read_deadline_state = ResponseReadDeadlineState::Armed; },
+                   [&] { conn->response_read_deadline_state = ResponseReadDeadlineState::None; });
+    rejected_while([&] { conn->upstream_abandoned = true; },
+                   [&] { conn->upstream_abandoned = false; });
+    rejected_while([&] { conn->upstream_recv_terminal_stale = true; },
+                   [&] { conn->upstream_recv_terminal_stale = false; });
+    rejected_while([&] { conn->upstream_recv_idle_stale_bytes = true; },
+                   [&] { conn->upstream_recv_idle_stale_bytes = false; });
+    rejected_while([&] { conn->upstream_recv_pause_rearm_pending = true; },
+                   [&] { conn->upstream_recv_pause_rearm_pending = false; });
+    // Attempts can change only when a retry selects a new upstream episode;
+    // an existing selected episode remains one-shot across response progress.
+    rejected_while([&] { conn->upstream_attempts = 2; }, [&] { conn->upstream_attempts = 1; });
+    rejected_while([&] { conn->on_upstream_recv = &test_sentinel_callback<IoUringEventLoop>; },
+                   [&] { conn->on_upstream_recv = &on_upstream_response<IoUringEventLoop>; });
+
+    // Both facts are mutable during one response episode. They must not switch
+    // a receive that began one-shot back to multishot after first response data
+    // or a control-plane drain request.
+    conn->upstream_reused = true;
+    CHECK(loop->use_one_shot_upstream_recv(*conn));
+    loop->drain(5);
+    CHECK(loop->use_one_shot_upstream_recv(*conn));
+
+    resources.snapshot_ring();
+    const u32 tail_before = resources.sq_tail_before;
+    REQUIRE(loop->submit_recv_upstream(*conn));
+    CHECK(conn->upstream_recv_armed);
+    CHECK_EQ(conn->pending_ops, 1u);
+    const auto& first = loop->backend.sq_entries[tail_before & *loop->backend.sq_ring_mask];
+    CHECK_EQ(first.ioprio & IORING_RECV_MULTISHOT, 0u);
+
+    // An already-armed call is idempotent. Each simulated terminal one-shot
+    // completion releases exactly one owner before the next arm acquires one.
+    CHECK(loop->submit_recv_upstream(*conn));
+    CHECK_EQ(__atomic_load_n(loop->backend.sq_tail, __ATOMIC_ACQUIRE), tail_before + 1u);
+    for (u32 i = 0; i < 3; ++i) {
+        conn->upstream_recv_armed = false;
+        REQUIRE_GT(conn->pending_ops, 0u);
+        --conn->pending_ops;
+        REQUIRE(loop->submit_recv_upstream(*conn));
+        CHECK(conn->upstream_recv_armed);
+        CHECK_EQ(conn->pending_ops, 1u);
+        const auto& sqe =
+            loop->backend.sq_entries[(tail_before + 1u + i) & *loop->backend.sq_ring_mask];
+        CHECK_EQ(sqe.ioprio & IORING_RECV_MULTISHOT, 0u);
+    }
+
+    // An excluded episode still uses the retained multishot primitive.
+    conn->upstream_recv_armed = false;
+    --conn->pending_ops;
+    conn->req_body_streamed = true;
+    REQUIRE(loop->submit_recv_upstream(*conn));
+    const auto& excluded =
+        loop->backend.sq_entries[(tail_before + 4u) & *loop->backend.sq_ring_mask];
+    CHECK((excluded.ioprio & IORING_RECV_MULTISHOT) != 0);
+}
+
+struct OneShotRecvFixture {
+    RouteConfig config;
+    IoUringEventLoop* loop = nullptr;
+    Connection* conn = nullptr;
+    SSL_CTX* ssl_ctx = nullptr;
+    i32 peer_fd = -1;
+    u32 sq_tail_before = 0;
+    u32 backend_pending_before = 0;
+    bool ring_snapshot = false;
+
+    ~OneShotRecvFixture() { cleanup(); }
+
+    bool stage(IoUringEventLoop* event_loop) {
+        if (event_loop == nullptr || loop != nullptr) return false;
+        loop = event_loop;
+        sq_tail_before = __atomic_load_n(loop->backend.sq_tail, __ATOMIC_ACQUIRE);
+        backend_pending_before = loop->backend.pending;
+        ring_snapshot = true;
+        config.upstream_count = 1;
+        conn = loop->alloc_conn();
+        if (conn == nullptr || !loop->alloc_upstream_buf(*conn)) return false;
+        i32 downstream[2] = {-1, -1};
+        if (socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, downstream) != 0) return false;
+        conn->fd = downstream[0];
+        peer_fd = downstream[1];
+        conn->upstream_fd = dup(STDERR_FILENO);
+        if (conn->upstream_fd < 0) return false;
+        ssl_ctx = SSL_CTX_new(TLS_server_method());
+        if (ssl_ctx == nullptr) return false;
+        conn->tls_engine.ssl = SSL_new(ssl_ctx);
+        if (conn->tls_engine.ssl == nullptr) return false;
+        conn->tls_active = true;
+        conn->tls_handshake_complete = true;
+        conn->protocol = ConnProtocol::Http11;
+        conn->state = ConnState::Proxying;
+        conn->request_config = &config;
+        conn->req_start_us = monotonic_us();
+        conn->upstream_attempts = 1;
+        conn->request_upload_complete = true;
+        conn->on_upstream_recv = &on_upstream_response<IoUringEventLoop>;
+        return loop->use_one_shot_upstream_recv(*conn);
+    }
+
+    void restore_ring() {
+        if (loop == nullptr || !ring_snapshot) return;
+        __atomic_store_n(loop->backend.sq_tail, sq_tail_before, __ATOMIC_RELEASE);
+        loop->backend.pending = backend_pending_before;
+        ring_snapshot = false;
+    }
+
+    void cleanup() {
+        if (loop == nullptr) return;
+        restore_ring();
+        if (conn != nullptr) {
+            conn->pending_ops = 0;
+            conn->upstream_recv_armed = false;
+            conn->upstream_recv_paused_for_send = false;
+            conn->upstream_recv_pause_cancel_pending = false;
+            conn->upstream_recv_pause_rearm_pending = false;
+            conn->upstream_recv_cancel_inflight = false;
+            conn->upstream_recv_terminal_stale = false;
+            if (conn->fd >= 0)
+                loop->close_conn(*conn);
+            else if (conn->recv_slice != nullptr)
+                loop->free_conn(*conn);
+        }
+        conn = nullptr;
+        if (peer_fd >= 0) close(peer_fd);
+        peer_fd = -1;
+        if (ssl_ctx != nullptr) SSL_CTX_free(ssl_ctx);
+        ssl_ctx = nullptr;
+        loop = nullptr;
+    }
+};
+
+TEST(iouring_upstream_recv, terminal_dispatch_rearms_once_across_reuse_clear_and_drain) {
+    ScopedIoUringLoopForRetirement guard;
+    if (!guard.init()) SKIP("io_uring unavailable");
+    auto* loop = guard.loop;
+    OneShotRecvFixture fixture;
+    REQUIRE(fixture.stage(loop));
+    Connection& conn = *fixture.conn;
+    conn.upstream_reused = true;
+    REQUIRE(loop->submit_recv_upstream(conn));
+    REQUIRE(conn.upstream_recv_armed);
+    REQUIRE_EQ(conn.pending_ops, 1u);
+    static constexpr u8 kFirst[] = "HTTP/";
+    REQUIRE_EQ(conn.upstream_recv_buf.write(kFirst, sizeof(kFirst) - 1u), sizeof(kFirst) - 1u);
+
+    const IoEvent first{conn.id,
+                        static_cast<i32>(sizeof(kFirst) - 1u),
+                        0,
+                        0,
+                        IoEventType::UpstreamRecv,
+                        0,
+                        0,
+                        conn.upstream_episode};
+    loop->dispatch(first);
+
+    CHECK_FALSE(conn.upstream_reused);  // first response byte clears this mutable fact
+    CHECK(conn.upstream_recv_armed);
+    CHECK_EQ(conn.pending_ops, 1u);
+    CHECK_EQ(__atomic_load_n(loop->backend.sq_tail, __ATOMIC_ACQUIRE), fixture.sq_tail_before + 2u);
+    const auto& second_sqe =
+        loop->backend.sq_entries[(fixture.sq_tail_before + 1u) & *loop->backend.sq_ring_mask];
+    CHECK_EQ(second_sqe.ioprio & IORING_RECV_MULTISHOT, 0u);
+
+    loop->drain(5);  // mutable control-plane state must not change this episode's mode
+    static constexpr u8 kSecond[] = "1.1 ";
+    REQUIRE_EQ(conn.upstream_recv_buf.write(kSecond, sizeof(kSecond) - 1u), sizeof(kSecond) - 1u);
+    const IoEvent second{conn.id,
+                         static_cast<i32>(sizeof(kSecond) - 1u),
+                         0,
+                         0,
+                         IoEventType::UpstreamRecv,
+                         0,
+                         0,
+                         conn.upstream_episode};
+    loop->dispatch(second);
+
+    CHECK(conn.upstream_recv_armed);
+    CHECK_EQ(conn.pending_ops, 1u);
+    CHECK_EQ(__atomic_load_n(loop->backend.sq_tail, __ATOMIC_ACQUIRE), fixture.sq_tail_before + 3u);
+    const auto& third_sqe =
+        loop->backend.sq_entries[(fixture.sq_tail_before + 2u) & *loop->backend.sq_ring_mask];
+    CHECK_EQ(third_sqe.ioprio & IORING_RECV_MULTISHOT, 0u);
+    fixture.cleanup();
+}
+
+TEST(iouring_upstream_recv, terminal_eof_error_and_pause_cancel_account_exactly_once) {
+    for (const i32 terminal : {0, -ECONNRESET}) {
+        ScopedIoUringLoopForRetirement guard;
+        if (!guard.init()) SKIP("io_uring unavailable");
+        auto* loop = guard.loop;
+        OneShotRecvFixture fixture;
+        REQUIRE(fixture.stage(loop));
+        Connection& conn = *fixture.conn;
+        const u32 id = conn.id;
+        REQUIRE(loop->submit_recv_upstream(conn));
+        REQUIRE_EQ(conn.pending_ops, 1u);
+
+        loop->dispatch(
+            {id, terminal, 0, 0, IoEventType::UpstreamRecv, 0, 0, conn.upstream_episode});
+
+        CHECK_EQ(loop->conns[id].fd, -1);
+        CHECK_EQ(loop->conns[id].pending_ops, 0u);
+        CHECK_FALSE(loop->conns[id].upstream_recv_armed);
+        fixture.cleanup();
+    }
+
+    ScopedIoUringLoopForRetirement guard;
+    if (!guard.init()) SKIP("io_uring unavailable");
+    auto* loop = guard.loop;
+    OneShotRecvFixture fixture;
+    REQUIRE(fixture.stage(loop));
+    Connection& conn = *fixture.conn;
+    REQUIRE(loop->submit_recv_upstream(conn));
+    REQUIRE(loop->pause_upstream_recv_for_send(conn));
+    REQUIRE_EQ(conn.pending_ops, 2u);  // one recv target plus one cancel owner
+    conn.upstream_recv_paused_for_send = false;
+    REQUIRE(loop->submit_recv_upstream(conn));
+    REQUIRE(conn.upstream_recv_pause_rearm_pending);
+
+    loop->dispatch(
+        {conn.id, -ECANCELED, 0, 0, IoEventType::UpstreamRecv, 0, 0, conn.upstream_episode});
+    CHECK_EQ(conn.pending_ops, 1u);
+    CHECK_FALSE(conn.upstream_recv_armed);
+    CHECK_FALSE(conn.upstream_recv_cancel_inflight);
+    CHECK(conn.upstream_recv_pause_cancel_pending);
+
+    loop->dispatch({conn.id,
+                    -ENOENT,
+                    0,
+                    0,
+                    IoEventType::UpstreamRecv,
+                    0,
+                    kPauseCancelAux,
+                    conn.upstream_episode});
+    CHECK_EQ(conn.pending_ops, 1u);  // cancel drained, exactly one replacement recv acquired
+    CHECK(conn.upstream_recv_armed);
+    CHECK_FALSE(conn.upstream_recv_pause_cancel_pending);
+    CHECK_FALSE(conn.upstream_recv_pause_rearm_pending);
+    const auto& replacement =
+        loop->backend.sq_entries[(fixture.sq_tail_before + 2u) & *loop->backend.sq_ring_mask];
+    CHECK_EQ(replacement.ioprio & IORING_RECV_MULTISHOT, 0u);
+    fixture.cleanup();
+}
+
+TEST(iouring_upstream_recv, ring_full_closes_initial_incomplete_and_tls_low_water_rearms) {
+    enum class Rearm : u8 { Initial, IncompleteHeader, TlsLowWater };
+    for (const Rearm rearm : {Rearm::Initial, Rearm::IncompleteHeader, Rearm::TlsLowWater}) {
+        for (const bool ring_full : {false, true}) {
+            ScopedIoUringLoopForRetirement guard;
+            if (!guard.init()) SKIP("io_uring unavailable");
+            auto* loop = guard.loop;
+            OneShotRecvFixture fixture;
+            REQUIRE(fixture.stage(loop));
+            Connection& conn = *fixture.conn;
+            const u32 id = conn.id;
+
+            if (rearm == Rearm::Initial) {
+                static constexpr u8 kRequest[] = "GET / HTTP/1.1\r\nHost: test\r\n\r\n";
+                REQUIRE_EQ(conn.recv_buf.write(kRequest, sizeof(kRequest) - 1u),
+                           sizeof(kRequest) - 1u);
+                conn.req_initial_send_len = sizeof(kRequest) - 1u;
+            } else if (rearm == Rearm::IncompleteHeader) {
+                static constexpr u8 kPartial[] = "HTTP/1.1 200 OK\r\nContent-Len";
+                REQUIRE_EQ(conn.upstream_recv_buf.write(kPartial, sizeof(kPartial) - 1u),
+                           sizeof(kPartial) - 1u);
+            } else {
+                void* region = mmap(nullptr,
+                                    IoUringEventLoop::kTlsOutBufCap,
+                                    PROT_READ | PROT_WRITE,
+                                    MAP_PRIVATE | MAP_ANONYMOUS,
+                                    -1,
+                                    0);
+                REQUIRE(region != MAP_FAILED);
+                conn.tls_out_slice = static_cast<u8*>(region);
+                conn.tls_out_buf.bind(conn.tls_out_slice, IoUringEventLoop::kTlsOutBufCap);
+                static constexpr u8 kCiphertext = 0x17;
+                REQUIRE_EQ(conn.tls_out_buf.write(&kCiphertext, 1), 1u);
+                conn.tls_out_inflight = true;
+                conn.tls_out_inflight_len = 1;
+                conn.tls_recv_paused_hw = true;
+                conn.tls_proxy_stream = true;
+                conn.resp_fully_buffered = false;
+            }
+
+            u32 full_pending = 0;
+            if (ring_full) {
+                const u32 sq_head = __atomic_load_n(loop->backend.sq_head, __ATOMIC_ACQUIRE);
+                __atomic_store_n(loop->backend.sq_tail,
+                                 sq_head + loop->backend.sq_ring_entries,
+                                 __ATOMIC_RELEASE);
+                loop->backend.pending =
+                    fixture.backend_pending_before + loop->backend.sq_ring_entries;
+                full_pending = loop->backend.pending;
+            }
+            const u32 tail_before_trigger =
+                __atomic_load_n(loop->backend.sq_tail, __ATOMIC_ACQUIRE);
+            const i32 fd_before_trigger = conn.fd;
+            REQUIRE_GE(fd_before_trigger, 0);
+
+            if (rearm == Rearm::Initial) {
+                on_upstream_request_sent<IoUringEventLoop>(
+                    loop,
+                    conn,
+                    {id,
+                     static_cast<i32>(conn.req_initial_send_len),
+                     0,
+                     0,
+                     IoEventType::UpstreamSend,
+                     0,
+                     0,
+                     conn.upstream_episode});
+            } else if (rearm == Rearm::IncompleteHeader) {
+                on_upstream_response<IoUringEventLoop>(
+                    loop,
+                    conn,
+                    {id,
+                     static_cast<i32>(conn.upstream_recv_buf.len()),
+                     0,
+                     0,
+                     IoEventType::UpstreamRecv,
+                     0,
+                     0,
+                     conn.upstream_episode});
+            } else {
+                tls_on_out_drain<IoUringEventLoop>(
+                    loop, conn, {id, 1, 0, 0, IoEventType::Send, 0, 0, conn.upstream_episode});
+            }
+
+            if (!ring_full) {
+                CHECK_EQ(loop->conns[id].fd, fd_before_trigger);
+                CHECK_GE(loop->conns[id].fd, 0);
+                CHECK(loop->conns[id].upstream_recv_armed);
+                CHECK_EQ(loop->conns[id].pending_ops, 1u);
+                CHECK_EQ(__atomic_load_n(loop->backend.sq_tail, __ATOMIC_ACQUIRE),
+                         tail_before_trigger + 1u);
+                CHECK_EQ(loop->backend.pending, fixture.backend_pending_before + 1u);
+                const auto& sqe =
+                    loop->backend.sq_entries[tail_before_trigger & *loop->backend.sq_ring_mask];
+                CHECK_EQ(sqe.ioprio & IORING_RECV_MULTISHOT, 0u);
+            } else {
+                CHECK_EQ(loop->conns[id].fd, -1);
+                CHECK_EQ(loop->conns[id].pending_ops, 0u);
+                CHECK_FALSE(loop->conns[id].upstream_recv_armed);
+                CHECK_EQ(__atomic_load_n(loop->backend.sq_tail, __ATOMIC_ACQUIRE),
+                         tail_before_trigger);
+                CHECK_EQ(loop->backend.pending, full_pending);
+            }
+        }
+    }
+}
 
 void prepare_recv_only_retirement(Connection& conn, u32 episode) {
     conn.upstream_episode = episode;
@@ -26033,6 +26679,7 @@ TEST(iouring_episode, upstream_submissions_carry_episode_and_aux) {
     CHECK(backend.add_connect(-1, kConnId, nullptr, 0, kEpisode));
     CHECK(backend.add_send_upstream(-1, kConnId, payload, sizeof(payload), kEpisode));
     CHECK(backend.add_recv_upstream(-1, kConnId, kEpisode));
+    CHECK(backend.add_recv_upstream_once(-1, kConnId, kEpisode));
     CHECK(backend.pause_upstream_recv(42, kConnId, kEpisode));
     CHECK(backend.cancel_retiring_upstream_recv(kConnId, kEpisode));
     CHECK(backend.cancel_retiring_upstream(kConnId, IoEventType::UpstreamConnect, kEpisode));
@@ -26063,8 +26710,10 @@ TEST(iouring_episode, upstream_submissions_carry_episode_and_aux) {
         backend.sq_entries[(first_tail + 4) & sq_mask].user_data,
         backend.sq_entries[(first_tail + 5) & sq_mask].user_data,
         backend.sq_entries[(first_tail + 6) & sq_mask].user_data,
+        backend.sq_entries[(first_tail + 7) & sq_mask].user_data,
     };
     const u8 expected_aux[] = {0,
+                               0,
                                0,
                                0,
                                kPauseCancelAux,
@@ -26076,9 +26725,21 @@ TEST(iouring_episode, upstream_submissions_carry_episode_and_aux) {
                                          IoEventType::UpstreamRecv,
                                          IoEventType::UpstreamRecv,
                                          IoEventType::UpstreamRecv,
+                                         IoEventType::UpstreamRecv,
                                          IoEventType::UpstreamConnect,
                                          IoEventType::UpstreamSend};
-    for (u32 i = 0; i < 7; i++) {
+    const auto& multishot = backend.sq_entries[(first_tail + 2) & sq_mask];
+    const auto& one_shot = backend.sq_entries[(first_tail + 3) & sq_mask];
+    CHECK_EQ(multishot.opcode, static_cast<u8>(IORING_OP_RECV));
+    CHECK_EQ(one_shot.opcode, static_cast<u8>(IORING_OP_RECV));
+    CHECK_EQ(multishot.len, 4096u);
+    CHECK_EQ(one_shot.len, 4096u);
+    CHECK((multishot.flags & IOSQE_BUFFER_SELECT) != 0);
+    CHECK((one_shot.flags & IOSQE_BUFFER_SELECT) != 0);
+    CHECK((multishot.ioprio & IORING_RECV_MULTISHOT) != 0);
+    CHECK_EQ(one_shot.ioprio & IORING_RECV_MULTISHOT, 0u);
+    CHECK_EQ(multishot.buf_group, one_shot.buf_group);
+    for (u32 i = 0; i < 8; i++) {
         decoded_conn = 0;
         decoded_type = IoEventType::Count;
         decoded_aux = 0;
@@ -26111,6 +26772,8 @@ TEST(iouring_episode, invalid_upstream_episodes_do_not_acquire_sqe_or_state) {
         -1, kConnId, payload, sizeof(payload), kIoUserDataMaxUpstreamEpisode + 1u));
     CHECK_FALSE(backend.add_recv_upstream(-1, kConnId, 0));
     CHECK_FALSE(backend.add_recv_upstream(-1, kConnId, kIoUserDataMaxUpstreamEpisode + 1u));
+    CHECK_FALSE(backend.add_recv_upstream_once(-1, kConnId, 0));
+    CHECK_FALSE(backend.add_recv_upstream_once(-1, kConnId, kIoUserDataMaxUpstreamEpisode + 1u));
     CHECK_FALSE(backend.pause_upstream_recv(42, kConnId, 0));
     CHECK_FALSE(backend.pause_upstream_recv(42, kConnId, kIoUserDataMaxUpstreamEpisode + 1u));
     CHECK_FALSE(backend.cancel_retiring_upstream_recv(kConnId, 0));
