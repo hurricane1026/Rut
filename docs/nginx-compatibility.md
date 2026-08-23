@@ -71,6 +71,12 @@ Allowed states are `SUPPORTED`, `PARTIAL`, `BLOCKED_BY_RUT`,
 - Complete response buffering currently admits downstream HTTP/1.1 only. The
   accepted nginx configuration syntax does not exclude HTTP/1.0 clients, so the
   omitted-buffering row remains blocked for that version domain as well.
+- The post-#273 audit found one converter-only root slice that can progress
+  without weakening those exclusions: exact HEAD may retain its existing
+  streaming route, exact bodyless GET may use a direct complete-buffering route,
+  and the method-omitted route must remain streaming so fixed-CL POST behavior
+  does not regress. This is not yet implemented or differential-tested; `/api/`
+  remains blocked because complete buffering rejects target transforms.
 - A `proxy_pass` without a URI suffix must not accidentally forward the
   normalized routing path instead of the original request target.
 - nginx proxy request defaults are version-dependent beginning at 1.29.7.
