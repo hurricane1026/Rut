@@ -13,7 +13,7 @@ Allowed states are `SUPPORTED`, `PARTIAL`, `BLOCKED_BY_RUT`,
 | `listen <port>` IPv4 wildcard | yes | yes | yes: one source `listen :<port>` declaration | pinned nginx/generated-RUT bind and request | SUPPORTED |
 | ordinary prefix `location /` | yes | yes | partial: root catch-all exists | bounded pinned generated-RUT GET differential | PARTIAL |
 | location applies to every method | yes | yes | yes: method-omitted route source form | RUT route tests; pinned GET and POST differentials | PARTIAL |
-| `OPTIONS *` under the accepted minimal root proxy config | implicit | no; converter does not emit unmatched policy yet | bounded generic strict-local-response metadata is active for strict H1.1 exact→ANY misses; invalid/partial fails closed and configured H2 misses close; #273 remains open pending public wire/converter evidence | pinned nginx 1.29.7 exact-close 400/157-byte-body/EOF with zero upstream effects; internal ownership/H1/H2/reload production-callback tests, no ordinary-source public wire or generated-RUT differential | BLOCKED_BY_RUT |
+| `OPTIONS *` under the accepted minimal root proxy config | implicit | no; converter does not emit unmatched policy yet | yes for the bounded strict H1.1 exact-method local-response slice; invalid/partial fails closed and configured H2 misses close; #273 remains open | pinned nginx 1.29.7 exact-close 400/157-byte-body/EOF and matching separate ordinary-RUT source/JIT/io_uring wire, both with zero upstream effects; no generated-RUT differential | NOT_IMPLEMENTED |
 | authority-form CONNECT under the accepted minimal root proxy config | implicit | no; converter does not emit unmatched policy yet | bounded generic strict-local-response metadata is active for strict H1.1 exact→ANY misses; invalid/partial fails closed and configured H2 misses close; #273 remains open pending public wire/converter evidence | pinned nginx 1.29.7 exact-close 405/157-byte-body/EOF with zero upstream effects; internal ownership/H1/H2/reload production-callback tests, no ordinary-source public wire or generated-RUT differential | BLOCKED_BY_RUT |
 | fixed IPv4 HTTP `proxy_pass`, no URI suffix | yes | yes | partial: fixed `forward` plus bounded policies | pinned generated-RUT GET/query/header and fixed-CL POST differentials | PARTIAL |
 | preserve raw request-target and query | implicit | yes | partial: origin-form forward sends original bytes | pinned query differential; broader normalization untested | PARTIAL |
@@ -42,9 +42,10 @@ Allowed states are `SUPPORTED`, `PARTIAL`, `BLOCKED_BY_RUT`,
   local 400 and authority-form CONNECT with an exact local 405, both with zero
   upstream effects. #273 now has an independently approved generic method-keyed
   strict-local-response design with legacy-default safeguards. Compiler metadata,
-  deep-owned config, H1 dispatch, and configured-H2 fail-close are active, but
-  ordinary-source public wires and converter differentials remain absent; both
-  rows therefore stay `BLOCKED_BY_RUT`.
+  deep-owned config, H1 dispatch, and configured-H2 fail-close are active. The
+  OPTIONS-star ordinary-source production wire is now committed, so that row is
+  converter-only `NOT_IMPLEMENTED`; CONNECT still lacks its public wire and
+  remains `BLOCKED_BY_RUT`. Neither has a converter differential.
 - With `location /api/` and a `/` URI in `proxy_pass`, pinned nginx sends `/`,
   `/x`, and `/x?y=1` upstream for `/api/`, `/api/x`, and `/api/x?y=1`.
   It redirects `/api`, collapses repeated slash/dot-segment inputs, and decodes
