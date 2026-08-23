@@ -17294,6 +17294,53 @@ route HEAD "/deadline" {
     }
 };
 
+// Compiler/JIT lifetime for the bounded bodyless-GET, Content-Length: 0
+// response-read deadline profile.  This remains ordinary RUT source evidence;
+// it is not nginx.conf lowering or general response-body timeout support.
+struct PublicGetCl0ResponseReadDeadlineSourceResources : PublicResponseReadDeadlineSourceResources {
+    bool compile(u16 backend_port) {
+        std::string source =
+            "upstream backend at \"127.0.0.1:" + std::to_string(backend_port) + "\"\n";
+        source += R"rut(
+route GET "/deadline" {
+  return forward(backend,
+    request_policy: { version: "HTTP/1.1", host: "upstream", connection: "omit",
+      strip_headers: ["Connection", "Keep-Alive", "TE", "Expect", "Upgrade"] },
+    response_policy: { version: "HTTP/1.1", framing: "content_length",
+      connection: "request", head_mode: "reject", server: "deadline-test",
+      date: "current", hide_headers: ["Date", "Server"] },
+    failure_policy: { version: "HTTP/1.1", status: 502, reason: "Origin Failed",
+      content_type: "text/plain", server: "deadline-test", date: "current",
+      connection: "request", head_mode: "reject", body: b"default failure\n" },
+    timeout_failure_policy: { version: "HTTP/1.1", status: 504,
+      reason: "First Response Deadline", content_type: "text/plain",
+      server: "deadline-test", date: "current", connection: "request",
+      head_mode: "reject", body: b"configured deadline\n" },
+    response_read_timeout: 1s)
+}
+)rut";
+
+        auto lexed = rut::lex({source.data(), static_cast<u32>(source.size())});
+        if (!lexed) return false;
+        auto ast = rut::parse_file(lexed.value());
+        if (!ast) return false;
+        std::unique_ptr<rut::AstFile> ast_owned(ast.value());
+        auto hir = rut::analyze_file(*ast_owned);
+        if (!hir) return false;
+        std::unique_ptr<rut::HirModule> hir_owned(hir.value());
+        auto mir = rut::build_mir(*hir_owned);
+        if (!mir) return false;
+        std::unique_ptr<rut::MirModule> mir_owned(mir.value());
+        if (!rut::lower_to_rir(*mir_owned, rir)) return false;
+        auto cg = rut::jit::codegen(rir.module);
+        if (!cg.ok || !engine.init()) return false;
+        engine_ready = true;
+        if (!engine.compile(cg.mod, cg.ctx)) return false;
+        if (!rut::populate_route_config(cfg, rir.module)) return false;
+        return rut::register_jit_routes(cfg, rir.module, engine);
+    }
+};
+
 static bool read_public_close_response(
     i32 fd, u32 expected_body_len, char* out, u32 capacity, u32& length) {
     length = 0;
@@ -21566,6 +21613,221 @@ TEST(route, public_ordinary_source_narrow_first_response_deadline_iouring) {
     REQUIRE_EQ(backend.request_history_header_len[1], static_cast<u32>(expected_request_len));
     CHECK_EQ(memcmp(backend.request_history[1], expected_request, expected_request_len), 0);
     CHECK_EQ(backend.request_body_len, 0u);
+}
+
+TEST(route, public_ordinary_source_get_cl0_response_deadline_reuses_downstream_iouring) {
+    using namespace rut;
+    if (!iouring_socket_live()) SKIP("io_uring async socket ops unavailable in this environment");
+    static constexpr char kSecondOrigin[] =
+        "HTTP/1.1 200 OK\r\n"
+        "Server: origin\r\n"
+        "Date: Tue, 01 Jan 2030 00:00:00 GMT\r\n"
+        "Content-Length: 0\r\n\r\n";
+    static constexpr char kTimeoutExpected[] =
+        "HTTP/1.1 504 First Response Deadline\r\n"
+        "Server: deadline-test\r\n"
+        "Date: XXXXXXXXXXXXXXXXXXXXXXXXXXXXX\r\n"
+        "Content-Type: text/plain\r\n"
+        "Content-Length: 20\r\n"
+        "Connection: keep-alive\r\n\r\n"
+        "configured deadline\n";
+    static constexpr char kSecondExpected[] =
+        "HTTP/1.1 200 OK\r\n"
+        "Server: deadline-test\r\n"
+        "Date: XXXXXXXXXXXXXXXXXXXXXXXXXXXXX\r\n"
+        "Content-Length: 0\r\n"
+        "Connection: keep-alive\r\n\r\n";
+    static_assert(sizeof("configured deadline\n") - 1 == 20);
+
+    RecordingUpstream backend;
+    backend.stall_first_response_for_peer_close = true;
+    backend.response_after_first = kSecondOrigin;
+    backend.response_after_first_len = sizeof(kSecondOrigin) - 1;
+    // The fixture must not manufacture origin EOF after the successful CL0
+    // response.  RUT owns retirement; the fixture keeps origin 2 open.
+    backend.keep_open = true;
+    REQUIRE(backend.setup());
+
+    PublicGetCl0ResponseReadDeadlineSourceResources resources;
+    REQUIRE(resources.compile(backend.port));
+    REQUIRE_EQ(resources.rir.module.func_count, 1u);
+    REQUIRE_EQ(resources.rir.module.response_policy_count, 1u);
+    REQUIRE_EQ(resources.rir.module.failure_policy_count, 2u);
+    REQUIRE_EQ(resources.rir.module.policy_bundle_count, 1u);
+    CHECK_EQ(resources.rir.module.policy_bundles[0].response_read_timeout_seconds, 1u);
+    CHECK_EQ(resources.rir.module.functions[0].preflight_forward_policy_bundle_id, 1u);
+    REQUIRE_EQ(resources.cfg.response_policy_count, 1u);
+    REQUIRE_EQ(resources.cfg.failure_policy_count, 2u);
+    REQUIRE_EQ(resources.cfg.policy_bundle_count, 1u);
+    const auto& bundle = resources.cfg.policy_bundles[0];
+    CHECK_EQ(bundle.response_policy_id, 1u);
+    CHECK_EQ(bundle.failure_policy_id, 1u);
+    CHECK_EQ(bundle.timeout_failure_policy_id, 2u);
+    CHECK_EQ(bundle.response_read_timeout_seconds, 1u);
+    CHECK_EQ(resources.cfg.response_policies[0].head_mode, ResponsePolicyHeadMode::Reject);
+    CHECK_EQ(resources.cfg.failure_policies[0].head_mode, FailurePolicyHeadMode::Reject);
+    CHECK_EQ(resources.cfg.failure_policies[1].head_mode, FailurePolicyHeadMode::Reject);
+    CHECK(resources.cfg.failure_policies[1].body.eq({"configured deadline\n", 20}));
+    REQUIRE_EQ(resources.cfg.route_count, 1u);
+    CHECK_EQ(resources.cfg.routes[0].preflight_forward_policy_bundle_id, 1u);
+
+    Shard<IoUringEventLoop> shard;
+    i32 listen_fd = create_listen_socket(0).value_or(-1);
+    REQUIRE_GE(listen_fd, 0);
+    struct ShardGuard {
+        Shard<IoUringEventLoop>& shard;
+        i32& listen_fd;
+        bool spawned = false;
+        ~ShardGuard() {
+            if (spawned) {
+                shard.stop();
+                shard.join();
+            }
+            shard.shutdown();
+            if (listen_fd >= 0) close(listen_fd);
+        }
+    } shard_guard{shard, listen_fd};
+    const u16 port = get_port(listen_fd);
+    REQUIRE(shard.init(0, listen_fd).has_value());
+    shard.route_config = &resources.cfg;
+    REQUIRE(shard.loop != nullptr);
+    REQUIRE_EQ(shard.loop->upstream_timeout, IoUringEventLoop::kDefaultUpstreamTimeout);
+    REQUIRE_GT(IoUringEventLoop::kDefaultUpstreamTimeout, 8u);
+    REQUIRE(shard.spawn(-1).has_value());
+    shard_guard.spawned = true;
+    usleep(50000);
+
+    struct ClientGuard {
+        i32 fd;
+        ~ClientGuard() {
+            if (fd >= 0) close(fd);
+        }
+    } client{connect_to(port)};
+    REQUIRE_GE(client.fd, 0);
+    set_socket_timeouts(client.fd, 8);
+    static constexpr char kRequest1[] =
+        "GET /deadline?stalled=1 HTTP/1.1\r\nHost: client.example\r\nX-Test: slow\r\n\r\n";
+    static constexpr char kRequest2[] =
+        "GET /deadline?complete=2 HTTP/1.1\r\nHost: client.example\r\nX-Test: final\r\n\r\n";
+
+    auto read_fixed_response =
+        [](i32 fd, u32 body_len, char* output, u32 capacity, u32& output_len, i32 timeout_ms) {
+            output_len = 0;
+            u32 header_end = 0;
+            for (u32 attempt = 0; attempt < 32 && output_len < capacity; attempt++) {
+                const i32 got =
+                    recv_timeout(fd, output + output_len, capacity - output_len, timeout_ms);
+                if (got <= 0) return false;
+                output_len += static_cast<u32>(got);
+                if (header_end == 0) {
+                    for (u32 i = 0; i + 3 < output_len; i++) {
+                        if (output[i] == '\r' && output[i + 1] == '\n' && output[i + 2] == '\r' &&
+                            output[i + 3] == '\n') {
+                            header_end = i + 4;
+                            break;
+                        }
+                    }
+                }
+                if (header_end != 0) {
+                    const u32 expected = header_end + body_len;
+                    if (output_len > expected) return false;
+                    if (output_len == expected) return true;
+                }
+            }
+            return false;
+        };
+
+    struct timespec started{};
+    REQUIRE_EQ(clock_gettime(CLOCK_MONOTONIC, &started), 0);
+    REQUIRE(send_all(client.fd, kRequest1, sizeof(kRequest1) - 1));
+    for (u32 waited = 0;
+         waited < 600 && (!backend.first_response_stalled_open.load(std::memory_order_acquire) ||
+                          backend.request_count.load(std::memory_order_acquire) < 1);
+         waited++)
+        usleep(5000);
+    REQUIRE(backend.first_response_stalled_open.load(std::memory_order_acquire));
+    REQUIRE_FALSE(backend.first_response_sent_open.load(std::memory_order_acquire));
+    REQUIRE_EQ(backend.first_response_fragment_count.load(std::memory_order_acquire), 0u);
+    REQUIRE_EQ(backend.accepted_count.load(std::memory_order_acquire), 1u);
+    REQUIRE_EQ(backend.request_count.load(std::memory_order_acquire), 1u);
+
+    char expected_request[256]{};
+    int expected_request_len = snprintf(expected_request,
+                                        sizeof(expected_request),
+                                        "GET /deadline?stalled=1 HTTP/1.1\r\nHost: 127.0.0.1:%u\r\n"
+                                        "X-Test: slow\r\n\r\n",
+                                        backend.port);
+    REQUIRE_GT(expected_request_len, 0);
+    REQUIRE_EQ(backend.request_history_len[0], static_cast<u32>(expected_request_len));
+    REQUIRE_EQ(backend.request_history_header_len[0], static_cast<u32>(expected_request_len));
+    CHECK_EQ(memcmp(backend.request_history[0], expected_request, expected_request_len), 0);
+    CHECK_EQ(backend.request_body_len, 0u);
+
+    char response[1024]{};
+    u32 response_len = 0;
+    REQUIRE(read_fixed_response(client.fd, 20, response, sizeof(response), response_len, 8000));
+    struct timespec finished{};
+    REQUIRE_EQ(clock_gettime(CLOCK_MONOTONIC, &finished), 0);
+    const double elapsed = static_cast<double>(finished.tv_sec - started.tv_sec) +
+                           (finished.tv_nsec - started.tv_nsec) / 1e9;
+    CHECK_LT(elapsed, 8.0);
+    REQUIRE(normalize_public_date(response, response_len));
+    REQUIRE_EQ(response_len, static_cast<u32>(strlen(kTimeoutExpected)));
+    CHECK_EQ(memcmp(response, kTimeoutExpected, response_len), 0);
+
+    for (u32 waited = 0;
+         waited < 600 && !backend.first_peer_closed.load(std::memory_order_acquire) &&
+         !backend.first_peer_unexpected_data.load(std::memory_order_acquire) &&
+         !backend.first_peer_close_timed_out.load(std::memory_order_acquire) &&
+         !backend.first_peer_observation_aborted.load(std::memory_order_acquire);
+         waited++)
+        usleep(5000);
+    REQUIRE(backend.first_peer_closed.load(std::memory_order_acquire));
+    REQUIRE_NE(backend.first_peer_closed_ns.load(std::memory_order_acquire), 0u);
+    CHECK_FALSE(backend.first_peer_unexpected_data.load(std::memory_order_acquire));
+    CHECK_FALSE(backend.first_peer_close_timed_out.load(std::memory_order_acquire));
+    CHECK_FALSE(backend.first_peer_observation_aborted.load(std::memory_order_acquire));
+    REQUIRE_EQ(backend.accepted_count.load(std::memory_order_acquire), 1u);
+    REQUIRE_EQ(backend.request_count.load(std::memory_order_acquire), 1u);
+
+    // Request 2 is sent on the same downstream fd only after the recorder has
+    // observed RUT retire origin 1.  A second accept is therefore a fresh origin
+    // episode, not pooling or fixture-driven EOF.
+    REQUIRE(send_all(client.fd, kRequest2, sizeof(kRequest2) - 1));
+    memset(response, 0, sizeof(response));
+    REQUIRE(read_fixed_response(client.fd, 0, response, sizeof(response), response_len, 5000));
+    REQUIRE(normalize_public_date(response, response_len));
+    REQUIRE_EQ(response_len, static_cast<u32>(strlen(kSecondExpected)));
+    CHECK_EQ(memcmp(response, kSecondExpected, response_len), 0);
+
+    for (u32 waited = 0; waited < 600 && backend.request_count.load(std::memory_order_acquire) < 2;
+         waited++)
+        usleep(5000);
+    REQUIRE_EQ(backend.accepted_count.load(std::memory_order_acquire), 2u);
+    REQUIRE_EQ(backend.request_count.load(std::memory_order_acquire), 2u);
+    memset(expected_request, 0, sizeof(expected_request));
+    expected_request_len = snprintf(expected_request,
+                                    sizeof(expected_request),
+                                    "GET /deadline?complete=2 HTTP/1.1\r\n"
+                                    "Host: 127.0.0.1:%u\r\nX-Test: final\r\n\r\n",
+                                    backend.port);
+    REQUIRE_GT(expected_request_len, 0);
+    REQUIRE_EQ(backend.request_history_len[1], static_cast<u32>(expected_request_len));
+    REQUIRE_EQ(backend.request_history_header_len[1], static_cast<u32>(expected_request_len));
+    CHECK_EQ(memcmp(backend.request_history[1], expected_request, expected_request_len), 0);
+    CHECK_EQ(backend.request_body_len, 0u);
+
+    char quiet[16];
+    REQUIRE_EQ(recv_timeout(client.fd, quiet, sizeof(quiet), 100), -EAGAIN);
+    CHECK_EQ(backend.accepted_count.load(std::memory_order_acquire), 2u);
+    CHECK_EQ(backend.request_count.load(std::memory_order_acquire), 2u);
+    for (u32 slot = 2; slot < RecordingUpstream::kMaxRecordedRequests; slot++) {
+        bool zero =
+            backend.request_history_len[slot] == 0 && backend.request_history_header_len[slot] == 0;
+        for (u32 i = 0; zero && i < RecordingUpstream::kRequestCapacity; i++)
+            zero = backend.request_history[slot][i] == '\0';
+        CHECK(zero);
+    }
 }
 
 TEST(route, public_ordinary_source_progress_then_response_deadline_iouring) {
