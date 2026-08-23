@@ -55,6 +55,28 @@ enum class ResponseReadDeadlineState : u8 {
     RefreshPending,
 };
 
+// Immutable request/response contract selected before the JIT handler runs.
+// The profile is part of every explicit-deadline ownership proof; method tests
+// outside the centralized classifier must never widen this domain.
+enum class ResponseReadDeadlineProfile : u8 {
+    None,
+    HeaderOnlyHead,
+    BodylessGetContentLengthZero,
+};
+
+enum class Http1PrebuiltResponseLayout : u8 {
+    None,
+    HeaderOnlyHead,
+    FullContentLengthGet,
+};
+
+enum class Http1PrebuiltResponsePurpose : u8 {
+    None,
+    StrictHeadHeaderOnly,
+    StrictGetCl0Success,
+    ResponseReadTimeout,
+};
+
 // Request-buffer ownership captured by the internal HTTP/1 prebuilt-response
 // rendezvous.  The value describes where request 1 still lives while an old
 // upstream episode and the downstream header send drain independently.
@@ -470,8 +492,12 @@ struct ConnectionBase {
     u32 response_read_deadline_upstream_episode;
     u16 response_read_deadline_bundle_id;
     u8 response_read_deadline_seconds;
+    ResponseReadDeadlineProfile response_read_deadline_profile;
     ResponseReadDeadlineState response_read_deadline_state;
     bool response_read_deadline_first_batch;
+    ResponseReadDeadlineProfile response_read_deadline_first_batch_profile;
+    u32 response_read_deadline_first_batch_generation;
+    u16 response_read_deadline_first_batch_bundle_id;
     // Exact cumulative positive-copy proof for the current deadline owner.
     // Set only after whole-batch witness validation and preserved across
     // incomplete-header re-arms; cleared with active deadline ownership.
@@ -491,10 +517,28 @@ struct ConnectionBase {
         response_read_deadline_upstream_episode = 0;
         response_read_deadline_bundle_id = 0;
         response_read_deadline_seconds = 0;
+        response_read_deadline_profile = ResponseReadDeadlineProfile::None;
         response_read_deadline_state = ResponseReadDeadlineState::None;
         response_read_deadline_progress_generation = 0;
         response_read_deadline_progress_episode = 0;
         response_read_deadline_progress_bytes = 0;
+        response_read_deadline_first_batch = false;
+        response_read_deadline_first_batch_profile = ResponseReadDeadlineProfile::None;
+        response_read_deadline_first_batch_generation = 0;
+        response_read_deadline_first_batch_bundle_id = 0;
+    }
+
+    void clear_http1_prebuilt_response_proof() {
+        http1_prebuilt_response_layout = Http1PrebuiltResponseLayout::None;
+        http1_prebuilt_response_purpose = Http1PrebuiltResponsePurpose::None;
+        http1_prebuilt_deadline_profile = ResponseReadDeadlineProfile::None;
+        http1_prebuilt_deadline_generation = 0;
+        http1_prebuilt_deadline_bundle_id = 0;
+        http1_prebuilt_deadline_config = nullptr;
+        http1_prebuilt_header_end = 0;
+        http1_prebuilt_total_len = 0;
+        http1_prebuilt_body_len = 0;
+        http1_prebuilt_status = 0;
     }
 
     // Advance the token without wrapping. Zero is the invalid sentinel and
@@ -741,6 +785,16 @@ struct ConnectionBase {
     u8 http1_prebuilt_wait;
     Http1RequestBufferDisposition http1_prebuilt_disposition;
     u32 http1_prebuilt_request_prefix_len;
+    Http1PrebuiltResponseLayout http1_prebuilt_response_layout;
+    Http1PrebuiltResponsePurpose http1_prebuilt_response_purpose;
+    ResponseReadDeadlineProfile http1_prebuilt_deadline_profile;
+    u32 http1_prebuilt_deadline_generation;
+    u16 http1_prebuilt_deadline_bundle_id;
+    const RouteConfig* http1_prebuilt_deadline_config;
+    u32 http1_prebuilt_header_end;
+    u32 http1_prebuilt_total_len;
+    u32 http1_prebuilt_body_len;
+    u16 http1_prebuilt_status;
     // True when an idle-return stale upstream recv CQE carried bytes. The stale branch
     // rolls those bytes back out of upstream_recv_buf, so the deferred pool-return path
     // needs this separate marker to close rather than reuse a desynced fd.
@@ -912,7 +966,6 @@ struct ConnectionBase {
         // response_read_deadline_generation follows that persistence rule too;
         // only the live owner is cleared.
         clear_response_read_deadline();
-        response_read_deadline_first_batch = false;
         request_config = nullptr;
         listener_context = {};
         pending_handler_fn = nullptr;
@@ -1018,6 +1071,7 @@ struct ConnectionBase {
         http1_prebuilt_wait = 0;
         http1_prebuilt_disposition = Http1RequestBufferDisposition::None;
         http1_prebuilt_request_prefix_len = 0;
+        clear_http1_prebuilt_response_proof();
         upstream_recv_idle_stale_bytes = false;
         yield_armed = false;
         yield_timeout_armed = false;

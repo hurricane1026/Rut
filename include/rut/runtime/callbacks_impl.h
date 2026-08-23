@@ -527,6 +527,11 @@ inline bool forward_policy_head_modes_compatible(const RouteConfig& config,
 inline bool response_policy_suppress_head_admitted(const Connection& conn,
                                                    const ForwardResponsePolicySpec& policy,
                                                    bool paired_failure);
+inline ResponseReadDeadlineProfile classify_response_read_deadline_profile(
+    const Connection& conn,
+    const ForwardResponsePolicySpec& response,
+    const ForwardFailurePolicySpec& failure,
+    const ForwardFailurePolicySpec& timeout);
 inline bool build_timeout_failure_policy_response(const Connection& conn,
                                                   const RouteConfig& config,
                                                   bool suppress_body,
@@ -584,24 +589,22 @@ bool prepare_response_read_deadline_preflight(Loop* loop,
         const auto& response = config->response_policies[bundle.response_policy_id - 1];
         const auto& failure = config->failure_policies[bundle.failure_policy_id - 1];
         const auto& timeout = config->failure_policies[bundle.timeout_failure_policy_id - 1];
+        const ResponseReadDeadlineProfile profile =
+            classify_response_read_deadline_profile(conn, response, failure, timeout);
         if (response.version != ResponsePolicyVersion::Http11 ||
             response.framing != ResponsePolicyFraming::ContentLength ||
             response.connection != ResponsePolicyConnection::Request ||
-            response.head_mode != ResponsePolicyHeadMode::SuppressBody ||
             failure.version != ForwardFailurePolicyVersion::Http11 ||
             failure.status_code != kStatusBadGateway ||
             failure.connection != ForwardFailurePolicyConnection::Request ||
-            failure.head_mode != FailurePolicyHeadMode::SuppressBody ||
             timeout.version != ForwardFailurePolicyVersion::Http11 ||
             timeout.connection != ForwardFailurePolicyConnection::Request ||
-            timeout.head_mode != FailurePolicyHeadMode::SuppressBody ||
             conn.protocol != ConnProtocol::Http11 || conn.tls_active || conn.req_malformed ||
             conn.req_body_mode != BodyMode::None || conn.req_body_remaining != 0 ||
             conn.request_body_fully_buffered || conn.req_client_has_transfer_encoding ||
             conn.req_client_has_te || conn.req_client_has_expect ||
             conn.req_client_has_upgrade_header || conn.req_client_connection_count != 0 ||
-            conn.req_wants_upgrade ||
-            !response_policy_suppress_head_admitted(conn, response, /*paired_failure=*/true) ||
+            conn.req_wants_upgrade || profile == ResponseReadDeadlineProfile::None ||
             conn.pipeline_depth != 0 || conn.recv_buf.len() != conn.req_initial_send_len) {
             loop->close_conn(conn);
             return false;
@@ -612,6 +615,7 @@ bool prepare_response_read_deadline_preflight(Loop* loop,
         }
         conn.response_read_deadline_bundle_id = id;
         conn.response_read_deadline_seconds = bundle.response_read_timeout_seconds;
+        conn.response_read_deadline_profile = profile;
         conn.response_read_deadline_state = ResponseReadDeadlineState::Preflight;
         return true;
     }
@@ -2372,6 +2376,17 @@ void handle_jit_outcome(
                     (request_policy_is_supported(outcome.request_policy_id) &&
                      inspect_request_policy_body(conn, outcome.request_policy_id) ==
                          RequestPolicyBodyState::Complete);
+                ResponseReadDeadlineProfile outcome_profile = ResponseReadDeadlineProfile::None;
+                if (config != nullptr &&
+                    config->response_policy_id_is_valid(forward_response_policy_id) &&
+                    config->failure_policy_id_is_valid(forward_failure_policy_id) &&
+                    config->timeout_failure_policy_id_is_valid(forward_timeout_failure_policy_id)) {
+                    outcome_profile = classify_response_read_deadline_profile(
+                        conn,
+                        config->response_policies[forward_response_policy_id - 1],
+                        config->failure_policies[forward_failure_policy_id - 1],
+                        config->failure_policies[forward_timeout_failure_policy_id - 1]);
+                }
                 if (!loop_supports_deadline ||
                     conn.response_read_deadline_state != ResponseReadDeadlineState::Preflight ||
                     conn.response_read_deadline_owner_generation == 0 ||
@@ -2380,16 +2395,17 @@ void handle_jit_outcome(
                     outcome.policy_bundle_id == 0 ||
                     outcome.policy_bundle_id != conn.response_read_deadline_bundle_id ||
                     outcome.response_read_timeout_seconds != conn.response_read_deadline_seconds ||
-                    !target_valid || !request_policy_complete || conn.target_transform_recorded ||
+                    outcome_profile == ResponseReadDeadlineProfile::None ||
+                    outcome_profile != conn.response_read_deadline_profile || !target_valid ||
+                    !request_policy_complete || conn.target_transform_recorded ||
                     conn.req_path_overridden || conn.req_header_override_count != 0 ||
                     conn.req_header_override_overflow || conn.resp_header_mutation_count != 0 ||
                     conn.resp_header_mutation_pending_count != 0 ||
                     conn.resp_header_mutation_pending_overflow ||
                     conn.resp_header_mutation_overflow || conn.protocol != ConnProtocol::Http11 ||
-                    conn.tls_active || conn.req_method != static_cast<u8>(LogHttpMethod::Head) ||
-                    conn.req_body_mode != BodyMode::None || conn.req_body_remaining != 0 ||
-                    conn.request_body_fully_buffered || conn.pipeline_depth != 0 ||
-                    conn.recv_buf.len() != conn.req_initial_send_len) {
+                    conn.tls_active || conn.req_body_mode != BodyMode::None ||
+                    conn.req_body_remaining != 0 || conn.request_body_fully_buffered ||
+                    conn.pipeline_depth != 0 || conn.recv_buf.len() != conn.req_initial_send_len) {
                     loop->close_conn(conn);
                     return;
                 }
@@ -2945,18 +2961,29 @@ inline bool try_prebuilt_strict_read_timeout(Loop* loop, Connection& conn) {
         const auto& response = config->response_policies[conn.response_policy_id - 1];
         const auto& failure = config->failure_policies[conn.failure_policy_id - 1];
         const auto& timeout = config->failure_policies[conn.timeout_failure_policy_id - 1];
+        const ResponseReadDeadlineProfile profile =
+            explicit_deadline_expiry ? conn.response_read_deadline_profile
+                                     : ResponseReadDeadlineProfile::HeaderOnlyHead;
+        const bool suppress_body = profile == ResponseReadDeadlineProfile::HeaderOnlyHead;
+        const bool profile_modes_match =
+            suppress_body
+                ? response.head_mode == ResponsePolicyHeadMode::SuppressBody &&
+                      failure.head_mode == FailurePolicyHeadMode::SuppressBody &&
+                      timeout.head_mode == FailurePolicyHeadMode::SuppressBody &&
+                      conn.response_policy_suppress_body && conn.failure_policy_suppress_body
+                : profile == ResponseReadDeadlineProfile::BodylessGetContentLengthZero &&
+                      response.head_mode == ResponsePolicyHeadMode::Reject &&
+                      failure.head_mode == FailurePolicyHeadMode::Reject &&
+                      timeout.head_mode == FailurePolicyHeadMode::Reject &&
+                      !conn.response_policy_suppress_body && !conn.failure_policy_suppress_body;
         if (response.version != ResponsePolicyVersion::Http11 ||
             response.framing != ResponsePolicyFraming::ContentLength ||
             response.connection != ResponsePolicyConnection::Request ||
-            response.head_mode != ResponsePolicyHeadMode::SuppressBody ||
             failure.version != ForwardFailurePolicyVersion::Http11 ||
             failure.status_code != kStatusBadGateway ||
             failure.connection != ForwardFailurePolicyConnection::Request ||
-            failure.head_mode != FailurePolicyHeadMode::SuppressBody ||
             timeout.version != ForwardFailurePolicyVersion::Http11 ||
-            timeout.connection != ForwardFailurePolicyConnection::Request ||
-            timeout.head_mode != FailurePolicyHeadMode::SuppressBody ||
-            !conn.response_policy_suppress_body || !conn.failure_policy_suppress_body)
+            timeout.connection != ForwardFailurePolicyConnection::Request || !profile_modes_match)
             return false;
 
         // The original request bytes were removed after the complete upload, so
@@ -2964,8 +2991,11 @@ inline bool try_prebuilt_strict_read_timeout(Loop* loop, Connection& conn) {
         // re-running response_policy_suppress_head_admitted against recv_buf.
         if (conn.protocol != ConnProtocol::Http11 || conn.tls_active ||
             conn.req_http_version != static_cast<u8>(HttpVersion::Http11) ||
-            conn.req_method != static_cast<u8>(LogHttpMethod::Head) || !conn.keep_alive ||
-            !conn.req_keep_alive || !conn.req_client_keep_alive ||
+            ((profile == ResponseReadDeadlineProfile::HeaderOnlyHead &&
+              conn.req_method != static_cast<u8>(LogHttpMethod::Head)) ||
+             (profile == ResponseReadDeadlineProfile::BodylessGetContentLengthZero &&
+              conn.req_method != static_cast<u8>(LogHttpMethod::Get))) ||
+            !conn.keep_alive || !conn.req_keep_alive || !conn.req_client_keep_alive ||
             conn.req_client_connection_close || conn.req_client_connection_close_exact ||
             conn.req_client_connection_count != 0 || conn.req_client_has_content_length ||
             conn.req_client_has_transfer_encoding || conn.req_client_has_te ||
@@ -3019,15 +3049,45 @@ inline bool try_prebuilt_strict_read_timeout(Loop* loop, Connection& conn) {
         if (!exact_slot) return false;
 
         u8 scratch[SlicePool::kSliceSize];
-        u32 header_len = 0;
-        if (!build_timeout_failure_policy_response(conn,
-                                                   *config,
-                                                   /*suppress_body=*/true,
-                                                   scratch,
-                                                   sizeof(scratch),
-                                                   &header_len) ||
-            header_len == 0 || header_len > conn.response_header_buf.capacity())
+        u32 response_len = 0;
+        if (!build_timeout_failure_policy_response(
+                conn, *config, suppress_body, scratch, sizeof(scratch), &response_len) ||
+            response_len == 0 || response_len > conn.response_header_buf.capacity())
             return false;
+
+        HttpResponseParser timeout_parser;
+        ParsedResponse timeout_response;
+        timeout_parser.reset();
+        timeout_response.reset();
+        if (timeout_parser.parse(scratch, response_len, &timeout_response) !=
+                ParseStatus::Complete ||
+            timeout_response.version != HttpVersion::Http11 ||
+            timeout_response.status_code != timeout.status_code ||
+            timeout_response.content_length_count != 1 || timeout_response.chunked ||
+            timeout_parser.header_end > response_len ||
+            (suppress_body
+                 ? timeout_parser.header_end != response_len
+                 : timeout_response.content_length != response_len - timeout_parser.header_end))
+            return false;
+
+        // Capture the complete immutable response owner before removing the
+        // live deadline.  D2 validates these fields again before publishing a
+        // byte, independently of the header parser's transient views.
+        if (explicit_deadline_expiry) {
+            conn.http1_prebuilt_response_layout =
+                suppress_body ? Http1PrebuiltResponseLayout::HeaderOnlyHead
+                              : Http1PrebuiltResponseLayout::FullContentLengthGet;
+            conn.http1_prebuilt_response_purpose =
+                Http1PrebuiltResponsePurpose::ResponseReadTimeout;
+            conn.http1_prebuilt_deadline_profile = profile;
+            conn.http1_prebuilt_deadline_generation = conn.response_read_deadline_generation;
+            conn.http1_prebuilt_deadline_bundle_id = conn.response_read_deadline_bundle_id;
+            conn.http1_prebuilt_deadline_config = config;
+            conn.http1_prebuilt_header_end = timeout_parser.header_end;
+            conn.http1_prebuilt_total_len = response_len;
+            conn.http1_prebuilt_body_len = response_len - timeout_parser.header_end;
+            conn.http1_prebuilt_status = timeout.status_code;
+        }
 
         // All admission and response construction checks above are read-only.
         // Only now may an explicit-deadline expiry consume its private prefix
@@ -3038,14 +3098,14 @@ inline bool try_prebuilt_strict_read_timeout(Loop* loop, Connection& conn) {
         }
 
         conn.response_header_buf.reset();
-        if (conn.response_header_buf.write(scratch, header_len) != header_len) {
+        if (conn.response_header_buf.write(scratch, response_len) != response_len) {
             loop->close_conn(conn);
             return true;
         }
         conn.resp_status = timeout.status_code;
         conn.resp_body_mode = BodyMode::None;
         conn.resp_body_remaining = 0;
-        conn.resp_body_sent = 0;
+        conn.resp_body_sent = suppress_body ? 0 : conn.http1_prebuilt_body_len;
         conn.upstream_send_len = 0;
         if (!loop->begin_prebuilt_http1_response(conn,
                                                  kUpstreamOpRecv,
@@ -6119,6 +6179,79 @@ inline bool response_policy_suppress_head_admitted(const Connection& conn,
            conn.recv_buf.len() == conn.req_initial_send_len;
 }
 
+inline ResponseReadDeadlineProfile classify_response_read_deadline_profile(
+    const Connection& conn,
+    const ForwardResponsePolicySpec& response,
+    const ForwardFailurePolicySpec& failure,
+    const ForwardFailurePolicySpec& timeout) {
+    const bool common = response.version == ResponsePolicyVersion::Http11 &&
+                        response.framing == ResponsePolicyFraming::ContentLength &&
+                        response.connection == ResponsePolicyConnection::Request &&
+                        failure.version == ForwardFailurePolicyVersion::Http11 &&
+                        failure.status_code == kStatusBadGateway &&
+                        failure.connection == ForwardFailurePolicyConnection::Request &&
+                        timeout.version == ForwardFailurePolicyVersion::Http11 &&
+                        timeout.connection == ForwardFailurePolicyConnection::Request;
+    if (!common) return ResponseReadDeadlineProfile::None;
+
+    if (response.head_mode == ResponsePolicyHeadMode::SuppressBody &&
+        failure.head_mode == FailurePolicyHeadMode::SuppressBody &&
+        timeout.head_mode == FailurePolicyHeadMode::SuppressBody &&
+        response_policy_suppress_head_admitted(conn, response, /*paired_failure=*/true))
+        return ResponseReadDeadlineProfile::HeaderOnlyHead;
+
+    // The second admitted profile is deliberately a raw, bodyless HTTP/1.1
+    // GET with default persistence.  Captured request facts are authoritative
+    // after upload, so this same predicate can be re-run without retaining a
+    // parser view into recv_buf.
+    if (response.head_mode != ResponsePolicyHeadMode::Reject ||
+        failure.head_mode != FailurePolicyHeadMode::Reject ||
+        timeout.head_mode != FailurePolicyHeadMode::Reject ||
+        conn.req_method != static_cast<u8>(LogHttpMethod::Get) ||
+        conn.req_http_version != static_cast<u8>(HttpVersion::Http11) || !conn.keep_alive ||
+        !conn.req_client_keep_alive || conn.req_client_connection_close ||
+        conn.req_client_connection_close_exact || conn.req_client_connection_count != 0 ||
+        conn.req_client_has_content_length || conn.req_client_has_transfer_encoding ||
+        conn.req_client_has_te || conn.req_client_has_expect ||
+        conn.req_client_has_upgrade_header || conn.req_malformed || conn.req_wants_upgrade ||
+        conn.req_path_canon.ptr == nullptr || conn.req_body_mode != BodyMode::None ||
+        conn.req_body_remaining != 0 || conn.request_body_fully_buffered ||
+        conn.req_body_streamed || conn.req_header_override_count != 0 ||
+        conn.req_header_override_overflow || conn.resp_header_mutation_count != 0 ||
+        conn.resp_header_mutation_pending_count != 0 ||
+        conn.resp_header_mutation_pending_overflow || conn.resp_header_mutation_overflow ||
+        conn.pipeline_stash_len != 0 || conn.protocol != ConnProtocol::Http11 || conn.tls_active)
+        return ResponseReadDeadlineProfile::None;
+    if (conn.recv_buf.data() == nullptr || conn.recv_buf.len() == 0)
+        return ResponseReadDeadlineProfile::None;
+    HttpParser parser;
+    ParsedRequest request;
+    parser.reset();
+    if (parser.parse(conn.recv_buf.data(), conn.recv_buf.len(), &request) !=
+            ParseStatus::Complete ||
+        parser.header_end != conn.recv_buf.len() || request.method != HttpMethod::GET ||
+        request.version != HttpVersion::Http11 || request.path.ptr == nullptr ||
+        request.path.len == 0 || request.path.ptr[0] != '/')
+        return ResponseReadDeadlineProfile::None;
+    u32 host_count = 0;
+    for (u32 i = 0; i < request.header_count; ++i) {
+        const Str name = request.headers[i].name;
+        if (http_header_name_eq_ci(name.ptr, name.len, "host", 4)) {
+            if (++host_count > 1 || request.headers[i].value.len == 0)
+                return ResponseReadDeadlineProfile::None;
+        } else if (http_header_name_eq_ci(name.ptr, name.len, "connection", 10) ||
+                   http_header_name_eq_ci(name.ptr, name.len, "content-length", 14) ||
+                   http_header_name_eq_ci(name.ptr, name.len, "transfer-encoding", 17) ||
+                   http_header_name_eq_ci(name.ptr, name.len, "te", 2) ||
+                   http_header_name_eq_ci(name.ptr, name.len, "expect", 6) ||
+                   http_header_name_eq_ci(name.ptr, name.len, "upgrade", 7)) {
+            return ResponseReadDeadlineProfile::None;
+        }
+    }
+    if (host_count != 1) return ResponseReadDeadlineProfile::None;
+    return ResponseReadDeadlineProfile::BodylessGetContentLengthZero;
+}
+
 inline u32 strict_response_dec(char* out, u32 value);
 inline u32 strict_response_date(char* out, u64 now_us);
 
@@ -6788,6 +6921,15 @@ void on_upstream_response(void* lp, Connection& conn, IoEvent ev) {
     const bool explicit_first_batch = conn.response_read_deadline_first_batch;
     const bool explicit_progress_batch =
         conn.response_read_deadline_state == ResponseReadDeadlineState::BatchPending;
+    const ResponseReadDeadlineProfile explicit_profile =
+        explicit_progress_batch ? conn.response_read_deadline_profile
+                                : conn.response_read_deadline_first_batch_profile;
+    const u32 explicit_generation = explicit_progress_batch
+                                        ? conn.response_read_deadline_generation
+                                        : conn.response_read_deadline_first_batch_generation;
+    const u16 explicit_bundle_id = explicit_progress_batch
+                                       ? conn.response_read_deadline_bundle_id
+                                       : conn.response_read_deadline_first_batch_bundle_id;
     auto disarm_explicit_deadline = [&]() {
         if constexpr (requires(Loop* candidate, Connection& c) {
                           candidate->disarm_response_read_deadline(c);
@@ -6870,6 +7012,11 @@ void on_upstream_response(void* lp, Connection& conn, IoEvent ev) {
     }
     if (ps == ParseStatus::Error) {
         if (explicit_first_batch || explicit_progress_batch) disarm_explicit_deadline();
+        if ((explicit_first_batch || explicit_progress_batch) &&
+            explicit_profile == ResponseReadDeadlineProfile::BodylessGetContentLengthZero) {
+            loop->close_conn(conn);
+            return;
+        }
         if (conn.response_policy_id != 0) {
             reject_strict_response(loop, conn, StrictResponseRejectionCause::UpstreamParse);
             return;
@@ -6887,6 +7034,111 @@ void on_upstream_response(void* lp, Connection& conn, IoEvent ev) {
         conn.resp_status = kStatusBadGateway;
         conn.transition_to_sending(&on_response_sent<Loop>);
         client_send(loop, conn, conn.send_buf.data(), conn.send_buf.len());
+        return;
+    }
+
+    if ((explicit_first_batch || explicit_progress_batch) &&
+        explicit_profile == ResponseReadDeadlineProfile::BodylessGetContentLengthZero) {
+        const RouteConfig* config = conn.request_config;
+        const bool owner_exact =
+            explicit_generation != 0 &&
+            explicit_generation == conn.response_read_deadline_generation &&
+            explicit_bundle_id != 0 && config != nullptr &&
+            config->policy_bundle_id_is_valid(explicit_bundle_id) &&
+            config->response_policy_id_is_valid(conn.response_policy_id) &&
+            config->failure_policy_id_is_valid(conn.failure_policy_id) &&
+            config->timeout_failure_policy_id_is_valid(conn.timeout_failure_policy_id) &&
+            config->policy_bundles[explicit_bundle_id - 1].response_policy_id ==
+                conn.response_policy_id &&
+            config->policy_bundles[explicit_bundle_id - 1].failure_policy_id ==
+                conn.failure_policy_id &&
+            config->policy_bundles[explicit_bundle_id - 1].timeout_failure_policy_id ==
+                conn.timeout_failure_policy_id &&
+            response_read_timeout_seconds_valid(
+                config->policy_bundles[explicit_bundle_id - 1].response_read_timeout_seconds) &&
+            config->response_policies[conn.response_policy_id - 1].head_mode ==
+                ResponsePolicyHeadMode::Reject &&
+            config->failure_policies[conn.failure_policy_id - 1].head_mode ==
+                FailurePolicyHeadMode::Reject &&
+            config->failure_policies[conn.timeout_failure_policy_id - 1].head_mode ==
+                FailurePolicyHeadMode::Reject;
+        const bool strict_cl0 =
+            owner_exact && resp.version == HttpVersion::Http11 && resp.status_code == 200 &&
+            resp.content_length_count == 1 && resp.has_content_length && resp.content_length == 0 &&
+            !resp.chunked && !resp.headers_truncated &&
+            resp_parser.header_end == conn.upstream_recv_buf.len() &&
+            conn.req_method == static_cast<u8>(LogHttpMethod::Get) &&
+            conn.req_http_version == static_cast<u8>(HttpVersion::Http11) &&
+            conn.req_body_mode == BodyMode::None && conn.req_body_remaining == 0 &&
+            !conn.req_body_streamed && !conn.response_policy_suppress_body &&
+            !conn.failure_policy_suppress_body && conn.resp_header_mutation_count == 0 &&
+            conn.resp_header_mutation_pending_count == 0 &&
+            !conn.resp_header_mutation_pending_overflow && !conn.resp_header_mutation_overflow &&
+            !conn.target_transform_recorded && !conn.req_path_overridden &&
+            conn.req_header_override_count == 0 && !conn.req_header_override_overflow &&
+            strict_response_upload_ready(conn);
+        if (!strict_cl0) {
+            disarm_explicit_deadline();
+            loop->close_conn(conn);
+            return;
+        }
+
+        // The origin frame is fully proven before any downstream response
+        // status/header/persistence byte is materialized.
+        conn.resp_status = 200;
+        if (!build_strict_response_headers(conn, *config, resp)) {
+            disarm_explicit_deadline();
+            loop->close_conn(conn);
+            return;
+        }
+        HttpResponseParser output_parser;
+        ParsedResponse output_response;
+        output_parser.reset();
+        output_response.reset();
+        const u32 output_len = conn.response_header_buf.len();
+        if (output_parser.parse(conn.response_header_buf.data(), output_len, &output_response) !=
+                ParseStatus::Complete ||
+            output_response.version != HttpVersion::Http11 || output_response.status_code != 200 ||
+            output_response.content_length_count != 1 || output_response.content_length != 0 ||
+            output_response.chunked || output_parser.header_end != output_len) {
+            disarm_explicit_deadline();
+            loop->close_conn(conn);
+            return;
+        }
+
+        conn.http1_prebuilt_response_layout = Http1PrebuiltResponseLayout::FullContentLengthGet;
+        conn.http1_prebuilt_response_purpose = Http1PrebuiltResponsePurpose::StrictGetCl0Success;
+        conn.http1_prebuilt_deadline_profile = explicit_profile;
+        conn.http1_prebuilt_deadline_generation = explicit_generation;
+        conn.http1_prebuilt_deadline_bundle_id = explicit_bundle_id;
+        conn.http1_prebuilt_deadline_config = config;
+        conn.http1_prebuilt_header_end = output_parser.header_end;
+        conn.http1_prebuilt_total_len = output_len;
+        conn.http1_prebuilt_body_len = 0;
+        conn.http1_prebuilt_status = 200;
+        conn.resp_body_mode = BodyMode::None;
+        conn.resp_body_remaining = 0;
+        conn.resp_body_sent = 0;
+        conn.upstream_send_len = 0;
+        disarm_explicit_deadline();
+        const u8 selected_targets = conn.upstream_recv_armed ? kUpstreamOpRecv : static_cast<u8>(0);
+        if constexpr (requires(Loop* candidate, Connection& c) {
+                          candidate->begin_prebuilt_http1_response(
+                              c, u8{}, Http1RequestBufferDisposition::ExistingPipeline, u32{});
+                      }) {
+            if (!loop->begin_prebuilt_http1_response(
+                    conn,
+                    selected_targets,
+                    Http1RequestBufferDisposition::ExistingPipeline,
+                    conn.retry_req_send_len)) {
+                if (conn.fd >= 0) loop->close_conn(conn);
+                return;
+            }
+        } else {
+            loop->close_conn(conn);
+            return;
+        }
+        conn.upstream_recv_buf.reset();
         return;
     }
     if (explicit_first_batch || explicit_progress_batch) disarm_explicit_deadline();

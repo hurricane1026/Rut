@@ -4,6 +4,7 @@
 #include "rut/runtime/callbacks.h"
 #include "rut/runtime/connection.h"
 #include "rut/runtime/error.h"
+#include "rut/runtime/response_read_deadline.h"
 
 #include <errno.h>
 #include <linux/io_uring.h>
@@ -32,6 +33,9 @@ static bool response_deadline_copy_owner(const Connection& conn, u32 upstream_ep
            conn.response_read_deadline_state == ResponseReadDeadlineState::Armed &&
            conn.response_read_deadline_owner_generation != 0 &&
            conn.response_read_deadline_owner_generation == conn.response_read_deadline_generation &&
+           response_read_deadline_owner_is_stable(conn,
+                                                  &on_upstream_response<IoUringEventLoop>,
+                                                  ResponseReadDeadlineOwnerPhase::ArmedForCopy) &&
            conn.response_read_deadline_upstream_episode == upstream_episode &&
            conn.upstream_episode == upstream_episode && valid_upstream_episode(upstream_episode) &&
            conn.upstream_recv_armed &&
@@ -872,6 +876,8 @@ u32 IoUringBackend::wait(IoEvent* events, u32 max_events, Connection* conns, u32
                                                      : IoEventCopyWitness::Invalid;
                     events[count].copy_deadline_generation =
                         conns[conn_id].response_read_deadline_generation;
+                    events[count].copy_deadline_profile =
+                        static_cast<u8>(conns[conn_id].response_read_deadline_profile);
                     if (events[count].copy_witness == IoEventCopyWitness::Full) {
                         events[count].copy_begin = copy_begin;
                         events[count].copy_end = target_buf.len();
@@ -881,6 +887,8 @@ u32 IoUringBackend::wait(IoEvent* events, u32 max_events, Connection* conns, u32
                 events[count].copy_witness = IoEventCopyWitness::Invalid;
                 events[count].copy_deadline_generation =
                     conns[conn_id].response_read_deadline_generation;
+                events[count].copy_deadline_profile =
+                    static_cast<u8>(conns[conn_id].response_read_deadline_profile);
                 if (!stale_upstream) buf_result = -ENOBUFS;
             } else if (cqe->res > 0 && !valid_buffer_id) {
                 buf_result = -ENOBUFS;
@@ -889,6 +897,8 @@ u32 IoUringBackend::wait(IoEvent* events, u32 max_events, Connection* conns, u32
                 events[count].copy_witness = IoEventCopyWitness::Invalid;
                 events[count].copy_deadline_generation =
                     conns[conn_id].response_read_deadline_generation;
+                events[count].copy_deadline_profile =
+                    static_cast<u8>(conns[conn_id].response_read_deadline_profile);
             }
 
             // Always return the buffer, even on error
@@ -1014,6 +1024,8 @@ u32 IoUringBackend::wait(IoEvent* events, u32 max_events, Connection* conns, u32
             events[count].copy_witness = IoEventCopyWitness::Invalid;
             events[count].copy_deadline_generation =
                 conns[conn_id].response_read_deadline_generation;
+            events[count].copy_deadline_profile =
+                static_cast<u8>(conns[conn_id].response_read_deadline_profile);
             if (cqe->res > 0 && upstream_episode == conns[conn_id].upstream_episode)
                 events[count].result = -ENOBUFS;
         }

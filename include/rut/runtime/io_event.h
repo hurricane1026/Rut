@@ -152,6 +152,7 @@ struct IoEvent {
     u32 upstream_episode = 0;  // neutral for non-upstream/legacy backend events
     IoEventCopyWitness copy_witness = IoEventCopyWitness::None;
     u32 copy_deadline_generation = 0;
+    u8 copy_deadline_profile = 0;
     u32 copy_begin = 0;
     u32 copy_end = 0;
 };

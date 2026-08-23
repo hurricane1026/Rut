@@ -15,6 +15,7 @@
 #include "rut/runtime/jit_dispatch.h"
 #include "rut/runtime/metrics.h"
 #include "rut/runtime/rate_limit.h"
+#include "rut/runtime/response_read_deadline.h"
 #include "rut/runtime/shard_control.h"
 #include "rut/runtime/slab_pool.h"
 #include "rut/runtime/slice_pool.h"
@@ -125,6 +126,7 @@ public:
         u32 conn_id = 0;
         u32 deadline_generation = 0;
         u32 upstream_episode = 0;
+        ResponseReadDeadlineProfile profile = ResponseReadDeadlineProfile::None;
         u32 last_relevant = 0;
         u32 first_copy_begin = 0;
         u32 expected_copy_end = 0;
@@ -461,6 +463,105 @@ private:
         return status == c.resp_status;
     }
 
+    static bool prebuilt_http1_response_is_complete(const Connection& c) {
+        if (c.http1_prebuilt_response_layout == Http1PrebuiltResponseLayout::None)
+            return prebuilt_http1_header_is_complete(c);
+        if (c.http1_prebuilt_deadline_profile == ResponseReadDeadlineProfile::None ||
+            c.http1_prebuilt_deadline_generation == 0 ||
+            c.http1_prebuilt_deadline_generation != c.response_read_deadline_generation ||
+            c.http1_prebuilt_deadline_bundle_id == 0 ||
+            c.http1_prebuilt_deadline_config == nullptr ||
+            c.http1_prebuilt_deadline_config != c.request_config ||
+            !c.request_config->policy_bundle_id_is_valid(c.http1_prebuilt_deadline_bundle_id) ||
+            c.response_header_buf.data() == nullptr || c.http1_prebuilt_total_len == 0 ||
+            c.http1_prebuilt_total_len != c.response_header_buf.len() ||
+            c.http1_prebuilt_header_end > c.http1_prebuilt_total_len ||
+            c.http1_prebuilt_body_len != c.http1_prebuilt_total_len - c.http1_prebuilt_header_end ||
+            c.http1_prebuilt_status != c.resp_status)
+            return false;
+        const auto& bundle =
+            c.request_config->policy_bundles[c.http1_prebuilt_deadline_bundle_id - 1];
+        if (!response_read_timeout_seconds_valid(bundle.response_read_timeout_seconds) ||
+            bundle.response_policy_id != c.response_policy_id ||
+            bundle.failure_policy_id != c.failure_policy_id ||
+            bundle.timeout_failure_policy_id != c.timeout_failure_policy_id ||
+            !c.request_config->response_policy_id_is_valid(c.response_policy_id) ||
+            !c.request_config->failure_policy_id_is_valid(c.failure_policy_id) ||
+            !c.request_config->timeout_failure_policy_id_is_valid(c.timeout_failure_policy_id))
+            return false;
+        const auto& response = c.request_config->response_policies[c.response_policy_id - 1];
+        const auto& failure = c.request_config->failure_policies[c.failure_policy_id - 1];
+        const auto& timeout = c.request_config->failure_policies[c.timeout_failure_policy_id - 1];
+        if (c.http1_prebuilt_response_layout == Http1PrebuiltResponseLayout::HeaderOnlyHead)
+            return c.http1_prebuilt_deadline_profile ==
+                       ResponseReadDeadlineProfile::HeaderOnlyHead &&
+                   c.http1_prebuilt_response_purpose ==
+                       Http1PrebuiltResponsePurpose::ResponseReadTimeout &&
+                   c.req_method == static_cast<u8>(LogHttpMethod::Head) &&
+                   response.head_mode == ResponsePolicyHeadMode::SuppressBody &&
+                   failure.head_mode == FailurePolicyHeadMode::SuppressBody &&
+                   timeout.head_mode == FailurePolicyHeadMode::SuppressBody &&
+                   c.http1_prebuilt_body_len == 0 &&
+                   c.http1_prebuilt_header_end == c.http1_prebuilt_total_len &&
+                   prebuilt_http1_header_is_complete(c);
+        if (c.http1_prebuilt_response_layout != Http1PrebuiltResponseLayout::FullContentLengthGet ||
+            c.http1_prebuilt_deadline_profile !=
+                ResponseReadDeadlineProfile::BodylessGetContentLengthZero)
+            return false;
+        if (c.req_method != static_cast<u8>(LogHttpMethod::Get) ||
+            response.head_mode != ResponsePolicyHeadMode::Reject ||
+            failure.head_mode != FailurePolicyHeadMode::Reject ||
+            timeout.head_mode != FailurePolicyHeadMode::Reject)
+            return false;
+        HttpResponseParser parser;
+        ParsedResponse parsed;
+        parser.reset();
+        parsed.reset();
+        if (parser.parse(c.response_header_buf.data(), c.response_header_buf.len(), &parsed) !=
+                ParseStatus::Complete ||
+            parsed.version != HttpVersion::Http11 ||
+            parsed.status_code != c.http1_prebuilt_status || parsed.content_length_count != 1 ||
+            parsed.chunked || parsed.headers_truncated ||
+            parser.header_end != c.http1_prebuilt_header_end ||
+            parsed.content_length != c.http1_prebuilt_body_len)
+            return false;
+        auto exact_header = [&](const char* name, u32 name_len, Str expected) {
+            u32 count = 0;
+            for (u32 i = 0; i < parsed.header_count; ++i) {
+                if (!http_header_name_eq_ci(
+                        parsed.headers[i].name.ptr, parsed.headers[i].name.len, name, name_len))
+                    continue;
+                ++count;
+                if (parsed.headers[i].value.len != expected.len ||
+                    (expected.len != 0 &&
+                     __builtin_memcmp(parsed.headers[i].value.ptr, expected.ptr, expected.len) !=
+                         0))
+                    return false;
+            }
+            return count == 1;
+        };
+        static constexpr Str kKeepAlive{"keep-alive", 10};
+        if (c.http1_prebuilt_response_purpose ==
+            Http1PrebuiltResponsePurpose::StrictGetCl0Success) {
+            return parsed.status_code == 200 && c.http1_prebuilt_body_len == 0 &&
+                   response.head_mode == ResponsePolicyHeadMode::Reject &&
+                   exact_header("server", 6, response.server) &&
+                   exact_header("connection", 10, kKeepAlive);
+        }
+        if (c.http1_prebuilt_response_purpose != Http1PrebuiltResponsePurpose::ResponseReadTimeout)
+            return false;
+        const u8* body = c.response_header_buf.data() + c.http1_prebuilt_header_end;
+        return parsed.status_code == timeout.status_code &&
+               parsed.reason.len == timeout.reason.len &&
+               __builtin_memcmp(parsed.reason.ptr, timeout.reason.ptr, timeout.reason.len) == 0 &&
+               c.http1_prebuilt_body_len == timeout.body.len &&
+               (timeout.body.len == 0 ||
+                __builtin_memcmp(body, timeout.body.ptr, timeout.body.len) == 0) &&
+               exact_header("server", 6, timeout.server) &&
+               exact_header("content-type", 12, timeout.content_type) &&
+               exact_header("connection", 10, kKeepAlive);
+    }
+
     bool prebuilt_http1_layout_is_valid(const Connection& c,
                                         u8 selected_targets,
                                         Http1RequestBufferDisposition disposition,
@@ -710,7 +811,7 @@ public:
             (selected_targets & static_cast<u8>(~kAllowed)) != 0 ||
             ((selected_targets & kUpstreamOpConnect) != 0 &&
              (selected_targets & kUpstreamOpSend) != 0) ||
-            !prebuilt_http1_header_is_complete(c) ||
+            !prebuilt_http1_response_is_complete(c) ||
             !prebuilt_http1_layout_is_valid(c, selected_targets, disposition, request_prefix_len))
             return false;
 
@@ -767,6 +868,7 @@ public:
         if (c.id >= kMaxConns || ev.conn_id != c.id || ev.type != IoEventType::Send || ev.more ||
             ev.aux != 0 || ev.result <= 0 ||
             static_cast<u32>(ev.result) != c.response_header_buf.len() ||
+            !prebuilt_http1_response_is_complete(c) ||
             c.http1_prebuilt_disposition == Http1RequestBufferDisposition::None ||
             (c.http1_prebuilt_wait & kHttp1WaitHeaderSend) == 0 || c.state != ConnState::Sending ||
             c.send_armed || c.req_start_us == 0 || c.epoch_held ||
@@ -1017,6 +1119,7 @@ public:
                 c.http1_prebuilt_wait = 0;
                 c.http1_prebuilt_disposition = Http1RequestBufferDisposition::None;
                 c.http1_prebuilt_request_prefix_len = 0;
+                c.clear_http1_prebuilt_response_proof();
                 epoch_leave();
                 c.epoch_held = false;
                 continue_http1_request_boundary<IoUringEventLoop>(this, c);
@@ -1510,12 +1613,21 @@ public:
         return false;
     }
 
+    bool response_read_deadline_profile_is_stable(const Connection& c,
+                                                  const RouteConfig& cfg,
+                                                  u16 bundle_id) const {
+        return c.request_config == &cfg && c.response_read_deadline_bundle_id == bundle_id &&
+               response_read_deadline_owner_is_stable(
+                   c, &on_upstream_response<Self>, ResponseReadDeadlineOwnerPhase::ActiveAfterCopy);
+    }
+
     [[nodiscard]] bool arm_first_response_read_deadline(Connection& c) {
         const RouteConfig* cfg = c.request_config;
         const u16 bundle_id = c.response_read_deadline_bundle_id;
         if (c.response_read_deadline_state != ResponseReadDeadlineState::Validated ||
             c.response_read_deadline_owner_generation == 0 ||
             c.response_read_deadline_owner_generation != c.response_read_deadline_generation ||
+            c.response_read_deadline_profile == ResponseReadDeadlineProfile::None ||
             c.response_read_deadline_progress_generation != 0 ||
             c.response_read_deadline_progress_episode != 0 ||
             c.response_read_deadline_progress_bytes != 0 || cfg == nullptr ||
@@ -1526,7 +1638,9 @@ public:
             bundle.response_read_timeout_seconds != c.response_read_deadline_seconds ||
             bundle.response_policy_id != c.response_policy_id ||
             bundle.failure_policy_id != c.failure_policy_id ||
-            bundle.timeout_failure_policy_id != c.timeout_failure_policy_id)
+            bundle.timeout_failure_policy_id != c.timeout_failure_policy_id ||
+            !response_read_deadline_owner_is_stable(
+                c, &on_upstream_response<Self>, ResponseReadDeadlineOwnerPhase::ValidatedBeforeArm))
             return false;
         if (c.upstream_idx >= cfg->upstream_count ||
             cfg->upstreams[c.upstream_idx].addr_count != 1 ||
@@ -1564,7 +1678,7 @@ public:
 
     void disarm_response_read_deadline(Connection& c) {
         if (c.response_read_deadline_state == ResponseReadDeadlineState::None) {
-            c.response_read_deadline_first_batch = false;
+            c.clear_response_read_deadline();
             return;
         }
         const bool owns_timer =
@@ -1572,7 +1686,6 @@ public:
             c.response_read_deadline_state == ResponseReadDeadlineState::ExpiryPending;
         if (owns_timer) timer.remove(&c);
         c.clear_response_read_deadline();
-        c.response_read_deadline_first_batch = false;
     }
 
     bool response_read_deadline_identity_is_stable(const Connection& c) const {
@@ -1582,6 +1695,7 @@ public:
             c.state != ConnState::Proxying || c.protocol != ConnProtocol::Http11 || c.tls_active ||
             c.h2 != nullptr || c.response_read_deadline_owner_generation == 0 ||
             c.response_read_deadline_owner_generation != c.response_read_deadline_generation ||
+            c.response_read_deadline_profile == ResponseReadDeadlineProfile::None ||
             c.response_read_deadline_upstream_episode != c.upstream_episode ||
             !valid_upstream_episode(c.upstream_episode) || c.upstream_episode_quarantined ||
             cfg == nullptr || !cfg->policy_bundle_id_is_valid(bundle_id))
@@ -1603,21 +1717,14 @@ public:
             c.response_read_deadline_progress_generation == c.response_read_deadline_generation &&
             c.response_read_deadline_progress_episode == c.upstream_episode &&
             c.response_read_deadline_progress_bytes != 0;
-        return (no_progress || exact_progress) && c.upstream_attempts == 1 && !c.upstream_reused &&
-               c.request_upload_complete && !c.upstream_request_incomplete &&
-               c.on_upstream_recv == &on_upstream_response<Self> &&
-               c.req_method == static_cast<u8>(LogHttpMethod::Head) &&
-               c.req_http_version == static_cast<u8>(HttpVersion::Http11) && c.req_keep_alive &&
-               c.req_body_mode == BodyMode::None && c.req_body_remaining == 0 &&
-               !c.request_body_fully_buffered && !c.req_client_has_content_length &&
-               !c.req_client_has_transfer_encoding && !c.req_client_has_te &&
-               !c.req_client_has_expect && !c.req_client_has_upgrade_header &&
-               c.req_client_connection_count == 0 && !c.req_wants_upgrade &&
-               c.pipeline_depth == 0 && c.response_policy_suppress_body &&
-               c.failure_policy_suppress_body && !c.target_transform_recorded &&
-               !c.req_path_overridden && c.req_header_override_count == 0 &&
-               !c.req_header_override_overflow && c.resp_header_mutation_count == 0 &&
-               c.resp_header_mutation_pending_count == 0 &&
+        return (no_progress || exact_progress) &&
+               response_read_deadline_profile_is_stable(c, *cfg, bundle_id) &&
+               c.upstream_attempts == 1 && !c.upstream_reused && c.request_upload_complete &&
+               !c.upstream_request_incomplete &&
+               c.on_upstream_recv == &on_upstream_response<Self> && c.pipeline_depth == 0 &&
+               !c.target_transform_recorded && !c.req_path_overridden &&
+               c.req_header_override_count == 0 && !c.req_header_override_overflow &&
+               c.resp_header_mutation_count == 0 && c.resp_header_mutation_pending_count == 0 &&
                !c.resp_header_mutation_pending_overflow && !c.resp_header_mutation_overflow &&
                !c.upstream_recv_paused_for_send && !c.upstream_recv_pause_cancel_pending &&
                !c.upstream_recv_pause_rearm_pending && !c.upstream_recv_cancel_inflight &&
@@ -1644,6 +1751,7 @@ public:
         owner.conn_id = cid;
         owner.deadline_generation = c.response_read_deadline_generation;
         owner.upstream_episode = c.upstream_episode;
+        owner.profile = c.response_read_deadline_profile;
         owner.valid = response_read_deadline_identity_is_stable(c) && c.upstream_recv_armed;
         return static_cast<u16>(++response_read_batch_owner_count);
     }
@@ -1700,6 +1808,7 @@ public:
             if (ev.result > 0) {
                 if (ev.copy_witness != IoEventCopyWitness::Full ||
                     ev.copy_deadline_generation != owner.deadline_generation ||
+                    ev.copy_deadline_profile != static_cast<u8>(owner.profile) ||
                     ev.copy_end < ev.copy_begin ||
                     ev.copy_end - ev.copy_begin != static_cast<u32>(ev.result)) {
                     owner.valid = false;
@@ -1759,6 +1868,7 @@ public:
                 c.id == owner.conn_id &&
                 c.response_read_deadline_generation == owner.deadline_generation &&
                 c.upstream_episode == owner.upstream_episode &&
+                c.response_read_deadline_profile == owner.profile &&
                 (c.response_read_deadline_state == ResponseReadDeadlineState::Armed ||
                  c.response_read_deadline_state == ResponseReadDeadlineState::ExpiryPending);
             if (!owner.valid || !key_stable) {
@@ -1800,7 +1910,8 @@ public:
             const bool key_stable =
                 c.id == owner.conn_id &&
                 c.response_read_deadline_generation == owner.deadline_generation &&
-                c.upstream_episode == owner.upstream_episode;
+                c.upstream_episode == owner.upstream_episode &&
+                c.response_read_deadline_profile == owner.profile;
             if (key_stable &&
                 c.response_read_deadline_state == ResponseReadDeadlineState::RefreshPending &&
                 c.upstream_recv_armed && response_read_deadline_identity_is_stable(c)) {
@@ -2589,8 +2700,15 @@ public:
                             this->close_conn(conn);
                             break;
                         }
+                        const ResponseReadDeadlineProfile first_profile =
+                            conn.response_read_deadline_profile;
+                        const u32 first_generation = conn.response_read_deadline_generation;
+                        const u16 first_bundle = conn.response_read_deadline_bundle_id;
                         disarm_response_read_deadline(conn);
                         conn.response_read_deadline_first_batch = true;
+                        conn.response_read_deadline_first_batch_profile = first_profile;
+                        conn.response_read_deadline_first_batch_generation = first_generation;
+                        conn.response_read_deadline_first_batch_bundle_id = first_bundle;
                     }
                     const bool has_recv_slot =
                         conn.on_recv && (!conn.uses_iouring_tls() || conn.tls_pending_on_recv);
