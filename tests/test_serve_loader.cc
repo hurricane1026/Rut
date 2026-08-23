@@ -13,6 +13,7 @@
 #endif
 #include <filesystem>
 #include <fstream>
+#include <memory>
 #include <string>
 
 using namespace rut;
@@ -517,7 +518,7 @@ TEST(serve_loader, format_read_stage_without_diag) {
     CHECK(contains(msg, "failed"));
 }
 
-TEST(serve_loader, unmatched_source_fails_at_register_before_serving) {
+TEST(serve_loader, unmatched_source_loads_into_owned_runtime_table) {
     const std::string path = write_file(
         "/tmp/rut_serve_loader_unmatched_guard",
         "app.rut",
@@ -528,16 +529,19 @@ TEST(serve_loader, unmatched_source_fails_at_register_before_serving) {
 
     LoadedProgram program;
     LoadError err;
-    CHECK_FALSE(load_rut_program(path.c_str(), program, err));
-    CHECK(err.stage == LoadStage::Register);
+    REQUIRE(load_rut_program(path.c_str(), program, err));
     CHECK_EQ(program.rir.module.strict_local_response_policy_count, 1u);
     CHECK_EQ(program.rir.module.unmatched_policy_ids[kRouteMethodOptions], 1u);
-    CHECK_EQ(program.config.route_count, 0u);
+    CHECK_EQ(program.config.route_count, 1u);
     CHECK_EQ(program.config.upstream_count, 0u);
+    CHECK_EQ(program.config.strict_local_response_policy_count, 1u);
+    CHECK_EQ(program.config.unmatched_policy_ids[kRouteMethodOptions], 1u);
+    CHECK(program.config.unmatched_policy_table_is_valid());
+    CHECK(program.config.strict_local_response_policy_id_is_owned(1));
     program.destroy();
 }
 
-TEST(serve_loader, unmatched_population_guard_rejects_valid_and_forged_tables_before_mutation) {
+TEST(serve_loader, unmatched_population_owns_valid_table_and_rejects_forgery_before_mutation) {
     static constexpr char kReason[] = "Bad Request";
     static constexpr char kType[] = "text/plain";
     static constexpr char kServer[] = "rut";
@@ -562,25 +566,75 @@ TEST(serve_loader, unmatched_population_guard_rejects_valid_and_forged_tables_be
     mod.upstreams[0].port = 9000;
     REQUIRE(rir::verify_module(mod).ok);
 
-    RouteConfig valid_cfg{};
-    CHECK_FALSE(populate_route_config(valid_cfg, mod));
-    CHECK_EQ(valid_cfg.route_count, 0u);
-    CHECK_EQ(valid_cfg.upstream_count, 0u);
-    CHECK_EQ(valid_cfg.response_body_count, 0u);
+    auto valid_cfg = std::make_unique<RouteConfig>();
+    REQUIRE(populate_route_config(*valid_cfg, mod));
+    CHECK_EQ(valid_cfg->route_count, 0u);
+    CHECK_EQ(valid_cfg->upstream_count, 1u);
+    CHECK_EQ(valid_cfg->response_body_count, 0u);
+    CHECK(valid_cfg->unmatched_policy_table_is_valid());
+    CHECK(valid_cfg->strict_local_response_policies[0].reason.ptr != kReason);
+    CHECK(valid_cfg->strict_local_response_policies[0].body.ptr != kBody);
+    CHECK(valid_cfg->strict_local_response_policies[0].reason.eq(policy.reason));
+    CHECK(valid_cfg->strict_local_response_policies[0].body.eq(policy.body));
+    const StrictLocalResponsePolicySpec valid_policy = policy;
 
     mod.strict_local_response_policy_count = 0;
-    RouteConfig forged_cfg{};
-    CHECK_FALSE(populate_route_config(forged_cfg, mod));
-    CHECK_EQ(forged_cfg.route_count, 0u);
-    CHECK_EQ(forged_cfg.upstream_count, 0u);
-    CHECK_EQ(forged_cfg.response_body_count, 0u);
+    auto forged_cfg = std::make_unique<RouteConfig>();
+    CHECK_FALSE(populate_route_config(*forged_cfg, mod));
+    CHECK_EQ(forged_cfg->route_count, 0u);
+    CHECK_EQ(forged_cfg->upstream_count, 0u);
+    CHECK_EQ(forged_cfg->response_body_count, 0u);
+    CHECK_FALSE(forged_cfg->has_unmatched_metadata());
 
+    mod.strict_local_response_policy_count = 1;
+    mod.strict_local_response_policies[0].reason = {nullptr, 1};
+    auto null_pointer_cfg = std::make_unique<RouteConfig>();
+    CHECK_FALSE(populate_route_config(*null_pointer_cfg, mod));
+    CHECK_EQ(null_pointer_cfg->upstream_count, 0u);
+    CHECK_FALSE(null_pointer_cfg->has_unmatched_metadata());
+    mod.strict_local_response_policies[0].reason = valid_policy.reason;
+
+    mod.strict_local_response_policies[0].head_mode = static_cast<StrictLocalResponseHeadMode>(255);
+    auto enum_cfg = std::make_unique<RouteConfig>();
+    CHECK_FALSE(populate_route_config(*enum_cfg, mod));
+    CHECK_EQ(enum_cfg->upstream_count, 0u);
+    CHECK_FALSE(enum_cfg->has_unmatched_metadata());
+    mod.strict_local_response_policies[0].head_mode = StrictLocalResponseHeadMode::Reject;
+
+    mod.strict_local_response_policy_count = kMaxStrictLocalResponsePolicies + 1;
+    auto count_cfg = std::make_unique<RouteConfig>();
+    CHECK_FALSE(populate_route_config(*count_cfg, mod));
+    CHECK_EQ(count_cfg->upstream_count, 0u);
+    CHECK_FALSE(count_cfg->has_unmatched_metadata());
+
+    // Aggregate pool overflow is rejected before the declared upstream can be
+    // appended to the destination.
+    const std::string body1(4096, 'a');
+    const std::string body2(4070, 'b');
+    mod.strict_local_response_policy_count = 2;
+    mod.strict_local_response_policies[0] = valid_policy;
+    mod.strict_local_response_policies[0].body = {body1.data(), static_cast<u32>(body1.size())};
+    auto& second = mod.strict_local_response_policies[1];
+    second = valid_policy;
+    second.status_code = 405;
+    second.reason = {"x", 1};
+    second.content_type = {"x", 1};
+    second.server = {"x", 1};
+    second.body = {body2.data(), static_cast<u32>(body2.size())};
+    mod.unmatched_policy_ids[kRouteMethodConnect] = 2;
+    auto capacity_cfg = std::make_unique<RouteConfig>();
+    CHECK_FALSE(populate_route_config(*capacity_cfg, mod));
+    CHECK_EQ(capacity_cfg->upstream_count, 0u);
+    CHECK_FALSE(capacity_cfg->has_unmatched_metadata());
+
+    mod.strict_local_response_policy_count = 0;
     mod.unmatched_policy_ids[kRouteMethodOptions] = 0;
+    mod.unmatched_policy_ids[kRouteMethodConnect] = 0;
     mod.upstream_count = 0;
-    RouteConfig omitted_cfg{};
-    CHECK(populate_route_config(omitted_cfg, mod));
-    CHECK_EQ(omitted_cfg.route_count, 0u);
-    CHECK_EQ(omitted_cfg.upstream_count, 0u);
+    auto omitted_cfg = std::make_unique<RouteConfig>();
+    CHECK(populate_route_config(*omitted_cfg, mod));
+    CHECK_EQ(omitted_cfg->route_count, 0u);
+    CHECK_EQ(omitted_cfg->upstream_count, 0u);
 }
 
 int main(int argc, char** argv) {

@@ -6,6 +6,7 @@
 #include "rut/common/http_header_validation.h"
 #include "rut/common/redirect_policy.h"
 #include "rut/common/response_policy.h"
+#include "rut/common/strict_local_response.h"
 #include "rut/common/types.h"
 #include "rut/jit/art_jit_codegen.h"  // ArtJitMatchFn typedef (LLVM-free)
 #include "rut/jit/handler_abi.h"
@@ -157,6 +158,9 @@ struct RouteConfig {
     static constexpr u32 kFailurePolicyBytesPoolBytes = 8 * 1024;
     static constexpr u32 kMaxRedirectPolicies = rut::kMaxRedirectPolicies;
     static constexpr u32 kRedirectPolicyBytesPoolBytes = rut::kRedirectPolicyBytes;
+    static constexpr u32 kMaxStrictLocalResponsePolicies = rut::kMaxStrictLocalResponsePolicies;
+    static constexpr u32 kStrictLocalResponseBytesPoolBytes =
+        rut::kMaxStrictLocalResponsePolicyBytes;
     // Per-response cap for header count. Bigger than what the AST
     // permits (16) so hand-built RouteConfigs — tests, future
     // compile→config helper — have headroom, but small enough that the
@@ -505,6 +509,243 @@ struct RouteConfig {
     u32 redirect_policy_count = 0;
     char redirect_policy_bytes[kRedirectPolicyBytesPoolBytes];
     u32 redirect_policy_bytes_used = 0;
+    StrictLocalResponsePolicySpec strict_local_response_policies[kMaxStrictLocalResponsePolicies]{};
+    u32 strict_local_response_policy_count = 0;
+    u16 unmatched_policy_ids[kStrictLocalResponseMethodSlots]{};
+    char strict_local_response_bytes[kStrictLocalResponseBytesPoolBytes];
+    u32 strict_local_response_bytes_used = 0;
+
+    // Any nonzero strict-local-response field is activation metadata.  This
+    // deliberately treats partial/forged public state as present so a route
+    // miss can fail closed instead of silently falling back to the legacy 200.
+    bool has_unmatched_metadata() const {
+        if (strict_local_response_policy_count != 0 || strict_local_response_bytes_used != 0)
+            return true;
+        for (u32 i = 0; i < kStrictLocalResponseMethodSlots; i++)
+            if (unmatched_policy_ids[i] != 0) return true;
+        return false;
+    }
+
+    bool strict_local_response_bytes_owned(Str value) const {
+        const uintptr_t begin = reinterpret_cast<uintptr_t>(strict_local_response_bytes);
+        const uintptr_t ptr = reinterpret_cast<uintptr_t>(value.ptr);
+        if (value.len == 0)
+            return value.ptr != nullptr && ptr >= begin &&
+                   ptr - begin <= strict_local_response_bytes_used;
+        if (value.ptr == nullptr || value.len > strict_local_response_bytes_used) return false;
+        if (ptr < begin || ptr - begin >= strict_local_response_bytes_used) return false;
+        return value.len <= strict_local_response_bytes_used - static_cast<u32>(ptr - begin);
+    }
+
+    // Complete runtime validation.  Validate counts/mappings before indexing,
+    // then require every byte view to live inside this RouteConfig's pool.
+    bool unmatched_policy_table_is_valid() const {
+        if (strict_local_response_policy_count > kMaxStrictLocalResponsePolicies ||
+            strict_local_response_bytes_used > kStrictLocalResponseBytesPoolBytes)
+            return false;
+        bool referenced[kMaxStrictLocalResponsePolicies]{};
+        for (u32 i = 0; i < strict_local_response_policy_count; i++) {
+            const auto& policy = strict_local_response_policies[i];
+            if (!strict_local_response_bytes_owned(policy.reason) ||
+                !strict_local_response_bytes_owned(policy.content_type) ||
+                !strict_local_response_bytes_owned(policy.server) ||
+                !strict_local_response_bytes_owned(policy.body))
+                return false;
+            if (!strict_local_response_policy_spec_valid(policy)) return false;
+            for (u32 prior = 0; prior < i; prior++)
+                if (strict_local_response_policy_spec_equal(strict_local_response_policies[prior],
+                                                            policy))
+                    return false;
+        }
+        for (u32 slot = 0; slot < kStrictLocalResponseMethodSlots; slot++) {
+            const u16 id = unmatched_policy_ids[slot];
+            if (id == 0) continue;
+            if (id > strict_local_response_policy_count) return false;
+            referenced[id - 1] = true;
+        }
+        for (u32 i = 0; i < strict_local_response_policy_count; i++)
+            if (!referenced[i]) return false;
+        const u16 any_id = unmatched_policy_ids[kRouteMethodAny];
+        if (any_id != 0 && strict_local_response_policies[any_id - 1].head_mode !=
+                               StrictLocalResponseHeadMode::SuppressBody)
+            return false;
+        const u16 head_id = unmatched_policy_ids[kRouteMethodHead];
+        if (head_id != 0 && strict_local_response_policies[head_id - 1].head_mode !=
+                                StrictLocalResponseHeadMode::SuppressBody)
+            return false;
+        return true;
+    }
+
+    bool strict_local_response_policy_id_is_owned(u16 id) const {
+        if (id == 0 || id > strict_local_response_policy_count ||
+            strict_local_response_policy_count > kMaxStrictLocalResponsePolicies ||
+            strict_local_response_bytes_used > kStrictLocalResponseBytesPoolBytes)
+            return false;
+        const auto& policy = strict_local_response_policies[id - 1];
+        return strict_local_response_bytes_owned(policy.reason) &&
+               strict_local_response_bytes_owned(policy.content_type) &&
+               strict_local_response_bytes_owned(policy.server) &&
+               strict_local_response_bytes_owned(policy.body) &&
+               strict_local_response_policy_spec_valid(policy);
+    }
+
+    // Incremental builder.  Dedup is semantic and stable (first insertion wins).
+    // A policy without a mapping is intentionally incomplete activation metadata
+    // and therefore fails closed on a miss until the table is completed.
+    u16 add_strict_local_response_policy(const StrictLocalResponsePolicySpec& policy) {
+        if (!strict_local_response_policy_spec_valid(policy) ||
+            strict_local_response_policy_count > kMaxStrictLocalResponsePolicies ||
+            strict_local_response_bytes_used > kStrictLocalResponseBytesPoolBytes)
+            return 0;
+        for (u32 i = 0; i < strict_local_response_policy_count; i++) {
+            if (!strict_local_response_policy_id_is_owned(static_cast<u16>(i + 1))) return 0;
+            if (strict_local_response_policy_spec_equal(strict_local_response_policies[i], policy))
+                return static_cast<u16>(i + 1);
+        }
+        if (strict_local_response_policy_count == kMaxStrictLocalResponsePolicies) return 0;
+        u32 total = 0;
+        const Str fields[] = {policy.reason, policy.content_type, policy.server, policy.body};
+        for (Str field : fields) {
+            if (field.len > kStrictLocalResponseBytesPoolBytes - total) return 0;
+            total += field.len;
+        }
+        if (total > kStrictLocalResponseBytesPoolBytes - strict_local_response_bytes_used) return 0;
+        auto copy = [&](Str src, Str& dst) {
+            char* out = strict_local_response_bytes + strict_local_response_bytes_used;
+            if (src.len != 0) __builtin_memcpy(out, src.ptr, src.len);
+            strict_local_response_bytes_used += src.len;
+            dst = {out, src.len};
+        };
+        auto& dst = strict_local_response_policies[strict_local_response_policy_count];
+        dst.version = policy.version;
+        dst.status_code = policy.status_code;
+        dst.date = policy.date;
+        dst.connection = policy.connection;
+        dst.head_mode = policy.head_mode;
+        copy(policy.reason, dst.reason);
+        copy(policy.content_type, dst.content_type);
+        copy(policy.server, dst.server);
+        copy(policy.body, dst.body);
+        return static_cast<u16>(++strict_local_response_policy_count);
+    }
+
+    bool set_unmatched_policy_id(u8 method_key, u16 policy_id) {
+        const u32 slot = route_method_slot_from_key(method_key);
+        if (slot == kRouteMethodSlotInvalid || policy_id == 0 ||
+            !strict_local_response_policy_id_is_owned(policy_id) || unmatched_policy_ids[slot] != 0)
+            return false;
+        if ((slot == kRouteMethodAny || slot == kRouteMethodHead) &&
+            strict_local_response_policies[policy_id - 1].head_mode !=
+                StrictLocalResponseHeadMode::SuppressBody)
+            return false;
+        unmatched_policy_ids[slot] = policy_id;
+        return true;
+    }
+
+    // Copy a complete already-owned table without allocation. Every check and
+    // every possible false return precedes the first destination write; once
+    // commit starts it only copies bounded arrays and rebases proven pool views.
+    bool copy_unmatched_policy_table_from_owned(const RouteConfig& source) {
+        if (strict_local_response_policy_count != 0 || strict_local_response_bytes_used != 0)
+            return false;
+        for (u32 i = 0; i < kStrictLocalResponseMethodSlots; i++)
+            if (unmatched_policy_ids[i] != 0) return false;
+        if (!source.unmatched_policy_table_is_valid()) return false;
+
+        // Convert every source view to a checked integer offset before the
+        // first destination write.  Public/forged views can carry an address
+        // numerically inside the source pool without C++ array provenance, so
+        // native pointer subtraction would itself be undefined even after the
+        // address-range validation above.
+        u32 offsets[kMaxStrictLocalResponsePolicies][4]{};
+        const uintptr_t source_base =
+            reinterpret_cast<uintptr_t>(source.strict_local_response_bytes);
+        auto checked_offset = [&](Str value, u32* out) {
+            if (out == nullptr || !source.strict_local_response_bytes_owned(value)) return false;
+            const uintptr_t address = reinterpret_cast<uintptr_t>(value.ptr);
+            if (address < source_base) return false;
+            const uintptr_t wide_offset = address - source_base;
+            if (wide_offset > source.strict_local_response_bytes_used ||
+                wide_offset > kStrictLocalResponseBytesPoolBytes)
+                return false;
+            const u32 offset = static_cast<u32>(wide_offset);
+            if (value.len > source.strict_local_response_bytes_used - offset ||
+                value.len > kStrictLocalResponseBytesPoolBytes - offset)
+                return false;
+            *out = offset;
+            return true;
+        };
+        for (u32 i = 0; i < source.strict_local_response_policy_count; i++) {
+            const auto& src = source.strict_local_response_policies[i];
+            if (!checked_offset(src.reason, &offsets[i][0]) ||
+                !checked_offset(src.content_type, &offsets[i][1]) ||
+                !checked_offset(src.server, &offsets[i][2]) ||
+                !checked_offset(src.body, &offsets[i][3]))
+                return false;
+        }
+
+        if (source.strict_local_response_bytes_used != 0)
+            __builtin_memcpy(strict_local_response_bytes,
+                             source.strict_local_response_bytes,
+                             source.strict_local_response_bytes_used);
+        for (u32 i = 0; i < source.strict_local_response_policy_count; i++) {
+            const auto& src = source.strict_local_response_policies[i];
+            auto& dst = strict_local_response_policies[i];
+            dst.version = src.version;
+            dst.status_code = src.status_code;
+            dst.date = src.date;
+            dst.connection = src.connection;
+            dst.head_mode = src.head_mode;
+            dst.reason = {strict_local_response_bytes + offsets[i][0], src.reason.len};
+            dst.content_type = {strict_local_response_bytes + offsets[i][1], src.content_type.len};
+            dst.server = {strict_local_response_bytes + offsets[i][2], src.server.len};
+            dst.body = {strict_local_response_bytes + offsets[i][3], src.body.len};
+        }
+        strict_local_response_bytes_used = source.strict_local_response_bytes_used;
+        strict_local_response_policy_count = source.strict_local_response_policy_count;
+        for (u32 i = 0; i < kStrictLocalResponseMethodSlots; i++)
+            unmatched_policy_ids[i] = source.unmatched_policy_ids[i];
+        return true;
+    }
+
+    // Install one complete table transactionally. A fresh RouteConfig probes
+    // deterministic dedup/remap; no destination byte changes until that probe
+    // has accepted the whole input, after which commit is infallible.
+    bool install_unmatched_policy_table(const StrictLocalResponsePolicySpec* policies,
+                                        u32 policy_count,
+                                        const u16* method_policy_ids) {
+        if (strict_local_response_policy_count != 0 || strict_local_response_bytes_used != 0)
+            return false;
+        for (u32 i = 0; i < kStrictLocalResponseMethodSlots; i++)
+            if (unmatched_policy_ids[i] != 0) return false;
+        if (!strict_local_response_policy_table_valid(policies, policy_count, method_policy_ids))
+            return false;
+        auto replay = [&](RouteConfig& target) {
+            u16 remap[kMaxStrictLocalResponsePolicies]{};
+            for (u32 i = 0; i < policy_count; i++) {
+                remap[i] = target.add_strict_local_response_policy(policies[i]);
+                if (remap[i] == 0) return false;
+            }
+            for (u32 slot = 0; slot < kStrictLocalResponseMethodSlots; slot++) {
+                const u16 source_id = method_policy_ids[slot];
+                if (source_id == 0) continue;
+                if (!target.set_unmatched_policy_id(static_cast<u8>(slot), remap[source_id - 1]))
+                    return false;
+            }
+            return target.unmatched_policy_table_is_valid();
+        };
+        RouteConfig* probe = new (std::nothrow) RouteConfig();
+        if (probe == nullptr) return false;
+        const bool staged = replay(*probe);
+        if (!staged) {
+            delete probe;
+            return false;
+        }
+
+        const bool committed = copy_unmatched_policy_table_from_owned(*probe);
+        delete probe;
+        return committed;
+    }
 
     // Populate the active dispatch's state with a newly-written
     // routes[route_count] entry. Returns false on:

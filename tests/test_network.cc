@@ -9386,6 +9386,411 @@ TEST(streaming, proxy_keepalive_two_requests) {
 
 // === Pipeline ===
 
+static StrictLocalResponsePolicySpec make_unmatched_policy(
+    u16 status,
+    const char* reason,
+    const char* body,
+    StrictLocalResponseHeadMode head_mode = StrictLocalResponseHeadMode::Reject) {
+    StrictLocalResponsePolicySpec p{};
+    p.version = StrictLocalResponseVersion::Http11;
+    p.status_code = status;
+    p.date = StrictLocalResponseDate::Current;
+    p.connection = StrictLocalResponseConnection::Request;
+    p.head_mode = head_mode;
+    p.reason = {reason, static_cast<u32>(strlen(reason))};
+    p.content_type = {"text/plain", 10};
+    p.server = {"rut", 3};
+    p.body = {body, static_cast<u32>(strlen(body))};
+    return p;
+}
+
+static u32 unmatched_h2_outer_hit_calls = 0;
+static u64 unmatched_h2_outer_hit_handler(void*, jit::HandlerCtx*, const u8*, u32, void*) {
+    unmatched_h2_outer_hit_calls++;
+    return jit::HandlerResult::make_status(204).pack();
+}
+
+static Connection* dispatch_unmatched_request(SmallLoop& loop,
+                                              RouteConfig& config,
+                                              const char* request) {
+    const RouteConfig* active = &config;
+    loop.config_ptr = &active;
+    Connection* conn = loop.alloc_conn();
+    if (conn == nullptr) return nullptr;
+    const u32 len = static_cast<u32>(strlen(request));
+    if (conn->recv_buf.write(reinterpret_cast<const u8*>(request), len) != len) return nullptr;
+    on_header_received<SmallLoop>(
+        &loop, *conn, make_ev(conn->id, IoEventType::Recv, static_cast<i32>(len)));
+    loop.config_ptr = nullptr;
+    return conn;
+}
+
+TEST(unmatched_local_response, exact_any_precedence_matched_wins_and_no_slot_legacy) {
+    SmallLoop loop;
+    loop.setup();
+    RouteConfig config{};
+    REQUIRE(config.add_static("/hit", kRouteMethodOptions, 204));
+    const auto exact = make_unmatched_policy(400, "Exact", "exact");
+    const auto any =
+        make_unmatched_policy(499, "Any", "any", StrictLocalResponseHeadMode::SuppressBody);
+    REQUIRE_EQ(config.add_strict_local_response_policy(exact), 1u);
+    REQUIRE_EQ(config.add_strict_local_response_policy(any), 2u);
+    REQUIRE(config.set_unmatched_policy_id(kRouteMethodOptions, 1));
+    REQUIRE(config.set_unmatched_policy_id(kRouteMethodAny, 2));
+    REQUIRE(config.unmatched_policy_table_is_valid());
+
+    Connection* matched = dispatch_unmatched_request(
+        loop, config, "OPTIONS /hit HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n");
+    REQUIRE(matched != nullptr);
+    CHECK_EQ(matched->resp_status, 204u);
+
+    Connection* exact_conn = dispatch_unmatched_request(
+        loop, config, "OPTIONS * HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n");
+    REQUIRE(exact_conn != nullptr);
+    CHECK_EQ(exact_conn->resp_status, 400u);
+    CHECK(buf_contains(reinterpret_cast<const char*>(exact_conn->send_buf.data()),
+                       exact_conn->send_buf.len(),
+                       "\r\n\r\nexact",
+                       9));
+
+    Connection* any_conn = dispatch_unmatched_request(
+        loop, config, "GET /miss HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n");
+    REQUIRE(any_conn != nullptr);
+    CHECK_EQ(any_conn->resp_status, 499u);
+    CHECK(buf_contains(reinterpret_cast<const char*>(any_conn->send_buf.data()),
+                       any_conn->send_buf.len(),
+                       "\r\n\r\nany",
+                       7));
+
+    RouteConfig no_slot{};
+    REQUIRE_EQ(no_slot.add_strict_local_response_policy(exact), 1u);
+    REQUIRE(no_slot.set_unmatched_policy_id(kRouteMethodOptions, 1));
+    REQUIRE(no_slot.unmatched_policy_table_is_valid());
+    Connection* legacy = dispatch_unmatched_request(
+        loop, no_slot, "GET /miss HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n");
+    REQUIRE(legacy != nullptr);
+    CHECK_EQ(legacy->resp_status, 200u);
+    CHECK(buf_contains(reinterpret_cast<const char*>(legacy->send_buf.data()),
+                       legacy->send_buf.len(),
+                       "\r\n\r\nOK",
+                       6));
+}
+
+TEST(unmatched_local_response, connect_exact_and_strict_gate_fail_closed_without_effects) {
+    SmallLoop loop;
+    loop.setup();
+    RouteConfig config{};
+    const auto connect = make_unmatched_policy(405, "Not Allowed", "connect");
+    REQUIRE_EQ(config.add_strict_local_response_policy(connect), 1u);
+    REQUIRE(config.set_unmatched_policy_id(kRouteMethodConnect, 1));
+    REQUIRE(config.unmatched_policy_table_is_valid());
+
+    Connection* selected = dispatch_unmatched_request(
+        loop,
+        config,
+        "CONNECT example.test:443 HTTP/1.1\r\nHost: other.test\r\nConnection: close\r\n\r\n");
+    REQUIRE(selected != nullptr);
+    CHECK_EQ(selected->resp_status, 405u);
+    CHECK_EQ(loop.backend.count_ops(MockOp::Connect), 0u);
+
+    auto closes_zero = [&](const char* request, RouteConfig& cfg) {
+        loop.backend.clear_ops();
+        const u32 before = loop.free_top;
+        Connection* stale = dispatch_unmatched_request(loop, cfg, request);
+        REQUIRE(stale != nullptr);
+        CHECK_EQ(loop.free_top, before);
+        CHECK_EQ(loop.backend.count_ops(MockOp::Send), 0u);
+        CHECK_EQ(loop.backend.count_ops(MockOp::Connect), 0u);
+    };
+    closes_zero("CONNECT example.test:443 HTTP/1.1\r\nBroken\r\n\r\n", config);
+    closes_zero("CONNECT example.test:443 HTTP/1.0\r\nHost: x\r\n\r\n", config);
+
+    RouteConfig partial{};
+    partial.unmatched_policy_ids[kRouteMethodConnect] = 1;
+    closes_zero("CONNECT example.test:443 HTTP/1.1\r\nHost: x\r\n\r\n", partial);
+
+    auto oversized_wire = std::make_unique<RouteConfig>();
+    const std::string large_body(kMaxStrictLocalResponseBodyLen, 'x');
+    auto large = make_unmatched_policy(400, "Bad", "x");
+    large.body = {large_body.data(), static_cast<u32>(large_body.size())};
+    REQUIRE_EQ(oversized_wire->add_strict_local_response_policy(large), 1u);
+    REQUIRE(oversized_wire->set_unmatched_policy_id(kRouteMethodOptions, 1));
+    closes_zero("OPTIONS * HTTP/1.1\r\nHost: x\r\n\r\n", *oversized_wire);
+}
+
+TEST(unmatched_local_response, head_suppression_body_framing_and_keepalive_lifecycle) {
+    SmallLoop loop;
+    loop.setup();
+    RouteConfig config{};
+    const auto head = make_unmatched_policy(
+        404, "Missing", "representation", StrictLocalResponseHeadMode::SuppressBody);
+    const auto options = make_unmatched_policy(400, "Bad", "bad");
+    REQUIRE_EQ(config.add_strict_local_response_policy(head), 1u);
+    REQUIRE_EQ(config.add_strict_local_response_policy(options), 2u);
+    REQUIRE(config.set_unmatched_policy_id(kRouteMethodHead, 1));
+    REQUIRE(config.set_unmatched_policy_id(kRouteMethodOptions, 2));
+    REQUIRE(config.unmatched_policy_table_is_valid());
+
+    Connection* head_conn = dispatch_unmatched_request(
+        loop, config, "HEAD /miss HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n");
+    REQUIRE(head_conn != nullptr);
+    CHECK_EQ(head_conn->resp_status, 404u);
+    CHECK(buf_contains(reinterpret_cast<const char*>(head_conn->send_buf.data()),
+                       head_conn->send_buf.len(),
+                       "Content-Length: 14\r\n",
+                       20));
+    CHECK_FALSE(buf_contains(reinterpret_cast<const char*>(head_conn->send_buf.data()),
+                             head_conn->send_buf.len(),
+                             "representation",
+                             14));
+
+    RouteConfig forged_head{};
+    REQUIRE_EQ(forged_head.add_strict_local_response_policy(options), 1u);
+    REQUIRE(forged_head.set_unmatched_policy_id(kRouteMethodOptions, 1));
+    forged_head.unmatched_policy_ids[kRouteMethodOptions] = 0;
+    forged_head.unmatched_policy_ids[kRouteMethodHead] = 1;
+    loop.backend.clear_ops();
+    const u32 before = loop.free_top;
+    (void)dispatch_unmatched_request(loop, forged_head, "HEAD /miss HTTP/1.1\r\nHost: x\r\n\r\n");
+    CHECK_EQ(loop.free_top, before);
+    CHECK_EQ(loop.backend.count_ops(MockOp::Send), 0u);
+
+    Connection* cl = dispatch_unmatched_request(
+        loop, config, "OPTIONS * HTTP/1.1\r\nHost: x\r\nContent-Length: 5\r\n\r\nxy");
+    REQUIRE(cl != nullptr);
+    CHECK_FALSE(cl->keep_alive);
+    CHECK_EQ(cl->on_recv, nullptr);
+    CHECK_EQ(loop.backend.count_ops(MockOp::Recv), 0u);
+    CHECK(buf_contains(reinterpret_cast<const char*>(cl->send_buf.data()),
+                       cl->send_buf.len(),
+                       "Connection: close\r\n",
+                       19));
+
+    loop.backend.clear_ops();
+    Connection* chunked = dispatch_unmatched_request(
+        loop, config, "OPTIONS * HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\n\r\n2\r\nx");
+    REQUIRE(chunked != nullptr);
+    CHECK_FALSE(chunked->keep_alive);
+    CHECK_EQ(chunked->on_recv, nullptr);
+    CHECK_EQ(loop.backend.count_ops(MockOp::Recv), 0u);
+
+    loop.backend.clear_ops();
+    Connection* reusable =
+        dispatch_unmatched_request(loop, config, "OPTIONS * HTTP/1.1\r\nHost: x\r\n\r\n");
+    REQUIRE(reusable != nullptr);
+    CHECK(reusable->keep_alive);
+    const u32 reusable_id = reusable->id;
+    const u32 send_len = reusable->send_buf.len();
+    loop.backend.clear_ops();
+    loop.inject_and_dispatch(make_ev(reusable_id, IoEventType::Send, static_cast<i32>(send_len)));
+    Connection* after = &loop.conns[reusable_id];
+    CHECK_EQ(after->state, ConnState::ReadingHeader);
+    CHECK_EQ(after->on_recv, &on_header_received<SmallLoop>);
+    CHECK_EQ(loop.backend.count_ops(MockOp::Recv), 1u);
+}
+
+TEST(unmatched_local_response, generic_serializer_preserves_failure_policy_wire) {
+    Connection conn{};
+    u8 recv[64]{}, send[1024]{};
+    conn.recv_slice = recv;
+    conn.send_slice = send;
+    conn.recv_buf.bind(recv, sizeof(recv));
+    conn.send_buf.bind(send, sizeof(send));
+    conn.keep_alive = true;
+    conn.req_client_keep_alive = true;
+    conn.req_method = static_cast<u8>(LogHttpMethod::Options);
+    const auto generic = make_unmatched_policy(502, "Bad Gateway", "bad");
+    ForwardFailurePolicySpec failure{};
+    failure.version = ForwardFailurePolicyVersion::Http11;
+    failure.status_code = generic.status_code;
+    failure.date = ForwardFailurePolicyDate::Current;
+    failure.connection = ForwardFailurePolicyConnection::Request;
+    failure.head_mode = FailurePolicyHeadMode::Reject;
+    failure.reason = generic.reason;
+    failure.content_type = generic.content_type;
+    failure.server = generic.server;
+    failure.body = generic.body;
+    u8 generic_wire[1024]{}, failure_wire[1024]{};
+    u32 generic_len = 0, failure_len = 0;
+    REQUIRE(build_strict_local_response(
+        conn, generic, false, generic_wire, sizeof(generic_wire), &generic_len));
+    REQUIRE(build_failure_policy_response_from_spec(
+        conn, failure, false, failure_wire, sizeof(failure_wire), &failure_len));
+    CHECK_EQ(generic_len, failure_len);
+    CHECK_EQ(__builtin_memcmp(generic_wire, failure_wire, generic_len), 0);
+}
+
+TEST(unmatched_local_response, reload_publication_is_consumed_and_inflight_request_stays_pinned) {
+    SmallLoop loop;
+    loop.setup();
+    auto omitted = std::make_unique<RouteConfig>();
+    auto configured = std::make_unique<RouteConfig>();
+    const auto policy = make_unmatched_policy(400, "Bad", "reload");
+    REQUIRE_EQ(configured->add_strict_local_response_policy(policy), 1u);
+    REQUIRE(configured->set_unmatched_policy_id(kRouteMethodOptions, 1));
+    REQUIRE(configured->unmatched_policy_table_is_valid());
+    const RouteConfig* active = omitted.get();
+    ShardControlBlock control{};
+    loop.config_ptr = &active;
+    loop.control = &control;
+
+    control.pending_config.store(configured.get(), std::memory_order_release);
+    loop.poll_command();
+    REQUIRE(active == configured.get());
+    Connection* conn = loop.alloc_conn();
+    REQUIRE(conn != nullptr);
+    static constexpr char kRequest[] = "OPTIONS * HTTP/1.1\r\nHost: x\r\n\r\n";
+    REQUIRE_EQ(conn->recv_buf.write(reinterpret_cast<const u8*>(kRequest), sizeof(kRequest) - 1),
+               sizeof(kRequest) - 1);
+    on_header_received<SmallLoop>(
+        &loop, *conn, make_ev(conn->id, IoEventType::Recv, static_cast<i32>(sizeof(kRequest) - 1)));
+    REQUIRE_EQ(conn->resp_status, 400u);
+    CHECK(conn->request_config == configured.get());
+    CHECK(buf_contains(reinterpret_cast<const char*>(conn->send_buf.data()),
+                       conn->send_buf.len(),
+                       "\r\n\r\nreload",
+                       10));
+
+    // Publish the old config before the selected response retires. The request
+    // remains pinned to the config that owned its policy bytes.
+    control.pending_config.store(omitted.get(), std::memory_order_release);
+    loop.poll_command();
+    CHECK(active == omitted.get());
+    CHECK(conn->request_config == configured.get());
+    const u32 send_len = conn->send_buf.len();
+    loop.inject_and_dispatch(make_ev(conn->id, IoEventType::Send, static_cast<i32>(send_len)));
+    CHECK_EQ(conn->state, ConnState::ReadingHeader);
+
+    // A successor request observes the newly published metadata-absent config
+    // and therefore retains the legacy miss response.
+    Connection* successor = loop.alloc_conn();
+    REQUIRE(successor != nullptr);
+    static constexpr char kGet[] = "GET /miss HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n";
+    REQUIRE_EQ(successor->recv_buf.write(reinterpret_cast<const u8*>(kGet), sizeof(kGet) - 1),
+               sizeof(kGet) - 1);
+    on_header_received<SmallLoop>(
+        &loop,
+        *successor,
+        make_ev(successor->id, IoEventType::Recv, static_cast<i32>(sizeof(kGet) - 1)));
+    CHECK_EQ(successor->resp_status, 200u);
+    CHECK(successor->request_config == omitted.get());
+}
+
+TEST(unmatched_local_response, h2_outer_callback_closes_and_discards_the_complete_batch) {
+    // SmallLoop's generic close shim predates the h2 epoch marker. Keep this
+    // test-local wrapper aligned with the production close path so the outer
+    // callback's balanced epoch release and actual slot reclamation are both
+    // observable.
+    struct OuterH2Loop : SmallLoop {
+        u32 close_count = 0;
+        void close_conn(Connection& conn) {
+            close_count++;
+            if (conn.epoch_held) {
+                epoch_leave();
+                conn.epoch_held = false;
+            }
+            close_conn_impl(conn);
+        }
+    };
+
+    auto run = [&](RouteConfig& config,
+                   const char* first_path,
+                   bool append_miss,
+                   bool expect_close,
+                   u16 expected_status,
+                   u32 expected_hit_calls) {
+        OuterH2Loop loop;
+        loop.setup();
+        ShardEpoch epoch{};
+        loop.epoch = &epoch;
+        const RouteConfig* active = &config;
+        loop.config_ptr = &active;
+        Connection* conn = loop.alloc_conn();
+        REQUIRE(conn != nullptr);
+        conn->fd = 42;
+        const u32 conn_id = conn->id;
+        Http2Conn h2{};
+        h2.init();
+        conn->h2 = &h2;
+
+        u8 input[1024]{};
+        u32 input_len = 0;
+        for (u32 i = 0; i < kClientPrefaceLen; i++) input[input_len++] = kClientPreface[i];
+        Http2Settings settings{};
+        settings.set_defaults();
+        input_len += write_settings_frame(input + input_len, settings);
+        auto append_headers = [&](u32 stream_id, const char* path) {
+            const hpack::Header headers[] = {
+                {{":method", 7}, {"GET", 3}},
+                {{":scheme", 7}, {"http", 4}},
+                {{":authority", 10}, {"x", 1}},
+                {{":path", 5}, {path, static_cast<u32>(strlen(path))}},
+            };
+            const u32 written = http2_write_headers(
+                input + input_len, sizeof(input) - input_len, stream_id, headers, 4, true);
+            REQUIRE_GT(written, 0u);
+            input_len += written;
+        };
+        append_headers(1, first_path);
+        if (append_miss) append_headers(3, "/miss");
+        REQUIRE_EQ(conn->recv_buf.write(input, input_len), input_len);
+        loop.backend.clear_ops();
+        unmatched_h2_outer_hit_calls = 0;
+
+        on_h2_data<OuterH2Loop>(
+            &loop, *conn, make_ev(conn_id, IoEventType::Recv, static_cast<i32>(input_len)));
+
+        CHECK_EQ(unmatched_h2_outer_hit_calls, expected_hit_calls);
+        CHECK_EQ(loop.backend.count_ops(MockOp::Connect), 0u);
+        CHECK_EQ(h2.pending_stream, 0u);
+        CHECK_EQ(h2.async_stream, 0u);
+        CHECK(h2.pending_route_config == nullptr);
+        CHECK(h2.async_cfg == nullptr);
+        CHECK_EQ(epoch.epoch.load(std::memory_order_acquire), 2u);
+        CHECK_FALSE(conn->epoch_held);
+        CHECK_EQ(conn->upstream_fd, -1);
+        CHECK_FALSE(conn->upstream_slot_held);
+        CHECK_EQ(conn->pending_handler_fn, nullptr);
+
+        if (expect_close) {
+            // The first /hit response and SETTINGS acknowledgement were both
+            // staged before the later miss. The sticky close boundary must
+            // discard the complete batch and reclaim the connection without
+            // submitting response, control, or H1-shaped bytes.
+            CHECK_EQ(loop.close_count, 1u);
+            CHECK_EQ(loop.free_top, OuterH2Loop::kMaxConns);
+            CHECK_EQ(loop.backend.count_ops(MockOp::Send), 0u);
+            CHECK_EQ(conn->send_buf.len(), 0u);
+        } else {
+            CHECK_EQ(loop.close_count, 0u);
+            CHECK_EQ(loop.free_top, OuterH2Loop::kMaxConns - 1);
+            CHECK_EQ(loop.backend.count_ops(MockOp::Send), 1u);
+            CHECK_EQ(h2_staged_status(conn->send_buf.data(), conn->send_buf.len(), 1),
+                     expected_status);
+            loop.free_conn(*conn);
+        }
+    };
+
+    auto omitted = std::make_unique<RouteConfig>();
+    run(*omitted, "/miss", false, false, 200, 0);
+
+    auto configured = std::make_unique<RouteConfig>();
+    const auto policy = make_unmatched_policy(400, "Bad", "h2");
+    REQUIRE_EQ(configured->add_strict_local_response_policy(policy), 1u);
+    REQUIRE(configured->set_unmatched_policy_id(kRouteMethodOptions, 1));
+    REQUIRE(configured->add_jit_handler(
+        "/hit", kRouteMethodGet, &unmatched_h2_outer_hit_handler, false));
+    REQUIRE(configured->unmatched_policy_table_is_valid());
+    run(*configured, "/hit", false, false, 204, 1);
+    run(*configured, "/hit", true, true, 0, 1);
+
+    auto partial = std::make_unique<RouteConfig>();
+    REQUIRE(
+        partial->add_jit_handler("/hit", kRouteMethodGet, &unmatched_h2_outer_hit_handler, false));
+    partial->unmatched_policy_ids[kRouteMethodOptions] = 1;
+    run(*partial, "/hit", true, true, 0, 1);
+}
+
 // Helper: write raw bytes into conn's recv_buf and dispatch as Recv event.
 static void inject_raw_recv(SmallLoop& loop, Connection& conn, const char* data, u32 len) {
     conn.recv_buf.reset();

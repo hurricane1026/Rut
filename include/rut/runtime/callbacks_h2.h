@@ -1022,6 +1022,17 @@ void h2_dispatch_request(H2Dispatch<Loop>& d,
         config->match_canonical(req.path_canon, kMethodKey, params, &param_count, kMaxRouteParams);
 
     if (!route) {
+        // H2 serialization for configured unmatched policies is intentionally
+        // outside the bounded capability. Presence (including forged partial
+        // public state) therefore makes a miss protocol-fail-close: discard any
+        // frames staged by this process batch and use the existing outer close
+        // path. Metadata-absent configs retain the exact legacy 200 behavior.
+        if (config->has_unmatched_metadata()) {
+            d.close_after_process = true;
+            d.resp_len = 0;
+            d.overflow = false;
+            return;
+        }
         if (!end_stream && req.has_content_length) {
             h2_defer_until_data_end(d,
                                     stream_id,

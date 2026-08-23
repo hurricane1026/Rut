@@ -55,6 +55,7 @@
 #include "rut/jit/jit_engine.h"
 #include "rut/runtime/cache_table.h"
 #include "rut/runtime/route_table.h"
+#include <memory>
 #include <new>
 
 namespace rut {
@@ -245,14 +246,6 @@ inline void cache_registry_publish_config(const RouteConfig& cfg, const void* ow
 }
 
 inline bool populate_route_config(RouteConfig& cfg, const rir::Module& mod) {
-    // Activation guard for compiler-only unmatched metadata. Keep this before
-    // verifier/config validation and before every mutation: until strict H1
-    // dispatch and configured-H2 fail-close land atomically, no nonempty or
-    // forged unmatched table may reach a serving RouteConfig.
-    if (mod.strict_local_response_policy_count != 0) return false;
-    for (u32 slot = 0; slot < kStrictLocalResponseMethodSlots; slot++)
-        if (mod.unmatched_policy_ids[slot] != 0) return false;
-
     // Bodies / header sets / routes must always start empty — there's
     // no "merge" semantics for those tables, and a non-zero count
     // would break the compile-time body_idx / headers_idx invariants.
@@ -261,7 +254,9 @@ inline bool populate_route_config(RouteConfig& cfg, const rir::Module& mod) {
         cfg.response_header_set_count != 0 || cfg.response_policy_count != 0 ||
         cfg.failure_policy_count != 0 || cfg.policy_bundle_count != 0 ||
         cfg.target_transform_count != 0 || cfg.target_transform_bytes_used != 0 ||
-        cfg.redirect_policy_count != 0 || cfg.redirect_policy_bytes_used != 0) {
+        cfg.redirect_policy_count != 0 || cfg.redirect_policy_bytes_used != 0 ||
+        cfg.strict_local_response_policy_count != 0 || cfg.strict_local_response_bytes_used != 0 ||
+        cfg.has_unmatched_metadata()) {
         return false;
     }
 
@@ -349,6 +344,24 @@ inline bool populate_route_config(RouteConfig& cfg, const rir::Module& mod) {
         const auto& ref = mod.header_sets[i];
         if (static_cast<u32>(ref.offset) + ref.count > mod.header_pool_used) return false;
         if (ref.count > RouteConfig::kMaxHeadersPerSet) return false;
+    }
+
+    // Probe, validate, deduplicate, and own a configured unmatched table before
+    // the first destination mutation. This keeps malformed/capacity/OOM
+    // rejection transactional even though the legacy population helper permits
+    // unrelated later failures to leave a discardable partial config. The
+    // metadata-absent legacy path performs no new allocation or commit.
+    bool source_has_unmatched_metadata = mod.strict_local_response_policy_count != 0;
+    for (u32 slot = 0; slot < kStrictLocalResponseMethodSlots; slot++)
+        source_has_unmatched_metadata |= mod.unmatched_policy_ids[slot] != 0;
+    std::unique_ptr<RouteConfig> unmatched_probe;
+    if (source_has_unmatched_metadata) {
+        unmatched_probe.reset(new (std::nothrow) RouteConfig());
+        if (!unmatched_probe ||
+            !unmatched_probe->install_unmatched_policy_table(mod.strict_local_response_policies,
+                                                             mod.strict_local_response_policy_count,
+                                                             mod.unmatched_policy_ids))
+            return false;
     }
 
     // Upstreams: the compiler emits `forward(name)` as a 0-based index
@@ -514,6 +527,10 @@ inline bool populate_route_config(RouteConfig& cfg, const rir::Module& mod) {
         if (idx == 0 || idx != i + 1) return false;
     }
     if (!cfg.add_redirect_policy_table(mod.redirect_policies, mod.redirect_policy_count))
+        return false;
+    // Every strict-table failure was exhausted before mutation. Commit the
+    // already-owned staged table by bounded copy/rebase without allocation.
+    if (unmatched_probe && !cfg.copy_unmatched_policy_table_from_owned(*unmatched_probe))
         return false;
     return true;
 }

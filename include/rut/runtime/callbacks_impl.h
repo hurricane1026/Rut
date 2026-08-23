@@ -455,6 +455,9 @@ void on_probe_response(void* lp, Connection& conn, IoEvent ev) {
 u8 map_log_method(HttpMethod method);
 u8 parse_log_method_fallback(const u8* data, u32 len, u32* method_len);
 void capture_request_metadata(Connection& conn);
+
+template <typename Loop>
+bool handle_configured_unmatched_response(Loop* loop, Connection& conn, const RouteConfig* config);
 u32 pipeline_leftover(const Connection& conn);
 bool pipeline_shift(Connection& conn);
 bool pipeline_stash(Connection& conn);
@@ -1486,6 +1489,11 @@ void on_header_received(void* lp, Connection& conn, IoEvent ev) {
         route = config->match_canonical(
             conn.req_path_canon, kMethodKey, route_params, &route_param_count, kMaxRouteParams);
     }
+
+    // Matched routes always win. Only a genuine miss consults the generic
+    // configured unmatched table; the helper returns false exclusively for the
+    // metadata-absent or valid-table/no-applicable-slot legacy-200 cases.
+    if (route == nullptr && handle_configured_unmatched_response(loop, conn, config)) return;
 
     if (!prepare_response_read_deadline_preflight(loop, conn, route, config)) return;
 
@@ -6832,12 +6840,13 @@ inline ResponseReadDeadlineProfile classify_response_read_deadline_profile(
 inline u32 strict_response_dec(char* out, u32 value);
 inline u32 strict_response_date(char* out, u64 now_us);
 
-inline bool build_failure_policy_response_from_spec(const Connection& conn,
-                                                    const ForwardFailurePolicySpec& policy,
-                                                    bool suppress_body,
-                                                    u8* out,
-                                                    u32 out_cap,
-                                                    u32* out_len) {
+template <typename Policy>
+inline bool build_bounded_local_response_bytes(const Connection& conn,
+                                               const Policy& policy,
+                                               bool suppress_body,
+                                               u8* out,
+                                               u32 out_cap,
+                                               u32* out_len) {
     if (out_len == nullptr) return false;
     *out_len = 0;
     if (out == nullptr) return false;
@@ -6877,6 +6886,93 @@ inline bool build_failure_policy_response_from_spec(const Connection& conn,
         (!suppress_body && !put(reinterpret_cast<const u8*>(policy.body.ptr), policy.body.len)))
         return false;
     *out_len = pos;
+    return true;
+}
+
+// Generic strict local response materializer. This API intentionally carries
+// no forwarding/failure vocabulary; the older failure-policy entry point below
+// delegates to the same proven byte serializer and remains byte-identical.
+inline bool build_strict_local_response(const Connection& conn,
+                                        const StrictLocalResponsePolicySpec& policy,
+                                        bool suppress_body,
+                                        u8* out,
+                                        u32 out_cap,
+                                        u32* out_len) {
+    if (out_len != nullptr) *out_len = 0;
+    if (!strict_local_response_policy_spec_valid(policy) ||
+        suppress_body != (conn.req_method == static_cast<u8>(LogHttpMethod::Head)) ||
+        (suppress_body && policy.head_mode != StrictLocalResponseHeadMode::SuppressBody) ||
+        (!suppress_body && conn.req_method == static_cast<u8>(LogHttpMethod::Head)))
+        return false;
+    return build_bounded_local_response_bytes(conn, policy, suppress_body, out, out_cap, out_len);
+}
+
+inline bool build_failure_policy_response_from_spec(const Connection& conn,
+                                                    const ForwardFailurePolicySpec& policy,
+                                                    bool suppress_body,
+                                                    u8* out,
+                                                    u32 out_cap,
+                                                    u32* out_len) {
+    return build_bounded_local_response_bytes(conn, policy, suppress_body, out, out_cap, out_len);
+}
+
+template <typename Loop>
+bool handle_configured_unmatched_response(Loop* loop, Connection& conn, const RouteConfig* config) {
+    if (config == nullptr || !config->has_unmatched_metadata()) return false;
+
+    auto fail_closed = [&]() {
+        // No serializer/buffer mutation and no upstream effect precedes this
+        // point, so every invalid/partial request/config shape closes with zero
+        // response bytes.
+        loop->close_conn(conn);
+        return true;
+    };
+    if (!config->unmatched_policy_table_is_valid() || !conn.req_strict_h1_complete ||
+        conn.req_http_version != static_cast<u8>(HttpVersion::Http11) || conn.req_malformed ||
+        conn.req_header_end == 0 || conn.req_header_end > conn.recv_buf.len())
+        return fail_closed();
+
+    const auto method = static_cast<LogHttpMethod>(conn.req_method);
+    if (method == LogHttpMethod::Other) return fail_closed();
+    const u8 method_key = route_method_key(method);
+    if (method_key == kRouteMethodInvalid || method_key == kRouteMethodAny ||
+        method_key >= kStrictLocalResponseMethodSlots)
+        return fail_closed();
+
+    u16 policy_id = config->unmatched_policy_ids[method_key];
+    if (policy_id == 0) policy_id = config->unmatched_policy_ids[kRouteMethodAny];
+    if (policy_id == 0) return false;
+    if (!config->strict_local_response_policy_id_is_owned(policy_id)) return fail_closed();
+    const auto& policy = config->strict_local_response_policies[policy_id - 1];
+    const bool is_head = method == LogHttpMethod::Head;
+    if ((is_head && policy.head_mode != StrictLocalResponseHeadMode::SuppressBody) ||
+        (!is_head && policy.head_mode != StrictLocalResponseHeadMode::Reject &&
+         policy.head_mode != StrictLocalResponseHeadMode::SuppressBody))
+        return fail_closed();
+
+    // An incomplete request body is not drained after a local decision. Emit
+    // the selected response, but make it terminal so no successor can be
+    // admitted and no further request-body recv is submitted.
+    const bool unread_body =
+        (conn.req_body_mode == BodyMode::ContentLength && conn.req_body_remaining != 0) ||
+        (conn.req_body_mode == BodyMode::Chunked &&
+         conn.req_chunk_parser.state != ChunkedParser::State::Complete);
+    if (unread_body) conn.keep_alive = false;
+    conn.keep_alive = conn.keep_alive && conn.req_client_keep_alive;
+
+    u8 scratch[SlicePool::kSliceSize];
+    const u32 cap =
+        conn.send_buf.capacity() < sizeof(scratch) ? conn.send_buf.capacity() : sizeof(scratch);
+    u32 response_len = 0;
+    if (!build_strict_local_response(conn, policy, is_head, scratch, cap, &response_len))
+        return fail_closed();
+    conn.send_buf.reset();
+    if (conn.send_buf.write(scratch, response_len) != response_len) return fail_closed();
+    conn.throttle_down_bps = 0;
+    conn.throttle_tat_ns = 0;
+    conn.resp_status = policy.status_code;
+    conn.transition_to_sending(&on_response_sent<Loop>);
+    client_send(loop, conn, conn.send_buf.data(), conn.send_buf.len());
     return true;
 }
 

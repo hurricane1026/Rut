@@ -8,6 +8,7 @@
 #include "rut/runtime/http2_conn.h"
 #include "rut/runtime/http2_frame.h"
 #include "test.h"
+#include <memory>
 
 using namespace rut;
 
@@ -1478,8 +1479,75 @@ TEST(h2_serving, inject_content_length_rejects_overflow) {
 }
 
 namespace {
-struct FakeH2Loop {};
+struct FakeH2Loop {
+    u8 response_headers[4096]{};
+    bool alloc_response_header_buf(Connection& conn) {
+        conn.response_header_slice = response_headers;
+        conn.response_header_buf.bind(response_headers, sizeof(response_headers));
+        return true;
+    }
+    void epoch_enter() {}
+    void epoch_leave() {}
+};
 }  // namespace
+
+TEST(h2_serving, unmatched_metadata_miss_fail_closes_while_omitted_and_matched_are_unchanged) {
+    auto dispatch = [](RouteConfig* cfg, const char* path) {
+        struct Result {
+            u32 response_len;
+            bool close;
+        };
+        Http2Conn h2;
+        h2.init();
+        Connection conn;
+        conn.reset();
+        conn.h2 = &h2;
+        conn.request_config = cfg;
+        FakeH2Loop loop;
+        u8 response[256]{};
+        H2Dispatch<FakeH2Loop> d{&loop, &conn, response, sizeof(response), 0, false};
+        const hpack::Header headers[] = {{{":method", 7}, {"GET", 3}},
+                                         {{":scheme", 7}, {"http", 4}},
+                                         {{":authority", 10}, {"x", 1}},
+                                         {{":path", 5}, {path, static_cast<u32>(strlen(path))}}};
+        h2_dispatch_request(d, 1, headers, 4, true);
+        return Result{d.resp_len, d.close_after_process};
+    };
+
+    auto omitted = std::make_unique<RouteConfig>();
+    const auto legacy = dispatch(omitted.get(), "/miss");
+    CHECK_GT(legacy.response_len, 0u);
+    CHECK_FALSE(legacy.close);
+
+    auto configured = std::make_unique<RouteConfig>();
+    StrictLocalResponsePolicySpec policy{};
+    policy.version = StrictLocalResponseVersion::Http11;
+    policy.status_code = 400;
+    policy.date = StrictLocalResponseDate::Current;
+    policy.connection = StrictLocalResponseConnection::Request;
+    policy.head_mode = StrictLocalResponseHeadMode::Reject;
+    policy.reason = {"Bad", 3};
+    policy.content_type = {"text/plain", 10};
+    policy.server = {"rut", 3};
+    policy.body = {"bad", 3};
+    REQUIRE_EQ(configured->add_strict_local_response_policy(policy), 1u);
+    REQUIRE(configured->set_unmatched_policy_id(kRouteMethodOptions, 1));
+    REQUIRE(configured->unmatched_policy_table_is_valid());
+    const auto configured_miss = dispatch(configured.get(), "/miss");
+    CHECK_EQ(configured_miss.response_len, 0u);
+    CHECK(configured_miss.close);
+
+    REQUIRE(configured->add_static("/hit", kRouteMethodGet, 204));
+    const auto matched = dispatch(configured.get(), "/hit");
+    CHECK_GT(matched.response_len, 0u);
+    CHECK_FALSE(matched.close);
+
+    auto partial = std::make_unique<RouteConfig>();
+    partial->unmatched_policy_ids[kRouteMethodOptions] = 1;
+    const auto partial_miss = dispatch(partial.get(), "/miss");
+    CHECK_EQ(partial_miss.response_len, 0u);
+    CHECK(partial_miss.close);
+}
 
 TEST(h2_serving, deferred_route_params_copied_to_stable_storage) {
     // A deferred dynamic route's param VALUES point into hdr_scratch, which the

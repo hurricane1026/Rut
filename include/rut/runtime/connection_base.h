@@ -871,6 +871,9 @@ struct ConnectionBase {
     bool failure_policy_suppress_body;
     // Exact parsed request HTTP version (HttpVersion underlying value).
     u8 req_http_version;  // HttpVersion::Http10/Http11, 255 when unknown.
+    // True only for the current request after the strict parser completed an
+    // HTTP/1.1 header block. Fallback method/path recovery never publishes it.
+    bool req_strict_h1_complete;
     // Request-side keep-alive intent of the CURRENT request, as parsed from its
     // request line + Connection header (HTTP/1.1 default true, HTTP/1.0 default
     // false, "Connection: close" → false). The proxy forwards the client's
@@ -1219,6 +1222,7 @@ struct ConnectionBase {
         timeout_failure_policy_id = 0;
         failure_policy_suppress_body = false;
         req_http_version = 255;
+        req_strict_h1_complete = false;
         req_keep_alive = false;
         req_client_keep_alive = false;
         req_client_connection_close = false;

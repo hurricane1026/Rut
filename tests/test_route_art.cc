@@ -6,6 +6,10 @@
 #include "rut/runtime/route_art.h"
 #include "rut/runtime/route_table.h"  // RouteConfig::kMaxRoutes
 #include "test.h"
+#include <memory>
+#include <new>
+#include <string>
+#include <vector>
 
 using namespace rut;
 
@@ -489,6 +493,209 @@ TEST(route_art, fills_max_routes_under_node48_pressure) {
     // first leaf and silently no-op).
     for (u32 i = 0; i < idx; i++) {
         CHECK_EQ(t.match(Str{paths[i], 4}, 0), static_cast<u16>(i));
+    }
+}
+
+namespace {
+StrictLocalResponsePolicySpec local_policy(
+    Str reason,
+    Str content_type,
+    Str server,
+    Str body,
+    u16 status = 400,
+    StrictLocalResponseHeadMode head_mode = StrictLocalResponseHeadMode::Reject) {
+    StrictLocalResponsePolicySpec p{};
+    p.version = StrictLocalResponseVersion::Http11;
+    p.status_code = status;
+    p.date = StrictLocalResponseDate::Current;
+    p.connection = StrictLocalResponseConnection::Request;
+    p.head_mode = head_mode;
+    p.reason = reason;
+    p.content_type = content_type;
+    p.server = server;
+    p.body = body;
+    return p;
+}
+}  // namespace
+
+TEST(route_config, unmatched_owned_table_exact_pool_dedup_and_atomic_rejection) {
+    const std::string reason1(1, 'a'), type1(1, 'b'), server1(1, 'c');
+    const std::string reason2(1, 'd'), type2(1, 'e'), server2(1, 'f');
+    const std::string body1(4096, 'x'), body2(4090, 'y');
+    StrictLocalResponsePolicySpec exact[2] = {
+        local_policy({reason1.data(), 1},
+                     {type1.data(), 1},
+                     {server1.data(), 1},
+                     {body1.data(), static_cast<u32>(body1.size())}),
+        local_policy({reason2.data(), 1},
+                     {type2.data(), 1},
+                     {server2.data(), 1},
+                     {body2.data(), static_cast<u32>(body2.size())},
+                     405)};
+    u16 ids[kStrictLocalResponseMethodSlots]{};
+    ids[kRouteMethodOptions] = 1;
+    ids[kRouteMethodConnect] = 2;
+    auto cfg = std::make_unique<RouteConfig>();
+    REQUIRE(cfg->add_static("/kept", kRouteMethodGet, 204));
+    REQUIRE(cfg->install_unmatched_policy_table(exact, 2, ids));
+    CHECK_EQ(cfg->strict_local_response_bytes_used, 8192u);
+    CHECK_EQ(cfg->strict_local_response_policy_count, 2u);
+    CHECK(cfg->unmatched_policy_table_is_valid());
+    CHECK(cfg->strict_local_response_policy_id_is_owned(1));
+    CHECK_EQ(cfg->routes[0].status_code, 204u);
+
+    const std::string body_over(4091, 'z');
+    exact[1].body = {body_over.data(), static_cast<u32>(body_over.size())};
+    auto overflow = std::make_unique<RouteConfig>();
+    CHECK_FALSE(overflow->install_unmatched_policy_table(exact, 2, ids));
+    CHECK_FALSE(overflow->has_unmatched_metadata());
+    auto unrelated = std::make_unique<RouteConfig>();
+    REQUIRE(unrelated->add_static("/kept", kRouteMethodGet, 207));
+    std::vector<u8> unrelated_before(sizeof(RouteConfig));
+    __builtin_memcpy(unrelated_before.data(), unrelated.get(), sizeof(RouteConfig));
+    CHECK_FALSE(unrelated->install_unmatched_policy_table(exact, 2, ids));
+    CHECK_EQ(__builtin_memcmp(unrelated_before.data(), unrelated.get(), sizeof(RouteConfig)), 0);
+    std::vector<u8> before(sizeof(RouteConfig));
+    __builtin_memcpy(before.data(), cfg.get(), sizeof(RouteConfig));
+    CHECK_FALSE(cfg->install_unmatched_policy_table(exact, 2, ids));
+    CHECK_EQ(__builtin_memcmp(before.data(), cfg.get(), sizeof(RouteConfig)), 0);
+
+    StrictLocalResponsePolicySpec duplicate[2] = {
+        local_policy({"Bad", 3}, {"text/plain", 10}, {"rut", 3}, {"x", 1}),
+        local_policy({"Bad", 3}, {"text/plain", 10}, {"rut", 3}, {"x", 1})};
+    auto dedup = std::make_unique<RouteConfig>();
+    REQUIRE(dedup->install_unmatched_policy_table(duplicate, 2, ids));
+    CHECK_EQ(dedup->strict_local_response_policy_count, 1u);
+    CHECK_EQ(dedup->unmatched_policy_ids[kRouteMethodOptions], 1u);
+    CHECK_EQ(dedup->unmatched_policy_ids[kRouteMethodConnect], 1u);
+    CHECK(dedup->unmatched_policy_table_is_valid());
+}
+
+TEST(route_config, unmatched_empty_body_lifetime_owned_ranges_and_reset) {
+    auto cfg = std::make_unique<RouteConfig>();
+    {
+        std::string reason = "Nope";
+        std::string type = "text/plain";
+        std::string server = "rut";
+        StrictLocalResponsePolicySpec p =
+            local_policy({reason.data(), 4}, {type.data(), 10}, {server.data(), 3}, {nullptr, 0});
+        u16 ids[kStrictLocalResponseMethodSlots]{};
+        ids[kRouteMethodOptions] = 1;
+        REQUIRE(cfg->install_unmatched_policy_table(&p, 1, ids));
+    }
+    REQUIRE(cfg->unmatched_policy_table_is_valid());
+    CHECK_EQ(cfg->strict_local_response_policies[0].body.len, 0u);
+    CHECK(cfg->strict_local_response_policies[0].body.ptr >= cfg->strict_local_response_bytes);
+    CHECK(cfg->strict_local_response_policies[0].body.ptr <=
+          cfg->strict_local_response_bytes + cfg->strict_local_response_bytes_used);
+
+    const Str saved = cfg->strict_local_response_policies[0].body;
+    const Str saved_reason = cfg->strict_local_response_policies[0].reason;
+    cfg->strict_local_response_policies[0].reason = {"external", 1};
+    CHECK_FALSE(cfg->unmatched_policy_table_is_valid());
+    cfg->strict_local_response_policies[0].reason = {
+        cfg->strict_local_response_bytes + cfg->strict_local_response_bytes_used, 1};
+    CHECK_FALSE(cfg->unmatched_policy_table_is_valid());
+    cfg->strict_local_response_policies[0].reason = saved_reason;
+    cfg->strict_local_response_policies[0].body = {"external", 1};
+    CHECK_FALSE(cfg->unmatched_policy_table_is_valid());
+    cfg->strict_local_response_policies[0].body = {
+        cfg->strict_local_response_bytes + cfg->strict_local_response_bytes_used, 1};
+    CHECK_FALSE(cfg->unmatched_policy_table_is_valid());
+    cfg->strict_local_response_policies[0].body = saved;
+    REQUIRE(cfg->unmatched_policy_table_is_valid());
+
+    cfg->~RouteConfig();
+    new (cfg.get()) RouteConfig();
+    CHECK_FALSE(cfg->has_unmatched_metadata());
+    CHECK(cfg->unmatched_policy_table_is_valid());
+}
+
+TEST(route_config, unmatched_copy_rebases_integer_addresses_without_pointer_subtraction) {
+    const std::string body1(4096, 'x');
+    const std::string body2(4087, 'y');
+    StrictLocalResponsePolicySpec policies[3] = {
+        local_policy({"a", 1}, {"b", 1}, {"c", 1}, {body1.data(), 4096}),
+        local_policy({"d", 1}, {"e", 1}, {"f", 1}, {body2.data(), 4087}),
+        local_policy({"g", 1}, {"h", 1}, {"i", 1}, {nullptr, 0}),
+    };
+    auto source = std::make_unique<RouteConfig>();
+    u16 ids[kStrictLocalResponseMethodSlots]{};
+    ids[kRouteMethodOptions] = 1;
+    ids[kRouteMethodConnect] = 2;
+    ids[kRouteMethodTrace] = 3;
+    REQUIRE(source->install_unmatched_policy_table(policies, 3, ids));
+    REQUIRE_EQ(source->strict_local_response_bytes_used,
+               RouteConfig::kStrictLocalResponseBytesPoolBytes);
+
+    // Reconstitute every view solely from its numeric address. This models a
+    // forged public view whose value falls inside the owned pool but whose C++
+    // array provenance cannot be assumed by the copy/rebase implementation.
+    auto numeric_view = [](Str value) {
+        return Str{reinterpret_cast<const char*>(reinterpret_cast<uintptr_t>(value.ptr)),
+                   value.len};
+    };
+    for (u32 i = 0; i < source->strict_local_response_policy_count; i++) {
+        auto& stored = source->strict_local_response_policies[i];
+        stored.reason = numeric_view(stored.reason);
+        stored.content_type = numeric_view(stored.content_type);
+        stored.server = numeric_view(stored.server);
+        stored.body = numeric_view(stored.body);
+    }
+    const uintptr_t source_base = reinterpret_cast<uintptr_t>(source->strict_local_response_bytes);
+    auto& one_past = source->strict_local_response_policies[2].body;
+    one_past = {
+        reinterpret_cast<const char*>(source_base + source->strict_local_response_bytes_used), 0};
+    REQUIRE(source->unmatched_policy_table_is_valid());
+
+    auto copied = std::make_unique<RouteConfig>();
+    REQUIRE(copied->copy_unmatched_policy_table_from_owned(*source));
+    REQUIRE(copied->unmatched_policy_table_is_valid());
+    CHECK(copied->strict_local_response_policies[0].reason.eq({"a", 1}));
+    CHECK(copied->strict_local_response_policies[2].body.ptr ==
+          copied->strict_local_response_bytes + copied->strict_local_response_bytes_used);
+
+    // The actual array-one-past numeric address is only valid for an empty view.
+    // A nonempty view must reject before any destination byte changes.
+    one_past.len = 1;
+    auto rejected = std::make_unique<RouteConfig>();
+    REQUIRE(rejected->add_static("/kept", kRouteMethodGet, 207));
+    std::vector<u8> before(sizeof(RouteConfig));
+    __builtin_memcpy(before.data(), rejected.get(), sizeof(RouteConfig));
+    CHECK_FALSE(rejected->copy_unmatched_policy_table_from_owned(*source));
+    CHECK_EQ(__builtin_memcmp(before.data(), rejected.get(), sizeof(RouteConfig)), 0);
+}
+
+TEST(route_config, unmatched_complete_install_rejects_partial_destination_and_bad_head_mapping) {
+    StrictLocalResponsePolicySpec reject =
+        local_policy({"Bad", 3}, {"text/plain", 10}, {"rut", 3}, {"x", 1});
+    u16 options[kStrictLocalResponseMethodSlots]{};
+    options[kRouteMethodOptions] = 1;
+
+    auto rejects_unchanged = [&](auto prepopulate) {
+        auto cfg = std::make_unique<RouteConfig>();
+        prepopulate(*cfg);
+        std::vector<u8> before(sizeof(RouteConfig));
+        __builtin_memcpy(before.data(), cfg.get(), sizeof(RouteConfig));
+        CHECK_FALSE(cfg->install_unmatched_policy_table(&reject, 1, options));
+        CHECK_EQ(__builtin_memcmp(before.data(), cfg.get(), sizeof(RouteConfig)), 0);
+    };
+    rejects_unchanged([](RouteConfig& c) { c.strict_local_response_policy_count = 1; });
+    rejects_unchanged([](RouteConfig& c) { c.strict_local_response_bytes_used = 1; });
+    rejects_unchanged([](RouteConfig& c) { c.unmatched_policy_ids[kRouteMethodOptions] = 1; });
+
+    auto invalid_id = std::make_unique<RouteConfig>();
+    u16 bad[kStrictLocalResponseMethodSlots]{};
+    bad[kRouteMethodOptions] = 2;
+    CHECK_FALSE(invalid_id->install_unmatched_policy_table(&reject, 1, bad));
+    CHECK_FALSE(invalid_id->has_unmatched_metadata());
+
+    for (u8 slot : {kRouteMethodAny, kRouteMethodHead}) {
+        auto invalid_head = std::make_unique<RouteConfig>();
+        u16 mapped[kStrictLocalResponseMethodSlots]{};
+        mapped[slot] = 1;
+        CHECK_FALSE(invalid_head->install_unmatched_policy_table(&reject, 1, mapped));
+        CHECK_FALSE(invalid_head->has_unmatched_metadata());
     }
 }
 
