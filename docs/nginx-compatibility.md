@@ -34,6 +34,10 @@ Allowed states are `SUPPORTED`, `PARTIAL`, `BLOCKED_BY_RUT`,
 
 - nginx route matching normalizes percent escapes, dot segments, and (by
   default) repeated slashes. RUT routing has different canonicalization rules.
+- Non-origin-form request targets currently receive no RUT canonical path, miss
+  the generated root route, bypass forward preflight, and hit the runtime's
+  fixed unmatched `200 OK`. Pinned nginx `OPTIONS *` and authority-form CONNECT
+  baselines are required before choosing a generic RUT routing/unmatched action.
 - With `location /api/` and a `/` URI in `proxy_pass`, pinned nginx sends `/`,
   `/x`, and `/x?y=1` upstream for `/api/`, `/api/x`, and `/api/x?y=1`.
   It redirects `/api`, collapses repeated slash/dot-segment inputs, and decodes
