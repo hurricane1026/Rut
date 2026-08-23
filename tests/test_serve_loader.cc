@@ -35,6 +35,21 @@ bool contains(const char* haystack, const char* needle) {
     return std::string(haystack).find(needle) != std::string::npos;
 }
 
+std::string make_eighty_route_source() {
+    std::string source;
+    source.reserve(80u * 40u);
+    for (u32 i = 0; i < 80; i++) {
+        source += "route ";
+        source += (i % 2u == 0u) ? "GET" : "POST";
+        source += " \"/capacity/";
+        source += std::to_string(i);
+        source += "\" { return ";
+        source += (i % 2u == 0u) ? "200" : "201";
+        source += " }\n";
+    }
+    return source;
+}
+
 }  // namespace
 
 TEST(serve_loader, status_routes_load) {
@@ -49,6 +64,28 @@ TEST(serve_loader, status_routes_load) {
     REQUIRE(load_rut_program(path.c_str(), program, err));
     // Both routes registered into the config the shards will serve.
     CHECK_EQ(program.config.route_count, 2u);
+    program.destroy();
+}
+
+TEST(serve_loader, eighty_route_source_registers_all_routes) {
+    const std::string dir = "/tmp/rut_serve_loader_eighty_routes";
+    const std::string source = make_eighty_route_source();
+    const std::string path = write_file(dir, "app.rut", source.c_str());
+
+    LoadedProgram program;
+    LoadError err;
+    REQUIRE(load_rut_program(path.c_str(), program, err));
+    REQUIRE_EQ(program.config.route_count, 80u);
+
+    const RouteEntry& first = program.config.routes[0];
+    CHECK_EQ(first.method, kRouteMethodGet);
+    CHECK_EQ(first.path_len, 11u);
+    CHECK(std::string(first.path, first.path_len) == "/capacity/0");
+
+    const RouteEntry& last = program.config.routes[79];
+    CHECK_EQ(last.method, kRouteMethodPost);
+    CHECK_EQ(last.path_len, 12u);
+    CHECK(std::string(last.path, last.path_len) == "/capacity/79");
     program.destroy();
 }
 

@@ -592,6 +592,97 @@ TEST(frontend, lex_recognizes_wait_keyword) {
     CHECK_EQ(static_cast<u8>(lexed->tokens[0].type), static_cast<u8>(TokenType::KwWait));
 }
 
+static std::string make_ident_stream(u32 count) {
+    std::string source;
+    source.reserve(count * 2u);
+    for (u32 i = 0; i < count; i++) {
+        if (i != 0) source.push_back(' ');
+        source.push_back('a');
+    }
+    return source;
+}
+
+TEST(frontend, lex_token_capacity_boundaries_are_exact) {
+    {
+        const std::string source = make_ident_stream(639);
+        auto result = lex({source.data(), static_cast<u32>(source.size())});
+        REQUIRE(result);
+        CHECK_EQ(result->tokens.len, 640u);  // 639 identifiers + EOF
+        CHECK(result->tokens[639].type == TokenType::Eof);
+        CHECK_EQ(result->tokens[639].start, static_cast<u32>(source.size()));
+        CHECK_EQ(result->tokens[639].end, static_cast<u32>(source.size()));
+        CHECK_EQ(result->tokens[639].line, 1u);
+        CHECK_EQ(result->tokens[639].col, static_cast<u32>(source.size() + 1u));
+    }
+
+    {
+        const std::string source = make_ident_stream(640);
+        auto result = lex({source.data(), static_cast<u32>(source.size())});
+        REQUIRE(!result);
+        CHECK(result.error().code == FrontendError::TooManyTokens);
+        CHECK_EQ(result.error().span.start, static_cast<u32>(source.size()));
+        CHECK_EQ(result.error().span.end, static_cast<u32>(source.size()));
+        CHECK_EQ(result.error().span.line, 1u);
+        CHECK_EQ(result.error().span.col, static_cast<u32>(source.size() + 1u));
+    }
+
+    {
+        const std::string source = make_ident_stream(641);
+        auto result = lex({source.data(), static_cast<u32>(source.size())});
+        REQUIRE(!result);
+        CHECK(result.error().code == FrontendError::TooManyTokens);
+        // The 641st one-character identifier starts after 640 "a " pairs.
+        CHECK_EQ(result.error().span.start, 1280u);
+        CHECK_EQ(result.error().span.end, 1281u);
+        CHECK_EQ(result.error().span.line, 1u);
+        CHECK_EQ(result.error().span.col, 1281u);
+    }
+}
+
+static std::string make_eighty_route_source() {
+    std::string source;
+    source.reserve(80u * 40u);
+    for (u32 i = 0; i < 80; i++) {
+        source += "route ";
+        source += (i % 2u == 0u) ? "GET" : "POST";
+        source += " \"/capacity/";
+        source += std::to_string(i);
+        source += "\" { return ";
+        source += (i % 2u == 0u) ? "200" : "201";
+        source += " }\n";
+    }
+    return source;
+}
+
+TEST(frontend, eighty_route_source_reaches_verified_rir_without_token_overflow) {
+    const std::string source = make_eighty_route_source();
+    auto lexed = lex({source.data(), static_cast<u32>(source.size())});
+    REQUIRE(lexed);
+    // Each route contributes: route, method, path, {, return, status, }.
+    REQUIRE_EQ(lexed->tokens.len, 561u);  // 80 * 7 route tokens + EOF
+
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    REQUIRE_EQ(ast->items.len, 80u);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    REQUIRE_EQ(hir->routes.len, 80u);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    REQUIRE(lower_to_rir(mir.value(), rir));
+    REQUIRE_EQ(rir.module.func_count, 80u);
+    const auto verified = rir::verify_module(rir.module);
+    REQUIRE(verified.ok);
+    for (u32 i = 0; i < 80; i++) {
+        const auto& fn = rir.module.functions[i];
+        CHECK_EQ(fn.http_method, i % 2u == 0u ? kRouteMethodGet : kRouteMethodPost);
+        const std::string expected_path = "/capacity/" + std::to_string(i);
+        CHECK(fn.route_pattern.eq({expected_path.data(), static_cast<u32>(expected_path.size())}));
+    }
+    rir.destroy();
+}
+
 TEST(frontend, lex_recognizes_downstream_keyword) {
     const char* src = "downstream";
     auto lexed = lex(lit(src));
