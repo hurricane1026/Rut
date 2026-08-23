@@ -138,7 +138,7 @@ struct LexedTokens {
 // Keep the bounded token buffer comfortably below a conventional 64 KiB
 // frontend stack budget on all supported data models; this is intentionally a
 // portable bound rather than an LP64-specific sizeof(Token) assertion.
-static_assert(sizeof(LexedTokens) <= 64u * 1024u,
+static_assert(sizeof(LexedTokens) <= 64uz * 1024uz,
               "LexedTokens exceeds the frontend stack budget");
 
 using LexResult = core::Expected<LexedTokens, Diagnostic>;
