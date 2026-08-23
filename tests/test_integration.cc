@@ -17875,6 +17875,7 @@ static bool read_public_head_response(
 
 static bool normalize_public_date(char* data, u32 length) {
     u32 count = 0;
+    u32 date_start = 0;
     for (u32 i = 0; i < length;) {
         if (length - i < 6) break;
         if (memcmp(data + i, "Date: ", 6) != 0) {
@@ -17882,17 +17883,284 @@ static bool normalize_public_date(char* data, u32 length) {
             continue;
         }
         count++;
+        if (count != 1) return false;
         if (i < 2 || length - i < 37 || data[i - 2] != '\r' || data[i + 35] != '\r' ||
             data[i + 36] != '\n')
             return false;
-        for (u32 j = 0; j < 29; j++) data[i + 6 + j] = 'X';
-        i += 6;
+        date_start = i + 6;
+        i += 35;
     }
-    return count == 1;
+    if (count != 1) return false;
+
+    const char* date = data + date_start;
+    const auto token_is_one_of = [](const char* value, const char* const* tokens, u32 count) {
+        for (u32 i = 0; i < count; i++)
+            if (memcmp(value, tokens[i], 3) == 0) return true;
+        return false;
+    };
+    static const char* const kWeekdays[] = {"Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"};
+    static const char* const kMonths[] = {
+        "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"};
+    const auto is_digit = [](char c) { return c >= '0' && c <= '9'; };
+    const auto two_digits = [&](u32 offset) {
+        return is_digit(date[offset]) && is_digit(date[offset + 1])
+                   ? static_cast<u32>((date[offset] - '0') * 10 + (date[offset + 1] - '0'))
+                   : 100u;
+    };
+    if (!token_is_one_of(date, kWeekdays, sizeof(kWeekdays) / sizeof(kWeekdays[0])) ||
+        date[3] != ',' || date[4] != ' ' || date[7] != ' ' ||
+        !token_is_one_of(date + 8, kMonths, sizeof(kMonths) / sizeof(kMonths[0])) ||
+        date[11] != ' ' || date[16] != ' ' || date[19] != ':' || date[22] != ':' ||
+        date[25] != ' ' || memcmp(date + 26, "GMT", 3) != 0)
+        return false;
+    const u32 day = two_digits(5);
+    const u32 hour = two_digits(17);
+    const u32 minute = two_digits(20);
+    const u32 second = two_digits(23);
+    if (day < 1 || day > 31 || hour > 23 || minute > 59 || second > 59) return false;
+    for (u32 i = 12; i < 16; i++)
+        if (!is_digit(date[i])) return false;
+
+    // Mutation is deliberately last: invalid input remains observable, and a
+    // successful normalization masks only the already-validated 29-byte value.
+    for (u32 i = 0; i < 29; i++) data[date_start + i] = 'X';
+    return true;
 }
 #endif
 
 #if RUT_ENABLE_JIT_TESTS
+TEST(route, public_ordinary_source_unmatched_options_star_nginx_400_zero_upstream_iouring) {
+    using namespace rut;
+    if (!iouring_socket_live()) SKIP("io_uring async socket ops unavailable in this environment");
+
+    static constexpr char kBody[] =
+        "<html>\r\n"
+        "<head><title>400 Bad Request</title></head>\r\n"
+        "<body>\r\n"
+        "<center><h1>400 Bad Request</h1></center>\r\n"
+        "<hr><center>nginx/1.29.7</center>\r\n"
+        "</body>\r\n"
+        "</html>\r\n";
+    static constexpr char kExpectedNormalized[] =
+        "HTTP/1.1 400 Bad Request\r\n"
+        "Server: nginx/1.29.7\r\n"
+        "Date: XXXXXXXXXXXXXXXXXXXXXXXXXXXXX\r\n"
+        "Content-Type: text/html\r\n"
+        "Content-Length: 157\r\n"
+        "Connection: close\r\n\r\n"
+        "<html>\r\n"
+        "<head><title>400 Bad Request</title></head>\r\n"
+        "<body>\r\n"
+        "<center><h1>400 Bad Request</h1></center>\r\n"
+        "<hr><center>nginx/1.29.7</center>\r\n"
+        "</body>\r\n"
+        "</html>\r\n";
+    static_assert(sizeof(kBody) - 1u == 157u);
+
+    // The wire comparison may mask only a syntactically valid IMF-fixdate.
+    // Pin representative invalid tokens, numeric ranges, punctuation, and the
+    // GMT suffix so arbitrary 29-byte data cannot compare equal.
+    static constexpr char kDateProbe[] =
+        "HTTP/1.1 400 Bad Request\r\nDate: Tue, 01 Jan 2030 00:00:00 GMT\r\n\r\n";
+    auto date_probe = [](u32 offset, char replacement) {
+        char probe[sizeof(kDateProbe)];
+        memcpy(probe, kDateProbe, sizeof(probe));
+        probe[offset] = replacement;
+        return normalize_public_date(probe, sizeof(probe) - 1u);
+    };
+    char valid_date_probe[sizeof(kDateProbe)];
+    memcpy(valid_date_probe, kDateProbe, sizeof(valid_date_probe));
+    REQUIRE(normalize_public_date(valid_date_probe, sizeof(valid_date_probe) - 1u));
+    CHECK(buf_contains(valid_date_probe,
+                       sizeof(valid_date_probe) - 1u,
+                       "Date: XXXXXXXXXXXXXXXXXXXXXXXXXXXXX\r\n",
+                       sizeof("Date: XXXXXXXXXXXXXXXXXXXXXXXXXXXXX\r\n") - 1u));
+    // Offsets below are absolute within kDateProbe; each replaces one byte in
+    // the Date field while preserving its total 29-byte width.
+    CHECK_FALSE(date_probe(32, 'X'));  // weekday
+    CHECK_FALSE(date_probe(35, ';'));  // comma
+    CHECK_FALSE(date_probe(38, '0'));  // day 00
+    CHECK_FALSE(date_probe(40, 'X'));  // month
+    CHECK_FALSE(date_probe(44, 'X'));  // year
+    CHECK_FALSE(date_probe(49, '3'));  // hour 30
+    CHECK_FALSE(date_probe(51, ';'));  // first colon
+    CHECK_FALSE(date_probe(52, '6'));  // minute 60
+    CHECK_FALSE(date_probe(55, '6'));  // second 60
+    CHECK_FALSE(date_probe(58, 'X'));  // GMT
+
+    RecordingUpstream backend;
+    REQUIRE(backend.setup());
+    std::string source =
+        "listen :0\nupstream backend at \"127.0.0.1:" + std::to_string(backend.port) + "\"\n";
+    source += R"rut(
+unmatched OPTIONS { return local_response({
+  version: "HTTP/1.1", status: 400, reason: "Bad Request", server: "nginx/1.29.7",
+  date: "current", content_type: "text/html", connection: "request",
+  head_mode: "reject", body: b"<html>\r\n<head><title>400 Bad Request</title></head>\r\n<body>\r\n<center><h1>400 Bad Request</h1></center>\r\n<hr><center>nginx/1.29.7</center>\r\n</body>\r\n</html>\r\n"
+}) }
+route "/" { return forward(backend) }
+)rut";
+
+    auto lexed = lex({source.data(), static_cast<u32>(source.size())});
+    REQUIRE(lexed);
+    auto ast = parse_file(lexed.value());
+    REQUIRE(ast);
+    std::unique_ptr<AstFile> ast_owned(ast.value());
+    REQUIRE_EQ(ast_owned->strict_local_response_policies.len, 1u);
+    CHECK_EQ(ast_owned->unmatched_policy_ids[kRouteMethodOptions], 1u);
+
+    auto hir = analyze_file(*ast_owned);
+    REQUIRE(hir);
+    std::unique_ptr<HirModule> hir_owned(hir.value());
+    REQUIRE(hir_owned->has_listener);
+    CHECK_EQ(hir_owned->listener.port, 0u);
+    REQUIRE_EQ(hir_owned->strict_local_response_policies.len, 1u);
+    CHECK_EQ(hir_owned->unmatched_policy_ids[kRouteMethodOptions], 1u);
+    REQUIRE_EQ(hir_owned->routes.len, 1u);
+
+    auto mir = build_mir(*hir_owned);
+    REQUIRE(mir);
+    std::unique_ptr<MirModule> mir_owned(mir.value());
+    REQUIRE_EQ(mir_owned->strict_local_response_policies.len, 1u);
+    CHECK_EQ(mir_owned->unmatched_policy_ids[kRouteMethodOptions], 1u);
+
+    struct CompilerResources {
+        FrontendRirModule rir{};
+        jit::JitEngine engine{};
+        bool engine_ready = false;
+        ~CompilerResources() {
+            if (engine_ready) engine.shutdown();
+            rir.destroy();
+        }
+    } resources;
+    REQUIRE(lower_to_rir(*mir_owned, resources.rir));
+    const auto& module = resources.rir.module;
+    REQUIRE(rir::verify_module(module).ok);
+    REQUIRE_EQ(module.func_count, 1u);
+    CHECK_EQ(module.functions[0].http_method, kRouteMethodAny);
+    REQUIRE(module.functions[0].route_pattern.eq({"/", 1}));
+    REQUIRE_EQ(module.upstream_count, 1u);
+    REQUIRE_EQ(module.strict_local_response_policy_count, 1u);
+    CHECK_EQ(module.unmatched_policy_ids[kRouteMethodOptions], 1u);
+    const auto& rir_policy = module.strict_local_response_policies[0];
+    CHECK_EQ(rir_policy.version, StrictLocalResponseVersion::Http11);
+    CHECK_EQ(rir_policy.status_code, 400u);
+    CHECK_EQ(rir_policy.date, StrictLocalResponseDate::Current);
+    CHECK_EQ(rir_policy.connection, StrictLocalResponseConnection::Request);
+    CHECK_EQ(rir_policy.head_mode, StrictLocalResponseHeadMode::Reject);
+    CHECK(rir_policy.reason.eq({"Bad Request", 11}));
+    CHECK(rir_policy.server.eq({"nginx/1.29.7", 12}));
+    CHECK(rir_policy.content_type.eq({"text/html", 9}));
+    CHECK(rir_policy.body.eq({kBody, sizeof(kBody) - 1u}));
+
+    auto cg = jit::codegen(module);
+    REQUIRE(cg.ok);
+    REQUIRE(resources.engine.init());
+    resources.engine_ready = true;
+    REQUIRE(resources.engine.compile(cg.mod, cg.ctx));
+    RouteConfig cfg{};
+    REQUIRE(populate_route_config(cfg, module));
+    REQUIRE(register_jit_routes(cfg, module, resources.engine));
+    REQUIRE_EQ(cfg.upstream_count, 1u);
+    REQUIRE_EQ(cfg.route_count, 1u);
+    CHECK_EQ(cfg.routes[0].method, kRouteMethodAny);
+    CHECK_EQ(cfg.routes[0].action, RouteAction::JitHandler);
+    CHECK_NE(cfg.routes[0].fn, nullptr);
+    REQUIRE_EQ(cfg.strict_local_response_policy_count, 1u);
+    REQUIRE_EQ(cfg.unmatched_policy_ids[kRouteMethodOptions], 1u);
+    REQUIRE(cfg.unmatched_policy_table_is_valid());
+    REQUIRE(cfg.strict_local_response_policy_id_is_owned(1u));
+    const auto& cfg_policy = cfg.strict_local_response_policies[0];
+    CHECK(cfg_policy.body.eq({kBody, sizeof(kBody) - 1u}));
+    CHECK_NE(cfg_policy.body.ptr, rir_policy.body.ptr);
+
+    ListenerSpec declared_listener{};
+    declared_listener.port = hir_owned->listener.port;
+    ListenerContext listener_context{};
+    auto listen_result =
+        bind_listener_shard(declared_listener, declared_listener.port, nullptr, &listener_context);
+    REQUIRE(listen_result.has_value());
+    i32 listen_fd = listen_result.value();
+    REQUIRE(listener_context.valid());
+    REQUIRE_NE(listener_context.port, 0u);
+
+    Shard<IoUringEventLoop> shard;
+    struct ShardGuard {
+        Shard<IoUringEventLoop>& shard;
+        i32& listen_fd;
+        bool spawned = false;
+        ~ShardGuard() {
+            if (spawned) {
+                shard.stop();
+                shard.join();
+            }
+            shard.shutdown();
+            if (listen_fd >= 0) close(listen_fd);
+        }
+    } shard_guard{shard, listen_fd};
+    REQUIRE(shard.init(0, listen_fd).has_value());
+    shard.route_config = &cfg;
+    REQUIRE(shard.loop != nullptr);
+    shard.loop->listener_context = listener_context;
+    REQUIRE(shard.spawn(-1).has_value());
+    shard_guard.spawned = true;
+    usleep(50000);
+
+    struct ClientGuard {
+        i32 fd = -1;
+        ~ClientGuard() {
+            if (fd >= 0) close(fd);
+        }
+    } client{connect_to(listener_context.port)};
+    REQUIRE_GE(client.fd, 0);
+    set_socket_timeouts(client.fd, 4);
+    static constexpr char kRequest[] =
+        "OPTIONS * HTTP/1.1\r\n"
+        "Host: options-star-client.example\r\n"
+        "Connection: close\r\n\r\n";
+    REQUIRE(send_all(client.fd, kRequest, sizeof(kRequest) - 1u));
+
+    char response[1024]{};
+    u32 response_len = 0;
+    // This observes the complete response and real peer EOF while both the
+    // production shard and recorder remain live; cleanup cannot create either
+    // the downstream terminal event or the zero-upstream observation window.
+    REQUIRE(read_public_close_response(
+        client.fd, sizeof(kBody) - 1u, response, sizeof(response), response_len));
+    REQUIRE_EQ(response_len, sizeof(kExpectedNormalized) - 1u);
+    REQUIRE(normalize_public_date(response, response_len));
+    CHECK_EQ(memcmp(response, kExpectedNormalized, response_len), 0);
+
+    // Keep both actors available long enough to expose a delayed route,
+    // connect, or send side effect, then join them before inspecting recorder
+    // history or the shard's single-writer counters.
+    usleep(500000);
+    shard.stop();
+    shard.join();
+    shard_guard.spawned = false;
+    backend.teardown();
+
+    CHECK_EQ(shard.shard_metrics.connections_total, 1u);
+    CHECK_EQ(shard.shard_metrics.connections_active, 0u);
+    CHECK_EQ(shard.shard_metrics.connections_closed, 1u);
+    CHECK_EQ(shard.shard_metrics.requests_total, 1u);
+    CHECK_EQ(shard.shard_metrics.requests_active, 0u);
+    REQUIRE_EQ(backend.accepted_count.load(std::memory_order_acquire), 0u);
+    REQUIRE_EQ(backend.request_count.load(std::memory_order_acquire), 0u);
+    CHECK_EQ(backend.request_len, 0u);
+    CHECK_EQ(backend.request_header_len, 0u);
+    CHECK_EQ(backend.request_body_len, 0u);
+    for (u32 slot = 0; slot < RecordingUpstream::kMaxRecordedRequests; slot++) {
+        CHECK_EQ(backend.request_history_len[slot], 0u);
+        CHECK_EQ(backend.request_history_header_len[slot], 0u);
+        CHECK_EQ(backend.request_recorded_ns[slot].load(std::memory_order_acquire), 0u);
+        bool empty = true;
+        for (u32 i = 0; empty && i < RecordingUpstream::kRequestCapacity; i++)
+            empty = backend.request_history[slot][i] == '\0';
+        CHECK(empty);
+    }
+}
+
 TEST(shard, serves_http2_jit_target_transform_initial_fails_closed) {
     H2TargetTransformJit compiled;
     REQUIRE(compiled.init(/*with_timer=*/false));
