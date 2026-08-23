@@ -263,6 +263,20 @@ static u64 response_buffering_runtime_handler(void*, jit::HandlerCtx*, const u8*
     return jit::HandlerResult::make_forward_with_bundle(0, 0, 2).pack();
 }
 
+static u64 response_buffering_request_policy_runtime_handler(
+    void*, jit::HandlerCtx*, const u8*, u32, void*) {
+    ++response_buffering_runtime_handler_calls;
+    return jit::HandlerResult::make_forward_with_bundle(
+               0, static_cast<u16>(RequestPolicyId::Http11FixedStrip), 2)
+        .pack();
+}
+
+static u64 response_buffering_forged_request_policy_runtime_handler(
+    void*, jit::HandlerCtx*, const u8*, u32, void*) {
+    ++response_buffering_runtime_handler_calls;
+    return jit::HandlerResult::make_forward_with_bundle(0, 2, 2).pack();
+}
+
 static u32 response_read_deadline_fixed_upload_handler_calls = 0;
 static u64 response_read_deadline_fixed_upload_handler(
     void*, jit::HandlerCtx*, const u8*, u32, void*) {
@@ -19051,6 +19065,69 @@ bool stage_strict_read_timeout(IoUringEventLoop* loop,
                                             get_profile ? LogHttpMethod::Get : LogHttpMethod::Head);
 }
 
+bool stage_complete_buffering_prebuilt_d2(IoUringEventLoop* loop,
+                                          RouteConfig* config,
+                                          bool timeout_owner,
+                                          PrebuiltD2Fixture* out) {
+    if (loop == nullptr || config == nullptr || out == nullptr ||
+        !stage_strict_read_timeout(loop, config, nullptr, 0, out, true))
+        return false;
+    Connection& conn = *out->conn;
+    conn.request_policy_id = static_cast<u16>(RequestPolicyId::Http11FixedStrip);
+    conn.response_read_deadline_upload.request_policy_id =
+        static_cast<u16>(RequestPolicyId::Http11FixedStrip);
+    if (!arm_staged_response_read_deadline(loop, *out)) return false;
+
+    HttpResponseParser parser;
+    ParsedResponse response;
+    parser.reset();
+    response.reset();
+    if (timeout_owner) {
+        u8 wire[SlicePool::kSliceSize]{};
+        u32 wire_len = 0;
+        if (!build_timeout_failure_policy_response(
+                conn, *config, false, wire, sizeof(wire), &wire_len) ||
+            wire_len == 0)
+            return false;
+        conn.response_header_buf.reset();
+        if (conn.response_header_buf.write(wire, wire_len) != wire_len ||
+            parser.parse(conn.response_header_buf.data(), wire_len, &response) !=
+                ParseStatus::Complete)
+            return false;
+        conn.resp_status = config->failure_policies[conn.timeout_failure_policy_id - 1].status_code;
+    } else {
+        static constexpr u8 kOrigin[] = "HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n";
+        if (parser.parse(kOrigin, sizeof(kOrigin) - 1u, &response) != ParseStatus::Complete)
+            return false;
+        conn.resp_status = 200;
+        if (!build_strict_response_headers(conn, *config, response)) return false;
+        parser.reset();
+        response.reset();
+        if (parser.parse(conn.response_header_buf.data(),
+                         conn.response_header_buf.len(),
+                         &response) != ParseStatus::Complete)
+            return false;
+    }
+
+    conn.http1_prebuilt_response_layout = Http1PrebuiltResponseLayout::FullContentLengthNonHead;
+    conn.http1_prebuilt_response_purpose =
+        timeout_owner ? Http1PrebuiltResponsePurpose::ResponseReadTimeout
+                      : Http1PrebuiltResponsePurpose::StrictNonHeadCl0Success;
+    conn.http1_prebuilt_deadline_profile = conn.response_read_deadline_profile;
+    conn.http1_prebuilt_deadline_method = conn.response_read_deadline_method;
+    conn.http1_prebuilt_deadline_route_method = conn.response_read_deadline_route_method;
+    conn.http1_prebuilt_deadline_generation = conn.response_read_deadline_generation;
+    conn.http1_prebuilt_deadline_bundle_id = conn.response_read_deadline_bundle_id;
+    conn.http1_prebuilt_deadline_config = config;
+    conn.http1_prebuilt_deadline_upload = conn.response_read_deadline_upload;
+    conn.http1_prebuilt_header_end = parser.header_end;
+    conn.http1_prebuilt_total_len = conn.response_header_buf.len();
+    conn.http1_prebuilt_body_len = conn.http1_prebuilt_total_len - parser.header_end;
+    conn.http1_prebuilt_status = conn.resp_status;
+    loop->disarm_response_read_deadline(conn);
+    return true;
+}
+
 bool stage_strict_parse_failure(IoUringEventLoop* loop,
                                 const RouteConfig* request_config,
                                 const u8* origin,
@@ -23064,8 +23141,11 @@ TEST(response_buffering_runtime,
     REQUIRE(config.add_upstream("backend", 0x7F000001, 9000).has_value());
     REQUIRE(add_bodyless_non_head_response_read_deadline_bundle(
         config, 5, ForwardResponseBufferingMode::CompleteContentLength));
-    REQUIRE(config.add_jit_handler(
-        "/buffered", kRouteMethodGet, &response_buffering_runtime_handler, false, 2));
+    REQUIRE(config.add_jit_handler("/buffered",
+                                   kRouteMethodGet,
+                                   &response_buffering_request_policy_runtime_handler,
+                                   false,
+                                   2));
     const RouteConfig* active = &config;
     loop->config_ptr = &active;
     Connection* conn = loop->alloc_conn();
@@ -23086,8 +23166,186 @@ TEST(response_buffering_runtime,
     CHECK_EQ(conn->response_read_deadline_state, ResponseReadDeadlineState::Validated);
     CHECK_EQ(conn->response_read_deadline_buffering,
              ForwardResponseBufferingMode::CompleteContentLength);
+    CHECK_EQ(conn->request_policy_id, static_cast<u16>(RequestPolicyId::Http11FixedStrip));
+    CHECK_EQ(conn->response_read_deadline_upload.request_policy_id,
+             static_cast<u16>(RequestPolicyId::Http11FixedStrip));
+    CHECK(buf_has(conn->recv_buf.data(), conn->recv_buf.len(), "Host: 127.0.0.1:9000\r\n"));
+    CHECK_FALSE(buf_has(conn->recv_buf.data(), conn->recv_buf.len(), "client.example"));
+    CHECK(conn->response_header_buf.data() != nullptr);
     CHECK_EQ(loop->backend.send_state[conn->id].remaining, 0u);
     loop->close_conn(*conn);
+    close(downstream[1]);
+}
+
+TEST(response_buffering_d2,
+     configured_timeout_rejects_stale_or_forged_request_policy_before_downstream_send) {
+    for (const u8 mutation : {static_cast<u8>(0), static_cast<u8>(1), static_cast<u8>(2)}) {
+        ScopedIoUringLoopForRetirement guard;
+        if (!guard.init()) SKIP("io_uring unavailable");
+        auto* loop = guard.loop;
+        RouteConfig config{};
+        REQUIRE(config.add_upstream("backend", 0x7F000001, 9000).has_value());
+        REQUIRE(add_bodyless_non_head_response_read_deadline_bundle(
+            config, 5, ForwardResponseBufferingMode::CompleteContentLength));
+        PrebuiltD2Fixture fixture{};
+        REQUIRE(
+            stage_complete_buffering_prebuilt_d2(loop, &config, /*timeout_owner=*/true, &fixture));
+        Connection& conn = *fixture.conn;
+        REQUIRE_EQ(conn.http1_prebuilt_response_purpose,
+                   Http1PrebuiltResponsePurpose::ResponseReadTimeout);
+        if (mutation == 2)
+            conn.http1_prebuilt_deadline_upload.request_policy_id = 0;
+        else if (mutation == 1)
+            conn.request_policy_id = 2;
+        const u32 id = conn.id;
+        const i32 upstream_fd = conn.upstream_fd;
+        const u32 episode = conn.upstream_episode;
+        const u32 pending = conn.pending_ops;
+        const u32 sq_tail = __atomic_load_n(loop->backend.sq_tail, __ATOMIC_ACQUIRE);
+        const bool began = loop->begin_prebuilt_http1_response(
+            conn, kUpstreamOpRecv, Http1RequestBufferDisposition::ExistingPipeline, 0);
+        if (mutation == 0) {
+            REQUIRE(began);
+            CHECK_GT(loop->backend.send_state[id].remaining, 0u);
+            cleanup_prebuilt_d2(loop, fixture);
+            continue;
+        }
+        CHECK_FALSE(began);
+        CHECK_EQ(conn.upstream_fd, upstream_fd);
+        CHECK_EQ(conn.upstream_episode, episode);
+        CHECK_EQ(conn.pending_ops, pending);
+        CHECK(conn.upstream_recv_armed);
+        CHECK_FALSE(conn.upstream_abandoned);
+        CHECK_EQ(conn.http1_prebuilt_disposition, Http1RequestBufferDisposition::None);
+        CHECK_EQ(conn.http1_prebuilt_wait, 0u);
+        CHECK_EQ(loop->backend.send_state[id].remaining, 0u);
+        CHECK_EQ(loop->backend.upstream_send_state[id].remaining, 0u);
+        CHECK_EQ(__atomic_load_n(loop->backend.sq_tail, __ATOMIC_ACQUIRE), sq_tail);
+        u8 downstream = 0;
+        errno = 0;
+        CHECK_EQ(recv(fixture.peer_fd, &downstream, 1, MSG_DONTWAIT), -1);
+        CHECK(errno == EAGAIN || errno == EWOULDBLOCK);
+        cleanup_prebuilt_d2(loop, fixture);
+    }
+}
+
+TEST(response_buffering_d2,
+     cl0_success_rejects_stale_or_forged_request_policy_before_downstream_send) {
+    for (const u8 mutation : {static_cast<u8>(0), static_cast<u8>(1), static_cast<u8>(2)}) {
+        ScopedIoUringLoopForRetirement guard;
+        if (!guard.init()) SKIP("io_uring unavailable");
+        auto* loop = guard.loop;
+        RouteConfig config{};
+        REQUIRE(config.add_upstream("backend", 0x7F000001, 9000).has_value());
+        REQUIRE(add_bodyless_non_head_response_read_deadline_bundle(
+            config, 5, ForwardResponseBufferingMode::CompleteContentLength));
+        PrebuiltD2Fixture fixture{};
+        REQUIRE(
+            stage_complete_buffering_prebuilt_d2(loop, &config, /*timeout_owner=*/false, &fixture));
+        Connection& conn = *fixture.conn;
+        REQUIRE_EQ(conn.http1_prebuilt_response_purpose,
+                   Http1PrebuiltResponsePurpose::StrictNonHeadCl0Success);
+        if (mutation == 2)
+            conn.http1_prebuilt_deadline_upload.request_policy_id = 0;
+        else if (mutation == 1)
+            conn.request_policy_id = 2;
+        const u32 id = conn.id;
+        const i32 upstream_fd = conn.upstream_fd;
+        const u32 episode = conn.upstream_episode;
+        const u32 pending = conn.pending_ops;
+        const u32 sq_tail = __atomic_load_n(loop->backend.sq_tail, __ATOMIC_ACQUIRE);
+        const bool began = loop->begin_prebuilt_http1_response(
+            conn, kUpstreamOpRecv, Http1RequestBufferDisposition::ExistingPipeline, 0);
+        if (mutation == 0) {
+            REQUIRE(began);
+            CHECK_GT(loop->backend.send_state[id].remaining, 0u);
+            cleanup_prebuilt_d2(loop, fixture);
+            continue;
+        }
+        CHECK_FALSE(began);
+        CHECK_EQ(conn.upstream_fd, upstream_fd);
+        CHECK_EQ(conn.upstream_episode, episode);
+        CHECK_EQ(conn.pending_ops, pending);
+        CHECK(conn.upstream_recv_armed);
+        CHECK_FALSE(conn.upstream_abandoned);
+        CHECK_EQ(conn.http1_prebuilt_disposition, Http1RequestBufferDisposition::None);
+        CHECK_EQ(conn.http1_prebuilt_wait, 0u);
+        CHECK_EQ(loop->backend.send_state[id].remaining, 0u);
+        CHECK_EQ(loop->backend.upstream_send_state[id].remaining, 0u);
+        CHECK_EQ(__atomic_load_n(loop->backend.sq_tail, __ATOMIC_ACQUIRE), sq_tail);
+        u8 downstream = 0;
+        errno = 0;
+        CHECK_EQ(recv(fixture.peer_fd, &downstream, 1, MSG_DONTWAIT), -1);
+        CHECK(errno == EAGAIN || errno == EWOULDBLOCK);
+        cleanup_prebuilt_d2(loop, fixture);
+    }
+}
+
+TEST(response_buffering_runtime,
+     forged_request_policy_rejects_before_rewrite_allocation_or_upstream_effect) {
+    ScopedIoUringLoopForRetirement guard;
+    if (!guard.init()) SKIP("io_uring unavailable");
+    auto* loop = guard.loop;
+    RouteConfig config{};
+    REQUIRE(config.add_upstream("backend", 0x7F000001, 9000).has_value());
+    REQUIRE(add_bodyless_non_head_response_read_deadline_bundle(
+        config, 5, ForwardResponseBufferingMode::CompleteContentLength));
+    REQUIRE(config.add_jit_handler("/buffered",
+                                   kRouteMethodGet,
+                                   &response_buffering_forged_request_policy_runtime_handler,
+                                   false,
+                                   2));
+    const RouteConfig* active = &config;
+    loop->config_ptr = &active;
+    Connection* conn = loop->alloc_conn();
+    REQUIRE(conn != nullptr);
+    const u32 id = conn->id;
+    i32 downstream[2] = {-1, -1};
+    REQUIRE_EQ(socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, downstream), 0);
+    conn->fd = downstream[0];
+    static constexpr u8 kRequest[] = "GET /buffered HTTP/1.1\r\nHost: client.example\r\n\r\n";
+    REQUIRE_EQ(conn->recv_buf.write(kRequest, sizeof(kRequest) - 1u), sizeof(kRequest) - 1u);
+    response_buffering_runtime_handler_calls = 0;
+    on_header_received<IoUringEventLoop>(
+        loop, *conn, {id, static_cast<i32>(sizeof(kRequest) - 1u), 0, 0, IoEventType::Recv, 1});
+    CHECK_EQ(response_buffering_runtime_handler_calls, 1u);
+    CHECK_EQ(loop->conns[id].fd, -1);
+    CHECK_EQ(loop->backend.upstream_send_state[id].remaining, 0u);
+    CHECK_EQ(loop->backend.send_state[id].remaining, 0u);
+    CHECK_EQ(loop->conns[id].response_header_buf.len(), 0u);
+    close(downstream[1]);
+}
+
+TEST(response_buffering_runtime,
+     stale_nonzero_preflight_request_policy_state_fails_closed_before_handler) {
+    ScopedIoUringLoopForRetirement guard;
+    if (!guard.init()) SKIP("io_uring unavailable");
+    auto* loop = guard.loop;
+    RouteConfig config{};
+    REQUIRE(config.add_upstream("backend", 0x7F000001, 9000).has_value());
+    REQUIRE(add_bodyless_non_head_response_read_deadline_bundle(
+        config, 5, ForwardResponseBufferingMode::CompleteContentLength));
+    REQUIRE(config.add_jit_handler(
+        "/buffered", kRouteMethodGet, &response_buffering_runtime_handler, false, 2));
+    Connection* conn = loop->alloc_conn();
+    REQUIRE(conn != nullptr);
+    const u32 id = conn->id;
+    i32 downstream[2] = {-1, -1};
+    REQUIRE_EQ(socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, downstream), 0);
+    conn->fd = downstream[0];
+    static constexpr u8 kRequest[] = "GET /buffered HTTP/1.1\r\nHost: client.example\r\n\r\n";
+    REQUIRE_EQ(conn->recv_buf.write(kRequest, sizeof(kRequest) - 1u), sizeof(kRequest) - 1u);
+    capture_request_metadata(*conn);
+    conn->req_initial_send_len = conn->recv_buf.len();
+    conn->request_config = &config;
+    conn->request_policy_id = static_cast<u16>(RequestPolicyId::Http11FixedStrip);
+    response_buffering_runtime_handler_calls = 0;
+    REQUIRE_FALSE(
+        prepare_response_read_deadline_preflight(loop, *conn, &config.routes[0], &config));
+    CHECK_EQ(response_buffering_runtime_handler_calls, 0u);
+    CHECK_EQ(loop->conns[id].fd, -1);
+    CHECK_EQ(loop->backend.upstream_send_state[id].remaining, 0u);
+    CHECK_EQ(loop->backend.send_state[id].remaining, 0u);
     close(downstream[1]);
 }
 
@@ -23137,6 +23395,57 @@ TEST(response_buffering_runtime,
 }
 
 TEST(response_buffering_runtime,
+     forged_or_stale_request_policy_identity_fails_owner_and_post_commit_closed) {
+    for (const bool forge_after_commit : {false, true}) {
+        ScopedIoUringLoopForRetirement guard;
+        if (!guard.init()) SKIP("io_uring unavailable");
+        auto* loop = guard.loop;
+        RouteConfig config{};
+        REQUIRE(config.add_upstream("backend", 0x7F000001, 9000).has_value());
+        REQUIRE(add_bodyless_non_head_response_read_deadline_bundle(
+            config, 5, ForwardResponseBufferingMode::CompleteContentLength));
+        PrebuiltD2Fixture fixture{};
+        REQUIRE(stage_strict_read_timeout(loop, &config, nullptr, 0, &fixture, true));
+        Connection& conn = *fixture.conn;
+        conn.request_policy_id = static_cast<u16>(RequestPolicyId::Http11FixedStrip);
+        conn.response_read_deadline_upload.request_policy_id =
+            static_cast<u16>(RequestPolicyId::Http11FixedStrip);
+        REQUIRE(arm_staged_response_read_deadline(loop, fixture));
+        const u32 id = conn.id;
+        static constexpr u8 kPartial[] = "HTTP/1.1 200 OK\r\nContent-Length: 4\r\n\r\na";
+        REQUIRE_EQ(conn.upstream_recv_buf.write(kPartial, sizeof(kPartial) - 1u),
+                   sizeof(kPartial) - 1u);
+        const IoEvent partial =
+            response_read_copy_event(conn, sizeof(kPartial) - 1u, true, 0, sizeof(kPartial) - 1u);
+        if (!forge_after_commit) {
+            conn.request_policy_id = 2;
+            conn.response_read_deadline_upload.request_policy_id = 2;
+            CHECK_FALSE(response_read_deadline_owner_is_stable(
+                conn,
+                &on_upstream_response<IoUringEventLoop>,
+                ResponseReadDeadlineOwnerPhase::ArmedForCopy));
+            loop->dispatch_batch(&partial, 1);
+        } else {
+            loop->dispatch_batch(&partial, 1);
+            REQUIRE_EQ(conn.response_read_deadline_post_commit_phase,
+                       ResponseReadDeadlinePostCommitPhase::Buffering);
+            REQUIRE(response_read_deadline_post_commit_is_stable(conn));
+            conn.response_read_deadline_upload.request_policy_id = 0;
+            CHECK_FALSE(response_read_deadline_post_commit_is_stable(conn));
+            const u32 begin = conn.upstream_recv_buf.len();
+            static constexpr u8 kNext[] = {'b'};
+            REQUIRE_EQ(conn.upstream_recv_buf.write(kNext, sizeof(kNext)), sizeof(kNext));
+            const IoEvent next = response_read_copy_event(
+                conn, sizeof(kNext), true, begin, conn.upstream_recv_buf.len());
+            loop->dispatch_batch(&next, 1);
+        }
+        CHECK_EQ(loop->conns[id].fd, -1);
+        CHECK_EQ(loop->backend.send_state[id].remaining, 0u);
+        release_closed_response_read_fixture(fixture);
+    }
+}
+
+TEST(response_buffering_runtime,
      complete_content_length_stays_quiet_until_full_body_then_drains_header_and_body) {
     ScopedIoUringLoopForRetirement guard;
     if (!guard.init()) SKIP("io_uring unavailable");
@@ -23162,8 +23471,11 @@ TEST(response_buffering_runtime,
     loop->metrics = &metrics;
     PrebuiltD2Fixture fixture{};
     REQUIRE(stage_strict_read_timeout(loop, &old_config, nullptr, 0, &fixture, true));
-    REQUIRE(arm_staged_response_read_deadline(loop, fixture));
     Connection& conn = *fixture.conn;
+    conn.request_policy_id = static_cast<u16>(RequestPolicyId::Http11FixedStrip);
+    conn.response_read_deadline_upload.request_policy_id =
+        static_cast<u16>(RequestPolicyId::Http11FixedStrip);
+    REQUIRE(arm_staged_response_read_deadline(loop, fixture));
     static constexpr u8 kFirst[] = "HTTP/1.1 200 OK\r\nContent-Length: 4\r\n\r\nab";
     REQUIRE_EQ(conn.upstream_recv_buf.write(kFirst, sizeof(kFirst) - 1u), sizeof(kFirst) - 1u);
     const IoEvent first =
@@ -23213,6 +23525,8 @@ TEST(response_buffering_runtime,
         loop, conn, kRequest2, sizeof(kRequest2) - 1u, sizeof(kRequest2) - 1u, true, &request2));
     loop->dispatch(request2);
     REQUIRE_EQ(conn.request_config, &current_config);
+    CHECK_EQ(conn.request_policy_id, 0u);
+    CHECK_EQ(conn.response_read_deadline_upload.request_policy_id, 0u);
     REQUIRE_NE(conn.upstream_episode, retired_episode);
     const u32 request2_episode = conn.upstream_episode;
     REQUIRE(conn.upstream_connect_armed);

@@ -1124,7 +1124,10 @@ inline VerifyResult verify_module(const Module& mod, VerifyOptions options = {})
                 const auto buffering = mod.policy_bundles[bundle_id - 1].response_buffering;
                 if (buffering != ForwardResponseBufferingMode::None &&
                     (buffering != ForwardResponseBufferingMode::CompleteContentLength ||
-                     fn.http_method != kRouteMethodGet || request_policy != 0))
+                     fn.http_method != kRouteMethodGet || request_policy < 0 ||
+                     request_policy > 0xffff ||
+                     !complete_content_length_request_policy_is_admitted(
+                         static_cast<u16>(request_policy))))
                     return verify_fail(
                         summary, VerifyIssueCode::InvalidForwardPreflight, fi, bi, ii);
                 if (sole_timeout_ret != nullptr || !has_preflight || bundle_id != preflight_id)

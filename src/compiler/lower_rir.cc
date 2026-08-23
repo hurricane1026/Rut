@@ -3102,8 +3102,9 @@ static FrontendResult<void> emit_term(const MirTerminator& term,
             if (term.forward_response_buffering !=
                     ForwardResponseBufferingMode::CompleteContentLength ||
                 term.forward_response_read_timeout_seconds == 0 ||
-                term.forward_request_policy_id != 0 || term.forward_response_policy_id == 0 ||
-                term.forward_failure_policy_id == 0 ||
+                !complete_content_length_request_policy_is_admitted(
+                    term.forward_request_policy_id) ||
+                term.forward_response_policy_id == 0 || term.forward_failure_policy_id == 0 ||
                 term.forward_timeout_failure_policy_id == 0 ||
                 term.forward_response_policy_id > b.mod->response_policy_count ||
                 term.forward_failure_policy_id > b.mod->failure_policy_count ||
@@ -3922,7 +3923,8 @@ FrontendResult<void> lower_to_rir(const MirModule& mir, FrontendRirModule& out) 
                 !timeout_term->has_forward_target_transform &&
                 !timeout_term->commit_response_mutations &&
                 (!complete_buffering || (function.method == kRouteMethodGet &&
-                                         timeout_term->forward_request_policy_id == 0));
+                                         complete_content_length_request_policy_is_admitted(
+                                             timeout_term->forward_request_policy_id)));
             if (!canonical) {
                 out.destroy();
                 return frontend_error(

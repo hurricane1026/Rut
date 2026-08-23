@@ -9734,6 +9734,11 @@ static FrontendResult<HirTerminator> analyze_term(const AstStatement& stmt, cons
     const ForwardResponsePolicySpec* response_policy = nullptr;
     const ForwardFailurePolicySpec* failure_policy = nullptr;
     const ForwardFailurePolicySpec* timeout_failure_policy = nullptr;
+    if (stmt.has_forward_request_policy != (stmt.forward_request_policy_id != 0) ||
+        (stmt.has_forward_request_policy &&
+         !request_policy_is_supported(stmt.forward_request_policy_id)))
+        return frontend_error(
+            FrontendError::UnsupportedSyntax, stmt.span, lit_str("invalid request policy"));
     if (stmt.has_forward_response_policy) {
         if (stmt.forward_response_policy_id == 0 ||
             stmt.forward_response_policy_id > mod.response_policies.len)
@@ -9786,7 +9791,7 @@ static FrontendResult<HirTerminator> analyze_term(const AstStatement& stmt, cons
     if (has_response_buffering &&
         (!stmt.has_forward_response_read_timeout || response_policy == nullptr ||
          failure_policy == nullptr || timeout_failure_policy == nullptr ||
-         stmt.has_forward_request_policy ||
+         !complete_content_length_request_policy_is_admitted(stmt.forward_request_policy_id) ||
          !complete_content_length_buffering_policies_valid(
              *response_policy, *failure_policy, *timeout_failure_policy)))
         return frontend_error(
@@ -19045,8 +19050,9 @@ static FrontendResult<HirModule*> analyze_file_internal(
                 route.throttle_down_bps == 0 && direct.forward_set_path.ptr == nullptr &&
                 direct.forward_set_headers.len == 0 && !direct.has_forward_target_transform &&
                 !direct.commit_response_mutations &&
-                (!complete_buffering ||
-                 (route.method == kRouteMethodGet && direct.forward_request_policy_id == 0));
+                (!complete_buffering || (route.method == kRouteMethodGet &&
+                                         complete_content_length_request_policy_is_admitted(
+                                             direct.forward_request_policy_id)));
             if (!canonical)
                 return frontend_error(
                     FrontendError::UnsupportedSyntax,

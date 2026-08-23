@@ -732,7 +732,8 @@ bool prepare_response_read_deadline_preflight(Loop* loop,
             (complete_buffering &&
              (profile != ResponseReadDeadlineProfile::BodylessNonHeadContentLengthZero ||
               conn.req_method != static_cast<u8>(LogHttpMethod::Get) ||
-              route->method != kRouteMethodGet ||
+              route->method != kRouteMethodGet || conn.request_policy_id != 0 ||
+              conn.request_policy_body_pending || conn.pending_forward_request_policy_id != 0 ||
               !complete_content_length_buffering_policies_valid(response, failure, timeout))) ||
             !response_read_deadline_route_method_matches(conn.req_method, route->method) ||
             conn.pipeline_depth != 0 || conn.recv_buf.len() != conn.req_initial_send_len ||
@@ -2550,6 +2551,8 @@ void handle_jit_outcome(
                 outcome.response_read_timeout_seconds = bundle.response_read_timeout_seconds;
                 forward_response_buffering = bundle.response_buffering;
             }
+            const bool complete_content_length_buffering =
+                forward_response_buffering == ForwardResponseBufferingMode::CompleteContentLength;
             if (outcome.response_read_timeout_seconds != 0) {
                 const bool loop_supports_deadline = [] {
                     if constexpr (requires { Loop::kSupportsExplicitFirstResponseDeadline; })
@@ -2588,12 +2591,16 @@ void handle_jit_outcome(
                      fn == nullptr && !conn.request_policy_body_pending &&
                      request_body_state == RequestPolicyBodyState::Complete);
                 const bool request_policy_valid =
-                    fixed_upload ? outcome.request_policy_id != 0 &&
-                                       request_policy_is_supported(outcome.request_policy_id) &&
-                                       request_body_state != RequestPolicyBodyState::Invalid
-                                 : outcome.request_policy_id == 0 ||
-                                       (request_policy_is_supported(outcome.request_policy_id) &&
-                                        request_body_state == RequestPolicyBodyState::Complete);
+                    complete_content_length_buffering
+                        ? complete_content_length_request_policy_is_admitted(
+                              outcome.request_policy_id) &&
+                              request_body_state == RequestPolicyBodyState::Complete
+                    : fixed_upload ? outcome.request_policy_id != 0 &&
+                                         request_policy_is_supported(outcome.request_policy_id) &&
+                                         request_body_state != RequestPolicyBodyState::Invalid
+                                   : outcome.request_policy_id == 0 ||
+                                         (request_policy_is_supported(outcome.request_policy_id) &&
+                                          request_body_state == RequestPolicyBodyState::Complete);
                 if (!loop_supports_deadline || !deadline_phase_valid ||
                     conn.response_read_deadline_owner_generation == 0 ||
                     conn.response_read_deadline_owner_generation !=
@@ -2635,6 +2642,13 @@ void handle_jit_outcome(
                         return;
                     }
                     proof.upstream_id = outcome.upstream_id;
+                    proof.request_policy_id = outcome.request_policy_id;
+                } else if (complete_content_length_buffering) {
+                    auto& proof = conn.response_read_deadline_upload;
+                    if (proof.request_policy_id != 0) {
+                        loop->close_conn(conn);
+                        return;
+                    }
                     proof.request_policy_id = outcome.request_policy_id;
                 }
                 conn.response_read_deadline_state = ResponseReadDeadlineState::Validated;
@@ -2810,7 +2824,10 @@ void handle_jit_outcome(
             // endpoint; never emit a Host for an endpoint that may differ on
             // retry.
             if (outcome.request_policy_id != 0 &&
-                (!request_policy_is_supported(outcome.request_policy_id) ||
+                (!(complete_content_length_buffering
+                       ? complete_content_length_request_policy_is_admitted(
+                             outcome.request_policy_id)
+                       : request_policy_is_supported(outcome.request_policy_id)) ||
                  target.addr_count != 1 || conn.resp_header_mutation_count != 0 ||
                  conn.resp_header_mutation_pending_count != 0 ||
                  conn.resp_header_mutation_pending_overflow || conn.resp_header_mutation_overflow ||
@@ -7598,6 +7615,9 @@ void on_upstream_response(void* lp, Connection& conn, IoEvent ev) {
                 conn.timeout_failure_policy_id &&
             config->policy_bundles[explicit_bundle_id - 1].response_buffering ==
                 explicit_buffering &&
+            (explicit_buffering != ForwardResponseBufferingMode::CompleteContentLength ||
+             (complete_content_length_request_policy_is_admitted(conn.request_policy_id) &&
+              explicit_upload.request_policy_id == conn.request_policy_id)) &&
             response_read_timeout_seconds_valid(
                 config->policy_bundles[explicit_bundle_id - 1].response_read_timeout_seconds) &&
             explicit_method == conn.req_method &&

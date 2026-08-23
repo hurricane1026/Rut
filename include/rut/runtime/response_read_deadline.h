@@ -1,5 +1,6 @@
 #pragma once
 
+#include "rut/common/request_policy.h"
 #include "rut/runtime/connection.h"
 #include "rut/runtime/http_parser.h"
 #include "rut/runtime/route_table.h"
@@ -103,6 +104,14 @@ inline bool response_read_deadline_upload_proof_equal(const ResponseReadDeadline
            a.route_fn == b.route_fn;
 }
 
+inline bool complete_content_length_request_policy_owner_is_stable(
+    const Connection& c, const ResponseReadDeadlineUploadProof& proof) {
+    if (c.response_read_deadline_buffering != ForwardResponseBufferingMode::CompleteContentLength)
+        return true;
+    return complete_content_length_request_policy_is_admitted(c.request_policy_id) &&
+           proof.request_policy_id == c.request_policy_id;
+}
+
 inline bool response_read_deadline_fixed_upload_materialization_is_stable(
     const Connection& c,
     const ResponseReadDeadlineUploadProof& proof,
@@ -198,6 +207,8 @@ inline bool response_read_deadline_owner_is_stable(const Connection& c,
         !cfg->response_policy_id_is_valid(bundle.response_policy_id) ||
         !cfg->failure_policy_id_is_valid(bundle.failure_policy_id) ||
         !cfg->timeout_failure_policy_id_is_valid(bundle.timeout_failure_policy_id))
+        return false;
+    if (!complete_content_length_request_policy_owner_is_stable(c, c.response_read_deadline_upload))
         return false;
     const auto& response = cfg->response_policies[bundle.response_policy_id - 1];
     const auto& failure = cfg->failure_policies[bundle.failure_policy_id - 1];
@@ -391,6 +402,8 @@ inline bool response_read_deadline_post_commit_is_stable(const Connection& c) {
         c.resp_header_mutation_pending_count != 0 || c.resp_header_mutation_pending_overflow ||
         c.resp_header_mutation_overflow || c.upstream_reused || c.upstream_attempts != 1 ||
         !c.request_upload_complete || c.upstream_request_incomplete)
+        return false;
+    if (!complete_content_length_request_policy_owner_is_stable(c, c.response_read_deadline_upload))
         return false;
     const auto& bundle = cfg->policy_bundles[bundle_id - 1];
     const bool complete_buffering =

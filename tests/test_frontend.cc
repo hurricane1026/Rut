@@ -33140,6 +33140,8 @@ TEST(frontend, response_buffering_parses_propagates_deduplicates_and_preserves_p
 upstream b at "127.0.0.1:9000"
 route GET "/one" {
     return forward(b,
+        request_policy: { version: "HTTP/1.1", host: "upstream", connection: "omit",
+            strip_headers: ["Connection", "Keep-Alive", "TE", "Expect", "Upgrade"] },
         response_policy: { version: "HTTP/1.1", framing: "content_length",
             connection: "request", server: "s", date: "current", hide_headers: [] },
         failure_policy: { version: "HTTP/1.1", status: 502, reason: "Bad Gateway",
@@ -33197,14 +33199,19 @@ route GET "/stream" {
     REQUIRE(hir);
     CHECK_EQ(hir->routes[0].control.direct_term.forward_response_buffering,
              ForwardResponseBufferingMode::CompleteContentLength);
+    CHECK_EQ(hir->routes[0].control.direct_term.forward_request_policy_id,
+             static_cast<u16>(RequestPolicyId::Http11FixedStrip));
     CHECK_EQ(hir->routes[1].control.direct_term.forward_response_buffering,
              ForwardResponseBufferingMode::CompleteContentLength);
+    CHECK_EQ(hir->routes[1].control.direct_term.forward_request_policy_id, 0u);
     CHECK_EQ(hir->routes[2].control.direct_term.forward_response_buffering,
              ForwardResponseBufferingMode::None);
     auto mir = build_mir_heap(hir.value());
     REQUIRE(mir);
     CHECK_EQ(mir->functions[0].blocks[0].term.forward_response_buffering,
              ForwardResponseBufferingMode::CompleteContentLength);
+    CHECK_EQ(mir->functions[0].blocks[0].term.forward_request_policy_id,
+             static_cast<u16>(RequestPolicyId::Http11FixedStrip));
     CHECK_EQ(mir->functions[1].blocks[0].term.forward_response_buffering,
              ForwardResponseBufferingMode::CompleteContentLength);
     CHECK_EQ(mir->functions[2].blocks[0].term.forward_response_buffering,
@@ -33220,14 +33227,29 @@ route GET "/stream" {
     CHECK_EQ(rir.module.policy_bundles[0].response_buffering,
              ForwardResponseBufferingMode::CompleteContentLength);
     CHECK_EQ(rir.module.policy_bundles[1].response_buffering, ForwardResponseBufferingMode::None);
+    const auto* policy_ret = find_first_op(rir.module.functions[0], rir::Opcode::RetForwardBundle);
+    REQUIRE(policy_ret != nullptr);
+    REQUIRE_EQ(policy_ret->operand_count, 3u);
+    const auto policy_value = policy_ret->operand(1);
+    REQUIRE_LT(policy_value.id, rir.module.functions[0].value_count);
+    const auto& policy_def = rir.module.functions[0].values[policy_value.id];
+    const auto& policy_const =
+        rir.module.functions[0].blocks[policy_def.def_block.id].insts[policy_def.def_inst];
+    REQUIRE_EQ(policy_const.op, rir::Opcode::ConstI32);
+    CHECK_EQ(policy_const.imm.i32_val, 1);
 
-    const auto packed = jit::HandlerResult::make_forward_with_bundle(7, 0, 1).pack();
+    const auto packed = jit::HandlerResult::make_forward_with_bundle(7, 1, 1).pack();
     static_assert(sizeof(packed) == sizeof(u64));
+    static_assert(sizeof(ForwardPolicyBundle) == 8);
     const auto unpacked = jit::HandlerResult::unpack(packed);
     CHECK_EQ(unpacked.action, jit::HandlerAction::ForwardBundle);
     CHECK_EQ(unpacked.upstream_id, 7u);
-    CHECK_EQ(unpacked.status_code, 0u);
+    CHECK_EQ(unpacked.status_code, 1u);
     CHECK_EQ(unpacked.next_state, 1u);
+    CHECK_EQ(
+        jit::HandlerResult::unpack(jit::HandlerResult::make_forward_with_bundle(7, 0, 1).pack())
+            .status_code,
+        0u);
     rir.destroy();
 }
 
@@ -33284,6 +33306,8 @@ TEST(frontend, response_buffering_rejects_bad_syntax_static_shapes_and_forgery) 
 upstream b
 route GET "/" {
     return forward(b,
+        request_policy: { version: "HTTP/1.1", host: "upstream", connection: "omit",
+            strip_headers: ["Connection", "Keep-Alive", "TE", "Expect", "Upgrade"] },
         response_policy: { version: "HTTP/1.1", framing: "content_length",
             connection: "request", server: "s", date: "current", hide_headers: [] },
         failure_policy: { version: "HTTP/1.1", status: 502, reason: "Bad Gateway",
@@ -33301,6 +33325,28 @@ route GET "/" {
     ast = parse_file_heap(lexed.value());
     REQUIRE(ast);
     auto* stmt = ast->items[1].route.statements[0];
+    REQUIRE(stmt != nullptr);
+    stmt->has_forward_request_policy = false;
+    rejected_hir = analyze_file_heap(ast.value());
+    REQUIRE_FALSE(rejected_hir.has_value());
+    CHECK(rejected_hir.error().detail.eq(lit("invalid request policy")));
+
+    lexed = lex(lit(valid));
+    REQUIRE(lexed);
+    ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    stmt = ast->items[1].route.statements[0];
+    REQUIRE(stmt != nullptr);
+    stmt->forward_request_policy_id = 0;
+    rejected_hir = analyze_file_heap(ast.value());
+    REQUIRE_FALSE(rejected_hir.has_value());
+    CHECK(rejected_hir.error().detail.eq(lit("invalid request policy")));
+
+    lexed = lex(lit(valid));
+    REQUIRE(lexed);
+    ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    stmt = ast->items[1].route.statements[0];
     REQUIRE(stmt != nullptr);
     stmt->forward_response_buffering = static_cast<ForwardResponseBufferingMode>(2);
     rejected_hir = analyze_file_heap(ast.value());
@@ -33323,6 +33369,20 @@ route GET "/" {
                 "route")));
     }
 
+    std::string effectful(valid);
+    const auto forward_stmt = effectful.find("    return forward");
+    REQUIRE_NE(forward_stmt, std::string::npos);
+    effectful.insert(forward_stmt, "    let observed = req.path\n");
+    lexed = lex({effectful.data(), static_cast<u32>(effectful.size())});
+    REQUIRE(lexed);
+    ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    rejected_hir = analyze_file_heap(ast.value());
+    REQUIRE_FALSE(rejected_hir.has_value());
+    CHECK(rejected_hir.error().detail.eq(
+        lit("response_buffering currently requires an effect-free direct exact GET Forward "
+            "route")));
+
     lexed = lex(lit(valid));
     REQUIRE(lexed);
     ast = parse_file_heap(lexed.value());
@@ -33331,6 +33391,13 @@ route GET "/" {
     REQUIRE(hir);
     auto mir = build_mir_heap(hir.value());
     REQUIRE(mir);
+    for (const u16 forged_policy : {static_cast<u16>(2), static_cast<u16>(0xffffu)}) {
+        mir->functions[0].blocks[0].term.forward_request_policy_id = forged_policy;
+        FrontendRirModule forged{};
+        CHECK_FALSE(lower_to_rir(mir.value(), forged).has_value());
+    }
+    mir->functions[0].blocks[0].term.forward_request_policy_id =
+        static_cast<u16>(RequestPolicyId::Http11FixedStrip);
     mir->functions[0].blocks[0].term.forward_response_buffering =
         static_cast<ForwardResponseBufferingMode>(2);
     FrontendRirModule rejected{};
@@ -33351,6 +33418,24 @@ route GET "/" {
     rir.module.functions[0].http_method = kRouteMethodAny;
     CHECK_FALSE(rir::verify_module(rir.module).ok);
     rir.module.functions[0].http_method = kRouteMethodGet;
+    CHECK(rir::verify_module(rir.module).ok);
+    auto* ret = find_first_op(rir.module.functions[0], rir::Opcode::RetForwardBundle);
+    REQUIRE(ret != nullptr);
+    const auto request_policy = ret->operand(1);
+    auto& request_policy_def = rir.module.functions[0].values[request_policy.id];
+    auto& request_policy_const = rir.module.functions[0]
+                                     .blocks[request_policy_def.def_block.id]
+                                     .insts[request_policy_def.def_inst];
+    REQUIRE_EQ(request_policy_const.op, rir::Opcode::ConstI32);
+    for (const i32 forged_policy : {-1, 2, 65535, 65537}) {
+        request_policy_const.imm.i32_val = forged_policy;
+        CHECK_FALSE(rir::verify_module(rir.module).ok);
+    }
+    request_policy_const.imm.i32_val = 1;
+    CHECK(rir::verify_module(rir.module).ok);
+    request_policy_const.op = rir::Opcode::Add;
+    CHECK_FALSE(rir::verify_module(rir.module).ok);
+    request_policy_const.op = rir::Opcode::ConstI32;
     CHECK(rir::verify_module(rir.module).ok);
     rir.destroy();
 }

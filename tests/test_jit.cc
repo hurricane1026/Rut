@@ -8434,6 +8434,8 @@ TEST(jit, compiled_response_buffering_reaches_config_without_changing_handler_re
 upstream b at "127.0.0.1:9000"
 route GET "/" {
     return forward(b,
+        request_policy: { version: "HTTP/1.1", host: "upstream", connection: "omit",
+            strip_headers: ["Connection", "Keep-Alive", "TE", "Expect", "Upgrade"] },
         response_policy: { version: "HTTP/1.1", framing: "content_length",
             connection: "request", server: "s", date: "current", hide_headers: [] },
         failure_policy: { version: "HTTP/1.1", status: 502, reason: "Bad Gateway",
@@ -8458,6 +8460,8 @@ route GET "/" {
     REQUIRE(lower_to_rir(mir.value(), rir));
     REQUIRE(rir::verify_module(rir.module).ok);
     REQUIRE_EQ(rir.module.policy_bundle_count, 1u);
+    static_assert(sizeof(ForwardPolicyBundle) == 8);
+    static_assert(sizeof(HandlerResult::make_forward_with_bundle(0, 1, 1).pack()) == sizeof(u64));
     CHECK_EQ(rir.module.policy_bundles[0].response_buffering,
              ForwardResponseBufferingMode::CompleteContentLength);
 
@@ -8470,9 +8474,14 @@ route GET "/" {
     REQUIRE(handler != nullptr);
     const auto raw = HandlerResult::unpack(handler(nullptr, nullptr, nullptr, 0, nullptr));
     CHECK_EQ(raw.action, HandlerAction::ForwardBundle);
-    CHECK_EQ(raw.status_code, 0u);
+    CHECK_EQ(raw.status_code, 1u);
     CHECK_EQ(raw.upstream_id, 0u);
     CHECK_EQ(raw.next_state, 1u);
+    HandlerCtx ctx{};
+    const auto outcome = invoke_jit_handler(handler, nullptr, ctx, nullptr, 0, nullptr);
+    CHECK_EQ(outcome.kind, JitDispatchOutcome::Kind::Forward);
+    CHECK_EQ(outcome.request_policy_id, static_cast<u16>(RequestPolicyId::Http11FixedStrip));
+    CHECK_EQ(outcome.policy_bundle_id, 1u);
 
     auto config = std::make_unique<RouteConfig>();
     REQUIRE(populate_route_config(*config, rir.module));
