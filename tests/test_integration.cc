@@ -23360,6 +23360,15 @@ TEST(
         "Host: client.example\r\n"
         "Connection: close\r\n"
         "X-Test: initial-two\r\n\r\n";
+    auto wait_for_origin_close_witness = [&](u32 history_slot) {
+        u64 closed_ns = 0;
+        for (u32 waited_ms = 0; waited_ms < 1000 && closed_ns == 0; waited_ms++) {
+            closed_ns =
+                backend.response_connection_closed_ns[history_slot].load(std::memory_order_acquire);
+            if (closed_ns == 0) usleep(1000);
+        }
+        return backend.response_connection_closed_ns[history_slot].load(std::memory_order_acquire);
+    };
     REQUIRE(send_all(client.fd, kRequestOne, sizeof(kRequestOne) - 1u));
 
     char response[sizeof(kExpectedTwo) + 64]{};
@@ -23388,9 +23397,9 @@ TEST(
     REQUIRE_EQ(backend.response_application_write_count[0].load(std::memory_order_acquire), 1u);
     const u64 origin_one_write_completed_ns =
         backend.response_last_application_write_completed_ns[0].load(std::memory_order_acquire);
-    const u64 origin_one_closed_ns =
-        backend.response_connection_closed_ns[0].load(std::memory_order_acquire);
+    const u64 origin_one_closed_ns = wait_for_origin_close_witness(0);
     REQUIRE_NE(origin_one_write_completed_ns, 0u);
+    REQUIRE_NE(origin_one_closed_ns, 0u);
     REQUIRE_GE(origin_one_closed_ns, origin_one_write_completed_ns);
     REQUIRE_EQ(backend.accepted_count.load(std::memory_order_acquire), 1u);
     REQUIRE_EQ(backend.request_count.load(std::memory_order_acquire), 1u);
@@ -23445,9 +23454,9 @@ TEST(
     REQUIRE_EQ(backend.response_application_write_count[1].load(std::memory_order_acquire), 1u);
     const u64 origin_two_write_completed_ns =
         backend.response_last_application_write_completed_ns[1].load(std::memory_order_acquire);
-    const u64 origin_two_closed_ns =
-        backend.response_connection_closed_ns[1].load(std::memory_order_acquire);
+    const u64 origin_two_closed_ns = wait_for_origin_close_witness(1);
     REQUIRE_NE(origin_two_write_completed_ns, 0u);
+    REQUIRE_NE(origin_two_closed_ns, 0u);
     REQUIRE_GE(origin_two_closed_ns, origin_two_write_completed_ns);
 
     // Keep both actors live briefly so delayed retries or a third origin
