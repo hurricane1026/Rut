@@ -1,6 +1,7 @@
 #pragma once
 
 #include "rut/common/buffer.h"
+#include "rut/common/failure_policy.h"
 #include "rut/common/forward_target_transform.h"
 #include "rut/common/http_header_validation.h"
 #include "rut/common/request_policy.h"
@@ -58,6 +59,10 @@ enum class ResponseReadDeadlineState : u8 {
 
 enum class ResponseReadDeadlinePostCommitPhase : u8 {
     None,
+    // The strict response header is pinned, but no downstream byte has been
+    // published.  Positive Content-Length bytes remain behind the header in
+    // upstream_recv_buf until a terminal buffering disposition is selected.
+    Buffering,
     HeaderSend,
     BodySend,
     WaitingBody,
@@ -527,6 +532,7 @@ struct ConnectionBase {
     u32 response_read_deadline_upstream_episode;
     u16 response_read_deadline_bundle_id;
     u8 response_read_deadline_seconds;
+    ForwardResponseBufferingMode response_read_deadline_buffering;
     ResponseReadDeadlineProfile response_read_deadline_profile;
     u8 response_read_deadline_method;
     u8 response_read_deadline_route_method;
@@ -537,6 +543,7 @@ struct ConnectionBase {
     u8 response_read_deadline_first_batch_route_method;
     u32 response_read_deadline_first_batch_generation;
     u16 response_read_deadline_first_batch_bundle_id;
+    ForwardResponseBufferingMode response_read_deadline_first_batch_buffering;
     ResponseReadDeadlineUploadProof response_read_deadline_upload;
     ResponseReadDeadlineUploadProof response_read_deadline_first_batch_upload;
     // Exact cumulative positive-copy proof for the current deadline owner.
@@ -557,6 +564,11 @@ struct ConnectionBase {
     u32 response_read_deadline_post_commit_downstream_submitted;
     u32 response_read_deadline_post_commit_downstream_completed;
     u32 response_read_deadline_post_commit_inflight_body;
+    // For the complete-Content-Length barrier this is the exact body prefix
+    // selected for publication.  It equals declared_body on success, zero on
+    // inactivity, and origin_received on a clean premature EOF.
+    u32 response_read_deadline_post_commit_send_body;
+    bool response_read_deadline_post_commit_close_after_drain;
     bool response_read_deadline_post_commit_pump_pending;
     // Exact downstream Send CQE ownership for the post-commit stream.  The
     // monotonically increasing token is encoded in io_uring user_data; the
@@ -606,6 +618,7 @@ struct ConnectionBase {
         response_read_deadline_upstream_episode = 0;
         response_read_deadline_bundle_id = 0;
         response_read_deadline_seconds = 0;
+        response_read_deadline_buffering = ForwardResponseBufferingMode::None;
         response_read_deadline_profile = ResponseReadDeadlineProfile::None;
         response_read_deadline_method = 0xffu;
         response_read_deadline_route_method = 0xffu;
@@ -622,6 +635,8 @@ struct ConnectionBase {
         response_read_deadline_post_commit_downstream_submitted = 0;
         response_read_deadline_post_commit_downstream_completed = 0;
         response_read_deadline_post_commit_inflight_body = 0;
+        response_read_deadline_post_commit_send_body = 0;
+        response_read_deadline_post_commit_close_after_drain = false;
         response_read_deadline_post_commit_pump_pending = false;
         clear_response_read_deadline_send_owner();
         response_read_deadline_first_batch = false;
@@ -630,6 +645,7 @@ struct ConnectionBase {
         response_read_deadline_first_batch_route_method = 0xffu;
         response_read_deadline_first_batch_generation = 0;
         response_read_deadline_first_batch_bundle_id = 0;
+        response_read_deadline_first_batch_buffering = ForwardResponseBufferingMode::None;
         response_read_deadline_upload = ResponseReadDeadlineUploadProof{};
         response_read_deadline_first_batch_upload = ResponseReadDeadlineUploadProof{};
     }

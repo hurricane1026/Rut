@@ -685,11 +685,9 @@ bool prepare_response_read_deadline_preflight(Loop* loop,
             return false;
         }
         const auto& bundle = config->policy_bundles[id - 1];
-        // Staged #271 metadata is intentionally not executable until the
-        // separately reviewed buffering state machine lands. Reject from
-        // pinned route metadata before invoking the handler or creating any
-        // upstream/downstream effect; never silently stream this mode.
-        if (bundle.response_buffering != ForwardResponseBufferingMode::None) {
+        const bool complete_buffering =
+            bundle.response_buffering == ForwardResponseBufferingMode::CompleteContentLength;
+        if (!forward_response_buffering_mode_valid(bundle.response_buffering)) {
             loop->close_conn(conn);
             return false;
         }
@@ -731,6 +729,11 @@ bool prepare_response_read_deadline_preflight(Loop* loop,
             conn.req_client_has_expect || conn.req_client_has_upgrade_header ||
             conn.req_client_connection_count != 0 || conn.req_wants_upgrade ||
             profile == ResponseReadDeadlineProfile::None ||
+            (complete_buffering &&
+             (profile != ResponseReadDeadlineProfile::BodylessNonHeadContentLengthZero ||
+              conn.req_method != static_cast<u8>(LogHttpMethod::Get) ||
+              route->method != kRouteMethodGet ||
+              !complete_content_length_buffering_policies_valid(response, failure, timeout))) ||
             !response_read_deadline_route_method_matches(conn.req_method, route->method) ||
             conn.pipeline_depth != 0 || conn.recv_buf.len() != conn.req_initial_send_len ||
             (fixed_upload &&
@@ -745,6 +748,7 @@ bool prepare_response_read_deadline_preflight(Loop* loop,
         }
         conn.response_read_deadline_bundle_id = id;
         conn.response_read_deadline_seconds = bundle.response_read_timeout_seconds;
+        conn.response_read_deadline_buffering = bundle.response_buffering;
         conn.response_read_deadline_profile = profile;
         conn.response_read_deadline_method = conn.req_method;
         conn.response_read_deadline_route_method = route->method;
@@ -2531,6 +2535,8 @@ void handle_jit_outcome(
             u16 forward_response_policy_id = outcome.response_policy_id;
             u16 forward_failure_policy_id = outcome.failure_policy_id;
             u16 forward_timeout_failure_policy_id = outcome.timeout_failure_policy_id;
+            ForwardResponseBufferingMode forward_response_buffering =
+                ForwardResponseBufferingMode::None;
             if (outcome.policy_bundle_id != 0) {
                 if (config == nullptr ||
                     !config->policy_bundle_id_is_valid(outcome.policy_bundle_id)) {
@@ -2542,6 +2548,7 @@ void handle_jit_outcome(
                 forward_failure_policy_id = bundle.failure_policy_id;
                 forward_timeout_failure_policy_id = bundle.timeout_failure_policy_id;
                 outcome.response_read_timeout_seconds = bundle.response_read_timeout_seconds;
+                forward_response_buffering = bundle.response_buffering;
             }
             if (outcome.response_read_timeout_seconds != 0) {
                 const bool loop_supports_deadline = [] {
@@ -2594,6 +2601,7 @@ void handle_jit_outcome(
                     outcome.policy_bundle_id == 0 ||
                     outcome.policy_bundle_id != conn.response_read_deadline_bundle_id ||
                     outcome.response_read_timeout_seconds != conn.response_read_deadline_seconds ||
+                    forward_response_buffering != conn.response_read_deadline_buffering ||
                     outcome_profile == ResponseReadDeadlineProfile::None ||
                     outcome_profile != conn.response_read_deadline_profile ||
                     conn.response_read_deadline_method != conn.req_method ||
@@ -4966,6 +4974,13 @@ void on_response_header_sent(void* lp, Connection& conn, IoEvent ev) {
         (void)consume_upstream_sent(conn);
         conn.response_read_deadline_post_commit_phase =
             ResponseReadDeadlinePostCommitPhase::WaitingBody;
+        if (conn.response_read_deadline_buffering ==
+                ForwardResponseBufferingMode::CompleteContentLength &&
+            conn.response_read_deadline_post_commit_close_after_drain &&
+            conn.response_read_deadline_post_commit_send_body == 0) {
+            loop->close_conn(conn);
+            return;
+        }
         if constexpr (requires(Loop* candidate, Connection& c) {
                           candidate->defer_response_read_deadline_body_pump(c);
                       }) {
@@ -5018,8 +5033,20 @@ void pump_response_read_deadline_body(Loop* loop, Connection& conn) {
         loop->close_conn(conn);
         return;
     }
-    const u32 available = received - completed;
+    const bool complete_buffering = conn.response_read_deadline_buffering ==
+                                    ForwardResponseBufferingMode::CompleteContentLength;
+    const u32 publish_body =
+        complete_buffering ? conn.response_read_deadline_post_commit_send_body : received;
+    if (publish_body > received || completed > publish_body) {
+        loop->close_conn(conn);
+        return;
+    }
+    const u32 available = publish_body - completed;
     if (available == 0) {
+        if (complete_buffering && conn.response_read_deadline_post_commit_close_after_drain) {
+            loop->close_conn(conn);
+            return;
+        }
         if (received == conn.response_read_deadline_post_commit_declared_body) {
             if constexpr (requires(Loop* candidate, Connection& c) {
                               candidate->retire_response_read_deadline_origin(c);
@@ -7426,6 +7453,9 @@ void on_upstream_response(void* lp, Connection& conn, IoEvent ev) {
     const u16 explicit_bundle_id = explicit_progress_batch
                                        ? conn.response_read_deadline_bundle_id
                                        : conn.response_read_deadline_first_batch_bundle_id;
+    const ForwardResponseBufferingMode explicit_buffering =
+        explicit_progress_batch ? conn.response_read_deadline_buffering
+                                : conn.response_read_deadline_first_batch_buffering;
     const u8 explicit_method = explicit_progress_batch
                                    ? conn.response_read_deadline_method
                                    : conn.response_read_deadline_first_batch_method;
@@ -7566,6 +7596,8 @@ void on_upstream_response(void* lp, Connection& conn, IoEvent ev) {
                 conn.failure_policy_id &&
             config->policy_bundles[explicit_bundle_id - 1].timeout_failure_policy_id ==
                 conn.timeout_failure_policy_id &&
+            config->policy_bundles[explicit_bundle_id - 1].response_buffering ==
+                explicit_buffering &&
             response_read_timeout_seconds_valid(
                 config->policy_bundles[explicit_bundle_id - 1].response_read_timeout_seconds) &&
             explicit_method == conn.req_method &&
@@ -7641,6 +7673,24 @@ void on_upstream_response(void* lp, Connection& conn, IoEvent ev) {
         }
 
         if (strict_positive_get) {
+            if (explicit_buffering == ForwardResponseBufferingMode::CompleteContentLength) {
+                if constexpr (requires(Loop* candidate,
+                                       Connection& c,
+                                       const IoEvent& event,
+                                       u32 header_end,
+                                       u32 declared) {
+                                  candidate->begin_complete_content_length_buffering(
+                                      c, event, header_end, declared);
+                              }) {
+                    if (!loop->begin_complete_content_length_buffering(
+                            conn, ev, raw_header_end, resp.content_length)) {
+                        loop->close_conn(conn);
+                    }
+                } else {
+                    loop->close_conn(conn);
+                }
+                return;
+            }
             if constexpr (requires(Loop* candidate,
                                    Connection& c,
                                    const IoEvent& event,

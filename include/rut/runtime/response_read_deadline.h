@@ -52,6 +52,44 @@ inline bool response_read_deadline_fixed_upload_method_admitted(u8 method) {
 
 inline bool response_read_deadline_route_method_matches(u8 method, u8 route_method);
 
+inline bool complete_content_length_pinned_header_is_stable(const Connection& c) {
+    if (c.request_config == nullptr ||
+        !c.request_config->response_policy_id_is_valid(c.response_policy_id) ||
+        c.response_header_buf.data() == nullptr || c.response_header_buf.len() == 0)
+        return false;
+    HttpResponseParser parser;
+    ParsedResponse parsed;
+    parser.reset();
+    parsed.reset();
+    if (parser.parse(c.response_header_buf.data(), c.response_header_buf.len(), &parsed) !=
+            ParseStatus::Complete ||
+        parser.header_end != c.response_header_buf.len() || parsed.version != HttpVersion::Http11 ||
+        parsed.status_code != 200 || parsed.content_length_count != 1 || parsed.chunked ||
+        parsed.headers_truncated ||
+        parsed.content_length != c.response_read_deadline_post_commit_declared_body)
+        return false;
+    const auto& policy = c.request_config->response_policies[c.response_policy_id - 1];
+    u32 server_count = 0;
+    u32 connection_count = 0;
+    for (u32 i = 0; i < parsed.header_count; ++i) {
+        const Header& header = parsed.headers[i];
+        if (http_header_name_eq_ci(header.name.ptr, header.name.len, "server", 6)) {
+            ++server_count;
+            if (header.value.len != policy.server.len ||
+                (policy.server.len != 0 &&
+                 __builtin_memcmp(header.value.ptr, policy.server.ptr, policy.server.len) != 0))
+                return false;
+        } else if (http_header_name_eq_ci(header.name.ptr, header.name.len, "connection", 10)) {
+            ++connection_count;
+            static constexpr char kKeepAlive[] = "keep-alive";
+            if (header.value.len != sizeof(kKeepAlive) - 1u ||
+                __builtin_memcmp(header.value.ptr, kKeepAlive, sizeof(kKeepAlive) - 1u) != 0)
+                return false;
+        }
+    }
+    return server_count == 1 && connection_count == 1;
+}
+
 inline bool response_read_deadline_upload_proof_equal(const ResponseReadDeadlineUploadProof& a,
                                                       const ResponseReadDeadlineUploadProof& b) {
     return a.handler_generation == b.handler_generation && a.raw_header_end == b.raw_header_end &&
@@ -153,6 +191,7 @@ inline bool response_read_deadline_owner_is_stable(const Connection& c,
     const auto& bundle = cfg->policy_bundles[bundle_id - 1];
     if (!response_read_timeout_seconds_valid(bundle.response_read_timeout_seconds) ||
         bundle.response_read_timeout_seconds != c.response_read_deadline_seconds ||
+        bundle.response_buffering != c.response_read_deadline_buffering ||
         bundle.response_policy_id != c.response_policy_id ||
         bundle.failure_policy_id != c.failure_policy_id ||
         bundle.timeout_failure_policy_id != c.timeout_failure_policy_id ||
@@ -219,6 +258,8 @@ inline bool response_read_deadline_owner_is_stable(const Connection& c,
     }
     const bool post_commit =
         c.response_read_deadline_post_commit_phase != ResponseReadDeadlinePostCommitPhase::None;
+    const bool complete_buffering =
+        c.response_read_deadline_buffering == ForwardResponseBufferingMode::CompleteContentLength;
     const bool post_commit_owner =
         post_commit &&
         c.response_read_deadline_post_commit_generation == c.response_read_deadline_generation &&
@@ -238,6 +279,29 @@ inline bool response_read_deadline_owner_is_stable(const Connection& c,
             c.response_read_deadline_post_commit_downstream_submitted -
                 c.response_read_deadline_post_commit_downstream_completed;
     if (post_commit && !post_commit_owner) return false;
+    if (complete_buffering && c.response_read_deadline_profile !=
+                                  ResponseReadDeadlineProfile::BodylessNonHeadContentLengthZero)
+        return false;
+    if (complete_buffering) {
+        const bool collecting = c.response_read_deadline_post_commit_phase ==
+                                ResponseReadDeadlinePostCommitPhase::Buffering;
+        if (c.response_read_deadline_route_method != kRouteMethodGet ||
+            c.response_read_deadline_post_commit_send_body >
+                c.response_read_deadline_post_commit_origin_received ||
+            (collecting && (c.response_read_deadline_post_commit_send_body != 0 ||
+                            c.response_read_deadline_post_commit_close_after_drain ||
+                            c.response_read_deadline_post_commit_downstream_submitted != 0 ||
+                            c.response_read_deadline_post_commit_downstream_completed != 0)) ||
+            (!collecting && !c.response_read_deadline_post_commit_close_after_drain &&
+             (c.response_read_deadline_post_commit_send_body !=
+                  c.response_read_deadline_post_commit_declared_body ||
+              c.response_read_deadline_post_commit_origin_received !=
+                  c.response_read_deadline_post_commit_declared_body)))
+            return false;
+    } else if (c.response_read_deadline_post_commit_send_body != 0 ||
+               c.response_read_deadline_post_commit_close_after_drain) {
+        return false;
+    }
     if (c.upstream_idx >= cfg->upstream_count || cfg->upstreams[c.upstream_idx].addr_count != 1 ||
         cfg->upstreams[c.upstream_idx].addrs[0].sin_family != AF_INET || c.upstream_attempts != 1 ||
         c.upstream_reused || !c.request_upload_complete || c.upstream_request_incomplete ||
@@ -277,11 +341,22 @@ inline bool response_read_deadline_owner_is_stable(const Connection& c,
 inline bool response_read_deadline_post_commit_is_stable(const Connection& c) {
     const RouteConfig* cfg = c.request_config;
     const u16 bundle_id = c.response_read_deadline_bundle_id;
+    const bool retired_buffered_send =
+        c.response_read_deadline_buffering == ForwardResponseBufferingMode::CompleteContentLength &&
+        c.response_read_deadline_post_commit_phase !=
+            ResponseReadDeadlinePostCommitPhase::Buffering;
+    const bool episode_stable =
+        retired_buffered_send
+            ? c.response_read_deadline_post_commit_episode == c.upstream_retiring_episode &&
+                  c.upstream_fd < 0 && c.upstream_abandoned &&
+                  valid_upstream_episode(c.upstream_episode)
+            : c.response_read_deadline_post_commit_episode == c.upstream_episode &&
+                  c.upstream_fd >= 0 && valid_upstream_episode(c.upstream_episode);
     if (cfg == nullptr || !cfg->policy_bundle_id_is_valid(bundle_id) ||
         c.response_read_deadline_post_commit_phase == ResponseReadDeadlinePostCommitPhase::None ||
         c.response_read_deadline_post_commit_generation == 0 ||
         c.response_read_deadline_post_commit_generation != c.response_read_deadline_generation ||
-        c.response_read_deadline_post_commit_episode != c.upstream_episode ||
+        !episode_stable ||
         c.response_read_deadline_profile !=
             ResponseReadDeadlineProfile::BodylessNonHeadContentLengthZero ||
         c.response_read_deadline_method != static_cast<u8>(LogHttpMethod::Get) ||
@@ -314,13 +389,45 @@ inline bool response_read_deadline_post_commit_is_stable(const Connection& c) {
         c.target_transform_recorded || c.req_path_overridden || c.req_header_override_count != 0 ||
         c.req_header_override_overflow || c.resp_header_mutation_count != 0 ||
         c.resp_header_mutation_pending_count != 0 || c.resp_header_mutation_pending_overflow ||
-        c.resp_header_mutation_overflow || c.upstream_fd < 0 ||
-        !valid_upstream_episode(c.upstream_episode) || c.upstream_reused ||
-        c.upstream_attempts != 1 || !c.request_upload_complete || c.upstream_request_incomplete)
+        c.resp_header_mutation_overflow || c.upstream_reused || c.upstream_attempts != 1 ||
+        !c.request_upload_complete || c.upstream_request_incomplete)
         return false;
     const auto& bundle = cfg->policy_bundles[bundle_id - 1];
+    const bool complete_buffering =
+        c.response_read_deadline_buffering == ForwardResponseBufferingMode::CompleteContentLength;
+    const bool collecting = c.response_read_deadline_post_commit_phase ==
+                            ResponseReadDeadlinePostCommitPhase::Buffering;
+    if (complete_buffering) {
+        if (c.response_read_deadline_route_method != kRouteMethodGet ||
+            !complete_content_length_pinned_header_is_stable(c) ||
+            c.response_read_deadline_post_commit_send_body >
+                c.response_read_deadline_post_commit_origin_received ||
+            (collecting && (c.response_read_deadline_post_commit_send_body != 0 ||
+                            c.response_read_deadline_post_commit_close_after_drain ||
+                            c.response_read_deadline_post_commit_downstream_submitted != 0 ||
+                            c.response_read_deadline_post_commit_downstream_completed != 0)) ||
+            (!collecting && !c.response_read_deadline_post_commit_close_after_drain &&
+             (c.response_read_deadline_post_commit_send_body !=
+                  c.response_read_deadline_post_commit_declared_body ||
+              c.response_read_deadline_post_commit_origin_received !=
+                  c.response_read_deadline_post_commit_declared_body)))
+            return false;
+    } else if (c.response_read_deadline_post_commit_send_body != 0 ||
+               c.response_read_deadline_post_commit_close_after_drain) {
+        return false;
+    }
+    if (complete_buffering &&
+        (!cfg->response_policy_id_is_valid(bundle.response_policy_id) ||
+         !cfg->failure_policy_id_is_valid(bundle.failure_policy_id) ||
+         !cfg->timeout_failure_policy_id_is_valid(bundle.timeout_failure_policy_id) ||
+         !complete_content_length_buffering_policies_valid(
+             cfg->response_policies[bundle.response_policy_id - 1],
+             cfg->failure_policies[bundle.failure_policy_id - 1],
+             cfg->failure_policies[bundle.timeout_failure_policy_id - 1])))
+        return false;
     return response_read_timeout_seconds_valid(bundle.response_read_timeout_seconds) &&
            bundle.response_read_timeout_seconds == c.response_read_deadline_seconds &&
+           bundle.response_buffering == c.response_read_deadline_buffering &&
            bundle.response_policy_id == c.response_policy_id &&
            bundle.failure_policy_id == c.failure_policy_id &&
            bundle.timeout_failure_policy_id == c.timeout_failure_policy_id &&
