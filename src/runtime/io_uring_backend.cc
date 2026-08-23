@@ -958,6 +958,24 @@ u32 IoUringBackend::wait(IoEvent* events, u32 max_events, Connection* conns, u32
             }
             if (cqe->res > 0 && ss.remaining > 0) {
                 u32 nw = static_cast<u32>(cqe->res);
+                if (nw > ss.remaining || ss.offset > UINT32_MAX - nw) {
+                    // A completion may never claim bytes outside the submitted
+                    // range.  Clear the state and emit one terminal failure;
+                    // wrapping remaining would otherwise manufacture a complete
+                    // fixed request upload (and can also address past src).
+                    ss.remaining = 0;
+                    events[count].conn_id = conn_id;
+                    events[count].type = type;
+                    events[count].result = -EOVERFLOW;
+                    events[count].buf_id = 0;
+                    events[count].has_buf = 0;
+                    events[count].more = 0;
+                    events[count].aux = static_cast<u8>(aux);
+                    events[count].upstream_episode = upstream_episode;
+                    head++;
+                    count++;
+                    continue;
+                }
                 ss.offset += nw;
                 ss.remaining -= nw;
                 if (ss.remaining > 0) {

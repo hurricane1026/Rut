@@ -509,11 +509,24 @@ private:
                    c.http1_prebuilt_header_end == c.http1_prebuilt_total_len &&
                    prebuilt_http1_header_is_complete(c);
         if (c.http1_prebuilt_response_layout !=
-                Http1PrebuiltResponseLayout::FullContentLengthNonHead ||
-            c.http1_prebuilt_deadline_profile !=
-                ResponseReadDeadlineProfile::BodylessNonHeadContentLengthZero)
+            Http1PrebuiltResponseLayout::FullContentLengthNonHead)
             return false;
-        if (!response_read_deadline_non_head_method_admitted(c.http1_prebuilt_deadline_method) ||
+        const bool fixed_upload =
+            c.http1_prebuilt_deadline_profile ==
+            ResponseReadDeadlineProfile::FixedContentLengthUploadNonHeadContentLengthZero;
+        if ((!fixed_upload && c.http1_prebuilt_deadline_profile !=
+                                  ResponseReadDeadlineProfile::BodylessNonHeadContentLengthZero) ||
+            (fixed_upload ? !response_read_deadline_fixed_upload_method_admitted(
+                                c.http1_prebuilt_deadline_method) ||
+                                !response_read_deadline_fixed_upload_materialization_is_stable(
+                                    c,
+                                    c.http1_prebuilt_deadline_upload,
+                                    /*require_upload_complete=*/true,
+                                    c.http1_prebuilt_deadline_bundle_id,
+                                    c.http1_prebuilt_deadline_route_method,
+                                    /*allow_retired_episode=*/true)
+                          : !response_read_deadline_non_head_method_admitted(
+                                c.http1_prebuilt_deadline_method)) ||
             response.head_mode != ResponsePolicyHeadMode::Reject ||
             failure.head_mode != FailurePolicyHeadMode::Reject ||
             timeout.head_mode != FailurePolicyHeadMode::Reject)
@@ -803,14 +816,20 @@ public:
                                                      Http1RequestBufferDisposition disposition,
                                                      u32 request_prefix_len) {
         constexpr u8 kAllowed = kUpstreamOpConnect | kUpstreamOpSend | kUpstreamOpRecv;
+        const bool fixed_upload =
+            c.http1_prebuilt_deadline_profile ==
+            ResponseReadDeadlineProfile::FixedContentLengthUploadNonHeadContentLengthZero;
         if (c.id >= kMaxConns || c.fd < 0 || c.upstream_fd < 0 ||
             c.protocol != ConnProtocol::Http11 || c.tls_active || c.state != ConnState::Proxying ||
             !c.keep_alive || !c.req_client_keep_alive || c.req_start_us == 0 || c.epoch_held ||
             c.resp_body_mode != BodyMode::None || c.resp_body_remaining != 0 ||
-            c.req_body_mode != BodyMode::None || c.req_body_remaining != 0 || c.req_body_streamed ||
-            c.send_armed || c.on_send != nullptr || c.http1_boundary_deferred ||
-            c.http1_boundary_ready || c.http1_boundary_successor_episode != 0 ||
-            c.http1_prebuilt_wait != 0 ||
+            (fixed_upload ? c.req_body_mode != BodyMode::ContentLength ||
+                                c.req_body_remaining != 0 || !c.request_body_fully_buffered
+                          : c.req_body_mode != BodyMode::None || c.req_body_remaining != 0 ||
+                                c.request_body_fully_buffered) ||
+            c.req_body_streamed || c.send_armed || c.on_send != nullptr ||
+            c.http1_boundary_deferred || c.http1_boundary_ready ||
+            c.http1_boundary_successor_episode != 0 || c.http1_prebuilt_wait != 0 ||
             c.http1_prebuilt_disposition != Http1RequestBufferDisposition::None ||
             c.http1_prebuilt_request_prefix_len != 0 ||
             (selected_targets & static_cast<u8>(~kAllowed)) != 0 ||
@@ -2714,6 +2733,8 @@ public:
                         const u8 first_route_method = conn.response_read_deadline_route_method;
                         const u32 first_generation = conn.response_read_deadline_generation;
                         const u16 first_bundle = conn.response_read_deadline_bundle_id;
+                        const ResponseReadDeadlineUploadProof first_upload =
+                            conn.response_read_deadline_upload;
                         disarm_response_read_deadline(conn);
                         conn.response_read_deadline_first_batch = true;
                         conn.response_read_deadline_first_batch_profile = first_profile;
@@ -2721,6 +2742,7 @@ public:
                         conn.response_read_deadline_first_batch_route_method = first_route_method;
                         conn.response_read_deadline_first_batch_generation = first_generation;
                         conn.response_read_deadline_first_batch_bundle_id = first_bundle;
+                        conn.response_read_deadline_first_batch_upload = first_upload;
                     }
                     const bool has_recv_slot =
                         conn.on_recv && (!conn.uses_iouring_tls() || conn.tls_pending_on_recv);

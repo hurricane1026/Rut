@@ -32,6 +32,99 @@ inline bool response_read_deadline_non_head_method_admitted(u8 method) {
     return false;
 }
 
+inline bool response_read_deadline_fixed_upload_method_admitted(u8 method) {
+    switch (static_cast<LogHttpMethod>(method)) {
+        case LogHttpMethod::Post:
+        case LogHttpMethod::Put:
+        case LogHttpMethod::Patch:
+            return true;
+        case LogHttpMethod::Get:
+        case LogHttpMethod::Head:
+        case LogHttpMethod::Delete:
+        case LogHttpMethod::Options:
+        case LogHttpMethod::Trace:
+        case LogHttpMethod::Connect:
+        case LogHttpMethod::Other:
+            return false;
+    }
+    return false;
+}
+
+inline bool response_read_deadline_route_method_matches(u8 method, u8 route_method);
+
+inline bool response_read_deadline_upload_proof_equal(const ResponseReadDeadlineUploadProof& a,
+                                                      const ResponseReadDeadlineUploadProof& b) {
+    return a.handler_generation == b.handler_generation && a.raw_header_end == b.raw_header_end &&
+           a.raw_content_length == b.raw_content_length &&
+           a.raw_total_length == b.raw_total_length &&
+           a.rewritten_header_end == b.rewritten_header_end &&
+           a.rewritten_total_length == b.rewritten_total_length &&
+           a.upload_episode == b.upload_episode &&
+           a.expected_upload_length == b.expected_upload_length && a.route_index == b.route_index &&
+           a.upstream_id == b.upstream_id && a.request_policy_id == b.request_policy_id &&
+           a.route_fn == b.route_fn;
+}
+
+inline bool response_read_deadline_fixed_upload_materialization_is_stable(
+    const Connection& c,
+    const ResponseReadDeadlineUploadProof& proof,
+    bool require_upload_complete,
+    u16 bundle_id,
+    u8 route_method,
+    bool allow_retired_episode = false) {
+    const RouteConfig* cfg = c.request_config;
+    if (cfg == nullptr || !response_read_deadline_fixed_upload_method_admitted(c.req_method) ||
+        proof.handler_generation == 0 || proof.handler_generation != c.handler_gen ||
+        proof.route_index >= cfg->route_count || proof.upstream_id >= cfg->upstream_count ||
+        proof.request_policy_id == 0 || !request_policy_is_supported(proof.request_policy_id) ||
+        proof.route_fn == nullptr || proof.raw_header_end == 0 || proof.raw_content_length == 0 ||
+        proof.raw_total_length <= proof.raw_header_end ||
+        proof.raw_content_length != proof.raw_total_length - proof.raw_header_end ||
+        proof.rewritten_header_end == 0 ||
+        proof.rewritten_total_length <= proof.rewritten_header_end ||
+        proof.rewritten_total_length - proof.rewritten_header_end != proof.raw_content_length ||
+        proof.expected_upload_length != proof.rewritten_total_length ||
+        !valid_upstream_episode(proof.upload_episode) ||
+        (proof.upload_episode != c.upstream_episode &&
+         (!allow_retired_episode || proof.upload_episode != c.upstream_retiring_episode)))
+        return false;
+    const RouteEntry& route = cfg->routes[proof.route_index];
+    const UpstreamTarget& target = cfg->upstreams[proof.upstream_id];
+    return route.action == RouteAction::JitHandler && route.fn == proof.route_fn &&
+           route.fn != nullptr && !route.needs_req_body && route.rate_limit.count == 0 &&
+           route.throttle_down_bps == 0 && !route.ws_terminate &&
+           route.preflight_forward_policy_bundle_id == bundle_id && route.method == route_method &&
+           response_read_deadline_route_method_matches(c.req_method, route.method) &&
+           target.addr_count == 1 && target.addrs[0].sin_family == AF_INET &&
+           target.max_inflight == 0 && c.upstream_idx == proof.upstream_id &&
+           c.request_policy_id == proof.request_policy_id && c.req_client_has_content_length &&
+           c.req_content_length == proof.raw_content_length &&
+           c.req_body_mode == BodyMode::ContentLength && c.req_body_remaining == 0 &&
+           c.request_body_fully_buffered && !c.request_policy_body_pending &&
+           !c.req_body_streamed && c.req_header_end == proof.rewritten_header_end &&
+           c.req_initial_send_len == proof.rewritten_total_length &&
+           (!require_upload_complete || c.request_upload_complete) &&
+           !c.upstream_request_incomplete;
+}
+
+inline bool response_read_deadline_fixed_upload_materialization_is_stable(
+    const Connection& c,
+    const ResponseReadDeadlineUploadProof& proof,
+    bool require_upload_complete) {
+    return response_read_deadline_fixed_upload_materialization_is_stable(
+        c,
+        proof,
+        require_upload_complete,
+        c.response_read_deadline_bundle_id,
+        c.response_read_deadline_route_method);
+}
+
+inline bool response_read_deadline_fixed_upload_proof_is_stable(
+    const Connection& c, const ResponseReadDeadlineUploadProof& proof) {
+    return response_read_deadline_fixed_upload_materialization_is_stable(
+        c, proof, /*require_upload_complete=*/true);
+}
+
 inline bool response_read_deadline_route_method_matches(u8 method, u8 route_method) {
     const auto parsed = static_cast<LogHttpMethod>(method);
     const u8 exact = route_method_key(parsed);
@@ -85,18 +178,18 @@ inline bool response_read_deadline_owner_is_stable(const Connection& c,
         c.req_http_version == static_cast<u8>(HttpVersion::Http11) && c.req_keep_alive &&
         c.req_client_keep_alive && !c.req_client_connection_close &&
         !c.req_client_connection_close_exact && c.req_client_connection_count == 0 &&
-        !c.req_client_has_content_length && !c.req_client_has_transfer_encoding &&
-        !c.req_client_has_te && !c.req_client_has_expect && !c.req_client_has_upgrade_header &&
-        !c.req_malformed && !c.req_wants_upgrade && c.req_path_canon.ptr != nullptr &&
-        c.req_body_mode == BodyMode::None && c.req_body_remaining == 0 &&
-        !c.request_body_fully_buffered && !c.req_body_streamed && c.pipeline_depth == 0 &&
-        c.pipeline_stash_len == 0 && !c.target_transform_recorded && !c.req_path_overridden &&
+        !c.req_client_has_transfer_encoding && !c.req_client_has_te && !c.req_client_has_expect &&
+        !c.req_client_has_upgrade_header && !c.req_malformed && !c.req_wants_upgrade &&
+        c.req_path_canon.ptr != nullptr && c.pipeline_depth == 0 && c.pipeline_stash_len == 0 &&
+        !c.target_transform_recorded && !c.req_path_overridden &&
         c.req_header_override_count == 0 && !c.req_header_override_overflow &&
         c.resp_header_mutation_count == 0 && c.resp_header_mutation_pending_count == 0 &&
         !c.resp_header_mutation_pending_overflow && !c.resp_header_mutation_overflow;
     if (!common_request) return false;
     if (c.response_read_deadline_profile == ResponseReadDeadlineProfile::HeaderOnlyHead) {
         if (c.req_method != static_cast<u8>(LogHttpMethod::Head) ||
+            c.req_client_has_content_length || c.req_body_mode != BodyMode::None ||
+            c.req_body_remaining != 0 || c.request_body_fully_buffered || c.req_body_streamed ||
             !c.response_policy_suppress_body || !c.failure_policy_suppress_body ||
             response.head_mode != ResponsePolicyHeadMode::SuppressBody ||
             failure.head_mode != FailurePolicyHeadMode::SuppressBody ||
@@ -105,6 +198,17 @@ inline bool response_read_deadline_owner_is_stable(const Connection& c,
     } else if (c.response_read_deadline_profile ==
                ResponseReadDeadlineProfile::BodylessNonHeadContentLengthZero) {
         if (!response_read_deadline_non_head_method_admitted(c.response_read_deadline_method) ||
+            c.req_client_has_content_length || c.req_body_mode != BodyMode::None ||
+            c.req_body_remaining != 0 || c.request_body_fully_buffered || c.req_body_streamed ||
+            c.response_policy_suppress_body || c.failure_policy_suppress_body ||
+            response.head_mode != ResponsePolicyHeadMode::Reject ||
+            failure.head_mode != FailurePolicyHeadMode::Reject ||
+            timeout.head_mode != FailurePolicyHeadMode::Reject)
+            return false;
+    } else if (c.response_read_deadline_profile ==
+               ResponseReadDeadlineProfile::FixedContentLengthUploadNonHeadContentLengthZero) {
+        if (!response_read_deadline_fixed_upload_proof_is_stable(c,
+                                                                 c.response_read_deadline_upload) ||
             c.response_policy_suppress_body || c.failure_policy_suppress_body ||
             response.head_mode != ResponsePolicyHeadMode::Reject ||
             failure.head_mode != FailurePolicyHeadMode::Reject ||

@@ -62,6 +62,26 @@ enum class ResponseReadDeadlineProfile : u8 {
     None,
     HeaderOnlyHead,
     BodylessNonHeadContentLengthZero,
+    FixedContentLengthUploadNonHeadContentLengthZero,
+};
+
+// Immutable request-upload identity for the bounded fixed-Content-Length
+// explicit-deadline profile. The active, first-response-batch, and D1/D2
+// copies are compared byte-for-byte by field so no transition can manufacture
+// a body/upload proof after the original request bytes have been released.
+struct ResponseReadDeadlineUploadProof {
+    u32 handler_generation = 0;
+    u32 raw_header_end = 0;
+    u32 raw_content_length = 0;
+    u32 raw_total_length = 0;
+    u32 rewritten_header_end = 0;
+    u32 rewritten_total_length = 0;
+    u32 upload_episode = 0;
+    u32 expected_upload_length = 0;
+    u16 route_index = 0xffffu;
+    u16 upstream_id = 0xffffu;
+    u16 request_policy_id = 0;
+    jit::HandlerFn route_fn = nullptr;
 };
 
 enum class Http1PrebuiltResponseLayout : u8 {
@@ -502,6 +522,8 @@ struct ConnectionBase {
     u8 response_read_deadline_first_batch_route_method;
     u32 response_read_deadline_first_batch_generation;
     u16 response_read_deadline_first_batch_bundle_id;
+    ResponseReadDeadlineUploadProof response_read_deadline_upload;
+    ResponseReadDeadlineUploadProof response_read_deadline_first_batch_upload;
     // Exact cumulative positive-copy proof for the current deadline owner.
     // Set only after whole-batch witness validation and preserved across
     // incomplete-header re-arms; cleared with active deadline ownership.
@@ -534,6 +556,8 @@ struct ConnectionBase {
         response_read_deadline_first_batch_route_method = 0xffu;
         response_read_deadline_first_batch_generation = 0;
         response_read_deadline_first_batch_bundle_id = 0;
+        response_read_deadline_upload = ResponseReadDeadlineUploadProof{};
+        response_read_deadline_first_batch_upload = ResponseReadDeadlineUploadProof{};
     }
 
     void clear_http1_prebuilt_response_proof() {
@@ -545,6 +569,7 @@ struct ConnectionBase {
         http1_prebuilt_deadline_generation = 0;
         http1_prebuilt_deadline_bundle_id = 0;
         http1_prebuilt_deadline_config = nullptr;
+        http1_prebuilt_deadline_upload = ResponseReadDeadlineUploadProof{};
         http1_prebuilt_header_end = 0;
         http1_prebuilt_total_len = 0;
         http1_prebuilt_body_len = 0;
@@ -803,6 +828,7 @@ struct ConnectionBase {
     u32 http1_prebuilt_deadline_generation;
     u16 http1_prebuilt_deadline_bundle_id;
     const RouteConfig* http1_prebuilt_deadline_config;
+    ResponseReadDeadlineUploadProof http1_prebuilt_deadline_upload;
     u32 http1_prebuilt_header_end;
     u32 http1_prebuilt_total_len;
     u32 http1_prebuilt_body_len;
