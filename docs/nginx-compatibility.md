@@ -47,6 +47,15 @@ Allowed states are `SUPPORTED`, `PARTIAL`, `BLOCKED_BY_RUT`,
   URI normalization.
 - nginx prefix matching is byte-prefix based; RUT routing is segment-aware.
   The root `/` case overlaps, but broader prefix support cannot reuse that fact.
+- `OPTIONS *` and ordinary authority-form CONNECT do not have a canonical
+  origin-form path in current RUT. They miss the converter's method-omitted `/`
+  route and currently receive the unmatched default 200 before buffering
+  preflight; focused admission-rejection tests do not prove production
+  fail-closed behavior. Pinned nginx location semantics are required before
+  deciding whether this needs a generic routing/unmatched-policy capability.
+- Complete response buffering currently admits downstream HTTP/1.1 only. The
+  accepted nginx configuration syntax does not exclude HTTP/1.0 clients, so the
+  omitted-buffering row remains blocked for that version domain as well.
 - A `proxy_pass` without a URI suffix must not accidentally forward the
   normalized routing path instead of the original request target.
 - nginx proxy request defaults are version-dependent beginning at 1.29.7.
