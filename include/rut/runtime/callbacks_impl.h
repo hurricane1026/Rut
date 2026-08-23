@@ -731,9 +731,11 @@ bool prepare_response_read_deadline_preflight(Loop* loop,
             profile == ResponseReadDeadlineProfile::None ||
             (complete_buffering &&
              (profile != ResponseReadDeadlineProfile::BodylessNonHeadContentLengthZero ||
-              conn.req_method != static_cast<u8>(LogHttpMethod::Get) ||
-              route->method != kRouteMethodGet || conn.request_policy_id != 0 ||
-              conn.request_policy_body_pending || conn.pending_forward_request_policy_id != 0 ||
+              !response_read_deadline_non_head_method_admitted(conn.req_method) ||
+              !complete_content_length_route_method_is_admitted(route->method) ||
+              !response_read_deadline_route_method_matches(conn.req_method, route->method) ||
+              conn.request_policy_id != 0 || conn.request_policy_body_pending ||
+              conn.pending_forward_request_policy_id != 0 ||
               !complete_content_length_buffering_policies_valid(response, failure, timeout))) ||
             !response_read_deadline_route_method_matches(conn.req_method, route->method) ||
             conn.pipeline_depth != 0 || conn.recv_buf.len() != conn.req_initial_send_len ||
@@ -7616,7 +7618,8 @@ void on_upstream_response(void* lp, Connection& conn, IoEvent ev) {
             config->policy_bundles[explicit_bundle_id - 1].response_buffering ==
                 explicit_buffering &&
             (explicit_buffering != ForwardResponseBufferingMode::CompleteContentLength ||
-             (complete_content_length_request_policy_is_admitted(conn.request_policy_id) &&
+             (complete_content_length_route_method_is_admitted(explicit_route_method) &&
+              complete_content_length_request_policy_is_admitted(conn.request_policy_id) &&
               explicit_upload.request_policy_id == conn.request_policy_id)) &&
             response_read_timeout_seconds_valid(
                 config->policy_bundles[explicit_bundle_id - 1].response_read_timeout_seconds) &&
@@ -7656,13 +7659,23 @@ void on_upstream_response(void* lp, Connection& conn, IoEvent ev) {
         const u32 raw_total = conn.upstream_recv_buf.len();
         const bool strict_cl0 =
             strict_common && resp.content_length == 0 && raw_header_end == raw_total;
-        const bool strict_positive_get =
+        const bool strict_positive_complete_buffering =
             strict_common && !fixed_upload &&
+            explicit_buffering == ForwardResponseBufferingMode::CompleteContentLength &&
+            response_read_deadline_non_head_method_admitted(explicit_method) &&
+            complete_content_length_route_method_is_admitted(explicit_route_method) &&
+            response_read_deadline_route_method_matches(explicit_method, explicit_route_method) &&
+            resp.content_length > 0 && raw_header_end <= conn.upstream_recv_buf.capacity() &&
+            resp.content_length <= conn.upstream_recv_buf.capacity() - raw_header_end &&
+            raw_total - raw_header_end <= resp.content_length;
+        const bool strict_positive_streaming_get =
+            strict_common && !fixed_upload &&
+            explicit_buffering == ForwardResponseBufferingMode::None &&
             explicit_method == static_cast<u8>(LogHttpMethod::Get) && resp.content_length > 0 &&
             raw_header_end <= conn.upstream_recv_buf.capacity() &&
             resp.content_length <= conn.upstream_recv_buf.capacity() - raw_header_end &&
             raw_total - raw_header_end <= resp.content_length;
-        if (!strict_cl0 && !strict_positive_get) {
+        if (!strict_cl0 && !strict_positive_complete_buffering && !strict_positive_streaming_get) {
             disarm_explicit_deadline();
             loop->close_conn(conn);
             return;
@@ -7692,8 +7705,8 @@ void on_upstream_response(void* lp, Connection& conn, IoEvent ev) {
             return;
         }
 
-        if (strict_positive_get) {
-            if (explicit_buffering == ForwardResponseBufferingMode::CompleteContentLength) {
+        if (strict_positive_complete_buffering || strict_positive_streaming_get) {
+            if (strict_positive_complete_buffering) {
                 if constexpr (requires(Loop* candidate,
                                        Connection& c,
                                        const IoEvent& event,

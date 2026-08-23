@@ -3922,9 +3922,10 @@ FrontendResult<void> lower_to_rir(const MirModule& mir, FrontendRirModule& out) 
                 timeout_term->forward_set_headers.len == 0 &&
                 !timeout_term->has_forward_target_transform &&
                 !timeout_term->commit_response_mutations &&
-                (!complete_buffering || (function.method == kRouteMethodGet &&
-                                         complete_content_length_request_policy_is_admitted(
-                                             timeout_term->forward_request_policy_id)));
+                (!complete_buffering ||
+                 (complete_content_length_route_method_is_admitted(function.method) &&
+                  complete_content_length_request_policy_is_admitted(
+                      timeout_term->forward_request_policy_id)));
             if (!canonical) {
                 out.destroy();
                 return frontend_error(
@@ -3932,7 +3933,7 @@ FrontendResult<void> lower_to_rir(const MirModule& mir, FrontendRirModule& out) 
                     timeout_term->span,
                     complete_buffering
                         ? lit_str("response_buffering currently requires an effect-free direct "
-                                  "exact GET Forward route")
+                                  "admitted bodyless non-HEAD Forward route")
                         : lit_str("response_read_timeout currently requires an effect-free direct "
                                   "Forward route"));
             }

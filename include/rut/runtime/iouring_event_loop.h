@@ -497,6 +497,8 @@ private:
         if (!response_read_timeout_seconds_valid(bundle.response_read_timeout_seconds) ||
             (bundle.response_buffering == ForwardResponseBufferingMode::CompleteContentLength &&
              (!complete_content_length_request_policy_is_admitted(c.request_policy_id) ||
+              !complete_content_length_route_method_is_admitted(
+                  c.http1_prebuilt_deadline_route_method) ||
               c.http1_prebuilt_deadline_upload.request_policy_id != c.request_policy_id)) ||
             bundle.response_policy_id != c.response_policy_id ||
             bundle.failure_policy_id != c.failure_policy_id ||
@@ -2236,8 +2238,13 @@ public:
             !response_read_deadline_identity_is_stable(c) ||
             c.response_read_deadline_profile !=
                 ResponseReadDeadlineProfile::BodylessNonHeadContentLengthZero ||
-            c.req_method != static_cast<u8>(LogHttpMethod::Get) || declared_body == 0 ||
-            raw_header_end == 0 || raw_header_end > c.upstream_recv_buf.len() ||
+            !response_read_deadline_non_head_method_admitted(c.req_method) ||
+            !complete_content_length_route_method_is_admitted(
+                c.response_read_deadline_route_method) ||
+            !response_read_deadline_route_method_matches(c.req_method,
+                                                         c.response_read_deadline_route_method) ||
+            declared_body == 0 || raw_header_end == 0 ||
+            raw_header_end > c.upstream_recv_buf.len() ||
             declared_body > c.upstream_recv_buf.capacity() - raw_header_end ||
             c.response_header_buf.data() == nullptr || c.response_header_buf.len() == 0 ||
             c.response_header_buf.len() > c.response_header_buf.capacity())

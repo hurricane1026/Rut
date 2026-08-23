@@ -8432,7 +8432,7 @@ route GET "/later" { return 204 }
 TEST(jit, compiled_response_buffering_reaches_config_without_changing_handler_result_abi) {
     const char source[] = R"rut(
 upstream b at "127.0.0.1:9000"
-route GET "/" {
+route POST "/" {
     return forward(b,
         request_policy: { version: "HTTP/1.1", host: "upstream", connection: "omit",
             strip_headers: ["Connection", "Keep-Alive", "TE", "Expect", "Upgrade"] },
@@ -8448,56 +8448,69 @@ route GET "/" {
         response_buffering: "complete_content_length")
 }
 )rut";
-    auto lexed = lex(lit(source));
-    REQUIRE(lexed);
-    auto ast = parse_file_heap(lexed.value());
-    REQUIRE(ast);
-    auto hir = analyze_file_heap(ast.value());
-    REQUIRE(hir);
-    auto mir = build_mir_heap(hir.value());
-    REQUIRE(mir);
-    FrontendRirModule rir{};
-    REQUIRE(lower_to_rir(mir.value(), rir));
-    REQUIRE(rir::verify_module(rir.module).ok);
-    REQUIRE_EQ(rir.module.policy_bundle_count, 1u);
-    static_assert(sizeof(ForwardPolicyBundle) == 8);
-    static_assert(sizeof(HandlerResult::make_forward_with_bundle(0, 1, 1).pack()) == sizeof(u64));
-    CHECK_EQ(rir.module.policy_bundles[0].response_buffering,
-             ForwardResponseBufferingMode::CompleteContentLength);
+    for (const bool any_route : {false, true}) {
+        std::string selected(source);
+        if (any_route) {
+            const auto method = selected.find("route POST");
+            REQUIRE_NE(method, std::string::npos);
+            selected.replace(method, sizeof("route POST") - 1u, "route");
+        }
+        const u8 expected_method = any_route ? kRouteMethodAny : kRouteMethodPost;
+        auto lexed = lex({selected.data(), static_cast<u32>(selected.size())});
+        REQUIRE(lexed);
+        auto ast = parse_file_heap(lexed.value());
+        REQUIRE(ast);
+        auto hir = analyze_file_heap(ast.value());
+        REQUIRE(hir);
+        auto mir = build_mir_heap(hir.value());
+        REQUIRE(mir);
+        FrontendRirModule rir{};
+        REQUIRE(lower_to_rir(mir.value(), rir));
+        REQUIRE(rir::verify_module(rir.module).ok);
+        REQUIRE_EQ(rir.module.func_count, 1u);
+        CHECK_EQ(rir.module.functions[0].http_method, expected_method);
+        REQUIRE_EQ(rir.module.policy_bundle_count, 1u);
+        static_assert(sizeof(ForwardPolicyBundle) == 8);
+        static_assert(sizeof(HandlerResult::make_forward_with_bundle(0, 1, 1).pack()) ==
+                      sizeof(u64));
+        CHECK_EQ(rir.module.policy_bundles[0].response_buffering,
+                 ForwardResponseBufferingMode::CompleteContentLength);
 
-    auto cg = codegen(rir.module);
-    REQUIRE(cg.ok);
-    JitEngine engine;
-    REQUIRE(engine.init());
-    REQUIRE(engine.compile(cg.mod, cg.ctx));
-    auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
-    REQUIRE(handler != nullptr);
-    const auto raw = HandlerResult::unpack(handler(nullptr, nullptr, nullptr, 0, nullptr));
-    CHECK_EQ(raw.action, HandlerAction::ForwardBundle);
-    CHECK_EQ(raw.status_code, 1u);
-    CHECK_EQ(raw.upstream_id, 0u);
-    CHECK_EQ(raw.next_state, 1u);
-    HandlerCtx ctx{};
-    const auto outcome = invoke_jit_handler(handler, nullptr, ctx, nullptr, 0, nullptr);
-    CHECK_EQ(outcome.kind, JitDispatchOutcome::Kind::Forward);
-    CHECK_EQ(outcome.request_policy_id, static_cast<u16>(RequestPolicyId::Http11FixedStrip));
-    CHECK_EQ(outcome.policy_bundle_id, 1u);
+        auto cg = codegen(rir.module);
+        REQUIRE(cg.ok);
+        JitEngine engine;
+        REQUIRE(engine.init());
+        REQUIRE(engine.compile(cg.mod, cg.ctx));
+        auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
+        REQUIRE(handler != nullptr);
+        const auto raw = HandlerResult::unpack(handler(nullptr, nullptr, nullptr, 0, nullptr));
+        CHECK_EQ(raw.action, HandlerAction::ForwardBundle);
+        CHECK_EQ(raw.status_code, 1u);
+        CHECK_EQ(raw.upstream_id, 0u);
+        CHECK_EQ(raw.next_state, 1u);
+        HandlerCtx ctx{};
+        const auto outcome = invoke_jit_handler(handler, nullptr, ctx, nullptr, 0, nullptr);
+        CHECK_EQ(outcome.kind, JitDispatchOutcome::Kind::Forward);
+        CHECK_EQ(outcome.request_policy_id, static_cast<u16>(RequestPolicyId::Http11FixedStrip));
+        CHECK_EQ(outcome.policy_bundle_id, 1u);
 
-    auto config = std::make_unique<RouteConfig>();
-    REQUIRE(populate_route_config(*config, rir.module));
-    REQUIRE_EQ(config->policy_bundle_count, 1u);
-    CHECK_EQ(config->policy_bundles[0].response_buffering,
-             ForwardResponseBufferingMode::CompleteContentLength);
-    config->policy_bundles[0].response_buffering = ForwardResponseBufferingMode::None;
-    CHECK_FALSE(register_jit_routes(*config, rir.module, engine));
-    CHECK_EQ(config->route_count, 0u);
-    config->policy_bundles[0].response_buffering =
-        ForwardResponseBufferingMode::CompleteContentLength;
-    REQUIRE(register_jit_routes(*config, rir.module, engine));
-    REQUIRE_EQ(config->route_count, 1u);
-    CHECK_EQ(config->routes[0].preflight_forward_policy_bundle_id, 1u);
-    engine.shutdown();
-    rir.destroy();
+        auto config = std::make_unique<RouteConfig>();
+        REQUIRE(populate_route_config(*config, rir.module));
+        REQUIRE_EQ(config->policy_bundle_count, 1u);
+        CHECK_EQ(config->policy_bundles[0].response_buffering,
+                 ForwardResponseBufferingMode::CompleteContentLength);
+        config->policy_bundles[0].response_buffering = ForwardResponseBufferingMode::None;
+        CHECK_FALSE(register_jit_routes(*config, rir.module, engine));
+        CHECK_EQ(config->route_count, 0u);
+        config->policy_bundles[0].response_buffering =
+            ForwardResponseBufferingMode::CompleteContentLength;
+        REQUIRE(register_jit_routes(*config, rir.module, engine));
+        REQUIRE_EQ(config->route_count, 1u);
+        CHECK_EQ(config->routes[0].method, expected_method);
+        CHECK_EQ(config->routes[0].preflight_forward_policy_bundle_id, 1u);
+        engine.shutdown();
+        rir.destroy();
+    }
 }
 
 TEST(result, pack_unpack_yield) {

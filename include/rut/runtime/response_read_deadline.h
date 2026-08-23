@@ -277,7 +277,14 @@ inline bool response_read_deadline_owner_is_stable(const Connection& c,
         c.response_read_deadline_post_commit_episode == c.upstream_episode &&
         c.response_read_deadline_profile ==
             ResponseReadDeadlineProfile::BodylessNonHeadContentLengthZero &&
-        c.response_read_deadline_method == static_cast<u8>(LogHttpMethod::Get) &&
+        ((complete_buffering &&
+          response_read_deadline_non_head_method_admitted(c.response_read_deadline_method) &&
+          complete_content_length_route_method_is_admitted(
+              c.response_read_deadline_route_method)) ||
+         (!complete_buffering &&
+          c.response_read_deadline_method == static_cast<u8>(LogHttpMethod::Get))) &&
+        response_read_deadline_route_method_matches(c.response_read_deadline_method,
+                                                    c.response_read_deadline_route_method) &&
         c.response_read_deadline_post_commit_declared_body != 0 &&
         c.response_read_deadline_post_commit_raw_header_end != 0 &&
         c.response_read_deadline_post_commit_origin_received <=
@@ -296,7 +303,8 @@ inline bool response_read_deadline_owner_is_stable(const Connection& c,
     if (complete_buffering) {
         const bool collecting = c.response_read_deadline_post_commit_phase ==
                                 ResponseReadDeadlinePostCommitPhase::Buffering;
-        if (c.response_read_deadline_route_method != kRouteMethodGet ||
+        if (!complete_content_length_route_method_is_admitted(
+                c.response_read_deadline_route_method) ||
             c.response_read_deadline_post_commit_send_body >
                 c.response_read_deadline_post_commit_origin_received ||
             (collecting && (c.response_read_deadline_post_commit_send_body != 0 ||
@@ -352,10 +360,11 @@ inline bool response_read_deadline_owner_is_stable(const Connection& c,
 inline bool response_read_deadline_post_commit_is_stable(const Connection& c) {
     const RouteConfig* cfg = c.request_config;
     const u16 bundle_id = c.response_read_deadline_bundle_id;
+    const bool complete_buffering =
+        c.response_read_deadline_buffering == ForwardResponseBufferingMode::CompleteContentLength;
     const bool retired_buffered_send =
-        c.response_read_deadline_buffering == ForwardResponseBufferingMode::CompleteContentLength &&
-        c.response_read_deadline_post_commit_phase !=
-            ResponseReadDeadlinePostCommitPhase::Buffering;
+        complete_buffering && c.response_read_deadline_post_commit_phase !=
+                                  ResponseReadDeadlinePostCommitPhase::Buffering;
     const bool episode_stable =
         retired_buffered_send
             ? c.response_read_deadline_post_commit_episode == c.upstream_retiring_episode &&
@@ -370,8 +379,12 @@ inline bool response_read_deadline_post_commit_is_stable(const Connection& c) {
         !episode_stable ||
         c.response_read_deadline_profile !=
             ResponseReadDeadlineProfile::BodylessNonHeadContentLengthZero ||
-        c.response_read_deadline_method != static_cast<u8>(LogHttpMethod::Get) ||
-        c.req_method != static_cast<u8>(LogHttpMethod::Get) ||
+        (complete_buffering
+             ? (!response_read_deadline_non_head_method_admitted(c.response_read_deadline_method) ||
+                !complete_content_length_route_method_is_admitted(
+                    c.response_read_deadline_route_method))
+             : c.response_read_deadline_method != static_cast<u8>(LogHttpMethod::Get)) ||
+        c.response_read_deadline_method != c.req_method ||
         !response_read_deadline_route_method_matches(c.req_method,
                                                      c.response_read_deadline_route_method) ||
         c.response_read_deadline_post_commit_raw_header_end == 0 ||
@@ -406,12 +419,11 @@ inline bool response_read_deadline_post_commit_is_stable(const Connection& c) {
     if (!complete_content_length_request_policy_owner_is_stable(c, c.response_read_deadline_upload))
         return false;
     const auto& bundle = cfg->policy_bundles[bundle_id - 1];
-    const bool complete_buffering =
-        c.response_read_deadline_buffering == ForwardResponseBufferingMode::CompleteContentLength;
     const bool collecting = c.response_read_deadline_post_commit_phase ==
                             ResponseReadDeadlinePostCommitPhase::Buffering;
     if (complete_buffering) {
-        if (c.response_read_deadline_route_method != kRouteMethodGet ||
+        if (!complete_content_length_route_method_is_admitted(
+                c.response_read_deadline_route_method) ||
             !complete_content_length_pinned_header_is_stable(c) ||
             c.response_read_deadline_post_commit_send_body >
                 c.response_read_deadline_post_commit_origin_received ||

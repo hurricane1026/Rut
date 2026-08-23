@@ -33353,11 +33353,12 @@ route GET "/" {
     REQUIRE_FALSE(rejected_hir.has_value());
     CHECK(rejected_hir.error().detail.eq(lit("invalid response buffering")));
 
-    for (const bool any_method : {false, true}) {
+    for (const char* rejected_method : {"HEAD"}) {
         std::string wrong_method(valid);
         const auto method = wrong_method.find("route GET");
         REQUIRE_NE(method, std::string::npos);
-        wrong_method.replace(method, sizeof("route GET") - 1u, any_method ? "route" : "route POST");
+        wrong_method.replace(
+            method, sizeof("route GET") - 1u, std::string("route ") + rejected_method);
         lexed = lex({wrong_method.data(), static_cast<u32>(wrong_method.size())});
         REQUIRE(lexed);
         ast = parse_file_heap(lexed.value());
@@ -33365,8 +33366,8 @@ route GET "/" {
         rejected_hir = analyze_file_heap(ast.value());
         REQUIRE_FALSE(rejected_hir.has_value());
         CHECK(rejected_hir.error().detail.eq(
-            lit("response_buffering currently requires an effect-free direct exact GET Forward "
-                "route")));
+            lit("response_buffering currently requires an effect-free direct admitted bodyless "
+                "non-HEAD Forward route")));
     }
 
     std::string effectful(valid);
@@ -33380,8 +33381,8 @@ route GET "/" {
     rejected_hir = analyze_file_heap(ast.value());
     REQUIRE_FALSE(rejected_hir.has_value());
     CHECK(rejected_hir.error().detail.eq(
-        lit("response_buffering currently requires an effect-free direct exact GET Forward "
-            "route")));
+        lit("response_buffering currently requires an effect-free direct admitted bodyless "
+            "non-HEAD Forward route")));
 
     lexed = lex(lit(valid));
     REQUIRE(lexed);
@@ -33391,6 +33392,16 @@ route GET "/" {
     REQUIRE(hir);
     auto mir = build_mir_heap(hir.value());
     REQUIRE(mir);
+    for (const u8 forged_method : {kRouteMethodHead,
+                                   kRouteMethodConnect,
+                                   kRouteMethodTrace,
+                                   kRouteMethodInvalid,
+                                   static_cast<u8>(10)}) {
+        mir->functions[0].method = forged_method;
+        FrontendRirModule forged{};
+        CHECK_FALSE(lower_to_rir(mir.value(), forged).has_value());
+    }
+    mir->functions[0].method = kRouteMethodGet;
     for (const u16 forged_policy : {static_cast<u16>(2), static_cast<u16>(0xffffu)}) {
         mir->functions[0].blocks[0].term.forward_request_policy_id = forged_policy;
         FrontendRirModule forged{};
@@ -33415,10 +33426,25 @@ route GET "/" {
     rir.module.policy_bundles[0].response_read_timeout_seconds = 0;
     CHECK_FALSE(rir::verify_module(rir.module).ok);
     rir.module.policy_bundles[0].response_read_timeout_seconds = 1;
-    rir.module.functions[0].http_method = kRouteMethodAny;
-    CHECK_FALSE(rir::verify_module(rir.module).ok);
+    for (const u8 admitted : {kRouteMethodAny,
+                              kRouteMethodGet,
+                              kRouteMethodPost,
+                              kRouteMethodPut,
+                              kRouteMethodDelete,
+                              kRouteMethodPatch,
+                              kRouteMethodOptions}) {
+        rir.module.functions[0].http_method = admitted;
+        CHECK(rir::verify_module(rir.module).ok);
+    }
+    for (const u8 rejected_method : {kRouteMethodHead,
+                                     kRouteMethodConnect,
+                                     kRouteMethodTrace,
+                                     kRouteMethodInvalid,
+                                     static_cast<u8>(10)}) {
+        rir.module.functions[0].http_method = rejected_method;
+        CHECK_FALSE(rir::verify_module(rir.module).ok);
+    }
     rir.module.functions[0].http_method = kRouteMethodGet;
-    CHECK(rir::verify_module(rir.module).ok);
     auto* ret = find_first_op(rir.module.functions[0], rir::Opcode::RetForwardBundle);
     REQUIRE(ret != nullptr);
     const auto request_policy = ret->operand(1);
@@ -33438,6 +33464,70 @@ route GET "/" {
     request_policy_const.op = rir::Opcode::ConstI32;
     CHECK(rir::verify_module(rir.module).ok);
     rir.destroy();
+}
+
+TEST(frontend, response_buffering_admits_closed_bodyless_non_head_static_route_method_set) {
+    static constexpr const char kRequestPolicy[] =
+        "request_policy: { version: \"HTTP/1.1\", host: \"upstream\", "
+        "connection: \"omit\", strip_headers: [\"Connection\", \"Keep-Alive\", \"TE\", "
+        "\"Expect\", \"Upgrade\"] }, ";
+    static constexpr const char kPolicies[] =
+        "response_policy: { version: \"HTTP/1.1\", framing: \"content_length\", "
+        "connection: \"request\", server: \"s\", date: \"current\", hide_headers: [] }, "
+        "failure_policy: { version: \"HTTP/1.1\", status: 502, reason: \"Bad Gateway\", "
+        "content_type: \"text/plain\", server: \"s\", date: \"current\", "
+        "connection: \"request\", body: b\"bad\" }, "
+        "timeout_failure_policy: { version: \"HTTP/1.1\", status: 504, "
+        "reason: \"Gateway Time-out\", content_type: \"text/plain\", server: \"s\", "
+        "date: \"current\", connection: \"request\", body: b\"slow\" }, "
+        "response_read_timeout: 1s, response_buffering: \"complete_content_length\") }\n";
+    struct MethodCase {
+        const char* source_method;
+        u8 route_method;
+    };
+    const MethodCase methods[] = {{"", kRouteMethodAny},
+                                  {"GET ", kRouteMethodGet},
+                                  {"POST ", kRouteMethodPost},
+                                  {"PUT ", kRouteMethodPut},
+                                  {"DELETE ", kRouteMethodDelete},
+                                  {"PATCH ", kRouteMethodPatch},
+                                  {"OPTIONS ", kRouteMethodOptions}};
+    for (const auto& method : methods) {
+        for (const bool request_policy : {false, true}) {
+            std::string source = "upstream b at \"127.0.0.1:9000\"\nroute ";
+            source += method.source_method;
+            source += "\"/\" { return forward(b, ";
+            if (request_policy) source += kRequestPolicy;
+            source += kPolicies;
+            auto lexed = lex({source.data(), static_cast<u32>(source.size())});
+            REQUIRE(lexed);
+            auto ast = parse_file_heap(lexed.value());
+            REQUIRE(ast);
+            auto hir = analyze_file_heap(ast.value());
+            REQUIRE(hir);
+            REQUIRE_EQ(hir->routes.len, 1u);
+            CHECK_EQ(hir->routes[0].method, method.route_method);
+            CHECK_EQ(hir->routes[0].control.direct_term.forward_request_policy_id,
+                     request_policy ? static_cast<u16>(RequestPolicyId::Http11FixedStrip) : 0u);
+            auto mir = build_mir_heap(hir.value());
+            REQUIRE(mir);
+            CHECK_EQ(mir->functions[0].method, method.route_method);
+            FrontendRirModule rir{};
+            REQUIRE(lower_to_rir(mir.value(), rir));
+            REQUIRE(rir::verify_module(rir.module).ok);
+            CHECK_EQ(rir.module.functions[0].http_method, method.route_method);
+            REQUIRE_EQ(rir.module.policy_bundle_count, 1u);
+            CHECK_EQ(rir.module.policy_bundles[0].response_buffering,
+                     ForwardResponseBufferingMode::CompleteContentLength);
+            rir.destroy();
+        }
+    }
+
+    CHECK_FALSE(complete_content_length_route_method_is_admitted(kRouteMethodHead));
+    CHECK_FALSE(complete_content_length_route_method_is_admitted(kRouteMethodConnect));
+    CHECK_FALSE(complete_content_length_route_method_is_admitted(kRouteMethodTrace));
+    CHECK_FALSE(complete_content_length_route_method_is_admitted(kRouteMethodInvalid));
+    CHECK_FALSE(complete_content_length_route_method_is_admitted(10));
 }
 
 TEST(frontend, response_read_timeout_bundle_shapes_deduplicate_and_reach_config_exactly) {

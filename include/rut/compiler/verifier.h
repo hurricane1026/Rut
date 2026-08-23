@@ -1124,8 +1124,8 @@ inline VerifyResult verify_module(const Module& mod, VerifyOptions options = {})
                 const auto buffering = mod.policy_bundles[bundle_id - 1].response_buffering;
                 if (buffering != ForwardResponseBufferingMode::None &&
                     (buffering != ForwardResponseBufferingMode::CompleteContentLength ||
-                     fn.http_method != kRouteMethodGet || request_policy < 0 ||
-                     request_policy > 0xffff ||
+                     !complete_content_length_route_method_is_admitted(fn.http_method) ||
+                     request_policy < 0 || request_policy > 0xffff ||
                      !complete_content_length_request_policy_is_admitted(
                          static_cast<u16>(request_policy))))
                     return verify_fail(

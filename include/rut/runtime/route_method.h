@@ -23,6 +23,29 @@ static constexpr u32 kRouteMethodSlots = 10;
 static constexpr u8 kRouteMethodInvalid = 0xffu;
 static constexpr u32 kRouteMethodSlotInvalid = 0xffffffffu;
 
+// Closed static-route admission set for the bounded complete-content-length
+// response-buffering profile.  Keep this separate from the general route-key
+// helpers: adding a future HTTP method must not silently widen buffering.
+// TRACE is intentionally admitted only at request time through an ANY route.
+inline bool complete_content_length_route_method_is_admitted(u8 method) {
+    switch (method) {
+        case kRouteMethodAny:
+        case kRouteMethodGet:
+        case kRouteMethodPost:
+        case kRouteMethodPut:
+        case kRouteMethodDelete:
+        case kRouteMethodPatch:
+        case kRouteMethodOptions:
+            return true;
+        case kRouteMethodHead:
+        case kRouteMethodConnect:
+        case kRouteMethodTrace:
+        case kRouteMethodInvalid:
+            return false;
+    }
+    return false;
+}
+
 inline u8 route_method_key(HttpMethod method) {
     switch (method) {
         case HttpMethod::GET:
