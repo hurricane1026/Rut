@@ -38,6 +38,10 @@ static constexpr char kGatewayRequest[] =
 static constexpr char kDefaultBufferingTimeoutRequest[] =
     "GET /buffered-timeout?q=1 HTTP/1.1\r\n"
     "Host: client.example\r\n\r\n";
+static constexpr char kDefaultBufferingCloseTimeoutRequest[] =
+    "GET /buffered-close-timeout?case=explicit-close HTTP/1.1\r\n"
+    "Host: close-timeout-client.example\r\n"
+    "Connection: close\r\n\r\n";
 static constexpr char kDefaultBufferingTimeoutOrigin[] =
     "HTTP/1.1 200 OK\r\n"
     "Server: stall-origin\r\n"
@@ -50,6 +54,12 @@ static constexpr char kDefaultBufferingTimeoutResponseNormalized[] =
     "Date: XXXXXXXXXXXXXXXXXXXXXXXXXXXXX\r\n"
     "Content-Length: 12\r\n"
     "Connection: keep-alive\r\n\r\n";
+static constexpr char kDefaultBufferingCloseTimeoutResponseNormalized[] =
+    "HTTP/1.1 200 OK\r\n"
+    "Server: nginx/1.29.7\r\n"
+    "Date: XXXXXXXXXXXXXXXXXXXXXXXXXXXXX\r\n"
+    "Content-Length: 12\r\n"
+    "Connection: close\r\n\r\n";
 static constexpr char kDefaultBufferingCompleteRequest[] =
     "GET /buffered-complete?q=1 HTTP/1.1\r\n"
     "Host: client.example\r\n\r\n";
@@ -2056,6 +2066,9 @@ static bool capture_nginx_default_buffering_timeout(u16 frontend_port,
                                                     const std::string& nginx_log_path,
                                                     const std::string& container_name,
                                                     Recorder& recorder,
+                                                    const char* request,
+                                                    u32 request_len,
+                                                    const char* expected_response_normalized,
                                                     DefaultBufferingTimeoutObservation& observation,
                                                     std::string& error) {
     DockerGuard docker(container_name);
@@ -2086,9 +2099,7 @@ static bool capture_nginx_default_buffering_timeout(u16 frontend_port,
             if (fd >= 0) close(fd);
         }
     } client{connect_once(frontend_port)};
-    if (client.fd < 0 || !send_all(client.fd,
-                                   kDefaultBufferingTimeoutRequest,
-                                   sizeof(kDefaultBufferingTimeoutRequest) - 1)) {
+    if (client.fd < 0 || !send_all(client.fd, request, request_len)) {
         error = "default-buffering timeout downstream request failed";
         return false;
     }
@@ -2200,7 +2211,7 @@ static bool capture_nginx_default_buffering_timeout(u16 frontend_port,
 
     detail.clear();
     if (!validate_exact_normalized_response(
-            observation.downstream, kDefaultBufferingTimeoutResponseNormalized, detail)) {
+            observation.downstream, expected_response_normalized, detail)) {
         error = "default-buffering timeout wire mismatch: " + detail;
         return false;
     }
@@ -4212,6 +4223,9 @@ int main(int argc, char** argv) {
                                                  temp.nginx_log,
                                                  container + "-default-buffering-timeout",
                                                  default_buffering_timeout_origin,
+                                                 kDefaultBufferingTimeoutRequest,
+                                                 sizeof(kDefaultBufferingTimeoutRequest) - 1,
+                                                 kDefaultBufferingTimeoutResponseNormalized,
                                                  default_buffering_timeout_observation,
                                                  default_buffering_timeout_error)) {
         std::cerr << "FAIL [pinned default buffering timeout]: " << default_buffering_timeout_error
@@ -4256,6 +4270,92 @@ int main(int argc, char** argv) {
                  "proxy_read_timeout (header/EOF/origin-close seconds="
               << first_byte_seconds << "/" << eof_seconds << "/" << origin_close_seconds
               << ", one upstream request)\n";
+
+    Recorder default_buffering_close_timeout_origin;
+    default_buffering_close_timeout_origin.wait_response_peer_close = true;
+    default_buffering_close_timeout_origin.observe_extra_requests_until_stop = true;
+    if (!default_buffering_close_timeout_origin.setup(backend_port,
+                                                      1,
+                                                      kDefaultBufferingTimeoutOrigin,
+                                                      sizeof(kDefaultBufferingTimeoutOrigin) - 1)) {
+        std::cerr << "FAIL [pinned default buffering explicit-close timeout]: origin setup "
+                     "failed\n";
+        return 1;
+    }
+    const std::string default_buffering_close_timeout_config =
+        "events {}\nhttp {\n  access_log off;\n  server {\n    listen 127.0.0.1:" +
+        std::to_string(frontend_port) +
+        ";\n    location / {\n      proxy_pass http://127.0.0.1:" + std::to_string(backend_port) +
+        ";\n      proxy_read_timeout 1s;\n    }\n  }\n}\n";
+    if (default_buffering_close_timeout_config.find("proxy_buffering") != std::string::npos ||
+        default_buffering_close_timeout_config.find("proxy_http_version") != std::string::npos ||
+        !write_file(temp.nginx_config,
+                    default_buffering_close_timeout_config.data(),
+                    default_buffering_close_timeout_config.size())) {
+        std::cerr << "FAIL [pinned default buffering explicit-close timeout]: semantic config "
+                     "write failed\n";
+        return 1;
+    }
+    DefaultBufferingTimeoutObservation default_buffering_close_timeout_observation;
+    std::string default_buffering_close_timeout_error;
+    if (!capture_nginx_default_buffering_timeout(frontend_port,
+                                                 temp.nginx_config,
+                                                 temp.nginx_log,
+                                                 container + "-default-buffering-close-timeout",
+                                                 default_buffering_close_timeout_origin,
+                                                 kDefaultBufferingCloseTimeoutRequest,
+                                                 sizeof(kDefaultBufferingCloseTimeoutRequest) - 1,
+                                                 kDefaultBufferingCloseTimeoutResponseNormalized,
+                                                 default_buffering_close_timeout_observation,
+                                                 default_buffering_close_timeout_error)) {
+        std::cerr << "FAIL [pinned default buffering explicit-close timeout]: "
+                  << default_buffering_close_timeout_error << "\n";
+        dump_wire("pinned default-buffering explicit-close timeout response",
+                  default_buffering_close_timeout_observation.downstream);
+        dump_log(temp.nginx_log, "pinned default-buffering explicit-close timeout nginx log");
+        return 1;
+    }
+    default_buffering_close_timeout_origin.stop();
+    const std::string expected_default_buffering_close_timeout_request =
+        "GET /buffered-close-timeout?case=explicit-close HTTP/1.1\r\nHost: 127.0.0.1:" +
+        std::to_string(backend_port) + "\r\n\r\n";
+    const std::vector<char> expected_default_buffering_close_timeout_request_wire(
+        expected_default_buffering_close_timeout_request.begin(),
+        expected_default_buffering_close_timeout_request.end());
+    if (default_buffering_close_timeout_origin.request !=
+            expected_default_buffering_close_timeout_request_wire ||
+        default_buffering_close_timeout_origin.history.size() != 1 ||
+        default_buffering_close_timeout_origin.history[0] !=
+            expected_default_buffering_close_timeout_request_wire ||
+        default_buffering_close_timeout_origin.accepted.load(std::memory_order_acquire) != 1 ||
+        default_buffering_close_timeout_origin.requests.load(std::memory_order_acquire) != 1) {
+        std::cerr << "FAIL [pinned default buffering explicit-close timeout]: exact upstream "
+                     "wire mismatch\n";
+        dump_wire("expected default-buffering explicit-close timeout upstream request",
+                  expected_default_buffering_close_timeout_request_wire);
+        dump_wire("actual default-buffering explicit-close timeout upstream request",
+                  default_buffering_close_timeout_origin.request);
+        return 1;
+    }
+    const u64 close_timeout_origin_sent_ns =
+        default_buffering_close_timeout_origin.response_sent_ns.load(std::memory_order_acquire);
+    const u64 close_timeout_origin_closed_ns =
+        default_buffering_close_timeout_origin.response_peer_closed_ns.load(
+            std::memory_order_acquire);
+    std::cerr
+        << "PASS: pinned nginx default response buffering honors one explicit downstream close "
+           "after incomplete-body inactivity (header/EOF/origin-close seconds="
+        << static_cast<double>(
+               default_buffering_close_timeout_observation.first_downstream_byte_ns -
+               close_timeout_origin_sent_ns) /
+               1e9
+        << "/"
+        << static_cast<double>(default_buffering_close_timeout_observation.downstream_eof_ns -
+                               close_timeout_origin_sent_ns) /
+               1e9
+        << "/"
+        << static_cast<double>(close_timeout_origin_closed_ns - close_timeout_origin_sent_ns) / 1e9
+        << ", one exact upstream request)\n";
 
     Recorder default_buffering_complete_origin;
     default_buffering_complete_origin.wait_response_peer_close = true;
