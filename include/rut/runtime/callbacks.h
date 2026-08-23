@@ -93,6 +93,8 @@ void on_response_body_recvd(void* lp, Connection& conn, IoEvent ev);
 
 template <typename Loop>
 void on_response_body_sent(void* lp, Connection& conn, IoEvent ev);
+template <typename Loop>
+void pump_response_read_deadline_body(Loop* loop, Connection& conn);
 
 template <typename Loop>
 void on_request_body_sent(void* lp, Connection& conn, IoEvent ev);

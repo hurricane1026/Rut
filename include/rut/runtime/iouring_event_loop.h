@@ -121,6 +121,7 @@ public:
     // the run loop consumes this after the complete wait batch.
     bool http1_boundary_ready_pending;
     bool response_read_deadline_expiry_pending;
+    bool response_read_deadline_body_pump_pending;
 
     struct ResponseReadBatchOwner {
         u32 conn_id = 0;
@@ -136,6 +137,10 @@ public:
         bool saw_relevant = false;
         bool saw_positive = false;
         bool saw_terminal = false;
+        bool post_commit_at_start = false;
+        bool terminal_fault = false;
+        bool positive_terminal = false;
+        bool body_complete_at_start = false;
     };
     ResponseReadBatchOwner response_read_batch_owners[kMaxEventsPerWait];
     u16 response_read_batch_event_owner[kMaxEventsPerWait];
@@ -219,6 +224,7 @@ public:
         upstream_retirement_retry_count = 0;
         http1_boundary_ready_pending = false;
         response_read_deadline_expiry_pending = false;
+        response_read_deadline_body_pump_pending = false;
         response_read_batch_owner_count = 0;
         response_read_batch_event_count = 0;
         response_read_batch_event_index = 0;
@@ -949,6 +955,122 @@ public:
         return true;
     }
 
+    bool consume_response_read_deadline_send_event(Connection& c, const IoEvent& ev) {
+        if (ev.type != IoEventType::Send) return false;
+        const bool close_cancel = (ev.non_upstream_generation & kNonUpstreamSendCancelBit) != 0;
+        const u32 event_generation = ev.non_upstream_generation & kNonUpstreamSendGenerationMask;
+        if (event_generation != 0 &&
+            event_generation == c.response_read_deadline_send_close_generation) {
+            bool* owned = close_cancel ? &c.response_read_deadline_send_close_cancel_owned
+                                       : &c.response_read_deadline_send_close_target_owned;
+            if (*owned && !ev.more) {
+                *owned = false;
+                if (c.pending_ops == 0) {
+                    backend.fatal_error.store(EPROTO, std::memory_order_release);
+                    running_.store(false, std::memory_order_release);
+                } else {
+                    c.pending_ops--;
+                }
+            }
+            if (!c.response_read_deadline_send_close_target_owned &&
+                !c.response_read_deadline_send_close_cancel_owned)
+                c.response_read_deadline_send_close_generation = 0;
+            if (c.fd < 0 && c.pending_ops == 0) reclaim_slot(c.id);
+            return true;
+        }
+        if (!c.response_read_deadline_send_owner_active) {
+            // A nonzero token is owned by this dedicated Send namespace.  Once
+            // tombstoned it remains consumable across retirement/request-2;
+            // generic generation-zero sends are unaffected.
+            return ev.non_upstream_generation != 0;
+        }
+        const u32 owner = c.response_read_deadline_send_owner_generation;
+        if (owner == 0 || ev.non_upstream_generation != owner) return true;
+
+        const bool header =
+            c.response_read_deadline_send_kind == ResponseReadDeadlineSendKind::Header;
+        const bool body = c.response_read_deadline_send_kind == ResponseReadDeadlineSendKind::Body;
+        const auto& send = backend.send_state[c.id];
+        const bool exact_shape =
+            c.id < kMaxConns && c.fd >= 0 && c.send_armed && c.pending_ops > 0 && !ev.more &&
+            ev.aux == 0 && ev.result > 0 &&
+            static_cast<u32>(ev.result) == c.response_read_deadline_send_len &&
+            c.response_read_deadline_send_deadline_generation ==
+                c.response_read_deadline_post_commit_generation &&
+            c.response_read_deadline_send_upstream_episode ==
+                c.response_read_deadline_post_commit_episode &&
+            c.response_read_deadline_send_fd == c.fd &&
+            c.response_read_deadline_send_src != nullptr &&
+            ((header &&
+              c.response_read_deadline_post_commit_phase ==
+                  ResponseReadDeadlinePostCommitPhase::HeaderSend &&
+              c.on_send == &on_response_header_sent<Self> &&
+              c.response_read_deadline_send_src == c.response_header_buf.data() &&
+              c.response_read_deadline_send_len == c.response_header_buf.len()) ||
+             (body &&
+              c.response_read_deadline_post_commit_phase ==
+                  ResponseReadDeadlinePostCommitPhase::BodySend &&
+              c.on_send == &on_response_body_sent<Self> &&
+              c.response_read_deadline_send_src == c.upstream_recv_buf.data() &&
+              c.response_read_deadline_send_len ==
+                  c.response_read_deadline_post_commit_inflight_body)) &&
+            send.src == c.response_read_deadline_send_src && send.fd == c.fd &&
+            send.type == IoEventType::Send && send.generation == owner &&
+            send.offset == c.response_read_deadline_send_len && send.remaining == 0;
+        if (exact_shape) {
+            c.response_read_deadline_send_owner_active = false;
+            c.response_read_deadline_send_tombstone_generation = owner;
+            return false;
+        }
+
+        // F_MORE is invalid for the single-shot downstream Send, but it is not
+        // terminal and therefore owns no completion count yet.  Keep the exact
+        // owner live until close_conn() transfers its generation and target to
+        // the close ledger; clearing it here would make the later target/cancel
+        // CQEs look like unowned duplicates and leak the deferred slot.
+        if (ev.more) {
+            close_conn(c);
+            return true;
+        }
+
+        // Only a matching terminal record may retire this Send target's one
+        // pending count.  Forged generations and duplicates above consume no
+        // accounting; F_MORE leaves the live target for close cancellation.
+        if (c.send_armed && c.pending_ops > 0) {
+            c.pending_ops--;
+            c.send_armed = false;
+            backend.send_state[c.id] = {};
+        }
+        c.response_read_deadline_send_owner_active = false;
+        c.response_read_deadline_send_tombstone_generation = owner;
+        c.clear_response_read_deadline_send_owner();
+        close_conn(c);
+        return true;
+    }
+
+    bool response_read_deadline_send_completion_is_valid(const Connection& c,
+                                                         const IoEvent& ev,
+                                                         ResponseReadDeadlineSendKind kind) const {
+        if (c.id >= kMaxConns) return false;
+        const auto& send = backend.send_state[c.id];
+        return !c.response_read_deadline_send_owner_active &&
+               c.response_read_deadline_send_owner_generation != 0 &&
+               c.response_read_deadline_send_tombstone_generation ==
+                   c.response_read_deadline_send_owner_generation &&
+               c.response_read_deadline_send_kind == kind && ev.type == IoEventType::Send &&
+               !ev.more && ev.aux == 0 &&
+               ev.non_upstream_generation == c.response_read_deadline_send_owner_generation &&
+               ev.result > 0 && static_cast<u32>(ev.result) == c.response_read_deadline_send_len &&
+               !c.send_armed &&
+               c.on_send == (kind == ResponseReadDeadlineSendKind::Header
+                                 ? &on_response_header_sent<Self>
+                                 : &on_response_body_sent<Self>) &&
+               send.src == c.response_read_deadline_send_src && send.fd == c.fd &&
+               send.type == IoEventType::Send &&
+               send.generation == c.response_read_deadline_send_owner_generation &&
+               send.offset == c.response_read_deadline_send_len && send.remaining == 0;
+    }
+
     // Existing production C1 caller: its callback has already been detached,
     // and the proven strict point owns at most one upstream recv target.
     [[nodiscard]] bool begin_strict_upstream_retirement(Connection& c) {
@@ -1482,6 +1604,11 @@ public:
         const u8 close_target_owned = c.upstream_close_target_owned;
         const u8 close_cancel_owned = c.upstream_close_cancel_owned;
         const bool close_pause_cancel_owned = c.upstream_close_pause_cancel_owned;
+        const u32 deadline_send_close_generation = c.response_read_deadline_send_close_generation;
+        const bool deadline_send_close_target_owned =
+            c.response_read_deadline_send_close_target_owned;
+        const bool deadline_send_close_cancel_owned =
+            c.response_read_deadline_send_close_cancel_owned;
         c.reset();
         conns[cid].id = cid;
         conns[cid].shard_id = allocated_shard;
@@ -1501,6 +1628,11 @@ public:
         conns[cid].upstream_close_target_owned = close_target_owned;
         conns[cid].upstream_close_cancel_owned = close_cancel_owned;
         conns[cid].upstream_close_pause_cancel_owned = close_pause_cancel_owned;
+        conns[cid].response_read_deadline_send_close_generation = deadline_send_close_generation;
+        conns[cid].response_read_deadline_send_close_target_owned =
+            deadline_send_close_target_owned;
+        conns[cid].response_read_deadline_send_close_cancel_owned =
+            deadline_send_close_cancel_owned;
         pending_free[pending_free_count++] = cid;
     }
 
@@ -1527,11 +1659,35 @@ public:
     // Raw client send — bytes go to the wire as-is (plaintext, or already-
     // encrypted ciphertext from the TLS layer).
     bool submit_send_raw(Connection& c, const u8* buf, u32 len) {
-        if (backend.add_send(c.fd, c.id, buf, len)) {
+        const bool deadline_send = c.response_read_deadline_post_commit_phase ==
+                                       ResponseReadDeadlinePostCommitPhase::HeaderSend ||
+                                   c.response_read_deadline_post_commit_phase ==
+                                       ResponseReadDeadlinePostCommitPhase::BodySend;
+        u32 generation = 0;
+        if (deadline_send) {
+            const ResponseReadDeadlineSendKind kind =
+                c.response_read_deadline_post_commit_phase ==
+                        ResponseReadDeadlinePostCommitPhase::HeaderSend
+                    ? ResponseReadDeadlineSendKind::Header
+                    : ResponseReadDeadlineSendKind::Body;
+            if (c.response_read_deadline_send_owner_active || buf == nullptr || len == 0 ||
+                c.fd < 0 || !c.next_response_read_deadline_send_generation())
+                return false;
+            generation = c.response_read_deadline_send_owner_generation;
+            c.response_read_deadline_send_deadline_generation = c.response_read_deadline_generation;
+            c.response_read_deadline_send_upstream_episode = c.upstream_episode;
+            c.response_read_deadline_send_src = buf;
+            c.response_read_deadline_send_len = len;
+            c.response_read_deadline_send_fd = c.fd;
+            c.response_read_deadline_send_kind = kind;
+            c.response_read_deadline_send_owner_active = true;
+        }
+        if (backend.add_send(c.fd, c.id, buf, len, generation)) {
             c.pending_ops++;
             c.send_armed = true;
             return true;
         }
+        if (deadline_send) c.clear_response_read_deadline_send_owner();
         return false;
     }
 
@@ -1715,9 +1871,12 @@ public:
     bool response_read_deadline_identity_is_stable(const Connection& c) const {
         const RouteConfig* cfg = c.request_config;
         const u16 bundle_id = c.response_read_deadline_bundle_id;
+        const bool post_commit =
+            c.response_read_deadline_post_commit_phase != ResponseReadDeadlinePostCommitPhase::None;
         if (c.id >= kMaxConns || c.fd < 0 || c.upstream_fd < 0 || is_draining() ||
-            c.state != ConnState::Proxying || c.protocol != ConnProtocol::Http11 || c.tls_active ||
-            c.h2 != nullptr || c.response_read_deadline_owner_generation == 0 ||
+            (c.state != ConnState::Proxying && !(post_commit && c.state == ConnState::Sending)) ||
+            c.protocol != ConnProtocol::Http11 || c.tls_active || c.h2 != nullptr ||
+            c.response_read_deadline_owner_generation == 0 ||
             c.response_read_deadline_owner_generation != c.response_read_deadline_generation ||
             c.response_read_deadline_profile == ResponseReadDeadlineProfile::None ||
             c.response_read_deadline_upstream_episode != c.upstream_episode ||
@@ -1741,12 +1900,26 @@ public:
             c.response_read_deadline_progress_generation == c.response_read_deadline_generation &&
             c.response_read_deadline_progress_episode == c.upstream_episode &&
             c.response_read_deadline_progress_bytes != 0;
-        return (no_progress || exact_progress) &&
+        const bool exact_post_commit_progress =
+            post_commit &&
+            c.response_read_deadline_progress_generation == c.response_read_deadline_generation &&
+            c.response_read_deadline_progress_episode == c.upstream_episode &&
+            c.response_read_deadline_progress_bytes ==
+                c.response_read_deadline_post_commit_origin_received;
+        const bool selecting_post_commit =
+            post_commit && no_progress &&
+            c.response_read_deadline_post_commit_phase ==
+                ResponseReadDeadlinePostCommitPhase::HeaderSend &&
+            (c.response_read_deadline_state == ResponseReadDeadlineState::RefreshPending ||
+             c.response_read_deadline_state == ResponseReadDeadlineState::BodyComplete);
+        return (post_commit ? exact_post_commit_progress || selecting_post_commit
+                            : no_progress || exact_progress) &&
                response_read_deadline_profile_is_stable(c, *cfg, bundle_id) &&
                c.upstream_attempts == 1 && !c.upstream_reused && c.request_upload_complete &&
                !c.upstream_request_incomplete &&
-               c.on_upstream_recv == &on_upstream_response<Self> && c.pipeline_depth == 0 &&
-               !c.target_transform_recorded && !c.req_path_overridden &&
+               (c.on_upstream_recv == &on_upstream_response<Self> ||
+                (post_commit && c.on_upstream_recv == nullptr)) &&
+               c.pipeline_depth == 0 && !c.target_transform_recorded && !c.req_path_overridden &&
                c.req_header_override_count == 0 && !c.req_header_override_overflow &&
                c.resp_header_mutation_count == 0 && c.resp_header_mutation_pending_count == 0 &&
                !c.resp_header_mutation_pending_overflow && !c.resp_header_mutation_overflow &&
@@ -1768,7 +1941,8 @@ public:
         if (cid >= kMaxConns || response_read_batch_owner_count >= kMaxEventsPerWait) return 0;
         const Connection& c = conns[cid];
         if (c.response_read_deadline_state != ResponseReadDeadlineState::Armed &&
-            c.response_read_deadline_state != ResponseReadDeadlineState::ExpiryPending)
+            c.response_read_deadline_state != ResponseReadDeadlineState::ExpiryPending &&
+            c.response_read_deadline_state != ResponseReadDeadlineState::BodyComplete)
             return 0;
         auto& owner = response_read_batch_owners[response_read_batch_owner_count];
         owner = {};
@@ -1777,6 +1951,10 @@ public:
         owner.upstream_episode = c.upstream_episode;
         owner.profile = c.response_read_deadline_profile;
         owner.method = c.response_read_deadline_method;
+        owner.post_commit_at_start =
+            c.response_read_deadline_post_commit_phase != ResponseReadDeadlinePostCommitPhase::None;
+        owner.body_complete_at_start =
+            c.response_read_deadline_state == ResponseReadDeadlineState::BodyComplete;
         owner.valid = response_read_deadline_identity_is_stable(c) && c.upstream_recv_armed;
         return static_cast<u16>(++response_read_batch_owner_count);
     }
@@ -1825,12 +2003,12 @@ public:
             response_read_batch_event_owner[i] = owner_index;
             owner.last_relevant = i;
             owner.saw_relevant = true;
-            if (owner.saw_terminal) owner.valid = false;
             if (ev.aux != 0 || ev.result == -ENOBUFS || ev.result == -ECANCELED ||
                 ev.copy_witness == IoEventCopyWitness::Invalid)
                 owner.valid = false;
 
             if (ev.result > 0) {
+                if (owner.saw_terminal && !owner.terminal_fault) owner.valid = false;
                 if (ev.copy_witness != IoEventCopyWitness::Full ||
                     ev.copy_deadline_generation != owner.deadline_generation ||
                     ev.copy_deadline_profile != static_cast<u8>(owner.profile) ||
@@ -1851,9 +2029,15 @@ public:
                         owner.positive_bytes += positive;
                     owner.saw_positive = true;
                 }
-                if (!ev.more) owner.saw_terminal = true;
+                if (!ev.more) {
+                    if (owner.saw_terminal) owner.valid = false;
+                    owner.saw_terminal = true;
+                    owner.positive_terminal = true;
+                }
             } else {
                 if (ev.more || ev.copy_witness != IoEventCopyWitness::None) owner.valid = false;
+                if (owner.saw_terminal) owner.valid = false;
+                owner.terminal_fault = true;
                 owner.saw_terminal = true;
             }
         }
@@ -1875,9 +2059,24 @@ public:
                 c.response_read_deadline_progress_generation == owner.deadline_generation &&
                 c.response_read_deadline_progress_episode == owner.upstream_episode &&
                 c.response_read_deadline_progress_bytes == pre_batch_bytes && pre_batch_bytes != 0;
-            if ((pre_batch_bytes == 0 && !no_prior_progress) ||
-                (pre_batch_bytes != 0 && !exact_prior_progress))
+            if (owner.post_commit_at_start) {
+                const u32 unsent = c.response_read_deadline_post_commit_origin_received -
+                                   c.response_read_deadline_post_commit_downstream_completed;
+                const u32 header_prefix = c.response_read_deadline_post_commit_phase ==
+                                                  ResponseReadDeadlinePostCommitPhase::HeaderSend
+                                              ? c.response_read_deadline_post_commit_raw_header_end
+                                              : 0;
+                if (header_prefix > 0xFFFFFFFFu - unsent ||
+                    pre_batch_bytes != header_prefix + unsent ||
+                    c.response_read_deadline_progress_generation != owner.deadline_generation ||
+                    c.response_read_deadline_progress_episode != owner.upstream_episode ||
+                    c.response_read_deadline_progress_bytes !=
+                        c.response_read_deadline_post_commit_origin_received)
+                    owner.valid = false;
+            } else if ((pre_batch_bytes == 0 && !no_prior_progress) ||
+                       (pre_batch_bytes != 0 && !exact_prior_progress)) {
                 owner.valid = false;
+            }
             if (owner.saw_positive &&
                 (owner.first_copy_begin > 0xFFFFFFFFu - owner.positive_bytes ||
                  owner.first_copy_begin + owner.positive_bytes != owner.expected_copy_end ||
@@ -1896,7 +2095,8 @@ public:
                 c.response_read_deadline_profile == owner.profile &&
                 c.response_read_deadline_method == owner.method &&
                 (c.response_read_deadline_state == ResponseReadDeadlineState::Armed ||
-                 c.response_read_deadline_state == ResponseReadDeadlineState::ExpiryPending);
+                 c.response_read_deadline_state == ResponseReadDeadlineState::ExpiryPending ||
+                 c.response_read_deadline_state == ResponseReadDeadlineState::BodyComplete);
             if (!owner.valid || !key_stable) {
                 owner.valid = false;
                 if (c.fd >= 0) close_conn(c);
@@ -1928,6 +2128,84 @@ public:
         return true;
     }
 
+    [[nodiscard]] bool begin_response_read_deadline_body_stream(Connection& c,
+                                                                const IoEvent& ev,
+                                                                u32 raw_header_end,
+                                                                u32 declared_body) {
+        if (c.response_read_deadline_state != ResponseReadDeadlineState::BatchPending ||
+            c.response_read_deadline_post_commit_phase !=
+                ResponseReadDeadlinePostCommitPhase::None ||
+            !response_read_deadline_identity_is_stable(c) ||
+            c.response_read_deadline_profile !=
+                ResponseReadDeadlineProfile::BodylessNonHeadContentLengthZero ||
+            c.req_method != static_cast<u8>(LogHttpMethod::Get) || declared_body == 0 ||
+            raw_header_end == 0 || raw_header_end > c.upstream_recv_buf.len() ||
+            declared_body > c.upstream_recv_buf.capacity() - raw_header_end)
+            return false;
+        const u32 initial_body = c.upstream_recv_buf.len() - raw_header_end;
+        if (initial_body > declared_body) return false;
+
+        c.response_read_deadline_post_commit_phase =
+            ResponseReadDeadlinePostCommitPhase::HeaderSend;
+        c.response_read_deadline_post_commit_generation = c.response_read_deadline_generation;
+        c.response_read_deadline_post_commit_episode = c.upstream_episode;
+        c.response_read_deadline_post_commit_raw_header_end = raw_header_end;
+        c.response_read_deadline_post_commit_declared_body = declared_body;
+        c.response_read_deadline_post_commit_origin_received = initial_body;
+        c.response_read_deadline_post_commit_downstream_submitted = 0;
+        c.response_read_deadline_post_commit_downstream_completed = 0;
+        c.response_read_deadline_post_commit_inflight_body = 0;
+        c.response_read_deadline_post_commit_pump_pending = false;
+
+        if (initial_body == declared_body) {
+            c.response_read_deadline_state = ResponseReadDeadlineState::BodyComplete;
+            return true;
+        }
+        if (ev.result <= 0 || ev.aux != 0 || ev.upstream_episode != c.upstream_episode)
+            return false;
+        if (ev.more) {
+            if (!c.upstream_recv_armed) return false;
+        } else {
+            if (c.upstream_recv_armed || c.upstream_recv_pause_cancel_pending ||
+                c.upstream_recv_pause_rearm_pending || c.upstream_recv_cancel_inflight ||
+                !backend.add_first_response_recv(c.upstream_fd, c.id, c.upstream_episode))
+                return false;
+            c.pending_ops++;
+            c.upstream_recv_armed = true;
+        }
+        c.response_read_deadline_state = ResponseReadDeadlineState::RefreshPending;
+        return true;
+    }
+
+    void defer_response_read_deadline_body_pump(Connection& c) {
+        c.response_read_deadline_post_commit_pump_pending = true;
+        response_read_deadline_body_pump_pending = true;
+    }
+
+    [[nodiscard]] bool retire_response_read_deadline_origin(Connection& c) {
+        if (c.response_read_deadline_state != ResponseReadDeadlineState::BodyComplete ||
+            !response_read_deadline_post_commit_is_stable(c) || c.send_armed ||
+            c.response_read_deadline_post_commit_origin_received !=
+                c.response_read_deadline_post_commit_declared_body ||
+            c.response_read_deadline_post_commit_downstream_completed !=
+                c.response_read_deadline_post_commit_declared_body ||
+            c.response_read_deadline_post_commit_inflight_body != 0 ||
+            c.upstream_recv_pause_cancel_pending || c.upstream_recv_cancel_inflight)
+            return false;
+        c.on_upstream_recv = nullptr;
+        c.upstream_abandoned = true;
+        c.upstream_keep_alive = false;
+        if (!begin_strict_upstream_retirement(c)) return false;
+        ::close(c.upstream_fd);
+        c.upstream_fd = -1;
+        if (c.upstream_slot_held) {
+            upstream_release(c.upstream_slot_uid);
+            c.upstream_slot_held = false;
+        }
+        c.clear_response_read_deadline();
+        return true;
+    }
+
     void settle_response_read_deadline_batch() {
         for (u32 oi = 0; oi < response_read_batch_owner_count; ++oi) {
             const auto& owner = response_read_batch_owners[oi];
@@ -1939,16 +2217,81 @@ public:
                 c.upstream_episode == owner.upstream_episode &&
                 c.response_read_deadline_profile == owner.profile &&
                 c.response_read_deadline_method == owner.method;
-            if (key_stable &&
-                c.response_read_deadline_state == ResponseReadDeadlineState::RefreshPending &&
-                c.upstream_recv_armed && response_read_deadline_identity_is_stable(c)) {
+            if (key_stable && !owner.post_commit_at_start &&
+                c.response_read_deadline_post_commit_phase ==
+                    ResponseReadDeadlinePostCommitPhase::HeaderSend &&
+                c.response_read_deadline_state == ResponseReadDeadlineState::BodyComplete) {
+                c.response_read_deadline_progress_generation = owner.deadline_generation;
+                c.response_read_deadline_progress_episode = owner.upstream_episode;
+                c.response_read_deadline_progress_bytes =
+                    c.response_read_deadline_post_commit_origin_received;
+            } else if (key_stable && owner.body_complete_at_start &&
+                       c.response_read_deadline_post_commit_phase !=
+                           ResponseReadDeadlinePostCommitPhase::None &&
+                       c.response_read_deadline_state == ResponseReadDeadlineState::BatchPending) {
+                if (owner.positive_bytes != 0) {
+                    close_conn(c);
+                    continue;
+                }
+                c.response_read_deadline_state = ResponseReadDeadlineState::BodyComplete;
+            } else if (key_stable && owner.post_commit_at_start &&
+                       c.response_read_deadline_post_commit_phase !=
+                           ResponseReadDeadlinePostCommitPhase::None &&
+                       (c.response_read_deadline_state == ResponseReadDeadlineState::BatchPending ||
+                        c.response_read_deadline_state ==
+                            ResponseReadDeadlineState::RefreshPending)) {
+                const u32 received = c.response_read_deadline_post_commit_origin_received;
+                const u32 declared = c.response_read_deadline_post_commit_declared_body;
+                if (owner.positive_bytes > declared - received) {
+                    close_conn(c);
+                    continue;
+                }
+                c.response_read_deadline_post_commit_origin_received =
+                    received + owner.positive_bytes;
+                c.response_read_deadline_progress_generation = owner.deadline_generation;
+                c.response_read_deadline_progress_episode = owner.upstream_episode;
+                c.response_read_deadline_progress_bytes =
+                    c.response_read_deadline_post_commit_origin_received;
+                if (c.response_read_deadline_post_commit_origin_received == declared) {
+                    c.response_read_deadline_state = ResponseReadDeadlineState::BodyComplete;
+                } else {
+                    if (owner.terminal_fault) {
+                        close_conn(c);
+                        continue;
+                    }
+                    if (owner.saw_terminal && !c.upstream_recv_armed) {
+                        if (c.upstream_recv_pause_cancel_pending ||
+                            c.upstream_recv_pause_rearm_pending ||
+                            c.upstream_recv_cancel_inflight ||
+                            !backend.add_first_response_recv(
+                                c.upstream_fd, c.id, c.upstream_episode)) {
+                            close_conn(c);
+                            continue;
+                        }
+                        c.pending_ops++;
+                        c.upstream_recv_armed = true;
+                    }
+                    timer.refresh(&c, c.response_read_deadline_seconds);
+                    c.response_read_deadline_state = ResponseReadDeadlineState::Armed;
+                }
+                if (c.response_read_deadline_post_commit_phase ==
+                    ResponseReadDeadlinePostCommitPhase::WaitingBody)
+                    defer_response_read_deadline_body_pump(c);
+            } else if (key_stable &&
+                       c.response_read_deadline_state ==
+                           ResponseReadDeadlineState::RefreshPending &&
+                       c.upstream_recv_armed && response_read_deadline_identity_is_stable(c)) {
                 if (c.upstream_recv_buf.len() == 0) {
                     close_conn(c);
                     continue;
                 }
                 c.response_read_deadline_progress_generation = owner.deadline_generation;
                 c.response_read_deadline_progress_episode = owner.upstream_episode;
-                c.response_read_deadline_progress_bytes = c.upstream_recv_buf.len();
+                c.response_read_deadline_progress_bytes =
+                    c.response_read_deadline_post_commit_phase ==
+                            ResponseReadDeadlinePostCommitPhase::None
+                        ? c.upstream_recv_buf.len()
+                        : c.response_read_deadline_post_commit_origin_received;
                 timer.refresh(&c, c.response_read_deadline_seconds);
                 c.response_read_deadline_state = ResponseReadDeadlineState::Armed;
             } else if (key_stable &&
@@ -1976,10 +2319,26 @@ public:
             Connection& c = conns[id];
             if (c.response_read_deadline_state != ResponseReadDeadlineState::ExpiryPending)
                 continue;
+            if (c.response_read_deadline_post_commit_phase !=
+                ResponseReadDeadlinePostCommitPhase::None) {
+                close_conn(c);
+                continue;
+            }
             // The strict-timeout helper owns the complete non-mutating proof,
             // private-prefix consumption, and deadline disarm ordering.  No
             // caller assertion can manufacture positive-progress admission.
             if (!try_prebuilt_strict_read_timeout<Self>(this, c) && c.fd >= 0) close_conn(c);
+        }
+    }
+
+    void pump_response_read_deadline_bodies() {
+        if (!response_read_deadline_body_pump_pending) return;
+        response_read_deadline_body_pump_pending = false;
+        for (u32 id = 0; id < kMaxConns; ++id) {
+            Connection& c = conns[id];
+            if (!c.response_read_deadline_post_commit_pump_pending) continue;
+            c.response_read_deadline_post_commit_pump_pending = false;
+            if (c.fd >= 0) pump_response_read_deadline_body<Self>(this, c);
         }
     }
 
@@ -1994,6 +2353,7 @@ public:
         }
         settle_response_read_deadline_batch();
         resolve_response_read_deadline_expiries();
+        pump_response_read_deadline_bodies();
         // Retirement/header rendezvous owners publish only readiness during
         // dispatch. Admit parked HTTP/1 request boundaries after every CQE in
         // this wait batch, before reclamation or accept reuse.
@@ -2113,6 +2473,15 @@ public:
     }
 
     void close_conn_impl(Connection& c) {
+        if (c.response_read_deadline_send_owner_active) {
+            c.response_read_deadline_send_close_generation =
+                c.response_read_deadline_send_owner_generation;
+            c.response_read_deadline_send_close_target_owned = c.send_armed;
+            c.response_read_deadline_send_close_cancel_owned = false;
+            c.response_read_deadline_send_tombstone_generation =
+                c.response_read_deadline_send_owner_generation;
+            c.clear_response_read_deadline_send_owner();
+        }
         disarm_response_read_deadline(c);
         timer.remove(&c);
         // A close is terminal for a parked request boundary. Readiness may have
@@ -2167,6 +2536,7 @@ public:
                                               !c.upstream_recv_pause_cancel_pending &&
                                               !idle_return_recv_draining;
             u8 close_cancel_mask = 0;
+            bool close_send_cancel_owned = false;
             const u32 submitted = backend.cancel(c.fd,
                                                  c.id,
                                                  c.recv_armed,
@@ -2178,8 +2548,10 @@ public:
                                                  c.upstream_episode,
                                                  c.yield_timeout_armed,
                                                  c.yield_timer_gen,
-                                                 &close_cancel_mask);
+                                                 &close_cancel_mask,
+                                                 &close_send_cancel_owned);
             c.upstream_close_cancel_owned |= close_cancel_mask;
+            c.response_read_deadline_send_close_cancel_owned |= close_send_cancel_owned;
             c.pending_ops += submitted;
         }
         if (c.fd >= 0) {
@@ -2463,6 +2835,7 @@ public:
                 if (ev.conn_id < kMaxConns) {
                     auto& conn = conns[ev.conn_id];
                     if (consume_strict_upstream_retirement_event(conn, ev)) break;
+                    if (consume_response_read_deadline_send_event(conn, ev)) break;
                     if (consume_prebuilt_http1_header_send_event(conn, ev)) break;
                     const bool stale_tagged_upstream =
                         io_event_is_tagged_stale(ev, conn.upstream_episode);
@@ -2611,6 +2984,12 @@ public:
                     // THIS recv drains.) Only the final CQE accounts/drains the recv.
                     if (ev.type == IoEventType::UpstreamRecv &&
                         conn.upstream_recv_cancel_inflight && conn.upstream_recv_terminal_stale) {
+                        const bool deadline_surplus =
+                            ev.result > 0 &&
+                            conn.response_read_deadline_state ==
+                                ResponseReadDeadlineState::BodyComplete &&
+                            conn.response_read_deadline_post_commit_phase !=
+                                ResponseReadDeadlinePostCommitPhase::None;
                         if (ev.result > 0) {
                             if (conn.idle_return_fd >= 0)
                                 conn.upstream_recv_idle_stale_bytes = true;
@@ -2618,6 +2997,16 @@ public:
                             if (conn.upstream_recv_buf.len() >= stale)
                                 conn.upstream_recv_buf.set_len(conn.upstream_recv_buf.len() -
                                                                stale);
+                        }
+                        if (deadline_surplus) {
+                            if (!ev.more) {
+                                conn.upstream_recv_armed = false;
+                                conn.upstream_recv_cancel_inflight = false;
+                                conn.upstream_recv_terminal_stale = false;
+                                if (conn.pending_ops > 0) conn.pending_ops--;
+                            }
+                            this->close_conn(conn);
+                            break;
                         }
                         if (!ev.more) {
                             conn.upstream_recv_armed = false;

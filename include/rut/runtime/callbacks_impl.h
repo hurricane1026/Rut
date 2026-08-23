@@ -790,6 +790,8 @@ inline bool try_prebuilt_strict_read_timeout(Loop* loop, Connection& conn);
 
 template <typename Loop>
 void pipeline_dispatch(Loop* loop, Connection& conn);
+template <typename Loop>
+void proxy_stream_complete(Loop* loop, Connection& conn);
 
 // Client send with @throttle token-bucket accounting. With no per-route throttle
 // (bps == 0) this is just loop->submit_send. Otherwise it advances the
@@ -4928,6 +4930,44 @@ template <typename Loop>
 void on_response_header_sent(void* lp, Connection& conn, IoEvent ev) {
     auto* loop = static_cast<Loop*>(lp);
 
+    if (conn.response_read_deadline_post_commit_phase !=
+        ResponseReadDeadlinePostCommitPhase::None) {
+        const bool send_owner_valid = [&]() {
+            if constexpr (requires(
+                              const Loop* candidate, const Connection& c, const IoEvent& event) {
+                              candidate->response_read_deadline_send_completion_is_valid(
+                                  c, event, ResponseReadDeadlineSendKind::Header);
+                          }) {
+                return loop->response_read_deadline_send_completion_is_valid(
+                    conn, ev, ResponseReadDeadlineSendKind::Header);
+            }
+            return false;
+        }();
+        if (!send_owner_valid || ev.result <= 0 ||
+            static_cast<u32>(ev.result) != conn.response_header_buf.len() ||
+            conn.response_read_deadline_post_commit_phase !=
+                ResponseReadDeadlinePostCommitPhase::HeaderSend ||
+            !response_read_deadline_post_commit_is_stable(conn) ||
+            conn.response_read_deadline_post_commit_inflight_body != 0 ||
+            conn.upstream_send_len != conn.response_read_deadline_post_commit_raw_header_end ||
+            conn.upstream_recv_buf.len() < conn.upstream_send_len) {
+            loop->close_conn(conn);
+            return;
+        }
+        conn.clear_response_read_deadline_send_owner();
+        (void)consume_upstream_sent(conn);
+        conn.response_read_deadline_post_commit_phase =
+            ResponseReadDeadlinePostCommitPhase::WaitingBody;
+        if constexpr (requires(Loop* candidate, Connection& c) {
+                          candidate->defer_response_read_deadline_body_pump(c);
+                      }) {
+            loop->defer_response_read_deadline_body_pump(conn);
+        } else {
+            loop->close_conn(conn);
+        }
+        return;
+    }
+
     if (ev.result <= 0) {
         loop->close_conn(conn);
         return;
@@ -4953,6 +4993,60 @@ void on_response_header_sent(void* lp, Connection& conn, IoEvent ev) {
     } else {
         loop->submit_recv_upstream(conn);
     }
+}
+
+template <typename Loop>
+void pump_response_read_deadline_body(Loop* loop, Connection& conn) {
+    if (!response_read_deadline_post_commit_is_stable(conn) ||
+        conn.response_read_deadline_post_commit_phase !=
+            ResponseReadDeadlinePostCommitPhase::WaitingBody ||
+        conn.response_read_deadline_post_commit_inflight_body != 0 || conn.send_armed) {
+        loop->close_conn(conn);
+        return;
+    }
+    const u32 received = conn.response_read_deadline_post_commit_origin_received;
+    const u32 completed = conn.response_read_deadline_post_commit_downstream_completed;
+    if (completed > received || conn.upstream_recv_buf.len() != received - completed) {
+        loop->close_conn(conn);
+        return;
+    }
+    const u32 available = received - completed;
+    if (available == 0) {
+        if (received == conn.response_read_deadline_post_commit_declared_body) {
+            if constexpr (requires(Loop* candidate, Connection& c) {
+                              candidate->retire_response_read_deadline_origin(c);
+                          }) {
+                if (!loop->retire_response_read_deadline_origin(conn)) {
+                    loop->close_conn(conn);
+                    return;
+                }
+            } else {
+                loop->close_conn(conn);
+                return;
+            }
+            // The post-commit Send owner is already tombstoned and the exact
+            // origin episode is under strict retirement.  Detach the completed
+            // Header/Body callbacks before proxy_stream_complete parks request
+            // 2; otherwise the rendezvous correctly refuses to hand a fresh
+            // request to a connection that still advertises an old Send owner.
+            conn.clear_slots();
+            proxy_stream_complete<Loop>(loop, conn);
+        }
+        return;
+    }
+    if (conn.response_read_deadline_post_commit_downstream_submitted != completed ||
+        available > conn.resp_body_remaining) {
+        loop->close_conn(conn);
+        return;
+    }
+    conn.response_read_deadline_post_commit_downstream_submitted += available;
+    conn.response_read_deadline_post_commit_inflight_body = available;
+    conn.resp_body_remaining -= available;
+    conn.resp_body_sent += available;
+    conn.upstream_send_len = available;
+    conn.response_read_deadline_post_commit_phase = ResponseReadDeadlinePostCommitPhase::BodySend;
+    conn.transition_to_sending(&on_response_body_sent<Loop>);
+    if (!client_send(loop, conn, conn.upstream_recv_buf.data(), available)) loop->close_conn(conn);
 }
 
 template <typename Loop>
@@ -5237,6 +5331,12 @@ void proxy_stream_complete(Loop* loop, Connection& conn) {
         return;
     }
 
+    if constexpr (requires(Loop* candidate, Connection& c) {
+                      candidate->defer_http1_request_boundary(c);
+                  }) {
+        if (conn.upstream_retirement_active && loop->defer_http1_request_boundary(conn)) return;
+    }
+
     // If this response was throttled, arm_throttle_timer pulled the connection off
     // the keepalive wheel (the precise timer owned its wakeup). Now that the
     // throttle pause is cleared (its timer tick is a no-op), restore the normal
@@ -5289,6 +5389,46 @@ void proxy_stream_complete(Loop* loop, Connection& conn) {
 template <typename Loop>
 void on_response_body_sent(void* lp, Connection& conn, IoEvent ev) {
     auto* loop = static_cast<Loop*>(lp);
+
+    if (conn.response_read_deadline_post_commit_phase !=
+        ResponseReadDeadlinePostCommitPhase::None) {
+        const u32 inflight = conn.response_read_deadline_post_commit_inflight_body;
+        const bool send_owner_valid = [&]() {
+            if constexpr (requires(
+                              const Loop* candidate, const Connection& c, const IoEvent& event) {
+                              candidate->response_read_deadline_send_completion_is_valid(
+                                  c, event, ResponseReadDeadlineSendKind::Body);
+                          }) {
+                return loop->response_read_deadline_send_completion_is_valid(
+                    conn, ev, ResponseReadDeadlineSendKind::Body);
+            }
+            return false;
+        }();
+        if (!send_owner_valid || ev.result <= 0 || static_cast<u32>(ev.result) != inflight ||
+            inflight == 0 ||
+            conn.response_read_deadline_post_commit_phase !=
+                ResponseReadDeadlinePostCommitPhase::BodySend ||
+            !response_read_deadline_post_commit_is_stable(conn) ||
+            conn.upstream_send_len != inflight || conn.upstream_recv_buf.len() < inflight ||
+            conn.response_read_deadline_post_commit_downstream_completed > 0xFFFFFFFFu - inflight) {
+            loop->close_conn(conn);
+            return;
+        }
+        conn.clear_response_read_deadline_send_owner();
+        conn.response_read_deadline_post_commit_downstream_completed += inflight;
+        conn.response_read_deadline_post_commit_inflight_body = 0;
+        (void)consume_upstream_sent(conn);
+        conn.response_read_deadline_post_commit_phase =
+            ResponseReadDeadlinePostCommitPhase::WaitingBody;
+        if constexpr (requires(Loop* candidate, Connection& c) {
+                          candidate->defer_response_read_deadline_body_pump(c);
+                      }) {
+            loop->defer_response_read_deadline_body_pump(conn);
+        } else {
+            loop->close_conn(conn);
+        }
+        return;
+    }
 
     if (ev.result <= 0) {
         loop->close_conn(conn);
@@ -7436,11 +7576,10 @@ void on_upstream_response(void* lp, Connection& conn, IoEvent ev) {
                 FailurePolicyHeadMode::Reject &&
             config->failure_policies[conn.timeout_failure_policy_id - 1].head_mode ==
                 FailurePolicyHeadMode::Reject;
-        const bool strict_cl0 =
+        const bool strict_common =
             owner_exact && resp.version == HttpVersion::Http11 && resp.status_code == 200 &&
-            resp.content_length_count == 1 && resp.has_content_length && resp.content_length == 0 &&
-            !resp.chunked && !resp.headers_truncated &&
-            resp_parser.header_end == conn.upstream_recv_buf.len() &&
+            resp.content_length_count == 1 && resp.has_content_length && !resp.chunked &&
+            !resp.headers_truncated && resp_parser.header_end <= conn.upstream_recv_buf.len() &&
             conn.req_http_version == static_cast<u8>(HttpVersion::Http11) &&
             (fixed_upload ? conn.req_body_mode == BodyMode::ContentLength &&
                                 conn.req_body_remaining == 0 && conn.request_body_fully_buffered
@@ -7453,7 +7592,17 @@ void on_upstream_response(void* lp, Connection& conn, IoEvent ev) {
             !conn.target_transform_recorded && !conn.req_path_overridden &&
             conn.req_header_override_count == 0 && !conn.req_header_override_overflow &&
             strict_response_upload_ready(conn);
-        if (!strict_cl0) {
+        const u32 raw_header_end = resp_parser.header_end;
+        const u32 raw_total = conn.upstream_recv_buf.len();
+        const bool strict_cl0 =
+            strict_common && resp.content_length == 0 && raw_header_end == raw_total;
+        const bool strict_positive_get =
+            strict_common && !fixed_upload &&
+            explicit_method == static_cast<u8>(LogHttpMethod::Get) && resp.content_length > 0 &&
+            raw_header_end <= conn.upstream_recv_buf.capacity() &&
+            resp.content_length <= conn.upstream_recv_buf.capacity() - raw_header_end &&
+            raw_total - raw_header_end <= resp.content_length;
+        if (!strict_cl0 && !strict_positive_get) {
             disarm_explicit_deadline();
             loop->close_conn(conn);
             return;
@@ -7475,10 +7624,43 @@ void on_upstream_response(void* lp, Connection& conn, IoEvent ev) {
         if (output_parser.parse(conn.response_header_buf.data(), output_len, &output_response) !=
                 ParseStatus::Complete ||
             output_response.version != HttpVersion::Http11 || output_response.status_code != 200 ||
-            output_response.content_length_count != 1 || output_response.content_length != 0 ||
-            output_response.chunked || output_parser.header_end != output_len) {
+            output_response.content_length_count != 1 ||
+            output_response.content_length != resp.content_length || output_response.chunked ||
+            output_parser.header_end != output_len) {
             disarm_explicit_deadline();
             loop->close_conn(conn);
+            return;
+        }
+
+        if (strict_positive_get) {
+            if constexpr (requires(Loop* candidate,
+                                   Connection& c,
+                                   const IoEvent& event,
+                                   u32 header_end,
+                                   u32 declared) {
+                              candidate->begin_response_read_deadline_body_stream(
+                                  c, event, header_end, declared);
+                          }) {
+                if (!loop->begin_response_read_deadline_body_stream(
+                        conn, ev, raw_header_end, resp.content_length)) {
+                    loop->close_conn(conn);
+                    return;
+                }
+            } else {
+                loop->close_conn(conn);
+                return;
+            }
+            conn.resp_status = 200;
+            conn.resp_body_mode = BodyMode::ContentLength;
+            conn.resp_body_remaining = resp.content_length;
+            conn.resp_body_sent = conn.response_header_buf.len();
+            conn.upstream_send_len = raw_header_end;
+            conn.upstream_keep_alive = false;
+            conn.proxy_resp_started = true;
+            conn.transition_to_sending(&on_response_header_sent<Loop>);
+            if (!client_send(
+                    loop, conn, conn.response_header_buf.data(), conn.response_header_buf.len()))
+                loop->close_conn(conn);
             return;
         }
 

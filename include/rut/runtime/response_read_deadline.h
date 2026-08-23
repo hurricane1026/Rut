@@ -217,13 +217,37 @@ inline bool response_read_deadline_owner_is_stable(const Connection& c,
     } else {
         return false;
     }
+    const bool post_commit =
+        c.response_read_deadline_post_commit_phase != ResponseReadDeadlinePostCommitPhase::None;
+    const bool post_commit_owner =
+        post_commit &&
+        c.response_read_deadline_post_commit_generation == c.response_read_deadline_generation &&
+        c.response_read_deadline_post_commit_episode == c.upstream_episode &&
+        c.response_read_deadline_profile ==
+            ResponseReadDeadlineProfile::BodylessNonHeadContentLengthZero &&
+        c.response_read_deadline_method == static_cast<u8>(LogHttpMethod::Get) &&
+        c.response_read_deadline_post_commit_declared_body != 0 &&
+        c.response_read_deadline_post_commit_raw_header_end != 0 &&
+        c.response_read_deadline_post_commit_origin_received <=
+            c.response_read_deadline_post_commit_declared_body &&
+        c.response_read_deadline_post_commit_downstream_completed <=
+            c.response_read_deadline_post_commit_downstream_submitted &&
+        c.response_read_deadline_post_commit_downstream_submitted <=
+            c.response_read_deadline_post_commit_origin_received &&
+        c.response_read_deadline_post_commit_inflight_body <=
+            c.response_read_deadline_post_commit_downstream_submitted -
+                c.response_read_deadline_post_commit_downstream_completed;
+    if (post_commit && !post_commit_owner) return false;
     if (c.upstream_idx >= cfg->upstream_count || cfg->upstreams[c.upstream_idx].addr_count != 1 ||
         cfg->upstreams[c.upstream_idx].addrs[0].sin_family != AF_INET || c.upstream_attempts != 1 ||
         c.upstream_reused || !c.request_upload_complete || c.upstream_request_incomplete ||
-        c.on_upstream_recv != expected_upstream_recv || c.on_upstream_send != nullptr ||
-        c.upstream_fd < 0 || !valid_upstream_episode(c.upstream_episode) ||
-        c.upstream_episode_quarantined || c.upstream_connect_armed || c.upstream_send_armed ||
-        c.upstream_recv_paused_for_send || c.upstream_recv_pause_cancel_pending ||
+        (!post_commit && c.on_upstream_recv != expected_upstream_recv) ||
+        (post_commit && c.on_upstream_recv != nullptr &&
+         c.on_upstream_recv != expected_upstream_recv) ||
+        c.on_upstream_send != nullptr || c.upstream_fd < 0 ||
+        !valid_upstream_episode(c.upstream_episode) || c.upstream_episode_quarantined ||
+        c.upstream_connect_armed || c.upstream_send_armed ||
+        (!post_commit && c.upstream_recv_paused_for_send) || c.upstream_recv_pause_cancel_pending ||
         c.upstream_recv_pause_rearm_pending || c.upstream_recv_cancel_inflight ||
         c.upstream_retirement_active || c.upstream_retirement_target_owned != 0 ||
         c.upstream_retirement_cancel_owned != 0 || c.upstream_retirement_cancel_retry != 0 ||
@@ -237,13 +261,72 @@ inline bool response_read_deadline_owner_is_stable(const Connection& c,
                c.upstream_recv_buf.len() == 0;
     const bool state_ok =
         phase == ResponseReadDeadlineOwnerPhase::ArmedForCopy
-            ? c.response_read_deadline_state == ResponseReadDeadlineState::Armed
+            ? c.response_read_deadline_state == ResponseReadDeadlineState::Armed ||
+                  (post_commit &&
+                   c.response_read_deadline_state == ResponseReadDeadlineState::BodyComplete)
             : c.response_read_deadline_state == ResponseReadDeadlineState::Armed ||
                   c.response_read_deadline_state == ResponseReadDeadlineState::ExpiryPending ||
                   c.response_read_deadline_state == ResponseReadDeadlineState::BatchPending ||
-                  c.response_read_deadline_state == ResponseReadDeadlineState::RefreshPending;
+                  c.response_read_deadline_state == ResponseReadDeadlineState::RefreshPending ||
+                  (post_commit &&
+                   c.response_read_deadline_state == ResponseReadDeadlineState::BodyComplete);
     return state_ok && c.response_read_deadline_upstream_episode == c.upstream_episode &&
            (phase == ResponseReadDeadlineOwnerPhase::ActiveAfterCopy || c.upstream_recv_armed);
+}
+
+inline bool response_read_deadline_post_commit_is_stable(const Connection& c) {
+    const RouteConfig* cfg = c.request_config;
+    const u16 bundle_id = c.response_read_deadline_bundle_id;
+    if (cfg == nullptr || !cfg->policy_bundle_id_is_valid(bundle_id) ||
+        c.response_read_deadline_post_commit_phase == ResponseReadDeadlinePostCommitPhase::None ||
+        c.response_read_deadline_post_commit_generation == 0 ||
+        c.response_read_deadline_post_commit_generation != c.response_read_deadline_generation ||
+        c.response_read_deadline_post_commit_episode != c.upstream_episode ||
+        c.response_read_deadline_profile !=
+            ResponseReadDeadlineProfile::BodylessNonHeadContentLengthZero ||
+        c.response_read_deadline_method != static_cast<u8>(LogHttpMethod::Get) ||
+        c.req_method != static_cast<u8>(LogHttpMethod::Get) ||
+        !response_read_deadline_route_method_matches(c.req_method,
+                                                     c.response_read_deadline_route_method) ||
+        c.response_read_deadline_post_commit_raw_header_end == 0 ||
+        c.response_read_deadline_post_commit_declared_body == 0 ||
+        c.response_read_deadline_post_commit_raw_header_end > c.upstream_recv_buf.capacity() ||
+        c.response_read_deadline_post_commit_declared_body >
+            c.upstream_recv_buf.capacity() - c.response_read_deadline_post_commit_raw_header_end ||
+        c.response_read_deadline_post_commit_origin_received >
+            c.response_read_deadline_post_commit_declared_body ||
+        c.response_read_deadline_post_commit_downstream_completed >
+            c.response_read_deadline_post_commit_downstream_submitted ||
+        c.response_read_deadline_post_commit_downstream_submitted >
+            c.response_read_deadline_post_commit_origin_received ||
+        c.response_read_deadline_post_commit_inflight_body >
+            c.response_read_deadline_post_commit_downstream_submitted -
+                c.response_read_deadline_post_commit_downstream_completed ||
+        c.protocol != ConnProtocol::Http11 || c.tls_active || c.h2 != nullptr ||
+        c.req_http_version != static_cast<u8>(HttpVersion::Http11) || !c.req_keep_alive ||
+        !c.req_client_keep_alive || c.req_client_connection_close ||
+        c.req_client_connection_close_exact || c.req_client_connection_count != 0 ||
+        c.req_client_has_content_length || c.req_client_has_transfer_encoding ||
+        c.req_client_has_te || c.req_client_has_expect || c.req_client_has_upgrade_header ||
+        c.req_body_mode != BodyMode::None || c.req_body_remaining != 0 ||
+        c.request_body_fully_buffered || c.req_body_streamed || c.req_malformed ||
+        c.req_wants_upgrade || c.pipeline_depth != 0 || c.pipeline_stash_len != 0 ||
+        c.target_transform_recorded || c.req_path_overridden || c.req_header_override_count != 0 ||
+        c.req_header_override_overflow || c.resp_header_mutation_count != 0 ||
+        c.resp_header_mutation_pending_count != 0 || c.resp_header_mutation_pending_overflow ||
+        c.resp_header_mutation_overflow || c.upstream_fd < 0 ||
+        !valid_upstream_episode(c.upstream_episode) || c.upstream_reused ||
+        c.upstream_attempts != 1 || !c.request_upload_complete || c.upstream_request_incomplete)
+        return false;
+    const auto& bundle = cfg->policy_bundles[bundle_id - 1];
+    return response_read_timeout_seconds_valid(bundle.response_read_timeout_seconds) &&
+           bundle.response_read_timeout_seconds == c.response_read_deadline_seconds &&
+           bundle.response_policy_id == c.response_policy_id &&
+           bundle.failure_policy_id == c.failure_policy_id &&
+           bundle.timeout_failure_policy_id == c.timeout_failure_policy_id &&
+           cfg->response_policy_id_is_valid(bundle.response_policy_id) &&
+           cfg->failure_policy_id_is_valid(bundle.failure_policy_id) &&
+           cfg->timeout_failure_policy_id_is_valid(bundle.timeout_failure_policy_id);
 }
 
 }  // namespace rut

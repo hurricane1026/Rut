@@ -53,6 +53,21 @@ enum class ResponseReadDeadlineState : u8 {
     ExpiryPending,
     BatchPending,
     RefreshPending,
+    BodyComplete,
+};
+
+enum class ResponseReadDeadlinePostCommitPhase : u8 {
+    None,
+    HeaderSend,
+    BodySend,
+    WaitingBody,
+    OriginComplete,
+};
+
+enum class ResponseReadDeadlineSendKind : u8 {
+    None,
+    Header,
+    Body,
 };
 
 // Immutable request/response contract selected before the JIT handler runs.
@@ -530,6 +545,54 @@ struct ConnectionBase {
     u32 response_read_deadline_progress_generation;
     u32 response_read_deadline_progress_episode;
     u32 response_read_deadline_progress_bytes;
+    // Bounded positive-Content-Length response owner.  This is selected only
+    // after the strict GET response header is fully validated.  The counters
+    // are monotonic across recv-buffer compaction and downstream send gaps.
+    ResponseReadDeadlinePostCommitPhase response_read_deadline_post_commit_phase;
+    u32 response_read_deadline_post_commit_generation;
+    u32 response_read_deadline_post_commit_episode;
+    u32 response_read_deadline_post_commit_raw_header_end;
+    u32 response_read_deadline_post_commit_declared_body;
+    u32 response_read_deadline_post_commit_origin_received;
+    u32 response_read_deadline_post_commit_downstream_submitted;
+    u32 response_read_deadline_post_commit_downstream_completed;
+    u32 response_read_deadline_post_commit_inflight_body;
+    bool response_read_deadline_post_commit_pump_pending;
+    // Exact downstream Send CQE ownership for the post-commit stream.  The
+    // monotonically increasing token is encoded in io_uring user_data; the
+    // tombstone survives retirement/request-boundary handoff so late CQEs
+    // cannot steal a successor request's accounting.
+    u32 response_read_deadline_send_generation = 0;
+    u32 response_read_deadline_send_owner_generation;
+    u32 response_read_deadline_send_tombstone_generation = 0;
+    u32 response_read_deadline_send_deadline_generation;
+    u32 response_read_deadline_send_upstream_episode;
+    const u8* response_read_deadline_send_src;
+    u32 response_read_deadline_send_len;
+    i32 response_read_deadline_send_fd;
+    ResponseReadDeadlineSendKind response_read_deadline_send_kind;
+    bool response_read_deadline_send_owner_active;
+    u32 response_read_deadline_send_close_generation = 0;
+    bool response_read_deadline_send_close_target_owned = false;
+    bool response_read_deadline_send_close_cancel_owned = false;
+
+    bool next_response_read_deadline_send_generation() {
+        if (response_read_deadline_send_generation == kNonUpstreamSendGenerationMask) return false;
+        ++response_read_deadline_send_generation;
+        response_read_deadline_send_owner_generation = response_read_deadline_send_generation;
+        return true;
+    }
+
+    void clear_response_read_deadline_send_owner() {
+        response_read_deadline_send_owner_generation = 0;
+        response_read_deadline_send_deadline_generation = 0;
+        response_read_deadline_send_upstream_episode = 0;
+        response_read_deadline_send_src = nullptr;
+        response_read_deadline_send_len = 0;
+        response_read_deadline_send_fd = -1;
+        response_read_deadline_send_kind = ResponseReadDeadlineSendKind::None;
+        response_read_deadline_send_owner_active = false;
+    }
 
     bool next_response_read_deadline_generation() {
         if (response_read_deadline_generation == 0xFFFFFFFFu) return false;
@@ -550,6 +613,17 @@ struct ConnectionBase {
         response_read_deadline_progress_generation = 0;
         response_read_deadline_progress_episode = 0;
         response_read_deadline_progress_bytes = 0;
+        response_read_deadline_post_commit_phase = ResponseReadDeadlinePostCommitPhase::None;
+        response_read_deadline_post_commit_generation = 0;
+        response_read_deadline_post_commit_episode = 0;
+        response_read_deadline_post_commit_raw_header_end = 0;
+        response_read_deadline_post_commit_declared_body = 0;
+        response_read_deadline_post_commit_origin_received = 0;
+        response_read_deadline_post_commit_downstream_submitted = 0;
+        response_read_deadline_post_commit_downstream_completed = 0;
+        response_read_deadline_post_commit_inflight_body = 0;
+        response_read_deadline_post_commit_pump_pending = false;
+        clear_response_read_deadline_send_owner();
         response_read_deadline_first_batch = false;
         response_read_deadline_first_batch_profile = ResponseReadDeadlineProfile::None;
         response_read_deadline_first_batch_method = 0xffu;
@@ -1004,6 +1078,9 @@ struct ConnectionBase {
         // response_read_deadline_generation follows that persistence rule too;
         // only the live owner is cleared.
         clear_response_read_deadline();
+        response_read_deadline_send_close_generation = 0;
+        response_read_deadline_send_close_target_owned = false;
+        response_read_deadline_send_close_cancel_owned = false;
         request_config = nullptr;
         listener_context = {};
         pending_handler_fn = nullptr;

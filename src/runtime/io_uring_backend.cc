@@ -28,9 +28,15 @@
 namespace rut {
 
 static bool response_deadline_copy_owner(const Connection& conn, u32 upstream_episode, u32 aux) {
-    return aux == 0 && conn.fd >= 0 && conn.upstream_fd >= 0 && conn.state == ConnState::Proxying &&
+    const bool post_commit =
+        conn.response_read_deadline_post_commit_phase != ResponseReadDeadlinePostCommitPhase::None;
+    return aux == 0 && conn.fd >= 0 && conn.upstream_fd >= 0 &&
+           (conn.state == ConnState::Proxying ||
+            (post_commit && conn.state == ConnState::Sending)) &&
            conn.protocol == ConnProtocol::Http11 && !conn.tls_active && conn.h2 == nullptr &&
-           conn.response_read_deadline_state == ResponseReadDeadlineState::Armed &&
+           (conn.response_read_deadline_state == ResponseReadDeadlineState::Armed ||
+            (post_commit &&
+             conn.response_read_deadline_state == ResponseReadDeadlineState::BodyComplete)) &&
            conn.response_read_deadline_owner_generation != 0 &&
            conn.response_read_deadline_owner_generation == conn.response_read_deadline_generation &&
            response_read_deadline_owner_is_stable(conn,
@@ -39,7 +45,8 @@ static bool response_deadline_copy_owner(const Connection& conn, u32 upstream_ep
            conn.response_read_deadline_upstream_episode == upstream_episode &&
            conn.upstream_episode == upstream_episode && valid_upstream_episode(upstream_episode) &&
            conn.upstream_recv_armed &&
-           conn.on_upstream_recv == &on_upstream_response<IoUringEventLoop> &&
+           (conn.on_upstream_recv == &on_upstream_response<IoUringEventLoop> ||
+            (post_commit && conn.on_upstream_recv == nullptr)) &&
            !conn.upstream_recv_paused_for_send && !conn.upstream_recv_pause_cancel_pending &&
            !conn.upstream_recv_pause_rearm_pending && !conn.upstream_recv_cancel_inflight &&
            !conn.upstream_retirement_active && conn.upstream_retirement_target_owned == 0 &&
@@ -163,8 +170,8 @@ core::Expected<void, Error> IoUringBackend::init(u32 /*shard_id*/, i32 lfd) {
     timer_read_armed = false;
     fatal_error.store(0, std::memory_order_relaxed);
     for (u32 i = 0; i < kMaxSendState; i++) {
-        send_state[i] = {nullptr, -1, 0, 0, IoEventType::Send, 0};
-        upstream_send_state[i] = {nullptr, -1, 0, 0, IoEventType::UpstreamSend, 0};
+        send_state[i] = {nullptr, -1, 0, 0, IoEventType::Send, 0, 0};
+        upstream_send_state[i] = {nullptr, -1, 0, 0, IoEventType::UpstreamSend, 0, 0};
     }
 
     // Setup io_uring with desired flags
@@ -460,14 +467,14 @@ bool IoUringBackend::cancel_retiring_upstream(u32 conn_id, IoEventType type, u32
                                upstream_episode);
 }
 
-bool IoUringBackend::add_send(i32 fd, u32 conn_id, const u8* buf, u32 len) {
+bool IoUringBackend::add_send(i32 fd, u32 conn_id, const u8* buf, u32 len, u32 generation) {
     io_uring_sqe* sqe = get_sqe();
     if (!sqe) return false;  // SQ full — don't record send_state without a submitted SQE
 
     // Record send state only after acquiring SQE — if kernel returns partial,
     // wait() re-submits the remainder.
     if (conn_id < kMaxSendState) {
-        send_state[conn_id] = {buf, fd, 0, len, IoEventType::Send, 0};
+        send_state[conn_id] = {buf, fd, 0, len, IoEventType::Send, 0, generation};
     }
 
     memset(sqe, 0, sizeof(*sqe));
@@ -475,7 +482,7 @@ bool IoUringBackend::add_send(i32 fd, u32 conn_id, const u8* buf, u32 len) {
     sqe->fd = fd;
     sqe->addr = reinterpret_cast<u64>(buf);
     sqe->len = len;
-    sqe->user_data = encode_user_data(conn_id, IoEventType::Send);
+    sqe->user_data = encode_user_data(conn_id, IoEventType::Send, generation);
 
     sqe_advance_tail(sq_tail);
     pending++;
@@ -490,7 +497,7 @@ bool IoUringBackend::add_send_upstream(
 
     if (conn_id < kMaxSendState) {
         upstream_send_state[conn_id] = {
-            buf, fd, 0, len, IoEventType::UpstreamSend, upstream_episode};
+            buf, fd, 0, len, IoEventType::UpstreamSend, upstream_episode, 0};
     }
 
     memset(sqe, 0, sizeof(*sqe));
@@ -648,8 +655,10 @@ u32 IoUringBackend::cancel(i32 /*fd*/,
                            u32 upstream_episode,
                            bool yield_armed,
                            u32 yield_timer_gen,
-                           u8* upstream_cancel_mask) {
+                           u8* upstream_cancel_mask,
+                           bool* send_cancel_owned) {
     if (upstream_cancel_mask) *upstream_cancel_mask = 0;
+    if (send_cancel_owned) *send_cancel_owned = false;
     if ((has_upstream || upstream_connect_armed || upstream_recv_armed || upstream_send_armed) &&
         !valid_upstream_episode(upstream_episode))
         return 0;
@@ -662,9 +671,14 @@ u32 IoUringBackend::cancel(i32 /*fd*/,
             submitted++;
     }
     if (send_armed) {
-        if (cancel_by_user_data(
-                encode_user_data(conn_id, IoEventType::Send), conn_id, IoEventType::Send))
+        const u32 generation = conn_id < kMaxSendState ? send_state[conn_id].generation : 0;
+        if (cancel_by_user_data(encode_user_data(conn_id, IoEventType::Send, generation),
+                                conn_id,
+                                IoEventType::Send,
+                                generation == 0 ? 0 : generation | kNonUpstreamSendCancelBit)) {
             submitted++;
+            if (send_cancel_owned) *send_cancel_owned = generation != 0;
+        }
     }
     // Upstream ops only if the connection was proxying.
     if (has_upstream) {
@@ -816,7 +830,9 @@ u32 IoUringBackend::wait(IoEvent* events, u32 max_events, Connection* conns, u32
             if (type == IoEventType::UpstreamRecv && conns != nullptr && conn_id < max_conns) {
                 const auto& conn = conns[conn_id];
                 deadline_active =
-                    conn.response_read_deadline_state == ResponseReadDeadlineState::Armed &&
+                    (conn.response_read_deadline_state == ResponseReadDeadlineState::Armed ||
+                     conn.response_read_deadline_state ==
+                         ResponseReadDeadlineState::BodyComplete) &&
                     conn.response_read_deadline_owner_generation != 0 &&
                     conn.response_read_deadline_owner_generation ==
                         conn.response_read_deadline_generation;
@@ -828,7 +844,9 @@ u32 IoUringBackend::wait(IoEvent* events, u32 max_events, Connection* conns, u32
                 if (!stale_upstream && type == IoEventType::UpstreamRecv) {
                     const auto& conn = conns[conn_id];
                     deadline_owner =
-                        conn.response_read_deadline_state == ResponseReadDeadlineState::Armed &&
+                        (conn.response_read_deadline_state == ResponseReadDeadlineState::Armed ||
+                         conn.response_read_deadline_state ==
+                             ResponseReadDeadlineState::BodyComplete) &&
                         conn.response_read_deadline_upstream_episode == upstream_episode &&
                         conn.response_read_deadline_owner_generation != 0 &&
                         conn.response_read_deadline_owner_generation ==
@@ -951,6 +969,8 @@ u32 IoUringBackend::wait(IoEvent* events, u32 max_events, Connection* conns, u32
                     events[count].more = 0;
                     events[count].aux = static_cast<u8>(aux);
                     events[count].upstream_episode = upstream_episode;
+                    events[count].non_upstream_generation =
+                        type == IoEventType::Send ? ss.generation : 0;
                     head++;
                     count++;
                     continue;
@@ -972,6 +992,8 @@ u32 IoUringBackend::wait(IoEvent* events, u32 max_events, Connection* conns, u32
                     events[count].more = 0;
                     events[count].aux = static_cast<u8>(aux);
                     events[count].upstream_episode = upstream_episode;
+                    events[count].non_upstream_generation =
+                        type == IoEventType::Send ? ss.generation : 0;
                     head++;
                     count++;
                     continue;
@@ -990,7 +1012,7 @@ u32 IoUringBackend::wait(IoEvent* events, u32 max_events, Connection* conns, u32
                         sqe->user_data =
                             type == IoEventType::UpstreamSend
                                 ? encode_upstream_user_data(conn_id, type, ss.upstream_episode)
-                                : encode_user_data(conn_id, type);
+                                : encode_user_data(conn_id, type, ss.generation);
                         sqe_advance_tail(sq_tail);
                         pending++;
                         head++;
@@ -1006,6 +1028,8 @@ u32 IoUringBackend::wait(IoEvent* events, u32 max_events, Connection* conns, u32
                     events[count].more = 0;
                     events[count].aux = 0;
                     events[count].upstream_episode = upstream_episode;
+                    events[count].non_upstream_generation =
+                        type == IoEventType::Send ? ss.generation : 0;
                     head++;
                     count++;
                     continue;
@@ -1019,6 +1043,8 @@ u32 IoUringBackend::wait(IoEvent* events, u32 max_events, Connection* conns, u32
                 events[count].more = 0;
                 events[count].aux = 0;
                 events[count].upstream_episode = upstream_episode;
+                events[count].non_upstream_generation =
+                    type == IoEventType::Send ? ss.generation : 0;
                 head++;
                 count++;
                 continue;
@@ -1035,8 +1061,9 @@ u32 IoUringBackend::wait(IoEvent* events, u32 max_events, Connection* conns, u32
         events[count].more = (cqe->flags & IORING_CQE_F_MORE) ? 1 : 0;
         // Forward the decoded aux so dispatch can recognize a pause cancel's own
         // completion (UpstreamRecv + kPauseCancelAux); 0 for every normal op.
-        events[count].aux = static_cast<u8>(aux);
+        events[count].aux = type == IoEventType::Send ? 0 : static_cast<u8>(aux);
         events[count].upstream_episode = upstream_episode;
+        events[count].non_upstream_generation = type == IoEventType::Send ? aux : 0;
         if (type == IoEventType::UpstreamRecv && conns != nullptr && conn_id < max_conns &&
             conns[conn_id].response_read_deadline_state == ResponseReadDeadlineState::Armed &&
             conns[conn_id].response_read_deadline_owner_generation != 0 &&

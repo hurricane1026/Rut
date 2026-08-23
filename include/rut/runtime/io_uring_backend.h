@@ -85,6 +85,7 @@ struct IoUringBackend {
         u32 remaining;
         IoEventType type;
         u32 upstream_episode;
+        u32 generation = 0;
     };
     SendState send_state[kMaxSendState];
     SendState upstream_send_state[kMaxSendState];
@@ -135,7 +136,7 @@ struct IoUringBackend {
 
     // Submit a send (or zero-copy send).
     // Returns false if SQ is full (no SQE submitted).
-    bool add_send(i32 fd, u32 conn_id, const u8* buf, u32 len);
+    bool add_send(i32 fd, u32 conn_id, const u8* buf, u32 len, u32 generation = 0);
 
     // Same as add_send but encodes UpstreamSend in user_data.
     bool add_send_upstream(i32 fd, u32 conn_id, const u8* buf, u32 len, u32 upstream_episode = 1);
@@ -166,7 +167,8 @@ struct IoUringBackend {
                u32 upstream_episode = 1,
                bool yield_armed = false,
                u32 yield_timer_gen = 0,
-               u8* upstream_cancel_mask = nullptr);
+               u8* upstream_cancel_mask = nullptr,
+               bool* send_cancel_owned = nullptr);
 
     bool cancel_yield_timeout(u32 conn_id, u32 yield_timer_gen);
 

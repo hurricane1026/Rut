@@ -59,6 +59,9 @@ struct NonUpstreamUserData {
     u32 generation = 0;
 };
 
+inline constexpr u32 kNonUpstreamSendCancelBit = 0x80000000u;
+inline constexpr u32 kNonUpstreamSendGenerationMask = 0x7FFFFFFFu;
+
 inline constexpr bool valid_upstream_event_token(const UpstreamEventToken& token) {
     return token.conn_id <= kIoUserDataMaxConnId && io_event_is_upstream(token.type) &&
            token.episode != 0 && token.episode <= kIoUserDataMaxUpstreamEpisode;
@@ -150,6 +153,7 @@ struct IoEvent {
     u8 aux = 0;                // decoded user_data aux tag; kPauseCancelAux marks a pause cancel's
                                // own completion (distinct from the recv CQE it cancels)
     u32 upstream_episode = 0;  // neutral for non-upstream/legacy backend events
+    u32 non_upstream_generation = 0;
     IoEventCopyWitness copy_witness = IoEventCopyWitness::None;
     u32 copy_deadline_generation = 0;
     u8 copy_deadline_profile = 0;
