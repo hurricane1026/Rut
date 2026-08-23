@@ -53,6 +53,26 @@ static constexpr char kOptionsStarResponseNormalized[] =
     "<hr><center>nginx/1.29.7</center>\r\n"
     "</body>\r\n"
     "</html>\r\n";
+static constexpr char kConnectAuthorityRequest[] =
+    "CONNECT example.com:443 HTTP/1.1\r\n"
+    // Keep Host valid but distinct from the authority-form target so this
+    // baseline cannot accidentally attribute target selection to Host.
+    "Host: connect-client.example\r\n"
+    "Connection: close\r\n\r\n";
+static constexpr char kConnectAuthorityResponseNormalized[] =
+    "HTTP/1.1 405 Not Allowed\r\n"
+    "Server: nginx/1.29.7\r\n"
+    "Date: XXXXXXXXXXXXXXXXXXXXXXXXXXXXX\r\n"
+    "Content-Type: text/html\r\n"
+    "Content-Length: 157\r\n"
+    "Connection: close\r\n\r\n"
+    "<html>\r\n"
+    "<head><title>405 Not Allowed</title></head>\r\n"
+    "<body>\r\n"
+    "<center><h1>405 Not Allowed</h1></center>\r\n"
+    "<hr><center>nginx/1.29.7</center>\r\n"
+    "</body>\r\n"
+    "</html>\r\n";
 static constexpr char kDefaultBufferingTimeoutRequest[] =
     "GET /buffered-timeout?q=1 HTTP/1.1\r\n"
     "Host: client.example\r\n\r\n";
@@ -3390,17 +3410,21 @@ static bool capture_case(u16 frontend_port,
     return true;
 }
 
-static bool capture_options_star_case(u16 frontend_port,
-                                      u16 backend_port,
-                                      const std::string& nginx_config_path,
-                                      const std::string& nginx_log_path,
-                                      const std::string& container_name,
-                                      std::vector<char>& downstream,
-                                      std::string& error) {
+static bool capture_pinned_local_rejection_case(u16 frontend_port,
+                                                u16 backend_port,
+                                                const std::string& nginx_config_path,
+                                                const std::string& nginx_log_path,
+                                                const std::string& container_name,
+                                                const char* case_name,
+                                                const char* request,
+                                                size_t request_len,
+                                                const char* expected_response_normalized,
+                                                std::vector<char>& downstream,
+                                                std::string& error) {
     Recorder recorder;
     recorder.observe_extra_requests_until_stop = true;
     if (!recorder.setup(backend_port)) {
-        error = "OPTIONS-star backend recorder setup failed";
+        error = std::string(case_name) + " backend recorder setup failed";
         return false;
     }
 
@@ -3421,25 +3445,25 @@ static bool capture_options_star_case(u16 frontend_port,
                       "daemon off;"},
                      nginx_log_path,
                      nginx.child)) {
-        error = "failed to start pinned nginx for OPTIONS-star case";
+        error = std::string("failed to start pinned nginx for ") + case_name + " case";
         return false;
     }
     if (!wait_ready(frontend_port, nginx.child, error)) return false;
 
     const int client = connect_once(frontend_port);
     bool ok = client >= 0;
-    if (ok) ok = send_all(client, kOptionsStarRequest, sizeof(kOptionsStarRequest) - 1);
+    if (ok) ok = send_all(client, request, request_len);
     if (ok) ok = read_response(client, downstream, error);
     if (ok) ok = read_eof(client, error);
     if (client >= 0) close(client);
     if (!ok) {
-        error = "nginx OPTIONS-star response/EOF failed: " + error;
+        error = std::string("nginx ") + case_name + " response/EOF failed: " + error;
         return false;
     }
 
     std::string detail;
-    if (!validate_exact_normalized_response(downstream, kOptionsStarResponseNormalized, detail)) {
-        error = "OPTIONS-star downstream response mismatch: " + detail;
+    if (!validate_exact_normalized_response(downstream, expected_response_normalized, detail)) {
+        error = std::string(case_name) + " downstream response mismatch: " + detail;
         return false;
     }
 
@@ -3450,17 +3474,17 @@ static bool capture_options_star_case(u16 frontend_port,
     const bool container_removed = docker.remove();
     recorder.stop();
     if (!nginx_stopped) {
-        error = "failed to stop nginx after OPTIONS-star case";
+        error = std::string("failed to stop nginx after ") + case_name + " case";
         return false;
     }
     if (!container_removed) {
-        error = "docker rm -f failed after OPTIONS-star case";
+        error = std::string("docker rm -f failed after ") + case_name + " case";
         return false;
     }
     if (recorder.accepted.load(std::memory_order_acquire) != 0 ||
         recorder.requests.load(std::memory_order_acquire) != 0 || !recorder.request.empty() ||
         !recorder.history.empty()) {
-        error = "OPTIONS-star unexpectedly contacted the configured upstream";
+        error = std::string(case_name) + " unexpectedly contacted the configured upstream";
         return false;
     }
     return true;
@@ -4317,13 +4341,17 @@ int main(int argc, char** argv) {
 
     std::vector<char> options_star_response;
     std::string options_star_error;
-    if (!capture_options_star_case(frontend_port,
-                                   backend_port,
-                                   temp.nginx_config,
-                                   temp.nginx_log,
-                                   container + "-options-star",
-                                   options_star_response,
-                                   options_star_error)) {
+    if (!capture_pinned_local_rejection_case(frontend_port,
+                                             backend_port,
+                                             temp.nginx_config,
+                                             temp.nginx_log,
+                                             container + "-options-star",
+                                             "OPTIONS-star",
+                                             kOptionsStarRequest,
+                                             sizeof(kOptionsStarRequest) - 1,
+                                             kOptionsStarResponseNormalized,
+                                             options_star_response,
+                                             options_star_error)) {
         std::cerr << "FAIL [pinned OPTIONS-star]: " << options_star_error << "\n";
         dump_wire("pinned OPTIONS-star response", options_star_response);
         dump_log(temp.nginx_log, "pinned OPTIONS-star nginx log");
@@ -4332,6 +4360,27 @@ int main(int argc, char** argv) {
     std::cerr << "PASS: pinned nginx rejects explicit-close OPTIONS * before location /, "
                  "returns the exact generated 400 response and EOF, and performs no upstream "
                  "operation\n";
+
+    std::vector<char> connect_authority_response;
+    std::string connect_authority_error;
+    if (!capture_pinned_local_rejection_case(frontend_port,
+                                             backend_port,
+                                             temp.nginx_config,
+                                             temp.nginx_log,
+                                             container + "-connect-authority",
+                                             "CONNECT authority-form",
+                                             kConnectAuthorityRequest,
+                                             sizeof(kConnectAuthorityRequest) - 1,
+                                             kConnectAuthorityResponseNormalized,
+                                             connect_authority_response,
+                                             connect_authority_error)) {
+        std::cerr << "FAIL [pinned CONNECT authority-form]: " << connect_authority_error << "\n";
+        dump_wire("pinned CONNECT authority-form response", connect_authority_response);
+        dump_log(temp.nginx_log, "pinned CONNECT authority-form nginx log");
+        return 1;
+    }
+    std::cerr << "PASS: pinned nginx rejects explicit-close authority-form CONNECT with the "
+                 "exact generated 405 response and EOF and performs no upstream operation\n";
 
     Recorder default_buffering_timeout_origin;
     default_buffering_timeout_origin.wait_response_peer_close = true;
