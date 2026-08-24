@@ -864,9 +864,18 @@ bool prepare_response_read_deadline_preflight(Loop* loop,
         const bool fixed_upload =
             profile ==
             ResponseReadDeadlineProfile::FixedContentLengthUploadNonHeadContentLengthZero;
+        const bool preflight_downstream_close =
+            complete_buffering &&
+            profile == ResponseReadDeadlineProfile::BodylessNonHeadContentLengthZero &&
+            !conn.req_client_keep_alive && conn.req_client_connection_close &&
+            conn.req_client_connection_close_exact && conn.req_client_connection_count == 1;
         const bool pipeline_generation_stable =
-            http1_pipeline_request_generation_provisional_is_stable(
-                conn, profile, bundle.response_buffering, conn.req_method, route->method);
+            http1_pipeline_request_generation_provisional_is_stable(conn,
+                                                                    profile,
+                                                                    bundle.response_buffering,
+                                                                    conn.req_method,
+                                                                    route->method,
+                                                                    preflight_downstream_close);
         ResponseReadDeadlineFixedUploadRequest upload_request{};
         u16 route_index = 0xffffu;
         if (response.version != ResponsePolicyVersion::Http11 ||
@@ -927,11 +936,7 @@ bool prepare_response_read_deadline_preflight(Loop* loop,
             conn.response_read_deadline_upload.handler_generation =
                 conn.http1_pipeline_request_generation;
         }
-        conn.response_read_deadline_upload.downstream_close =
-            complete_buffering &&
-            profile == ResponseReadDeadlineProfile::BodylessNonHeadContentLengthZero &&
-            !conn.req_client_keep_alive && conn.req_client_connection_close &&
-            conn.req_client_connection_close_exact && conn.req_client_connection_count == 1;
+        conn.response_read_deadline_upload.downstream_close = preflight_downstream_close;
         if (conn.recv_buf.len() > conn.req_initial_send_len) {
             auto& proof = conn.response_read_deadline_upload;
             if (!response_read_deadline_route_index(*config, route, &route_index)) {
@@ -3154,8 +3159,11 @@ void handle_jit_outcome(
                 }
                 if (strict_pipeline_successor) {
                     auto& proof = conn.response_read_deadline_upload;
+                    ResponseReadDeadlineUploadProof materialized_proof = proof;
+                    materialized_proof.request_policy_id = conn.request_policy_id;
                     if (!http1_pipeline_successor_request_shape_is_stable(
                             conn,
+                            materialized_proof,
                             conn.response_read_deadline_profile,
                             conn.response_read_deadline_buffering,
                             conn.response_read_deadline_method,
@@ -3168,7 +3176,7 @@ void handle_jit_outcome(
                         proof.rewritten_total_length != 0 || proof.expected_upload_length != 0 ||
                         proof.upload_episode != 0 || proof.route_index != 0xffffu ||
                         proof.upstream_id != 0xffffu || proof.request_policy_id != 0 ||
-                        proof.route_fn != nullptr || proof.downstream_close) {
+                        proof.route_fn != nullptr) {
                         loop->close_conn(conn);
                         return;
                     }

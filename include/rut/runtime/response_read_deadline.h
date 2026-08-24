@@ -414,6 +414,7 @@ inline bool http1_pipeline_successor_upstream_owners_are_neutral(const Connectio
 
 inline bool http1_pipeline_successor_semantic_shape_is_stable(
     const Connection& c,
+    const ResponseReadDeadlineUploadProof& proof,
     ResponseReadDeadlineProfile profile,
     ForwardResponseBufferingMode buffering,
     u8 method,
@@ -425,7 +426,9 @@ inline bool http1_pipeline_successor_semantic_shape_is_stable(
            c.req_http_version == static_cast<u8>(HttpVersion::Http11) && c.req_strict_h1_complete &&
            c.req_method == method && c.req_path_canon.ptr != nullptr &&
            response_read_deadline_route_method_matches(c.req_method, route_method) &&
-           response_read_deadline_default_persistence_is_stable(c) &&
+           (proof.downstream_close ? complete_content_length_explicit_close_request_is_stable(
+                                         c, proof, buffering, profile)
+                                   : response_read_deadline_default_persistence_is_stable(c)) &&
            !c.req_client_has_content_length && !c.req_client_has_transfer_encoding &&
            !c.req_client_has_te && !c.req_client_has_expect && !c.req_client_has_upgrade_header &&
            c.req_body_mode == BodyMode::None && c.req_body_remaining == 0 &&
@@ -440,13 +443,15 @@ inline bool http1_pipeline_successor_semantic_shape_is_stable(
            !c.resp_header_mutation_overflow;
 }
 
-inline bool http1_pipeline_successor_request_shape_is_stable(const Connection& c,
-                                                             ResponseReadDeadlineProfile profile,
-                                                             ForwardResponseBufferingMode buffering,
-                                                             u8 method,
-                                                             u8 route_method) {
+inline bool http1_pipeline_successor_request_shape_is_stable(
+    const Connection& c,
+    const ResponseReadDeadlineUploadProof& proof,
+    ResponseReadDeadlineProfile profile,
+    ForwardResponseBufferingMode buffering,
+    u8 method,
+    u8 route_method) {
     return http1_pipeline_successor_semantic_shape_is_stable(
-               c, profile, buffering, method, route_method) &&
+               c, proof, profile, buffering, method, route_method) &&
            c.recv_buf.len() == c.req_initial_send_len;
 }
 
@@ -455,11 +460,18 @@ inline bool http1_pipeline_request_generation_provisional_is_stable(
     ResponseReadDeadlineProfile candidate_profile,
     ForwardResponseBufferingMode candidate_buffering,
     u8 candidate_method,
-    u8 candidate_route_method) {
+    u8 candidate_route_method,
+    bool candidate_downstream_close = false) {
     if (http1_pipeline_request_is_legacy(c)) return true;
+    ResponseReadDeadlineUploadProof candidate_proof{};
+    candidate_proof.downstream_close = candidate_downstream_close;
     if (!http1_pipeline_request_is_current_successor(c) ||
-        !http1_pipeline_successor_request_shape_is_stable(
-            c, candidate_profile, candidate_buffering, candidate_method, candidate_route_method) ||
+        !http1_pipeline_successor_request_shape_is_stable(c,
+                                                          candidate_proof,
+                                                          candidate_profile,
+                                                          candidate_buffering,
+                                                          candidate_method,
+                                                          candidate_route_method) ||
         c.upstream_attempts > 1 || !valid_upstream_episode(c.upstream_episode) ||
         c.upstream_episode_quarantined || !http1_pipeline_successor_tombstone_is_safe(c) ||
         !http1_pipeline_successor_upstream_owners_are_neutral(c))
@@ -476,11 +488,13 @@ inline bool http1_pipeline_request_generation_jit_candidate_is_stable(
     u8 candidate_route_method,
     u16 candidate_request_policy_id) {
     if (http1_pipeline_request_is_legacy(c)) return true;
-    return http1_pipeline_request_generation_provisional_is_stable(c,
-                                                                   candidate_profile,
-                                                                   candidate_buffering,
-                                                                   candidate_method,
-                                                                   candidate_route_method) &&
+    return http1_pipeline_request_generation_provisional_is_stable(
+               c,
+               candidate_profile,
+               candidate_buffering,
+               candidate_method,
+               candidate_route_method,
+               preflight_proof.downstream_close) &&
            candidate_request_policy_id == static_cast<u16>(RequestPolicyId::Http11FixedStrip) &&
            c.request_policy_id == 0 &&
            response_read_deadline_upload_proof_equal(c.response_read_deadline_upload,
@@ -492,7 +506,7 @@ inline bool http1_pipeline_request_generation_jit_candidate_is_stable(
            preflight_proof.rewritten_total_length == 0 && preflight_proof.upload_episode == 0 &&
            preflight_proof.expected_upload_length == 0 && preflight_proof.route_index == 0xffffu &&
            preflight_proof.upstream_id == 0xffffu && preflight_proof.request_policy_id == 0 &&
-           preflight_proof.route_fn == nullptr && !preflight_proof.downstream_close;
+           preflight_proof.route_fn == nullptr;
 }
 
 inline bool http1_pipeline_successor_selected_identity_is_stable(
@@ -506,9 +520,9 @@ inline bool http1_pipeline_successor_selected_identity_is_stable(
     const RouteConfig* cfg = c.request_config;
     if (!http1_pipeline_request_is_current_successor(c) || cfg == nullptr ||
         !(require_materialized_request ? http1_pipeline_successor_request_shape_is_stable(
-                                             c, profile, buffering, method, route_method)
+                                             c, proof, profile, buffering, method, route_method)
                                        : http1_pipeline_successor_semantic_shape_is_stable(
-                                             c, profile, buffering, method, route_method)) ||
+                                             c, proof, profile, buffering, method, route_method)) ||
         c.response_read_deadline_profile != profile ||
         c.response_read_deadline_buffering != buffering ||
         c.response_read_deadline_method != method ||
@@ -519,9 +533,8 @@ inline bool http1_pipeline_successor_selected_identity_is_stable(
         proof.handler_generation != c.http1_pipeline_request_generation ||
         proof.route_index >= cfg->route_count || proof.route_fn == nullptr ||
         proof.upstream_id >= cfg->upstream_count || proof.upstream_id != c.upstream_idx ||
-        proof.downstream_close || c.upstream_attempts != 1 ||
-        !valid_upstream_episode(c.upstream_episode) || c.upstream_episode_quarantined ||
-        !http1_pipeline_successor_tombstone_is_safe(c) ||
+        c.upstream_attempts != 1 || !valid_upstream_episode(c.upstream_episode) ||
+        c.upstream_episode_quarantined || !http1_pipeline_successor_tombstone_is_safe(c) ||
         !response_read_deadline_upload_proof_equal(c.response_read_deadline_upload, proof))
         return false;
     const RouteEntry& route = cfg->routes[proof.route_index];
@@ -631,8 +644,12 @@ inline bool http1_pipeline_request_generation_prebuilt_is_stable(
     if (!http1_pipeline_request_is_current_successor(c) || copied_config == nullptr ||
         copied_config != c.request_config ||
         !copied_config->policy_bundle_id_is_valid(copied_bundle_id) ||
-        !http1_pipeline_successor_semantic_shape_is_stable(
-            c, copied_profile, copied_buffering, copied_method, copied_route_method) ||
+        !http1_pipeline_successor_semantic_shape_is_stable(c,
+                                                           copied_proof,
+                                                           copied_profile,
+                                                           copied_buffering,
+                                                           copied_method,
+                                                           copied_route_method) ||
         copied_profile != ResponseReadDeadlineProfile::BodylessNonHeadContentLengthZero ||
         copied_buffering != ForwardResponseBufferingMode::CompleteContentLength ||
         copied_method != static_cast<u8>(LogHttpMethod::Get) ||
@@ -658,7 +675,6 @@ inline bool http1_pipeline_request_generation_prebuilt_is_stable(
         copied_proof.rewritten_total_length != c.req_initial_send_len ||
         copied_proof.rewritten_total_length != copied_proof.rewritten_header_end ||
         copied_proof.expected_upload_length != copied_proof.rewritten_total_length ||
-        copied_proof.downstream_close ||
         copied_proof.request_policy_id != static_cast<u16>(RequestPolicyId::Http11FixedStrip) ||
         copied_proof.request_policy_id != c.request_policy_id ||
         copied_proof.upstream_id >= copied_config->upstream_count ||

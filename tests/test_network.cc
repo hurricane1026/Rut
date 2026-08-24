@@ -22323,7 +22323,7 @@ struct PipelineGenerationFoundationFixture {
     u8 send_storage[512]{};
     u8 upstream_storage[512]{};
 
-    bool setup(bool older_tombstone = false) {
+    bool setup(bool older_tombstone = false, bool downstream_close = false) {
         if (!config.add_upstream("backend", 0x7F000001, 9000).has_value() ||
             !add_bodyless_non_head_response_read_deadline_bundle(
                 config, 5, ForwardResponseBufferingMode::CompleteContentLength) ||
@@ -22340,9 +22340,14 @@ struct PipelineGenerationFoundationFixture {
         conn.send_buf.bind(send_storage, sizeof(send_storage));
         conn.upstream_recv_slice = upstream_storage;
         conn.upstream_recv_buf.bind(upstream_storage, sizeof(upstream_storage));
-        static constexpr u8 kRequest[] = "GET /one HTTP/1.1\r\nHost: client.example\r\n\r\n";
-        if (conn.recv_buf.write(kRequest, sizeof(kRequest) - 1u) != sizeof(kRequest) - 1u)
-            return false;
+        static constexpr u8 kKeepAliveRequest[] =
+            "GET /one HTTP/1.1\r\nHost: client.example\r\n\r\n";
+        static constexpr u8 kCloseRequest[] =
+            "GET /one HTTP/1.1\r\nHost: client.example\r\nConnection: close\r\n\r\n";
+        const u8* request = downstream_close ? kCloseRequest : kKeepAliveRequest;
+        const u32 request_len =
+            downstream_close ? sizeof(kCloseRequest) - 1u : sizeof(kKeepAliveRequest) - 1u;
+        if (conn.recv_buf.write(request, request_len) != request_len) return false;
         capture_request_metadata(conn);
         conn.pipeline_depth = 1;
         conn.handler_gen = 23;
@@ -22360,6 +22365,7 @@ struct PipelineGenerationFoundationFixture {
         Connection& conn = loop.conns[0];
         ResponseReadDeadlineUploadProof proof{};
         proof.handler_generation = conn.http1_pipeline_request_generation;
+        proof.downstream_close = conn.req_client_connection_close_exact;
         conn.response_read_deadline_upload = proof;
         return proof;
     }
@@ -22367,13 +22373,14 @@ struct PipelineGenerationFoundationFixture {
     ResponseReadDeadlineUploadProof stage_jit_preconnect() {
         Connection& conn = loop.conns[0];
         conn.request_policy_id = static_cast<u16>(RequestPolicyId::Http11FixedStrip);
+        if (conn.req_client_connection_close_exact) conn.req_keep_alive = true;
         conn.response_read_deadline_profile =
             ResponseReadDeadlineProfile::BodylessNonHeadContentLengthZero;
         conn.response_read_deadline_buffering = ForwardResponseBufferingMode::CompleteContentLength;
         conn.response_read_deadline_method = static_cast<u8>(LogHttpMethod::Get);
         conn.response_read_deadline_route_method = kRouteMethodGet;
         conn.response_read_deadline_bundle_id = 2;
-        ResponseReadDeadlineUploadProof proof{};
+        ResponseReadDeadlineUploadProof proof = conn.response_read_deadline_upload;
         proof.handler_generation = conn.handler_gen;
         proof.rewritten_header_end = conn.req_header_end;
         proof.rewritten_total_length = conn.req_header_end;
@@ -22689,6 +22696,124 @@ TEST(http1_pipeline_generation_foundation,
         Http1PrebuiltResponsePurpose::ResponseReadTimeout));
 }
 
+TEST(http1_pipeline_generation_foundation,
+     exact_close_persistence_owner_is_pinned_across_generation_phases) {
+    PipelineGenerationFoundationFixture fixture;
+    REQUIRE(fixture.setup(/*older_tombstone=*/true, /*downstream_close=*/true));
+    Connection& conn = fixture.loop.conns[0];
+    REQUIRE_FALSE(conn.req_client_keep_alive);
+    REQUIRE(conn.req_client_connection_close);
+    REQUIRE(conn.req_client_connection_close_exact);
+    REQUIRE_EQ(conn.req_client_connection_count, 1u);
+
+    ResponseReadDeadlineUploadProof preflight = fixture.stage_preflight();
+    REQUIRE(preflight.downstream_close);
+    CHECK(http1_pipeline_request_generation_provisional_is_stable(
+        conn,
+        ResponseReadDeadlineProfile::BodylessNonHeadContentLengthZero,
+        ForwardResponseBufferingMode::CompleteContentLength,
+        static_cast<u8>(LogHttpMethod::Get),
+        kRouteMethodGet,
+        true));
+    CHECK_FALSE(http1_pipeline_request_generation_provisional_is_stable(
+        conn,
+        ResponseReadDeadlineProfile::BodylessNonHeadContentLengthZero,
+        ForwardResponseBufferingMode::CompleteContentLength,
+        static_cast<u8>(LogHttpMethod::Get),
+        kRouteMethodGet,
+        false));
+    CHECK(http1_pipeline_request_generation_jit_candidate_is_stable(
+        conn,
+        preflight,
+        ResponseReadDeadlineProfile::BodylessNonHeadContentLengthZero,
+        ForwardResponseBufferingMode::CompleteContentLength,
+        static_cast<u8>(LogHttpMethod::Get),
+        kRouteMethodGet,
+        static_cast<u16>(RequestPolicyId::Http11FixedStrip)));
+    preflight.downstream_close = false;
+    conn.response_read_deadline_upload = preflight;
+    CHECK_FALSE(http1_pipeline_request_generation_jit_candidate_is_stable(
+        conn,
+        preflight,
+        ResponseReadDeadlineProfile::BodylessNonHeadContentLengthZero,
+        ForwardResponseBufferingMode::CompleteContentLength,
+        static_cast<u8>(LogHttpMethod::Get),
+        kRouteMethodGet,
+        static_cast<u16>(RequestPolicyId::Http11FixedStrip)));
+
+    conn.response_read_deadline_upload.downstream_close = true;
+    ResponseReadDeadlineUploadProof preconnect = fixture.stage_jit_preconnect();
+    REQUIRE(conn.req_keep_alive);
+    REQUIRE(preconnect.downstream_close);
+    REQUIRE(http1_pipeline_request_generation_preconnect_is_stable(
+        conn,
+        preconnect,
+        ResponseReadDeadlineProfile::BodylessNonHeadContentLengthZero,
+        ForwardResponseBufferingMode::CompleteContentLength,
+        static_cast<u8>(LogHttpMethod::Get),
+        kRouteMethodGet));
+    ResponseReadDeadlineUploadProof forged = preconnect;
+    forged.downstream_close = false;
+    conn.response_read_deadline_upload = forged;
+    CHECK_FALSE(http1_pipeline_request_generation_preconnect_is_stable(
+        conn,
+        forged,
+        ResponseReadDeadlineProfile::BodylessNonHeadContentLengthZero,
+        ForwardResponseBufferingMode::CompleteContentLength,
+        static_cast<u8>(LogHttpMethod::Get),
+        kRouteMethodGet));
+
+    conn.response_read_deadline_upload = preconnect;
+    conn.recv_buf.reset();
+    const ResponseReadDeadlineUploadProof active = fixture.stage_upload_active(preconnect);
+    REQUIRE(active.downstream_close);
+    REQUIRE(http1_pipeline_request_generation_upload_active_is_stable(
+        conn,
+        active,
+        ResponseReadDeadlineProfile::BodylessNonHeadContentLengthZero,
+        ForwardResponseBufferingMode::CompleteContentLength,
+        static_cast<u8>(LogHttpMethod::Get),
+        kRouteMethodGet));
+    forged = active;
+    forged.downstream_close = false;
+    conn.response_read_deadline_upload = forged;
+    CHECK_FALSE(http1_pipeline_request_generation_upload_active_is_stable(
+        conn,
+        forged,
+        ResponseReadDeadlineProfile::BodylessNonHeadContentLengthZero,
+        ForwardResponseBufferingMode::CompleteContentLength,
+        static_cast<u8>(LogHttpMethod::Get),
+        kRouteMethodGet));
+
+    conn.response_read_deadline_upload = active;
+    fixture.stage_prebuilt(active, Http1PrebuiltResponsePurpose::ResponseReadTimeout);
+    REQUIRE(http1_pipeline_request_generation_prebuilt_is_stable(
+        conn,
+        active,
+        &fixture.config,
+        2,
+        ResponseReadDeadlineProfile::BodylessNonHeadContentLengthZero,
+        ForwardResponseBufferingMode::CompleteContentLength,
+        static_cast<u8>(LogHttpMethod::Get),
+        kRouteMethodGet,
+        Http1PrebuiltResponseLayout::FullContentLengthNonHead,
+        Http1PrebuiltResponsePurpose::ResponseReadTimeout));
+    forged = active;
+    forged.downstream_close = false;
+    conn.http1_prebuilt_deadline_upload = forged;
+    CHECK_FALSE(http1_pipeline_request_generation_prebuilt_is_stable(
+        conn,
+        forged,
+        &fixture.config,
+        2,
+        ResponseReadDeadlineProfile::BodylessNonHeadContentLengthZero,
+        ForwardResponseBufferingMode::CompleteContentLength,
+        static_cast<u8>(LogHttpMethod::Get),
+        kRouteMethodGet,
+        Http1PrebuiltResponseLayout::FullContentLengthNonHead,
+        Http1PrebuiltResponsePurpose::ResponseReadTimeout));
+}
+
 TEST(http1_pipeline_generation_foundation, legacy_depth_zero_contract_is_not_narrowed) {
     Connection conn{};
     conn.reset();
@@ -22784,157 +22909,177 @@ TEST(http1_pipeline_generation_foundation,
 
 TEST(http1_pipeline_generation_activation,
      validated_failures_admit_exact_successor_for_both_downstream_recv_shapes) {
-    static constexpr u8 kSuccessor[] = "GET /one HTTP/1.1\r\nHost: client.example\r\n\r\n";
+    static constexpr u8 kKeepAliveSuccessor[] = "GET /one HTTP/1.1\r\nHost: client.example\r\n\r\n";
+    static constexpr u8 kCloseSuccessor[] =
+        "GET /one HTTP/1.1\r\nHost: client.example\r\nConnection: close\r\n\r\n";
     for (const LateFailureSite site : {LateFailureSite::SocketCreate,
                                        LateFailureSite::ConnectSubmit,
                                        LateFailureSite::ConnectCompletion}) {
         for (const bool terminal_downstream_recv : {false, true}) {
-            ScopedBackendHealthReset health_reset{};
-            ScopedIoUringLoopForRetirement guard;
-            if (!guard.init()) SKIP("io_uring unavailable");
-            auto* loop = guard.loop;
-            ShardEpoch epoch{};
-            epoch.epoch.store(0, std::memory_order_relaxed);
-            ShardMetrics metrics{};
-            metrics.init();
-            AccessLogRing access_log{};
-            access_log.init();
-            CaptureRing capture{};
-            capture.init();
-            loop->epoch = &epoch;
-            loop->metrics = &metrics;
-            loop->access_log = &access_log;
-            REQUIRE(loop->set_capture(&capture));
+            for (const bool downstream_close : {false, true}) {
+                ScopedBackendHealthReset health_reset{};
+                ScopedIoUringLoopForRetirement guard;
+                if (!guard.init()) SKIP("io_uring unavailable");
+                auto* loop = guard.loop;
+                ShardEpoch epoch{};
+                epoch.epoch.store(0, std::memory_order_relaxed);
+                ShardMetrics metrics{};
+                metrics.init();
+                AccessLogRing access_log{};
+                access_log.init();
+                CaptureRing capture{};
+                capture.init();
+                loop->epoch = &epoch;
+                loop->metrics = &metrics;
+                loop->access_log = &access_log;
+                REQUIRE(loop->set_capture(&capture));
 
-            RouteConfig config{};
-            PreconnectConnectSubmitFixture fixture{};
-            u32 request1_failed_episode = 0;
-            REQUIRE(
-                stage_late_failure_response(loop,
-                                            config,
-                                            LateFailureSite::ConnectCompletion,
-                                            AsyncConnectFailureProfile::BodylessGet,
-                                            &fixture,
-                                            &request1_failed_episode,
-                                            &response_buffering_request_policy_runtime_handler));
-            Connection& conn = *fixture.conn;
-            const u32 id = conn.id;
-            BackendHealth* health = backend_health(0, 0);
-            REQUIRE(health != nullptr);
-            REQUIRE_EQ(health->fails, 1u);
-            REQUIRE_EQ(conn.recv_buf.write(kSuccessor, sizeof(kSuccessor) - 1u),
-                       sizeof(kSuccessor) - 1u);
-            if (terminal_downstream_recv) {
-                REQUIRE(conn.recv_armed);
-                REQUIRE_GT(conn.pending_ops, 0u);
-                conn.recv_armed = false;
-                conn.pending_ops--;
-            }
-
-            const u32 ring_tail_before_request2 =
-                __atomic_load_n(loop->backend.sq_tail, __ATOMIC_ACQUIRE);
-            const u32 backend_pending_before_request2 = loop->backend.pending;
-            const u32 response1_len = conn.response_header_buf.len();
-            loop->backend.send_state[id].remaining = 0;
-            loop->dispatch({id, static_cast<i32>(response1_len), 0, 0, IoEventType::Send, 0});
-
-            REQUIRE_GE(conn.fd, 0);
-            REQUIRE_GE(conn.upstream_fd, 0);
-            REQUIRE(conn.upstream_connect_armed);
-            REQUIRE_EQ(conn.pipeline_depth, 1u);
-            REQUIRE_EQ(conn.http1_pipeline_request_generation, conn.handler_gen);
-            REQUIRE_EQ(conn.response_read_deadline_state, ResponseReadDeadlineState::Validated);
-            REQUIRE(http1_pipeline_request_generation_preconnect_is_stable(
-                conn,
-                conn.response_read_deadline_upload,
-                conn.response_read_deadline_profile,
-                conn.response_read_deadline_buffering,
-                conn.response_read_deadline_method,
-                conn.response_read_deadline_route_method));
-            CHECK_EQ(conn.response_read_deadline_upload.raw_total_length, 0u);
-            CHECK_EQ(conn.response_read_deadline_upload.upload_episode, 0u);
-            CHECK_EQ(conn.upstream_backend_idx, 0u);
-            CHECK_EQ(conn.upstream_attempts, 1u);
-            CHECK_NE(conn.upstream_start_us, 0u);
-            CHECK_EQ(conn.recv_armed, !terminal_downstream_recv);
-            CHECK_EQ(conn.pending_ops, terminal_downstream_recv ? 1u : 2u);
-            CHECK_EQ(metrics.requests_total, 1u);
-            CHECK_EQ(metrics.requests_active, 1u);
-            CHECK_EQ(epoch.epoch.load(std::memory_order_acquire), 3u);
-
-            // No Connect SQE from this deterministic seam reaches the kernel.
-            // Rewind only ring publication while retaining the exact logical
-            // owner that the selected failure site consumes below.
-            __atomic_store_n(loop->backend.sq_tail, ring_tail_before_request2, __ATOMIC_RELEASE);
-            loop->backend.pending = backend_pending_before_request2;
-            const u32 request2_episode = conn.upstream_episode;
-            if (site == LateFailureSite::ConnectCompletion) {
-                loop->dispatch(async_connect_failure_event(conn, -ECONNREFUSED));
-            } else {
-                conn.upstream_connect_armed = false;
-                conn.pending_ops--;
-                if (site == LateFailureSite::SocketCreate) {
-                    close(conn.upstream_fd);
-                    conn.upstream_fd = -1;
-                    conn.on_upstream_send = nullptr;
-                    respond_validated_preconnect_failure(
-                        loop, conn, ValidatedPreconnectFailureSite::SocketCreate);
-                } else {
-                    respond_validated_preconnect_failure(
-                        loop, conn, ValidatedPreconnectFailureSite::ConnectSubmit);
+                RouteConfig config{};
+                PreconnectConnectSubmitFixture fixture{};
+                u32 request1_failed_episode = 0;
+                REQUIRE(stage_late_failure_response(
+                    loop,
+                    config,
+                    LateFailureSite::ConnectCompletion,
+                    AsyncConnectFailureProfile::BodylessGet,
+                    &fixture,
+                    &request1_failed_episode,
+                    &response_buffering_request_policy_runtime_handler));
+                Connection& conn = *fixture.conn;
+                const u32 id = conn.id;
+                BackendHealth* health = backend_health(0, 0);
+                REQUIRE(health != nullptr);
+                REQUIRE_EQ(health->fails, 1u);
+                const u8* successor = downstream_close ? kCloseSuccessor : kKeepAliveSuccessor;
+                const u32 successor_len = downstream_close ? sizeof(kCloseSuccessor) - 1u
+                                                           : sizeof(kKeepAliveSuccessor) - 1u;
+                REQUIRE_EQ(conn.recv_buf.write(successor, successor_len), successor_len);
+                if (terminal_downstream_recv) {
+                    REQUIRE(conn.recv_armed);
+                    REQUIRE_GT(conn.pending_ops, 0u);
+                    conn.recv_armed = false;
+                    conn.pending_ops--;
                 }
+
+                const u32 ring_tail_before_request2 =
+                    __atomic_load_n(loop->backend.sq_tail, __ATOMIC_ACQUIRE);
+                const u32 backend_pending_before_request2 = loop->backend.pending;
+                const u32 response1_len = conn.response_header_buf.len();
+                loop->backend.send_state[id].remaining = 0;
+                loop->dispatch({id, static_cast<i32>(response1_len), 0, 0, IoEventType::Send, 0});
+
+                REQUIRE_GE(conn.fd, 0);
+                REQUIRE_GE(conn.upstream_fd, 0);
+                REQUIRE(conn.upstream_connect_armed);
+                REQUIRE_EQ(conn.pipeline_depth, 1u);
+                REQUIRE_EQ(conn.http1_pipeline_request_generation, conn.handler_gen);
+                REQUIRE_EQ(conn.response_read_deadline_state, ResponseReadDeadlineState::Validated);
+                REQUIRE_EQ(conn.response_read_deadline_upload.downstream_close, downstream_close);
+                REQUIRE(http1_pipeline_request_generation_preconnect_is_stable(
+                    conn,
+                    conn.response_read_deadline_upload,
+                    conn.response_read_deadline_profile,
+                    conn.response_read_deadline_buffering,
+                    conn.response_read_deadline_method,
+                    conn.response_read_deadline_route_method));
+                CHECK_EQ(conn.response_read_deadline_upload.raw_total_length, 0u);
+                CHECK_EQ(conn.response_read_deadline_upload.upload_episode, 0u);
+                CHECK_EQ(conn.upstream_backend_idx, 0u);
+                CHECK_EQ(conn.upstream_attempts, 1u);
+                CHECK_NE(conn.upstream_start_us, 0u);
+                CHECK_EQ(conn.recv_armed, !terminal_downstream_recv);
+                CHECK_EQ(conn.pending_ops, terminal_downstream_recv ? 1u : 2u);
+                CHECK_EQ(metrics.requests_total, 1u);
+                CHECK_EQ(metrics.requests_active, 1u);
+                CHECK_EQ(epoch.epoch.load(std::memory_order_acquire), 3u);
+
+                // No Connect SQE from this deterministic seam reaches the kernel.
+                // Rewind only ring publication while retaining the exact logical
+                // owner that the selected failure site consumes below.
+                __atomic_store_n(
+                    loop->backend.sq_tail, ring_tail_before_request2, __ATOMIC_RELEASE);
+                loop->backend.pending = backend_pending_before_request2;
+                const u32 request2_episode = conn.upstream_episode;
+                if (site == LateFailureSite::ConnectCompletion) {
+                    loop->dispatch(async_connect_failure_event(conn, -ECONNREFUSED));
+                } else {
+                    conn.upstream_connect_armed = false;
+                    conn.pending_ops--;
+                    if (site == LateFailureSite::SocketCreate) {
+                        close(conn.upstream_fd);
+                        conn.upstream_fd = -1;
+                        conn.on_upstream_send = nullptr;
+                        respond_validated_preconnect_failure(
+                            loop, conn, ValidatedPreconnectFailureSite::SocketCreate);
+                    } else {
+                        respond_validated_preconnect_failure(
+                            loop, conn, ValidatedPreconnectFailureSite::ConnectSubmit);
+                    }
+                }
+
+                REQUIRE_GE(conn.fd, 0);
+                REQUIRE(conn.send_armed);
+                CHECK_EQ(conn.on_send, &on_validated_preconnect_failure_sent<IoUringEventLoop>);
+                CHECK_EQ(conn.response_read_deadline_state, ResponseReadDeadlineState::None);
+                CHECK(conn.response_read_deadline_owner_is_neutral());
+                CHECK_EQ(conn.resp_status, 502u);
+                CHECK(buf_has(conn.response_header_buf.data(),
+                              conn.response_header_buf.len(),
+                              "HTTP/1.1 502 Bad Gateway"));
+                CHECK(buf_has(conn.response_header_buf.data(),
+                              conn.response_header_buf.len(),
+                              downstream_close ? "Connection: close" : "Connection: keep-alive"));
+                CHECK_EQ(metrics.requests_total, 1u);
+                CHECK_EQ(metrics.requests_active, 1u);
+                CHECK_EQ(epoch.epoch.load(std::memory_order_acquire), 3u);
+                CHECK_EQ(health->fails, site == LateFailureSite::ConnectCompletion ? 2u : 1u);
+                if (site == LateFailureSite::ConnectCompletion) {
+                    CHECK_EQ(conn.upstream_retiring_episode, request2_episode);
+                    CHECK_NE(conn.upstream_episode, request2_episode);
+                    CHECK_FALSE(conn.upstream_retirement_active);
+                    CHECK_EQ(conn.upstream_retirement_target_owned, 0u);
+                    CHECK_EQ(conn.upstream_retirement_cancel_owned, 0u);
+                } else {
+                    CHECK_EQ(conn.upstream_retiring_episode, request1_failed_episode);
+                }
+
+                const u32 response2_len = conn.response_header_buf.len();
+                loop->backend.send_state[id].remaining = 0;
+                loop->dispatch({id, static_cast<i32>(response2_len), 0, 0, IoEventType::Send, 0});
+                CHECK_EQ(metrics.requests_total, 2u);
+                CHECK_EQ(metrics.requests_active, 0u);
+                CHECK_EQ(epoch.epoch.load(std::memory_order_acquire), 4u);
+                if (downstream_close) {
+                    CHECK_EQ(loop->conns[id].fd, -1);
+                    CHECK_FALSE(loop->conns[id].recv_armed);
+                    CHECK_FALSE(loop->conns[id].send_armed);
+                    CHECK_EQ(loop->conns[id].pending_ops, terminal_downstream_recv ? 0u : 2u);
+                    if (!terminal_downstream_recv) {
+                        loop->dispatch({id, -ECANCELED, 0, 0, IoEventType::Recv, 0});
+                        loop->dispatch({id, -ENOENT, 0, 0, IoEventType::Recv, 0});
+                        CHECK_EQ(loop->conns[id].pending_ops, 0u);
+                    }
+                } else {
+                    CHECK_GE(loop->conns[id].fd, 0);
+                    CHECK(loop->conns[id].recv_armed);
+                    CHECK_EQ(loop->conns[id].pending_ops, 1u);
+                }
+
+                for (u32 response_index = 0; response_index < 2; ++response_index) {
+                    AccessLogEntry access{};
+                    REQUIRE(access_log.pop(access));
+                    CHECK_EQ(access.status, 502u);
+                    CaptureEntry captured{};
+                    REQUIRE(capture.pop(captured));
+                    CHECK_EQ(captured.resp_status, 502u);
+                }
+                AccessLogEntry no_access{};
+                CHECK_FALSE(access_log.pop(no_access));
+                CaptureEntry no_capture{};
+                CHECK_FALSE(capture.pop(no_capture));
+
+                cleanup_late_failure_fixture(loop, fixture);
             }
-
-            REQUIRE_GE(conn.fd, 0);
-            REQUIRE(conn.send_armed);
-            CHECK_EQ(conn.on_send, &on_validated_preconnect_failure_sent<IoUringEventLoop>);
-            CHECK_EQ(conn.response_read_deadline_state, ResponseReadDeadlineState::None);
-            CHECK(conn.response_read_deadline_owner_is_neutral());
-            CHECK_EQ(conn.resp_status, 502u);
-            CHECK(buf_has(conn.response_header_buf.data(),
-                          conn.response_header_buf.len(),
-                          "HTTP/1.1 502 Bad Gateway"));
-            CHECK(buf_has(conn.response_header_buf.data(),
-                          conn.response_header_buf.len(),
-                          "Connection: keep-alive"));
-            CHECK_EQ(metrics.requests_total, 1u);
-            CHECK_EQ(metrics.requests_active, 1u);
-            CHECK_EQ(epoch.epoch.load(std::memory_order_acquire), 3u);
-            CHECK_EQ(health->fails, site == LateFailureSite::ConnectCompletion ? 2u : 1u);
-            if (site == LateFailureSite::ConnectCompletion) {
-                CHECK_EQ(conn.upstream_retiring_episode, request2_episode);
-                CHECK_NE(conn.upstream_episode, request2_episode);
-                CHECK_FALSE(conn.upstream_retirement_active);
-                CHECK_EQ(conn.upstream_retirement_target_owned, 0u);
-                CHECK_EQ(conn.upstream_retirement_cancel_owned, 0u);
-            } else {
-                CHECK_EQ(conn.upstream_retiring_episode, request1_failed_episode);
-            }
-
-            const u32 response2_len = conn.response_header_buf.len();
-            loop->backend.send_state[id].remaining = 0;
-            loop->dispatch({id, static_cast<i32>(response2_len), 0, 0, IoEventType::Send, 0});
-            CHECK_EQ(metrics.requests_total, 2u);
-            CHECK_EQ(metrics.requests_active, 0u);
-            CHECK_EQ(epoch.epoch.load(std::memory_order_acquire), 4u);
-            CHECK_GE(loop->conns[id].fd, 0);
-            CHECK(loop->conns[id].recv_armed);
-            CHECK_EQ(loop->conns[id].pending_ops, 1u);
-
-            for (u32 response_index = 0; response_index < 2; ++response_index) {
-                AccessLogEntry access{};
-                REQUIRE(access_log.pop(access));
-                CHECK_EQ(access.status, 502u);
-                CaptureEntry captured{};
-                REQUIRE(capture.pop(captured));
-                CHECK_EQ(captured.resp_status, 502u);
-            }
-            AccessLogEntry no_access{};
-            CHECK_FALSE(access_log.pop(no_access));
-            CaptureEntry no_capture{};
-            CHECK_FALSE(capture.pop(no_capture));
-
-            cleanup_late_failure_fixture(loop, fixture);
         }
     }
 }
@@ -23088,80 +23233,96 @@ TEST(http1_pipeline_generation_activation,
      strict_success_and_timeout_complete_both_d2_orders_for_request_two) {
     enum class Outcome : u8 { Success, Timeout };
     static constexpr u8 kOrigin[] = "HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n";
+    static constexpr u8 kCloseSuccessor[] =
+        "GET /one HTTP/1.1\r\nHost: client.example\r\nConnection: close\r\n\r\n";
     for (const Outcome outcome : {Outcome::Success, Outcome::Timeout}) {
         for (const bool header_first : {false, true}) {
-            ScopedBackendHealthReset health_reset{};
-            ScopedIoUringLoopForRetirement guard;
-            if (!guard.init()) SKIP("io_uring unavailable");
-            auto* loop = guard.loop;
-            ShardMetrics metrics{};
-            metrics.init();
-            loop->metrics = &metrics;
-            RouteConfig config{};
-            PreconnectConnectSubmitFixture fixture{};
-            REQUIRE(stage_pipeline_generation_successor_upload(loop, config, &fixture));
-            Connection& conn = *fixture.conn;
-            const u32 id = conn.id;
-            const auto upload = conn.response_read_deadline_upload;
-            REQUIRE(http1_pipeline_request_generation_upload_active_is_stable(
-                conn,
-                upload,
-                conn.response_read_deadline_profile,
-                conn.response_read_deadline_buffering,
-                conn.response_read_deadline_method,
-                conn.response_read_deadline_route_method));
+            for (const bool downstream_close : {false, true}) {
+                ScopedBackendHealthReset health_reset{};
+                ScopedIoUringLoopForRetirement guard;
+                if (!guard.init()) SKIP("io_uring unavailable");
+                auto* loop = guard.loop;
+                ShardMetrics metrics{};
+                metrics.init();
+                loop->metrics = &metrics;
+                RouteConfig config{};
+                PreconnectConnectSubmitFixture fixture{};
+                REQUIRE(stage_pipeline_generation_successor_upload(
+                    loop,
+                    config,
+                    &fixture,
+                    /*terminal_downstream_recv=*/false,
+                    downstream_close ? kCloseSuccessor : nullptr,
+                    downstream_close ? sizeof(kCloseSuccessor) - 1u : 0u));
+                Connection& conn = *fixture.conn;
+                const u32 id = conn.id;
+                const auto upload = conn.response_read_deadline_upload;
+                REQUIRE(http1_pipeline_request_generation_upload_active_is_stable(
+                    conn,
+                    upload,
+                    conn.response_read_deadline_profile,
+                    conn.response_read_deadline_buffering,
+                    conn.response_read_deadline_method,
+                    conn.response_read_deadline_route_method));
 
-            if (outcome == Outcome::Success) {
-                REQUIRE_EQ(conn.upstream_recv_buf.write(kOrigin, sizeof(kOrigin) - 1u),
-                           sizeof(kOrigin) - 1u);
-                const IoEvent response = response_read_copy_event(
-                    conn, sizeof(kOrigin) - 1u, true, 0, sizeof(kOrigin) - 1u);
-                loop->dispatch_batch(&response, 1);
-                REQUIRE_EQ(conn.resp_status, 200u);
-                REQUIRE_EQ(conn.http1_prebuilt_response_purpose,
-                           Http1PrebuiltResponsePurpose::StrictNonHeadCl0Success);
-            } else {
-                conn.response_read_deadline_state = ResponseReadDeadlineState::ExpiryPending;
-                REQUIRE(try_prebuilt_strict_read_timeout(loop, conn));
-                REQUIRE_EQ(conn.resp_status, 504u);
-                REQUIRE_EQ(conn.http1_prebuilt_response_purpose,
-                           Http1PrebuiltResponsePurpose::ResponseReadTimeout);
-            }
+                if (outcome == Outcome::Success) {
+                    REQUIRE_EQ(conn.upstream_recv_buf.write(kOrigin, sizeof(kOrigin) - 1u),
+                               sizeof(kOrigin) - 1u);
+                    const IoEvent response = response_read_copy_event(
+                        conn, sizeof(kOrigin) - 1u, true, 0, sizeof(kOrigin) - 1u);
+                    loop->dispatch_batch(&response, 1);
+                    REQUIRE_EQ(conn.resp_status, 200u);
+                    REQUIRE_EQ(conn.http1_prebuilt_response_purpose,
+                               Http1PrebuiltResponsePurpose::StrictNonHeadCl0Success);
+                } else {
+                    conn.response_read_deadline_state = ResponseReadDeadlineState::ExpiryPending;
+                    REQUIRE(try_prebuilt_strict_read_timeout(loop, conn));
+                    REQUIRE_EQ(conn.resp_status, 504u);
+                    REQUIRE_EQ(conn.http1_prebuilt_response_purpose,
+                               Http1PrebuiltResponsePurpose::ResponseReadTimeout);
+                }
 
-            REQUIRE_EQ(conn.http1_prebuilt_response_layout,
-                       Http1PrebuiltResponseLayout::FullContentLengthNonHead);
-            REQUIRE_EQ(conn.http1_prebuilt_deadline_config, &config);
-            REQUIRE_EQ(conn.http1_prebuilt_deadline_bundle_id, 2u);
-            REQUIRE_EQ(conn.http1_prebuilt_deadline_profile,
-                       ResponseReadDeadlineProfile::BodylessNonHeadContentLengthZero);
-            REQUIRE_EQ(conn.http1_prebuilt_deadline_method, static_cast<u8>(LogHttpMethod::Get));
-            REQUIRE_EQ(conn.http1_prebuilt_deadline_route_method, kRouteMethodGet);
-            REQUIRE(response_read_deadline_upload_proof_equal(conn.http1_prebuilt_deadline_upload,
-                                                              upload));
-            REQUIRE(conn.upstream_retirement_active);
-            REQUIRE_EQ(conn.http1_prebuilt_wait,
-                       kHttp1WaitHeaderSend | kHttp1WaitUpstreamRetirement);
-            REQUIRE(conn.send_armed);
+                REQUIRE_EQ(conn.http1_prebuilt_response_layout,
+                           Http1PrebuiltResponseLayout::FullContentLengthNonHead);
+                REQUIRE_EQ(conn.http1_prebuilt_deadline_config, &config);
+                REQUIRE_EQ(conn.http1_prebuilt_deadline_bundle_id, 2u);
+                REQUIRE_EQ(conn.http1_prebuilt_deadline_profile,
+                           ResponseReadDeadlineProfile::BodylessNonHeadContentLengthZero);
+                REQUIRE_EQ(conn.http1_prebuilt_deadline_method,
+                           static_cast<u8>(LogHttpMethod::Get));
+                REQUIRE_EQ(conn.http1_prebuilt_deadline_route_method, kRouteMethodGet);
+                REQUIRE(response_read_deadline_upload_proof_equal(
+                    conn.http1_prebuilt_deadline_upload, upload));
+                REQUIRE_EQ(upload.downstream_close, downstream_close);
+                CHECK(buf_has(conn.response_header_buf.data(),
+                              conn.response_header_buf.len(),
+                              downstream_close ? "Connection: close" : "Connection: keep-alive"));
+                REQUIRE(conn.upstream_retirement_active);
+                REQUIRE_EQ(conn.http1_prebuilt_wait,
+                           kHttp1WaitHeaderSend | kHttp1WaitUpstreamRetirement);
+                REQUIRE(conn.send_armed);
 
-            if (header_first) complete_prebuilt_d2_header(loop, conn);
-            CHECK_FALSE(conn.http1_boundary_ready);
-            drain_prebuilt_d2_retirement(loop, conn, kUpstreamOpRecv, false);
-            if (!header_first) {
+                if (header_first) complete_prebuilt_d2_header(loop, conn);
                 CHECK_FALSE(conn.http1_boundary_ready);
-                complete_prebuilt_d2_header(loop, conn);
+                drain_prebuilt_d2_retirement(loop, conn, kUpstreamOpRecv, false);
+                if (!header_first) {
+                    CHECK_FALSE(conn.http1_boundary_ready);
+                    complete_prebuilt_d2_header(loop, conn);
+                }
+                REQUIRE(conn.http1_boundary_ready);
+                loop->resume_deferred_http1_boundaries();
+                CHECK_EQ(loop->conns[id].fd >= 0, !downstream_close);
+                if (!downstream_close) CHECK_EQ(conn.state, ConnState::ReadingHeader);
+                CHECK_EQ(conn.pipeline_depth, 0u);
+                // The token remains pinned until the next header admission clears
+                // or republishes it; depth 0 alone must not be treated as a live
+                // successor owner between requests.
+                CHECK_EQ(conn.http1_pipeline_request_generation,
+                         downstream_close ? 0u : conn.handler_gen);
+                CHECK_EQ(metrics.requests_total, 2u);
+                CHECK_EQ(metrics.requests_active, 0u);
+                cleanup_late_failure_fixture(loop, fixture);
             }
-            REQUIRE(conn.http1_boundary_ready);
-            loop->resume_deferred_http1_boundaries();
-            REQUIRE_GE(loop->conns[id].fd, 0);
-            CHECK_EQ(conn.state, ConnState::ReadingHeader);
-            CHECK_EQ(conn.pipeline_depth, 0u);
-            // The token remains pinned until the next header admission clears
-            // or republishes it; depth 0 alone must not be treated as a live
-            // successor owner between requests.
-            CHECK_EQ(conn.http1_pipeline_request_generation, conn.handler_gen);
-            CHECK_EQ(metrics.requests_total, 2u);
-            CHECK_EQ(metrics.requests_active, 0u);
-            cleanup_late_failure_fixture(loop, fixture);
         }
     }
 }
@@ -23240,6 +23401,7 @@ TEST(http1_pipeline_generation_activation,
         Bundle,
         Buffering,
         Policy,
+        DownstreamClose,
         Generation,
         CurrentLength,
     };
@@ -23252,6 +23414,7 @@ TEST(http1_pipeline_generation_activation,
                                       Forgery::Bundle,
                                       Forgery::Buffering,
                                       Forgery::Policy,
+                                      Forgery::DownstreamClose,
                                       Forgery::Generation,
                                       Forgery::CurrentLength}) {
             ScopedBackendHealthReset health_reset{};
@@ -23297,6 +23460,9 @@ TEST(http1_pipeline_generation_activation,
                 case Forgery::Policy:
                     conn.http1_prebuilt_deadline_upload.request_policy_id = 0;
                     break;
+                case Forgery::DownstreamClose:
+                    conn.http1_prebuilt_deadline_upload.downstream_close = true;
+                    break;
                 case Forgery::Generation:
                     ++conn.http1_prebuilt_deadline_generation;
                     break;
@@ -23322,12 +23488,15 @@ TEST(http1_pipeline_generation_activation,
 TEST(http1_pipeline_generation_activation,
      active_and_postcommit_owners_reject_request_two_identity_forgery) {
     enum class Phase : u8 { Active, PostCommit };
-    enum class Forgery : u8 { Policy, Generation, Episode, CurrentLength };
+    enum class Forgery : u8 { Policy, DownstreamClose, Generation, Episode, CurrentLength };
     static constexpr u8 kPartial[] = "HTTP/1.1 200 OK\r\nContent-Length: 4\r\n\r\nab";
     static constexpr u8 kLast[] = {'c', 'd'};
     for (const Phase phase : {Phase::Active, Phase::PostCommit}) {
-        for (const Forgery forgery :
-             {Forgery::Policy, Forgery::Generation, Forgery::Episode, Forgery::CurrentLength}) {
+        for (const Forgery forgery : {Forgery::Policy,
+                                      Forgery::DownstreamClose,
+                                      Forgery::Generation,
+                                      Forgery::Episode,
+                                      Forgery::CurrentLength}) {
             ScopedBackendHealthReset health_reset{};
             ScopedIoUringLoopForRetirement guard;
             if (!guard.init()) SKIP("io_uring unavailable");
@@ -23352,6 +23521,9 @@ TEST(http1_pipeline_generation_activation,
             switch (forgery) {
                 case Forgery::Policy:
                     conn.response_read_deadline_upload.request_policy_id = 0;
+                    break;
+                case Forgery::DownstreamClose:
+                    conn.response_read_deadline_upload.downstream_close = true;
                     break;
                 case Forgery::Generation:
                     ++conn.http1_pipeline_request_generation;
@@ -23386,110 +23558,124 @@ TEST(http1_pipeline_generation_activation,
 TEST(http1_pipeline_generation_activation,
      retired_postcommit_request_two_completes_once_and_forgery_stops_before_body) {
     static constexpr u8 kOrigin[] = "HTTP/1.1 200 OK\r\nContent-Length: 4\r\n\r\nabcd";
+    static constexpr u8 kCloseSuccessor[] =
+        "GET /one HTTP/1.1\r\nHost: client.example\r\nConnection: close\r\n\r\n";
     for (const bool forge_header_boundary : {false, true}) {
-        ScopedBackendHealthReset health_reset{};
-        ScopedIoUringLoopForRetirement guard;
-        if (!guard.init()) SKIP("io_uring unavailable");
-        auto* loop = guard.loop;
-        ShardEpoch epoch{};
-        epoch.epoch.store(0, std::memory_order_relaxed);
-        ShardMetrics metrics{};
-        metrics.init();
-        AccessLogRing access_log{};
-        access_log.init();
-        CaptureRing capture{};
-        capture.init();
-        loop->epoch = &epoch;
-        loop->metrics = &metrics;
-        loop->access_log = &access_log;
-        REQUIRE(loop->set_capture(&capture));
+        for (const bool downstream_close : {false, true}) {
+            ScopedBackendHealthReset health_reset{};
+            ScopedIoUringLoopForRetirement guard;
+            if (!guard.init()) SKIP("io_uring unavailable");
+            auto* loop = guard.loop;
+            ShardEpoch epoch{};
+            epoch.epoch.store(0, std::memory_order_relaxed);
+            ShardMetrics metrics{};
+            metrics.init();
+            AccessLogRing access_log{};
+            access_log.init();
+            CaptureRing capture{};
+            capture.init();
+            loop->epoch = &epoch;
+            loop->metrics = &metrics;
+            loop->access_log = &access_log;
+            REQUIRE(loop->set_capture(&capture));
 
-        RouteConfig config{};
-        PreconnectConnectSubmitFixture fixture{};
-        REQUIRE(stage_pipeline_generation_successor_upload(loop, config, &fixture));
-        Connection& conn = *fixture.conn;
-        const u32 id = conn.id;
-        const u32 upload_episode = conn.response_read_deadline_upload.upload_episode;
-        REQUIRE_EQ(upload_episode, conn.upstream_episode);
-        REQUIRE_EQ(metrics.requests_total, 1u);
-        REQUIRE_EQ(metrics.requests_active, 1u);
+            RouteConfig config{};
+            PreconnectConnectSubmitFixture fixture{};
+            REQUIRE(stage_pipeline_generation_successor_upload(
+                loop,
+                config,
+                &fixture,
+                /*terminal_downstream_recv=*/false,
+                downstream_close ? kCloseSuccessor : nullptr,
+                downstream_close ? sizeof(kCloseSuccessor) - 1u : 0u));
+            Connection& conn = *fixture.conn;
+            const u32 id = conn.id;
+            const u32 upload_episode = conn.response_read_deadline_upload.upload_episode;
+            REQUIRE_EQ(upload_episode, conn.upstream_episode);
+            REQUIRE_EQ(metrics.requests_total, 1u);
+            REQUIRE_EQ(metrics.requests_active, 1u);
 
-        REQUIRE_EQ(conn.upstream_recv_buf.write(kOrigin, sizeof(kOrigin) - 1u),
-                   sizeof(kOrigin) - 1u);
-        const IoEvent response =
-            response_read_copy_event(conn, sizeof(kOrigin) - 1u, true, 0, sizeof(kOrigin) - 1u);
-        loop->dispatch_batch(&response, 1);
-        REQUIRE_GE(conn.fd, 0);
-        REQUIRE_EQ(conn.response_read_deadline_post_commit_phase,
-                   ResponseReadDeadlinePostCommitPhase::HeaderSend);
-        REQUIRE(conn.upstream_retirement_active);
-        REQUIRE_NE(conn.upstream_episode, upload_episode);
-        REQUIRE_EQ(conn.upstream_retiring_episode, upload_episode);
-        REQUIRE_EQ(conn.response_read_deadline_upload.upload_episode,
-                   conn.upstream_retiring_episode);
-        REQUIRE(response_read_deadline_post_commit_is_stable(conn));
-        REQUIRE_EQ(conn.response_read_deadline_post_commit_declared_body, 4u);
-        REQUIRE_EQ(conn.response_read_deadline_post_commit_origin_received, 4u);
-        REQUIRE_EQ(conn.response_read_deadline_post_commit_send_body, 4u);
-        REQUIRE_EQ(conn.response_read_deadline_send_kind, ResponseReadDeadlineSendKind::Header);
+            REQUIRE_EQ(conn.upstream_recv_buf.write(kOrigin, sizeof(kOrigin) - 1u),
+                       sizeof(kOrigin) - 1u);
+            const IoEvent response =
+                response_read_copy_event(conn, sizeof(kOrigin) - 1u, true, 0, sizeof(kOrigin) - 1u);
+            loop->dispatch_batch(&response, 1);
+            REQUIRE_GE(conn.fd, 0);
+            REQUIRE_EQ(conn.response_read_deadline_post_commit_phase,
+                       ResponseReadDeadlinePostCommitPhase::HeaderSend);
+            REQUIRE(conn.upstream_retirement_active);
+            REQUIRE_NE(conn.upstream_episode, upload_episode);
+            REQUIRE_EQ(conn.upstream_retiring_episode, upload_episode);
+            REQUIRE_EQ(conn.response_read_deadline_upload.upload_episode,
+                       conn.upstream_retiring_episode);
+            REQUIRE(response_read_deadline_post_commit_is_stable(conn));
+            REQUIRE_EQ(conn.response_read_deadline_upload.downstream_close, downstream_close);
+            CHECK(buf_has(conn.response_header_buf.data(),
+                          conn.response_header_buf.len(),
+                          downstream_close ? "Connection: close" : "Connection: keep-alive"));
+            REQUIRE_EQ(conn.response_read_deadline_post_commit_declared_body, 4u);
+            REQUIRE_EQ(conn.response_read_deadline_post_commit_origin_received, 4u);
+            REQUIRE_EQ(conn.response_read_deadline_post_commit_send_body, 4u);
+            REQUIRE_EQ(conn.response_read_deadline_send_kind, ResponseReadDeadlineSendKind::Header);
 
-        if (forge_header_boundary) {
-            conn.response_read_deadline_upload.request_policy_id = 0;
-            REQUIRE_FALSE(response_read_deadline_post_commit_is_stable(conn));
-            IoEvent forged_header = exact_response_deadline_send_event(loop, conn);
-            loop->dispatch_batch(&forged_header, 1);
-            CHECK_EQ(loop->conns[id].fd, -1);
-            CHECK_NE(loop->conns[id].response_read_deadline_post_commit_phase,
-                     ResponseReadDeadlinePostCommitPhase::BodySend);
-            CHECK_EQ(loop->backend.send_state[id].remaining, 0u);
-            CHECK_EQ(metrics.requests_total, 1u);
+            if (forge_header_boundary) {
+                conn.response_read_deadline_upload.request_policy_id = 0;
+                REQUIRE_FALSE(response_read_deadline_post_commit_is_stable(conn));
+                IoEvent forged_header = exact_response_deadline_send_event(loop, conn);
+                loop->dispatch_batch(&forged_header, 1);
+                CHECK_EQ(loop->conns[id].fd, -1);
+                CHECK_NE(loop->conns[id].response_read_deadline_post_commit_phase,
+                         ResponseReadDeadlinePostCommitPhase::BodySend);
+                CHECK_EQ(loop->backend.send_state[id].remaining, 0u);
+                CHECK_EQ(metrics.requests_total, 1u);
+                cleanup_late_failure_fixture(loop, fixture);
+                continue;
+            }
+
+            IoEvent header = exact_response_deadline_send_event(loop, conn);
+            loop->dispatch_batch(&header, 1);
+            REQUIRE_GE(conn.fd, 0);
+            REQUIRE_EQ(conn.response_read_deadline_post_commit_phase,
+                       ResponseReadDeadlinePostCommitPhase::BodySend);
+            REQUIRE(response_read_deadline_post_commit_is_stable(conn));
+            REQUIRE_EQ(conn.response_read_deadline_send_kind, ResponseReadDeadlineSendKind::Body);
+            REQUIRE_EQ(conn.response_read_deadline_send_len, 4u);
+            REQUIRE_EQ(__builtin_memcmp(conn.response_read_deadline_send_src, "abcd", 4), 0);
+
+            IoEvent body = exact_response_deadline_send_event(loop, conn);
+            loop->dispatch_batch(&body, 1);
+            REQUIRE_GE(conn.fd, 0);
+            REQUIRE(conn.http1_boundary_deferred);
+            REQUIRE_FALSE(conn.http1_boundary_ready);
+            REQUIRE(conn.upstream_retirement_active);
+            drain_prebuilt_d2_retirement(loop, conn, kUpstreamOpRecv, false);
+            REQUIRE(conn.http1_boundary_ready);
+            loop->resume_deferred_http1_boundaries();
+            CHECK_EQ(loop->conns[id].fd >= 0, !downstream_close);
+            if (!downstream_close) CHECK_EQ(conn.state, ConnState::ReadingHeader);
+            CHECK_EQ(conn.pipeline_depth, 0u);
+            CHECK_EQ(metrics.requests_total, 2u);
+            CHECK_EQ(metrics.requests_active, 0u);
+            CHECK_EQ(epoch.epoch.load(std::memory_order_acquire), 4u);
+
+            AccessLogEntry request1_access{};
+            AccessLogEntry request2_access{};
+            REQUIRE(access_log.pop(request1_access));
+            REQUIRE(access_log.pop(request2_access));
+            CHECK_EQ(request1_access.status, 502u);
+            CHECK_EQ(request2_access.status, 200u);
+            AccessLogEntry no_access{};
+            CHECK_FALSE(access_log.pop(no_access));
+            CaptureEntry request1_capture{};
+            CaptureEntry request2_capture{};
+            REQUIRE(capture.pop(request1_capture));
+            REQUIRE(capture.pop(request2_capture));
+            CHECK_EQ(request1_capture.resp_status, 502u);
+            CHECK_EQ(request2_capture.resp_status, 200u);
+            CaptureEntry no_capture{};
+            CHECK_FALSE(capture.pop(no_capture));
             cleanup_late_failure_fixture(loop, fixture);
-            continue;
         }
-
-        IoEvent header = exact_response_deadline_send_event(loop, conn);
-        loop->dispatch_batch(&header, 1);
-        REQUIRE_GE(conn.fd, 0);
-        REQUIRE_EQ(conn.response_read_deadline_post_commit_phase,
-                   ResponseReadDeadlinePostCommitPhase::BodySend);
-        REQUIRE(response_read_deadline_post_commit_is_stable(conn));
-        REQUIRE_EQ(conn.response_read_deadline_send_kind, ResponseReadDeadlineSendKind::Body);
-        REQUIRE_EQ(conn.response_read_deadline_send_len, 4u);
-        REQUIRE_EQ(__builtin_memcmp(conn.response_read_deadline_send_src, "abcd", 4), 0);
-
-        IoEvent body = exact_response_deadline_send_event(loop, conn);
-        loop->dispatch_batch(&body, 1);
-        REQUIRE_GE(conn.fd, 0);
-        REQUIRE(conn.http1_boundary_deferred);
-        REQUIRE_FALSE(conn.http1_boundary_ready);
-        REQUIRE(conn.upstream_retirement_active);
-        drain_prebuilt_d2_retirement(loop, conn, kUpstreamOpRecv, false);
-        REQUIRE(conn.http1_boundary_ready);
-        loop->resume_deferred_http1_boundaries();
-        REQUIRE_GE(loop->conns[id].fd, 0);
-        CHECK_EQ(conn.state, ConnState::ReadingHeader);
-        CHECK_EQ(conn.pipeline_depth, 0u);
-        CHECK_EQ(metrics.requests_total, 2u);
-        CHECK_EQ(metrics.requests_active, 0u);
-        CHECK_EQ(epoch.epoch.load(std::memory_order_acquire), 4u);
-
-        AccessLogEntry request1_access{};
-        AccessLogEntry request2_access{};
-        REQUIRE(access_log.pop(request1_access));
-        REQUIRE(access_log.pop(request2_access));
-        CHECK_EQ(request1_access.status, 502u);
-        CHECK_EQ(request2_access.status, 200u);
-        AccessLogEntry no_access{};
-        CHECK_FALSE(access_log.pop(no_access));
-        CaptureEntry request1_capture{};
-        CaptureEntry request2_capture{};
-        REQUIRE(capture.pop(request1_capture));
-        REQUIRE(capture.pop(request2_capture));
-        CHECK_EQ(request1_capture.resp_status, 502u);
-        CHECK_EQ(request2_capture.resp_status, 200u);
-        CaptureEntry no_capture{};
-        CHECK_FALSE(capture.pop(no_capture));
-        cleanup_late_failure_fixture(loop, fixture);
     }
 }
 
@@ -23556,7 +23742,10 @@ TEST(http1_pipeline_generation_activation,
         "GET /one HTTP/1.1\r\nHost: client.example\r\nExpect: 100-continue\r\n\r\n",
         "GET /one HTTP/1.1\r\nHost: client.example\r\nUpgrade: websocket\r\nConnection: "
         "Upgrade\r\n\r\n",
-        "GET /one HTTP/1.1\r\nHost: client.example\r\nConnection: close\r\n\r\n",
+        "GET /one HTTP/1.1\r\nHost: client.example\r\nConnection: close, keep-alive\r\n\r\n",
+        "GET /one HTTP/1.1\r\nHost: client.example\r\nConnection: close\r\nConnection: "
+        "close\r\n\r\n",
+        "GET /one HTTP/1.1\r\nHost: client.example\r\nConnection: keep-alive\r\n\r\n",
         "GET /one HTTP/1.0\r\nHost: client.example\r\n\r\n",
     };
     for (const char* request : kRejected) {
