@@ -4,6 +4,7 @@
 #include "rut/compiler/rir_printer.h"
 #include "rut/compiler/verifier.h"
 #include "test.h"
+#include <memory>
 #include <string>
 
 using namespace rut;
@@ -2100,12 +2101,12 @@ TEST(RirPrinter, StrictLocalResponseForgedMetadataPrintsOneSafeMarker) {
     mod = valid_module();
     mod.strict_local_response_policies[0].reason.len = kMaxStrictLocalResponseReasonLen + 1;
     check_marker(mod);
-    mod = Module{};
-    mod.unmatched_policy_ids[kRouteMethodOptions] = 1;
-    check_marker(mod);
-    mod = Module{};
-    mod.exact_strict_local_response_bindings[3].reserved1 = 1;
-    check_marker(mod);
+    auto empty_forgery = std::make_unique<Module>();
+    empty_forgery->unmatched_policy_ids[kRouteMethodOptions] = 1;
+    check_marker(*empty_forgery);
+    empty_forgery = std::make_unique<Module>();
+    empty_forgery->exact_strict_local_response_bindings[3].reserved1 = 1;
+    check_marker(*empty_forgery);
 }
 
 int main(int argc, char** argv) {
