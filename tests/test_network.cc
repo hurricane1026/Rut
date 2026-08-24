@@ -2797,7 +2797,7 @@ TEST(recv, then_send) {
     CHECK_EQ(c->state, ConnState::Sending);
     CHECK_EQ(c->on_send, &on_response_sent<SmallLoop>);
     // recv_buf preserved until on_response_sent (allows proxy to read it)
-    CHECK_EQ(c->recv_buf.len(), 100u);
+    CHECK_EQ(c->recv_buf.len(), sizeof(kRequest) - 1);
     CHECK_GT(c->send_buf.len(), 0u);
     auto* op = loop.backend.last_op(MockOp::Send);
     REQUIRE(op != nullptr);
@@ -4530,8 +4530,11 @@ TEST(recv_buf, survives_connection_reuse) {
     u32 cid = c->id;
 
     // recv → preserved → send response (resets) → EOF → close
-    loop.inject_and_dispatch(make_ev(cid, IoEventType::Recv, 100));
-    CHECK_EQ(c->recv_buf.len(), 100u);  // preserved until send
+    static constexpr char kRequest[] = "GET / HTTP/1.1\r\nHost: x\r\n\r\n";
+    REQUIRE_EQ(c->recv_buf.write(reinterpret_cast<const u8*>(kRequest), sizeof(kRequest) - 1),
+               sizeof(kRequest) - 1);
+    loop.dispatch(make_ev(cid, IoEventType::Recv, sizeof(kRequest) - 1));
+    CHECK_EQ(c->recv_buf.len(), sizeof(kRequest) - 1);  // preserved until send
     loop.inject_and_dispatch(make_ev(cid, IoEventType::Send, static_cast<i32>(c->send_buf.len())));
     CHECK_EQ(c->state, ConnState::ReadingHeader);
     loop.inject_and_dispatch(make_ev(cid, IoEventType::Recv, 0));  // EOF → close
@@ -4727,8 +4730,11 @@ TEST(recv_semantic, proxy_recv_buf_lifetime) {
     REQUIRE(conn != nullptr);
 
     // Receive original request — preserved for proxy forwarding
-    loop.inject_and_dispatch(make_ev(conn->id, IoEventType::Recv, 100));
-    CHECK_EQ(conn->recv_buf.len(), 100u);  // preserved
+    static constexpr char kRequest[] = "GET /proxy HTTP/1.1\r\nHost: x\r\n\r\n";
+    REQUIRE_EQ(conn->recv_buf.write(reinterpret_cast<const u8*>(kRequest), sizeof(kRequest) - 1),
+               sizeof(kRequest) - 1);
+    loop.dispatch(make_ev(conn->id, IoEventType::Recv, sizeof(kRequest) - 1));
+    CHECK_EQ(conn->recv_buf.len(), sizeof(kRequest) - 1);  // preserved
 
     // Switch to proxy mode and connect upstream
     conn->upstream_fd = 100;
@@ -4740,7 +4746,8 @@ TEST(recv_semantic, proxy_recv_buf_lifetime) {
 
     // Upstream request sent → on_upstream_request_sent resets upstream_recv_buf for response.
     // recv_buf retains original request data (not touched).
-    loop.inject_and_dispatch(make_ev(conn->id, IoEventType::UpstreamSend, 100));
+    loop.inject_and_dispatch(
+        make_ev(conn->id, IoEventType::UpstreamSend, sizeof(kRequest) - 1));
     CHECK_EQ(conn->upstream_recv_buf.len(), 0u);  // reset by on_upstream_request_sent
 
     // Upstream response received → data goes into upstream_recv_buf (valid HTTP response)
@@ -9405,7 +9412,11 @@ TEST(streaming, proxy_keepalive_two_requests) {
     loop.inject_and_dispatch(make_ev(0, IoEventType::Accept, 42));
     auto* conn = loop.find_fd(42);
     REQUIRE(conn != nullptr);
-    loop.inject_and_dispatch(make_ev(conn->id, IoEventType::Recv, 100));
+    static constexpr char kFirstRequest[] = "GET /proxy/first HTTP/1.1\r\nHost: x\r\n\r\n";
+    REQUIRE_EQ(conn->recv_buf.write(reinterpret_cast<const u8*>(kFirstRequest),
+                                    sizeof(kFirstRequest) - 1),
+               sizeof(kFirstRequest) - 1);
+    loop.dispatch(make_ev(conn->id, IoEventType::Recv, sizeof(kFirstRequest) - 1));
 
     // Proxy setup.
     conn->upstream_fd = 100;
@@ -9413,7 +9424,8 @@ TEST(streaming, proxy_keepalive_two_requests) {
     conn->state = ConnState::Proxying;
     loop.submit_connect(*conn, nullptr, 0);
     loop.inject_and_dispatch(make_ev(conn->id, IoEventType::UpstreamConnect, 0));
-    loop.inject_and_dispatch(make_ev(conn->id, IoEventType::UpstreamSend, 100));
+    loop.inject_and_dispatch(
+        make_ev(conn->id, IoEventType::UpstreamSend, sizeof(kFirstRequest) - 1));
 
     // Upstream response.
     inject_upstream_response(loop, *conn);
@@ -9425,7 +9437,11 @@ TEST(streaming, proxy_keepalive_two_requests) {
     CHECK_EQ(conn->upstream_fd, -1);
 
     // Second request cycle — should work.
-    loop.inject_and_dispatch(make_ev(conn->id, IoEventType::Recv, 100));
+    static constexpr char kSecondRequest[] = "GET /proxy/second HTTP/1.1\r\nHost: x\r\n\r\n";
+    REQUIRE_EQ(conn->recv_buf.write(reinterpret_cast<const u8*>(kSecondRequest),
+                                    sizeof(kSecondRequest) - 1),
+               sizeof(kSecondRequest) - 1);
+    loop.dispatch(make_ev(conn->id, IoEventType::Recv, sizeof(kSecondRequest) - 1));
     conn->upstream_fd = 200;
     conn->on_upstream_send = &on_upstream_connected<SmallLoop>;
     conn->state = ConnState::Proxying;
@@ -10893,12 +10909,8 @@ TEST(streaming, response_body_recvd_cl_premature_eof) {
 TEST(streaming, response_body_sent_cl_done) {
     SmallLoop loop;
     loop.setup();
-    loop.inject_and_dispatch(make_ev(0, IoEventType::Accept, 42));
-    auto* c = loop.find_fd(42);
+    auto* c = setup_proxy_conn(loop);
     REQUIRE(c != nullptr);
-    loop.inject_and_dispatch(make_ev(c->id, IoEventType::Recv, 100));
-    c->upstream_fd = 100;
-    loop.alloc_upstream_buf(*c);
     c->resp_body_mode = BodyMode::ContentLength;
     c->resp_body_remaining = 0;  // body complete
     c->resp_body_sent = 200;
@@ -35689,7 +35701,10 @@ TEST(state_transition, response_sent_clears_all) {
     loop.inject_and_dispatch(make_ev(0, IoEventType::Accept, 42));
     auto* c = loop.find_fd(42);
     REQUIRE(c != nullptr);
-    loop.inject_and_dispatch(make_ev(c->id, IoEventType::Recv, 100));
+    static constexpr char kRequest[] = "GET / HTTP/1.1\r\nHost: x\r\n\r\n";
+    REQUIRE_EQ(c->recv_buf.write(reinterpret_cast<const u8*>(kRequest), sizeof(kRequest) - 1),
+               sizeof(kRequest) - 1);
+    loop.dispatch(make_ev(c->id, IoEventType::Recv, sizeof(kRequest) - 1));
     // Capture send_buf.len before dispatch (response_sent validates it)
     u32 slen = c->send_buf.len();
     loop.inject_and_dispatch(make_ev(c->id, IoEventType::Send, static_cast<i32>(slen)));
