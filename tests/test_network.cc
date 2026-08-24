@@ -9760,15 +9760,56 @@ TEST(exact_local_response,
         loop.backend.clear_ops();
         const u32 free_before = loop.free_top;
         const u64 requests_before = metrics.requests_total;
+        const u64 requests_active_before = metrics.requests_active;
+        const u32 access_before = access.available();
+        const u32 capture_before = capture.available();
         const u64 epoch_before = epoch.epoch.load(std::memory_order_acquire);
+        CHECK_EQ(requests_active_before, 0u);
         (void)dispatch_unmatched_request(loop, config, request);
         CHECK_EQ(loop.free_top, free_before);
         CHECK_EQ(loop.backend.count_ops(MockOp::Send), 0u);
         CHECK_EQ(loop.backend.count_ops(MockOp::Connect), 0u);
         CHECK_EQ(metrics.requests_total, requests_before);
-        CHECK_EQ(metrics.requests_active, 0u);
+        CHECK_EQ(metrics.requests_active, requests_active_before);
+        CHECK_EQ(access.available(), access_before);
+        CHECK_EQ(capture.available(), capture_before);
         CHECK_EQ(epoch.epoch.load(std::memory_order_acquire), epoch_before + expected_epoch_delta);
     };
+
+    auto require_complete_non_origin =
+        [&](const char* request, HttpMethod expected_method, Str expected_target) {
+            const u32 len = static_cast<u32>(strlen(request));
+            HttpParser parser;
+            ParsedRequest parsed;
+            parser.reset();
+            parsed.reset();
+            REQUIRE_EQ(parser.parse(reinterpret_cast<const u8*>(request), len, &parsed),
+                       ParseStatus::Complete);
+            REQUIRE_EQ(parser.header_end, len);
+            REQUIRE_EQ(parsed.method, expected_method);
+            REQUIRE_EQ(parsed.version, HttpVersion::Http11);
+            REQUIRE(parsed.path.eq(expected_target));
+            REQUIRE_EQ(parsed.path_canon.ptr, nullptr);
+            REQUIRE_EQ(parsed.path_canon.len, 0u);
+            REQUIRE_FALSE(parsed.target_has_fragment);
+            REQUIRE(parsed.connection_close);
+            REQUIRE_FALSE(parsed.has_content_length);
+            REQUIRE_EQ(parsed.transfer_encoding, RequestTransferEncoding::None);
+        };
+
+    static constexpr char kOptionsStar[] =
+        "OPTIONS * HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n";
+    static constexpr char kConnectAuthority[] =
+        "CONNECT example.com:443 HTTP/1.1\r\nHost: example.com:443\r\nConnection: close\r\n\r\n";
+    static constexpr char kAbsoluteForm[] =
+        "GET http://example.com/static HTTP/1.1\r\nHost: example.com\r\nConnection: close\r\n\r\n";
+    require_complete_non_origin(kOptionsStar, HttpMethod::OPTIONS, {"*", 1});
+    closes_without_effect(*valid, kOptionsStar, 0);
+    require_complete_non_origin(kConnectAuthority, HttpMethod::CONNECT, {"example.com:443", 15});
+    closes_without_effect(*valid, kConnectAuthority, 0);
+    require_complete_non_origin(kAbsoluteForm, HttpMethod::GET, {"http://example.com/static", 25});
+    closes_without_effect(*valid, kAbsoluteForm, 0);
+
     closes_without_effect(
         *valid,
         "GET /static?aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
