@@ -1614,6 +1614,14 @@ void on_header_received(void* lp, Connection& conn, IoEvent ev) {
     // different upstream table.
     const RouteConfig* config = loop->config_ptr ? *loop->config_ptr : nullptr;
     conn.request_config = config;
+    // #288B ownership fence. Exact metadata is fully owned but deliberately
+    // behavior-inactive until the selector/serializer activation increment.
+    // Treat every inventory shape (including partial/forged tails) alike and
+    // close before firewall, built-in endpoints, routing, or response bytes.
+    if (config && config->has_exact_strict_local_response_inventory()) {
+        loop->close_conn(conn);
+        return;
+    }
     if (config && !config->firewall_allows_peer(conn.peer_addr, conn.peer_port)) {
         conn.resp_status = 403;
         format_static_response(conn, 403, /*keep_alive=*/false);

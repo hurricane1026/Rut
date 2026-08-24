@@ -969,6 +969,17 @@ void h2_dispatch_request(H2Dispatch<Loop>& d,
                          u32 nheaders,
                          bool end_stream) {
     if (d.close_after_process) return;
+    const RouteConfig* config = d.conn->request_config;
+    // #288B ownership fence. No exact selector is active yet. Close before
+    // header conversion (and its malformed-400 path), firewall, routing, or
+    // frame staging; the outer process path observes close_after_process and
+    // publishes none of this batch's response bytes.
+    if (config && config->has_exact_strict_local_response_inventory()) {
+        d.close_after_process = true;
+        d.resp_len = 0;
+        d.overflow = false;
+        return;
+    }
     // A prepared Forward waiting to learn whether its open request stream is
     // actually empty owns both pending_synth and the connection mutation log.
     if (d.conn->h2->pending_prepared_forward) {
@@ -989,7 +1000,6 @@ void h2_dispatch_request(H2Dispatch<Loop>& d,
         return;
     }
 
-    const RouteConfig* config = d.conn->request_config;
     // Firewall gate — mirrors the HTTP/1 path (callbacks_impl.h checks
     // firewall_allows_peer before route matching and 403s). Without this an h2
     // client bypasses a deny/default-deny rule and can reach a protected upstream

@@ -1548,6 +1548,61 @@ TEST(h2_serving, unmatched_metadata_miss_fail_closes_while_omitted_and_matched_a
     const auto partial_miss = dispatch(partial.get(), "/miss");
     CHECK_EQ(partial_miss.response_len, 0u);
     CHECK(partial_miss.close);
+
+    // #288B owns exact metadata but deliberately does not select it. Even a
+    // fully valid table closes before path matching; count-zero forged tails
+    // and out-of-range counts take the same zero-frame boundary.
+    auto exact = std::make_unique<RouteConfig>();
+    StrictLocalResponsePolicySpec exact_policy = policy;
+    exact_policy.status_code = 200;
+    exact_policy.reason = {"OK", 2};
+    exact_policy.server = {"nginx/1.29.7", 12};
+    exact_policy.body = {"successor-static", 16};
+    exact_policy.head_mode = StrictLocalResponseHeadMode::SuppressBody;
+    u16 no_unmatched[kStrictLocalResponseMethodSlots]{};
+    ExactStrictLocalResponseBinding exact_bindings[kMaxExactStrictLocalResponseBindings]{};
+    __builtin_memcpy(exact_bindings[0].path, "/static", 7);
+    exact_bindings[0].path_len = 7;
+    exact_bindings[0].method = kRouteMethodGet;
+    exact_bindings[0].policy_id = 1;
+    REQUIRE(exact->install_strict_local_response_table(
+        &exact_policy, 1, no_unmatched, exact_bindings, 1));
+    REQUIRE(exact->strict_local_response_table_is_valid());
+    REQUIRE(exact->add_static("/static", kRouteMethodGet, 204));
+    const auto exact_match = dispatch(exact.get(), "/static");
+    CHECK_EQ(exact_match.response_len, 0u);
+    CHECK(exact_match.close);
+    const auto exact_nonmatch = dispatch(exact.get(), "/other");
+    CHECK_EQ(exact_nonmatch.response_len, 0u);
+    CHECK(exact_nonmatch.close);
+
+    auto exact_tail = std::make_unique<RouteConfig>();
+    exact_tail->exact_strict_local_response_bindings[15].reserved1 = 1;
+    const auto tail_result = dispatch(exact_tail.get(), "/miss");
+    CHECK_EQ(tail_result.response_len, 0u);
+    CHECK(tail_result.close);
+
+    auto exact_count = std::make_unique<RouteConfig>();
+    exact_count->exact_strict_local_response_binding_count =
+        kMaxExactStrictLocalResponseBindings + 1;
+    const auto count_result = dispatch(exact_count.get(), "/miss");
+    CHECK_EQ(count_result.response_len, 0u);
+    CHECK(count_result.close);
+
+    Http2Conn malformed_h2;
+    malformed_h2.init();
+    Connection malformed_conn;
+    malformed_conn.reset();
+    malformed_conn.h2 = &malformed_h2;
+    malformed_conn.request_config = exact.get();
+    FakeH2Loop malformed_loop;
+    u8 malformed_response[256]{};
+    H2Dispatch<FakeH2Loop> malformed_dispatch{
+        &malformed_loop, &malformed_conn, malformed_response, sizeof(malformed_response), 0, false};
+    const hpack::Header malformed_headers[] = {{{":method", 7}, {"GET", 3}}};
+    h2_dispatch_request(malformed_dispatch, 1, malformed_headers, 1, true);
+    CHECK_EQ(malformed_dispatch.resp_len, 0u);
+    CHECK(malformed_dispatch.close_after_process);
 }
 
 TEST(h2_serving, deferred_route_params_copied_to_stable_storage) {

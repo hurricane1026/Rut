@@ -9520,6 +9520,19 @@ static StrictLocalResponsePolicySpec make_representation200_policy() {
     return policy;
 }
 
+static ExactStrictLocalResponseBinding make_exact_local_binding(const char* path,
+                                                                u8 method,
+                                                                u16 policy_id) {
+    ExactStrictLocalResponseBinding binding{};
+    const u32 path_len = static_cast<u32>(strlen(path));
+    if (path_len > kMaxExactStrictLocalResponsePathLen) return binding;
+    __builtin_memcpy(binding.path, path, path_len);
+    binding.path_len = static_cast<u8>(path_len);
+    binding.method = method;
+    binding.policy_id = policy_id;
+    return binding;
+}
+
 static std::string expected_representation200_wire(bool keep_alive, bool suppress_body) {
     std::string wire =
         "HTTP/1.1 200 OK\r\n"
@@ -9603,6 +9616,78 @@ TEST(unmatched_local_response, exact_any_precedence_matched_wins_and_no_slot_leg
                        legacy->send_buf.len(),
                        "\r\n\r\nOK",
                        6));
+}
+
+TEST(exact_local_response_inactive,
+     h1_valid_partial_reload_firewall_and_metrics_close_before_external_effects) {
+    SmallLoop loop;
+    loop.setup();
+    ShardMetrics metrics{};
+    metrics.init();
+    AccessLogRing access{};
+    access.init();
+    CaptureRing capture{};
+    capture.init();
+    ShardEpoch epoch{};
+    loop.metrics = &metrics;
+    loop.access_log = &access;
+    loop.epoch = &epoch;
+    REQUIRE(loop.set_capture(&capture));
+
+    auto valid = std::make_unique<RouteConfig>();
+    REQUIRE(valid->add_static("/static", kRouteMethodGet, 204));
+    REQUIRE(valid->add_firewall_deny_ip("0.0.0.0"));
+    const auto policy = make_representation200_policy();
+    u16 unmatched[kStrictLocalResponseMethodSlots]{};
+    ExactStrictLocalResponseBinding exact[kMaxExactStrictLocalResponseBindings]{};
+    exact[0] = make_exact_local_binding("/static", kRouteMethodGet, 1);
+    REQUIRE(valid->install_strict_local_response_table(&policy, 1, unmatched, exact, 1));
+    REQUIRE(valid->strict_local_response_table_is_valid());
+
+    auto closes_without_effect = [&](RouteConfig& config, const char* request) {
+        loop.backend.clear_ops();
+        const u32 free_before = loop.free_top;
+        const u64 requests_before = metrics.requests_total;
+        const u64 epoch_before = epoch.epoch.load(std::memory_order_acquire);
+        (void)dispatch_unmatched_request(loop, config, request);
+        CHECK_EQ(loop.free_top, free_before);
+        CHECK_EQ(loop.backend.count_ops(MockOp::Send), 0u);
+        CHECK_EQ(loop.backend.count_ops(MockOp::Connect), 0u);
+        CHECK_EQ(metrics.requests_total, requests_before);
+        CHECK_EQ(metrics.requests_active, 0u);
+        CHECK_EQ(access.available(), 0u);
+        CHECK_EQ(capture.available(), 0u);
+        CHECK_EQ(epoch.epoch.load(std::memory_order_acquire), epoch_before + 2);
+    };
+    closes_without_effect(*valid, "GET /static HTTP/1.1\r\nHost: x\r\n\r\n");
+    closes_without_effect(*valid, "GET /metrics HTTP/1.1\r\nHost: x\r\n\r\n");
+    closes_without_effect(*valid, "POST /static HTTP/1.1\r\nHost: x\r\nContent-Length: 1\r\n\r\nx");
+    closes_without_effect(*valid, "GET /static HTTP/1.1\r\nBroken\r\n\r\n");
+
+    auto forged_tail = std::make_unique<RouteConfig>();
+    forged_tail->exact_strict_local_response_bindings[15].reserved1 = 1;
+    CHECK(forged_tail->has_exact_strict_local_response_inventory());
+    closes_without_effect(*forged_tail, "POST /miss HTTP/1.1\r\nHost: x\r\n\r\n");
+
+    auto forged_count = std::make_unique<RouteConfig>();
+    forged_count->exact_strict_local_response_binding_count =
+        kMaxExactStrictLocalResponseBindings + 1;
+    closes_without_effect(*forged_count, "GET /miss HTTP/1.1\r\nHost: x\r\n\r\n");
+
+    auto omitted = std::make_unique<RouteConfig>();
+    const RouteConfig* active = valid.get();
+    ShardControlBlock control{};
+    loop.config_ptr = &active;
+    loop.control = &control;
+    control.pending_config.store(omitted.get(), std::memory_order_release);
+    loop.poll_command();
+    REQUIRE(active == omitted.get());
+    loop.backend.clear_ops();
+    Connection* legacy = dispatch_unmatched_request(
+        loop, *omitted, "GET /miss HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n");
+    REQUIRE(legacy != nullptr);
+    CHECK_EQ(legacy->resp_status, 200u);
+    CHECK_EQ(loop.backend.count_ops(MockOp::Send), 1u);
 }
 
 TEST(unmatched_local_response, connect_exact_and_strict_gate_fail_closed_without_effects) {
@@ -10153,6 +10238,18 @@ TEST(unmatched_local_response, h2_outer_callback_closes_and_discards_the_complet
         partial->add_jit_handler("/hit", kRouteMethodGet, &unmatched_h2_outer_hit_handler, false));
     partial->unmatched_policy_ids[kRouteMethodOptions] = 1;
     run(*partial, "/hit", true, true, 0, 1);
+
+    auto exact_inactive = std::make_unique<RouteConfig>();
+    u16 no_unmatched[kStrictLocalResponseMethodSlots]{};
+    ExactStrictLocalResponseBinding exact_bindings[kMaxExactStrictLocalResponseBindings]{};
+    exact_bindings[0] = make_exact_local_binding("/hit", kRouteMethodGet, 1);
+    REQUIRE(exact_inactive->install_strict_local_response_table(
+        &representation_policy, 1, no_unmatched, exact_bindings, 1));
+    REQUIRE(exact_inactive->add_jit_handler(
+        "/hit", kRouteMethodGet, &unmatched_h2_outer_hit_handler, false));
+    // The early exact fence discards SETTINGS ACK and closes before even the
+    // otherwise matched JIT handler can run.
+    run(*exact_inactive, "/hit", false, true, 0, 0);
 }
 
 // Helper: write raw bytes into conn's recv_buf and dispatch as Recv event.

@@ -516,6 +516,17 @@ StrictLocalResponsePolicySpec local_policy(
     p.body = body;
     return p;
 }
+
+ExactStrictLocalResponseBinding exact_local_binding(const char* path, u8 method, u16 policy_id) {
+    ExactStrictLocalResponseBinding binding{};
+    const u32 len = static_cast<u32>(strlen(path));
+    if (len > kMaxExactStrictLocalResponsePathLen) return binding;
+    __builtin_memcpy(binding.path, path, len);
+    binding.path_len = static_cast<u8>(len);
+    binding.method = method;
+    binding.policy_id = policy_id;
+    return binding;
+}
 }  // namespace
 
 TEST(route_config, unmatched_owned_table_exact_pool_dedup_and_atomic_rejection) {
@@ -697,6 +708,140 @@ TEST(route_config, unmatched_complete_install_rejects_partial_destination_and_ba
         CHECK_FALSE(invalid_head->install_unmatched_policy_table(&reject, 1, mapped));
         CHECK_FALSE(invalid_head->has_unmatched_metadata());
     }
+}
+
+TEST(route_config, exact_strict_table_dedups_remaps_owns_copies_and_rolls_back_atomically) {
+    std::string reason = "Local";
+    std::string type = "text/plain";
+    std::string server = "rut";
+    std::string body = "owned-body";
+    StrictLocalResponsePolicySpec policies[3] = {
+        local_policy({reason.data(), 5}, {type.data(), 10}, {server.data(), 3}, {body.data(), 10}),
+        local_policy({reason.data(), 5}, {type.data(), 10}, {server.data(), 3}, {body.data(), 10}),
+        local_policy({reason.data(), 5}, {type.data(), 10}, {server.data(), 3}, {body.data(), 10}),
+    };
+    u16 unmatched[kStrictLocalResponseMethodSlots]{};
+    unmatched[kRouteMethodOptions] = 1;
+    ExactStrictLocalResponseBinding exact[kMaxExactStrictLocalResponseBindings]{};
+    exact[0] = exact_local_binding("/static", kRouteMethodGet, 2);
+    exact[1] = exact_local_binding("/submit", kRouteMethodPost, 3);
+
+    auto installed = std::make_unique<RouteConfig>();
+    REQUIRE(installed->install_strict_local_response_table(policies, 3, unmatched, exact, 2));
+    REQUIRE(installed->strict_local_response_table_is_valid());
+    CHECK(installed->has_exact_strict_local_response_inventory());
+    CHECK_EQ(installed->strict_local_response_policy_count, 1u);
+    CHECK_EQ(installed->unmatched_policy_ids[kRouteMethodOptions], 1u);
+    CHECK_EQ(installed->exact_strict_local_response_binding_count, 2u);
+    CHECK_EQ(installed->exact_strict_local_response_bindings[0].policy_id, 1u);
+    CHECK_EQ(installed->exact_strict_local_response_bindings[1].policy_id, 1u);
+
+    reason.assign("xxxxx");
+    type.assign("xxxxxxxxxx");
+    server.assign("xxx");
+    body.assign("xxxxxxxxxx");
+    CHECK(installed->strict_local_response_policies[0].reason.eq({"Local", 5}));
+    CHECK(installed->strict_local_response_policies[0].body.eq({"owned-body", 10}));
+    CHECK_EQ(
+        __builtin_memcmp(installed->exact_strict_local_response_bindings[0].path, "/static", 7), 0);
+
+    auto copied = std::make_unique<RouteConfig>();
+    REQUIRE(copied->copy_strict_local_response_table_from_owned(*installed));
+    REQUIRE(copied->strict_local_response_table_is_valid());
+    CHECK(copied->strict_local_response_policies[0].body.ptr >=
+          copied->strict_local_response_bytes);
+    CHECK(copied->strict_local_response_policies[0].body.ptr <
+          copied->strict_local_response_bytes + copied->strict_local_response_bytes_used);
+    CHECK(copied->strict_local_response_policies[0].body.ptr !=
+          installed->strict_local_response_policies[0].body.ptr);
+    CHECK_EQ(__builtin_memcmp(copied->exact_strict_local_response_bindings,
+                              installed->exact_strict_local_response_bindings,
+                              sizeof(copied->exact_strict_local_response_bindings)),
+             0);
+
+    auto partial_destination = std::make_unique<RouteConfig>();
+    partial_destination->exact_strict_local_response_bindings[15].reserved1 = 1;
+    std::vector<u8> before(sizeof(RouteConfig));
+    __builtin_memcpy(before.data(), partial_destination.get(), sizeof(RouteConfig));
+    CHECK_FALSE(
+        partial_destination->install_strict_local_response_table(policies, 3, unmatched, exact, 2));
+    CHECK_EQ(__builtin_memcmp(before.data(), partial_destination.get(), sizeof(RouteConfig)), 0);
+
+    ExactStrictLocalResponseBinding invalid_source[kMaxExactStrictLocalResponseBindings]{};
+    __builtin_memcpy(invalid_source, exact, sizeof(invalid_source));
+    invalid_source[1].method = kRouteMethodGet;
+    invalid_source[1].path_len = invalid_source[0].path_len;
+    __builtin_memcpy(
+        invalid_source[1].path, invalid_source[0].path, sizeof(invalid_source[1].path));
+    auto rejected = std::make_unique<RouteConfig>();
+    REQUIRE(rejected->add_static("/kept", kRouteMethodGet, 207));
+    std::vector<u8> rejected_before(sizeof(RouteConfig));
+    __builtin_memcpy(rejected_before.data(), rejected.get(), sizeof(RouteConfig));
+    CHECK_FALSE(
+        rejected->install_strict_local_response_table(policies, 3, unmatched, invalid_source, 2));
+    CHECK_EQ(__builtin_memcmp(rejected_before.data(), rejected.get(), sizeof(RouteConfig)), 0);
+
+    ExactStrictLocalResponseBinding reused_source_id[kMaxExactStrictLocalResponseBindings]{};
+    __builtin_memcpy(reused_source_id, exact, sizeof(reused_source_id));
+    reused_source_id[1].policy_id = 2;
+    auto source_contract_rejected = std::make_unique<RouteConfig>();
+    CHECK_FALSE(source_contract_rejected->install_strict_local_response_table(
+        policies, 3, unmatched, reused_source_id, 2));
+    CHECK_FALSE(source_contract_rejected->has_strict_local_response_table_inventory());
+}
+
+TEST(route_config, exact_strict_runtime_validator_rejects_every_binding_forgery_class) {
+    const auto policy = local_policy({"Local", 5}, {"text/plain", 10}, {"rut", 3}, {"body", 4});
+    u16 unmatched[kStrictLocalResponseMethodSlots]{};
+    ExactStrictLocalResponseBinding exact[kMaxExactStrictLocalResponseBindings]{};
+    exact[0] = exact_local_binding("/static", kRouteMethodGet, 1);
+
+    auto valid = std::make_unique<RouteConfig>();
+    REQUIRE(valid->install_strict_local_response_table(&policy, 1, unmatched, exact, 1));
+    REQUIRE(valid->strict_local_response_table_is_valid());
+    CHECK_FALSE(valid->unmatched_policy_table_is_valid());
+
+    auto rejects = [&](auto forge) {
+        auto candidate = std::make_unique<RouteConfig>();
+        REQUIRE(candidate->copy_strict_local_response_table_from_owned(*valid));
+        forge(*candidate);
+        CHECK(candidate->has_exact_strict_local_response_inventory());
+        CHECK_FALSE(candidate->strict_local_response_table_is_valid());
+    };
+    rejects([](RouteConfig& c) {
+        c.exact_strict_local_response_binding_count = kMaxExactStrictLocalResponseBindings + 1;
+    });
+    rejects([](RouteConfig& c) { c.exact_strict_local_response_bindings[0].path_len = 0; });
+    rejects([](RouteConfig& c) { c.exact_strict_local_response_bindings[0].path[0] = 'x'; });
+    rejects([](RouteConfig& c) { c.exact_strict_local_response_bindings[0].path[1] = '#'; });
+    rejects([](RouteConfig& c) { c.exact_strict_local_response_bindings[0].path[7] = 'x'; });
+    rejects([](RouteConfig& c) { c.exact_strict_local_response_bindings[0].method = 10; });
+    rejects([](RouteConfig& c) { c.exact_strict_local_response_bindings[0].reserved0 = 1; });
+    rejects([](RouteConfig& c) { c.exact_strict_local_response_bindings[0].reserved1 = 1; });
+    rejects([](RouteConfig& c) { c.exact_strict_local_response_bindings[0].policy_id = 0; });
+    rejects([](RouteConfig& c) { c.exact_strict_local_response_bindings[0].policy_id = 2; });
+    rejects([](RouteConfig& c) {
+        c.exact_strict_local_response_binding_count = 0;
+        c.exact_strict_local_response_bindings[0].path_len = 0;
+    });
+    rejects([](RouteConfig& c) { c.exact_strict_local_response_bindings[1].reserved1 = 1; });
+
+    auto duplicate = std::make_unique<RouteConfig>();
+    REQUIRE(duplicate->copy_strict_local_response_table_from_owned(*valid));
+    duplicate->exact_strict_local_response_bindings[1] =
+        duplicate->exact_strict_local_response_bindings[0];
+    duplicate->exact_strict_local_response_binding_count = 2;
+    CHECK_FALSE(duplicate->strict_local_response_table_is_valid());
+
+    auto method_plus_any = std::make_unique<RouteConfig>();
+    REQUIRE(method_plus_any->copy_strict_local_response_table_from_owned(*valid));
+    auto any = method_plus_any->exact_strict_local_response_bindings[0];
+    any.method = kRouteMethodAny;
+    method_plus_any->strict_local_response_policies[0].head_mode =
+        StrictLocalResponseHeadMode::SuppressBody;
+    method_plus_any->exact_strict_local_response_bindings[1] = any;
+    method_plus_any->exact_strict_local_response_binding_count = 2;
+    CHECK(method_plus_any->strict_local_response_table_is_valid());
 }
 
 int main(int argc, char** argv) {

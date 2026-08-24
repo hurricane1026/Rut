@@ -263,7 +263,7 @@ inline bool populate_route_config(RouteConfig& cfg, const rir::Module& mod) {
         cfg.target_transform_count != 0 || cfg.target_transform_bytes_used != 0 ||
         cfg.redirect_policy_count != 0 || cfg.redirect_policy_bytes_used != 0 ||
         cfg.strict_local_response_policy_count != 0 || cfg.strict_local_response_bytes_used != 0 ||
-        cfg.has_unmatched_metadata()) {
+        cfg.has_strict_local_response_table_inventory()) {
         return false;
     }
 
