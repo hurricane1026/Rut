@@ -25,6 +25,57 @@ _Static_assert(__NR_io_uring_setup == 425 && __NR_io_uring_enter == 426 &&
                    __NR_io_uring_register == 427,
                "x86-64 io_uring syscall numbers changed");
 
+/*
+ * These feature-bit values are stable io_uring UAPI.  Keep private names so
+ * the helper also compiles against Linux 6.8 headers, which stop at bit 13,
+ * while still recognizing every feature a newer production kernel may return.
+ */
+#define RUT_GATE_IORING_FEAT_RECVSEND_BUNDLE (UINT32_C(1) << 14)
+#define RUT_GATE_IORING_FEAT_MIN_TIMEOUT (UINT32_C(1) << 15)
+#define RUT_GATE_IORING_FEAT_RW_ATTR (UINT32_C(1) << 16)
+#define RUT_GATE_IORING_FEAT_NO_IOWAIT (UINT32_C(1) << 17)
+
+#ifdef IORING_FEAT_RECVSEND_BUNDLE
+_Static_assert(IORING_FEAT_RECVSEND_BUNDLE == RUT_GATE_IORING_FEAT_RECVSEND_BUNDLE,
+               "IORING_FEAT_RECVSEND_BUNDLE UAPI value changed");
+#endif
+#ifdef IORING_FEAT_MIN_TIMEOUT
+_Static_assert(IORING_FEAT_MIN_TIMEOUT == RUT_GATE_IORING_FEAT_MIN_TIMEOUT,
+               "IORING_FEAT_MIN_TIMEOUT UAPI value changed");
+#endif
+#ifdef IORING_FEAT_RW_ATTR
+_Static_assert(IORING_FEAT_RW_ATTR == RUT_GATE_IORING_FEAT_RW_ATTR,
+               "IORING_FEAT_RW_ATTR UAPI value changed");
+#endif
+#ifdef IORING_FEAT_NO_IOWAIT
+_Static_assert(IORING_FEAT_NO_IOWAIT == RUT_GATE_IORING_FEAT_NO_IOWAIT,
+               "IORING_FEAT_NO_IOWAIT UAPI value changed");
+#endif
+
+/*
+ * Linux 6.8 names bytes [16, 40) resv[3]; newer headers split the same stable
+ * UAPI bytes into min_left plus resv[5].  Validate the wire layout using only
+ * fields common to both declarations, then inspect that tail bytewise.
+ */
+#define RUT_GATE_PBUF_REG_RESERVED_OFFSET 16U
+#define RUT_GATE_PBUF_REG_RESERVED_SIZE 24U
+_Static_assert(sizeof(struct io_uring_buf_reg) == 40, "io_uring_buf_reg UAPI size changed");
+_Static_assert(offsetof(struct io_uring_buf_reg, ring_addr) == 0,
+               "io_uring_buf_reg ring_addr offset changed");
+_Static_assert(offsetof(struct io_uring_buf_reg, ring_entries) == 8,
+               "io_uring_buf_reg ring_entries offset changed");
+_Static_assert(offsetof(struct io_uring_buf_reg, bgid) == 12,
+               "io_uring_buf_reg bgid offset changed");
+_Static_assert(offsetof(struct io_uring_buf_reg, flags) == 14,
+               "io_uring_buf_reg flags offset changed");
+_Static_assert(offsetof(struct io_uring_buf_reg, flags) +
+                       sizeof(((struct io_uring_buf_reg*)0)->flags) ==
+                   RUT_GATE_PBUF_REG_RESERVED_OFFSET,
+               "io_uring_buf_reg common prefix size changed");
+_Static_assert(RUT_GATE_PBUF_REG_RESERVED_OFFSET + RUT_GATE_PBUF_REG_RESERVED_SIZE ==
+                   sizeof(struct io_uring_buf_reg),
+               "io_uring_buf_reg reserved tail is out of bounds");
+
 #define RUT_GATE_BUFFER_COUNT 2048U
 #define RUT_GATE_BUFFER_SIZE 4096U
 #define RUT_GATE_BUFFER_GROUP 0U
@@ -301,8 +352,9 @@ static int setup_params_valid(const struct io_uring_params* params) {
         IORING_FEAT_RW_CUR_POS | IORING_FEAT_CUR_PERSONALITY | IORING_FEAT_FAST_POLL |
         IORING_FEAT_POLL_32BITS | IORING_FEAT_SQPOLL_NONFIXED | IORING_FEAT_EXT_ARG |
         IORING_FEAT_NATIVE_WORKERS | IORING_FEAT_RSRC_TAGS | IORING_FEAT_CQE_SKIP |
-        IORING_FEAT_LINKED_FILE | IORING_FEAT_REG_REG_RING | IORING_FEAT_RECVSEND_BUNDLE |
-        IORING_FEAT_MIN_TIMEOUT | IORING_FEAT_RW_ATTR | IORING_FEAT_NO_IOWAIT;
+        IORING_FEAT_LINKED_FILE | IORING_FEAT_REG_REG_RING | RUT_GATE_IORING_FEAT_RECVSEND_BUNDLE |
+        RUT_GATE_IORING_FEAT_MIN_TIMEOUT | RUT_GATE_IORING_FEAT_RW_ATTR |
+        RUT_GATE_IORING_FEAT_NO_IOWAIT;
     const uint32_t required_features = IORING_FEAT_SINGLE_MMAP | IORING_FEAT_NODROP;
     if (params == 0 || params->sq_entries != RUT_GATE_RING_ENTRIES ||
         params->cq_entries != RUT_GATE_CQ_ENTRIES || params->flags != IORING_SETUP_COOP_TASKRUN ||
@@ -424,6 +476,16 @@ static int runtime_ring_complete(void) {
            rut_downstream_gate_load(&gate->ring_ready) == 1 && ring_complete();
 }
 
+static int pbuf_registration_reserved_bytes_zero(const struct io_uring_buf_reg* registration) {
+    if (registration == 0) return 0;
+    const unsigned char* bytes = (const unsigned char*)registration;
+    for (size_t i = RUT_GATE_PBUF_REG_RESERVED_OFFSET;
+         i < RUT_GATE_PBUF_REG_RESERVED_OFFSET + RUT_GATE_PBUF_REG_RESERVED_SIZE;
+         i++)
+        if (bytes[i] != 0) return 0;
+    return 1;
+}
+
 static int pbuf_registration_valid(const struct io_uring_buf_reg* registration) {
     if (registration == 0 || ring_view.buffer_data_mapping == 0 ||
         ring_view.buffer_data_length != RUT_GATE_PBUF_DATA_SIZE ||
@@ -432,7 +494,7 @@ static int pbuf_registration_valid(const struct io_uring_buf_reg* registration) 
         registration->ring_addr != (uint64_t)(uintptr_t)ring_view.buffer_ring_mapping ||
         registration->ring_entries != RUT_GATE_BUFFER_COUNT ||
         registration->bgid != RUT_GATE_BUFFER_GROUP || registration->flags != 0 ||
-        registration->min_left != 0 ||
+        !pbuf_registration_reserved_bytes_zero(registration) ||
         ((uintptr_t)ring_view.buffer_ring_mapping % (uintptr_t)getpagesize()) != 0 ||
         ((uintptr_t)ring_view.buffer_data_mapping % (uintptr_t)getpagesize()) != 0 ||
         !range_valid(ring_view.buffer_ring_mapping,
@@ -472,8 +534,6 @@ static int pbuf_registration_valid(const struct io_uring_buf_reg* registration) 
                          ring_view.sqes,
                          ring_view.sqes_length))
         return 0;
-    for (size_t i = 0; i < sizeof(registration->resv) / sizeof(registration->resv[0]); i++)
-        if (registration->resv[i] != 0) return 0;
     return 1;
 }
 
