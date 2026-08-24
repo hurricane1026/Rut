@@ -1363,7 +1363,7 @@ void on_header_received(void* lp, Connection& conn, IoEvent ev) {
             // Keep pipeline_depth > 0 so subsequent recvs also check for
             // Incomplete (multi-packet reassembly of the pipelined request).
             conn.transition_to_reading_header(&on_header_received<Loop>);
-            loop->submit_recv(conn);
+            if (!loop->submit_recv(conn)) loop->close_conn(conn);
             return;
         }
     }
@@ -7427,6 +7427,10 @@ void on_validated_preconnect_failure_sent(void* lp, Connection& conn, IoEvent ev
     conn.send_buf.reset();
     if (loop->is_draining() || !conn.keep_alive) {
         loop->close_conn(conn);
+        return;
+    }
+    if (pipeline_shift(conn)) {
+        pipeline_dispatch<Loop>(loop, conn);
         return;
     }
     conn.pipeline_depth = 0;
