@@ -1397,6 +1397,8 @@ struct HirModule {
     FixedVec<StrictLocalResponsePolicySpec, kMaxStrictLocalResponsePolicies>
         strict_local_response_policies;
     u16 unmatched_policy_ids[kStrictLocalResponseMethodSlots]{};
+    FixedVec<ExactStrictLocalResponseBinding, kMaxExactStrictLocalResponseBindings>
+        exact_strict_local_response_bindings;
     FixedVec<RedirectPolicySpec, kMaxRedirectPolicies> redirect_policies;
     bool has_listener = false;
     HirListener listener{};
@@ -1426,6 +1428,7 @@ struct HirModule {
           response_policies(other.response_policies),
           failure_policies(other.failure_policies),
           strict_local_response_policies(other.strict_local_response_policies),
+          exact_strict_local_response_bindings(other.exact_strict_local_response_bindings),
           redirect_policies(other.redirect_policies),
           has_listener(other.has_listener),
           listener(other.listener),
@@ -1457,6 +1460,7 @@ struct HirModule {
         response_policies = other.response_policies;
         failure_policies = other.failure_policies;
         strict_local_response_policies = other.strict_local_response_policies;
+        exact_strict_local_response_bindings = other.exact_strict_local_response_bindings;
         for (u32 i = 0; i < kStrictLocalResponseMethodSlots; i++)
             unmatched_policy_ids[i] = other.unmatched_policy_ids[i];
         redirect_policies = other.redirect_policies;

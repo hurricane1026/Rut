@@ -249,6 +249,13 @@ inline bool populate_route_config(RouteConfig& cfg, const rir::Module& mod) {
     // Bodies / header sets / routes must always start empty — there's
     // no "merge" semantics for those tables, and a non-zero count
     // would break the compile-time body_idx / headers_idx invariants.
+    // Increment #288A establishes compiler metadata only. Refuse even a valid
+    // inventory until RouteConfig owns and atomically installs exact bindings.
+    // Scan the entire fixed array so a forged count of zero cannot hide a tail.
+    if (exact_strict_local_response_inventory_present(
+            mod.exact_strict_local_response_bindings,
+            mod.exact_strict_local_response_binding_count))
+        return false;
     if (!rir::verify_module(mod).ok) return false;
     if (cfg.route_count != 0 || cfg.response_body_count != 0 ||
         cfg.response_header_set_count != 0 || cfg.response_policy_count != 0 ||

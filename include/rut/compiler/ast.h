@@ -25,6 +25,7 @@ enum class AstItemKind : u8 {
     Impl,
     Chain,
     Route,
+    ExactStrictLocalResponse,
     Unmatched,
     Timer,
     // Top-level `let <name> = <expr>` — state declaration (currently only
@@ -579,6 +580,13 @@ struct AstUnmatchedDecl {
     u16 policy_id = 0;
 };
 
+struct AstExactStrictLocalResponseDecl {
+    Span span{};
+    bool method_is_any = false;
+    u8 method = 0;
+    ExactStrictLocalResponseBinding binding{};
+};
+
 // Background periodic task: `timer name, every: <duration> { <body> }`. The body
 // compiles to a no-request/no-response state-machine handler the shard event loop
 // fires every interval. (slice 1: `shard:` selector deferred — runs every shard.)
@@ -618,6 +626,7 @@ struct AstItem {
     AstImplDecl impl_decl{};
     AstChainDecl chain{};
     AstRouteDecl route{};
+    AstExactStrictLocalResponseDecl exact_strict_local_response{};
     AstUnmatchedDecl unmatched{};
     AstTimerDecl timer{};
 };
@@ -648,6 +657,8 @@ struct AstFile {
     FixedVec<StrictLocalResponsePolicySpec, kMaxStrictLocalResponsePolicies>
         strict_local_response_policies;
     u16 unmatched_policy_ids[kStrictLocalResponseMethodSlots]{};
+    FixedVec<ExactStrictLocalResponseBinding, kMaxExactStrictLocalResponseBindings>
+        exact_strict_local_response_bindings;
     FixedVec<u8, kStrictLocalResponseBodyPoolBytes> strict_local_response_body_pool;
     FixedVec<RedirectPolicySpec, kMaxRedirectPolicies> redirect_policies;
     FixedVec<u8, kRedirectPolicyBodyPoolBytes> redirect_policy_body_pool;
@@ -665,6 +676,7 @@ struct AstFile {
           failure_policies(other.failure_policies),
           failure_policy_body_pool(other.failure_policy_body_pool),
           strict_local_response_policies(other.strict_local_response_policies),
+          exact_strict_local_response_bindings(other.exact_strict_local_response_bindings),
           strict_local_response_body_pool(other.strict_local_response_body_pool),
           redirect_policies(other.redirect_policies),
           redirect_policy_body_pool(other.redirect_policy_body_pool) {
@@ -682,6 +694,7 @@ struct AstFile {
         failure_policies = other.failure_policies;
         failure_policy_body_pool = other.failure_policy_body_pool;
         strict_local_response_policies = other.strict_local_response_policies;
+        exact_strict_local_response_bindings = other.exact_strict_local_response_bindings;
         strict_local_response_body_pool = other.strict_local_response_body_pool;
         for (u32 i = 0; i < kStrictLocalResponseMethodSlots; i++)
             unmatched_policy_ids[i] = other.unmatched_policy_ids[i];
@@ -699,6 +712,7 @@ struct AstFile {
           failure_policies(other.failure_policies),
           failure_policy_body_pool(other.failure_policy_body_pool),
           strict_local_response_policies(other.strict_local_response_policies),
+          exact_strict_local_response_bindings(other.exact_strict_local_response_bindings),
           strict_local_response_body_pool(other.strict_local_response_body_pool),
           redirect_policies(other.redirect_policies),
           redirect_policy_body_pool(other.redirect_policy_body_pool) {
@@ -716,6 +730,7 @@ struct AstFile {
         failure_policies = other.failure_policies;
         failure_policy_body_pool = other.failure_policy_body_pool;
         strict_local_response_policies = other.strict_local_response_policies;
+        exact_strict_local_response_bindings = other.exact_strict_local_response_bindings;
         strict_local_response_body_pool = other.strict_local_response_body_pool;
         for (u32 i = 0; i < kStrictLocalResponseMethodSlots; i++)
             unmatched_policy_ids[i] = other.unmatched_policy_ids[i];
@@ -1026,6 +1041,7 @@ private:
                         rebase_stmt_ptr(other, items[i].route.statements[j]);
                     }
                     break;
+                case AstItemKind::ExactStrictLocalResponse:
                 case AstItemKind::Unmatched:
                     break;
                 case AstItemKind::Timer:

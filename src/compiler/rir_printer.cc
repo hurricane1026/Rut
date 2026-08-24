@@ -1040,21 +1040,17 @@ static bool has_strict_local_response_metadata(const Module& mod) {
     if (mod.strict_local_response_policy_count != 0) return true;
     for (u32 slot = 0; slot < kStrictLocalResponseMethodSlots; slot++)
         if (mod.unmatched_policy_ids[slot] != 0) return true;
-    return false;
+    return exact_strict_local_response_inventory_present(
+        mod.exact_strict_local_response_bindings, mod.exact_strict_local_response_binding_count);
 }
 
 static bool printable_strict_local_response_table(const Module& mod) {
-    if (!strict_local_response_policy_table_valid(mod.strict_local_response_policies,
-                                                  mod.strict_local_response_policy_count,
-                                                  mod.unmatched_policy_ids))
-        return false;
-    const u16 any_id = mod.unmatched_policy_ids[kRouteMethodAny];
-    if (any_id != 0 && mod.strict_local_response_policies[any_id - 1].head_mode !=
-                           StrictLocalResponseHeadMode::SuppressBody)
-        return false;
-    const u16 head_id = mod.unmatched_policy_ids[kRouteMethodHead];
-    return head_id == 0 || mod.strict_local_response_policies[head_id - 1].head_mode ==
-                               StrictLocalResponseHeadMode::SuppressBody;
+    return strict_local_response_source_table_valid(mod.strict_local_response_policies,
+                                                    mod.strict_local_response_policy_count,
+                                                    mod.unmatched_policy_ids,
+                                                    mod.exact_strict_local_response_bindings,
+                                                    mod.exact_strict_local_response_binding_count,
+                                                    kMaxExactStrictLocalResponseBindings);
 }
 
 void print_module(PrintBuf& buf, const Module& mod) {
@@ -1136,6 +1132,20 @@ void print_module(PrintBuf& buf, const Module& mod) {
                 buf.put_cstr(" -> local_response#");
                 buf.put_u32(mod.unmatched_policy_ids[slot]);
                 buf.newline();
+            }
+            if (mod.exact_strict_local_response_binding_count != 0) {
+                buf.put_cstr("exact:");
+                buf.newline();
+                for (u32 i = 0; i < mod.exact_strict_local_response_binding_count; i++) {
+                    const auto& binding = mod.exact_strict_local_response_bindings[i];
+                    buf.put_cstr("  ");
+                    buf.put_cstr(unmatched_method_name(binding.method));
+                    buf.put_cstr(" ");
+                    print_quoted_str(buf, Str{binding.path, binding.path_len});
+                    buf.put_cstr(" -> local_response#");
+                    buf.put_u32(binding.policy_id);
+                    buf.newline();
+                }
             }
         }
     }

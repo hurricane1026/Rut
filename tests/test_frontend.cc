@@ -34970,6 +34970,256 @@ unmatched { return local_response({
     lowered.destroy();
 }
 
+TEST(frontend, exact_local_response_metadata_is_lossless_without_executable_routes) {
+    static constexpr char kSource[] = R"rut(
+route exact "/static" { return local_response({
+  version: "HTTP/1.1", status: 200, reason: "OK", server: "nginx/1.29.7",
+  date: "current", content_type: "text/plain", connection: "request",
+  head_mode: "suppress_body", body: b"successor-static"
+}) }
+route exact GET "/health" { return local_response({
+  version: "HTTP/1.1", status: 404, reason: "Not Found", server: "rut",
+  date: "current", content_type: "text/plain", connection: "request",
+  head_mode: "reject", body: b"missing"
+}) }
+)rut";
+    auto lexed = lex(lit(kSource));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    REQUIRE_EQ(ast->items.len, 2u);
+    CHECK_EQ(ast->items[0].kind, AstItemKind::ExactStrictLocalResponse);
+    CHECK_EQ(ast->items[1].kind, AstItemKind::ExactStrictLocalResponse);
+    REQUIRE_EQ(ast->exact_strict_local_response_bindings.len, 2u);
+    REQUIRE_EQ(ast->strict_local_response_policies.len, 2u);
+    const auto& any = ast->exact_strict_local_response_bindings[0];
+    const auto& get = ast->exact_strict_local_response_bindings[1];
+    CHECK_EQ(any.method, kRouteMethodAny);
+    CHECK_EQ(any.policy_id, 1u);
+    CHECK((Str{any.path, any.path_len}.eq(lit("/static"))));
+    CHECK_EQ(get.method, kRouteMethodGet);
+    CHECK_EQ(get.policy_id, 2u);
+    CHECK((Str{get.path, get.path_len}.eq(lit("/health"))));
+    for (u32 i = any.path_len; i < sizeof(any.path); i++) CHECK_EQ(any.path[i], 0);
+
+    auto copied = std::make_unique<AstFile>(ast.value());
+    CHECK_EQ(copied->exact_strict_local_response_bindings.len, 2u);
+    CHECK((Str{copied->exact_strict_local_response_bindings[0].path,
+               copied->exact_strict_local_response_bindings[0].path_len}
+               .eq(lit("/static"))));
+    auto moved = std::make_unique<AstFile>(std::move(*copied));
+    REQUIRE_EQ(moved->exact_strict_local_response_bindings.len, 2u);
+    CHECK((Str{moved->exact_strict_local_response_bindings[1].path,
+               moved->exact_strict_local_response_bindings[1].path_len}
+               .eq(lit("/health"))));
+    auto forged_ast = std::make_unique<AstFile>(ast.value());
+    forged_ast->exact_strict_local_response_bindings[0].reserved1 = 1;
+    CHECK_FALSE(analyze_file_heap(*forged_ast).has_value());
+    forged_ast = std::make_unique<AstFile>(ast.value());
+    forged_ast->items[1].exact_strict_local_response.method = static_cast<u8>(TokenType::KwPost);
+    CHECK_FALSE(analyze_file_heap(*forged_ast).has_value());
+
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    CHECK_EQ(hir->routes.len, 0u);
+    REQUIRE_EQ(hir->exact_strict_local_response_bindings.len, 2u);
+    auto forged_hir = std::make_unique<HirModule>(hir.value());
+    forged_hir->exact_strict_local_response_bindings[0].policy_id = 2;
+    CHECK_FALSE(build_mir_heap(*forged_hir).has_value());
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    CHECK_EQ(mir->functions.len, 0u);
+    REQUIRE_EQ(mir->exact_strict_local_response_bindings.len, 2u);
+    auto forged_mir = std::make_unique<MirModule>(mir.value());
+    forged_mir->exact_strict_local_response_bindings.data[5].reserved0 = 1;
+    FrontendRirModule forged_lowered{};
+    CHECK_FALSE(lower_to_rir(*forged_mir, forged_lowered).has_value());
+    forged_lowered.destroy();
+    FrontendRirModule lowered{};
+    REQUIRE(lower_to_rir(mir.value(), lowered));
+    REQUIRE(rir::verify_module(lowered.module).ok);
+    CHECK_EQ(lowered.module.func_count, 0u);
+    REQUIRE_EQ(lowered.module.exact_strict_local_response_binding_count, 2u);
+    CHECK((Str{lowered.module.exact_strict_local_response_bindings[0].path,
+               lowered.module.exact_strict_local_response_bindings[0].path_len}
+               .eq(lit("/static"))));
+
+    char output[2048];
+    rir::PrintBuf buf;
+    buf.init(output, sizeof(output), -1);
+    rir::print_module(buf, lowered.module);
+    CHECK_FALSE(buf.overflow);
+    const std::string printed(buf.data, buf.len);
+    CHECK(printed.find("exact:\n  ANY \"/static\" -> local_response#1\n"
+                       "  GET \"/health\" -> local_response#2\n") != std::string::npos);
+    lowered.destroy();
+}
+
+TEST(frontend, exact_local_response_accepts_the_62_byte_path_boundary_losslessly) {
+    const std::string path = "/" + std::string(kMaxExactStrictLocalResponsePathLen - 1, 'x');
+    REQUIRE_EQ(path.size(), static_cast<std::size_t>(kMaxExactStrictLocalResponsePathLen));
+    const std::string source =
+        "route exact GET \"" + path +
+        "\" { return local_response({ version: \"HTTP/1.1\", status: 400, "
+        "reason: \"Bad Request\", server: \"rut\", date: \"current\", "
+        "content_type: \"text/plain\", connection: \"request\", head_mode: \"reject\", "
+        "body: b\"boundary\" }) }\n";
+    auto lexed = lex({source.data(), static_cast<u32>(source.size())});
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    REQUIRE_EQ(ast->items.len, 1u);
+    CHECK_EQ(ast->items[0].kind, AstItemKind::ExactStrictLocalResponse);
+    REQUIRE_EQ(ast->exact_strict_local_response_bindings.len, 1u);
+    const auto& ast_binding = ast->exact_strict_local_response_bindings[0];
+    CHECK_EQ(ast_binding.path_len, kMaxExactStrictLocalResponsePathLen);
+    CHECK_EQ(ast_binding.path[kMaxExactStrictLocalResponsePathLen], '\0');
+    CHECK_EQ(ast_binding.reserved0, 0u);
+    CHECK_EQ(ast_binding.reserved1, 0u);
+    CHECK_EQ(ast_binding.method, kRouteMethodGet);
+    CHECK_EQ(ast_binding.policy_id, 1u);
+    CHECK((Str{ast_binding.path, ast_binding.path_len}.eq(
+        {path.data(), static_cast<u32>(path.size())})));
+
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    CHECK_EQ(hir->routes.len, 0u);
+    REQUIRE_EQ(hir->exact_strict_local_response_bindings.len, 1u);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    CHECK_EQ(mir->functions.len, 0u);
+    REQUIRE_EQ(mir->exact_strict_local_response_bindings.len, 1u);
+    FrontendRirModule lowered{};
+    REQUIRE(lower_to_rir(mir.value(), lowered));
+    REQUIRE(rir::verify_module(lowered.module).ok);
+    CHECK_EQ(lowered.module.func_count, 0u);
+    REQUIRE_EQ(lowered.module.exact_strict_local_response_binding_count, 1u);
+    const auto& rir_binding = lowered.module.exact_strict_local_response_bindings[0];
+    CHECK_EQ(rir_binding.path_len, kMaxExactStrictLocalResponsePathLen);
+    CHECK_EQ(rir_binding.path[kMaxExactStrictLocalResponsePathLen], '\0');
+    CHECK_EQ(rir_binding.reserved0, 0u);
+    CHECK_EQ(rir_binding.reserved1, 0u);
+    CHECK((Str{rir_binding.path, rir_binding.path_len}.eq(
+        {path.data(), static_cast<u32>(path.size())})));
+    for (u32 i = 1; i < kMaxExactStrictLocalResponseBindings; i++)
+        CHECK(exact_strict_local_response_binding_is_neutral(
+            lowered.module.exact_strict_local_response_bindings[i]));
+    lowered.destroy();
+}
+
+TEST(frontend, exact_and_unmatched_source_tables_coexist_with_same_path_any_and_get) {
+    static constexpr char kSource[] = R"rut(
+unmatched OPTIONS { return local_response({
+  version: "HTTP/1.1", status: 400, reason: "Bad Request", server: "rut",
+  date: "current", content_type: "text/plain", connection: "request",
+  head_mode: "reject", body: b"unmatched"
+}) }
+route exact "/static" { return local_response({
+  version: "HTTP/1.1", status: 403, reason: "Forbidden", server: "rut",
+  date: "current", content_type: "text/plain", connection: "request",
+  head_mode: "suppress_body", body: b"any"
+}) }
+route exact GET "/static" { return local_response({
+  version: "HTTP/1.1", status: 404, reason: "Not Found", server: "rut",
+  date: "current", content_type: "text/plain", connection: "request",
+  head_mode: "reject", body: b"get"
+}) }
+)rut";
+    auto lexed = lex(lit(kSource));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    REQUIRE_EQ(ast->strict_local_response_policies.len, 3u);
+    CHECK_EQ(ast->unmatched_policy_ids[kRouteMethodOptions], 1u);
+    REQUIRE_EQ(ast->exact_strict_local_response_bindings.len, 2u);
+    const auto check_bindings = [&](const auto& bindings) {
+        const auto& any = bindings[0];
+        const auto& get = bindings[1];
+        CHECK_EQ(any.method, kRouteMethodAny);
+        CHECK_EQ(any.policy_id, 2u);
+        CHECK((Str{any.path, any.path_len}.eq(lit("/static"))));
+        CHECK_EQ(get.method, kRouteMethodGet);
+        CHECK_EQ(get.policy_id, 3u);
+        CHECK((Str{get.path, get.path_len}.eq(lit("/static"))));
+    };
+    check_bindings(ast->exact_strict_local_response_bindings);
+    CHECK(strict_local_response_source_table_valid(ast->strict_local_response_policies.data,
+                                                   ast->strict_local_response_policies.len,
+                                                   ast->unmatched_policy_ids,
+                                                   ast->exact_strict_local_response_bindings.data,
+                                                   ast->exact_strict_local_response_bindings.len));
+
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    CHECK_EQ(hir->routes.len, 0u);
+    CHECK_EQ(hir->unmatched_policy_ids[kRouteMethodOptions], 1u);
+    REQUIRE_EQ(hir->exact_strict_local_response_bindings.len, 2u);
+    check_bindings(hir->exact_strict_local_response_bindings);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    CHECK_EQ(mir->functions.len, 0u);
+    CHECK_EQ(mir->unmatched_policy_ids[kRouteMethodOptions], 1u);
+    REQUIRE_EQ(mir->exact_strict_local_response_bindings.len, 2u);
+    check_bindings(mir->exact_strict_local_response_bindings);
+    FrontendRirModule lowered{};
+    REQUIRE(lower_to_rir(mir.value(), lowered));
+    REQUIRE(rir::verify_module(lowered.module).ok);
+    CHECK_EQ(lowered.module.func_count, 0u);
+    CHECK_EQ(lowered.module.unmatched_policy_ids[kRouteMethodOptions], 1u);
+    REQUIRE_EQ(lowered.module.exact_strict_local_response_binding_count, 2u);
+    check_bindings(lowered.module.exact_strict_local_response_bindings);
+    lowered.destroy();
+}
+
+TEST(frontend, exact_local_response_syntax_and_selector_rejection_matrix) {
+    auto source_for = [](const std::string& selector, const char* head_mode = "suppress_body") {
+        return "route exact " + selector +
+               " { return local_response({ version: \"HTTP/1.1\", status: 400, "
+               "reason: \"Bad Request\", server: \"rut\", date: \"current\", "
+               "content_type: \"text/plain\", connection: \"request\", head_mode: \"" +
+               head_mode + "\", body: b\"x\" }) }\n";
+    };
+    const std::string too_long = "/" + std::string(kMaxExactStrictLocalResponsePathLen, 'x');
+    const std::string invalid_selectors[] = {
+        "ANY \"/static\"",
+        "FOO \"/static\"",
+        "\"\"",
+        "\"static\"",
+        "\"/a?b\"",
+        "\"/a#b\"",
+        "\"/a:b\"",
+        "\"/a*b\"",
+        "\"/a$var\"",
+        "\"/a{b}\"",
+        "\"/a\\\\b\"",
+        "\"" + too_long + "\"",
+    };
+    for (const auto& selector : invalid_selectors) {
+        const std::string source = source_for(selector);
+        auto lexed = lex({source.data(), static_cast<u32>(source.size())});
+        if (!lexed) continue;
+        CHECK_FALSE(parse_file_heap(lexed.value()).has_value());
+    }
+    for (const std::string& source : {
+             source_for("\"/static\"", "reject"),
+             source_for("HEAD \"/static\"", "reject"),
+         }) {
+        auto lexed = lex({source.data(), static_cast<u32>(source.size())});
+        REQUIRE(lexed);
+        CHECK_FALSE(parse_file_heap(lexed.value()).has_value());
+    }
+    const std::string duplicate =
+        source_for("GET \"/static\"", "reject") + source_for("GET \"/static\"", "reject");
+    auto duplicate_lexed = lex({duplicate.data(), static_cast<u32>(duplicate.size())});
+    REQUIRE(duplicate_lexed);
+    CHECK_FALSE(parse_file_heap(duplicate_lexed.value()).has_value());
+
+    const std::string generic = "route exact GET \"/static\" { return 200 }\n";
+    auto generic_lexed = lex({generic.data(), static_cast<u32>(generic.size())});
+    REQUIRE(generic_lexed);
+    CHECK_FALSE(parse_file_heap(generic_lexed.value()).has_value());
+}
+
 TEST(frontend, strict_local_response_representation200_profile_is_exact_and_reaches_rir) {
     static_assert(strict_local_response_profile(200) ==
                   StrictLocalResponseProfile::Representation200);
@@ -35260,6 +35510,43 @@ TEST(frontend, strict_local_response_body_parse_failures_are_transactional) {
     check_valid_after_failure();
 }
 
+TEST(frontend, exact_local_response_body_parse_failures_are_transactional) {
+    const char source[] = R"rut(route exact GET "/static" { return local_response({
+      version: "HTTP/1.1", status: 400, reason: "Bad Request", server: "rut",
+      date: "current", content_type: "text/plain", connection: "request",
+      head_mode: "reject", body: b"ok"
+    }) })rut";
+    auto lexed_result = lex(lit(source));
+    REQUIRE(lexed_result);
+    auto& tokens = lexed_result.value().tokens;
+    u32 body_token = tokens.len;
+    u32 final_rparen = tokens.len;
+    for (u32 i = 0; i < tokens.len; i++) {
+        if (tokens[i].type == TokenType::StringLit && tokens[i].text.eq(lit("ok"))) body_token = i;
+        if (tokens[i].type == TokenType::RParen) final_rparen = i;
+    }
+    REQUIRE(body_token < tokens.len);
+    REQUIRE(final_rparen < tokens.len);
+    const Token original_body = tokens[body_token];
+    const Token original_rparen = tokens[final_rparen];
+    const char unknown_escape[] = {'\\', 'q'};
+    tokens[body_token].text = {unknown_escape, sizeof(unknown_escape)};
+    CHECK_FALSE(parse_file_heap(lexed_result.value()).has_value());
+
+    tokens[body_token] = original_body;
+    tokens[final_rparen].type = TokenType::Ident;
+    CHECK_FALSE(parse_file_heap(lexed_result.value()).has_value());
+
+    tokens[final_rparen] = original_rparen;
+    auto parsed = parse_file_heap(lexed_result.value());
+    REQUIRE(parsed);
+    REQUIRE_EQ(parsed->strict_local_response_body_pool.len, 2u);
+    REQUIRE_EQ(parsed->strict_local_response_policies.len, 1u);
+    REQUIRE_EQ(parsed->exact_strict_local_response_bindings.len, 1u);
+    CHECK_EQ(parsed->exact_strict_local_response_bindings[0].policy_id, 1u);
+    CHECK(parsed->strict_local_response_policies[0].body.eq(lit("ok")));
+}
+
 TEST(frontend, unmatched_connect_trace_are_contextual_and_source_shape_is_strict) {
     const char identifiers[] =
         "func CONNECT() -> i32 => 1\n"
@@ -35451,6 +35738,24 @@ TEST(frontend, imported_unmatched_declaration_is_rejected) {
                "}) }\n";
     }
     const char main_source[] = "import \"fallback.rut\"\nroute GET \"/\" { return 200 }\n";
+    auto lexed = lex(lit(main_source));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    CHECK_FALSE(analyze_file_heap_with_path(ast.value(), dir + "/main.rut").has_value());
+}
+
+TEST(frontend, imported_exact_local_response_declaration_is_rejected) {
+    const std::string dir = "/tmp/rut_import_exact_local_response_frontend";
+    std::filesystem::create_directories(dir);
+    {
+        std::ofstream out(dir + "/exact.rut", std::ios::binary);
+        out << "route exact GET \"/static\" { return local_response({ version: \"HTTP/1.1\", "
+               "status: 400, reason: \"Bad Request\", server: \"rut\", date: \"current\", "
+               "content_type: \"text/plain\", connection: \"request\", head_mode: \"reject\", "
+               "body: b\"x\" }) }\n";
+    }
+    const char main_source[] = "import \"exact.rut\"\nroute GET \"/\" { return 200 }\n";
     auto lexed = lex(lit(main_source));
     REQUIRE(lexed);
     auto ast = parse_file_heap(lexed.value());

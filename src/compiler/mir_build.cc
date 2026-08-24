@@ -845,6 +845,13 @@ static FrontendResult<MirValue> mir_value(const HirExpr& expr,
 }  // namespace
 
 FrontendResult<MirModule*> build_mir(const HirModule& module) {
+    if (!strict_local_response_source_table_valid(module.strict_local_response_policies.data,
+                                                  module.strict_local_response_policies.len,
+                                                  module.unmatched_policy_ids,
+                                                  module.exact_strict_local_response_bindings.data,
+                                                  module.exact_strict_local_response_bindings.len,
+                                                  kMaxExactStrictLocalResponseBindings))
+        return frontend_error(FrontendError::UnsupportedSyntax, {});
     auto* mir = new MirModule{};
 
     for (u32 i = 0; i < module.response_policies.len; i++) {
@@ -855,16 +862,17 @@ FrontendResult<MirModule*> build_mir(const HirModule& module) {
         if (!mir->failure_policies.push(module.failure_policies[i]))
             return frontend_error(FrontendError::TooManyItems, {});
     }
-    if (!strict_local_response_policy_table_valid(module.strict_local_response_policies.data,
-                                                  module.strict_local_response_policies.len,
-                                                  module.unmatched_policy_ids))
-        return frontend_error(FrontendError::UnsupportedSyntax, {});
     for (u32 i = 0; i < module.strict_local_response_policies.len; i++) {
         if (!mir->strict_local_response_policies.push(module.strict_local_response_policies[i]))
             return frontend_error(FrontendError::TooManyItems, {});
     }
     for (u32 i = 0; i < kStrictLocalResponseMethodSlots; i++)
         mir->unmatched_policy_ids[i] = module.unmatched_policy_ids[i];
+    for (u32 i = 0; i < module.exact_strict_local_response_bindings.len; i++) {
+        if (!mir->exact_strict_local_response_bindings.push(
+                module.exact_strict_local_response_bindings[i]))
+            return frontend_error(FrontendError::TooManyItems, {});
+    }
     for (u32 i = 0; i < module.redirect_policies.len; i++) {
         if (!mir->redirect_policies.push(module.redirect_policies[i]))
             return frontend_error(FrontendError::TooManyItems, {});

@@ -87,13 +87,15 @@ struct Parser {
         AstFile* file;
         u32 body_len;
         u32 policy_len;
+        u32 exact_binding_len;
         u16 method_policy_ids[kStrictLocalResponseMethodSlots]{};
         bool committed = false;
 
         explicit StrictLocalResponseParseTransaction(AstFile* f)
             : file(f),
               body_len(f->strict_local_response_body_pool.len),
-              policy_len(f->strict_local_response_policies.len) {
+              policy_len(f->strict_local_response_policies.len),
+              exact_binding_len(f->exact_strict_local_response_bindings.len) {
             for (u32 slot = 0; slot < kStrictLocalResponseMethodSlots; slot++)
                 method_policy_ids[slot] = f->unmatched_policy_ids[slot];
         }
@@ -101,6 +103,7 @@ struct Parser {
             if (!committed) {
                 file->strict_local_response_body_pool.len = body_len;
                 file->strict_local_response_policies.len = policy_len;
+                file->exact_strict_local_response_bindings.len = exact_binding_len;
                 for (u32 slot = 0; slot < kStrictLocalResponseMethodSlots; slot++)
                     file->unmatched_policy_ids[slot] = method_policy_ids[slot];
             }
@@ -4593,69 +4596,20 @@ struct Parser {
     FrontendResult<AstItem> parse_route() {
         auto kw = expect(TokenType::KwRoute);
         if (!kw) return core::make_unexpected(kw.error());
+        if (cur().type == TokenType::Ident && cur().text.eq({"exact", 5})) {
+            pos++;
+            return parse_exact_strict_local_response(*kw.value());
+        }
         return parse_route_entry(*kw.value(), true);
     }
 
-    FrontendResult<AstItem> parse_unmatched() {
-        const Token start = cur();
-        if (start.type != TokenType::Ident || !start.text.eq({"unmatched", 9}))
-            return frontend_error(FrontendError::UnexpectedToken, span_from(start), start.text);
-        pos++;
+    struct ParsedStrictLocalResponseBlock {
+        StrictLocalResponsePolicySpec policy{};
+        const Token* outer_rbrace = nullptr;
+    };
 
-        AstItem item{};
-        item.kind = AstItemKind::Unmatched;
-        item.unmatched.method_is_any = cur().type == TokenType::LBrace;
-        if (item.unmatched.method_is_any) {
-            item.unmatched.method_slot = kRouteMethodAny;
-        } else if (is_method_keyword(cur().type)) {
-            item.unmatched.method = static_cast<u8>(cur().type);
-            switch (cur().type) {
-                case TokenType::KwGet:
-                    item.unmatched.method_slot = kRouteMethodGet;
-                    break;
-                case TokenType::KwPost:
-                    item.unmatched.method_slot = kRouteMethodPost;
-                    break;
-                case TokenType::KwPut:
-                    item.unmatched.method_slot = kRouteMethodPut;
-                    break;
-                case TokenType::KwDelete:
-                    item.unmatched.method_slot = kRouteMethodDelete;
-                    break;
-                case TokenType::KwPatch:
-                    item.unmatched.method_slot = kRouteMethodPatch;
-                    break;
-                case TokenType::KwHead:
-                    item.unmatched.method_slot = kRouteMethodHead;
-                    break;
-                case TokenType::KwOptions:
-                    item.unmatched.method_slot = kRouteMethodOptions;
-                    break;
-                default:
-                    return frontend_error(
-                        FrontendError::UnexpectedToken, span_from(cur()), cur().text);
-            }
-            pos++;
-        } else if (cur().type == TokenType::Ident &&
-                   (cur().text.eq({"CONNECT", 7}) || cur().text.eq({"connect", 7}) ||
-                    cur().text.eq({"TRACE", 5}) || cur().text.eq({"trace", 5}))) {
-            item.unmatched.method = static_cast<u8>(TokenType::Ident);
-            item.unmatched.method_slot =
-                cur().text.len == 7 ? kRouteMethodConnect : kRouteMethodTrace;
-            pos++;
-        } else {
-            return frontend_error(FrontendError::UnsupportedSyntax, span_from(cur()), cur().text);
-        }
-
-        const u32 slot = item.unmatched.method_slot;
-        static_assert(kRouteMethodSlots == kStrictLocalResponseMethodSlots);
-        if (slot >= kStrictLocalResponseMethodSlots)
-            return frontend_error(FrontendError::UnsupportedSyntax, span_from(start), start.text);
-        if (file->unmatched_policy_ids[slot] != 0)
-            return frontend_error(FrontendError::UnsupportedSyntax,
-                                  span_from(start),
-                                  lit_str("duplicate unmatched method selector"));
-
+    FrontendResult<ParsedStrictLocalResponseBlock> parse_strict_local_response_block(
+        const Token& start, u32 method_slot, Str head_mode_error) {
         auto outer_lbrace = expect(TokenType::LBrace);
         if (!outer_lbrace) return core::make_unexpected(outer_lbrace.error());
         auto ret = expect(TokenType::KwReturn);
@@ -4671,7 +4625,6 @@ struct Parser {
         auto object_lbrace = expect(TokenType::LBrace);
         if (!object_lbrace) return core::make_unexpected(object_lbrace.error());
 
-        StrictLocalResponseParseTransaction transaction(file);
         StrictLocalResponsePolicySpec policy{};
         u16 fields = 0;
         while (cur().type != TokenType::RBrace && cur().type != TokenType::Eof) {
@@ -4778,19 +4731,184 @@ struct Parser {
         auto outer_rbrace = expect(TokenType::RBrace);
         if (!outer_rbrace) return core::make_unexpected(outer_rbrace.error());
 
-        if ((slot == kRouteMethodAny || slot == kRouteMethodHead) &&
+        if ((method_slot == kRouteMethodAny || method_slot == kRouteMethodHead) &&
             policy.head_mode != StrictLocalResponseHeadMode::SuppressBody)
-            return frontend_error(FrontendError::UnsupportedSyntax,
-                                  span_from(start),
-                                  lit_str("ANY and HEAD unmatched policies must suppress body"));
+            return frontend_error(
+                FrontendError::UnsupportedSyntax, span_from(start), head_mode_error);
         if (!strict_local_response_policy_spec_valid(policy))
             return frontend_error(FrontendError::UnsupportedSyntax, span_from(start));
-        const u16 policy_id = file->add_strict_local_response_policy(policy);
+        return ParsedStrictLocalResponseBlock{policy, outer_rbrace.value()};
+    }
+
+    FrontendResult<AstItem> parse_unmatched() {
+        const Token start = cur();
+        if (start.type != TokenType::Ident || !start.text.eq({"unmatched", 9}))
+            return frontend_error(FrontendError::UnexpectedToken, span_from(start), start.text);
+        pos++;
+
+        AstItem item{};
+        item.kind = AstItemKind::Unmatched;
+        item.unmatched.method_is_any = cur().type == TokenType::LBrace;
+        if (item.unmatched.method_is_any) {
+            item.unmatched.method_slot = kRouteMethodAny;
+        } else if (is_method_keyword(cur().type)) {
+            item.unmatched.method = static_cast<u8>(cur().type);
+            switch (cur().type) {
+                case TokenType::KwGet:
+                    item.unmatched.method_slot = kRouteMethodGet;
+                    break;
+                case TokenType::KwPost:
+                    item.unmatched.method_slot = kRouteMethodPost;
+                    break;
+                case TokenType::KwPut:
+                    item.unmatched.method_slot = kRouteMethodPut;
+                    break;
+                case TokenType::KwDelete:
+                    item.unmatched.method_slot = kRouteMethodDelete;
+                    break;
+                case TokenType::KwPatch:
+                    item.unmatched.method_slot = kRouteMethodPatch;
+                    break;
+                case TokenType::KwHead:
+                    item.unmatched.method_slot = kRouteMethodHead;
+                    break;
+                case TokenType::KwOptions:
+                    item.unmatched.method_slot = kRouteMethodOptions;
+                    break;
+                default:
+                    return frontend_error(
+                        FrontendError::UnexpectedToken, span_from(cur()), cur().text);
+            }
+            pos++;
+        } else if (cur().type == TokenType::Ident &&
+                   (cur().text.eq({"CONNECT", 7}) || cur().text.eq({"connect", 7}) ||
+                    cur().text.eq({"TRACE", 5}) || cur().text.eq({"trace", 5}))) {
+            item.unmatched.method = static_cast<u8>(TokenType::Ident);
+            item.unmatched.method_slot =
+                cur().text.len == 7 ? kRouteMethodConnect : kRouteMethodTrace;
+            pos++;
+        } else {
+            return frontend_error(FrontendError::UnsupportedSyntax, span_from(cur()), cur().text);
+        }
+
+        const u32 slot = item.unmatched.method_slot;
+        static_assert(kRouteMethodSlots == kStrictLocalResponseMethodSlots);
+        if (slot >= kStrictLocalResponseMethodSlots)
+            return frontend_error(FrontendError::UnsupportedSyntax, span_from(start), start.text);
+        if (file->unmatched_policy_ids[slot] != 0)
+            return frontend_error(FrontendError::UnsupportedSyntax,
+                                  span_from(start),
+                                  lit_str("duplicate unmatched method selector"));
+
+        StrictLocalResponseParseTransaction transaction(file);
+        auto parsed = parse_strict_local_response_block(
+            start, slot, lit_str("ANY and HEAD unmatched policies must suppress body"));
+        if (!parsed) return core::make_unexpected(parsed.error());
+        const u16 policy_id = file->add_strict_local_response_policy(parsed->policy);
         if (policy_id == 0) return frontend_error(FrontendError::TooManyItems, span_from(start));
         file->unmatched_policy_ids[slot] = policy_id;
         item.unmatched.policy_id = policy_id;
-        item.span = Span{start.start, outer_rbrace.value()->end, start.line, start.col};
+        item.span = Span{start.start, parsed->outer_rbrace->end, start.line, start.col};
         item.unmatched.span = item.span;
+        transaction.commit();
+        return item;
+    }
+
+    FrontendResult<AstItem> parse_exact_strict_local_response(const Token& kw_route) {
+        const Token start = kw_route;
+        AstItem item{};
+        item.kind = AstItemKind::ExactStrictLocalResponse;
+        u32 method_slot = kRouteMethodAny;
+        item.exact_strict_local_response.method_is_any = cur().type == TokenType::StringLit;
+        if (!item.exact_strict_local_response.method_is_any) {
+            if (cur().type == TokenType::Ident && cur().text.eq({"ANY", 3}))
+                return frontend_error(FrontendError::UnsupportedSyntax,
+                                      span_from(cur()),
+                                      lit_str("omit the method for exact ANY"));
+            if (is_method_keyword(cur().type)) {
+                item.exact_strict_local_response.method = static_cast<u8>(cur().type);
+                switch (cur().type) {
+                    case TokenType::KwGet:
+                        method_slot = kRouteMethodGet;
+                        break;
+                    case TokenType::KwPost:
+                        method_slot = kRouteMethodPost;
+                        break;
+                    case TokenType::KwPut:
+                        method_slot = kRouteMethodPut;
+                        break;
+                    case TokenType::KwDelete:
+                        method_slot = kRouteMethodDelete;
+                        break;
+                    case TokenType::KwPatch:
+                        method_slot = kRouteMethodPatch;
+                        break;
+                    case TokenType::KwHead:
+                        method_slot = kRouteMethodHead;
+                        break;
+                    case TokenType::KwOptions:
+                        method_slot = kRouteMethodOptions;
+                        break;
+                    default:
+                        return frontend_error(
+                            FrontendError::UnexpectedToken, span_from(cur()), cur().text);
+                }
+                pos++;
+            } else if (cur().type == TokenType::Ident &&
+                       (cur().text.eq({"CONNECT", 7}) || cur().text.eq({"connect", 7}) ||
+                        cur().text.eq({"TRACE", 5}) || cur().text.eq({"trace", 5}))) {
+                item.exact_strict_local_response.method = static_cast<u8>(TokenType::Ident);
+                method_slot = cur().text.len == 7 ? kRouteMethodConnect : kRouteMethodTrace;
+                pos++;
+            } else {
+                return frontend_error(
+                    FrontendError::UnsupportedSyntax, span_from(cur()), cur().text);
+            }
+        }
+
+        auto path = expect(TokenType::StringLit);
+        if (!path) return core::make_unexpected(path.error());
+        ExactStrictLocalResponseBinding binding{};
+        binding.path_len = static_cast<u8>(path.value()->text.len);
+        binding.method = static_cast<u8>(method_slot);
+        if (path.value()->text.len == 0 ||
+            path.value()->text.len > kMaxExactStrictLocalResponsePathLen)
+            return frontend_error(
+                FrontendError::UnsupportedSyntax, span_from(*path.value()), path.value()->text);
+        for (u32 i = 0; i < path.value()->text.len; i++) {
+            if (!exact_strict_local_response_path_byte_valid(path.value()->text.ptr[i]))
+                return frontend_error(
+                    FrontendError::UnsupportedSyntax, span_from(*path.value()), path.value()->text);
+            binding.path[i] = path.value()->text.ptr[i];
+        }
+        if (binding.path[0] != '/')
+            return frontend_error(
+                FrontendError::UnsupportedSyntax, span_from(*path.value()), path.value()->text);
+        for (u32 i = 0; i < file->exact_strict_local_response_bindings.len; i++) {
+            const auto& existing = file->exact_strict_local_response_bindings[i];
+            if (existing.method != binding.method || existing.path_len != binding.path_len)
+                continue;
+            bool same = true;
+            for (u32 k = 0; k < binding.path_len; k++)
+                if (existing.path[k] != binding.path[k]) same = false;
+            if (same)
+                return frontend_error(FrontendError::UnsupportedSyntax,
+                                      span_from(*path.value()),
+                                      lit_str("duplicate exact local-response selector"));
+        }
+
+        StrictLocalResponseParseTransaction transaction(file);
+        auto parsed = parse_strict_local_response_block(
+            start, method_slot, lit_str("ANY and HEAD exact policies must suppress body"));
+        if (!parsed) return core::make_unexpected(parsed.error());
+        const u16 policy_id = file->add_strict_local_response_policy(parsed->policy);
+        if (policy_id == 0) return frontend_error(FrontendError::TooManyItems, span_from(start));
+        binding.policy_id = policy_id;
+        if (!file->exact_strict_local_response_bindings.push(binding))
+            return frontend_error(FrontendError::TooManyItems, span_from(start));
+        item.exact_strict_local_response.binding = binding;
+        item.span = Span{start.start, parsed->outer_rbrace->end, start.line, start.col};
+        item.exact_strict_local_response.span = item.span;
         transaction.commit();
         return item;
     }
@@ -5047,6 +5165,11 @@ FrontendResult<AstFile*> parse_file(const LexedTokens& tokens) {
                 if (p.cur().type != TokenType::KwRoute || p.peek().type == TokenType::LBrace)
                     return frontend_error(
                         FrontendError::UnsupportedSyntax, Parser::span_from(p.cur()), p.cur().text);
+                if (p.peek().type == TokenType::Ident && p.peek().text.eq({"exact", 5}))
+                    return frontend_error(
+                        FrontendError::UnsupportedSyntax,
+                        Parser::span_from(p.peek()),
+                        lit_str("exact local responses do not accept decorators"));
                 auto r = p.parse_route();
                 if (!r) return core::make_unexpected(r.error());
                 AstItem route_item = r.value();

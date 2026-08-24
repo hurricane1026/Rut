@@ -22,6 +22,7 @@ enum class VerifyIssueCode : u8 {
     InvalidJumpTarget,
     InvalidRedirectPolicyId,
     InvalidUnmatchedPolicyId,
+    InvalidExactStrictLocalResponseBinding,
     InvalidStateZeroEntry,
     InvalidResumeBlock,
     MissingYieldResumeMapping,
@@ -1011,16 +1012,28 @@ inline VerifyResult verify_module(const Module& mod, VerifyOptions options = {})
     summary.function_count = mod.func_count;
 
     static_assert(kRouteMethodSlots == kStrictLocalResponseMethodSlots);
-    if (!strict_local_response_policy_table_valid(mod.strict_local_response_policies,
-                                                  mod.strict_local_response_policy_count,
-                                                  mod.unmatched_policy_ids) ||
-        (mod.unmatched_policy_ids[kRouteMethodAny] != 0 &&
-         mod.strict_local_response_policies[mod.unmatched_policy_ids[kRouteMethodAny] - 1]
-                 .head_mode != StrictLocalResponseHeadMode::SuppressBody) ||
-        (mod.unmatched_policy_ids[kRouteMethodHead] != 0 &&
-         mod.strict_local_response_policies[mod.unmatched_policy_ids[kRouteMethodHead] - 1]
-                 .head_mode != StrictLocalResponseHeadMode::SuppressBody))
+    const bool has_exact_strict_local_response_inventory =
+        exact_strict_local_response_inventory_present(
+            mod.exact_strict_local_response_bindings,
+            mod.exact_strict_local_response_binding_count);
+    if (!has_exact_strict_local_response_inventory &&
+        (!strict_local_response_policy_table_valid(mod.strict_local_response_policies,
+                                                   mod.strict_local_response_policy_count,
+                                                   mod.unmatched_policy_ids) ||
+         (mod.unmatched_policy_ids[kRouteMethodAny] != 0 &&
+          mod.strict_local_response_policies[mod.unmatched_policy_ids[kRouteMethodAny] - 1]
+                  .head_mode != StrictLocalResponseHeadMode::SuppressBody) ||
+         (mod.unmatched_policy_ids[kRouteMethodHead] != 0 &&
+          mod.strict_local_response_policies[mod.unmatched_policy_ids[kRouteMethodHead] - 1]
+                  .head_mode != StrictLocalResponseHeadMode::SuppressBody)))
         return verify_fail(summary, VerifyIssueCode::InvalidUnmatchedPolicyId, 0);
+    if (!strict_local_response_source_table_valid(mod.strict_local_response_policies,
+                                                  mod.strict_local_response_policy_count,
+                                                  mod.unmatched_policy_ids,
+                                                  mod.exact_strict_local_response_bindings,
+                                                  mod.exact_strict_local_response_binding_count,
+                                                  kMaxExactStrictLocalResponseBindings))
+        return verify_fail(summary, VerifyIssueCode::InvalidExactStrictLocalResponseBinding, 0);
 
     if (!redirect_policy_table_valid(mod.redirect_policies, mod.redirect_policy_count))
         return verify_fail(summary, VerifyIssueCode::InvalidRedirectPolicyId, 0);
@@ -1227,6 +1240,8 @@ inline const char* verify_issue_code_name(VerifyIssueCode code) {
             return "InvalidRedirectPolicyId";
         case VerifyIssueCode::InvalidUnmatchedPolicyId:
             return "InvalidUnmatchedPolicyId";
+        case VerifyIssueCode::InvalidExactStrictLocalResponseBinding:
+            return "InvalidExactStrictLocalResponseBinding";
         case VerifyIssueCode::InvalidStateZeroEntry:
             return "InvalidStateZeroEntry";
         case VerifyIssueCode::InvalidResumeBlock:

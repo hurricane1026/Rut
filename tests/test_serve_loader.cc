@@ -724,6 +724,68 @@ TEST(serve_loader, unmatched_population_owns_valid_table_and_rejects_forgery_bef
     CHECK_EQ(omitted_cfg->upstream_count, 0u);
 }
 
+TEST(serve_loader, exact_strict_local_response_metadata_is_rejected_before_config_mutation) {
+    rir::Module mod{};
+    auto& policy = mod.strict_local_response_policies[0];
+    policy.version = StrictLocalResponseVersion::Http11;
+    policy.status_code = 400;
+    policy.date = StrictLocalResponseDate::Current;
+    policy.connection = StrictLocalResponseConnection::Request;
+    policy.head_mode = StrictLocalResponseHeadMode::Reject;
+    policy.reason = {"Bad Request", 11};
+    policy.content_type = {"text/plain", 10};
+    policy.server = {"rut", 3};
+    policy.body = {"x", 1};
+    mod.strict_local_response_policy_count = 1;
+    auto& binding = mod.exact_strict_local_response_bindings[0];
+    const Str path{"/static", 7};
+    for (u32 i = 0; i < path.len; i++) binding.path[i] = path.ptr[i];
+    binding.path_len = static_cast<u8>(path.len);
+    binding.method = kRouteMethodGet;
+    binding.policy_id = 1;
+    mod.exact_strict_local_response_binding_count = 1;
+    mod.upstream_count = 1;
+    mod.upstreams[0].name = {"would_mutate", 12};
+    mod.upstreams[0].has_address = true;
+    mod.upstreams[0].ip = 0x7f000001u;
+    mod.upstreams[0].port = 9000;
+    REQUIRE(rir::verify_module(mod).ok);
+
+    auto cfg = std::make_unique<RouteConfig>();
+    CHECK_FALSE(populate_route_config(*cfg, mod));
+    CHECK_EQ(cfg->upstream_count, 0u);
+    CHECK_EQ(cfg->route_count, 0u);
+    CHECK_FALSE(cfg->has_unmatched_metadata());
+
+    rir::Module hidden{};
+    hidden.exact_strict_local_response_bindings[7].reserved1 = 1;
+    auto hidden_cfg = std::make_unique<RouteConfig>();
+    CHECK_FALSE(populate_route_config(*hidden_cfg, hidden));
+    CHECK_EQ(hidden_cfg->upstream_count, 0u);
+    CHECK_EQ(hidden_cfg->route_count, 0u);
+}
+
+TEST(serve_loader, exact_strict_local_response_source_reaches_register_then_fails_closed) {
+    const std::string path =
+        write_file("/tmp/rut_serve_loader_exact_strict_foundation",
+                   "app.rut",
+                   "route exact GET \"/static\" { return local_response({ version: \"HTTP/1.1\", "
+                   "status: 400, reason: \"Bad Request\", server: \"rut\", date: \"current\", "
+                   "content_type: \"text/plain\", connection: \"request\", head_mode: \"reject\", "
+                   "body: b\"x\" }) }\n"
+                   "route GET \"/sentinel\" { return 204 }\n");
+
+    LoadedProgram program;
+    LoadError err;
+    CHECK_FALSE(load_rut_program(path.c_str(), program, err));
+    CHECK_EQ(err.stage, LoadStage::Register);
+    CHECK_FALSE(err.has_diag);
+    CHECK_EQ(program.config.route_count, 0u);
+    CHECK_EQ(program.config.upstream_count, 0u);
+    CHECK_FALSE(program.config.has_unmatched_metadata());
+    program.destroy();
+}
+
 int main(int argc, char** argv) {
     return rut::test::run_all(argc, argv);
 }

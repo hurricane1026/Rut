@@ -3406,9 +3406,12 @@ FrontendResult<void> lower_to_rir(const MirModule& mir, FrontendRirModule& out) 
     }
     out.module.failure_policy_count = mir.failure_policies.len;
 
-    if (!strict_local_response_policy_table_valid(mir.strict_local_response_policies.data,
+    if (!strict_local_response_source_table_valid(mir.strict_local_response_policies.data,
                                                   mir.strict_local_response_policies.len,
-                                                  mir.unmatched_policy_ids))
+                                                  mir.unmatched_policy_ids,
+                                                  mir.exact_strict_local_response_bindings.data,
+                                                  mir.exact_strict_local_response_bindings.len,
+                                                  kMaxExactStrictLocalResponseBindings))
         return frontend_error(FrontendError::UnsupportedSyntax);
     for (u32 i = 0; i < mir.strict_local_response_policies.len; i++) {
         const auto& src = mir.strict_local_response_policies[i];
@@ -3426,6 +3429,11 @@ FrontendResult<void> lower_to_rir(const MirModule& mir, FrontendRirModule& out) 
     out.module.strict_local_response_policy_count = mir.strict_local_response_policies.len;
     for (u32 i = 0; i < kStrictLocalResponseMethodSlots; i++)
         out.module.unmatched_policy_ids[i] = mir.unmatched_policy_ids[i];
+    for (u32 i = 0; i < mir.exact_strict_local_response_bindings.len; i++)
+        out.module.exact_strict_local_response_bindings[i] =
+            mir.exact_strict_local_response_bindings[i];
+    out.module.exact_strict_local_response_binding_count =
+        mir.exact_strict_local_response_bindings.len;
 
     if (mir.redirect_policies.len > kMaxRedirectPolicies)
         return frontend_error(FrontendError::TooManyItems);
