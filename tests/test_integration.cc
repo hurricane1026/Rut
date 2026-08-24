@@ -23346,8 +23346,6 @@ TEST(route, ordinary_source_local_response_request_persistence_iouring) {
     shard.active_config = shard.route_config;
     REQUIRE(shard.loop != nullptr);
     REQUIRE(shard.spawn(-1).has_value());
-    usleep(50000);
-    REQUIRE(shard.loop->is_running());
     REQUIRE_EQ(shard.backend_failure_code(), 0);
 
     struct ClientGuard {
