@@ -20760,39 +20760,139 @@ TEST(iouring_connect_completion_failure,
 }
 
 TEST(iouring_connect_completion_failure,
-     wrong_episode_is_swallowed_before_callback_without_health_or_response) {
+     wrong_episode_consumes_only_stale_owner_then_current_failure_completes) {
     ScopedBackendHealthReset health_reset{};
     ScopedIoUringLoopForRetirement guard;
     if (!guard.init()) SKIP("io_uring unavailable");
     auto* loop = guard.loop;
-    RouteConfig config{};
+    RouteConfig pinned{};
     PreconnectConnectSubmitFixture fixture{};
     REQUIRE(stage_async_connect_completion(
-        loop, config, AsyncConnectFailureProfile::BodylessGet, false, false, &fixture));
+        loop, pinned, AsyncConnectFailureProfile::BodylessGet, false, false, &fixture));
+    REQUIRE(pinned.add_static("/two", kRouteMethodGet, 204));
+    RouteConfig hot{};
+    REQUIRE(hot.add_upstream("hot", 0x7F000001, 9001).has_value());
+    REQUIRE(add_bodyless_non_head_response_read_deadline_bundle(
+        hot, 5, ForwardResponseBufferingMode::CompleteContentLength));
+    REQUIRE(
+        hot.add_jit_handler("/one", kRouteMethodGet, &response_read_deadline_handler, false, 2));
+    REQUIRE(hot.add_static("/two", kRouteMethodGet, 204));
+    hot.failure_policies[0].body = {"hot-reload", 10};
+    fixture.active = &hot;
     Connection& conn = *fixture.conn;
+    const u32 id = conn.id;
     BackendHealth* health = backend_health(0, 0);
     REQUIRE(health != nullptr);
+    health->fails = 1;
+    health->eject_until_us = 4321;
+    health->active_down = false;
     const u32 old_episode = conn.upstream_episode;
     IoEvent stale = async_connect_failure_event(conn, -ECONNREFUSED);
     stale.upstream_episode = old_episode == 1 ? 2 : old_episode - 1;
+
     const i32 fd_before = conn.fd;
     const i32 upstream_fd_before = conn.upstream_fd;
-    const u32 pending_before = conn.pending_ops;
+    const u32 current_pending = conn.pending_ops;
+    const auto on_recv_before = conn.on_recv;
+    const auto on_send_before = conn.on_send;
+    const auto on_upstream_recv_before = conn.on_upstream_recv;
+    const auto on_upstream_send_before = conn.on_upstream_send;
+    const RouteConfig* request_config_before = conn.request_config;
+    const ResponseReadDeadlineState deadline_state_before = conn.response_read_deadline_state;
+    const u32 deadline_generation_before = conn.response_read_deadline_generation;
+    const u32 deadline_owner_before = conn.response_read_deadline_owner_generation;
+    const u16 deadline_bundle_before = conn.response_read_deadline_bundle_id;
+    const u32 response_len_before = conn.response_header_buf.len();
+    const u32 retiring_episode_before = conn.upstream_retiring_episode;
+    const u32 close_episode_before = conn.upstream_close_episode;
+    REQUIRE(conn.recv_armed);
+    REQUIRE(conn.upstream_connect_armed);
+    REQUIRE_EQ(current_pending, 2u);
+
+    // The wrong-episode terminal belongs to an older submitted Connect lifetime
+    // that shares this slot's aggregate pending count but owns no current armed
+    // flag or callback. Dispatch must retire only that independent old owner.
+    conn.pending_ops++;
+    REQUIRE_EQ(conn.pending_ops, current_pending + 1u);
     loop->dispatch(stale);
+
     CHECK_EQ(conn.fd, fd_before);
     CHECK_EQ(conn.upstream_fd, upstream_fd_before);
     CHECK_EQ(conn.upstream_episode, old_episode);
-    CHECK_EQ(conn.upstream_retiring_episode, 0u);
-    CHECK_EQ(conn.resp_status, 0u);
-    CHECK_EQ(conn.response_header_buf.len(), 0u);
-    CHECK_EQ(health->fails, 0u);
+    CHECK_EQ(conn.upstream_retiring_episode, retiring_episode_before);
+    CHECK_EQ(conn.upstream_close_episode, close_episode_before);
+    CHECK_FALSE(conn.upstream_retirement_active);
+    CHECK_EQ(conn.upstream_retirement_target_owned, 0u);
+    CHECK_EQ(conn.upstream_retirement_cancel_owned, 0u);
+    CHECK(conn.recv_armed);
     CHECK(conn.upstream_connect_armed);
-    // Existing stale transport accounting consumes only the stale terminal's
-    // lifetime count; it does not clear or dispatch the current Connect owner.
-    CHECK_EQ(conn.pending_ops, pending_before - 1u);
+    CHECK_EQ(conn.on_recv, on_recv_before);
+    CHECK_EQ(conn.on_send, on_send_before);
+    CHECK_EQ(conn.on_upstream_recv, on_upstream_recv_before);
+    CHECK_EQ(conn.on_upstream_send, on_upstream_send_before);
+    CHECK_EQ(conn.request_config, request_config_before);
+    CHECK_EQ(conn.response_read_deadline_state, deadline_state_before);
+    CHECK_EQ(conn.response_read_deadline_generation, deadline_generation_before);
+    CHECK_EQ(conn.response_read_deadline_owner_generation, deadline_owner_before);
+    CHECK_EQ(conn.response_read_deadline_bundle_id, deadline_bundle_before);
+    CHECK_EQ(conn.resp_status, 0u);
+    CHECK_EQ(conn.response_header_buf.len(), response_len_before);
+    CHECK_EQ(health->fails, 1u);
+    CHECK_EQ(health->eject_until_us, 4321u);
+    CHECK_FALSE(health->active_down);
+    CHECK_EQ(conn.pending_ops, current_pending);
+
+    loop->dispatch(async_connect_failure_event(conn, -ECONNREFUSED));
+
+    REQUIRE_GE(conn.fd, 0);
+    CHECK_EQ(conn.resp_status, 502u);
+    CHECK_EQ(conn.request_config, &pinned);
+    CHECK_EQ(conn.response_read_deadline_state, ResponseReadDeadlineState::None);
+    CHECK(conn.response_read_deadline_owner_is_neutral());
+    CHECK_EQ(conn.upstream_fd, -1);
+    CHECK(conn.upstream_abandoned);
+    CHECK(conn.send_armed);
+    CHECK(conn.recv_armed);
+    CHECK_EQ(conn.pending_ops, 2u);
+    CHECK_EQ(conn.upstream_retiring_episode, old_episode);
+    CHECK_NE(conn.upstream_episode, old_episode);
+    CHECK_FALSE(conn.upstream_retirement_active);
+    CHECK_EQ(conn.upstream_retirement_target_owned, 0u);
+    CHECK_EQ(conn.upstream_retirement_cancel_owned, 0u);
+    CHECK_EQ(health->fails, 2u);
+    CHECK_EQ(health->eject_until_us, 4321u);
+    CHECK_FALSE(health->active_down);
+    CHECK(buf_has(conn.response_header_buf.data(), conn.response_header_buf.len(), "default"));
+    CHECK_FALSE(
+        buf_has(conn.response_header_buf.data(), conn.response_header_buf.len(), "hot-reload"));
+    CHECK_FALSE(buf_contains(reinterpret_cast<const char*>(conn.response_header_buf.data()),
+                             conn.response_header_buf.len(),
+                             "time\0out",
+                             8));
+
+    const u32 response_len = conn.response_header_buf.len();
+    loop->backend.send_state[id].remaining = 0;
+    loop->dispatch({id, static_cast<i32>(response_len), 0, 0, IoEventType::Send, 0});
+    REQUIRE_EQ(conn.state, ConnState::ReadingHeader);
+    REQUIRE_EQ(conn.on_recv, &on_header_received<IoUringEventLoop>);
+    REQUIRE(conn.recv_armed);
+    REQUIRE_EQ(conn.pending_ops, 1u);
+    CHECK_EQ(conn.upstream_retiring_episode, old_episode);
+
+    fixture.active = &pinned;
+    static constexpr u8 kSuccessor[] =
+        "GET /two HTTP/1.1\r\nHost: client.example\r\nConnection: close\r\n\r\n";
+    REQUIRE_EQ(conn.recv_buf.write(kSuccessor, sizeof(kSuccessor) - 1u), sizeof(kSuccessor) - 1u);
+    loop->dispatch({id, static_cast<i32>(sizeof(kSuccessor) - 1u), 0, 0, IoEventType::Recv, 1});
+    CHECK_EQ(conn.resp_status, 204u);
+    CHECK(conn.send_armed);
+    CHECK(conn.recv_armed);
+    CHECK_EQ(conn.pending_ops, 2u);
 
     __atomic_store_n(loop->backend.sq_tail, fixture.sq_tail, __ATOMIC_RELEASE);
     loop->backend.pending = fixture.backend_pending;
+    loop->backend.send_state[id] = {};
+    conn.send_armed = false;
     conn.recv_armed = false;
     conn.upstream_connect_armed = false;
     conn.pending_ops = 0;
