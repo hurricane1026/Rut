@@ -542,12 +542,25 @@ inline bool build_timeout_failure_policy_response(const Connection& conn,
                                                   u8* out,
                                                   u32 out_cap,
                                                   u32* out_len);
+inline bool build_failure_policy_response(const Connection& conn,
+                                          const RouteConfig& config,
+                                          bool suppress_body,
+                                          u8* out,
+                                          u32 out_cap,
+                                          u32* out_len);
 template <typename Loop>
 inline void reject_request_policy(Loop* loop, Connection& conn);
 template <typename Loop>
 inline void reject_response_policy(Loop* loop, Connection& conn);
 template <typename Loop>
 inline void respond_upstream_connect_failure(Loop* loop, Connection& conn);
+enum class ValidatedPreconnectFailureSite : u8 { SocketCreate, ConnectSubmit };
+template <typename Loop>
+inline void respond_validated_preconnect_failure(Loop* loop,
+                                                 Connection& conn,
+                                                 ValidatedPreconnectFailureSite site);
+template <typename Loop>
+void on_validated_preconnect_failure_sent(void* lp, Connection& conn, IoEvent ev);
 void prepare_early_response_state(Connection& conn);
 u32 consume_upstream_sent(Connection& conn);
 
@@ -3074,7 +3087,8 @@ void handle_jit_outcome(
             const i32 kUpstreamFd = UpstreamPool::create_socket();
             if (kUpstreamFd < 0) {
                 if (conn.response_read_deadline_state == ResponseReadDeadlineState::Validated) {
-                    loop->close_conn(conn);
+                    respond_validated_preconnect_failure(
+                        loop, conn, ValidatedPreconnectFailureSite::SocketCreate);
                 } else if (conn.failure_policy_id != 0) {
                     respond_upstream_connect_failure(loop, conn);
                 } else {
@@ -3091,7 +3105,8 @@ void handle_jit_outcome(
             if (!loop->submit_connect(
                     conn, &target.addrs[kBackend], sizeof(target.addrs[kBackend]))) {
                 if (conn.response_read_deadline_state == ResponseReadDeadlineState::Validated) {
-                    loop->close_conn(conn);
+                    respond_validated_preconnect_failure(
+                        loop, conn, ValidatedPreconnectFailureSite::ConnectSubmit);
                 } else if (conn.failure_policy_id != 0) {
                     respond_upstream_connect_failure(loop, conn);
                 } else {
@@ -7011,6 +7026,281 @@ inline bool build_timeout_failure_policy_response(const Connection& conn,
         out,
         out_cap,
         out_len);
+}
+
+template <typename Loop>
+inline bool validated_preconnect_failure_owner_is_stable(Loop* loop,
+                                                         const Connection& conn,
+                                                         ValidatedPreconnectFailureSite site) {
+    if constexpr (!requires(const Loop* candidate) {
+                      candidate->backend.send_state[0];
+                      candidate->backend.upstream_send_state[0];
+                  }) {
+        return false;
+    } else {
+        const RouteConfig* config = conn.request_config;
+        const u16 bundle_id = conn.response_read_deadline_bundle_id;
+        if (loop == nullptr || conn.id >= Loop::kMaxConns || conn.fd < 0 || config == nullptr ||
+            conn.state != ConnState::Proxying || conn.protocol != ConnProtocol::Http11 ||
+            conn.tls_active || conn.h2 != nullptr || conn.req_start_us == 0 || conn.epoch_held ||
+            conn.response_read_deadline_state != ResponseReadDeadlineState::Validated ||
+            conn.response_read_deadline_owner_generation == 0 ||
+            conn.response_read_deadline_owner_generation !=
+                conn.response_read_deadline_generation ||
+            conn.response_read_deadline_upstream_episode != 0 ||
+            conn.response_read_deadline_progress_generation != 0 ||
+            conn.response_read_deadline_progress_episode != 0 ||
+            conn.response_read_deadline_progress_bytes != 0 ||
+            conn.response_read_deadline_post_commit_phase !=
+                ResponseReadDeadlinePostCommitPhase::None ||
+            conn.response_read_deadline_first_batch ||
+            conn.response_read_deadline_send_owner_active ||
+            conn.response_read_deadline_send_close_target_owned ||
+            conn.response_read_deadline_send_close_cancel_owned ||
+            conn.response_read_deadline_profile == ResponseReadDeadlineProfile::None ||
+            conn.response_read_deadline_method != conn.req_method ||
+            !response_read_deadline_route_method_matches(
+                conn.req_method, conn.response_read_deadline_route_method) ||
+            !config->policy_bundle_id_is_valid(bundle_id))
+            return false;
+        const auto& bundle = config->policy_bundles[bundle_id - 1];
+        if (!response_read_timeout_seconds_valid(bundle.response_read_timeout_seconds) ||
+            bundle.response_read_timeout_seconds != conn.response_read_deadline_seconds ||
+            bundle.response_buffering != conn.response_read_deadline_buffering ||
+            bundle.response_policy_id != conn.response_policy_id ||
+            bundle.failure_policy_id != conn.failure_policy_id ||
+            bundle.timeout_failure_policy_id != conn.timeout_failure_policy_id ||
+            !config->response_policy_id_is_valid(bundle.response_policy_id) ||
+            !config->failure_policy_id_is_valid(bundle.failure_policy_id) ||
+            !config->timeout_failure_policy_id_is_valid(bundle.timeout_failure_policy_id) ||
+            !complete_content_length_request_policy_owner_is_stable(
+                conn, conn.response_read_deadline_upload))
+            return false;
+        const auto& response = config->response_policies[bundle.response_policy_id - 1];
+        const auto& failure = config->failure_policies[bundle.failure_policy_id - 1];
+        const auto& timeout = config->failure_policies[bundle.timeout_failure_policy_id - 1];
+        if (!response_policy_spec_valid(response) || !forward_failure_policy_spec_valid(failure) ||
+            !forward_timeout_failure_policy_spec_valid(timeout) ||
+            response.version != ResponsePolicyVersion::Http11 ||
+            response.framing != ResponsePolicyFraming::ContentLength ||
+            response.connection != ResponsePolicyConnection::Request ||
+            failure.version != ForwardFailurePolicyVersion::Http11 ||
+            failure.status_code != kStatusBadGateway ||
+            failure.connection != ForwardFailurePolicyConnection::Request ||
+            timeout.version != ForwardFailurePolicyVersion::Http11 ||
+            timeout.connection != ForwardFailurePolicyConnection::Request)
+            return false;
+        RouteParam params[kMaxRouteParams]{};
+        u32 param_count = 0;
+        const u8 method_key = route_method_key(static_cast<LogHttpMethod>(conn.req_method));
+        const RouteEntry* route = config->match_canonical(
+            conn.req_path_canon, method_key, params, &param_count, kMaxRouteParams);
+        if (route == nullptr || route->action != RouteAction::JitHandler || route->fn == nullptr ||
+            route->needs_req_body || route->rate_limit.count != 0 ||
+            route->throttle_down_bps != 0 || route->ws_terminate ||
+            route->preflight_forward_policy_bundle_id != bundle_id ||
+            route->method != conn.response_read_deadline_route_method ||
+            conn.upstream_idx >= config->upstream_count ||
+            config->upstreams[conn.upstream_idx].addr_count != 1 ||
+            config->upstreams[conn.upstream_idx].addrs[0].sin_family != AF_INET ||
+            config->upstreams[conn.upstream_idx].max_inflight != 0 || conn.upstream_attempts != 1 ||
+            conn.upstream_backend_idx != 0 || !valid_upstream_episode(conn.upstream_episode) ||
+            conn.upstream_episode_quarantined || conn.upstream_reused || conn.upstream_slot_held ||
+            conn.upstream_abandoned || conn.upstream_keep_alive || conn.request_upload_complete ||
+            conn.upstream_request_incomplete || conn.proxy_resp_started ||
+            conn.resp_body_sent != 0 || conn.send_progress != 0 || conn.send_armed ||
+            conn.on_send != nullptr || conn.upstream_send_armed || conn.upstream_recv_armed ||
+            conn.upstream_recv_paused_for_send || conn.upstream_recv_pause_cancel_pending ||
+            conn.upstream_recv_pause_rearm_pending || conn.upstream_recv_cancel_inflight ||
+            conn.upstream_retirement_active || conn.upstream_retirement_target_owned != 0 ||
+            conn.upstream_retirement_cancel_owned != 0 ||
+            conn.upstream_retirement_cancel_retry != 0 || conn.upstream_close_episode != 0 ||
+            conn.upstream_close_target_owned != 0 || conn.upstream_close_cancel_owned != 0 ||
+            conn.upstream_close_pause_cancel_owned || conn.idle_return_fd >= 0 ||
+            conn.idle_return_config != nullptr || conn.close_after_idle_return ||
+            conn.request_policy_body_pending || conn.pending_forward_upstream_id != 0 ||
+            conn.pending_forward_request_policy_id != 0 ||
+            conn.pending_forward_response_policy_id != 0 ||
+            conn.pending_forward_failure_policy_id != 0 ||
+            conn.pending_forward_timeout_failure_policy_id != 0 || conn.target_transform_recorded ||
+            conn.req_path_overridden || conn.req_header_override_count != 0 ||
+            conn.req_header_override_overflow || conn.resp_header_mutation_count != 0 ||
+            conn.resp_header_mutation_pending_count != 0 ||
+            conn.resp_header_mutation_pending_overflow || conn.resp_header_mutation_overflow ||
+            conn.response_mutations_snapshotted || conn.retry_req_send_len != 0 ||
+            conn.pipeline_depth != 0 || conn.pipeline_stash_len != 0 ||
+            conn.response_header_buf.is_released() || !conn.response_header_buf.valid() ||
+            conn.response_header_buf.len() != 0 ||
+            loop->backend.send_state[conn.id].remaining != 0 ||
+            loop->backend.upstream_send_state[conn.id].remaining != 0)
+            return false;
+        const bool complete_buffering = conn.response_read_deadline_buffering ==
+                                        ForwardResponseBufferingMode::CompleteContentLength;
+        const bool fixed_upload =
+            conn.response_read_deadline_profile ==
+            ResponseReadDeadlineProfile::FixedContentLengthUploadNonHeadContentLengthZero;
+        if (!response_read_deadline_persistence_owner_is_stable(conn,
+                                                                conn.response_read_deadline_upload))
+            return false;
+        if (conn.response_read_deadline_profile == ResponseReadDeadlineProfile::HeaderOnlyHead) {
+            if (conn.req_method != static_cast<u8>(LogHttpMethod::Head) ||
+                conn.req_client_has_content_length || conn.req_body_mode != BodyMode::None ||
+                conn.req_body_remaining != 0 || conn.request_body_fully_buffered ||
+                conn.req_body_streamed || !conn.response_policy_suppress_body ||
+                !conn.failure_policy_suppress_body ||
+                response.head_mode != ResponsePolicyHeadMode::SuppressBody ||
+                failure.head_mode != FailurePolicyHeadMode::SuppressBody ||
+                timeout.head_mode != FailurePolicyHeadMode::SuppressBody)
+                return false;
+        } else if (conn.response_read_deadline_profile ==
+                   ResponseReadDeadlineProfile::BodylessNonHeadContentLengthZero) {
+            if (!response_read_deadline_non_head_method_admitted(conn.req_method) ||
+                conn.req_client_has_content_length || conn.req_body_mode != BodyMode::None ||
+                conn.req_body_remaining != 0 || conn.request_body_fully_buffered ||
+                conn.req_body_streamed || conn.response_policy_suppress_body ||
+                conn.failure_policy_suppress_body ||
+                response.head_mode != ResponsePolicyHeadMode::Reject ||
+                failure.head_mode != FailurePolicyHeadMode::Reject ||
+                timeout.head_mode != FailurePolicyHeadMode::Reject)
+                return false;
+        } else if (fixed_upload) {
+            const auto& proof = conn.response_read_deadline_upload;
+            ResponseReadDeadlineFixedUploadRequest rewritten{};
+            const u16 route_index = static_cast<u16>(route - config->routes);
+            if (!complete_buffering || proof.handler_generation == 0 ||
+                proof.handler_generation != conn.handler_gen || proof.route_index != route_index ||
+                proof.route_fn != route->fn || proof.upstream_id != conn.upstream_idx ||
+                proof.request_policy_id != conn.request_policy_id || proof.raw_header_end == 0 ||
+                proof.raw_content_length == 0 ||
+                proof.raw_total_length != proof.raw_header_end + proof.raw_content_length ||
+                proof.rewritten_header_end == 0 ||
+                proof.rewritten_total_length !=
+                    proof.rewritten_header_end + proof.raw_content_length ||
+                proof.expected_upload_length != proof.rewritten_total_length ||
+                proof.upload_episode != 0 || proof.downstream_close ||
+                conn.request_policy_id != static_cast<u16>(RequestPolicyId::Http11FixedStrip) ||
+                !inspect_response_read_deadline_fixed_upload_request(conn, &rewritten) ||
+                rewritten.header_end != proof.rewritten_header_end ||
+                rewritten.content_length != proof.raw_content_length ||
+                rewritten.total_length != proof.rewritten_total_length ||
+                conn.req_header_end != proof.rewritten_header_end ||
+                conn.req_content_length != proof.raw_content_length ||
+                conn.req_initial_send_len != proof.rewritten_total_length ||
+                conn.recv_buf.len() != proof.rewritten_total_length ||
+                conn.req_body_mode != BodyMode::ContentLength || conn.req_body_remaining != 0 ||
+                !conn.request_body_fully_buffered || conn.req_body_streamed ||
+                conn.response_policy_suppress_body || conn.failure_policy_suppress_body ||
+                response.head_mode != ResponsePolicyHeadMode::Reject ||
+                failure.head_mode != FailurePolicyHeadMode::Reject ||
+                timeout.head_mode != FailurePolicyHeadMode::Reject)
+                return false;
+        } else {
+            return false;
+        }
+        const bool fixed_upload_recv_exception =
+            fixed_upload && conn.on_recv == &on_request_policy_body_recvd<Loop> && conn.recv_armed;
+        const u32 downstream_pending = conn.recv_armed ? 1u : 0u;
+        if (site == ValidatedPreconnectFailureSite::SocketCreate) {
+            if (conn.upstream_fd >= 0 || conn.on_upstream_recv != nullptr ||
+                conn.on_upstream_send != nullptr || conn.upstream_connect_armed ||
+                (conn.on_recv != nullptr && !fixed_upload_recv_exception) ||
+                (conn.recv_armed && !fixed_upload_recv_exception))
+                return false;
+        } else if (conn.upstream_fd < 0 || conn.on_upstream_send != &on_upstream_connected<Loop> ||
+                   conn.on_upstream_recv != nullptr || conn.on_recv != nullptr || conn.recv_armed ||
+                   conn.upstream_connect_armed) {
+            return false;
+        }
+        return conn.pending_ops == downstream_pending;
+    }
+}
+
+template <typename Loop>
+inline void respond_validated_preconnect_failure(Loop* loop,
+                                                 Connection& conn,
+                                                 ValidatedPreconnectFailureSite site) {
+    const auto fail_closed = [&]() { loop->close_conn(conn); };
+    if (!validated_preconnect_failure_owner_is_stable(loop, conn, site)) {
+        fail_closed();
+        return;
+    }
+
+    u8 scratch[SlicePool::kSliceSize];
+    u32 response_len = 0;
+    if (!build_failure_policy_response(conn,
+                                       *conn.request_config,
+                                       conn.failure_policy_suppress_body,
+                                       scratch,
+                                       sizeof(scratch),
+                                       &response_len) ||
+        response_len == 0 || response_len > conn.response_header_buf.capacity()) {
+        fail_closed();
+        return;
+    }
+
+    // Everything above is read-only, including serialization. There is no
+    // connect CQE owner at either site, so the never-armed deadline and local fd
+    // can now be neutralized without a tombstone or health episode.
+    if constexpr (requires(Loop* candidate, Connection& c) {
+                      candidate->disarm_response_read_deadline(c);
+                  }) {
+        loop->disarm_response_read_deadline(conn);
+    } else {
+        fail_closed();
+        return;
+    }
+    conn.clear_slots();
+    conn.upstream_abandoned = true;
+    conn.upstream_keep_alive = false;
+    conn.upstream_start_us = 0;
+    (void)detach_upstream_close(loop, conn);
+    release_upstream_slot(loop, conn);
+    conn.response_header_buf.reset();
+    if (conn.response_header_buf.write(scratch, response_len) != response_len) {
+        fail_closed();
+        return;
+    }
+    conn.keep_alive = conn.keep_alive && conn.req_client_keep_alive;
+    conn.resp_status = kStatusBadGateway;
+    conn.resp_body_mode = BodyMode::None;
+    conn.resp_body_remaining = 0;
+    conn.resp_body_sent = response_len;
+    conn.transition_to_sending(&on_validated_preconnect_failure_sent<Loop>);
+    if constexpr (requires(Loop* candidate, Connection& c, const u8* data, u32 len) {
+                      candidate->submit_staged_local_response(c, data, len);
+                  }) {
+        if (!loop->submit_staged_local_response(
+                conn, conn.response_header_buf.data(), conn.response_header_buf.len()))
+            fail_closed();
+    } else {
+        fail_closed();
+    }
+}
+
+template <typename Loop>
+void on_validated_preconnect_failure_sent(void* lp, Connection& conn, IoEvent ev) {
+    auto* loop = static_cast<Loop*>(lp);
+    const u32 response_len = conn.response_header_buf.len();
+    if (ev.type != IoEventType::Send || ev.result <= 0 ||
+        static_cast<u32>(ev.result) != response_len || response_len == 0 ||
+        conn.response_read_deadline_state != ResponseReadDeadlineState::None ||
+        conn.upstream_fd >= 0 || conn.on_send != &on_validated_preconnect_failure_sent<Loop>) {
+        loop->close_conn(conn);
+        return;
+    }
+    conn.clear_slots();
+    on_request_complete(loop, conn, conn.resp_status, response_len);
+    loop->epoch_leave();
+    conn.response_header_buf.reset();
+    conn.send_buf.reset();
+    if (loop->is_draining() || !conn.keep_alive) {
+        loop->close_conn(conn);
+        return;
+    }
+    conn.pipeline_depth = 0;
+    conn.recv_buf.reset();
+    conn.transition_to_reading_header(&on_header_received<Loop>);
+    if (!loop->submit_recv(conn)) loop->close_conn(conn);
 }
 
 template <typename Loop>

@@ -17,6 +17,9 @@ struct FaultState {
     bool mprotect_fail = false;
 
     int fake_socket_fd = -1;
+    int socket_failures = 0;
+    int iouring_connect_submit_failures = 0;
+    int iouring_staged_send_submit_failures = 0;
 
     int recv_fd = -1;
     int recv_eintrs = 0;
@@ -141,6 +144,16 @@ public:
 class ScopedFakeSocket : private ScopedFaultState {
 public:
     explicit ScopedFakeSocket(int fd);
+};
+
+class ScopedSocketFailure : private ScopedFaultState {
+public:
+    explicit ScopedSocketFailure(int failures = 1);
+};
+
+class ScopedIoUringSubmitFailure : private ScopedFaultState {
+public:
+    ScopedIoUringSubmitFailure(int connect_failures, int staged_send_failures = 0);
 };
 
 class ScopedRecvData : private ScopedFaultState {

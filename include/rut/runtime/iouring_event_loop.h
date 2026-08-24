@@ -34,6 +34,21 @@
 
 namespace rut {
 
+namespace detail {
+
+// Optional test-binary hook. Production binaries leave this weak symbol
+// unresolved, so it cannot publish an owner or alter the event-loop layout.
+[[gnu::weak]] bool test_fail_iouring_submit(u8 operation) noexcept;
+
+inline bool injected_iouring_submit_failure(u8 operation) noexcept {
+    return test_fail_iouring_submit != nullptr && test_fail_iouring_submit(operation);
+}
+
+inline constexpr u8 kTestIoUringConnectSubmit = 1;
+inline constexpr u8 kTestIoUringStagedSendSubmit = 2;
+
+}  // namespace detail
+
 // IoUringEventLoop — concrete, non-template event loop for io_uring backend.
 //
 // io_uring is asynchronous: the kernel may still reference user buffers
@@ -876,7 +891,11 @@ public:
             c,
             src,
             len,
-            [&]() { return submit_send_raw(c, src, len); },
+            [&]() {
+                return !detail::injected_iouring_submit_failure(
+                           detail::kTestIoUringStagedSendSubmit) &&
+                       submit_send_raw(c, src, len);
+            },
             [&]() { return backend.flush_pending_nonblocking(); });
     }
 
@@ -1893,6 +1912,8 @@ public:
     }
 
     bool submit_connect_impl(Connection& c, const void* addr, u32 addr_len) {
+        if (detail::injected_iouring_submit_failure(detail::kTestIoUringConnectSubmit))
+            return false;
         if (backend.add_connect(c.upstream_fd, c.id, addr, addr_len, c.upstream_episode)) {
             c.pending_ops++;
             c.upstream_connect_armed = true;

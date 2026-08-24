@@ -402,6 +402,16 @@ ScopedFakeSocket::ScopedFakeSocket(int fd) {
     g_state.fake_socket_fd = fd;
 }
 
+ScopedSocketFailure::ScopedSocketFailure(int failures) {
+    g_state.socket_failures = failures;
+}
+
+ScopedIoUringSubmitFailure::ScopedIoUringSubmitFailure(int connect_failures,
+                                                       int staged_send_failures) {
+    g_state.iouring_connect_submit_failures = connect_failures;
+    g_state.iouring_staged_send_submit_failures = staged_send_failures;
+}
+
 ScopedRecvData::ScopedRecvData(int fd, const char* data, size_t len, int eintrs) {
     g_state.recv_fd = fd;
     g_state.recv_eintrs = eintrs;
@@ -526,6 +536,22 @@ uint64_t ScopedHeldEpollEvent::captured_data() const {
 
 }  // namespace rut::test_fault
 
+namespace rut::detail {
+
+bool test_fail_iouring_submit(u8 operation) noexcept {
+    auto& fault = test_fault::state();
+    int* remaining = nullptr;
+    if (operation == 1)
+        remaining = &fault.iouring_connect_submit_failures;
+    else if (operation == 2)
+        remaining = &fault.iouring_staged_send_submit_failures;
+    if (remaining == nullptr || *remaining <= 0) return false;
+    --*remaining;
+    return true;
+}
+
+}  // namespace rut::detail
+
 extern "C" void* mmap(void* addr, size_t len, int prot, int flags, int fd, off_t offset) {
     pthread_once(&rut::test_fault::g_syscall_once, rut::test_fault::resolve_syscalls);
     auto& state = rut::test_fault::state();
@@ -557,6 +583,11 @@ extern "C" int mprotect(void* addr, size_t len, int prot) {
 extern "C" int socket(int domain, int type, int protocol) {
     pthread_once(&rut::test_fault::g_syscall_once, rut::test_fault::resolve_syscalls);
     auto& state = rut::test_fault::state();
+    if (state.socket_failures > 0 && domain == AF_INET && (type & SOCK_STREAM) == SOCK_STREAM) {
+        --state.socket_failures;
+        errno = EMFILE;
+        return -1;
+    }
     if (state.fake_socket_fd >= 0 && domain == AF_INET && (type & SOCK_STREAM) == SOCK_STREAM) {
         int fd = state.fake_socket_fd;
         state.fake_socket_fd = -1;
