@@ -18682,6 +18682,365 @@ route "/" { return forward(backend) }
     }
 }
 
+TEST(route, public_ordinary_source_unmatched_representation200_wire_iouring) {
+    using namespace rut;
+    if (!iouring_socket_live()) SKIP("io_uring async socket ops unavailable in this environment");
+
+    static constexpr char kSource[] = R"rut(
+unmatched { return local_response({
+  version: "HTTP/1.1", status: 200, reason: "OK", server: "nginx/1.29.7",
+  date: "current", content_type: "text/plain", connection: "request",
+  head_mode: "suppress_body", body: b"successor-static"
+}) }
+listen :0
+route GET "/compiled-sentinel" { return 204 }
+)rut";
+    static constexpr char kExpectedKeepAlive[] =
+        "HTTP/1.1 200 OK\r\n"
+        "Server: nginx/1.29.7\r\n"
+        "Date: XXXXXXXXXXXXXXXXXXXXXXXXXXXXX\r\n"
+        "Content-Type: text/plain\r\n"
+        "Content-Length: 16\r\n"
+        "Connection: keep-alive\r\n\r\n"
+        "successor-static";
+    static constexpr char kExpectedClose[] =
+        "HTTP/1.1 200 OK\r\n"
+        "Server: nginx/1.29.7\r\n"
+        "Date: XXXXXXXXXXXXXXXXXXXXXXXXXXXXX\r\n"
+        "Content-Type: text/plain\r\n"
+        "Content-Length: 16\r\n"
+        "Connection: close\r\n\r\n"
+        "successor-static";
+    static constexpr char kExpectedHeadClose[] =
+        "HTTP/1.1 200 OK\r\n"
+        "Server: nginx/1.29.7\r\n"
+        "Date: XXXXXXXXXXXXXXXXXXXXXXXXXXXXX\r\n"
+        "Content-Type: text/plain\r\n"
+        "Content-Length: 16\r\n"
+        "Connection: close\r\n\r\n";
+    static_assert(sizeof("successor-static") - 1u == 16u);
+
+    struct TempSource {
+        char path[64] = "/tmp/rut_representation200_wire_XXXXXX";
+        i32 fd = -1;
+
+        bool create() {
+            fd = mkstemp(path);
+            if (fd < 0) return false;
+            u32 written = 0;
+            while (written < sizeof(kSource) - 1u) {
+                const ssize_t n = write(fd, kSource + written, sizeof(kSource) - 1u - written);
+                if (n < 0 && errno == EINTR) continue;
+                if (n <= 0) return false;
+                written += static_cast<u32>(n);
+            }
+            if (close(fd) != 0) return false;
+            fd = -1;
+            return true;
+        }
+
+        ~TempSource() {
+            if (fd >= 0) close(fd);
+            unlink(path);
+        }
+    } source;
+    REQUIRE(source.create());
+
+    LoadedProgram program{};
+    struct ProgramGuard {
+        LoadedProgram& program;
+        bool armed = true;
+        ~ProgramGuard() {
+            if (armed) program.destroy();
+        }
+    } program_guard{program};
+    LoadError load_error{};
+    const bool loaded = load_rut_program(source.path, program, load_error, jit::OptLevel::O0);
+    char load_message[512]{};
+    if (!loaded) format_load_error(load_error, load_message, sizeof(load_message));
+    REQUIRE_MSG(loaded, load_message);
+
+    // load_rut_program is the production source path: lexer/parser, HIR/MIR/RIR,
+    // codegen/JIT, transactional RouteConfig population, and owned policy bytes.
+    REQUIRE(program.jit_inited);
+    REQUIRE(program.has_listener);
+    CHECK_EQ(program.listener.port, 0u);
+    REQUIRE_EQ(program.rir.module.func_count, 1u);
+    REQUIRE_EQ(program.rir.module.upstream_count, 0u);
+    REQUIRE_EQ(program.rir.module.strict_local_response_policy_count, 1u);
+    CHECK_EQ(program.rir.module.unmatched_policy_ids[kRouteMethodAny], 1u);
+    REQUIRE_EQ(program.config.route_count, 1u);
+    REQUIRE_EQ(program.config.upstream_count, 0u);
+    REQUIRE_EQ(program.config.strict_local_response_policy_count, 1u);
+    CHECK_EQ(program.config.unmatched_policy_ids[kRouteMethodAny], 1u);
+    REQUIRE(program.config.unmatched_policy_table_is_valid());
+    REQUIRE(program.config.strict_local_response_policy_id_is_owned(1u));
+    const RouteEntry* sentinel =
+        program.config.match(reinterpret_cast<const u8*>("/compiled-sentinel"),
+                             sizeof("/compiled-sentinel") - 1u,
+                             kRouteMethodGet);
+    REQUIRE(sentinel != nullptr);
+    CHECK_EQ(sentinel->action, RouteAction::JitHandler);
+    CHECK_NE(sentinel->fn, nullptr);
+    CHECK_EQ(program.config.match(
+                 reinterpret_cast<const u8*>("/static"), sizeof("/static") - 1u, kRouteMethodGet),
+             nullptr);
+    const auto& rir_policy = program.rir.module.strict_local_response_policies[0];
+    const auto& policy = program.config.strict_local_response_policies[0];
+    CHECK_EQ(policy.version, StrictLocalResponseVersion::Http11);
+    CHECK_EQ(policy.status_code, 200u);
+    CHECK_EQ(policy.date, StrictLocalResponseDate::Current);
+    CHECK_EQ(policy.connection, StrictLocalResponseConnection::Request);
+    CHECK_EQ(policy.head_mode, StrictLocalResponseHeadMode::SuppressBody);
+    CHECK_EQ(strict_local_response_profile(policy.status_code),
+             StrictLocalResponseProfile::Representation200);
+    CHECK(policy.reason.eq({"OK", 2}));
+    CHECK(policy.server.eq({"nginx/1.29.7", 12}));
+    CHECK(policy.content_type.eq({"text/plain", 10}));
+    CHECK(policy.body.eq({"successor-static", 16}));
+    CHECK_NE(policy.reason.ptr, rir_policy.reason.ptr);
+    CHECK_NE(policy.server.ptr, rir_policy.server.ptr);
+    CHECK_NE(policy.content_type.ptr, rir_policy.content_type.ptr);
+    CHECK_NE(policy.body.ptr, rir_policy.body.ptr);
+
+    Shard<IoUringEventLoop> shard;
+    struct ShardGuard {
+        Shard<IoUringEventLoop>& shard;
+        bool initialized = false;
+        bool spawned = false;
+        ~ShardGuard() {
+            if (spawned) {
+                shard.stop();
+                shard.join();
+            }
+            if (initialized) {
+                if (shard.loop != nullptr) shard.loop->force_close_all();
+                shard.shutdown();
+            }
+        }
+    } shard_guard{shard};
+    struct FdGuard {
+        i32 fd = -1;
+        ~FdGuard() {
+            if (fd >= 0) close(fd);
+        }
+    } listen_guard{create_listen_socket(0).value_or(-1)};
+    REQUIRE_GE(listen_guard.fd, 0);
+    const u16 port = get_port(listen_guard.fd);
+    REQUIRE(shard.init(0, listen_guard.fd).has_value());
+    shard_guard.initialized = true;
+    shard.owns_listen_fd = true;
+    listen_guard.fd = -1;
+    shard.route_config = &program.config;
+    shard.active_config = shard.route_config;
+    REQUIRE(shard.loop != nullptr);
+    REQUIRE(shard.init_access_log().has_value());
+    CaptureRing* capture_ring = shard.enable_capture();
+    REQUIRE(capture_ring != nullptr);
+    REQUIRE_EQ(shard.loop->access_log, shard.log_ring);
+    REQUIRE_EQ(shard.loop->capture_ring, capture_ring);
+    REQUIRE(shard.spawn(-1).has_value());
+    shard_guard.spawned = true;
+    REQUIRE_EQ(shard.backend_failure_code(), 0);
+
+    enum class ReadOutcome : u8 { Complete, Timeout, Eof, Error };
+    auto read_exact_until = [](i32 fd,
+                               char* out,
+                               u32 expected_len,
+                               i64 absolute_deadline_ms,
+                               u32* observed_len) -> ReadOutcome {
+        *observed_len = 0;
+        while (*observed_len < expected_len) {
+            const i64 remaining_ms = absolute_deadline_ms - test_mono_ms();
+            if (remaining_ms <= 0) return ReadOutcome::Timeout;
+            const i32 got = recv_timeout(fd,
+                                         out + *observed_len,
+                                         expected_len - *observed_len,
+                                         static_cast<i32>(remaining_ms));
+            if (got > 0) {
+                *observed_len += static_cast<u32>(got);
+                continue;
+            }
+            if (got == 0) return ReadOutcome::Eof;
+            if (got == -EAGAIN || got == -EWOULDBLOCK) return ReadOutcome::Timeout;
+            if (got == -EINTR) continue;
+            return ReadOutcome::Error;
+        }
+        return ReadOutcome::Complete;
+    };
+    auto expect_eof = [](i32 fd, i64 absolute_deadline_ms) {
+        char tail[32];
+        while (test_mono_ms() < absolute_deadline_ms) {
+            const i64 remaining_ms = absolute_deadline_ms - test_mono_ms();
+            if (remaining_ms <= 0) break;
+            const i32 got = recv_timeout(fd, tail, sizeof(tail), static_cast<i32>(remaining_ms));
+            if (got == -EINTR) continue;
+            return got == 0;
+        }
+        return false;
+    };
+    auto exact_normalized_wire = [&](i32 fd, const char* expected, u32 expected_len) {
+        char wire[512]{};
+        if (expected_len > sizeof(wire)) return false;
+        u32 wire_len = 0;
+        if (read_exact_until(fd, wire, expected_len, test_mono_ms() + 5000, &wire_len) !=
+                ReadOutcome::Complete ||
+            wire_len != expected_len || !normalize_public_date(wire, wire_len))
+            return false;
+        return memcmp(wire, expected, expected_len) == 0;
+    };
+
+    static constexpr char kGet[] =
+        "GET /static HTTP/1.1\r\n"
+        "Host: client.example\r\n"
+        "X-Request: get\r\n\r\n";
+    static constexpr char kHead[] =
+        "HEAD /static HTTP/1.1\r\n"
+        "Host: client.example\r\n"
+        "Connection: close\r\n"
+        "X-Request: head\r\n\r\n";
+    static constexpr char kPost[] =
+        "POST /static HTTP/1.1\r\n"
+        "Host: client.example\r\n"
+        "Connection: close\r\n"
+        "X-Request: post\r\n\r\n";
+    static constexpr char kOptions[] =
+        "OPTIONS /static HTTP/1.1\r\n"
+        "Host: client.example\r\n"
+        "Connection: close\r\n"
+        "X-Request: options\r\n\r\n";
+
+    struct ClientGuard {
+        i32 fd = -1;
+        ~ClientGuard() {
+            if (fd >= 0) close(fd);
+        }
+    } sequential{connect_to(port)};
+    REQUIRE_GE(sequential.fd, 0);
+    set_socket_timeouts(sequential.fd, 5);
+    REQUIRE(send_all(sequential.fd, kGet, sizeof(kGet) - 1u));
+    REQUIRE(
+        exact_normalized_wire(sequential.fd, kExpectedKeepAlive, sizeof(kExpectedKeepAlive) - 1u));
+    char quiet[32];
+    REQUIRE_EQ(recv_timeout(sequential.fd, quiet, sizeof(quiet), 200), -EAGAIN);
+    REQUIRE(shard.loop->is_running());
+    REQUIRE_EQ(shard.backend_failure_code(), 0);
+
+    REQUIRE(send_all(sequential.fd, kHead, sizeof(kHead) - 1u));
+    REQUIRE(
+        exact_normalized_wire(sequential.fd, kExpectedHeadClose, sizeof(kExpectedHeadClose) - 1u));
+    REQUIRE(expect_eof(sequential.fd, test_mono_ms() + 3000));
+    REQUIRE(shard.loop->is_running());
+    REQUIRE_EQ(shard.backend_failure_code(), 0);
+    REQUIRE_EQ(close(sequential.fd), 0);
+    sequential.fd = -1;
+
+    ClientGuard post{connect_to(port)};
+    REQUIRE_GE(post.fd, 0);
+    set_socket_timeouts(post.fd, 5);
+    REQUIRE(send_all(post.fd, kPost, sizeof(kPost) - 1u));
+    REQUIRE(exact_normalized_wire(post.fd, kExpectedClose, sizeof(kExpectedClose) - 1u));
+    REQUIRE(expect_eof(post.fd, test_mono_ms() + 3000));
+    REQUIRE(shard.loop->is_running());
+    REQUIRE_EQ(shard.backend_failure_code(), 0);
+    REQUIRE_EQ(close(post.fd), 0);
+    post.fd = -1;
+
+    ClientGuard options{connect_to(port)};
+    REQUIRE_GE(options.fd, 0);
+    set_socket_timeouts(options.fd, 5);
+    REQUIRE(send_all(options.fd, kOptions, sizeof(kOptions) - 1u));
+    REQUIRE(exact_normalized_wire(options.fd, kExpectedClose, sizeof(kExpectedClose) - 1u));
+    REQUIRE(expect_eof(options.fd, test_mono_ms() + 3000));
+    REQUIRE(shard.loop->is_running());
+    REQUIRE_EQ(shard.backend_failure_code(), 0);
+    REQUIRE_EQ(close(options.fd), 0);
+    options.fd = -1;
+
+    shard.stop();
+    shard.join();
+    shard_guard.spawned = false;
+    REQUIRE_EQ(shard.backend_failure_code(), 0);
+    CHECK_FALSE(shard.loop->is_running());
+    CHECK_EQ(shard.loop->active_count(), 0u);
+    CHECK_EQ(shard.loop->pending_free_count, 0u);
+    CHECK_EQ(shard.loop->pool.in_use(), 0u);
+    CHECK_EQ(shard.upstream->idle_count.load(std::memory_order_acquire), 0u);
+    CHECK_EQ(shard.upstream->free_top, UpstreamPool::kMaxConns);
+    CHECK_EQ(shard.shard_metrics.connections_total, 3u);
+    CHECK_EQ(shard.shard_metrics.connections_active, 0u);
+    CHECK_EQ(shard.shard_metrics.connections_closed, 3u);
+    CHECK_EQ(shard.shard_metrics.requests_total, 4u);
+    CHECK_EQ(shard.shard_metrics.requests_active, 0u);
+    CHECK_EQ(shard.shard_metrics.request_latency.count, 4u);
+    const u64 final_epoch = shard.epoch.epoch.load(std::memory_order_acquire);
+    CHECK_EQ(final_epoch, 8u);
+    CHECK_EQ(final_epoch % 2u, 0u);
+
+    static constexpr struct {
+        LogHttpMethod method;
+        const char* request;
+        u32 request_len;
+        u32 response_len;
+    } kAccounting[] = {
+        {LogHttpMethod::Get, kGet, sizeof(kGet) - 1u, sizeof(kExpectedKeepAlive) - 1u},
+        {LogHttpMethod::Head, kHead, sizeof(kHead) - 1u, sizeof(kExpectedHeadClose) - 1u},
+        {LogHttpMethod::Post, kPost, sizeof(kPost) - 1u, sizeof(kExpectedClose) - 1u},
+        {LogHttpMethod::Options, kOptions, sizeof(kOptions) - 1u, sizeof(kExpectedClose) - 1u},
+    };
+    REQUIRE_EQ(shard.log_ring->available(), 4u);
+    REQUIRE_EQ(capture_ring->available(), 4u);
+    for (const auto& expected : kAccounting) {
+        AccessLogEntry access{};
+        REQUIRE(shard.log_ring->pop(access));
+        CHECK_EQ(access.status, 200u);
+        CHECK_EQ(access.method, static_cast<u8>(expected.method));
+        CHECK_EQ(access.resp_size, expected.response_len);
+        CHECK_EQ(strcmp(access.path, "/static"), 0);
+        CHECK_EQ(access.upstream[0], '\0');
+
+        CaptureEntry capture{};
+        REQUIRE(capture_ring->pop(capture));
+        CHECK_EQ(capture.resp_status, 200u);
+        CHECK_EQ(capture.method, static_cast<u8>(expected.method));
+        CHECK_EQ(capture.req_content_length, 0u);
+        CHECK_EQ(capture.resp_content_length, expected.response_len);
+        REQUIRE_EQ(capture.raw_header_len, expected.request_len);
+        CHECK_EQ(memcmp(capture.raw_headers, expected.request, expected.request_len), 0);
+        CHECK_EQ(capture.upstream_name[0], '\0');
+    }
+    AccessLogEntry no_access{};
+    CaptureEntry no_capture{};
+    CHECK_FALSE(shard.log_ring->pop(no_access));
+    CHECK_FALSE(capture_ring->pop(no_capture));
+
+    bool all_connections_settled = true;
+    for (u32 id = 0; id < IoUringEventLoop::kMaxConns; id++) {
+        const Connection& conn = shard.loop->conns[id];
+        all_connections_settled &=
+            conn.fd == -1 && conn.upstream_fd == -1 && conn.pending_ops == 0 &&
+            conn.upstream_attempts == 0 && !conn.upstream_connect_armed &&
+            !conn.upstream_send_armed && !conn.upstream_recv_armed &&
+            !conn.upstream_retirement_active && conn.upstream_retirement_target_owned == 0 &&
+            conn.upstream_retirement_cancel_owned == 0 && conn.upstream_close_target_owned == 0 &&
+            conn.upstream_close_cancel_owned == 0 && !conn.upstream_slot_held &&
+            conn.pipeline_depth == 0 && conn.pipeline_stash_len == 0 && conn.recv_buf.len() == 0 &&
+            conn.send_buf.len() == 0 &&
+            (!conn.response_header_buf.valid() || conn.response_header_buf.len() == 0) &&
+            conn.response_read_deadline_owner_is_neutral() &&
+            conn.http1_prebuilt_response_proof_is_neutral();
+    }
+    CHECK(all_connections_settled);
+
+    // The production socket does not offer a deterministic partial-Send seam;
+    // foundation tests cover that callback path. This wire intentionally keeps
+    // the production scheduler and backend unchanged.
+    shard.shutdown();
+    shard_guard.initialized = false;
+    program.destroy();
+    program_guard.armed = false;
+}
+
 TEST(shard, serves_http2_jit_target_transform_initial_fails_closed) {
     H2TargetTransformJit compiled;
     REQUIRE(compiled.init(/*with_timer=*/false));
