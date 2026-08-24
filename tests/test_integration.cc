@@ -17705,6 +17705,23 @@ route GET "/static" {
     }
 };
 
+// The raw-CQ runner mirrors IoUringEventLoop::run rather than adding a runtime
+// hook. This test-only C++ access shim lets that mirror invoke the exact private
+// deferred-accept phase at its production scheduler position.
+template <typename Tag, typename Tag::Member Member>
+struct ValidatedFailurePrivateMemberAccess {
+    friend typename Tag::Member validated_failure_private_member(Tag) { return Member; }
+};
+
+struct ValidatedFailureRetryDeferredAcceptsTag {
+    using Member = void (IoUringEventLoop::*)();
+    friend Member validated_failure_private_member(ValidatedFailureRetryDeferredAcceptsTag);
+};
+
+template struct ValidatedFailurePrivateMemberAccess<
+    ValidatedFailureRetryDeferredAcceptsTag,
+    &IoUringEventLoop::retry_deferred_accepts>;
+
 // Exact-POST policy-1 sibling for the closed bodyless non-HEAD buffering
 // profile. Keeping it separate leaves the existing GET source and wire as
 // independent evidence.
@@ -24142,6 +24159,15 @@ TEST(route, ordinary_source_validated_failure_late_successor_iouring) {
         bool request_one_f_more = false;
         bool request_one_exact = false;
         bool request_one_admitted = false;
+        bool request_one_continuity_valid = true;
+        bool request_one_owner_live = false;
+        bool deferred_accepts_neutral = false;
+        bool control_state_neutral = false;
+        bool config_state_neutral = false;
+        bool loop_not_draining = false;
+        u32 request_one_recv_generation = UINT32_MAX;
+        u64 request_one_recv_user_data = kInvalidIoUserData;
+        i32 request_one_recv_fd = -1;
         u32 sq_head_before_dispatch = 0;
         u32 sq_tail_before_dispatch = 0;
         u32 sq_pending_before_dispatch = 0;
@@ -24169,6 +24195,8 @@ TEST(route, ordinary_source_validated_failure_late_successor_iouring) {
 
             while (loop->is_running()) {
                 loop->retry_strict_upstream_retirement_cancels();
+                const u32 sq_tail_before_wait =
+                    __atomic_load_n(loop->backend.sq_tail, __ATOMIC_ACQUIRE);
                 const u32 n = loop->backend.wait(
                     events, kMaxEventsPerWait, loop->conns, IoUringEventLoop::kMaxConns);
                 if (loop->backend.failure_code() != 0) {
@@ -24177,9 +24205,17 @@ TEST(route, ordinary_source_validated_failure_late_successor_iouring) {
                 }
 
                 bool failure_batch = false;
+                bool request_one_witness_in_batch = false;
+                u32 request_one_witness_generation = UINT32_MAX;
                 for (u32 i = 0; i < n; i++) {
                     const IoEvent& event = events[i];
-                    if (event.type == IoEventType::Recv && event.result > 0 && event.more != 0) {
+                    if (self->request_one_admitted && event.conn_id == self->conn_id &&
+                        event.type == IoEventType::Recv) {
+                        self->request_one_continuity_valid = false;
+                    }
+                    if (!self->request_one_admitted && event.type == IoEventType::Recv &&
+                        event.result > 0 && event.more != 0 && event.aux == 0 &&
+                        event.upstream_episode == 0) {
                         const Connection& conn = loop->conns[event.conn_id];
                         if (conn.recv_buf.len() == sizeof(kRequestOne) - 1u &&
                             memcmp(conn.recv_buf.data(), kRequestOne, sizeof(kRequestOne) - 1u) ==
@@ -24187,6 +24223,8 @@ TEST(route, ordinary_source_validated_failure_late_successor_iouring) {
                             self->conn_id = event.conn_id;
                             self->request_one_f_more = true;
                             self->request_one_exact = true;
+                            request_one_witness_in_batch = true;
+                            request_one_witness_generation = event.non_upstream_generation;
                         }
                     }
                     if (event.type == IoEventType::UpstreamConnect && event.result < 0 &&
@@ -24205,12 +24243,54 @@ TEST(route, ordinary_source_validated_failure_late_successor_iouring) {
                 }
 
                 loop->dispatch_batch(events, n);
+                (loop->*validated_failure_private_member(
+                    ValidatedFailureRetryDeferredAcceptsTag{}))();
 
-                if (self->conn_id != UINT32_MAX && !failure_batch && self->request_one_exact) {
+                if (self->conn_id != UINT32_MAX && !self->request_one_admitted &&
+                    request_one_witness_in_batch && self->request_one_exact) {
                     const Connection& conn = loop->conns[self->conn_id];
                     self->request_one_admitted = conn.fd >= 0 && conn.upstream_connect_armed &&
                                                  conn.req_start_us != 0 && conn.recv_armed &&
                                                  conn.request_config == self->shard.route_config;
+                    if (self->request_one_admitted) {
+                        self->request_one_recv_generation = request_one_witness_generation;
+                        self->request_one_recv_user_data = encode_non_upstream_user_data(
+                            {self->conn_id,
+                             IoEventType::Recv,
+                             self->request_one_recv_generation});
+                        self->request_one_recv_fd = conn.fd;
+                    }
+                }
+
+                // Once request 1 is admitted, its original multishot Recv must
+                // remain the sole downstream Recv owner until the negative
+                // Connect completion has staged response 1. Inspect every SQE
+                // produced by dispatch: a fresh target Recv or a cancel of the
+                // original user_data invalidates the witness even when the
+                // cancel's own CQE would later be swallowed by backend.wait().
+                if (self->request_one_admitted) {
+                    const u32 sq_tail_after_batch =
+                        __atomic_load_n(loop->backend.sq_tail, __ATOMIC_ACQUIRE);
+                    const u32 mask = *loop->backend.sq_ring_mask;
+                    if (sq_tail_after_batch - sq_tail_before_wait > loop->backend.sq_ring_entries) {
+                        self->request_one_continuity_valid = false;
+                    } else {
+                        for (u32 tail = sq_tail_before_wait; tail != sq_tail_after_batch; ++tail) {
+                            const u32 array_slot = tail & mask;
+                            const u32 sqe_index = loop->backend.sq_array[array_slot];
+                            if (sqe_index >= loop->backend.sq_ring_entries) {
+                                self->request_one_continuity_valid = false;
+                                continue;
+                            }
+                            const io_uring_sqe& sqe = loop->backend.sq_entries[sqe_index];
+                            if (sqe.opcode == IORING_OP_RECV &&
+                                sqe.user_data == self->request_one_recv_user_data)
+                                self->request_one_continuity_valid = false;
+                            if (sqe.opcode == IORING_OP_ASYNC_CANCEL &&
+                                sqe.addr == self->request_one_recv_user_data)
+                                self->request_one_continuity_valid = false;
+                        }
+                    }
                 }
 
                 if (failure_batch) {
@@ -24234,6 +24314,27 @@ TEST(route, ordinary_source_validated_failure_late_successor_iouring) {
                     const auto& send = loop->backend.send_state[self->conn_id];
                     self->staged_response = send.src;
                     self->staged_response_len = send.remaining;
+                    const Connection& conn = loop->conns[self->conn_id];
+                    self->request_one_owner_live =
+                        self->request_one_continuity_valid && conn.fd == self->request_one_recv_fd &&
+                        conn.recv_armed && self->request_one_recv_generation == 0 &&
+                        self->request_one_recv_user_data ==
+                            encode_non_upstream_user_data({self->conn_id,
+                                                           IoEventType::Recv,
+                                                           self->request_one_recv_generation});
+                    self->deferred_accepts_neutral = loop->deferred_accept_count == 0;
+                    self->control_state_neutral =
+                        loop->control == &self->shard.control &&
+                        self->shard.control.pending_config.load(std::memory_order_acquire) ==
+                            nullptr &&
+                        self->shard.control.pending_jit.load(std::memory_order_acquire) == nullptr &&
+                        self->shard.control.pending_capture.load(std::memory_order_acquire) ==
+                            nullptr;
+                    self->config_state_neutral =
+                        loop->config_ptr == &self->shard.active_config &&
+                        self->shard.active_config == self->shard.route_config &&
+                        *loop->config_ptr == self->shard.route_config;
+                    self->loop_not_draining = !loop->is_draining();
                     self->send_staged.store(true, std::memory_order_release);
                     while (!self->release.load(std::memory_order_acquire) && loop->is_running())
                         sched_yield();
@@ -24294,6 +24395,23 @@ TEST(route, ordinary_source_validated_failure_late_successor_iouring) {
     REQUIRE(runner.request_one_f_more);
     REQUIRE(runner.request_one_exact);
     REQUIRE(runner.request_one_admitted);
+    REQUIRE(runner.request_one_continuity_valid);
+    REQUIRE(runner.request_one_owner_live);
+    REQUIRE_EQ(runner.request_one_recv_generation, 0u);
+    REQUIRE_EQ(runner.request_one_recv_user_data,
+               encode_non_upstream_user_data({runner.conn_id, IoEventType::Recv, 0}));
+    REQUIRE_EQ(runner.request_one_recv_fd, shard.loop->conns[runner.conn_id].fd);
+    REQUIRE(runner.deferred_accepts_neutral);
+    REQUIRE(runner.control_state_neutral);
+    REQUIRE(runner.config_state_neutral);
+    REQUIRE(runner.loop_not_draining);
+    REQUIRE_EQ(shard.loop->deferred_accept_count, 0u);
+    REQUIRE_EQ(shard.control.pending_config.load(std::memory_order_acquire), nullptr);
+    REQUIRE_EQ(shard.control.pending_jit.load(std::memory_order_acquire), nullptr);
+    REQUIRE_EQ(shard.control.pending_capture.load(std::memory_order_acquire), nullptr);
+    REQUIRE_EQ(shard.active_config, shard.route_config);
+    REQUIRE_EQ(shard.loop->config_ptr, &shard.active_config);
+    REQUIRE_FALSE(shard.loop->is_draining());
     REQUIRE_LT(runner.connect_result, 0);
 
     auto& backend = shard.loop->backend;
@@ -24324,12 +24442,27 @@ TEST(route, ordinary_source_validated_failure_late_successor_iouring) {
     // io_uring_enter can submit response 1's staged Send while the raw CQ proof
     // below waits for the already-owned multishot Recv.
     REQUIRE(send_all(client.fd, kRequestTwo, sizeof(kRequestTwo) - 1u));
+    REQUIRE_NE(backend.cq_head, nullptr);
+    REQUIRE_NE(backend.cq_tail, nullptr);
+    REQUIRE_NE(backend.cq_ring_mask, nullptr);
+    REQUIRE_NE(backend.cq_entries, nullptr);
+    REQUIRE_NE(backend.buf_base, nullptr);
+    REQUIRE_GT(backend.cq_ring_entries, 0u);
+    REQUIRE_EQ(backend.cq_ring_entries & (backend.cq_ring_entries - 1u), 0u);
+    REQUIRE_EQ(*backend.cq_ring_mask, backend.cq_ring_entries - 1u);
     const u32 raw_head = __atomic_load_n(backend.cq_head, __ATOMIC_ACQUIRE);
     u32 raw_cursor = raw_head;
     u32 raw_request_len = 0;
     char raw_request[sizeof(kRequestTwo)]{};
-    bool raw_more_seen = false;
     bool raw_terminal_seen = false;
+    bool raw_timer_seen = false;
+    static constexpr u32 kRawTimerConnId = 0x00FFFFFEu;
+    const u64 expected_recv_user_data = encode_non_upstream_user_data(
+        {runner.conn_id, IoEventType::Recv, runner.request_one_recv_generation});
+    const u64 expected_timer_user_data =
+        encode_non_upstream_user_data({kRawTimerConnId, IoEventType::Timeout, 0});
+    REQUIRE_NE(expected_recv_user_data, kInvalidIoUserData);
+    REQUIRE_NE(expected_timer_user_data, kInvalidIoUserData);
     const i64 raw_deadline_ms = test_mono_ms() + 5000;
     while (raw_request_len < sizeof(kRequestTwo) - 1u && test_mono_ms() < raw_deadline_ms) {
         const u32 raw_tail = __atomic_load_n(backend.cq_tail, __ATOMIC_ACQUIRE);
@@ -24337,35 +24470,42 @@ TEST(route, ordinary_source_validated_failure_late_successor_iouring) {
         while (raw_cursor != raw_tail) {
             const io_uring_cqe& cqe =
                 backend.cq_entries[raw_cursor & *backend.cq_ring_mask];
-            u32 cqe_conn = UINT32_MAX;
-            u32 cqe_aux = UINT32_MAX;
-            u32 cqe_episode = UINT32_MAX;
-            IoEventType cqe_type = IoEventType::Count;
-            cqe_type = static_cast<IoEventType>(cqe.user_data & 0xFFu);
-            cqe_conn = static_cast<u32>((cqe.user_data >> 8) & 0xFFFFFFu);
-            cqe_aux = static_cast<u32>(cqe.user_data >> 32);
-            cqe_episode = 0;
-            if (cqe_conn == runner.conn_id && cqe_type == IoEventType::Send)
-                FAIL("response 1 Send completed before its SQ submission barrier was released");
-            if (cqe_conn == runner.conn_id && cqe_type == IoEventType::Recv) {
-                REQUIRE_EQ(cqe_aux, 0u);
-                REQUIRE_EQ(cqe_episode, 0u);
+            if (cqe.user_data == expected_recv_user_data) {
+                REQUIRE_FALSE(raw_terminal_seen);
                 REQUIRE_GT(cqe.res, 0);
-                REQUIRE(cqe.flags & IORING_CQE_F_BUFFER);
+                static constexpr u32 kCqeMetadataMask =
+                    (1u << IORING_CQE_BUFFER_SHIFT) - 1u;
+                const bool more = (cqe.flags & IORING_CQE_F_MORE) != 0;
+                const u32 expected_metadata =
+                    IORING_CQE_F_BUFFER | (more ? IORING_CQE_F_MORE : 0u);
+                REQUIRE_EQ(cqe.flags & kCqeMetadataMask, expected_metadata);
                 const u16 buf_id =
                     static_cast<u16>(cqe.flags >> IORING_CQE_BUFFER_SHIFT);
                 REQUIRE_LT(buf_id, kProvidedBufCount);
                 REQUIRE_LE(static_cast<u32>(cqe.res), kProvidedBufSize);
-                REQUIRE_LE(raw_request_len + static_cast<u32>(cqe.res),
-                           sizeof(kRequestTwo) - 1u);
+                const u32 fragment_len = static_cast<u32>(cqe.res);
+                REQUIRE_LE(fragment_len, sizeof(kRequestTwo) - 1u - raw_request_len);
                 const u8* bytes =
                     backend.buf_base + static_cast<u64>(buf_id) * kProvidedBufSize;
-                memcpy(raw_request + raw_request_len, bytes, static_cast<u32>(cqe.res));
-                raw_request_len += static_cast<u32>(cqe.res);
-                if (cqe.flags & IORING_CQE_F_MORE)
-                    raw_more_seen = true;
-                else
-                    raw_terminal_seen = true;
+                REQUIRE_EQ(memcmp(bytes, kRequestTwo + raw_request_len, fragment_len), 0);
+                memcpy(raw_request + raw_request_len, bytes, fragment_len);
+                raw_request_len += fragment_len;
+                if (raw_request_len < sizeof(kRequestTwo) - 1u) REQUIRE(more);
+                if (!more) raw_terminal_seen = true;
+            } else if (cqe.user_data == expected_timer_user_data) {
+                REQUIRE_FALSE(raw_timer_seen);
+                REQUIRE_EQ(cqe.flags, 0u);
+                REQUIRE_EQ(cqe.res, static_cast<i32>(sizeof(backend.timer_ticks_buf)));
+                REQUIRE_GT(backend.timer_ticks_buf, 0u);
+                REQUIRE(backend.timer_read_armed);
+                raw_timer_seen = true;
+            } else {
+                // The raw barrier admits only the original target Recv owner
+                // and the single already-armed timerfd read. This rejects a
+                // target Send, Accept, any cancel sentinel/completion,
+                // upstream traffic, a different connection, and malformed or
+                // unknown user_data without consuming the CQE.
+                FAIL("unexpected CQE at validated-failure raw barrier");
             }
             raw_cursor++;
         }
@@ -24373,7 +24513,6 @@ TEST(route, ordinary_source_validated_failure_late_successor_iouring) {
     }
     REQUIRE_EQ(raw_request_len, sizeof(kRequestTwo) - 1u);
     REQUIRE_EQ(memcmp(raw_request, kRequestTwo, raw_request_len), 0);
-    CHECK(raw_more_seen || raw_terminal_seen);
     REQUIRE_EQ(__atomic_load_n(backend.cq_head, __ATOMIC_ACQUIRE), raw_head);
     REQUIRE_EQ(__atomic_load_n(backend.sq_head, __ATOMIC_ACQUIRE),
                runner.sq_head_after_dispatch);
