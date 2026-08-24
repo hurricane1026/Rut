@@ -24826,6 +24826,737 @@ TEST(route, ordinary_source_validated_failure_late_successor_iouring) {
     CHECK_FALSE(runner.final_health.active_down);
 }
 
+TEST(route, ordinary_source_validated_failure_late_strict_successor_iouring) {
+    using namespace rut;
+    if (!iouring_socket_live()) SKIP("io_uring async socket ops unavailable in this environment");
+
+    static constexpr char kRequestOne[] =
+        "GET /buffered?late=one HTTP/1.1\r\n"
+        "Host: client.example\r\n"
+        "X-Request: one\r\n\r\n";
+    static constexpr char kRequestTwo[] =
+        "GET /buffered?late=two HTTP/1.1\r\n"
+        "Host: client.example\r\n"
+        "Connection: close\r\n"
+        "X-Request: two\r\n\r\n";
+    static constexpr char kExpectedOne[] =
+        "HTTP/1.1 502 Origin Failed\r\n"
+        "Server: buffered-test\r\n"
+        "Date: XXXXXXXXXXXXXXXXXXXXXXXXXXXXX\r\n"
+        "Content-Type: text/plain\r\n"
+        "Content-Length: 16\r\n"
+        "Connection: keep-alive\r\n\r\n"
+        "default failure\n";
+    static constexpr char kExpectedTwo[] =
+        "HTTP/1.1 502 Origin Failed\r\n"
+        "Server: buffered-test\r\n"
+        "Date: XXXXXXXXXXXXXXXXXXXXXXXXXXXXX\r\n"
+        "Content-Type: text/plain\r\n"
+        "Content-Length: 16\r\n"
+        "Connection: close\r\n\r\n"
+        "default failure\n";
+    static_assert(sizeof("default failure\n") - 1u == 16u);
+
+    DeadEndpoint dead;
+    REQUIRE(dead.reserve());
+    i32 accepts_connections = -1;
+    socklen_t accepts_connections_len = sizeof(accepts_connections);
+    REQUIRE_EQ(
+        getsockopt(
+            dead.fd, SOL_SOCKET, SO_ACCEPTCONN, &accepts_connections, &accepts_connections_len),
+        0);
+    REQUIRE_EQ(accepts_connections, 0);
+
+    PublicGetCompleteContentLengthBufferingFixedRequestPolicySourceResources resources;
+    REQUIRE(resources.compile(dead.port));
+    REQUIRE_EQ(resources.rir.module.upstream_count, 1u);
+    REQUIRE(resources.rir.module.upstreams[0].has_address);
+    CHECK_EQ(resources.rir.module.upstreams[0].ip, 0x7F000001u);
+    CHECK_EQ(resources.rir.module.upstreams[0].port, dead.port);
+    REQUIRE_EQ(resources.cfg.upstream_count, 1u);
+    REQUIRE_EQ(resources.cfg.upstreams[0].addr_count, 1u);
+    CHECK_EQ(resources.cfg.upstreams[0].addrs[0].sin_family, AF_INET);
+    CHECK_EQ(ntohl(resources.cfg.upstreams[0].addrs[0].sin_addr.s_addr), 0x7F000001u);
+    CHECK_EQ(ntohs(resources.cfg.upstreams[0].addrs[0].sin_port), dead.port);
+    CHECK_EQ(resources.cfg.upstreams[0].max_inflight, 0u);
+    REQUIRE_EQ(resources.cfg.route_count, 1u);
+    const RouteEntry* forward_route = resources.cfg.match(
+        reinterpret_cast<const u8*>("/buffered"), sizeof("/buffered") - 1u, kRouteMethodGet);
+    REQUIRE(forward_route != nullptr);
+    CHECK_EQ(forward_route->action, RouteAction::JitHandler);
+    CHECK_EQ(forward_route->preflight_forward_policy_bundle_id, 1u);
+    REQUIRE_EQ(resources.cfg.response_policy_count, 1u);
+    REQUIRE_EQ(resources.cfg.failure_policy_count, 2u);
+    REQUIRE_EQ(resources.cfg.policy_bundle_count, 1u);
+    const auto& bundle = resources.cfg.policy_bundles[0];
+    CHECK_EQ(bundle.response_policy_id, 1u);
+    CHECK_EQ(bundle.failure_policy_id, 1u);
+    CHECK_EQ(bundle.timeout_failure_policy_id, 2u);
+    CHECK_EQ(bundle.response_read_timeout_seconds, 1u);
+    CHECK_EQ(bundle.response_buffering, ForwardResponseBufferingMode::CompleteContentLength);
+    CHECK_EQ(resources.cfg.failure_policies[0].status_code, 502u);
+    CHECK_EQ(resources.cfg.failure_policies[1].status_code, 504u);
+    REQUIRE_EQ(resources.rir.module.func_count, 1u);
+    const auto& function = resources.rir.module.functions[0];
+    CHECK_EQ(function.http_method, kRouteMethodGet);
+    CHECK_EQ(function.preflight_forward_policy_bundle_id, 1u);
+    auto const_i32_value = [](const rir::Block& block, rir::ValueId id) -> i32 {
+        for (u32 i = 0; i < block.inst_count; i++) {
+            if (block.insts[i].result == id && block.insts[i].op == rir::Opcode::ConstI32)
+                return block.insts[i].imm.i32_val;
+        }
+        return -1;
+    };
+    u32 exact_forward_count = 0;
+    for (u32 bi = 0; bi < function.block_count; bi++) {
+        const auto& block = function.blocks[bi];
+        for (u32 ii = 0; ii < block.inst_count; ii++) {
+            const auto& inst = block.insts[ii];
+            if (inst.op != rir::Opcode::RetForwardBundle) continue;
+            exact_forward_count++;
+            REQUIRE_EQ(inst.operand_count, 3u);
+            CHECK_EQ(const_i32_value(block, inst.operands[0]), 0);
+            CHECK_EQ(const_i32_value(block, inst.operands[1]),
+                     static_cast<i32>(RequestPolicyId::Http11FixedStrip));
+            CHECK_EQ(const_i32_value(block, inst.operands[2]), 1);
+        }
+    }
+    REQUIRE_EQ(exact_forward_count, 1u);
+
+    Shard<IoUringEventLoop> shard;
+    struct ShardGuard {
+        Shard<IoUringEventLoop>& shard;
+        i32 listen_fd = -1;
+        bool initialized = false;
+        ~ShardGuard() {
+            if (initialized) {
+                if (shard.loop != nullptr) shard.loop->force_close_all();
+                shard.shutdown();
+            }
+            if (listen_fd >= 0) close(listen_fd);
+        }
+    } shard_guard{shard, create_listen_socket(0).value_or(-1)};
+    REQUIRE_GE(shard_guard.listen_fd, 0);
+    const u16 port = get_port(shard_guard.listen_fd);
+    REQUIRE(shard.init(0, shard_guard.listen_fd).has_value());
+    shard_guard.initialized = true;
+    shard.route_config = &resources.cfg;
+    shard.active_config = shard.route_config;
+    REQUIRE(shard.loop != nullptr);
+    REQUIRE(shard.init_access_log().has_value());
+    CaptureRing* capture_ring = shard.enable_capture();
+    REQUIRE(capture_ring != nullptr);
+    REQUIRE_EQ(shard.loop->access_log, shard.log_ring);
+    REQUIRE_EQ(shard.loop->capture_ring, capture_ring);
+
+    // This runner preserves the production backend.wait()/dispatch_batch()
+    // scheduler pair and pauses only between those batches. The pause leaves a
+    // newly staged Send in the userspace SQ while the already submitted
+    // multishot Recv remains owned by the kernel.
+    struct BarrierRunner {
+        Shard<IoUringEventLoop>& shard;
+        pthread_t thread{};
+        bool started = false;
+        std::atomic<bool> entered{false};
+        std::atomic<bool> send_staged{false};
+        std::atomic<bool> release{false};
+        std::atomic<bool> exited{false};
+
+        u32 conn_id = UINT32_MAX;
+        i32 connect_result = 0;
+        u32 connect_failure_count = 0;
+        u32 failure_event_episode[2]{};
+        u32 failure_tombstone_episode[2]{};
+        u32 failure_current_episode[2]{};
+        u32 failure_attempts[2]{};
+        u32 health_fails_after_failure[2]{};
+        u32 failure_pipeline_depth[2]{};
+        u32 failure_pipeline_generation[2]{};
+        u32 failure_proof_generation[2]{};
+        u16 failure_request_policy[2]{};
+        bool failure_upstream_reused[2]{};
+        bool failure_episode_witness_valid = true;
+        bool request_one_f_more = false;
+        bool request_one_exact = false;
+        bool request_one_admitted = false;
+        bool request_one_continuity_valid = true;
+        bool request_one_owner_live = false;
+        bool deferred_accepts_neutral = false;
+        bool control_state_neutral = false;
+        bool config_state_neutral = false;
+        bool loop_not_draining = false;
+        u32 request_one_recv_generation = UINT32_MAX;
+        u64 request_one_recv_user_data = kInvalidIoUserData;
+        i32 request_one_recv_fd = -1;
+        bool request_one_sq_cursor_initialized = false;
+        u32 request_one_sq_cursor = 0;
+        u32 request_one_sq_barrier_tail = 0;
+        u32 sq_head_before_dispatch = 0;
+        u32 sq_tail_before_dispatch = 0;
+        u32 sq_pending_before_dispatch = 0;
+        u32 sq_head_after_dispatch = 0;
+        u32 sq_tail_after_dispatch = 0;
+        u32 sq_pending_after_dispatch = 0;
+        u32 staged_sqe_index = UINT32_MAX;
+        io_uring_sqe staged_sqe{};
+        u32 staged_send_conn_id = UINT32_MAX;
+        IoEventType staged_send_type = IoEventType::Count;
+        u32 staged_send_generation = UINT32_MAX;
+        const u8* staged_response = nullptr;
+        u32 staged_response_len = 0;
+        BackendHealth final_health{};
+
+        static void* run(void* arg) {
+            auto* self = static_cast<BarrierRunner*>(arg);
+            auto* loop = self->shard.loop;
+            reset_backend_health();
+            loop->backend.add_accept();
+            loop->fire_due_timers();
+            loop->arm_health_on_config_change();
+            self->entered.store(true, std::memory_order_release);
+            IoEvent events[kMaxEventsPerWait];
+
+            while (loop->is_running()) {
+                loop->retry_strict_upstream_retirement_cancels();
+                const u32 sq_tail_before_wait =
+                    __atomic_load_n(loop->backend.sq_tail, __ATOMIC_ACQUIRE);
+                const u32 n = loop->backend.wait(
+                    events, kMaxEventsPerWait, loop->conns, IoUringEventLoop::kMaxConns);
+                if (loop->backend.failure_code() != 0) {
+                    loop->stop();
+                    break;
+                }
+
+                bool failure_batch = false;
+                u32 failure_batch_episode = 0;
+                bool request_one_witness_in_batch = false;
+                u32 request_one_witness_generation = UINT32_MAX;
+                for (u32 i = 0; i < n; i++) {
+                    const IoEvent& event = events[i];
+                    if (self->request_one_admitted && event.conn_id == self->conn_id &&
+                        event.type == IoEventType::Recv) {
+                        self->request_one_continuity_valid = false;
+                    }
+                    if (!self->request_one_admitted && event.type == IoEventType::Recv &&
+                        event.result > 0 && event.more != 0 && event.aux == 0 &&
+                        event.upstream_episode == 0) {
+                        const Connection& conn = loop->conns[event.conn_id];
+                        if (conn.recv_buf.len() == sizeof(kRequestOne) - 1u &&
+                            memcmp(conn.recv_buf.data(), kRequestOne, sizeof(kRequestOne) - 1u) ==
+                                0) {
+                            self->conn_id = event.conn_id;
+                            self->request_one_f_more = true;
+                            self->request_one_exact = true;
+                            request_one_witness_in_batch = true;
+                            request_one_witness_generation = event.non_upstream_generation;
+                        }
+                    }
+                    if (event.type == IoEventType::UpstreamConnect && event.result < 0 &&
+                        event.conn_id == self->conn_id) {
+                        if (failure_batch) self->failure_episode_witness_valid = false;
+                        failure_batch = true;
+                        failure_batch_episode = event.upstream_episode;
+                        if (self->connect_failure_count < 2) {
+                            const Connection& failing = loop->conns[event.conn_id];
+                            const u32 index = self->connect_failure_count;
+                            self->failure_pipeline_depth[index] = failing.pipeline_depth;
+                            self->failure_pipeline_generation[index] =
+                                failing.http1_pipeline_request_generation;
+                            self->failure_proof_generation[index] =
+                                failing.response_read_deadline_upload.handler_generation;
+                            self->failure_request_policy[index] = failing.request_policy_id;
+                            self->failure_upstream_reused[index] = failing.upstream_reused;
+                        }
+                        self->connect_result = event.result;
+                    }
+                }
+
+                if (failure_batch) {
+                    self->sq_head_before_dispatch =
+                        __atomic_load_n(loop->backend.sq_head, __ATOMIC_ACQUIRE);
+                    self->sq_tail_before_dispatch =
+                        __atomic_load_n(loop->backend.sq_tail, __ATOMIC_ACQUIRE);
+                    self->sq_pending_before_dispatch = loop->backend.pending;
+                }
+
+                loop->dispatch_batch(events, n);
+                (loop->*validated_failure_private_member(
+                            ValidatedFailureRetryDeferredAcceptsTag{}))();
+
+                if (failure_batch) {
+                    if (self->connect_failure_count >= 2) {
+                        self->failure_episode_witness_valid = false;
+                    } else {
+                        const u32 index = self->connect_failure_count;
+                        const Connection& failed = loop->conns[self->conn_id];
+                        const BackendHealth* health = backend_health(0, 0);
+                        self->failure_event_episode[index] = failure_batch_episode;
+                        self->failure_tombstone_episode[index] = failed.upstream_retiring_episode;
+                        self->failure_current_episode[index] = failed.upstream_episode;
+                        self->failure_attempts[index] = failed.upstream_attempts;
+                        self->health_fails_after_failure[index] =
+                            health == nullptr ? UINT32_MAX : health->fails;
+                        if (!valid_upstream_episode(failure_batch_episode) ||
+                            failed.upstream_retiring_episode != failure_batch_episode ||
+                            !valid_upstream_episode(failed.upstream_episode) ||
+                            failed.upstream_episode == failure_batch_episode ||
+                            failed.upstream_retirement_active ||
+                            failed.upstream_retirement_target_owned != 0 ||
+                            failed.upstream_retirement_cancel_owned != 0)
+                            self->failure_episode_witness_valid = false;
+                        self->connect_failure_count++;
+                    }
+                }
+
+                if (self->conn_id != UINT32_MAX && !self->request_one_admitted &&
+                    request_one_witness_in_batch && self->request_one_exact) {
+                    const Connection& conn = loop->conns[self->conn_id];
+                    self->request_one_admitted = conn.fd >= 0 && conn.upstream_connect_armed &&
+                                                 conn.req_start_us != 0 && conn.recv_armed &&
+                                                 conn.request_config == self->shard.route_config;
+                    if (self->request_one_admitted) {
+                        self->request_one_recv_generation = request_one_witness_generation;
+                        self->request_one_recv_user_data = encode_non_upstream_user_data(
+                            {self->conn_id, IoEventType::Recv, self->request_one_recv_generation});
+                        self->request_one_recv_fd = conn.fd;
+                        // Start at this admission iteration's pre-wait tail.
+                        // The original target Recv was submitted by that wait,
+                        // while every SQE queued from this point onward remains
+                        // inside the continuity proof.
+                        self->request_one_sq_cursor = sq_tail_before_wait;
+                        self->request_one_sq_cursor_initialized = true;
+                    }
+                }
+
+                // Once request 1 is admitted, its original multishot Recv must
+                // remain the sole downstream Recv owner until the negative
+                // Connect completion has staged response 1. The persistent
+                // cursor covers SQEs queued by prior poll-command, timer, and
+                // health phases plus the current dispatch and exact
+                // retry-deferred-accept phase. A fresh target Recv or a cancel
+                // of the original user_data invalidates the witness even when
+                // the cancel's own CQE would later be swallowed by backend.wait().
+                if (self->request_one_admitted) {
+                    const u32 sq_tail_after_batch =
+                        __atomic_load_n(loop->backend.sq_tail, __ATOMIC_ACQUIRE);
+                    const u32 mask = *loop->backend.sq_ring_mask;
+                    if (!self->request_one_sq_cursor_initialized ||
+                        sq_tail_after_batch - self->request_one_sq_cursor >
+                            loop->backend.sq_ring_entries) {
+                        self->request_one_continuity_valid = false;
+                    } else {
+                        for (u32 tail = self->request_one_sq_cursor; tail != sq_tail_after_batch;
+                             ++tail) {
+                            const u32 array_slot = tail & mask;
+                            const u32 sqe_index = loop->backend.sq_array[array_slot];
+                            if (sqe_index >= loop->backend.sq_ring_entries) {
+                                self->request_one_continuity_valid = false;
+                                continue;
+                            }
+                            const io_uring_sqe& sqe = loop->backend.sq_entries[sqe_index];
+                            if (sqe.opcode == IORING_OP_RECV && sqe.fd == self->request_one_recv_fd)
+                                self->request_one_continuity_valid = false;
+                            if (sqe.opcode == IORING_OP_ASYNC_CANCEL &&
+                                sqe.addr == self->request_one_recv_user_data)
+                                self->request_one_continuity_valid = false;
+                        }
+                        // Publish progress only after the entire bounded span
+                        // has been inspected; the next iteration resumes here.
+                        self->request_one_sq_cursor = sq_tail_after_batch;
+                    }
+                }
+
+                if (failure_batch) {
+                    self->sq_head_after_dispatch =
+                        __atomic_load_n(loop->backend.sq_head, __ATOMIC_ACQUIRE);
+                    self->sq_tail_after_dispatch =
+                        __atomic_load_n(loop->backend.sq_tail, __ATOMIC_ACQUIRE);
+                    self->sq_pending_after_dispatch = loop->backend.pending;
+                    self->request_one_sq_barrier_tail = self->sq_tail_after_dispatch;
+                    if (self->sq_tail_after_dispatch == self->sq_tail_before_dispatch + 1u) {
+                        const u32 mask = *loop->backend.sq_ring_mask;
+                        const u32 array_slot = self->sq_tail_before_dispatch & mask;
+                        self->staged_sqe_index = loop->backend.sq_array[array_slot];
+                        if (self->staged_sqe_index < loop->backend.sq_ring_entries)
+                            self->staged_sqe = loop->backend.sq_entries[self->staged_sqe_index];
+                    }
+                    const u64 user_data = self->staged_sqe.user_data;
+                    self->staged_send_type = static_cast<IoEventType>(user_data & 0xFFu);
+                    self->staged_send_conn_id = static_cast<u32>((user_data >> 8) & 0xFFFFFFu);
+                    self->staged_send_generation = static_cast<u32>(user_data >> 32);
+                    const auto& send = loop->backend.send_state[self->conn_id];
+                    self->staged_response = send.src;
+                    self->staged_response_len = send.remaining;
+                    const Connection& conn = loop->conns[self->conn_id];
+                    self->request_one_owner_live =
+                        self->request_one_continuity_valid &&
+                        conn.fd == self->request_one_recv_fd && conn.recv_armed &&
+                        self->request_one_recv_generation == 0 &&
+                        self->request_one_recv_user_data ==
+                            encode_non_upstream_user_data({self->conn_id,
+                                                           IoEventType::Recv,
+                                                           self->request_one_recv_generation});
+                    self->deferred_accepts_neutral = loop->deferred_accept_count == 0;
+                    self->control_state_neutral =
+                        loop->control == &self->shard.control &&
+                        self->shard.control.pending_config.load(std::memory_order_acquire) ==
+                            nullptr &&
+                        self->shard.control.pending_jit.load(std::memory_order_acquire) ==
+                            nullptr &&
+                        self->shard.control.pending_capture.load(std::memory_order_acquire) ==
+                            nullptr;
+                    self->config_state_neutral =
+                        loop->config_ptr == &self->shard.active_config &&
+                        self->shard.active_config == self->shard.route_config &&
+                        *loop->config_ptr == self->shard.route_config;
+                    self->loop_not_draining = !loop->is_draining();
+                    self->send_staged.store(true, std::memory_order_release);
+                    while (!self->release.load(std::memory_order_acquire) && loop->is_running())
+                        sched_yield();
+                }
+
+                loop->poll_command();
+                loop->fire_due_timers();
+                loop->arm_health_on_config_change();
+            }
+            const BackendHealth* health = backend_health(0, 0);
+            if (health != nullptr) self->final_health = *health;
+            self->exited.store(true, std::memory_order_release);
+            return nullptr;
+        }
+
+        bool start() {
+            const i32 rc = pthread_create(&thread, nullptr, run, this);
+            started = rc == 0;
+            return started;
+        }
+
+        void join() {
+            if (!started) return;
+            pthread_join(thread, nullptr);
+            started = false;
+        }
+
+        ~BarrierRunner() {
+            release.store(true, std::memory_order_release);
+            if (started) {
+                shard.stop();
+                join();
+            }
+        }
+    } runner{shard};
+    REQUIRE(runner.start());
+    const i64 entered_deadline_ms = test_mono_ms() + 3000;
+    while (!runner.entered.load(std::memory_order_acquire) && test_mono_ms() < entered_deadline_ms)
+        sched_yield();
+    REQUIRE(runner.entered.load(std::memory_order_acquire));
+
+    struct ClientGuard {
+        i32 fd = -1;
+        ~ClientGuard() {
+            if (fd >= 0) close(fd);
+        }
+    } client{connect_to(port)};
+    REQUIRE_GE(client.fd, 0);
+    set_socket_timeouts(client.fd, 8);
+    REQUIRE(send_all(client.fd, kRequestOne, sizeof(kRequestOne) - 1u));
+
+    const i64 staged_deadline_ms = test_mono_ms() + 5000;
+    while (!runner.send_staged.load(std::memory_order_acquire) &&
+           test_mono_ms() < staged_deadline_ms)
+        sched_yield();
+    REQUIRE(runner.send_staged.load(std::memory_order_acquire));
+    REQUIRE(runner.request_one_f_more);
+    REQUIRE(runner.request_one_exact);
+    REQUIRE(runner.request_one_admitted);
+    REQUIRE(runner.request_one_continuity_valid);
+    REQUIRE(runner.request_one_owner_live);
+    REQUIRE_EQ(runner.request_one_recv_generation, 0u);
+    REQUIRE_EQ(runner.request_one_recv_user_data,
+               encode_non_upstream_user_data({runner.conn_id, IoEventType::Recv, 0}));
+    REQUIRE_EQ(runner.request_one_recv_fd, shard.loop->conns[runner.conn_id].fd);
+    REQUIRE(runner.request_one_sq_cursor_initialized);
+    REQUIRE_EQ(runner.request_one_sq_cursor, runner.request_one_sq_barrier_tail);
+    REQUIRE(runner.deferred_accepts_neutral);
+    REQUIRE(runner.control_state_neutral);
+    REQUIRE(runner.config_state_neutral);
+    REQUIRE(runner.loop_not_draining);
+    REQUIRE_EQ(shard.loop->deferred_accept_count, 0u);
+    REQUIRE_EQ(shard.control.pending_config.load(std::memory_order_acquire), nullptr);
+    REQUIRE_EQ(shard.control.pending_jit.load(std::memory_order_acquire), nullptr);
+    REQUIRE_EQ(shard.control.pending_capture.load(std::memory_order_acquire), nullptr);
+    REQUIRE_EQ(shard.active_config, shard.route_config);
+    REQUIRE_EQ(shard.loop->config_ptr, &shard.active_config);
+    REQUIRE_FALSE(shard.loop->is_draining());
+    REQUIRE_LT(runner.connect_result, 0);
+    REQUIRE_EQ(runner.connect_failure_count, 1u);
+    REQUIRE(runner.failure_episode_witness_valid);
+    REQUIRE_EQ(runner.failure_event_episode[0], runner.failure_tombstone_episode[0]);
+    REQUIRE_NE(runner.failure_current_episode[0], runner.failure_event_episode[0]);
+    REQUIRE_EQ(runner.failure_attempts[0], 1u);
+    REQUIRE_EQ(runner.health_fails_after_failure[0], 1u);
+    REQUIRE_EQ(runner.failure_pipeline_depth[0], 0u);
+    REQUIRE_EQ(runner.failure_pipeline_generation[0], 0u);
+    REQUIRE_EQ(runner.failure_proof_generation[0], 0u);
+    REQUIRE_EQ(runner.failure_request_policy[0],
+               static_cast<u16>(RequestPolicyId::Http11FixedStrip));
+    REQUIRE_FALSE(runner.failure_upstream_reused[0]);
+
+    auto& backend = shard.loop->backend;
+    REQUIRE_EQ(runner.sq_head_after_dispatch, runner.sq_head_before_dispatch);
+    REQUIRE_EQ(runner.sq_tail_after_dispatch, runner.sq_tail_before_dispatch + 1u);
+    REQUIRE_EQ(runner.sq_pending_after_dispatch, runner.sq_pending_before_dispatch + 1u);
+    REQUIRE_LT(runner.staged_sqe_index, backend.sq_ring_entries);
+    REQUIRE_EQ(runner.staged_sqe.opcode, IORING_OP_SEND);
+    REQUIRE_EQ(runner.staged_sqe.fd, shard.loop->conns[runner.conn_id].fd);
+    REQUIRE_EQ(runner.staged_send_conn_id, runner.conn_id);
+    REQUIRE_EQ(runner.staged_send_type, IoEventType::Send);
+    REQUIRE_EQ(runner.staged_send_generation, 0u);
+    REQUIRE_EQ(runner.staged_sqe.addr, reinterpret_cast<u64>(runner.staged_response));
+    REQUIRE_EQ(runner.staged_sqe.len, runner.staged_response_len);
+    REQUIRE_EQ(runner.staged_response_len,
+               shard.loop->conns[runner.conn_id].response_header_buf.len());
+    REQUIRE_EQ(runner.staged_response,
+               shard.loop->conns[runner.conn_id].response_header_buf.data());
+    REQUIRE_EQ(runner.staged_response, shard.loop->backend.send_state[runner.conn_id].src);
+    REQUIRE_EQ(runner.staged_response_len, sizeof(kExpectedOne) - 1u);
+    char staged_response_copy[sizeof(kExpectedOne)]{};
+    memcpy(staged_response_copy, runner.staged_response, runner.staged_response_len);
+    REQUIRE(normalize_public_date(staged_response_copy, runner.staged_response_len));
+    REQUIRE_EQ(memcmp(staged_response_copy, kExpectedOne, runner.staged_response_len), 0);
+
+    // Only now publish request 2.  The runner is paused, so no subsequent
+    // io_uring_enter can submit response 1's staged Send while the raw CQ proof
+    // below waits for the already-owned multishot Recv.
+    REQUIRE(send_all(client.fd, kRequestTwo, sizeof(kRequestTwo) - 1u));
+    REQUIRE_NE(backend.cq_head, nullptr);
+    REQUIRE_NE(backend.cq_tail, nullptr);
+    REQUIRE_NE(backend.cq_ring_mask, nullptr);
+    REQUIRE_NE(backend.cq_entries, nullptr);
+    REQUIRE_NE(backend.buf_base, nullptr);
+    REQUIRE_GT(backend.cq_ring_entries, 0u);
+    REQUIRE_EQ(backend.cq_ring_entries & (backend.cq_ring_entries - 1u), 0u);
+    REQUIRE_EQ(*backend.cq_ring_mask, backend.cq_ring_entries - 1u);
+    const u32 raw_head = __atomic_load_n(backend.cq_head, __ATOMIC_ACQUIRE);
+    u32 raw_cursor = raw_head;
+    u32 raw_request_len = 0;
+    char raw_request[sizeof(kRequestTwo)]{};
+    bool raw_terminal_seen = false;
+    bool raw_timer_seen = false;
+    static constexpr u32 kRawTimerConnId = 0x00FFFFFEu;
+    const u64 expected_recv_user_data = encode_non_upstream_user_data(
+        {runner.conn_id, IoEventType::Recv, runner.request_one_recv_generation});
+    const u64 expected_timer_user_data =
+        encode_non_upstream_user_data({kRawTimerConnId, IoEventType::Timeout, 0});
+    REQUIRE_NE(expected_recv_user_data, kInvalidIoUserData);
+    REQUIRE_NE(expected_timer_user_data, kInvalidIoUserData);
+    const i64 raw_deadline_ms = test_mono_ms() + 5000;
+    while (raw_request_len < sizeof(kRequestTwo) - 1u && test_mono_ms() < raw_deadline_ms) {
+        const u32 raw_tail = __atomic_load_n(backend.cq_tail, __ATOMIC_ACQUIRE);
+        REQUIRE_LE(raw_tail - raw_head, backend.cq_ring_entries);
+        while (raw_cursor != raw_tail) {
+            const io_uring_cqe& cqe = backend.cq_entries[raw_cursor & *backend.cq_ring_mask];
+            if (cqe.user_data == expected_recv_user_data) {
+                REQUIRE_FALSE(raw_terminal_seen);
+                REQUIRE_GT(cqe.res, 0);
+                static constexpr u32 kCqeMetadataMask = (1u << IORING_CQE_BUFFER_SHIFT) - 1u;
+#ifdef IORING_CQE_F_SOCK_NONEMPTY
+                static constexpr u32 kCqeSockNonempty = IORING_CQE_F_SOCK_NONEMPTY;
+#else
+                // Stable io_uring UAPI value for builds against older headers.
+                static constexpr u32 kCqeSockNonempty = 1u << 2;
+#endif
+                static constexpr u32 kAllowedCqeMetadata =
+                    IORING_CQE_F_BUFFER | IORING_CQE_F_MORE | kCqeSockNonempty;
+                static constexpr u32 kExplicitlyForbiddenCqeMetadata =
+                    (1u << 3) | (1u << 4) | (1u << 5);  // NOTIF, BUF_MORE, SKIP.
+                const u32 metadata = cqe.flags & kCqeMetadataMask;
+                REQUIRE_EQ(metadata & kExplicitlyForbiddenCqeMetadata, 0u);
+                REQUIRE_EQ(metadata & ~kAllowedCqeMetadata, 0u);
+                REQUIRE_EQ(metadata & IORING_CQE_F_BUFFER, IORING_CQE_F_BUFFER);
+                const bool more = (cqe.flags & IORING_CQE_F_MORE) != 0;
+                const u16 buf_id = static_cast<u16>(cqe.flags >> IORING_CQE_BUFFER_SHIFT);
+                REQUIRE_LT(buf_id, kProvidedBufCount);
+                REQUIRE_LE(static_cast<u32>(cqe.res), kProvidedBufSize);
+                const u32 fragment_len = static_cast<u32>(cqe.res);
+                REQUIRE_LE(fragment_len, sizeof(kRequestTwo) - 1u - raw_request_len);
+                const u8* bytes = backend.buf_base + static_cast<u64>(buf_id) * kProvidedBufSize;
+                REQUIRE_EQ(memcmp(bytes, kRequestTwo + raw_request_len, fragment_len), 0);
+                memcpy(raw_request + raw_request_len, bytes, fragment_len);
+                raw_request_len += fragment_len;
+                if (raw_request_len < sizeof(kRequestTwo) - 1u) REQUIRE(more);
+                if (!more) raw_terminal_seen = true;
+            } else if (cqe.user_data == expected_timer_user_data) {
+                REQUIRE_FALSE(raw_timer_seen);
+                REQUIRE_EQ(cqe.flags, 0u);
+                REQUIRE_EQ(cqe.res, static_cast<i32>(sizeof(backend.timer_ticks_buf)));
+                REQUIRE_GT(backend.timer_ticks_buf, 0u);
+                REQUIRE(backend.timer_read_armed);
+                raw_timer_seen = true;
+            } else {
+                // The raw barrier admits only the original target Recv owner
+                // and the single already-armed timerfd read. This rejects a
+                // target Send, Accept, any cancel sentinel/completion,
+                // upstream traffic, a different connection, and malformed or
+                // unknown user_data without consuming the CQE.
+                FAIL("unexpected CQE at validated-failure raw barrier");
+            }
+            raw_cursor++;
+        }
+        if (raw_request_len < sizeof(kRequestTwo) - 1u) sched_yield();
+    }
+    REQUIRE_EQ(raw_request_len, sizeof(kRequestTwo) - 1u);
+    REQUIRE_EQ(memcmp(raw_request, kRequestTwo, raw_request_len), 0);
+    REQUIRE_EQ(__atomic_load_n(backend.cq_head, __ATOMIC_ACQUIRE), raw_head);
+    REQUIRE_EQ(__atomic_load_n(backend.sq_head, __ATOMIC_ACQUIRE), runner.sq_head_after_dispatch);
+    REQUIRE_EQ(backend.pending, runner.sq_pending_after_dispatch);
+
+    runner.release.store(true, std::memory_order_release);
+
+    char wire[sizeof(kExpectedOne) + sizeof(kExpectedTwo) + 32]{};
+    const u32 expected_wire_len = sizeof(kExpectedOne) - 1u + sizeof(kExpectedTwo) - 1u;
+    u32 wire_len = 0;
+    const i64 wire_deadline_ms = test_mono_ms() + 5000;
+    while (wire_len < expected_wire_len && test_mono_ms() < wire_deadline_ms) {
+        const i64 remaining_ms = wire_deadline_ms - test_mono_ms();
+        if (remaining_ms <= 0) break;
+        const i32 got = recv_timeout(
+            client.fd, wire + wire_len, sizeof(wire) - wire_len, static_cast<i32>(remaining_ms));
+        REQUIRE_GT(got, 0);
+        wire_len += static_cast<u32>(got);
+        REQUIRE_LE(wire_len, expected_wire_len);
+    }
+    REQUIRE_EQ(wire_len, expected_wire_len);
+    REQUIRE(normalize_public_date(wire, sizeof(kExpectedOne) - 1u));
+    REQUIRE(normalize_public_date(wire + sizeof(kExpectedOne) - 1u, sizeof(kExpectedTwo) - 1u));
+    REQUIRE_EQ(memcmp(wire, kExpectedOne, sizeof(kExpectedOne) - 1u), 0);
+    REQUIRE_EQ(memcmp(wire + sizeof(kExpectedOne) - 1u, kExpectedTwo, sizeof(kExpectedTwo) - 1u),
+               0);
+
+    char eof_probe[32];
+    const i64 eof_deadline_ms = test_mono_ms() + 3000;
+    i32 eof_result = -EAGAIN;
+    while (test_mono_ms() < eof_deadline_ms) {
+        const i64 remaining_ms = eof_deadline_ms - test_mono_ms();
+        if (remaining_ms <= 0) break;
+        eof_result =
+            recv_timeout(client.fd, eof_probe, sizeof(eof_probe), static_cast<i32>(remaining_ms));
+        if (eof_result != -EINTR) break;
+    }
+    REQUIRE_EQ(eof_result, 0);
+    REQUIRE(shard.loop->is_running());
+    REQUIRE_EQ(shard.backend_failure_code(), 0);
+
+    REQUIRE_EQ(close(client.fd), 0);
+    client.fd = -1;
+    shard.stop();
+    runner.join();
+    REQUIRE(runner.exited.load(std::memory_order_acquire));
+
+    CHECK_EQ(shard.backend_failure_code(), 0);
+    CHECK_FALSE(shard.loop->is_running());
+    CHECK_EQ(shard.loop->active_count(), 0u);
+    CHECK_EQ(shard.loop->pending_free_count, 0u);
+    CHECK_EQ(shard.loop->pool.in_use(), 0u);
+    CHECK_EQ(shard.upstream->idle_count.load(std::memory_order_acquire), 0u);
+    CHECK_EQ(shard.upstream->free_top, UpstreamPool::kMaxConns);
+    CHECK_EQ(shard.shard_metrics.connections_total, 1u);
+    CHECK_EQ(shard.shard_metrics.connections_active, 0u);
+    CHECK_EQ(shard.shard_metrics.connections_closed, 1u);
+    CHECK_EQ(shard.shard_metrics.requests_total, 2u);
+    CHECK_EQ(shard.shard_metrics.requests_active, 0u);
+    CHECK_EQ(shard.shard_metrics.request_latency.count, 2u);
+    const u64 final_epoch = shard.epoch.epoch.load(std::memory_order_acquire);
+    CHECK_EQ(final_epoch, 4u);
+    CHECK_EQ(final_epoch % 2u, 0u);
+
+    REQUIRE_EQ(runner.connect_failure_count, 2u);
+    REQUIRE(runner.failure_episode_witness_valid);
+    CHECK_EQ(runner.failure_event_episode[0], runner.failure_tombstone_episode[0]);
+    CHECK_EQ(runner.failure_event_episode[1], runner.failure_tombstone_episode[1]);
+    CHECK_NE(runner.failure_event_episode[0], runner.failure_event_episode[1]);
+    CHECK_NE(runner.failure_current_episode[0], runner.failure_event_episode[0]);
+    CHECK_NE(runner.failure_current_episode[1], runner.failure_event_episode[1]);
+    CHECK_EQ(runner.failure_attempts[0], 1u);
+    CHECK_EQ(runner.failure_attempts[1], 1u);
+    CHECK_EQ(runner.health_fails_after_failure[0], 1u);
+    CHECK_EQ(runner.health_fails_after_failure[1], 2u);
+    CHECK_EQ(runner.failure_pipeline_depth[0], 0u);
+    CHECK_EQ(runner.failure_pipeline_generation[0], 0u);
+    CHECK_EQ(runner.failure_proof_generation[0], 0u);
+    CHECK_EQ(runner.failure_pipeline_depth[1], 1u);
+    CHECK_NE(runner.failure_pipeline_generation[1], 0u);
+    CHECK_EQ(runner.failure_proof_generation[1], runner.failure_pipeline_generation[1]);
+    CHECK_EQ(runner.failure_request_policy[0], static_cast<u16>(RequestPolicyId::Http11FixedStrip));
+    CHECK_EQ(runner.failure_request_policy[1], static_cast<u16>(RequestPolicyId::Http11FixedStrip));
+    CHECK_FALSE(runner.failure_upstream_reused[0]);
+    CHECK_FALSE(runner.failure_upstream_reused[1]);
+    CHECK_EQ(runner.final_health.fails, 2u);
+    CHECK_EQ(runner.final_health.eject_until_us, 0u);
+    CHECK_FALSE(runner.final_health.active_down);
+
+    REQUIRE_EQ(shard.log_ring->available(), 2u);
+    AccessLogEntry access_one{};
+    AccessLogEntry access_two{};
+    AccessLogEntry no_access{};
+    REQUIRE(shard.log_ring->pop(access_one));
+    REQUIRE(shard.log_ring->pop(access_two));
+    CHECK_FALSE(shard.log_ring->pop(no_access));
+    CHECK_EQ(access_one.status, 502u);
+    CHECK_EQ(access_two.status, 502u);
+    CHECK_EQ(access_one.method, static_cast<u8>(LogHttpMethod::Get));
+    CHECK_EQ(access_two.method, static_cast<u8>(LogHttpMethod::Get));
+    CHECK_GT(access_one.req_size, 0u);
+    CHECK_GT(access_two.req_size, 0u);
+    CHECK_EQ(access_one.resp_size, sizeof(kExpectedOne) - 1u);
+    CHECK_EQ(access_two.resp_size, sizeof(kExpectedTwo) - 1u);
+    CHECK_EQ(strcmp(access_one.path, "/buffered?late=one"), 0);
+    CHECK_EQ(strcmp(access_two.path, "/buffered?late=two"), 0);
+    CHECK_EQ(strcmp(access_one.upstream, "backend"), 0);
+    CHECK_EQ(strcmp(access_two.upstream, "backend"), 0);
+
+    REQUIRE_EQ(capture_ring->available(), 2u);
+    CaptureEntry capture_one{};
+    CaptureEntry capture_two{};
+    CaptureEntry no_capture{};
+    REQUIRE(capture_ring->pop(capture_one));
+    REQUIRE(capture_ring->pop(capture_two));
+    CHECK_FALSE(capture_ring->pop(no_capture));
+    CHECK_EQ(capture_one.resp_status, 502u);
+    CHECK_EQ(capture_two.resp_status, 502u);
+    CHECK_EQ(capture_one.method, static_cast<u8>(LogHttpMethod::Get));
+    CHECK_EQ(capture_two.method, static_cast<u8>(LogHttpMethod::Get));
+    CHECK_EQ(capture_one.req_content_length, 0u);
+    CHECK_EQ(capture_two.req_content_length, 0u);
+    CHECK_EQ(capture_one.resp_content_length, sizeof(kExpectedOne) - 1u);
+    CHECK_EQ(capture_two.resp_content_length, sizeof(kExpectedTwo) - 1u);
+    REQUIRE_EQ(capture_one.raw_header_len, sizeof(kRequestOne) - 1u);
+    REQUIRE_EQ(capture_two.raw_header_len, sizeof(kRequestTwo) - 1u);
+    CHECK_EQ(memcmp(capture_one.raw_headers, kRequestOne, sizeof(kRequestOne) - 1u), 0);
+    CHECK_EQ(memcmp(capture_two.raw_headers, kRequestTwo, sizeof(kRequestTwo) - 1u), 0);
+    CHECK_EQ(strcmp(capture_one.upstream_name, "backend"), 0);
+    CHECK_EQ(strcmp(capture_two.upstream_name, "backend"), 0);
+
+    REQUIRE_LT(runner.conn_id, IoUringEventLoop::kMaxConns);
+    const Connection& settled = shard.loop->conns[runner.conn_id];
+    CHECK_EQ(settled.fd, -1);
+    CHECK_EQ(settled.upstream_fd, -1);
+    CHECK_EQ(settled.pending_ops, 0u);
+    CHECK_FALSE(settled.upstream_connect_armed);
+    CHECK_FALSE(settled.upstream_send_armed);
+    CHECK_FALSE(settled.upstream_recv_armed);
+    CHECK_FALSE(settled.upstream_retirement_active);
+    CHECK_EQ(settled.upstream_retirement_target_owned, 0u);
+    CHECK_EQ(settled.upstream_retirement_cancel_owned, 0u);
+    CHECK_EQ(settled.upstream_close_target_owned, 0u);
+    CHECK_EQ(settled.upstream_close_cancel_owned, 0u);
+    CHECK_FALSE(settled.upstream_slot_held);
+    CHECK_EQ(settled.pipeline_depth, 0u);
+    CHECK_EQ(settled.pipeline_stash_len, 0u);
+    CHECK(settled.response_read_deadline_owner_is_neutral());
+    CHECK(settled.http1_prebuilt_response_proof_is_neutral());
+}
+
 TEST(route, ordinary_source_coalesced_strict_get_successor_iouring) {
     using namespace rut;
     if (!iouring_socket_live()) SKIP("io_uring async socket ops unavailable in this environment");
