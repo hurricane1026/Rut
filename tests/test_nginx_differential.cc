@@ -1,3 +1,4 @@
+#include "downstream_publication_gate.h"
 #include "rut/nginx/converter.h"
 #include "rut/nginx/parser.h"
 #include <atomic>
@@ -13,7 +14,9 @@
 #include <poll.h>
 #include <pthread.h>
 #include <signal.h>
+#include <sys/mman.h>
 #include <sys/socket.h>
+#include <sys/stat.h>
 #include <sys/wait.h>
 #include <unistd.h>
 
@@ -473,6 +476,7 @@ struct TempDir {
     std::string nginx_log;
     std::string rut_log;
     std::string preflight_log;
+    std::string gate_control;
 
     bool create() {
         if (!mkdtemp(path)) return false;
@@ -482,6 +486,7 @@ struct TempDir {
         nginx_log = std::string(path) + "/nginx.log";
         rut_log = std::string(path) + "/rut.log";
         preflight_log = std::string(path) + "/preflight.log";
+        gate_control = std::string(path) + "/downstream-gate.control";
         return true;
     }
 
@@ -492,6 +497,7 @@ struct TempDir {
             unlink(nginx_log.c_str());
             unlink(rut_log.c_str());
             unlink(preflight_log.c_str());
+            unlink(gate_control.c_str());
             rmdir(path);
         }
     }
@@ -4659,11 +4665,353 @@ static bool capture_api_invalid_case(u16 frontend_port,
     return true;
 }
 
+struct DownstreamGateMapping {
+    int fd = -1;
+    rut_downstream_publication_gate* gate = nullptr;
+
+    bool create(const std::string& path) {
+        fd = open(path.c_str(), O_RDWR | O_CREAT | O_EXCL, 0600);
+        if (fd < 0 || ftruncate(fd, sizeof(*gate)) != 0) return false;
+        void* mapped = mmap(nullptr, sizeof(*gate), PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+        if (mapped == MAP_FAILED) return false;
+        gate = static_cast<rut_downstream_publication_gate*>(mapped);
+        memset(gate, 0, sizeof(*gate));
+        gate->magic = RUT_DOWNSTREAM_GATE_MAGIC;
+        gate->version = RUT_DOWNSTREAM_GATE_VERSION;
+        gate->layout_size = sizeof(*gate);
+        gate->intercepted_fd = -1;
+        rut_downstream_gate_store(&gate->state, RUT_DOWNSTREAM_GATE_DISARMED);
+        return msync(gate, sizeof(*gate), MS_SYNC) == 0;
+    }
+
+    ~DownstreamGateMapping() {
+        if (gate != nullptr) munmap(gate, sizeof(*gate));
+        if (fd >= 0) close(fd);
+    }
+};
+
+struct DownstreamGateRelease {
+    rut_downstream_publication_gate* gate = nullptr;
+
+    ~DownstreamGateRelease() {
+        if (gate == nullptr) return;
+        const u32 state = rut_downstream_gate_load(&gate->state);
+        if (state != RUT_DOWNSTREAM_GATE_RELEASED && state != RUT_DOWNSTREAM_GATE_FAILED) {
+            if (rut_downstream_gate_load(&gate->error_code) == RUT_DOWNSTREAM_GATE_ERROR_NONE)
+                rut_downstream_gate_store(&gate->error_code, RUT_DOWNSTREAM_GATE_ERROR_TRANSITION);
+            rut_downstream_gate_store(&gate->state, RUT_DOWNSTREAM_GATE_FAILED);
+        }
+        rut_downstream_gate_wake(&gate->state);
+    }
+};
+
+static bool wait_for_downstream_gate_hook(rut_downstream_publication_gate& gate,
+                                          int timeout_ms,
+                                          std::string& error) {
+    const int64_t deadline = rut_downstream_gate_now_ms() + timeout_ms;
+    while (rut_downstream_gate_now_ms() < deadline) {
+        if (rut_downstream_gate_load(&gate.state) == RUT_DOWNSTREAM_GATE_FAILED) {
+            error = "preload hook reported startup failure " +
+                    std::to_string(rut_downstream_gate_load(&gate.error_code));
+            return false;
+        }
+        if (rut_downstream_gate_load(&gate.hook_magic_ok) == 1 &&
+            rut_downstream_gate_load(&gate.hook_version) == RUT_DOWNSTREAM_GATE_VERSION &&
+            rut_downstream_gate_load(&gate.hook_layout_size) == sizeof(gate) &&
+            rut_downstream_gate_load(&gate.target_master_pid) != 0)
+            return true;
+        const u32 current = rut_downstream_gate_load(&gate.state);
+        timespec bounded_wait{0, 50'000'000};
+        (void)syscall(SYS_futex, &gate.state, FUTEX_WAIT, current, &bounded_wait, nullptr, 0);
+    }
+    error = "preload hook startup handshake timeout";
+    return false;
+}
+
+static bool downstream_has_no_readable_byte(int fd, std::string& error) {
+    pollfd probe{fd, POLLIN | POLLHUP | POLLERR, 0};
+    int ready;
+    do {
+        ready = poll(&probe, 1, 0);
+    } while (ready < 0 && errno == EINTR);
+    if (ready < 0) {
+        error = "pre-release downstream poll failed";
+        return false;
+    }
+    char byte = 0;
+    const ssize_t n = recv(fd, &byte, 1, MSG_PEEK | MSG_DONTWAIT);
+    if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) return true;
+    if (n > 0)
+        error = "a downstream response byte was readable before gate release";
+    else if (n == 0)
+        error = "downstream reached EOF before gate release";
+    else
+        error = "pre-release downstream peek failed";
+    return false;
+}
+
+static bool read_two_responses_and_eof(int fd,
+                                       std::vector<char>& first,
+                                       std::vector<char>& second,
+                                       std::string& error) {
+    using Clock = std::chrono::steady_clock;
+    const auto deadline = Clock::now() + std::chrono::seconds(5);
+    std::vector<char> wire;
+    bool eof = false;
+    while (Clock::now() < deadline && !eof) {
+        const auto remaining =
+            std::chrono::duration_cast<std::chrono::milliseconds>(deadline - Clock::now()).count();
+        pollfd input{fd, POLLIN | POLLHUP | POLLERR, 0};
+        const int wait_ms = remaining > 100 ? 100 : static_cast<int>(remaining);
+        const int ready = poll(&input, 1, wait_ms > 0 ? wait_ms : 1);
+        if (ready < 0) {
+            if (errno == EINTR) continue;
+            error = "two-response downstream poll failed";
+            return false;
+        }
+        if (ready == 0) continue;
+        char bytes[4096];
+        const ssize_t n = recv(fd, bytes, sizeof(bytes), 0);
+        if (n > 0) {
+            wire.insert(wire.end(), bytes, bytes + n);
+            continue;
+        }
+        if (n == 0) {
+            eof = true;
+            break;
+        }
+        if (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK) continue;
+        error = "two-response downstream recv failed";
+        return false;
+    }
+    if (!eof) {
+        error = "server EOF did not follow the second response";
+        return false;
+    }
+
+    const auto take_frame = [&](size_t offset, std::vector<char>& frame, size_t& next) {
+        if (offset >= wire.size()) return false;
+        std::vector<char> suffix(wire.begin() + static_cast<ptrdiff_t>(offset), wire.end());
+        const size_t end = header_end(suffix);
+        size_t body_length = 0;
+        if (end == 0 || !parse_content_length(suffix, end, body_length) ||
+            end + body_length > suffix.size())
+            return false;
+        next = offset + end + body_length;
+        frame.assign(wire.begin() + static_cast<ptrdiff_t>(offset),
+                     wire.begin() + static_cast<ptrdiff_t>(next));
+        return true;
+    };
+    size_t second_offset = 0;
+    size_t wire_end = 0;
+    if (!take_frame(0, first, second_offset) || !take_frame(second_offset, second, wire_end) ||
+        wire_end != wire.size()) {
+        error = "downstream wire was not exactly two Content-Length responses";
+        return false;
+    }
+    return true;
+}
+
+static bool run_nginx_downstream_gate_spike(u16 frontend_port,
+                                            u16 backend_port,
+                                            TempDir& temp,
+                                            const std::string& container_name,
+                                            const char* preload_path,
+                                            std::string& error) {
+    if (preload_path == nullptr || preload_path[0] != '/' || access(preload_path, R_OK) != 0) {
+        error = "preload helper path is not an absolute readable file";
+        return false;
+    }
+    struct stat preload_stat{};
+    if (stat(preload_path, &preload_stat) != 0 || !S_ISREG(preload_stat.st_mode)) {
+        error = "preload helper is not a regular file";
+        return false;
+    }
+
+    DeadPort dead;
+    if (!dead.reserve(backend_port)) {
+        error = "failed to reserve the gate spike dead upstream";
+        return false;
+    }
+    const std::string fragment =
+        "server {\n  listen " + std::to_string(frontend_port) +
+        ";\n  location / {\n    proxy_pass http://127.0.0.1:" + std::to_string(backend_port) +
+        ";\n  }\n}\n";
+    const std::string config = "events {}\nhttp {\n" + fragment + "}\n";
+    if (!write_file(temp.nginx_config, config.data(), config.size())) {
+        error = "failed to write nginx gate spike config";
+        return false;
+    }
+
+    DownstreamGateMapping mapping;
+    if (!mapping.create(temp.gate_control)) {
+        error = "failed to create shared downstream gate control";
+        return false;
+    }
+    DockerGuard docker(container_name);
+    ChildGuard nginx;
+    struct ClientGuard {
+        int fd = -1;
+        ~ClientGuard() {
+            if (fd >= 0) close(fd);
+        }
+    } client;
+    DownstreamGateRelease release{mapping.gate};
+    if (!spawn_child({"docker",
+                      "run",
+                      "--pull=never",
+                      "--network",
+                      "host",
+                      "--name",
+                      container_name,
+                      "-e",
+                      "LD_PRELOAD=/rut-gate/preload.so",
+                      "-e",
+                      "RUT_DOWNSTREAM_GATE_CONTROL=/rut-gate/control",
+                      "-e",
+                      "RUT_DOWNSTREAM_GATE_TARGET_EXECUTABLE=/usr/sbin/nginx",
+                      "-v",
+                      std::string(preload_path) + ":/rut-gate/preload.so:ro",
+                      "-v",
+                      temp.gate_control + ":/rut-gate/control",
+                      "-v",
+                      temp.nginx_config + ":/etc/nginx/nginx.conf:ro",
+                      kNginxImage,
+                      "nginx",
+                      "-g",
+                      "daemon off;"},
+                     temp.nginx_log,
+                     nginx.child)) {
+        error = "failed to start pinned nginx with downstream gate preload";
+        return false;
+    }
+    if (!wait_ready(frontend_port, nginx.child, error)) return false;
+    if (!wait_for_downstream_gate_hook(*mapping.gate, 3000, error)) return false;
+    if (rut_downstream_gate_load(&mapping.gate->state) != RUT_DOWNSTREAM_GATE_DISARMED ||
+        mapping.gate->intercepted_operation != RUT_DOWNSTREAM_GATE_OP_NONE ||
+        mapping.gate->intercepted_fd != -1) {
+        error = "disarmed readiness traffic changed downstream gate state";
+        return false;
+    }
+
+    client.fd = connect_once(frontend_port);
+    if (client.fd < 0) {
+        error = "failed to connect target downstream client";
+        return false;
+    }
+    sockaddr_in local{};
+    socklen_t local_length = sizeof(local);
+    if (getsockname(client.fd, reinterpret_cast<sockaddr*>(&local), &local_length) != 0 ||
+        local_length < sizeof(local) || local.sin_family != AF_INET) {
+        error = "failed to resolve target downstream peer identity";
+        return false;
+    }
+    mapping.gate->target_peer_ipv4_be = local.sin_addr.s_addr;
+    mapping.gate->target_peer_port_be = local.sin_port;
+    mapping.gate->request_two_length = sizeof(kGatewayCloseRequest2) - 1u;
+    memcpy(mapping.gate->request_two, kGatewayCloseRequest2, mapping.gate->request_two_length);
+    if (!rut_downstream_gate_cas(
+            &mapping.gate->state, RUT_DOWNSTREAM_GATE_DISARMED, RUT_DOWNSTREAM_GATE_ARMED)) {
+        error = "failed to arm downstream gate from DISARMED";
+        return false;
+    }
+    rut_downstream_gate_wake(&mapping.gate->state);
+    if (!send_all(client.fd, kGatewayKeepAliveRequest1, sizeof(kGatewayKeepAliveRequest1) - 1u)) {
+        error = "failed to send request 1 to pinned nginx gate spike";
+        return false;
+    }
+    if (!rut_downstream_gate_wait_until(mapping.gate, RUT_DOWNSTREAM_GATE_HIT, 5000)) {
+        error = "downstream gate did not HIT first target 502; hook error " +
+                std::to_string(rut_downstream_gate_load(&mapping.gate->error_code));
+        return false;
+    }
+    static constexpr unsigned char kExpectedPrefix[] = "HTTP/1.1 502 ";
+    const u32 target_master = rut_downstream_gate_load(&mapping.gate->target_master_pid);
+    if (target_master == 0 || mapping.gate->intercepted_fd < 0 ||
+        mapping.gate->intercepted_pid == 0 || mapping.gate->intercepted_pid == target_master ||
+        mapping.gate->intercepted_ppid != target_master ||
+        mapping.gate->intercepted_operation < RUT_DOWNSTREAM_GATE_OP_WRITE ||
+        mapping.gate->intercepted_operation > RUT_DOWNSTREAM_GATE_OP_SENDMSG ||
+        mapping.gate->intercepted_length < sizeof(kExpectedPrefix) - 1u ||
+        mapping.gate->intercepted_prefix_length < sizeof(kExpectedPrefix) - 1u ||
+        memcmp(mapping.gate->intercepted_prefix, kExpectedPrefix, sizeof(kExpectedPrefix) - 1u) !=
+            0) {
+        error = "downstream gate HIT metadata did not identify a worker HTTP/1.1 502 write";
+        return false;
+    }
+    if (!downstream_has_no_readable_byte(client.fd, error)) return false;
+    if (!send_all(client.fd, kGatewayCloseRequest2, sizeof(kGatewayCloseRequest2) - 1u)) {
+        error = "failed to send exact request 2 while response 1 was gated";
+        return false;
+    }
+    if (!rut_downstream_gate_cas(
+            &mapping.gate->state, RUT_DOWNSTREAM_GATE_HIT, RUT_DOWNSTREAM_GATE_R2_SENT)) {
+        error = "failed downstream gate HIT to R2_SENT transition";
+        return false;
+    }
+    rut_downstream_gate_wake(&mapping.gate->state);
+    if (!rut_downstream_gate_wait_until(mapping.gate, RUT_DOWNSTREAM_GATE_R2_ARRIVED, 5000)) {
+        error = "hook did not prove exact request 2 arrival; hook error " +
+                std::to_string(rut_downstream_gate_load(&mapping.gate->error_code));
+        return false;
+    }
+    if (!downstream_has_no_readable_byte(client.fd, error)) return false;
+    if (!rut_downstream_gate_cas(
+            &mapping.gate->state, RUT_DOWNSTREAM_GATE_R2_ARRIVED, RUT_DOWNSTREAM_GATE_RELEASED)) {
+        error = "failed downstream gate R2_ARRIVED to RELEASED transition";
+        return false;
+    }
+    rut_downstream_gate_wake(&mapping.gate->state);
+
+    std::vector<char> first;
+    std::vector<char> second;
+    if (!read_two_responses_and_eof(client.fd, first, second, error)) return false;
+    std::string detail;
+    if (!validate_exact_normalized_response(first, kGatewayKeepAliveResponseNormalized, detail)) {
+        error = "gated nginx response 1 mismatch: " + detail;
+        return false;
+    }
+    if (!validate_exact_normalized_response(second, kGatewayResponseNormalized, detail)) {
+        error = "gated nginx response 2 mismatch: " + detail;
+        return false;
+    }
+    if (poll_child(nginx.child)) {
+        error = "pinned nginx exited after the gated two-response exchange";
+        return false;
+    }
+    if (rut_downstream_gate_load(&mapping.gate->error_code) != RUT_DOWNSTREAM_GATE_ERROR_NONE ||
+        rut_downstream_gate_load(&mapping.gate->state) != RUT_DOWNSTREAM_GATE_RELEASED) {
+        error = "downstream gate did not remain cleanly RELEASED";
+        return false;
+    }
+
+    std::cerr << "gate evidence: master pid=" << target_master
+              << " worker pid=" << mapping.gate->intercepted_pid
+              << " worker ppid=" << mapping.gate->intercepted_ppid
+              << " operation=" << mapping.gate->intercepted_operation
+              << " bytes=" << mapping.gate->intercepted_length << "\n";
+
+    close(client.fd);
+    client.fd = -1;
+    const bool nginx_stopped = stop_child(nginx.child);
+    const bool container_removed = docker.remove();
+    if (!nginx_stopped || !container_removed) {
+        error = !nginx_stopped ? "failed to TERM/reap gated pinned nginx"
+                               : "failed to remove gated pinned nginx container";
+        return false;
+    }
+    return true;
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
-    if (argc != 2 || argv[1][0] != '/') {
-        std::cerr << "usage: test_nginx_differential <absolute-rut-executable>\n";
+    const bool nginx_gate_spike = argc == 3 && strcmp(argv[1], "--nginx-gate-spike") == 0;
+    if ((!nginx_gate_spike && (argc != 2 || argv[1][0] != '/')) ||
+        (nginx_gate_spike && argv[2][0] != '/')) {
+        std::cerr << "usage: test_nginx_differential <absolute-rut-executable>\n"
+                     "   or: test_nginx_differential --nginx-gate-spike "
+                     "<absolute-preload-helper>\n";
         return 1;
     }
 #ifndef __linux__
@@ -4713,6 +5061,23 @@ int main(int argc, char** argv) {
         frontend_port == backend_port) {
         std::cerr << "FAIL [preflight]: bounded dynamic port allocation failed\n";
         return 1;
+    }
+
+    if (nginx_gate_spike) {
+        const char* source_suffix = strrchr(temp.path, '/');
+        source_suffix = source_suffix ? source_suffix + 1 : temp.path;
+        const std::string gate_container =
+            "rut-nginx-gate-" + std::to_string(getpid()) + "-" + source_suffix;
+        std::string gate_error;
+        if (!run_nginx_downstream_gate_spike(
+                frontend_port, backend_port, temp, gate_container, argv[2], gate_error)) {
+            std::cerr << "FAIL [nginx downstream gate spike]: " << gate_error << "\n";
+            dump_log(temp.nginx_log, "pinned nginx gate log");
+            return 1;
+        }
+        std::cerr << "PASS: pinned nginx gate reached HIT/R2_SENT/R2_ARRIVED/RELEASED with no "
+                     "pre-release downstream byte and emitted both exact 502 responses\n";
+        return 0;
     }
 
     std::string fragment =

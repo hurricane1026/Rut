@@ -347,13 +347,31 @@ add_test(NAME test_shard_control COMMAND test_shard_control)
 set_tests_properties(test_shard_control PROPERTIES LABELS "unit")
 
 if(RUT_ENABLE_JIT)
+    add_library(test_nginx_downstream_gate_preload SHARED nginx_downstream_gate_preload.c)
+    target_include_directories(test_nginx_downstream_gate_preload PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}
+    )
+    target_link_libraries(test_nginx_downstream_gate_preload PRIVATE dl)
+
     add_executable(test_nginx_differential test_nginx_differential.cc
                    ${PROJECT_SOURCE_DIR}/src/placement_new.cc)
     target_link_libraries(test_nginx_differential PRIVATE rut_nginx Threads::Threads)
     target_include_directories(test_nginx_differential PRIVATE
         ${PROJECT_SOURCE_DIR}/include
     )
-    add_dependencies(test_nginx_differential rut)
+    add_dependencies(test_nginx_differential rut test_nginx_downstream_gate_preload)
+    add_test(
+        NAME test_nginx_downstream_gate_spike
+        COMMAND test_nginx_differential --nginx-gate-spike
+                $<TARGET_FILE:test_nginx_downstream_gate_preload>
+    )
+    set_tests_properties(test_nginx_downstream_gate_spike PROPERTIES
+        LABELS "integration;nginx;docker"
+        RUN_SERIAL TRUE
+        RESOURCE_LOCK nginx-differential
+        TIMEOUT 60
+        SKIP_RETURN_CODE 77
+    )
     add_test(
         NAME test_nginx_differential
         COMMAND test_nginx_differential $<TARGET_FILE:rut>
