@@ -31,8 +31,11 @@ static constexpr char kRequest[] =
     "X-Dup: one\r\n"
     "X-Dup: two\r\n"
     "Connection: close\r\n\r\n";
-static constexpr char kGatewayRequest[] =
+static constexpr char kGatewayKeepAliveRequest1[] =
     "GET /missing?q=1 HTTP/1.1\r\n"
+    "Host: client.example\r\n\r\n";
+static constexpr char kGatewayCloseRequest2[] =
+    "GET /missing?q=2 HTTP/1.1\r\n"
     "Host: client.example\r\n"
     "Connection: close\r\n\r\n";
 static constexpr char kOptionsStarRequest[] =
@@ -257,6 +260,21 @@ static constexpr char kGatewayResponseNormalized[] =
     "Content-Type: text/html\r\n"
     "Content-Length: 157\r\n"
     "Connection: close\r\n"
+    "\r\n"
+    "<html>\r\n"
+    "<head><title>502 Bad Gateway</title></head>\r\n"
+    "<body>\r\n"
+    "<center><h1>502 Bad Gateway</h1></center>\r\n"
+    "<hr><center>nginx/1.29.7</center>\r\n"
+    "</body>\r\n"
+    "</html>\r\n";
+static constexpr char kGatewayKeepAliveResponseNormalized[] =
+    "HTTP/1.1 502 Bad Gateway\r\n"
+    "Server: nginx/1.29.7\r\n"
+    "Date: XXXXXXXXXXXXXXXXXXXXXXXXXXXXX\r\n"
+    "Content-Type: text/html\r\n"
+    "Content-Length: 157\r\n"
+    "Connection: keep-alive\r\n"
     "\r\n"
     "<html>\r\n"
     "<head><title>502 Bad Gateway</title></head>\r\n"
@@ -4105,6 +4123,76 @@ static bool capture_head_gateway_rut_case(u16 frontend_port,
     return true;
 }
 
+static bool exercise_sequential_gateway_failures(u16 frontend_port,
+                                                 Child& frontend,
+                                                 const char* side,
+                                                 std::vector<std::vector<char>>& responses,
+                                                 std::string& error) {
+    struct ClientGuard {
+        int fd = -1;
+        ~ClientGuard() {
+            if (fd >= 0) close(fd);
+        }
+    } client{connect_once(frontend_port)};
+    if (client.fd < 0 ||
+        !send_all(client.fd, kGatewayKeepAliveRequest1, sizeof(kGatewayKeepAliveRequest1) - 1)) {
+        error = std::string(side) + " sequential gateway request 1 send failed";
+        return false;
+    }
+
+    responses.clear();
+    std::vector<char> first;
+    std::string detail;
+    if (!read_response(client.fd, first, detail)) {
+        error = std::string(side) + " sequential gateway response 1 failed: " + detail;
+        return false;
+    }
+    if (!validate_exact_normalized_response(first, kGatewayKeepAliveResponseNormalized, detail)) {
+        error = std::string(side) + " sequential gateway response 1 mismatch: " + detail;
+        return false;
+    }
+    responses.push_back(std::move(first));
+
+    bool eof = false;
+    if (!wait_keepalive_quiet_or_eof(client.fd, 500, eof, detail) || eof) {
+        error = eof ? std::string(side) +
+                          " closed the sequential gateway downstream during the quiet window"
+                    : std::string(side) + " sequential gateway quiet window failed: " + detail;
+        return false;
+    }
+    if (poll_child(frontend)) {
+        error = std::string(side) + " exited during the sequential gateway quiet window";
+        return false;
+    }
+
+    if (!send_all(client.fd, kGatewayCloseRequest2, sizeof(kGatewayCloseRequest2) - 1)) {
+        error = std::string(side) + " sequential gateway request 2 send failed";
+        return false;
+    }
+    std::vector<char> second;
+    detail.clear();
+    if (!read_response(client.fd, second, detail)) {
+        error = std::string(side) + " sequential gateway response 2 failed: " + detail;
+        return false;
+    }
+    if (!validate_exact_normalized_response(second, kGatewayResponseNormalized, detail)) {
+        error = std::string(side) + " sequential gateway response 2 mismatch: " + detail;
+        return false;
+    }
+    if (!read_eof(client.fd, detail)) {
+        error = std::string(side) + " sequential gateway response 2 EOF failed: " + detail;
+        return false;
+    }
+    responses.push_back(std::move(second));
+
+    if (responses.size() != 2) {
+        error = std::string(side) +
+                " sequential gateway did not produce exactly two complete responses";
+        return false;
+    }
+    return true;
+}
+
 static bool capture_gateway_case(u16 frontend_port,
                                  u16 backend_port,
                                  const std::string& source_path,
@@ -4113,8 +4201,8 @@ static bool capture_gateway_case(u16 frontend_port,
                                  const std::string& rut_log_path,
                                  const std::string& rut_path,
                                  const std::string& container_name,
-                                 std::vector<char>& nginx_response,
-                                 std::vector<char>& rut_response,
+                                 std::vector<std::vector<char>>& nginx_responses,
+                                 std::vector<std::vector<char>>& rut_responses,
                                  std::string& error) {
     DeadPort dead;
     if (!dead.reserve(backend_port)) {
@@ -4143,20 +4231,26 @@ static bool capture_gateway_case(u16 frontend_port,
         return false;
     }
     if (!wait_ready(frontend_port, nginx.child, error)) return false;
-    const int nginx_client = connect_once(frontend_port);
-    if (nginx_client < 0 || !send_all(nginx_client, kGatewayRequest, sizeof(kGatewayRequest) - 1) ||
-        !read_response(nginx_client, nginx_response, error) || !read_eof(nginx_client, error)) {
-        if (nginx_client >= 0) close(nginx_client);
-        error = "nginx gateway response/EOF failed: " + error;
+    if (!exercise_sequential_gateway_failures(
+            frontend_port, nginx.child, "nginx", nginx_responses, error))
         return false;
-    }
-    close(nginx_client);
     if (!stop_child(nginx.child)) {
         error = "failed to stop nginx after gateway case";
         return false;
     }
     if (!docker.remove()) {
         error = "docker rm -f failed after nginx gateway case";
+        return false;
+    }
+    const std::string upstream_context = "127.0.0.1:" + std::to_string(backend_port);
+    u32 connect_failure_record_count = 0;
+    const bool log_readable = log_count_line_with(
+        nginx_log_path, "connect() failed", upstream_context.c_str(), connect_failure_record_count);
+    if (!log_readable || connect_failure_record_count != 2) {
+        error =
+            "nginx sequential gateway log did not contain exactly two line-scoped connect "
+            "failures for " +
+            upstream_context + " (actual " + std::to_string(connect_failure_record_count) + ")";
         return false;
     }
 
@@ -4168,14 +4262,9 @@ static bool capture_gateway_case(u16 frontend_port,
         return false;
     }
     if (!wait_ready(frontend_port, rut.child, error)) return false;
-    const int rut_client = connect_once(frontend_port);
-    if (rut_client < 0 || !send_all(rut_client, kGatewayRequest, sizeof(kGatewayRequest) - 1) ||
-        !read_response(rut_client, rut_response, error) || !read_eof(rut_client, error)) {
-        if (rut_client >= 0) close(rut_client);
-        error = "RUT gateway response/EOF failed: " + error;
+    if (!exercise_sequential_gateway_failures(
+            frontend_port, rut.child, "RUT", rut_responses, error))
         return false;
-    }
-    close(rut_client);
     if (!stop_child(rut.child)) {
         error = "failed to stop production RUT after gateway case";
         return false;
@@ -5549,8 +5638,8 @@ int main(int argc, char** argv) {
                  "explicit-close completion vector (one complete fixed-CL origin send, immediate "
                  "clean origin EOF, exact normalized response/downstream EOF, no retry); this "
                  "does not claim pipelined successors or broader client/config behavior\n";
-    std::vector<char> nginx_gateway_response;
-    std::vector<char> rut_gateway_response;
+    std::vector<std::vector<char>> nginx_gateway_responses;
+    std::vector<std::vector<char>> rut_gateway_responses;
     std::string gateway_error;
     const std::string gateway_container = container + "-gateway";
     if (!capture_gateway_case(frontend_port,
@@ -5561,45 +5650,40 @@ int main(int argc, char** argv) {
                               temp.rut_log,
                               argv[1],
                               gateway_container,
-                              nginx_gateway_response,
-                              rut_gateway_response,
+                              nginx_gateway_responses,
+                              rut_gateway_responses,
                               gateway_error)) {
         std::cerr << "FAIL [gateway differential]: " << gateway_error << "\n";
-        dump_wire("nginx gateway response", nginx_gateway_response);
-        dump_wire("RUT gateway response", rut_gateway_response);
+        for (const auto& response : nginx_gateway_responses)
+            dump_wire("nginx sequential gateway response", response);
+        for (const auto& response : rut_gateway_responses)
+            dump_wire("RUT sequential gateway response", response);
         dump_log(temp.nginx_log, "nginx log");
         dump_log(temp.rut_log, "RUT log");
         return 1;
     }
-    static constexpr char kGatewayStatus[] = "HTTP/1.1 502 Bad Gateway\r\n";
-    if (nginx_gateway_response.size() < sizeof(kGatewayStatus) - 1 ||
-        rut_gateway_response.size() < sizeof(kGatewayStatus) - 1 ||
-        memcmp(nginx_gateway_response.data(), kGatewayStatus, sizeof(kGatewayStatus) - 1) != 0 ||
-        memcmp(rut_gateway_response.data(), kGatewayStatus, sizeof(kGatewayStatus) - 1) != 0) {
-        std::cerr << "FAIL [gateway compare]: expected exact HTTP/1.1 502 status\n";
-        dump_wire("nginx gateway response", nginx_gateway_response);
-        dump_wire("RUT gateway response", rut_gateway_response);
-        dump_log(temp.nginx_log, "nginx log");
-        dump_log(temp.rut_log, "RUT log");
+    if (nginx_gateway_responses.size() != 2 || rut_gateway_responses.size() != 2) {
+        std::cerr << "FAIL [gateway compare]: expected exactly two complete responses per side\n";
         return 1;
     }
-    std::vector<char> normalized_nginx_gateway = nginx_gateway_response;
-    std::vector<char> normalized_rut_gateway = rut_gateway_response;
-    if (!normalize_date(normalized_nginx_gateway) || !normalize_date(normalized_rut_gateway) ||
-        normalized_nginx_gateway != normalized_rut_gateway ||
-        normalized_nginx_gateway.size() != sizeof(kGatewayResponseNormalized) - 1 ||
-        memcmp(normalized_nginx_gateway.data(),
-               kGatewayResponseNormalized,
-               sizeof(kGatewayResponseNormalized) - 1) != 0) {
-        std::cerr
-            << "FAIL [gateway compare]: exact 502 response mismatch after Date normalization\n";
-        dump_wire("nginx gateway response", nginx_gateway_response);
-        dump_wire("RUT gateway response", rut_gateway_response);
-        dump_log(temp.nginx_log, "nginx log");
-        dump_log(temp.rut_log, "RUT log");
-        return 1;
+    for (size_t i = 0; i < 2; i++) {
+        std::vector<char> normalized_nginx_gateway = nginx_gateway_responses[i];
+        std::vector<char> normalized_rut_gateway = rut_gateway_responses[i];
+        if (!normalize_date(normalized_nginx_gateway) || !normalize_date(normalized_rut_gateway) ||
+            normalized_nginx_gateway != normalized_rut_gateway) {
+            std::cerr << "FAIL [gateway compare]: response " << (i + 1)
+                      << " differs after strict Date normalization\n";
+            dump_wire("nginx sequential gateway response", nginx_gateway_responses[i]);
+            dump_wire("RUT sequential gateway response", rut_gateway_responses[i]);
+            dump_log(temp.nginx_log, "nginx log");
+            dump_log(temp.rut_log, "RUT log");
+            return 1;
+        }
     }
-    std::cerr << "PASS: pinned nginx and RUT unavailable-upstream gateway case (502 + EOF)\n";
+    std::cerr << "PASS: converter-generated RUT matches pinned nginx for bounded sequential GET "
+                 "unavailable-upstream 502 -> 502 on one downstream (response 1 keep-alive + live "
+                 "quiet window, response 2 close + real EOF, exactly two scoped nginx connect "
+                 "failures); this excludes pipelining/#276 and broader client/config behavior\n";
 
     std::vector<char> nginx_head_response;
     std::vector<char> nginx_head_request;
