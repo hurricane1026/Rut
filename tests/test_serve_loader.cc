@@ -578,6 +578,56 @@ TEST(serve_loader, unmatched_source_loads_into_owned_runtime_table) {
     program.destroy();
 }
 
+TEST(serve_loader, unmatched_representation200_is_deep_owned_and_copyable) {
+    const std::string path =
+        write_file("/tmp/rut_serve_loader_unmatched_representation200",
+                   "app.rut",
+                   "unmatched { return local_response({ version: \"HTTP/1.1\", status: 200, "
+                   "reason: \"OK\", server: \"nginx/1.29.7\", date: \"current\", content_type: "
+                   "\"text/plain\", connection: \"request\", head_mode: \"suppress_body\", "
+                   "body: b\"successor-static\" }) }\n"
+                   "route GET \"/\" { return 204 }\n");
+
+    LoadedProgram program;
+    LoadError err;
+    REQUIRE(load_rut_program(path.c_str(), program, err));
+    REQUIRE_EQ(program.rir.module.strict_local_response_policy_count, 1u);
+    REQUIRE_EQ(program.config.strict_local_response_policy_count, 1u);
+    CHECK_EQ(program.rir.module.unmatched_policy_ids[kRouteMethodAny], 1u);
+    CHECK_EQ(program.config.unmatched_policy_ids[kRouteMethodAny], 1u);
+    const auto& rir_policy = program.rir.module.strict_local_response_policies[0];
+    const auto& owned = program.config.strict_local_response_policies[0];
+    CHECK(strict_local_response_policy_spec_valid(rir_policy));
+    CHECK(strict_local_response_policy_spec_valid(owned));
+    CHECK_EQ(strict_local_response_profile(owned.status_code),
+             StrictLocalResponseProfile::Representation200);
+    CHECK(owned.reason.eq({"OK", 2}));
+    CHECK(owned.content_type.eq({"text/plain", 10}));
+    CHECK(owned.server.eq({"nginx/1.29.7", 12}));
+    CHECK(owned.body.eq({"successor-static", 16}));
+    CHECK(owned.reason.ptr != rir_policy.reason.ptr);
+    CHECK(owned.content_type.ptr != rir_policy.content_type.ptr);
+    CHECK(owned.server.ptr != rir_policy.server.ptr);
+    CHECK(owned.body.ptr != rir_policy.body.ptr);
+    CHECK(program.config.strict_local_response_policy_id_is_owned(1));
+    CHECK(program.config.unmatched_policy_table_is_valid());
+
+    auto copied = std::make_unique<RouteConfig>();
+    REQUIRE(copied->copy_unmatched_policy_table_from_owned(program.config));
+    REQUIRE(copied->unmatched_policy_table_is_valid());
+    const auto& copied_policy = copied->strict_local_response_policies[0];
+    CHECK(copied_policy.body.eq({"successor-static", 16}));
+    CHECK(copied_policy.reason.ptr != owned.reason.ptr);
+    CHECK(copied_policy.content_type.ptr != owned.content_type.ptr);
+    CHECK(copied_policy.server.ptr != owned.server.ptr);
+    CHECK(copied_policy.body.ptr != owned.body.ptr);
+
+    copied->strict_local_response_policies[0].reason = {"Created", 7};
+    CHECK_FALSE(copied->unmatched_policy_table_is_valid());
+    CHECK_FALSE(copied->strict_local_response_policy_id_is_owned(1));
+    program.destroy();
+}
+
 TEST(serve_loader, unmatched_population_owns_valid_table_and_rejects_forgery_before_mutation) {
     static constexpr char kReason[] = "Bad Request";
     static constexpr char kType[] = "text/plain";

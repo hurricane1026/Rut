@@ -4703,7 +4703,8 @@ struct Parser {
                                               span_from(*value.value()));
                     status = status * 10 + digit;
                 }
-                if (status < 400 || status > 599)
+                if (status > 0xffffu ||
+                    !strict_local_response_status_supported(static_cast<u16>(status)))
                     return frontend_error(FrontendError::InvalidStatusCode,
                                           span_from(*value.value()));
                 policy.status_code = static_cast<u16>(status);

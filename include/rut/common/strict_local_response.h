@@ -17,6 +17,11 @@ enum class StrictLocalResponseVersion : u8 { Invalid = 0, Http11 = 1 };
 enum class StrictLocalResponseDate : u8 { Invalid = 0, Current = 1 };
 enum class StrictLocalResponseConnection : u8 { Invalid = 0, Request = 1 };
 enum class StrictLocalResponseHeadMode : u8 { Reject = 0, SuppressBody = 1, Invalid = 2 };
+enum class StrictLocalResponseProfile : u8 {
+    Invalid = 0,
+    Representation200 = 1,
+    LegacyError = 2,
+};
 
 struct StrictLocalResponsePolicySpec {
     StrictLocalResponseVersion version = StrictLocalResponseVersion::Invalid;
@@ -50,9 +55,21 @@ inline bool strict_local_response_content_type_valid(Str value) {
                HttpHeaderValidation::Ok;
 }
 
+constexpr StrictLocalResponseProfile strict_local_response_profile(u16 status_code) {
+    if (status_code == 200) return StrictLocalResponseProfile::Representation200;
+    if (status_code >= 400 && status_code <= 599) return StrictLocalResponseProfile::LegacyError;
+    return StrictLocalResponseProfile::Invalid;
+}
+
+constexpr bool strict_local_response_status_supported(u16 status_code) {
+    return strict_local_response_profile(status_code) != StrictLocalResponseProfile::Invalid;
+}
+
 inline bool strict_local_response_policy_spec_valid(const StrictLocalResponsePolicySpec& policy) {
-    if (policy.version != StrictLocalResponseVersion::Http11 || policy.status_code < 400 ||
-        policy.status_code > 599 || policy.date != StrictLocalResponseDate::Current ||
+    const auto profile = strict_local_response_profile(policy.status_code);
+    if (profile == StrictLocalResponseProfile::Invalid ||
+        policy.version != StrictLocalResponseVersion::Http11 ||
+        policy.date != StrictLocalResponseDate::Current ||
         policy.connection != StrictLocalResponseConnection::Request ||
         (policy.head_mode != StrictLocalResponseHeadMode::Reject &&
          policy.head_mode != StrictLocalResponseHeadMode::SuppressBody) ||
@@ -60,6 +77,10 @@ inline bool strict_local_response_policy_spec_valid(const StrictLocalResponsePol
         !strict_local_response_content_type_valid(policy.content_type) ||
         !strict_local_response_safe_text(policy.server, kMaxStrictLocalResponseServerLen) ||
         !strict_local_response_body_valid(policy.body))
+        return false;
+    if (profile == StrictLocalResponseProfile::Representation200 &&
+        (!policy.reason.eq(lit_str("OK")) || !policy.content_type.eq(lit_str("text/plain")) ||
+         policy.head_mode != StrictLocalResponseHeadMode::SuppressBody || policy.body.len == 0))
         return false;
     return true;
 }

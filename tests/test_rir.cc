@@ -1923,6 +1923,55 @@ TEST(RirVerifier, StrictLocalResponseRejectsForgedCountsIdsMappingsAndPolicies) 
     }
 }
 
+TEST(RirVerifier, StrictLocalResponseRepresentation200RejectsEveryForgedProfileField) {
+    static constexpr char kBody[] = "successor-static";
+    StrictLocalResponsePolicySpec policy{};
+    policy.version = StrictLocalResponseVersion::Http11;
+    policy.status_code = 200;
+    policy.date = StrictLocalResponseDate::Current;
+    policy.connection = StrictLocalResponseConnection::Request;
+    policy.head_mode = StrictLocalResponseHeadMode::SuppressBody;
+    policy.reason = {"OK", 2};
+    policy.content_type = {"text/plain", 10};
+    policy.server = {"nginx/1.29.7", 12};
+    policy.body = {kBody, sizeof(kBody) - 1};
+
+    auto module_with = [](const StrictLocalResponsePolicySpec& candidate) {
+        Module mod{};
+        mod.strict_local_response_policies[0] = candidate;
+        mod.strict_local_response_policy_count = 1;
+        mod.unmatched_policy_ids[kRouteMethodAny] = 1;
+        return mod;
+    };
+    REQUIRE(verify_module(module_with(policy)).ok);
+    auto rejects = [&](const StrictLocalResponsePolicySpec& forged) {
+        CHECK_EQ(verify_module(module_with(forged)).issue.code,
+                 VerifyIssueCode::InvalidUnmatchedPolicyId);
+    };
+
+    for (const u16 status : {199u, 201u, 204u, 205u, 206u, 304u}) {
+        auto forged = policy;
+        forged.status_code = status;
+        rejects(forged);
+    }
+    auto forged = policy;
+    forged.reason = {"Created", 7};
+    rejects(forged);
+    forged = policy;
+    forged.content_type = {"text/html", 9};
+    rejects(forged);
+    forged = policy;
+    forged.head_mode = StrictLocalResponseHeadMode::Reject;
+    rejects(forged);
+    forged = policy;
+    forged.body = {kBody, 0};
+    rejects(forged);
+    std::string oversized(kMaxStrictLocalResponseBodyLen + 1, 'x');
+    forged = policy;
+    forged.body = {oversized.data(), static_cast<u32>(oversized.size())};
+    rejects(forged);
+}
+
 TEST(RirPrinter, StrictLocalResponseForgedMetadataPrintsOneSafeMarker) {
     static constexpr char kReason[] = "Bad Request";
     static constexpr char kType[] = "text/plain";

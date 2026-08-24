@@ -34970,6 +34970,185 @@ unmatched { return local_response({
     lowered.destroy();
 }
 
+TEST(frontend, strict_local_response_representation200_profile_is_exact_and_reaches_rir) {
+    static_assert(strict_local_response_profile(200) ==
+                  StrictLocalResponseProfile::Representation200);
+    static_assert(strict_local_response_profile(400) == StrictLocalResponseProfile::LegacyError);
+    static_assert(strict_local_response_profile(599) == StrictLocalResponseProfile::LegacyError);
+    static_assert(strict_local_response_profile(199) == StrictLocalResponseProfile::Invalid);
+    static_assert(strict_local_response_profile(201) == StrictLocalResponseProfile::Invalid);
+    static_assert(strict_local_response_profile(600) == StrictLocalResponseProfile::Invalid);
+
+    static constexpr char kSource[] = R"rut(
+unmatched { return local_response({
+  version: "HTTP/1.1", status: 200, reason: "OK", server: "nginx/1.29.7",
+  date: "current", content_type: "text/plain", connection: "request",
+  head_mode: "suppress_body", body: b"successor-static"
+}) }
+)rut";
+    auto lexed = lex(lit(kSource));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    REQUIRE_EQ(ast->strict_local_response_policies.len, 1u);
+    CHECK_EQ(ast->unmatched_policy_ids[kRouteMethodAny], 1u);
+    const auto& ast_policy = ast->strict_local_response_policies[0];
+    CHECK_EQ(strict_local_response_profile(ast_policy.status_code),
+             StrictLocalResponseProfile::Representation200);
+    CHECK(ast_policy.reason.eq(lit("OK")));
+    CHECK(ast_policy.content_type.eq(lit("text/plain")));
+    CHECK(ast_policy.server.eq(lit("nginx/1.29.7")));
+    CHECK(ast_policy.body.eq(lit("successor-static")));
+
+    auto ast_copy = std::make_unique<AstFile>(ast.value());
+    CHECK(ast_copy->strict_local_response_policies[0].body.ptr != ast_policy.body.ptr);
+    CHECK(ast_copy->strict_local_response_policies[0].body.eq(lit("successor-static")));
+
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    REQUIRE_EQ(hir->strict_local_response_policies.len, 1u);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    REQUIRE_EQ(mir->strict_local_response_policies.len, 1u);
+    FrontendRirModule lowered{};
+    REQUIRE(lower_to_rir(mir.value(), lowered));
+    REQUIRE(rir::verify_module(lowered.module).ok);
+    REQUIRE_EQ(lowered.module.strict_local_response_policy_count, 1u);
+    const auto& rir_policy = lowered.module.strict_local_response_policies[0];
+    CHECK(strict_local_response_policy_spec_valid(rir_policy));
+    CHECK(rir_policy.reason.eq(lit("OK")));
+    CHECK(rir_policy.content_type.eq(lit("text/plain")));
+    CHECK(rir_policy.server.eq(lit("nginx/1.29.7")));
+    CHECK(rir_policy.body.eq(lit("successor-static")));
+    CHECK(rir_policy.reason.ptr != ast_policy.reason.ptr);
+    CHECK(rir_policy.content_type.ptr != ast_policy.content_type.ptr);
+    CHECK(rir_policy.server.ptr != ast_policy.server.ptr);
+    CHECK(rir_policy.body.ptr != ast_policy.body.ptr);
+    lowered.destroy();
+}
+
+TEST(frontend, strict_local_response_representation200_rejection_matrix_is_central) {
+    std::string body(kMaxStrictLocalResponseBodyLen, 'x');
+    StrictLocalResponsePolicySpec representation{};
+    representation.version = StrictLocalResponseVersion::Http11;
+    representation.status_code = 200;
+    representation.date = StrictLocalResponseDate::Current;
+    representation.connection = StrictLocalResponseConnection::Request;
+    representation.head_mode = StrictLocalResponseHeadMode::SuppressBody;
+    representation.reason = {"OK", 2};
+    representation.content_type = {"text/plain", 10};
+    representation.server = {"nginx/1.29.7", 12};
+    representation.body = {body.data(), static_cast<u32>(body.size())};
+    REQUIRE(strict_local_response_policy_spec_valid(representation));
+
+    auto rejects = [&](const StrictLocalResponsePolicySpec& forged) {
+        CHECK_FALSE(strict_local_response_policy_spec_valid(forged));
+        auto ast = std::make_unique<AstFile>();
+        CHECK_EQ(ast->add_strict_local_response_policy(forged), 0u);
+    };
+    for (const u16 status : {199u, 201u, 204u, 205u, 206u, 304u}) {
+        auto forged = representation;
+        forged.status_code = status;
+        rejects(forged);
+    }
+    auto forged = representation;
+    forged.reason = {"Created", 7};
+    rejects(forged);
+    forged = representation;
+    forged.content_type = {"text/html", 9};
+    rejects(forged);
+    forged = representation;
+    forged.head_mode = StrictLocalResponseHeadMode::Reject;
+    rejects(forged);
+    forged = representation;
+    forged.body = {body.data(), 0};
+    rejects(forged);
+    body.push_back('x');
+    forged = representation;
+    forged.body = {body.data(), static_cast<u32>(body.size())};
+    rejects(forged);
+    body.pop_back();
+
+    // The legacy error profile remains byte-for-byte permissive about its
+    // representation fields: empty bodies and both historical HEAD modes are
+    // still accepted at both status boundaries.
+    StrictLocalResponsePolicySpec legacy = representation;
+    legacy.status_code = 400;
+    legacy.reason = {"Bad", 3};
+    legacy.content_type = {"text/html", 9};
+    legacy.head_mode = StrictLocalResponseHeadMode::Reject;
+    legacy.body = {};
+    CHECK(strict_local_response_policy_spec_valid(legacy));
+    legacy.status_code = 599;
+    legacy.head_mode = StrictLocalResponseHeadMode::SuppressBody;
+    CHECK(strict_local_response_policy_spec_valid(legacy));
+
+    const u16 invalid_statuses[] = {199, 201, 204, 205, 206, 304};
+    for (const u16 status : invalid_statuses) {
+        const std::string source =
+            "unmatched { return local_response({ version: \"HTTP/1.1\", status: " +
+            std::to_string(status) +
+            ", reason: \"OK\", server: \"nginx/1.29.7\", date: \"current\", "
+            "content_type: \"text/plain\", connection: \"request\", "
+            "head_mode: \"suppress_body\", body: b\"successor-static\" }) }\n";
+        auto invalid_lexed = lex({source.data(), static_cast<u32>(source.size())});
+        REQUIRE(invalid_lexed);
+        CHECK_FALSE(parse_file_heap(invalid_lexed.value()).has_value());
+    }
+
+    const std::string valid_source =
+        "unmatched { return local_response({ version: \"HTTP/1.1\", status: 200, "
+        "reason: \"OK\", server: \"nginx/1.29.7\", date: \"current\", content_type: "
+        "\"text/plain\", connection: \"request\", head_mode: \"suppress_body\", "
+        "body: b\"successor-static\" }) }\n";
+    auto replace_once = [&](std::string value, const char* from, const std::string& to) {
+        const auto pos = value.find(from);
+        CHECK(pos != std::string::npos);
+        if (pos == std::string::npos) return value;
+        value.replace(pos, std::char_traits<char>::length(from), to);
+        return value;
+    };
+    const std::string oversized_body(kMaxStrictLocalResponseBodyLen + 1, 'x');
+    const std::string invalid_profiles[] = {
+        replace_once(valid_source, "reason: \"OK\"", "reason: \"Created\""),
+        replace_once(valid_source, "content_type: \"text/plain\"", "content_type: \"text/html\""),
+        replace_once(valid_source, "head_mode: \"suppress_body\"", "head_mode: \"reject\""),
+        replace_once(valid_source, "body: b\"successor-static\"", "body: b\"\""),
+        replace_once(valid_source,
+                     "body: b\"successor-static\"",
+                     std::string("body: b\"") + oversized_body + "\""),
+    };
+    for (const auto& source : invalid_profiles) {
+        auto invalid_lexed = lex({source.data(), static_cast<u32>(source.size())});
+        REQUIRE(invalid_lexed);
+        CHECK_FALSE(parse_file_heap(invalid_lexed.value()).has_value());
+    }
+
+    std::string aggregate;
+    for (const char* method : {"OPTIONS", "CONNECT"}) {
+        aggregate += "unmatched ";
+        aggregate += method;
+        aggregate +=
+            " { return local_response({ version: \"HTTP/1.1\", status: 200, reason: \"OK\", "
+            "server: \"nginx/1.29.7\", date: \"current\", content_type: \"text/plain\", "
+            "connection: \"request\", head_mode: \"suppress_body\", body: b\"";
+        aggregate.append(4080, method[0]);
+        aggregate += "\" }) }\n";
+    }
+    auto aggregate_lexed = lex({aggregate.data(), static_cast<u32>(aggregate.size())});
+    REQUIRE(aggregate_lexed);
+    CHECK_FALSE(parse_file_heap(aggregate_lexed.value()).has_value());
+
+    const char malformed_escape[] = R"rut(unmatched { return local_response({
+      version: "HTTP/1.1", status: 200, reason: "OK", server: "nginx/1.29.7",
+      date: "current", content_type: "text/plain", connection: "request",
+      head_mode: "suppress_body", body: b"bad\q"
+    }) })rut";
+    auto malformed_lexed = lex(lit(malformed_escape));
+    REQUIRE(malformed_lexed);
+    CHECK_FALSE(parse_file_heap(malformed_lexed.value()).has_value());
+}
+
 TEST(frontend, strict_local_response_ast_copy_move_owns_nonempty_and_empty_bodies) {
     const char source[] = R"rut(
 unmatched OPTIONS { return local_response({
