@@ -81,6 +81,8 @@ Allowed states are `SUPPORTED`, `PARTIAL`, `BLOCKED_BY_RUT`,
   domains remain open. #278 owns strict-policy admission/execution after a
   preserved successor is dispatched with nonzero pipeline depth. The bounded
   `SUPPORTED` GET row is explicitly sequential and claims none of these cases.
+  Separately, #285 tracks enforcement of RUT's declared maximum HTTP/1 pipeline
+  depth; it does not block #278's exact depth-one design.
 - Ordinary JIT local responses now use one parser-proven HTTP/1 request boundary
   and client persistence decision for their wire framing and lifecycle (#280).
   Their text body literal still retains escape spellings such as `\\n` instead
