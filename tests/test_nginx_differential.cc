@@ -44,6 +44,37 @@ static constexpr char kGatewayCloseRequest2[] =
     "GET /missing?q=2 HTTP/1.1\r\n"
     "Host: client.example\r\n"
     "Connection: close\r\n\r\n";
+static constexpr char kExactLocalGetKeepAliveRequest[] =
+    "GET /static HTTP/1.1\r\n"
+    "Host: exact-local.example\r\n\r\n";
+static constexpr char kExactLocalGetCloseRequest[] =
+    "GET /static HTTP/1.1\r\n"
+    "Host: exact-local.example\r\n"
+    "Connection: close\r\n\r\n";
+static constexpr char kExactLocalHeadCloseRequest[] =
+    "HEAD /static HTTP/1.1\r\n"
+    "Host: exact-local.example\r\n"
+    "Connection: close\r\n\r\n";
+static constexpr char kExactLocalPostCloseRequest[] =
+    "POST /static HTTP/1.1\r\n"
+    "Host: exact-local.example\r\n"
+    "Connection: close\r\n\r\n";
+static constexpr char kExactLocalOptionsCloseRequest[] =
+    "OPTIONS /static HTTP/1.1\r\n"
+    "Host: exact-local.example\r\n"
+    "Connection: close\r\n\r\n";
+static constexpr char kExactLocalQueryCloseRequest[] =
+    "GET /static?x=1 HTTP/1.1\r\n"
+    "Host: exact-local.example\r\n"
+    "Connection: close\r\n\r\n";
+static constexpr char kExactLocalSlashFallbackRequest[] =
+    "GET /static/ HTTP/1.1\r\n"
+    "Host: exact-local.example\r\n"
+    "Connection: close\r\n\r\n";
+static constexpr char kExactLocalChildFallbackRequest[] =
+    "GET /static/child HTTP/1.1\r\n"
+    "Host: exact-local.example\r\n"
+    "Connection: close\r\n\r\n";
 static constexpr char kOptionsStarRequest[] =
     "OPTIONS * HTTP/1.1\r\n"
     "Host: options-star-client.example\r\n"
@@ -289,6 +320,32 @@ static constexpr char kGatewayKeepAliveResponseNormalized[] =
     "<hr><center>nginx/1.29.7</center>\r\n"
     "</body>\r\n"
     "</html>\r\n";
+static constexpr char kExactLocalKeepAliveResponseNormalized[] =
+    "HTTP/1.1 200 OK\r\n"
+    "Server: nginx/1.29.7\r\n"
+    "Date: XXXXXXXXXXXXXXXXXXXXXXXXXXXXX\r\n"
+    "Content-Type: text/plain\r\n"
+    "Content-Length: 16\r\n"
+    "Connection: keep-alive\r\n"
+    "\r\n"
+    "successor-static";
+static constexpr char kExactLocalCloseResponseNormalized[] =
+    "HTTP/1.1 200 OK\r\n"
+    "Server: nginx/1.29.7\r\n"
+    "Date: XXXXXXXXXXXXXXXXXXXXXXXXXXXXX\r\n"
+    "Content-Type: text/plain\r\n"
+    "Content-Length: 16\r\n"
+    "Connection: close\r\n"
+    "\r\n"
+    "successor-static";
+static constexpr char kExactLocalHeadCloseResponseNormalized[] =
+    "HTTP/1.1 200 OK\r\n"
+    "Server: nginx/1.29.7\r\n"
+    "Date: XXXXXXXXXXXXXXXXXXXXXXXXXXXXX\r\n"
+    "Content-Type: text/plain\r\n"
+    "Content-Length: 16\r\n"
+    "Connection: close\r\n"
+    "\r\n";
 
 struct Child {
     pid_t pid = -1;
@@ -5763,10 +5820,295 @@ static bool run_late_successor_differential(u16 frontend_port,
     return true;
 }
 
+struct ExactLocalReturnObservation {
+    std::string order;
+    std::vector<std::vector<char>> wires;
+    u32 scoped_connect_failures = 0;
+};
+
+static void dump_exact_local_return_observation(const ExactLocalReturnObservation& observation) {
+    static constexpr const char* kLabels[] = {
+        "GET keep-alive",
+        "GET keep-alive successor close",
+        "GET close",
+        "HEAD close",
+        "POST close",
+        "OPTIONS close",
+        "GET query close",
+        "GET /static/ fallback",
+        "GET /static/child fallback",
+    };
+    std::cerr << "exact-local order=" << observation.order
+              << " scoped-connect-failures=" << observation.scoped_connect_failures << "\n";
+    for (size_t i = 0; i < observation.wires.size(); i++) {
+        const std::string label =
+            std::string("exact-local ") +
+            (i < sizeof(kLabels) / sizeof(kLabels[0]) ? kLabels[i] : "unexpected vector");
+        dump_wire(label.c_str(), observation.wires[i]);
+    }
+}
+
+static bool capture_pinned_exact_local_order(u16 frontend_port,
+                                             u16 backend_port,
+                                             TempDir& temp,
+                                             const std::string& container_name,
+                                             bool exact_first,
+                                             ExactLocalReturnObservation& observation,
+                                             std::string& error) {
+    // This baseline is deliberately limited to the literal origin-form path
+    // /static.  //static, percent-encoded spellings, and dot-segment aliases
+    // are not converter-compatibility evidence for #286/#288.
+    const std::string exact_location =
+        "    location = /static { return 200 \"successor-static\"; }\n";
+    const std::string root_location =
+        "    location / { proxy_pass http://127.0.0.1:" + std::to_string(backend_port) + "; }\n";
+    const std::string config =
+        "error_log stderr notice;\n"
+        "events {}\n"
+        "http {\n  server {\n    listen " +
+        std::to_string(frontend_port) + ";\n" +
+        (exact_first ? exact_location + root_location : root_location + exact_location) +
+        "  }\n}\n";
+    if (!write_file(temp.nginx_config, config.data(), config.size())) {
+        error = "failed to write exact-local pinned nginx config";
+        return false;
+    }
+
+    DockerGuard docker(container_name);
+    ChildGuard nginx;
+    if (!spawn_child({"docker",
+                      "run",
+                      "--pull=never",
+                      "--network",
+                      "host",
+                      "--name",
+                      container_name,
+                      "-v",
+                      temp.nginx_config + ":/etc/nginx/nginx.conf:ro",
+                      kNginxImage,
+                      "nginx",
+                      "-g",
+                      "daemon off;"},
+                     temp.nginx_log,
+                     nginx.child)) {
+        error = "failed to start pinned nginx for exact-local baseline";
+        return false;
+    }
+    if (!wait_ready(frontend_port, nginx.child, error)) return false;
+
+    observation.order = exact_first ? "exact-before-root" : "root-before-exact";
+    observation.wires.clear();
+    observation.scoped_connect_failures = 0;
+    const std::string upstream_context = "127.0.0.1:" + std::to_string(backend_port);
+    const auto require_frontend_live = [&](const char* vector_name) {
+        if (!poll_child(nginx.child)) return true;
+        error = std::string("pinned nginx exited during exact-local vector ") + vector_name;
+        return false;
+    };
+    const auto validate_and_record =
+        [&](std::vector<char>& wire, const char* expected, const char* vector_name) {
+            observation.wires.push_back(wire);
+            std::string detail;
+            if (!validate_exact_normalized_response(wire, expected, detail)) {
+                error = std::string(vector_name) + " exact wire mismatch: " + detail;
+                return false;
+            }
+            return require_frontend_live(vector_name);
+        };
+    const auto run_close_vector = [&](const char* vector_name,
+                                      const char* request,
+                                      size_t request_length,
+                                      const char* expected,
+                                      bool head) {
+        struct ClientGuard {
+            int fd = -1;
+            ~ClientGuard() {
+                if (fd >= 0) close(fd);
+            }
+        } client{connect_once(frontend_port)};
+        if (client.fd < 0 || !send_all(client.fd, request, request_length)) {
+            error = std::string("failed to send exact-local vector ") + vector_name;
+            return false;
+        }
+        std::vector<char> wire;
+        const bool response_ok = head ? read_head_response(client.fd, wire, error)
+                                      : read_response(client.fd, wire, error);
+        if (!response_ok || !read_eof(client.fd, error)) {
+            observation.wires.push_back(wire);
+            error = std::string(vector_name) + " response/EOF failed: " + error;
+            return false;
+        }
+        return validate_and_record(wire, expected, vector_name);
+    };
+
+    {
+        struct ClientGuard {
+            int fd = -1;
+            ~ClientGuard() {
+                if (fd >= 0) close(fd);
+            }
+        } client{connect_once(frontend_port)};
+        if (client.fd < 0 || !send_all(client.fd,
+                                       kExactLocalGetKeepAliveRequest,
+                                       sizeof(kExactLocalGetKeepAliveRequest) - 1u)) {
+            error = "failed to send exact-local GET keep-alive vector";
+            return false;
+        }
+        std::vector<char> first;
+        if (!read_response(client.fd, first, error)) {
+            observation.wires.push_back(first);
+            error = "GET /static keep-alive response failed: " + error;
+            return false;
+        }
+        if (!validate_and_record(
+                first, kExactLocalKeepAliveResponseNormalized, "GET /static keep-alive"))
+            return false;
+        bool eof = false;
+        if (!wait_keepalive_quiet_or_eof(client.fd, 500, eof, error) || eof) {
+            if (error.empty()) error = "GET /static keep-alive closed before successor request";
+            return false;
+        }
+        if (!require_frontend_live("GET /static keep-alive quiet window") ||
+            !send_all(
+                client.fd, kExactLocalGetCloseRequest, sizeof(kExactLocalGetCloseRequest) - 1u)) {
+            if (error.empty()) error = "failed to send exact-local keep-alive successor request";
+            return false;
+        }
+        std::vector<char> second;
+        if (!read_response(client.fd, second, error) || !read_eof(client.fd, error)) {
+            observation.wires.push_back(second);
+            error = "GET /static successor close response/EOF failed: " + error;
+            return false;
+        }
+        if (!validate_and_record(
+                second, kExactLocalCloseResponseNormalized, "GET /static successor close"))
+            return false;
+    }
+
+    if (!run_close_vector("GET /static close",
+                          kExactLocalGetCloseRequest,
+                          sizeof(kExactLocalGetCloseRequest) - 1u,
+                          kExactLocalCloseResponseNormalized,
+                          false) ||
+        !run_close_vector("HEAD /static close",
+                          kExactLocalHeadCloseRequest,
+                          sizeof(kExactLocalHeadCloseRequest) - 1u,
+                          kExactLocalHeadCloseResponseNormalized,
+                          true) ||
+        !run_close_vector("POST /static close",
+                          kExactLocalPostCloseRequest,
+                          sizeof(kExactLocalPostCloseRequest) - 1u,
+                          kExactLocalCloseResponseNormalized,
+                          false) ||
+        !run_close_vector("OPTIONS /static close",
+                          kExactLocalOptionsCloseRequest,
+                          sizeof(kExactLocalOptionsCloseRequest) - 1u,
+                          kExactLocalCloseResponseNormalized,
+                          false) ||
+        !run_close_vector("GET /static?x=1 close",
+                          kExactLocalQueryCloseRequest,
+                          sizeof(kExactLocalQueryCloseRequest) - 1u,
+                          kExactLocalCloseResponseNormalized,
+                          false))
+        return false;
+
+    if (!run_close_vector("GET /static/ fallback",
+                          kExactLocalSlashFallbackRequest,
+                          sizeof(kExactLocalSlashFallbackRequest) - 1u,
+                          kGatewayResponseNormalized,
+                          false) ||
+        !run_close_vector("GET /static/child fallback",
+                          kExactLocalChildFallbackRequest,
+                          sizeof(kExactLocalChildFallbackRequest) - 1u,
+                          kGatewayResponseNormalized,
+                          false))
+        return false;
+
+    const bool nginx_stopped = stop_child(nginx.child);
+    const bool container_removed = docker.remove();
+    if (!nginx_stopped || !container_removed) {
+        error = !nginx_stopped ? "failed to stop exact-local pinned nginx"
+                               : "failed to remove exact-local pinned nginx container";
+        return false;
+    }
+    u32 total_connects = 0;
+    u32 slash_connects = 0;
+    u32 child_connects = 0;
+    if (!log_count_line_with(
+            temp.nginx_log, "connect() failed", upstream_context.c_str(), total_connects) ||
+        !log_count_line_with(temp.nginx_log,
+                             "request: \"GET /static/ HTTP/1.1\"",
+                             upstream_context.c_str(),
+                             slash_connects) ||
+        !log_count_line_with(temp.nginx_log,
+                             "request: \"GET /static/child HTTP/1.1\"",
+                             upstream_context.c_str(),
+                             child_connects) ||
+        total_connects != 2 || slash_connects != 1 || child_connects != 1) {
+        error =
+            "exact-local log did not prove zero local attempts and one attempt per fallback "
+            "(total=" +
+            std::to_string(total_connects) + ", slash=" + std::to_string(slash_connects) +
+            ", child=" + std::to_string(child_connects) + ")";
+        return false;
+    }
+    observation.scoped_connect_failures = total_connects;
+    return true;
+}
+
+static bool run_pinned_exact_local_return_baseline(u16 frontend_port,
+                                                   u16 backend_port,
+                                                   TempDir& temp,
+                                                   const std::string& container_prefix,
+                                                   ExactLocalReturnObservation& exact_first,
+                                                   ExactLocalReturnObservation& root_first,
+                                                   std::string& error) {
+    DeadPort dead;
+    if (!dead.reserve(backend_port)) {
+        error = "failed to hold exact-local baseline dead upstream";
+        return false;
+    }
+    if (!capture_pinned_exact_local_order(frontend_port,
+                                          backend_port,
+                                          temp,
+                                          container_prefix + "-exact-first",
+                                          true,
+                                          exact_first,
+                                          error) ||
+        !capture_pinned_exact_local_order(frontend_port,
+                                          backend_port,
+                                          temp,
+                                          container_prefix + "-root-first",
+                                          false,
+                                          root_first,
+                                          error))
+        return false;
+    if (exact_first.wires.size() != root_first.wires.size() || exact_first.wires.empty()) {
+        error = "exact-local order variants produced different vector cardinality";
+        return false;
+    }
+    for (size_t i = 0; i < exact_first.wires.size(); i++) {
+        std::vector<char> left = exact_first.wires[i];
+        std::vector<char> right = root_first.wires[i];
+        if (!normalize_date(left) || !normalize_date(right) || left != right) {
+            error = "exact-local location declaration order changed normalized vector " +
+                    std::to_string(i + 1);
+            return false;
+        }
+    }
+    if (exact_first.scoped_connect_failures != 2 || root_first.scoped_connect_failures != 2) {
+        error = "exact-local order variants did not retain exact scoped attempt totals";
+        return false;
+    }
+    return true;
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
     const bool nginx_gate_spike = argc == 3 && strcmp(argv[1], "--nginx-gate-spike") == 0;
+    const bool exact_local_return_baseline =
+        argc == 2 && strcmp(argv[1], "--exact-local-return-baseline") == 0;
     const bool late_successor_differential =
         argc == 5 && strcmp(argv[1], "--late-successor-differential") == 0;
     const bool rut_iouring_gate_spike =
@@ -5782,10 +6124,10 @@ int main(int argc, char** argv) {
     const bool normal_differential =
         (argc == 2 && argv[1][0] == '/') ||
         (argc == 4 && argv[1][0] == '/' && argv[2][0] == '/' && argv[3][0] == '/');
-    if ((!nginx_gate_spike && !rut_iouring_gate_spike && !rut_iouring_gate_identity_negative &&
-         !rut_iouring_gate_ready_mutation_negative && !rut_iouring_gate_owner_death_negative &&
-         !rut_iouring_gate_connect_journal_negative && !late_successor_differential &&
-         !normal_differential) ||
+    if ((!nginx_gate_spike && !exact_local_return_baseline && !rut_iouring_gate_spike &&
+         !rut_iouring_gate_identity_negative && !rut_iouring_gate_ready_mutation_negative &&
+         !rut_iouring_gate_owner_death_negative && !rut_iouring_gate_connect_journal_negative &&
+         !late_successor_differential && !normal_differential) ||
         (nginx_gate_spike && argv[2][0] != '/') ||
         ((rut_iouring_gate_spike || rut_iouring_gate_identity_negative ||
           rut_iouring_gate_ready_mutation_negative || rut_iouring_gate_owner_death_negative ||
@@ -5797,6 +6139,7 @@ int main(int argc, char** argv) {
                      "<absolute-nginx-preload-helper> <absolute-rut-preload-helper>\n"
                      "   or: test_nginx_differential --nginx-gate-spike "
                      "<absolute-preload-helper>\n"
+                     "   or: test_nginx_differential --exact-local-return-baseline\n"
                      "   or: test_nginx_differential --rut-iouring-gate-spike "
                      "<absolute-rut-executable> <absolute-preload-helper>\n"
                      "   or: test_nginx_differential --rut-iouring-gate-identity-negative "
@@ -5916,6 +6259,34 @@ int main(int argc, char** argv) {
         frontend_port == backend_port) {
         std::cerr << "FAIL [preflight]: bounded dynamic port allocation failed\n";
         return 1;
+    }
+
+    if (exact_local_return_baseline || normal_differential) {
+        const char* source_suffix = strrchr(temp.path, '/');
+        source_suffix = source_suffix ? source_suffix + 1 : temp.path;
+        const std::string exact_local_container =
+            "rut-nginx-exact-local-" + std::to_string(getpid()) + "-" + source_suffix;
+        ExactLocalReturnObservation exact_first;
+        ExactLocalReturnObservation root_first;
+        std::string exact_local_error;
+        if (!run_pinned_exact_local_return_baseline(frontend_port,
+                                                    backend_port,
+                                                    temp,
+                                                    exact_local_container,
+                                                    exact_first,
+                                                    root_first,
+                                                    exact_local_error)) {
+            std::cerr << "FAIL [pinned exact-local return baseline]: " << exact_local_error << "\n";
+            dump_exact_local_return_observation(exact_first);
+            dump_exact_local_return_observation(root_first);
+            dump_log(temp.nginx_config, "pinned exact-local nginx config");
+            dump_log(temp.nginx_log, "pinned exact-local nginx log");
+            return 1;
+        }
+        std::cerr << "PASS: pinned nginx exact /static local return is declaration-order "
+                     "independent (GET/HEAD/POST/OPTIONS/query), preserves request persistence, "
+                     "and excludes /static/ plus /static/child with exactly two proxy attempts\n";
+        if (exact_local_return_baseline) return 0;
     }
 
     if (nginx_gate_spike) {
