@@ -16900,6 +16900,8 @@ struct RecordingUpstream {
     i32 listen_fd = -1;
     u16 port = 0;
     std::atomic<bool> running{false};
+    std::atomic<bool> thread_alive{false};
+    std::atomic<bool> listener_failed{false};
     std::atomic<u32> accepted_count{0};
     std::atomic<u32> request_count{0};
     // Match the production connection slice so the exact fixed-CL boundary can
@@ -16986,6 +16988,11 @@ struct RecordingUpstream {
 
     static void* run(void* arg) {
         auto* s = static_cast<RecordingUpstream*>(arg);
+        struct ThreadAliveGuard {
+            RecordingUpstream* owner;
+            ~ThreadAliveGuard() { owner->thread_alive.store(false, std::memory_order_release); }
+        } alive_guard{s};
+        s->thread_alive.store(true, std::memory_order_release);
         while (s->running.load(std::memory_order_acquire)) {
             i32 client = accept(s->listen_fd, nullptr, nullptr);
             if (client < 0) {
@@ -16993,6 +17000,8 @@ struct RecordingUpstream {
                     usleep(1000);
                     continue;
                 }
+                if (s->running.load(std::memory_order_acquire))
+                    s->listener_failed.store(true, std::memory_order_release);
                 break;
             }
             s->accepted_count.fetch_add(1, std::memory_order_release);
@@ -17279,6 +17288,8 @@ struct RecordingUpstream {
     }
 
     bool setup() {
+        thread_alive.store(false, std::memory_order_release);
+        listener_failed.store(false, std::memory_order_release);
         const u32 first_response_modes = static_cast<u32>(gate_first_response_close) +
                                          static_cast<u32>(wait_first_response_for_peer_close) +
                                          static_cast<u32>(stall_first_response_for_peer_close);
@@ -19035,6 +19046,326 @@ route GET "/compiled-sentinel" { return 204 }
     // The production socket does not offer a deterministic partial-Send seam;
     // foundation tests cover that callback path. This wire intentionally keeps
     // the production scheduler and backend unchanged.
+    shard.shutdown();
+    shard_guard.initialized = false;
+    program.destroy();
+    program_guard.armed = false;
+}
+
+TEST(route, public_ordinary_source_exact_strict_local_response_and_prefix_fallback_iouring) {
+    using namespace rut;
+    if (!iouring_socket_live()) SKIP("io_uring async socket ops unavailable in this environment");
+
+    static constexpr char kOriginResponse[] =
+        "HTTP/1.1 201 Created\r\n"
+        "Server: origin\r\n"
+        "Date: Tue, 01 Jan 2030 00:00:00 GMT\r\n"
+        "X-Origin: fallback\r\n"
+        "Content-Length: 8\r\n"
+        "Connection: close\r\n\r\n"
+        "fallback";
+    static constexpr char kExpectedFallback[] =
+        "HTTP/1.1 201 Created\r\n"
+        "Server: rut-fallback\r\n"
+        "Date: XXXXXXXXXXXXXXXXXXXXXXXXXXXXX\r\n"
+        "Content-Length: 8\r\n"
+        "Connection: close\r\n"
+        "X-Origin: fallback\r\n\r\n"
+        "fallback";
+    static constexpr char kExpectedGet[] =
+        "HTTP/1.1 200 OK\r\n"
+        "Server: rut-get\r\n"
+        "Date: XXXXXXXXXXXXXXXXXXXXXXXXXXXXX\r\n"
+        "Content-Type: text/plain\r\n"
+        "Content-Length: 12\r\n"
+        "Connection: close\r\n\r\n"
+        "get-specific";
+    static constexpr char kExpectedAny[] =
+        "HTTP/1.1 200 OK\r\n"
+        "Server: rut-any\r\n"
+        "Date: XXXXXXXXXXXXXXXXXXXXXXXXXXXXX\r\n"
+        "Content-Type: text/plain\r\n"
+        "Content-Length: 10\r\n"
+        "Connection: close\r\n\r\n"
+        "any-static";
+    static_assert(sizeof("get-specific") - 1u == 12u);
+    static_assert(sizeof("any-static") - 1u == 10u);
+
+    RecordingUpstream backend;
+    backend.response = kOriginResponse;
+    backend.response_len = sizeof(kOriginResponse) - 1u;
+    REQUIRE(backend.setup());
+
+    // Put the prefix fallback first. Exact bindings are separate metadata, so
+    // declaration order cannot turn them into executable prefix routes.
+    std::string source_text =
+        "listen :0\nupstream backend at \"127.0.0.1:" + std::to_string(backend.port) + "\"\n";
+    source_text += R"rut(
+route "/" {
+  return forward(backend,
+    request_policy: { version: "HTTP/1.1", host: "upstream", connection: "omit",
+      strip_headers: ["Connection", "Keep-Alive", "TE", "Expect", "Upgrade"] },
+    response_policy: { version: "HTTP/1.1", framing: "content_length",
+      connection: "request", server: "rut-fallback", date: "current",
+      hide_headers: ["Date", "Server"] })
+}
+route exact "/static" { return local_response({
+  version: "HTTP/1.1", status: 200, reason: "OK", server: "rut-any",
+  date: "current", content_type: "text/plain", connection: "request",
+  head_mode: "suppress_body", body: b"any-static"
+}) }
+route exact GET "/static" { return local_response({
+  version: "HTTP/1.1", status: 200, reason: "OK", server: "rut-get",
+  date: "current", content_type: "text/plain", connection: "request",
+  head_mode: "suppress_body", body: b"get-specific"
+}) }
+)rut";
+
+    struct TempSource {
+        char path[64] = "/tmp/rut_exact_local_wire_XXXXXX";
+        i32 fd = -1;
+
+        bool create(Str text) {
+            fd = mkstemp(path);
+            if (fd < 0) return false;
+            u32 written = 0;
+            while (written < text.len) {
+                const ssize_t n = write(fd, text.ptr + written, text.len - written);
+                if (n < 0 && errno == EINTR) continue;
+                if (n <= 0) return false;
+                written += static_cast<u32>(n);
+            }
+            if (close(fd) != 0) return false;
+            fd = -1;
+            return true;
+        }
+
+        ~TempSource() {
+            if (fd >= 0) close(fd);
+            unlink(path);
+        }
+    } source;
+    REQUIRE(source.create({source_text.data(), static_cast<u32>(source_text.size())}));
+
+    LoadedProgram program{};
+    struct ProgramGuard {
+        LoadedProgram& program;
+        bool armed = true;
+        ~ProgramGuard() {
+            if (armed) program.destroy();
+        }
+    } program_guard{program};
+    LoadError load_error{};
+    const bool loaded = load_rut_program(source.path, program, load_error, jit::OptLevel::O0);
+    char load_message[512]{};
+    if (!loaded) format_load_error(load_error, load_message, sizeof(load_message));
+    REQUIRE_MSG(loaded, load_message);
+
+    // This is the ordinary production source path, not a hand-built RouteConfig.
+    REQUIRE(program.jit_inited);
+    REQUIRE(program.has_listener);
+    REQUIRE_EQ(program.rir.module.func_count, 1u);
+    REQUIRE_EQ(program.rir.module.upstream_count, 1u);
+    REQUIRE_EQ(program.rir.module.exact_strict_local_response_binding_count, 2u);
+    REQUIRE_EQ(program.config.route_count, 1u);
+    REQUIRE_EQ(program.config.upstream_count, 1u);
+    REQUIRE_EQ(program.config.exact_strict_local_response_binding_count, 2u);
+    REQUIRE(program.config.strict_local_response_table_is_valid());
+    CHECK_EQ(program.config.match_exact_strict_local_response({"/static?x=1", 11}, kRouteMethodGet),
+             2u);
+    CHECK_EQ(
+        program.config.match_exact_strict_local_response({"/static?y=2", 11}, kRouteMethodOptions),
+        1u);
+    CHECK_EQ(program.config.match_exact_strict_local_response({"/static/", 8}, kRouteMethodGet),
+             0u);
+    const RouteEntry* fallback = program.config.match_canonical({"static/", 7}, kRouteMethodGet);
+    REQUIRE(fallback != nullptr);
+    CHECK_EQ(fallback->action, RouteAction::JitHandler);
+    CHECK_NE(fallback->fn, nullptr);
+
+    Shard<IoUringEventLoop> shard;
+    struct ShardGuard {
+        Shard<IoUringEventLoop>& shard;
+        bool initialized = false;
+        bool spawned = false;
+        ~ShardGuard() {
+            if (spawned) {
+                shard.stop();
+                shard.join();
+            }
+            if (initialized) {
+                if (shard.loop != nullptr) shard.loop->force_close_all();
+                shard.shutdown();
+            }
+        }
+    } shard_guard{shard};
+    struct FdGuard {
+        i32 fd = -1;
+        ~FdGuard() {
+            if (fd >= 0) close(fd);
+        }
+    } listen_guard{create_listen_socket(0).value_or(-1)};
+    REQUIRE_GE(listen_guard.fd, 0);
+    const u16 port = get_port(listen_guard.fd);
+    REQUIRE(shard.init(0, listen_guard.fd).has_value());
+    shard_guard.initialized = true;
+    shard.owns_listen_fd = true;
+    listen_guard.fd = -1;
+    shard.route_config = &program.config;
+    shard.active_config = shard.route_config;
+    REQUIRE(shard.loop != nullptr);
+    REQUIRE(shard.spawn(-1).has_value());
+    shard_guard.spawned = true;
+    REQUIRE_EQ(shard.backend_failure_code(), 0);
+
+    struct ClientGuard {
+        i32 fd = -1;
+        ~ClientGuard() {
+            if (fd >= 0) close(fd);
+        }
+    };
+    auto run_exact =
+        [&](const char* request, const char* expected, u32 expected_len, u32 body_len) {
+            ClientGuard client{connect_to(port)};
+            if (client.fd < 0) return false;
+            set_socket_timeouts(client.fd, 5);
+            if (!send_all(client.fd, request, static_cast<u32>(strlen(request)))) return false;
+            char response[512]{};
+            u32 response_len = 0;
+            if (!read_public_close_response(
+                    client.fd, body_len, response, sizeof(response), response_len) ||
+                response_len != expected_len || !normalize_public_date(response, response_len))
+                return false;
+            return memcmp(response, expected, expected_len) == 0;
+        };
+
+    static constexpr char kGetPlain[] =
+        "GET /static HTTP/1.1\r\nHost: client.example\r\nConnection: close\r\n"
+        "X-Case: get-plain\r\n\r\n";
+    static constexpr char kGetQuery[] =
+        "GET /static?x=1 HTTP/1.1\r\nHost: client.example\r\nConnection: close\r\n"
+        "X-Case: get-query\r\n\r\n";
+    static constexpr char kOptionsQuery[] =
+        "OPTIONS /static?y=2 HTTP/1.1\r\nHost: client.example\r\nConnection: close\r\n"
+        "X-Case: any-query\r\n\r\n";
+    REQUIRE(run_exact(kGetPlain, kExpectedGet, sizeof(kExpectedGet) - 1u, 12));
+    REQUIRE(run_exact(kGetQuery, kExpectedGet, sizeof(kExpectedGet) - 1u, 12));
+    REQUIRE(run_exact(kOptionsQuery, kExpectedAny, sizeof(kExpectedAny) - 1u, 10));
+
+    // Both actors remain live for the complete bounded absence window. Atomic
+    // counters are the only recorder state observed until its thread is joined.
+    bool exact_window_quiet = true;
+    for (u32 sample = 0; sample < 100; sample++) {
+        exact_window_quiet &= backend.accepted_count.load(std::memory_order_acquire) == 0u;
+        exact_window_quiet &= backend.request_count.load(std::memory_order_acquire) == 0u;
+        exact_window_quiet &= backend.running.load(std::memory_order_acquire);
+        exact_window_quiet &= backend.thread_alive.load(std::memory_order_acquire);
+        exact_window_quiet &= !backend.listener_failed.load(std::memory_order_acquire);
+        exact_window_quiet &= shard.loop->is_running();
+        exact_window_quiet &= shard.backend_failure_code() == 0;
+        usleep(5000);
+    }
+    REQUIRE(exact_window_quiet);
+
+    static constexpr const char* kFallbackRequests[] = {
+        "GET /static/ HTTP/1.1\r\nHost: client.example\r\nConnection: close\r\n"
+        "X-Case: slash\r\n\r\n",
+        "OPTIONS /static/child?z=3 HTTP/1.1\r\nHost: client.example\r\n"
+        "Connection: close\r\nX-Case: child\r\n\r\n",
+    };
+    for (u32 index = 0; index < 2; index++) {
+        ClientGuard client{connect_to(port)};
+        REQUIRE_GE(client.fd, 0);
+        set_socket_timeouts(client.fd, 5);
+        REQUIRE(send_all(client.fd,
+                         kFallbackRequests[index],
+                         static_cast<u32>(strlen(kFallbackRequests[index]))));
+        char response[512]{};
+        u32 response_len = 0;
+        REQUIRE(read_public_close_response(
+            client.fd, sizeof("fallback") - 1u, response, sizeof(response), response_len));
+        REQUIRE(normalize_public_date(response, response_len));
+        REQUIRE_EQ(response_len, sizeof(kExpectedFallback) - 1u);
+        CHECK_EQ(memcmp(response, kExpectedFallback, response_len), 0);
+        const u32 expected_count = index + 1u;
+        for (u32 wait = 0;
+             wait < 400 && backend.request_count.load(std::memory_order_acquire) < expected_count;
+             wait++)
+            usleep(5000);
+        REQUIRE_EQ(backend.accepted_count.load(std::memory_order_acquire), expected_count);
+        REQUIRE_EQ(backend.request_count.load(std::memory_order_acquire), expected_count);
+        REQUIRE(shard.loop->is_running());
+        REQUIRE_EQ(shard.backend_failure_code(), 0);
+    }
+
+    // Do not let stop/join manufacture the absence of a delayed third origin
+    // episode. Both the production shard and recorder remain live throughout.
+    bool fallback_window_quiet = true;
+    for (u32 sample = 0; sample < 100; sample++) {
+        fallback_window_quiet &= backend.accepted_count.load(std::memory_order_acquire) == 2u;
+        fallback_window_quiet &= backend.request_count.load(std::memory_order_acquire) == 2u;
+        fallback_window_quiet &= backend.running.load(std::memory_order_acquire);
+        fallback_window_quiet &= backend.thread_alive.load(std::memory_order_acquire);
+        fallback_window_quiet &= !backend.listener_failed.load(std::memory_order_acquire);
+        fallback_window_quiet &= shard.loop->is_running();
+        fallback_window_quiet &= shard.backend_failure_code() == 0;
+        usleep(5000);
+    }
+    REQUIRE(fallback_window_quiet);
+
+    shard.stop();
+    shard.join();
+    shard_guard.spawned = false;
+    REQUIRE_EQ(shard.backend_failure_code(), 0);
+    backend.teardown();
+
+    REQUIRE_EQ(backend.accepted_count.load(std::memory_order_acquire), 2u);
+    REQUIRE_EQ(backend.request_count.load(std::memory_order_acquire), 2u);
+    for (u32 index = 0; index < 2; index++) {
+        const char* method = index == 0 ? "GET" : "OPTIONS";
+        const char* target = index == 0 ? "/static/" : "/static/child?z=3";
+        const char* marker = index == 0 ? "slash" : "child";
+        char expected[256]{};
+        const int formatted = snprintf(expected,
+                                       sizeof(expected),
+                                       "%s %s HTTP/1.1\r\nHost: 127.0.0.1:%u\r\n"
+                                       "X-Case: %s\r\n\r\n",
+                                       method,
+                                       target,
+                                       backend.port,
+                                       marker);
+        REQUIRE_GT(formatted, 0);
+        REQUIRE_LT(formatted, static_cast<int>(sizeof(expected)));
+        const u32 expected_len = static_cast<u32>(formatted);
+        REQUIRE_EQ(backend.request_history_len[index], expected_len);
+        REQUIRE_EQ(backend.request_history_header_len[index], expected_len);
+        CHECK_EQ(memcmp(backend.request_history[index], expected, expected_len), 0);
+    }
+    for (u32 slot = 2; slot < RecordingUpstream::kMaxRecordedRequests; slot++) {
+        CHECK_EQ(backend.request_history_len[slot], 0u);
+        CHECK_EQ(backend.request_history_header_len[slot], 0u);
+        CHECK_EQ(backend.request_recorded_ns[slot].load(std::memory_order_acquire), 0u);
+        bool empty = true;
+        for (u32 byte = 0; empty && byte < RecordingUpstream::kRequestCapacity; byte++)
+            empty = backend.request_history[slot][byte] == '\0';
+        CHECK(empty);
+    }
+
+    CHECK_EQ(shard.shard_metrics.connections_total, 5u);
+    CHECK_EQ(shard.shard_metrics.connections_active, 0u);
+    CHECK_EQ(shard.shard_metrics.connections_closed, 5u);
+    CHECK_EQ(shard.shard_metrics.requests_total, 5u);
+    CHECK_EQ(shard.shard_metrics.requests_active, 0u);
+    CHECK_EQ(shard.shard_metrics.request_latency.count, 5u);
+    const u64 final_epoch = shard.epoch.epoch.load(std::memory_order_acquire);
+    CHECK_EQ(final_epoch, 10u);
+    CHECK_EQ(final_epoch % 2u, 0u);
+    CHECK_EQ(shard.loop->active_count(), 0u);
+    CHECK_EQ(shard.loop->pending_free_count, 0u);
+    CHECK_EQ(shard.loop->pool.in_use(), 0u);
+    CHECK_EQ(shard.upstream->idle_count.load(std::memory_order_acquire), 0u);
+    CHECK_EQ(shard.upstream->free_top, UpstreamPool::kMaxConns);
+
     shard.shutdown();
     shard_guard.initialized = false;
     program.destroy();
