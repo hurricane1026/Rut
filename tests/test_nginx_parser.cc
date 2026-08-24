@@ -80,6 +80,65 @@ TEST(nginx_parser, parses_minimal_server_and_spans) {
     CHECK_EQ(result.value().location.proxy_read_timeout.value_span.end, 0u);
     CHECK_EQ(result.value().location.proxy_read_timeout.value_span.line, 1u);
     CHECK_EQ(result.value().location.proxy_read_timeout.value_span.col, 1u);
+    CHECK_FALSE(result.value().exact_local_return.present);
+    CHECK_EQ(result.value().exact_local_return.path.ptr, nullptr);
+    CHECK_EQ(result.value().exact_local_return.path.len, 0u);
+    CHECK_EQ(result.value().exact_local_return.response.status, 0u);
+}
+
+TEST(nginx_parser, parses_root_proxy_and_exact_local_return_in_either_order) {
+    const char root_first[] =
+        "server {\n"
+        "  listen 8080;\n"
+        "  location / { proxy_pass http://127.0.0.1:9000; }\n"
+        "  location = /static { return 200 \"successor-static\"; }\n"
+        "}\n";
+    const char exact_first[] =
+        "server {\n"
+        "  listen 8080;\n"
+        "  location = /static { return 200 \"successor-static\"; }\n"
+        "  location / { proxy_pass http://127.0.0.1:9000; }\n"
+        "}\n";
+
+    auto check = [&](const char* source, u32 len, u32 root_line, u32 exact_line) {
+        const auto result = nginx::parse({source, len});
+        REQUIRE(result);
+        const auto& server = result.value();
+        CHECK(server.location.path.eq(lit_str("/")));
+        CHECK_EQ(server.location.span.line, root_line);
+        CHECK_EQ(server.location.proxy_pass.port, 9000u);
+        REQUIRE(server.exact_local_return.present);
+        CHECK(server.exact_local_return.path.eq(lit_str("/static")));
+        CHECK_EQ(server.exact_local_return.span.line, exact_line);
+        CHECK_EQ(server.exact_local_return.response.status, 200u);
+        CHECK(server.exact_local_return.response.body.eq(lit_str("successor-static")));
+        CHECK_EQ(server.exact_local_return.response.body_span.line, exact_line);
+        CHECK_GE(server.exact_local_return.response.body.ptr, source);
+        CHECK_LT(server.exact_local_return.response.body.ptr, source + len);
+        CHECK_EQ(server.exact_local_return.response.body_span.end -
+                     server.exact_local_return.response.body_span.start,
+                 server.exact_local_return.response.body.len);
+    };
+    check(root_first, sizeof(root_first) - 1u, 3, 4);
+    check(exact_first, sizeof(exact_first) - 1u, 4, 3);
+}
+
+TEST(nginx_parser, accepts_exact_local_return_64_byte_body_boundary) {
+    static constexpr char kBody[] =
+        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    static_assert(sizeof(kBody) - 1u == nginx::kMaxLocalReturnBodyLen);
+    char source[512]{};
+    const int len = snprintf(source,
+                             sizeof(source),
+                             "server { listen 8080; location / { proxy_pass "
+                             "http://127.0.0.1:9000; } location = /static { return 200 \"%s\"; } }",
+                             kBody);
+    REQUIRE_GT(len, 0);
+    REQUIRE_LT(static_cast<u32>(len), static_cast<u32>(sizeof(source)));
+    const auto result = nginx::parse({source, static_cast<u32>(len)});
+    REQUIRE(result);
+    CHECK_EQ(result.value().exact_local_return.response.body.len, nginx::kMaxLocalReturnBodyLen);
+    CHECK(result.value().exact_local_return.response.body.eq(lit_str(kBody)));
 }
 
 TEST(nginx_parser, parses_bounded_proxy_read_timeout_in_either_directive_order) {
@@ -473,6 +532,108 @@ TEST(nginx_parser, rejects_missing_and_duplicate_directives) {
                    lit_str("duplicate proxy_pass")));
 }
 
+TEST(nginx_parser, rejects_unsupported_exact_local_return_shapes) {
+    struct Vector {
+        const char* source;
+        FrontendError code;
+        Str detail;
+    };
+    const Vector vectors[] = {
+        {"server { listen 8080; location = /static { return 200 \"x\"; } }",
+         FrontendError::UnsupportedSyntax,
+         lit_str("exact location requires a root proxy fallback")},
+        {"server { listen 8080; location / { proxy_pass http://127.0.0.1:1; } location = "
+         "/static { return 200 \"x\"; } location /api/ { proxy_pass http://127.0.0.1:2/; } }",
+         FrontendError::UnsupportedSyntax,
+         lit_str("third location is unsupported")},
+        {"server { listen 8080; location = /static { return 200 \"x\"; } location = /static { "
+         "return 200 \"y\"; } }",
+         FrontendError::UnsupportedSyntax,
+         lit_str("duplicate exact location")},
+        {"server { listen 8080; location / { proxy_pass http://127.0.0.1:1; } location = "
+         "/static { proxy_pass http://127.0.0.1:2; } }",
+         FrontendError::UnsupportedSyntax,
+         lit_str("proxy_pass is unsupported in exact locations")},
+        {"server { listen 8080; location / { proxy_pass http://127.0.0.1:1; } location = "
+         "/static { } }",
+         FrontendError::UnsupportedSyntax,
+         lit_str("missing return directive in exact location")},
+        {"server { listen 8080; location / { return 200 \"x\"; } }",
+         FrontendError::UnsupportedSyntax,
+         lit_str("return is unsupported in proxy locations")},
+        {"server { listen 8080; location / { proxy_pass http://127.0.0.1:1; } location = "
+         "/other { return 200 \"x\"; } }",
+         FrontendError::UnsupportedSyntax,
+         lit_str("only exact location = /static is supported")},
+        {"server { listen 8080; location /api/ { proxy_pass http://127.0.0.1:1/; } location = "
+         "/static { return 200 \"x\"; } }",
+         FrontendError::UnsupportedSyntax,
+         lit_str("exact location requires location / proxy fallback")},
+        {"server { listen 8080; location / { proxy_pass http://127.0.0.1:1; } location = "
+         "/static { location /nested { return 200 \"x\"; } } }",
+         FrontendError::UnsupportedSyntax,
+         lit_str("nested locations are unsupported")},
+        {"server { listen 8080; location / { proxy_pass http://127.0.0.1:1; } location = "
+         "/static { return 201 \"x\"; } }",
+         FrontendError::UnsupportedSyntax,
+         lit_str("only return status 200 is supported")},
+        {"server { listen 8080; location / { proxy_pass http://127.0.0.1:1; } location = "
+         "/static { return; } }",
+         FrontendError::UnexpectedToken,
+         lit_str("return requires status and body")},
+        {"server { listen 8080; location / { proxy_pass http://127.0.0.1:1; } location = "
+         "/static { return 200; } }",
+         FrontendError::UnexpectedToken,
+         lit_str("return requires a literal body")},
+        {"server { listen 8080; location / { proxy_pass http://127.0.0.1:1; } location = "
+         "/static { return 200 \"x\" extra; } }",
+         FrontendError::UnexpectedToken,
+         lit_str("return accepts exactly status and body")},
+        {"server { listen 8080; location / { proxy_pass http://127.0.0.1:1; } location = "
+         "/static { return 200 $body; } }",
+         FrontendError::UnsupportedSyntax,
+         lit_str("return body must be 1..64 token-safe quoted ASCII bytes")},
+        {"server { listen 8080; location / { proxy_pass http://127.0.0.1:1; } location = "
+         "/static { return 200 \"$body\"; } }",
+         FrontendError::UnsupportedSyntax,
+         lit_str("return body must be 1..64 token-safe quoted ASCII bytes")},
+        {"server { listen 8080; location / { proxy_pass http://127.0.0.1:1; } location = "
+         "/static { return 200 successor-static; } }",
+         FrontendError::UnsupportedSyntax,
+         lit_str("return body must be 1..64 token-safe quoted ASCII bytes")},
+        {"server { listen 8080; location / { proxy_pass http://127.0.0.1:1; } location = "
+         "/static { return 200 \"two words\"; } }",
+         FrontendError::UnsupportedSyntax,
+         lit_str("return body must be 1..64 token-safe quoted ASCII bytes")},
+        {"server { listen 8080; location / { proxy_pass http://127.0.0.1:1; } location = "
+         "/static { return 200 \"x\"; return 200 \"y\"; } }",
+         FrontendError::UnsupportedSyntax,
+         lit_str("duplicate return directive")},
+    };
+    for (const auto& vector : vectors) {
+        const auto result = nginx::parse({vector.source, static_cast<u32>(strlen(vector.source))});
+        REQUIRE_FALSE(result);
+        CHECK_EQ(result.error().code, vector.code);
+        CHECK(result.error().detail.eq(vector.detail));
+    }
+
+    static constexpr char kTooLong[] =
+        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    static_assert(sizeof(kTooLong) - 1u == nginx::kMaxLocalReturnBodyLen + 1u);
+    char source[512]{};
+    const int len = snprintf(source,
+                             sizeof(source),
+                             "server { listen 8080; location / { proxy_pass "
+                             "http://127.0.0.1:1; } location = /static { return 200 \"%s\"; } }",
+                             kTooLong);
+    REQUIRE_GT(len, 0);
+    const auto too_long = nginx::parse({source, static_cast<u32>(len)});
+    REQUIRE_FALSE(too_long);
+    CHECK_EQ(too_long.error().code, FrontendError::UnsupportedSyntax);
+    CHECK(too_long.error().detail.eq(
+        lit_str("return body must be 1..64 token-safe quoted ASCII bytes")));
+}
+
 TEST(nginx_parser, rejects_unknown_directives_and_multiple_servers) {
     const char unknown_server[] = "server { listen 8080; worker_processes 1; }";
     CHECK(is_error(nginx::parse({unknown_server, sizeof(unknown_server) - 1}),
@@ -486,7 +647,7 @@ TEST(nginx_parser, rejects_unknown_directives_and_multiple_servers) {
                    FrontendError::UnsupportedSyntax,
                    1,
                    36,
-                   lit_str("unknown location directive")));
+                   lit_str("return is unsupported in proxy locations")));
 
     const char second_server[] =
         "server { listen 8080; location / { proxy_pass http://127.0.0.1:1; } } server { listen "
@@ -611,10 +772,10 @@ TEST(nginx_parser, rejects_invalid_ports_ip_and_trailing_tokens) {
 
 TEST(nginx_parser, rejects_modifiers_variables_and_non_http_upstreams) {
     const char modifiers[][80] = {
-        "server { listen 8080; location = / { proxy_pass http://127.0.0.1:1; } }",
         "server { listen 8080; location ^~ / { proxy_pass http://127.0.0.1:1; } }",
         "server { listen 8080; location ~ / { proxy_pass http://127.0.0.1:1; } }",
         "server { listen 8080; location ~* / { proxy_pass http://127.0.0.1:1; } }",
+        "server { listen 8080; location @named { proxy_pass http://127.0.0.1:1; } }",
     };
     for (u32 i = 0; i < 4; i++) {
         CHECK(is_error(nginx::parse({modifiers[i], sizeof(modifiers[i]) - 1}),
@@ -684,6 +845,28 @@ static nginx::Server api_server() {
     server.location.proxy_pass.uri = {kProxyUri, 1};
     server.location.proxy_pass.uri_span = Span{53, 54, 1, 54};
     return server;
+}
+
+TEST(nginx_converter, rejects_parsed_exact_local_return_until_lowering_increment) {
+    const char source[] =
+        "server { listen 8080; location = /static { return 200 \"successor-static\"; } "
+        "location / { proxy_pass http://127.0.0.1:9000; } }";
+    const auto parsed = nginx::parse({source, sizeof(source) - 1u});
+    REQUIRE(parsed);
+    REQUIRE(parsed.value().exact_local_return.present);
+    const auto lowered = nginx::lower_to_rut(parsed.value());
+    REQUIRE_FALSE(lowered);
+    CHECK_EQ(lowered.error().code, FrontendError::UnsupportedSyntax);
+    CHECK(lowered.error().detail.eq(lit_str("exact local return lowering is not implemented")));
+    CHECK_EQ(lowered.error().span.start, parsed.value().exact_local_return.span.start);
+
+    auto forged = canonical_server();
+    forged.exact_local_return.response.status = 200;
+    const auto forged_lowered = nginx::lower_to_rut(forged);
+    REQUIRE_FALSE(forged_lowered);
+    CHECK_EQ(forged_lowered.error().code, FrontendError::UnsupportedSyntax);
+    CHECK(forged_lowered.error().detail.eq(
+        lit_str("exact local return lowering is not implemented")));
 }
 
 TEST(nginx_converter, lowers_canonical_model_to_stable_rut_source) {

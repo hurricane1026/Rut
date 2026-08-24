@@ -99,6 +99,12 @@ auto missing(Span span, Str detail) {
     return frontend_error(FrontendError::UnexpectedEof, span, detail);
 }
 
+struct ParsedLocation {
+    bool exact = false;
+    Location proxy{};
+    ExactLocalReturnLocation local{};
+};
+
 class Parser {
 public:
     explicit Parser(Str source) : lexer_(source) { advance(); }
@@ -119,7 +125,9 @@ public:
         Server result{};
         result.span = start;
         bool have_listen = false;
-        bool have_location = false;
+        bool have_proxy_location = false;
+        bool have_exact_location = false;
+        u32 location_count = 0;
         while (cur_.kind != TokenKind::RBrace && cur_.kind != TokenKind::End) {
             if (cur_.kind != TokenKind::Word) {
                 return invalid(cur_.span, lit_str("expected server directive"));
@@ -131,11 +139,23 @@ public:
                 result.listen = parsed.value();
                 have_listen = true;
             } else if (eq(cur_.text, "location", 8)) {
-                if (have_location) return unsupported(cur_.span, lit_str("duplicate location"));
+                if (location_count == 2)
+                    return unsupported(cur_.span, lit_str("third location is unsupported"));
+                const Span location_span = cur_.span;
                 auto parsed = parse_location();
                 if (!parsed) return core::make_unexpected(parsed.error());
-                result.location = parsed.value();
-                have_location = true;
+                if (parsed.value().exact) {
+                    if (have_exact_location)
+                        return unsupported(location_span, lit_str("duplicate exact location"));
+                    result.exact_local_return = parsed.value().local;
+                    have_exact_location = true;
+                } else {
+                    if (have_proxy_location)
+                        return unsupported(location_span, lit_str("duplicate location"));
+                    result.location = parsed.value().proxy;
+                    have_proxy_location = true;
+                }
+                location_count++;
             } else if (eq(cur_.text, "proxy_read_timeout", 18)) {
                 return unsupported(cur_.span,
                                    lit_str("proxy_read_timeout is unsupported at server level"));
@@ -148,7 +168,15 @@ public:
         result.span.end = cur_.span.end;
         advance();
         if (!have_listen) return unsupported(result.span, lit_str("missing listen"));
-        if (!have_location) return unsupported(result.span, lit_str("missing location"));
+        if (!have_proxy_location) {
+            if (have_exact_location)
+                return unsupported(result.exact_local_return.span,
+                                   lit_str("exact location requires a root proxy fallback"));
+            return unsupported(result.span, lit_str("missing location"));
+        }
+        if (have_exact_location && !eq(result.location.path, "/", 1))
+            return unsupported(result.location.path_span,
+                               lit_str("exact location requires location / proxy fallback"));
         if (cur_.kind != TokenKind::End) {
             if (cur_.kind == TokenKind::Word && eq(cur_.text, "server", 6))
                 return unsupported(cur_.span, lit_str("multiple servers are unsupported"));
@@ -198,16 +226,17 @@ private:
         return Listen{value, Span{start.start, end.end, start.line, start.col}};
     }
 
-    FrontendResult<Location> parse_location() {
+    FrontendResult<ParsedLocation> parse_location() {
         const Span start = cur_.span;
         advance();
         if (cur_.kind == TokenKind::End)
             return missing(cur_.span, lit_str("location requires a path"));
         if (cur_.kind != TokenKind::Word)
             return invalid(cur_.span, lit_str("location requires a path"));
+        if (eq(cur_.text, "=", 1)) return parse_exact_location(start);
         const Token path = cur_;
-        if (eq(path.text, "=", 1) || eq(path.text, "^~", 2) || eq(path.text, "~", 1) ||
-            eq(path.text, "~*", 2))
+        if (eq(path.text, "^~", 2) || eq(path.text, "~", 1) || eq(path.text, "~*", 2) ||
+            (path.text.len != 0 && path.text.ptr[0] == '@'))
             return unsupported(path.span, lit_str("location modifiers are unsupported"));
         if (contains(path.text, '$'))
             return unsupported(path.span, lit_str("variables are unsupported"));
@@ -217,7 +246,8 @@ private:
         if (!expect(TokenKind::LBrace, lit_str("expected '{' after location path")))
             return core::make_unexpected(error_);
 
-        Location result{};
+        ParsedLocation parsed{};
+        Location& result = parsed.proxy;
         result.path = path.text;
         result.path_span = path.span;
         bool have_proxy = false;
@@ -244,6 +274,8 @@ private:
                 have_proxy_read_timeout = true;
             } else if (eq(cur_.text, "location", 8)) {
                 return unsupported(cur_.span, lit_str("nested locations are unsupported"));
+            } else if (eq(cur_.text, "return", 6)) {
+                return unsupported(cur_.span, lit_str("return is unsupported in proxy locations"));
             } else {
                 return unsupported(cur_.span, lit_str("unknown location directive"));
             }
@@ -261,7 +293,108 @@ private:
             return unsupported(result.path_span,
                                lit_str("location /api/ requires proxy_pass URI /"));
         result.span = Span{start.start, end.end, start.line, start.col};
-        return result;
+        return parsed;
+    }
+
+    FrontendResult<ParsedLocation> parse_exact_location(Span start) {
+        advance();
+        if (cur_.kind == TokenKind::End)
+            return missing(cur_.span, lit_str("exact location requires a path"));
+        if (cur_.kind != TokenKind::Word)
+            return invalid(cur_.span, lit_str("exact location requires a path"));
+        const Token path = cur_;
+        if (contains(path.text, '$'))
+            return unsupported(path.span, lit_str("variables are unsupported"));
+        if (!eq(path.text, "/static", 7))
+            return unsupported(path.span, lit_str("only exact location = /static is supported"));
+        advance();
+        if (!expect(TokenKind::LBrace, lit_str("expected '{' after exact location path")))
+            return core::make_unexpected(error_);
+
+        ParsedLocation parsed{};
+        parsed.exact = true;
+        ExactLocalReturnLocation& result = parsed.local;
+        result.present = true;
+        result.path = path.text;
+        result.path_span = path.span;
+        bool have_return = false;
+        while (cur_.kind != TokenKind::RBrace && cur_.kind != TokenKind::End) {
+            if (cur_.kind != TokenKind::Word)
+                return invalid(cur_.span, lit_str("expected exact location directive"));
+            if (eq(cur_.text, "return", 6)) {
+                if (have_return)
+                    return unsupported(cur_.span, lit_str("duplicate return directive"));
+                auto response = parse_local_return();
+                if (!response) return core::make_unexpected(response.error());
+                result.response = response.value();
+                have_return = true;
+            } else if (eq(cur_.text, "proxy_pass", 10)) {
+                return unsupported(cur_.span,
+                                   lit_str("proxy_pass is unsupported in exact locations"));
+            } else if (eq(cur_.text, "location", 8)) {
+                return unsupported(cur_.span, lit_str("nested locations are unsupported"));
+            } else {
+                return unsupported(cur_.span, lit_str("unknown exact location directive"));
+            }
+        }
+        if (cur_.kind == TokenKind::End)
+            return missing(cur_.span, lit_str("missing '}' for exact location"));
+        const Span end = cur_.span;
+        advance();
+        if (!have_return)
+            return unsupported(end, lit_str("missing return directive in exact location"));
+        result.span = Span{start.start, end.end, start.line, start.col};
+        return parsed;
+    }
+
+    FrontendResult<LocalReturn> parse_local_return() {
+        const Span start = cur_.span;
+        advance();
+        if (cur_.kind == TokenKind::End)
+            return missing(cur_.span, lit_str("return requires status and body"));
+        if (cur_.kind != TokenKind::Word)
+            return invalid(cur_.span, lit_str("return requires status and body"));
+        const Token status = cur_;
+        if (!eq(status.text, "200", 3))
+            return unsupported(status.span, lit_str("only return status 200 is supported"));
+        advance();
+        if (cur_.kind == TokenKind::End)
+            return missing(cur_.span, lit_str("return requires a literal body"));
+        if (cur_.kind != TokenKind::Word)
+            return invalid(cur_.span, lit_str("return requires a literal body"));
+        const Token body = cur_;
+        if (!local_return_body_valid(body.text))
+            return unsupported(body.span,
+                               lit_str("return body must be 1..64 token-safe quoted ASCII bytes"));
+        advance();
+        if (cur_.kind == TokenKind::End)
+            return missing(cur_.span, lit_str("expected ';' after return"));
+        if (cur_.kind != TokenKind::Semicolon) {
+            if (cur_.kind == TokenKind::Word)
+                return invalid(cur_.span, lit_str("return accepts exactly status and body"));
+            return invalid(cur_.span, lit_str("expected ';' after return"));
+        }
+        const Span end = cur_.span;
+        advance();
+        return LocalReturn{
+            200,
+            body.text.slice(1, body.text.len - 1),
+            Span{body.span.start + 1, body.span.end - 1, body.span.line, body.span.col + 1},
+            Span{start.start, end.end, start.line, start.col}};
+    }
+
+    static bool local_return_body_valid(Str text) {
+        if (text.len < 3 || text.ptr[0] != '"' || text.ptr[text.len - 1] != '"') return false;
+        const u32 body_len = text.len - 2;
+        if (body_len == 0 || body_len > kMaxLocalReturnBodyLen) return false;
+        for (u32 i = 1; i + 1 < text.len; i++) {
+            const u8 value = static_cast<u8>(text.ptr[i]);
+            if (value < 0x21 || value > 0x7e || text.ptr[i] == '"' || text.ptr[i] == '\\' ||
+                text.ptr[i] == '$' || text.ptr[i] == '#' || text.ptr[i] == '{' ||
+                text.ptr[i] == '}' || text.ptr[i] == ';')
+                return false;
+        }
+        return true;
     }
 
     FrontendResult<ProxyReadTimeout> parse_proxy_read_timeout() {

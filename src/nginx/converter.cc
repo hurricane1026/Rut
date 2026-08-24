@@ -41,6 +41,23 @@ Span model_span(const Server& server) {
     return server.span;
 }
 
+bool has_exact_local_return_inventory(const ExactLocalReturnLocation& location) {
+    const LocalReturn& response = location.response;
+    return location.present || location.path.ptr != nullptr || location.path.len != 0 ||
+           !is_default_span(location.path_span) || !is_default_span(location.span) ||
+           response.status != 0 || response.body.ptr != nullptr || response.body.len != 0 ||
+           !is_default_span(response.body_span) || !is_default_span(response.span);
+}
+
+Span exact_local_return_span(const Server& server) {
+    const auto& location = server.exact_local_return;
+    if (is_valid_span(location.span)) return location.span;
+    if (is_valid_span(location.path_span)) return location.path_span;
+    if (is_valid_span(location.response.span)) return location.response.span;
+    if (is_valid_span(location.response.body_span)) return location.response.body_span;
+    return server.span;
+}
+
 FrontendResult<bool> validate_proxy_read_timeout(const Server& server) {
     const ProxyReadTimeout& timeout = server.location.proxy_read_timeout;
     if (!timeout.present) {
@@ -274,6 +291,9 @@ bool put_root_forward(
 }  // namespace
 
 FrontendResult<RutSource> lower_to_rut(const Server& server) {
+    if (has_exact_local_return_inventory(server.exact_local_return))
+        return unsupported(exact_local_return_span(server),
+                           lit_str("exact local return lowering is not implemented"));
     auto timeout = validate_proxy_read_timeout(server);
     if (!timeout) return core::make_unexpected(timeout.error());
     if (server.listen.port == 0)
