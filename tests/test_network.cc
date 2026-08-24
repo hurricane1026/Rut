@@ -14501,6 +14501,16 @@ TEST(epoll_loop, callbacks_pipeline_incomplete_rearms_recv) {
     c->fd = dup(2);
     REQUIRE(c->fd >= 0);
     c->pipeline_depth = 1;
+    c->resp_status = 502;
+    c->resp_body_mode = BodyMode::Chunked;
+    c->resp_body_remaining = 11;
+    c->resp_chunk_parser.state = ChunkedParser::State::Data;
+    c->resp_chunk_parser.chunk_remaining = 13;
+    c->resp_chunk_parser.has_digits = true;
+    c->resp_body_sent = 17;
+    c->upstream_send_len = 19;
+    c->handler_gen = 23;
+    c->req_start_us = 29;
     loop->timer.add(c, loop->keepalive_timeout);
 
     static const char kPartial[] = "GET /next HTTP/1.1\r\nHos";
@@ -14512,6 +14522,16 @@ TEST(epoll_loop, callbacks_pipeline_incomplete_rearms_recv) {
     CHECK_EQ(c->on_recv, &on_header_received<EpollEventLoop>);
     CHECK_EQ(c->pipeline_depth, 1u);
     CHECK_EQ(c->recv_buf.len(), static_cast<u32>(sizeof(kPartial) - 1));
+    CHECK_EQ(c->resp_status, 502u);
+    CHECK_EQ(c->resp_body_mode, BodyMode::Chunked);
+    CHECK_EQ(c->resp_body_remaining, 11u);
+    CHECK_EQ(c->resp_chunk_parser.state, ChunkedParser::State::Data);
+    CHECK_EQ(c->resp_chunk_parser.chunk_remaining, 13u);
+    CHECK(c->resp_chunk_parser.has_digits);
+    CHECK_EQ(c->resp_body_sent, 17u);
+    CHECK_EQ(c->upstream_send_len, 19u);
+    CHECK_EQ(c->handler_gen, 23u);
+    CHECK_EQ(c->req_start_us, 29u);
 
     close(c->fd);
     c->fd = -1;
@@ -18953,6 +18973,86 @@ TEST(state_invariant, upstream_episode_checked_increment_and_reset) {
     CHECK_EQ(conn.fd, -1);
 }
 
+TEST(state_invariant, response_accounting_clear_is_exact_and_reset_reuses_it) {
+    ConnectionBase conn{};
+    conn.reset();
+
+    u8 recv_storage[32]{};
+    conn.recv_buf.bind(recv_storage, sizeof(recv_storage));
+    REQUIRE_EQ(conn.recv_buf.write(reinterpret_cast<const u8*>("sentinel"), 8), 8u);
+    conn.resp_status = 502;
+    conn.resp_body_mode = BodyMode::Chunked;
+    conn.resp_body_remaining = 17;
+    conn.resp_chunk_parser.state = ChunkedParser::State::Data;
+    conn.resp_chunk_parser.chunk_remaining = 19;
+    conn.resp_chunk_parser.has_digits = true;
+    conn.resp_body_sent = 23;
+    conn.upstream_send_len = 29;
+
+    conn.fd = 31;
+    conn.upstream_fd = 37;
+    conn.recv_armed = true;
+    conn.send_armed = true;
+    conn.upstream_connect_armed = true;
+    conn.pending_ops = 3;
+    conn.on_recv = &on_header_received<SmallLoop>;
+    conn.on_send = &on_response_sent<SmallLoop>;
+    conn.upstream_slot_held = true;
+    conn.upstream_slot_uid = 41;
+    conn.response_read_deadline_state = ResponseReadDeadlineState::Validated;
+    conn.response_read_deadline_generation = 43;
+    conn.upstream_episode = 47;
+    conn.upstream_retiring_episode = 53;
+    conn.tls_active = true;
+    conn.is_ws_tunnel = true;
+
+    conn.clear_response_accounting();
+
+    CHECK_EQ(conn.resp_status, 0u);
+    CHECK_EQ(conn.resp_body_mode, BodyMode::None);
+    CHECK_EQ(conn.resp_body_remaining, 0u);
+    CHECK_EQ(conn.resp_chunk_parser.state, ChunkedParser::State::Size);
+    CHECK_EQ(conn.resp_chunk_parser.chunk_remaining, 0u);
+    CHECK_FALSE(conn.resp_chunk_parser.has_digits);
+    CHECK_EQ(conn.resp_body_sent, 0u);
+    CHECK_EQ(conn.upstream_send_len, 0u);
+    CHECK_EQ(conn.fd, 31);
+    CHECK_EQ(conn.upstream_fd, 37);
+    CHECK(conn.recv_armed);
+    CHECK(conn.send_armed);
+    CHECK(conn.upstream_connect_armed);
+    CHECK_EQ(conn.pending_ops, 3u);
+    CHECK_EQ(conn.on_recv, &on_header_received<SmallLoop>);
+    CHECK_EQ(conn.on_send, &on_response_sent<SmallLoop>);
+    CHECK(conn.upstream_slot_held);
+    CHECK_EQ(conn.upstream_slot_uid, 41u);
+    CHECK_EQ(conn.response_read_deadline_state, ResponseReadDeadlineState::Validated);
+    CHECK_EQ(conn.response_read_deadline_generation, 43u);
+    CHECK_EQ(conn.upstream_episode, 47u);
+    CHECK_EQ(conn.upstream_retiring_episode, 53u);
+    CHECK_EQ(conn.recv_buf.len(), 8u);
+    CHECK(conn.tls_active);
+    CHECK(conn.is_ws_tunnel);
+
+    conn.resp_status = 504;
+    conn.resp_body_mode = BodyMode::ContentLength;
+    conn.resp_body_remaining = 59;
+    conn.resp_chunk_parser.state = ChunkedParser::State::Complete;
+    conn.resp_chunk_parser.chunk_remaining = 61;
+    conn.resp_chunk_parser.has_digits = true;
+    conn.resp_body_sent = 67;
+    conn.upstream_send_len = 71;
+    conn.reset();
+    CHECK_EQ(conn.resp_status, 0u);
+    CHECK_EQ(conn.resp_body_mode, BodyMode::None);
+    CHECK_EQ(conn.resp_body_remaining, 0u);
+    CHECK_EQ(conn.resp_chunk_parser.state, ChunkedParser::State::Size);
+    CHECK_EQ(conn.resp_chunk_parser.chunk_remaining, 0u);
+    CHECK_FALSE(conn.resp_chunk_parser.has_digits);
+    CHECK_EQ(conn.resp_body_sent, 0u);
+    CHECK_EQ(conn.upstream_send_len, 0u);
+}
+
 namespace {
 struct ScopedIoUringLoopForRetirement {
     void* storage = MAP_FAILED;
@@ -20513,6 +20613,180 @@ bool stage_async_connect_completion(IoUringEventLoop* loop,
 
 IoEvent async_connect_failure_event(const Connection& conn, i32 result) {
     return {conn.id, result, 0, 0, IoEventType::UpstreamConnect, 0, 0, conn.upstream_episode};
+}
+
+TEST(iouring_connect_completion_failure,
+     sequential_same_forward_clears_response_accounting_for_both_recv_shapes) {
+    for (const bool terminal_downstream_recv : {false, true}) {
+        ScopedBackendHealthReset health_reset{};
+        ScopedIoUringLoopForRetirement guard;
+        if (!guard.init()) SKIP("io_uring unavailable");
+        auto* loop = guard.loop;
+        const u32 free_before = loop->free_top;
+        ShardMetrics metrics{};
+        metrics.init();
+        loop->metrics = &metrics;
+        RouteConfig config{};
+        PreconnectConnectSubmitFixture fixture{};
+        REQUIRE(stage_async_connect_completion(loop,
+                                               config,
+                                               AsyncConnectFailureProfile::BodylessGet,
+                                               terminal_downstream_recv,
+                                               false,
+                                               &fixture));
+        Connection& conn = *fixture.conn;
+        const u32 id = conn.id;
+        BackendHealth* health = backend_health(0, 0);
+        REQUIRE(health != nullptr);
+        const u32 request1_episode = conn.upstream_episode;
+        const IoEvent request1_failure = async_connect_failure_event(conn, -ECONNREFUSED);
+
+        loop->dispatch(request1_failure);
+
+        REQUIRE(conn.send_armed);
+        CHECK_EQ(conn.resp_status, 502u);
+        CHECK_EQ(conn.resp_body_mode, BodyMode::None);
+        CHECK_EQ(conn.resp_body_remaining, 0u);
+        CHECK_EQ(conn.resp_body_sent, conn.response_header_buf.len());
+        CHECK_EQ(conn.upstream_send_len, 0u);
+        CHECK_EQ(conn.upstream_retiring_episode, request1_episode);
+        CHECK_NE(conn.upstream_episode, request1_episode);
+        CHECK_EQ(health->fails, 1u);
+        CHECK_EQ(metrics.requests_total, 0u);
+        CHECK_EQ(metrics.requests_active, 1u);
+        CHECK_EQ(conn.recv_armed, !terminal_downstream_recv);
+        CHECK_EQ(conn.pending_ops, terminal_downstream_recv ? 1u : 2u);
+        CHECK(buf_has(conn.response_header_buf.data(), conn.response_header_buf.len(), "default"));
+
+        const u32 request1_pending = conn.pending_ops;
+        loop->dispatch(request1_failure);
+        CHECK_EQ(conn.pending_ops, request1_pending);
+        CHECK_EQ(health->fails, 1u);
+        CHECK_EQ(metrics.requests_total, 0u);
+
+        const u32 request1_response_len = conn.response_header_buf.len();
+        loop->backend.send_state[id].remaining = 0;
+        loop->dispatch({id, static_cast<i32>(request1_response_len), 0, 0, IoEventType::Send, 0});
+        REQUIRE_EQ(conn.state, ConnState::ReadingHeader);
+        REQUIRE_EQ(conn.on_recv, &on_header_received<IoUringEventLoop>);
+        REQUIRE(conn.recv_armed);
+        REQUIRE_EQ(conn.pending_ops, 1u);
+        CHECK_EQ(metrics.requests_total, 1u);
+        CHECK_EQ(metrics.requests_active, 0u);
+        // Request-1 completion accounting consumes the tuple before the
+        // successor boundary, so it must remain available through this point.
+        CHECK_EQ(conn.resp_status, 502u);
+        CHECK_EQ(conn.resp_body_mode, BodyMode::None);
+        CHECK_EQ(conn.resp_body_remaining, 0u);
+        CHECK_EQ(conn.resp_body_sent, request1_response_len);
+        CHECK_EQ(conn.upstream_send_len, 0u);
+
+        static constexpr u8 kRequest2KeepAlive[] =
+            "GET /one HTTP/1.1\r\nHost: client.example\r\n\r\n";
+        static constexpr u8 kRequest2Close[] =
+            "GET /one HTTP/1.1\r\nHost: client.example\r\nConnection: close\r\n\r\n";
+        const u8* request2 = terminal_downstream_recv ? kRequest2Close : kRequest2KeepAlive;
+        const u32 request2_len = terminal_downstream_recv ? sizeof(kRequest2Close) - 1u
+                                                          : sizeof(kRequest2KeepAlive) - 1u;
+        REQUIRE_EQ(conn.recv_buf.write(request2, request2_len), request2_len);
+        const u32 request2_sq_tail = __atomic_load_n(loop->backend.sq_tail, __ATOMIC_ACQUIRE);
+        const u32 request2_backend_pending = loop->backend.pending;
+        loop->dispatch({id, static_cast<i32>(request2_len), 0, 0, IoEventType::Recv, 1});
+
+        REQUIRE_GE(conn.fd, 0);
+        REQUIRE_GE(conn.upstream_fd, 0);
+        REQUIRE(conn.upstream_connect_armed);
+        REQUIRE(conn.recv_armed);
+        REQUIRE_EQ(conn.pending_ops, 2u);
+        CHECK_EQ(conn.resp_status, 0u);
+        CHECK_EQ(conn.resp_body_mode, BodyMode::None);
+        CHECK_EQ(conn.resp_body_remaining, 0u);
+        CHECK_EQ(conn.resp_chunk_parser.state, ChunkedParser::State::Size);
+        CHECK_EQ(conn.resp_chunk_parser.chunk_remaining, 0u);
+        CHECK_FALSE(conn.resp_chunk_parser.has_digits);
+        CHECK_EQ(conn.resp_body_sent, 0u);
+        CHECK_EQ(conn.upstream_send_len, 0u);
+        CHECK_EQ(metrics.requests_total, 1u);
+        CHECK_EQ(metrics.requests_active, 1u);
+        CHECK_EQ(health->fails, 1u);
+        CHECK_EQ(conn.upstream_retiring_episode, request1_episode);
+        const u32 request2_episode = conn.upstream_episode;
+        REQUIRE_NE(request2_episode, request1_episode);
+
+        // The second Connect SQE is intentionally not submitted by this
+        // deterministic seam. Retain only its logical owner for dispatch.
+        __atomic_store_n(loop->backend.sq_tail, request2_sq_tail, __ATOMIC_RELEASE);
+        loop->backend.pending = request2_backend_pending;
+        if (terminal_downstream_recv) {
+            conn.recv_armed = false;
+            conn.pending_ops--;
+        }
+        const IoEvent request2_failure = async_connect_failure_event(conn, -ECONNREFUSED);
+        loop->dispatch(request2_failure);
+
+        REQUIRE(conn.send_armed);
+        CHECK_EQ(conn.recv_armed, !terminal_downstream_recv);
+        CHECK_EQ(conn.pending_ops, terminal_downstream_recv ? 1u : 2u);
+        CHECK_EQ(conn.resp_status, 502u);
+        CHECK_EQ(conn.resp_body_mode, BodyMode::None);
+        CHECK_EQ(conn.resp_body_remaining, 0u);
+        CHECK_EQ(conn.resp_body_sent, conn.response_header_buf.len());
+        CHECK_EQ(conn.upstream_send_len, 0u);
+        CHECK_EQ(conn.upstream_retiring_episode, request2_episode);
+        CHECK_NE(conn.upstream_episode, request2_episode);
+        CHECK_EQ(health->fails, 2u);
+        CHECK_EQ(metrics.requests_total, 1u);
+        CHECK_EQ(metrics.requests_active, 1u);
+        CHECK(buf_has(conn.response_header_buf.data(), conn.response_header_buf.len(), "default"));
+        CHECK_FALSE(buf_contains(reinterpret_cast<const char*>(conn.response_header_buf.data()),
+                                 conn.response_header_buf.len(),
+                                 "time\0out",
+                                 8));
+
+        const u32 request2_pending = conn.pending_ops;
+        loop->dispatch(request2_failure);
+        CHECK_EQ(conn.pending_ops, request2_pending);
+        CHECK_EQ(health->fails, 2u);
+        CHECK_EQ(metrics.requests_total, 1u);
+
+        const u32 request2_response_len = conn.response_header_buf.len();
+        loop->backend.send_state[id].remaining = 0;
+        if (terminal_downstream_recv) {
+            const i32 ring_fd = loop->backend.ring_fd;
+            loop->backend.ring_fd = -1;
+            loop->dispatch(
+                {id, static_cast<i32>(request2_response_len), 0, 0, IoEventType::Send, 0});
+            loop->backend.ring_fd = ring_fd;
+            loop->backend.fatal_error.store(0, std::memory_order_release);
+            CHECK_EQ(loop->conns[id].fd, -1);
+            CHECK_EQ(loop->conns[id].pending_ops, 0u);
+            CHECK_EQ(loop->free_top, free_before);
+            CHECK_EQ(loop->conns[id].upstream_retiring_episode, request2_episode);
+        } else {
+            loop->dispatch(
+                {id, static_cast<i32>(request2_response_len), 0, 0, IoEventType::Send, 0});
+            REQUIRE_EQ(conn.state, ConnState::ReadingHeader);
+            REQUIRE_EQ(conn.on_recv, &on_header_received<IoUringEventLoop>);
+            REQUIRE(conn.recv_armed);
+            REQUIRE_EQ(conn.pending_ops, 1u);
+        }
+        CHECK_EQ(metrics.requests_total, 2u);
+        CHECK_EQ(metrics.requests_active, 0u);
+        CHECK_EQ(health->fails, 2u);
+
+        __atomic_store_n(loop->backend.sq_tail, fixture.sq_tail, __ATOMIC_RELEASE);
+        loop->backend.pending = fixture.backend_pending;
+        loop->backend.send_state[id] = {};
+        if (!terminal_downstream_recv) {
+            conn.send_armed = false;
+            conn.recv_armed = false;
+            conn.upstream_connect_armed = false;
+            conn.pending_ops = 0;
+            conn.clear_slots();
+            loop->close_conn(conn);
+        }
+        close(fixture.peer_fd);
+    }
 }
 
 TEST(iouring_connect_completion_failure,

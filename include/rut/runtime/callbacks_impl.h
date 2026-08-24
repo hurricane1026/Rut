@@ -1368,6 +1368,7 @@ void on_header_received(void* lp, Connection& conn, IoEvent ev) {
         }
     }
 
+    conn.clear_response_accounting();
     capture_request_metadata(conn);
 
     // Tag the request with a fresh generation so the yield-heap stale

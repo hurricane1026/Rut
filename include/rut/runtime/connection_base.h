@@ -1074,6 +1074,15 @@ struct ConnectionBase {
     u8* upstream_recv_slice;
     Buffer upstream_recv_buf;
 
+    void clear_response_accounting() {
+        resp_status = 0;
+        resp_body_mode = BodyMode::None;
+        resp_body_remaining = 0;
+        resp_chunk_parser.reset();
+        resp_body_sent = 0;
+        upstream_send_len = 0;
+    }
+
     void reset() {
         on_recv = nullptr;
         on_send = nullptr;
@@ -1240,11 +1249,7 @@ struct ConnectionBase {
         req_body_remaining = 0;
         req_chunk_parser.reset();
         req_body_streamed = false;
-        resp_body_mode = BodyMode::None;
-        resp_body_remaining = 0;
-        resp_chunk_parser.reset();
-        resp_body_sent = 0;
-        upstream_send_len = 0;
+        clear_response_accounting();
         recv_armed = false;
         send_armed = false;
         upstream_connect_armed = false;
@@ -1278,7 +1283,6 @@ struct ConnectionBase {
         upstream_recv_idle_stale_bytes = false;
         yield_armed = false;
         yield_timeout_armed = false;
-        resp_status = 0;
         req_method = 0;
         req_size = 0;
         peer_addr = 0;
