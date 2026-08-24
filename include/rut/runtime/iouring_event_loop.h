@@ -65,6 +65,50 @@ private:
     std::atomic<u64> drain_start_;
     std::atomic<u32> drain_period_;
 
+private:
+    template <typename Submit, typename Flush>
+    [[nodiscard]] bool submit_staged_local_response_impl(
+        Connection& c, const u8* src, u32 len, Submit&& submit, Flush&& flush) {
+        const bool staged_in_send_buf =
+            src == c.send_buf.data() && len == c.send_buf.len() && len != 0;
+        const bool staged_in_response_header_buf =
+            src == c.response_header_buf.data() && len == c.response_header_buf.len() && len != 0;
+        if (c.id >= kMaxConns || c.fd < 0 || src == nullptr || len == 0 || c.tls_active ||
+            (!staged_in_send_buf && !staged_in_response_header_buf) || c.send_armed ||
+            backend.send_state[c.id].remaining != 0 || c.response_read_deadline_send_owner_active ||
+            c.response_read_deadline_send_close_target_owned ||
+            c.response_read_deadline_send_close_cancel_owned ||
+            c.response_read_deadline_post_commit_phase ==
+                ResponseReadDeadlinePostCommitPhase::HeaderSend ||
+            c.response_read_deadline_post_commit_phase ==
+                ResponseReadDeadlinePostCommitPhase::BodySend ||
+            backend.failure_code() != 0)
+            return false;
+
+        const u32 pending_ops_before = c.pending_ops;
+        const auto send_state_before = backend.send_state[c.id];
+        const auto attempt_left_no_owner = [&]() {
+            const auto& send = backend.send_state[c.id];
+            return c.pending_ops == pending_ops_before && !c.send_armed &&
+                   send.src == send_state_before.src && send.fd == send_state_before.fd &&
+                   send.offset == send_state_before.offset &&
+                   send.remaining == send_state_before.remaining &&
+                   send.type == send_state_before.type &&
+                   send.upstream_episode == send_state_before.upstream_episode &&
+                   send.generation == send_state_before.generation;
+        };
+
+        if (submit()) return true;
+        if (!attempt_left_no_owner()) {
+            backend.fatal_error.store(EPROTO, std::memory_order_release);
+            return false;
+        }
+        if (!flush()) return false;
+        if (submit()) return true;
+        if (!attempt_left_no_owner()) backend.fatal_error.store(EPROTO, std::memory_order_release);
+        return false;
+    }
+
 public:
     static constexpr u32 kMaxConns = 16384;
     // Active health-check probing requires synchronous probe teardown; the
@@ -822,6 +866,38 @@ private:
     }
 
 public:
+    // Queue an already-built immutable cleartext local response.  This helper
+    // is intentionally narrower than client_send(): it does not serialize,
+    // select policy, advance throttling, enter TLS, or participate in the
+    // response-deadline Send-generation namespace.  On initial SQ exhaustion
+    // it performs one nonblocking flush and retries exactly once.  Both failed
+    // attempts leave downstream send ownership unpublished, so a caller can
+    // fail closed without preserving a deferred response marker.
+    [[nodiscard]] bool submit_staged_local_response(Connection& c, const u8* src, u32 len) {
+        return submit_staged_local_response_impl(
+            c,
+            src,
+            len,
+            [&]() { return submit_send_raw(c, src, len); },
+            [&]() { return backend.flush_pending_nonblocking(); });
+    }
+
+#ifdef RUT_TESTING
+    template <typename AttemptObserver, typename Flush>
+    [[nodiscard]] bool test_submit_staged_local_response(
+        Connection& c, const u8* src, u32 len, AttemptObserver&& observe_attempt, Flush&& flush) {
+        return submit_staged_local_response_impl(
+            c,
+            src,
+            len,
+            [&]() {
+                observe_attempt();
+                return submit_send_raw(c, src, len);
+            },
+            flush);
+    }
+#endif
+
     // Establish exact transport ownership for a bounded upstream episode. This
     // is foundation only: Connect/Send callers may not publish an HTTP/1
     // request boundary until #265's later epoch/header rendezvous exists.

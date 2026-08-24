@@ -18982,6 +18982,286 @@ struct ScopedIoUringLoopForRetirement {
     }
 };
 
+struct StagedLocalSendFixture {
+    void* loop_storage = MAP_FAILED;
+    IoUringEventLoop* loop = nullptr;
+    Connection connection{};
+    Connection* conn = nullptr;
+    u8 response_storage[512]{};
+    u32 sq_head = 0;
+    u32 sq_tail = 0;
+    u32 sq_mask = 3;
+    u32 sq_array[4]{};
+    io_uring_sqe sq_entries[4]{};
+
+    bool stage(const u8* bytes, u32 len) {
+        loop_storage = mmap(nullptr,
+                            sizeof(IoUringEventLoop),
+                            PROT_READ | PROT_WRITE,
+                            MAP_PRIVATE | MAP_ANONYMOUS,
+                            -1,
+                            0);
+        if (loop_storage == MAP_FAILED) return false;
+        loop = new (loop_storage) IoUringEventLoop();
+        loop->backend.sq_head = &sq_head;
+        loop->backend.sq_tail = &sq_tail;
+        loop->backend.sq_ring_mask = &sq_mask;
+        loop->backend.sq_array = sq_array;
+        loop->backend.sq_entries = sq_entries;
+        loop->backend.sq_ring_entries = 4;
+        loop->backend.pending = 0;
+        loop->backend.fatal_error.store(0, std::memory_order_relaxed);
+        loop->backend.send_state[0] = {nullptr, -1, 0, 0, IoEventType::Send, 0, 0};
+        conn = &connection;
+        conn->reset();
+        conn->id = 0;
+        conn->fd = 42;
+        conn->response_header_slice = response_storage;
+        conn->response_header_buf.bind(response_storage, sizeof(response_storage));
+        if (conn->response_header_buf.write(bytes, len) != len) return false;
+        return true;
+    }
+
+    bool safe_to_close() const {
+        return conn != nullptr && !conn->send_armed && conn->pending_ops == 0 &&
+               loop->backend.send_state[conn->id].remaining == 0;
+    }
+
+    ~StagedLocalSendFixture() {
+        if (loop != nullptr) loop->~IoUringEventLoop();
+        if (loop_storage != MAP_FAILED) munmap(loop_storage, sizeof(IoUringEventLoop));
+    }
+};
+
+static bool same_send_state(const IoUringBackend::SendState& lhs,
+                            const IoUringBackend::SendState& rhs) {
+    return lhs.src == rhs.src && lhs.fd == rhs.fd && lhs.offset == rhs.offset &&
+           lhs.remaining == rhs.remaining && lhs.type == rhs.type &&
+           lhs.upstream_episode == rhs.upstream_episode && lhs.generation == rhs.generation;
+}
+
+TEST(iouring_staged_local_send, first_attempt_success_does_not_flush) {
+    static constexpr u8 kResponse[] = "HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\n\r\n";
+    StagedLocalSendFixture fixture;
+    REQUIRE(fixture.stage(kResponse, sizeof(kResponse) - 1u));
+    auto* loop = fixture.loop;
+    Connection& conn = *fixture.conn;
+    RouteConfig config{};
+    conn.request_config = &config;
+    conn.request_policy_id = 7;
+    conn.failure_policy_id = 11;
+    conn.req_start_us = 1234;
+    conn.epoch_held = true;
+    conn.response_read_deadline_send_generation = 23;
+
+    const u32 tail_before = __atomic_load_n(loop->backend.sq_tail, __ATOMIC_ACQUIRE);
+    const u32 head_before = __atomic_load_n(loop->backend.sq_head, __ATOMIC_ACQUIRE);
+    const u32 backend_pending_before = loop->backend.pending;
+    const u32 conn_pending_before = conn.pending_ops;
+    const auto send_before = loop->backend.send_state[conn.id];
+    const u8* const src = conn.response_header_buf.data();
+    const u32 len = conn.response_header_buf.len();
+    u32 attempts = 0;
+    u32 flushes = 0;
+
+    REQUIRE(loop->test_submit_staged_local_response(
+        conn,
+        src,
+        len,
+        [&]() { ++attempts; },
+        [&]() {
+            ++flushes;
+            return true;
+        }));
+
+    CHECK_EQ(attempts, 1u);
+    CHECK_EQ(flushes, 0u);
+    CHECK_EQ(__atomic_load_n(loop->backend.sq_head, __ATOMIC_ACQUIRE), head_before);
+    CHECK_EQ(__atomic_load_n(loop->backend.sq_tail, __ATOMIC_ACQUIRE), tail_before + 1u);
+    CHECK_EQ(loop->backend.pending, backend_pending_before + 1u);
+    CHECK_EQ(conn.pending_ops, conn_pending_before + 1u);
+    CHECK(conn.send_armed);
+    const auto& send = loop->backend.send_state[conn.id];
+    CHECK_EQ(send.src, src);
+    CHECK_EQ(send.fd, conn.fd);
+    CHECK_EQ(send.offset, 0u);
+    CHECK_EQ(send.remaining, len);
+    CHECK_EQ(send.type, IoEventType::Send);
+    CHECK_EQ(send.generation, 0u);
+    CHECK_EQ(conn.request_config, &config);
+    CHECK_EQ(conn.request_policy_id, 7u);
+    CHECK_EQ(conn.failure_policy_id, 11u);
+    CHECK_EQ(conn.req_start_us, 1234u);
+    CHECK(conn.epoch_held);
+    CHECK_EQ(conn.response_read_deadline_send_generation, 23u);
+    CHECK_EQ(conn.response_header_buf.len(), len);
+    CHECK(__builtin_memcmp(conn.response_header_buf.data(), kResponse, len) == 0);
+
+    // Restore the manual ring after proving the sole staged SQE.
+    __atomic_store_n(loop->backend.sq_tail, tail_before, __ATOMIC_RELEASE);
+    loop->backend.pending = backend_pending_before;
+    conn.pending_ops = conn_pending_before;
+    conn.send_armed = false;
+    loop->backend.send_state[conn.id] = send_before;
+}
+
+TEST(iouring_staged_local_send, sq_full_flushes_once_and_retries_once) {
+    static constexpr u8 kResponse[] = "HTTP/1.1 502 Bad Gateway\r\nContent-Length: 1\r\n\r\nx";
+    StagedLocalSendFixture fixture;
+    REQUIRE(fixture.stage(kResponse, sizeof(kResponse) - 1u));
+    auto* loop = fixture.loop;
+    Connection& conn = *fixture.conn;
+    const u8* const src = conn.response_header_buf.data();
+    const u32 len = conn.response_header_buf.len();
+    const u32 conn_pending_before = conn.pending_ops;
+    const u32 head_before = __atomic_load_n(loop->backend.sq_head, __ATOMIC_ACQUIRE);
+    const u32 full_tail = head_before + loop->backend.sq_ring_entries;
+
+    // Publish a full SQ. The deterministic nonblocking-flush seam exposes one
+    // slot; only the single retry can then acquire it.
+    __atomic_store_n(loop->backend.sq_tail, full_tail, __ATOMIC_RELEASE);
+    loop->backend.pending = 1;
+    u32 attempts = 0;
+    u32 flushes = 0;
+
+    REQUIRE(loop->test_submit_staged_local_response(
+        conn,
+        src,
+        len,
+        [&]() { ++attempts; },
+        [&]() {
+            ++flushes;
+            __atomic_store_n(loop->backend.sq_head, head_before + 1u, __ATOMIC_RELEASE);
+            loop->backend.pending = 0;
+            return true;
+        }));
+
+    CHECK_EQ(attempts, 2u);
+    CHECK_EQ(flushes, 1u);
+    CHECK_EQ(__atomic_load_n(loop->backend.sq_head, __ATOMIC_ACQUIRE), head_before + 1u);
+    CHECK_EQ(__atomic_load_n(loop->backend.sq_tail, __ATOMIC_ACQUIRE), full_tail + 1u);
+    CHECK_EQ(loop->backend.pending, 1u);
+    CHECK_EQ(conn.pending_ops, conn_pending_before + 1u);
+    CHECK(conn.send_armed);
+    const auto& send = loop->backend.send_state[conn.id];
+    CHECK_EQ(send.src, src);
+    CHECK_EQ(send.fd, conn.fd);
+    CHECK_EQ(send.offset, 0u);
+    CHECK_EQ(send.remaining, len);
+    CHECK_EQ(send.generation, 0u);
+    const auto& sqe = loop->backend.sq_entries[full_tail & *loop->backend.sq_ring_mask];
+    CHECK_EQ(sqe.opcode, IORING_OP_SEND);
+    CHECK_EQ(sqe.addr, reinterpret_cast<u64>(src));
+    CHECK_EQ(sqe.len, len);
+    u32 decoded_conn = 0;
+    u32 decoded_generation = 0;
+    IoEventType decoded_type = IoEventType::Count;
+    IoUringBackend::decode_user_data(sqe.user_data, decoded_conn, decoded_type, decoded_generation);
+    CHECK_EQ(decoded_conn, conn.id);
+    CHECK_EQ(decoded_type, IoEventType::Send);
+    CHECK_EQ(decoded_generation, 0u);
+    CHECK_EQ(conn.response_header_buf.len(), len);
+    CHECK(__builtin_memcmp(conn.response_header_buf.data(), kResponse, len) == 0);
+}
+
+TEST(iouring_staged_local_send, flush_failure_leaves_response_unowned_and_closeable) {
+    static constexpr u8 kResponse[] = "HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\n\r\n";
+    StagedLocalSendFixture fixture;
+    REQUIRE(fixture.stage(kResponse, sizeof(kResponse) - 1u));
+    auto* loop = fixture.loop;
+    Connection& conn = *fixture.conn;
+    RouteConfig config{};
+    conn.request_config = &config;
+    const u8* const src = conn.response_header_buf.data();
+    const u32 len = conn.response_header_buf.len();
+    const u32 conn_pending_before = conn.pending_ops;
+    const auto send_before = loop->backend.send_state[conn.id];
+    const u32 head = __atomic_load_n(loop->backend.sq_head, __ATOMIC_ACQUIRE);
+    __atomic_store_n(loop->backend.sq_tail, head + loop->backend.sq_ring_entries, __ATOMIC_RELEASE);
+    loop->backend.pending = 1;
+    u32 attempts = 0;
+    u32 flushes = 0;
+
+    CHECK_FALSE(loop->test_submit_staged_local_response(
+        conn,
+        src,
+        len,
+        [&]() { ++attempts; },
+        [&]() {
+            ++flushes;
+            return loop->backend.flush_pending_nonblocking();
+        }));
+
+    CHECK_EQ(attempts, 1u);
+    CHECK_EQ(flushes, 1u);
+    CHECK_EQ(loop->backend.failure_code(), EBADF);
+    CHECK_EQ(__atomic_load_n(loop->backend.sq_tail, __ATOMIC_ACQUIRE),
+             head + loop->backend.sq_ring_entries);
+    CHECK_EQ(loop->backend.pending, 1u);
+    CHECK_EQ(conn.pending_ops, conn_pending_before);
+    CHECK_FALSE(conn.send_armed);
+    CHECK(same_send_state(loop->backend.send_state[conn.id], send_before));
+    CHECK_EQ(conn.request_config, &config);
+    CHECK_EQ(conn.response_header_buf.len(), len);
+    CHECK(__builtin_memcmp(conn.response_header_buf.data(), kResponse, len) == 0);
+    CHECK(fixture.safe_to_close());
+
+    u32 sticky_attempts = 0;
+    u32 sticky_flushes = 0;
+    CHECK_FALSE(loop->test_submit_staged_local_response(
+        conn,
+        src,
+        len,
+        [&]() { ++sticky_attempts; },
+        [&]() {
+            ++sticky_flushes;
+            return true;
+        }));
+    CHECK_EQ(sticky_attempts, 0u);
+    CHECK_EQ(sticky_flushes, 0u);
+}
+
+TEST(iouring_staged_local_send, retry_still_full_leaves_response_unowned_and_closeable) {
+    static constexpr u8 kResponse[] = "HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\n\r\n";
+    StagedLocalSendFixture fixture;
+    REQUIRE(fixture.stage(kResponse, sizeof(kResponse) - 1u));
+    auto* loop = fixture.loop;
+    Connection& conn = *fixture.conn;
+    const u8* const src = conn.response_header_buf.data();
+    const u32 len = conn.response_header_buf.len();
+    const u32 conn_pending_before = conn.pending_ops;
+    const auto send_before = loop->backend.send_state[conn.id];
+    const u32 head = __atomic_load_n(loop->backend.sq_head, __ATOMIC_ACQUIRE);
+    __atomic_store_n(loop->backend.sq_tail, head + loop->backend.sq_ring_entries, __ATOMIC_RELEASE);
+    loop->backend.pending = 0;
+    u32 attempts = 0;
+    u32 flushes = 0;
+
+    CHECK_FALSE(loop->test_submit_staged_local_response(
+        conn,
+        src,
+        len,
+        [&]() { ++attempts; },
+        [&]() {
+            ++flushes;
+            return loop->backend.flush_pending_nonblocking();
+        }));
+
+    CHECK_EQ(attempts, 2u);
+    CHECK_EQ(flushes, 1u);
+    CHECK_EQ(loop->backend.failure_code(), 0);
+    CHECK_EQ(__atomic_load_n(loop->backend.sq_head, __ATOMIC_ACQUIRE), head);
+    CHECK_EQ(__atomic_load_n(loop->backend.sq_tail, __ATOMIC_ACQUIRE),
+             head + loop->backend.sq_ring_entries);
+    CHECK_EQ(loop->backend.pending, 0u);
+    CHECK_EQ(conn.pending_ops, conn_pending_before);
+    CHECK_FALSE(conn.send_armed);
+    CHECK(same_send_state(loop->backend.send_state[conn.id], send_before));
+    CHECK_EQ(conn.response_header_buf.len(), len);
+    CHECK(__builtin_memcmp(conn.response_header_buf.data(), kResponse, len) == 0);
+    CHECK(fixture.safe_to_close());
+}
+
 static u64 response_read_deadline_neutrality_test_handler(
     void*, jit::HandlerCtx*, const u8*, u32, void*) {
     return 0;

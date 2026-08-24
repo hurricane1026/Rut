@@ -508,6 +508,23 @@ bool IoUringBackend::add_send(i32 fd, u32 conn_id, const u8* buf, u32 len, u32 g
     return true;
 }
 
+bool IoUringBackend::flush_pending_nonblocking() {
+    if (failure_code() != 0) return false;
+    if (pending == 0) return true;
+
+    const i32 flushed = io_uring_enter(ring_fd, pending, 0, IORING_ENTER_SQ_WAKEUP);
+    if (flushed < 0) {
+        record_enter_error(flushed);
+        return false;
+    }
+    if (static_cast<u32>(flushed) > pending) {
+        fatal_error.store(EPROTO, std::memory_order_release);
+        return false;
+    }
+    pending -= static_cast<u32>(flushed);
+    return true;
+}
+
 bool IoUringBackend::add_send_upstream(
     i32 fd, u32 conn_id, const u8* buf, u32 len, u32 upstream_episode) {
     if (conn_id >= kMaxSendState || !valid_upstream_episode(upstream_episode)) return false;

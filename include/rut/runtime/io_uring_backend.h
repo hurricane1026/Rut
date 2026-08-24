@@ -143,6 +143,12 @@ struct IoUringBackend {
     // Returns false if SQ is full (no SQE submitted).
     bool add_send(i32 fd, u32 conn_id, const u8* buf, u32 len, u32 generation = 0);
 
+    // Submit the currently staged SQ entries without waiting for a completion.
+    // This is a bounded pressure-relief primitive: callers decide whether to
+    // retry their failed operation, and must not loop here.  A sticky backend
+    // error or an io_uring_enter failure is reported as false.
+    [[nodiscard]] bool flush_pending_nonblocking();
+
     // Same as add_send but encodes UpstreamSend in user_data.
     bool add_send_upstream(i32 fd, u32 conn_id, const u8* buf, u32 len, u32 upstream_episode = 1);
 
