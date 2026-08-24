@@ -597,19 +597,32 @@ private:
         const bool fixed_upload =
             c.http1_prebuilt_deadline_profile ==
             ResponseReadDeadlineProfile::FixedContentLengthUploadNonHeadContentLengthZero;
+        const bool coalesced_get =
+            !fixed_upload && c.http1_prebuilt_deadline_upload.raw_total_length != 0;
         if ((!fixed_upload && c.http1_prebuilt_deadline_profile !=
                                   ResponseReadDeadlineProfile::BodylessNonHeadContentLengthZero) ||
-            (fixed_upload ? !response_read_deadline_fixed_upload_method_admitted(
-                                c.http1_prebuilt_deadline_method) ||
-                                !response_read_deadline_fixed_upload_materialization_is_stable(
-                                    c,
-                                    c.http1_prebuilt_deadline_upload,
-                                    /*require_upload_complete=*/true,
-                                    c.http1_prebuilt_deadline_bundle_id,
-                                    c.http1_prebuilt_deadline_route_method,
-                                    /*allow_retired_episode=*/true)
-                          : !response_read_deadline_non_head_method_admitted(
-                                c.http1_prebuilt_deadline_method)) ||
+            (fixed_upload
+                 ? !response_read_deadline_fixed_upload_method_admitted(
+                       c.http1_prebuilt_deadline_method) ||
+                       !response_read_deadline_fixed_upload_materialization_is_stable(
+                           c,
+                           c.http1_prebuilt_deadline_upload,
+                           /*require_upload_complete=*/true,
+                           c.http1_prebuilt_deadline_bundle_id,
+                           c.http1_prebuilt_deadline_route_method,
+                           /*allow_retired_episode=*/true)
+                 : !response_read_deadline_non_head_method_admitted(
+                       c.http1_prebuilt_deadline_method) ||
+                       (coalesced_get &&
+                        !response_read_deadline_coalesced_get_phase1_prebuilt_stash_is_stable(
+                            c,
+                            c.http1_prebuilt_deadline_upload,
+                            c.http1_prebuilt_deadline_profile,
+                            bundle.response_buffering,
+                            c.http1_prebuilt_deadline_bundle_id,
+                            c.http1_prebuilt_deadline_method,
+                            c.http1_prebuilt_deadline_route_method,
+                            /*allow_retired_episode=*/true))) ||
             response.head_mode != ResponsePolicyHeadMode::Reject ||
             failure.head_mode != FailurePolicyHeadMode::Reject ||
             timeout.head_mode != FailurePolicyHeadMode::Reject)
@@ -712,9 +725,29 @@ private:
                 // not reached that callback and belongs to RetrySendBuf instead.
                 const u32 stored =
                     static_cast<u32>(c.retry_req_send_len) + static_cast<u32>(c.pipeline_stash_len);
+                const bool coalesced_get =
+                    c.http1_prebuilt_deadline_profile ==
+                        ResponseReadDeadlineProfile::BodylessNonHeadContentLengthZero &&
+                    c.http1_prebuilt_deadline_upload.raw_total_length != 0;
                 return c.request_upload_complete && !c.upstream_request_incomplete &&
                        !retiring_connect && !retiring_send &&
-                       request_prefix_len == c.retry_req_send_len && stored <= c.send_buf.len();
+                       request_prefix_len == c.retry_req_send_len && stored <= c.send_buf.len() &&
+                       (!coalesced_get ||
+                        response_read_deadline_coalesced_get_phase1_prebuilt_stash_is_stable(
+                            c,
+                            c.http1_prebuilt_deadline_upload,
+                            c.http1_prebuilt_deadline_profile,
+                            c.http1_prebuilt_deadline_config != nullptr &&
+                                    c.http1_prebuilt_deadline_config->policy_bundle_id_is_valid(
+                                        c.http1_prebuilt_deadline_bundle_id)
+                                ? c.http1_prebuilt_deadline_config
+                                      ->policy_bundles[c.http1_prebuilt_deadline_bundle_id - 1]
+                                      .response_buffering
+                                : ForwardResponseBufferingMode::None,
+                            c.http1_prebuilt_deadline_bundle_id,
+                            c.http1_prebuilt_deadline_method,
+                            c.http1_prebuilt_deadline_route_method,
+                            /*allow_retired_episode=*/true));
             }
             case Http1RequestBufferDisposition::None:
                 return false;
@@ -1297,6 +1330,10 @@ public:
                 c.upstream_retirement_cancel_retry == 0) {
                 c.upstream_retirement_active = false;
                 if (c.http1_prebuilt_disposition != Http1RequestBufferDisposition::None) {
+                    if (!prebuilt_http1_response_is_complete(c)) {
+                        close_conn(c);
+                        return true;
+                    }
                     if ((c.http1_prebuilt_wait & kHttp1WaitUpstreamRetirement) == 0) {
                         c.upstream_episode = kInvalidUpstreamEventEpisode;
                         c.upstream_episode_quarantined = true;
@@ -1386,8 +1423,9 @@ public:
                     valid_upstream_episode(expected_episode) &&
                     c.upstream_episode == expected_episode && c.upstream_fd < 0 &&
                     !c.upstream_slot_held && c.state == ConnState::Sending && !c.send_armed &&
-                    c.req_start_us == 0 && c.epoch_held && !c.upstream_connect_armed &&
-                    !c.upstream_send_armed && !c.upstream_recv_armed && !has_request_callback;
+                    c.req_start_us == 0 && c.epoch_held && prebuilt_http1_response_is_complete(c) &&
+                    !c.upstream_connect_armed && !c.upstream_send_armed && !c.upstream_recv_armed &&
+                    !has_request_callback;
                 const bool explicit_close =
                     c.http1_prebuilt_deadline_config != nullptr &&
                     c.http1_prebuilt_deadline_config->policy_bundle_id_is_valid(

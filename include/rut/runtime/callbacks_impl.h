@@ -654,6 +654,61 @@ struct ResponseReadDeadlineFixedUploadRequest {
     u32 total_length = 0;
 };
 
+inline bool inspect_response_read_deadline_coalesced_get_phase1(const Connection& conn,
+                                                                ParsedRequest* parsed = nullptr) {
+    if (conn.recv_buf.data() == nullptr || conn.req_initial_send_len == 0 ||
+        conn.req_initial_send_len != conn.req_header_end ||
+        conn.req_initial_send_len >= conn.recv_buf.len() ||
+        conn.req_initial_send_len > conn.recv_buf.capacity() ||
+        conn.protocol != ConnProtocol::Http11 || conn.tls_active || conn.h2 != nullptr ||
+        conn.req_method != static_cast<u8>(LogHttpMethod::Get) ||
+        conn.req_http_version != static_cast<u8>(HttpVersion::Http11) ||
+        !response_read_deadline_default_persistence_is_stable(conn) ||
+        conn.req_client_has_content_length || conn.req_client_has_transfer_encoding ||
+        conn.req_client_has_te || conn.req_client_has_expect ||
+        conn.req_client_has_upgrade_header || conn.req_client_connection_count != 0 ||
+        conn.req_body_mode != BodyMode::None || conn.req_body_remaining != 0 ||
+        conn.request_body_fully_buffered || conn.req_body_streamed || conn.req_malformed ||
+        conn.req_wants_upgrade || conn.req_path_canon.ptr == nullptr || conn.pipeline_depth != 0 ||
+        conn.pipeline_stash_len != 0 || conn.retry_req_send_len != 0 ||
+        conn.response_mutations_snapshotted || conn.target_transform_recorded ||
+        conn.req_path_overridden || conn.req_header_override_count != 0 ||
+        conn.req_header_override_overflow || conn.resp_header_mutation_count != 0 ||
+        conn.resp_header_mutation_pending_count != 0 ||
+        conn.resp_header_mutation_pending_overflow || conn.resp_header_mutation_overflow ||
+        conn.upstream_fd >= 0 || conn.upstream_reused || conn.upstream_attempts != 0)
+        return false;
+    HttpParser parser;
+    ParsedRequest request;
+    parser.reset();
+    request.reset();
+    if (parser.parse(conn.recv_buf.data(), conn.req_initial_send_len, &request) !=
+            ParseStatus::Complete ||
+        parser.header_end != conn.req_initial_send_len || request.method != HttpMethod::GET ||
+        request.version != HttpVersion::Http11 || request.path.ptr == nullptr ||
+        request.path.len == 0 || request.path.ptr[0] != '/' || request.has_content_length ||
+        request.chunked || request.upgrade || request.has_upgrade_header)
+        return false;
+    u32 host_count = 0;
+    for (u32 i = 0; i < request.header_count; ++i) {
+        const Header& header = request.headers[i];
+        const Str name = header.name;
+        if (http_header_name_eq_ci(name.ptr, name.len, "host", 4)) {
+            if (++host_count > 1 || header.value.len == 0) return false;
+        } else if (http_header_name_eq_ci(name.ptr, name.len, "content-length", 14) ||
+                   http_header_name_eq_ci(name.ptr, name.len, "transfer-encoding", 17) ||
+                   http_header_name_eq_ci(name.ptr, name.len, "connection", 10) ||
+                   http_header_name_eq_ci(name.ptr, name.len, "te", 2) ||
+                   http_header_name_eq_ci(name.ptr, name.len, "expect", 6) ||
+                   http_header_name_eq_ci(name.ptr, name.len, "upgrade", 7)) {
+            return false;
+        }
+    }
+    if (host_count != 1) return false;
+    if (parsed != nullptr) *parsed = request;
+    return true;
+}
+
 inline bool inspect_response_read_deadline_fixed_upload_request(
     const Connection& conn, ResponseReadDeadlineFixedUploadRequest* out) {
     if (out == nullptr || conn.recv_buf.data() == nullptr || conn.recv_buf.len() == 0 ||
@@ -841,7 +896,10 @@ bool prepare_response_read_deadline_preflight(Loop* loop,
               conn.pending_forward_request_policy_id != 0 ||
               !complete_content_length_buffering_policies_valid(response, failure, timeout))) ||
             !response_read_deadline_route_method_matches(conn.req_method, route->method) ||
-            conn.pipeline_depth != 0 || conn.recv_buf.len() != conn.req_initial_send_len ||
+            conn.pipeline_depth != 0 ||
+            (conn.recv_buf.len() != conn.req_initial_send_len &&
+             !(complete_buffering && route->method == kRouteMethodGet &&
+               inspect_response_read_deadline_coalesced_get_phase1(conn))) ||
             (fixed_upload &&
              (!inspect_response_read_deadline_fixed_upload_request(conn, &upload_request) ||
               !response_read_deadline_route_index(*config, route, &route_index)))) {
@@ -864,6 +922,18 @@ bool prepare_response_read_deadline_preflight(Loop* loop,
             profile == ResponseReadDeadlineProfile::BodylessNonHeadContentLengthZero &&
             !conn.req_client_keep_alive && conn.req_client_connection_close &&
             conn.req_client_connection_close_exact && conn.req_client_connection_count == 1;
+        if (conn.recv_buf.len() > conn.req_initial_send_len) {
+            auto& proof = conn.response_read_deadline_upload;
+            if (!response_read_deadline_route_index(*config, route, &route_index)) {
+                loop->close_conn(conn);
+                return false;
+            }
+            proof.handler_generation = conn.handler_gen;
+            proof.raw_header_end = conn.req_initial_send_len;
+            proof.raw_total_length = conn.req_initial_send_len;
+            proof.route_index = route_index;
+            proof.route_fn = route->fn;
+        }
         if (fixed_upload) {
             auto& proof = conn.response_read_deadline_upload;
             proof.handler_generation = conn.handler_gen;
@@ -1762,11 +1832,16 @@ void on_header_received(void* lp, Connection& conn, IoEvent ev) {
         ctx->route_param_count = route_param_count;
         for (u32 i = 0; i < route_param_count; i++) ctx->route_params[i] = route_params[i];
         conn.send_buf.reset();
+        const u32 jit_request_len =
+            conn.response_read_deadline_state == ResponseReadDeadlineState::Preflight &&
+                    inspect_response_read_deadline_coalesced_get_phase1(conn)
+                ? conn.req_initial_send_len
+                : conn.recv_buf.len();
         auto outcome = invoke_jit_handler(route->fn,
                                           static_cast<void*>(&conn),
                                           *ctx,
                                           conn.recv_buf.data(),
-                                          conn.recv_buf.len(),
+                                          jit_request_len,
                                           /*arena=*/nullptr);
         handle_jit_outcome<Loop>(loop, conn, outcome, route->fn, kKeepAlive);
     } else {
@@ -2708,9 +2783,19 @@ void handle_jit_outcome(
                 const bool fixed_upload =
                     outcome_profile ==
                     ResponseReadDeadlineProfile::FixedContentLengthUploadNonHeadContentLengthZero;
+                const auto& deadline_proof = conn.response_read_deadline_upload;
+                const bool coalesced_get =
+                    outcome_profile ==
+                        ResponseReadDeadlineProfile::BodylessNonHeadContentLengthZero &&
+                    inspect_response_read_deadline_coalesced_get_phase1(conn) && fn != nullptr &&
+                    deadline_proof.route_fn == fn && deadline_proof.handler_generation != 0 &&
+                    deadline_proof.handler_generation == conn.handler_gen &&
+                    deadline_proof.raw_header_end == conn.req_initial_send_len &&
+                    deadline_proof.raw_total_length == conn.req_initial_send_len &&
+                    deadline_proof.raw_content_length == 0;
                 const bool deadline_phase_valid =
                     (conn.response_read_deadline_state == ResponseReadDeadlineState::Preflight &&
-                     (!fixed_upload ||
+                     ((!fixed_upload && !coalesced_get) ||
                       (fn != nullptr && fn == conn.response_read_deadline_upload.route_fn))) ||
                     (fixed_upload &&
                      conn.response_read_deadline_state == ResponseReadDeadlineState::Validated &&
@@ -2748,7 +2833,7 @@ void handle_jit_outcome(
                     conn.resp_header_mutation_pending_overflow ||
                     conn.resp_header_mutation_overflow || conn.protocol != ConnProtocol::Http11 ||
                     conn.tls_active || conn.pipeline_depth != 0 ||
-                    (!fixed_upload &&
+                    (!fixed_upload && !coalesced_get &&
                      (conn.req_body_mode != BodyMode::None || conn.req_body_remaining != 0 ||
                       conn.request_body_fully_buffered ||
                       conn.recv_buf.len() != conn.req_initial_send_len)) ||
@@ -2771,11 +2856,13 @@ void handle_jit_outcome(
                     proof.request_policy_id = outcome.request_policy_id;
                 } else if (complete_content_length_buffering) {
                     auto& proof = conn.response_read_deadline_upload;
-                    if (proof.request_policy_id != 0) {
+                    if (proof.request_policy_id != 0 ||
+                        (coalesced_get && proof.upstream_id != 0xffffu)) {
                         loop->close_conn(conn);
                         return;
                     }
                     proof.request_policy_id = outcome.request_policy_id;
+                    if (coalesced_get) proof.upstream_id = outcome.upstream_id;
                 }
                 conn.response_read_deadline_state = ResponseReadDeadlineState::Validated;
             } else if (conn.response_read_deadline_state != ResponseReadDeadlineState::None) {
@@ -2995,6 +3082,34 @@ void handle_jit_outcome(
                     else
                         reject_request_policy(loop, conn);
                     return;
+                }
+                if (conn.response_read_deadline_profile ==
+                        ResponseReadDeadlineProfile::BodylessNonHeadContentLengthZero &&
+                    conn.response_read_deadline_upload.raw_total_length != 0) {
+                    auto& proof = conn.response_read_deadline_upload;
+                    HttpParser rewritten_parser;
+                    ParsedRequest rewritten_request;
+                    rewritten_parser.reset();
+                    rewritten_request.reset();
+                    if (conn.request_policy_id !=
+                            static_cast<u16>(RequestPolicyId::Http11FixedStrip) ||
+                        conn.req_initial_send_len == 0 ||
+                        conn.req_initial_send_len != conn.req_header_end ||
+                        conn.req_initial_send_len >= conn.recv_buf.len() ||
+                        rewritten_parser.parse(conn.recv_buf.data(),
+                                               conn.req_initial_send_len,
+                                               &rewritten_request) != ParseStatus::Complete ||
+                        rewritten_parser.header_end != conn.req_initial_send_len ||
+                        rewritten_request.method != HttpMethod::GET ||
+                        rewritten_request.version != HttpVersion::Http11 ||
+                        rewritten_request.has_content_length || rewritten_request.chunked ||
+                        rewritten_request.upgrade || rewritten_request.has_upgrade_header) {
+                        loop->close_conn(conn);
+                        return;
+                    }
+                    proof.rewritten_header_end = conn.req_header_end;
+                    proof.rewritten_total_length = conn.req_initial_send_len;
+                    proof.expected_upload_length = conn.req_initial_send_len;
                 }
                 if (conn.response_read_deadline_profile ==
                     ResponseReadDeadlineProfile::FixedContentLengthUploadNonHeadContentLengthZero) {
@@ -4056,6 +4171,15 @@ inline bool apply_request_policy(Connection& conn, const sockaddr_in& endpoint, 
 
     const u8* data = conn.recv_buf.data();
     const u32 len = conn.recv_buf.len();
+    const bool coalesced_phase1 =
+        conn.response_read_deadline_state == ResponseReadDeadlineState::Validated &&
+        conn.response_read_deadline_profile ==
+            ResponseReadDeadlineProfile::BodylessNonHeadContentLengthZero &&
+        conn.response_read_deadline_upload.raw_total_length != 0 &&
+        conn.response_read_deadline_upload.raw_total_length == conn.req_initial_send_len &&
+        conn.req_initial_send_len < len;
+    const u32 original_request_end = conn.req_initial_send_len;
+    const u32 original_successor_len = coalesced_phase1 ? len - original_request_end : 0;
     HttpParser parser;
     ParsedRequest req;
     parser.reset();
@@ -4166,6 +4290,12 @@ inline bool apply_request_policy(Connection& conn, const sockaddr_in& endpoint, 
     if (request_end64 > len) return false;
     const u32 request_end = static_cast<u32>(request_end64);
     if (!append(data + body_start, body_len) || !append(data + request_end, len - request_end))
+        return false;
+    if (coalesced_phase1 &&
+        (request_end != original_request_end || conn.send_buf.len() < original_successor_len ||
+         __builtin_memcmp(conn.send_buf.data() + conn.send_buf.len() - original_successor_len,
+                          data + original_request_end,
+                          original_successor_len) != 0))
         return false;
     if (conn.send_buf.len() > conn.recv_buf.capacity()) return false;
     conn.recv_buf.reset();
@@ -4376,6 +4506,21 @@ void on_upstream_connected(void* lp, Connection& conn, IoEvent ev) {
             loop->close_conn(conn);
             return;
         }
+    } else if (conn.response_read_deadline_state == ResponseReadDeadlineState::Validated &&
+               conn.response_read_deadline_profile ==
+                   ResponseReadDeadlineProfile::BodylessNonHeadContentLengthZero &&
+               conn.response_read_deadline_upload.raw_total_length != 0) {
+        auto& proof = conn.response_read_deadline_upload;
+        proof.upload_episode = conn.upstream_episode;
+        if (conn.upstream_reused || conn.upstream_attempts != 1 ||
+            conn.upstream_recv_buf.len() != 0 || conn.upstream_recv_armed ||
+            conn.request_upload_complete || req_src != conn.recv_buf.data() ||
+            req_send_len != proof.expected_upload_length ||
+            req_send_len != conn.req_initial_send_len || req_send_len >= conn.recv_buf.len() ||
+            !response_read_deadline_coalesced_get_phase1_proof_is_stable(conn, proof)) {
+            loop->close_conn(conn);
+            return;
+        }
     }
     conn.set_slots(nullptr,
                    nullptr,
@@ -4395,7 +4540,12 @@ void on_upstream_request_sent(void* lp, Connection& conn, IoEvent ev) {
         conn.response_read_deadline_state == ResponseReadDeadlineState::Validated &&
         conn.response_read_deadline_profile ==
             ResponseReadDeadlineProfile::FixedContentLengthUploadNonHeadContentLengthZero;
-    if (fixed_upload) {
+    const bool coalesced_get =
+        conn.response_read_deadline_state == ResponseReadDeadlineState::Validated &&
+        conn.response_read_deadline_profile ==
+            ResponseReadDeadlineProfile::BodylessNonHeadContentLengthZero &&
+        conn.response_read_deadline_upload.raw_total_length != 0;
+    if (fixed_upload || coalesced_get) {
         const auto& proof = conn.response_read_deadline_upload;
         bool send_owner_stable = false;
         if constexpr (requires(Loop* candidate) { candidate->backend.upstream_send_state[0]; }) {
@@ -4411,8 +4561,10 @@ void on_upstream_request_sent(void* lp, Connection& conn, IoEvent ev) {
             conn.upstream_send_armed || conn.on_upstream_send != &on_upstream_request_sent<Loop> ||
             conn.request_upload_complete || conn.upstream_recv_buf.len() != 0 ||
             conn.upstream_recv_armed ||
-            !response_read_deadline_fixed_upload_materialization_is_stable(
-                conn, proof, /*require_upload_complete=*/false)) {
+            (fixed_upload
+                 ? !response_read_deadline_fixed_upload_materialization_is_stable(
+                       conn, proof, /*require_upload_complete=*/false)
+                 : !response_read_deadline_coalesced_get_phase1_proof_is_stable(conn, proof))) {
             conn.upstream_request_incomplete = true;
             loop->close_conn(conn);
             return;
@@ -4560,6 +4712,11 @@ void on_upstream_request_sent(void* lp, Connection& conn, IoEvent ev) {
         // then land at offset 0 and flow through pipeline_recover, and the just-sent
         // request can never leak into the next request's parse.
         conn.recv_buf.reset();
+        if (coalesced_get && !response_read_deadline_coalesced_get_phase1_stash_is_stable(
+                                 conn, conn.response_read_deadline_upload)) {
+            loop->close_conn(conn);
+            return;
+        }
     }
     conn.upstream_start_us = monotonic_us();
     conn.set_slots(nullptr, nullptr, &on_upstream_response<Loop>, nullptr);
@@ -5679,6 +5836,18 @@ void on_response_body_sent(void* lp, Connection& conn, IoEvent ev) {
 
 template <typename Loop>
 void handle_early_upstream_recv(Loop* loop, Connection& conn, IoEvent ev, bool send_in_flight) {
+    // #277 phase 1 intentionally does not publish an origin response while the
+    // request-1 Send still owns its source prefix.  Closing here covers the
+    // Recv-before-Send ordering; Send-before-Recv first completes the upload,
+    // establishes the exact stash and moves to the ordinary strict recv slot.
+    if (send_in_flight &&
+        conn.response_read_deadline_state == ResponseReadDeadlineState::Validated &&
+        conn.response_read_deadline_upload.raw_total_length != 0 &&
+        response_read_deadline_coalesced_get_phase1_proof_is_stable(
+            conn, conn.response_read_deadline_upload)) {
+        loop->close_conn(conn);
+        return;
+    }
     if (ev.result <= 0 && conn.upstream_recv_buf.len() == 0) {
         // EOF/error before any response, possibly before the request send even
         // completed (epoll can deliver a reused socket's FIN/RST while the send is
@@ -6917,12 +7086,13 @@ inline ResponseReadDeadlineProfile classify_response_read_deadline_profile(
         return ResponseReadDeadlineProfile::None;
     if (conn.recv_buf.data() == nullptr || conn.recv_buf.len() == 0)
         return ResponseReadDeadlineProfile::None;
+    const bool coalesced_get = inspect_response_read_deadline_coalesced_get_phase1(conn);
+    const u32 request_view_len = coalesced_get ? conn.req_initial_send_len : conn.recv_buf.len();
     HttpParser parser;
     ParsedRequest request;
     parser.reset();
-    if (parser.parse(conn.recv_buf.data(), conn.recv_buf.len(), &request) !=
-            ParseStatus::Complete ||
-        parser.header_end != conn.recv_buf.len() ||
+    if (parser.parse(conn.recv_buf.data(), request_view_len, &request) != ParseStatus::Complete ||
+        parser.header_end != request_view_len ||
         route_method_key(request.method) !=
             route_method_key(static_cast<LogHttpMethod>(conn.req_method)) ||
         request.version != HttpVersion::Http11 || request.path.ptr == nullptr ||
@@ -7275,6 +7445,15 @@ inline bool validated_preconnect_failure_owner_is_stable(Loop* loop,
                 response.head_mode != ResponsePolicyHeadMode::Reject ||
                 failure.head_mode != FailurePolicyHeadMode::Reject ||
                 timeout.head_mode != FailurePolicyHeadMode::Reject)
+                return false;
+            const auto& proof = conn.response_read_deadline_upload;
+            if (proof.raw_total_length != 0 &&
+                (!response_read_deadline_coalesced_get_phase1_proof_is_stable(
+                     conn,
+                     proof,
+                     /*allow_retired_episode=*/false,
+                     /*require_upload_episode=*/false) ||
+                 conn.recv_buf.len() <= conn.req_initial_send_len || conn.pipeline_stash_len != 0))
                 return false;
         } else if (fixed_upload) {
             const auto& proof = conn.response_read_deadline_upload;
