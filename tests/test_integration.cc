@@ -10,6 +10,7 @@
 #if RUT_ENABLE_JIT_TESTS
 #include "rut/jit/codegen.h"
 #include "rut/jit/jit_engine.h"
+#include "rut/serve_loader.h"
 #endif
 #include "rut/runtime/cache_table.h"
 #include "rut/runtime/callbacks_h2.h"
@@ -23243,6 +23244,232 @@ TEST(
             zero = backend.request_history[slot][i] == '\0';
         CHECK(zero);
     }
+}
+
+TEST(route, ordinary_source_local_response_request_persistence_iouring) {
+    using namespace rut;
+    if (!iouring_socket_live()) SKIP("io_uring async socket ops unavailable in this environment");
+
+    static constexpr char kSource[] =
+        "route GET \"/static\" { return response(200, body: \"static280\") }\n";
+    static constexpr char kExpectedKeepAlive[] =
+        "HTTP/1.1 200 OK\r\n"
+        "Content-Length: 9\r\n"
+        "Content-Type: text/plain; charset=utf-8\r\n"
+        "Connection: keep-alive\r\n\r\n"
+        "static280";
+    static constexpr char kExpectedClose[] =
+        "HTTP/1.1 200 OK\r\n"
+        "Content-Length: 9\r\n"
+        "Content-Type: text/plain; charset=utf-8\r\n"
+        "Connection: close\r\n\r\n"
+        "static280";
+    static_assert(sizeof("static280") - 1u == 9u);
+
+    struct TempSource {
+        char path[64] = "/tmp/rut_local_persistence_XXXXXX";
+        i32 fd = -1;
+
+        bool create() {
+            fd = mkstemp(path);
+            if (fd < 0) return false;
+            u32 written = 0;
+            while (written < sizeof(kSource) - 1u) {
+                const ssize_t n = write(fd, kSource + written, sizeof(kSource) - 1u - written);
+                if (n < 0 && errno == EINTR) continue;
+                if (n <= 0) return false;
+                written += static_cast<u32>(n);
+            }
+            if (close(fd) != 0) return false;
+            fd = -1;
+            return true;
+        }
+
+        ~TempSource() {
+            if (fd >= 0) close(fd);
+            unlink(path);
+        }
+    } source;
+    REQUIRE(source.create());
+
+    LoadedProgram program{};
+    struct ProgramGuard {
+        LoadedProgram& program;
+        bool armed = true;
+        ~ProgramGuard() {
+            if (armed) program.destroy();
+        }
+    } program_guard{program};
+    LoadError load_error{};
+    REQUIRE(load_rut_program(source.path, program, load_error, jit::OptLevel::O0));
+
+    // This must be the ordinary source-loader/JIT path, not a hand-built
+    // RouteConfig or the legacy static action. Prove the published config and
+    // its owned response-body table before the shard can observe either.
+    REQUIRE_EQ(program.config.route_count, 1u);
+    REQUIRE_EQ(program.config.response_body_count, 1u);
+    REQUIRE_EQ(program.config.upstream_count, 0u);
+    const RouteEntry* compiled_route = program.config.match(
+        reinterpret_cast<const u8*>("/static"), sizeof("/static") - 1u, kRouteMethodGet);
+    REQUIRE(compiled_route != nullptr);
+    CHECK_EQ(compiled_route, &program.config.routes[0]);
+    CHECK_EQ(compiled_route->method, kRouteMethodGet);
+    CHECK_EQ(compiled_route->action, RouteAction::JitHandler);
+    CHECK_NE(compiled_route->fn, nullptr);
+    CHECK_EQ(compiled_route->path_len, sizeof("/static") - 1u);
+    CHECK_EQ(memcmp(compiled_route->path, "/static", sizeof("/static") - 1u), 0);
+    const auto& compiled_body = program.config.response_bodies[0];
+    REQUIRE_EQ(compiled_body.len, sizeof("static280") - 1u);
+    CHECK_EQ(memcmp(compiled_body.data, "static280", compiled_body.len), 0);
+
+    Shard<IoUringEventLoop> shard;
+    struct ShardGuard {
+        Shard<IoUringEventLoop>& shard;
+        bool initialized = false;
+        ~ShardGuard() {
+            if (initialized) shard.shutdown();
+        }
+    } shard_guard{shard};
+    struct FdGuard {
+        i32 fd = -1;
+        ~FdGuard() {
+            if (fd >= 0) close(fd);
+        }
+    } listen_guard{create_listen_socket(0).value_or(-1)};
+    REQUIRE_GE(listen_guard.fd, 0);
+    const u16 port = get_port(listen_guard.fd);
+    REQUIRE(shard.init(0, listen_guard.fd).has_value());
+    shard_guard.initialized = true;
+    shard.owns_listen_fd = true;
+    listen_guard.fd = -1;  // ownership transferred; drain may close it in the loop
+    shard.route_config = &program.config;
+    shard.active_config = shard.route_config;
+    REQUIRE(shard.loop != nullptr);
+    REQUIRE(shard.spawn(-1).has_value());
+    usleep(50000);
+    REQUIRE(shard.loop->is_running());
+    REQUIRE_EQ(shard.backend_failure_code(), 0);
+
+    struct ClientGuard {
+        i32 fd = -1;
+        ~ClientGuard() {
+            if (fd >= 0) close(fd);
+        }
+    } client{connect_to(port)};
+    REQUIRE_GE(client.fd, 0);
+
+    enum class ReadOutcome : u8 { Complete, Timeout, Eof, Error };
+    auto read_exact_until = [](i32 fd,
+                               char* out,
+                               u32 expected_len,
+                               i64 absolute_deadline_ms,
+                               u32* observed_len) -> ReadOutcome {
+        *observed_len = 0;
+        while (*observed_len < expected_len) {
+            const i64 remaining_ms = absolute_deadline_ms - test_mono_ms();
+            if (remaining_ms <= 0) return ReadOutcome::Timeout;
+            const i32 timeout_ms = remaining_ms > 5000 ? 5000 : static_cast<i32>(remaining_ms);
+            const i32 got =
+                recv_timeout(fd, out + *observed_len, expected_len - *observed_len, timeout_ms);
+            if (got > 0) {
+                *observed_len += static_cast<u32>(got);
+                continue;
+            }
+            if (got == 0) return ReadOutcome::Eof;
+            if (got == -EAGAIN || got == -EWOULDBLOCK) return ReadOutcome::Timeout;
+            return ReadOutcome::Error;
+        }
+        return ReadOutcome::Complete;
+    };
+
+    static constexpr char kRequestOne[] =
+        "GET /static HTTP/1.1\r\n"
+        "Host: client.example\r\n"
+        "X-Request: one\r\n\r\n";
+    REQUIRE(send_all(client.fd, kRequestOne, sizeof(kRequestOne) - 1u));
+    char response[sizeof(kExpectedKeepAlive) + 32]{};
+    u32 response_len = 0;
+    const i64 response_one_deadline_ms = test_mono_ms() + 5000;
+    REQUIRE_EQ(read_exact_until(client.fd,
+                                response,
+                                sizeof(kExpectedKeepAlive) - 1u,
+                                response_one_deadline_ms,
+                                &response_len),
+               ReadOutcome::Complete);
+    REQUIRE_EQ(response_len, sizeof(kExpectedKeepAlive) - 1u);
+    CHECK_EQ(memcmp(response, kExpectedKeepAlive, response_len), 0);
+    CHECK_FALSE(buf_contains(response, response_len, "Date:", 5));
+    CHECK_FALSE(buf_contains(response, response_len, "Server:", 7));
+
+    // Request 2 is intentionally absent until a complete first response is
+    // observed and the live production shard leaves the downstream boundary
+    // open and byte-quiet. This is sequential #280 evidence, not #276.
+    char probe[32];
+    REQUIRE_EQ(recv_timeout(client.fd, probe, sizeof(probe), 200), -EAGAIN);
+    REQUIRE(shard.loop->is_running());
+    REQUIRE_EQ(shard.backend_failure_code(), 0);
+
+    static constexpr char kRequestTwo[] =
+        "GET /static HTTP/1.1\r\n"
+        "Host: client.example\r\n"
+        "Connection: close\r\n"
+        "X-Request: two\r\n\r\n";
+    REQUIRE(send_all(client.fd, kRequestTwo, sizeof(kRequestTwo) - 1u));
+    memset(response, 0, sizeof(response));
+    response_len = 0;
+    const i64 response_two_deadline_ms = test_mono_ms() + 5000;
+    REQUIRE_EQ(read_exact_until(client.fd,
+                                response,
+                                sizeof(kExpectedClose) - 1u,
+                                response_two_deadline_ms,
+                                &response_len),
+               ReadOutcome::Complete);
+    REQUIRE_EQ(response_len, sizeof(kExpectedClose) - 1u);
+    CHECK_EQ(memcmp(response, kExpectedClose, response_len), 0);
+    CHECK_FALSE(buf_contains(response, response_len, "Date:", 5));
+    CHECK_FALSE(buf_contains(response, response_len, "Server:", 7));
+
+    // EOF is a wire witness, not a cleanup side effect: keep the client fd and
+    // both owners live, and wait on one absolute three-second budget.
+    const i64 eof_deadline_ms = test_mono_ms() + 3000;
+    i32 eof_result = -EAGAIN;
+    do {
+        const i64 remaining_ms = eof_deadline_ms - test_mono_ms();
+        if (remaining_ms <= 0) break;
+        eof_result = recv_timeout(client.fd, probe, sizeof(probe), static_cast<i32>(remaining_ms));
+    } while (eof_result == -EINTR);
+    REQUIRE_EQ(eof_result, 0);
+    REQUIRE(shard.loop->is_running());
+    REQUIRE_EQ(shard.backend_failure_code(), 0);
+
+    // Close the already-EOF peer before graceful drain. The shard owns the
+    // listener, so its drain-time close cannot leave a second owner with a
+    // stale fd that might later close an unrelated descriptor.
+    REQUIRE_EQ(close(client.fd), 0);
+    client.fd = -1;
+    shard.drain(1);
+    shard.join();
+
+    REQUIRE_EQ(shard.backend_failure_code(), 0);
+    CHECK_FALSE(shard.loop->is_running());
+    CHECK_EQ(shard.loop->active_count(), 0u);
+    CHECK_EQ(shard.loop->pending_free_count, 0u);
+    CHECK_EQ(shard.loop->pool.in_use(), 0u);
+    CHECK_EQ(shard.upstream->idle_count.load(std::memory_order_acquire), 0u);
+    CHECK_EQ(shard.upstream->free_top, UpstreamPool::kMaxConns);
+    CHECK_EQ(shard.shard_metrics.connections_total, 1u);
+    CHECK_EQ(shard.shard_metrics.connections_active, 0u);
+    CHECK_EQ(shard.shard_metrics.connections_closed, 1u);
+    CHECK_EQ(shard.shard_metrics.requests_total, 2u);
+    CHECK_EQ(shard.shard_metrics.requests_active, 0u);
+    CHECK_EQ(shard.shard_metrics.request_latency.count, 2u);
+    CHECK_EQ(shard.epoch.epoch.load(std::memory_order_acquire), 4u);
+
+    // Tear down the shard before releasing the source mmap and JIT code.
+    shard.shutdown();
+    shard_guard.initialized = false;
+    program.destroy();
+    program_guard.armed = false;
 }
 
 TEST(

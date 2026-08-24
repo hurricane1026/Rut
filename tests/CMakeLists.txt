@@ -81,7 +81,7 @@ target_compile_definitions(test_integration PRIVATE
     RUT_TESTDATA_DIR="${RUT_TLS_TESTDATA_DIR}"
 )
 if(RUT_ENABLE_JIT)
-    target_link_libraries(test_integration rut_jit)
+    target_link_libraries(test_integration rut_jit rut_loader)
     target_compile_definitions(test_integration PRIVATE RUT_ENABLE_JIT_TESTS=1)
 else()
     target_compile_definitions(test_integration PRIVATE RUT_ENABLE_JIT_TESTS=0)
