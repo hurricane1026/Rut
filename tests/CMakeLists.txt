@@ -428,11 +428,45 @@ if(RUT_ENABLE_JIT)
             RESOURCE_LOCK nginx-differential
             TIMEOUT 30
         )
+        add_test(
+            NAME test_rut_iouring_gate_connect_journal_negative
+            COMMAND test_nginx_differential --rut-iouring-gate-connect-journal-negative
+                    $<TARGET_FILE:rut> $<TARGET_FILE:test_rut_iouring_gate_preload>
+        )
+        set_tests_properties(test_rut_iouring_gate_connect_journal_negative PROPERTIES
+            LABELS "integration;nginx;negative"
+            RUN_SERIAL TRUE
+            RESOURCE_LOCK nginx-differential
+            TIMEOUT 30
+        )
+        add_test(
+            NAME test_nginx_late_successor_differential
+            COMMAND test_nginx_differential --late-successor-differential
+                    $<TARGET_FILE:rut>
+                    $<TARGET_FILE:test_nginx_downstream_gate_preload>
+                    $<TARGET_FILE:test_rut_iouring_gate_preload>
+        )
+        set_tests_properties(test_nginx_late_successor_differential PROPERTIES
+            LABELS "integration;nginx;docker"
+            RUN_SERIAL TRUE
+            RESOURCE_LOCK nginx-differential
+            TIMEOUT 60
+            SKIP_RETURN_CODE 77
+        )
     endif()
-    add_test(
-        NAME test_nginx_differential
-        COMMAND test_nginx_differential $<TARGET_FILE:rut>
-    )
+    if(TARGET test_rut_iouring_gate_preload)
+        add_test(
+            NAME test_nginx_differential
+            COMMAND test_nginx_differential $<TARGET_FILE:rut>
+                    $<TARGET_FILE:test_nginx_downstream_gate_preload>
+                    $<TARGET_FILE:test_rut_iouring_gate_preload>
+        )
+    else()
+        add_test(
+            NAME test_nginx_differential
+            COMMAND test_nginx_differential $<TARGET_FILE:rut>
+        )
+    endif()
     set_tests_properties(test_nginx_differential PROPERTIES
         LABELS "integration;nginx;docker"
         RUN_SERIAL TRUE

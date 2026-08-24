@@ -30,6 +30,7 @@ _Static_assert(__NR_io_uring_setup == 425 && __NR_io_uring_enter == 426 &&
 #define RUT_GATE_BUFFER_GROUP 0U
 #define RUT_GATE_RECV_EVENT 1U
 #define RUT_GATE_SEND_EVENT 2U
+#define RUT_GATE_UPSTREAM_CONNECT_EVENT 3U
 #define RUT_GATE_TIMEOUT_EVENT 6U
 #define RUT_GATE_TIMER_CONN_ID 0x00FFFFFEU
 #define RUT_GATE_RING_ENTRIES 16384U
@@ -64,6 +65,7 @@ static struct ring_view ring_view = {.fd = -1};
 static int target_process;
 static int duplicate_sq_mapping_injected;
 static int ready_mask_mutation_injected;
+static int duplicate_connect_journal_injected;
 
 /*
  * Both entry points use the x86-64 SysV variadic syscall ABI.  The public
@@ -247,6 +249,50 @@ static int target_peer(int fd) {
     return result == 0 && length >= sizeof(peer) && peer.sin_family == AF_INET &&
            peer.sin_addr.s_addr == gate->target_peer_ipv4_be &&
            peer.sin_port == gate->target_peer_port_be;
+}
+
+static int target_upstream_connect(const struct io_uring_sqe* sqe, struct sockaddr_in* address) {
+    if (sqe->opcode != IORING_OP_CONNECT) return 0;
+    if (sqe->addr == 0 || sqe->off != sizeof(*address)) {
+        fail(RUT_IOURING_GATE_ERROR_CONNECT_JOURNAL);
+        return -1;
+    }
+    memcpy(address, (const void*)(uintptr_t)sqe->addr, sizeof(*address));
+    if (address->sin_family != AF_INET ||
+        address->sin_addr.s_addr != gate->target_upstream_ipv4_be ||
+        address->sin_port != gate->target_upstream_port_be)
+        return 0;
+    if (sqe->flags != 0 || sqe->ioprio != 0 || sqe->len != 0 ||
+        (sqe->user_data & 0xffU) != RUT_GATE_UPSTREAM_CONNECT_EVENT ||
+        ((sqe->user_data >> 32) & 0xffffffU) == 0) {
+        fail(RUT_IOURING_GATE_ERROR_CONNECT_JOURNAL);
+        return -1;
+    }
+    return 1;
+}
+
+static int append_connect_attempt_locked(const struct io_uring_sqe* sqe,
+                                         const struct sockaddr_in* address) {
+    for (uint32_t i = 0; i < gate->connect_attempt_count; i++) {
+        if (gate->connect_attempts[i].user_data == sqe->user_data) {
+            gate->connect_journal_duplicate = 1;
+            fail_locked(RUT_IOURING_GATE_ERROR_CONNECT_JOURNAL);
+            return 0;
+        }
+    }
+    if (gate->connect_attempt_count >= RUT_IOURING_GATE_CONNECT_JOURNAL_CAPACITY) {
+        gate->connect_journal_overflow = 1;
+        fail_locked(RUT_IOURING_GATE_ERROR_CONNECT_JOURNAL);
+        return 0;
+    }
+    struct rut_iouring_gate_connect_attempt* attempt =
+        &gate->connect_attempts[gate->connect_attempt_count++];
+    attempt->fd = sqe->fd;
+    attempt->ipv4_be = address->sin_addr.s_addr;
+    attempt->port_be = address->sin_port;
+    attempt->address_length = (uint16_t)sqe->off;
+    attempt->user_data = sqe->user_data;
+    return 1;
 }
 
 static int setup_params_valid(const struct io_uring_params* params) {
@@ -541,6 +587,30 @@ static int inspect_submission(uint32_t to_submit) {
             return 0;
         }
         const struct io_uring_sqe* sqe = &ring_view.sqes[index];
+        struct sockaddr_in upstream_address;
+        const int target_connect =
+            gate->target_upstream_ipv4_be != 0 && gate->target_upstream_port_be != 0
+                ? target_upstream_connect(sqe, &upstream_address)
+                : 0;
+        if (target_connect < 0) return 0;
+        if (target_connect > 0) {
+            lock_identity();
+            if (!failed_locked() && !append_connect_attempt_locked(sqe, &upstream_address)) {
+                unlock_identity();
+                rut_downstream_gate_wake(&gate->state);
+                return 0;
+            }
+            const char* inject = getenv("RUT_IOURING_GATE_INJECT_DUPLICATE_CONNECT_JOURNAL");
+            if (!failed_locked() && !duplicate_connect_journal_injected && inject != 0 &&
+                strcmp(inject, "1") == 0) {
+                duplicate_connect_journal_injected = 1;
+                (void)append_connect_attempt_locked(sqe, &upstream_address);
+                unlock_identity();
+                rut_downstream_gate_wake(&gate->state);
+                return 0;
+            }
+            unlock_identity();
+        }
         if (sqe->opcode == IORING_OP_RECV && target_peer(sqe->fd)) {
             if (sqe->flags != IOSQE_BUFFER_SELECT || sqe->ioprio != IORING_RECV_MULTISHOT ||
                 sqe->buf_group != RUT_GATE_BUFFER_GROUP || sqe->len != RUT_GATE_BUFFER_SIZE ||
@@ -827,6 +897,10 @@ __attribute__((visibility("hidden"))) long rut_gate_io_uring_syscall(long number
             __atomic_store_n(mask, original, __ATOMIC_RELEASE);
         }
         const int inspection = inspect_submission((uint32_t)arg2);
+        if (inspection == 0) {
+            errno = EPROTO;
+            return -1;
+        }
         if (inspection == 2 && !hold_before_enter()) {
             errno = EPROTO;
             return -1;

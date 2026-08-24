@@ -387,6 +387,19 @@ static bool stop_child(Child& child) {
     return clean;
 }
 
+static bool settle_expected_failure_child(Child& child) {
+    if (poll_child(child)) {
+        const bool failed =
+            child.status_valid && ((WIFEXITED(child.status) && WEXITSTATUS(child.status) != 0) ||
+                                   WIFSIGNALED(child.status));
+        child.pid = -1;
+        return failed;
+    }
+    if (stop_child(child)) return true;
+    if (!child.reaped || !child.status_valid) return false;
+    return (WIFEXITED(child.status) && WEXITSTATUS(child.status) != 0) || WIFSIGNALED(child.status);
+}
+
 static bool command_ok(const std::vector<std::string>& args,
                        const std::string& log_path = "/dev/null") {
     Child child;
@@ -4767,22 +4780,19 @@ struct RutIoUringGateProcessMapping {
 
 struct RutIoUringGateRelease {
     rut_iouring_gate* gate = nullptr;
-    Child* child = nullptr;
 
     ~RutIoUringGateRelease() {
         if (gate == nullptr) return;
-        if (child != nullptr && child->pid >= 0) (void)stop_child(*child);
-        const bool writers_stopped = child == nullptr || child->pid < 0;
-        if (rut_iouring_gate_lock_identity(gate, 500)) {
-            const u32 state = rut_downstream_gate_load(&gate->state);
-            if (state != RUT_DOWNSTREAM_GATE_RELEASED && state != RUT_DOWNSTREAM_GATE_FAILED)
-                rut_iouring_gate_recover_owner_death_locked(gate);
-            rut_iouring_gate_unlock_identity(gate);
-        } else if (writers_stopped) {
-            // The only helper writer has terminated and was reaped, so no-lock
-            // recovery cannot race a later publication even if its robust
-            // mutex became unrecoverable.
-            rut_iouring_gate_recover_owner_death_locked(gate);
+        const u32 state = rut_downstream_gate_load(&gate->state);
+        if (state != RUT_DOWNSTREAM_GATE_RELEASED && state != RUT_DOWNSTREAM_GATE_FAILED) {
+            u32 expected = RUT_IOURING_GATE_ERROR_NONE;
+            (void)__atomic_compare_exchange_n(&gate->error_code,
+                                              &expected,
+                                              RUT_IOURING_GATE_ERROR_TRANSITION,
+                                              false,
+                                              __ATOMIC_ACQ_REL,
+                                              __ATOMIC_ACQUIRE);
+            rut_downstream_gate_store(&gate->state, RUT_DOWNSTREAM_GATE_FAILED);
         }
         rut_downstream_gate_wake(&gate->state);
     }
@@ -4836,10 +4846,39 @@ static bool downstream_has_no_readable_byte(int fd, std::string& error) {
 static bool read_two_responses_and_eof(int fd,
                                        std::vector<char>& first,
                                        std::vector<char>& second,
-                                       std::string& error) {
+                                       std::string& error,
+                                       std::vector<char>* raw_wire = nullptr,
+                                       std::vector<char>* tail = nullptr) {
     using Clock = std::chrono::steady_clock;
     const auto deadline = Clock::now() + std::chrono::seconds(5);
     std::vector<char> wire;
+    const auto snapshot = [&]() {
+        if (raw_wire != nullptr) *raw_wire = wire;
+        first.clear();
+        second.clear();
+        const auto take_frame = [&](size_t offset, std::vector<char>& frame, size_t& next) {
+            if (offset >= wire.size()) return false;
+            std::vector<char> suffix(wire.begin() + static_cast<ptrdiff_t>(offset), wire.end());
+            const size_t end = header_end(suffix);
+            size_t body_length = 0;
+            if (end == 0 || !parse_content_length(suffix, end, body_length) ||
+                end + body_length > suffix.size())
+                return false;
+            next = offset + end + body_length;
+            frame.assign(wire.begin() + static_cast<ptrdiff_t>(offset),
+                         wire.begin() + static_cast<ptrdiff_t>(next));
+            return true;
+        };
+        size_t second_offset = 0;
+        size_t wire_end = 0;
+        const bool first_ok = take_frame(0, first, second_offset);
+        const bool second_ok = first_ok && take_frame(second_offset, second, wire_end);
+        if (tail != nullptr) {
+            const size_t tail_offset = second_ok ? wire_end : (first_ok ? second_offset : 0);
+            tail->assign(wire.begin() + static_cast<ptrdiff_t>(tail_offset), wire.end());
+        }
+        return first_ok && second_ok && wire_end == wire.size();
+    };
     bool eof = false;
     while (Clock::now() < deadline && !eof) {
         const auto remaining =
@@ -4849,6 +4888,7 @@ static bool read_two_responses_and_eof(int fd,
         const int ready = poll(&input, 1, wait_ms > 0 ? wait_ms : 1);
         if (ready < 0) {
             if (errno == EINTR) continue;
+            (void)snapshot();
             error = "two-response downstream poll failed";
             return false;
         }
@@ -4864,35 +4904,82 @@ static bool read_two_responses_and_eof(int fd,
             break;
         }
         if (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK) continue;
+        (void)snapshot();
         error = "two-response downstream recv failed";
         return false;
     }
     if (!eof) {
+        (void)snapshot();
         error = "server EOF did not follow the second response";
         return false;
     }
-
-    const auto take_frame = [&](size_t offset, std::vector<char>& frame, size_t& next) {
-        if (offset >= wire.size()) return false;
-        std::vector<char> suffix(wire.begin() + static_cast<ptrdiff_t>(offset), wire.end());
-        const size_t end = header_end(suffix);
-        size_t body_length = 0;
-        if (end == 0 || !parse_content_length(suffix, end, body_length) ||
-            end + body_length > suffix.size())
-            return false;
-        next = offset + end + body_length;
-        frame.assign(wire.begin() + static_cast<ptrdiff_t>(offset),
-                     wire.begin() + static_cast<ptrdiff_t>(next));
-        return true;
-    };
-    size_t second_offset = 0;
-    size_t wire_end = 0;
-    if (!take_frame(0, first, second_offset) || !take_frame(second_offset, second, wire_end) ||
-        wire_end != wire.size()) {
+    if (!snapshot()) {
         error = "downstream wire was not exactly two Content-Length responses";
         return false;
     }
     return true;
+}
+
+static bool run_two_response_diagnostic_self_check() {
+    static constexpr char kCompleteFirst[] = "HTTP/1.1 200 OK\r\nContent-Length: 1\r\n\r\na";
+    static constexpr char kTruncatedSecond[] =
+        "HTTP/1.1 201 Created\r\nContent-Length: 4\r\n\r\nxy";
+    int sockets[2] = {-1, -1};
+    if (socketpair(AF_UNIX, SOCK_STREAM, 0, sockets) != 0) return false;
+    const std::string wire = std::string(kCompleteFirst) + kTruncatedSecond;
+    const bool sent = send_all(sockets[0], wire.data(), wire.size());
+    const bool shut_down = shutdown(sockets[0], SHUT_WR) == 0;
+    std::vector<char> first;
+    std::vector<char> second;
+    std::vector<char> raw;
+    std::vector<char> tail;
+    std::string error;
+    const bool accepted = sent && shut_down &&
+                          read_two_responses_and_eof(sockets[1], first, second, error, &raw, &tail);
+    close(sockets[0]);
+    close(sockets[1]);
+    const std::vector<char> expected_raw(wire.begin(), wire.end());
+    const std::vector<char> expected_first(kCompleteFirst,
+                                           kCompleteFirst + sizeof(kCompleteFirst) - 1u);
+    const std::vector<char> expected_tail(kTruncatedSecond,
+                                          kTruncatedSecond + sizeof(kTruncatedSecond) - 1u);
+    if (accepted || raw != expected_raw || first != expected_first || !second.empty() ||
+        tail != expected_tail ||
+        error != "downstream wire was not exactly two Content-Length responses") {
+        std::cerr << "FAIL [two-response diagnostic self-check]: truncated second frame was not "
+                     "preserved exactly\n";
+        dump_wire("diagnostic self-check raw", raw);
+        dump_wire("diagnostic self-check first", first);
+        dump_wire("diagnostic self-check second", second);
+        dump_wire("diagnostic self-check carry", tail);
+        return false;
+    }
+    return true;
+}
+
+struct LateSuccessorObservation {
+    std::vector<char> first;
+    std::vector<char> second;
+    std::vector<char> raw_wire;
+    std::vector<char> tail;
+    u32 connect_attempts = 0;
+    std::string gate_evidence;
+};
+
+static void dump_late_successor_observation(const char* side,
+                                            const LateSuccessorObservation& observation) {
+    const std::string prefix(side);
+    dump_wire((prefix + " raw wire").c_str(), observation.raw_wire);
+    dump_wire((prefix + " response 1").c_str(), observation.first);
+    dump_wire((prefix + " response 2").c_str(), observation.second);
+    dump_wire((prefix + " tail").c_str(), observation.tail);
+    std::vector<char> normalized_first = observation.first;
+    std::vector<char> normalized_second = observation.second;
+    if (normalize_date(normalized_first))
+        dump_wire((prefix + " normalized response 1").c_str(), normalized_first);
+    if (normalize_date(normalized_second))
+        dump_wire((prefix + " normalized response 2").c_str(), normalized_second);
+    std::cerr << prefix << " gate/journal evidence: " << observation.gate_evidence << "\n";
 }
 
 static bool run_nginx_downstream_gate_spike(u16 frontend_port,
@@ -4900,7 +4987,10 @@ static bool run_nginx_downstream_gate_spike(u16 frontend_port,
                                             TempDir& temp,
                                             const std::string& container_name,
                                             const char* preload_path,
-                                            std::string& error) {
+                                            std::string& error,
+                                            DeadPort* shared_dead = nullptr,
+                                            const std::string* shared_fragment = nullptr,
+                                            LateSuccessorObservation* observation = nullptr) {
     if (preload_path == nullptr || preload_path[0] != '/' || access(preload_path, R_OK) != 0) {
         error = "preload helper path is not an absolute readable file";
         return false;
@@ -4911,15 +5001,20 @@ static bool run_nginx_downstream_gate_spike(u16 frontend_port,
         return false;
     }
 
-    DeadPort dead;
-    if (!dead.reserve(backend_port)) {
+    DeadPort owned_dead;
+    if (shared_dead == nullptr && !owned_dead.reserve(backend_port)) {
         error = "failed to reserve the gate spike dead upstream";
         return false;
     }
-    const std::string fragment =
+    if (shared_dead != nullptr && shared_dead->fd < 0) {
+        error = "shared dead upstream reservation is not live";
+        return false;
+    }
+    const std::string local_fragment =
         "server {\n  listen " + std::to_string(frontend_port) +
         ";\n  location / {\n    proxy_pass http://127.0.0.1:" + std::to_string(backend_port) +
         ";\n  }\n}\n";
+    const std::string& fragment = shared_fragment == nullptr ? local_fragment : *shared_fragment;
     const std::string config = "events {}\nhttp {\n" + fragment + "}\n";
     if (!write_file(temp.nginx_config, config.data(), config.size())) {
         error = "failed to write nginx gate spike config";
@@ -4931,8 +5026,58 @@ static bool run_nginx_downstream_gate_spike(u16 frontend_port,
         error = "failed to create shared downstream gate control";
         return false;
     }
+    Child nginx;
+    bool child_settled = false;
+    bool cleanup_clean = true;
+    struct GateEvidenceCapture {
+        rut_downstream_publication_gate* gate;
+        Child* child;
+        const bool* child_settled;
+        const bool* cleanup_clean;
+        LateSuccessorObservation* observation;
+        ~GateEvidenceCapture() {
+            if (observation == nullptr) return;
+            if (!*child_settled || child->pid >= 0) {
+                observation->gate_evidence =
+                    "cleanup failure: nginx helper may still be live; shared metadata suppressed";
+                return;
+            }
+            observation->gate_evidence =
+                std::string(*cleanup_clean ? "cleanup=clean " : "cleanup=failed-but-reaped ") +
+                "state=" + std::to_string(rut_downstream_gate_load(&gate->state)) +
+                " error=" + std::to_string(rut_downstream_gate_load(&gate->error_code)) +
+                " master=" + std::to_string(gate->target_master_pid) +
+                " worker=" + std::to_string(gate->intercepted_pid) +
+                " op=" + std::to_string(gate->intercepted_operation) +
+                " bytes=" + std::to_string(gate->intercepted_length) +
+                " r2=" + std::to_string(gate->request_two_length);
+        }
+    } gate_evidence_capture{mapping.gate, &nginx, &child_settled, &cleanup_clean, observation};
     DockerGuard docker(container_name);
-    ChildGuard nginx;
+    struct StopGuard {
+        Child* child;
+        bool* settled;
+        bool* clean;
+        std::string* error;
+        bool stop() {
+            if (child->pid < 0) {
+                *settled = true;
+                return *clean;
+            }
+            *clean = stop_child(*child);
+            *settled = child->pid < 0;
+            if (!*clean) {
+                if (!error->empty()) *error += "; ";
+                *error += *settled ? "bounded nginx cleanup required an abnormal reap"
+                                   : "bounded nginx cleanup could not stop/reap helper; evidence "
+                                     "suppressed";
+            }
+            return *clean;
+        }
+        ~StopGuard() {
+            if (!*settled) (void)stop();
+        }
+    } stop_guard{&nginx, &child_settled, &cleanup_clean, &error};
     struct ClientGuard {
         int fd = -1;
         ~ClientGuard() {
@@ -4964,11 +5109,11 @@ static bool run_nginx_downstream_gate_spike(u16 frontend_port,
                       "-g",
                       "daemon off;"},
                      temp.nginx_log,
-                     nginx.child)) {
+                     nginx)) {
         error = "failed to start pinned nginx with downstream gate preload";
         return false;
     }
-    if (!wait_ready(frontend_port, nginx.child, error)) return false;
+    if (!wait_ready(frontend_port, nginx, error)) return false;
     if (!wait_for_downstream_gate_hook(*mapping.gate, 3000, error)) return false;
     if (rut_downstream_gate_load(&mapping.gate->state) != RUT_DOWNSTREAM_GATE_DISARMED ||
         mapping.gate->intercepted_operation != RUT_DOWNSTREAM_GATE_OP_NONE ||
@@ -5048,7 +5193,17 @@ static bool run_nginx_downstream_gate_spike(u16 frontend_port,
 
     std::vector<char> first;
     std::vector<char> second;
-    if (!read_two_responses_and_eof(client.fd, first, second, error)) return false;
+    std::vector<char> raw_wire;
+    std::vector<char> tail;
+    const bool read_ok =
+        read_two_responses_and_eof(client.fd, first, second, error, &raw_wire, &tail);
+    if (observation != nullptr) {
+        observation->first = first;
+        observation->second = second;
+        observation->raw_wire = raw_wire;
+        observation->tail = tail;
+    }
+    if (!read_ok) return false;
     std::string detail;
     if (!validate_exact_normalized_response(first, kGatewayKeepAliveResponseNormalized, detail)) {
         error = "gated nginx response 1 mismatch: " + detail;
@@ -5058,7 +5213,7 @@ static bool run_nginx_downstream_gate_spike(u16 frontend_port,
         error = "gated nginx response 2 mismatch: " + detail;
         return false;
     }
-    if (poll_child(nginx.child)) {
+    if (poll_child(nginx)) {
         error = "pinned nginx exited after the gated two-response exchange";
         return false;
     }
@@ -5076,12 +5231,23 @@ static bool run_nginx_downstream_gate_spike(u16 frontend_port,
 
     close(client.fd);
     client.fd = -1;
-    const bool nginx_stopped = stop_child(nginx.child);
+    const bool nginx_stopped = stop_guard.stop();
     const bool container_removed = docker.remove();
     if (!nginx_stopped || !container_removed) {
         error = !nginx_stopped ? "failed to TERM/reap gated pinned nginx"
                                : "failed to remove gated pinned nginx container";
         return false;
+    }
+    const std::string upstream_context = "127.0.0.1:" + std::to_string(backend_port);
+    u32 connect_attempts = 0;
+    if (!log_count_line_with(
+            temp.nginx_log, "connect() failed", upstream_context.c_str(), connect_attempts) ||
+        connect_attempts != 2) {
+        error = "pinned nginx log did not prove exactly two scoped dead-port connect failures";
+        return false;
+    }
+    if (observation != nullptr) {
+        observation->connect_attempts = connect_attempts;
     }
     return true;
 }
@@ -5120,7 +5286,11 @@ static bool run_rut_iouring_gate_spike(u16 frontend_port,
                                        bool expect_identity_failure,
                                        bool expect_ready_mutation_failure,
                                        bool expect_owner_death,
-                                       std::string& error) {
+                                       bool expect_connect_journal_failure,
+                                       std::string& error,
+                                       DeadPort* shared_dead = nullptr,
+                                       const std::string* shared_fragment = nullptr,
+                                       LateSuccessorObservation* observation = nullptr) {
     if (rut_path == nullptr || rut_path[0] != '/' || access(rut_path, X_OK) != 0) {
         error = "RUT executable path is not absolute and executable";
         return false;
@@ -5134,15 +5304,20 @@ static bool run_rut_iouring_gate_spike(u16 frontend_port,
         error = "RUT io_uring preload is not a regular file";
         return false;
     }
-    DeadPort dead;
-    if (!dead.reserve(backend_port)) {
+    DeadPort owned_dead;
+    if (shared_dead == nullptr && !owned_dead.reserve(backend_port)) {
         error = "failed to reserve RUT io_uring gate dead upstream";
         return false;
     }
-    const std::string fragment =
+    if (shared_dead != nullptr && shared_dead->fd < 0) {
+        error = "shared RUT dead upstream reservation is not live";
+        return false;
+    }
+    const std::string local_fragment =
         "server {\n  listen " + std::to_string(frontend_port) +
         ";\n  location / {\n    proxy_pass http://127.0.0.1:" + std::to_string(backend_port) +
         ";\n  }\n}\n";
+    const std::string& fragment = shared_fragment == nullptr ? local_fragment : *shared_fragment;
     auto parsed = rut::nginx::parse({fragment.data(), static_cast<rut::u32>(fragment.size())});
     if (!parsed) {
         error = "RUT io_uring gate nginx fragment parse failed";
@@ -5161,13 +5336,84 @@ static bool run_rut_iouring_gate_spike(u16 frontend_port,
         error = "failed to create RUT io_uring shared gate control";
         return false;
     }
+    struct GateEvidenceCapture {
+        rut_iouring_gate* gate;
+        Child* child;
+        const bool* child_settled;
+        const bool* cleanup_clean;
+        LateSuccessorObservation* observation;
+        ~GateEvidenceCapture() {
+            if (observation == nullptr) return;
+            if (!*child_settled || child->pid >= 0) {
+                observation->gate_evidence =
+                    "cleanup failure: helper may still be live; shared metadata suppressed";
+                return;
+            }
+            observation->gate_evidence =
+                std::string(*cleanup_clean ? "cleanup=clean " : "cleanup=failed-but-reaped ") +
+                "state=" + std::to_string(rut_downstream_gate_load(&gate->state)) +
+                " error=" + std::to_string(rut_downstream_gate_load(&gate->error_code)) +
+                " ring=" + std::to_string(gate->ring_fd) +
+                " send_fd=" + std::to_string(gate->intercepted_fd) +
+                " send_bytes=" + std::to_string(gate->intercepted_length) +
+                " cq_head=" + std::to_string(gate->cq_head_at_hit) +
+                " cq_tail=" + std::to_string(gate->cq_tail_at_arrival) +
+                " fragments=" + std::to_string(gate->witness_fragments) +
+                " witness=" + std::to_string(gate->witness_length) +
+                " attempts=" + std::to_string(gate->connect_attempt_count) +
+                " overflow=" + std::to_string(gate->connect_journal_overflow) +
+                " duplicate=" + std::to_string(gate->connect_journal_duplicate);
+            for (u32 i = 0;
+                 i < gate->connect_attempt_count && i < RUT_IOURING_GATE_CONNECT_JOURNAL_CAPACITY;
+                 i++) {
+                observation->gate_evidence +=
+                    " [fd=" + std::to_string(gate->connect_attempts[i].fd) +
+                    " user_data=" + std::to_string(gate->connect_attempts[i].user_data) + "]";
+            }
+        }
+    };
+    bool child_settled = false;
+    bool cleanup_clean = true;
+    GateEvidenceCapture gate_evidence_capture{
+        mapping.gate, &rut_process.child, &child_settled, &cleanup_clean, observation};
+    struct StopGuard {
+        Child* child;
+        bool* settled;
+        bool* clean;
+        std::string* error;
+        void report_failure() {
+            if (!error->empty()) *error += "; ";
+            *error += *settled ? "bounded RUT cleanup required an abnormal reap"
+                               : "bounded RUT cleanup could not stop/reap helper; evidence "
+                                 "suppressed";
+        }
+        bool stop() {
+            if (child->pid < 0) {
+                *settled = true;
+                return *clean;
+            }
+            *clean = stop_child(*child);
+            *settled = child->pid < 0;
+            if (!*clean) report_failure();
+            return *clean;
+        }
+        bool settle_expected_failure() {
+            *clean = settle_expected_failure_child(*child);
+            *settled = child->pid < 0;
+            if (!*clean) report_failure();
+            return *clean;
+        }
+        ~StopGuard() {
+            if (!*settled) (void)stop();
+        }
+    } stop_guard{&rut_process.child, &child_settled, &cleanup_clean, &error};
     struct ClientGuard {
         int fd = -1;
         ~ClientGuard() {
             if (fd >= 0) close(fd);
         }
     } client;
-    RutIoUringGateRelease release{mapping.gate, &rut_process.child};
+    RutIoUringGateRelease release{mapping.gate};
     const std::string preload_environment = std::string("LD_PRELOAD=") + preload_path;
     const std::string control_environment =
         "RUT_IOURING_GATE_CONTROL=" + temp.rut_iouring_gate_control;
@@ -5180,6 +5426,9 @@ static bool run_rut_iouring_gate_spike(u16 frontend_port,
         (expect_ready_mutation_failure ? "1" : "");
     const std::string owner_death_environment =
         std::string("RUT_IOURING_GATE_INJECT_OWNER_DEATH=") + (expect_owner_death ? "1" : "");
+    const std::string connect_journal_environment =
+        std::string("RUT_IOURING_GATE_INJECT_DUPLICATE_CONNECT_JOURNAL=") +
+        (expect_connect_journal_failure ? "1" : "");
     if (!spawn_child({"env",
                       preload_environment,
                       control_environment,
@@ -5187,6 +5436,7 @@ static bool run_rut_iouring_gate_spike(u16 frontend_port,
                       identity_environment,
                       mutation_environment,
                       owner_death_environment,
+                      connect_journal_environment,
                       rut_path,
                       temp.source,
                       "--shards",
@@ -5217,7 +5467,9 @@ static bool run_rut_iouring_gate_spike(u16 frontend_port,
             rut_downstream_gate_load(&mapping.gate->ring_ready) != 0 ||
             mapping.gate->ring_fd != -1 || mapping.gate->intercepted_fd != -1 ||
             mapping.gate->intercepted_opcode != 0 || mapping.gate->recv_user_data != 0 ||
-            mapping.gate->witness_length != 0) {
+            mapping.gate->witness_length != 0 || mapping.gate->connect_attempt_count != 0 ||
+            mapping.gate->connect_journal_overflow != 0 ||
+            mapping.gate->connect_journal_duplicate != 0) {
             error = "owner-death recovery left a published identity";
             return false;
         }
@@ -5231,7 +5483,7 @@ static bool run_rut_iouring_gate_spike(u16 frontend_port,
                         : "ready SQ mask mutation did not fail the RUT io_uring gate";
             return false;
         }
-        if (!stop_child(rut_process.child)) {
+        if (!stop_guard.settle_expected_failure()) {
             error = "failed to TERM/reap RUT after identity rejection";
             return false;
         }
@@ -5243,7 +5495,10 @@ static bool run_rut_iouring_gate_spike(u16 frontend_port,
             mapping.gate->intercepted_user_data != 0 || mapping.gate->recv_user_data != 0 ||
             mapping.gate->sq_head_at_hit != 0 || mapping.gate->sq_tail_at_hit != 0 ||
             mapping.gate->cq_head_at_hit != 0 || mapping.gate->cq_tail_at_arrival != 0 ||
-            mapping.gate->witness_fragments != 0 || mapping.gate->witness_length != 0) {
+            mapping.gate->witness_fragments != 0 || mapping.gate->witness_length != 0 ||
+            mapping.gate->connect_attempt_count != 0 ||
+            mapping.gate->connect_journal_overflow != 0 ||
+            mapping.gate->connect_journal_duplicate != 0) {
             error = "identity failure published metadata after process settlement";
             return false;
         }
@@ -5253,7 +5508,9 @@ static bool run_rut_iouring_gate_spike(u16 frontend_port,
     if (rut_downstream_gate_load(&mapping.gate->state) != RUT_DOWNSTREAM_GATE_DISARMED ||
         mapping.gate->intercepted_opcode != 0 || mapping.gate->intercepted_fd != -1 ||
         mapping.gate->intercepted_user_data != 0 || mapping.gate->recv_user_data != 0 ||
-        mapping.gate->witness_fragments != 0 || mapping.gate->witness_length != 0) {
+        mapping.gate->witness_fragments != 0 || mapping.gate->witness_length != 0 ||
+        mapping.gate->connect_attempt_count != 0 || mapping.gate->connect_journal_overflow != 0 ||
+        mapping.gate->connect_journal_duplicate != 0) {
         error = "disarmed RUT readiness traffic armed the io_uring gate";
         return false;
     }
@@ -5272,6 +5529,8 @@ static bool run_rut_iouring_gate_spike(u16 frontend_port,
     }
     mapping.gate->target_peer_ipv4_be = local.sin_addr.s_addr;
     mapping.gate->target_peer_port_be = local.sin_port;
+    mapping.gate->target_upstream_ipv4_be = htonl(INADDR_LOOPBACK);
+    mapping.gate->target_upstream_port_be = htons(backend_port);
     mapping.gate->request_two_length = sizeof(kGatewayCloseRequest2) - 1u;
     memcpy(mapping.gate->request_two, kGatewayCloseRequest2, mapping.gate->request_two_length);
     if (!rut_downstream_gate_cas(
@@ -5283,6 +5542,26 @@ static bool run_rut_iouring_gate_spike(u16 frontend_port,
     if (!send_all(client.fd, kGatewayKeepAliveRequest1, sizeof(kGatewayKeepAliveRequest1) - 1u)) {
         error = "failed to send RUT io_uring request 1";
         return false;
+    }
+    if (expect_connect_journal_failure) {
+        if (!rut_iouring_gate_wait_until(mapping.gate, RUT_DOWNSTREAM_GATE_FAILED, 5000)) {
+            error = "duplicate Connect journal identity did not fail the RUT gate";
+            return false;
+        }
+        if (!downstream_has_no_readable_byte(client.fd, error)) return false;
+        if (!stop_guard.settle_expected_failure()) {
+            error = "failed to TERM/reap RUT after Connect journal rejection";
+            return false;
+        }
+        if (rut_downstream_gate_load(&mapping.gate->error_code) !=
+                RUT_IOURING_GATE_ERROR_CONNECT_JOURNAL ||
+            mapping.gate->connect_attempt_count != 1 ||
+            mapping.gate->connect_journal_overflow != 0 ||
+            mapping.gate->connect_journal_duplicate != 1) {
+            error = "Connect journal rejection did not preserve exact fail-closed evidence";
+            return false;
+        }
+        return true;
     }
     if (!rut_iouring_gate_wait_until(mapping.gate, RUT_DOWNSTREAM_GATE_HIT, 5000)) {
         error = "RUT io_uring gate did not HIT; hook error " +
@@ -5339,7 +5618,17 @@ static bool run_rut_iouring_gate_spike(u16 frontend_port,
 
     std::vector<char> first;
     std::vector<char> second;
-    if (!read_two_responses_and_eof(client.fd, first, second, error)) return false;
+    std::vector<char> raw_wire;
+    std::vector<char> tail;
+    const bool read_ok =
+        read_two_responses_and_eof(client.fd, first, second, error, &raw_wire, &tail);
+    if (observation != nullptr) {
+        observation->first = first;
+        observation->second = second;
+        observation->raw_wire = raw_wire;
+        observation->tail = tail;
+    }
+    if (!read_ok) return false;
     std::string detail;
     if (!validate_exact_normalized_response(first, kGatewayKeepAliveResponseNormalized, detail)) {
         error = "gated RUT response 1 mismatch: " + detail;
@@ -5358,6 +5647,25 @@ static bool run_rut_iouring_gate_spike(u16 frontend_port,
         error = "RUT io_uring gate did not remain cleanly RELEASED";
         return false;
     }
+    if (mapping.gate->connect_attempt_count != 2 || mapping.gate->connect_journal_overflow != 0 ||
+        mapping.gate->connect_journal_duplicate != 0) {
+        error = "RUT production ring did not journal exactly two upstream Connect SQEs";
+        return false;
+    }
+    const rut_iouring_gate_connect_attempt& attempt1 = mapping.gate->connect_attempts[0];
+    const rut_iouring_gate_connect_attempt& attempt2 = mapping.gate->connect_attempts[1];
+    const u64 episode1 = (attempt1.user_data >> 32) & 0xffffffu;
+    const u64 episode2 = (attempt2.user_data >> 32) & 0xffffffu;
+    if (attempt1.fd < 0 || attempt2.fd < 0 || attempt1.ipv4_be != htonl(INADDR_LOOPBACK) ||
+        attempt2.ipv4_be != htonl(INADDR_LOOPBACK) || attempt1.port_be != htons(backend_port) ||
+        attempt2.port_be != htons(backend_port) || attempt1.address_length != sizeof(sockaddr_in) ||
+        attempt2.address_length != sizeof(sockaddr_in) ||
+        (attempt1.user_data & 0xffu) != static_cast<rut::u8>(rut::IoEventType::UpstreamConnect) ||
+        (attempt2.user_data & 0xffu) != static_cast<rut::u8>(rut::IoEventType::UpstreamConnect) ||
+        episode1 == 0 || episode2 == 0 || episode1 == episode2) {
+        error = "RUT Connect journal did not contain two unique exact target episodes";
+        return false;
+    }
     std::cerr << "RUT gate evidence: pid=" << mapping.gate->target_pid
               << " ring=" << mapping.gate->ring_fd << " send-fd=" << mapping.gate->intercepted_fd
               << " bytes=" << mapping.gate->intercepted_length
@@ -5365,8 +5673,91 @@ static bool run_rut_iouring_gate_spike(u16 frontend_port,
 
     close(client.fd);
     client.fd = -1;
-    if (!stop_child(rut_process.child)) {
+    if (!stop_guard.stop()) {
         error = "failed to TERM/reap generated-source RUT after io_uring gate spike";
+        return false;
+    }
+    if (observation != nullptr) {
+        observation->connect_attempts = mapping.gate->connect_attempt_count;
+    }
+    return true;
+}
+
+static bool run_late_successor_differential(u16 frontend_port,
+                                            u16 backend_port,
+                                            TempDir& temp,
+                                            const char* rut_path,
+                                            const char* nginx_preload_path,
+                                            const char* rut_preload_path,
+                                            const std::string& container_name,
+                                            LateSuccessorObservation& nginx,
+                                            LateSuccessorObservation& generated_rut,
+                                            std::string& fragment,
+                                            std::string& error) {
+    DeadPort dead;
+    if (!dead.reserve(backend_port)) {
+        error = "failed to hold the shared dead upstream for both differential sides";
+        return false;
+    }
+    fragment =
+        "server {\n  listen " + std::to_string(frontend_port) +
+        ";\n  location / {\n    proxy_pass http://127.0.0.1:" + std::to_string(backend_port) +
+        ";\n  }\n}\n";
+
+    if (!run_nginx_downstream_gate_spike(frontend_port,
+                                         backend_port,
+                                         temp,
+                                         container_name,
+                                         nginx_preload_path,
+                                         error,
+                                         &dead,
+                                         &fragment,
+                                         &nginx)) {
+        error = "pinned-nginx side: " + error;
+        return false;
+    }
+    if (!run_rut_iouring_gate_spike(frontend_port,
+                                    backend_port,
+                                    temp,
+                                    rut_path,
+                                    rut_preload_path,
+                                    false,
+                                    false,
+                                    false,
+                                    false,
+                                    error,
+                                    &dead,
+                                    &fragment,
+                                    &generated_rut)) {
+        error = "converter-generated RUT side: " + error;
+        return false;
+    }
+
+    std::vector<char> normalized_nginx_first = nginx.first;
+    std::vector<char> normalized_nginx_second = nginx.second;
+    std::vector<char> normalized_rut_first = generated_rut.first;
+    std::vector<char> normalized_rut_second = generated_rut.second;
+    if (!normalize_date(normalized_nginx_first) || !normalize_date(normalized_nginx_second) ||
+        !normalize_date(normalized_rut_first) || !normalize_date(normalized_rut_second)) {
+        error = "one composed response lacked exactly one syntactically valid Date field";
+        return false;
+    }
+    const std::vector<char> expected_first(
+        kGatewayKeepAliveResponseNormalized,
+        kGatewayKeepAliveResponseNormalized + sizeof(kGatewayKeepAliveResponseNormalized) - 1u);
+    const std::vector<char> expected_second(
+        kGatewayResponseNormalized,
+        kGatewayResponseNormalized + sizeof(kGatewayResponseNormalized) - 1u);
+    if (normalized_nginx_first != expected_first || normalized_rut_first != expected_first ||
+        normalized_nginx_second != expected_second || normalized_rut_second != expected_second ||
+        normalized_nginx_first != normalized_rut_first ||
+        normalized_nginx_second != normalized_rut_second) {
+        error = "exact nginx/generated-RUT response pair differed after strict Date normalization";
+        return false;
+    }
+    if (!nginx.tail.empty() || !generated_rut.tail.empty() || nginx.connect_attempts != 2 ||
+        generated_rut.connect_attempts != 2) {
+        error = "composed sides did not prove two frames, zero tail, and exactly two attempts";
         return false;
     }
     return true;
@@ -5376,6 +5767,8 @@ static bool run_rut_iouring_gate_spike(u16 frontend_port,
 
 int main(int argc, char** argv) {
     const bool nginx_gate_spike = argc == 3 && strcmp(argv[1], "--nginx-gate-spike") == 0;
+    const bool late_successor_differential =
+        argc == 5 && strcmp(argv[1], "--late-successor-differential") == 0;
     const bool rut_iouring_gate_spike =
         argc == 4 && strcmp(argv[1], "--rut-iouring-gate-spike") == 0;
     const bool rut_iouring_gate_identity_negative =
@@ -5384,14 +5777,24 @@ int main(int argc, char** argv) {
         argc == 4 && strcmp(argv[1], "--rut-iouring-gate-ready-mutation-negative") == 0;
     const bool rut_iouring_gate_owner_death_negative =
         argc == 4 && strcmp(argv[1], "--rut-iouring-gate-owner-death-negative") == 0;
+    const bool rut_iouring_gate_connect_journal_negative =
+        argc == 4 && strcmp(argv[1], "--rut-iouring-gate-connect-journal-negative") == 0;
+    const bool normal_differential =
+        (argc == 2 && argv[1][0] == '/') ||
+        (argc == 4 && argv[1][0] == '/' && argv[2][0] == '/' && argv[3][0] == '/');
     if ((!nginx_gate_spike && !rut_iouring_gate_spike && !rut_iouring_gate_identity_negative &&
          !rut_iouring_gate_ready_mutation_negative && !rut_iouring_gate_owner_death_negative &&
-         (argc != 2 || argv[1][0] != '/')) ||
+         !rut_iouring_gate_connect_journal_negative && !late_successor_differential &&
+         !normal_differential) ||
         (nginx_gate_spike && argv[2][0] != '/') ||
         ((rut_iouring_gate_spike || rut_iouring_gate_identity_negative ||
-          rut_iouring_gate_ready_mutation_negative || rut_iouring_gate_owner_death_negative) &&
-         (argv[2][0] != '/' || argv[3][0] != '/'))) {
-        std::cerr << "usage: test_nginx_differential <absolute-rut-executable>\n"
+          rut_iouring_gate_ready_mutation_negative || rut_iouring_gate_owner_death_negative ||
+          rut_iouring_gate_connect_journal_negative) &&
+         (argv[2][0] != '/' || argv[3][0] != '/')) ||
+        (late_successor_differential &&
+         (argv[2][0] != '/' || argv[3][0] != '/' || argv[4][0] != '/'))) {
+        std::cerr << "usage: test_nginx_differential <absolute-rut-executable> "
+                     "<absolute-nginx-preload-helper> <absolute-rut-preload-helper>\n"
                      "   or: test_nginx_differential --nginx-gate-spike "
                      "<absolute-preload-helper>\n"
                      "   or: test_nginx_differential --rut-iouring-gate-spike "
@@ -5401,7 +5804,12 @@ int main(int argc, char** argv) {
                      "   or: test_nginx_differential --rut-iouring-gate-ready-mutation-negative "
                      "<absolute-rut-executable> <absolute-preload-helper>\n"
                      "   or: test_nginx_differential --rut-iouring-gate-owner-death-negative "
-                     "<absolute-rut-executable> <absolute-preload-helper>\n";
+                     "<absolute-rut-executable> <absolute-preload-helper>\n"
+                     "   or: test_nginx_differential --rut-iouring-gate-connect-journal-negative "
+                     "<absolute-rut-executable> <absolute-preload-helper>\n"
+                     "   or: test_nginx_differential --late-successor-differential "
+                     "<absolute-rut-executable> <absolute-nginx-preload-helper> "
+                     "<absolute-rut-preload-helper>\n";
         return 1;
     }
 #ifndef __linux__
@@ -5413,8 +5821,10 @@ int main(int argc, char** argv) {
         return 1;
     }
     if (!run_normalize_date_self_checks()) return 1;
+    if (!run_two_response_diagnostic_self_check()) return 1;
     if (rut_iouring_gate_spike || rut_iouring_gate_identity_negative ||
-        rut_iouring_gate_ready_mutation_negative || rut_iouring_gate_owner_death_negative) {
+        rut_iouring_gate_ready_mutation_negative || rut_iouring_gate_owner_death_negative ||
+        rut_iouring_gate_connect_journal_negative) {
         u16 rut_frontend_port = 0;
         u16 rut_backend_port = 0;
         if (!allocate_port(rut_frontend_port) || !allocate_port(rut_backend_port) ||
@@ -5431,6 +5841,7 @@ int main(int argc, char** argv) {
                                         rut_iouring_gate_identity_negative,
                                         rut_iouring_gate_ready_mutation_negative,
                                         rut_iouring_gate_owner_death_negative,
+                                        rut_iouring_gate_connect_journal_negative,
                                         gate_error)) {
             std::cerr << "FAIL [RUT io_uring gate "
                       << (rut_iouring_gate_identity_negative
@@ -5439,7 +5850,9 @@ int main(int argc, char** argv) {
                                      ? "ready mutation negative]: "
                                      : (rut_iouring_gate_owner_death_negative
                                             ? "owner death negative]: "
-                                            : "spike]: ")))
+                                            : (rut_iouring_gate_connect_journal_negative
+                                                   ? "Connect journal negative]: "
+                                                   : "spike]: "))))
                       << gate_error << "\n";
             dump_log(temp.rut_log, "RUT io_uring gate log");
             return 1;
@@ -5454,6 +5867,10 @@ int main(int argc, char** argv) {
         }
         if (rut_iouring_gate_owner_death_negative) {
             std::cerr << "PASS: robust identity owner death recovered without blocking\n";
+            return 0;
+        }
+        if (rut_iouring_gate_connect_journal_negative) {
+            std::cerr << "PASS: duplicate upstream Connect journal identity failed closed\n";
             return 0;
         }
         std::cerr << "PASS: converter-generated RUT gate reached "
@@ -5518,6 +5935,40 @@ int main(int argc, char** argv) {
         return 0;
     }
 
+    if (late_successor_differential) {
+        const char* source_suffix = strrchr(temp.path, '/');
+        source_suffix = source_suffix ? source_suffix + 1 : temp.path;
+        const std::string gate_container =
+            "rut-nginx-late-" + std::to_string(getpid()) + "-" + source_suffix;
+        LateSuccessorObservation nginx_observation;
+        LateSuccessorObservation rut_observation;
+        std::string shared_fragment;
+        std::string gate_error;
+        if (!run_late_successor_differential(frontend_port,
+                                             backend_port,
+                                             temp,
+                                             argv[2],
+                                             argv[3],
+                                             argv[4],
+                                             gate_container,
+                                             nginx_observation,
+                                             rut_observation,
+                                             shared_fragment,
+                                             gate_error)) {
+            std::cerr << "FAIL [late-successor differential]: " << gate_error << "\n";
+            dump_late_successor_observation("pinned nginx", nginx_observation);
+            dump_late_successor_observation("generated RUT", rut_observation);
+            std::cerr << "shared nginx fragment:\n" << shared_fragment;
+            dump_log(temp.source, "converter-generated RUT source");
+            dump_log(temp.nginx_log, "pinned nginx gate log");
+            dump_log(temp.rut_log, "generated RUT gate log");
+            return 1;
+        }
+        std::cerr << "PASS: converter-generated RUT late successor matches pinned nginx at the "
+                     "causal publication boundary (two exact 502 responses, EOF, two attempts)\n";
+        return 0;
+    }
+
     std::string fragment =
         "server {\n  listen " + std::to_string(frontend_port) +
         ";\n  location / {\n    proxy_pass http://127.0.0.1:" + std::to_string(backend_port) +
@@ -5554,6 +6005,35 @@ int main(int argc, char** argv) {
     source_suffix = source_suffix ? source_suffix + 1 : temp.path;
     const std::string container =
         "rut-nginx-diff-" + std::to_string(getpid()) + "-" + source_suffix;
+
+    if (argc == 4) {
+        LateSuccessorObservation late_nginx;
+        LateSuccessorObservation late_rut;
+        std::string late_fragment;
+        std::string late_error;
+        if (!run_late_successor_differential(frontend_port,
+                                             backend_port,
+                                             temp,
+                                             argv[1],
+                                             argv[2],
+                                             argv[3],
+                                             container + "-late-successor",
+                                             late_nginx,
+                                             late_rut,
+                                             late_fragment,
+                                             late_error)) {
+            std::cerr << "FAIL [late-successor differential]: " << late_error << "\n";
+            dump_late_successor_observation("pinned nginx late", late_nginx);
+            dump_late_successor_observation("generated RUT late", late_rut);
+            std::cerr << "shared nginx fragment:\n" << late_fragment;
+            dump_log(temp.source, "converter-generated RUT source");
+            dump_log(temp.nginx_log, "pinned nginx late gate log");
+            dump_log(temp.rut_log, "generated RUT late gate log");
+            return 1;
+        }
+        std::cerr << "PASS: monolithic converter-generated late-successor differential matched "
+                     "pinned nginx with causal gates and exact attempt evidence\n";
+    }
 
     std::vector<char> options_star_response;
     std::string options_star_error;
