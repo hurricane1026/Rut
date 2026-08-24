@@ -182,6 +182,13 @@ static constexpr char kBackendResponse[] =
     "Server: differential-backend\r\n"
     "Date: Tue, 01 Jan 2030 00:00:00 GMT\r\n"
     "Content-Length: 2\r\n\r\nok";
+static constexpr char kSuccessResponseNormalized[] =
+    "HTTP/1.1 200 OK\r\n"
+    "Server: nginx/1.29.7\r\n"
+    "Date: XXXXXXXXXXXXXXXXXXXXXXXXXXXXX\r\n"
+    "Content-Length: 2\r\n"
+    "Connection: close\r\n"
+    "\r\nok";
 static constexpr char kHeadRequest[] =
     "HEAD /head?q=1 HTTP/1.1\r\n"
     "Host: client.example\r\n"
@@ -878,6 +885,13 @@ struct Recorder {
     std::atomic<bool> response_peer_observation_failed{false};
     std::atomic<u64> response_sent_ns{0};
     std::atomic<u64> response_peer_closed_ns{0};
+    // Test-only witnesses for the default response path. A successful
+    // converter completion vector must make exactly one application-level
+    // send_all call and then cleanly shut down and close that origin episode.
+    std::atomic<u32> response_send_all_calls{0};
+    std::atomic<bool> response_send_succeeded{false};
+    std::atomic<bool> response_clean_shutdown{false};
+    std::atomic<bool> response_connection_closed{false};
     pthread_t thread{};
     bool thread_started = false;
 
@@ -966,9 +980,12 @@ struct Recorder {
                         self->response_fragments_sent.store(part + 1, std::memory_order_release);
                     }
                 } else {
+                    self->response_send_all_calls.fetch_add(1, std::memory_order_relaxed);
                     response_sent =
                         send_all(client, self->response_bytes, self->response_bytes_len);
                 }
+                if (response_sent)
+                    self->response_send_succeeded.store(true, std::memory_order_release);
                 if (self->wait_response_peer_close || self->gate_incomplete_response_close) {
                     if (!response_sent) {
                         self->response_send_failed.store(true, std::memory_order_release);
@@ -1060,8 +1077,13 @@ struct Recorder {
                     }
                 }
             }
-            shutdown(client, SHUT_RDWR);
-            close(client);
+            const bool clean_shutdown = shutdown(client, SHUT_RDWR) == 0;
+            const bool connection_closed = close(client) == 0;
+            if (response_sent) {
+                self->response_clean_shutdown.store(clean_shutdown, std::memory_order_release);
+                self->response_connection_closed.store(connection_closed,
+                                                       std::memory_order_release);
+            }
             if (!self->observe_extra_requests_until_stop &&
                 self->requests.load(std::memory_order_acquire) >= self->expected_requests) {
                 self->running.store(false, std::memory_order_release);
@@ -1123,6 +1145,10 @@ struct Recorder {
             response_peer_observation_failed.store(false, std::memory_order_relaxed);
             response_sent_ns.store(0, std::memory_order_relaxed);
             response_peer_closed_ns.store(0, std::memory_order_relaxed);
+            response_send_all_calls.store(0, std::memory_order_relaxed);
+            response_send_succeeded.store(false, std::memory_order_relaxed);
+            response_clean_shutdown.store(false, std::memory_order_relaxed);
+            response_connection_closed.store(false, std::memory_order_relaxed);
             response_fragment_permit.store(permit_gated_complete_response ? 1u : 0u,
                                            std::memory_order_relaxed);
             response_fragments_sent.store(0, std::memory_order_relaxed);
@@ -1160,6 +1186,69 @@ struct Recorder {
 
     ~Recorder() { stop(); }
 };
+
+static bool complete_origin_episode_is_exact(const Recorder& recorder) {
+    return recorder.accepted.load(std::memory_order_acquire) == 1 &&
+           recorder.requests.load(std::memory_order_acquire) == 1 &&
+           recorder.response_send_all_calls.load(std::memory_order_acquire) == 1 &&
+           recorder.response_send_succeeded.load(std::memory_order_acquire) &&
+           recorder.response_clean_shutdown.load(std::memory_order_acquire) &&
+           recorder.response_connection_closed.load(std::memory_order_acquire);
+}
+
+static bool wait_for_live_complete_origin_episode(Recorder& recorder,
+                                                  Child& process,
+                                                  const char* side,
+                                                  std::string& error) {
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+    while (std::chrono::steady_clock::now() < deadline) {
+        if (poll_child(process)) {
+            error = std::string(side) + " process exited before completion observation";
+            return false;
+        }
+        if (!recorder.running.load(std::memory_order_acquire)) {
+            error = std::string(side) + " recorder stopped before completion observation";
+            return false;
+        }
+        if (recorder.accepted.load(std::memory_order_acquire) > 1 ||
+            recorder.requests.load(std::memory_order_acquire) > 1 ||
+            recorder.response_send_all_calls.load(std::memory_order_acquire) > 1) {
+            error = std::string(side) + " origin retried during completion observation";
+            return false;
+        }
+        if (complete_origin_episode_is_exact(recorder)) return true;
+        usleep(1000);
+    }
+    error = std::string(side) +
+            " origin did not prove one complete send_all followed by clean shutdown/close";
+    return false;
+}
+
+static bool observe_live_complete_origin_quiet(Recorder& recorder,
+                                               Child& process,
+                                               const char* side,
+                                               std::string& error) {
+    if (!wait_for_live_complete_origin_episode(recorder, process, side, error)) return false;
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(500);
+    while (std::chrono::steady_clock::now() < deadline) {
+        if (poll_child(process)) {
+            error = std::string(side) + " process exited during post-EOF live observation";
+            return false;
+        }
+        if (!recorder.running.load(std::memory_order_acquire) ||
+            !complete_origin_episode_is_exact(recorder)) {
+            error = std::string(side) +
+                    " origin changed or recorder stopped during post-EOF live observation";
+            return false;
+        }
+        const auto remaining = std::chrono::duration_cast<std::chrono::milliseconds>(
+                                   deadline - std::chrono::steady_clock::now())
+                                   .count();
+        const int wait_ms = remaining > 50 ? 50 : static_cast<int>(remaining);
+        (void)poll(nullptr, 0, wait_ms > 0 ? wait_ms : 1);
+    }
+    return true;
+}
 
 // Pinned-baseline backend for two requests on one downstream connection. It
 // keeps accepted upstream fds open, records the connection id with every
@@ -3438,6 +3527,7 @@ static bool capture_case(u16 frontend_port,
                          std::vector<char>& rut_upstream,
                          std::string& error) {
     Recorder recorder;
+    recorder.observe_extra_requests_until_stop = true;
     if (!recorder.setup(backend_port)) {
         error = "backend recorder setup failed";
         return false;
@@ -3469,13 +3559,16 @@ static bool capture_case(u16 frontend_port,
         return false;
     }
     const int nginx_client = connect_once(frontend_port);
-    if (nginx_client < 0 || !send_all(nginx_client, kRequest, sizeof(kRequest) - 1) ||
-        !read_response(nginx_client, nginx_downstream, error)) {
-        if (nginx_client >= 0) close(nginx_client);
+    bool nginx_ok = nginx_client >= 0;
+    if (nginx_ok) nginx_ok = send_all(nginx_client, kRequest, sizeof(kRequest) - 1);
+    if (nginx_ok) nginx_ok = read_response(nginx_client, nginx_downstream, error);
+    if (nginx_ok) nginx_ok = read_eof(nginx_client, error);
+    if (nginx_client >= 0) close(nginx_client);
+    if (!nginx_ok) {
         error = "nginx request/response failed: " + error;
         return false;
     }
-    close(nginx_client);
+    if (!observe_live_complete_origin_quiet(recorder, nginx.child, "nginx", error)) return false;
     if (!stop_child(nginx.child)) {
         error = "failed to stop nginx";
         return false;
@@ -3485,14 +3578,15 @@ static bool capture_case(u16 frontend_port,
         return false;
     }
     recorder.stop();
-    if (recorder.accepted.load(std::memory_order_acquire) != 1 ||
-        recorder.requests.load(std::memory_order_acquire) != 1) {
-        error = "nginx recorder did not observe exactly one request";
+    if (!complete_origin_episode_is_exact(recorder) || recorder.history.size() != 1 ||
+        recorder.request != recorder.history[0]) {
+        error = "nginx recorder joined with inexact completion lifecycle";
         return false;
     }
     nginx_upstream = recorder.request;
 
     Recorder fresh_recorder;
+    fresh_recorder.observe_extra_requests_until_stop = true;
     if (!fresh_recorder.setup(backend_port)) {
         error = "fresh backend recorder setup failed";
         return false;
@@ -3508,21 +3602,25 @@ static bool capture_case(u16 frontend_port,
         return false;
     }
     const int rut_client = connect_once(frontend_port);
-    if (rut_client < 0 || !send_all(rut_client, kRequest, sizeof(kRequest) - 1) ||
-        !read_response(rut_client, rut_downstream, error)) {
-        if (rut_client >= 0) close(rut_client);
+    bool rut_ok = rut_client >= 0;
+    if (rut_ok) rut_ok = send_all(rut_client, kRequest, sizeof(kRequest) - 1);
+    if (rut_ok) rut_ok = read_response(rut_client, rut_downstream, error);
+    if (rut_ok) rut_ok = read_eof(rut_client, error);
+    if (rut_client >= 0) close(rut_client);
+    if (!rut_ok) {
         error = "RUT request/response failed: " + error;
         return false;
     }
-    close(rut_client);
+    if (!observe_live_complete_origin_quiet(fresh_recorder, rut.child, "generated RUT", error))
+        return false;
     if (!stop_child(rut.child)) {
         error = "failed to stop production RUT";
         return false;
     }
     fresh_recorder.stop();
-    if (fresh_recorder.accepted.load(std::memory_order_acquire) != 1 ||
-        fresh_recorder.requests.load(std::memory_order_acquire) != 1) {
-        error = "RUT recorder did not observe exactly one request";
+    if (!complete_origin_episode_is_exact(fresh_recorder) || fresh_recorder.history.size() != 1 ||
+        fresh_recorder.request != fresh_recorder.history[0]) {
+        error = "RUT recorder joined with inexact completion lifecycle";
         return false;
     }
     rut_upstream = fresh_recorder.request;
@@ -5373,9 +5471,18 @@ int main(int argc, char** argv) {
     }
     std::vector<char> normalized_nginx = nginx_response;
     std::vector<char> normalized_rut = rut_response;
-    if (!normalize_date(normalized_nginx) || !normalize_date(normalized_rut) ||
+    std::string nginx_success_detail;
+    std::string rut_success_detail;
+    if (!validate_exact_normalized_response(
+            nginx_response, kSuccessResponseNormalized, nginx_success_detail) ||
+        !validate_exact_normalized_response(
+            rut_response, kSuccessResponseNormalized, rut_success_detail) ||
+        !normalize_date(normalized_nginx) || !normalize_date(normalized_rut) ||
         normalized_nginx != normalized_rut) {
-        std::cerr << "FAIL [compare]: downstream response mismatch after Date normalization\n";
+        std::cerr << "FAIL [compare]: exact downstream response mismatch after strict Date "
+                     "normalization"
+                  << (nginx_success_detail.empty() ? "" : ": nginx " + nginx_success_detail)
+                  << (rut_success_detail.empty() ? "" : ": RUT " + rut_success_detail) << "\n";
         dump_wire("nginx response", nginx_response);
         dump_wire("RUT response", rut_response);
         dump_log(temp.nginx_log, "nginx log");
@@ -5405,7 +5512,10 @@ int main(int argc, char** argv) {
         dump_log(temp.rut_log, "RUT log");
         return 1;
     }
-    std::cerr << "PASS: pinned nginx and RUT differential success case\n";
+    std::cerr << "PASS: converter-generated RUT matches pinned nginx for the bounded sequential "
+                 "explicit-close completion vector (one complete fixed-CL origin send, immediate "
+                 "clean origin EOF, exact normalized response/downstream EOF, no retry); this "
+                 "does not claim pipelined successors or broader client/config behavior\n";
     std::vector<char> nginx_gateway_response;
     std::vector<char> rut_gateway_response;
     std::string gateway_error;
