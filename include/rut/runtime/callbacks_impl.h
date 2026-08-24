@@ -7035,14 +7035,32 @@ inline bool validated_preconnect_failure_owner_is_stable(Loop* loop,
     if constexpr (!requires(const Loop* candidate) {
                       candidate->backend.send_state[0];
                       candidate->backend.upstream_send_state[0];
+                      candidate->conns[0];
                   }) {
         return false;
     } else {
         const RouteConfig* config = conn.request_config;
         const u16 bundle_id = conn.response_read_deadline_bundle_id;
-        if (loop == nullptr || conn.id >= Loop::kMaxConns || conn.fd < 0 || config == nullptr ||
-            conn.state != ConnState::Proxying || conn.protocol != ConnProtocol::Http11 ||
-            conn.tls_active || conn.h2 != nullptr || conn.req_start_us == 0 || conn.epoch_held ||
+        if (loop == nullptr || conn.id >= Loop::kMaxConns || &loop->conns[conn.id] != &conn ||
+            conn.fd < 0 || config == nullptr || conn.state != ConnState::Proxying ||
+            conn.protocol != ConnProtocol::Http11 || conn.tls_active || conn.h2 != nullptr ||
+            conn.req_start_us == 0 || conn.epoch_held || conn.is_health_probe ||
+            conn.req_http_version != static_cast<u8>(HttpVersion::Http11) ||
+            !conn.req_strict_h1_complete || conn.req_client_has_transfer_encoding ||
+            conn.req_client_has_te || conn.req_client_has_expect ||
+            conn.req_client_has_upgrade_header || conn.req_malformed || conn.req_wants_upgrade ||
+            conn.req_upgrade_is_websocket || conn.resp_upgrade_is_websocket ||
+            conn.req_path_canon.ptr == nullptr || conn.pending_handler_fn != nullptr ||
+            conn.handler_state != 0 || conn.pending_yield_kind != jit::YieldKind::Timer ||
+            conn.resume_event_kind != jit::YieldKind::Timer || conn.resume_event_result != 0 ||
+            conn.handler_ctx != reinterpret_cast<const void*>(conn.handler_ctx_storage) ||
+            conn.yield_armed || conn.yield_timeout_armed || conn.throttle_paused ||
+            conn.throttle_down_bps != 0 || conn.throttle_tat_ns != 0 || conn.recv_paused_for_send ||
+            conn.recv_pause_cancel_pending || conn.recv_pause_rearm_pending ||
+            conn.resp_status != 0 || conn.resp_body_mode != BodyMode::None ||
+            conn.resp_body_remaining != 0 || conn.resp_body_sent != 0 ||
+            conn.upstream_send_len != 0 || conn.upstream_recv_buf.len() != 0 ||
+            conn.upstream_start_us == 0 ||
             conn.response_read_deadline_state != ResponseReadDeadlineState::Validated ||
             conn.response_read_deadline_owner_generation == 0 ||
             conn.response_read_deadline_owner_generation !=
@@ -7197,21 +7215,24 @@ inline bool validated_preconnect_failure_owner_is_stable(Loop* loop,
         } else {
             return false;
         }
-        const bool fixed_upload_recv_exception =
-            fixed_upload && conn.on_recv == &on_request_policy_body_recvd<Loop> && conn.recv_armed;
-        const u32 downstream_pending = conn.recv_armed ? 1u : 0u;
+        // io_uring's original multishot downstream Recv remains live while the
+        // synchronous JIT Forward path selects and connects the upstream.  The
+        // callback slot is already clear for bodyless/HEAD requests.  A fixed
+        // upload reaches SocketCreate from its body-recv callback and therefore
+        // retains that exact callback until set_slots publishes ConnectSubmit.
+        // The Recv itself is never cancelled merely to serialize a local 502.
+        if (!conn.recv_armed || conn.pending_ops != 1u) return false;
         if (site == ValidatedPreconnectFailureSite::SocketCreate) {
             if (conn.upstream_fd >= 0 || conn.on_upstream_recv != nullptr ||
                 conn.on_upstream_send != nullptr || conn.upstream_connect_armed ||
-                (conn.on_recv != nullptr && !fixed_upload_recv_exception) ||
-                (conn.recv_armed && !fixed_upload_recv_exception))
+                conn.on_recv != (fixed_upload ? &on_request_policy_body_recvd<Loop> : nullptr))
                 return false;
         } else if (conn.upstream_fd < 0 || conn.on_upstream_send != &on_upstream_connected<Loop> ||
-                   conn.on_upstream_recv != nullptr || conn.on_recv != nullptr || conn.recv_armed ||
+                   conn.on_upstream_recv != nullptr || conn.on_recv != nullptr ||
                    conn.upstream_connect_armed) {
             return false;
         }
-        return conn.pending_ops == downstream_pending;
+        return true;
     }
 }
 

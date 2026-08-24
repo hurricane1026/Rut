@@ -20425,12 +20425,13 @@ bool stage_preconnect_connect_submit(IoUringEventLoop* loop,
         return false;
     out->sq_tail = __atomic_load_n(loop->backend.sq_tail, __ATOMIC_ACQUIRE);
     out->backend_pending = loop->backend.pending;
+    if (!loop->submit_recv(*conn)) return false;
     on_header_received<IoUringEventLoop>(
         loop,
         *conn,
-        {conn->id, static_cast<i32>(sizeof(kRequest) - 1u), 0, 0, IoEventType::Recv, 0});
+        {conn->id, static_cast<i32>(sizeof(kRequest) - 1u), 0, 0, IoEventType::Recv, 1});
     if (conn->fd < 0 || conn->upstream_fd < 0 || !conn->upstream_connect_armed ||
-        conn->pending_ops != 1 ||
+        !conn->recv_armed || conn->pending_ops != 2 || conn->on_recv != nullptr ||
         conn->on_upstream_send != &on_upstream_connected<IoUringEventLoop>)
         return false;
     // The connect SQE was never submitted to the kernel. Roll it back to the
@@ -20438,7 +20439,7 @@ bool stage_preconnect_connect_submit(IoUringEventLoop* loop,
     __atomic_store_n(loop->backend.sq_tail, out->sq_tail, __ATOMIC_RELEASE);
     loop->backend.pending = out->backend_pending;
     conn->upstream_connect_armed = false;
-    conn->pending_ops = 0;
+    conn->pending_ops = 1;
     out->conn = conn;
     out->peer_fd = downstream[1];
     return true;
@@ -20455,6 +20456,7 @@ TEST(iouring_preconnect_failure,
     REQUIRE(add_bodyless_non_head_response_read_deadline_bundle(config));
     REQUIRE(
         config.add_jit_handler("/one", kRouteMethodGet, &response_read_deadline_handler, false, 2));
+    REQUIRE(config.add_static("/two", kRouteMethodGet, 204));
     const RouteConfig* active = &config;
     loop->config_ptr = &active;
     Connection* conn = loop->alloc_conn();
@@ -20466,12 +20468,13 @@ TEST(iouring_preconnect_failure,
     REQUIRE_EQ(conn->recv_buf.write(kRequest, sizeof(kRequest) - 1u), sizeof(kRequest) - 1u);
     const u32 sq_tail_before = __atomic_load_n(loop->backend.sq_tail, __ATOMIC_ACQUIRE);
     const u32 backend_pending_before = loop->backend.pending;
+    REQUIRE(loop->submit_recv(*conn));
     {
         test_fault::ScopedSocketFailure socket_failure;
         on_header_received<IoUringEventLoop>(
             loop,
             *conn,
-            {conn->id, static_cast<i32>(sizeof(kRequest) - 1u), 0, 0, IoEventType::Recv, 0});
+            {conn->id, static_cast<i32>(sizeof(kRequest) - 1u), 0, 0, IoEventType::Recv, 1});
     }
 
     REQUIRE_GE(conn->fd, 0);
@@ -20492,12 +20495,35 @@ TEST(iouring_preconnect_failure,
                              conn->response_header_buf.len(),
                              "time\0out",
                              8));
-    CHECK_EQ(conn->pending_ops, 1u);
+    CHECK(conn->recv_armed);
+    CHECK_EQ(conn->pending_ops, 2u);
+
+    const u32 response_len = conn->response_header_buf.len();
+    __atomic_store_n(loop->backend.sq_tail, sq_tail_before, __ATOMIC_RELEASE);
+    loop->backend.pending = backend_pending_before;
+    loop->backend.send_state[conn->id].remaining = 0;
+    loop->dispatch({conn->id, static_cast<i32>(response_len), 0, 0, IoEventType::Send, 0});
+    REQUIRE_GE(conn->fd, 0);
+    REQUIRE_EQ(conn->state, ConnState::ReadingHeader);
+    REQUIRE_EQ(conn->on_recv, &on_header_received<IoUringEventLoop>);
+    REQUIRE(conn->recv_armed);
+    REQUIRE_EQ(conn->pending_ops, 1u);
+
+    static constexpr u8 kSuccessor[] =
+        "GET /two HTTP/1.1\r\nHost: client.example\r\nConnection: close\r\n\r\n";
+    REQUIRE_EQ(conn->recv_buf.write(kSuccessor, sizeof(kSuccessor) - 1u), sizeof(kSuccessor) - 1u);
+    loop->dispatch(
+        {conn->id, static_cast<i32>(sizeof(kSuccessor) - 1u), 0, 0, IoEventType::Recv, 1});
+    CHECK_EQ(conn->resp_status, 204u);
+    CHECK(conn->send_armed);
+    CHECK(conn->recv_armed);
+    CHECK_EQ(conn->pending_ops, 2u);
 
     __atomic_store_n(loop->backend.sq_tail, sq_tail_before, __ATOMIC_RELEASE);
     loop->backend.pending = backend_pending_before;
     loop->backend.send_state[conn->id] = {};
     conn->send_armed = false;
+    conn->recv_armed = false;
     conn->pending_ops = 0;
     conn->clear_slots();
     loop->close_conn(*conn);
@@ -20531,12 +20557,13 @@ TEST(iouring_preconnect_failure,
     REQUIRE_EQ(conn->recv_buf.write(kRequest, sizeof(kRequest) - 1u), sizeof(kRequest) - 1u);
     const u32 sq_tail_before = __atomic_load_n(loop->backend.sq_tail, __ATOMIC_ACQUIRE);
     const u32 backend_pending_before = loop->backend.pending;
+    REQUIRE(loop->submit_recv(*conn));
     {
         test_fault::ScopedIoUringSubmitFailure connect_failure(/*connect_failures=*/1);
         on_header_received<IoUringEventLoop>(
             loop,
             *conn,
-            {conn->id, static_cast<i32>(sizeof(kRequest) - 1u), 0, 0, IoEventType::Recv, 0});
+            {conn->id, static_cast<i32>(sizeof(kRequest) - 1u), 0, 0, IoEventType::Recv, 1});
     }
 
     REQUIRE_GE(conn->fd, 0);
@@ -20556,11 +20583,14 @@ TEST(iouring_preconnect_failure,
                              conn->response_header_buf.len(),
                              "time\0out",
                              8));
+    CHECK(conn->recv_armed);
+    CHECK_EQ(conn->pending_ops, 2u);
 
     __atomic_store_n(loop->backend.sq_tail, sq_tail_before, __ATOMIC_RELEASE);
     loop->backend.pending = backend_pending_before;
     loop->backend.send_state[conn->id] = {};
     conn->send_armed = false;
+    conn->recv_armed = false;
     conn->pending_ops = 0;
     conn->clear_slots();
     loop->close_conn(*conn);
@@ -20586,12 +20616,13 @@ TEST(iouring_preconnect_failure, head_socket_create_suppresses_body_and_keeps_al
     REQUIRE_EQ(conn->recv_buf.write(kRequest, sizeof(kRequest) - 1u), sizeof(kRequest) - 1u);
     const u32 sq_tail_before = __atomic_load_n(loop->backend.sq_tail, __ATOMIC_ACQUIRE);
     const u32 backend_pending_before = loop->backend.pending;
+    REQUIRE(loop->submit_recv(*conn));
     {
         test_fault::ScopedSocketFailure socket_failure;
         on_header_received<IoUringEventLoop>(
             loop,
             *conn,
-            {conn->id, static_cast<i32>(sizeof(kRequest) - 1u), 0, 0, IoEventType::Recv, 0});
+            {conn->id, static_cast<i32>(sizeof(kRequest) - 1u), 0, 0, IoEventType::Recv, 1});
     }
     REQUIRE(conn->send_armed);
     REQUIRE_EQ(conn->resp_status, 502u);
@@ -20606,6 +20637,7 @@ TEST(iouring_preconnect_failure, head_socket_create_suppresses_body_and_keeps_al
     loop->backend.pending = backend_pending_before;
     loop->backend.send_state[conn->id] = {};
     conn->send_armed = false;
+    conn->recv_armed = false;
     conn->pending_ops = 0;
     conn->clear_slots();
     loop->close_conn(*conn);
@@ -20624,8 +20656,10 @@ TEST(iouring_preconnect_failure, complete_buffered_get_socket_create_honors_expl
         config.add_jit_handler("/one", kRouteMethodGet, &response_read_deadline_handler, false, 2));
     const RouteConfig* active = &config;
     loop->config_ptr = &active;
+    const u32 free_before = loop->free_top;
     Connection* conn = loop->alloc_conn();
     REQUIRE(conn != nullptr);
+    const u32 id = conn->id;
     i32 downstream[2] = {-1, -1};
     REQUIRE_EQ(socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, downstream), 0);
     conn->fd = downstream[0];
@@ -20634,12 +20668,13 @@ TEST(iouring_preconnect_failure, complete_buffered_get_socket_create_honors_expl
     REQUIRE_EQ(conn->recv_buf.write(kRequest, sizeof(kRequest) - 1u), sizeof(kRequest) - 1u);
     const u32 sq_tail_before = __atomic_load_n(loop->backend.sq_tail, __ATOMIC_ACQUIRE);
     const u32 backend_pending_before = loop->backend.pending;
+    REQUIRE(loop->submit_recv(*conn));
     {
         test_fault::ScopedSocketFailure socket_failure;
         on_header_received<IoUringEventLoop>(
             loop,
             *conn,
-            {conn->id, static_cast<i32>(sizeof(kRequest) - 1u), 0, 0, IoEventType::Recv, 0});
+            {conn->id, static_cast<i32>(sizeof(kRequest) - 1u), 0, 0, IoEventType::Recv, 1});
     }
     REQUIRE(conn->send_armed);
     CHECK_EQ(conn->resp_status, 502u);
@@ -20651,12 +20686,22 @@ TEST(iouring_preconnect_failure, complete_buffered_get_socket_create_honors_expl
     __atomic_store_n(loop->backend.sq_tail, sq_tail_before, __ATOMIC_RELEASE);
     loop->backend.pending = backend_pending_before;
     loop->backend.send_state[conn->id] = {};
-    conn->send_armed = false;
-    conn->pending_ops = 0;
-    on_validated_preconnect_failure_sent<IoUringEventLoop>(
-        loop, *conn, {conn->id, static_cast<i32>(response_len), 0, 0, IoEventType::Send, 0});
+    loop->backend.send_state[id].remaining = 0;
+    const i32 ring_fd = loop->backend.ring_fd;
+    loop->backend.ring_fd = -1;
+    loop->dispatch({id, static_cast<i32>(response_len), 0, 0, IoEventType::Send, 0});
+    loop->backend.ring_fd = ring_fd;
+    loop->backend.fatal_error.store(0, std::memory_order_release);
+    __atomic_store_n(loop->backend.sq_tail, sq_tail_before, __ATOMIC_RELEASE);
+    loop->backend.pending = backend_pending_before;
     CHECK_EQ(conn->fd, -1);
-    CHECK_EQ(conn->pending_ops, 0u);
+    CHECK_EQ(conn->pending_ops, 2u);
+    CHECK_EQ(loop->pending_free_count, 1u);
+    loop->dispatch({id, -ECANCELED, 0, 0, IoEventType::Recv, 0});
+    CHECK_EQ(conn->pending_ops, 1u);
+    loop->dispatch({id, -ENOENT, 0, 0, IoEventType::Recv, 0});
+    CHECK_EQ(loop->pending_free_count, 0u);
+    CHECK_EQ(loop->free_top, free_before);
     close(downstream[1]);
 }
 
@@ -20734,6 +20779,139 @@ TEST(iouring_preconnect_failure,
     close(downstream[1]);
 }
 
+TEST(iouring_preconnect_failure,
+     fixed_upload_connect_submit_preserves_live_recv_and_keepalive_successor) {
+    ScopedIoUringLoopForRetirement guard;
+    if (!guard.init()) SKIP("io_uring unavailable");
+    auto* loop = guard.loop;
+    RouteConfig pinned{};
+    REQUIRE(pinned.add_upstream("backend", 0x7F000001, 9000).has_value());
+    REQUIRE(add_bodyless_non_head_response_read_deadline_bundle(
+        pinned, 5, ForwardResponseBufferingMode::CompleteContentLength));
+    REQUIRE(pinned.add_jit_handler(
+        "/one", kRouteMethodPost, &response_read_deadline_fixed_upload_handler, false, 2));
+    REQUIRE(pinned.add_static("/two", kRouteMethodGet, 205));
+    RouteConfig hot{};
+    REQUIRE(hot.add_upstream("hot", 0x7F000001, 9001).has_value());
+    REQUIRE(add_bodyless_non_head_response_read_deadline_bundle(
+        hot, 5, ForwardResponseBufferingMode::CompleteContentLength));
+    hot.failure_policies[0].body = {"hot-reload", 10};
+    REQUIRE(hot.add_jit_handler(
+        "/one", kRouteMethodPost, &response_read_deadline_fixed_upload_handler, false, 2));
+    const RouteConfig* active = &pinned;
+    loop->config_ptr = &active;
+    Connection* conn = loop->alloc_conn();
+    REQUIRE(conn != nullptr);
+    i32 downstream[2] = {-1, -1};
+    REQUIRE_EQ(socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, downstream), 0);
+    conn->fd = downstream[0];
+    static constexpr u8 kPartial[] =
+        "POST /one HTTP/1.1\r\nHost: client.example\r\nContent-Length: 3\r\n\r\na";
+    REQUIRE_EQ(conn->recv_buf.write(kPartial, sizeof(kPartial) - 1u), sizeof(kPartial) - 1u);
+    const u32 sq_tail_before = __atomic_load_n(loop->backend.sq_tail, __ATOMIC_ACQUIRE);
+    const u32 backend_pending_before = loop->backend.pending;
+    on_header_received<IoUringEventLoop>(
+        loop,
+        *conn,
+        {conn->id, static_cast<i32>(sizeof(kPartial) - 1u), 0, 0, IoEventType::Recv, 1});
+    REQUIRE(conn->request_policy_body_pending);
+    REQUIRE(conn->recv_armed);
+    REQUIRE_EQ(conn->pending_ops, 1u);
+    REQUIRE_EQ(conn->on_recv, &on_request_policy_body_recvd<IoUringEventLoop>);
+
+    active = &hot;
+    static constexpr u8 kRemainder[] = {'b', 'c'};
+    REQUIRE_EQ(conn->recv_buf.write(kRemainder, sizeof(kRemainder)), sizeof(kRemainder));
+    {
+        test_fault::ScopedIoUringSubmitFailure connect_failure(/*connect_failures=*/1);
+        on_request_policy_body_recvd<IoUringEventLoop>(
+            loop, *conn, {conn->id, 2, 0, 0, IoEventType::Recv, 1});
+    }
+    REQUIRE_GE(conn->fd, 0);
+    REQUIRE(conn->send_armed);
+    CHECK_EQ(conn->resp_status, 502u);
+    CHECK_EQ(conn->request_config, &pinned);
+    CHECK_EQ(conn->on_recv, nullptr);
+    CHECK(conn->recv_armed);
+    CHECK_EQ(conn->pending_ops, 2u);
+    CHECK(buf_has(conn->response_header_buf.data(), conn->response_header_buf.len(), "default"));
+    CHECK_FALSE(
+        buf_has(conn->response_header_buf.data(), conn->response_header_buf.len(), "hot-reload"));
+
+    active = &pinned;
+    const u32 response_len = conn->response_header_buf.len();
+    __atomic_store_n(loop->backend.sq_tail, sq_tail_before, __ATOMIC_RELEASE);
+    loop->backend.pending = backend_pending_before;
+    loop->backend.send_state[conn->id].remaining = 0;
+    loop->dispatch({conn->id, static_cast<i32>(response_len), 0, 0, IoEventType::Send, 0});
+    REQUIRE_EQ(conn->state, ConnState::ReadingHeader);
+    REQUIRE_EQ(conn->on_recv, &on_header_received<IoUringEventLoop>);
+    REQUIRE(conn->recv_armed);
+    REQUIRE_EQ(conn->pending_ops, 1u);
+
+    static constexpr u8 kSuccessor[] =
+        "GET /two HTTP/1.1\r\nHost: client.example\r\nConnection: close\r\n\r\n";
+    REQUIRE_EQ(conn->recv_buf.write(kSuccessor, sizeof(kSuccessor) - 1u), sizeof(kSuccessor) - 1u);
+    loop->dispatch(
+        {conn->id, static_cast<i32>(sizeof(kSuccessor) - 1u), 0, 0, IoEventType::Recv, 1});
+    CHECK_EQ(conn->resp_status, 205u);
+    CHECK(conn->send_armed);
+    CHECK(conn->recv_armed);
+    CHECK_EQ(conn->pending_ops, 2u);
+
+    __atomic_store_n(loop->backend.sq_tail, sq_tail_before, __ATOMIC_RELEASE);
+    loop->backend.pending = backend_pending_before;
+    loop->backend.send_state[conn->id] = {};
+    conn->send_armed = false;
+    conn->recv_armed = false;
+    conn->pending_ops = 0;
+    conn->clear_slots();
+    loop->close_conn(*conn);
+    close(downstream[1]);
+}
+
+TEST(iouring_preconnect_failure, socket_create_callback_recv_and_pending_shape_is_exact) {
+    ScopedIoUringLoopForRetirement guard;
+    if (!guard.init()) SKIP("io_uring unavailable");
+    auto* loop = guard.loop;
+    RouteConfig config{};
+    PreconnectConnectSubmitFixture fixture{};
+    REQUIRE(stage_preconnect_connect_submit(loop, config, &fixture));
+    Connection& conn = *fixture.conn;
+    REQUIRE_GE(conn.upstream_fd, 0);
+    close(conn.upstream_fd);
+    conn.upstream_fd = -1;
+    conn.on_upstream_send = nullptr;
+
+    CHECK(validated_preconnect_failure_owner_is_stable(
+        loop, conn, ValidatedPreconnectFailureSite::SocketCreate));
+    conn.on_recv = &test_sentinel_callback<IoUringEventLoop>;
+    CHECK_FALSE(validated_preconnect_failure_owner_is_stable(
+        loop, conn, ValidatedPreconnectFailureSite::SocketCreate));
+    conn.on_recv = &on_request_policy_body_recvd<IoUringEventLoop>;
+    CHECK_FALSE(validated_preconnect_failure_owner_is_stable(
+        loop, conn, ValidatedPreconnectFailureSite::SocketCreate));
+    conn.on_recv = nullptr;
+    conn.recv_armed = false;
+    CHECK_FALSE(validated_preconnect_failure_owner_is_stable(
+        loop, conn, ValidatedPreconnectFailureSite::SocketCreate));
+    conn.recv_armed = true;
+    conn.pending_ops = 0;
+    CHECK_FALSE(validated_preconnect_failure_owner_is_stable(
+        loop, conn, ValidatedPreconnectFailureSite::SocketCreate));
+    conn.pending_ops = 2;
+    CHECK_FALSE(validated_preconnect_failure_owner_is_stable(
+        loop, conn, ValidatedPreconnectFailureSite::SocketCreate));
+
+    __atomic_store_n(loop->backend.sq_tail, fixture.sq_tail, __ATOMIC_RELEASE);
+    loop->backend.pending = fixture.backend_pending;
+    conn.recv_armed = false;
+    conn.pending_ops = 0;
+    conn.clear_slots();
+    loop->close_conn(conn);
+    close(fixture.peer_fd);
+}
+
 TEST(iouring_preconnect_failure, forged_connect_submit_owners_fail_closed_without_response) {
     enum class Forgery : u8 {
         Generation,
@@ -20743,7 +20921,44 @@ TEST(iouring_preconnect_failure, forged_connect_submit_owners_fail_closed_withou
         Route,
         Policy,
         Persistence,
-        Callback,
+        HealthProbe,
+        HttpVersion,
+        StrictRequest,
+        TransferEncoding,
+        Te,
+        Expect,
+        UpgradeHeader,
+        Malformed,
+        WantsUpgrade,
+        UpgradeWebsocket,
+        ResponseUpgradeWebsocket,
+        CanonicalPath,
+        LoopIdentity,
+        ResponseStatus,
+        ResponseBodyMode,
+        ResponseBodyRemaining,
+        ResponseBodySent,
+        UpstreamSendLength,
+        UpstreamSendState,
+        UpstreamRecvBuffer,
+        UpstreamStart,
+        DownstreamPaused,
+        DownstreamPauseCancel,
+        DownstreamPauseRearm,
+        PendingHandler,
+        HandlerState,
+        PendingYieldKind,
+        ResumeKind,
+        ResumeResult,
+        HandlerContext,
+        YieldArmed,
+        YieldTimeoutArmed,
+        ThrottlePaused,
+        ThrottleRate,
+        ThrottleTat,
+        DownstreamCallback,
+        DownstreamRecv,
+        UpstreamCallback,
         Pending,
     };
     const Forgery forgeries[] = {Forgery::Generation,
@@ -20753,10 +20968,48 @@ TEST(iouring_preconnect_failure, forged_connect_submit_owners_fail_closed_withou
                                  Forgery::Route,
                                  Forgery::Policy,
                                  Forgery::Persistence,
-                                 Forgery::Callback,
+                                 Forgery::HealthProbe,
+                                 Forgery::HttpVersion,
+                                 Forgery::StrictRequest,
+                                 Forgery::TransferEncoding,
+                                 Forgery::Te,
+                                 Forgery::Expect,
+                                 Forgery::UpgradeHeader,
+                                 Forgery::Malformed,
+                                 Forgery::WantsUpgrade,
+                                 Forgery::UpgradeWebsocket,
+                                 Forgery::ResponseUpgradeWebsocket,
+                                 Forgery::CanonicalPath,
+                                 Forgery::LoopIdentity,
+                                 Forgery::ResponseStatus,
+                                 Forgery::ResponseBodyMode,
+                                 Forgery::ResponseBodyRemaining,
+                                 Forgery::ResponseBodySent,
+                                 Forgery::UpstreamSendLength,
+                                 Forgery::UpstreamSendState,
+                                 Forgery::UpstreamRecvBuffer,
+                                 Forgery::UpstreamStart,
+                                 Forgery::DownstreamPaused,
+                                 Forgery::DownstreamPauseCancel,
+                                 Forgery::DownstreamPauseRearm,
+                                 Forgery::PendingHandler,
+                                 Forgery::HandlerState,
+                                 Forgery::PendingYieldKind,
+                                 Forgery::ResumeKind,
+                                 Forgery::ResumeResult,
+                                 Forgery::HandlerContext,
+                                 Forgery::YieldArmed,
+                                 Forgery::YieldTimeoutArmed,
+                                 Forgery::ThrottlePaused,
+                                 Forgery::ThrottleRate,
+                                 Forgery::ThrottleTat,
+                                 Forgery::DownstreamCallback,
+                                 Forgery::DownstreamRecv,
+                                 Forgery::UpstreamCallback,
                                  Forgery::Pending};
     u32 cases = 0;
     for (const Forgery forgery : forgeries) {
+        ScopedBackendHealthReset health_reset{};
         ScopedIoUringLoopForRetirement guard;
         if (!guard.init()) SKIP("io_uring unavailable");
         auto* loop = guard.loop;
@@ -20765,6 +21018,11 @@ TEST(iouring_preconnect_failure, forged_connect_submit_owners_fail_closed_withou
         REQUIRE(stage_preconnect_connect_submit(loop, config, &fixture));
         Connection& conn = *fixture.conn;
         const u32 id = conn.id;
+        BackendHealth* health = backend_health(0, 0);
+        REQUIRE(health != nullptr);
+        health->fails = 3;
+        health->eject_until_us = 4567;
+        health->active_down = false;
         switch (forgery) {
             case Forgery::Generation:
                 ++conn.response_read_deadline_owner_generation;
@@ -20787,34 +21045,192 @@ TEST(iouring_preconnect_failure, forged_connect_submit_owners_fail_closed_withou
             case Forgery::Persistence:
                 conn.req_client_keep_alive = false;
                 break;
-            case Forgery::Callback:
+            case Forgery::HealthProbe:
+                conn.is_health_probe = true;
+                break;
+            case Forgery::HttpVersion:
+                conn.req_http_version = static_cast<u8>(HttpVersion::Http10);
+                break;
+            case Forgery::StrictRequest:
+                conn.req_strict_h1_complete = false;
+                break;
+            case Forgery::TransferEncoding:
+                conn.req_client_has_transfer_encoding = true;
+                break;
+            case Forgery::Te:
+                conn.req_client_has_te = true;
+                break;
+            case Forgery::Expect:
+                conn.req_client_has_expect = true;
+                break;
+            case Forgery::UpgradeHeader:
+                conn.req_client_has_upgrade_header = true;
+                break;
+            case Forgery::Malformed:
+                conn.req_malformed = true;
+                break;
+            case Forgery::WantsUpgrade:
+                conn.req_wants_upgrade = true;
+                break;
+            case Forgery::UpgradeWebsocket:
+                conn.req_upgrade_is_websocket = true;
+                break;
+            case Forgery::ResponseUpgradeWebsocket:
+                conn.resp_upgrade_is_websocket = true;
+                break;
+            case Forgery::CanonicalPath:
+                conn.req_path_canon = {nullptr, 0};
+                break;
+            case Forgery::LoopIdentity:
+                conn.id = (id + 1u) % IoUringEventLoop::kMaxConns;
+                break;
+            case Forgery::ResponseStatus:
+                conn.resp_status = 200;
+                break;
+            case Forgery::ResponseBodyMode:
+                conn.resp_body_mode = BodyMode::ContentLength;
+                break;
+            case Forgery::ResponseBodyRemaining:
+                conn.resp_body_remaining = 1;
+                break;
+            case Forgery::ResponseBodySent:
+                conn.resp_body_sent = 1;
+                break;
+            case Forgery::UpstreamSendLength:
+                conn.upstream_send_len = 1;
+                break;
+            case Forgery::UpstreamSendState:
+                loop->backend.upstream_send_state[id].remaining = 1;
+                break;
+            case Forgery::UpstreamRecvBuffer:
+                REQUIRE(loop->alloc_upstream_buf(conn));
+                REQUIRE_EQ(conn.upstream_recv_buf.write(reinterpret_cast<const u8*>("x"), 1), 1u);
+                break;
+            case Forgery::UpstreamStart:
+                conn.upstream_start_us = 0;
+                break;
+            case Forgery::DownstreamPaused:
+                conn.recv_paused_for_send = true;
+                break;
+            case Forgery::DownstreamPauseCancel:
+                conn.recv_pause_cancel_pending = true;
+                break;
+            case Forgery::DownstreamPauseRearm:
+                conn.recv_pause_rearm_pending = true;
+                break;
+            case Forgery::PendingHandler:
+                conn.pending_handler_fn = &response_read_deadline_handler;
+                break;
+            case Forgery::HandlerState:
+                conn.handler_state = 1;
+                break;
+            case Forgery::PendingYieldKind:
+                conn.pending_yield_kind = jit::YieldKind::UpstreamRecv;
+                break;
+            case Forgery::ResumeKind:
+                conn.resume_event_kind = jit::YieldKind::Recv;
+                break;
+            case Forgery::ResumeResult:
+                conn.resume_event_result = 1;
+                break;
+            case Forgery::HandlerContext:
+                conn.handler_ctx = nullptr;
+                break;
+            case Forgery::YieldArmed:
+                conn.yield_armed = true;
+                break;
+            case Forgery::YieldTimeoutArmed:
+                conn.yield_timeout_armed = true;
+                break;
+            case Forgery::ThrottlePaused:
+                conn.throttle_paused = true;
+                break;
+            case Forgery::ThrottleRate:
+                conn.throttle_down_bps = 1;
+                break;
+            case Forgery::ThrottleTat:
+                conn.throttle_tat_ns = 1;
+                break;
+            case Forgery::DownstreamCallback:
+                conn.on_recv = &test_sentinel_callback<IoUringEventLoop>;
+                break;
+            case Forgery::DownstreamRecv:
+                conn.recv_armed = false;
+                break;
+            case Forgery::UpstreamCallback:
                 conn.on_upstream_send = &test_sentinel_callback<IoUringEventLoop>;
                 break;
             case Forgery::Pending:
-                conn.pending_ops = 1;
+                conn.pending_ops = 2;
                 break;
         }
         const u32 tail_before = __atomic_load_n(loop->backend.sq_tail, __ATOMIC_ACQUIRE);
-        respond_validated_preconnect_failure(
+        const i32 fd_before = conn.fd;
+        const i32 upstream_fd_before = conn.upstream_fd;
+        const u32 generation_before = conn.response_read_deadline_generation;
+        const u32 episode_before = conn.upstream_episode;
+        const u32 response_len_before = conn.response_header_buf.len();
+        const bool stable = validated_preconnect_failure_owner_is_stable(
             loop, conn, ValidatedPreconnectFailureSite::ConnectSubmit);
-        const Connection& closed = loop->conns[id];
-        CHECK_EQ(closed.fd, -1);
-        CHECK_EQ(closed.upstream_fd, -1);
-        CHECK_EQ(closed.pending_ops, forgery == Forgery::Pending ? 1u : 0u);
-        CHECK_EQ(closed.response_header_buf.len(), 0u);
-        CHECK_EQ(loop->backend.send_state[id].remaining, 0u);
-        CHECK_EQ(loop->backend.upstream_send_state[id].remaining, 0u);
+        CHECK_FALSE(stable);
+        CHECK_EQ(conn.fd, fd_before);
+        CHECK_EQ(conn.upstream_fd, upstream_fd_before);
+        CHECK_EQ(conn.response_read_deadline_state, ResponseReadDeadlineState::Validated);
+        CHECK_EQ(conn.response_read_deadline_generation, generation_before);
+        CHECK_EQ(conn.upstream_episode, episode_before);
+        CHECK_EQ(conn.response_header_buf.len(), response_len_before);
+        CHECK_EQ(health->fails, 3u);
+        CHECK_EQ(health->eject_until_us, 4567u);
+        CHECK_FALSE(health->active_down);
         CHECK_EQ(__atomic_load_n(loop->backend.sq_tail, __ATOMIC_ACQUIRE), tail_before);
-        u8 byte = 0;
-        CHECK_EQ(recv(fixture.peer_fd, &byte, 1, MSG_DONTWAIT), 0);
-        if (forgery == Forgery::Pending) {
-            loop->conns[id].pending_ops = 0;
-            loop->reclaim_slot(id);
+
+        if (forgery == Forgery::LoopIdentity) conn.id = id;
+        if (forgery != Forgery::LoopIdentity) {
+            const i32 ring_fd = loop->backend.ring_fd;
+            loop->backend.ring_fd = -1;
+            respond_validated_preconnect_failure(
+                loop, conn, ValidatedPreconnectFailureSite::ConnectSubmit);
+            loop->backend.ring_fd = ring_fd;
+            loop->backend.fatal_error.store(0, std::memory_order_release);
+        }
+        Connection& closed = loop->conns[id];
+        if (forgery != Forgery::LoopIdentity) {
+            CHECK_EQ(closed.fd, -1);
+            CHECK_EQ(closed.upstream_fd, -1);
+            CHECK_EQ(closed.response_header_buf.len(), 0u);
+            CHECK_EQ(loop->backend.send_state[id].remaining, 0u);
+            CHECK_EQ(health->fails, 3u);
+            CHECK_EQ(health->eject_until_us, 4567u);
+            CHECK_FALSE(health->active_down);
+            CHECK_EQ(closed.response_read_deadline_generation, generation_before);
+            CHECK_EQ(closed.upstream_episode, episode_before);
+            u8 byte = 0;
+            CHECK_EQ(recv(fixture.peer_fd, &byte, 1, MSG_DONTWAIT), 0);
+        }
+        __atomic_store_n(loop->backend.sq_tail, fixture.sq_tail, __ATOMIC_RELEASE);
+        loop->backend.pending = fixture.backend_pending;
+        loop->backend.send_state[id] = {};
+        loop->backend.upstream_send_state[id] = {};
+        if (closed.recv_slice != nullptr) {
+            if (closed.fd >= 0) {
+                closed.recv_armed = false;
+                closed.pending_ops = 0;
+                closed.clear_slots();
+                loop->close_conn(closed);
+            } else {
+                closed.recv_armed = false;
+                closed.send_armed = false;
+                closed.upstream_connect_armed = false;
+                closed.upstream_send_armed = false;
+                closed.upstream_recv_armed = false;
+                closed.pending_ops = 0;
+                loop->reclaim_slot(id);
+            }
         }
         close(fixture.peer_fd);
         ++cases;
     }
-    CHECK_EQ(cases, 9u);
+    CHECK_EQ(cases, 46u);
 }
 
 TEST(iouring_preconnect_failure,
@@ -20824,6 +21240,7 @@ TEST(iouring_preconnect_failure,
         ScopedIoUringLoopForRetirement guard;
         if (!guard.init()) SKIP("io_uring unavailable");
         auto* loop = guard.loop;
+        const u32 free_before = loop->free_top;
         RouteConfig config{};
         PreconnectConnectSubmitFixture fixture{};
         REQUIRE(stage_preconnect_connect_submit(loop, config, &fixture));
@@ -20834,17 +21251,27 @@ TEST(iouring_preconnect_failure,
         if (failure == Failure::Date) {
             config.failure_policies[0].date = static_cast<ForwardFailurePolicyDate>(0xff);
         }
+        const i32 ring_fd = loop->backend.ring_fd;
+        loop->backend.ring_fd = -1;
         respond_validated_preconnect_failure(
             loop, conn, ValidatedPreconnectFailureSite::ConnectSubmit);
-        const Connection& closed = loop->conns[id];
+        loop->backend.ring_fd = ring_fd;
+        loop->backend.fatal_error.store(0, std::memory_order_release);
+        __atomic_store_n(loop->backend.sq_tail, fixture.sq_tail, __ATOMIC_RELEASE);
+        loop->backend.pending = fixture.backend_pending;
+        Connection& closed = loop->conns[id];
         CHECK_EQ(closed.fd, -1);
         CHECK_EQ(closed.upstream_fd, -1);
-        CHECK_EQ(closed.pending_ops, 0u);
+        CHECK_EQ(closed.pending_ops, 2u);
         CHECK_EQ(closed.response_header_buf.len(), 0u);
         CHECK_FALSE(closed.send_armed);
         CHECK_EQ(loop->backend.send_state[id].remaining, 0u);
         u8 byte = 0;
         CHECK_EQ(recv(fixture.peer_fd, &byte, 1, MSG_DONTWAIT), 0);
+        loop->dispatch({id, -ECANCELED, 0, 0, IoEventType::Recv, 0});
+        loop->dispatch({id, -ENOENT, 0, 0, IoEventType::Recv, 0});
+        CHECK_EQ(loop->pending_free_count, 0u);
+        CHECK_EQ(loop->free_top, free_before);
         close(fixture.peer_fd);
     }
 }
@@ -20854,43 +21281,34 @@ TEST(iouring_preconnect_failure, staged_submit_false_after_flush_fails_closed_wi
     if (!guard.init()) SKIP("io_uring unavailable");
     auto* loop = guard.loop;
     RouteConfig config{};
-    REQUIRE(config.add_upstream("backend", 0x7F000001, 9000).has_value());
-    REQUIRE(add_bodyless_non_head_response_read_deadline_bundle(config));
-    REQUIRE(
-        config.add_jit_handler("/one", kRouteMethodGet, &response_read_deadline_handler, false, 2));
-    const RouteConfig* active = &config;
-    loop->config_ptr = &active;
-    Connection* conn = loop->alloc_conn();
-    REQUIRE(conn != nullptr);
-    const u32 id = conn->id;
-    i32 downstream[2] = {-1, -1};
-    REQUIRE_EQ(socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, downstream), 0);
-    conn->fd = downstream[0];
-    static constexpr u8 kRequest[] = "GET /one HTTP/1.1\r\nHost: client.example\r\n\r\n";
-    REQUIRE_EQ(conn->recv_buf.write(kRequest, sizeof(kRequest) - 1u), sizeof(kRequest) - 1u);
-    const u32 tail_before = __atomic_load_n(loop->backend.sq_tail, __ATOMIC_ACQUIRE);
-    const u32 pending_before = loop->backend.pending;
+    const u32 free_before = loop->free_top;
+    PreconnectConnectSubmitFixture fixture{};
+    REQUIRE(stage_preconnect_connect_submit(loop, config, &fixture));
+    Connection& conn = *fixture.conn;
+    const u32 id = conn.id;
     {
-        test_fault::ScopedSocketFailure socket_failure;
         test_fault::ScopedIoUringSubmitFailure submit_failure(
             /*connect_failures=*/0, /*staged_send_failures=*/2);
-        on_header_received<IoUringEventLoop>(
-            loop, *conn, {id, static_cast<i32>(sizeof(kRequest) - 1u), 0, 0, IoEventType::Recv, 0});
+        respond_validated_preconnect_failure(
+            loop, conn, ValidatedPreconnectFailureSite::ConnectSubmit);
         CHECK_EQ(test_fault::state().iouring_staged_send_submit_failures, 0);
     }
-    const Connection& closed = loop->conns[id];
+    __atomic_store_n(loop->backend.sq_tail, fixture.sq_tail, __ATOMIC_RELEASE);
+    loop->backend.pending = fixture.backend_pending;
+    Connection& closed = loop->conns[id];
     CHECK_EQ(closed.fd, -1);
     CHECK_EQ(closed.upstream_fd, -1);
-    CHECK_EQ(closed.pending_ops, 0u);
+    CHECK_EQ(closed.pending_ops, 2u);
     CHECK_FALSE(closed.send_armed);
     CHECK_EQ(closed.response_header_buf.len(), 0u);
     CHECK_EQ(loop->backend.send_state[id].remaining, 0u);
-    CHECK_EQ(__atomic_load_n(loop->backend.sq_tail, __ATOMIC_ACQUIRE), tail_before);
-    CHECK_EQ(pending_before, 1u);
-    CHECK_EQ(loop->backend.pending, 0u);
     u8 byte = 0;
-    CHECK_EQ(recv(downstream[1], &byte, 1, 0), 0);
-    close(downstream[1]);
+    CHECK_EQ(recv(fixture.peer_fd, &byte, 1, 0), 0);
+    loop->dispatch({id, -ECANCELED, 0, 0, IoEventType::Recv, 0});
+    loop->dispatch({id, -ENOENT, 0, 0, IoEventType::Recv, 0});
+    CHECK_EQ(loop->pending_free_count, 0u);
+    CHECK_EQ(loop->free_top, free_before);
+    close(fixture.peer_fd);
 }
 
 IoEvent response_read_copy_event(
