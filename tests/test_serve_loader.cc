@@ -724,7 +724,7 @@ TEST(serve_loader, unmatched_population_owns_valid_table_and_rejects_forgery_bef
     CHECK_EQ(omitted_cfg->upstream_count, 0u);
 }
 
-TEST(serve_loader, exact_strict_local_response_metadata_is_rejected_before_config_mutation) {
+TEST(serve_loader, exact_strict_local_response_metadata_installs_atomically) {
     rir::Module mod{};
     auto& policy = mod.strict_local_response_policies[0];
     policy.version = StrictLocalResponseVersion::Http11;
@@ -752,10 +752,14 @@ TEST(serve_loader, exact_strict_local_response_metadata_is_rejected_before_confi
     REQUIRE(rir::verify_module(mod).ok);
 
     auto cfg = std::make_unique<RouteConfig>();
-    CHECK_FALSE(populate_route_config(*cfg, mod));
-    CHECK_EQ(cfg->upstream_count, 0u);
+    REQUIRE(populate_route_config(*cfg, mod));
+    CHECK_EQ(cfg->upstream_count, 1u);
     CHECK_EQ(cfg->route_count, 0u);
-    CHECK_FALSE(cfg->has_unmatched_metadata());
+    REQUIRE(cfg->strict_local_response_table_is_valid());
+    CHECK(cfg->has_exact_strict_local_response_inventory());
+    CHECK_EQ(cfg->exact_strict_local_response_binding_count, 1u);
+    CHECK_EQ(cfg->match_exact_strict_local_response({"/static?x=1", 11}, kRouteMethodGet), 1u);
+    CHECK_EQ(cfg->match_exact_strict_local_response({"/static/", 8}, kRouteMethodGet), 0u);
 
     rir::Module hidden{};
     hidden.exact_strict_local_response_bindings[7].reserved1 = 1;
@@ -765,7 +769,7 @@ TEST(serve_loader, exact_strict_local_response_metadata_is_rejected_before_confi
     CHECK_EQ(hidden_cfg->route_count, 0u);
 }
 
-TEST(serve_loader, exact_strict_local_response_source_reaches_register_then_fails_closed) {
+TEST(serve_loader, exact_strict_local_response_source_reaches_runtime_config) {
     const std::string path =
         write_file("/tmp/rut_serve_loader_exact_strict_foundation",
                    "app.rut",
@@ -777,12 +781,12 @@ TEST(serve_loader, exact_strict_local_response_source_reaches_register_then_fail
 
     LoadedProgram program;
     LoadError err;
-    CHECK_FALSE(load_rut_program(path.c_str(), program, err));
-    CHECK_EQ(err.stage, LoadStage::Register);
-    CHECK_FALSE(err.has_diag);
-    CHECK_EQ(program.config.route_count, 0u);
+    REQUIRE(load_rut_program(path.c_str(), program, err));
+    CHECK_EQ(program.config.route_count, 1u);
     CHECK_EQ(program.config.upstream_count, 0u);
-    CHECK_FALSE(program.config.has_unmatched_metadata());
+    REQUIRE(program.config.strict_local_response_table_is_valid());
+    CHECK(program.config.has_exact_strict_local_response_inventory());
+    CHECK_EQ(program.config.match_exact_strict_local_response({"/static", 7}, kRouteMethodGet), 1u);
     program.destroy();
 }
 

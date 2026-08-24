@@ -1549,9 +1549,9 @@ TEST(h2_serving, unmatched_metadata_miss_fail_closes_while_omitted_and_matched_a
     CHECK_EQ(partial_miss.response_len, 0u);
     CHECK(partial_miss.close);
 
-    // #288B owns exact metadata but deliberately does not select it. Even a
-    // fully valid table closes before path matching; count-zero forged tails
-    // and out-of-range counts take the same zero-frame boundary.
+    // H2 exact matches fail closed until a strict H2 serializer exists. A raw
+    // nonmatch still reaches the existing prefix route, while invalid inventory
+    // and fragments close before staging a frame.
     auto exact = std::make_unique<RouteConfig>();
     StrictLocalResponsePolicySpec exact_policy = policy;
     exact_policy.status_code = 200;
@@ -1568,13 +1568,19 @@ TEST(h2_serving, unmatched_metadata_miss_fail_closes_while_omitted_and_matched_a
     REQUIRE(exact->install_strict_local_response_table(
         &exact_policy, 1, no_unmatched, exact_bindings, 1));
     REQUIRE(exact->strict_local_response_table_is_valid());
-    REQUIRE(exact->add_static("/static", kRouteMethodGet, 204));
+    REQUIRE(exact->add_static("/", kRouteMethodGet, 204));
     const auto exact_match = dispatch(exact.get(), "/static");
     CHECK_EQ(exact_match.response_len, 0u);
     CHECK(exact_match.close);
     const auto exact_nonmatch = dispatch(exact.get(), "/other");
-    CHECK_EQ(exact_nonmatch.response_len, 0u);
-    CHECK(exact_nonmatch.close);
+    CHECK_GT(exact_nonmatch.response_len, 0u);
+    CHECK_FALSE(exact_nonmatch.close);
+    const auto exact_child = dispatch(exact.get(), "/static/child");
+    CHECK_GT(exact_child.response_len, 0u);
+    CHECK_FALSE(exact_child.close);
+    const auto exact_fragment = dispatch(exact.get(), "/other?long=query#fragment");
+    CHECK_EQ(exact_fragment.response_len, 0u);
+    CHECK(exact_fragment.close);
 
     auto exact_tail = std::make_unique<RouteConfig>();
     exact_tail->exact_strict_local_response_bindings[15].reserved1 = 1;
@@ -1601,8 +1607,8 @@ TEST(h2_serving, unmatched_metadata_miss_fail_closes_while_omitted_and_matched_a
         &malformed_loop, &malformed_conn, malformed_response, sizeof(malformed_response), 0, false};
     const hpack::Header malformed_headers[] = {{{":method", 7}, {"GET", 3}}};
     h2_dispatch_request(malformed_dispatch, 1, malformed_headers, 1, true);
-    CHECK_EQ(malformed_dispatch.resp_len, 0u);
-    CHECK(malformed_dispatch.close_after_process);
+    CHECK_GT(malformed_dispatch.resp_len, 0u);
+    CHECK_FALSE(malformed_dispatch.close_after_process);
 }
 
 TEST(h2_serving, deferred_route_params_copied_to_stable_storage) {

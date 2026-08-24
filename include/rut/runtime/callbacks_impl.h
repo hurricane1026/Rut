@@ -458,6 +458,11 @@ void capture_request_metadata(Connection& conn);
 
 template <typename Loop>
 bool handle_configured_unmatched_response(Loop* loop, Connection& conn, const RouteConfig* config);
+template <typename Loop>
+bool handle_configured_strict_local_response(Loop* loop,
+                                             Connection& conn,
+                                             const RouteConfig* config,
+                                             u16 policy_id);
 u32 pipeline_leftover(const Connection& conn);
 bool pipeline_shift(Connection& conn);
 
@@ -536,6 +541,46 @@ inline bool ordinary_local_response_may_persist(Loop* loop,
                                                 bool terminal_baseline) {
     return terminal_baseline && !loop->is_draining() && conn.req_client_keep_alive &&
            ordinary_local_response_request_boundary_reusable(conn);
+}
+
+inline bool exact_strict_local_response_common_request_is_admitted(const Connection& conn) {
+    const auto method = static_cast<LogHttpMethod>(conn.req_method);
+    return conn.protocol == ConnProtocol::Http11 && !conn.tls_active && conn.h2 == nullptr &&
+           conn.req_strict_h1_complete &&
+           conn.req_http_version == static_cast<u8>(HttpVersion::Http11) &&
+           conn.req_path_canon.ptr != nullptr && !conn.req_target_has_fragment &&
+           !conn.req_malformed && !conn.req_wants_upgrade && !conn.req_client_has_content_length &&
+           !conn.req_client_has_transfer_encoding && !conn.req_client_has_te &&
+           !conn.req_client_has_expect && !conn.req_client_has_upgrade_header &&
+           conn.req_body_mode == BodyMode::None && conn.req_content_length == 0 &&
+           conn.req_body_remaining == 0 && !conn.request_body_fully_buffered &&
+           !conn.req_body_streamed && conn.req_header_end != 0 &&
+           conn.req_header_end == conn.req_initial_send_len &&
+           conn.req_initial_send_len == conn.recv_buf.len() &&
+           (method == LogHttpMethod::Get || method == LogHttpMethod::Head ||
+            method == LogHttpMethod::Post || method == LogHttpMethod::Options);
+}
+
+inline bool exact_strict_local_response_request_is_admitted(const Connection& conn) {
+    if (!exact_strict_local_response_common_request_is_admitted(conn)) return false;
+    if (http1_pipeline_request_is_legacy(conn)) return true;
+    const bool exact_close =
+        !conn.req_keep_alive && !conn.req_client_keep_alive && conn.req_client_connection_close &&
+        conn.req_client_connection_close_exact && conn.req_client_connection_count == 1;
+    return http1_pipeline_request_is_current_successor(conn) &&
+           conn.req_method == static_cast<u8>(LogHttpMethod::Get) && exact_close &&
+           conn.http1_pipeline_boundary_owners_settled &&
+           conn.recv_buf.len() == conn.req_initial_send_len && conn.pipeline_stash_len == 0 &&
+           conn.send_buf.len() == 0 && conn.send_progress == 0 && !conn.send_armed &&
+           conn.on_send == nullptr && conn.req_start_us != 0 && !conn.epoch_held &&
+           conn.response_read_deadline_owner_is_neutral() && conn.http1_prebuilt_wait == 0 &&
+           conn.http1_prebuilt_disposition == Http1RequestBufferDisposition::None &&
+           conn.http1_prebuilt_request_prefix_len == 0 &&
+           conn.http1_prebuilt_response_proof_is_neutral() && !conn.http1_boundary_deferred &&
+           !conn.http1_boundary_ready && conn.http1_boundary_successor_episode == 0 &&
+           !conn.upstream_episode_quarantined && http1_pipeline_successor_tombstone_is_safe(conn) &&
+           http1_pipeline_successor_upstream_owners_are_neutral(conn) &&
+           conn.retry_req_send_len == 0 && conn.upstream_attempts <= 1;
 }
 bool pipeline_stash(Connection& conn);
 bool pipeline_recover(Connection& conn);
@@ -1465,6 +1510,20 @@ void on_request_complete(Loop* loop, Connection& conn, u16 status, u32 resp_size
 
 template <typename Loop>
 void pipeline_dispatch(Loop* loop, Connection& conn) {
+    // Snapshot before transition_to_reading_header clears the previous callback
+    // slots. The remaining ledgers are checked again by the selector-time
+    // predicate after a complete successor parse; fragmented reparses retain
+    // this bit until that point.
+    conn.http1_pipeline_boundary_owners_settled =
+        conn.pipeline_depth == 1 && conn.req_start_us == 0 && !conn.epoch_held &&
+        conn.send_progress == 0 && !conn.send_armed && conn.on_send == nullptr &&
+        conn.response_read_deadline_owner_is_neutral() && conn.http1_prebuilt_wait == 0 &&
+        conn.http1_prebuilt_disposition == Http1RequestBufferDisposition::None &&
+        conn.http1_prebuilt_request_prefix_len == 0 &&
+        conn.http1_prebuilt_response_proof_is_neutral() && !conn.http1_boundary_deferred &&
+        !conn.http1_boundary_ready && conn.http1_boundary_successor_episode == 0 &&
+        !conn.upstream_episode_quarantined && http1_pipeline_successor_tombstone_is_safe(conn) &&
+        http1_pipeline_successor_upstream_owners_are_neutral(conn);
     conn.transition_to_reading_header(&on_header_received<Loop>);
     // Refresh keepalive timer — synthetic dispatch skips the normal
     // EventLoop::dispatch() which calls timer.refresh().
@@ -1479,6 +1538,7 @@ void on_header_received(void* lp, Connection& conn, IoEvent ev) {
     auto* loop = static_cast<Loop*>(lp);
     // Slot: on_recv. dispatch_event guarantees ev.type == Recv.
     conn.send_progress = 0;
+    if (conn.pipeline_depth == 0) conn.http1_pipeline_boundary_owners_settled = false;
 
     if (ev.result <= 0) {
         loop->close_conn(conn);
@@ -1601,8 +1661,6 @@ void on_header_received(void* lp, Connection& conn, IoEvent ev) {
     conn.response_mutations_snapshotted = false;
     conn.req_body_streamed = false;
     if (loop->capture_ring) capture_stage_headers(conn);
-    loop->epoch_enter();
-    if (loop->metrics) loop->metrics->on_request_start();
 
     const bool kKeepAlive = !loop->is_draining();
     conn.keep_alive = kKeepAlive;
@@ -1614,14 +1672,29 @@ void on_header_received(void* lp, Connection& conn, IoEvent ev) {
     // different upstream table.
     const RouteConfig* config = loop->config_ptr ? *loop->config_ptr : nullptr;
     conn.request_config = config;
-    // #288B ownership fence. Exact metadata is fully owned but deliberately
-    // behavior-inactive until the selector/serializer activation increment.
-    // Treat every inventory shape (including partial/forged tails) alike and
-    // close before firewall, built-in endpoints, routing, or response bytes.
-    if (config && config->has_exact_strict_local_response_inventory()) {
+    const bool has_strict_inventory =
+        config != nullptr && config->has_strict_local_response_table_inventory();
+    const bool has_exact_inventory =
+        config != nullptr && config->has_exact_strict_local_response_inventory();
+    // Invalid/partial public metadata is globally terminal before request
+    // accounting or any response publication.  An active exact table also
+    // requires a complete origin-form HTTP/1.1 request and the full-target
+    // fragment witness before either exact selection or canonical fallback.
+    if ((has_strict_inventory && !config->strict_local_response_table_is_valid()) ||
+        (has_exact_inventory && (!conn.req_strict_h1_complete ||
+                                 conn.req_http_version != static_cast<u8>(HttpVersion::Http11) ||
+                                 conn.req_path_canon.ptr == nullptr ||
+                                 conn.req_target_has_fragment || conn.req_malformed))) {
+        // The request timestamp is provisionally captured before config pin,
+        // but this fence deliberately precedes epoch/metrics acquisition.
+        // Clear it so close_conn does not publish a matching epoch leave or
+        // active-request decrement for ownership that was never acquired.
+        conn.req_start_us = 0;
         loop->close_conn(conn);
         return;
     }
+    loop->epoch_enter();
+    if (loop->metrics) loop->metrics->on_request_start();
     if (config && !config->firewall_allows_peer(conn.peer_addr, conn.peer_port)) {
         conn.resp_status = 403;
         format_static_response(conn, 403, /*keep_alive=*/false);
@@ -1679,6 +1752,22 @@ void on_header_received(void* lp, Connection& conn, IoEvent ev) {
     u32 route_param_count = 0;
     if (config) {
         const u8 kMethodKey = route_method_key(static_cast<LogHttpMethod>(conn.req_method));
+        u32 raw_target_len = 0;
+        while (raw_target_len < sizeof(conn.req_path) && conn.req_path[raw_target_len] != '\0')
+            raw_target_len++;
+        const u16 exact_policy_id = has_exact_inventory
+                                        ? config->match_exact_strict_local_response(
+                                              Str{conn.req_path, raw_target_len}, kMethodKey)
+                                        : 0;
+        if (exact_policy_id != 0) {
+            if (!exact_strict_local_response_request_is_admitted(conn)) {
+                loop->close_conn(conn);
+                return;
+            }
+            conn.http1_pipeline_boundary_owners_settled = false;
+            (void)handle_configured_strict_local_response(loop, conn, config, exact_policy_id);
+            return;
+        }
         // Use the parser-supplied canonical view (PR #50 round 7 path A)
         // to skip the redundant canon scan and the strlen-style scan
         // over conn.req_path. The parser only populates path_canon for
@@ -2087,6 +2176,7 @@ void on_response_sent(void* lp, Connection& conn, IoEvent ev) {
         return;
     }
     conn.pipeline_depth = 0;
+    conn.http1_pipeline_boundary_owners_settled = false;
     conn.recv_buf.reset();
     conn.transition_to_reading_header(&on_header_received<Loop>);
     if (!loop->submit_recv(conn)) loop->close_conn(conn);
@@ -5922,6 +6012,7 @@ void proxy_stream_complete(Loop* loop, Connection& conn) {
         return;
     }
     conn.pipeline_depth = 0;
+    conn.http1_pipeline_boundary_owners_settled = false;
     conn.recv_buf.reset();
     conn.transition_to_reading_header(&on_header_received<Loop>);
     loop->submit_recv(conn);
@@ -7383,17 +7474,17 @@ inline bool build_failure_policy_response_from_spec(const Connection& conn,
 }
 
 template <typename Loop>
-bool handle_configured_unmatched_response(Loop* loop, Connection& conn, const RouteConfig* config) {
-    if (config == nullptr || !config->has_unmatched_metadata()) return false;
-
+bool handle_configured_strict_local_response(Loop* loop,
+                                             Connection& conn,
+                                             const RouteConfig* config,
+                                             u16 policy_id) {
     auto fail_closed = [&]() {
-        // No serializer/buffer mutation and no upstream effect precedes this
-        // point, so every invalid/partial request/config shape closes with zero
-        // response bytes.
         loop->close_conn(conn);
         return true;
     };
-    if (!config->unmatched_policy_table_is_valid() || !conn.req_strict_h1_complete ||
+    if (config == nullptr || !config->strict_local_response_table_is_valid() ||
+        !config->strict_local_response_policy_id_is_owned(policy_id) ||
+        !conn.req_strict_h1_complete ||
         conn.req_http_version != static_cast<u8>(HttpVersion::Http11) || conn.req_malformed ||
         conn.req_header_end == 0 || conn.req_header_end > conn.recv_buf.len())
         return fail_closed();
@@ -7405,10 +7496,6 @@ bool handle_configured_unmatched_response(Loop* loop, Connection& conn, const Ro
         method_key >= kStrictLocalResponseMethodSlots)
         return fail_closed();
 
-    u16 policy_id = config->unmatched_policy_ids[method_key];
-    if (policy_id == 0) policy_id = config->unmatched_policy_ids[kRouteMethodAny];
-    if (policy_id == 0) return false;
-    if (!config->strict_local_response_policy_id_is_owned(policy_id)) return fail_closed();
     const auto& policy = config->strict_local_response_policies[policy_id - 1];
     const bool is_head = method == LogHttpMethod::Head;
     if ((is_head && policy.head_mode != StrictLocalResponseHeadMode::SuppressBody) ||
@@ -7433,6 +7520,26 @@ bool handle_configured_unmatched_response(Loop* loop, Connection& conn, const Ro
     conn.transition_to_sending(&on_response_sent<Loop>);
     client_send(loop, conn, conn.send_buf.data(), conn.send_buf.len());
     return true;
+}
+
+template <typename Loop>
+bool handle_configured_unmatched_response(Loop* loop, Connection& conn, const RouteConfig* config) {
+    if (config == nullptr || !config->has_unmatched_metadata()) return false;
+    if (!config->strict_local_response_table_is_valid()) {
+        loop->close_conn(conn);
+        return true;
+    }
+    const auto method = static_cast<LogHttpMethod>(conn.req_method);
+    const u8 method_key = route_method_key(method);
+    if (method == LogHttpMethod::Other || method_key == kRouteMethodInvalid ||
+        method_key == kRouteMethodAny || method_key >= kStrictLocalResponseMethodSlots) {
+        loop->close_conn(conn);
+        return true;
+    }
+    u16 policy_id = config->unmatched_policy_ids[method_key];
+    if (policy_id == 0) policy_id = config->unmatched_policy_ids[kRouteMethodAny];
+    if (policy_id == 0) return false;
+    return handle_configured_strict_local_response(loop, conn, config, policy_id);
 }
 
 inline bool build_failure_policy_response(const Connection& conn,
@@ -7879,6 +7986,7 @@ void on_validated_preconnect_failure_sent(void* lp, Connection& conn, IoEvent ev
         return;
     }
     conn.pipeline_depth = 0;
+    conn.http1_pipeline_boundary_owners_settled = false;
     conn.recv_buf.reset();
     conn.transition_to_reading_header(&on_header_received<Loop>);
     if (!loop->submit_recv(conn)) loop->close_conn(conn);
@@ -9300,6 +9408,7 @@ void continue_http1_request_boundary(Loop* loop, Connection& conn) {
         return;
     }
     conn.pipeline_depth = 0;
+    conn.http1_pipeline_boundary_owners_settled = false;
     conn.recv_buf.reset();
     conn.transition_to_reading_header(&on_header_received<Loop>);
     loop->submit_recv(conn);

@@ -970,11 +970,15 @@ void h2_dispatch_request(H2Dispatch<Loop>& d,
                          bool end_stream) {
     if (d.close_after_process) return;
     const RouteConfig* config = d.conn->request_config;
-    // #288B ownership fence. No exact selector is active yet. Close before
-    // header conversion (and its malformed-400 path), firewall, routing, or
-    // frame staging; the outer process path observes close_after_process and
-    // publishes none of this batch's response bytes.
-    if (config && config->has_exact_strict_local_response_inventory()) {
+    const bool has_strict_inventory =
+        config != nullptr && config->has_strict_local_response_table_inventory();
+    const bool has_exact_inventory =
+        config != nullptr && config->has_exact_strict_local_response_inventory();
+    // Public metadata integrity is global and precedes malformed-header 400,
+    // firewall, or any frame publication. Exact H2 serialization is not yet an
+    // admitted capability: a valid raw match closes with zero bytes below,
+    // while an unambiguous nonmatch continues through the legacy selector.
+    if (has_strict_inventory && !config->strict_local_response_table_is_valid()) {
         d.close_after_process = true;
         d.resp_len = 0;
         d.overflow = false;
@@ -983,6 +987,12 @@ void h2_dispatch_request(H2Dispatch<Loop>& d,
     // A prepared Forward waiting to learn whether its open request stream is
     // actually empty owns both pending_synth and the connection mutation log.
     if (d.conn->h2->pending_prepared_forward) {
+        if (has_exact_inventory) {
+            d.close_after_process = true;
+            d.resp_len = 0;
+            d.overflow = false;
+            return;
+        }
         h2_emit_status(d, stream_id, 503);
         return;
     }
@@ -992,7 +1002,19 @@ void h2_dispatch_request(H2Dispatch<Loop>& d,
     if (d.conn->h2->async_stream == 0) h2_reset_request_mutations(*d.conn);
     ParsedRequest req;
     if (!h2_headers_to_request(headers, nheaders, &req)) {
+        if (has_exact_inventory && req.target_has_fragment) {
+            d.close_after_process = true;
+            d.resp_len = 0;
+            d.overflow = false;
+            return;
+        }
         h2_emit_status(d, stream_id, 400);
+        return;
+    }
+    if (has_exact_inventory && req.target_has_fragment) {
+        d.close_after_process = true;
+        d.resp_len = 0;
+        d.overflow = false;
         return;
     }
     if (end_stream && req.has_content_length && req.content_length != 0) {
@@ -1029,6 +1051,13 @@ void h2_dispatch_request(H2Dispatch<Loop>& d,
     }
 
     const u8 kMethodKey = route_method_key(req.method);
+    if (has_exact_inventory &&
+        config->match_exact_strict_local_response(req.path, kMethodKey) != 0) {
+        d.close_after_process = true;
+        d.resp_len = 0;
+        d.overflow = false;
+        return;
+    }
     RouteParam params[kMaxRouteParams]{};
     u32 param_count = 0;
     const RouteEntry* route =

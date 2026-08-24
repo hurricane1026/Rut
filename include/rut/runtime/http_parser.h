@@ -77,6 +77,10 @@ struct ParsedRequest {
     bool upgrade_is_websocket;  // the Upgrade: token is specifically "websocket"
     bool connection_close;      // a Connection: close token was seen (sticky across
                                 // duplicate Connection fields — suppresses upgrade)
+    // Full raw request-target witness. Unlike path_canon and Connection::req_path,
+    // this is computed before any canonicalization or bounded copy, so a '#'
+    // after a long query remains visible to exact-route safety checks.
+    bool target_has_fragment;
 
     void reset() {
         method = HttpMethod::Unknown;
@@ -93,6 +97,7 @@ struct ParsedRequest {
         has_upgrade_header = false;
         upgrade_is_websocket = false;
         connection_close = false;
+        target_has_fragment = false;
     }
 };
 

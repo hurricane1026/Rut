@@ -620,6 +620,32 @@ struct RouteConfig {
                strict_local_response_table_is_valid();
     }
 
+    // Raw origin-form exact lookup. Query bytes are outside the selector; no
+    // canonicalization is performed. Callers separately enforce the mandatory
+    // full-target fragment witness before invoking this helper.
+    u16 match_exact_strict_local_response(Str raw_target, u8 method_key) const {
+        if (!strict_local_response_table_is_valid() || raw_target.ptr == nullptr ||
+            raw_target.len == 0 || raw_target.ptr[0] != '/' || method_key == kRouteMethodInvalid ||
+            method_key == kRouteMethodAny ||
+            route_method_slot_from_key(method_key) == kRouteMethodSlotInvalid)
+            return 0;
+        auto match_method = [&](u8 wanted) -> u16 {
+            for (u32 i = 0; i < exact_strict_local_response_binding_count; i++) {
+                const auto& binding = exact_strict_local_response_bindings[i];
+                if (binding.method != wanted || raw_target.len < binding.path_len) continue;
+                bool equal = true;
+                for (u32 byte = 0; byte < binding.path_len; byte++)
+                    equal &= raw_target.ptr[byte] == binding.path[byte];
+                if (!equal) continue;
+                if (raw_target.len == binding.path_len || raw_target.ptr[binding.path_len] == '?')
+                    return binding.policy_id;
+            }
+            return 0;
+        };
+        const u16 exact = match_method(method_key);
+        return exact != 0 ? exact : match_method(kRouteMethodAny);
+    }
+
     bool strict_local_response_policy_id_is_owned(u16 id) const {
         if (id == 0 || id > strict_local_response_policy_count ||
             strict_local_response_policy_count > kMaxStrictLocalResponsePolicies ||

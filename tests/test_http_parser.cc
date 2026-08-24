@@ -1,6 +1,7 @@
 #include "rut/runtime/http_parser.h"
 #include "rut/runtime/simd/simd.h"
 #include "test.h"
+#include <string>
 
 #include <string.h>
 
@@ -4092,6 +4093,31 @@ TEST(PathCanon, non_origin_form_leaves_canon_null) {
     CHECK_EQ(static_cast<u8>(s3), static_cast<u8>(ParseStatus::Complete));
     CHECK(req.path_canon.ptr != nullptr);
     CHECK_EQ(req.path_canon.len, 0u);
+}
+
+TEST(request_parser, full_target_fragment_witness_survives_long_query_and_resets) {
+    HttpParser parser;
+    ParsedRequest req;
+    std::string raw = "GET /static?";
+    raw.append(96, 'x');
+    raw += "#fragment HTTP/1.1\r\nHost: x\r\n\r\n";
+    parser.reset();
+    REQUIRE_EQ(
+        parser.parse(reinterpret_cast<const u8*>(raw.data()), static_cast<u32>(raw.size()), &req),
+        ParseStatus::Complete);
+    CHECK(req.target_has_fragment);
+    CHECK(req.path_canon.eq({"static", 6}));
+
+    parser.reset();
+    REQUIRE_EQ(parse_one("GET /static?x=1 HTTP/1.1\r\nHost: x\r\n\r\n", &req, &parser),
+               ParseStatus::Complete);
+    CHECK_FALSE(req.target_has_fragment);
+
+    parser.reset();
+    const char malformed[] = "GET /static#fragment HTTP/1.1\r\nBroken\r\n\r\n";
+    CHECK_EQ(parser.parse(reinterpret_cast<const u8*>(malformed), sizeof(malformed) - 1, &req),
+             ParseStatus::Error);
+    CHECK(req.target_has_fragment);
 }
 
 // A response with exactly kMaxHeaders fields is fully stored and NOT flagged

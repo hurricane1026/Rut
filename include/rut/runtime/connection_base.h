@@ -868,11 +868,18 @@ struct ConnectionBase {
     // remains the chain/reassembly counter).  Foundation only: existing runtime
     // guards deliberately do not consume this token yet.
     u32 http1_pipeline_request_generation;
+    // Snapshot taken at the synthetic request boundary before
+    // transition_to_reading_header replaces the previous callback slots. It is
+    // retained across fragmented depth-one reparses and consumed only by the
+    // bounded exact local-response successor predicate.
+    bool http1_pipeline_boundary_owners_settled;
 
     void copy_http1_pipeline_state_from(const ConnectionBase& source) {
         pipeline_depth = source.pipeline_depth;
         pipeline_stash_len = source.pipeline_stash_len;
         http1_pipeline_request_generation = source.http1_pipeline_request_generation;
+        http1_pipeline_boundary_owners_settled = source.http1_pipeline_boundary_owners_settled;
+        req_target_has_fragment = source.req_target_has_fragment;
     }
 
     // Body streaming state (proxy large body support)
@@ -935,6 +942,9 @@ struct ConnectionBase {
     // HTTP/1.0 or HTTP/1.1 header block. Fallback method/path recovery never
     // publishes it.
     bool req_strict_h1_complete;
+    // Full raw request-target fragment witness for the current request. This is
+    // deliberately independent of the bounded req_path copy and canonical view.
+    bool req_target_has_fragment;
     // Request-side keep-alive intent of the CURRENT request, as parsed from its
     // request line + Connection header (HTTP/1.1 default true, HTTP/1.0 default
     // false, "Connection: close" → false). The proxy forwards the client's
@@ -1272,6 +1282,7 @@ struct ConnectionBase {
         pipeline_depth = 0;
         pipeline_stash_len = 0;
         http1_pipeline_request_generation = 0;
+        http1_pipeline_boundary_owners_settled = false;
         req_header_end = 0;
         req_content_length = 0;
         req_initial_send_len = 0;
@@ -1295,6 +1306,7 @@ struct ConnectionBase {
         failure_policy_suppress_body = false;
         req_http_version = 255;
         req_strict_h1_complete = false;
+        req_target_has_fragment = false;
         req_keep_alive = false;
         req_client_keep_alive = false;
         req_client_connection_close = false;

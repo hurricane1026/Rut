@@ -93,6 +93,7 @@ u8 parse_log_method_fallback(const u8* data, u32 len, u32* method_len) {
 
 void capture_request_metadata(Connection& conn) {
     conn.req_strict_h1_complete = false;
+    conn.req_target_has_fragment = false;
     conn.req_method = static_cast<u8>(LogHttpMethod::Other);
     conn.req_size = conn.recv_buf.len();
     conn.req_path[0] = '/';
@@ -143,7 +144,9 @@ void capture_request_metadata(Connection& conn) {
     HttpParser parser;
     ParsedRequest req;
     parser.reset();
-    if (parser.parse(data, kLen, &req) == ParseStatus::Complete) {
+    const ParseStatus parse_status = parser.parse(data, kLen, &req);
+    conn.req_target_has_fragment = req.target_has_fragment;
+    if (parse_status == ParseStatus::Complete) {
         conn.req_header_end = parser.header_end;
         conn.req_http_version = static_cast<u8>(req.version);
         // Require BOTH Connection: upgrade and an Upgrade header — Connection is

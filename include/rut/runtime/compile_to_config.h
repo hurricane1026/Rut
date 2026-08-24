@@ -249,13 +249,6 @@ inline bool populate_route_config(RouteConfig& cfg, const rir::Module& mod) {
     // Bodies / header sets / routes must always start empty — there's
     // no "merge" semantics for those tables, and a non-zero count
     // would break the compile-time body_idx / headers_idx invariants.
-    // Increment #288A establishes compiler metadata only. Refuse even a valid
-    // inventory until RouteConfig owns and atomically installs exact bindings.
-    // Scan the entire fixed array so a forged count of zero cannot hide a tail.
-    if (exact_strict_local_response_inventory_present(
-            mod.exact_strict_local_response_bindings,
-            mod.exact_strict_local_response_binding_count))
-        return false;
     if (!rir::verify_module(mod).ok) return false;
     if (cfg.route_count != 0 || cfg.response_body_count != 0 ||
         cfg.response_header_set_count != 0 || cfg.response_policy_count != 0 ||
@@ -353,21 +346,28 @@ inline bool populate_route_config(RouteConfig& cfg, const rir::Module& mod) {
         if (ref.count > RouteConfig::kMaxHeadersPerSet) return false;
     }
 
-    // Probe, validate, deduplicate, and own a configured unmatched table before
+    // Probe, validate, deduplicate, and own the complete strict local-response table before
     // the first destination mutation. This keeps malformed/capacity/OOM
     // rejection transactional even though the legacy population helper permits
     // unrelated later failures to leave a discardable partial config. The
     // metadata-absent legacy path performs no new allocation or commit.
-    bool source_has_unmatched_metadata = mod.strict_local_response_policy_count != 0;
+    bool source_has_strict_local_response_metadata =
+        mod.strict_local_response_policy_count != 0 ||
+        exact_strict_local_response_inventory_present(
+            mod.exact_strict_local_response_bindings,
+            mod.exact_strict_local_response_binding_count);
     for (u32 slot = 0; slot < kStrictLocalResponseMethodSlots; slot++)
-        source_has_unmatched_metadata |= mod.unmatched_policy_ids[slot] != 0;
-    std::unique_ptr<RouteConfig> unmatched_probe;
-    if (source_has_unmatched_metadata) {
-        unmatched_probe.reset(new (std::nothrow) RouteConfig());
-        if (!unmatched_probe ||
-            !unmatched_probe->install_unmatched_policy_table(mod.strict_local_response_policies,
-                                                             mod.strict_local_response_policy_count,
-                                                             mod.unmatched_policy_ids))
+        source_has_strict_local_response_metadata |= mod.unmatched_policy_ids[slot] != 0;
+    std::unique_ptr<RouteConfig> strict_local_response_probe;
+    if (source_has_strict_local_response_metadata) {
+        strict_local_response_probe.reset(new (std::nothrow) RouteConfig());
+        if (!strict_local_response_probe ||
+            !strict_local_response_probe->install_strict_local_response_table(
+                mod.strict_local_response_policies,
+                mod.strict_local_response_policy_count,
+                mod.unmatched_policy_ids,
+                mod.exact_strict_local_response_bindings,
+                mod.exact_strict_local_response_binding_count))
             return false;
     }
 
@@ -537,7 +537,8 @@ inline bool populate_route_config(RouteConfig& cfg, const rir::Module& mod) {
         return false;
     // Every strict-table failure was exhausted before mutation. Commit the
     // already-owned staged table by bounded copy/rebase without allocation.
-    if (unmatched_probe && !cfg.copy_unmatched_policy_table_from_owned(*unmatched_probe))
+    if (strict_local_response_probe &&
+        !cfg.copy_strict_local_response_table_from_owned(*strict_local_response_probe))
         return false;
     return true;
 }

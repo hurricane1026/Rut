@@ -735,6 +735,14 @@ TEST(route_config, exact_strict_table_dedups_remaps_owns_copies_and_rolls_back_a
     CHECK_EQ(installed->exact_strict_local_response_binding_count, 2u);
     CHECK_EQ(installed->exact_strict_local_response_bindings[0].policy_id, 1u);
     CHECK_EQ(installed->exact_strict_local_response_bindings[1].policy_id, 1u);
+    CHECK_EQ(installed->match_exact_strict_local_response({"/static", 7}, kRouteMethodGet), 1u);
+    CHECK_EQ(installed->match_exact_strict_local_response({"/static?x=1", 11}, kRouteMethodGet),
+             1u);
+    CHECK_EQ(installed->match_exact_strict_local_response({"/static/", 8}, kRouteMethodGet), 0u);
+    CHECK_EQ(installed->match_exact_strict_local_response({"/static/child", 13}, kRouteMethodGet),
+             0u);
+    CHECK_EQ(installed->match_exact_strict_local_response({"//static", 8}, kRouteMethodGet), 0u);
+    CHECK_EQ(installed->match_exact_strict_local_response({"/static", 7}, kRouteMethodPost), 0u);
 
     reason.assign("xxxxx");
     type.assign("xxxxxxxxxx");
@@ -842,6 +850,20 @@ TEST(route_config, exact_strict_runtime_validator_rejects_every_binding_forgery_
     method_plus_any->exact_strict_local_response_bindings[1] = any;
     method_plus_any->exact_strict_local_response_binding_count = 2;
     CHECK(method_plus_any->strict_local_response_table_is_valid());
+
+    StrictLocalResponsePolicySpec precedence_policies[2] = {
+        valid->strict_local_response_policies[0], valid->strict_local_response_policies[0]};
+    precedence_policies[1].status_code = 405;
+    precedence_policies[1].head_mode = StrictLocalResponseHeadMode::SuppressBody;
+    ExactStrictLocalResponseBinding precedence_bindings[kMaxExactStrictLocalResponseBindings]{};
+    precedence_bindings[0] = exact_local_binding("/priority", kRouteMethodGet, 1);
+    precedence_bindings[1] = exact_local_binding("/priority", kRouteMethodAny, 2);
+    u16 precedence_unmatched[kStrictLocalResponseMethodSlots]{};
+    auto precedence = std::make_unique<RouteConfig>();
+    REQUIRE(precedence->install_strict_local_response_table(
+        precedence_policies, 2, precedence_unmatched, precedence_bindings, 2));
+    CHECK_EQ(precedence->match_exact_strict_local_response({"/priority", 9}, kRouteMethodGet), 1u);
+    CHECK_EQ(precedence->match_exact_strict_local_response({"/priority", 9}, kRouteMethodPost), 2u);
 }
 
 int main(int argc, char** argv) {

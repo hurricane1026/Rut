@@ -380,6 +380,7 @@ ParseStatus HttpParser::parse(const u8* buf, u32 len, ParsedRequest* req) {
         if (UNLIKELY(uri_end >= len)) goto maybe_incomplete;
         if (UNLIKELY(uri_end == uri_start)) return ParseStatus::Error;
         req->path = {reinterpret_cast<const char*>(buf + uri_start), uri_end - uri_start};
+        for (u32 i = uri_start; i < uri_end; i++) req->target_has_fragment |= buf[i] == '#';
         if (buf[uri_start] == '/') {
             req->path_canon = finalize_path_canonical(
                 reinterpret_cast<const char*>(buf + uri_start), canon_end - uri_start);

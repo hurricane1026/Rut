@@ -9546,6 +9546,14 @@ static std::string expected_representation200_wire(bool keep_alive, bool suppres
     return wire;
 }
 
+static bool install_representation200_exact(RouteConfig& config, const char* path) {
+    const auto policy = make_representation200_policy();
+    u16 unmatched[kStrictLocalResponseMethodSlots]{};
+    ExactStrictLocalResponseBinding exact[kMaxExactStrictLocalResponseBindings]{};
+    exact[0] = make_exact_local_binding(path, kRouteMethodAny, 1);
+    return config.install_strict_local_response_table(&policy, 1, unmatched, exact, 1);
+}
+
 static u32 unmatched_h2_outer_hit_calls = 0;
 static u64 unmatched_h2_outer_hit_handler(void*, jit::HandlerCtx*, const u8*, u32, void*) {
     unmatched_h2_outer_hit_calls++;
@@ -9618,8 +9626,8 @@ TEST(unmatched_local_response, exact_any_precedence_matched_wins_and_no_slot_leg
                        6));
 }
 
-TEST(exact_local_response_inactive,
-     h1_valid_partial_reload_firewall_and_metrics_close_before_external_effects) {
+TEST(exact_local_response,
+     h1_raw_selector_query_fallback_firewall_and_invalid_inventory_are_fail_closed) {
     SmallLoop loop;
     loop.setup();
     ShardMetrics metrics{};
@@ -9635,16 +9643,120 @@ TEST(exact_local_response_inactive,
     REQUIRE(loop.set_capture(&capture));
 
     auto valid = std::make_unique<RouteConfig>();
-    REQUIRE(valid->add_static("/static", kRouteMethodGet, 204));
-    REQUIRE(valid->add_firewall_deny_ip("0.0.0.0"));
+    REQUIRE(valid->add_static("/", kRouteMethodGet, 204));
     const auto policy = make_representation200_policy();
+    const StrictLocalResponsePolicySpec policies[2] = {policy, policy};
     u16 unmatched[kStrictLocalResponseMethodSlots]{};
     ExactStrictLocalResponseBinding exact[kMaxExactStrictLocalResponseBindings]{};
     exact[0] = make_exact_local_binding("/static", kRouteMethodGet, 1);
-    REQUIRE(valid->install_strict_local_response_table(&policy, 1, unmatched, exact, 1));
+    exact[1] = make_exact_local_binding("/static", kRouteMethodAny, 2);
+    REQUIRE(valid->install_strict_local_response_table(policies, 2, unmatched, exact, 2));
     REQUIRE(valid->strict_local_response_table_is_valid());
 
-    auto closes_without_effect = [&](RouteConfig& config, const char* request) {
+    auto dispatch_and_finish = [&](RouteConfig& config,
+                                   const char* request,
+                                   u16 expected_status,
+                                   bool expected_exact,
+                                   bool suppress_body = false) {
+        loop.backend.clear_ops();
+        Connection* conn = dispatch_unmatched_request(loop, config, request);
+        REQUIRE(conn != nullptr);
+        CHECK_EQ(conn->resp_status, expected_status);
+        CHECK_EQ(loop.backend.count_ops(MockOp::Send), 1u);
+        CHECK_EQ(loop.backend.count_ops(MockOp::Connect), 0u);
+        if (expected_exact) {
+            u8 normalized[SmallLoop::kBufSize]{};
+            REQUIRE(conn->send_buf.len() <= sizeof(normalized));
+            __builtin_memcpy(normalized, conn->send_buf.data(), conn->send_buf.len());
+            REQUIRE(normalize_redirect_date(normalized, conn->send_buf.len()));
+            const std::string expected = expected_representation200_wire(false, suppress_body);
+            REQUIRE_EQ(conn->send_buf.len(), static_cast<u32>(expected.size()));
+            CHECK_EQ(__builtin_memcmp(normalized, expected.data(), expected.size()), 0);
+        }
+        const u32 wire_len = conn->send_buf.len();
+        loop.inject_and_dispatch(make_ev(conn->id, IoEventType::Send, static_cast<i32>(wire_len)));
+    };
+    dispatch_and_finish(
+        *valid, "GET /static HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n", 200, true);
+    dispatch_and_finish(
+        *valid, "HEAD /static HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n", 200, true, true);
+    dispatch_and_finish(
+        *valid, "POST /static HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n", 200, true);
+    dispatch_and_finish(
+        *valid, "OPTIONS /static HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n", 200, true);
+    dispatch_and_finish(
+        *valid, "GET /static?x=1 HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n", 200, true);
+    dispatch_and_finish(
+        *valid, "GET /static/ HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n", 204, false);
+    dispatch_and_finish(
+        *valid, "GET /static/child HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n", 204, false);
+
+    // Sequential keep-alive GET followed by a close HEAD remains depth zero;
+    // both methods use the exact table and the shared strict serializer.
+    loop.backend.clear_ops();
+    Connection* sequential =
+        dispatch_unmatched_request(loop, *valid, "GET /static HTTP/1.1\r\nHost: x\r\n\r\n");
+    REQUIRE(sequential != nullptr);
+    REQUIRE(sequential->keep_alive);
+    const u32 first_len = sequential->send_buf.len();
+    loop.inject_and_dispatch(
+        make_ev(sequential->id, IoEventType::Send, static_cast<i32>(first_len)));
+    REQUIRE_EQ(sequential->state, ConnState::ReadingHeader);
+    static constexpr char kSequentialHead[] =
+        "HEAD /static HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n";
+    REQUIRE_EQ(sequential->recv_buf.write(reinterpret_cast<const u8*>(kSequentialHead),
+                                          sizeof(kSequentialHead) - 1),
+               sizeof(kSequentialHead) - 1);
+    const RouteConfig* sequential_config = valid.get();
+    loop.config_ptr = &sequential_config;
+    on_header_received<SmallLoop>(
+        &loop,
+        *sequential,
+        make_ev(sequential->id, IoEventType::Recv, static_cast<i32>(sizeof(kSequentialHead) - 1)));
+    REQUIRE_EQ(sequential->resp_status, 200u);
+    REQUIRE_FALSE(sequential->keep_alive);
+    loop.config_ptr = nullptr;
+    const u32 head_len = sequential->send_buf.len();
+    loop.inject_and_dispatch(
+        make_ev(sequential->id, IoEventType::Send, static_cast<i32>(head_len)));
+
+    // The exact response may be request2 only after the normal response
+    // boundary has proven old owners settled and published the current depth-1
+    // generation. No upstream episode is fabricated for the local successor.
+    loop.backend.clear_ops();
+    Connection* coalesced = loop.alloc_conn();
+    REQUIRE(coalesced != nullptr);
+    coalesced->fd = 77;
+    const u32 coalesced_id = coalesced->id;
+    static constexpr char kCoalesced[] =
+        "GET /first HTTP/1.1\r\nHost: x\r\n\r\n"
+        "GET /static HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n";
+    REQUIRE_EQ(
+        coalesced->recv_buf.write(reinterpret_cast<const u8*>(kCoalesced), sizeof(kCoalesced) - 1),
+        sizeof(kCoalesced) - 1);
+    const RouteConfig* coalesced_config = valid.get();
+    loop.config_ptr = &coalesced_config;
+    on_header_received<SmallLoop>(
+        &loop,
+        *coalesced,
+        make_ev(coalesced_id, IoEventType::Recv, static_cast<i32>(sizeof(kCoalesced) - 1)));
+    REQUIRE_EQ(coalesced->resp_status, 204u);
+    const u32 first_response_len = coalesced->send_buf.len();
+    loop.inject_and_dispatch(
+        make_ev(coalesced_id, IoEventType::Send, static_cast<i32>(first_response_len)));
+    REQUIRE_EQ(coalesced->resp_status, 200u);
+    CHECK_EQ(coalesced->pipeline_depth, 1u);
+    CHECK_EQ(coalesced->http1_pipeline_request_generation, coalesced->handler_gen);
+    CHECK_FALSE(coalesced->http1_pipeline_boundary_owners_settled);
+    CHECK_EQ(loop.backend.count_ops(MockOp::Connect), 0u);
+    const u32 exact_successor_len = coalesced->send_buf.len();
+    loop.inject_and_dispatch(
+        make_ev(coalesced_id, IoEventType::Send, static_cast<i32>(exact_successor_len)));
+    loop.config_ptr = nullptr;
+
+    auto closes_without_effect = [&](RouteConfig& config,
+                                     const char* request,
+                                     u64 expected_epoch_delta) {
         loop.backend.clear_ops();
         const u32 free_before = loop.free_top;
         const u64 requests_before = metrics.requests_total;
@@ -9655,24 +9767,39 @@ TEST(exact_local_response_inactive,
         CHECK_EQ(loop.backend.count_ops(MockOp::Connect), 0u);
         CHECK_EQ(metrics.requests_total, requests_before);
         CHECK_EQ(metrics.requests_active, 0u);
-        CHECK_EQ(access.available(), 0u);
-        CHECK_EQ(capture.available(), 0u);
-        CHECK_EQ(epoch.epoch.load(std::memory_order_acquire), epoch_before + 2);
+        CHECK_EQ(epoch.epoch.load(std::memory_order_acquire), epoch_before + expected_epoch_delta);
     };
-    closes_without_effect(*valid, "GET /static HTTP/1.1\r\nHost: x\r\n\r\n");
-    closes_without_effect(*valid, "GET /metrics HTTP/1.1\r\nHost: x\r\n\r\n");
-    closes_without_effect(*valid, "POST /static HTTP/1.1\r\nHost: x\r\nContent-Length: 1\r\n\r\nx");
-    closes_without_effect(*valid, "GET /static HTTP/1.1\r\nBroken\r\n\r\n");
+    closes_without_effect(
+        *valid,
+        "GET /static?aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        "#fragment HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n",
+        0);
+    closes_without_effect(
+        *valid, "POST /static HTTP/1.1\r\nHost: x\r\nContent-Length: 1\r\n\r\nx", 2);
+    closes_without_effect(*valid, "GET /static HTTP/1.1\r\nBroken\r\n\r\n", 0);
+
+    // A depth-zero exact response does not silently acquire ownership of a
+    // coalesced successor. The depth-one admission below is a separate proven
+    // request-boundary contract.
+    closes_without_effect(
+        *valid, "GET /static HTTP/1.1\r\nHost: x\r\n\r\nGET /next HTTP/1.1\r\nHost: x\r\n\r\n", 2);
+
+    auto firewall = std::make_unique<RouteConfig>();
+    REQUIRE(firewall->copy_strict_local_response_table_from_owned(*valid));
+    REQUIRE(firewall->add_static("/", kRouteMethodGet, 204));
+    REQUIRE(firewall->add_firewall_deny_ip("0.0.0.0"));
+    dispatch_and_finish(
+        *firewall, "GET /static HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n", 403, false);
 
     auto forged_tail = std::make_unique<RouteConfig>();
     forged_tail->exact_strict_local_response_bindings[15].reserved1 = 1;
     CHECK(forged_tail->has_exact_strict_local_response_inventory());
-    closes_without_effect(*forged_tail, "POST /miss HTTP/1.1\r\nHost: x\r\n\r\n");
+    closes_without_effect(*forged_tail, "POST /miss HTTP/1.1\r\nHost: x\r\n\r\n", 0);
 
     auto forged_count = std::make_unique<RouteConfig>();
     forged_count->exact_strict_local_response_binding_count =
         kMaxExactStrictLocalResponseBindings + 1;
-    closes_without_effect(*forged_count, "GET /miss HTTP/1.1\r\nHost: x\r\n\r\n");
+    closes_without_effect(*forged_count, "GET /miss HTTP/1.1\r\nHost: x\r\n\r\n", 0);
 
     auto omitted = std::make_unique<RouteConfig>();
     const RouteConfig* active = valid.get();
@@ -9688,6 +9815,139 @@ TEST(exact_local_response_inactive,
     REQUIRE(legacy != nullptr);
     CHECK_EQ(legacy->resp_status, 200u);
     CHECK_EQ(loop.backend.count_ops(MockOp::Send), 1u);
+}
+
+TEST(exact_local_response, depth_one_matching_exclusions_fail_before_second_response) {
+    static constexpr const char* kRejected[] = {
+        "GET /static HTTP/1.1\r\nHost: x\r\n\r\n",
+        "POST /static HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n",
+        "GET /static HTTP/1.1\r\nHost: x\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+        "GET /static HTTP/1.1\r\nHost: x\r\nConnection: close, keep-alive\r\n\r\n",
+        ("GET /static HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n"
+         "GET /third HTTP/1.1\r\nHost: x\r\n\r\n"),
+    };
+    for (const char* rejected : kRejected) {
+        SmallLoop loop;
+        loop.setup();
+        RouteConfig config{};
+        REQUIRE(install_representation200_exact(config, "/static"));
+        REQUIRE(config.add_static("/", kRouteMethodGet, 204));
+        const RouteConfig* active = &config;
+        loop.config_ptr = &active;
+        Connection* conn = loop.alloc_conn();
+        REQUIRE(conn != nullptr);
+        conn->fd = 88;
+        static constexpr char kFirst[] = "GET /first HTTP/1.1\r\nHost: x\r\n\r\n";
+        REQUIRE_EQ(conn->recv_buf.write(reinterpret_cast<const u8*>(kFirst), sizeof(kFirst) - 1),
+                   sizeof(kFirst) - 1);
+        const u32 rejected_len = static_cast<u32>(strlen(rejected));
+        REQUIRE_EQ(conn->recv_buf.write(reinterpret_cast<const u8*>(rejected), rejected_len),
+                   rejected_len);
+        const u32 id = conn->id;
+        on_header_received<SmallLoop>(
+            &loop,
+            *conn,
+            make_ev(id, IoEventType::Recv, static_cast<i32>(sizeof(kFirst) - 1 + rejected_len)));
+        REQUIRE_EQ(conn->resp_status, 204u);
+        const u32 response1_len = conn->send_buf.len();
+        loop.inject_and_dispatch(make_ev(id, IoEventType::Send, static_cast<i32>(response1_len)));
+        CHECK_EQ(loop.conns[id].fd, -1);
+        CHECK_EQ(loop.backend.count_ops(MockOp::Connect), 0u);
+    }
+}
+
+TEST(exact_local_response,
+     provenance_overwrites_preserves_fragmented_reparse_and_consumes_on_dispatch) {
+    SmallLoop loop;
+    loop.setup();
+    RouteConfig config{};
+    REQUIRE(install_representation200_exact(config, "/static"));
+    const RouteConfig* active = &config;
+    loop.config_ptr = &active;
+    Connection* conn = loop.alloc_conn();
+    REQUIRE(conn != nullptr);
+    conn->fd = 89;
+    conn->pipeline_depth = 1;
+    conn->http1_pipeline_boundary_owners_settled = false;
+    static constexpr char kPartial[] = "GET /static HTTP/1.1\r\nHost: x\r\nConnection: close\r\n";
+    REQUIRE_EQ(conn->recv_buf.write(reinterpret_cast<const u8*>(kPartial), sizeof(kPartial) - 1),
+               sizeof(kPartial) - 1);
+
+    // pipeline_dispatch is the only writer of true. The incomplete parse then
+    // re-enters ReadingHeader without replacing that old-boundary provenance.
+    pipeline_dispatch<SmallLoop>(&loop, *conn);
+    REQUIRE_GE(conn->fd, 0);
+    CHECK(conn->http1_pipeline_boundary_owners_settled);
+    CHECK_EQ(conn->http1_pipeline_request_generation, 0u);
+    CHECK_EQ(conn->state, ConnState::ReadingHeader);
+
+    static constexpr char kEnd[] = "\r\n";
+    REQUIRE_EQ(conn->recv_buf.write(reinterpret_cast<const u8*>(kEnd), sizeof(kEnd) - 1),
+               sizeof(kEnd) - 1);
+    on_header_received<SmallLoop>(
+        &loop, *conn, make_ev(conn->id, IoEventType::Recv, static_cast<i32>(sizeof(kEnd) - 1)));
+    REQUIRE_GE(conn->fd, 0);
+    CHECK_EQ(conn->http1_pipeline_request_generation, conn->handler_gen);
+    CHECK_FALSE(conn->http1_pipeline_boundary_owners_settled);
+    CHECK_EQ(conn->resp_status, 200u);
+    CHECK_FALSE(conn->keep_alive);
+    const u32 response_len = conn->send_buf.len();
+    loop.inject_and_dispatch(make_ev(conn->id, IoEventType::Send, static_cast<i32>(response_len)));
+
+    Connection* depth_zero = loop.alloc_conn();
+    REQUIRE(depth_zero != nullptr);
+    depth_zero->fd = 90;
+    depth_zero->http1_pipeline_boundary_owners_settled = true;
+    static constexpr char kDepthZero[] =
+        "GET /other HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n";
+    REQUIRE_EQ(
+        depth_zero->recv_buf.write(reinterpret_cast<const u8*>(kDepthZero), sizeof(kDepthZero) - 1),
+        sizeof(kDepthZero) - 1);
+    on_header_received<SmallLoop>(
+        &loop,
+        *depth_zero,
+        make_ev(depth_zero->id, IoEventType::Recv, static_cast<i32>(sizeof(kDepthZero) - 1)));
+    CHECK_FALSE(depth_zero->http1_pipeline_boundary_owners_settled);
+}
+
+TEST(exact_local_response, provenance_half_set_and_stale_combinations_fail_closed) {
+    Connection conn{};
+    u8 recv[512]{}, send[512]{}, upstream[512]{}, response[512]{};
+    conn.reset();
+    conn.recv_slice = recv;
+    conn.send_slice = send;
+    conn.upstream_recv_slice = upstream;
+    conn.response_header_slice = response;
+    conn.recv_buf.bind(recv, sizeof(recv));
+    conn.send_buf.bind(send, sizeof(send));
+    conn.upstream_recv_buf.bind(upstream, sizeof(upstream));
+    conn.response_header_buf.bind(response, sizeof(response));
+    static constexpr char kRequest[] =
+        "GET /static HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n";
+    REQUIRE_EQ(conn.recv_buf.write(reinterpret_cast<const u8*>(kRequest), sizeof(kRequest) - 1),
+               sizeof(kRequest) - 1);
+    capture_request_metadata(conn);
+    conn.pipeline_depth = 1;
+    conn.handler_gen = 17;
+    conn.http1_pipeline_request_generation = 17;
+    conn.http1_pipeline_boundary_owners_settled = true;
+    conn.req_start_us = 1;
+    REQUIRE(exact_strict_local_response_request_is_admitted(conn));
+
+    conn.http1_pipeline_boundary_owners_settled = false;
+    CHECK_FALSE(exact_strict_local_response_request_is_admitted(conn));
+    conn.http1_pipeline_boundary_owners_settled = true;
+    conn.http1_pipeline_request_generation = 16;
+    CHECK_FALSE(exact_strict_local_response_request_is_admitted(conn));
+    conn.http1_pipeline_request_generation = 17;
+    conn.pipeline_depth = 0;
+    CHECK_FALSE(exact_strict_local_response_request_is_admitted(conn));
+    conn.pipeline_depth = 2;
+    CHECK_FALSE(exact_strict_local_response_request_is_admitted(conn));
+
+    conn.reset();
+    CHECK_FALSE(conn.http1_pipeline_boundary_owners_settled);
+    CHECK_EQ(conn.http1_pipeline_request_generation, 0u);
 }
 
 TEST(unmatched_local_response, connect_exact_and_strict_gate_fail_closed_without_effects) {
@@ -10237,7 +10497,9 @@ TEST(unmatched_local_response, h2_outer_callback_closes_and_discards_the_complet
     REQUIRE(
         partial->add_jit_handler("/hit", kRouteMethodGet, &unmatched_h2_outer_hit_handler, false));
     partial->unmatched_policy_ids[kRouteMethodOptions] = 1;
-    run(*partial, "/hit", true, true, 0, 1);
+    // Partial strict metadata is a global integrity failure, so the first
+    // stream closes before the otherwise matching JIT handler can run.
+    run(*partial, "/hit", true, true, 0, 0);
 
     auto exact_inactive = std::make_unique<RouteConfig>();
     u16 no_unmatched[kStrictLocalResponseMethodSlots]{};
@@ -10726,22 +10988,30 @@ TEST(pipeline, request_generation_token_rejects_handler_wrap_and_resets) {
     CHECK_EQ(conn->http1_pipeline_request_generation, 0u);
 
     conn->http1_pipeline_request_generation = 37;
+    conn->http1_pipeline_boundary_owners_settled = true;
+    conn->req_target_has_fragment = true;
     conn->reset();
     CHECK_EQ(conn->http1_pipeline_request_generation, 0u);
+    CHECK_FALSE(conn->http1_pipeline_boundary_owners_settled);
+    CHECK_FALSE(conn->req_target_has_fragment);
 }
 
-TEST(pipeline, simulation_state_copy_preserves_request_generation_token) {
+TEST(pipeline, simulation_state_copy_preserves_generation_boundary_and_fragment_witness) {
     ConnectionBase source{};
     source.reset();
     source.pipeline_depth = 1;
     source.pipeline_stash_len = 19;
     source.http1_pipeline_request_generation = 41;
+    source.http1_pipeline_boundary_owners_settled = true;
+    source.req_target_has_fragment = true;
     ConnectionBase destination{};
     destination.reset();
     destination.copy_http1_pipeline_state_from(source);
     CHECK_EQ(destination.pipeline_depth, 1u);
     CHECK_EQ(destination.pipeline_stash_len, 19u);
     CHECK_EQ(destination.http1_pipeline_request_generation, 41u);
+    CHECK(destination.http1_pipeline_boundary_owners_settled);
+    CHECK(destination.req_target_has_fragment);
 }
 
 // Exact single request — pipeline_leftover returns 0.
@@ -21568,7 +21838,7 @@ void cleanup_coalesced_phase1_fixture(IoUringEventLoop* loop,
 }
 
 TEST(response_read_deadline_coalesced_get_phase1,
-     configured_preconnect_failures_preserve_successor_for_live_and_terminal_recv) {
+     configured_preconnect_failures_dispatch_exact_successor_for_live_and_terminal_recv) {
     enum class Site : u8 { SocketCreate, ConnectSubmit, ConnectCompletion };
     static constexpr u8 kSuccessor[] =
         "GET /two HTTP/1.1\r\nHost: successor.example\r\nConnection: close\r\n\r\n";
@@ -21592,6 +21862,12 @@ TEST(response_read_deadline_coalesced_get_phase1,
             loop->access_log = &access_log;
             REQUIRE(loop->set_capture(&capture));
             RouteConfig config{};
+            const auto exact_policy = make_representation200_policy();
+            u16 no_unmatched[kStrictLocalResponseMethodSlots]{};
+            ExactStrictLocalResponseBinding exact[kMaxExactStrictLocalResponseBindings]{};
+            exact[0] = make_exact_local_binding("/two", kRouteMethodGet, 1);
+            REQUIRE(config.install_strict_local_response_table(
+                &exact_policy, 1, no_unmatched, exact, 1));
             CoalescedPhase1ArmedFixture fixture{};
             REQUIRE(stage_coalesced_phase1_preconnect(
                 loop, config, kSuccessor, sizeof(kSuccessor) - 1u, &fixture));
@@ -21648,11 +21924,18 @@ TEST(response_read_deadline_coalesced_get_phase1,
             loop->backend.send_state[id].remaining = 0;
             loop->dispatch({id, static_cast<i32>(response1_len), 0, 0, IoEventType::Send, 0});
             REQUIRE_GE(conn.fd, 0);
-            CHECK_EQ(conn.resp_status, 204u);
+            CHECK_EQ(conn.resp_status, 200u);
             CHECK_EQ(conn.pipeline_depth, 1u);
             CHECK_EQ(conn.recv_buf.len(), sizeof(kSuccessor) - 1u);
             CHECK_EQ(__builtin_memcmp(conn.recv_buf.data(), kSuccessor, sizeof(kSuccessor) - 1u),
                      0);
+            u8 normalized[SmallLoop::kBufSize]{};
+            REQUIRE(conn.send_buf.len() <= sizeof(normalized));
+            __builtin_memcpy(normalized, conn.send_buf.data(), conn.send_buf.len());
+            REQUIRE(normalize_redirect_date(normalized, conn.send_buf.len()));
+            const std::string expected = expected_representation200_wire(false, false);
+            REQUIRE_EQ(conn.send_buf.len(), static_cast<u32>(expected.size()));
+            CHECK_EQ(__builtin_memcmp(normalized, expected.data(), expected.size()), 0);
             CHECK_EQ(metrics.requests_total, 1u);
             CHECK_EQ(metrics.requests_active, 1u);
             CHECK_EQ(epoch.epoch.load(std::memory_order_acquire), 3u);
@@ -21671,10 +21954,10 @@ TEST(response_read_deadline_coalesced_get_phase1,
             CHECK_EQ(epoch.epoch.load(std::memory_order_acquire), 4u);
             AccessLogEntry access2{};
             REQUIRE(access_log.pop(access2));
-            CHECK_EQ(access2.status, 204u);
+            CHECK_EQ(access2.status, 200u);
             CaptureEntry capture2{};
             REQUIRE(capture.pop(capture2));
-            CHECK_EQ(capture2.resp_status, 204u);
+            CHECK_EQ(capture2.resp_status, 200u);
             AccessLogEntry no_access{};
             CaptureEntry no_capture{};
             CHECK_FALSE(access_log.pop(no_access));
@@ -21803,6 +22086,7 @@ TEST(response_read_deadline_coalesced_get_phase1,
     if (!guard.init()) SKIP("io_uring unavailable");
     auto* loop = guard.loop;
     RouteConfig config{};
+    REQUIRE(install_representation200_exact(config, "/two"));
     REQUIRE(config.add_upstream("backend", 0x7F000001, 9000).has_value());
     REQUIRE(add_bodyless_non_head_response_read_deadline_bundle(
         config, 5, ForwardResponseBufferingMode::CompleteContentLength));
@@ -21817,7 +22101,8 @@ TEST(response_read_deadline_coalesced_get_phase1,
     REQUIRE_EQ(socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, downstream), 0);
     conn->fd = downstream[0];
     static constexpr u8 kRequest1[] = "GET /one HTTP/1.1\r\nHost: client.example\r\n\r\n";
-    static constexpr u8 kSuccessor[] = "GET /two HTTP/1.1\r\nHost: client.example\r\n\r\n";
+    static constexpr u8 kSuccessor[] =
+        "GET /two HTTP/1.1\r\nHost: client.example\r\nConnection: close\r\n\r\n";
     REQUIRE_EQ(conn->recv_buf.write(kRequest1, sizeof(kRequest1) - 1u), sizeof(kRequest1) - 1u);
     REQUIRE_EQ(conn->recv_buf.write(kSuccessor, sizeof(kSuccessor) - 1u), sizeof(kSuccessor) - 1u);
     const u32 sq_tail = __atomic_load_n(loop->backend.sq_tail, __ATOMIC_ACQUIRE);
@@ -21888,10 +22173,17 @@ TEST(response_read_deadline_coalesced_get_phase1,
     drain_prebuilt_d2_retirement(loop, *conn, kUpstreamOpRecv, false);
     REQUIRE(conn->http1_boundary_ready);
     loop->resume_deferred_http1_boundaries();
-    REQUIRE_EQ(conn->resp_status, 204u);
+    REQUIRE_EQ(conn->resp_status, 200u);
     CHECK_EQ(conn->pipeline_depth, 1u);
     CHECK_EQ(conn->recv_buf.len(), sizeof(kSuccessor) - 1u);
     CHECK_EQ(__builtin_memcmp(conn->recv_buf.data(), kSuccessor, sizeof(kSuccessor) - 1u), 0);
+    u8 normalized[SmallLoop::kBufSize]{};
+    REQUIRE(conn->send_buf.len() <= sizeof(normalized));
+    __builtin_memcpy(normalized, conn->send_buf.data(), conn->send_buf.len());
+    REQUIRE(normalize_redirect_date(normalized, conn->send_buf.len()));
+    const std::string expected = expected_representation200_wire(false, false);
+    REQUIRE_EQ(conn->send_buf.len(), static_cast<u32>(expected.size()));
+    CHECK_EQ(__builtin_memcmp(normalized, expected.data(), expected.size()), 0);
 
     __atomic_store_n(loop->backend.sq_tail, sq_tail, __ATOMIC_RELEASE);
     loop->backend.pending = backend_pending;
@@ -21919,6 +22211,7 @@ TEST(response_read_deadline_coalesced_get_phase1,
         if (!guard.init()) SKIP("io_uring unavailable");
         auto* loop = guard.loop;
         RouteConfig config{};
+        REQUIRE(install_representation200_exact(config, "/two"));
         CoalescedPhase1ArmedFixture fixture{};
         REQUIRE(stage_coalesced_phase1_armed(
             loop, config, kSuccessor, sizeof(kSuccessor) - 1u, &fixture));
@@ -21963,12 +22256,19 @@ TEST(response_read_deadline_coalesced_get_phase1,
             }
             if (test == Case::Success) {
                 REQUIRE_GE(conn.fd, 0);
-                CHECK_EQ(conn.resp_status, 204u);
+                CHECK_EQ(conn.resp_status, 200u);
                 CHECK_EQ(conn.pipeline_depth, 1u);
                 CHECK_EQ(conn.pipeline_stash_len, 0u);
                 CHECK_EQ(conn.recv_buf.len(), sizeof(kSuccessor) - 1u);
                 CHECK_EQ(
                     __builtin_memcmp(conn.recv_buf.data(), kSuccessor, sizeof(kSuccessor) - 1u), 0);
+                u8 normalized[SmallLoop::kBufSize]{};
+                REQUIRE(conn.send_buf.len() <= sizeof(normalized));
+                __builtin_memcpy(normalized, conn.send_buf.data(), conn.send_buf.len());
+                REQUIRE(normalize_redirect_date(normalized, conn.send_buf.len()));
+                const std::string expected = expected_representation200_wire(false, false);
+                REQUIRE_EQ(conn.send_buf.len(), static_cast<u32>(expected.size()));
+                CHECK_EQ(__builtin_memcmp(normalized, expected.data(), expected.size()), 0);
             } else {
                 CHECK_EQ(loop->conns[id].fd, -1);
             }
@@ -21977,7 +22277,7 @@ TEST(response_read_deadline_coalesced_get_phase1,
             u8 byte = 0;
             CHECK_EQ(recv(fixture.peer_fd, &byte, 1, MSG_DONTWAIT), 0);
         } else if (test != Case::Success) {
-            CHECK_NE(conn.resp_status, 204u);
+            CHECK_NE(conn.resp_status, 200u);
             CHECK_EQ(conn.pipeline_depth, 0u);
         }
         cleanup_coalesced_phase1_fixture(loop, fixture);
@@ -21997,6 +22297,7 @@ TEST(response_read_deadline_coalesced_get_phase1,
         metrics.init();
         loop->metrics = &metrics;
         RouteConfig config{};
+        REQUIRE(install_representation200_exact(config, "/two"));
         CoalescedPhase1ArmedFixture fixture{};
         REQUIRE(stage_coalesced_phase1_armed(loop, config, kStart, sizeof(kStart) - 1u, &fixture));
         Connection& conn = *fixture.conn;
@@ -22040,7 +22341,7 @@ TEST(response_read_deadline_coalesced_get_phase1,
         REQUIRE(conn.http1_boundary_ready);
         loop->resume_deferred_http1_boundaries();
         REQUIRE_GE(conn.fd, 0);
-        CHECK_EQ(conn.resp_status, 204u);
+        CHECK_EQ(conn.resp_status, 200u);
         CHECK_EQ(conn.pipeline_depth, 1u);
         CHECK_EQ(conn.recv_buf.len(), request2_len);
         CHECK_EQ(__builtin_memcmp(conn.recv_buf.data(), kStart, stash_len), 0);
@@ -22049,6 +22350,13 @@ TEST(response_read_deadline_coalesced_get_phase1,
                  0);
         CHECK_EQ(metrics.requests_total, 1u);
         CHECK_EQ(metrics.requests_active, 1u);
+        u8 normalized[SmallLoop::kBufSize]{};
+        REQUIRE(conn.send_buf.len() <= sizeof(normalized));
+        __builtin_memcpy(normalized, conn.send_buf.data(), conn.send_buf.len());
+        REQUIRE(normalize_redirect_date(normalized, conn.send_buf.len()));
+        const std::string expected = expected_representation200_wire(false, false);
+        REQUIRE_EQ(conn.send_buf.len(), static_cast<u32>(expected.size()));
+        CHECK_EQ(__builtin_memcmp(normalized, expected.data(), expected.size()), 0);
         const u32 response2_len = conn.send_buf.len();
         loop->backend.send_state[id].remaining = 0;
         loop->dispatch({id, static_cast<i32>(response2_len), 0, 0, IoEventType::Send, 0});
@@ -22057,6 +22365,65 @@ TEST(response_read_deadline_coalesced_get_phase1,
         CHECK_EQ(loop->conns[id].fd, -1);
         cleanup_coalesced_phase1_fixture(loop, fixture);
     }
+}
+
+TEST(response_read_deadline_coalesced_get_phase1,
+     positive_content_length_header_body_retirement_dispatches_exact_successor) {
+    ScopedIoUringLoopForRetirement guard;
+    if (!guard.init()) SKIP("io_uring unavailable");
+    auto* loop = guard.loop;
+    RouteConfig config{};
+    REQUIRE(install_representation200_exact(config, "/two"));
+    static constexpr u8 kSuccessor[] =
+        "GET /two HTTP/1.1\r\nHost: successor.example\r\nConnection: close\r\n\r\n";
+    static constexpr u8 kOrigin[] = "HTTP/1.1 200 OK\r\nContent-Length: 4\r\n\r\nabcd";
+    CoalescedPhase1ArmedFixture fixture{};
+    REQUIRE(
+        stage_coalesced_phase1_armed(loop, config, kSuccessor, sizeof(kSuccessor) - 1u, &fixture));
+    Connection& conn = *fixture.conn;
+    const u32 id = conn.id;
+
+    REQUIRE_EQ(conn.upstream_recv_buf.write(kOrigin, sizeof(kOrigin) - 1u), sizeof(kOrigin) - 1u);
+    const IoEvent response =
+        response_read_copy_event(conn, sizeof(kOrigin) - 1u, true, 0, sizeof(kOrigin) - 1u);
+    loop->dispatch_batch(&response, 1);
+    REQUIRE_GE(conn.fd, 0);
+    REQUIRE_EQ(conn.response_read_deadline_post_commit_phase,
+               ResponseReadDeadlinePostCommitPhase::HeaderSend);
+    REQUIRE(conn.upstream_retirement_active);
+
+    IoEvent header = exact_response_deadline_send_event(loop, conn);
+    loop->dispatch_batch(&header, 1);
+    REQUIRE_GE(conn.fd, 0);
+    REQUIRE_EQ(conn.response_read_deadline_post_commit_phase,
+               ResponseReadDeadlinePostCommitPhase::BodySend);
+    IoEvent body = exact_response_deadline_send_event(loop, conn);
+    loop->dispatch_batch(&body, 1);
+    REQUIRE(conn.http1_boundary_deferred);
+    REQUIRE(conn.upstream_retirement_active);
+    REQUIRE_GT(conn.response_header_buf.len(), 0u);
+
+    drain_prebuilt_d2_retirement(loop, conn, kUpstreamOpRecv, false);
+    REQUIRE(conn.http1_boundary_ready);
+    loop->resume_deferred_http1_boundaries();
+    REQUIRE_GE(conn.fd, 0);
+    CHECK_EQ(conn.resp_status, 200u);
+    CHECK_EQ(conn.pipeline_depth, 1u);
+    CHECK_EQ(conn.http1_pipeline_request_generation, conn.handler_gen);
+    CHECK_FALSE(conn.http1_pipeline_boundary_owners_settled);
+    u8 normalized[SmallLoop::kBufSize]{};
+    REQUIRE(conn.send_buf.len() <= sizeof(normalized));
+    __builtin_memcpy(normalized, conn.send_buf.data(), conn.send_buf.len());
+    REQUIRE(normalize_redirect_date(normalized, conn.send_buf.len()));
+    const std::string expected = expected_representation200_wire(false, false);
+    REQUIRE_EQ(conn.send_buf.len(), static_cast<u32>(expected.size()));
+    CHECK_EQ(__builtin_memcmp(normalized, expected.data(), expected.size()), 0);
+
+    const u32 exact_len = conn.send_buf.len();
+    loop->backend.send_state[id].remaining = 0;
+    loop->dispatch({id, static_cast<i32>(exact_len), 0, 0, IoEventType::Send, 0});
+    CHECK_EQ(loop->conns[id].fd, -1);
+    cleanup_coalesced_phase1_fixture(loop, fixture);
 }
 
 TEST(response_read_deadline_coalesced_get_phase1,
@@ -24388,6 +24755,68 @@ TEST(iouring_validated_failure_pipeline,
 
         cleanup_late_failure_fixture(loop, fixture);
     }
+}
+
+TEST(iouring_validated_failure_pipeline,
+     connect_completion_late_arrival_dispatches_exact_close_successor) {
+    ScopedBackendHealthReset health_reset{};
+    ScopedIoUringLoopForRetirement guard;
+    if (!guard.init()) SKIP("io_uring unavailable");
+    auto* loop = guard.loop;
+    ShardMetrics metrics{};
+    metrics.init();
+    loop->metrics = &metrics;
+    RouteConfig config{};
+    REQUIRE(install_representation200_exact(config, "/two"));
+    PreconnectConnectSubmitFixture fixture{};
+    u32 failed_episode = 0;
+    REQUIRE(stage_late_failure_response(loop,
+                                        config,
+                                        LateFailureSite::ConnectCompletion,
+                                        AsyncConnectFailureProfile::BodylessGet,
+                                        &fixture,
+                                        &failed_episode));
+    REQUIRE(config.add_static("/two", kRouteMethodGet, 204));
+    Connection& conn = *fixture.conn;
+    const u32 id = conn.id;
+    static constexpr u8 kSuccessor[] =
+        "GET /two HTTP/1.1\r\nHost: client.example\r\nConnection: close\r\n\r\n";
+
+    // Publication of request1's configured response already owns Send. Only
+    // now does request2 arrive through the still-live downstream Recv owner.
+    REQUIRE(conn.send_armed);
+    REQUIRE_EQ(conn.recv_buf.write(kSuccessor, sizeof(kSuccessor) - 1u), sizeof(kSuccessor) - 1u);
+    __atomic_store_n(loop->backend.sq_tail, fixture.sq_tail, __ATOMIC_RELEASE);
+    loop->backend.pending = fixture.backend_pending;
+    const u32 response1_len = conn.response_header_buf.len();
+    loop->backend.send_state[id].remaining = 0;
+    loop->dispatch({id, static_cast<i32>(response1_len), 0, 0, IoEventType::Send, 0});
+
+    REQUIRE_GE(conn.fd, 0);
+    CHECK_EQ(conn.resp_status, 200u);
+    CHECK_EQ(conn.pipeline_depth, 1u);
+    CHECK_EQ(conn.http1_pipeline_request_generation, conn.handler_gen);
+    CHECK_FALSE(conn.keep_alive);
+    CHECK_EQ(conn.upstream_attempts, 1u);
+    CHECK_EQ(conn.upstream_retiring_episode, failed_episode);
+    CHECK_FALSE(conn.upstream_connect_armed);
+    CHECK_FALSE(conn.upstream_send_armed);
+    CHECK_FALSE(conn.upstream_recv_armed);
+    u8 normalized[SmallLoop::kBufSize]{};
+    REQUIRE(conn.send_buf.len() <= sizeof(normalized));
+    __builtin_memcpy(normalized, conn.send_buf.data(), conn.send_buf.len());
+    REQUIRE(normalize_redirect_date(normalized, conn.send_buf.len()));
+    const std::string expected = expected_representation200_wire(false, false);
+    REQUIRE_EQ(conn.send_buf.len(), static_cast<u32>(expected.size()));
+    CHECK_EQ(__builtin_memcmp(normalized, expected.data(), expected.size()), 0);
+
+    const u32 response2_len = conn.send_buf.len();
+    loop->backend.send_state[id].remaining = 0;
+    loop->dispatch({id, static_cast<i32>(response2_len), 0, 0, IoEventType::Send, 0});
+    CHECK_EQ(loop->conns[id].fd, -1);
+    CHECK_EQ(metrics.requests_total, 2u);
+    CHECK_EQ(metrics.requests_active, 0u);
+    cleanup_late_failure_fixture(loop, fixture);
 }
 
 TEST(iouring_validated_failure_pipeline,
