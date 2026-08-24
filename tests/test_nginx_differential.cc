@@ -6343,6 +6343,433 @@ static bool run_strict_local_response_differential(
     return true;
 }
 
+struct ExactStrictRouteSideObservation {
+    std::vector<std::vector<char>> wires;
+    std::vector<std::vector<char>> upstream_history;
+    u32 upstream_accepts = 0;
+    u32 upstream_requests = 0;
+    u32 upstream_response_sends = 0;
+};
+
+struct ExactStrictRouteDifferentialObservation {
+    ExactStrictRouteSideObservation nginx;
+    ExactStrictRouteSideObservation rut;
+};
+
+static void dump_exact_strict_route_side(const char* side,
+                                         const ExactStrictRouteSideObservation& observation) {
+    static constexpr const char* kLabels[] = {
+        "GET /static",
+        "HEAD /static",
+        "POST /static",
+        "OPTIONS /static",
+        "GET /static?x=1",
+        "GET /static/ fallback",
+        "GET /static/child fallback",
+        "GET /other fallback",
+    };
+    std::cerr << side << " exact-route upstream accepts=" << observation.upstream_accepts
+              << " requests=" << observation.upstream_requests
+              << " response-sends=" << observation.upstream_response_sends << "\n";
+    for (size_t i = 0; i < observation.wires.size(); i++) {
+        const std::string label =
+            std::string(side) + " " +
+            (i < sizeof(kLabels) / sizeof(kLabels[0]) ? kLabels[i] : "unexpected vector");
+        dump_wire(label.c_str(), observation.wires[i]);
+    }
+    for (size_t i = 0; i < observation.upstream_history.size(); i++) {
+        const std::string label = std::string(side) + " upstream history " + std::to_string(i + 1);
+        dump_wire(label.c_str(), observation.upstream_history[i]);
+    }
+}
+
+static bool run_exact_strict_route_differential(
+    u16 frontend_port,
+    u16 backend_port,
+    TempDir& temp,
+    const std::string& container_name,
+    const char* rut_path,
+    ExactStrictRouteDifferentialObservation& observation,
+    std::string& error) {
+    if (rut_path == nullptr || rut_path[0] != '/' || access(rut_path, X_OK) != 0) {
+        error = "exact strict-route differential requires an executable absolute RUT path";
+        return false;
+    }
+
+    // The root proxy is intentionally declared first. This is generic RUT
+    // capability evidence: the ordinary source below is hand-authored and is
+    // never passed through nginx::parse or converter lowering. #286 remains the
+    // separate nginx-model/converter increment.
+    const std::string nginx_config =
+        "error_log stderr notice;\n"
+        "events {}\n"
+        "http {\n  server {\n    listen " +
+        std::to_string(frontend_port) +
+        ";\n"
+        "    location / { proxy_pass http://127.0.0.1:" +
+        std::to_string(backend_port) +
+        "; }\n"
+        "    location = /static { return 200 \"successor-static\"; }\n"
+        "  }\n}\n";
+    const std::string rut_source =
+        "listen :" + std::to_string(frontend_port) + "\n" +
+        "upstream backend at \"127.0.0.1:" + std::to_string(backend_port) + "\"\n" +
+        R"rut(route GET "/" {
+  return forward(backend,
+    request_policy: { version: "HTTP/1.1", host: "upstream", connection: "omit",
+      strip_headers: ["Connection", "Keep-Alive", "TE", "Expect", "Upgrade"] },
+    response_policy: { version: "HTTP/1.1", framing: "content_length",
+      connection: "request", server: "nginx/1.29.7", date: "current",
+      hide_headers: ["Date", "Server", "X-Pad"] },
+    failure_policy: { version: "HTTP/1.1", status: 502, reason: "Bad Gateway",
+      content_type: "text/html", server: "nginx/1.29.7", date: "current",
+      connection: "request", head_mode: "reject",
+      body: b"<html>\r\n<head><title>502 Bad Gateway</title></head>\r\n<body>\r\n<center><h1>502 Bad Gateway</h1></center>\r\n<hr><center>nginx/1.29.7</center>\r\n</body>\r\n</html>\r\n" },
+    timeout_failure_policy: { version: "HTTP/1.1", status: 504,
+      reason: "Gateway Time-out", content_type: "text/html",
+      server: "nginx/1.29.7", date: "current", connection: "request",
+      head_mode: "reject",
+      body: b"<html>\r\n<head><title>504 Gateway Time-out</title></head>\r\n<body>\r\n<center><h1>504 Gateway Time-out</h1></center>\r\n<hr><center>nginx/1.29.7</center>\r\n</body>\r\n</html>\r\n" },
+    response_read_timeout: 60s,
+    response_buffering: "complete_content_length")
+}
+route exact "/static" { return local_response({
+  version: "HTTP/1.1", status: 200, reason: "OK", server: "nginx/1.29.7",
+  date: "current", content_type: "text/plain", connection: "request",
+  head_mode: "suppress_body", body: b"successor-static"
+}) }
+)rut";
+    if (rut_source.find("route exact \"/static\"") == std::string::npos ||
+        rut_source.find("route exact GET \"/static\"") != std::string::npos ||
+        rut_source.find("return forward(backend") == std::string::npos) {
+        error = "hand-authored ordinary RUT source lost its exact-ANY/root-forward shape";
+        return false;
+    }
+    if (!write_file(temp.nginx_config, nginx_config.data(), nginx_config.size()) ||
+        !write_file(temp.source, rut_source.data(), rut_source.size())) {
+        error = "failed to write exact strict-route differential inputs";
+        return false;
+    }
+
+    static constexpr char kSlashRequest[] =
+        "GET /static/ HTTP/1.1\r\n"
+        "Host: exact-local.example\r\n"
+        "Connection: close\r\n"
+        "X-D3-Vector: slash\r\n\r\n";
+    static constexpr char kChildRequest[] =
+        "GET /static/child HTTP/1.1\r\n"
+        "Host: exact-local.example\r\n"
+        "Connection: close\r\n"
+        "X-D3-Vector: child\r\n\r\n";
+    static constexpr char kOtherRequest[] =
+        "GET /other HTTP/1.1\r\n"
+        "Host: exact-local.example\r\n"
+        "Connection: close\r\n"
+        "X-D3-Vector: other\r\n\r\n";
+    static constexpr struct Vector {
+        const char* name;
+        const char* request;
+        size_t request_len;
+        const char* expected;
+        bool head;
+        bool local;
+    } kVectors[] = {
+        {"GET /static",
+         kExactLocalGetCloseRequest,
+         sizeof(kExactLocalGetCloseRequest) - 1u,
+         kExactLocalCloseResponseNormalized,
+         false,
+         true},
+        {"HEAD /static",
+         kExactLocalHeadCloseRequest,
+         sizeof(kExactLocalHeadCloseRequest) - 1u,
+         kExactLocalHeadCloseResponseNormalized,
+         true,
+         true},
+        {"POST /static",
+         kExactLocalPostCloseRequest,
+         sizeof(kExactLocalPostCloseRequest) - 1u,
+         kExactLocalCloseResponseNormalized,
+         false,
+         true},
+        {"OPTIONS /static",
+         kExactLocalOptionsCloseRequest,
+         sizeof(kExactLocalOptionsCloseRequest) - 1u,
+         kExactLocalCloseResponseNormalized,
+         false,
+         true},
+        {"GET /static?x=1",
+         kExactLocalQueryCloseRequest,
+         sizeof(kExactLocalQueryCloseRequest) - 1u,
+         kExactLocalCloseResponseNormalized,
+         false,
+         true},
+        {"GET /static/ fallback",
+         kSlashRequest,
+         sizeof(kSlashRequest) - 1u,
+         kSuccessResponseNormalized,
+         false,
+         false},
+        {"GET /static/child fallback",
+         kChildRequest,
+         sizeof(kChildRequest) - 1u,
+         kSuccessResponseNormalized,
+         false,
+         false},
+        {"GET /other fallback",
+         kOtherRequest,
+         sizeof(kOtherRequest) - 1u,
+         kSuccessResponseNormalized,
+         false,
+         false},
+    };
+
+    const auto append_error = [&](const std::string& detail) {
+        if (!error.empty()) error += "; ";
+        error += detail;
+    };
+    const auto recorder_is_live = [](const Recorder& upstream) {
+        return upstream.running.load(std::memory_order_acquire) &&
+               upstream.thread_alive.load(std::memory_order_acquire) &&
+               !upstream.listener_failed.load(std::memory_order_acquire);
+    };
+    const auto wait_recorder_ready = [&](Recorder& upstream, Child& process, const char* side) {
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+        while (std::chrono::steady_clock::now() < deadline) {
+            if (poll_child(process)) {
+                error = std::string(side) + " frontend exited before recorder readiness (" +
+                        child_status_description(process) + ")";
+                return false;
+            }
+            if (upstream.listener_failed.load(std::memory_order_acquire) ||
+                !upstream.running.load(std::memory_order_acquire)) {
+                error = std::string(side) + " recorder failed before readiness";
+                return false;
+            }
+            if (upstream.thread_alive.load(std::memory_order_acquire)) return true;
+            (void)poll(nullptr, 0, 5);
+        }
+        error = std::string(side) + " recorder thread readiness timed out";
+        return false;
+    };
+    const auto observe_live_count =
+        [&](Recorder& upstream, Child& process, const char* side, const char* phase, u32 expected) {
+            const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(500);
+            for (;;) {
+                if (poll_child(process)) {
+                    error = std::string(side) + " frontend exited during " + phase + " (" +
+                            child_status_description(process) + ")";
+                    return false;
+                }
+                if (!recorder_is_live(upstream)) {
+                    error = std::string(side) + " recorder stopped or failed during " + phase;
+                    return false;
+                }
+                if (upstream.accepted.load(std::memory_order_acquire) != expected ||
+                    upstream.requests.load(std::memory_order_acquire) != expected) {
+                    error = std::string(side) + " unexpected upstream count during " + phase;
+                    return false;
+                }
+                const auto now = std::chrono::steady_clock::now();
+                if (now >= deadline) return true;
+                const auto remaining =
+                    std::chrono::duration_cast<std::chrono::milliseconds>(deadline - now).count();
+                (void)poll(nullptr, 0, remaining > 50 ? 50 : static_cast<int>(remaining));
+            }
+        };
+    const auto wait_for_request_count =
+        [&](Recorder& upstream, Child& process, const char* side, u32 expected) {
+            const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+            while (std::chrono::steady_clock::now() < deadline) {
+                if (poll_child(process)) {
+                    error = std::string(side) + " frontend exited awaiting fallback request (" +
+                            child_status_description(process) + ")";
+                    return false;
+                }
+                if (!recorder_is_live(upstream)) {
+                    error = std::string(side) + " recorder stopped awaiting fallback request";
+                    return false;
+                }
+                const u32 accepted = upstream.accepted.load(std::memory_order_acquire);
+                const u32 requests = upstream.requests.load(std::memory_order_acquire);
+                if (accepted > expected || requests > expected) {
+                    error = std::string(side) + " observed a retry/extra fallback request";
+                    return false;
+                }
+                if (accepted == expected && requests == expected) return true;
+                (void)poll(nullptr, 0, 5);
+            }
+            error = std::string(side) + " fallback request observation timed out";
+            return false;
+        };
+    const auto exercise = [&](Recorder& upstream,
+                              Child& process,
+                              const char* side,
+                              ExactStrictRouteSideObservation& side_observation) {
+        if (!wait_recorder_ready(upstream, process, side)) return false;
+        side_observation.wires.clear();
+        for (size_t index = 0; index < sizeof(kVectors) / sizeof(kVectors[0]); index++) {
+            const Vector& vector = kVectors[index];
+            struct ClientGuard {
+                int fd = -1;
+                ~ClientGuard() {
+                    if (fd >= 0) close(fd);
+                }
+            } client{connect_once(frontend_port)};
+            std::vector<char> wire;
+            std::string detail;
+            const bool response_ok = client.fd >= 0 &&
+                                     send_all(client.fd, vector.request, vector.request_len) &&
+                                     (vector.head ? read_head_response(client.fd, wire, detail)
+                                                  : read_response(client.fd, wire, detail)) &&
+                                     read_eof(client.fd, detail);
+            side_observation.wires.push_back(wire);
+            if (!response_ok) {
+                error = std::string(side) + " " + vector.name + " response/EOF failed: " +
+                        (detail.empty() ? "connect or send failed" : detail);
+                return false;
+            }
+            if (!validate_exact_normalized_response(wire, vector.expected, detail)) {
+                error = std::string(side) + " " + vector.name + " wire mismatch: " + detail;
+                return false;
+            }
+            if (poll_child(process)) {
+                error = std::string(side) + " frontend exited after " + vector.name + " (" +
+                        child_status_description(process) + ")";
+                return false;
+            }
+            if (vector.local) {
+                if (upstream.accepted.load(std::memory_order_acquire) != 0 ||
+                    upstream.requests.load(std::memory_order_acquire) != 0) {
+                    error = std::string(side) + " local vector performed upstream work";
+                    return false;
+                }
+                if (index == 4 &&
+                    !observe_live_count(upstream, process, side, "local zero-upstream window", 0))
+                    return false;
+            } else {
+                const u32 expected = static_cast<u32>(index - 4);
+                if (!wait_for_request_count(upstream, process, side, expected)) return false;
+            }
+        }
+        return observe_live_count(upstream, process, side, "fallback no-fourth window", 3);
+    };
+    const auto settle_recorder = [&](Recorder& upstream,
+                                     const char* side,
+                                     ExactStrictRouteSideObservation& side_observation) {
+        upstream.stop();
+        side_observation.upstream_accepts = upstream.accepted.load(std::memory_order_acquire);
+        side_observation.upstream_requests = upstream.requests.load(std::memory_order_acquire);
+        side_observation.upstream_response_sends =
+            upstream.response_send_all_calls.load(std::memory_order_acquire);
+        side_observation.upstream_history = upstream.history;
+        if (upstream.thread_alive.load(std::memory_order_acquire) ||
+            upstream.listener_failed.load(std::memory_order_acquire) ||
+            side_observation.upstream_accepts != 3 || side_observation.upstream_requests != 3 ||
+            side_observation.upstream_response_sends != 3 ||
+            !upstream.response_send_succeeded.load(std::memory_order_acquire) ||
+            !upstream.response_clean_shutdown.load(std::memory_order_acquire) ||
+            !upstream.response_connection_closed.load(std::memory_order_acquire) ||
+            side_observation.upstream_history.size() != 3) {
+            append_error(std::string(side) + " recorder did not settle at exactly three episodes");
+            return false;
+        }
+        return true;
+    };
+
+    {
+        Recorder upstream;
+        upstream.observe_extra_requests_until_stop = true;
+        if (!upstream.setup(backend_port, 3, kBackendResponse, sizeof(kBackendResponse) - 1u)) {
+            error = "failed to start pinned nginx exact-route recorder";
+            return false;
+        }
+        DockerGuard docker(container_name);
+        ChildGuard nginx;
+        const bool spawned = spawn_child({"docker",
+                                          "run",
+                                          "--pull=never",
+                                          "--network",
+                                          "host",
+                                          "--name",
+                                          container_name,
+                                          "-v",
+                                          temp.nginx_config + ":/etc/nginx/nginx.conf:ro",
+                                          kNginxImage,
+                                          "nginx",
+                                          "-g",
+                                          "daemon off;"},
+                                         temp.nginx_log,
+                                         nginx.child);
+        bool side_ok = spawned;
+        if (!spawned) error = "failed to start pinned nginx for exact strict-route differential";
+        if (side_ok) side_ok = wait_ready(frontend_port, nginx.child, error);
+        if (side_ok) side_ok = exercise(upstream, nginx.child, "pinned nginx", observation.nginx);
+        const bool process_stopped = stop_child(nginx.child);
+        const bool container_removed = docker.remove();
+        const bool recorder_settled = settle_recorder(upstream, "pinned nginx", observation.nginx);
+        if (!process_stopped) append_error("failed to stop pinned nginx cleanly");
+        if (!container_removed) append_error("failed to remove pinned nginx container");
+        if (!side_ok || !process_stopped || !container_removed || !recorder_settled) return false;
+    }
+
+    {
+        Recorder upstream;
+        upstream.observe_extra_requests_until_stop = true;
+        if (!upstream.setup(backend_port, 3, kBackendResponse, sizeof(kBackendResponse) - 1u)) {
+            error = "failed to start ordinary RUT exact-route recorder";
+            return false;
+        }
+        ChildGuard rut;
+        const bool spawned =
+            spawn_child({rut_path, temp.source, "--shards", "1", "--no-pin", "--drain", "0"},
+                        temp.rut_log,
+                        rut.child);
+        bool side_ok = spawned;
+        if (!spawned) error = "failed to start ordinary RUT for exact strict-route differential";
+        if (side_ok) side_ok = wait_ready(frontend_port, rut.child, error);
+        if (side_ok) side_ok = exercise(upstream, rut.child, "ordinary RUT", observation.rut);
+        const bool process_stopped = stop_child(rut.child);
+        const bool recorder_settled = settle_recorder(upstream, "ordinary RUT", observation.rut);
+        if (!process_stopped) append_error("failed to stop ordinary RUT cleanly");
+        if (!side_ok || !process_stopped || !recorder_settled) return false;
+    }
+
+    if (observation.nginx.wires.size() != sizeof(kVectors) / sizeof(kVectors[0]) ||
+        observation.rut.wires.size() != sizeof(kVectors) / sizeof(kVectors[0])) {
+        error = "exact strict-route sides produced an incomplete vector matrix";
+        return false;
+    }
+    for (size_t index = 0; index < sizeof(kVectors) / sizeof(kVectors[0]); index++) {
+        std::vector<char> normalized_nginx = observation.nginx.wires[index];
+        std::vector<char> normalized_rut = observation.rut.wires[index];
+        if (!normalize_date(normalized_nginx) || !normalize_date(normalized_rut) ||
+            normalized_nginx != normalized_rut) {
+            error =
+                std::string("exact strict-route cross-wire mismatch for ") + kVectors[index].name;
+            return false;
+        }
+    }
+
+    static constexpr const char* kFallbackTargets[] = {"/static/", "/static/child", "/other"};
+    static constexpr const char* kFallbackMarkers[] = {"slash", "child", "other"};
+    for (size_t index = 0; index < 3; index++) {
+        const char* target = kFallbackTargets[index];
+        const char* marker = kFallbackMarkers[index];
+        const std::string expected = std::string("GET ") + target + " HTTP/1.1\r\n" +
+                                     "Host: 127.0.0.1:" + std::to_string(backend_port) + "\r\n" +
+                                     "X-D3-Vector: " + marker + "\r\n\r\n";
+        const std::vector<char> expected_wire(expected.begin(), expected.end());
+        if (observation.nginx.upstream_history[index] != expected_wire ||
+            observation.rut.upstream_history[index] != expected_wire ||
+            observation.nginx.upstream_history[index] != observation.rut.upstream_history[index]) {
+            error = std::string("exact strict-route upstream request mismatch for ") + marker;
+            return false;
+        }
+    }
+    return true;
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -6351,6 +6778,8 @@ int main(int argc, char** argv) {
         argc == 2 && strcmp(argv[1], "--exact-local-return-baseline") == 0;
     const bool strict_local_response_differential =
         argc == 3 && strcmp(argv[1], "--strict-local-response-differential") == 0;
+    const bool exact_strict_route_differential =
+        argc == 3 && strcmp(argv[1], "--exact-strict-route-differential") == 0;
     const bool late_successor_differential =
         argc == 5 && strcmp(argv[1], "--late-successor-differential") == 0;
     const bool rut_iouring_gate_spike =
@@ -6367,12 +6796,13 @@ int main(int argc, char** argv) {
         (argc == 2 && argv[1][0] == '/') ||
         (argc == 4 && argv[1][0] == '/' && argv[2][0] == '/' && argv[3][0] == '/');
     if ((!nginx_gate_spike && !exact_local_return_baseline && !strict_local_response_differential &&
-         !rut_iouring_gate_spike && !rut_iouring_gate_identity_negative &&
-         !rut_iouring_gate_ready_mutation_negative && !rut_iouring_gate_owner_death_negative &&
-         !rut_iouring_gate_connect_journal_negative && !late_successor_differential &&
-         !normal_differential) ||
+         !exact_strict_route_differential && !rut_iouring_gate_spike &&
+         !rut_iouring_gate_identity_negative && !rut_iouring_gate_ready_mutation_negative &&
+         !rut_iouring_gate_owner_death_negative && !rut_iouring_gate_connect_journal_negative &&
+         !late_successor_differential && !normal_differential) ||
         (nginx_gate_spike && argv[2][0] != '/') ||
         (strict_local_response_differential && argv[2][0] != '/') ||
+        (exact_strict_route_differential && argv[2][0] != '/') ||
         ((rut_iouring_gate_spike || rut_iouring_gate_identity_negative ||
           rut_iouring_gate_ready_mutation_negative || rut_iouring_gate_owner_death_negative ||
           rut_iouring_gate_connect_journal_negative) &&
@@ -6385,6 +6815,8 @@ int main(int argc, char** argv) {
                      "<absolute-preload-helper>\n"
                      "   or: test_nginx_differential --exact-local-return-baseline\n"
                      "   or: test_nginx_differential --strict-local-response-differential "
+                     "<absolute-rut-executable>\n"
+                     "   or: test_nginx_differential --exact-strict-route-differential "
                      "<absolute-rut-executable>\n"
                      "   or: test_nginx_differential --rut-iouring-gate-spike "
                      "<absolute-rut-executable> <absolute-preload-helper>\n"
@@ -6569,6 +7001,37 @@ int main(int argc, char** argv) {
                      "pinned nginx exact /static after Date-only normalization, close/EOF, and "
                      "zero upstream work (selection precondition only; no #288 claim)\n";
         if (strict_local_response_differential) return 0;
+    }
+
+    if (exact_strict_route_differential || normal_differential) {
+        const char* source_suffix = strrchr(temp.path, '/');
+        source_suffix = source_suffix ? source_suffix + 1 : temp.path;
+        const std::string container_name =
+            "rut-nginx-exact-strict-route-" + std::to_string(getpid()) + "-" + source_suffix;
+        ExactStrictRouteDifferentialObservation observation;
+        std::string differential_error;
+        const char* rut_path = exact_strict_route_differential ? argv[2] : argv[1];
+        if (!run_exact_strict_route_differential(frontend_port,
+                                                 backend_port,
+                                                 temp,
+                                                 container_name,
+                                                 rut_path,
+                                                 observation,
+                                                 differential_error)) {
+            std::cerr << "FAIL [exact strict-route differential]: " << differential_error << "\n";
+            dump_exact_strict_route_side("pinned nginx", observation.nginx);
+            dump_exact_strict_route_side("ordinary RUT", observation.rut);
+            dump_log(temp.nginx_config, "exact strict-route pinned nginx config");
+            dump_log(temp.source, "exact strict-route hand-authored ordinary RUT source");
+            dump_log(temp.nginx_log, "exact strict-route pinned nginx log");
+            dump_log(temp.rut_log, "exact strict-route ordinary RUT log");
+            return 1;
+        }
+        std::cerr << "PASS: hand-authored ordinary RUT exact-ANY /static plus root GET fallback "
+                     "matches pinned nginx across eight explicit-close vectors, Date-only "
+                     "normalization, exact backend effects, and live no-extra windows "
+                     "(generic capability only; not converter-generated; #286 remains)\n";
+        if (exact_strict_route_differential) return 0;
     }
 
     if (nginx_gate_spike) {
