@@ -77,7 +77,16 @@ Allowed states are `SUPPORTED`, `PARTIAL`, `BLOCKED_BY_RUT`,
   completes. #277 owns request1+request2 already coalesced before strict-policy
   admission. #278 owns strict-policy admission/execution after a preserved
   successor is dispatched with nonzero pipeline depth. The bounded `SUPPORTED`
-  GET row is explicitly sequential and claims none of these cases.
+  GET row is explicitly sequential and claims none of these cases. #276's
+  trustworthy raw-CQ production barrier now reaches an ordinary static successor,
+  but exact close/EOF evidence is blocked by generic local-response persistence
+  issue #280.
+- Ordinary JIT local responses currently overwrite parsed HTTP/1 request close
+  intent with a drain-only keep-alive decision (#280). Their text body literal
+  also retains escape spellings such as `\\n` instead of providing an exact
+  decoded-byte form (#279). Neither limitation is silently hidden by converter
+  lowering; #280 blocks the current #276 production wire, while #279 is tracked
+  for future local-response/body compatibility.
 - The post-#273 audit identified an exact-HEAD streaming, exact-bodyless-GET
   complete-buffering, method-omitted streaming split. Its first lowering attempt
   compiled correctly but exposed two generic runtime gaps: an initially complete
