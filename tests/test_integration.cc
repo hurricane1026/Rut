@@ -20510,9 +20510,9 @@ TEST(route, response_policy_request_connection_preserves_client_intent) {
         CHECK(buf_contains(
             warm_response, static_cast<u32>(warm_len), "200", static_cast<u32>(strlen("200"))));
 
-        // The drain clock is whole-second granular, so use an 8-second period
-        // to keep this warmed connection's drain point beyond the 2-second timeout.
-        proxy.loop->drain(8);
+        // Isolate the immediate lifecycle gate from the forced-drain deadline;
+        // this finite period is deliberately far beyond fixture scheduling windows.
+        proxy.loop->drain(3600);
         static constexpr char kDraining[] = "GET /api HTTP/1.1\r\nHost: client.example\r\n\r\n";
         REQUIRE(send_all(client, kDraining, sizeof(kDraining) - 1));
         char response[2048]{};
