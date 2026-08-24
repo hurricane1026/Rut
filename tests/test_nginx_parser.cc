@@ -716,51 +716,102 @@ TEST(nginx_converter, lowers_canonical_model_to_stable_rut_source) {
         "<body>\\r\\n<center><h1>400 Bad Request</h1></center>\\r\\n"
         "<hr><center>nginx/1.29.7</center>\\r\\n</body>\\r\\n</html>\\r\\n\"\n"
         "}) }\n"
+        "route HEAD \"/\" {\n"
+        "    return forward(nginx_upstream, request_policy: {\n"
+        "            version: \"HTTP/1.1\",\n"
+        "            host: \"upstream\",\n"
+        "            connection: \"omit\",\n"
+        "            strip_headers: [\"Connection\", \"Keep-Alive\", \"TE\", \"Expect\", "
+        "\"Upgrade\"]\n"
+        "        },\n"
+        "        response_policy: {\n"
+        "            version: \"HTTP/1.1\",\n"
+        "            framing: \"content_length\",\n"
+        "            connection: \"request\",\n"
+        "            head_mode: \"suppress_body\",\n"
+        "            server: \"nginx/1.29.7\",\n"
+        "            date: \"current\",\n"
+        "            hide_headers: [\"Date\", \"Server\", \"X-Pad\"]\n"
+        "        },\n"
+        "        failure_policy: {\n"
+        "            version: \"HTTP/1.1\",\n"
+        "            status: 502,\n"
+        "            reason: \"Bad Gateway\",\n"
+        "            content_type: \"text/html\",\n"
+        "            server: \"nginx/1.29.7\",\n"
+        "            date: \"current\",\n"
+        "            connection: \"request\",\n"
+        "            head_mode: \"suppress_body\",\n"
+        "            body: b\"<html>\\r\\n<head><title>502 Bad "
+        "Gateway</title></head>\\r\\n<body>\\r\\n<center><h1>502 Bad "
+        "Gateway</h1></center>\\r\\n<hr><center>nginx/1.29.7</center>\\r\\n</body>\\r\\n</"
+        "html>\\r\\n\"\n"
+        "        }\n"
+        "    )\n"
+        "}\n"
+        "route GET \"/\" {\n"
+        "    return forward(nginx_upstream, request_policy: {\n"
+        "            version: \"HTTP/1.1\",\n"
+        "            host: \"upstream\",\n"
+        "            connection: \"omit\",\n"
+        "            strip_headers: [\"Connection\", \"Keep-Alive\", \"TE\", \"Expect\", "
+        "\"Upgrade\"]\n"
+        "        },\n"
+        "        response_policy: {\n"
+        "            version: \"HTTP/1.1\",\n"
+        "            framing: \"content_length\",\n"
+        "            connection: \"request\",\n"
+        "            server: \"nginx/1.29.7\",\n"
+        "            date: \"current\",\n"
+        "            hide_headers: [\"Date\", \"Server\", \"X-Pad\"]\n"
+        "        },\n"
+        "        failure_policy: {\n"
+        "            version: \"HTTP/1.1\",\n"
+        "            status: 502,\n"
+        "            reason: \"Bad Gateway\",\n"
+        "            content_type: \"text/html\",\n"
+        "            server: \"nginx/1.29.7\",\n"
+        "            date: \"current\",\n"
+        "            connection: \"request\",\n"
+        "            body: b\"<html>\\r\\n<head><title>502 Bad "
+        "Gateway</title></head>\\r\\n<body>\\r\\n<center><h1>502 Bad "
+        "Gateway</h1></center>\\r\\n<hr><center>nginx/1.29.7</center>\\r\\n</body>\\r\\n</"
+        "html>\\r\\n\"\n"
+        "        },\n"
+        "        timeout_failure_policy: {\n"
+        "            version: \"HTTP/1.1\",\n"
+        "            status: 504,\n"
+        "            reason: \"Gateway Time-out\",\n"
+        "            content_type: \"text/html\",\n"
+        "            server: \"nginx/1.29.7\",\n"
+        "            date: \"current\",\n"
+        "            connection: \"request\",\n"
+        "            body: b\"<html>\\r\\n<head><title>504 Gateway Time-out</title></head>\\r\\n"
+        "<body>\\r\\n<center><h1>504 Gateway Time-out</h1></center>\\r\\n"
+        "<hr><center>nginx/1.29.7</center>\\r\\n</body>\\r\\n"
+        "</html>\\r\\n\"\n"
+        "        },\n"
+        "        response_read_timeout: 60s,\n"
+        "        response_buffering: \"complete_content_length\"\n"
+        "    )\n"
+        "}\n"
         "route \"/\" {\n"
-        "    if req.method == HEAD {\n"
-        "        return forward(nginx_upstream, request_policy: {\n"
+        "    return forward(nginx_upstream, request_policy: {\n"
         "            version: \"HTTP/1.1\",\n"
         "            host: \"upstream\",\n"
         "            connection: \"omit\",\n"
         "            strip_headers: [\"Connection\", \"Keep-Alive\", \"TE\", \"Expect\", "
         "\"Upgrade\"]\n"
-        "        }, response_policy: {\n"
-        "            version: \"HTTP/1.1\",\n"
-        "            framing: \"content_length\",\n"
-        "            connection: \"request\",\n"
-        "            head_mode: \"suppress_body\",\n"
-        "            server: \"nginx/1.29.7\",\n"
-        "            date: \"current\",\n"
-        "            hide_headers: [\"Date\", \"Server\", \"X-Pad\"]\n"
-        "        }, failure_policy: {\n"
-        "            version: \"HTTP/1.1\",\n"
-        "            status: 502,\n"
-        "            reason: \"Bad Gateway\",\n"
-        "            content_type: \"text/html\",\n"
-        "            server: \"nginx/1.29.7\",\n"
-        "            date: \"current\",\n"
-        "            connection: \"request\",\n"
-        "            head_mode: \"suppress_body\",\n"
-        "            body: b\"<html>\\r\\n<head><title>502 Bad "
-        "Gateway</title></head>\\r\\n<body>\\r\\n<center><h1>502 Bad "
-        "Gateway</h1></center>\\r\\n<hr><center>nginx/1.29.7</center>\\r\\n</body>\\r\\n</"
-        "html>\\r\\n\"\n"
-        "        })\n"
-        "    } else {\n"
-        "        return forward(nginx_upstream, request_policy: {\n"
-        "            version: \"HTTP/1.1\",\n"
-        "            host: \"upstream\",\n"
-        "            connection: \"omit\",\n"
-        "            strip_headers: [\"Connection\", \"Keep-Alive\", \"TE\", \"Expect\", "
-        "\"Upgrade\"]\n"
-        "        }, response_policy: {\n"
+        "        },\n"
+        "        response_policy: {\n"
         "            version: \"HTTP/1.1\",\n"
         "            framing: \"content_length\",\n"
         "            connection: \"request\",\n"
         "            server: \"nginx/1.29.7\",\n"
         "            date: \"current\",\n"
         "            hide_headers: [\"Date\", \"Server\", \"X-Pad\"]\n"
-        "        }, failure_policy: {\n"
+        "        },\n"
+        "        failure_policy: {\n"
         "            version: \"HTTP/1.1\",\n"
         "            status: 502,\n"
         "            reason: \"Bad Gateway\",\n"
@@ -772,8 +823,8 @@ TEST(nginx_converter, lowers_canonical_model_to_stable_rut_source) {
         "Gateway</title></head>\\r\\n<body>\\r\\n<center><h1>502 Bad "
         "Gateway</h1></center>\\r\\n<hr><center>nginx/1.29.7</center>\\r\\n</body>\\r\\n</"
         "html>\\r\\n\"\n"
-        "        })\n"
-        "    }\n"
+        "        }\n"
+        "    )\n"
         "}\n";
     CHECK_EQ(result.value().len, static_cast<u32>(sizeof(kExpected) - 1));
     CHECK_LT(result.value().len, nginx::RutSource::kCapacity);
@@ -884,6 +935,23 @@ TEST(nginx_converter, formatting_and_comments_do_not_change_lowering) {
     CHECK(compact_lowered.value().view().eq(formatted_lowered.value().view()));
 }
 
+TEST(nginx_converter, root_maximum_ports_fit_bounded_source_capacity) {
+    auto model = canonical_server();
+    model.listen.port = 65535;
+    model.location.proxy_pass.port = 65535;
+    const auto lowered = nginx::lower_to_rut(model);
+    REQUIRE(lowered);
+    CHECK_EQ(lowered.value().len, 4899u);
+    CHECK_LT(lowered.value().len, nginx::RutSource::kCapacity);
+    const auto lexed = lex(lowered.value().view());
+    REQUIRE(lexed);
+    CHECK_EQ(lexed.value().tokens.len, 530u);
+}
+
+// These checks prove only converter golden output and compiler/config ownership.
+// Behavioral equivalence requires the separate nginx-vs-generated-RUT
+// differentials. In particular, pipelined validated-failure successors remain
+// excluded by #276, as do the converter's other documented client/config bounds.
 TEST(nginx_converter, emitted_source_reaches_rir_with_source_metadata) {
     auto lowered = nginx::lower_to_rut(canonical_server());
     REQUIRE(lowered);
@@ -892,7 +960,7 @@ TEST(nginx_converter, emitted_source_reaches_rir_with_source_metadata) {
     auto ast = parse_file(lexed.value());
     REQUIRE(ast);
     std::unique_ptr<AstFile> ast_owned(ast.value());
-    REQUIRE_EQ(ast_owned->items.len, 6u);
+    REQUIRE_EQ(ast_owned->items.len, 8u);
     CHECK(ast_owned->items[0].kind == AstItemKind::Listen);
     CHECK_EQ(ast_owned->items[0].listen.port, 8080u);
     CHECK(ast_owned->items[1].kind == AstItemKind::Upstream);
@@ -900,6 +968,35 @@ TEST(nginx_converter, emitted_source_reaches_rir_with_source_metadata) {
     CHECK(ast_owned->items[3].kind == AstItemKind::Unmatched);
     CHECK(ast_owned->items[4].kind == AstItemKind::Unmatched);
     CHECK(ast_owned->items[5].kind == AstItemKind::Route);
+    CHECK(ast_owned->items[6].kind == AstItemKind::Route);
+    CHECK(ast_owned->items[7].kind == AstItemKind::Route);
+    const u8 expected_route_methods[] = {
+        static_cast<u8>(TokenType::KwHead), static_cast<u8>(TokenType::KwGet), 0};
+    for (u32 i = 0; i < 3; i++) {
+        const auto& route = ast_owned->items[5 + i].route;
+        CHECK(route.path.eq(lit_str("/")));
+        CHECK_EQ(route.method_is_any, i == 2);
+        if (i != 2) CHECK_EQ(route.method, expected_route_methods[i]);
+        REQUIRE_EQ(route.statements.len, 1u);
+        const AstStatement& forward = *route.statements[0];
+        CHECK(forward.kind == AstStmtKind::ForwardUpstream);
+        CHECK(forward.has_forward_request_policy);
+        CHECK_EQ(forward.forward_request_policy_id, 1u);
+        CHECK(request_policy_is_supported(forward.forward_request_policy_id));
+        CHECK(
+            complete_content_length_request_policy_is_admitted(forward.forward_request_policy_id));
+        CHECK_EQ(strcmp(request_policy_version(forward.forward_request_policy_id), "HTTP/1.1"), 0);
+        CHECK(forward.has_forward_response_policy);
+        CHECK(forward.has_forward_failure_policy);
+        CHECK_EQ(forward.forward_timeout_failure_policy_id, i == 1 ? 3u : 0u);
+        CHECK_EQ(forward.has_forward_timeout_failure_policy, i == 1);
+        CHECK_EQ(forward.forward_response_read_timeout_seconds, i == 1 ? 60u : 0u);
+        CHECK_EQ(forward.has_forward_response_read_timeout, i == 1);
+        CHECK(forward.forward_response_buffering ==
+              (i == 1 ? ForwardResponseBufferingMode::CompleteContentLength
+                      : ForwardResponseBufferingMode::None));
+        CHECK_EQ(forward.has_forward_response_buffering, i == 1);
+    }
     REQUIRE_EQ(ast_owned->strict_local_response_policies.len, 3u);
     CHECK_EQ(ast_owned->unmatched_policy_ids[kRouteMethodOptions], 1u);
     CHECK_EQ(ast_owned->unmatched_policy_ids[kRouteMethodConnect], 2u);
@@ -970,19 +1067,35 @@ TEST(nginx_converter, emitted_source_reaches_rir_with_source_metadata) {
     CHECK_EQ(hir_owned->upstreams[0].ip, 0x7F000001u);
     CHECK_EQ(hir_owned->upstreams[0].port, 9000u);
     REQUIRE_EQ(hir_owned->response_policies.len, 2u);
-    REQUIRE_EQ(hir_owned->failure_policies.len, 2u);
-    REQUIRE_EQ(hir_owned->routes.len, 1u);
-    REQUIRE_EQ(hir_owned->routes[0].control.kind, HirControlKind::If);
-    const auto& hir_then = hir_owned->routes[0].control.then_term;
-    const auto& hir_else = hir_owned->routes[0].control.else_term;
-    CHECK_EQ(hir_then.kind, HirTerminatorKind::ForwardUpstream);
-    CHECK_EQ(hir_then.forward_request_policy_id, 1u);
-    CHECK_EQ(hir_then.forward_response_policy_id, 1u);
-    CHECK_EQ(hir_then.forward_failure_policy_id, 1u);
-    CHECK_EQ(hir_else.kind, HirTerminatorKind::ForwardUpstream);
-    CHECK_EQ(hir_else.forward_request_policy_id, 1u);
-    CHECK_EQ(hir_else.forward_response_policy_id, 2u);
-    CHECK_EQ(hir_else.forward_failure_policy_id, 2u);
+    REQUIRE_EQ(hir_owned->failure_policies.len, 3u);
+    REQUIRE_EQ(hir_owned->routes.len, 3u);
+    CHECK_EQ(hir_owned->routes[0].method, kRouteMethodHead);
+    CHECK_EQ(hir_owned->routes[1].method, kRouteMethodGet);
+    CHECK_EQ(hir_owned->routes[2].method, kRouteMethodAny);
+    for (u32 i = 0; i < hir_owned->routes.len; i++) {
+        REQUIRE(hir_owned->routes[i].control.kind == HirControlKind::Direct);
+        const auto& term = hir_owned->routes[i].control.direct_term;
+        CHECK_EQ(term.kind, HirTerminatorKind::ForwardUpstream);
+        CHECK_EQ(term.forward_request_policy_id, 1u);
+    }
+    CHECK_EQ(hir_owned->routes[0].control.direct_term.forward_response_policy_id, 1u);
+    CHECK_EQ(hir_owned->routes[0].control.direct_term.forward_failure_policy_id, 1u);
+    CHECK_EQ(hir_owned->routes[1].control.direct_term.forward_response_policy_id, 2u);
+    CHECK_EQ(hir_owned->routes[1].control.direct_term.forward_failure_policy_id, 2u);
+    CHECK_EQ(hir_owned->routes[2].control.direct_term.forward_response_policy_id, 2u);
+    CHECK_EQ(hir_owned->routes[2].control.direct_term.forward_failure_policy_id, 2u);
+    CHECK_EQ(hir_owned->routes[1].control.direct_term.forward_timeout_failure_policy_id, 3u);
+    CHECK_EQ(hir_owned->routes[1].control.direct_term.forward_response_read_timeout_seconds, 60u);
+    CHECK(hir_owned->routes[1].control.direct_term.forward_response_buffering ==
+          ForwardResponseBufferingMode::CompleteContentLength);
+    CHECK_EQ(hir_owned->routes[0].control.direct_term.forward_timeout_failure_policy_id, 0u);
+    CHECK_EQ(hir_owned->routes[2].control.direct_term.forward_timeout_failure_policy_id, 0u);
+    CHECK_EQ(hir_owned->routes[0].control.direct_term.forward_response_read_timeout_seconds, 0u);
+    CHECK_EQ(hir_owned->routes[2].control.direct_term.forward_response_read_timeout_seconds, 0u);
+    CHECK(hir_owned->routes[0].control.direct_term.forward_response_buffering ==
+          ForwardResponseBufferingMode::None);
+    CHECK(hir_owned->routes[2].control.direct_term.forward_response_buffering ==
+          ForwardResponseBufferingMode::None);
     auto mir = build_mir(*hir_owned);
     REQUIRE(mir);
     std::unique_ptr<MirModule> mir_owned(mir.value());
@@ -990,33 +1103,36 @@ TEST(nginx_converter, emitted_source_reaches_rir_with_source_metadata) {
     CHECK_EQ(mir_owned->upstreams[0].ip, 0x7F000001u);
     CHECK_EQ(mir_owned->upstreams[0].port, 9000u);
     REQUIRE_EQ(mir_owned->response_policies.len, 2u);
-    REQUIRE_EQ(mir_owned->failure_policies.len, 2u);
+    REQUIRE_EQ(mir_owned->failure_policies.len, 3u);
     REQUIRE_EQ(mir_owned->strict_local_response_policies.len, 3u);
     CHECK_EQ(mir_owned->unmatched_policy_ids[kRouteMethodOptions], 1u);
     CHECK_EQ(mir_owned->unmatched_policy_ids[kRouteMethodConnect], 2u);
     CHECK_EQ(mir_owned->unmatched_policy_ids[kRouteMethodAny], 3u);
-    REQUIRE_EQ(mir_owned->functions.len, 1u);
-    CHECK_EQ(mir_owned->functions[0].method, 0u);
-    CHECK(mir_owned->functions[0].path.eq(lit_str("/")));
+    REQUIRE_EQ(mir_owned->functions.len, 3u);
+    CHECK_EQ(mir_owned->functions[0].method, kRouteMethodHead);
+    CHECK_EQ(mir_owned->functions[1].method, kRouteMethodGet);
+    CHECK_EQ(mir_owned->functions[2].method, kRouteMethodAny);
+    for (u32 fi = 0; fi < mir_owned->functions.len; fi++)
+        CHECK(mir_owned->functions[fi].path.eq(lit_str("/")));
     CHECK(request_policy_is_supported(1));
     const char* request_version = request_policy_version(1);
     REQUIRE(request_version != nullptr);
     const Str request_version_str{request_version, 8};
     CHECK(request_version_str.eq(lit_str("HTTP/1.1")));
-    u32 mir_bundles = 0;
-    for (u32 bi = 0; bi < mir_owned->functions[0].blocks.len; bi++) {
-        const auto& term = mir_owned->functions[0].blocks[bi].term;
-        if (term.kind != MirTerminatorKind::ForwardUpstream) continue;
+    for (u32 fi = 0; fi < mir_owned->functions.len; fi++) {
+        const auto& function = mir_owned->functions[fi];
+        REQUIRE_EQ(function.blocks.len, 1u);
+        const auto& term = function.blocks[0].term;
+        CHECK_EQ(term.kind, MirTerminatorKind::ForwardUpstream);
         CHECK_EQ(term.forward_request_policy_id, 1u);
-        if (term.forward_response_policy_id == 1u) {
-            CHECK_EQ(term.forward_failure_policy_id, 1u);
-            mir_bundles++;
-        } else if (term.forward_response_policy_id == 2u) {
-            CHECK_EQ(term.forward_failure_policy_id, 2u);
-            mir_bundles++;
-        }
+        CHECK_EQ(term.forward_response_policy_id, fi == 0 ? 1u : 2u);
+        CHECK_EQ(term.forward_failure_policy_id, fi == 0 ? 1u : 2u);
+        CHECK_EQ(term.forward_timeout_failure_policy_id, fi == 1 ? 3u : 0u);
+        CHECK_EQ(term.forward_response_read_timeout_seconds, fi == 1 ? 60u : 0u);
+        CHECK(term.forward_response_buffering ==
+              (fi == 1 ? ForwardResponseBufferingMode::CompleteContentLength
+                       : ForwardResponseBufferingMode::None));
     }
-    CHECK_EQ(mir_bundles, 2u);
 
     FrontendRirModule rir{};
     RirGuard rir_guard{rir};
@@ -1053,7 +1169,7 @@ TEST(nginx_converter, emitted_source_reaches_rir_with_source_metadata) {
     CHECK(response_policy.hide_headers[2].eq(lit_str("X-Pad")));
     CHECK(rir.module.response_policies[1].head_mode == ResponsePolicyHeadMode::Reject);
 
-    REQUIRE_EQ(rir.module.failure_policy_count, 2u);
+    REQUIRE_EQ(rir.module.failure_policy_count, 3u);
     const auto& failure_policy = rir.module.failure_policies[0];
     CHECK(failure_policy.version == ForwardFailurePolicyVersion::Http11);
     CHECK_EQ(failure_policy.status_code, 502u);
@@ -1075,55 +1191,65 @@ TEST(nginx_converter, emitted_source_reaches_rir_with_source_metadata) {
     CHECK_EQ(failure_policy.body.len, static_cast<u32>(sizeof(kFailureBody) - 1));
     CHECK(failure_policy.body.eq({kFailureBody, sizeof(kFailureBody) - 1}));
     CHECK(rir.module.failure_policies[1].head_mode == FailurePolicyHeadMode::Reject);
+    CHECK_EQ(rir.module.failure_policies[2].status_code, 504u);
+    CHECK(rir.module.failure_policies[2].reason.eq(lit_str("Gateway Time-out")));
+    CHECK(rir.module.failure_policies[2].content_type.eq(lit_str("text/html")));
+    CHECK(rir.module.failure_policies[2].server.eq(lit_str("nginx/1.29.7")));
+    CHECK(rir.module.failure_policies[2].date == ForwardFailurePolicyDate::Current);
+    CHECK(rir.module.failure_policies[2].connection == ForwardFailurePolicyConnection::Request);
+    CHECK(rir.module.failure_policies[2].head_mode == FailurePolicyHeadMode::Reject);
+    CHECK_EQ(rir.module.failure_policies[2].body.len, 167u);
 
-    REQUIRE_EQ(rir.module.policy_bundle_count, 2u);
+    REQUIRE_EQ(rir.module.policy_bundle_count, 3u);
     CHECK_EQ(rir.module.policy_bundles[0].response_policy_id, 1u);
     CHECK_EQ(rir.module.policy_bundles[0].failure_policy_id, 1u);
+    CHECK_EQ(rir.module.policy_bundles[0].timeout_failure_policy_id, 0u);
+    CHECK_EQ(rir.module.policy_bundles[0].response_read_timeout_seconds, 0u);
+    CHECK(rir.module.policy_bundles[0].response_buffering == ForwardResponseBufferingMode::None);
     CHECK_EQ(rir.module.policy_bundles[1].response_policy_id, 2u);
     CHECK_EQ(rir.module.policy_bundles[1].failure_policy_id, 2u);
+    CHECK_EQ(rir.module.policy_bundles[2].response_policy_id, 2u);
+    CHECK_EQ(rir.module.policy_bundles[2].failure_policy_id, 2u);
+    CHECK_EQ(rir.module.policy_bundles[1].timeout_failure_policy_id, 3u);
+    CHECK_EQ(rir.module.policy_bundles[1].response_read_timeout_seconds, 60u);
+    CHECK(rir.module.policy_bundles[1].response_buffering ==
+          ForwardResponseBufferingMode::CompleteContentLength);
 
-    REQUIRE_EQ(rir.module.func_count, 1u);
-    const auto& function = rir.module.functions[0];
-    CHECK(function.route_pattern.eq(lit_str("/")));
-    CHECK_EQ(function.http_method, 0u);
-    u32 ret_count = 0;
-    u32 plain_forward_count = 0;
-    bool saw_bundle_one = false;
-    bool saw_bundle_two = false;
-    for (u32 bi = 0; bi < function.block_count; bi++) {
-        const auto& block = function.blocks[bi];
-        for (u32 ii = 0; ii < block.inst_count; ii++) {
-            const auto& instruction = block.insts[ii];
-            if (instruction.op == rir::Opcode::RetForward) {
-                plain_forward_count++;
-                continue;
+    REQUIRE_EQ(rir.module.func_count, 3u);
+    for (u32 fi = 0; fi < rir.module.func_count; fi++) {
+        const auto& function = rir.module.functions[fi];
+        CHECK(function.route_pattern.eq(lit_str("/")));
+        CHECK_EQ(function.http_method,
+                 fi == 0   ? kRouteMethodHead
+                 : fi == 1 ? kRouteMethodGet
+                           : kRouteMethodAny);
+        u32 ret_count = 0;
+        for (u32 bi = 0; bi < function.block_count; bi++) {
+            const auto& block = function.blocks[bi];
+            for (u32 ii = 0; ii < block.inst_count; ii++) {
+                const auto& instruction = block.insts[ii];
+                if (instruction.op != rir::Opcode::RetForwardBundle) continue;
+                ret_count++;
+                REQUIRE_EQ(instruction.operand_count, 3u);
+                i32 upstream_id = -1;
+                i32 request_policy_id = -1;
+                i32 bundle_id = -1;
+                REQUIRE(find_const_i32(function, instruction.operand(0), upstream_id));
+                REQUIRE(find_const_i32(function, instruction.operand(1), request_policy_id));
+                REQUIRE(find_const_i32(function, instruction.operand(2), bundle_id));
+                CHECK_EQ(upstream_id, 0);
+                CHECK_EQ(request_policy_id, 1);
+                CHECK_EQ(bundle_id, fi == 0 ? 1 : fi == 1 ? 2 : 3);
             }
-            if (instruction.op != rir::Opcode::RetForwardBundle) continue;
-            ret_count++;
-            REQUIRE_EQ(instruction.operand_count, 3u);
-            i32 upstream_id = -1;
-            i32 request_policy_id = -1;
-            i32 bundle_id = -1;
-            REQUIRE(find_const_i32(function, instruction.operand(0), upstream_id));
-            REQUIRE(find_const_i32(function, instruction.operand(1), request_policy_id));
-            REQUIRE(find_const_i32(function, instruction.operand(2), bundle_id));
-            CHECK_EQ(upstream_id, 0);
-            CHECK_EQ(request_policy_id, 1);
-            if (bundle_id == 1) saw_bundle_one = true;
-            if (bundle_id == 2) saw_bundle_two = true;
-            CHECK(bundle_id == 1 || bundle_id == 2);
         }
+        CHECK_EQ(ret_count, 1u);
     }
-    CHECK_EQ(ret_count, 2u);
-    CHECK_EQ(plain_forward_count, 0u);
-    CHECK(saw_bundle_one);
-    CHECK(saw_bundle_two);
 
     RouteConfig populated{};
     REQUIRE(populate_route_config(populated, rir.module));
     REQUIRE_EQ(populated.response_policy_count, 2u);
-    REQUIRE_EQ(populated.failure_policy_count, 2u);
-    REQUIRE_EQ(populated.policy_bundle_count, 2u);
+    REQUIRE_EQ(populated.failure_policy_count, 3u);
+    REQUIRE_EQ(populated.policy_bundle_count, 3u);
     REQUIRE_EQ(populated.strict_local_response_policy_count, 3u);
     CHECK_EQ(populated.unmatched_policy_ids[kRouteMethodOptions], 1u);
     CHECK_EQ(populated.unmatched_policy_ids[kRouteMethodConnect], 2u);
@@ -1146,6 +1272,12 @@ TEST(nginx_converter, emitted_source_reaches_rir_with_source_metadata) {
     CHECK_EQ(populated.policy_bundles[0].failure_policy_id, 1u);
     CHECK_EQ(populated.policy_bundles[1].response_policy_id, 2u);
     CHECK_EQ(populated.policy_bundles[1].failure_policy_id, 2u);
+    CHECK_EQ(populated.policy_bundles[2].response_policy_id, 2u);
+    CHECK_EQ(populated.policy_bundles[2].failure_policy_id, 2u);
+    CHECK_EQ(populated.policy_bundles[1].timeout_failure_policy_id, 3u);
+    CHECK_EQ(populated.policy_bundles[1].response_read_timeout_seconds, 60u);
+    CHECK(populated.policy_bundles[1].response_buffering ==
+          ForwardResponseBufferingMode::CompleteContentLength);
 }
 
 TEST(nginx_converter, emitted_api_source_reaches_rir_with_target_transform) {
@@ -1292,6 +1424,9 @@ TEST(nginx_converter, emitted_api_source_reaches_rir_with_target_transform) {
     CHECK_EQ(populated.unmatched_policy_ids[kRouteMethodConnect], 2u);
     CHECK_EQ(populated.unmatched_policy_ids[kRouteMethodAny], 3u);
     CHECK(populated.unmatched_policy_table_is_valid());
+    CHECK_EQ(populated.policy_bundles[0].timeout_failure_policy_id, 0u);
+    CHECK_EQ(populated.policy_bundles[0].response_read_timeout_seconds, 0u);
+    CHECK(populated.policy_bundles[0].response_buffering == ForwardResponseBufferingMode::None);
 }
 
 TEST(nginx_converter, rejects_parsed_proxy_read_timeout_before_lowering) {
