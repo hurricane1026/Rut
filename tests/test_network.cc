@@ -15347,6 +15347,11 @@ TEST(local_response_persistence, ordinary_jit_connection_close_owns_send_until_t
 }
 
 TEST(local_response_persistence, ordinary_publishers_share_wire_and_lifecycle_decision) {
+    auto make_loop = [] {
+        auto loop = std::make_unique<SmallLoop>();
+        loop->setup();
+        return loop;
+    };
     auto dispatch = [](SmallLoop& loop, RouteConfig* config, const char* request) -> Connection* {
         const RouteConfig* active = config;
         loop.config_ptr = config == nullptr ? nullptr : &active;
@@ -15368,26 +15373,23 @@ TEST(local_response_persistence, ordinary_publishers_share_wire_and_lifecycle_de
     };
 
     {
-        SmallLoop loop;
-        loop.setup();
-        Connection* conn = dispatch(loop, nullptr, "GET / HTTP/1.1\r\nHost: x\r\n\r\n");
+        auto loop = make_loop();
+        Connection* conn = dispatch(*loop, nullptr, "GET / HTTP/1.1\r\nHost: x\r\n\r\n");
         REQUIRE(conn != nullptr);
         check_wire(*conn, true);  // legacy/default 200
     }
     {
-        SmallLoop loop;
-        loop.setup();
-        Connection* conn =
-            dispatch(loop, nullptr, "GET / HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n");
+        auto loop = make_loop();
+        Connection* conn = dispatch(
+            *loop, nullptr, "GET / HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n");
         REQUIRE(conn != nullptr);
         check_wire(*conn, false);
     }
     {
-        SmallLoop loop;
-        loop.setup();
+        auto loop = make_loop();
         RouteConfig config{};
         REQUIRE(config.add_static("/local", kRouteMethodGet, 204));
-        Connection* conn = dispatch(loop,
+        Connection* conn = dispatch(*loop,
                                     &config,
                                     "GET /local HTTP/1.0\r\nHost: x\r\n"
                                     "Connection: keep-alive\r\n\r\n");
@@ -15395,49 +15397,48 @@ TEST(local_response_persistence, ordinary_publishers_share_wire_and_lifecycle_de
         check_wire(*conn, true);  // lifecycle only; #282 owns the status-line version
     }
     {
-        SmallLoop loop;
-        loop.setup();
+        auto loop = make_loop();
         RouteConfig config{};
         REQUIRE(config.add_jit_handler(
             "/local", kRouteMethodGet, &response_read_timeout_later_handler, false));
-        Connection* conn = dispatch(loop, &config, "GET /local HTTP/1.1\r\nHost: x\r\n\r\n");
+        Connection* conn =
+            dispatch(*loop, &config, "GET /local HTTP/1.1\r\nHost: x\r\n\r\n");
         REQUIRE(conn != nullptr);
         CHECK_EQ(conn->resp_status, 204u);
         check_wire(*conn, true);  // immediate JIT ReturnStatus
     }
     {
-        SmallLoop loop;
-        loop.setup();
+        auto loop = make_loop();
         ShardMetrics shard{};
         shard.init();
         ShardMetrics* shards[] = {&shard};
-        loop.all_shard_metrics = shards;
-        loop.shard_metrics_count = 1;
-        Connection* conn = dispatch(loop, nullptr, "GET /metrics HTTP/1.1\r\nHost: x\r\n\r\n");
+        loop->all_shard_metrics = shards;
+        loop->shard_metrics_count = 1;
+        Connection* conn =
+            dispatch(*loop, nullptr, "GET /metrics HTTP/1.1\r\nHost: x\r\n\r\n");
         REQUIRE(conn != nullptr);
         CHECK_EQ(conn->resp_status, 200u);
         check_wire(*conn, true);
     }
     {
-        SmallLoop loop;
-        loop.setup();
+        auto loop = make_loop();
         RouteConfig config{};
         REQUIRE(config.add_static("/local", kRouteMethodGet, 204));
-        loop.draining = true;
-        Connection* conn = dispatch(loop, &config, "GET /local HTTP/1.1\r\nHost: x\r\n\r\n");
+        loop->draining = true;
+        Connection* conn =
+            dispatch(*loop, &config, "GET /local HTTP/1.1\r\nHost: x\r\n\r\n");
         REQUIRE(conn != nullptr);
         check_wire(*conn, false);  // drain already active at publication
     }
     {
-        SmallLoop loop;
-        loop.setup();
-        Connection* conn = dispatch(loop, nullptr, "GET / HTTP/1.1\r\nHost: x\r\n\r\n");
+        auto loop = make_loop();
+        Connection* conn = dispatch(*loop, nullptr, "GET / HTTP/1.1\r\nHost: x\r\n\r\n");
         REQUIRE(conn != nullptr);
         const u32 id = conn->id;
         const u32 len = conn->send_buf.len();
-        loop.draining = true;
-        loop.inject_and_dispatch(make_ev(id, IoEventType::Send, static_cast<i32>(len)));
-        CHECK_EQ(loop.conns[id].fd, -1);  // drain began after publication
+        loop->draining = true;
+        loop->inject_and_dispatch(make_ev(id, IoEventType::Send, static_cast<i32>(len)));
+        CHECK_EQ(loop->conns[id].fd, -1);  // drain began after publication
     }
 }
 
