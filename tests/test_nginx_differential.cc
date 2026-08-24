@@ -383,6 +383,21 @@ static bool wait_child(Child& child, int timeout_ms) {
     return false;
 }
 
+static std::string child_status_description(const Child& child) {
+    if (!child.status_valid) return "status unavailable";
+    if (WIFEXITED(child.status)) return "exit " + std::to_string(WEXITSTATUS(child.status));
+    if (WIFSIGNALED(child.status)) {
+        std::string result = "signal " + std::to_string(WTERMSIG(child.status));
+#ifdef WCOREDUMP
+        if (WCOREDUMP(child.status)) result += " (core dumped)";
+#endif
+        return result;
+    }
+    if (WIFSTOPPED(child.status))
+        return "stopped by signal " + std::to_string(WSTOPSIG(child.status));
+    return "unrecognized wait status " + std::to_string(child.status);
+}
+
 static bool spawn_child(const std::vector<std::string>& args,
                         const std::string& log_path,
                         Child& child) {
@@ -633,7 +648,7 @@ static int connect_once(u16 port) {
 static bool wait_ready(u16 port, Child& child, std::string& error) {
     for (int attempt = 0; attempt < 200; attempt++) {
         if (poll_child(child)) {
-            error = "process exited before readiness";
+            error = "process exited before readiness (" + child_status_description(child) + ")";
             return false;
         }
         const int fd = connect_once(port);
@@ -5399,14 +5414,15 @@ static bool run_rut_iouring_gate_spike(u16 frontend_port,
         const bool* child_settled;
         const bool* cleanup_clean;
         LateSuccessorObservation* observation;
+        std::string* error;
         ~GateEvidenceCapture() {
-            if (observation == nullptr) return;
             if (!*child_settled || child->pid >= 0) {
-                observation->gate_evidence =
-                    "cleanup failure: helper may still be live; shared metadata suppressed";
+                if (observation != nullptr)
+                    observation->gate_evidence =
+                        "cleanup failure: helper may still be live; shared metadata suppressed";
                 return;
             }
-            observation->gate_evidence =
+            std::string evidence =
                 std::string(*cleanup_clean ? "cleanup=clean " : "cleanup=failed-but-reaped ") +
                 "state=" + std::to_string(rut_downstream_gate_load(&gate->state)) +
                 " error=" + std::to_string(rut_downstream_gate_load(&gate->error_code)) +
@@ -5423,16 +5439,18 @@ static bool run_rut_iouring_gate_spike(u16 frontend_port,
             for (u32 i = 0;
                  i < gate->connect_attempt_count && i < RUT_IOURING_GATE_CONNECT_JOURNAL_CAPACITY;
                  i++) {
-                observation->gate_evidence +=
-                    " [fd=" + std::to_string(gate->connect_attempts[i].fd) +
-                    " user_data=" + std::to_string(gate->connect_attempts[i].user_data) + "]";
+                evidence += " [fd=" + std::to_string(gate->connect_attempts[i].fd) +
+                            " user_data=" + std::to_string(gate->connect_attempts[i].user_data) +
+                            "]";
             }
+            if (observation != nullptr) observation->gate_evidence = evidence;
+            if (error != nullptr && !error->empty()) *error += "; settled gate " + evidence;
         }
     };
     bool child_settled = false;
     bool cleanup_clean = true;
     GateEvidenceCapture gate_evidence_capture{
-        mapping.gate, &rut_process.child, &child_settled, &cleanup_clean, observation};
+        mapping.gate, &rut_process.child, &child_settled, &cleanup_clean, observation, &error};
     struct StopGuard {
         Child* child;
         bool* settled;
@@ -5509,7 +5527,8 @@ static bool run_rut_iouring_gate_spike(u16 frontend_port,
     if (expect_owner_death) {
         if (!wait_child(rut_process.child, 3000) || !rut_process.child.status_valid ||
             !WIFEXITED(rut_process.child.status) || WEXITSTATUS(rut_process.child.status) != 86) {
-            error = "owner-death helper did not exit while holding identity mutex";
+            error = "owner-death helper did not exit while holding identity mutex (" +
+                    child_status_description(rut_process.child) + ")";
             return false;
         }
         rut_process.child.pid = -1;

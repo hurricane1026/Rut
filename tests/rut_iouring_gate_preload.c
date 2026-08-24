@@ -119,29 +119,21 @@ static int ready_mask_mutation_injected;
 static int duplicate_connect_journal_injected;
 
 /*
- * Both entry points use the x86-64 SysV variadic syscall ABI.  The public
+ * Both entry points use the x86-64 SysV variadic syscall ABI.  Define them as
+ * file-scope assembly rather than naked C functions: GCC may still emit its
+ * variadic register-save sequence around extended asm at -O0, and a naked
+ * function has no frame for those compiler-generated stores.  The public
  * syscall symbol either tail-calls the C inspector for the three io_uring
  * calls or forwards all six kernel argument slots directly.  No va_list is
  * formed and unrelated syscall arities are never guessed.
  */
-__attribute__((naked, visibility("hidden"))) long rut_gate_kernel_syscall(long number,
-                                                                          unsigned long arg1,
-                                                                          unsigned long arg2,
-                                                                          unsigned long arg3,
-                                                                          unsigned long arg4,
-                                                                          unsigned long arg5,
-                                                                          unsigned long arg6) {
-    __asm__ volatile(
-        "mov %rdi, %rax\n"
-        "mov %rsi, %rdi\n"
-        "mov %rdx, %rsi\n"
-        "mov %rcx, %rdx\n"
-        "mov %r8, %r10\n"
-        "mov %r9, %r8\n"
-        "mov 8(%rsp), %r9\n"
-        "syscall\n"
-        "ret\n");
-}
+__attribute__((visibility("hidden"))) long rut_gate_kernel_syscall(long number,
+                                                                   unsigned long arg1,
+                                                                   unsigned long arg2,
+                                                                   unsigned long arg3,
+                                                                   unsigned long arg4,
+                                                                   unsigned long arg5,
+                                                                   unsigned long arg6);
 
 __attribute__((visibility("hidden"))) long rut_gate_io_uring_syscall(long number,
                                                                      unsigned long arg1,
@@ -151,34 +143,50 @@ __attribute__((visibility("hidden"))) long rut_gate_io_uring_syscall(long number
                                                                      unsigned long arg5,
                                                                      unsigned long arg6);
 
-__attribute__((naked)) long syscall(long number, ...) {
-    __asm__ volatile(
-        "cmp $425, %rdi\n"
-        "je rut_gate_io_uring_syscall\n"
-        "cmp $426, %rdi\n"
-        "je rut_gate_io_uring_syscall\n"
-        "cmp $427, %rdi\n"
-        "je rut_gate_io_uring_syscall\n"
-        "mov %rdi, %rax\n"
-        "mov %rsi, %rdi\n"
-        "mov %rdx, %rsi\n"
-        "mov %rcx, %rdx\n"
-        "mov %r8, %r10\n"
-        "mov %r9, %r8\n"
-        "mov 8(%rsp), %r9\n"
-        "syscall\n"
-        "cmp $-4095, %rax\n"
-        "jae 1f\n"
-        "ret\n"
-        "1:\n"
-        "push %rax\n"
-        "call __errno_location@PLT\n"
-        "pop %rcx\n"
-        "neg %ecx\n"
-        "mov %ecx, (%rax)\n"
-        "mov $-1, %rax\n"
-        "ret\n");
-}
+__asm__(
+    ".text\n"
+    ".hidden rut_gate_kernel_syscall\n"
+    ".type rut_gate_kernel_syscall,@function\n"
+    "rut_gate_kernel_syscall:\n"
+    "mov %rdi, %rax\n"
+    "mov %rsi, %rdi\n"
+    "mov %rdx, %rsi\n"
+    "mov %rcx, %rdx\n"
+    "mov %r8, %r10\n"
+    "mov %r9, %r8\n"
+    "mov 8(%rsp), %r9\n"
+    "syscall\n"
+    "ret\n"
+    ".size rut_gate_kernel_syscall,.-rut_gate_kernel_syscall\n"
+    ".globl syscall\n"
+    ".type syscall,@function\n"
+    "syscall:\n"
+    "cmp $425, %rdi\n"
+    "je rut_gate_io_uring_syscall\n"
+    "cmp $426, %rdi\n"
+    "je rut_gate_io_uring_syscall\n"
+    "cmp $427, %rdi\n"
+    "je rut_gate_io_uring_syscall\n"
+    "mov %rdi, %rax\n"
+    "mov %rsi, %rdi\n"
+    "mov %rdx, %rsi\n"
+    "mov %rcx, %rdx\n"
+    "mov %r8, %r10\n"
+    "mov %r9, %r8\n"
+    "mov 8(%rsp), %r9\n"
+    "syscall\n"
+    "cmp $-4095, %rax\n"
+    "jae 1f\n"
+    "ret\n"
+    "1:\n"
+    "push %rax\n"
+    "call __errno_location@PLT\n"
+    "pop %rcx\n"
+    "neg %ecx\n"
+    "mov %ecx, (%rax)\n"
+    "mov $-1, %rax\n"
+    "ret\n"
+    ".size syscall,.-syscall\n");
 
 static long libc_result(long result) {
     if ((unsigned long)result >= (unsigned long)-4095) {
