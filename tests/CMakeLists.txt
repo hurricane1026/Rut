@@ -353,6 +353,14 @@ if(RUT_ENABLE_JIT)
     )
     target_link_libraries(test_nginx_downstream_gate_preload PRIVATE dl)
 
+    if(CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|AMD64)$")
+        add_library(test_rut_iouring_gate_preload SHARED rut_iouring_gate_preload.c)
+        target_include_directories(test_rut_iouring_gate_preload PRIVATE
+            ${CMAKE_CURRENT_SOURCE_DIR}
+        )
+        target_link_libraries(test_rut_iouring_gate_preload PRIVATE Threads::Threads)
+    endif()
+
     add_executable(test_nginx_differential test_nginx_differential.cc
                    ${PROJECT_SOURCE_DIR}/src/placement_new.cc)
     target_link_libraries(test_nginx_differential PRIVATE rut_nginx Threads::Threads)
@@ -360,6 +368,9 @@ if(RUT_ENABLE_JIT)
         ${PROJECT_SOURCE_DIR}/include
     )
     add_dependencies(test_nginx_differential rut test_nginx_downstream_gate_preload)
+    if(TARGET test_rut_iouring_gate_preload)
+        add_dependencies(test_nginx_differential test_rut_iouring_gate_preload)
+    endif()
     add_test(
         NAME test_nginx_downstream_gate_spike
         COMMAND test_nginx_differential --nginx-gate-spike
@@ -372,6 +383,52 @@ if(RUT_ENABLE_JIT)
         TIMEOUT 60
         SKIP_RETURN_CODE 77
     )
+    if(TARGET test_rut_iouring_gate_preload)
+        add_test(
+            NAME test_rut_iouring_gate_spike
+            COMMAND test_nginx_differential --rut-iouring-gate-spike
+                    $<TARGET_FILE:rut> $<TARGET_FILE:test_rut_iouring_gate_preload>
+        )
+        set_tests_properties(test_rut_iouring_gate_spike PROPERTIES
+            LABELS "integration;nginx"
+            RUN_SERIAL TRUE
+            RESOURCE_LOCK nginx-differential
+            TIMEOUT 30
+        )
+        add_test(
+            NAME test_rut_iouring_gate_identity_negative
+            COMMAND test_nginx_differential --rut-iouring-gate-identity-negative
+                    $<TARGET_FILE:rut> $<TARGET_FILE:test_rut_iouring_gate_preload>
+        )
+        set_tests_properties(test_rut_iouring_gate_identity_negative PROPERTIES
+            LABELS "integration;nginx;negative"
+            RUN_SERIAL TRUE
+            RESOURCE_LOCK nginx-differential
+            TIMEOUT 30
+        )
+        add_test(
+            NAME test_rut_iouring_gate_ready_mutation_negative
+            COMMAND test_nginx_differential --rut-iouring-gate-ready-mutation-negative
+                    $<TARGET_FILE:rut> $<TARGET_FILE:test_rut_iouring_gate_preload>
+        )
+        set_tests_properties(test_rut_iouring_gate_ready_mutation_negative PROPERTIES
+            LABELS "integration;nginx;negative"
+            RUN_SERIAL TRUE
+            RESOURCE_LOCK nginx-differential
+            TIMEOUT 30
+        )
+        add_test(
+            NAME test_rut_iouring_gate_owner_death_negative
+            COMMAND test_nginx_differential --rut-iouring-gate-owner-death-negative
+                    $<TARGET_FILE:rut> $<TARGET_FILE:test_rut_iouring_gate_preload>
+        )
+        set_tests_properties(test_rut_iouring_gate_owner_death_negative PROPERTIES
+            LABELS "integration;nginx;negative"
+            RUN_SERIAL TRUE
+            RESOURCE_LOCK nginx-differential
+            TIMEOUT 30
+        )
+    endif()
     add_test(
         NAME test_nginx_differential
         COMMAND test_nginx_differential $<TARGET_FILE:rut>

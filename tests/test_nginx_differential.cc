@@ -1,6 +1,8 @@
 #include "downstream_publication_gate.h"
 #include "rut/nginx/converter.h"
 #include "rut/nginx/parser.h"
+#include "rut/runtime/io_event.h"
+#include "rut_iouring_gate.h"
 #include <atomic>
 #include <cerrno>
 #include <chrono>
@@ -11,6 +13,7 @@
 
 #include <arpa/inet.h>
 #include <fcntl.h>
+#include <linux/io_uring.h>
 #include <poll.h>
 #include <pthread.h>
 #include <signal.h>
@@ -361,17 +364,16 @@ static bool stop_child(Child& child) {
         } else {
             (void)poll_child(child);
         }
-        child.pid = -1;
+        if (child.reaped) child.pid = -1;
         return false;
     }
     if (!wait_child(child, 3000)) {
-        kill(child.pid, SIGKILL);
+        (void)kill(child.pid, SIGKILL);
         const bool reaped = wait_child(child, 2000);
         if (!reaped) {
-            const pid_t rc = waitpid(child.pid, &child.status, 0);
-            child.reaped = rc == child.pid;
-            child.status_valid = child.reaped;
-            child.pid = -1;
+            // Keep the pid so a later bounded cleanup attempt can retry.  An
+            // unbounded waitpid here could deadlock an identity owner-death
+            // cleanup if the child could not actually be killed/reaped.
             return false;
         }
         child.pid = -1;
@@ -477,6 +479,7 @@ struct TempDir {
     std::string rut_log;
     std::string preflight_log;
     std::string gate_control;
+    std::string rut_iouring_gate_control;
 
     bool create() {
         if (!mkdtemp(path)) return false;
@@ -487,6 +490,7 @@ struct TempDir {
         rut_log = std::string(path) + "/rut.log";
         preflight_log = std::string(path) + "/preflight.log";
         gate_control = std::string(path) + "/downstream-gate.control";
+        rut_iouring_gate_control = std::string(path) + "/rut-iouring-gate.control";
         return true;
     }
 
@@ -498,6 +502,7 @@ struct TempDir {
             unlink(rut_log.c_str());
             unlink(preflight_log.c_str());
             unlink(gate_control.c_str());
+            unlink(rut_iouring_gate_control.c_str());
             rmdir(path);
         }
     }
@@ -4705,6 +4710,84 @@ struct DownstreamGateRelease {
     }
 };
 
+struct RutIoUringGateMapping {
+    int fd = -1;
+    rut_iouring_gate* gate = nullptr;
+    Child* child = nullptr;
+
+    bool create(const std::string& path) {
+        fd = open(path.c_str(), O_RDWR | O_CREAT | O_EXCL, 0600);
+        if (fd < 0 || ftruncate(fd, sizeof(*gate)) != 0) return false;
+        void* mapped = mmap(nullptr, sizeof(*gate), PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+        if (mapped == MAP_FAILED) return false;
+        gate = static_cast<rut_iouring_gate*>(mapped);
+        memset(gate, 0, sizeof(*gate));
+        pthread_mutexattr_t attributes;
+        if (pthread_mutexattr_init(&attributes) != 0) return false;
+        const bool mutex_initialized =
+            pthread_mutexattr_setpshared(&attributes, PTHREAD_PROCESS_SHARED) == 0 &&
+            pthread_mutexattr_setrobust(&attributes, PTHREAD_MUTEX_ROBUST) == 0 &&
+            pthread_mutex_init(&gate->identity_mutex, &attributes) == 0;
+        (void)pthread_mutexattr_destroy(&attributes);
+        if (!mutex_initialized) return false;
+        rut_downstream_gate_store(&gate->identity_mutex_initialized, 1);
+        gate->magic = RUT_IOURING_GATE_MAGIC;
+        gate->version = RUT_IOURING_GATE_VERSION;
+        gate->layout_size = sizeof(*gate);
+        gate->ring_fd = -1;
+        gate->intercepted_fd = -1;
+        rut_downstream_gate_store(&gate->state, RUT_DOWNSTREAM_GATE_DISARMED);
+        return msync(gate, sizeof(*gate), MS_SYNC) == 0;
+    }
+
+    ~RutIoUringGateMapping() {
+        if (gate != nullptr) {
+            if ((child == nullptr || child->pid < 0) &&
+                rut_downstream_gate_load(&gate->identity_mutex_initialized) == 1) {
+                (void)pthread_mutex_destroy(&gate->identity_mutex);
+                rut_downstream_gate_store(&gate->identity_mutex_initialized, 0);
+            }
+            munmap(gate, sizeof(*gate));
+        }
+        if (fd >= 0) close(fd);
+    }
+};
+
+struct RutIoUringGateProcessMapping {
+    // Member declaration order is a lifetime contract: reverse destruction
+    // must destroy mapping before child_guard because mapping consults the
+    // still-live Child state before deciding whether its robust mutex is safe
+    // to destroy.  This also keeps a failed-stop writer protected until the
+    // final ChildGuard cleanup attempt.
+    ChildGuard child_guard;
+    RutIoUringGateMapping mapping;
+
+    RutIoUringGateProcessMapping() { mapping.child = &child_guard.child; }
+};
+
+struct RutIoUringGateRelease {
+    rut_iouring_gate* gate = nullptr;
+    Child* child = nullptr;
+
+    ~RutIoUringGateRelease() {
+        if (gate == nullptr) return;
+        if (child != nullptr && child->pid >= 0) (void)stop_child(*child);
+        const bool writers_stopped = child == nullptr || child->pid < 0;
+        if (rut_iouring_gate_lock_identity(gate, 500)) {
+            const u32 state = rut_downstream_gate_load(&gate->state);
+            if (state != RUT_DOWNSTREAM_GATE_RELEASED && state != RUT_DOWNSTREAM_GATE_FAILED)
+                rut_iouring_gate_recover_owner_death_locked(gate);
+            rut_iouring_gate_unlock_identity(gate);
+        } else if (writers_stopped) {
+            // The only helper writer has terminated and was reaped, so no-lock
+            // recovery cannot race a later publication even if its robust
+            // mutex became unrecoverable.
+            rut_iouring_gate_recover_owner_death_locked(gate);
+        }
+        rut_downstream_gate_wake(&gate->state);
+    }
+};
+
 static bool wait_for_downstream_gate_hook(rut_downstream_publication_gate& gate,
                                           int timeout_ms,
                                           std::string& error) {
@@ -5003,15 +5086,322 @@ static bool run_nginx_downstream_gate_spike(u16 frontend_port,
     return true;
 }
 
+static bool wait_for_rut_iouring_gate_hook(rut_iouring_gate& gate,
+                                           int timeout_ms,
+                                           std::string& error) {
+    const int64_t deadline = rut_downstream_gate_now_ms() + timeout_ms;
+    while (rut_downstream_gate_now_ms() < deadline) {
+        if (rut_downstream_gate_load(&gate.state) == RUT_DOWNSTREAM_GATE_FAILED) {
+            error =
+                "RUT io_uring hook reported startup failure " +
+                std::to_string(rut_downstream_gate_load(&gate.error_code)) +
+                " with ring_ready=" + std::to_string(rut_downstream_gate_load(&gate.ring_ready));
+            return false;
+        }
+        if (rut_downstream_gate_load(&gate.hook_magic_ok) == 1 &&
+            rut_downstream_gate_load(&gate.hook_version) == RUT_IOURING_GATE_VERSION &&
+            rut_downstream_gate_load(&gate.hook_layout_size) == sizeof(gate) &&
+            rut_downstream_gate_load(&gate.target_pid) != 0 &&
+            rut_downstream_gate_load(&gate.ring_ready) == 1 && gate.ring_fd >= 0)
+            return true;
+        const u32 current = rut_downstream_gate_load(&gate.state);
+        timespec bounded_wait{0, 50'000'000};
+        (void)syscall(SYS_futex, &gate.state, FUTEX_WAIT, current, &bounded_wait, nullptr, 0);
+    }
+    error = "RUT io_uring preload startup/ring handshake timeout";
+    return false;
+}
+
+static bool run_rut_iouring_gate_spike(u16 frontend_port,
+                                       u16 backend_port,
+                                       TempDir& temp,
+                                       const char* rut_path,
+                                       const char* preload_path,
+                                       bool expect_identity_failure,
+                                       bool expect_ready_mutation_failure,
+                                       bool expect_owner_death,
+                                       std::string& error) {
+    if (rut_path == nullptr || rut_path[0] != '/' || access(rut_path, X_OK) != 0) {
+        error = "RUT executable path is not absolute and executable";
+        return false;
+    }
+    if (preload_path == nullptr || preload_path[0] != '/' || access(preload_path, R_OK) != 0) {
+        error = "RUT io_uring preload path is not absolute and readable";
+        return false;
+    }
+    struct stat preload_stat{};
+    if (stat(preload_path, &preload_stat) != 0 || !S_ISREG(preload_stat.st_mode)) {
+        error = "RUT io_uring preload is not a regular file";
+        return false;
+    }
+    DeadPort dead;
+    if (!dead.reserve(backend_port)) {
+        error = "failed to reserve RUT io_uring gate dead upstream";
+        return false;
+    }
+    const std::string fragment =
+        "server {\n  listen " + std::to_string(frontend_port) +
+        ";\n  location / {\n    proxy_pass http://127.0.0.1:" + std::to_string(backend_port) +
+        ";\n  }\n}\n";
+    auto parsed = rut::nginx::parse({fragment.data(), static_cast<rut::u32>(fragment.size())});
+    if (!parsed) {
+        error = "RUT io_uring gate nginx fragment parse failed";
+        return false;
+    }
+    auto lowered = rut::nginx::lower_to_rut(parsed.value());
+    if (!lowered || !write_file(temp.source, lowered.value().data, lowered.value().len)) {
+        error = "RUT io_uring gate converter output failed";
+        return false;
+    }
+
+    RutIoUringGateProcessMapping process_mapping;
+    ChildGuard& rut_process = process_mapping.child_guard;
+    RutIoUringGateMapping& mapping = process_mapping.mapping;
+    if (!mapping.create(temp.rut_iouring_gate_control)) {
+        error = "failed to create RUT io_uring shared gate control";
+        return false;
+    }
+    struct ClientGuard {
+        int fd = -1;
+        ~ClientGuard() {
+            if (fd >= 0) close(fd);
+        }
+    } client;
+    RutIoUringGateRelease release{mapping.gate, &rut_process.child};
+    const std::string preload_environment = std::string("LD_PRELOAD=") + preload_path;
+    const std::string control_environment =
+        "RUT_IOURING_GATE_CONTROL=" + temp.rut_iouring_gate_control;
+    const std::string target_environment =
+        std::string("RUT_IOURING_GATE_TARGET_EXECUTABLE=") + rut_path;
+    const std::string identity_environment =
+        std::string("RUT_IOURING_GATE_INJECT_DUPLICATE_SQ=") + (expect_identity_failure ? "1" : "");
+    const std::string mutation_environment =
+        std::string("RUT_IOURING_GATE_INJECT_READY_MASK_MUTATION=") +
+        (expect_ready_mutation_failure ? "1" : "");
+    const std::string owner_death_environment =
+        std::string("RUT_IOURING_GATE_INJECT_OWNER_DEATH=") + (expect_owner_death ? "1" : "");
+    if (!spawn_child({"env",
+                      preload_environment,
+                      control_environment,
+                      target_environment,
+                      identity_environment,
+                      mutation_environment,
+                      owner_death_environment,
+                      rut_path,
+                      temp.source,
+                      "--shards",
+                      "1",
+                      "--no-pin",
+                      "--drain",
+                      "0"},
+                     temp.rut_log,
+                     rut_process.child)) {
+        error = "failed to start generated-source RUT with io_uring gate preload";
+        return false;
+    }
+    if (expect_owner_death) {
+        if (!wait_child(rut_process.child, 3000) || !rut_process.child.status_valid ||
+            !WIFEXITED(rut_process.child.status) || WEXITSTATUS(rut_process.child.status) != 86) {
+            error = "owner-death helper did not exit while holding identity mutex";
+            return false;
+        }
+        rut_process.child.pid = -1;
+        if (!rut_iouring_gate_lock_identity(mapping.gate, 500)) {
+            error = "controller could not recover robust identity mutex after owner death";
+            return false;
+        }
+        rut_iouring_gate_unlock_identity(mapping.gate);
+        if (rut_downstream_gate_load(&mapping.gate->state) != RUT_DOWNSTREAM_GATE_FAILED ||
+            rut_downstream_gate_load(&mapping.gate->error_code) !=
+                RUT_IOURING_GATE_ERROR_TRANSITION ||
+            rut_downstream_gate_load(&mapping.gate->ring_ready) != 0 ||
+            mapping.gate->ring_fd != -1 || mapping.gate->intercepted_fd != -1 ||
+            mapping.gate->intercepted_opcode != 0 || mapping.gate->recv_user_data != 0 ||
+            mapping.gate->witness_length != 0) {
+            error = "owner-death recovery left a published identity";
+            return false;
+        }
+        return true;
+    }
+    if (!wait_ready(frontend_port, rut_process.child, error)) return false;
+    if (expect_identity_failure || expect_ready_mutation_failure) {
+        if (!rut_iouring_gate_wait_until(mapping.gate, RUT_DOWNSTREAM_GATE_FAILED, 3000)) {
+            error = expect_identity_failure
+                        ? "duplicate SQ mapping did not fail the RUT io_uring gate"
+                        : "ready SQ mask mutation did not fail the RUT io_uring gate";
+            return false;
+        }
+        if (!stop_child(rut_process.child)) {
+            error = "failed to TERM/reap RUT after identity rejection";
+            return false;
+        }
+        if (rut_downstream_gate_load(&mapping.gate->error_code) != RUT_IOURING_GATE_ERROR_RING ||
+            rut_downstream_gate_load(&mapping.gate->ring_ready) != 0 ||
+            mapping.gate->ring_fd != -1 || mapping.gate->intercepted_fd != -1 ||
+            mapping.gate->intercepted_opcode != 0 || mapping.gate->intercepted_length != 0 ||
+            mapping.gate->intercepted_prefix_length != 0 ||
+            mapping.gate->intercepted_user_data != 0 || mapping.gate->recv_user_data != 0 ||
+            mapping.gate->sq_head_at_hit != 0 || mapping.gate->sq_tail_at_hit != 0 ||
+            mapping.gate->cq_head_at_hit != 0 || mapping.gate->cq_tail_at_arrival != 0 ||
+            mapping.gate->witness_fragments != 0 || mapping.gate->witness_length != 0) {
+            error = "identity failure published metadata after process settlement";
+            return false;
+        }
+        return true;
+    }
+    if (!wait_for_rut_iouring_gate_hook(*mapping.gate, 3000, error)) return false;
+    if (rut_downstream_gate_load(&mapping.gate->state) != RUT_DOWNSTREAM_GATE_DISARMED ||
+        mapping.gate->intercepted_opcode != 0 || mapping.gate->intercepted_fd != -1 ||
+        mapping.gate->intercepted_user_data != 0 || mapping.gate->recv_user_data != 0 ||
+        mapping.gate->witness_fragments != 0 || mapping.gate->witness_length != 0) {
+        error = "disarmed RUT readiness traffic armed the io_uring gate";
+        return false;
+    }
+
+    client.fd = connect_once(frontend_port);
+    if (client.fd < 0) {
+        error = "failed to connect RUT io_uring target downstream";
+        return false;
+    }
+    sockaddr_in local{};
+    socklen_t local_length = sizeof(local);
+    if (getsockname(client.fd, reinterpret_cast<sockaddr*>(&local), &local_length) != 0 ||
+        local_length < sizeof(local) || local.sin_family != AF_INET) {
+        error = "failed to resolve RUT target peer identity";
+        return false;
+    }
+    mapping.gate->target_peer_ipv4_be = local.sin_addr.s_addr;
+    mapping.gate->target_peer_port_be = local.sin_port;
+    mapping.gate->request_two_length = sizeof(kGatewayCloseRequest2) - 1u;
+    memcpy(mapping.gate->request_two, kGatewayCloseRequest2, mapping.gate->request_two_length);
+    if (!rut_downstream_gate_cas(
+            &mapping.gate->state, RUT_DOWNSTREAM_GATE_DISARMED, RUT_DOWNSTREAM_GATE_ARMED)) {
+        error = "failed to arm RUT io_uring gate";
+        return false;
+    }
+    rut_downstream_gate_wake(&mapping.gate->state);
+    if (!send_all(client.fd, kGatewayKeepAliveRequest1, sizeof(kGatewayKeepAliveRequest1) - 1u)) {
+        error = "failed to send RUT io_uring request 1";
+        return false;
+    }
+    if (!rut_iouring_gate_wait_until(mapping.gate, RUT_DOWNSTREAM_GATE_HIT, 5000)) {
+        error = "RUT io_uring gate did not HIT; hook error " +
+                std::to_string(rut_downstream_gate_load(&mapping.gate->error_code));
+        return false;
+    }
+    static constexpr unsigned char kExpectedPrefix[] = "HTTP/1.1 502 ";
+    if (mapping.gate->target_pid != static_cast<u32>(rut_process.child.pid) ||
+        mapping.gate->ring_fd < 0 || mapping.gate->intercepted_fd < 0 ||
+        mapping.gate->intercepted_opcode != IORING_OP_SEND ||
+        mapping.gate->intercepted_length < sizeof(kExpectedPrefix) - 1u ||
+        mapping.gate->intercepted_prefix_length != sizeof(kExpectedPrefix) - 1u ||
+        memcmp(mapping.gate->intercepted_prefix, kExpectedPrefix, sizeof(kExpectedPrefix) - 1u) !=
+            0 ||
+        mapping.gate->recv_user_data == 0 ||
+        (mapping.gate->recv_user_data & 0xffu) != static_cast<rut::u8>(rut::IoEventType::Recv) ||
+        (mapping.gate->intercepted_user_data & 0xffu) !=
+            static_cast<rut::u8>(rut::IoEventType::Send) ||
+        ((mapping.gate->recv_user_data >> 8) & 0xffffffu) !=
+            ((mapping.gate->intercepted_user_data >> 8) & 0xffffffu) ||
+        mapping.gate->sq_tail_at_hit <= mapping.gate->sq_head_at_hit) {
+        error = "RUT io_uring HIT metadata did not prove target 502 Send/Recv ownership";
+        return false;
+    }
+    if (!downstream_has_no_readable_byte(client.fd, error)) return false;
+    if (!send_all(client.fd, kGatewayCloseRequest2, sizeof(kGatewayCloseRequest2) - 1u)) {
+        error = "failed to send exact RUT request 2 while enter was gated";
+        return false;
+    }
+    if (!rut_downstream_gate_cas(
+            &mapping.gate->state, RUT_DOWNSTREAM_GATE_HIT, RUT_DOWNSTREAM_GATE_R2_SENT)) {
+        error = "failed RUT gate HIT to R2_SENT transition";
+        return false;
+    }
+    rut_downstream_gate_wake(&mapping.gate->state);
+    if (!rut_iouring_gate_wait_until(mapping.gate, RUT_DOWNSTREAM_GATE_R2_ARRIVED, 5000)) {
+        error = "RUT hook did not prove raw-CQ request 2 arrival; hook error " +
+                std::to_string(rut_downstream_gate_load(&mapping.gate->error_code));
+        return false;
+    }
+    if (mapping.gate->witness_length != sizeof(kGatewayCloseRequest2) - 1u ||
+        mapping.gate->witness_fragments == 0 ||
+        mapping.gate->cq_tail_at_arrival <= mapping.gate->cq_head_at_hit) {
+        error = "RUT raw-CQ witness metadata was incomplete";
+        return false;
+    }
+    if (!downstream_has_no_readable_byte(client.fd, error)) return false;
+    if (!rut_downstream_gate_cas(
+            &mapping.gate->state, RUT_DOWNSTREAM_GATE_R2_ARRIVED, RUT_DOWNSTREAM_GATE_RELEASED)) {
+        error = "failed RUT gate R2_ARRIVED to RELEASED transition";
+        return false;
+    }
+    rut_downstream_gate_wake(&mapping.gate->state);
+
+    std::vector<char> first;
+    std::vector<char> second;
+    if (!read_two_responses_and_eof(client.fd, first, second, error)) return false;
+    std::string detail;
+    if (!validate_exact_normalized_response(first, kGatewayKeepAliveResponseNormalized, detail)) {
+        error = "gated RUT response 1 mismatch: " + detail;
+        return false;
+    }
+    if (!validate_exact_normalized_response(second, kGatewayResponseNormalized, detail)) {
+        error = "gated RUT response 2 mismatch: " + detail;
+        return false;
+    }
+    if (poll_child(rut_process.child)) {
+        error = "RUT exited after gated two-response exchange";
+        return false;
+    }
+    if (rut_downstream_gate_load(&mapping.gate->error_code) != RUT_IOURING_GATE_ERROR_NONE ||
+        rut_downstream_gate_load(&mapping.gate->state) != RUT_DOWNSTREAM_GATE_RELEASED) {
+        error = "RUT io_uring gate did not remain cleanly RELEASED";
+        return false;
+    }
+    std::cerr << "RUT gate evidence: pid=" << mapping.gate->target_pid
+              << " ring=" << mapping.gate->ring_fd << " send-fd=" << mapping.gate->intercepted_fd
+              << " bytes=" << mapping.gate->intercepted_length
+              << " raw-cq-fragments=" << mapping.gate->witness_fragments << "\n";
+
+    close(client.fd);
+    client.fd = -1;
+    if (!stop_child(rut_process.child)) {
+        error = "failed to TERM/reap generated-source RUT after io_uring gate spike";
+        return false;
+    }
+    return true;
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
     const bool nginx_gate_spike = argc == 3 && strcmp(argv[1], "--nginx-gate-spike") == 0;
-    if ((!nginx_gate_spike && (argc != 2 || argv[1][0] != '/')) ||
-        (nginx_gate_spike && argv[2][0] != '/')) {
+    const bool rut_iouring_gate_spike =
+        argc == 4 && strcmp(argv[1], "--rut-iouring-gate-spike") == 0;
+    const bool rut_iouring_gate_identity_negative =
+        argc == 4 && strcmp(argv[1], "--rut-iouring-gate-identity-negative") == 0;
+    const bool rut_iouring_gate_ready_mutation_negative =
+        argc == 4 && strcmp(argv[1], "--rut-iouring-gate-ready-mutation-negative") == 0;
+    const bool rut_iouring_gate_owner_death_negative =
+        argc == 4 && strcmp(argv[1], "--rut-iouring-gate-owner-death-negative") == 0;
+    if ((!nginx_gate_spike && !rut_iouring_gate_spike && !rut_iouring_gate_identity_negative &&
+         !rut_iouring_gate_ready_mutation_negative && !rut_iouring_gate_owner_death_negative &&
+         (argc != 2 || argv[1][0] != '/')) ||
+        (nginx_gate_spike && argv[2][0] != '/') ||
+        ((rut_iouring_gate_spike || rut_iouring_gate_identity_negative ||
+          rut_iouring_gate_ready_mutation_negative || rut_iouring_gate_owner_death_negative) &&
+         (argv[2][0] != '/' || argv[3][0] != '/'))) {
         std::cerr << "usage: test_nginx_differential <absolute-rut-executable>\n"
                      "   or: test_nginx_differential --nginx-gate-spike "
-                     "<absolute-preload-helper>\n";
+                     "<absolute-preload-helper>\n"
+                     "   or: test_nginx_differential --rut-iouring-gate-spike "
+                     "<absolute-rut-executable> <absolute-preload-helper>\n"
+                     "   or: test_nginx_differential --rut-iouring-gate-identity-negative "
+                     "<absolute-rut-executable> <absolute-preload-helper>\n"
+                     "   or: test_nginx_differential --rut-iouring-gate-ready-mutation-negative "
+                     "<absolute-rut-executable> <absolute-preload-helper>\n"
+                     "   or: test_nginx_differential --rut-iouring-gate-owner-death-negative "
+                     "<absolute-rut-executable> <absolute-preload-helper>\n";
         return 1;
     }
 #ifndef __linux__
@@ -5023,6 +5413,54 @@ int main(int argc, char** argv) {
         return 1;
     }
     if (!run_normalize_date_self_checks()) return 1;
+    if (rut_iouring_gate_spike || rut_iouring_gate_identity_negative ||
+        rut_iouring_gate_ready_mutation_negative || rut_iouring_gate_owner_death_negative) {
+        u16 rut_frontend_port = 0;
+        u16 rut_backend_port = 0;
+        if (!allocate_port(rut_frontend_port) || !allocate_port(rut_backend_port) ||
+            rut_frontend_port == rut_backend_port) {
+            std::cerr << "FAIL [RUT io_uring gate preflight]: dynamic port allocation failed\n";
+            return 1;
+        }
+        std::string gate_error;
+        if (!run_rut_iouring_gate_spike(rut_frontend_port,
+                                        rut_backend_port,
+                                        temp,
+                                        argv[2],
+                                        argv[3],
+                                        rut_iouring_gate_identity_negative,
+                                        rut_iouring_gate_ready_mutation_negative,
+                                        rut_iouring_gate_owner_death_negative,
+                                        gate_error)) {
+            std::cerr << "FAIL [RUT io_uring gate "
+                      << (rut_iouring_gate_identity_negative
+                              ? "identity negative]: "
+                              : (rut_iouring_gate_ready_mutation_negative
+                                     ? "ready mutation negative]: "
+                                     : (rut_iouring_gate_owner_death_negative
+                                            ? "owner death negative]: "
+                                            : "spike]: ")))
+                      << gate_error << "\n";
+            dump_log(temp.rut_log, "RUT io_uring gate log");
+            return 1;
+        }
+        if (rut_iouring_gate_identity_negative) {
+            std::cerr << "PASS: duplicate target SQ mapping failed closed with ring_ready=0\n";
+            return 0;
+        }
+        if (rut_iouring_gate_ready_mutation_negative) {
+            std::cerr << "PASS: ready SQ mask mutation failed closed and could not revive\n";
+            return 0;
+        }
+        if (rut_iouring_gate_owner_death_negative) {
+            std::cerr << "PASS: robust identity owner death recovered without blocking\n";
+            return 0;
+        }
+        std::cerr << "PASS: converter-generated RUT gate reached "
+                     "HIT/R2_SENT/R2_ARRIVED/RELEASED with no pre-release downstream byte "
+                     "and emitted both exact 502 responses\n";
+        return 0;
+    }
     const char* suffix = strrchr(temp.path, '/');
     const std::string probe_name =
         "rut-nginx-probe-" + std::to_string(getpid()) + "-" + (suffix ? suffix + 1 : "tmp");
