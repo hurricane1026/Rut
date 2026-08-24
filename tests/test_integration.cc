@@ -17650,6 +17650,61 @@ route GET "/buffered" {
     }
 };
 
+// Ordinary-source lifetime for the #276 late-successor production wire.  The
+// first route deliberately uses the same strict configured connect-failure
+// policy as the bounded converter profile; the second route is an ordinary JIT
+// local response, so it cannot accidentally exercise #278's second strict
+// forward policy.
+struct PublicValidatedFailureLateSuccessorSourceResources
+    : PublicResponseReadDeadlineSourceResources {
+    bool compile(u16 backend_port) {
+        std::string source =
+            "upstream backend at \"127.0.0.1:" + std::to_string(backend_port) + "\"\n";
+        source += R"rut(
+route GET "/buffered" {
+  return forward(backend,
+    request_policy: { version: "HTTP/1.1", host: "upstream", connection: "omit",
+      strip_headers: ["Connection", "Keep-Alive", "TE", "Expect", "Upgrade"] },
+    response_policy: { version: "HTTP/1.1", framing: "content_length",
+      connection: "request", head_mode: "reject", server: "buffered-test",
+      date: "current", hide_headers: ["Date", "Server"] },
+    failure_policy: { version: "HTTP/1.1", status: 502, reason: "Origin Failed",
+      content_type: "text/plain", server: "buffered-test", date: "current",
+      connection: "request", head_mode: "reject", body: b"default failure\n" },
+    timeout_failure_policy: { version: "HTTP/1.1", status: 504,
+      reason: "Response Read Deadline", content_type: "text/plain",
+      server: "buffered-test", date: "current", connection: "request",
+      head_mode: "reject", body: b"configured deadline\n" },
+    response_read_timeout: 1s,
+    response_buffering: "complete_content_length")
+}
+
+route GET "/static" {
+  return response(200, body: "successor-static")
+}
+)rut";
+
+        auto lexed = rut::lex({source.data(), static_cast<u32>(source.size())});
+        if (!lexed) return false;
+        auto ast = rut::parse_file(lexed.value());
+        if (!ast) return false;
+        std::unique_ptr<rut::AstFile> ast_owned(ast.value());
+        auto hir = rut::analyze_file(*ast_owned);
+        if (!hir) return false;
+        std::unique_ptr<rut::HirModule> hir_owned(hir.value());
+        auto mir = rut::build_mir(*hir_owned);
+        if (!mir) return false;
+        std::unique_ptr<rut::MirModule> mir_owned(mir.value());
+        if (!rut::lower_to_rir(*mir_owned, rir)) return false;
+        auto cg = rut::jit::codegen(rir.module);
+        if (!cg.ok || !engine.init()) return false;
+        engine_ready = true;
+        if (!engine.compile(cg.mod, cg.ctx)) return false;
+        if (!rut::populate_route_config(cfg, rir.module)) return false;
+        return rut::register_jit_routes(cfg, rir.module, engine);
+    }
+};
+
 // Exact-POST policy-1 sibling for the closed bodyless non-HEAD buffering
 // profile. Keeping it separate leaves the existing GET source and wire as
 // independent evidence.
@@ -23991,6 +24046,401 @@ TEST(
     // Only the async ConnectCompletion path records passive health. Exactly two
     // failures therefore prove two real episodes and fence duplicate mutation.
     CHECK_EQ(runner.final_health.fails, 2u);
+    CHECK_EQ(runner.final_health.eject_until_us, 0u);
+    CHECK_FALSE(runner.final_health.active_down);
+}
+
+TEST(route, ordinary_source_validated_failure_late_successor_iouring) {
+    using namespace rut;
+    if (!iouring_socket_live()) SKIP("io_uring async socket ops unavailable in this environment");
+
+    static constexpr char kRequestOne[] =
+        "GET /buffered?late=one HTTP/1.1\r\n"
+        "Host: client.example\r\n"
+        "X-Request: one\r\n\r\n";
+    static constexpr char kRequestTwo[] =
+        "GET /static HTTP/1.1\r\n"
+        "Host: client.example\r\n"
+        "Connection: close\r\n"
+        "X-Request: two\r\n\r\n";
+    static constexpr char kExpectedOne[] =
+        "HTTP/1.1 502 Origin Failed\r\n"
+        "Server: buffered-test\r\n"
+        "Date: XXXXXXXXXXXXXXXXXXXXXXXXXXXXX\r\n"
+        "Content-Type: text/plain\r\n"
+        "Content-Length: 16\r\n"
+        "Connection: keep-alive\r\n\r\n"
+        "default failure\n";
+    static constexpr char kExpectedTwo[] =
+        "HTTP/1.1 200 OK\r\n"
+        "Content-Length: 16\r\n"
+        "Content-Type: text/plain; charset=utf-8\r\n"
+        "Connection: close\r\n\r\n"
+        "successor-static";
+    static_assert(sizeof("successor-static") - 1u == 16u);
+
+    DeadEndpoint dead;
+    REQUIRE(dead.reserve());
+    i32 accepts_connections = -1;
+    socklen_t accepts_connections_len = sizeof(accepts_connections);
+    REQUIRE_EQ(
+        getsockopt(
+            dead.fd, SOL_SOCKET, SO_ACCEPTCONN, &accepts_connections, &accepts_connections_len),
+        0);
+    REQUIRE_EQ(accepts_connections, 0);
+
+    PublicValidatedFailureLateSuccessorSourceResources resources;
+    REQUIRE(resources.compile(dead.port));
+    REQUIRE_EQ(resources.cfg.route_count, 2u);
+    const RouteEntry* forward_route = resources.cfg.match(
+        reinterpret_cast<const u8*>("/buffered"), sizeof("/buffered") - 1u, kRouteMethodGet);
+    const RouteEntry* static_route = resources.cfg.match(
+        reinterpret_cast<const u8*>("/static"), sizeof("/static") - 1u, kRouteMethodGet);
+    REQUIRE(forward_route != nullptr);
+    REQUIRE(static_route != nullptr);
+    CHECK_EQ(forward_route->action, RouteAction::JitHandler);
+    CHECK_EQ(forward_route->preflight_forward_policy_bundle_id, 1u);
+    CHECK_EQ(static_route->action, RouteAction::JitHandler);
+    CHECK_NE(static_route->fn, nullptr);
+    REQUIRE_EQ(resources.cfg.response_body_count, 1u);
+    REQUIRE_EQ(resources.cfg.response_bodies[0].len, 16u);
+    CHECK_EQ(memcmp(resources.cfg.response_bodies[0].data, "successor-static", 16), 0);
+
+    Shard<IoUringEventLoop> shard;
+    struct ShardGuard {
+        Shard<IoUringEventLoop>& shard;
+        i32 listen_fd = -1;
+        bool initialized = false;
+        ~ShardGuard() {
+            if (initialized) shard.shutdown();
+            if (listen_fd >= 0) close(listen_fd);
+        }
+    } shard_guard{shard, create_listen_socket(0).value_or(-1)};
+    REQUIRE_GE(shard_guard.listen_fd, 0);
+    const u16 port = get_port(shard_guard.listen_fd);
+    REQUIRE(shard.init(0, shard_guard.listen_fd).has_value());
+    shard_guard.initialized = true;
+    shard.route_config = &resources.cfg;
+    shard.active_config = shard.route_config;
+    REQUIRE(shard.loop != nullptr);
+
+    // This runner preserves the production backend.wait()/dispatch_batch()
+    // scheduler pair and pauses only between those batches. The pause leaves a
+    // newly staged Send in the userspace SQ while the already submitted
+    // multishot Recv remains owned by the kernel.
+    struct BarrierRunner {
+        Shard<IoUringEventLoop>& shard;
+        pthread_t thread{};
+        bool started = false;
+        std::atomic<bool> entered{false};
+        std::atomic<bool> send_staged{false};
+        std::atomic<bool> release{false};
+        std::atomic<bool> exited{false};
+
+        u32 conn_id = UINT32_MAX;
+        i32 connect_result = 0;
+        bool request_one_f_more = false;
+        bool request_one_exact = false;
+        bool request_one_admitted = false;
+        u32 sq_head_before_dispatch = 0;
+        u32 sq_tail_before_dispatch = 0;
+        u32 sq_pending_before_dispatch = 0;
+        u32 sq_head_after_dispatch = 0;
+        u32 sq_tail_after_dispatch = 0;
+        u32 sq_pending_after_dispatch = 0;
+        u32 staged_sqe_index = UINT32_MAX;
+        io_uring_sqe staged_sqe{};
+        u32 staged_send_conn_id = UINT32_MAX;
+        IoEventType staged_send_type = IoEventType::Count;
+        u32 staged_send_generation = UINT32_MAX;
+        const u8* staged_response = nullptr;
+        u32 staged_response_len = 0;
+        BackendHealth final_health{};
+
+        static void* run(void* arg) {
+            auto* self = static_cast<BarrierRunner*>(arg);
+            auto* loop = self->shard.loop;
+            reset_backend_health();
+            loop->backend.add_accept();
+            loop->fire_due_timers();
+            loop->arm_health_on_config_change();
+            self->entered.store(true, std::memory_order_release);
+            IoEvent events[kMaxEventsPerWait];
+
+            while (loop->is_running()) {
+                loop->retry_strict_upstream_retirement_cancels();
+                const u32 n = loop->backend.wait(
+                    events, kMaxEventsPerWait, loop->conns, IoUringEventLoop::kMaxConns);
+                if (loop->backend.failure_code() != 0) {
+                    loop->stop();
+                    break;
+                }
+
+                bool failure_batch = false;
+                for (u32 i = 0; i < n; i++) {
+                    const IoEvent& event = events[i];
+                    if (event.type == IoEventType::Recv && event.result > 0 && event.more != 0) {
+                        const Connection& conn = loop->conns[event.conn_id];
+                        if (conn.recv_buf.len() == sizeof(kRequestOne) - 1u &&
+                            memcmp(conn.recv_buf.data(), kRequestOne, sizeof(kRequestOne) - 1u) ==
+                                0) {
+                            self->conn_id = event.conn_id;
+                            self->request_one_f_more = true;
+                            self->request_one_exact = true;
+                        }
+                    }
+                    if (event.type == IoEventType::UpstreamConnect && event.result < 0 &&
+                        event.conn_id == self->conn_id) {
+                        failure_batch = true;
+                        self->connect_result = event.result;
+                    }
+                }
+
+                if (failure_batch) {
+                    self->sq_head_before_dispatch =
+                        __atomic_load_n(loop->backend.sq_head, __ATOMIC_ACQUIRE);
+                    self->sq_tail_before_dispatch =
+                        __atomic_load_n(loop->backend.sq_tail, __ATOMIC_ACQUIRE);
+                    self->sq_pending_before_dispatch = loop->backend.pending;
+                }
+
+                loop->dispatch_batch(events, n);
+
+                if (self->conn_id != UINT32_MAX && !failure_batch && self->request_one_exact) {
+                    const Connection& conn = loop->conns[self->conn_id];
+                    self->request_one_admitted = conn.fd >= 0 && conn.upstream_connect_armed &&
+                                                 conn.req_start_us != 0 && conn.recv_armed &&
+                                                 conn.request_config == self->shard.route_config;
+                }
+
+                if (failure_batch) {
+                    self->sq_head_after_dispatch =
+                        __atomic_load_n(loop->backend.sq_head, __ATOMIC_ACQUIRE);
+                    self->sq_tail_after_dispatch =
+                        __atomic_load_n(loop->backend.sq_tail, __ATOMIC_ACQUIRE);
+                    self->sq_pending_after_dispatch = loop->backend.pending;
+                    if (self->sq_tail_after_dispatch == self->sq_tail_before_dispatch + 1u) {
+                        const u32 mask = *loop->backend.sq_ring_mask;
+                        const u32 array_slot = self->sq_tail_before_dispatch & mask;
+                        self->staged_sqe_index = loop->backend.sq_array[array_slot];
+                        if (self->staged_sqe_index < loop->backend.sq_ring_entries)
+                            self->staged_sqe = loop->backend.sq_entries[self->staged_sqe_index];
+                    }
+                    const u64 user_data = self->staged_sqe.user_data;
+                    self->staged_send_type = static_cast<IoEventType>(user_data & 0xFFu);
+                    self->staged_send_conn_id =
+                        static_cast<u32>((user_data >> 8) & 0xFFFFFFu);
+                    self->staged_send_generation = static_cast<u32>(user_data >> 32);
+                    const auto& send = loop->backend.send_state[self->conn_id];
+                    self->staged_response = send.src;
+                    self->staged_response_len = send.remaining;
+                    self->send_staged.store(true, std::memory_order_release);
+                    while (!self->release.load(std::memory_order_acquire) && loop->is_running())
+                        sched_yield();
+                }
+
+                loop->poll_command();
+                loop->fire_due_timers();
+                loop->arm_health_on_config_change();
+            }
+            const BackendHealth* health = backend_health(0, 0);
+            if (health != nullptr) self->final_health = *health;
+            self->exited.store(true, std::memory_order_release);
+            return nullptr;
+        }
+
+        bool start() {
+            const i32 rc = pthread_create(&thread, nullptr, run, this);
+            started = rc == 0;
+            return started;
+        }
+
+        void join() {
+            if (!started) return;
+            pthread_join(thread, nullptr);
+            started = false;
+        }
+
+        ~BarrierRunner() {
+            release.store(true, std::memory_order_release);
+            if (started) {
+                shard.stop();
+                join();
+            }
+        }
+    } runner{shard};
+    REQUIRE(runner.start());
+    const i64 entered_deadline_ms = test_mono_ms() + 3000;
+    while (!runner.entered.load(std::memory_order_acquire) &&
+           test_mono_ms() < entered_deadline_ms)
+        sched_yield();
+    REQUIRE(runner.entered.load(std::memory_order_acquire));
+
+    struct ClientGuard {
+        i32 fd = -1;
+        ~ClientGuard() {
+            if (fd >= 0) close(fd);
+        }
+    } client{connect_to(port)};
+    REQUIRE_GE(client.fd, 0);
+    set_socket_timeouts(client.fd, 8);
+    REQUIRE(send_all(client.fd, kRequestOne, sizeof(kRequestOne) - 1u));
+
+    const i64 staged_deadline_ms = test_mono_ms() + 5000;
+    while (!runner.send_staged.load(std::memory_order_acquire) &&
+           test_mono_ms() < staged_deadline_ms)
+        sched_yield();
+    REQUIRE(runner.send_staged.load(std::memory_order_acquire));
+    REQUIRE(runner.request_one_f_more);
+    REQUIRE(runner.request_one_exact);
+    REQUIRE(runner.request_one_admitted);
+    REQUIRE_LT(runner.connect_result, 0);
+
+    auto& backend = shard.loop->backend;
+    REQUIRE_EQ(runner.sq_head_after_dispatch, runner.sq_head_before_dispatch);
+    REQUIRE_EQ(runner.sq_tail_after_dispatch, runner.sq_tail_before_dispatch + 1u);
+    REQUIRE_EQ(runner.sq_pending_after_dispatch, runner.sq_pending_before_dispatch + 1u);
+    REQUIRE_LT(runner.staged_sqe_index, backend.sq_ring_entries);
+    REQUIRE_EQ(runner.staged_sqe.opcode, IORING_OP_SEND);
+    REQUIRE_EQ(runner.staged_sqe.fd, shard.loop->conns[runner.conn_id].fd);
+    REQUIRE_EQ(runner.staged_send_conn_id, runner.conn_id);
+    REQUIRE_EQ(runner.staged_send_type, IoEventType::Send);
+    REQUIRE_EQ(runner.staged_send_generation, 0u);
+    REQUIRE_EQ(runner.staged_sqe.addr, reinterpret_cast<u64>(runner.staged_response));
+    REQUIRE_EQ(runner.staged_sqe.len, runner.staged_response_len);
+    REQUIRE_EQ(runner.staged_response_len,
+               shard.loop->conns[runner.conn_id].response_header_buf.len());
+    REQUIRE_EQ(runner.staged_response,
+               shard.loop->conns[runner.conn_id].response_header_buf.data());
+    REQUIRE_EQ(runner.staged_response,
+               shard.loop->backend.send_state[runner.conn_id].src);
+    REQUIRE_EQ(runner.staged_response_len, sizeof(kExpectedOne) - 1u);
+    char staged_response_copy[sizeof(kExpectedOne)]{};
+    memcpy(staged_response_copy, runner.staged_response, runner.staged_response_len);
+    REQUIRE(normalize_public_date(staged_response_copy, runner.staged_response_len));
+    REQUIRE_EQ(memcmp(staged_response_copy, kExpectedOne, runner.staged_response_len), 0);
+
+    // Only now publish request 2.  The runner is paused, so no subsequent
+    // io_uring_enter can submit response 1's staged Send while the raw CQ proof
+    // below waits for the already-owned multishot Recv.
+    REQUIRE(send_all(client.fd, kRequestTwo, sizeof(kRequestTwo) - 1u));
+    const u32 raw_head = __atomic_load_n(backend.cq_head, __ATOMIC_ACQUIRE);
+    u32 raw_cursor = raw_head;
+    u32 raw_request_len = 0;
+    char raw_request[sizeof(kRequestTwo)]{};
+    bool raw_more_seen = false;
+    bool raw_terminal_seen = false;
+    const i64 raw_deadline_ms = test_mono_ms() + 5000;
+    while (raw_request_len < sizeof(kRequestTwo) - 1u && test_mono_ms() < raw_deadline_ms) {
+        const u32 raw_tail = __atomic_load_n(backend.cq_tail, __ATOMIC_ACQUIRE);
+        REQUIRE_LE(raw_tail - raw_head, backend.cq_ring_entries);
+        while (raw_cursor != raw_tail) {
+            const io_uring_cqe& cqe =
+                backend.cq_entries[raw_cursor & *backend.cq_ring_mask];
+            u32 cqe_conn = UINT32_MAX;
+            u32 cqe_aux = UINT32_MAX;
+            u32 cqe_episode = UINT32_MAX;
+            IoEventType cqe_type = IoEventType::Count;
+            cqe_type = static_cast<IoEventType>(cqe.user_data & 0xFFu);
+            cqe_conn = static_cast<u32>((cqe.user_data >> 8) & 0xFFFFFFu);
+            cqe_aux = static_cast<u32>(cqe.user_data >> 32);
+            cqe_episode = 0;
+            if (cqe_conn == runner.conn_id && cqe_type == IoEventType::Send)
+                FAIL("response 1 Send completed before its SQ submission barrier was released");
+            if (cqe_conn == runner.conn_id && cqe_type == IoEventType::Recv) {
+                REQUIRE_EQ(cqe_aux, 0u);
+                REQUIRE_EQ(cqe_episode, 0u);
+                REQUIRE_GT(cqe.res, 0);
+                REQUIRE(cqe.flags & IORING_CQE_F_BUFFER);
+                const u16 buf_id =
+                    static_cast<u16>(cqe.flags >> IORING_CQE_BUFFER_SHIFT);
+                REQUIRE_LT(buf_id, kProvidedBufCount);
+                REQUIRE_LE(static_cast<u32>(cqe.res), kProvidedBufSize);
+                REQUIRE_LE(raw_request_len + static_cast<u32>(cqe.res),
+                           sizeof(kRequestTwo) - 1u);
+                const u8* bytes =
+                    backend.buf_base + static_cast<u64>(buf_id) * kProvidedBufSize;
+                memcpy(raw_request + raw_request_len, bytes, static_cast<u32>(cqe.res));
+                raw_request_len += static_cast<u32>(cqe.res);
+                if (cqe.flags & IORING_CQE_F_MORE)
+                    raw_more_seen = true;
+                else
+                    raw_terminal_seen = true;
+            }
+            raw_cursor++;
+        }
+        if (raw_request_len < sizeof(kRequestTwo) - 1u) sched_yield();
+    }
+    REQUIRE_EQ(raw_request_len, sizeof(kRequestTwo) - 1u);
+    REQUIRE_EQ(memcmp(raw_request, kRequestTwo, raw_request_len), 0);
+    CHECK(raw_more_seen || raw_terminal_seen);
+    REQUIRE_EQ(__atomic_load_n(backend.cq_head, __ATOMIC_ACQUIRE), raw_head);
+    REQUIRE_EQ(__atomic_load_n(backend.sq_head, __ATOMIC_ACQUIRE),
+               runner.sq_head_after_dispatch);
+    REQUIRE_EQ(backend.pending, runner.sq_pending_after_dispatch);
+
+    runner.release.store(true, std::memory_order_release);
+
+    char wire[sizeof(kExpectedOne) + sizeof(kExpectedTwo) + 32]{};
+    const u32 expected_wire_len = sizeof(kExpectedOne) - 1u + sizeof(kExpectedTwo) - 1u;
+    u32 wire_len = 0;
+    const i64 wire_deadline_ms = test_mono_ms() + 5000;
+    while (wire_len < expected_wire_len && test_mono_ms() < wire_deadline_ms) {
+        const i64 remaining_ms = wire_deadline_ms - test_mono_ms();
+        if (remaining_ms <= 0) break;
+        const i32 got = recv_timeout(client.fd,
+                                     wire + wire_len,
+                                     sizeof(wire) - wire_len,
+                                     static_cast<i32>(remaining_ms));
+        REQUIRE_GT(got, 0);
+        wire_len += static_cast<u32>(got);
+        REQUIRE_LE(wire_len, expected_wire_len);
+    }
+    REQUIRE_EQ(wire_len, expected_wire_len);
+    REQUIRE(normalize_public_date(wire, wire_len));
+    REQUIRE_EQ(memcmp(wire, kExpectedOne, sizeof(kExpectedOne) - 1u), 0);
+    REQUIRE_EQ(memcmp(wire + sizeof(kExpectedOne) - 1u,
+                      kExpectedTwo,
+                      sizeof(kExpectedTwo) - 1u),
+               0);
+
+    char eof_probe[32];
+    const i64 eof_deadline_ms = test_mono_ms() + 3000;
+    i32 eof_result = -EAGAIN;
+    while (test_mono_ms() < eof_deadline_ms) {
+        const i64 remaining_ms = eof_deadline_ms - test_mono_ms();
+        if (remaining_ms <= 0) break;
+        eof_result = recv_timeout(
+            client.fd, eof_probe, sizeof(eof_probe), static_cast<i32>(remaining_ms));
+        if (eof_result != -EINTR) break;
+    }
+    REQUIRE_EQ(eof_result, 0);
+    REQUIRE(shard.loop->is_running());
+    REQUIRE_EQ(shard.backend_failure_code(), 0);
+
+    REQUIRE_EQ(close(client.fd), 0);
+    client.fd = -1;
+    shard.stop();
+    runner.join();
+    REQUIRE(runner.exited.load(std::memory_order_acquire));
+
+    CHECK_EQ(shard.backend_failure_code(), 0);
+    CHECK_FALSE(shard.loop->is_running());
+    CHECK_EQ(shard.loop->active_count(), 0u);
+    CHECK_EQ(shard.loop->pending_free_count, 0u);
+    CHECK_EQ(shard.loop->pool.in_use(), 0u);
+    CHECK_EQ(shard.upstream->idle_count.load(std::memory_order_acquire), 0u);
+    CHECK_EQ(shard.upstream->free_top, UpstreamPool::kMaxConns);
+    CHECK_EQ(shard.shard_metrics.connections_total, 1u);
+    CHECK_EQ(shard.shard_metrics.connections_active, 0u);
+    CHECK_EQ(shard.shard_metrics.connections_closed, 1u);
+    CHECK_EQ(shard.shard_metrics.requests_total, 2u);
+    CHECK_EQ(shard.shard_metrics.requests_active, 0u);
+    CHECK_EQ(shard.shard_metrics.request_latency.count, 2u);
+    const u64 final_epoch = shard.epoch.epoch.load(std::memory_order_acquire);
+    CHECK_GE(final_epoch, 4u);
+    CHECK_EQ(final_epoch % 2u, 0u);
+    CHECK_EQ(runner.final_health.fails, 1u);
     CHECK_EQ(runner.final_health.eject_until_us, 0u);
     CHECK_FALSE(runner.final_health.active_down);
 }
