@@ -20716,6 +20716,27 @@ TEST(iouring_validated_failure_pipeline,
         REQUIRE_EQ(metrics.requests_active, 1u);
         REQUIRE_EQ(epoch.epoch.load(std::memory_order_acquire), 1u);
 
+        const u32 advanced_episode = conn.upstream_episode;
+        const auto check_connect_completion_neutrality = [&] {
+            CHECK_EQ(conn.upstream_episode, advanced_episode);
+            CHECK_EQ(conn.upstream_retiring_episode, failed_episode);
+            CHECK_FALSE(conn.upstream_retirement_active);
+            CHECK_EQ(conn.upstream_retirement_target_owned, 0u);
+            CHECK_EQ(conn.upstream_retirement_cancel_owned, 0u);
+            CHECK_EQ(conn.upstream_retirement_cancel_retry, 0u);
+            CHECK_EQ(loop->upstream_retirement_retry_count, 0u);
+            CHECK_EQ(conn.upstream_close_episode, 0u);
+            CHECK_EQ(conn.upstream_close_target_owned, 0u);
+            CHECK_EQ(conn.upstream_close_cancel_owned, 0u);
+            CHECK_FALSE(conn.upstream_close_pause_cancel_owned);
+            CHECK_EQ(conn.response_read_deadline_state, ResponseReadDeadlineState::None);
+            CHECK(conn.response_read_deadline_owner_is_neutral());
+        };
+        if (test.site == LateFailureSite::ConnectCompletion) {
+            CHECK_NE(advanced_episode, failed_episode);
+            check_connect_completion_neutrality();
+        }
+
         // The successor arrives only after request 1 has been admitted and its
         // configured 502 Send owns the downstream. The multishot Recv remains
         // live (F_MORE), so no second Recv owner may be fabricated.
@@ -20742,6 +20763,7 @@ TEST(iouring_validated_failure_pipeline,
         CHECK_EQ(epoch.epoch.load(std::memory_order_acquire), 3u);
         CHECK(buf_has(conn.send_buf.data(), conn.send_buf.len(), "HTTP/1.1 204"));
         CHECK_EQ(health->fails, expected_health);
+        if (test.site == LateFailureSite::ConnectCompletion) check_connect_completion_neutrality();
 
         AccessLogEntry access1{};
         REQUIRE(access_log.pop(access1));
@@ -20760,15 +20782,28 @@ TEST(iouring_validated_failure_pipeline,
             const u64 epoch_before_duplicate = epoch.epoch.load(std::memory_order_acquire);
             const u32 request2_len = conn.recv_buf.len();
             const u32 request2_send_len = conn.send_buf.len();
+            const auto request2_handler_before_duplicate = conn.on_send;
+            const bool send_armed_before_duplicate = conn.send_armed;
+            const bool recv_armed_before_duplicate = conn.recv_armed;
+            const u32 pipeline_depth_before_duplicate = conn.pipeline_depth;
+            REQUIRE_EQ(request2_len, sizeof(kSuccessor) - 1u);
+            REQUIRE_EQ(__builtin_memcmp(conn.recv_buf.data(), kSuccessor, request2_len), 0);
             loop->dispatch(
                 {id, -ECONNREFUSED, 0, 0, IoEventType::UpstreamConnect, 0, 0, failed_episode});
             CHECK_EQ(conn.pending_ops, pending_before_duplicate);
             CHECK_EQ(conn.recv_buf.len(), request2_len);
+            CHECK_EQ(__builtin_memcmp(conn.recv_buf.data(), kSuccessor, request2_len), 0);
             CHECK_EQ(conn.send_buf.len(), request2_send_len);
+            CHECK_EQ(conn.on_send, request2_handler_before_duplicate);
+            CHECK_EQ(conn.on_send, &on_response_sent<IoUringEventLoop>);
+            CHECK_EQ(conn.send_armed, send_armed_before_duplicate);
+            CHECK_EQ(conn.recv_armed, recv_armed_before_duplicate);
+            CHECK_EQ(conn.pipeline_depth, pipeline_depth_before_duplicate);
             CHECK_EQ(conn.resp_status, 204u);
             CHECK_EQ(metrics.requests_total, requests_before_duplicate);
             CHECK_EQ(epoch.epoch.load(std::memory_order_acquire), epoch_before_duplicate);
             CHECK_EQ(health->fails, expected_health);
+            check_connect_completion_neutrality();
         }
 
         const u32 response2_len = conn.send_buf.len();
@@ -20791,6 +20826,87 @@ TEST(iouring_validated_failure_pipeline,
 
         cleanup_late_failure_fixture(loop, fixture);
     }
+}
+
+TEST(iouring_validated_failure_pipeline,
+     complete_positive_terminal_successor_consumes_recv_before_immediate_dispatch) {
+    ScopedBackendHealthReset health_reset{};
+    ScopedIoUringLoopForRetirement guard;
+    if (!guard.init()) SKIP("io_uring unavailable");
+    auto* loop = guard.loop;
+    ShardMetrics metrics{};
+    metrics.init();
+    loop->metrics = &metrics;
+    RouteConfig config{};
+    PreconnectConnectSubmitFixture fixture{};
+    u32 failed_episode = 0;
+    REQUIRE(stage_late_failure_response(loop,
+                                        config,
+                                        LateFailureSite::ConnectCompletion,
+                                        AsyncConnectFailureProfile::BodylessGet,
+                                        &fixture,
+                                        &failed_episode));
+    REQUIRE(config.add_static("/two", kRouteMethodGet, 206));
+    Connection& conn = *fixture.conn;
+    const u32 id = conn.id;
+    static constexpr u8 kSuccessor[] = "GET /two HTTP/1.1\r\nHost: client.example\r\n\r\n";
+
+    // Request 2 arrives only after the validated failure has staged request 1's
+    // downstream Send. Deliver it through the still-live multishot Recv as a
+    // positive terminal event, rather than pre-populating a fixture state.
+    REQUIRE(conn.send_armed);
+    REQUIRE(conn.recv_armed);
+    REQUIRE_EQ(conn.pending_ops, 2u);
+    REQUIRE_EQ(conn.recv_buf.write(kSuccessor, sizeof(kSuccessor) - 1u), sizeof(kSuccessor) - 1u);
+    __atomic_store_n(loop->backend.sq_tail, fixture.sq_tail, __ATOMIC_RELEASE);
+    loop->backend.pending = fixture.backend_pending;
+    const u32 tail_before_terminal_recv = __atomic_load_n(loop->backend.sq_tail, __ATOMIC_ACQUIRE);
+    loop->dispatch({id, static_cast<i32>(sizeof(kSuccessor) - 1u), 0, 0, IoEventType::Recv, 0});
+
+    REQUIRE_GE(conn.fd, 0);
+    CHECK(conn.send_armed);
+    CHECK_FALSE(conn.recv_armed);
+    CHECK_EQ(conn.pending_ops, 1u);
+    CHECK_EQ(conn.recv_buf.len(), conn.req_initial_send_len + sizeof(kSuccessor) - 1u);
+    CHECK_EQ(__atomic_load_n(loop->backend.sq_tail, __ATOMIC_ACQUIRE), tail_before_terminal_recv);
+    CHECK_EQ(metrics.requests_total, 0u);
+    CHECK_EQ(metrics.requests_active, 1u);
+
+    const u32 response1_len = conn.response_header_buf.len();
+    loop->backend.send_state[id].remaining = 0;
+    loop->dispatch({id, static_cast<i32>(response1_len), 0, 0, IoEventType::Send, 0});
+
+    REQUIRE_GE(conn.fd, 0);
+    CHECK_EQ(conn.resp_status, 206u);
+    CHECK_EQ(conn.on_send, &on_response_sent<IoUringEventLoop>);
+    CHECK(conn.send_armed);
+    CHECK_FALSE(conn.recv_armed);
+    CHECK_EQ(conn.pending_ops, 1u);
+    CHECK_EQ(conn.pipeline_depth, 1u);
+    CHECK_EQ(conn.recv_buf.len(), sizeof(kSuccessor) - 1u);
+    CHECK_EQ(__atomic_load_n(loop->backend.sq_tail, __ATOMIC_ACQUIRE),
+             tail_before_terminal_recv + 1u);
+    CHECK_EQ(loop->backend.pending, fixture.backend_pending + 1u);
+    CHECK_EQ(metrics.requests_total, 1u);
+    CHECK_EQ(metrics.requests_active, 1u);
+    CHECK(buf_has(conn.send_buf.data(), conn.send_buf.len(), "HTTP/1.1 206"));
+
+    const u32 response2_len = conn.send_buf.len();
+    loop->backend.send_state[id].remaining = 0;
+    loop->dispatch({id, static_cast<i32>(response2_len), 0, 0, IoEventType::Send, 0});
+
+    REQUIRE_GE(conn.fd, 0);
+    CHECK_FALSE(conn.send_armed);
+    CHECK(conn.recv_armed);
+    CHECK_EQ(conn.pending_ops, 1u);
+    CHECK_EQ(conn.pipeline_depth, 0u);
+    CHECK_EQ(__atomic_load_n(loop->backend.sq_tail, __ATOMIC_ACQUIRE),
+             tail_before_terminal_recv + 2u);
+    CHECK_EQ(loop->backend.pending, fixture.backend_pending + 2u);
+    CHECK_EQ(metrics.requests_total, 2u);
+    CHECK_EQ(metrics.requests_active, 0u);
+
+    cleanup_late_failure_fixture(loop, fixture);
 }
 
 TEST(iouring_validated_failure_pipeline,
