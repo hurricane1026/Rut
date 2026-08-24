@@ -847,26 +847,135 @@ static nginx::Server api_server() {
     return server;
 }
 
-TEST(nginx_converter, rejects_parsed_exact_local_return_until_lowering_increment) {
-    const char source[] =
+TEST(nginx_converter, lowers_exact_local_return_in_either_declaration_order_to_stable_rut) {
+    const char root_first[] =
+        "server { listen 8080; location / { proxy_pass http://127.0.0.1:9000; } "
+        "location = /static { return 200 \"successor-static\"; } }";
+    const char exact_first[] =
         "server { listen 8080; location = /static { return 200 \"successor-static\"; } "
         "location / { proxy_pass http://127.0.0.1:9000; } }";
-    const auto parsed = nginx::parse({source, sizeof(source) - 1u});
-    REQUIRE(parsed);
-    REQUIRE(parsed.value().exact_local_return.present);
-    const auto lowered = nginx::lower_to_rut(parsed.value());
-    REQUIRE_FALSE(lowered);
-    CHECK_EQ(lowered.error().code, FrontendError::UnsupportedSyntax);
-    CHECK(lowered.error().detail.eq(lit_str("exact local return lowering is not implemented")));
-    CHECK_EQ(lowered.error().span.start, parsed.value().exact_local_return.span.start);
+    const auto root_parsed = nginx::parse({root_first, sizeof(root_first) - 1u});
+    const auto exact_parsed = nginx::parse({exact_first, sizeof(exact_first) - 1u});
+    REQUIRE(root_parsed);
+    REQUIRE(exact_parsed);
+    const auto root_lowered = nginx::lower_to_rut(root_parsed.value());
+    const auto exact_lowered = nginx::lower_to_rut(exact_parsed.value());
+    const auto legacy = nginx::lower_to_rut(canonical_server());
+    REQUIRE(root_lowered);
+    REQUIRE(exact_lowered);
+    REQUIRE(legacy);
+    CHECK(root_lowered.value().view().eq(exact_lowered.value().view()));
 
-    auto forged = canonical_server();
-    forged.exact_local_return.response.status = 200;
-    const auto forged_lowered = nginx::lower_to_rut(forged);
-    REQUIRE_FALSE(forged_lowered);
-    CHECK_EQ(forged_lowered.error().code, FrontendError::UnsupportedSyntax);
-    CHECK(forged_lowered.error().detail.eq(
-        lit_str("exact local return lowering is not implemented")));
+    static constexpr char kExactGolden[] =
+        "route exact \"/static\" { return local_response({\n"
+        "  version: \"HTTP/1.1\", status: 200, reason: \"OK\", server: \"nginx/1.29.7\",\n"
+        "  date: \"current\", content_type: \"text/plain\", connection: \"request\",\n"
+        "  head_mode: \"suppress_body\", body: b\"successor-static\"\n"
+        "}) }\n";
+    REQUIRE_EQ(root_lowered.value().len,
+               legacy.value().len + static_cast<u32>(sizeof(kExactGolden) - 1u));
+    CHECK((Str{root_lowered.value().data, legacy.value().len}.eq(legacy.value().view())));
+    CHECK((Str{root_lowered.value().data + legacy.value().len,
+               root_lowered.value().len - legacy.value().len}
+               .eq({kExactGolden, sizeof(kExactGolden) - 1u})));
+}
+
+TEST(nginx_converter, exact_local_return_maximum_body_fits_bounded_source) {
+    static constexpr char kBody[] =
+        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    static_assert(sizeof(kBody) - 1u == nginx::kMaxLocalReturnBodyLen);
+    char source[512]{};
+    const int len =
+        snprintf(source,
+                 sizeof(source),
+                 "server { listen 65535; location / { proxy_pass "
+                 "http://127.0.0.1:65535; } location = /static { return 200 \"%s\"; } }",
+                 kBody);
+    REQUIRE_GT(len, 0);
+    REQUIRE_LT(static_cast<u32>(len), static_cast<u32>(sizeof(source)));
+    const auto parsed = nginx::parse({source, static_cast<u32>(len)});
+    REQUIRE(parsed);
+    const auto lowered = nginx::lower_to_rut(parsed.value());
+    REQUIRE(lowered);
+    CHECK_EQ(lowered.value().len, 5200u);
+    CHECK_LT(lowered.value().len, nginx::RutSource::kCapacity);
+    const auto lexed = lex(lowered.value().view());
+    REQUIRE(lexed);
+}
+
+TEST(nginx_converter, rejects_forged_exact_local_return_model_inconsistencies) {
+    static constexpr char kSource[] =
+        "server { listen 8080; location / { proxy_pass http://127.0.0.1:9000; } "
+        "location = /static { return 200 \"successor-static\"; } }";
+    const auto parsed = nginx::parse({kSource, sizeof(kSource) - 1u});
+    REQUIRE(parsed);
+    const auto expect_rejected = [&](const nginx::Server& model, Str detail) {
+        const auto result = nginx::lower_to_rut(model);
+        REQUIRE_FALSE(result);
+        CHECK_EQ(result.error().code, FrontendError::UnsupportedSyntax);
+        CHECK(result.error().detail.eq(detail));
+    };
+
+    auto absent_status = canonical_server();
+    absent_status.exact_local_return.response.status = 200;
+    expect_rejected(absent_status, lit_str("invalid absent exact local return model"));
+    auto absent_path = canonical_server();
+    absent_path.exact_local_return.path = lit_str("/static");
+    expect_rejected(absent_path, lit_str("invalid absent exact local return model"));
+    auto missing_presence = parsed.value();
+    missing_presence.exact_local_return.present = false;
+    expect_rejected(missing_presence, lit_str("invalid absent exact local return model"));
+    auto present_only = canonical_server();
+    present_only.exact_local_return.present = true;
+    expect_rejected(present_only, lit_str("invalid exact local return path model"));
+
+    auto wrong_path = parsed.value();
+    wrong_path.exact_local_return.path = lit_str("/other");
+    expect_rejected(wrong_path, lit_str("invalid exact local return path model"));
+    auto short_path = parsed.value();
+    short_path.exact_local_return.path.len--;
+    expect_rejected(short_path, lit_str("invalid exact local return path model"));
+    auto null_path = parsed.value();
+    null_path.exact_local_return.path = {nullptr, 7};
+    expect_rejected(null_path, lit_str("invalid exact local return path model"));
+    auto wrong_status = parsed.value();
+    wrong_status.exact_local_return.response.status = 201;
+    expect_rejected(wrong_status, lit_str("invalid exact local return status"));
+
+    auto empty_body = parsed.value();
+    empty_body.exact_local_return.response.body.len = 0;
+    expect_rejected(empty_body, lit_str("invalid exact local return body"));
+    auto null_body = parsed.value();
+    null_body.exact_local_return.response.body.ptr = nullptr;
+    expect_rejected(null_body, lit_str("invalid exact local return body"));
+    static constexpr char kTooLong[] =
+        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    auto long_body = parsed.value();
+    long_body.exact_local_return.response.body = {kTooLong, sizeof(kTooLong) - 1u};
+    expect_rejected(long_body, lit_str("invalid exact local return body"));
+    auto unsafe_body = parsed.value();
+    unsafe_body.exact_local_return.response.body = lit_str("two words");
+    expect_rejected(unsafe_body, lit_str("invalid exact local return body"));
+
+    auto bad_location_span = parsed.value();
+    bad_location_span.exact_local_return.span = {};
+    expect_rejected(bad_location_span, lit_str("invalid exact local return location spans"));
+    auto outside_server_span = parsed.value();
+    outside_server_span.exact_local_return.span.end = outside_server_span.span.end + 1u;
+    expect_rejected(outside_server_span, lit_str("invalid exact local return location spans"));
+    auto bad_path_length = parsed.value();
+    bad_path_length.exact_local_return.path_span.end++;
+    expect_rejected(bad_path_length, lit_str("invalid exact local return location spans"));
+    auto bad_response_span = parsed.value();
+    bad_response_span.exact_local_return.response.span = {};
+    expect_rejected(bad_response_span, lit_str("invalid exact local return response spans"));
+    auto bad_body_span = parsed.value();
+    bad_body_span.exact_local_return.response.body_span.end++;
+    expect_rejected(bad_body_span, lit_str("invalid exact local return response spans"));
+
+    auto api_fallback = parsed.value();
+    api_fallback.location = api_server().location;
+    expect_rejected(api_fallback, lit_str("exact local return requires location / fallback"));
 }
 
 TEST(nginx_converter, lowers_canonical_model_to_stable_rut_source) {
@@ -1129,6 +1238,100 @@ TEST(nginx_converter, root_maximum_ports_fit_bounded_source_capacity) {
     const auto lexed = lex(lowered.value().view());
     REQUIRE(lexed);
     CHECK_EQ(lexed.value().tokens.len, 530u);
+}
+
+TEST(nginx_converter, emitted_exact_source_reaches_owned_runtime_config) {
+    auto populated = std::make_unique<RouteConfig>();
+    {
+        char nginx_source[] =
+            "server { listen 8080; location = /static { return 200 \"successor-static\"; } "
+            "location / { proxy_pass http://127.0.0.1:9000; } }";
+        auto parsed = nginx::parse({nginx_source, sizeof(nginx_source) - 1u});
+        REQUIRE(parsed);
+        auto lowered = nginx::lower_to_rut(parsed.value());
+        REQUIRE(lowered);
+        memset(nginx_source, 'x', sizeof(nginx_source) - 1u);
+
+        auto lexed = lex(lowered.value().view());
+        REQUIRE(lexed);
+        auto ast = parse_file(lexed.value());
+        REQUIRE(ast);
+        std::unique_ptr<AstFile> ast_owned(ast.value());
+        REQUIRE_EQ(ast_owned->items.len, 9u);
+        CHECK(ast_owned->items[8].kind == AstItemKind::ExactStrictLocalResponse);
+        REQUIRE_EQ(ast_owned->exact_strict_local_response_bindings.len, 1u);
+        REQUIRE_EQ(ast_owned->strict_local_response_policies.len, 4u);
+        const auto& ast_binding = ast_owned->exact_strict_local_response_bindings[0];
+        CHECK_EQ(ast_binding.method, kRouteMethodAny);
+        CHECK_EQ(ast_binding.policy_id, 4u);
+        CHECK((Str{ast_binding.path, ast_binding.path_len}.eq(lit_str("/static"))));
+        const auto& ast_policy = ast_owned->strict_local_response_policies[3];
+        CHECK(ast_policy.version == StrictLocalResponseVersion::Http11);
+        CHECK_EQ(ast_policy.status_code, 200u);
+        CHECK(ast_policy.reason.eq(lit_str("OK")));
+        CHECK(ast_policy.server.eq(lit_str("nginx/1.29.7")));
+        CHECK(ast_policy.date == StrictLocalResponseDate::Current);
+        CHECK(ast_policy.content_type.eq(lit_str("text/plain")));
+        CHECK(ast_policy.connection == StrictLocalResponseConnection::Request);
+        CHECK(ast_policy.head_mode == StrictLocalResponseHeadMode::SuppressBody);
+        CHECK(ast_policy.body.eq(lit_str("successor-static")));
+
+        auto hir = analyze_file(*ast_owned);
+        REQUIRE(hir);
+        std::unique_ptr<HirModule> hir_owned(hir.value());
+        REQUIRE_EQ(hir_owned->routes.len, 3u);
+        REQUIRE_EQ(hir_owned->exact_strict_local_response_bindings.len, 1u);
+        REQUIRE_EQ(hir_owned->strict_local_response_policies.len, 4u);
+        CHECK_EQ(hir_owned->exact_strict_local_response_bindings[0].method, kRouteMethodAny);
+        CHECK_EQ(hir_owned->exact_strict_local_response_bindings[0].policy_id, 4u);
+
+        auto mir = build_mir(*hir_owned);
+        REQUIRE(mir);
+        std::unique_ptr<MirModule> mir_owned(mir.value());
+        REQUIRE_EQ(mir_owned->functions.len, 3u);
+        REQUIRE_EQ(mir_owned->exact_strict_local_response_bindings.len, 1u);
+        REQUIRE_EQ(mir_owned->strict_local_response_policies.len, 4u);
+        CHECK_EQ(mir_owned->exact_strict_local_response_bindings[0].method, kRouteMethodAny);
+        for (u32 i = 0; i < mir_owned->functions.len; i++)
+            CHECK(mir_owned->functions[i].path.eq(lit_str("/")));
+
+        FrontendRirModule rir{};
+        RirGuard rir_guard{rir};
+        REQUIRE(lower_to_rir(*mir_owned, rir));
+        REQUIRE(rir::verify_module(rir.module).ok);
+        REQUIRE_EQ(rir.module.func_count, 3u);
+        REQUIRE_EQ(rir.module.exact_strict_local_response_binding_count, 1u);
+        REQUIRE_EQ(rir.module.strict_local_response_policy_count, 4u);
+        const auto& rir_binding = rir.module.exact_strict_local_response_bindings[0];
+        CHECK_EQ(rir_binding.method, kRouteMethodAny);
+        CHECK_EQ(rir_binding.policy_id, 4u);
+        CHECK((Str{rir_binding.path, rir_binding.path_len}.eq(lit_str("/static"))));
+        for (u32 i = 1; i < kMaxExactStrictLocalResponseBindings; i++)
+            CHECK(exact_strict_local_response_binding_is_neutral(
+                rir.module.exact_strict_local_response_bindings[i]));
+        REQUIRE(populate_route_config(*populated, rir.module));
+        memset(lowered.value().data, 'y', lowered.value().len);
+    }
+
+    REQUIRE(populated->strict_local_response_table_is_valid());
+    // Exact policies are installed as dispatch metadata rather than executable
+    // route functions. The three root fallbacks remain RIR functions above;
+    // production dispatch consults this owned exact table before that prefix
+    // route table is entered.
+    REQUIRE_EQ(populated->route_count, 0u);
+    REQUIRE_EQ(populated->exact_strict_local_response_binding_count, 1u);
+    CHECK((Str{populated->exact_strict_local_response_bindings[0].path,
+               populated->exact_strict_local_response_bindings[0].path_len}
+               .eq(lit_str("/static"))));
+    const u16 exact_id =
+        populated->match_exact_strict_local_response(lit_str("/static?x=1"), kRouteMethodGet);
+    REQUIRE_EQ(exact_id, 4u);
+    CHECK_EQ(populated->match_exact_strict_local_response(lit_str("/static/"), kRouteMethodGet),
+             0u);
+    REQUIRE(populated->strict_local_response_policy_id_is_owned(exact_id));
+    const auto& owned_policy = populated->strict_local_response_policies[exact_id - 1u];
+    CHECK(owned_policy.body.eq(lit_str("successor-static")));
+    CHECK(owned_policy.server.eq(lit_str("nginx/1.29.7")));
 }
 
 // These checks prove only converter golden output and compiler/config ownership.

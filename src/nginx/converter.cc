@@ -58,6 +58,59 @@ Span exact_local_return_span(const Server& server) {
     return server.span;
 }
 
+constexpr bool span_position_is_coherent(const Span& outer, const Span& inner) {
+    if (!is_valid_span(outer) || !is_valid_span(inner) || !span_contains(outer, inner) ||
+        inner.line < outer.line)
+        return false;
+    if (inner.line != outer.line) return true;
+    const u32 offset = inner.start - outer.start;
+    return offset <= 0xFFFFFFFFu - outer.col && inner.col == outer.col + offset;
+}
+
+bool local_return_body_byte_is_safe(char value) {
+    const u8 byte = static_cast<u8>(value);
+    return byte >= 0x21 && byte <= 0x7e && value != '"' && value != '\\' && value != '$' &&
+           value != '#' && value != '{' && value != '}' && value != ';';
+}
+
+FrontendResult<bool> validate_exact_local_return(const Server& server) {
+    const ExactLocalReturnLocation& location = server.exact_local_return;
+    const LocalReturn& response = location.response;
+    if (!location.present) {
+        if (has_exact_local_return_inventory(location))
+            return unsupported(exact_local_return_span(server),
+                               lit_str("invalid absent exact local return model"));
+        return false;
+    }
+
+    if (!eq(location.path, "/static", 7))
+        return unsupported(is_valid_span(location.path_span) ? location.path_span
+                                                             : exact_local_return_span(server),
+                           lit_str("invalid exact local return path model"));
+    if (!span_position_is_coherent(server.span, location.span) ||
+        !span_position_is_coherent(location.span, location.path_span) ||
+        location.path_span.end - location.path_span.start != location.path.len)
+        return unsupported(exact_local_return_span(server),
+                           lit_str("invalid exact local return location spans"));
+    if (response.status != 200)
+        return unsupported(is_valid_span(response.span) ? response.span : location.span,
+                           lit_str("invalid exact local return status"));
+    if (response.body.ptr == nullptr || response.body.len == 0 ||
+        response.body.len > kMaxLocalReturnBodyLen)
+        return unsupported(is_valid_span(response.body_span) ? response.body_span : response.span,
+                           lit_str("invalid exact local return body"));
+    for (u32 i = 0; i < response.body.len; i++) {
+        if (!local_return_body_byte_is_safe(response.body.ptr[i]))
+            return unsupported(response.body_span, lit_str("invalid exact local return body"));
+    }
+    if (!span_position_is_coherent(location.span, response.span) ||
+        !span_position_is_coherent(response.span, response.body_span) ||
+        response.body_span.end - response.body_span.start != response.body.len)
+        return unsupported(exact_local_return_span(server),
+                           lit_str("invalid exact local return response spans"));
+    return true;
+}
+
 FrontendResult<bool> validate_proxy_read_timeout(const Server& server) {
     const ProxyReadTimeout& timeout = server.location.proxy_read_timeout;
     if (!timeout.present) {
@@ -288,12 +341,22 @@ bool put_root_forward(
            writer.put_cstr("    )\n}\n");
 }
 
+bool put_exact_local_return(Writer& writer, Str body) {
+    return writer.put_cstr("route exact \"/static\" { return local_response({\n") &&
+           writer.put_cstr(
+               "  version: \"HTTP/1.1\", status: 200, reason: \"OK\", server: "
+               "\"nginx/1.29.7\",\n") &&
+           writer.put_cstr(
+               "  date: \"current\", content_type: \"text/plain\", connection: \"request\",\n") &&
+           writer.put_cstr("  head_mode: \"suppress_body\", body: b\"") && writer.put(body) &&
+           writer.put_cstr("\"\n}) }\n");
+}
+
 }  // namespace
 
 FrontendResult<RutSource> lower_to_rut(const Server& server) {
-    if (has_exact_local_return_inventory(server.exact_local_return))
-        return unsupported(exact_local_return_span(server),
-                           lit_str("exact local return lowering is not implemented"));
+    auto exact_local_return = validate_exact_local_return(server);
+    if (!exact_local_return) return core::make_unexpected(exact_local_return.error());
     auto timeout = validate_proxy_read_timeout(server);
     if (!timeout) return core::make_unexpected(timeout.error());
     if (server.listen.port == 0)
@@ -303,6 +366,9 @@ FrontendResult<RutSource> lower_to_rut(const Server& server) {
     if (!is_root && !is_api)
         return unsupported(server.location.path_span,
                            lit_str("converter requires location / or /api/"));
+    if (exact_local_return.value() && !is_root)
+        return unsupported(server.exact_local_return.span,
+                           lit_str("exact local return requires location / fallback"));
     const ProxyPass& proxy = server.location.proxy_pass;
     if (proxy.port == 0)
         return invalid_integer(server.location.proxy_pass.span,
@@ -367,7 +433,9 @@ FrontendResult<RutSource> lower_to_rut(const Server& server) {
     if (is_root) {
         if (!put_root_forward(writer, "HEAD", 4, true, false) ||
             !put_root_forward(writer, "GET", 3, false, true) ||
-            !put_root_forward(writer, "", 0, false, false))
+            !put_root_forward(writer, "", 0, false, false) ||
+            (exact_local_return.value() &&
+             !put_exact_local_return(writer, server.exact_local_return.response.body)))
             return fail_overflow();
         return output;
     }
