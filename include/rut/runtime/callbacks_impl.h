@@ -466,8 +466,9 @@ bool pipeline_shift(Connection& conn);
 // intentionally conservative: ambiguous Transfer-Encoding shapes are terminal
 // for ordinary local responses without changing proxy admission (#284).
 inline bool ordinary_local_response_request_boundary_reusable(const Connection& conn) {
-    if (!conn.req_strict_h1_complete || conn.req_malformed || conn.recv_buf.data() == nullptr ||
-        conn.req_header_end == 0 || conn.req_header_end > conn.req_initial_send_len ||
+    if (conn.protocol != ConnProtocol::Http11 || !conn.req_strict_h1_complete ||
+        conn.req_malformed || conn.recv_buf.data() == nullptr || conn.req_header_end == 0 ||
+        conn.req_header_end > conn.req_initial_send_len ||
         conn.req_initial_send_len > conn.recv_buf.len())
         return false;
 
@@ -489,7 +490,30 @@ inline bool ordinary_local_response_request_boundary_reusable(const Connection& 
             conn.req_body_remaining != 0 ||
             conn.req_chunk_parser.state != ChunkedParser::State::Complete)
             return false;
-        return conn.req_initial_send_len > conn.req_header_end;
+
+        // req_initial_send_len is an ownership boundary, not merely cached
+        // metadata.  Re-parse exactly its alleged body span so neither a
+        // truncated terminal chunk nor successor bytes hidden beyond the real
+        // terminal chunk can make a local response reusable.
+        const u8* body = conn.recv_buf.data() + conn.req_header_end;
+        const u32 body_len = conn.req_initial_send_len - conn.req_header_end;
+        if (body_len == 0) return false;
+        ChunkedParser probe;
+        probe.reset();
+        u32 offset = 0;
+        while (offset < body_len) {
+            u32 consumed = 0;
+            u32 out_start = 0;
+            u32 out_len = 0;
+            const ChunkStatus status = probe.feed(
+                body + offset, body_len - offset, &consumed, &out_start, &out_len);
+            if (consumed > body_len - offset) return false;
+            offset += consumed;
+            if (status == ChunkStatus::Done)
+                return probe.state == ChunkedParser::State::Complete && offset == body_len;
+            if (status == ChunkStatus::Error || consumed == 0) return false;
+        }
+        return false;
     }
 
     if (te != RequestTransferEncoding::None || has_te) return false;

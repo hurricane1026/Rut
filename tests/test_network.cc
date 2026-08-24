@@ -15233,6 +15233,9 @@ TEST(local_response_persistence, exact_request_boundary_matrix) {
     CHECK(!classify("POST / HTTP/1.1\r\nTransfer-Encoding: gzip\r\n\r\n"));
 
     REQUIRE(classify("GET / HTTP/1.1\r\nHost: x\r\n\r\n"));
+    conn->protocol = ConnProtocol::Http2;
+    CHECK(!ordinary_local_response_request_boundary_reusable(*conn));
+    conn->protocol = ConnProtocol::Http11;
     conn->req_client_transfer_encoding = RequestTransferEncoding::Unparsed;
     CHECK(!ordinary_local_response_request_boundary_reusable(*conn));
     capture_request_metadata(*conn);
@@ -15253,6 +15256,94 @@ TEST(local_response_persistence, exact_request_boundary_matrix) {
     CHECK_EQ(static_cast<u8>(conn->req_client_transfer_encoding),
              static_cast<u8>(RequestTransferEncoding::None));
     CHECK(ordinary_local_response_request_boundary_reusable(*conn));
+
+    static constexpr char kChunkedPipeline[] =
+        "POST / HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n"
+        "3\r\nabc\r\n0\r\n\r\n"
+        "GET /next HTTP/1.1\r\nHost: x\r\n\r\n";
+    REQUIRE(classify(kChunkedPipeline));
+    const u32 exact_chunked_end = conn->req_initial_send_len;
+    REQUIRE_GT(exact_chunked_end, conn->req_header_end);
+    REQUIRE_LT(exact_chunked_end, conn->recv_buf.len());
+    conn->req_initial_send_len = exact_chunked_end - 1;
+    CHECK(!ordinary_local_response_request_boundary_reusable(*conn));
+    conn->req_initial_send_len = exact_chunked_end + 1;
+    CHECK(!ordinary_local_response_request_boundary_reusable(*conn));
+    conn->req_initial_send_len = exact_chunked_end;
+    CHECK(ordinary_local_response_request_boundary_reusable(*conn));
+}
+
+TEST(local_response_persistence, ordinary_jit_connection_close_owns_send_until_terminal) {
+    for (const bool recv_stays_live : {false, true}) {
+        AsyncSmallLoop loop;
+        loop.setup();
+        RouteConfig config{};
+        REQUIRE(config.add_jit_handler(
+            "/local", kRouteMethodGet, &response_read_timeout_later_handler, false));
+        const RouteConfig* active = &config;
+        loop.config_ptr = &active;
+        loop.dispatch(make_ev(0, IoEventType::Accept, 42));
+        Connection* conn = loop.find_fd(42);
+        REQUIRE(conn != nullptr);
+        REQUIRE(conn->recv_armed);
+
+        static constexpr char kRequests[] =
+            "GET /local HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n"
+            "GET /local HTTP/1.1\r\nHost: x\r\n\r\n";
+        REQUIRE_EQ(conn->recv_buf.write(reinterpret_cast<const u8*>(kRequests),
+                                        sizeof(kRequests) - 1),
+                   sizeof(kRequests) - 1);
+        response_read_timeout_later_handler_calls = 0;
+        loop.dispatch(make_ev_more(conn->id,
+                                   IoEventType::Recv,
+                                   static_cast<i32>(sizeof(kRequests) - 1),
+                                   recv_stays_live ? 1 : 0));
+
+        REQUIRE_EQ(conn->state, ConnState::Sending);
+        REQUIRE_EQ(conn->on_send, &on_response_sent<AsyncSmallLoop>);
+        CHECK_EQ(response_read_timeout_later_handler_calls, 1u);
+        CHECK_FALSE(conn->keep_alive);
+        static constexpr char kExpected[] =
+            "HTTP/1.1 204 No Content\r\n"
+            "Content-Length: 0\r\n"
+            "Connection: close\r\n"
+            "\r\n";
+        REQUIRE_EQ(conn->send_buf.len(), sizeof(kExpected) - 1);
+        CHECK_EQ(__builtin_memcmp(conn->send_buf.data(), kExpected, sizeof(kExpected) - 1), 0);
+        CHECK_EQ(conn->recv_armed, recv_stays_live);
+        CHECK_EQ(conn->pipeline_depth, 0u);
+        const u32 id = conn->id;
+        const u32 send_len = conn->send_buf.len();
+        REQUIRE_GT(send_len, 1u);
+
+        loop.backend.clear_ops();
+        loop.dispatch(make_ev(id, IoEventType::Send, 1));
+        REQUIRE_EQ(loop.conns[id].fd, 42);
+        CHECK_EQ(loop.conns[id].state, ConnState::Sending);
+        CHECK_EQ(loop.conns[id].on_send, &on_response_sent<AsyncSmallLoop>);
+        CHECK_EQ(loop.conns[id].send_progress, 1u);
+        CHECK_EQ(response_read_timeout_later_handler_calls, 1u);
+        CHECK_EQ(loop.conns[id].pipeline_depth, 0u);
+        CHECK_EQ(loop.conns[id].recv_buf.len(), sizeof(kRequests) - 1);
+        CHECK_EQ(loop.backend.count_ops(MockOp::Recv), 0u);
+        const MockOp* remainder = loop.backend.last_op(MockOp::Send);
+        REQUIRE(remainder != nullptr);
+        CHECK_EQ(remainder->send_buf, conn->send_buf.data() + 1);
+        CHECK_EQ(remainder->send_len, send_len - 1);
+
+        loop.backend.clear_ops();
+        loop.dispatch(make_ev(id, IoEventType::Send, static_cast<i32>(send_len - 1)));
+        CHECK_EQ(loop.conns[id].fd, -1);
+        CHECK_EQ(response_read_timeout_later_handler_calls, 1u);
+        CHECK_EQ(loop.backend.count_ops(MockOp::Recv), 0u);
+        if (recv_stays_live) {
+            CHECK_EQ(loop.pending_free_count, 1u);
+            CHECK_GT(loop.backend.count_ops(MockOp::Cancel), 0u);
+        } else {
+            CHECK_EQ(loop.pending_free_count, 0u);
+            CHECK_EQ(loop.backend.count_ops(MockOp::Cancel), 0u);
+        }
+    }
 }
 
 TEST(local_response_persistence, ordinary_publishers_share_wire_and_lifecycle_decision) {
