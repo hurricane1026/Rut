@@ -6103,12 +6103,235 @@ static bool run_pinned_exact_local_return_baseline(u16 frontend_port,
     return true;
 }
 
+struct StrictLocalResponseDifferentialObservation {
+    std::vector<char> nginx_wire;
+    std::vector<char> rut_wire;
+    u32 nginx_upstream_accepts = 0;
+    u32 nginx_upstream_requests = 0;
+    u32 rut_upstream_accepts = 0;
+    u32 rut_upstream_requests = 0;
+};
+
+static bool run_strict_local_response_differential(
+    u16 frontend_port,
+    u16 backend_port,
+    TempDir& temp,
+    const std::string& container_name,
+    const char* rut_path,
+    StrictLocalResponseDifferentialObservation& observation,
+    std::string& error) {
+    if (rut_path == nullptr || rut_path[0] != '/' || access(rut_path, X_OK) != 0) {
+        error = "strict-local differential requires an executable absolute RUT path";
+        return false;
+    }
+
+    // The two sides intentionally share only the response-selection precondition:
+    // nginx selects one exact literal /static location, while ordinary RUT has no
+    // /static route and therefore selects its top-level unmatched policy.  This
+    // proves #287's response capability without claiming #288 route placement.
+    const std::string nginx_config =
+        "error_log stderr notice;\n"
+        "events {}\n"
+        "http {\n  server {\n    listen " +
+        std::to_string(frontend_port) +
+        ";\n"
+        "    location = /static { return 200 \"successor-static\"; }\n"
+        "    location / { proxy_pass http://127.0.0.1:" +
+        std::to_string(backend_port) +
+        "; }\n"
+        "  }\n}\n";
+    const std::string rut_source =
+        "unmatched { return local_response({\n"
+        "  version: \"HTTP/1.1\", status: 200, reason: \"OK\", "
+        "server: \"nginx/1.29.7\",\n"
+        "  date: \"current\", content_type: \"text/plain\", connection: \"request\",\n"
+        "  head_mode: \"suppress_body\", body: b\"successor-static\"\n"
+        "}) }\n"
+        "listen :" +
+        std::to_string(frontend_port) +
+        "\n"
+        "route GET \"/compiled-sentinel\" { return 204 }\n";
+    if (rut_source.find("route GET \"/static\"") != std::string::npos ||
+        rut_source.find("upstream ") != std::string::npos ||
+        rut_source.find("forward(") != std::string::npos) {
+        error =
+            "ordinary RUT selection precondition unexpectedly contains /static routing or "
+            "upstream work";
+        return false;
+    }
+    if (!write_file(temp.nginx_config, nginx_config.data(), nginx_config.size()) ||
+        !write_file(temp.source, rut_source.data(), rut_source.size())) {
+        error = "failed to write strict-local differential inputs";
+        return false;
+    }
+
+    auto exercise = [&](Child& process, const char* side, std::vector<char>& wire) {
+        struct ClientGuard {
+            int fd = -1;
+            ~ClientGuard() {
+                if (fd >= 0) close(fd);
+            }
+        } client{connect_once(frontend_port)};
+        std::string detail;
+        if (client.fd < 0 ||
+            !send_all(
+                client.fd, kExactLocalGetCloseRequest, sizeof(kExactLocalGetCloseRequest) - 1u) ||
+            !read_response(client.fd, wire, detail) || !read_eof(client.fd, detail)) {
+            error = std::string(side) + " strict-local request/response/EOF failed: " +
+                    (detail.empty() ? "connect or send failed" : detail);
+            return false;
+        }
+        if (poll_child(process)) {
+            error = std::string(side) + " frontend exited after the strict-local response";
+            return false;
+        }
+        if (!validate_exact_normalized_response(wire, kExactLocalCloseResponseNormalized, detail)) {
+            error = std::string(side) + " strict-local wire mismatch: " + detail;
+            return false;
+        }
+        return true;
+    };
+    auto observe_zero_upstream_window = [&](Recorder& upstream, Child& process, const char* side) {
+        // Match the established invalid-target absence pattern's bounded
+        // 500ms window, but keep both owners live and inspect the recorder's
+        // atomic publication counters throughout it. History is inspected
+        // only after the recorder joins below.
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(500);
+        for (;;) {
+            if (poll_child(process)) {
+                error = std::string(side) +
+                        " frontend exited during the zero-upstream observation window";
+                return false;
+            }
+            if (!upstream.running.load(std::memory_order_acquire) ||
+                !upstream.thread_alive.load(std::memory_order_acquire) ||
+                upstream.listener_failed.load(std::memory_order_acquire)) {
+                error = std::string(side) +
+                        " upstream witness stopped or failed during the observation window";
+                return false;
+            }
+            if (upstream.accepted.load(std::memory_order_acquire) != 0 ||
+                upstream.requests.load(std::memory_order_acquire) != 0) {
+                error = std::string(side) + " strict local response performed upstream work";
+                return false;
+            }
+            const auto now = std::chrono::steady_clock::now();
+            if (now >= deadline) return true;
+            const auto remaining =
+                std::chrono::duration_cast<std::chrono::milliseconds>(deadline - now).count();
+            const int wait_ms = remaining > 50 ? 50 : static_cast<int>(remaining);
+            (void)poll(nullptr, 0, wait_ms > 0 ? wait_ms : 1);
+        }
+    };
+    auto settled_zero_upstream =
+        [&](Recorder& upstream, u32& accepted, u32& requests, const char* side) {
+            upstream.stop();
+            accepted = upstream.accepted.load(std::memory_order_acquire);
+            requests = upstream.requests.load(std::memory_order_acquire);
+            if (upstream.thread_alive.load(std::memory_order_acquire) ||
+                upstream.listener_failed.load(std::memory_order_acquire) || accepted != 0 ||
+                requests != 0 || !upstream.history.empty()) {
+                error = std::string(side) + " zero-upstream witness did not settle empty";
+                return false;
+            }
+            return true;
+        };
+
+    {
+        Recorder upstream;
+        upstream.observe_extra_requests_until_stop = true;
+        if (!upstream.setup(backend_port)) {
+            error = "failed to start pinned nginx zero-upstream witness";
+            return false;
+        }
+        DockerGuard docker(container_name);
+        ChildGuard nginx;
+        if (!spawn_child({"docker",
+                          "run",
+                          "--pull=never",
+                          "--network",
+                          "host",
+                          "--name",
+                          container_name,
+                          "-v",
+                          temp.nginx_config + ":/etc/nginx/nginx.conf:ro",
+                          kNginxImage,
+                          "nginx",
+                          "-g",
+                          "daemon off;"},
+                         temp.nginx_log,
+                         nginx.child)) {
+            error = "failed to start pinned nginx for strict-local differential";
+            return false;
+        }
+        if (!wait_ready(frontend_port, nginx.child, error) ||
+            !exercise(nginx.child, "pinned nginx", observation.nginx_wire) ||
+            !observe_zero_upstream_window(upstream, nginx.child, "pinned nginx"))
+            return false;
+        if (!stop_child(nginx.child)) {
+            error = "failed to stop pinned nginx after strict-local differential";
+            return false;
+        }
+        if (!docker.remove()) {
+            error = "failed to remove pinned nginx after strict-local differential";
+            return false;
+        }
+        if (!settled_zero_upstream(upstream,
+                                   observation.nginx_upstream_accepts,
+                                   observation.nginx_upstream_requests,
+                                   "pinned nginx"))
+            return false;
+    }
+
+    {
+        Recorder upstream;
+        upstream.observe_extra_requests_until_stop = true;
+        if (!upstream.setup(backend_port)) {
+            error = "failed to start ordinary RUT zero-upstream witness";
+            return false;
+        }
+        ChildGuard rut;
+        if (!spawn_child({rut_path, temp.source, "--shards", "1", "--no-pin", "--drain", "0"},
+                         temp.rut_log,
+                         rut.child)) {
+            error = "failed to start ordinary RUT for strict-local differential";
+            return false;
+        }
+        if (!wait_ready(frontend_port, rut.child, error) ||
+            !exercise(rut.child, "ordinary RUT", observation.rut_wire) ||
+            !observe_zero_upstream_window(upstream, rut.child, "ordinary RUT"))
+            return false;
+        if (!stop_child(rut.child)) {
+            error = "failed to stop ordinary RUT after strict-local differential";
+            return false;
+        }
+        if (!settled_zero_upstream(upstream,
+                                   observation.rut_upstream_accepts,
+                                   observation.rut_upstream_requests,
+                                   "ordinary RUT"))
+            return false;
+    }
+
+    std::vector<char> normalized_nginx = observation.nginx_wire;
+    std::vector<char> normalized_rut = observation.rut_wire;
+    if (!normalize_date(normalized_nginx) || !normalize_date(normalized_rut) ||
+        normalized_nginx != normalized_rut) {
+        error =
+            "pinned nginx and ordinary RUT strict-local wires differ after Date-only "
+            "normalization";
+        return false;
+    }
+    return true;
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
     const bool nginx_gate_spike = argc == 3 && strcmp(argv[1], "--nginx-gate-spike") == 0;
     const bool exact_local_return_baseline =
         argc == 2 && strcmp(argv[1], "--exact-local-return-baseline") == 0;
+    const bool strict_local_response_differential =
+        argc == 3 && strcmp(argv[1], "--strict-local-response-differential") == 0;
     const bool late_successor_differential =
         argc == 5 && strcmp(argv[1], "--late-successor-differential") == 0;
     const bool rut_iouring_gate_spike =
@@ -6124,11 +6347,13 @@ int main(int argc, char** argv) {
     const bool normal_differential =
         (argc == 2 && argv[1][0] == '/') ||
         (argc == 4 && argv[1][0] == '/' && argv[2][0] == '/' && argv[3][0] == '/');
-    if ((!nginx_gate_spike && !exact_local_return_baseline && !rut_iouring_gate_spike &&
-         !rut_iouring_gate_identity_negative && !rut_iouring_gate_ready_mutation_negative &&
-         !rut_iouring_gate_owner_death_negative && !rut_iouring_gate_connect_journal_negative &&
-         !late_successor_differential && !normal_differential) ||
+    if ((!nginx_gate_spike && !exact_local_return_baseline && !strict_local_response_differential &&
+         !rut_iouring_gate_spike && !rut_iouring_gate_identity_negative &&
+         !rut_iouring_gate_ready_mutation_negative && !rut_iouring_gate_owner_death_negative &&
+         !rut_iouring_gate_connect_journal_negative && !late_successor_differential &&
+         !normal_differential) ||
         (nginx_gate_spike && argv[2][0] != '/') ||
+        (strict_local_response_differential && argv[2][0] != '/') ||
         ((rut_iouring_gate_spike || rut_iouring_gate_identity_negative ||
           rut_iouring_gate_ready_mutation_negative || rut_iouring_gate_owner_death_negative ||
           rut_iouring_gate_connect_journal_negative) &&
@@ -6140,6 +6365,8 @@ int main(int argc, char** argv) {
                      "   or: test_nginx_differential --nginx-gate-spike "
                      "<absolute-preload-helper>\n"
                      "   or: test_nginx_differential --exact-local-return-baseline\n"
+                     "   or: test_nginx_differential --strict-local-response-differential "
+                     "<absolute-rut-executable>\n"
                      "   or: test_nginx_differential --rut-iouring-gate-spike "
                      "<absolute-rut-executable> <absolute-preload-helper>\n"
                      "   or: test_nginx_differential --rut-iouring-gate-identity-negative "
@@ -6287,6 +6514,42 @@ int main(int argc, char** argv) {
                      "independent (GET/HEAD/POST/OPTIONS/query), preserves request persistence, "
                      "and excludes /static/ plus /static/child with exactly two proxy attempts\n";
         if (exact_local_return_baseline) return 0;
+    }
+
+    if (strict_local_response_differential || normal_differential) {
+        const char* source_suffix = strrchr(temp.path, '/');
+        source_suffix = source_suffix ? source_suffix + 1 : temp.path;
+        const std::string container_name =
+            "rut-nginx-strict-local-" + std::to_string(getpid()) + "-" + source_suffix;
+        StrictLocalResponseDifferentialObservation observation;
+        std::string differential_error;
+        const char* rut_path = strict_local_response_differential ? argv[2] : argv[1];
+        if (!run_strict_local_response_differential(frontend_port,
+                                                    backend_port,
+                                                    temp,
+                                                    container_name,
+                                                    rut_path,
+                                                    observation,
+                                                    differential_error)) {
+            std::cerr << "FAIL [strict local response differential]: " << differential_error
+                      << "\n";
+            dump_wire("pinned nginx strict-local", observation.nginx_wire);
+            dump_wire("ordinary RUT strict-local", observation.rut_wire);
+            std::cerr << "strict-local upstream nginx accepted="
+                      << observation.nginx_upstream_accepts
+                      << " requests=" << observation.nginx_upstream_requests
+                      << " RUT accepted=" << observation.rut_upstream_accepts
+                      << " requests=" << observation.rut_upstream_requests << "\n";
+            dump_log(temp.nginx_config, "strict-local pinned nginx config");
+            dump_log(temp.source, "strict-local ordinary RUT source");
+            dump_log(temp.nginx_log, "strict-local pinned nginx log");
+            dump_log(temp.rut_log, "strict-local ordinary RUT log");
+            return 1;
+        }
+        std::cerr << "PASS: ordinary-source RUT strict status-200 unmatched response matches "
+                     "pinned nginx exact /static after Date-only normalization, close/EOF, and "
+                     "zero upstream work (selection precondition only; no #288 claim)\n";
+        if (strict_local_response_differential) return 0;
     }
 
     if (nginx_gate_spike) {

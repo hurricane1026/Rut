@@ -394,6 +394,18 @@ if(RUT_ENABLE_JIT)
         TIMEOUT 60
         SKIP_RETURN_CODE 77
     )
+    add_test(
+        NAME test_nginx_strict_local_response_differential
+        COMMAND test_nginx_differential --strict-local-response-differential
+                $<TARGET_FILE:rut>
+    )
+    set_tests_properties(test_nginx_strict_local_response_differential PROPERTIES
+        LABELS "integration;nginx;docker"
+        RUN_SERIAL TRUE
+        RESOURCE_LOCK nginx-differential
+        TIMEOUT 60
+        SKIP_RETURN_CODE 77
+    )
     if(TARGET test_rut_iouring_gate_preload)
         add_test(
             NAME test_rut_iouring_gate_spike
