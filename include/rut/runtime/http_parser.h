@@ -24,6 +24,15 @@ enum class HttpVersion : u8 {
     Unknown = 255,
 };
 
+// Conservative request Transfer-Encoding framing classification.  This is
+// metadata only: proxy admission keeps its historical behaviour until #284.
+enum class RequestTransferEncoding : u8 {
+    Unparsed,
+    None,
+    FinalChunked,
+    Unsupported,
+};
+
 // A single HTTP header: name + value, both non-owning views into recv_buf.
 struct Header {
     Str name;
@@ -57,9 +66,10 @@ struct ParsedRequest {
     Header headers[kMaxHeaders];
     u32 header_count;
 
-    u32 content_length;         // From Content-Length header, 0 if absent.
-    bool keep_alive;            // Derived from Connection header + HTTP version.
-    bool chunked;               // Transfer-Encoding: chunked
+    u32 content_length;  // From Content-Length header, 0 if absent.
+    bool keep_alive;     // Derived from Connection header + HTTP version.
+    bool chunked;        // Transfer-Encoding: chunked
+    RequestTransferEncoding transfer_encoding;
     bool has_content_length;    // True if Content-Length header was seen.
     bool upgrade;               // Connection: upgrade token present
     bool has_upgrade_header;    // Upgrade: header present (both required for a
@@ -77,6 +87,7 @@ struct ParsedRequest {
         content_length = 0;
         keep_alive = false;
         chunked = false;
+        transfer_encoding = RequestTransferEncoding::Unparsed;
         has_content_length = false;
         upgrade = false;
         has_upgrade_header = false;

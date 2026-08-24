@@ -520,6 +520,7 @@ TEST(h2_request, basic_get_maps_method_path_authority) {
     CHECK(req.method == HttpMethod::GET);
     CHECK(req.version == HttpVersion::Http11);
     CHECK(req.keep_alive);
+    CHECK(req.transfer_encoding == RequestTransferEncoding::None);
     CHECK(req.path.eq(Str{"/", 1}));
     CHECK_EQ(req.path_canon.len, 0u);  // "/" canonicalizes to empty, non-null
     CHECK(req.path_canon.ptr != nullptr);

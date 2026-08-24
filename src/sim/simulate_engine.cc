@@ -722,6 +722,7 @@ static void copy_sim_connection_state(Connection& dst, const Connection& src) {
     dst.req_content_length = src.req_content_length;
     dst.req_initial_send_len = src.req_initial_send_len;
     dst.req_malformed = src.req_malformed;
+    dst.req_client_transfer_encoding = src.req_client_transfer_encoding;
     dst.req_body_mode = src.req_body_mode;
     dst.req_body_remaining = src.req_body_remaining;
     dst.req_chunk_parser = src.req_chunk_parser;

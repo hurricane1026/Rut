@@ -325,6 +325,7 @@ bool h2_headers_to_request(const hpack::Header* hs, u32 n, ParsedRequest* req) {
     req->reset();
     req->version = HttpVersion::Http11;  // h2 maps to HTTP/1.1 semantics
     req->keep_alive = true;              // h2 connections persist
+    req->transfer_encoding = RequestTransferEncoding::None;
 
     bool have_method = false;
     bool have_path = false;

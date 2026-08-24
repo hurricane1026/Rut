@@ -123,6 +123,7 @@ void capture_request_metadata(Connection& conn) {
     conn.req_client_connection_close = false;
     conn.req_client_connection_close_exact = false;
     conn.req_client_has_content_length = false;
+    conn.req_client_transfer_encoding = RequestTransferEncoding::Unparsed;
     conn.req_client_has_transfer_encoding = false;
     conn.req_client_has_te = false;
     conn.req_client_has_expect = false;
@@ -156,6 +157,7 @@ void capture_request_metadata(Connection& conn) {
         conn.req_client_keep_alive = conn.req_keep_alive;
         conn.req_client_connection_close = req.connection_close;
         conn.req_client_has_content_length = req.has_content_length;
+        conn.req_client_transfer_encoding = req.transfer_encoding;
         for (u32 i = 0; i < req.header_count; i++) {
             const Str name = req.headers[i].name;
             conn.req_client_has_transfer_encoding |=
@@ -262,7 +264,8 @@ void capture_request_metadata(Connection& conn) {
         }
         if (conn.req_initial_send_len > 0) conn.req_size = conn.req_initial_send_len;
         conn.req_strict_h1_complete =
-            req.version == HttpVersion::Http11 && conn.req_header_end != 0;
+            (req.version == HttpVersion::Http10 || req.version == HttpVersion::Http11) &&
+            conn.req_header_end != 0;
         return;
     }
 

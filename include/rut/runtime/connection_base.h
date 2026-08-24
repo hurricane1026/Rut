@@ -9,6 +9,7 @@
 #include "rut/common/wait_limits.h"
 #include "rut/jit/handler_abi.h"
 #include "rut/runtime/chunked_parser.h"
+#include "rut/runtime/http_parser.h"
 #include "rut/runtime/io_event.h"
 #include "rut/runtime/listener_context.h"
 #include "rut/runtime/tls_engine.h"
@@ -872,7 +873,8 @@ struct ConnectionBase {
     // Exact parsed request HTTP version (HttpVersion underlying value).
     u8 req_http_version;  // HttpVersion::Http10/Http11, 255 when unknown.
     // True only for the current request after the strict parser completed an
-    // HTTP/1.1 header block. Fallback method/path recovery never publishes it.
+    // HTTP/1.0 or HTTP/1.1 header block. Fallback method/path recovery never
+    // publishes it.
     bool req_strict_h1_complete;
     // Request-side keep-alive intent of the CURRENT request, as parsed from its
     // request line + Connection header (HTTP/1.1 default true, HTTP/1.0 default
@@ -888,6 +890,7 @@ struct ConnectionBase {
     bool req_client_connection_close;
     bool req_client_connection_close_exact;
     bool req_client_has_content_length;
+    RequestTransferEncoding req_client_transfer_encoding;
     // Original request framing/upgrade facts captured before any request-policy
     // rewrite. SuppressBody HEAD admission must not lose these when rewritten
     // requests strip hop-by-hop fields.
@@ -1237,6 +1240,7 @@ struct ConnectionBase {
         req_client_connection_close = false;
         req_client_connection_close_exact = false;
         req_client_has_content_length = false;
+        req_client_transfer_encoding = RequestTransferEncoding::Unparsed;
         req_client_has_transfer_encoding = false;
         req_client_has_te = false;
         req_client_has_expect = false;

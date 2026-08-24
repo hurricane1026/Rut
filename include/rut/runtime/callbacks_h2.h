@@ -65,17 +65,20 @@ inline bool h2_prepare_forward_request(
     Buffer saved_buf = static_cast<Buffer&&>(conn.recv_buf);
     const u32 saved_header_end = conn.req_header_end;
     const u32 saved_initial_send_len = conn.req_initial_send_len;
+    const RequestTransferEncoding saved_transfer_encoding = conn.req_client_transfer_encoding;
     conn.recv_slice = out;
     conn.recv_buf.bind(out, out_cap);
     conn.recv_buf.commit(synth_len);
     conn.req_header_end = header_end;
     conn.req_initial_send_len = synth_len;
+    conn.req_client_transfer_encoding = RequestTransferEncoding::None;
     const bool ok = h2_apply_forward_request_overrides(conn);
     if (ok) *out_len = conn.recv_buf.len();
     conn.recv_buf = static_cast<Buffer&&>(saved_buf);
     conn.recv_slice = saved_slice;
     conn.req_header_end = saved_header_end;
     conn.req_initial_send_len = saved_initial_send_len;
+    conn.req_client_transfer_encoding = saved_transfer_encoding;
     return ok;
 }
 

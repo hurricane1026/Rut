@@ -44,6 +44,8 @@ struct SmallLoop : EventLoopCRTP<SmallLoop> {
     AccessLogRing* access_log = nullptr;
     struct CaptureRing* capture_ring = nullptr;
     ShardMetrics* metrics = nullptr;
+    ShardMetrics* const* all_shard_metrics = nullptr;
+    u32 shard_metrics_count = 0;
 
     // Inline buffer storage for tests (no SlicePool dependency).
     u8 recv_storage[kMaxConns][kBufSize];
@@ -102,6 +104,8 @@ struct SmallLoop : EventLoopCRTP<SmallLoop> {
         access_log = nullptr;
         capture_ring = nullptr;
         metrics = nullptr;
+        all_shard_metrics = nullptr;
+        shard_metrics_count = 0;
         config_ptr = nullptr;
         control = nullptr;
         epoch = nullptr;

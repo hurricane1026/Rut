@@ -213,6 +213,47 @@ static inline void match_connection(const u8* val, u32 vlen, ParsedRequest* req)
     }
 }
 
+static inline bool is_transfer_coding_token_char(u8 c) {
+    return (c >= '0' && c <= '9') || (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || c == '!' ||
+           c == '#' || c == '$' || c == '%' || c == '&' || c == '\'' || c == '*' || c == '+' ||
+           c == '-' || c == '.' || c == '^' || c == '_' || c == '`' || c == '|' || c == '~';
+}
+
+// Classify one complete Transfer-Encoding field.  Parameters and duplicate
+// fields are deliberately unsupported: local-response connection reuse needs
+// one exact, unambiguous request boundary.  The legacy `chunked` bit is parsed
+// separately below so this metadata addition does not alter proxy behaviour.
+static inline RequestTransferEncoding classify_transfer_encoding(const u8* val, u32 vlen) {
+    if (vlen == 0) return RequestTransferEncoding::Unsupported;
+    bool saw_token = false;
+    bool saw_chunked = false;
+    u32 i = 0;
+    for (;;) {
+        while (i < vlen && (val[i] == ' ' || val[i] == '\t')) i++;
+        if (i == vlen || val[i] == ',') return RequestTransferEncoding::Unsupported;
+
+        const u32 start = i;
+        while (i < vlen && is_transfer_coding_token_char(val[i])) i++;
+        if (i == start) return RequestTransferEncoding::Unsupported;
+        saw_token = true;
+        const bool is_chunked = i - start == 7 && str_ci_eq(val + start, "chunked", 7);
+        if (is_chunked) {
+            if (saw_chunked) return RequestTransferEncoding::Unsupported;
+            saw_chunked = true;
+        }
+
+        while (i < vlen && (val[i] == ' ' || val[i] == '\t')) i++;
+        if (i == vlen)
+            return saw_token && saw_chunked ? RequestTransferEncoding::FinalChunked
+                                            : RequestTransferEncoding::Unsupported;
+        if (val[i] != ',') return RequestTransferEncoding::Unsupported;
+        // `chunked` must be the final coding, and a comma must introduce a
+        // non-empty next token.
+        if (is_chunked) return RequestTransferEncoding::Unsupported;
+        i++;
+    }
+}
+
 // Check and apply semantic headers inline.
 // Returns quickly for non-semantic headers via first-byte + length dispatch.
 static inline ParseStatus apply_semantic_header(
@@ -239,6 +280,11 @@ static inline ParseStatus apply_semantic_header(
         }
     } else if (first == 't') {
         if (name_len == 17 && str_ci_eq(name + 1, "ransfer-encoding", 16)) {
+            if (req->transfer_encoding != RequestTransferEncoding::Unparsed) {
+                req->transfer_encoding = RequestTransferEncoding::Unsupported;
+            } else {
+                req->transfer_encoding = classify_transfer_encoding(val, vlen);
+            }
             // Parse as comma-separated token list, match full "chunked" token
             u32 ti = 0;
             while (ti < vlen) {
@@ -291,6 +337,7 @@ static inline ParseStatus apply_semantic_header(
 
 ParseStatus HttpParser::parse(const u8* buf, u32 len, ParsedRequest* req) {
     header_end = 0;  // Clear on entry so stale values are never exposed on Incomplete/Error.
+    req->reset();
 
     // Quick check: need at least 4 bytes to try method matching.
     if (UNLIKELY(len < 4)) {
@@ -299,7 +346,6 @@ ParseStatus HttpParser::parse(const u8* buf, u32 len, ParsedRequest* req) {
 
     // Single-pass: parse directly without find_header_end pre-scan.
     // We check bounds at each step and return Incomplete if needed.
-    req->reset();
     u32 pos = 0;
     // Declare loop variables here so goto doesn't jump over them.
     u32 hdr_count = 0;
@@ -431,6 +477,9 @@ ParseStatus HttpParser::parse(const u8* buf, u32 len, ParsedRequest* req) {
 
     req->header_count = hdr_count;
     header_end = pos;
+
+    if (req->transfer_encoding == RequestTransferEncoding::Unparsed)
+        req->transfer_encoding = RequestTransferEncoding::None;
 
     // Reject requests with both Content-Length and Transfer-Encoding: chunked
     // to prevent request-smuggling attacks (RFC 7230 §3.3.3).

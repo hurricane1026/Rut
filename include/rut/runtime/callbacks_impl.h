@@ -460,6 +460,59 @@ template <typename Loop>
 bool handle_configured_unmatched_response(Loop* loop, Connection& conn, const RouteConfig* config);
 u32 pipeline_leftover(const Connection& conn);
 bool pipeline_shift(Connection& conn);
+
+// Prove that recv_buf contains one complete, strictly parsed HTTP/1 request at
+// [0, req_initial_send_len), optionally followed by successor bytes.  This is
+// intentionally conservative: ambiguous Transfer-Encoding shapes are terminal
+// for ordinary local responses without changing proxy admission (#284).
+inline bool ordinary_local_response_request_boundary_reusable(const Connection& conn) {
+    if (!conn.req_strict_h1_complete || conn.req_malformed || conn.recv_buf.data() == nullptr ||
+        conn.req_header_end == 0 || conn.req_header_end > conn.req_initial_send_len ||
+        conn.req_initial_send_len > conn.recv_buf.len())
+        return false;
+
+    const bool is_h10 = conn.req_http_version == static_cast<u8>(HttpVersion::Http10);
+    const bool is_h11 = conn.req_http_version == static_cast<u8>(HttpVersion::Http11);
+    if (!is_h10 && !is_h11) return false;
+
+    const auto te = conn.req_client_transfer_encoding;
+    const bool has_te = conn.req_client_has_transfer_encoding;
+    if ((te == RequestTransferEncoding::None && has_te) ||
+        (te != RequestTransferEncoding::None && !has_te) ||
+        te == RequestTransferEncoding::Unparsed || te == RequestTransferEncoding::Unsupported)
+        return false;
+    if (conn.req_client_has_content_length && has_te) return false;
+
+    if (te == RequestTransferEncoding::FinalChunked) {
+        if (is_h10 || !has_te || conn.req_client_has_content_length ||
+            conn.req_body_mode != BodyMode::Chunked || conn.req_content_length != 0 ||
+            conn.req_body_remaining != 0 ||
+            conn.req_chunk_parser.state != ChunkedParser::State::Complete)
+            return false;
+        return conn.req_initial_send_len > conn.req_header_end;
+    }
+
+    if (te != RequestTransferEncoding::None || has_te) return false;
+    if (!conn.req_client_has_content_length) {
+        return conn.req_body_mode == BodyMode::None && conn.req_content_length == 0 &&
+               conn.req_body_remaining == 0 && conn.req_initial_send_len == conn.req_header_end;
+    }
+    if (conn.req_content_length == 0) {
+        return conn.req_body_mode == BodyMode::None && conn.req_body_remaining == 0 &&
+               conn.req_initial_send_len == conn.req_header_end;
+    }
+    const u64 exact_end = static_cast<u64>(conn.req_header_end) + conn.req_content_length;
+    return conn.req_body_mode == BodyMode::ContentLength && conn.req_body_remaining == 0 &&
+           exact_end == conn.req_initial_send_len;
+}
+
+template <typename Loop>
+inline bool ordinary_local_response_may_persist(Loop* loop,
+                                                const Connection& conn,
+                                                bool terminal_baseline) {
+    return terminal_baseline && !loop->is_draining() && conn.req_client_keep_alive &&
+           ordinary_local_response_request_boundary_reusable(conn);
+}
 bool pipeline_stash(Connection& conn);
 bool pipeline_recover(Connection& conn);
 void capture_stage_headers(Connection& conn);
@@ -1478,6 +1531,8 @@ void on_header_received(void* lp, Connection& conn, IoEvent ev) {
                 aggregate_metrics(loop->all_shard_metrics, loop->shard_metrics_count);
             const u32 kLen = format_prometheus(kAgg, mbuf, sizeof(mbuf));
             if (kLen > 0) {
+                conn.keep_alive = ordinary_local_response_may_persist(
+                    loop, conn, /*terminal_baseline=*/conn.keep_alive);
                 format_response_with_body(conn, 200, mbuf, kLen, conn.keep_alive);
             } else {
                 format_static_response(conn, 500, /*keep_alive=*/false);
@@ -1653,7 +1708,9 @@ void on_header_received(void* lp, Connection& conn, IoEvent ev) {
         }
     } else if (route && route->action == RouteAction::Static) {
         conn.resp_status = route->status_code;
-        format_static_response(conn, route->status_code, kKeepAlive);
+        conn.keep_alive =
+            ordinary_local_response_may_persist(loop, conn, /*terminal_baseline=*/kKeepAlive);
+        format_static_response(conn, route->status_code, conn.keep_alive);
         conn.transition_to_sending(&on_response_sent<Loop>);
         client_send(loop, conn, conn.send_buf.data(), conn.send_buf.len());
     } else if (route && route->action == RouteAction::JitHandler && route->fn) {
@@ -1690,8 +1747,10 @@ void on_header_received(void* lp, Connection& conn, IoEvent ev) {
         handle_jit_outcome<Loop>(loop, conn, outcome, route->fn, kKeepAlive);
     } else {
         conn.resp_status = kStatusOK;
+        conn.keep_alive =
+            ordinary_local_response_may_persist(loop, conn, /*terminal_baseline=*/kKeepAlive);
         conn.send_buf.reset();
-        if (kKeepAlive)
+        if (conn.keep_alive)
             conn.send_buf.write(reinterpret_cast<const u8*>(kResponse200), kResponse200Len);
         else
             conn.send_buf.write(reinterpret_cast<const u8*>(kResponse200Close),
@@ -1884,7 +1943,7 @@ void on_response_sent(void* lp, Connection& conn, IoEvent ev) {
     (void)detach_upstream_close(loop, conn);
     conn.upstream_idx = 0;
 
-    if (!conn.keep_alive) {
+    if (loop->is_draining() || !conn.keep_alive) {
         loop->close_conn(conn);
         return;
     }
@@ -1896,7 +1955,7 @@ void on_response_sent(void* lp, Connection& conn, IoEvent ev) {
     conn.pipeline_depth = 0;
     conn.recv_buf.reset();
     conn.transition_to_reading_header(&on_header_received<Loop>);
-    loop->submit_recv(conn);
+    if (!loop->submit_recv(conn)) loop->close_conn(conn);
 }
 
 template <typename Loop>
@@ -2244,6 +2303,9 @@ void handle_jit_outcome(
         case JitDispatchOutcome::Kind::ReturnStatus: {
             conn.pending_handler_fn = nullptr;
             conn.resp_status = outcome.status_code;
+            const bool effective_keep_alive =
+                ordinary_local_response_may_persist(loop, conn, keep_alive);
+            conn.keep_alive = effective_keep_alive;
             // ABI: upstream_id is a 1-based index into the pinned
             // route config's response_bodies table (0 = use default
             // status-reason body). Out-of-range indices fall back to
@@ -2308,15 +2370,15 @@ void handle_jit_outcome(
                                                       body_len,
                                                       kvs,
                                                       header_count,
-                                                      keep_alive,
+                                                      effective_keep_alive,
                                                       body_is_fallback,
                                                       suppress_default_content_type);
             } else if (has_body) {
                 const auto& body = cfg->response_bodies[outcome.response_body_idx - 1];
                 format_response_with_body(
-                    conn, outcome.status_code, body.data, body.len, keep_alive);
+                    conn, outcome.status_code, body.data, body.len, effective_keep_alive);
             } else {
-                format_static_response(conn, outcome.status_code, keep_alive);
+                format_static_response(conn, outcome.status_code, effective_keep_alive);
             }
             conn.transition_to_sending(&on_response_sent<Loop>);
             client_send(loop, conn, conn.send_buf.data(), conn.send_buf.len());
@@ -6981,15 +7043,8 @@ bool handle_configured_unmatched_response(Loop* loop, Connection& conn, const Ro
          policy.head_mode != StrictLocalResponseHeadMode::SuppressBody))
         return fail_closed();
 
-    // An incomplete request body is not drained after a local decision. Emit
-    // the selected response, but make it terminal so no successor can be
-    // admitted and no further request-body recv is submitted.
-    const bool unread_body =
-        (conn.req_body_mode == BodyMode::ContentLength && conn.req_body_remaining != 0) ||
-        (conn.req_body_mode == BodyMode::Chunked &&
-         conn.req_chunk_parser.state != ChunkedParser::State::Complete);
-    if (unread_body) conn.keep_alive = false;
-    conn.keep_alive = conn.keep_alive && conn.req_client_keep_alive;
+    conn.keep_alive =
+        ordinary_local_response_may_persist(loop, conn, /*terminal_baseline=*/conn.keep_alive);
 
     u8 scratch[SlicePool::kSliceSize];
     const u32 cap =

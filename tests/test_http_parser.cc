@@ -3024,6 +3024,93 @@ TEST(TETokens, ChunkedExtSuffix) {
     CHECK(!req.chunked);
 }
 
+TEST(TEFraming, ConservativeOrderedClassificationAndReset) {
+    struct Case {
+        const char* raw;
+        ParseStatus status;
+        RequestTransferEncoding framing;
+        bool legacy_chunked;
+    };
+    const Case cases[] = {
+        {"GET / HTTP/1.1\r\nHost: x\r\n\r\n",
+         ParseStatus::Complete,
+         RequestTransferEncoding::None,
+         false},
+        {"GET / HTTP/1.1\r\nTE: trailers\r\n\r\n",
+         ParseStatus::Complete,
+         RequestTransferEncoding::None,
+         false},
+        {"POST / HTTP/1.1\r\nTransfer-Encoding: gzip, chunked\r\n\r\n",
+         ParseStatus::Complete,
+         RequestTransferEncoding::FinalChunked,
+         true},
+        {"POST / HTTP/1.1\r\nTransfer-Encoding: gzip\r\n\r\n",
+         ParseStatus::Complete,
+         RequestTransferEncoding::Unsupported,
+         false},
+        {"POST / HTTP/1.1\r\nTransfer-Encoding: chunked, gzip\r\n\r\n",
+         ParseStatus::Complete,
+         RequestTransferEncoding::Unsupported,
+         true},
+        {"POST / HTTP/1.1\r\nTransfer-Encoding: chunked, chunked\r\n\r\n",
+         ParseStatus::Complete,
+         RequestTransferEncoding::Unsupported,
+         true},
+        {"POST / HTTP/1.1\r\nTransfer-Encoding: chunked;foo=bar\r\n\r\n",
+         ParseStatus::Complete,
+         RequestTransferEncoding::Unsupported,
+         false},
+        {"POST / HTTP/1.1\r\nTransfer-Encoding:\r\n\r\n",
+         ParseStatus::Complete,
+         RequestTransferEncoding::Unsupported,
+         false},
+        {"POST / HTTP/1.1\r\nTransfer-Encoding: ,chunked\r\n\r\n",
+         ParseStatus::Complete,
+         RequestTransferEncoding::Unsupported,
+         true},
+        {"POST / HTTP/1.1\r\nTransfer-Encoding: chunked,\r\n\r\n",
+         ParseStatus::Complete,
+         RequestTransferEncoding::Unsupported,
+         true},
+        {"POST / HTTP/1.1\r\nTransfer-Encoding: gzip,,chunked\r\n\r\n",
+         ParseStatus::Complete,
+         RequestTransferEncoding::Unsupported,
+         true},
+        {"POST / HTTP/1.1\r\nTransfer-Encoding: bad/token\r\n\r\n",
+         ParseStatus::Complete,
+         RequestTransferEncoding::Unsupported,
+         false},
+        {"POST / HTTP/1.1\r\nTransfer-Encoding: gzip\r\nTransfer-Encoding: chunked\r\n\r\n",
+         ParseStatus::Complete,
+         RequestTransferEncoding::Unsupported,
+         true},
+        {"POST / HTTP/1.1\r\nContent-Length: 1\r\nTransfer-Encoding: gzip\r\n\r\nx",
+         ParseStatus::Complete,
+         RequestTransferEncoding::Unsupported,
+         false},
+        {"POST / HTTP/1.1\r\nContent-Length: 1\r\nTransfer-Encoding: chunked\r\n\r\n",
+         ParseStatus::Error,
+         RequestTransferEncoding::FinalChunked,
+         true},
+    };
+
+    HttpParser parser;
+    ParsedRequest req;
+    req.transfer_encoding = RequestTransferEncoding::FinalChunked;
+    for (const auto& tc : cases) {
+        const auto status = parse_one(tc.raw, &req, &parser);
+        CHECK_EQ(static_cast<u8>(status), static_cast<u8>(tc.status));
+        CHECK_EQ(static_cast<u8>(req.transfer_encoding), static_cast<u8>(tc.framing));
+        CHECK_EQ(req.chunked, tc.legacy_chunked);
+    }
+    req.reset();
+    CHECK_EQ(static_cast<u8>(req.transfer_encoding),
+             static_cast<u8>(RequestTransferEncoding::Unparsed));
+    CHECK(parse_raw(reinterpret_cast<const u8*>("G"), 1, &req, &parser) == ParseStatus::Incomplete);
+    CHECK_EQ(static_cast<u8>(req.transfer_encoding),
+             static_cast<u8>(RequestTransferEncoding::Unparsed));
+}
+
 // ============================================================================
 // TEST SUITE: obs-text (0x80-0xFF) in header values
 // ============================================================================
