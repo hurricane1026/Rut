@@ -378,6 +378,312 @@ inline bool response_read_deadline_coalesced_get_phase1_stash_is_stable(
     return true;
 }
 
+// #278 foundation.  These predicates describe the staged identity contract for
+// a completely admitted depth-1 HTTP/1 successor.  They are intentionally pure
+// and are not consumed by any production guard in this increment.  Every API
+// preserves the depth-0/token-0 legacy branch without re-checking its method,
+// upload, policy, or response profile; the existing guards remain authoritative
+// for that branch until the later atomic activation.
+inline bool http1_pipeline_request_is_legacy(const Connection& c) {
+    return c.pipeline_depth == 0 && c.http1_pipeline_request_generation == 0;
+}
+
+inline bool http1_pipeline_request_is_current_successor(const Connection& c) {
+    return c.pipeline_depth == 1 && c.handler_gen != 0 &&
+           c.http1_pipeline_request_generation == c.handler_gen;
+}
+
+inline bool http1_pipeline_successor_tombstone_is_safe(const Connection& c) {
+    return c.upstream_retiring_episode == 0 ||
+           (valid_upstream_episode(c.upstream_retiring_episode) &&
+            c.upstream_retiring_episode < c.upstream_episode);
+}
+
+inline bool http1_pipeline_successor_upstream_owners_are_neutral(const Connection& c) {
+    return c.upstream_fd < 0 && !c.upstream_slot_held && c.on_upstream_recv == nullptr &&
+           c.on_upstream_send == nullptr && !c.upstream_connect_armed && !c.upstream_send_armed &&
+           !c.upstream_recv_armed && !c.upstream_recv_paused_for_send &&
+           !c.upstream_recv_pause_cancel_pending && !c.upstream_recv_pause_rearm_pending &&
+           !c.upstream_recv_cancel_inflight && !c.upstream_retirement_active &&
+           c.upstream_retirement_target_owned == 0 && c.upstream_retirement_cancel_owned == 0 &&
+           c.upstream_retirement_cancel_retry == 0 && c.upstream_close_episode == 0 &&
+           c.upstream_close_target_owned == 0 && c.upstream_close_cancel_owned == 0 &&
+           !c.upstream_close_pause_cancel_owned && c.idle_return_fd < 0 &&
+           c.idle_return_config == nullptr && !c.close_after_idle_return &&
+           c.upstream_recv_buf.len() == 0 && !c.h2_proxy_recv_draining &&
+           !c.h2_proxy_synth_quarantined;
+}
+
+inline bool http1_pipeline_successor_semantic_shape_is_stable(
+    const Connection& c,
+    ResponseReadDeadlineProfile profile,
+    ForwardResponseBufferingMode buffering,
+    u8 method,
+    u8 route_method) {
+    return profile == ResponseReadDeadlineProfile::BodylessNonHeadContentLengthZero &&
+           buffering == ForwardResponseBufferingMode::CompleteContentLength &&
+           method == static_cast<u8>(LogHttpMethod::Get) && route_method == kRouteMethodGet &&
+           c.protocol == ConnProtocol::Http11 && !c.tls_active && c.h2 == nullptr &&
+           c.req_http_version == static_cast<u8>(HttpVersion::Http11) && c.req_strict_h1_complete &&
+           c.req_method == method && c.req_path_canon.ptr != nullptr &&
+           response_read_deadline_route_method_matches(c.req_method, route_method) &&
+           response_read_deadline_default_persistence_is_stable(c) &&
+           !c.req_client_has_content_length && !c.req_client_has_transfer_encoding &&
+           !c.req_client_has_te && !c.req_client_has_expect && !c.req_client_has_upgrade_header &&
+           c.req_body_mode == BodyMode::None && c.req_body_remaining == 0 &&
+           !c.request_body_fully_buffered && !c.req_body_streamed && !c.req_malformed &&
+           !c.req_wants_upgrade && !c.req_upgrade_is_websocket && !c.resp_upgrade_is_websocket &&
+           c.req_header_end != 0 && c.req_initial_send_len == c.req_header_end &&
+           c.pipeline_stash_len == 0 && c.retry_req_send_len == 0 &&
+           !c.response_mutations_snapshotted && !c.target_transform_recorded &&
+           !c.req_path_overridden && c.req_header_override_count == 0 &&
+           !c.req_header_override_overflow && c.resp_header_mutation_count == 0 &&
+           c.resp_header_mutation_pending_count == 0 && !c.resp_header_mutation_pending_overflow &&
+           !c.resp_header_mutation_overflow;
+}
+
+inline bool http1_pipeline_successor_request_shape_is_stable(const Connection& c,
+                                                             ResponseReadDeadlineProfile profile,
+                                                             ForwardResponseBufferingMode buffering,
+                                                             u8 method,
+                                                             u8 route_method) {
+    return http1_pipeline_successor_semantic_shape_is_stable(
+               c, profile, buffering, method, route_method) &&
+           c.recv_buf.len() == c.req_initial_send_len;
+}
+
+inline bool http1_pipeline_request_generation_provisional_is_stable(
+    const Connection& c,
+    ResponseReadDeadlineProfile candidate_profile,
+    ForwardResponseBufferingMode candidate_buffering,
+    u8 candidate_method,
+    u8 candidate_route_method) {
+    if (http1_pipeline_request_is_legacy(c)) return true;
+    if (!http1_pipeline_request_is_current_successor(c) ||
+        !http1_pipeline_successor_request_shape_is_stable(
+            c, candidate_profile, candidate_buffering, candidate_method, candidate_route_method) ||
+        c.upstream_attempts > 1 || !valid_upstream_episode(c.upstream_episode) ||
+        c.upstream_episode_quarantined || !http1_pipeline_successor_tombstone_is_safe(c) ||
+        !http1_pipeline_successor_upstream_owners_are_neutral(c))
+        return false;
+    return true;
+}
+
+inline bool http1_pipeline_request_generation_jit_candidate_is_stable(
+    const Connection& c,
+    const ResponseReadDeadlineUploadProof& preflight_proof,
+    ResponseReadDeadlineProfile candidate_profile,
+    ForwardResponseBufferingMode candidate_buffering,
+    u8 candidate_method,
+    u8 candidate_route_method,
+    u16 candidate_request_policy_id) {
+    if (http1_pipeline_request_is_legacy(c)) return true;
+    return http1_pipeline_request_generation_provisional_is_stable(c,
+                                                                   candidate_profile,
+                                                                   candidate_buffering,
+                                                                   candidate_method,
+                                                                   candidate_route_method) &&
+           candidate_request_policy_id == static_cast<u16>(RequestPolicyId::Http11FixedStrip) &&
+           c.request_policy_id == 0 &&
+           response_read_deadline_upload_proof_equal(c.response_read_deadline_upload,
+                                                     preflight_proof) &&
+           preflight_proof.handler_generation == c.handler_gen &&
+           preflight_proof.handler_generation == c.http1_pipeline_request_generation &&
+           preflight_proof.raw_header_end == 0 && preflight_proof.raw_content_length == 0 &&
+           preflight_proof.raw_total_length == 0 && preflight_proof.rewritten_header_end == 0 &&
+           preflight_proof.rewritten_total_length == 0 && preflight_proof.upload_episode == 0 &&
+           preflight_proof.expected_upload_length == 0 && preflight_proof.route_index == 0xffffu &&
+           preflight_proof.upstream_id == 0xffffu && preflight_proof.request_policy_id == 0 &&
+           preflight_proof.route_fn == nullptr && !preflight_proof.downstream_close;
+}
+
+inline bool http1_pipeline_successor_selected_identity_is_stable(
+    const Connection& c,
+    const ResponseReadDeadlineUploadProof& proof,
+    ResponseReadDeadlineProfile profile,
+    ForwardResponseBufferingMode buffering,
+    u8 method,
+    u8 route_method,
+    bool require_materialized_request) {
+    const RouteConfig* cfg = c.request_config;
+    if (!http1_pipeline_request_is_current_successor(c) || cfg == nullptr ||
+        !(require_materialized_request ? http1_pipeline_successor_request_shape_is_stable(
+                                             c, profile, buffering, method, route_method)
+                                       : http1_pipeline_successor_semantic_shape_is_stable(
+                                             c, profile, buffering, method, route_method)) ||
+        c.response_read_deadline_profile != profile ||
+        c.response_read_deadline_buffering != buffering ||
+        c.response_read_deadline_method != method ||
+        c.response_read_deadline_route_method != route_method ||
+        c.request_policy_id != static_cast<u16>(RequestPolicyId::Http11FixedStrip) ||
+        proof.request_policy_id != c.request_policy_id ||
+        proof.handler_generation != c.handler_gen ||
+        proof.handler_generation != c.http1_pipeline_request_generation ||
+        proof.route_index >= cfg->route_count || proof.route_fn == nullptr ||
+        proof.upstream_id >= cfg->upstream_count || proof.upstream_id != c.upstream_idx ||
+        proof.downstream_close || c.upstream_attempts != 1 ||
+        !valid_upstream_episode(c.upstream_episode) || c.upstream_episode_quarantined ||
+        !http1_pipeline_successor_tombstone_is_safe(c) ||
+        !response_read_deadline_upload_proof_equal(c.response_read_deadline_upload, proof))
+        return false;
+    const RouteEntry& route = cfg->routes[proof.route_index];
+    const UpstreamTarget& target = cfg->upstreams[proof.upstream_id];
+    return route.action == RouteAction::JitHandler && route.fn == proof.route_fn &&
+           !route.needs_req_body && route.rate_limit.count == 0 && route.throttle_down_bps == 0 &&
+           !route.ws_terminate && route.method == kRouteMethodGet &&
+           cfg->policy_bundle_id_is_valid(c.response_read_deadline_bundle_id) &&
+           route.preflight_forward_policy_bundle_id == c.response_read_deadline_bundle_id &&
+           target.addr_count == 1 && target.addrs[0].sin_family == AF_INET &&
+           target.max_inflight == 0;
+}
+
+inline bool http1_pipeline_request_generation_preconnect_is_stable(
+    const Connection& c,
+    const ResponseReadDeadlineUploadProof& proof,
+    ResponseReadDeadlineProfile profile,
+    ForwardResponseBufferingMode buffering,
+    u8 method,
+    u8 route_method) {
+    if (http1_pipeline_request_is_legacy(c)) return true;
+    return http1_pipeline_successor_selected_identity_is_stable(
+               c, proof, profile, buffering, method, route_method, true) &&
+           proof.raw_header_end == 0 && proof.raw_content_length == 0 &&
+           proof.raw_total_length == 0 && proof.rewritten_header_end == c.req_header_end &&
+           proof.rewritten_total_length == c.req_initial_send_len &&
+           proof.expected_upload_length == proof.rewritten_total_length &&
+           proof.upload_episode == 0;
+}
+
+inline bool http1_pipeline_request_generation_upload_active_is_stable(
+    const Connection& c,
+    const ResponseReadDeadlineUploadProof& proof,
+    ResponseReadDeadlineProfile profile,
+    ForwardResponseBufferingMode buffering,
+    u8 method,
+    u8 route_method,
+    bool allow_retired_episode = false) {
+    if (http1_pipeline_request_is_legacy(c)) return true;
+    const bool episode =
+        proof.upload_episode == c.upstream_episode ||
+        (allow_retired_episode && proof.upload_episode == c.upstream_retiring_episode);
+    return http1_pipeline_successor_selected_identity_is_stable(
+               c, proof, profile, buffering, method, route_method, false) &&
+           proof.raw_header_end == 0 && proof.raw_content_length == 0 &&
+           proof.raw_total_length == 0 && proof.rewritten_header_end == c.req_header_end &&
+           proof.rewritten_total_length == c.req_initial_send_len &&
+           proof.expected_upload_length == proof.rewritten_total_length &&
+           valid_upstream_episode(proof.upload_episode) && episode;
+}
+
+template <typename Loop>
+inline bool http1_pipeline_request_generation_connected_is_stable(
+    const Loop* loop,
+    const Connection& c,
+    const IoEvent& ev,
+    Connection::Callback expected_upstream_connect) {
+    if (http1_pipeline_request_is_legacy(c)) return true;
+    if constexpr (!requires(const Loop* candidate) {
+                      candidate->backend.send_state[0];
+                      candidate->backend.upstream_send_state[0];
+                      candidate->conns[0];
+                  }) {
+        return false;
+    } else {
+        if (loop == nullptr || expected_upstream_connect == nullptr || c.id >= Loop::kMaxConns ||
+            &loop->conns[c.id] != &c || c.fd < 0 || c.req_start_us == 0 ||
+            c.state != ConnState::Proxying || c.upstream_fd < 0 ||
+            c.on_upstream_send != expected_upstream_connect || c.on_upstream_recv != nullptr ||
+            c.on_recv != nullptr || c.on_send != nullptr || c.upstream_connect_armed ||
+            c.upstream_send_armed || c.upstream_recv_armed || c.upstream_slot_held ||
+            c.upstream_retirement_active || c.upstream_retirement_target_owned != 0 ||
+            c.upstream_retirement_cancel_owned != 0 || c.upstream_retirement_cancel_retry != 0 ||
+            c.upstream_close_episode != 0 || c.upstream_close_target_owned != 0 ||
+            c.upstream_close_cancel_owned != 0 || c.upstream_close_pause_cancel_owned ||
+            c.idle_return_fd >= 0 || c.idle_return_config != nullptr || c.close_after_idle_return ||
+            loop->backend.send_state[c.id].remaining != 0 ||
+            loop->backend.upstream_send_state[c.id].remaining != 0 ||
+            ev.type != IoEventType::UpstreamConnect || ev.result != 0 || ev.aux != 0 || ev.more ||
+            ev.conn_id != c.id || ev.upstream_episode != c.upstream_episode ||
+            !http1_pipeline_request_generation_preconnect_is_stable(
+                c,
+                c.response_read_deadline_upload,
+                c.response_read_deadline_profile,
+                c.response_read_deadline_buffering,
+                c.response_read_deadline_method,
+                c.response_read_deadline_route_method))
+            return false;
+        const bool live_downstream_recv = c.recv_armed && c.pending_ops == 1u;
+        const bool terminal_downstream_recv_consumed = !c.recv_armed && c.pending_ops == 0u;
+        return live_downstream_recv || terminal_downstream_recv_consumed;
+    }
+}
+
+inline bool http1_pipeline_request_generation_prebuilt_is_stable(
+    const Connection& c,
+    const ResponseReadDeadlineUploadProof& copied_proof,
+    const RouteConfig* copied_config,
+    u16 copied_bundle_id,
+    ResponseReadDeadlineProfile copied_profile,
+    ForwardResponseBufferingMode copied_buffering,
+    u8 copied_method,
+    u8 copied_route_method,
+    Http1PrebuiltResponseLayout copied_layout,
+    Http1PrebuiltResponsePurpose copied_purpose) {
+    if (http1_pipeline_request_is_legacy(c)) return true;
+    if (!http1_pipeline_request_is_current_successor(c) || copied_config == nullptr ||
+        copied_config != c.request_config ||
+        !copied_config->policy_bundle_id_is_valid(copied_bundle_id) ||
+        !http1_pipeline_successor_semantic_shape_is_stable(
+            c, copied_profile, copied_buffering, copied_method, copied_route_method) ||
+        copied_profile != ResponseReadDeadlineProfile::BodylessNonHeadContentLengthZero ||
+        copied_buffering != ForwardResponseBufferingMode::CompleteContentLength ||
+        copied_method != static_cast<u8>(LogHttpMethod::Get) ||
+        copied_route_method != kRouteMethodGet ||
+        copied_layout != Http1PrebuiltResponseLayout::FullContentLengthNonHead ||
+        (copied_purpose != Http1PrebuiltResponsePurpose::StrictNonHeadCl0Success &&
+         copied_purpose != Http1PrebuiltResponsePurpose::ResponseReadTimeout) ||
+        c.http1_prebuilt_deadline_config != copied_config ||
+        c.http1_prebuilt_deadline_bundle_id != copied_bundle_id ||
+        c.http1_prebuilt_deadline_profile != copied_profile ||
+        c.http1_prebuilt_deadline_method != copied_method ||
+        c.http1_prebuilt_deadline_route_method != copied_route_method ||
+        c.http1_prebuilt_response_layout != copied_layout ||
+        c.http1_prebuilt_response_purpose != copied_purpose ||
+        !response_read_deadline_upload_proof_equal(c.http1_prebuilt_deadline_upload,
+                                                   copied_proof) ||
+        copied_proof.handler_generation != c.handler_gen ||
+        copied_proof.handler_generation != c.http1_pipeline_request_generation ||
+        copied_proof.route_index >= copied_config->route_count ||
+        copied_proof.route_fn == nullptr || copied_proof.raw_header_end != 0 ||
+        copied_proof.raw_content_length != 0 || copied_proof.raw_total_length != 0 ||
+        copied_proof.rewritten_header_end != c.req_header_end ||
+        copied_proof.rewritten_total_length != c.req_initial_send_len ||
+        copied_proof.rewritten_total_length != copied_proof.rewritten_header_end ||
+        copied_proof.expected_upload_length != copied_proof.rewritten_total_length ||
+        copied_proof.downstream_close ||
+        copied_proof.request_policy_id != static_cast<u16>(RequestPolicyId::Http11FixedStrip) ||
+        copied_proof.request_policy_id != c.request_policy_id ||
+        copied_proof.upstream_id >= copied_config->upstream_count ||
+        copied_proof.upstream_id != c.upstream_idx || c.http1_prebuilt_deadline_generation == 0 ||
+        c.http1_prebuilt_deadline_generation != c.response_read_deadline_generation ||
+        !valid_upstream_episode(copied_proof.upload_episode) ||
+        (copied_proof.upload_episode != c.upstream_episode &&
+         copied_proof.upload_episode != c.upstream_retiring_episode) ||
+        !valid_upstream_episode(c.upstream_episode) || c.upstream_episode_quarantined ||
+        !http1_pipeline_successor_tombstone_is_safe(c))
+        return false;
+    const auto& bundle = copied_config->policy_bundles[copied_bundle_id - 1];
+    const RouteEntry& route = copied_config->routes[copied_proof.route_index];
+    const UpstreamTarget& target = copied_config->upstreams[copied_proof.upstream_id];
+    return bundle.response_buffering == copied_buffering &&
+           route.action == RouteAction::JitHandler && route.fn == copied_proof.route_fn &&
+           route.method == kRouteMethodGet &&
+           route.preflight_forward_policy_bundle_id == copied_bundle_id && !route.needs_req_body &&
+           route.rate_limit.count == 0 && route.throttle_down_bps == 0 && !route.ws_terminate &&
+           target.addr_count == 1 && target.addrs[0].sin_family == AF_INET &&
+           target.max_inflight == 0;
+}
+
 inline bool response_read_deadline_owner_is_stable(const Connection& c,
                                                    Connection::Callback expected_upstream_recv,
                                                    ResponseReadDeadlineOwnerPhase phase) {

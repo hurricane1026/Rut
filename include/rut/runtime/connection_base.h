@@ -815,6 +815,18 @@ struct ConnectionBase {
     // HTTP pipelining state
     u16 pipeline_depth;      // pipelined requests processed on this connection
     u16 pipeline_stash_len;  // bytes of next request stashed in send_buf (proxy)
+    // Non-zero only for one completely admitted depth-1 HTTP/1 successor.  The
+    // token is bound to handler_gen so later strict-owner predicates can reject
+    // stale or forged pipeline state without repurposing pipeline_depth (which
+    // remains the chain/reassembly counter).  Foundation only: existing runtime
+    // guards deliberately do not consume this token yet.
+    u32 http1_pipeline_request_generation;
+
+    void copy_http1_pipeline_state_from(const ConnectionBase& source) {
+        pipeline_depth = source.pipeline_depth;
+        pipeline_stash_len = source.pipeline_stash_len;
+        http1_pipeline_request_generation = source.http1_pipeline_request_generation;
+    }
 
     // Body streaming state (proxy large body support)
     u32 req_header_end;        // offset past request headers (\r\n\r\n)
@@ -1212,6 +1224,7 @@ struct ConnectionBase {
         tls_pending_on_send = nullptr;
         pipeline_depth = 0;
         pipeline_stash_len = 0;
+        http1_pipeline_request_generation = 0;
         req_header_end = 0;
         req_content_length = 0;
         req_initial_send_len = 0;

@@ -1498,6 +1498,13 @@ void on_header_received(void* lp, Connection& conn, IoEvent ev) {
     // for upstream forwarding. Reset happens in on_response_sent / on_proxy_response_sent
     // when the cycle completes and we're about to read the next request.
 
+    // A pipeline token belongs only to a request proven complete by this
+    // invocation.  Clear it before every parse/re-entry decision so a stale
+    // depth-1 token cannot survive fragmented depth>1 reassembly or malformed
+    // input.
+    conn.http1_pipeline_request_generation = 0;
+    bool complete_pipeline_request = false;
+
     // Check if the buffer contains a complete request before proceeding.
     // For pipelined re-entries, an incomplete request should wait for more
     // data instead of getting a spurious default response.
@@ -1505,14 +1512,16 @@ void on_header_received(void* lp, Connection& conn, IoEvent ev) {
         HttpParser pre_parser;
         ParsedRequest pre_req;
         pre_parser.reset();
-        if (pre_parser.parse(conn.recv_buf.data(), conn.recv_buf.len(), &pre_req) ==
-            ParseStatus::Incomplete) {
+        const ParseStatus pipeline_status =
+            pre_parser.parse(conn.recv_buf.data(), conn.recv_buf.len(), &pre_req);
+        if (pipeline_status == ParseStatus::Incomplete) {
             // Keep pipeline_depth > 0 so subsequent recvs also check for
             // Incomplete (multi-packet reassembly of the pipelined request).
             conn.transition_to_reading_header(&on_header_received<Loop>);
             if (!loop->submit_recv(conn)) loop->close_conn(conn);
             return;
         }
+        complete_pipeline_request = pipeline_status == ParseStatus::Complete;
     }
 
     conn.clear_response_accounting();
@@ -1522,6 +1531,9 @@ void on_header_received(void* lp, Connection& conn, IoEvent ev) {
     // filter can reliably reject entries left by a close+reuse even if
     // the new request's req_start_us lands in the same microsecond.
     conn.handler_gen++;
+    if (conn.pipeline_depth == 1 && complete_pipeline_request && conn.handler_gen != 0 &&
+        conn.req_strict_h1_complete && !conn.req_malformed)
+        conn.http1_pipeline_request_generation = conn.handler_gen;
     conn.req_start_us = monotonic_us();
     // Per-request proxy state must start clean on EVERY request. reset() runs
     // only at connection alloc, so on a keep-alive-reused connection these flags

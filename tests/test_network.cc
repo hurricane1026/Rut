@@ -10223,6 +10223,175 @@ TEST(pipeline, no_pipeline_resets_depth) {
     CHECK_GE(loop.backend.count_ops(MockOp::Recv), 1u);
 }
 
+TEST(pipeline, request_generation_token_publishes_only_for_complete_depth_one) {
+    SmallLoop loop;
+    loop.setup();
+    loop.inject_and_dispatch(make_ev(0, IoEventType::Accept, 42));
+    auto* conn = loop.find_fd(42);
+    REQUIRE(conn != nullptr);
+
+    static constexpr char kFirst[] = "GET / HTTP/1.1\r\nHost: x\r\n\r\n";
+    static constexpr char kSecond[] = "GET /b HTTP/1.1\r\nHost: x\r\n\r\n";
+    static constexpr char kThird[] = "GET /c HTTP/1.1\r\nHost: x\r\n\r\n";
+    std::string requests = std::string(kFirst) + kSecond + kThird;
+    inject_raw_recv(loop, *conn, requests.data(), static_cast<u32>(requests.size()));
+    REQUIRE_EQ(conn->handler_gen, 1u);
+    CHECK_EQ(conn->http1_pipeline_request_generation, 0u);
+
+    loop.backend.clear_ops();
+    loop.inject_and_dispatch(
+        make_ev(conn->id, IoEventType::Send, static_cast<i32>(conn->send_buf.len())));
+    REQUIRE_EQ(conn->pipeline_depth, 1u);
+    REQUIRE_EQ(conn->handler_gen, 2u);
+    CHECK_EQ(conn->http1_pipeline_request_generation, conn->handler_gen);
+
+    loop.backend.clear_ops();
+    loop.inject_and_dispatch(
+        make_ev(conn->id, IoEventType::Send, static_cast<i32>(conn->send_buf.len())));
+    REQUIRE_EQ(conn->pipeline_depth, 2u);
+    REQUIRE_EQ(conn->handler_gen, 3u);
+    CHECK_EQ(conn->http1_pipeline_request_generation, 0u);
+}
+
+TEST(pipeline, fragmented_successor_defers_request_generation_token_until_complete) {
+    SmallLoop loop;
+    loop.setup();
+    loop.inject_and_dispatch(make_ev(0, IoEventType::Accept, 42));
+    auto* conn = loop.find_fd(42);
+    REQUIRE(conn != nullptr);
+
+    static constexpr char kBytes[] =
+        "GET / HTTP/1.1\r\nHost: x\r\n\r\n"
+        "GET /b HTTP/1.1\r\nHost: x";
+    inject_raw_recv(loop, *conn, kBytes, sizeof(kBytes) - 1u);
+    REQUIRE_EQ(conn->handler_gen, 1u);
+    loop.backend.clear_ops();
+    loop.inject_and_dispatch(
+        make_ev(conn->id, IoEventType::Send, static_cast<i32>(conn->send_buf.len())));
+    REQUIRE_EQ(conn->pipeline_depth, 1u);
+    REQUIRE_EQ(conn->handler_gen, 1u);
+    CHECK_EQ(conn->http1_pipeline_request_generation, 0u);
+
+    static constexpr char kTail[] = "\r\n\r\n";
+    REQUIRE_EQ(conn->recv_buf.write(reinterpret_cast<const u8*>(kTail), sizeof(kTail) - 1u),
+               sizeof(kTail) - 1u);
+    loop.inject_and_dispatch(
+        make_ev(conn->id, IoEventType::Recv, static_cast<i32>(sizeof(kTail) - 1u)));
+    REQUIRE_EQ(conn->handler_gen, 2u);
+    CHECK_EQ(conn->http1_pipeline_request_generation, conn->handler_gen);
+}
+
+TEST(pipeline, malformed_depth_one_never_publishes_request_generation_token) {
+    SmallLoop loop;
+    loop.setup();
+    loop.inject_and_dispatch(make_ev(0, IoEventType::Accept, 42));
+    auto* conn = loop.find_fd(42);
+    REQUIRE(conn != nullptr);
+    static constexpr u8 kMalformed[] =
+        "POST / HTTP/1.1\r\nHost: client\r\nTransfer-Encoding: chunked\r\n\r\nZZ\r\n";
+    HttpParser parser;
+    ParsedRequest parsed;
+    parser.reset();
+    REQUIRE_EQ(parser.parse(kMalformed, sizeof(kMalformed) - 1u, &parsed), ParseStatus::Complete);
+    conn->pipeline_depth = 1;
+    conn->handler_gen = 11;
+    conn->http1_pipeline_request_generation = conn->handler_gen;
+    conn->recv_buf.reset();
+    REQUIRE_EQ(conn->recv_buf.write(kMalformed, sizeof(kMalformed) - 1u), sizeof(kMalformed) - 1u);
+    on_header_received<SmallLoop>(
+        &loop,
+        *conn,
+        {conn->id, static_cast<i32>(sizeof(kMalformed) - 1u), 0, 0, IoEventType::Recv, 0});
+    CHECK_EQ(conn->handler_gen, 12u);
+    CHECK(conn->req_malformed);
+    CHECK_EQ(conn->http1_pipeline_request_generation, 0u);
+}
+
+TEST(pipeline, parse_error_depth_one_never_publishes_request_generation_token) {
+    SmallLoop loop;
+    loop.setup();
+    loop.inject_and_dispatch(make_ev(0, IoEventType::Accept, 42));
+    auto* conn = loop.find_fd(42);
+    REQUIRE(conn != nullptr);
+    static constexpr u8 kParseError[] = "GET / HTTP/1.1\r\nHost: bad\x01value\r\n\r\n";
+    HttpParser parser;
+    ParsedRequest parsed;
+    parser.reset();
+    REQUIRE_EQ(parser.parse(kParseError, sizeof(kParseError) - 1u, &parsed), ParseStatus::Error);
+    conn->pipeline_depth = 1;
+    conn->handler_gen = 17;
+    conn->http1_pipeline_request_generation = conn->handler_gen;
+    conn->recv_buf.reset();
+    REQUIRE_EQ(conn->recv_buf.write(kParseError, sizeof(kParseError) - 1u),
+               sizeof(kParseError) - 1u);
+    on_header_received<SmallLoop>(
+        &loop,
+        *conn,
+        {conn->id, static_cast<i32>(sizeof(kParseError) - 1u), 0, 0, IoEventType::Recv, 0});
+    CHECK_EQ(conn->handler_gen, 18u);
+    CHECK_EQ(conn->http1_pipeline_request_generation, 0u);
+}
+
+TEST(pipeline, fragmented_depth_greater_than_one_clears_stale_request_generation_token) {
+    SmallLoop loop;
+    loop.setup();
+    loop.inject_and_dispatch(make_ev(0, IoEventType::Accept, 42));
+    auto* conn = loop.find_fd(42);
+    REQUIRE(conn != nullptr);
+    static constexpr u8 kPartial[] = "GET / HTTP/1.1\r\nHost: client";
+    conn->pipeline_depth = 2;
+    conn->handler_gen = 13;
+    conn->http1_pipeline_request_generation = conn->handler_gen;
+    conn->recv_buf.reset();
+    REQUIRE_EQ(conn->recv_buf.write(kPartial, sizeof(kPartial) - 1u), sizeof(kPartial) - 1u);
+    on_header_received<SmallLoop>(
+        &loop,
+        *conn,
+        {conn->id, static_cast<i32>(sizeof(kPartial) - 1u), 0, 0, IoEventType::Recv, 0});
+    CHECK_EQ(conn->handler_gen, 13u);
+    CHECK_EQ(conn->http1_pipeline_request_generation, 0u);
+    CHECK_EQ(conn->pipeline_depth, 2u);
+    CHECK_EQ(conn->state, ConnState::ReadingHeader);
+}
+
+TEST(pipeline, request_generation_token_rejects_handler_wrap_and_resets) {
+    SmallLoop loop;
+    loop.setup();
+    loop.inject_and_dispatch(make_ev(0, IoEventType::Accept, 42));
+    auto* conn = loop.find_fd(42);
+    REQUIRE(conn != nullptr);
+    static constexpr char kRequest[] = "GET / HTTP/1.1\r\nHost: x\r\n\r\n";
+    conn->pipeline_depth = 1;
+    conn->handler_gen = 0xffffffffu;
+    conn->recv_buf.reset();
+    REQUIRE_EQ(conn->recv_buf.write(reinterpret_cast<const u8*>(kRequest), sizeof(kRequest) - 1u),
+               sizeof(kRequest) - 1u);
+    on_header_received<SmallLoop>(
+        &loop,
+        *conn,
+        {conn->id, static_cast<i32>(sizeof(kRequest) - 1u), 0, 0, IoEventType::Recv, 0});
+    REQUIRE_EQ(conn->handler_gen, 0u);
+    CHECK_EQ(conn->http1_pipeline_request_generation, 0u);
+
+    conn->http1_pipeline_request_generation = 37;
+    conn->reset();
+    CHECK_EQ(conn->http1_pipeline_request_generation, 0u);
+}
+
+TEST(pipeline, simulation_state_copy_preserves_request_generation_token) {
+    ConnectionBase source{};
+    source.reset();
+    source.pipeline_depth = 1;
+    source.pipeline_stash_len = 19;
+    source.http1_pipeline_request_generation = 41;
+    ConnectionBase destination{};
+    destination.reset();
+    destination.copy_http1_pipeline_state_from(source);
+    CHECK_EQ(destination.pipeline_depth, 1u);
+    CHECK_EQ(destination.pipeline_stash_len, 19u);
+    CHECK_EQ(destination.http1_pipeline_request_generation, 41u);
+}
+
 // Exact single request — pipeline_leftover returns 0.
 TEST(pipeline, leftover_returns_zero_for_exact_request) {
     SmallLoop loop;
@@ -22046,6 +22215,478 @@ void cleanup_late_failure_fixture(IoUringEventLoop* loop, PreconnectConnectSubmi
     fixture.conn = nullptr;
 }
 
+void pipeline_generation_connect_callback(void*, Connection&, IoEvent) {}
+
+struct PipelineGenerationFoundationLoop {
+    static constexpr u32 kMaxConns = 1;
+    struct BackendState {
+        IoUringBackend::SendState send_state[kMaxConns]{};
+        IoUringBackend::SendState upstream_send_state[kMaxConns]{};
+    } backend;
+    Connection conns[kMaxConns];
+};
+
+struct PipelineGenerationFoundationFixture {
+    PipelineGenerationFoundationLoop loop{};
+    RouteConfig config{};
+    u8 recv_storage[512]{};
+    u8 send_storage[512]{};
+    u8 upstream_storage[512]{};
+
+    bool setup(bool older_tombstone = false) {
+        if (!config.add_upstream("backend", 0x7F000001, 9000).has_value() ||
+            !add_bodyless_non_head_response_read_deadline_bundle(
+                config, 5, ForwardResponseBufferingMode::CompleteContentLength) ||
+            !config.add_jit_handler(
+                "/one", kRouteMethodGet, &response_read_deadline_handler, false, 2))
+            return false;
+        Connection& conn = loop.conns[0];
+        conn.reset();
+        conn.id = 0;
+        conn.fd = 42;
+        conn.recv_slice = recv_storage;
+        conn.recv_buf.bind(recv_storage, sizeof(recv_storage));
+        conn.send_slice = send_storage;
+        conn.send_buf.bind(send_storage, sizeof(send_storage));
+        conn.upstream_recv_slice = upstream_storage;
+        conn.upstream_recv_buf.bind(upstream_storage, sizeof(upstream_storage));
+        static constexpr u8 kRequest[] = "GET /one HTTP/1.1\r\nHost: client.example\r\n\r\n";
+        if (conn.recv_buf.write(kRequest, sizeof(kRequest) - 1u) != sizeof(kRequest) - 1u)
+            return false;
+        capture_request_metadata(conn);
+        conn.pipeline_depth = 1;
+        conn.handler_gen = 23;
+        conn.http1_pipeline_request_generation = conn.handler_gen;
+        conn.req_start_us = 1;
+        conn.request_config = &config;
+        conn.upstream_idx = 0;
+        conn.upstream_attempts = 1;
+        conn.upstream_episode = older_tombstone ? 2 : 1;
+        conn.upstream_retiring_episode = older_tombstone ? 1 : 0;
+        return true;
+    }
+
+    ResponseReadDeadlineUploadProof stage_preflight() {
+        Connection& conn = loop.conns[0];
+        ResponseReadDeadlineUploadProof proof{};
+        proof.handler_generation = conn.http1_pipeline_request_generation;
+        conn.response_read_deadline_upload = proof;
+        return proof;
+    }
+
+    ResponseReadDeadlineUploadProof stage_jit_preconnect() {
+        Connection& conn = loop.conns[0];
+        conn.request_policy_id = static_cast<u16>(RequestPolicyId::Http11FixedStrip);
+        conn.response_read_deadline_profile =
+            ResponseReadDeadlineProfile::BodylessNonHeadContentLengthZero;
+        conn.response_read_deadline_buffering = ForwardResponseBufferingMode::CompleteContentLength;
+        conn.response_read_deadline_method = static_cast<u8>(LogHttpMethod::Get);
+        conn.response_read_deadline_route_method = kRouteMethodGet;
+        conn.response_read_deadline_bundle_id = 2;
+        ResponseReadDeadlineUploadProof proof{};
+        proof.handler_generation = conn.handler_gen;
+        proof.rewritten_header_end = conn.req_header_end;
+        proof.rewritten_total_length = conn.req_header_end;
+        proof.expected_upload_length = conn.req_header_end;
+        proof.route_index = 0;
+        proof.upstream_id = 0;
+        proof.request_policy_id = conn.request_policy_id;
+        proof.route_fn = config.routes[0].fn;
+        conn.response_read_deadline_upload = proof;
+        return proof;
+    }
+
+    void stage_connected() {
+        Connection& conn = loop.conns[0];
+        conn.state = ConnState::Proxying;
+        conn.upstream_fd = 91;
+        conn.on_upstream_send = &pipeline_generation_connect_callback;
+        conn.recv_armed = true;
+        conn.pending_ops = 1;
+    }
+
+    ResponseReadDeadlineUploadProof stage_upload_active(
+        const ResponseReadDeadlineUploadProof& preconnect, bool retired_episode = false) {
+        Connection& conn = loop.conns[0];
+        ResponseReadDeadlineUploadProof proof = preconnect;
+        proof.upload_episode =
+            retired_episode ? conn.upstream_retiring_episode : conn.upstream_episode;
+        conn.response_read_deadline_upload = proof;
+        return proof;
+    }
+
+    void stage_prebuilt(const ResponseReadDeadlineUploadProof& proof,
+                        Http1PrebuiltResponsePurpose purpose) {
+        Connection& conn = loop.conns[0];
+        conn.http1_prebuilt_deadline_config = &config;
+        conn.response_read_deadline_generation = 1;
+        conn.http1_prebuilt_deadline_generation = conn.response_read_deadline_generation;
+        conn.http1_prebuilt_deadline_bundle_id = 2;
+        conn.http1_prebuilt_deadline_profile =
+            ResponseReadDeadlineProfile::BodylessNonHeadContentLengthZero;
+        conn.http1_prebuilt_deadline_method = static_cast<u8>(LogHttpMethod::Get);
+        conn.http1_prebuilt_deadline_route_method = kRouteMethodGet;
+        conn.http1_prebuilt_response_layout = Http1PrebuiltResponseLayout::FullContentLengthNonHead;
+        conn.http1_prebuilt_response_purpose = purpose;
+        conn.http1_prebuilt_deadline_upload = proof;
+    }
+};
+
+TEST(http1_pipeline_generation_foundation,
+     provisional_and_jit_accept_only_exact_current_successor_with_neutral_owners) {
+    PipelineGenerationFoundationFixture fixture;
+    REQUIRE(fixture.setup());
+    Connection& conn = fixture.loop.conns[0];
+    ResponseReadDeadlineUploadProof preflight = fixture.stage_preflight();
+    const auto provisional = [&] {
+        return http1_pipeline_request_generation_provisional_is_stable(
+            conn,
+            ResponseReadDeadlineProfile::BodylessNonHeadContentLengthZero,
+            ForwardResponseBufferingMode::CompleteContentLength,
+            static_cast<u8>(LogHttpMethod::Get),
+            kRouteMethodGet);
+    };
+    const auto jit = [&](u16 policy) {
+        return http1_pipeline_request_generation_jit_candidate_is_stable(
+            conn,
+            preflight,
+            ResponseReadDeadlineProfile::BodylessNonHeadContentLengthZero,
+            ForwardResponseBufferingMode::CompleteContentLength,
+            static_cast<u8>(LogHttpMethod::Get),
+            kRouteMethodGet,
+            policy);
+    };
+
+    CHECK(provisional());
+    CHECK(jit(static_cast<u16>(RequestPolicyId::Http11FixedStrip)));
+    CHECK_FALSE(jit(0));
+    conn.upstream_attempts = 0;
+    CHECK(provisional());
+    conn.upstream_attempts = 1;
+
+    const auto rejected_while = [&](auto mutate, auto restore) {
+        mutate();
+        CHECK_FALSE(provisional());
+        restore();
+        CHECK(provisional());
+    };
+    rejected_while([&] { ++conn.http1_pipeline_request_generation; },
+                   [&] { conn.http1_pipeline_request_generation = conn.handler_gen; });
+    rejected_while([&] { conn.pipeline_depth = 2; }, [&] { conn.pipeline_depth = 1; });
+    rejected_while([&] { conn.upstream_episode = 0; }, [&] { conn.upstream_episode = 1; });
+    rejected_while([&] { conn.upstream_episode_quarantined = true; },
+                   [&] { conn.upstream_episode_quarantined = false; });
+    rejected_while([&] { conn.upstream_retiring_episode = conn.upstream_episode; },
+                   [&] { conn.upstream_retiring_episode = 0; });
+    rejected_while([&] { conn.upstream_retirement_active = true; },
+                   [&] { conn.upstream_retirement_active = false; });
+    rejected_while([&] { conn.upstream_close_episode = conn.upstream_episode; },
+                   [&] { conn.upstream_close_episode = 0; });
+    rejected_while([&] { conn.upstream_fd = 9; }, [&] { conn.upstream_fd = -1; });
+    rejected_while([&] { conn.upstream_slot_held = true; },
+                   [&] { conn.upstream_slot_held = false; });
+    rejected_while([&] { conn.upstream_connect_armed = true; },
+                   [&] { conn.upstream_connect_armed = false; });
+    rejected_while([&] { conn.on_upstream_send = &pipeline_generation_connect_callback; },
+                   [&] { conn.on_upstream_send = nullptr; });
+
+    CHECK_EQ(preflight.handler_generation, conn.http1_pipeline_request_generation);
+    CHECK_EQ(preflight.raw_total_length, 0u);
+    CHECK_EQ(preflight.rewritten_total_length, 0u);
+    CHECK_EQ(preflight.upload_episode, 0u);
+    conn.response_read_deadline_upload.raw_total_length = 1;
+    CHECK_FALSE(jit(static_cast<u16>(RequestPolicyId::Http11FixedStrip)));
+    conn.response_read_deadline_upload = preflight;
+    ++preflight.handler_generation;
+    CHECK_FALSE(jit(static_cast<u16>(RequestPolicyId::Http11FixedStrip)));
+
+    PipelineGenerationFoundationFixture older;
+    REQUIRE(older.setup(/*older_tombstone=*/true));
+    CHECK(http1_pipeline_request_generation_provisional_is_stable(
+        older.loop.conns[0],
+        ResponseReadDeadlineProfile::BodylessNonHeadContentLengthZero,
+        ForwardResponseBufferingMode::CompleteContentLength,
+        static_cast<u8>(LogHttpMethod::Get),
+        kRouteMethodGet));
+}
+
+TEST(http1_pipeline_generation_foundation,
+     preconnect_connected_upload_and_prebuilt_use_distinct_proof_phases) {
+    PipelineGenerationFoundationFixture fixture;
+    REQUIRE(fixture.setup(/*older_tombstone=*/true));
+    Connection& conn = fixture.loop.conns[0];
+    const ResponseReadDeadlineUploadProof preflight = fixture.stage_preflight();
+    REQUIRE(http1_pipeline_request_generation_jit_candidate_is_stable(
+        conn,
+        preflight,
+        ResponseReadDeadlineProfile::BodylessNonHeadContentLengthZero,
+        ForwardResponseBufferingMode::CompleteContentLength,
+        static_cast<u8>(LogHttpMethod::Get),
+        kRouteMethodGet,
+        static_cast<u16>(RequestPolicyId::Http11FixedStrip)));
+    ResponseReadDeadlineUploadProof preconnect = fixture.stage_jit_preconnect();
+    const auto preconnect_stable = [&](const ResponseReadDeadlineUploadProof& candidate) {
+        return http1_pipeline_request_generation_preconnect_is_stable(
+            conn,
+            candidate,
+            ResponseReadDeadlineProfile::BodylessNonHeadContentLengthZero,
+            ForwardResponseBufferingMode::CompleteContentLength,
+            static_cast<u8>(LogHttpMethod::Get),
+            kRouteMethodGet);
+    };
+    CHECK_EQ(preconnect.raw_header_end, 0u);
+    CHECK_EQ(preconnect.raw_total_length, 0u);
+    CHECK_EQ(preconnect.upload_episode, 0u);
+    CHECK(preconnect_stable(preconnect));
+    ResponseReadDeadlineUploadProof wrong = preconnect;
+    ++wrong.handler_generation;
+    CHECK_FALSE(preconnect_stable(wrong));
+    wrong = preconnect;
+    wrong.upstream_id = 1;
+    CHECK_FALSE(preconnect_stable(wrong));
+    wrong = preconnect;
+    wrong.request_policy_id = 0;
+    CHECK_FALSE(preconnect_stable(wrong));
+    wrong = preconnect;
+    wrong.raw_total_length = 1;
+    CHECK_FALSE(preconnect_stable(wrong));
+    wrong = preconnect;
+    wrong.upload_episode = conn.upstream_episode;
+    CHECK_FALSE(preconnect_stable(wrong));
+
+    fixture.stage_connected();
+    const IoEvent connected{
+        conn.id, 0, 0, 0, IoEventType::UpstreamConnect, 0, 0, conn.upstream_episode};
+    CHECK(http1_pipeline_request_generation_connected_is_stable(
+        &fixture.loop, conn, connected, &pipeline_generation_connect_callback));
+    conn.recv_armed = false;
+    conn.pending_ops = 0;
+    CHECK(http1_pipeline_request_generation_connected_is_stable(
+        &fixture.loop, conn, connected, &pipeline_generation_connect_callback));
+    conn.pending_ops = 1;
+    CHECK_FALSE(http1_pipeline_request_generation_connected_is_stable(
+        &fixture.loop, conn, connected, &pipeline_generation_connect_callback));
+    conn.pending_ops = 0;
+    IoEvent forged = connected;
+    forged.result = 1;
+    CHECK_FALSE(http1_pipeline_request_generation_connected_is_stable(
+        &fixture.loop, conn, forged, &pipeline_generation_connect_callback));
+    forged = connected;
+    --forged.upstream_episode;
+    CHECK_FALSE(http1_pipeline_request_generation_connected_is_stable(
+        &fixture.loop, conn, forged, &pipeline_generation_connect_callback));
+    conn.upstream_fd = -1;
+    conn.on_upstream_send = nullptr;
+
+    // The request upload callback releases recv_buf before the active response
+    // phase; later proof checks must use the published rewrite/upload identity,
+    // not pretend the preconnect request bytes are still materialized.
+    conn.recv_buf.reset();
+    ResponseReadDeadlineUploadProof active = fixture.stage_upload_active(preconnect);
+    CHECK_EQ(active.raw_total_length, 0u);
+    CHECK_EQ(active.upload_episode, conn.upstream_episode);
+    CHECK(http1_pipeline_request_generation_upload_active_is_stable(
+        conn,
+        active,
+        ResponseReadDeadlineProfile::BodylessNonHeadContentLengthZero,
+        ForwardResponseBufferingMode::CompleteContentLength,
+        static_cast<u8>(LogHttpMethod::Get),
+        kRouteMethodGet));
+    wrong = active;
+    wrong.raw_total_length = wrong.rewritten_total_length;
+    CHECK_FALSE(http1_pipeline_request_generation_upload_active_is_stable(
+        conn,
+        wrong,
+        ResponseReadDeadlineProfile::BodylessNonHeadContentLengthZero,
+        ForwardResponseBufferingMode::CompleteContentLength,
+        static_cast<u8>(LogHttpMethod::Get),
+        kRouteMethodGet));
+
+    for (const auto purpose : {Http1PrebuiltResponsePurpose::StrictNonHeadCl0Success,
+                               Http1PrebuiltResponsePurpose::ResponseReadTimeout}) {
+        fixture.stage_prebuilt(active, purpose);
+        CHECK(http1_pipeline_request_generation_prebuilt_is_stable(
+            conn,
+            active,
+            &fixture.config,
+            2,
+            ResponseReadDeadlineProfile::BodylessNonHeadContentLengthZero,
+            ForwardResponseBufferingMode::CompleteContentLength,
+            static_cast<u8>(LogHttpMethod::Get),
+            kRouteMethodGet,
+            Http1PrebuiltResponseLayout::FullContentLengthNonHead,
+            purpose));
+    }
+    CHECK_FALSE(http1_pipeline_request_generation_prebuilt_is_stable(
+        conn,
+        active,
+        &fixture.config,
+        2,
+        ResponseReadDeadlineProfile::BodylessNonHeadContentLengthZero,
+        ForwardResponseBufferingMode::CompleteContentLength,
+        static_cast<u8>(LogHttpMethod::Get),
+        kRouteMethodGet,
+        Http1PrebuiltResponseLayout::HeaderOnlyHead,
+        Http1PrebuiltResponsePurpose::ResponseReadTimeout));
+    CHECK_FALSE(http1_pipeline_request_generation_prebuilt_is_stable(
+        conn,
+        active,
+        &fixture.config,
+        1,
+        ResponseReadDeadlineProfile::BodylessNonHeadContentLengthZero,
+        ForwardResponseBufferingMode::None,
+        static_cast<u8>(LogHttpMethod::Get),
+        kRouteMethodGet,
+        Http1PrebuiltResponseLayout::FullContentLengthNonHead,
+        Http1PrebuiltResponsePurpose::ResponseReadTimeout));
+    wrong = active;
+    ++wrong.handler_generation;
+    CHECK_FALSE(http1_pipeline_request_generation_prebuilt_is_stable(
+        conn,
+        wrong,
+        &fixture.config,
+        2,
+        ResponseReadDeadlineProfile::BodylessNonHeadContentLengthZero,
+        ForwardResponseBufferingMode::CompleteContentLength,
+        static_cast<u8>(LogHttpMethod::Get),
+        kRouteMethodGet,
+        Http1PrebuiltResponseLayout::FullContentLengthNonHead,
+        Http1PrebuiltResponsePurpose::ResponseReadTimeout));
+    ++conn.http1_prebuilt_deadline_generation;
+    CHECK_FALSE(http1_pipeline_request_generation_prebuilt_is_stable(
+        conn,
+        active,
+        &fixture.config,
+        2,
+        ResponseReadDeadlineProfile::BodylessNonHeadContentLengthZero,
+        ForwardResponseBufferingMode::CompleteContentLength,
+        static_cast<u8>(LogHttpMethod::Get),
+        kRouteMethodGet,
+        Http1PrebuiltResponseLayout::FullContentLengthNonHead,
+        Http1PrebuiltResponsePurpose::ResponseReadTimeout));
+    --conn.http1_prebuilt_deadline_generation;
+    wrong = active;
+    ++wrong.rewritten_header_end;
+    ++wrong.rewritten_total_length;
+    ++wrong.expected_upload_length;
+    conn.http1_prebuilt_deadline_upload = wrong;
+    CHECK_FALSE(http1_pipeline_request_generation_prebuilt_is_stable(
+        conn,
+        wrong,
+        &fixture.config,
+        2,
+        ResponseReadDeadlineProfile::BodylessNonHeadContentLengthZero,
+        ForwardResponseBufferingMode::CompleteContentLength,
+        static_cast<u8>(LogHttpMethod::Get),
+        kRouteMethodGet,
+        Http1PrebuiltResponseLayout::FullContentLengthNonHead,
+        Http1PrebuiltResponsePurpose::ResponseReadTimeout));
+
+    ResponseReadDeadlineUploadProof retired =
+        fixture.stage_upload_active(preconnect, /*retired_episode=*/true);
+    REQUIRE_NE(retired.upload_episode, conn.upstream_episode);
+    fixture.stage_prebuilt(retired, Http1PrebuiltResponsePurpose::ResponseReadTimeout);
+    CHECK(http1_pipeline_request_generation_prebuilt_is_stable(
+        conn,
+        retired,
+        &fixture.config,
+        2,
+        ResponseReadDeadlineProfile::BodylessNonHeadContentLengthZero,
+        ForwardResponseBufferingMode::CompleteContentLength,
+        static_cast<u8>(LogHttpMethod::Get),
+        kRouteMethodGet,
+        Http1PrebuiltResponseLayout::FullContentLengthNonHead,
+        Http1PrebuiltResponsePurpose::ResponseReadTimeout));
+}
+
+TEST(http1_pipeline_generation_foundation, legacy_depth_zero_contract_is_not_narrowed) {
+    Connection conn{};
+    conn.reset();
+    conn.pipeline_depth = 0;
+    conn.http1_pipeline_request_generation = 0;
+    ResponseReadDeadlineUploadProof proof{};
+    CHECK(http1_pipeline_request_generation_provisional_is_stable(
+        conn,
+        ResponseReadDeadlineProfile::HeaderOnlyHead,
+        ForwardResponseBufferingMode::None,
+        static_cast<u8>(LogHttpMethod::Head),
+        kRouteMethodHead));
+    CHECK(http1_pipeline_request_generation_jit_candidate_is_stable(
+        conn,
+        proof,
+        ResponseReadDeadlineProfile::FixedContentLengthUploadNonHeadContentLengthZero,
+        ForwardResponseBufferingMode::CompleteContentLength,
+        static_cast<u8>(LogHttpMethod::Post),
+        kRouteMethodPost,
+        0));
+    CHECK(http1_pipeline_request_generation_preconnect_is_stable(
+        conn,
+        proof,
+        ResponseReadDeadlineProfile::BodylessNonHeadContentLengthZero,
+        ForwardResponseBufferingMode::CompleteContentLength,
+        static_cast<u8>(LogHttpMethod::Get),
+        kRouteMethodGet));
+    // #277's depth-0 coalesced profile carries a non-neutral proof/stash.  The
+    // foundation discriminator must leave that existing domain to its current
+    // guard rather than accidentally narrowing it here.
+    proof.handler_generation = 7;
+    proof.raw_header_end = 31;
+    proof.raw_total_length = 31;
+    conn.pipeline_stash_len = 29;
+    CHECK(http1_pipeline_request_generation_upload_active_is_stable(
+        conn,
+        proof,
+        ResponseReadDeadlineProfile::BodylessNonHeadContentLengthZero,
+        ForwardResponseBufferingMode::CompleteContentLength,
+        static_cast<u8>(LogHttpMethod::Get),
+        kRouteMethodGet,
+        true));
+    CHECK(http1_pipeline_request_generation_connected_is_stable<PipelineGenerationFoundationLoop>(
+        nullptr, conn, {}, nullptr));
+    CHECK(http1_pipeline_request_generation_prebuilt_is_stable(conn,
+                                                               proof,
+                                                               nullptr,
+                                                               0,
+                                                               ResponseReadDeadlineProfile::None,
+                                                               ForwardResponseBufferingMode::None,
+                                                               0xffu,
+                                                               0xffu,
+                                                               Http1PrebuiltResponseLayout::None,
+                                                               Http1PrebuiltResponsePurpose::None));
+}
+
+TEST(http1_pipeline_generation_foundation,
+     existing_production_strict_guard_still_rejects_depth_one_successor) {
+    PipelineGenerationFoundationFixture fixture;
+    REQUIRE(fixture.setup());
+    Connection& conn = fixture.loop.conns[0];
+    fixture.stage_preflight();
+    const ResponseReadDeadlineUploadProof preconnect = fixture.stage_jit_preconnect();
+    const ResponseReadDeadlineUploadProof proof = fixture.stage_upload_active(preconnect);
+    conn.response_policy_id = 1;
+    conn.failure_policy_id = 1;
+    conn.timeout_failure_policy_id = 2;
+    conn.response_read_deadline_seconds = 5;
+    conn.response_read_deadline_generation = 1;
+    conn.response_read_deadline_owner_generation = 1;
+    conn.response_read_deadline_state = ResponseReadDeadlineState::Validated;
+    conn.state = ConnState::Proxying;
+    conn.upstream_fd = 91;
+    conn.request_upload_complete = true;
+    conn.on_upstream_recv = &pipeline_generation_connect_callback;
+    CHECK(http1_pipeline_request_generation_upload_active_is_stable(
+        conn,
+        proof,
+        ResponseReadDeadlineProfile::BodylessNonHeadContentLengthZero,
+        ForwardResponseBufferingMode::CompleteContentLength,
+        static_cast<u8>(LogHttpMethod::Get),
+        kRouteMethodGet));
+    CHECK_FALSE(
+        response_read_deadline_owner_is_stable(conn,
+                                               &pipeline_generation_connect_callback,
+                                               ResponseReadDeadlineOwnerPhase::ValidatedBeforeArm));
+}
+
 TEST(iouring_validated_failure_pipeline,
      complete_late_successor_dispatches_once_across_sites_and_request_profiles) {
     struct Case {
@@ -22129,7 +22770,29 @@ TEST(iouring_validated_failure_pipeline,
 
         REQUIRE_GE(conn.fd, 0);
         CHECK_EQ(conn.pipeline_depth, 1u);
+        CHECK_NE(conn.handler_gen, 0u);
+        CHECK_EQ(conn.http1_pipeline_request_generation, conn.handler_gen);
+        CHECK_EQ(conn.upstream_attempts, 1u);
         CHECK_EQ(conn.recv_buf.len(), sizeof(kSuccessor) - 1u);
+        CHECK(http1_pipeline_request_generation_provisional_is_stable(
+            conn,
+            ResponseReadDeadlineProfile::BodylessNonHeadContentLengthZero,
+            ForwardResponseBufferingMode::CompleteContentLength,
+            static_cast<u8>(LogHttpMethod::Get),
+            kRouteMethodGet));
+        const ResponseReadDeadlineUploadProof saved_proof = conn.response_read_deadline_upload;
+        ResponseReadDeadlineUploadProof successor_preflight{};
+        successor_preflight.handler_generation = conn.http1_pipeline_request_generation;
+        conn.response_read_deadline_upload = successor_preflight;
+        CHECK(http1_pipeline_request_generation_jit_candidate_is_stable(
+            conn,
+            successor_preflight,
+            ResponseReadDeadlineProfile::BodylessNonHeadContentLengthZero,
+            ForwardResponseBufferingMode::CompleteContentLength,
+            static_cast<u8>(LogHttpMethod::Get),
+            kRouteMethodGet,
+            static_cast<u16>(RequestPolicyId::Http11FixedStrip)));
+        conn.response_read_deadline_upload = saved_proof;
         CHECK_EQ(conn.resp_status, 204u);
         CHECK_EQ(conn.on_send, &on_response_sent<IoUringEventLoop>);
         CHECK(conn.send_armed);
@@ -22326,6 +22989,7 @@ TEST(iouring_validated_failure_pipeline,
 
         REQUIRE_GE(conn.fd, 0);
         CHECK_EQ(conn.pipeline_depth, 1u);
+        CHECK_EQ(conn.http1_pipeline_request_generation, 0u);
         CHECK_EQ(conn.state, ConnState::ReadingHeader);
         CHECK_EQ(conn.on_recv, &on_header_received<IoUringEventLoop>);
         CHECK_EQ(conn.recv_buf.len(), sizeof(kPartial) - 1u);
@@ -22345,6 +23009,9 @@ TEST(iouring_validated_failure_pipeline,
                         IoEventType::Recv,
                         static_cast<u8>(!terminal_late_recv)});
         REQUIRE_GE(conn.fd, 0);
+        CHECK_NE(conn.handler_gen, 0u);
+        CHECK_EQ(conn.http1_pipeline_request_generation, conn.handler_gen);
+        CHECK_EQ(conn.upstream_attempts, 1u);
         CHECK_EQ(conn.resp_status, 205u);
         CHECK_EQ(conn.on_send, &on_response_sent<IoUringEventLoop>);
         CHECK(conn.send_armed);
