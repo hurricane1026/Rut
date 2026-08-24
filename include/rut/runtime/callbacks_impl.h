@@ -7215,13 +7215,18 @@ inline bool validated_preconnect_failure_owner_is_stable(Loop* loop,
         } else {
             return false;
         }
-        // io_uring's original multishot downstream Recv remains live while the
-        // synchronous JIT Forward path selects and connects the upstream.  The
-        // callback slot is already clear for bodyless/HEAD requests.  A fixed
-        // upload reaches SocketCreate from its body-recv callback and therefore
-        // retains that exact callback until set_slots publishes ConnectSubmit.
-        // The Recv itself is never cancelled merely to serialize a local 502.
-        if (!conn.recv_armed || conn.pending_ops != 1u) return false;
+        // Usually io_uring's original multishot downstream Recv remains live
+        // while the synchronous JIT Forward path selects and connects the
+        // upstream.  A positive terminal CQE is also valid: dispatch consumes
+        // that Recv's armed flag and pending count before invoking this request
+        // callback.  Accept exactly those two ownership shapes, never a mixed
+        // flag/count pair or an additional owner.  The callback slot is already
+        // clear for bodyless/HEAD requests.  A fixed upload reaches SocketCreate
+        // from its body-recv callback and therefore retains that exact callback
+        // until set_slots publishes ConnectSubmit.
+        const bool live_downstream_recv = conn.recv_armed && conn.pending_ops == 1u;
+        const bool terminal_downstream_recv_consumed = !conn.recv_armed && conn.pending_ops == 0u;
+        if (!live_downstream_recv && !terminal_downstream_recv_consumed) return false;
         if (site == ValidatedPreconnectFailureSite::SocketCreate) {
             if (conn.upstream_fd >= 0 || conn.on_upstream_recv != nullptr ||
                 conn.on_upstream_send != nullptr || conn.upstream_connect_armed ||
