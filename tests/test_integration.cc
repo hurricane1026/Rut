@@ -24601,6 +24601,383 @@ TEST(route, ordinary_source_validated_failure_late_successor_iouring) {
     CHECK_FALSE(runner.final_health.active_down);
 }
 
+TEST(route, ordinary_source_coalesced_strict_get_successor_iouring) {
+    using namespace rut;
+    if (!iouring_socket_live()) SKIP("io_uring async socket ops unavailable in this environment");
+
+    static constexpr char kRequestOne[] =
+        "GET /buffered?coalesced=one HTTP/1.1\r\n"
+        "Host: client.example\r\n"
+        "X-Request: one\r\n\r\n";
+    static constexpr char kRequestTwo[] =
+        "GET /static HTTP/1.1\r\n"
+        "Host: client.example\r\n"
+        "Connection: close\r\n"
+        "X-Request: two\r\n\r\n";
+    static constexpr char kRequestWire[] =
+        "GET /buffered?coalesced=one HTTP/1.1\r\n"
+        "Host: client.example\r\n"
+        "X-Request: one\r\n\r\n"
+        "GET /static HTTP/1.1\r\n"
+        "Host: client.example\r\n"
+        "Connection: close\r\n"
+        "X-Request: two\r\n\r\n";
+    static constexpr char kExpectedOne[] =
+        "HTTP/1.1 502 Origin Failed\r\n"
+        "Server: buffered-test\r\n"
+        "Date: XXXXXXXXXXXXXXXXXXXXXXXXXXXXX\r\n"
+        "Content-Type: text/plain\r\n"
+        "Content-Length: 16\r\n"
+        "Connection: keep-alive\r\n\r\n"
+        "default failure\n";
+    static constexpr char kExpectedTwo[] =
+        "HTTP/1.1 200 OK\r\n"
+        "Content-Length: 16\r\n"
+        "Content-Type: text/plain; charset=utf-8\r\n"
+        "Connection: close\r\n\r\n"
+        "successor-static";
+    static_assert(sizeof(kRequestWire) - 1u == sizeof(kRequestOne) - 1u + sizeof(kRequestTwo) - 1u);
+    static_assert(sizeof("successor-static") - 1u == 16u);
+
+    // A bound-but-not-listening endpoint admits no origin connection or
+    // request. The configured failure serializer is therefore the only source
+    // of response 1 on this production wire.
+    DeadEndpoint dead;
+    REQUIRE(dead.reserve());
+    i32 accepts_connections = -1;
+    socklen_t accepts_connections_len = sizeof(accepts_connections);
+    REQUIRE_EQ(
+        getsockopt(
+            dead.fd, SOL_SOCKET, SO_ACCEPTCONN, &accepts_connections, &accepts_connections_len),
+        0);
+    REQUIRE_EQ(accepts_connections_len, sizeof(accepts_connections));
+    REQUIRE_EQ(accepts_connections, 0);
+
+    PublicValidatedFailureLateSuccessorSourceResources resources;
+    REQUIRE(resources.compile(dead.port));
+    REQUIRE_EQ(resources.cfg.upstream_count, 1u);
+    REQUIRE_EQ(resources.cfg.upstreams[0].addr_count, 1u);
+    REQUIRE_EQ(resources.cfg.upstreams[0].addrs[0].sin_family, AF_INET);
+    REQUIRE_EQ(ntohl(resources.cfg.upstreams[0].addrs[0].sin_addr.s_addr), 0x7F000001u);
+    REQUIRE_EQ(ntohs(resources.cfg.upstreams[0].addrs[0].sin_port), dead.port);
+    REQUIRE_EQ(resources.cfg.upstreams[0].max_inflight, 0u);
+    REQUIRE_EQ(resources.cfg.route_count, 2u);
+    const RouteEntry* forward_route = resources.cfg.match(
+        reinterpret_cast<const u8*>("/buffered"), sizeof("/buffered") - 1u, kRouteMethodGet);
+    const RouteEntry* static_route = resources.cfg.match(
+        reinterpret_cast<const u8*>("/static"), sizeof("/static") - 1u, kRouteMethodGet);
+    REQUIRE(forward_route != nullptr);
+    REQUIRE(static_route != nullptr);
+    REQUIRE_EQ(forward_route->action, RouteAction::JitHandler);
+    REQUIRE_EQ(forward_route->preflight_forward_policy_bundle_id, 1u);
+    REQUIRE_EQ(static_route->action, RouteAction::JitHandler);
+    REQUIRE_NE(static_route->fn, nullptr);
+    REQUIRE_EQ(resources.cfg.policy_bundle_count, 1u);
+    REQUIRE_EQ(resources.cfg.policy_bundles[0].response_buffering,
+               ForwardResponseBufferingMode::CompleteContentLength);
+    REQUIRE_EQ(resources.cfg.response_body_count, 1u);
+    REQUIRE_EQ(resources.cfg.response_bodies[0].len, 16u);
+    REQUIRE_EQ(memcmp(resources.cfg.response_bodies[0].data, "successor-static", 16), 0);
+
+    Shard<IoUringEventLoop> shard;
+    struct ShardGuard {
+        Shard<IoUringEventLoop>& shard;
+        i32 listen_fd = -1;
+        bool initialized = false;
+        ~ShardGuard() {
+            if (initialized) {
+                // PreDispatchRunner is declared after this guard, so C++
+                // destroys (and joins) it first on every normal, failed-check,
+                // and SKIP unwind. Only the test thread may force-close a live
+                // ReadingHeader connection left behind by an absent witness.
+                if (shard.loop != nullptr) shard.loop->force_close_all();
+                shard.shutdown();
+            }
+            if (listen_fd >= 0) close(listen_fd);
+        }
+    } shard_guard{shard, create_listen_socket(0).value_or(-1)};
+    REQUIRE_GE(shard_guard.listen_fd, 0);
+    const u16 port = get_port(shard_guard.listen_fd);
+    REQUIRE(shard.init(0, shard_guard.listen_fd).has_value());
+    shard_guard.initialized = true;
+    shard.route_config = &resources.cfg;
+    shard.active_config = shard.route_config;
+    REQUIRE(shard.loop != nullptr);
+
+    // Mirror the production scheduler and pause at its one trustworthy seam:
+    // backend.wait() has copied every CQE payload in this batch, but
+    // dispatch_batch() has not admitted request 1 yet. No runtime hook or
+    // transport mutation is involved.
+    struct PreDispatchRunner {
+        Shard<IoUringEventLoop>& shard;
+        pthread_t thread{};
+        bool started = false;
+        std::atomic<bool> entered{false};
+        std::atomic<bool> ingress_checked{false};
+        std::atomic<bool> release{false};
+        std::atomic<bool> exited{false};
+
+        bool full_batch_witness = false;
+        bool absent_ingress_witness = false;
+        u32 conn_id = UINT32_MAX;
+        u32 target_recv_events = 0;
+        u32 target_recv_bytes = 0;
+        bool unadmitted_connection = false;
+        bool unadmitted_request_metadata = false;
+        bool unadmitted_policy = false;
+        bool unadmitted_upstream = false;
+        bool unadmitted_response = false;
+        bool unadmitted_metrics_epoch = false;
+        bool scheduler_state_neutral = false;
+        BackendHealth final_health{};
+
+        static void* run(void* arg) {
+            auto* self = static_cast<PreDispatchRunner*>(arg);
+            auto* loop = self->shard.loop;
+            reset_backend_health();
+            loop->backend.add_accept();
+            loop->fire_due_timers();
+            loop->arm_health_on_config_change();
+            self->entered.store(true, std::memory_order_release);
+            IoEvent events[kMaxEventsPerWait];
+
+            while (loop->is_running()) {
+                loop->retry_strict_upstream_retirement_cancels();
+                const u32 n = loop->backend.wait(
+                    events, kMaxEventsPerWait, loop->conns, IoUringEventLoop::kMaxConns);
+                if (loop->backend.failure_code() != 0) {
+                    loop->stop();
+                    break;
+                }
+
+                if (!self->ingress_checked.load(std::memory_order_acquire)) {
+                    u32 candidate = UINT32_MAX;
+                    for (u32 i = 0; i < n; i++) {
+                        const IoEvent& event = events[i];
+                        if (event.type != IoEventType::Recv || event.result <= 0 ||
+                            event.aux != 0 || event.upstream_episode != 0)
+                            continue;
+                        if (candidate == UINT32_MAX) candidate = event.conn_id;
+                        if (event.conn_id == candidate) {
+                            self->target_recv_events++;
+                            self->target_recv_bytes += static_cast<u32>(event.result);
+                        }
+                    }
+                    if (candidate != UINT32_MAX) {
+                        self->conn_id = candidate;
+                        const Connection& conn = loop->conns[candidate];
+                        self->full_batch_witness =
+                            conn.recv_buf.len() == sizeof(kRequestWire) - 1u &&
+                            memcmp(conn.recv_buf.data(), kRequestWire, sizeof(kRequestWire) - 1u) ==
+                                0;
+                        self->absent_ingress_witness = !self->full_batch_witness;
+                        self->unadmitted_connection =
+                            conn.fd >= 0 && conn.state == ConnState::ReadingHeader &&
+                            conn.pipeline_depth == 0 && conn.pipeline_stash_len == 0 &&
+                            conn.req_start_us == 0 && conn.request_config == nullptr &&
+                            !conn.epoch_held;
+                        self->unadmitted_request_metadata =
+                            conn.req_size == 0 && conn.req_header_end == 0 &&
+                            conn.req_initial_send_len == 0 && conn.req_method == 0 &&
+                            conn.req_path[0] == '\0' && conn.req_path_canon.ptr == nullptr &&
+                            conn.req_path_canon.len == 0;
+                        self->unadmitted_policy =
+                            conn.request_policy_id == 0 && conn.response_policy_id == 0 &&
+                            conn.failure_policy_id == 0 && conn.timeout_failure_policy_id == 0 &&
+                            !conn.request_policy_body_pending &&
+                            conn.pending_forward_upstream_id == 0 &&
+                            conn.pending_forward_request_policy_id == 0 &&
+                            conn.pending_forward_response_policy_id == 0 &&
+                            conn.pending_forward_failure_policy_id == 0 &&
+                            conn.pending_forward_timeout_failure_policy_id == 0;
+                        self->unadmitted_upstream =
+                            conn.upstream_fd < 0 && !conn.upstream_connect_armed &&
+                            !conn.upstream_send_armed && !conn.upstream_recv_armed &&
+                            conn.upstream_attempts == 0 && !conn.upstream_reused &&
+                            conn.retry_req_send_len == 0;
+                        self->unadmitted_response = conn.response_header_buf.len() == 0 &&
+                                                    conn.send_buf.len() == 0 && !conn.send_armed &&
+                                                    !conn.proxy_resp_started &&
+                                                    conn.response_read_deadline_owner_is_neutral();
+                        self->unadmitted_metrics_epoch =
+                            self->shard.shard_metrics.requests_total == 0 &&
+                            self->shard.shard_metrics.requests_active == 0 &&
+                            self->shard.shard_metrics.request_latency.count == 0 &&
+                            self->shard.epoch.epoch.load(std::memory_order_acquire) == 0;
+                        self->scheduler_state_neutral =
+                            loop->deferred_accept_count == 0 &&
+                            loop->control == &self->shard.control &&
+                            self->shard.control.pending_config.load(std::memory_order_acquire) ==
+                                nullptr &&
+                            self->shard.control.pending_jit.load(std::memory_order_acquire) ==
+                                nullptr &&
+                            self->shard.control.pending_capture.load(std::memory_order_acquire) ==
+                                nullptr &&
+                            loop->config_ptr == &self->shard.active_config &&
+                            self->shard.active_config == self->shard.route_config &&
+                            *loop->config_ptr == self->shard.route_config && !loop->is_draining();
+                        self->ingress_checked.store(true, std::memory_order_release);
+                        while (!self->release.load(std::memory_order_acquire) && loop->is_running())
+                            sched_yield();
+                        if (!self->full_batch_witness) {
+                            loop->stop();
+                            break;
+                        }
+                    }
+                }
+
+                loop->dispatch_batch(events, n);
+                (loop->*validated_failure_private_member(
+                            ValidatedFailureRetryDeferredAcceptsTag{}))();
+                loop->poll_command();
+                loop->fire_due_timers();
+                loop->arm_health_on_config_change();
+            }
+            const BackendHealth* health = backend_health(0, 0);
+            if (health != nullptr) self->final_health = *health;
+            self->exited.store(true, std::memory_order_release);
+            return nullptr;
+        }
+
+        bool start() {
+            const i32 rc = pthread_create(&thread, nullptr, run, this);
+            started = rc == 0;
+            return started;
+        }
+
+        void join() {
+            if (!started) return;
+            pthread_join(thread, nullptr);
+            started = false;
+        }
+
+        ~PreDispatchRunner() {
+            release.store(true, std::memory_order_release);
+            if (started) {
+                shard.stop();
+                join();
+            }
+        }
+    } runner{shard};
+    struct ClientGuard {
+        i32 fd = -1;
+        ~ClientGuard() {
+            if (fd >= 0) close(fd);
+        }
+    } client{connect_to(port)};
+    REQUIRE_GE(client.fd, 0);
+    set_socket_timeouts(client.fd, 8);
+
+    // One application send is part of the evidence. Retrying a short write
+    // would no longer prove that both requests entered through one client write.
+    REQUIRE_EQ(send(client.fd, kRequestWire, sizeof(kRequestWire) - 1u, MSG_NOSIGNAL),
+               static_cast<ssize_t>(sizeof(kRequestWire) - 1u));
+
+    // Only now start accepting. connect() acknowledged the listener backlog
+    // and the exact send() acknowledged the complete application write, so the
+    // first downstream Recv batch has a deterministic opportunity to harvest
+    // both requests without a startup sleep.
+    REQUIRE(runner.start());
+    const i64 entered_deadline_ms = test_mono_ms() + 3000;
+    while (!runner.entered.load(std::memory_order_acquire) && test_mono_ms() < entered_deadline_ms)
+        sched_yield();
+    REQUIRE(runner.entered.load(std::memory_order_acquire));
+
+    const i64 ingress_deadline_ms = test_mono_ms() + 5000;
+    while (!runner.ingress_checked.load(std::memory_order_acquire) &&
+           test_mono_ms() < ingress_deadline_ms)
+        sched_yield();
+    REQUIRE(runner.ingress_checked.load(std::memory_order_acquire));
+    if (runner.absent_ingress_witness) {
+        runner.release.store(true, std::memory_order_release);
+        runner.join();
+        SKIP("kernel did not harvest the complete coalesced request wire in the first Recv batch");
+    }
+    REQUIRE(runner.full_batch_witness);
+    REQUIRE_EQ(runner.target_recv_bytes, sizeof(kRequestWire) - 1u);
+    REQUIRE_GE(runner.target_recv_events, 1u);
+    REQUIRE_LT(runner.conn_id, IoUringEventLoop::kMaxConns);
+    REQUIRE(runner.unadmitted_connection);
+    REQUIRE(runner.unadmitted_request_metadata);
+    REQUIRE(runner.unadmitted_policy);
+    REQUIRE(runner.unadmitted_upstream);
+    REQUIRE(runner.unadmitted_response);
+    REQUIRE(runner.unadmitted_metrics_epoch);
+    REQUIRE(runner.scheduler_state_neutral);
+    REQUIRE_EQ(shard.shard_metrics.connections_total, 1u);
+    REQUIRE_EQ(shard.shard_metrics.connections_active, 1u);
+    REQUIRE_EQ(shard.upstream->idle_count.load(std::memory_order_acquire), 0u);
+    REQUIRE_EQ(shard.upstream->free_top, UpstreamPool::kMaxConns);
+
+    runner.release.store(true, std::memory_order_release);
+
+    char wire[sizeof(kExpectedOne) + sizeof(kExpectedTwo) + 32]{};
+    const u32 expected_wire_len = sizeof(kExpectedOne) - 1u + sizeof(kExpectedTwo) - 1u;
+    u32 wire_len = 0;
+    const i64 wire_deadline_ms = test_mono_ms() + 5000;
+    while (wire_len < expected_wire_len && test_mono_ms() < wire_deadline_ms) {
+        const i64 remaining_ms = wire_deadline_ms - test_mono_ms();
+        if (remaining_ms <= 0) break;
+        const i32 got = recv_timeout(
+            client.fd, wire + wire_len, sizeof(wire) - wire_len, static_cast<i32>(remaining_ms));
+        REQUIRE_GT(got, 0);
+        wire_len += static_cast<u32>(got);
+        REQUIRE_LE(wire_len, expected_wire_len);
+    }
+    REQUIRE_EQ(wire_len, expected_wire_len);
+    REQUIRE(normalize_public_date(wire, wire_len));
+    REQUIRE_EQ(memcmp(wire, kExpectedOne, sizeof(kExpectedOne) - 1u), 0);
+    REQUIRE_EQ(memcmp(wire + sizeof(kExpectedOne) - 1u, kExpectedTwo, sizeof(kExpectedTwo) - 1u),
+               0);
+
+    char eof_probe[32];
+    const i64 eof_deadline_ms = test_mono_ms() + 3000;
+    i32 eof_result = -EAGAIN;
+    while (test_mono_ms() < eof_deadline_ms) {
+        const i64 remaining_ms = eof_deadline_ms - test_mono_ms();
+        if (remaining_ms <= 0) break;
+        eof_result =
+            recv_timeout(client.fd, eof_probe, sizeof(eof_probe), static_cast<i32>(remaining_ms));
+        if (eof_result != -EINTR) break;
+    }
+    REQUIRE_EQ(eof_result, 0);
+    REQUIRE(shard.loop->is_running());
+    REQUIRE_EQ(shard.backend_failure_code(), 0);
+
+    accepts_connections = -1;
+    accepts_connections_len = sizeof(accepts_connections);
+    REQUIRE_EQ(
+        getsockopt(
+            dead.fd, SOL_SOCKET, SO_ACCEPTCONN, &accepts_connections, &accepts_connections_len),
+        0);
+    REQUIRE_EQ(accepts_connections, 0);
+
+    REQUIRE_EQ(close(client.fd), 0);
+    client.fd = -1;
+    shard.stop();
+    runner.join();
+    REQUIRE(runner.exited.load(std::memory_order_acquire));
+    CHECK_EQ(shard.backend_failure_code(), 0);
+    CHECK_FALSE(shard.loop->is_running());
+    CHECK_EQ(shard.loop->active_count(), 0u);
+    CHECK_EQ(shard.loop->pending_free_count, 0u);
+    CHECK_EQ(shard.loop->pool.in_use(), 0u);
+    CHECK_EQ(shard.upstream->idle_count.load(std::memory_order_acquire), 0u);
+    CHECK_EQ(shard.upstream->free_top, UpstreamPool::kMaxConns);
+    CHECK_EQ(shard.shard_metrics.connections_total, 1u);
+    CHECK_EQ(shard.shard_metrics.connections_active, 0u);
+    CHECK_EQ(shard.shard_metrics.connections_closed, 1u);
+    CHECK_EQ(shard.shard_metrics.requests_total, 2u);
+    CHECK_EQ(shard.shard_metrics.requests_active, 0u);
+    CHECK_EQ(shard.shard_metrics.request_latency.count, 2u);
+    const u64 final_epoch = shard.epoch.epoch.load(std::memory_order_acquire);
+    CHECK_GE(final_epoch, 4u);
+    CHECK_EQ(final_epoch % 2u, 0u);
+    CHECK_EQ(runner.final_health.fails, 1u);
+    CHECK_EQ(runner.final_health.eject_until_us, 0u);
+    CHECK_FALSE(runner.final_health.active_down);
+}
+
 TEST(
     route,
     public_ordinary_source_complete_content_length_buffering_fixed_request_policy_explicit_close_fragmented_success_iouring) {
