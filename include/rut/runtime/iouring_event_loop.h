@@ -66,23 +66,19 @@ private:
     std::atomic<u32> drain_period_;
 
 private:
-    template <typename Submit, typename Flush>
+    template <typename Submit, typename FlushResult>
     [[nodiscard]] bool submit_staged_local_response_impl(
-        Connection& c, const u8* src, u32 len, Submit&& submit, Flush&& flush) {
-        const bool staged_in_send_buf =
-            src == c.send_buf.data() && len == c.send_buf.len() && len != 0;
+        Connection& c, const u8* src, u32 len, Submit&& submit, FlushResult&& flush_result) {
         const bool staged_in_response_header_buf =
             src == c.response_header_buf.data() && len == c.response_header_buf.len() && len != 0;
         if (c.id >= kMaxConns || c.fd < 0 || src == nullptr || len == 0 || c.tls_active ||
-            (!staged_in_send_buf && !staged_in_response_header_buf) || c.send_armed ||
-            backend.send_state[c.id].remaining != 0 || c.response_read_deadline_send_owner_active ||
-            c.response_read_deadline_send_close_target_owned ||
-            c.response_read_deadline_send_close_cancel_owned ||
-            c.response_read_deadline_post_commit_phase ==
-                ResponseReadDeadlinePostCommitPhase::HeaderSend ||
-            c.response_read_deadline_post_commit_phase ==
-                ResponseReadDeadlinePostCommitPhase::BodySend ||
-            backend.failure_code() != 0)
+            !staged_in_response_header_buf || c.send_armed ||
+            backend.send_state[c.id].remaining != 0 ||
+            !c.response_read_deadline_owner_is_neutral() || c.upstream_send_armed ||
+            c.on_upstream_send != nullptr || c.upstream_send_len != 0 ||
+            backend.upstream_send_state[c.id].remaining != 0 || c.retry_req_send_len != 0 ||
+            c.pipeline_stash_len != 0 || c.response_mutations_snapshotted ||
+            c.upstream_request_incomplete || backend.failure_code() != 0)
             return false;
 
         const u32 pending_ops_before = c.pending_ops;
@@ -103,7 +99,7 @@ private:
             backend.fatal_error.store(EPROTO, std::memory_order_release);
             return false;
         }
-        if (!flush()) return false;
+        if (!flush_result()) return false;
         if (submit()) return true;
         if (!attempt_left_no_owner()) backend.fatal_error.store(EPROTO, std::memory_order_release);
         return false;
@@ -866,11 +862,13 @@ private:
     }
 
 public:
-    // Queue an already-built immutable cleartext local response.  This helper
-    // is intentionally narrower than client_send(): it does not serialize,
+    // Queue an already-built immutable cleartext local response that owns the
+    // whole response_header_buf. This helper is intentionally narrower than
+    // client_send(): every response-deadline owner and every upstream-send or
+    // request-snapshot owner must already be neutral. It does not serialize,
     // select policy, advance throttling, enter TLS, or participate in the
-    // response-deadline Send-generation namespace.  On initial SQ exhaustion
-    // it performs one nonblocking flush and retries exactly once.  Both failed
+    // response-deadline Send-generation namespace. On initial SQ exhaustion it
+    // performs one nonblocking flush and retries exactly once. Both failed
     // attempts leave downstream send ownership unpublished, so a caller can
     // fail closed without preserving a deferred response marker.
     [[nodiscard]] bool submit_staged_local_response(Connection& c, const u8* src, u32 len) {
@@ -883,9 +881,12 @@ public:
     }
 
 #ifdef RUT_TESTING
-    template <typename AttemptObserver, typename Flush>
-    [[nodiscard]] bool test_submit_staged_local_response(
-        Connection& c, const u8* src, u32 len, AttemptObserver&& observe_attempt, Flush&& flush) {
+    template <typename AttemptObserver, typename FlushResult>
+    [[nodiscard]] bool test_submit_staged_local_response(Connection& c,
+                                                         const u8* src,
+                                                         u32 len,
+                                                         AttemptObserver&& observe_attempt,
+                                                         FlushResult&& flush_result) {
         return submit_staged_local_response_impl(
             c,
             src,
@@ -894,7 +895,7 @@ public:
                 observe_attempt();
                 return submit_send_raw(c, src, len);
             },
-            flush);
+            [&]() { return backend.test_flush_pending_nonblocking(flush_result); });
     }
 #endif
 

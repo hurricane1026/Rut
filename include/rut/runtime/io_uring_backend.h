@@ -149,6 +149,24 @@ struct IoUringBackend {
     // error or an io_uring_enter failure is reported as false.
     [[nodiscard]] bool flush_pending_nonblocking();
 
+#ifdef RUT_TESTING
+    // Deterministic syscall seam for flush_pending_nonblocking().  The caller
+    // supplies only the simulated io_uring_enter result; positive, in-range
+    // results also advance the synthetic kernel SQ head by the consumed count.
+    // All pending/error decisions remain in the production implementation.
+    template <typename EnterResult>
+    [[nodiscard]] bool test_flush_pending_nonblocking(EnterResult&& enter_result) {
+        return flush_pending_nonblocking_impl([&](i32, u32 to_submit, u32, u32) {
+            const i32 result = enter_result();
+            if (result > 0 && static_cast<u32>(result) <= to_submit) {
+                const u32 head = __atomic_load_n(sq_head, __ATOMIC_RELAXED);
+                __atomic_store_n(sq_head, head + static_cast<u32>(result), __ATOMIC_RELEASE);
+            }
+            return result;
+        });
+    }
+#endif
+
     // Same as add_send but encodes UpstreamSend in user_data.
     bool add_send_upstream(i32 fd, u32 conn_id, const u8* buf, u32 len, u32 upstream_episode = 1);
 
@@ -220,6 +238,24 @@ private:
         u64 data, u32& conn_id, IoEventType& type, u32& aux, u32& upstream_episode);
 
 private:
+    template <typename Enter>
+    [[nodiscard]] bool flush_pending_nonblocking_impl(Enter&& enter) {
+        if (failure_code() != 0) return false;
+        if (pending == 0) return true;
+
+        const i32 flushed = enter(ring_fd, pending, 0, IORING_ENTER_SQ_WAKEUP);
+        if (flushed < 0) {
+            record_enter_error(flushed);
+            return false;
+        }
+        if (static_cast<u32>(flushed) > pending) {
+            fatal_error.store(EPROTO, std::memory_order_release);
+            return false;
+        }
+        pending -= static_cast<u32>(flushed);
+        return true;
+    }
+
     // Submit a cancel SQE matching a specific user_data value.
     // conn_id/type/aux are encoded in the cancel CQE's user_data. Pass the real
     // conn_id for tracked close-path cancels, or kCancelConnId for fire-and-

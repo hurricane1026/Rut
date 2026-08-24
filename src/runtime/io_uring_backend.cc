@@ -509,20 +509,9 @@ bool IoUringBackend::add_send(i32 fd, u32 conn_id, const u8* buf, u32 len, u32 g
 }
 
 bool IoUringBackend::flush_pending_nonblocking() {
-    if (failure_code() != 0) return false;
-    if (pending == 0) return true;
-
-    const i32 flushed = io_uring_enter(ring_fd, pending, 0, IORING_ENTER_SQ_WAKEUP);
-    if (flushed < 0) {
-        record_enter_error(flushed);
-        return false;
-    }
-    if (static_cast<u32>(flushed) > pending) {
-        fatal_error.store(EPROTO, std::memory_order_release);
-        return false;
-    }
-    pending -= static_cast<u32>(flushed);
-    return true;
+    return flush_pending_nonblocking_impl([](i32 fd, u32 to_submit, u32 min_complete, u32 flags) {
+        return io_uring_enter(fd, to_submit, min_complete, flags);
+    });
 }
 
 bool IoUringBackend::add_send_upstream(
