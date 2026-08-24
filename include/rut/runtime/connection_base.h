@@ -712,6 +712,38 @@ struct ConnectionBase {
         return neutral;
     }
 
+    [[nodiscard]] bool response_read_deadline_connected_auxiliary_owners_are_neutral() const {
+        bool neutral = response_read_deadline_first_batch_upload.owner_is_neutral();
+        const auto check = [&](const auto& value, const auto& reset_value) {
+            neutral = neutral && value == reset_value;
+        };
+        check(response_read_deadline_progress_generation, u32{0});
+        check(response_read_deadline_progress_episode, u32{0});
+        check(response_read_deadline_progress_bytes, u32{0});
+        check(response_read_deadline_post_commit_phase, ResponseReadDeadlinePostCommitPhase::None);
+        check(response_read_deadline_post_commit_generation, u32{0});
+        check(response_read_deadline_post_commit_episode, u32{0});
+        check(response_read_deadline_post_commit_raw_header_end, u32{0});
+        check(response_read_deadline_post_commit_declared_body, u32{0});
+        check(response_read_deadline_post_commit_origin_received, u32{0});
+        check(response_read_deadline_post_commit_downstream_submitted, u32{0});
+        check(response_read_deadline_post_commit_downstream_completed, u32{0});
+        check(response_read_deadline_post_commit_inflight_body, u32{0});
+        check(response_read_deadline_post_commit_send_body, u32{0});
+        check(response_read_deadline_post_commit_close_after_drain, false);
+        check(response_read_deadline_post_commit_pump_pending, false);
+        check(response_read_deadline_first_batch, false);
+        check(response_read_deadline_first_batch_profile, ResponseReadDeadlineProfile::None);
+        check(response_read_deadline_first_batch_method, u8{0xffu});
+        check(response_read_deadline_first_batch_route_method, u8{0xffu});
+        check(response_read_deadline_first_batch_generation, u32{0});
+        check(response_read_deadline_first_batch_bundle_id, u16{0});
+        check(response_read_deadline_first_batch_buffering, ForwardResponseBufferingMode::None);
+        visit_response_read_deadline_send_owner_fields(*this, check);
+        visit_response_read_deadline_send_close_owner_fields(*this, check);
+        return neutral;
+    }
+
     void clear_response_read_deadline() {
         visit_response_read_deadline_owner_fields(
             *this, [](auto& value, const auto& reset_value) { value = reset_value; });
@@ -720,20 +752,35 @@ struct ConnectionBase {
         response_read_deadline_first_batch_upload.clear_owner();
     }
 
+    template <typename Self, typename Visitor>
+    static void visit_http1_prebuilt_response_proof_fields(Self& c, Visitor&& visit) {
+        visit(c.http1_prebuilt_response_layout, Http1PrebuiltResponseLayout::None);
+        visit(c.http1_prebuilt_response_purpose, Http1PrebuiltResponsePurpose::None);
+        visit(c.http1_prebuilt_deadline_profile, ResponseReadDeadlineProfile::None);
+        visit(c.http1_prebuilt_deadline_method, u8{0xffu});
+        visit(c.http1_prebuilt_deadline_route_method, u8{0xffu});
+        visit(c.http1_prebuilt_deadline_generation, u32{0});
+        visit(c.http1_prebuilt_deadline_bundle_id, u16{0});
+        visit(c.http1_prebuilt_deadline_config, static_cast<const RouteConfig*>(nullptr));
+        visit(c.http1_prebuilt_header_end, u32{0});
+        visit(c.http1_prebuilt_total_len, u32{0});
+        visit(c.http1_prebuilt_body_len, u32{0});
+        visit(c.http1_prebuilt_status, u16{0});
+    }
+
+    [[nodiscard]] bool http1_prebuilt_response_proof_is_neutral() const {
+        bool neutral = http1_prebuilt_deadline_upload.owner_is_neutral();
+        const auto check = [&](const auto& value, const auto& reset_value) {
+            neutral = neutral && value == reset_value;
+        };
+        visit_http1_prebuilt_response_proof_fields(*this, check);
+        return neutral;
+    }
+
     void clear_http1_prebuilt_response_proof() {
-        http1_prebuilt_response_layout = Http1PrebuiltResponseLayout::None;
-        http1_prebuilt_response_purpose = Http1PrebuiltResponsePurpose::None;
-        http1_prebuilt_deadline_profile = ResponseReadDeadlineProfile::None;
-        http1_prebuilt_deadline_method = 0xffu;
-        http1_prebuilt_deadline_route_method = 0xffu;
-        http1_prebuilt_deadline_generation = 0;
-        http1_prebuilt_deadline_bundle_id = 0;
-        http1_prebuilt_deadline_config = nullptr;
+        visit_http1_prebuilt_response_proof_fields(
+            *this, [](auto& value, const auto& reset_value) { value = reset_value; });
         http1_prebuilt_deadline_upload = ResponseReadDeadlineUploadProof{};
-        http1_prebuilt_header_end = 0;
-        http1_prebuilt_total_len = 0;
-        http1_prebuilt_body_len = 0;
-        http1_prebuilt_status = 0;
     }
 
     // Advance the token without wrapping. Zero is the invalid sentinel and

@@ -378,12 +378,10 @@ inline bool response_read_deadline_coalesced_get_phase1_stash_is_stable(
     return true;
 }
 
-// #278 foundation.  These predicates describe the staged identity contract for
-// a completely admitted depth-1 HTTP/1 successor.  They are intentionally pure
-// and are not consumed by any production guard in this increment.  Every API
-// preserves the depth-0/token-0 legacy branch without re-checking its method,
-// upload, policy, or response profile; the existing guards remain authoritative
-// for that branch until the later atomic activation.
+// #278 staged identity contract for a completely admitted depth-1 HTTP/1
+// successor.  Every predicate is pure and preserves the depth-0/token-0 legacy
+// branch without re-checking its method, upload, policy, or response profile;
+// the enclosing legacy guards remain authoritative for that branch.
 inline bool http1_pipeline_request_is_legacy(const Connection& c) {
     return c.pipeline_depth == 0 && c.http1_pipeline_request_generation == 0;
 }
@@ -400,16 +398,16 @@ inline bool http1_pipeline_successor_tombstone_is_safe(const Connection& c) {
 }
 
 inline bool http1_pipeline_successor_upstream_owners_are_neutral(const Connection& c) {
-    return c.upstream_fd < 0 && !c.upstream_slot_held && c.on_upstream_recv == nullptr &&
-           c.on_upstream_send == nullptr && !c.upstream_connect_armed && !c.upstream_send_armed &&
-           !c.upstream_recv_armed && !c.upstream_recv_paused_for_send &&
-           !c.upstream_recv_pause_cancel_pending && !c.upstream_recv_pause_rearm_pending &&
-           !c.upstream_recv_cancel_inflight && !c.upstream_retirement_active &&
-           c.upstream_retirement_target_owned == 0 && c.upstream_retirement_cancel_owned == 0 &&
-           c.upstream_retirement_cancel_retry == 0 && c.upstream_close_episode == 0 &&
-           c.upstream_close_target_owned == 0 && c.upstream_close_cancel_owned == 0 &&
-           !c.upstream_close_pause_cancel_owned && c.idle_return_fd < 0 &&
-           c.idle_return_config == nullptr && !c.close_after_idle_return &&
+    return c.upstream_fd < 0 && !c.upstream_reused && !c.upstream_slot_held &&
+           c.on_upstream_recv == nullptr && c.on_upstream_send == nullptr &&
+           !c.upstream_connect_armed && !c.upstream_send_armed && !c.upstream_recv_armed &&
+           !c.upstream_recv_paused_for_send && !c.upstream_recv_pause_cancel_pending &&
+           !c.upstream_recv_pause_rearm_pending && !c.upstream_recv_cancel_inflight &&
+           !c.upstream_retirement_active && c.upstream_retirement_target_owned == 0 &&
+           c.upstream_retirement_cancel_owned == 0 && c.upstream_retirement_cancel_retry == 0 &&
+           c.upstream_close_episode == 0 && c.upstream_close_target_owned == 0 &&
+           c.upstream_close_cancel_owned == 0 && !c.upstream_close_pause_cancel_owned &&
+           c.idle_return_fd < 0 && c.idle_return_config == nullptr && !c.close_after_idle_return &&
            c.upstream_recv_buf.len() == 0 && !c.h2_proxy_recv_draining &&
            !c.h2_proxy_synth_quarantined;
 }
@@ -724,17 +722,25 @@ inline bool response_read_deadline_owner_is_stable(const Connection& c,
         timeout.version != ForwardFailurePolicyVersion::Http11 ||
         timeout.connection != ForwardFailurePolicyConnection::Request)
         return false;
+    const bool pipeline_generation_stable =
+        http1_pipeline_request_generation_upload_active_is_stable(
+            c,
+            c.response_read_deadline_upload,
+            c.response_read_deadline_profile,
+            c.response_read_deadline_buffering,
+            c.response_read_deadline_method,
+            c.response_read_deadline_route_method);
     const bool common_request =
         c.protocol == ConnProtocol::Http11 && !c.tls_active && c.h2 == nullptr &&
         c.req_http_version == static_cast<u8>(HttpVersion::Http11) &&
         response_read_deadline_persistence_owner_is_stable(c, c.response_read_deadline_upload) &&
         !c.req_client_has_transfer_encoding && !c.req_client_has_te && !c.req_client_has_expect &&
         !c.req_client_has_upgrade_header && !c.req_malformed && !c.req_wants_upgrade &&
-        c.req_path_canon.ptr != nullptr && c.pipeline_depth == 0 && !c.target_transform_recorded &&
-        !c.req_path_overridden && c.req_header_override_count == 0 &&
-        !c.req_header_override_overflow && c.resp_header_mutation_count == 0 &&
-        c.resp_header_mutation_pending_count == 0 && !c.resp_header_mutation_pending_overflow &&
-        !c.resp_header_mutation_overflow;
+        c.req_path_canon.ptr != nullptr && pipeline_generation_stable &&
+        !c.target_transform_recorded && !c.req_path_overridden &&
+        c.req_header_override_count == 0 && !c.req_header_override_overflow &&
+        c.resp_header_mutation_count == 0 && c.resp_header_mutation_pending_count == 0 &&
+        !c.resp_header_mutation_pending_overflow && !c.resp_header_mutation_overflow;
     if (!common_request) return false;
     const bool coalesced_get = response_read_deadline_coalesced_get_phase1_stash_is_stable(
         c, c.response_read_deadline_upload);
@@ -876,6 +882,15 @@ inline bool response_read_deadline_post_commit_is_stable(const Connection& c) {
     const bool retired_buffered_send =
         complete_buffering && c.response_read_deadline_post_commit_phase !=
                                   ResponseReadDeadlinePostCommitPhase::Buffering;
+    const bool pipeline_generation_stable =
+        http1_pipeline_request_generation_upload_active_is_stable(
+            c,
+            c.response_read_deadline_upload,
+            c.response_read_deadline_profile,
+            c.response_read_deadline_buffering,
+            c.response_read_deadline_method,
+            c.response_read_deadline_route_method,
+            retired_buffered_send);
     const bool fixed_upload =
         c.response_read_deadline_profile ==
         ResponseReadDeadlineProfile::FixedContentLengthUploadNonHeadContentLengthZero;
@@ -931,12 +946,13 @@ inline bool response_read_deadline_post_commit_is_stable(const Connection& c) {
                             !c.request_body_fully_buffered
                       : c.req_body_mode != BodyMode::None || c.req_body_remaining != 0 ||
                             c.request_body_fully_buffered) ||
-        c.req_body_streamed || c.req_malformed || c.req_wants_upgrade || c.pipeline_depth != 0 ||
-        c.target_transform_recorded || c.req_path_overridden || c.req_header_override_count != 0 ||
-        c.req_header_override_overflow || c.resp_header_mutation_count != 0 ||
-        c.resp_header_mutation_pending_count != 0 || c.resp_header_mutation_pending_overflow ||
-        c.resp_header_mutation_overflow || c.upstream_reused || c.upstream_attempts != 1 ||
-        !c.request_upload_complete || c.upstream_request_incomplete)
+        c.req_body_streamed || c.req_malformed || c.req_wants_upgrade ||
+        !pipeline_generation_stable || c.target_transform_recorded || c.req_path_overridden ||
+        c.req_header_override_count != 0 || c.req_header_override_overflow ||
+        c.resp_header_mutation_count != 0 || c.resp_header_mutation_pending_count != 0 ||
+        c.resp_header_mutation_pending_overflow || c.resp_header_mutation_overflow ||
+        c.upstream_reused || c.upstream_attempts != 1 || !c.request_upload_complete ||
+        c.upstream_request_incomplete)
         return false;
     if (c.pipeline_stash_len != 0 && !response_read_deadline_coalesced_get_phase1_stash_is_stable(
                                          c, c.response_read_deadline_upload, retired_buffered_send))

@@ -864,6 +864,9 @@ bool prepare_response_read_deadline_preflight(Loop* loop,
         const bool fixed_upload =
             profile ==
             ResponseReadDeadlineProfile::FixedContentLengthUploadNonHeadContentLengthZero;
+        const bool pipeline_generation_stable =
+            http1_pipeline_request_generation_provisional_is_stable(
+                conn, profile, bundle.response_buffering, conn.req_method, route->method);
         ResponseReadDeadlineFixedUploadRequest upload_request{};
         u16 route_index = 0xffffu;
         if (response.version != ResponsePolicyVersion::Http11 ||
@@ -896,7 +899,7 @@ bool prepare_response_read_deadline_preflight(Loop* loop,
               conn.pending_forward_request_policy_id != 0 ||
               !complete_content_length_buffering_policies_valid(response, failure, timeout))) ||
             !response_read_deadline_route_method_matches(conn.req_method, route->method) ||
-            conn.pipeline_depth != 0 ||
+            !pipeline_generation_stable ||
             (conn.recv_buf.len() != conn.req_initial_send_len &&
              !(complete_buffering && route->method == kRouteMethodGet &&
                inspect_response_read_deadline_coalesced_get_phase1(conn))) ||
@@ -917,6 +920,13 @@ bool prepare_response_read_deadline_preflight(Loop* loop,
         conn.response_read_deadline_method = conn.req_method;
         conn.response_read_deadline_route_method = route->method;
         conn.response_read_deadline_state = ResponseReadDeadlineState::Preflight;
+        if (http1_pipeline_request_is_current_successor(conn)) {
+            // The provisional phase owns no selected route, target, request
+            // policy, or transport episode.  Pin only the request generation;
+            // JIT publishes the rest after exact request materialisation.
+            conn.response_read_deadline_upload.handler_generation =
+                conn.http1_pipeline_request_generation;
+        }
         conn.response_read_deadline_upload.downstream_close =
             complete_buffering &&
             profile == ResponseReadDeadlineProfile::BodylessNonHeadContentLengthZero &&
@@ -2751,6 +2761,8 @@ void handle_jit_outcome(
             u16 forward_timeout_failure_policy_id = outcome.timeout_failure_policy_id;
             ForwardResponseBufferingMode forward_response_buffering =
                 ForwardResponseBufferingMode::None;
+            bool strict_pipeline_successor = false;
+            u16 strict_pipeline_successor_route_index = 0xffffu;
             if (outcome.policy_bundle_id != 0) {
                 if (config == nullptr ||
                     !config->policy_bundle_id_is_valid(outcome.policy_bundle_id)) {
@@ -2805,9 +2817,20 @@ void handle_jit_outcome(
                     deadline_proof.raw_header_end == conn.req_initial_send_len &&
                     deadline_proof.raw_total_length == conn.req_initial_send_len &&
                     deadline_proof.raw_content_length == 0;
+                strict_pipeline_successor =
+                    http1_pipeline_request_is_current_successor(conn) &&
+                    http1_pipeline_request_generation_jit_candidate_is_stable(
+                        conn,
+                        deadline_proof,
+                        outcome_profile,
+                        forward_response_buffering,
+                        conn.req_method,
+                        conn.response_read_deadline_route_method,
+                        outcome.request_policy_id);
                 const bool deadline_phase_valid =
                     (conn.response_read_deadline_state == ResponseReadDeadlineState::Preflight &&
-                     ((!fixed_upload && !coalesced_get) ||
+                     ((!fixed_upload && !coalesced_get && !strict_pipeline_successor) ||
+                      (strict_pipeline_successor && fn != nullptr) ||
                       (fn != nullptr && fn == conn.response_read_deadline_upload.route_fn))) ||
                     (fixed_upload &&
                      conn.response_read_deadline_state == ResponseReadDeadlineState::Validated &&
@@ -2844,7 +2867,15 @@ void handle_jit_outcome(
                     conn.resp_header_mutation_pending_count != 0 ||
                     conn.resp_header_mutation_pending_overflow ||
                     conn.resp_header_mutation_overflow || conn.protocol != ConnProtocol::Http11 ||
-                    conn.tls_active || conn.pipeline_depth != 0 ||
+                    conn.tls_active ||
+                    !http1_pipeline_request_generation_jit_candidate_is_stable(
+                        conn,
+                        deadline_proof,
+                        outcome_profile,
+                        forward_response_buffering,
+                        conn.req_method,
+                        conn.response_read_deadline_route_method,
+                        outcome.request_policy_id) ||
                     (!fixed_upload && !coalesced_get &&
                      (conn.req_body_mode != BodyMode::None || conn.req_body_remaining != 0 ||
                       conn.request_body_fully_buffered ||
@@ -2873,8 +2904,12 @@ void handle_jit_outcome(
                         loop->close_conn(conn);
                         return;
                     }
-                    proof.request_policy_id = outcome.request_policy_id;
-                    if (coalesced_get) proof.upstream_id = outcome.upstream_id;
+                    // A pipeline successor remains generation-only until its
+                    // exact Http11FixedStrip request has been materialized.
+                    if (!strict_pipeline_successor) {
+                        proof.request_policy_id = outcome.request_policy_id;
+                        if (coalesced_get) proof.upstream_id = outcome.upstream_id;
+                    }
                 }
                 conn.response_read_deadline_state = ResponseReadDeadlineState::Validated;
             } else if (conn.response_read_deadline_state != ResponseReadDeadlineState::None) {
@@ -3043,6 +3078,28 @@ void handle_jit_outcome(
                 return;
             }
             auto& target = config->upstreams[outcome.upstream_id];
+            if (strict_pipeline_successor) {
+                RouteParam params[kMaxRouteParams]{};
+                u32 param_count = 0;
+                const u8 method_key = route_method_key(static_cast<LogHttpMethod>(conn.req_method));
+                const RouteEntry* selected = config->match_canonical(
+                    conn.req_path_canon, method_key, params, &param_count, kMaxRouteParams);
+                if (selected == nullptr || selected->fn != fn ||
+                    !response_read_deadline_route_index(
+                        *config, selected, &strict_pipeline_successor_route_index)) {
+                    loop->close_conn(conn);
+                    return;
+                }
+                if (selected->action != RouteAction::JitHandler || selected->needs_req_body ||
+                    selected->rate_limit.count != 0 || selected->throttle_down_bps != 0 ||
+                    selected->ws_terminate || selected->method != kRouteMethodGet ||
+                    selected->preflight_forward_policy_bundle_id != outcome.policy_bundle_id ||
+                    target.addr_count != 1 || target.addrs[0].sin_family != AF_INET ||
+                    target.max_inflight != 0) {
+                    loop->close_conn(conn);
+                    return;
+                }
+            }
             // Policy rewriting uses the request buffers before the response
             // mutation snapshot is established. Reject combinations and
             // multi-endpoint targets before allocating slots or selecting an
@@ -3094,6 +3151,30 @@ void handle_jit_outcome(
                     else
                         reject_request_policy(loop, conn);
                     return;
+                }
+                if (strict_pipeline_successor) {
+                    auto& proof = conn.response_read_deadline_upload;
+                    if (!http1_pipeline_successor_request_shape_is_stable(
+                            conn,
+                            conn.response_read_deadline_profile,
+                            conn.response_read_deadline_buffering,
+                            conn.response_read_deadline_method,
+                            conn.response_read_deadline_route_method) ||
+                        conn.request_policy_id !=
+                            static_cast<u16>(RequestPolicyId::Http11FixedStrip) ||
+                        proof.handler_generation != conn.http1_pipeline_request_generation ||
+                        proof.raw_header_end != 0 || proof.raw_content_length != 0 ||
+                        proof.raw_total_length != 0 || proof.rewritten_header_end != 0 ||
+                        proof.rewritten_total_length != 0 || proof.expected_upload_length != 0 ||
+                        proof.upload_episode != 0 || proof.route_index != 0xffffu ||
+                        proof.upstream_id != 0xffffu || proof.request_policy_id != 0 ||
+                        proof.route_fn != nullptr || proof.downstream_close) {
+                        loop->close_conn(conn);
+                        return;
+                    }
+                    proof.rewritten_header_end = conn.req_header_end;
+                    proof.rewritten_total_length = conn.req_initial_send_len;
+                    proof.expected_upload_length = conn.req_initial_send_len;
                 }
                 if (conn.response_read_deadline_profile ==
                         ResponseReadDeadlineProfile::BodylessNonHeadContentLengthZero &&
@@ -3265,6 +3346,25 @@ void handle_jit_outcome(
                     conn.req_header_override_overflow ||
                     !apply_request_policy(conn, target.addrs[kBackend], conn.request_policy_id)) {
                     reject_request_policy(loop, conn);
+                    return;
+                }
+            }
+
+            if (strict_pipeline_successor) {
+                auto& proof = conn.response_read_deadline_upload;
+                proof.route_index = strict_pipeline_successor_route_index;
+                proof.upstream_id = outcome.upstream_id;
+                proof.request_policy_id = outcome.request_policy_id;
+                proof.route_fn = fn;
+                if (kBackend != 0 || conn.upstream_start_us == 0 ||
+                    !http1_pipeline_request_generation_preconnect_is_stable(
+                        conn,
+                        proof,
+                        conn.response_read_deadline_profile,
+                        conn.response_read_deadline_buffering,
+                        conn.response_read_deadline_method,
+                        conn.response_read_deadline_route_method)) {
+                    loop->close_conn(conn);
                     return;
                 }
             }
@@ -3465,12 +3565,9 @@ inline bool try_prebuilt_strict_read_timeout(Loop* loop, Connection& conn) {
                 explicit_deadline_expiry = no_progress || retained_positive_progress;
             }
         }
-        const bool ordinary_zero_progress =
-            conn.response_read_deadline_state == ResponseReadDeadlineState::None &&
-            conn.upstream_recv_buf.len() == 0 &&
-            conn.response_read_deadline_progress_generation == 0 &&
-            conn.response_read_deadline_progress_episode == 0 &&
-            conn.response_read_deadline_progress_bytes == 0 && conn.upstream_start_us != 0;
+        const bool ordinary_zero_progress = conn.response_read_deadline_owner_is_neutral() &&
+                                            conn.upstream_recv_buf.len() == 0 &&
+                                            conn.upstream_start_us != 0;
         if (!explicit_deadline_expiry && !ordinary_zero_progress) return false;
 
         const RouteConfig* config = conn.request_config;
@@ -3517,6 +3614,14 @@ inline bool try_prebuilt_strict_read_timeout(Loop* loop, Connection& conn) {
         const bool fixed_upload =
             profile ==
             ResponseReadDeadlineProfile::FixedContentLengthUploadNonHeadContentLengthZero;
+        const bool pipeline_generation_stable =
+            ordinary_zero_progress || http1_pipeline_request_generation_upload_active_is_stable(
+                                          conn,
+                                          conn.response_read_deadline_upload,
+                                          profile,
+                                          conn.response_read_deadline_buffering,
+                                          conn.req_method,
+                                          conn.response_read_deadline_route_method);
         if (conn.protocol != ConnProtocol::Http11 || conn.tls_active ||
             conn.req_http_version != static_cast<u8>(HttpVersion::Http11) ||
             ((profile == ResponseReadDeadlineProfile::HeaderOnlyHead &&
@@ -3563,7 +3668,7 @@ inline bool try_prebuilt_strict_read_timeout(Loop* loop, Connection& conn) {
             !conn.upstream_recv_armed || conn.on_upstream_recv != &on_upstream_response<Loop> ||
             conn.upstream_connect_armed || conn.upstream_send_armed ||
             conn.on_upstream_send != nullptr || conn.retry_req_send_len != 0 ||
-            (!fixed_upload && conn.response_mutations_snapshotted) || conn.pipeline_depth != 0 ||
+            (!fixed_upload && conn.response_mutations_snapshotted) || !pipeline_generation_stable ||
             conn.recv_paused_for_send || conn.recv_pause_cancel_pending ||
             conn.recv_pause_rearm_pending || conn.upstream_recv_paused_for_send ||
             conn.upstream_recv_pause_cancel_pending || conn.upstream_recv_pause_rearm_pending ||
@@ -4429,6 +4534,23 @@ void on_upstream_connected(void* lp, Connection& conn, IoEvent ev) {
         return;
     }
 
+    // A depth-1 strict successor must still own the exact generation, selected
+    // policy/upstream identity, current Connect event, and one of the two
+    // legitimate downstream Recv shapes.  An entirely neutral deadline owner
+    // is an ordinary proxy request even when pipeline admission published a
+    // generation token; bypass only that exact state so a half-activated or
+    // forged strict owner still fails closed.  Revalidate before passive-health
+    // success, upstream-buffer allocation, callback replacement, or origin
+    // request bytes.
+    if (!conn.response_read_deadline_owner_is_neutral() &&
+        (conn.response_read_deadline_state != ResponseReadDeadlineState::Validated ||
+         !conn.response_read_deadline_connected_auxiliary_owners_are_neutral() ||
+         !http1_pipeline_request_generation_connected_is_stable(
+             loop, conn, ev, &on_upstream_connected<Loop>))) {
+        loop->close_conn(conn);
+        return;
+    }
+
     // A fresh TCP connect succeeded — clear this backend's passive-health record.
     // Reused pooled sockets only prove health once they return a response.
     if (!conn.upstream_reused) {
@@ -4533,6 +4655,25 @@ void on_upstream_connected(void* lp, Connection& conn, IoEvent ev) {
             loop->close_conn(conn);
             return;
         }
+    } else if (conn.response_read_deadline_state == ResponseReadDeadlineState::Validated &&
+               http1_pipeline_request_is_current_successor(conn)) {
+        auto& proof = conn.response_read_deadline_upload;
+        proof.upload_episode = conn.upstream_episode;
+        if (conn.upstream_reused || conn.upstream_attempts != 1 ||
+            conn.upstream_recv_buf.len() != 0 || conn.upstream_recv_armed ||
+            conn.request_upload_complete || req_src != conn.recv_buf.data() ||
+            req_send_len != proof.expected_upload_length ||
+            req_send_len != conn.req_initial_send_len || req_send_len != conn.recv_buf.len() ||
+            !http1_pipeline_request_generation_upload_active_is_stable(
+                conn,
+                proof,
+                conn.response_read_deadline_profile,
+                conn.response_read_deadline_buffering,
+                conn.response_read_deadline_method,
+                conn.response_read_deadline_route_method)) {
+            loop->close_conn(conn);
+            return;
+        }
     }
     conn.set_slots(nullptr,
                    nullptr,
@@ -4557,7 +4698,10 @@ void on_upstream_request_sent(void* lp, Connection& conn, IoEvent ev) {
         conn.response_read_deadline_profile ==
             ResponseReadDeadlineProfile::BodylessNonHeadContentLengthZero &&
         conn.response_read_deadline_upload.raw_total_length != 0;
-    if (fixed_upload || coalesced_get) {
+    const bool pipeline_successor =
+        conn.response_read_deadline_state == ResponseReadDeadlineState::Validated &&
+        http1_pipeline_request_is_current_successor(conn);
+    if (fixed_upload || coalesced_get || pipeline_successor) {
         const auto& proof = conn.response_read_deadline_upload;
         bool send_owner_stable = false;
         if constexpr (requires(Loop* candidate) { candidate->backend.upstream_send_state[0]; }) {
@@ -4573,10 +4717,17 @@ void on_upstream_request_sent(void* lp, Connection& conn, IoEvent ev) {
             conn.upstream_send_armed || conn.on_upstream_send != &on_upstream_request_sent<Loop> ||
             conn.request_upload_complete || conn.upstream_recv_buf.len() != 0 ||
             conn.upstream_recv_armed ||
-            (fixed_upload
-                 ? !response_read_deadline_fixed_upload_materialization_is_stable(
-                       conn, proof, /*require_upload_complete=*/false)
-                 : !response_read_deadline_coalesced_get_phase1_proof_is_stable(conn, proof))) {
+            (fixed_upload ? !response_read_deadline_fixed_upload_materialization_is_stable(
+                                conn, proof, /*require_upload_complete=*/false)
+             : coalesced_get
+                 ? !response_read_deadline_coalesced_get_phase1_proof_is_stable(conn, proof)
+                 : !http1_pipeline_request_generation_upload_active_is_stable(
+                       conn,
+                       proof,
+                       conn.response_read_deadline_profile,
+                       conn.response_read_deadline_buffering,
+                       conn.response_read_deadline_method,
+                       conn.response_read_deadline_route_method))) {
             conn.upstream_request_incomplete = true;
             loop->close_conn(conn);
             return;
@@ -7390,6 +7541,14 @@ inline bool validated_preconnect_failure_owner_is_stable(Loop* loop,
         const u8 method_key = route_method_key(static_cast<LogHttpMethod>(conn.req_method));
         const RouteEntry* route = config->match_canonical(
             conn.req_path_canon, method_key, params, &param_count, kMaxRouteParams);
+        const bool pipeline_generation_stable =
+            http1_pipeline_request_generation_preconnect_is_stable(
+                conn,
+                conn.response_read_deadline_upload,
+                conn.response_read_deadline_profile,
+                conn.response_read_deadline_buffering,
+                conn.response_read_deadline_method,
+                conn.response_read_deadline_route_method);
         if (route == nullptr || route->action != RouteAction::JitHandler || route->fn == nullptr ||
             route->needs_req_body || route->rate_limit.count != 0 ||
             route->throttle_down_bps != 0 || route->ws_terminate ||
@@ -7423,7 +7582,7 @@ inline bool validated_preconnect_failure_owner_is_stable(Loop* loop,
             conn.resp_header_mutation_pending_count != 0 ||
             conn.resp_header_mutation_pending_overflow || conn.resp_header_mutation_overflow ||
             conn.response_mutations_snapshotted || conn.retry_req_send_len != 0 ||
-            conn.pipeline_depth != 0 || conn.pipeline_stash_len != 0 ||
+            !pipeline_generation_stable || conn.pipeline_stash_len != 0 ||
             conn.response_header_buf.is_released() || !conn.response_header_buf.valid() ||
             conn.response_header_buf.len() != 0 ||
             loop->backend.send_state[conn.id].remaining != 0 ||
@@ -8437,8 +8596,15 @@ void on_upstream_response(void* lp, Connection& conn, IoEvent ev) {
             explicit_profile ==
             ResponseReadDeadlineProfile::FixedContentLengthUploadNonHeadContentLengthZero;
         const RouteConfig* config = conn.request_config;
+        const bool pipeline_generation_exact =
+            http1_pipeline_request_generation_upload_active_is_stable(conn,
+                                                                      explicit_upload,
+                                                                      explicit_profile,
+                                                                      explicit_buffering,
+                                                                      explicit_method,
+                                                                      explicit_route_method);
         const bool owner_exact =
-            explicit_generation != 0 &&
+            pipeline_generation_exact && explicit_generation != 0 &&
             explicit_generation == conn.response_read_deadline_generation &&
             explicit_bundle_id != 0 && config != nullptr &&
             config->policy_bundle_id_is_valid(explicit_bundle_id) &&

@@ -529,6 +529,33 @@ private:
     }
 
     static bool prebuilt_http1_response_is_complete(const Connection& c) {
+        // A generic pipeline generation token is not a strict activation bit.
+        // Preserve the legacy layout shortcut only while every copied owner
+        // field is at its canonical reset value.  Once any copied field is
+        // published, a non-legacy request must prove the complete strict
+        // identity before layout-None or header-only can return.
+        if (!c.http1_prebuilt_response_proof_is_neutral() && !http1_pipeline_request_is_legacy(c)) {
+            ForwardResponseBufferingMode copied_buffering = ForwardResponseBufferingMode::None;
+            if (c.http1_prebuilt_deadline_config != nullptr &&
+                c.http1_prebuilt_deadline_config->policy_bundle_id_is_valid(
+                    c.http1_prebuilt_deadline_bundle_id)) {
+                copied_buffering = c.http1_prebuilt_deadline_config
+                                       ->policy_bundles[c.http1_prebuilt_deadline_bundle_id - 1]
+                                       .response_buffering;
+            }
+            if (!http1_pipeline_request_generation_prebuilt_is_stable(
+                    c,
+                    c.http1_prebuilt_deadline_upload,
+                    c.http1_prebuilt_deadline_config,
+                    c.http1_prebuilt_deadline_bundle_id,
+                    c.http1_prebuilt_deadline_profile,
+                    copied_buffering,
+                    c.http1_prebuilt_deadline_method,
+                    c.http1_prebuilt_deadline_route_method,
+                    c.http1_prebuilt_response_layout,
+                    c.http1_prebuilt_response_purpose))
+                return false;
+        }
         if (c.http1_prebuilt_response_layout == Http1PrebuiltResponseLayout::None)
             return prebuilt_http1_header_is_complete(c);
         if (c.http1_prebuilt_deadline_profile == ResponseReadDeadlineProfile::None ||
@@ -2166,6 +2193,14 @@ public:
                  ResponseReadDeadlinePostCommitPhase::Buffering) &&
             (c.response_read_deadline_state == ResponseReadDeadlineState::RefreshPending ||
              c.response_read_deadline_state == ResponseReadDeadlineState::BodyComplete);
+        const bool pipeline_generation_stable =
+            http1_pipeline_request_generation_upload_active_is_stable(
+                c,
+                c.response_read_deadline_upload,
+                c.response_read_deadline_profile,
+                c.response_read_deadline_buffering,
+                c.response_read_deadline_method,
+                c.response_read_deadline_route_method);
         return (post_commit ? exact_post_commit_progress || selecting_post_commit
                             : no_progress || exact_progress) &&
                response_read_deadline_profile_is_stable(c, *cfg, bundle_id) &&
@@ -2173,9 +2208,10 @@ public:
                !c.upstream_request_incomplete &&
                (c.on_upstream_recv == &on_upstream_response<Self> ||
                 (post_commit && c.on_upstream_recv == nullptr)) &&
-               c.pipeline_depth == 0 && !c.target_transform_recorded && !c.req_path_overridden &&
-               c.req_header_override_count == 0 && !c.req_header_override_overflow &&
-               c.resp_header_mutation_count == 0 && c.resp_header_mutation_pending_count == 0 &&
+               pipeline_generation_stable && !c.target_transform_recorded &&
+               !c.req_path_overridden && c.req_header_override_count == 0 &&
+               !c.req_header_override_overflow && c.resp_header_mutation_count == 0 &&
+               c.resp_header_mutation_pending_count == 0 &&
                !c.resp_header_mutation_pending_overflow && !c.resp_header_mutation_overflow &&
                !c.upstream_recv_paused_for_send && !c.upstream_recv_pause_cancel_pending &&
                !c.upstream_recv_pause_rearm_pending && !c.upstream_recv_cancel_inflight &&
