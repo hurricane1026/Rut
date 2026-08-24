@@ -17721,6 +17721,217 @@ struct ValidatedFailureRetryDeferredAcceptsTag {
 template struct ValidatedFailurePrivateMemberAccess<ValidatedFailureRetryDeferredAcceptsTag,
                                                     &IoUringEventLoop::retry_deferred_accepts>;
 
+struct DrainBarrierCloseListenTag {
+    using Member = void (IoUringEventLoop::*)();
+    friend Member validated_failure_private_member(DrainBarrierCloseListenTag);
+};
+
+template struct ValidatedFailurePrivateMemberAccess<DrainBarrierCloseListenTag,
+                                                    &IoUringEventLoop::close_listen>;
+
+struct DrainBarrierStartTag {
+    using Member = std::atomic<u64> IoUringEventLoop::*;
+    friend Member validated_failure_private_member(DrainBarrierStartTag);
+};
+
+template struct ValidatedFailurePrivateMemberAccess<DrainBarrierStartTag,
+                                                    &IoUringEventLoop::drain_start_>;
+
+struct DrainBarrierPeriodTag {
+    using Member = std::atomic<u32> IoUringEventLoop::*;
+    friend Member validated_failure_private_member(DrainBarrierPeriodTag);
+};
+
+template struct ValidatedFailurePrivateMemberAccess<DrainBarrierPeriodTag,
+                                                    &IoUringEventLoop::drain_period_>;
+
+// Dedicated production-io_uring runner for the drain lifecycle test below.
+// The only inserted seam is after the complete scheduler batch (including
+// deferred accepts, commands, timers, and health) and immediately before the
+// production drain phase. All non-atomic state is inspected on this thread;
+// only the barrier handshake crosses threads.
+struct ScopedIoUringProxyRequestCompletionBarrier {
+    Shard<IoUringEventLoop> shard;
+    u16 port = 0;
+    pthread_t thread{};
+    bool initialized = false;
+    bool started = false;
+    std::atomic<bool> barrier_reached{false};
+    std::atomic<bool> barrier_release{false};
+    std::atomic<bool> barrier_failed{false};
+    std::atomic<bool> exited{false};
+
+    ~ScopedIoUringProxyRequestCompletionBarrier() { teardown(); }
+
+    static bool completion_boundary_ready(ScopedIoUringProxyRequestCompletionBarrier* self) {
+        auto* loop = self->shard.loop;
+        if (self->shard.shard_metrics.requests_total != 1 ||
+            self->shard.shard_metrics.requests_active != 0 ||
+            self->shard.shard_metrics.request_latency.count != 1 ||
+            self->shard.shard_metrics.connections_total != 1 ||
+            self->shard.shard_metrics.connections_active != 1 || loop->active_count() != 1 ||
+            loop->pending_free_count != 0 || loop->backend.failure_code() != 0)
+            return false;
+
+        u32 live_count = 0;
+        u32 matching_count = 0;
+        for (u32 i = 0; i < IoUringEventLoop::kMaxConns; i++) {
+            const Connection& conn = loop->conns[i];
+            if (conn.fd < 0) continue;
+            live_count++;
+            const auto& send = loop->backend.send_state[i];
+            const auto& upstream_send = loop->backend.upstream_send_state[i];
+            const bool downstream_recv_owner =
+                conn.state == ConnState::ReadingHeader && conn.req_start_us == 0 &&
+                conn.recv_armed && conn.pending_ops == 1 && !conn.recv_paused_for_send &&
+                !conn.recv_pause_cancel_pending && !conn.recv_pause_rearm_pending &&
+                conn.on_recv == &on_header_received<IoUringEventLoop> && conn.on_send == nullptr &&
+                conn.send_progress == 0 && conn.send_buf.len() == 0 && conn.recv_buf.len() == 0 &&
+                !conn.send_armed;
+            // io_uring has no separate downstream fd map. Its completed send
+            // record is the backend fd identity: remaining==0 is owner-neutral,
+            // while fd/src/offset retain the exact completed warm Send.
+            const bool downstream_backend_neutral =
+                send.fd == conn.fd && send.src == conn.send_buf.data() && send.offset > 0 &&
+                send.remaining == 0 && send.type == IoEventType::Send &&
+                send.upstream_episode == 0 && send.generation == 0;
+            const bool upstream_neutral =
+                conn.upstream_fd < 0 && !conn.upstream_connect_armed && !conn.upstream_send_armed &&
+                !conn.upstream_recv_armed && !conn.upstream_recv_pause_cancel_pending &&
+                !conn.upstream_recv_cancel_inflight && !conn.upstream_retirement_active &&
+                conn.upstream_retirement_target_owned == 0 &&
+                conn.upstream_retirement_cancel_owned == 0 &&
+                conn.upstream_retirement_cancel_retry == 0 &&
+                conn.upstream_close_target_owned == 0 && conn.upstream_close_cancel_owned == 0 &&
+                !conn.upstream_close_pause_cancel_owned && !conn.upstream_slot_held &&
+                conn.idle_return_fd < 0 && conn.upstream_recv_buf.len() == 0 &&
+                conn.on_upstream_recv == nullptr && conn.on_upstream_send == nullptr &&
+                upstream_send.src == nullptr && upstream_send.fd == -1 &&
+                upstream_send.offset == 0 && upstream_send.remaining == 0 &&
+                upstream_send.type == IoEventType::UpstreamSend &&
+                upstream_send.upstream_episode == 0 && upstream_send.generation == 0;
+            const bool request_boundary_neutral =
+                conn.pipeline_depth == 0 && conn.pipeline_stash_len == 0 &&
+                !conn.http1_boundary_deferred && !conn.http1_boundary_ready &&
+                conn.http1_boundary_successor_episode == 0 && conn.http1_prebuilt_wait == 0 &&
+                conn.http1_prebuilt_disposition == Http1RequestBufferDisposition::None &&
+                !conn.epoch_held;
+            if (downstream_recv_owner && downstream_backend_neutral && upstream_neutral &&
+                request_boundary_neutral)
+                matching_count++;
+        }
+        return live_count == 1 && matching_count == 1 &&
+               self->shard.epoch.epoch.load(std::memory_order_acquire) == 2;
+    }
+
+    static void production_drain_phase(IoUringEventLoop* loop) {
+        if (!loop->is_draining()) return;
+        (loop->*validated_failure_private_member(DrainBarrierCloseListenTag{}))();
+        if (loop->upstream != nullptr) loop->upstream->drain();
+        const u64 start = (loop->*validated_failure_private_member(DrainBarrierStartTag{}))
+                              .load(std::memory_order_relaxed);
+        const u32 period = (loop->*validated_failure_private_member(DrainBarrierPeriodTag{}))
+                               .load(std::memory_order_relaxed);
+        if (loop->active_count() == 0) {
+            loop->stop();
+        } else if (monotonic_secs() >= start + period) {
+            loop->force_close_all();
+            loop->stop();
+        }
+    }
+
+    static void* run(void* arg) {
+        auto* self = static_cast<ScopedIoUringProxyRequestCompletionBarrier*>(arg);
+        auto* loop = self->shard.loop;
+        reset_backend_health();
+        loop->backend.add_accept();
+        loop->fire_due_timers();
+        loop->arm_health_on_config_change();
+        IoEvent events[kMaxEventsPerWait];
+
+        while (loop->is_running()) {
+            loop->retry_strict_upstream_retirement_cancels();
+            const u32 n = loop->backend.wait(
+                events, kMaxEventsPerWait, loop->conns, IoUringEventLoop::kMaxConns);
+            if (loop->backend.failure_code() != 0) {
+                loop->stop();
+                break;
+            }
+            loop->dispatch_batch(events, n);
+            (loop->*validated_failure_private_member(ValidatedFailureRetryDeferredAcceptsTag{}))();
+            loop->poll_command();
+            loop->fire_due_timers();
+            loop->arm_health_on_config_change();
+
+            // Pause at the sole inserted seam: every production phase through
+            // health has completed, while this iteration's drain phase has not.
+            if (!self->barrier_reached.load(std::memory_order_relaxed) &&
+                completion_boundary_ready(self)) {
+                self->barrier_reached.store(true, std::memory_order_release);
+                const i64 deadline = test_mono_ms() + 10'000;
+                while (!self->barrier_release.load(std::memory_order_acquire) &&
+                       loop->is_running() && test_mono_ms() < deadline)
+                    sched_yield();
+                if (!self->barrier_release.load(std::memory_order_acquire)) {
+                    self->barrier_failed.store(true, std::memory_order_release);
+                    loop->stop();
+                }
+            }
+            production_drain_phase(loop);
+        }
+        self->exited.store(true, std::memory_order_release);
+        return nullptr;
+    }
+
+    bool setup(const RouteConfig* config) {
+        const auto listen = create_listen_socket(0);
+        if (!listen.has_value()) return false;
+        shard.owns_listen_fd = true;
+        if (!shard.init(0, listen.value()).has_value()) {
+            close(listen.value());
+            shard.listen_fd = -1;
+            return false;
+        }
+        initialized = true;
+        port = get_port(listen.value());
+        shard.route_config = config;
+        shard.active_config = config;
+        const i32 rc = pthread_create(&thread, nullptr, run, this);
+        started = rc == 0;
+        if (!started) teardown();
+        return started;
+    }
+
+    bool wait_until_reached(i64 timeout_ms) {
+        const i64 deadline = test_mono_ms() + timeout_ms;
+        while (!barrier_reached.load(std::memory_order_acquire) &&
+               !barrier_failed.load(std::memory_order_acquire) &&
+               !exited.load(std::memory_order_acquire) && test_mono_ms() < deadline)
+            sched_yield();
+        return barrier_reached.load(std::memory_order_acquire) &&
+               !barrier_failed.load(std::memory_order_acquire);
+    }
+
+    void release() { barrier_release.store(true, std::memory_order_release); }
+
+    void teardown() {
+        // A failed REQUIRE may unwind while the runner is paused. Always
+        // release first, stop second, and join before touching loop resources.
+        barrier_release.store(true, std::memory_order_release);
+        if (initialized && shard.loop != nullptr) shard.stop();
+        if (started) {
+            pthread_join(thread, nullptr);
+            started = false;
+        }
+        if (initialized) {
+            if (shard.loop != nullptr) shard.loop->force_close_all();
+            shard.shutdown();
+            initialized = false;
+        }
+        port = 0;
+    }
+};
+
 // Exact-POST policy-1 sibling for the closed bodyless non-HEAD buffering
 // profile. Keeping it separate leaves the existing GET source and wire as
 // independent evidence.
@@ -20489,6 +20700,8 @@ TEST(route, response_policy_request_connection_preserves_client_intent) {
     // gate. Warm the downstream connection before entering drain so the test
     // does not depend on an accept racing the drain transition.
     {
+        if (!iouring_socket_live())
+            SKIP("io_uring async socket ops unavailable for the drain lifecycle subcase");
         RecordingUpstream backend;
         REQUIRE(backend.setup());
         RouteConfig cfg{};
@@ -20496,32 +20709,42 @@ TEST(route, response_policy_request_connection_preserves_client_intent) {
         REQUIRE(cfg.add_upstream("backend", 0x7F000001, backend.port).has_value());
         REQUIRE_EQ(cfg.add_response_policy(test_response_policy_request_spec()), 1u);
         REQUIRE(cfg.add_jit_handler("/api", 'G', &forward_request_and_response_policy_handler));
-        const RouteConfig* active = &cfg;
-        ScopedProxyLoop proxy;
-        REQUIRE(proxy.setup(&active, 1000));
-        i32 client = connect_to(proxy.port);
-        REQUIRE_GE(client, 0);
-        set_socket_timeouts(client, 2);
+        ScopedIoUringProxyRequestCompletionBarrier proxy;
+        REQUIRE(proxy.setup(&cfg));
+        struct ClientGuard {
+            i32 fd = -1;
+            ~ClientGuard() {
+                if (fd >= 0) close(fd);
+            }
+        } client{connect_to(proxy.port)};
+        REQUIRE_GE(client.fd, 0);
+        set_socket_timeouts(client.fd, 2);
         static constexpr char kWarm[] = "GET /warm HTTP/1.1\r\nHost: client.example\r\n\r\n";
-        REQUIRE(send_all(client, kWarm, sizeof(kWarm) - 1));
+        REQUIRE(send_all(client.fd, kWarm, sizeof(kWarm) - 1));
         char warm_response[512];
-        const i32 warm_len = recv_timeout(client, warm_response, sizeof(warm_response), 2000);
+        const i32 warm_len = recv_timeout(client.fd, warm_response, sizeof(warm_response), 2000);
         REQUIRE_GT(warm_len, 0);
         CHECK(buf_contains(
             warm_response, static_cast<u32>(warm_len), "200", static_cast<u32>(strlen("200"))));
 
-        // Isolate the immediate lifecycle gate from the forced-drain deadline;
-        // this finite period is deliberately far beyond fixture scheduling windows.
-        proxy.loop->drain(3600);
+        // The client receiving bytes does not prove that the event loop has
+        // dispatched the Send completion. The loop-thread barrier proves the
+        // complete batch boundary and pauses immediately before drain handling.
+        REQUIRE(proxy.wait_until_reached(3000));
+        // This test isolates the immediate is_draining() request lifecycle
+        // gate. A long finite period keeps the forced deadline out of scope.
+        proxy.shard.drain(3600);
         static constexpr char kDraining[] = "GET /api HTTP/1.1\r\nHost: client.example\r\n\r\n";
-        REQUIRE(send_all(client, kDraining, sizeof(kDraining) - 1));
+        REQUIRE(send_all(client.fd, kDraining, sizeof(kDraining) - 1));
+        proxy.release();
         char response[2048]{};
-        const u32 response_len = read_response(client, response, sizeof(response));
+        const u32 response_len = read_response(client.fd, response, sizeof(response));
         REQUIRE_GT(response_len, 0u);
         normalize_and_check(response, response_len, "close");
         char tail[16];
-        CHECK_EQ(recv_timeout(client, tail, sizeof(tail), 2000), 0);
-        close(client);
+        CHECK_EQ(recv_timeout(client.fd, tail, sizeof(tail), 2000), 0);
+        REQUIRE_EQ(close(client.fd), 0);
+        client.fd = -1;
         CHECK_EQ(backend.request_count.load(std::memory_order_acquire), 1u);
     }
 }
