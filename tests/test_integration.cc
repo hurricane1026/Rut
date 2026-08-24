@@ -24168,6 +24168,9 @@ TEST(route, ordinary_source_validated_failure_late_successor_iouring) {
         u32 request_one_recv_generation = UINT32_MAX;
         u64 request_one_recv_user_data = kInvalidIoUserData;
         i32 request_one_recv_fd = -1;
+        bool request_one_sq_cursor_initialized = false;
+        u32 request_one_sq_cursor = 0;
+        u32 request_one_sq_barrier_tail = 0;
         u32 sq_head_before_dispatch = 0;
         u32 sq_tail_before_dispatch = 0;
         u32 sq_pending_before_dispatch = 0;
@@ -24259,23 +24262,35 @@ TEST(route, ordinary_source_validated_failure_late_successor_iouring) {
                              IoEventType::Recv,
                              self->request_one_recv_generation});
                         self->request_one_recv_fd = conn.fd;
+                        // Start at this admission iteration's pre-wait tail.
+                        // The original target Recv was submitted by that wait,
+                        // while every SQE queued from this point onward remains
+                        // inside the continuity proof.
+                        self->request_one_sq_cursor = sq_tail_before_wait;
+                        self->request_one_sq_cursor_initialized = true;
                     }
                 }
 
                 // Once request 1 is admitted, its original multishot Recv must
                 // remain the sole downstream Recv owner until the negative
-                // Connect completion has staged response 1. Inspect every SQE
-                // produced by dispatch: a fresh target Recv or a cancel of the
-                // original user_data invalidates the witness even when the
-                // cancel's own CQE would later be swallowed by backend.wait().
+                // Connect completion has staged response 1. The persistent
+                // cursor covers SQEs queued by prior poll-command, timer, and
+                // health phases plus the current dispatch and exact
+                // retry-deferred-accept phase. A fresh target Recv or a cancel
+                // of the original user_data invalidates the witness even when
+                // the cancel's own CQE would later be swallowed by backend.wait().
                 if (self->request_one_admitted) {
                     const u32 sq_tail_after_batch =
                         __atomic_load_n(loop->backend.sq_tail, __ATOMIC_ACQUIRE);
                     const u32 mask = *loop->backend.sq_ring_mask;
-                    if (sq_tail_after_batch - sq_tail_before_wait > loop->backend.sq_ring_entries) {
+                    if (!self->request_one_sq_cursor_initialized ||
+                        sq_tail_after_batch - self->request_one_sq_cursor >
+                            loop->backend.sq_ring_entries) {
                         self->request_one_continuity_valid = false;
                     } else {
-                        for (u32 tail = sq_tail_before_wait; tail != sq_tail_after_batch; ++tail) {
+                        for (u32 tail = self->request_one_sq_cursor;
+                             tail != sq_tail_after_batch;
+                             ++tail) {
                             const u32 array_slot = tail & mask;
                             const u32 sqe_index = loop->backend.sq_array[array_slot];
                             if (sqe_index >= loop->backend.sq_ring_entries) {
@@ -24284,12 +24299,15 @@ TEST(route, ordinary_source_validated_failure_late_successor_iouring) {
                             }
                             const io_uring_sqe& sqe = loop->backend.sq_entries[sqe_index];
                             if (sqe.opcode == IORING_OP_RECV &&
-                                sqe.user_data == self->request_one_recv_user_data)
+                                sqe.fd == self->request_one_recv_fd)
                                 self->request_one_continuity_valid = false;
                             if (sqe.opcode == IORING_OP_ASYNC_CANCEL &&
                                 sqe.addr == self->request_one_recv_user_data)
                                 self->request_one_continuity_valid = false;
                         }
+                        // Publish progress only after the entire bounded span
+                        // has been inspected; the next iteration resumes here.
+                        self->request_one_sq_cursor = sq_tail_after_batch;
                     }
                 }
 
@@ -24299,6 +24317,7 @@ TEST(route, ordinary_source_validated_failure_late_successor_iouring) {
                     self->sq_tail_after_dispatch =
                         __atomic_load_n(loop->backend.sq_tail, __ATOMIC_ACQUIRE);
                     self->sq_pending_after_dispatch = loop->backend.pending;
+                    self->request_one_sq_barrier_tail = self->sq_tail_after_dispatch;
                     if (self->sq_tail_after_dispatch == self->sq_tail_before_dispatch + 1u) {
                         const u32 mask = *loop->backend.sq_ring_mask;
                         const u32 array_slot = self->sq_tail_before_dispatch & mask;
@@ -24401,6 +24420,8 @@ TEST(route, ordinary_source_validated_failure_late_successor_iouring) {
     REQUIRE_EQ(runner.request_one_recv_user_data,
                encode_non_upstream_user_data({runner.conn_id, IoEventType::Recv, 0}));
     REQUIRE_EQ(runner.request_one_recv_fd, shard.loop->conns[runner.conn_id].fd);
+    REQUIRE(runner.request_one_sq_cursor_initialized);
+    REQUIRE_EQ(runner.request_one_sq_cursor, runner.request_one_sq_barrier_tail);
     REQUIRE(runner.deferred_accepts_neutral);
     REQUIRE(runner.control_state_neutral);
     REQUIRE(runner.config_state_neutral);
@@ -24475,10 +24496,21 @@ TEST(route, ordinary_source_validated_failure_late_successor_iouring) {
                 REQUIRE_GT(cqe.res, 0);
                 static constexpr u32 kCqeMetadataMask =
                     (1u << IORING_CQE_BUFFER_SHIFT) - 1u;
+#ifdef IORING_CQE_F_SOCK_NONEMPTY
+                static constexpr u32 kCqeSockNonempty = IORING_CQE_F_SOCK_NONEMPTY;
+#else
+                // Stable io_uring UAPI value for builds against older headers.
+                static constexpr u32 kCqeSockNonempty = 1u << 2;
+#endif
+                static constexpr u32 kAllowedCqeMetadata =
+                    IORING_CQE_F_BUFFER | IORING_CQE_F_MORE | kCqeSockNonempty;
+                static constexpr u32 kExplicitlyForbiddenCqeMetadata =
+                    (1u << 3) | (1u << 4) | (1u << 5);  // NOTIF, BUF_MORE, SKIP.
+                const u32 metadata = cqe.flags & kCqeMetadataMask;
+                REQUIRE_EQ(metadata & kExplicitlyForbiddenCqeMetadata, 0u);
+                REQUIRE_EQ(metadata & ~kAllowedCqeMetadata, 0u);
+                REQUIRE_EQ(metadata & IORING_CQE_F_BUFFER, IORING_CQE_F_BUFFER);
                 const bool more = (cqe.flags & IORING_CQE_F_MORE) != 0;
-                const u32 expected_metadata =
-                    IORING_CQE_F_BUFFER | (more ? IORING_CQE_F_MORE : 0u);
-                REQUIRE_EQ(cqe.flags & kCqeMetadataMask, expected_metadata);
                 const u16 buf_id =
                     static_cast<u16>(cqe.flags >> IORING_CQE_BUFFER_SHIFT);
                 REQUIRE_LT(buf_id, kProvidedBufCount);
