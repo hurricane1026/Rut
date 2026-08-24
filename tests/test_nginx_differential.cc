@@ -6343,6 +6343,290 @@ static bool run_strict_local_response_differential(
     return true;
 }
 
+struct ConverterExactLocalDifferentialObservation {
+    std::vector<char> nginx_wire;
+    std::vector<char> generated_rut_wire;
+    u32 nginx_upstream_accepts = 0;
+    u32 nginx_upstream_requests = 0;
+    u32 generated_rut_upstream_accepts = 0;
+    u32 generated_rut_upstream_requests = 0;
+};
+
+static bool run_converter_exact_local_differential(
+    u16 frontend_port,
+    u16 backend_port,
+    TempDir& temp,
+    const std::string& container_name,
+    const char* rut_path,
+    ConverterExactLocalDifferentialObservation& observation,
+    std::string& error) {
+    if (rut_path == nullptr || rut_path[0] != '/' || access(rut_path, X_OK) != 0) {
+        error =
+            "converter-generated exact-local differential requires an executable absolute "
+            "RUT path";
+        return false;
+    }
+
+    // One shared accepted fragment feeds both sides. Root-before-exact is the
+    // intentionally recorded declaration order for this bounded evidence.
+    const std::string fragment =
+        "server {\n"
+        "  listen " +
+        std::to_string(frontend_port) +
+        ";\n"
+        "  location / { proxy_pass http://127.0.0.1:" +
+        std::to_string(backend_port) +
+        "; }\n"
+        "  location = /static { return 200 \"successor-static\"; }\n"
+        "}\n";
+    const std::string nginx_config =
+        "error_log stderr notice;\n"
+        "events {}\n"
+        "http {\n" +
+        fragment + "}\n";
+
+    const auto parsed = rut::nginx::parse({fragment.data(), static_cast<u32>(fragment.size())});
+    if (!parsed || !parsed.value().location.path.eq(rut::lit_str("/")) ||
+        !parsed.value().exact_local_return.present ||
+        !parsed.value().exact_local_return.path.eq(rut::lit_str("/static")) ||
+        parsed.value().exact_local_return.response.status != 200 ||
+        !parsed.value().exact_local_return.response.body.eq(rut::lit_str("successor-static"))) {
+        error = "shared root-before-exact nginx fragment did not reach the bounded semantic model";
+        return false;
+    }
+    const auto lowered = rut::nginx::lower_to_rut(parsed.value());
+    if (!lowered) {
+        error = "accepted exact-local nginx semantic model failed converter lowering";
+        return false;
+    }
+    const rut::Str generated = lowered.value().view();
+    const std::string rut_source(generated.ptr, generated.len);
+    static constexpr char kExactTerminator[] = "route exact \"/static\" { return local_response({";
+    const size_t exact_begin = rut_source.find(kExactTerminator);
+    const size_t exact_end =
+        exact_begin == std::string::npos ? std::string::npos : rut_source.find("}) }", exact_begin);
+    bool only_exact_static_route = true;
+    u32 static_route_count = 0;
+    for (size_t line_begin = 0; line_begin < rut_source.size();) {
+        const size_t line_end = rut_source.find('\n', line_begin);
+        const size_t length =
+            (line_end == std::string::npos ? rut_source.size() : line_end) - line_begin;
+        const std::string line = rut_source.substr(line_begin, length);
+        if (line.rfind("route ", 0) == 0 && line.find("\"/static\"") != std::string::npos) {
+            static_route_count++;
+            only_exact_static_route &= line.rfind("route exact \"/static\"", 0) == 0;
+        }
+        if (line_end == std::string::npos) break;
+        line_begin = line_end + 1;
+    }
+    const auto exact_contains = [&](const char* needle) {
+        if (exact_begin == std::string::npos || exact_end == std::string::npos) return false;
+        const size_t found = rut_source.find(needle, exact_begin);
+        return found != std::string::npos && found < exact_end;
+    };
+    if (exact_begin == std::string::npos || exact_end == std::string::npos ||
+        static_route_count != 1 || !only_exact_static_route ||
+        !exact_contains("status: 200, reason: \"OK\"") ||
+        !exact_contains("head_mode: \"suppress_body\", body: b\"successor-static\"") ||
+        rut_source.find("route exact GET \"/static\"") != std::string::npos ||
+        rut_source.find("return forward(nginx_upstream") == std::string::npos ||
+        rut_source.find("route \"/\"") == std::string::npos ||
+        rut_source.find("return response(") != std::string::npos) {
+        error = "converter output lost the exact-ANY strict-local/root-forward source shape";
+        return false;
+    }
+    if (!write_file(temp.nginx_config, nginx_config.data(), nginx_config.size()) ||
+        !write_file(temp.source, rut_source.data(), rut_source.size())) {
+        error = "failed to write converter-generated exact-local differential inputs";
+        return false;
+    }
+
+    const auto recorder_is_live = [](const Recorder& upstream) {
+        return upstream.running.load(std::memory_order_acquire) &&
+               upstream.thread_alive.load(std::memory_order_acquire) &&
+               !upstream.listener_failed.load(std::memory_order_acquire);
+    };
+    const auto wait_recorder_ready = [&](Recorder& upstream, Child& process, const char* side) {
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+        while (std::chrono::steady_clock::now() < deadline) {
+            if (poll_child(process)) {
+                error = std::string(side) + " frontend exited before recorder readiness (" +
+                        child_status_description(process) + ")";
+                return false;
+            }
+            if (upstream.listener_failed.load(std::memory_order_acquire) ||
+                !upstream.running.load(std::memory_order_acquire)) {
+                error = std::string(side) + " zero-upstream recorder failed before readiness";
+                return false;
+            }
+            if (upstream.thread_alive.load(std::memory_order_acquire)) return true;
+            (void)poll(nullptr, 0, 5);
+        }
+        error = std::string(side) + " zero-upstream recorder readiness timed out";
+        return false;
+    };
+    const auto observe_zero_upstream = [&](Recorder& upstream, Child& process, const char* side) {
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(500);
+        for (;;) {
+            if (poll_child(process)) {
+                error = std::string(side) +
+                        " frontend exited during the live zero-upstream observation window (" +
+                        child_status_description(process) + ")";
+                return false;
+            }
+            if (!recorder_is_live(upstream)) {
+                error = std::string(side) +
+                        " recorder stopped or failed during the live zero-upstream window";
+                return false;
+            }
+            if (upstream.accepted.load(std::memory_order_acquire) != 0 ||
+                upstream.requests.load(std::memory_order_acquire) != 0 ||
+                upstream.response_send_all_calls.load(std::memory_order_acquire) != 0) {
+                error = std::string(side) + " exact local response performed upstream work";
+                return false;
+            }
+            const auto now = std::chrono::steady_clock::now();
+            if (now >= deadline) return true;
+            const auto remaining =
+                std::chrono::duration_cast<std::chrono::milliseconds>(deadline - now).count();
+            (void)poll(nullptr, 0, remaining > 50 ? 50 : static_cast<int>(remaining));
+        }
+    };
+    const auto exercise = [&](Recorder& upstream,
+                              Child& process,
+                              const char* side,
+                              std::vector<char>& wire) {
+        if (!wait_recorder_ready(upstream, process, side)) return false;
+        struct ClientGuard {
+            int fd = -1;
+            ~ClientGuard() {
+                if (fd >= 0) close(fd);
+            }
+        } client{connect_once(frontend_port)};
+        std::string detail;
+        if (client.fd < 0 ||
+            !send_all(
+                client.fd, kExactLocalGetCloseRequest, sizeof(kExactLocalGetCloseRequest) - 1u) ||
+            !read_response(client.fd, wire, detail) || !read_eof(client.fd, detail)) {
+            error = std::string(side) +
+                    " converter exact-local request/ordered-response/EOF failed: " +
+                    (detail.empty() ? "connect or send failed" : detail);
+            return false;
+        }
+        if (!validate_exact_normalized_response(wire, kExactLocalCloseResponseNormalized, detail)) {
+            error = std::string(side) + " exact status/header/body wire mismatch: " + detail;
+            return false;
+        }
+        return observe_zero_upstream(upstream, process, side);
+    };
+    const auto settle_zero_upstream =
+        [&](Recorder& upstream, u32& accepts, u32& requests, const char* side) {
+            upstream.stop();
+            accepts = upstream.accepted.load(std::memory_order_acquire);
+            requests = upstream.requests.load(std::memory_order_acquire);
+            if (upstream.running.load(std::memory_order_acquire) ||
+                upstream.thread_alive.load(std::memory_order_acquire) ||
+                upstream.listener_failed.load(std::memory_order_acquire) || accepts != 0 ||
+                requests != 0 ||
+                upstream.response_send_all_calls.load(std::memory_order_acquire) != 0 ||
+                upstream.response_send_succeeded.load(std::memory_order_acquire) ||
+                upstream.response_clean_shutdown.load(std::memory_order_acquire) ||
+                upstream.response_connection_closed.load(std::memory_order_acquire) ||
+                !upstream.request.empty() || !upstream.history.empty()) {
+                error = std::string(side) +
+                        " zero-upstream recorder did not join with exact empty settled state";
+                return false;
+            }
+            return true;
+        };
+
+    {
+        Recorder upstream;
+        upstream.observe_extra_requests_until_stop = true;
+        if (!upstream.setup(backend_port)) {
+            error = "failed to start pinned-nginx converter exact-local recorder";
+            return false;
+        }
+        DockerGuard docker(container_name);
+        ChildGuard nginx;
+        const bool spawned = spawn_child({"docker",
+                                          "run",
+                                          "--pull=never",
+                                          "--network",
+                                          "host",
+                                          "--name",
+                                          container_name,
+                                          "-v",
+                                          temp.nginx_config + ":/etc/nginx/nginx.conf:ro",
+                                          kNginxImage,
+                                          "nginx",
+                                          "-g",
+                                          "daemon off;"},
+                                         temp.nginx_log,
+                                         nginx.child);
+        bool side_ok = spawned;
+        if (!spawned) error = "failed to start pinned nginx for converter exact-local evidence";
+        if (side_ok) side_ok = wait_ready(frontend_port, nginx.child, error);
+        if (side_ok)
+            side_ok = exercise(upstream, nginx.child, "pinned nginx", observation.nginx_wire);
+        // Keep the recorder live until the frontend has been stopped and reaped.
+        const bool process_stopped = stop_child(nginx.child);
+        const bool container_removed = docker.remove();
+        const bool recorder_settled = settle_zero_upstream(upstream,
+                                                           observation.nginx_upstream_accepts,
+                                                           observation.nginx_upstream_requests,
+                                                           "pinned nginx");
+        if (!side_ok || !process_stopped || !container_removed || !recorder_settled) {
+            if (error.empty()) error = "pinned-nginx exact-local cleanup failed";
+            return false;
+        }
+    }
+
+    {
+        Recorder upstream;
+        upstream.observe_extra_requests_until_stop = true;
+        if (!upstream.setup(backend_port)) {
+            error = "failed to start converter-generated RUT exact-local recorder";
+            return false;
+        }
+        ChildGuard generated_rut;
+        const bool spawned =
+            spawn_child({rut_path, temp.source, "--shards", "1", "--no-pin", "--drain", "0"},
+                        temp.rut_log,
+                        generated_rut.child);
+        bool side_ok = spawned;
+        if (!spawned) error = "failed to start converter-generated ordinary RUT";
+        if (side_ok) side_ok = wait_ready(frontend_port, generated_rut.child, error);
+        if (side_ok)
+            side_ok = exercise(upstream,
+                               generated_rut.child,
+                               "converter-generated ordinary RUT",
+                               observation.generated_rut_wire);
+        // Preserve the same frontend-before-recorder teardown order as nginx.
+        const bool process_stopped = stop_child(generated_rut.child);
+        const bool recorder_settled =
+            settle_zero_upstream(upstream,
+                                 observation.generated_rut_upstream_accepts,
+                                 observation.generated_rut_upstream_requests,
+                                 "converter-generated ordinary RUT");
+        if (!side_ok || !process_stopped || !recorder_settled) {
+            if (error.empty()) error = "converter-generated ordinary RUT cleanup failed";
+            return false;
+        }
+    }
+
+    std::vector<char> normalized_nginx = observation.nginx_wire;
+    std::vector<char> normalized_generated_rut = observation.generated_rut_wire;
+    if (!normalize_date(normalized_nginx) || !normalize_date(normalized_generated_rut) ||
+        normalized_nginx != normalized_generated_rut) {
+        error =
+            "pinned nginx and converter-generated ordinary RUT exact /static wires differ "
+            "after Date-only normalization";
+        return false;
+    }
+    return true;
+}
+
 struct ExactStrictRouteSideObservation {
     std::vector<std::vector<char>> wires;
     std::vector<std::vector<char>> upstream_history;
@@ -6778,6 +7062,8 @@ int main(int argc, char** argv) {
         argc == 2 && strcmp(argv[1], "--exact-local-return-baseline") == 0;
     const bool strict_local_response_differential =
         argc == 3 && strcmp(argv[1], "--strict-local-response-differential") == 0;
+    const bool converter_exact_local_differential =
+        argc == 3 && strcmp(argv[1], "--converter-exact-local-differential") == 0;
     const bool exact_strict_route_differential =
         argc == 3 && strcmp(argv[1], "--exact-strict-route-differential") == 0;
     const bool late_successor_differential =
@@ -6796,12 +7082,14 @@ int main(int argc, char** argv) {
         (argc == 2 && argv[1][0] == '/') ||
         (argc == 4 && argv[1][0] == '/' && argv[2][0] == '/' && argv[3][0] == '/');
     if ((!nginx_gate_spike && !exact_local_return_baseline && !strict_local_response_differential &&
-         !exact_strict_route_differential && !rut_iouring_gate_spike &&
-         !rut_iouring_gate_identity_negative && !rut_iouring_gate_ready_mutation_negative &&
-         !rut_iouring_gate_owner_death_negative && !rut_iouring_gate_connect_journal_negative &&
-         !late_successor_differential && !normal_differential) ||
+         !converter_exact_local_differential && !exact_strict_route_differential &&
+         !rut_iouring_gate_spike && !rut_iouring_gate_identity_negative &&
+         !rut_iouring_gate_ready_mutation_negative && !rut_iouring_gate_owner_death_negative &&
+         !rut_iouring_gate_connect_journal_negative && !late_successor_differential &&
+         !normal_differential) ||
         (nginx_gate_spike && argv[2][0] != '/') ||
         (strict_local_response_differential && argv[2][0] != '/') ||
+        (converter_exact_local_differential && argv[2][0] != '/') ||
         (exact_strict_route_differential && argv[2][0] != '/') ||
         ((rut_iouring_gate_spike || rut_iouring_gate_identity_negative ||
           rut_iouring_gate_ready_mutation_negative || rut_iouring_gate_owner_death_negative ||
@@ -6815,6 +7103,8 @@ int main(int argc, char** argv) {
                      "<absolute-preload-helper>\n"
                      "   or: test_nginx_differential --exact-local-return-baseline\n"
                      "   or: test_nginx_differential --strict-local-response-differential "
+                     "<absolute-rut-executable>\n"
+                     "   or: test_nginx_differential --converter-exact-local-differential "
                      "<absolute-rut-executable>\n"
                      "   or: test_nginx_differential --exact-strict-route-differential "
                      "<absolute-rut-executable>\n"
@@ -7032,6 +7322,45 @@ int main(int argc, char** argv) {
                      "normalization, exact backend effects, and live no-extra windows "
                      "(generic capability only; not converter-generated; #286 remains)\n";
         if (exact_strict_route_differential) return 0;
+    }
+
+    if (converter_exact_local_differential || normal_differential) {
+        const char* source_suffix = strrchr(temp.path, '/');
+        source_suffix = source_suffix ? source_suffix + 1 : temp.path;
+        const std::string container_name =
+            "rut-nginx-converter-exact-local-" + std::to_string(getpid()) + "-" + source_suffix;
+        ConverterExactLocalDifferentialObservation observation;
+        std::string differential_error;
+        const char* rut_path = converter_exact_local_differential ? argv[2] : argv[1];
+        if (!run_converter_exact_local_differential(frontend_port,
+                                                    backend_port,
+                                                    temp,
+                                                    container_name,
+                                                    rut_path,
+                                                    observation,
+                                                    differential_error)) {
+            std::cerr << "FAIL [converter-generated exact /static differential]: "
+                      << differential_error << "\n";
+            dump_wire("pinned nginx converter exact /static", observation.nginx_wire);
+            dump_wire("converter-generated ordinary RUT exact /static",
+                      observation.generated_rut_wire);
+            std::cerr << "converter exact-local upstream nginx accepted="
+                      << observation.nginx_upstream_accepts
+                      << " requests=" << observation.nginx_upstream_requests
+                      << " generated-RUT accepted=" << observation.generated_rut_upstream_accepts
+                      << " requests=" << observation.generated_rut_upstream_requests << "\n";
+            dump_log(temp.nginx_config, "converter exact-local pinned nginx config");
+            dump_log(temp.source, "converter-generated ordinary RUT source");
+            dump_log(temp.nginx_log, "converter exact-local pinned nginx log");
+            dump_log(temp.rut_log, "converter-generated ordinary RUT log");
+            return 1;
+        }
+        std::cerr
+            << "PASS: nginx fragment parsed and lowered to converter-generated ordinary RUT; "
+               "its bounded exact /static GET matches pinned nginx after Date-only "
+               "normalization, explicit close/EOF, and independent live zero-upstream windows "
+               "(not direct nginx.conf runtime support or broader location semantics)\n";
+        if (converter_exact_local_differential) return 0;
     }
 
     if (nginx_gate_spike) {

@@ -407,6 +407,18 @@ if(RUT_ENABLE_JIT)
         SKIP_RETURN_CODE 77
     )
     add_test(
+        NAME test_nginx_converter_exact_local_differential
+        COMMAND test_nginx_differential --converter-exact-local-differential
+                $<TARGET_FILE:rut>
+    )
+    set_tests_properties(test_nginx_converter_exact_local_differential PROPERTIES
+        LABELS "integration;nginx;docker"
+        RUN_SERIAL TRUE
+        RESOURCE_LOCK nginx-differential
+        TIMEOUT 60
+        SKIP_RETURN_CODE 77
+    )
+    add_test(
         NAME test_nginx_exact_strict_route_differential
         COMMAND test_nginx_differential --exact-strict-route-differential
                 $<TARGET_FILE:rut>
