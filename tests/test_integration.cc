@@ -17716,6 +17716,63 @@ route GET "/static" {
     }
 };
 
+// Ordinary-source lifetime for #288-D2. Request 1 exercises the established
+// strict configured-failure forward path; request 2 is metadata-only exact
+// selection and therefore cannot manufacture a second JIT/upstream episode.
+struct PublicExactStrictCoalescedSuccessorSourceResources
+    : PublicResponseReadDeadlineSourceResources {
+    bool compile(u16 backend_port) {
+        std::string source =
+            "upstream backend at \"127.0.0.1:" + std::to_string(backend_port) + "\"\n";
+        source += R"rut(
+route GET "/buffered" {
+  return forward(backend,
+    request_policy: { version: "HTTP/1.1", host: "upstream", connection: "omit",
+      strip_headers: ["Connection", "Keep-Alive", "TE", "Expect", "Upgrade"] },
+    response_policy: { version: "HTTP/1.1", framing: "content_length",
+      connection: "request", head_mode: "reject", server: "nginx/1.29.7",
+      date: "current", hide_headers: ["Date", "Server"] },
+    failure_policy: { version: "HTTP/1.1", status: 502, reason: "Bad Gateway",
+      content_type: "text/html", server: "nginx/1.29.7", date: "current",
+      connection: "request", head_mode: "reject",
+      body: b"<html>\r\n<head><title>502 Bad Gateway</title></head>\r\n<body>\r\n<center><h1>502 Bad Gateway</h1></center>\r\n<hr><center>nginx/1.29.7</center>\r\n</body>\r\n</html>\r\n" },
+    timeout_failure_policy: { version: "HTTP/1.1", status: 504,
+      reason: "Gateway Time-out", content_type: "text/html",
+      server: "nginx/1.29.7", date: "current", connection: "request",
+      head_mode: "reject",
+      body: b"<html>\r\n<head><title>504 Gateway Time-out</title></head>\r\n<body>\r\n<center><h1>504 Gateway Time-out</h1></center>\r\n<hr><center>nginx/1.29.7</center>\r\n</body>\r\n</html>\r\n" },
+    response_read_timeout: 60s,
+    response_buffering: "complete_content_length")
+}
+
+route exact GET "/static" { return local_response({
+  version: "HTTP/1.1", status: 200, reason: "OK", server: "nginx/1.29.7",
+  date: "current", content_type: "text/plain", connection: "request",
+  head_mode: "suppress_body", body: b"successor-static"
+}) }
+)rut";
+
+        auto lexed = rut::lex({source.data(), static_cast<u32>(source.size())});
+        if (!lexed) return false;
+        auto ast = rut::parse_file(lexed.value());
+        if (!ast) return false;
+        std::unique_ptr<rut::AstFile> ast_owned(ast.value());
+        auto hir = rut::analyze_file(*ast_owned);
+        if (!hir) return false;
+        std::unique_ptr<rut::HirModule> hir_owned(hir.value());
+        auto mir = rut::build_mir(*hir_owned);
+        if (!mir) return false;
+        std::unique_ptr<rut::MirModule> mir_owned(mir.value());
+        if (!rut::lower_to_rir(*mir_owned, rir)) return false;
+        auto cg = rut::jit::codegen(rir.module);
+        if (!cg.ok || !engine.init()) return false;
+        engine_ready = true;
+        if (!engine.compile(cg.mod, cg.ctx)) return false;
+        if (!rut::populate_route_config(cfg, rir.module)) return false;
+        return rut::register_jit_routes(cfg, rir.module, engine);
+    }
+};
+
 // The raw-CQ runner mirrors IoUringEventLoop::run rather than adding a runtime
 // hook. This test-only C++ access shim lets that mirror invoke the exact private
 // deferred-accept phase at its production scheduler position.
@@ -26622,6 +26679,654 @@ TEST(route, ordinary_source_coalesced_strict_get_successor_iouring) {
     CHECK_EQ(runner.final_health.fails, 1u);
     CHECK_EQ(runner.final_health.eject_until_us, 0u);
     CHECK_FALSE(runner.final_health.active_down);
+}
+
+TEST(route, ordinary_source_coalesced_exact_strict_get_successor_iouring) {
+    using namespace rut;
+    if (!iouring_socket_live()) SKIP("io_uring async socket ops unavailable in this environment");
+
+    static constexpr char kRequestOne[] =
+        "GET /buffered?d2=one HTTP/1.1\r\n"
+        "Host: client.example\r\n"
+        "X-D2: one\r\n\r\n";
+    static constexpr char kRequestTwo[] =
+        "GET /static?d2=two HTTP/1.1\r\n"
+        "Host: client.example\r\n"
+        "Connection: close\r\n"
+        "X-D2: two\r\n\r\n";
+    static constexpr char kRequestWire[] =
+        "GET /buffered?d2=one HTTP/1.1\r\n"
+        "Host: client.example\r\n"
+        "X-D2: one\r\n\r\n"
+        "GET /static?d2=two HTTP/1.1\r\n"
+        "Host: client.example\r\n"
+        "Connection: close\r\n"
+        "X-D2: two\r\n\r\n";
+    static constexpr char kGatewayBody[] =
+        "<html>\r\n"
+        "<head><title>502 Bad Gateway</title></head>\r\n"
+        "<body>\r\n"
+        "<center><h1>502 Bad Gateway</h1></center>\r\n"
+        "<hr><center>nginx/1.29.7</center>\r\n"
+        "</body>\r\n"
+        "</html>\r\n";
+    static constexpr char kExpectedOne[] =
+        "HTTP/1.1 502 Bad Gateway\r\n"
+        "Server: nginx/1.29.7\r\n"
+        "Date: XXXXXXXXXXXXXXXXXXXXXXXXXXXXX\r\n"
+        "Content-Type: text/html\r\n"
+        "Content-Length: 157\r\n"
+        "Connection: keep-alive\r\n\r\n"
+        "<html>\r\n"
+        "<head><title>502 Bad Gateway</title></head>\r\n"
+        "<body>\r\n"
+        "<center><h1>502 Bad Gateway</h1></center>\r\n"
+        "<hr><center>nginx/1.29.7</center>\r\n"
+        "</body>\r\n"
+        "</html>\r\n";
+    static constexpr char kExpectedTwo[] =
+        "HTTP/1.1 200 OK\r\n"
+        "Server: nginx/1.29.7\r\n"
+        "Date: XXXXXXXXXXXXXXXXXXXXXXXXXXXXX\r\n"
+        "Content-Type: text/plain\r\n"
+        "Content-Length: 16\r\n"
+        "Connection: close\r\n\r\n"
+        "successor-static";
+    static_assert(sizeof(kGatewayBody) - 1u == 157u);
+    static_assert(sizeof("successor-static") - 1u == 16u);
+    static_assert(sizeof(kRequestWire) - 1u == sizeof(kRequestOne) - 1u + sizeof(kRequestTwo) - 1u);
+
+    DeadEndpoint dead;
+    REQUIRE(dead.reserve());
+    i32 accepts_connections = -1;
+    socklen_t accepts_connections_len = sizeof(accepts_connections);
+    REQUIRE_EQ(
+        getsockopt(
+            dead.fd, SOL_SOCKET, SO_ACCEPTCONN, &accepts_connections, &accepts_connections_len),
+        0);
+    REQUIRE_EQ(accepts_connections_len, sizeof(accepts_connections));
+    REQUIRE_EQ(accepts_connections, 0);
+
+    PublicExactStrictCoalescedSuccessorSourceResources resources;
+    REQUIRE(resources.compile(dead.port));
+    REQUIRE_EQ(resources.rir.module.func_count, 1u);
+    REQUIRE_EQ(resources.rir.module.upstream_count, 1u);
+    REQUIRE_EQ(resources.rir.module.exact_strict_local_response_binding_count, 1u);
+    REQUIRE_EQ(resources.cfg.route_count, 1u);
+    REQUIRE_EQ(resources.cfg.upstream_count, 1u);
+    REQUIRE_EQ(resources.cfg.exact_strict_local_response_binding_count, 1u);
+    REQUIRE(resources.cfg.strict_local_response_table_is_valid());
+    REQUIRE_EQ(
+        resources.cfg.match_exact_strict_local_response({"/static?d2=two", 14}, kRouteMethodGet),
+        1u);
+    REQUIRE_EQ(resources.cfg.match_exact_strict_local_response({"/static/", 8}, kRouteMethodGet),
+               0u);
+    const RouteEntry* forward = resources.cfg.match_canonical({"buffered", 8}, kRouteMethodGet);
+    REQUIRE(forward != nullptr);
+    REQUIRE_EQ(forward->action, RouteAction::JitHandler);
+    REQUIRE_EQ(forward->preflight_forward_policy_bundle_id, 1u);
+    REQUIRE_EQ(resources.cfg.policy_bundles[0].response_buffering,
+               ForwardResponseBufferingMode::CompleteContentLength);
+    REQUIRE_EQ(ntohl(resources.cfg.upstreams[0].addrs[0].sin_addr.s_addr), 0x7F000001u);
+    REQUIRE_EQ(ntohs(resources.cfg.upstreams[0].addrs[0].sin_port), dead.port);
+
+    Shard<IoUringEventLoop> shard;
+    struct ShardGuard {
+        Shard<IoUringEventLoop>& shard;
+        i32 listen_fd = -1;
+        bool initialized = false;
+        ~ShardGuard() {
+            if (initialized) {
+                if (shard.loop != nullptr) shard.loop->force_close_all();
+                shard.shutdown();
+            }
+            if (listen_fd >= 0) close(listen_fd);
+        }
+    } shard_guard{shard, create_listen_socket(0).value_or(-1)};
+    REQUIRE_GE(shard_guard.listen_fd, 0);
+    const u16 port = get_port(shard_guard.listen_fd);
+    REQUIRE(shard.init(0, shard_guard.listen_fd).has_value());
+    shard_guard.initialized = true;
+    shard.route_config = &resources.cfg;
+    shard.active_config = shard.route_config;
+    REQUIRE(shard.loop != nullptr);
+    REQUIRE(shard.init_access_log().has_value());
+    CaptureRing* capture_ring = shard.enable_capture();
+    REQUIRE(capture_ring != nullptr);
+
+    struct PreDispatchAndExactStageRunner {
+        Shard<IoUringEventLoop>& shard;
+        pthread_t thread{};
+        bool started = false;
+        std::atomic<bool> entered{false};
+        std::atomic<bool> ingress_checked{false};
+        std::atomic<bool> ingress_release{false};
+        std::atomic<bool> exact_staged{false};
+        std::atomic<bool> exact_release{false};
+        std::atomic<bool> exited{false};
+
+        bool full_batch_witness = false;
+        bool absent_ingress_witness = false;
+        u32 conn_id = UINT32_MAX;
+        u32 target_recv_events = 0;
+        u32 target_recv_bytes = 0;
+        bool ingress_neutral = false;
+        u32 connect_event_count = 0;
+        u32 negative_connect_count = 0;
+        i32 connect_result = 0;
+        u64 connect_episode = 0;
+
+        bool exact_depth_generation = false;
+        bool exact_provenance_consumed = false;
+        bool exact_request = false;
+        bool exact_r1_settled_r2_active = false;
+        bool exact_boundary_neutral = false;
+        bool exact_upstream_neutral = false;
+        bool exact_only_send_armed = false;
+        bool exact_sq_identity = false;
+        bool exact_no_connect_sqe = false;
+        u32 exact_connect_sqe_count = UINT32_MAX;
+        u32 exact_target_send_sqe_count = 0;
+        u32 exact_stage_generation = 0;
+        u32 exact_stage_handler_generation = 0;
+        u32 exact_stage_upstream_attempts = 0;
+        u32 exact_stage_upstream_episode = 0;
+        u32 exact_stage_upstream_retiring_episode = 0;
+        u32 exact_stage_pending_ops = 0;
+        u64 exact_stage_req_start_us = 0;
+        bool exact_stage_epoch_held = false;
+        u64 exact_stage_requests_total = 0;
+        u64 exact_stage_requests_active = 0;
+        u64 exact_stage_latency_count = 0;
+        u64 exact_stage_epoch = 0;
+        u32 exact_stage_wire_len = 0;
+        char exact_stage_wire[512]{};
+        BackendHealth final_health{};
+
+        static void* run(void* arg) {
+            auto* self = static_cast<PreDispatchAndExactStageRunner*>(arg);
+            auto* loop = self->shard.loop;
+            reset_backend_health();
+            loop->backend.add_accept();
+            loop->fire_due_timers();
+            loop->arm_health_on_config_change();
+            self->entered.store(true, std::memory_order_release);
+            IoEvent events[kMaxEventsPerWait];
+
+            while (loop->is_running()) {
+                loop->retry_strict_upstream_retirement_cancels();
+                const u32 n = loop->backend.wait(
+                    events, kMaxEventsPerWait, loop->conns, IoUringEventLoop::kMaxConns);
+                if (loop->backend.failure_code() != 0) {
+                    loop->stop();
+                    break;
+                }
+
+                if (!self->ingress_checked.load(std::memory_order_acquire)) {
+                    u32 candidate = UINT32_MAX;
+                    for (u32 i = 0; i < n; i++) {
+                        const IoEvent& event = events[i];
+                        if (event.type != IoEventType::Recv || event.result <= 0 ||
+                            event.aux != 0 || event.upstream_episode != 0)
+                            continue;
+                        if (candidate == UINT32_MAX) candidate = event.conn_id;
+                        if (event.conn_id == candidate) {
+                            self->target_recv_events++;
+                            self->target_recv_bytes += static_cast<u32>(event.result);
+                        }
+                    }
+                    if (candidate != UINT32_MAX) {
+                        self->conn_id = candidate;
+                        const Connection& conn = loop->conns[candidate];
+                        self->full_batch_witness =
+                            conn.recv_buf.len() == sizeof(kRequestWire) - 1u &&
+                            memcmp(conn.recv_buf.data(), kRequestWire, sizeof(kRequestWire) - 1u) ==
+                                0;
+                        self->absent_ingress_witness = !self->full_batch_witness;
+                        self->ingress_neutral =
+                            conn.fd >= 0 && conn.state == ConnState::ReadingHeader &&
+                            conn.pipeline_depth == 0 && conn.pipeline_stash_len == 0 &&
+                            conn.req_start_us == 0 && conn.request_config == nullptr &&
+                            conn.req_size == 0 && conn.req_header_end == 0 &&
+                            conn.req_initial_send_len == 0 && conn.req_path[0] == '\0' &&
+                            conn.req_path_canon.ptr == nullptr && conn.upstream_fd < 0 &&
+                            !conn.upstream_connect_armed && !conn.send_armed &&
+                            conn.send_buf.len() == 0 && conn.response_header_buf.len() == 0 &&
+                            self->shard.shard_metrics.requests_total == 0 &&
+                            self->shard.shard_metrics.requests_active == 0 &&
+                            self->shard.shard_metrics.request_latency.count == 0 &&
+                            self->shard.epoch.epoch.load(std::memory_order_acquire) == 0 &&
+                            loop->deferred_accept_count == 0 && !loop->is_draining();
+                        self->ingress_checked.store(true, std::memory_order_release);
+                        while (!self->ingress_release.load(std::memory_order_acquire) &&
+                               loop->is_running())
+                            sched_yield();
+                        if (!self->full_batch_witness) {
+                            loop->stop();
+                            break;
+                        }
+                    }
+                }
+
+                for (u32 i = 0; i < n; i++) {
+                    const IoEvent& event = events[i];
+                    if (event.type != IoEventType::UpstreamConnect ||
+                        event.conn_id != self->conn_id)
+                        continue;
+                    self->connect_event_count++;
+                    self->connect_result = event.result;
+                    self->connect_episode = event.upstream_episode;
+                    if (event.result < 0) self->negative_connect_count++;
+                }
+
+                loop->dispatch_batch(events, n);
+                (loop->*validated_failure_private_member(
+                            ValidatedFailureRetryDeferredAcceptsTag{}))();
+                loop->poll_command();
+                loop->fire_due_timers();
+                loop->arm_health_on_config_change();
+
+                if (!self->exact_staged.load(std::memory_order_relaxed) &&
+                    self->conn_id != UINT32_MAX) {
+                    const Connection& conn = loop->conns[self->conn_id];
+                    if (conn.fd >= 0 && conn.state == ConnState::Sending && conn.send_armed &&
+                        conn.resp_status == 200) {
+                        self->exact_stage_generation = conn.http1_pipeline_request_generation;
+                        self->exact_stage_handler_generation = conn.handler_gen;
+                        self->exact_stage_upstream_attempts = conn.upstream_attempts;
+                        self->exact_stage_upstream_episode = conn.upstream_episode;
+                        self->exact_stage_upstream_retiring_episode =
+                            conn.upstream_retiring_episode;
+                        self->exact_stage_pending_ops = conn.pending_ops;
+                        self->exact_stage_req_start_us = conn.req_start_us;
+                        self->exact_stage_epoch_held = conn.epoch_held;
+                        self->exact_stage_requests_total = self->shard.shard_metrics.requests_total;
+                        self->exact_stage_requests_active =
+                            self->shard.shard_metrics.requests_active;
+                        self->exact_stage_latency_count =
+                            self->shard.shard_metrics.request_latency.count;
+                        self->exact_stage_epoch =
+                            self->shard.epoch.epoch.load(std::memory_order_acquire);
+                        self->exact_depth_generation =
+                            conn.pipeline_depth == 1 &&
+                            conn.http1_pipeline_request_generation != 0 &&
+                            conn.http1_pipeline_request_generation == conn.handler_gen;
+                        self->exact_provenance_consumed =
+                            !conn.http1_pipeline_boundary_owners_settled;
+                        self->exact_request =
+                            conn.protocol == ConnProtocol::Http11 && !conn.tls_active &&
+                            conn.req_strict_h1_complete && !conn.req_malformed &&
+                            conn.req_http_version == static_cast<u8>(HttpVersion::Http11) &&
+                            conn.req_method == static_cast<u8>(LogHttpMethod::Get) &&
+                            strcmp(conn.req_path, "/static?d2=two") == 0 &&
+                            conn.req_path_canon.eq({"static", 6}) &&
+                            !conn.req_target_has_fragment && !conn.req_client_has_content_length &&
+                            !conn.req_client_has_transfer_encoding && !conn.req_client_has_te &&
+                            !conn.req_client_has_expect && !conn.req_client_has_upgrade_header &&
+                            conn.req_body_mode == BodyMode::None && conn.req_content_length == 0 &&
+                            conn.req_body_remaining == 0 &&
+                            conn.req_header_end == sizeof(kRequestTwo) - 1u &&
+                            conn.req_initial_send_len == sizeof(kRequestTwo) - 1u &&
+                            conn.recv_buf.len() == sizeof(kRequestTwo) - 1u &&
+                            !conn.req_keep_alive && !conn.req_client_keep_alive &&
+                            conn.req_client_connection_close &&
+                            conn.req_client_connection_close_exact &&
+                            conn.req_client_connection_count == 1;
+                        self->exact_r1_settled_r2_active =
+                            self->connect_event_count == 1 && self->negative_connect_count == 1 &&
+                            self->connect_result < 0 && self->connect_episode != 0 &&
+                            conn.req_start_us != 0 && !conn.epoch_held &&
+                            self->shard.shard_metrics.requests_total == 1 &&
+                            self->shard.shard_metrics.requests_active == 1 &&
+                            self->shard.shard_metrics.request_latency.count == 1 &&
+                            self->shard.epoch.epoch.load(std::memory_order_acquire) == 3;
+                        self->exact_boundary_neutral =
+                            conn.pipeline_stash_len == 0 && !conn.http1_boundary_deferred &&
+                            !conn.http1_boundary_ready &&
+                            conn.http1_boundary_successor_episode == 0 &&
+                            conn.http1_prebuilt_wait == 0 &&
+                            conn.http1_prebuilt_disposition ==
+                                Http1RequestBufferDisposition::None &&
+                            conn.http1_prebuilt_request_prefix_len == 0 &&
+                            conn.http1_prebuilt_response_proof_is_neutral() &&
+                            conn.response_read_deadline_owner_is_neutral();
+                        const auto& upstream_send =
+                            loop->backend.upstream_send_state[self->conn_id];
+                        self->exact_upstream_neutral =
+                            conn.upstream_fd < 0 && !conn.upstream_reused &&
+                            !conn.upstream_connect_armed && !conn.upstream_send_armed &&
+                            !conn.upstream_recv_armed && !conn.upstream_recv_paused_for_send &&
+                            !conn.upstream_recv_pause_cancel_pending &&
+                            !conn.upstream_recv_pause_rearm_pending &&
+                            !conn.upstream_recv_cancel_inflight &&
+                            !conn.upstream_retirement_active &&
+                            conn.upstream_retirement_target_owned == 0 &&
+                            conn.upstream_retirement_cancel_owned == 0 &&
+                            conn.upstream_retirement_cancel_retry == 0 &&
+                            conn.upstream_close_episode == 0 &&
+                            conn.upstream_close_target_owned == 0 &&
+                            conn.upstream_close_cancel_owned == 0 &&
+                            !conn.upstream_close_pause_cancel_owned && !conn.upstream_slot_held &&
+                            conn.idle_return_fd < 0 && conn.idle_return_config == nullptr &&
+                            !conn.close_after_idle_return && conn.upstream_recv_buf.len() == 0 &&
+                            !conn.h2_proxy_recv_draining && !conn.h2_proxy_synth_quarantined &&
+                            !conn.upstream_episode_quarantined &&
+                            http1_pipeline_successor_tombstone_is_safe(conn) &&
+                            conn.retry_req_send_len == 0 && conn.on_upstream_recv == nullptr &&
+                            conn.on_upstream_send == nullptr && upstream_send.src == nullptr &&
+                            upstream_send.fd == -1 && upstream_send.offset == 0 &&
+                            upstream_send.remaining == 0 &&
+                            upstream_send.type == IoEventType::UpstreamSend &&
+                            upstream_send.upstream_episode == 0 && upstream_send.generation == 0;
+
+                        u32 armed_sends = 0;
+                        for (u32 id = 0; id < IoUringEventLoop::kMaxConns; id++)
+                            armed_sends += loop->conns[id].send_armed ? 1u : 0u;
+                        const auto& send = loop->backend.send_state[self->conn_id];
+                        self->exact_only_send_armed =
+                            armed_sends == 1 && send.fd == conn.fd &&
+                            send.src == conn.send_buf.data() && send.offset == 0 &&
+                            send.remaining == conn.send_buf.len() &&
+                            send.type == IoEventType::Send && send.upstream_episode == 0 &&
+                            send.generation == 0;
+
+                        const u32 sq_head =
+                            __atomic_load_n(loop->backend.sq_head, __ATOMIC_ACQUIRE);
+                        const u32 sq_tail =
+                            __atomic_load_n(loop->backend.sq_tail, __ATOMIC_ACQUIRE);
+                        self->exact_connect_sqe_count = 0;
+                        self->exact_target_send_sqe_count = 0;
+                        bool sq_valid = sq_tail - sq_head <= loop->backend.sq_ring_entries &&
+                                        loop->backend.sq_ring_mask != nullptr;
+                        if (sq_valid) {
+                            const u32 mask = *loop->backend.sq_ring_mask;
+                            for (u32 cursor = sq_head; cursor != sq_tail; cursor++) {
+                                const u32 sqe_index = loop->backend.sq_array[cursor & mask];
+                                if (sqe_index >= loop->backend.sq_ring_entries) {
+                                    sq_valid = false;
+                                    break;
+                                }
+                                const io_uring_sqe& sqe = loop->backend.sq_entries[sqe_index];
+                                if (sqe.opcode == IORING_OP_CONNECT)
+                                    self->exact_connect_sqe_count++;
+                                if (sqe.opcode == IORING_OP_SEND && sqe.fd == conn.fd) {
+                                    self->exact_target_send_sqe_count++;
+                                    const u64 user_data = sqe.user_data;
+                                    self->exact_sq_identity =
+                                        static_cast<IoEventType>(user_data & 0xFFu) ==
+                                            IoEventType::Send &&
+                                        static_cast<u32>((user_data >> 8) & 0xFFFFFFu) ==
+                                            self->conn_id &&
+                                        static_cast<u32>(user_data >> 32) == 0 &&
+                                        sqe.addr == reinterpret_cast<u64>(send.src) &&
+                                        sqe.len == send.remaining;
+                                }
+                            }
+                        }
+                        self->exact_no_connect_sqe = sq_valid &&
+                                                     self->exact_connect_sqe_count == 0 &&
+                                                     self->exact_target_send_sqe_count == 1;
+                        self->exact_stage_wire_len = conn.send_buf.len();
+                        if (self->exact_stage_wire_len <= sizeof(self->exact_stage_wire))
+                            memcpy(self->exact_stage_wire,
+                                   conn.send_buf.data(),
+                                   self->exact_stage_wire_len);
+                        else
+                            self->exact_stage_wire_len = 0;
+                        self->exact_staged.store(true, std::memory_order_release);
+                        while (!self->exact_release.load(std::memory_order_acquire) &&
+                               loop->is_running())
+                            sched_yield();
+                    }
+                }
+            }
+            const BackendHealth* health = backend_health(0, 0);
+            if (health != nullptr) self->final_health = *health;
+            self->exited.store(true, std::memory_order_release);
+            return nullptr;
+        }
+
+        bool start() {
+            const i32 rc = pthread_create(&thread, nullptr, run, this);
+            started = rc == 0;
+            return started;
+        }
+        void join() {
+            if (!started) return;
+            pthread_join(thread, nullptr);
+            started = false;
+        }
+        ~PreDispatchAndExactStageRunner() {
+            ingress_release.store(true, std::memory_order_release);
+            exact_release.store(true, std::memory_order_release);
+            if (started) {
+                shard.stop();
+                join();
+            }
+        }
+    } runner{shard};
+
+    struct ClientGuard {
+        i32 fd = -1;
+        ~ClientGuard() {
+            if (fd >= 0) close(fd);
+        }
+    } client{connect_to(port)};
+    REQUIRE_GE(client.fd, 0);
+    set_socket_timeouts(client.fd, 8);
+    REQUIRE_EQ(send(client.fd, kRequestWire, sizeof(kRequestWire) - 1u, MSG_NOSIGNAL),
+               static_cast<ssize_t>(sizeof(kRequestWire) - 1u));
+    REQUIRE(runner.start());
+
+    const i64 ingress_deadline_ms = test_mono_ms() + 5000;
+    while (!runner.ingress_checked.load(std::memory_order_acquire) &&
+           test_mono_ms() < ingress_deadline_ms)
+        sched_yield();
+    REQUIRE(runner.ingress_checked.load(std::memory_order_acquire));
+    if (runner.absent_ingress_witness) {
+        fprintf(stderr,
+                "#288-D2 missing pre-dispatch witness: recv-events=%u recv-bytes=%u expected=%zu\n",
+                runner.target_recv_events,
+                runner.target_recv_bytes,
+                sizeof(kRequestWire) - 1u);
+        runner.ingress_release.store(true, std::memory_order_release);
+        runner.join();
+        REQUIRE_FALSE(runner.absent_ingress_witness);
+    }
+    REQUIRE(runner.full_batch_witness);
+    REQUIRE(runner.ingress_neutral);
+    REQUIRE_EQ(runner.target_recv_bytes, sizeof(kRequestWire) - 1u);
+    REQUIRE_GE(runner.target_recv_events, 1u);
+    REQUIRE_LT(runner.conn_id, IoUringEventLoop::kMaxConns);
+    runner.ingress_release.store(true, std::memory_order_release);
+
+    const i64 stage_deadline_ms = test_mono_ms() + 5000;
+    while (!runner.exact_staged.load(std::memory_order_acquire) &&
+           !runner.exited.load(std::memory_order_acquire) && test_mono_ms() < stage_deadline_ms)
+        sched_yield();
+    REQUIRE(runner.exact_staged.load(std::memory_order_acquire));
+    REQUIRE(runner.exact_depth_generation);
+    REQUIRE(runner.exact_provenance_consumed);
+    REQUIRE(runner.exact_request);
+    if (!runner.exact_r1_settled_r2_active)
+        fprintf(stderr,
+                "#288-D2 R1/R2 stage: connects=%u negative=%u result=%d episode=%llu "
+                "req-start=%llu epoch-held=%d requests=%llu active=%llu latency=%llu epoch=%llu\n",
+                runner.connect_event_count,
+                runner.negative_connect_count,
+                runner.connect_result,
+                static_cast<unsigned long long>(runner.connect_episode),
+                static_cast<unsigned long long>(runner.exact_stage_req_start_us),
+                runner.exact_stage_epoch_held ? 1 : 0,
+                static_cast<unsigned long long>(runner.exact_stage_requests_total),
+                static_cast<unsigned long long>(runner.exact_stage_requests_active),
+                static_cast<unsigned long long>(runner.exact_stage_latency_count),
+                static_cast<unsigned long long>(runner.exact_stage_epoch));
+    REQUIRE(runner.exact_r1_settled_r2_active);
+    REQUIRE(runner.exact_boundary_neutral);
+    REQUIRE(runner.exact_upstream_neutral);
+    REQUIRE(runner.exact_only_send_armed);
+    REQUIRE(runner.exact_sq_identity);
+    REQUIRE(runner.exact_no_connect_sqe);
+    REQUIRE_EQ(runner.connect_event_count, 1u);
+    REQUIRE_EQ(runner.negative_connect_count, 1u);
+    REQUIRE_LT(runner.connect_result, 0);
+    REQUIRE_NE(runner.connect_episode, 0u);
+    REQUIRE_EQ(runner.exact_connect_sqe_count, 0u);
+    REQUIRE_EQ(runner.exact_target_send_sqe_count, 1u);
+    REQUIRE_EQ(runner.exact_stage_generation, runner.exact_stage_handler_generation);
+    REQUIRE_NE(runner.exact_stage_generation, 0u);
+    REQUIRE_EQ(runner.exact_stage_upstream_attempts, 1u);
+    REQUIRE_EQ(runner.exact_stage_upstream_retiring_episode, runner.connect_episode);
+    REQUIRE(valid_upstream_episode(runner.exact_stage_upstream_retiring_episode));
+    REQUIRE(valid_upstream_episode(runner.exact_stage_upstream_episode));
+    REQUIRE_GT(runner.exact_stage_upstream_episode, runner.exact_stage_upstream_retiring_episode);
+    REQUIRE_EQ(runner.exact_stage_upstream_episode,
+               runner.exact_stage_upstream_retiring_episode + 1u);
+    REQUIRE_GE(runner.exact_stage_pending_ops, 1u);
+    REQUIRE_EQ(runner.exact_stage_wire_len, sizeof(kExpectedTwo) - 1u);
+    REQUIRE(normalize_public_date(runner.exact_stage_wire, runner.exact_stage_wire_len));
+    REQUIRE_EQ(memcmp(runner.exact_stage_wire, kExpectedTwo, runner.exact_stage_wire_len), 0);
+    runner.exact_release.store(true, std::memory_order_release);
+
+    char wire[sizeof(kExpectedOne) + sizeof(kExpectedTwo) + 32]{};
+    const u32 expected_wire_len = sizeof(kExpectedOne) - 1u + sizeof(kExpectedTwo) - 1u;
+    u32 wire_len = 0;
+    const i64 wire_deadline_ms = test_mono_ms() + 5000;
+    while (wire_len < expected_wire_len && test_mono_ms() < wire_deadline_ms) {
+        const i64 remaining_ms = wire_deadline_ms - test_mono_ms();
+        if (remaining_ms <= 0) break;
+        const i32 got = recv_timeout(
+            client.fd, wire + wire_len, sizeof(wire) - wire_len, static_cast<i32>(remaining_ms));
+        REQUIRE_GT(got, 0);
+        wire_len += static_cast<u32>(got);
+        REQUIRE_LE(wire_len, expected_wire_len);
+    }
+    REQUIRE_EQ(wire_len, expected_wire_len);
+    REQUIRE(normalize_public_date(wire, sizeof(kExpectedOne) - 1u));
+    REQUIRE(normalize_public_date(wire + sizeof(kExpectedOne) - 1u, sizeof(kExpectedTwo) - 1u));
+    REQUIRE_EQ(memcmp(wire, kExpectedOne, sizeof(kExpectedOne) - 1u), 0);
+    REQUIRE_EQ(memcmp(wire + sizeof(kExpectedOne) - 1u, kExpectedTwo, sizeof(kExpectedTwo) - 1u),
+               0);
+    char eof_probe[32];
+    REQUIRE_EQ(recv_timeout(client.fd, eof_probe, sizeof(eof_probe), 3000), 0);
+    REQUIRE(shard.loop->is_running());
+    REQUIRE_EQ(shard.backend_failure_code(), 0);
+
+    // Leave every production owner live briefly so a delayed request 3,
+    // Connect, health mutation, or response effect is observable before join.
+    usleep(100000);
+    accepts_connections = -1;
+    accepts_connections_len = sizeof(accepts_connections);
+    REQUIRE_EQ(
+        getsockopt(
+            dead.fd, SOL_SOCKET, SO_ACCEPTCONN, &accepts_connections, &accepts_connections_len),
+        0);
+    REQUIRE_EQ(accepts_connections, 0);
+    REQUIRE_EQ(close(client.fd), 0);
+    client.fd = -1;
+    shard.stop();
+    runner.join();
+    REQUIRE(runner.exited.load(std::memory_order_acquire));
+    const Connection& final_conn = shard.loop->conns[runner.conn_id];
+    const u32 final_upstream_episode = final_conn.upstream_episode;
+    const u32 final_upstream_retiring_episode = final_conn.upstream_retiring_episode;
+    CHECK_EQ(final_upstream_episode, runner.exact_stage_upstream_episode);
+    CHECK_EQ(final_upstream_retiring_episode, runner.exact_stage_upstream_retiring_episode);
+
+    CHECK_EQ(shard.backend_failure_code(), 0);
+    CHECK_FALSE(shard.loop->is_running());
+    CHECK_EQ(runner.connect_event_count, 1u);
+    CHECK_EQ(runner.negative_connect_count, 1u);
+    CHECK_EQ(runner.final_health.fails, 1u);
+    CHECK_EQ(runner.final_health.eject_until_us, 0u);
+    CHECK_FALSE(runner.final_health.active_down);
+    CHECK_EQ(shard.shard_metrics.connections_total, 1u);
+    CHECK_EQ(shard.shard_metrics.connections_active, 0u);
+    CHECK_EQ(shard.shard_metrics.connections_closed, 1u);
+    CHECK_EQ(shard.shard_metrics.requests_total, 2u);
+    CHECK_EQ(shard.shard_metrics.requests_active, 0u);
+    CHECK_EQ(shard.shard_metrics.request_latency.count, 2u);
+    const u64 final_epoch = shard.epoch.epoch.load(std::memory_order_acquire);
+    CHECK_EQ(final_epoch, 4u);
+    CHECK_EQ(final_epoch % 2u, 0u);
+    CHECK_EQ(shard.loop->active_count(), 0u);
+    CHECK_EQ(shard.loop->pending_free_count, 0u);
+    CHECK_EQ(shard.loop->pool.in_use(), 0u);
+    CHECK_EQ(shard.upstream->idle_count.load(std::memory_order_acquire), 0u);
+    CHECK_EQ(shard.upstream->free_top, UpstreamPool::kMaxConns);
+
+    REQUIRE_EQ(shard.log_ring->available(), 2u);
+    AccessLogEntry access_one{};
+    AccessLogEntry access_two{};
+    REQUIRE(shard.log_ring->pop(access_one));
+    REQUIRE(shard.log_ring->pop(access_two));
+    CHECK_EQ(access_one.status, 502u);
+    CHECK_EQ(access_two.status, 200u);
+    CHECK_EQ(access_one.method, static_cast<u8>(LogHttpMethod::Get));
+    CHECK_EQ(access_two.method, static_cast<u8>(LogHttpMethod::Get));
+    CHECK_EQ(strcmp(access_one.path, "/buffered?d2=one"), 0);
+    CHECK_EQ(strcmp(access_two.path, "/static?d2=two"), 0);
+    CHECK_EQ(access_one.resp_size, sizeof(kExpectedOne) - 1u);
+    CHECK_EQ(access_two.resp_size, sizeof(kExpectedTwo) - 1u);
+    CHECK_EQ(strcmp(access_one.upstream, "backend"), 0);
+    CHECK_EQ(access_two.upstream[0], '\0');
+    AccessLogEntry no_access{};
+    CHECK_FALSE(shard.log_ring->pop(no_access));
+
+    REQUIRE_EQ(capture_ring->available(), 2u);
+    CaptureEntry capture_one{};
+    CaptureEntry capture_two{};
+    REQUIRE(capture_ring->pop(capture_one));
+    REQUIRE(capture_ring->pop(capture_two));
+    CHECK_EQ(capture_one.resp_status, 502u);
+    CHECK_EQ(capture_two.resp_status, 200u);
+    CHECK_EQ(capture_one.req_content_length, 0u);
+    CHECK_EQ(capture_two.req_content_length, 0u);
+    CHECK_EQ(capture_one.resp_content_length, sizeof(kExpectedOne) - 1u);
+    CHECK_EQ(capture_two.resp_content_length, sizeof(kExpectedTwo) - 1u);
+    REQUIRE_EQ(capture_one.raw_header_len, sizeof(kRequestOne) - 1u);
+    REQUIRE_EQ(capture_two.raw_header_len, sizeof(kRequestTwo) - 1u);
+    CHECK_EQ(memcmp(capture_one.raw_headers, kRequestOne, sizeof(kRequestOne) - 1u), 0);
+    CHECK_EQ(memcmp(capture_two.raw_headers, kRequestTwo, sizeof(kRequestTwo) - 1u), 0);
+    CHECK_EQ(strcmp(capture_one.upstream_name, "backend"), 0);
+    CHECK_EQ(capture_two.upstream_name[0], '\0');
+    CaptureEntry no_capture{};
+    CHECK_FALSE(capture_ring->pop(no_capture));
+
+    REQUIRE_LT(runner.conn_id, IoUringEventLoop::kMaxConns);
+    const Connection& settled = shard.loop->conns[runner.conn_id];
+    CHECK_EQ(settled.fd, -1);
+    CHECK_EQ(settled.upstream_fd, -1);
+    CHECK_EQ(settled.pending_ops, 0u);
+    CHECK_FALSE(settled.upstream_connect_armed);
+    CHECK_FALSE(settled.upstream_send_armed);
+    CHECK_FALSE(settled.upstream_recv_armed);
+    CHECK_FALSE(settled.upstream_retirement_active);
+    CHECK_EQ(settled.upstream_retirement_target_owned, 0u);
+    CHECK_EQ(settled.upstream_retirement_cancel_owned, 0u);
+    CHECK_EQ(settled.upstream_close_target_owned, 0u);
+    CHECK_EQ(settled.upstream_close_cancel_owned, 0u);
+    CHECK_FALSE(settled.upstream_slot_held);
+    CHECK_EQ(settled.pipeline_depth, 0u);
+    CHECK_EQ(settled.pipeline_stash_len, 0u);
+    CHECK_EQ(settled.http1_pipeline_request_generation, 0u);
+    CHECK_FALSE(settled.http1_pipeline_boundary_owners_settled);
+    CHECK_FALSE(settled.http1_boundary_deferred);
+    CHECK_FALSE(settled.http1_boundary_ready);
+    CHECK_EQ(settled.http1_boundary_successor_episode, 0u);
+    CHECK_EQ(settled.http1_prebuilt_wait, 0u);
+    CHECK_EQ(settled.http1_prebuilt_disposition, Http1RequestBufferDisposition::None);
+    CHECK_EQ(settled.http1_prebuilt_request_prefix_len, 0u);
+    CHECK_EQ(settled.recv_buf.len(), 0u);
+    CHECK_EQ(settled.send_buf.len(), 0u);
+    CHECK(settled.response_read_deadline_owner_is_neutral());
+    CHECK(settled.http1_prebuilt_response_proof_is_neutral());
+    const auto& settled_send = shard.loop->backend.send_state[runner.conn_id];
+    const auto& settled_upstream_send = shard.loop->backend.upstream_send_state[runner.conn_id];
+    CHECK_EQ(settled_send.remaining, 0u);
+    CHECK_EQ(settled_upstream_send.remaining, 0u);
+    CHECK_EQ(settled_upstream_send.upstream_episode, 0u);
 }
 
 TEST(
