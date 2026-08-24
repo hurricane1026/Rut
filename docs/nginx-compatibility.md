@@ -72,6 +72,12 @@ Allowed states are `SUPPORTED`, `PARTIAL`, `BLOCKED_BY_RUT`,
 - Complete response buffering currently admits downstream HTTP/1.1 only. The
   accepted nginx configuration syntax does not exclude HTTP/1.0 clients, so the
   omitted-buffering row remains blocked for that version domain as well.
+- Pipelined validated-failure support has three distinct RUT gaps. #276 owns
+  successor bytes that arrive after request 1 is admitted but before its 502 Send
+  completes. #277 owns request1+request2 already coalesced before strict-policy
+  admission. #278 owns strict-policy admission/execution after a preserved
+  successor is dispatched with nonzero pipeline depth. The bounded `SUPPORTED`
+  GET row is explicitly sequential and claims none of these cases.
 - The post-#273 audit identified an exact-HEAD streaming, exact-bodyless-GET
   complete-buffering, method-omitted streaming split. Its first lowering attempt
   compiled correctly but exposed two generic runtime gaps: an initially complete
