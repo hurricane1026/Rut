@@ -23509,6 +23509,269 @@ TEST(
 
 TEST(
     route,
+    public_ordinary_source_complete_content_length_buffering_unavailable_upstream_selects_default_502_twice_iouring) {
+    using namespace rut;
+    if (!iouring_socket_live()) SKIP("io_uring async socket ops unavailable in this environment");
+
+    static constexpr char kExpectedKeepAlive[] =
+        "HTTP/1.1 502 Origin Failed\r\n"
+        "Server: buffered-test\r\n"
+        "Date: XXXXXXXXXXXXXXXXXXXXXXXXXXXXX\r\n"
+        "Content-Type: text/plain\r\n"
+        "Content-Length: 16\r\n"
+        "Connection: keep-alive\r\n\r\n"
+        "default failure\n";
+    static constexpr char kExpectedClose[] =
+        "HTTP/1.1 502 Origin Failed\r\n"
+        "Server: buffered-test\r\n"
+        "Date: XXXXXXXXXXXXXXXXXXXXXXXXXXXXX\r\n"
+        "Content-Type: text/plain\r\n"
+        "Content-Length: 16\r\n"
+        "Connection: close\r\n\r\n"
+        "default failure\n";
+    static_assert(sizeof("default failure\n") - 1u == 16u);
+
+    // Keep a real loopback port bound but non-listening for the entire wire.
+    // The kernel must complete each production connect with an error; there is
+    // no fixture accept or request path that could fabricate the response.
+    DeadEndpoint dead;
+    REQUIRE(dead.reserve());
+    i32 accepts_connections = -1;
+    socklen_t accepts_connections_len = sizeof(accepts_connections);
+    REQUIRE_EQ(
+        getsockopt(
+            dead.fd, SOL_SOCKET, SO_ACCEPTCONN, &accepts_connections, &accepts_connections_len),
+        0);
+    REQUIRE_EQ(accepts_connections_len, sizeof(accepts_connections));
+    REQUIRE_EQ(accepts_connections, 0);
+
+    PublicGetCompleteContentLengthBufferingFixedRequestPolicySourceResources resources;
+    REQUIRE(resources.compile(dead.port));
+    REQUIRE_EQ(resources.rir.module.upstream_count, 1u);
+    REQUIRE(resources.rir.module.upstreams[0].has_address);
+    CHECK_EQ(resources.rir.module.upstreams[0].ip, 0x7F000001u);
+    CHECK_EQ(resources.rir.module.upstreams[0].port, dead.port);
+    REQUIRE_EQ(resources.rir.module.func_count, 1u);
+    const auto& function = resources.rir.module.functions[0];
+    CHECK_EQ(function.http_method, kRouteMethodGet);
+    CHECK_EQ(function.preflight_forward_policy_bundle_id, 1u);
+    REQUIRE_EQ(resources.rir.module.response_policy_count, 1u);
+    REQUIRE_EQ(resources.rir.module.failure_policy_count, 2u);
+    REQUIRE_EQ(resources.rir.module.policy_bundle_count, 1u);
+    const auto& rir_bundle = resources.rir.module.policy_bundles[0];
+    CHECK_EQ(rir_bundle.response_policy_id, 1u);
+    CHECK_EQ(rir_bundle.failure_policy_id, 1u);
+    CHECK_EQ(rir_bundle.timeout_failure_policy_id, 2u);
+    CHECK_EQ(rir_bundle.response_read_timeout_seconds, 1u);
+    CHECK_EQ(rir_bundle.response_buffering, ForwardResponseBufferingMode::CompleteContentLength);
+
+    auto const_i32_value = [](const rir::Block& block, rir::ValueId id) -> i32 {
+        for (u32 i = 0; i < block.inst_count; i++) {
+            if (block.insts[i].result == id && block.insts[i].op == rir::Opcode::ConstI32)
+                return block.insts[i].imm.i32_val;
+        }
+        return -1;
+    };
+    u32 forward_bundle_count = 0;
+    for (u32 bi = 0; bi < function.block_count; bi++) {
+        const auto& block = function.blocks[bi];
+        for (u32 ii = 0; ii < block.inst_count; ii++) {
+            const auto& inst = block.insts[ii];
+            if (inst.op != rir::Opcode::RetForwardBundle) continue;
+            forward_bundle_count++;
+            REQUIRE_EQ(inst.operand_count, 3u);
+            CHECK_EQ(const_i32_value(block, inst.operands[0]), 0);
+            CHECK_EQ(const_i32_value(block, inst.operands[1]), 1);
+            CHECK_EQ(const_i32_value(block, inst.operands[2]), 1);
+        }
+    }
+    REQUIRE_EQ(forward_bundle_count, 1u);
+
+    REQUIRE_EQ(resources.cfg.upstream_count, 1u);
+    REQUIRE_EQ(resources.cfg.upstreams[0].addr_count, 1u);
+    CHECK_EQ(ntohl(resources.cfg.upstreams[0].addrs[0].sin_addr.s_addr), 0x7F000001u);
+    CHECK_EQ(ntohs(resources.cfg.upstreams[0].addrs[0].sin_port), dead.port);
+    REQUIRE_EQ(resources.cfg.response_policy_count, 1u);
+    REQUIRE_EQ(resources.cfg.failure_policy_count, 2u);
+    REQUIRE_EQ(resources.cfg.policy_bundle_count, 1u);
+    const auto& cfg_default = resources.cfg.failure_policies[0];
+    CHECK_EQ(cfg_default.status_code, 502u);
+    CHECK(cfg_default.reason.eq({"Origin Failed", 13}));
+    CHECK(cfg_default.body.eq({"default failure\n", 16}));
+    CHECK_NE(cfg_default.body.ptr, resources.rir.module.failure_policies[0].body.ptr);
+    const auto& cfg_timeout = resources.cfg.failure_policies[1];
+    CHECK_EQ(cfg_timeout.status_code, 504u);
+    CHECK(cfg_timeout.reason.eq({"Response Read Deadline", 22}));
+    CHECK(cfg_timeout.body.eq({"configured deadline\n", 20}));
+    CHECK_NE(cfg_timeout.body.ptr, resources.rir.module.failure_policies[1].body.ptr);
+    const auto& cfg_bundle = resources.cfg.policy_bundles[0];
+    CHECK_EQ(cfg_bundle.response_policy_id, 1u);
+    CHECK_EQ(cfg_bundle.failure_policy_id, 1u);
+    CHECK_EQ(cfg_bundle.timeout_failure_policy_id, 2u);
+    CHECK_EQ(cfg_bundle.response_read_timeout_seconds, 1u);
+    CHECK_EQ(cfg_bundle.response_buffering, ForwardResponseBufferingMode::CompleteContentLength);
+    REQUIRE_EQ(resources.cfg.route_count, 1u);
+    CHECK_EQ(resources.cfg.routes[0].method, kRouteMethodGet);
+    CHECK_EQ(resources.cfg.routes[0].action, RouteAction::JitHandler);
+    CHECK_NE(resources.cfg.routes[0].fn, nullptr);
+    CHECK_EQ(resources.cfg.routes[0].preflight_forward_policy_bundle_id, 1u);
+
+    Shard<IoUringEventLoop> shard;
+    i32 listen_fd = create_listen_socket(0).value_or(-1);
+    REQUIRE_GE(listen_fd, 0);
+    REQUIRE(shard.init(0, listen_fd).has_value());
+    shard.route_config = &resources.cfg;
+    shard.active_config = shard.route_config;
+    REQUIRE(shard.loop != nullptr);
+    REQUIRE_EQ(shard.loop->upstream_timeout, IoUringEventLoop::kDefaultUpstreamTimeout);
+
+    // BackendHealth is thread_local. This test-only owner calls the unchanged
+    // production run loop, resets health before either request, and publishes
+    // the final witness only through pthread_join synchronization.
+    struct HealthWitnessRunner {
+        Shard<IoUringEventLoop>& shard;
+        i32& listen_fd;
+        pthread_t thread{};
+        bool started = false;
+        std::atomic<bool> entered{false};
+        BackendHealth final_health{};
+
+        static void* run(void* arg) {
+            auto* self = static_cast<HealthWitnessRunner*>(arg);
+            reset_backend_health();
+            self->entered.store(true, std::memory_order_release);
+            self->shard.loop->run();
+            const BackendHealth* health = backend_health(0, 0);
+            if (health != nullptr) self->final_health = *health;
+            return nullptr;
+        }
+
+        i32 start() {
+            const i32 rc = pthread_create(&thread, nullptr, run, this);
+            if (rc == 0) started = true;
+            return rc;
+        }
+
+        void stop_and_join() {
+            if (!started) return;
+            shard.stop();
+            pthread_join(thread, nullptr);
+            started = false;
+        }
+
+        ~HealthWitnessRunner() {
+            stop_and_join();
+            shard.shutdown();
+            if (listen_fd >= 0) close(listen_fd);
+        }
+    } runner{shard, listen_fd};
+    const u16 port = get_port(listen_fd);
+    REQUIRE_EQ(runner.start(), 0);
+    for (u32 waited_ms = 0; waited_ms < 1000 && !runner.entered.load(std::memory_order_acquire);
+         waited_ms++)
+        usleep(1000);
+    REQUIRE(runner.entered.load(std::memory_order_acquire));
+
+    struct ClientGuard {
+        i32 fd = -1;
+        ~ClientGuard() {
+            if (fd >= 0) close(fd);
+        }
+    } client{connect_to(port)};
+    REQUIRE_GE(client.fd, 0);
+    set_socket_timeouts(client.fd, 8);
+    static constexpr char kRequestOne[] =
+        "GET /buffered?unavailable=one HTTP/1.1\r\n"
+        "Host: client.example\r\n"
+        "Keep-Alive: timeout=5\r\n"
+        "X-Test: one\r\n\r\n";
+    static constexpr char kRequestTwo[] =
+        "GET /buffered?unavailable=two HTTP/1.1\r\n"
+        "Host: client.example\r\n"
+        "Connection: close\r\n"
+        "X-Test: two\r\n\r\n";
+    REQUIRE(send_all(client.fd, kRequestOne, sizeof(kRequestOne) - 1u));
+
+    char response[sizeof(kExpectedKeepAlive) + 64]{};
+    u32 response_len = 0;
+    const u32 expected_keep_alive_len = sizeof(kExpectedKeepAlive) - 1u;
+    while (response_len < expected_keep_alive_len) {
+        const i32 got =
+            recv_timeout(client.fd, response + response_len, sizeof(response) - response_len, 4000);
+        REQUIRE_GT(got, 0);
+        response_len += static_cast<u32>(got);
+        REQUIRE_LE(response_len, expected_keep_alive_len);
+    }
+    REQUIRE(normalize_public_date(response, response_len));
+    REQUIRE_EQ(response_len, expected_keep_alive_len);
+    CHECK_EQ(memcmp(response, kExpectedKeepAlive, response_len), 0);
+    CHECK_FALSE(buf_contains(response, response_len, "504", 3));
+    CHECK_FALSE(buf_contains(response, response_len, "Response Read Deadline", 22));
+    CHECK_FALSE(buf_contains(response, response_len, "configured deadline\n", 20));
+    char quiet[64];
+    REQUIRE_EQ(recv_timeout(client.fd, quiet, sizeof(quiet), 100), -EAGAIN);
+
+    // This is deliberately sequential evidence, not #276: request 2 is not
+    // written until request 1's complete body was read and the socket remained
+    // open and byte-quiet at the response boundary.
+    REQUIRE(send_all(client.fd, kRequestTwo, sizeof(kRequestTwo) - 1u));
+    memset(response, 0, sizeof(response));
+    response_len = 0;
+    const u32 expected_close_len = sizeof(kExpectedClose) - 1u;
+    while (response_len < expected_close_len) {
+        const i32 got =
+            recv_timeout(client.fd, response + response_len, sizeof(response) - response_len, 4000);
+        REQUIRE_GT(got, 0);
+        response_len += static_cast<u32>(got);
+        REQUIRE_LE(response_len, expected_close_len);
+    }
+    REQUIRE(normalize_public_date(response, response_len));
+    REQUIRE_EQ(response_len, expected_close_len);
+    CHECK_EQ(memcmp(response, kExpectedClose, response_len), 0);
+    CHECK_FALSE(buf_contains(response, response_len, "504", 3));
+    CHECK_FALSE(buf_contains(response, response_len, "Response Read Deadline", 22));
+    CHECK_FALSE(buf_contains(response, response_len, "configured deadline\n", 20));
+    REQUIRE_EQ(recv_timeout(client.fd, quiet, sizeof(quiet), 1000), 0);
+
+    // Leave the loop and reserved dead endpoint live for a bounded window after
+    // the real EOF. Delayed cleanup cannot manufacture another downstream wire,
+    // connect health mutation, or request completion before the synchronized join.
+    usleep(100000);
+    accepts_connections = -1;
+    accepts_connections_len = sizeof(accepts_connections);
+    REQUIRE_EQ(
+        getsockopt(
+            dead.fd, SOL_SOCKET, SO_ACCEPTCONN, &accepts_connections, &accepts_connections_len),
+        0);
+    REQUIRE_EQ(accepts_connections, 0);
+
+    runner.stop_and_join();
+    CHECK_EQ(shard.backend_failure_code(), 0);
+    CHECK_FALSE(shard.loop->is_running());
+    CHECK_EQ(shard.loop->active_count(), 0u);
+    CHECK_EQ(shard.loop->pending_free_count, 0u);
+    CHECK_EQ(shard.loop->pool.in_use(), 0u);
+    CHECK_EQ(shard.upstream->idle_count.load(std::memory_order_acquire), 0u);
+    CHECK_EQ(shard.upstream->free_top, UpstreamPool::kMaxConns);
+    CHECK_EQ(shard.shard_metrics.connections_total, 1u);
+    CHECK_EQ(shard.shard_metrics.connections_active, 0u);
+    CHECK_EQ(shard.shard_metrics.connections_closed, 1u);
+    CHECK_EQ(shard.shard_metrics.requests_total, 2u);
+    CHECK_EQ(shard.shard_metrics.requests_active, 0u);
+    CHECK_EQ(shard.shard_metrics.request_latency.count, 2u);
+    const u64 final_epoch = shard.epoch.epoch.load(std::memory_order_acquire);
+    CHECK_GE(final_epoch, 4u);
+    CHECK_EQ(final_epoch % 2u, 0u);
+
+    // Only the async ConnectCompletion path records passive health. Exactly two
+    // failures therefore prove two real episodes and fence duplicate mutation.
+    CHECK_EQ(runner.final_health.fails, 2u);
+    CHECK_EQ(runner.final_health.eject_until_us, 0u);
+    CHECK_FALSE(runner.final_health.active_down);
+}
+
+TEST(
+    route,
     public_ordinary_source_complete_content_length_buffering_fixed_request_policy_explicit_close_fragmented_success_iouring) {
     using namespace rut;
     if (!iouring_socket_live()) SKIP("io_uring async socket ops unavailable in this environment");
