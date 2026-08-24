@@ -836,6 +836,8 @@ struct Recorder {
     u16 port = 0;
     u32 expected_requests = 1;
     std::atomic<bool> running{false};
+    std::atomic<bool> thread_alive{false};
+    std::atomic<bool> listener_failed{false};
     std::atomic<u32> accepted{0};
     std::atomic<u32> requests{0};
     std::vector<char> request;
@@ -897,19 +899,35 @@ struct Recorder {
 
     static void* run(void* opaque) {
         auto* self = static_cast<Recorder*>(opaque);
+        struct LivenessGuard {
+            Recorder* recorder;
+            ~LivenessGuard() { recorder->thread_alive.store(false, std::memory_order_release); }
+        } liveness_guard{self};
+        self->thread_alive.store(true, std::memory_order_release);
+        const auto fail_listener = [self]() {
+            if (self->running.exchange(false, std::memory_order_acq_rel))
+                self->listener_failed.store(true, std::memory_order_release);
+        };
         const int fd = self->listen_fd;
         while (self->running.load(std::memory_order_acquire)) {
             pollfd listener_poll{fd, POLLIN, 0};
             const int ready = poll(&listener_poll, 1, 50);
             if (ready < 0) {
                 if (errno == EINTR) continue;
+                fail_listener();
                 break;
             }
             if (!self->running.load(std::memory_order_acquire)) break;
-            if (ready == 0 || !(listener_poll.revents & POLLIN)) continue;
+            if (ready == 0) continue;
+            if (listener_poll.revents & (POLLERR | POLLHUP | POLLNVAL)) {
+                fail_listener();
+                break;
+            }
+            if (!(listener_poll.revents & POLLIN)) continue;
             const int client = accept(fd, nullptr, nullptr);
             if (client < 0) {
                 if (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK) continue;
+                fail_listener();
                 break;
             }
             self->accepted.fetch_add(1, std::memory_order_release);
@@ -1158,6 +1176,8 @@ struct Recorder {
             response_closed_by_gate.store(false, std::memory_order_relaxed);
             response_close_failed.store(false, std::memory_order_relaxed);
             response_close_released_ns.store(0, std::memory_order_relaxed);
+            thread_alive.store(false, std::memory_order_relaxed);
+            listener_failed.store(false, std::memory_order_relaxed);
             running.store(true, std::memory_order_release);
             if (pthread_create(&thread, nullptr, &Recorder::run, this) == 0) {
                 thread_started = true;
@@ -1210,6 +1230,12 @@ static bool wait_for_live_complete_origin_episode(Recorder& recorder,
             error = std::string(side) + " recorder stopped before completion observation";
             return false;
         }
+        if (!recorder.thread_alive.load(std::memory_order_acquire) ||
+            recorder.listener_failed.load(std::memory_order_acquire)) {
+            error = std::string(side) +
+                    " recorder listener exited or failed before completion observation";
+            return false;
+        }
         if (recorder.accepted.load(std::memory_order_acquire) > 1 ||
             recorder.requests.load(std::memory_order_acquire) > 1 ||
             recorder.response_send_all_calls.load(std::memory_order_acquire) > 1) {
@@ -1230,24 +1256,27 @@ static bool observe_live_complete_origin_quiet(Recorder& recorder,
                                                std::string& error) {
     if (!wait_for_live_complete_origin_episode(recorder, process, side, error)) return false;
     const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(500);
-    while (std::chrono::steady_clock::now() < deadline) {
+    for (;;) {
         if (poll_child(process)) {
             error = std::string(side) + " process exited during post-EOF live observation";
             return false;
         }
         if (!recorder.running.load(std::memory_order_acquire) ||
+            !recorder.thread_alive.load(std::memory_order_acquire) ||
+            recorder.listener_failed.load(std::memory_order_acquire) ||
             !complete_origin_episode_is_exact(recorder)) {
             error = std::string(side) +
-                    " origin changed or recorder stopped during post-EOF live observation";
+                    " origin changed or recorder listener stopped/failed during post-EOF live "
+                    "observation";
             return false;
         }
-        const auto remaining = std::chrono::duration_cast<std::chrono::milliseconds>(
-                                   deadline - std::chrono::steady_clock::now())
-                                   .count();
+        const auto now = std::chrono::steady_clock::now();
+        if (now >= deadline) return true;
+        const auto remaining =
+            std::chrono::duration_cast<std::chrono::milliseconds>(deadline - now).count();
         const int wait_ms = remaining > 50 ? 50 : static_cast<int>(remaining);
         (void)poll(nullptr, 0, wait_ms > 0 ? wait_ms : 1);
     }
-    return true;
 }
 
 // Pinned-baseline backend for two requests on one downstream connection. It
@@ -3578,7 +3607,9 @@ static bool capture_case(u16 frontend_port,
         return false;
     }
     recorder.stop();
-    if (!complete_origin_episode_is_exact(recorder) || recorder.history.size() != 1 ||
+    if (recorder.thread_alive.load(std::memory_order_acquire) ||
+        recorder.listener_failed.load(std::memory_order_acquire) ||
+        !complete_origin_episode_is_exact(recorder) || recorder.history.size() != 1 ||
         recorder.request != recorder.history[0]) {
         error = "nginx recorder joined with inexact completion lifecycle";
         return false;
@@ -3618,7 +3649,9 @@ static bool capture_case(u16 frontend_port,
         return false;
     }
     fresh_recorder.stop();
-    if (!complete_origin_episode_is_exact(fresh_recorder) || fresh_recorder.history.size() != 1 ||
+    if (fresh_recorder.thread_alive.load(std::memory_order_acquire) ||
+        fresh_recorder.listener_failed.load(std::memory_order_acquire) ||
+        !complete_origin_episode_is_exact(fresh_recorder) || fresh_recorder.history.size() != 1 ||
         fresh_recorder.request != fresh_recorder.history[0]) {
         error = "RUT recorder joined with inexact completion lifecycle";
         return false;
