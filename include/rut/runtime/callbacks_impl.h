@@ -560,6 +560,10 @@ inline void respond_validated_preconnect_failure(Loop* loop,
                                                  Connection& conn,
                                                  ValidatedPreconnectFailureSite site);
 template <typename Loop>
+inline void respond_validated_connect_completion_failure(Loop* loop,
+                                                         Connection& conn,
+                                                         const IoEvent& ev);
+template <typename Loop>
 void on_validated_preconnect_failure_sent(void* lp, Connection& conn, IoEvent ev);
 void prepare_early_response_state(Connection& conn);
 u32 consume_upstream_sent(Connection& conn);
@@ -4130,6 +4134,17 @@ template <typename Loop>
 void on_upstream_connected(void* lp, Connection& conn, IoEvent ev) {
     auto* loop = static_cast<Loop*>(lp);
 
+    // io_uring accounts a terminal Connect CQE before dispatching this callback.
+    // A validated response-read owner needs the pinned configured default-502
+    // path, including strict event/episode validation and an old-episode
+    // tombstone.  Run it before passive-health accounting; malformed current
+    // owner records fail closed without changing health or publishing bytes.
+    if (conn.response_read_deadline_state == ResponseReadDeadlineState::Validated &&
+        ev.result < 0) {
+        respond_validated_connect_completion_failure(loop, conn, ev);
+        return;
+    }
+
     // Stale same-batch UpstreamSend guard (epoll). A dead reused upstream fd with a
     // partial send parked on EPOLLOUT can surface BOTH an UpstreamRecv EOF and an
     // UpstreamSend completion in ONE EpollBackend::wait() batch. The EOF dispatches
@@ -7267,6 +7282,96 @@ inline void respond_validated_preconnect_failure(Loop* loop,
     // Everything above is read-only, including serialization. There is no
     // connect CQE owner at either site, so the never-armed deadline and local fd
     // can now be neutralized without a tombstone or health episode.
+    if constexpr (requires(Loop* candidate, Connection& c) {
+                      candidate->disarm_response_read_deadline(c);
+                  }) {
+        loop->disarm_response_read_deadline(conn);
+    } else {
+        fail_closed();
+        return;
+    }
+    conn.clear_slots();
+    conn.upstream_abandoned = true;
+    conn.upstream_keep_alive = false;
+    conn.upstream_start_us = 0;
+    (void)detach_upstream_close(loop, conn);
+    release_upstream_slot(loop, conn);
+    conn.response_header_buf.reset();
+    if (conn.response_header_buf.write(scratch, response_len) != response_len) {
+        fail_closed();
+        return;
+    }
+    conn.keep_alive = conn.keep_alive && conn.req_client_keep_alive;
+    conn.resp_status = kStatusBadGateway;
+    conn.resp_body_mode = BodyMode::None;
+    conn.resp_body_remaining = 0;
+    conn.resp_body_sent = response_len;
+    conn.transition_to_sending(&on_validated_preconnect_failure_sent<Loop>);
+    if constexpr (requires(Loop* candidate, Connection& c, const u8* data, u32 len) {
+                      candidate->submit_staged_local_response(c, data, len);
+                  }) {
+        if (!loop->submit_staged_local_response(
+                conn, conn.response_header_buf.data(), conn.response_header_buf.len()))
+            fail_closed();
+    } else {
+        fail_closed();
+    }
+}
+
+template <typename Loop>
+inline bool validated_connect_completion_failure_owner_is_stable(Loop* loop,
+                                                                 const Connection& conn,
+                                                                 const IoEvent& ev) {
+    return validated_preconnect_failure_owner_is_stable(
+               loop, conn, ValidatedPreconnectFailureSite::ConnectSubmit) &&
+           ev.type == IoEventType::UpstreamConnect && ev.result < 0 && ev.aux == 0 && !ev.more &&
+           ev.conn_id == conn.id && valid_upstream_episode(ev.upstream_episode) &&
+           ev.upstream_episode == conn.upstream_episode && !conn.upstream_connect_armed;
+}
+
+template <typename Loop>
+inline void respond_validated_connect_completion_failure(Loop* loop,
+                                                         Connection& conn,
+                                                         const IoEvent& ev) {
+    const auto fail_closed = [&]() { loop->close_conn(conn); };
+    if (!validated_connect_completion_failure_owner_is_stable(loop, conn, ev)) {
+        fail_closed();
+        return;
+    }
+
+    u8 scratch[SlicePool::kSliceSize];
+    u32 response_len = 0;
+    if (!build_failure_policy_response(conn,
+                                       *conn.request_config,
+                                       conn.failure_policy_suppress_body,
+                                       scratch,
+                                       sizeof(scratch),
+                                       &response_len) ||
+        response_len == 0 || response_len > conn.response_header_buf.capacity()) {
+        fail_closed();
+        return;
+    }
+
+    // Dispatch has already consumed the only Connect pending owner and cleared
+    // upstream_connect_armed.  Publish a zero-target tombstone for that exact
+    // completed episode before any health or response state changes.  A late
+    // duplicate is then swallowed by the retirement consumer without stealing
+    // downstream pending ownership or reaching this callback again.
+    if constexpr (requires(Loop* candidate, Connection& c) {
+                      candidate->advance_upstream_retirement_tombstone(c);
+                  }) {
+        if (!loop->advance_upstream_retirement_tombstone(conn)) {
+            fail_closed();
+            return;
+        }
+    } else {
+        fail_closed();
+        return;
+    }
+
+    record_backend_result(
+        conn.upstream_idx, conn.upstream_backend_idx, /*success=*/false, monotonic_us());
+
     if constexpr (requires(Loop* candidate, Connection& c) {
                       candidate->disarm_response_read_deadline(c);
                   }) {

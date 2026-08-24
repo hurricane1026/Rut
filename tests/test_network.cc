@@ -20445,6 +20445,398 @@ bool stage_preconnect_connect_submit(IoUringEventLoop* loop,
     return true;
 }
 
+enum class AsyncConnectFailureProfile : u8 { Head, BodylessGet, FixedUpload };
+
+bool stage_async_connect_completion(IoUringEventLoop* loop,
+                                    RouteConfig& config,
+                                    AsyncConnectFailureProfile profile,
+                                    bool terminal_downstream_recv,
+                                    bool explicit_close,
+                                    PreconnectConnectSubmitFixture* out) {
+    if (loop == nullptr || out == nullptr ||
+        !config.add_upstream("backend", 0x7F000001, 9000).has_value())
+        return false;
+    const bool head = profile == AsyncConnectFailureProfile::Head;
+    const bool upload = profile == AsyncConnectFailureProfile::FixedUpload;
+    if (head ? !add_response_read_deadline_bundle(config)
+             : !add_bodyless_non_head_response_read_deadline_bundle(
+                   config, 5, ForwardResponseBufferingMode::CompleteContentLength))
+        return false;
+    const u8 route_method = head ? kRouteMethodHead : (upload ? kRouteMethodPost : kRouteMethodGet);
+    auto* handler =
+        upload ? &response_read_deadline_fixed_upload_handler : &response_read_deadline_handler;
+    if (!config.add_jit_handler("/one", route_method, handler, false, 2)) return false;
+    out->active = &config;
+    loop->config_ptr = &out->active;
+    Connection* conn = loop->alloc_conn();
+    if (conn == nullptr) return false;
+    i32 downstream[2] = {-1, -1};
+    if (socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, downstream) != 0) return false;
+    conn->fd = downstream[0];
+    static constexpr u8 kHead[] = "HEAD /one HTTP/1.1\r\nHost: client.example\r\n\r\n";
+    static constexpr u8 kGet[] = "GET /one HTTP/1.1\r\nHost: client.example\r\n\r\n";
+    static constexpr u8 kGetClose[] =
+        "GET /one HTTP/1.1\r\nHost: client.example\r\nConnection: close\r\n\r\n";
+    static constexpr u8 kUpload[] =
+        "POST /one HTTP/1.1\r\nHost: client.example\r\nContent-Length: 3\r\n\r\nabc";
+    const u8* request = head ? kHead : (upload ? kUpload : (explicit_close ? kGetClose : kGet));
+    const u32 request_len =
+        head ? sizeof(kHead) - 1u
+             : (upload ? sizeof(kUpload) - 1u
+                       : (explicit_close ? sizeof(kGetClose) - 1u : sizeof(kGet) - 1u));
+    if (conn->recv_buf.write(request, request_len) != request_len) return false;
+    out->sq_tail = __atomic_load_n(loop->backend.sq_tail, __ATOMIC_ACQUIRE);
+    out->backend_pending = loop->backend.pending;
+
+    // This deterministic seam mirrors a live multishot downstream Recv without
+    // placing that unrelated SQE in the kernel ring. The JIT path publishes the
+    // real Connect owner; rolling back only the unsubmitted SQ tail leaves the
+    // exact logical pre-CQE shape consumed by dispatch below.
+    conn->recv_armed = true;
+    conn->pending_ops = 1;
+    on_header_received<IoUringEventLoop>(
+        loop, *conn, {conn->id, static_cast<i32>(request_len), 0, 0, IoEventType::Recv, 1});
+    if (conn->fd < 0 || conn->upstream_fd < 0 || !conn->upstream_connect_armed ||
+        !conn->recv_armed || conn->pending_ops != 2 || conn->on_recv != nullptr ||
+        conn->on_upstream_send != &on_upstream_connected<IoUringEventLoop>)
+        return false;
+    __atomic_store_n(loop->backend.sq_tail, out->sq_tail, __ATOMIC_RELEASE);
+    loop->backend.pending = out->backend_pending;
+    if (terminal_downstream_recv) {
+        conn->recv_armed = false;
+        conn->pending_ops--;
+    }
+    out->conn = conn;
+    out->peer_fd = downstream[1];
+    return true;
+}
+
+IoEvent async_connect_failure_event(const Connection& conn, i32 result) {
+    return {conn.id, result, 0, 0, IoEventType::UpstreamConnect, 0, 0, conn.upstream_episode};
+}
+
+TEST(iouring_connect_completion_failure,
+     econnrefused_live_recv_uses_pinned_502_once_and_keeps_successor) {
+    ScopedBackendHealthReset health_reset{};
+    ScopedIoUringLoopForRetirement guard;
+    if (!guard.init()) SKIP("io_uring unavailable");
+    auto* loop = guard.loop;
+    RouteConfig pinned{};
+    PreconnectConnectSubmitFixture fixture{};
+    REQUIRE(stage_async_connect_completion(
+        loop, pinned, AsyncConnectFailureProfile::BodylessGet, false, false, &fixture));
+    REQUIRE(pinned.add_static("/two", kRouteMethodGet, 204));
+    RouteConfig hot{};
+    REQUIRE(hot.add_upstream("hot", 0x7F000001, 9001).has_value());
+    REQUIRE(add_bodyless_non_head_response_read_deadline_bundle(
+        hot, 5, ForwardResponseBufferingMode::CompleteContentLength));
+    REQUIRE(
+        hot.add_jit_handler("/one", kRouteMethodGet, &response_read_deadline_handler, false, 2));
+    REQUIRE(hot.add_static("/two", kRouteMethodGet, 204));
+    hot.failure_policies[0].body = {"hot-reload", 10};
+    fixture.active = &hot;
+    Connection& conn = *fixture.conn;
+    const u32 id = conn.id;
+    const u32 old_episode = conn.upstream_episode;
+    BackendHealth* health = backend_health(0, 0);
+    REQUIRE(health != nullptr);
+    health->fails = 1;
+    const IoEvent failure = async_connect_failure_event(conn, -ECONNREFUSED);
+
+    loop->dispatch(failure);
+
+    REQUIRE_GE(conn.fd, 0);
+    CHECK_EQ(conn.resp_status, 502u);
+    CHECK_EQ(conn.request_config, &pinned);
+    CHECK_EQ(conn.response_read_deadline_state, ResponseReadDeadlineState::None);
+    CHECK(conn.response_read_deadline_owner_is_neutral());
+    CHECK_EQ(conn.upstream_fd, -1);
+    CHECK(conn.upstream_abandoned);
+    CHECK(conn.send_armed);
+    CHECK(conn.recv_armed);
+    CHECK_EQ(conn.pending_ops, 2u);
+    CHECK_EQ(conn.upstream_retiring_episode, old_episode);
+    CHECK_NE(conn.upstream_episode, old_episode);
+    CHECK_FALSE(conn.upstream_retirement_active);
+    CHECK_EQ(conn.upstream_retirement_target_owned, 0u);
+    CHECK_EQ(conn.upstream_retirement_cancel_owned, 0u);
+    CHECK_EQ(health->fails, 2u);
+    CHECK(buf_has(conn.response_header_buf.data(), conn.response_header_buf.len(), "default"));
+    CHECK_FALSE(
+        buf_has(conn.response_header_buf.data(), conn.response_header_buf.len(), "hot-reload"));
+    CHECK_FALSE(buf_contains(reinterpret_cast<const char*>(conn.response_header_buf.data()),
+                             conn.response_header_buf.len(),
+                             "time\0out",
+                             8));
+
+    const u32 response_len = conn.response_header_buf.len();
+    const u32 pending_before_duplicate = conn.pending_ops;
+    const u32 health_before_duplicate = health->fails;
+    loop->dispatch(failure);
+    CHECK_EQ(conn.pending_ops, pending_before_duplicate);
+    CHECK_EQ(health->fails, health_before_duplicate);
+    CHECK_EQ(conn.response_header_buf.len(), response_len);
+    CHECK_EQ(conn.upstream_retiring_episode, old_episode);
+
+    loop->backend.send_state[id].remaining = 0;
+    loop->dispatch({id, static_cast<i32>(response_len), 0, 0, IoEventType::Send, 0});
+    REQUIRE_EQ(conn.state, ConnState::ReadingHeader);
+    REQUIRE_EQ(conn.on_recv, &on_header_received<IoUringEventLoop>);
+    REQUIRE(conn.recv_armed);
+    REQUIRE_EQ(conn.pending_ops, 1u);
+    CHECK_EQ(conn.upstream_retiring_episode, old_episode);
+
+    fixture.active = &pinned;
+    static constexpr u8 kSuccessor[] =
+        "GET /two HTTP/1.1\r\nHost: client.example\r\nConnection: close\r\n\r\n";
+    REQUIRE_EQ(conn.recv_buf.write(kSuccessor, sizeof(kSuccessor) - 1u), sizeof(kSuccessor) - 1u);
+    loop->dispatch({id, static_cast<i32>(sizeof(kSuccessor) - 1u), 0, 0, IoEventType::Recv, 1});
+    CHECK_EQ(conn.resp_status, 204u);
+    CHECK(conn.send_armed);
+    CHECK(conn.recv_armed);
+    CHECK_EQ(conn.pending_ops, 2u);
+
+    loop->backend.send_state[id] = {};
+    conn.send_armed = false;
+    conn.recv_armed = false;
+    conn.pending_ops = 0;
+    conn.clear_slots();
+    loop->close_conn(conn);
+    close(fixture.peer_fd);
+}
+
+TEST(iouring_connect_completion_failure,
+     kernel_etimedout_terminal_recv_selects_default_502_and_explicit_close_reclaims) {
+    ScopedBackendHealthReset health_reset{};
+    ScopedIoUringLoopForRetirement guard;
+    if (!guard.init()) SKIP("io_uring unavailable");
+    auto* loop = guard.loop;
+    const u32 free_before = loop->free_top;
+    RouteConfig config{};
+    PreconnectConnectSubmitFixture fixture{};
+    REQUIRE(stage_async_connect_completion(
+        loop, config, AsyncConnectFailureProfile::BodylessGet, true, true, &fixture));
+    Connection& conn = *fixture.conn;
+    const u32 id = conn.id;
+    const u32 old_episode = conn.upstream_episode;
+    BackendHealth* health = backend_health(0, 0);
+    REQUIRE(health != nullptr);
+
+    loop->dispatch(async_connect_failure_event(conn, -ETIMEDOUT));
+
+    REQUIRE(conn.send_armed);
+    CHECK_FALSE(conn.recv_armed);
+    CHECK_EQ(conn.pending_ops, 1u);
+    CHECK_EQ(conn.resp_status, 502u);
+    CHECK_FALSE(conn.keep_alive);
+    CHECK_EQ(conn.upstream_retiring_episode, old_episode);
+    CHECK_NE(conn.upstream_episode, old_episode);
+    CHECK_EQ(health->fails, 1u);
+    CHECK(buf_has(conn.response_header_buf.data(), conn.response_header_buf.len(), "default"));
+    CHECK_FALSE(buf_contains(reinterpret_cast<const char*>(conn.response_header_buf.data()),
+                             conn.response_header_buf.len(),
+                             "time\0out",
+                             8));
+    const u32 response_len = conn.response_header_buf.len();
+    loop->backend.send_state[id].remaining = 0;
+    const i32 ring_fd = loop->backend.ring_fd;
+    loop->backend.ring_fd = -1;
+    loop->dispatch({id, static_cast<i32>(response_len), 0, 0, IoEventType::Send, 0});
+    loop->backend.ring_fd = ring_fd;
+    loop->backend.fatal_error.store(0, std::memory_order_release);
+    CHECK_EQ(loop->free_top, free_before);
+    CHECK_EQ(loop->conns[id].fd, -1);
+    CHECK_EQ(loop->conns[id].pending_ops, 0u);
+    u8 byte = 0;
+    CHECK_EQ(recv(fixture.peer_fd, &byte, 1, MSG_DONTWAIT), 0);
+    close(fixture.peer_fd);
+}
+
+TEST(iouring_connect_completion_failure, head_and_fixed_upload_preserve_exact_profiles) {
+    for (const AsyncConnectFailureProfile profile :
+         {AsyncConnectFailureProfile::Head, AsyncConnectFailureProfile::FixedUpload}) {
+        ScopedBackendHealthReset health_reset{};
+        ScopedIoUringLoopForRetirement guard;
+        if (!guard.init()) SKIP("io_uring unavailable");
+        auto* loop = guard.loop;
+        RouteConfig config{};
+        PreconnectConnectSubmitFixture fixture{};
+        REQUIRE(stage_async_connect_completion(loop, config, profile, false, false, &fixture));
+        Connection& conn = *fixture.conn;
+        const u32 id = conn.id;
+        loop->dispatch(async_connect_failure_event(conn, -ECONNREFUSED));
+        REQUIRE(conn.send_armed);
+        CHECK_EQ(conn.resp_status, 502u);
+        CHECK(conn.recv_armed);
+        CHECK_EQ(conn.pending_ops, 2u);
+        CHECK(buf_has(
+            conn.response_header_buf.data(), conn.response_header_buf.len(), "502 Bad Gateway"));
+        CHECK_EQ(buf_contains(reinterpret_cast<const char*>(conn.response_header_buf.data()),
+                              conn.response_header_buf.len(),
+                              "default",
+                              7),
+                 profile == AsyncConnectFailureProfile::FixedUpload);
+        CHECK_EQ(conn.failure_policy_suppress_body, profile == AsyncConnectFailureProfile::Head);
+        loop->backend.send_state[id] = {};
+        conn.send_armed = false;
+        conn.recv_armed = false;
+        conn.pending_ops = 0;
+        conn.clear_slots();
+        loop->close_conn(conn);
+        close(fixture.peer_fd);
+    }
+}
+
+TEST(iouring_connect_completion_failure,
+     malformed_current_events_fail_closed_without_health_or_policy_publication) {
+    enum class Malformed : u8 { Aux, More, Type, NeutralEpisode, ConnId };
+    for (const Malformed malformed : {Malformed::Aux,
+                                      Malformed::More,
+                                      Malformed::Type,
+                                      Malformed::NeutralEpisode,
+                                      Malformed::ConnId}) {
+        ScopedBackendHealthReset health_reset{};
+        ScopedIoUringLoopForRetirement guard;
+        if (!guard.init()) SKIP("io_uring unavailable");
+        auto* loop = guard.loop;
+        RouteConfig config{};
+        PreconnectConnectSubmitFixture fixture{};
+        REQUIRE(stage_async_connect_completion(
+            loop, config, AsyncConnectFailureProfile::BodylessGet, false, false, &fixture));
+        Connection& conn = *fixture.conn;
+        const u32 id = conn.id;
+        const u32 old_episode = conn.upstream_episode;
+        BackendHealth* health = backend_health(0, 0);
+        REQUIRE(health != nullptr);
+        health->fails = 2;
+        health->eject_until_us = 777;
+        IoEvent event = async_connect_failure_event(conn, -ECONNREFUSED);
+        switch (malformed) {
+            case Malformed::Aux:
+                event.aux = 1;
+                break;
+            case Malformed::More:
+                event.more = 1;
+                break;
+            case Malformed::Type:
+                event.type = IoEventType::UpstreamSend;
+                break;
+            case Malformed::NeutralEpisode:
+                event.upstream_episode = 0;
+                break;
+            case Malformed::ConnId:
+                event.conn_id = (id + 1u) % IoUringEventLoop::kMaxConns;
+                break;
+        }
+        CHECK_FALSE(validated_connect_completion_failure_owner_is_stable(loop, conn, event));
+        if (malformed == Malformed::ConnId)
+            on_upstream_connected<IoUringEventLoop>(loop, conn, event);
+        else
+            loop->dispatch(event);
+        CHECK_EQ(loop->conns[id].fd, -1);
+        CHECK_EQ(loop->conns[id].resp_status, 0u);
+        CHECK_EQ(loop->conns[id].response_header_buf.len(), 0u);
+        CHECK_EQ(health->fails, 2u);
+        CHECK_EQ(health->eject_until_us, 777u);
+        CHECK_EQ(loop->backend.send_state[id].remaining, 0u);
+        CHECK_NE(loop->conns[id].upstream_retiring_episode, old_episode);
+
+        __atomic_store_n(loop->backend.sq_tail, fixture.sq_tail, __ATOMIC_RELEASE);
+        loop->backend.pending = fixture.backend_pending;
+        Connection& closed = loop->conns[id];
+        closed.recv_armed = false;
+        closed.send_armed = false;
+        closed.upstream_connect_armed = false;
+        closed.upstream_send_armed = false;
+        closed.upstream_recv_armed = false;
+        closed.upstream_retirement_active = false;
+        closed.upstream_retirement_target_owned = 0;
+        closed.upstream_retirement_cancel_owned = 0;
+        closed.upstream_retirement_cancel_retry = 0;
+        closed.pending_ops = 0;
+        if (closed.recv_slice != nullptr && closed.fd < 0) loop->reclaim_slot(id);
+        close(fixture.peer_fd);
+    }
+}
+
+TEST(iouring_connect_completion_failure,
+     wrong_episode_is_swallowed_before_callback_without_health_or_response) {
+    ScopedBackendHealthReset health_reset{};
+    ScopedIoUringLoopForRetirement guard;
+    if (!guard.init()) SKIP("io_uring unavailable");
+    auto* loop = guard.loop;
+    RouteConfig config{};
+    PreconnectConnectSubmitFixture fixture{};
+    REQUIRE(stage_async_connect_completion(
+        loop, config, AsyncConnectFailureProfile::BodylessGet, false, false, &fixture));
+    Connection& conn = *fixture.conn;
+    BackendHealth* health = backend_health(0, 0);
+    REQUIRE(health != nullptr);
+    const u32 old_episode = conn.upstream_episode;
+    IoEvent stale = async_connect_failure_event(conn, -ECONNREFUSED);
+    stale.upstream_episode = old_episode == 1 ? 2 : old_episode - 1;
+    const i32 fd_before = conn.fd;
+    const i32 upstream_fd_before = conn.upstream_fd;
+    const u32 pending_before = conn.pending_ops;
+    loop->dispatch(stale);
+    CHECK_EQ(conn.fd, fd_before);
+    CHECK_EQ(conn.upstream_fd, upstream_fd_before);
+    CHECK_EQ(conn.upstream_episode, old_episode);
+    CHECK_EQ(conn.upstream_retiring_episode, 0u);
+    CHECK_EQ(conn.resp_status, 0u);
+    CHECK_EQ(conn.response_header_buf.len(), 0u);
+    CHECK_EQ(health->fails, 0u);
+    CHECK(conn.upstream_connect_armed);
+    // Existing stale transport accounting consumes only the stale terminal's
+    // lifetime count; it does not clear or dispatch the current Connect owner.
+    CHECK_EQ(conn.pending_ops, pending_before - 1u);
+
+    __atomic_store_n(loop->backend.sq_tail, fixture.sq_tail, __ATOMIC_RELEASE);
+    loop->backend.pending = fixture.backend_pending;
+    conn.recv_armed = false;
+    conn.upstream_connect_armed = false;
+    conn.pending_ops = 0;
+    conn.clear_slots();
+    loop->close_conn(conn);
+    close(fixture.peer_fd);
+}
+
+TEST(iouring_connect_completion_failure,
+     staged_send_failure_closes_after_single_health_record_and_tombstone) {
+    ScopedBackendHealthReset health_reset{};
+    ScopedIoUringLoopForRetirement guard;
+    if (!guard.init()) SKIP("io_uring unavailable");
+    auto* loop = guard.loop;
+    RouteConfig config{};
+    PreconnectConnectSubmitFixture fixture{};
+    REQUIRE(stage_async_connect_completion(
+        loop, config, AsyncConnectFailureProfile::BodylessGet, true, false, &fixture));
+    Connection& conn = *fixture.conn;
+    const u32 id = conn.id;
+    const u32 old_episode = conn.upstream_episode;
+    BackendHealth* health = backend_health(0, 0);
+    REQUIRE(health != nullptr);
+    {
+        test_fault::ScopedIoUringSubmitFailure submit_failure(
+            /*connect_failures=*/0, /*staged_send_failures=*/2);
+        loop->dispatch(async_connect_failure_event(conn, -ECONNREFUSED));
+        CHECK_EQ(test_fault::state().iouring_staged_send_submit_failures, 0);
+    }
+    CHECK_EQ(loop->conns[id].fd, -1);
+    CHECK_EQ(health->fails, 1u);
+    CHECK_EQ(loop->conns[id].upstream_retiring_episode, old_episode);
+    CHECK_NE(loop->conns[id].upstream_episode, old_episode);
+    CHECK_FALSE(loop->conns[id].send_armed);
+    CHECK_EQ(loop->backend.send_state[id].remaining, 0u);
+    u8 byte = 0;
+    CHECK_EQ(recv(fixture.peer_fd, &byte, 1, MSG_DONTWAIT), 0);
+    if (loop->conns[id].recv_slice != nullptr) {
+        loop->conns[id].pending_ops = 0;
+        loop->reclaim_slot(id);
+    }
+    close(fixture.peer_fd);
+}
+
 TEST(iouring_preconnect_failure,
      bodyless_get_socket_create_uses_configured_default_policy_without_timeout_bytes) {
     ScopedBackendHealthReset health_reset{};
