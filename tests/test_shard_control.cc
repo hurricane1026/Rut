@@ -326,7 +326,10 @@ TEST_F(EpochLoopF, odd_during_request) {
     REQUIRE(c != nullptr);
     CHECK_EQ(self.ep.epoch, 0u);
 
-    self.loop.inject_and_dispatch(make_ev(c->id, IoEventType::Recv, 50));
+    static constexpr char kRequest[] = "GET / HTTP/1.1\r\nHost: x\r\n\r\n";
+    REQUIRE_EQ(c->recv_buf.write(reinterpret_cast<const u8*>(kRequest), sizeof(kRequest) - 1),
+               sizeof(kRequest) - 1);
+    self.loop.dispatch(make_ev(c->id, IoEventType::Recv, sizeof(kRequest) - 1));
     CHECK_EQ(self.ep.epoch, 1u);
     CHECK_EQ(c->state, ConnState::Sending);
 
@@ -342,13 +345,18 @@ TEST_F(EpochLoopF, across_keepalive) {
     auto* c = self.loop.find_fd(42);
     REQUIRE(c != nullptr);
 
-    self.loop.inject_and_dispatch(make_ev(c->id, IoEventType::Recv, 50));
+    static constexpr char kRequest[] = "GET / HTTP/1.1\r\nHost: x\r\n\r\n";
+    REQUIRE_EQ(c->recv_buf.write(reinterpret_cast<const u8*>(kRequest), sizeof(kRequest) - 1),
+               sizeof(kRequest) - 1);
+    self.loop.dispatch(make_ev(c->id, IoEventType::Recv, sizeof(kRequest) - 1));
     CHECK_EQ(self.ep.epoch, 1u);
     self.loop.inject_and_dispatch(
         make_ev(c->id, IoEventType::Send, static_cast<i32>(c->send_buf.len())));
     CHECK_EQ(self.ep.epoch, 2u);
 
-    self.loop.inject_and_dispatch(make_ev(c->id, IoEventType::Recv, 50));
+    REQUIRE_EQ(c->recv_buf.write(reinterpret_cast<const u8*>(kRequest), sizeof(kRequest) - 1),
+               sizeof(kRequest) - 1);
+    self.loop.dispatch(make_ev(c->id, IoEventType::Recv, sizeof(kRequest) - 1));
     CHECK_EQ(self.ep.epoch, 3u);
     self.loop.inject_and_dispatch(
         make_ev(c->id, IoEventType::Send, static_cast<i32>(c->send_buf.len())));

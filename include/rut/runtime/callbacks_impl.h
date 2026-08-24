@@ -505,8 +505,8 @@ inline bool ordinary_local_response_request_boundary_reusable(const Connection& 
             u32 consumed = 0;
             u32 out_start = 0;
             u32 out_len = 0;
-            const ChunkStatus status = probe.feed(
-                body + offset, body_len - offset, &consumed, &out_start, &out_len);
+            const ChunkStatus status =
+                probe.feed(body + offset, body_len - offset, &consumed, &out_start, &out_len);
             if (consumed > body_len - offset) return false;
             offset += consumed;
             if (status == ChunkStatus::Done)

@@ -206,7 +206,11 @@ struct MetricsLoopF {
         c = loop.find_fd(42);
         if (!c) return false;
         cid = c->id;
-        loop.inject_and_dispatch(make_ev(cid, IoEventType::Recv, 100));
+        static constexpr char kRequest[] = "GET / HTTP/1.1\r\nHost: x\r\n\r\n";
+        if (c->recv_buf.write(reinterpret_cast<const u8*>(kRequest), sizeof(kRequest) - 1) !=
+            sizeof(kRequest) - 1)
+            return false;
+        loop.dispatch(make_ev(cid, IoEventType::Recv, sizeof(kRequest) - 1));
         return true;
     }
 

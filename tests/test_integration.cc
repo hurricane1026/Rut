@@ -17718,9 +17718,8 @@ struct ValidatedFailureRetryDeferredAcceptsTag {
     friend Member validated_failure_private_member(ValidatedFailureRetryDeferredAcceptsTag);
 };
 
-template struct ValidatedFailurePrivateMemberAccess<
-    ValidatedFailureRetryDeferredAcceptsTag,
-    &IoUringEventLoop::retry_deferred_accepts>;
+template struct ValidatedFailurePrivateMemberAccess<ValidatedFailureRetryDeferredAcceptsTag,
+                                                    &IoUringEventLoop::retry_deferred_accepts>;
 
 // Exact-POST policy-1 sibling for the closed bodyless non-HEAD buffering
 // profile. Keeping it separate leaves the existing GET source and wire as
@@ -24247,7 +24246,7 @@ TEST(route, ordinary_source_validated_failure_late_successor_iouring) {
 
                 loop->dispatch_batch(events, n);
                 (loop->*validated_failure_private_member(
-                    ValidatedFailureRetryDeferredAcceptsTag{}))();
+                            ValidatedFailureRetryDeferredAcceptsTag{}))();
 
                 if (self->conn_id != UINT32_MAX && !self->request_one_admitted &&
                     request_one_witness_in_batch && self->request_one_exact) {
@@ -24258,9 +24257,7 @@ TEST(route, ordinary_source_validated_failure_late_successor_iouring) {
                     if (self->request_one_admitted) {
                         self->request_one_recv_generation = request_one_witness_generation;
                         self->request_one_recv_user_data = encode_non_upstream_user_data(
-                            {self->conn_id,
-                             IoEventType::Recv,
-                             self->request_one_recv_generation});
+                            {self->conn_id, IoEventType::Recv, self->request_one_recv_generation});
                         self->request_one_recv_fd = conn.fd;
                         // Start at this admission iteration's pre-wait tail.
                         // The original target Recv was submitted by that wait,
@@ -24288,8 +24285,7 @@ TEST(route, ordinary_source_validated_failure_late_successor_iouring) {
                             loop->backend.sq_ring_entries) {
                         self->request_one_continuity_valid = false;
                     } else {
-                        for (u32 tail = self->request_one_sq_cursor;
-                             tail != sq_tail_after_batch;
+                        for (u32 tail = self->request_one_sq_cursor; tail != sq_tail_after_batch;
                              ++tail) {
                             const u32 array_slot = tail & mask;
                             const u32 sqe_index = loop->backend.sq_array[array_slot];
@@ -24298,8 +24294,7 @@ TEST(route, ordinary_source_validated_failure_late_successor_iouring) {
                                 continue;
                             }
                             const io_uring_sqe& sqe = loop->backend.sq_entries[sqe_index];
-                            if (sqe.opcode == IORING_OP_RECV &&
-                                sqe.fd == self->request_one_recv_fd)
+                            if (sqe.opcode == IORING_OP_RECV && sqe.fd == self->request_one_recv_fd)
                                 self->request_one_continuity_valid = false;
                             if (sqe.opcode == IORING_OP_ASYNC_CANCEL &&
                                 sqe.addr == self->request_one_recv_user_data)
@@ -24327,16 +24322,16 @@ TEST(route, ordinary_source_validated_failure_late_successor_iouring) {
                     }
                     const u64 user_data = self->staged_sqe.user_data;
                     self->staged_send_type = static_cast<IoEventType>(user_data & 0xFFu);
-                    self->staged_send_conn_id =
-                        static_cast<u32>((user_data >> 8) & 0xFFFFFFu);
+                    self->staged_send_conn_id = static_cast<u32>((user_data >> 8) & 0xFFFFFFu);
                     self->staged_send_generation = static_cast<u32>(user_data >> 32);
                     const auto& send = loop->backend.send_state[self->conn_id];
                     self->staged_response = send.src;
                     self->staged_response_len = send.remaining;
                     const Connection& conn = loop->conns[self->conn_id];
                     self->request_one_owner_live =
-                        self->request_one_continuity_valid && conn.fd == self->request_one_recv_fd &&
-                        conn.recv_armed && self->request_one_recv_generation == 0 &&
+                        self->request_one_continuity_valid &&
+                        conn.fd == self->request_one_recv_fd && conn.recv_armed &&
+                        self->request_one_recv_generation == 0 &&
                         self->request_one_recv_user_data ==
                             encode_non_upstream_user_data({self->conn_id,
                                                            IoEventType::Recv,
@@ -24346,7 +24341,8 @@ TEST(route, ordinary_source_validated_failure_late_successor_iouring) {
                         loop->control == &self->shard.control &&
                         self->shard.control.pending_config.load(std::memory_order_acquire) ==
                             nullptr &&
-                        self->shard.control.pending_jit.load(std::memory_order_acquire) == nullptr &&
+                        self->shard.control.pending_jit.load(std::memory_order_acquire) ==
+                            nullptr &&
                         self->shard.control.pending_capture.load(std::memory_order_acquire) ==
                             nullptr;
                     self->config_state_neutral =
@@ -24391,8 +24387,7 @@ TEST(route, ordinary_source_validated_failure_late_successor_iouring) {
     } runner{shard};
     REQUIRE(runner.start());
     const i64 entered_deadline_ms = test_mono_ms() + 3000;
-    while (!runner.entered.load(std::memory_order_acquire) &&
-           test_mono_ms() < entered_deadline_ms)
+    while (!runner.entered.load(std::memory_order_acquire) && test_mono_ms() < entered_deadline_ms)
         sched_yield();
     REQUIRE(runner.entered.load(std::memory_order_acquire));
 
@@ -24451,8 +24446,7 @@ TEST(route, ordinary_source_validated_failure_late_successor_iouring) {
                shard.loop->conns[runner.conn_id].response_header_buf.len());
     REQUIRE_EQ(runner.staged_response,
                shard.loop->conns[runner.conn_id].response_header_buf.data());
-    REQUIRE_EQ(runner.staged_response,
-               shard.loop->backend.send_state[runner.conn_id].src);
+    REQUIRE_EQ(runner.staged_response, shard.loop->backend.send_state[runner.conn_id].src);
     REQUIRE_EQ(runner.staged_response_len, sizeof(kExpectedOne) - 1u);
     char staged_response_copy[sizeof(kExpectedOne)]{};
     memcpy(staged_response_copy, runner.staged_response, runner.staged_response_len);
@@ -24489,13 +24483,11 @@ TEST(route, ordinary_source_validated_failure_late_successor_iouring) {
         const u32 raw_tail = __atomic_load_n(backend.cq_tail, __ATOMIC_ACQUIRE);
         REQUIRE_LE(raw_tail - raw_head, backend.cq_ring_entries);
         while (raw_cursor != raw_tail) {
-            const io_uring_cqe& cqe =
-                backend.cq_entries[raw_cursor & *backend.cq_ring_mask];
+            const io_uring_cqe& cqe = backend.cq_entries[raw_cursor & *backend.cq_ring_mask];
             if (cqe.user_data == expected_recv_user_data) {
                 REQUIRE_FALSE(raw_terminal_seen);
                 REQUIRE_GT(cqe.res, 0);
-                static constexpr u32 kCqeMetadataMask =
-                    (1u << IORING_CQE_BUFFER_SHIFT) - 1u;
+                static constexpr u32 kCqeMetadataMask = (1u << IORING_CQE_BUFFER_SHIFT) - 1u;
 #ifdef IORING_CQE_F_SOCK_NONEMPTY
                 static constexpr u32 kCqeSockNonempty = IORING_CQE_F_SOCK_NONEMPTY;
 #else
@@ -24511,14 +24503,12 @@ TEST(route, ordinary_source_validated_failure_late_successor_iouring) {
                 REQUIRE_EQ(metadata & ~kAllowedCqeMetadata, 0u);
                 REQUIRE_EQ(metadata & IORING_CQE_F_BUFFER, IORING_CQE_F_BUFFER);
                 const bool more = (cqe.flags & IORING_CQE_F_MORE) != 0;
-                const u16 buf_id =
-                    static_cast<u16>(cqe.flags >> IORING_CQE_BUFFER_SHIFT);
+                const u16 buf_id = static_cast<u16>(cqe.flags >> IORING_CQE_BUFFER_SHIFT);
                 REQUIRE_LT(buf_id, kProvidedBufCount);
                 REQUIRE_LE(static_cast<u32>(cqe.res), kProvidedBufSize);
                 const u32 fragment_len = static_cast<u32>(cqe.res);
                 REQUIRE_LE(fragment_len, sizeof(kRequestTwo) - 1u - raw_request_len);
-                const u8* bytes =
-                    backend.buf_base + static_cast<u64>(buf_id) * kProvidedBufSize;
+                const u8* bytes = backend.buf_base + static_cast<u64>(buf_id) * kProvidedBufSize;
                 REQUIRE_EQ(memcmp(bytes, kRequestTwo + raw_request_len, fragment_len), 0);
                 memcpy(raw_request + raw_request_len, bytes, fragment_len);
                 raw_request_len += fragment_len;
@@ -24546,8 +24536,7 @@ TEST(route, ordinary_source_validated_failure_late_successor_iouring) {
     REQUIRE_EQ(raw_request_len, sizeof(kRequestTwo) - 1u);
     REQUIRE_EQ(memcmp(raw_request, kRequestTwo, raw_request_len), 0);
     REQUIRE_EQ(__atomic_load_n(backend.cq_head, __ATOMIC_ACQUIRE), raw_head);
-    REQUIRE_EQ(__atomic_load_n(backend.sq_head, __ATOMIC_ACQUIRE),
-               runner.sq_head_after_dispatch);
+    REQUIRE_EQ(__atomic_load_n(backend.sq_head, __ATOMIC_ACQUIRE), runner.sq_head_after_dispatch);
     REQUIRE_EQ(backend.pending, runner.sq_pending_after_dispatch);
 
     runner.release.store(true, std::memory_order_release);
@@ -24559,10 +24548,8 @@ TEST(route, ordinary_source_validated_failure_late_successor_iouring) {
     while (wire_len < expected_wire_len && test_mono_ms() < wire_deadline_ms) {
         const i64 remaining_ms = wire_deadline_ms - test_mono_ms();
         if (remaining_ms <= 0) break;
-        const i32 got = recv_timeout(client.fd,
-                                     wire + wire_len,
-                                     sizeof(wire) - wire_len,
-                                     static_cast<i32>(remaining_ms));
+        const i32 got = recv_timeout(
+            client.fd, wire + wire_len, sizeof(wire) - wire_len, static_cast<i32>(remaining_ms));
         REQUIRE_GT(got, 0);
         wire_len += static_cast<u32>(got);
         REQUIRE_LE(wire_len, expected_wire_len);
@@ -24570,9 +24557,7 @@ TEST(route, ordinary_source_validated_failure_late_successor_iouring) {
     REQUIRE_EQ(wire_len, expected_wire_len);
     REQUIRE(normalize_public_date(wire, wire_len));
     REQUIRE_EQ(memcmp(wire, kExpectedOne, sizeof(kExpectedOne) - 1u), 0);
-    REQUIRE_EQ(memcmp(wire + sizeof(kExpectedOne) - 1u,
-                      kExpectedTwo,
-                      sizeof(kExpectedTwo) - 1u),
+    REQUIRE_EQ(memcmp(wire + sizeof(kExpectedOne) - 1u, kExpectedTwo, sizeof(kExpectedTwo) - 1u),
                0);
 
     char eof_probe[32];
@@ -24581,8 +24566,8 @@ TEST(route, ordinary_source_validated_failure_late_successor_iouring) {
     while (test_mono_ms() < eof_deadline_ms) {
         const i64 remaining_ms = eof_deadline_ms - test_mono_ms();
         if (remaining_ms <= 0) break;
-        eof_result = recv_timeout(
-            client.fd, eof_probe, sizeof(eof_probe), static_cast<i32>(remaining_ms));
+        eof_result =
+            recv_timeout(client.fd, eof_probe, sizeof(eof_probe), static_cast<i32>(remaining_ms));
         if (eof_result != -EINTR) break;
     }
     REQUIRE_EQ(eof_result, 0);

@@ -240,7 +240,10 @@ TEST(drain_callback, non_drain_response_has_keep_alive) {
     REQUIRE(c != nullptr);
     loop.backend.clear_ops();
 
-    loop.inject_and_dispatch(make_ev(c->id, IoEventType::Recv, 100));
+    static constexpr char kRequest[] = "GET / HTTP/1.1\r\nHost: x\r\n\r\n";
+    REQUIRE_EQ(c->recv_buf.write(reinterpret_cast<const u8*>(kRequest), sizeof(kRequest) - 1),
+               sizeof(kRequest) - 1);
+    loop.dispatch(make_ev(c->id, IoEventType::Recv, sizeof(kRequest) - 1));
 
     CHECK(c->keep_alive);
     CHECK(buf_contains(c->send_buf, "keep-alive"));

@@ -4746,8 +4746,7 @@ TEST(recv_semantic, proxy_recv_buf_lifetime) {
 
     // Upstream request sent → on_upstream_request_sent resets upstream_recv_buf for response.
     // recv_buf retains original request data (not touched).
-    loop.inject_and_dispatch(
-        make_ev(conn->id, IoEventType::UpstreamSend, sizeof(kRequest) - 1));
+    loop.inject_and_dispatch(make_ev(conn->id, IoEventType::UpstreamSend, sizeof(kRequest) - 1));
     CHECK_EQ(conn->upstream_recv_buf.len(), 0u);  // reset by on_upstream_request_sent
 
     // Upstream response received → data goes into upstream_recv_buf (valid HTTP response)
@@ -7734,13 +7733,18 @@ TEST(close_cancel, no_cancel_for_idle_conn) {
     auto* c = loop.find_fd(42);
     REQUIRE(c != nullptr);
 
-    // Complete the full request-response cycle so fds get cleared normally.
-    loop.inject_and_dispatch(make_ev(c->id, IoEventType::Recv, 50));
+    // Complete a valid keep-alive request-response cycle. This keeps the slot
+    // allocated while leaving it idle for the explicit invalid-fd guard below.
+    static constexpr char kRequest[] = "GET / HTTP/1.1\r\nHost: x\r\n\r\n";
+    REQUIRE_EQ(c->recv_buf.write(reinterpret_cast<const u8*>(kRequest), sizeof(kRequest) - 1),
+               sizeof(kRequest) - 1);
+    loop.dispatch(make_ev(c->id, IoEventType::Recv, sizeof(kRequest) - 1));
     u32 send_len = c->send_buf.len();
     loop.inject_and_dispatch(make_ev(c->id, IoEventType::Send, static_cast<i32>(send_len)));
+    REQUIRE_EQ(c->state, ConnState::ReadingHeader);
+    REQUIRE_EQ(c->fd, 42);
 
-    // Now force-close a connection whose fd is already -1 (keep-alive idle
-    // would not have fd=-1, but test the guard path).
+    // Force the allocated idle slot's fds to -1 to test the cancel guard path.
     c->fd = -1;
     c->upstream_fd = -1;
     loop.backend.clear_ops();
@@ -9413,9 +9417,9 @@ TEST(streaming, proxy_keepalive_two_requests) {
     auto* conn = loop.find_fd(42);
     REQUIRE(conn != nullptr);
     static constexpr char kFirstRequest[] = "GET /proxy/first HTTP/1.1\r\nHost: x\r\n\r\n";
-    REQUIRE_EQ(conn->recv_buf.write(reinterpret_cast<const u8*>(kFirstRequest),
-                                    sizeof(kFirstRequest) - 1),
-               sizeof(kFirstRequest) - 1);
+    REQUIRE_EQ(
+        conn->recv_buf.write(reinterpret_cast<const u8*>(kFirstRequest), sizeof(kFirstRequest) - 1),
+        sizeof(kFirstRequest) - 1);
     loop.dispatch(make_ev(conn->id, IoEventType::Recv, sizeof(kFirstRequest) - 1));
 
     // Proxy setup.
@@ -15302,9 +15306,9 @@ TEST(local_response_persistence, ordinary_jit_connection_close_owns_send_until_t
         static constexpr char kRequests[] =
             "GET /local HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n"
             "GET /local HTTP/1.1\r\nHost: x\r\n\r\n";
-        REQUIRE_EQ(conn->recv_buf.write(reinterpret_cast<const u8*>(kRequests),
-                                        sizeof(kRequests) - 1),
-                   sizeof(kRequests) - 1);
+        REQUIRE_EQ(
+            conn->recv_buf.write(reinterpret_cast<const u8*>(kRequests), sizeof(kRequests) - 1),
+            sizeof(kRequests) - 1);
         response_read_timeout_later_handler_calls = 0;
         loop.dispatch(make_ev_more(conn->id,
                                    IoEventType::Recv,
@@ -15392,8 +15396,8 @@ TEST(local_response_persistence, ordinary_publishers_share_wire_and_lifecycle_de
     }
     {
         auto loop = make_loop();
-        Connection* conn = dispatch(
-            *loop, nullptr, "GET / HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n");
+        Connection* conn =
+            dispatch(*loop, nullptr, "GET / HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n");
         REQUIRE(conn != nullptr);
         check_wire(*conn, false);
     }
@@ -15413,8 +15417,7 @@ TEST(local_response_persistence, ordinary_publishers_share_wire_and_lifecycle_de
         RouteConfig config{};
         REQUIRE(config.add_jit_handler(
             "/local", kRouteMethodGet, &response_read_timeout_later_handler, false));
-        Connection* conn =
-            dispatch(*loop, &config, "GET /local HTTP/1.1\r\nHost: x\r\n\r\n");
+        Connection* conn = dispatch(*loop, &config, "GET /local HTTP/1.1\r\nHost: x\r\n\r\n");
         REQUIRE(conn != nullptr);
         CHECK_EQ(conn->resp_status, 204u);
         check_wire(*conn, true);  // immediate JIT ReturnStatus
@@ -15426,8 +15429,7 @@ TEST(local_response_persistence, ordinary_publishers_share_wire_and_lifecycle_de
         ShardMetrics* shards[] = {&shard};
         loop->all_shard_metrics = shards;
         loop->shard_metrics_count = 1;
-        Connection* conn =
-            dispatch(*loop, nullptr, "GET /metrics HTTP/1.1\r\nHost: x\r\n\r\n");
+        Connection* conn = dispatch(*loop, nullptr, "GET /metrics HTTP/1.1\r\nHost: x\r\n\r\n");
         REQUIRE(conn != nullptr);
         CHECK_EQ(conn->resp_status, 200u);
         check_wire(*conn, true);
@@ -15437,8 +15439,7 @@ TEST(local_response_persistence, ordinary_publishers_share_wire_and_lifecycle_de
         RouteConfig config{};
         REQUIRE(config.add_static("/local", kRouteMethodGet, 204));
         loop->draining = true;
-        Connection* conn =
-            dispatch(*loop, &config, "GET /local HTTP/1.1\r\nHost: x\r\n\r\n");
+        Connection* conn = dispatch(*loop, &config, "GET /local HTTP/1.1\r\nHost: x\r\n\r\n");
         REQUIRE(conn != nullptr);
         check_wire(*conn, false);  // drain already active at publication
     }
