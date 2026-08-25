@@ -7334,6 +7334,7 @@ struct ConverterExactLocalDifferentialObservation {
     std::vector<char> nginx_options_wire;
     std::vector<char> nginx_delete_wire;
     std::vector<char> nginx_put_wire;
+    std::vector<char> nginx_patch_wire;
     std::vector<char> generated_rut_wire;
     std::vector<char> generated_rut_head_wire;
     std::vector<char> generated_rut_post_wire;
@@ -7342,6 +7343,7 @@ struct ConverterExactLocalDifferentialObservation {
     std::vector<char> generated_rut_options_wire;
     std::vector<char> generated_rut_delete_wire;
     std::vector<char> generated_rut_put_wire;
+    std::vector<char> generated_rut_patch_wire;
     u32 nginx_upstream_accepts = 0;
     u32 nginx_upstream_requests = 0;
     u32 generated_rut_upstream_accepts = 0;
@@ -7429,8 +7431,10 @@ static bool run_converter_exact_local_differential(
         rut_source.find("route exact OPTIONS \"/static\"") != std::string::npos ||
         rut_source.find("route exact DELETE \"/static\"") != std::string::npos ||
         rut_source.find("route exact PUT \"/static\"") != std::string::npos ||
+        rut_source.find("route exact PATCH \"/static\"") != std::string::npos ||
         rut_source.find("DELETE") != std::string::npos ||
         rut_source.find("PUT") != std::string::npos ||
+        rut_source.find("PATCH") != std::string::npos ||
         rut_source.find("/static?") != std::string::npos ||
         rut_source.find("return forward(nginx_upstream") == std::string::npos ||
         rut_source.find("route \"/\"") == std::string::npos ||
@@ -7578,6 +7582,29 @@ static bool run_converter_exact_local_differential(
         put_header_end == std::string::npos || put_header_end + 4u != put_request.size() ||
         put_request.rfind("\r\n\r\n") != put_header_end) {
         error = "converter exact-local PUT left the fresh header-absent bounded domain";
+        return false;
+    }
+
+    // Pin one fresh header-absent origin-form PATCH request without introducing
+    // a general method, target, or framing parser.
+    const std::string patch_request(kExactLocalPatchCloseRequest,
+                                    sizeof(kExactLocalPatchCloseRequest) - 1u);
+    const size_t patch_header_end = patch_request.find("\r\n\r\n");
+    if (patch_request !=
+            "PATCH /static HTTP/1.1\r\n"
+            "Host: exact-local.example\r\n"
+            "Connection: close\r\n\r\n" ||
+        patch_request.rfind("PATCH /static HTTP/1.1\r\n", 0) != 0 ||
+        count_literal(patch_request, "\r\nConnection: close\r\n") != 1 ||
+        patch_request.find('?') != std::string::npos ||
+        patch_request.find("\r\nContent-Length:") != std::string::npos ||
+        patch_request.find("\r\nTransfer-Encoding:") != std::string::npos ||
+        patch_request.find("\r\nTE:") != std::string::npos ||
+        patch_request.find("\r\nExpect:") != std::string::npos ||
+        patch_request.find("\r\nUpgrade:") != std::string::npos ||
+        patch_header_end == std::string::npos || patch_header_end + 4u != patch_request.size() ||
+        patch_request.rfind("\r\n\r\n") != patch_header_end) {
+        error = "converter exact-local PATCH left the fresh header-absent bounded domain";
         return false;
     }
 
@@ -7794,6 +7821,16 @@ static bool run_converter_exact_local_differential(
                                kExactLocalCloseResponseNormalized,
                                false,
                                observation.nginx_put_wire);
+        if (side_ok)
+            side_ok = exercise(upstream,
+                               nginx.child,
+                               "pinned nginx",
+                               "header-absent PATCH /static",
+                               kExactLocalPatchCloseRequest,
+                               sizeof(kExactLocalPatchCloseRequest) - 1u,
+                               kExactLocalCloseResponseNormalized,
+                               false,
+                               observation.nginx_patch_wire);
         // Keep the recorder live until the frontend has been stopped and reaped.
         const bool process_stopped = stop_child(nginx.child);
         const bool container_removed = docker.remove();
@@ -7902,6 +7939,16 @@ static bool run_converter_exact_local_differential(
                                kExactLocalCloseResponseNormalized,
                                false,
                                observation.generated_rut_put_wire);
+        if (side_ok)
+            side_ok = exercise(upstream,
+                               generated_rut.child,
+                               "converter-generated ordinary RUT",
+                               "header-absent PATCH /static",
+                               kExactLocalPatchCloseRequest,
+                               sizeof(kExactLocalPatchCloseRequest) - 1u,
+                               kExactLocalCloseResponseNormalized,
+                               false,
+                               observation.generated_rut_patch_wire);
         // Preserve the same frontend-before-recorder teardown order as nginx.
         const bool process_stopped = stop_child(generated_rut.child);
         const bool recorder_settled =
@@ -8010,6 +8057,21 @@ static bool run_converter_exact_local_differential(
         normalized_nginx_put != normalized_generated_rut_put) {
         error =
             "pinned nginx and converter-generated ordinary RUT header-absent PUT /static wires "
+            "did not each equal the expected response after Date-only normalization";
+        return false;
+    }
+    const std::vector<char> expected_patch(
+        kExactLocalCloseResponseNormalized,
+        kExactLocalCloseResponseNormalized + sizeof(kExactLocalCloseResponseNormalized) - 1u);
+    std::vector<char> normalized_nginx_patch = observation.nginx_patch_wire;
+    std::vector<char> normalized_generated_rut_patch = observation.generated_rut_patch_wire;
+    if (!normalize_date(normalized_nginx_patch) ||
+        !normalize_date(normalized_generated_rut_patch) ||
+        normalized_nginx_patch != expected_patch ||
+        normalized_generated_rut_patch != expected_patch ||
+        normalized_nginx_patch != normalized_generated_rut_patch) {
+        error =
+            "pinned nginx and converter-generated ordinary RUT header-absent PATCH /static wires "
             "did not each equal the expected response after Date-only normalization";
         return false;
     }
@@ -8891,6 +8953,8 @@ int main(int argc, char** argv) {
                       observation.nginx_delete_wire);
             dump_wire("pinned nginx converter header-absent PUT /static",
                       observation.nginx_put_wire);
+            dump_wire("pinned nginx converter header-absent PATCH /static",
+                      observation.nginx_patch_wire);
             dump_wire("converter-generated ordinary RUT exact GET /static",
                       observation.generated_rut_wire);
             dump_wire("converter-generated ordinary RUT exact HEAD /static",
@@ -8907,6 +8971,8 @@ int main(int argc, char** argv) {
                       observation.generated_rut_delete_wire);
             dump_wire("converter-generated ordinary RUT header-absent PUT /static",
                       observation.generated_rut_put_wire);
+            dump_wire("converter-generated ordinary RUT header-absent PATCH /static",
+                      observation.generated_rut_patch_wire);
             std::cerr << "converter exact-local upstream nginx accepted="
                       << observation.nginx_upstream_accepts
                       << " requests=" << observation.nginx_upstream_requests
@@ -8939,12 +9005,17 @@ int main(int argc, char** argv) {
                "wire, EOF, and live zero-upstream oracle (excluding DELETE query, any "
                "Content-Length including CL0, TE/Transfer-Encoding, Expect, Upgrade, body/tail, "
                "reuse/pipeline, proxy DELETE, other paths, TLS/H2, or broader locations); one "
-               "final fresh depth-zero cleartext HTTP/1.1 origin-form header-absent "
+               "fresh depth-zero cleartext HTTP/1.1 origin-form header-absent "
                "explicit-close PUT /static independently matches the same fixed full-body wire, "
                "real EOF, and live/settled zero-upstream oracle (excluding PUT query, any "
                "Content-Length including CL0, TE/Transfer-Encoding, Expect, Upgrade, body/tail, "
-               "reuse/pipeline, proxy PUT, PATCH, other paths, TLS/H2, broader locations, or "
-               "direct nginx.conf runtime support)\n";
+               "reuse/pipeline, proxy PUT, other paths, TLS/H2, or broader locations); one final "
+               "fresh depth-zero cleartext HTTP/1.1 origin-form header-absent explicit-close "
+               "PATCH /static independently matches the same fixed full-body wire, real EOF, and "
+               "live/settled zero-upstream oracle (excluding PATCH query, any Content-Length "
+               "including CL0, TE/Transfer-Encoding, Expect, Upgrade, body/tail, reuse/pipeline, "
+               "proxy PATCH, other paths, TLS/H2, broader locations, or direct nginx.conf runtime "
+               "support)\n";
         if (converter_exact_local_differential) return 0;
     }
 
