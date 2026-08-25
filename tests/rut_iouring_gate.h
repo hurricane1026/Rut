@@ -7,7 +7,7 @@
 #include <string.h>
 
 #define RUT_IOURING_GATE_MAGIC UINT64_C(0x525554494F475431)
-#define RUT_IOURING_GATE_VERSION UINT32_C(3)
+#define RUT_IOURING_GATE_VERSION UINT32_C(4)
 #define RUT_IOURING_GATE_CONNECT_JOURNAL_CAPACITY UINT32_C(4)
 
 enum rut_iouring_gate_error {
@@ -25,6 +25,19 @@ enum rut_iouring_gate_error {
     RUT_IOURING_GATE_ERROR_CONNECT_JOURNAL = 11,
 };
 
+enum rut_iouring_gate_mode {
+    RUT_IOURING_GATE_MODE_NONE = 0,
+    RUT_IOURING_GATE_MODE_LATE_SUCCESSOR = 1,
+    RUT_IOURING_GATE_MODE_COALESCED_INGRESS = 2,
+};
+
+enum rut_iouring_gate_ingress_state {
+    RUT_IOURING_GATE_INGRESS_RECV_OWNED = 20,
+    RUT_IOURING_GATE_INGRESS_REQUEST_SENT = 21,
+    RUT_IOURING_GATE_INGRESS_HIT = 22,
+    RUT_IOURING_GATE_INGRESS_RELEASED = 23,
+};
+
 struct rut_iouring_gate_connect_attempt {
     int32_t fd;
     uint32_t ipv4_be;
@@ -39,6 +52,7 @@ struct rut_iouring_gate {
     uint32_t layout_size;
     uint32_t state;
     uint32_t error_code;
+    uint32_t mode;
     uint32_t hook_magic_ok;
     uint32_t hook_version;
     uint32_t hook_layout_size;
@@ -63,6 +77,9 @@ struct rut_iouring_gate {
     uint32_t cq_tail_at_arrival;
     uint32_t witness_fragments;
     uint32_t witness_length;
+    uint32_t witness_wire_length;
+    uint32_t ingress_recv_sqe_count;
+    uint32_t ingress_send_sqe_count;
     uint32_t request_two_length;
     uint32_t connect_attempt_count;
     uint32_t connect_journal_overflow;
@@ -73,6 +90,7 @@ struct rut_iouring_gate {
     pthread_mutex_t identity_mutex;
     unsigned char intercepted_prefix[RUT_DOWNSTREAM_GATE_PREFIX_CAPACITY];
     unsigned char request_two[RUT_DOWNSTREAM_GATE_REQUEST_CAPACITY];
+    unsigned char witness_wire[RUT_DOWNSTREAM_GATE_REQUEST_CAPACITY];
 };
 
 static inline void rut_iouring_gate_recover_owner_death_locked(struct rut_iouring_gate* gate) {
@@ -96,11 +114,15 @@ static inline void rut_iouring_gate_recover_owner_death_locked(struct rut_iourin
     gate->cq_tail_at_arrival = 0;
     gate->witness_fragments = 0;
     gate->witness_length = 0;
+    gate->witness_wire_length = 0;
+    gate->ingress_recv_sqe_count = 0;
+    gate->ingress_send_sqe_count = 0;
     gate->connect_attempt_count = 0;
     gate->connect_journal_overflow = 0;
     gate->connect_journal_duplicate = 0;
     memset(gate->connect_attempts, 0, sizeof(gate->connect_attempts));
     memset(gate->intercepted_prefix, 0, sizeof(gate->intercepted_prefix));
+    memset(gate->witness_wire, 0, sizeof(gate->witness_wire));
     rut_downstream_gate_store(&gate->ring_ready, 0);
     rut_downstream_gate_store(&gate->state, RUT_DOWNSTREAM_GATE_FAILED);
 }
@@ -156,7 +178,7 @@ static inline int rut_iouring_gate_wait_until(struct rut_iouring_gate* gate,
 }
 
 #if defined(__cplusplus) && defined(__x86_64__)
-static_assert(sizeof(struct rut_iouring_gate) == 824);
+static_assert(sizeof(struct rut_iouring_gate) == 1360);
 #elif defined(__x86_64__)
-_Static_assert(sizeof(struct rut_iouring_gate) == 824, "RUT io_uring gate layout drift");
+_Static_assert(sizeof(struct rut_iouring_gate) == 1360, "RUT io_uring gate layout drift");
 #endif

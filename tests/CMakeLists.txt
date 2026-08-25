@@ -499,6 +499,18 @@ if(RUT_ENABLE_JIT)
             TIMEOUT 30
         )
         add_test(
+            NAME test_rut_iouring_coalesced_ingress_gate
+            COMMAND test_nginx_differential --rut-iouring-coalesced-ingress-gate
+                    $<TARGET_FILE:rut> $<TARGET_FILE:test_rut_iouring_gate_preload>
+        )
+        set_tests_properties(test_rut_iouring_coalesced_ingress_gate PROPERTIES
+            LABELS "integration;nginx"
+            RUN_SERIAL TRUE
+            RESOURCE_LOCK nginx-differential
+            TIMEOUT 30
+            ENVIRONMENT "RUT_NGINX_DIFFERENTIAL_REQUIRED=1"
+        )
+        add_test(
             NAME test_nginx_late_successor_differential
             COMMAND test_nginx_differential --late-successor-differential
                     $<TARGET_FILE:rut>
