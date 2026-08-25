@@ -72,6 +72,10 @@ static constexpr char kExactLocalDeleteCloseRequest[] =
     "DELETE /static HTTP/1.1\r\n"
     "Host: exact-local.example\r\n"
     "Connection: close\r\n\r\n";
+static constexpr char kExactLocalPutCloseRequest[] =
+    "PUT /static HTTP/1.1\r\n"
+    "Host: exact-local.example\r\n"
+    "Connection: close\r\n\r\n";
 static constexpr char kExactLocalQueryCloseRequest[] =
     "GET /static?x=1 HTTP/1.1\r\n"
     "Host: exact-local.example\r\n"
@@ -6655,7 +6659,8 @@ struct ExactLocalReturnObservation {
 static constexpr size_t kExactLocalHeaderAbsentPostVectorIndex = 4;
 static constexpr size_t kExactLocalCl0PostVectorIndex = 5;
 static constexpr size_t kExactLocalDeleteVectorIndex = 7;
-static constexpr size_t kExactLocalReturnVectorCount = 11;
+static constexpr size_t kExactLocalPutVectorIndex = 8;
+static constexpr size_t kExactLocalReturnVectorCount = 12;
 
 static void dump_exact_local_return_observation(const ExactLocalReturnObservation& observation) {
     static constexpr const char* kLabels[] = {
@@ -6667,6 +6672,7 @@ static void dump_exact_local_return_observation(const ExactLocalReturnObservatio
         "POST Content-Length: 0 close",
         "OPTIONS close",
         "DELETE header-absent close",
+        "PUT header-absent close",
         "GET query close",
         "GET /static/ fallback",
         "GET /static/child fallback",
@@ -6710,6 +6716,31 @@ static bool capture_pinned_exact_local_order(u16 frontend_port,
         delete_header_end == std::string::npos || delete_header_end + 4u != delete_request.size() ||
         delete_request.rfind("\r\n\r\n") != delete_header_end) {
         error = "pinned exact-local DELETE left the header-absent bounded domain";
+        return false;
+    }
+
+    // A deliberately byte-exact #298/#299 prerequisite request, not a general
+    // request parser: fresh H1.1 origin form with one close header and no query,
+    // framing, body, or tail.
+    const std::string put_request(kExactLocalPutCloseRequest,
+                                  sizeof(kExactLocalPutCloseRequest) - 1u);
+    const size_t put_close = put_request.find("\r\nConnection: close\r\n");
+    const size_t put_header_end = put_request.find("\r\n\r\n");
+    if (put_request !=
+            "PUT /static HTTP/1.1\r\n"
+            "Host: exact-local.example\r\n"
+            "Connection: close\r\n\r\n" ||
+        put_request.rfind("PUT /static HTTP/1.1\r\n", 0) != 0 ||
+        put_request.find('?') != std::string::npos || put_close == std::string::npos ||
+        put_request.rfind("\r\nConnection: close\r\n") != put_close ||
+        put_request.find("\r\nContent-Length:") != std::string::npos ||
+        put_request.find("\r\nTransfer-Encoding:") != std::string::npos ||
+        put_request.find("\r\nTE:") != std::string::npos ||
+        put_request.find("\r\nExpect:") != std::string::npos ||
+        put_request.find("\r\nUpgrade:") != std::string::npos ||
+        put_header_end == std::string::npos || put_header_end + 4u != put_request.size() ||
+        put_request.rfind("\r\n\r\n") != put_header_end) {
+        error = "pinned exact-local PUT left the fresh header-absent bounded domain";
         return false;
     }
 
@@ -6873,6 +6904,11 @@ static bool capture_pinned_exact_local_order(u16 frontend_port,
                           sizeof(kExactLocalDeleteCloseRequest) - 1u,
                           kExactLocalCloseResponseNormalized,
                           false) ||
+        !run_close_vector("PUT /static header-absent close",
+                          kExactLocalPutCloseRequest,
+                          sizeof(kExactLocalPutCloseRequest) - 1u,
+                          kExactLocalCloseResponseNormalized,
+                          false) ||
         !run_close_vector("GET /static?x=1 close",
                           kExactLocalQueryCloseRequest,
                           sizeof(kExactLocalQueryCloseRequest) - 1u,
@@ -6978,6 +7014,17 @@ static bool run_pinned_exact_local_return_baseline(u16 frontend_port,
         exact_first_delete != root_first_delete) {
         error =
             "pinned exact-local DELETE did not equal the fixed oracle in both declaration orders";
+        return false;
+    }
+    const std::vector<char> expected_put(
+        kExactLocalCloseResponseNormalized,
+        kExactLocalCloseResponseNormalized + sizeof(kExactLocalCloseResponseNormalized) - 1u);
+    std::vector<char> exact_first_put = exact_first.wires[kExactLocalPutVectorIndex];
+    std::vector<char> root_first_put = root_first.wires[kExactLocalPutVectorIndex];
+    if (!normalize_date(exact_first_put) || !normalize_date(root_first_put) ||
+        exact_first_put != expected_put || root_first_put != expected_put ||
+        exact_first_put != root_first_put) {
+        error = "pinned exact-local PUT did not equal the fixed oracle in both declaration orders";
         return false;
     }
     if (!normalized_wires_equal(
@@ -8627,12 +8674,13 @@ int main(int argc, char** argv) {
             << "PASS: pinned nginx exact /static local return is declaration-order independent; "
                "an explicit-close POST with exactly one Content-Length: 0 matches the adjacent "
                "header-absent POST, and a fresh header-absent explicit-close DELETE /static in "
-               "both declaration orders yields exact 200/CL16/full successor-static/EOF; only "
-               "/static/ and /static/child retain exactly two scoped proxy attempts "
-               "(pinned-nginx-only semantic evidence; RUT equivalence remains blocked by #295 and "
-               "there is no converter equivalence claim; excludes DELETE CL including CL0, "
-               "body/framing, query, keep-alive/reuse/pipeline, other methods or paths, proxy "
-               "DELETE, and TLS/H2)\n";
+               "both declaration orders retains its fixed oracle; a fresh header-absent "
+               "explicit-close PUT /static independently yields exact 200/CL16/full "
+               "successor-static/close/EOF in both declaration orders; only /static/ and "
+               "/static/child retain exactly two scoped proxy attempts (pinned-nginx-only bounded "
+               "PUT semantic evidence; RUT equivalence remains blocked by #299 and there is no "
+               "converter equivalence claim; excludes PUT CL including CL0, body/framing, query, "
+               "keep-alive/reuse/pipeline, other methods or paths, proxy PUT, and TLS/H2)\n";
         if (exact_local_return_baseline) return 0;
     }
 
