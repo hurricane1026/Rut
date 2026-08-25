@@ -7189,11 +7189,13 @@ struct ConverterExactLocalDifferentialObservation {
     std::vector<char> nginx_post_wire;
     std::vector<char> nginx_cl0_post_wire;
     std::vector<char> nginx_query_wire;
+    std::vector<char> nginx_options_wire;
     std::vector<char> generated_rut_wire;
     std::vector<char> generated_rut_head_wire;
     std::vector<char> generated_rut_post_wire;
     std::vector<char> generated_rut_cl0_post_wire;
     std::vector<char> generated_rut_query_wire;
+    std::vector<char> generated_rut_options_wire;
     u32 nginx_upstream_accepts = 0;
     u32 nginx_upstream_requests = 0;
     u32 generated_rut_upstream_accepts = 0;
@@ -7278,6 +7280,7 @@ static bool run_converter_exact_local_differential(
         !exact_contains("status: 200, reason: \"OK\"") ||
         !exact_contains("head_mode: \"suppress_body\", body: b\"successor-static\"") ||
         rut_source.find("route exact GET \"/static\"") != std::string::npos ||
+        rut_source.find("route exact OPTIONS \"/static\"") != std::string::npos ||
         rut_source.find("/static?") != std::string::npos ||
         rut_source.find("return forward(nginx_upstream") == std::string::npos ||
         rut_source.find("route \"/\"") == std::string::npos ||
@@ -7356,6 +7359,29 @@ static bool run_converter_exact_local_differential(
         query_header_end == std::string::npos || query_header_end + 4u != query_request.size() ||
         query_request.rfind("\r\n\r\n") != query_header_end) {
         error = "converter exact-local query GET left the literal /static?x=1 bounded domain";
+        return false;
+    }
+
+    // Pin one header-absent origin-form OPTIONS request without introducing a
+    // general method or framing parser.
+    const std::string options_request(kExactLocalOptionsCloseRequest,
+                                      sizeof(kExactLocalOptionsCloseRequest) - 1u);
+    const size_t options_header_end = options_request.find("\r\n\r\n");
+    if (options_request !=
+            "OPTIONS /static HTTP/1.1\r\n"
+            "Host: exact-local.example\r\n"
+            "Connection: close\r\n\r\n" ||
+        options_request.rfind("OPTIONS /static HTTP/1.1\r\n", 0) != 0 ||
+        count_literal(options_request, "\r\nConnection: close\r\n") != 1 ||
+        options_request.find("\r\nContent-Length:") != std::string::npos ||
+        options_request.find("\r\nTransfer-Encoding:") != std::string::npos ||
+        options_request.find("\r\nTE:") != std::string::npos ||
+        options_request.find("\r\nExpect:") != std::string::npos ||
+        options_request.find("\r\nUpgrade:") != std::string::npos ||
+        options_header_end == std::string::npos ||
+        options_header_end + 4u != options_request.size() ||
+        options_request.rfind("\r\n\r\n") != options_header_end) {
+        error = "converter exact-local OPTIONS left the header-absent bounded domain";
         return false;
     }
 
@@ -7542,6 +7568,16 @@ static bool run_converter_exact_local_differential(
                                kExactLocalCloseResponseNormalized,
                                false,
                                observation.nginx_query_wire);
+        if (side_ok)
+            side_ok = exercise(upstream,
+                               nginx.child,
+                               "pinned nginx",
+                               "header-absent OPTIONS /static",
+                               kExactLocalOptionsCloseRequest,
+                               sizeof(kExactLocalOptionsCloseRequest) - 1u,
+                               kExactLocalCloseResponseNormalized,
+                               false,
+                               observation.nginx_options_wire);
         // Keep the recorder live until the frontend has been stopped and reaped.
         const bool process_stopped = stop_child(nginx.child);
         const bool container_removed = docker.remove();
@@ -7620,6 +7656,16 @@ static bool run_converter_exact_local_differential(
                                kExactLocalCloseResponseNormalized,
                                false,
                                observation.generated_rut_query_wire);
+        if (side_ok)
+            side_ok = exercise(upstream,
+                               generated_rut.child,
+                               "converter-generated ordinary RUT",
+                               "header-absent OPTIONS /static",
+                               kExactLocalOptionsCloseRequest,
+                               sizeof(kExactLocalOptionsCloseRequest) - 1u,
+                               kExactLocalCloseResponseNormalized,
+                               false,
+                               observation.generated_rut_options_wire);
         // Preserve the same frontend-before-recorder teardown order as nginx.
         const bool process_stopped = stop_child(generated_rut.child);
         const bool recorder_settled =
@@ -7686,6 +7732,21 @@ static bool run_converter_exact_local_differential(
         error =
             "pinned nginx and converter-generated ordinary RUT literal GET /static?x=1 wires did "
             "not each equal the expected response after Date-only normalization";
+        return false;
+    }
+    const std::vector<char> expected_options(
+        kExactLocalCloseResponseNormalized,
+        kExactLocalCloseResponseNormalized + sizeof(kExactLocalCloseResponseNormalized) - 1u);
+    std::vector<char> normalized_nginx_options = observation.nginx_options_wire;
+    std::vector<char> normalized_generated_rut_options = observation.generated_rut_options_wire;
+    if (!normalize_date(normalized_nginx_options) ||
+        !normalize_date(normalized_generated_rut_options) ||
+        normalized_nginx_options != expected_options ||
+        normalized_generated_rut_options != expected_options ||
+        normalized_nginx_options != normalized_generated_rut_options) {
+        error =
+            "pinned nginx and converter-generated ordinary RUT header-absent OPTIONS /static "
+            "wires did not each equal the expected response after Date-only normalization";
         return false;
     }
     return true;
@@ -8554,6 +8615,8 @@ int main(int argc, char** argv) {
                       observation.nginx_cl0_post_wire);
             dump_wire("pinned nginx converter literal GET /static?x=1",
                       observation.nginx_query_wire);
+            dump_wire("pinned nginx converter header-absent OPTIONS /static",
+                      observation.nginx_options_wire);
             dump_wire("converter-generated ordinary RUT exact GET /static",
                       observation.generated_rut_wire);
             dump_wire("converter-generated ordinary RUT exact HEAD /static",
@@ -8564,6 +8627,8 @@ int main(int argc, char** argv) {
                       observation.generated_rut_cl0_post_wire);
             dump_wire("converter-generated ordinary RUT literal GET /static?x=1",
                       observation.generated_rut_query_wire);
+            dump_wire("converter-generated ordinary RUT header-absent OPTIONS /static",
+                      observation.generated_rut_options_wire);
             std::cerr << "converter exact-local upstream nginx accepted="
                       << observation.nginx_upstream_accepts
                       << " requests=" << observation.nginx_upstream_requests
@@ -8587,8 +8652,11 @@ int main(int argc, char** argv) {
                "empty/multiple/repeated/different queries, encoded delimiters, fragments, absolute "
                "form, $args/$request_uri or other variables, rewrite/internal redirects, proxy "
                "query forwarding, alternate/duplicate/conflicting/malformed Content-Length, "
-               "CL+TE, positive body, reuse/pipeline, TLS/H2, other methods or paths, broader "
-               "locations, or direct nginx.conf runtime support)\n";
+               "CL+TE, positive body); one fresh header-absent explicit-close OPTIONS /static also "
+               "matches the full 16-byte-body oracle with no extra headers or tail (excluding "
+               "OPTIONS-star, CORS/preflight, general Allow synthesis, proxy or query-bearing "
+               "OPTIONS, request framing/body, reuse/pipeline, other paths or methods, TLS/H2, "
+               "broader semantics, or direct nginx.conf runtime support)\n";
         if (converter_exact_local_differential) return 0;
     }
 
