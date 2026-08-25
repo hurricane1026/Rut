@@ -17287,14 +17287,14 @@ struct RecordingUpstream {
         return nullptr;
     }
 
-    bool setup() {
+    bool setup(u16 requested_port = 0) {
         thread_alive.store(false, std::memory_order_release);
         listener_failed.store(false, std::memory_order_release);
         const u32 first_response_modes = static_cast<u32>(gate_first_response_close) +
                                          static_cast<u32>(wait_first_response_for_peer_close) +
                                          static_cast<u32>(stall_first_response_for_peer_close);
         if (first_response_modes > 1) return false;
-        auto lfd = create_listen_socket(0);
+        auto lfd = create_listen_socket(requested_port);
         if (!lfd.has_value()) return false;
         listen_fd = lfd.value();
         port = get_port(listen_fd);
@@ -24550,6 +24550,474 @@ route "/api" {
             zero = backend.request_history[slot][i] == '\0';
         CHECK(zero);
     }
+#endif
+}
+
+TEST(route, fixed_redirect_ordinary_source_reaches_production_h1_and_root_neighbors) {
+#if !RUT_ENABLE_JIT_TESTS
+    return;
+#else
+    using namespace rut;
+    if (!iouring_socket_live()) SKIP("io_uring async socket ops unavailable in this environment");
+
+    static constexpr char kRedirectBody[] =
+        "<html>\r\n"
+        "<head><title>301 Moved Permanently</title></head>\r\n"
+        "<body>\r\n"
+        "<center><h1>301 Moved Permanently</h1></center>\r\n"
+        "<hr><center>nginx/1.29.7</center>\r\n"
+        "</body>\r\n"
+        "</html>\r\n";
+    static constexpr char kExpectedRedirect[] =
+        "HTTP/1.1 301 Moved Permanently\r\n"
+        "Server: nginx/1.29.7\r\n"
+        "Date: XXXXXXXXXXXXXXXXXXXXXXXXXXXXX\r\n"
+        "Content-Type: text/html\r\n"
+        "Content-Length: 169\r\n"
+        "Connection: close\r\n"
+        "Location: http://redirect.example/new\r\n\r\n"
+        "<html>\r\n"
+        "<head><title>301 Moved Permanently</title></head>\r\n"
+        "<body>\r\n"
+        "<center><h1>301 Moved Permanently</h1></center>\r\n"
+        "<hr><center>nginx/1.29.7</center>\r\n"
+        "</body>\r\n"
+        "</html>\r\n";
+    static constexpr char kOriginResponse[] =
+        "HTTP/1.1 200 OK\r\n"
+        "Server: origin\r\n"
+        "Date: Tue, 01 Jan 2030 00:00:00 GMT\r\n"
+        "X-Origin: neighbor\r\n"
+        "Content-Length: 2\r\n"
+        "Connection: close\r\n\r\n"
+        "ok";
+    static_assert(sizeof(kRedirectBody) - 1u == 169u);
+    static_assert(sizeof(kExpectedRedirect) - 1u == 366u);
+
+    // Both recorder lifetimes enclose the shard lifetime below.  On any
+    // failure-path return, reverse destruction therefore stops/joins the
+    // shard before either listener or its recorded state is released.
+    RecordingUpstream redirect_epoch;
+    RecordingUpstream neighbor_epoch;
+    neighbor_epoch.response = kOriginResponse;
+    neighbor_epoch.response_len = sizeof(kOriginResponse) - 1u;
+    REQUIRE(redirect_epoch.setup());
+    const u16 upstream_port = redirect_epoch.port;
+
+    std::string source_text =
+        "listen :0\nupstream backend at \"127.0.0.1:" + std::to_string(upstream_port) + "\"\n";
+    source_text += R"rut(
+route GET "/" {
+  if req.pathOnly == "/old" {
+    return redirect({scheme: "http", authority: "static",
+      static_authority: "redirect.example", port: "omit", path: "static",
+      query: "discard", date: "current", connection: "close",
+      header_order: "connection_then_location", status: 301,
+      reason: "Moved Permanently", server: "nginx/1.29.7",
+      content_type: "text/html", target_path: "/new",
+      body: b"<html>\r\n<head><title>301 Moved Permanently</title></head>\r\n<body>\r\n<center><h1>301 Moved Permanently</h1></center>\r\n<hr><center>nginx/1.29.7</center>\r\n</body>\r\n</html>\r\n"})
+  } else {
+    return forward(backend,
+      request_policy: { version: "HTTP/1.1", host: "upstream", connection: "omit",
+        strip_headers: ["Connection", "Keep-Alive", "TE", "Expect", "Upgrade"] },
+      response_policy: { version: "HTTP/1.1", framing: "content_length",
+        connection: "request", server: "nginx/1.29.7", date: "current",
+        hide_headers: ["Date", "Server", "Connection"] },
+      failure_policy: { version: "HTTP/1.1", status: 502, reason: "Bad Gateway",
+        content_type: "text/html", server: "nginx/1.29.7", date: "current",
+        connection: "request", body: b"unavailable" })
+  }
+}
+)rut";
+
+    struct TempSource {
+        char path[64] = "/tmp/rut_fixed_redirect_wire_XXXXXX";
+        i32 fd = -1;
+        bool present = false;
+
+        bool create(Str text) {
+            fd = mkstemp(path);
+            if (fd < 0) return false;
+            present = true;
+            u32 written = 0;
+            while (written < text.len) {
+                const ssize_t n = write(fd, text.ptr + written, text.len - written);
+                if (n < 0 && errno == EINTR) continue;
+                if (n <= 0) return false;
+                written += static_cast<u32>(n);
+            }
+            if (close(fd) != 0) return false;
+            fd = -1;
+            return true;
+        }
+
+        bool remove() {
+            if (!present) return true;
+            if (unlink(path) != 0) return false;
+            present = false;
+            return true;
+        }
+
+        ~TempSource() {
+            if (fd >= 0) close(fd);
+            if (present) unlink(path);
+        }
+    } source;
+    REQUIRE(source.create({source_text.data(), static_cast<u32>(source_text.size())}));
+
+    LoadedProgram program{};
+    struct ProgramGuard {
+        LoadedProgram& program;
+        bool armed = true;
+        ~ProgramGuard() {
+            if (armed) program.destroy();
+        }
+    } program_guard{program};
+    LoadError load_error{};
+    const bool loaded = load_rut_program(source.path, program, load_error, jit::OptLevel::O0);
+    char load_message[512]{};
+    if (!loaded) format_load_error(load_error, load_message, sizeof(load_message));
+    REQUIRE_MSG(loaded, load_message);
+
+    // The only construction path above was load_rut_program.  Its frontend
+    // temporaries are already gone; the published config owns every redirect
+    // byte used by the running shard, independently of both RIR and source.
+    REQUIRE(program.jit_inited);
+    REQUIRE(program.has_listener);
+    CHECK_EQ(program.listener.port, 0u);
+    REQUIRE_EQ(program.rir.module.func_count, 1u);
+    REQUIRE(program.rir.module.functions[0].route_pattern.eq({"/", 1}));
+    CHECK_EQ(program.rir.module.functions[0].http_method, kRouteMethodGet);
+    REQUIRE_EQ(program.rir.module.upstream_count, 1u);
+    REQUIRE_EQ(program.rir.module.redirect_policy_count, 1u);
+    REQUIRE_EQ(program.rir.module.response_policy_count, 1u);
+    REQUIRE_EQ(program.rir.module.failure_policy_count, 1u);
+    REQUIRE_EQ(program.rir.module.policy_bundle_count, 1u);
+    REQUIRE_EQ(program.config.route_count, 1u);
+    REQUIRE_EQ(program.config.upstream_count, 1u);
+    REQUIRE_EQ(program.config.redirect_policy_count, 1u);
+    REQUIRE_EQ(program.config.response_policy_count, 1u);
+    REQUIRE_EQ(program.config.failure_policy_count, 1u);
+    REQUIRE_EQ(program.config.policy_bundle_count, 1u);
+    REQUIRE(program.config.redirect_policy_id_is_valid(1u));
+    REQUIRE(program.config.policy_bundle_id_is_valid(1u));
+    CHECK_EQ(program.config.policy_bundles[0].response_policy_id, 1u);
+    CHECK_EQ(program.config.policy_bundles[0].failure_policy_id, 1u);
+    CHECK_EQ(program.config.policy_bundles[0].timeout_failure_policy_id, 0u);
+    REQUIRE_EQ(program.config.upstreams[0].addr_count, 1u);
+    REQUIRE_EQ(program.config.upstreams[0].name_len, sizeof("backend") - 1u);
+    CHECK_EQ(memcmp(program.config.upstreams[0].name, "backend", sizeof("backend") - 1u), 0);
+    CHECK_EQ(program.config.upstreams[0].name[sizeof("backend") - 1u], '\0');
+    CHECK_NE(program.config.upstreams[0].name, program.rir.module.upstreams[0].name.ptr);
+    CHECK_EQ(ntohl(program.config.upstreams[0].addrs[0].sin_addr.s_addr), 0x7F000001u);
+    CHECK_EQ(ntohs(program.config.upstreams[0].addrs[0].sin_port), upstream_port);
+    const RouteEntry* root = program.config.match(
+        reinterpret_cast<const u8*>("/old"), sizeof("/old") - 1u, kRouteMethodGet);
+    REQUIRE(root != nullptr);
+    CHECK_EQ(root, &program.config.routes[0]);
+    REQUIRE_EQ(root->path_len, sizeof("/") - 1u);
+    CHECK_EQ(memcmp(root->path, "/", sizeof("/") - 1u), 0);
+    CHECK_EQ(root->path[root->path_len], '\0');
+    CHECK_NE(root->path, program.rir.module.functions[0].route_pattern.ptr);
+    CHECK_EQ(root->method, kRouteMethodGet);
+    CHECK_EQ(root->action, RouteAction::JitHandler);
+    CHECK_NE(root->fn, nullptr);
+
+    bool saw_redirect = false;
+    bool saw_forward = false;
+    for (u32 fi = 0; fi < program.rir.module.func_count; fi++) {
+        const auto& fn = program.rir.module.functions[fi];
+        for (u32 bi = 0; bi < fn.block_count; bi++) {
+            const auto& block = fn.blocks[bi];
+            for (u32 ii = 0; ii < block.inst_count; ii++) {
+                const auto& inst = block.insts[ii];
+                if (inst.op == rir::Opcode::RetRedirect) {
+                    saw_redirect = true;
+                    CHECK_EQ(inst.imm.i32_val, 1);
+                } else if (inst.op == rir::Opcode::RetForwardBundle) {
+                    saw_forward = true;
+                }
+            }
+        }
+    }
+    REQUIRE(saw_redirect);
+    REQUIRE(saw_forward);
+    REQUIRE(rir::verify_module(program.rir.module).ok);
+
+    const auto& lowered_policy = program.rir.module.redirect_policies[0];
+    const auto& policy = program.config.redirect_policies[0];
+    CHECK_EQ(policy.authority, RedirectPolicyAuthority::Static);
+    CHECK_EQ(policy.port, RedirectPolicyPort::Omit);
+    CHECK_EQ(policy.query, RedirectPolicyQuery::Discard);
+    CHECK_EQ(policy.header_order, RedirectPolicyHeaderOrder::ConnectionThenLocation);
+    CHECK(policy.static_authority.eq({"redirect.example", 16}));
+    CHECK(policy.target_path.eq({"/new", 4}));
+    CHECK(policy.body.eq({kRedirectBody, sizeof(kRedirectBody) - 1u}));
+    REQUIRE(program.config.redirect_policy_strings_are_owned(policy));
+    const Str owned_fields[] = {policy.reason,
+                                policy.server,
+                                policy.content_type,
+                                policy.static_authority,
+                                policy.target_path,
+                                policy.body};
+    const Str lowered_fields[] = {lowered_policy.reason,
+                                  lowered_policy.server,
+                                  lowered_policy.content_type,
+                                  lowered_policy.static_authority,
+                                  lowered_policy.target_path,
+                                  lowered_policy.body};
+    const uintptr_t source_begin = reinterpret_cast<uintptr_t>(program.src_map);
+    const uintptr_t source_end = source_begin + program.src_map_len;
+    for (u32 field = 0; field < 6; field++) {
+        CHECK_NE(owned_fields[field].ptr, lowered_fields[field].ptr);
+        const uintptr_t owned_begin = reinterpret_cast<uintptr_t>(owned_fields[field].ptr);
+        CHECK(owned_begin < source_begin || owned_begin >= source_end);
+    }
+    const uintptr_t route_path_begin = reinterpret_cast<uintptr_t>(root->path);
+    CHECK(route_path_begin < source_begin || route_path_begin >= source_end);
+    const uintptr_t upstream_name_begin =
+        reinterpret_cast<uintptr_t>(program.config.upstreams[0].name);
+    CHECK(upstream_name_begin < source_begin || upstream_name_begin >= source_end);
+    CHECK_NE(program.config.response_policies[0].server.ptr,
+             program.rir.module.response_policies[0].server.ptr);
+    CHECK_NE(program.config.failure_policies[0].reason.ptr,
+             program.rir.module.failure_policies[0].reason.ptr);
+    CHECK_NE(program.config.failure_policies[0].body.ptr,
+             program.rir.module.failure_policies[0].body.ptr);
+    std::string{}.swap(source_text);
+    CHECK(source_text.empty());
+    REQUIRE(source.remove());
+    CHECK_EQ(access(source.path, F_OK), -1);
+    CHECK_EQ(errno, ENOENT);
+
+    Shard<IoUringEventLoop> shard;
+    struct ShardGuard {
+        Shard<IoUringEventLoop>& shard;
+        bool initialized = false;
+        bool spawned = false;
+        ~ShardGuard() {
+            if (spawned) {
+                shard.stop();
+                shard.join();
+            }
+            if (initialized) {
+                if (shard.loop != nullptr) shard.loop->force_close_all();
+                shard.shutdown();
+            }
+        }
+    } shard_guard{shard};
+    ListenerContext listener_context{};
+    auto listen_result =
+        bind_listener_shard(program.listener, program.listener.port, nullptr, &listener_context);
+    REQUIRE(listen_result.has_value());
+    struct FdGuard {
+        i32 fd = -1;
+        ~FdGuard() {
+            if (fd >= 0) close(fd);
+        }
+    } listen_guard{listen_result.value()};
+    REQUIRE(listener_context.valid());
+    const u16 frontend_port = listener_context.port;
+    REQUIRE_NE(frontend_port, 0u);
+    REQUIRE(shard.init(0, listen_guard.fd).has_value());
+    shard_guard.initialized = true;
+    shard.owns_listen_fd = true;
+    listen_guard.fd = -1;
+    shard.route_config = &program.config;
+    shard.active_config = shard.route_config;
+    REQUIRE(shard.loop != nullptr);
+    shard.loop->listener_context = listener_context;
+    REQUIRE(shard.spawn(-1).has_value());
+    shard_guard.spawned = true;
+    REQUIRE_EQ(shard.backend_failure_code(), 0);
+
+    struct ClientGuard {
+        i32 fd = -1;
+        ~ClientGuard() {
+            if (fd >= 0) close(fd);
+        }
+    };
+    auto run_redirect = [&](const char* target, const char* host) {
+        ClientGuard client{connect_to(frontend_port)};
+        if (client.fd < 0) return false;
+        set_socket_timeouts(client.fd, 5);
+        char request[256]{};
+        const int formatted = snprintf(request,
+                                       sizeof(request),
+                                       "GET %s HTTP/1.1\r\nHost: %s\r\n"
+                                       "Connection: close\r\n\r\n",
+                                       target,
+                                       host);
+        if (formatted <= 0 || formatted >= static_cast<int>(sizeof(request))) return false;
+        if (!send_all(client.fd, request, static_cast<u32>(formatted))) return false;
+        char response[512]{};
+        u32 response_len = 0;
+        const bool complete = read_public_close_response(
+            client.fd, sizeof(kRedirectBody) - 1u, response, sizeof(response), response_len);
+        CHECK(complete);
+        if (!complete) return false;
+        CHECK_EQ(response_len, sizeof(kExpectedRedirect) - 1u);
+        if (response_len != sizeof(kExpectedRedirect) - 1u) return false;
+        const bool valid_date = normalize_public_date(response, response_len);
+        CHECK(valid_date);
+        if (!valid_date) return false;
+        const bool exact = memcmp(response, kExpectedRedirect, response_len) == 0;
+        CHECK(exact);
+        return exact;
+    };
+    const u16 mismatched_host_port = frontend_port == 65534u ? 65533u : 65534u;
+    REQUIRE_NE(mismatched_host_port, 0u);
+    REQUIRE_NE(mismatched_host_port, frontend_port);
+    char alternate_host[64]{};
+    const int alternate_host_len = snprintf(
+        alternate_host, sizeof(alternate_host), "alternate.example:%u", mismatched_host_port);
+    REQUIRE_GT(alternate_host_len, 0);
+    REQUIRE_LT(alternate_host_len, static_cast<int>(sizeof(alternate_host)));
+    REQUIRE(run_redirect("/old", "redirect-source.example"));
+    REQUIRE(run_redirect("/old", alternate_host));
+    REQUIRE(run_redirect("/old?x=1", "redirect-source.example"));
+
+    // This is a distinct redirect-only recorder epoch.  Keep both actors live
+    // for 500 ms, then join the recorder and inspect its non-atomic history
+    // before any intentionally forwarded neighbor is allowed to run.
+    bool redirect_window_quiet = true;
+    for (u32 sample = 0; sample < 100; sample++) {
+        redirect_window_quiet &=
+            redirect_epoch.accepted_count.load(std::memory_order_acquire) == 0u;
+        redirect_window_quiet &= redirect_epoch.request_count.load(std::memory_order_acquire) == 0u;
+        redirect_window_quiet &= redirect_epoch.running.load(std::memory_order_acquire);
+        redirect_window_quiet &= redirect_epoch.thread_alive.load(std::memory_order_acquire);
+        redirect_window_quiet &= !redirect_epoch.listener_failed.load(std::memory_order_acquire);
+        redirect_window_quiet &= shard.loop->is_running();
+        redirect_window_quiet &= shard.backend_failure_code() == 0;
+        usleep(5000);
+    }
+    REQUIRE(redirect_window_quiet);
+    redirect_epoch.teardown();
+    REQUIRE_EQ(redirect_epoch.accepted_count.load(std::memory_order_acquire), 0u);
+    REQUIRE_EQ(redirect_epoch.request_count.load(std::memory_order_acquire), 0u);
+    CHECK_EQ(redirect_epoch.request_len, 0u);
+    CHECK_EQ(redirect_epoch.request_header_len, 0u);
+    CHECK_EQ(redirect_epoch.request_body_len, 0u);
+    for (u32 slot = 0; slot < RecordingUpstream::kMaxRecordedRequests; slot++) {
+        CHECK_EQ(redirect_epoch.request_history_len[slot], 0u);
+        CHECK_EQ(redirect_epoch.request_history_header_len[slot], 0u);
+        CHECK_EQ(redirect_epoch.request_recorded_ns[slot].load(std::memory_order_acquire), 0u);
+        CHECK_EQ(
+            redirect_epoch.response_application_write_count[slot].load(std::memory_order_acquire),
+            0u);
+        CHECK_EQ(redirect_epoch.response_last_application_write_completed_ns[slot].load(
+                     std::memory_order_acquire),
+                 0u);
+        CHECK_EQ(redirect_epoch.response_connection_closed_ns[slot].load(std::memory_order_acquire),
+                 0u);
+        bool empty = true;
+        for (u32 byte = 0; empty && byte < RecordingUpstream::kRequestCapacity; byte++)
+            empty = redirect_epoch.request_history[slot][byte] == '\0';
+        CHECK(empty);
+    }
+    CHECK_EQ(redirect_epoch.first_response_fragment_count.load(std::memory_order_acquire), 0u);
+
+    REQUIRE(neighbor_epoch.setup(upstream_port));
+    REQUIRE_EQ(neighbor_epoch.port, upstream_port);
+    auto run_neighbor = [&](const char* target, const char* marker, u32 expected_count) {
+        ClientGuard client{connect_to(frontend_port)};
+        if (client.fd < 0) return false;
+        set_socket_timeouts(client.fd, 5);
+        char request[256]{};
+        const int formatted = snprintf(request,
+                                       sizeof(request),
+                                       "GET %s HTTP/1.1\r\nHost: client.example\r\n"
+                                       "Connection: close\r\nX-Case: %s\r\n\r\n",
+                                       target,
+                                       marker);
+        if (formatted <= 0 || formatted >= static_cast<int>(sizeof(request))) return false;
+        if (!send_all(client.fd, request, static_cast<u32>(formatted))) return false;
+        char response[512]{};
+        u32 response_len = 0;
+        if (!read_public_close_response(client.fd, 2u, response, sizeof(response), response_len))
+            return false;
+        if (!buf_contains(response, response_len, "HTTP/1.1 200 OK", 15) ||
+            !buf_contains(response, response_len, "\r\n\r\nok", 6))
+            return false;
+        for (u32 wait = 0; wait < 400 && neighbor_epoch.request_count.load(
+                                             std::memory_order_acquire) < expected_count;
+             wait++)
+            usleep(5000);
+        return neighbor_epoch.accepted_count.load(std::memory_order_acquire) == expected_count &&
+               neighbor_epoch.request_count.load(std::memory_order_acquire) == expected_count;
+    };
+    REQUIRE(run_neighbor("/old/", "slash", 1u));
+    REQUIRE(run_neighbor("/", "root", 2u));
+
+    bool neighbor_window_quiet = true;
+    for (u32 sample = 0; sample < 100; sample++) {
+        neighbor_window_quiet &=
+            neighbor_epoch.accepted_count.load(std::memory_order_acquire) == 2u;
+        neighbor_window_quiet &= neighbor_epoch.request_count.load(std::memory_order_acquire) == 2u;
+        neighbor_window_quiet &= neighbor_epoch.running.load(std::memory_order_acquire);
+        neighbor_window_quiet &= neighbor_epoch.thread_alive.load(std::memory_order_acquire);
+        neighbor_window_quiet &= !neighbor_epoch.listener_failed.load(std::memory_order_acquire);
+        neighbor_window_quiet &= shard.loop->is_running();
+        neighbor_window_quiet &= shard.backend_failure_code() == 0;
+        usleep(5000);
+    }
+    REQUIRE(neighbor_window_quiet);
+
+    shard.stop();
+    shard.join();
+    shard_guard.spawned = false;
+    REQUIRE_EQ(shard.backend_failure_code(), 0);
+    neighbor_epoch.teardown();
+
+    REQUIRE_EQ(neighbor_epoch.accepted_count.load(std::memory_order_acquire), 2u);
+    REQUIRE_EQ(neighbor_epoch.request_count.load(std::memory_order_acquire), 2u);
+    const char* const targets[] = {"/old/", "/"};
+    const char* const markers[] = {"slash", "root"};
+    for (u32 index = 0; index < 2; index++) {
+        char expected[256]{};
+        const int formatted = snprintf(expected,
+                                       sizeof(expected),
+                                       "GET %s HTTP/1.1\r\nHost: 127.0.0.1:%u\r\n"
+                                       "X-Case: %s\r\n\r\n",
+                                       targets[index],
+                                       upstream_port,
+                                       markers[index]);
+        REQUIRE_GT(formatted, 0);
+        REQUIRE_LT(formatted, static_cast<int>(sizeof(expected)));
+        REQUIRE_EQ(neighbor_epoch.request_history_len[index], static_cast<u32>(formatted));
+        REQUIRE_EQ(neighbor_epoch.request_history_header_len[index], static_cast<u32>(formatted));
+        CHECK_EQ(memcmp(neighbor_epoch.request_history[index], expected, formatted), 0);
+    }
+    for (u32 slot = 2; slot < RecordingUpstream::kMaxRecordedRequests; slot++) {
+        CHECK_EQ(neighbor_epoch.request_history_len[slot], 0u);
+        CHECK_EQ(neighbor_epoch.request_history_header_len[slot], 0u);
+        CHECK_EQ(neighbor_epoch.request_recorded_ns[slot].load(std::memory_order_acquire), 0u);
+        bool empty = true;
+        for (u32 byte = 0; empty && byte < RecordingUpstream::kRequestCapacity; byte++)
+            empty = neighbor_epoch.request_history[slot][byte] == '\0';
+        CHECK(empty);
+    }
+
+    CHECK_EQ(shard.shard_metrics.connections_total, 5u);
+    CHECK_EQ(shard.shard_metrics.connections_active, 0u);
+    CHECK_EQ(shard.shard_metrics.connections_closed, 5u);
+    CHECK_EQ(shard.shard_metrics.requests_total, 5u);
+    CHECK_EQ(shard.shard_metrics.requests_active, 0u);
+    CHECK_EQ(shard.shard_metrics.request_latency.count, 5u);
+    const u64 final_epoch = shard.epoch.epoch.load(std::memory_order_acquire);
+    CHECK_EQ(final_epoch, 10u);
+    CHECK_EQ(final_epoch % 2u, 0u);
+    CHECK_EQ(shard.loop->active_count(), 0u);
+    CHECK_EQ(shard.loop->pending_free_count, 0u);
+    CHECK_EQ(shard.loop->pool.in_use(), 0u);
+    CHECK_EQ(shard.upstream->idle_count.load(std::memory_order_acquire), 0u);
+    CHECK_EQ(shard.upstream->free_top, UpstreamPool::kMaxConns);
+
+    shard.shutdown();
+    shard_guard.initialized = false;
+    program.destroy();
+    program_guard.armed = false;
 #endif
 }
 
