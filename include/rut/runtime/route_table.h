@@ -511,6 +511,9 @@ struct RouteConfig {
     u32 redirect_policy_bytes_used = 0;
     StrictLocalResponsePolicySpec strict_local_response_policies[kMaxStrictLocalResponsePolicies]{};
     u32 strict_local_response_policy_count = 0;
+    // Concrete-method responses selected before exact/prefix/unmatched routing.
+    // Slot zero (ANY) is reserved and must remain neutral.
+    u16 pre_route_policy_ids[kStrictLocalResponseMethodSlots]{};
     u16 unmatched_policy_ids[kStrictLocalResponseMethodSlots]{};
     ExactStrictLocalResponseBinding
         exact_strict_local_response_bindings[kMaxExactStrictLocalResponseBindings]{};
@@ -518,12 +521,20 @@ struct RouteConfig {
     char strict_local_response_bytes[kStrictLocalResponseBytesPoolBytes];
     u32 strict_local_response_bytes_used = 0;
 
-    // Any nonzero strict-local-response field is activation metadata.  This
-    // deliberately treats partial/forged public state as present so a route
-    // miss can fail closed instead of silently falling back to the legacy 200.
+    bool has_strict_local_response_policy_inventory() const {
+        return strict_local_response_policy_count != 0 || strict_local_response_bytes_used != 0;
+    }
+
+    bool has_pre_route_metadata() const {
+        for (u32 i = 0; i < kStrictLocalResponseMethodSlots; i++)
+            if (pre_route_policy_ids[i] != 0) return true;
+        return false;
+    }
+
+    // This is selector metadata, not the shared policy inventory. A policy
+    // pool owned solely by pre-route/exact selectors must not turn a route miss
+    // into a configured unmatched response.
     bool has_unmatched_metadata() const {
-        if (strict_local_response_policy_count != 0 || strict_local_response_bytes_used != 0)
-            return true;
         for (u32 i = 0; i < kStrictLocalResponseMethodSlots; i++)
             if (unmatched_policy_ids[i] != 0) return true;
         return false;
@@ -535,7 +546,8 @@ struct RouteConfig {
     }
 
     bool has_strict_local_response_table_inventory() const {
-        return has_unmatched_metadata() || has_exact_strict_local_response_inventory();
+        return has_strict_local_response_policy_inventory() || has_pre_route_metadata() ||
+               has_unmatched_metadata() || has_exact_strict_local_response_inventory();
     }
 
     bool strict_local_response_bytes_owned(Str value) const {
@@ -572,6 +584,16 @@ struct RouteConfig {
                 if (strict_local_response_policy_spec_equal(strict_local_response_policies[prior],
                                                             policy))
                     return false;
+        }
+        if (pre_route_policy_ids[kRouteMethodAny] != 0) return false;
+        for (u32 slot = 1; slot < kStrictLocalResponseMethodSlots; slot++) {
+            const u16 id = pre_route_policy_ids[slot];
+            if (id == 0) continue;
+            if (id > strict_local_response_policy_count) return false;
+            if (slot == kRouteMethodHead && strict_local_response_policies[id - 1].head_mode !=
+                                                StrictLocalResponseHeadMode::SuppressBody)
+                return false;
+            referenced[id - 1] = true;
         }
         for (u32 slot = 0; slot < kStrictLocalResponseMethodSlots; slot++) {
             const u16 id = unmatched_policy_ids[slot];
@@ -616,8 +638,16 @@ struct RouteConfig {
     }
 
     bool unmatched_policy_table_is_valid() const {
-        return !has_exact_strict_local_response_inventory() &&
+        return !has_pre_route_metadata() && !has_exact_strict_local_response_inventory() &&
                strict_local_response_table_is_valid();
+    }
+
+    u16 pre_route_policy_id(u8 method_key) const {
+        const u32 slot = route_method_slot_from_key(method_key);
+        if (slot == kRouteMethodSlotInvalid || slot == kRouteMethodAny ||
+            !strict_local_response_table_is_valid())
+            return 0;
+        return pre_route_policy_ids[slot];
     }
 
     // Raw origin-form exact lookup. Query bytes are outside the selector; no
@@ -712,6 +742,18 @@ struct RouteConfig {
         return true;
     }
 
+    bool set_pre_route_policy_id(u8 method_key, u16 policy_id) {
+        const u32 slot = route_method_slot_from_key(method_key);
+        if (slot == kRouteMethodSlotInvalid || slot == kRouteMethodAny || policy_id == 0 ||
+            !strict_local_response_policy_id_is_owned(policy_id) || pre_route_policy_ids[slot] != 0)
+            return false;
+        if (slot == kRouteMethodHead && strict_local_response_policies[policy_id - 1].head_mode !=
+                                            StrictLocalResponseHeadMode::SuppressBody)
+            return false;
+        pre_route_policy_ids[slot] = policy_id;
+        return true;
+    }
+
     bool append_exact_strict_local_response_binding(const ExactStrictLocalResponseBinding& source,
                                                     u16 owned_policy_id) {
         if (exact_strict_local_response_binding_count >= kMaxExactStrictLocalResponseBindings ||
@@ -800,8 +842,10 @@ struct RouteConfig {
         }
         strict_local_response_bytes_used = source.strict_local_response_bytes_used;
         strict_local_response_policy_count = source.strict_local_response_policy_count;
-        for (u32 i = 0; i < kStrictLocalResponseMethodSlots; i++)
+        for (u32 i = 0; i < kStrictLocalResponseMethodSlots; i++) {
+            pre_route_policy_ids[i] = source.pre_route_policy_ids[i];
             unmatched_policy_ids[i] = source.unmatched_policy_ids[i];
+        }
         for (u32 i = 0; i < kMaxExactStrictLocalResponseBindings; i++) {
             const auto& src = source.exact_strict_local_response_bindings[i];
             auto& dst = exact_strict_local_response_bindings[i];
@@ -818,8 +862,122 @@ struct RouteConfig {
     }
 
     bool copy_unmatched_policy_table_from_owned(const RouteConfig& source) {
-        if (source.has_exact_strict_local_response_inventory()) return false;
+        if (source.has_pre_route_metadata() || source.has_exact_strict_local_response_inventory())
+            return false;
         return copy_strict_local_response_table_from_owned(source);
+    }
+
+    // Internal runtime/config transaction. Phase 1 deliberately has no
+    // compiler/source representation; callers must provide a complete concrete
+    // pre-route table and the existing unmatched/exact inventory together.
+    bool install_strict_local_response_table_with_pre_route(
+        const StrictLocalResponsePolicySpec* policies,
+        u32 policy_count,
+        const u16* pre_route_ids,
+        const u16* method_policy_ids,
+        const ExactStrictLocalResponseBinding* exact_bindings,
+        u32 exact_binding_count) {
+        if (has_strict_local_response_table_inventory() || policies == nullptr ||
+            pre_route_ids == nullptr || method_policy_ids == nullptr || exact_bindings == nullptr ||
+            policy_count > kMaxStrictLocalResponsePolicies ||
+            exact_binding_count > kMaxExactStrictLocalResponseBindings ||
+            pre_route_ids[kRouteMethodAny] != 0)
+            return false;
+
+        bool referenced[kMaxStrictLocalResponsePolicies]{};
+        u32 reference_count = 0;
+        auto add_reference = [&](u16 id) {
+            if (id == 0 || id > policy_count || referenced[id - 1]) return false;
+            referenced[id - 1] = true;
+            ++reference_count;
+            return true;
+        };
+        u32 total_bytes = 0;
+        for (u32 i = 0; i < policy_count; i++) {
+            if (!strict_local_response_policy_spec_valid(policies[i])) return false;
+            const Str fields[] = {
+                policies[i].reason, policies[i].content_type, policies[i].server, policies[i].body};
+            for (Str field : fields) {
+                if (field.len > kStrictLocalResponseBytesPoolBytes - total_bytes) return false;
+                total_bytes += field.len;
+            }
+        }
+        for (u32 slot = 1; slot < kStrictLocalResponseMethodSlots; slot++) {
+            const u16 id = pre_route_ids[slot];
+            if (id == 0) continue;
+            if (!add_reference(id) ||
+                (slot == kRouteMethodHead &&
+                 policies[id - 1].head_mode != StrictLocalResponseHeadMode::SuppressBody))
+                return false;
+        }
+        for (u32 slot = 0; slot < kStrictLocalResponseMethodSlots; slot++) {
+            const u16 id = method_policy_ids[slot];
+            if (id == 0) continue;
+            if (!add_reference(id) ||
+                ((slot == kRouteMethodAny || slot == kRouteMethodHead) &&
+                 policies[id - 1].head_mode != StrictLocalResponseHeadMode::SuppressBody))
+                return false;
+        }
+        for (u32 i = 0; i < kMaxExactStrictLocalResponseBindings; i++) {
+            const auto& binding = exact_bindings[i];
+            if (i >= exact_binding_count) {
+                if (!exact_strict_local_response_binding_is_neutral(binding)) return false;
+                continue;
+            }
+            if (!exact_strict_local_response_binding_shape_valid(binding) ||
+                !add_reference(binding.policy_id))
+                return false;
+            const u32 slot = route_method_slot_from_key(binding.method);
+            if (slot == kRouteMethodSlotInvalid ||
+                ((slot == kRouteMethodAny || slot == kRouteMethodHead) &&
+                 policies[binding.policy_id - 1].head_mode !=
+                     StrictLocalResponseHeadMode::SuppressBody))
+                return false;
+            for (u32 prior = 0; prior < i; prior++) {
+                const auto& earlier = exact_bindings[prior];
+                if (earlier.method == binding.method && earlier.path_len == binding.path_len &&
+                    __builtin_memcmp(earlier.path, binding.path, binding.path_len) == 0)
+                    return false;
+            }
+        }
+        if (reference_count != policy_count) return false;
+
+        auto replay = [&](RouteConfig& target) {
+            u16 remap[kMaxStrictLocalResponsePolicies]{};
+            for (u32 i = 0; i < policy_count; i++) {
+                remap[i] = target.add_strict_local_response_policy(policies[i]);
+                if (remap[i] == 0) return false;
+            }
+            for (u32 slot = 1; slot < kStrictLocalResponseMethodSlots; slot++) {
+                const u16 source_id = pre_route_ids[slot];
+                if (source_id != 0 &&
+                    !target.set_pre_route_policy_id(static_cast<u8>(slot), remap[source_id - 1]))
+                    return false;
+            }
+            for (u32 slot = 0; slot < kStrictLocalResponseMethodSlots; slot++) {
+                const u16 source_id = method_policy_ids[slot];
+                if (source_id != 0 &&
+                    !target.set_unmatched_policy_id(static_cast<u8>(slot), remap[source_id - 1]))
+                    return false;
+            }
+            for (u32 i = 0; i < exact_binding_count; i++) {
+                const u16 source_id = exact_bindings[i].policy_id;
+                if (!target.append_exact_strict_local_response_binding(exact_bindings[i],
+                                                                       remap[source_id - 1]))
+                    return false;
+            }
+            return target.strict_local_response_table_is_valid();
+        };
+        RouteConfig* probe = new (std::nothrow) RouteConfig();
+        if (probe == nullptr) return false;
+        const bool staged = replay(*probe);
+        if (!staged) {
+            delete probe;
+            return false;
+        }
+        const bool committed = copy_strict_local_response_table_from_owned(*probe);
+        delete probe;
+        return committed;
     }
 
     // Install one complete table transactionally. A fresh RouteConfig probes

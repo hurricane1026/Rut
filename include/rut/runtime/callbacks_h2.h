@@ -974,6 +974,7 @@ void h2_dispatch_request(H2Dispatch<Loop>& d,
         config != nullptr && config->has_strict_local_response_table_inventory();
     const bool has_exact_inventory =
         config != nullptr && config->has_exact_strict_local_response_inventory();
+    const bool has_pre_route_inventory = config != nullptr && config->has_pre_route_metadata();
     // Public metadata integrity is global and precedes malformed-header 400,
     // firewall, or any frame publication. Exact H2 serialization is not yet an
     // admitted capability: a valid raw match closes with zero bytes below,
@@ -987,6 +988,20 @@ void h2_dispatch_request(H2Dispatch<Loop>& d,
     // A prepared Forward waiting to learn whether its open request stream is
     // actually empty owns both pending_synth and the connection mutation log.
     if (d.conn->h2->pending_prepared_forward) {
+        // Classify the new stream through a local request only.  In particular,
+        // do not clear or consume the prepared stream's pending owner or the
+        // connection-owned mutation log while deciding whether pre-route must
+        // fence this method before the legacy prepared-forward 503.
+        ParsedRequest pending_req;
+        if (h2_headers_to_request(headers, nheaders, &pending_req)) {
+            const u8 pending_method_key = route_method_key(pending_req.method);
+            if (config != nullptr && config->pre_route_policy_id(pending_method_key) != 0) {
+                d.close_after_process = true;
+                d.resp_len = 0;
+                d.overflow = false;
+                return;
+            }
+        }
         if (has_exact_inventory) {
             d.close_after_process = true;
             d.resp_len = 0;
@@ -1011,7 +1026,9 @@ void h2_dispatch_request(H2Dispatch<Loop>& d,
         h2_emit_status(d, stream_id, 400);
         return;
     }
-    if (has_exact_inventory && req.target_has_fragment) {
+    const u8 kMethodKey = route_method_key(req.method);
+    const u16 pre_route_policy_id = config != nullptr ? config->pre_route_policy_id(kMethodKey) : 0;
+    if ((has_exact_inventory || pre_route_policy_id != 0) && req.target_has_fragment) {
         d.close_after_process = true;
         d.resp_len = 0;
         d.overflow = false;
@@ -1050,7 +1067,15 @@ void h2_dispatch_request(H2Dispatch<Loop>& d,
         return;
     }
 
-    const u8 kMethodKey = route_method_key(req.method);
+    // Phase 1 has no H2 strict serializer. A concrete match is therefore a
+    // protocol fail-close with no staged frame; an unambiguous nonmatch retains
+    // the exact legacy route/unmatched behavior.
+    if (has_pre_route_inventory && pre_route_policy_id != 0) {
+        d.close_after_process = true;
+        d.resp_len = 0;
+        d.overflow = false;
+        return;
+    }
     if (has_exact_inventory &&
         config->match_exact_strict_local_response(req.path, kMethodKey) != 0) {
         d.close_after_process = true;

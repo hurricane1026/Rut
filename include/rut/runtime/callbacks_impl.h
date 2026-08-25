@@ -569,6 +569,81 @@ inline bool exact_strict_local_response_header_absent_framing_is_admitted(const 
            conn.req_content_length == 0;
 }
 
+inline bool pre_route_strict_local_response_wire_is_admitted(const Connection& conn,
+                                                             u8 selected_method_key) {
+    if (selected_method_key == kRouteMethodAny ||
+        route_method_slot_from_key(selected_method_key) == kRouteMethodSlotInvalid ||
+        conn.recv_buf.data() == nullptr || conn.recv_buf.len() == 0)
+        return false;
+    const auto metadata_method = static_cast<LogHttpMethod>(conn.req_method);
+    if (metadata_method == LogHttpMethod::Other ||
+        route_method_key(metadata_method) != selected_method_key)
+        return false;
+
+    HttpParser parser;
+    ParsedRequest request;
+    parser.reset();
+    request.reset();
+    if (parser.parse(conn.recv_buf.data(), conn.recv_buf.len(), &request) !=
+            ParseStatus::Complete ||
+        parser.header_end != conn.recv_buf.len() || request.method == HttpMethod::Unknown ||
+        route_method_key(request.method) != selected_method_key ||
+        request.version != HttpVersion::Http11 || request.path.ptr == nullptr ||
+        request.path.len == 0 || request.path.ptr[0] != '/' || request.path_canon.ptr == nullptr ||
+        request.target_has_fragment || request.has_content_length ||
+        request.content_length_count != 0 || request.chunked ||
+        request.transfer_encoding != RequestTransferEncoding::None || request.upgrade ||
+        request.has_upgrade_header || !request.connection_close)
+        return false;
+    for (u32 i = 0; i < request.path.len; i++)
+        if (request.path.ptr[i] == '?' || request.path.ptr[i] == '#') return false;
+
+    u32 host_count = 0;
+    u32 connection_count = 0;
+    for (u32 i = 0; i < request.header_count; i++) {
+        const Header& header = request.headers[i];
+        if (http_header_name_eq_ci(header.name.ptr, header.name.len, "host", 4)) {
+            if (++host_count != 1 || header.value.len == 0) return false;
+        } else if (http_header_name_eq_ci(header.name.ptr, header.name.len, "connection", 10)) {
+            if (++connection_count != 1 || header.value.len != 5 ||
+                !http_header_name_eq_ci(header.value.ptr, header.value.len, "close", 5))
+                return false;
+        } else if (http_header_name_eq_ci(header.name.ptr, header.name.len, "content-length", 14) ||
+                   http_header_name_eq_ci(
+                       header.name.ptr, header.name.len, "transfer-encoding", 17) ||
+                   http_header_name_eq_ci(header.name.ptr, header.name.len, "te", 2) ||
+                   http_header_name_eq_ci(header.name.ptr, header.name.len, "expect", 6) ||
+                   http_header_name_eq_ci(header.name.ptr, header.name.len, "upgrade", 7)) {
+            return false;
+        }
+    }
+    return host_count == 1 && connection_count == 1;
+}
+
+inline bool pre_route_strict_local_response_request_is_admitted(const Connection& conn,
+                                                                u8 selected_method_key) {
+    const bool exact_close =
+        !conn.req_keep_alive && !conn.req_client_keep_alive && conn.req_client_connection_close &&
+        conn.req_client_connection_close_exact && conn.req_client_connection_count == 1;
+    return exact_strict_local_response_base_request_shape_is_admitted(conn) &&
+           exact_strict_local_response_header_absent_framing_is_admitted(conn) && exact_close &&
+           conn.req_client_transfer_encoding == RequestTransferEncoding::None &&
+           http1_pipeline_request_is_legacy(conn) && conn.downstream_completed_request_count == 0 &&
+           pre_route_strict_local_response_wire_is_admitted(conn, selected_method_key) &&
+           !conn.epoch_held && !conn.http1_pipeline_boundary_owners_settled &&
+           conn.pipeline_stash_len == 0 && conn.send_buf.len() == 0 && conn.send_progress == 0 &&
+           !conn.send_armed && conn.on_send == nullptr && conn.resp_status == 0 &&
+           conn.response_read_deadline_owner_is_neutral() && conn.http1_prebuilt_wait == 0 &&
+           conn.http1_prebuilt_disposition == Http1RequestBufferDisposition::None &&
+           conn.http1_prebuilt_request_prefix_len == 0 &&
+           conn.http1_prebuilt_response_proof_is_neutral() && !conn.http1_boundary_deferred &&
+           !conn.http1_boundary_ready && conn.http1_boundary_successor_episode == 0 &&
+           !conn.upstream_episode_quarantined && http1_pipeline_successor_tombstone_is_safe(conn) &&
+           http1_pipeline_successor_upstream_owners_are_neutral(conn) &&
+           !conn.request_upload_complete && conn.retry_req_send_len == 0 &&
+           conn.upstream_attempts == 0;
+}
+
 inline bool exact_strict_local_response_common_request_is_admitted(const Connection& conn) {
     return exact_strict_local_response_common_request_shape_is_admitted(conn) &&
            exact_strict_local_response_header_absent_framing_is_admitted(conn);
@@ -1838,6 +1913,15 @@ void on_header_received(void* lp, Connection& conn, IoEvent ev) {
         loop->close_conn(conn);
         return;
     }
+    const u8 request_method_key = route_method_key(static_cast<LogHttpMethod>(conn.req_method));
+    const u16 pre_route_policy_id =
+        config != nullptr ? config->pre_route_policy_id(request_method_key) : 0;
+    if (pre_route_policy_id != 0 &&
+        !pre_route_strict_local_response_request_is_admitted(conn, request_method_key)) {
+        conn.req_start_us = 0;
+        loop->close_conn(conn);
+        return;
+    }
     loop->epoch_enter();
     if (loop->metrics) loop->metrics->on_request_start();
     if (config && !config->firewall_allows_peer(conn.peer_addr, conn.peer_port)) {
@@ -1892,18 +1976,26 @@ void on_header_received(void* lp, Connection& conn, IoEvent ev) {
         }
     }
 
+    // Concrete pre-route policies retain firewall and the reserved metrics
+    // endpoint's precedence, but execute before exact/prefix/unmatched routing.
+    // Admission was established before request accounting above so an invalid
+    // matching request cannot publish a response or route/upstream effect.
+    if (pre_route_policy_id != 0) {
+        (void)handle_configured_strict_local_response(loop, conn, config, pre_route_policy_id);
+        return;
+    }
+
     const RouteEntry* route = nullptr;
     RouteParam route_params[kMaxRouteParams]{};
     u32 route_param_count = 0;
     if (config) {
-        const u8 kMethodKey = route_method_key(static_cast<LogHttpMethod>(conn.req_method));
         u32 raw_target_len = 0;
         while (raw_target_len < sizeof(conn.req_path) && conn.req_path[raw_target_len] != '\0')
             raw_target_len++;
-        const u16 exact_policy_id = has_exact_inventory
-                                        ? config->match_exact_strict_local_response(
-                                              Str{conn.req_path, raw_target_len}, kMethodKey)
-                                        : 0;
+        const u16 exact_policy_id =
+            has_exact_inventory ? config->match_exact_strict_local_response(
+                                      Str{conn.req_path, raw_target_len}, request_method_key)
+                                : 0;
         if (exact_policy_id != 0) {
             if (!exact_strict_local_response_request_is_admitted(conn)) {
                 loop->close_conn(conn);
@@ -1922,8 +2014,11 @@ void on_header_received(void* lp, Connection& conn, IoEvent ev) {
         // nullptr (miss) so those targets cannot fall into a "/" catchall.
         // {non-null ptr, len=0} remains a legitimate canonical view of
         // the origin-form root "/" and dispatches normally.
-        route = config->match_canonical(
-            conn.req_path_canon, kMethodKey, route_params, &route_param_count, kMaxRouteParams);
+        route = config->match_canonical(conn.req_path_canon,
+                                        request_method_key,
+                                        route_params,
+                                        &route_param_count,
+                                        kMaxRouteParams);
     }
 
     // Matched routes always win. Only a genuine miss consults the generic

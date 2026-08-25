@@ -866,6 +866,136 @@ TEST(route_config, exact_strict_runtime_validator_rejects_every_binding_forgery_
     CHECK_EQ(precedence->match_exact_strict_local_response({"/priority", 9}, kRouteMethodPost), 2u);
 }
 
+TEST(route_config, pre_route_strict_table_is_concrete_owned_transactional_and_combined) {
+    std::string trace_body = "trace-owned";
+    StrictLocalResponsePolicySpec policies[4] = {
+        local_policy({"Method Not Allowed", 18},
+                     {"text/html", 9},
+                     {"nginx/1.29.7", 12},
+                     {trace_body.data(), static_cast<u32>(trace_body.size())},
+                     405),
+        local_policy({"Generic", 7}, {"text/plain", 10}, {"rut", 3}, {"opt", 3}, 418),
+        local_policy({"Unmatched", 9}, {"text/plain", 10}, {"rut", 3}, {"miss", 4}, 400),
+        local_policy({"OK", 2},
+                     {"text/plain", 10},
+                     {"nginx/1.29.7", 12},
+                     {"exact", 5},
+                     200,
+                     StrictLocalResponseHeadMode::SuppressBody),
+    };
+    u16 pre_route[kStrictLocalResponseMethodSlots]{};
+    pre_route[kRouteMethodTrace] = 1;
+    pre_route[kRouteMethodOptions] = 2;
+    u16 unmatched[kStrictLocalResponseMethodSlots]{};
+    unmatched[kRouteMethodTrace] = 3;
+    ExactStrictLocalResponseBinding exact[kMaxExactStrictLocalResponseBindings]{};
+    exact[0] = exact_local_binding("/static", kRouteMethodAny, 4);
+
+    auto installed = std::make_unique<RouteConfig>();
+    REQUIRE(installed->add_static("/", kRouteMethodAny, 207));
+    REQUIRE(installed->install_strict_local_response_table_with_pre_route(
+        policies, 4, pre_route, unmatched, exact, 1));
+    REQUIRE(installed->strict_local_response_table_is_valid());
+    CHECK(installed->has_pre_route_metadata());
+    CHECK(installed->has_unmatched_metadata());
+    CHECK_EQ(installed->pre_route_policy_id(kRouteMethodTrace), 1u);
+    CHECK_EQ(installed->pre_route_policy_id(kRouteMethodOptions), 2u);
+    CHECK_EQ(installed->pre_route_policy_id(kRouteMethodGet), 0u);
+    CHECK_EQ(installed->pre_route_policy_id(kRouteMethodAny), 0u);
+    CHECK_EQ(installed->unmatched_policy_ids[kRouteMethodTrace], 3u);
+    CHECK_EQ(installed->exact_strict_local_response_bindings[0].policy_id, 4u);
+    trace_body.assign("overwritten!");
+    CHECK(installed->strict_local_response_policies[0].body.eq({"trace-owned", 11}));
+
+    auto copied = std::make_unique<RouteConfig>();
+    REQUIRE(copied->copy_strict_local_response_table_from_owned(*installed));
+    REQUIRE(copied->strict_local_response_table_is_valid());
+    CHECK_EQ(copied->pre_route_policy_ids[kRouteMethodTrace], 1u);
+    CHECK(copied->strict_local_response_policies[0].body.ptr !=
+          installed->strict_local_response_policies[0].body.ptr);
+    CHECK(copied->strict_local_response_policies[0].body.eq({"trace-owned", 11}));
+
+    // Equal policy values from distinct source storage are each referenced
+    // exactly once across the three selector families.  Installation performs
+    // semantic deduplication only after validating that source ownership, then
+    // remaps every selector to the single deep-owned policy.
+    std::string dedup_reason[3] = {"OK", "OK", "OK"};
+    std::string dedup_type[3] = {"text/plain", "text/plain", "text/plain"};
+    std::string dedup_server[3] = {"nginx/1.29.7", "nginx/1.29.7", "nginx/1.29.7"};
+    std::string dedup_body[3] = {"same-owned", "same-owned", "same-owned"};
+    StrictLocalResponsePolicySpec equal_policies[3]{};
+    for (u32 i = 0; i < 3; i++) {
+        equal_policies[i] =
+            local_policy({dedup_reason[i].data(), static_cast<u32>(dedup_reason[i].size())},
+                         {dedup_type[i].data(), static_cast<u32>(dedup_type[i].size())},
+                         {dedup_server[i].data(), static_cast<u32>(dedup_server[i].size())},
+                         {dedup_body[i].data(), static_cast<u32>(dedup_body[i].size())},
+                         200,
+                         StrictLocalResponseHeadMode::SuppressBody);
+    }
+    u16 dedup_pre_route[kStrictLocalResponseMethodSlots]{};
+    dedup_pre_route[kRouteMethodTrace] = 1;
+    u16 dedup_unmatched[kStrictLocalResponseMethodSlots]{};
+    dedup_unmatched[kRouteMethodOptions] = 2;
+    ExactStrictLocalResponseBinding dedup_exact[kMaxExactStrictLocalResponseBindings]{};
+    dedup_exact[0] = exact_local_binding("/dedup", kRouteMethodAny, 3);
+    auto deduplicated = std::make_unique<RouteConfig>();
+    REQUIRE(deduplicated->install_strict_local_response_table_with_pre_route(
+        equal_policies, 3, dedup_pre_route, dedup_unmatched, dedup_exact, 1));
+    REQUIRE(deduplicated->strict_local_response_table_is_valid());
+    CHECK_EQ(deduplicated->strict_local_response_policy_count, 1u);
+    CHECK_EQ(deduplicated->pre_route_policy_ids[kRouteMethodTrace], 1u);
+    CHECK_EQ(deduplicated->unmatched_policy_ids[kRouteMethodOptions], 1u);
+    CHECK_EQ(deduplicated->exact_strict_local_response_binding_count, 1u);
+    CHECK_EQ(deduplicated->exact_strict_local_response_bindings[0].policy_id, 1u);
+    CHECK_EQ(deduplicated->exact_strict_local_response_bindings[0].method, kRouteMethodAny);
+    CHECK_EQ(deduplicated->exact_strict_local_response_bindings[0].path_len, 6u);
+    CHECK_EQ(
+        __builtin_memcmp(deduplicated->exact_strict_local_response_bindings[0].path, "/dedup", 6),
+        0);
+    auto dedup_copy = std::make_unique<RouteConfig>();
+    REQUIRE(dedup_copy->copy_strict_local_response_table_from_owned(*deduplicated));
+    REQUIRE(dedup_copy->strict_local_response_table_is_valid());
+    CHECK_EQ(dedup_copy->strict_local_response_policy_count, 1u);
+    CHECK_EQ(dedup_copy->pre_route_policy_ids[kRouteMethodTrace], 1u);
+    CHECK_EQ(dedup_copy->unmatched_policy_ids[kRouteMethodOptions], 1u);
+    CHECK_EQ(dedup_copy->exact_strict_local_response_bindings[0].policy_id, 1u);
+    CHECK_EQ(
+        __builtin_memcmp(dedup_copy->exact_strict_local_response_bindings[0].path, "/dedup", 6), 0);
+    CHECK(dedup_copy->strict_local_response_policies[0].body.ptr !=
+          deduplicated->strict_local_response_policies[0].body.ptr);
+    CHECK(dedup_copy->strict_local_response_policies[0].body.eq({"same-owned", 10}));
+
+    auto dedup_rejected = std::make_unique<RouteConfig>();
+    REQUIRE(dedup_rejected->add_static("/kept-dedup", kRouteMethodGet, 208));
+    std::vector<u8> dedup_before(sizeof(RouteConfig));
+    __builtin_memcpy(dedup_before.data(), dedup_rejected.get(), sizeof(RouteConfig));
+    dedup_pre_route[kRouteMethodAny] = 1;
+    CHECK_FALSE(dedup_rejected->install_strict_local_response_table_with_pre_route(
+        equal_policies, 3, dedup_pre_route, dedup_unmatched, dedup_exact, 1));
+    CHECK_EQ(__builtin_memcmp(dedup_before.data(), dedup_rejected.get(), sizeof(RouteConfig)), 0);
+    for (u32 i = 0; i < 3; i++) dedup_body[i].assign("source-mutated");
+    CHECK(deduplicated->strict_local_response_policies[0].body.eq({"same-owned", 10}));
+    CHECK(dedup_copy->strict_local_response_policies[0].body.eq({"same-owned", 10}));
+
+    auto forged = std::make_unique<RouteConfig>();
+    REQUIRE(forged->copy_strict_local_response_table_from_owned(*installed));
+    forged->pre_route_policy_ids[kRouteMethodAny] = 1;
+    CHECK_FALSE(forged->strict_local_response_table_is_valid());
+    forged->pre_route_policy_ids[kRouteMethodAny] = 0;
+    forged->pre_route_policy_ids[kRouteMethodTrace] = 9;
+    CHECK_FALSE(forged->strict_local_response_table_is_valid());
+
+    auto rejected = std::make_unique<RouteConfig>();
+    REQUIRE(rejected->add_static("/kept", kRouteMethodGet, 209));
+    std::vector<u8> before(sizeof(RouteConfig));
+    __builtin_memcpy(before.data(), rejected.get(), sizeof(RouteConfig));
+    pre_route[kRouteMethodAny] = 1;
+    CHECK_FALSE(rejected->install_strict_local_response_table_with_pre_route(
+        policies, 4, pre_route, unmatched, exact, 1));
+    CHECK_EQ(__builtin_memcmp(before.data(), rejected.get(), sizeof(RouteConfig)), 0);
+}
+
 int main(int argc, char** argv) {
     return rut::test::run_all(argc, argv);
 }

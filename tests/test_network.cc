@@ -9560,6 +9560,12 @@ static u64 unmatched_h2_outer_hit_handler(void*, jit::HandlerCtx*, const u8*, u3
     return jit::HandlerResult::make_status(204).pack();
 }
 
+static u32 pre_route_root_handler_calls = 0;
+static u64 pre_route_root_handler(void*, jit::HandlerCtx*, const u8*, u32, void*) {
+    ++pre_route_root_handler_calls;
+    return jit::HandlerResult::make_forward(0).pack();
+}
+
 static Connection* dispatch_unmatched_request(SmallLoop& loop,
                                               RouteConfig& config,
                                               const char* request) {
@@ -9624,6 +9630,432 @@ TEST(unmatched_local_response, exact_any_precedence_matched_wins_and_no_slot_leg
                        legacy->send_buf.len(),
                        "\r\n\r\nOK",
                        6));
+}
+
+TEST(pre_route_local_response,
+     concrete_method_precedes_exact_root_and_unmatched_with_bounded_lifecycle) {
+    static constexpr char kNginx405Body[] =
+        "<html>\r\n<head><title>405 Not Allowed</title></head>\r\n<body>\r\n"
+        "<center><h1>405 Not Allowed</h1></center>\r\n"
+        "<hr><center>nginx/1.29.7</center>\r\n</body>\r\n</html>\r\n";
+    static_assert(sizeof(kNginx405Body) - 1u == 157u);
+    StrictLocalResponsePolicySpec policies[4] = {
+        make_unmatched_policy(405, "Not Allowed", kNginx405Body),
+        make_representation200_policy(),
+        make_unmatched_policy(499, "Unmatched", "unmatched-trace"),
+        make_unmatched_policy(418, "Generic", "generic-options"),
+    };
+    policies[0].server = {"nginx/1.29.7", 12};
+    policies[0].content_type = {"text/html", 9};
+    u16 pre_route[kStrictLocalResponseMethodSlots]{};
+    pre_route[kRouteMethodTrace] = 1;
+    pre_route[kRouteMethodOptions] = 4;
+    u16 unmatched[kStrictLocalResponseMethodSlots]{};
+    unmatched[kRouteMethodTrace] = 3;
+    ExactStrictLocalResponseBinding exact[kMaxExactStrictLocalResponseBindings]{};
+    exact[0] = make_exact_local_binding("/static", kRouteMethodAny, 2);
+
+    RouteConfig config{};
+    REQUIRE(config.add_upstream("root", 0x7f000001, 9000).has_value());
+    REQUIRE(config.add_jit_handler("/", kRouteMethodAny, &pre_route_root_handler, false));
+    REQUIRE(config.install_strict_local_response_table_with_pre_route(
+        policies, 4, pre_route, unmatched, exact, 1));
+    REQUIRE(config.strict_local_response_table_is_valid());
+
+    SmallLoop loop;
+    loop.setup();
+    ShardMetrics metrics{};
+    metrics.init();
+    AccessLogRing access{};
+    access.init();
+    CaptureRing capture{};
+    capture.init();
+    ShardEpoch epoch{};
+    loop.metrics = &metrics;
+    loop.access_log = &access;
+    loop.epoch = &epoch;
+    REQUIRE(loop.set_capture(&capture));
+    pre_route_root_handler_calls = 0;
+
+    static constexpr char kTrace[] =
+        "TRACE /static HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n";
+
+    // The selected pre-route key, captured metadata, and independently reparsed
+    // raw method form one closed identity.  Exercise every owner family used by
+    // admission directly so a future routing refactor cannot accidentally turn
+    // a half-active request into a response or upstream action.
+    auto admission = [&](const char* raw, u8 selected_method, auto mutate) -> bool {
+        auto candidate = std::make_unique<Connection>();
+        candidate->reset();
+        u8 recv_storage[1024]{};
+        u8 send_storage[1024]{};
+        u8 upstream_storage[128]{};
+        u8 response_storage[128]{};
+        candidate->recv_slice = recv_storage;
+        candidate->send_slice = send_storage;
+        candidate->upstream_recv_slice = upstream_storage;
+        candidate->response_header_slice = response_storage;
+        candidate->recv_buf.bind(recv_storage, sizeof(recv_storage));
+        candidate->send_buf.bind(send_storage, sizeof(send_storage));
+        candidate->upstream_recv_buf.bind(upstream_storage, sizeof(upstream_storage));
+        candidate->response_header_buf.bind(response_storage, sizeof(response_storage));
+        const u32 len = static_cast<u32>(strlen(raw));
+        const u32 written = candidate->recv_buf.write(reinterpret_cast<const u8*>(raw), len);
+        CHECK_EQ(written, len);
+        if (written != len) return false;
+        capture_request_metadata(*candidate);
+        mutate(*candidate);
+        return pre_route_strict_local_response_request_is_admitted(*candidate, selected_method);
+    };
+    const auto unchanged = [](Connection&) {};
+    REQUIRE(admission(kTrace, kRouteMethodTrace, unchanged));
+    CHECK_FALSE(admission(kTrace, kRouteMethodGet, unchanged));
+    CHECK_FALSE(admission(kTrace, kRouteMethodTrace, [](Connection& c) {
+        c.req_method = static_cast<u8>(LogHttpMethod::Options);
+    }));
+    static constexpr char kRawOptions[] =
+        "OPTIONS /static HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n";
+    CHECK_FALSE(admission(kRawOptions, kRouteMethodTrace, [](Connection& c) {
+        c.req_method = static_cast<u8>(LogHttpMethod::Trace);
+    }));
+
+    auto owner_rejected = [&](auto mutate) {
+        CHECK_FALSE(admission(kTrace, kRouteMethodTrace, mutate));
+    };
+    owner_rejected([](Connection& c) { c.pipeline_depth = 1; });
+    owner_rejected([](Connection& c) { c.http1_pipeline_request_generation = 1; });
+    owner_rejected([](Connection& c) { c.http1_pipeline_boundary_owners_settled = true; });
+    owner_rejected([](Connection& c) { c.http1_boundary_deferred = true; });
+    owner_rejected([](Connection& c) { c.http1_boundary_ready = true; });
+    owner_rejected([](Connection& c) { c.http1_boundary_successor_episode = 1; });
+    owner_rejected([](Connection& c) {
+        const u8 byte = 'x';
+        (void)c.send_buf.write(&byte, 1);
+    });
+    owner_rejected([](Connection& c) { c.send_progress = 1; });
+    owner_rejected([](Connection& c) { c.send_armed = true; });
+    owner_rejected([](Connection& c) { c.on_send = &on_response_sent<SmallLoop>; });
+    owner_rejected([](Connection& c) {
+        c.response_read_deadline_state = ResponseReadDeadlineState::Preflight;
+    });
+    owner_rejected([](Connection& c) { c.http1_prebuilt_wait = 1; });
+    owner_rejected([](Connection& c) {
+        c.http1_prebuilt_disposition = Http1RequestBufferDisposition::PrefixInRecv;
+    });
+    owner_rejected([](Connection& c) { c.http1_prebuilt_status = 200; });
+    owner_rejected([](Connection& c) { c.retry_req_send_len = 1; });
+    owner_rejected([](Connection& c) { c.request_upload_complete = true; });
+    owner_rejected([](Connection& c) { c.upstream_fd = 9; });
+    owner_rejected([](Connection& c) { c.upstream_slot_held = true; });
+    owner_rejected([](Connection& c) { c.on_upstream_recv = &on_upstream_response<SmallLoop>; });
+    owner_rejected([](Connection& c) { c.on_upstream_send = &on_upstream_connected<SmallLoop>; });
+    owner_rejected([](Connection& c) { c.upstream_connect_armed = true; });
+    owner_rejected([](Connection& c) { c.upstream_send_armed = true; });
+    owner_rejected([](Connection& c) { c.upstream_recv_armed = true; });
+    owner_rejected([](Connection& c) { c.upstream_attempts = 1; });
+    owner_rejected([](Connection& c) { c.upstream_episode_quarantined = true; });
+    REQUIRE(admission(kTrace, kRouteMethodTrace, [](Connection& c) {
+        c.upstream_episode = 2;
+        c.upstream_retiring_episode = 1;
+    }));
+    owner_rejected([](Connection& c) {
+        c.upstream_episode = 2;
+        c.upstream_retiring_episode = 2;
+    });
+
+    loop.backend.clear_ops();
+    Connection* trace = dispatch_unmatched_request(loop, config, kTrace);
+    REQUIRE(trace != nullptr);
+    const u32 trace_id = trace->id;
+    REQUIRE_EQ(trace->resp_status, 405u);
+    CHECK_EQ(trace->request_config, &config);
+    CHECK_EQ(trace->pipeline_depth, 0u);
+    CHECK_EQ(trace->downstream_completed_request_count, 0u);
+    CHECK_EQ(trace->upstream_fd, -1);
+    CHECK_FALSE(trace->upstream_slot_held);
+    CHECK_EQ(trace->upstream_attempts, 0u);
+    CHECK_EQ(trace->retry_req_send_len, 0u);
+    CHECK(trace->response_read_deadline_owner_is_neutral());
+    CHECK_EQ(trace->http1_prebuilt_wait, 0u);
+    CHECK_EQ(trace->http1_prebuilt_disposition, Http1RequestBufferDisposition::None);
+    CHECK_FALSE(trace->http1_boundary_deferred);
+    CHECK_FALSE(trace->http1_boundary_ready);
+    CHECK_EQ(pre_route_root_handler_calls, 0u);
+    CHECK_EQ(loop.backend.count_ops(MockOp::Connect), 0u);
+    CHECK_EQ(loop.backend.count_ops(MockOp::Send), 1u);
+    CHECK_EQ(metrics.requests_total, 0u);
+    CHECK_EQ(metrics.requests_active, 1u);
+    CHECK_EQ(epoch.epoch.load(std::memory_order_acquire), 1u);
+    u8 normalized[SmallLoop::kBufSize]{};
+    const u32 wire_len = trace->send_buf.len();
+    REQUIRE_LE(wire_len, sizeof(normalized));
+    __builtin_memcpy(normalized, trace->send_buf.data(), wire_len);
+    REQUIRE(normalize_redirect_date(normalized, wire_len));
+    std::string expected =
+        "HTTP/1.1 405 Not Allowed\r\n"
+        "Server: nginx/1.29.7\r\n"
+        "Date: XXXXXXXXXXXXXXXXXXXXXXXXXXXXX\r\n"
+        "Content-Type: text/html\r\n"
+        "Content-Length: 157\r\n"
+        "Connection: close\r\n\r\n";
+    expected += kNginx405Body;
+    REQUIRE_EQ(wire_len, static_cast<u32>(expected.size()));
+    CHECK_EQ(__builtin_memcmp(normalized, expected.data(), expected.size()), 0);
+
+    static constexpr u32 kPartial = 11;
+    loop.inject_and_dispatch(make_ev(trace_id, IoEventType::Send, kPartial));
+    CHECK_EQ(trace->send_progress, kPartial);
+    auto replacement = std::make_unique<RouteConfig>();
+    const RouteConfig* replacement_active = replacement.get();
+    loop.config_ptr = &replacement_active;
+    CHECK_EQ(trace->request_config, &config);
+    CHECK_EQ(metrics.requests_total, 0u);
+    CHECK_EQ(metrics.requests_active, 1u);
+    const MockOp* remainder = loop.backend.last_op(MockOp::Send);
+    REQUIRE(remainder != nullptr);
+    CHECK_EQ(remainder->send_buf, trace->send_buf.data() + kPartial);
+    CHECK_EQ(remainder->send_len, wire_len - kPartial);
+    loop.inject_and_dispatch(
+        make_ev(trace_id, IoEventType::Send, static_cast<i32>(wire_len - kPartial)));
+    loop.config_ptr = nullptr;
+    CHECK_EQ(metrics.requests_total, 1u);
+    CHECK_EQ(metrics.requests_active, 0u);
+    CHECK_EQ(metrics.request_latency.count, 1u);
+    CHECK_EQ(access.available(), 1u);
+    CHECK_EQ(capture.available(), 1u);
+    CHECK_EQ(epoch.epoch.load(std::memory_order_acquire), 2u);
+    AccessLogEntry access_entry{};
+    REQUIRE(access.pop(access_entry));
+    CHECK_EQ(access_entry.status, 405u);
+    CHECK_EQ(access_entry.method, static_cast<u8>(LogHttpMethod::Trace));
+    CHECK_EQ(access_entry.upstream_us, 0u);
+    CaptureEntry capture_entry{};
+    REQUIRE(capture.pop(capture_entry));
+    CHECK_EQ(capture_entry.resp_status, 405u);
+    CHECK_EQ(capture_entry.method, static_cast<u8>(LogHttpMethod::Trace));
+    CHECK_EQ(capture_entry.raw_header_len, sizeof(kTrace) - 1u);
+    CHECK_EQ(__builtin_memcmp(capture_entry.raw_headers, kTrace, sizeof(kTrace) - 1u), 0);
+
+    // Firewall denial retains precedence after the early admission proof.
+    config.set_firewall_default_deny();
+    loop.backend.clear_ops();
+    Connection* denied = dispatch_unmatched_request(loop, config, kTrace);
+    REQUIRE(denied != nullptr);
+    REQUIRE_EQ(denied->resp_status, 403u);
+    CHECK_EQ(pre_route_root_handler_calls, 0u);
+    CHECK_EQ(loop.backend.count_ops(MockOp::Connect), 0u);
+    const u32 denied_len = denied->send_buf.len();
+    loop.inject_and_dispatch(make_ev(denied->id, IoEventType::Send, static_cast<i32>(denied_len)));
+    config.set_firewall_default_allow(true);
+
+    // A second concrete component proves the selector is generic rather than a
+    // TRACE-specific runtime mode, and still wins over exact ANY and root JIT.
+    static constexpr char kOptions[] =
+        "OPTIONS /static HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n";
+    loop.backend.clear_ops();
+    Connection* options = dispatch_unmatched_request(loop, config, kOptions);
+    REQUIRE(options != nullptr);
+    REQUIRE_EQ(options->resp_status, 418u);
+    CHECK_EQ(pre_route_root_handler_calls, 0u);
+    CHECK_EQ(loop.backend.count_ops(MockOp::Connect), 0u);
+    const u32 options_len = options->send_buf.len();
+    loop.inject_and_dispatch(
+        make_ev(options->id, IoEventType::Send, static_cast<i32>(options_len)));
+
+    // The reserved Prometheus endpoint remains decisive after pre-route
+    // admission.  A configured GET policy must not shadow /metrics when the
+    // registry is enabled, and the root JIT route must remain untouched.
+    StrictLocalResponsePolicySpec metrics_policy = policies[3];
+    u16 metrics_pre_route[kStrictLocalResponseMethodSlots]{};
+    metrics_pre_route[kRouteMethodGet] = 1;
+    u16 metrics_unmatched[kStrictLocalResponseMethodSlots]{};
+    ExactStrictLocalResponseBinding metrics_exact[kMaxExactStrictLocalResponseBindings]{};
+    auto metrics_config = std::make_unique<RouteConfig>();
+    REQUIRE(metrics_config->add_jit_handler("/", kRouteMethodAny, &pre_route_root_handler, false));
+    REQUIRE(metrics_config->install_strict_local_response_table_with_pre_route(
+        &metrics_policy, 1, metrics_pre_route, metrics_unmatched, metrics_exact, 0));
+    ShardMetrics* all_metrics[] = {&metrics};
+    loop.all_shard_metrics = all_metrics;
+    loop.shard_metrics_count = 1;
+    const u32 root_before_metrics = pre_route_root_handler_calls;
+    loop.backend.clear_ops();
+    Connection* metrics_response = dispatch_unmatched_request(
+        loop, *metrics_config, "GET /metrics HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n");
+    REQUIRE(metrics_response != nullptr);
+    REQUIRE_EQ(metrics_response->resp_status, 200u);
+    CHECK(buf_contains(reinterpret_cast<const char*>(metrics_response->send_buf.data()),
+                       metrics_response->send_buf.len(),
+                       "rut_requests_total",
+                       18));
+    CHECK_FALSE(buf_contains(reinterpret_cast<const char*>(metrics_response->send_buf.data()),
+                             metrics_response->send_buf.len(),
+                             "generic-options",
+                             15));
+    CHECK_EQ(pre_route_root_handler_calls, root_before_metrics);
+    CHECK_EQ(loop.backend.count_ops(MockOp::Connect), 0u);
+    const u32 metrics_len = metrics_response->send_buf.len();
+    loop.inject_and_dispatch(
+        make_ev(metrics_response->id, IoEventType::Send, static_cast<i32>(metrics_len)));
+    loop.all_shard_metrics = nullptr;
+    loop.shard_metrics_count = 0;
+
+    // Pre-route is independently earlier than unmatched selection: this table
+    // has no exact or prefix route, and both selectors name TRACE with distinct
+    // responses.  The pre-route policy is the only published response.
+    StrictLocalResponsePolicySpec precedence_policies[2] = {policies[0], policies[2]};
+    u16 precedence_pre_route[kStrictLocalResponseMethodSlots]{};
+    precedence_pre_route[kRouteMethodTrace] = 1;
+    u16 precedence_unmatched[kStrictLocalResponseMethodSlots]{};
+    precedence_unmatched[kRouteMethodTrace] = 2;
+    ExactStrictLocalResponseBinding precedence_exact[kMaxExactStrictLocalResponseBindings]{};
+    auto precedence_config = std::make_unique<RouteConfig>();
+    REQUIRE(precedence_config->install_strict_local_response_table_with_pre_route(
+        precedence_policies, 2, precedence_pre_route, precedence_unmatched, precedence_exact, 0));
+    loop.backend.clear_ops();
+    Connection* precedence = dispatch_unmatched_request(
+        loop,
+        *precedence_config,
+        "TRACE /unmatched-only HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n");
+    REQUIRE(precedence != nullptr);
+    REQUIRE_EQ(precedence->resp_status, 405u);
+    CHECK(buf_contains(reinterpret_cast<const char*>(precedence->send_buf.data()),
+                       precedence->send_buf.len(),
+                       kNginx405Body,
+                       sizeof(kNginx405Body) - 1u));
+    CHECK_FALSE(buf_contains(reinterpret_cast<const char*>(precedence->send_buf.data()),
+                             precedence->send_buf.len(),
+                             "unmatched-trace",
+                             15));
+    CHECK_EQ(loop.backend.count_ops(MockOp::Connect), 0u);
+    const u32 precedence_len = precedence->send_buf.len();
+    loop.inject_and_dispatch(
+        make_ev(precedence->id, IoEventType::Send, static_cast<i32>(precedence_len)));
+
+    // A matching but out-of-domain request is terminal before epoch/metrics or
+    // exact/root/unmatched publication; it may not fall through.
+    static constexpr const char* kRejected[] = {
+        "TRACE /static?x=1 HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n",
+        "TRACE /static? HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n",
+        "TRACE /static#x HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n",
+        "TRACE /static HTTP/1.1\r\nConnection: close\r\n\r\n",
+        "TRACE /static HTTP/1.1\r\nHost:\r\nConnection: close\r\n\r\n",
+        "TRACE /static HTTP/1.1\r\nHost: x\r\nHost: y\r\nConnection: close\r\n\r\n",
+        "TRACE /static HTTP/1.1\r\nHost: x\r\n\r\n",
+        "TRACE /static HTTP/1.1\r\nHost: x\r\nConnection: close\r\nConnection: close\r\n\r\n",
+        "TRACE /static HTTP/1.1\r\nHost: x\r\nConnection: close, close\r\n\r\n",
+        "TRACE /static HTTP/1.1\r\nHost: x\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+        "TRACE /static HTTP/1.1\r\nHost: x\r\nContent-Length: 0\r\nContent-Length: "
+        "0\r\nConnection: close\r\n\r\n",
+        "TRACE /static HTTP/1.1\r\nHost: x\r\nContent-Length: x\r\nConnection: close\r\n\r\n",
+        "TRACE /static HTTP/1.1\r\nHost: x\r\nContent-Length: 0\r\nContent-Length: "
+        "1\r\nConnection: close\r\n\r\n",
+        "TRACE /static HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\nConnection: "
+        "close\r\n\r\n",
+        "TRACE /static HTTP/1.1\r\nHost: x\r\nTE: trailers\r\nConnection: close\r\n\r\n",
+        "TRACE /static HTTP/1.1\r\nHost: x\r\nExpect: 100-continue\r\nConnection: close\r\n\r\n",
+        "TRACE /static HTTP/1.1\r\nHost: x\r\nUpgrade: websocket\r\nConnection: close\r\n\r\n",
+        "TRACE /static HTTP/1.1\r\nHost: x\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n\r\n",
+        "TRACE /static HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\nx",
+        "TRACE /static HTTP/1.0\r\nHost: x\r\nConnection: close\r\n\r\n",
+        "TRACE * HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n",
+        "TRACE example.com:443 HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n",
+        "TRACE http://x/static HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n",
+    };
+    for (const char* request : kRejected) {
+        const u64 requests_before_reject = metrics.requests_total;
+        const u64 active_before_reject = metrics.requests_active;
+        const u32 access_before_reject = access.available();
+        const u32 capture_before_reject = capture.available();
+        const u32 root_before_reject = pre_route_root_handler_calls;
+        const u64 epoch_before_reject = epoch.epoch.load(std::memory_order_acquire);
+        loop.backend.clear_ops();
+        Connection* rejected = dispatch_unmatched_request(loop, config, request);
+        REQUIRE(rejected != nullptr);
+        CHECK_EQ(rejected->fd, -1);
+        CHECK_EQ(loop.backend.count_ops(MockOp::Send), 0u);
+        CHECK_EQ(loop.backend.count_ops(MockOp::Connect), 0u);
+        CHECK_EQ(metrics.requests_total, requests_before_reject);
+        CHECK_EQ(metrics.requests_active, active_before_reject);
+        CHECK_EQ(access.available(), access_before_reject);
+        CHECK_EQ(capture.available(), capture_before_reject);
+        CHECK_EQ(pre_route_root_handler_calls, root_before_reject);
+        CHECK_EQ(epoch.epoch.load(std::memory_order_acquire), epoch_before_reject);
+    }
+
+    // EPIPE balances the admitted request but publishes no successful access,
+    // capture, or downstream completion.
+    const u32 access_before_epipe = access.available();
+    const u32 capture_before_epipe = capture.available();
+    loop.backend.clear_ops();
+    Connection* failed = dispatch_unmatched_request(loop, config, kTrace);
+    REQUIRE(failed != nullptr);
+    const u32 failed_id = failed->id;
+    loop.inject_and_dispatch(make_ev(failed_id, IoEventType::Send, -EPIPE));
+    CHECK_EQ(loop.conns[failed_id].downstream_completed_request_count, 0u);
+    CHECK_EQ(metrics.requests_active, 0u);
+    CHECK_EQ(access.available(), access_before_epipe);
+    CHECK_EQ(capture.available(), capture_before_epipe);
+    CHECK_EQ(loop.backend.count_ops(MockOp::Connect), 0u);
+
+    // A nonmatching method retains normal exact selection.
+    loop.backend.clear_ops();
+    Connection* get = dispatch_unmatched_request(
+        loop, config, "GET /static HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n");
+    REQUIRE(get != nullptr);
+    CHECK_EQ(get->resp_status, 200u);
+    CHECK_EQ(loop.backend.count_ops(MockOp::Connect), 0u);
+    loop.close_conn(*get);
+
+    // The transport-completion witness prevents a later request on the same
+    // downstream from borrowing the fresh pre-route admission shape.
+    loop.backend.clear_ops();
+    Connection* reused =
+        dispatch_unmatched_request(loop, config, "GET /static HTTP/1.1\r\nHost: x\r\n\r\n");
+    REQUIRE(reused != nullptr);
+    const u32 reused_id = reused->id;
+    const u32 reused_first_len = reused->send_buf.len();
+    loop.inject_and_dispatch(
+        make_ev(reused_id, IoEventType::Send, static_cast<i32>(reused_first_len)));
+    REQUIRE_EQ(reused->downstream_completed_request_count, 1u);
+    const u64 reused_requests_before = metrics.requests_total;
+    const u64 reused_epoch_before = epoch.epoch.load(std::memory_order_acquire);
+    loop.backend.clear_ops();
+    REQUIRE_EQ(reused->recv_buf.write(reinterpret_cast<const u8*>(kTrace), sizeof(kTrace) - 1u),
+               sizeof(kTrace) - 1u);
+    const RouteConfig* reused_active = &config;
+    loop.config_ptr = &reused_active;
+    on_header_received<SmallLoop>(
+        &loop,
+        *reused,
+        make_ev(reused_id, IoEventType::Recv, static_cast<i32>(sizeof(kTrace) - 1u)));
+    loop.config_ptr = nullptr;
+    CHECK_EQ(loop.conns[reused_id].fd, -1);
+    CHECK_EQ(loop.backend.count_ops(MockOp::Send), 0u);
+    CHECK_EQ(loop.backend.count_ops(MockOp::Connect), 0u);
+    CHECK_EQ(metrics.requests_total, reused_requests_before);
+    CHECK_EQ(epoch.epoch.load(std::memory_order_acquire), reused_epoch_before);
+
+    loop.backend.clear_ops();
+    Connection* root = dispatch_unmatched_request(
+        loop, config, "GET /other HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n");
+    REQUIRE(root != nullptr);
+    CHECK_EQ(pre_route_root_handler_calls, 1u);
+    CHECK_EQ(loop.backend.count_ops(MockOp::Connect), 1u);
+    CHECK_EQ(root->resp_status, 0u);
+    loop.close_conn(*root);
+
+    auto partial = std::make_unique<RouteConfig>();
+    partial->pre_route_policy_ids[kRouteMethodTrace] = 1;
+    const u64 partial_requests_before = metrics.requests_total;
+    const u64 partial_epoch_before = epoch.epoch.load(std::memory_order_acquire);
+    loop.backend.clear_ops();
+    Connection* partial_conn = dispatch_unmatched_request(loop, *partial, kTrace);
+    REQUIRE(partial_conn != nullptr);
+    CHECK_EQ(partial_conn->fd, -1);
+    CHECK_EQ(loop.backend.count_ops(MockOp::Send), 0u);
+    CHECK_EQ(loop.backend.count_ops(MockOp::Connect), 0u);
+    CHECK_EQ(metrics.requests_total, partial_requests_before);
+    CHECK_EQ(epoch.epoch.load(std::memory_order_acquire), partial_epoch_before);
 }
 
 TEST(exact_local_response,
