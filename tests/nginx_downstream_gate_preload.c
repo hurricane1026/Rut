@@ -23,15 +23,18 @@ static ssize_t (*real_write_fn)(int, const void*, size_t);
 static ssize_t (*real_writev_fn)(int, const struct iovec*, int);
 static ssize_t (*real_send_fn)(int, const void*, size_t, int);
 static ssize_t (*real_sendmsg_fn)(int, const struct msghdr*, int);
+static ssize_t (*real_recv_fn)(int, void*, size_t, int);
 
 static void gate_resolve_symbols(void) {
-    if (real_write_fn != 0 && real_writev_fn != 0 && real_send_fn != 0 && real_sendmsg_fn != 0)
+    if (real_write_fn != 0 && real_writev_fn != 0 && real_send_fn != 0 && real_sendmsg_fn != 0 &&
+        real_recv_fn != 0)
         return;
     gate_inside++;
     *(void**)(&real_write_fn) = dlsym(RTLD_NEXT, "write");
     *(void**)(&real_writev_fn) = dlsym(RTLD_NEXT, "writev");
     *(void**)(&real_send_fn) = dlsym(RTLD_NEXT, "send");
     *(void**)(&real_sendmsg_fn) = dlsym(RTLD_NEXT, "sendmsg");
+    *(void**)(&real_recv_fn) = dlsym(RTLD_NEXT, "recv");
     gate_inside--;
 }
 
@@ -70,7 +73,8 @@ __attribute__((constructor)) static void gate_initialize(void) {
         return;
     }
     gate_resolve_symbols();
-    if (real_write_fn == 0 || real_writev_fn == 0 || real_send_fn == 0 || real_sendmsg_fn == 0) {
+    if (real_write_fn == 0 || real_writev_fn == 0 || real_send_fn == 0 || real_sendmsg_fn == 0 ||
+        real_recv_fn == 0) {
         rut_downstream_gate_fail(gate, RUT_DOWNSTREAM_GATE_ERROR_REAL_SYMBOL);
         return;
     }
@@ -187,6 +191,10 @@ static void gate_before_publication(int fd,
         rut_downstream_gate_load(&gate->state) != RUT_DOWNSTREAM_GATE_ARMED)
         return;
     if (!gate_is_502_prefix(prefix, prefix_length) || !gate_target_peer(fd)) return;
+    if (rut_downstream_gate_load(&gate->mode) != RUT_DOWNSTREAM_GATE_MODE_LATE_SUCCESSOR) {
+        rut_downstream_gate_fail(gate, RUT_DOWNSTREAM_GATE_ERROR_MODE);
+        return;
+    }
 
     gate->intercepted_fd = fd;
     gate->intercepted_pid = (uint32_t)getpid();
@@ -222,6 +230,87 @@ static void gate_before_publication(int fd,
     if (!rut_downstream_gate_wait_until(gate, RUT_DOWNSTREAM_GATE_RELEASED, 5000) &&
         rut_downstream_gate_load(&gate->state) != RUT_DOWNSTREAM_GATE_FAILED)
         rut_downstream_gate_fail(gate, RUT_DOWNSTREAM_GATE_ERROR_TIMEOUT);
+}
+
+static ssize_t gate_coalesced_ingress_recv(int fd, void* data, size_t length, int flags) {
+    if (!gate_protocol_valid() ||
+        rut_downstream_gate_load(&gate->state) != RUT_DOWNSTREAM_GATE_ARMED ||
+        !gate_target_peer(fd))
+        return real_recv_fn(fd, data, length, flags);
+
+    const uint32_t mode = rut_downstream_gate_load(&gate->mode);
+    if (mode == RUT_DOWNSTREAM_GATE_MODE_LATE_SUCCESSOR)
+        return real_recv_fn(fd, data, length, flags);
+    if (mode != RUT_DOWNSTREAM_GATE_MODE_COALESCED_INGRESS) {
+        rut_downstream_gate_fail(gate, RUT_DOWNSTREAM_GATE_ERROR_MODE);
+        return real_recv_fn(fd, data, length, flags);
+    }
+
+    const uint32_t expected_length = gate->request_two_length;
+    if (expected_length == 0 || expected_length > RUT_DOWNSTREAM_GATE_REQUEST_CAPACITY ||
+        length < expected_length || flags != 0) {
+        rut_downstream_gate_fail(gate, RUT_DOWNSTREAM_GATE_ERROR_PROTOCOL);
+        return real_recv_fn(fd, data, length, flags);
+    }
+    unsigned char peek[RUT_DOWNSTREAM_GATE_REQUEST_CAPACITY + 1];
+    const long peeked =
+        syscall(SYS_recvfrom, fd, peek, expected_length + 1u, MSG_PEEK | MSG_DONTWAIT, 0, 0);
+    if (peeked < 0) {
+        if (errno == EAGAIN || errno == EWOULDBLOCK)
+            rut_downstream_gate_fail(gate, RUT_DOWNSTREAM_GATE_ERROR_PEEK);
+        else
+            rut_downstream_gate_fail(gate, RUT_DOWNSTREAM_GATE_ERROR_RECV);
+        return real_recv_fn(fd, data, length, flags);
+    }
+    if ((uint32_t)peeked != expected_length ||
+        memcmp(peek, gate->request_two, expected_length) != 0) {
+        rut_downstream_gate_fail(gate, RUT_DOWNSTREAM_GATE_ERROR_REQUEST_MISMATCH);
+        return real_recv_fn(fd, data, length, flags);
+    }
+
+    // Consume through nginx's real libc call, but do not return its bytes to
+    // the parser until the controller has inspected INGRESS_HIT and released
+    // this worker. The preceding non-consuming peek and this real recv must
+    // independently equal the entire configured R1||R2 wire.
+    const ssize_t received = real_recv_fn(fd, data, length, flags);
+    const int received_errno = errno;
+    if (received != (ssize_t)expected_length ||
+        memcmp(data, gate->request_two, expected_length) != 0) {
+        rut_downstream_gate_fail(gate,
+                                 received < 0 ? RUT_DOWNSTREAM_GATE_ERROR_RECV
+                                              : RUT_DOWNSTREAM_GATE_ERROR_REQUEST_MISMATCH);
+        errno = received_errno;
+        return received;
+    }
+
+    gate->intercepted_fd = fd;
+    gate->intercepted_pid = (uint32_t)getpid();
+    gate->intercepted_ppid = (uint32_t)getppid();
+    gate->intercepted_operation = RUT_DOWNSTREAM_GATE_OP_RECV;
+    gate->intercepted_length = (uint64_t)received;
+    gate->intercepted_prefix_length = expected_length < RUT_DOWNSTREAM_GATE_PREFIX_CAPACITY
+                                          ? expected_length
+                                          : RUT_DOWNSTREAM_GATE_PREFIX_CAPACITY;
+    memcpy(gate->intercepted_prefix, data, gate->intercepted_prefix_length);
+    gate->intercepted_wire_length = expected_length;
+    memcpy(gate->intercepted_wire, data, expected_length);
+    uint32_t expected = RUT_DOWNSTREAM_GATE_ARMED;
+    if (!__atomic_compare_exchange_n(&gate->state,
+                                     &expected,
+                                     RUT_DOWNSTREAM_GATE_INGRESS_HIT,
+                                     0,
+                                     __ATOMIC_RELEASE,
+                                     __ATOMIC_ACQUIRE)) {
+        rut_downstream_gate_fail(gate, RUT_DOWNSTREAM_GATE_ERROR_TRANSITION);
+        errno = received_errno;
+        return received;
+    }
+    rut_downstream_gate_wake(&gate->state);
+    if (!rut_downstream_gate_wait_until(gate, RUT_DOWNSTREAM_GATE_INGRESS_RELEASED, 5000) &&
+        rut_downstream_gate_load(&gate->state) != RUT_DOWNSTREAM_GATE_FAILED)
+        rut_downstream_gate_fail(gate, RUT_DOWNSTREAM_GATE_ERROR_TIMEOUT);
+    errno = received_errno;
+    return received;
 }
 
 ssize_t write(int fd, const void* data, size_t length) {
@@ -307,4 +396,17 @@ ssize_t sendmsg(int fd, const struct msghdr* message, int flags) {
     gate_before_publication(fd, RUT_DOWNSTREAM_GATE_OP_SENDMSG, total, prefix, prefix_length);
     gate_inside--;
     return real_sendmsg_fn(fd, message, flags);
+}
+
+ssize_t recv(int fd, void* data, size_t length, int flags) {
+    if (gate_inside != 0) return syscall(SYS_recvfrom, fd, data, length, flags, 0, 0);
+    gate_resolve_symbols();
+    if (real_recv_fn == 0) {
+        errno = ENOSYS;
+        return -1;
+    }
+    gate_inside++;
+    const ssize_t result = gate_coalesced_ingress_recv(fd, data, length, flags);
+    gate_inside--;
+    return result;
 }

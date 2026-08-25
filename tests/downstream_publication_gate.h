@@ -8,7 +8,7 @@
 #include <unistd.h>
 
 #define RUT_DOWNSTREAM_GATE_MAGIC UINT64_C(0x5255544741544531)
-#define RUT_DOWNSTREAM_GATE_VERSION UINT32_C(2)
+#define RUT_DOWNSTREAM_GATE_VERSION UINT32_C(3)
 #define RUT_DOWNSTREAM_GATE_PREFIX_CAPACITY UINT32_C(32)
 #define RUT_DOWNSTREAM_GATE_REQUEST_CAPACITY UINT32_C(512)
 
@@ -20,6 +20,14 @@ enum rut_downstream_gate_state {
     RUT_DOWNSTREAM_GATE_R2_ARRIVED = 4,
     RUT_DOWNSTREAM_GATE_RELEASED = 5,
     RUT_DOWNSTREAM_GATE_FAILED = 6,
+    RUT_DOWNSTREAM_GATE_INGRESS_HIT = 7,
+    RUT_DOWNSTREAM_GATE_INGRESS_RELEASED = 8,
+};
+
+enum rut_downstream_gate_mode {
+    RUT_DOWNSTREAM_GATE_MODE_NONE = 0,
+    RUT_DOWNSTREAM_GATE_MODE_LATE_SUCCESSOR = 1,
+    RUT_DOWNSTREAM_GATE_MODE_COALESCED_INGRESS = 2,
 };
 
 enum rut_downstream_gate_operation {
@@ -28,6 +36,7 @@ enum rut_downstream_gate_operation {
     RUT_DOWNSTREAM_GATE_OP_WRITEV = 2,
     RUT_DOWNSTREAM_GATE_OP_SEND = 3,
     RUT_DOWNSTREAM_GATE_OP_SENDMSG = 4,
+    RUT_DOWNSTREAM_GATE_OP_RECV = 5,
 };
 
 enum rut_downstream_gate_error {
@@ -40,6 +49,8 @@ enum rut_downstream_gate_error {
     RUT_DOWNSTREAM_GATE_ERROR_PEEK = 6,
     RUT_DOWNSTREAM_GATE_ERROR_REQUEST_MISMATCH = 7,
     RUT_DOWNSTREAM_GATE_ERROR_TRANSITION = 8,
+    RUT_DOWNSTREAM_GATE_ERROR_RECV = 9,
+    RUT_DOWNSTREAM_GATE_ERROR_MODE = 10,
 };
 
 struct rut_downstream_publication_gate {
@@ -48,6 +59,7 @@ struct rut_downstream_publication_gate {
     uint32_t layout_size;
     uint32_t state;
     uint32_t error_code;
+    uint32_t mode;
     uint32_t hook_magic_ok;
     uint32_t hook_version;
     uint32_t hook_layout_size;
@@ -61,15 +73,20 @@ struct rut_downstream_publication_gate {
     uint32_t intercepted_operation;
     uint64_t intercepted_length;
     uint32_t intercepted_prefix_length;
+    // In late-successor mode this is request 2. In coalesced-ingress
+    // mode it is the complete expected R1||R2 first-recv payload.
     uint32_t request_two_length;
+    uint32_t intercepted_wire_length;
     unsigned char intercepted_prefix[RUT_DOWNSTREAM_GATE_PREFIX_CAPACITY];
     unsigned char request_two[RUT_DOWNSTREAM_GATE_REQUEST_CAPACITY];
+    // Exact real-recv bytes, published before INGRESS_HIT.
+    unsigned char intercepted_wire[RUT_DOWNSTREAM_GATE_REQUEST_CAPACITY];
 };
 
 #if defined(__cplusplus)
-static_assert(sizeof(struct rut_downstream_publication_gate) == 624);
+static_assert(sizeof(struct rut_downstream_publication_gate) == 1152);
 #else
-_Static_assert(sizeof(struct rut_downstream_publication_gate) == 624,
+_Static_assert(sizeof(struct rut_downstream_publication_gate) == 1152,
                "downstream publication gate layout drift");
 #endif
 

@@ -4786,7 +4786,8 @@ struct DownstreamGateRelease {
     ~DownstreamGateRelease() {
         if (gate == nullptr) return;
         const u32 state = rut_downstream_gate_load(&gate->state);
-        if (state != RUT_DOWNSTREAM_GATE_RELEASED && state != RUT_DOWNSTREAM_GATE_FAILED) {
+        if (state != RUT_DOWNSTREAM_GATE_RELEASED &&
+            state != RUT_DOWNSTREAM_GATE_INGRESS_RELEASED && state != RUT_DOWNSTREAM_GATE_FAILED) {
             if (rut_downstream_gate_load(&gate->error_code) == RUT_DOWNSTREAM_GATE_ERROR_NONE)
                 rut_downstream_gate_store(&gate->error_code, RUT_DOWNSTREAM_GATE_ERROR_TRANSITION);
             rut_downstream_gate_store(&gate->state, RUT_DOWNSTREAM_GATE_FAILED);
@@ -5208,6 +5209,7 @@ static bool run_nginx_downstream_gate_spike(u16 frontend_port,
     }
     mapping.gate->target_peer_ipv4_be = local.sin_addr.s_addr;
     mapping.gate->target_peer_port_be = local.sin_port;
+    rut_downstream_gate_store(&mapping.gate->mode, RUT_DOWNSTREAM_GATE_MODE_LATE_SUCCESSOR);
     mapping.gate->request_two_length = sizeof(kGatewayCloseRequest2) - 1u;
     memcpy(mapping.gate->request_two, kGatewayCloseRequest2, mapping.gate->request_two_length);
     if (!rut_downstream_gate_cas(
@@ -5320,6 +5322,328 @@ static bool run_nginx_downstream_gate_spike(u16 frontend_port,
     }
     if (observation != nullptr) {
         observation->connect_attempts = connect_attempts;
+    }
+    return true;
+}
+
+struct CoalescedIngressObservation {
+    std::vector<char> first;
+    std::vector<char> second;
+    std::vector<char> raw_wire;
+    std::vector<char> tail;
+    u32 connect_attempts = 0;
+    std::string gate_evidence;
+};
+
+static bool run_nginx_coalesced_ingress_gate_evidence(u16 frontend_port,
+                                                      u16 backend_port,
+                                                      TempDir& temp,
+                                                      const std::string& container_name,
+                                                      const char* preload_path,
+                                                      CoalescedIngressObservation& observation,
+                                                      std::string& error) {
+    if (preload_path == nullptr || preload_path[0] != '/' || access(preload_path, R_OK) != 0) {
+        error = "coalesced-ingress preload helper path is not an absolute readable file";
+        return false;
+    }
+    struct stat preload_stat{};
+    if (stat(preload_path, &preload_stat) != 0 || !S_ISREG(preload_stat.st_mode)) {
+        error = "coalesced-ingress preload helper is not a regular file";
+        return false;
+    }
+
+    DeadPort dead;
+    if (!dead.reserve(backend_port)) {
+        error = "failed to retain the coalesced-ingress dead upstream reservation";
+        return false;
+    }
+    const std::string fragment =
+        "server {\n"
+        "  listen " +
+        std::to_string(frontend_port) +
+        ";\n"
+        "  location / { proxy_pass http://127.0.0.1:" +
+        std::to_string(backend_port) +
+        "; }\n"
+        "  location = /static { return 200 \"successor-static\"; }\n"
+        "}\n";
+    const std::string config =
+        "error_log stderr notice;\n"
+        "events {}\n"
+        "http {\n" +
+        fragment + "}\n";
+    if (!write_file(temp.nginx_config, config.data(), config.size())) {
+        error = "failed to write pinned-nginx coalesced-ingress config";
+        return false;
+    }
+
+    DownstreamGateMapping mapping;
+    if (!mapping.create(temp.gate_control)) {
+        error = "failed to create coalesced-ingress gate control";
+        return false;
+    }
+    Child nginx;
+    bool child_settled = false;
+    bool cleanup_clean = true;
+    struct EvidenceCapture {
+        rut_downstream_publication_gate* gate;
+        Child* child;
+        const bool* child_settled;
+        const bool* cleanup_clean;
+        CoalescedIngressObservation* observation;
+        ~EvidenceCapture() {
+            if (!*child_settled || child->pid >= 0) {
+                observation->gate_evidence =
+                    "cleanup failure: nginx helper may still be live; ingress metadata suppressed";
+                return;
+            }
+            observation->gate_evidence =
+                std::string(*cleanup_clean ? "cleanup=clean " : "cleanup=failed-but-reaped ") +
+                "state=" + std::to_string(rut_downstream_gate_load(&gate->state)) +
+                " error=" + std::to_string(rut_downstream_gate_load(&gate->error_code)) +
+                " mode=" + std::to_string(rut_downstream_gate_load(&gate->mode)) +
+                " master=" + std::to_string(gate->target_master_pid) +
+                " worker=" + std::to_string(gate->intercepted_pid) +
+                " op=" + std::to_string(gate->intercepted_operation) +
+                " bytes=" + std::to_string(gate->intercepted_length);
+        }
+    } evidence_capture{mapping.gate, &nginx, &child_settled, &cleanup_clean, &observation};
+    DockerGuard docker(container_name);
+    struct StopGuard {
+        Child* child;
+        bool* settled;
+        bool* clean;
+        std::string* error;
+        bool stop() {
+            if (child->pid < 0) {
+                *settled = true;
+                return *clean;
+            }
+            *clean = stop_child(*child);
+            *settled = child->pid < 0;
+            if (!*clean) {
+                if (!error->empty()) *error += "; ";
+                *error += *settled ? "bounded nginx ingress cleanup required an abnormal reap"
+                                   : "bounded nginx ingress cleanup could not stop/reap helper; "
+                                     "evidence suppressed";
+            }
+            return *clean;
+        }
+        ~StopGuard() {
+            if (!*settled) (void)stop();
+        }
+    } stop_guard{&nginx, &child_settled, &cleanup_clean, &error};
+    struct ClientGuard {
+        int fd = -1;
+        ~ClientGuard() {
+            if (fd >= 0) close(fd);
+        }
+    } client;
+    DownstreamGateRelease release{mapping.gate};
+
+    if (!spawn_child({"docker",
+                      "run",
+                      "--pull=never",
+                      "--network",
+                      "host",
+                      "--name",
+                      container_name,
+                      "-e",
+                      "LD_PRELOAD=/rut-gate/preload.so",
+                      "-e",
+                      "RUT_DOWNSTREAM_GATE_CONTROL=/rut-gate/control",
+                      "-e",
+                      "RUT_DOWNSTREAM_GATE_TARGET_EXECUTABLE=/usr/sbin/nginx",
+                      "-v",
+                      std::string(preload_path) + ":/rut-gate/preload.so:ro",
+                      "-v",
+                      temp.gate_control + ":/rut-gate/control",
+                      "-v",
+                      temp.nginx_config + ":/etc/nginx/nginx.conf:ro",
+                      kNginxImage,
+                      "nginx",
+                      "-g",
+                      "daemon off;"},
+                     temp.nginx_log,
+                     nginx)) {
+        error = "failed to start pinned nginx with coalesced-ingress preload";
+        return false;
+    }
+    if (!wait_ready(frontend_port, nginx, error) ||
+        !wait_for_downstream_gate_hook(*mapping.gate, 3000, error))
+        return false;
+    if (rut_downstream_gate_load(&mapping.gate->state) != RUT_DOWNSTREAM_GATE_DISARMED ||
+        rut_downstream_gate_load(&mapping.gate->mode) != RUT_DOWNSTREAM_GATE_MODE_NONE ||
+        mapping.gate->intercepted_operation != RUT_DOWNSTREAM_GATE_OP_NONE ||
+        mapping.gate->intercepted_fd != -1 || mapping.gate->intercepted_wire_length != 0) {
+        error = "disarmed readiness traffic changed coalesced-ingress gate state";
+        return false;
+    }
+
+    client.fd = socket(AF_INET, SOCK_STREAM, 0);
+    if (client.fd < 0) {
+        error = "failed to create the pre-bound coalesced-ingress client";
+        return false;
+    }
+    sockaddr_in local{};
+    local.sin_family = AF_INET;
+    local.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    local.sin_port = 0;
+    if (bind(client.fd, reinterpret_cast<sockaddr*>(&local), sizeof(local)) != 0) {
+        error = "failed to pre-bind the coalesced-ingress client identity";
+        return false;
+    }
+    socklen_t local_length = sizeof(local);
+    if (getsockname(client.fd, reinterpret_cast<sockaddr*>(&local), &local_length) != 0 ||
+        local_length < sizeof(local) || local.sin_family != AF_INET || local.sin_port == 0) {
+        error = "failed to publish the pre-connect coalesced-ingress peer identity";
+        return false;
+    }
+    timeval timeout{2, 0};
+    (void)setsockopt(client.fd, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
+    (void)setsockopt(client.fd, SOL_SOCKET, SO_SNDTIMEO, &timeout, sizeof(timeout));
+
+    const std::string combined =
+        std::string(kGatewayKeepAliveRequest1) + kExactLocalGetCloseRequest;
+    if (combined.size() > RUT_DOWNSTREAM_GATE_REQUEST_CAPACITY) {
+        error = "coalesced-ingress request pair exceeds the shared gate capacity";
+        return false;
+    }
+    mapping.gate->target_peer_ipv4_be = local.sin_addr.s_addr;
+    mapping.gate->target_peer_port_be = local.sin_port;
+    mapping.gate->request_two_length = static_cast<u32>(combined.size());
+    memcpy(mapping.gate->request_two, combined.data(), combined.size());
+    rut_downstream_gate_store(&mapping.gate->mode, RUT_DOWNSTREAM_GATE_MODE_COALESCED_INGRESS);
+    if (!rut_downstream_gate_cas(
+            &mapping.gate->state, RUT_DOWNSTREAM_GATE_DISARMED, RUT_DOWNSTREAM_GATE_ARMED)) {
+        error = "failed to arm coalesced-ingress gate from DISARMED";
+        return false;
+    }
+    rut_downstream_gate_wake(&mapping.gate->state);
+
+    sockaddr_in frontend{};
+    frontend.sin_family = AF_INET;
+    frontend.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    frontend.sin_port = htons(frontend_port);
+    if (connect(client.fd, reinterpret_cast<sockaddr*>(&frontend), sizeof(frontend)) != 0) {
+        error = "pre-bound coalesced-ingress client failed to connect";
+        return false;
+    }
+    const ssize_t sent = send(client.fd, combined.data(), combined.size(), MSG_NOSIGNAL);
+    if (sent != static_cast<ssize_t>(combined.size())) {
+        error = sent < 0 ? "single coalesced-ingress send failed"
+                         : "single coalesced-ingress send was short";
+        return false;
+    }
+    if (!rut_downstream_gate_wait_until(mapping.gate, RUT_DOWNSTREAM_GATE_INGRESS_HIT, 5000)) {
+        error = "nginx first recv did not publish coalesced-ingress HIT; hook error " +
+                std::to_string(rut_downstream_gate_load(&mapping.gate->error_code));
+        return false;
+    }
+
+    const u32 target_master = rut_downstream_gate_load(&mapping.gate->target_master_pid);
+    bool neutral_tails = true;
+    for (size_t i = combined.size(); i < RUT_DOWNSTREAM_GATE_REQUEST_CAPACITY; i++) {
+        neutral_tails &= mapping.gate->request_two[i] == 0;
+        neutral_tails &= mapping.gate->intercepted_wire[i] == 0;
+    }
+    if (target_master == 0 || mapping.gate->intercepted_fd < 0 ||
+        mapping.gate->intercepted_pid == 0 || mapping.gate->intercepted_pid == target_master ||
+        mapping.gate->intercepted_ppid != target_master ||
+        rut_downstream_gate_load(&mapping.gate->mode) !=
+            RUT_DOWNSTREAM_GATE_MODE_COALESCED_INGRESS ||
+        mapping.gate->intercepted_operation != RUT_DOWNSTREAM_GATE_OP_RECV ||
+        mapping.gate->intercepted_length != combined.size() ||
+        mapping.gate->intercepted_wire_length != combined.size() ||
+        memcmp(mapping.gate->intercepted_wire, combined.data(), combined.size()) != 0 ||
+        !neutral_tails ||
+        mapping.gate->intercepted_prefix_length != RUT_DOWNSTREAM_GATE_PREFIX_CAPACITY ||
+        memcmp(mapping.gate->intercepted_prefix,
+               combined.data(),
+               RUT_DOWNSTREAM_GATE_PREFIX_CAPACITY) != 0) {
+        error = "coalesced-ingress HIT metadata did not prove one exact worker recv of R1||R2";
+        return false;
+    }
+    if (!downstream_has_no_readable_byte(client.fd, error)) return false;
+    const std::string upstream_context = "127.0.0.1:" + std::to_string(backend_port);
+    u32 premature_connects = 0;
+    if (!log_count_line_with(
+            temp.nginx_log, "connect() failed", upstream_context.c_str(), premature_connects) ||
+        premature_connects != 0) {
+        error = "nginx showed a dead-port connect before the held first recv returned";
+        return false;
+    }
+    if (!rut_downstream_gate_cas(&mapping.gate->state,
+                                 RUT_DOWNSTREAM_GATE_INGRESS_HIT,
+                                 RUT_DOWNSTREAM_GATE_INGRESS_RELEASED)) {
+        error = "failed coalesced-ingress HIT to RELEASED transition";
+        return false;
+    }
+    rut_downstream_gate_wake(&mapping.gate->state);
+
+    const bool read_ok = read_two_responses_and_eof(client.fd,
+                                                    observation.first,
+                                                    observation.second,
+                                                    error,
+                                                    &observation.raw_wire,
+                                                    &observation.tail);
+    if (!read_ok) return false;
+    std::string detail;
+    if (!validate_exact_normalized_response(
+            observation.first, kGatewayKeepAliveResponseNormalized, detail)) {
+        error = "coalesced-ingress nginx response 1 mismatch: " + detail;
+        return false;
+    }
+    if (!validate_exact_normalized_response(
+            observation.second, kExactLocalCloseResponseNormalized, detail)) {
+        error = "coalesced-ingress nginx exact-local response 2 mismatch: " + detail;
+        return false;
+    }
+    if (!observation.tail.empty()) {
+        error = "coalesced-ingress nginx response pair retained unexpected tail bytes";
+        return false;
+    }
+    const auto settle_deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(500);
+    while (std::chrono::steady_clock::now() < settle_deadline) {
+        if (poll_child(nginx)) {
+            error = "pinned nginx exited during coalesced-ingress no-extra window";
+            return false;
+        }
+        (void)poll(nullptr, 0, 25);
+    }
+    u32 live_connect_attempts = 0;
+    if (!log_count_line_with(
+            temp.nginx_log, "connect() failed", upstream_context.c_str(), live_connect_attempts) ||
+        live_connect_attempts != 1 ||
+        rut_downstream_gate_load(&mapping.gate->state) != RUT_DOWNSTREAM_GATE_INGRESS_RELEASED ||
+        rut_downstream_gate_load(&mapping.gate->error_code) != RUT_DOWNSTREAM_GATE_ERROR_NONE) {
+        error = "coalesced-ingress live settle did not retain one R1 connect and clean gate state";
+        return false;
+    }
+
+    close(client.fd);
+    client.fd = -1;
+    const bool nginx_stopped = stop_guard.stop();
+    const bool container_removed = docker.remove();
+    u32 reaped_connect_attempts = 0;
+    const bool exact_reaped_attempts =
+        log_count_line_with(temp.nginx_log,
+                            "connect() failed",
+                            upstream_context.c_str(),
+                            reaped_connect_attempts) &&
+        reaped_connect_attempts == 1 && child_settled && nginx.pid < 0 &&
+        rut_downstream_gate_load(&mapping.gate->state) == RUT_DOWNSTREAM_GATE_INGRESS_RELEASED &&
+        rut_downstream_gate_load(&mapping.gate->error_code) == RUT_DOWNSTREAM_GATE_ERROR_NONE &&
+        mapping.gate->intercepted_wire_length == combined.size() &&
+        memcmp(mapping.gate->intercepted_wire, combined.data(), combined.size()) == 0;
+    observation.connect_attempts = reaped_connect_attempts;
+    if (!nginx_stopped || !container_removed || !exact_reaped_attempts) {
+        error = !nginx_stopped
+                    ? "failed to TERM/reap coalesced-ingress pinned nginx"
+                    : (!container_removed
+                           ? "failed to remove coalesced-ingress pinned nginx container"
+                           : "post-reap nginx log did not retain exactly one scoped R1 connect");
+        return false;
     }
     return true;
 }
@@ -7058,6 +7382,8 @@ route exact "/static" { return local_response({
 
 int main(int argc, char** argv) {
     const bool nginx_gate_spike = argc == 3 && strcmp(argv[1], "--nginx-gate-spike") == 0;
+    const bool nginx_coalesced_ingress_gate =
+        argc == 3 && strcmp(argv[1], "--nginx-coalesced-ingress-gate") == 0;
     const bool exact_local_return_baseline =
         argc == 2 && strcmp(argv[1], "--exact-local-return-baseline") == 0;
     const bool strict_local_response_differential =
@@ -7081,13 +7407,14 @@ int main(int argc, char** argv) {
     const bool normal_differential =
         (argc == 2 && argv[1][0] == '/') ||
         (argc == 4 && argv[1][0] == '/' && argv[2][0] == '/' && argv[3][0] == '/');
-    if ((!nginx_gate_spike && !exact_local_return_baseline && !strict_local_response_differential &&
-         !converter_exact_local_differential && !exact_strict_route_differential &&
-         !rut_iouring_gate_spike && !rut_iouring_gate_identity_negative &&
-         !rut_iouring_gate_ready_mutation_negative && !rut_iouring_gate_owner_death_negative &&
-         !rut_iouring_gate_connect_journal_negative && !late_successor_differential &&
-         !normal_differential) ||
+    if ((!nginx_gate_spike && !nginx_coalesced_ingress_gate && !exact_local_return_baseline &&
+         !strict_local_response_differential && !converter_exact_local_differential &&
+         !exact_strict_route_differential && !rut_iouring_gate_spike &&
+         !rut_iouring_gate_identity_negative && !rut_iouring_gate_ready_mutation_negative &&
+         !rut_iouring_gate_owner_death_negative && !rut_iouring_gate_connect_journal_negative &&
+         !late_successor_differential && !normal_differential) ||
         (nginx_gate_spike && argv[2][0] != '/') ||
+        (nginx_coalesced_ingress_gate && argv[2][0] != '/') ||
         (strict_local_response_differential && argv[2][0] != '/') ||
         (converter_exact_local_differential && argv[2][0] != '/') ||
         (exact_strict_route_differential && argv[2][0] != '/') ||
@@ -7100,6 +7427,8 @@ int main(int argc, char** argv) {
         std::cerr << "usage: test_nginx_differential <absolute-rut-executable> "
                      "<absolute-nginx-preload-helper> <absolute-rut-preload-helper>\n"
                      "   or: test_nginx_differential --nginx-gate-spike "
+                     "<absolute-preload-helper>\n"
+                     "   or: test_nginx_differential --nginx-coalesced-ingress-gate "
                      "<absolute-preload-helper>\n"
                      "   or: test_nginx_differential --exact-local-return-baseline\n"
                      "   or: test_nginx_differential --strict-local-response-differential "
@@ -7227,6 +7556,39 @@ int main(int argc, char** argv) {
         frontend_port == backend_port) {
         std::cerr << "FAIL [preflight]: bounded dynamic port allocation failed\n";
         return 1;
+    }
+
+    if (nginx_coalesced_ingress_gate) {
+        const char* source_suffix = strrchr(temp.path, '/');
+        source_suffix = source_suffix ? source_suffix + 1 : temp.path;
+        const std::string container_name =
+            "rut-nginx-coalesced-ingress-" + std::to_string(getpid()) + "-" + source_suffix;
+        CoalescedIngressObservation observation;
+        std::string ingress_error;
+        if (!run_nginx_coalesced_ingress_gate_evidence(frontend_port,
+                                                       backend_port,
+                                                       temp,
+                                                       container_name,
+                                                       argv[2],
+                                                       observation,
+                                                       ingress_error)) {
+            std::cerr << "FAIL [pinned nginx coalesced-ingress gate]: " << ingress_error << "\n";
+            dump_wire("pinned nginx coalesced-ingress raw wire", observation.raw_wire);
+            dump_wire("pinned nginx coalesced-ingress response 1", observation.first);
+            dump_wire("pinned nginx coalesced-ingress response 2", observation.second);
+            dump_wire("pinned nginx coalesced-ingress tail", observation.tail);
+            std::cerr << "coalesced-ingress connect attempts=" << observation.connect_attempts
+                      << " gate evidence=" << observation.gate_evidence << "\n";
+            dump_log(temp.nginx_config, "coalesced-ingress pinned nginx config");
+            dump_log(temp.nginx_log, "coalesced-ingress pinned nginx log");
+            return 1;
+        }
+        std::cerr
+            << "PASS: pinned nginx first recv held one exact R1||R2 send before parsing, then "
+               "emitted configured 502 keep-alive plus exact-local 200 close/EOF with one "
+               "scoped upstream attempt (nginx-side ingress evidence only; no RUT or converter "
+               "differential claim)\n";
+        return 0;
     }
 
     if (exact_local_return_baseline || normal_differential) {

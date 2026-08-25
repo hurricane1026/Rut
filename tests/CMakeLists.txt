@@ -384,6 +384,18 @@ if(RUT_ENABLE_JIT)
         SKIP_RETURN_CODE 77
     )
     add_test(
+        NAME test_nginx_coalesced_ingress_gate
+        COMMAND test_nginx_differential --nginx-coalesced-ingress-gate
+                $<TARGET_FILE:test_nginx_downstream_gate_preload>
+    )
+    set_tests_properties(test_nginx_coalesced_ingress_gate PROPERTIES
+        LABELS "integration;nginx;docker"
+        RUN_SERIAL TRUE
+        RESOURCE_LOCK nginx-differential
+        TIMEOUT 60
+        SKIP_RETURN_CODE 77
+    )
+    add_test(
         NAME test_nginx_exact_local_return_baseline
         COMMAND test_nginx_differential --exact-local-return-baseline
     )
