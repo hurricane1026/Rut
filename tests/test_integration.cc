@@ -19429,6 +19429,330 @@ route exact GET "/static" { return local_response({
     program_guard.armed = false;
 }
 
+TEST(route, public_ordinary_source_exact_strict_local_response_single_cl0_post_iouring) {
+    using namespace rut;
+    if (!iouring_socket_live()) SKIP("io_uring async socket ops unavailable in this environment");
+
+    static constexpr char kRequest[] =
+        "POST /static HTTP/1.1\r\n"
+        "Host: exact-local.example\r\n"
+        "Content-Length: 0\r\n"
+        "Connection: close\r\n\r\n";
+    static constexpr char kExpected[] =
+        "HTTP/1.1 200 OK\r\n"
+        "Server: nginx/1.29.7\r\n"
+        "Date: XXXXXXXXXXXXXXXXXXXXXXXXXXXXX\r\n"
+        "Content-Type: text/plain\r\n"
+        "Content-Length: 16\r\n"
+        "Connection: close\r\n\r\n"
+        "successor-static";
+    static_assert(sizeof("successor-static") - 1u == 16u);
+
+    RecordingUpstream backend;
+    REQUIRE(backend.setup());
+
+    std::string source_text =
+        "listen :0\nupstream backend at \"127.0.0.1:" + std::to_string(backend.port) + "\"\n";
+    source_text += R"rut(
+route "/" {
+  return forward(backend,
+    request_policy: { version: "HTTP/1.1", host: "upstream", connection: "omit",
+      strip_headers: ["Connection", "Keep-Alive", "TE", "Expect", "Upgrade"] },
+    response_policy: { version: "HTTP/1.1", framing: "content_length",
+      connection: "request", server: "rut-fallback", date: "current",
+      hide_headers: ["Date", "Server"] })
+}
+route exact "/static" { return local_response({
+  version: "HTTP/1.1", status: 200, reason: "OK", server: "nginx/1.29.7",
+  date: "current", content_type: "text/plain", connection: "request",
+  head_mode: "suppress_body", body: b"successor-static"
+}) }
+)rut";
+
+    struct TempSource {
+        char path[64] = "/tmp/rut_exact_cl0_wire_XXXXXX";
+        i32 fd = -1;
+
+        bool create(Str text) {
+            fd = mkstemp(path);
+            if (fd < 0) return false;
+            u32 written = 0;
+            while (written < text.len) {
+                const ssize_t n = write(fd, text.ptr + written, text.len - written);
+                if (n < 0 && errno == EINTR) continue;
+                if (n <= 0) return false;
+                written += static_cast<u32>(n);
+            }
+            if (close(fd) != 0) return false;
+            fd = -1;
+            return true;
+        }
+
+        ~TempSource() {
+            if (fd >= 0) close(fd);
+            unlink(path);
+        }
+    } source;
+    REQUIRE(source.create({source_text.data(), static_cast<u32>(source_text.size())}));
+
+    LoadedProgram program{};
+    struct ProgramGuard {
+        LoadedProgram& program;
+        bool armed = true;
+        ~ProgramGuard() {
+            if (armed) program.destroy();
+        }
+    } program_guard{program};
+    LoadError load_error{};
+    const bool loaded = load_rut_program(source.path, program, load_error, jit::OptLevel::O0);
+    char load_message[512]{};
+    if (!loaded) format_load_error(load_error, load_message, sizeof(load_message));
+    REQUIRE_MSG(loaded, load_message);
+
+    // This is the full ordinary-source production path. The exact binding is
+    // metadata beside, rather than an executable replacement for, the root JIT
+    // fallback.
+    REQUIRE(program.jit_inited);
+    REQUIRE(program.has_listener);
+    CHECK_EQ(program.listener.port, 0u);
+    REQUIRE_EQ(program.rir.module.func_count, 1u);
+    REQUIRE_EQ(program.rir.module.upstream_count, 1u);
+    REQUIRE_EQ(program.rir.module.strict_local_response_policy_count, 1u);
+    REQUIRE_EQ(program.rir.module.exact_strict_local_response_binding_count, 1u);
+    REQUIRE_EQ(program.config.route_count, 1u);
+    REQUIRE_EQ(program.config.upstream_count, 1u);
+    REQUIRE_EQ(program.config.strict_local_response_policy_count, 1u);
+    REQUIRE_EQ(program.config.exact_strict_local_response_binding_count, 1u);
+    REQUIRE(program.config.strict_local_response_table_is_valid());
+    REQUIRE(program.config.strict_local_response_policy_id_is_owned(1u));
+    REQUIRE(program.rir.module.upstreams[0].has_address);
+    CHECK_EQ(program.rir.module.upstreams[0].ip, 0x7F000001u);
+    CHECK_EQ(program.rir.module.upstreams[0].port, backend.port);
+    REQUIRE_EQ(program.config.upstreams[0].addr_count, 1u);
+    CHECK_EQ(program.config.upstreams[0].addrs[0].sin_family, AF_INET);
+    CHECK_EQ(ntohl(program.config.upstreams[0].addrs[0].sin_addr.s_addr), 0x7F000001u);
+    CHECK_EQ(ntohs(program.config.upstreams[0].addrs[0].sin_port), backend.port);
+
+    const auto& rir_binding = program.rir.module.exact_strict_local_response_bindings[0];
+    const auto& binding = program.config.exact_strict_local_response_bindings[0];
+    REQUIRE_EQ(rir_binding.path_len, sizeof("/static") - 1u);
+    REQUIRE_EQ(binding.path_len, sizeof("/static") - 1u);
+    CHECK_EQ(memcmp(rir_binding.path, "/static", sizeof("/static") - 1u), 0);
+    CHECK_EQ(memcmp(binding.path, "/static", sizeof("/static") - 1u), 0);
+    CHECK_EQ(rir_binding.path[rir_binding.path_len], '\0');
+    CHECK_EQ(binding.path[binding.path_len], '\0');
+    CHECK_NE(&rir_binding.path[0], &binding.path[0]);
+    CHECK_EQ(rir_binding.method, kRouteMethodAny);
+    CHECK_EQ(binding.method, kRouteMethodAny);
+    CHECK_EQ(rir_binding.policy_id, 1u);
+    CHECK_EQ(binding.policy_id, 1u);
+    CHECK_EQ(program.config.match_exact_strict_local_response({"/static", 7}, kRouteMethodPost),
+             1u);
+    CHECK_EQ(
+        program.config.match_exact_strict_local_response({"/static?x=1", 11}, kRouteMethodPost),
+        1u);
+    CHECK_EQ(program.config.match_exact_strict_local_response({"/static/", 8}, kRouteMethodPost),
+             0u);
+
+    const RouteEntry* fallback = program.config.match_canonical({"fallback", 8}, kRouteMethodPost);
+    REQUIRE(fallback != nullptr);
+    CHECK_EQ(fallback->action, RouteAction::JitHandler);
+    CHECK_NE(fallback->fn, nullptr);
+    const auto& rir_policy = program.rir.module.strict_local_response_policies[0];
+    const auto& policy = program.config.strict_local_response_policies[0];
+    CHECK_EQ(policy.version, StrictLocalResponseVersion::Http11);
+    CHECK_EQ(policy.status_code, 200u);
+    CHECK_EQ(policy.date, StrictLocalResponseDate::Current);
+    CHECK_EQ(policy.connection, StrictLocalResponseConnection::Request);
+    CHECK_EQ(policy.head_mode, StrictLocalResponseHeadMode::SuppressBody);
+    CHECK_EQ(strict_local_response_profile(policy.status_code),
+             StrictLocalResponseProfile::Representation200);
+    CHECK(policy.reason.eq({"OK", 2}));
+    CHECK(policy.server.eq({"nginx/1.29.7", 12}));
+    CHECK(policy.content_type.eq({"text/plain", 10}));
+    CHECK(policy.body.eq({"successor-static", 16}));
+    CHECK_NE(policy.reason.ptr, rir_policy.reason.ptr);
+    CHECK_NE(policy.server.ptr, rir_policy.server.ptr);
+    CHECK_NE(policy.content_type.ptr, rir_policy.content_type.ptr);
+    CHECK_NE(policy.body.ptr, rir_policy.body.ptr);
+
+    Shard<IoUringEventLoop> shard;
+    struct ShardGuard {
+        Shard<IoUringEventLoop>& shard;
+        bool initialized = false;
+        bool spawned = false;
+        ~ShardGuard() {
+            if (spawned) {
+                shard.stop();
+                shard.join();
+            }
+            if (initialized) {
+                if (shard.loop != nullptr) shard.loop->force_close_all();
+                shard.shutdown();
+            }
+        }
+    } shard_guard{shard};
+    struct FdGuard {
+        i32 fd = -1;
+        ~FdGuard() {
+            if (fd >= 0) close(fd);
+        }
+    } listen_guard{create_listen_socket(0).value_or(-1)};
+    REQUIRE_GE(listen_guard.fd, 0);
+    const u16 port = get_port(listen_guard.fd);
+    REQUIRE(shard.init(0, listen_guard.fd).has_value());
+    shard_guard.initialized = true;
+    shard.owns_listen_fd = true;
+    listen_guard.fd = -1;
+    shard.route_config = &program.config;
+    shard.active_config = shard.route_config;
+    REQUIRE(shard.loop != nullptr);
+    REQUIRE(shard.init_access_log().has_value());
+    CaptureRing* capture_ring = shard.enable_capture();
+    REQUIRE(capture_ring != nullptr);
+    REQUIRE_EQ(shard.loop->access_log, shard.log_ring);
+    REQUIRE_EQ(shard.loop->capture_ring, capture_ring);
+    REQUIRE(shard.spawn(-1).has_value());
+    shard_guard.spawned = true;
+    REQUIRE_EQ(shard.backend_failure_code(), 0);
+
+    struct ClientGuard {
+        i32 fd = -1;
+        ~ClientGuard() {
+            if (fd >= 0) close(fd);
+        }
+    } client{connect_to(port)};
+    REQUIRE_GE(client.fd, 0);
+    set_socket_timeouts(client.fd, 5);
+    REQUIRE(send_all(client.fd, kRequest, sizeof(kRequest) - 1u));
+    char response[512]{};
+    u32 response_len = 0;
+    REQUIRE(read_public_close_response(
+        client.fd, sizeof("successor-static") - 1u, response, sizeof(response), response_len));
+    REQUIRE_EQ(response_len, sizeof(kExpected) - 1u);
+    REQUIRE(normalize_public_date(response, response_len));
+    CHECK_EQ(memcmp(response, kExpected, response_len), 0);
+
+    // Keep both actors alive for the complete absence observation. Recorder
+    // counters are atomic; shard-owned accounting is read only after join.
+    bool zero_upstream_window = true;
+    for (u32 sample = 0; sample < 100; sample++) {
+        zero_upstream_window &= backend.accepted_count.load(std::memory_order_acquire) == 0u;
+        zero_upstream_window &= backend.request_count.load(std::memory_order_acquire) == 0u;
+        zero_upstream_window &= backend.running.load(std::memory_order_acquire);
+        zero_upstream_window &= backend.thread_alive.load(std::memory_order_acquire);
+        zero_upstream_window &= !backend.listener_failed.load(std::memory_order_acquire);
+        zero_upstream_window &= shard.loop->is_running();
+        zero_upstream_window &= shard.backend_failure_code() == 0;
+        usleep(5000);
+    }
+    REQUIRE(zero_upstream_window);
+    REQUIRE_EQ(close(client.fd), 0);
+    client.fd = -1;
+
+    shard.stop();
+    shard.join();
+    shard_guard.spawned = false;
+    REQUIRE_EQ(shard.backend_failure_code(), 0);
+    backend.teardown();
+
+    CHECK_FALSE(shard.loop->is_running());
+    CHECK_EQ(shard.loop->active_count(), 0u);
+    CHECK_EQ(shard.loop->pending_free_count, 0u);
+    CHECK_EQ(shard.loop->pool.in_use(), 0u);
+    CHECK_EQ(shard.upstream->idle_count.load(std::memory_order_acquire), 0u);
+    CHECK_EQ(shard.upstream->free_top, UpstreamPool::kMaxConns);
+    CHECK_EQ(shard.shard_metrics.connections_total, 1u);
+    CHECK_EQ(shard.shard_metrics.connections_active, 0u);
+    CHECK_EQ(shard.shard_metrics.connections_closed, 1u);
+    CHECK_EQ(shard.shard_metrics.requests_total, 1u);
+    CHECK_EQ(shard.shard_metrics.requests_active, 0u);
+    CHECK_EQ(shard.shard_metrics.request_latency.count, 1u);
+    const u64 final_epoch = shard.epoch.epoch.load(std::memory_order_acquire);
+    CHECK_EQ(final_epoch, 2u);
+    CHECK_EQ(final_epoch % 2u, 0u);
+
+    REQUIRE_EQ(backend.accepted_count.load(std::memory_order_acquire), 0u);
+    REQUIRE_EQ(backend.request_count.load(std::memory_order_acquire), 0u);
+    CHECK_EQ(backend.request_len, 0u);
+    CHECK_EQ(backend.request_header_len, 0u);
+    CHECK_EQ(backend.request_body_len, 0u);
+    for (u32 slot = 0; slot < RecordingUpstream::kMaxRecordedRequests; slot++) {
+        CHECK_EQ(backend.request_history_len[slot], 0u);
+        CHECK_EQ(backend.request_history_header_len[slot], 0u);
+        CHECK_EQ(backend.request_recorded_ns[slot].load(std::memory_order_acquire), 0u);
+        CHECK_EQ(backend.response_application_write_count[slot].load(std::memory_order_acquire),
+                 0u);
+        CHECK_EQ(backend.response_last_application_write_completed_ns[slot].load(
+                     std::memory_order_acquire),
+                 0u);
+        CHECK_EQ(backend.response_connection_closed_ns[slot].load(std::memory_order_acquire), 0u);
+        bool empty = true;
+        for (u32 byte = 0; empty && byte < RecordingUpstream::kRequestCapacity; byte++)
+            empty = backend.request_history[slot][byte] == '\0';
+        CHECK(empty);
+    }
+
+    REQUIRE_EQ(shard.log_ring->available(), 1u);
+    AccessLogEntry access{};
+    REQUIRE(shard.log_ring->pop(access));
+    CHECK_EQ(access.status, 200u);
+    CHECK_EQ(access.method, static_cast<u8>(LogHttpMethod::Post));
+    CHECK_EQ(access.req_size, sizeof(kRequest) - 1u);
+    CHECK_EQ(access.resp_size, sizeof(kExpected) - 1u);
+    CHECK_EQ(access.upstream_us, 0u);
+    CHECK_EQ(strcmp(access.path, "/static"), 0);
+    CHECK_EQ(access.upstream[0], '\0');
+    AccessLogEntry no_access{};
+    CHECK_FALSE(shard.log_ring->pop(no_access));
+
+    REQUIRE_EQ(capture_ring->available(), 1u);
+    CaptureEntry capture{};
+    REQUIRE(capture_ring->pop(capture));
+    CHECK_EQ(capture.resp_status, 200u);
+    CHECK_EQ(capture.method, static_cast<u8>(LogHttpMethod::Post));
+    CHECK_EQ(capture.req_content_length, 0u);
+    CHECK_EQ(capture.resp_content_length, sizeof(kExpected) - 1u);
+    REQUIRE_EQ(capture.raw_header_len, sizeof(kRequest) - 1u);
+    CHECK_EQ(memcmp(capture.raw_headers, kRequest, sizeof(kRequest) - 1u), 0);
+    CHECK_EQ(capture.upstream_name[0], '\0');
+    CaptureEntry no_capture{};
+    CHECK_FALSE(capture_ring->pop(no_capture));
+
+    bool all_connections_settled = true;
+    for (u32 id = 0; id < IoUringEventLoop::kMaxConns; id++) {
+        const Connection& conn = shard.loop->conns[id];
+        all_connections_settled &=
+            conn.fd == -1 && conn.on_recv == nullptr && conn.on_send == nullptr &&
+            !conn.recv_armed && !conn.send_armed && !conn.recv_paused_for_send &&
+            !conn.recv_pause_cancel_pending && !conn.recv_pause_rearm_pending &&
+            conn.pending_ops == 0 && conn.request_config == nullptr &&
+            conn.upstream_attempts == 0 && conn.retry_req_send_len == 0 &&
+            conn.upstream_retiring_episode == 0 &&
+            http1_pipeline_successor_upstream_owners_are_neutral(conn) &&
+            conn.pipeline_depth == 0 && conn.pipeline_stash_len == 0 &&
+            conn.http1_pipeline_request_generation == 0 && !conn.http1_boundary_deferred &&
+            !conn.http1_boundary_ready && conn.http1_boundary_successor_episode == 0 &&
+            conn.recv_buf.len() == 0 && conn.send_buf.len() == 0 &&
+            (!conn.response_header_buf.valid() || conn.response_header_buf.len() == 0) &&
+            conn.response_read_deadline_owner_is_neutral() &&
+            conn.response_read_deadline_connected_auxiliary_owners_are_neutral() &&
+            conn.http1_prebuilt_wait == 0 &&
+            conn.http1_prebuilt_disposition == Http1RequestBufferDisposition::None &&
+            conn.http1_prebuilt_request_prefix_len == 0 &&
+            conn.http1_prebuilt_response_proof_is_neutral();
+    }
+    CHECK(all_connections_settled);
+
+    // This evidence covers only the literal numeric spelling "0" on one fresh
+    // production connection. Deterministic Phase 2 tests remain authoritative
+    // for partial-Send and EPIPE callback behavior.
+    shard.shutdown();
+    shard_guard.initialized = false;
+    program.destroy();
+    program_guard.armed = false;
+}
+
 TEST(shard, serves_http2_jit_target_transform_initial_fails_closed) {
     H2TargetTransformJit compiled;
     REQUIRE(compiled.init(/*with_timer=*/false));
