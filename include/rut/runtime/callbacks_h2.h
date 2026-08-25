@@ -733,6 +733,12 @@ void h2_invoke_emit(H2Dispatch<Loop>& d,
                     bool request_body_followed,
                     bool request_forwardable,
                     const ParsedRequest* open_request = nullptr) {
+    if (route_requires_response_read_timeout_preflight_close(route, cfg)) {
+        d.close_after_process = true;
+        d.resp_len = 0;
+        d.overflow = false;
+        return;
+    }
     auto* ctx = d.conn->reset_jit_ctx();
     d.conn->resp_header_mutation_pending_count = 0;
     d.conn->resp_header_mutation_pending_overflow = false;

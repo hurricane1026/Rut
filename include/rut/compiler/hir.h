@@ -1136,9 +1136,8 @@ struct HirRoute {
     HirControl control{};
     bool allow_respond_effects = false;
     u32 error_variant_index = 0xffffffffu;
-    // Compiler-derived response-read-deadline preflight timing. The behavior-
-    // neutral foundation admits only None and EagerDirect; deferred selection
-    // remains a fail-closed reserved value.
+    // Compiler-derived response-read-deadline preflight timing. Deferred mode
+    // is reserved for the verifier-proven path-only selector shape.
     ForwardPreflightMode forward_preflight_mode = ForwardPreflightMode::None;
     // @rateLimit decorators → stacked fixed-window rules (empty = no limit).
     // Flows to the RIR Function and on to RouteConfig rate-limit setup.

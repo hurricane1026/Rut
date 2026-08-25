@@ -189,12 +189,12 @@ inline bool register_jit_routes(RouteConfig& cfg, const rir::Module& mod, jit::J
             for (u32 j = 0; j < fn.route_pattern.len; j++) path[j] = fn.route_pattern.ptr[j];
             path[fn.route_pattern.len] = '\0';
 
-            if (!target.add_jit_handler(path,
-                                        fn.http_method,
-                                        handler,
-                                        rir_function_needs_req_body(fn),
-                                        fn.forward_preflight_mode,
-                                        fn.preflight_forward_policy_bundle_id))
+            if (!target.add_verified_jit_handler(path,
+                                                 fn.http_method,
+                                                 handler,
+                                                 rir_function_needs_req_body(fn),
+                                                 fn.forward_preflight_mode,
+                                                 fn.preflight_forward_policy_bundle_id))
                 return false;
             // @rateLimit decorators → stacked token-bucket rules, each with its own
             // metering key (the route just added is at index route_count - 1).

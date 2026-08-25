@@ -25,6 +25,13 @@
 
 namespace rut {
 
+namespace rir {
+struct Module;
+}
+
+struct RouteConfig;
+bool register_jit_routes(RouteConfig& cfg, const rir::Module& mod, jit::JitEngine& engine);
+
 // Action for a matched route.
 enum class RouteAction : u8 {
     Static,      // respond with fixed status (e.g., 200 OK, 404)
@@ -1265,22 +1272,26 @@ struct RouteConfig {
         return true;
     }
 
-    // Add a JIT-handler route. Handler is invoked on match; its HandlerResult
-    // tells the runtime what to do next (return status, forward, or yield).
-    // Same failure modes as add_proxy() plus null-fn check.
-    bool add_jit_handler(const char* path,
-                         u8 method,
-                         jit::HandlerFn fn,
-                         bool needs_req_body,
-                         ForwardPreflightMode forward_preflight_mode,
-                         u16 preflight_forward_policy_bundle_id) {
+private:
+    friend bool register_jit_routes(RouteConfig& cfg,
+                                    const rir::Module& mod,
+                                    jit::JitEngine& engine);
+
+    // Verified-RIR publication entry. Deferred mode is inaccessible to native
+    // callers and admitted only after register_jit_routes verifies the module.
+    bool add_verified_jit_handler(const char* path,
+                                  u8 method,
+                                  jit::HandlerFn fn,
+                                  bool needs_req_body,
+                                  ForwardPreflightMode forward_preflight_mode,
+                                  u16 preflight_forward_policy_bundle_id) {
         if (route_count >= kMaxRoutes) return false;
         if (fn == nullptr) return false;
         if (!forward_preflight_mode_valid(forward_preflight_mode) ||
-            !forward_preflight_metadata_is_eager_runtime_safe(forward_preflight_mode,
-                                                              preflight_forward_policy_bundle_id))
+            !forward_preflight_metadata_is_verified_runtime_safe(
+                forward_preflight_mode, preflight_forward_policy_bundle_id))
             return false;
-        if (forward_preflight_mode == ForwardPreflightMode::EagerDirect &&
+        if (forward_preflight_mode_can_own_runtime_deadline(forward_preflight_mode) &&
             (!policy_bundle_id_is_valid(preflight_forward_policy_bundle_id) ||
              !response_read_timeout_seconds_valid(
                  policy_bundles[preflight_forward_policy_bundle_id - 1]
@@ -1291,6 +1302,12 @@ struct RouteConfig {
         if (!param_count_fits(path)) return false;
         const u8 method_key = route_method_key_from_legacy_char(method);
         if (route_method_slot(method_key) == kMethodSlotInvalid) return false;
+        if (forward_preflight_mode == ForwardPreflightMode::AfterCanonicalSelection &&
+            (needs_req_body || method_key == kRouteMethodAny ||
+             !complete_content_length_route_method_is_admitted(method_key) ||
+             policy_bundles[preflight_forward_policy_bundle_id - 1].response_buffering !=
+                 ForwardResponseBufferingMode::CompleteContentLength))
+            return false;
         auto& r = routes[route_count];
         r.path_len = 0;
         while (path[r.path_len] && r.path_len < sizeof(r.path) - 1) {
@@ -1312,6 +1329,28 @@ struct RouteConfig {
         }
         route_count++;
         return true;
+    }
+
+public:
+    // Add a JIT-handler route. Handler is invoked on match; its HandlerResult
+    // tells the runtime what to do next (return status, forward, or yield).
+    // Same failure modes as add_proxy() plus null-fn check. Native callers are
+    // intentionally limited to None/EagerDirect metadata.
+    bool add_jit_handler(const char* path,
+                         u8 method,
+                         jit::HandlerFn fn,
+                         bool needs_req_body,
+                         ForwardPreflightMode forward_preflight_mode,
+                         u16 preflight_forward_policy_bundle_id) {
+        if (!forward_preflight_metadata_is_eager_runtime_safe(forward_preflight_mode,
+                                                              preflight_forward_policy_bundle_id))
+            return false;
+        return add_verified_jit_handler(path,
+                                        method,
+                                        fn,
+                                        needs_req_body,
+                                        forward_preflight_mode,
+                                        preflight_forward_policy_bundle_id);
     }
 
     // Source-compatible legacy registration. A nonzero historical marker is

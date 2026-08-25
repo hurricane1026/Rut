@@ -3142,18 +3142,6 @@ static FrontendResult<void> emit_term(const MirTerminator& term,
             if (!p) return frontend_error(FrontendError::OutOfMemory, term.span);
             policy = p.value();
         }
-        rir::ValueId response_policy = rir::kNoValue;
-        if (term.forward_response_policy_id != 0) {
-            if (policy == rir::kNoValue) {
-                auto p0 = b.emit_const_i32(0, {term.span.line, term.span.col});
-                if (!p0) return frontend_error(FrontendError::OutOfMemory, term.span);
-                policy = p0.value();
-            }
-            auto p = b.emit_const_i32(static_cast<i32>(term.forward_response_policy_id),
-                                      {term.span.line, term.span.col});
-            if (!p) return frontend_error(FrontendError::OutOfMemory, term.span);
-            response_policy = p.value();
-        }
         if (term.forward_failure_policy_id != 0 || term.forward_timeout_failure_policy_id != 0 ||
             term.forward_response_read_timeout_seconds != 0 ||
             term.forward_response_buffering != ForwardResponseBufferingMode::None) {
@@ -3218,7 +3206,7 @@ static FrontendResult<void> emit_term(const MirTerminator& term,
             if (term.forward_response_read_timeout_seconds != 0 ||
                 term.forward_response_buffering != ForwardResponseBufferingMode::None) {
                 if (fn == nullptr ||
-                    fn->forward_preflight_mode != ForwardPreflightMode::EagerDirect ||
+                    !forward_preflight_mode_can_own_runtime_deadline(fn->forward_preflight_mode) ||
                     fn->preflight_forward_policy_bundle_id != 0)
                     return frontend_error(FrontendError::UnsupportedSyntax, term.span);
                 fn->preflight_forward_policy_bundle_id = bundle_id;
@@ -3227,6 +3215,18 @@ static FrontendResult<void> emit_term(const MirTerminator& term,
                     upstream.value(), policy, bundle.value(), {term.span.line, term.span.col}))
                 return frontend_error(FrontendError::OutOfMemory, term.span);
             return {};
+        }
+        rir::ValueId response_policy = rir::kNoValue;
+        if (term.forward_response_policy_id != 0) {
+            if (policy == rir::kNoValue) {
+                auto p0 = b.emit_const_i32(0, {term.span.line, term.span.col});
+                if (!p0) return frontend_error(FrontendError::OutOfMemory, term.span);
+                policy = p0.value();
+            }
+            auto p = b.emit_const_i32(static_cast<i32>(term.forward_response_policy_id),
+                                      {term.span.line, term.span.col});
+            if (!p) return frontend_error(FrontendError::OutOfMemory, term.span);
+            response_policy = p.value();
         }
         u16 target_transform_id = 0;
         if (term.has_forward_target_transform) {
@@ -3286,6 +3286,112 @@ void FrontendRirModule::destroy() {
     auto saved_source_name = source_name;
     module = rir::Module{};
     source_name = saved_source_name;
+}
+
+// MIR -> RIR trust boundary for forward-preflight timing. Keep this validator
+// independent from HIR -> MIR so forged MIR cannot inherit authorization from
+// an upstream marker.
+static bool mir_forward_preflight_lowering_shape_valid(const MirModule& module,
+                                                       const MirFunction& function) {
+    if (!forward_preflight_mode_valid(function.forward_preflight_mode)) return false;
+    const MirTerminator* timeout_term = nullptr;
+    u32 timeout_count = 0;
+    for (u32 bi = 0; bi < function.blocks.len; bi++) {
+        const auto& term = function.blocks[bi].term;
+        if (term.forward_response_read_timeout_seconds == 0 &&
+            term.forward_response_buffering == ForwardResponseBufferingMode::None)
+            continue;
+        timeout_count++;
+        if (timeout_term == nullptr) timeout_term = &term;
+    }
+    if (timeout_term == nullptr)
+        return function.forward_preflight_mode == ForwardPreflightMode::None;
+    if (timeout_count != 1) return false;
+    const bool common = function.locals.len == 0 && function.waits.len == 0 &&
+                        !function.state_zero_enters_entry && !function.has_explicit_resume_blocks &&
+                        function.rate_limit.count == 0 && function.throttle_down_bps == 0 &&
+                        !function.is_timer;
+    if (function.forward_preflight_mode == ForwardPreflightMode::EagerDirect) {
+        const bool complete = timeout_term->forward_response_buffering ==
+                              ForwardResponseBufferingMode::CompleteContentLength;
+        return common && function.blocks.len == 1 && function.values.len == 0 &&
+               &function.blocks[0].term == timeout_term && function.blocks[0].effects.len == 0 &&
+               timeout_term->kind == MirTerminatorKind::ForwardUpstream &&
+               timeout_term->forward_set_path.ptr == nullptr &&
+               timeout_term->forward_set_headers.len == 0 &&
+               !timeout_term->has_forward_target_transform &&
+               !timeout_term->commit_response_mutations &&
+               (!complete || (complete_content_length_route_method_is_admitted(function.method) &&
+                              complete_content_length_request_policy_is_admitted(
+                                  timeout_term->forward_request_policy_id)));
+    }
+    if (function.forward_preflight_mode != ForwardPreflightMode::AfterCanonicalSelection ||
+        !common || function.method == kRouteMethodAny ||
+        !complete_content_length_route_method_is_admitted(function.method) ||
+        function.blocks.len != 3 || function.values.len != 2)
+        return false;
+    const auto& entry = function.blocks[0];
+    const auto& redirect = function.blocks[1].term;
+    const auto& forward = function.blocks[2].term;
+    const auto& cond = entry.term.cond;
+    auto value_is_owned = [&](const MirValue* value) {
+        if (value == nullptr) return false;
+        for (u32 i = 0; i < function.values.len; i++) {
+            if (value == &function.values[i]) return true;
+        }
+        return false;
+    };
+    const bool owned = value_is_owned(cond.lhs) && value_is_owned(cond.rhs) && cond.lhs != cond.rhs;
+    const bool policy_bundle_valid =
+        forward.forward_response_policy_id != 0 &&
+        forward.forward_response_policy_id <= module.response_policies.len &&
+        forward.forward_failure_policy_id != 0 &&
+        forward.forward_failure_policy_id <= module.failure_policies.len &&
+        forward.forward_timeout_failure_policy_id != 0 &&
+        forward.forward_timeout_failure_policy_id <= module.failure_policies.len &&
+        response_policy_spec_valid(
+            module.response_policies[forward.forward_response_policy_id - 1]) &&
+        forward_failure_policy_spec_valid(
+            module.failure_policies[forward.forward_failure_policy_id - 1]) &&
+        forward_timeout_failure_policy_spec_valid(
+            module.failure_policies[forward.forward_timeout_failure_policy_id - 1]) &&
+        complete_content_length_buffering_policies_valid(
+            module.response_policies[forward.forward_response_policy_id - 1],
+            module.failure_policies[forward.forward_failure_policy_id - 1],
+            module.failure_policies[forward.forward_timeout_failure_policy_id - 1]);
+    return entry.effects.len == 0 && function.blocks[1].effects.len == 0 &&
+           function.blocks[2].effects.len == 0 && entry.term.kind == MirTerminatorKind::Branch &&
+           entry.term.then_block == 1 && entry.term.else_block == 2 && owned &&
+           cond.kind == MirValueKind::Eq && cond.type == MirTypeKind::Bool &&
+           cond.lhs->kind == MirValueKind::ReqPathOnly && cond.lhs->type == MirTypeKind::Str &&
+           cond.rhs->kind == MirValueKind::StrConst && cond.rhs->type == MirTypeKind::Str &&
+           (cond.rhs->str_value.len == 0 || cond.rhs->str_value.ptr != nullptr) &&
+           redirect.kind == MirTerminatorKind::Redirect &&
+           redirect.source_kind == MirTerminatorSourceKind::Literal &&
+           redirect.local_ref_index == 0xffffffffu && redirect.status_code == 0 &&
+           !redirect.commit_response_mutations && redirect.response_body.ptr == nullptr &&
+           redirect.response_headers.len == 0 && redirect.forward_set_path.ptr == nullptr &&
+           redirect.forward_set_headers.len == 0 && redirect.forward_request_policy_id == 0 &&
+           redirect.forward_response_policy_id == 0 && redirect.forward_failure_policy_id == 0 &&
+           redirect.forward_timeout_failure_policy_id == 0 &&
+           redirect.forward_response_read_timeout_seconds == 0 &&
+           redirect.forward_response_buffering == ForwardResponseBufferingMode::None &&
+           !redirect.has_forward_target_transform && redirect.redirect_policy_id != 0 &&
+           redirect.redirect_policy_id <= module.redirect_policies.len &&
+           redirect_policy_spec_valid(module.redirect_policies[redirect.redirect_policy_id - 1]) &&
+           &forward == timeout_term && forward.kind == MirTerminatorKind::ForwardUpstream &&
+           forward.source_kind == MirTerminatorSourceKind::Literal &&
+           forward.local_ref_index == 0xffffffffu && forward.status_code == 0 &&
+           !forward.commit_response_mutations && forward.response_body.ptr == nullptr &&
+           forward.response_headers.len == 0 && forward.redirect_policy_id == 0 &&
+           forward.upstream_index < module.upstreams.len &&
+           forward.forward_set_path.ptr == nullptr && forward.forward_set_headers.len == 0 &&
+           !forward.has_forward_target_transform &&
+           response_read_timeout_seconds_valid(forward.forward_response_read_timeout_seconds) &&
+           forward.forward_response_buffering ==
+               ForwardResponseBufferingMode::CompleteContentLength &&
+           complete_content_length_request_policy_is_admitted(forward.forward_request_policy_id) &&
+           policy_bundle_valid;
 }
 
 FrontendResult<void> lower_to_rir(const MirModule& mir, FrontendRirModule& out) {
@@ -3932,56 +4038,9 @@ FrontendResult<void> lower_to_rir(const MirModule& mir, FrontendRirModule& out) 
     }
 
     for (u32 i = 0; i < mir.functions.len; i++) {
-        const MirTerminator* timeout_term = nullptr;
-        for (u32 bi = 0; bi < mir.functions[i].blocks.len; bi++) {
-            const auto& candidate = mir.functions[i].blocks[bi].term;
-            if (candidate.forward_response_read_timeout_seconds != 0 ||
-                candidate.forward_response_buffering != ForwardResponseBufferingMode::None) {
-                if (timeout_term != nullptr) {
-                    out.destroy();
-                    return frontend_error(FrontendError::UnsupportedSyntax, candidate.span);
-                }
-                timeout_term = &candidate;
-            }
-        }
-        if (!forward_preflight_mode_valid(mir.functions[i].forward_preflight_mode) ||
-            mir.functions[i].forward_preflight_mode ==
-                ForwardPreflightMode::AfterCanonicalSelection ||
-            (timeout_term == nullptr) !=
-                (mir.functions[i].forward_preflight_mode == ForwardPreflightMode::None)) {
+        if (!mir_forward_preflight_lowering_shape_valid(mir, mir.functions[i])) {
             out.destroy();
             return frontend_error(FrontendError::UnsupportedSyntax, mir.functions[i].span);
-        }
-        if (timeout_term != nullptr) {
-            const auto& function = mir.functions[i];
-            const bool complete_buffering = timeout_term->forward_response_buffering ==
-                                            ForwardResponseBufferingMode::CompleteContentLength;
-            const bool canonical =
-                function.blocks.len == 1 && &function.blocks[0].term == timeout_term &&
-                timeout_term->kind == MirTerminatorKind::ForwardUpstream &&
-                function.locals.len == 0 && function.values.len == 0 && function.waits.len == 0 &&
-                function.blocks[0].effects.len == 0 && !function.state_zero_enters_entry &&
-                !function.has_explicit_resume_blocks && function.rate_limit.count == 0 &&
-                function.throttle_down_bps == 0 && timeout_term->forward_set_path.ptr == nullptr &&
-                timeout_term->forward_set_headers.len == 0 &&
-                !timeout_term->has_forward_target_transform &&
-                !timeout_term->commit_response_mutations && !function.is_timer &&
-                function.forward_preflight_mode == ForwardPreflightMode::EagerDirect &&
-                (!complete_buffering ||
-                 (complete_content_length_route_method_is_admitted(function.method) &&
-                  complete_content_length_request_policy_is_admitted(
-                      timeout_term->forward_request_policy_id)));
-            if (!canonical) {
-                out.destroy();
-                return frontend_error(
-                    FrontendError::UnsupportedSyntax,
-                    timeout_term->span,
-                    complete_buffering
-                        ? lit_str("response_buffering currently requires an effect-free direct "
-                                  "admitted bodyless non-HEAD Forward route")
-                        : lit_str("response_read_timeout currently requires an effect-free direct "
-                                  "Forward route"));
-            }
         }
         Str name{};
         Str path{};

@@ -19087,15 +19087,18 @@ static FrontendResult<HirModule*> analyze_file_internal(
                               "request_policy cannot be combined with response header mutations"));
         }
 
-        // The first response-read-timeout slice is deliberately narrower than
-        // the general Forward grammar: the runtime must be able to reject from
-        // route metadata before it evaluates any handler code. Find every
-        // timeout-bearing terminal, including short-circuit/control bodies, then
-        // admit only one effect-free whole-route Direct Forward.
+        // Response-read-deadline routes are deliberately narrower than the
+        // general Forward grammar. Count every timeout/buffering terminal,
+        // including hidden control bodies, and admit either the established
+        // effect-free direct route or one exact pure path selector.
         const HirTerminator* timeout_term = nullptr;
+        u32 timeout_term_count = 0;
         auto note_timeout = [&](const HirTerminator& term) {
-            if (term.forward_response_read_timeout_seconds != 0 && timeout_term == nullptr)
-                timeout_term = &term;
+            if (term.forward_response_read_timeout_seconds == 0 &&
+                term.forward_response_buffering == ForwardResponseBufferingMode::None)
+                return;
+            timeout_term_count++;
+            if (timeout_term == nullptr) timeout_term = &term;
         };
         auto note_guard = [&](const HirGuard& guard) {
             if (guard.fail_kind == HirGuard::FailKind::Term) {
@@ -19155,20 +19158,74 @@ static FrontendResult<HirModule*> analyze_file_internal(
             const HirTerminator& direct = route.control.direct_term;
             const bool complete_buffering = timeout_term->forward_response_buffering ==
                                             ForwardResponseBufferingMode::CompleteContentLength;
-            const bool canonical =
-                route.control.kind == HirControlKind::Direct && timeout_term == &direct &&
-                direct.kind == HirTerminatorKind::ForwardUpstream && route.locals.len == 0 &&
-                route.exprs.len == 0 && route.guards.len == 0 && route.waits.len == 0 &&
-                route.for_loops.len == 0 && route_decl.chains.len == 0 &&
-                route_decl.decorators.len == 0 && route.rate_limit.count == 0 &&
-                route.throttle_down_bps == 0 && direct.forward_set_path.ptr == nullptr &&
-                direct.forward_set_headers.len == 0 && !direct.has_forward_target_transform &&
-                !direct.commit_response_mutations &&
+            auto canonical_forward = [&](const HirTerminator& term) {
+                return term.kind == HirTerminatorKind::ForwardUpstream &&
+                       term.source_kind == HirTerminatorSourceKind::Literal &&
+                       term.local_ref_index == 0xffffffffu && term.status_code == 0 &&
+                       term.response_body.ptr == nullptr && term.response_headers.len == 0 &&
+                       term.redirect_policy_id == 0 && term.forward_set_path.ptr == nullptr &&
+                       term.forward_set_headers.len == 0 && !term.has_forward_target_transform &&
+                       !term.commit_response_mutations &&
+                       term.forward_response_read_timeout_seconds != 0 &&
+                       response_read_timeout_seconds_valid(
+                           term.forward_response_read_timeout_seconds) &&
+                       term.forward_response_buffering ==
+                           ForwardResponseBufferingMode::CompleteContentLength &&
+                       complete_content_length_request_policy_is_admitted(
+                           term.forward_request_policy_id);
+            };
+            auto canonical_redirect = [&](const HirTerminator& term) {
+                return term.kind == HirTerminatorKind::Redirect &&
+                       term.source_kind == HirTerminatorSourceKind::Literal &&
+                       term.local_ref_index == 0xffffffffu && term.status_code == 0 &&
+                       term.response_body.ptr == nullptr && term.response_headers.len == 0 &&
+                       !term.commit_response_mutations && term.forward_set_path.ptr == nullptr &&
+                       term.forward_set_headers.len == 0 && term.forward_request_policy_id == 0 &&
+                       term.forward_response_policy_id == 0 &&
+                       term.forward_failure_policy_id == 0 &&
+                       term.forward_timeout_failure_policy_id == 0 &&
+                       term.forward_response_read_timeout_seconds == 0 &&
+                       term.forward_response_buffering == ForwardResponseBufferingMode::None &&
+                       !term.has_forward_target_transform && term.redirect_policy_id != 0 &&
+                       term.redirect_policy_id <= mod.redirect_policies.len &&
+                       redirect_policy_spec_valid(
+                           mod.redirect_policies[term.redirect_policy_id - 1]);
+            };
+            const bool common = timeout_term_count == 1 && route.locals.len == 0 &&
+                                route.guards.len == 0 && route.waits.len == 0 &&
+                                route.for_loops.len == 0 && route_decl.chains.len == 0 &&
+                                route_decl.decorators.len == 0 && route.rate_limit.count == 0 &&
+                                route.throttle_down_bps == 0 && !route.is_timer;
+            const bool direct_canonical =
+                common && route.control.kind == HirControlKind::Direct && timeout_term == &direct &&
+                route.exprs.len == 0 && direct.kind == HirTerminatorKind::ForwardUpstream &&
+                direct.forward_set_path.ptr == nullptr && direct.forward_set_headers.len == 0 &&
+                !direct.has_forward_target_transform && !direct.commit_response_mutations &&
                 (!complete_buffering ||
                  (complete_content_length_route_method_is_admitted(route.method) &&
                   complete_content_length_request_policy_is_admitted(
                       direct.forward_request_policy_id)));
-            if (!canonical)
+            const HirExpr& cond = route.control.cond;
+            auto expression_is_owned = [&](const HirExpr* expression) {
+                if (expression == nullptr) return false;
+                for (u32 i = 0; i < route.exprs.len; i++) {
+                    if (expression == &route.exprs[i]) return true;
+                }
+                return false;
+            };
+            const bool cond_ptrs_owned = route.exprs.len == 2 && expression_is_owned(cond.lhs) &&
+                                         expression_is_owned(cond.rhs) && cond.lhs != cond.rhs;
+            const bool deferred_canonical =
+                common && route.control.kind == HirControlKind::If &&
+                timeout_term == &route.control.else_term && route.method != kRouteMethodAny &&
+                complete_content_length_route_method_is_admitted(route.method) && cond_ptrs_owned &&
+                cond.kind == HirExprKind::Eq && cond.type == HirTypeKind::Bool &&
+                cond.lhs->kind == HirExprKind::ReqPathOnly && cond.lhs->type == HirTypeKind::Str &&
+                cond.rhs->kind == HirExprKind::StrLit && cond.rhs->type == HirTypeKind::Str &&
+                (cond.rhs->str_value.len == 0 || cond.rhs->str_value.ptr != nullptr) &&
+                canonical_redirect(route.control.then_term) &&
+                canonical_forward(route.control.else_term);
+            if (!direct_canonical && !deferred_canonical)
                 return frontend_error(
                     FrontendError::UnsupportedSyntax,
                     timeout_term->span,
@@ -19177,7 +19234,9 @@ static FrontendResult<HirModule*> analyze_file_internal(
                                   "admitted bodyless non-HEAD Forward route")
                         : lit_str("response_read_timeout currently requires an effect-free direct "
                                   "Forward route"));
-            route.forward_preflight_mode = ForwardPreflightMode::EagerDirect;
+            route.forward_preflight_mode = direct_canonical
+                                               ? ForwardPreflightMode::EagerDirect
+                                               : ForwardPreflightMode::AfterCanonicalSelection;
         }
 
         // Wait-route backstop: the creation-time gates (kTimeWaitDetail /

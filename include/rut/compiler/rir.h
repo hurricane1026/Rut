@@ -423,10 +423,9 @@ struct Function {
     u8* yield_kinds;
     u8* yield_arm_masks;
 
-    // Metadata-only fail-closed preflight for the bounded
-    // response_read_timeout slice. A nonzero value is the exact 1-based
-    // ForwardPolicyBundle id returned by this function's sole canonical
-    // RetForwardBundle terminal.
+    // Compiler-verified preflight timing for the bounded response-read-timeout
+    // slice. A nonzero value is the exact 1-based ForwardPolicyBundle id
+    // returned by the function's sole timeout-bearing RetForwardBundle.
     ForwardPreflightMode forward_preflight_mode = ForwardPreflightMode::None;
     u16 preflight_forward_policy_bundle_id = 0;
 

@@ -2,6 +2,7 @@
 // compiles a source file end to end (lex -> parse -> analyze -> MIR -> RIR ->
 // JIT) into a RouteConfig, plus its fail-closed error reporting.
 
+#include "deferred_preflight_fixture.h"
 #include "rut/runtime/cache_table.h"
 #include "rut/runtime/compile_to_config.h"
 #include "rut/runtime/listener.h"
@@ -1022,6 +1023,47 @@ TEST(serve_loader, no_pre_route_source_keeps_pre_route_table_neutral) {
     }
     CHECK_FALSE(program.config.has_pre_route_metadata());
     REQUIRE(program.config.strict_local_response_table_is_valid());
+    program.destroy();
+}
+
+TEST(serve_loader, verified_deferred_preflight_route_owns_identity_after_compiler_destruction) {
+    const std::string path =
+        write_file("/tmp/rut_serve_loader_deferred_preflight", "app.rut", kDeferredPreflightSource);
+    LoadedProgram program;
+    LoadError err;
+    REQUIRE(load_rut_program(path.c_str(), program, err));
+    REQUIRE_EQ(program.rir.module.func_count, 1u);
+    REQUIRE_EQ(program.config.route_count, 1u);
+    CHECK_EQ(program.rir.module.functions[0].forward_preflight_mode,
+             ForwardPreflightMode::AfterCanonicalSelection);
+    CHECK_EQ(program.rir.module.functions[0].preflight_forward_policy_bundle_id, 1u);
+    const auto& route = program.config.routes[0];
+    CHECK_EQ(route.forward_preflight_mode, ForwardPreflightMode::AfterCanonicalSelection);
+    CHECK_EQ(route.preflight_forward_policy_bundle_id, 1u);
+    CHECK_EQ(route.method, kRouteMethodGet);
+    REQUIRE(route.fn != nullptr);
+    REQUIRE_EQ(program.config.policy_bundle_count, 1u);
+    CHECK_EQ(program.config.policy_bundles[0].response_buffering,
+             ForwardResponseBufferingMode::CompleteContentLength);
+
+    // Native/legacy APIs cannot opt into deferred execution even when handed a
+    // superficially valid bundle. Only verified RIR publication can do so.
+    auto native = std::make_unique<RouteConfig>();
+    REQUIRE(native->add_response_policy(program.config.response_policies[0]) == 1u);
+    REQUIRE(native->add_failure_policy(program.config.failure_policies[0]) == 1u);
+    REQUIRE(native->add_failure_policy(program.config.failure_policies[1]) == 2u);
+    REQUIRE(native->add_policy_bundle(
+                1, 1, 2, 1, ForwardResponseBufferingMode::CompleteContentLength) == 1u);
+    CHECK_FALSE(native->add_jit_handler(
+        "/", kRouteMethodGet, route.fn, false, ForwardPreflightMode::AfterCanonicalSelection, 1));
+
+    program.rir.destroy();
+    CHECK_EQ(program.config.routes[0].forward_preflight_mode,
+             ForwardPreflightMode::AfterCanonicalSelection);
+    CHECK_EQ(program.config.routes[0].preflight_forward_policy_bundle_id, 1u);
+    CHECK(program.config.redirect_policies[0].static_authority.eq({"redirect.example", 16}));
+    CHECK(program.config.redirect_policies[0].target_path.eq({"/new", 4}));
+    CHECK(program.config.redirect_policies[0].body.eq({"fixed", 5}));
     program.destroy();
 }
 

@@ -1040,7 +1040,8 @@ inline bool response_read_deadline_fixed_upload_route_stable(const Connection& c
     const RouteEntry& pinned = config->routes[proof.route_index];
     if (pinned.action != RouteAction::JitHandler || pinned.fn != proof.route_fn ||
         pinned.needs_req_body || pinned.rate_limit.count != 0 || pinned.throttle_down_bps != 0 ||
-        pinned.ws_terminate || pinned.forward_preflight_mode != ForwardPreflightMode::EagerDirect ||
+        pinned.ws_terminate ||
+        !forward_preflight_mode_can_own_runtime_deadline(pinned.forward_preflight_mode) ||
         pinned.preflight_forward_policy_bundle_id != conn.response_read_deadline_bundle_id ||
         pinned.method != conn.response_read_deadline_route_method ||
         !response_read_deadline_route_method_matches(conn.req_method, pinned.method))
@@ -1075,16 +1076,18 @@ inline bool response_read_deadline_fixed_upload_route_stable(const Connection& c
 }
 
 template <typename Loop>
-bool prepare_response_read_deadline_preflight(Loop* loop,
-                                              Connection& conn,
-                                              const RouteEntry* route,
-                                              const RouteConfig* config) {
+bool prepare_response_read_deadline_preflight_for_mode(Loop* loop,
+                                                       Connection& conn,
+                                                       const RouteEntry* route,
+                                                       const RouteConfig* config,
+                                                       ForwardPreflightMode expected_mode) {
     if (route == nullptr) return true;
     if (route->forward_preflight_mode == ForwardPreflightMode::None &&
         route->preflight_forward_policy_bundle_id == 0)
         return true;
     if (!forward_preflight_mode_valid(route->forward_preflight_mode) ||
-        route->forward_preflight_mode != ForwardPreflightMode::EagerDirect ||
+        !forward_preflight_mode_can_own_runtime_deadline(route->forward_preflight_mode) ||
+        route->forward_preflight_mode != expected_mode ||
         route->preflight_forward_policy_bundle_id == 0) {
         loop->close_conn(conn);
         return false;
@@ -1235,6 +1238,15 @@ bool prepare_response_read_deadline_preflight(Loop* loop,
 }
 
 template <typename Loop>
+bool prepare_response_read_deadline_preflight(Loop* loop,
+                                              Connection& conn,
+                                              const RouteEntry* route,
+                                              const RouteConfig* config) {
+    return prepare_response_read_deadline_preflight_for_mode(
+        loop, conn, route, config, ForwardPreflightMode::EagerDirect);
+}
+
+template <typename Loop>
 void on_request_complete(Loop* loop, Connection& conn, u16 status, u32 resp_size);
 
 #if RUT_ENABLE_WEBSOCKET
@@ -1247,9 +1259,53 @@ void on_ws_upstream_recv(void* lp, Connection& conn, IoEvent ev);
 // translate JitDispatchOutcome into event-loop operations (send, forward,
 // register timer for resume, or 500). Shared between the initial call
 // (on_header_received) and timer-driven resumes.
+inline bool deferred_canonical_selection_state_is_neutral(const Connection& conn) {
+    return conn.response_read_deadline_owner_is_neutral() && conn.request_policy_id == 0 &&
+           !conn.request_policy_body_pending && conn.pending_forward_upstream_id == 0 &&
+           conn.pending_forward_request_policy_id == 0 &&
+           conn.pending_forward_response_policy_id == 0 &&
+           conn.pending_forward_failure_policy_id == 0 &&
+           conn.pending_forward_timeout_failure_policy_id == 0 && !conn.target_transform_recorded &&
+           !conn.req_path_overridden && conn.req_header_override_count == 0 &&
+           !conn.req_header_override_overflow && conn.resp_header_mutation_count == 0 &&
+           conn.resp_header_mutation_pending_count == 0 &&
+           !conn.resp_header_mutation_pending_overflow && !conn.resp_header_mutation_overflow &&
+           !conn.response_mutations_snapshotted && conn.resp_status == 0 &&
+           conn.resp_body_mode == BodyMode::None && conn.resp_body_remaining == 0 &&
+           conn.resp_body_sent == 0 && conn.send_buf.len() == 0 && conn.send_progress == 0 &&
+           !conn.send_armed && conn.on_send == nullptr && conn.upstream_attempts == 0 &&
+           conn.upstream_start_us == 0 && !conn.upstream_slot_held && !conn.upstream_send_armed &&
+           !conn.upstream_recv_armed && !conn.request_body_fully_buffered &&
+           !conn.request_upload_complete;
+}
+
+inline bool deferred_canonical_selection_route_is_valid(const Connection& conn,
+                                                        const RouteEntry* route,
+                                                        const RouteConfig* config,
+                                                        jit::HandlerFn fn) {
+    if (route == nullptr || config == nullptr || conn.request_config != config) return false;
+    bool owned = false;
+    for (u32 i = 0; i < config->route_count; i++) owned = owned || route == &config->routes[i];
+    if (!owned || route->action != RouteAction::JitHandler || route->fn == nullptr ||
+        route->fn != fn || route->needs_req_body || route->rate_limit.count != 0 ||
+        route->throttle_down_bps != 0 || route->ws_terminate ||
+        route->forward_preflight_mode != ForwardPreflightMode::AfterCanonicalSelection ||
+        route->preflight_forward_policy_bundle_id == 0 || route->method == kRouteMethodAny ||
+        !complete_content_length_route_method_is_admitted(route->method) ||
+        !config->policy_bundle_id_is_valid(route->preflight_forward_policy_bundle_id))
+        return false;
+    const auto& bundle = config->policy_bundles[route->preflight_forward_policy_bundle_id - 1];
+    return response_read_timeout_seconds_valid(bundle.response_read_timeout_seconds) &&
+           bundle.response_buffering == ForwardResponseBufferingMode::CompleteContentLength;
+}
+
 template <typename Loop>
-void handle_jit_outcome(
-    Loop* loop, Connection& conn, JitDispatchOutcome outcome, jit::HandlerFn fn, bool keep_alive);
+void handle_jit_outcome(Loop* loop,
+                        Connection& conn,
+                        JitDispatchOutcome outcome,
+                        jit::HandlerFn fn,
+                        bool keep_alive,
+                        const RouteEntry* selected_route = nullptr);
 
 template <typename Loop>
 void on_request_policy_body_recvd(void* lp, Connection& conn, IoEvent ev);
@@ -2035,7 +2091,16 @@ void on_header_received(void* lp, Connection& conn, IoEvent ev) {
     // metadata-absent or valid-table/no-applicable-slot legacy-200 cases.
     if (route == nullptr && handle_configured_unmatched_response(loop, conn, config)) return;
 
-    if (!prepare_response_read_deadline_preflight(loop, conn, route, config)) return;
+    if (route != nullptr &&
+        route->forward_preflight_mode == ForwardPreflightMode::AfterCanonicalSelection) {
+        if (!deferred_canonical_selection_route_is_valid(conn, route, config, route->fn) ||
+            !deferred_canonical_selection_state_is_neutral(conn)) {
+            loop->close_conn(conn);
+            return;
+        }
+    } else if (!prepare_response_read_deadline_preflight(loop, conn, route, config)) {
+        return;
+    }
 
     // Per-route rate limit (fixed window). Enforced after route match, before
     // dispatch. A route may stack several rules; a request must pass every one,
@@ -2216,7 +2281,7 @@ void on_header_received(void* lp, Connection& conn, IoEvent ev) {
                                           conn.recv_buf.data(),
                                           jit_request_len,
                                           /*arena=*/nullptr);
-        handle_jit_outcome<Loop>(loop, conn, outcome, route->fn, kKeepAlive);
+        handle_jit_outcome<Loop>(loop, conn, outcome, route->fn, kKeepAlive, route);
     } else {
         conn.resp_status = kStatusOK;
         conn.keep_alive =
@@ -2765,8 +2830,43 @@ inline bool build_h1_forward_response_headers(Connection& conn, u32 header_len, 
 }
 
 template <typename Loop>
-void handle_jit_outcome(
-    Loop* loop, Connection& conn, JitDispatchOutcome outcome, jit::HandlerFn fn, bool keep_alive) {
+void handle_jit_outcome(Loop* loop,
+                        Connection& conn,
+                        JitDispatchOutcome outcome,
+                        jit::HandlerFn fn,
+                        bool keep_alive,
+                        const RouteEntry* selected_route) {
+    if (selected_route != nullptr &&
+        selected_route->forward_preflight_mode == ForwardPreflightMode::AfterCanonicalSelection) {
+        const RouteConfig* config = conn.request_config;
+        if (!deferred_canonical_selection_route_is_valid(conn, selected_route, config, fn) ||
+            !deferred_canonical_selection_state_is_neutral(conn)) {
+            loop->close_conn(conn);
+            return;
+        }
+        if (outcome.kind == JitDispatchOutcome::Kind::Redirect) {
+            if (config == nullptr ||
+                !config->redirect_policy_id_is_valid(outcome.redirect_policy_id)) {
+                loop->close_conn(conn);
+                return;
+            }
+        } else if (outcome.kind == JitDispatchOutcome::Kind::Forward) {
+            if (outcome.policy_bundle_id != selected_route->preflight_forward_policy_bundle_id) {
+                loop->close_conn(conn);
+                return;
+            }
+            if (!prepare_response_read_deadline_preflight_for_mode(
+                    loop,
+                    conn,
+                    selected_route,
+                    config,
+                    ForwardPreflightMode::AfterCanonicalSelection))
+                return;
+        } else {
+            loop->close_conn(conn);
+            return;
+        }
+    }
     if (conn.response_read_deadline_state == ResponseReadDeadlineState::Preflight &&
         outcome.kind != JitDispatchOutcome::Kind::Forward) {
         loop->close_conn(conn);
@@ -3445,7 +3545,8 @@ void handle_jit_outcome(
                 if (selected->action != RouteAction::JitHandler || selected->needs_req_body ||
                     selected->rate_limit.count != 0 || selected->throttle_down_bps != 0 ||
                     selected->ws_terminate || selected->method != kRouteMethodGet ||
-                    selected->forward_preflight_mode != ForwardPreflightMode::EagerDirect ||
+                    !forward_preflight_mode_can_own_runtime_deadline(
+                        selected->forward_preflight_mode) ||
                     selected->preflight_forward_policy_bundle_id != outcome.policy_bundle_id ||
                     target.addr_count != 1 || target.addrs[0].sin_family != AF_INET ||
                     target.max_inflight != 0) {
@@ -7925,7 +8026,7 @@ inline bool validated_preconnect_failure_owner_is_stable(Loop* loop,
         if (route == nullptr || route->action != RouteAction::JitHandler || route->fn == nullptr ||
             route->needs_req_body || route->rate_limit.count != 0 ||
             route->throttle_down_bps != 0 || route->ws_terminate ||
-            route->forward_preflight_mode != ForwardPreflightMode::EagerDirect ||
+            !forward_preflight_mode_can_own_runtime_deadline(route->forward_preflight_mode) ||
             route->preflight_forward_policy_bundle_id != bundle_id ||
             route->method != conn.response_read_deadline_route_method ||
             conn.upstream_idx >= config->upstream_count ||

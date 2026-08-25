@@ -46,43 +46,120 @@ static Str match_default_label() {
     return {"match_default", 13};
 }
 
-// HIR -> MIR trust boundary for phase-1 forward preflight metadata. Inspect the
-// fully built MIR shape rather than trusting the HIR marker: this also catches a
-// forged timeout-bearing terminal hidden in any HIR control-flow arm.
-static bool eager_direct_forward_preflight_metadata_valid(const MirFunction& function) {
-    if (!forward_preflight_mode_valid(function.forward_preflight_mode) ||
-        function.forward_preflight_mode == ForwardPreflightMode::AfterCanonicalSelection)
-        return false;
+// HIR -> MIR trust boundary. Inspect the fully built MIR rather than trusting
+// the HIR marker, including every timeout-bearing terminal and every field of
+// the single admitted deferred selector.
+static bool forward_preflight_metadata_valid(const MirModule& module, const MirFunction& function) {
+    if (!forward_preflight_mode_valid(function.forward_preflight_mode)) return false;
 
     const MirTerminator* preflight_term = nullptr;
+    u32 preflight_term_count = 0;
     for (u32 bi = 0; bi < function.blocks.len; bi++) {
         const auto& term = function.blocks[bi].term;
         if (term.forward_response_read_timeout_seconds == 0 &&
             term.forward_response_buffering == ForwardResponseBufferingMode::None)
             continue;
-        if (preflight_term != nullptr) return false;
-        preflight_term = &term;
+        preflight_term_count++;
+        if (preflight_term == nullptr) preflight_term = &term;
     }
     if (preflight_term == nullptr)
         return function.forward_preflight_mode == ForwardPreflightMode::None;
-    if (function.forward_preflight_mode != ForwardPreflightMode::EagerDirect) return false;
+    if (preflight_term_count != 1) return false;
 
     const bool complete_buffering = preflight_term->forward_response_buffering ==
                                     ForwardResponseBufferingMode::CompleteContentLength;
-    return function.blocks.len == 1 && &function.blocks[0].term == preflight_term &&
-           preflight_term->kind == MirTerminatorKind::ForwardUpstream && function.locals.len == 0 &&
-           function.values.len == 0 && function.waits.len == 0 &&
-           function.blocks[0].effects.len == 0 && !function.state_zero_enters_entry &&
-           !function.has_explicit_resume_blocks && function.rate_limit.count == 0 &&
-           function.throttle_down_bps == 0 && !function.is_timer &&
-           preflight_term->forward_set_path.ptr == nullptr &&
-           preflight_term->forward_set_headers.len == 0 &&
-           !preflight_term->has_forward_target_transform &&
-           !preflight_term->commit_response_mutations &&
-           (!complete_buffering ||
-            (complete_content_length_route_method_is_admitted(function.method) &&
-             complete_content_length_request_policy_is_admitted(
-                 preflight_term->forward_request_policy_id)));
+    const bool common = function.locals.len == 0 && function.waits.len == 0 &&
+                        !function.state_zero_enters_entry && !function.has_explicit_resume_blocks &&
+                        function.rate_limit.count == 0 && function.throttle_down_bps == 0 &&
+                        !function.is_timer;
+    if (function.forward_preflight_mode == ForwardPreflightMode::EagerDirect) {
+        return common && function.blocks.len == 1 && &function.blocks[0].term == preflight_term &&
+               preflight_term->kind == MirTerminatorKind::ForwardUpstream &&
+               function.values.len == 0 && function.blocks[0].effects.len == 0 &&
+               preflight_term->forward_set_path.ptr == nullptr &&
+               preflight_term->forward_set_headers.len == 0 &&
+               !preflight_term->has_forward_target_transform &&
+               !preflight_term->commit_response_mutations &&
+               (!complete_buffering ||
+                (complete_content_length_route_method_is_admitted(function.method) &&
+                 complete_content_length_request_policy_is_admitted(
+                     preflight_term->forward_request_policy_id)));
+    }
+    if (function.forward_preflight_mode != ForwardPreflightMode::AfterCanonicalSelection ||
+        !common || function.method == kRouteMethodAny ||
+        !complete_content_length_route_method_is_admitted(function.method) ||
+        function.blocks.len != 3 || function.values.len != 2)
+        return false;
+
+    const auto& entry = function.blocks[0];
+    const auto& then_block = function.blocks[1];
+    const auto& else_block = function.blocks[2];
+    if (entry.effects.len != 0 || then_block.effects.len != 0 || else_block.effects.len != 0 ||
+        entry.term.kind != MirTerminatorKind::Branch || entry.term.then_block != 1 ||
+        entry.term.else_block != 2 || &else_block.term != preflight_term)
+        return false;
+    const MirValue& cond = entry.term.cond;
+    auto value_is_owned = [&](const MirValue* value) {
+        if (value == nullptr) return false;
+        for (u32 i = 0; i < function.values.len; i++) {
+            if (value == &function.values[i]) return true;
+        }
+        return false;
+    };
+    const bool cond_owned =
+        value_is_owned(cond.lhs) && value_is_owned(cond.rhs) && cond.lhs != cond.rhs;
+    if (!cond_owned || cond.kind != MirValueKind::Eq || cond.type != MirTypeKind::Bool ||
+        cond.lhs->kind != MirValueKind::ReqPathOnly || cond.lhs->type != MirTypeKind::Str ||
+        cond.rhs->kind != MirValueKind::StrConst || cond.rhs->type != MirTypeKind::Str ||
+        (cond.rhs->str_value.len != 0 && cond.rhs->str_value.ptr == nullptr))
+        return false;
+
+    const auto& redirect = then_block.term;
+    const bool redirect_valid =
+        redirect.kind == MirTerminatorKind::Redirect &&
+        redirect.source_kind == MirTerminatorSourceKind::Literal &&
+        redirect.local_ref_index == 0xffffffffu && redirect.status_code == 0 &&
+        !redirect.commit_response_mutations && redirect.response_body.ptr == nullptr &&
+        redirect.response_headers.len == 0 && redirect.forward_set_path.ptr == nullptr &&
+        redirect.forward_set_headers.len == 0 && redirect.forward_request_policy_id == 0 &&
+        redirect.forward_response_policy_id == 0 && redirect.forward_failure_policy_id == 0 &&
+        redirect.forward_timeout_failure_policy_id == 0 &&
+        redirect.forward_response_read_timeout_seconds == 0 &&
+        redirect.forward_response_buffering == ForwardResponseBufferingMode::None &&
+        !redirect.has_forward_target_transform && redirect.redirect_policy_id != 0 &&
+        redirect.redirect_policy_id <= module.redirect_policies.len &&
+        redirect_policy_spec_valid(module.redirect_policies[redirect.redirect_policy_id - 1]);
+    const auto& forward = else_block.term;
+    const bool policy_bundle_valid =
+        forward.forward_response_policy_id != 0 &&
+        forward.forward_response_policy_id <= module.response_policies.len &&
+        forward.forward_failure_policy_id != 0 &&
+        forward.forward_failure_policy_id <= module.failure_policies.len &&
+        forward.forward_timeout_failure_policy_id != 0 &&
+        forward.forward_timeout_failure_policy_id <= module.failure_policies.len &&
+        response_policy_spec_valid(
+            module.response_policies[forward.forward_response_policy_id - 1]) &&
+        forward_failure_policy_spec_valid(
+            module.failure_policies[forward.forward_failure_policy_id - 1]) &&
+        forward_timeout_failure_policy_spec_valid(
+            module.failure_policies[forward.forward_timeout_failure_policy_id - 1]) &&
+        complete_content_length_buffering_policies_valid(
+            module.response_policies[forward.forward_response_policy_id - 1],
+            module.failure_policies[forward.forward_failure_policy_id - 1],
+            module.failure_policies[forward.forward_timeout_failure_policy_id - 1]);
+    const bool forward_valid =
+        forward.kind == MirTerminatorKind::ForwardUpstream &&
+        forward.source_kind == MirTerminatorSourceKind::Literal &&
+        forward.local_ref_index == 0xffffffffu && forward.status_code == 0 &&
+        !forward.commit_response_mutations && forward.response_body.ptr == nullptr &&
+        forward.response_headers.len == 0 && forward.redirect_policy_id == 0 &&
+        forward.upstream_index < module.upstreams.len && forward.forward_set_path.ptr == nullptr &&
+        forward.forward_set_headers.len == 0 && !forward.has_forward_target_transform &&
+        response_read_timeout_seconds_valid(forward.forward_response_read_timeout_seconds) &&
+        forward.forward_response_buffering == ForwardResponseBufferingMode::CompleteContentLength &&
+        complete_content_length_request_policy_is_admitted(forward.forward_request_policy_id) &&
+        policy_bundle_valid;
+    return redirect_valid && forward_valid;
 }
 
 static MirTypeKind mir_type_kind(HirTypeKind kind) {
@@ -1764,7 +1841,7 @@ FrontendResult<MirModule*> build_mir(const HirModule& module) {
                 if (!emitted) return core::make_unexpected(emitted.error());
             }
 
-            if (!eager_direct_forward_preflight_metadata_valid(fn)) {
+            if (!forward_preflight_metadata_valid(*mir, fn)) {
                 delete mir;
                 return frontend_error(FrontendError::UnsupportedSyntax, fn.span);
             }
@@ -2652,7 +2729,7 @@ FrontendResult<MirModule*> build_mir(const HirModule& module) {
                 if (!emitted) return core::make_unexpected(emitted.error());
             }
 
-            if (!eager_direct_forward_preflight_metadata_valid(fn)) {
+            if (!forward_preflight_metadata_valid(*mir, fn)) {
                 delete mir;
                 return frontend_error(FrontendError::UnsupportedSyntax, fn.span);
             }
@@ -2717,7 +2794,7 @@ FrontendResult<MirModule*> build_mir(const HirModule& module) {
 
             fn.state_zero_enters_entry = true;
             fn.resume_terminal_block = terminal_index;
-            if (!eager_direct_forward_preflight_metadata_valid(fn)) {
+            if (!forward_preflight_metadata_valid(*mir, fn)) {
                 delete mir;
                 return frontend_error(FrontendError::UnsupportedSyntax, fn.span);
             }
@@ -3250,7 +3327,7 @@ FrontendResult<MirModule*> build_mir(const HirModule& module) {
             set_term_from_hir(&block.term, module.routes[i].control.direct_term);
             if (!fn.blocks.push(block)) return frontend_error(FrontendError::TooManyItems, fn.span);
         }
-        if (!eager_direct_forward_preflight_metadata_valid(fn)) {
+        if (!forward_preflight_metadata_valid(*mir, fn)) {
             delete mir;
             return frontend_error(FrontendError::UnsupportedSyntax, fn.span);
         }

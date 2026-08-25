@@ -255,6 +255,41 @@ static u64 response_read_timeout_later_handler(void*, jit::HandlerCtx*, const u8
     return jit::HandlerResult::make_status(204).pack();
 }
 
+enum class DeferredPreflightTestOutcome : u8 {
+    Redirect,
+    ForwardBundle,
+    ReturnStatus,
+    OrdinaryForward,
+    WrongBundle,
+};
+static DeferredPreflightTestOutcome deferred_preflight_test_outcome =
+    DeferredPreflightTestOutcome::Redirect;
+static u32 deferred_preflight_handler_calls = 0;
+static u64 deferred_preflight_handler(void*, jit::HandlerCtx*, const u8*, u32, void*) {
+    deferred_preflight_handler_calls++;
+    switch (deferred_preflight_test_outcome) {
+        case DeferredPreflightTestOutcome::Redirect:
+            return jit::HandlerResult::make_redirect(1).pack();
+        case DeferredPreflightTestOutcome::ForwardBundle:
+            return jit::HandlerResult::make_forward_with_bundle(
+                       0, static_cast<u16>(RequestPolicyId::Http11FixedStrip), 1)
+                .pack();
+        case DeferredPreflightTestOutcome::ReturnStatus:
+            return jit::HandlerResult::make_status(204).pack();
+        case DeferredPreflightTestOutcome::OrdinaryForward:
+            return jit::HandlerResult::make_forward(0).pack();
+        case DeferredPreflightTestOutcome::WrongBundle:
+            return jit::HandlerResult::make_forward_with_bundle(
+                       0, static_cast<u16>(RequestPolicyId::Http11FixedStrip), 2)
+                .pack();
+    }
+    return jit::HandlerResult::make_status(500).pack();
+}
+
+struct DeferredPreflightMockLoop : SmallLoop {
+    static constexpr bool kSupportsExplicitFirstResponseDeadline = true;
+};
+
 static u64 response_read_deadline_handler(void*, jit::HandlerCtx*, const u8*, u32, void*) {
     return jit::HandlerResult::make_forward_with_bundle(0, 0, 2).pack();
 }
@@ -418,6 +453,44 @@ static RedirectPolicySpec make_test_fixed_redirect_policy() {
     policy.static_authority = {"redirect.example", 16};
     policy.target_path = {"/new", 4};
     return policy;
+}
+
+static bool configure_deferred_preflight_test_route(RouteConfig& config) {
+    if (!config.add_upstream("backend", 0x7F000001, 9000).has_value()) return false;
+    if (config.add_redirect_policy(make_test_fixed_redirect_policy()) != 1) return false;
+    ForwardResponsePolicySpec response{};
+    response.version = ResponsePolicyVersion::Http11;
+    response.framing = ResponsePolicyFraming::ContentLength;
+    response.connection = ResponsePolicyConnection::Request;
+    response.date = ResponsePolicyDate::Current;
+    response.server = {"rut", 3};
+    if (config.add_response_policy(response) != 1) return false;
+    ForwardFailurePolicySpec failure{};
+    failure.version = ForwardFailurePolicyVersion::Http11;
+    failure.status_code = 502;
+    failure.date = ForwardFailurePolicyDate::Current;
+    failure.connection = ForwardFailurePolicyConnection::Request;
+    failure.reason = {"Bad Gateway", 11};
+    failure.content_type = {"text/plain", 10};
+    failure.server = {"rut", 3};
+    failure.body = {"bad", 3};
+    if (config.add_failure_policy(failure) != 1) return false;
+    failure.status_code = 504;
+    failure.reason = {"Gateway Time-out", 16};
+    failure.body = {"slow", 4};
+    if (config.add_failure_policy(failure) != 2) return false;
+    if (config.add_policy_bundle(1, 1, 2, 1, ForwardResponseBufferingMode::CompleteContentLength) !=
+        1)
+        return false;
+    // Runtime-only fixture: production deferred publication is private and is
+    // proven end-to-end by the loader test. Start from the public neutral API,
+    // then forge only the owned RouteEntry metadata needed to exercise H1/H2
+    // fail-closed behavior without exposing a native deferred insertion path.
+    if (!config.add_jit_handler("/", kRouteMethodGet, &deferred_preflight_handler, false))
+        return false;
+    config.routes[0].forward_preflight_mode = ForwardPreflightMode::AfterCanonicalSelection;
+    config.routes[0].preflight_forward_policy_bundle_id = 1;
+    return true;
 }
 
 // Date is the sole dynamic field in the pinned redirect wire vector. Keep the
@@ -1363,6 +1436,133 @@ TEST(response_read_timeout, h1_route_preflight_closes_before_body_wait_or_handle
     CHECK_EQ(response_read_timeout_preflight_handler_calls, 0u);
     CHECK_EQ(loop.free_top, SmallLoop::kMaxConns);
     CHECK_EQ(loop.backend.count_ops(MockOp::Recv), 0u);
+    CHECK_EQ(loop.backend.count_ops(MockOp::Connect), 0u);
+    CHECK_EQ(loop.backend.count_ops(MockOp::Send), 0u);
+}
+
+TEST(response_read_timeout,
+     h1_deferred_selector_redirects_without_preflight_and_arms_exact_bundle_before_forward) {
+    static constexpr char kRedirectRequest[] =
+        "GET /old?x=1 HTTP/1.1\r\nHost: ignored.example\r\nConnection: close\r\n\r\n";
+    static constexpr char kForwardRequest[] =
+        "GET / HTTP/1.1\r\nHost: client.example\r\nConnection: close\r\n\r\n";
+
+    {
+        DeferredPreflightMockLoop loop;
+        loop.setup();
+        loop.listener_context = {
+            ListenerAddress::IPv4Wildcard, ListenerTransport::Cleartext, static_cast<u16>(8080)};
+        auto config = std::make_unique<RouteConfig>();
+        REQUIRE(configure_deferred_preflight_test_route(*config));
+        const RouteConfig* active = config.get();
+        loop.config_ptr = &active;
+        deferred_preflight_test_outcome = DeferredPreflightTestOutcome::Redirect;
+        deferred_preflight_handler_calls = 0;
+        auto* conn = loop.alloc_conn();
+        REQUIRE(conn != nullptr);
+        const u32 id = conn->id;
+        REQUIRE_EQ(conn->recv_buf.write(reinterpret_cast<const u8*>(kRedirectRequest),
+                                        sizeof(kRedirectRequest) - 1),
+                   sizeof(kRedirectRequest) - 1);
+        loop.backend.clear_ops();
+        on_header_received<DeferredPreflightMockLoop>(
+            &loop, *conn, make_ev(id, IoEventType::Recv, sizeof(kRedirectRequest) - 1));
+        CHECK_EQ(deferred_preflight_handler_calls, 1u);
+        CHECK_EQ(conn->resp_status, 301u);
+        CHECK(conn->response_read_deadline_owner_is_neutral());
+        CHECK_EQ(loop.backend.count_ops(MockOp::Connect), 0u);
+        CHECK_EQ(loop.backend.count_ops(MockOp::Send), 1u);
+        u8 normalized[SmallLoop::kBufSize]{};
+        REQUIRE(conn->send_buf.len() <= sizeof(normalized));
+        __builtin_memcpy(normalized, conn->send_buf.data(), conn->send_buf.len());
+        REQUIRE(normalize_redirect_date(normalized, conn->send_buf.len()));
+        const std::string expected = expected_fixed_redirect_wire();
+        CHECK_EQ(conn->send_buf.len(), static_cast<u32>(expected.size()));
+        CHECK_EQ(__builtin_memcmp(normalized, expected.data(), expected.size()), 0);
+        loop.close_conn(*conn);
+    }
+
+    {
+        DeferredPreflightMockLoop loop;
+        loop.setup();
+        loop.listener_context = {
+            ListenerAddress::IPv4Wildcard, ListenerTransport::Cleartext, static_cast<u16>(8080)};
+        auto config = std::make_unique<RouteConfig>();
+        REQUIRE(configure_deferred_preflight_test_route(*config));
+        const RouteConfig* active = config.get();
+        loop.config_ptr = &active;
+        deferred_preflight_test_outcome = DeferredPreflightTestOutcome::ForwardBundle;
+        deferred_preflight_handler_calls = 0;
+        auto* conn = loop.alloc_conn();
+        REQUIRE(conn != nullptr);
+        const u32 id = conn->id;
+        REQUIRE_EQ(conn->recv_buf.write(reinterpret_cast<const u8*>(kForwardRequest),
+                                        sizeof(kForwardRequest) - 1),
+                   sizeof(kForwardRequest) - 1);
+        loop.backend.clear_ops();
+        on_header_received<DeferredPreflightMockLoop>(
+            &loop, *conn, make_ev(id, IoEventType::Recv, sizeof(kForwardRequest) - 1));
+        CHECK_EQ(deferred_preflight_handler_calls, 1u);
+        CHECK_EQ(conn->response_read_deadline_state, ResponseReadDeadlineState::Validated);
+        CHECK_EQ(conn->response_read_deadline_bundle_id, 1u);
+        CHECK_EQ(conn->response_read_deadline_buffering,
+                 ForwardResponseBufferingMode::CompleteContentLength);
+        CHECK_EQ(loop.backend.count_ops(MockOp::Connect), 1u);
+        CHECK_EQ(loop.backend.count_ops(MockOp::Send), 0u);
+        CHECK_FALSE(conn->upstream_slot_held);
+        loop.close_conn(*conn);
+    }
+}
+
+TEST(response_read_timeout,
+     h1_deferred_selector_unexpected_outcomes_and_mutated_state_close_without_effects) {
+    static constexpr char kRequest[] =
+        "GET / HTTP/1.1\r\nHost: client.example\r\nConnection: close\r\n\r\n";
+    for (const auto outcome : {DeferredPreflightTestOutcome::ReturnStatus,
+                               DeferredPreflightTestOutcome::OrdinaryForward,
+                               DeferredPreflightTestOutcome::WrongBundle}) {
+        DeferredPreflightMockLoop loop;
+        loop.setup();
+        auto config = std::make_unique<RouteConfig>();
+        REQUIRE(configure_deferred_preflight_test_route(*config));
+        const RouteConfig* active = config.get();
+        loop.config_ptr = &active;
+        deferred_preflight_test_outcome = outcome;
+        deferred_preflight_handler_calls = 0;
+        auto* conn = loop.alloc_conn();
+        REQUIRE(conn != nullptr);
+        const u32 id = conn->id;
+        REQUIRE_EQ(
+            conn->recv_buf.write(reinterpret_cast<const u8*>(kRequest), sizeof(kRequest) - 1),
+            sizeof(kRequest) - 1);
+        loop.backend.clear_ops();
+        on_header_received<DeferredPreflightMockLoop>(
+            &loop, *conn, make_ev(id, IoEventType::Recv, sizeof(kRequest) - 1));
+        CHECK_EQ(deferred_preflight_handler_calls, 1u);
+        CHECK_EQ(loop.free_top, DeferredPreflightMockLoop::kMaxConns);
+        CHECK_EQ(loop.backend.count_ops(MockOp::Connect), 0u);
+        CHECK_EQ(loop.backend.count_ops(MockOp::Send), 0u);
+        CHECK_EQ(loop.backend.count_ops(MockOp::Recv), 0u);
+    }
+
+    DeferredPreflightMockLoop loop;
+    loop.setup();
+    auto config = std::make_unique<RouteConfig>();
+    REQUIRE(configure_deferred_preflight_test_route(*config));
+    auto* conn = loop.alloc_conn();
+    REQUIRE(conn != nullptr);
+    REQUIRE_EQ(conn->recv_buf.write(reinterpret_cast<const u8*>(kRequest), sizeof(kRequest) - 1),
+               sizeof(kRequest) - 1);
+    capture_request_metadata(*conn);
+    conn->request_config = config.get();
+    conn->req_path_overridden = true;
+    JitDispatchOutcome selected{};
+    selected.kind = JitDispatchOutcome::Kind::Redirect;
+    selected.redirect_policy_id = 1;
+    loop.backend.clear_ops();
+    handle_jit_outcome<DeferredPreflightMockLoop>(
+        &loop, *conn, selected, &deferred_preflight_handler, true, &config->routes[0]);
+    CHECK_EQ(loop.free_top, DeferredPreflightMockLoop::kMaxConns);
     CHECK_EQ(loop.backend.count_ops(MockOp::Connect), 0u);
     CHECK_EQ(loop.backend.count_ops(MockOp::Send), 0u);
 }
@@ -2728,6 +2928,36 @@ TEST(response_read_timeout, h2_forged_outcomes_set_sticky_close_without_local_st
         CHECK_EQ(loop.free_top, SmallLoop::kMaxConns - 1);
         loop.close_conn(*conn);
         CHECK_EQ(loop.free_top, SmallLoop::kMaxConns);
+    }
+
+    // Verified deferred metadata remains outside H2: the selector is never
+    // invoked and the stream gets the same sticky zero-byte close.
+    {
+        SmallLoop loop;
+        loop.setup();
+        auto* conn = loop.alloc_conn();
+        REQUIRE(conn != nullptr);
+        Http2Conn h2{};
+        h2.init();
+        conn->h2 = &h2;
+        RouteEntry route{};
+        route.action = RouteAction::JitHandler;
+        route.method = kRouteMethodGet;
+        route.fn = &deferred_preflight_handler;
+        route.forward_preflight_mode = ForwardPreflightMode::AfterCanonicalSelection;
+        route.preflight_forward_policy_bundle_id = 1;
+        u8 response[8192]{};
+        H2Dispatch<SmallLoop> dispatch{&loop, conn, response, sizeof(response), 0, false};
+        deferred_preflight_handler_calls = 0;
+        loop.backend.clear_ops();
+        h2_invoke_emit(
+            dispatch, 1, &route, nullptr, 0, &config, kSynth, sizeof(kSynth) - 1, false, true);
+        CHECK(dispatch.close_after_process);
+        CHECK_EQ(dispatch.resp_len, 0u);
+        CHECK_EQ(deferred_preflight_handler_calls, 0u);
+        CHECK_EQ(loop.backend.count_ops(MockOp::Connect), 0u);
+        CHECK_EQ(loop.backend.count_ops(MockOp::Send), 0u);
+        loop.close_conn(*conn);
     }
 
     // A forged bundle is rejected at the same zero-byte boundary.

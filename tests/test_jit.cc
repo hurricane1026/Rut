@@ -1,3 +1,4 @@
+#include "deferred_preflight_fixture.h"
 #include "rut/compiler/analyze.h"
 #include "rut/compiler/lexer.h"
 #include "rut/compiler/lower_rir.h"
@@ -19965,6 +19966,59 @@ TEST(jit_dispatch, timer_seconds_rounds_up_from_ms) {
     CHECK_EQ(timer_seconds_from_ms(1000), 1);  // 1000ms → 1s (exact)
     CHECK_EQ(timer_seconds_from_ms(1001), 2);  // 1001ms → 2s
     CHECK_EQ(timer_seconds_from_ms(2500), 3);  // 2500ms → 3s
+}
+
+TEST(jit, deferred_preflight_selector_returns_only_exact_redirect_or_bundle_identity) {
+    auto lexed = lex(lit(kDeferredPreflightSource));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    REQUIRE(lower_to_rir(mir.value(), rir));
+    REQUIRE(rir::verify_module(rir.module).ok);
+    REQUIRE_EQ(rir.module.functions[0].forward_preflight_mode,
+               ForwardPreflightMode::AfterCanonicalSelection);
+    REQUIRE_EQ(rir.module.functions[0].preflight_forward_policy_bundle_id, 1u);
+
+    auto cg = codegen(rir.module);
+    REQUIRE(cg.ok);
+    JitEngine engine;
+    REQUIRE(engine.init());
+    REQUIRE(engine.compile(cg.mod, cg.ctx));
+    auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
+    REQUIRE(handler != nullptr);
+
+    struct Case {
+        const char* request;
+        HandlerAction action;
+    } cases[] = {
+        {"GET /old HTTP/1.1\r\nHost: test\r\n\r\n", HandlerAction::Redirect},
+        {"GET /old?x=1 HTTP/1.1\r\nHost: test\r\n\r\n", HandlerAction::Redirect},
+        {"GET /old/ HTTP/1.1\r\nHost: test\r\n\r\n", HandlerAction::ForwardBundle},
+        {"GET / HTTP/1.1\r\nHost: test\r\n\r\n", HandlerAction::ForwardBundle},
+    };
+    for (const auto& test : cases) {
+        const u32 len = static_cast<u32>(__builtin_strlen(test.request));
+        const auto raw = HandlerResult::unpack(
+            handler(nullptr, nullptr, reinterpret_cast<const u8*>(test.request), len, nullptr));
+        CHECK_EQ(raw.action, test.action);
+        if (test.action == HandlerAction::Redirect) {
+            CHECK_EQ(raw.status_code, 0u);
+            CHECK_EQ(raw.upstream_id, 1u);
+            CHECK_EQ(raw.next_state, 0u);
+        } else {
+            CHECK_EQ(raw.status_code, 1u);
+            CHECK_EQ(raw.upstream_id, 0u);
+            CHECK_EQ(raw.next_state, 1u);
+        }
+    }
+
+    engine.shutdown();
+    rir.destroy();
 }
 
 TEST(jit_dispatch, wait_handler_yields_then_resumes_to_status) {

@@ -1,3 +1,4 @@
+#include "deferred_preflight_fixture.h"
 #include "rut/compiler/analyze.h"
 #include "rut/compiler/lexer.h"
 #include "rut/compiler/lower_rir.h"
@@ -34356,24 +34357,31 @@ route GET "/api" {
     REQUIRE_EQ(rir.module.policy_bundle_count, 1u);
     CHECK_EQ(rir.module.policy_bundles[0].response_policy_id, 1u);
     CHECK_EQ(rir.module.policy_bundles[0].failure_policy_id, 1u);
-    const auto& block = rir.module.functions[0].blocks[0];
-    REQUIRE_EQ(block.inst_count, 6u);
-    CHECK_EQ(block.insts[0].op, rir::Opcode::ConstI32);
-    CHECK_EQ(block.insts[0].imm.i32_val, 0);
-    CHECK_EQ(block.insts[1].op, rir::Opcode::ConstI32);
-    CHECK_EQ(block.insts[1].imm.i32_val, 1);
-    CHECK_EQ(block.insts[2].op, rir::Opcode::ConstI32);
-    CHECK_EQ(block.insts[2].imm.i32_val, 1);
-    CHECK_EQ(block.insts[3].op, rir::Opcode::ConstI32);
+    const auto& fn = rir.module.functions[0];
+    const auto& block = fn.blocks[0];
+    REQUIRE_EQ(block.inst_count, 5u);
+    const rir::Opcode expected_ops[] = {rir::Opcode::ConstI32,
+                                        rir::Opcode::ConstI32,
+                                        rir::Opcode::ConstI32,
+                                        rir::Opcode::ReqSetTargetTransform,
+                                        rir::Opcode::RetForwardBundle};
+    for (u32 i = 0; i < block.inst_count; i++) CHECK_EQ(block.insts[i].op, expected_ops[i]);
     CHECK_EQ(block.insts[3].imm.i32_val, 1);
-    CHECK_EQ(block.insts[block.inst_count - 2].op, rir::Opcode::ReqSetTargetTransform);
-    CHECK_EQ(block.insts[block.inst_count - 2].imm.i32_val, 1);
-    const auto& ret = block.insts[block.inst_count - 1];
+    const auto& ret = block.insts[4];
     CHECK_EQ(ret.op, rir::Opcode::RetForwardBundle);
     CHECK_EQ(ret.operand_count, 3u);
-    CHECK_EQ(ret.operands[0].id, block.insts[0].result.id);
-    CHECK_EQ(ret.operands[1].id, block.insts[1].result.id);
-    CHECK_EQ(ret.operands[2].id, block.insts[3].result.id);
+    const i32 expected_operand_constants[] = {0, 1, 1};
+    for (u32 i = 0; i < ret.operand_count; i++) {
+        const auto operand = ret.operand(i);
+        REQUIRE_LT(operand.id, fn.value_count);
+        const auto& value = fn.values[operand.id];
+        CHECK_EQ(value.def_block.id, 0u);
+        CHECK_EQ(value.def_inst, i);
+        const auto& defining_const = block.insts[value.def_inst];
+        CHECK_EQ(defining_const.op, rir::Opcode::ConstI32);
+        CHECK_EQ(defining_const.result.id, operand.id);
+        CHECK_EQ(defining_const.imm.i32_val, expected_operand_constants[i]);
+    }
     rir.destroy();
 }
 
@@ -34551,19 +34559,37 @@ route GET "/api" {
     REQUIRE(lower_to_rir(mir.value(), rir));
     REQUIRE_EQ(rir.module.target_transform_count, 1u);
     REQUIRE_EQ(rir.module.policy_bundle_count, 1u);
-    const auto& block = rir.module.functions[0].blocks[0];
-    REQUIRE_GE(block.inst_count, 5u);
-    const auto& ret = block.insts[block.inst_count - 1];
+    const auto& fn = rir.module.functions[0];
+    const auto& block = fn.blocks[0];
+    REQUIRE_EQ(block.inst_count, 5u);
+    const rir::Opcode expected_ops[] = {rir::Opcode::ConstI32,
+                                        rir::Opcode::ConstI32,
+                                        rir::Opcode::ConstI32,
+                                        rir::Opcode::ReqSetTargetTransform,
+                                        rir::Opcode::RetForwardBundle};
+    for (u32 i = 0; i < block.inst_count; i++) CHECK_EQ(block.insts[i].op, expected_ops[i]);
+    const auto& ret = block.insts[4];
     REQUIRE_EQ(static_cast<u8>(ret.op), static_cast<u8>(rir::Opcode::RetForwardBundle));
     REQUIRE_EQ(ret.operand_count, 3u);
-    const auto& transform = block.insts[block.inst_count - 2];
+    const auto& transform = block.insts[3];
     CHECK_EQ(static_cast<u8>(transform.op), static_cast<u8>(rir::Opcode::ReqSetTargetTransform));
     CHECK_EQ(transform.imm.i32_val, 1);
-    CHECK_EQ(block.insts[block.inst_count - 3].op, rir::Opcode::ConstI32);
-    // The bundle branch carries an explicit zero request-policy operand,
-    // followed by the response/failure bundle ID.
-    CHECK_EQ(ret.operands[1].id, block.insts[block.inst_count - 5].result.id);
-    CHECK_EQ(ret.operands[2].id, block.insts[block.inst_count - 3].result.id);
+    // No response-policy dead value is emitted. The bundle is interned before
+    // the explicit zero request-policy value, while RetForwardBundle retains
+    // the ABI operand order upstream/request-policy/bundle.
+    const u32 expected_def_insts[] = {0, 2, 1};
+    const i32 expected_operand_constants[] = {0, 0, 1};
+    for (u32 i = 0; i < ret.operand_count; i++) {
+        const auto operand = ret.operand(i);
+        REQUIRE_LT(operand.id, fn.value_count);
+        const auto& value = fn.values[operand.id];
+        CHECK_EQ(value.def_block.id, 0u);
+        CHECK_EQ(value.def_inst, expected_def_insts[i]);
+        const auto& defining_const = block.insts[value.def_inst];
+        CHECK_EQ(defining_const.op, rir::Opcode::ConstI32);
+        CHECK_EQ(defining_const.result.id, operand.id);
+        CHECK_EQ(defining_const.imm.i32_val, expected_operand_constants[i]);
+    }
     CHECK_EQ(rir.module.policy_bundles[0].response_policy_id, 1u);
     CHECK_EQ(rir.module.policy_bundles[0].failure_policy_id, 1u);
     rir.destroy();
@@ -36198,6 +36224,262 @@ TEST(frontend, imported_exact_local_response_declaration_is_rejected) {
     auto ast = parse_file_heap(lexed.value());
     REQUIRE(ast);
     CHECK_FALSE(analyze_file_heap_with_path(ast.value(), dir + "/main.rut").has_value());
+}
+
+TEST(frontend, deferred_forward_preflight_admits_only_exact_path_redirect_selector) {
+    auto lexed = lex(lit(kDeferredPreflightSource));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    REQUIRE_EQ(hir->routes.len, 1u);
+    auto& route = hir->routes[0];
+    CHECK_EQ(route.forward_preflight_mode, ForwardPreflightMode::AfterCanonicalSelection);
+    REQUIRE_EQ(route.control.kind, HirControlKind::If);
+    CHECK_EQ(route.control.cond.kind, HirExprKind::Eq);
+    REQUIRE(route.control.cond.lhs != nullptr);
+    REQUIRE(route.control.cond.rhs != nullptr);
+    CHECK_EQ(route.control.cond.lhs->kind, HirExprKind::ReqPathOnly);
+    CHECK_EQ(route.control.cond.rhs->kind, HirExprKind::StrLit);
+    CHECK_EQ(route.control.then_term.kind, HirTerminatorKind::Redirect);
+    CHECK_EQ(route.control.else_term.kind, HirTerminatorKind::ForwardUpstream);
+
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    auto& mf = mir->functions[0];
+    CHECK_EQ(mf.forward_preflight_mode, ForwardPreflightMode::AfterCanonicalSelection);
+    REQUIRE_EQ(mf.blocks.len, 3u);
+    CHECK_EQ(mf.blocks[0].term.kind, MirTerminatorKind::Branch);
+    CHECK_EQ(mf.blocks[0].term.then_block, 1u);
+    CHECK_EQ(mf.blocks[0].term.else_block, 2u);
+    CHECK_EQ(mf.blocks[1].term.kind, MirTerminatorKind::Redirect);
+    CHECK_EQ(mf.blocks[2].term.kind, MirTerminatorKind::ForwardUpstream);
+
+    FrontendRirModule lowered{};
+    REQUIRE(lower_to_rir(mir.value(), lowered));
+    REQUIRE(rir::verify_module(lowered.module).ok);
+    auto& fn = lowered.module.functions[0];
+    CHECK_EQ(fn.forward_preflight_mode, ForwardPreflightMode::AfterCanonicalSelection);
+    CHECK_EQ(fn.preflight_forward_policy_bundle_id, 1u);
+    REQUIRE_EQ(fn.block_count, 3u);
+    REQUIRE_EQ(fn.blocks[0].inst_count, 4u);
+    CHECK_EQ(fn.blocks[0].insts[0].op, rir::Opcode::ReqPathOnly);
+    CHECK_EQ(fn.blocks[0].insts[1].op, rir::Opcode::ConstStr);
+    CHECK_EQ(fn.blocks[0].insts[2].op, rir::Opcode::CmpEq);
+    CHECK_EQ(fn.blocks[0].insts[3].op, rir::Opcode::Br);
+    REQUIRE_EQ(fn.blocks[1].inst_count, 1u);
+    CHECK_EQ(fn.blocks[1].insts[0].op, rir::Opcode::RetRedirect);
+    REQUIRE_EQ(fn.blocks[2].inst_count, 4u);
+    CHECK_EQ(fn.blocks[2].insts[3].op, rir::Opcode::RetForwardBundle);
+
+    char printed[4096]{};
+    rir::PrintBuf print_buf;
+    print_buf.init(printed, sizeof(printed), -1);
+    rir::print_module(print_buf, lowered.module);
+    CHECK_FALSE(print_buf.overflow);
+    CHECK(std::string(printed, print_buf.len)
+              .find("forward_preflight: after_canonical_selection bundle=1") != std::string::npos);
+
+    // RIR verifier independently rejects representative trust-boundary
+    // forgeries and succeeds again after each exact restoration.
+    auto expect_invalid_preflight = [&]() {
+        const auto verified = rir::verify_module(lowered.module);
+        CHECK_FALSE(verified.ok);
+        CHECK_EQ(verified.issue.code, rir::VerifyIssueCode::InvalidForwardPreflight);
+    };
+    const u32 saved_block_cap = fn.block_cap;
+    fn.block_cap = fn.block_count - 1;
+    expect_invalid_preflight();
+    fn.block_cap = saved_block_cap;
+    const u32 saved_value_cap = fn.value_cap;
+    fn.value_cap = fn.value_count - 1;
+    expect_invalid_preflight();
+    fn.value_cap = saved_value_cap;
+
+    const rir::ValueId canonical_results[] = {fn.blocks[0].insts[0].result,
+                                              fn.blocks[0].insts[1].result,
+                                              fn.blocks[0].insts[2].result,
+                                              fn.blocks[2].insts[0].result,
+                                              fn.blocks[2].insts[1].result,
+                                              fn.blocks[2].insts[2].result};
+    const rir::Type* str_type = fn.values[canonical_results[0].id].type;
+    const rir::Type* bool_type = fn.values[canonical_results[2].id].type;
+    const rir::Type* i32_type = fn.values[canonical_results[3].id].type;
+    REQUIRE(str_type != nullptr);
+    REQUIRE(bool_type != nullptr);
+    REQUIRE(i32_type != nullptr);
+    for (u32 i = 0; i < sizeof(canonical_results) / sizeof(canonical_results[0]); i++) {
+        auto& value = fn.values[canonical_results[i].id];
+        const rir::Type* saved_type = value.type;
+        value.type = nullptr;
+        expect_invalid_preflight();
+        value.type = i < 2 ? bool_type : str_type;
+        expect_invalid_preflight();
+        value.type = saved_type;
+    }
+    auto* forged_primitive = const_cast<rir::Type*>(str_type);
+    const rir::Type* saved_inner = forged_primitive->inner;
+    forged_primitive->inner = i32_type;
+    expect_invalid_preflight();
+    forged_primitive->inner = saved_inner;
+    CHECK(rir::verify_module(lowered.module).ok);
+
+    fn.blocks[0].insts[3].imm.block_targets[0].id = 2;
+    CHECK_FALSE(rir::verify_module(lowered.module).ok);
+    fn.blocks[0].insts[3].imm.block_targets[0].id = 1;
+    fn.blocks[0].insts[0].op = rir::Opcode::ReqPath;
+    CHECK_FALSE(rir::verify_module(lowered.module).ok);
+    fn.blocks[0].insts[0].op = rir::Opcode::ReqPathOnly;
+    fn.blocks[2].insts[2].imm.i32_val = 2;
+    CHECK_FALSE(rir::verify_module(lowered.module).ok);
+    fn.blocks[2].insts[2].imm.i32_val = 1;
+    fn.forward_preflight_mode = ForwardPreflightMode::EagerDirect;
+    CHECK_FALSE(rir::verify_module(lowered.module).ok);
+    fn.forward_preflight_mode = ForwardPreflightMode::AfterCanonicalSelection;
+    CHECK(rir::verify_module(lowered.module).ok);
+    lowered.destroy();
+
+    // HIR and MIR independently reject branch reversal, condition direction,
+    // extra effects, and forged timing metadata.
+    auto expect_hir_rejection = [&]() { CHECK_FALSE(build_mir_heap(hir.value()).has_value()); };
+    auto& hir_forward = route.control.else_term;
+    auto reject_hir_policy_id = [&](u16& id, u16 valid, u16 out_of_range) {
+        id = 0;
+        expect_hir_rejection();
+        id = out_of_range;
+        expect_hir_rejection();
+        id = valid;
+    };
+    reject_hir_policy_id(hir_forward.forward_response_policy_id,
+                         1,
+                         static_cast<u16>(hir->response_policies.len + 1));
+    reject_hir_policy_id(
+        hir_forward.forward_failure_policy_id, 1, static_cast<u16>(hir->failure_policies.len + 1));
+    reject_hir_policy_id(hir_forward.forward_timeout_failure_policy_id,
+                         2,
+                         static_cast<u16>(hir->failure_policies.len + 1));
+    const auto saved_hir_response = hir->response_policies[0];
+    hir->response_policies[0].version = static_cast<ResponsePolicyVersion>(0xff);
+    expect_hir_rejection();
+    hir->response_policies[0] = saved_hir_response;
+    hir->response_policies[0].connection = ResponsePolicyConnection::KeepAlive;
+    expect_hir_rejection();
+    hir->response_policies[0] = saved_hir_response;
+    const auto saved_hir_failure = hir->failure_policies[0];
+    hir->failure_policies[0].status_code = 200;
+    expect_hir_rejection();
+    hir->failure_policies[0] = saved_hir_failure;
+    hir->failure_policies[0].head_mode = FailurePolicyHeadMode::SuppressBody;
+    expect_hir_rejection();
+    hir->failure_policies[0] = saved_hir_failure;
+    const auto saved_hir_timeout = hir->failure_policies[1];
+    hir->failure_policies[1].status_code = 200;
+    expect_hir_rejection();
+    hir->failure_policies[1] = saved_hir_timeout;
+    hir->failure_policies[1].head_mode = FailurePolicyHeadMode::SuppressBody;
+    expect_hir_rejection();
+    hir->failure_policies[1] = saved_hir_timeout;
+
+    auto saved_then = route.control.then_term;
+    route.control.then_term = route.control.else_term;
+    route.control.else_term = saved_then;
+    CHECK_FALSE(build_mir_heap(hir.value()).has_value());
+    route.control.else_term = route.control.then_term;
+    route.control.then_term = saved_then;
+    auto* saved_lhs = route.control.cond.lhs;
+    route.control.cond.lhs = route.control.cond.rhs;
+    route.control.cond.rhs = saved_lhs;
+    CHECK_FALSE(build_mir_heap(hir.value()).has_value());
+    route.control.cond.rhs = route.control.cond.lhs;
+    route.control.cond.lhs = saved_lhs;
+    route.forward_preflight_mode = ForwardPreflightMode::EagerDirect;
+    CHECK_FALSE(build_mir_heap(hir.value()).has_value());
+
+    lexed = lex(lit(kDeferredPreflightSource));
+    REQUIRE(lexed);
+    ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    auto& forged_mir = mir->functions[0];
+    auto expect_mir_rejection = [&]() {
+        FrontendRirModule rejected{};
+        CHECK_FALSE(lower_to_rir(mir.value(), rejected).has_value());
+    };
+    auto& mir_forward = forged_mir.blocks[2].term;
+    auto reject_mir_policy_id = [&](u16& id, u16 valid, u16 out_of_range) {
+        id = 0;
+        expect_mir_rejection();
+        id = out_of_range;
+        expect_mir_rejection();
+        id = valid;
+    };
+    reject_mir_policy_id(mir_forward.forward_response_policy_id,
+                         1,
+                         static_cast<u16>(mir->response_policies.len + 1));
+    reject_mir_policy_id(
+        mir_forward.forward_failure_policy_id, 1, static_cast<u16>(mir->failure_policies.len + 1));
+    reject_mir_policy_id(mir_forward.forward_timeout_failure_policy_id,
+                         2,
+                         static_cast<u16>(mir->failure_policies.len + 1));
+    const auto saved_mir_response = mir->response_policies[0];
+    mir->response_policies[0].version = static_cast<ResponsePolicyVersion>(0xff);
+    expect_mir_rejection();
+    mir->response_policies[0] = saved_mir_response;
+    mir->response_policies[0].connection = ResponsePolicyConnection::KeepAlive;
+    expect_mir_rejection();
+    mir->response_policies[0] = saved_mir_response;
+    const auto saved_mir_failure = mir->failure_policies[0];
+    mir->failure_policies[0].status_code = 200;
+    expect_mir_rejection();
+    mir->failure_policies[0] = saved_mir_failure;
+    mir->failure_policies[0].head_mode = FailurePolicyHeadMode::SuppressBody;
+    expect_mir_rejection();
+    mir->failure_policies[0] = saved_mir_failure;
+    const auto saved_mir_timeout = mir->failure_policies[1];
+    mir->failure_policies[1].status_code = 200;
+    expect_mir_rejection();
+    mir->failure_policies[1] = saved_mir_timeout;
+    mir->failure_policies[1].head_mode = FailurePolicyHeadMode::SuppressBody;
+    expect_mir_rejection();
+    mir->failure_policies[1] = saved_mir_timeout;
+
+    forged_mir.blocks[0].term.then_block = 2;
+    FrontendRirModule rejected{};
+    CHECK_FALSE(lower_to_rir(mir.value(), rejected).has_value());
+    forged_mir.blocks[0].term.then_block = 1;
+    MirBlock::Effect effect{};
+    effect.value_index = 0;
+    REQUIRE(forged_mir.blocks[1].effects.push(effect));
+    CHECK_FALSE(lower_to_rir(mir.value(), rejected).has_value());
+}
+
+TEST(frontend, deferred_forward_preflight_rejects_alternate_source_conditions) {
+    const std::string canonical(kDeferredPreflightSource);
+    struct Replacement {
+        const char* from;
+        const char* to;
+    } cases[] = {
+        {"req.pathOnly == \"/old\"", "\"/old\" == req.pathOnly"},
+        {"req.pathOnly == \"/old\"", "req.path == \"/old\""},
+        {"req.pathOnly == \"/old\"", "req.pathOnly.matches(re\"^/old$\")"},
+    };
+    for (const auto& test : cases) {
+        std::string source = canonical;
+        const auto pos = source.find(test.from);
+        REQUIRE_NE(pos, std::string::npos);
+        source.replace(pos, __builtin_strlen(test.from), test.to);
+        auto lexed = lex({source.data(), static_cast<u32>(source.size())});
+        REQUIRE(lexed);
+        auto ast = parse_file_heap(lexed.value());
+        REQUIRE(ast);
+        auto hir = analyze_file_heap(ast.value());
+        REQUIRE_FALSE(hir.has_value());
+        CHECK_EQ(hir.error().code, FrontendError::UnsupportedSyntax);
+    }
 }
 
 int main(int argc, char** argv) {
