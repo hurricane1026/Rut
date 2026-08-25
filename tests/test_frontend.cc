@@ -35727,6 +35727,203 @@ TEST(frontend, strict_local_response_policy_bounds_and_forged_compiler_metadata_
     CHECK_FALSE(build_mir_heap(hir.value()).has_value());
 }
 
+TEST(frontend, pre_route_contextual_source_survives_every_ir_and_combines_three_selectors) {
+    static constexpr char kSource[] = R"rut(
+pre_route TRACE { return local_response({
+  version: "HTTP/1.1", status: 405, reason: "Not Allowed", server: "rut",
+  date: "current", content_type: "text/plain", connection: "request",
+  head_mode: "reject", body: b"trace-pre"
+}) }
+pre_route OPTIONS { return local_response({
+  version: "HTTP/1.1", status: 400, reason: "Bad Request", server: "rut",
+  date: "current", content_type: "text/plain", connection: "request",
+  head_mode: "reject", body: b"options-pre"
+}) }
+route exact "/static" { return local_response({
+  version: "HTTP/1.1", status: 200, reason: "OK", server: "rut",
+  date: "current", content_type: "text/plain", connection: "request",
+  head_mode: "suppress_body", body: b"exact"
+}) }
+route GET "/" { return 204 }
+unmatched TRACE { return local_response({
+  version: "HTTP/1.1", status: 403, reason: "Forbidden", server: "rut",
+  date: "current", content_type: "text/plain", connection: "request",
+  head_mode: "reject", body: b"trace-miss"
+}) }
+)rut";
+    auto lexed = lex(lit(kSource));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    REQUIRE_EQ(ast->items.len, 5u);
+    CHECK_EQ(ast->items[0].kind, AstItemKind::PreRoute);
+    CHECK_EQ(ast->items[1].kind, AstItemKind::PreRoute);
+    CHECK_EQ(ast->items[2].kind, AstItemKind::ExactStrictLocalResponse);
+    CHECK_EQ(ast->items[3].kind, AstItemKind::Route);
+    CHECK_EQ(ast->items[4].kind, AstItemKind::Unmatched);
+    CHECK_EQ(ast->pre_route_policy_ids[kRouteMethodTrace], 1u);
+    CHECK_EQ(ast->pre_route_policy_ids[kRouteMethodOptions], 2u);
+    CHECK_EQ(ast->unmatched_policy_ids[kRouteMethodTrace], 4u);
+    CHECK_EQ(ast->exact_strict_local_response_bindings[0].policy_id, 3u);
+    CHECK(strict_local_response_source_table_valid(ast->strict_local_response_policies.data,
+                                                   ast->strict_local_response_policies.len,
+                                                   ast->pre_route_policy_ids,
+                                                   ast->unmatched_policy_ids,
+                                                   ast->exact_strict_local_response_bindings.data,
+                                                   ast->exact_strict_local_response_bindings.len));
+
+    auto ast_copy = std::make_unique<AstFile>(ast.value());
+    CHECK_EQ(ast_copy->pre_route_policy_ids[kRouteMethodTrace], 1u);
+    CHECK(ast_copy->strict_local_response_policies[0].body.eq(lit("trace-pre")));
+    CHECK(ast_copy->strict_local_response_policies[0].body.ptr !=
+          ast->strict_local_response_policies[0].body.ptr);
+    auto ast_move = std::make_unique<AstFile>(std::move(*ast_copy));
+    CHECK_EQ(ast_move->pre_route_policy_ids[kRouteMethodOptions], 2u);
+    CHECK(ast_move->strict_local_response_policies[1].body.eq(lit("options-pre")));
+    auto ast_assigned = std::make_unique<AstFile>();
+    *ast_assigned = ast.value();
+    CHECK_EQ(ast_assigned->pre_route_policy_ids[kRouteMethodTrace], 1u);
+    auto ast_move_assigned = std::make_unique<AstFile>();
+    *ast_move_assigned = std::move(*ast_assigned);
+    CHECK_EQ(ast_move_assigned->pre_route_policy_ids[kRouteMethodOptions], 2u);
+
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    CHECK_EQ(hir->pre_route_policy_ids[kRouteMethodTrace], 1u);
+    CHECK_EQ(hir->pre_route_policy_ids[kRouteMethodOptions], 2u);
+    auto hir_copy = std::make_unique<HirModule>(hir.value());
+    CHECK_EQ(hir_copy->pre_route_policy_ids[kRouteMethodTrace], 1u);
+    auto hir_assigned = std::make_unique<HirModule>();
+    *hir_assigned = hir.value();
+    CHECK_EQ(hir_assigned->pre_route_policy_ids[kRouteMethodOptions], 2u);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    CHECK_EQ(mir->pre_route_policy_ids[kRouteMethodTrace], 1u);
+    CHECK_EQ(mir->pre_route_policy_ids[kRouteMethodOptions], 2u);
+    auto mir_copy = std::make_unique<MirModule>(mir.value());
+    CHECK_EQ(mir_copy->pre_route_policy_ids[kRouteMethodOptions], 2u);
+    auto mir_move = std::make_unique<MirModule>(std::move(*mir_copy));
+    CHECK_EQ(mir_move->pre_route_policy_ids[kRouteMethodTrace], 1u);
+    auto mir_assigned = std::make_unique<MirModule>();
+    *mir_assigned = mir.value();
+    CHECK_EQ(mir_assigned->pre_route_policy_ids[kRouteMethodTrace], 1u);
+    auto mir_move_assigned = std::make_unique<MirModule>();
+    *mir_move_assigned = std::move(*mir_assigned);
+    CHECK_EQ(mir_move_assigned->pre_route_policy_ids[kRouteMethodOptions], 2u);
+
+    FrontendRirModule lowered{};
+    REQUIRE(lower_to_rir(mir.value(), lowered));
+    REQUIRE(rir::verify_module(lowered.module).ok);
+    CHECK_EQ(lowered.module.pre_route_policy_ids[kRouteMethodTrace], 1u);
+    CHECK_EQ(lowered.module.pre_route_policy_ids[kRouteMethodOptions], 2u);
+    CHECK_EQ(lowered.module.unmatched_policy_ids[kRouteMethodTrace], 4u);
+    CHECK_EQ(lowered.module.exact_strict_local_response_binding_count, 1u);
+    for (u32 slot = 0; slot < kStrictLocalResponseMethodSlots; slot++) {
+        if (slot != kRouteMethodTrace && slot != kRouteMethodOptions)
+            CHECK_EQ(lowered.module.pre_route_policy_ids[slot], 0u);
+    }
+    char output[4096];
+    rir::PrintBuf buf;
+    buf.init(output, sizeof(output), -1);
+    rir::print_module(buf, lowered.module);
+    REQUIRE_FALSE(buf.overflow);
+    const std::string printed(buf.data, buf.len);
+    CHECK(printed.find("pre_route:\n  OPTIONS -> local_response#2\n"
+                       "  TRACE -> local_response#1\n") != std::string::npos);
+    CHECK(printed.find("unmatched:\n  TRACE -> local_response#4\n") != std::string::npos);
+    CHECK(printed.find("exact:\n  ANY \"/static\" -> local_response#3\n") != std::string::npos);
+    lowered.destroy();
+}
+
+TEST(frontend, pre_route_shape_head_and_parser_transaction_fail_closed) {
+    auto source_for = [](const char* selector, const char* head_mode = "reject") {
+        return std::string("pre_route ") + selector +
+               " { return local_response({ version: \"HTTP/1.1\", status: 400, "
+               "reason: \"Bad Request\", server: \"rut\", date: \"current\", "
+               "content_type: \"text/plain\", connection: \"request\", head_mode: \"" +
+               head_mode + "\", body: b\"ok\" }) }\n";
+    };
+    for (const std::string& source : {
+             source_for(""),
+             source_for("ANY"),
+             source_for("FOO"),
+             source_for("HEAD", "reject"),
+             std::string("pre_route TRACE { return 405 }\n"),
+             std::string("pre_route TRACE { return local_response({}) return 405 }\n"),
+             source_for("TRACE") + source_for("TRACE"),
+         }) {
+        auto bad_lexed = lex({source.data(), static_cast<u32>(source.size())});
+        REQUIRE(bad_lexed);
+        CHECK_FALSE(parse_file_heap(bad_lexed.value()).has_value());
+    }
+    const std::string head = source_for("HEAD", "suppress_body");
+    auto head_lexed = lex({head.data(), static_cast<u32>(head.size())});
+    REQUIRE(head_lexed);
+    auto head_ast = parse_file_heap(head_lexed.value());
+    REQUIRE(head_ast);
+    CHECK_EQ(head_ast->pre_route_policy_ids[kRouteMethodHead], 1u);
+
+    const std::string connect = source_for("CONNECT");
+    auto connect_lexed = lex({connect.data(), static_cast<u32>(connect.size())});
+    REQUIRE(connect_lexed);
+    auto connect_ast = parse_file_heap(connect_lexed.value());
+    REQUIRE(connect_ast);
+    CHECK_EQ(connect_ast->pre_route_policy_ids[kRouteMethodConnect], 1u);
+
+    const std::string valid = source_for("TRACE");
+    auto lexed = lex({valid.data(), static_cast<u32>(valid.size())});
+    REQUIRE(lexed);
+    auto& tokens = lexed.value().tokens;
+    u32 rparen = tokens.len;
+    for (u32 i = 0; i < tokens.len; i++)
+        if (tokens[i].type == TokenType::RParen) rparen = i;
+    REQUIRE(rparen < tokens.len);
+    const Token original = tokens[rparen];
+    tokens[rparen].type = TokenType::Ident;
+    CHECK_FALSE(parse_file_heap(lexed.value()).has_value());
+    tokens[rparen] = original;
+    auto recovered = parse_file_heap(lexed.value());
+    REQUIRE(recovered);
+    CHECK_EQ(recovered->strict_local_response_policies.len, 1u);
+    CHECK_EQ(recovered->strict_local_response_body_pool.len, 2u);
+    CHECK_EQ(recovered->pre_route_policy_ids[kRouteMethodTrace], 1u);
+
+    auto forged_item = std::make_unique<AstFile>(recovered.value());
+    forged_item->items[0].pre_route.method_slot = kRouteMethodConnect;
+    CHECK_FALSE(analyze_file_heap(*forged_item).has_value());
+    auto forged_table = std::make_unique<AstFile>(recovered.value());
+    forged_table->pre_route_policy_ids[kRouteMethodTrace] = 0;
+    forged_table->pre_route_policy_ids[kRouteMethodAny] = 1;
+    CHECK_FALSE(analyze_file_heap(*forged_table).has_value());
+}
+
+TEST(frontend, imported_pre_route_declaration_and_table_only_forgery_are_rejected) {
+    const std::string dir = "/tmp/rut_import_pre_route_frontend";
+    std::filesystem::create_directories(dir);
+    const std::string declaration =
+        "pre_route TRACE { return local_response({ version: \"HTTP/1.1\", status: 405, "
+        "reason: \"Not Allowed\", server: \"rut\", date: \"current\", content_type: "
+        "\"text/plain\", connection: \"request\", head_mode: \"reject\", body: b\"x\" "
+        "}) }\n";
+    {
+        std::ofstream out(dir + "/pre.rut", std::ios::binary);
+        out << declaration;
+    }
+    const char main_source[] = "import \"pre.rut\"\nroute GET \"/\" { return 200 }\n";
+    auto lexed = lex(lit(main_source));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    CHECK_FALSE(analyze_file_heap_with_path(ast.value(), dir + "/main.rut").has_value());
+
+    auto declaration_lexed = lex({declaration.data(), static_cast<u32>(declaration.size())});
+    REQUIRE(declaration_lexed);
+    auto table_only = parse_file_heap(declaration_lexed.value());
+    REQUIRE(table_only);
+    table_only->items.len = 0;
+    CHECK_FALSE(analyze_file_heap(table_only.value()).has_value());
+}
+
 TEST(frontend, imported_unmatched_declaration_is_rejected) {
     const std::string dir = "/tmp/rut_import_unmatched_frontend";
     std::filesystem::create_directories(dir);

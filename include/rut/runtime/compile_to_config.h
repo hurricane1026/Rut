@@ -356,15 +356,18 @@ inline bool populate_route_config(RouteConfig& cfg, const rir::Module& mod) {
         exact_strict_local_response_inventory_present(
             mod.exact_strict_local_response_bindings,
             mod.exact_strict_local_response_binding_count);
-    for (u32 slot = 0; slot < kStrictLocalResponseMethodSlots; slot++)
+    for (u32 slot = 0; slot < kStrictLocalResponseMethodSlots; slot++) {
+        source_has_strict_local_response_metadata |= mod.pre_route_policy_ids[slot] != 0;
         source_has_strict_local_response_metadata |= mod.unmatched_policy_ids[slot] != 0;
+    }
     std::unique_ptr<RouteConfig> strict_local_response_probe;
     if (source_has_strict_local_response_metadata) {
         strict_local_response_probe.reset(new (std::nothrow) RouteConfig());
         if (!strict_local_response_probe ||
-            !strict_local_response_probe->install_strict_local_response_table(
+            !strict_local_response_probe->install_strict_local_response_table_with_pre_route(
                 mod.strict_local_response_policies,
                 mod.strict_local_response_policy_count,
+                mod.pre_route_policy_ids,
                 mod.unmatched_policy_ids,
                 mod.exact_strict_local_response_bindings,
                 mod.exact_strict_local_response_binding_count))

@@ -31,6 +31,7 @@ enum class AstItemKind : u8 {
     // Top-level `let <name> = <expr>` — state declaration (currently only
     // `Cache<IP, i64>(capacity: N)` inits are accepted; analyze validates).
     State,
+    PreRoute,
 };
 
 struct AstListenDecl {
@@ -580,6 +581,13 @@ struct AstUnmatchedDecl {
     u16 policy_id = 0;
 };
 
+struct AstPreRouteDecl {
+    Span span{};
+    u8 method = 0;
+    u8 method_slot = 0;
+    u16 policy_id = 0;
+};
+
 struct AstExactStrictLocalResponseDecl {
     Span span{};
     bool method_is_any = false;
@@ -627,6 +635,7 @@ struct AstItem {
     AstChainDecl chain{};
     AstRouteDecl route{};
     AstExactStrictLocalResponseDecl exact_strict_local_response{};
+    AstPreRouteDecl pre_route{};
     AstUnmatchedDecl unmatched{};
     AstTimerDecl timer{};
 };
@@ -656,6 +665,7 @@ struct AstFile {
     FixedVec<u8, kFailurePolicyBodyPoolBytes> failure_policy_body_pool;
     FixedVec<StrictLocalResponsePolicySpec, kMaxStrictLocalResponsePolicies>
         strict_local_response_policies;
+    u16 pre_route_policy_ids[kStrictLocalResponseMethodSlots]{};
     u16 unmatched_policy_ids[kStrictLocalResponseMethodSlots]{};
     FixedVec<ExactStrictLocalResponseBinding, kMaxExactStrictLocalResponseBindings>
         exact_strict_local_response_bindings;
@@ -680,8 +690,10 @@ struct AstFile {
           strict_local_response_body_pool(other.strict_local_response_body_pool),
           redirect_policies(other.redirect_policies),
           redirect_policy_body_pool(other.redirect_policy_body_pool) {
-        for (u32 i = 0; i < kStrictLocalResponseMethodSlots; i++)
+        for (u32 i = 0; i < kStrictLocalResponseMethodSlots; i++) {
+            pre_route_policy_ids[i] = other.pre_route_policy_ids[i];
             unmatched_policy_ids[i] = other.unmatched_policy_ids[i];
+        }
         rebase_from(other);
     }
     AstFile& operator=(const AstFile& other) {
@@ -696,8 +708,10 @@ struct AstFile {
         strict_local_response_policies = other.strict_local_response_policies;
         exact_strict_local_response_bindings = other.exact_strict_local_response_bindings;
         strict_local_response_body_pool = other.strict_local_response_body_pool;
-        for (u32 i = 0; i < kStrictLocalResponseMethodSlots; i++)
+        for (u32 i = 0; i < kStrictLocalResponseMethodSlots; i++) {
+            pre_route_policy_ids[i] = other.pre_route_policy_ids[i];
             unmatched_policy_ids[i] = other.unmatched_policy_ids[i];
+        }
         redirect_policies = other.redirect_policies;
         redirect_policy_body_pool = other.redirect_policy_body_pool;
         rebase_from(other);
@@ -716,8 +730,10 @@ struct AstFile {
           strict_local_response_body_pool(other.strict_local_response_body_pool),
           redirect_policies(other.redirect_policies),
           redirect_policy_body_pool(other.redirect_policy_body_pool) {
-        for (u32 i = 0; i < kStrictLocalResponseMethodSlots; i++)
+        for (u32 i = 0; i < kStrictLocalResponseMethodSlots; i++) {
+            pre_route_policy_ids[i] = other.pre_route_policy_ids[i];
             unmatched_policy_ids[i] = other.unmatched_policy_ids[i];
+        }
         rebase_from(other);
     }
     AstFile& operator=(AstFile&& other) noexcept {
@@ -732,8 +748,10 @@ struct AstFile {
         strict_local_response_policies = other.strict_local_response_policies;
         exact_strict_local_response_bindings = other.exact_strict_local_response_bindings;
         strict_local_response_body_pool = other.strict_local_response_body_pool;
-        for (u32 i = 0; i < kStrictLocalResponseMethodSlots; i++)
+        for (u32 i = 0; i < kStrictLocalResponseMethodSlots; i++) {
+            pre_route_policy_ids[i] = other.pre_route_policy_ids[i];
             unmatched_policy_ids[i] = other.unmatched_policy_ids[i];
+        }
         redirect_policies = other.redirect_policies;
         redirect_policy_body_pool = other.redirect_policy_body_pool;
         rebase_from(other);
@@ -1042,6 +1060,7 @@ private:
                     }
                     break;
                 case AstItemKind::ExactStrictLocalResponse:
+                case AstItemKind::PreRoute:
                 case AstItemKind::Unmatched:
                     break;
                 case AstItemKind::Timer:

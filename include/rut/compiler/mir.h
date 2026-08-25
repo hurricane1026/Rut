@@ -516,6 +516,7 @@ struct MirModule {
     FixedVec<ForwardFailurePolicySpec, kMaxForwardFailurePolicies> failure_policies;
     FixedVec<StrictLocalResponsePolicySpec, kMaxStrictLocalResponsePolicies>
         strict_local_response_policies;
+    u16 pre_route_policy_ids[kStrictLocalResponseMethodSlots]{};
     u16 unmatched_policy_ids[kStrictLocalResponseMethodSlots]{};
     FixedVec<ExactStrictLocalResponseBinding, kMaxExactStrictLocalResponseBindings>
         exact_strict_local_response_bindings;
@@ -539,8 +540,10 @@ struct MirModule {
           variants(other.variants),
           functions(other.functions),
           type_shapes(other.type_shapes) {
-        for (u32 i = 0; i < kStrictLocalResponseMethodSlots; i++)
+        for (u32 i = 0; i < kStrictLocalResponseMethodSlots; i++) {
+            pre_route_policy_ids[i] = other.pre_route_policy_ids[i];
             unmatched_policy_ids[i] = other.unmatched_policy_ids[i];
+        }
     }
     MirModule& operator=(const MirModule& other) {
         if (this == &other) return *this;
@@ -549,8 +552,10 @@ struct MirModule {
         failure_policies = other.failure_policies;
         strict_local_response_policies = other.strict_local_response_policies;
         exact_strict_local_response_bindings = other.exact_strict_local_response_bindings;
-        for (u32 i = 0; i < kStrictLocalResponseMethodSlots; i++)
+        for (u32 i = 0; i < kStrictLocalResponseMethodSlots; i++) {
+            pre_route_policy_ids[i] = other.pre_route_policy_ids[i];
             unmatched_policy_ids[i] = other.unmatched_policy_ids[i];
+        }
         redirect_policies = other.redirect_policies;
         caches = other.caches;
         structs = other.structs;
@@ -571,8 +576,10 @@ struct MirModule {
           variants(other.variants),
           functions(other.functions),
           type_shapes(other.type_shapes) {
-        for (u32 i = 0; i < kStrictLocalResponseMethodSlots; i++)
+        for (u32 i = 0; i < kStrictLocalResponseMethodSlots; i++) {
+            pre_route_policy_ids[i] = other.pre_route_policy_ids[i];
             unmatched_policy_ids[i] = other.unmatched_policy_ids[i];
+        }
     }
     MirModule& operator=(MirModule&& other) noexcept {
         if (this == &other) return *this;
@@ -581,8 +588,10 @@ struct MirModule {
         failure_policies = other.failure_policies;
         strict_local_response_policies = other.strict_local_response_policies;
         exact_strict_local_response_bindings = other.exact_strict_local_response_bindings;
-        for (u32 i = 0; i < kStrictLocalResponseMethodSlots; i++)
+        for (u32 i = 0; i < kStrictLocalResponseMethodSlots; i++) {
+            pre_route_policy_ids[i] = other.pre_route_policy_ids[i];
             unmatched_policy_ids[i] = other.unmatched_policy_ids[i];
+        }
         redirect_policies = other.redirect_policies;
         caches = other.caches;
         structs = other.structs;

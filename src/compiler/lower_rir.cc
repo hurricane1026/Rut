@@ -3408,6 +3408,7 @@ FrontendResult<void> lower_to_rir(const MirModule& mir, FrontendRirModule& out) 
 
     if (!strict_local_response_source_table_valid(mir.strict_local_response_policies.data,
                                                   mir.strict_local_response_policies.len,
+                                                  mir.pre_route_policy_ids,
                                                   mir.unmatched_policy_ids,
                                                   mir.exact_strict_local_response_bindings.data,
                                                   mir.exact_strict_local_response_bindings.len,
@@ -3427,8 +3428,10 @@ FrontendResult<void> lower_to_rir(const MirModule& mir, FrontendRirModule& out) 
             return frontend_error(FrontendError::OutOfMemory);
     }
     out.module.strict_local_response_policy_count = mir.strict_local_response_policies.len;
-    for (u32 i = 0; i < kStrictLocalResponseMethodSlots; i++)
+    for (u32 i = 0; i < kStrictLocalResponseMethodSlots; i++) {
+        out.module.pre_route_policy_ids[i] = mir.pre_route_policy_ids[i];
         out.module.unmatched_policy_ids[i] = mir.unmatched_policy_ids[i];
+    }
     for (u32 i = 0; i < mir.exact_strict_local_response_bindings.len; i++)
         out.module.exact_strict_local_response_bindings[i] =
             mir.exact_strict_local_response_bindings[i];

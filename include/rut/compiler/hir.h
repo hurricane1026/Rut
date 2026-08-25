@@ -1396,6 +1396,7 @@ struct HirModule {
     FixedVec<ForwardFailurePolicySpec, kMaxForwardFailurePolicies> failure_policies;
     FixedVec<StrictLocalResponsePolicySpec, kMaxStrictLocalResponsePolicies>
         strict_local_response_policies;
+    u16 pre_route_policy_ids[kStrictLocalResponseMethodSlots]{};
     u16 unmatched_policy_ids[kStrictLocalResponseMethodSlots]{};
     FixedVec<ExactStrictLocalResponseBinding, kMaxExactStrictLocalResponseBindings>
         exact_strict_local_response_bindings;
@@ -1450,8 +1451,10 @@ struct HirModule {
           has_package_decl(other.has_package_decl),
           package_span(other.package_span),
           package_name(other.package_name) {
-        for (u32 i = 0; i < kStrictLocalResponseMethodSlots; i++)
+        for (u32 i = 0; i < kStrictLocalResponseMethodSlots; i++) {
+            pre_route_policy_ids[i] = other.pre_route_policy_ids[i];
             unmatched_policy_ids[i] = other.unmatched_policy_ids[i];
+        }
         rebase_type_alias_storage_ptrs(other);
     }
     HirModule& operator=(const HirModule& other) {
@@ -1461,8 +1464,10 @@ struct HirModule {
         failure_policies = other.failure_policies;
         strict_local_response_policies = other.strict_local_response_policies;
         exact_strict_local_response_bindings = other.exact_strict_local_response_bindings;
-        for (u32 i = 0; i < kStrictLocalResponseMethodSlots; i++)
+        for (u32 i = 0; i < kStrictLocalResponseMethodSlots; i++) {
+            pre_route_policy_ids[i] = other.pre_route_policy_ids[i];
             unmatched_policy_ids[i] = other.unmatched_policy_ids[i];
+        }
         redirect_policies = other.redirect_policies;
         has_listener = other.has_listener;
         listener = other.listener;

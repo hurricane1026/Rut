@@ -88,6 +88,7 @@ struct Parser {
         u32 body_len;
         u32 policy_len;
         u32 exact_binding_len;
+        u16 pre_route_policy_ids[kStrictLocalResponseMethodSlots]{};
         u16 method_policy_ids[kStrictLocalResponseMethodSlots]{};
         bool committed = false;
 
@@ -96,16 +97,20 @@ struct Parser {
               body_len(f->strict_local_response_body_pool.len),
               policy_len(f->strict_local_response_policies.len),
               exact_binding_len(f->exact_strict_local_response_bindings.len) {
-            for (u32 slot = 0; slot < kStrictLocalResponseMethodSlots; slot++)
+            for (u32 slot = 0; slot < kStrictLocalResponseMethodSlots; slot++) {
+                pre_route_policy_ids[slot] = f->pre_route_policy_ids[slot];
                 method_policy_ids[slot] = f->unmatched_policy_ids[slot];
+            }
         }
         ~StrictLocalResponseParseTransaction() {
             if (!committed) {
                 file->strict_local_response_body_pool.len = body_len;
                 file->strict_local_response_policies.len = policy_len;
                 file->exact_strict_local_response_bindings.len = exact_binding_len;
-                for (u32 slot = 0; slot < kStrictLocalResponseMethodSlots; slot++)
+                for (u32 slot = 0; slot < kStrictLocalResponseMethodSlots; slot++) {
+                    file->pre_route_policy_ids[slot] = pre_route_policy_ids[slot];
                     file->unmatched_policy_ids[slot] = method_policy_ids[slot];
+                }
             }
         }
         void commit() { committed = true; }
@@ -4814,6 +4819,77 @@ struct Parser {
         return item;
     }
 
+    FrontendResult<AstItem> parse_pre_route() {
+        const Token start = cur();
+        if (start.type != TokenType::Ident || !start.text.eq({"pre_route", 9}))
+            return frontend_error(FrontendError::UnexpectedToken, span_from(start), start.text);
+        pos++;
+
+        AstItem item{};
+        item.kind = AstItemKind::PreRoute;
+        u32 slot = kRouteMethodSlotInvalid;
+        if (is_method_keyword(cur().type)) {
+            item.pre_route.method = static_cast<u8>(cur().type);
+            switch (cur().type) {
+                case TokenType::KwGet:
+                    slot = kRouteMethodGet;
+                    break;
+                case TokenType::KwPost:
+                    slot = kRouteMethodPost;
+                    break;
+                case TokenType::KwPut:
+                    slot = kRouteMethodPut;
+                    break;
+                case TokenType::KwDelete:
+                    slot = kRouteMethodDelete;
+                    break;
+                case TokenType::KwPatch:
+                    slot = kRouteMethodPatch;
+                    break;
+                case TokenType::KwHead:
+                    slot = kRouteMethodHead;
+                    break;
+                case TokenType::KwOptions:
+                    slot = kRouteMethodOptions;
+                    break;
+                default:
+                    return frontend_error(
+                        FrontendError::UnsupportedSyntax, span_from(cur()), cur().text);
+            }
+            pos++;
+        } else if (cur().type == TokenType::Ident &&
+                   (cur().text.eq({"CONNECT", 7}) || cur().text.eq({"connect", 7}) ||
+                    cur().text.eq({"TRACE", 5}) || cur().text.eq({"trace", 5}))) {
+            item.pre_route.method = static_cast<u8>(TokenType::Ident);
+            slot = cur().text.len == 7 ? kRouteMethodConnect : kRouteMethodTrace;
+            pos++;
+        } else {
+            return frontend_error(FrontendError::UnsupportedSyntax, span_from(cur()), cur().text);
+        }
+
+        static_assert(kRouteMethodSlots == kStrictLocalResponseMethodSlots);
+        if (slot == kRouteMethodAny || slot >= kStrictLocalResponseMethodSlots)
+            return frontend_error(FrontendError::UnsupportedSyntax, span_from(start), start.text);
+        if (file->pre_route_policy_ids[slot] != 0)
+            return frontend_error(FrontendError::UnsupportedSyntax,
+                                  span_from(start),
+                                  lit_str("duplicate pre-route method selector"));
+
+        StrictLocalResponseParseTransaction transaction(file);
+        auto parsed = parse_strict_local_response_block(
+            start, slot, lit_str("HEAD pre-route policies must suppress body"));
+        if (!parsed) return core::make_unexpected(parsed.error());
+        const u16 policy_id = file->add_strict_local_response_policy(parsed->policy);
+        if (policy_id == 0) return frontend_error(FrontendError::TooManyItems, span_from(start));
+        file->pre_route_policy_ids[slot] = policy_id;
+        item.pre_route.method_slot = static_cast<u8>(slot);
+        item.pre_route.policy_id = policy_id;
+        item.span = Span{start.start, parsed->outer_rbrace->end, start.line, start.col};
+        item.pre_route.span = item.span;
+        transaction.commit();
+        return item;
+    }
+
     FrontendResult<AstItem> parse_exact_strict_local_response(const Token& kw_route) {
         const Token start = kw_route;
         AstItem item{};
@@ -5181,6 +5257,10 @@ FrontendResult<AstFile*> parse_file(const LexedTokens& tokens) {
                 break;
             }
             default:
+                if (p.cur().type == TokenType::Ident && p.cur().text.eq({"pre_route", 9})) {
+                    item = p.parse_pre_route();
+                    break;
+                }
                 if (p.cur().type == TokenType::Ident && p.cur().text.eq({"unmatched", 9})) {
                     item = p.parse_unmatched();
                     break;

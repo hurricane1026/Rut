@@ -42,6 +42,7 @@ enum class VerifyIssueCode : u8 {
     TooManyBlocks,
     UnreachableBlock,
     InvalidForwardPreflight,
+    InvalidPreRoutePolicyId,
 };
 
 struct VerifyIssue {
@@ -1016,7 +1017,22 @@ inline VerifyResult verify_module(const Module& mod, VerifyOptions options = {})
         exact_strict_local_response_inventory_present(
             mod.exact_strict_local_response_bindings,
             mod.exact_strict_local_response_binding_count);
-    if (!has_exact_strict_local_response_inventory &&
+    bool has_pre_route_metadata = false;
+    bool pre_route_referenced[kMaxStrictLocalResponsePolicies]{};
+    if (mod.pre_route_policy_ids[kRouteMethodAny] != 0)
+        return verify_fail(summary, VerifyIssueCode::InvalidPreRoutePolicyId, 0);
+    for (u32 slot = 1; slot < kStrictLocalResponseMethodSlots; slot++) {
+        const u16 id = mod.pre_route_policy_ids[slot];
+        if (id == 0) continue;
+        has_pre_route_metadata = true;
+        if (mod.strict_local_response_policy_count > kMaxStrictLocalResponsePolicies ||
+            id > mod.strict_local_response_policy_count || pre_route_referenced[id - 1] ||
+            (slot == kRouteMethodHead && mod.strict_local_response_policies[id - 1].head_mode !=
+                                             StrictLocalResponseHeadMode::SuppressBody))
+            return verify_fail(summary, VerifyIssueCode::InvalidPreRoutePolicyId, 0);
+        pre_route_referenced[id - 1] = true;
+    }
+    if (!has_pre_route_metadata && !has_exact_strict_local_response_inventory &&
         (!strict_local_response_policy_table_valid(mod.strict_local_response_policies,
                                                    mod.strict_local_response_policy_count,
                                                    mod.unmatched_policy_ids) ||
@@ -1029,6 +1045,7 @@ inline VerifyResult verify_module(const Module& mod, VerifyOptions options = {})
         return verify_fail(summary, VerifyIssueCode::InvalidUnmatchedPolicyId, 0);
     if (!strict_local_response_source_table_valid(mod.strict_local_response_policies,
                                                   mod.strict_local_response_policy_count,
+                                                  mod.pre_route_policy_ids,
                                                   mod.unmatched_policy_ids,
                                                   mod.exact_strict_local_response_bindings,
                                                   mod.exact_strict_local_response_binding_count,
@@ -1238,6 +1255,8 @@ inline const char* verify_issue_code_name(VerifyIssueCode code) {
             return "InvalidJumpTarget";
         case VerifyIssueCode::InvalidRedirectPolicyId:
             return "InvalidRedirectPolicyId";
+        case VerifyIssueCode::InvalidPreRoutePolicyId:
+            return "InvalidPreRoutePolicyId";
         case VerifyIssueCode::InvalidUnmatchedPolicyId:
             return "InvalidUnmatchedPolicyId";
         case VerifyIssueCode::InvalidExactStrictLocalResponseBinding:

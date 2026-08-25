@@ -847,6 +847,7 @@ static FrontendResult<MirValue> mir_value(const HirExpr& expr,
 FrontendResult<MirModule*> build_mir(const HirModule& module) {
     if (!strict_local_response_source_table_valid(module.strict_local_response_policies.data,
                                                   module.strict_local_response_policies.len,
+                                                  module.pre_route_policy_ids,
                                                   module.unmatched_policy_ids,
                                                   module.exact_strict_local_response_bindings.data,
                                                   module.exact_strict_local_response_bindings.len,
@@ -866,8 +867,10 @@ FrontendResult<MirModule*> build_mir(const HirModule& module) {
         if (!mir->strict_local_response_policies.push(module.strict_local_response_policies[i]))
             return frontend_error(FrontendError::TooManyItems, {});
     }
-    for (u32 i = 0; i < kStrictLocalResponseMethodSlots; i++)
+    for (u32 i = 0; i < kStrictLocalResponseMethodSlots; i++) {
+        mir->pre_route_policy_ids[i] = module.pre_route_policy_ids[i];
         mir->unmatched_policy_ids[i] = module.unmatched_policy_ids[i];
+    }
     for (u32 i = 0; i < module.exact_strict_local_response_bindings.len; i++) {
         if (!mir->exact_strict_local_response_bindings.push(
                 module.exact_strict_local_response_bindings[i]))

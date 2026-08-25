@@ -14682,11 +14682,42 @@ static FrontendResult<HirModule*> analyze_file_internal(
     static_assert(kRouteMethodSlots == kStrictLocalResponseMethodSlots);
     if (!strict_local_response_source_table_valid(file.strict_local_response_policies.data,
                                                   file.strict_local_response_policies.len,
+                                                  file.pre_route_policy_ids,
                                                   file.unmatched_policy_ids,
                                                   file.exact_strict_local_response_bindings.data,
                                                   file.exact_strict_local_response_bindings.len,
                                                   kMaxExactStrictLocalResponseBindings))
         return frontend_error(FrontendError::UnsupportedSyntax, {});
+    auto concrete_ast_method_matches = [](u8 method, u8 slot) {
+        const TokenType token = static_cast<TokenType>(method);
+        if (token == TokenType::KwGet) return slot == kRouteMethodGet;
+        if (token == TokenType::KwPost) return slot == kRouteMethodPost;
+        if (token == TokenType::KwPut) return slot == kRouteMethodPut;
+        if (token == TokenType::KwDelete) return slot == kRouteMethodDelete;
+        if (token == TokenType::KwPatch) return slot == kRouteMethodPatch;
+        if (token == TokenType::KwHead) return slot == kRouteMethodHead;
+        if (token == TokenType::KwOptions) return slot == kRouteMethodOptions;
+        return token == TokenType::Ident &&
+               (slot == kRouteMethodConnect || slot == kRouteMethodTrace);
+    };
+    bool pre_route_slots_seen[kStrictLocalResponseMethodSlots]{};
+    u32 pre_route_item_count = 0;
+    for (u32 i = 0; i < file.items.len; i++) {
+        const auto& item = file.items[i];
+        if (item.kind != AstItemKind::PreRoute) continue;
+        const u32 slot = item.pre_route.method_slot;
+        if (slot == kRouteMethodAny || slot >= kStrictLocalResponseMethodSlots ||
+            pre_route_slots_seen[slot] || item.pre_route.policy_id == 0 ||
+            item.pre_route.policy_id != file.pre_route_policy_ids[slot] ||
+            !concrete_ast_method_matches(item.pre_route.method, static_cast<u8>(slot)))
+            return frontend_error(FrontendError::UnsupportedSyntax, item.pre_route.span);
+        const auto& policy = file.strict_local_response_policies[item.pre_route.policy_id - 1];
+        if (slot == kRouteMethodHead &&
+            policy.head_mode != StrictLocalResponseHeadMode::SuppressBody)
+            return frontend_error(FrontendError::UnsupportedSyntax, item.pre_route.span);
+        pre_route_slots_seen[slot] = true;
+        pre_route_item_count++;
+    }
     bool unmatched_slots_seen[kStrictLocalResponseMethodSlots]{};
     u32 unmatched_item_count = 0;
     for (u32 i = 0; i < file.items.len; i++) {
@@ -14740,15 +14771,18 @@ static FrontendResult<HirModule*> analyze_file_internal(
                                   item.exact_strict_local_response.span);
         exact_item_count++;
     }
-    if (unmatched_item_count + exact_item_count != file.strict_local_response_policies.len ||
+    if (pre_route_item_count + unmatched_item_count + exact_item_count !=
+            file.strict_local_response_policies.len ||
         exact_item_count != file.exact_strict_local_response_bindings.len)
         return frontend_error(FrontendError::UnsupportedSyntax, {});
     for (u32 i = 0; i < file.strict_local_response_policies.len; i++) {
         if (!mod.strict_local_response_policies.push(file.strict_local_response_policies[i]))
             return frontend_error(FrontendError::TooManyItems, {});
     }
-    for (u32 i = 0; i < kStrictLocalResponseMethodSlots; i++)
+    for (u32 i = 0; i < kStrictLocalResponseMethodSlots; i++) {
+        mod.pre_route_policy_ids[i] = file.pre_route_policy_ids[i];
         mod.unmatched_policy_ids[i] = file.unmatched_policy_ids[i];
+    }
     for (u32 i = 0; i < file.exact_strict_local_response_bindings.len; i++) {
         if (!mod.exact_strict_local_response_bindings.push(
                 file.exact_strict_local_response_bindings[i]))

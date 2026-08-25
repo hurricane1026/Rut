@@ -15,6 +15,7 @@
 #include <fstream>
 #include <memory>
 #include <string>
+#include <vector>
 
 using namespace rut;
 
@@ -787,6 +788,133 @@ TEST(serve_loader, exact_strict_local_response_source_reaches_runtime_config) {
     REQUIRE(program.config.strict_local_response_table_is_valid());
     CHECK(program.config.has_exact_strict_local_response_inventory());
     CHECK_EQ(program.config.match_exact_strict_local_response({"/static", 7}, kRouteMethodGet), 1u);
+    program.destroy();
+}
+
+TEST(serve_loader, pre_route_source_installs_full_owned_deduplicated_selector_table) {
+    static constexpr char kSource[] = R"rut(
+upstream backend at "127.0.0.1:9000"
+pre_route TRACE { return local_response({
+  version: "HTTP/1.1", status: 405, reason: "Not Allowed", server: "nginx/1.29.7",
+  date: "current", content_type: "text/html", connection: "request",
+  head_mode: "reject", body: b"trace-rejected"
+}) }
+pre_route OPTIONS { return local_response({
+  version: "HTTP/1.1", status: 405, reason: "Not Allowed", server: "nginx/1.29.7",
+  date: "current", content_type: "text/html", connection: "request",
+  head_mode: "reject", body: b"trace-rejected"
+}) }
+route exact "/static" { return local_response({
+  version: "HTTP/1.1", status: 200, reason: "OK", server: "nginx/1.29.7",
+  date: "current", content_type: "text/plain", connection: "request",
+  head_mode: "suppress_body", body: b"successor-static"
+}) }
+route "/" { return forward(backend) }
+unmatched TRACE { return local_response({
+  version: "HTTP/1.1", status: 405, reason: "Not Allowed", server: "nginx/1.29.7",
+  date: "current", content_type: "text/html", connection: "request",
+  head_mode: "reject", body: b"trace-rejected"
+}) }
+)rut";
+    const std::string path =
+        write_file("/tmp/rut_serve_loader_pre_route_source", "app.rut", kSource);
+    LoadedProgram program;
+    LoadError err;
+    REQUIRE(load_rut_program(path.c_str(), program, err));
+    REQUIRE_EQ(program.rir.module.strict_local_response_policy_count, 4u);
+    CHECK_EQ(program.rir.module.pre_route_policy_ids[kRouteMethodTrace], 1u);
+    CHECK_EQ(program.rir.module.pre_route_policy_ids[kRouteMethodOptions], 2u);
+    CHECK_EQ(program.rir.module.exact_strict_local_response_bindings[0].policy_id, 3u);
+    CHECK_EQ(program.rir.module.unmatched_policy_ids[kRouteMethodTrace], 4u);
+    REQUIRE(program.config.strict_local_response_table_is_valid());
+    REQUIRE(program.config.has_pre_route_metadata());
+    REQUIRE(program.config.has_unmatched_metadata());
+    REQUIRE(program.config.has_exact_strict_local_response_inventory());
+    CHECK_EQ(program.config.route_count, 1u);
+    CHECK_EQ(program.config.upstream_count, 1u);
+    // Stable semantic dedup collapses the three equal 405 source policies.
+    REQUIRE_EQ(program.config.strict_local_response_policy_count, 2u);
+    CHECK_EQ(program.config.pre_route_policy_ids[kRouteMethodTrace], 1u);
+    CHECK_EQ(program.config.pre_route_policy_ids[kRouteMethodOptions], 1u);
+    CHECK_EQ(program.config.unmatched_policy_ids[kRouteMethodTrace], 1u);
+    CHECK_EQ(program.config.exact_strict_local_response_bindings[0].policy_id, 2u);
+    CHECK_EQ(program.config.pre_route_policy_id(kRouteMethodTrace), 1u);
+    CHECK_EQ(program.config.pre_route_policy_id(kRouteMethodOptions), 1u);
+    CHECK_EQ(program.config.match_exact_strict_local_response({"/static", 7}, kRouteMethodGet), 2u);
+    const auto& source_policy = program.rir.module.strict_local_response_policies[0];
+    const auto& owned = program.config.strict_local_response_policies[0];
+    CHECK(owned.reason.ptr != source_policy.reason.ptr);
+    CHECK(owned.server.ptr != source_policy.server.ptr);
+    CHECK(owned.content_type.ptr != source_policy.content_type.ptr);
+    CHECK(owned.body.ptr != source_policy.body.ptr);
+    CHECK(owned.reason.eq({"Not Allowed", 11}));
+    CHECK(owned.server.eq({"nginx/1.29.7", 12}));
+    CHECK(owned.content_type.eq({"text/html", 9}));
+    CHECK(owned.body.eq({"trace-rejected", 14}));
+
+    auto copied = std::make_unique<RouteConfig>();
+    REQUIRE(copied->copy_strict_local_response_table_from_owned(program.config));
+    REQUIRE(copied->strict_local_response_table_is_valid());
+    CHECK(copied->strict_local_response_policies[0].body.ptr != owned.body.ptr);
+    CHECK(copied->strict_local_response_policies[0].body.eq({"trace-rejected", 14}));
+    CHECK((Str{copied->exact_strict_local_response_bindings[0].path,
+               copied->exact_strict_local_response_bindings[0].path_len}
+               .eq({"/static", 7})));
+
+    // A forged full-table transaction is rejected before any destination byte
+    // changes, even though the module also contains an upstream and route.
+    auto forged = program.rir.module;
+    forged.pre_route_policy_ids[kRouteMethodAny] = 1;
+    auto destination = std::make_unique<RouteConfig>();
+    REQUIRE(destination->add_static("/kept", kRouteMethodGet, 207));
+    std::vector<u8> before(sizeof(RouteConfig));
+    __builtin_memcpy(before.data(), destination.get(), sizeof(RouteConfig));
+    CHECK_FALSE(populate_route_config(*destination, forged));
+    CHECK_EQ(__builtin_memcmp(before.data(), destination.get(), sizeof(RouteConfig)), 0);
+
+    // Compiler arena storage can disappear while the installed RouteConfig
+    // remains valid and independently owned.
+    program.rir.destroy();
+    REQUIRE(program.config.strict_local_response_table_is_valid());
+    CHECK_EQ(program.config.pre_route_policy_id(kRouteMethodTrace), 1u);
+    CHECK(program.config.strict_local_response_policies[0].reason.eq({"Not Allowed", 11}));
+    CHECK(program.config.strict_local_response_policies[0].body.eq({"trace-rejected", 14}));
+    CHECK((Str{program.config.exact_strict_local_response_bindings[0].path,
+               program.config.exact_strict_local_response_bindings[0].path_len}
+               .eq({"/static", 7})));
+
+    // The independently copied table likewise survives all LoadedProgram
+    // compiler/config storage destruction.
+    program.destroy();
+    REQUIRE(copied->strict_local_response_table_is_valid());
+    CHECK_EQ(copied->pre_route_policy_id(kRouteMethodTrace), 1u);
+    CHECK(copied->strict_local_response_policies[0].reason.eq({"Not Allowed", 11}));
+    CHECK(copied->strict_local_response_policies[0].body.eq({"trace-rejected", 14}));
+    CHECK((Str{copied->exact_strict_local_response_bindings[0].path,
+               copied->exact_strict_local_response_bindings[0].path_len}
+               .eq({"/static", 7})));
+}
+
+TEST(serve_loader, no_pre_route_source_keeps_pre_route_table_neutral) {
+    const std::string path = write_file(
+        "/tmp/rut_serve_loader_pre_route_neutral",
+        "app.rut",
+        "unmatched OPTIONS { return local_response({ version: \"HTTP/1.1\", status: 400, "
+        "reason: \"Bad Request\", server: \"rut\", date: \"current\", content_type: "
+        "\"text/plain\", connection: \"request\", head_mode: \"reject\", body: b\"x\" }) }\n"
+        "route exact GET \"/static\" { return local_response({ version: \"HTTP/1.1\", "
+        "status: 400, reason: \"Bad Request\", server: \"rut\", date: \"current\", "
+        "content_type: \"text/plain\", connection: \"request\", head_mode: \"reject\", "
+        "body: b\"y\" }) }\n");
+    LoadedProgram program;
+    LoadError err;
+    REQUIRE(load_rut_program(path.c_str(), program, err));
+    for (u32 slot = 0; slot < kStrictLocalResponseMethodSlots; slot++) {
+        CHECK_EQ(program.rir.module.pre_route_policy_ids[slot], 0u);
+        CHECK_EQ(program.config.pre_route_policy_ids[slot], 0u);
+    }
+    CHECK_FALSE(program.config.has_pre_route_metadata());
+    REQUIRE(program.config.strict_local_response_table_is_valid());
     program.destroy();
 }
 

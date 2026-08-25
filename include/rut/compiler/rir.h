@@ -493,6 +493,7 @@ struct Module {
     // zero in a canonical method slot means no configured action.
     StrictLocalResponsePolicySpec strict_local_response_policies[kMaxStrictLocalResponsePolicies]{};
     u32 strict_local_response_policy_count = 0;
+    u16 pre_route_policy_ids[kStrictLocalResponseMethodSlots]{};
     u16 unmatched_policy_ids[kStrictLocalResponseMethodSlots]{};
     ExactStrictLocalResponseBinding
         exact_strict_local_response_bindings[kMaxExactStrictLocalResponseBindings]{};

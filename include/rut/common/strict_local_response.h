@@ -192,19 +192,21 @@ inline bool strict_local_response_policy_table_valid(
     return true;
 }
 
-// Compiler-source ownership validator for the combined unmatched + exact
+// Compiler-source ownership validator for the combined pre-route + unmatched + exact
 // metadata contract.  Source IDs are intentionally single-use; a later
 // RouteConfig installer may semantically deduplicate equal policy specs while
 // remapping those independent source IDs.
 inline bool strict_local_response_source_table_valid(
     const StrictLocalResponsePolicySpec* policies,
     u32 policy_count,
+    const u16* pre_route_policy_ids,
     const u16* unmatched_policy_ids,
     const ExactStrictLocalResponseBinding* exact_bindings,
     u32 exact_binding_count,
     u32 exact_binding_capacity = kMaxExactStrictLocalResponseBindings) {
     if (policy_count > kMaxStrictLocalResponsePolicies || policies == nullptr ||
-        unmatched_policy_ids == nullptr || exact_bindings == nullptr ||
+        pre_route_policy_ids == nullptr || unmatched_policy_ids == nullptr ||
+        exact_bindings == nullptr ||
         exact_binding_capacity != kMaxExactStrictLocalResponseBindings ||
         exact_binding_count > exact_binding_capacity)
         return false;
@@ -228,6 +230,15 @@ inline bool strict_local_response_source_table_valid(
         reference_count++;
         return true;
     };
+    if (pre_route_policy_ids[kStrictLocalResponseAnyMethodSlot] != 0) return false;
+    for (u32 slot = 1; slot < kStrictLocalResponseMethodSlots; slot++) {
+        const u16 id = pre_route_policy_ids[slot];
+        if (id == 0) continue;
+        if (!add_reference(id)) return false;
+        if (slot == kStrictLocalResponseHeadMethodSlot &&
+            policies[id - 1].head_mode != StrictLocalResponseHeadMode::SuppressBody)
+            return false;
+    }
     for (u32 slot = 0; slot < kStrictLocalResponseMethodSlots; slot++) {
         const u16 id = unmatched_policy_ids[slot];
         if (id == 0) continue;
@@ -260,6 +271,26 @@ inline bool strict_local_response_source_table_valid(
         }
     }
     return reference_count == policy_count;
+}
+
+// Compatibility overload for compiler/runtime callers that intentionally have
+// no pre-route source metadata. New source pipelines use the complete overload
+// above so policy references are validated across all three selector classes.
+inline bool strict_local_response_source_table_valid(
+    const StrictLocalResponsePolicySpec* policies,
+    u32 policy_count,
+    const u16* unmatched_policy_ids,
+    const ExactStrictLocalResponseBinding* exact_bindings,
+    u32 exact_binding_count,
+    u32 exact_binding_capacity = kMaxExactStrictLocalResponseBindings) {
+    const u16 empty_pre_route[kStrictLocalResponseMethodSlots]{};
+    return strict_local_response_source_table_valid(policies,
+                                                    policy_count,
+                                                    empty_pre_route,
+                                                    unmatched_policy_ids,
+                                                    exact_bindings,
+                                                    exact_binding_count,
+                                                    exact_binding_capacity);
 }
 
 }  // namespace rut

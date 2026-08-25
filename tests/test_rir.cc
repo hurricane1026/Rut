@@ -1998,6 +1998,48 @@ TEST(RirVerifier, ExactStrictLocalResponseRejectsForgedInventory) {
     rejects(mod);
 }
 
+TEST(RirVerifier, PreRouteRejectsAnyBadIdsHeadModeAndCrossTableReuseBeforeIndexing) {
+    StrictLocalResponsePolicySpec policy{};
+    policy.version = StrictLocalResponseVersion::Http11;
+    policy.status_code = 400;
+    policy.date = StrictLocalResponseDate::Current;
+    policy.connection = StrictLocalResponseConnection::Request;
+    policy.head_mode = StrictLocalResponseHeadMode::Reject;
+    policy.reason = {"Bad Request", 11};
+    policy.content_type = {"text/plain", 10};
+    policy.server = {"rut", 3};
+    policy.body = {"x", 1};
+    auto valid = [&]() {
+        Module mod{};
+        mod.strict_local_response_policies[0] = policy;
+        mod.strict_local_response_policy_count = 1;
+        mod.pre_route_policy_ids[kRouteMethodTrace] = 1;
+        return mod;
+    };
+    REQUIRE(verify_module(valid()).ok);
+    auto rejects_id = [&](auto forge) {
+        Module mod = valid();
+        forge(mod);
+        CHECK_EQ(verify_module(mod).issue.code, VerifyIssueCode::InvalidPreRoutePolicyId);
+    };
+    rejects_id([](Module& mod) { mod.pre_route_policy_ids[kRouteMethodAny] = 1; });
+    rejects_id([](Module& mod) { mod.pre_route_policy_ids[kRouteMethodTrace] = 2; });
+    rejects_id([](Module& mod) { mod.strict_local_response_policy_count = 0; });
+    rejects_id([](Module& mod) { mod.pre_route_policy_ids[kRouteMethodOptions] = 1; });
+    rejects_id([](Module& mod) {
+        mod.pre_route_policy_ids[kRouteMethodTrace] = 0;
+        mod.pre_route_policy_ids[kRouteMethodHead] = 1;
+    });
+    rejects_id([](Module& mod) {
+        mod.strict_local_response_policy_count = kMaxStrictLocalResponsePolicies + 1;
+    });
+
+    Module cross = valid();
+    cross.unmatched_policy_ids[kRouteMethodOptions] = 1;
+    CHECK_EQ(verify_module(cross).issue.code,
+             VerifyIssueCode::InvalidExactStrictLocalResponseBinding);
+}
+
 TEST(RirVerifier, StrictLocalResponseRepresentation200RejectsEveryForgedProfileField) {
     static constexpr char kBody[] = "successor-static";
     StrictLocalResponsePolicySpec policy{};
@@ -2106,6 +2148,12 @@ TEST(RirPrinter, StrictLocalResponseForgedMetadataPrintsOneSafeMarker) {
     check_marker(*empty_forgery);
     empty_forgery = std::make_unique<Module>();
     empty_forgery->exact_strict_local_response_bindings[3].reserved1 = 1;
+    check_marker(*empty_forgery);
+    empty_forgery = std::make_unique<Module>();
+    empty_forgery->pre_route_policy_ids[kRouteMethodAny] = 0xffffu;
+    check_marker(*empty_forgery);
+    empty_forgery = std::make_unique<Module>();
+    empty_forgery->pre_route_policy_ids[kRouteMethodTrace] = 0xffffu;
     check_marker(*empty_forgery);
 }
 

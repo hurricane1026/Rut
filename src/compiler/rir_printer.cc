@@ -1038,8 +1038,10 @@ static const char* unmatched_method_name(u32 slot) {
 
 static bool has_strict_local_response_metadata(const Module& mod) {
     if (mod.strict_local_response_policy_count != 0) return true;
-    for (u32 slot = 0; slot < kStrictLocalResponseMethodSlots; slot++)
+    for (u32 slot = 0; slot < kStrictLocalResponseMethodSlots; slot++) {
+        if (mod.pre_route_policy_ids[slot] != 0) return true;
         if (mod.unmatched_policy_ids[slot] != 0) return true;
+    }
     return exact_strict_local_response_inventory_present(
         mod.exact_strict_local_response_bindings, mod.exact_strict_local_response_binding_count);
 }
@@ -1047,6 +1049,7 @@ static bool has_strict_local_response_metadata(const Module& mod) {
 static bool printable_strict_local_response_table(const Module& mod) {
     return strict_local_response_source_table_valid(mod.strict_local_response_policies,
                                                     mod.strict_local_response_policy_count,
+                                                    mod.pre_route_policy_ids,
                                                     mod.unmatched_policy_ids,
                                                     mod.exact_strict_local_response_bindings,
                                                     mod.exact_strict_local_response_binding_count,
@@ -1122,6 +1125,21 @@ void print_module(PrintBuf& buf, const Module& mod) {
                 buf.put_cstr(", body=");
                 print_redirect_body(buf, policy.body);
                 buf.newline();
+            }
+            bool has_pre_route = false;
+            for (u32 slot = 1; slot < kStrictLocalResponseMethodSlots; slot++)
+                has_pre_route |= mod.pre_route_policy_ids[slot] != 0;
+            if (has_pre_route) {
+                buf.put_cstr("pre_route:");
+                buf.newline();
+                for (u32 slot = 1; slot < kStrictLocalResponseMethodSlots; slot++) {
+                    if (mod.pre_route_policy_ids[slot] == 0) continue;
+                    buf.put_cstr("  ");
+                    buf.put_cstr(unmatched_method_name(slot));
+                    buf.put_cstr(" -> local_response#");
+                    buf.put_u32(mod.pre_route_policy_ids[slot]);
+                    buf.newline();
+                }
             }
             buf.put_cstr("unmatched:");
             buf.newline();
