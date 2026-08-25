@@ -3,6 +3,15 @@
 namespace rut::nginx {
 namespace {
 
+static constexpr char kTraceBody[] =
+    "<html>\\r\\n"
+    "<head><title>405 Not Allowed</title></head>\\r\\n"
+    "<body>\\r\\n"
+    "<center><h1>405 Not Allowed</h1></center>\\r\\n"
+    "<hr><center>nginx/1.29.7</center>\\r\\n"
+    "</body>\\r\\n"
+    "</html>\\r\\n";
+
 constexpr bool eq(Str a, const char* b, u32 n) {
     if (a.ptr == nullptr || a.len != n) return false;
     for (u32 i = 0; i < n; i++) {
@@ -108,6 +117,39 @@ FrontendResult<bool> validate_exact_local_return(const Server& server) {
         response.body_span.end - response.body_span.start != response.body.len)
         return unsupported(exact_local_return_span(server),
                            lit_str("invalid exact local return response spans"));
+    return true;
+}
+
+Span pre_route_trace_span(const Server& server) {
+    return is_valid_span(server.pre_route_trace.span) ? server.pre_route_trace.span
+                                                      : model_span(server);
+}
+
+FrontendResult<bool> validate_pre_route_trace(const Server& server, bool exact_present) {
+    const ImplicitPreRouteTrace& trace = server.pre_route_trace;
+    switch (trace.profile) {
+        case ImplicitPreRouteProfile::None:
+            if (!is_default_span(trace.span))
+                return unsupported(pre_route_trace_span(server),
+                                   lit_str("invalid absent pre-route TRACE model"));
+            if (exact_present)
+                return unsupported(exact_local_return_span(server),
+                                   lit_str("missing pre-route TRACE model"));
+            return false;
+        case ImplicitPreRouteProfile::Nginx1297PreLocationTrace405:
+            break;
+        default:
+            return unsupported(pre_route_trace_span(server),
+                               lit_str("invalid pre-route TRACE profile model"));
+    }
+    if (!exact_present)
+        return unsupported(pre_route_trace_span(server),
+                           lit_str("pre-route TRACE requires exact local return"));
+    const ExactLocalReturnLocation& exact = server.exact_local_return;
+    if (!is_valid_span(trace.span) || !span_position_is_coherent(server.span, trace.span) ||
+        trace.span.start != exact.span.start || trace.span.end != exact.span.end ||
+        trace.span.line != exact.span.line || trace.span.col != exact.span.col)
+        return unsupported(pre_route_trace_span(server), lit_str("invalid pre-route TRACE spans"));
     return true;
 }
 
@@ -273,6 +315,18 @@ bool put_unmatched(Writer& writer,
            writer.put_lit(body, body_len) && writer.put_lit(kClose, sizeof(kClose) - 1);
 }
 
+bool put_pre_route_trace(Writer& writer, ImplicitPreRouteProfile profile) {
+    if (profile != ImplicitPreRouteProfile::Nginx1297PreLocationTrace405) return false;
+    return writer.put_cstr("pre_route TRACE { return local_response({\n") &&
+           writer.put_cstr(
+               "  version: \"HTTP/1.1\", status: 405, reason: \"Not Allowed\", server: "
+               "\"nginx/1.29.7\",\n") &&
+           writer.put_cstr(
+               "  date: \"current\", content_type: \"text/html\", connection: \"request\",\n") &&
+           writer.put_cstr("  head_mode: \"reject\", body: b\"") &&
+           writer.put_lit(kTraceBody, sizeof(kTraceBody) - 1u) && writer.put_cstr("\"\n}) }\n");
+}
+
 bool put_request_policy(Writer& writer) {
     return writer.put_cstr("request_policy: {\n") &&
            writer.put_cstr("            version: \"HTTP/1.1\",\n") &&
@@ -357,6 +411,8 @@ bool put_exact_local_return(Writer& writer, Str body) {
 FrontendResult<RutSource> lower_to_rut(const Server& server) {
     auto exact_local_return = validate_exact_local_return(server);
     if (!exact_local_return) return core::make_unexpected(exact_local_return.error());
+    auto pre_route_trace = validate_pre_route_trace(server, exact_local_return.value());
+    if (!pre_route_trace) return core::make_unexpected(pre_route_trace.error());
     auto timeout = validate_proxy_read_timeout(server);
     if (!timeout) return core::make_unexpected(timeout.error());
     if (server.listen.port == 0)
@@ -399,6 +455,9 @@ FrontendResult<RutSource> lower_to_rut(const Server& server) {
         !put("upstream nginx_upstream at \"") ||
         !writer.put_ipv4(server.location.proxy_pass.address) || !put(":") ||
         !writer.put_u16(proxy.port) || !put("\"\n"))
+        return fail_overflow();
+
+    if (pre_route_trace.value() && !put_pre_route_trace(writer, server.pre_route_trace.profile))
         return fail_overflow();
 
     // These policies cover only the converter's bounded unmatched-request

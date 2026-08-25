@@ -84,6 +84,11 @@ TEST(nginx_parser, parses_minimal_server_and_spans) {
     CHECK_EQ(result.value().exact_local_return.path.ptr, nullptr);
     CHECK_EQ(result.value().exact_local_return.path.len, 0u);
     CHECK_EQ(result.value().exact_local_return.response.status, 0u);
+    CHECK(result.value().pre_route_trace.profile == nginx::ImplicitPreRouteProfile::None);
+    CHECK_EQ(result.value().pre_route_trace.span.start, 0u);
+    CHECK_EQ(result.value().pre_route_trace.span.end, 0u);
+    CHECK_EQ(result.value().pre_route_trace.span.line, 1u);
+    CHECK_EQ(result.value().pre_route_trace.span.col, 1u);
 }
 
 TEST(nginx_parser, parses_root_proxy_and_exact_local_return_in_either_order) {
@@ -118,6 +123,12 @@ TEST(nginx_parser, parses_root_proxy_and_exact_local_return_in_either_order) {
         CHECK_EQ(server.exact_local_return.response.body_span.end -
                      server.exact_local_return.response.body_span.start,
                  server.exact_local_return.response.body.len);
+        REQUIRE(server.pre_route_trace.profile ==
+                nginx::ImplicitPreRouteProfile::Nginx1297PreLocationTrace405);
+        CHECK_EQ(server.pre_route_trace.span.start, server.exact_local_return.span.start);
+        CHECK_EQ(server.pre_route_trace.span.end, server.exact_local_return.span.end);
+        CHECK_EQ(server.pre_route_trace.span.line, server.exact_local_return.span.line);
+        CHECK_EQ(server.pre_route_trace.span.col, server.exact_local_return.span.col);
     };
     check(root_first, sizeof(root_first) - 1u, 3, 4);
     check(exact_first, sizeof(exact_first) - 1u, 4, 3);
@@ -872,11 +883,31 @@ TEST(nginx_converter, lowers_exact_local_return_in_either_declaration_order_to_s
         "  date: \"current\", content_type: \"text/plain\", connection: \"request\",\n"
         "  head_mode: \"suppress_body\", body: b\"successor-static\"\n"
         "}) }\n";
+    static constexpr char kTraceGolden[] =
+        "pre_route TRACE { return local_response({\n"
+        "  version: \"HTTP/1.1\", status: 405, reason: \"Not Allowed\", server: \"nginx/1.29.7\",\n"
+        "  date: \"current\", content_type: \"text/html\", connection: \"request\",\n"
+        "  head_mode: \"reject\", body: b\"<html>\\r\\n<head><title>405 Not "
+        "Allowed</title></head>\\r\\n"
+        "<body>\\r\\n<center><h1>405 Not Allowed</h1></center>\\r\\n"
+        "<hr><center>nginx/1.29.7</center>\\r\\n</body>\\r\\n</html>\\r\\n\"\n"
+        "}) }\n";
+    const u32 common_prefix_len =
+        static_cast<u32>(strlen("listen :8080\nupstream nginx_upstream at \"127.0.0.1:9000\"\n"));
     REQUIRE_EQ(root_lowered.value().len,
-               legacy.value().len + static_cast<u32>(sizeof(kExactGolden) - 1u));
-    CHECK((Str{root_lowered.value().data, legacy.value().len}.eq(legacy.value().view())));
-    CHECK((Str{root_lowered.value().data + legacy.value().len,
-               root_lowered.value().len - legacy.value().len}
+               legacy.value().len + static_cast<u32>(sizeof(kTraceGolden) - 1u) +
+                   static_cast<u32>(sizeof(kExactGolden) - 1u));
+    CHECK((Str{root_lowered.value().data, common_prefix_len}.eq(
+        Str{legacy.value().data, common_prefix_len})));
+    CHECK((Str{root_lowered.value().data + common_prefix_len, sizeof(kTraceGolden) - 1u}.eq(
+        {kTraceGolden, sizeof(kTraceGolden) - 1u})));
+    const u32 suffix_len = legacy.value().len - common_prefix_len;
+    CHECK(
+        (Str{root_lowered.value().data + common_prefix_len + sizeof(kTraceGolden) - 1u, suffix_len}
+             .eq({legacy.value().data + common_prefix_len, suffix_len})));
+    CHECK((Str{root_lowered.value().data + root_lowered.value().len -
+                   static_cast<u32>(sizeof(kExactGolden) - 1u),
+               sizeof(kExactGolden) - 1u}
                .eq({kExactGolden, sizeof(kExactGolden) - 1u})));
 }
 
@@ -889,7 +920,7 @@ TEST(nginx_converter, exact_local_return_maximum_body_fits_bounded_source) {
         snprintf(source,
                  sizeof(source),
                  "server { listen 65535; location / { proxy_pass "
-                 "http://127.0.0.1:65535; } location = /static { return 200 \"%s\"; } }",
+                 "http://255.255.255.255:65535; } location = /static { return 200 \"%s\"; } }",
                  kBody);
     REQUIRE_GT(len, 0);
     REQUIRE_LT(static_cast<u32>(len), static_cast<u32>(sizeof(source)));
@@ -897,7 +928,8 @@ TEST(nginx_converter, exact_local_return_maximum_body_fits_bounded_source) {
     REQUIRE(parsed);
     const auto lowered = nginx::lower_to_rut(parsed.value());
     REQUIRE(lowered);
-    CHECK_EQ(lowered.value().len, 5200u);
+    CHECK_EQ(lowered.value().len, 5609u);
+    CHECK_EQ(nginx::RutSource::kCapacity, 5610u);
     CHECK_LT(lowered.value().len, nginx::RutSource::kCapacity);
     const auto lexed = lex(lowered.value().view());
     REQUIRE(lexed);
@@ -976,6 +1008,34 @@ TEST(nginx_converter, rejects_forged_exact_local_return_model_inconsistencies) {
     auto api_fallback = parsed.value();
     api_fallback.location = api_server().location;
     expect_rejected(api_fallback, lit_str("exact local return requires location / fallback"));
+
+    auto missing_trace = parsed.value();
+    missing_trace.pre_route_trace = {};
+    expect_rejected(missing_trace, lit_str("missing pre-route TRACE model"));
+    auto unknown_trace_profile = parsed.value();
+    unknown_trace_profile.pre_route_trace.profile =
+        static_cast<nginx::ImplicitPreRouteProfile>(0xff);
+    expect_rejected(unknown_trace_profile, lit_str("invalid pre-route TRACE profile model"));
+    auto bad_trace_start = parsed.value();
+    bad_trace_start.pre_route_trace.span.start++;
+    expect_rejected(bad_trace_start, lit_str("invalid pre-route TRACE spans"));
+    auto bad_trace_end = parsed.value();
+    bad_trace_end.pre_route_trace.span.end++;
+    expect_rejected(bad_trace_end, lit_str("invalid pre-route TRACE spans"));
+    auto bad_trace_line = parsed.value();
+    bad_trace_line.pre_route_trace.span.line++;
+    expect_rejected(bad_trace_line, lit_str("invalid pre-route TRACE spans"));
+    auto bad_trace_col = parsed.value();
+    bad_trace_col.pre_route_trace.span.col++;
+    expect_rejected(bad_trace_col, lit_str("invalid pre-route TRACE spans"));
+    auto absent_trace_inventory = canonical_server();
+    absent_trace_inventory.pre_route_trace.span = canonical_server().span;
+    expect_rejected(absent_trace_inventory, lit_str("invalid absent pre-route TRACE model"));
+    auto trace_without_exact = canonical_server();
+    trace_without_exact.pre_route_trace.profile =
+        nginx::ImplicitPreRouteProfile::Nginx1297PreLocationTrace405;
+    trace_without_exact.pre_route_trace.span = canonical_server().span;
+    expect_rejected(trace_without_exact, lit_str("pre-route TRACE requires exact local return"));
 }
 
 TEST(nginx_converter, lowers_canonical_model_to_stable_rut_source) {
@@ -1257,15 +1317,21 @@ TEST(nginx_converter, emitted_exact_source_reaches_owned_runtime_config) {
         auto ast = parse_file(lexed.value());
         REQUIRE(ast);
         std::unique_ptr<AstFile> ast_owned(ast.value());
-        REQUIRE_EQ(ast_owned->items.len, 9u);
-        CHECK(ast_owned->items[8].kind == AstItemKind::ExactStrictLocalResponse);
+        REQUIRE_EQ(ast_owned->items.len, 10u);
+        CHECK(ast_owned->items[2].kind == AstItemKind::PreRoute);
+        CHECK(ast_owned->items[9].kind == AstItemKind::ExactStrictLocalResponse);
         REQUIRE_EQ(ast_owned->exact_strict_local_response_bindings.len, 1u);
-        REQUIRE_EQ(ast_owned->strict_local_response_policies.len, 4u);
+        REQUIRE_EQ(ast_owned->strict_local_response_policies.len, 5u);
+        CHECK_EQ(ast_owned->pre_route_policy_ids[kRouteMethodTrace], 1u);
+        CHECK(ast_owned->strict_local_response_policies[0].body.eq(
+            lit_str("<html>\r\n<head><title>405 Not Allowed</title></head>\r\n"
+                    "<body>\r\n<center><h1>405 Not Allowed</h1></center>\r\n"
+                    "<hr><center>nginx/1.29.7</center>\r\n</body>\r\n</html>\r\n")));
         const auto& ast_binding = ast_owned->exact_strict_local_response_bindings[0];
         CHECK_EQ(ast_binding.method, kRouteMethodAny);
-        CHECK_EQ(ast_binding.policy_id, 4u);
+        CHECK_EQ(ast_binding.policy_id, 5u);
         CHECK((Str{ast_binding.path, ast_binding.path_len}.eq(lit_str("/static"))));
-        const auto& ast_policy = ast_owned->strict_local_response_policies[3];
+        const auto& ast_policy = ast_owned->strict_local_response_policies[4];
         CHECK(ast_policy.version == StrictLocalResponseVersion::Http11);
         CHECK_EQ(ast_policy.status_code, 200u);
         CHECK(ast_policy.reason.eq(lit_str("OK")));
@@ -1281,16 +1347,18 @@ TEST(nginx_converter, emitted_exact_source_reaches_owned_runtime_config) {
         std::unique_ptr<HirModule> hir_owned(hir.value());
         REQUIRE_EQ(hir_owned->routes.len, 3u);
         REQUIRE_EQ(hir_owned->exact_strict_local_response_bindings.len, 1u);
-        REQUIRE_EQ(hir_owned->strict_local_response_policies.len, 4u);
+        REQUIRE_EQ(hir_owned->strict_local_response_policies.len, 5u);
+        CHECK_EQ(hir_owned->pre_route_policy_ids[kRouteMethodTrace], 1u);
         CHECK_EQ(hir_owned->exact_strict_local_response_bindings[0].method, kRouteMethodAny);
-        CHECK_EQ(hir_owned->exact_strict_local_response_bindings[0].policy_id, 4u);
+        CHECK_EQ(hir_owned->exact_strict_local_response_bindings[0].policy_id, 5u);
 
         auto mir = build_mir(*hir_owned);
         REQUIRE(mir);
         std::unique_ptr<MirModule> mir_owned(mir.value());
         REQUIRE_EQ(mir_owned->functions.len, 3u);
         REQUIRE_EQ(mir_owned->exact_strict_local_response_bindings.len, 1u);
-        REQUIRE_EQ(mir_owned->strict_local_response_policies.len, 4u);
+        REQUIRE_EQ(mir_owned->strict_local_response_policies.len, 5u);
+        CHECK_EQ(mir_owned->pre_route_policy_ids[kRouteMethodTrace], 1u);
         CHECK_EQ(mir_owned->exact_strict_local_response_bindings[0].method, kRouteMethodAny);
         for (u32 i = 0; i < mir_owned->functions.len; i++)
             CHECK(mir_owned->functions[i].path.eq(lit_str("/")));
@@ -1301,10 +1369,10 @@ TEST(nginx_converter, emitted_exact_source_reaches_owned_runtime_config) {
         REQUIRE(rir::verify_module(rir.module).ok);
         REQUIRE_EQ(rir.module.func_count, 3u);
         REQUIRE_EQ(rir.module.exact_strict_local_response_binding_count, 1u);
-        REQUIRE_EQ(rir.module.strict_local_response_policy_count, 4u);
+        REQUIRE_EQ(rir.module.strict_local_response_policy_count, 5u);
         const auto& rir_binding = rir.module.exact_strict_local_response_bindings[0];
         CHECK_EQ(rir_binding.method, kRouteMethodAny);
-        CHECK_EQ(rir_binding.policy_id, 4u);
+        CHECK_EQ(rir_binding.policy_id, 5u);
         CHECK((Str{rir_binding.path, rir_binding.path_len}.eq(lit_str("/static"))));
         for (u32 i = 1; i < kMaxExactStrictLocalResponseBindings; i++)
             CHECK(exact_strict_local_response_binding_is_neutral(
@@ -1313,12 +1381,38 @@ TEST(nginx_converter, emitted_exact_source_reaches_owned_runtime_config) {
         memset(lowered.value().data, 'y', lowered.value().len);
     }
 
+    // nginx/source/compiler storage above has either been overwritten or
+    // destroyed. Resolve runtime IDs only now: installation may semantically
+    // deduplicate source policy IDs (TRACE and unmatched CONNECT are equal).
     REQUIRE(populated->strict_local_response_table_is_valid());
     // Exact policies are installed as dispatch metadata rather than executable
     // route functions. The three root fallbacks remain RIR functions above;
     // production dispatch consults this owned exact table before that prefix
     // route table is entered.
     REQUIRE_EQ(populated->route_count, 0u);
+    const u16 trace_id = populated->pre_route_policy_id(kRouteMethodTrace);
+    REQUIRE_NE(trace_id, 0u);
+    REQUIRE(populated->strict_local_response_policy_id_is_owned(trace_id));
+    CHECK_EQ(trace_id, populated->unmatched_policy_ids[kRouteMethodConnect]);
+    const auto& trace_policy = populated->strict_local_response_policies[trace_id - 1u];
+    CHECK(trace_policy.version == StrictLocalResponseVersion::Http11);
+    CHECK_EQ(trace_policy.status_code, 405u);
+    CHECK(trace_policy.reason.eq(lit_str("Not Allowed")));
+    CHECK(trace_policy.server.eq(lit_str("nginx/1.29.7")));
+    CHECK(trace_policy.date == StrictLocalResponseDate::Current);
+    CHECK(trace_policy.content_type.eq(lit_str("text/html")));
+    CHECK(trace_policy.connection == StrictLocalResponseConnection::Request);
+    CHECK(trace_policy.head_mode == StrictLocalResponseHeadMode::Reject);
+    static constexpr char kDecodedTraceBody[] =
+        "<html>\r\n"
+        "<head><title>405 Not Allowed</title></head>\r\n"
+        "<body>\r\n"
+        "<center><h1>405 Not Allowed</h1></center>\r\n"
+        "<hr><center>nginx/1.29.7</center>\r\n"
+        "</body>\r\n"
+        "</html>\r\n";
+    static_assert(sizeof(kDecodedTraceBody) - 1u == 157u);
+    CHECK(trace_policy.body.eq({kDecodedTraceBody, sizeof(kDecodedTraceBody) - 1u}));
     REQUIRE_EQ(populated->exact_strict_local_response_binding_count, 1u);
     CHECK((Str{populated->exact_strict_local_response_bindings[0].path,
                populated->exact_strict_local_response_bindings[0].path_len}

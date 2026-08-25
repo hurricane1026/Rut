@@ -177,6 +177,10 @@ public:
         if (have_exact_location && !eq(result.location.path, "/", 1))
             return unsupported(result.location.path_span,
                                lit_str("exact location requires location / proxy fallback"));
+        if (have_exact_location) {
+            result.pre_route_trace.profile = ImplicitPreRouteProfile::Nginx1297PreLocationTrace405;
+            result.pre_route_trace.span = result.exact_local_return.span;
+        }
         if (cur_.kind != TokenKind::End) {
             if (cur_.kind == TokenKind::Word && eq(cur_.text, "server", 6))
                 return unsupported(cur_.span, lit_str("multiple servers are unsupported"));

@@ -57,6 +57,22 @@ struct ExactLocalReturnLocation {
     LocalReturn response{};
 };
 
+// Closed canonical profiles for implicit nginx behavior that precedes route
+// selection.  This is semantic-model metadata, not an nginx directive or a
+// runtime mode; the converter owns every emitted policy byte for each profile.
+enum class ImplicitPreRouteProfile : u8 {
+    None,
+    Nginx1297PreLocationTrace405,
+};
+
+// nginx rejects TRACE during request processing, before location selection, in
+// the bounded root-proxy plus exact-local fragment. `span` is the exact source
+// location whose accepted shape establishes that semantic fact.
+struct ImplicitPreRouteTrace {
+    ImplicitPreRouteProfile profile = ImplicitPreRouteProfile::None;
+    Span span{};
+};
+
 struct Server {
     Span span{};
     Listen listen{};
@@ -64,6 +80,7 @@ struct Server {
     // order. `exact_local_return` is the optional exact selector/action.
     Location location{};
     ExactLocalReturnLocation exact_local_return{};
+    ImplicitPreRouteTrace pre_route_trace{};
 };
 
 // Parse exactly one minimal nginx server fragment. The returned model borrows
