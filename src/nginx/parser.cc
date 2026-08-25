@@ -103,6 +103,7 @@ struct ParsedLocation {
     bool exact = false;
     Location proxy{};
     ExactLocalReturnLocation local{};
+    ExactAbsoluteRedirectLocation redirect{};
 };
 
 class Parser {
@@ -147,7 +148,10 @@ public:
                 if (parsed.value().exact) {
                     if (have_exact_location)
                         return unsupported(location_span, lit_str("duplicate exact location"));
-                    result.exact_local_return = parsed.value().local;
+                    if (parsed.value().local.present)
+                        result.exact_local_return = parsed.value().local;
+                    else
+                        result.exact_absolute_redirect = parsed.value().redirect;
                     have_exact_location = true;
                 } else {
                     if (have_proxy_location)
@@ -169,9 +173,13 @@ public:
         advance();
         if (!have_listen) return unsupported(result.span, lit_str("missing listen"));
         if (!have_proxy_location) {
-            if (have_exact_location)
-                return unsupported(result.exact_local_return.span,
+            if (have_exact_location) {
+                const Span exact_span = result.exact_local_return.present
+                                            ? result.exact_local_return.span
+                                            : result.exact_absolute_redirect.span;
+                return unsupported(exact_span,
                                    lit_str("exact location requires a root proxy fallback"));
+            }
             return unsupported(result.span, lit_str("missing location"));
         }
         if (have_exact_location && !eq(result.location.path, "/", 1))
@@ -312,18 +320,28 @@ private:
         const Token path = cur_;
         if (contains(path.text, '$'))
             return unsupported(path.span, lit_str("variables are unsupported"));
-        if (!eq(path.text, "/static", 7))
-            return unsupported(path.span, lit_str("only exact location = /static is supported"));
+        const bool is_local_return = eq(path.text, "/static", 7);
+        const bool is_absolute_redirect = eq(path.text, "/old", 4);
+        if (!is_local_return && !is_absolute_redirect)
+            return unsupported(path.span,
+                               lit_str("only exact location = /static or /old is supported"));
         advance();
         if (!expect(TokenKind::LBrace, lit_str("expected '{' after exact location path")))
             return core::make_unexpected(error_);
 
         ParsedLocation parsed{};
         parsed.exact = true;
-        ExactLocalReturnLocation& result = parsed.local;
-        result.present = true;
-        result.path = path.text;
-        result.path_span = path.span;
+        ExactLocalReturnLocation& local = parsed.local;
+        ExactAbsoluteRedirectLocation& redirect = parsed.redirect;
+        if (is_local_return) {
+            local.present = true;
+            local.path = path.text;
+            local.path_span = path.span;
+        } else {
+            redirect.present = true;
+            redirect.path = path.text;
+            redirect.path_span = path.span;
+        }
         bool have_return = false;
         while (cur_.kind != TokenKind::RBrace && cur_.kind != TokenKind::End) {
             if (cur_.kind != TokenKind::Word)
@@ -331,9 +349,15 @@ private:
             if (eq(cur_.text, "return", 6)) {
                 if (have_return)
                     return unsupported(cur_.span, lit_str("duplicate return directive"));
-                auto response = parse_local_return();
-                if (!response) return core::make_unexpected(response.error());
-                result.response = response.value();
+                if (is_local_return) {
+                    auto response = parse_local_return();
+                    if (!response) return core::make_unexpected(response.error());
+                    local.response = response.value();
+                } else {
+                    auto response = parse_absolute_redirect();
+                    if (!response) return core::make_unexpected(response.error());
+                    redirect.response = response.value();
+                }
                 have_return = true;
             } else if (eq(cur_.text, "proxy_pass", 10)) {
                 return unsupported(cur_.span,
@@ -350,8 +374,64 @@ private:
         advance();
         if (!have_return)
             return unsupported(end, lit_str("missing return directive in exact location"));
-        result.span = Span{start.start, end.end, start.line, start.col};
+        if (is_local_return)
+            local.span = Span{start.start, end.end, start.line, start.col};
+        else
+            redirect.span = Span{start.start, end.end, start.line, start.col};
         return parsed;
+    }
+
+    FrontendResult<AbsoluteRedirect> parse_absolute_redirect() {
+        constexpr Str kTarget = lit_str("http://redirect.example/new");
+        constexpr u32 kAuthorityOffset = 7;
+        constexpr u32 kAuthorityLen = 16;
+        constexpr u32 kPathOffset = kAuthorityOffset + kAuthorityLen;
+
+        const Span start = cur_.span;
+        advance();
+        if (cur_.kind == TokenKind::End)
+            return missing(cur_.span, lit_str("return requires status and target"));
+        if (cur_.kind != TokenKind::Word)
+            return invalid(cur_.span, lit_str("return requires status and target"));
+        const Token status = cur_;
+        if (!eq(status.text, "301", 3))
+            return unsupported(status.span, lit_str("only redirect status 301 is supported"));
+        advance();
+        if (cur_.kind == TokenKind::End)
+            return missing(cur_.span, lit_str("return requires an absolute target"));
+        if (cur_.kind != TokenKind::Word)
+            return invalid(cur_.span, lit_str("return requires an absolute target"));
+        const Token target = cur_;
+        if (!target.text.eq(kTarget))
+            return unsupported(
+                target.span,
+                lit_str("only redirect target http://redirect.example/new is supported"));
+        advance();
+        if (cur_.kind == TokenKind::End)
+            return missing(cur_.span, lit_str("expected ';' after return"));
+        if (cur_.kind != TokenKind::Semicolon) {
+            if (cur_.kind == TokenKind::Word)
+                return invalid(cur_.span, lit_str("return accepts exactly status and target"));
+            return invalid(cur_.span, lit_str("expected ';' after return"));
+        }
+        const Span end = cur_.span;
+        advance();
+        return AbsoluteRedirect{
+            301,
+            status.span,
+            target.text,
+            target.span,
+            target.text.slice(kAuthorityOffset, kAuthorityOffset + kAuthorityLen),
+            Span{target.span.start + kAuthorityOffset,
+                 target.span.start + kAuthorityOffset + kAuthorityLen,
+                 target.span.line,
+                 target.span.col + kAuthorityOffset},
+            target.text.slice(kPathOffset, target.text.len),
+            Span{target.span.start + kPathOffset,
+                 target.span.end,
+                 target.span.line,
+                 target.span.col + kPathOffset},
+            Span{start.start, end.end, start.line, start.col}};
     }
 
     FrontendResult<LocalReturn> parse_local_return() {

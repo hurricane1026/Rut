@@ -67,6 +67,35 @@ Span exact_local_return_span(const Server& server) {
     return server.span;
 }
 
+bool has_exact_absolute_redirect_inventory(const ExactAbsoluteRedirectLocation& location) {
+    const AbsoluteRedirect& response = location.response;
+    return location.present || location.path.ptr != nullptr || location.path.len != 0 ||
+           !is_default_span(location.path_span) || !is_default_span(location.span) ||
+           response.status != 0 || !is_default_span(response.status_span) ||
+           response.target.ptr != nullptr || response.target.len != 0 ||
+           !is_default_span(response.target_span) || response.authority.ptr != nullptr ||
+           response.authority.len != 0 || !is_default_span(response.authority_span) ||
+           response.path.ptr != nullptr || response.path.len != 0 ||
+           !is_default_span(response.path_span) || !is_default_span(response.span);
+}
+
+Span exact_absolute_redirect_span(const Server& server) {
+    const auto& location = server.exact_absolute_redirect;
+    if (is_valid_span(location.span)) return location.span;
+    if (is_valid_span(location.path_span)) return location.path_span;
+    if (is_valid_span(location.response.span)) return location.response.span;
+    if (is_valid_span(location.response.target_span)) return location.response.target_span;
+    return server.span;
+}
+
+FrontendResult<bool> reject_exact_absolute_redirect(const Server& server) {
+    const auto& location = server.exact_absolute_redirect;
+    if (!has_exact_absolute_redirect_inventory(location)) return false;
+    return unsupported(exact_absolute_redirect_span(server),
+                       location.present ? lit_str("exact absolute redirect lowering is unsupported")
+                                        : lit_str("invalid absent exact absolute redirect model"));
+}
+
 constexpr bool span_position_is_coherent(const Span& outer, const Span& inner) {
     if (!is_valid_span(outer) || !is_valid_span(inner) || !span_contains(outer, inner) ||
         inner.line < outer.line)
@@ -402,6 +431,8 @@ bool put_exact_local_return(Writer& writer, Str body) {
 }  // namespace
 
 FrontendResult<RutSource> lower_to_rut(const Server& server) {
+    auto exact_absolute_redirect = reject_exact_absolute_redirect(server);
+    if (!exact_absolute_redirect) return core::make_unexpected(exact_absolute_redirect.error());
     auto exact_local_return = validate_exact_local_return(server);
     if (!exact_local_return) return core::make_unexpected(exact_local_return.error());
     auto timeout = validate_proxy_read_timeout(server);

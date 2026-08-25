@@ -84,6 +84,10 @@ TEST(nginx_parser, parses_minimal_server_and_spans) {
     CHECK_EQ(result.value().exact_local_return.path.ptr, nullptr);
     CHECK_EQ(result.value().exact_local_return.path.len, 0u);
     CHECK_EQ(result.value().exact_local_return.response.status, 0u);
+    CHECK_FALSE(result.value().exact_absolute_redirect.present);
+    CHECK_EQ(result.value().exact_absolute_redirect.path.ptr, nullptr);
+    CHECK_EQ(result.value().exact_absolute_redirect.path.len, 0u);
+    CHECK_EQ(result.value().exact_absolute_redirect.response.status, 0u);
     CHECK(result.value().pre_route_trace.profile ==
           nginx::ImplicitPreRouteProfile::Nginx1297PreLocationTrace405);
     CHECK_EQ(result.value().pre_route_trace.span.start, result.value().span.start);
@@ -151,6 +155,62 @@ TEST(nginx_parser, accepts_exact_local_return_64_byte_body_boundary) {
     REQUIRE(result);
     CHECK_EQ(result.value().exact_local_return.response.body.len, nginx::kMaxLocalReturnBodyLen);
     CHECK(result.value().exact_local_return.response.body.eq(lit_str(kBody)));
+}
+
+TEST(nginx_parser, parses_bounded_exact_absolute_redirect_in_either_order) {
+    char root_first[] =
+        "server {\n"
+        "  listen 8080;\n"
+        "  location / { proxy_pass http://127.0.0.1:9000; }\n"
+        "  location = /old { return 301 http://redirect.example/new; }\n"
+        "}\n";
+    char exact_first[] =
+        "server {\n"
+        "  listen 8080;\n"
+        "  location = /old { return 301 http://redirect.example/new; }\n"
+        "  location / { proxy_pass http://127.0.0.1:9000; }\n"
+        "}\n";
+
+    const auto check = [&](char* source, u32 len, u32 root_line, u32 exact_line) {
+        const auto result = nginx::parse({source, len});
+        REQUIRE(result);
+        const auto& server = result.value();
+        CHECK(server.location.path.eq(lit_str("/")));
+        CHECK_EQ(server.location.span.line, root_line);
+        CHECK_FALSE(server.exact_local_return.present);
+        REQUIRE(server.exact_absolute_redirect.present);
+        const auto& location = server.exact_absolute_redirect;
+        const auto& response = location.response;
+        CHECK(location.path.eq(lit_str("/old")));
+        CHECK_EQ(location.path_span.line, exact_line);
+        CHECK_EQ(location.span.line, exact_line);
+        CHECK_EQ(response.status, 301u);
+        CHECK_EQ(response.status_span.line, exact_line);
+        CHECK(response.target.eq(lit_str("http://redirect.example/new")));
+        CHECK(response.authority.eq(lit_str("redirect.example")));
+        CHECK(response.path.eq(lit_str("/new")));
+        CHECK_EQ(response.target_span.line, exact_line);
+        CHECK_EQ(response.authority_span.line, exact_line);
+        CHECK_EQ(response.path_span.line, exact_line);
+        CHECK_GE(location.path.ptr, source);
+        CHECK_LT(location.path.ptr, source + len);
+        CHECK_GE(response.target.ptr, source);
+        CHECK_LT(response.target.ptr, source + len);
+        CHECK_EQ(response.authority.ptr, response.target.ptr + 7);
+        CHECK_EQ(response.path.ptr, response.authority.ptr + response.authority.len);
+        CHECK_EQ(response.target_span.end - response.target_span.start, response.target.len);
+        CHECK_EQ(response.authority_span.end - response.authority_span.start,
+                 response.authority.len);
+        CHECK_EQ(response.path_span.end - response.path_span.start, response.path.len);
+        CHECK_EQ(response.authority_span.start, response.target_span.start + 7u);
+        CHECK_EQ(response.path_span.end, response.target_span.end);
+        REQUIRE(server.pre_route_trace.profile ==
+                nginx::ImplicitPreRouteProfile::Nginx1297PreLocationTrace405);
+        CHECK_EQ(server.pre_route_trace.span.start, server.span.start);
+        CHECK_EQ(server.pre_route_trace.span.end, server.span.end);
+    };
+    check(root_first, sizeof(root_first) - 1u, 3u, 4u);
+    check(exact_first, sizeof(exact_first) - 1u, 4u, 3u);
 }
 
 TEST(nginx_parser, parses_bounded_proxy_read_timeout_in_either_directive_order) {
@@ -582,7 +642,7 @@ TEST(nginx_parser, rejects_unsupported_exact_local_return_shapes) {
         {"server { listen 8080; location / { proxy_pass http://127.0.0.1:1; } location = "
          "/other { return 200 \"x\"; } }",
          FrontendError::UnsupportedSyntax,
-         lit_str("only exact location = /static is supported")},
+         lit_str("only exact location = /static or /old is supported")},
         {"server { listen 8080; location /api/ { proxy_pass http://127.0.0.1:1/; } location = "
          "/static { return 200 \"x\"; } }",
          FrontendError::UnsupportedSyntax,
@@ -650,6 +710,143 @@ TEST(nginx_parser, rejects_unsupported_exact_local_return_shapes) {
     CHECK_EQ(too_long.error().code, FrontendError::UnsupportedSyntax);
     CHECK(too_long.error().detail.eq(
         lit_str("return body must be 1..64 token-safe quoted ASCII bytes")));
+}
+
+TEST(nginx_parser, rejects_broader_exact_absolute_redirect_shapes) {
+    struct Vector {
+        const char* exact;
+        FrontendError code;
+        Str detail;
+    };
+    const Vector vectors[] = {
+        {"location = /older { return 301 http://redirect.example/new; }",
+         FrontendError::UnsupportedSyntax,
+         lit_str("only exact location = /static or /old is supported")},
+        {"location = /old { return 300 http://redirect.example/new; }",
+         FrontendError::UnsupportedSyntax,
+         lit_str("only redirect status 301 is supported")},
+        {"location = /old { return 302 http://redirect.example/new; }",
+         FrontendError::UnsupportedSyntax,
+         lit_str("only redirect status 301 is supported")},
+        {"location = /old { return 200 http://redirect.example/new; }",
+         FrontendError::UnsupportedSyntax,
+         lit_str("only redirect status 301 is supported")},
+        {"location = /old { return 301 /new; }",
+         FrontendError::UnsupportedSyntax,
+         lit_str("only redirect target http://redirect.example/new is supported")},
+        {"location = /old { return 301 \"http://redirect.example/new\"; }",
+         FrontendError::UnsupportedSyntax,
+         lit_str("only redirect target http://redirect.example/new is supported")},
+        {"location = /old { return 301 http://$host/new; }",
+         FrontendError::UnsupportedSyntax,
+         lit_str("only redirect target http://redirect.example/new is supported")},
+        {"location = /old { return 301 https://redirect.example/new; }",
+         FrontendError::UnsupportedSyntax,
+         lit_str("only redirect target http://redirect.example/new is supported")},
+        {"location = /old { return 301 http://other.example/new; }",
+         FrontendError::UnsupportedSyntax,
+         lit_str("only redirect target http://redirect.example/new is supported")},
+        {"location = /old { return 301 http://redirect.example/other; }",
+         FrontendError::UnsupportedSyntax,
+         lit_str("only redirect target http://redirect.example/new is supported")},
+        {"location = /old { return 301 http://redirect.example:80/new; }",
+         FrontendError::UnsupportedSyntax,
+         lit_str("only redirect target http://redirect.example/new is supported")},
+        {"location = /old { return 301 http://redirect.example/new?x=1; }",
+         FrontendError::UnsupportedSyntax,
+         lit_str("only redirect target http://redirect.example/new is supported")},
+        {"location = /old { return 301 \"http://redirect.example/new#fragment\"; }",
+         FrontendError::UnsupportedSyntax,
+         lit_str("only redirect target http://redirect.example/new is supported")},
+        {"location = /old { return; }",
+         FrontendError::UnexpectedToken,
+         lit_str("return requires status and target")},
+        {"location = /old { return 301; }",
+         FrontendError::UnexpectedToken,
+         lit_str("return requires an absolute target")},
+        {"location = /old { return 301 http://redirect.example/new extra; }",
+         FrontendError::UnexpectedToken,
+         lit_str("return accepts exactly status and target")},
+        {"location = /old { }",
+         FrontendError::UnsupportedSyntax,
+         lit_str("missing return directive in exact location")},
+        {"location = /old { return 301 http://redirect.example/new; return 301 "
+         "http://redirect.example/new; }",
+         FrontendError::UnsupportedSyntax,
+         lit_str("duplicate return directive")},
+        {"location = /old { proxy_pass http://127.0.0.1:2; }",
+         FrontendError::UnsupportedSyntax,
+         lit_str("proxy_pass is unsupported in exact locations")},
+        {"location = /old { location /nested { return 301 "
+         "http://redirect.example/new; } }",
+         FrontendError::UnsupportedSyntax,
+         lit_str("nested locations are unsupported")},
+        {"location = /old { add_header X-Test value; }",
+         FrontendError::UnsupportedSyntax,
+         lit_str("unknown exact location directive")},
+    };
+    static constexpr char kPrefix[] =
+        "server { listen 8080; location / { proxy_pass http://127.0.0.1:1; } ";
+    for (const auto& vector : vectors) {
+        char source[512]{};
+        const int len = snprintf(source, sizeof(source), "%s%s }", kPrefix, vector.exact);
+        REQUIRE_GT(len, 0);
+        REQUIRE_LT(static_cast<u32>(len), static_cast<u32>(sizeof(source)));
+        const auto result = nginx::parse({source, static_cast<u32>(len)});
+        REQUIRE_FALSE(result);
+        CHECK_EQ(result.error().code, vector.code);
+        CHECK(result.error().detail.eq(vector.detail));
+    }
+
+    struct SpanVector {
+        const char* exact;
+        const char* offending;
+    };
+    const SpanVector span_vectors[] = {
+        {"location = /older { return 301 http://redirect.example/new; }", "/older"},
+        {"location = /old { return 302 http://redirect.example/new; }", "302"},
+        {"location = /old { return 301 https://redirect.example/new; }",
+         "https://redirect.example/new"},
+        {"location = /old { add_header X-Test value; }", "add_header"},
+    };
+    for (const auto& vector : span_vectors) {
+        char source[512]{};
+        const int len = snprintf(source, sizeof(source), "%s%s }", kPrefix, vector.exact);
+        REQUIRE_GT(len, 0);
+        const auto result = nginx::parse({source, static_cast<u32>(len)});
+        REQUIRE_FALSE(result);
+        const char* offending = strstr(source, vector.offending);
+        REQUIRE(offending != nullptr);
+        CHECK_EQ(result.error().span.start, static_cast<u32>(offending - source));
+        CHECK_EQ(result.error().span.end - result.error().span.start,
+                 static_cast<u32>(strlen(vector.offending)));
+    }
+
+    const char exact_only[] =
+        "server { listen 8080; location = /old { return 301 "
+        "http://redirect.example/new; } }";
+    CHECK(is_error(nginx::parse({exact_only, sizeof(exact_only) - 1u}),
+                   FrontendError::UnsupportedSyntax,
+                   1,
+                   23,
+                   lit_str("exact location requires a root proxy fallback")));
+
+    const char two_exact[] =
+        "server { listen 8080; location = /static { return 200 \"x\"; } location = /old { "
+        "return 301 http://redirect.example/new; } }";
+    const auto duplicate = nginx::parse({two_exact, sizeof(two_exact) - 1u});
+    REQUIRE_FALSE(duplicate);
+    CHECK_EQ(duplicate.error().code, FrontendError::UnsupportedSyntax);
+    CHECK(duplicate.error().detail.eq(lit_str("duplicate exact location")));
+
+    const char third[] =
+        "server { listen 8080; location / { proxy_pass http://127.0.0.1:1; } location = /old "
+        "{ return 301 http://redirect.example/new; } location /api/ { proxy_pass "
+        "http://127.0.0.1:2/; } }";
+    const auto third_result = nginx::parse({third, sizeof(third) - 1u});
+    REQUIRE_FALSE(third_result);
+    CHECK_EQ(third_result.error().code, FrontendError::UnsupportedSyntax);
+    CHECK(third_result.error().detail.eq(lit_str("third location is unsupported")));
 }
 
 TEST(nginx_parser, rejects_unknown_directives_and_multiple_servers) {
@@ -1065,6 +1262,78 @@ TEST(nginx_converter, rejects_forged_exact_local_return_model_inconsistencies) {
     api_absent_trace_inventory.pre_route_trace.profile = nginx::ImplicitPreRouteProfile::None;
     api_absent_trace_inventory.pre_route_trace.span = api_server().span;
     expect_rejected(api_absent_trace_inventory, lit_str("invalid absent pre-route TRACE model"));
+}
+
+TEST(nginx_converter, rejects_exact_absolute_redirect_before_emitting_output) {
+    static constexpr char kRootFirst[] =
+        "server { listen 8080; location / { proxy_pass http://127.0.0.1:9000; } location = "
+        "/old { return 301 http://redirect.example/new; } }";
+    static constexpr char kExactFirst[] =
+        "server { listen 8080; location = /old { return 301 http://redirect.example/new; } "
+        "location / { proxy_pass http://127.0.0.1:9000; } }";
+    const auto check = [&](Str source) {
+        const auto parsed = nginx::parse(source);
+        REQUIRE(parsed);
+        const auto lowered = nginx::lower_to_rut(parsed.value());
+        REQUIRE_FALSE(lowered);
+        CHECK_EQ(lowered.error().code, FrontendError::UnsupportedSyntax);
+        CHECK(
+            lowered.error().detail.eq(lit_str("exact absolute redirect lowering is unsupported")));
+        CHECK_EQ(lowered.error().span.start, parsed.value().exact_absolute_redirect.span.start);
+        CHECK_EQ(lowered.error().span.end, parsed.value().exact_absolute_redirect.span.end);
+    };
+    check({kRootFirst, sizeof(kRootFirst) - 1u});
+    check({kExactFirst, sizeof(kExactFirst) - 1u});
+
+    // lower_to_rut owns output inside its success alternative, so this error
+    // result publishes no partial generated source to the caller.
+}
+
+TEST(nginx_converter, rejects_forged_exact_absolute_redirect_inventory) {
+    static constexpr char kRedirectSource[] =
+        "server { listen 8080; location / { proxy_pass http://127.0.0.1:9000; } location = "
+        "/old { return 301 http://redirect.example/new; } }";
+    static constexpr char kLocalSource[] =
+        "server { listen 8080; location / { proxy_pass http://127.0.0.1:9000; } location = "
+        "/static { return 200 \"successor-static\"; } }";
+    const auto redirect = nginx::parse({kRedirectSource, sizeof(kRedirectSource) - 1u});
+    const auto local = nginx::parse({kLocalSource, sizeof(kLocalSource) - 1u});
+    REQUIRE(redirect);
+    REQUIRE(local);
+    const auto expect_rejected = [&](const nginx::Server& model, Str detail) {
+        const auto result = nginx::lower_to_rut(model);
+        REQUIRE_FALSE(result);
+        CHECK_EQ(result.error().code, FrontendError::UnsupportedSyntax);
+        CHECK(result.error().detail.eq(detail));
+    };
+
+    auto missing_presence = redirect.value();
+    missing_presence.exact_absolute_redirect.present = false;
+    expect_rejected(missing_presence, lit_str("invalid absent exact absolute redirect model"));
+
+    auto absent_status = canonical_server();
+    absent_status.exact_absolute_redirect.response.status = 301;
+    expect_rejected(absent_status, lit_str("invalid absent exact absolute redirect model"));
+    auto absent_target = canonical_server();
+    absent_target.exact_absolute_redirect.response.target = lit_str("http://redirect.example/new");
+    expect_rejected(absent_target, lit_str("invalid absent exact absolute redirect model"));
+    auto absent_authority = canonical_server();
+    absent_authority.exact_absolute_redirect.response.authority = lit_str("redirect.example");
+    expect_rejected(absent_authority, lit_str("invalid absent exact absolute redirect model"));
+    auto absent_path = canonical_server();
+    absent_path.exact_absolute_redirect.path = lit_str("/old");
+    expect_rejected(absent_path, lit_str("invalid absent exact absolute redirect model"));
+    auto absent_span = canonical_server();
+    absent_span.exact_absolute_redirect.response.target_span = Span{1, 2, 1, 2};
+    expect_rejected(absent_span, lit_str("invalid absent exact absolute redirect model"));
+
+    auto present_only = canonical_server();
+    present_only.exact_absolute_redirect.present = true;
+    expect_rejected(present_only, lit_str("exact absolute redirect lowering is unsupported"));
+
+    auto both_actions = redirect.value();
+    both_actions.exact_local_return = local.value().exact_local_return;
+    expect_rejected(both_actions, lit_str("exact absolute redirect lowering is unsupported"));
 }
 
 TEST(nginx_converter, lowers_canonical_model_to_stable_rut_source) {

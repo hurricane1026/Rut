@@ -57,6 +57,29 @@ struct ExactLocalReturnLocation {
     LocalReturn response{};
 };
 
+// A distinct semantic action for the first bounded absolute redirect slice.
+// The complete target and its authority/path decomposition borrow directly
+// from the nginx source so later lowering never needs to reinterpret URL text.
+struct AbsoluteRedirect {
+    u16 status = 0;
+    Span status_span{};
+    Str target{};
+    Span target_span{};
+    Str authority{};
+    Span authority_span{};
+    Str path{};
+    Span path_span{};
+    Span span{};
+};
+
+struct ExactAbsoluteRedirectLocation {
+    bool present = false;
+    Str path{};
+    Span path_span{};
+    Span span{};
+    AbsoluteRedirect response{};
+};
+
 // Closed canonical profiles for implicit nginx behavior that precedes route
 // selection.  This is semantic-model metadata, not an nginx directive or a
 // runtime mode; the converter owns every emitted policy byte for each profile.
@@ -78,9 +101,10 @@ struct Server {
     Span span{};
     Listen listen{};
     // `location` is always the proxy fallback, independent of declaration
-    // order. `exact_local_return` is the optional exact selector/action.
+    // order. At most one exact selector/action is populated by the parser.
     Location location{};
     ExactLocalReturnLocation exact_local_return{};
+    ExactAbsoluteRedirectLocation exact_absolute_redirect{};
     ImplicitPreRouteTrace pre_route_trace{};
 };
 
