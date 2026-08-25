@@ -5333,14 +5333,35 @@ struct CoalescedIngressObservation {
     std::vector<char> raw_wire;
     std::vector<char> tail;
     u32 connect_attempts = 0;
+    u32 connect_ipv4_be = 0;
+    u16 connect_port_be = 0;
+    u64 connect_user_data = 0;
     std::string gate_evidence;
 };
+
+static std::string make_converter_coalesced_fragment(u16 frontend_port, u16 backend_port) {
+    return "server {\n"
+           "  listen " +
+           std::to_string(frontend_port) +
+           ";\n"
+           "  location / { proxy_pass http://127.0.0.1:" +
+           std::to_string(backend_port) +
+           "; }\n"
+           "  location = /static { return 200 \"successor-static\"; }\n"
+           "}\n";
+}
+
+static std::string make_converter_coalesced_request_wire() {
+    return std::string(kGatewayKeepAliveRequest1) + kExactLocalGetCloseRequest;
+}
 
 static bool run_nginx_coalesced_ingress_gate_evidence(u16 frontend_port,
                                                       u16 backend_port,
                                                       TempDir& temp,
                                                       const std::string& container_name,
                                                       const char* preload_path,
+                                                      const std::string& fragment,
+                                                      const std::string& combined,
                                                       CoalescedIngressObservation& observation,
                                                       std::string& error) {
     if (preload_path == nullptr || preload_path[0] != '/' || access(preload_path, R_OK) != 0) {
@@ -5358,16 +5379,6 @@ static bool run_nginx_coalesced_ingress_gate_evidence(u16 frontend_port,
         error = "failed to retain the coalesced-ingress dead upstream reservation";
         return false;
     }
-    const std::string fragment =
-        "server {\n"
-        "  listen " +
-        std::to_string(frontend_port) +
-        ";\n"
-        "  location / { proxy_pass http://127.0.0.1:" +
-        std::to_string(backend_port) +
-        "; }\n"
-        "  location = /static { return 200 \"successor-static\"; }\n"
-        "}\n";
     const std::string config =
         "error_log stderr notice;\n"
         "events {}\n"
@@ -5504,8 +5515,6 @@ static bool run_nginx_coalesced_ingress_gate_evidence(u16 frontend_port,
     (void)setsockopt(client.fd, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
     (void)setsockopt(client.fd, SOL_SOCKET, SO_SNDTIMEO, &timeout, sizeof(timeout));
 
-    const std::string combined =
-        std::string(kGatewayKeepAliveRequest1) + kExactLocalGetCloseRequest;
     if (combined.size() > RUT_DOWNSTREAM_GATE_REQUEST_CAPACITY) {
         error = "coalesced-ingress request pair exceeds the shared gate capacity";
         return false;
@@ -6090,6 +6099,8 @@ static bool run_rut_coalesced_ingress_gate_evidence(u16 frontend_port,
                                                     TempDir& temp,
                                                     const char* rut_path,
                                                     const char* preload_path,
+                                                    const std::string& fragment,
+                                                    const std::string& combined,
                                                     CoalescedIngressObservation& observation,
                                                     std::string& error) {
     if (rut_path == nullptr || rut_path[0] != '/' || access(rut_path, X_OK) != 0) {
@@ -6111,16 +6122,6 @@ static bool run_rut_coalesced_ingress_gate_evidence(u16 frontend_port,
         error = "failed to retain the coalesced-ingress RUT dead upstream reservation";
         return false;
     }
-    const std::string fragment =
-        "server {\n"
-        "  listen " +
-        std::to_string(frontend_port) +
-        ";\n"
-        "  location / { proxy_pass http://127.0.0.1:" +
-        std::to_string(backend_port) +
-        "; }\n"
-        "  location = /static { return 200 \"successor-static\"; }\n"
-        "}\n";
     const auto parsed = rut::nginx::parse({fragment.data(), static_cast<u32>(fragment.size())});
     if (!parsed || !parsed.value().location.path.eq(rut::lit_str("/")) ||
         !parsed.value().exact_local_return.present ||
@@ -6269,8 +6270,6 @@ static bool run_rut_coalesced_ingress_gate_evidence(u16 frontend_port,
     (void)setsockopt(client.fd, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
     (void)setsockopt(client.fd, SOL_SOCKET, SO_SNDTIMEO, &timeout, sizeof(timeout));
 
-    const std::string combined =
-        std::string(kGatewayKeepAliveRequest1) + kExactLocalGetCloseRequest;
     if (combined.size() > RUT_DOWNSTREAM_GATE_REQUEST_CAPACITY) {
         error = "RUT coalesced-ingress request pair exceeds the shared gate capacity";
         return false;
@@ -6440,8 +6439,119 @@ static bool run_rut_coalesced_ingress_gate_evidence(u16 frontend_port,
         mapping.gate->witness_wire_length == combined.size() &&
         memcmp(mapping.gate->witness_wire, combined.data(), combined.size()) == 0;
     observation.connect_attempts = mapping.gate->connect_attempt_count;
+    observation.connect_ipv4_be = attempt.ipv4_be;
+    observation.connect_port_be = attempt.port_be;
+    observation.connect_user_data = attempt.user_data;
     if (!settled_exact) {
         error = "post-reap RUT evidence did not retain one Connect and one exact ingress witness";
+        return false;
+    }
+    return true;
+}
+
+struct ConverterCoalescedSuccessorObservation {
+    CoalescedIngressObservation nginx;
+    CoalescedIngressObservation generated_rut;
+    std::string fragment;
+    std::string request_wire;
+};
+
+static void dump_converter_coalesced_successor_observation(
+    const ConverterCoalescedSuccessorObservation& observation) {
+    const auto dump_side = [](const char* side, const CoalescedIngressObservation& value) {
+        const std::string prefix(side);
+        dump_wire((prefix + " raw wire").c_str(), value.raw_wire);
+        dump_wire((prefix + " response 1").c_str(), value.first);
+        dump_wire((prefix + " response 2").c_str(), value.second);
+        dump_wire((prefix + " tail").c_str(), value.tail);
+        std::cerr << prefix << " attempts=" << value.connect_attempts
+                  << " connect-ipv4-be=" << value.connect_ipv4_be
+                  << " connect-port-be=" << value.connect_port_be
+                  << " connect-user-data=" << value.connect_user_data
+                  << " gate evidence=" << value.gate_evidence << "\n";
+    };
+    dump_side("pinned nginx coalesced", observation.nginx);
+    dump_side("converter-generated ordinary RUT coalesced", observation.generated_rut);
+    std::cerr << "shared accepted nginx fragment:\n" << observation.fragment;
+    dump_wire("shared one-send R1||R2",
+              std::vector<char>(observation.request_wire.begin(), observation.request_wire.end()));
+}
+
+static bool run_converter_coalesced_successor_differential(
+    u16 frontend_port,
+    u16 backend_port,
+    TempDir& temp,
+    const std::string& container_name,
+    const char* rut_path,
+    const char* nginx_preload_path,
+    const char* rut_preload_path,
+    ConverterCoalescedSuccessorObservation& observation,
+    std::string& error) {
+    observation.fragment = make_converter_coalesced_fragment(frontend_port, backend_port);
+    observation.request_wire = make_converter_coalesced_request_wire();
+
+    // Run the production-ring side first on the freshly allocated port. Its
+    // raw-CQ gate intentionally rejects every unrelated/stale completion,
+    // whereas pinned nginx has no corresponding kernel-ring ownership state.
+    if (!run_rut_coalesced_ingress_gate_evidence(frontend_port,
+                                                 backend_port,
+                                                 temp,
+                                                 rut_path,
+                                                 rut_preload_path,
+                                                 observation.fragment,
+                                                 observation.request_wire,
+                                                 observation.generated_rut,
+                                                 error)) {
+        error = "converter-generated ordinary RUT side: " + error;
+        return false;
+    }
+    if (!run_nginx_coalesced_ingress_gate_evidence(frontend_port,
+                                                   backend_port,
+                                                   temp,
+                                                   container_name,
+                                                   nginx_preload_path,
+                                                   observation.fragment,
+                                                   observation.request_wire,
+                                                   observation.nginx,
+                                                   error)) {
+        error = "pinned-nginx side: " + error;
+        return false;
+    }
+
+    std::vector<char> normalized_nginx_first = observation.nginx.first;
+    std::vector<char> normalized_nginx_second = observation.nginx.second;
+    std::vector<char> normalized_rut_first = observation.generated_rut.first;
+    std::vector<char> normalized_rut_second = observation.generated_rut.second;
+    if (!normalize_date(normalized_nginx_first) || !normalize_date(normalized_nginx_second) ||
+        !normalize_date(normalized_rut_first) || !normalize_date(normalized_rut_second)) {
+        error = "one coalesced response frame lacked exactly one syntactically valid Date";
+        return false;
+    }
+    const std::vector<char> expected_first(
+        kGatewayKeepAliveResponseNormalized,
+        kGatewayKeepAliveResponseNormalized + sizeof(kGatewayKeepAliveResponseNormalized) - 1u);
+    const std::vector<char> expected_second(
+        kExactLocalCloseResponseNormalized,
+        kExactLocalCloseResponseNormalized + sizeof(kExactLocalCloseResponseNormalized) - 1u);
+    if (normalized_nginx_first != expected_first || normalized_rut_first != expected_first ||
+        normalized_nginx_second != expected_second || normalized_rut_second != expected_second ||
+        normalized_nginx_first != normalized_rut_first ||
+        normalized_nginx_second != normalized_rut_second) {
+        error =
+            "coalesced nginx/generated-RUT response pair differed after Date-only normalization";
+        return false;
+    }
+    const u64 rut_episode = (observation.generated_rut.connect_user_data >> 32) & 0xffffffu;
+    if (!observation.nginx.tail.empty() || !observation.generated_rut.tail.empty() ||
+        observation.nginx.connect_attempts != 1 ||
+        observation.generated_rut.connect_attempts != 1 ||
+        observation.generated_rut.connect_ipv4_be != htonl(INADDR_LOOPBACK) ||
+        observation.generated_rut.connect_port_be != htons(backend_port) ||
+        (observation.generated_rut.connect_user_data & 0xffu) !=
+            static_cast<rut::u8>(rut::IoEventType::UpstreamConnect) ||
+        rut_episode == 0 || observation.nginx.gate_evidence.empty() ||
+        observation.generated_rut.gate_evidence.empty()) {
+        error = "coalesced sides did not retain exact ingress, zero-tail, and one-attempt evidence";
         return false;
     }
     return true;
@@ -7756,6 +7866,8 @@ int main(int argc, char** argv) {
         argc == 3 && strcmp(argv[1], "--converter-exact-local-differential") == 0;
     const bool exact_strict_route_differential =
         argc == 3 && strcmp(argv[1], "--exact-strict-route-differential") == 0;
+    const bool converter_coalesced_successor_differential =
+        argc == 5 && strcmp(argv[1], "--converter-coalesced-successor-differential") == 0;
     const bool late_successor_differential =
         argc == 5 && strcmp(argv[1], "--late-successor-differential") == 0;
     const bool rut_iouring_gate_spike =
@@ -7775,16 +7887,18 @@ int main(int argc, char** argv) {
         (argc == 4 && argv[1][0] == '/' && argv[2][0] == '/' && argv[3][0] == '/');
     if ((!nginx_gate_spike && !nginx_coalesced_ingress_gate && !exact_local_return_baseline &&
          !strict_local_response_differential && !converter_exact_local_differential &&
-         !exact_strict_route_differential && !rut_iouring_gate_spike &&
-         !rut_iouring_gate_identity_negative && !rut_iouring_gate_ready_mutation_negative &&
-         !rut_iouring_gate_owner_death_negative && !rut_iouring_gate_connect_journal_negative &&
-         !rut_iouring_coalesced_ingress_gate && !late_successor_differential &&
-         !normal_differential) ||
+         !exact_strict_route_differential && !converter_coalesced_successor_differential &&
+         !rut_iouring_gate_spike && !rut_iouring_gate_identity_negative &&
+         !rut_iouring_gate_ready_mutation_negative && !rut_iouring_gate_owner_death_negative &&
+         !rut_iouring_gate_connect_journal_negative && !rut_iouring_coalesced_ingress_gate &&
+         !late_successor_differential && !normal_differential) ||
         (nginx_gate_spike && argv[2][0] != '/') ||
         (nginx_coalesced_ingress_gate && argv[2][0] != '/') ||
         (strict_local_response_differential && argv[2][0] != '/') ||
         (converter_exact_local_differential && argv[2][0] != '/') ||
         (exact_strict_route_differential && argv[2][0] != '/') ||
+        (converter_coalesced_successor_differential &&
+         (argv[2][0] != '/' || argv[3][0] != '/' || argv[4][0] != '/')) ||
         ((rut_iouring_gate_spike || rut_iouring_gate_identity_negative ||
           rut_iouring_gate_ready_mutation_negative || rut_iouring_gate_owner_death_negative ||
           rut_iouring_gate_connect_journal_negative || rut_iouring_coalesced_ingress_gate) &&
@@ -7804,6 +7918,9 @@ int main(int argc, char** argv) {
                      "<absolute-rut-executable>\n"
                      "   or: test_nginx_differential --exact-strict-route-differential "
                      "<absolute-rut-executable>\n"
+                     "   or: test_nginx_differential --converter-coalesced-successor-differential "
+                     "<absolute-rut-executable> <absolute-nginx-preload-helper> "
+                     "<absolute-rut-preload-helper>\n"
                      "   or: test_nginx_differential --rut-iouring-gate-spike "
                      "<absolute-rut-executable> <absolute-preload-helper>\n"
                      "   or: test_nginx_differential --rut-iouring-gate-identity-negative "
@@ -7897,11 +8014,16 @@ int main(int argc, char** argv) {
         }
         CoalescedIngressObservation observation;
         std::string ingress_error;
+        const std::string fragment =
+            make_converter_coalesced_fragment(rut_frontend_port, rut_backend_port);
+        const std::string request_wire = make_converter_coalesced_request_wire();
         if (!run_rut_coalesced_ingress_gate_evidence(rut_frontend_port,
                                                      rut_backend_port,
                                                      temp,
                                                      argv[2],
                                                      argv[3],
+                                                     fragment,
+                                                     request_wire,
                                                      observation,
                                                      ingress_error)) {
             std::cerr << "FAIL [converter-generated RUT coalesced-ingress gate]: " << ingress_error
@@ -7963,6 +8085,49 @@ int main(int argc, char** argv) {
         return 1;
     }
 
+    if (converter_coalesced_successor_differential || (normal_differential && argc == 4)) {
+        TempDir coalesced_temp;
+        if (!coalesced_temp.create()) {
+            std::cerr << "FAIL [converter coalesced differential]: secure temporary directory "
+                         "creation failed\n";
+            return 1;
+        }
+        const char* source_suffix = strrchr(coalesced_temp.path, '/');
+        source_suffix = source_suffix ? source_suffix + 1 : coalesced_temp.path;
+        const std::string container_name =
+            "rut-nginx-converter-coalesced-" + std::to_string(getpid()) + "-" + source_suffix;
+        const char* rut_path = converter_coalesced_successor_differential ? argv[2] : argv[1];
+        const char* nginx_preload = converter_coalesced_successor_differential ? argv[3] : argv[2];
+        const char* rut_preload = converter_coalesced_successor_differential ? argv[4] : argv[3];
+        ConverterCoalescedSuccessorObservation observation;
+        std::string differential_error;
+        if (!run_converter_coalesced_successor_differential(frontend_port,
+                                                            backend_port,
+                                                            coalesced_temp,
+                                                            container_name,
+                                                            rut_path,
+                                                            nginx_preload,
+                                                            rut_preload,
+                                                            observation,
+                                                            differential_error)) {
+            std::cerr << "FAIL [converter-generated coalesced successor differential]: "
+                      << differential_error << "\n";
+            dump_converter_coalesced_successor_observation(observation);
+            dump_log(coalesced_temp.nginx_config, "converter coalesced pinned nginx config");
+            dump_log(coalesced_temp.source, "converter-generated coalesced ordinary RUT source");
+            dump_log(coalesced_temp.nginx_log, "converter coalesced pinned nginx log");
+            dump_log(coalesced_temp.rut_log, "converter-generated coalesced ordinary RUT log");
+            return 1;
+        }
+        std::cerr
+            << "PASS: one accepted nginx fragment lowered to converter-generated ordinary RUT "
+               "matches pinned nginx for one causally gated R1||R2 send: exact 502 "
+               "keep-alive, exact-local 200 close/EOF, and one upstream attempt/episode "
+               "(bounded depth-one bodyless GET only; not direct nginx.conf runtime support or "
+               "a broad pipelining claim)\n";
+        if (converter_coalesced_successor_differential) return 0;
+    }
+
     if (nginx_coalesced_ingress_gate) {
         const char* source_suffix = strrchr(temp.path, '/');
         source_suffix = source_suffix ? source_suffix + 1 : temp.path;
@@ -7970,11 +8135,15 @@ int main(int argc, char** argv) {
             "rut-nginx-coalesced-ingress-" + std::to_string(getpid()) + "-" + source_suffix;
         CoalescedIngressObservation observation;
         std::string ingress_error;
+        const std::string fragment = make_converter_coalesced_fragment(frontend_port, backend_port);
+        const std::string request_wire = make_converter_coalesced_request_wire();
         if (!run_nginx_coalesced_ingress_gate_evidence(frontend_port,
                                                        backend_port,
                                                        temp,
                                                        container_name,
                                                        argv[2],
+                                                       fragment,
+                                                       request_wire,
                                                        observation,
                                                        ingress_error)) {
             std::cerr << "FAIL [pinned nginx coalesced-ingress gate]: " << ingress_error << "\n";
