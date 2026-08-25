@@ -431,6 +431,18 @@ if(RUT_ENABLE_JIT)
         ENVIRONMENT "RUT_NGINX_DIFFERENTIAL_REQUIRED=1"
     )
     add_test(
+        NAME test_nginx_exact_absolute_redirect_oracle
+        COMMAND test_nginx_differential --exact-absolute-redirect-oracle
+    )
+    set_tests_properties(test_nginx_exact_absolute_redirect_oracle PROPERTIES
+        LABELS "integration;nginx;docker"
+        RUN_SERIAL TRUE
+        RESOURCE_LOCK nginx-differential
+        TIMEOUT 60
+        SKIP_RETURN_CODE 77
+        ENVIRONMENT "RUT_NGINX_DIFFERENTIAL_REQUIRED=1"
+    )
+    add_test(
         NAME test_nginx_converter_root_proxy_trace_differential
         COMMAND test_nginx_differential --converter-root-proxy-trace-differential
                 $<TARGET_FILE:rut>
