@@ -34630,6 +34630,46 @@ TEST(frontend, inline_redirect_source_reaches_rir_and_owned_config) {
     rir.destroy();
 }
 
+TEST(frontend, fixed_redirect_source_is_complete_and_reaches_rir) {
+    // Object fields are intentionally far from declaration order: redirect
+    // objects are name-based and must not gain an accidental positional ABI.
+    const char source[] =
+        "route GET \"/old\" { return redirect({"
+        "body: b\"fixed\", target_path: \"/new\", content_type: \"text/html\", status: 301, "
+        "header_order: \"connection_then_location\", query: \"discard\", scheme: \"http\", "
+        "server: \"nginx/1.29.7\", port: \"omit\", reason: \"Moved Permanently\", "
+        "connection: \"close\", static_authority: \"redirect.example\", date: \"current\", "
+        "path: \"static\", authority: \"static\"}) }\n";
+    auto lexed = lex(lit(source));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    REQUIRE_EQ(ast->redirect_policies.len, 1u);
+    CHECK_EQ(ast->redirect_policies[0].authority, RedirectPolicyAuthority::Static);
+    CHECK(ast->redirect_policies[0].static_authority.eq(lit_str("redirect.example")));
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    REQUIRE(lower_to_rir(mir.value(), rir));
+    REQUIRE_EQ(rir.module.redirect_policy_count, 1u);
+    CHECK(redirect_policy_spec_valid(rir.module.redirect_policies[0]));
+    CHECK_EQ(rir.module.redirect_policies[0].scheme, RedirectPolicyScheme::Http);
+    CHECK_EQ(rir.module.redirect_policies[0].port, RedirectPolicyPort::Omit);
+    CHECK_EQ(rir.module.redirect_policies[0].path, RedirectPolicyPath::Static);
+    CHECK_EQ(rir.module.redirect_policies[0].query, RedirectPolicyQuery::Discard);
+    CHECK_EQ(rir.module.redirect_policies[0].date, RedirectPolicyDate::Current);
+    CHECK_EQ(rir.module.redirect_policies[0].connection, RedirectPolicyConnection::Close);
+    CHECK_EQ(rir.module.redirect_policies[0].status_code, 301u);
+    CHECK_NE(rir.module.redirect_policies[0].static_authority.ptr,
+             ast->redirect_policies[0].static_authority.ptr);
+    CHECK(rir.module.redirect_policies[0].static_authority.eq(lit_str("redirect.example")));
+    CHECK_EQ(rir.module.redirect_policies[0].header_order,
+             RedirectPolicyHeaderOrder::ConnectionThenLocation);
+    rir.destroy();
+}
+
 TEST(frontend, inline_redirect_rejects_invalid_shape_and_duplicate_fields) {
     const char* sources[] = {
         "route GET \"/\" { return redirect({scheme: \"http\"}) }",
@@ -34678,6 +34718,27 @@ TEST(frontend, inline_redirect_rejects_invalid_shape_and_duplicate_fields) {
         "\"current\", connection: \"close\", header_order: \"connection_then_location\", "
         "status: 301, reason: \"Moved Permanently\", server: \"s\", content_type: "
         "\"text/html\", target_path: \"/x\", body: b\"\"}) }",
+        "route GET \"/\" { return redirect({scheme: \"http\", authority: \"static\", "
+        "static_authority: \"redirect.example\", port: \"omit\", path: \"static\", "
+        "query: \"discard\", date: \"current\", connection: \"close\", status: 301, "
+        "reason: \"Moved Permanently\", server: \"s\", content_type: \"text/html\", "
+        "target_path: \"/x\", body: b\"\"}) }",
+        "route GET \"/\" { return redirect({scheme: \"http\", authority: \"static\", "
+        "static_authority: \"redirect.example\", port: \"omit\", path: \"static\", "
+        "query: \"discard\", date: \"current\", connection: \"close\", header_order: "
+        "\"connection_then_location\", status: 302, reason: \"Found\", server: \"s\", "
+        "content_type: \"text/html\", target_path: \"/x\", body: b\"\"}) }",
+        "route GET \"/\" { return redirect({scheme: \"http\", authority: \"request_host\", "
+        "port: \"actual_listener\", path: \"static\", query: \"preserve_raw\", date: "
+        "\"current\", connection: \"close\", header_order: \"location_then_connection\", "
+        "status: 301, reason: \"Moved Permanently\", server: \"s\", content_type: "
+        "\"text/html\", target_path: \"/x\", body: b\"\"}) }",
+        "route GET \"/\" { return redirect({scheme: \"http\", authority: \"static\", "
+        "static_authority: \"redirect.example\", static_authority: \"other.example\", port: "
+        "\"omit\", path: \"static\", query: \"discard\", date: \"current\", connection: "
+        "\"close\", header_order: \"connection_then_location\", status: 301, reason: "
+        "\"Moved Permanently\", server: \"s\", content_type: \"text/html\", target_path: "
+        "\"/x\", body: b\"\"}) }",
     };
     for (const char* source : sources) {
         auto lexed = lex(lit(source));

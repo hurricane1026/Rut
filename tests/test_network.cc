@@ -409,6 +409,17 @@ static RedirectPolicySpec make_test_redirect_policy() {
     return policy;
 }
 
+static RedirectPolicySpec make_test_fixed_redirect_policy() {
+    RedirectPolicySpec policy = make_test_redirect_policy();
+    policy.authority = RedirectPolicyAuthority::Static;
+    policy.port = RedirectPolicyPort::Omit;
+    policy.query = RedirectPolicyQuery::Discard;
+    policy.header_order = RedirectPolicyHeaderOrder::ConnectionThenLocation;
+    policy.static_authority = {"redirect.example", 16};
+    policy.target_path = {"/new", 4};
+    return policy;
+}
+
 // Date is the sole dynamic field in the pinned redirect wire vector. Keep the
 // comparison byte-exact everywhere else, including framing and body bytes.
 static bool normalize_redirect_date(u8* data, u32 len) {
@@ -433,6 +444,17 @@ static std::string expected_redirect_wire(const char* location) {
            "Content-Type: text/html\r\n"
            "Content-Length: 169\r\nLocation: " +
            location + "\r\nConnection: close\r\n\r\n" + kRedirectBody;
+}
+
+static std::string expected_fixed_redirect_wire() {
+    return std::string("HTTP/1.1 301 Moved Permanently\r\n") +
+           "Server: nginx/1.29.7\r\n"
+           "Date: XXXXXXXXXXXXXXXXXXXXXXXXXXXXX\r\n"
+           "Content-Type: text/html\r\n"
+           "Content-Length: 169\r\n"
+           "Connection: close\r\n"
+           "Location: http://redirect.example/new\r\n\r\n" +
+           kRedirectBody;
 }
 
 static u32 count_upstream_send_ops(const SmallLoop& loop, const Connection& conn) {
@@ -2259,6 +2281,51 @@ TEST(redirect, h1_serializer_preserves_query_and_actual_authority) {
     }
 }
 
+TEST(redirect, h1_fixed_serializer_owns_authority_discards_query_and_orders_headers) {
+    SmallLoop loop;
+    loop.setup();
+    loop.listener_context = {
+        ListenerAddress::IPv4Wildcard, ListenerTransport::Cleartext, static_cast<u16>(8080)};
+    RouteConfig cfg{};
+    REQUIRE(cfg.add_upstream("backend", 0x7F000001, 9000).has_value());
+    REQUIRE_EQ(cfg.add_redirect_policy(make_test_fixed_redirect_policy()), 1u);
+
+    const char* requests[] = {
+        "GET /old HTTP/1.1\r\nHost: first.example\r\nConnection: close\r\n\r\n",
+        "GET /old?x=1 HTTP/1.1\r\nHost: other.example\r\nConnection: close\r\n\r\n",
+        "GET /old?discard=1 HTTP/1.1\r\nHost: port.example:8081\r\nConnection: close\r\n\r\n",
+    };
+    const std::string expected = expected_fixed_redirect_wire();
+    REQUIRE_EQ(expected.size(), 366u);
+    for (const char* request : requests) {
+        auto* conn = loop.alloc_conn();
+        REQUIRE(conn != nullptr);
+        const u32 request_len = static_cast<u32>(strlen(request));
+        REQUIRE_EQ(conn->recv_buf.write(reinterpret_cast<const u8*>(request), request_len),
+                   request_len);
+        capture_request_metadata(*conn);
+        const char sentinel[] = "existing send state";
+        REQUIRE_EQ(
+            conn->send_buf.write(reinterpret_cast<const u8*>(sentinel), sizeof(sentinel) - 1),
+            sizeof(sentinel) - 1);
+        u8 output[4096]{};
+        u32 output_len = 0;
+        REQUIRE(build_redirect_response(*conn, cfg, 1, output, sizeof(output), &output_len));
+        REQUIRE(normalize_redirect_date(output, output_len));
+        CHECK_EQ(output_len, static_cast<u32>(expected.size()));
+        CHECK_EQ(__builtin_memcmp(output, expected.data(), expected.size()), 0);
+        CHECK_FALSE(buf_has(output, output_len, "redirect.example:8080"));
+        CHECK_FALSE(buf_has(output, output_len, "?x=1"));
+
+        u32 short_len = 999;
+        CHECK_FALSE(build_redirect_response(*conn, cfg, 1, output, output_len - 1, &short_len));
+        CHECK_EQ(short_len, 0u);
+        CHECK_EQ(conn->send_buf.len(), static_cast<u32>(sizeof(sentinel) - 1));
+        CHECK_EQ(__builtin_memcmp(conn->send_buf.data(), sentinel, sizeof(sentinel) - 1), 0);
+        loop.free_conn(*conn);
+    }
+}
+
 TEST(redirect, h1_serializer_rejects_ambiguous_input_atomically) {
     SmallLoop loop;
     loop.setup();
@@ -2267,9 +2334,27 @@ TEST(redirect, h1_serializer_rejects_ambiguous_input_atomically) {
     RouteConfig cfg{};
     REQUIRE(cfg.add_upstream("backend", 0x7F000001, 9000).has_value());
     REQUIRE_EQ(cfg.add_redirect_policy(make_test_redirect_policy()), 1u);
+    REQUIRE_EQ(cfg.add_redirect_policy(make_test_fixed_redirect_policy()), 2u);
+    {
+        const char request[] =
+            "GET /api HTTP/1.1\r\nHost: example.test:8081\r\nConnection: close\r\n\r\n";
+        auto* conn = loop.alloc_conn();
+        REQUIRE(conn != nullptr);
+        REQUIRE_EQ(conn->recv_buf.write(reinterpret_cast<const u8*>(request), sizeof(request) - 1),
+                   sizeof(request) - 1);
+        capture_request_metadata(*conn);
+        u8 output[4096]{};
+        u32 output_len = 123;
+        CHECK_FALSE(build_redirect_response(*conn, cfg, 1, output, sizeof(output), &output_len));
+        CHECK_EQ(output_len, 0u);
+        loop.free_conn(*conn);
+    }
     const char* requests[] = {
-        "GET /api HTTP/1.1\r\nHost: example.test:8081\r\nConnection: close\r\n\r\n",
+        "GET /api HTTP/1.1\r\nConnection: close\r\n\r\n",
         "GET /api HTTP/1.1\r\nHost: [::1]\r\nConnection: close\r\n\r\n",
+        "GET /api HTTP/1.1\r\nHost: example.test:0\r\nConnection: close\r\n\r\n",
+        "GET /api HTTP/1.1\r\nHost: example.test:65536\r\nConnection: close\r\n\r\n",
+        "GET /api HTTP/1.1\r\nHost: example.test:8080:9\r\nConnection: close\r\n\r\n",
         "GET /api HTTP/1.1\r\nHost: example.test\r\nHost: other\r\nConnection: close\r\n\r\n",
         "GET /api HTTP/1.1\r\nHost: example.test\r\n\r\n",
         "GET /api HTTP/1.1\r\nHost: example.test\r\nConnection: close, keep-alive\r\n\r\n",
@@ -2281,23 +2366,26 @@ TEST(redirect, h1_serializer_rejects_ambiguous_input_atomically) {
         "HTTP/1.1\r\n",
     };
     for (const char* request : requests) {
-        auto* conn = loop.alloc_conn();
-        REQUIRE(conn != nullptr);
-        const char sentinel[] = "preexisting output";
-        REQUIRE_EQ(
-            conn->send_buf.write(reinterpret_cast<const u8*>(sentinel), sizeof(sentinel) - 1),
-            sizeof(sentinel) - 1);
-        const u32 request_len = static_cast<u32>(strlen(request));
-        REQUIRE_EQ(conn->recv_buf.write(reinterpret_cast<const u8*>(request), request_len),
-                   request_len);
-        capture_request_metadata(*conn);
-        u8 output[4096]{};
-        u32 output_len = 123;
-        CHECK_FALSE(build_redirect_response(*conn, cfg, 1, output, sizeof(output), &output_len));
-        CHECK_EQ(output_len, 0u);
-        CHECK_EQ(conn->send_buf.len(), static_cast<u32>(sizeof(sentinel) - 1));
-        CHECK_EQ(__builtin_memcmp(conn->send_buf.data(), sentinel, sizeof(sentinel) - 1), 0);
-        loop.free_conn(*conn);
+        for (u16 policy_id = 1; policy_id <= 2; policy_id++) {
+            auto* conn = loop.alloc_conn();
+            REQUIRE(conn != nullptr);
+            const char sentinel[] = "preexisting output";
+            REQUIRE_EQ(
+                conn->send_buf.write(reinterpret_cast<const u8*>(sentinel), sizeof(sentinel) - 1),
+                sizeof(sentinel) - 1);
+            const u32 request_len = static_cast<u32>(strlen(request));
+            REQUIRE_EQ(conn->recv_buf.write(reinterpret_cast<const u8*>(request), request_len),
+                       request_len);
+            capture_request_metadata(*conn);
+            u8 output[4096]{};
+            u32 output_len = 123;
+            CHECK_FALSE(build_redirect_response(
+                *conn, cfg, policy_id, output, sizeof(output), &output_len));
+            CHECK_EQ(output_len, 0u);
+            CHECK_EQ(conn->send_buf.len(), static_cast<u32>(sizeof(sentinel) - 1));
+            CHECK_EQ(__builtin_memcmp(conn->send_buf.data(), sentinel, sizeof(sentinel) - 1), 0);
+            loop.free_conn(*conn);
+        }
     }
 }
 
@@ -2385,6 +2473,68 @@ TEST(redirect, h1_immediate_success_has_no_upstream_side_effect) {
     CHECK_EQ(loop.free_top, SmallLoop::kMaxConns);
 }
 
+TEST(redirect, h1_fixed_action_partial_send_and_epipe_are_local_and_terminal) {
+    SmallLoop loop;
+    loop.setup();
+    loop.listener_context = {
+        ListenerAddress::IPv4Wildcard, ListenerTransport::Cleartext, static_cast<u16>(8080)};
+    RouteConfig cfg{};
+    REQUIRE(cfg.add_upstream("backend", 0x7F000001, 9000).has_value());
+    REQUIRE_EQ(cfg.add_redirect_policy(make_test_fixed_redirect_policy()), 1u);
+    const char request[] =
+        "GET /old?x=1 HTTP/1.1\r\nHost: client.example:8081\r\nConnection: close\r\n\r\n";
+    auto dispatch = [&](Connection& conn) {
+        REQUIRE_EQ(conn.recv_buf.write(reinterpret_cast<const u8*>(request), sizeof(request) - 1),
+                   sizeof(request) - 1);
+        capture_request_metadata(conn);
+        conn.request_config = &cfg;
+        loop.backend.clear_ops();
+        JitDispatchOutcome outcome{};
+        outcome.kind = JitDispatchOutcome::Kind::Redirect;
+        outcome.redirect_policy_id = 1;
+        handle_jit_outcome<SmallLoop>(&loop, conn, outcome, nullptr, true);
+        CHECK_EQ(conn.resp_status, 301u);
+        CHECK_EQ(conn.state, ConnState::Sending);
+        CHECK_EQ(conn.upstream_fd, -1);
+        CHECK_FALSE(conn.upstream_slot_held);
+        CHECK_EQ(loop.backend.count_ops(MockOp::Connect), 0u);
+        CHECK_EQ(count_upstream_send_ops(loop, conn), 0u);
+        CHECK_EQ(loop.backend.count_ops(MockOp::Send), 1u);
+        u8 normalized[SmallLoop::kBufSize]{};
+        REQUIRE(conn.send_buf.len() <= sizeof(normalized));
+        __builtin_memcpy(normalized, conn.send_buf.data(), conn.send_buf.len());
+        REQUIRE(normalize_redirect_date(normalized, conn.send_buf.len()));
+        const std::string expected = expected_fixed_redirect_wire();
+        REQUIRE_EQ(conn.send_buf.len(), static_cast<u32>(expected.size()));
+        CHECK_EQ(__builtin_memcmp(normalized, expected.data(), expected.size()), 0);
+    };
+
+    auto* completed = loop.alloc_conn();
+    REQUIRE(completed != nullptr);
+    const u32 completed_id = completed->id;
+    dispatch(*completed);
+    const u32 wire_len = completed->send_buf.len();
+    static constexpr u32 kPartial = 11;
+    REQUIRE_GT(wire_len, kPartial);
+    loop.inject_and_dispatch(make_ev(completed_id, IoEventType::Send, kPartial));
+    CHECK_EQ(completed->send_progress, kPartial);
+    const MockOp* remainder = loop.backend.last_op(MockOp::Send);
+    REQUIRE(remainder != nullptr);
+    CHECK_EQ(remainder->send_buf, completed->send_buf.data() + kPartial);
+    CHECK_EQ(remainder->send_len, wire_len - kPartial);
+    loop.inject_and_dispatch(
+        make_ev(completed_id, IoEventType::Send, static_cast<i32>(wire_len - kPartial)));
+    CHECK_EQ(loop.free_top, SmallLoop::kMaxConns);
+
+    auto* failed = loop.alloc_conn();
+    REQUIRE(failed != nullptr);
+    const u32 failed_id = failed->id;
+    dispatch(*failed);
+    loop.inject_and_dispatch(make_ev(failed_id, IoEventType::Send, -EPIPE));
+    CHECK_EQ(loop.free_top, SmallLoop::kMaxConns);
+    CHECK_EQ(loop.backend.count_ops(MockOp::Connect), 0u);
+}
+
 TEST(redirect, h1_timer_resume_uses_pinned_config_and_succeeds) {
     SmallLoop loop;
     loop.setup();
@@ -2396,7 +2546,7 @@ TEST(redirect, h1_timer_resume_uses_pinned_config_and_succeeds) {
     RouteConfig swapped{};
     REQUIRE(pinned.add_upstream("backend", 0x7F000001, 9000).has_value());
     REQUIRE(swapped.add_upstream("backend", 0x7F000001, 9000).has_value());
-    RedirectPolicySpec pinned_policy = make_test_redirect_policy();
+    RedirectPolicySpec pinned_policy = make_test_fixed_redirect_policy();
     RedirectPolicySpec swapped_policy = pinned_policy;
     swapped_policy.server = {"swapped", 7};
     REQUIRE_EQ(pinned.add_redirect_policy(pinned_policy), 1u);
@@ -2425,7 +2575,7 @@ TEST(redirect, h1_timer_resume_uses_pinned_config_and_succeeds) {
     REQUIRE(conn->send_buf.len() <= sizeof(normalized));
     __builtin_memcpy(normalized, conn->send_buf.data(), conn->send_buf.len());
     CHECK(normalize_redirect_date(normalized, conn->send_buf.len()));
-    const std::string expected = expected_redirect_wire("http://example.test:8080/api/");
+    const std::string expected = expected_fixed_redirect_wire();
     CHECK_EQ(conn->send_buf.len(), static_cast<u32>(expected.size()));
     CHECK_EQ(__builtin_memcmp(normalized, expected.data(), expected.size()), 0);
     CHECK_EQ(conn->upstream_fd, -1);
@@ -2701,21 +2851,7 @@ TEST(redirect, h2_immediate_rejects_before_async_or_proxy) {
     REQUIRE(conn != nullptr);
     RouteConfig cfg{};
     REQUIRE(cfg.add_upstream("backend", 0x7F000001, 9000).has_value());
-    RedirectPolicySpec policy{};
-    policy.scheme = RedirectPolicyScheme::Http;
-    policy.authority = RedirectPolicyAuthority::RequestHost;
-    policy.port = RedirectPolicyPort::ActualListener;
-    policy.path = RedirectPolicyPath::Static;
-    policy.query = RedirectPolicyQuery::PreserveRaw;
-    policy.date = RedirectPolicyDate::Current;
-    policy.connection = RedirectPolicyConnection::Close;
-    policy.header_order = RedirectPolicyHeaderOrder::LocationThenConnection;
-    policy.status_code = 301;
-    policy.reason = {"Moved Permanently", 16};
-    policy.server = {"rut", 3};
-    policy.content_type = {"text/html", 9};
-    policy.target_path = {"/api/", 5};
-    REQUIRE_EQ(cfg.add_redirect_policy(policy), 1u);
+    REQUIRE_EQ(cfg.add_redirect_policy(make_test_fixed_redirect_policy()), 1u);
     Http2Conn h2{};
     h2.init();
     conn->h2 = &h2;

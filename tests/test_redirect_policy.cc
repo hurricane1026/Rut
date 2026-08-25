@@ -33,6 +33,17 @@ RedirectPolicySpec policy(Str body = lit_str("ok")) {
     return result;
 }
 
+RedirectPolicySpec fixed_policy(Str body = lit_str("ok")) {
+    RedirectPolicySpec result = policy(body);
+    result.authority = RedirectPolicyAuthority::Static;
+    result.port = RedirectPolicyPort::Omit;
+    result.query = RedirectPolicyQuery::Discard;
+    result.header_order = RedirectPolicyHeaderOrder::ConnectionThenLocation;
+    result.static_authority = lit_str("redirect.example");
+    result.target_path = lit_str("/new");
+    return result;
+}
+
 bool equal_bytes(const char* actual, u32 actual_len, const char* expected, u32 expected_len) {
     if (actual_len != expected_len) return false;
     for (u32 i = 0; i < actual_len; i++)
@@ -62,14 +73,12 @@ RedirectInventorySnapshot snapshot_redirect_inventory(const RouteConfig& cfg) {
     return snapshot;
 }
 
-bool redirect_inventory_matches(const RouteConfig& cfg,
-                                const RedirectInventorySnapshot& snapshot) {
+bool redirect_inventory_matches(const RouteConfig& cfg, const RedirectInventorySnapshot& snapshot) {
     return cfg.redirect_policy_count == snapshot.count &&
            cfg.redirect_policy_bytes_used == snapshot.bytes_used &&
            __builtin_memcmp(cfg.redirect_policies, snapshot.policies, sizeof(snapshot.policies)) ==
                0 &&
-           __builtin_memcmp(cfg.redirect_policy_bytes, snapshot.bytes, sizeof(snapshot.bytes)) ==
-               0;
+           __builtin_memcmp(cfg.redirect_policy_bytes, snapshot.bytes, sizeof(snapshot.bytes)) == 0;
 }
 
 }  // namespace
@@ -178,6 +187,37 @@ TEST(redirect_policy, rejects_invalid_enum_status_text_path_and_body_forms) {
     invalid = valid;
     invalid.target_path = {nullptr, 0};
     CHECK_FALSE(redirect_policy_spec_valid(invalid));
+}
+
+TEST(redirect_policy, fixed_profile_is_closed_and_cross_products_fail) {
+    const auto fixed = fixed_policy();
+    CHECK(redirect_policy_spec_valid(fixed));
+
+    auto invalid = fixed;
+    invalid.authority = RedirectPolicyAuthority::RequestHost;
+    CHECK_FALSE(redirect_policy_spec_valid(invalid));
+    invalid = fixed;
+    invalid.port = RedirectPolicyPort::ActualListener;
+    CHECK_FALSE(redirect_policy_spec_valid(invalid));
+    invalid = fixed;
+    invalid.query = RedirectPolicyQuery::PreserveRaw;
+    CHECK_FALSE(redirect_policy_spec_valid(invalid));
+    invalid = fixed;
+    invalid.header_order = RedirectPolicyHeaderOrder::LocationThenConnection;
+    CHECK_FALSE(redirect_policy_spec_valid(invalid));
+    invalid = fixed;
+    invalid.static_authority = {};
+    CHECK_FALSE(redirect_policy_spec_valid(invalid));
+    invalid = fixed;
+    invalid.static_authority = lit_str("user@redirect.example");
+    CHECK_FALSE(redirect_policy_spec_valid(invalid));
+    invalid = fixed;
+    invalid.status_code = 302;
+    CHECK_FALSE(redirect_policy_spec_valid(invalid));
+
+    invalid = policy();
+    invalid.status_code = 399;
+    CHECK(redirect_policy_spec_valid(invalid));
 }
 
 TEST(redirect_policy, static_authority_foundation_accepts_only_bounded_dns_ipv4_shape) {
@@ -440,7 +480,6 @@ TEST(redirect_policy, partial_fixed_profile_rejects_without_destination_mutation
     partial.static_authority = lit_str("redirect.example");
     partial.port = RedirectPolicyPort::Omit;
     partial.query = RedirectPolicyQuery::Discard;
-    partial.header_order = RedirectPolicyHeaderOrder::ConnectionThenLocation;
     CHECK_FALSE(redirect_policy_spec_valid(partial));
 
     rir::Module mod{};
@@ -558,6 +597,48 @@ TEST(redirect_policy, source_redirect_reaches_owned_route_config) {
                       cfg.redirect_policies[0].target_path.len,
                       "/api/",
                       5));
+    rir.destroy();
+}
+
+TEST(redirect_policy, fixed_source_reaches_rir_and_owned_route_config) {
+    const char source[] =
+        "route GET \"/old\" { return redirect({"
+        "scheme: \"http\", authority: \"static\", static_authority: \"redirect.example\", "
+        "port: \"omit\", path: \"static\", query: \"discard\", date: \"current\", "
+        "connection: \"close\", header_order: \"connection_then_location\", status: 301, "
+        "reason: \"Moved Permanently\", server: \"nginx/1.29.7\", "
+        "content_type: \"text/html\", target_path: \"/new\", body: b\"fixed\"}) }\n";
+    auto lexed = lex(source_lit(source));
+    REQUIRE(lexed);
+    auto ast_result = parse_file(lexed.value());
+    REQUIRE(ast_result);
+    std::unique_ptr<AstFile> ast(ast_result.value());
+    auto hir_result = analyze_file(*ast);
+    REQUIRE(hir_result);
+    std::unique_ptr<HirModule> hir(hir_result.value());
+    auto mir_result = build_mir(*hir);
+    REQUIRE(mir_result);
+    std::unique_ptr<MirModule> mir(mir_result.value());
+
+    FrontendRirModule rir{};
+    REQUIRE(lower_to_rir(*mir, rir));
+    REQUIRE_EQ(rir.module.redirect_policy_count, 1u);
+    const auto& lowered = rir.module.redirect_policies[0];
+    CHECK_EQ(lowered.authority, RedirectPolicyAuthority::Static);
+    CHECK_EQ(lowered.port, RedirectPolicyPort::Omit);
+    CHECK_EQ(lowered.query, RedirectPolicyQuery::Discard);
+    CHECK_EQ(lowered.header_order, RedirectPolicyHeaderOrder::ConnectionThenLocation);
+    CHECK(lowered.static_authority.eq(lit_str("redirect.example")));
+
+    RouteConfig cfg{};
+    REQUIRE(populate_route_config(cfg, rir.module));
+    REQUIRE_EQ(cfg.redirect_policy_count, 1u);
+    const auto& owned = cfg.redirect_policies[0];
+    CHECK(redirect_policy_spec_valid(owned));
+    CHECK_NE(owned.static_authority.ptr, lowered.static_authority.ptr);
+    CHECK(owned.static_authority.eq(lit_str("redirect.example")));
+    CHECK(owned.target_path.eq(lit_str("/new")));
+    CHECK(owned.body.eq(lit_str("fixed")));
     rir.destroy();
 }
 

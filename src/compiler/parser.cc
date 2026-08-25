@@ -1751,7 +1751,8 @@ struct Parser {
                 bool have_path = false, have_query = false, have_date = false;
                 bool have_connection = false, have_status = false, have_reason = false;
                 bool have_server = false, have_content_type = false, have_target_path = false;
-                bool have_body = false;
+                bool have_body = false, have_static_authority = false;
+                bool have_header_order = false, have_new_selector = false;
                 while (true) {
                     auto field = expect(TokenType::Ident);
                     if (!field) return core::make_unexpected(field.error());
@@ -1772,20 +1773,30 @@ struct Parser {
                         seen = &have_authority;
                         auto v = expect(TokenType::StringLit);
                         if (!v) return core::make_unexpected(v.error());
-                        if (!v.value()->text.eq({"request_host", 12}))
+                        if (v.value()->text.eq({"request_host", 12})) {
+                            policy.authority = RedirectPolicyAuthority::RequestHost;
+                        } else if (v.value()->text.eq({"static", 6})) {
+                            policy.authority = RedirectPolicyAuthority::Static;
+                            have_new_selector = true;
+                        } else {
                             return frontend_error(FrontendError::UnsupportedSyntax,
                                                   span_from(*v.value()),
                                                   v.value()->text);
-                        policy.authority = RedirectPolicyAuthority::RequestHost;
+                        }
                     } else if (name.eq({"port", 4})) {
                         seen = &have_port;
                         auto v = expect(TokenType::StringLit);
                         if (!v) return core::make_unexpected(v.error());
-                        if (!v.value()->text.eq({"actual_listener", 15}))
+                        if (v.value()->text.eq({"actual_listener", 15})) {
+                            policy.port = RedirectPolicyPort::ActualListener;
+                        } else if (v.value()->text.eq({"omit", 4})) {
+                            policy.port = RedirectPolicyPort::Omit;
+                            have_new_selector = true;
+                        } else {
                             return frontend_error(FrontendError::UnsupportedSyntax,
                                                   span_from(*v.value()),
                                                   v.value()->text);
-                        policy.port = RedirectPolicyPort::ActualListener;
+                        }
                     } else if (name.eq({"path", 4})) {
                         seen = &have_path;
                         auto v = expect(TokenType::StringLit);
@@ -1799,11 +1810,16 @@ struct Parser {
                         seen = &have_query;
                         auto v = expect(TokenType::StringLit);
                         if (!v) return core::make_unexpected(v.error());
-                        if (!v.value()->text.eq({"preserve_raw", 12}))
+                        if (v.value()->text.eq({"preserve_raw", 12})) {
+                            policy.query = RedirectPolicyQuery::PreserveRaw;
+                        } else if (v.value()->text.eq({"discard", 7})) {
+                            policy.query = RedirectPolicyQuery::Discard;
+                            have_new_selector = true;
+                        } else {
                             return frontend_error(FrontendError::UnsupportedSyntax,
                                                   span_from(*v.value()),
                                                   v.value()->text);
-                        policy.query = RedirectPolicyQuery::PreserveRaw;
+                        }
                     } else if (name.eq({"date", 4})) {
                         seen = &have_date;
                         auto v = expect(TokenType::StringLit);
@@ -1822,6 +1838,20 @@ struct Parser {
                                                   span_from(*v.value()),
                                                   v.value()->text);
                         policy.connection = RedirectPolicyConnection::Close;
+                    } else if (name.eq({"header_order", 12})) {
+                        seen = &have_header_order;
+                        have_new_selector = true;
+                        auto v = expect(TokenType::StringLit);
+                        if (!v) return core::make_unexpected(v.error());
+                        if (v.value()->text.eq({"location_then_connection", 24})) {
+                            policy.header_order = RedirectPolicyHeaderOrder::LocationThenConnection;
+                        } else if (v.value()->text.eq({"connection_then_location", 24})) {
+                            policy.header_order = RedirectPolicyHeaderOrder::ConnectionThenLocation;
+                        } else {
+                            return frontend_error(FrontendError::UnsupportedSyntax,
+                                                  span_from(*v.value()),
+                                                  v.value()->text);
+                        }
                     } else if (name.eq({"status", 6})) {
                         seen = &have_status;
                         auto v = expect(TokenType::IntLit);
@@ -1847,6 +1877,12 @@ struct Parser {
                         auto v = expect(TokenType::StringLit);
                         if (!v) return core::make_unexpected(v.error());
                         policy.content_type = v.value()->text;
+                    } else if (name.eq({"static_authority", 16})) {
+                        seen = &have_static_authority;
+                        have_new_selector = true;
+                        auto v = expect(TokenType::StringLit);
+                        if (!v) return core::make_unexpected(v.error());
+                        policy.static_authority = v.value()->text;
                     } else if (name.eq({"target_path", 11})) {
                         seen = &have_target_path;
                         auto v = expect(TokenType::StringLit);
@@ -1870,9 +1906,16 @@ struct Parser {
                 }
                 auto rbrace = expect(TokenType::RBrace);
                 if (!rbrace) return core::make_unexpected(rbrace.error());
+                const bool complete_fixed_source =
+                    have_new_selector && have_static_authority && have_header_order &&
+                    policy.authority == RedirectPolicyAuthority::Static &&
+                    policy.port == RedirectPolicyPort::Omit &&
+                    policy.query == RedirectPolicyQuery::Discard &&
+                    policy.header_order == RedirectPolicyHeaderOrder::ConnectionThenLocation;
                 if (!have_scheme || !have_authority || !have_port || !have_path || !have_query ||
                     !have_date || !have_connection || !have_status || !have_reason ||
                     !have_server || !have_content_type || !have_target_path || !have_body ||
+                    (have_new_selector && !complete_fixed_source) ||
                     !redirect_policy_spec_valid(policy))
                     return frontend_error(FrontendError::UnsupportedSyntax,
                                           span_from(*rbrace.value()),

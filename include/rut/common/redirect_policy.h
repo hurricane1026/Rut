@@ -112,8 +112,8 @@ inline bool redirect_policy_safe_static_authority(Str value) {
             label_len = 0;
             continue;
         }
-        const bool alphanumeric = (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
-                                  (c >= '0' && c <= '9');
+        const bool alphanumeric =
+            (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9');
         if ((!alphanumeric && c != '-') || (label_len == 0 && !alphanumeric) || label_len == 63)
             return false;
         label_len++;
@@ -126,16 +126,21 @@ inline bool redirect_policy_safe_body(Str value) {
 }
 
 inline bool redirect_policy_spec_valid(const RedirectPolicySpec& policy) {
-    if (policy.scheme != RedirectPolicyScheme::Http ||
-        policy.authority != RedirectPolicyAuthority::RequestHost ||
-        policy.port != RedirectPolicyPort::ActualListener ||
-        policy.path != RedirectPolicyPath::Static ||
-        policy.query != RedirectPolicyQuery::PreserveRaw ||
+    const bool legacy_profile =
+        policy.authority == RedirectPolicyAuthority::RequestHost &&
+        policy.port == RedirectPolicyPort::ActualListener &&
+        policy.query == RedirectPolicyQuery::PreserveRaw &&
+        policy.header_order == RedirectPolicyHeaderOrder::LocationThenConnection &&
+        policy.static_authority.len == 0 && policy.status_code >= 300 && policy.status_code <= 399;
+    const bool fixed_profile =
+        policy.authority == RedirectPolicyAuthority::Static &&
+        policy.port == RedirectPolicyPort::Omit && policy.query == RedirectPolicyQuery::Discard &&
+        policy.header_order == RedirectPolicyHeaderOrder::ConnectionThenLocation &&
+        policy.status_code == 301 && redirect_policy_safe_static_authority(policy.static_authority);
+    if (policy.scheme != RedirectPolicyScheme::Http || policy.path != RedirectPolicyPath::Static ||
         policy.date != RedirectPolicyDate::Current ||
         policy.connection != RedirectPolicyConnection::Close ||
-        policy.header_order != RedirectPolicyHeaderOrder::LocationThenConnection ||
-        policy.static_authority.len != 0 || policy.status_code < 300 ||
-        policy.status_code > 399 ||
+        (!legacy_profile && !fixed_profile) ||
         !redirect_policy_safe_text(policy.reason, kMaxRedirectReasonLen) ||
         !redirect_policy_safe_text(policy.server, kMaxRedirectServerLen) ||
         !redirect_policy_safe_text(policy.content_type, kMaxRedirectContentTypeLen) ||
@@ -151,10 +156,9 @@ inline bool redirect_policy_spec_equal(const RedirectPolicySpec& a, const Redire
     return a.scheme == b.scheme && a.authority == b.authority && a.port == b.port &&
            a.path == b.path && a.query == b.query && a.date == b.date &&
            a.connection == b.connection && a.header_order == b.header_order &&
-           a.status_code == b.status_code &&
-           a.reason.eq(b.reason) && a.server.eq(b.server) && a.content_type.eq(b.content_type) &&
-           a.static_authority.eq(b.static_authority) && a.target_path.eq(b.target_path) &&
-           a.body.eq(b.body);
+           a.status_code == b.status_code && a.reason.eq(b.reason) && a.server.eq(b.server) &&
+           a.content_type.eq(b.content_type) && a.static_authority.eq(b.static_authority) &&
+           a.target_path.eq(b.target_path) && a.body.eq(b.body);
 }
 
 inline bool redirect_policy_table_valid(const RedirectPolicySpec* specs, u32 count) {

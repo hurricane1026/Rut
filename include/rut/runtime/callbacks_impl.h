@@ -8372,6 +8372,7 @@ inline u32 strict_response_date(char* out, u64 now_us) {
 struct RedirectAuthorityView {
     Str value{};
     bool has_port = false;
+    u16 port = 0;
 };
 
 inline bool redirect_name_eq(Str name, const char* literal, u32 literal_len) {
@@ -8387,10 +8388,8 @@ inline bool redirect_connection_close(Str value) {
     return end - start == 5 && http_header_name_eq_ci(value.ptr + start, 5, "close", 5);
 }
 
-inline bool redirect_authority_valid(Str value, u16 actual_port, RedirectAuthorityView* out) {
-    if (out == nullptr || value.ptr == nullptr || value.len == 0 || value.len > 255 ||
-        actual_port == 0)
-        return false;
+inline bool redirect_authority_syntax_valid(Str value, RedirectAuthorityView* out) {
+    if (out == nullptr || value.ptr == nullptr || value.len == 0 || value.len > 255) return false;
     u32 colon = value.len;
     for (u32 i = 0; i < value.len; i++) {
         const u8 c = static_cast<u8>(value.ptr[i]);
@@ -8404,16 +8403,16 @@ inline bool redirect_authority_valid(Str value, u16 actual_port, RedirectAuthori
     }
     if (colon == 0) return false;
     const bool has_port = colon != value.len;
+    u32 parsed_port = 0;
     if (has_port) {
         if (colon + 1 == value.len) return false;
-        u32 parsed = 0;
         for (u32 i = colon + 1; i < value.len; i++) {
             const u8 c = static_cast<u8>(value.ptr[i]);
             if (c < '0' || c > '9') return false;
-            if (parsed > 6553u || (parsed == 6553u && c > '5')) return false;
-            parsed = parsed * 10u + static_cast<u32>(c - '0');
+            if (parsed_port > 6553u || (parsed_port == 6553u && c > '5')) return false;
+            parsed_port = parsed_port * 10u + static_cast<u32>(c - '0');
         }
-        if (parsed == 0 || parsed != actual_port) return false;
+        if (parsed_port == 0) return false;
     }
     const u32 host_len = has_port ? colon : value.len;
     for (u32 i = 0; i < host_len; i++) {
@@ -8424,10 +8423,17 @@ inline bool redirect_authority_valid(Str value, u16 actual_port, RedirectAuthori
     }
     out->value = value;
     out->has_port = has_port;
+    out->port = static_cast<u16>(parsed_port);
     return true;
 }
 
+inline bool redirect_legacy_authority_matches_listener(const RedirectAuthorityView& authority,
+                                                       u16 actual_port) {
+    return actual_port != 0 && (!authority.has_port || authority.port == actual_port);
+}
+
 inline bool redirect_origin_request_valid(const Connection& conn,
+                                          bool require_listener_port_match,
                                           ParsedRequest* out_req,
                                           u32* out_target_start,
                                           u32* out_path_len,
@@ -8474,7 +8480,9 @@ inline bool redirect_origin_request_valid(const Connection& conn,
         }
     }
     if (host_count != 1 || connection_count != 1 || host == nullptr ||
-        !redirect_authority_valid(host->value, conn.listener_context.port, out_authority))
+        !redirect_authority_syntax_valid(host->value, out_authority) ||
+        (require_listener_port_match &&
+         !redirect_legacy_authority_matches_listener(*out_authority, conn.listener_context.port)))
         return false;
 
     u32 path_len = target_len;
@@ -8511,12 +8519,13 @@ inline bool build_redirect_response(const Connection& conn,
         return false;
     const auto& policy = config.redirect_policies[policy_id - 1];
     if (!redirect_policy_spec_valid(policy)) return false;
+    const bool legacy_profile = policy.authority == RedirectPolicyAuthority::RequestHost;
 
     ParsedRequest req{};
     u32 target_start = 0, path_len = 0, query_len = 0;
     RedirectAuthorityView authority{};
     if (!redirect_origin_request_valid(
-            conn, &req, &target_start, &path_len, &query_len, &authority))
+            conn, legacy_profile, &req, &target_start, &path_len, &query_len, &authority))
         return false;
 
     char status[3] = {static_cast<char>('0' + policy.status_code / 100),
@@ -8527,11 +8536,15 @@ inline bool build_redirect_response(const Connection& conn,
     char actual_port[10];
     const u32 date_len = strict_response_date(date, realtime_us());
     const u32 body_len_digits = strict_response_dec(body_len, policy.body.len);
-    const u32 actual_port_digits = strict_response_dec(actual_port, conn.listener_context.port);
-    if (date_len == 0 || actual_port_digits == 0) return false;
+    const u32 actual_port_digits =
+        legacy_profile ? strict_response_dec(actual_port, conn.listener_context.port) : 0;
+    if (date_len == 0 || (legacy_profile && actual_port_digits == 0)) return false;
 
+    const Str location_authority = legacy_profile ? authority.value : policy.static_authority;
+    const bool append_listener_port = legacy_profile && !authority.has_port;
     const u32 authority_len =
-        authority.value.len + (authority.has_port ? 0u : 1u + actual_port_digits);
+        location_authority.len + (append_listener_port ? 1u + actual_port_digits : 0u);
+    const u32 location_query_len = legacy_profile ? query_len : 0;
     u64 required = 0;
     auto add = [&](u64 n) {
         if (n > 0xffffffffu - required) return false;
@@ -8539,11 +8552,15 @@ inline bool build_redirect_response(const Connection& conn,
         return true;
     };
     static constexpr char kLocationPrefix[] = "\r\nLocation: http://";
-    static constexpr char kTail[] = "\r\nConnection: close\r\n\r\n";
+    static constexpr char kLegacyTail[] = "\r\nConnection: close\r\n\r\n";
+    static constexpr char kFixedLocationPrefix[] = "\r\nConnection: close\r\nLocation: http://";
+    static constexpr char kFixedTail[] = "\r\n\r\n";
     if (!add(9 + 3 + 1 + policy.reason.len + 2) || !add(10 + policy.server.len) ||
         !add(8 + date_len) || !add(16 + policy.content_type.len) || !add(18 + body_len_digits) ||
-        !add(sizeof(kLocationPrefix) - 1 + authority_len) ||
-        !add(policy.target_path.len + query_len) || !add(sizeof(kTail) - 1) ||
+        !add((legacy_profile ? sizeof(kLocationPrefix) : sizeof(kFixedLocationPrefix)) - 1 +
+             authority_len) ||
+        !add(policy.target_path.len + location_query_len) ||
+        !add((legacy_profile ? sizeof(kLegacyTail) : sizeof(kFixedTail)) - 1) ||
         !add(policy.body.len) || required > out_cap)
         return false;
 
@@ -8563,12 +8580,15 @@ inline bool build_redirect_response(const Connection& conn,
         !put(date, date_len) || !put_lit("\r\nContent-Type: ") ||
         !put(policy.content_type.ptr, policy.content_type.len) ||
         !put_lit("\r\nContent-Length: ") || !put(body_len, body_len_digits) ||
-        !put(kLocationPrefix, sizeof(kLocationPrefix) - 1) ||
-        !put(authority.value.ptr, authority.value.len) ||
-        (!authority.has_port && (!put_lit(":") || !put(actual_port, actual_port_digits))) ||
+        !(legacy_profile ? put(kLocationPrefix, sizeof(kLocationPrefix) - 1)
+                         : put(kFixedLocationPrefix, sizeof(kFixedLocationPrefix) - 1)) ||
+        !put(location_authority.ptr, location_authority.len) ||
+        (append_listener_port && (!put_lit(":") || !put(actual_port, actual_port_digits))) ||
         !put(policy.target_path.ptr, policy.target_path.len) ||
-        !put(conn.recv_buf.data() + target_start + path_len, query_len) ||
-        !put(kTail, sizeof(kTail) - 1) || !put(policy.body.ptr, policy.body.len))
+        !put(conn.recv_buf.data() + target_start + path_len, location_query_len) ||
+        !(legacy_profile ? put(kLegacyTail, sizeof(kLegacyTail) - 1)
+                         : put(kFixedTail, sizeof(kFixedTail) - 1)) ||
+        !put(policy.body.ptr, policy.body.len))
         return false;
     *out_len = pos;
     return true;
