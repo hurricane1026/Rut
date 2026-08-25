@@ -68,6 +68,10 @@ static constexpr char kExactLocalOptionsCloseRequest[] =
     "OPTIONS /static HTTP/1.1\r\n"
     "Host: exact-local.example\r\n"
     "Connection: close\r\n\r\n";
+static constexpr char kExactLocalDeleteCloseRequest[] =
+    "DELETE /static HTTP/1.1\r\n"
+    "Host: exact-local.example\r\n"
+    "Connection: close\r\n\r\n";
 static constexpr char kExactLocalQueryCloseRequest[] =
     "GET /static?x=1 HTTP/1.1\r\n"
     "Host: exact-local.example\r\n"
@@ -6650,7 +6654,8 @@ struct ExactLocalReturnObservation {
 
 static constexpr size_t kExactLocalHeaderAbsentPostVectorIndex = 4;
 static constexpr size_t kExactLocalCl0PostVectorIndex = 5;
-static constexpr size_t kExactLocalReturnVectorCount = 10;
+static constexpr size_t kExactLocalDeleteVectorIndex = 7;
+static constexpr size_t kExactLocalReturnVectorCount = 11;
 
 static void dump_exact_local_return_observation(const ExactLocalReturnObservation& observation) {
     static constexpr const char* kLabels[] = {
@@ -6661,6 +6666,7 @@ static void dump_exact_local_return_observation(const ExactLocalReturnObservatio
         "POST header-absent close",
         "POST Content-Length: 0 close",
         "OPTIONS close",
+        "DELETE header-absent close",
         "GET query close",
         "GET /static/ fallback",
         "GET /static/child fallback",
@@ -6683,6 +6689,30 @@ static bool capture_pinned_exact_local_order(u16 frontend_port,
                                              bool exact_first,
                                              ExactLocalReturnObservation& observation,
                                              std::string& error) {
+    // A deliberately byte-exact #296 baseline request, not a general request
+    // parser: one close header and no framing, body, or tail.
+    const std::string delete_request(kExactLocalDeleteCloseRequest,
+                                     sizeof(kExactLocalDeleteCloseRequest) - 1u);
+    const size_t delete_close = delete_request.find("\r\nConnection: close\r\n");
+    const size_t delete_header_end = delete_request.find("\r\n\r\n");
+    if (delete_request !=
+            "DELETE /static HTTP/1.1\r\n"
+            "Host: exact-local.example\r\n"
+            "Connection: close\r\n\r\n" ||
+        delete_request.rfind("DELETE /static HTTP/1.1\r\n", 0) != 0 ||
+        delete_close == std::string::npos ||
+        delete_request.rfind("\r\nConnection: close\r\n") != delete_close ||
+        delete_request.find("\r\nContent-Length:") != std::string::npos ||
+        delete_request.find("\r\nTransfer-Encoding:") != std::string::npos ||
+        delete_request.find("\r\nTE:") != std::string::npos ||
+        delete_request.find("\r\nExpect:") != std::string::npos ||
+        delete_request.find("\r\nUpgrade:") != std::string::npos ||
+        delete_header_end == std::string::npos || delete_header_end + 4u != delete_request.size() ||
+        delete_request.rfind("\r\n\r\n") != delete_header_end) {
+        error = "pinned exact-local DELETE left the header-absent bounded domain";
+        return false;
+    }
+
     // This baseline is deliberately limited to the literal origin-form path
     // /static.  //static, percent-encoded spellings, and dot-segment aliases
     // are not converter-compatibility evidence for #286/#288.
@@ -6838,6 +6868,11 @@ static bool capture_pinned_exact_local_order(u16 frontend_port,
                           sizeof(kExactLocalOptionsCloseRequest) - 1u,
                           kExactLocalCloseResponseNormalized,
                           false) ||
+        !run_close_vector("DELETE /static header-absent close",
+                          kExactLocalDeleteCloseRequest,
+                          sizeof(kExactLocalDeleteCloseRequest) - 1u,
+                          kExactLocalCloseResponseNormalized,
+                          false) ||
         !run_close_vector("GET /static?x=1 close",
                           kExactLocalQueryCloseRequest,
                           sizeof(kExactLocalQueryCloseRequest) - 1u,
@@ -6933,6 +6968,18 @@ static bool run_pinned_exact_local_return_baseline(u16 frontend_port,
         }
         return true;
     };
+    const std::vector<char> expected_delete(
+        kExactLocalCloseResponseNormalized,
+        kExactLocalCloseResponseNormalized + sizeof(kExactLocalCloseResponseNormalized) - 1u);
+    std::vector<char> exact_first_delete = exact_first.wires[kExactLocalDeleteVectorIndex];
+    std::vector<char> root_first_delete = root_first.wires[kExactLocalDeleteVectorIndex];
+    if (!normalize_date(exact_first_delete) || !normalize_date(root_first_delete) ||
+        exact_first_delete != expected_delete || root_first_delete != expected_delete ||
+        exact_first_delete != root_first_delete) {
+        error =
+            "pinned exact-local DELETE did not equal the fixed oracle in both declaration orders";
+        return false;
+    }
     if (!normalized_wires_equal(
             exact_first.wires[kExactLocalHeaderAbsentPostVectorIndex],
             exact_first.wires[kExactLocalCl0PostVectorIndex],
@@ -8517,9 +8564,13 @@ int main(int argc, char** argv) {
         std::cerr
             << "PASS: pinned nginx exact /static local return is declaration-order independent; "
                "an explicit-close POST with exactly one Content-Length: 0 matches the adjacent "
-               "header-absent POST as exact 200/CL16/successor-static/EOF, while /static/ and "
-               "/static/child retain exactly two scoped proxy attempts (pinned-nginx-only "
-               "semantic baseline; no converter/RUT equivalence claim)\n";
+               "header-absent POST, and a fresh header-absent explicit-close DELETE /static in "
+               "both declaration orders yields exact 200/CL16/full successor-static/EOF; only "
+               "/static/ and /static/child retain exactly two scoped proxy attempts "
+               "(pinned-nginx-only semantic evidence; RUT equivalence remains blocked by #295 and "
+               "there is no converter equivalence claim; excludes DELETE CL including CL0, "
+               "body/framing, query, keep-alive/reuse/pipeline, other methods or paths, proxy "
+               "DELETE, and TLS/H2)\n";
         if (exact_local_return_baseline) return 0;
     }
 
