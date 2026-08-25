@@ -1,6 +1,7 @@
 #pragma once
 
 #include "rut/common/failure_policy.h"
+#include "rut/common/forward_preflight.h"
 #include "rut/common/forward_target_transform.h"
 #include "rut/common/redirect_policy.h"
 #include "rut/common/request_policy.h"
@@ -1135,6 +1136,10 @@ struct HirRoute {
     HirControl control{};
     bool allow_respond_effects = false;
     u32 error_variant_index = 0xffffffffu;
+    // Compiler-derived response-read-deadline preflight timing. The behavior-
+    // neutral foundation admits only None and EagerDirect; deferred selection
+    // remains a fail-closed reserved value.
+    ForwardPreflightMode forward_preflight_mode = ForwardPreflightMode::None;
     // @rateLimit decorators → stacked fixed-window rules (empty = no limit).
     // Flows to the RIR Function and on to RouteConfig rate-limit setup.
     RateLimitRuleSet rate_limit{};
@@ -1170,6 +1175,7 @@ struct HirRoute {
           control(other.control),
           allow_respond_effects(other.allow_respond_effects),
           error_variant_index(other.error_variant_index),
+          forward_preflight_mode(other.forward_preflight_mode),
           rate_limit(other.rate_limit),
           throttle_down_bps(other.throttle_down_bps),
           is_ws_terminate(other.is_ws_terminate),
@@ -1194,6 +1200,7 @@ struct HirRoute {
         control = other.control;
         allow_respond_effects = other.allow_respond_effects;
         error_variant_index = other.error_variant_index;
+        forward_preflight_mode = other.forward_preflight_mode;
         rate_limit = other.rate_limit;
         throttle_down_bps = other.throttle_down_bps;
         is_ws_terminate = other.is_ws_terminate;
@@ -1218,6 +1225,7 @@ struct HirRoute {
           control(other.control),
           allow_respond_effects(other.allow_respond_effects),
           error_variant_index(other.error_variant_index),
+          forward_preflight_mode(other.forward_preflight_mode),
           rate_limit(other.rate_limit),
           throttle_down_bps(other.throttle_down_bps),
           is_ws_terminate(other.is_ws_terminate),
@@ -1242,6 +1250,7 @@ struct HirRoute {
         control = other.control;
         allow_respond_effects = other.allow_respond_effects;
         error_variant_index = other.error_variant_index;
+        forward_preflight_mode = other.forward_preflight_mode;
         rate_limit = other.rate_limit;
         throttle_down_bps = other.throttle_down_bps;
         is_ws_terminate = other.is_ws_terminate;

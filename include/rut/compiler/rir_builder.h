@@ -136,6 +136,7 @@ struct Builder {
         fn->name = name;
         fn->route_pattern = route_pattern;
         fn->http_method = http_method;
+        fn->forward_preflight_mode = ForwardPreflightMode::None;
         fn->preflight_forward_policy_bundle_id = 0;
         fn->yield_count = 0;
         fn->state_zero_enters_entry = false;

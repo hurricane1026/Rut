@@ -1040,7 +1040,7 @@ inline bool response_read_deadline_fixed_upload_route_stable(const Connection& c
     const RouteEntry& pinned = config->routes[proof.route_index];
     if (pinned.action != RouteAction::JitHandler || pinned.fn != proof.route_fn ||
         pinned.needs_req_body || pinned.rate_limit.count != 0 || pinned.throttle_down_bps != 0 ||
-        pinned.ws_terminate ||
+        pinned.ws_terminate || pinned.forward_preflight_mode != ForwardPreflightMode::EagerDirect ||
         pinned.preflight_forward_policy_bundle_id != conn.response_read_deadline_bundle_id ||
         pinned.method != conn.response_read_deadline_route_method ||
         !response_read_deadline_route_method_matches(conn.req_method, pinned.method))
@@ -1079,7 +1079,16 @@ bool prepare_response_read_deadline_preflight(Loop* loop,
                                               Connection& conn,
                                               const RouteEntry* route,
                                               const RouteConfig* config) {
-    if (route == nullptr || route->preflight_forward_policy_bundle_id == 0) return true;
+    if (route == nullptr) return true;
+    if (route->forward_preflight_mode == ForwardPreflightMode::None &&
+        route->preflight_forward_policy_bundle_id == 0)
+        return true;
+    if (!forward_preflight_mode_valid(route->forward_preflight_mode) ||
+        route->forward_preflight_mode != ForwardPreflightMode::EagerDirect ||
+        route->preflight_forward_policy_bundle_id == 0) {
+        loop->close_conn(conn);
+        return false;
+    }
     constexpr bool supports_explicit_deadline = [] {
         if constexpr (requires { Loop::kSupportsExplicitFirstResponseDeadline; })
             return Loop::kSupportsExplicitFirstResponseDeadline;
@@ -3436,6 +3445,7 @@ void handle_jit_outcome(
                 if (selected->action != RouteAction::JitHandler || selected->needs_req_body ||
                     selected->rate_limit.count != 0 || selected->throttle_down_bps != 0 ||
                     selected->ws_terminate || selected->method != kRouteMethodGet ||
+                    selected->forward_preflight_mode != ForwardPreflightMode::EagerDirect ||
                     selected->preflight_forward_policy_bundle_id != outcome.policy_bundle_id ||
                     target.addr_count != 1 || target.addrs[0].sin_family != AF_INET ||
                     target.max_inflight != 0) {
@@ -7915,6 +7925,7 @@ inline bool validated_preconnect_failure_owner_is_stable(Loop* loop,
         if (route == nullptr || route->action != RouteAction::JitHandler || route->fn == nullptr ||
             route->needs_req_body || route->rate_limit.count != 0 ||
             route->throttle_down_bps != 0 || route->ws_terminate ||
+            route->forward_preflight_mode != ForwardPreflightMode::EagerDirect ||
             route->preflight_forward_policy_bundle_id != bundle_id ||
             route->method != conn.response_read_deadline_route_method ||
             conn.upstream_idx >= config->upstream_count ||

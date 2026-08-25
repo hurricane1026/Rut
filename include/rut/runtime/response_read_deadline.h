@@ -184,6 +184,7 @@ inline bool response_read_deadline_fixed_upload_materialization_is_stable(
     return route.action == RouteAction::JitHandler && route.fn == proof.route_fn &&
            route.fn != nullptr && !route.needs_req_body && route.rate_limit.count == 0 &&
            route.throttle_down_bps == 0 && !route.ws_terminate &&
+           route.forward_preflight_mode == ForwardPreflightMode::EagerDirect &&
            route.preflight_forward_policy_bundle_id == bundle_id && route.method == route_method &&
            response_read_deadline_route_method_matches(c.req_method, route.method) &&
            target.addr_count == 1 && target.addrs[0].sin_family == AF_INET &&
@@ -325,7 +326,9 @@ inline bool response_read_deadline_coalesced_get_phase1_proof_is_stable(
         (allow_retired_episode && proof.upload_episode == c.upstream_retiring_episode);
     return episode && route.action == RouteAction::JitHandler && route.fn == proof.route_fn &&
            !route.needs_req_body && route.rate_limit.count == 0 && route.throttle_down_bps == 0 &&
-           !route.ws_terminate && route.preflight_forward_policy_bundle_id == identity_bundle_id &&
+           !route.ws_terminate &&
+           route.forward_preflight_mode == ForwardPreflightMode::EagerDirect &&
+           route.preflight_forward_policy_bundle_id == identity_bundle_id &&
            route.method == kRouteMethodGet && target.addr_count == 1 &&
            target.addrs[0].sin_family == AF_INET && target.max_inflight == 0 &&
            c.req_header_end == proof.rewritten_header_end &&
@@ -543,6 +546,7 @@ inline bool http1_pipeline_successor_selected_identity_is_stable(
            !route.needs_req_body && route.rate_limit.count == 0 && route.throttle_down_bps == 0 &&
            !route.ws_terminate && route.method == kRouteMethodGet &&
            cfg->policy_bundle_id_is_valid(c.response_read_deadline_bundle_id) &&
+           route.forward_preflight_mode == ForwardPreflightMode::EagerDirect &&
            route.preflight_forward_policy_bundle_id == c.response_read_deadline_bundle_id &&
            target.addr_count == 1 && target.addrs[0].sin_family == AF_INET &&
            target.max_inflight == 0;
@@ -692,6 +696,7 @@ inline bool http1_pipeline_request_generation_prebuilt_is_stable(
     return bundle.response_buffering == copied_buffering &&
            route.action == RouteAction::JitHandler && route.fn == copied_proof.route_fn &&
            route.method == kRouteMethodGet &&
+           route.forward_preflight_mode == ForwardPreflightMode::EagerDirect &&
            route.preflight_forward_policy_bundle_id == copied_bundle_id && !route.needs_req_body &&
            route.rate_limit.count == 0 && route.throttle_down_bps == 0 && !route.ws_terminate &&
            target.addr_count == 1 && target.addrs[0].sin_family == AF_INET &&

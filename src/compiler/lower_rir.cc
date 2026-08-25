@@ -3217,7 +3217,9 @@ static FrontendResult<void> emit_term(const MirTerminator& term,
                 return frontend_error(FrontendError::OutOfMemory, term.span);
             if (term.forward_response_read_timeout_seconds != 0 ||
                 term.forward_response_buffering != ForwardResponseBufferingMode::None) {
-                if (fn == nullptr || fn->preflight_forward_policy_bundle_id != 0)
+                if (fn == nullptr ||
+                    fn->forward_preflight_mode != ForwardPreflightMode::EagerDirect ||
+                    fn->preflight_forward_policy_bundle_id != 0)
                     return frontend_error(FrontendError::UnsupportedSyntax, term.span);
                 fn->preflight_forward_policy_bundle_id = bundle_id;
             }
@@ -3933,13 +3935,22 @@ FrontendResult<void> lower_to_rir(const MirModule& mir, FrontendRirModule& out) 
         const MirTerminator* timeout_term = nullptr;
         for (u32 bi = 0; bi < mir.functions[i].blocks.len; bi++) {
             const auto& candidate = mir.functions[i].blocks[bi].term;
-            if (candidate.forward_response_read_timeout_seconds != 0) {
+            if (candidate.forward_response_read_timeout_seconds != 0 ||
+                candidate.forward_response_buffering != ForwardResponseBufferingMode::None) {
                 if (timeout_term != nullptr) {
                     out.destroy();
                     return frontend_error(FrontendError::UnsupportedSyntax, candidate.span);
                 }
                 timeout_term = &candidate;
             }
+        }
+        if (!forward_preflight_mode_valid(mir.functions[i].forward_preflight_mode) ||
+            mir.functions[i].forward_preflight_mode ==
+                ForwardPreflightMode::AfterCanonicalSelection ||
+            (timeout_term == nullptr) !=
+                (mir.functions[i].forward_preflight_mode == ForwardPreflightMode::None)) {
+            out.destroy();
+            return frontend_error(FrontendError::UnsupportedSyntax, mir.functions[i].span);
         }
         if (timeout_term != nullptr) {
             const auto& function = mir.functions[i];
@@ -3954,7 +3965,8 @@ FrontendResult<void> lower_to_rir(const MirModule& mir, FrontendRirModule& out) 
                 function.throttle_down_bps == 0 && timeout_term->forward_set_path.ptr == nullptr &&
                 timeout_term->forward_set_headers.len == 0 &&
                 !timeout_term->has_forward_target_transform &&
-                !timeout_term->commit_response_mutations &&
+                !timeout_term->commit_response_mutations && !function.is_timer &&
+                function.forward_preflight_mode == ForwardPreflightMode::EagerDirect &&
                 (!complete_buffering ||
                  (complete_content_length_route_method_is_admitted(function.method) &&
                   complete_content_length_request_policy_is_admitted(
@@ -3985,6 +3997,7 @@ FrontendResult<void> lower_to_rir(const MirModule& mir, FrontendRirModule& out) 
             return frontend_error(FrontendError::OutOfMemory, mir.functions[i].span);
         }
         fn.value()->rate_limit = mir.functions[i].rate_limit;
+        fn.value()->forward_preflight_mode = mir.functions[i].forward_preflight_mode;
         fn.value()->throttle_down_bps = mir.functions[i].throttle_down_bps;
         fn.value()->is_timer = mir.functions[i].is_timer;
         fn.value()->timer_interval_ms = mir.functions[i].timer_interval_ms;

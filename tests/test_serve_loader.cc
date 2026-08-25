@@ -88,6 +88,67 @@ TEST(serve_loader, status_routes_load) {
     program.destroy();
 }
 
+TEST(serve_loader, forward_preflight_mode_reaches_owned_routes_and_deferred_publication_rejects) {
+    static constexpr char kSource[] = R"rut(
+upstream b at "127.0.0.1:9000"
+route GET "/buffered" {
+    return forward(b,
+        response_policy: { version: "HTTP/1.1", framing: "content_length",
+            connection: "request", server: "s", date: "current", hide_headers: [] },
+        failure_policy: { version: "HTTP/1.1", status: 502, reason: "Bad Gateway",
+            content_type: "text/plain", server: "s", date: "current",
+            connection: "request", body: b"bad" },
+        timeout_failure_policy: { version: "HTTP/1.1", status: 504,
+            reason: "Gateway Time-out", content_type: "text/plain", server: "s",
+            date: "current", connection: "request", body: b"slow" },
+        response_read_timeout: 1s,
+        response_buffering: "complete_content_length")
+}
+route GET "/plain" { return 204 }
+)rut";
+    const std::string path =
+        write_file("/tmp/rut_serve_loader_forward_preflight", "app.rut", kSource);
+
+    LoadedProgram program;
+    LoadError err;
+    REQUIRE(load_rut_program(path.c_str(), program, err));
+    REQUIRE_EQ(program.rir.module.func_count, 2u);
+    REQUIRE_EQ(program.config.route_count, 2u);
+    CHECK_EQ(program.rir.module.functions[0].forward_preflight_mode,
+             ForwardPreflightMode::EagerDirect);
+    CHECK_EQ(program.rir.module.functions[0].preflight_forward_policy_bundle_id, 1u);
+    CHECK_EQ(program.config.routes[0].forward_preflight_mode, ForwardPreflightMode::EagerDirect);
+    CHECK_EQ(program.config.routes[0].preflight_forward_policy_bundle_id, 1u);
+    CHECK_EQ(program.config.routes[1].forward_preflight_mode, ForwardPreflightMode::None);
+    CHECK_EQ(program.config.routes[1].preflight_forward_policy_bundle_id, 0u);
+    REQUIRE_EQ(program.config.policy_bundle_count, 1u);
+    CHECK_EQ(program.config.policy_bundles[0].response_buffering,
+             ForwardResponseBufferingMode::CompleteContentLength);
+
+    auto unpublished = std::make_unique<RouteConfig>();
+    REQUIRE(populate_route_config(*unpublished, program.rir.module));
+    REQUIRE_EQ(unpublished->route_count, 0u);
+    const u32 upstream_count = unpublished->upstream_count;
+    const u32 policy_bundle_count = unpublished->policy_bundle_count;
+    std::vector<u8> unpublished_before(sizeof(RouteConfig));
+    __builtin_memcpy(unpublished_before.data(), unpublished.get(), sizeof(RouteConfig));
+    program.rir.module.functions[0].forward_preflight_mode =
+        ForwardPreflightMode::AfterCanonicalSelection;
+    CHECK_FALSE(register_jit_routes(*unpublished, program.rir.module, program.engine));
+    CHECK_EQ(unpublished->route_count, 0u);
+    CHECK_EQ(unpublished->upstream_count, upstream_count);
+    CHECK_EQ(unpublished->policy_bundle_count, policy_bundle_count);
+    CHECK_EQ(__builtin_memcmp(unpublished_before.data(), unpublished.get(), sizeof(RouteConfig)),
+             0);
+
+    program.rir.module.functions[0].forward_preflight_mode = ForwardPreflightMode::EagerDirect;
+    program.rir.destroy();
+    CHECK_EQ(program.config.routes[0].forward_preflight_mode, ForwardPreflightMode::EagerDirect);
+    CHECK_EQ(program.config.routes[0].preflight_forward_policy_bundle_id, 1u);
+    CHECK_EQ(program.config.routes[1].forward_preflight_mode, ForwardPreflightMode::None);
+    program.destroy();
+}
+
 TEST(serve_loader, eighty_route_source_registers_all_routes) {
     const std::string dir = "/tmp/rut_serve_loader_eighty_routes";
     const std::string source = make_eighty_route_source();

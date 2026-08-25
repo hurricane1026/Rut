@@ -955,6 +955,29 @@ void print_function(PrintBuf& buf, const Function& fn) {
     buf.put_str(fn.route_pattern);
     buf.newline();
 
+    if (fn.forward_preflight_mode != ForwardPreflightMode::None ||
+        fn.preflight_forward_policy_bundle_id != 0) {
+        buf.indent(1);
+        buf.put_cstr("forward_preflight: ");
+        switch (fn.forward_preflight_mode) {
+            case ForwardPreflightMode::None:
+                buf.put_cstr("none");
+                break;
+            case ForwardPreflightMode::EagerDirect:
+                buf.put_cstr("eager_direct");
+                break;
+            case ForwardPreflightMode::AfterCanonicalSelection:
+                buf.put_cstr("after_canonical_selection");
+                break;
+            default:
+                buf.put_cstr("invalid");
+                break;
+        }
+        buf.put_cstr(" bundle=");
+        buf.put_u32(fn.preflight_forward_policy_bundle_id);
+        buf.newline();
+    }
+
     buf.indent(1);
     buf.put_cstr("io_points: ");
     buf.put_u32(fn.yield_count);

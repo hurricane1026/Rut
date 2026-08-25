@@ -1347,6 +1347,24 @@ TEST(response_read_timeout, h1_route_preflight_closes_before_body_wait_or_handle
     CHECK_EQ(loop.backend.count_ops(MockOp::Connect), 0u);
     CHECK_EQ(loop.backend.count_ops(MockOp::Send), 0u);
     CHECK_EQ(__builtin_memcmp(loop.recv_storage[conn_id], kRequest, sizeof(kRequest) - 1), 0);
+
+    // A forged deferred marker is represented but cannot enter the eager
+    // preflight or handler path in this behavior-neutral phase.
+    config.routes[0].forward_preflight_mode = ForwardPreflightMode::AfterCanonicalSelection;
+    auto* deferred = loop.alloc_conn();
+    REQUIRE(deferred != nullptr);
+    const u32 deferred_id = deferred->id;
+    REQUIRE_EQ(
+        deferred->recv_buf.write(reinterpret_cast<const u8*>(kRequest), sizeof(kRequest) - 1),
+        sizeof(kRequest) - 1);
+    loop.backend.clear_ops();
+    on_header_received<SmallLoop>(
+        &loop, *deferred, make_ev(deferred_id, IoEventType::Recv, sizeof(kRequest) - 1));
+    CHECK_EQ(response_read_timeout_preflight_handler_calls, 0u);
+    CHECK_EQ(loop.free_top, SmallLoop::kMaxConns);
+    CHECK_EQ(loop.backend.count_ops(MockOp::Recv), 0u);
+    CHECK_EQ(loop.backend.count_ops(MockOp::Connect), 0u);
+    CHECK_EQ(loop.backend.count_ops(MockOp::Send), 0u);
 }
 
 TEST(response_buffering, unsupported_loop_rejects_before_handler_or_forward_effects) {
@@ -1408,12 +1426,69 @@ TEST(response_buffering, unsupported_loop_rejects_before_handler_or_forward_effe
 TEST(response_read_timeout, route_preflight_marker_fails_closed_for_every_nonzero_shape) {
     RouteConfig duration{};
     REQUIRE_EQ(duration.add_policy_bundle(0, 0, 0, 5), 1u);
+    REQUIRE(duration.add_jit_handler(
+        "/legacy", kRouteMethodGet, &response_read_timeout_preflight_handler, false, 1));
+    REQUIRE_EQ(duration.route_count, 1u);
+    CHECK_EQ(duration.routes[0].forward_preflight_mode, ForwardPreflightMode::EagerDirect);
+    CHECK_EQ(duration.routes[0].preflight_forward_policy_bundle_id, 1u);
+    REQUIRE(duration.add_jit_handler("/plain",
+                                     kRouteMethodGet,
+                                     &response_read_timeout_later_handler,
+                                     false,
+                                     ForwardPreflightMode::None,
+                                     0));
+    REQUIRE_EQ(duration.route_count, 2u);
+    CHECK_EQ(duration.routes[1].forward_preflight_mode, ForwardPreflightMode::None);
+    CHECK_EQ(duration.routes[1].preflight_forward_policy_bundle_id, 0u);
+
+    const u32 stable_route_count = duration.route_count;
+    std::vector<u8> stable_config(sizeof(RouteConfig));
+    __builtin_memcpy(stable_config.data(), &duration, sizeof(RouteConfig));
+    CHECK_FALSE(duration.add_jit_handler("/none-with-id",
+                                         kRouteMethodGet,
+                                         &response_read_timeout_preflight_handler,
+                                         false,
+                                         ForwardPreflightMode::None,
+                                         1));
+    CHECK_FALSE(duration.add_jit_handler("/eager-without-id",
+                                         kRouteMethodGet,
+                                         &response_read_timeout_preflight_handler,
+                                         false,
+                                         ForwardPreflightMode::EagerDirect,
+                                         0));
+    CHECK_FALSE(duration.add_jit_handler("/deferred",
+                                         kRouteMethodGet,
+                                         &response_read_timeout_preflight_handler,
+                                         false,
+                                         ForwardPreflightMode::AfterCanonicalSelection,
+                                         1));
+    CHECK_FALSE(duration.add_jit_handler("/invalid",
+                                         kRouteMethodGet,
+                                         &response_read_timeout_preflight_handler,
+                                         false,
+                                         static_cast<ForwardPreflightMode>(0xff),
+                                         1));
+    CHECK_FALSE(duration.add_jit_handler("/bad-id",
+                                         kRouteMethodGet,
+                                         &response_read_timeout_preflight_handler,
+                                         false,
+                                         ForwardPreflightMode::EagerDirect,
+                                         99));
+    CHECK_EQ(duration.route_count, stable_route_count);
+    CHECK_EQ(__builtin_memcmp(stable_config.data(), &duration, sizeof(RouteConfig)), 0);
+
     RouteEntry route{};
     CHECK_FALSE(route_requires_response_read_timeout_preflight_close(&route, &duration));
     route.preflight_forward_policy_bundle_id = 1;
     CHECK(route_requires_response_read_timeout_preflight_close(&route, &duration));
     CHECK(route_requires_response_read_timeout_preflight_close(&route, nullptr));
+    route.forward_preflight_mode = ForwardPreflightMode::EagerDirect;
     route.preflight_forward_policy_bundle_id = 99;
+    CHECK(route_requires_response_read_timeout_preflight_close(&route, &duration));
+    route.forward_preflight_mode = ForwardPreflightMode::AfterCanonicalSelection;
+    route.preflight_forward_policy_bundle_id = 1;
+    CHECK(route_requires_response_read_timeout_preflight_close(&route, &duration));
+    route.forward_preflight_mode = static_cast<ForwardPreflightMode>(0xff);
     CHECK(route_requires_response_read_timeout_preflight_close(&route, &duration));
 
     RouteConfig zero_duration{};
@@ -1428,6 +1503,7 @@ TEST(response_read_timeout, route_preflight_marker_fails_closed_for_every_nonzer
     failure.body = {"bad", 3};
     REQUIRE_EQ(zero_duration.add_failure_policy(failure), 1u);
     REQUIRE_EQ(zero_duration.add_policy_bundle(0, 1), 1u);
+    route.forward_preflight_mode = ForwardPreflightMode::EagerDirect;
     route.preflight_forward_policy_bundle_id = 1;
     CHECK(route_requires_response_read_timeout_preflight_close(&route, &zero_duration));
 }

@@ -33365,6 +33365,8 @@ route GET "/stream" {
     CHECK_EQ(hir->routes[1].control.direct_term.forward_request_policy_id, 0u);
     CHECK_EQ(hir->routes[2].control.direct_term.forward_response_buffering,
              ForwardResponseBufferingMode::None);
+    for (u32 i = 0; i < 3; i++)
+        CHECK_EQ(hir->routes[i].forward_preflight_mode, ForwardPreflightMode::EagerDirect);
     auto mir = build_mir_heap(hir.value());
     REQUIRE(mir);
     CHECK_EQ(mir->functions[0].blocks[0].term.forward_response_buffering,
@@ -33375,6 +33377,8 @@ route GET "/stream" {
              ForwardResponseBufferingMode::CompleteContentLength);
     CHECK_EQ(mir->functions[2].blocks[0].term.forward_response_buffering,
              ForwardResponseBufferingMode::None);
+    for (u32 i = 0; i < 3; i++)
+        CHECK_EQ(mir->functions[i].forward_preflight_mode, ForwardPreflightMode::EagerDirect);
 
     FrontendRirModule rir{};
     REQUIRE(lower_to_rir(mir.value(), rir));
@@ -33383,6 +33387,8 @@ route GET "/stream" {
     CHECK_EQ(rir.module.functions[0].preflight_forward_policy_bundle_id, 1u);
     CHECK_EQ(rir.module.functions[1].preflight_forward_policy_bundle_id, 1u);
     CHECK_EQ(rir.module.functions[2].preflight_forward_policy_bundle_id, 2u);
+    for (u32 i = 0; i < 3; i++)
+        CHECK_EQ(rir.module.functions[i].forward_preflight_mode, ForwardPreflightMode::EagerDirect);
     CHECK_EQ(rir.module.policy_bundles[0].response_buffering,
              ForwardResponseBufferingMode::CompleteContentLength);
     CHECK_EQ(rir.module.policy_bundles[1].response_buffering, ForwardResponseBufferingMode::None);
@@ -33823,8 +33829,37 @@ TEST(frontend, response_read_timeout_rejects_forged_mir_and_rir_preflight_mismat
     REQUIRE(ast);
     auto hir = analyze_file_heap(ast.value());
     REQUIRE(hir);
+    REQUIRE_EQ(hir->routes[0].forward_preflight_mode, ForwardPreflightMode::EagerDirect);
+    HirRoute copied_hir_route = hir->routes[0];
+    CHECK_EQ(copied_hir_route.forward_preflight_mode, ForwardPreflightMode::EagerDirect);
+    HirRoute moved_hir_route = static_cast<HirRoute&&>(copied_hir_route);
+    CHECK_EQ(moved_hir_route.forward_preflight_mode, ForwardPreflightMode::EagerDirect);
+    for (const ForwardPreflightMode forged_mode : {
+             ForwardPreflightMode::None,
+             ForwardPreflightMode::AfterCanonicalSelection,
+             static_cast<ForwardPreflightMode>(0xff),
+         }) {
+        hir->routes[0].forward_preflight_mode = forged_mode;
+        CHECK_FALSE(build_mir_heap(hir.value()).has_value());
+    }
+    hir->routes[0].forward_preflight_mode = ForwardPreflightMode::EagerDirect;
     auto mir = build_mir_heap(hir.value());
     REQUIRE(mir);
+    MirFunction copied_mir_function = mir->functions[0];
+    CHECK_EQ(copied_mir_function.forward_preflight_mode, ForwardPreflightMode::EagerDirect);
+    MirFunction moved_mir_function = static_cast<MirFunction&&>(copied_mir_function);
+    CHECK_EQ(moved_mir_function.forward_preflight_mode, ForwardPreflightMode::EagerDirect);
+
+    for (const ForwardPreflightMode forged_mode : {
+             ForwardPreflightMode::None,
+             ForwardPreflightMode::AfterCanonicalSelection,
+             static_cast<ForwardPreflightMode>(0xff),
+         }) {
+        mir->functions[0].forward_preflight_mode = forged_mode;
+        FrontendRirModule forged{};
+        CHECK_FALSE(lower_to_rir(mir.value(), forged).has_value());
+    }
+    mir->functions[0].forward_preflight_mode = ForwardPreflightMode::EagerDirect;
 
     mir->functions[0].state_zero_enters_entry = true;
     FrontendRirModule rejected{};
@@ -33837,12 +33872,21 @@ TEST(frontend, response_read_timeout_rejects_forged_mir_and_rir_preflight_mismat
     REQUIRE(lower_to_rir(mir.value(), rir));
     REQUIRE(rir::verify_module(rir.module).ok);
     auto& fn = rir.module.functions[0];
+    CHECK_EQ(fn.forward_preflight_mode, ForwardPreflightMode::EagerDirect);
     auto* ret = find_first_op(fn, rir::Opcode::RetForwardBundle);
     REQUIRE(ret != nullptr);
     REQUIRE_EQ(ret->operand_count, 3u);
 
     fn.preflight_forward_policy_bundle_id = 0;
     CHECK_FALSE(rir::verify_module(rir.module).ok);
+    fn.forward_preflight_mode = ForwardPreflightMode::None;
+    CHECK_FALSE(rir::verify_module(rir.module).ok);
+    fn.forward_preflight_mode = ForwardPreflightMode::AfterCanonicalSelection;
+    fn.preflight_forward_policy_bundle_id = 1;
+    CHECK_FALSE(rir::verify_module(rir.module).ok);
+    fn.forward_preflight_mode = static_cast<ForwardPreflightMode>(0xff);
+    CHECK_FALSE(rir::verify_module(rir.module).ok);
+    fn.forward_preflight_mode = ForwardPreflightMode::EagerDirect;
     fn.preflight_forward_policy_bundle_id = 99;
     CHECK_FALSE(rir::verify_module(rir.module).ok);
     fn.preflight_forward_policy_bundle_id = 1;
@@ -33879,6 +33923,56 @@ TEST(frontend, response_read_timeout_rejects_forged_mir_and_rir_preflight_mismat
     CHECK_FALSE(rir::verify_module(rir.module).ok);
     request_policy_const.imm.i32_val = 1;
     CHECK(rir::verify_module(rir.module).ok);
+    char printed_data[4096];
+    rir::PrintBuf printed;
+    printed.init(printed_data, sizeof(printed_data), -1);
+    rir::print_function(printed, fn);
+    REQUIRE_FALSE(printed.overflow);
+    CHECK_NE(
+        std::string(printed.data, printed.len).find("forward_preflight: eager_direct bundle=1"),
+        std::string::npos);
+    rir.destroy();
+}
+
+TEST(frontend, forward_preflight_none_zero_pair_propagates_and_forged_eager_rejects) {
+    const char source[] = "route GET \"/\" { return 204 }\n";
+    auto lexed = lex(lit(source));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    REQUIRE_EQ(hir->routes.len, 1u);
+    CHECK_EQ(hir->routes[0].forward_preflight_mode, ForwardPreflightMode::None);
+
+    hir->routes[0].forward_preflight_mode = ForwardPreflightMode::EagerDirect;
+    CHECK_FALSE(build_mir_heap(hir.value()).has_value());
+    hir->routes[0].forward_preflight_mode = ForwardPreflightMode::None;
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    REQUIRE_EQ(mir->functions.len, 1u);
+    CHECK_EQ(mir->functions[0].forward_preflight_mode, ForwardPreflightMode::None);
+
+    mir->functions[0].forward_preflight_mode = ForwardPreflightMode::EagerDirect;
+    FrontendRirModule rejected{};
+    CHECK_FALSE(lower_to_rir(mir.value(), rejected).has_value());
+    mir->functions[0].forward_preflight_mode = ForwardPreflightMode::None;
+    FrontendRirModule rir{};
+    REQUIRE(lower_to_rir(mir.value(), rir));
+    REQUIRE(rir::verify_module(rir.module).ok);
+    auto& fn = rir.module.functions[0];
+    CHECK_EQ(fn.forward_preflight_mode, ForwardPreflightMode::None);
+    CHECK_EQ(fn.preflight_forward_policy_bundle_id, 0u);
+
+    fn.forward_preflight_mode = ForwardPreflightMode::EagerDirect;
+    CHECK_FALSE(rir::verify_module(rir.module).ok);
+    fn.forward_preflight_mode = ForwardPreflightMode::AfterCanonicalSelection;
+    fn.preflight_forward_policy_bundle_id = 1;
+    CHECK_FALSE(rir::verify_module(rir.module).ok);
+    fn.forward_preflight_mode = ForwardPreflightMode::None;
+    fn.preflight_forward_policy_bundle_id = 0;
+    CHECK(rir::verify_module(rir.module).ok);
+
     rir.destroy();
 }
 

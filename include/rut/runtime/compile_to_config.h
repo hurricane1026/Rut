@@ -193,6 +193,7 @@ inline bool register_jit_routes(RouteConfig& cfg, const rir::Module& mod, jit::J
                                         fn.http_method,
                                         handler,
                                         rir_function_needs_req_body(fn),
+                                        fn.forward_preflight_mode,
                                         fn.preflight_forward_policy_bundle_id))
                 return false;
             // @rateLimit decorators → stacked token-bucket rules, each with its own
@@ -221,6 +222,30 @@ inline bool register_jit_routes(RouteConfig& cfg, const rir::Module& mod, jit::J
 
     RouteConfig* probe = new (std::nothrow) RouteConfig();
     if (probe == nullptr) return false;
+    // The replay transaction validates typed route metadata against owned
+    // policy tables too. Rebuild only those tables through their public owning
+    // APIs: RouteConfig is intentionally non-copyable because its dispatch
+    // structures contain views into routes[].
+    bool probe_policies_valid = true;
+    for (u32 i = 0; probe_policies_valid && i < cfg.response_policy_count; i++)
+        probe_policies_valid =
+            probe->add_response_policy(cfg.response_policies[i]) == static_cast<u16>(i + 1);
+    for (u32 i = 0; probe_policies_valid && i < cfg.failure_policy_count; i++)
+        probe_policies_valid =
+            probe->add_failure_policy(cfg.failure_policies[i]) == static_cast<u16>(i + 1);
+    for (u32 i = 0; probe_policies_valid && i < cfg.policy_bundle_count; i++) {
+        const auto& bundle = cfg.policy_bundles[i];
+        probe_policies_valid =
+            probe->add_policy_bundle(bundle.response_policy_id,
+                                     bundle.failure_policy_id,
+                                     bundle.timeout_failure_policy_id,
+                                     bundle.response_read_timeout_seconds,
+                                     bundle.response_buffering) == static_cast<u16>(i + 1);
+    }
+    if (!probe_policies_valid) {
+        delete probe;
+        return false;
+    }
     const bool staged = replay(*probe);
     delete probe;
     if (!staged) return false;

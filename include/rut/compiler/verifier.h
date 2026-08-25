@@ -1111,8 +1111,12 @@ inline VerifyResult verify_module(const Module& mod, VerifyOptions options = {})
 
     for (u32 fi = 0; fi < mod.func_count; fi++) {
         const Function& fn = mod.functions[fi];
+        const ForwardPreflightMode preflight_mode = fn.forward_preflight_mode;
         const u16 preflight_id = fn.preflight_forward_policy_bundle_id;
-        const bool has_preflight = preflight_id != 0;
+        if (!forward_preflight_mode_valid(preflight_mode) ||
+            !forward_preflight_metadata_is_eager_runtime_safe(preflight_mode, preflight_id))
+            return verify_fail(summary, VerifyIssueCode::InvalidForwardPreflight, fi);
+        const bool has_preflight = preflight_mode == ForwardPreflightMode::EagerDirect;
         if (has_preflight &&
             (preflight_id > mod.policy_bundle_count ||
              !response_read_timeout_seconds_valid(

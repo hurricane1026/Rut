@@ -1,6 +1,7 @@
 #pragma once
 
 #include "rut/common/failure_policy.h"
+#include "rut/common/forward_preflight.h"
 #include "rut/common/forward_target_transform.h"
 #include "rut/common/rate_limit_key_spec.h"
 #include "rut/common/redirect_policy.h"
@@ -336,6 +337,7 @@ struct MirFunction {
     bool has_explicit_resume_blocks = false;
     u32 resume_blocks[kMaxWaits + 1]{};
     u32 error_variant_index = 0xffffffffu;
+    ForwardPreflightMode forward_preflight_mode = ForwardPreflightMode::None;
     // @rateLimit per-route limit, copied from HirRoute → carried to RIR Function.
     // @rateLimit decorators -> stacked fixed-window rules (empty = no limit).
     RateLimitRuleSet rate_limit{};
@@ -362,6 +364,7 @@ struct MirFunction {
           resume_terminal_block(other.resume_terminal_block),
           has_explicit_resume_blocks(other.has_explicit_resume_blocks),
           error_variant_index(other.error_variant_index),
+          forward_preflight_mode(other.forward_preflight_mode),
           rate_limit(other.rate_limit),
           throttle_down_bps(other.throttle_down_bps),
           is_timer(other.is_timer),
@@ -385,6 +388,7 @@ struct MirFunction {
         has_explicit_resume_blocks = other.has_explicit_resume_blocks;
         for (u32 i = 0; i < kMaxWaits + 1; i++) resume_blocks[i] = other.resume_blocks[i];
         error_variant_index = other.error_variant_index;
+        forward_preflight_mode = other.forward_preflight_mode;
         rate_limit = other.rate_limit;
         throttle_down_bps = other.throttle_down_bps;
         is_timer = other.is_timer;
@@ -406,6 +410,7 @@ struct MirFunction {
           resume_terminal_block(other.resume_terminal_block),
           has_explicit_resume_blocks(other.has_explicit_resume_blocks),
           error_variant_index(other.error_variant_index),
+          forward_preflight_mode(other.forward_preflight_mode),
           rate_limit(other.rate_limit),
           throttle_down_bps(other.throttle_down_bps),
           is_timer(other.is_timer),
@@ -429,6 +434,7 @@ struct MirFunction {
         has_explicit_resume_blocks = other.has_explicit_resume_blocks;
         for (u32 i = 0; i < kMaxWaits + 1; i++) resume_blocks[i] = other.resume_blocks[i];
         error_variant_index = other.error_variant_index;
+        forward_preflight_mode = other.forward_preflight_mode;
         rate_limit = other.rate_limit;
         throttle_down_bps = other.throttle_down_bps;
         is_timer = other.is_timer;

@@ -2,6 +2,7 @@
 
 #include "core/expected.h"
 #include "rut/common/failure_policy.h"
+#include "rut/common/forward_preflight.h"
 #include "rut/common/forward_target_transform.h"
 #include "rut/common/rate_limit_key_spec.h"
 #include "rut/common/redirect_policy.h"
@@ -426,6 +427,7 @@ struct Function {
     // response_read_timeout slice. A nonzero value is the exact 1-based
     // ForwardPolicyBundle id returned by this function's sole canonical
     // RetForwardBundle terminal.
+    ForwardPreflightMode forward_preflight_mode = ForwardPreflightMode::None;
     u16 preflight_forward_policy_bundle_id = 0;
 
     Block* entry() { return block_count > 0 ? &blocks[0] : nullptr; }

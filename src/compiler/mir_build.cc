@@ -1,5 +1,6 @@
 #include "rut/compiler/mir_build.h"
 
+#include "rut/runtime/route_method.h"
 #include <vector>
 
 namespace rut {
@@ -43,6 +44,45 @@ static Str match_case_label() {
 
 static Str match_default_label() {
     return {"match_default", 13};
+}
+
+// HIR -> MIR trust boundary for phase-1 forward preflight metadata. Inspect the
+// fully built MIR shape rather than trusting the HIR marker: this also catches a
+// forged timeout-bearing terminal hidden in any HIR control-flow arm.
+static bool eager_direct_forward_preflight_metadata_valid(const MirFunction& function) {
+    if (!forward_preflight_mode_valid(function.forward_preflight_mode) ||
+        function.forward_preflight_mode == ForwardPreflightMode::AfterCanonicalSelection)
+        return false;
+
+    const MirTerminator* preflight_term = nullptr;
+    for (u32 bi = 0; bi < function.blocks.len; bi++) {
+        const auto& term = function.blocks[bi].term;
+        if (term.forward_response_read_timeout_seconds == 0 &&
+            term.forward_response_buffering == ForwardResponseBufferingMode::None)
+            continue;
+        if (preflight_term != nullptr) return false;
+        preflight_term = &term;
+    }
+    if (preflight_term == nullptr)
+        return function.forward_preflight_mode == ForwardPreflightMode::None;
+    if (function.forward_preflight_mode != ForwardPreflightMode::EagerDirect) return false;
+
+    const bool complete_buffering = preflight_term->forward_response_buffering ==
+                                    ForwardResponseBufferingMode::CompleteContentLength;
+    return function.blocks.len == 1 && &function.blocks[0].term == preflight_term &&
+           preflight_term->kind == MirTerminatorKind::ForwardUpstream && function.locals.len == 0 &&
+           function.values.len == 0 && function.waits.len == 0 &&
+           function.blocks[0].effects.len == 0 && !function.state_zero_enters_entry &&
+           !function.has_explicit_resume_blocks && function.rate_limit.count == 0 &&
+           function.throttle_down_bps == 0 && !function.is_timer &&
+           preflight_term->forward_set_path.ptr == nullptr &&
+           preflight_term->forward_set_headers.len == 0 &&
+           !preflight_term->has_forward_target_transform &&
+           !preflight_term->commit_response_mutations &&
+           (!complete_buffering ||
+            (complete_content_length_route_method_is_admitted(function.method) &&
+             complete_content_length_request_policy_is_admitted(
+                 preflight_term->forward_request_policy_id)));
 }
 
 static MirTypeKind mir_type_kind(HirTypeKind kind) {
@@ -1058,6 +1098,7 @@ FrontendResult<MirModule*> build_mir(const HirModule& module) {
         fn.path = module.routes[i].path;
         fn.name = {"route", 5};
         fn.error_variant_index = module.routes[i].error_variant_index;
+        fn.forward_preflight_mode = module.routes[i].forward_preflight_mode;
         fn.rate_limit = module.routes[i].rate_limit;
         fn.throttle_down_bps = module.routes[i].throttle_down_bps;
         fn.is_timer = module.routes[i].is_timer;
@@ -1723,6 +1764,10 @@ FrontendResult<MirModule*> build_mir(const HirModule& module) {
                 if (!emitted) return core::make_unexpected(emitted.error());
             }
 
+            if (!eager_direct_forward_preflight_metadata_valid(fn)) {
+                delete mir;
+                return frontend_error(FrontendError::UnsupportedSyntax, fn.span);
+            }
             if (!mir->functions.push(fn))
                 return frontend_error(FrontendError::TooManyItems, fn.span);
             continue;
@@ -2607,6 +2652,10 @@ FrontendResult<MirModule*> build_mir(const HirModule& module) {
                 if (!emitted) return core::make_unexpected(emitted.error());
             }
 
+            if (!eager_direct_forward_preflight_metadata_valid(fn)) {
+                delete mir;
+                return frontend_error(FrontendError::UnsupportedSyntax, fn.span);
+            }
             if (!mir->functions.push(fn))
                 return frontend_error(FrontendError::TooManyItems, fn.span);
             continue;
@@ -2668,6 +2717,10 @@ FrontendResult<MirModule*> build_mir(const HirModule& module) {
 
             fn.state_zero_enters_entry = true;
             fn.resume_terminal_block = terminal_index;
+            if (!eager_direct_forward_preflight_metadata_valid(fn)) {
+                delete mir;
+                return frontend_error(FrontendError::UnsupportedSyntax, fn.span);
+            }
             if (!mir->functions.push(fn))
                 return frontend_error(FrontendError::TooManyItems, fn.span);
             continue;
@@ -3196,6 +3249,10 @@ FrontendResult<MirModule*> build_mir(const HirModule& module) {
         } else {
             set_term_from_hir(&block.term, module.routes[i].control.direct_term);
             if (!fn.blocks.push(block)) return frontend_error(FrontendError::TooManyItems, fn.span);
+        }
+        if (!eager_direct_forward_preflight_metadata_valid(fn)) {
+            delete mir;
+            return frontend_error(FrontendError::UnsupportedSyntax, fn.span);
         }
         if (!mir->functions.push(fn)) return frontend_error(FrontendError::TooManyItems, fn.span);
     }

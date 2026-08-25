@@ -2,6 +2,7 @@
 
 #include "core/expected.h"
 #include "rut/common/failure_policy.h"
+#include "rut/common/forward_preflight.h"
 #include "rut/common/forward_target_transform.h"
 #include "rut/common/http_header_validation.h"
 #include "rut/common/redirect_policy.h"
@@ -121,6 +122,7 @@ struct RouteEntry {
     u16 ws_close_code = 1000;
     // Nonzero only for the bounded static direct-forward timeout preflight.
     // Resolves through the same pinned RouteConfig as this RouteEntry.
+    ForwardPreflightMode forward_preflight_mode = ForwardPreflightMode::None;
     u16 preflight_forward_policy_bundle_id = 0;
 };
 
@@ -1096,6 +1098,7 @@ struct RouteConfig {
         r.status_code = 0;
         r.fn = nullptr;
         r.needs_req_body = false;
+        r.forward_preflight_mode = ForwardPreflightMode::None;
         r.preflight_forward_policy_bundle_id = 0;
         if (!populate_dispatch_state(r)) {
             return false;  // active dispatch at capacity — fail loud
@@ -1253,6 +1256,7 @@ struct RouteConfig {
         r.status_code = status;
         r.fn = nullptr;
         r.needs_req_body = false;
+        r.forward_preflight_mode = ForwardPreflightMode::None;
         r.preflight_forward_policy_bundle_id = 0;
         if (!populate_dispatch_state(r)) {
             return false;
@@ -1267,10 +1271,21 @@ struct RouteConfig {
     bool add_jit_handler(const char* path,
                          u8 method,
                          jit::HandlerFn fn,
-                         bool needs_req_body = false,
-                         u16 preflight_forward_policy_bundle_id = 0) {
+                         bool needs_req_body,
+                         ForwardPreflightMode forward_preflight_mode,
+                         u16 preflight_forward_policy_bundle_id) {
         if (route_count >= kMaxRoutes) return false;
         if (fn == nullptr) return false;
+        if (!forward_preflight_mode_valid(forward_preflight_mode) ||
+            !forward_preflight_metadata_is_eager_runtime_safe(forward_preflight_mode,
+                                                              preflight_forward_policy_bundle_id))
+            return false;
+        if (forward_preflight_mode == ForwardPreflightMode::EagerDirect &&
+            (!policy_bundle_id_is_valid(preflight_forward_policy_bundle_id) ||
+             !response_read_timeout_seconds_valid(
+                 policy_bundles[preflight_forward_policy_bundle_id - 1]
+                     .response_read_timeout_seconds)))
+            return false;
         if (!is_routable_path(path)) return false;
         if (!dispatch_accepts_path_shape(path)) return false;
         if (!param_count_fits(path)) return false;
@@ -1290,12 +1305,28 @@ struct RouteConfig {
         r.status_code = 0;
         r.fn = fn;
         r.needs_req_body = needs_req_body;
+        r.forward_preflight_mode = forward_preflight_mode;
         r.preflight_forward_policy_bundle_id = preflight_forward_policy_bundle_id;
         if (!populate_dispatch_state(r)) {
             return false;
         }
         route_count++;
         return true;
+    }
+
+    // Source-compatible legacy registration. A nonzero historical marker is
+    // always the already-supported eager-direct mode; it can never opt into
+    // deferred post-selection behavior.
+    bool add_jit_handler(const char* path,
+                         u8 method,
+                         jit::HandlerFn fn,
+                         bool needs_req_body = false,
+                         u16 preflight_forward_policy_bundle_id = 0) {
+        const ForwardPreflightMode mode = preflight_forward_policy_bundle_id == 0
+                                              ? ForwardPreflightMode::None
+                                              : ForwardPreflightMode::EagerDirect;
+        return add_jit_handler(
+            path, method, fn, needs_req_body, mode, preflight_forward_policy_bundle_id);
     }
 
     // Register a response body. Copies the bytes into body_pool so the
@@ -2399,7 +2430,14 @@ private:
 
 inline bool route_requires_response_read_timeout_preflight_close(const RouteEntry* route,
                                                                  const RouteConfig* config) {
-    if (route == nullptr || route->preflight_forward_policy_bundle_id == 0) return false;
+    if (route == nullptr) return false;
+    if (route->forward_preflight_mode == ForwardPreflightMode::None &&
+        route->preflight_forward_policy_bundle_id == 0)
+        return false;
+    if (!forward_preflight_mode_valid(route->forward_preflight_mode) ||
+        route->forward_preflight_mode != ForwardPreflightMode::EagerDirect ||
+        route->preflight_forward_policy_bundle_id == 0)
+        return true;
     const u16 id = route->preflight_forward_policy_bundle_id;
     if (config == nullptr || !config->policy_bundle_id_is_valid(id)) return true;
     const auto& bundle = config->policy_bundles[id - 1];

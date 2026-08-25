@@ -19177,6 +19177,7 @@ static FrontendResult<HirModule*> analyze_file_internal(
                                   "admitted bodyless non-HEAD Forward route")
                         : lit_str("response_read_timeout currently requires an effect-free direct "
                                   "Forward route"));
+            route.forward_preflight_mode = ForwardPreflightMode::EagerDirect;
         }
 
         // Wait-route backstop: the creation-time gates (kTimeWaitDetail /
