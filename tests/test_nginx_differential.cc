@@ -7144,8 +7144,10 @@ static bool run_strict_local_response_differential(
 struct ConverterExactLocalDifferentialObservation {
     std::vector<char> nginx_wire;
     std::vector<char> nginx_head_wire;
+    std::vector<char> nginx_post_wire;
     std::vector<char> generated_rut_wire;
     std::vector<char> generated_rut_head_wire;
+    std::vector<char> generated_rut_post_wire;
     u32 nginx_upstream_accepts = 0;
     u32 nginx_upstream_requests = 0;
     u32 generated_rut_upstream_accepts = 0;
@@ -7238,6 +7240,19 @@ static bool run_converter_exact_local_differential(
     if (!write_file(temp.nginx_config, nginx_config.data(), nginx_config.size()) ||
         !write_file(temp.source, rut_source.data(), rut_source.size())) {
         error = "failed to write converter-generated exact-local differential inputs";
+        return false;
+    }
+
+    // This exact header-only request is the bounded POST compatibility domain:
+    // no Content-Length (including CL0), Transfer-Encoding, TE, Expect,
+    // Upgrade, body, or bytes after the header terminator.
+    const std::string post_request(kExactLocalPostCloseRequest,
+                                   sizeof(kExactLocalPostCloseRequest) - 1u);
+    if (post_request !=
+        "POST /static HTTP/1.1\r\n"
+        "Host: exact-local.example\r\n"
+        "Connection: close\r\n\r\n") {
+        error = "converter exact-local POST request left the header-absent bodyless domain";
         return false;
     }
 
@@ -7394,6 +7409,16 @@ static bool run_converter_exact_local_differential(
                                kExactLocalHeadCloseResponseNormalized,
                                true,
                                observation.nginx_head_wire);
+        if (side_ok)
+            side_ok = exercise(upstream,
+                               nginx.child,
+                               "pinned nginx",
+                               "header-absent POST /static",
+                               kExactLocalPostCloseRequest,
+                               sizeof(kExactLocalPostCloseRequest) - 1u,
+                               kExactLocalCloseResponseNormalized,
+                               false,
+                               observation.nginx_post_wire);
         // Keep the recorder live until the frontend has been stopped and reaped.
         const bool process_stopped = stop_child(nginx.child);
         const bool container_removed = docker.remove();
@@ -7442,6 +7467,16 @@ static bool run_converter_exact_local_differential(
                                kExactLocalHeadCloseResponseNormalized,
                                true,
                                observation.generated_rut_head_wire);
+        if (side_ok)
+            side_ok = exercise(upstream,
+                               generated_rut.child,
+                               "converter-generated ordinary RUT",
+                               "header-absent POST /static",
+                               kExactLocalPostCloseRequest,
+                               sizeof(kExactLocalPostCloseRequest) - 1u,
+                               kExactLocalCloseResponseNormalized,
+                               false,
+                               observation.generated_rut_post_wire);
         // Preserve the same frontend-before-recorder teardown order as nginx.
         const bool process_stopped = stop_child(generated_rut.child);
         const bool recorder_settled =
@@ -7471,6 +7506,15 @@ static bool run_converter_exact_local_differential(
         error =
             "pinned nginx and converter-generated ordinary RUT exact HEAD /static wires differ "
             "after Date-only normalization";
+        return false;
+    }
+    std::vector<char> normalized_nginx_post = observation.nginx_post_wire;
+    std::vector<char> normalized_generated_rut_post = observation.generated_rut_post_wire;
+    if (!normalize_date(normalized_nginx_post) || !normalize_date(normalized_generated_rut_post) ||
+        normalized_nginx_post != normalized_generated_rut_post) {
+        error =
+            "pinned nginx and converter-generated ordinary RUT exact header-absent POST /static "
+            "wires differ after Date-only normalization";
         return false;
     }
     return true;
@@ -8330,10 +8374,14 @@ int main(int argc, char** argv) {
                       << differential_error << "\n";
             dump_wire("pinned nginx converter exact GET /static", observation.nginx_wire);
             dump_wire("pinned nginx converter exact HEAD /static", observation.nginx_head_wire);
+            dump_wire("pinned nginx converter exact header-absent POST /static",
+                      observation.nginx_post_wire);
             dump_wire("converter-generated ordinary RUT exact GET /static",
                       observation.generated_rut_wire);
             dump_wire("converter-generated ordinary RUT exact HEAD /static",
                       observation.generated_rut_head_wire);
+            dump_wire("converter-generated ordinary RUT exact header-absent POST /static",
+                      observation.generated_rut_post_wire);
             std::cerr << "converter exact-local upstream nginx accepted="
                       << observation.nginx_upstream_accepts
                       << " requests=" << observation.nginx_upstream_requests
@@ -8347,10 +8395,12 @@ int main(int argc, char** argv) {
         }
         std::cerr
             << "PASS: nginx fragment parsed and lowered to converter-generated ordinary RUT; "
-               "its bounded exact /static GET and HEAD match pinned nginx after Date-only "
-               "normalization, explicit close/EOF, HEAD body suppression, and independent live "
-               "zero-upstream windows "
-               "(not direct nginx.conf runtime support or broader location semantics)\n";
+               "its prior bounded exact /static GET and HEAD evidence remains, and one fresh "
+               "depth-zero cleartext HTTP/1.1 origin-form explicit-close POST /static with no "
+               "Content-Length (including CL0), Transfer-Encoding/TE, Expect, Upgrade, body, or "
+               "tail matches pinned nginx after Date-only normalization, EOF, and an independent "
+               "live zero-upstream window (excluding pipeline, TLS/H2, other methods, broader "
+               "locations, and direct nginx.conf runtime support)\n";
         if (converter_exact_local_differential) return 0;
     }
 
