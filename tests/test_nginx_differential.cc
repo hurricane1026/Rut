@@ -7143,7 +7143,9 @@ static bool run_strict_local_response_differential(
 
 struct ConverterExactLocalDifferentialObservation {
     std::vector<char> nginx_wire;
+    std::vector<char> nginx_head_wire;
     std::vector<char> generated_rut_wire;
+    std::vector<char> generated_rut_head_wire;
     u32 nginx_upstream_accepts = 0;
     u32 nginx_upstream_requests = 0;
     u32 generated_rut_upstream_accepts = 0;
@@ -7293,8 +7295,14 @@ static bool run_converter_exact_local_differential(
     const auto exercise = [&](Recorder& upstream,
                               Child& process,
                               const char* side,
+                              const char* vector_name,
+                              const char* request,
+                              size_t request_length,
+                              const char* expected,
+                              bool head,
                               std::vector<char>& wire) {
-        if (!wait_recorder_ready(upstream, process, side)) return false;
+        const std::string vector_side = std::string(side) + " " + vector_name;
+        if (!wait_recorder_ready(upstream, process, vector_side.c_str())) return false;
         struct ClientGuard {
             int fd = -1;
             ~ClientGuard() {
@@ -7302,20 +7310,21 @@ static bool run_converter_exact_local_differential(
             }
         } client{connect_once(frontend_port)};
         std::string detail;
-        if (client.fd < 0 ||
-            !send_all(
-                client.fd, kExactLocalGetCloseRequest, sizeof(kExactLocalGetCloseRequest) - 1u) ||
-            !read_response(client.fd, wire, detail) || !read_eof(client.fd, detail)) {
-            error = std::string(side) +
+        const bool response_ok = client.fd >= 0 && send_all(client.fd, request, request_length) &&
+                                 (head ? read_head_response(client.fd, wire, detail)
+                                       : read_response(client.fd, wire, detail));
+        if (!response_ok || !read_eof(client.fd, detail)) {
+            error = std::string(side) + " " + vector_name +
                     " converter exact-local request/ordered-response/EOF failed: " +
                     (detail.empty() ? "connect or send failed" : detail);
             return false;
         }
-        if (!validate_exact_normalized_response(wire, kExactLocalCloseResponseNormalized, detail)) {
-            error = std::string(side) + " exact status/header/body wire mismatch: " + detail;
+        if (!validate_exact_normalized_response(wire, expected, detail)) {
+            error = std::string(side) + " " + vector_name +
+                    " exact status/header/body wire mismatch: " + detail;
             return false;
         }
-        return observe_zero_upstream(upstream, process, side);
+        return observe_zero_upstream(upstream, process, vector_side.c_str());
     };
     const auto settle_zero_upstream =
         [&](Recorder& upstream, u32& accepts, u32& requests, const char* side) {
@@ -7366,7 +7375,25 @@ static bool run_converter_exact_local_differential(
         if (!spawned) error = "failed to start pinned nginx for converter exact-local evidence";
         if (side_ok) side_ok = wait_ready(frontend_port, nginx.child, error);
         if (side_ok)
-            side_ok = exercise(upstream, nginx.child, "pinned nginx", observation.nginx_wire);
+            side_ok = exercise(upstream,
+                               nginx.child,
+                               "pinned nginx",
+                               "GET /static",
+                               kExactLocalGetCloseRequest,
+                               sizeof(kExactLocalGetCloseRequest) - 1u,
+                               kExactLocalCloseResponseNormalized,
+                               false,
+                               observation.nginx_wire);
+        if (side_ok)
+            side_ok = exercise(upstream,
+                               nginx.child,
+                               "pinned nginx",
+                               "HEAD /static",
+                               kExactLocalHeadCloseRequest,
+                               sizeof(kExactLocalHeadCloseRequest) - 1u,
+                               kExactLocalHeadCloseResponseNormalized,
+                               true,
+                               observation.nginx_head_wire);
         // Keep the recorder live until the frontend has been stopped and reaped.
         const bool process_stopped = stop_child(nginx.child);
         const bool container_removed = docker.remove();
@@ -7399,7 +7426,22 @@ static bool run_converter_exact_local_differential(
             side_ok = exercise(upstream,
                                generated_rut.child,
                                "converter-generated ordinary RUT",
+                               "GET /static",
+                               kExactLocalGetCloseRequest,
+                               sizeof(kExactLocalGetCloseRequest) - 1u,
+                               kExactLocalCloseResponseNormalized,
+                               false,
                                observation.generated_rut_wire);
+        if (side_ok)
+            side_ok = exercise(upstream,
+                               generated_rut.child,
+                               "converter-generated ordinary RUT",
+                               "HEAD /static",
+                               kExactLocalHeadCloseRequest,
+                               sizeof(kExactLocalHeadCloseRequest) - 1u,
+                               kExactLocalHeadCloseResponseNormalized,
+                               true,
+                               observation.generated_rut_head_wire);
         // Preserve the same frontend-before-recorder teardown order as nginx.
         const bool process_stopped = stop_child(generated_rut.child);
         const bool recorder_settled =
@@ -7418,7 +7460,16 @@ static bool run_converter_exact_local_differential(
     if (!normalize_date(normalized_nginx) || !normalize_date(normalized_generated_rut) ||
         normalized_nginx != normalized_generated_rut) {
         error =
-            "pinned nginx and converter-generated ordinary RUT exact /static wires differ "
+            "pinned nginx and converter-generated ordinary RUT exact GET /static wires differ "
+            "after Date-only normalization";
+        return false;
+    }
+    std::vector<char> normalized_nginx_head = observation.nginx_head_wire;
+    std::vector<char> normalized_generated_rut_head = observation.generated_rut_head_wire;
+    if (!normalize_date(normalized_nginx_head) || !normalize_date(normalized_generated_rut_head) ||
+        normalized_nginx_head != normalized_generated_rut_head) {
+        error =
+            "pinned nginx and converter-generated ordinary RUT exact HEAD /static wires differ "
             "after Date-only normalization";
         return false;
     }
@@ -8277,9 +8328,12 @@ int main(int argc, char** argv) {
                                                     differential_error)) {
             std::cerr << "FAIL [converter-generated exact /static differential]: "
                       << differential_error << "\n";
-            dump_wire("pinned nginx converter exact /static", observation.nginx_wire);
-            dump_wire("converter-generated ordinary RUT exact /static",
+            dump_wire("pinned nginx converter exact GET /static", observation.nginx_wire);
+            dump_wire("pinned nginx converter exact HEAD /static", observation.nginx_head_wire);
+            dump_wire("converter-generated ordinary RUT exact GET /static",
                       observation.generated_rut_wire);
+            dump_wire("converter-generated ordinary RUT exact HEAD /static",
+                      observation.generated_rut_head_wire);
             std::cerr << "converter exact-local upstream nginx accepted="
                       << observation.nginx_upstream_accepts
                       << " requests=" << observation.nginx_upstream_requests
@@ -8293,8 +8347,9 @@ int main(int argc, char** argv) {
         }
         std::cerr
             << "PASS: nginx fragment parsed and lowered to converter-generated ordinary RUT; "
-               "its bounded exact /static GET matches pinned nginx after Date-only "
-               "normalization, explicit close/EOF, and independent live zero-upstream windows "
+               "its bounded exact /static GET and HEAD match pinned nginx after Date-only "
+               "normalization, explicit close/EOF, HEAD body suppression, and independent live "
+               "zero-upstream windows "
                "(not direct nginx.conf runtime support or broader location semantics)\n";
         if (converter_exact_local_differential) return 0;
     }
