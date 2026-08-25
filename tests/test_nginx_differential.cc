@@ -76,6 +76,10 @@ static constexpr char kExactLocalPutCloseRequest[] =
     "PUT /static HTTP/1.1\r\n"
     "Host: exact-local.example\r\n"
     "Connection: close\r\n\r\n";
+static constexpr char kExactLocalPatchCloseRequest[] =
+    "PATCH /static HTTP/1.1\r\n"
+    "Host: exact-local.example\r\n"
+    "Connection: close\r\n\r\n";
 static constexpr char kExactLocalQueryCloseRequest[] =
     "GET /static?x=1 HTTP/1.1\r\n"
     "Host: exact-local.example\r\n"
@@ -6660,7 +6664,8 @@ static constexpr size_t kExactLocalHeaderAbsentPostVectorIndex = 4;
 static constexpr size_t kExactLocalCl0PostVectorIndex = 5;
 static constexpr size_t kExactLocalDeleteVectorIndex = 7;
 static constexpr size_t kExactLocalPutVectorIndex = 8;
-static constexpr size_t kExactLocalReturnVectorCount = 12;
+static constexpr size_t kExactLocalPatchVectorIndex = 9;
+static constexpr size_t kExactLocalReturnVectorCount = 13;
 
 static void dump_exact_local_return_observation(const ExactLocalReturnObservation& observation) {
     static constexpr const char* kLabels[] = {
@@ -6673,6 +6678,7 @@ static void dump_exact_local_return_observation(const ExactLocalReturnObservatio
         "OPTIONS close",
         "DELETE header-absent close",
         "PUT header-absent close",
+        "PATCH header-absent close",
         "GET query close",
         "GET /static/ fallback",
         "GET /static/child fallback",
@@ -6741,6 +6747,31 @@ static bool capture_pinned_exact_local_order(u16 frontend_port,
         put_header_end == std::string::npos || put_header_end + 4u != put_request.size() ||
         put_request.rfind("\r\n\r\n") != put_header_end) {
         error = "pinned exact-local PUT left the fresh header-absent bounded domain";
+        return false;
+    }
+
+    // A deliberately byte-exact #300/#301 prerequisite request, not a general
+    // request parser: fresh H1.1 origin form with one close header and no query,
+    // framing, body, or tail.
+    const std::string patch_request(kExactLocalPatchCloseRequest,
+                                    sizeof(kExactLocalPatchCloseRequest) - 1u);
+    const size_t patch_close = patch_request.find("\r\nConnection: close\r\n");
+    const size_t patch_header_end = patch_request.find("\r\n\r\n");
+    if (patch_request !=
+            "PATCH /static HTTP/1.1\r\n"
+            "Host: exact-local.example\r\n"
+            "Connection: close\r\n\r\n" ||
+        patch_request.rfind("PATCH /static HTTP/1.1\r\n", 0) != 0 ||
+        patch_request.find('?') != std::string::npos || patch_close == std::string::npos ||
+        patch_request.rfind("\r\nConnection: close\r\n") != patch_close ||
+        patch_request.find("\r\nContent-Length:") != std::string::npos ||
+        patch_request.find("\r\nTransfer-Encoding:") != std::string::npos ||
+        patch_request.find("\r\nTE:") != std::string::npos ||
+        patch_request.find("\r\nExpect:") != std::string::npos ||
+        patch_request.find("\r\nUpgrade:") != std::string::npos ||
+        patch_header_end == std::string::npos || patch_header_end + 4u != patch_request.size() ||
+        patch_request.rfind("\r\n\r\n") != patch_header_end) {
+        error = "pinned exact-local PATCH left the fresh header-absent bounded domain";
         return false;
     }
 
@@ -6909,6 +6940,11 @@ static bool capture_pinned_exact_local_order(u16 frontend_port,
                           sizeof(kExactLocalPutCloseRequest) - 1u,
                           kExactLocalCloseResponseNormalized,
                           false) ||
+        !run_close_vector("PATCH /static header-absent close",
+                          kExactLocalPatchCloseRequest,
+                          sizeof(kExactLocalPatchCloseRequest) - 1u,
+                          kExactLocalCloseResponseNormalized,
+                          false) ||
         !run_close_vector("GET /static?x=1 close",
                           kExactLocalQueryCloseRequest,
                           sizeof(kExactLocalQueryCloseRequest) - 1u,
@@ -7025,6 +7061,18 @@ static bool run_pinned_exact_local_return_baseline(u16 frontend_port,
         exact_first_put != expected_put || root_first_put != expected_put ||
         exact_first_put != root_first_put) {
         error = "pinned exact-local PUT did not equal the fixed oracle in both declaration orders";
+        return false;
+    }
+    const std::vector<char> expected_patch(
+        kExactLocalCloseResponseNormalized,
+        kExactLocalCloseResponseNormalized + sizeof(kExactLocalCloseResponseNormalized) - 1u);
+    std::vector<char> exact_first_patch = exact_first.wires[kExactLocalPatchVectorIndex];
+    std::vector<char> root_first_patch = root_first.wires[kExactLocalPatchVectorIndex];
+    if (!normalize_date(exact_first_patch) || !normalize_date(root_first_patch) ||
+        exact_first_patch != expected_patch || root_first_patch != expected_patch ||
+        exact_first_patch != root_first_patch) {
+        error =
+            "pinned exact-local PATCH did not equal the fixed oracle in both declaration orders";
         return false;
     }
     if (!normalized_wires_equal(
@@ -8735,12 +8783,13 @@ int main(int argc, char** argv) {
                "an explicit-close POST with exactly one Content-Length: 0 matches the adjacent "
                "header-absent POST, and a fresh header-absent explicit-close DELETE /static in "
                "both declaration orders retains its fixed oracle; a fresh header-absent "
-               "explicit-close PUT /static independently yields exact 200/CL16/full "
+               "explicit-close PUT /static retains its fixed oracle; a fresh header-absent "
+               "explicit-close PATCH /static independently yields exact 200/CL16/full "
                "successor-static/close/EOF in both declaration orders; only /static/ and "
                "/static/child retain exactly two scoped proxy attempts (pinned-nginx-only bounded "
-               "PUT semantic evidence; RUT equivalence remains blocked by #299 and there is no "
-               "converter equivalence claim; excludes PUT CL including CL0, body/framing, query, "
-               "keep-alive/reuse/pipeline, other methods or paths, proxy PUT, and TLS/H2)\n";
+               "PATCH semantic evidence; RUT equivalence remains blocked by #301 and there is no "
+               "converter equivalence claim; excludes PATCH CL including CL0, body/framing, query, "
+               "keep-alive/reuse/pipeline, other methods or paths, proxy PATCH, and TLS/H2)\n";
         if (exact_local_return_baseline) return 0;
     }
 
