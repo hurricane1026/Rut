@@ -543,17 +543,16 @@ inline bool ordinary_local_response_may_persist(Loop* loop,
            ordinary_local_response_request_boundary_reusable(conn);
 }
 
-inline bool exact_strict_local_response_common_request_is_admitted(const Connection& conn) {
+inline bool exact_strict_local_response_common_request_shape_is_admitted(const Connection& conn) {
     const auto method = static_cast<LogHttpMethod>(conn.req_method);
     return conn.protocol == ConnProtocol::Http11 && !conn.tls_active && conn.h2 == nullptr &&
            conn.req_strict_h1_complete &&
            conn.req_http_version == static_cast<u8>(HttpVersion::Http11) &&
            conn.req_path_canon.ptr != nullptr && !conn.req_target_has_fragment &&
-           !conn.req_malformed && !conn.req_wants_upgrade && !conn.req_client_has_content_length &&
-           conn.req_client_content_length_count == 0 && !conn.req_client_has_transfer_encoding &&
-           !conn.req_client_has_te && !conn.req_client_has_expect &&
-           !conn.req_client_has_upgrade_header && conn.req_body_mode == BodyMode::None &&
-           conn.req_content_length == 0 && conn.req_body_remaining == 0 &&
+           !conn.req_malformed && !conn.req_wants_upgrade &&
+           !conn.req_client_has_transfer_encoding && !conn.req_client_has_te &&
+           !conn.req_client_has_expect && !conn.req_client_has_upgrade_header &&
+           conn.req_body_mode == BodyMode::None && conn.req_body_remaining == 0 &&
            !conn.request_body_fully_buffered && !conn.req_body_streamed &&
            conn.req_header_end != 0 && conn.req_header_end == conn.req_initial_send_len &&
            conn.req_initial_send_len == conn.recv_buf.len() &&
@@ -561,26 +560,51 @@ inline bool exact_strict_local_response_common_request_is_admitted(const Connect
             method == LogHttpMethod::Post || method == LogHttpMethod::Options);
 }
 
-inline bool exact_strict_local_response_request_is_admitted(const Connection& conn) {
-    if (!exact_strict_local_response_common_request_is_admitted(conn)) return false;
-    if (http1_pipeline_request_is_legacy(conn)) return true;
+inline bool exact_strict_local_response_header_absent_framing_is_admitted(const Connection& conn) {
+    return !conn.req_client_has_content_length && conn.req_client_content_length_count == 0 &&
+           conn.req_content_length == 0;
+}
+
+inline bool exact_strict_local_response_common_request_is_admitted(const Connection& conn) {
+    return exact_strict_local_response_common_request_shape_is_admitted(conn) &&
+           exact_strict_local_response_header_absent_framing_is_admitted(conn);
+}
+
+inline bool exact_strict_local_response_single_cl0_post_request_is_admitted(
+    const Connection& conn) {
     const bool exact_close =
         !conn.req_keep_alive && !conn.req_client_keep_alive && conn.req_client_connection_close &&
         conn.req_client_connection_close_exact && conn.req_client_connection_count == 1;
-    return http1_pipeline_request_is_current_successor(conn) &&
-           conn.req_method == static_cast<u8>(LogHttpMethod::Get) && exact_close &&
-           conn.http1_pipeline_boundary_owners_settled &&
-           conn.recv_buf.len() == conn.req_initial_send_len && conn.pipeline_stash_len == 0 &&
-           conn.send_buf.len() == 0 && conn.send_progress == 0 && !conn.send_armed &&
-           conn.on_send == nullptr && conn.req_start_us != 0 && !conn.epoch_held &&
-           conn.response_read_deadline_owner_is_neutral() && conn.http1_prebuilt_wait == 0 &&
-           conn.http1_prebuilt_disposition == Http1RequestBufferDisposition::None &&
-           conn.http1_prebuilt_request_prefix_len == 0 &&
-           conn.http1_prebuilt_response_proof_is_neutral() && !conn.http1_boundary_deferred &&
-           !conn.http1_boundary_ready && conn.http1_boundary_successor_episode == 0 &&
-           !conn.upstream_episode_quarantined && http1_pipeline_successor_tombstone_is_safe(conn) &&
-           http1_pipeline_successor_upstream_owners_are_neutral(conn) &&
-           conn.retry_req_send_len == 0 && conn.upstream_attempts <= 1;
+    return exact_strict_local_response_common_request_shape_is_admitted(conn) &&
+           conn.req_method == static_cast<u8>(LogHttpMethod::Post) &&
+           conn.req_client_has_content_length && conn.req_client_content_length_count == 1 &&
+           conn.req_content_length == 0 && exact_close && http1_pipeline_request_is_legacy(conn);
+}
+
+inline bool exact_strict_local_response_request_is_admitted(const Connection& conn) {
+    if (exact_strict_local_response_common_request_is_admitted(conn)) {
+        if (http1_pipeline_request_is_legacy(conn)) return true;
+        const bool exact_close = !conn.req_keep_alive && !conn.req_client_keep_alive &&
+                                 conn.req_client_connection_close &&
+                                 conn.req_client_connection_close_exact &&
+                                 conn.req_client_connection_count == 1;
+        return http1_pipeline_request_is_current_successor(conn) &&
+               conn.req_method == static_cast<u8>(LogHttpMethod::Get) && exact_close &&
+               conn.http1_pipeline_boundary_owners_settled &&
+               conn.recv_buf.len() == conn.req_initial_send_len && conn.pipeline_stash_len == 0 &&
+               conn.send_buf.len() == 0 && conn.send_progress == 0 && !conn.send_armed &&
+               conn.on_send == nullptr && conn.req_start_us != 0 && !conn.epoch_held &&
+               conn.response_read_deadline_owner_is_neutral() && conn.http1_prebuilt_wait == 0 &&
+               conn.http1_prebuilt_disposition == Http1RequestBufferDisposition::None &&
+               conn.http1_prebuilt_request_prefix_len == 0 &&
+               conn.http1_prebuilt_response_proof_is_neutral() && !conn.http1_boundary_deferred &&
+               !conn.http1_boundary_ready && conn.http1_boundary_successor_episode == 0 &&
+               !conn.upstream_episode_quarantined &&
+               http1_pipeline_successor_tombstone_is_safe(conn) &&
+               http1_pipeline_successor_upstream_owners_are_neutral(conn) &&
+               conn.retry_req_send_len == 0 && conn.upstream_attempts <= 1;
+    }
+    return exact_strict_local_response_single_cl0_post_request_is_admitted(conn);
 }
 bool pipeline_stash(Connection& conn);
 bool pipeline_recover(Connection& conn);

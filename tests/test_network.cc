@@ -9819,13 +9819,91 @@ TEST(exact_local_response,
         *valid, "POST /static HTTP/1.1\r\nHost: x\r\nContent-Length: 1\r\n\r\nx", 2);
     closes_without_effect(
         *valid,
-        "POST /static HTTP/1.1\r\nHost: x\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+        "GET /static HTTP/1.1\r\nHost: x\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
         2);
+    closes_without_effect(
+        *valid,
+        "HEAD /static HTTP/1.1\r\nHost: x\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+        2);
+    closes_without_effect(
+        *valid,
+        "OPTIONS /static HTTP/1.1\r\nHost: x\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+        2);
+    closes_without_effect(
+        *valid, "POST /static HTTP/1.1\r\nHost: x\r\nContent-Length: 0\r\n\r\n", 2);
     closes_without_effect(
         *valid,
         "POST /static HTTP/1.1\r\nHost: x\r\nContent-Length: 0\r\nContent-Length: "
         "0\r\nConnection: close\r\n\r\n",
         2);
+    closes_without_effect(
+        *valid,
+        "POST /static HTTP/1.1\r\nHost: x\r\nContent-Length: 0\r\nTransfer-Encoding: "
+        "chunked\r\nConnection: close\r\n\r\n",
+        0);
+    closes_without_effect(
+        *valid,
+        "POST /static HTTP/1.1\r\nHost: x\r\nContent-Length: 0\r\nContent-Length: "
+        "1\r\nConnection: close\r\n\r\n",
+        0);
+    closes_without_effect(
+        *valid,
+        "POST /static HTTP/1.1\r\nHost: x\r\nContent-Length: nope\r\nConnection: close\r\n\r\n",
+        0);
+    closes_without_effect(
+        *valid,
+        "POST /static HTTP/1.1\r\nHost: x\r\nContent-Length: 1\r\nConnection: close\r\n\r\n",
+        2);
+    closes_without_effect(
+        *valid,
+        "POST /static HTTP/1.1\r\nHost: x\r\nContent-Length: 2\r\nConnection: close\r\n\r\nx",
+        2);
+    closes_without_effect(
+        *valid,
+        "POST /static HTTP/1.1\r\nHost: x\r\nContent-Length: 1\r\nConnection: close\r\n\r\nx",
+        2);
+    closes_without_effect(
+        *valid,
+        "POST /static HTTP/1.1\r\nHost: x\r\nContent-Length: 0\r\nConnection: close\r\n\r\nx",
+        2);
+    closes_without_effect(
+        *valid,
+        "POST /static HTTP/1.1\r\nHost: x\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+        "GET /next HTTP/1.1\r\nHost: x\r\n\r\n",
+        2);
+    closes_without_effect(*valid,
+                          "POST /static HTTP/1.1\r\nHost: x\r\nContent-Length: 0\r\nExpect: "
+                          "100-continue\r\nConnection: close\r\n\r\n",
+                          2);
+    closes_without_effect(
+        *valid,
+        "POST /static HTTP/1.1\r\nHost: x\r\nContent-Length: 0\r\nTE: trailers\r\n"
+        "Connection: close\r\n\r\n",
+        2);
+    closes_without_effect(
+        *valid,
+        "POST /static HTTP/1.1\r\nHost: x\r\nContent-Length: 0\r\nConnection: Upgrade\r\n"
+        "Upgrade: websocket\r\n\r\n",
+        2);
+    closes_without_effect(
+        *valid,
+        "POST /static HTTP/1.1\r\nHost: x\r\nContent-Length: 0\r\nConnection: close, "
+        "close\r\n\r\n",
+        2);
+    closes_without_effect(
+        *valid,
+        "POST /static#fragment HTTP/1.1\r\nHost: x\r\nContent-Length: 0\r\nConnection: "
+        "close\r\n\r\n",
+        0);
+    closes_without_effect(
+        *valid,
+        "POST /static HTTP/1.0\r\nHost: x\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+        0);
+    closes_without_effect(
+        *valid,
+        "POST http://example.test/static HTTP/1.1\r\nHost: example.test\r\nContent-Length: "
+        "0\r\nConnection: close\r\n\r\n",
+        0);
     closes_without_effect(*valid, "GET /static HTTP/1.1\r\nBroken\r\n\r\n", 0);
 
     // A depth-zero exact response does not silently acquire ownership of a
@@ -9867,10 +9945,226 @@ TEST(exact_local_response,
     CHECK_EQ(loop.backend.count_ops(MockOp::Send), 1u);
 }
 
+TEST(exact_local_response,
+     single_content_length_zero_post_depth_zero_lifecycle_and_forgery_are_bounded) {
+    SmallLoop loop;
+    loop.setup();
+    ShardMetrics metrics{};
+    metrics.init();
+    AccessLogRing access{};
+    access.init();
+    CaptureRing capture{};
+    capture.init();
+    ShardEpoch epoch{};
+    loop.metrics = &metrics;
+    loop.access_log = &access;
+    loop.epoch = &epoch;
+    REQUIRE(loop.set_capture(&capture));
+
+    RouteConfig config{};
+    REQUIRE(install_representation200_exact(config, "/static"));
+    const RouteConfig* active = &config;
+    loop.config_ptr = &active;
+
+    static constexpr char kCl0Post[] =
+        "POST /static HTTP/1.1\r\nHost: x\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+    loop.backend.clear_ops();
+    Connection* conn = dispatch_unmatched_request(loop, config, kCl0Post);
+    REQUIRE(conn != nullptr);
+    const u32 conn_id = conn->id;
+    REQUIRE_EQ(conn->resp_status, 200u);
+    CHECK_EQ(conn->req_method, static_cast<u8>(LogHttpMethod::Post));
+    CHECK(conn->req_client_has_content_length);
+    CHECK_EQ(conn->req_client_content_length_count, 1u);
+    CHECK_EQ(conn->req_content_length, 0u);
+    CHECK_EQ(conn->req_body_mode, BodyMode::None);
+    CHECK_EQ(conn->req_body_remaining, 0u);
+    CHECK_EQ(conn->pipeline_depth, 0u);
+    CHECK_EQ(conn->http1_pipeline_request_generation, 0u);
+    CHECK_FALSE(conn->req_keep_alive);
+    CHECK_FALSE(conn->req_client_keep_alive);
+    CHECK(conn->req_client_connection_close);
+    CHECK(conn->req_client_connection_close_exact);
+    CHECK_EQ(conn->req_client_connection_count, 1u);
+    CHECK_FALSE(conn->keep_alive);
+    CHECK_EQ(conn->upstream_fd, -1);
+    CHECK_FALSE(conn->upstream_slot_held);
+    CHECK_EQ(conn->upstream_attempts, 0u);
+    CHECK_EQ(conn->retry_req_send_len, 0u);
+    CHECK_EQ(loop.backend.count_ops(MockOp::Connect), 0u);
+    CHECK_EQ(loop.backend.count_ops(MockOp::Send), 1u);
+    CHECK_EQ(metrics.requests_total, 0u);
+    CHECK_EQ(metrics.requests_active, 1u);
+    CHECK_EQ(access.available(), 0u);
+    CHECK_EQ(capture.available(), 0u);
+    CHECK_EQ(epoch.epoch.load(std::memory_order_acquire), 1u);
+
+    u8 normalized[SmallLoop::kBufSize]{};
+    const u32 wire_len = conn->send_buf.len();
+    REQUIRE(wire_len <= sizeof(normalized));
+    __builtin_memcpy(normalized, conn->send_buf.data(), wire_len);
+    REQUIRE(normalize_redirect_date(normalized, wire_len));
+    const std::string expected = expected_representation200_wire(false, false);
+    REQUIRE_EQ(wire_len, static_cast<u32>(expected.size()));
+    CHECK_EQ(__builtin_memcmp(normalized, expected.data(), expected.size()), 0);
+
+    static constexpr u32 kPartial = 7;
+    REQUIRE_GT(wire_len, kPartial);
+    loop.inject_and_dispatch(make_ev(conn_id, IoEventType::Send, kPartial));
+    CHECK_EQ(metrics.requests_total, 0u);
+    CHECK_EQ(metrics.requests_active, 1u);
+    CHECK_EQ(access.available(), 0u);
+    CHECK_EQ(capture.available(), 0u);
+    CHECK_EQ(epoch.epoch.load(std::memory_order_acquire), 1u);
+    CHECK_EQ(conn->send_progress, kPartial);
+    const MockOp* remainder = loop.backend.last_op(MockOp::Send);
+    REQUIRE(remainder != nullptr);
+    CHECK_EQ(remainder->send_buf, conn->send_buf.data() + kPartial);
+    CHECK_EQ(remainder->send_len, wire_len - kPartial);
+    loop.inject_and_dispatch(
+        make_ev(conn_id, IoEventType::Send, static_cast<i32>(wire_len - kPartial)));
+    CHECK_EQ(loop.free_top, SmallLoop::kMaxConns);
+    CHECK_EQ(metrics.requests_total, 1u);
+    CHECK_EQ(metrics.requests_active, 0u);
+    CHECK_EQ(access.available(), 1u);
+    CHECK_EQ(capture.available(), 1u);
+    CHECK_EQ(epoch.epoch.load(std::memory_order_acquire), 2u);
+    AccessLogEntry access_entry{};
+    REQUIRE(access.pop(access_entry));
+    CHECK_EQ(access_entry.status, 200u);
+    CHECK_EQ(access_entry.method, static_cast<u8>(LogHttpMethod::Post));
+    CHECK_EQ(access_entry.resp_size, wire_len);
+    CHECK_EQ(access_entry.upstream_us, 0u);
+    CaptureEntry capture_entry{};
+    REQUIRE(capture.pop(capture_entry));
+    CHECK_EQ(capture_entry.resp_status, 200u);
+    CHECK_EQ(capture_entry.method, static_cast<u8>(LogHttpMethod::Post));
+    CHECK_EQ(capture_entry.req_content_length, 0u);
+    CHECK_EQ(capture_entry.resp_content_length, wire_len);
+    CHECK_EQ(capture_entry.raw_header_len, sizeof(kCl0Post) - 1);
+    CHECK_EQ(__builtin_memcmp(capture_entry.raw_headers, kCl0Post, sizeof(kCl0Post) - 1), 0);
+    CHECK_EQ(access.available(), 0u);
+    CHECK_EQ(capture.available(), 0u);
+
+    // Numeric zero is a parsed semantic value, not a raw nginx spelling.  A
+    // valid alternate decimal spelling therefore enters the same bounded RUT
+    // branch without expanding the converter compatibility claim.
+    static constexpr char kAlternateZero[] =
+        "POST /static HTTP/1.1\r\nHost: x\r\nContent-Length: 000\r\nConnection: close\r\n\r\n";
+    loop.backend.clear_ops();
+    Connection* alternate = dispatch_unmatched_request(loop, config, kAlternateZero);
+    REQUIRE(alternate != nullptr);
+    CHECK(alternate->req_client_has_content_length);
+    CHECK_EQ(alternate->req_client_content_length_count, 1u);
+    CHECK_EQ(alternate->req_content_length, 0u);
+    CHECK_EQ(alternate->resp_status, 200u);
+    CHECK_EQ(loop.backend.count_ops(MockOp::Connect), 0u);
+    const u32 alternate_len = alternate->send_buf.len();
+    loop.inject_and_dispatch(
+        make_ev(alternate->id, IoEventType::Send, static_cast<i32>(alternate_len)));
+    CHECK_EQ(metrics.requests_total, 2u);
+    CHECK_EQ(metrics.requests_active, 0u);
+    CHECK_EQ(epoch.epoch.load(std::memory_order_acquire), 4u);
+    REQUIRE(access.pop(access_entry));
+    REQUIRE(capture.pop(capture_entry));
+    CHECK_EQ(capture_entry.raw_header_len, sizeof(kAlternateZero) - 1);
+    CHECK_EQ(
+        __builtin_memcmp(capture_entry.raw_headers, kAlternateZero, sizeof(kAlternateZero) - 1), 0);
+
+    // A downstream send failure settles the acquired request/epoch exactly
+    // once but publishes neither success accounting nor access/capture data.
+    loop.backend.clear_ops();
+    Connection* failed = dispatch_unmatched_request(loop, config, kCl0Post);
+    REQUIRE(failed != nullptr);
+    const u32 failed_id = failed->id;
+    CHECK_EQ(metrics.requests_active, 1u);
+    CHECK_EQ(epoch.epoch.load(std::memory_order_acquire), 5u);
+    CHECK_EQ(loop.backend.count_ops(MockOp::Connect), 0u);
+    loop.inject_and_dispatch(make_ev(failed_id, IoEventType::Send, -EPIPE));
+    CHECK_EQ(loop.free_top, SmallLoop::kMaxConns);
+    CHECK_EQ(metrics.requests_total, 2u);
+    CHECK_EQ(metrics.requests_active, 0u);
+    CHECK_EQ(access.available(), 0u);
+    CHECK_EQ(capture.available(), 0u);
+    CHECK_EQ(epoch.epoch.load(std::memory_order_acquire), 6u);
+    CHECK_EQ(loop.backend.count_ops(MockOp::Connect), 0u);
+
+    // The framing identity is fail-closed under every half-state; the old
+    // header-absent framing identity remains independently admissible.
+    Connection forged{};
+    u8 recv[512]{}, send[512]{}, upstream[512]{}, response[512]{};
+    forged.reset();
+    forged.recv_slice = recv;
+    forged.send_slice = send;
+    forged.upstream_recv_slice = upstream;
+    forged.response_header_slice = response;
+    forged.recv_buf.bind(recv, sizeof(recv));
+    forged.send_buf.bind(send, sizeof(send));
+    forged.upstream_recv_buf.bind(upstream, sizeof(upstream));
+    forged.response_header_buf.bind(response, sizeof(response));
+    REQUIRE_EQ(forged.recv_buf.write(reinterpret_cast<const u8*>(kCl0Post), sizeof(kCl0Post) - 1),
+               sizeof(kCl0Post) - 1);
+    capture_request_metadata(forged);
+    REQUIRE(exact_strict_local_response_request_is_admitted(forged));
+    forged.req_client_content_length_count = 0;
+    CHECK_FALSE(exact_strict_local_response_request_is_admitted(forged));
+    forged.req_client_content_length_count = 2;
+    CHECK_FALSE(exact_strict_local_response_request_is_admitted(forged));
+    forged.req_client_content_length_count = 1;
+    forged.req_client_has_content_length = false;
+    CHECK_FALSE(exact_strict_local_response_request_is_admitted(forged));
+    forged.req_client_has_content_length = true;
+    forged.req_content_length = 1;
+    CHECK_FALSE(exact_strict_local_response_request_is_admitted(forged));
+    forged.req_content_length = 0;
+    REQUIRE(exact_strict_local_response_request_is_admitted(forged));
+    forged.req_body_remaining = 1;
+    CHECK_FALSE(exact_strict_local_response_request_is_admitted(forged));
+    forged.req_body_remaining = 0;
+    forged.request_body_fully_buffered = true;
+    CHECK_FALSE(exact_strict_local_response_request_is_admitted(forged));
+    forged.request_body_fully_buffered = false;
+    forged.req_body_streamed = true;
+    CHECK_FALSE(exact_strict_local_response_request_is_admitted(forged));
+    forged.req_body_streamed = false;
+    forged.req_client_connection_close_exact = false;
+    CHECK_FALSE(exact_strict_local_response_request_is_admitted(forged));
+    forged.req_client_connection_close_exact = true;
+    forged.req_client_connection_count = 2;
+    CHECK_FALSE(exact_strict_local_response_request_is_admitted(forged));
+    forged.req_client_connection_count = 1;
+    forged.tls_active = true;
+    CHECK_FALSE(exact_strict_local_response_request_is_admitted(forged));
+    forged.tls_active = false;
+    forged.protocol = ConnProtocol::Http2;
+    CHECK_FALSE(exact_strict_local_response_request_is_admitted(forged));
+    forged.protocol = ConnProtocol::Http11;
+    forged.pipeline_depth = 1;
+    forged.http1_pipeline_request_generation = 1;
+    forged.handler_gen = 1;
+    forged.http1_pipeline_boundary_owners_settled = true;
+    CHECK_FALSE(exact_strict_local_response_request_is_admitted(forged));
+
+    // Coherent absence remains the byte-compatible legacy branch.  Half-state
+    // absence cannot borrow that branch when the count/value disagree.
+    forged.pipeline_depth = 0;
+    forged.http1_pipeline_request_generation = 0;
+    forged.req_client_has_content_length = false;
+    forged.req_client_content_length_count = 0;
+    forged.req_content_length = 0;
+    REQUIRE(exact_strict_local_response_request_is_admitted(forged));
+    forged.req_client_content_length_count = 1;
+    CHECK_FALSE(exact_strict_local_response_request_is_admitted(forged));
+    forged.req_client_content_length_count = 0;
+    forged.req_content_length = 1;
+    CHECK_FALSE(exact_strict_local_response_request_is_admitted(forged));
+}
+
 TEST(exact_local_response, depth_one_matching_exclusions_fail_before_second_response) {
     static constexpr const char* kRejected[] = {
         "GET /static HTTP/1.1\r\nHost: x\r\n\r\n",
         "POST /static HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n",
+        "POST /static HTTP/1.1\r\nHost: x\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
         "GET /static HTTP/1.1\r\nHost: x\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
         "GET /static HTTP/1.1\r\nHost: x\r\nConnection: close, keep-alive\r\n\r\n",
         ("GET /static HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n"
