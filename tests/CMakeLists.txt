@@ -407,6 +407,18 @@ if(RUT_ENABLE_JIT)
         SKIP_RETURN_CODE 77
     )
     add_test(
+        NAME test_nginx_root_proxy_trace_oracle
+        COMMAND test_nginx_differential --root-proxy-trace-oracle
+    )
+    set_tests_properties(test_nginx_root_proxy_trace_oracle PROPERTIES
+        LABELS "integration;nginx;docker"
+        RUN_SERIAL TRUE
+        RESOURCE_LOCK nginx-differential
+        TIMEOUT 60
+        SKIP_RETURN_CODE 77
+        ENVIRONMENT "RUT_NGINX_DIFFERENTIAL_REQUIRED=1"
+    )
+    add_test(
         NAME test_nginx_strict_local_response_differential
         COMMAND test_nginx_differential --strict-local-response-differential
                 $<TARGET_FILE:rut>

@@ -84,6 +84,10 @@ static constexpr char kExactLocalTraceCloseRequest[] =
     "TRACE /static HTTP/1.1\r\n"
     "Host: exact-local.example\r\n"
     "Connection: close\r\n\r\n";
+static constexpr char kRootProxyTraceCloseRequest[] =
+    "TRACE / HTTP/1.1\r\n"
+    "Host: root-proxy.example\r\n"
+    "Connection: close\r\n\r\n";
 static constexpr char kExactLocalTraceResponseNormalized[] =
     "HTTP/1.1 405 Not Allowed\r\n"
     "Server: nginx/1.29.7\r\n"
@@ -7177,6 +7181,168 @@ static bool run_pinned_exact_local_return_baseline(u16 frontend_port,
     return true;
 }
 
+static bool run_pinned_root_proxy_trace_oracle(u16 frontend_port,
+                                               u16 backend_port,
+                                               TempDir& temp,
+                                               const std::string& container_name,
+                                               std::string& error) {
+    const std::string request(kRootProxyTraceCloseRequest,
+                              sizeof(kRootProxyTraceCloseRequest) - 1u);
+    const size_t header_end = request.find("\r\n\r\n");
+    const size_t close_header = request.find("\r\nConnection: close\r\n");
+    if (request !=
+            "TRACE / HTTP/1.1\r\n"
+            "Host: root-proxy.example\r\n"
+            "Connection: close\r\n\r\n" ||
+        request.rfind("TRACE / HTTP/1.1\r\n", 0) != 0 || request.find('?') != std::string::npos ||
+        request.find('#') != std::string::npos || close_header == std::string::npos ||
+        request.rfind("\r\nConnection: close\r\n") != close_header ||
+        request.find("\r\nContent-Length:") != std::string::npos ||
+        request.find("\r\nTransfer-Encoding:") != std::string::npos ||
+        request.find("\r\nTE:") != std::string::npos ||
+        request.find("\r\nExpect:") != std::string::npos ||
+        request.find("\r\nUpgrade:") != std::string::npos || header_end == std::string::npos ||
+        header_end + 4u != request.size() || request.rfind("\r\n\r\n") != header_end) {
+        error = "root-only TRACE oracle request escaped the fresh depth-zero bounded domain";
+        return false;
+    }
+
+    // Keep the upstream listener live throughout the response and the
+    // post-response window.  Its non-atomic history is inspected only after
+    // this thread has been joined below.
+    Recorder recorder;
+    recorder.observe_extra_requests_until_stop = true;
+    if (!recorder.setup(backend_port, 1, kBackendResponse, sizeof(kBackendResponse) - 1u)) {
+        error = "failed to start root-only TRACE upstream recorder";
+        return false;
+    }
+
+    const std::string config =
+        "error_log stderr notice;\n"
+        "events {}\n"
+        "http {\n"
+        "  server {\n"
+        "    listen " +
+        std::to_string(frontend_port) +
+        ";\n"
+        "    location / {\n"
+        "      proxy_pass http://127.0.0.1:" +
+        std::to_string(backend_port) +
+        ";\n"
+        "    }\n"
+        "  }\n"
+        "}\n";
+    if (!write_file(temp.nginx_config, config.data(), config.size())) {
+        error = "failed to write root-only proxy pinned nginx config";
+        return false;
+    }
+
+    DockerGuard docker(container_name);
+    ChildGuard nginx;
+    if (!spawn_child({"docker",
+                      "run",
+                      "--pull=never",
+                      "--network",
+                      "host",
+                      "--name",
+                      container_name,
+                      "-v",
+                      temp.nginx_config + ":/etc/nginx/nginx.conf:ro",
+                      kNginxImage,
+                      "nginx",
+                      "-g",
+                      "daemon off;"},
+                     temp.nginx_log,
+                     nginx.child)) {
+        error = "failed to start pinned nginx for root-only TRACE oracle";
+        return false;
+    }
+    if (!wait_ready(frontend_port, nginx.child, error)) return false;
+
+    struct ClientGuard {
+        int fd = -1;
+        ~ClientGuard() {
+            if (fd >= 0) close(fd);
+        }
+    } client{connect_once(frontend_port)};
+    if (client.fd < 0 || !send_all(client.fd, request.data(), request.size())) {
+        error = "failed to send root-only TRACE oracle request";
+        return false;
+    }
+    std::vector<char> wire;
+    if (!read_response(client.fd, wire, error) || !read_eof(client.fd, error)) {
+        error = "root-only TRACE response/EOF failed: " + error;
+        return false;
+    }
+    std::string detail;
+    if (!validate_exact_normalized_response(wire, kExactLocalTraceResponseNormalized, detail)) {
+        error = "root-only TRACE exact wire mismatch: " + detail;
+        return false;
+    }
+
+    // The response must be a pre-location rejection: keep both nginx and the
+    // recorder live for a full bounded interval after downstream EOF and
+    // reject any upstream accept/request as a semantic failure.
+    const auto quiet_deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(500);
+    while (std::chrono::steady_clock::now() < quiet_deadline) {
+        if (poll_child(nginx.child)) {
+            error = "pinned nginx exited during root-only TRACE upstream quiet window";
+            return false;
+        }
+        if (!recorder.running.load(std::memory_order_acquire) ||
+            !recorder.thread_alive.load(std::memory_order_acquire) ||
+            recorder.listener_failed.load(std::memory_order_acquire)) {
+            error = "root-only TRACE upstream recorder stopped or failed during quiet window";
+            return false;
+        }
+        if (recorder.accepted.load(std::memory_order_acquire) != 0 ||
+            recorder.requests.load(std::memory_order_acquire) != 0) {
+            error = "root-only TRACE unexpectedly reached the proxy upstream";
+            return false;
+        }
+        usleep(5000);
+    }
+
+    // Stop nginx before joining the recorder.  This leaves no possible proxy
+    // writer racing the recorder's final non-atomic history inspection.
+    if (!stop_child(nginx.child)) {
+        error = "failed to stop root-only TRACE pinned nginx";
+        return false;
+    }
+    if (!docker.remove()) {
+        error = "docker rm -f failed after root-only TRACE oracle";
+        return false;
+    }
+    recorder.stop();
+    if (recorder.listener_failed.load(std::memory_order_acquire) ||
+        recorder.accepted.load(std::memory_order_acquire) != 0 ||
+        recorder.requests.load(std::memory_order_acquire) != 0 ||
+        recorder.response_send_all_calls.load(std::memory_order_acquire) != 0 ||
+        recorder.response_send_succeeded.load(std::memory_order_acquire) ||
+        !recorder.history.empty() || !recorder.request.empty()) {
+        error = "root-only TRACE recorder did not settle with zero upstream activity";
+        return false;
+    }
+
+    u32 access_records = 0;
+    u32 upstream_connect_logs = 0;
+    const std::string access_marker = "\"TRACE / HTTP/1.1\" 405 157";
+    const std::string upstream_context = "127.0.0.1:" + std::to_string(backend_port);
+    if (!log_count_line_with(
+            temp.nginx_log, access_marker.c_str(), "127.0.0.1 - -", access_records) ||
+        !log_count_line_with(
+            temp.nginx_log, "connect() failed", upstream_context.c_str(), upstream_connect_logs) ||
+        access_records != 1 || upstream_connect_logs != 0) {
+        error =
+            "root-only TRACE log evidence was not exactly one scoped 405 and zero upstream "
+            "connect failures (access=" +
+            std::to_string(access_records) + ", upstream=" + std::to_string(upstream_connect_logs) +
+            ")";
+        return false;
+    }
+    return true;
+}
+
 struct StrictLocalResponseDifferentialObservation {
     std::vector<char> nginx_wire;
     std::vector<char> rut_wire;
@@ -8669,6 +8835,8 @@ int main(int argc, char** argv) {
         argc == 3 && strcmp(argv[1], "--nginx-coalesced-ingress-gate") == 0;
     const bool exact_local_return_baseline =
         argc == 2 && strcmp(argv[1], "--exact-local-return-baseline") == 0;
+    const bool root_proxy_trace_oracle =
+        argc == 2 && strcmp(argv[1], "--root-proxy-trace-oracle") == 0;
     const bool strict_local_response_differential =
         argc == 3 && strcmp(argv[1], "--strict-local-response-differential") == 0;
     const bool converter_exact_local_differential =
@@ -8695,12 +8863,13 @@ int main(int argc, char** argv) {
         (argc == 2 && argv[1][0] == '/') ||
         (argc == 4 && argv[1][0] == '/' && argv[2][0] == '/' && argv[3][0] == '/');
     if ((!nginx_gate_spike && !nginx_coalesced_ingress_gate && !exact_local_return_baseline &&
-         !strict_local_response_differential && !converter_exact_local_differential &&
-         !exact_strict_route_differential && !converter_coalesced_successor_differential &&
-         !rut_iouring_gate_spike && !rut_iouring_gate_identity_negative &&
-         !rut_iouring_gate_ready_mutation_negative && !rut_iouring_gate_owner_death_negative &&
-         !rut_iouring_gate_connect_journal_negative && !rut_iouring_coalesced_ingress_gate &&
-         !late_successor_differential && !normal_differential) ||
+         !root_proxy_trace_oracle && !strict_local_response_differential &&
+         !converter_exact_local_differential && !exact_strict_route_differential &&
+         !converter_coalesced_successor_differential && !rut_iouring_gate_spike &&
+         !rut_iouring_gate_identity_negative && !rut_iouring_gate_ready_mutation_negative &&
+         !rut_iouring_gate_owner_death_negative && !rut_iouring_gate_connect_journal_negative &&
+         !rut_iouring_coalesced_ingress_gate && !late_successor_differential &&
+         !normal_differential) ||
         (nginx_gate_spike && argv[2][0] != '/') ||
         (nginx_coalesced_ingress_gate && argv[2][0] != '/') ||
         (strict_local_response_differential && argv[2][0] != '/') ||
@@ -8721,6 +8890,7 @@ int main(int argc, char** argv) {
                      "   or: test_nginx_differential --nginx-coalesced-ingress-gate "
                      "<absolute-preload-helper>\n"
                      "   or: test_nginx_differential --exact-local-return-baseline\n"
+                     "   or: test_nginx_differential --root-proxy-trace-oracle\n"
                      "   or: test_nginx_differential --strict-local-response-differential "
                      "<absolute-rut-executable>\n"
                      "   or: test_nginx_differential --converter-exact-local-differential "
@@ -8892,6 +9062,30 @@ int main(int argc, char** argv) {
         frontend_port == backend_port) {
         std::cerr << "FAIL [preflight]: bounded dynamic port allocation failed\n";
         return 1;
+    }
+
+    if (root_proxy_trace_oracle) {
+        const char* source_suffix = strrchr(temp.path, '/');
+        source_suffix = source_suffix ? source_suffix + 1 : temp.path;
+        const std::string container_name =
+            "rut-nginx-root-proxy-trace-" + std::to_string(getpid()) + "-" + source_suffix;
+        std::string oracle_error;
+        if (!run_pinned_root_proxy_trace_oracle(
+                frontend_port, backend_port, temp, container_name, oracle_error)) {
+            std::cerr << "FAIL [pinned root-only proxy TRACE oracle]: " << oracle_error << "\n";
+            dump_log(temp.nginx_config, "root-only proxy pinned nginx config");
+            dump_log(temp.nginx_log, "root-only proxy pinned nginx log");
+            return 1;
+        }
+        std::cerr
+            << "PASS: pinned nginx root-only proxy rejects one fresh header-absent explicit-close "
+               "TRACE / before location/proxy handling with exact 405/CL157/full-body/close/EOF "
+               "wire, one scoped access record, and a live/settled zero-upstream recorder "
+               "(nginx-only #305 oracle; no converter/RUT equivalence claim; excludes query, "
+               "fragment, Content-Length including CL0, TE/Transfer-Encoding, Expect, Upgrade, "
+               "body/tail, reuse/pipeline, other targets or methods, TLS/H2, and malformed "
+               "requests)\n";
+        return 0;
     }
 
     if (converter_coalesced_successor_differential || (normal_differential && argc == 4)) {
