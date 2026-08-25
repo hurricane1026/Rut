@@ -7408,6 +7408,7 @@ struct ConverterExactLocalDifferentialObservation {
     std::vector<char> nginx_delete_wire;
     std::vector<char> nginx_put_wire;
     std::vector<char> nginx_patch_wire;
+    std::vector<char> nginx_trace_wire;
     std::vector<char> generated_rut_wire;
     std::vector<char> generated_rut_head_wire;
     std::vector<char> generated_rut_post_wire;
@@ -7417,6 +7418,7 @@ struct ConverterExactLocalDifferentialObservation {
     std::vector<char> generated_rut_delete_wire;
     std::vector<char> generated_rut_put_wire;
     std::vector<char> generated_rut_patch_wire;
+    std::vector<char> generated_rut_trace_wire;
     u32 nginx_upstream_accepts = 0;
     u32 nginx_upstream_requests = 0;
     u32 generated_rut_upstream_accepts = 0;
@@ -7473,6 +7475,24 @@ static bool run_converter_exact_local_differential(
     }
     const rut::Str generated = lowered.value().view();
     const std::string rut_source(generated.ptr, generated.len);
+    const auto count_source_literal = [&](const char* literal) {
+        size_t count = 0;
+        for (size_t offset = 0;;) {
+            offset = rut_source.find(literal, offset);
+            if (offset == std::string::npos) return count;
+            count++;
+            offset += strlen(literal);
+        }
+    };
+    if (count_source_literal("pre_route TRACE { return local_response({") != 1 ||
+        rut_source.find("unmatched TRACE") != std::string::npos ||
+        rut_source.find("\nroute TRACE ") != std::string::npos ||
+        rut_source.rfind("route exact TRACE ", 0) == 0 ||
+        rut_source.find("\nroute exact TRACE ") != std::string::npos ||
+        count_source_literal("pre_route ") != 1) {
+        error = "converter output did not preserve exactly one concrete pre-route TRACE policy";
+        return false;
+    }
     static constexpr char kExactTerminator[] = "route exact \"/static\" { return local_response({";
     const size_t exact_begin = rut_source.find(kExactTerminator);
     const size_t exact_end =
@@ -7531,6 +7551,34 @@ static bool run_converter_exact_local_differential(
         "Host: exact-local.example\r\n"
         "Connection: close\r\n\r\n") {
         error = "converter exact-local POST request left the header-absent bodyless domain";
+        return false;
+    }
+
+    // This is the one fresh converter-generated TRACE vector: depth-zero
+    // cleartext H1.1 origin-form, explicit close, header-absent, and exactly
+    // the request bytes below.  No query/fragment, framing, expectation,
+    // upgrade, body/tail, duplicate close, reuse, or successor is admitted.
+    const std::string trace_request(kExactLocalTraceCloseRequest,
+                                    sizeof(kExactLocalTraceCloseRequest) - 1u);
+    const size_t trace_close = trace_request.find("\r\nConnection: close\r\n");
+    const size_t trace_header_end = trace_request.find("\r\n\r\n");
+    if (trace_request !=
+            "TRACE /static HTTP/1.1\r\n"
+            "Host: exact-local.example\r\n"
+            "Connection: close\r\n\r\n" ||
+        trace_request.rfind("TRACE /static HTTP/1.1\r\n", 0) != 0 ||
+        trace_request.find('?') != std::string::npos ||
+        trace_request.find('#') != std::string::npos || trace_close == std::string::npos ||
+        trace_request.rfind("\r\nConnection: close\r\n") != trace_close ||
+        trace_request.find("\r\nContent-Length:") != std::string::npos ||
+        trace_request.find("\r\nTransfer-Encoding:") != std::string::npos ||
+        trace_request.find("\r\nTE:") != std::string::npos ||
+        trace_request.find("\r\nExpect:") != std::string::npos ||
+        trace_request.find("\r\nUpgrade:") != std::string::npos ||
+        trace_header_end == std::string::npos || trace_header_end + 4u != trace_request.size() ||
+        trace_request.rfind("\r\n\r\n") != trace_header_end) {
+        error =
+            "converter exact-local TRACE left the fresh depth-zero header-absent bounded domain";
         return false;
     }
 
@@ -7904,6 +7952,16 @@ static bool run_converter_exact_local_differential(
                                kExactLocalCloseResponseNormalized,
                                false,
                                observation.nginx_patch_wire);
+        if (side_ok)
+            side_ok = exercise(upstream,
+                               nginx.child,
+                               "pinned nginx",
+                               "TRACE /static pre-location",
+                               kExactLocalTraceCloseRequest,
+                               sizeof(kExactLocalTraceCloseRequest) - 1u,
+                               kExactLocalTraceResponseNormalized,
+                               false,
+                               observation.nginx_trace_wire);
         // Keep the recorder live until the frontend has been stopped and reaped.
         const bool process_stopped = stop_child(nginx.child);
         const bool container_removed = docker.remove();
@@ -8022,6 +8080,16 @@ static bool run_converter_exact_local_differential(
                                kExactLocalCloseResponseNormalized,
                                false,
                                observation.generated_rut_patch_wire);
+        if (side_ok)
+            side_ok = exercise(upstream,
+                               generated_rut.child,
+                               "converter-generated ordinary RUT",
+                               "TRACE /static pre-route",
+                               kExactLocalTraceCloseRequest,
+                               sizeof(kExactLocalTraceCloseRequest) - 1u,
+                               kExactLocalTraceResponseNormalized,
+                               false,
+                               observation.generated_rut_trace_wire);
         // Preserve the same frontend-before-recorder teardown order as nginx.
         const bool process_stopped = stop_child(generated_rut.child);
         const bool recorder_settled =
@@ -8146,6 +8214,21 @@ static bool run_converter_exact_local_differential(
         error =
             "pinned nginx and converter-generated ordinary RUT header-absent PATCH /static wires "
             "did not each equal the expected response after Date-only normalization";
+        return false;
+    }
+    std::vector<char> normalized_nginx_trace = observation.nginx_trace_wire;
+    std::vector<char> normalized_generated_rut_trace = observation.generated_rut_trace_wire;
+    const std::vector<char> expected_trace(
+        kExactLocalTraceResponseNormalized,
+        kExactLocalTraceResponseNormalized + sizeof(kExactLocalTraceResponseNormalized) - 1u);
+    if (!normalize_date(normalized_nginx_trace) ||
+        !normalize_date(normalized_generated_rut_trace) ||
+        normalized_nginx_trace != expected_trace ||
+        normalized_generated_rut_trace != expected_trace ||
+        normalized_nginx_trace != normalized_generated_rut_trace) {
+        error =
+            "pinned nginx and converter-generated ordinary RUT pre-route TRACE wires did not "
+            "each equal the fixed 405 oracle after Date-only normalization";
         return false;
     }
     return true;
@@ -9032,6 +9115,8 @@ int main(int argc, char** argv) {
                       observation.nginx_put_wire);
             dump_wire("pinned nginx converter header-absent PATCH /static",
                       observation.nginx_patch_wire);
+            dump_wire("pinned nginx converter TRACE /static pre-location",
+                      observation.nginx_trace_wire);
             dump_wire("converter-generated ordinary RUT exact GET /static",
                       observation.generated_rut_wire);
             dump_wire("converter-generated ordinary RUT exact HEAD /static",
@@ -9050,6 +9135,8 @@ int main(int argc, char** argv) {
                       observation.generated_rut_put_wire);
             dump_wire("converter-generated ordinary RUT header-absent PATCH /static",
                       observation.generated_rut_patch_wire);
+            dump_wire("converter-generated ordinary RUT TRACE /static pre-route",
+                      observation.generated_rut_trace_wire);
             std::cerr << "converter exact-local upstream nginx accepted="
                       << observation.nginx_upstream_accepts
                       << " requests=" << observation.nginx_upstream_requests
@@ -9092,7 +9179,14 @@ int main(int argc, char** argv) {
                "live/settled zero-upstream oracle (excluding PATCH query, any Content-Length "
                "including CL0, TE/Transfer-Encoding, Expect, Upgrade, body/tail, reuse/pipeline, "
                "proxy PATCH, other paths, TLS/H2, broader locations, or direct nginx.conf runtime "
-               "support)\n";
+               "support); one fresh depth-zero cleartext HTTP/1.1 origin-form header-absent "
+               "explicit-close TRACE /static independently matches nginx's pre-location fixed "
+               "405/CL157/nginx-body/close/EOF wire after Date-only normalization, with a live "
+               "and settled zero-upstream recorder (bounded converter-generated TRACE equivalence "
+               "only; excludes TRACE query/fragment, any Content-Length including CL0, "
+               "TE/Transfer-Encoding, Expect, Upgrade, body/tail, duplicate close, "
+               "reuse/pipeline, proxy TRACE, other targets or methods, TLS/H2, malformed input, "
+               "and direct nginx.conf runtime support)\n";
         if (converter_exact_local_differential) return 0;
     }
 
