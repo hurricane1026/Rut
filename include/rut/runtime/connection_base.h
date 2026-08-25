@@ -820,6 +820,20 @@ struct ConnectionBase {
     // Active wire protocol. Defaults to Http11; set from the ALPN result once
     // the TLS handshake completes, or on detecting the cleartext h2c preface.
     ConnProtocol protocol;
+    // Number of successfully completed requests on the currently accepted
+    // downstream transport. This is transport identity, not request metadata:
+    // reset() clears it on slot allocation/reuse, while keep-alive request
+    // boundaries deliberately preserve it. Saturates instead of wrapping.
+    u32 downstream_completed_request_count;
+
+    void record_downstream_request_completion() {
+        if (downstream_completed_request_count != ~u32{0}) downstream_completed_request_count++;
+    }
+
+    void copy_downstream_transport_state_from(const ConnectionBase& source) {
+        downstream_completed_request_count = source.downstream_completed_request_count;
+    }
+
     // Per-connection HTTP/2 engine, lazily allocated from a per-shard pool when
     // the connection switches to Http2; returned to the pool on close. Null for
     // HTTP/1 connections (they pay nothing).
@@ -1260,6 +1274,7 @@ struct ConnectionBase {
         tls_active = false;
         tls_handshake_complete = false;
         protocol = ConnProtocol::Http11;
+        downstream_completed_request_count = 0;
         h2 = nullptr;  // pool slot is released by free_conn_impl, not reset()
         tls = nullptr;
         // tls_engine.ssl is SSL_free'd by close_conn_impl before reset(); null

@@ -716,6 +716,7 @@ static void copy_sim_connection_state(Connection& dst, const Connection& src) {
     dst.tls_active = src.tls_active;
     dst.tls_handshake_complete = src.tls_handshake_complete;
     dst.tls = src.tls;
+    dst.copy_downstream_transport_state_from(src);
     dst.copy_http1_pipeline_state_from(src);
     dst.req_header_end = src.req_header_end;
     dst.req_content_length = src.req_content_length;

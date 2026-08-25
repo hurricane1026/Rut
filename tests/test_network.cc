@@ -9720,6 +9720,44 @@ TEST(exact_local_response,
     loop.inject_and_dispatch(
         make_ev(sequential->id, IoEventType::Send, static_cast<i32>(head_len)));
 
+    // Phase 1 of #295 is ownership-only: even after one successful request on
+    // the same keep-alive transport, DELETE remains fail-closed with no response
+    // or upstream publication and no successful-request accounting.
+    loop.backend.clear_ops();
+    Connection* sequential_delete =
+        dispatch_unmatched_request(loop, *valid, "GET /static HTTP/1.1\r\nHost: x\r\n\r\n");
+    REQUIRE(sequential_delete != nullptr);
+    const u32 sequential_delete_id = sequential_delete->id;
+    const u32 sequential_first_len = sequential_delete->send_buf.len();
+    loop.inject_and_dispatch(
+        make_ev(sequential_delete_id, IoEventType::Send, static_cast<i32>(sequential_first_len)));
+    REQUIRE_EQ(sequential_delete->downstream_completed_request_count, 1u);
+    const u64 delete_requests_before = metrics.requests_total;
+    const u32 delete_access_before = access.available();
+    const u32 delete_capture_before = capture.available();
+    const u64 delete_epoch_before = epoch.epoch.load(std::memory_order_acquire);
+    loop.backend.clear_ops();
+    static constexpr char kSequentialDelete[] =
+        "DELETE /static HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n";
+    REQUIRE_EQ(sequential_delete->recv_buf.write(reinterpret_cast<const u8*>(kSequentialDelete),
+                                                 sizeof(kSequentialDelete) - 1u),
+               sizeof(kSequentialDelete) - 1u);
+    const RouteConfig* sequential_delete_config = valid.get();
+    loop.config_ptr = &sequential_delete_config;
+    on_header_received<SmallLoop>(&loop,
+                                  *sequential_delete,
+                                  make_ev(sequential_delete_id,
+                                          IoEventType::Recv,
+                                          static_cast<i32>(sizeof(kSequentialDelete) - 1u)));
+    loop.config_ptr = nullptr;
+    CHECK_EQ(loop.conns[sequential_delete_id].fd, -1);
+    CHECK_EQ(loop.backend.count_ops(MockOp::Send), 0u);
+    CHECK_EQ(loop.backend.count_ops(MockOp::Connect), 0u);
+    CHECK_EQ(metrics.requests_total, delete_requests_before);
+    CHECK_EQ(access.available(), delete_access_before);
+    CHECK_EQ(capture.available(), delete_capture_before);
+    CHECK_EQ(epoch.epoch.load(std::memory_order_acquire), delete_epoch_before + 2u);
+
     // The exact response may be request2 only after the normal response
     // boundary has proven old owners settled and published the current depth-1
     // generation. No upstream episode is fabricated for the local successor.
@@ -9796,6 +9834,11 @@ TEST(exact_local_response,
             REQUIRE_FALSE(parsed.has_content_length);
             REQUIRE_EQ(parsed.transfer_encoding, RequestTransferEncoding::None);
         };
+
+    closes_without_effect(
+        *valid, "DELETE /static HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n", 2);
+    closes_without_effect(
+        *valid, "DELETE /static?x=1 HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n", 2);
 
     static constexpr char kOptionsStar[] =
         "OPTIONS * HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n";
@@ -11353,6 +11396,7 @@ TEST(pipeline, request_generation_token_rejects_handler_wrap_and_resets) {
 TEST(pipeline, simulation_state_copy_preserves_generation_boundary_and_fragment_witness) {
     ConnectionBase source{};
     source.reset();
+    source.downstream_completed_request_count = 9;
     source.pipeline_depth = 1;
     source.pipeline_stash_len = 19;
     source.http1_pipeline_request_generation = 41;
@@ -11360,12 +11404,16 @@ TEST(pipeline, simulation_state_copy_preserves_generation_boundary_and_fragment_
     source.req_target_has_fragment = true;
     ConnectionBase destination{};
     destination.reset();
+    destination.copy_downstream_transport_state_from(source);
     destination.copy_http1_pipeline_state_from(source);
+    CHECK_EQ(destination.downstream_completed_request_count, 9u);
     CHECK_EQ(destination.pipeline_depth, 1u);
     CHECK_EQ(destination.pipeline_stash_len, 19u);
     CHECK_EQ(destination.http1_pipeline_request_generation, 41u);
     CHECK(destination.http1_pipeline_boundary_owners_settled);
     CHECK(destination.req_target_has_fragment);
+    destination.reset();
+    CHECK_EQ(destination.downstream_completed_request_count, 0u);
 }
 
 // Exact single request — pipeline_leftover returns 0.
@@ -15809,6 +15857,79 @@ TEST(epoll_loop, callbacks_static_route_send_keepalive) {
     loop->free_conn(*c);
     loop->shutdown();
     destroy_real_loop(loop);
+}
+
+TEST(connection_lifecycle,
+     downstream_completed_request_count_is_transport_owned_exact_once_and_saturating) {
+    SmallLoop loop;
+    loop.setup();
+    RouteConfig config{};
+    REQUIRE(config.add_static("/", 0, 204));
+
+    Connection* conn =
+        dispatch_unmatched_request(loop, config, "GET /first HTTP/1.1\r\nHost: x\r\n\r\n");
+    REQUIRE(conn != nullptr);
+    const u32 id = conn->id;
+    CHECK_EQ(conn->downstream_completed_request_count, 0u);
+
+    const u32 first_wire_len = conn->send_buf.len();
+    REQUIRE_GT(first_wire_len, 3u);
+    loop.inject_and_dispatch(make_ev(id, IoEventType::Send, 3));
+    CHECK_EQ(conn->downstream_completed_request_count, 0u);
+    loop.inject_and_dispatch(make_ev(id, IoEventType::Send, static_cast<i32>(first_wire_len - 3u)));
+    REQUIRE_EQ(conn->downstream_completed_request_count, 1u);
+    REQUIRE_EQ(conn->state, ConnState::ReadingHeader);
+
+    // A duplicated terminal callback has no live request-completion ownership.
+    on_request_complete<SmallLoop>(&loop, *conn, 204, first_wire_len);
+    CHECK_EQ(conn->downstream_completed_request_count, 1u);
+
+    static constexpr char kSecond[] = "GET /second HTTP/1.1\r\nHost: x\r\n\r\n";
+    REQUIRE_EQ(conn->recv_buf.write(reinterpret_cast<const u8*>(kSecond), sizeof(kSecond) - 1u),
+               sizeof(kSecond) - 1u);
+    const RouteConfig* active = &config;
+    loop.config_ptr = &active;
+    on_header_received<SmallLoop>(
+        &loop, *conn, make_ev(id, IoEventType::Recv, static_cast<i32>(sizeof(kSecond) - 1u)));
+    loop.config_ptr = nullptr;
+    REQUIRE_EQ(conn->downstream_completed_request_count, 1u);
+    const u32 second_wire_len = conn->send_buf.len();
+    loop.inject_and_dispatch(make_ev(id, IoEventType::Send, static_cast<i32>(second_wire_len)));
+    REQUIRE_EQ(conn->downstream_completed_request_count, 2u);
+    REQUIRE_EQ(conn->state, ConnState::ReadingHeader);
+
+    loop.close_conn(*conn);
+    CHECK_EQ(loop.conns[id].downstream_completed_request_count, 0u);
+    Connection* reused = loop.alloc_conn();
+    REQUIRE(reused != nullptr);
+    REQUIRE_EQ(reused->id, id);
+    CHECK_EQ(reused->downstream_completed_request_count, 0u);
+
+    reused->fd = 81;
+    static constexpr char kFailed[] =
+        "GET /failed HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n";
+    REQUIRE_EQ(reused->recv_buf.write(reinterpret_cast<const u8*>(kFailed), sizeof(kFailed) - 1u),
+               sizeof(kFailed) - 1u);
+    loop.config_ptr = &active;
+    on_header_received<SmallLoop>(
+        &loop, *reused, make_ev(id, IoEventType::Recv, static_cast<i32>(sizeof(kFailed) - 1u)));
+    loop.config_ptr = nullptr;
+    REQUIRE_EQ(reused->downstream_completed_request_count, 0u);
+    loop.inject_and_dispatch(make_ev(id, IoEventType::Send, -EPIPE));
+    CHECK_EQ(loop.conns[id].downstream_completed_request_count, 0u);
+
+    Connection* saturating = loop.alloc_conn();
+    REQUIRE(saturating != nullptr);
+    REQUIRE_EQ(saturating->id, id);
+    saturating->downstream_completed_request_count = ~u32{0} - 1u;
+    saturating->req_start_us = monotonic_us();
+    on_request_complete<SmallLoop>(&loop, *saturating, 204, 0);
+    REQUIRE_EQ(saturating->downstream_completed_request_count, ~u32{0});
+    saturating->req_start_us = monotonic_us();
+    on_request_complete<SmallLoop>(&loop, *saturating, 204, 0);
+    CHECK_EQ(saturating->downstream_completed_request_count, ~u32{0});
+    saturating->reset();
+    CHECK_EQ(saturating->downstream_completed_request_count, 0u);
 }
 
 TEST(epoll_loop, callbacks_pipeline_incomplete_rearms_recv) {

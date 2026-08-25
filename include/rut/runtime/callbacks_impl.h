@@ -1471,10 +1471,12 @@ void handle_early_upstream_recv(Loop* loop, Connection& conn, IoEvent ev, bool s
 
 template <typename Loop>
 void on_request_complete(Loop* loop, Connection& conn, u16 status, u32 resp_size) {
+    const bool kOwnsRequestCompletion = conn.req_start_us != 0;
     const u32 kDurationUs = static_cast<u32>(monotonic_us() - conn.req_start_us);
 
     // Clear req_start_us so close_conn_impl knows no request is in flight.
     conn.req_start_us = 0;
+    if (kOwnsRequestCompletion) conn.record_downstream_request_completion();
 
     if (loop->metrics) {
         loop->metrics->on_request_complete(kDurationUs);
