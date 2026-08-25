@@ -51,6 +51,26 @@ std::string make_eighty_route_source() {
     return source;
 }
 
+std::string make_653_slot_route_source() {
+    std::string source = "listen :0\n";
+    source.reserve(4u * 1024u);
+    for (u32 i = 0; i < 91; i++) {
+        source += "route ";
+        source += (i % 2u == 0u) ? "GET" : "POST";
+        source += " \"/capacity/";
+        source += std::to_string(i);
+        source += "\" { return ";
+        source += (i % 2u == 0u) ? "200" : "201";
+        source += " }\n";
+    }
+    for (u32 i = 91; i < 93; i++) {
+        source += "route \"/capacity/";
+        source += std::to_string(i);
+        source += "\" { return 202 }\n";
+    }
+    return source;
+}
+
 }  // namespace
 
 TEST(serve_loader, status_routes_load) {
@@ -87,6 +107,32 @@ TEST(serve_loader, eighty_route_source_registers_all_routes) {
     CHECK_EQ(last.method, kRouteMethodPost);
     CHECK_EQ(last.path_len, 12u);
     CHECK(std::string(last.path, last.path_len) == "/capacity/79");
+    program.destroy();
+}
+
+TEST(serve_loader, six_hundred_fifty_three_slot_source_registers_owned_routes) {
+    const std::string dir = "/tmp/rut_serve_loader_653_tokens";
+    const std::string source = make_653_slot_route_source();
+    const std::string path = write_file(dir, "app.rut", source.c_str());
+
+    LoadedProgram program;
+    LoadError err;
+    REQUIRE(load_rut_program(path.c_str(), program, err));
+    CHECK(program.has_listener);
+    CHECK_EQ(program.listener.port, 0u);
+    CHECK(program.listener.address == ListenerAddress::IPv4Wildcard);
+    CHECK(program.listener.transport == ListenerTransport::Cleartext);
+    REQUIRE_EQ(program.config.route_count, 93u);
+
+    const RouteEntry& first = program.config.routes[0];
+    CHECK_EQ(first.method, kRouteMethodGet);
+    CHECK_EQ(first.path_len, 11u);
+    CHECK(std::string(first.path, first.path_len) == "/capacity/0");
+
+    const RouteEntry& last = program.config.routes[92];
+    CHECK_EQ(last.method, kRouteMethodAny);
+    CHECK_EQ(last.path_len, 12u);
+    CHECK(std::string(last.path, last.path_len) == "/capacity/92");
     program.destroy();
 }
 

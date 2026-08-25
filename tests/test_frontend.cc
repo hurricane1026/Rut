@@ -607,7 +607,7 @@ TEST(frontend, lex_token_capacity_boundaries_are_exact) {
         const std::string source = make_ident_stream(639);
         auto result = lex({source.data(), static_cast<u32>(source.size())});
         REQUIRE(result);
-        CHECK_EQ(result->tokens.len, 640u);  // 639 identifiers + EOF
+        CHECK_EQ(result->tokens.len, 640u);  // legacy 639 identifiers + EOF
         CHECK(result->tokens[639].type == TokenType::Eof);
         CHECK_EQ(result->tokens[639].start, static_cast<u32>(source.size()));
         CHECK_EQ(result->tokens[639].end, static_cast<u32>(source.size()));
@@ -616,9 +616,22 @@ TEST(frontend, lex_token_capacity_boundaries_are_exact) {
     }
 
     {
-        const std::string source = make_ident_stream(640);
+        const std::string source = make_ident_stream(767);
+        auto result = lex({source.data(), static_cast<u32>(source.size())});
+        REQUIRE(result);
+        CHECK_EQ(result->tokens.len, 768u);  // 767 identifiers + EOF
+        CHECK(result->tokens[767].type == TokenType::Eof);
+        CHECK_EQ(result->tokens[767].start, static_cast<u32>(source.size()));
+        CHECK_EQ(result->tokens[767].end, static_cast<u32>(source.size()));
+        CHECK_EQ(result->tokens[767].line, 1u);
+        CHECK_EQ(result->tokens[767].col, static_cast<u32>(source.size() + 1u));
+    }
+
+    {
+        const std::string source = make_ident_stream(768);
         auto result = lex({source.data(), static_cast<u32>(source.size())});
         REQUIRE(!result);
+        CHECK_FALSE(result.has_value());
         CHECK(result.error().code == FrontendError::TooManyTokens);
         CHECK_EQ(result.error().span.start, static_cast<u32>(source.size()));
         CHECK_EQ(result.error().span.end, static_cast<u32>(source.size()));
@@ -627,15 +640,16 @@ TEST(frontend, lex_token_capacity_boundaries_are_exact) {
     }
 
     {
-        const std::string source = make_ident_stream(641);
+        const std::string source = make_ident_stream(769);
         auto result = lex({source.data(), static_cast<u32>(source.size())});
         REQUIRE(!result);
+        CHECK_FALSE(result.has_value());
         CHECK(result.error().code == FrontendError::TooManyTokens);
-        // The 641st one-character identifier starts after 640 "a " pairs.
-        CHECK_EQ(result.error().span.start, 1280u);
-        CHECK_EQ(result.error().span.end, 1281u);
+        // The 769th one-character identifier starts after 768 "a " pairs.
+        CHECK_EQ(result.error().span.start, 1536u);
+        CHECK_EQ(result.error().span.end, 1537u);
         CHECK_EQ(result.error().span.line, 1u);
-        CHECK_EQ(result.error().span.col, 1281u);
+        CHECK_EQ(result.error().span.col, 1537u);
     }
 }
 
@@ -650,6 +664,26 @@ static std::string make_eighty_route_source() {
         source += "\" { return ";
         source += (i % 2u == 0u) ? "200" : "201";
         source += " }\n";
+    }
+    return source;
+}
+
+static std::string make_653_slot_route_source() {
+    std::string source = "listen :0\n";
+    source.reserve(4u * 1024u);
+    for (u32 i = 0; i < 91; i++) {
+        source += "route ";
+        source += (i % 2u == 0u) ? "GET" : "POST";
+        source += " \"/capacity/";
+        source += std::to_string(i);
+        source += "\" { return ";
+        source += (i % 2u == 0u) ? "200" : "201";
+        source += " }\n";
+    }
+    for (u32 i = 91; i < 93; i++) {
+        source += "route \"/capacity/";
+        source += std::to_string(i);
+        source += "\" { return 202 }\n";
     }
     return source;
 }
@@ -680,6 +714,40 @@ TEST(frontend, eighty_route_source_reaches_verified_rir_without_token_overflow) 
         const std::string expected_path = "/capacity/" + std::to_string(i);
         CHECK(fn.route_pattern.eq({expected_path.data(), static_cast<u32>(expected_path.size())}));
     }
+    rir.destroy();
+}
+
+TEST(frontend, six_hundred_fifty_three_slot_source_reaches_verified_rir) {
+    const std::string source = make_653_slot_route_source();
+    auto lexed = lex({source.data(), static_cast<u32>(source.size())});
+    REQUIRE(lexed);
+    // listen contributes 3 tokens, 91 method-specific routes contribute 7
+    // each, 2 method-omitted routes contribute 6 each, followed by EOF.
+    REQUIRE_EQ(lexed->tokens.len, 653u);
+
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    REQUIRE_EQ(ast->items.len, 94u);  // listener + 93 routes
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    CHECK(hir->has_listener);
+    CHECK_EQ(hir->listener.port, 0u);
+    REQUIRE_EQ(hir->routes.len, 93u);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    REQUIRE_EQ(mir->functions.len, 93u);
+    FrontendRirModule rir{};
+    REQUIRE(lower_to_rir(mir.value(), rir));
+    REQUIRE_EQ(rir.module.func_count, 93u);
+    const auto verified = rir::verify_module(rir.module);
+    REQUIRE(verified.ok);
+
+    const auto& first = rir.module.functions[0];
+    CHECK_EQ(first.http_method, kRouteMethodGet);
+    CHECK(first.route_pattern.eq({"/capacity/0", 11}));
+    const auto& last = rir.module.functions[92];
+    CHECK_EQ(last.http_method, kRouteMethodAny);
+    CHECK(last.route_pattern.eq({"/capacity/92", 12}));
     rir.destroy();
 }
 

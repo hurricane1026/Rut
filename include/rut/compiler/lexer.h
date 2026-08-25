@@ -129,19 +129,21 @@ struct Token {
 };
 
 struct LexedTokens {
-    // Bounded lexer storage: 640 tokens keep frontend stack use predictable
-    // while admitting ordinary programs without dynamic allocation.
-    static constexpr u32 kMaxTokens = 640;
+    // Bounded lexer storage: 768 tokens admit larger ordinary programs while
+    // retaining fixed-capacity, allocation-free ownership.
+    static constexpr u32 kMaxTokens = 768;
     FixedVec<Token, kMaxTokens> tokens;
 };
 
-// Keep the bounded token buffer comfortably below a conventional 64 KiB
-// frontend stack budget on all supported data models; this is intentionally a
-// portable bound rather than an LP64-specific sizeof(Token) assertion.
-static_assert(sizeof(LexedTokens) <= 64uz * 1024uz,
-              "LexedTokens exceeds the frontend stack budget");
-
 using LexResult = core::Expected<LexedTokens, Diagnostic>;
+
+// Keep each bounded lexer result object below 64 KiB on every supported data
+// model. These assertions bound the objects themselves; callers remain
+// responsible for their complete thread-stack usage.
+static_assert(sizeof(LexedTokens) <= 64uz * 1024uz,
+              "LexedTokens exceeds the bounded 64 KiB object size");
+static_assert(sizeof(LexResult) <= 64uz * 1024uz,
+              "LexResult exceeds the bounded 64 KiB object size");
 
 LexResult lex(Str source);
 
