@@ -588,7 +588,8 @@ inline bool exact_strict_local_response_single_cl0_post_request_is_admitted(
 inline bool exact_strict_local_response_fresh_method_pair_is_supported(
     LogHttpMethod metadata_method, HttpMethod raw_method) {
     return (metadata_method == LogHttpMethod::Delete && raw_method == HttpMethod::DELETE) ||
-           (metadata_method == LogHttpMethod::Put && raw_method == HttpMethod::PUT);
+           (metadata_method == LogHttpMethod::Put && raw_method == HttpMethod::PUT) ||
+           (metadata_method == LogHttpMethod::Patch && raw_method == HttpMethod::PATCH);
 }
 
 inline bool exact_strict_local_response_fresh_method_wire_is_admitted(
@@ -686,6 +687,16 @@ inline bool exact_strict_local_response_put_request_is_admitted(const Connection
         conn, LogHttpMethod::Put, HttpMethod::PUT);
 }
 
+inline bool exact_strict_local_response_patch_wire_is_admitted(const Connection& conn) {
+    return exact_strict_local_response_fresh_method_wire_is_admitted(
+        conn, LogHttpMethod::Patch, HttpMethod::PATCH);
+}
+
+inline bool exact_strict_local_response_patch_request_is_admitted(const Connection& conn) {
+    return exact_strict_local_response_fresh_method_request_is_admitted(
+        conn, LogHttpMethod::Patch, HttpMethod::PATCH);
+}
+
 inline bool exact_strict_local_response_request_is_admitted(const Connection& conn) {
     if (exact_strict_local_response_common_request_is_admitted(conn)) {
         if (http1_pipeline_request_is_legacy(conn)) return true;
@@ -711,7 +722,8 @@ inline bool exact_strict_local_response_request_is_admitted(const Connection& co
     }
     if (exact_strict_local_response_single_cl0_post_request_is_admitted(conn)) return true;
     if (exact_strict_local_response_delete_request_is_admitted(conn)) return true;
-    return exact_strict_local_response_put_request_is_admitted(conn);
+    if (exact_strict_local_response_put_request_is_admitted(conn)) return true;
+    return exact_strict_local_response_patch_request_is_admitted(conn);
 }
 bool pipeline_stash(Connection& conn);
 bool pipeline_recover(Connection& conn);
