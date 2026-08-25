@@ -80,6 +80,24 @@ static constexpr char kExactLocalPatchCloseRequest[] =
     "PATCH /static HTTP/1.1\r\n"
     "Host: exact-local.example\r\n"
     "Connection: close\r\n\r\n";
+static constexpr char kExactLocalTraceCloseRequest[] =
+    "TRACE /static HTTP/1.1\r\n"
+    "Host: exact-local.example\r\n"
+    "Connection: close\r\n\r\n";
+static constexpr char kExactLocalTraceResponseNormalized[] =
+    "HTTP/1.1 405 Not Allowed\r\n"
+    "Server: nginx/1.29.7\r\n"
+    "Date: XXXXXXXXXXXXXXXXXXXXXXXXXXXXX\r\n"
+    "Content-Type: text/html\r\n"
+    "Content-Length: 157\r\n"
+    "Connection: close\r\n\r\n"
+    "<html>\r\n"
+    "<head><title>405 Not Allowed</title></head>\r\n"
+    "<body>\r\n"
+    "<center><h1>405 Not Allowed</h1></center>\r\n"
+    "<hr><center>nginx/1.29.7</center>\r\n"
+    "</body>\r\n"
+    "</html>\r\n";
 static constexpr char kExactLocalQueryCloseRequest[] =
     "GET /static?x=1 HTTP/1.1\r\n"
     "Host: exact-local.example\r\n"
@@ -6658,6 +6676,7 @@ struct ExactLocalReturnObservation {
     std::string order;
     std::vector<std::vector<char>> wires;
     u32 scoped_connect_failures = 0;
+    u32 scoped_trace_rejections = 0;
 };
 
 static constexpr size_t kExactLocalHeaderAbsentPostVectorIndex = 4;
@@ -6665,7 +6684,8 @@ static constexpr size_t kExactLocalCl0PostVectorIndex = 5;
 static constexpr size_t kExactLocalDeleteVectorIndex = 7;
 static constexpr size_t kExactLocalPutVectorIndex = 8;
 static constexpr size_t kExactLocalPatchVectorIndex = 9;
-static constexpr size_t kExactLocalReturnVectorCount = 13;
+static constexpr size_t kExactLocalTraceVectorIndex = 10;
+static constexpr size_t kExactLocalReturnVectorCount = 14;
 
 static void dump_exact_local_return_observation(const ExactLocalReturnObservation& observation) {
     static constexpr const char* kLabels[] = {
@@ -6679,13 +6699,15 @@ static void dump_exact_local_return_observation(const ExactLocalReturnObservatio
         "DELETE header-absent close",
         "PUT header-absent close",
         "PATCH header-absent close",
+        "TRACE pre-location close",
         "GET query close",
         "GET /static/ fallback",
         "GET /static/child fallback",
     };
     static_assert(sizeof(kLabels) / sizeof(kLabels[0]) == kExactLocalReturnVectorCount);
     std::cerr << "exact-local order=" << observation.order
-              << " scoped-connect-failures=" << observation.scoped_connect_failures << "\n";
+              << " scoped-connect-failures=" << observation.scoped_connect_failures
+              << " scoped-trace-rejections=" << observation.scoped_trace_rejections << "\n";
     for (size_t i = 0; i < observation.wires.size(); i++) {
         const std::string label =
             std::string("exact-local ") +
@@ -6775,6 +6797,28 @@ static bool capture_pinned_exact_local_order(u16 frontend_port,
         return false;
     }
 
+    const std::string trace_request(kExactLocalTraceCloseRequest,
+                                    sizeof(kExactLocalTraceCloseRequest) - 1u);
+    const size_t trace_close = trace_request.find("\r\nConnection: close\r\n");
+    const size_t trace_header_end = trace_request.find("\r\n\r\n");
+    if (trace_request !=
+            "TRACE /static HTTP/1.1\r\n"
+            "Host: exact-local.example\r\n"
+            "Connection: close\r\n\r\n" ||
+        trace_request.rfind("TRACE /static HTTP/1.1\r\n", 0) != 0 ||
+        trace_request.find('?') != std::string::npos || trace_close == std::string::npos ||
+        trace_request.rfind("\r\nConnection: close\r\n") != trace_close ||
+        trace_request.find("\r\nContent-Length:") != std::string::npos ||
+        trace_request.find("\r\nTransfer-Encoding:") != std::string::npos ||
+        trace_request.find("\r\nTE:") != std::string::npos ||
+        trace_request.find("\r\nExpect:") != std::string::npos ||
+        trace_request.find("\r\nUpgrade:") != std::string::npos ||
+        trace_header_end == std::string::npos || trace_header_end + 4u != trace_request.size() ||
+        trace_request.rfind("\r\n\r\n") != trace_header_end) {
+        error = "pinned exact-local TRACE left the fresh header-absent bounded domain";
+        return false;
+    }
+
     // This baseline is deliberately limited to the literal origin-form path
     // /static.  //static, percent-encoded spellings, and dot-segment aliases
     // are not converter-compatibility evidence for #286/#288.
@@ -6819,6 +6863,7 @@ static bool capture_pinned_exact_local_order(u16 frontend_port,
     observation.order = exact_first ? "exact-before-root" : "root-before-exact";
     observation.wires.clear();
     observation.scoped_connect_failures = 0;
+    observation.scoped_trace_rejections = 0;
     const std::string upstream_context = "127.0.0.1:" + std::to_string(backend_port);
     const auto require_frontend_live = [&](const char* vector_name) {
         if (!poll_child(nginx.child)) return true;
@@ -6945,6 +6990,11 @@ static bool capture_pinned_exact_local_order(u16 frontend_port,
                           sizeof(kExactLocalPatchCloseRequest) - 1u,
                           kExactLocalCloseResponseNormalized,
                           false) ||
+        !run_close_vector("TRACE /static pre-location close",
+                          kExactLocalTraceCloseRequest,
+                          sizeof(kExactLocalTraceCloseRequest) - 1u,
+                          kExactLocalTraceResponseNormalized,
+                          false) ||
         !run_close_vector("GET /static?x=1 close",
                           kExactLocalQueryCloseRequest,
                           sizeof(kExactLocalQueryCloseRequest) - 1u,
@@ -6974,6 +7024,7 @@ static bool capture_pinned_exact_local_order(u16 frontend_port,
     u32 total_connects = 0;
     u32 slash_connects = 0;
     u32 child_connects = 0;
+    u32 trace_rejections = 0;
     if (!log_count_line_with(
             temp.nginx_log, "connect() failed", upstream_context.c_str(), total_connects) ||
         !log_count_line_with(temp.nginx_log,
@@ -6984,15 +7035,23 @@ static bool capture_pinned_exact_local_order(u16 frontend_port,
                              "request: \"GET /static/child HTTP/1.1\"",
                              upstream_context.c_str(),
                              child_connects) ||
-        total_connects != 2 || slash_connects != 1 || child_connects != 1) {
+        !log_count_line_with(temp.nginx_log,
+                             "\"TRACE /static HTTP/1.1\" 405 157",
+                             "127.0.0.1 - -",
+                             trace_rejections) ||
+        total_connects != 2 || slash_connects != 1 || child_connects != 1 ||
+        trace_rejections != 1) {
         error =
-            "exact-local log did not prove zero local attempts and one attempt per fallback "
+            "exact-local log did not prove one TRACE 405, zero local attempts, and one attempt "
+            "per fallback "
             "(total=" +
             std::to_string(total_connects) + ", slash=" + std::to_string(slash_connects) +
-            ", child=" + std::to_string(child_connects) + ")";
+            ", child=" + std::to_string(child_connects) +
+            ", trace405=" + std::to_string(trace_rejections) + ")";
         return false;
     }
     observation.scoped_connect_failures = total_connects;
+    observation.scoped_trace_rejections = trace_rejections;
     return true;
 }
 
@@ -7075,6 +7134,19 @@ static bool run_pinned_exact_local_return_baseline(u16 frontend_port,
             "pinned exact-local PATCH did not equal the fixed oracle in both declaration orders";
         return false;
     }
+    const std::vector<char> expected_trace(
+        kExactLocalTraceResponseNormalized,
+        kExactLocalTraceResponseNormalized + sizeof(kExactLocalTraceResponseNormalized) - 1u);
+    std::vector<char> exact_first_trace = exact_first.wires[kExactLocalTraceVectorIndex];
+    std::vector<char> root_first_trace = root_first.wires[kExactLocalTraceVectorIndex];
+    if (!normalize_date(exact_first_trace) || !normalize_date(root_first_trace) ||
+        exact_first_trace != expected_trace || root_first_trace != expected_trace ||
+        exact_first_trace != root_first_trace) {
+        error =
+            "pinned exact-local TRACE did not equal the observed fixed 405 oracle in both "
+            "declaration orders";
+        return false;
+    }
     if (!normalized_wires_equal(
             exact_first.wires[kExactLocalHeaderAbsentPostVectorIndex],
             exact_first.wires[kExactLocalCl0PostVectorIndex],
@@ -7097,8 +7169,9 @@ static bool run_pinned_exact_local_return_baseline(u16 frontend_port,
             return false;
         }
     }
-    if (exact_first.scoped_connect_failures != 2 || root_first.scoped_connect_failures != 2) {
-        error = "exact-local order variants did not retain exact scoped attempt totals";
+    if (exact_first.scoped_connect_failures != 2 || root_first.scoped_connect_failures != 2 ||
+        exact_first.scoped_trace_rejections != 1 || root_first.scoped_trace_rejections != 1) {
+        error = "exact-local order variants did not retain exact scoped attempt/rejection totals";
         return false;
     }
     return true;
@@ -8846,12 +8919,16 @@ int main(int argc, char** argv) {
                "header-absent POST, and a fresh header-absent explicit-close DELETE /static in "
                "both declaration orders retains its fixed oracle; a fresh header-absent "
                "explicit-close PUT /static retains its fixed oracle; a fresh header-absent "
-               "explicit-close PATCH /static independently yields exact 200/CL16/full "
-               "successor-static/close/EOF in both declaration orders; only /static/ and "
-               "/static/child retain exactly two scoped proxy attempts (pinned-nginx-only bounded "
-               "PATCH semantic evidence; RUT equivalence remains blocked by #301 and there is no "
-               "converter equivalence claim; excludes PATCH CL including CL0, body/framing, query, "
-               "keep-alive/reuse/pipeline, other methods or paths, proxy PATCH, and TLS/H2)\n";
+               "explicit-close PATCH /static retains its fixed oracle; one fresh header-absent "
+               "explicit-close origin-form TRACE /static is rejected before location handling with "
+               "the exact 405/CL157/nginx-body/close/EOF oracle in both declaration orders and one "
+               "scoped TRACE 405 log record per order; only /static/ and /static/child retain "
+               "exactly two scoped proxy attempts (pinned-nginx-only bounded TRACE semantic "
+               "evidence; RUT capability remains blocked by #303 and there is no converter "
+               "equivalence or direct nginx.conf runtime claim; excludes TRACE query, any "
+               "Content-Length including CL0, TE/Transfer-Encoding, Expect, Upgrade, body/tail, "
+               "reuse/pipeline, proxy TRACE, other targets or methods, TLS/H2, and malformed "
+               "requests)\n";
         if (exact_local_return_baseline) return 0;
     }
 
