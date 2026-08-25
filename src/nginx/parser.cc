@@ -178,14 +178,12 @@ public:
             return unsupported(result.location.path_span,
                                lit_str("exact location requires location / proxy fallback"));
         // nginx rejects TRACE during request processing before location
-        // selection for every accepted root-proxy server in this bounded
+        // selection for every accepted proxy-location server in this bounded
         // model.  Keep the provenance at the semantic server level so the
-        // profile has one invariant independent of optional exact locations
-        // and declaration order.
-        if (eq(result.location.path, "/", 1)) {
-            result.pre_route_trace.profile = ImplicitPreRouteProfile::Nginx1297PreLocationTrace405;
-            result.pre_route_trace.span = result.span;
-        }
+        // profile has one invariant independent of the root-vs-transformed
+        // fallback, optional exact location, and declaration order.
+        result.pre_route_trace.profile = ImplicitPreRouteProfile::Nginx1297PreLocationTrace405;
+        result.pre_route_trace.span = result.span;
         if (cur_.kind != TokenKind::End) {
             if (cur_.kind == TokenKind::Word && eq(cur_.text, "server", 6))
                 return unsupported(cur_.span, lit_str("multiple servers are unsupported"));

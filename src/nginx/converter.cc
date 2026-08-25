@@ -125,16 +125,14 @@ Span pre_route_trace_span(const Server& server) {
                                                       : model_span(server);
 }
 
-FrontendResult<bool> validate_pre_route_trace(const Server& server, bool root_present) {
+FrontendResult<bool> validate_pre_route_trace(const Server& server) {
     const ImplicitPreRouteTrace& trace = server.pre_route_trace;
     switch (trace.profile) {
         case ImplicitPreRouteProfile::None:
             if (!is_default_span(trace.span))
                 return unsupported(pre_route_trace_span(server),
                                    lit_str("invalid absent pre-route TRACE model"));
-            if (root_present)
-                return unsupported(model_span(server), lit_str("missing pre-route TRACE model"));
-            return false;
+            return unsupported(model_span(server), lit_str("missing pre-route TRACE model"));
         case ImplicitPreRouteProfile::Nginx1297PreLocationTrace405:
             break;
         default:
@@ -145,9 +143,6 @@ FrontendResult<bool> validate_pre_route_trace(const Server& server, bool root_pr
         trace.span.start != server.span.start || trace.span.end != server.span.end ||
         trace.span.line != server.span.line || trace.span.col != server.span.col)
         return unsupported(pre_route_trace_span(server), lit_str("invalid pre-route TRACE spans"));
-    if (!root_present)
-        return unsupported(pre_route_trace_span(server),
-                           lit_str("pre-route TRACE requires location / proxy fallback"));
     return true;
 }
 
@@ -418,7 +413,7 @@ FrontendResult<RutSource> lower_to_rut(const Server& server) {
     if (!is_root && !is_api)
         return unsupported(server.location.path_span,
                            lit_str("converter requires location / or /api/"));
-    auto pre_route_trace = validate_pre_route_trace(server, is_root);
+    auto pre_route_trace = validate_pre_route_trace(server);
     if (!pre_route_trace) return core::make_unexpected(pre_route_trace.error());
     if (exact_local_return.value() && !is_root)
         return unsupported(server.exact_local_return.span,

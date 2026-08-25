@@ -420,6 +420,12 @@ TEST(nginx_parser, parses_api_location_and_proxy_uri_with_spans) {
     CHECK_EQ(location.proxy_pass.uri_span.line, 4u);
     CHECK_EQ(location.proxy_pass.uri_span.start + 1, location.proxy_pass.uri_span.end);
     CHECK_LT(location.proxy_pass.uri_span.end, location.proxy_pass.span.end);
+    CHECK(result.value().pre_route_trace.profile ==
+          nginx::ImplicitPreRouteProfile::Nginx1297PreLocationTrace405);
+    CHECK_EQ(result.value().pre_route_trace.span.start, result.value().span.start);
+    CHECK_EQ(result.value().pre_route_trace.span.end, result.value().span.end);
+    CHECK_EQ(result.value().pre_route_trace.span.line, result.value().span.line);
+    CHECK_EQ(result.value().pre_route_trace.span.col, result.value().span.col);
 }
 
 TEST(nginx_parser, rejects_unmatched_location_and_proxy_uri_shapes) {
@@ -858,7 +864,6 @@ static nginx::Server api_server() {
     server.location.proxy_pass.has_uri = true;
     server.location.proxy_pass.uri = {kProxyUri, 1};
     server.location.proxy_pass.uri_span = Span{53, 54, 1, 54};
-    server.pre_route_trace = {};
     return server;
 }
 
@@ -1012,7 +1017,8 @@ TEST(nginx_converter, rejects_forged_exact_local_return_model_inconsistencies) {
 
     auto api_fallback = parsed.value();
     api_fallback.location = api_server().location;
-    expect_rejected(api_fallback, lit_str("pre-route TRACE requires location / proxy fallback"));
+    api_fallback.pre_route_trace = {};
+    expect_rejected(api_fallback, lit_str("missing pre-route TRACE model"));
 
     auto missing_trace = parsed.value();
     missing_trace.pre_route_trace = {};
@@ -1040,12 +1046,25 @@ TEST(nginx_converter, rejects_forged_exact_local_return_model_inconsistencies) {
     absent_trace_inventory.pre_route_trace.profile = nginx::ImplicitPreRouteProfile::None;
     absent_trace_inventory.pre_route_trace.span = canonical_server().span;
     expect_rejected(absent_trace_inventory, lit_str("invalid absent pre-route TRACE model"));
-    auto unexpected_api_trace = api_server();
-    unexpected_api_trace.pre_route_trace.profile =
-        nginx::ImplicitPreRouteProfile::Nginx1297PreLocationTrace405;
-    unexpected_api_trace.pre_route_trace.span = api_server().span;
-    expect_rejected(unexpected_api_trace,
-                    lit_str("pre-route TRACE requires location / proxy fallback"));
+    auto api_unknown_trace = api_server();
+    api_unknown_trace.pre_route_trace.profile = static_cast<nginx::ImplicitPreRouteProfile>(0xff);
+    expect_rejected(api_unknown_trace, lit_str("invalid pre-route TRACE profile model"));
+    auto api_bad_trace_start = api_server();
+    api_bad_trace_start.pre_route_trace.span.start++;
+    expect_rejected(api_bad_trace_start, lit_str("invalid pre-route TRACE spans"));
+    auto api_bad_trace_end = api_server();
+    api_bad_trace_end.pre_route_trace.span.end++;
+    expect_rejected(api_bad_trace_end, lit_str("invalid pre-route TRACE spans"));
+    auto api_bad_trace_line = api_server();
+    api_bad_trace_line.pre_route_trace.span.line++;
+    expect_rejected(api_bad_trace_line, lit_str("invalid pre-route TRACE spans"));
+    auto api_bad_trace_col = api_server();
+    api_bad_trace_col.pre_route_trace.span.col++;
+    expect_rejected(api_bad_trace_col, lit_str("invalid pre-route TRACE spans"));
+    auto api_absent_trace_inventory = api_server();
+    api_absent_trace_inventory.pre_route_trace.profile = nginx::ImplicitPreRouteProfile::None;
+    api_absent_trace_inventory.pre_route_trace.span = api_server().span;
+    expect_rejected(api_absent_trace_inventory, lit_str("invalid absent pre-route TRACE model"));
 }
 
 TEST(nginx_converter, lowers_canonical_model_to_stable_rut_source) {
@@ -1202,11 +1221,21 @@ TEST(nginx_converter, lowers_canonical_model_to_stable_rut_source) {
 }
 
 TEST(nginx_converter, lowers_api_model_to_stable_target_transform_source) {
+    // Generation/golden evidence only: this does not claim nginx equivalence
+    // or mark the broader /api/ TRACE row SUPPORTED before differential proof.
     const auto result = nginx::lower_to_rut(api_server());
     REQUIRE(result);
     static constexpr char kExpected[] =
         "listen :8080\n"
         "upstream nginx_upstream at \"127.0.0.1:9000\"\n"
+        "pre_route TRACE { return local_response({\n"
+        "  version: \"HTTP/1.1\", status: 405, reason: \"Not Allowed\", server: \"nginx/1.29.7\",\n"
+        "  date: \"current\", content_type: \"text/html\", connection: \"request\",\n"
+        "  head_mode: \"reject\", body: b\"<html>\\r\\n<head><title>405 Not "
+        "Allowed</title></head>\\r\\n"
+        "<body>\\r\\n<center><h1>405 Not Allowed</h1></center>\\r\\n"
+        "<hr><center>nginx/1.29.7</center>\\r\\n</body>\\r\\n</html>\\r\\n\"\n"
+        "}) }\n"
         "unmatched OPTIONS { return local_response({\n"
         "  version: \"HTTP/1.1\", status: 400, reason: \"Bad Request\", server: \"nginx/1.29.7\",\n"
         "  date: \"current\", content_type: \"text/html\", connection: \"request\",\n"
@@ -1303,6 +1332,26 @@ TEST(nginx_converter, formatting_and_comments_do_not_change_lowering) {
     REQUIRE(compact_lowered);
     REQUIRE(formatted_lowered);
     CHECK(compact_lowered.value().view().eq(formatted_lowered.value().view()));
+
+    const char api_compact[] =
+        "server { listen 8080; location /api/ { proxy_pass http://127.0.0.1:9000/; } }";
+    const char api_formatted[] =
+        "# same transformed model\n"
+        "server {\n"
+        "  listen 8080;\n"
+        "  location\t/api/ {\n"
+        "    proxy_pass http://127.0.0.1:9000/; # URI replacement\n"
+        "  }\n"
+        "}\n";
+    auto api_compact_parsed = nginx::parse({api_compact, sizeof(api_compact) - 1});
+    auto api_formatted_parsed = nginx::parse({api_formatted, sizeof(api_formatted) - 1});
+    REQUIRE(api_compact_parsed);
+    REQUIRE(api_formatted_parsed);
+    auto api_compact_lowered = nginx::lower_to_rut(api_compact_parsed.value());
+    auto api_formatted_lowered = nginx::lower_to_rut(api_formatted_parsed.value());
+    REQUIRE(api_compact_lowered);
+    REQUIRE(api_formatted_lowered);
+    CHECK(api_compact_lowered.value().view().eq(api_formatted_lowered.value().view()));
 }
 
 TEST(nginx_converter, root_maximum_ports_fit_bounded_source_capacity) {
@@ -1320,6 +1369,22 @@ TEST(nginx_converter, root_maximum_ports_fit_bounded_source_capacity) {
     const auto lexed = lex(lowered.value().view());
     REQUIRE(lexed);
     CHECK_GT(lexed.value().tokens.len, 530u);
+}
+
+TEST(nginx_converter, api_maximum_ports_fit_bounded_source_capacity) {
+    auto model = api_server();
+    model.listen.port = 65535;
+    model.location.proxy_pass.address[0] = 255;
+    model.location.proxy_pass.address[1] = 255;
+    model.location.proxy_pass.address[2] = 255;
+    model.location.proxy_pass.address[3] = 255;
+    model.location.proxy_pass.port = 65535;
+    const auto lowered = nginx::lower_to_rut(model);
+    REQUIRE(lowered);
+    CHECK_EQ(lowered.value().len, 3341u);
+    CHECK_LT(lowered.value().len, nginx::RutSource::kCapacity);
+    const auto lexed = lex(lowered.value().view());
+    REQUIRE(lexed);
 }
 
 TEST(nginx_converter, emitted_exact_source_reaches_owned_runtime_config) {
@@ -1877,6 +1942,8 @@ TEST(nginx_converter, root_pre_route_trace_policy_remains_owned_after_frontend_l
 }
 
 TEST(nginx_converter, emitted_api_source_reaches_rir_with_target_transform) {
+    // Frontend/ownership evidence only: nginx equivalence and SUPPORTED status
+    // require the separate pinned-nginx differential increment.
     auto lowered = nginx::lower_to_rut(api_server());
     REQUIRE(lowered);
     auto lexed = lex(lowered.value().view());
@@ -1884,17 +1951,20 @@ TEST(nginx_converter, emitted_api_source_reaches_rir_with_target_transform) {
     auto ast = parse_file(lexed.value());
     REQUIRE(ast);
     std::unique_ptr<AstFile> ast_owned(ast.value());
-    REQUIRE_EQ(ast_owned->strict_local_response_policies.len, 3u);
-    CHECK_EQ(ast_owned->unmatched_policy_ids[kRouteMethodOptions], 1u);
-    CHECK_EQ(ast_owned->unmatched_policy_ids[kRouteMethodConnect], 2u);
-    CHECK_EQ(ast_owned->unmatched_policy_ids[kRouteMethodAny], 3u);
+    REQUIRE_EQ(ast_owned->strict_local_response_policies.len, 4u);
+    CHECK_EQ(ast_owned->items[2].kind, AstItemKind::PreRoute);
+    CHECK_EQ(ast_owned->pre_route_policy_ids[kRouteMethodTrace], 1u);
+    CHECK_EQ(ast_owned->unmatched_policy_ids[kRouteMethodOptions], 2u);
+    CHECK_EQ(ast_owned->unmatched_policy_ids[kRouteMethodConnect], 3u);
+    CHECK_EQ(ast_owned->unmatched_policy_ids[kRouteMethodAny], 4u);
     auto hir = analyze_file(*ast_owned);
     REQUIRE(hir);
     std::unique_ptr<HirModule> hir_owned(hir.value());
-    REQUIRE_EQ(hir_owned->strict_local_response_policies.len, 3u);
-    CHECK_EQ(hir_owned->unmatched_policy_ids[kRouteMethodOptions], 1u);
-    CHECK_EQ(hir_owned->unmatched_policy_ids[kRouteMethodConnect], 2u);
-    CHECK_EQ(hir_owned->unmatched_policy_ids[kRouteMethodAny], 3u);
+    REQUIRE_EQ(hir_owned->strict_local_response_policies.len, 4u);
+    CHECK_EQ(hir_owned->pre_route_policy_ids[kRouteMethodTrace], 1u);
+    CHECK_EQ(hir_owned->unmatched_policy_ids[kRouteMethodOptions], 2u);
+    CHECK_EQ(hir_owned->unmatched_policy_ids[kRouteMethodConnect], 3u);
+    CHECK_EQ(hir_owned->unmatched_policy_ids[kRouteMethodAny], 4u);
     REQUIRE_EQ(hir_owned->routes.len, 1u);
     CHECK_EQ(hir_owned->routes[0].control.kind, HirControlKind::If);
     const auto& hir_redirect = hir_owned->routes[0].control.then_term;
@@ -1912,10 +1982,11 @@ TEST(nginx_converter, emitted_api_source_reaches_rir_with_target_transform) {
     auto mir = build_mir(*hir_owned);
     REQUIRE(mir);
     std::unique_ptr<MirModule> mir_owned(mir.value());
-    REQUIRE_EQ(mir_owned->strict_local_response_policies.len, 3u);
-    CHECK_EQ(mir_owned->unmatched_policy_ids[kRouteMethodOptions], 1u);
-    CHECK_EQ(mir_owned->unmatched_policy_ids[kRouteMethodConnect], 2u);
-    CHECK_EQ(mir_owned->unmatched_policy_ids[kRouteMethodAny], 3u);
+    REQUIRE_EQ(mir_owned->strict_local_response_policies.len, 4u);
+    CHECK_EQ(mir_owned->pre_route_policy_ids[kRouteMethodTrace], 1u);
+    CHECK_EQ(mir_owned->unmatched_policy_ids[kRouteMethodOptions], 2u);
+    CHECK_EQ(mir_owned->unmatched_policy_ids[kRouteMethodConnect], 3u);
+    CHECK_EQ(mir_owned->unmatched_policy_ids[kRouteMethodAny], 4u);
     CHECK(mir_owned->functions[0].path.eq(lit_str("/api")));
     bool mir_redirect = false;
     bool mir_forward = false;
@@ -1941,10 +2012,11 @@ TEST(nginx_converter, emitted_api_source_reaches_rir_with_target_transform) {
     REQUIRE(lower_to_rir(*mir_owned, rir));
     auto verified = rir::verify_module(rir.module);
     REQUIRE(verified.ok);
-    REQUIRE_EQ(rir.module.strict_local_response_policy_count, 3u);
-    CHECK_EQ(rir.module.unmatched_policy_ids[kRouteMethodOptions], 1u);
-    CHECK_EQ(rir.module.unmatched_policy_ids[kRouteMethodConnect], 2u);
-    CHECK_EQ(rir.module.unmatched_policy_ids[kRouteMethodAny], 3u);
+    REQUIRE_EQ(rir.module.strict_local_response_policy_count, 4u);
+    CHECK_EQ(rir.module.pre_route_policy_ids[kRouteMethodTrace], 1u);
+    CHECK_EQ(rir.module.unmatched_policy_ids[kRouteMethodOptions], 2u);
+    CHECK_EQ(rir.module.unmatched_policy_ids[kRouteMethodConnect], 3u);
+    CHECK_EQ(rir.module.unmatched_policy_ids[kRouteMethodAny], 4u);
     REQUIRE_EQ(rir.module.target_transform_count, 1u);
     CHECK(rir.module.target_transforms[0].strip_prefix.eq(lit_str("/api/")));
     CHECK(rir.module.target_transforms[0].replace_prefix.eq(lit_str("/")));
@@ -2016,13 +2088,84 @@ TEST(nginx_converter, emitted_api_source_reaches_rir_with_target_transform) {
     RouteConfig populated{};
     REQUIRE(populate_route_config(populated, rir.module));
     REQUIRE_EQ(populated.strict_local_response_policy_count, 3u);
-    CHECK_EQ(populated.unmatched_policy_ids[kRouteMethodOptions], 1u);
-    CHECK_EQ(populated.unmatched_policy_ids[kRouteMethodConnect], 2u);
+    CHECK_EQ(populated.pre_route_policy_id(kRouteMethodTrace), 1u);
+    CHECK_EQ(populated.unmatched_policy_ids[kRouteMethodOptions], 2u);
+    CHECK_EQ(populated.unmatched_policy_ids[kRouteMethodConnect], 1u);
     CHECK_EQ(populated.unmatched_policy_ids[kRouteMethodAny], 3u);
-    CHECK(populated.unmatched_policy_table_is_valid());
+    CHECK(populated.strict_local_response_table_is_valid());
     CHECK_EQ(populated.policy_bundles[0].timeout_failure_policy_id, 0u);
     CHECK_EQ(populated.policy_bundles[0].response_read_timeout_seconds, 0u);
     CHECK(populated.policy_bundles[0].response_buffering == ForwardResponseBufferingMode::None);
+}
+
+TEST(nginx_converter, api_pre_route_trace_policy_remains_owned_after_frontend_lifetimes) {
+    auto populated = std::make_unique<RouteConfig>();
+    {
+        char nginx_source[] =
+            "server { listen 8080; location /api/ { proxy_pass http://127.0.0.1:9000/; } }";
+        auto parsed = nginx::parse({nginx_source, sizeof(nginx_source) - 1u});
+        REQUIRE(parsed);
+        CHECK(parsed.value().pre_route_trace.profile ==
+              nginx::ImplicitPreRouteProfile::Nginx1297PreLocationTrace405);
+        auto lowered = nginx::lower_to_rut(parsed.value());
+        REQUIRE(lowered);
+        memset(nginx_source, 'x', sizeof(nginx_source) - 1u);
+
+        auto lexed = lex(lowered.value().view());
+        REQUIRE(lexed);
+        auto ast = parse_file(lexed.value());
+        REQUIRE(ast);
+        std::unique_ptr<AstFile> ast_owned(ast.value());
+        REQUIRE_EQ(ast_owned->pre_route_policy_ids[kRouteMethodTrace], 1u);
+
+        auto hir = analyze_file(*ast_owned);
+        REQUIRE(hir);
+        std::unique_ptr<HirModule> hir_owned(hir.value());
+        CHECK_EQ(hir_owned->pre_route_policy_ids[kRouteMethodTrace], 1u);
+
+        auto mir = build_mir(*hir_owned);
+        REQUIRE(mir);
+        std::unique_ptr<MirModule> mir_owned(mir.value());
+        CHECK_EQ(mir_owned->pre_route_policy_ids[kRouteMethodTrace], 1u);
+
+        FrontendRirModule rir{};
+        RirGuard rir_guard{rir};
+        REQUIRE(lower_to_rir(*mir_owned, rir));
+        REQUIRE(rir::verify_module(rir.module).ok);
+        REQUIRE_EQ(rir.module.pre_route_policy_ids[kRouteMethodTrace], 1u);
+        REQUIRE_EQ(rir.module.target_transform_count, 1u);
+        REQUIRE(populate_route_config(*populated, rir.module));
+        memset(lowered.value().data, 'y', lowered.value().len);
+    }
+
+    REQUIRE(populated->strict_local_response_table_is_valid());
+    const u16 trace_id = populated->pre_route_policy_id(kRouteMethodTrace);
+    REQUIRE_NE(trace_id, 0u);
+    REQUIRE(populated->strict_local_response_policy_id_is_owned(trace_id));
+    CHECK_EQ(trace_id, populated->unmatched_policy_ids[kRouteMethodConnect]);
+    const auto& policy = populated->strict_local_response_policies[trace_id - 1u];
+    CHECK(policy.version == StrictLocalResponseVersion::Http11);
+    CHECK_EQ(policy.status_code, 405u);
+    CHECK(policy.reason.eq(lit_str("Not Allowed")));
+    CHECK(policy.server.eq(lit_str("nginx/1.29.7")));
+    CHECK(policy.date == StrictLocalResponseDate::Current);
+    CHECK(policy.content_type.eq(lit_str("text/html")));
+    CHECK(policy.connection == StrictLocalResponseConnection::Request);
+    CHECK(policy.head_mode == StrictLocalResponseHeadMode::Reject);
+    static constexpr char kTraceBody[] =
+        "<html>\r\n"
+        "<head><title>405 Not Allowed</title></head>\r\n"
+        "<body>\r\n"
+        "<center><h1>405 Not Allowed</h1></center>\r\n"
+        "<hr><center>nginx/1.29.7</center>\r\n"
+        "</body>\r\n"
+        "</html>\r\n";
+    static_assert(sizeof(kTraceBody) - 1u == 157u);
+    CHECK_EQ(policy.body.len, 157u);
+    CHECK(policy.body.eq({kTraceBody, sizeof(kTraceBody) - 1u}));
+    REQUIRE_EQ(populated->target_transform_count, 1u);
+    CHECK(populated->target_transforms[0].strip_prefix.eq(lit_str("/api/")));
+    CHECK(populated->target_transforms[0].replace_prefix.eq(lit_str("/")));
 }
 
 TEST(nginx_converter, rejects_parsed_proxy_read_timeout_before_lowering) {
