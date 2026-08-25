@@ -399,6 +399,7 @@ static RedirectPolicySpec make_test_redirect_policy() {
     policy.query = RedirectPolicyQuery::PreserveRaw;
     policy.date = RedirectPolicyDate::Current;
     policy.connection = RedirectPolicyConnection::Close;
+    policy.header_order = RedirectPolicyHeaderOrder::LocationThenConnection;
     policy.status_code = 301;
     policy.reason = {"Moved Permanently", 17};
     policy.server = {"nginx/1.29.7", 12};
@@ -2173,6 +2174,7 @@ TEST(redirect, h1_foundation_action_rejects_before_upstream) {
     policy.query = RedirectPolicyQuery::PreserveRaw;
     policy.date = RedirectPolicyDate::Current;
     policy.connection = RedirectPolicyConnection::Close;
+    policy.header_order = RedirectPolicyHeaderOrder::LocationThenConnection;
     policy.status_code = 301;
     policy.reason = {"Moved Permanently", 16};
     policy.server = {"rut", 3};
@@ -2653,6 +2655,7 @@ TEST(redirect, h2_initial_and_timer_resume_reject_without_proxy) {
     policy.query = RedirectPolicyQuery::PreserveRaw;
     policy.date = RedirectPolicyDate::Current;
     policy.connection = RedirectPolicyConnection::Close;
+    policy.header_order = RedirectPolicyHeaderOrder::LocationThenConnection;
     policy.status_code = 301;
     policy.reason = {"Moved Permanently", 16};
     policy.server = {"rut", 3};
@@ -2706,6 +2709,7 @@ TEST(redirect, h2_immediate_rejects_before_async_or_proxy) {
     policy.query = RedirectPolicyQuery::PreserveRaw;
     policy.date = RedirectPolicyDate::Current;
     policy.connection = RedirectPolicyConnection::Close;
+    policy.header_order = RedirectPolicyHeaderOrder::LocationThenConnection;
     policy.status_code = 301;
     policy.reason = {"Moved Permanently", 16};
     policy.server = {"rut", 3};
@@ -2750,6 +2754,7 @@ TEST(redirect, h1_timer_resume_rejects_without_proxy) {
     policy.query = RedirectPolicyQuery::PreserveRaw;
     policy.date = RedirectPolicyDate::Current;
     policy.connection = RedirectPolicyConnection::Close;
+    policy.header_order = RedirectPolicyHeaderOrder::LocationThenConnection;
     policy.status_code = 301;
     policy.reason = {"Moved Permanently", 16};
     policy.server = {"rut", 3};

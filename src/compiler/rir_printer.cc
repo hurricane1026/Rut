@@ -606,6 +606,15 @@ static void print_redirect_connection(PrintBuf& buf, RedirectPolicyConnection va
         buf.put_cstr("invalid");
 }
 
+static void print_redirect_header_order(PrintBuf& buf, RedirectPolicyHeaderOrder value) {
+    if (value == RedirectPolicyHeaderOrder::LocationThenConnection)
+        buf.put_cstr("location_then_connection");
+    else if (value == RedirectPolicyHeaderOrder::ConnectionThenLocation)
+        buf.put_cstr("connection_then_location");
+    else
+        buf.put_cstr("invalid");
+}
+
 static void print_block_ref(PrintBuf& buf, BlockId bid, const Function& fn) {
     if (bid.id < fn.block_count) {
         buf.put_str(fn.blocks[bid.id].label);
@@ -1192,6 +1201,8 @@ void print_module(PrintBuf& buf, const Module& mod) {
             print_redirect_date(buf, policy.date);
             buf.put_cstr(", connection=");
             print_redirect_connection(buf, policy.connection);
+            buf.put_cstr(", header_order=");
+            print_redirect_header_order(buf, policy.header_order);
             buf.put_cstr(", status=");
             buf.put_u32(policy.status_code);
             buf.put_cstr(", reason=");
@@ -1200,6 +1211,8 @@ void print_module(PrintBuf& buf, const Module& mod) {
             print_quoted_str(buf, policy.server);
             buf.put_cstr(", content_type=");
             print_quoted_str(buf, policy.content_type);
+            buf.put_cstr(", static_authority=");
+            print_quoted_str(buf, policy.static_authority);
             buf.put_cstr(", target_path=");
             print_quoted_str(buf, policy.target_path);
             buf.put_cstr(", body=");

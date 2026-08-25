@@ -848,14 +848,19 @@ struct AstFile {
         u32 total = 0;
         for (u32 i = 0; i < redirect_policies.len; i++) {
             const auto& p = redirect_policies[i];
-            const Str fields[] = {p.reason, p.server, p.content_type, p.target_path, p.body};
+            const Str fields[] = {
+                p.reason, p.server, p.content_type, p.static_authority, p.target_path, p.body};
             for (const Str field : fields) {
                 if (field.len > kRedirectPolicyBytes - total) return 0;
                 total += field.len;
             }
         }
-        const Str fields[] = {
-            policy.reason, policy.server, policy.content_type, policy.target_path, policy.body};
+        const Str fields[] = {policy.reason,
+                              policy.server,
+                              policy.content_type,
+                              policy.static_authority,
+                              policy.target_path,
+                              policy.body};
         for (const Str field : fields) {
             if (field.len > kRedirectPolicyBytes - total) return 0;
             total += field.len;

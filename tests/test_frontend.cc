@@ -34661,6 +34661,23 @@ TEST(frontend, inline_redirect_rejects_invalid_shape_and_duplicate_fields) {
         "\"actual_listener\", path: \"static\", query: \"preserve_raw\", date: \"current\", "
         "connection: \"close\", status: 301, reason: \"Moved Permanently\", server: \"s\", "
         "content_type: \"text/html\", target_path: \"/x\", body: b\"\\xZZ\"}) }",
+        "route GET \"/\" { return redirect({scheme: \"http\", authority: \"static\", port: "
+        "\"actual_listener\", path: \"static\", query: \"preserve_raw\", date: \"current\", "
+        "connection: \"close\", status: 301, reason: \"Moved Permanently\", server: \"s\", "
+        "content_type: \"text/html\", target_path: \"/x\", body: b\"\"}) }",
+        "route GET \"/\" { return redirect({scheme: \"http\", authority: \"request_host\", "
+        "port: \"omit\", path: \"static\", query: \"preserve_raw\", date: \"current\", "
+        "connection: \"close\", status: 301, reason: \"Moved Permanently\", server: \"s\", "
+        "content_type: \"text/html\", target_path: \"/x\", body: b\"\"}) }",
+        "route GET \"/\" { return redirect({scheme: \"http\", authority: \"request_host\", "
+        "port: \"actual_listener\", path: \"static\", query: \"discard\", date: \"current\", "
+        "connection: \"close\", status: 301, reason: \"Moved Permanently\", server: \"s\", "
+        "content_type: \"text/html\", target_path: \"/x\", body: b\"\"}) }",
+        "route GET \"/\" { return redirect({scheme: \"http\", authority: \"request_host\", "
+        "port: \"actual_listener\", path: \"static\", query: \"preserve_raw\", date: "
+        "\"current\", connection: \"close\", header_order: \"connection_then_location\", "
+        "status: 301, reason: \"Moved Permanently\", server: \"s\", content_type: "
+        "\"text/html\", target_path: \"/x\", body: b\"\"}) }",
     };
     for (const char* source : sources) {
         auto lexed = lex(lit(source));

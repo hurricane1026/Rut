@@ -3460,6 +3460,7 @@ FrontendResult<void> lower_to_rir(const MirModule& mir, FrontendRirModule& out) 
         if (!copy_redirect_str(src.reason, dst.reason) ||
             !copy_redirect_str(src.server, dst.server) ||
             !copy_redirect_str(src.content_type, dst.content_type) ||
+            !copy_redirect_str(src.static_authority, dst.static_authority) ||
             !copy_redirect_str(src.target_path, dst.target_path) ||
             !copy_redirect_str(src.body, dst.body))
             return frontend_error(FrontendError::OutOfMemory);

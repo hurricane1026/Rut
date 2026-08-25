@@ -1743,6 +1743,10 @@ struct Parser {
                     return frontend_error(
                         FrontendError::UnsupportedSyntax, span_from(cur()), lit_str("redirect"));
                 RedirectPolicySpec policy{};
+                // The original 13-field source form predates the explicit
+                // header-order dimension. Materialize its established wire
+                // order without making a new field mandatory.
+                policy.header_order = RedirectPolicyHeaderOrder::LocationThenConnection;
                 bool have_scheme = false, have_authority = false, have_port = false;
                 bool have_path = false, have_query = false, have_date = false;
                 bool have_connection = false, have_status = false, have_reason = false;

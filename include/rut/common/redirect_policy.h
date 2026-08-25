@@ -12,6 +12,7 @@ static constexpr u32 kMaxRedirectPolicies = 16;
 static constexpr u32 kMaxRedirectReasonLen = 64;
 static constexpr u32 kMaxRedirectServerLen = 64;
 static constexpr u32 kMaxRedirectContentTypeLen = 128;
+static constexpr u32 kMaxRedirectStaticAuthorityLen = 253;
 static constexpr u32 kMaxRedirectTargetPathLen = 256;
 static constexpr u32 kMaxRedirectBodyLen = 4096;
 static constexpr u32 kRedirectPolicyBytes = 16 * 1024;
@@ -24,11 +25,13 @@ enum class RedirectPolicyScheme : u8 {
 enum class RedirectPolicyAuthority : u8 {
     Invalid = 0,
     RequestHost = 1,
+    Static = 2,
 };
 
 enum class RedirectPolicyPort : u8 {
     Invalid = 0,
     ActualListener = 1,
+    Omit = 2,
 };
 
 enum class RedirectPolicyPath : u8 {
@@ -39,6 +42,7 @@ enum class RedirectPolicyPath : u8 {
 enum class RedirectPolicyQuery : u8 {
     Invalid = 0,
     PreserveRaw = 1,
+    Discard = 2,
 };
 
 enum class RedirectPolicyDate : u8 {
@@ -51,6 +55,12 @@ enum class RedirectPolicyConnection : u8 {
     Close = 1,
 };
 
+enum class RedirectPolicyHeaderOrder : u8 {
+    Invalid = 0,
+    LocationThenConnection = 1,
+    ConnectionThenLocation = 2,
+};
+
 struct RedirectPolicySpec {
     RedirectPolicyScheme scheme = RedirectPolicyScheme::Invalid;
     RedirectPolicyAuthority authority = RedirectPolicyAuthority::Invalid;
@@ -59,10 +69,12 @@ struct RedirectPolicySpec {
     RedirectPolicyQuery query = RedirectPolicyQuery::Invalid;
     RedirectPolicyDate date = RedirectPolicyDate::Invalid;
     RedirectPolicyConnection connection = RedirectPolicyConnection::Invalid;
+    RedirectPolicyHeaderOrder header_order = RedirectPolicyHeaderOrder::Invalid;
     u16 status_code = 0;
     Str reason{};
     Str server{};
     Str content_type{};
+    Str static_authority{};
     Str target_path{};
     Str body{};
 };
@@ -89,6 +101,26 @@ inline bool redirect_policy_safe_target_path(Str value) {
     return true;
 }
 
+inline bool redirect_policy_safe_static_authority(Str value) {
+    if (value.ptr == nullptr || value.len == 0 || value.len > kMaxRedirectStaticAuthorityLen)
+        return false;
+    u32 label_len = 0;
+    for (u32 i = 0; i < value.len; i++) {
+        const u8 c = static_cast<u8>(value.ptr[i]);
+        if (c == '.') {
+            if (label_len == 0 || value.ptr[i - 1] == '-') return false;
+            label_len = 0;
+            continue;
+        }
+        const bool alphanumeric = (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+                                  (c >= '0' && c <= '9');
+        if ((!alphanumeric && c != '-') || (label_len == 0 && !alphanumeric) || label_len == 63)
+            return false;
+        label_len++;
+    }
+    return label_len != 0 && value.ptr[value.len - 1] != '-';
+}
+
 inline bool redirect_policy_safe_body(Str value) {
     return (value.ptr != nullptr || value.len == 0) && value.len <= kMaxRedirectBodyLen;
 }
@@ -100,7 +132,9 @@ inline bool redirect_policy_spec_valid(const RedirectPolicySpec& policy) {
         policy.path != RedirectPolicyPath::Static ||
         policy.query != RedirectPolicyQuery::PreserveRaw ||
         policy.date != RedirectPolicyDate::Current ||
-        policy.connection != RedirectPolicyConnection::Close || policy.status_code < 300 ||
+        policy.connection != RedirectPolicyConnection::Close ||
+        policy.header_order != RedirectPolicyHeaderOrder::LocationThenConnection ||
+        policy.static_authority.len != 0 || policy.status_code < 300 ||
         policy.status_code > 399 ||
         !redirect_policy_safe_text(policy.reason, kMaxRedirectReasonLen) ||
         !redirect_policy_safe_text(policy.server, kMaxRedirectServerLen) ||
@@ -116,9 +150,11 @@ inline bool redirect_policy_spec_valid(const RedirectPolicySpec& policy) {
 inline bool redirect_policy_spec_equal(const RedirectPolicySpec& a, const RedirectPolicySpec& b) {
     return a.scheme == b.scheme && a.authority == b.authority && a.port == b.port &&
            a.path == b.path && a.query == b.query && a.date == b.date &&
-           a.connection == b.connection && a.status_code == b.status_code &&
+           a.connection == b.connection && a.header_order == b.header_order &&
+           a.status_code == b.status_code &&
            a.reason.eq(b.reason) && a.server.eq(b.server) && a.content_type.eq(b.content_type) &&
-           a.target_path.eq(b.target_path) && a.body.eq(b.body);
+           a.static_authority.eq(b.static_authority) && a.target_path.eq(b.target_path) &&
+           a.body.eq(b.body);
 }
 
 inline bool redirect_policy_table_valid(const RedirectPolicySpec* specs, u32 count) {
@@ -129,6 +165,7 @@ inline bool redirect_policy_table_valid(const RedirectPolicySpec* specs, u32 cou
         const Str fields[] = {specs[i].reason,
                               specs[i].server,
                               specs[i].content_type,
+                              specs[i].static_authority,
                               specs[i].target_path,
                               specs[i].body};
         for (const Str field : fields) {

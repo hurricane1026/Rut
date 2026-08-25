@@ -1613,17 +1613,46 @@ struct RouteConfig {
 
     // Register foundation-only redirect metadata. Strings are copied into
     // RouteConfig-owned storage; no compiler/RIR pointer escapes here.
+    bool redirect_policy_string_is_owned(Str value) const {
+        if (value.len == 0) return true;
+        if (value.ptr == nullptr || redirect_policy_bytes_used > kRedirectPolicyBytesPoolBytes ||
+            value.len > redirect_policy_bytes_used)
+            return false;
+        const uintptr_t begin = reinterpret_cast<uintptr_t>(redirect_policy_bytes);
+        const uintptr_t end = begin + redirect_policy_bytes_used;
+        const uintptr_t ptr = reinterpret_cast<uintptr_t>(value.ptr);
+        return ptr >= begin && ptr <= end && value.len <= end - ptr;
+    }
+
+    bool redirect_policy_strings_are_owned(const RedirectPolicySpec& policy) const {
+        const Str fields[] = {policy.reason,
+                              policy.server,
+                              policy.content_type,
+                              policy.static_authority,
+                              policy.target_path,
+                              policy.body};
+        for (const Str field : fields)
+            if (!redirect_policy_string_is_owned(field)) return false;
+        return true;
+    }
+
     u16 add_redirect_policy(const RedirectPolicySpec& policy) {
+        if (redirect_policy_count > kMaxRedirectPolicies ||
+            redirect_policy_bytes_used > kRedirectPolicyBytesPoolBytes)
+            return 0;
         if (!redirect_policy_spec_valid(policy)) return 0;
         for (u32 i = 0; i < redirect_policy_count; i++) {
+            if (!redirect_policy_strings_are_owned(redirect_policies[i])) return 0;
             if (redirect_policy_spec_equal(redirect_policies[i], policy))
                 return static_cast<u16>(i + 1);
         }
-        if (redirect_policy_count >= kMaxRedirectPolicies ||
-            redirect_policy_bytes_used > kRedirectPolicyBytesPoolBytes)
-            return 0;
-        const Str fields[] = {
-            policy.reason, policy.server, policy.content_type, policy.target_path, policy.body};
+        if (redirect_policy_count >= kMaxRedirectPolicies) return 0;
+        const Str fields[] = {policy.reason,
+                              policy.server,
+                              policy.content_type,
+                              policy.static_authority,
+                              policy.target_path,
+                              policy.body};
         u32 total = 0;
         for (const Str field : fields) {
             if (field.len > kRedirectPolicyBytesPoolBytes - redirect_policy_bytes_used - total)
@@ -1644,10 +1673,12 @@ struct RouteConfig {
         dst.query = policy.query;
         dst.date = policy.date;
         dst.connection = policy.connection;
+        dst.header_order = policy.header_order;
         dst.status_code = policy.status_code;
         copy(policy.reason, dst.reason);
         copy(policy.server, dst.server);
         copy(policy.content_type, dst.content_type);
+        copy(policy.static_authority, dst.static_authority);
         copy(policy.target_path, dst.target_path);
         copy(policy.body, dst.body);
         redirect_policy_count++;
@@ -1666,6 +1697,7 @@ struct RouteConfig {
             const Str fields[] = {specs[i].reason,
                                   specs[i].server,
                                   specs[i].content_type,
+                                  specs[i].static_authority,
                                   specs[i].target_path,
                                   specs[i].body};
             for (const Str field : fields) {
@@ -1684,12 +1716,21 @@ struct RouteConfig {
             dst.query = src.query;
             dst.date = src.date;
             dst.connection = src.connection;
+            dst.header_order = src.header_order;
             dst.status_code = src.status_code;
-            const Str fields[] = {
-                src.reason, src.server, src.content_type, src.target_path, src.body};
-            Str* destinations[] = {
-                &dst.reason, &dst.server, &dst.content_type, &dst.target_path, &dst.body};
-            for (u32 field = 0; field < 5; field++) {
+            const Str fields[] = {src.reason,
+                                  src.server,
+                                  src.content_type,
+                                  src.static_authority,
+                                  src.target_path,
+                                  src.body};
+            Str* destinations[] = {&dst.reason,
+                                   &dst.server,
+                                   &dst.content_type,
+                                   &dst.static_authority,
+                                   &dst.target_path,
+                                   &dst.body};
+            for (u32 field = 0; field < 6; field++) {
                 char* out = redirect_policy_bytes + used;
                 for (u32 j = 0; j < fields[field].len; j++) out[j] = fields[field].ptr[j];
                 *destinations[field] = {out, fields[field].len};
@@ -1702,7 +1743,10 @@ struct RouteConfig {
     }
 
     bool redirect_policy_id_is_valid(u16 id) const {
-        return id != 0 && id <= redirect_policy_count &&
+        return redirect_policy_count <= kMaxRedirectPolicies &&
+               redirect_policy_bytes_used <= kRedirectPolicyBytesPoolBytes && id != 0 &&
+               id <= redirect_policy_count &&
+               redirect_policy_strings_are_owned(redirect_policies[id - 1]) &&
                redirect_policy_spec_valid(redirect_policies[id - 1]);
     }
 
