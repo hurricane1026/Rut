@@ -9817,6 +9817,15 @@ TEST(exact_local_response,
         0);
     closes_without_effect(
         *valid, "POST /static HTTP/1.1\r\nHost: x\r\nContent-Length: 1\r\n\r\nx", 2);
+    closes_without_effect(
+        *valid,
+        "POST /static HTTP/1.1\r\nHost: x\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+        2);
+    closes_without_effect(
+        *valid,
+        "POST /static HTTP/1.1\r\nHost: x\r\nContent-Length: 0\r\nContent-Length: "
+        "0\r\nConnection: close\r\n\r\n",
+        2);
     closes_without_effect(*valid, "GET /static HTTP/1.1\r\nBroken\r\n\r\n", 0);
 
     // A depth-zero exact response does not silently acquire ownership of a
@@ -9973,6 +9982,16 @@ TEST(exact_local_response, provenance_half_set_and_stale_combinations_fail_close
     conn.http1_pipeline_request_generation = 17;
     conn.http1_pipeline_boundary_owners_settled = true;
     conn.req_start_us = 1;
+    REQUIRE(exact_strict_local_response_request_is_admitted(conn));
+
+    CHECK_FALSE(conn.req_client_has_content_length);
+    CHECK_EQ(conn.req_client_content_length_count, 0u);
+    conn.req_client_content_length_count = 1;
+    CHECK_FALSE(exact_strict_local_response_request_is_admitted(conn));
+    conn.req_client_content_length_count = 0;
+    conn.req_client_has_content_length = true;
+    CHECK_FALSE(exact_strict_local_response_request_is_admitted(conn));
+    conn.req_client_has_content_length = false;
     REQUIRE(exact_strict_local_response_request_is_admitted(conn));
 
     conn.http1_pipeline_boundary_owners_settled = false;
@@ -11077,6 +11096,32 @@ TEST(pipeline, leftover_returns_zero_for_exact_request) {
     // req_initial_send_len should equal recv_buf.len() — no leftover bytes.
     CHECK_EQ(conn->req_initial_send_len, conn->recv_buf.len());
     CHECK_EQ(pipeline_leftover(*conn), 0u);
+}
+
+TEST(pipeline, content_length_count_is_reparsed_for_successor) {
+    SmallLoop loop;
+    loop.setup();
+    loop.inject_and_dispatch(make_ev(0, IoEventType::Accept, 42));
+    auto* conn = loop.find_fd(42);
+    REQUIRE(conn != nullptr);
+
+    static constexpr char kRequests[] =
+        "POST /first HTTP/1.1\r\nHost: x\r\nContent-Length: 0\r\nContent-Length: 0\r\n\r\n"
+        "GET /second HTTP/1.1\r\nHost: x\r\n\r\n";
+    REQUIRE_EQ(conn->recv_buf.write(reinterpret_cast<const u8*>(kRequests), sizeof(kRequests) - 1u),
+               sizeof(kRequests) - 1u);
+    capture_request_metadata(*conn);
+    CHECK(conn->req_client_has_content_length);
+    CHECK_EQ(conn->req_client_content_length_count, 2u);
+    CHECK_EQ(conn->req_content_length, 0u);
+
+    REQUIRE(pipeline_shift(*conn));
+    REQUIRE_EQ(conn->pipeline_depth, 1u);
+    capture_request_metadata(*conn);
+    CHECK_FALSE(conn->req_client_has_content_length);
+    CHECK_EQ(conn->req_client_content_length_count, 0u);
+    CHECK_EQ(conn->req_content_length, 0u);
+    CHECK_EQ(conn->req_method, static_cast<u8>(LogHttpMethod::Get));
 }
 
 // === Buffer Isolation ===
@@ -12483,6 +12528,48 @@ TEST(metadata, empty_recv_buf) {
     capture_request_metadata(c);
     CHECK_EQ(c.req_method, static_cast<u8>(LogHttpMethod::Other));
     CHECK_EQ(c.req_path[0], '/');
+    CHECK_FALSE(c.req_client_has_content_length);
+    CHECK_EQ(c.req_client_content_length_count, 0u);
+}
+
+TEST(metadata, content_length_count_is_current_request_owned) {
+    Connection c;
+    c.reset();
+    u8 recv[512]{};
+    c.recv_buf.bind(recv, sizeof(recv));
+    const auto capture = [&](const char* request) {
+        c.recv_buf.reset();
+        const u32 length = static_cast<u32>(strlen(request));
+        REQUIRE_EQ(c.recv_buf.write(reinterpret_cast<const u8*>(request), length), length);
+        capture_request_metadata(c);
+    };
+
+    capture("POST /absent HTTP/1.1\r\nHost: x\r\n\r\n");
+    CHECK_FALSE(c.req_client_has_content_length);
+    CHECK_EQ(c.req_client_content_length_count, 0u);
+    CHECK_EQ(c.req_content_length, 0u);
+
+    capture("POST /single HTTP/1.1\r\nHost: x\r\nContent-Length: 0\r\n\r\n");
+    CHECK(c.req_client_has_content_length);
+    CHECK_EQ(c.req_client_content_length_count, 1u);
+    CHECK_EQ(c.req_content_length, 0u);
+
+    capture(
+        "POST /duplicate HTTP/1.1\r\nHost: x\r\nContent-Length: 0\r\n"
+        "Content-Length: 0\r\n\r\n");
+    CHECK(c.req_client_has_content_length);
+    CHECK_EQ(c.req_client_content_length_count, 2u);
+    CHECK_EQ(c.req_content_length, 0u);
+
+    capture("GET /next HTTP/1.1\r\nHost: x\r\n\r\n");
+    CHECK_FALSE(c.req_client_has_content_length);
+    CHECK_EQ(c.req_client_content_length_count, 0u);
+    CHECK_EQ(c.req_content_length, 0u);
+
+    c.req_client_content_length_count = 9;
+    c.reset();
+    CHECK_FALSE(c.req_client_has_content_length);
+    CHECK_EQ(c.req_client_content_length_count, 0u);
 }
 
 TEST(metadata, fallback_non_origin_form_clears_canon) {

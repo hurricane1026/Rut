@@ -391,6 +391,7 @@ bool h2_headers_to_request(const hpack::Header* hs, u32 n, ParsedRequest* req) {
             have_content_length = true;
             req->content_length = cl;
             req->has_content_length = true;
+            req->content_length_count = 1;
         }
     }
     return have_method && have_path;

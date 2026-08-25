@@ -1136,7 +1136,29 @@ TEST(ContentLength, Zero) {
 
     auto s = parse_one("POST / HTTP/1.1\r\nContent-Length: 0\r\n\r\n", &req, &parser);
     CHECK_EQ(static_cast<u8>(s), static_cast<u8>(ParseStatus::Complete));
+    CHECK(req.has_content_length);
+    CHECK_EQ(req.content_length_count, 1u);
     CHECK_EQ(req.content_length, 0u);
+    CHECK(request_content_length_identity_is_valid(req));
+}
+
+TEST(ContentLength, AbsentHasNeutralFieldIdentity) {
+    HttpParser parser;
+    ParsedRequest req;
+
+    const auto s = parse_one("POST / HTTP/1.1\r\nHost: x\r\n\r\n", &req, &parser);
+    CHECK_EQ(static_cast<u8>(s), static_cast<u8>(ParseStatus::Complete));
+    CHECK_FALSE(req.has_content_length);
+    CHECK_EQ(req.content_length_count, 0u);
+    CHECK_EQ(req.content_length, 0u);
+    CHECK(request_content_length_identity_is_valid(req));
+
+    CHECK_FALSE(request_content_length_identity_is_valid(false, 1, 0));
+    CHECK_FALSE(request_content_length_identity_is_valid(false, 0, 1));
+    CHECK_FALSE(request_content_length_identity_is_valid(true, 0, 0));
+    CHECK_FALSE(request_content_length_identity_is_valid(true, kMaxHeaders + 1, 0));
+    CHECK(request_content_length_identity_is_valid(true, 1, 0));
+    CHECK(request_content_length_identity_is_valid(true, 2, 5));
 }
 
 TEST(ContentLength, MaxU32) {
@@ -1383,12 +1405,22 @@ TEST(Reuse, AcrossRequests) {
     auto s1 = parse_one("GET /first HTTP/1.1\r\n\r\n", &req, &parser);
     CHECK_EQ(static_cast<u8>(s1), static_cast<u8>(ParseStatus::Complete));
     CHECK(req.path.eq(Str{"/first", 6}));
+    CHECK_FALSE(req.has_content_length);
+    CHECK_EQ(req.content_length_count, 0u);
 
     auto s2 = parse_one("POST /second HTTP/1.1\r\nContent-Length: 5\r\n\r\n", &req, &parser);
     CHECK_EQ(static_cast<u8>(s2), static_cast<u8>(ParseStatus::Complete));
     CHECK_EQ(static_cast<u8>(req.method), static_cast<u8>(HttpMethod::POST));
     CHECK(req.path.eq(Str{"/second", 7}));
+    CHECK(req.has_content_length);
+    CHECK_EQ(req.content_length_count, 1u);
     CHECK_EQ(req.content_length, 5u);
+
+    const auto s3 = parse_one("GET /third HTTP/1.1\r\n\r\n", &req, &parser);
+    CHECK_EQ(static_cast<u8>(s3), static_cast<u8>(ParseStatus::Complete));
+    CHECK_FALSE(req.has_content_length);
+    CHECK_EQ(req.content_length_count, 0u);
+    CHECK_EQ(req.content_length, 0u);
 }
 
 TEST(Reuse, AfterError) {
@@ -1993,7 +2025,10 @@ TEST(NginxHeaders, DuplicateContentLengthSameValue) {
         &req,
         &parser);
     CHECK_EQ(static_cast<u8>(s), static_cast<u8>(ParseStatus::Complete));
+    CHECK(req.has_content_length);
+    CHECK_EQ(req.content_length_count, 2u);
     CHECK_EQ(req.content_length, 5u);
+    CHECK(request_content_length_identity_is_valid(req));
 }
 
 TEST(NginxHeaders, ContentLengthAndTransferEncodingConflict) {
@@ -2025,7 +2060,10 @@ TEST(NginxHeaders, DuplicateContentLengthZeroZero) {
         &req,
         &parser);
     CHECK_EQ(static_cast<u8>(s), static_cast<u8>(ParseStatus::Complete));
+    CHECK(req.has_content_length);
+    CHECK_EQ(req.content_length_count, 2u);
     CHECK_EQ(req.content_length, 0u);
+    CHECK(request_content_length_identity_is_valid(req));
 }
 
 TEST(NginxHeaders, DuplicateContentLengthZeroNonzero) {
@@ -2055,7 +2093,29 @@ TEST(NginxHeaders, TripleDuplicateContentLength) {
         &req,
         &parser);
     CHECK_EQ(static_cast<u8>(s), static_cast<u8>(ParseStatus::Complete));
+    CHECK(req.has_content_length);
+    CHECK_EQ(req.content_length_count, 3u);
     CHECK_EQ(req.content_length, 42u);
+    CHECK(request_content_length_identity_is_valid(req));
+}
+
+TEST(NginxHeaders, MaximumHeaderCountBoundsContentLengthCount) {
+    std::string request = "POST / HTTP/1.1\r\n";
+    for (u32 i = 0; i < kMaxHeaders; i++) request += "Content-Length: 0\r\n";
+    request += "\r\n";
+
+    HttpParser parser;
+    ParsedRequest req;
+    const auto s = parse_raw(reinterpret_cast<const u8*>(request.data()),
+                             static_cast<u32>(request.size()),
+                             &req,
+                             &parser);
+    CHECK_EQ(static_cast<u8>(s), static_cast<u8>(ParseStatus::Complete));
+    CHECK_EQ(req.header_count, kMaxHeaders);
+    CHECK(req.has_content_length);
+    CHECK_EQ(req.content_length_count, kMaxHeaders);
+    CHECK_EQ(req.content_length, 0u);
+    CHECK(request_content_length_identity_is_valid(req));
 }
 
 TEST(NginxHeaders, TripleDuplicateContentLengthMismatch) {

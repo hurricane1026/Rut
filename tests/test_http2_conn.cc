@@ -546,6 +546,7 @@ TEST(h2_request, content_length_parsed) {
     REQUIRE(h2_headers_to_request(hs, 3, &req));
     CHECK(req.method == HttpMethod::POST);
     CHECK(req.has_content_length);
+    CHECK_EQ(req.content_length_count, 1u);
     CHECK_EQ(req.content_length, 42u);
 }
 
@@ -558,6 +559,7 @@ TEST(h2_request, ten_digit_content_length_parsed) {
     ParsedRequest req;
     REQUIRE(h2_headers_to_request(hs, 3, &req));
     CHECK(req.has_content_length);
+    CHECK_EQ(req.content_length_count, 1u);
     CHECK_EQ(req.content_length, 0u);
 
     hpack::Header max[] = {
@@ -566,6 +568,7 @@ TEST(h2_request, ten_digit_content_length_parsed) {
         {{"content-length", 14}, {"4294967295", 10}},
     };
     REQUIRE(h2_headers_to_request(max, 3, &req));
+    CHECK_EQ(req.content_length_count, 1u);
     CHECK_EQ(req.content_length, 4294967295u);
 }
 
@@ -1637,6 +1640,7 @@ TEST(h2_serving, deferred_route_params_copied_to_stable_storage) {
     const hpack::Header hs[] = {{{":method", 7}, {"GET", 3}}, {{":path", 5}, {path_buf, 9}}};
     ParsedRequest req{};
     req.has_content_length = true;
+    req.content_length_count = 1;
     req.content_length = 0;
 
     REQUIRE(h2_defer_until_data_end(d,

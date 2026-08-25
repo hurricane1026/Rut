@@ -550,12 +550,12 @@ inline bool exact_strict_local_response_common_request_is_admitted(const Connect
            conn.req_http_version == static_cast<u8>(HttpVersion::Http11) &&
            conn.req_path_canon.ptr != nullptr && !conn.req_target_has_fragment &&
            !conn.req_malformed && !conn.req_wants_upgrade && !conn.req_client_has_content_length &&
-           !conn.req_client_has_transfer_encoding && !conn.req_client_has_te &&
-           !conn.req_client_has_expect && !conn.req_client_has_upgrade_header &&
-           conn.req_body_mode == BodyMode::None && conn.req_content_length == 0 &&
-           conn.req_body_remaining == 0 && !conn.request_body_fully_buffered &&
-           !conn.req_body_streamed && conn.req_header_end != 0 &&
-           conn.req_header_end == conn.req_initial_send_len &&
+           conn.req_client_content_length_count == 0 && !conn.req_client_has_transfer_encoding &&
+           !conn.req_client_has_te && !conn.req_client_has_expect &&
+           !conn.req_client_has_upgrade_header && conn.req_body_mode == BodyMode::None &&
+           conn.req_content_length == 0 && conn.req_body_remaining == 0 &&
+           !conn.request_body_fully_buffered && !conn.req_body_streamed &&
+           conn.req_header_end != 0 && conn.req_header_end == conn.req_initial_send_len &&
            conn.req_initial_send_len == conn.recv_buf.len() &&
            (method == LogHttpMethod::Get || method == LogHttpMethod::Head ||
             method == LogHttpMethod::Post || method == LogHttpMethod::Options);

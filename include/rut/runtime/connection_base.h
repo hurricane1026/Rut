@@ -959,6 +959,7 @@ struct ConnectionBase {
     bool req_client_connection_close;
     bool req_client_connection_close_exact;
     bool req_client_has_content_length;
+    u8 req_client_content_length_count;
     RequestTransferEncoding req_client_transfer_encoding;
     // Original request framing/upgrade facts captured before any request-policy
     // rewrite. SuppressBody HEAD admission must not lose these when rewritten
@@ -1312,6 +1313,7 @@ struct ConnectionBase {
         req_client_connection_close = false;
         req_client_connection_close_exact = false;
         req_client_has_content_length = false;
+        req_client_content_length_count = 0;
         req_client_transfer_encoding = RequestTransferEncoding::Unparsed;
         req_client_has_transfer_encoding = false;
         req_client_has_te = false;

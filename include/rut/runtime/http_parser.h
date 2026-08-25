@@ -44,6 +44,7 @@ struct Header {
 
 // Maximum headers we store per request. Beyond this, parsing returns error.
 static constexpr u32 kMaxHeaders = 64;
+static_assert(kMaxHeaders < 255, "request Content-Length count must fit in u8");
 
 // Result of an incremental parse call.
 enum class ParseStatus : u8 {
@@ -71,6 +72,7 @@ struct ParsedRequest {
     bool chunked;        // Transfer-Encoding: chunked
     RequestTransferEncoding transfer_encoding;
     bool has_content_length;    // True if Content-Length header was seen.
+    u8 content_length_count;    // Number of successfully parsed Content-Length fields.
     bool upgrade;               // Connection: upgrade token present
     bool has_upgrade_header;    // Upgrade: header present (both required for a
                                 // valid upgrade — Connection is hop-by-hop alone)
@@ -93,6 +95,7 @@ struct ParsedRequest {
         chunked = false;
         transfer_encoding = RequestTransferEncoding::Unparsed;
         has_content_length = false;
+        content_length_count = 0;
         upgrade = false;
         has_upgrade_header = false;
         upgrade_is_websocket = false;
@@ -100,6 +103,18 @@ struct ParsedRequest {
         target_has_fragment = false;
     }
 };
+
+inline bool request_content_length_identity_is_valid(bool has_content_length,
+                                                     u8 content_length_count,
+                                                     u32 content_length) {
+    return has_content_length ? content_length_count != 0 && content_length_count <= kMaxHeaders
+                              : content_length_count == 0 && content_length == 0;
+}
+
+inline bool request_content_length_identity_is_valid(const ParsedRequest& request) {
+    return request_content_length_identity_is_valid(
+        request.has_content_length, request.content_length_count, request.content_length);
+}
 
 // Incremental HTTP/1.x request parser.
 //

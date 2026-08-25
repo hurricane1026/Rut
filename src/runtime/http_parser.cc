@@ -265,6 +265,8 @@ static inline ParseStatus apply_semantic_header(
         if (name_len == 14 && str_ci_eq(name + 1, "ontent-length", 13)) {
             auto cl = parse_uint(val, vlen);
             if (UNLIKELY(!cl)) return ParseStatus::Error;
+            if (UNLIKELY(req->content_length_count == 255)) return ParseStatus::Error;
+            req->content_length_count++;
             if (UNLIKELY(req->has_content_length)) {
                 // Duplicate Content-Length with different value → reject
                 if (req->content_length != cl.value()) return ParseStatus::Error;

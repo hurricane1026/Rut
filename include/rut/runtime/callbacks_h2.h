@@ -1658,6 +1658,7 @@ void h2_resume_jit_handler(Loop* loop, Connection& conn) {
             ParsedRequest open_request;
             open_request.reset();
             open_request.has_content_length = h2->async_request_has_content_length;
+            open_request.content_length_count = h2->async_request_has_content_length ? 1 : 0;
             open_request.content_length = h2->async_request_content_length;
             u8 resp[8192];
             H2Dispatch<Loop> d{loop, &conn, resp, sizeof(resp), 0, false};
