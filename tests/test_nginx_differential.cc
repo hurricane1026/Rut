@@ -59,6 +59,11 @@ static constexpr char kExactLocalPostCloseRequest[] =
     "POST /static HTTP/1.1\r\n"
     "Host: exact-local.example\r\n"
     "Connection: close\r\n\r\n";
+static constexpr char kExactLocalPostCl0CloseRequest[] =
+    "POST /static HTTP/1.1\r\n"
+    "Host: exact-local.example\r\n"
+    "Content-Length: 0\r\n"
+    "Connection: close\r\n\r\n";
 static constexpr char kExactLocalOptionsCloseRequest[] =
     "OPTIONS /static HTTP/1.1\r\n"
     "Host: exact-local.example\r\n"
@@ -6643,18 +6648,24 @@ struct ExactLocalReturnObservation {
     u32 scoped_connect_failures = 0;
 };
 
+static constexpr size_t kExactLocalHeaderAbsentPostVectorIndex = 4;
+static constexpr size_t kExactLocalCl0PostVectorIndex = 5;
+static constexpr size_t kExactLocalReturnVectorCount = 10;
+
 static void dump_exact_local_return_observation(const ExactLocalReturnObservation& observation) {
     static constexpr const char* kLabels[] = {
         "GET keep-alive",
         "GET keep-alive successor close",
         "GET close",
         "HEAD close",
-        "POST close",
+        "POST header-absent close",
+        "POST Content-Length: 0 close",
         "OPTIONS close",
         "GET query close",
         "GET /static/ fallback",
         "GET /static/child fallback",
     };
+    static_assert(sizeof(kLabels) / sizeof(kLabels[0]) == kExactLocalReturnVectorCount);
     std::cerr << "exact-local order=" << observation.order
               << " scoped-connect-failures=" << observation.scoped_connect_failures << "\n";
     for (size_t i = 0; i < observation.wires.size(); i++) {
@@ -6812,9 +6823,14 @@ static bool capture_pinned_exact_local_order(u16 frontend_port,
                           sizeof(kExactLocalHeadCloseRequest) - 1u,
                           kExactLocalHeadCloseResponseNormalized,
                           true) ||
-        !run_close_vector("POST /static close",
+        !run_close_vector("POST /static header-absent close",
                           kExactLocalPostCloseRequest,
                           sizeof(kExactLocalPostCloseRequest) - 1u,
+                          kExactLocalCloseResponseNormalized,
+                          false) ||
+        !run_close_vector("POST /static Content-Length: 0 close",
+                          kExactLocalPostCl0CloseRequest,
+                          sizeof(kExactLocalPostCl0CloseRequest) - 1u,
                           kExactLocalCloseResponseNormalized,
                           false) ||
         !run_close_vector("OPTIONS /static close",
@@ -6900,10 +6916,36 @@ static bool run_pinned_exact_local_return_baseline(u16 frontend_port,
                                           root_first,
                                           error))
         return false;
-    if (exact_first.wires.size() != root_first.wires.size() || exact_first.wires.empty()) {
+    if (exact_first.wires.size() != kExactLocalReturnVectorCount ||
+        root_first.wires.size() != kExactLocalReturnVectorCount) {
         error = "exact-local order variants produced different vector cardinality";
         return false;
     }
+    const auto normalized_wires_equal = [&](const std::vector<char>& left,
+                                            const std::vector<char>& right,
+                                            const std::string& mismatch) {
+        std::vector<char> normalized_left = left;
+        std::vector<char> normalized_right = right;
+        if (!normalize_date(normalized_left) || !normalize_date(normalized_right) ||
+            normalized_left != normalized_right) {
+            error = mismatch;
+            return false;
+        }
+        return true;
+    };
+    if (!normalized_wires_equal(
+            exact_first.wires[kExactLocalHeaderAbsentPostVectorIndex],
+            exact_first.wires[kExactLocalCl0PostVectorIndex],
+            "exact-before-root Content-Length: 0 POST differed from header-absent POST") ||
+        !normalized_wires_equal(
+            root_first.wires[kExactLocalHeaderAbsentPostVectorIndex],
+            root_first.wires[kExactLocalCl0PostVectorIndex],
+            "root-before-exact Content-Length: 0 POST differed from header-absent POST") ||
+        !normalized_wires_equal(
+            exact_first.wires[kExactLocalCl0PostVectorIndex],
+            root_first.wires[kExactLocalCl0PostVectorIndex],
+            "location declaration order changed the Content-Length: 0 POST wire"))
+        return false;
     for (size_t i = 0; i < exact_first.wires.size(); i++) {
         std::vector<char> left = exact_first.wires[i];
         std::vector<char> right = root_first.wires[i];
@@ -8282,9 +8324,12 @@ int main(int argc, char** argv) {
             dump_log(temp.nginx_log, "pinned exact-local nginx log");
             return 1;
         }
-        std::cerr << "PASS: pinned nginx exact /static local return is declaration-order "
-                     "independent (GET/HEAD/POST/OPTIONS/query), preserves request persistence, "
-                     "and excludes /static/ plus /static/child with exactly two proxy attempts\n";
+        std::cerr
+            << "PASS: pinned nginx exact /static local return is declaration-order independent; "
+               "an explicit-close POST with exactly one Content-Length: 0 matches the adjacent "
+               "header-absent POST as exact 200/CL16/successor-static/EOF, while /static/ and "
+               "/static/child retain exactly two scoped proxy attempts (pinned-nginx-only "
+               "semantic baseline; no converter/RUT equivalence claim)\n";
         if (exact_local_return_baseline) return 0;
     }
 
