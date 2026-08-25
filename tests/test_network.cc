@@ -9759,6 +9759,43 @@ TEST(exact_local_response,
     CHECK_EQ(capture.available(), delete_capture_before);
     CHECK_EQ(epoch.epoch.load(std::memory_order_acquire), delete_epoch_before + 2u);
 
+    // PUT owns the same fresh-transport proof and must not borrow the legacy
+    // depth-zero shape after a completed request on this transport.
+    loop.backend.clear_ops();
+    Connection* sequential_put =
+        dispatch_unmatched_request(loop, *valid, "GET /static HTTP/1.1\r\nHost: x\r\n\r\n");
+    REQUIRE(sequential_put != nullptr);
+    const u32 sequential_put_id = sequential_put->id;
+    const u32 sequential_put_first_len = sequential_put->send_buf.len();
+    loop.inject_and_dispatch(
+        make_ev(sequential_put_id, IoEventType::Send, static_cast<i32>(sequential_put_first_len)));
+    REQUIRE_EQ(sequential_put->downstream_completed_request_count, 1u);
+    const u64 put_requests_before = metrics.requests_total;
+    const u32 put_access_before = access.available();
+    const u32 put_capture_before = capture.available();
+    const u64 put_epoch_before = epoch.epoch.load(std::memory_order_acquire);
+    loop.backend.clear_ops();
+    static constexpr char kSequentialPut[] =
+        "PUT /static HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n";
+    REQUIRE_EQ(sequential_put->recv_buf.write(reinterpret_cast<const u8*>(kSequentialPut),
+                                              sizeof(kSequentialPut) - 1u),
+               sizeof(kSequentialPut) - 1u);
+    const RouteConfig* sequential_put_config = valid.get();
+    loop.config_ptr = &sequential_put_config;
+    on_header_received<SmallLoop>(
+        &loop,
+        *sequential_put,
+        make_ev(
+            sequential_put_id, IoEventType::Recv, static_cast<i32>(sizeof(kSequentialPut) - 1u)));
+    loop.config_ptr = nullptr;
+    CHECK_EQ(loop.conns[sequential_put_id].fd, -1);
+    CHECK_EQ(loop.backend.count_ops(MockOp::Send), 0u);
+    CHECK_EQ(loop.backend.count_ops(MockOp::Connect), 0u);
+    CHECK_EQ(metrics.requests_total, put_requests_before);
+    CHECK_EQ(access.available(), put_access_before);
+    CHECK_EQ(capture.available(), put_capture_before);
+    CHECK_EQ(epoch.epoch.load(std::memory_order_acquire), put_epoch_before + 2u);
+
     // The exact response may be request2 only after the normal response
     // boundary has proven old owners settled and published the current depth-1
     // generation. No upstream episode is fabricated for the local successor.
@@ -9838,8 +9875,12 @@ TEST(exact_local_response,
 
     dispatch_and_finish(
         *valid, "DELETE /static HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n", 200, true);
+    dispatch_and_finish(
+        *valid, "PUT /static HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n", 200, true);
     closes_without_effect(
         *valid, "DELETE /static?x=1 HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n", 2);
+    closes_without_effect(
+        *valid, "PUT /static?x=1 HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n", 2);
 
     static constexpr char kOptionsStar[] =
         "OPTIONS * HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n";
@@ -9964,6 +10005,8 @@ TEST(exact_local_response,
         *firewall, "GET /static HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n", 403, false);
     dispatch_and_finish(
         *firewall, "DELETE /static HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n", 403, false);
+    dispatch_and_finish(
+        *firewall, "PUT /static HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n", 403, false);
 
     auto forged_tail = std::make_unique<RouteConfig>();
     forged_tail->exact_strict_local_response_bindings[15].reserved1 = 1;
@@ -10304,6 +10347,7 @@ TEST(exact_local_response,
     CHECK_EQ(remainder->send_len, wire_len - kPartial);
     loop.inject_and_dispatch(make_ev(id, IoEventType::Send, wire_len - kPartial));
     CHECK_EQ(loop.free_top, SmallLoop::kMaxConns);
+    CHECK_EQ(loop.conns[id].downstream_completed_request_count, 0u);
     CHECK_EQ(metrics.requests_total, 1u);
     CHECK_EQ(metrics.requests_active, 0u);
     CHECK_EQ(metrics.request_latency.count, 1u);
@@ -10341,6 +10385,7 @@ TEST(exact_local_response,
     CHECK_EQ(loop.backend.count_ops(MockOp::Connect), 0u);
     loop.inject_and_dispatch(make_ev(failed_id, IoEventType::Send, -EPIPE));
     CHECK_EQ(loop.free_top, SmallLoop::kMaxConns);
+    CHECK_EQ(loop.conns[failed_id].downstream_completed_request_count, 0u);
     CHECK_EQ(metrics.requests_total, 1u);
     CHECK_EQ(metrics.requests_active, 0u);
     CHECK_EQ(metrics.request_latency.count, 1u);
@@ -10350,7 +10395,153 @@ TEST(exact_local_response,
     CHECK_EQ(loop.backend.count_ops(MockOp::Connect), 0u);
 }
 
-TEST(exact_local_response, fresh_header_absent_delete_exclusions_and_forged_owners_fail_closed) {
+TEST(exact_local_response,
+     fresh_header_absent_put_lifecycle_config_pin_and_send_failure_are_exact) {
+    SmallLoop loop;
+    loop.setup();
+    ShardMetrics metrics{};
+    metrics.init();
+    AccessLogRing access{};
+    access.init();
+    CaptureRing capture{};
+    capture.init();
+    ShardEpoch epoch{};
+    loop.metrics = &metrics;
+    loop.access_log = &access;
+    loop.epoch = &epoch;
+    REQUIRE(loop.set_capture(&capture));
+
+    RouteConfig config{};
+    REQUIRE(install_representation200_exact(config, "/static"));
+    const RouteConfig* active = &config;
+    loop.config_ptr = &active;
+    static constexpr char kPut[] = "PUT /static HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n";
+
+    loop.backend.clear_ops();
+    Connection* conn = dispatch_unmatched_request(loop, config, kPut);
+    REQUIRE(conn != nullptr);
+    const u32 id = conn->id;
+    REQUIRE_EQ(conn->resp_status, 200u);
+    CHECK_EQ(conn->req_method, static_cast<u8>(LogHttpMethod::Put));
+    CHECK(conn->req_strict_h1_complete);
+    CHECK_EQ(conn->req_http_version, static_cast<u8>(HttpVersion::Http11));
+    CHECK_FALSE(conn->req_client_has_content_length);
+    CHECK_EQ(conn->req_client_content_length_count, 0u);
+    CHECK_EQ(conn->req_content_length, 0u);
+    CHECK_EQ(conn->req_body_mode, BodyMode::None);
+    CHECK_EQ(conn->req_body_remaining, 0u);
+    CHECK_EQ(conn->req_header_end, sizeof(kPut) - 1u);
+    CHECK_EQ(conn->req_initial_send_len, sizeof(kPut) - 1u);
+    CHECK_EQ(conn->recv_buf.len(), sizeof(kPut) - 1u);
+    CHECK_FALSE(conn->req_keep_alive);
+    CHECK_FALSE(conn->req_client_keep_alive);
+    CHECK(conn->req_client_connection_close);
+    CHECK(conn->req_client_connection_close_exact);
+    CHECK_EQ(conn->req_client_connection_count, 1u);
+    CHECK_EQ(conn->pipeline_depth, 0u);
+    CHECK_EQ(conn->http1_pipeline_request_generation, 0u);
+    CHECK_EQ(conn->downstream_completed_request_count, 0u);
+    CHECK_EQ(conn->request_config, &config);
+    CHECK_EQ(conn->upstream_fd, -1);
+    CHECK_FALSE(conn->upstream_slot_held);
+    CHECK_EQ(conn->upstream_attempts, 0u);
+    CHECK_EQ(conn->retry_req_send_len, 0u);
+    CHECK_EQ(loop.backend.count_ops(MockOp::Connect), 0u);
+    CHECK_EQ(loop.backend.count_ops(MockOp::Send), 1u);
+    CHECK_EQ(metrics.requests_total, 0u);
+    CHECK_EQ(metrics.requests_active, 1u);
+    CHECK_EQ(access.available(), 0u);
+    CHECK_EQ(capture.available(), 0u);
+    CHECK_EQ(epoch.epoch.load(std::memory_order_acquire), 1u);
+
+    u8 normalized[SmallLoop::kBufSize]{};
+    const u32 wire_len = conn->send_buf.len();
+    REQUIRE(wire_len <= sizeof(normalized));
+    __builtin_memcpy(normalized, conn->send_buf.data(), wire_len);
+    REQUIRE(normalize_redirect_date(normalized, wire_len));
+    const std::string expected = expected_representation200_wire(false, false);
+    REQUIRE_EQ(wire_len, static_cast<u32>(expected.size()));
+    CHECK_EQ(__builtin_memcmp(normalized, expected.data(), expected.size()), 0);
+
+    // The response stays bound to the request's pinned config through partial
+    // Send even if the active config changes after staging.
+    RouteConfig replacement{};
+    auto replacement_policy = make_representation200_policy();
+    replacement_policy.body = {"replacement-body", 16};
+    u16 replacement_unmatched[kStrictLocalResponseMethodSlots]{};
+    ExactStrictLocalResponseBinding replacement_exact[kMaxExactStrictLocalResponseBindings]{};
+    replacement_exact[0] = make_exact_local_binding("/static", kRouteMethodAny, 1);
+    REQUIRE(replacement.install_strict_local_response_table(
+        &replacement_policy, 1, replacement_unmatched, replacement_exact, 1));
+    active = &replacement;
+    loop.config_ptr = &active;
+    CHECK_EQ(conn->request_config, &config);
+    static constexpr u32 kPartial = 7;
+    REQUIRE_GT(wire_len, kPartial);
+    loop.inject_and_dispatch(make_ev(id, IoEventType::Send, kPartial));
+    CHECK_EQ(conn->downstream_completed_request_count, 0u);
+    CHECK_EQ(conn->send_progress, kPartial);
+    CHECK_EQ(metrics.requests_total, 0u);
+    CHECK_EQ(metrics.requests_active, 1u);
+    CHECK_EQ(access.available(), 0u);
+    CHECK_EQ(capture.available(), 0u);
+    CHECK_EQ(epoch.epoch.load(std::memory_order_acquire), 1u);
+    const MockOp* remainder = loop.backend.last_op(MockOp::Send);
+    REQUIRE(remainder != nullptr);
+    CHECK_EQ(remainder->send_buf, conn->send_buf.data() + kPartial);
+    CHECK_EQ(remainder->send_len, wire_len - kPartial);
+    loop.inject_and_dispatch(make_ev(id, IoEventType::Send, wire_len - kPartial));
+    CHECK_EQ(loop.free_top, SmallLoop::kMaxConns);
+    CHECK_EQ(loop.conns[id].downstream_completed_request_count, 0u);
+    CHECK_EQ(metrics.requests_total, 1u);
+    CHECK_EQ(metrics.requests_active, 0u);
+    CHECK_EQ(metrics.request_latency.count, 1u);
+    CHECK_EQ(access.available(), 1u);
+    CHECK_EQ(capture.available(), 1u);
+    CHECK_EQ(epoch.epoch.load(std::memory_order_acquire), 2u);
+    AccessLogEntry access_entry{};
+    REQUIRE(access.pop(access_entry));
+    CHECK_EQ(access_entry.status, 200u);
+    CHECK_EQ(access_entry.method, static_cast<u8>(LogHttpMethod::Put));
+    CHECK_EQ(access_entry.resp_size, wire_len);
+    CHECK_EQ(access_entry.upstream_us, 0u);
+    CaptureEntry capture_entry{};
+    REQUIRE(capture.pop(capture_entry));
+    CHECK_EQ(capture_entry.resp_status, 200u);
+    CHECK_EQ(capture_entry.method, static_cast<u8>(LogHttpMethod::Put));
+    CHECK_EQ(capture_entry.req_content_length, 0u);
+    CHECK_EQ(capture_entry.resp_content_length, wire_len);
+    CHECK_EQ(capture_entry.raw_header_len, sizeof(kPut) - 1u);
+    CHECK_EQ(__builtin_memcmp(capture_entry.raw_headers, kPut, sizeof(kPut) - 1u), 0);
+    CHECK_EQ(access.available(), 0u);
+    CHECK_EQ(capture.available(), 0u);
+    CHECK_EQ(loop.backend.count_ops(MockOp::Connect), 0u);
+
+    // EPIPE releases request/epoch ownership exactly once without publishing a
+    // successful completion, access/capture entry, or upstream attempt.
+    active = &config;
+    loop.backend.clear_ops();
+    Connection* failed = dispatch_unmatched_request(loop, config, kPut);
+    REQUIRE(failed != nullptr);
+    const u32 failed_id = failed->id;
+    CHECK_EQ(failed->downstream_completed_request_count, 0u);
+    CHECK_EQ(metrics.requests_active, 1u);
+    CHECK_EQ(epoch.epoch.load(std::memory_order_acquire), 3u);
+    CHECK_EQ(loop.backend.count_ops(MockOp::Connect), 0u);
+    loop.inject_and_dispatch(make_ev(failed_id, IoEventType::Send, -EPIPE));
+    CHECK_EQ(loop.free_top, SmallLoop::kMaxConns);
+    CHECK_EQ(loop.conns[failed_id].downstream_completed_request_count, 0u);
+    CHECK_EQ(metrics.requests_total, 1u);
+    CHECK_EQ(metrics.requests_active, 0u);
+    CHECK_EQ(metrics.request_latency.count, 1u);
+    CHECK_EQ(access.available(), 0u);
+    CHECK_EQ(capture.available(), 0u);
+    CHECK_EQ(epoch.epoch.load(std::memory_order_acquire), 4u);
+    CHECK_EQ(loop.backend.count_ops(MockOp::Connect), 0u);
+}
+
+TEST(exact_local_response,
+     fresh_header_absent_delete_and_put_exclusions_and_forged_owners_fail_closed) {
     SmallLoop loop;
     loop.setup();
     ShardMetrics metrics{};
@@ -10392,7 +10583,7 @@ TEST(exact_local_response, fresh_header_absent_delete_exclusions_and_forged_owne
         CHECK_EQ(epoch.epoch.load(std::memory_order_acquire), epoch_before + expected_epoch_delta);
     };
 
-    static constexpr const char* kAdmittedParseRejected[] = {
+    static constexpr const char* kDeleteAdmittedParseRejected[] = {
         "DELETE /static HTTP/1.1\r\nHost: x\r\n\r\n",
         "DELETE /static HTTP/1.1\r\nHost: x\r\nConnection: close\r\nConnection: close\r\n\r\n",
         "DELETE /static HTTP/1.1\r\nHost: x\r\nConnection: close, close\r\n\r\n",
@@ -10411,13 +10602,35 @@ TEST(exact_local_response, fresh_header_absent_delete_exclusions_and_forged_owne
         "DELETE /static HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\nx",
         "DELETE /static HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\nGET /next "
         "HTTP/1.1\r\nHost: x\r\n\r\n",
-        "PUT /static HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n",
         "PATCH /static HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n",
         "TRACE /static HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n",
     };
-    for (const char* request : kAdmittedParseRejected) closes_without_effect(request, 2);
+    for (const char* request : kDeleteAdmittedParseRejected) closes_without_effect(request, 2);
 
-    static constexpr const char* kEarlyRejected[] = {
+    static constexpr const char* kPutAdmittedParseRejected[] = {
+        "PUT /static HTTP/1.1\r\nHost: x\r\n\r\n",
+        "PUT /static HTTP/1.1\r\nHost: x\r\nConnection: keep-alive\r\n\r\n",
+        "PUT /static HTTP/1.1\r\nHost: x\r\nConnection: close\r\nConnection: close\r\n\r\n",
+        "PUT /static HTTP/1.1\r\nHost: x\r\nConnection: close, close\r\n\r\n",
+        "PUT /static? HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n",
+        "PUT /static?x=1 HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n",
+        "PUT /static HTTP/1.1\r\nHost: x\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+        "PUT /static HTTP/1.1\r\nHost: x\r\nContent-Length: 0\r\nContent-Length: "
+        "0\r\nConnection: close\r\n\r\n",
+        "PUT /static HTTP/1.1\r\nHost: x\r\nContent-Length: 1\r\nConnection: close\r\n\r\n",
+        "PUT /static HTTP/1.1\r\nHost: x\r\nContent-Length: 1\r\nConnection: close\r\n\r\nx",
+        "PUT /static HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\nConnection: "
+        "close\r\n\r\n",
+        "PUT /static HTTP/1.1\r\nHost: x\r\nTE: trailers\r\nConnection: close\r\n\r\n",
+        "PUT /static HTTP/1.1\r\nHost: x\r\nExpect: 100-continue\r\nConnection: close\r\n\r\n",
+        "PUT /static HTTP/1.1\r\nHost: x\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n\r\n",
+        "PUT /static HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\nx",
+        "PUT /static HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\nGET /next "
+        "HTTP/1.1\r\nHost: x\r\n\r\n",
+    };
+    for (const char* request : kPutAdmittedParseRejected) closes_without_effect(request, 2);
+
+    static constexpr const char* kDeleteEarlyRejected[] = {
         "DELETE /static#fragment HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n",
         "DELETE /static HTTP/1.0\r\nHost: x\r\nConnection: close\r\n\r\n",
         "DELETE http://example.test/static HTTP/1.1\r\nHost: example.test\r\nConnection: "
@@ -10430,15 +10643,32 @@ TEST(exact_local_response, fresh_header_absent_delete_exclusions_and_forged_owne
         "chunked\r\nConnection: close\r\n\r\n",
         "BREW /static HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n",
     };
-    for (const char* request : kEarlyRejected) closes_without_effect(request, 0);
+    for (const char* request : kDeleteEarlyRejected) closes_without_effect(request, 0);
+
+    static constexpr const char* kPutEarlyRejected[] = {
+        "PUT /static#fragment HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n",
+        "PUT /static HTTP/1.0\r\nHost: x\r\nConnection: close\r\n\r\n",
+        "PUT * HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n",
+        "PUT http://example.test/static HTTP/1.1\r\nHost: example.test\r\nConnection: "
+        "close\r\n\r\n",
+        "PUT example.test:80 HTTP/1.1\r\nHost: example.test\r\nConnection: close\r\n\r\n",
+        "PUT /static HTTP/1.1\r\nHost: x\r\nContent-Length: nope\r\nConnection: close\r\n\r\n",
+        "PUT /static HTTP/1.1\r\nHost: x\r\nContent-Length: 0\r\nContent-Length: "
+        "1\r\nConnection: close\r\n\r\n",
+        "PUT /static HTTP/1.1\r\nHost: x\r\nContent-Length: 0\r\nTransfer-Encoding: "
+        "chunked\r\nConnection: close\r\n\r\n",
+    };
+    for (const char* request : kPutEarlyRejected) closes_without_effect(request, 0);
 
     Connection forged{};
     u8 recv[512]{}, send[512]{}, upstream[512]{}, response[512]{};
-    auto reset_forged = [&]() {
+    auto reset_forged = [&](bool put) {
         forged.reset();
-        // Quarantine is deliberately sticky across slot reset. This forged
-        // fixture models a canonical fresh transport for each independent
-        // mutation, so clear the prior case's synthetic quarantine explicitly.
+        // Episode/tombstone identity and quarantine are deliberately sticky
+        // across slot reset. This fixture models a canonical fresh transport
+        // for each independent mutation, so restore their accept-time values.
+        forged.upstream_episode = 1;
+        forged.upstream_retiring_episode = 0;
         forged.upstream_episode_quarantined = false;
         forged.recv_slice = recv;
         forged.send_slice = send;
@@ -10450,16 +10680,31 @@ TEST(exact_local_response, fresh_header_absent_delete_exclusions_and_forged_owne
         forged.response_header_buf.bind(response, sizeof(response));
         static constexpr char kDelete[] =
             "DELETE /static HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n";
-        REQUIRE_EQ(
-            forged.recv_buf.write(reinterpret_cast<const u8*>(kDelete), sizeof(kDelete) - 1u),
-            sizeof(kDelete) - 1u);
+        static constexpr char kPut[] =
+            "PUT /static HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n";
+        const char* request = put ? kPut : kDelete;
+        const u32 request_len = static_cast<u32>(strlen(request));
+        REQUIRE_EQ(forged.recv_buf.write(reinterpret_cast<const u8*>(request), request_len),
+                   request_len);
         capture_request_metadata(forged);
-        REQUIRE(exact_strict_local_response_delete_request_is_admitted(forged));
+        if (put) {
+            REQUIRE(exact_strict_local_response_put_request_is_admitted(forged));
+        } else {
+            REQUIRE(exact_strict_local_response_delete_request_is_admitted(forged));
+        }
+        REQUIRE(exact_strict_local_response_request_is_admitted(forged));
     };
     auto rejected = [&](auto mutate) {
-        reset_forged();
-        mutate(forged);
-        CHECK_FALSE(exact_strict_local_response_delete_request_is_admitted(forged));
+        for (const bool put : {false, true}) {
+            reset_forged(put);
+            mutate(forged);
+            if (put) {
+                CHECK_FALSE(exact_strict_local_response_put_request_is_admitted(forged));
+            } else {
+                CHECK_FALSE(exact_strict_local_response_delete_request_is_admitted(forged));
+            }
+            CHECK_FALSE(exact_strict_local_response_request_is_admitted(forged));
+        }
     };
     rejected([](Connection& c) { c.downstream_completed_request_count = 1; });
     rejected([](Connection& c) { c.req_client_connection_count = 2; });
@@ -10508,8 +10753,56 @@ TEST(exact_local_response, fresh_header_absent_delete_exclusions_and_forged_owne
     rejected([](Connection& c) { c.on_upstream_recv = &on_upstream_response<SmallLoop>; });
     rejected([](Connection& c) { c.idle_return_fd = 99; });
     rejected([](Connection& c) { c.upstream_episode_quarantined = true; });
+    rejected([](Connection& c) {
+        c.upstream_episode = 1;
+        c.upstream_retiring_episode = 2;
+    });
     rejected([](Connection& c) { c.tls_active = true; });
     rejected([](Connection& c) { c.protocol = ConnProtocol::Http2; });
+
+    CHECK(exact_strict_local_response_fresh_method_pair_is_supported(LogHttpMethod::Delete,
+                                                                     HttpMethod::DELETE));
+    CHECK(exact_strict_local_response_fresh_method_pair_is_supported(LogHttpMethod::Put,
+                                                                     HttpMethod::PUT));
+    CHECK_FALSE(exact_strict_local_response_fresh_method_pair_is_supported(LogHttpMethod::Delete,
+                                                                           HttpMethod::PUT));
+    CHECK_FALSE(exact_strict_local_response_fresh_method_pair_is_supported(LogHttpMethod::Put,
+                                                                           HttpMethod::DELETE));
+    CHECK_FALSE(exact_strict_local_response_fresh_method_pair_is_supported(LogHttpMethod::Patch,
+                                                                           HttpMethod::PATCH));
+    CHECK_FALSE(exact_strict_local_response_fresh_method_pair_is_supported(LogHttpMethod::Delete,
+                                                                           HttpMethod::PATCH));
+    CHECK_FALSE(exact_strict_local_response_fresh_method_pair_is_supported(LogHttpMethod::Patch,
+                                                                           HttpMethod::DELETE));
+    CHECK_FALSE(exact_strict_local_response_fresh_method_pair_is_supported(LogHttpMethod::Put,
+                                                                           HttpMethod::PATCH));
+    CHECK_FALSE(exact_strict_local_response_fresh_method_pair_is_supported(LogHttpMethod::Patch,
+                                                                           HttpMethod::PUT));
+
+    // Captured metadata and the independently reparsed raw method must agree;
+    // neither supported method may borrow the other's proof.
+    reset_forged(false);
+    forged.req_method = static_cast<u8>(LogHttpMethod::Put);
+    CHECK_FALSE(exact_strict_local_response_delete_request_is_admitted(forged));
+    CHECK_FALSE(exact_strict_local_response_put_request_is_admitted(forged));
+    CHECK_FALSE(exact_strict_local_response_request_is_admitted(forged));
+    reset_forged(true);
+    forged.req_method = static_cast<u8>(LogHttpMethod::Delete);
+    CHECK_FALSE(exact_strict_local_response_delete_request_is_admitted(forged));
+    CHECK_FALSE(exact_strict_local_response_put_request_is_admitted(forged));
+    CHECK_FALSE(exact_strict_local_response_request_is_admitted(forged));
+
+    reset_forged(true);
+    forged.recv_buf.reset();
+    static constexpr char kPatch[] =
+        "PATCH /static HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n";
+    REQUIRE_EQ(forged.recv_buf.write(reinterpret_cast<const u8*>(kPatch), sizeof(kPatch) - 1u),
+               sizeof(kPatch) - 1u);
+    capture_request_metadata(forged);
+    REQUIRE_EQ(forged.req_method, static_cast<u8>(LogHttpMethod::Patch));
+    CHECK_FALSE(exact_strict_local_response_delete_request_is_admitted(forged));
+    CHECK_FALSE(exact_strict_local_response_put_request_is_admitted(forged));
+    CHECK_FALSE(exact_strict_local_response_request_is_admitted(forged));
 }
 
 TEST(exact_local_response, depth_one_matching_exclusions_fail_before_second_response) {
@@ -10517,6 +10810,7 @@ TEST(exact_local_response, depth_one_matching_exclusions_fail_before_second_resp
         "GET /static HTTP/1.1\r\nHost: x\r\n\r\n",
         "POST /static HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n",
         "DELETE /static HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n",
+        "PUT /static HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n",
         "POST /static HTTP/1.1\r\nHost: x\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
         "GET /static HTTP/1.1\r\nHost: x\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
         "GET /static HTTP/1.1\r\nHost: x\r\nConnection: close, keep-alive\r\n\r\n",

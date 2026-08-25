@@ -585,7 +585,19 @@ inline bool exact_strict_local_response_single_cl0_post_request_is_admitted(
            conn.req_content_length == 0 && exact_close && http1_pipeline_request_is_legacy(conn);
 }
 
-inline bool exact_strict_local_response_delete_wire_is_admitted(const Connection& conn) {
+inline bool exact_strict_local_response_fresh_method_pair_is_supported(
+    LogHttpMethod metadata_method, HttpMethod raw_method) {
+    return (metadata_method == LogHttpMethod::Delete && raw_method == HttpMethod::DELETE) ||
+           (metadata_method == LogHttpMethod::Put && raw_method == HttpMethod::PUT);
+}
+
+inline bool exact_strict_local_response_fresh_method_wire_is_admitted(
+    const Connection& conn,
+    LogHttpMethod expected_metadata_method,
+    HttpMethod expected_raw_method) {
+    if (!exact_strict_local_response_fresh_method_pair_is_supported(expected_metadata_method,
+                                                                    expected_raw_method))
+        return false;
     if (conn.recv_buf.data() == nullptr || conn.recv_buf.len() == 0) return false;
     HttpParser parser;
     ParsedRequest request;
@@ -593,7 +605,7 @@ inline bool exact_strict_local_response_delete_wire_is_admitted(const Connection
     request.reset();
     if (parser.parse(conn.recv_buf.data(), conn.recv_buf.len(), &request) !=
             ParseStatus::Complete ||
-        parser.header_end != conn.recv_buf.len() || request.method != HttpMethod::DELETE ||
+        parser.header_end != conn.recv_buf.len() || request.method != expected_raw_method ||
         request.version != HttpVersion::Http11 || request.path.ptr == nullptr ||
         request.path.len == 0 || request.path.ptr[0] != '/' || request.path_canon.ptr == nullptr ||
         request.has_content_length || request.content_length_count != 0 || request.chunked ||
@@ -623,16 +635,23 @@ inline bool exact_strict_local_response_delete_wire_is_admitted(const Connection
     return connection_count == 1;
 }
 
-inline bool exact_strict_local_response_delete_request_is_admitted(const Connection& conn) {
+inline bool exact_strict_local_response_fresh_method_request_is_admitted(
+    const Connection& conn,
+    LogHttpMethod expected_metadata_method,
+    HttpMethod expected_raw_method) {
+    if (!exact_strict_local_response_fresh_method_pair_is_supported(expected_metadata_method,
+                                                                    expected_raw_method))
+        return false;
     const bool exact_close =
         !conn.req_keep_alive && !conn.req_client_keep_alive && conn.req_client_connection_close &&
         conn.req_client_connection_close_exact && conn.req_client_connection_count == 1;
     return exact_strict_local_response_base_request_shape_is_admitted(conn) &&
-           conn.req_method == static_cast<u8>(LogHttpMethod::Delete) &&
+           conn.req_method == static_cast<u8>(expected_metadata_method) &&
            exact_strict_local_response_header_absent_framing_is_admitted(conn) && exact_close &&
            conn.req_client_transfer_encoding == RequestTransferEncoding::None &&
            http1_pipeline_request_is_legacy(conn) && conn.downstream_completed_request_count == 0 &&
-           exact_strict_local_response_delete_wire_is_admitted(conn) &&
+           exact_strict_local_response_fresh_method_wire_is_admitted(
+               conn, expected_metadata_method, expected_raw_method) &&
            !conn.http1_pipeline_boundary_owners_settled && conn.pipeline_stash_len == 0 &&
            conn.send_buf.len() == 0 && conn.send_progress == 0 && !conn.send_armed &&
            conn.on_send == nullptr && conn.response_read_deadline_owner_is_neutral() &&
@@ -645,6 +664,26 @@ inline bool exact_strict_local_response_delete_request_is_admitted(const Connect
            http1_pipeline_successor_upstream_owners_are_neutral(conn) &&
            !conn.request_upload_complete && conn.retry_req_send_len == 0 &&
            conn.upstream_attempts == 0;
+}
+
+inline bool exact_strict_local_response_delete_wire_is_admitted(const Connection& conn) {
+    return exact_strict_local_response_fresh_method_wire_is_admitted(
+        conn, LogHttpMethod::Delete, HttpMethod::DELETE);
+}
+
+inline bool exact_strict_local_response_delete_request_is_admitted(const Connection& conn) {
+    return exact_strict_local_response_fresh_method_request_is_admitted(
+        conn, LogHttpMethod::Delete, HttpMethod::DELETE);
+}
+
+inline bool exact_strict_local_response_put_wire_is_admitted(const Connection& conn) {
+    return exact_strict_local_response_fresh_method_wire_is_admitted(
+        conn, LogHttpMethod::Put, HttpMethod::PUT);
+}
+
+inline bool exact_strict_local_response_put_request_is_admitted(const Connection& conn) {
+    return exact_strict_local_response_fresh_method_request_is_admitted(
+        conn, LogHttpMethod::Put, HttpMethod::PUT);
 }
 
 inline bool exact_strict_local_response_request_is_admitted(const Connection& conn) {
@@ -671,7 +710,8 @@ inline bool exact_strict_local_response_request_is_admitted(const Connection& co
                conn.retry_req_send_len == 0 && conn.upstream_attempts <= 1;
     }
     if (exact_strict_local_response_single_cl0_post_request_is_admitted(conn)) return true;
-    return exact_strict_local_response_delete_request_is_admitted(conn);
+    if (exact_strict_local_response_delete_request_is_admitted(conn)) return true;
+    return exact_strict_local_response_put_request_is_admitted(conn);
 }
 bool pipeline_stash(Connection& conn);
 bool pipeline_recover(Connection& conn);
