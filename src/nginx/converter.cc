@@ -125,16 +125,15 @@ Span pre_route_trace_span(const Server& server) {
                                                       : model_span(server);
 }
 
-FrontendResult<bool> validate_pre_route_trace(const Server& server, bool exact_present) {
+FrontendResult<bool> validate_pre_route_trace(const Server& server, bool root_present) {
     const ImplicitPreRouteTrace& trace = server.pre_route_trace;
     switch (trace.profile) {
         case ImplicitPreRouteProfile::None:
             if (!is_default_span(trace.span))
                 return unsupported(pre_route_trace_span(server),
                                    lit_str("invalid absent pre-route TRACE model"));
-            if (exact_present)
-                return unsupported(exact_local_return_span(server),
-                                   lit_str("missing pre-route TRACE model"));
+            if (root_present)
+                return unsupported(model_span(server), lit_str("missing pre-route TRACE model"));
             return false;
         case ImplicitPreRouteProfile::Nginx1297PreLocationTrace405:
             break;
@@ -142,14 +141,13 @@ FrontendResult<bool> validate_pre_route_trace(const Server& server, bool exact_p
             return unsupported(pre_route_trace_span(server),
                                lit_str("invalid pre-route TRACE profile model"));
     }
-    if (!exact_present)
-        return unsupported(pre_route_trace_span(server),
-                           lit_str("pre-route TRACE requires exact local return"));
-    const ExactLocalReturnLocation& exact = server.exact_local_return;
     if (!is_valid_span(trace.span) || !span_position_is_coherent(server.span, trace.span) ||
-        trace.span.start != exact.span.start || trace.span.end != exact.span.end ||
-        trace.span.line != exact.span.line || trace.span.col != exact.span.col)
+        trace.span.start != server.span.start || trace.span.end != server.span.end ||
+        trace.span.line != server.span.line || trace.span.col != server.span.col)
         return unsupported(pre_route_trace_span(server), lit_str("invalid pre-route TRACE spans"));
+    if (!root_present)
+        return unsupported(pre_route_trace_span(server),
+                           lit_str("pre-route TRACE requires location / proxy fallback"));
     return true;
 }
 
@@ -411,8 +409,6 @@ bool put_exact_local_return(Writer& writer, Str body) {
 FrontendResult<RutSource> lower_to_rut(const Server& server) {
     auto exact_local_return = validate_exact_local_return(server);
     if (!exact_local_return) return core::make_unexpected(exact_local_return.error());
-    auto pre_route_trace = validate_pre_route_trace(server, exact_local_return.value());
-    if (!pre_route_trace) return core::make_unexpected(pre_route_trace.error());
     auto timeout = validate_proxy_read_timeout(server);
     if (!timeout) return core::make_unexpected(timeout.error());
     if (server.listen.port == 0)
@@ -422,6 +418,8 @@ FrontendResult<RutSource> lower_to_rut(const Server& server) {
     if (!is_root && !is_api)
         return unsupported(server.location.path_span,
                            lit_str("converter requires location / or /api/"));
+    auto pre_route_trace = validate_pre_route_trace(server, is_root);
+    if (!pre_route_trace) return core::make_unexpected(pre_route_trace.error());
     if (exact_local_return.value() && !is_root)
         return unsupported(server.exact_local_return.span,
                            lit_str("exact local return requires location / fallback"));

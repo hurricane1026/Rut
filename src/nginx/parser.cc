@@ -177,9 +177,14 @@ public:
         if (have_exact_location && !eq(result.location.path, "/", 1))
             return unsupported(result.location.path_span,
                                lit_str("exact location requires location / proxy fallback"));
-        if (have_exact_location) {
+        // nginx rejects TRACE during request processing before location
+        // selection for every accepted root-proxy server in this bounded
+        // model.  Keep the provenance at the semantic server level so the
+        // profile has one invariant independent of optional exact locations
+        // and declaration order.
+        if (eq(result.location.path, "/", 1)) {
             result.pre_route_trace.profile = ImplicitPreRouteProfile::Nginx1297PreLocationTrace405;
-            result.pre_route_trace.span = result.exact_local_return.span;
+            result.pre_route_trace.span = result.span;
         }
         if (cur_.kind != TokenKind::End) {
             if (cur_.kind == TokenKind::Word && eq(cur_.text, "server", 6))

@@ -66,8 +66,9 @@ enum class ImplicitPreRouteProfile : u8 {
 };
 
 // nginx rejects TRACE during request processing, before location selection, in
-// the bounded root-proxy plus exact-local fragment. `span` is the exact source
-// location whose accepted shape establishes that semantic fact.
+// every accepted bounded root-proxy fragment. `span` is the complete semantic
+// server span whose accepted shape establishes that fact; using one server-
+// level provenance convention keeps root-only and exact-root models identical.
 struct ImplicitPreRouteTrace {
     ImplicitPreRouteProfile profile = ImplicitPreRouteProfile::None;
     Span span{};

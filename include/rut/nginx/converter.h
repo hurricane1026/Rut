@@ -12,10 +12,11 @@ namespace rut::nginx {
 struct RutSource {
     // The root model emits three method-keyed forward routes (HEAD, GET, and
     // method-omitted ANY) plus three bounded unmatched policies and one bounded
-    // exact local response. The exact-root model additionally emits the
-    // implicit pre-route TRACE policy. The exact measured maximum uses listen
-    // and upstream port 65535, IPv4 255.255.255.255, and a 64-byte body: 5609
-    // bytes. Writer completion remains strict (`len < kCapacity`).
+    // exact local response. Every accepted root model additionally emits the
+    // implicit pre-route TRACE policy. The exact-root measured maximum uses
+    // listen and upstream port 65535, IPv4 255.255.255.255, and a 64-byte
+    // body: 5609 bytes; the root-only maximum is smaller. Writer completion
+    // remains strict (`len < kCapacity`).
     static constexpr u32 kCapacity = 5610;
     char data[kCapacity]{};
     u32 len = 0;
