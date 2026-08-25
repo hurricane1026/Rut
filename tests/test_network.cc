@@ -9720,9 +9720,10 @@ TEST(exact_local_response,
     loop.inject_and_dispatch(
         make_ev(sequential->id, IoEventType::Send, static_cast<i32>(head_len)));
 
-    // Phase 1 of #295 is ownership-only: even after one successful request on
-    // the same keep-alive transport, DELETE remains fail-closed with no response
-    // or upstream publication and no successful-request accounting.
+    // The bounded DELETE branch is fresh-transport only. Even after one
+    // successful request on the same keep-alive transport it remains
+    // fail-closed with no response or upstream publication and no successful
+    // request accounting.
     loop.backend.clear_ops();
     Connection* sequential_delete =
         dispatch_unmatched_request(loop, *valid, "GET /static HTTP/1.1\r\nHost: x\r\n\r\n");
@@ -9835,8 +9836,8 @@ TEST(exact_local_response,
             REQUIRE_EQ(parsed.transfer_encoding, RequestTransferEncoding::None);
         };
 
-    closes_without_effect(
-        *valid, "DELETE /static HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n", 2);
+    dispatch_and_finish(
+        *valid, "DELETE /static HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n", 200, true);
     closes_without_effect(
         *valid, "DELETE /static?x=1 HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n", 2);
 
@@ -9961,6 +9962,8 @@ TEST(exact_local_response,
     REQUIRE(firewall->add_firewall_deny_ip("0.0.0.0"));
     dispatch_and_finish(
         *firewall, "GET /static HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n", 403, false);
+    dispatch_and_finish(
+        *firewall, "DELETE /static HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n", 403, false);
 
     auto forged_tail = std::make_unique<RouteConfig>();
     forged_tail->exact_strict_local_response_bindings[15].reserved1 = 1;
@@ -10203,10 +10206,317 @@ TEST(exact_local_response,
     CHECK_FALSE(exact_strict_local_response_request_is_admitted(forged));
 }
 
+TEST(exact_local_response,
+     fresh_header_absent_delete_lifecycle_config_pin_and_send_failure_are_exact) {
+    SmallLoop loop;
+    loop.setup();
+    ShardMetrics metrics{};
+    metrics.init();
+    AccessLogRing access{};
+    access.init();
+    CaptureRing capture{};
+    capture.init();
+    ShardEpoch epoch{};
+    loop.metrics = &metrics;
+    loop.access_log = &access;
+    loop.epoch = &epoch;
+    REQUIRE(loop.set_capture(&capture));
+
+    RouteConfig config{};
+    REQUIRE(install_representation200_exact(config, "/static"));
+    const RouteConfig* active = &config;
+    loop.config_ptr = &active;
+    static constexpr char kDelete[] =
+        "DELETE /static HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n";
+
+    loop.backend.clear_ops();
+    Connection* conn = dispatch_unmatched_request(loop, config, kDelete);
+    REQUIRE(conn != nullptr);
+    const u32 id = conn->id;
+    REQUIRE_EQ(conn->resp_status, 200u);
+    CHECK_EQ(conn->req_method, static_cast<u8>(LogHttpMethod::Delete));
+    CHECK(conn->req_strict_h1_complete);
+    CHECK_EQ(conn->req_http_version, static_cast<u8>(HttpVersion::Http11));
+    CHECK_FALSE(conn->req_client_has_content_length);
+    CHECK_EQ(conn->req_client_content_length_count, 0u);
+    CHECK_EQ(conn->req_content_length, 0u);
+    CHECK_EQ(conn->req_body_mode, BodyMode::None);
+    CHECK_EQ(conn->req_body_remaining, 0u);
+    CHECK_EQ(conn->req_header_end, sizeof(kDelete) - 1u);
+    CHECK_EQ(conn->req_initial_send_len, sizeof(kDelete) - 1u);
+    CHECK_EQ(conn->recv_buf.len(), sizeof(kDelete) - 1u);
+    CHECK_FALSE(conn->req_keep_alive);
+    CHECK_FALSE(conn->req_client_keep_alive);
+    CHECK(conn->req_client_connection_close);
+    CHECK(conn->req_client_connection_close_exact);
+    CHECK_EQ(conn->req_client_connection_count, 1u);
+    CHECK_EQ(conn->pipeline_depth, 0u);
+    CHECK_EQ(conn->http1_pipeline_request_generation, 0u);
+    CHECK_EQ(conn->downstream_completed_request_count, 0u);
+    CHECK_EQ(conn->request_config, &config);
+    CHECK_EQ(conn->upstream_fd, -1);
+    CHECK_FALSE(conn->upstream_slot_held);
+    CHECK_EQ(conn->upstream_attempts, 0u);
+    CHECK_EQ(conn->retry_req_send_len, 0u);
+    CHECK_EQ(loop.backend.count_ops(MockOp::Connect), 0u);
+    CHECK_EQ(loop.backend.count_ops(MockOp::Send), 1u);
+    CHECK_EQ(metrics.requests_total, 0u);
+    CHECK_EQ(metrics.requests_active, 1u);
+    CHECK_EQ(access.available(), 0u);
+    CHECK_EQ(capture.available(), 0u);
+    CHECK_EQ(epoch.epoch.load(std::memory_order_acquire), 1u);
+
+    u8 normalized[SmallLoop::kBufSize]{};
+    const u32 wire_len = conn->send_buf.len();
+    REQUIRE(wire_len <= sizeof(normalized));
+    __builtin_memcpy(normalized, conn->send_buf.data(), wire_len);
+    REQUIRE(normalize_redirect_date(normalized, wire_len));
+    const std::string expected = expected_representation200_wire(false, false);
+    REQUIRE_EQ(wire_len, static_cast<u32>(expected.size()));
+    CHECK_EQ(__builtin_memcmp(normalized, expected.data(), expected.size()), 0);
+
+    // Once staged, the selected response remains owned by the request's pinned
+    // config even if the active pointer changes before partial Send retirement.
+    RouteConfig replacement{};
+    auto replacement_policy = make_representation200_policy();
+    replacement_policy.body = {"replacement-body", 16};
+    u16 replacement_unmatched[kStrictLocalResponseMethodSlots]{};
+    ExactStrictLocalResponseBinding replacement_exact[kMaxExactStrictLocalResponseBindings]{};
+    replacement_exact[0] = make_exact_local_binding("/static", kRouteMethodAny, 1);
+    REQUIRE(replacement.install_strict_local_response_table(
+        &replacement_policy, 1, replacement_unmatched, replacement_exact, 1));
+    active = &replacement;
+    loop.config_ptr = &active;
+    CHECK_EQ(conn->request_config, &config);
+    static constexpr u32 kPartial = 7;
+    REQUIRE_GT(wire_len, kPartial);
+    loop.inject_and_dispatch(make_ev(id, IoEventType::Send, kPartial));
+    CHECK_EQ(conn->downstream_completed_request_count, 0u);
+    CHECK_EQ(conn->send_progress, kPartial);
+    CHECK_EQ(metrics.requests_total, 0u);
+    CHECK_EQ(metrics.requests_active, 1u);
+    CHECK_EQ(access.available(), 0u);
+    CHECK_EQ(capture.available(), 0u);
+    CHECK_EQ(epoch.epoch.load(std::memory_order_acquire), 1u);
+    const MockOp* remainder = loop.backend.last_op(MockOp::Send);
+    REQUIRE(remainder != nullptr);
+    CHECK_EQ(remainder->send_buf, conn->send_buf.data() + kPartial);
+    CHECK_EQ(remainder->send_len, wire_len - kPartial);
+    loop.inject_and_dispatch(make_ev(id, IoEventType::Send, wire_len - kPartial));
+    CHECK_EQ(loop.free_top, SmallLoop::kMaxConns);
+    CHECK_EQ(metrics.requests_total, 1u);
+    CHECK_EQ(metrics.requests_active, 0u);
+    CHECK_EQ(metrics.request_latency.count, 1u);
+    CHECK_EQ(access.available(), 1u);
+    CHECK_EQ(capture.available(), 1u);
+    CHECK_EQ(epoch.epoch.load(std::memory_order_acquire), 2u);
+    AccessLogEntry access_entry{};
+    REQUIRE(access.pop(access_entry));
+    CHECK_EQ(access_entry.status, 200u);
+    CHECK_EQ(access_entry.method, static_cast<u8>(LogHttpMethod::Delete));
+    CHECK_EQ(access_entry.resp_size, wire_len);
+    CHECK_EQ(access_entry.upstream_us, 0u);
+    CaptureEntry capture_entry{};
+    REQUIRE(capture.pop(capture_entry));
+    CHECK_EQ(capture_entry.resp_status, 200u);
+    CHECK_EQ(capture_entry.method, static_cast<u8>(LogHttpMethod::Delete));
+    CHECK_EQ(capture_entry.req_content_length, 0u);
+    CHECK_EQ(capture_entry.resp_content_length, wire_len);
+    CHECK_EQ(capture_entry.raw_header_len, sizeof(kDelete) - 1u);
+    CHECK_EQ(__builtin_memcmp(capture_entry.raw_headers, kDelete, sizeof(kDelete) - 1u), 0);
+    CHECK_EQ(access.available(), 0u);
+    CHECK_EQ(capture.available(), 0u);
+    CHECK_EQ(loop.backend.count_ops(MockOp::Connect), 0u);
+
+    // EPIPE releases request/epoch ownership exactly once but never publishes
+    // successful completion, access, capture, or an upstream attempt.
+    active = &config;
+    loop.backend.clear_ops();
+    Connection* failed = dispatch_unmatched_request(loop, config, kDelete);
+    REQUIRE(failed != nullptr);
+    const u32 failed_id = failed->id;
+    CHECK_EQ(failed->downstream_completed_request_count, 0u);
+    CHECK_EQ(metrics.requests_active, 1u);
+    CHECK_EQ(epoch.epoch.load(std::memory_order_acquire), 3u);
+    CHECK_EQ(loop.backend.count_ops(MockOp::Connect), 0u);
+    loop.inject_and_dispatch(make_ev(failed_id, IoEventType::Send, -EPIPE));
+    CHECK_EQ(loop.free_top, SmallLoop::kMaxConns);
+    CHECK_EQ(metrics.requests_total, 1u);
+    CHECK_EQ(metrics.requests_active, 0u);
+    CHECK_EQ(metrics.request_latency.count, 1u);
+    CHECK_EQ(access.available(), 0u);
+    CHECK_EQ(capture.available(), 0u);
+    CHECK_EQ(epoch.epoch.load(std::memory_order_acquire), 4u);
+    CHECK_EQ(loop.backend.count_ops(MockOp::Connect), 0u);
+}
+
+TEST(exact_local_response, fresh_header_absent_delete_exclusions_and_forged_owners_fail_closed) {
+    SmallLoop loop;
+    loop.setup();
+    ShardMetrics metrics{};
+    metrics.init();
+    AccessLogRing access{};
+    access.init();
+    CaptureRing capture{};
+    capture.init();
+    ShardEpoch epoch{};
+    loop.metrics = &metrics;
+    loop.access_log = &access;
+    loop.epoch = &epoch;
+    REQUIRE(loop.set_capture(&capture));
+    RouteConfig config{};
+    REQUIRE(install_representation200_exact(config, "/static"));
+
+    auto closes_without_effect = [&](const char* request, u64 expected_epoch_delta) {
+        loop.backend.clear_ops();
+        const u32 free_before = loop.free_top;
+        const u64 requests_before = metrics.requests_total;
+        const u64 active_before = metrics.requests_active;
+        const u32 access_before = access.available();
+        const u32 capture_before = capture.available();
+        const u64 epoch_before = epoch.epoch.load(std::memory_order_acquire);
+        Connection* rejected = dispatch_unmatched_request(loop, config, request);
+        REQUIRE(rejected != nullptr);
+        CHECK_EQ(loop.free_top, free_before);
+        CHECK_EQ(rejected->fd, -1);
+        CHECK_EQ(rejected->downstream_completed_request_count, 0u);
+        CHECK_EQ(rejected->upstream_fd, -1);
+        CHECK_FALSE(rejected->upstream_slot_held);
+        CHECK_EQ(rejected->upstream_attempts, 0u);
+        CHECK_EQ(loop.backend.count_ops(MockOp::Send), 0u);
+        CHECK_EQ(loop.backend.count_ops(MockOp::Connect), 0u);
+        CHECK_EQ(metrics.requests_total, requests_before);
+        CHECK_EQ(metrics.requests_active, active_before);
+        CHECK_EQ(access.available(), access_before);
+        CHECK_EQ(capture.available(), capture_before);
+        CHECK_EQ(epoch.epoch.load(std::memory_order_acquire), epoch_before + expected_epoch_delta);
+    };
+
+    static constexpr const char* kAdmittedParseRejected[] = {
+        "DELETE /static HTTP/1.1\r\nHost: x\r\n\r\n",
+        "DELETE /static HTTP/1.1\r\nHost: x\r\nConnection: close\r\nConnection: close\r\n\r\n",
+        "DELETE /static HTTP/1.1\r\nHost: x\r\nConnection: close, close\r\n\r\n",
+        "DELETE /static? HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n",
+        "DELETE /static?x=1 HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n",
+        "DELETE /static HTTP/1.1\r\nHost: x\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+        "DELETE /static HTTP/1.1\r\nHost: x\r\nContent-Length: 0\r\nContent-Length: "
+        "0\r\nConnection: close\r\n\r\n",
+        "DELETE /static HTTP/1.1\r\nHost: x\r\nContent-Length: 1\r\nConnection: close\r\n\r\n",
+        "DELETE /static HTTP/1.1\r\nHost: x\r\nContent-Length: 1\r\nConnection: close\r\n\r\nx",
+        "DELETE /static HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\nConnection: "
+        "close\r\n\r\n",
+        "DELETE /static HTTP/1.1\r\nHost: x\r\nTE: trailers\r\nConnection: close\r\n\r\n",
+        "DELETE /static HTTP/1.1\r\nHost: x\r\nExpect: 100-continue\r\nConnection: close\r\n\r\n",
+        "DELETE /static HTTP/1.1\r\nHost: x\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n\r\n",
+        "DELETE /static HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\nx",
+        "DELETE /static HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\nGET /next "
+        "HTTP/1.1\r\nHost: x\r\n\r\n",
+        "PUT /static HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n",
+        "PATCH /static HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n",
+        "TRACE /static HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n",
+    };
+    for (const char* request : kAdmittedParseRejected) closes_without_effect(request, 2);
+
+    static constexpr const char* kEarlyRejected[] = {
+        "DELETE /static#fragment HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n",
+        "DELETE /static HTTP/1.0\r\nHost: x\r\nConnection: close\r\n\r\n",
+        "DELETE http://example.test/static HTTP/1.1\r\nHost: example.test\r\nConnection: "
+        "close\r\n\r\n",
+        "DELETE example.test:80 HTTP/1.1\r\nHost: example.test\r\nConnection: close\r\n\r\n",
+        "DELETE /static HTTP/1.1\r\nHost: x\r\nContent-Length: nope\r\nConnection: close\r\n\r\n",
+        "DELETE /static HTTP/1.1\r\nHost: x\r\nContent-Length: 0\r\nContent-Length: "
+        "1\r\nConnection: close\r\n\r\n",
+        "DELETE /static HTTP/1.1\r\nHost: x\r\nContent-Length: 0\r\nTransfer-Encoding: "
+        "chunked\r\nConnection: close\r\n\r\n",
+        "BREW /static HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n",
+    };
+    for (const char* request : kEarlyRejected) closes_without_effect(request, 0);
+
+    Connection forged{};
+    u8 recv[512]{}, send[512]{}, upstream[512]{}, response[512]{};
+    auto reset_forged = [&]() {
+        forged.reset();
+        // Quarantine is deliberately sticky across slot reset. This forged
+        // fixture models a canonical fresh transport for each independent
+        // mutation, so clear the prior case's synthetic quarantine explicitly.
+        forged.upstream_episode_quarantined = false;
+        forged.recv_slice = recv;
+        forged.send_slice = send;
+        forged.upstream_recv_slice = upstream;
+        forged.response_header_slice = response;
+        forged.recv_buf.bind(recv, sizeof(recv));
+        forged.send_buf.bind(send, sizeof(send));
+        forged.upstream_recv_buf.bind(upstream, sizeof(upstream));
+        forged.response_header_buf.bind(response, sizeof(response));
+        static constexpr char kDelete[] =
+            "DELETE /static HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n";
+        REQUIRE_EQ(
+            forged.recv_buf.write(reinterpret_cast<const u8*>(kDelete), sizeof(kDelete) - 1u),
+            sizeof(kDelete) - 1u);
+        capture_request_metadata(forged);
+        REQUIRE(exact_strict_local_response_delete_request_is_admitted(forged));
+    };
+    auto rejected = [&](auto mutate) {
+        reset_forged();
+        mutate(forged);
+        CHECK_FALSE(exact_strict_local_response_delete_request_is_admitted(forged));
+    };
+    rejected([](Connection& c) { c.downstream_completed_request_count = 1; });
+    rejected([](Connection& c) { c.req_client_connection_count = 2; });
+    rejected([](Connection& c) { c.req_client_connection_close_exact = false; });
+    rejected([](Connection& c) { c.req_keep_alive = true; });
+    rejected([](Connection& c) { c.req_client_keep_alive = true; });
+    rejected([](Connection& c) { c.req_client_has_content_length = true; });
+    rejected([](Connection& c) { c.req_client_content_length_count = 1; });
+    rejected([](Connection& c) { c.req_content_length = 1; });
+    rejected([](Connection& c) {
+        c.req_client_transfer_encoding = RequestTransferEncoding::FinalChunked;
+    });
+    rejected([](Connection& c) { c.req_client_has_transfer_encoding = true; });
+    rejected([](Connection& c) { c.req_client_has_te = true; });
+    rejected([](Connection& c) { c.req_client_has_expect = true; });
+    rejected([](Connection& c) { c.req_client_has_upgrade_header = true; });
+    rejected([](Connection& c) { c.req_body_remaining = 1; });
+    rejected([](Connection& c) { c.request_body_fully_buffered = true; });
+    rejected([](Connection& c) { c.request_upload_complete = true; });
+    rejected([](Connection& c) { c.req_body_streamed = true; });
+    rejected([](Connection& c) { c.pipeline_depth = 1; });
+    rejected([](Connection& c) { c.http1_pipeline_request_generation = 1; });
+    rejected([](Connection& c) { c.http1_pipeline_boundary_owners_settled = true; });
+    rejected([](Connection& c) { c.pipeline_stash_len = 1; });
+    rejected([](Connection& c) {
+        static constexpr u8 kByte = 'x';
+        (void)c.send_buf.write(&kByte, 1);
+    });
+    rejected([](Connection& c) { c.send_progress = 1; });
+    rejected([](Connection& c) { c.send_armed = true; });
+    rejected([](Connection& c) { c.on_send = &on_response_sent<SmallLoop>; });
+    rejected([](Connection& c) { c.response_read_deadline_owner_generation = 1; });
+    rejected([](Connection& c) { c.http1_prebuilt_wait = 1; });
+    rejected([](Connection& c) {
+        c.http1_prebuilt_response_layout = Http1PrebuiltResponseLayout::FullContentLengthNonHead;
+    });
+    rejected([](Connection& c) { c.http1_boundary_deferred = true; });
+    rejected([](Connection& c) { c.http1_boundary_ready = true; });
+    rejected([](Connection& c) { c.retry_req_send_len = 1; });
+    rejected([](Connection& c) { c.upstream_attempts = 1; });
+    rejected([](Connection& c) { c.upstream_fd = 99; });
+    rejected([](Connection& c) { c.upstream_slot_held = true; });
+    rejected([](Connection& c) { c.upstream_connect_armed = true; });
+    rejected([](Connection& c) { c.upstream_send_armed = true; });
+    rejected([](Connection& c) { c.upstream_recv_armed = true; });
+    rejected([](Connection& c) { c.on_upstream_recv = &on_upstream_response<SmallLoop>; });
+    rejected([](Connection& c) { c.idle_return_fd = 99; });
+    rejected([](Connection& c) { c.upstream_episode_quarantined = true; });
+    rejected([](Connection& c) { c.tls_active = true; });
+    rejected([](Connection& c) { c.protocol = ConnProtocol::Http2; });
+}
+
 TEST(exact_local_response, depth_one_matching_exclusions_fail_before_second_response) {
     static constexpr const char* kRejected[] = {
         "GET /static HTTP/1.1\r\nHost: x\r\n\r\n",
         "POST /static HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n",
+        "DELETE /static HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n",
         "POST /static HTTP/1.1\r\nHost: x\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
         "GET /static HTTP/1.1\r\nHost: x\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
         "GET /static HTTP/1.1\r\nHost: x\r\nConnection: close, keep-alive\r\n\r\n",
