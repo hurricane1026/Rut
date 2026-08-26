@@ -940,6 +940,7 @@ TEST(route_config, exact_strict_mixed_views_are_owned_and_match_with_explicit_pr
     auto config = std::make_unique<RouteConfig>();
     REQUIRE(config->install_strict_local_response_table(policies, 4, unmatched, bindings, 4));
     REQUIRE(config->strict_local_response_table_is_valid());
+    CHECK(config->has_slash_normalized_exact_strict_local_response_inventory());
 
     const auto expect = [&](Str raw, Str normalized, u8 method, u16 policy_id) {
         const auto result =
@@ -999,10 +1000,16 @@ TEST(route_config, exact_strict_mixed_views_are_owned_and_match_with_explicit_pr
     CHECK_EQ(after_source_lifetime.policy_id, 2u);
     CHECK(copied->strict_local_response_policies[1].body.eq({"norm-get", 8}));
     copied->exact_strict_local_response_bindings[0].reserved1 = 1;
+    CHECK_FALSE(copied->has_slash_normalized_exact_strict_local_response_inventory());
     const auto invalid_table = copied->match_exact_strict_local_response_views(
         {"/health/check/", 14}, {"/health/check/", 14}, kRouteMethodGet);
     CHECK_EQ(invalid_table.state, ExactStrictLocalResponseMatchState::InvalidInput);
     CHECK_EQ(invalid_table.policy_id, 0u);
+
+    auto forged_count = std::make_unique<RouteConfig>();
+    forged_count->exact_strict_local_response_binding_count =
+        kMaxExactStrictLocalResponseBindings + 1;
+    CHECK_FALSE(forged_count->has_slash_normalized_exact_strict_local_response_inventory());
 }
 
 TEST(route_config, exact_strict_mixed_view_capacity_and_normalized_duplicates_are_atomic) {

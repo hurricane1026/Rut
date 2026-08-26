@@ -132,16 +132,81 @@ inline bool configure_route_dispatch(RouteConfig& cfg, const rir::Module& mod) {
     return cfg.use_art();
 }
 
-// Call only after rir::verify_module has accepted the module: verification
-// proves the fixed-table count before this helper indexes the binding inventory.
-// Slash-normalized exact selectors may be owned by a prepared RouteConfig, but
-// production activation remains closed until request-time raw-target capture
-// and selection are introduced. Keep this check at the public JIT-registration
-// boundary before lookup, replay, or any destination mutation.
-inline bool verified_exact_path_views_are_runtime_supported(const rir::Module& mod) {
-    for (u32 i = 0; i < mod.exact_strict_local_response_binding_count; i++) {
-        if (mod.exact_strict_local_response_bindings[i].path_view != ExactPathView::Raw)
+inline bool module_has_strict_local_response_metadata(const rir::Module& mod) {
+    bool present = mod.strict_local_response_policy_count != 0 ||
+                   exact_strict_local_response_inventory_present(
+                       mod.exact_strict_local_response_bindings,
+                       mod.exact_strict_local_response_binding_count);
+    for (u32 slot = 0; slot < kStrictLocalResponseMethodSlots; slot++) {
+        present |= mod.pre_route_policy_ids[slot] != 0;
+        present |= mod.unmatched_policy_ids[slot] != 0;
+    }
+    return present;
+}
+
+// Activation must not silently drop verified source metadata when a caller
+// bypasses populate_route_config. Rebuild the source table through the same
+// owning/deduplicating transaction used by population, then compare its
+// complete remapped representation with the destination. The caller must
+// verify mod before entering this function: public counts are scanned here.
+inline bool strict_local_response_activation_matches(const RouteConfig& cfg,
+                                                      const rir::Module& mod) {
+    if (!cfg.strict_local_response_table_is_valid()) return false;
+
+    std::unique_ptr<RouteConfig> expected(new (std::nothrow) RouteConfig());
+    if (!expected) return false;
+    if (module_has_strict_local_response_metadata(mod) &&
+        !expected->install_strict_local_response_table_with_pre_route(
+            mod.strict_local_response_policies,
+            mod.strict_local_response_policy_count,
+            mod.pre_route_policy_ids,
+            mod.unmatched_policy_ids,
+            mod.exact_strict_local_response_bindings,
+            mod.exact_strict_local_response_binding_count))
+        return false;
+
+    if (cfg.strict_local_response_policy_count != expected->strict_local_response_policy_count ||
+        cfg.exact_strict_local_response_binding_count !=
+            expected->exact_strict_local_response_binding_count)
+        return false;
+    // Policy IDs are representation-local. Compare policy semantics and then
+    // resolve every selector through its table's owned ID, so an independently
+    // built but correctly remapped destination is accepted.
+    for (u32 wanted = 0; wanted < expected->strict_local_response_policy_count; wanted++) {
+        bool found = false;
+        for (u32 actual = 0; actual < cfg.strict_local_response_policy_count; actual++)
+            found |= strict_local_response_policy_spec_equal(
+                cfg.strict_local_response_policies[actual],
+                expected->strict_local_response_policies[wanted]);
+        if (!found) return false;
+    }
+    auto mapped_policy_equal = [&](u16 actual_id, u16 wanted_id) {
+        if (actual_id == 0 || wanted_id == 0) return actual_id == wanted_id;
+        return strict_local_response_policy_spec_equal(
+            cfg.strict_local_response_policies[actual_id - 1],
+            expected->strict_local_response_policies[wanted_id - 1]);
+    };
+    for (u32 slot = 0; slot < kStrictLocalResponseMethodSlots; slot++) {
+        if (!mapped_policy_equal(cfg.pre_route_policy_ids[slot],
+                                 expected->pre_route_policy_ids[slot]) ||
+            !mapped_policy_equal(cfg.unmatched_policy_ids[slot],
+                                 expected->unmatched_policy_ids[slot]))
             return false;
+    }
+    for (u32 i = 0; i < expected->exact_strict_local_response_binding_count; i++) {
+        const auto& wanted = expected->exact_strict_local_response_bindings[i];
+        bool found = false;
+        for (u32 j = 0; j < cfg.exact_strict_local_response_binding_count; j++) {
+            const auto& actual = cfg.exact_strict_local_response_bindings[j];
+            if (actual.path_len == wanted.path_len && actual.method == wanted.method &&
+                actual.path_view == wanted.path_view &&
+                __builtin_memcmp(actual.path, wanted.path, actual.path_len) == 0 &&
+                mapped_policy_equal(actual.policy_id, wanted.policy_id)) {
+                found = true;
+                break;
+            }
+        }
+        if (!found) return false;
     }
     return true;
 }
@@ -153,10 +218,10 @@ inline bool register_jit_routes(RouteConfig& cfg, const rir::Module& mod, jit::J
     if (cfg.route_count != 0 || cfg.timer_count != 0 || !rir::verify_module(mod).ok ||
         mod.func_count > RouteConfig::kMaxRoutes + RouteConfig::kMaxTimers)
         return false;
-    // This public activation entry can be called without populate_route_config.
-    // Reject not-yet-active metadata before symbol lookup, replay, dispatcher
-    // selection, or any other destination mutation.
-    if (!verified_exact_path_views_are_runtime_supported(mod)) return false;
+    // This is the first post-verification gate and precedes symbol lookup,
+    // dispatch probing, or destination mutation. A direct caller must provide
+    // the complete owned metadata installed by populate_route_config.
+    if (!strict_local_response_activation_matches(cfg, mod)) return false;
     if (cfg.policy_bundle_count != mod.policy_bundle_count) return false;
     for (u32 i = 0; i < mod.policy_bundle_count; i++) {
         const auto& expected = mod.policy_bundles[i];
@@ -394,17 +459,8 @@ inline bool populate_route_config(RouteConfig& cfg, const rir::Module& mod) {
     // rejection transactional even though the legacy population helper permits
     // unrelated later failures to leave a discardable partial config. The
     // metadata-absent legacy path performs no new allocation or commit.
-    bool source_has_strict_local_response_metadata =
-        mod.strict_local_response_policy_count != 0 ||
-        exact_strict_local_response_inventory_present(
-            mod.exact_strict_local_response_bindings,
-            mod.exact_strict_local_response_binding_count);
-    for (u32 slot = 0; slot < kStrictLocalResponseMethodSlots; slot++) {
-        source_has_strict_local_response_metadata |= mod.pre_route_policy_ids[slot] != 0;
-        source_has_strict_local_response_metadata |= mod.unmatched_policy_ids[slot] != 0;
-    }
     std::unique_ptr<RouteConfig> strict_local_response_probe;
-    if (source_has_strict_local_response_metadata) {
+    if (module_has_strict_local_response_metadata(mod)) {
         strict_local_response_probe.reset(new (std::nothrow) RouteConfig());
         if (!strict_local_response_probe ||
             !strict_local_response_probe->install_strict_local_response_table_with_pre_route(

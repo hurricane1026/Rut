@@ -569,6 +569,58 @@ inline bool exact_strict_local_response_header_absent_framing_is_admitted(const 
            conn.req_content_length == 0;
 }
 
+enum class SlashNormalizedExactSelectionState : u8 {
+    InvalidInput = 0,
+    Miss = 1,
+    Match = 2,
+};
+
+struct SlashNormalizedExactSelectionResult {
+    SlashNormalizedExactSelectionState state;
+    u16 policy_id;
+};
+
+// Select from a validated mixed-view exact table using only the checked H1
+// full-target witness. This function owns no persistent normalized storage and
+// never changes the recv/log/forward target. OutputOverflow is a proven miss
+// for the normalized view but still permits an exact match against the complete
+// Raw view.
+inline SlashNormalizedExactSelectionResult select_slash_normalized_exact_strict_local_response(
+    const Connection& conn, const RouteConfig& config, u8 method_key) {
+    const SlashNormalizedExactSelectionResult invalid{
+        SlashNormalizedExactSelectionState::InvalidInput, 0};
+    if (!config.has_slash_normalized_exact_strict_local_response_inventory() ||
+        conn.req_target_has_fragment || method_key == kRouteMethodInvalid ||
+        method_key == kRouteMethodAny ||
+        route_method_slot_from_key(method_key) == kRouteMethodSlotInvalid)
+        return invalid;
+
+    const auto raw_witness = conn.checked_raw_request_target();
+    if (raw_witness.state != RawRequestTargetWitnessState::Valid) return invalid;
+
+    char normalized[kMaxExactPathViewLen]{};
+    u32 normalized_len = 0;
+    const auto normalized_result = normalize_exact_path_slashes(
+        raw_witness.target, normalized, sizeof(normalized), &normalized_len);
+    if (normalized_result == ExactPathNormalizationResult::InvalidInput) return invalid;
+    if (normalized_result == ExactPathNormalizationResult::OutputOverflow) {
+        const u16 raw_policy_id =
+            config.match_exact_strict_local_response(raw_witness.target, method_key);
+        return raw_policy_id != 0
+                   ? SlashNormalizedExactSelectionResult{SlashNormalizedExactSelectionState::Match,
+                                                         raw_policy_id}
+                   : SlashNormalizedExactSelectionResult{SlashNormalizedExactSelectionState::Miss,
+                                                         0};
+    }
+
+    const auto match = config.match_exact_strict_local_response_views(
+        raw_witness.target, Str{normalized, normalized_len}, method_key);
+    if (match.state == ExactStrictLocalResponseMatchState::InvalidInput) return invalid;
+    if (match.state == ExactStrictLocalResponseMatchState::Match)
+        return {SlashNormalizedExactSelectionState::Match, match.policy_id};
+    return {SlashNormalizedExactSelectionState::Miss, 0};
+}
+
 inline bool pre_route_strict_local_response_wire_is_admitted(const Connection& conn,
                                                              u8 selected_method_key) {
     if (selected_method_key == kRouteMethodAny ||
@@ -2054,13 +2106,28 @@ void on_header_received(void* lp, Connection& conn, IoEvent ev) {
     RouteParam route_params[kMaxRouteParams]{};
     u32 route_param_count = 0;
     if (config) {
-        u32 raw_target_len = 0;
-        while (raw_target_len < sizeof(conn.req_path) && conn.req_path[raw_target_len] != '\0')
-            raw_target_len++;
-        const u16 exact_policy_id =
-            has_exact_inventory ? config->match_exact_strict_local_response(
-                                      Str{conn.req_path, raw_target_len}, request_method_key)
-                                : 0;
+        const bool has_normalized_exact_inventory =
+            has_exact_inventory &&
+            config->has_slash_normalized_exact_strict_local_response_inventory();
+        u16 exact_policy_id = 0;
+        if (has_normalized_exact_inventory) {
+            const auto selection = select_slash_normalized_exact_strict_local_response(
+                conn, *config, request_method_key);
+            if (selection.state == SlashNormalizedExactSelectionState::InvalidInput) {
+                loop->close_conn(conn);
+                return;
+            }
+            if (selection.state == SlashNormalizedExactSelectionState::Match)
+                exact_policy_id = selection.policy_id;
+        } else if (has_exact_inventory) {
+            // Preserve the established Raw-only fast path byte-for-byte: it
+            // neither obtains the new witness nor invokes the normalizer.
+            u32 raw_target_len = 0;
+            while (raw_target_len < sizeof(conn.req_path) && conn.req_path[raw_target_len] != '\0')
+                raw_target_len++;
+            exact_policy_id = config->match_exact_strict_local_response(
+                Str{conn.req_path, raw_target_len}, request_method_key);
+        }
         if (exact_policy_id != 0) {
             if (!exact_strict_local_response_request_is_admitted(conn)) {
                 loop->close_conn(conn);

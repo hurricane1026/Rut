@@ -10179,15 +10179,15 @@ static StrictLocalResponsePolicySpec make_representation200_policy() {
     return policy;
 }
 
-static ExactStrictLocalResponseBinding make_exact_local_binding(const char* path,
-                                                                u8 method,
-                                                                u16 policy_id) {
+static ExactStrictLocalResponseBinding make_exact_local_binding(
+    const char* path, u8 method, u16 policy_id, ExactPathView path_view = ExactPathView::Raw) {
     ExactStrictLocalResponseBinding binding{};
     const u32 path_len = static_cast<u32>(strlen(path));
     if (path_len > kMaxExactStrictLocalResponsePathLen) return binding;
     __builtin_memcpy(binding.path, path, path_len);
     binding.path_len = static_cast<u8>(path_len);
     binding.method = method;
+    binding.path_view = path_view;
     binding.policy_id = policy_id;
     return binding;
 }
@@ -11166,6 +11166,243 @@ TEST(exact_local_response,
     REQUIRE(legacy != nullptr);
     CHECK_EQ(legacy->resp_status, 200u);
     CHECK_EQ(loop.backend.count_ops(MockOp::Send), 1u);
+}
+
+TEST(exact_local_response,
+     h1_slash_normalized_selection_precedence_witness_overflow_and_reuse_are_bounded) {
+    SmallLoop loop;
+    loop.setup();
+
+    auto config = std::make_unique<RouteConfig>();
+    REQUIRE(config->add_static("/", kRouteMethodGet, 204));
+    StrictLocalResponsePolicySpec policies[4] = {
+        make_unmatched_policy(410, "Raw Get", "raw-get"),
+        make_unmatched_policy(411, "Normalized Get", "normalized-get"),
+        make_unmatched_policy(412, "Raw Any", "raw-any", StrictLocalResponseHeadMode::SuppressBody),
+        make_unmatched_policy(
+            413, "Normalized Any", "normalized-any", StrictLocalResponseHeadMode::SuppressBody),
+    };
+    u16 unmatched[kStrictLocalResponseMethodSlots]{};
+    ExactStrictLocalResponseBinding exact[kMaxExactStrictLocalResponseBindings]{};
+    exact[0] = make_exact_local_binding("/health/check/", kRouteMethodGet, 1, ExactPathView::Raw);
+    exact[1] = make_exact_local_binding(
+        "/health/check/", kRouteMethodGet, 2, ExactPathView::SlashNormalized);
+    exact[2] = make_exact_local_binding("/health/check/", kRouteMethodAny, 3, ExactPathView::Raw);
+    exact[3] = make_exact_local_binding(
+        "/health/check/", kRouteMethodAny, 4, ExactPathView::SlashNormalized);
+    REQUIRE(config->install_strict_local_response_table(policies, 4, unmatched, exact, 4));
+    REQUIRE(config->strict_local_response_table_is_valid());
+    REQUIRE(config->has_slash_normalized_exact_strict_local_response_inventory());
+
+    auto dispatch_and_finish = [&](RouteConfig& selected,
+                                   const char* request,
+                                   u16 expected_status,
+                                   Str expected_target) {
+        loop.backend.clear_ops();
+        Connection* conn = dispatch_unmatched_request(loop, selected, request);
+        REQUIRE(conn != nullptr);
+        REQUIRE_EQ(conn->resp_status, expected_status);
+        const auto witness = conn->checked_raw_request_target();
+        REQUIRE_EQ(witness.state, RawRequestTargetWitnessState::Valid);
+        CHECK(witness.target.eq(expected_target));
+        CHECK_EQ(loop.backend.count_ops(MockOp::Connect), 0u);
+        REQUIRE_EQ(loop.backend.count_ops(MockOp::Send), 1u);
+        const u32 wire_len = conn->send_buf.len();
+        loop.inject_and_dispatch(make_ev(conn->id, IoEventType::Send, static_cast<i32>(wire_len)));
+    };
+
+    // Concrete/ANY and Raw/SlashNormalized precedence is fixed across GET and
+    // POST. Query bytes do not enter the normalized key.
+    dispatch_and_finish(*config,
+                        "GET /health/check/ HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n",
+                        410,
+                        lit_str("/health/check/"));
+    dispatch_and_finish(*config,
+                        "GET /health/check// HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n",
+                        411,
+                        lit_str("/health/check//"));
+    dispatch_and_finish(*config,
+                        "GET /health/check//?x=1 HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n",
+                        411,
+                        lit_str("/health/check//?x=1"));
+    dispatch_and_finish(*config,
+                        "POST /health/check/ HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n",
+                        412,
+                        lit_str("/health/check/"));
+    dispatch_and_finish(*config,
+                        "POST /health/check// HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n",
+                        413,
+                        lit_str("/health/check//"));
+
+    // Trailing slash identity, percent/dot opacity, and raw fallback bytes are
+    // preserved rather than being rewritten in recv storage.
+    dispatch_and_finish(*config,
+                        "GET /health/check HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n",
+                        204,
+                        lit_str("/health/check"));
+    dispatch_and_finish(
+        *config, "GET / HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n", 204, lit_str("/"));
+    dispatch_and_finish(
+        *config,
+        "GET /health/%2F/./check// HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n",
+        204,
+        lit_str("/health/%2F/./check//"));
+
+    // A normalized path longer than the bounded key cannot partially match a
+    // shorter normalized binding and falls through with the full Raw target.
+    static constexpr char kOverflowTarget[] =
+        "/health/check/abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
+    static constexpr char kOverflowRequest[] =
+        "GET /health/check/abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789 "
+        "HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n";
+    static_assert(sizeof(kOverflowTarget) - 1 > kMaxExactPathViewLen);
+    dispatch_and_finish(*config,
+                        kOverflowRequest,
+                        204,
+                        {kOverflowTarget, static_cast<u32>(sizeof(kOverflowTarget) - 1)});
+
+    auto normalized_only = std::make_unique<RouteConfig>();
+    REQUIRE(normalized_only->add_static("/", kRouteMethodGet, 204));
+    ExactStrictLocalResponseBinding
+        normalized_only_bindings[kMaxExactStrictLocalResponseBindings]{};
+    normalized_only_bindings[0] = make_exact_local_binding(
+        "/health/check/", kRouteMethodGet, 1, ExactPathView::SlashNormalized);
+    REQUIRE(normalized_only->install_strict_local_response_table(
+        &policies[1], 1, unmatched, normalized_only_bindings, 1));
+    dispatch_and_finish(*normalized_only,
+                        "GET /health/check/ HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n",
+                        411,
+                        lit_str("/health/check/"));
+    dispatch_and_finish(*normalized_only,
+                        "GET /health/check/?x=1 HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n",
+                        411,
+                        lit_str("/health/check/?x=1"));
+    dispatch_and_finish(*normalized_only,
+                        "GET /health/check// HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n",
+                        411,
+                        lit_str("/health/check//"));
+
+    auto captured_probe = [&](const char* request) -> Connection* {
+        Connection* conn = loop.alloc_conn();
+        if (conn == nullptr) return nullptr;
+        const u32 len = static_cast<u32>(strlen(request));
+        if (conn->recv_buf.write(reinterpret_cast<const u8*>(request), len) != len) return nullptr;
+        capture_request_metadata(*conn);
+        return conn;
+    };
+    static constexpr char kRawMatch[] =
+        "GET /health/check/ HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n";
+    Connection* neutral = captured_probe(kRawMatch);
+    REQUIRE(neutral != nullptr);
+    neutral->clear_raw_request_target_witness();
+    CHECK_EQ(select_slash_normalized_exact_strict_local_response(*neutral, *config, kRouteMethodGet)
+                 .state,
+             SlashNormalizedExactSelectionState::InvalidInput);
+    loop.close_conn(*neutral);
+    Connection* invalid = captured_probe(kRawMatch);
+    REQUIRE(invalid != nullptr);
+    invalid->req_raw_target_episode++;
+    CHECK_EQ(select_slash_normalized_exact_strict_local_response(*invalid, *config, kRouteMethodGet)
+                 .state,
+             SlashNormalizedExactSelectionState::InvalidInput);
+    loop.close_conn(*invalid);
+    Connection* leading =
+        captured_probe("GET //health/check/ HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n");
+    REQUIRE(leading != nullptr);
+    CHECK_EQ(select_slash_normalized_exact_strict_local_response(*leading, *config, kRouteMethodGet)
+                 .state,
+             SlashNormalizedExactSelectionState::InvalidInput);
+    loop.close_conn(*leading);
+    Connection* fragment =
+        captured_probe("GET /health/check//#x HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n");
+    REQUIRE(fragment != nullptr);
+    CHECK(fragment->req_target_has_fragment);
+    CHECK_EQ(
+        select_slash_normalized_exact_strict_local_response(*fragment, *config, kRouteMethodGet)
+            .state,
+        SlashNormalizedExactSelectionState::InvalidInput);
+    loop.close_conn(*fragment);
+
+    // A normalized response followed by a fallback request on the same H1
+    // transport must recapture its witness; no stack view survives the first
+    // callback.
+    loop.backend.clear_ops();
+    Connection* reused = dispatch_unmatched_request(
+        loop, *config, "GET /health/check// HTTP/1.1\r\nHost: x\r\n\r\n");
+    REQUIRE(reused != nullptr);
+    REQUIRE_EQ(reused->resp_status, 411u);
+    const u32 reused_id = reused->id;
+    const u32 first_len = reused->send_buf.len();
+    loop.inject_and_dispatch(make_ev(reused_id, IoEventType::Send, static_cast<i32>(first_len)));
+    REQUIRE_EQ(reused->state, ConnState::ReadingHeader);
+    static constexpr char kSuccessor[] =
+        "GET /health/check HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n";
+    REQUIRE_EQ(
+        reused->recv_buf.write(reinterpret_cast<const u8*>(kSuccessor), sizeof(kSuccessor) - 1),
+        sizeof(kSuccessor) - 1);
+    const RouteConfig* active = config.get();
+    loop.config_ptr = &active;
+    on_header_received<SmallLoop>(
+        &loop,
+        *reused,
+        make_ev(reused_id, IoEventType::Recv, static_cast<i32>(sizeof(kSuccessor) - 1)));
+    loop.config_ptr = nullptr;
+    REQUIRE_EQ(reused->resp_status, 204u);
+    REQUIRE(reused->checked_raw_request_target().target.eq(lit_str("/health/check")));
+    const u32 successor_len = reused->send_buf.len();
+    loop.inject_and_dispatch(
+        make_ev(reused_id, IoEventType::Send, static_cast<i32>(successor_len)));
+
+    loop.backend.clear_ops();
+    Connection* pipelined = loop.alloc_conn();
+    REQUIRE(pipelined != nullptr);
+    pipelined->fd = 78;
+    const u32 pipelined_id = pipelined->id;
+    static constexpr char kPipelined[] =
+        "GET /health/check HTTP/1.1\r\nHost: x\r\n\r\n"
+        "GET /health/check// HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n";
+    REQUIRE_EQ(
+        pipelined->recv_buf.write(reinterpret_cast<const u8*>(kPipelined), sizeof(kPipelined) - 1),
+        sizeof(kPipelined) - 1);
+    const RouteConfig* pipelined_active = config.get();
+    loop.config_ptr = &pipelined_active;
+    on_header_received<SmallLoop>(
+        &loop,
+        *pipelined,
+        make_ev(pipelined_id, IoEventType::Recv, static_cast<i32>(sizeof(kPipelined) - 1)));
+    REQUIRE_EQ(pipelined->resp_status, 204u);
+    const u32 pipelined_first_len = pipelined->send_buf.len();
+    loop.inject_and_dispatch(
+        make_ev(pipelined_id, IoEventType::Send, static_cast<i32>(pipelined_first_len)));
+    REQUIRE_EQ(pipelined->resp_status, 411u);
+    REQUIRE_EQ(pipelined->pipeline_depth, 1u);
+    REQUIRE(pipelined->checked_raw_request_target().target.eq(lit_str("/health/check//")));
+    const u32 pipelined_second_len = pipelined->send_buf.len();
+    loop.inject_and_dispatch(
+        make_ev(pipelined_id, IoEventType::Send, static_cast<i32>(pipelined_second_len)));
+    loop.config_ptr = nullptr;
+
+    // Concrete pre_route remains ahead of both exact views.
+    auto pre_route_config = std::make_unique<RouteConfig>();
+    StrictLocalResponsePolicySpec pre_policies[2] = {
+        make_unmatched_policy(414, "Pre Route", "pre-route"), policies[1]};
+    u16 pre_route[kStrictLocalResponseMethodSlots]{};
+    pre_route[kRouteMethodGet] = 1;
+    ExactStrictLocalResponseBinding pre_exact[kMaxExactStrictLocalResponseBindings]{};
+    pre_exact[0] = make_exact_local_binding(
+        "/health/check/", kRouteMethodGet, 2, ExactPathView::SlashNormalized);
+    REQUIRE(pre_route_config->install_strict_local_response_table_with_pre_route(
+        pre_policies, 2, pre_route, unmatched, pre_exact, 1));
+    loop.backend.clear_ops();
+    Connection* pre = dispatch_unmatched_request(
+        loop,
+        *pre_route_config,
+        "GET /health/check// HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n");
+    REQUIRE(pre != nullptr);
+    REQUIRE_EQ(pre->resp_status, 414u);
+    CHECK_EQ(loop.backend.count_ops(MockOp::Connect), 0u);
+    const u32 pre_len = pre->send_buf.len();
+    loop.inject_and_dispatch(make_ev(pre->id, IoEventType::Send, static_cast<i32>(pre_len)));
 }
 
 TEST(exact_local_response,
@@ -12854,6 +13091,24 @@ TEST(unmatched_local_response, h2_outer_callback_closes_and_discards_the_complet
     // The early exact fence discards SETTINGS ACK and closes before even the
     // otherwise matched JIT handler can run.
     run(*exact_inactive, "/hit", false, true, 0, 0);
+    // Raw-only exact inventory retains its established unambiguous-miss path.
+    run(*exact_inactive, "/miss", false, false, 200, 0);
+
+    auto normalized_inactive = std::make_unique<RouteConfig>();
+    ExactStrictLocalResponseBinding normalized_bindings[kMaxExactStrictLocalResponseBindings]{};
+    normalized_bindings[0] =
+        make_exact_local_binding("/hit", kRouteMethodGet, 1, ExactPathView::SlashNormalized);
+    REQUIRE(normalized_inactive->install_strict_local_response_table(
+        &representation_policy, 1, no_unmatched, normalized_bindings, 1));
+    REQUIRE(normalized_inactive->add_jit_handler(
+        "/hit", kRouteMethodGet, &unmatched_h2_outer_hit_handler, false));
+    REQUIRE(normalized_inactive->add_jit_handler(
+        "/miss", kRouteMethodGet, &unmatched_h2_outer_hit_handler, false));
+    REQUIRE(normalized_inactive->has_slash_normalized_exact_strict_local_response_inventory());
+    // The first normalized-inventory stream terminates in the production outer
+    // callback. The coalesced successor would otherwise hit /miss, but cannot
+    // dispatch or emit after the sticky zero-byte fail-close.
+    run(*normalized_inactive, "/hit", true, true, 0, 0);
 }
 
 // Helper: write raw bytes into conn's recv_buf and dispatch as Recv event.

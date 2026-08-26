@@ -993,6 +993,16 @@ void h2_dispatch_request(H2Dispatch<Loop>& d,
         d.overflow = false;
         return;
     }
+    // Slash-normalized exact selection is currently admitted only for H1,
+    // where the strict parser supplies a checked full raw-target witness. H2
+    // must not silently ignore this inventory or reinterpret it as Raw.
+    if (has_exact_inventory &&
+        config->has_slash_normalized_exact_strict_local_response_inventory()) {
+        d.close_after_process = true;
+        d.resp_len = 0;
+        d.overflow = false;
+        return;
+    }
     // A prepared Forward waiting to learn whether its open request stream is
     // actually empty owns both pending_synth and the connection mutation log.
     if (d.conn->h2->pending_prepared_forward) {

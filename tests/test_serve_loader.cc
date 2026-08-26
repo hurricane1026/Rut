@@ -900,7 +900,7 @@ TEST(serve_loader, exact_strict_local_response_metadata_installs_atomically) {
              ExactPathView::SlashNormalized);
 }
 
-TEST(serve_loader, slash_normalized_exact_source_reaches_verified_rir_but_not_activation) {
+TEST(serve_loader, slash_normalized_exact_source_loads_and_owns_runtime_inventory) {
     static constexpr char kSource[] = R"rut(
 route exact slash_normalized GET "/health/check" { return local_response({
   version: "HTTP/1.1", status: 400, reason: "Bad Request", server: "rut",
@@ -917,8 +917,7 @@ route exact slash_normalized "/health/any" { return local_response({
         write_file("/tmp/rut_serve_loader_slash_normalized_stage2", "app.rut", kSource);
     LoadedProgram program;
     LoadError err;
-    CHECK_FALSE(load_rut_program(path.c_str(), program, err));
-    CHECK_EQ(err.stage, LoadStage::Register);
+    REQUIRE(load_rut_program(path.c_str(), program, err));
     REQUIRE(rir::verify_module(program.rir.module).ok);
     REQUIRE_EQ(program.rir.module.exact_strict_local_response_binding_count, 2u);
     const auto& get = program.rir.module.exact_strict_local_response_bindings[0];
@@ -938,16 +937,16 @@ route exact slash_normalized "/health/any" { return local_response({
              ExactPathView::SlashNormalized);
     CHECK_EQ(program.config.exact_strict_local_response_bindings[1].path_view,
              ExactPathView::SlashNormalized);
+    CHECK(program.config.has_slash_normalized_exact_strict_local_response_inventory());
 
-    // Population is now a preparation boundary. Production registration must
-    // still reject the already-established table before dispatcher mutation.
+    // Both public activation paths admit the verified owned table.
     REQUIRE_EQ(program.rir.module.func_count, 0u);
     auto direct_cfg = std::make_unique<RouteConfig>();
     REQUIRE(populate_route_config(*direct_cfg, program.rir.module));
-    std::vector<u8> direct_before(sizeof(RouteConfig));
-    __builtin_memcpy(direct_before.data(), direct_cfg.get(), sizeof(RouteConfig));
-    CHECK_FALSE(register_jit_routes(*direct_cfg, program.rir.module, program.engine));
-    CHECK_EQ(__builtin_memcmp(direct_before.data(), direct_cfg.get(), sizeof(RouteConfig)), 0);
+    REQUIRE(register_jit_routes(*direct_cfg, program.rir.module, program.engine));
+    CHECK_EQ(direct_cfg->route_count, 0u);
+    CHECK_EQ(direct_cfg->timer_count, 0u);
+    CHECK(direct_cfg->has_slash_normalized_exact_strict_local_response_inventory());
 
     // load_rut_program has already destroyed AST/HIR/MIR. End every remaining
     // compiler/source lifetime and prove the prepared RouteConfig owns both
@@ -974,7 +973,7 @@ route exact slash_normalized "/health/any" { return local_response({
     program.destroy();
 }
 
-TEST(serve_loader, slash_normalized_exact_rejects_direct_jit_route_activation_atomically) {
+TEST(serve_loader, slash_normalized_exact_and_jit_route_activate_together) {
     static constexpr char kSource[] = R"rut(
 route exact slash_normalized GET "/health/check" { return local_response({
   version: "HTTP/1.1", status: 400, reason: "Bad Request", server: "rut",
@@ -989,8 +988,7 @@ route GET "/sentinel" { return 204 }
                    kSource);
     LoadedProgram program;
     LoadError err;
-    CHECK_FALSE(load_rut_program(path.c_str(), program, err));
-    CHECK_EQ(err.stage, LoadStage::Register);
+    REQUIRE(load_rut_program(path.c_str(), program, err));
     REQUIRE(rir::verify_module(program.rir.module).ok);
     REQUIRE_EQ(program.rir.module.exact_strict_local_response_binding_count, 1u);
     REQUIRE_EQ(program.rir.module.func_count, 1u);
@@ -999,16 +997,34 @@ route GET "/sentinel" { return 204 }
     CHECK((program.rir.module.functions[0].route_pattern.eq({"/sentinel", 9})));
     REQUIRE(program.engine.lookup("handler_route_0") != nullptr);
 
-    // Without an entry gate, this valid compiled handler is looked up and its
-    // ordinary route is installed despite the not-yet-active exact-path view.
-    // A fresh direct destination remains byte-identical at this boundary.
+    // Direct registration cannot omit or substitute the module's verified
+    // strict inventory. Both failures precede lookup/replay and leave every
+    // destination byte unchanged.
+    auto omitted_cfg = std::make_unique<RouteConfig>();
+    std::vector<u8> omitted_before(sizeof(RouteConfig));
+    __builtin_memcpy(omitted_before.data(), omitted_cfg.get(), sizeof(RouteConfig));
+    CHECK_FALSE(register_jit_routes(*omitted_cfg, program.rir.module, program.engine));
+    CHECK_EQ(__builtin_memcmp(omitted_before.data(), omitted_cfg.get(), sizeof(RouteConfig)), 0);
+
+    auto mismatched_module = program.rir.module;
+    mismatched_module.strict_local_response_policies[0].body = {"different", 9};
+    REQUIRE(rir::verify_module(mismatched_module).ok);
+    auto mismatched_cfg = std::make_unique<RouteConfig>();
+    REQUIRE(populate_route_config(*mismatched_cfg, mismatched_module));
+    std::vector<u8> mismatched_before(sizeof(RouteConfig));
+    __builtin_memcpy(mismatched_before.data(), mismatched_cfg.get(), sizeof(RouteConfig));
+    CHECK_FALSE(register_jit_routes(*mismatched_cfg, program.rir.module, program.engine));
+    CHECK_EQ(__builtin_memcmp(mismatched_before.data(), mismatched_cfg.get(), sizeof(RouteConfig)),
+             0);
+
+    // A separately populated destination activates the normalized selector and
+    // ordinary route in the same transactional registration step.
     auto direct_cfg = std::make_unique<RouteConfig>();
-    std::vector<u8> direct_before(sizeof(RouteConfig));
-    __builtin_memcpy(direct_before.data(), direct_cfg.get(), sizeof(RouteConfig));
-    CHECK_FALSE(register_jit_routes(*direct_cfg, program.rir.module, program.engine));
-    CHECK_EQ(__builtin_memcmp(direct_before.data(), direct_cfg.get(), sizeof(RouteConfig)), 0);
-    CHECK_EQ(direct_cfg->route_count, 0u);
+    REQUIRE(populate_route_config(*direct_cfg, program.rir.module));
+    REQUIRE(register_jit_routes(*direct_cfg, program.rir.module, program.engine));
+    CHECK_EQ(direct_cfg->route_count, 1u);
     CHECK_EQ(direct_cfg->timer_count, 0u);
+    CHECK(direct_cfg->has_slash_normalized_exact_strict_local_response_inventory());
     program.destroy();
 }
 

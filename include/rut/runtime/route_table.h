@@ -565,6 +565,18 @@ struct RouteConfig {
             exact_strict_local_response_bindings, exact_strict_local_response_binding_count);
     }
 
+    // A request-time caller may only branch on normalized selector metadata
+    // after the complete owned table has been validated.  In particular, do
+    // not trust the public count or path_view bytes before that validation has
+    // bounded the scan and admitted every enum value.
+    bool has_slash_normalized_exact_strict_local_response_inventory() const {
+        if (!strict_local_response_table_is_valid()) return false;
+        for (u32 i = 0; i < exact_strict_local_response_binding_count; i++)
+            if (exact_strict_local_response_bindings[i].path_view == ExactPathView::SlashNormalized)
+                return true;
+        return false;
+    }
+
     bool has_strict_local_response_table_inventory() const {
         return has_strict_local_response_policy_inventory() || has_pre_route_metadata() ||
                has_unmatched_metadata() || has_exact_strict_local_response_inventory();

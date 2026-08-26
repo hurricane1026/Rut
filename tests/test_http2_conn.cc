@@ -1585,6 +1585,27 @@ TEST(h2_serving, unmatched_metadata_miss_fail_closes_while_omitted_and_matched_a
     CHECK_EQ(exact_fragment.response_len, 0u);
     CHECK(exact_fragment.close);
 
+    // H2 has no checked H1 raw-target witness. Presence of normalized exact
+    // inventory is therefore terminal even for a nonmatching path; it may not
+    // be ignored in favor of Raw/prefix/unmatched routing.
+    auto normalized_exact = std::make_unique<RouteConfig>();
+    ExactStrictLocalResponseBinding normalized_bindings[kMaxExactStrictLocalResponseBindings]{};
+    __builtin_memcpy(normalized_bindings[0].path, "/health/check/", 14);
+    normalized_bindings[0].path_len = 14;
+    normalized_bindings[0].method = kRouteMethodGet;
+    normalized_bindings[0].path_view = ExactPathView::SlashNormalized;
+    normalized_bindings[0].policy_id = 1;
+    REQUIRE(normalized_exact->install_strict_local_response_table(
+        &exact_policy, 1, no_unmatched, normalized_bindings, 1));
+    REQUIRE(normalized_exact->add_static("/", kRouteMethodGet, 204));
+    REQUIRE(normalized_exact->has_slash_normalized_exact_strict_local_response_inventory());
+    const auto normalized_match = dispatch(normalized_exact.get(), "/health/check//");
+    CHECK_EQ(normalized_match.response_len, 0u);
+    CHECK(normalized_match.close);
+    const auto normalized_miss = dispatch(normalized_exact.get(), "/other");
+    CHECK_EQ(normalized_miss.response_len, 0u);
+    CHECK(normalized_miss.close);
+
     auto exact_tail = std::make_unique<RouteConfig>();
     exact_tail->exact_strict_local_response_bindings[15].reserved1 = 1;
     const auto tail_result = dispatch(exact_tail.get(), "/miss");
