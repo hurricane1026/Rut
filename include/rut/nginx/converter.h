@@ -16,7 +16,7 @@ struct RutSource {
     // exact-redirect measured maximum uses listen and upstream port 65535 and
     // IPv4 255.255.255.255: 5936 bytes for 301 and 5912 bytes for 302. The
     // exact-local-return maximum is 5681 bytes for a 62-byte trailing-slash
-    // path, a 64-byte body containing one internal ASCII space, and the
+    // path, a 64-byte body containing internal ASCII spaces, and the
     // slash_normalized exact-path view keyword. The equivalent raw exact shape
     // remains 5664 bytes. The bounded
     // transformed-location maximum uses a 63-byte path, 128-byte replacement

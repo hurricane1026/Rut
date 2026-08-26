@@ -408,10 +408,9 @@ bool local_return_body_byte_is_safe(char value) {
 
 bool local_return_body_is_clean(Str body) {
     if (body.ptr == nullptr || body.len == 0 || body.len > kMaxLocalReturnBodyLen) return false;
-    u32 space_count = 0;
     for (u32 i = 0; i < body.len; i++) {
         if (body.ptr[i] == ' ') {
-            if (i == 0 || i + 1u == body.len || ++space_count > 1) return false;
+            if (i == 0 || i + 1u == body.len) return false;
             continue;
         }
         if (!local_return_body_byte_is_safe(body.ptr[i])) return false;
