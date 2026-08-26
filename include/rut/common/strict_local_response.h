@@ -1,5 +1,6 @@
 #pragma once
 
+#include "rut/common/exact_path_view.h"
 #include "rut/common/http_header_validation.h"
 #include "rut/common/types.h"
 
@@ -17,7 +18,7 @@ static constexpr u32 kMaxStrictLocalResponseServerLen = 64;
 static constexpr u32 kMaxStrictLocalResponseBodyLen = 4096;
 static constexpr u32 kMaxStrictLocalResponsePolicyBytes = 8192;
 static constexpr u32 kMaxExactStrictLocalResponseBindings = 16;
-static constexpr u32 kMaxExactStrictLocalResponsePathLen = 62;
+static constexpr u32 kMaxExactStrictLocalResponsePathLen = kMaxExactPathViewLen;
 
 // Compiler/runtime hand-off metadata for the bounded exact selector.  Every
 // byte is named and validated so forged padding can never hide activation.

@@ -6,6 +6,14 @@ target_include_directories(test_framework PRIVATE
 add_test(NAME test_framework COMMAND test_framework)
 set_tests_properties(test_framework PROPERTIES WILL_FAIL TRUE)
 
+add_executable(test_exact_path_view test_exact_path_view.cc)
+target_include_directories(test_exact_path_view PRIVATE
+    ${PROJECT_SOURCE_DIR}/include
+    ${PROJECT_SOURCE_DIR}/testing
+)
+add_test(NAME test_exact_path_view COMMAND test_exact_path_view)
+set_tests_properties(test_exact_path_view PROPERTIES LABELS "unit")
+
 add_executable(test_network
     test_network.cc
     ${PROJECT_SOURCE_DIR}/testing/fault_injection.cc
