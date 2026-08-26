@@ -5822,15 +5822,17 @@ static bool parse_exact_return204_access_log(const std::string& contents,
                                              size_t local_request_size,
                                              size_t fallback_request_size,
                                              size_t fallback_response_size,
-                                             std::string& error) {
+                                             std::string& error,
+                                             bool query_target = false) {
     std::vector<std::string> records;
     if (!split_exact_complete_log(
             contents, 2u, "converter-generated #324 access log", records, error))
         return false;
     std::vector<std::string> local;
     std::vector<std::string> fallback;
+    const char* local_target = query_target ? "/static?x=1" : "/static";
     if (!split_space_fields(records[0], local) || local.size() != 9u ||
-        !exact_log_timestamp(local[0]) || local[1] != "GET" || local[2] != "/static" ||
+        !exact_log_timestamp(local[0]) || local[1] != "GET" || local[2] != local_target ||
         !decimal_field_equals(local[3], 204u) || !exact_log_duration(local[4]) ||
         !decimal_field_equals(local[5], local_request_size) ||
         !decimal_field_equals(local[6], 105u) || local[7] != "127.0.0.1" || local[8] != "s=0") {
@@ -5929,6 +5931,64 @@ static bool run_exact_return204_log_parser_self_checks(std::string& error) {
                                  "#324 self-check log",
                                  completion_error)) {
         error = "#324 runtime/bounded-log parser mutation self-check failed";
+        return false;
+    }
+    return true;
+}
+
+static bool run_converter_exact_return204_query_access_log_self_checks(std::string& error) {
+    static constexpr char kLocal[] =
+        "2026-08-26T21:13:05.248Z GET /static?x=1 204 361us 77 105 127.0.0.1 s=0\n";
+    static constexpr char kFallback[] =
+        "2026-08-26T21:13:05.907Z GET /fallback?q=1 200 1577us 86 118 127.0.0.1 "
+        "nginx_upstream 243us s=0\n";
+    const std::string valid = std::string(kLocal) + kFallback;
+    const auto rejects = [&](const std::string& value) {
+        std::string detail;
+        return !parse_exact_return204_access_log(value, 77u, 86u, 118u, detail, true);
+    };
+    std::string overflow = kLocal;
+    const size_t size_offset = overflow.find(" 77 105 ");
+    if (size_offset == std::string::npos) {
+        error = "#325 query converter access-log fixture lost request-size field";
+        return false;
+    }
+    overflow.replace(size_offset + 1u, 2u, "999999999999999999999999999999999");
+    std::string wrong_target = valid;
+    const size_t target_offset = wrong_target.find("/static?x=1");
+    if (target_offset == std::string::npos) {
+        error = "#325 query converter access-log fixture lost target field";
+        return false;
+    }
+    wrong_target.replace(target_offset, strlen("/static?x=1"), "/static");
+    if (!parse_exact_return204_access_log(valid, 77u, 86u, 118u, error, true) ||
+        !rejects(valid + kLocal) || !rejects(kFallback + std::string(kLocal)) ||
+        !rejects(valid.substr(0, valid.size() - 1u)) || !rejects(wrong_target) ||
+        !rejects(overflow + kFallback)) {
+        error = "#325 converter query access-log parser mutation self-check failed";
+        return false;
+    }
+    return true;
+}
+
+static bool generated_exact_return204_source_is_query_free(const std::string& source) {
+    return source.find("?x=1") == std::string::npos &&
+           source.find("query-return204.example") == std::string::npos;
+}
+
+static bool run_converter_exact_return204_source_validation_self_checks(std::string& error) {
+    static constexpr char kCanonical[] =
+        "listen :54321\n"
+        "route exact GET \"/static\" { return local_response({ status: 204 }) }\n"
+        "route GET \"/\" { return forward(nginx_upstream) }\n";
+    const std::string query_route =
+        std::string(kCanonical) + "route exact GET \"/static?x=1\" { return response() }\n";
+    const std::string host_predicate =
+        std::string(kCanonical) + "if host == \"query-return204.example\" { return response() }\n";
+    if (!generated_exact_return204_source_is_query_free(kCanonical) ||
+        generated_exact_return204_source_is_query_free(query_route) ||
+        generated_exact_return204_source_is_query_free(host_predicate)) {
+        error = "#325 generated source query-specific route/host mutation was not rejected";
         return false;
     }
     return true;
@@ -6706,11 +6766,13 @@ static bool capture_generated_exact_local_return204_order(
     TempDir& temp,
     const char* rut_path,
     bool exact_first,
+    bool query_target,
     ExactLocalReturn204OracleObservation& observation,
     std::string& generated_source,
     std::string& error) {
     if (rut_path == nullptr || rut_path[0] != '/' || access(rut_path, X_OK) != 0) {
-        error = "converter-generated #324 differential requires an executable absolute RUT path";
+        error = std::string("converter-generated #") + (query_target ? "325" : "324") +
+                " differential requires an executable absolute RUT path";
         return false;
     }
 
@@ -6805,6 +6867,7 @@ static bool capture_generated_exact_local_return204_order(
         generated_source.find("return 204") != std::string::npos ||
         generated_source.find("nginx::") != std::string::npos ||
         generated_source.find("nginx_compat") != std::string::npos ||
+        !generated_exact_return204_source_is_query_free(generated_source) ||
         !write_file(temp.source, generated.ptr, generated.len)) {
         error =
             "#324 output was not exactly one public strict /static selector plus the canonical "
@@ -6828,11 +6891,22 @@ static bool capture_generated_exact_local_return204_order(
         "GET /static HTTP/1.1\r\n"
         "Host: return204.example\r\n"
         "Connection: close\r\n\r\n";
+    static constexpr char kQueryLocalRequest[] =
+        "GET /static?x=1 HTTP/1.1\r\n"
+        "Host: query-return204.example\r\n"
+        "Connection: close\r\n\r\n";
     static constexpr char kFallbackRequest[] =
         "GET /fallback?q=1 HTTP/1.1\r\n"
         "Host: return204.example\r\n"
         "X-324-Vector: fallback\r\n"
         "Connection: close\r\n\r\n";
+    static constexpr char kQueryFallbackRequest[] =
+        "GET /fallback?q=1 HTTP/1.1\r\n"
+        "Host: query-return204.example\r\n"
+        "X-324-Vector: fallback\r\n"
+        "Connection: close\r\n\r\n";
+    const char* local_request = query_target ? kQueryLocalRequest : kLocalRequest;
+    const char* fallback_request = query_target ? kQueryFallbackRequest : kFallbackRequest;
 
     const auto recorder_live = [](const Recorder& recorder) {
         return recorder.running.load(std::memory_order_acquire) &&
@@ -6881,8 +6955,9 @@ static bool capture_generated_exact_local_return204_order(
         error = "converter-generated #324 RUT lacked exact source-load/listener/io_uring proof";
         return false;
     }
-    static constexpr char kDestroyedSource[] = "destroyed-after-324-public-load\n";
-    if (!write_file(temp.source, kDestroyedSource, sizeof(kDestroyedSource) - 1u)) {
+    const std::string destroyed_source =
+        std::string("destroyed-after-") + (query_target ? "325" : "324") + "-public-load\n";
+    if (!write_file(temp.source, destroyed_source.data(), destroyed_source.size())) {
         error = "failed to destroy #324 generated RUT source after public readiness";
         return false;
     }
@@ -6968,7 +7043,7 @@ static bool capture_generated_exact_local_return204_order(
         !observe_count(
             zero, 0, "pre-local live zero-upstream window", std::chrono::milliseconds(250)) ||
         !request_close("strict local return 204",
-                       kLocalRequest,
+                       local_request,
                        true,
                        kExactLocalReturn204ResponseNormalized,
                        observation.local_wire) ||
@@ -7008,7 +7083,7 @@ static bool capture_generated_exact_local_return204_order(
                        "pre-fallback live zero-upstream window",
                        std::chrono::milliseconds(100)) ||
         !request_close("root fallback",
-                       kFallbackRequest,
+                       fallback_request,
                        false,
                        kSuccessResponseNormalized,
                        observation.fallback_wire))
@@ -7066,10 +7141,11 @@ static bool capture_generated_exact_local_return204_order(
     if (!read_exact_return204_log(
             temp.rut_access_log, "converter-generated #324 access log", access_contents, error) ||
         !parse_exact_return204_access_log(access_contents,
-                                          strlen(kLocalRequest),
+                                          strlen(local_request),
                                           expected_backend.size(),
                                           sizeof(kSuccessResponseNormalized) - 1u,
-                                          error) ||
+                                          error,
+                                          query_target) ||
         !read_exact_return204_log(
             temp.rut_log, "converter-generated #324 runtime log", runtime_contents, error) ||
         !parse_exact_return204_runtime_log(runtime_contents, temp.source, listener_record, error)) {
@@ -7082,6 +7158,7 @@ static bool capture_generated_exact_local_return204_order(
 
 static bool run_converter_exact_local_return204_differential(const std::string& container_prefix,
                                                              const char* rut_path,
+                                                             bool query_target,
                                                              std::string& error) {
     u16 ports[8]{};
     bool ports_unique = false;
@@ -7095,14 +7172,16 @@ static bool run_converter_exact_local_return204_differential(const std::string& 
         }
     }
     if (!ports_unique) {
-        error = "#324 could not allocate eight unique four-side frontend/backend ports";
+        error = std::string("#") + (query_target ? "325" : "324") +
+                " could not allocate eight unique four-side frontend/backend ports";
         return false;
     }
 
     TempDir temps[4];
     for (TempDir& temp : temps) {
         if (!temp.create()) {
-            error = "#324 could not create four isolated differential temp trees";
+            error = std::string("#") + (query_target ? "325" : "324") +
+                    " could not create four isolated differential temp trees";
             return false;
         }
     }
@@ -7112,7 +7191,8 @@ static bool run_converter_exact_local_return204_differential(const std::string& 
                 temps[i].nginx_config == temps[j].nginx_config ||
                 temps[i].nginx_log == temps[j].nginx_log || temps[i].rut_log == temps[j].rut_log ||
                 temps[i].rut_access_log == temps[j].rut_access_log) {
-                error = "#324 four sides shared a temp/config/source/log/access identity";
+                error = std::string("#") + (query_target ? "325" : "324") +
+                        " four sides shared a temp/config/source/log/access identity";
                 return false;
             }
         }
@@ -7142,15 +7222,28 @@ static bool run_converter_exact_local_return204_differential(const std::string& 
         }
     };
     if (containers[0] == containers[1] ||
-        !capture_pinned_exact_local_return204_order(
-            ports[0], ports[1], temps[0], containers[0], true, false, observations[0], error) ||
-        !capture_pinned_exact_local_return204_order(
-            ports[2], ports[3], temps[1], containers[1], false, false, observations[1], error) ||
+        !capture_pinned_exact_local_return204_order(ports[0],
+                                                    ports[1],
+                                                    temps[0],
+                                                    containers[0],
+                                                    true,
+                                                    query_target,
+                                                    observations[0],
+                                                    error) ||
+        !capture_pinned_exact_local_return204_order(ports[2],
+                                                    ports[3],
+                                                    temps[1],
+                                                    containers[1],
+                                                    false,
+                                                    query_target,
+                                                    observations[1],
+                                                    error) ||
         !capture_generated_exact_local_return204_order(ports[4],
                                                        ports[5],
                                                        temps[2],
                                                        rut_path,
                                                        true,
+                                                       query_target,
                                                        observations[2],
                                                        generated_sources[0],
                                                        error) ||
@@ -7159,6 +7252,7 @@ static bool run_converter_exact_local_return204_differential(const std::string& 
                                                        temps[3],
                                                        rut_path,
                                                        false,
+                                                       query_target,
                                                        observations[3],
                                                        generated_sources[1],
                                                        error)) {
@@ -17354,6 +17448,8 @@ int main(int argc, char** argv) {
         strcmp(argv[1], "--converter-exact-local-body-multiple-space-differential") == 0;
     const bool converter_exact_local_return204_differential =
         argc == 3 && strcmp(argv[1], "--converter-exact-local-return204-differential") == 0;
+    const bool converter_exact_local_return204_query_differential =
+        argc == 3 && strcmp(argv[1], "--converter-exact-local-return204-query-differential") == 0;
     const bool converter_api_non_root_proxy_uri_differential =
         argc == 3 && strcmp(argv[1], "--converter-api-non-root-proxy-uri-differential") == 0;
     const bool converter_service_root_proxy_uri_differential =
@@ -17409,6 +17505,7 @@ int main(int argc, char** argv) {
          !exact_local_return204_query_oracle && !converter_exact_local_body_space_differential &&
          !converter_exact_local_body_multiple_space_differential &&
          !converter_exact_local_return204_differential &&
+         !converter_exact_local_return204_query_differential &&
          !converter_api_non_root_proxy_uri_differential &&
          !converter_service_root_proxy_uri_differential &&
          !converter_bounded_exact_local_path_differential &&
@@ -17436,6 +17533,7 @@ int main(int argc, char** argv) {
         (converter_exact_local_body_space_differential && argv[2][0] != '/') ||
         (converter_exact_local_body_multiple_space_differential && argv[2][0] != '/') ||
         (converter_exact_local_return204_differential && argv[2][0] != '/') ||
+        (converter_exact_local_return204_query_differential && argv[2][0] != '/') ||
         (converter_exact_absolute_redirect_differential && argv[2][0] != '/') ||
         (converter_exact_absolute_redirect_302_differential && argv[2][0] != '/') ||
         (converter_exact_local_differential && argv[2][0] != '/') ||
@@ -17477,6 +17575,9 @@ int main(int argc, char** argv) {
                      "<absolute-rut-executable>\n"
                      "   or: test_nginx_differential "
                      "--converter-exact-local-return204-differential "
+                     "<absolute-rut-executable>\n"
+                     "   or: test_nginx_differential "
+                     "--converter-exact-local-return204-query-differential "
                      "<absolute-rut-executable>\n"
                      "   or: test_nginx_differential "
                      "--converter-api-non-root-proxy-uri-differential "
@@ -17540,10 +17641,27 @@ int main(int argc, char** argv) {
     }
     if (!run_normalize_date_self_checks()) return 1;
     if (!run_two_response_diagnostic_self_check()) return 1;
-    if (converter_exact_local_return204_differential) {
+    if (converter_exact_local_return204_differential ||
+        converter_exact_local_return204_query_differential) {
         std::string parser_error;
         if (!run_exact_return204_log_parser_self_checks(parser_error)) {
             std::cerr << "FAIL [#324 exact log parser self-check]: " << parser_error << "\n";
+            return 1;
+        }
+        if (converter_exact_local_return204_query_differential &&
+            !run_exact_return204_query_access_log_self_checks(parser_error)) {
+            std::cerr << "FAIL [#325 query access-log parser self-check]: " << parser_error << "\n";
+            return 1;
+        }
+        if (converter_exact_local_return204_query_differential &&
+            !run_converter_exact_return204_query_access_log_self_checks(parser_error)) {
+            std::cerr << "FAIL [#325 converter access-log parser self-check]: " << parser_error
+                      << "\n";
+            return 1;
+        }
+        if (!run_converter_exact_return204_source_validation_self_checks(parser_error)) {
+            std::cerr << "FAIL [#325 generated source validation self-check]: " << parser_error
+                      << "\n";
             return 1;
         }
     }
@@ -17749,16 +17867,23 @@ int main(int argc, char** argv) {
         return 1;
     }
 
-    if (converter_exact_local_return204_differential) {
+    if (converter_exact_local_return204_differential ||
+        converter_exact_local_return204_query_differential) {
         const char* source_suffix = strrchr(temp.path, '/');
         source_suffix = source_suffix ? source_suffix + 1 : temp.path;
         const std::string container_prefix =
-            "rut-nginx-converter-return204-" + std::to_string(getpid()) + "-" + source_suffix;
+            std::string("rut-nginx-converter-return204-") +
+            (converter_exact_local_return204_query_differential ? "query-" : "") +
+            std::to_string(getpid()) + "-" + source_suffix;
         std::string differential_error;
         if (!run_converter_exact_local_return204_differential(
-                container_prefix, argv[2], differential_error)) {
-            std::cerr << "FAIL [converter-generated exact-local return 204 differential]: "
-                      << differential_error << "\n";
+                container_prefix,
+                argv[2],
+                converter_exact_local_return204_query_differential,
+                differential_error)) {
+            std::cerr << "FAIL [converter-generated exact-local return 204 "
+                      << (converter_exact_local_return204_query_differential ? "query " : "")
+                      << "differential]: " << differential_error << "\n";
             return 1;
         }
         std::cerr
@@ -17768,8 +17893,9 @@ int main(int argc, char** argv) {
                "105-byte strict /static 204 close/EOF wires with live and settled zero upstream; "
                "each independent /fallback?q=1 request produced the exact 200 client wire, one "
                "byte-exact dynamic-port upstream episode and no retry, with exactly two response-"
-               "size-accounted access records and clean logs per side (#324 bounded final "
-               "behavioral evidence)\n";
+               "size-accounted access records and clean logs per side (#"
+            << (converter_exact_local_return204_query_differential ? "325" : "324")
+            << " bounded final behavioral evidence)\n";
         return 0;
     }
 

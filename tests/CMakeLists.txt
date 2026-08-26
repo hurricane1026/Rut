@@ -600,6 +600,19 @@ if(RUT_ENABLE_JIT)
         ENVIRONMENT "RUT_NGINX_DIFFERENTIAL_REQUIRED=1"
     )
     add_test(
+        NAME test_nginx_converter_exact_local_return204_query_differential
+        COMMAND test_nginx_differential --converter-exact-local-return204-query-differential
+                $<TARGET_FILE:rut>
+    )
+    set_tests_properties(test_nginx_converter_exact_local_return204_query_differential PROPERTIES
+        LABELS "integration;nginx;docker;network;io_uring"
+        RUN_SERIAL TRUE
+        RESOURCE_LOCK nginx-differential
+        TIMEOUT 150
+        SKIP_RETURN_CODE 77
+        ENVIRONMENT "RUT_NGINX_DIFFERENTIAL_REQUIRED=1"
+    )
+    add_test(
         NAME test_nginx_converter_bounded_exact_local_path_differential
         COMMAND test_nginx_differential --converter-bounded-exact-local-path-differential
                 $<TARGET_FILE:rut>
